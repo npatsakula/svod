@@ -9,6 +9,7 @@ use std::sync::Arc;
 use svod_dtype::{AmdArch, DType, ScalarDType};
 use svod_ir::{WmmaMetadata, prelude::*};
 
+use crate::llvm::common::gpu::wmma_operand_dtype;
 use crate::llvm::common::{RenderContext, ldt};
 
 /// Render a WMMA UOp for the AMD target. Returns `None` if the (arch, dtype,
@@ -32,15 +33,10 @@ pub fn render_wmma_amd(
     let c_name = ctx.get(c).to_string();
 
     let (n, m, k) = metadata.dims;
-    // WMMA operands are vectors (e.g. `<16 x half>` for inputs, `<8 x float>`
-    // for accumulators). `DType::scalar()` returns `None` for `Vector{..}` —
-    // we need `base()`, which unwraps both `Scalar` and `Vector` to the inner
-    // ScalarDType. svod's `.scalar()` is stricter than that, so we use
-    // `.base()` here. Wrapping in `Some` keeps the downstream API uniform.
-    let a_dtype = hardware_dtype(a);
-    let b_dtype = hardware_dtype(b);
-    let c_dtype = hardware_dtype(c);
-    let out_dtype = hardware_dtype(uop);
+    let a_dtype = wmma_operand_dtype(a);
+    let b_dtype = wmma_operand_dtype(b);
+    let c_dtype = wmma_operand_dtype(c);
+    let out_dtype = wmma_operand_dtype(uop);
     let in_scalar = Some(a_dtype.base());
     let acc_scalar = Some(out_dtype.base());
 
@@ -106,17 +102,6 @@ pub fn render_wmma_amd(
         kernel.push(format!("  {dst} = bitcast {acc_wire} {call_dst} to {}", ldt(&out_dtype)));
     }
     Some(())
-}
-
-fn hardware_dtype(uop: &Arc<UOp>) -> DType {
-    let dtype = uop.dtype();
-    let count = uop
-        .shape()
-        .ok()
-        .flatten()
-        .and_then(|shape| shape.iter().try_fold(1usize, |count, dim| Some(count * dim.as_const()?)))
-        .unwrap_or(1);
-    if count > 1 { dtype.scalar_dtype().vec(count).expect("WMMA shape must be vectorizable") } else { dtype }
 }
 
 /// The LLVM type a WMMA/MFMA operand must be passed as, plus whether that

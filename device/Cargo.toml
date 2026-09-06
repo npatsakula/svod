@@ -23,7 +23,6 @@ smallvec = { workspace = true }
 tracing = "0.1"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
-cudarc = { version = "0.17", features = ["cuda-13000"], optional = true }
 
 proptest-derive = { version = "0.7", optional = true }
 proptest = { version = "1.9", optional = true }
@@ -51,6 +50,3 @@ tinyvec = "1.10"
 [features]
 default = []
 proptest = ["dep:proptest", "dep:proptest-derive", "svod-dtype/proptest"]
-# Devices
-cuda = ["dep:cudarc"]
-webgpu = []

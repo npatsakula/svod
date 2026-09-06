@@ -109,8 +109,23 @@ impl DeviceFactoryRegistry {
             );
         }
 
-        // Future: Register CUDA and WebGPU factories when implemented
-        // registry.register_factory("CUDA", Arc::new(|spec, reg| create_cuda_device(spec, reg)));
+        // CUDA factory. Same contract again: always compiled, registered only
+        // when `libcuda.so.1` loads and reports a device. The compute
+        // capability lives on the opened device, not the spec.
+        if svod_device::cuda::has_devices() {
+            registry.register_factory(
+                "CUDA",
+                Arc::new(|spec, alloc_reg| {
+                    let svod_ir::DeviceSpec::Cuda { device_id } = spec else {
+                        return Err(svod_device::Error::DeviceUnavailable {
+                            reason: format!("CUDA factory called with non-CUDA spec: {spec:?}"),
+                        });
+                    };
+                    let arch = svod_device::registry::resolve_cuda_arch(*device_id)?;
+                    crate::devices::cuda::create_cuda_device(alloc_reg, *device_id, arch)
+                }),
+            );
+        }
 
         registry
     }

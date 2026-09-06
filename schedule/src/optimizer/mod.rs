@@ -1012,7 +1012,7 @@ fn optimize_kernel_with_config_impl(
     // Author-supplied `opts_to_apply` (tinygrad parity) is read from the kernel
     // SINK marker BEFORE pre-optimization. When set, it overrides the strategy:
     // apply exactly those opts (an empty list applies none), never heuristics.
-    let explicit_opts = kernel_opts_to_apply(&ast);
+    let explicit_opts = kernel_opts_to_apply(&ast).or_else(|| config.opts_to_apply.clone());
 
     // Pre-optimization: per-kernel stages. Kept ON for the explicit-opts path
     // for parity with `OptStrategy::None` (which also keeps it).

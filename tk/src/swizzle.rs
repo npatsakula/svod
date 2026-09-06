@@ -27,6 +27,13 @@ pub enum Swizzle {
     Sw16x32,
     /// `ST_32X16` (bf16 XOR).
     Sw32x16,
+    /// `ST_16X16_MMA`: the 16-byte chunk index XORed with row bit 2
+    /// (`col ^= (16/itemsize)·((row/4)%2)`). Conflict-free for the `mma.sync`
+    /// fragment gather (per register a warp touches 8 rows × one 16-byte chunk:
+    /// unswizzled rows `r` and `r+4` share banks in a 32-byte row), for
+    /// `ldmatrix` (the same 8-row × 16-byte phase) and for 16-byte `cp.async`
+    /// writers; 16-byte groups stay contiguous.
+    Sw16x16Mma,
 }
 
 /// HipKittens `swizzle_bytes` (`st.cuh:74-86`): the bank-conflict-avoiding XOR
@@ -68,8 +75,18 @@ impl Swizzle {
     pub(crate) fn period_bytes(&self, cols: usize, itemsize: i64) -> Option<i64> {
         match self {
             Swizzle::Identity => None,
+            Swizzle::Sw16x16Mma => Some(256), // the row-bit-2 pattern repeats every 8 rows of 32 bytes
             _ => Some(swizzle_bytes(cols, itemsize)),
         }
+    }
+
+    /// Whether every aligned 16-byte column chunk of a row stays one contiguous,
+    /// 16-byte-aligned run under the swizzle — the `ldmatrix` row / `cp.async`
+    /// copy unit. The HipKittens XOR variants permute at 8-byte granularity
+    /// (`st.cuh:96` `<< 3`), so only the identity and the chunk-granular
+    /// [`Swizzle::Sw16x16Mma`] qualify.
+    pub fn keeps_16b_chunks(&self) -> bool {
+        matches!(self, Swizzle::Identity | Swizzle::Sw16x16Mma)
     }
 
     /// Map `(row, col)` within a base tile of `cols` columns to swizzled
@@ -83,6 +100,10 @@ impl Swizzle {
     pub fn swizzle_rc(&self, row: Arc<UOp>, col: Arc<UOp>, cols: usize, scalar: ScalarDType) -> (Arc<UOp>, Arc<UOp>) {
         match self {
             Swizzle::Identity => (row, col),
+            Swizzle::Sw16x16Mma => {
+                let chunk = 16 / scalar.bytes() as i64;
+                (row.clone(), col.xor(&row.shr(&cidx(2)).mod_(&cidx(2)).mul(&cidx(chunk))))
+            }
             Swizzle::Sw16x16 | Swizzle::Sw32x32 | Swizzle::Sw16x32 | Swizzle::Sw32x16 => {
                 let cols_i = cols as i64;
                 let itemsize = scalar.bytes() as i64;

@@ -42,9 +42,6 @@ proptest = ["dep:proptest-derive", "svod-ir/proptest"]
 serde = ["svod-ir/serde"]
 # Enable trace-level spans in hot paths (compile-time control)
 tracing-verbose = []
-# Devices
-cuda = ["svod-device/cuda"]
-webgpu = ["svod-device/webgpu"]
 
 [dev-dependencies]
 proptest = "1.9.0"

@@ -1696,3 +1696,31 @@ fn test_deferred_naming_finalizes_to_the_unique_name() {
     let unnamed = UOp::sink(vec![UOp::native_const(2.0f32)]);
     assert!(Arc::ptr_eq(&finalize_kernel_name(&unnamed), &unnamed));
 }
+
+/// A hand-authored kernel (`opts_to_apply` set) keeps its name on first use
+/// and draws suffixes afterwards, so two different bodies launched under one
+/// name stay distinguishable.
+#[test]
+fn test_authored_kernel_names_go_through_the_counter() {
+    use crate::optimizer::{KernelInfo, finalize_kernel_name};
+
+    let authored = |value: f32| {
+        let info = svod_ir::KernelInfo {
+            name: Some("authored_kernel_test".into()),
+            opts_to_apply: Some(vec![]),
+            ..Default::default()
+        };
+        UOp::sink_with_info(vec![UOp::native_const(value)], info).with_metadata(KernelInfo {
+            name: "authored_kernel_test".into(),
+            applied_opts: vec![],
+            dont_use_locals: false,
+        })
+    };
+    let name_of = |ast: &Arc<UOp>| {
+        let Op::Sink(ops::Sink { info: Some(info), .. }) = ast.op() else { panic!("{:?}", ast.op()) };
+        assert_eq!(info.name.as_deref(), Some(ast.metadata::<KernelInfo>().unwrap().name.as_str()));
+        info.name.clone().unwrap()
+    };
+    assert_eq!(name_of(&finalize_kernel_name(&authored(1.0))), "authored_kernel_test");
+    assert_eq!(name_of(&finalize_kernel_name(&authored(2.0))), "authored_kernel_testn1");
+}

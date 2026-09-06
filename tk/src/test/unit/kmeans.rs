@@ -38,7 +38,7 @@ fn kmeans_sink(n: usize, k: usize, d: usize, caps: ArchCaps) -> Arc<UOp> {
 /// `[N, 1]` output stores. Holds on both wave64 (gfx942) and wave32 (gfx1151).
 #[test]
 fn test_kmeans_assign_graph_shape() {
-    for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
+    for caps in [ArchCaps::GFX942, ArchCaps::for_amd(AmdArch::Gfx1151)] {
         let arch = caps.arch;
         let (n, k, d) = (32usize, 48usize, 32usize);
         let topo = kmeans_sink(n, k, d, caps).toposort();

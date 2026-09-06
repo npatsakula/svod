@@ -958,7 +958,9 @@ fn replay_cached(scheduler: &Scheduler, cached_opts: &[Opt]) -> Result<Scheduler
 fn cache_get(key: &CacheKey) -> Option<Vec<Opt>> {
     let db = CACHE_DB.as_ref()?;
     let bytes = db.get(key.to_bytes()).ok()??;
-    deserialize_opts(&bytes)
+    let opts = deserialize_opts(&bytes);
+    tracing::debug!(ast_hash = format_args!("{:016x}", key.ast_hash), hit = opts.is_some(), "Beam cache lookup");
+    opts
 }
 
 /// Store beam search result in cache.

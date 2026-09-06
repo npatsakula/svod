@@ -1,3 +1,5 @@
+use test_case::test_case;
+
 use crate::{DeviceSpec, registry::DeviceSpecExt};
 use svod_dtype::DType;
 use svod_ir::ops;
@@ -83,16 +85,45 @@ fn device_spec_parses_aliases_and_round_trips_through_canonicalize() {
         ("AMD", DeviceSpec::Amd { device_id: 0 }, "AMD:0"),
         ("AMD:1", DeviceSpec::Amd { device_id: 1 }, "AMD:1"),
         ("hip:2", DeviceSpec::Amd { device_id: 2 }, "AMD:2"),
-        #[cfg(feature = "cuda")]
         ("cuda", DeviceSpec::Cuda { device_id: 0 }, "CUDA:0"),
-        #[cfg(feature = "cuda")]
         ("CUDA:1", DeviceSpec::Cuda { device_id: 1 }, "CUDA:1"),
-        #[cfg(feature = "cuda")]
         ("GPU:2", DeviceSpec::Cuda { device_id: 2 }, "CUDA:2"),
+        ("metal", DeviceSpec::Metal { device_id: 0 }, "Metal:0"),
+        ("Metal:1", DeviceSpec::Metal { device_id: 1 }, "Metal:1"),
+        ("webgpu", DeviceSpec::WebGpu, "WebGPU"),
     ];
     for (text, spec, canonical) in cases {
         assert_eq!(DeviceSpec::parse(text).unwrap(), spec, "{text}");
         assert_eq!(spec.canonicalize(), canonical);
+    }
+}
+
+#[test_case("CUDA:x"; "non numeric id")]
+#[test_case("AMD:-1"; "negative id")]
+#[test_case("METAL:"; "empty id")]
+#[test_case("NV:0"; "alias reserved for a userspace driver")]
+#[test_case(""; "empty")]
+fn device_spec_parse_rejects_malformed_specs(text: &str) {
+    let err = DeviceSpec::parse(text).expect_err(text);
+    assert!(matches!(err, crate::Error::InvalidDevice { .. }), "{text}: {err:?}");
+}
+
+/// Opening CUDA must never panic: without the driver library, without a GPU,
+/// or on a driver failure it returns a typed error; with a GPU it succeeds
+/// and `has_devices` agrees.
+#[test]
+fn cuda_allocator_open_returns_a_clean_result_on_every_host() {
+    use crate::error::Error;
+    match crate::registry::registry().get(&DeviceSpec::Cuda { device_id: 0 }) {
+        Ok(allocator) => {
+            assert_eq!(allocator.name(), "CUDA");
+            assert!(crate::cuda::has_devices());
+        }
+        Err(error @ (Error::DeviceUnavailable { .. } | Error::NoCudaGpu { .. })) => {
+            assert!(!crate::cuda::has_devices(), "{error:?}");
+        }
+        Err(Error::CudaDriver { .. }) => {}
+        Err(other) => panic!("unexpected CUDA open error: {other:?}"),
     }
 }
 

@@ -116,11 +116,6 @@ pub enum Error {
     #[snafu(display("{what} requires a host-visible AMD buffer"))]
     NotHostVisible { what: &'static str },
 
-    #[cfg(feature = "cuda")]
-    /// CUDA-specific errors.
-    #[snafu(display("CUDA error: {source}"))]
-    CudaError { source: cudarc::driver::DriverError },
-
     /// AMD GPU not present (no `/dev/kfd`, empty topology, permission denied,
     /// or selected device index out of range).
     #[snafu(display("no AMD GPU available: {reason}"))]
@@ -143,6 +138,23 @@ pub enum Error {
     /// Kernel requests more LDS/group-segment than the device exposes.
     #[snafu(display("group_segment too large: {requested} > device limit {limit} (lds_size_in_kb {lds_kb})"))]
     GroupSegmentTooLarge { requested: u32, limit: u32, lds_kb: u32 },
+
+    /// No CUDA GPU (driver loaded but `cuInit` failed, zero devices, or the
+    /// selected device index is out of range).
+    #[snafu(display("no CUDA GPU available: {reason}"))]
+    NoCudaGpu { reason: String },
+
+    /// CUDA driver API call failure, described by the driver itself.
+    #[snafu(display("CUDA {call} failed: {name} ({code}): {message}"))]
+    CudaDriver { call: &'static str, code: i32, name: String, message: String },
+
+    /// The driver JIT rejected a PTX module; `log` is its error log.
+    #[snafu(display("CUDA JIT of kernel {kernel:?} failed: {cause}\n{log}"))]
+    CudaJit { kernel: String, cause: String, log: String },
+
+    /// CUDA allocation failure (VRAM exhaustion, unsupported memory kind).
+    #[snafu(display("CUDA allocation of {size} bytes failed: {reason}"))]
+    CudaAllocFailed { size: usize, reason: String },
 
     /// Device requested but unavailable on this host (wrong OS, missing libs).
     #[snafu(display("device unavailable: {reason}"))]

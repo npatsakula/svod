@@ -1,8 +1,9 @@
 //! Common utilities for LLVM IR text generation.
 //!
-//! Shared between CPU and GPU backends.
+//! Shared between the CPU and GPU backends.
 
 mod ctx;
+pub mod gpu;
 pub mod target;
 pub mod types;
 

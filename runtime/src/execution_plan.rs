@@ -1664,6 +1664,7 @@ impl ExecutionPlan {
         for &index in &self.distinct_storage_indices {
             self.buffers[index].record_completion(&token);
         }
+        token.published();
     }
 
     /// Deep-copy the plan for concurrent execution. Fork policy per storage:

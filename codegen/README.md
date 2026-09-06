@@ -19,10 +19,16 @@ let code = render(&kernel_graph, backend)?;
 
 Select at runtime via `SVOD_CPU_BACKEND` env var (`clang` or `llvm`).
 
+GPU targets share the LLVM text renderer (`llvm::LlvmTextRenderer`) or the C renderer:
+
+| Target | Output |
+|--------|--------|
+| **AMD** (`LlvmTextRenderer::amd(arch)`) | amdgcn LLVM IR → `clang --target=amdgcn-amd-amdhsa` → code object |
+| **NVIDIA** (`LlvmTextRenderer::nvptx(arch)`) | nvptx64 LLVM IR → `clang --target=nvptx64-nvidia-cuda` → PTX, JIT'd by the CUDA driver |
+| **Metal** (`c::CRenderer::metal()`) | MSL source → `metallib` via `MTLCodeGenService` |
+
 **Planned:**
 
-- PTX renderer (CUDA)
-- Metal renderer
 - WebGPU (WGSL) renderer
 
 ## Testing

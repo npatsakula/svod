@@ -22,6 +22,66 @@ use svod_ir::ops;
 /// Value 4 provides good SIMD utilization on most architectures (SSE/NEON).
 pub const DEFAULT_UPCAST_FACTOR: usize = 4;
 
+/// Cumulative LOCAL size budget per kernel (tinygrad heuristic.py:184).
+const LOCAL_BUDGET: usize = 128;
+
+/// Threads of a block are issued in warps of this many lanes on every renderer
+/// with locals (CUDA, Metal SIMD-groups, RDNA wave32); a block whose size is
+/// not a multiple leaves its last warp partly idle.
+const WARP_LANES: usize = 32;
+
+/// Block sizes a global axis may be padded to, best first.
+const PAD_BLOCKS: [usize; 3] = [32, 16, 8];
+
+/// `size` rounded up to a multiple of `align`, when the padded (masked) tail
+/// adds at most 5% of extra work.
+fn padded_extent(size: usize, align: usize) -> Option<usize> {
+    let padded = size.div_ceil(align) * align;
+    ((padded - size) * 20 <= size).then_some(padded)
+}
+
+/// The constant extent of a RANGE, if it has one.
+fn const_extent(rng: &Arc<UOp>) -> Option<usize> {
+    match rng.op() {
+        Op::Range(ops::Range { end, .. }) => match end.op() {
+            Op::Const(cv) => match cv.0 {
+                svod_ir::ConstValue::Int(size) if size > 0 => Some(size as usize),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// LOCAL size for a global axis none of the standard sizes divides, with the
+/// PADTO alignment it needs first.
+///
+/// Two options compete on the fraction of lanes that do useful work in a
+/// block of `cumulative * threads` (the block occupies whole warps, and
+/// padded elements are computed then masked): the largest divisor of `size`
+/// within `budget`, and the largest of [`PAD_BLOCKS`] whose padding stays
+/// cheap ([`padded_extent`]). Ties keep the exact divisor.
+fn local_fallback(size: usize, cumulative: usize, budget: usize) -> Option<(usize, Option<usize>)> {
+    let lane_efficiency = |threads: usize, useful: usize, total: usize| {
+        let block = cumulative * threads;
+        block as f64 / (block.div_ceil(WARP_LANES) * WARP_LANES) as f64 * useful as f64 / total as f64
+    };
+    let divisor = (2..=budget.min(size)).rev().find(|d| size.is_multiple_of(*d));
+    let padded = PAD_BLOCKS
+        .into_iter()
+        .filter(|&block| block <= budget)
+        .find_map(|block| padded_extent(size, block).map(|padded| (block, padded)));
+    match (divisor, padded) {
+        (Some(d), Some((block, padded))) if lane_efficiency(block, size, padded) > lane_efficiency(d, size, size) => {
+            Some((block, Some(block)))
+        }
+        (Some(d), _) => Some((d, None)),
+        (None, Some((block, _))) => Some((block, Some(block))),
+        (None, None) => None,
+    }
+}
+
 // ============================================================================
 // MAIN ENTRY POINT
 // ============================================================================
@@ -624,11 +684,20 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
         let Some(&global_dim) = full_shape.get(global_idx) else {
             continue;
         };
-        if global_dim <= 0 || !(global_dim as usize).is_multiple_of(row_tile) {
+        if global_dim <= 0 {
+            continue;
+        }
+        // An axis the row tile does not divide is padded to it when that stays cheap.
+        let global_dim = global_dim as usize;
+        let padto = !global_dim.is_multiple_of(row_tile);
+        if padto && padded_extent(global_dim, row_tile).is_none() {
             continue;
         }
 
         let mut trial = scheduler.clone();
+        if padto && apply_opt(&mut trial, &Opt::padto(global_idx, row_tile), true).is_err() {
+            continue;
+        }
 
         // GROUP is best-effort in this fast path.
         if threads_per_row > 1 {
@@ -683,15 +752,10 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
     let total_elements = estimate_total_elements(scheduler);
 
     const THREAD_LIST: [usize; 9] = [32, 16, 12, 8, 6, 5, 4, 3, 2];
+    let counts =
+        THREAD_LIST.into_iter().filter(|&threads| threads <= max_threads && total_elements / 131072 >= threads as i64);
 
-    for &threads in &THREAD_LIST {
-        if threads > max_threads {
-            continue;
-        }
-        if total_elements / 131072 < threads as i64 {
-            continue;
-        }
-
+    for threads in counts.clone() {
         // Only thread LOOP axes.
         let loop_axes = scheduler.axes_of(&[AxisType::Weak]);
         let mut thread_applied = false;
@@ -711,6 +775,24 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
         }
         if thread_applied {
             return true;
+        }
+    }
+
+    // No count divides any loop axis (a prime extent would run single-threaded):
+    // pad the first axis whose padding stays cheap to the largest count.
+    for threads in counts {
+        let loop_axes = scheduler.axes_of(&[AxisType::Weak]);
+        for &axis_idx in &loop_axes {
+            let Some(size) = scheduler.rngs().get(axis_idx).and_then(const_extent) else { continue };
+            let mut trial = scheduler.clone();
+            if padded_extent(size, threads).is_some()
+                && apply_opt(&mut trial, &Opt::padto(axis_idx, threads), true).is_ok()
+                && apply_opt(&mut trial, &Opt::thread(axis_idx, threads), true).is_ok()
+            {
+                debug!(axis = axis_idx, threads, "apply_threading: applied PADTO + THREAD");
+                *scheduler = trial;
+                return true;
+            }
         }
     }
 
@@ -873,11 +955,14 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
 ///
 /// Prioritizes expand axes (stride-0 in some buffer = broadcast) for LOCAL,
 /// then higher axis indices. Tries sizes [32, 16, 8, 4, 3, 2] for axis 0
-/// and [16, 8, 4, 3, 2] for others, with cumulative LOCAL size ≤ 128.
+/// and [16, 8, 4, 3, 2] for others, with cumulative LOCAL size ≤ 128. An
+/// axis none of them divides (Whisper's 51865 = 5·11·23·41 vocabulary) falls
+/// back to [`local_fallback`] instead of running one thread per block.
 pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     if !scheduler.renderer().has_local || config.disable_locals {
         return false;
     }
+    let budget = LOCAL_BUDGET.min(scheduler.renderer().local_max.unwrap_or(LOCAL_BUDGET));
 
     // Rank axes by (has_expand_pattern, axis_index) — expand axes (stride-0 in
     // some buffer = broadcast) first, then higher axis indices.
@@ -905,39 +990,52 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
     // Sort descending by (is_expand, axis) — expand axes first, higher index first
     local_axis_ranking.sort_by(|a, b| b.cmp(a));
 
-    // Collect LOCAL candidates with cumulative size constraint
-    let mut to_local: Vec<(usize, usize)> = Vec::new();
+    // Collect LOCAL candidates with cumulative size constraint: (axis, size, padto).
+    let mut to_local: Vec<(usize, usize, Option<usize>)> = Vec::new();
     for &(_, axis) in &local_axis_ranking {
-        let cumulative_local: usize = to_local.iter().map(|(_, sz)| *sz).product::<usize>().max(1);
+        let cumulative_local: usize = to_local.iter().map(|(_, sz, _)| *sz).product::<usize>().max(1);
         let axis_size = full_shape[axis];
         if axis_size <= 0 {
             continue;
         }
+        let axis_size = axis_size as usize;
 
         // Axis 0 gets [32, 16, 8, 4, 3, 2]; others get [16, 8, 4, 3, 2].
         let candidates: &[usize] = if axis == 0 { &[32, 16, 8, 4, 3, 2] } else { &[16, 8, 4, 3, 2] };
 
-        let local_sz =
-            candidates.iter().copied().find(|&x| (axis_size as usize).is_multiple_of(x) && cumulative_local * x <= 128);
+        let local_sz = candidates
+            .iter()
+            .copied()
+            .find(|&x| axis_size.is_multiple_of(x) && cumulative_local * x <= LOCAL_BUDGET)
+            .map(|sz| (sz, None))
+            .or_else(|| local_fallback(axis_size, cumulative_local, budget / cumulative_local));
 
-        if let Some(sz) = local_sz {
-            to_local.push((axis, sz));
+        if let Some((sz, padto)) = local_sz {
+            to_local.push((axis, sz, padto));
         }
     }
 
     // Apply at most 3 LOCALs, sorted by axis (ascending)
     // Track deleted shapes: if local_sz == full_shape[axis], axis merges and shifts indices
-    let mut to_apply: Vec<(usize, usize)> = to_local.into_iter().take(3).collect();
+    let mut to_apply: Vec<(usize, usize, Option<usize>)> = to_local.into_iter().take(3).collect();
     to_apply.sort();
 
     let mut applied = false;
     let mut deleted_shape = 0usize;
-    for (axis, local_sz) in to_apply {
+    for (axis, local_sz, padto) in to_apply {
         let adjusted_axis = axis - deleted_shape;
-        let will_delete = local_sz == full_shape[axis] as usize;
-        if apply_opt(scheduler, &Opt::local(adjusted_axis, local_sz), true).is_ok() {
+        let mut axis_size = full_shape[axis] as usize;
+        let mut trial = scheduler.clone();
+        if let Some(align) = padto {
+            if apply_opt(&mut trial, &Opt::padto(adjusted_axis, align), true).is_err() {
+                continue;
+            }
+            axis_size = axis_size.div_ceil(align) * align;
+        }
+        if apply_opt(&mut trial, &Opt::local(adjusted_axis, local_sz), true).is_ok() {
+            *scheduler = trial;
             applied = true;
-            if will_delete {
+            if local_sz == axis_size {
                 deleted_shape += 1;
             }
         }

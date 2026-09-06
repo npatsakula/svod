@@ -122,6 +122,12 @@ fn worker_codegen(init: &WorkerInit) -> Result<WorkerCodegen> {
             DeviceSpec::Metal { device_id } => {
                 svod_runtime::create_metal_codegen(device_id).map_err(BeamWorker::at("Metal codegen"))?
             }
+            DeviceSpec::Cuda { device_id } => {
+                let arch = init.gpu_arch.and_then(GpuArch::cuda).ok_or_else(|| BeamWorker::HelperUnavailable {
+                    reason: "CUDA BEAM worker initialization has no target architecture".into(),
+                })?;
+                svod_runtime::create_cuda_codegen(device_id, arch).map_err(BeamWorker::at("CUDA codegen"))?
+            }
             _ => {
                 return Err(BeamWorker::HelperUnavailable {
                     reason: format!("{:?} has no device-disabled BEAM codegen factory", init.device),
@@ -151,6 +157,13 @@ fn worker_codegen(init: &WorkerInit) -> Result<WorkerCodegen> {
             .and_then(GpuArch::metal)
             .map(svod_schedule::OptimizerRenderer::for_metal_family)
             .unwrap_or_else(svod_schedule::OptimizerRenderer::metal),
+        DeviceSpec::Cuda { .. } => {
+            init.gpu_arch.and_then(GpuArch::cuda).map(svod_schedule::OptimizerRenderer::for_cuda_arch).ok_or_else(
+                || BeamWorker::HelperUnavailable {
+                    reason: "CUDA BEAM worker initialization has no optimizer profile".into(),
+                },
+            )?
+        }
         _ => {
             return Err(BeamWorker::HelperUnavailable {
                 reason: format!("{:?} has no BEAM optimizer profile", init.device),

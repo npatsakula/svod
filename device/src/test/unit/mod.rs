@@ -1,5 +1,6 @@
 mod amd;
 mod buffer;
+mod cuda;
 mod device;
 mod hcq;
 mod metal;

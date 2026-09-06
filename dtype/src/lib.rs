@@ -1,5 +1,6 @@
 pub mod amd_arch;
 pub mod cast;
+pub mod cuda_arch;
 pub mod default_device;
 pub mod ext;
 pub mod metal_family;
@@ -10,6 +11,7 @@ pub mod test;
 use std::path::PathBuf;
 
 pub use amd_arch::AmdArch;
+pub use cuda_arch::CudaArch;
 pub use metal_family::MetalFamily;
 
 /// GPU hardware architecture a renderer/compiler targets — a backend-neutral
@@ -23,6 +25,8 @@ pub enum GpuArch {
     Amd(AmdArch),
     /// Apple GPU family behind a Metal device.
     Metal(MetalFamily),
+    /// NVIDIA compute capability behind a CUDA device.
+    Cuda(CudaArch),
 }
 
 impl GpuArch {
@@ -30,7 +34,7 @@ impl GpuArch {
     pub fn amd(self) -> Option<AmdArch> {
         match self {
             GpuArch::Amd(arch) => Some(arch),
-            GpuArch::Metal(_) => None,
+            GpuArch::Metal(_) | GpuArch::Cuda(_) => None,
         }
     }
 
@@ -38,16 +42,25 @@ impl GpuArch {
     pub fn metal(self) -> Option<MetalFamily> {
         match self {
             GpuArch::Metal(family) => Some(family),
-            GpuArch::Amd(_) => None,
+            GpuArch::Amd(_) | GpuArch::Cuda(_) => None,
         }
     }
 
-    /// The exact target within its backend family (`gfx1151`, `Apple9`), as
-    /// the optimizer profile records it.
+    /// The CUDA arch when this is a CUDA target, else `None`.
+    pub fn cuda(self) -> Option<CudaArch> {
+        match self {
+            GpuArch::Cuda(arch) => Some(arch),
+            GpuArch::Amd(_) | GpuArch::Metal(_) => None,
+        }
+    }
+
+    /// The exact target within its backend family (`gfx1151`, `Apple9`,
+    /// `sm_86`), as the optimizer profile records it.
     pub fn target_name(self) -> String {
         match self {
-            GpuArch::Amd(arch) => arch.mcpu().to_string(),
+            GpuArch::Amd(arch) => arch.to_string(),
             GpuArch::Metal(family) => family.to_string(),
+            GpuArch::Cuda(arch) => arch.to_string(),
         }
     }
 }
@@ -110,8 +123,8 @@ impl DeviceSpec {
     /// Known limits:
     /// - Metal: 31 buffers (Apple Silicon hardware limit)
     /// - WebGPU: 8 buffers (WebGPU specification limit)
-    /// - CPU/CUDA: None (no practical limit)
-    /// - Disk: None (file-backed, no kernel execution)
+    /// - CUDA/AMD: 128 (kernarg segment budget)
+    /// - CPU/Disk: None
     pub fn max_buffers(&self) -> Option<usize> {
         match self {
             DeviceSpec::Cpu | DeviceSpec::Disk { .. } => None,

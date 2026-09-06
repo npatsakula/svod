@@ -7,8 +7,8 @@
 //! arch (gfx942 CDNA MFMA vs gfx1151 RDNA WMMA), so one builder serves both.
 //!
 //! Per-arch tuning lives in the configs ([`M1_CFG`] / [`SMALL_CFG`] for gfx942's
-//! size-adaptive [`cfg_for_n`]; [`GFX1151_CFG`] for the occupancy-tuned RDNA3.5 path),
-//! selected by [`cfg_for_arch`]. The strongest gfx1151 lever is `k_step`: a smaller
+//! size-adaptive [`cfg_for_n`]; [`GFX1151_CFG`] for the occupancy-tuned RDNA3.5 path;
+//! [`SM80_CFG`] / [`SM80_SMALL_CFG`] for CUDA `mma.sync`), selected by [`cfg_for_arch`]. The strongest gfx1151 lever is `k_step`: a smaller
 //! strip shrinks the live WMMA-input fragment VGPR/lane (each input replicates all
 //! `k_step`/16 K-sub-steps), raising occupancy. A port of tinygrad
 //! `test_tk.py::test_simple_matmul` lifted to a reusable kernel builder.
@@ -48,7 +48,7 @@ pub struct MatmulCfg {
     /// `block_idx`. Grid becomes `[grid² , 1, 1]`.
     pub l2_swizzle: bool,
     /// Fill the GLOBAL→LDS strips with 128-bit (`vec8` bf16) coalesced loads
-    /// instead of the scalar/`vec4`-folded path.
+    /// instead of the scalar/`vec4`-folded path (16-byte `cp.async` copies on CUDA).
     pub vec_load: bool,
     /// K-reduction step (LDS strip depth) for the single-buffered K-loop. Must be a
     /// multiple of 16 (the WMMA K-edge) and divide N. Lowering it cuts the live
@@ -123,6 +123,19 @@ pub const SMALL_CFG: MatmulCfg =
 pub const GFX1151_CFG: MatmulCfg =
     MatmulCfg { block: 64, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: false, vec_load: true, k_step: 32 };
 
+/// CUDA sm_80+ (`mma.sync`, warp32) config: 128×128 block, 2×4 waves (256 threads),
+/// two 32×32 accumulators/wave, 128-bit vec fills, `k_step = 32`. The 8-register
+/// two-half fragments make register pressure the lever: a 32×32 f32 accumulator
+/// is 32 regs/lane and each 32×32 operand strip 64 packed halves, so `reg = 32`
+/// and the short strip keep a warp well under the 255-register ceiling; the
+/// 2×(128×32) bf16 strips are 16 KiB of the 48 KiB static shared budget.
+pub const SM80_CFG: MatmulCfg =
+    MatmulCfg { block: 128, wave_rows: 2, wave_cols: 4, n_accum: 2, l2_swizzle: false, vec_load: true, k_step: 32 };
+/// CUDA sm_80+ small-N config (N a multiple of 64 but not 128): 64×64 block, 2×2
+/// waves, one 32×32 accumulator/wave.
+pub const SM80_SMALL_CFG: MatmulCfg =
+    MatmulCfg { block: 64, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: false, vec_load: true, k_step: 32 };
+
 /// Size-adaptive config selection: small N (where the 256×256/8-wave grid
 /// starves the machine) uses [`SMALL_CFG`]; everything else keeps [`M1_CFG`].
 /// Small N uses an occupancy-tuned config; the threshold follows size-adaptive tuning.
@@ -131,12 +144,16 @@ pub fn cfg_for_n(n: usize) -> MatmulCfg {
 }
 
 /// Per-arch config: gfx1151 (RDNA3.5 wave32) uses the occupancy-tuned
-/// [`GFX1151_CFG`]; gfx942 (CDNA wave64) keeps the size-adaptive [`cfg_for_n`].
-/// Arch-specific peak tuning lives here (the generic optimizer stays generic);
-/// this is the tk peer of HK shipping separate gfx942/gfx950/gfx1250 kernels.
-pub fn cfg_for_arch(arch: svod_dtype::AmdArch, n: usize) -> MatmulCfg {
+/// [`GFX1151_CFG`]; CUDA the register-pressure-tuned [`SM80_CFG`] (or
+/// [`SM80_SMALL_CFG`] when N only tiles by 64); gfx942 (CDNA wave64) keeps the
+/// size-adaptive [`cfg_for_n`]. Arch-specific peak tuning lives here (the generic
+/// optimizer stays generic); this is the tk peer of HK shipping separate
+/// gfx942/gfx950/gfx1250 kernels.
+pub fn cfg_for_arch(arch: svod_dtype::GpuArch, n: usize) -> MatmulCfg {
     match arch {
-        svod_dtype::AmdArch::Gfx1151 if n.is_multiple_of(GFX1151_CFG.block) => GFX1151_CFG,
+        svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx1151) if n.is_multiple_of(GFX1151_CFG.block) => GFX1151_CFG,
+        svod_dtype::GpuArch::Cuda(_) if n.is_multiple_of(SM80_CFG.block) => SM80_CFG,
+        svod_dtype::GpuArch::Cuda(_) => SM80_SMALL_CFG,
         _ => cfg_for_n(n),
     }
 }
@@ -161,11 +178,14 @@ fn block_coords(ker: &Kernel, m: usize, n: usize, cfg: &MatmulCfg) -> (Arc<UOp>,
     }
 }
 
-/// The GPU arch(es) the tile matmul is built for: gfx942 (CDNA MFMA, wave64) and
-/// gfx1151 (RDNA3.5 WMMA, wave32 — the `_W32_*` fragment shapes). The launcher
-/// gates against this; see [`crate::target::check_target`].
-/// Validated on gfx942 (CDNA3) and gfx1151 (RDNA3.5).
-pub const MATMUL_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
+/// The GPU arch(es) the tile matmul is built for: gfx942 (CDNA MFMA, wave64),
+/// gfx1151 (RDNA3.5 WMMA, wave32 — the `_W32_*` fragment shapes) and CUDA sm_80+
+/// (`mma.sync.m16n8k16`, warp32 — the two-half `RT_16X16_MMA` fragment). The
+/// launcher gates against this; see [`crate::target::check_target`]. Validated on
+/// gfx942 (CDNA3), gfx1151 (RDNA3.5) and sm_86 (Ampere).
+pub const MATMUL_SUPPORTED_ARCHS: crate::ArchSet =
+    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151])
+        .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
 
 /// **Graph-native** `n×n` matrix multiply — returns a lazy output [`Tensor`] (a
 /// `custom_kernel` / `Op::Call` node), the matmul peer of [`crate::flash_attention`].
@@ -258,7 +278,8 @@ pub fn build_matmul_cfg(ker: &Kernel, n: usize, cfg: MatmulCfg) {
 
 /// [`build_matmul_cfg`] with an explicit `k_step` (the LDS strip depth / K-loop
 /// reduction step, replacing the hardcoded [`K_STEP`]). A thin wrapper that binds
-/// the square `n×n` bf16→f32 ABI and runs [`gemm_core`].
+/// the square `n×n` 16-bit→f32 ABI and runs [`gemm_core`] (the bound operand
+/// buffers' dtype — bf16 or f16 — is the matrix-core input dtype).
 ///
 /// # Panics
 /// Panics on the same preconditions as [`gemm_core`].
@@ -304,12 +325,13 @@ pub fn gemm_core(
     assert_eq!(cfg.wave_cols, cfg.wave_rows * cfg.n_accum, "config invariant wave_cols == wave_rows*n_accum");
     let reg = cfg.reg();
     let g = ker.group_2d(cfg.wave_rows, cfg.wave_cols);
-    let bf16 = DType::BFloat16;
+    // The matrix-core input dtype is the operands' (bf16 or f16, both K=16 cores).
+    let in_dt = a_gl.elem().clone();
 
     // A strip [block×k_step] = [M-block, K-strip]; B strip [k_step×block] = [K-strip,
     // N-block]; both XOR-swizzled, single-buffered.
-    let a_smem = ker.shared_sw((cfg.block, k_step), bf16.clone(), TileLayout::Row);
-    let b_smem = ker.shared_sw((k_step, cfg.block), bf16.clone(), TileLayout::Row);
+    let a_smem = ker.shared_sw((cfg.block, k_step), in_dt.clone(), TileLayout::Row);
+    let b_smem = ker.shared_sw((k_step, cfg.block), in_dt.clone(), TileLayout::Row);
 
     let (row, col) = block_coords(ker, m, n, &cfg); // (pid_m, pid_n) in block units
     let warp_row = g.warp_row();
@@ -340,14 +362,14 @@ pub fn gemm_core(
     // [k_step, reg] Col fragment, and per-accumulator A sub-tiles (M row-block
     // {warp_row + a*wave_rows}).
     let bb = g.load(
-        ker.operand((k_step, reg), bf16.clone(), TileLayout::Col),
+        ker.operand((k_step, reg), in_dt.clone(), TileLayout::Col),
         b_smem.subtile((k_step, reg), (0, warp_col.clone())),
         MoveIdx::default(),
     );
     let a_subs: Vec<RT> = (0..cfg.n_accum)
         .map(|a| {
             g.load(
-                ker.operand((reg, k_step), bf16.clone(), TileLayout::Row),
+                ker.operand((reg, k_step), in_dt.clone(), TileLayout::Row),
                 a_smem.subtile((reg, k_step), (acc_row(&warp_row, a, &cfg), 0)),
                 MoveIdx::default(),
             )

@@ -12,11 +12,10 @@ fn test_max_buffers_cpu() {
     assert_eq!(spec.max_buffers(), None, "CPU should have no buffer limit");
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn test_max_buffers_cuda() {
     let spec = DeviceSpec::Cuda { device_id: 0 };
-    assert_eq!(spec.max_buffers(), None, "CUDA should have no buffer limit");
+    assert_eq!(spec.max_buffers(), Some(128));
 }
 
 #[test]
@@ -25,7 +24,6 @@ fn test_max_buffers_metal() {
     assert_eq!(spec.max_buffers(), Some(31), "Metal should have 31 buffer limit");
 }
 
-#[cfg(feature = "webgpu")]
 #[test]
 fn test_max_buffers_webgpu() {
     let spec = DeviceSpec::WebGpu;

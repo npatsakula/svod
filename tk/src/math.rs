@@ -8,7 +8,8 @@
 //! - a same-shape **tile** (`add`/`sub`/`mul`/`div`/`maximum`): the matching
 //!   element of another [`RT`]/[`RV`];
 //! - a **register vector** broadcast into an [`RT`] (`*_rv`): per the RT layout,
-//!   `ROW` indexes the vector by the row-tile and `COL` by the col-tile.
+//!   `ROW` indexes the vector by the row-tile and `COL` by the col-tile, and the
+//!   vector slot by the element's [`LaneMap::slot_of`](crate::layout::LaneMap::slot_of).
 //!
 //! Faithful to the mixin, `sub` is `add(neg)` and `div` is `mul(recip)`.
 
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use svod_ir::{ConstValue, UOp};
 
 use crate::Group;
-use crate::index::{Idx, load_at};
+use crate::index::load_at;
 use crate::tile::{RT, RV, RegTile};
 use crate::tiles::TileLayout;
 
@@ -122,14 +123,15 @@ impl<'k> Group<'k> {
 
     // ── register-vector broadcast into an RT ──────────────────────────────────
     fn combine_rv(&self, a: RT<'k>, v: &RV<'k>, f: Combine) -> RT<'k> {
-        let (vbuf, vshape, velem, aelem, layout) =
-            (self.anchor(v.uop()), v.shape().to_vec(), v.elem().clone(), a.elem().clone(), a.layout);
+        let (vbuf, vshape, velem, aelem, layout, map) =
+            (self.anchor(v.uop()), v.shape().to_vec(), v.elem().clone(), a.elem().clone(), a.layout, a.base.map);
+        assert_eq!(vshape[1], map.slots(), "rv broadcast: vector slots must match the tile's lane map");
         self.map(a, move |x, idx| {
             let sel = match layout {
                 TileLayout::Row => idx[0].clone(),
                 TileLayout::Col => idx[1].clone(),
             };
-            let mut y = load_at(&vbuf, &vshape, &[sel, Idx::Const(0)]);
+            let mut y = load_at(&vbuf, &vshape, &[sel, map.slot_of(&idx[2])]);
             if velem != aelem {
                 y = y.cast(aelem.clone());
             }

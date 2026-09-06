@@ -10,9 +10,9 @@
 //!   3. `SVOD_DEVICE` env var (parsed once at first access).
 //!   4. [`platform_default`]: `METAL:0` on macOS, `CPU` elsewhere.
 //!
-//! Note: parsing is intentionally restricted to "CPU", "AMD[:N]" and
-//! "METAL[:N]". Devices that need richer specs (CUDA, WebGPU) can opt in by
-//! extending `parse_simple` here.
+//! Note: parsing is intentionally restricted to `NAME[:N]` forms ("CPU",
+//! "AMD", "METAL", "CUDA" and their aliases). Devices that need richer specs
+//! (DISK paths) go through `svod_device::DeviceSpecExt`.
 
 use std::cell::RefCell;
 
@@ -93,13 +93,9 @@ where
 
 /// Minimal `DeviceSpec` parser for the `SVOD_DEVICE` env var. We intentionally
 /// do NOT pull `svod_device::DeviceSpecExt` here — that crate depends on
-/// `svod-dtype`, not the other way around. Supports:
-///   - `CPU`
-///   - `AMD` / `AMD:N` — arch field defaults to `Gfx1100`, but the real arch
-///     comes from KFD topology when the registry/device-factory opens the
-///     allocator. The default-device value is only used as a *spec hint*;
-///     downstream consumers re-resolve through the registry.
-///   - `METAL` / `METAL:N`
+/// `svod-dtype`, not the other way around. Supports `CPU`, `AMD[:N]` / `HIP`,
+/// `METAL[:N]` and `CUDA[:N]` / `NV` / `GPU`; the GPU arch is a property of
+/// the opened device, never of the spec.
 fn parse_simple(s: &str) -> Option<DeviceSpec> {
     let upper = s.to_uppercase();
     let parts: Vec<&str> = upper.split(':').collect();
@@ -108,6 +104,7 @@ fn parse_simple(s: &str) -> Option<DeviceSpec> {
         "CPU" => Some(DeviceSpec::Cpu),
         "AMD" | "HIP" => Some(DeviceSpec::Amd { device_id: device_id()? }),
         "METAL" => Some(DeviceSpec::Metal { device_id: device_id()? }),
+        "CUDA" | "NV" | "GPU" => Some(DeviceSpec::Cuda { device_id: device_id()? }),
         _ => None,
     }
 }

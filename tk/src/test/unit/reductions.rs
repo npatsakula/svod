@@ -10,7 +10,7 @@ use svod_ir::{BinaryOp, Op};
 
 use crate::arch::FragRole;
 use crate::tile::RegTile;
-use crate::tiles::{RT_16X16, ST_16X16, TileLayout, VecLayout};
+use crate::tiles::{RT_16X16, TileLayout, VecLayout};
 use crate::{ArchCaps, ArgDir, Kernel, MoveIdx};
 use svod_ir::ops;
 
@@ -19,7 +19,8 @@ const ROW: TileLayout = TileLayout::Row;
 const INV_LN2: f64 = std::f64::consts::LOG2_E; // 1 / ln(2) == log2(e)
 
 /// Build the softmax-over-axis-3 SINK for a `block × n` row-softmax with a
-/// `block × block` tile, mirroring tinygrad `test_softmax`.
+/// `block × block` tile, mirroring tinygrad `test_softmax`, on the arch's
+/// accumulator fragment and canonical LDS strip.
 fn build_softmax(ker: &Kernel, n: usize, block: usize) {
     let warp = ker.warp();
 
@@ -27,9 +28,9 @@ fn build_softmax(ker: &Kernel, n: usize, block: usize) {
     let b = ker.gl(&[1, 1, block, n], DType::Float32);
     let a = ker.gl(&[1, 1, block, n], DType::Float32);
 
-    let max_vec = ker.rv(block, DType::Float32, VecLayout::Ortho, RT_16X16);
-    let norm_vec = ker.rv(block, DType::Float32, VecLayout::Ortho, RT_16X16);
-    let max_vec_last = ker.rv(block, DType::Float32, VecLayout::Ortho, RT_16X16);
+    let max_vec = ker.acc_vec(block);
+    let norm_vec = ker.acc_vec(block);
+    let max_vec_last = ker.acc_vec(block);
 
     let mut max_vec = warp.neg_inf_rv(max_vec);
     let mut norm_vec = warp.zero_rv(norm_vec);
@@ -38,8 +39,8 @@ fn build_softmax(ker: &Kernel, n: usize, block: usize) {
     // Pass 1: running max + normalization accumulator over the column tiles.
     let tile_col = ker.range((n / block) as i64);
     {
-        let a_smem = ker.st((block, block), DType::Float32, TileLayout::Row, ST_16X16);
-        let a_reg = ker.rt((block, block), DType::Float32, TileLayout::Row, RT_16X16);
+        let a_smem = ker.shared((block, block), DType::Float32, TileLayout::Row);
+        let a_reg = ker.acc((block, block), TileLayout::Row);
         let a_smem = warp.load(a_smem, a.clone(), MoveIdx::block((0, 0, 0, tile_col.clone()), 2));
         let a_reg = warp.load(a_reg, a_smem, MoveIdx::default());
         let a_reg = warp.mul_scalar(a_reg, INV_LN2);
@@ -60,8 +61,8 @@ fn build_softmax(ker: &Kernel, n: usize, block: usize) {
     // Pass 2: recompute the (scaled) exponentials and normalize.
     let tile_col = ker.range((n / block) as i64);
     {
-        let a_smem = ker.st((block, block), DType::Float32, TileLayout::Row, ST_16X16);
-        let a_reg = ker.rt((block, block), DType::Float32, TileLayout::Row, RT_16X16);
+        let a_smem = ker.shared((block, block), DType::Float32, TileLayout::Row);
+        let a_reg = ker.acc((block, block), TileLayout::Row);
         let a_smem = warp.load(a_smem, a.clone(), MoveIdx::block((0, 0, 0, tile_col.clone()), 2));
         let a_reg = warp.load(a_reg, a_smem, MoveIdx::default());
         let a_reg = warp.mul_scalar(a_reg, INV_LN2);
@@ -114,7 +115,7 @@ fn test_row_arg_reduce_graph_shape() {
     let build = |caps: ArchCaps| {
         let ker = Kernel::new("argred", [1, 1, 1], caps.wave_size as i64, vec![], caps);
         let warp = ker.warp();
-        let frag = ker.caps.frag(FragRole::Accumulator);
+        let frag = ker.frag(FragRole::Accumulator);
         let src = warp.zero(ker.rt((16, 16), DType::Float32, ROW, frag));
         let val = warp.clear_rv(ker.rv(16, DType::Float32, VecLayout::Ortho, frag), f64::INFINITY);
         let idx = warp.clear_rv(ker.rv(16, DType::Int32, VecLayout::Ortho, frag), -1.0);
@@ -123,7 +124,7 @@ fn test_row_arg_reduce_graph_shape() {
         let (_, idx) = warp.row_arg_reduce(val, idx, &src, ArgDir::Min);
         idx.uop().toposort()
     };
-    for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
+    for caps in [ArchCaps::GFX942, ArchCaps::for_amd(AmdArch::Gfx1151)] {
         let want_customs = 2 * caps.reduce_tree().len();
         let topo = build(caps);
         let customs = topo.iter().filter(|u| matches!(u.op(), Op::Custom(..))).count();
@@ -148,29 +149,27 @@ fn test_row_arg_reduce_graph_shape() {
 }
 
 // =============================================================================
-// Hardware-gated end-to-end softmax on gfx942.
+// Hardware-gated end-to-end softmax (gfx942 wave64, CUDA warp32).
 // =============================================================================
 
-/// Whether the active device is CDNA (wave64). These softmax tests hardcode a
-/// 64-thread launch block + single-warp geometry tuned for wave64, so they skip on
-/// a wave32 (RDNA) device — the reduce itself is arch-blind; only the test's launch
-/// geometry is wave64-specific (a 64-thread block is 2 waves on wave32, racing the
-/// shared output). A wave32 softmax would need an arch-derived block.
-fn is_cdna_device() -> bool {
-    let dev = svod_tensor::Tensor::rand(&[16, 16]).expect("probe tensor").device();
-    crate::target::resolve_arch(&dev).is_some_and(|a| a.is_cdna())
+/// The single-warp softmax runs on a device whose `Row` accumulator map folds
+/// columns per lane row — CDNA (`ds_bpermute` sibling tree) and CUDA (`shfl.bfly`
+/// quad, two row slots per lane); RDNA's even/odd accumulator folds rows, so it
+/// skips. Returns the wave width for the launch block.
+fn softmax_device() -> Option<i64> {
+    super::row_fold_device().map(|caps| caps.wave_size as i64)
 }
 
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib reductions::test_softmax_amd -- --ignored --nocapture`.
+/// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib reductions::test_softmax_gpu -- --ignored --nocapture`.
 #[test]
 #[ignore]
-fn test_softmax_amd() {
+fn test_softmax_gpu() {
     use svod_tensor::Tensor;
 
-    if !is_cdna_device() {
-        eprintln!("skip test_softmax_amd: wave64 launch geometry (CDNA-only)");
+    let Some(w) = softmax_device() else {
+        eprintln!("skip test_softmax_gpu: no CDNA/CUDA device");
         return;
-    }
+    };
     let (n, block) = (64usize, 32usize);
 
     let a = Tensor::rand(&[1, 1, block, n]).expect("rand a");
@@ -178,7 +177,7 @@ fn test_softmax_amd() {
     a.realize().expect("realize a");
     let mut out = Tensor::empty(&[1, 1, block, n], DType::Float32);
 
-    crate::run_kernel("softmax", [1, 1, 1], 64, &mut [&mut out], &[&a], |ker| {
+    crate::run_kernel("softmax", [1, 1, 1], w, &mut [&mut out], &[&a], |ker| {
         build_softmax(ker, n, block);
         ker.finish(1)
     })
@@ -196,27 +195,27 @@ fn test_softmax_amd() {
     assert!(max_abs < 1e-4, "max abs error {max_abs} exceeds f32 softmax tolerance 1e-4");
 }
 
-/// P1 isolation (`SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib reductions::test_softmax_unroll_amd -- --ignored --nocapture`):
+/// P1 isolation (`SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib reductions::test_softmax_unroll_gpu -- --ignored --nocapture`):
 /// the **fully-unrolled** softmax (reduce_u + unrolled map/copy, no mma/db) must
 /// match the reference — isolates the unrolled reduce/elementwise from the FA
 /// double-buffer + mma context. Swept across block sizes so `outer_end` varies
 /// (16 → 1 fragment, 32 → 2).
 #[test]
 #[ignore]
-fn test_softmax_unroll_amd() {
+fn test_softmax_unroll_gpu() {
     use svod_tensor::Tensor;
 
-    if !is_cdna_device() {
-        eprintln!("skip test_softmax_unroll_amd: wave64 launch geometry (CDNA-only)");
+    let Some(w) = softmax_device() else {
+        eprintln!("skip test_softmax_unroll_gpu: no CDNA/CUDA device");
         return;
-    }
+    };
     for (n, block) in [(64usize, 16usize), (64, 32)] {
         let a = Tensor::rand(&[1, 1, block, n]).expect("rand a");
         let mut a = a.cast(DType::Float32).expect("cast a");
         a.realize().expect("realize a");
         let mut out = Tensor::empty(&[1, 1, block, n], DType::Float32);
 
-        crate::run_kernel("softmax_u", [1, 1, 1], 64, &mut [&mut out], &[&a], |ker| {
+        crate::run_kernel("softmax_u", [1, 1, 1], w, &mut [&mut out], &[&a], |ker| {
             ker.set_unroll(true);
             build_softmax(ker, n, block);
             ker.finish(1)
@@ -234,10 +233,11 @@ fn test_softmax_unroll_amd() {
     }
 }
 
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib reductions::test_row_argmin_amd -- --ignored --nocapture`.
+/// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib reductions::test_row_argmin_gpu -- --ignored --nocapture`.
 ///
 /// End-to-end argmin of a known 16×16 matrix into the role-selected accumulator
-/// fragment (arch-portable: wave64 gfx942 or wave32 gfx1151). `row_arg_reduce`
+/// fragment (arch-portable: wave64 gfx942, wave32 gfx1151, warp32 CUDA — where the
+/// quad butterfly completes the fold and each lane keeps two row slots). `row_arg_reduce`
 /// reduces the fragment's `inner`-carrying folded axis — the matrix *column* on the
 /// non-interleave gfx942 frag, the matrix *row* on the wave32 even/odd accumulator
 /// (the caller arranges the tile, exactly like `row_reduce` in FA). To assert one
@@ -248,15 +248,14 @@ fn test_softmax_unroll_amd() {
 /// makes index 0 a **tie** (cols 1 and 6 → must resolve to 1).
 #[test]
 #[ignore]
-fn test_row_argmin_amd() {
+fn test_row_argmin_gpu() {
     use svod_tensor::Tensor;
 
-    let dev = Tensor::rand(&[16, 16]).expect("probe").device();
-    let Some(arch) = crate::target::resolve_arch(&dev) else {
-        eprintln!("skip test_row_argmin_amd: no AMD device");
+    let Some(caps) = super::fragment_device() else {
+        eprintln!("skip test_row_argmin_gpu: no device with tk fragment layouts");
         return;
     };
-    let w = arch.wave_size() as i64;
+    let w = caps.wave_size as i64;
 
     // Symmetric matrix: +1.0 except −1.0 at the involution pairs (2k, 2k+1) and a
     // tie pair (0, 6). Symmetry ⇒ per-row argmin == per-column argmin, so the
@@ -289,7 +288,7 @@ fn test_row_argmin_amd() {
 
     crate::run_kernel("argmin", [1, 1, 1], w, &mut [&mut vout, &mut iout], &[&a], |ker| {
         let warp = ker.warp();
-        let frag = ker.caps.frag(FragRole::Accumulator);
+        let frag = ker.frag(FragRole::Accumulator);
         let vo = ker.gl(&[1, 1, 16, 16], DType::Float32);
         let io = ker.gl(&[1, 1, 16, 16], DType::Int32);
         let ain = ker.gl(&[1, 1, 16, 16], DType::Float32);
@@ -314,5 +313,5 @@ fn test_row_argmin_amd() {
         assert_eq!(gi[k * 16 + k], expect[k], "row/col {k}: argmin index (diagonal)");
         assert!((gv[k * 16 + k] + 1.0).abs() < 1e-6, "row/col {k}: argmin value −1.0, got {}", gv[k * 16 + k]);
     }
-    println!("row_argmin: 16/16 correct on {arch:?} (tie at index 0 → 1)");
+    println!("row_argmin: 16/16 correct on {:?} (tie at index 0 → 1)", caps.arch);
 }

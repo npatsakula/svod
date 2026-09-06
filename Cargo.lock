@@ -723,15 +723,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cudarc"
-version = "0.17.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bf99ab37ee7072d64d906aa2dada9a3422f1d975cdf8c8055a573bc84897ed8"
-dependencies = [
- "libloading",
-]
-
-[[package]]
 name = "darling"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3431,7 +3422,6 @@ name = "svod-device"
 version = "0.1.0-alpha.6"
 dependencies = [
  "bindgen 0.71.1",
- "cudarc",
  "enum_delegate",
  "libc",
  "libloading",
@@ -3589,6 +3579,7 @@ dependencies = [
  "svod-device",
  "svod-dtype",
  "svod-ir",
+ "svod-schedule",
  "tempfile",
  "test-case",
  "tracing",

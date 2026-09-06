@@ -35,7 +35,7 @@ fn build_tile_add(ker: &Kernel) -> Arc<UOp> {
 
     // Ask for the fragment by ROLE, not a hardcoded constant — `caps.frag`
     // resolves it to the arch-correct `16×16` f32 accumulator (wave64 or wave32).
-    let frag = ker.caps.frag(FragRole::Accumulator);
+    let frag = ker.frag(FragRole::Accumulator);
 
     // global -> register, straight into the fragment layout (axis 2 splits the
     // row stride of the `[1, 1, N, N]` view).
@@ -95,12 +95,11 @@ fn test_tile_add_graph_shape() {
 fn test_tile_add_amd() {
     use svod_tensor::Tensor;
 
-    let dev = Tensor::rand(&[16, 16]).expect("probe").device();
-    let Some(arch) = crate::target::resolve_arch(&dev) else {
-        eprintln!("skip test_tile_add_amd: no AMD device");
+    let Some(caps) = super::fragment_device() else {
+        eprintln!("skip test_tile_add_amd: no device with tk fragment layouts");
         return;
     };
-    let w = arch.wave_size() as i64;
+    let w = caps.wave_size as i64;
 
     let a: Vec<f32> = (0..256).map(|i| i as f32).collect();
     let b: Vec<f32> = (0..256).map(|i| (2 * i) as f32).collect();

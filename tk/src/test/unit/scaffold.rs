@@ -3,7 +3,7 @@
 //! gfx942-only golden tests don't cover gfx1151), and `bind_abi` binds outputs
 //! before inputs. The end-to-end graph-identity is covered by the golden digests.
 
-use svod_dtype::{AmdArch, DType, DeviceSpec};
+use svod_dtype::{AmdArch, CudaArch, DType, DeviceSpec, GpuArch};
 use svod_ir::UOp;
 
 use crate::arch::FragRole;
@@ -16,15 +16,34 @@ use crate::{ArchCaps, GlSpec, Kernel};
 #[test]
 fn role_tiles_resolve_arch_fragment() {
     for arch in [AmdArch::Gfx942, AmdArch::Gfx1151] {
-        let caps = ArchCaps::for_arch(arch);
+        let caps = ArchCaps::for_amd(arch);
         let ker = Kernel::new("scaf", [1, 1, 1], 64, vec![], caps);
         let (row, col) = (TileLayout::Row, TileLayout::Col);
-        assert_eq!(ker.acc((16, 16), col).base, caps.frag(FragRole::Accumulator), "{arch:?} acc");
-        assert_eq!(ker.operand((16, 16), DType::BFloat16, row).base, caps.frag(FragRole::Operand), "{arch:?} operand");
-        assert_eq!(ker.acc_t((16, 16), row).base, caps.frag(FragRole::AccumulatorT), "{arch:?} acc_t");
-        assert_eq!(ker.shared((16, 16), DType::BFloat16, row).base, caps.shared_default(), "{arch:?} shared");
-        assert_eq!(ker.shared_sw((16, 16), DType::BFloat16, row).base, caps.shared_swizzled(), "{arch:?} shared_sw");
+        assert_eq!(Some(ker.acc((16, 16), col).base), caps.frag(FragRole::Accumulator), "{arch:?} acc");
+        assert_eq!(
+            Some(ker.operand((16, 16), DType::BFloat16, row).base),
+            caps.frag(FragRole::Operand),
+            "{arch:?} operand"
+        );
+        assert_eq!(Some(ker.acc_t((16, 16), row).base), caps.frag(FragRole::AccumulatorT), "{arch:?} acc_t");
+        assert_eq!(Some(ker.shared((16, 16), DType::BFloat16, row).base), caps.shared_default(), "{arch:?} shared");
+        assert_eq!(
+            Some(ker.shared_sw((16, 16), DType::BFloat16, row).base),
+            caps.shared_swizzled(),
+            "{arch:?} shared_sw"
+        );
     }
+}
+
+/// On an arch without fragment layouts (pre-Ampere CUDA: no f16/bf16 `m16n8k16`)
+/// the role tiles refuse loudly instead of silently building a layout the hardware
+/// does not have.
+#[test]
+#[should_panic(expected = "sm_75: tk defines no Accumulator fragment layout")]
+fn role_tiles_panic_without_fragment_layouts() {
+    let caps = ArchCaps::for_arch(GpuArch::Cuda(CudaArch::from_compute_capability(7, 5)));
+    let ker = Kernel::new("scaf", [1, 1, 1], 32, vec![], caps);
+    let _ = ker.acc((16, 16), TileLayout::Col);
 }
 
 /// `bind_abi` binds outputs first, then inputs, preserving order and shapes — so the

@@ -5,13 +5,6 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
-#[cfg(feature = "cuda")]
-use cudarc::driver::{CudaContext, CudaSlice, UnifiedSlice};
-#[cfg(feature = "cuda")]
-use snafu::ResultExt;
-#[cfg(feature = "cuda")]
-use std::sync::Arc;
-
 use crate::error::*;
 
 /// 64-byte aligned buffer for SIMD operations (covers SSE/AVX/AVX-512).
@@ -93,16 +86,6 @@ pub enum RawBuffer {
         data: memmap2::Mmap,
         size: usize,
     },
-    #[cfg(feature = "cuda")]
-    CudaDevice {
-        data: UnsafeCell<CudaSlice<u8>>,
-        device: Arc<CudaContext>,
-    },
-    #[cfg(feature = "cuda")]
-    CudaUnified {
-        data: UnsafeCell<UnifiedSlice<u8>>,
-        device: Arc<CudaContext>,
-    },
     /// AMD GPU VRAM/GTT buffer allocated via KFD ioctls.
     ///
     /// `gpu_addr` is the GPU virtual address that kernels see in their
@@ -129,6 +112,16 @@ pub enum RawBuffer {
         contents: std::ptr::NonNull<u8>,
         size: usize,
         device: std::sync::Arc<crate::metal::MetalDevice>,
+    },
+    /// CUDA allocation. `device_ptr` is what kernels receive in their kernarg
+    /// slot; `host_ptr` is `Some` for managed and pinned memory (`memory`
+    /// says which), the CPU side of the same allocation.
+    Cuda {
+        device_ptr: u64,
+        host_ptr: Option<std::ptr::NonNull<u8>>,
+        size: usize,
+        memory: crate::cuda::CudaMemory,
+        device: std::sync::Arc<crate::cuda::CudaDevice>,
     },
 }
 
@@ -195,14 +188,6 @@ impl std::fmt::Debug for RawBuffer {
                 f.debug_struct("Cpu").field("cpu_accessible", cpu_accessible).finish_non_exhaustive()
             }
             RawBuffer::Mmap { size, .. } => f.debug_struct("Mmap").field("size", size).finish_non_exhaustive(),
-            #[cfg(feature = "cuda")]
-            RawBuffer::CudaDevice { device, .. } => {
-                f.debug_struct("CudaDevice").field("device", device).finish_non_exhaustive()
-            }
-            #[cfg(feature = "cuda")]
-            RawBuffer::CudaUnified { device, .. } => {
-                f.debug_struct("CudaUnified").field("device", device).finish_non_exhaustive()
-            }
             RawBuffer::AmdDevice { gpu_addr, size, host_ptr, .. } => f
                 .debug_struct("AmdDevice")
                 .field("gpu_addr", gpu_addr)
@@ -212,6 +197,12 @@ impl std::fmt::Debug for RawBuffer {
             RawBuffer::Metal { contents, size, .. } => {
                 f.debug_struct("Metal").field("contents", contents).field("size", size).finish_non_exhaustive()
             }
+            RawBuffer::Cuda { device_ptr, size, memory, .. } => f
+                .debug_struct("Cuda")
+                .field("device_ptr", &format_args!("{device_ptr:#x}"))
+                .field("size", size)
+                .field("memory", memory)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -223,12 +214,9 @@ impl RawBuffer {
         match self {
             RawBuffer::Cpu { data, .. } => unsafe { (&*data.get()).len() },
             RawBuffer::Mmap { size, .. } => *size,
-            #[cfg(feature = "cuda")]
-            RawBuffer::CudaDevice { data, .. } => unsafe { (&*data.get()).len() },
-            #[cfg(feature = "cuda")]
-            RawBuffer::CudaUnified { data, .. } => unsafe { (&*data.get()).len() },
             RawBuffer::AmdDevice { size, .. } => *size,
             RawBuffer::Metal { size, .. } => *size,
+            RawBuffer::Cuda { size, .. } => *size,
         }
     }
 
@@ -237,12 +225,9 @@ impl RawBuffer {
         match self {
             RawBuffer::Cpu { cpu_accessible, .. } => *cpu_accessible,
             RawBuffer::Mmap { .. } => true,
-            #[cfg(feature = "cuda")]
-            RawBuffer::CudaDevice { .. } => false,
-            #[cfg(feature = "cuda")]
-            RawBuffer::CudaUnified { .. } => true,
             RawBuffer::AmdDevice { host_ptr, .. } => host_ptr.is_some(),
             RawBuffer::Metal { .. } => true,
+            RawBuffer::Cuda { host_ptr, .. } => host_ptr.is_some(),
         }
     }
 }
@@ -263,8 +248,8 @@ pub struct BufferSpec {
     /// CPU-accessible mapping.
     ///
     /// CPU allocator: always honored (host memory is always accessible).
-    /// CUDA allocator: false = device-only (cuMemAlloc), true = unified (cuMemAllocManaged).
     /// AMD allocator: adds a host BAR mmap (`host_ptr: Some`).
+    /// Metal allocator: always honored (shared storage mode).
     pub cpu_access: bool,
     /// Host (GTT/userptr) memory rather than device VRAM.
     pub host: bool,
@@ -485,132 +470,6 @@ impl Allocator for DiskAllocator {
     }
 }
 
-/// CUDA allocator using GPU memory.
-#[cfg(feature = "cuda")]
-#[derive(Debug, Clone)]
-pub struct CudaAllocator {
-    device: Arc<CudaContext>,
-    device_id: usize,
-}
-
-#[cfg(feature = "cuda")]
-impl CudaAllocator {
-    pub fn new(device_id: usize) -> Result<Self> {
-        let device = CudaContext::new(device_id).context(CudaSnafu)?;
-        Ok(Self { device, device_id })
-    }
-
-    pub fn device_id(&self) -> usize {
-        self.device_id
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Allocator for CudaAllocator {
-    fn _alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
-        if options.cpu_access {
-            // Allocate unified memory (CPU-accessible)
-            let mut data = unsafe { self.device.alloc_unified::<u8>(size, true) }.context(CudaSnafu)?;
-
-            if zero {
-                self.device.default_stream().memset_zeros(&mut data).context(CudaSnafu)?;
-            }
-
-            Ok(RawBuffer::CudaUnified { data: UnsafeCell::new(data), device: Arc::clone(&self.device) })
-        } else {
-            // Allocate device-only memory (faster GPU access)
-            let stream = self.device.default_stream();
-            let data = if zero { stream.alloc_zeros::<u8>(size) } else { unsafe { stream.alloc::<u8>(size) } }
-                .context(CudaSnafu)?;
-
-            Ok(RawBuffer::CudaDevice { data: UnsafeCell::new(data), device: Arc::clone(&self.device) })
-        }
-    }
-
-    fn _copyin(&self, dest: &RawBuffer, dest_off: usize, src: &[u8]) -> Result<()> {
-        match dest {
-            RawBuffer::CudaDevice { data, device } => {
-                let cuda_data = unsafe { &mut *data.get() };
-                let mut view = cuda_data.slice_mut(dest_off..dest_off + src.len());
-                device.default_stream().memcpy_htod(src, &mut view).context(CudaSnafu)
-            }
-            RawBuffer::CudaUnified { data, .. } => {
-                let unified_data = unsafe { &mut *data.get() };
-                let slice = unified_data.as_mut_slice().context(CudaSnafu)?;
-                slice[dest_off..dest_off + src.len()].copy_from_slice(src);
-                Ok(())
-            }
-            other => unreachable!("CudaAllocator::_copyin on non-CUDA buffer: {other:?}"),
-        }
-    }
-
-    fn _copyout(&self, dest: &mut [u8], src: &RawBuffer, src_off: usize) -> Result<()> {
-        match src {
-            RawBuffer::CudaDevice { data, device } => {
-                device.synchronize().context(CudaSnafu)?;
-                let cuda_data = unsafe { &*data.get() };
-                let view = cuda_data.slice(src_off..src_off + dest.len());
-                device.default_stream().memcpy_dtoh(&view, dest).context(CudaSnafu)
-            }
-            RawBuffer::CudaUnified { data, .. } => {
-                let unified_data = unsafe { &*data.get() };
-                let slice = unified_data.as_slice().context(CudaSnafu)?;
-                dest.copy_from_slice(&slice[src_off..src_off + dest.len()]);
-                Ok(())
-            }
-            other => unreachable!("CudaAllocator::_copyout on non-CUDA buffer: {other:?}"),
-        }
-    }
-
-    fn _transfer(&self, dest: &RawBuffer, dest_off: usize, src: &RawBuffer, src_off: usize, sz: usize) -> Result<()> {
-        let stream = self.device.default_stream();
-        match (dest, src) {
-            (RawBuffer::CudaDevice { data: dst_data, .. }, RawBuffer::CudaDevice { data: src_data, .. }) => {
-                let dst_cuda = unsafe { &mut *dst_data.get() };
-                let src_cuda = unsafe { &*src_data.get() };
-                let mut dst_view = dst_cuda.slice_mut(dest_off..dest_off + sz);
-                let src_view = src_cuda.slice(src_off..src_off + sz);
-                stream.memcpy_dtod(&src_view, &mut dst_view).context(CudaSnafu)
-            }
-            (RawBuffer::CudaUnified { data: dst_data, .. }, RawBuffer::CudaUnified { data: src_data, .. }) => {
-                let dst_unified = unsafe { &mut *dst_data.get() };
-                let src_unified = unsafe { &*src_data.get() };
-                let dst_slice = dst_unified.as_mut_slice().context(CudaSnafu)?;
-                let src_slice = src_unified.as_slice().context(CudaSnafu)?;
-                dst_slice[dest_off..dest_off + sz].copy_from_slice(&src_slice[src_off..src_off + sz]);
-                Ok(())
-            }
-            (RawBuffer::CudaUnified { data: dst_data, .. }, RawBuffer::CudaDevice { data: src_data, .. }) => {
-                let src_cuda = unsafe { &*src_data.get() };
-                let src_view = src_cuda.slice(src_off..src_off + sz);
-                let dst_unified = unsafe { &mut *dst_data.get() };
-                let mut dst_target = dst_unified.slice_mut(dest_off..dest_off + sz);
-                stream.memcpy_dtod(&src_view, &mut dst_target).context(CudaSnafu)
-            }
-            (RawBuffer::CudaDevice { data: dst_data, .. }, RawBuffer::CudaUnified { data: src_data, .. }) => {
-                let dst_cuda = unsafe { &mut *dst_data.get() };
-                let mut dst_view = dst_cuda.slice_mut(dest_off..dest_off + sz);
-                let src_unified = unsafe { &*src_data.get() };
-                let src_source = src_unified.slice(src_off..src_off + sz);
-                stream.memcpy_htod(&src_source, &mut dst_view).context(CudaSnafu)
-            }
-            _ => UnsupportedSnafu { op: "transfer" }.fail(),
-        }
-    }
-
-    fn synchronize(&self) -> Result<()> {
-        self.device.default_stream().synchronize().context(CudaSnafu)
-    }
-
-    fn name(&self) -> &str {
-        "CUDA"
-    }
-
-    fn device_spec(&self) -> svod_dtype::DeviceSpec {
-        svod_dtype::DeviceSpec::Cuda { device_id: self.device_id }
-    }
-}
-
 /// LRU allocator that caches freed buffers for reuse:
 ///
 /// - the cache is keyed on the whole `(size, BufferSpec)`;
@@ -707,16 +566,10 @@ impl LruAllocator {
                 unsafe { std::ptr::write_bytes(contents.as_ptr(), 0, *size) };
                 Ok(true)
             }
-            #[cfg(feature = "cuda")]
-            RawBuffer::CudaDevice { data, device } => {
-                let cuda_data = unsafe { &mut *data.get() };
-                device.default_stream().memset_zeros(cuda_data).context(CudaSnafu)?;
-                Ok(true)
-            }
-            #[cfg(feature = "cuda")]
-            RawBuffer::CudaUnified { data, device } => {
-                let unified_data = unsafe { &mut *data.get() };
-                device.default_stream().memset_zeros(unified_data).context(CudaSnafu)?;
+            // A device-side memset on the copy lane, ordered after the
+            // storage's in-flight producers; works for every CUDA memory kind.
+            RawBuffer::Cuda { device_ptr, size, device, .. } => {
+                device.zero(*device_ptr, (*size).max(1))?;
                 Ok(true)
             }
         }
@@ -757,9 +610,12 @@ impl Allocator for LruAllocator {
             // in-flight kernels (`free` never drains). Fence on the storage's
             // recorded producers before handing it out — nearly free once
             // everything has retired.
-            if let RawBuffer::AmdDevice { gpu_addr, device, .. } = &buffer
-                && let Err(error) = device.core().wait_storage(*gpu_addr)
-            {
+            let fenced = match &buffer {
+                RawBuffer::AmdDevice { gpu_addr, device, .. } => device.core().wait_storage(*gpu_addr),
+                RawBuffer::Cuda { device_ptr, device, .. } => device.wait_storage(*device_ptr),
+                _ => Ok(()),
+            };
+            if let Err(error) = fenced {
                 self.inner.free(buffer, size, options);
                 return Err(error);
             }

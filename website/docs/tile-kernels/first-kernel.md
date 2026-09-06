@@ -45,9 +45,9 @@ let ta = Tensor::from_slice(&a);
 let tb = Tensor::from_slice(&b);
 let mut out = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
 
-// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA.
-let arch = svod_tk::target::resolve_arch(&ta.device()).expect("an AMD device");
-let w = arch.wave_size() as i64;
+// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA and CUDA.
+let arch = svod_tk::target::resolve_arch(&ta.device()).expect("a GPU device");
+let w = svod_tk::ArchCaps::for_arch(arch).wave_size as i64;
 
 run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| {
     let warp = ker.warp();
@@ -96,7 +96,7 @@ run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| { /* bo
 The `[1, 1, 1]` grid and `w` block are the launch geometry. We use **one workgroup of one wave**:
 the whole `16×16` tile fits in a single wave's registers, so there is nothing to spread across
 blocks. The block size is `w`, the **wave width** — which we queried from the device up front
-(`resolve_arch(&ta.device()).wave_size()`), because a wave is 64 lanes on CDNA but 32 on RDNA and
+(`ArchCaps::for_arch(resolve_arch(&ta.device())).wave_size`), because a wave is 64 lanes on CDNA but 32 on RDNA and
 the block dimension *is* that lane count. The output slice comes first, the inputs second — and
 **that order is the contract** the next step depends on.
 

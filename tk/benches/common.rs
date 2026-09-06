@@ -5,8 +5,9 @@
 //! (it wraps the per-kernel device-time path; the criterion `iter_custom` source), so
 //! outlier rejection / CIs operate on real on-device time, not host wall-clock.
 //!
-//! Run one kernel: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench knn`
-//! GPU benches self-skip (record no samples) when no supported AMD GPU is present.
+//! Run one kernel: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench knn` (or
+//! `SVOD_DEVICE=CUDA:0` for a kernel whose `ArchSet` includes CUDA). GPU benches
+//! self-skip (record no samples) when no supported GPU is present.
 
 use std::hint::black_box;
 use std::path::Path;
@@ -27,11 +28,11 @@ pub fn randn_bf16(shape: &[usize]) -> Tensor {
     t
 }
 
-/// Whether the env-selected device is a supported AMD GPU with the AMD-LLVM toolchain
-/// (`check_target`), so HW dispatch stamps are available. `cargo bench` has no
-/// `#[ignore]`, so a bench self-skips cleanly here instead of recording garbage (or
-/// panicking) on CPU.
-pub fn requirements_met(archs: &'static [svod_dtype::AmdArch]) -> bool {
+/// Whether the env-selected device is in the kernel's `archs` with its LLVM GPU
+/// backend present (`check_target`), so HW dispatch stamps are available. `cargo
+/// bench` has no `#[ignore]`, so a bench self-skips cleanly here instead of
+/// recording garbage (or panicking) on CPU.
+pub fn requirements_met(archs: svod_tk::ArchSet) -> bool {
     let spec = Tensor::empty(&[1], DType::Float32).device(); // the env/default device
     svod_tk::target::check_target(&spec, archs).is_ok()
 }

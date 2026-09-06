@@ -20,7 +20,7 @@ use svod_ir::UOp;
 use crate::arch::FragRole;
 use crate::kernel::Kernel;
 use crate::tile::{GL, RT, RV, ST};
-use crate::tiles::{RT_16X16, TileLayout, VecLayout};
+use crate::tiles::{RTBaseShape, STBaseShape, TileLayout, VecLayout};
 
 /// A global-buffer binding spec for [`Kernel::bind_abi`] (logical shape + element
 /// dtype). The concrete buffer's dtype governs; `dtype` carries the author's intent.
@@ -64,36 +64,78 @@ impl Kernel {
         self.block_idx[2].clone()
     }
 
+    /// The arch's physical fragment for `role` ([`crate::ArchCaps::frag`]) for a
+    /// kernel that requires a matrix-core layout.
+    ///
+    /// # Panics
+    /// Panics when tk defines no matrix-core fragment layouts for the arch (Metal,
+    /// pre-Ampere CUDA) — an authoring error: such kernels must gate on an
+    /// [`crate::ArchSet`] that excludes those arches.
+    pub fn frag(&self, role: FragRole) -> RTBaseShape {
+        self.caps.frag(role).unwrap_or_else(|| self.no_layout(&format!("{role:?} fragment")))
+    }
+    fn no_layout<T>(&self, what: &str) -> T {
+        panic!(
+            "{}: tk defines no {what} layout for this arch (matrix-core kernels need AMD or CUDA sm_80+)",
+            self.caps.arch.target_name()
+        )
+    }
+
     /// An f32 accumulator register tile ([`FragRole::Accumulator`]), arch-resolved.
+    ///
+    /// # Panics
+    /// Panics when the arch has no fragment layouts (see [`Kernel::frag`]).
     pub fn acc(&self, dims: (usize, usize), layout: TileLayout) -> RT<'_> {
-        self.rt(dims, DType::Float32, layout, self.caps.frag(FragRole::Accumulator))
+        self.rt(dims, DType::Float32, layout, self.frag(FragRole::Accumulator))
     }
     /// An f32 **transposed** accumulator ([`FragRole::AccumulatorT`]) — the layout for
     /// an N-major store (e.g. the FA output `O[q,d]` from the `[d,q]` PV accumulator).
+    ///
+    /// # Panics
+    /// Panics when the arch has no fragment layouts (see [`Kernel::frag`]).
     pub fn acc_t(&self, dims: (usize, usize), layout: TileLayout) -> RT<'_> {
-        self.rt(dims, DType::Float32, layout, self.caps.frag(FragRole::AccumulatorT))
+        self.rt(dims, DType::Float32, layout, self.frag(FragRole::AccumulatorT))
     }
     /// A WMMA input-operand register tile ([`FragRole::Operand`]) of dtype `dt`.
+    ///
+    /// # Panics
+    /// Panics when the arch has no fragment layouts (see [`Kernel::frag`]).
     pub fn operand(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> RT<'_> {
-        self.rt(dims, dt, layout, self.caps.frag(FragRole::Operand))
+        self.rt(dims, dt, layout, self.frag(FragRole::Operand))
     }
-    /// An f32 ortho register-vector — the softmax/reduce accumulator vectors. Uses
-    /// [`RT_16X16`] on both arches (the vectors are not arch-fragment-resolved today).
+    /// An f32 ortho register-vector — the softmax/reduce accumulator vectors, sized
+    /// by the accumulator fragment's per-lane slots ([`FragRole::Accumulator`]).
+    ///
+    /// # Panics
+    /// Panics when the arch has no fragment layouts (see [`Kernel::frag`]).
     pub fn acc_vec(&self, length: usize) -> RV<'_> {
-        self.rv(length, DType::Float32, VecLayout::Ortho, RT_16X16)
+        self.rv(length, DType::Float32, VecLayout::Ortho, self.frag(FragRole::Accumulator))
     }
     /// A shared (LDS) tile with the arch's canonical strip ([`crate::ArchCaps::shared_default`]).
+    ///
+    /// # Panics
+    /// Panics when the arch has no fragment layouts (see [`Kernel::frag`]).
     pub fn shared(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST {
-        self.st(dims, dt, layout, self.caps.shared_default())
+        self.st(dims, dt, layout, self.shared_strip(false))
     }
     /// A 2×-size double-buffered shared tile with the canonical strip.
+    ///
+    /// # Panics
+    /// Panics when the arch has no fragment layouts (see [`Kernel::frag`]).
     pub fn shared_db(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST {
-        self.st_db(dims, dt, layout, self.caps.shared_default())
+        self.st_db(dims, dt, layout, self.shared_strip(false))
     }
     /// A shared (LDS) tile with the XOR-swizzled strip ([`crate::ArchCaps::shared_swizzled`]),
     /// for kernels that swizzle to avoid LDS bank conflicts (the matmul A/B strips).
+    ///
+    /// # Panics
+    /// Panics when the arch has no fragment layouts (see [`Kernel::frag`]).
     pub fn shared_sw(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST {
-        self.st(dims, dt, layout, self.caps.shared_swizzled())
+        self.st(dims, dt, layout, self.shared_strip(true))
+    }
+    fn shared_strip(&self, swizzled: bool) -> STBaseShape {
+        let strip = if swizzled { self.caps.shared_swizzled() } else { self.caps.shared_default() };
+        strip.unwrap_or_else(|| self.no_layout("shared strip"))
     }
 
     /// Build-time divisibility check with a uniform message (emits no UOps, so it is

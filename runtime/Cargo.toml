@@ -14,6 +14,7 @@ svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.6" }
 svod-device = { path = "../device", version = "=0.1.0-alpha.6" }
 svod-ir = { path = "../ir", version = "=0.1.0-alpha.6" }
 svod-codegen = { path = "../codegen", version = "=0.1.0-alpha.6" }
+svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.6" }
 snafu = "0.8.9"
 parking_lot = "0.12"
 once_cell = "1.21"
@@ -41,6 +42,5 @@ tempfile = "3"
 [features]
 default = []
 dlopen-fallback = ["dep:tempfile"]
-cuda = ["svod-device/cuda"]
 # Enable trace-level spans in hot paths (compile-time control)
 tracing-verbose = []

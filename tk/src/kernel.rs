@@ -60,14 +60,15 @@ impl Kernel {
     /// In a debug build, panics if the arch wave size is neither 32 nor 64 — tk
     /// only has fragment-layout tables for wave32/wave64.
     pub fn new(name: impl Into<String>, grid: [i64; 3], block: i64, buffers: Vec<Arc<UOp>>, caps: ArchCaps) -> Self {
-        // tk has fragment-layout tables for wave64 (gfx942 CDNA, all kernels) and
-        // wave32 (gfx11 RDNA — matmul; FA stays wave64-only until Stage 2). Any
-        // other wave size has no tables: gate it loudly (such an arch is also
-        // absent from FA_/MATMUL_SUPPORTED_ARCHS and falls back before here).
+        // tk's lane math (reduce tree, sibling folds) is calibrated for wave64
+        // (gfx942 CDNA) and wave32 (gfx11 RDNA, CUDA). Any other wave size is
+        // gated loudly (such an arch is also absent from every kernel's `ArchSet`
+        // and falls back before here).
         debug_assert!(
             matches!(caps.wave_size, 32 | 64),
-            "tk supports wave32/wave64 fragment layouts; got wave{}",
-            caps.wave_size
+            "tk supports wave32/wave64 lane layouts; got wave{} ({:?})",
+            caps.wave_size,
+            caps.arch
         );
         let globals = buffers.iter().enumerate().map(|(slot, buf)| flat_param(slot, buf)).collect();
         let block_idx = [

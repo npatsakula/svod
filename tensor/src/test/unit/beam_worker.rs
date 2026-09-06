@@ -104,3 +104,47 @@ fn worker_misorder_is_a_distinguishable_variant() {
     assert!(matches!(misorder, BeamWorker::WorkerMisorder { got: 3, expected: Some(1) }));
     assert!(misorder.to_string().contains("expected Some(1)"), "{misorder}");
 }
+
+fn cuda_worker_init(gpu_arch: Option<GpuArch>, compiler_key: &str) -> WorkerInit {
+    WorkerInit {
+        protocol_version: BEAM_WORKER_PROTOCOL_VERSION,
+        graph: svod_ir::OptimizerWireGraph::from_root(&svod_ir::UOp::sink(vec![])).unwrap(),
+        device: DeviceSpec::Cuda { device_id: 0 },
+        gpu_arch,
+        compiler_key: compiler_key.to_string(),
+        renderer_fingerprint: 0,
+        base_opt_count: 0,
+        beam: BeamConfig::default(),
+        transcendental: 0,
+        disable_fast_idiv: false,
+        log_surpass: false,
+    }
+}
+
+/// The CUDA arm needs the compute capability on the wire: without it the
+/// helper reports itself unavailable instead of guessing an arch.
+#[test]
+fn cuda_worker_without_an_arch_is_unavailable() {
+    let Err(error) = worker_codegen(&cuda_worker_init(None, "nvptx-clang:none")) else { panic!("no arch on the wire") };
+    assert!(
+        matches!(&error, BeamWorker::HelperUnavailable { reason } if reason.contains("target architecture")),
+        "{error}"
+    );
+}
+
+/// A clean worker rebuilds the parent's compiler from the wire arch alone, so
+/// it fills the parent's object-cache slot and optimizes with the parent's
+/// profile.
+#[test]
+fn cuda_worker_codegen_reproduces_the_parent_identity() {
+    let Some(arch) = crate::config::cuda_test_arch() else {
+        eprintln!("skipped: no CUDA device");
+        return;
+    };
+    let (parent_renderer, parent) = svod_runtime::create_cuda_codegen(0, arch).unwrap();
+    let codegen = worker_codegen(&cuda_worker_init(Some(GpuArch::Cuda(arch)), parent.cache_key())).unwrap();
+    assert_eq!(codegen.compiler.cache_key(), parent.cache_key());
+    let parent_profile =
+        svod_schedule::OptimizerRenderer::for_cuda_arch(arch).with_codegen_renderer(parent_renderer.as_ref());
+    assert_eq!(codegen.optimizer_renderer.cache_fingerprint(), parent_profile.cache_fingerprint());
+}

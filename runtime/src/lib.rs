@@ -24,6 +24,7 @@
 pub mod amd;
 pub mod benchmark;
 pub mod clang;
+pub mod cuda;
 pub mod custom_function;
 pub mod device_registry;
 pub mod devices;
@@ -50,7 +51,8 @@ pub use devices::{
         CpuBackend, cpu_device_with_backend, create_cpu_codegen, create_cpu_device, create_cpu_device_with_backend,
         ensure_thread_pool,
     },
-    create_amd_codegen, create_metal_codegen, create_metal_device,
+    create_amd_codegen, create_cuda_codegen, create_cuda_device, create_cuda_program, create_metal_codegen,
+    create_metal_device,
 };
 pub use error::*;
 pub use execution_plan::{

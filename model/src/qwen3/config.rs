@@ -2,7 +2,7 @@
 //!
 //! Mirrors the published schema of `Qwen/Qwen3-Embedding-0.6B`. The clean
 //! [`Qwen3Config`] keeps only the fields the Rust backbone consumes and adds
-//! a caller-chosen compute [`DType`] (defaults to bf16 on the AMD target,
+//! a caller-chosen compute [`DType`] (defaults to [`crate::default_compute_dtype`];
 //! f32 for CPU parity tests).
 //!
 //! Key detail: `head_dim` is **explicit** and may differ from
@@ -77,7 +77,7 @@ pub fn qwen3_embedding_0_6b() -> Qwen3Config {
         attention_bias: false,
         tie_word_embeddings: true,
         pad_token_id: 151_643,
-        dtype: DType::BFloat16,
+        dtype: crate::default_compute_dtype(),
         max_batch_size: 1,
     }
 }

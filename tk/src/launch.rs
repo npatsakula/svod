@@ -23,10 +23,12 @@ use snafu::{IntoError, OptionExt, ResultExt, Snafu};
 use svod_codegen::program_pipeline::{self, ProgramTarget};
 use svod_device::Buffer;
 use svod_device::device::{Device, Program, ProgramSpec};
-use svod_dtype::{AmdArch, DType, DeviceSpec};
+use svod_dtype::{DType, DeviceSpec, GpuArch};
 use svod_ir::UOp;
 use svod_ir::ops;
 use svod_tensor::Tensor;
+
+use crate::target::ArchSet;
 
 /// Result type for the launch path.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -126,16 +128,14 @@ pub enum Error {
         source: Box<svod_tensor::error::Error>,
     },
 
-    /// The resolved device's GPU arch isn't in the kernel's supported set (the tile
-    /// kernels target gfx942/CDNA3 and gfx1151/RDNA3.5).
-    #[snafu(display("unsupported target: kernel supports {supported:?}, device {spec:?} resolved to {resolved:?}"))]
-    UnsupportedArch { supported: &'static [AmdArch], spec: DeviceSpec, resolved: Option<AmdArch> },
+    /// The resolved device's GPU arch isn't in the kernel's supported [`ArchSet`].
+    #[snafu(display("unsupported target: kernel supports {supported}, device {spec:?} resolved to {resolved:?}"))]
+    UnsupportedArch { supported: ArchSet, spec: DeviceSpec, resolved: Option<GpuArch> },
 
-    /// The AMD LLVM (clang amdgcn) toolchain needed to compile tile kernels is absent.
-    #[snafu(display(
-        "AMD LLVM target unavailable — clang with the amdgcn backend is required (install ROCm/LLVM clang)"
-    ))]
-    ToolchainUnavailable,
+    /// The LLVM GPU backend (`amdgcn` / `nvptx64`) needed to compile tile kernels
+    /// for the resolved arch is absent from the host `clang`.
+    #[snafu(display("LLVM {target} target unavailable — a clang built with the {target} backend is required"))]
+    ToolchainUnavailable { target: &'static str },
 
     /// Casting an input to the kernel's bf16 operand dtype failed.
     #[snafu(display("cast matmul operand: {source}"))]
@@ -322,7 +322,12 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
     svod_runtime::ensure_thread_pool(svod_schedule::thread_budget());
     let optimizer_renderer = match device.device {
         DeviceSpec::Cpu => svod_schedule::OptimizerRenderer::cpu(),
-        DeviceSpec::Cuda { .. } => svod_schedule::OptimizerRenderer::cuda(),
+        DeviceSpec::Cuda { .. } => device
+            .renderer
+            .gpu_arch()
+            .and_then(svod_dtype::GpuArch::cuda)
+            .map(svod_schedule::OptimizerRenderer::for_cuda_arch)
+            .unwrap_or_else(svod_schedule::OptimizerRenderer::cuda),
         DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
         DeviceSpec::Amd { .. } => device
             .renderer
@@ -410,7 +415,7 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
 /// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
 /// let mut c = Tensor::empty(&[n, n], DType::Float32);
 /// let cfg = GFX1151_CFG;
-/// let block = cfg.threads(ArchCaps::for_arch(AmdArch::Gfx1151).wave_size);
+/// let block = cfg.threads(ArchCaps::for_amd(AmdArch::Gfx1151).wave_size);
 /// run_kernel("matmul", cfg.grid_dims(n), block, &mut [&mut c], &[&a, &b],
 ///     move |ker| { build_matmul_cfg(ker, n, cfg); ker.finish(cfg.n_accum) }).unwrap();
 /// // `c` now holds A·B; inspect it with `c.as_vec::<f32>()`.
@@ -459,7 +464,7 @@ where
 /// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
 /// let out = Tensor::empty(&[n, n], DType::Float32);
 /// let cfg = GFX1151_CFG;
-/// let caps = ArchCaps::for_arch(AmdArch::Gfx1151);
+/// let caps = ArchCaps::for_amd(AmdArch::Gfx1151);
 /// // Wrap the hand-built SINK as a lazy graph node — composes + `prepare()`s like
 /// // any tensor op (`build_matmul_cfg` is the worked kernel body).
 /// let mut c = graph_launch("matmul", cfg.grid_dims(n), cfg.threads(caps.wave_size),
@@ -543,14 +548,14 @@ where
 /// so the arch / `None` / `Err` / `Some` decision lives in one place instead of
 /// being re-threaded per kernel:
 ///
-/// - `Ok(None)` — *doesn't apply here:* `device` isn't one of `archs` (with the AMD
-///   toolchain), **or** `applies` is false (a runtime property — e.g. a sequence
+/// - `Ok(None)` — *doesn't apply here:* `device` isn't in `archs` (with its LLVM
+///   backend), **or** `applies` is false (a runtime property — e.g. a sequence
 ///   length that doesn't tile). The caller substitutes its own path.
 /// - `Err` — `validate` rejected the request (a FIXED shape/dtype property is wrong —
 ///   a caller bug), or `build` failed.
 /// - `Ok(Some(out))` — the kernel ran, yielding the lazy output [`Tensor`].
 ///
-/// `validate`, `applies`, and `build` receive the resolved [`AmdArch`] for
+/// `validate`, `applies`, and `build` receive the resolved [`GpuArch`] for
 /// arch-specific constraints / configs; `applies` is a predicate (kept out of
 /// `validate` because failing it is a fallback trigger, not an error) — taking
 /// the arch lets arch-dependent fit rules (e.g. a head dim the wave size must
@@ -558,10 +563,10 @@ where
 /// Shared by [`crate::matmul`] and [`crate::flash_attention_with`].
 pub fn launch_custom(
     device: &DeviceSpec,
-    archs: &'static [AmdArch],
-    validate: impl FnOnce(AmdArch) -> Result<()>,
-    applies: impl FnOnce(AmdArch) -> bool,
-    build: impl FnOnce(AmdArch) -> Result<Tensor>,
+    archs: ArchSet,
+    validate: impl FnOnce(GpuArch) -> Result<()>,
+    applies: impl FnOnce(GpuArch) -> bool,
+    build: impl FnOnce(GpuArch) -> Result<Tensor>,
 ) -> Result<Option<Tensor>> {
     // "Can this device run the kernel at all?" — wrong arch / missing toolchain is
     // environmental, so `None` (the caller's fallback), never an error.
@@ -597,7 +602,7 @@ pub fn launch_custom(
 /// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
 /// let mut c = Tensor::empty(&[n, n], DType::Float32);
 /// let cfg = GFX1151_CFG;
-/// let block = cfg.threads(ArchCaps::for_arch(AmdArch::Gfx1151).wave_size);
+/// let block = cfg.threads(ArchCaps::for_amd(AmdArch::Gfx1151).wave_size);
 /// // Render + compile ONCE …
 /// let compiled = compile_kernel("matmul", cfg.grid_dims(n), block, &mut [&mut c], &[&a, &b],
 ///     move |ker| { build_matmul_cfg(ker, n, cfg); ker.finish(cfg.n_accum) }).unwrap();
@@ -650,8 +655,8 @@ where
         .device(&device_spec, svod_device::registry::registry())
         .context(DeviceFactorySnafu { spec: format!("{device_spec:?}") })?;
 
-    // Caps from the realized buffers' arch (gfx942 in practice); a non-AMD/host
-    // render target falls back to gfx942 so the WMMA descriptor still resolves.
+    // Caps from the realized buffers' arch; a host render target falls back to
+    // gfx942 so the WMMA descriptor still resolves.
     let caps =
         crate::target::resolve_arch(&device_spec).map(crate::ArchCaps::for_arch).unwrap_or(crate::ArchCaps::GFX942);
     let ker = crate::Kernel::new(name, grid, block, buf_uops, caps);

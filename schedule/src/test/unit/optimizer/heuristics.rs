@@ -6,7 +6,8 @@ use test_case::test_case;
 
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
 use crate::optimizer::heuristics::{
-    apply_default_upcast, apply_heuristic_upcasts, apply_image_upcasts, apply_matvec_fast_path, try_tensor_cores,
+    apply_default_upcast, apply_heuristic_upcasts, apply_image_upcasts, apply_local_dims, apply_matvec_fast_path,
+    apply_threading, try_tensor_cores,
 };
 use crate::optimizer::{Opt, OptOps, Renderer, Scheduler};
 use crate::test::helpers::{create_matmul_pattern_with, create_typed_matmul_pattern};
@@ -15,7 +16,12 @@ use svod_ir::ops;
 /// Matvec-shaped `sum_k A[k] * B[k]` over `stored` buffers; with `wide`, both
 /// loads are cast to it before the product.
 fn create_matvec_like_pattern(rows: i64, cols: i64, stored: DType, wide: Option<DType>) -> Arc<UOp> {
-    let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
+    create_row_reduce_pattern(AxisType::Global, rows, cols, stored, wide)
+}
+
+/// [`create_matvec_like_pattern`] with the row axis of `row_axis` type.
+fn create_row_reduce_pattern(row_axis: AxisType, rows: i64, cols: i64, stored: DType, wide: Option<DType>) -> Arc<UOp> {
+    let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), row_axis);
     let reduce = UOp::range_axis(UOp::index_const(cols), AxisId::Renumbered(1), AxisType::Reduce);
 
     let idx_expr = row.try_add(&reduce).expect("index add should succeed");
@@ -220,5 +226,81 @@ fn heuristic_upcasts_rank_by_strides(axes: usize, size: i64, stride0: bool, expe
 
     assert_eq!(apply_heuristic_upcasts(&mut scheduler), !expected.is_empty());
     let expected: Vec<Opt> = expected.iter().map(|&(axis, amount)| Opt::upcast(axis, amount)).collect();
+    assert_eq!(scheduler.applied_opts, expected);
+}
+
+/// Elementwise SINK over `shape` axes of `axis_type`, loading one row-major
+/// buffer, so every axis is a LOCAL/THREAD candidate without a broadcast.
+fn create_elementwise_pattern(shape: &[i64], axis_type: AxisType) -> Arc<UOp> {
+    let ranges: Vec<Arc<UOp>> = shape
+        .iter()
+        .enumerate()
+        .map(|(i, &size)| UOp::range_axis(UOp::index_const(size), AxisId::Renumbered(i), axis_type))
+        .collect();
+    let mut stride = 1i64;
+    let mut idx = UOp::index_const(0);
+    for (rng, &size) in ranges.iter().zip(shape).rev() {
+        idx = idx.try_add(&rng.try_mul(&UOp::index_const(stride)).expect("index mul")).expect("index add");
+        stride *= size;
+    }
+    let buf = UOp::new_buffer(DeviceSpec::Cpu, stride as usize, DType::Float32);
+    let val = UOp::index().buffer(buf).indices(vec![idx]).call().expect("index should build");
+    let doubled = val.try_add(&val).expect("add should succeed");
+    UOp::sink(std::iter::once(doubled).chain(ranges).collect())
+}
+
+/// A global axis none of the standard LOCAL sizes divides gets the largest
+/// divisor within the budget when that fills the warps better, and is
+/// padded to a real block size otherwise; divisible axes are unchanged.
+#[test_case(51865, &[Opt::padto(0, 32), Opt::local(0, 32)]; "whisper vocabulary pads seven elements to 32")]
+#[test_case(10007, &[Opt::padto(0, 32), Opt::local(0, 32)]; "prime extent pads to 32")]
+#[test_case(385, &[Opt::local(0, 77)]; "5·7·11 keeps its exact divisor 77")]
+#[test_case(12, &[Opt::local(0, 4)]; "candidate list still wins for 12")]
+#[test_case(96, &[Opt::local(0, 32)]; "candidate list still wins for 96")]
+#[test_case(1024, &[Opt::local(0, 32)]; "candidate list still wins for 1024")]
+#[test_case(25, &[Opt::local(0, 25)]; "tie keeps the exact divisor")]
+fn local_dims_fall_back_for_undividable_axes(size: i64, expected: &[Opt]) {
+    let mut scheduler = Scheduler::new(create_elementwise_pattern(&[size], AxisType::Global), Renderer::cuda());
+
+    assert!(apply_local_dims(&mut scheduler, &HeuristicsConfig::builder().build()));
+    assert_eq!(scheduler.applied_opts, expected);
+}
+
+/// The decoder logits shape `[2, 51865]`: the vocabulary axis is padded and
+/// localized, and the row axis still folds into the same block.
+#[test]
+fn local_dims_pad_the_vocabulary_axis_beside_the_row_local() {
+    let mut scheduler = Scheduler::new(create_elementwise_pattern(&[2, 51865], AxisType::Global), Renderer::cuda());
+
+    assert!(apply_local_dims(&mut scheduler, &HeuristicsConfig::builder().build()));
+    // LOCAL 2 consumes axis 0 entirely, so the vocabulary axis becomes axis 0.
+    assert_eq!(scheduler.applied_opts, vec![Opt::local(0, 2), Opt::padto(0, 32), Opt::local(0, 32)]);
+    assert_eq!(scheduler.full_shape(), vec![1621, 2, 32]);
+}
+
+/// The matvec fast path pads a row axis the row tile does not divide when
+/// the padding is cheap, and declines when it is not.
+#[test_case(64, Some(&[Opt::group(0, 8), Opt::local(0, 4), Opt::upcast(0, 4)][..]); "divisible rows are unchanged")]
+#[test_case(51865, Some(&[Opt::padto(0, 16), Opt::group(0, 8), Opt::local(0, 4), Opt::upcast(0, 4)][..]); "vocabulary rows pad to the tile")]
+#[test_case(17, None; "padding almost doubling the rows is declined")]
+fn matvec_fast_path_pads_the_row_axis(rows: i64, expected: Option<&[Opt]>) {
+    let sink = create_matvec_like_pattern(rows, 128, DType::Float32, None);
+    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
+
+    assert_eq!(apply_matvec_fast_path(&mut scheduler, &HeuristicsConfig::builder().build()), expected.is_some());
+    assert_eq!(scheduler.applied_opts, expected.unwrap_or_default());
+}
+
+/// CPU threading pads a loop axis no thread count divides (otherwise it runs
+/// on one core); an axis some count divides keeps that count.
+#[test_case(10007, 512, &[Opt::padto(0, 32), Opt::thread(0, 32)]; "prime rows pad to 32 threads")]
+#[test_case(51865, 512, &[Opt::thread(0, 5)]; "a dividing count is still preferred")]
+#[test_case(96, 65536, &[Opt::thread(0, 32)]; "divisible rows are unchanged")]
+#[test_case(10007, 4, &[]; "too little work stays single threaded")]
+fn threading_pads_undividable_loop_axes(rows: i64, cols: i64, expected: &[Opt]) {
+    let sink = create_row_reduce_pattern(AxisType::Weak, rows, cols, DType::Float32, None);
+    let mut scheduler = Scheduler::new(sink, Renderer::cpu());
+
+    assert_eq!(apply_threading(&mut scheduler, 32), !expected.is_empty());
     assert_eq!(scheduler.applied_opts, expected);
 }

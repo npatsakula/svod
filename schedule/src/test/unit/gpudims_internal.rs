@@ -72,6 +72,56 @@ fn global_special_extents(renderer: &Renderer, global_extents: &[i64], local_ext
     ends
 }
 
+/// The `lidx*` SPECIAL extents `add_gpudims` emits for a WARP axis of
+/// `warp` threads plus `locals`, with `warp_axis` deciding where the warp
+/// range sits in axis-id order.
+fn local_special_extents(warp: i64, locals: &[i64], warp_axis: usize) -> Vec<(String, usize)> {
+    let mut ranges: Vec<Arc<UOp>> = locals
+        .iter()
+        .enumerate()
+        .map(|(i, &extent)| {
+            let axis = svod_ir::AxisId::Renumbered(if i < warp_axis { i } else { i + 1 });
+            UOp::range_axis(UOp::index_const(extent), axis, AxisType::Local)
+        })
+        .collect();
+    let warp_range = UOp::range_axis(UOp::index_const(warp), svod_ir::AxisId::Renumbered(warp_axis), AxisType::Warp);
+    ranges.push(warp_range.clone());
+    let sink = UOp::sink(ranges);
+    let lowered =
+        add_gpudims(&mut GpuDimsContext::from(Renderer::cuda_sm80(false)), &sink).expect("GPU ranges should lower");
+    // The warp range must lower to a bare `lidx0` SPECIAL: any div/mod on it
+    // means another local was folded into the warp's thread dimension.
+    let Op::Sink(ops::Sink { sources, .. }) = lowered.op() else { panic!("sink") };
+    let warp_idx = &sources[locals.len()];
+    assert!(
+        matches!(warp_idx.op(), Op::Special(ops::Special { name, .. }) if name == "lidx0"),
+        "warp axis must be lidx0 itself, got {}",
+        warp_idx.tree()
+    );
+    let mut ends: Vec<(String, usize)> = lowered
+        .toposort()
+        .into_iter()
+        .filter_map(|uop| match uop.op() {
+            Op::Special(ops::Special { end, name }) if name.starts_with("lidx") => Some((name.clone(), dim_max(end))),
+            _ => None,
+        })
+        .collect();
+    ends.sort();
+    ends.dedup();
+    ends
+}
+
+/// A tensor-core WARP axis plus three size-2 LOCALs is four local dims for
+/// CUDA's three: the extra local must fold into `lidx1`/`lidx2`, never into
+/// the warp's `tid.x` (a BEAM plan `TC, ..., LOCAL, LOCAL, LOCAL` once put a
+/// local in the low bit of `tid.x` and scrambled every `mma.sync` lane).
+#[test_case(0; "warp numbered first")]
+#[test_case(3; "warp numbered last")]
+fn warp_axis_keeps_tid_x_to_itself(warp_axis: usize) {
+    let ends = local_special_extents(32, &[2, 2, 2], warp_axis);
+    assert_eq!(ends, [("lidx0".to_string(), 32), ("lidx1".to_string(), 4), ("lidx2".to_string(), 2)]);
+}
+
 #[test_case(&[8], &[4, 1 << 28]; "one local axis divides the work item cap")]
 #[test_case(&[0], &[1 << 30]; "zero extent local axis does not divide by zero")]
 #[test_case(&[64, 64, 64, 4], &[32, 1 << 25]; "contracted locals still cap the grid")]

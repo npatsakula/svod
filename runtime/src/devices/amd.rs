@@ -147,13 +147,7 @@ impl Renderer for AmdRendererWrapper {
         let renderer = LlvmTextRenderer::amd(self.arch);
         let rendered = svod_codegen::Renderer::render(&renderer, ast, name.or(Some("kernel")))
             .map_err(|e| svod_device::Error::Runtime { message: format!("AMD IR rendering failed: {e}") })?;
-        let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
-        spec.set_var_names(rendered.var_names.clone());
-        spec.abi = rendered.abi.clone();
-        if spec.buf_count == 0 {
-            spec.buf_count = rendered.buffer_args.len();
-        }
-        Ok(spec)
+        Ok(super::program_spec(&rendered, &self.device, ast))
     }
 
     fn device(&self) -> &DeviceSpec {

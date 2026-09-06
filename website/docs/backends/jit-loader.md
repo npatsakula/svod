@@ -8,7 +8,7 @@ Most ML compilers either link an entire LLVM toolchain into the binary — addin
 
 When a kernel needs to execute, Svod pipes the generated source through `clang` on stdin, receives a relocatable ELF object on stdout, parses it in-process, copies the machine code into an anonymous memory mapping, applies relocations, flips the page permissions to executable, and calls the function pointer directly. The whole process happens in memory — no temp files touch the disk, no shared libraries are loaded, and no LLVM installation is required beyond `clang` on the PATH.
 
-This chapter describes how the CPU JIT loader works. GPU backends (CUDA, Metal, etc.) use their respective driver APIs for compilation and dispatch, and will be documented separately as they are added. The higher-level graph wrapper API that compiles a model graph once and replays it many times is documented in [JIT Graphs](../architecture/jit-graphs.md).
+This chapter describes how the CPU JIT loader works. The GPU backends pipe through the same `clang` but dispatch through their drivers: see the [AMD backend](./amd/overview.md) (KFD-direct) and the [CUDA backend](./cuda/overview.md) (driver API, PTX JIT). The higher-level graph wrapper API that compiles a model graph once and replays it many times is documented in [JIT Graphs](../architecture/jit-graphs.md).
 
 ## Pipeline
 

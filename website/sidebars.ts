@@ -80,6 +80,18 @@ const sidebars: SidebarsConfig = {
             'backends/amd/debugging',
           ],
         },
+        {
+          type: 'category',
+          label: 'CUDA Backend',
+          items: [
+            'backends/cuda/overview',
+            'backends/cuda/architecture',
+            'backends/cuda/codegen',
+            'backends/cuda/profiling',
+            'backends/cuda/limitations',
+            'backends/cuda/debugging',
+          ],
+        },
       ],
     },
   ],

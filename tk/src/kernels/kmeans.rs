@@ -63,7 +63,8 @@ const TM: usize = 16;
 /// The GPU arch(es) this kernel targets (gfx942 CDNA3 wave64 + gfx1151 RDNA3.5
 /// wave32). The launcher gates against this list.
 /// Validated on gfx942 (CDNA3) and gfx1151 (RDNA3.5).
-pub const KMEANS_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
+pub const KMEANS_SUPPORTED_ARCHS: crate::ArchSet =
+    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151]);
 
 const POS_INF: f64 = f64::INFINITY;
 
@@ -99,12 +100,12 @@ fn rv_point_src<'k>(warp: &Group<'k>, rv: &RV<'k>) -> (Arc<UOp>, Vec<usize>) {
 
 /// A length-`BLK` f32 RV seeded to `init` (the `row_arg_reduce` value accumulator).
 fn seed_val<'k>(ker: &'k Kernel, warp: &Group<'k>, init: f64) -> RV<'k> {
-    let frag = ker.caps.frag(FragRole::Accumulator);
+    let frag = ker.frag(FragRole::Accumulator);
     warp.clear_rv(ker.rv(BLK, DType::Float32, VecLayout::Ortho, frag), init)
 }
 /// A length-`BLK` Int32 index RV seeded to `−1` (the `row_arg_reduce` index acc).
 fn seed_idx<'k>(ker: &'k Kernel, warp: &Group<'k>) -> RV<'k> {
-    let frag = ker.caps.frag(FragRole::Accumulator);
+    let frag = ker.frag(FragRole::Accumulator);
     warp.clear_rv(ker.rv(BLK, DType::Int32, VecLayout::Ortho, frag), -1.0)
 }
 
@@ -294,7 +295,7 @@ fn store_best<'k>(
     n_blk: &Idx,
 ) {
     let row = TileLayout::Row;
-    let acc_t = ker.caps.frag(FragRole::AccumulatorT);
+    let acc_t = ker.frag(FragRole::AccumulatorT);
     // k = 1 < BLK, so the trailing columns must be masked off.
     let mi = MoveIdx::block((0, 0, n_blk.clone(), 0), 2).masked();
 
@@ -352,8 +353,7 @@ pub fn build_kmeans_assign(ker: &Kernel, n_points: usize, k_clusters: usize, d: 
     // Running argmin state (Col `[BLK, BLK]`). ALL rows seed to +∞ (val) / -1
     // (idx); row 0 is updated by `fold_best`, rows 1-15 stay as padding.
     let best_val = warp.map(ker.acc((BLK, BLK), col), |x, _| fconst(&x.dtype(), POS_INF));
-    let best_idx =
-        warp.map(ker.rt((BLK, BLK), i32.clone(), col, ker.caps.frag(FragRole::Accumulator)), |_, _| iconst32(-1));
+    let best_idx = warp.map(ker.rt((BLK, BLK), i32.clone(), col, ker.frag(FragRole::Accumulator)), |_, _| iconst32(-1));
     let best = Best { val: best_val, idx: best_idx };
 
     // Stream K centroids in TM-tall tiles via the FA running-state Loop carry.

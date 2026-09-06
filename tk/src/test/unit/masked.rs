@@ -92,12 +92,11 @@ fn test_masked_store_graph_shape() {
 fn test_masked_load_roundtrip_amd() {
     use svod_tensor::Tensor;
 
-    let dev = Tensor::rand(&[16, 16]).expect("probe").device();
-    let Some(arch) = crate::target::resolve_arch(&dev) else {
-        eprintln!("skip test_masked_load_roundtrip_amd: no AMD device");
+    let Some(caps) = super::fragment_device() else {
+        eprintln!("skip test_masked_load_roundtrip_amd: no device with tk fragment layouts");
         return;
     };
-    let w = arch.wave_size() as i64;
+    let w = caps.wave_size as i64;
     let (rows, cols) = (17usize, 20usize);
 
     // Ragged input: unique positive values, so the 0.0 out-of-bounds fill is
@@ -109,7 +108,7 @@ fn test_masked_load_roundtrip_amd() {
 
     crate::run_kernel("masked_roundtrip", [1, 1, 1], w, &mut [&mut out], &[&a], |ker| {
         let warp = ker.warp();
-        let frag = ker.caps.frag(FragRole::Accumulator);
+        let frag = ker.frag(FragRole::Accumulator);
         let o = ker.gl(&[1, 1, 32, 32], DType::Float32);
         let ain = ker.gl(&[1, 1, rows, cols], DType::Float32);
         // Masked load of a 32×32 tile straddling the [17, 20] edge → OOB lanes 0.0.
@@ -133,6 +132,6 @@ fn test_masked_load_roundtrip_amd() {
             }
         }
     }
-    assert_eq!(bad, 0, "{bad}/1024 elements wrong on {arch:?}");
-    println!("masked round-trip: 1024/1024 correct on {arch:?} ([17,20] in-bounds, 0.0 OOB)");
+    assert_eq!(bad, 0, "{bad}/1024 elements wrong on {:?}", caps.arch);
+    println!("masked round-trip: 1024/1024 correct on {:?} ([17,20] in-bounds, 0.0 OOB)", caps.arch);
 }

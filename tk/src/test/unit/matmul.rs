@@ -4,14 +4,17 @@
 
 use std::sync::Arc;
 
-use svod_dtype::{DType, DeviceSpec};
+use svod_dtype::{CudaArch, DType, DeviceSpec, GpuArch};
 use svod_ir::{Op, UOp};
 use svod_tensor::Tensor;
+use test_case::test_case;
 
 use crate::kernels::matmul::*;
-use crate::tiles::{RT_16X16, TileLayout};
+use crate::tiles::{RT_16X16, RT_16X16_MMA, TileLayout};
 use crate::{Kernel, MoveIdx};
 use svod_ir::ops;
+
+const SM_86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
 
 /// Dummy `(c, a, b)` BUFFER UOps for GPU-free graph-shape kernel builds.
 fn dummy_buffers(n: usize) -> Vec<Arc<UOp>> {
@@ -140,7 +143,7 @@ fn test_matmul_rdna_renders_wmma() {
         SMALL_CFG.grid_dims(n),
         SMALL_CFG.threads(32),
         dummy_buffers(n),
-        crate::ArchCaps::for_arch(svod_dtype::AmdArch::Gfx1151),
+        crate::ArchCaps::for_amd(svod_dtype::AmdArch::Gfx1151),
     );
     build_matmul_cfg(&ker, n, SMALL_CFG);
     let sink = ker.finish(SMALL_CFG.n_accum);
@@ -159,6 +162,129 @@ fn test_matmul_rdna_renders_wmma() {
 
     assert!(code.contains("llvm.amdgcn.wmma.f32.16x16x16.bf16"), "gfx1151 matmul must emit the RDNA WMMA intrinsic");
     assert!(!code.contains("mfma"), "gfx1151 is WMMA, not CDNA MFMA");
+}
+
+/// CUDA graph shape (no GPU): one 16×16 fragment product on `mma.sync` is TWO
+/// `m16n8k16` WMMAs per K-iteration — `(8,16,16)` / `8-4-4` — over the two-half
+/// registers: A = all 8, B = `{2h,2h+1,2h+4,2h+5}`, C = `4h..4h+4` for a `Row`
+/// accumulator; a `Col` accumulator computes `Cᵀ += Bᵀ·Aᵀ`, so the WMMA's first
+/// operand comes from the B tile (8 registers) and the second from the A tile.
+#[test_case(TileLayout::Row, false; "row accumulator")]
+#[test_case(TileLayout::Col, true; "col accumulator swaps operands")]
+fn test_mma_ab_mma_sync_graph_shape(acc_layout: TileLayout, swapped: bool) {
+    let ker = Kernel::new("mma_sync_probe", [1, 1, 1], 32, vec![], crate::ArchCaps::for_arch(SM_86));
+    // Unrolled: every tile index is a constant, so a register load's flat INDEX
+    // offset is the bare register number.
+    ker.set_unroll(true);
+    let warp = ker.warp();
+    let a = ker.rt((16, 16), DType::BFloat16, TileLayout::Row, RT_16X16_MMA);
+    let b = ker.rt((16, 16), DType::BFloat16, TileLayout::Col, RT_16X16_MMA);
+    let c = warp.zero(ker.rt((16, 16), DType::Float32, acc_layout, RT_16X16_MMA));
+    let out = warp.mma_ab(c, &a, &b);
+
+    let wmmas: Vec<_> = out.uop().toposort().into_iter().filter(|u| matches!(u.op(), Op::Wmma(..))).collect();
+    assert_eq!(wmmas.len(), 2, "two m16n8k16 halves per 16×16 fragment");
+    let regs = |stack: &Arc<UOp>| -> Vec<i64> {
+        let Op::Stack(ops::Stack { sources }) = stack.op() else { panic!("WMMA operands are STACKs") };
+        sources
+            .iter()
+            .map(|load| {
+                let Op::Load(ops::Load { index, .. }) = load.op() else { panic!("STACK of register LOADs") };
+                let Op::Index(ops::Index { indices, .. }) = index.op() else { unreachable!() };
+                match indices[0].op() {
+                    Op::Const(c) => match c.0 {
+                        svod_ir::ConstValue::Int(v) => v,
+                        other => panic!("register offset {other:?}"),
+                    },
+                    other => panic!("register offset must be a constant, got {other:?}"),
+                }
+            })
+            .collect()
+    };
+    let mut halves: Vec<(Vec<i64>, Vec<i64>, Vec<i64>)> = wmmas
+        .iter()
+        .map(|w| {
+            let Op::Wmma(ops::Wmma { a, b, c, metadata }) = w.op() else { unreachable!() };
+            assert_eq!(metadata.dims, (8, 16, 16));
+            assert_eq!(metadata.threads, 32);
+            let width = |u: &Arc<UOp>| u.shape().unwrap().unwrap()[0].as_const();
+            assert_eq!((width(a), width(b), width(c)), (Some(8), Some(4), Some(4)), "A/B/C register widths");
+            (regs(a), regs(b), regs(c))
+        })
+        .collect();
+    halves.sort_by_key(|(_, _, c)| c[0]);
+    assert_eq!(halves[0].2, vec![0, 1, 2, 3], "half 0 accumulates registers 0..4");
+    assert_eq!(halves[1].2, vec![4, 5, 6, 7], "half 1 accumulates registers 4..8");
+    for (h, (x, y, _)) in halves.iter().enumerate() {
+        let h = h as i64;
+        assert_eq!(x, &(0..8).collect::<Vec<_>>(), "half {h}: the 8-register operand");
+        assert_eq!(y, &vec![2 * h, 2 * h + 1, 2 * h + 4, 2 * h + 5], "half {h}: the n-half operand");
+    }
+    // Which tile feeds the 8-register slot: the A tile (`Row` acc) or the B tile (`Col` acc).
+    let feeds_first = |w: &Arc<UOp>, t: &crate::RT<'_>| {
+        let Op::Wmma(ops::Wmma { a, .. }) = w.op() else { unreachable!() };
+        a.toposort().iter().any(|u| Arc::ptr_eq(u, t.uop()))
+    };
+    for w in &wmmas {
+        assert_eq!(feeds_first(w, &b), swapped, "Col accumulator ⇒ the B tile supplies the A fragment");
+        assert_eq!(feeds_first(w, &a), !swapped);
+    }
+}
+
+/// sm_86 matmul renders to `mma.sync` (host, no GPU): built with warp32
+/// [`crate::ArchCaps`], [`SM80_SMALL_CFG`] must select the `RT_16X16_MMA` two-half
+/// fragments and lower to `llvm.nvvm.mma.m16n8k16.row.col.bf16` — never an `mfma`
+/// or `wmma` intrinsic. Numerical correctness is gated on CUDA hardware.
+#[test]
+fn test_matmul_sm86_renders_mma_sync() {
+    let n = 64usize;
+    let cfg = SM80_SMALL_CFG;
+    let caps = crate::ArchCaps::for_arch(SM_86);
+    let ker = Kernel::new("matmul_sm86", cfg.grid_dims(n), cfg.threads(caps.wave_size), dummy_buffers(n), caps);
+    build_matmul_cfg(&ker, n, cfg);
+    let sink = ker.finish(cfg.n_accum);
+    // The launch path's pipeline (post-optimization with the CUDA optimizer profile,
+    // then linearize + render), so the IR is what ptxas gets.
+    let sm86 = CudaArch::from_compute_capability(8, 6);
+    let renderer = svod_codegen::llvm::LlvmTextRenderer::nvptx(sm86);
+    let opt_renderer = svod_schedule::OptimizerRenderer::for_cuda_arch(sm86).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        svod_codegen::traits::Renderer::decompositor(&renderer),
+        None,
+    );
+    let optimized =
+        svod_schedule::apply_post_optimization_with_renderer(sink, &opt_renderer).expect("post optimization");
+    let program =
+        svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Cpu).expect("final target graph");
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+    let linear_uop =
+        linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear(..))).expect("LINEAR present");
+    let code =
+        svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some("matmul_sm86")).expect("render").code;
+    if let Ok(dump) = std::env::var("TK_DUMP_IR") {
+        std::fs::write(dump, &code).expect("dump IR");
+    }
+    assert!(code.contains("llvm.nvvm.mma.m16n8k16.row.col.bf16"), "sm_86 matmul must emit mma.sync m16n8k16 bf16");
+    assert!(!code.contains("mfma") && !code.contains("amdgcn"), "no AMD intrinsics on NVPTX");
+    // The LDS strips fill by `cp.async` (one 16-byte copy per lane per pass of each
+    // strip, retired by `wait_group 0` + barrier) and the operands gather by
+    // `ldmatrix.x4`: plain for the `Row` A sub-tile, `.trans` for the `Col` B sub-tile.
+    let calls = |needle: &str| code.lines().filter(|l| l.contains(needle) && !l.contains("declare")).count();
+    let (reg, k_step) = (cfg.reg(), cfg.k_step());
+    let passes = (cfg.block * k_step * 2).div_ceil(cfg.threads(32) as usize * 16);
+    assert_eq!(calls("@llvm.nvvm.cp.async.cg.shared.global.16("), 2 * passes);
+    assert_eq!(calls("@llvm.nvvm.cp.async.wait.group(i32 0)"), 2);
+    assert_eq!(calls("ldmatrix.sync.aligned.m8n8.x4.b16("), cfg.n_accum * (reg / 16) * (k_step / 16), "A");
+    assert_eq!(calls("ldmatrix.sync.aligned.m8n8.x4.trans.b16("), (k_step / 16) * (reg / 16), "B");
+    if let Some(ptx) = super::fa::ptx_of(&code) {
+        let count = |needle: &str| ptx.matches(needle).count();
+        assert_eq!((count("ld.shared.b16"), count("st.shared")), (0, 0), "scalar LDS traffic in the PTX:\n{ptx}");
+        assert_eq!(
+            count("ldmatrix.sync.aligned.m8n8.x4"),
+            cfg.n_accum * (reg / 16) * (k_step / 16) + (k_step / 16) * (reg / 16)
+        );
+        assert_eq!(count("cp.async.cg.shared.global"), 2 * passes);
+    }
 }
 
 /// A `group_2d(2,4)` is 8 waves / 512 threads, with `warp_row`/`warp_col`
@@ -216,40 +342,52 @@ fn test_st_db_base_offset_infra() {
 }
 
 // =============================================================================
-// Hardware-gated end-to-end matmul on gfx942.
+// Hardware-gated end-to-end matmul (gfx942 / gfx1151 / CUDA sm_80+).
 // =============================================================================
 
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_simple_matmul_amd -- --ignored --nocapture`.
+/// The env-selected device's arch when the tile matmul supports it (its LLVM
+/// backend present), so a test picks [`cfg_for_arch`] the way `matmul()` does.
+fn matmul_device() -> Option<GpuArch> {
+    let spec = Tensor::empty(&[1], DType::Float32).device();
+    crate::target::resolve_supported_arch(&spec, MATMUL_SUPPORTED_ARCHS).ok()
+}
+
+/// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib matmul::test_simple_matmul_gpu -- --ignored --nocapture`.
 ///
-/// Runs the 8-wave 256×256 tile matmul on the real GPU across several N and
-/// checks each against a reference `a.matmul(b)` over the *same* bf16-rounded
-/// operands (bf16 tolerance ~5e-2).
+/// Runs the arch's large-N tile matmul (the 8-wave 256×256 [`M1_CFG`] on gfx942)
+/// on the real GPU across several N and checks each against a reference
+/// `a.matmul(b)` over the *same* bf16-rounded operands (bf16 tolerance ~5e-2).
 #[test]
 #[ignore]
-fn test_simple_matmul_amd() {
+fn test_simple_matmul_gpu() {
+    let Some(arch) = matmul_device() else {
+        eprintln!("skip test_simple_matmul_gpu: unsupported device/toolchain");
+        return;
+    };
     for n in [256usize, 512, 1024, 2048] {
-        run_matmul_check(n);
+        let cfg = cfg_for_arch(arch, n);
+        let (a, b) = matmul_inputs(n);
+        let got = launch_matmul("simple_matmul", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
+        let max_abs = max_abs_err(&got, &matmul_reference(&a, &b));
+        println!("matmul N={n} block={}: max abs error = {max_abs:e}", cfg.block);
+        assert!(max_abs < 5e-2, "N={n}: max abs error {max_abs} exceeds bf16 tolerance 5e-2");
     }
 }
 
-fn run_matmul_check(n: usize) {
-    let (a, b) = matmul_inputs(n);
-    let got = launch_matmul("simple_matmul", n, M1_CFG, |ker| build_matmul_cfg(ker, n, M1_CFG), &a, &b);
-    let expected = matmul_reference(&a, &b);
-    let max_abs = max_abs_err(&got, &expected);
-    println!("matmul N={n}: max abs error = {max_abs:e}");
-    assert!(max_abs < 5e-2, "N={n}: max abs error {max_abs} exceeds bf16 tolerance 5e-2");
-}
-
 /// The chiplet/L2 grid swizzle in **isolation** (1-D grid + [`l2_swizzle`],
-/// scalar fill). It permutes which workgroup computes which 256-block, so the
-/// full C must be bit-identical-up-to-bf16-tolerance to `a.matmul(b)`.
+/// scalar fill) over the arch's large-N config. It permutes which workgroup
+/// computes which C block, so the full C must be bit-identical-up-to-bf16-tolerance
+/// to `a.matmul(b)`.
 ///
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_l2swizzle_amd -- --ignored --nocapture`.
+/// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib matmul::test_matmul_l2swizzle_gpu -- --ignored --nocapture`.
 #[test]
 #[ignore]
-fn test_matmul_l2swizzle_amd() {
-    let cfg = MatmulCfg { vec_load: false, ..M1_CFG };
+fn test_matmul_l2swizzle_gpu() {
+    let Some(arch) = matmul_device() else {
+        eprintln!("skip test_matmul_l2swizzle_gpu: unsupported device/toolchain");
+        return;
+    };
+    let cfg = MatmulCfg { l2_swizzle: true, vec_load: false, ..cfg_for_arch(arch, 2048) };
     for n in [2048usize, 4096] {
         let (a, b) = matmul_inputs(n);
         let got = launch_matmul("matmul_l2sw", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
@@ -262,12 +400,7 @@ fn test_matmul_l2swizzle_amd() {
 
 /// Realized bf16 `(a, b)` inputs so kernel + reference see identical rounding.
 fn matmul_inputs(n: usize) -> (svod_tensor::Tensor, svod_tensor::Tensor) {
-    use svod_tensor::Tensor;
-    let mut a = Tensor::rand(&[n, n]).expect("rand a").cast(DType::BFloat16).expect("cast a→bf16");
-    let mut b = Tensor::rand(&[n, n]).expect("rand b").cast(DType::BFloat16).expect("cast b→bf16");
-    a.realize().expect("realize a");
-    b.realize().expect("realize b");
-    (a, b)
+    matmul_inputs_dt(n, DType::BFloat16)
 }
 
 /// f32 ground-truth `a·b` over the bf16-rounded operands.
@@ -291,6 +424,10 @@ fn max_abs_err(got: &[f32], expected: &[f32]) -> f32 {
 #[test]
 #[ignore]
 fn test_matmul_rdna_computes_ab() {
+    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+        eprintln!("skip test_matmul_rdna_computes_ab: unsupported device/toolchain");
+        return;
+    }
     use svod_tensor::Tensor;
     let n = 64usize;
     let (a, b) = matmul_inputs(n);
@@ -331,6 +468,10 @@ fn test_matmul_rdna_computes_ab() {
 #[test]
 #[ignore]
 fn test_matmul_rdna_grid() {
+    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+        eprintln!("skip test_matmul_rdna_grid: unsupported device/toolchain");
+        return;
+    }
     use svod_tensor::Tensor;
     let n = 64usize;
     let mut a_data = vec![0f32; n * n];
@@ -352,6 +493,132 @@ fn test_matmul_rdna_grid() {
     }
 }
 
+/// Whether the env-selected device is CUDA sm_80+ with the NVPTX toolchain.
+fn cuda_device() -> bool {
+    super::fragment_device().is_some_and(|caps| caps.cuda().is_some())
+}
+
+/// `SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --lib matmul::test_matmul_cuda -- --ignored --nocapture`.
+///
+/// The `mma.sync` matmul on the real GPU across both configs, several N and both
+/// 16-bit input dtypes (f16 and bf16, f32 accumulate) against the f32 reference
+/// over the SAME rounded operands.
+#[test]
+#[ignore]
+fn test_matmul_cuda() {
+    if !cuda_device() {
+        eprintln!("skip test_matmul_cuda: no CUDA sm_80+ device / toolchain");
+        return;
+    }
+    for dtype in [DType::BFloat16, DType::Float16] {
+        for n in [64usize, 128, 192, 256, 512, 1024] {
+            let cfg = cfg_for_arch(SM_86, n);
+            let (a, b) = matmul_inputs_dt(n, dtype.clone());
+            let got = launch_matmul("matmul_cuda", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
+            let max_abs = max_abs_err(&got, &matmul_reference(&a, &b));
+            println!("matmul[cuda] {dtype:?} N={n} block={}: max abs error = {max_abs:e}", cfg.block);
+            let tol = if dtype == DType::Float16 { 2e-2 } else { 5e-2 };
+            assert!(max_abs < tol, "{dtype:?} N={n}: max abs error {max_abs} exceeds {tol}");
+        }
+    }
+}
+
+/// Element-level check of the `mma.sync` two-half lane map (the CUDA peer of
+/// [`test_matmul_rdna_grid`]): `A = I`, `B[k][j] = (k%16)·16 + j%16` ⇒ `C = B`, so the
+/// first 16×16 output fragment must read `got[i][j] = i·16 + j`; a within-fragment
+/// permutation of the A/B/C register order lands at the wrong `(i, j)`.
+/// `SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --lib matmul::test_matmul_cuda_grid -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_matmul_cuda_grid() {
+    if !cuda_device() {
+        eprintln!("skip test_matmul_cuda_grid: no CUDA sm_80+ device / toolchain");
+        return;
+    }
+    let n = 64usize;
+    let mut a_data = vec![0f32; n * n];
+    for i in 0..n {
+        a_data[i * n + i] = 1.0;
+    }
+    let b_data: Vec<f32> = (0..n * n).map(|p| (((p / n) % 16) * 16 + (p % n) % 16) as f32).collect();
+    let mk =
+        |d: &[f32]| Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16).expect("→bf16");
+    let (mut a, mut b) = (mk(&a_data), mk(&b_data));
+    a.realize().expect("realize a");
+    b.realize().expect("realize b");
+    let cfg = SM80_SMALL_CFG;
+    let got = launch_matmul("matmul_cuda_grid", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
+    for i in 0..16 {
+        let row: Vec<i32> = (0..16).map(|j| got[i * n + j].round() as i32).collect();
+        let expected: Vec<i32> = (0..16).map(|j| (i * 16 + j) as i32).collect();
+        assert_eq!(row, expected, "fragment(0,0) row i={i} permuted: {row:?} (expected {expected:?})");
+    }
+}
+
+/// The four `mma_{ab,abt,atb,atbt}` variants and both accumulator orientations on
+/// CUDA compute exactly `A·B` from register tiles gathered straight from GLOBAL
+/// (no LDS): `Row`/`Col` operand readings pack the same registers, and a `Col`
+/// accumulator (`Cᵀ += Bᵀ·Aᵀ`) stores the same matrix.
+/// `SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --lib matmul::test_mma_variants_cuda -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_mma_variants_cuda() {
+    if !cuda_device() {
+        eprintln!("skip test_mma_variants_cuda: no CUDA sm_80+ device / toolchain");
+        return;
+    }
+    let n = 32usize;
+    let (a, b) = matmul_inputs_dt(n, DType::BFloat16);
+    let expected = matmul_reference(&a, &b);
+    let tr = |x: &Tensor| {
+        let mut t = x.try_permute(&[1, 0]).expect("transpose").contiguous();
+        t.realize().expect("realize");
+        t
+    };
+    let (at, bt) = (tr(&a), tr(&b));
+    for (name, a_t, b_t) in [("ab", false, false), ("abt", false, true), ("atb", true, false), ("atbt", true, true)] {
+        for acc_layout in [TileLayout::Row, TileLayout::Col] {
+            let (a_in, b_in) = (if a_t { &at } else { &a }, if b_t { &bt } else { &b });
+            let mut c = Tensor::empty(&[n, n], DType::Float32);
+            crate::run_kernel(format!("mma_{name}"), [1, 1, 1], 32, &mut [&mut c], &[a_in, b_in], |ker| {
+                let warp = ker.warp();
+                let c_gl = ker.gl(&[1, 1, n, n], DType::Float32);
+                let a_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
+                let b_gl = ker.gl(&[1, 1, n, n], DType::BFloat16);
+                // A stored `[m,k]` reads `Row`; `Aᵀ` stored `[k,m]` reads `Col` (the same
+                // registers); symmetric for B (`[k,n]` is `Col`, `Bᵀ` `[n,k]` is `Row`).
+                let a_l = if a_t { TileLayout::Col } else { TileLayout::Row };
+                let b_l = if b_t { TileLayout::Row } else { TileLayout::Col };
+                let ra = warp.load(ker.operand((n, n), DType::BFloat16, a_l), a_gl, MoveIdx::block((0, 0, 0, 0), 2));
+                let rb = warp.load(ker.operand((n, n), DType::BFloat16, b_l), b_gl, MoveIdx::block((0, 0, 0, 0), 2));
+                let acc = warp.zero(ker.acc((n, n), acc_layout));
+                let acc = match (a_t, b_t) {
+                    (false, false) => warp.mma_ab(acc, &ra, &rb),
+                    (false, true) => warp.mma_abt(acc, &ra, &rb),
+                    (true, false) => warp.mma_atb(acc, &ra, &rb),
+                    (true, true) => warp.mma_atbt(acc, &ra, &rb),
+                };
+                let _ = warp.store(c_gl, acc, MoveIdx::block((0, 0, 0, 0), 2));
+                ker.finish(1)
+            })
+            .expect("mma variant launch");
+            let got = c.as_vec::<f32>().expect("read c");
+            let err = max_abs_err(&got, &expected);
+            println!("mma_{name} acc={acc_layout:?}: max abs error = {err:e}");
+            assert!(err < 5e-2, "mma_{name} acc={acc_layout:?}: max abs error {err}");
+        }
+    }
+}
+
+/// Realized `(a, b)` inputs of `dtype` so kernel + reference see identical rounding.
+fn matmul_inputs_dt(n: usize, dtype: DType) -> (Tensor, Tensor) {
+    let mut a = Tensor::rand(&[n, n]).expect("rand a").cast(dtype.clone()).expect("cast a");
+    let mut b = Tensor::rand(&[n, n]).expect("rand b").cast(dtype).expect("cast b");
+    a.realize().expect("realize a");
+    b.realize().expect("realize b");
+    (a, b)
+}
+
 /// Build + dispatch a matmul `cfg` over `(a, b)` once, returning the f32 C.
 fn launch_matmul<F>(
     name: &str,
@@ -367,7 +634,7 @@ where
     use svod_tensor::Tensor;
     // Launch block must match the device wave size (gfx942 wave64, gfx11 wave32),
     // matching the `matmul()` entry's `cfg.threads(caps.wave_size)`.
-    let ws = crate::target::resolve_arch(&a.device()).map(|ar| ar.wave_size() as usize).unwrap_or(64);
+    let ws = crate::target::resolve_arch(&a.device()).map(|ar| crate::ArchCaps::for_arch(ar).wave_size).unwrap_or(64);
     let mut c = Tensor::empty(&[n, n], DType::Float32);
     crate::run_kernel(name, cfg.grid_dims(n), cfg.threads(ws), &mut [&mut c], &[a, b], |ker| {
         build(ker);
@@ -377,7 +644,7 @@ where
     c.as_vec::<f32>().expect("read c")
 }
 
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_graph_amd -- --ignored --nocapture`.
+/// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib matmul::test_matmul_graph_gpu -- --ignored --nocapture`.
 ///
 /// The graph-native `matmul` (a `custom_kernel` / `Op::Call` node) matches **(a)**
 /// the f32 reference (bf16 tol) AND **(b)** the direct-launch kernel **bit-for-bit**
@@ -386,11 +653,15 @@ where
 /// kernel-agnostic) as through direct launch.
 #[test]
 #[ignore]
-fn test_matmul_graph_amd() {
+fn test_matmul_graph_gpu() {
+    let Some(arch) = matmul_device() else {
+        eprintln!("skip test_matmul_graph_gpu: unsupported device/toolchain");
+        return;
+    };
     for n in [256usize, 512, 1024] {
         let (a, b) = matmul_inputs(n);
         let expected = matmul_reference(&a, &b);
-        let cfg = cfg_for_n(n);
+        let cfg = cfg_for_arch(arch, n);
         let direct = launch_matmul("matmul_direct", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
 
         let mut g = crate::kernels::matmul::matmul(&a, &b).expect("graph matmul").expect("matmul kernel applies");
@@ -404,21 +675,82 @@ fn test_matmul_graph_amd() {
     }
 }
 
-/// The size-adaptive matmul is correct at every N, picking [`SMALL_CFG`] for
-/// small N (where the 256×256 block under-occupies the machine) and [`M1_CFG`]
-/// otherwise.
+/// The size-adaptive matmul is correct at every N — on gfx942 picking [`SMALL_CFG`]
+/// for small N (where the 256×256 block under-occupies the machine) and [`M1_CFG`]
+/// otherwise; on CUDA [`SM80_SMALL_CFG`] when N only tiles by 64.
 ///
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_adaptive_amd -- --ignored --nocapture`.
+/// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib matmul::test_matmul_adaptive_gpu -- --ignored --nocapture`.
 #[test]
 #[ignore]
-fn test_matmul_adaptive_amd() {
+fn test_matmul_adaptive_gpu() {
+    let Some(arch) = matmul_device() else {
+        eprintln!("skip test_matmul_adaptive_gpu: unsupported device/toolchain");
+        return;
+    };
     for n in [256usize, 512, 768, 1024, 2048] {
         let (a, b) = matmul_inputs(n);
-        let cfg = cfg_for_n(n);
+        let cfg = cfg_for_arch(arch, n);
         let got = launch_matmul("matmul_adaptive", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
         let expected = matmul_reference(&a, &b);
         let max_abs = max_abs_err(&got, &expected);
         println!("adaptive N={n} (block={}): max abs error = {max_abs:e}", cfg.block);
         assert!(max_abs < 5e-2, "adaptive N={n}: max abs error {max_abs} exceeds 5e-2");
     }
+}
+
+/// `SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --lib matmul::test_matmul_bench_cuda -- --ignored --nocapture`.
+///
+/// Per-dispatch GPU time and TFLOP/s of the arch's bf16 matmul config at
+/// N = 1024 / 2048 — the measurement behind the CUDA fill/gather lowering.
+#[test]
+#[ignore]
+fn test_matmul_bench_cuda() {
+    if !cuda_device() {
+        eprintln!("skip test_matmul_bench_cuda: no CUDA sm_80+ device / toolchain");
+        return;
+    }
+    let ws = super::fragment_device().expect("caps").wave_size;
+    for n in [1024usize, 2048] {
+        let cfg = cfg_for_arch(SM_86, n);
+        let (a, b) = matmul_inputs(n);
+        let mut c = Tensor::empty(&[n, n], DType::Float32);
+        let compiled =
+            crate::compile_kernel("matmul_bench", cfg.grid_dims(n), cfg.threads(ws), &mut [&mut c], &[&a, &b], |ker| {
+                build_matmul_cfg(ker, n, cfg);
+                ker.finish(cfg.n_accum)
+            })
+            .expect("compile");
+        let mut us: Vec<f64> =
+            (0..12).map(|_| compiled.dispatch_gpu_ns().expect("dispatch").expect("stamped") as f64 / 1e3).collect();
+        us.sort_by(f64::total_cmp);
+        let median = us[us.len() / 2];
+        let tflops = 2.0 * (n as f64).powi(3) / (median * 1e-6) / 1e12;
+        println!(
+            "matmul[cuda] N={n} block={}: median {median:.1} µs = {tflops:.2} TFLOP/s (min {:.1})",
+            cfg.block, us[0]
+        );
+    }
+}
+
+/// `mma_AB` reads B as a `[k,n]` (`Col`) tile; a `Row` tile would be
+/// multiplied transposed, so the plan refuses it at build time. GPU-free.
+#[test]
+#[should_panic(expected = "operand B must be a Col tile")]
+fn mma_ab_rejects_a_row_b_tile() {
+    let ker = Kernel::new("mma_orient", [1, 1, 1], 64, vec![], crate::ArchCaps::GFX942);
+    let warp = ker.warp();
+    let a = ker.operand((16, 16), DType::BFloat16, TileLayout::Row);
+    let b = ker.operand((16, 16), DType::BFloat16, TileLayout::Row);
+    let _ = warp.mma_ab(warp.zero(ker.acc((16, 16), TileLayout::Col)), &a, &b);
+}
+
+/// Symmetrically, `mma_AtB` reads A as a `[k,m]` (`Col`) tile.
+#[test]
+#[should_panic(expected = "operand A must be a Col tile")]
+fn mma_atb_rejects_a_row_a_tile() {
+    let ker = Kernel::new("mma_orient", [1, 1, 1], 32, vec![], crate::ArchCaps::for_arch(SM_86));
+    let warp = ker.warp();
+    let a = ker.operand((16, 16), DType::BFloat16, TileLayout::Row);
+    let b = ker.operand((16, 16), DType::BFloat16, TileLayout::Col);
+    let _ = warp.mma_atb(warp.zero(ker.acc((16, 16), TileLayout::Col)), &a, &b);
 }

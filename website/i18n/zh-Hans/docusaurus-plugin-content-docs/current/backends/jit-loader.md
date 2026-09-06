@@ -8,7 +8,7 @@ sidebar_label: JIT 编译器
 
 当 kernel 需要执行时，Svod 通过 stdin 将生成的源代码传递给 `clang`，在 stdout 接收可重定位的 ELF 对象，在进程内解析，将机器码复制到匿名内存映射中，应用重定位，将页面权限切换为可执行，然后直接通过函数指针调用。整个过程在内存中完成——没有临时文件接触磁盘，没有加载共享库，除了 PATH 中的 `clang` 之外不需要任何 LLVM 安装。
 
-本章描述 CPU JIT 加载器的工作原理。GPU 后端（CUDA、Metal 等）使用各自的驱动 API 进行编译和调度，将在添加时单独文档化。
+本章描述 CPU JIT 加载器的工作原理。GPU 后端通过同一个 `clang` 传输，但经由各自的驱动调度：见 [AMD 后端](./amd/overview.md)（KFD 直连）与 [CUDA 后端](./cuda/overview.md)（驱动 API、PTX JIT）。
 
 ## 流水线
 

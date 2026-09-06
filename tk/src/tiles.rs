@@ -12,6 +12,7 @@
 //! inputs** (256/32 × the 0-15≡16-31 wave-half replication). The `_W32_*`
 //! constants below are the RDNA (gfx11) shapes; the unsuffixed ones are gfx942.
 
+pub use crate::layout::LaneMap;
 use crate::swizzle::Swizzle;
 
 /// Register-tile element layout within a warp.
@@ -55,34 +56,17 @@ pub struct STBaseShape {
     pub swizzle: Swizzle,
 }
 
-/// Register-tile base fragment: a [`BaseShape`] plus the per-lane fragment
-/// `stride` (the lane-group step in `lane_rc`) and the `interleave`/`interleave_t`
-/// flags. gfx942 spreads K across lane-groups (stride = ept); RDNA holds all K in
-/// one lane (`stride = 0` for the replicated inputs). `interleave` selects the
-/// RDNA WMMA f32 accumulator's even/odd row map (`m = 2·j + lane/16, n = lane%16`),
-/// which no `stride` can express; `interleave_t` is its **transpose**
-/// (`row = lane%16, col = 2·j + lane/16`) — the layout for storing an RDNA
-/// accumulator to memory along the transposed (N-major) axis, e.g. the FA output
-/// tile `O[q,d]` from the `[d,q]` PV accumulator (see `lane_rc`). At most one of
-/// the two is set.
+/// Register-tile base fragment: a [`BaseShape`] plus its per-lane [`LaneMap`]
+/// (which element of the fragment each lane's register `j` holds).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RTBaseShape {
     pub base: BaseShape,
-    pub stride: usize,
-    pub interleave: bool,
-    pub interleave_t: bool,
+    pub map: LaneMap,
 }
 
 impl RTBaseShape {
     pub const fn elements_per_thread(&self) -> usize {
         self.base.elements_per_thread()
-    }
-    pub const fn num_strides(&self) -> usize {
-        // `stride == 0` (RDNA replicated inputs: all K in one lane) ⇒ a single run.
-        match self.elements_per_thread().checked_div(self.stride) {
-            Some(n) => n,
-            None => 1,
-        }
     }
 }
 
@@ -102,36 +86,51 @@ pub const ST_32X16: STBaseShape =
 
 // Predefined register-tile base shapes.
 pub const RT_16X16: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 4 }, stride: 4, interleave: false, interleave_t: false };
+    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 4 }, map: LaneMap::Strided { stride: 4 } };
 pub const RT_32X32: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 32, cols: 32, ept: 16 }, stride: 4, interleave: false, interleave_t: false };
+    RTBaseShape { base: BaseShape { rows: 32, cols: 32, ept: 16 }, map: LaneMap::Strided { stride: 4 } };
 pub const RT_16X32: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 16, cols: 32, ept: 8 }, stride: 8, interleave: false, interleave_t: false };
+    RTBaseShape { base: BaseShape { rows: 16, cols: 32, ept: 8 }, map: LaneMap::Strided { stride: 8 } };
 pub const RT_32X16: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 32, cols: 16, ept: 8 }, stride: 8, interleave: false, interleave_t: false };
+    RTBaseShape { base: BaseShape { rows: 32, cols: 16, ept: 8 }, map: LaneMap::Strided { stride: 8 } };
 
 // ── RDNA (gfx11, wave32) base shapes — for the gfx1151 WMMA matmul ────────────
 //
-// Accumulator: ept = 256/32 = 8, `interleave` ⇒ `lane_rc` gives the RDNA3 WMMA
-// f32 even/odd row map `m = 2·j + lane/16, n = lane%16` (tinygrad `ops_python`
-// `c_map = (lane%16, lane//16 + 2·elem)`; NOT the gfx12/CK contiguous layout).
-// Inputs: ept = 16 (replicated across wave-halves), stride = 0 ⇒ lane = M/N, the
-// 16 elements = the K run, identical for lanes L and L+16.
+// Accumulator: ept = 256/32 = 8, [`LaneMap::Interleaved`] (the RDNA3 WMMA f32
+// even/odd row map; NOT the gfx12/CK contiguous layout). Inputs: ept = 16
+// (replicated across wave-halves), stride = 0 ⇒ lane = M/N, the 16 elements = the
+// K run, identical for lanes L and L+16.
 
 /// LDS strip fragment for the wave32 matmul (`ept = 256/32 = 8`).
 pub const ST_16X16_SWIZZLED_W32: STBaseShape =
     STBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, swizzle: Swizzle::Sw16x16 };
-/// wave32 WMMA f32 accumulator fragment: even/odd row interleave (`interleave`).
-/// `stride` is unused (the interleave map ignores it).
+/// wave32 WMMA f32 accumulator fragment: even/odd row interleave.
 pub const RT_16X16_W32_ACC: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, stride: 1, interleave: true, interleave_t: false };
+    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, map: LaneMap::Interleaved };
 /// wave32 WMMA input fragment: 16 K/lane, replicated across the two wave-halves.
 pub const RT_16X16_W32_IN: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 16 }, stride: 0, interleave: false, interleave_t: false };
+    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 16 }, map: LaneMap::Strided { stride: 0 } };
 /// wave32 WMMA f32 accumulator, **transposed** for an N-major memory store
-/// (`interleave_t`): `row = lane%16, col = 2·j + lane/16`. Used for the FA output
+/// ([`LaneMap::InterleavedT`]). Used for the FA output
 /// tile (`o_reg_t`, `O[q,d]`) — the transpose of the `[d,q]` PV accumulator
 /// ([`RT_16X16_W32_ACC`]). gfx942 reaches the same transposed store through the
 /// plain stride map, so this is RDNA-only.
 pub const RT_16X16_W32_ACC_T: RTBaseShape =
-    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, stride: 1, interleave: false, interleave_t: true };
+    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, map: LaneMap::InterleavedT };
+
+// ── CUDA sm_80+ (warp32, `mma.sync.m16n8k16`) base shapes ─────────────────────
+//
+// A 16×16 register tile is two m16n8 halves along the register axis
+// ([`LaneMap::MmaSync`], ThunderKittens `rt_base`): 8 elements/lane for f16/bf16
+// inputs AND the f32 accumulator, so every fragment role shares one shape and an
+// accumulator is directly reusable as an A operand (as on CDNA). The LDS strip
+// fills 256/32 = 8 elements/lane and is XOR-swizzled for the quad-strided gather.
+
+/// LDS strip fragment for the warp32 `mma.sync` kernels (`ept = 256/32 = 8`),
+/// swizzled conflict-free for the m16n8k16 gather ([`Swizzle::Sw16x16Mma`]).
+pub const ST_16X16_MMA: STBaseShape =
+    STBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, swizzle: Swizzle::Sw16x16Mma };
+/// warp32 `mma.sync` fragment: A operand, B operand (read transposed) and f32
+/// accumulator alike.
+pub const RT_16X16_MMA: RTBaseShape =
+    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, map: LaneMap::MmaSync };

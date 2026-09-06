@@ -1,7 +1,8 @@
-//! Single-warp cross-lane shuffle ops built on the [`ds_bpermute`](super::Group)
-//! gather primitive `shuffle_lane`: the generic `shuffle`, the butterfly
-//! `shuffle_xor`, the `shuffle_down`/`shuffle_up` rotates, and the bitonic
-//! `compare_exchange`. One `ds_bpermute` per element — no LDS, no barrier.
+//! Single-warp cross-lane shuffle ops built on the arch-lowered gather primitive
+//! `shuffle_lane` (`ds_bpermute` on AMD, `shfl.sync` on CUDA): the generic
+//! `shuffle`, the butterfly `shuffle_xor`, the `shuffle_down`/`shuffle_up`
+//! rotates, and the bitonic `compare_exchange`. One gather per element — no LDS,
+//! no barrier.
 
 use std::sync::Arc;
 
@@ -24,8 +25,7 @@ impl<'k> Group<'k> {
         assert!(self.ker.caps.wave_size.is_multiple_of(width), "subgroup width must divide wave size");
         let mut mask = 1i64;
         while mask < width as i64 {
-            let partner = self.shuffle_lane(&value, &ixor(&self.laneid(), mask));
-            value = op(&value, &partner);
+            value = op(&value, &self.shuffle_xor_lane(&value, mask));
             mask *= 2;
         }
         value
@@ -56,8 +56,7 @@ impl<'k> Group<'k> {
         assert_eq!(self.warps, 1, "wave_reduce_scalar is a single-warp op");
         let mut mask = 1i64;
         while mask < self.ker.caps.wave_size as i64 {
-            let partner = self.shuffle_lane(&value, &ixor(&self.laneid(), mask));
-            value = op(&value, &partner);
+            value = op(&value, &self.shuffle_xor_lane(&value, mask));
             mask *= 2;
         }
         value
@@ -138,7 +137,6 @@ impl<'k> Group<'k> {
         let w = self.ker.caps.wave_size as i64;
         assert!(mask > 0 && mask < w, "compare_exchange mask {mask} must be in 1..{w}");
         let laneid = self.laneid();
-        let partner = ixor(&laneid, mask);
         // `keep_min`: this lane keeps the smaller of the pair (else the larger). The
         // lower-index lane of a pair is `(laneid & mask) == 0`.
         let is_low = iand(&laneid, mask).try_cmpeq(&cidx(0)).expect("ce is_low");
@@ -156,7 +154,7 @@ impl<'k> Group<'k> {
         let (dbuf, dshape) = (dst.uop().clone(), dst.shape().to_vec());
         let ended = self.elementwise(&dshape.clone(), move |idxs| {
             let v = load_at(&sbuf, &sshape, idxs);
-            let p = self.shuffle_lane(&v, &partner);
+            let p = self.shuffle_xor_lane(&v, mask);
             let lt = v.try_cmplt(&p).expect("ce lt");
             let mn = UOp::try_where(lt, v.clone(), p.clone()).expect("ce min");
             let mx = v.try_max(&p).expect("ce max");

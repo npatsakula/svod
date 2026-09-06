@@ -1,5 +1,6 @@
-//! Flash-attention forward — a GPU-free graph-shape check plus a gfx942
-//! comparison against `Tensor::scaled_dot_product_attention`.
+//! Flash-attention forward — GPU-free graph-shape / render checks plus the
+//! gfx942, gfx1151 and CUDA sm_80+ comparisons against
+//! `Tensor::scaled_dot_product_attention`.
 
 use std::sync::Arc;
 
@@ -204,7 +205,7 @@ fn test_fa_graph_path_renders_clean_gfx1151() {
         [h as i64, (n / q_blk / 8) as i64, b as i64],
         8 * 32, // NUM_WARPS * wave32
         dummy_fa_buffers(b, n, h, h_kv, d),
-        crate::ArchCaps::for_arch(svod_dtype::AmdArch::Gfx1151),
+        crate::ArchCaps::for_amd(svod_dtype::AmdArch::Gfx1151),
     );
     build_fa_mw_rdb(
         &ker,
@@ -269,7 +270,7 @@ fn test_fa_mw_rdb_renders_wave32() {
         [h as i64, (n / 16 / 8) as i64, b as i64],
         8 * 32, // NUM_WARPS * wave32
         dummy_fa_buffers(b, n, h, h_kv, d),
-        crate::ArchCaps::for_arch(svod_dtype::AmdArch::Gfx1151),
+        crate::ArchCaps::for_amd(svod_dtype::AmdArch::Gfx1151),
     );
     build_fa_mw_rdb(
         &ker,
@@ -354,8 +355,7 @@ fn test_fa_mw_rdb_unroll_amd() {
 /// wave-width-aware `flash_attention_with` graph entry, exercised by the
 /// `*_noncausal_*`/`*_graph_check_*` tests).
 fn is_cdna_device() -> bool {
-    let dev = svod_tensor::Tensor::rand(&[16, 16]).expect("probe tensor").device();
-    crate::target::resolve_arch(&dev).is_some_and(|a| a.is_cdna())
+    super::is_cdna_device()
 }
 
 fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
@@ -485,25 +485,33 @@ fn test_fa_graph_amd() {
     }
 }
 
+/// The f32 causal SDPA reference for the graph check below, in `[B,N,H,D]`.
+#[allow(clippy::result_large_err)] // one-shot check helper, like the macro body
+fn fa_causal_reference(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor, svod_tensor::error::Error> {
+    let perm = |t: &Tensor| t.cast(DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute");
+    let (qp, kp, vp) = (perm(q), perm(k), perm(v));
+    let r = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(true).call().expect("sdpa");
+    r.try_permute(&[0, 2, 1, 3])
+}
+
 // Generic custom-kernel **check** via the `tensor`-layer macro — the graph-native
-// `flash_attention` vs causal SDPA on gfx942. Demonstrates the reusable
+// `flash_attention` vs causal SDPA on gfx942/gfx1151. Demonstrates the reusable
 // definition(`Tensor::graph_kernel`)/check(`custom_kernel_check!`) facility: tk just
 // supplies the kernel `run` + the `reference` op; the boilerplate (build inputs, run
-// both, cast f32, compare within tol) is generated.
+// both, cast f32, compare within tol) is generated. On a device the FA kernel
+// declines (`Ok(None)`: CUDA until the FA port), `run` self-skips onto the reference.
 // `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_graph_check_amd -- --ignored --nocapture`.
 svod_tensor::custom_kernel_check! {
     test_fa_graph_check_amd,
     inputs (q, k, v): shape [1, 128, 2, 64], dtype svod_dtype::DType::BFloat16,
-    run: |q, k, v| crate::kernels::fa::flash_attention(q, k, v).map(|o| o.expect("FA kernel applies to this shape")),
-    reference: |q, k, v| {
-        use svod_tensor::Tensor;
-        let perm = |t: &Tensor| {
-            t.cast(svod_dtype::DType::Float32).expect("→f32").try_permute(&[0, 2, 1, 3]).expect("permute")
-        };
-        let (qp, kp, vp) = (perm(q), perm(k), perm(v));
-        let r = qp.scaled_dot_product_attention().key(&kp).value(&vp).is_causal(true).call().expect("sdpa");
-        r.try_permute(&[0, 2, 1, 3])
+    run: |q, k, v| match crate::kernels::fa::flash_attention(q, k, v).expect("FA build") {
+        Some(o) => Ok(o),
+        None => {
+            eprintln!("skip test_fa_graph_check_amd: the FA kernel does not apply on this device");
+            fa_causal_reference(q, k, v)
+        }
     },
+    reference: fa_causal_reference,
     tol: 2e-2,
 }
 
@@ -516,6 +524,10 @@ svod_tensor::custom_kernel_check! {
 #[test]
 #[ignore]
 fn test_fa_noncausal_f16_amd() {
+    if !super::device_supported(crate::kernels::fa::FA_SUPPORTED_ARCHS) {
+        eprintln!("skip test_fa_noncausal_f16_amd: unsupported device/toolchain");
+        return;
+    }
     use crate::kernels::fa::{FaOpts, flash_attention_with};
     use svod_tensor::Tensor;
 
@@ -558,6 +570,10 @@ fn test_fa_noncausal_f16_amd() {
 #[test]
 #[ignore]
 fn test_fa_noncausal_f16_masked_amd() {
+    if !super::device_supported(crate::kernels::fa::FA_SUPPORTED_ARCHS) {
+        eprintln!("skip test_fa_noncausal_f16_masked_amd: unsupported device/toolchain");
+        return;
+    }
     use crate::kernels::fa::{FaOpts, flash_attention_with};
     use svod_tensor::Tensor;
 
@@ -617,6 +633,10 @@ fn test_fa_noncausal_f16_masked_amd() {
 #[test]
 #[ignore]
 fn test_fa_key_lens_zero_is_finite_amd() {
+    if !super::device_supported(crate::kernels::fa::FA_SUPPORTED_ARCHS) {
+        eprintln!("skip test_fa_key_lens_zero_is_finite_amd: unsupported device/toolchain");
+        return;
+    }
     use crate::kernels::fa::{FaOpts, flash_attention_with};
     use svod_tensor::Tensor;
 
@@ -640,4 +660,313 @@ fn test_fa_key_lens_zero_is_finite_amd() {
     let got: Vec<f32> = og_f.as_vec::<f32>().expect("read og");
 
     assert!(got.iter().all(|x| x.is_finite()), "key_lens==0 lane must be finite (key_lens clamp to >=1 missing?)");
+}
+
+// =============================================================================
+// CUDA sm_80+ (`mma.sync`, warp32).
+// =============================================================================
+
+/// Whether the env-selected device is CUDA sm_80+ with the NVPTX toolchain.
+fn cuda_device() -> bool {
+    super::fragment_device().is_some_and(|caps| caps.cuda().is_some())
+}
+
+/// `SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --lib fa::test_fa_tile_bench_cuda -- --ignored --nocapture`.
+///
+/// Per-dispatch GPU time of the non-causal kernel over the per-warp tile ×
+/// body-form grid at the whisper (`b·h = 6..48`) and GigaAM (`b·h = 128`)
+/// encoder geometries — the measurement behind the CUDA [`crate::kernels::fa::FaPolicy`].
+#[test]
+#[ignore]
+fn test_fa_tile_bench_cuda() {
+    use crate::kernels::fa::NUM_WARPS;
+    if !cuda_device() {
+        eprintln!("skip test_fa_tile_bench_cuda: no CUDA sm_80+ device / toolchain");
+        return;
+    }
+    let ws = super::fragment_device().expect("caps").wave_size;
+    let geometries = [(1usize, 1536usize, 6usize, 64usize), (8, 1536, 6, 64), (8, 1536, 16, 64), (1, 1024, 16, 64)];
+    let tiles = [(16usize, 16usize), (16, 32), (32, 32), (16, 64)];
+    for (b, n, h, d) in geometries {
+        let mk = || {
+            let mut t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16).expect("cast");
+            t.realize().expect("realize");
+            t
+        };
+        let (q, k, v) = (mk(), mk(), mk());
+        for (q_blk, kv_blk) in tiles {
+            for unroll in [false, true] {
+                if !n.is_multiple_of(q_blk * NUM_WARPS) {
+                    continue;
+                }
+                let mut o = Tensor::empty(&[b, n, h, d], DType::Float16);
+                let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
+                let cfg = FaConfig { q_blk, kv_blk, unroll, causal: false };
+                let compiled = crate::compile_kernel(
+                    "fa_bench",
+                    grid,
+                    (NUM_WARPS * ws) as i64,
+                    &mut [&mut o],
+                    &[&q, &k, &v],
+                    |ker| {
+                        build_fa_mw_rdb(ker, b, n, h, h, d, cfg, DType::Float16, false);
+                        ker.finish(1)
+                    },
+                )
+                .expect("compile");
+                let mut us: Vec<f64> = (0..12)
+                    .map(|_| compiled.dispatch_gpu_ns().expect("dispatch").expect("stamped") as f64 / 1e3)
+                    .collect();
+                us.sort_by(f64::total_cmp);
+                println!(
+                    "fa[cuda] b={b} n={n} h={h} tile={q_blk}x{kv_blk} unroll={unroll}: median {:.1} µs (min {:.1})",
+                    us[us.len() / 2],
+                    us[0]
+                );
+            }
+        }
+    }
+}
+
+/// Render `build_fa_mw_rdb` for sm_86 through the launch path's pipeline
+/// (post-optimization with the CUDA profile → linearize → render); with
+/// `TK_DUMP_IR=dir` the IR is written to `dir/<name>.ll` for offline `ptxas -v`.
+fn render_fa_sm86(name: &str, (b, n, h, h_kv, d): (usize, usize, usize, usize, usize), cfg: FaConfig) -> String {
+    use crate::kernels::fa::NUM_WARPS;
+    let sm86 = svod_dtype::CudaArch::from_compute_capability(8, 6);
+    let caps = crate::ArchCaps::for_arch(svod_dtype::GpuArch::Cuda(sm86));
+    let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
+    let ker = Kernel::new(name, grid, (NUM_WARPS * caps.wave_size) as i64, dummy_fa_buffers(b, n, h, h_kv, d), caps);
+    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, false);
+    let sink = ker.finish(1);
+    let renderer = svod_codegen::llvm::LlvmTextRenderer::nvptx(sm86);
+    let opt_renderer = svod_schedule::OptimizerRenderer::for_cuda_arch(sm86).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        svod_codegen::traits::Renderer::decompositor(&renderer),
+        None,
+    );
+    let optimized =
+        svod_schedule::apply_post_optimization_with_renderer(sink, &opt_renderer).expect("post optimization");
+    let program =
+        svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Cpu).expect("final target graph");
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+    let linear_uop =
+        linearized.toposort().into_iter().find(|u| matches!(u.op(), svod_ir::Op::Linear(..))).expect("LINEAR present");
+    let code = svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some(name)).expect("render").code;
+    if let Ok(dir) = std::env::var("TK_DUMP_IR") {
+        std::fs::create_dir_all(&dir).expect("dump dir");
+        std::fs::write(std::path::Path::new(&dir).join(format!("{name}.ll")), &code).expect("dump IR");
+    }
+    code
+}
+
+/// sm_86 FA renders to `mma.sync` (host, no GPU) for every per-warp tile and body
+/// form the CUDA [`crate::kernels::fa::FaPolicy`] can select: the two-half
+/// fragments lower to `llvm.nvvm.mma.m16n8k16` (bf16, f32 accumulate), the K/V
+/// double buffers are `addrspace(3)` shared arrays, the cross-lane reduce is the
+/// quad `shfl.bfly`, and no AMD intrinsic leaks through. `TK_DUMP_IR=dir` keeps the
+/// IR for `ptxas -v`.
+#[test_case::test_case(16, 32, false, true, 64; "16x32 rolled causal")]
+#[test_case::test_case(16, 32, true, false, 64; "16x32 flat")]
+#[test_case::test_case(32, 32, false, false, 64; "32x32 rolled")]
+#[test_case::test_case(32, 32, true, false, 64; "32x32 flat")]
+#[test_case::test_case(32, 32, true, true, 64; "32x32 flat causal")]
+#[test_case::test_case(32, 32, true, false, 128; "32x32 flat d=128")]
+#[test_case::test_case(16, 32, true, false, 128; "16x32 flat d=128")]
+#[test_case::test_case(16, 64, true, false, 64; "16x64 flat")]
+#[test_case::test_case(16, 64, true, true, 128; "16x64 flat causal d=128")]
+fn test_fa_sm86_renders_mma_sync(q_blk: usize, kv_blk: usize, unroll: bool, causal: bool, d: usize) {
+    let body = if unroll { "flat" } else { "rolled" };
+    let name = format!("fa_sm86_{q_blk}x{kv_blk}_{body}{}_d{d}", if causal { "_causal" } else { "" });
+    let code = render_fa_sm86(&name, (1, 512, 2, 2, d), FaConfig { q_blk, kv_blk, unroll, causal });
+    let mma =
+        code.lines().filter(|l| l.contains("llvm.nvvm.mma.m16n8k16.row.col.bf16") && !l.contains("declare")).count();
+    let per_slice = 2 * (kv_blk / 16) * (d / 16) * 2; // QKᵀ + A·V halves per fragment product
+    if unroll {
+        assert_eq!(mma, per_slice * (q_blk / 16), "flat body: every m16n8k16 half is a distinct call site");
+    } else {
+        assert!(mma > 0 && mma < per_slice, "rolled body keeps the fragment loops ({mma} sites)");
+    }
+    assert!(code.contains("addrspace(3)"), "the K/V double buffers are NVPTX shared arrays");
+    assert!(code.contains("shfl.sync.bfly"), "the softmax reduce completes in the quad butterfly");
+    // The K/V gathers are one `ldmatrix.x4` per 16×16 fragment — plain for K (a
+    // `Row` tile read `Row`), `.trans` for V (read `Col`) — and no scalar shared
+    // load remains.
+    let calls = |needle: &str| code.lines().filter(|l| l.contains(needle) && !l.contains("declare")).count();
+    let frags = (kv_blk / 16) * (d / 16);
+    assert_eq!(calls("call { i32, i32, i32, i32 } @llvm.nvvm.ldmatrix.sync.aligned.m8n8.x4.b16("), frags, "K");
+    assert_eq!(calls("call { i32, i32, i32, i32 } @llvm.nvvm.ldmatrix.sync.aligned.m8n8.x4.trans.b16("), frags, "V");
+    // The K/V stream is `cp.async`: one 16-byte copy per lane per pass of each tile
+    // in the prologue and in the loop, one commit per tile, one `wait_group 0` at the
+    // loop top and one `wait_all` drain after it; no `st.shared` commit remains.
+    let passes = (kv_blk * d * 2).div_ceil(256 * 16);
+    assert_eq!(calls("@llvm.nvvm.cp.async.cg.shared.global.16("), 4 * passes, "K+V copies, prologue + loop");
+    assert_eq!(calls("@llvm.nvvm.cp.async.commit.group()"), 4);
+    assert_eq!(calls("@llvm.nvvm.cp.async.wait.group(i32 0)"), 1);
+    assert_eq!(calls("@llvm.nvvm.cp.async.wait.all()"), 1);
+    // In the PTX: no scalar shared load survives (the gathers are `ldmatrix`), the
+    // K/V commit is `cp.async` (no `st.shared`), and the loop carries one barrier.
+    if let Some(ptx) = ptx_of(&code) {
+        let count = |needle: &str| ptx.matches(needle).count();
+        assert_eq!(count("ld.shared.b16"), 0, "scalar LDS gather in the PTX:\n{ptx}");
+        assert_eq!(count("st.shared"), 0, "register-staged LDS commit in the PTX:\n{ptx}");
+        assert_eq!(count("ldmatrix.sync.aligned.m8n8.x4.shared.b16"), frags);
+        assert_eq!(count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16"), frags);
+        assert_eq!(count("cp.async.cg.shared.global"), 4 * passes);
+        assert_eq!((count("cp.async.wait_group"), count("cp.async.wait_all"), count("bar.sync")), (1, 1, 1));
+    }
+    assert!(
+        !code.contains("amdgcn") && !code.contains("mfma") && !code.contains("wmma."),
+        "no AMD intrinsics on NVPTX"
+    );
+}
+
+/// The sm_86 PTX of rendered NVPTX IR, or `None` without an NVPTX-enabled clang
+/// (the render assertions still run; only the PTX-level ones skip).
+pub(super) fn ptx_of(code: &str) -> Option<String> {
+    if !svod_runtime::cuda::has_nvptx_target() {
+        return None;
+    }
+    let sm86 = svod_dtype::CudaArch::from_compute_capability(8, 6);
+    Some(String::from_utf8(svod_runtime::cuda::compile_ir_to_ptx(code, sm86).expect("clang accepts the IR")).unwrap())
+}
+
+const GFX942: svod_dtype::GpuArch = svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942);
+const GFX1151: svod_dtype::GpuArch = svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx1151);
+const SM_86: svod_dtype::GpuArch = svod_dtype::GpuArch::Cuda(svod_dtype::CudaArch::from_compute_capability(8, 6));
+
+/// The per-arch tile policy: gfx942's `{32,32}` needs `b·h·n/256 >= 304` blocks
+/// (else the `{16,32}` baseline), gfx1151 always takes the baseline, and CUDA
+/// takes the taller `{16,64}` KV block (flat) once the grid covers its 28 SMs, at
+/// d ≤ 64 (the d=128 double buffers would exceed the static LDS).
+#[test_case::test_case(GFX942, (1, 1536, 16, 64), (16, 32), false; "gfx942 small grid")]
+#[test_case::test_case(GFX942, (8, 2048, 32, 128), (32, 32), false; "gfx942 machine-covering grid")]
+#[test_case::test_case(GFX942, (64, 1152, 16, 64), (16, 32), false; "gfx942 N not a 256-multiple")]
+#[test_case::test_case(GFX1151, (64, 2048, 32, 64), (16, 32), false; "gfx1151 baseline only")]
+#[test_case::test_case(SM_86, (1, 1536, 6, 64), (16, 64), true; "sm_86 whisper-tiny b=1")]
+#[test_case::test_case(SM_86, (8, 1536, 16, 64), (16, 64), true; "sm_86 gigaam")]
+#[test_case::test_case(SM_86, (1, 1024, 16, 64), (16, 64), true; "sm_86 gigaam b=1")]
+#[test_case::test_case(SM_86, (1, 256, 2, 64), (16, 32), true; "sm_86 tiny grid")]
+#[test_case::test_case(SM_86, (8, 1152, 16, 64), (16, 64), true; "sm_86 N a 128-multiple only")]
+#[test_case::test_case(SM_86, (8, 1536, 16, 128), (16, 32), true; "sm_86 d=128 keeps the small tile")]
+fn fa_policy_tile(
+    arch: svod_dtype::GpuArch,
+    (b, n, h, d): (usize, usize, usize, usize),
+    tile: (usize, usize),
+    unroll: bool,
+) {
+    let policy = crate::kernels::fa::FaPolicy::for_arch(arch);
+    assert_eq!(policy.tile(b, n, h, d), tile);
+    let cfg = policy.config(b, n, h, d, false);
+    assert_eq!((cfg.q_blk, cfg.kv_blk, cfg.unroll, cfg.causal), (tile.0, tile.1, unroll, false));
+}
+
+/// The f32 SDPA reference of `flash_attention_with(q, k, v, opts)` in `[B,N,H,D]`:
+/// the GQA `h_kv` groups broadcast to `h`, `causal` and the `[B,1,1,N]` key mask
+/// (`kv_pos >= key_lens[b]`) applied exactly as the kernel does.
+fn fa_reference(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, key_lens: Option<&[i32]>) -> Tensor {
+    let dims = |t: &Tensor| t.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>();
+    let (b, n, h, d) = (dims(q)[0], dims(q)[1], dims(q)[2], dims(q)[3]);
+    let h_kv = dims(k)[2];
+    let perm = |t: &Tensor| {
+        let t = t.cast(DType::Float32).unwrap();
+        let t = if dims(&t)[2] == h {
+            t
+        } else {
+            t.try_reshape([b, n, h_kv, 1, d])
+                .unwrap()
+                .try_expand([b, n, h_kv, h / h_kv, d])
+                .unwrap()
+                .try_reshape([b, n, h, d])
+                .unwrap()
+        };
+        t.try_permute(&[0, 2, 1, 3]).unwrap()
+    };
+    let mask = key_lens.map(|lens| {
+        let range = Tensor::arange(n as i64, None, None).unwrap().try_reshape([1usize, 1, 1, n]).unwrap();
+        range.try_ge(&Tensor::from_slice(lens).try_reshape([b, 1, 1, 1]).unwrap()).unwrap()
+    });
+    perm(q)
+        .scaled_dot_product_attention()
+        .key(&perm(k))
+        .value(&perm(v))
+        .is_causal(causal)
+        .maybe_attn_mask(mask.as_ref())
+        .call()
+        .unwrap()
+        .try_permute(&[0, 2, 1, 3])
+        .unwrap()
+}
+
+/// `SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --lib fa::test_fa_cuda -- --ignored --nocapture`.
+///
+/// The production [`flash_attention_with`] on CUDA sm_80+ vs SDPA at the model
+/// geometries: whisper (d=64, T=1500 padded to 1536 with a 1500-key mask, h=6/8,
+/// b=1..8), GigaAM (d=64, T=1536, h=16, b=8, key-padding mask), causal, GQA
+/// (`h_kv < h`), d=128, bf16 and f16, both per-warp tiles of the policy. The
+/// kernel accumulates in f32 over the same 16-bit operands the reference reads.
+#[test_case::test_case(1, 1536, 6, 6, 64, DType::Float16, false, Some(1500); "whisper tiny b=1 f16")]
+#[test_case::test_case(8, 1536, 8, 8, 64, DType::Float16, false, Some(1500); "whisper base b=8 f16")]
+#[test_case::test_case(3, 1536, 8, 8, 64, DType::BFloat16, false, None; "whisper b=3 bf16 unmasked")]
+#[test_case::test_case(8, 1536, 16, 16, 64, DType::Float16, false, Some(1000); "gigaam b=8 f16 padded")]
+#[test_case::test_case(2, 1024, 16, 16, 64, DType::BFloat16, false, Some(777); "gigaam-like bf16 padded")]
+#[test_case::test_case(1, 512, 4, 4, 64, DType::BFloat16, true, None; "causal bf16 big tile")]
+#[test_case::test_case(1, 128, 2, 2, 64, DType::Float16, true, None; "causal f16 small tile")]
+#[test_case::test_case(2, 256, 8, 2, 64, DType::BFloat16, false, None; "gqa bf16 small tile")]
+#[test_case::test_case(2, 512, 8, 2, 128, DType::Float16, true, None; "gqa d=128 causal f16")]
+#[test_case::test_case(1, 256, 8, 8, 64, DType::Float16, false, Some(200); "masked f16 small tile")]
+#[ignore]
+#[allow(clippy::too_many_arguments)]
+fn test_fa_cuda(b: usize, n: usize, h: usize, h_kv: usize, d: usize, dtype: DType, causal: bool, valid: Option<i32>) {
+    if !cuda_device() {
+        eprintln!("skip test_fa_cuda: no CUDA sm_80+ device / toolchain");
+        return;
+    }
+    let mk = |h: usize| {
+        let mut t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(dtype.clone()).expect("cast");
+        t.realize().expect("realize");
+        t
+    };
+    let (q, k, v) = (mk(h), mk(h_kv), mk(h_kv));
+    let lens: Option<Vec<i32>> = valid.map(|l| vec![l; b]);
+    let lens_t = lens.as_ref().map(|l| Tensor::from_slice(l.as_slice()));
+    let mut got = flash_attention_with(&q, &k, &v, FaOpts { causal, key_lens: lens_t.as_ref() })
+        .expect("fa")
+        .expect("the FA kernel applies on CUDA sm_80+")
+        .cast(DType::Float32)
+        .expect("→f32");
+    got.realize().expect("realize");
+    let mut reference = fa_reference(&q, &k, &v, causal, lens.as_deref());
+    reference.realize().expect("realize reference");
+    let report = svod_tensor::testing::allclose_f32(
+        &got.as_vec::<f32>().expect("read"),
+        &reference.as_vec::<f32>().expect("read reference"),
+        2e-2,
+        2e-2,
+    );
+    println!("fa[cuda] b={b} n={n} h={h}/{h_kv} d={d} {dtype:?} causal={causal} lens={valid:?}: {}", report.message);
+    assert!(report.ok, "{}", report.message);
+}
+
+/// Every RANGE a kernel body opens must be closed on every path to its SINK: the
+/// tensor scheduler's kernel split (`split_store`) treats a RANGE still in scope
+/// at a CALL as an interior loop and refuses to cut the *consumer* kernel, which
+/// then fails the kernel-graph spec. `After.ended_ranges()` only propagates through
+/// `END`/`After` deps — an ordering statement (a `cp.async` wait, a barrier) as an
+/// `After` dep hides the loop `END` from a carried accumulator's post-loop read, so
+/// the CUDA stream threads its drain through the output GLOBAL instead. Pins both
+/// K/V streams, flat and rolled.
+#[test_case::test_case(SM_86, true; "sm_86 flat")]
+#[test_case::test_case(SM_86, false; "sm_86 rolled")]
+#[test_case::test_case(GFX942, false; "gfx942 rolled")]
+fn fa_sink_leaves_no_range_in_scope(arch: svod_dtype::GpuArch, unroll: bool) {
+    use crate::kernels::fa::NUM_WARPS;
+    let (b, n, h, h_kv, d) = (1usize, 128usize, 2usize, 2usize, 64usize);
+    let cfg = FaConfig { q_blk: 16, kv_blk: 32, unroll, causal: true };
+    let caps = crate::ArchCaps::for_arch(arch);
+    let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
+    let ker = Kernel::new("fa", grid, (NUM_WARPS * caps.wave_size) as i64, dummy_fa_buffers(b, n, h, h_kv, d), caps);
+    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, false);
+    let sink = ker.finish(1);
+    assert!(sink.in_scope_ranges().is_empty(), "RANGE {:?} still open at the SINK", sink.in_scope_ranges());
 }

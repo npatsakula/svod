@@ -105,11 +105,18 @@ nix fmt # Format source files
 | libffi | >=3.4 | yes | Foreign function interface |
 | libxml2 | >=2.13 | yes | XML parsing |
 | Z3 | >=4.15 | no | SMT solver for optimization verification |
+| NVIDIA driver | CUDA >=12.8 (R570) | no | `libcuda.so.1` for the CUDA backend, loaded at runtime; no toolkit needed |
+| Clang NVPTX / AMDGPU targets | - | no | GPU kernel compilation (`clang --print-targets`) |
+
+### Threads
+
+`SVOD_THREADS` (default: host parallelism) is the single thread budget: it sizes
+the pool that compiles kernels and executes CPU kernels, and is the default
+`core_id` split of CPU kernels. `RAYON_NUM_THREADS` is not consulted.
 
 ## Test
 
 ```bash
 cargo test
 cargo test --features z3,proptest  # With Z3 verification and PB generated tests
-cargo test --features cuda   # With CUDA tests
 ```

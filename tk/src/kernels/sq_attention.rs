@@ -10,16 +10,18 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 use snafu::ensure;
-use svod_dtype::{AmdArch, DType};
+use svod_dtype::{AmdArch, CudaArch, DType};
 use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
-use crate::Kernel;
 use crate::index::{Idx, flat_index, flat_offset, index_off_gated, load_at, load_off_gated};
 use crate::scaffold::GlSpec;
+use crate::{ArchCaps, ArchSet, Kernel};
 
-/// Architectures on which the scalar shuffle implementation is supported.
-pub const SQ_ATTENTION_SUPPORTED_ARCHS: &[AmdArch] = &[AmdArch::Gfx942, AmdArch::Gfx1151];
+/// Architectures on which the scalar shuffle implementation is supported: the AMD
+/// pair plus CUDA from Ampere up (the kernel needs only `shfl.sync` and `ex2`).
+pub const SQ_ATTENTION_SUPPORTED_ARCHS: ArchSet =
+    ArchSet::amd(&[AmdArch::Gfx942, AmdArch::Gfx1151]).with_cuda_from(CudaArch::from_compute_capability(8, 0));
 
 /// Compile-time masking options for [`single_query_attention`].
 #[derive(Clone, Copy)]
@@ -417,8 +419,8 @@ pub(crate) fn build_single_query_attention_merge(ker: &Kernel, b: usize, h: usiz
 ///
 /// Q is `[B,1,H,D]`, K/V are `[B,N,H_total,D]`, and output is `[B,1,H,D]`.
 /// The first `H` K/V heads are selected.
-/// Returns `Ok(None)` when the target is not gfx942/gfx1151. No generic SDPA
-/// fallback is performed here.
+/// Returns `Ok(None)` when the target is outside [`SQ_ATTENTION_SUPPORTED_ARCHS`].
+/// No generic SDPA fallback is performed here.
 pub fn single_query_attention(
     q: &Tensor,
     k: &Tensor,
@@ -551,9 +553,9 @@ pub fn single_query_attention_packed(
         // arch's wave size does not divide is a fit failure of THIS runtime
         // instance (wave is 32 or 64 by arch), not a caller bug: decline to
         // `Ok(None)` and let the caller's generic attention path take over.
-        move |arch| d.is_multiple_of(arch.wave_size() as usize),
+        move |arch| d.is_multiple_of(ArchCaps::for_arch(arch).wave_size),
         move |arch| {
-            let caps = crate::ArchCaps::for_arch(arch);
+            let caps = ArchCaps::for_arch(arch);
             if splits == 1 {
                 let out = Tensor::empty(&[b, 1, h, d], DType::Float32);
                 let mut inputs = vec![q, k, v];

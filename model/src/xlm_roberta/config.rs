@@ -3,7 +3,7 @@
 //! Mirrors the published schema of `BAAI/bge-m3` (XLM-RoBERTa-large). The
 //! [`RawXlmRobertaConfig`] serde mirror captures the on-disk shape; the clean
 //! [`XlmRobertaConfig`] keeps only the fields the Rust backbone consumes and
-//! adds a caller-chosen compute [`DType`] (defaults to bf16 on the AMD target,
+//! adds a caller-chosen compute [`DType`] (defaults to [`crate::default_compute_dtype`];
 //! f32 for CPU parity tests).
 
 use std::path::Path;
@@ -99,7 +99,7 @@ pub fn xlm_roberta_large() -> XlmRobertaConfig {
         type_vocab_size: 1,
         layer_norm_eps: 1e-5,
         pad_token_id: 1,
-        dtype: DType::BFloat16,
+        dtype: crate::default_compute_dtype(),
         max_batch_size: 1,
     }
 }

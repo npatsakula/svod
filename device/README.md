@@ -5,76 +5,53 @@ Device abstraction with lazy buffer allocation, zero-copy views, and LRU caching
 ## Example
 
 ```rust
-use svod_device::{Buffer, BufferOptions, registry};
+use svod_device::{Buffer, BufferSpec, registry};
 use svod_dtype::DType;
 
 // CPU buffer (lazy allocation)
-let cpu = registry::cpu();
-let buf = Buffer::new(cpu, DType::float32(), &[1024], BufferOptions::default());
+let cpu = registry::cpu()?;
+let buf = Buffer::new(cpu, DType::Float32, vec![1024], BufferSpec::default());
 
-// CUDA buffer with unified memory (CPU-accessible)
-let cuda = registry::cuda(0);
-let opts = BufferOptions { cpu_accessible: true, ..Default::default() };
-let unified = Buffer::allocate(cuda, DType::float32(), &[1024], opts)?;
+// AMD buffer without a host mapping (device-only VRAM)
+let amd = registry::get_device("AMD:0")?;
+let opts = BufferSpec { cpu_access: false, ..Default::default() };
+let vram = Buffer::allocate(amd, DType::Float32, vec![1024], opts)?;
 
 // Zero-copy view
-let view = buf.view(0, 512);
+let view = buf.view(0, 512)?;
 
 // Device-to-device copy
 dst.copy_from(&src)?;
 ```
 
-## Features
+## Allocators
 
-**Supported:**
+| Device | Allocator | Backing |
+|--------|-----------|---------|
+| `CPU` | `CpuAllocator` | 64-byte aligned host memory |
+| `AMD:N` | `AmdAllocator` | KFD ioctls: VRAM or GTT, optional host BAR mmap |
+| `METAL:N` | `MetalAllocator` | `MTLBuffer` with shared storage |
+| `DISK:path` | `DiskAllocator` | read-only mmap, no LRU cache |
+| `CUDA:N` | `CudaAllocator` | CUDA driver API: device memory, managed for host-visible, pinned for `host` |
 
-- Lazy buffer allocation via `OnceLock`
-- Zero-copy buffer views with offset tracking
-- LRU allocation cache (per-size pooling)
-- CPU allocator
-- CUDA allocator (feature `cuda`)
-
-**CUDA Buffer Management** (feature `cuda`; CUDA code generation is not yet available — CPU backends only):
-| Feature | Implementation | Notes |
-|---------|---------------|-------|
-| Unified memory | `cudaMallocManaged` | `cpu_accessible: true` |
-| Device memory | `cuMemAlloc` | Faster GPU access |
-| D2D copy | `memcpy_dtod` | Direct device-to-device |
-| H2D/D2H copy | `memcpy_htod/dtoh` | Host transfers |
-| Zero-init | `memset_zeros` | Stream-based |
-
-**Planned:**
-
-- Metal allocator
-- WebGPU allocator
-- Multi-GPU peer access
-- Custom stream management
-- Pinned host memory
-
-## Copy Matrix
-
-All combinations supported:
-
-| | CPU | CudaDevice | CudaUnified |
-|--|-----|------------|-------------|
-| **CPU** | slice | H2D | slice |
-| **CudaDevice** | D2H | D2D | D2D |
-| **CudaUnified** | slice | D2D | slice |
+Every compute allocator is wrapped in `LruAllocator`, which pools freed
+buffers by `(size, BufferSpec)` and re-zeroes on demand. GPU backends are
+always compiled and self-register only when their hardware is present.
 
 ## Device Registry
 
 ```rust
-registry::cpu()              // CPU allocator
-registry::cuda(0)            // CUDA device 0
-registry::get_device("CUDA:1")  // Parse string
+registry::cpu()                 // CPU allocator
+registry::get_device("AMD:1")   // Parse string, cached per spec
 
-DeviceSpec::parse("cuda:0")  // Case-insensitive parsing
-spec.canonicalize()          // → "CUDA:0"
+DeviceSpec::parse("amd:0")      // Case-insensitive parsing
+spec.canonicalize()             // → "AMD:0"
 ```
 
 ## Testing
 
 ```bash
 cargo test -p svod-device
-cargo test -p svod-device --features cuda  # with CUDA
 ```
+
+GPU tests self-skip when no supported device is present.

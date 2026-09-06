@@ -59,7 +59,9 @@ pub enum KernelNaming {
 /// Give a kernel finished under [`KernelNaming::Deferred`] its unique name, on
 /// both channels the optimizer writes it to: the SINK's structural
 /// `KernelInfo.name` and the attached optimizer metadata. Kernels without
-/// optimizer metadata were never named and stay as they are.
+/// optimizer metadata were never named and stay as they are. A hand-authored
+/// name goes through the same counter, so two different kernels launched
+/// under one name stay distinguishable in profiles and IR dumps.
 pub fn finalize_kernel_name(ast: &Arc<UOp>) -> Arc<UOp> {
     use crate::optimizer::KernelInfo;
     let Some(info) = ast.metadata::<KernelInfo>() else { return ast.clone() };
@@ -1009,15 +1011,20 @@ impl Scheduler {
         let flattened_ast =
             crate::rewrite::graph_rewrite(crate::rangeify::pm_flatten_range(), self.ast.clone(), &mut ());
 
-        let flattened_ast = match flattened_ast.op() {
+        let (flattened_ast, name) = match flattened_ast.op() {
             Op::Sink(ops::Sink { sources, info }) => {
                 let mut structural = info.clone().unwrap_or_default();
+                // A hand-authored kernel (`opts_to_apply` set) keeps its author's name.
+                let name = match &structural.name {
+                    Some(authored) if structural.opts_to_apply.is_some() => authored.clone(),
+                    _ => name,
+                };
                 structural.name = Some(name.clone());
                 structural.applied_opts = self.applied_opts.clone();
                 structural.dont_use_locals = self.dont_use_locals;
-                UOp::sink_with_info(sources.iter().cloned().collect(), structural)
+                (UOp::sink_with_info(sources.iter().cloned().collect(), structural), name)
             }
-            _ => flattened_ast,
+            _ => (flattened_ast, name),
         };
 
         // 3. Attach metadata

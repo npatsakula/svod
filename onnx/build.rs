@@ -12,7 +12,7 @@ fn main() {
     generate_light_tests();
 }
 
-/// Generate a Clang, LLVM, and availability-gated AMD test module for each case.
+/// Generate a Clang, LLVM, and availability-gated AMD and CUDA test module for each case.
 fn write_backend_test(code: &mut String, fn_name: &str, ignored: bool, helper_call: &str) {
     let attr = if ignored { "#[ignore]\n        " } else { "" };
     code.push_str(&format!(
@@ -39,6 +39,16 @@ mod {fn_name} {{
         ::svod_schedule::testing::setup_test_tracing();
         let Some(config) = svod_tensor::PrepareConfig::for_amd_if_available() else {{
             eprintln!(\"AMD ONNX variant skipped: no active supported AMD device\");
+            return;
+        }};
+        {helper_call}
+    }}
+
+    #[test]
+    {attr}fn cuda() {{
+        ::svod_schedule::testing::setup_test_tracing();
+        let Some(config) = svod_tensor::PrepareConfig::for_cuda_if_available() else {{
+            eprintln!(\"CUDA ONNX variant skipped: no active CUDA device\");
             return;
         }};
         {helper_call}

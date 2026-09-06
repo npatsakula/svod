@@ -18,12 +18,7 @@ use svod_tensor::testing::allclose_f32;
 use crate::kernels::fa::{FA_SUPPORTED_ARCHS, FaOpts, flash_attention_with};
 use crate::kernels::matmul::{MATMUL_SUPPORTED_ARCHS, matmul};
 
-/// Whether the env-selected device is a supported AMD GPU (with the AMD-LLVM
-/// toolchain) — else the `#[ignore]`d tests self-skip instead of erroring on CPU.
-fn device_supported(archs: &'static [svod_dtype::AmdArch]) -> bool {
-    let spec = Tensor::empty(&[1], DType::Float32).device();
-    crate::target::check_target(&spec, archs).is_ok()
-}
+use super::device_supported;
 
 /// A realized random tensor of `dtype` on the env-selected device.
 fn randn_dt(shape: &[usize], dtype: DType) -> Tensor {

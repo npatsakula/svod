@@ -372,7 +372,7 @@ impl Buffer {
     ///
     /// # Errors
     /// - `NotAllocated` if buffer hasn't been allocated
-    /// - `NotCpuAccessible` for CUDA device buffers (use `copyout` instead)
+    /// - `NotCpuAccessible` for device-only buffers (use `copyout` instead)
     pub fn as_host_bytes(&self) -> Result<&[u8]> {
         self.ensure_allocated()?;
         let raw = self.data.raw();
@@ -387,6 +387,10 @@ impl Buffer {
             RawBuffer::Mmap { data, .. } => Ok(&data[self.offset..self.offset + self.size]),
             RawBuffer::Metal { contents, device, .. } => {
                 let base = metal_host_ptr(device, *contents, self.offset)?;
+                Ok(unsafe { std::slice::from_raw_parts(base, self.size) })
+            }
+            RawBuffer::Cuda { device_ptr, host_ptr, device, .. } => {
+                let base = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)?;
                 Ok(unsafe { std::slice::from_raw_parts(base, self.size) })
             }
             RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
@@ -417,8 +421,6 @@ impl Buffer {
                 );
                 NotCpuAccessibleSnafu.fail()
             }
-            #[cfg(feature = "cuda")]
-            _ => NotCpuAccessibleSnafu.fail(),
         }
     }
 
@@ -429,7 +431,7 @@ impl Buffer {
     ///
     /// # Errors
     /// - `NotAllocated` if buffer hasn't been allocated
-    /// - `NotCpuAccessible` for CUDA device buffers
+    /// - `NotCpuAccessible` for device-only buffers
     #[allow(clippy::mut_from_ref)] // interior mutability via UnsafeCell
     pub fn as_host_bytes_mut(&self) -> Result<&mut [u8]> {
         self.ensure_mutable("as_host_bytes_mut")?;
@@ -449,6 +451,10 @@ impl Buffer {
                 let base = metal_host_ptr(device, *contents, self.offset)?;
                 Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
             }
+            RawBuffer::Cuda { device_ptr, host_ptr, device, .. } => {
+                let base = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)?;
+                Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
+            }
             RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
@@ -457,15 +463,13 @@ impl Buffer {
                 Ok(unsafe { std::slice::from_raw_parts_mut(base, self.size) })
             }
             RawBuffer::AmdDevice { host_ptr: None, .. } => NotCpuAccessibleSnafu.fail(),
-            #[cfg(feature = "cuda")]
-            _ => NotCpuAccessibleSnafu.fail(),
         }
     }
 
     /// Typed immutable view over CPU-accessible buffer memory.
     ///
     /// Returns an ndarray view shaped according to the buffer's concrete dimensions.
-    /// Only works for CPU-accessible buffers — fails for device-only CUDA memory.
+    /// Only works for CPU-accessible buffers — fails for device-only memory.
     ///
     /// # Errors
     /// - `TypeMismatch` if `T::DTYPE` doesn't match buffer dtype
@@ -496,6 +500,12 @@ impl Buffer {
                 let typed = unsafe { std::slice::from_raw_parts(bytes_ptr, count) };
                 ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
             }
+            RawBuffer::Cuda { device_ptr, host_ptr, device, .. } => {
+                let bytes_ptr = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)? as *const T;
+                let count = self.size / T::DTYPE.bytes();
+                let typed = unsafe { std::slice::from_raw_parts(bytes_ptr, count) };
+                ndarray::ArrayViewD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
+            }
             RawBuffer::AmdDevice { host_ptr: Some(ptr), gpu_addr, device, .. } => {
                 // Async dispatch: drain before raw host access — host-pointer
                 // reads/writes aren't ordered on the GPU timeline.
@@ -519,8 +529,6 @@ impl Buffer {
                 );
                 NotCpuAccessibleSnafu.fail()
             }
-            #[cfg(feature = "cuda")]
-            _ => NotCpuAccessibleSnafu.fail(),
         }
     }
 
@@ -549,6 +557,12 @@ impl Buffer {
             }
             RawBuffer::Metal { contents, device, .. } => {
                 let bytes_ptr = metal_host_ptr(device, *contents, self.offset)? as *mut T;
+                let count = self.size / T::DTYPE.bytes();
+                let typed = unsafe { std::slice::from_raw_parts_mut(bytes_ptr, count) };
+                ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
+            }
+            RawBuffer::Cuda { device_ptr, host_ptr: host_ptr @ Some(_), device, .. } => {
+                let bytes_ptr = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)? as *mut T;
                 let count = self.size / T::DTYPE.bytes();
                 let typed = unsafe { std::slice::from_raw_parts_mut(bytes_ptr, count) };
                 ndarray::ArrayViewMutD::from_shape(ndarray::IxDyn(&self.shape), typed).context(NdarrayShapeSnafu)
@@ -583,6 +597,11 @@ impl Buffer {
             }
             RawBuffer::Metal { contents, device, .. } => {
                 let bytes_ptr = metal_host_ptr(device, *contents, self.offset)? as *const T;
+                let count = self.size / T::DTYPE.bytes();
+                Ok(unsafe { std::slice::from_raw_parts(bytes_ptr, count) })
+            }
+            RawBuffer::Cuda { device_ptr, host_ptr: host_ptr @ Some(_), device, .. } => {
+                let bytes_ptr = cuda_host_ptr(device, *device_ptr, *host_ptr, self.offset)? as *const T;
                 let count = self.size / T::DTYPE.bytes();
                 Ok(unsafe { std::slice::from_raw_parts(bytes_ptr, count) })
             }
@@ -784,12 +803,14 @@ impl Buffer {
     }
 
     /// Record `token` as an in-flight producer/reader of this buffer's
-    /// storage for scoped host synchronization (see the AMD backend's
-    /// `wait_storage`). No-op on non-AMD storage and on storage that was
+    /// storage for scoped host synchronization (the AMD and CUDA
+    /// `wait_storage`). No-op on other backends and on storage that was
     /// never allocated (nothing can be in flight against it).
     pub fn record_completion(&self, token: &Arc<dyn crate::sync::CompletionToken>) {
-        if let Some(RawBuffer::AmdDevice { gpu_addr, device, .. }) = self.data.raw.get() {
-            device.core().record_producer(*gpu_addr, token);
+        match self.data.raw.get() {
+            Some(RawBuffer::AmdDevice { gpu_addr, device, .. }) => device.core().record_producer(*gpu_addr, token),
+            Some(RawBuffer::Cuda { device_ptr, device, .. }) => device.record_producer(*device_ptr, token),
+            _ => {}
         }
     }
 
@@ -831,13 +852,8 @@ impl Buffer {
                 // this pointer; it's just stuffed into the kernarg slot.
                 (*gpu_addr as usize + self.offset) as *mut u8
             }
-            #[cfg(feature = "cuda")]
-            RawBuffer::CudaDevice { .. } | RawBuffer::CudaUnified { .. } => {
-                // TODO: CUDA device memory support for kernels
-                // This requires proper stream management and synchronization
-                // For MVP, we only support CPU execution
-                unimplemented!("CUDA buffer raw pointers not yet supported for kernel execution")
-            }
+            // Device pointer for the kernarg slot, as on AMD.
+            RawBuffer::Cuda { device_ptr, .. } => (*device_ptr as usize + self.offset) as *mut u8,
         }
     }
 
@@ -866,20 +882,24 @@ impl Buffer {
             RawBuffer::Mmap { data, .. } => data.as_ptr() as usize,
             RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr as usize,
             RawBuffer::Metal { contents, .. } => contents.as_ptr() as usize,
-            #[cfg(feature = "cuda")]
-            RawBuffer::CudaDevice { data, .. } => {
-                // For CUDA device memory, we use the CudaSlice's internal pointer
-                // SAFETY: Only reading pointer address for test comparison
-                unsafe { &*data.get() as *const _ as usize }
-            }
-            #[cfg(feature = "cuda")]
-            RawBuffer::CudaUnified { data, .. } => {
-                // For CUDA unified memory, we use the UnifiedSlice's internal pointer
-                // SAFETY: Only reading pointer address for test comparison
-                unsafe { &*data.get() as *const _ as usize }
-            }
+            RawBuffer::Cuda { device_ptr, .. } => *device_ptr as usize,
         }
     }
+}
+
+/// Host pointer into a managed or pinned CUDA allocation after waiting the
+/// storage's in-flight producers and readers (host access is not ordered
+/// against the plan streams); device-only allocations have no host side.
+fn cuda_host_ptr(
+    device: &Arc<crate::cuda::CudaDevice>,
+    device_ptr: u64,
+    host_ptr: Option<std::ptr::NonNull<u8>>,
+    offset: usize,
+) -> Result<*mut u8> {
+    let host_ptr = host_ptr.ok_or(crate::error::Error::NotCpuAccessible)?;
+    device.wait_storage(device_ptr)?;
+    // SAFETY: the view offset is bounded by the allocation (`Buffer::view`).
+    Ok(unsafe { host_ptr.as_ptr().add(offset) })
 }
 
 /// Drain the Metal device before raw host access: shared-storage reads and

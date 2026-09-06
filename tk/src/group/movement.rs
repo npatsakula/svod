@@ -1,16 +1,19 @@
 //! The load/store path: the public [`Group::load`](super::Group)/`store` entry
 //! points (their legal address-space pairs resolved at compile time via
 //! `LoadInto`/`StoreInto`), the coalesced GLOBAL↔LDS fills (scalar and vectorized,
-//! plus the register-staged prefetch), and the GLOBAL/LOCAL↔REG fragment
-//! gather/scatter hops.
+//! plus the register-staged prefetch and the CUDA `cp.async` fill), and the
+//! GLOBAL/LOCAL↔REG fragment gather/scatter hops (the LOCAL→REG gather of a 16-bit
+//! `mma.sync` fragment is one `ldmatrix.x4` on CUDA).
 
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
+use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_commit, cp_async_wait, ldmatrix};
 use svod_ir::{AxisType, ConstValue, Op, UOp};
 
-use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, lane_rc, wave_offset};
+use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, wave_offset};
 use crate::index::{Idx, cidx, flat_index, flat_offset, index_off, index_off_gated, load_at, load_off, load_off_gated};
+use crate::layout::LdmatrixX4;
 use crate::tile::{GL, RT, ST};
 use crate::tiles::TileLayout;
 use svod_ir::ops;
@@ -83,21 +86,7 @@ impl<'k> Group<'k> {
     pub fn stage_global_to_reg(&self, st: &ST, src: &GL, idxs: &[Idx], axis: usize) -> Arc<UOp> {
         let geom = self.lds_fill_geom(st);
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
-        let idxs_t: Vec<Idx> = idxs
-            .iter()
-            .enumerate()
-            .map(|(i, idx)| {
-                let mut e = idx.clone();
-                if i == axis {
-                    e = idx_mul(&e, st.rows as i64);
-                }
-                if i == 3 {
-                    e = idx_mul(&e, st.cols as i64);
-                }
-                e
-            })
-            .collect();
-        let src_i_base = flat_offset(src.shape(), &idxs_t);
+        let src_i_base = Self::tile_base(st, src, idxs, axis);
 
         let stage = self.ker.alloc_reg((geom.total_calls * geom.ept) as usize, st.elem().clone());
         let outer = self.ker.raw_range(geom.total_calls, AxisType::Loop);
@@ -234,21 +223,7 @@ impl<'k> Group<'k> {
     /// `false` and inserts the barrier itself (see [`Self::fill_local_nobar`]).
     pub(super) fn load_global_to_local(&self, st: ST, src: &GL, idxs: &[Idx], axis: usize, barrier: bool) -> ST {
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
-        let idxs_t: Vec<Idx> = idxs
-            .iter()
-            .enumerate()
-            .map(|(i, idx)| {
-                let mut e = idx.clone();
-                if i == axis {
-                    e = idx_mul(&e, st.rows as i64);
-                }
-                if i == 3 {
-                    e = idx_mul(&e, st.cols as i64);
-                }
-                e
-            })
-            .collect();
-        let src_i_base = flat_offset(src.shape(), &idxs_t);
+        let src_i_base = Self::tile_base(&st, src, idxs, axis);
 
         let ept = st.base.base.elements_per_thread() as i64;
         let st_cols = st.cols as i64;
@@ -307,6 +282,80 @@ impl<'k> Group<'k> {
         self.finalize_st(st, ended)
     }
 
+    /// The flat GLOBAL element offset of the `st`-sized tile at block `idxs` of
+    /// `src` (row axis `axis`): the block index on `axis` counts `st.rows`-tall
+    /// tiles, the last one `st.cols`-wide tiles.
+    fn tile_base(st: &ST, src: &GL, idxs: &[Idx], axis: usize) -> Arc<UOp> {
+        let idxs_t: Vec<Idx> = idxs
+            .iter()
+            .enumerate()
+            .map(|(i, idx)| {
+                let mut e = idx.clone();
+                if i == axis {
+                    e = idx_mul(&e, st.rows as i64);
+                }
+                if i == 3 {
+                    e = idx_mul(&e, st.cols as i64);
+                }
+                e
+            })
+            .collect();
+        flat_offset(src.shape(), &idxs_t)
+    }
+
+    /// Whether the collaborative fill of `st` from `src` can be `cp.async`
+    /// 16-byte copies: a CUDA target, one lane's `elements_per_thread` run is
+    /// exactly 16 bytes, no element cast, and the swizzle keeps 16-byte chunks
+    /// contiguous ([`crate::swizzle::Swizzle::keeps_16b_chunks`]).
+    pub fn cp_async_fill_applies(&self, st: &ST, src: &GL) -> bool {
+        self.ker.caps.cuda().is_some()
+            && st.base.base.elements_per_thread() * st.elem().bytes() == 16
+            && src.elem() == st.elem()
+            && st.base.swizzle.keeps_16b_chunks()
+    }
+
+    /// Asynchronous GLOBAL→LOCAL tile fill (sm_80+): every group thread issues one
+    /// 16-byte `cp.async.cg` per pass (the same per-lane addressing as the scalar
+    /// fill, so LDS is laid out identically), then commits them as ONE group.
+    /// Returns the `commit` statement; the caller retires it with a
+    /// `cp.async.wait_group` and a workgroup barrier before any lane reads the tile
+    /// (`wait_group N; bar.sync; consume` — copies of other lanes are visible only
+    /// after the barrier). `st` carries the ordering deps of the destination (thread
+    /// the WAR barrier through `st.after([..])`).
+    ///
+    /// # Panics
+    /// Panics unless [`Self::cp_async_fill_applies`], and unless the global rows
+    /// are 16-byte aligned (`axis` row stride and the innermost extent multiples of
+    /// the per-lane run — `D % 8 == 0` for bf16).
+    pub fn cp_async_fill(&self, st: &ST, src: &GL, idxs: &[Idx], axis: usize) -> Arc<UOp> {
+        assert!(self.cp_async_fill_applies(st, src), "cp.async fill: CUDA, 16-byte lane runs, no cast, chunk swizzle");
+        let geom = self.lds_fill_geom(st);
+        let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
+        let inner = *src.shape().last().expect("GL rank") as i64;
+        assert_eq!(row_stride % geom.ept, 0, "cp.async fill: row stride {row_stride} not 16-byte aligned");
+        assert_eq!(inner % geom.ept, 0, "cp.async fill: innermost extent {inner} not 16-byte aligned");
+        let src_i_base = Self::tile_base(st, src, idxs, axis);
+
+        let copies: SmallVec<[Arc<UOp>; 4]> = (0..geom.total_calls)
+            .map(|pass| {
+                let (height, width, row, col) = self.fill_lane_rc(&geom, &cidx(pass), &cidx(0));
+                let (srow, scol) =
+                    st.base.swizzle.swizzle_rc(row.clone(), col.clone(), st.base.base.cols, st.elem().base());
+                let dst =
+                    st_index(st, &[Idx::Uop(height.clone()), Idx::Uop(width.clone()), Idx::Uop(srow), Idx::Uop(scol)]);
+                let off = iadd(
+                    &src_i_base,
+                    &iadd(
+                        &iadd(&imul(&height, geom.base_rows * row_stride), &imul(&width, geom.base_cols)),
+                        &iadd(&imul(&row, row_stride), &col),
+                    ),
+                );
+                cp_async_16(&dst, &index_off(src.uop(), off))
+            })
+            .collect();
+        cp_async_commit(copies)
+    }
+
     /// Stackd GLOBAL→LOCAL fill: the [`Self::load_global_to_local`]
     /// counterpart that issues **128-bit** (`vec8` bf16) coalesced global loads
     /// (one `global_load_dwordx4`/lane) and commits each into the XOR-swizzled
@@ -327,6 +376,13 @@ impl<'k> Group<'k> {
     }
 
     fn load_global_to_local_vec(&self, st: ST, src: &GL, idxs: &[Idx], axis: usize, barrier: bool) -> ST {
+        // sm_80+: the 128-bit lane copy is a `cp.async`, retired (`wait_group 0`)
+        // under the same trailing barrier the register path ends in.
+        if barrier && self.cp_async_fill_applies(&st, src) {
+            let commit = self.cp_async_fill(&st, src, idxs, axis);
+            let landed = cp_async_wait(0, smallvec![commit]).barrier(SmallVec::new());
+            return self.finalize_st(st, landed);
+        }
         let itemsize = st.elem().base().bytes() as i64;
         assert_eq!(itemsize, 2, "vec fill: bf16-only (128-bit = vec8)");
         assert_eq!(src.elem(), st.elem(), "vec fill: cast unsupported (use the scalar fill)");
@@ -347,21 +403,7 @@ impl<'k> Group<'k> {
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
         assert_eq!(row_stride % vw, 0, "vec fill: row stride {row_stride} not {vw}-aligned (need N % 8 == 0)");
 
-        let idxs_t: Vec<Idx> = idxs
-            .iter()
-            .enumerate()
-            .map(|(i, idx)| {
-                let mut e = idx.clone();
-                if i == axis {
-                    e = idx_mul(&e, st.rows as i64);
-                }
-                if i == 3 {
-                    e = idx_mul(&e, st.cols as i64);
-                }
-                e
-            })
-            .collect();
-        let src_i_base = flat_offset(src.shape(), &idxs_t);
+        let src_i_base = Self::tile_base(&st, src, idxs, axis);
 
         let num_elements = st.base.base.num_elements() as i64;
         let n = st.shape().len();
@@ -448,29 +490,21 @@ impl<'k> Group<'k> {
     pub(super) fn load_local_to_reg(&self, rt: RT<'k>, st: &ST, dst_idxs: &[Idx], idxs: &[Idx]) -> RT<'k> {
         let laneid = self.ker.laneid();
         let ept = rt.base.base.elements_per_thread() as i64;
-        let base_rows = rt.base.base.rows as i64;
-        let base_cols = rt.base.base.cols as i64;
-        let stride = rt.base.stride as i64;
         let n = rt.shape().len();
         let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
         // SI-1 off-by-one guard: the wave's RT sub-tile must fit inside the ST.
         let sn = st.shape().len();
         let (st_h, st_w) = (st.shape()[sn - 4] as i64, st.shape()[sn - 3] as i64);
         assert!(rt_h <= st_h && rt_w <= st_w, "load LOCAL→REG: RT {rt_h}×{rt_w} exceeds ST {st_h}×{st_w}");
+        let transpose = rt.layout != st.layout;
+        if let Some(plan) = self.ldmatrix_plan(&rt, st, transpose) {
+            return self.ldmatrix_local_to_reg(rt, st, dst_idxs, idxs, plan);
+        }
         let height = self.ker.raw_range(rt_h, AxisType::Loop);
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
 
-        let (row, col) = lane_rc(
-            rt.layout != st.layout,
-            rt.base.interleave,
-            rt.base.interleave_t,
-            &laneid,
-            base_rows,
-            base_cols,
-            stride,
-            &inner,
-        );
+        let (row, col) = rt.lane_rc(transpose, &laneid, &inner);
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         // Wave sub-tile fragment offset (SI-1): the caller passes the wave's
@@ -486,6 +520,63 @@ impl<'k> Group<'k> {
         let mut didx: Vec<Idx> = dst_idxs.to_vec();
         didx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
         let ended = flat_index(rt.uop(), rt.shape(), &didx).store(load).end(smallvec![height, width, inner]);
+        self.finalize_reg(rt, ended)
+    }
+
+    /// The `ldmatrix.x4` plan for the LOCAL→REG hop, when it applies: a CUDA
+    /// target, a 16-bit fragment with no cast, the 16×16 / 8-per-lane base, a lane
+    /// map [`LaneMap::ldmatrix_x4`](crate::layout::LaneMap::ldmatrix_x4) covers,
+    /// and a swizzle that keeps 16-byte row chunks contiguous.
+    fn ldmatrix_plan(&self, rt: &RT<'k>, st: &ST, transpose: bool) -> Option<LdmatrixX4> {
+        let base = &rt.base.base;
+        (self.ker.caps.cuda().is_some()
+            && rt.elem().bytes() == 2
+            && st.elem() == rt.elem()
+            && (base.rows, base.cols, base.elements_per_thread()) == (16, 16, 8)
+            && st.base.base == *base
+            && st.base.swizzle.keeps_16b_chunks())
+        .then(|| rt.base.map.ldmatrix_x4(transpose))
+        .flatten()
+    }
+
+    /// LOCAL→REG fragment gather as one warp-collective `ldmatrix.x4[.trans]` per
+    /// 16×16 fragment: lane `L` supplies the (swizzled) address of row `L % 16`,
+    /// columns `8·(L/16)..+8`, and the four returned 32-bit words are scattered onto
+    /// the fragment's register pairs per the plan (every register index constant,
+    /// so the fragment stays in registers). Replaces the eight scalar `ld.shared.b16`
+    /// per fragment of the generic gather.
+    fn ldmatrix_local_to_reg(&self, rt: RT<'k>, st: &ST, dst_idxs: &[Idx], idxs: &[Idx], plan: LdmatrixX4) -> RT<'k> {
+        let laneid = self.ker.laneid();
+        let n = rt.shape().len();
+        let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
+        let row = imod(&laneid, 16);
+        let col = imul(&idiv(&laneid, 16), 8);
+        let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
+        let pair = rt.elem().vec(2).expect("16-bit element pair");
+        let at = |block: Option<&Idx>, frags: i64, i: i64| match block {
+            None => Idx::Const(i),
+            Some(b) => Idx::Uop(iadd(&imul(&b.to_uop(), frags), &cidx(i))),
+        };
+        let mut stores = Vec::with_capacity((rt_h * rt_w * 8) as usize);
+        for h in 0..rt_h {
+            for w in 0..rt_w {
+                let src_idx = [
+                    at(idxs.first(), rt_h, h),
+                    at(idxs.get(1), rt_w, w),
+                    Idx::Uop(srow.clone()),
+                    Idx::Uop(scol.clone()),
+                ];
+                let words = ldmatrix(&st_index(st, &src_idx), 4, plan.trans, pair.clone());
+                for (p, &m) in plan.words.iter().enumerate() {
+                    for e in 0..2 {
+                        let mut didx = dst_idxs.to_vec();
+                        didx.extend([Idx::Const(h), Idx::Const(w), Idx::Const(2 * p as i64 + e as i64)]);
+                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(words[m].index_axes(vec![e])));
+                    }
+                }
+            }
+        }
+        let ended = if stores.len() == 1 { stores.into_iter().next().unwrap() } else { UOp::group(stores) };
         self.finalize_reg(rt, ended)
     }
 
@@ -542,7 +633,6 @@ impl<'k> Group<'k> {
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
         let base_rows = rt.base.base.rows as i64;
         let base_cols = rt.base.base.cols as i64;
-        let stride = rt.base.stride as i64;
         let ept = rt.base.base.elements_per_thread() as i64;
         let n = rt.shape().len();
         let s3 = rt.shape()[n - 3] as i64;
@@ -571,16 +661,7 @@ impl<'k> Group<'k> {
 
         let base_row = imul(&height, base_rows);
         let base_col = imul(&width, base_cols);
-        let (row, col) = lane_rc(
-            rt.layout == TileLayout::Col,
-            rt.base.interleave,
-            rt.base.interleave_t,
-            &laneid,
-            base_rows,
-            base_cols,
-            stride,
-            &inner,
-        );
+        let (row, col) = rt.lane_rc(rt.layout == TileLayout::Col, &laneid, &inner);
         let srow = iadd(&base_row, &row);
         let scol = iadd(&base_col, &col);
         let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
@@ -609,25 +690,13 @@ impl<'k> Group<'k> {
     pub(super) fn store_reg_to_local(&self, st: ST, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx]) -> ST {
         let laneid = self.ker.laneid();
         let ept = rt.base.base.elements_per_thread() as i64;
-        let base_rows = rt.base.base.rows as i64;
-        let base_cols = rt.base.base.cols as i64;
-        let stride = rt.base.stride as i64;
         let n = rt.shape().len();
         let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
         let height = self.ker.raw_range(rt_h, AxisType::Loop);
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
 
-        let (row, col) = lane_rc(
-            rt.layout != st.layout,
-            rt.base.interleave,
-            rt.base.interleave_t,
-            &laneid,
-            base_rows,
-            base_cols,
-            stride,
-            &inner,
-        );
+        let (row, col) = rt.lane_rc(rt.layout != st.layout, &laneid, &inner);
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         let mut sidx: Vec<Idx> = src_idxs.to_vec();
@@ -658,7 +727,6 @@ impl<'k> Group<'k> {
         let row_stride: i64 = dst.shape()[axis + 1..].iter().product::<usize>() as i64;
         let base_rows = rt.base.base.rows as i64;
         let base_cols = rt.base.base.cols as i64;
-        let stride = rt.base.stride as i64;
         let ept = rt.base.base.elements_per_thread() as i64;
         let n = rt.shape().len();
         let s3 = rt.shape()[n - 3] as i64;
@@ -687,16 +755,7 @@ impl<'k> Group<'k> {
 
         let base_row = imul(&height, base_rows);
         let base_col = imul(&width, base_cols);
-        let (row, col) = lane_rc(
-            rt.layout == TileLayout::Col,
-            rt.base.interleave,
-            rt.base.interleave_t,
-            &laneid,
-            base_rows,
-            base_cols,
-            stride,
-            &inner,
-        );
+        let (row, col) = rt.lane_rc(rt.layout == TileLayout::Col, &laneid, &inner);
         let srow = iadd(&base_row, &row);
         let scol = iadd(&base_col, &col);
         let off = iadd(&dst_i_base, &iadd(&imul(&srow, row_stride), &scol));

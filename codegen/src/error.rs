@@ -28,6 +28,12 @@ pub enum Error {
     #[snafu(display("Missing {what}"))]
     Missing { what: String },
 
+    /// A CUSTOM body references a vendor intrinsic the active target cannot
+    /// lower (clang would emit it as an extern call that only fails in the
+    /// device assembler).
+    #[snafu(display("intrinsic @{intrinsic} is not available on the {target} target"))]
+    ForeignIntrinsic { intrinsic: String, target: String },
+
     /// Invalid configuration or parameters.
     #[snafu(display("Invalid configuration: {reason}"))]
     InvalidConfig { reason: String },

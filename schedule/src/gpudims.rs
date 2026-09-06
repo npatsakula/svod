@@ -149,9 +149,12 @@ fn add_gpudims(ctx: &mut GpuDimsContext, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
         }
     }
 
-    // Sort by axis_id for consistent ordering
+    // Sort by axis_id for consistent ordering. The WARP axis leads the locals
+    // (tinygrad numbers it -1): `mma.sync` addresses fragments by the hardware
+    // lane, so the warp axis must be the low bits of the linear thread index.
     global_dims.sort_by(|(a, _), (b, _)| a.cmp(b));
     local_dims.sort_by(|(a, _), (b, _)| a.cmp(b));
+    local_dims.sort_by_key(|(_, axis_type)| *axis_type != AxisType::Warp);
 
     // No GPU dimensions to inject
     if global_dims.is_empty() && local_dims.is_empty() {
@@ -192,8 +195,14 @@ fn add_gpudims(ctx: &mut GpuDimsContext, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     } else {
         // Generate GPU indices
         // Renderer keeps the workgroup product cap separate from per-axis caps.
-        let local_max: Option<Vec<usize>> =
+        let mut local_max: Option<Vec<usize>> =
             renderer.local_max_axes().map(|axes| axes.to_vec()).or_else(|| renderer.local_max.map(|max| vec![max; 3]));
+        // Pin the leading axis cap to the warp extent so `group_dims` never
+        // folds another local into `lidx0` (tinygrad gpudims.py:59): a warp
+        // sharing `tid.x` with a size-2 local scrambles the tensor-core lanes.
+        if let (Some(max), Some((_, AxisType::Warp))) = (local_max.as_mut(), local_dims.first()) {
+            max[0] = dim_max(&local_shape[0]);
+        }
         let local_max_slice = local_max.as_deref();
 
         // Create local indices (lidx0, lidx1, ...)

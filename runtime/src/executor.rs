@@ -286,17 +286,9 @@ impl UnifiedExecutor {
         // Create device handle
         let device = crate::DEVICE_FACTORIES.device(&device_spec, self.registry)?;
 
-        // Create timeline signal based on device type
-        let signal: Arc<dyn TimelineSignal> = match &device_spec {
-            DeviceSpec::Cpu => Arc::new(CpuTimelineSignal::new()),
-            #[cfg(feature = "cuda")]
-            DeviceSpec::Cuda { .. } => {
-                // TODO: Create CUDA timeline signal with events
-                // For now, fall back to CPU signal (works, but less efficient)
-                Arc::new(CpuTimelineSignal::new())
-            }
-            _ => Arc::new(CpuTimelineSignal::new()),
-        };
+        // Executor-level ordering is a host signal for every backend; GPU
+        // backends order their own submissions on the device beneath it.
+        let signal: Arc<dyn TimelineSignal> = Arc::new(CpuTimelineSignal::new());
 
         let ctx = DeviceContext::new(device, signal);
         self.contexts.insert(device_spec, ctx);

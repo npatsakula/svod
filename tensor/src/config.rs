@@ -143,16 +143,28 @@ impl PrepareConfig {
         let DeviceSpec::Metal { .. } = svod_dtype::default_device::default_device() else { return None };
         svod_device::metal::has_devices().then(Self::from_env)
     }
+
+    /// CUDA variant for the `codegen_tests!` macro. The test runs only when the
+    /// active default is a CUDA device the driver can open.
+    pub fn for_cuda_if_available() -> Option<Self> {
+        let DeviceSpec::Cuda { device_id } = svod_dtype::default_device::default_device() else { return None };
+        svod_device::registry::resolve_cuda_arch(device_id).ok()?;
+        Some(Self::from_env())
+    }
 }
 
-/// Whether a device family can hold buffers of `dtype`, per its optimizer
-/// profile (Metal and WebGPU have no `double`). Family-level: arch-specific
-/// refinements (AMD fp8 variants) need the opened device's renderer.
+/// Whether a device can hold buffers of `dtype`, per its optimizer profile
+/// (Metal and WebGPU have no `double`; CUDA below sm_80 has no bf16). CUDA
+/// resolves the opened device's compute capability; the other GPU families
+/// are family-level, so arch-specific refinements (AMD fp8 variants) need the
+/// opened device's renderer.
 pub fn device_supports_storage_dtype(spec: &DeviceSpec, dtype: svod_dtype::ScalarDType) -> bool {
     use svod_schedule::OptimizerRenderer;
     let profile = match spec {
         DeviceSpec::Cpu | DeviceSpec::Disk { .. } => OptimizerRenderer::cpu(),
-        DeviceSpec::Cuda { .. } => OptimizerRenderer::cuda(),
+        DeviceSpec::Cuda { device_id } => svod_device::registry::resolve_cuda_arch(*device_id)
+            .map(OptimizerRenderer::for_cuda_arch)
+            .unwrap_or_else(|_| OptimizerRenderer::cuda()),
         DeviceSpec::Amd { .. } => OptimizerRenderer::amd_rdna3(),
         DeviceSpec::Metal { .. } => OptimizerRenderer::metal(),
         DeviceSpec::WebGpu => OptimizerRenderer::webgpu(),
@@ -167,6 +179,12 @@ pub fn device_supports_storage_dtype(spec: &DeviceSpec, dtype: svod_dtype::Scala
 pub fn amd_test_arch() -> Option<svod_dtype::AmdArch> {
     let nodes = svod_device::amd::topology::enumerate();
     nodes.into_iter().find_map(|n| svod_dtype::AmdArch::from_gfx_target_version(n.gfx_target_version))
+}
+
+/// Detect a CUDA GPU on this host: the compute capability of device 0 when
+/// the driver loads and reports one.
+pub fn cuda_test_arch() -> Option<svod_dtype::CudaArch> {
+    svod_device::cuda::has_devices().then(|| svod_device::registry::resolve_cuda_arch(0).ok()).flatten()
 }
 
 impl PrepareConfig {
@@ -291,6 +309,22 @@ macro_rules! codegen_tests {
                 };
                 $body
             }
+
+            /// CUDA variant — runs only under `SVOD_DEVICE=CUDA:N` on a host
+            /// with an NVIDIA GPU; skips otherwise.
+            #[test]
+            $(#[$meta])*
+            fn cuda() {
+                ::svod_schedule::testing::setup_test_tracing();
+                let $config = match $crate::PrepareConfig::for_cuda_if_available() {
+                    Some(cfg) => cfg,
+                    None => {
+                        eprintln!("cuda codegen_tests variant: skipped (no CUDA device)");
+                        return;
+                    }
+                };
+                $body
+            }
         }
         $crate::codegen_tests!($($rest)*);
     };
@@ -380,6 +414,26 @@ macro_rules! codegen_tests {
                     Ok(())
                 }).unwrap();
             }
+
+            #[test]
+            #[allow(unused_parens)]
+            $(#[$meta])*
+            fn cuda() {
+                ::svod_schedule::testing::setup_test_tracing();
+                let cuda_cfg = match $crate::PrepareConfig::for_cuda_if_available() {
+                    Some(cfg) => cfg,
+                    None => {
+                        eprintln!("cuda codegen_tests variant: skipped (no CUDA device)");
+                        return;
+                    }
+                };
+                let mut runner = $runner;
+                runner.run(&($($strategy),+), |($($param),+)| {
+                    let $config = cuda_cfg.clone();
+                    $body
+                    Ok(())
+                }).unwrap();
+            }
         }
     };
 
@@ -440,6 +494,24 @@ macro_rules! codegen_tests {
                         Some(cfg) => cfg,
                         None => {
                             eprintln!("metal codegen_tests variant: skipped (no Metal device)");
+                            return;
+                        }
+                    };
+                    $body
+                }
+            }
+            mod cuda {
+                #[allow(unused_imports)]
+                use super::super::*;
+                use ::test_case::test_case;
+
+                $(#[$meta])*
+                fn $name($($param: $ty),+) {
+                    ::svod_schedule::testing::setup_test_tracing();
+                    let $config = match $crate::PrepareConfig::for_cuda_if_available() {
+                        Some(cfg) => cfg,
+                        None => {
+                            eprintln!("cuda codegen_tests variant: skipped (no CUDA device)");
                             return;
                         }
                     };

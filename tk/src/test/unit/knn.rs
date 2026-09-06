@@ -37,7 +37,7 @@ fn knn_sink(corpus: usize, query: usize, d: usize, caps: ArchCaps) -> Arc<UOp> {
 /// Holds on both wave64 (gfx942) and wave32 (gfx1151).
 #[test]
 fn test_knn_score_graph_shape() {
-    for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
+    for caps in [ArchCaps::GFX942, ArchCaps::for_amd(AmdArch::Gfx1151)] {
         let arch = caps.arch;
         let topo = knn_sink(32, 32, 32, caps).toposort();
 
@@ -96,7 +96,7 @@ fn test_knn_score_amd() {
     }
     let dev = Tensor::rand(&[16, 16]).expect("probe").device();
     let arch = crate::target::resolve_arch(&dev).expect("resolve arch");
-    let w = arch.wave_size() as i64;
+    let w = ArchCaps::for_arch(arch).wave_size as i64;
 
     for (corpus, query, d) in [(16usize, 16usize, 16usize), (32, 32, 32), (32, 16, 48)] {
         // Realized bf16 inputs so the kernel and the reference see identical rounding.
@@ -173,7 +173,7 @@ fn topk_sink(corpus: usize, query: usize, d: usize, k: usize, caps: ArchCaps) ->
 /// two `[query, k]` output stores. Built rolled (the corpus loop).
 #[test]
 fn test_knn_topk_graph_shape() {
-    for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
+    for caps in [ArchCaps::GFX942, ArchCaps::for_amd(AmdArch::Gfx1151)] {
         let arch = caps.arch;
         let (corpus, query, d, k) = (32usize, 16usize, 16usize, 4usize);
         let topo = topk_sink(corpus, query, d, k, caps).toposort();
@@ -233,7 +233,7 @@ fn test_knn_topk_amd() {
     }
     let dev = Tensor::rand(&[16, 16]).expect("probe").device();
     let arch = crate::target::resolve_arch(&dev).expect("resolve arch");
-    let w = arch.wave_size() as i64;
+    let w = ArchCaps::for_arch(arch).wave_size as i64;
 
     // (corpus, query, d, k, tie): a square/ragged sweep over k. `tie` forces two
     // corpus rows equidistant to query 0 (a duplicated corpus row) so the smaller

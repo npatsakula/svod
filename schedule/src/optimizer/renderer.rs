@@ -5,7 +5,7 @@
 //! and provides tensor core configurations for hardware-accelerated matrix multiplication.
 
 use smallvec::SmallVec;
-use svod_dtype::{AmdArch, DType, MetalFamily, ScalarDType};
+use svod_dtype::{AmdArch, CudaArch, DType, MetalFamily, ScalarDType};
 use svod_ir::{RendererDevice, RendererOps, TypedPatternMatcher};
 
 /// Tensor core optimization operation.
@@ -317,7 +317,8 @@ impl Renderer {
         }
     }
 
-    /// Create a CUDA GPU renderer for SM89 (Hopper - H100).
+    /// Create a CUDA GPU renderer for SM89 (Ada - RTX 40xx, L4; the first
+    /// capability with fp8 `mma.sync`).
     pub fn cuda_sm89(allow_tf32: bool) -> Self {
         Self {
             device: RendererDevice::CudaSm89,
@@ -510,6 +511,24 @@ impl Renderer {
         renderer
     }
 
+    /// Select the CUDA optimizer profile for a compute capability, tinygrad's
+    /// `tc.get_cuda` plus int8: sm_80+ has the bf16 / tf32 shapes, `m16n8k16`
+    /// and the s8 `m16n8k32`, sm_75 the f16 `m16n8k8` core only (its integer
+    /// `mma.sync` shapes are `m8n8k16`, which the NVPTX renderer does not
+    /// lower), and anything older runs without tensor cores. The sm_89 fp8
+    /// profile is withheld from every capability until the NVPTX renderer
+    /// lowers the `cvt.*.e4m3x2` conversions; its fp8 storage dtype would fail
+    /// at render time today.
+    pub fn for_cuda_arch(arch: CudaArch) -> Self {
+        let sm = arch.sm();
+        let mut renderer = if arch.has_bf16_mma() { Self::cuda_sm80(false) } else { Self::cuda_sm75() };
+        if sm < 75 {
+            renderer.tensor_cores.clear();
+        }
+        renderer.target = Some(arch.to_string());
+        renderer
+    }
+
     /// Create an Intel Xe GPU renderer.
     pub fn intel_xe() -> Self {
         Self {
@@ -573,6 +592,9 @@ impl Renderer {
                 | RendererDevice::AmdRdna4
                 | RendererDevice::AmdCdna3
                 | RendererDevice::AmdCdna4 => "amd-decomposition-v1",
+                RendererDevice::CudaSm75 | RendererDevice::CudaSm80 | RendererDevice::CudaSm89 => {
+                    "nvptx-decomposition-v1"
+                }
                 _ => "backend-decomposition-v1",
             }
         } else {
@@ -585,6 +607,7 @@ impl Renderer {
                 | RendererDevice::AmdRdna4
                 | RendererDevice::AmdCdna3
                 | RendererDevice::AmdCdna4 => "llvm-amd-fp8-extra-v1",
+                RendererDevice::CudaSm75 | RendererDevice::CudaSm80 | RendererDevice::CudaSm89 => "llvm-nvptx-extra-v1",
                 _ => "backend-extra-v1",
             }
         } else {
@@ -946,7 +969,10 @@ impl TensorCore {
         vec![CUDA_8168.build(DType::Float16, DType::Float32), CUDA_8168.build(DType::Float16, DType::Float16)]
     }
 
-    /// Get all tensor cores for NVIDIA SM80 architecture (Ampere).
+    /// Get all tensor cores for NVIDIA SM80 architecture (Ampere). The
+    /// `m16n8k32` int8 core shares the fp8 fragment layout (both are one byte
+    /// per element), so it reuses `CUDA_81632`; it mirrors the RDNA3
+    /// `int8 -> int32` core that quantized linears already engage on AMD.
     pub fn sm80_tensor_cores(allow_tf32: bool) -> Vec<TensorCore> {
         let mut tcs = vec![
             CUDA_81616.build(DType::Float16, DType::Float32),
@@ -954,6 +980,7 @@ impl TensorCore {
             CUDA_81616.build(DType::Float16, DType::Float16),
             CUDA_8168.build(DType::Float16, DType::Float32),
             CUDA_8168.build(DType::Float16, DType::Float16),
+            CUDA_81632.build(DType::Int8, DType::Int32),
         ];
         if allow_tf32 {
             tcs.push(CUDA_8168_TF32.build(DType::Float32, DType::Float32));

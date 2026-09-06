@@ -35,6 +35,13 @@ fn unsupported_device_keeps_original_encoder_sequence() {
 #[test]
 #[ignore = "GPU: inspect full padded Whisper encoder execution plan"]
 fn padded_encoder_plan_has_one_flash_attention_per_block() {
+    // The encoder gates on its activations' device, which follows the weights
+    // onto the process default device.
+    let device = svod_dtype::default_device::default_device();
+    if !svod_tk::flash_attention_supported(&device) {
+        eprintln!("skipping: flash-attention is not supported on {device:?}");
+        return;
+    }
     let encoder = AudioEncoder::empty(&encoder_dims(32));
     let mel = Tensor::zeros(&[1, 4, 3000], DType::Float32).unwrap();
     let mut out = encoder.forward(&mel).unwrap();

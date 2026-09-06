@@ -68,7 +68,8 @@ const TM: usize = 32;
 /// gfx1151 (RDNA3.5 WMMA, wave32). Both resolve the accumulator/operand fragments
 /// by role through [`crate::ArchCaps`]; the launcher gates against this list.
 /// Validated on gfx942 (CDNA3) and gfx1151 (RDNA3.5).
-pub const KNN_SUPPORTED_ARCHS: &[svod_dtype::AmdArch] = &[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151];
+pub const KNN_SUPPORTED_ARCHS: crate::ArchSet =
+    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151]);
 
 const POS_INF: f64 = f64::INFINITY;
 const NEG_INF: f64 = f64::NEG_INFINITY;
@@ -259,7 +260,7 @@ pub fn build_knn_topk(ker: &Kernel, corpus: usize, query: usize, d: usize, k: us
     let i32 = DType::Int32;
     let col = TileLayout::Col;
     let warp = ker.warp();
-    let acc_frag = ker.caps.frag(FragRole::Accumulator);
+    let acc_frag = ker.frag(FragRole::Accumulator);
 
     // ABI: outputs (idx i32, val f32) then inputs (x, c — bf16; c_sq_rep — f32).
     let (outs, ins) = ker.bind_abi(
@@ -388,12 +389,12 @@ fn topk_insert<'k>(
 /// lane): `row_arg_reduce` collapses the whole reduced axis — including the score
 /// tile's `TM/16` stacked frags, folded internally — into that single slot.
 fn seed_val<'k>(ker: &'k Kernel, warp: &Group<'k>, length: usize, init: f64) -> RV<'k> {
-    let frag = ker.caps.frag(FragRole::Accumulator);
+    let frag = ker.frag(FragRole::Accumulator);
     warp.clear_rv(ker.rv(length, DType::Float32, VecLayout::Ortho, frag), init)
 }
 /// A length-`length` Int32 index RV seeded to `−1` (the `row_arg_reduce` index acc).
 fn seed_idx<'k>(ker: &'k Kernel, warp: &Group<'k>, length: usize) -> RV<'k> {
-    let frag = ker.caps.frag(FragRole::Accumulator);
+    let frag = ker.frag(FragRole::Accumulator);
     warp.clear_rv(ker.rv(length, DType::Int32, VecLayout::Ortho, frag), -1.0)
 }
 
@@ -512,7 +513,7 @@ fn store_topk<'k>(
 ) {
     let row = TileLayout::Row;
     let i32 = DType::Int32;
-    let acc_t = ker.caps.frag(FragRole::AccumulatorT);
+    let acc_t = ker.frag(FragRole::AccumulatorT);
     // Offset the output store's query-row block by `q_blk` (this workgroup's query
     // block, in query-tile-height units), the store-side mirror of `load_query_t`'s
     // load offset, so each workgroup writes its own 16-query rows of the `[Npad, k]`

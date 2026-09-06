@@ -4,6 +4,7 @@
 //! Supports both explicit configuration and environment variable fallbacks.
 
 use bon::bon;
+use svod_ir::Opt;
 
 fn beam_min_progress_from_env() -> u64 {
     parse_beam_min_progress(std::env::var("BEAM_MIN_PROGRESS").ok().as_deref())
@@ -525,6 +526,11 @@ pub struct OptimizerConfig {
     /// (`DISABLE_FAST_IDIV = ContextVar("DISABLE_FAST_IDIV", 1)`); its own tests
     /// opt in with `Context(DISABLE_FAST_IDIV=0)`.
     pub disable_fast_idiv: bool,
+    /// Apply exactly these opts to every kernel instead of `strategy` — the
+    /// config-level analog of a SINK's `KernelInfo.opts_to_apply` (which still
+    /// wins per kernel). Replays a beam plan deterministically, e.g. in a
+    /// regression test for a plan that once miscompiled.
+    pub opts_to_apply: Option<Vec<Opt>>,
 }
 
 impl Default for OptimizerConfig {
@@ -535,6 +541,7 @@ impl Default for OptimizerConfig {
             heuristics: HeuristicsConfig::default(),
             transcendental: 1,
             disable_fast_idiv: true,
+            opts_to_apply: None,
         }
     }
 }
@@ -556,9 +563,10 @@ impl OptimizerConfig {
         transcendental: i32,
         #[builder(default = std::env::var("DISABLE_FAST_IDIV").ok().and_then(|value| value.parse::<i32>().ok()).unwrap_or(1) != 0)]
         disable_fast_idiv: bool,
+        opts_to_apply: Option<Vec<Opt>>,
     ) -> Self {
         let beam = beam.with_strategy_width(&strategy);
-        Self { strategy, beam, heuristics, transcendental, disable_fast_idiv }
+        Self { strategy, beam, heuristics, transcendental, disable_fast_idiv, opts_to_apply }
     }
 
     /// Create configuration from environment variables.
@@ -577,7 +585,7 @@ impl OptimizerConfig {
         let disable_fast_idiv =
             std::env::var("DISABLE_FAST_IDIV").ok().and_then(|value| value.parse::<i32>().ok()).unwrap_or(1) != 0;
 
-        Self { strategy, beam, heuristics, transcendental, disable_fast_idiv }
+        Self { strategy, beam, heuristics, transcendental, disable_fast_idiv, opts_to_apply: None }
     }
 }
 

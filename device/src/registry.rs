@@ -7,12 +7,12 @@ use parking_lot::RwLock;
 pub use svod_dtype::DeviceSpec;
 
 use crate::allocator::{Allocator, CpuAllocator, LruAllocator};
-use crate::error::{InvalidDeviceSnafu, Result};
+use crate::error::{DeviceUnavailableSnafu, InvalidDeviceSnafu, Result};
+use snafu::OptionExt;
 
 /// Extension trait for DeviceSpec to add parsing functionality.
 ///
-/// This is in the device crate because parsing depends on feature flags
-/// and error types that are device-specific.
+/// Lives in the device crate because parsing reports this crate's error type.
 pub trait DeviceSpecExt {
     /// Parse a device string into a DeviceSpec.
     ///
@@ -31,52 +31,23 @@ impl DeviceSpecExt for DeviceSpec {
         }
 
         let s = s.to_uppercase();
-        let parts: Vec<&str> = s.split(':').collect();
+        let (kind, id) = match s.split_once(':') {
+            Some((kind, id)) => (kind, Some(id)),
+            None => (s.as_str(), None),
+        };
+        // `NAME` alone selects device 0; `NAME:N` selects device N. The arch
+        // of a GPU device is intentionally not part of the spec: it's a
+        // hardware property of the opened device, and encoding it here would
+        // give one physical device two identities.
+        let device_id =
+            || -> Result<usize> { id.map_or(Ok(0), |id| id.parse().ok().context(InvalidDeviceSnafu { device: &s })) };
 
-        match parts[0] {
+        match kind {
             "CPU" => Ok(DeviceSpec::Cpu),
-            #[cfg(feature = "cuda")]
-            "CUDA" | "GPU" => {
-                let device_id = if parts.len() > 1 {
-                    parts[1].parse().map_err(|_| crate::error::Error::InvalidDevice { device: s.to_string() })?
-                } else {
-                    0
-                };
-                Ok(DeviceSpec::Cuda { device_id })
-            }
-            #[cfg(not(feature = "cuda"))]
-            "CUDA" | "GPU" => {
-                let device_id = if parts.len() > 1 {
-                    parts[1].parse().map_err(|_| crate::error::Error::InvalidDevice { device: s.to_string() })?
-                } else {
-                    0
-                };
-                Ok(DeviceSpec::Cuda { device_id })
-            }
-            "METAL" => {
-                let device_id = if parts.len() > 1 {
-                    parts[1].parse().map_err(|_| crate::error::Error::InvalidDevice { device: s.to_string() })?
-                } else {
-                    0
-                };
-                Ok(DeviceSpec::Metal { device_id })
-            }
-            #[cfg(feature = "webgpu")]
+            "CUDA" | "GPU" => Ok(DeviceSpec::Cuda { device_id: device_id()? }),
+            "METAL" => Ok(DeviceSpec::Metal { device_id: device_id()? }),
             "WEBGPU" => Ok(DeviceSpec::WebGpu),
-            #[cfg(not(feature = "webgpu"))]
-            "WEBGPU" => Ok(DeviceSpec::WebGpu),
-            "AMD" | "HIP" => {
-                // Format: AMD | AMD:N. The arch lives on the opened
-                // `AmdDevice` (resolved from KFD topology); it's intentionally
-                // not part of the DeviceSpec to avoid identity ambiguity
-                // (two specs for one physical device).
-                let device_id = if parts.len() > 1 {
-                    parts[1].parse().map_err(|_| crate::error::Error::InvalidDevice { device: s.to_string() })?
-                } else {
-                    0
-                };
-                Ok(DeviceSpec::Amd { device_id })
-            }
+            "AMD" | "HIP" => Ok(DeviceSpec::Amd { device_id: device_id()? }),
             _ => InvalidDeviceSnafu { device: s }.fail(),
         }
     }
@@ -126,20 +97,11 @@ impl DeviceRegistry {
 
         let base: Box<dyn Allocator> = match spec {
             DeviceSpec::Cpu => Box::new(CpuAllocator),
-            #[cfg(feature = "cuda")]
-            DeviceSpec::Cuda { device_id } => Box::new(crate::allocator::CudaAllocator::new(*device_id)?),
-            #[cfg(not(feature = "cuda"))]
-            DeviceSpec::Cuda { .. } => {
-                return Err(crate::error::Error::DeviceUnavailable {
-                    reason: "CUDA device requested but the `cuda` feature is not enabled".into(),
-                });
-            }
+            DeviceSpec::Cuda { device_id } => Box::new(crate::cuda::CudaAllocator::new(*device_id)?),
             DeviceSpec::Amd { device_id, .. } => Box::new(crate::amd::AmdAllocator::new(*device_id)?),
             DeviceSpec::Metal { device_id } => Box::new(crate::metal::MetalAllocator::new(*device_id)?),
             DeviceSpec::WebGpu => {
-                return Err(crate::error::Error::DeviceUnavailable {
-                    reason: "WebGPU allocator is not yet implemented".into(),
-                });
+                return DeviceUnavailableSnafu { reason: "WebGPU allocator is not yet implemented" }.fail();
             }
             DeviceSpec::Disk { .. } => unreachable!(),
         };
@@ -184,8 +146,8 @@ pub fn resolve_amd_arch_from_topology(device_id: usize) -> Result<svod_dtype::Am
     })
 }
 
-/// Convenience function to get CUDA allocator.
-#[cfg(feature = "cuda")]
-pub fn cuda(device_id: usize) -> Result<Arc<dyn Allocator>> {
-    registry().get(&DeviceSpec::Cuda { device_id })
+/// The compute capability of CUDA device `device_id`, read from the opened
+/// (cached) device; the CUDA counterpart of [`resolve_amd_arch_from_topology`].
+pub fn resolve_cuda_arch(device_id: usize) -> Result<svod_dtype::CudaArch> {
+    Ok(crate::cuda::CudaDevice::open(device_id)?.arch())
 }

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use svod_dtype::{AmdArch, DType, DeviceSpec};
+use svod_dtype::{AmdArch, CudaArch, DType, DeviceSpec, GpuArch};
 use svod_ir::{Op, UOp};
 use svod_tensor::Tensor;
+use test_case::test_case;
 
 use crate::kernels::sq_attention::{
     HeadSelection, SQ_ATTENTION_SUPPORTED_ARCHS, SqAttentionOpts, build_single_query_attention,
@@ -10,6 +11,13 @@ use crate::kernels::sq_attention::{
 };
 use crate::{ArchCaps, Kernel};
 use svod_ir::ops;
+
+const SM_86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
+
+/// Every arch the kernel is built for: the AMD pair plus CUDA warp32.
+fn all_caps() -> [ArchCaps; 3] {
+    [ArchCaps::GFX942, ArchCaps::for_amd(AmdArch::Gfx1151), ArchCaps::for_arch(SM_86)]
+}
 
 fn buffers(b: usize, n: usize, h: usize, d: usize, masked: bool) -> Vec<Arc<UOp>> {
     let mut bufs = vec![
@@ -69,8 +77,8 @@ fn split_sinks(caps: ArchCaps, splits: usize, d: usize) -> (Arc<UOp>, Arc<UOp>) 
 }
 
 #[test]
-fn sq_attention_graph_shape_both_arches() {
-    for caps in [ArchCaps::GFX942, ArchCaps::for_arch(AmdArch::Gfx1151)] {
+fn sq_attention_graph_shape_all_arches() {
+    for caps in all_caps() {
         for masked in [false, true] {
             let topo = sink(caps, masked).toposort();
             let shuffles = topo.iter().filter(|u| matches!(u.op(), Op::Custom(..))).count();
@@ -127,32 +135,49 @@ fn sq_attention_graph_shape_both_arches() {
     }
 }
 
-#[test]
-fn sq_attention_renders_both_arches() {
-    for arch in [AmdArch::Gfx942, AmdArch::Gfx1151] {
-        let caps = ArchCaps::for_arch(arch);
-        let (partial, merge) = split_sinks(caps, 4, 64);
-        for (name, graph, shuffle) in [
-            ("sq_attention", sink(caps, true), true),
-            ("sq_attention_partial", partial, true),
-            ("sq_attention_merge", merge, false),
-        ] {
-            let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(arch);
-            let opt_renderer = svod_schedule::OptimizerRenderer::for_amd_arch(arch).with_rewrite_capabilities(
-                svod_ir::RendererOps::all(),
-                svod_codegen::traits::Renderer::decompositor(&renderer),
-                None,
-            );
-            let optimized =
-                svod_schedule::apply_post_optimization_with_renderer(graph, &opt_renderer).expect("post optimization");
-            let program = svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Cpu)
-                .expect("final target graph");
-            let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("linearize");
-            let linear = linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear(..))).expect("LINEAR");
-            let code = svod_codegen::traits::Renderer::render(&renderer, &linear, Some(name)).expect("render").code;
-            assert_eq!(code.contains("llvm.amdgcn.ds.bpermute"), shuffle, "{arch:?}: {name} shuffle rendering");
-            assert!(!code.contains("@local"), "{arch:?}: {name} no LDS allocation");
+/// The three kernels render on every supported arch with the arch's own
+/// cross-lane primitive — `ds_bpermute` on AMD, `shfl.sync.bfly` (the XOR
+/// reductions) plus `shfl.sync.idx` (the per-subgroup beta broadcast, partial
+/// kernel only) on NVPTX — and never allocate LDS.
+#[test_case(GpuArch::Amd(AmdArch::Gfx942), &["llvm.amdgcn.ds.bpermute"], &[]; "gfx942")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx1151), &["llvm.amdgcn.ds.bpermute"], &[]; "gfx1151")]
+#[test_case(SM_86, &["llvm.nvvm.shfl.sync.bfly.i32"], &["llvm.nvvm.shfl.sync.idx.i32"]; "sm_86")]
+fn sq_attention_renders_per_arch(arch: GpuArch, reduce_intrinsics: &[&str], broadcast_intrinsics: &[&str]) {
+    let caps = ArchCaps::for_arch(arch);
+    let (renderer, opt_renderer) = match arch {
+        GpuArch::Amd(amd) => {
+            (svod_codegen::llvm::LlvmTextRenderer::amd(amd), svod_schedule::OptimizerRenderer::for_amd_arch(amd))
         }
+        GpuArch::Cuda(cuda) => {
+            (svod_codegen::llvm::LlvmTextRenderer::nvptx(cuda), svod_schedule::OptimizerRenderer::for_cuda_arch(cuda))
+        }
+        GpuArch::Metal(_) => unreachable!("no Metal case"),
+    };
+    let opt_renderer = opt_renderer.with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        svod_codegen::traits::Renderer::decompositor(&renderer),
+        None,
+    );
+    let (partial, merge) = split_sinks(caps, 4, 64);
+    for (name, graph, reduces, broadcasts) in [
+        ("sq_attention", sink(caps, true), true, false),
+        ("sq_attention_partial", partial, true, true),
+        ("sq_attention_merge", merge, false, false),
+    ] {
+        let optimized =
+            svod_schedule::apply_post_optimization_with_renderer(graph, &opt_renderer).expect("post optimization");
+        let program =
+            svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Cpu).expect("final target graph");
+        let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("linearize");
+        let linear = linearized.toposort().into_iter().find(|u| matches!(u.op(), Op::Linear(..))).expect("LINEAR");
+        let code = svod_codegen::traits::Renderer::render(&renderer, &linear, Some(name)).expect("render").code;
+        for intrinsic in reduce_intrinsics {
+            assert_eq!(code.contains(intrinsic), reduces, "{arch:?}: {name} reduce shuffle {intrinsic}");
+        }
+        for intrinsic in broadcast_intrinsics {
+            assert_eq!(code.contains(intrinsic), broadcasts, "{arch:?}: {name} broadcast shuffle {intrinsic}");
+        }
+        assert!(!code.contains("@local"), "{arch:?}: {name} no LDS allocation");
     }
 }
 
@@ -212,11 +237,12 @@ fn cpu_reference(
     out
 }
 
+/// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib sq_attention_numerical_gpu -- --ignored`.
 #[test]
 #[ignore]
-fn sq_attention_numerical_amd() {
+fn sq_attention_numerical_gpu() {
     if !supported_device() {
-        eprintln!("skip sq_attention_numerical_amd: unsupported device/toolchain");
+        eprintln!("skip sq_attention_numerical_gpu: unsupported device/toolchain");
         return;
     }
     let (b, n, h, h_total, d, head_offset) = (2, 20, 3, 7, 64, 2);
@@ -283,9 +309,9 @@ fn sq_attention_numerical_amd() {
 /// A head dim the arch's wave size does not divide is a fit failure, not a
 /// caller bug: the launch declines with `Ok(None)` so a dispatch layer (the
 /// whisper decoder) falls back to its generic attention path. Host-portable:
-/// off-AMD the arch resolution declines the same way, so the assertion holds
-/// on every runner, and on real AMD hardware it exercises the `applies`
-/// arm (no supported arch has a wave size dividing 4).
+/// off-GPU the arch resolution declines the same way, so the assertion holds
+/// on every runner, and on real hardware it exercises the `applies` arm (no
+/// supported arch has a wave size dividing 4).
 #[test]
 fn undivisible_head_dim_declines_instead_of_erroring() {
     let (b, n, h, d) = (1usize, 3usize, 2usize, 4usize);

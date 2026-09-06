@@ -3,7 +3,7 @@
 //! Mirrors the published schema of `answerdotai/ModernBERT-{base,large}`. The
 //! [`RawModernBertConfig`] serde mirror captures the on-disk shape; the clean
 //! [`ModernBertConfig`] keeps only the fields the Rust backbone consumes and
-//! adds a caller-chosen compute [`DType`] (defaults to bf16 on the AMD target,
+//! adds a caller-chosen compute [`DType`] (defaults to [`crate::default_compute_dtype`];
 //! f32 for CPU parity tests).
 //!
 //! Per-layer global vs local attention: every `global_attn_every_n_layers`-th
@@ -114,7 +114,7 @@ impl Default for ModernBertConfig {
             pad_token_id: 0,
             tie_word_embeddings: false,
             decoder_bias: false,
-            dtype: DType::BFloat16,
+            dtype: crate::default_compute_dtype(),
             max_batch_size: 1,
         }
     }

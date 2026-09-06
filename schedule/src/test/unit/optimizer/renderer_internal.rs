@@ -145,3 +145,139 @@ fn test_metal_profile_follows_gpu_family() {
     assert_ne!(m4.cache_fingerprint(), Renderer::metal().cache_fingerprint());
     assert_eq!(Renderer::for_metal_family(MetalFamily::Apple(9)).cache_fingerprint(), m4.cache_fingerprint());
 }
+
+/// Tinygrad `tc.get_cuda` minus fp8 plus int8: bf16/tf32, `m16n8k16` and the
+/// s8 `m16n8k32` need sm_80, sm_75 keeps the f16 `m16n8k8` core only, and
+/// older parts run without tensor cores. fp8 stays off even on sm_89+ (no
+/// NVPTX cast lowering yet). The int8 core is the `CUDA_81632` fragment shape
+/// with the `int8 -> int32` dtype pair the RDNA3 profile declares, so a
+/// quantized linear selects it on both vendors.
+#[test_case::test_case(7, 0, RendererDevice::CudaSm75, 0, false, false, false; "volta has no m16n8 mma")]
+#[test_case::test_case(7, 5, RendererDevice::CudaSm75, 2, false, false, false; "turing")]
+#[test_case::test_case(8, 0, RendererDevice::CudaSm80, 6, true, false, true; "ampere a100")]
+#[test_case::test_case(8, 6, RendererDevice::CudaSm80, 6, true, false, true; "ampere ga10x")]
+#[test_case::test_case(8, 9, RendererDevice::CudaSm80, 6, true, false, true; "ada withholds fp8")]
+#[test_case::test_case(9, 0, RendererDevice::CudaSm80, 6, true, false, true; "hopper")]
+#[test_case::test_case(12, 0, RendererDevice::CudaSm80, 6, true, false, true; "blackwell consumer")]
+fn test_for_cuda_arch_follows_capability(
+    major: u8,
+    minor: u8,
+    device: RendererDevice,
+    tensor_cores: usize,
+    bf16: bool,
+    fp8: bool,
+    int8: bool,
+) {
+    use svod_dtype::{CudaArch, ScalarDType};
+    let arch = CudaArch::from_compute_capability(major, minor);
+    let renderer = Renderer::for_cuda_arch(arch);
+    assert_eq!(renderer.device, device);
+    assert_eq!(renderer.tensor_cores.len(), tensor_cores);
+    assert_eq!(renderer.target.as_deref(), Some(arch.to_string().as_str()));
+    assert_eq!(renderer.supports_storage_dtype(ScalarDType::BFloat16), bf16);
+    assert_eq!(renderer.supports_matrix_dtype(ScalarDType::BFloat16), bf16 && tensor_cores > 0);
+    assert!(renderer.supports_storage_dtype(ScalarDType::Int8));
+    assert_eq!(renderer.supports_matrix_dtype(ScalarDType::Int8), int8);
+    let int8_cores: Vec<_> = renderer.tensor_cores.iter().filter(|tc| tc.dtype_in == DType::Int8).collect();
+    assert_eq!(int8_cores.len(), usize::from(int8));
+    if let Some(tc) = int8_cores.first() {
+        let fp8_shape = CUDA_81632.build(DType::Int8, DType::Int32);
+        assert_eq!(**tc, fp8_shape, "int8 must reuse the byte-wide m16n8k32 fragment layout");
+        assert_eq!((tc.dims, tc.elements_per_thread, tc.dtype_out.clone()), ((8, 16, 32), (16, 8, 4), DType::Int32));
+        let rdna3 = Renderer::amd_rdna3();
+        assert!(
+            rdna3.tensor_cores.iter().any(|amd| (&amd.dtype_in, &amd.dtype_out) == (&tc.dtype_in, &tc.dtype_out)),
+            "CUDA int8 core must share the RDNA3 dtype pair"
+        );
+    }
+    assert_eq!(renderer.supports_storage_dtype(ScalarDType::FP8E4M3), fp8);
+    assert_eq!(renderer.supports_matrix_dtype(ScalarDType::FP8E4M3), fp8);
+    assert!(!renderer.tensor_cores.iter().any(|tc| tc.dtype_in.scalar_dtype().is_fp8()));
+    assert!(!renderer.supports_storage_dtype(ScalarDType::FP8E4M3FNUZ));
+    assert!(renderer.tensor_cores.iter().all(|tc| tc.threads == 32 && (tc.dims.0, tc.dims.1) == (8, 16)));
+    // No tf32 core unless explicitly allowed (tinygrad `ALLOW_TF32`).
+    assert!(!renderer.tensor_cores.iter().any(|tc| tc.dtype_in == DType::Float32));
+    assert_eq!(renderer.local_max_axes(), Some([1024, 1024, 64]));
+}
+
+/// Two capabilities sharing a profile still fingerprint apart (the target
+/// string reaches the kernel cache), and the same capability is stable.
+#[test]
+fn test_for_cuda_arch_fingerprint_tracks_the_exact_capability() {
+    use svod_dtype::CudaArch;
+    let sm80 = Renderer::for_cuda_arch(CudaArch::from_compute_capability(8, 0));
+    let sm86 = Renderer::for_cuda_arch(CudaArch::from_compute_capability(8, 6));
+    assert_eq!(sm80.device, sm86.device);
+    assert_ne!(sm80.cache_fingerprint(), sm86.cache_fingerprint());
+    assert_eq!(
+        Renderer::for_cuda_arch(CudaArch::from_compute_capability(8, 6)).cache_fingerprint(),
+        sm86.cache_fingerprint()
+    );
+    assert_ne!(
+        Renderer::cuda().cache_fingerprint(),
+        sm80.cache_fingerprint(),
+        "the arch-agnostic profile has no target"
+    );
+}
+
+struct FakeCudaRenderer(svod_dtype::CudaArch);
+
+impl svod_device::device::Renderer for FakeCudaRenderer {
+    fn render(
+        &self,
+        ast: &std::sync::Arc<svod_ir::UOp>,
+        name: Option<&str>,
+    ) -> svod_device::Result<svod_device::device::ProgramSpec> {
+        Ok(svod_device::device::ProgramSpec::new(
+            name.unwrap_or("kernel").to_string(),
+            String::new(),
+            svod_dtype::DeviceSpec::Cuda { device_id: 0 },
+            ast.clone(),
+        ))
+    }
+
+    fn device(&self) -> &svod_dtype::DeviceSpec {
+        static DEVICE: svod_dtype::DeviceSpec = svod_dtype::DeviceSpec::Cuda { device_id: 0 };
+        &DEVICE
+    }
+
+    fn gpu_arch(&self) -> Option<svod_dtype::GpuArch> {
+        Some(svod_dtype::GpuArch::Cuda(self.0))
+    }
+
+    fn supported_ops(&self) -> svod_ir::RendererOps {
+        svod_ir::RendererOps::all()
+    }
+
+    fn decompositor(&self) -> Option<TypedPatternMatcher> {
+        Some(svod_ir::decompositions::nvptx_decomposition_patterns())
+    }
+
+    fn extra_matcher(&self) -> Option<TypedPatternMatcher> {
+        Some(svod_schedule_bool_storage())
+    }
+}
+
+fn svod_schedule_bool_storage() -> TypedPatternMatcher {
+    crate::devectorize::bool_storage_patterns().clone()
+}
+
+/// The matcher identities are part of the cache key; NVPTX must not share
+/// AMD's or the generic backend's strings, or kernels compiled for one
+/// target could be served to another.
+#[test]
+fn test_with_codegen_renderer_keys_nvptx_matchers_distinctly() {
+    let arch = svod_dtype::CudaArch::from_compute_capability(8, 6);
+    let cuda = Renderer::for_cuda_arch(arch).with_codegen_renderer(&FakeCudaRenderer(arch));
+    assert_eq!(cuda.decomposition_profile, "nvptx-decomposition-v1");
+    assert_eq!(cuda.extra_profile, "llvm-nvptx-extra-v1");
+    assert_eq!(cuda.target.as_deref(), Some("sm_86"));
+
+    let amd = Renderer::for_amd_arch(svod_dtype::AmdArch::Gfx1151).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        None,
+        None,
+    );
+    assert_ne!(cuda.decomposition_profile, amd.decomposition_profile);
+    assert_ne!(cuda.cache_fingerprint(), Renderer::for_cuda_arch(arch).cache_fingerprint());
+}

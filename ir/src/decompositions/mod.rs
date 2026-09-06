@@ -202,6 +202,23 @@ pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
     }
 }
 
+/// Decomposition patterns for the NVPTX backend.
+///
+/// The AMD set (transcendentals over native `exp2`/`log2`, integer-domain bf16
+/// rounding) plus the f64 `Exp2`/`Log2` expansions: NVPTX lowers
+/// `@llvm.exp2` for f16/f32 only and `Log2` rides the f32-only
+/// `lg2.approx.f32`, so double precision takes the polynomial path.
+pub fn nvptx_decomposition_patterns() -> TypedPatternMatcher<()> {
+    fn f64(d: &crate::DType) -> bool {
+        d.base() == svod_dtype::ScalarDType::Float64
+    }
+    amd_decomposition_patterns()
+        + patterns! {
+            Exp2(src) if f64(&src.dtype()) => xexp2(src),
+            Log2(src) if f64(&src.dtype()) => xlog2(src),
+        }
+}
+
 /// Apply decomposition to a UOp graph using the provided pattern matcher.
 ///
 /// Uses `graph_rewrite_bottom_up` to traverse the graph and apply decomposition

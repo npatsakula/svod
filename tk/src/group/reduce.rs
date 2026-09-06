@@ -1,7 +1,10 @@
 //! Cross-lane reductions: the value-only `row_reduce`/`col_reduce` (shared
 //! `reduce`/`reduce_u` bodies) and the index-carrying argmin/argmax
 //! `row_arg_reduce`/`col_arg_reduce` (shared `arg_reduce` body). Each folds the
-//! lane-local elements, then the sibling 16-lane slots via `ds_bpermute`.
+//! lane-local elements into the fragment map's per-lane slots
+//! ([`LaneMap::slot_of`](crate::layout::LaneMap::slot_of) — one slot on AMD, the
+//! `g`/`g+8` pair on `mma.sync`), then completes across lanes per the map's
+//! [`ReduceTree`] (the `ds_bpermute` sibling gather, or the `shfl.bfly` quad).
 
 use std::sync::Arc;
 
@@ -9,12 +12,42 @@ use smallvec::{SmallVec, smallvec};
 use svod_dtype::DType;
 use svod_ir::{AxisType, ConstValue, UOp};
 
-use super::{ArgDir, Group, arg_fold, iadd, imod, imul, lane_rc};
+use super::{ArgDir, Group, arg_fold, iadd, imod, imul};
 use crate::index::{Idx, cidx, flat_index, load_at};
+use crate::layout::{LaneMap, ReduceTree};
 use crate::tile::{RT, RV};
 use crate::tiles::TileLayout;
 
 impl<'k> Group<'k> {
+    /// The source fragment's lane map and cross-lane tree for this wave.
+    fn fold_plan(&self, src: &RT<'k>) -> (LaneMap, ReduceTree) {
+        (src.base.map, src.base.map.tree(self.ker.caps.wave_size))
+    }
+
+    /// Complete a per-lane `partial` across the wave per `tree`: gather the
+    /// siblings' ORIGINAL partials (`(laneid + d) % group`, `ds_bpermute`) or
+    /// butterfly the RUNNING value with `laneid ^ m` (`shfl.bfly`).
+    fn cross_lane<F>(&self, tree: &ReduceTree, partial: &Arc<UOp>, op: &F) -> Arc<UOp>
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        let mut acc = partial.clone();
+        match tree {
+            ReduceTree::Gather(offsets) => {
+                let laneid = self.laneid();
+                for &d in offsets {
+                    let src_lane = imod(&iadd(&laneid, &cidx(d)), self.group_threads() as i64);
+                    acc = op(&acc, &self.shuffle_lane(partial, &src_lane));
+                }
+            }
+            ReduceTree::Butterfly(masks) => {
+                for &m in masks {
+                    acc = op(&acc, &self.shuffle_xor_lane(&acc, m));
+                }
+            }
+        }
+        acc
+    }
     /// Reduce each row of `src` into `vec` (tinygrad `row_reduce`): per
     /// row-tile `height`, fold `op` over the `(width, inner)` lane-local
     /// elements into a 1-element REG accumulator, publish it to an LDS scratch
@@ -72,58 +105,62 @@ impl<'k> Group<'k> {
         }
         let elem = src.elem().clone();
         let ept = src.shape()[src.shape().len() - 1] as i64;
-        let red_reg = self.ker.alloc_reg(1, elem.clone());
-        let laneid = self.laneid();
+        let (map, tree) = self.fold_plan(src);
+        let slots = map.slots();
+        assert_eq!(vec.shape()[1], slots, "reduce: vector slots must match the source fragment map");
+        let red_reg = self.ker.alloc_reg(slots, elem.clone());
 
-        let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
         let init_val = UOp::const_(elem.clone(), ConstValue::Float(init_value));
 
         let outer = self.ker.raw_range(outer_end, AxisType::Loop);
 
-        // Re-init the REG accumulator each outer iteration: the init store must
-        // depend on `outer` (and the enclosing tracked loops), or it hoists above
-        // them and the accumulator carries stale state across iterations.
+        // Re-init the REG accumulator slots each outer iteration: the init store
+        // must depend on `outer` (and the enclosing tracked loops), or it hoists
+        // above them and the accumulator carries stale state across iterations.
         let mut init_deps: SmallVec<[Arc<UOp>; 4]> = smallvec![outer.clone()];
         init_deps.extend(self.ker.tracked_ranges());
         let init_buf = red_reg.after(init_deps);
-        let i = self.ker.raw_range(1, AxisType::Loop);
-        let mut latest = flat_index(&init_buf, &[1], &[Idx::from(&i)]).store(init_val).end(smallvec![i]);
+        let i = self.ker.raw_range(slots as i64, AxisType::Loop);
+        let mut latest = flat_index(&init_buf, &[slots], &[Idx::from(&i)]).store(init_val).end(smallvec![i]);
 
-        // In-lane fold over (acc, inner). The accumulator read must observe both
-        // the prior store (`latest`) and the live reduce ranges, else it hoists.
+        // In-lane fold over (acc, inner) into the element's slot. The accumulator
+        // read must observe both the prior store (`latest`) and the live reduce
+        // ranges, else it hoists.
         let acc = self.ker.raw_range(acc_end, AxisType::Reduce);
         let inner = self.ker.raw_range(ept, AxisType::Reduce);
-        let acc_read = read0(&red_reg.after(smallvec![latest.clone(), acc.clone(), inner.clone()]));
+        let slot = map.slot_of(&Idx::from(&inner));
+        let acc_read = load_at(
+            &red_reg.after(smallvec![latest.clone(), acc.clone(), inner.clone()]),
+            &[slots],
+            std::slice::from_ref(&slot),
+        );
         let src_idx = if row {
             [Idx::from(&outer), Idx::from(&acc), Idx::from(&inner)]
         } else {
             [Idx::from(&acc), Idx::from(&outer), Idx::from(&inner)]
         };
         let src_v = load_at(src.uop(), src.shape(), &src_idx);
-        latest = flat_index(&red_reg, &[1], &[Idx::Const(0)]).store(op(&acc_read, &src_v)).end(smallvec![acc, inner]);
+        latest = flat_index(&red_reg, &[slots], &[slot]).store(op(&acc_read, &src_v)).end(smallvec![acc, inner]);
 
-        // Cross-lane fold via `ds_bpermute`: read this lane's in-lane `partial`
-        // once, then gather the three sibling 16-lane slots' *original* partials
-        // (lanes L+16, L+32, L+48 mod warp) straight from registers — no LDS and
-        // no barrier. The wave executes the gather in lockstep, so every lane's
-        // `partial` is live before any lane reads it (the LDS barrier's old job).
-        // Lane L thus folds the partials of {L, L+16, L+32, L+48} — bit-for-bit
-        // the prior LDS sibling tree.
-        let partial = read0(&red_reg.after(smallvec![latest]));
-        let mut acc = partial.clone();
-        for d in self.ker.caps.reduce_tree() {
-            let src_lane = imod(&iadd(&laneid, &cidx(d)), self.group_threads() as i64);
-            acc = op(&acc, &self.shuffle_lane(&partial, &src_lane));
-        }
-
-        // Fold the lane result into vec[outer]: the vec read carries the incoming
-        // vec state plus `outer` so it accumulates across outer iterations.
-        let vec_acc =
-            load_at(&vec.uop().after(smallvec![outer.clone()]), vec.shape(), &[Idx::from(&outer), Idx::Const(0)]);
-        let vec_store = flat_index(vec.uop(), vec.shape(), &[Idx::from(&outer), Idx::Const(0)])
-            .store(op(&vec_acc, &acc))
-            .end(smallvec![outer]);
-        self.finalize_tile(vec, vec_store)
+        // Cross-lane completion per slot, straight from registers — no LDS and no
+        // barrier: the wave executes the shuffle in lockstep, so every lane's
+        // partial is live before any lane reads it. On AMD lane L gathers the
+        // ORIGINAL partials of {L+16, L+32, L+48} — bit-for-bit the prior LDS
+        // sibling tree; on CUDA the quad butterflies its running value.
+        let folded = red_reg.after(smallvec![latest]);
+        let stores: Vec<Arc<UOp>> = (0..slots as i64)
+            .map(|s| {
+                let partial = load_at(&folded, &[slots], &[Idx::Const(s)]);
+                let acc = self.cross_lane(&tree, &partial, &op);
+                // Fold the lane result into vec[outer, s]: the vec read carries the
+                // incoming vec state plus `outer` so it accumulates across iterations.
+                let at = [Idx::from(&outer), Idx::Const(s)];
+                let vec_acc = load_at(&vec.uop().after(smallvec![outer.clone()]), vec.shape(), &at);
+                flat_index(vec.uop(), vec.shape(), &at).store(op(&vec_acc, &acc))
+            })
+            .collect();
+        let grouped = if stores.len() == 1 { stores.into_iter().next().unwrap() } else { UOp::group(stores) };
+        self.finalize_tile(vec, grouped.end(smallvec![outer]))
     }
 
     /// Fully **unrolled** [`Self::reduce`]: the `outer`/`acc`/`inner` `RANGE`s
@@ -147,8 +184,9 @@ impl<'k> Group<'k> {
     {
         let elem = src.elem().clone();
         let ept = src.shape()[src.shape().len() - 1] as i64;
-        let laneid = self.laneid();
-        let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
+        let (map, tree) = self.fold_plan(src);
+        let slots = map.slots();
+        assert_eq!(vec.shape()[1], slots, "reduce: vector slots must match the source fragment map");
         // Anchor the `src` read so a constant-address read of a carried tile is
         // not hoisted out of the enclosing rolled loop (see `Group::anchor`).
         let src_buf = self.anchor(src.uop());
@@ -157,50 +195,54 @@ impl<'k> Group<'k> {
         // enclosing (rolled KV) loop's `END`.
         let mut vec_prev: Option<Arc<UOp>> = None;
         for o in 0..outer_end {
-            // Fresh 1-element accumulator per `outer` (no cross-`outer` reuse, so
+            // Fresh per-slot accumulator per `outer` (no cross-`outer` reuse, so
             // the unrolled folds stay independent).
-            let red_reg = self.ker.alloc_reg(1, elem.clone());
+            let red_reg = self.ker.alloc_reg(slots, elem.clone());
 
             // Re-init: anchor the init store inside the enclosing tracked (KV)
             // loop, or — having only a constant input — it hoists above the rolled
             // loop and the accumulator carries stale state across KV iterations
-            // (the looped form's `init_deps` invariant).
+            // (the looped form's `init_deps` invariant). Slot stores chain.
             let init_buf = red_reg.after(self.ker.tracked_ranges());
             let init_val = UOp::const_(elem.clone(), ConstValue::Float(init_value));
-            let mut latest = flat_index(&init_buf, &[1], &[Idx::Const(0)]).store(init_val);
+            let mut latest = flat_index(&init_buf, &[slots], &[Idx::Const(0)]).store(init_val.clone());
+            for s in 1..slots as i64 {
+                latest =
+                    flat_index(&red_reg.after(smallvec![latest]), &[slots], &[Idx::Const(s)]).store(init_val.clone());
+            }
 
-            // In-lane fold over (acc, inner): each step observes the prior store.
+            // In-lane fold over (acc, inner) into each element's slot: each step
+            // observes the prior store.
             for a in 0..acc_end {
                 for i in 0..ept {
-                    let acc_read = read0(&red_reg.after(smallvec![latest.clone()]));
+                    let slot = map.slot_of(&Idx::Const(i));
+                    let acc_read =
+                        load_at(&red_reg.after(smallvec![latest.clone()]), &[slots], std::slice::from_ref(&slot));
                     let src_idx = if row {
                         [Idx::Const(o), Idx::Const(a), Idx::Const(i)]
                     } else {
                         [Idx::Const(a), Idx::Const(o), Idx::Const(i)]
                     };
                     let src_v = load_at(&src_buf, src.shape(), &src_idx);
-                    latest = flat_index(&red_reg, &[1], &[Idx::Const(0)]).store(op(&acc_read, &src_v));
+                    latest = flat_index(&red_reg, &[slots], &[slot]).store(op(&acc_read, &src_v));
                 }
             }
 
-            // Cross-lane fold via `ds_bpermute` (the same sibling 16-lane tree as
-            // the looped form): read this lane's partial once, gather L+{16,32,48}.
-            let partial = read0(&red_reg.after(smallvec![latest]));
-            let mut acc = partial.clone();
-            for d in self.ker.caps.reduce_tree() {
-                let src_lane = imod(&iadd(&laneid, &cidx(d)), self.group_threads() as i64);
-                acc = op(&acc, &self.shuffle_lane(&partial, &src_lane));
+            // Cross-lane completion per slot (the same tree as the looped form),
+            // then fold into vec[o, s], carrying the incoming (running) vec state;
+            // chain across `outer` (and slots) for loop scoping.
+            let folded = red_reg.after(smallvec![latest]);
+            for s in 0..slots as i64 {
+                let partial = load_at(&folded, &[slots], &[Idx::Const(s)]);
+                let acc = self.cross_lane(&tree, &partial, &op);
+                let vbuf = match &vec_prev {
+                    Some(p) => vec.uop().after(smallvec![p.clone()]),
+                    None => self.anchor(vec.uop()),
+                };
+                let at = [Idx::Const(o), Idx::Const(s)];
+                let vec_acc = load_at(&vbuf, vec.shape(), &at);
+                vec_prev = Some(flat_index(vec.uop(), vec.shape(), &at).store(op(&vec_acc, &acc)));
             }
-
-            // Fold into vec[o], carrying the incoming (running) vec state; chain
-            // across `outer` for loop scoping.
-            let vbuf = match &vec_prev {
-                Some(p) => vec.uop().after(smallvec![p.clone()]),
-                None => self.anchor(vec.uop()),
-            };
-            let vec_acc = load_at(&vbuf, vec.shape(), &[Idx::Const(o), Idx::Const(0)]);
-            let vstore = flat_index(vec.uop(), vec.shape(), &[Idx::Const(o), Idx::Const(0)]).store(op(&vec_acc, &acc));
-            vec_prev = Some(vstore);
         }
         let terminal = vec_prev.expect("reduce_u: at least one outer tile");
         self.finalize_tile(vec, terminal)
@@ -213,38 +255,24 @@ impl<'k> Group<'k> {
     /// `0..extent` index to its GLOBAL position in the reduced axis; it is `0` (no
     /// offset) for a single-fragment source. `frag_extent` is the per-frag span of
     /// the folded axis (`16` for a 16×16 base), so frag `f` starts at element
-    /// `f*frag_extent`. Reuses the source fragment's [`lane_rc`] mapping — the same
-    /// one the value load uses — and picks the lane_rc coordinate that *varies with
-    /// `inner`*, since that (with the cross-lane tree) is exactly the axis the
-    /// reduce folds. It is the **column** for the normal (gfx942 stride-4) and
-    /// `interleave_t` layouts, and the **row** for the `transpose` (`Col`-layout)
-    /// and the wave32 even/odd `interleave` accumulator — where the 16-wide reduced
-    /// axis is split across a lane's `inner` elements and its `L+16` sibling. So
+    /// `f*frag_extent`. Reuses the source fragment's lane map — the same one the
+    /// value load uses — and picks the coordinate that *varies with `inner`*
+    /// ([`LaneMap::folds_cols`]), since that (with the cross-lane tree) is exactly
+    /// the axis the reduce folds. It is the **column** for the normal (gfx942
+    /// stride-4) and `InterleavedT` layouts, and the **row** for the `transpose`
+    /// (`Col`-layout) and the wave32 even/odd `Interleaved` accumulator — where the
+    /// 16-wide reduced axis is split across a lane's `inner` elements and its `L+16`
+    /// sibling. So
     /// `row_arg_reduce` on a wave32 accumulator reduces the interleave's
     /// `inner`-carrying axis, exactly as `row_reduce` does (the caller arranges the
     /// tile to match).
     fn axis_index_of(&self, src: &RT<'k>, frag: Option<&Arc<UOp>>, acc: &Arc<UOp>, inner: &Arc<UOp>) -> Arc<UOp> {
         let base_rows = src.base.base.rows as i64;
         let base_cols = src.base.base.cols as i64;
-        let (r, c) = lane_rc(
-            src.layout == TileLayout::Col,
-            src.base.interleave,
-            src.base.interleave_t,
-            &self.laneid(),
-            base_rows,
-            base_cols,
-            src.base.stride as i64,
-            inner,
-        );
-        // Which lane_rc coordinate carries `inner` (the folded axis)?
-        let inner_is_col = if src.base.interleave_t {
-            true
-        } else if src.base.interleave {
-            false
-        } else {
-            src.layout != TileLayout::Col
-        };
-        let (folded, extent) = if inner_is_col { (c, base_cols) } else { (r, base_rows) };
+        let transpose = src.layout == TileLayout::Col;
+        let (r, c) = src.lane_rc(transpose, &self.laneid(), inner);
+        // Which coordinate carries `inner` (the folded axis)?
+        let (folded, extent) = if src.base.map.folds_cols(transpose) { (c, base_cols) } else { (r, base_rows) };
         // `acc` (the in-lane reduce frag) and `frag` (the stacked height/width
         // frags the cross-frag fold sweeps) BOTH step by `extent` along the folded
         // axis — the caller stacks the extra frags there — so the global frag index
@@ -342,9 +370,11 @@ impl<'k> Group<'k> {
 
         let velem = src.elem().clone();
         let ept = src.shape()[src.shape().len() - 1] as i64;
-        let val_reg = self.ker.alloc_reg(1, velem.clone());
-        let idx_reg = self.ker.alloc_reg(1, DType::Int32);
-        let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
+        let (map, tree) = self.fold_plan(src);
+        let slots = map.slots();
+        assert_eq!(val.shape()[1], slots, "arg_reduce: vector slots must match the source fragment map");
+        let val_reg = self.ker.alloc_reg(slots, velem.clone());
+        let idx_reg = self.ker.alloc_reg(slots, DType::Int32);
 
         let outer = self.ker.raw_range(outer_end, AxisType::Loop);
 
@@ -354,19 +384,23 @@ impl<'k> Group<'k> {
         // tiny init loop once.
         let mut init_deps: SmallVec<[Arc<UOp>; 4]> = smallvec![outer.clone()];
         init_deps.extend(self.ker.tracked_ranges());
-        let i_range = self.ker.raw_range(1, AxisType::Loop);
-        let v_init = flat_index(&val_reg.after(init_deps.clone()), &[1], &[Idx::from(&i_range)])
-            .store(UOp::const_(velem.clone(), ConstValue::Float(dir.init())));
-        let i_init = flat_index(&idx_reg.after(init_deps), &[1], &[Idx::from(&i_range)])
-            .store(UOp::const_(DType::Int32, ConstValue::Int(-1)));
-        let init_grp = UOp::group(vec![v_init, i_init]).end(smallvec![i_range]);
+        let init_grp = self.arg_init(dir, &velem, &val_reg, &idx_reg, slots, init_deps);
 
         // In-lane fold over (acc, inner): fold this element's value + its global
-        // axis index into the running pair, storing both under one grouped END.
+        // axis index into the element's slot pair, storing both under one grouped END.
         let acc = self.ker.raw_range(acc_end, AxisType::Reduce);
         let inner = self.ker.raw_range(ept, AxisType::Reduce);
-        let va = read0(&val_reg.after(smallvec![init_grp.clone(), acc.clone(), inner.clone()]));
-        let ia = read0(&idx_reg.after(smallvec![init_grp.clone(), acc.clone(), inner.clone()]));
+        let slot = map.slot_of(&Idx::from(&inner));
+        let va = load_at(
+            &val_reg.after(smallvec![init_grp.clone(), acc.clone(), inner.clone()]),
+            &[slots],
+            std::slice::from_ref(&slot),
+        );
+        let ia = load_at(
+            &idx_reg.after(smallvec![init_grp.clone(), acc.clone(), inner.clone()]),
+            &[slots],
+            std::slice::from_ref(&slot),
+        );
         let src_idx = if row {
             [Idx::from(&outer), Idx::from(&acc), Idx::from(&inner)]
         } else {
@@ -375,47 +409,85 @@ impl<'k> Group<'k> {
         let vb = load_at(src.uop(), src.shape(), &src_idx);
         let ib = self.axis_index_of(src, None, &acc, &inner);
         let (vf, idf) = arg_fold(dir, &va, &ia, &vb, &ib);
-        let v_fold = flat_index(&val_reg, &[1], &[Idx::Const(0)]).store(vf);
-        let i_fold = flat_index(&idx_reg, &[1], &[Idx::Const(0)]).store(idf);
+        let v_fold = flat_index(&val_reg, &[slots], std::slice::from_ref(&slot)).store(vf);
+        let i_fold = flat_index(&idx_reg, &[slots], &[slot]).store(idf);
         let fold_grp = UOp::group(vec![v_fold, i_fold]).end(smallvec![acc, inner]);
 
-        // Cross-lane fold via `ds_bpermute`: value and index each ride their own
-        // shuffle, so the partner's winning index is transported, not re-derived.
-        let (vacc, iacc) = self.arg_cross_lane(dir, &val_reg, &idx_reg, &fold_grp);
-
-        // Re-seed the OUTPUT pair to `dir.init()`/`-1` once per outer trip AND per
-        // enclosing tracked loop, so a reduce *inside* a rolled loop (the KNN corpus
-        // stream) starts fresh each trip instead of folding onto the previous trip's
-        // result — the running-extremum hoist that an `outer`-only edge leaves open
-        // (the output RVs' seed `clear_rv` carries no tracked-loop dependency, so it
-        // is hoisted to `run_count = 1`; this re-seed restores the per-trip start).
-        // A reduce with no enclosing tracked loop re-seeds once (`init_deps = [outer]`),
-        // identical to the prior single-fold behavior. The fold then reads THIS seed,
-        // not the carried buffer, so it is a fresh per-trip reduce, not a running one.
-        let mut out_init: SmallVec<[Arc<UOp>; 4]> = smallvec![outer.clone()];
-        out_init.extend(self.ker.tracked_ranges());
-        let vo_seed = flat_index(&val.uop().after(out_init.clone()), val.shape(), &[Idx::from(&outer), Idx::Const(0)])
-            .store(UOp::const_(velem.clone(), ConstValue::Float(dir.init())));
-        let io_seed = flat_index(&idx.uop().after(out_init), idx.shape(), &[Idx::from(&outer), Idx::Const(0)])
-            .store(UOp::const_(DType::Int32, ConstValue::Int(-1)));
-        let oseed_grp = UOp::group(vec![vo_seed, io_seed]);
-
-        // Fold the lane result into the freshly re-seeded (val[outer], idx[outer]).
-        let v_in = load_at(
-            &val.uop().after(smallvec![oseed_grp.clone(), outer.clone()]),
-            val.shape(),
-            &[Idx::from(&outer), Idx::Const(0)],
-        );
-        let i_in = load_at(
-            &idx.uop().after(smallvec![oseed_grp, outer.clone()]),
-            idx.shape(),
-            &[Idx::from(&outer), Idx::Const(0)],
-        );
-        let (vout, iout) = arg_fold(dir, &v_in, &i_in, &vacc, &iacc);
-        let v_store = flat_index(val.uop(), val.shape(), &[Idx::from(&outer), Idx::Const(0)]).store(vout);
-        let i_store = flat_index(idx.uop(), idx.shape(), &[Idx::from(&outer), Idx::Const(0)]).store(iout);
-        let out_grp = UOp::group(vec![v_store, i_store]).end(smallvec![outer]);
+        // Cross-lane fold per slot, then fold into the re-seeded output pair.
+        let out_grp = self.arg_output(dir, &tree, &val_reg, &idx_reg, &fold_grp, &val, &idx, &outer);
         self.finalize_pair(val, idx, out_grp)
+    }
+
+    /// Seed the `slots`-wide `(val_reg, idx_reg)` accumulators to `dir.init()`/`-1`
+    /// under one grouped END over a tiny slot loop, ordered after `deps`.
+    fn arg_init(
+        &self,
+        dir: ArgDir,
+        velem: &DType,
+        val_reg: &Arc<UOp>,
+        idx_reg: &Arc<UOp>,
+        slots: usize,
+        deps: SmallVec<[Arc<UOp>; 4]>,
+    ) -> Arc<UOp> {
+        let i_range = self.ker.raw_range(slots as i64, AxisType::Loop);
+        let v_init = flat_index(&val_reg.after(deps.clone()), &[slots], &[Idx::from(&i_range)])
+            .store(UOp::const_(velem.clone(), ConstValue::Float(dir.init())));
+        let i_init = flat_index(&idx_reg.after(deps), &[slots], &[Idx::from(&i_range)])
+            .store(UOp::const_(DType::Int32, ConstValue::Int(-1)));
+        UOp::group(vec![v_init, i_init]).end(smallvec![i_range])
+    }
+
+    /// Complete the per-slot `(val_reg, idx_reg)` partials across lanes and fold
+    /// them into the output pair at `(out, slot)`, re-seeding the OUTPUT pair to
+    /// `dir.init()`/`-1` once per `out` trip AND per enclosing tracked loop, so a
+    /// reduce *inside* a rolled loop (the KNN corpus stream) starts fresh each trip
+    /// instead of folding onto the previous trip's result — the running-extremum
+    /// hoist that an `out`-only edge leaves open (the output RVs' seed `clear_rv`
+    /// carries no tracked-loop dependency, so it is hoisted to `run_count = 1`; this
+    /// re-seed restores the per-trip start). A reduce with no enclosing tracked loop
+    /// re-seeds once, identical to the prior single-fold behavior. The fold then
+    /// reads THIS seed, not the carried buffer, so it is a fresh per-trip reduce.
+    /// Returns the grouped output store ended on `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn arg_output(
+        &self,
+        dir: ArgDir,
+        tree: &ReduceTree,
+        val_reg: &Arc<UOp>,
+        idx_reg: &Arc<UOp>,
+        fold_grp: &Arc<UOp>,
+        val: &RV<'k>,
+        idx: &RV<'k>,
+        out: &Arc<UOp>,
+    ) -> Arc<UOp> {
+        let slots = val.shape()[1];
+        let velem = val.elem().clone();
+        let mut out_init: SmallVec<[Arc<UOp>; 4]> = smallvec![out.clone()];
+        out_init.extend(self.ker.tracked_ranges());
+        let (mut seeds, mut stores) = (Vec::with_capacity(2 * slots), Vec::with_capacity(2 * slots));
+        let mut folds = Vec::with_capacity(slots);
+        for s in 0..slots as i64 {
+            let at = [Idx::from(out), Idx::Const(s)];
+            let (vacc, iacc) = self.arg_cross_lane(dir, tree, val_reg, idx_reg, fold_grp, s);
+            seeds.push(
+                flat_index(&val.uop().after(out_init.clone()), val.shape(), &at)
+                    .store(UOp::const_(velem.clone(), ConstValue::Float(dir.init()))),
+            );
+            seeds.push(
+                flat_index(&idx.uop().after(out_init.clone()), idx.shape(), &at)
+                    .store(UOp::const_(DType::Int32, ConstValue::Int(-1))),
+            );
+            folds.push((at, vacc, iacc));
+        }
+        let oseed_grp = UOp::group(seeds);
+        for (at, vacc, iacc) in folds {
+            let v_in = load_at(&val.uop().after(smallvec![oseed_grp.clone(), out.clone()]), val.shape(), &at);
+            let i_in = load_at(&idx.uop().after(smallvec![oseed_grp.clone(), out.clone()]), idx.shape(), &at);
+            let (vout, iout) = arg_fold(dir, &v_in, &i_in, &vacc, &iacc);
+            stores.push(flat_index(val.uop(), val.shape(), &at).store(vout));
+            stores.push(flat_index(idx.uop(), idx.shape(), &at).store(iout));
+        }
+        UOp::group(stores).end(smallvec![out.clone()])
     }
 
     /// The cross-frag-folding [`Self::arg_reduce`] for a source TALLER than one
@@ -439,31 +511,28 @@ impl<'k> Group<'k> {
     ) -> (RV<'k>, RV<'k>) {
         let velem = src.elem().clone();
         let ept = src.shape()[src.shape().len() - 1] as i64;
-        let val_reg = self.ker.alloc_reg(1, velem.clone());
-        let idx_reg = self.ker.alloc_reg(1, DType::Int32);
-        let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
+        let (map, tree) = self.fold_plan(src);
+        let slots = map.slots();
+        assert_eq!(val.shape()[1], slots, "arg_reduce: vector slots must match the source fragment map");
+        let val_reg = self.ker.alloc_reg(slots, velem.clone());
+        let idx_reg = self.ker.alloc_reg(slots, DType::Int32);
 
         // Re-init both accumulators each enclosing tracked-loop iteration: the init
         // stores must depend on the tracked loops, or they hoist above the loop and
         // carry stale state (cf. the single-fold path's `outer`-keyed re-init). One
         // grouped END closes the tiny init loop once.
-        let init_deps = self.ker.tracked_ranges();
-        let i_range = self.ker.raw_range(1, AxisType::Loop);
-        let v_init = flat_index(&val_reg.after(init_deps.clone()), &[1], &[Idx::from(&i_range)])
-            .store(UOp::const_(velem.clone(), ConstValue::Float(dir.init())));
-        let i_init = flat_index(&idx_reg.after(init_deps), &[1], &[Idx::from(&i_range)])
-            .store(UOp::const_(DType::Int32, ConstValue::Int(-1)));
-        let init_grp = UOp::group(vec![v_init, i_init]).end(smallvec![i_range]);
+        let init_grp = self.arg_init(dir, &velem, &val_reg, &idx_reg, slots, self.ker.tracked_ranges());
 
         // In-lane fold over (frag, acc, inner): the `frag` Reduce range sweeps the
-        // stacked frags so the whole reduced axis collapses into the single pair; the
+        // stacked frags so the whole reduced axis collapses into the slot pair; the
         // global axis index carries the `frag*extent` lift.
         let frag = self.ker.raw_range(outer_end, AxisType::Reduce);
         let acc = self.ker.raw_range(acc_end, AxisType::Reduce);
         let inner = self.ker.raw_range(ept, AxisType::Reduce);
+        let slot = map.slot_of(&Idx::from(&inner));
         let red_deps = smallvec![init_grp.clone(), frag.clone(), acc.clone(), inner.clone()];
-        let va = read0(&val_reg.after(red_deps.clone()));
-        let ia = read0(&idx_reg.after(red_deps));
+        let va = load_at(&val_reg.after(red_deps.clone()), &[slots], std::slice::from_ref(&slot));
+        let ia = load_at(&idx_reg.after(red_deps), &[slots], std::slice::from_ref(&slot));
         let src_idx = if row {
             [Idx::from(&frag), Idx::from(&acc), Idx::from(&inner)]
         } else {
@@ -472,81 +541,67 @@ impl<'k> Group<'k> {
         let vb = load_at(src.uop(), src.shape(), &src_idx);
         let ib = self.axis_index_of(src, Some(&frag), &acc, &inner);
         let (vf, idf) = arg_fold(dir, &va, &ia, &vb, &ib);
-        let v_fold = flat_index(&val_reg, &[1], &[Idx::Const(0)]).store(vf);
-        let i_fold = flat_index(&idx_reg, &[1], &[Idx::Const(0)]).store(idf);
+        let v_fold = flat_index(&val_reg, &[slots], std::slice::from_ref(&slot)).store(vf);
+        let i_fold = flat_index(&idx_reg, &[slots], &[slot]).store(idf);
         let fold_grp = UOp::group(vec![v_fold, i_fold]).end(smallvec![frag, acc, inner]);
 
-        // Cross-lane fold via `ds_bpermute` (shared with the single-fold path).
-        let (vacc, iacc) = self.arg_cross_lane(dir, &val_reg, &idx_reg, &fold_grp);
-
-        // The whole reduced axis collapsed to the single output slot 0. A single-trip
-        // `out` `Loop` range scopes the lone output store (the single-fold path's
-        // degenerate end-1 `outer` loop), so the grouped terminal closes exactly once.
-        // Re-seed the slot to `dir.init()`/`-1` per `out` trip + enclosing tracked loop
-        // (the same per-trip-fresh invariant as the single-fold path), then fold the
-        // lane result into it.
+        // The whole reduced axis collapsed to output row 0. A single-trip `out`
+        // `Loop` range scopes the output stores (the single-fold path's degenerate
+        // end-1 `outer` loop), so the grouped terminal closes exactly once.
         let out = self.ker.raw_range(1, AxisType::Loop);
-        let mut out_init: SmallVec<[Arc<UOp>; 4]> = smallvec![out.clone()];
-        out_init.extend(self.ker.tracked_ranges());
-        let vo_seed = flat_index(&val.uop().after(out_init.clone()), val.shape(), &[Idx::from(&out), Idx::Const(0)])
-            .store(UOp::const_(velem.clone(), ConstValue::Float(dir.init())));
-        let io_seed = flat_index(&idx.uop().after(out_init), idx.shape(), &[Idx::from(&out), Idx::Const(0)])
-            .store(UOp::const_(DType::Int32, ConstValue::Int(-1)));
-        let oseed_grp = UOp::group(vec![vo_seed, io_seed]);
-
-        let v_in = load_at(
-            &val.uop().after(smallvec![oseed_grp.clone(), out.clone()]),
-            val.shape(),
-            &[Idx::from(&out), Idx::Const(0)],
-        );
-        let i_in = load_at(
-            &idx.uop().after(smallvec![oseed_grp, out.clone()]),
-            idx.shape(),
-            &[Idx::from(&out), Idx::Const(0)],
-        );
-        let (vout, iout) = arg_fold(dir, &v_in, &i_in, &vacc, &iacc);
-        let v_store = flat_index(val.uop(), val.shape(), &[Idx::from(&out), Idx::Const(0)]).store(vout);
-        let i_store = flat_index(idx.uop(), idx.shape(), &[Idx::from(&out), Idx::Const(0)]).store(iout);
-        let out_grp = UOp::group(vec![v_store, i_store]).end(smallvec![out]);
+        let out_grp = self.arg_output(dir, &tree, &val_reg, &idx_reg, &fold_grp, &val, &idx, &out);
         self.finalize_pair(val, idx, out_grp)
     }
 
-    /// The cross-lane `ds_bpermute` sibling-fold shared by both [`Self::arg_reduce`]
-    /// paths: read this lane's in-lane `(value, index)` partial once, then fold the
-    /// sibling 16-lane slots' partials per the arch's `reduce_tree` — value and index
-    /// each ride their OWN shuffle so the partner's winning index is transported, not
-    /// re-derived. Returns the warp-wide `(value, index)` extremum for this lane.
+    /// The cross-lane fold of slot `slot` shared by both [`Self::arg_reduce`] paths:
+    /// read this lane's in-lane `(value, index)` partial once, then fold the
+    /// partners' partials per `tree` — value and index each ride their OWN shuffle
+    /// so the partner's winning index is transported, not re-derived. Returns the
+    /// warp-wide `(value, index)` extremum for this lane.
     fn arg_cross_lane(
         &self,
         dir: ArgDir,
+        tree: &ReduceTree,
         val_reg: &Arc<UOp>,
         idx_reg: &Arc<UOp>,
         fold_grp: &Arc<UOp>,
+        slot: i64,
     ) -> (Arc<UOp>, Arc<UOp>) {
-        let read0 = |buf: &Arc<UOp>| load_at(buf, &[1], &[Idx::Const(0)]);
-        let v_partial = read0(&val_reg.after(smallvec![fold_grp.clone()]));
-        let i_partial = read0(&idx_reg.after(smallvec![fold_grp.clone()]));
-        // Pin the `ds_bpermute` lane address to THIS reduce's fold scope by
-        // materializing `laneid` through a per-reduce 1-element register. The
-        // register round-trip — not a bare `laneid.after(fold_grp)` — is the
-        // tinygrad anchoring discipline (`llm/kernels/amd.py` anchors ride
-        // register buffers): the pinned AFTER spec admits no ALU/SPECIAL
-        // passthrough, and a weak-dtyped AFTER is a fixpoint `pm_lower_weak`
-        // never strengthens. The Int32 store also commits the WeakInt SPECIAL
-        // chain before the index arithmetic below.
-        let lane_reg = self.ker.alloc_reg(1, DType::Int32);
-        let lane_store = flat_index(&lane_reg, &[1], &[Idx::Const(0)]).store(self.laneid().cast(DType::Int32));
-        // Strong load, weak cast outside for the index arithmetic below — the
-        // `pm_lower_weak` PARAM discipline.
-        let laneid = read0(&lane_reg.after(smallvec![lane_store, fold_grp.clone()])).cast(DType::WeakInt);
+        let slots = &[val_reg.buffer_size().expect("arg_reduce register")];
+        let at = [Idx::Const(slot)];
+        let v_partial = load_at(&val_reg.after(smallvec![fold_grp.clone()]), slots, &at);
+        let i_partial = load_at(&idx_reg.after(smallvec![fold_grp.clone()]), slots, &at);
         let (mut vacc, mut iacc) = (v_partial.clone(), i_partial.clone());
-        for d in self.ker.caps.reduce_tree() {
-            let src_lane = imod(&iadd(&laneid, &cidx(d)), self.group_threads() as i64);
-            let pv = self.shuffle_lane(&v_partial, &src_lane);
-            let pi = self.shuffle_lane(&i_partial, &src_lane);
-            let (v, i) = arg_fold(dir, &vacc, &iacc, &pv, &pi);
-            vacc = v;
-            iacc = i;
+        match tree {
+            ReduceTree::Gather(offsets) => {
+                // Pin the `ds_bpermute` lane address to THIS reduce's fold scope by
+                // materializing `laneid` through a per-reduce 1-element register. The
+                // register round-trip — not a bare `laneid.after(fold_grp)` — is the
+                // tinygrad anchoring discipline (`llm/kernels/amd.py` anchors ride
+                // register buffers): the pinned AFTER spec admits no ALU/SPECIAL
+                // passthrough, and a weak-dtyped AFTER is a fixpoint `pm_lower_weak`
+                // never strengthens. The Int32 store also commits the WeakInt SPECIAL
+                // chain before the index arithmetic below.
+                let lane_reg = self.ker.alloc_reg(1, DType::Int32);
+                let lane_store = flat_index(&lane_reg, &[1], &[Idx::Const(0)]).store(self.laneid().cast(DType::Int32));
+                // Strong load, weak cast outside for the index arithmetic below — the
+                // `pm_lower_weak` PARAM discipline.
+                let laneid = load_at(&lane_reg.after(smallvec![lane_store, fold_grp.clone()]), &[1], &[Idx::Const(0)])
+                    .cast(DType::WeakInt);
+                for &d in offsets {
+                    let src_lane = imod(&iadd(&laneid, &cidx(d)), self.group_threads() as i64);
+                    let pv = self.shuffle_lane(&v_partial, &src_lane);
+                    let pi = self.shuffle_lane(&i_partial, &src_lane);
+                    (vacc, iacc) = arg_fold(dir, &vacc, &iacc, &pv, &pi);
+                }
+            }
+            ReduceTree::Butterfly(masks) => {
+                for &m in masks {
+                    let pv = self.shuffle_xor_lane(&vacc, m);
+                    let pi = self.shuffle_xor_lane(&iacc, m);
+                    (vacc, iacc) = arg_fold(dir, &vacc, &iacc, &pv, &pi);
+                }
+            }
         }
         (vacc, iacc)
     }

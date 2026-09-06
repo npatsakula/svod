@@ -3,6 +3,7 @@
 use crate::Tensor;
 use ndarray::{Array2, array};
 use svod_dtype::DType;
+use test_case::test_case;
 
 crate::codegen_tests! {
     // =========================================================================
@@ -412,4 +413,184 @@ crate::codegen_tests! {
         assert!((view[[0, 0, 2]] - 1.0).abs() < 1e-5);
         assert!((view[[0, 0, 3]] - 0.0).abs() < 1e-5);
     }
+}
+
+/// GigaAM-shaped fp16 SDPA inputs: realized `[B, T, H, d]` buffers (as the
+/// model's projections leave them) with head-major views, plus per-batch key
+/// lengths. `run` builds the attention on `device` and realizes it with `config`.
+struct SdpaCase {
+    b: usize,
+    h: usize,
+    t: usize,
+    d: usize,
+}
+
+impl SdpaCase {
+    fn sample(&self, seed: usize) -> ndarray::Array4<f32> {
+        let (b, t, h, d) = (self.b, self.t, self.h, self.d);
+        ndarray::Array4::from_shape_fn((b, t, h, d), |(i, j, k, l)| {
+            let x = (i * 7919 + j * 104729 + k * 1301 + l * 7 + seed * 31) % 997;
+            (x as f32 / 498.5) - 1.0
+        })
+    }
+
+    fn key_lens(&self) -> Vec<i32> {
+        (0..self.b).map(|i| (self.t - (i * self.t) / (2 * self.b)) as i32).collect()
+    }
+
+    /// Everything the expression builds (inputs, arange, consts) lands on `device`.
+    /// The inputs realize under `inputs` (a plan meant for the attention kernels
+    /// need not fit a cast), the expression under `config`. `build` receives
+    /// head-major `q, k, v` and the `[B, 1, 1, 1]` key lengths.
+    fn run(
+        &self,
+        device: svod_dtype::DeviceSpec,
+        inputs: &crate::PrepareConfig,
+        config: &crate::PrepareConfig,
+        build: impl Fn(&Tensor, &Tensor, &Tensor, &Tensor) -> Tensor,
+    ) -> Vec<f32> {
+        svod_dtype::default_device::with_default_device(device, || {
+            let realized = |mut x: Tensor| {
+                x.realize_with(inputs).unwrap();
+                x
+            };
+            let heads = |seed: usize| {
+                realized(Tensor::from_ndarray(&self.sample(seed)).cast(DType::Float16).unwrap())
+                    .try_permute(&[0, 2, 1, 3])
+                    .unwrap()
+            };
+            let (q, k, v) = (heads(1), heads(2), heads(3));
+            let lens = realized(Tensor::from_ndarray(&ndarray::Array1::from(self.key_lens())))
+                .try_reshape([self.b, 1, 1, 1])
+                .unwrap();
+            let mut out = build(&q, &k, &v, &lens);
+            out.realize_with(config).unwrap();
+            out.as_vec::<f32>().unwrap()
+        })
+    }
+
+    /// `[B, 1, 1, T]` bool key-padding mask: true (masked) where `arange(T) >= lens[b]`.
+    fn key_mask(&self, lens: &Tensor) -> Tensor {
+        let range = Tensor::arange(self.t as i64, None, None).unwrap().try_reshape([1usize, 1, 1, self.t]).unwrap();
+        range.try_ge(lens).unwrap()
+    }
+}
+
+/// Relative mismatch report: the count over `tol` and the worst offender.
+fn assert_all_close(actual: &[f32], expected: &[f32], tol: f32) {
+    assert_eq!(actual.len(), expected.len());
+    let mut worst = (0usize, 0f32);
+    let mut bad = 0usize;
+    for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+        let diff = (a - e).abs() / (1.0 + e.abs());
+        if diff > worst.1 {
+            worst = (i, diff);
+        }
+        if diff > tol {
+            bad += 1;
+        }
+    }
+    assert!(
+        bad == 0,
+        "{bad}/{} outputs differ by > {tol}; worst at {}: GPU={} CPU={}",
+        actual.len(),
+        worst.0,
+        actual[worst.0],
+        expected[worst.0]
+    );
+}
+
+/// GigaAM-shaped masked fp16 SDPA on `CUDA:0` must match the CPU result. The
+/// BEAM variant replays/searches every kernel's plan (minutes), so it is
+/// opt-in; the heuristic variant is the everyday check.
+#[test_case(false; "heuristic")]
+#[test_case(true => ignore["BEAM search over five kernels takes minutes"]; "beam")]
+fn test_sdpa_cuda_masked_f16_matches_cpu(beam: bool) {
+    use crate::{CpuBackend, PrepareConfig};
+    use svod_dtype::DeviceSpec;
+    use svod_schedule::{BeamConfig, OptStrategy, OptimizerConfig};
+
+    svod_schedule::testing::setup_test_tracing();
+    let Some(config) = PrepareConfig::for_cuda_if_available() else {
+        eprintln!("skipped: default device is not a CUDA GPU");
+        return;
+    };
+    let case = SdpaCase { b: 8, h: 16, t: 1024, d: 64 };
+    let build = |q: &Tensor, k: &Tensor, v: &Tensor, lens: &Tensor| {
+        q.scaled_dot_product_attention()
+            .key(k)
+            .value(v)
+            .is_causal(false)
+            .attn_mask(&case.key_mask(lens))
+            .call()
+            .unwrap()
+            .try_permute(&[0, 2, 1, 3])
+            .unwrap()
+            .cast(DType::Float32)
+            .unwrap()
+    };
+    let cpu = PrepareConfig::for_cpu_backend(CpuBackend::Llvm);
+    let expected = case.run(DeviceSpec::Cpu, &cpu, &cpu, build);
+    let optimizer = if beam {
+        OptimizerConfig::builder()
+            .strategy(OptStrategy::Beam { width: 2 })
+            .beam(BeamConfig::builder().beam_width(2).build())
+            .build()
+    } else {
+        OptimizerConfig::builder().strategy(OptStrategy::Heuristic).build()
+    };
+    let cuda = PrepareConfig { optimizer, ..config };
+    let actual = case.run(DeviceSpec::Cuda { device_id: 0 }, &cuda, &cuda, build);
+    assert_all_close(&actual, &expected, 2e-2);
+}
+
+/// The BEAM plan GigaAM's masked `Q·Kᵀ` kernel picked on sm_86: a tensor-core
+/// WARP axis plus three size-2 LOCALs, four local dims for CUDA's three. The
+/// extra local must fold into `tid.y`/`tid.z`, never into the warp's `tid.x`:
+/// with the warp in the high bits of `tid.x` every `mma.sync` lane read the
+/// wrong fragment and the transcript came out empty. CUDA only; the CPU result
+/// is the reference.
+#[test]
+fn test_sdpa_scores_cuda_tc_warp_with_three_locals_matches_cpu() {
+    use crate::{CpuBackend, PrepareConfig};
+    use svod_dtype::{DeviceSpec, ScalarDType};
+    use svod_ir::{ConstValue, Opt, OptArg, OptOps};
+    use svod_schedule::{OptStrategy, OptimizerConfig};
+
+    svod_schedule::testing::setup_test_tracing();
+    let Some(config) = PrepareConfig::for_cuda_if_available() else {
+        eprintln!("skipped: default device is not a CUDA GPU");
+        return;
+    };
+    if !crate::config::cuda_test_arch().is_some_and(|arch| arch.has_bf16_mma()) {
+        eprintln!("skipped: no m16n8k16 tensor cores");
+        return;
+    }
+    let case = SdpaCase { b: 8, h: 16, t: 256, d: 64 };
+    let build = |q: &Tensor, k: &Tensor, _v: &Tensor, lens: &Tensor| {
+        let keep = case.key_mask(lens).logical_not().unwrap();
+        let kt = k.try_transpose(-1, -2).unwrap();
+        let scores = q.matmul_with().other(&kt).dtype(DType::Float32).call().unwrap();
+        let scores = scores.try_mul(&Tensor::const_(0.125f64, DType::Float32)).unwrap();
+        scores.where_(&keep, &Tensor::const_(ConstValue::min(ScalarDType::Float32), DType::Float32)).unwrap()
+    };
+    let cpu = PrepareConfig::for_cpu_backend(CpuBackend::Llvm);
+    let expected = case.run(DeviceSpec::Cpu, &cpu, &cpu, build);
+    let swap = |axis: usize, other_axis: usize| Opt::new(OptOps::SWAP, Some(axis), OptArg::Swap { other_axis });
+    let plan = vec![
+        Opt::new(OptOps::TC, Some(0), OptArg::TensorCore { tc_select: -1, opt_level: 0, use_tc: 1 }),
+        Opt::upcast(3, 4),
+        Opt::upcast(2, 4),
+        swap(2, 3),
+        Opt::new(OptOps::UNROLL, Some(0), OptArg::Int(0)),
+        Opt::upcast(2, 2),
+        Opt::local(2, 2),
+        Opt::local(1, 2),
+        Opt::local(2, 2),
+        swap(0, 1),
+    ];
+    let optimizer = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).opts_to_apply(plan).build();
+    let forced = PrepareConfig { optimizer, ..config.clone() };
+    let actual = case.run(DeviceSpec::Cuda { device_id: 0 }, &config, &forced, build);
+    assert_all_close(&actual, &expected, 1e-2);
 }

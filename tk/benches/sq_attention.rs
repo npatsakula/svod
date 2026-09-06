@@ -1,6 +1,6 @@
 //! Whisper single-query attention device-time comparison.
 //!
-//! Run: `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench sq_attention`.
+//! Run: `SVOD_DEVICE=AMD:0` (or `CUDA:0`) `cargo bench -p svod-tk --bench sq_attention`.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use svod_dtype::DType;

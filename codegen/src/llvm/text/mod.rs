@@ -13,14 +13,16 @@
 
 use std::sync::Arc;
 
-use svod_dtype::AmdArch;
+use svod_dtype::{AmdArch, CudaArch};
 use svod_ir::pattern::TypedPatternMatcher;
 use svod_ir::{Op, prelude::*};
 
 use crate::common::{collect_abi_params, is_output_buffer};
 use crate::llvm::amd;
+use crate::llvm::common::gpu::max_local_threads;
 use crate::llvm::common::{LlvmTarget, RenderContext, ldt};
 use crate::llvm::cpu;
+use crate::llvm::nvptx;
 use crate::{BufferArg, Error, RenderedKernel, RenderedOperation, Renderer, Result};
 use svod_ir::ops;
 
@@ -28,8 +30,9 @@ use svod_ir::ops;
 ///
 /// Generates LLVM IR as strings, suitable for compilation via external clang.
 /// Produces a single function with direct typed parameters. The active
-/// [`LlvmTarget`] selects between the CPU emitter and the AMDGPU emitter
-/// (`amdgpu_kernel` ABI, addrspace(3) LDS, amdgcn intrinsics).
+/// [`LlvmTarget`] selects between the CPU emitter, the AMDGPU emitter
+/// (`amdgpu_kernel` ABI, addrspace(3) LDS, amdgcn intrinsics) and the NVPTX
+/// emitter (`ptx_kernel` ABI, addrspace(3) shared memory, nvvm intrinsics).
 pub struct LlvmTextRenderer {
     target: LlvmTarget,
 }
@@ -43,6 +46,11 @@ impl LlvmTextRenderer {
     /// Renderer for an AMD GPU at the named `gfx{family}` target.
     pub fn amd(arch: AmdArch) -> Self {
         Self { target: LlvmTarget::Amd(arch) }
+    }
+
+    /// Renderer for an NVIDIA GPU at the named `sm_XY` compute capability.
+    pub fn nvptx(arch: CudaArch) -> Self {
+        Self { target: LlvmTarget::Nvptx(arch) }
     }
 
     /// Construct with an explicit target.
@@ -143,6 +151,9 @@ impl Renderer for LlvmTextRenderer {
                 ctx.register(node.id, String::new());
                 continue;
             }
+            if let Some(intrinsic) = foreign_intrinsic(node, self.target) {
+                return Err(Error::ForeignIntrinsic { intrinsic, target: self.target.to_string() });
+            }
             let first_line = kernel.len();
             match self.target {
                 LlvmTarget::Cpu => {
@@ -150,6 +161,9 @@ impl Renderer for LlvmTextRenderer {
                 }
                 LlvmTarget::Amd(_) => {
                     amd::render_uop(node, &mut ctx, &mut kernel, self.target);
+                }
+                LlvmTarget::Nvptx(_) => {
+                    nvptx::render_uop(node, &mut ctx, &mut kernel, self.target);
                 }
             }
             if let Some(err) = ctx.take_error() {
@@ -164,11 +178,18 @@ impl Renderer for LlvmTextRenderer {
             });
         }
 
-        if self.target.is_amd() {
-            // Tinygrad's AMD C frontend emits `contract` only. In particular,
-            // `arcp` turns division into an unrefined reciprocal on AMDGPU.
-            for line in &mut kernel {
-                *line = line.replace(" nsz arcp contract afn ", " contract ");
+        match self.target {
+            LlvmTarget::Cpu => {}
+            // Both GPU backends turn `arcp`/`afn` division into an unrefined
+            // reciprocal: AMDGPU selects `v_rcp_f32`, and NVPTX lowers
+            // `fdiv nsz arcp contract afn` to `rcp.approx.f32` where plain
+            // `contract` keeps the exact `div.rn.f32` (probed on clang 22).
+            // Tinygrad's CUDA and AMD C frontends both compile with exact
+            // division, so keep `contract` only.
+            LlvmTarget::Amd(_) | LlvmTarget::Nvptx(_) => {
+                for line in &mut kernel {
+                    *line = line.replace(" nsz arcp contract afn ", " contract ");
+                }
             }
         }
 
@@ -181,6 +202,8 @@ impl Renderer for LlvmTextRenderer {
         let abi = match self.target {
             LlvmTarget::Cpu => "void",
             LlvmTarget::Amd(_) => "amdgpu_kernel void",
+            // `ptx_kernel` alone yields `.visible .entry`; no `!nvvm.annotations`.
+            LlvmTarget::Nvptx(_) => "ptx_kernel void",
         };
 
         let attrs = build_function_attributes(&self.target, &nodes);
@@ -208,6 +231,17 @@ impl Renderer for LlvmTextRenderer {
         let target_triple_line = match self.target {
             LlvmTarget::Cpu => String::new(),
             LlvmTarget::Amd(_) => "target triple = \"amdgcn-amd-amdhsa\"\n".to_string(),
+            // clang overrides a mismatching module datalayout silently, so the
+            // line exists for tools that parse the module standalone
+            // (`llvm-as`, `opt`, IR dumps) and would otherwise assume the
+            // host layout. This is clang 22's default for nvptx64, and every
+            // spec in it (`p6` = the 32-bit `.param` space, `i256`) parses on
+            // older LLVMs as well.
+            LlvmTarget::Nvptx(_) => {
+                "target datalayout = \"e-p6:32:32-i64:64-i128:128-i256:256-v16:16-v32:32-n16:32:64\"\n\
+                                    target triple = \"nvptx64-nvidia-cuda\"\n"
+                    .to_string()
+            }
         };
 
         let ir = format!(
@@ -246,12 +280,33 @@ attributes #0 = {{ {attrs} }}
     }
 
     fn backend_name(&self) -> &str {
-        "llvm-text"
+        match self.target {
+            LlvmTarget::Cpu | LlvmTarget::Amd(_) => "llvm-text",
+            LlvmTarget::Nvptx(_) => "nvptx",
+        }
     }
 
     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
         None
     }
+}
+
+/// The first `@llvm.nvvm.*` / `@llvm.amdgcn.*` reference in a CUSTOM body
+/// that `target` cannot lower. The typed builders (`nvptx::{ops,smem}`, tk's
+/// gfx9 `asm`) are target-specific; on the wrong target clang emits the name
+/// as an extern call that only the device assembler rejects.
+fn foreign_intrinsic(node: &Arc<UOp>, target: LlvmTarget) -> Option<String> {
+    let code = match node.op() {
+        Op::Custom(ops::Custom { code, .. }) | Op::CustomI(ops::CustomI { code, .. }) => code,
+        _ => return None,
+    };
+    code.match_indices("@llvm.")
+        .map(|(at, _)| code[at + 1..].split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or_default())
+        .find(|name| {
+            (name.starts_with("llvm.nvvm.") && !target.is_nvptx())
+                || (name.starts_with("llvm.amdgcn.") && !target.is_amd())
+        })
+        .map(str::to_string)
 }
 
 fn mangle_type(llvm_type: &str) -> String {
@@ -339,42 +394,67 @@ fn generate_intrinsic_declarations(kernel: &[String], target: &LlvmTarget) -> St
         }
     }
 
-    if target.is_amd() {
-        // Only the f64 transcendentals the AMDGPU backend cannot select stay on
-        // ROCm device libraries; everything else is an `@llvm.*` intrinsic
-        // declared by the generic loop above. See `amd::ops::render_float_unary`.
-        for op in ["log2", "exp2"] {
-            let name = format!("@__ocml_{op}_f64");
-            if kernel_str.contains(&name) {
-                decls.push(format!("declare double {name}(double)"));
+    match target {
+        LlvmTarget::Cpu => {}
+        LlvmTarget::Amd(_) => {
+            // Only the f64 transcendentals the AMDGPU backend cannot select stay on
+            // ROCm device libraries; everything else is an `@llvm.*` intrinsic
+            // declared by the generic loop above. See `amd::ops::render_float_unary`.
+            for op in ["log2", "exp2"] {
+                let name = format!("@__ocml_{op}_f64");
+                if kernel_str.contains(&name) {
+                    decls.push(format!("declare double {name}(double)"));
+                }
+            }
+            // Scalar (non-mangled) amdgcn intrinsics; declared whenever referenced
+            // in the kernel body. Source: AMDGPU LLVM intrinsic reference.
+            for (pattern, decl) in [
+                ("@llvm.amdgcn.s.barrier", "declare void @llvm.amdgcn.s.barrier()"),
+                ("@llvm.amdgcn.workgroup.id.x", "declare i32 @llvm.amdgcn.workgroup.id.x()"),
+                ("@llvm.amdgcn.workgroup.id.y", "declare i32 @llvm.amdgcn.workgroup.id.y()"),
+                ("@llvm.amdgcn.workgroup.id.z", "declare i32 @llvm.amdgcn.workgroup.id.z()"),
+                ("@llvm.amdgcn.workitem.id.x", "declare i32 @llvm.amdgcn.workitem.id.x()"),
+                ("@llvm.amdgcn.workitem.id.y", "declare i32 @llvm.amdgcn.workitem.id.y()"),
+                ("@llvm.amdgcn.workitem.id.z", "declare i32 @llvm.amdgcn.workitem.id.z()"),
+                ("@llvm.amdgcn.cvt.f32.fp8", "declare float @llvm.amdgcn.cvt.f32.fp8(i32, i32)"),
+                ("@llvm.amdgcn.cvt.f32.bf8", "declare float @llvm.amdgcn.cvt.f32.bf8(i32, i32)"),
+                ("@llvm.amdgcn.cvt.pk.fp8.f32", "declare i32 @llvm.amdgcn.cvt.pk.fp8.f32(float, float, i32, i1)"),
+                ("@llvm.amdgcn.cvt.pk.bf8.f32", "declare i32 @llvm.amdgcn.cvt.pk.bf8.f32(float, float, i32, i1)"),
+                ("@llvm.amdgcn.fmed3.f32", "declare float @llvm.amdgcn.fmed3.f32(float, float, float)"),
+            ] {
+                if kernel_str.contains(pattern) {
+                    decls.push(decl.to_string());
+                }
             }
         }
-        // Scalar (non-mangled) amdgcn intrinsics; declared whenever referenced
-        // in the kernel body. Source: AMDGPU LLVM intrinsic reference.
-        for (pattern, decl) in [
-            ("@llvm.amdgcn.s.barrier", "declare void @llvm.amdgcn.s.barrier()"),
-            ("@llvm.amdgcn.workgroup.id.x", "declare i32 @llvm.amdgcn.workgroup.id.x()"),
-            ("@llvm.amdgcn.workgroup.id.y", "declare i32 @llvm.amdgcn.workgroup.id.y()"),
-            ("@llvm.amdgcn.workgroup.id.z", "declare i32 @llvm.amdgcn.workgroup.id.z()"),
-            ("@llvm.amdgcn.workitem.id.x", "declare i32 @llvm.amdgcn.workitem.id.x()"),
-            ("@llvm.amdgcn.workitem.id.y", "declare i32 @llvm.amdgcn.workitem.id.y()"),
-            ("@llvm.amdgcn.workitem.id.z", "declare i32 @llvm.amdgcn.workitem.id.z()"),
-            ("@llvm.amdgcn.cvt.f32.fp8", "declare float @llvm.amdgcn.cvt.f32.fp8(i32, i32)"),
-            ("@llvm.amdgcn.cvt.f32.bf8", "declare float @llvm.amdgcn.cvt.f32.bf8(i32, i32)"),
-            ("@llvm.amdgcn.cvt.pk.fp8.f32", "declare i32 @llvm.amdgcn.cvt.pk.fp8.f32(float, float, i32, i1)"),
-            ("@llvm.amdgcn.cvt.pk.bf8.f32", "declare i32 @llvm.amdgcn.cvt.pk.bf8.f32(float, float, i32, i1)"),
-            ("@llvm.amdgcn.fmed3.f32", "declare float @llvm.amdgcn.fmed3.f32(float, float, float)"),
-        ] {
-            if kernel_str.contains(pattern) {
-                decls.push(decl.to_string());
+        LlvmTarget::Nvptx(_) => {
+            // Scalar nvvm intrinsics referenced by `nvptx::ops`. Names are exact:
+            // a misspelt nvvm intrinsic (`lg2.approx.f32`) is emitted as an
+            // external call and only fails inside ptxas.
+            for (pattern, decl) in [
+                ("@llvm.nvvm.barrier0", "declare void @llvm.nvvm.barrier0()"),
+                ("@llvm.nvvm.lg2.approx.f", "declare float @llvm.nvvm.lg2.approx.f(float)"),
+                ("@llvm.nvvm.read.ptx.sreg.ctaid.x", "declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()"),
+                ("@llvm.nvvm.read.ptx.sreg.ctaid.y", "declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.y()"),
+                ("@llvm.nvvm.read.ptx.sreg.ctaid.z", "declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.z()"),
+                ("@llvm.nvvm.read.ptx.sreg.tid.x", "declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()"),
+                ("@llvm.nvvm.read.ptx.sreg.tid.y", "declare i32 @llvm.nvvm.read.ptx.sreg.tid.y()"),
+                ("@llvm.nvvm.read.ptx.sreg.tid.z", "declare i32 @llvm.nvvm.read.ptx.sreg.tid.z()"),
+            ] {
+                if kernel_str.contains(pattern) {
+                    decls.push(decl.to_string());
+                }
             }
         }
-        // WMMA / MFMA intrinsics: the signature varies by family and dtype, so
-        // we synthesize each `declare` from its call site's operand types. The
-        // operands already carry the intrinsic-required wire types (bf16 as
-        // i16, fp8 as a packed integer — bitcast in `render_wmma_amd`), so the
-        // declaration matches the call by construction. Dedup identical lines
-        // (a tiled matmul emits many calls to the same intrinsic).
+    }
+    if !matches!(target, LlvmTarget::Cpu) {
+        // WMMA / MFMA / mma.sync intrinsics: the signature varies by family
+        // and dtype, so we synthesize each `declare` from its call site's
+        // operand types. The operands already carry the intrinsic-required
+        // wire types (bf16 as i16 or packed i32, fp8 as a packed integer,
+        // f16 as `<2 x half>` pairs), so the declaration matches the call by
+        // construction. Dedup identical lines (a tiled matmul emits many
+        // calls to the same intrinsic).
         for line in kernel.iter() {
             if let Some(decl) = wmma_declaration_from_call(line)
                 && !decls.contains(&decl)
@@ -387,20 +467,14 @@ fn generate_intrinsic_declarations(kernel: &[String], target: &LlvmTarget) -> St
     decls.join("\n")
 }
 
-/// Synthesize a `declare` line for a `@llvm.amdgcn.{wmma,mfma}.*` call by
-/// echoing the call's argument types. Returns `None` if the line isn't a
-/// WMMA/MFMA call site.
+/// Synthesize a `declare` line for a `@llvm.amdgcn.{wmma,mfma}.*` or
+/// `@llvm.nvvm.mma.*` call by echoing the call's argument types. Returns
+/// `None` if the line isn't a matrix-core call site.
 fn wmma_declaration_from_call(line: &str) -> Option<String> {
-    let needle_wmma = "@llvm.amdgcn.wmma.";
-    let needle_mfma = "@llvm.amdgcn.mfma.";
-    let needle = if line.contains(needle_wmma) {
-        needle_wmma
-    } else if line.contains(needle_mfma) {
-        needle_mfma
-    } else {
-        return None;
-    };
-    // `  %vN = call <ret_ty> @llvm.amdgcn.wmma.<rest>(<args>)`
+    const NEEDLES: [&str; 3] = ["@llvm.amdgcn.wmma.", "@llvm.amdgcn.mfma.", "@llvm.nvvm.mma."];
+    let needle = NEEDLES.into_iter().find(|needle| line.contains(needle))?;
+    // `  %vN = call <ret_ty> @llvm.amdgcn.wmma.<rest>(<args>)`; the NVPTX
+    // return type is an aggregate (`{ float, float, float, float }`).
     let call_start = line.find("call ")?;
     let after_call = &line[call_start + "call ".len()..];
     let ret_end = after_call.find(" @")?;
@@ -476,27 +550,22 @@ fn wmma_declaration_from_call(line: &str) -> Option<String> {
 fn build_function_attributes(target: &LlvmTarget, nodes: &[Arc<UOp>]) -> String {
     match target {
         LlvmTarget::Cpu => "nounwind \"no-builtins\" \"no-trapping-math\"=\"true\"".to_string(),
-        LlvmTarget::Amd(_) => {
-            // Tinygrad `llvmir.py:259-263`: include the upper bound on the
-            // local workgroup size so the AMDGPU backend can size scratch
-            // allocations / waves correctly.
-            let max_l = nodes
-                .iter()
-                .filter_map(|n| match n.op() {
-                    Op::Special(ops::Special { name, end }) if name.starts_with('l') => match end.vmax() {
-                        svod_ir::ConstValue::Int(v) => Some(*v as u64),
-                        svod_ir::ConstValue::UInt(v) => Some(*v),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-                .product::<u64>()
-                .max(1);
-            format!(
-                "alwaysinline nounwind \"no-builtins\" \"amdgpu-flat-work-group-size\"=\"1,{max_l}\" \
-                 \"no-trapping-math\"=\"true\""
-            )
-        }
+        // Tinygrad `llvmir.py:259-263`: include the upper bound on the local
+        // workgroup size so the AMDGPU backend can size scratch allocations /
+        // waves correctly.
+        LlvmTarget::Amd(_) => format!(
+            "alwaysinline nounwind \"no-builtins\" \"amdgpu-flat-work-group-size\"=\"1,{}\" \
+             \"no-trapping-math\"=\"true\"",
+            max_local_threads(nodes)
+        ),
+        // `nvvm.maxntid` is the PTX `.maxntid` launch bound: ptxas budgets
+        // registers per thread against it instead of the 1024-thread worst
+        // case. Older LLVMs ignore the unknown string attribute (they only read
+        // the `!nvvm.annotations` form), which merely costs the hint.
+        LlvmTarget::Nvptx(_) => format!(
+            "nounwind \"no-builtins\" \"no-trapping-math\"=\"true\" \"nvvm.maxntid\"=\"{}\"",
+            max_local_threads(nodes)
+        ),
     }
 }
 

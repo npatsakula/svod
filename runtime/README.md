@@ -32,10 +32,18 @@ kernel preparation in `svod-tensor`, and for the default kernel split;
 published atomically and never locked — concurrent compilers of one key both
 publish identical bytes, last rename wins.
 
-**Planned:**
+## GPU backends
 
-- CUDA kernel execution
-- Metal kernel execution
+Always compiled, registered only when the hardware is present:
+
+| Device | Compile | Dispatch |
+|--------|---------|----------|
+| `AMD:N` | `clang --target=amdgcn-amd-amdhsa` → ELF code object | KFD-direct PM4/AQL rings (`svod_device::amd`) |
+| `CUDA:N` | `clang --target=nvptx64-nvidia-cuda` → PTX, assembled by `ptxas` when installed (`SVOD_CUDA_PTXAS=0` opts out), else JIT'd by `libcuda.so.1` | streams and CUDA graphs (`svod_device::cuda`) |
+| `METAL:N` | MSL → `metallib` through `MTLCodeGenService` | `MTLCommandQueue` (`svod_device::metal`) |
+
+Select with `SVOD_DEVICE=AMD:0`, `CUDA:0`, or `METAL:0`. `SVOD_DUMP_AMD_IR` /
+`SVOD_DUMP_NVPTX_IR` name a directory that receives each kernel's LLVM IR.
 
 ## Testing
 

@@ -9,6 +9,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::{Op, UnaryOp, prelude::*};
 
 use crate::llvm::amd::wmma;
+use crate::llvm::common::gpu::{AXIS_LETTERS, parse_special_axis, render_define_local};
 use crate::llvm::common::{LlvmTarget, RenderContext, ldt};
 use crate::llvm::cpu;
 use svod_ir::ops;
@@ -99,25 +100,6 @@ fn render_float_unary(
 
 // ── SPECIAL: workgroup / workitem / direct-global axis ────────────────────
 
-/// Parse a SPECIAL axis name: `'g'/'l'/'i'` prefix + 0/1/2 axis suffix.
-///
-/// Matches `device::ProgramSpec::special_launch_axis` (`device/src/device.rs:594`),
-/// which is the producer side for these strings.
-fn parse_special_axis(name: &str) -> Option<(char, u8)> {
-    let prefix = name.chars().next()?;
-    if !matches!(prefix, 'g' | 'l' | 'i') {
-        return None;
-    }
-    let suffix_start = name.rfind(|c: char| !c.is_ascii_digit()).map(|i| i + 1).unwrap_or(0);
-    if suffix_start == name.len() {
-        return None;
-    }
-    let axis: u8 = name[suffix_start..].parse().ok()?;
-    (axis < 3).then_some((prefix, axis))
-}
-
-const AXIS_LETTERS: [char; 3] = ['x', 'y', 'z'];
-
 fn render_special(uop: &Arc<UOp>, name: &str, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
     let dst = ctx.name(uop);
     let (kind, axis) = match parse_special_axis(name) {
@@ -151,31 +133,6 @@ fn render_barrier(kernel: &mut Vec<String>) -> Option<()> {
     kernel.push("  fence syncscope(\"workgroup\") release".to_string());
     kernel.push("  tail call void @llvm.amdgcn.s.barrier()".to_string());
     kernel.push("  fence syncscope(\"workgroup\") acquire".to_string());
-    Some(())
-}
-
-// ── DEFINE_LOCAL: addrspace(3) module-level global ────────────────────────
-
-fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
-    let dst = ctx.name(uop); // e.g. "%local42"
-    let (id, base_dtype) = match uop.op() {
-        Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
-            (arg.slot, arg.dtype.clone())
-        }
-        _ => unreachable!(),
-    };
-    let size = uop.buffer_size().unwrap_or(1);
-    let base_ty = ldt(&base_dtype);
-    let global_name = format!("@local{id}");
-    // Declare the LDS-backed global at module scope.
-    ctx.push_module_prefix(format!(
-        "{global_name} = internal unnamed_addr addrspace(3) global [{size} x {base_ty}] undef, align 16"
-    ));
-    // Addrspacecast `addrspace(3) global → ptr` so downstream GEP/LOAD/STORE
-    // can use the generic `ptr` type.
-    // Without this cast, GEP emits `getelementptr ..., ptr @local0, ...`
-    // which clang rejects (`@local0` is `ptr addrspace(3)`).
-    kernel.push(format!("  {dst} = addrspacecast ptr addrspace(3) {global_name} to ptr"));
     Some(())
 }
 
@@ -288,7 +245,3 @@ exit:
   %trunc = trunc i32 %packed to i8
   ret i8 %trunc
 }"#;
-
-#[cfg(test)]
-#[path = "../../test/unit/llvm_amd_ops.rs"]
-mod tests;

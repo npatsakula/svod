@@ -59,7 +59,7 @@ fn test_map_position_emits_gfx942_stride() {
 /// `Mul` by 2 (the interleave factor) and NOT a `Mul` by 4 (the CDNA stride).
 #[test]
 fn test_map_position_emits_gfx1151_interleave() {
-    let topo = map_position_topo(ArchCaps::for_arch(AmdArch::Gfx1151), Idx::Const(0));
+    let topo = map_position_topo(ArchCaps::for_amd(AmdArch::Gfx1151), Idx::Const(0));
     assert!(has_mul_by_const(&topo, 2), "gfx1151: interleave (mul by 2)");
     assert!(!has_mul_by_const(&topo, 4), "gfx1151: no CDNA stride (mul by 4)");
     assert!(has_mod_by_const(&topo, 16), "gfx1151: lane_rc col (mod by 16)");

@@ -1,6 +1,6 @@
 //! Device abstraction layer for tensor operations.
 //!
-//! This module provides a clean abstraction over different compute devices (CPU, CUDA, etc.)
+//! This module provides a clean abstraction over different compute devices (CPU, AMD, CUDA, Metal, DISK)
 //! with support for:
 //! - Lazy buffer allocation
 //! - Buffer views with zero-copy slicing
@@ -32,6 +32,7 @@
 pub mod allocator;
 pub mod amd;
 pub mod buffer;
+pub mod cuda;
 pub mod device;
 pub mod error;
 pub mod hcq;
@@ -56,9 +57,5 @@ pub use sync::{CompletionToken, CpuTimelineSignal, DispatchTimestamps, TimelineS
 mod test;
 
 // Re-export commonly used types
-#[cfg(feature = "cuda")]
-pub use allocator::CudaAllocator;
 pub use allocator::{Allocator, BufferSpec, CpuAllocator};
-#[cfg(feature = "cuda")]
-pub use registry::cuda;
 pub use registry::{DeviceSpec, cpu, get_device};

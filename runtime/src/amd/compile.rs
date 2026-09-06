@@ -1,14 +1,10 @@
 //! `clang -target amdgcn-amd-amdhsa` driver: lowers AMD LLVM text-IR
 //! to an AMDGPU code object (ELF) that the KFD runtime can dispatch.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
-
 use svod_dtype::AmdArch;
 use tracing::debug;
 
-use crate::clang::ClangToolchain;
+use crate::clang::{ClangToolchain, dump_ir, path_clang_has_target};
 use crate::error::JitResultExt;
 
 /// Compile AMD LLVM IR text into a fully-linked AMDGPU code object.
@@ -61,7 +57,7 @@ pub(crate) fn compile_ir_to_amd_object_with(
     ir: &str,
     arch: AmdArch,
 ) -> crate::Result<Vec<u8>> {
-    if !has_amdgpu_target_with(toolchain) {
+    if !toolchain.has_target("amdgcn") {
         return Err(crate::Error::JitCompilation {
             reason: "AMD GPU support requires clang built with the AMDGPU target. \
                      Reinstall clang from your distro or build with \
@@ -69,57 +65,9 @@ pub(crate) fn compile_ir_to_amd_object_with(
                 .to_string(),
         });
     }
-
-    if let Ok(dir) = std::env::var("SVOD_DUMP_AMD_IR") {
-        // Extract the kernel name from the `ModuleID = '<name>'` directive so
-        // each kernel lands in its own file. Without this, every compile
-        // overwrites the same path and debugging a specific failing kernel is
-        // impossible (the dispatcher pre-compiles many kernels ahead of any
-        // dispatch, so the dumped file would always be the LAST one compiled,
-        // never the failing one).
-        let kernel_name = ir
-            .lines()
-            .find_map(|l| l.strip_prefix("; ModuleID = '").and_then(|s| s.strip_suffix("'")))
-            .unwrap_or("unknown");
-        // Sanitize for filesystem (kernel names contain only [A-Za-z0-9_] in
-        // practice, but be defensive against future renderer changes).
-        let safe: String =
-            kernel_name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
-        let path = std::path::Path::new(&dir).join(format!("{}_{}.ll", arch.mcpu(), safe));
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(&path, ir);
-    }
-
+    dump_ir("SVOD_DUMP_AMD_IR", arch.mcpu(), ir);
     debug!(arch = arch.mcpu(), ir.length = ir.len(), "compiling amdgcn IR via clang");
-
-    let args = amd_object_flags(ir, arch);
-
-    let mut child = toolchain
-        .command()
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .jit("spawn clang for amdgcn IR")?;
-
-    child.stdin.take().expect("stdin piped").write_all(ir.as_bytes()).jit("write amdgcn IR to clang stdin")?;
-
-    let output = child.wait_with_output().jit("wait for clang (amdgcn)")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(crate::Error::JitCompilation {
-            reason: format!("clang amdgcn compilation failed (mcpu={}):\n{stderr}", arch.mcpu()),
-        });
-    }
-    if output.stdout.is_empty() {
-        return Err(crate::Error::JitCompilation {
-            reason: format!("clang produced empty output for amdgcn mcpu={}", arch.mcpu()),
-        });
-    }
-
-    Ok(output.stdout)
+    toolchain.compile_ir(&amd_object_flags(ir, arch), ir, &format!("amdgcn (mcpu={})", arch.mcpu()))
 }
 
 /// Validate both the generic ELF contract and the architecture encoded in
@@ -167,33 +115,12 @@ fn amd_elf_machine(arch: AmdArch) -> u32 {
     }
 }
 
-/// Does `executable` advertise the `amdgcn` target?
-fn probe_amdgcn(executable: &std::path::Path) -> bool {
-    let Ok(output) = Command::new(executable).arg("--print-targets").output() else { return false };
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout).lines().any(|line| line.split_whitespace().next() == Some("amdgcn"))
-}
-
-/// Cached per clang executable: an installation does not change during a run,
-/// and this forked a subprocess on *every* AMD compile.
-fn has_amdgpu_target_with(toolchain: &ClangToolchain) -> bool {
-    static CACHE: OnceLock<papaya::HashMap<std::path::PathBuf, bool>> = OnceLock::new();
-    let probed = CACHE.get_or_init(papaya::HashMap::new).pin();
-    if let Some(known) = probed.get(toolchain.executable()) {
-        return *known;
-    }
-    let result = probe_amdgcn(toolchain.executable());
-    probed.insert(toolchain.executable().to_path_buf(), result);
-    result
-}
-
 /// Does the host `clang` advertise the `amdgpu` target?
 ///
 /// Cached for the lifetime of the process: clang installation doesn't change
 /// during a run, and the subprocess is too slow to do per-call.
 pub fn has_amdgpu_target() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| probe_amdgcn(std::path::Path::new("clang")))
+    path_clang_has_target("amdgcn")
 }
 
 #[cfg(test)]

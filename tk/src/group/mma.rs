@@ -1,17 +1,21 @@
-//! WMMA/MFMA matrix-multiply tile ops — the four `mma_{ab,abt,atb,atbt}`
+//! WMMA/MFMA/`mma.sync` matrix-multiply tile ops — the four `mma_{ab,abt,atb,atbt}`
 //! variants and their shared looped/unrolled bodies. Each `mma` reduces over the
-//! K-edge with one [`Op::Wmma`](svod_ir::Op::Wmma) per K-iteration.
+//! K-edge with one [`MmaPlan`] per 16×16 fragment and K-iteration: a single
+//! [`Op::Wmma`](svod_ir::Op::Wmma) on the AMD 16×16×16 cores, two `m16n8k16`
+//! `Op::Wmma`s (one per n-half) on CUDA.
 
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
-use svod_dtype::{AmdArch, DType};
+use svod_dtype::{DType, GpuArch};
 use svod_ir::{AxisId, AxisType, RendererDevice, UOp, WmmaMetadata, WmmaUpcastAxes};
 use svod_schedule::optimizer::{Renderer, TensorCore};
 
 use super::Group;
 use crate::index::{Idx, flat_index, load_at};
+use crate::layout::LaneMap;
 use crate::tile::RT;
+use crate::tiles::TileLayout;
 
 /// Bridge a scheduler [`TensorCore`] (the per-arch×dtype matrix-op table, the
 /// single source of truth — `schedule::optimizer::renderer`) into the IR
@@ -44,22 +48,31 @@ fn wmma_from_tc(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
     }
 }
 
-/// The K=16 WMMA descriptor for input dtype `dtype_in` on `arch`, looked up from
-/// the shared per-arch tensor-core table (`Renderer::for_amd_arch`) rather than
-/// re-encoded here — so bf16/f16 on CDNA's MFMA cores and the RDNA wave32 cores
-/// come from one source. Both accumulate in f32. `arch` is threaded from
-/// [`crate::ArchCaps::arch`] (gfx942 in practice; the table already carries the
-/// RDNA cores for when a wave32 arch is enabled).
-fn wmma_desc(arch: AmdArch, dtype_in: &DType) -> WmmaMetadata {
-    let ren = Renderer::for_amd_arch(arch);
-    let tc =
-        ren.tensor_cores.iter().find(|tc| &tc.dtype_in == dtype_in && tc.dims == (16, 16, 16)).unwrap_or_else(|| {
+/// The K=16 matrix-core descriptor for `dtype_in → dtype_out` on `arch`, looked up
+/// from the shared per-arch tensor-core table (`Renderer::for_{amd,cuda}_arch`)
+/// rather than re-encoded here — so bf16/f16 on CDNA's MFMA cores, the RDNA wave32
+/// cores and CUDA's `mma.sync` come from one source. AMD cores are the square
+/// `(16,16,16)`; CUDA's `m16n8k16` is `(8,16,16)` (dims are `(N, M, K)`).
+fn wmma_desc(arch: GpuArch, dtype_in: &DType, dtype_out: &DType) -> WmmaMetadata {
+    let ren = match arch {
+        GpuArch::Amd(amd) => Renderer::for_amd_arch(amd),
+        GpuArch::Cuda(cuda) => Renderer::for_cuda_arch(cuda),
+        GpuArch::Metal(family) => Renderer::for_metal_family(family),
+    };
+    let dims = if arch.cuda().is_some() { (8, 16, 16) } else { (16, 16, 16) };
+    let tc = ren
+        .tensor_cores
+        .iter()
+        .find(|tc| &tc.dtype_in == dtype_in && &tc.dtype_out == dtype_out && tc.dims == dims)
+        .unwrap_or_else(|| {
             // Precondition violation by the kernel author, not end-user input: the
-            // matrix-core operand dtype must be bf16/f16 (the only 16×16×16 WMMA
-            // inputs). The USE-face kernels pre-cast; an AUTHOR calling `mma_*`
-            // with an unsupported RT dtype lands here.
+            // matrix-core operand dtype must be bf16/f16 with an f32 accumulator on
+            // an arch with a K=16 core. The USE-face kernels pre-cast and gate by
+            // `ArchSet`; an AUTHOR calling `mma_*` with an unsupported RT dtype or on
+            // an arch without a core lands here.
             unimplemented!(
-                "mma: operand dtype {dtype_in:?} has no 16×16×16 WMMA on {arch:?} — operands must be bf16 or f16"
+                "mma: {dtype_in:?} → {dtype_out:?} has no {dims:?} matrix core on {arch:?} — operands must be bf16 \
+                 or f16 with an f32 accumulator on an AMD matrix-core arch or CUDA sm_80+"
             )
         });
     wmma_from_tc(tc, ren.device)
@@ -68,24 +81,133 @@ fn wmma_desc(arch: AmdArch, dtype_in: &DType) -> WmmaMetadata {
 /// Per-lane element count for a WMMA operand = product of its upcast-axis sizes
 /// (`wmma_from_tc` builds these as `log2(elements_per_thread)` size-2 entries, so
 /// the product is the elements-per-thread). gfx942 16×16×16 → A/B/C = 4/4/4; RDNA
-/// → 16/16/8 (replicated 16-wide inputs, 8-wide accumulator). Empty axes ⇒ 1.
+/// → 16/16/8 (replicated 16-wide inputs, 8-wide accumulator); CUDA m16n8k16 →
+/// 8/4/4. Empty axes ⇒ 1.
 fn upcast_count(axes: &[(AxisId, usize)]) -> i64 {
     axes.iter().map(|(_, sz)| *sz as i64).product()
+}
+
+/// One matrix-core instruction of a fragment step: which registers of the A, B
+/// and C tiles it consumes (in the intrinsic's operand order) and whether the
+/// A/B tiles feed the intrinsic's `(a, b)` slots swapped.
+struct MmaStep {
+    a: Vec<i64>,
+    b: Vec<i64>,
+    c: Vec<i64>,
+    swap: bool,
+}
+
+/// How one `(height, width, k)` 16×16 fragment product lowers on the arch.
+struct MmaPlan {
+    meta: WmmaMetadata,
+    steps: Vec<MmaStep>,
+}
+
+impl MmaPlan {
+    /// Resolve the plan for `c += a·b` over the tiles' fragment maps.
+    ///
+    /// AMD: one WMMA over the descriptor's per-lane widths (4/4/4 on gfx942,
+    /// 16/16/8 on RDNA) — the operand tiles must carry the 16-column WMMA base.
+    ///
+    /// CUDA: every tile is the two-half [`LaneMap::MmaSync`] 16×16 (8 registers).
+    /// The A tile's 8 registers are the PTX A fragment `a0..a7`; the B tile
+    /// (`k×n` read as `Col`, or `n×k` as `Row` — the same registers either way)
+    /// holds n-half `h` in registers `{2h, 2h+1, 2h+4, 2h+5}` (`b0..b3`), and a
+    /// `Row` accumulator holds n-half `h` in `4h..4h+4` (`c0..c3`) — ThunderKittens
+    /// `mma_AB_base`. A `Col` accumulator holds `Cᵀ` in that register order, so it
+    /// is computed as `Cᵀ += Bᵀ·Aᵀ`: the B tile supplies the A fragment, the A tile
+    /// the two B fragments (`swap`), and the halves split M instead of N.
+    fn resolve(arch: GpuArch, c: &RT<'_>, a: &RT<'_>, b: &RT<'_>, a_t: bool, b_t: bool) -> Self {
+        // The fragment registers are read as `[m,k]`/`[k,n]` (`Row`/`Col`) or
+        // their transposes; a tile declared the other way round is silently
+        // multiplied transposed.
+        let expect = |name, layout: TileLayout, wanted: TileLayout| {
+            assert_eq!(layout, wanted, "mma: operand {name} must be a {wanted:?} tile for this variant");
+        };
+        expect("A", a.layout, if a_t { TileLayout::Col } else { TileLayout::Row });
+        expect("B", b.layout, if b_t { TileLayout::Row } else { TileLayout::Col });
+        let meta = wmma_desc(arch, a.elem(), c.elem());
+        let steps = if arch.cuda().is_some() {
+            for (name, t) in [("A", a), ("B", b), ("C", c)] {
+                assert_eq!(
+                    (t.base.map, t.base.base.elements_per_thread()),
+                    (LaneMap::MmaSync, 8),
+                    "mma: operand {name} must carry the two-half mma.sync 16×16 fragment (RT_16X16_MMA)"
+                );
+            }
+            let swap = c.layout == TileLayout::Col;
+            (0..2)
+                .map(|h| {
+                    let full = (0..8).collect();
+                    let half = vec![2 * h, 2 * h + 1, 2 * h + 4, 2 * h + 5];
+                    let (a, b) = if swap { (half, full) } else { (full, half) };
+                    MmaStep { a, b, c: (4 * h..4 * h + 4).collect(), swap }
+                })
+                .collect()
+        } else {
+            assert_eq!(a.base.base.cols, 16, "mma: only the 16-col WMMA base is supported");
+            let axes = meta.upcast_axes.as_ref().expect("unexpanded WMMA metadata");
+            let regs = |axes| (0..upcast_count(axes)).collect();
+            vec![MmaStep { a: regs(&axes.a), b: regs(&axes.b), c: regs(&axes.c), swap: false }]
+        };
+        MmaPlan { meta, steps }
+    }
+
+    /// Emit the plan's instructions for one fragment: `at = [a_at, b_at, c_at]`
+    /// give the leading `[height/inner, ..]` indices of each tile, `c_src` the
+    /// accumulator buffer to read (carrying its loop/chain dependencies). Returns
+    /// the grouped accumulator stores.
+    fn emit(&self, a: &RT<'_>, b: &RT<'_>, c: &RT<'_>, at: [&[Idx]; 3], c_src: &Arc<UOp>) -> Arc<UOp> {
+        let [a_at, b_at, c_at] = at;
+        let gather = |t: &RT<'_>, buf: &Arc<UOp>, at: &[Idx], regs: &[i64]| {
+            UOp::stack(
+                regs.iter()
+                    .map(|&i| {
+                        let mut idx: SmallVec<[Idx; 4]> = at.iter().cloned().collect();
+                        idx.push(Idx::Const(i));
+                        load_at(buf, t.shape(), &idx)
+                    })
+                    .collect(),
+            )
+        };
+        let stores: Vec<Arc<UOp>> = self
+            .steps
+            .iter()
+            .flat_map(|step| {
+                let a_in = gather(a, a.uop(), a_at, &step.a);
+                let b_in = gather(b, b.uop(), b_at, &step.b);
+                let d_in = gather(c, c_src, c_at, &step.c);
+                let (x, y) = if step.swap { (b_in, a_in) } else { (a_in, b_in) };
+                let out = UOp::wmma(x, y, d_in, self.meta.clone());
+                step.c
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &i)| {
+                        let mut idx: SmallVec<[Idx; 4]> = c_at.iter().cloned().collect();
+                        idx.push(Idx::Const(i));
+                        flat_index(c.uop(), c.shape(), &idx).store(out.index_axes(vec![pos]))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        UOp::group(stores)
+    }
 }
 
 impl<'k> Group<'k> {
     /// `C += A·B` over a tile (tinygrad `mma_AB`): for every output fragment
     /// `(height, width)` accumulate `WMMA(A[height,inner], B[inner,width])`
     /// across the reduce axis `inner`. One [`Op::Wmma`](svod_ir::Op::Wmma) per
-    /// K-iteration → one `mfma.f32.16x16x16bf16.1k`.
+    /// K-iteration → one `mfma.f32.16x16x16bf16.1k` (two `mma.sync.m16n8k16` on CUDA).
     ///
     /// # Panics
-    /// The operand tiles `a`/`b` must be **bf16 or f16** — the only 16×16×16
-    /// matrix-core input dtypes. An operand of any other dtype panics (a kernel-
-    /// authoring error). Accumulation is always f32; this precondition holds for
-    /// all four `mma_{ab,abt,atb,atbt}` variants. Also panics unless the operand
-    /// tile's base is the 16-column WMMA base, and on an operand-rank mismatch
-    /// (the index permutation reads the trailing fragment-grid axes).
+    /// The operand tiles `a`/`b` must be **bf16 or f16** — the only K=16
+    /// matrix-core input dtypes — and `c` f32. An operand of any other dtype panics
+    /// (a kernel-authoring error); this precondition holds for all four
+    /// `mma_{ab,abt,atb,atbt}` variants. Also panics unless the operand tiles carry
+    /// the arch's matrix-core fragment (the 16-column WMMA base on AMD, the two-half
+    /// `mma.sync` fragment on CUDA), and on an operand-rank mismatch (the index
+    /// permutation reads the trailing fragment-grid axes).
     pub fn mma_ab(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
         self.mma(c, a, b, false, false)
     }
@@ -94,8 +216,7 @@ impl<'k> Group<'k> {
     /// (`b[width, inner]`); reduce axis stays `a.shape[-2]`.
     ///
     /// # Panics
-    /// Panics on an unsupported operand dtype, unless the operand base is the
-    /// 16-column WMMA base, and on an operand-rank mismatch (see [`Self::mma_ab`]).
+    /// See [`Self::mma_ab`].
     pub fn mma_abt(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
         self.mma(c, a, b, false, true)
     }
@@ -104,8 +225,7 @@ impl<'k> Group<'k> {
     /// (`a[inner, height]`) and the reduce axis is `a.shape[-3]`.
     ///
     /// # Panics
-    /// Panics on an unsupported operand dtype, unless the operand base is the
-    /// 16-column WMMA base, and on an operand-rank mismatch (see [`Self::mma_ab`]).
+    /// See [`Self::mma_ab`].
     pub fn mma_atb(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
         self.mma(c, a, b, true, false)
     }
@@ -113,33 +233,26 @@ impl<'k> Group<'k> {
     /// `C += Aᵀ·Bᵀ` (tinygrad `mma_AtBt`): both fragments read transposed.
     ///
     /// # Panics
-    /// Panics on an unsupported operand dtype, unless the operand base is the
-    /// 16-column WMMA base, and on an operand-rank mismatch (see [`Self::mma_ab`]).
+    /// See [`Self::mma_ab`].
     pub fn mma_atbt(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>) -> RT<'k> {
         self.mma(c, a, b, true, true)
     }
 
-    /// The shared WMMA body. The four `mma_{AB,ABt,AtB,AtBt}` variants differ
-    /// only in the operand index permutation and the reduce-axis selection:
+    /// The shared matrix-multiply body. The four `mma_{AB,ABt,AtB,AtBt}` variants
+    /// differ only in the operand index permutation and the reduce-axis selection:
     /// - `a_t` (Aᵀ): A is read `a[inner, height]` and the reduce axis is
     ///   `a.shape[-3]`; otherwise `a[height, inner]`, reduce axis `a.shape[-2]`.
     /// - `b_t` (Bᵀ): B is read `b[width, inner]`; otherwise `b[inner, width]`.
+    ///
+    /// Wave-agnostic: each wave runs the matrix op on its own per-lane RT operands
+    /// (the wave sub-tile selection happens in the LDS→REG load, not here).
     fn mma(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
         // Flat (cross-tile-pipeline) FA opts into the fully-unrolled body so the
         // QKᵀ / A·V MFMAs render loop-free for the attention scheduling comb.
         if self.ker.unrolled() {
             return self.mma_u(c, a, b, a_t, b_t);
         }
-        // Wave-agnostic: each wave runs the WMMA on its own per-lane RT operands
-        // (the wave sub-tile selection happens in the LDS→REG load, not here). The
-        // per-lane operand widths come from the descriptor (gfx942 4/4/4; RDNA
-        // 16/16/8), not a hardcoded 4.
-        assert_eq!(a.base.base.cols, 16, "mma: only the 16-col WMMA base is supported");
-        let meta = wmma_desc(self.ker.caps.arch, a.elem());
-        let (a_w, b_w, c_w) = {
-            let axes = meta.upcast_axes.as_ref().expect("unexpanded WMMA metadata");
-            (upcast_count(&axes.a), upcast_count(&axes.b), upcast_count(&axes.c))
-        };
+        let plan = MmaPlan::resolve(self.ker.caps.arch, &c, a, b, a_t, b_t);
 
         let h_end = c.shape()[c.shape().len() - 3] as i64;
         let w_end = c.shape()[c.shape().len() - 2] as i64;
@@ -148,30 +261,9 @@ impl<'k> Group<'k> {
         let width = self.ker.raw_range(w_end, AxisType::Loop);
         let inner = self.ker.raw_range(k_end, AxisType::Reduce);
 
-        let a_in = UOp::stack(
-            (0..a_w)
-                .map(|i| {
-                    let idx = if a_t {
-                        [Idx::from(&inner), Idx::from(&height), Idx::Const(i)]
-                    } else {
-                        [Idx::from(&height), Idx::from(&inner), Idx::Const(i)]
-                    };
-                    load_at(a.uop(), a.shape(), &idx)
-                })
-                .collect(),
-        );
-        let b_in = UOp::stack(
-            (0..b_w)
-                .map(|i| {
-                    let idx = if b_t {
-                        [Idx::from(&width), Idx::from(&inner), Idx::Const(i)]
-                    } else {
-                        [Idx::from(&inner), Idx::from(&width), Idx::Const(i)]
-                    };
-                    load_at(b.uop(), b.shape(), &idx)
-                })
-                .collect(),
-        );
+        let a_at = if a_t { [Idx::from(&inner), Idx::from(&height)] } else { [Idx::from(&height), Idx::from(&inner)] };
+        let b_at = if b_t { [Idx::from(&width), Idx::from(&inner)] } else { [Idx::from(&inner), Idx::from(&width)] };
+        let c_at = [Idx::from(&height), Idx::from(&width)];
         // The accumulator read must depend on the reduce range `inner`, or it is
         // loop-invariant w.r.t. the K loop and gets hoisted *out* of it — every
         // K-iteration would then re-read the pre-loop C and the WMMA's
@@ -179,43 +271,24 @@ impl<'k> Group<'k> {
         // (`acc.after([..reduce_range]).index(..)`): the `After([inner])` keeps
         // the read inside the K loop so it observes the prior iteration's store.
         let c_acc = c.uop().after(smallvec![inner.clone()]);
-        let d_in = UOp::stack(
-            (0..c_w)
-                .map(|i| load_at(&c_acc, c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(i)]))
-                .collect(),
-        );
-
-        let out = UOp::wmma(a_in, b_in, d_in, meta);
-        let c_i: Vec<Arc<UOp>> = (0..c_w)
-            .map(|i| {
-                flat_index(c.uop(), c.shape(), &[Idx::from(&height), Idx::from(&width), Idx::Const(i)])
-                    .store(out.index_axes(vec![i as usize]))
-            })
-            .collect();
-        let c_store = UOp::group(c_i).end(smallvec![height, width, inner]);
+        let c_store = plan.emit(a, b, &c, [&a_at, &b_at, &c_at], &c_acc).end(smallvec![height, width, inner]);
         self.finalize_reg(c, c_store)
     }
 
-    /// Fully **unrolled** [`Self::mma`]: emit one [`Op::Wmma`](svod_ir::Op::Wmma)
-    /// per `(height, width, k)` fragment via Rust `for` loops — **no inner
-    /// `RANGE`** — so the MFMAs render as a *flat* schedulable LLVM region the
-    /// attention scheduling comb can weave the online softmax through. tk's
-    /// direct-launch path skips the optimizer's `pre_expand`, so the looped
-    /// [`Self::mma`] stays rolled (three `loop_body_*` around the mfma); explicit
-    /// unroll is the only way to flatten it (route b — the cheap axis-flip is dead
-    /// on the direct path).
+    /// Fully **unrolled** [`Self::mma`]: emit the fragment plan per
+    /// `(height, width, k)` via Rust `for` loops — **no inner `RANGE`** — so the
+    /// MFMAs render as a *flat* schedulable LLVM region the attention scheduling
+    /// comb can weave the online softmax through. tk's direct-launch path skips the
+    /// optimizer's `pre_expand`, so the looped [`Self::mma`] stays rolled (three
+    /// `loop_body_*` around the mfma); explicit unroll is the only way to flatten
+    /// it (route b — the cheap axis-flip is dead on the direct path).
     ///
     /// Each fragment's K-accumulation chains (`c[h,w]`'s k-step read observes the
     /// k−1 store); fragments chain into one terminal store so the enclosing rolled
     /// KV loop's `END` scopes them all (cf. the matmul accumulator chain,
     /// `kernels/matmul.rs:201`). Bit-identical accumulation order to [`Self::mma`].
     fn mma_u(&self, c: RT<'k>, a: &RT<'k>, b: &RT<'k>, a_t: bool, b_t: bool) -> RT<'k> {
-        assert_eq!(a.base.base.cols, 16, "mma_u: only the 16-col WMMA base is supported");
-        let meta = wmma_desc(self.ker.caps.arch, a.elem());
-        let (a_w, b_w, c_w) = {
-            let axes = meta.upcast_axes.as_ref().expect("unexpanded WMMA metadata");
-            (upcast_count(&axes.a), upcast_count(&axes.b), upcast_count(&axes.c))
-        };
+        let plan = MmaPlan::resolve(self.ker.caps.arch, &c, a, b, a_t, b_t);
 
         let h_end = c.shape()[c.shape().len() - 3] as i64;
         let w_end = c.shape()[c.shape().len() - 2] as i64;
@@ -232,60 +305,20 @@ impl<'k> Group<'k> {
                 // `c.after([inner])` loop-carry).
                 let mut frag_prev: Option<Arc<UOp>> = None;
                 for k in 0..k_end {
-                    let a_in = UOp::stack(
-                        (0..a_w)
-                            .map(|i| {
-                                let idx = if a_t {
-                                    [Idx::Const(k), Idx::Const(h), Idx::Const(i)]
-                                } else {
-                                    [Idx::Const(h), Idx::Const(k), Idx::Const(i)]
-                                };
-                                load_at(a.uop(), a.shape(), &idx)
-                            })
-                            .collect(),
-                    );
-                    let b_in = UOp::stack(
-                        (0..b_w)
-                            .map(|i| {
-                                let idx = if b_t {
-                                    [Idx::Const(w), Idx::Const(k), Idx::Const(i)]
-                                } else {
-                                    [Idx::Const(k), Idx::Const(w), Idx::Const(i)]
-                                };
-                                load_at(b.uop(), b.shape(), &idx)
-                            })
-                            .collect(),
-                    );
+                    let a_at = if a_t { [Idx::Const(k), Idx::Const(h)] } else { [Idx::Const(h), Idx::Const(k)] };
+                    let b_at = if b_t { [Idx::Const(w), Idx::Const(k)] } else { [Idx::Const(k), Idx::Const(w)] };
+                    let c_at = [Idx::Const(h), Idx::Const(w)];
                     // Accumulator source: the prior k-step's store for this
                     // fragment; on k==0 the incoming `c` carrying the
                     // fragment-scoping dep on the previous fragment's store.
-                    let mut deps: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
-                    match &frag_prev {
-                        Some(fp) => deps.push(fp.clone()),
-                        None => {
-                            if let Some(pf) = &prev_frag {
-                                deps.push(pf.clone());
-                            }
-                        }
-                    }
+                    let deps: SmallVec<[Arc<UOp>; 4]> =
+                        frag_prev.as_ref().or(prev_frag.as_ref()).cloned().into_iter().collect();
                     // Anchor the incoming accumulator read (no chain dep yet) to the
                     // enclosing rolled loop so a carried accumulator (`o_reg`) is not
                     // hoisted out (see `Group::anchor`); subsequent k/fragment reads
                     // chain through their stores, which are already loop-scoped.
                     let c_src = if deps.is_empty() { self.anchor(c.uop()) } else { c.uop().after(deps) };
-                    let d_in = UOp::stack(
-                        (0..c_w)
-                            .map(|i| load_at(&c_src, c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(i)]))
-                            .collect(),
-                    );
-                    let out = UOp::wmma(a_in, b_in, d_in, meta.clone());
-                    let c_i: Vec<Arc<UOp>> = (0..c_w)
-                        .map(|i| {
-                            flat_index(c.uop(), c.shape(), &[Idx::Const(h), Idx::Const(w), Idx::Const(i)])
-                                .store(out.index_axes(vec![i as usize]))
-                        })
-                        .collect();
-                    frag_prev = Some(UOp::group(c_i));
+                    frag_prev = Some(plan.emit(a, b, &c, [&a_at, &b_at, &c_at], &c_src));
                 }
                 prev_frag = frag_prev;
             }

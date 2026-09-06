@@ -276,7 +276,7 @@ impl MultiHeadSelfAttention {
         let k = split_heads(&k, b.clone(), t.clone(), h, d_k)?;
         let v = split_heads(&v, b.clone(), t.clone(), h, d_k)?;
 
-        // The hand FA kernel when it applies (AMD + tiling shape), else this model's
+        // The hand FA kernel when it applies (a supported GPU + tiling shape), else this model's
         // own SDPA — tk no longer falls back silently; the policy lives here.
         let attn = if matches!(q.uop().dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16) {
             match svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens })

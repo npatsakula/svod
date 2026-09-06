@@ -100,11 +100,12 @@ nix fmt # Format source files
 | libffi | >=3.4 | हाँ | फ़ॉरेन फ़ंक्शन इंटरफ़ेस |
 | libxml2 | >=2.13 | हाँ | XML पार्सिंग |
 | Z3 | >=4.15 | नहीं | ऑप्टिमाइज़ेशन वेरिफ़िकेशन के लिए SMT सॉल्वर |
+| NVIDIA ड्राइवर | CUDA >=12.8 (R570) | नहीं | CUDA बैकएंड के लिए `libcuda.so.1`, रनटाइम पर लोड होता है; किसी toolkit की ज़रूरत नहीं |
+| Clang NVPTX / AMDGPU टारगेट्स | - | नहीं | GPU कर्नेल कम्पाइलेशन (`clang --print-targets`) |
 
 ## टेस्ट
 
 ```bash
 cargo test
 cargo test --features z3,proptest  # With Z3 verification and PB generated tests
-cargo test --features cuda   # With CUDA tests
 ```
