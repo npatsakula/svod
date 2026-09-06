@@ -13,7 +13,7 @@ svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.6" }
 svod-ir = { path = "../ir", version = "=0.1.0-alpha.6" }
 svod-tensor = { path = "../tensor", version = "=0.1.0-alpha.6" }
 smallvec = { workspace = true }
-snafu = "0.8.9"
+snafu = "0.9.2"
 svod-codegen = { path = "../codegen", version = "=0.1.0-alpha.6" }
 svod-device = { path = "../device", version = "=0.1.0-alpha.6" }
 svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.6" }
