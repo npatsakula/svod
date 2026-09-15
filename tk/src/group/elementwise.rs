@@ -147,10 +147,17 @@ impl<'k> Group<'k> {
     /// This replaces the leaky `warp.map(tile, |x, idx| { lane_rc(...); ... })`
     /// pattern — `lane_rc` and the position arithmetic become implementation
     /// details. The named mask primitives (`mask_where`) build on this.
+    ///
+    /// # Panics
+    /// Panics unless the group is a single wave: a fragment's lane map is indexed
+    /// by the lane's position **within its wave**, so a wider group would read the
+    /// map past its last lane. A multi-wave kernel calls this on
+    /// [`Kernel::warp`](crate::Kernel::warp), as every in-tree caller does.
     pub fn map_position<F>(&self, tile: RT<'k>, row_blk: Idx, col_blk: Idx, op: F) -> RT<'k>
     where
         F: Fn(&Arc<UOp>, &[Idx], &Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
     {
+        assert_eq!(self.warps, 1, "map_position is a single-wave op (the lane map is wave-relative)");
         let (buf, shape) = (tile.uop().clone(), tile.shape().to_vec());
         let rbuf = self.anchor(&buf);
         let laneid = self.laneid();

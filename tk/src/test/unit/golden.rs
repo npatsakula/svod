@@ -17,7 +17,7 @@ use svod_dtype::{DType, DeviceSpec};
 use svod_ir::UOp;
 
 use crate::kernels::fa::{FaConfig, build_fa_mw_rdb};
-use crate::kernels::matmul::{M1_CFG, build_matmul_cfg};
+use crate::kernels::gemm::{M1_CFG, build_matmul_cfg};
 use crate::{ArchCaps, Kernel, kernel_fingerprint};
 use svod_ir::ops;
 
@@ -77,17 +77,18 @@ fn fa_sink() -> Arc<UOp> {
 // Committed structural golden digests. Update ONLY for an intentional graph change.
 const MATMUL_DIGEST: u128 = 0x0678_fad7_5395_74af_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 536;
-const FA_DIGEST: u128 = 0xcb5c_0c18_143b_2390_0000_0000_0000_0000;
-const FA_NODES: usize = 899;
+const FA_DIGEST: u128 = 0x8a20_2349_757e_64b0_0000_0000_0000_0000;
+const FA_NODES: usize = 883;
 // Non-causal and non-causal+key-masked build variants (pin the `causal:false` and
 // `key_lens:Some` branches GPU-free). The FA all-masked-row NaN fix is a key_lens
 // clamp at the kernel ENTRY (a tensor-graph op), so the SINK graph is unchanged.
-// The FA digests last moved when the softmax scale left `Q` for the f32 `QKᵀ`
-// accumulator: the multiply moves inside the KV loop, so each variant gains two nodes.
-const FA_NONCAUSAL_DIGEST: u128 = 0x3af5_5511_a827_0210_0000_0000_0000_0000;
-const FA_NONCAUSAL_NODES: usize = 873;
-const FA_MASKED_DIGEST: u128 = 0x6a06_f161_5833_523c_0000_0000_0000_0000;
-const FA_MASKED_NODES: usize = 897;
+// The FA digests last moved when the Q tile lost its f32 staging copy: the gather
+// lands the 16-bit operand dtype straight in registers (the softmax scale already
+// rides on the f32 `QKᵀ` accumulator), so each variant drops those 16 nodes.
+const FA_NONCAUSAL_DIGEST: u128 = 0xd629_128d_5adc_ef74_0000_0000_0000_0000;
+const FA_NONCAUSAL_NODES: usize = 857;
+const FA_MASKED_DIGEST: u128 = 0xf841_8880_061b_92f5_0000_0000_0000_0000;
+const FA_MASKED_NODES: usize = 881;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
     let fp = kernel_fingerprint(&sink);

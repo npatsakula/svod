@@ -898,6 +898,32 @@ fn test_custom_kernel_builds_after_call_outputs() {
     }
 }
 
+/// A reshape of a realized input is the same bytes: the kernel binds the
+/// realized node, not a copy, while the placeholder keeps the reshaped shape.
+#[test]
+fn test_custom_kernel_binds_reshaped_after_input_without_a_copy() {
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
+    let dep = UOp::new_buffer(DeviceSpec::Cpu, 1, DType::Float32);
+    let realized = buffer.after(smallvec![dep]);
+    let viewed = realized.try_reshape(&smallvec![SInt::Const(2), SInt::Const(4)]).expect("reshape");
+
+    let outputs = UOp::custom_kernel(
+        vec![viewed],
+        |placeholders| {
+            let shape = placeholders[0].shape().unwrap().cloned().expect("placeholder shape");
+            assert_eq!(shape.iter().map(|d| d.as_const()).collect::<Vec<_>>(), vec![Some(2), Some(4)]);
+            UOp::sink(vec![placeholders[0].clone()])
+        },
+        CallInfo::default(),
+    )
+    .expect("custom kernel should build");
+
+    let Op::After(ops::After { passthrough, deps }) = outputs[0].op() else { panic!("expected AFTER output") };
+    assert!(Arc::ptr_eq(passthrough, &realized), "the realized node is bound, not a copy of its view");
+    let Op::Call(ops::Call { args, .. }) = deps[0].op() else { panic!("expected CALL dep") };
+    assert!(Arc::ptr_eq(&args[0], &realized));
+}
+
 #[test]
 fn test_custom_kernel_value_body_wraps_in_function() {
     // A value-producing body (here a binary Add) routes through Op::Function

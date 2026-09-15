@@ -1,5 +1,6 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
 use crate::qwen3::{Qwen3Attention, qwen3_embedding_0_6b};
 
@@ -10,18 +11,15 @@ fn tiny_attn() -> Qwen3Attention {
 #[test]
 fn gqa_projection_shapes() {
     let attn = tiny_attn();
-    let q_shape = attn.q_proj_weight.dims().unwrap();
-    let k_shape = attn.k_proj_weight.dims().unwrap();
-    let v_shape = attn.v_proj_weight.dims().unwrap();
-    let o_shape = attn.o_proj_weight.dims().unwrap();
+    let sd = attn.state_dict("");
+    let dims = |key: &str| sd[key].dims().unwrap();
 
     // q: (4*32, 64) = (128, 64), k/v: (2*32, 64) = (64, 64), o: (64, 128)
-    assert_eq!(q_shape[0], 128);
-    assert_eq!(q_shape[1], 64);
-    assert_eq!(k_shape[0], 64);
-    assert_eq!(v_shape[0], 64);
-    assert_eq!(o_shape[0], 64);
-    assert_eq!(o_shape[1], 128);
+    assert_eq!(dims("q_proj.weight"), [128, 64]);
+    assert_eq!(dims("k_proj.weight"), [64, 64]);
+    assert_eq!(dims("v_proj.weight"), [64, 64]);
+    assert_eq!(dims("o_proj.weight"), [64, 128]);
+    assert_eq!(attn.qkv_weight.dims().unwrap(), [256, 64]);
 }
 
 #[test]
@@ -38,9 +36,10 @@ fn forward_output_shape() {
     let attn = tiny_attn();
 
     let x = Tensor::from_slice([0.5f32; 512]).try_reshape([1isize, 8, 64]).unwrap();
-    let rope = Tensor::rope_table(10000.0, 8, 32, DType::Float32).unwrap();
+    let (cos, sin) = Tensor::rope_table(10000.0, 8, 32, DType::Float32).unwrap();
+    let rope = (cos.try_transpose(1, 2).unwrap(), sin.try_transpose(1, 2).unwrap());
 
-    let out = attn.forward(&x, &rope, None).unwrap();
+    let out = attn.forward(&x, &rope).unwrap();
     out.realize().unwrap();
     let s = out.dims().unwrap();
     assert_eq!(s[0], 1);
@@ -62,16 +61,10 @@ fn published_weight_shapes() {
         cfg.rms_norm_eps,
         DType::BFloat16,
     );
-    let q = attn.q_proj_weight.dims().unwrap();
-    let k = attn.k_proj_weight.dims().unwrap();
-    let o = attn.o_proj_weight.dims().unwrap();
-    // q: (16*128, 1024) = (2048, 1024)
-    assert_eq!(q[0], 2048);
-    assert_eq!(q[1], 1024);
-    // k: (8*128, 1024) = (1024, 1024)
-    assert_eq!(k[0], 1024);
-    assert_eq!(k[1], 1024);
-    // o: (1024, 2048)
-    assert_eq!(o[0], 1024);
-    assert_eq!(o[1], 2048);
+    let sd = attn.state_dict("");
+    let dims = |key: &str| sd[key].dims().unwrap();
+    assert_eq!(dims("q_proj.weight"), [16 * 128, 1024]);
+    assert_eq!(dims("k_proj.weight"), [8 * 128, 1024]);
+    assert_eq!(dims("v_proj.weight"), [8 * 128, 1024]);
+    assert_eq!(dims("o_proj.weight"), [1024, 16 * 128]);
 }

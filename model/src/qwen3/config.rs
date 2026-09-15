@@ -34,7 +34,6 @@ pub struct Qwen3Config {
     pub tie_word_embeddings: bool,
     pub pad_token_id: usize,
     pub dtype: DType,
-    pub max_batch_size: usize,
 }
 
 impl Qwen3Config {
@@ -78,7 +77,6 @@ pub fn qwen3_embedding_0_6b() -> Qwen3Config {
         tie_word_embeddings: true,
         pad_token_id: 151_643,
         dtype: crate::default_compute_dtype(),
-        max_batch_size: 1,
     }
 }
 
@@ -115,7 +113,6 @@ impl Qwen3Config {
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(base.tie_word_embeddings),
             pad_token_id: raw.pad_token_id.unwrap_or(base.pad_token_id),
             dtype: base.dtype,
-            max_batch_size: base.max_batch_size,
         }
     }
 }

@@ -192,10 +192,20 @@ impl UOp {
         Self::placeholder(&shape, anchor.dtype(), slot, addrspace, None)
     }
 
+    /// The realized node a chain of reshapes views, if the base is one.
+    fn realized_base(x: &Arc<Self>) -> Option<Arc<Self>> {
+        match x.op() {
+            Op::After(..) => Some(x.clone()),
+            Op::Reshape(ops::Reshape { src, .. }) => Self::realized_base(src),
+            _ => None,
+        }
+    }
+
     /// Build a custom kernel callable and return `AFTER(callable)` outputs for all inputs.
     ///
-    /// Input sources are made contiguous (except existing AFTER nodes), placeholders
-    /// are built from those sources, and the closure returns the kernel body UOp.
+    /// Input sources are made contiguous (except AFTER nodes and reshapes of them,
+    /// which bind the realized node itself), placeholders are built from the
+    /// caller's sources, and the closure returns the kernel body UOp.
     ///
     /// Body dispatch mirrors tinygrad's `_OPAQUE_CALL_BODIES` set:
     /// - Opaque bodies (`Sink`, `Program`, `Linear`, `Copy`, `Slice`,
@@ -210,17 +220,19 @@ impl UOp {
     {
         // Materialising an input is the producer's work, not the caller's: the copy
         // takes the source's origin so every scope that hands over the same node
-        // shares one materialisation instead of minting one per call site.
-        let contig_srcs: Vec<Arc<Self>> = srcs
-            .into_iter()
-            .map(|x| if matches!(x.op(), Op::After(..)) { x } else { x.contiguous().rorigin(x.origin()) })
-            .collect();
-
-        let placeholders: Vec<Arc<Self>> = contig_srcs
+        // shares one materialisation instead of minting one per call site. A
+        // reshape of an already-realized source is the same bytes, so the kernel
+        // is handed that source instead of a copy; the placeholder keeps the
+        // caller's shape.
+        let placeholders: Vec<Arc<Self>> = srcs
             .iter()
             .enumerate()
             .map(|(i, s)| UOp::placeholder_like(s, i, svod_dtype::AddrSpace::Global))
             .collect::<Result<_>>()?;
+        let contig_srcs: Vec<Arc<Self>> = srcs
+            .into_iter()
+            .map(|x| Self::realized_base(&x).unwrap_or_else(|| x.contiguous().rorigin(x.origin())))
+            .collect();
 
         let mut body = fxn(placeholders);
         if let Op::Sink(ops::Sink { sources, info: None }) = body.op() {

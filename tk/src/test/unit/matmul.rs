@@ -1,4 +1,4 @@
-//! Tests for the bf16→f32 tile matmul ([`crate::kernels::matmul`]): a port of
+//! Tests for the bf16→f32 tile matmul ([`crate::kernels::gemm`]): a port of
 //! tinygrad `test_tk.py::test_simple_matmul` plus a GPU-free graph-shape check of
 //! the `mma_AB` WMMA construction and the hardware-gated end-to-end checks.
 
@@ -9,7 +9,7 @@ use svod_ir::{Op, UOp};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use crate::kernels::matmul::*;
+use crate::kernels::gemm::*;
 use crate::tiles::{RT_16X16, RT_16X16_MMA, TileLayout};
 use crate::{Kernel, MoveIdx};
 use svod_ir::ops;
@@ -665,7 +665,7 @@ fn test_matmul_graph_gpu() {
         let cfg = cfg_for_arch(arch, n);
         let direct = launch_matmul("matmul_direct", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
 
-        let g = crate::kernels::matmul::matmul(&a, &b).expect("graph matmul").expect("matmul kernel applies");
+        let g = crate::kernels::gemm::matmul(&a, &b).expect("graph matmul").expect("matmul kernel applies");
         g.realize().expect("realize graph matmul");
         let graph = g.as_vec::<f32>().expect("read graph matmul");
 
@@ -749,14 +749,14 @@ fn test_matmul_bench_gpu() {
         eprintln!("skip test_matmul_bench_gpu: no fragment device");
         return;
     };
-    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+    if !super::device_supported(crate::kernels::gemm::MATMUL_SUPPORTED_ARCHS) {
         eprintln!("skip test_matmul_bench_gpu: matmul unsupported here");
         return;
     }
     let envu = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
     for n in [2048usize, 4096] {
         let base = cfg_for_arch(caps.arch, n);
-        let cfg = crate::kernels::matmul::MatmulCfg {
+        let cfg = crate::kernels::gemm::MatmulCfg {
             block: envu("MM_BLOCK", base.block),
             wave_rows: envu("MM_WR", base.wave_rows),
             wave_cols: envu("MM_WC", base.wave_cols),
@@ -850,7 +850,7 @@ fn test_matmul_metal_grid() {
     };
     let _ = caps;
     let n = 64usize;
-    let cfg = crate::kernels::matmul::METAL_CFG;
+    let cfg = crate::kernels::gemm::METAL_CFG;
     let eye: Vec<f32> = (0..n * n).map(|p| if p / n == p % n { 1.0 } else { 0.0 }).collect();
     let ramp: Vec<f32> = (0..n * n).map(|p| (((p / n) % 16) * 16 + (p % n) % 16) as f32).collect();
     let mk = |d: &[f32]| {
@@ -908,7 +908,7 @@ fn matmul_core_contract() {
         return;
     };
     let n = 64usize;
-    let cfg = crate::kernels::matmul::cfg_for_arch(caps.arch, n);
+    let cfg = crate::kernels::gemm::cfg_for_arch(caps.arch, n);
     if !n.is_multiple_of(cfg.block) {
         eprintln!("skip matmul_core_contract: N={n} not a multiple of block {}", cfg.block);
         return;
@@ -972,7 +972,7 @@ fn matmul_k_addressing() {
         return;
     };
     let n = 64usize;
-    let cfg = crate::kernels::matmul::cfg_for_arch(caps.arch, n);
+    let cfg = crate::kernels::gemm::cfg_for_arch(caps.arch, n);
     if !n.is_multiple_of(cfg.block) {
         eprintln!("skip matmul_k_addressing: N={n} not a multiple of block {}", cfg.block);
         return;

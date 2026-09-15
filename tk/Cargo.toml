@@ -33,6 +33,10 @@ name = "fa"
 harness = false
 
 [[bench]]
+name = "gemm"
+harness = false
+
+[[bench]]
 name = "kmeans"
 harness = false
 
@@ -42,6 +46,10 @@ harness = false
 
 [[bench]]
 name = "matmul"
+harness = false
+
+[[bench]]
+name = "norm"
 harness = false
 
 [[bench]]

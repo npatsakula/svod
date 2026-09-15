@@ -58,10 +58,9 @@ fn json_parse() {
 }
 
 #[test]
-fn merge_preserves_dtype_and_batch() {
+fn merge_preserves_dtype() {
     let mut cfg = qwen3_embedding_0_6b();
     cfg.dtype = DType::Float32;
-    cfg.max_batch_size = 8;
 
     let mut parsed = qwen3_embedding_0_6b();
     parsed.vocab_size = 999;
@@ -69,5 +68,4 @@ fn merge_preserves_dtype_and_batch() {
 
     assert_eq!(cfg.vocab_size, 999);
     assert_eq!(cfg.dtype, DType::Float32);
-    assert_eq!(cfg.max_batch_size, 8);
 }

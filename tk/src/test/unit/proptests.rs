@@ -16,7 +16,7 @@ use svod_tensor::rand::manual_seed;
 use svod_tensor::testing::allclose_f32;
 
 use crate::kernels::fa::{FA_SUPPORTED_ARCHS, FaOpts, flash_attention_with};
-use crate::kernels::matmul::{MATMUL_SUPPORTED_ARCHS, matmul};
+use crate::kernels::gemm::{MATMUL_SUPPORTED_ARCHS, matmul};
 
 use super::device_supported;
 

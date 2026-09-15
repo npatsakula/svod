@@ -277,6 +277,7 @@ fn foldable_buffer(buffer: &Arc<UOp>) -> bool {
         DType::Scalar(
             ScalarDType::Float32
                 | ScalarDType::Float16
+                | ScalarDType::BFloat16
                 | ScalarDType::Int32
                 | ScalarDType::UInt32
                 | ScalarDType::FP8E4M3

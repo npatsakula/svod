@@ -60,6 +60,27 @@ pub fn plan_gpu_ns(plan: &ExecutionPlan, iters: u64) -> u64 {
     total
 }
 
+/// [`plan_gpu_ns`] restricted to the dispatches whose entry point starts with
+/// `entry`: a hand kernel's own time. Realizing a hand kernel's output on its own
+/// adds a copy of it that a consumer inside a model never pays, so a plan built
+/// just to bench the kernel would otherwise charge that copy to it.
+pub fn kernel_gpu_ns(plan: &ExecutionPlan, iters: u64, entry: &str) -> u64 {
+    use svod_runtime::PmcSelection;
+    let opts = ProfileOptions { iters: 1, static_analysis: false, counters: PmcSelection::None, ..Default::default() };
+    let mut total = 0u64;
+    for _ in 0..iters {
+        let report = plan.profile(&opts).expect("plan.profile");
+        for k in report.stages.iter().flat_map(|s| s.kernels.iter()) {
+            if let (Some(s), Some(e)) = (k.gpu_start_ns, k.gpu_end_ns)
+                && k.kernel.entry_point.starts_with(entry)
+            {
+                total += e - s;
+            }
+        }
+    }
+    total
+}
+
 /// Bench `plan` by GPU device time. Under `cargo bench --profile-time`, also
 /// capture the plan's full profile (roofline / occupancy / PMC, configured via
 /// `ProfileOptions::from_env`) into the shared [`bench_profiler`], which writes it
@@ -67,6 +88,14 @@ pub fn plan_gpu_ns(plan: &ExecutionPlan, iters: u64) -> u64 {
 pub fn bench_plan(bencher: &mut Bencher<'_>, plan: &ExecutionPlan) {
     bench_profiler().maybe_capture(plan);
     bencher.iter_custom(|iters| Duration::from_nanos(black_box(plan_gpu_ns(plan, iters))));
+}
+
+/// [`bench_plan`] counting only the hand kernel named by `entry` (see
+/// [`kernel_gpu_ns`]).
+#[allow(dead_code)]
+pub fn bench_kernel(bencher: &mut Bencher<'_>, plan: &ExecutionPlan, entry: &str) {
+    bench_profiler().maybe_capture(plan);
+    bencher.iter_custom(|iters| Duration::from_nanos(black_box(kernel_gpu_ns(plan, iters, entry))));
 }
 
 /// Process-global profiler shared between criterion (via

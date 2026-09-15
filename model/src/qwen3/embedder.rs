@@ -1,20 +1,13 @@
-//! Qwen3 embedding model: decoder backbone + last-token pooling + L2 normalize.
+//! Qwen3 embedding model: decoder backbone + last-token pooling + L2 normalize
+//! (the `sentence-transformers` `modules.json` pipeline).
 //!
-//! The pipeline (matching `sentence-transformers` `modules.json`):
-//! 1. Qwen3 decoder forward → `(B, L, D)` last hidden states
-//! 2. Last-token pooling → `(B, D)` (select position `L-1`)
-//! 3. L2 normalize → `(B, D)` unit-norm embeddings
-//!
-//! **Padding convention**: requires **left-padding** (standard for decoder
-//! embedding inference). With left-padding the last real token is at position
-//! `L-1`, a compile-time constant — so last-token pooling works in JIT
-//! (identical to CLS pooling in ModernBERT).
-//!
-//! Loads from the same `model.safetensors` as [`Qwen3Model`] (bare keys,
-//! no `model.` prefix).
+//! Inputs are right-padded; `lengths` names each row's real token count and
+//! the pooled token is the one at `lengths - 1`. Loads from the same
+//! `model.safetensors` as [`Qwen3Model`] (bare keys, no `model.` prefix).
 
 use std::path::Path;
 
+use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
 
@@ -22,8 +15,7 @@ use crate::state::{self, StateDict};
 
 use super::config::Qwen3Config;
 use super::error::Result;
-
-use super::model::Qwen3Model;
+use super::model::{Qwen3Model, last_token};
 
 #[derive(Clone, Module)]
 pub struct Qwen3Embedding {
@@ -34,21 +26,14 @@ pub struct Qwen3Embedding {
 
 impl Qwen3Embedding {
     pub fn empty(config: Qwen3Config) -> Self {
-        let model = Qwen3Model::empty(config);
-        Self { model, normalize: true }
+        Self { model: Qwen3Model::empty(config), normalize: true }
     }
 
-    /// Eager forward: `input_ids` `(B, L)` + `attention_mask` `(B, L)` →
-    /// embeddings `(B, D)`.
-    pub fn encode(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
-        let hidden = self.model.forward(input_ids, Some(attention_mask))?;
-        self.pool_and_normalize(&hidden)
-    }
-
-    fn pool_and_normalize(&self, hidden: &Tensor) -> Result<Tensor> {
-        // Last-token pooling: take position L-1 (requires left-padding).
-        let pooled = hidden.take_index(1, -1)?;
-        if self.normalize { Ok(pooled.lp_normalize(-1, 2)?) } else { Ok(pooled) }
+    /// Right-padded `input_ids` `(B, L)` + `lengths` `(B)` → f32 embeddings
+    /// `(B, D)`.
+    pub fn encode(&self, input_ids: &Tensor, lengths: &Tensor) -> Result<Tensor> {
+        let pooled = last_token(&self.model.forward(input_ids)?, lengths)?.cast(DType::Float32);
+        Ok(if self.normalize { pooled.lp_normalize(-1, 2)? } else { pooled })
     }
 
     pub fn from_hub(model_id: &str, mut config: Qwen3Config) -> Result<Self> {

@@ -140,6 +140,14 @@ impl Kernel {
     pub fn shared_sw(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> ST {
         self.st(dims, dt, layout, self.shared_strip(true))
     }
+    /// [`Self::shared_sw`] with `stages` pipeline halves ([`Kernel::st_stages`]);
+    /// `stages == 1` is exactly [`Self::shared_sw`].
+    ///
+    /// # Panics
+    /// Panics when the arch has no fragment layouts (see [`Kernel::frag`]).
+    pub fn shared_sw_stages(&self, dims: (usize, usize), dt: DType, layout: TileLayout, stages: usize) -> ST {
+        self.st_stages(dims, dt, layout, self.shared_strip(true), stages)
+    }
     fn shared_strip(&self, swizzled: bool) -> STBaseShape {
         let strip = if swizzled { self.caps.shared_swizzled() } else { self.caps.shared_default() };
         strip.unwrap_or_else(|| self.no_layout("shared strip"))

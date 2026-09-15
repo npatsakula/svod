@@ -243,13 +243,13 @@ fn coalescing_groups_scalar_loads_by_run(sink: Arc<UOp>, renderer: Renderer, gro
 
 /// Only the allowlisted element types are grouped; everything else stays scalar.
 #[test_case(ScalarDType::Float16, 1 ; "float16 folds")]
+#[test_case(ScalarDType::BFloat16, 1 ; "bfloat16 folds")]
 #[test_case(ScalarDType::Int32, 1 ; "int32 folds")]
 #[test_case(ScalarDType::UInt32, 1 ; "uint32 folds")]
 #[test_case(ScalarDType::FP8E4M3, 1 ; "fp8 e4m3 folds")]
 #[test_case(ScalarDType::FP8E5M2, 1 ; "fp8 e5m2 folds")]
 #[test_case(ScalarDType::Int8, 4 ; "int8 is not foldable")]
 #[test_case(ScalarDType::Float64, 4 ; "float64 is not foldable")]
-#[test_case(ScalarDType::BFloat16, 4 ; "bfloat16 is not foldable")]
 fn only_allowlisted_element_types_coalesce(scalar: ScalarDType, groups: usize) {
     let result = memory_coalescing(contiguous_loads(UOp::param(0, 16, DType::Scalar(scalar), None)), &Renderer::cpu());
     assert_eq!(loads(&result).len(), groups, "{}", result.tree());

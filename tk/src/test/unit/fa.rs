@@ -774,6 +774,8 @@ fn render_fa_sm86(name: &str, (b, n, h, h_kv, d): (usize, usize, usize, usize, u
 #[test_case::test_case(16, 32, true, false, 128; "16x32 flat d=128")]
 #[test_case::test_case(16, 64, true, false, 64; "16x64 flat")]
 #[test_case::test_case(16, 64, true, true, 128; "16x64 flat causal d=128")]
+#[test_case::test_case(16, 16, true, false, 128; "16x16 flat d=128")]
+#[test_case::test_case(16, 16, true, true, 128; "16x16 flat causal d=128")]
 fn test_fa_sm86_renders_mma_sync(q_blk: usize, kv_blk: usize, unroll: bool, causal: bool, d: usize) {
     let body = if unroll { "flat" } else { "rolled" };
     let name = format!("fa_sm86_{q_blk}x{kv_blk}_{body}{}_d{d}", if causal { "_causal" } else { "" });
@@ -813,11 +815,68 @@ fn test_fa_sm86_renders_mma_sync(q_blk: usize, kv_blk: usize, unroll: bool, caus
         assert_eq!(count("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16"), frags);
         assert_eq!(count("cp.async.cg.shared.global"), 4 * passes);
         assert_eq!((count("cp.async.wait_group"), count("cp.async.wait_all"), count("bar.sync")), (1, 1, 1));
+        // The Q gather and the O write-back are the kernel's only GLOBAL register
+        // traffic (K/V ride `cp.async`). Under the flat body each is emitted per
+        // element with a *constant* register index, so the two `mma.sync` elements a
+        // lane holds side by side in a row fold into one 32-bit access and no tile
+        // is pinned to local memory. A rolled body indexes the tiles dynamically,
+        // which both blocks the fold and spills them — the reason CUDA is flat.
+        if unroll {
+            let pairs = q_blk * d / 64;
+            assert_eq!((count("ld.global.nc.b32"), count("st.global.b32")), (pairs, pairs), "{ptx}");
+            assert_eq!((count("ld.global.nc.b16"), count("st.global.b16")), (0, 0), "{ptx}");
+            assert_eq!(count("__local_depot"), 0, "flat body must keep every register tile in registers:\n{ptx}");
+        }
     }
     assert!(
         !code.contains("amdgcn") && !code.contains("mfma") && !code.contains("wmma."),
         "no AMD intrinsics on NVPTX"
     );
+}
+
+/// The right-hand side of every `icmp ult i32` loop-latch test in `code` — one
+/// per rendered loop, a literal for a static trip count and an `%ssa` name for a
+/// runtime one.
+fn loop_bounds(code: &str) -> Vec<String> {
+    code.lines()
+        .filter(|l| l.contains("cmp = icmp ult i32"))
+        .filter_map(|l| l.rsplit(',').next())
+        .map(|b| b.trim().to_string())
+        .collect()
+}
+
+/// The causal sweep really skips the KV super-blocks above the diagonal instead
+/// of masking them: the per-q-block trip count is
+/// `(block_q_base + 1) * NUM_WARPS * Q_BLK / KV_BLK`, so the rendered KV loop
+/// tests against a runtime (`ctaid.y`-derived) bound, where the bidirectional
+/// sweep tests against the constant `N / KV_BLK` and every rendered loop bound is
+/// a literal.
+#[test_case::test_case(16, 16; "square tile")]
+#[test_case::test_case(16, 32; "taller KV block")]
+fn test_fa_sm86_causal_skips_kv_blocks(q_blk: usize, kv_blk: usize) {
+    let (n, d) = (512usize, 128usize);
+    let shape = (1, n, 2, 2, d);
+    let cfg = |causal| FaConfig { q_blk, kv_blk, unroll: true, causal };
+    let full = render_fa_sm86(&format!("fa_skip_full_{q_blk}x{kv_blk}"), shape, cfg(false));
+    let causal = render_fa_sm86(&format!("fa_skip_causal_{q_blk}x{kv_blk}"), shape, cfg(true));
+
+    let full_bounds = loop_bounds(&full);
+    assert!(full_bounds.contains(&(n / kv_blk).to_string()), "bidirectional sweeps every KV block: {full_bounds:?}");
+    assert!(
+        full_bounds.iter().all(|b| b.parse::<i64>().is_ok()),
+        "no bidirectional loop bound is runtime-valued: {full_bounds:?}"
+    );
+
+    let causal_bounds = loop_bounds(&causal);
+    assert!(
+        causal_bounds.iter().any(|b| b.starts_with('%')),
+        "the causal KV loop must stop at this block's own diagonal: {causal_bounds:?}"
+    );
+    assert!(
+        !causal_bounds.contains(&(n / kv_blk).to_string()),
+        "no causal loop may still sweep every KV block: {causal_bounds:?}"
+    );
+    assert!(causal.contains("read.ptx.sreg.ctaid.y"), "the causal bound is derived from the q-block index");
 }
 
 /// The sm_86 PTX of rendered NVPTX IR, or `None` without an NVPTX-enabled clang
@@ -836,8 +895,10 @@ const SM_86: svod_dtype::GpuArch = svod_dtype::GpuArch::Cuda(svod_dtype::CudaArc
 
 /// The per-arch tile policy: gfx942's `{32,32}` needs `b·h·n/256 >= 304` blocks
 /// (else the `{16,32}` baseline), gfx1151 always takes the baseline, and CUDA
-/// takes the taller `{16,64}` KV block (flat) once the grid covers its 28 SMs, at
-/// d ≤ 64 (the d=128 double buffers would exceed the static LDS).
+/// takes the taller `{16,64}` KV block (flat) once the grid covers its 28 SMs at
+/// d ≤ 64 (the d=128 double buffers would exceed the static LDS), the square
+/// `{16,16}` (two blocks per SM) at d ≤ 128, and the `{16,32}` baseline both on a
+/// grid too small to fill the SMs twice over and past every `big` head-dim bound.
 #[test_case::test_case(GFX942, (1, 1536, 16, 64), (16, 32), false; "gfx942 small grid")]
 #[test_case::test_case(GFX942, (8, 2048, 32, 128), (32, 32), false; "gfx942 machine-covering grid")]
 #[test_case::test_case(GFX942, (64, 1152, 16, 64), (16, 32), false; "gfx942 N not a 256-multiple")]
@@ -847,7 +908,9 @@ const SM_86: svod_dtype::GpuArch = svod_dtype::GpuArch::Cuda(svod_dtype::CudaArc
 #[test_case::test_case(SM_86, (1, 1024, 16, 64), (16, 64), true; "sm_86 gigaam b=1")]
 #[test_case::test_case(SM_86, (1, 256, 2, 64), (16, 32), true; "sm_86 tiny grid")]
 #[test_case::test_case(SM_86, (8, 1152, 16, 64), (16, 64), true; "sm_86 N a 128-multiple only")]
-#[test_case::test_case(SM_86, (8, 1536, 16, 128), (16, 32), true; "sm_86 d=128 keeps the small tile")]
+#[test_case::test_case(SM_86, (8, 1536, 16, 128), (16, 16), true; "sm_86 d=128 takes the square tile")]
+#[test_case::test_case(SM_86, (1, 128, 16, 128), (16, 32), true; "sm_86 d=128 small grid keeps the taller KV block")]
+#[test_case::test_case(SM_86, (8, 512, 16, 192), (16, 32), true; "sm_86 d=192 has no big tile")]
 fn fa_policy_tile(
     arch: svod_dtype::GpuArch,
     (b, n, h, d): (usize, usize, usize, usize),

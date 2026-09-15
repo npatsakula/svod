@@ -11,6 +11,18 @@ pub enum Error {
         source: Box<svod_tensor::error::Error>,
     },
 
+    #[snafu(display("{source}"), context(false))]
+    Jit {
+        #[snafu(source(from(crate::jit::JitError, Box::new)))]
+        source: Box<crate::jit::JitError>,
+    },
+
+    #[snafu(display("flash-attention kernel: {source}"))]
+    Tk {
+        #[snafu(source(from(svod_tk::LaunchError, Box::new)))]
+        source: Box<svod_tk::LaunchError>,
+    },
+
     #[snafu(display("state-dict op failed"), context(false))]
     State {
         #[snafu(source(from(crate::state::Error, Box::new)))]

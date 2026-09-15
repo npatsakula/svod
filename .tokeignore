@@ -16,6 +16,8 @@ scripts/
 ir/examples/
 tensor/examples/
 model/examples/
+tk/benches/
+model/benches/
 macros/src/module/test.rs
 macros/src/patterns/test/
 macros/src/jit/test.rs

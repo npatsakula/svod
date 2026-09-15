@@ -21,7 +21,7 @@
 //! either wrap its SINK as a lazy graph node ([`graph_launch`], production wiring)
 //! or dispatch it directly against concrete buffers for isolation/debug
 //! ([`run_kernel`] / [`compile_kernel`] / [`CompiledLaunch`]). The built-in
-//! [`matmul`](kernels::matmul) is the worked reference kernel.
+//! [`matmul`](kernels::gemm::matmul) is the worked reference kernel.
 //!
 //! It is a thin eager builder, not a backend: tiles wrap UOp buffers and emit the
 //! same lowered-kernel IR (`Range` + `index().store(..).end(..)`) the normal
@@ -72,11 +72,13 @@ const _: () = assert!(WARP_THREADS == ArchCaps::GFX942.wave_size);
 
 // ── Use the built-in kernels (Tensor in → Tensor out) ───────────────────────
 pub use kernels::fa::{
-    FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaOpts, flash_attention, flash_attention_supported, flash_attention_with,
+    FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaOpts, flash_attention, flash_attention_supported, flash_attention_tuned,
+    flash_attention_with,
 };
+pub use kernels::gemm::{Epilogue, GemmCfg, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, matmul, swiglu_pair_width};
 pub use kernels::kmeans::{kmeans_assign, kmeans_update};
 pub use kernels::knn::knn;
-pub use kernels::matmul::matmul;
+pub use kernels::norm::{NORM_SUPPORTED_ARCHS, NormCfg, add_rms_norm, rms_norm, select_norm_cfg};
 pub use kernels::sq_attention::{SqAttentionOpts, single_query_attention, single_query_attention_packed};
 pub use launch::{Error as LaunchError, Result as LaunchResult};
 pub use target::ArchSet;

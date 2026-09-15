@@ -671,33 +671,29 @@ impl<'k> Group<'k> {
         let src_i_base = flat_offset(src.shape(), &idxs_t);
 
         let laneid = self.ker.laneid();
-        let height = self.ker.raw_range(s3, AxisType::Loop);
-        let width = self.ker.raw_range(s2, AxisType::Loop);
-        let inner = self.ker.raw_range(ept, AxisType::Loop);
-
-        let base_row = imul(&height, base_rows);
-        let base_col = imul(&width, base_cols);
-        let (row, col) = rt.lane_rc(rt.layout == TileLayout::Col, &laneid, &inner);
-        let srow = iadd(&base_row, &row);
-        let scol = iadd(&base_col, &col);
-        let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
-
-        let gate = masked
-            .then(|| self.boundary_gate(src.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
-            .flatten();
-        let mut load = match gate {
-            Some(g) => {
-                let zero = if src.elem().is_float() { ConstValue::Float(0.0) } else { ConstValue::Int(0) };
-                load_off_gated(src.uop(), off, g, UOp::const_(src.elem().clone(), zero))
+        let transpose = rt.layout == TileLayout::Col;
+        let ended = self.elementwise(&[s3 as usize, s2 as usize, ept as usize], |ix| {
+            let (row, col) = rt.lane_rc(transpose, &laneid, &ix[2].to_uop());
+            let srow = iadd(&imul(&ix[0].to_uop(), base_rows), &row);
+            let scol = iadd(&imul(&ix[1].to_uop(), base_cols), &col);
+            let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
+            let gate = masked
+                .then(|| self.boundary_gate(src.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
+                .flatten();
+            let mut load = match gate {
+                Some(g) => {
+                    let zero = if src.elem().is_float() { ConstValue::Float(0.0) } else { ConstValue::Int(0) };
+                    load_off_gated(src.uop(), off, g, UOp::const_(src.elem().clone(), zero))
+                }
+                None => load_off(src.uop(), off),
+            };
+            if src.elem() != rt.elem() {
+                load = load.cast(rt.elem().clone());
             }
-            None => load_off(src.uop(), off),
-        };
-        if src.elem() != rt.elem() {
-            load = load.cast(rt.elem().clone());
-        }
-        let mut didx: Vec<Idx> = dst_idxs.to_vec();
-        didx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
-        let ended = flat_index(rt.uop(), rt.shape(), &didx).store(load).end(smallvec![height, width, inner]);
+            let mut didx: Vec<Idx> = dst_idxs.to_vec();
+            didx.extend(ix.iter().cloned());
+            flat_index(rt.uop(), rt.shape(), &didx).store(load)
+        });
         self.finalize_reg(rt, ended)
     }
 
@@ -740,6 +736,41 @@ impl<'k> Group<'k> {
         axis: usize,
         masked: bool,
     ) -> GL {
+        self.store_reg_to_global_with(dst, rt, idxs, src_idxs, axis, masked, |v, _| v.clone())
+    }
+
+    /// [`Self::store`]'s REG→GLOBAL hop with a per-element **value transform**:
+    /// `value` receives the register element (already cast to the destination
+    /// dtype) and the flat global element offset the store is about to write, and
+    /// returns what is actually stored. An epilogue that reads a second tensor at
+    /// the store's own position — the GEMM's residual add — folds into this pass
+    /// instead of running its own over the register tile, which would round-trip
+    /// the tile through a second loop nest and spill it (measured: 8 B/lane of
+    /// scratch and −5% on the `[4096, 3072]·[1024, 3072]ᵀ` down-projection).
+    ///
+    /// # Panics
+    /// As [`Self::store`]: `ix.axis` must be in range for `dst`'s rank.
+    pub fn store_global_with<F>(&self, dst: GL, rt: &RT<'k>, ix: MoveIdx, value: F) -> GL
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_reg_to_global_with<F>(
+        &self,
+        dst: GL,
+        rt: &RT<'k>,
+        idxs: &[Idx],
+        src_idxs: &[Idx],
+        axis: usize,
+        masked: bool,
+        value: F,
+    ) -> GL
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
         let row_stride: i64 = dst.shape()[axis + 1..].iter().product::<usize>() as i64;
         let base_rows = rt.base.base.rows as i64;
         let base_cols = rt.base.base.cols as i64;
@@ -765,31 +796,29 @@ impl<'k> Group<'k> {
         let dst_i_base = flat_offset(dst.shape(), &idxs_t);
 
         let laneid = self.ker.laneid();
-        let height = self.ker.raw_range(s3, AxisType::Loop);
-        let width = self.ker.raw_range(s2, AxisType::Loop);
-        let inner = self.ker.raw_range(ept, AxisType::Loop);
+        let transpose = rt.layout == TileLayout::Col;
+        let ended = self.elementwise(&[s3 as usize, s2 as usize, ept as usize], |ix| {
+            let (row, col) = rt.lane_rc(transpose, &laneid, &ix[2].to_uop());
+            let srow = iadd(&imul(&ix[0].to_uop(), base_rows), &row);
+            let scol = iadd(&imul(&ix[1].to_uop(), base_cols), &col);
+            let off = iadd(&dst_i_base, &iadd(&imul(&srow, row_stride), &scol));
 
-        let base_row = imul(&height, base_rows);
-        let base_col = imul(&width, base_cols);
-        let (row, col) = rt.lane_rc(rt.layout == TileLayout::Col, &laneid, &inner);
-        let srow = iadd(&base_row, &row);
-        let scol = iadd(&base_col, &col);
-        let off = iadd(&dst_i_base, &iadd(&imul(&srow, row_stride), &scol));
-
-        let mut sidx: Vec<Idx> = src_idxs.to_vec();
-        sidx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
-        let mut load = load_at(rt.uop(), rt.shape(), &sidx);
-        if rt.elem() != dst.elem() {
-            load = load.cast(dst.elem().clone());
-        }
-        let gate = masked
-            .then(|| self.boundary_gate(dst.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
-            .flatten();
-        let target = match gate {
-            Some(g) => index_off_gated(dst.uop(), off, g),
-            None => index_off(dst.uop(), off),
-        };
-        let ended = target.store(load).end(smallvec![height, width, inner]);
+            let mut sidx: Vec<Idx> = src_idxs.to_vec();
+            sidx.extend(ix.iter().cloned());
+            let mut load = load_at(rt.uop(), rt.shape(), &sidx);
+            if rt.elem() != dst.elem() {
+                load = load.cast(dst.elem().clone());
+            }
+            let load = value(&load, &off);
+            let gate = masked
+                .then(|| self.boundary_gate(dst.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
+                .flatten();
+            let target = match gate {
+                Some(g) => index_off_gated(dst.uop(), off, g),
+                None => index_off(dst.uop(), off),
+            };
+            target.store(load)
+        });
         self.finalize_gl(dst, ended)
     }
 }

@@ -16,7 +16,7 @@ use common::{bench_plan, randn_bf16, requirements_met};
 /// generic optimizer); this is its DSL perf-canary. Square `M = N = K`, bf16 in,
 /// f32 accumulate.
 fn bench_matmul(c: &mut Criterion) {
-    if !requirements_met(svod_tk::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+    if !requirements_met(svod_tk::kernels::gemm::MATMUL_SUPPORTED_ARCHS) {
         eprintln!("svod-tk matmul bench: skipped (no supported GPU / toolchain)");
         return;
     }

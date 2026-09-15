@@ -1,6 +1,7 @@
 mod arch;
 mod elementwise;
 mod fa;
+mod gemm;
 mod golden;
 mod grid;
 mod guide;
@@ -14,6 +15,7 @@ mod masked;
 mod math;
 mod matmul;
 mod movement;
+mod norm;
 mod proptests;
 mod reductions;
 mod scaffold;

@@ -45,3 +45,10 @@ svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.7", features = [
 ndarray-npy = "0.10"
 tempfile = "3.27.0"
 test-case = "3.3.1"
+proptest = "1.11.0"
+unicode-normalization = "0.1.25"
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "qwen3_embed"
+harness = false

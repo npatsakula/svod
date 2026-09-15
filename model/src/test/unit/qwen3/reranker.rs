@@ -20,7 +20,6 @@ fn tiny_cfg() -> Qwen3Config {
         tie_word_embeddings: true,
         pad_token_id: 0,
         dtype: DType::Float32,
-        max_batch_size: 1,
     }
 }
 
@@ -28,10 +27,10 @@ fn tiny_cfg() -> Qwen3Config {
 fn forward_output_shape() {
     let mut reranker = Qwen3Reranker::empty(tiny_cfg());
     reranker.yes_loc = 5; // within tiny vocab_size=100
-    let ids = Tensor::from_slice([0i64, 1, 2, 3, 4, 5, 6, 7]).try_reshape([1isize, 8]).unwrap();
-    let mask = Tensor::from_slice([1i64, 1, 1, 1, 1, 1, 1, 1]).try_reshape([1isize, 8]).unwrap();
+    let ids = Tensor::from_slice([0i32, 1, 2, 3, 4, 5, 6, 7]).try_reshape([1isize, 8]).unwrap();
+    let lengths = Tensor::from_slice([8i32]);
 
-    let out = reranker.forward(&ids, &mask).unwrap();
+    let out = reranker.forward(&ids, &lengths).unwrap();
     out.realize().unwrap();
     let s = out.dims().unwrap();
     // (B,) scalar score per row (after sigmoid)

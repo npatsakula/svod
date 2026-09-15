@@ -376,6 +376,24 @@ impl Kernel {
     /// Panics unless `rows` is a multiple of `base.base.rows`, `cols` a multiple
     /// of `base.base.cols`, and `cols` a multiple of the per-thread element count.
     pub fn st_db(&self, dims: (usize, usize), dtype: DType, layout: TileLayout, base: STBaseShape) -> ST {
+        self.st_stages(dims, dtype, layout, base, 2)
+    }
+
+    /// [`Kernel::st_db`] generalized to `stages` halves — the software pipeline's
+    /// shared strip. `stages == 1` allocates exactly what [`Kernel::st`] does (same
+    /// buffer size, same logical shape), so a single-buffered kernel is unaffected.
+    ///
+    /// # Panics
+    /// Panics unless `rows` is a multiple of `base.base.rows`, `cols` a multiple
+    /// of `base.base.cols`, and `cols` a multiple of the per-thread element count.
+    pub fn st_stages(
+        &self,
+        dims: (usize, usize),
+        dtype: DType,
+        layout: TileLayout,
+        base: STBaseShape,
+        stages: usize,
+    ) -> ST {
         let (rows, cols) = dims;
         assert_eq!(rows % base.base.rows, 0, "ST rows {rows} not a multiple of base {}", base.base.rows);
         assert_eq!(cols % base.base.cols, 0, "ST cols {cols} not a multiple of base {}", base.base.cols);
@@ -384,7 +402,7 @@ impl Kernel {
         let width = cols / base.base.cols;
         let shape = vec![height, width, base.base.rows, base.base.cols];
         let half: usize = shape.iter().product();
-        let buf = self.alloc_local(2 * half, dtype.clone());
+        let buf = self.alloc_local(stages * half, dtype.clone());
         ST { buf, shape, rows, cols, layout, base, elem: dtype, base_offset: None }
     }
 

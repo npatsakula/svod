@@ -121,13 +121,16 @@ impl<'k> StoreInto<'k, GL> for RT<'k> {
 pub(crate) fn idiv(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
     a.try_div(&cidx(k)).expect("idiv")
 }
-pub(crate) fn imod(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
+/// `a % k` as an `Index`-typed UOp.
+pub fn imod(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
     a.try_mod(&cidx(k)).expect("imod")
 }
-pub(crate) fn imul(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
+/// `a · k` as an `Index`-typed UOp, folding `k = 1` away.
+pub fn imul(a: &Arc<UOp>, k: i64) -> Arc<UOp> {
     if k == 1 { a.clone() } else { a.try_mul(&cidx(k)).expect("imul") }
 }
-pub(crate) fn iadd(a: &Arc<UOp>, b: &Arc<UOp>) -> Arc<UOp> {
+/// `a + b` as an `Index`-typed UOp.
+pub fn iadd(a: &Arc<UOp>, b: &Arc<UOp>) -> Arc<UOp> {
     a.try_add(b).expect("iadd")
 }
 pub(super) fn ixor(a: &Arc<UOp>, k: i64) -> Arc<UOp> {

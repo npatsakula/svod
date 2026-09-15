@@ -8,7 +8,7 @@
 //! Pipeline (matching FlagEmbedding `FlagLLMReranker`):
 //! 1. Qwen3 decoder forward → `(B, L, D)` hidden states
 //! 2. Tied LM head: `hidden @ embed_tokens.weight.T` → `(B, L, V)` logits
-//! 3. Last-token logit: `logits[:, L-1, :]` → `(B, V)` (requires left-padding)
+//! 3. Last-token logit: `logits[b, lengths[b]-1, :]` → `(B, V)` (right-padded rows)
 //! 4. Score: `logits[:, yes_loc]` → `(B,)`
 //! 5. Optional sigmoid → `(B,)` normalized scores
 //!
@@ -26,7 +26,7 @@ use crate::state;
 use super::config::Qwen3Config;
 use super::error::Result;
 
-use super::model::Qwen3Model;
+use super::model::{Qwen3Model, last_token};
 
 /// Token ID for "Yes" in the Qwen tokenizer — the reranker's positive class.
 const YES_LOC: usize = 9454;
@@ -50,22 +50,15 @@ impl Qwen3Reranker {
         Self { model, lm_head_weight, yes_loc: YES_LOC, normalize: true }
     }
 
-    /// Eager forward: returns `(B,)` relevance scores.
-    pub fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
-        let hidden = self.model.forward(input_ids, Some(attention_mask))?;
-        self.score(&hidden)
-    }
-
-    fn score(&self, hidden: &Tensor) -> Result<Tensor> {
-        // Last-token hidden state: (B, D) — slice BEFORE the LM head to avoid
-        // computing logits for all L positions when we only need one.
-        let last_hidden = hidden.take_index(1, -1)?;
-
-        // LM head: (B, D) @ (D, V) → (B, V), then the "Yes" logit → (B,).
+    /// Right-padded `input_ids` `(B, L)` + `lengths` `(B)` → `(B,)` relevance
+    /// scores.
+    pub fn forward(&self, input_ids: &Tensor, lengths: &Tensor) -> Result<Tensor> {
+        // Only the last token's logits are scored, so the LM head runs on
+        // `(B, D)`, not `(B, L, D)`.
+        let last_hidden = last_token(&self.model.forward(input_ids)?, lengths)?;
         let logits = last_hidden.linear().weight(&self.lm_head_weight).call()?;
         let scores = logits.take_index(-1, self.yes_loc as isize)?;
-
-        if self.normalize { Ok(scores.sigmoid()?) } else { Ok(scores) }
+        Ok(if self.normalize { scores.sigmoid()? } else { scores })
     }
 
     pub fn from_hub(model_id: &str, mut config: Qwen3Config) -> Result<Self> {

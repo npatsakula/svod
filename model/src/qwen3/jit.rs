@@ -1,7 +1,6 @@
-//! JIT wrapper for [`Qwen3Embedding`]. Bakes the `input_ids` /
-//! `attention_mask` shapes into the plan and exposes `b` as the rebindable
-//! batch variable. The entire pipeline (backbone + last-token pooling +
-//! L2 normalize) runs in one JIT plan.
+//! JIT wrappers for the Qwen3 heads. Prepared at a concrete `[B, L]`: the
+//! hand attention kernel takes no symbolic dimension, so batch and length are
+//! plan shape and [`super::Qwen3Embedder`] keeps one plan per length bucket.
 
 use svod_macros::jit_wrapper;
 
@@ -11,13 +10,12 @@ use super::reranker::Qwen3Reranker;
 jit_wrapper! {
     Qwen3EmbeddingJit(Qwen3Embedding) {
         input_ids: Tensor,
-        attention_mask: Tensor,
+        lengths: Tensor,
 
-        batch_var b: (1, model.model.config.max_batch_size),
         outputs { embeddings }
 
-        build(input_ids, attention_mask) {
-            model.encode(input_ids, attention_mask)
+        build(input_ids, lengths) {
+            model.encode(input_ids, lengths)
         }
     }
 }
@@ -25,13 +23,12 @@ jit_wrapper! {
 jit_wrapper! {
     Qwen3RerankerJit(Qwen3Reranker) {
         input_ids: Tensor,
-        attention_mask: Tensor,
+        lengths: Tensor,
 
-        batch_var b: (1, model.model.config.max_batch_size),
         outputs { scores }
 
-        build(input_ids, attention_mask) {
-            model.forward(input_ids, attention_mask)
+        build(input_ids, lengths) {
+            model.forward(input_ids, lengths)
         }
     }
 }
