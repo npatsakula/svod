@@ -194,6 +194,25 @@ fn access_buffer_follows_aliasing_wrappers(store_kind: usize, load_kind: usize, 
     assert_eq!(matches!(computation.op(), Op::Barrier(..)), barriered, "{}", result.tree());
 }
 
+/// A load outside the loop's scope — a gather the loop's fill is ordered after
+/// through `After` — is not re-run against the loop's stores, so the END gets no
+/// per-iteration barrier (the double-buffer commit of a strip the K loop read).
+#[test]
+fn a_local_load_outside_the_loop_scope_does_not_bar_it() {
+    let local = buffer(0, AddrSpace::Local);
+    let gather = load(index_of(local.clone(), UOp::index_const(3)));
+    let fill = range(4, AxisType::Loop, 0);
+    let stored = index_of(local.after(smallvec![gather]), fill.clone()).store(UOp::native_const(1.0f32));
+    let result = add_implicit_barriers(stored.end(smallvec![fill]));
+
+    assert!(
+        matches!(result.op(), Op::End(ops::End { computation, .. })
+        if matches!(computation.op(), Op::Store(..))),
+        "{}",
+        result.tree()
+    );
+}
+
 /// A store in a different buffer's scope does not bar a reduce over another one:
 /// the store does not reference the inner range, so the inner END stays clean.
 #[test]

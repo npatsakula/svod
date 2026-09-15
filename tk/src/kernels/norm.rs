@@ -29,16 +29,17 @@ use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
 use crate::group::{iadd, imul};
-use crate::index::{cidx, index_off, load_off};
+use crate::index::{cidx, load_off_vec, store_off_vec, vec_elem};
 use crate::scaffold::GlSpec;
 use crate::{Group, Kernel};
 
 /// The arches these kernels are enabled for. The bodies are arch-generic (wave
-/// size + butterfly shuffle), but the vector-width ladder and the block shapes
-/// below are measured on `mma.sync` (sm_86); another arch joins by measuring its
-/// own, not by inheriting this one.
-pub const NORM_SUPPORTED_ARCHS: crate::ArchSet =
-    crate::ArchSet::amd(&[]).with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
+/// size + butterfly shuffle); the vector-width ladder and block shapes below are
+/// measured on sm_86 and gfx1151 (both wave32: 585 GB/s cache-resident and 90%
+/// of the DRAM copy rate once the working set spills), and a wave64 part joins
+/// by measuring its own.
+pub const NORM_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx1151])
+    .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
 
 /// Per-lane global-access widths, widest first: 8 bf16 is the 128-bit vector
 /// load, and a wave issuing it covers `32 × 16 = 512` contiguous bytes.
@@ -71,36 +72,20 @@ fn f32c(v: f64) -> Arc<UOp> {
 }
 
 /// A lane's `vec`-wide load at flat element offset `off` — one shaped access,
-/// which the renderer widens to a single `ld.global.v4`-class instruction.
+/// which the late coalescing folds to one 128-bit instruction on the LLVM GPU
+/// targets (`ld.global.v4` / `global_load_dwordx4`).
 pub fn vload(buf: &Arc<UOp>, off: &Arc<UOp>, vec: usize) -> Arc<UOp> {
-    if vec == 1 {
-        return load_off(buf, off.clone());
-    }
-    let idx = UOp::index().buffer(buf.clone()).indices(vec![spread(off, vec)]).call().expect("vector load INDEX");
-    UOp::load().index(idx).call()
+    load_off_vec(buf, off, vec)
 }
 
 /// Element `j` of a [`vload`] result.
 pub fn vpick(v: &Arc<UOp>, j: usize, vec: usize) -> Arc<UOp> {
-    if vec == 1 { v.clone() } else { v.index_axes(vec![j]) }
+    vec_elem(v, j, vec)
 }
 
 /// A lane's `vals.len()`-wide store at flat element offset `off`.
 pub fn vstore(buf: &Arc<UOp>, off: &Arc<UOp>, vals: Vec<Arc<UOp>>) -> Arc<UOp> {
-    if vals.len() == 1 {
-        return index_off(buf, off.clone()).store(vals.into_iter().next().expect("one value"));
-    }
-    UOp::index()
-        .buffer(buf.clone())
-        .indices(vec![spread(off, vals.len())])
-        .call()
-        .expect("vector store INDEX")
-        .store(UOp::stack(vals.into_iter().collect()))
-}
-
-/// `[off, off+1, …, off+w-1]` as one shaped index.
-fn spread(off: &Arc<UOp>, w: usize) -> Arc<UOp> {
-    UOp::stack((0..w as i64).map(|l| if l == 0 { off.clone() } else { iadd(off, &cidx(l)) }).collect())
+    store_off_vec(buf, off, vals)
 }
 
 /// `off + k` with the constant folded away when it is zero.
@@ -267,8 +252,8 @@ fn check_norm_operands(
 ///
 /// The outcome is three-way (via [`crate::launch_custom`]):
 ///
-/// - `Ok(None)` — *doesn't apply here:* the device is not CUDA sm_80+ with its
-///   LLVM backend ([`NORM_SUPPORTED_ARCHS`]), **or** the shape does not fit
+/// - `Ok(None)` — *doesn't apply here:* the device is not one of
+///   [`NORM_SUPPORTED_ARCHS`] with its LLVM backend, **or** the shape does not fit
 ///   ([`select_norm_cfg`]): `D` must be a multiple of the wave (32) and at most
 ///   `64·32 = 2048` (a row lives in registers). The caller substitutes
 ///   `Tensor::rms_norm_with`.

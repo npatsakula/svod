@@ -261,6 +261,11 @@ impl<'k> Group<'k> {
         self.group_threads
     }
 
+    /// The kernel this group builds into.
+    pub fn kernel(&self) -> &'k Kernel {
+        self.ker
+    }
+
     /// The wave's flat index within the group (`(threadIdx % group_threads)/64`).
     pub fn warpid_in_group(&self) -> Arc<UOp> {
         idiv(&imod(&self.ker.thread_idx, self.group_threads as i64), self.ker.caps.wave_size as i64)

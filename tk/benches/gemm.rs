@@ -3,7 +3,7 @@
 //! `Tensor::linear` on the transformer linear-layer shapes. See [`common`] for
 //! device-time stamping and self-skip.
 //!
-//! Run: `SVOD_DEVICE=CUDA:0 cargo bench -p svod-tk --bench gemm`
+//! Run: `SVOD_DEVICE={CUDA,AMD}:0 cargo bench -p svod-tk --bench gemm`
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
@@ -54,7 +54,7 @@ fn bench_gemm_nt(c: &mut Criterion) {
         let id = format!("{m}x{k}x{n}");
         group.throughput(Throughput::Elements(2 * (m * k * n) as u64));
         let (x, w) = (randn_bf16(&[m, k]), randn_bf16(&[n, k]));
-        let pair = svod_tk::swiglu_pair_width().expect("a common pair width");
+        let pair = svod_tk::swiglu_pair_width(&x.device()).expect("a common pair width");
         let fused = svod_tk::gemm_nt_with_epilogue(&x, &w, svod_tk::Epilogue::SwiGlu { pair })
             .expect("gemm_nt build")
             .expect("the epilogue applies");

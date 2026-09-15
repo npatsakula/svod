@@ -367,11 +367,12 @@ pub fn memory_coalescing(sink: Arc<UOp>, ctx: &Renderer) -> Arc<UOp> {
         } else if image_shape(&buffer).is_some() {
             lengths.push(4usize);
         } else if ctx.supports_float4 {
-            if buffer.dtype() == DType::Float16 && env_enabled("ALLOW_HALF8") {
-                lengths.extend_from_slice(&[8, 4, 2]);
-            } else {
-                lengths.extend_from_slice(&[4, 2]);
-            }
+            // The widest fold is one 16-byte access where the target renders it as
+            // one instruction (`global_load_dwordx4` / `ld.global.v4` on the LLVM
+            // GPU targets: eight 16-bit lanes), and four lanes where it does not
+            // (MSL and C have no vector wider than four; f32 is four either way).
+            let widest = if ctx.access_bytes() >= 16 { 16 / buffer.dtype().base().bytes() } else { 4 };
+            lengths.extend((1..=widest.trailing_zeros()).rev().map(|s| 1usize << s));
         }
         lengths.push(1);
 

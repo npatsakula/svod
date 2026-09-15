@@ -6,8 +6,10 @@
 //! `[M, I]` and never forming the `[M, 2I]` intermediate
 //! ([`svod_tk::Epilogue::SwiGlu`]). That epilogue pairs each gate column with
 //! its up column **inside one wave's accumulator**, so the stacked rows are
-//! interleaved in blocks of [`svod_tk::swiglu_pair_width`] — `[g0.., u0.., g1..,
-//! u1.., …]` — at load time. The state dict keeps the published two-key layout.
+//! interleaved in blocks of the weight's device's [`svod_tk::swiglu_pair_width`]
+//! — `[g0.., u0.., g1.., u1.., …]` — at load time; on a device without the hand
+//! GEMM they stay plainly stacked. The state dict keeps the published two-key
+//! layout.
 
 use svod_dtype::DType;
 use svod_ir::SInt;
@@ -99,6 +101,20 @@ impl Qwen3MLP {
     }
 }
 
+/// `gate` over `up` as one `[2I, H]` buffer (a lazy `cat` would be re-read part
+/// by part inside the GEMM's K loop: 2x the weight loads, half the throughput),
+/// in alternating `pair`-row gate/up blocks when `pair` is set.
+pub(crate) fn pair_rows(gate: &Tensor, up: &Tensor, pair: Option<usize>) -> svod_tensor::error::Result<Tensor> {
+    let (i, h) = (gate.dim_const(0)?, gate.dim_const(1)?);
+    let stacked = Tensor::cat(&[gate, up], 0)?;
+    let Some(pair) = pair else { return Ok(stacked.contiguous()) };
+    stacked
+        .try_reshape([2, (i / pair) as isize, pair as isize, h as isize])?
+        .try_permute(&[1, 0, 2, 3])?
+        .contiguous()
+        .try_reshape([(2 * i) as isize, h as isize])
+}
+
 impl Module for Qwen3MLP {
     fn write_state(&self, prefix: &str, out: &mut StateDict) {
         out.insert(prefixed(prefix, "gate_proj.weight"), self.published_half(0));
@@ -110,21 +126,11 @@ impl Module for Qwen3MLP {
         let gate = get_tensor(sd, &prefixed(prefix, "gate_proj.weight"))?;
         let up = get_tensor(sd, &prefixed(prefix, "up_proj.weight"))?;
         let i = self.intermediate_size;
-        let h = gate.dim_const(1)?;
         // The epilogue pairs a gate column with its up column inside one wave's
-        // accumulator, so their rows must be interleaved in blocks of `pair`.
-        // One buffer either way: a lazy `cat` would be re-read part by part
-        // inside the GEMM's K loop (2x the weight loads, half the throughput).
-        self.pair = svod_tk::swiglu_pair_width().filter(|p| i.is_multiple_of(*p));
-        let stacked = Tensor::cat(&[&gate, &up], 0)?;
-        self.gate_up_weight = match self.pair {
-            None => stacked.contiguous(),
-            Some(pair) => stacked
-                .try_reshape([2, (i / pair) as isize, pair as isize, h as isize])?
-                .try_permute(&[1, 0, 2, 3])?
-                .contiguous()
-                .try_reshape([(2 * i) as isize, h as isize])?,
-        };
+        // accumulator, so their rows must be interleaved in blocks of `pair` —
+        // the width the GEMM tiles of the weight's device read.
+        self.pair = svod_tk::swiglu_pair_width(&gate.device()).filter(|p| i.is_multiple_of(*p));
+        self.gate_up_weight = pair_rows(&gate, &up, self.pair)?;
         self.gate_up_weight.realize()?;
         self.down_weight = get_tensor(sd, &prefixed(prefix, "down_proj.weight"))?;
         Ok(())

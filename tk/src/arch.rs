@@ -66,6 +66,33 @@ pub enum FragRole {
     AccumulatorT,
 }
 
+/// The matrix-core family an arch belongs to: what a kernel's per-arch config
+/// table is keyed by, so a new part of a known family needs no table of its own
+/// (only a [`crate::ArchSet`] entry once validated).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Family {
+    /// AMD CDNA: MFMA, wave64.
+    Cdna,
+    /// AMD RDNA3+: WMMA, wave32.
+    Rdna,
+    /// CUDA: `mma.sync`, warp32.
+    Cuda,
+    /// Apple: `simdgroup_matrix`, SIMD-group 32.
+    Metal,
+}
+
+impl Family {
+    /// The family of `arch`.
+    pub const fn of(arch: GpuArch) -> Self {
+        match arch {
+            GpuArch::Amd(amd) if amd.is_cdna() => Self::Cdna,
+            GpuArch::Amd(_) => Self::Rdna,
+            GpuArch::Cuda(_) => Self::Cuda,
+            GpuArch::Metal(_) => Self::Metal,
+        }
+    }
+}
+
 /// Lanes per wave on `arch`: 64 on CDNA, 32 on RDNA3/4, 32 on every CUDA
 /// generation, 32 on Apple GPUs (the SIMD-group width).
 pub const fn wave_size_of(arch: GpuArch) -> usize {
@@ -111,6 +138,11 @@ impl ArchCaps {
     /// The CUDA compute capability when this is a CUDA target.
     pub fn cuda(&self) -> Option<CudaArch> {
         self.arch.cuda()
+    }
+
+    /// The arch's matrix-core [`Family`].
+    pub const fn family(&self) -> Family {
+        Family::of(self.arch)
     }
 
     /// Whether the arch is AMD CDNA (MFMA, wave64) — the only arch whose

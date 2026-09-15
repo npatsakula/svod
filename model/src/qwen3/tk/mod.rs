@@ -241,8 +241,8 @@ fn build_qkv_norm_rope(ker: &Kernel, rows: usize, seq: usize, heads: Heads, dt: 
 ///
 /// The outcome is three-way (via [`svod_tk::launch_custom`]):
 ///
-/// - `Ok(None)` — *doesn't apply here:* the device is not CUDA sm_80+ with its
-///   LLVM backend ([`NORM_SUPPORTED_ARCHS`]), **or** the geometry does not fit
+/// - `Ok(None)` — *doesn't apply here:* the device is not one of
+///   [`NORM_SUPPORTED_ARCHS`] with its LLVM backend, **or** the geometry does not fit
 ///   ([`select_qkv_cfg`]): `dh` and `dh/2` must both be multiples of the wave
 ///   (32) with at most 64 elements per lane, and some wave count must divide
 ///   both `h` and `h_kv`. The caller substitutes the split / norm / rope graph.

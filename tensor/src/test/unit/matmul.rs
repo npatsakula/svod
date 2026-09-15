@@ -668,6 +668,12 @@ struct AFragment {
     alt: Arc<UOp>,
 }
 
+/// Lanes per pinned A access: one 16-byte bf16 access, the widest fold the late
+/// coalescing makes on the LLVM GPU targets.
+const A_LANES: usize = 8;
+/// Shaped A loads per 16-wide fragment row.
+const A_LOADS: usize = 16 / A_LANES;
+
 /// The memory fragments of a padded WMMA kernel, collected from either the
 /// optimized graph or the linearized op list — both must describe the same
 /// bytes, so `assert_padded_5x16` runs against each.
@@ -704,12 +710,12 @@ impl Fragments {
                             .iter()
                             .filter_map(|extent| extent.as_const())
                             .collect::<Vec<_>>();
-                        assert_eq!(shape, [4]);
-                        assert_eq!(eval_lane(sizes, 0), 4, "each pinned A access must contain four shaped lanes");
+                        assert_eq!(shape, [A_LANES]);
+                        assert_eq!(eval_lane(sizes, 0), A_LANES as i64, "each pinned A access is one 16-byte run");
                         let alt = alt.as_ref().expect("padded A loads require a shaped zero alternative");
                         let gate = gate.as_ref().expect("padded A loads require a validity gate");
                         assert!(
-                            is_zero_stack(alt, 4),
+                            is_zero_stack(alt, A_LANES),
                             "every invalid padded A lane must contribute zero: {}",
                             alt.tree()
                         );
@@ -754,11 +760,11 @@ impl Fragments {
     /// A 5x16 operand padded into a 16x16 tile: A[0..80] and C[0..80] are real,
     /// A[80..256] and C[80..96] are the padded tails the gates must disable.
     fn assert_padded_5x16(&self, stage: &str) {
-        assert_eq!(self.a.len(), 4, "{stage}: padded WMMA A fragment must contain four shaped loads");
+        assert_eq!(self.a.len(), A_LOADS, "{stage}: padded WMMA A fragment must contain {A_LOADS} shaped loads");
         let (mut loaded_a, mut padded_a) = (BTreeSet::new(), BTreeSet::new());
         for AFragment { offsets, gate, .. } in &self.a {
             for lane in 0..32 {
-                for shaped_lane in 0..4 {
+                for shaped_lane in 0..A_LANES as i64 {
                     let index = eval_lane(offsets, lane) + shaped_lane;
                     assert!((0..256).contains(&index), "{stage}: raw padded A index escaped the 16x16 tile");
                     if eval_gate(gate, lane) {
@@ -898,8 +904,9 @@ fn test_matmul_m5_gfx1151_padded_wmma_compile_only() {
             index_render.lines
         );
         assert!(load_render.lines.iter().any(|line| line.contains("br i1") && line.contains(&gate_name)));
-        assert!(load_render.lines.iter().any(|line| line.contains("load <4 x half>") && line.contains(&address_name)));
-        assert!(load_render.lines.iter().any(|line| line.contains("phi <4 x half>") && line.contains(&alt_name)));
+        let (load_ty, phi_ty) = (format!("load <{A_LANES} x half>"), format!("phi <{A_LANES} x half>"));
+        assert!(load_render.lines.iter().any(|line| line.contains(&load_ty) && line.contains(&address_name)));
+        assert!(load_render.lines.iter().any(|line| line.contains(&phi_ty) && line.contains(&alt_name)));
         assert_eq!(
             load_render.source_ids,
             vec![index.id, alt.id, gate.id],

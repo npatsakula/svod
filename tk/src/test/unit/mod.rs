@@ -22,11 +22,13 @@ mod scaffold;
 mod shuffle;
 mod sq_attention;
 mod swizzle;
+mod tune;
 
 /// The env-selected device's caps when tk defines its matrix-core fragment layouts
 /// (AMD, CUDA sm_80+), else `None` — the skip gate for fragment-layout HW tests, so
 /// a device without them skips instead of panicking at `Kernel::frag`.
 pub(crate) fn fragment_device() -> Option<crate::ArchCaps> {
+    crate::tune::set_enabled(false);
     let dev = svod_tensor::Tensor::rand(&[16, 16]).expect("probe tensor").device();
     crate::target::resolve_arch(&dev).map(crate::ArchCaps::for_arch).filter(crate::ArchCaps::has_matrix_core_layouts)
 }
@@ -53,6 +55,9 @@ pub(crate) fn row_fold_device() -> Option<crate::ArchCaps> {
 /// Whether the env-selected device is in `archs` with its LLVM backend present —
 /// the self-skip gate for the `#[ignore]`d HW tests of a kernel.
 pub(crate) fn device_supported(archs: crate::ArchSet) -> bool {
+    // A kernel test checks numerics against the graph; tuning every shape it
+    // touches would multiply its GPU time for nothing it asserts.
+    crate::tune::set_enabled(false);
     let spec = svod_tensor::Tensor::empty(&[1], svod_dtype::DType::Float32).device();
     crate::target::check_target(&spec, archs).is_ok()
 }

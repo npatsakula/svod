@@ -8,6 +8,8 @@ use svod_tensor::Tensor;
 use svod_tensor::nn::{Module, StateDict};
 
 use crate::qwen3::Qwen3MLP;
+use crate::qwen3::pair_rows;
+use test_case::test_case;
 
 const H: usize = 16;
 const I: usize = 32;
@@ -39,22 +41,38 @@ fn rows(t: &Tensor) -> Vec<Vec<f32>> {
     t.as_vec::<f32>().expect("read").chunks(cols).map(<[f32]>::to_vec).collect()
 }
 
-/// The fused weight arrives as alternating `pair`-row gate and up blocks, which
-/// is what puts a gate column beside its up column inside one wave's
-/// accumulator. The block width is the kernel's, not a number spelled here.
-#[test]
-fn load_state_dict_interleaves_the_gate_up_rows() {
-    let pair = svod_tk::swiglu_pair_width().expect("the GEMM tiles agree on a pair width");
-    assert_eq!(I % pair, 0, "the tiny intermediate size must divide by the pair width");
-    let (gate, up, down) = (marked(I, H, 100.0), marked(I, H, 200.0), marked(H, I, 300.0));
-    let mlp = loaded(&gate, &up, &down);
-
-    assert_eq!(mlp.gate_up_weight.dims().expect("dims"), [2 * I, H]);
-    let (got, g, u) = (rows(&mlp.gate_up_weight), rows(&gate), rows(&up));
+/// The fused weight is laid out in alternating `pair`-row gate and up blocks,
+/// which is what puts a gate column beside its up column inside one wave's
+/// accumulator, at whatever width the device's GEMM tiles read; `None` keeps the
+/// checkpoint's plain stacking.
+#[test_case(Some(8); "pair 8")]
+#[test_case(Some(16); "pair 16")]
+#[test_case(None; "plainly stacked")]
+fn pair_rows_interleaves_the_gate_up_blocks(pair: Option<usize>) {
+    let (gate, up) = (marked(I, H, 100.0), marked(I, H, 200.0));
+    let fused = pair_rows(&gate, &up, pair).expect("pair rows");
+    assert_eq!(fused.dims().expect("dims"), [2 * I, H]);
+    let (got, g, u) = (rows(&fused), rows(&gate), rows(&up));
+    let pair = pair.unwrap_or(I);
     for (r, row) in got.iter().enumerate() {
         let (block, within) = (r / pair, r % pair);
         let want = if block % 2 == 0 { &g[(block / 2) * pair + within] } else { &u[(block / 2) * pair + within] };
         assert_eq!(row, want, "row {r} of the fused weight");
+    }
+}
+
+/// The load-time row order is the weight's device's: the host has no hand GEMM,
+/// so a CPU-loaded module keeps the rows plainly stacked and publishes them back
+/// unchanged.
+#[test]
+fn load_state_dict_pairs_the_rows_at_the_device_width() {
+    let (gate, up, down) = (marked(I, H, 100.0), marked(I, H, 200.0), marked(H, I, 300.0));
+    let mlp = loaded(&gate, &up, &down);
+    let want = svod_tk::swiglu_pair_width(&gate.device());
+    let all = rows(&mlp.gate_up_weight);
+    match want {
+        None => assert_eq!(all, [rows(&gate), rows(&up)].concat(), "no hand GEMM: plainly stacked"),
+        Some(pair) => assert_eq!(all, rows(&pair_rows(&gate, &up, Some(pair)).expect("pair rows"))),
     }
 }
 

@@ -13,10 +13,12 @@
 //!   two coordinates exchanged, so both strips fill and gather identically and the
 //!   orientation is carried entirely by the `mma` variant.
 //! - [`GemmCfg::stages`] — `1` keeps the single-buffered fill/barrier/gather/mma
-//!   loop; `2` runs the `cp.async` software pipeline (the flash-attention K/V
-//!   pattern): the next K strip is issued into the other shared half and stays in
-//!   flight under the current strip's `ldmatrix` gathers and MMAs, under one
-//!   workgroup barrier per trip.
+//!   loop; `2` runs the software pipeline (the flash-attention K/V pattern): the
+//!   next K strip is in flight under the current strip's gathers and MMAs, under
+//!   one workgroup barrier per trip. The fill primitive is the arch's, chosen
+//!   through [`Group`]: `cp.async` straight into the other shared half where it
+//!   applies (CUDA sm_80+), else the register-staged stream — `global_load`
+//!   before the MMAs, `ds_write` into the other half after them.
 //!
 //! The output dtype is the bound C buffer's: a bf16 `c_gl` makes the epilogue cast
 //! the f32 accumulators on the way out, with no f32 round trip through memory.
@@ -87,6 +89,15 @@ impl<T> Epilogue<T> {
             _ => n,
         }
     }
+
+    /// A small integer naming the variant (the tuning key's epilogue field).
+    pub const fn code(&self) -> usize {
+        match self {
+            Epilogue::Plain => 0,
+            Epilogue::Add(_) => 1,
+            Epilogue::SwiGlu { .. } => 2,
+        }
+    }
 }
 
 /// Block / wave geometry of one GEMM workgroup. A `warps_m × warps_n` wave grid
@@ -106,8 +117,9 @@ pub struct GemmCfg {
     /// K-reduction step (the shared strip depth); a multiple of the matrix core's
     /// K-edge, and `K` must be a multiple of `k_step · split_k`.
     pub k_step: usize,
-    /// Shared-memory strips in flight: `1` = single-buffered, `2` = the `cp.async`
-    /// double-buffered software pipeline.
+    /// Shared-memory strips in flight: `1` = single-buffered, `2` = the
+    /// double-buffered software pipeline (`cp.async` where the arch has it, the
+    /// register-staged stream elsewhere; deeper pipelines are `cp.async`-only).
     pub stages: usize,
     /// B's global layout.
     pub b_order: BOrder,
@@ -116,7 +128,7 @@ pub struct GemmCfg {
     pub l2_swizzle: bool,
     /// Fill the single-buffered strips with 128-bit coalesced loads (`cp.async` on
     /// sm_80+) instead of the scalar path. Ignored when `stages > 1` (the pipeline
-    /// is always `cp.async`).
+    /// has its own fill).
     pub vec_load: bool,
     /// K-slabs the reduction is split across: each `(pid_m, pid_n)` block is
     /// computed by `split_k` workgroups over `K / split_k` each, written as
@@ -300,7 +312,7 @@ pub fn gemm_core(
     let lp = ker.loop_static(trips);
     let strip = Strips { cfg: &cfg, a_gl: &a_gl, b_gl: &b_gl, row: &row, col: &col, slab: slab.clone(), trips };
 
-    let (a_cur, b_cur, fence) =
+    let (a_cur, b_cur, stream) =
         if cfg.stages > 1 { strip.pipelined(&g, &lp, a_smem, b_smem) } else { strip.single(&g, &lp, a_smem, b_smem) };
 
     // Shared B sub-tile (N col-block {warp_col}, same for every accumulator), and
@@ -318,9 +330,10 @@ pub fn gemm_core(
         .collect();
 
     // Cross-wave WAR barrier: every wave must finish reading LDS before the next
-    // K iteration's collaborative fill overwrites it. The pipeline fences at the
-    // loop top instead — its single barrier covers both the RAW and the WAR.
-    let (bb, a_subs) = if fence {
+    // K iteration's collaborative fill overwrites it. The pipelines fence
+    // elsewhere — at the loop top (`cp.async`) or in the tail commit (staged) —
+    // with one barrier covering both the RAW and the WAR.
+    let (bb, a_subs) = if matches!(stream, Stream::Single) {
         let mut bar_deps: SmallVec<[Arc<UOp>; 4]> = smallvec![bb.uop().clone()];
         bar_deps.extend(a_subs.iter().skip(1).map(|t| t.uop().clone()));
         let sync = a_subs[0].uop().barrier(bar_deps);
@@ -346,13 +359,27 @@ pub fn gemm_core(
         };
         prev_out = Some(out.uop().clone());
     }
-    let ended = lp.close();
+    let ended = match &stream {
+        // The staged stream's `ds_write` of the next strip lands after this trip's
+        // MMAs (ordered through the last one), and the one barrier-wrapped commit
+        // of both strips is the loop's terminal store: one fence per trip,
+        // covering the RAW on the half just written and the WAR on the half every
+        // wave just gathered.
+        Stream::Staged { stage, nxt } => {
+            let after_mma = prev_out.clone().expect("at least one accumulator");
+            let (a_nxt, b_nxt) = (nxt[0].after(&after_mma), nxt[1].after(&after_mma));
+            let fenced = g.commit_regs_to_local(&[(&a_nxt, &stage[0]), (&b_nxt, &stage[1])]).barrier(smallvec![]);
+            ker.push_store(fenced, a_nxt.uop().clone());
+            lp.close()
+        }
+        _ => lp.close(),
+    };
     // Each accumulator reads its fully-reduced register value *outside* the loop.
     let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
     // No copy may be outstanding at exit: drain the last trip's wrapped prefetch
     // before the epilogue writes (threaded through the GLOBAL tile, so the carried
     // accumulators keep their plain post-loop reads).
-    let c_gl = if cfg.stages > 1 {
+    let c_gl = if matches!(stream, Stream::Async) {
         let drained = cp_async_wait_all(smallvec![final_accs[0].uop().clone()]);
         c_gl.rewrap(c_gl.uop().after(smallvec![drained]))
     } else {
@@ -464,7 +491,20 @@ fn narrow<'k>(ker: &'k Kernel, g: &Group<'k>, acc: RT<'k>, out_dt: &DType) -> RT
     out
 }
 
-/// The K-strip stream: everything the two fill strategies share (the operand
+/// How the K strips reach shared memory, and what [`gemm_core`] owes each stream
+/// after the trip's MMAs.
+enum Stream {
+    /// Single-buffered: the caller fences the gathers against the next fill.
+    Single,
+    /// The `cp.async` pipeline: fenced at the loop top; drained after the loop.
+    Async,
+    /// The register-staged pipeline: the next strip is in `stage` (per operand)
+    /// and is committed into the `nxt` halves after the MMAs, under the trip's
+    /// one barrier.
+    Staged { stage: [Arc<UOp>; 2], nxt: Box<[ST; 2]> },
+}
+
+/// The K-strip stream: everything the fill strategies share (the operand
 /// globals, this workgroup's `(pid_m, pid_n)` and K-slab, and the trip count).
 struct Strips<'a> {
     cfg: &'a GemmCfg,
@@ -489,7 +529,7 @@ impl Strips<'_> {
     /// Single-buffered: one collaborative GLOBAL→LDS fill per trip, the two strips
     /// sharing ONE barrier (the RAW edge) before the gathers; the WAR edge back to
     /// the next fill is the barrier the caller puts after them (`fence = true`).
-    fn single(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, bool) {
+    fn single(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
         let (a_idx, b_idx) = self.at(lp.index());
         let (a_f, b_f) = if self.cfg.vec_load {
             (
@@ -505,7 +545,54 @@ impl Strips<'_> {
         // Depending on B's fill makes "after both fills" a graph edge rather than a
         // linearizer accident, and saves the barrier each strip used to close with.
         let filled = a_f.uop().barrier(smallvec![b_f.uop().clone()]);
-        (a_f.after(smallvec![filled.clone()]), b_f.after(smallvec![filled]), true)
+        (a_f.after(smallvec![filled.clone()]), b_f.after(smallvec![filled]), Stream::Single)
+    }
+
+    /// The software pipeline, on the fill primitive the arch has: `cp.async`
+    /// where it applies to both strips ([`Group::cp_async_fill_applies`]), else
+    /// the two-deep register-staged stream.
+    fn pipelined(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
+        if g.cp_async_fill_applies(&a_smem, self.a_gl) && g.cp_async_fill_applies(&b_smem, self.b_gl) {
+            self.async_pipelined(g, lp, a_smem, b_smem)
+        } else {
+            assert_eq!(self.cfg.stages, 2, "the register-staged pipeline is two-deep (one strip in flight)");
+            self.staged(g, lp, a_smem, b_smem)
+        }
+    }
+
+    /// The register-staged double buffer (the flash-attention K/V stream on AMD):
+    /// the prologue lands strip 0 in half 0; each trip issues the global loads of
+    /// strip `tile + 1` into per-lane registers, where they stay in flight under
+    /// the current half's gathers and MMAs, and [`gemm_core`] writes them into the
+    /// other half after the MMAs, under the trip's single barrier. The prefetch
+    /// index wraps modulo the trip count, so the last trip re-reads strip 0
+    /// (never gathered) instead of running off the operand.
+    fn staged(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
+        let half = |st: &ST, p: &Arc<UOp>| st.with_base_offset(p.mul(&cidx(st.half_elems() as i64)));
+        let (a0, b0) = self.at(&cidx(0));
+        let s_a = g.stage_global_to_reg(&a_smem, self.a_gl, &a0, 2);
+        let s_b = g.stage_global_to_reg(&b_smem, self.b_gl, &b0, 2);
+        let (a_half, b_half) = (half(&a_smem, &cidx(0)), half(&b_smem, &cidx(0)));
+        let landed = g.commit_regs_to_local(&[(&a_half, &s_a), (&b_half, &s_b)]).barrier(smallvec![]);
+        g.kernel().push_store(landed.clone(), a_smem.uop().clone());
+        let (a_smem, b_smem) = (a_smem.after(&landed), b_smem.after(&landed));
+
+        let idx = lp.index().clone();
+        let nxt = idx.add(&cidx(1));
+        let par = |t: &Arc<UOp>| t.try_mod(&cidx(2)).expect("stage parity");
+        let (par_cur, par_nxt) = (par(&idx), par(&nxt));
+        let pf = nxt.try_mod(&cidx(self.trips)).expect("prefetch strip % trips");
+        let (ai, bi) = self.at(&pf);
+        let stage =
+            [g.stage_global_to_reg(&a_smem, self.a_gl, &ai, 2), g.stage_global_to_reg(&b_smem, self.b_gl, &bi, 2)];
+        // The gathers order after the issue, so the loads are in flight under them.
+        let issued: SmallVec<[Arc<UOp>; 4]> = smallvec![stage[0].clone(), stage[1].clone()];
+        let nxt = Box::new([half(&a_smem, &par_nxt), half(&b_smem, &par_nxt)]);
+        (
+            half(&a_smem, &par_cur).after(issued.clone()),
+            half(&b_smem, &par_cur).after(issued),
+            Stream::Staged { stage, nxt },
+        )
     }
 
     /// The `cp.async` software pipeline. A prologue issues the first `stages - 1`
@@ -517,7 +604,7 @@ impl Strips<'_> {
     /// hands back the current half for the gathers, which run with `stages - 1`
     /// copies in flight. Prefetch indices wrap modulo the trip count, so the tail
     /// trips re-read strip 0 (never gathered) instead of running off the operand.
-    fn pipelined(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, bool) {
+    fn async_pipelined(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
         let stages = self.cfg.stages as i64;
         let half = |st: &ST, p: &Arc<UOp>| st.with_base_offset(p.mul(&cidx(st.half_elems() as i64)));
         let issue = |a: &ST, b: &ST, t: &Arc<UOp>| {
@@ -543,19 +630,19 @@ impl Strips<'_> {
         let landed = cp_async_wait(2 * (stages as u32).saturating_sub(2), smallvec![idx]).barrier(smallvec![]);
         let mut issued: SmallVec<[Arc<UOp>; 4]> = smallvec![landed.clone()];
         issued.extend(issue(&half(&a_smem, &par_nxt).after(&landed), &half(&b_smem, &par_nxt).after(&landed), &pf));
-        (half(&a_smem, &par_cur).after(issued.clone()), half(&b_smem, &par_cur).after(issued), false)
+        (half(&a_smem, &par_cur).after(issued.clone()), half(&b_smem, &par_cur).after(issued), Stream::Async)
     }
 }
 
 // ── The NT linear-layer kernel (`y = x · wᵀ`) ────────────────────────────────
 
-/// The arches [`gemm_nt`] is enabled for. The core is arch-generic, but the
-/// [`select_cfg`] tile table is measured on `mma.sync` (sm_86); another arch joins
-/// by adding its own measured table, not by inheriting this one.
-pub const GEMM_NT_SUPPORTED_ARCHS: crate::ArchSet =
-    crate::ArchSet::amd(&[]).with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
+/// The arches [`gemm_nt`] is enabled for. The core is arch-generic; a family
+/// joins with its own measured tile table in [`GemmPolicy::for_arch`], a new
+/// part of a known family with an entry here once validated.
+pub const GEMM_NT_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx1151])
+    .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
 
-/// The default tile: 128×64, a 2×2 wave grid (128 threads), two 32×32 f32
+/// The CUDA default tile: 128×64, a 2×2 wave grid (128 threads), two 32×32 f32
 /// accumulators per wave, `k_step = 32` and the two-stage `cp.async` pipeline.
 /// 24 KiB of shared memory and ~116 registers, so four blocks are resident per
 /// sm_86 SM. Measured fastest on every shape in `benches/gemm.rs`: the
@@ -595,68 +682,172 @@ pub const NT_64X64: GemmCfg = GemmCfg { block_m: 64, acc_m: 1, ..NT_128X64 };
 /// flips the sign.
 pub const NT_SPLIT_K: GemmCfg = GemmCfg { split_k: 2, l2_swizzle: false, ..NT_128X64 };
 
-/// Tile selection for the NT GEMM: the device's SM count, which sets how small a
-/// launch grid counts as starving the machine.
+/// The CUDA sm_80+ tiles, widest first.
+pub const CUDA_TILES: [GemmCfg; 2] = [NT_128X64, NT_64X64];
+
+/// The RDNA (wave32 WMMA) tiles, measured on gfx1151: the CUDA tiles on the
+/// register-staged pipeline without the L2 swizzle (single-XCD parts; ±3%
+/// either way), and the fine tile on a 64-deep strip, which halves the barriers
+/// per K and wins once the grid is short (batch-1 down projection 12.3 vs 7.1
+/// TFLOP/s). A 32-deep 64×64 tile keeps a `K` of 64 or 96 servable. 128×128
+/// trailed by 10-15% and `k_step = 64` on the wide tile halved its throughput
+/// (48 KiB of LDS), so neither is a candidate.
+pub const RDNA_TILES: [GemmCfg; 3] = [
+    GemmCfg { l2_swizzle: false, ..NT_128X64 },
+    GemmCfg { l2_swizzle: false, k_step: 64, ..NT_64X64 },
+    GemmCfg { l2_swizzle: false, ..NT_64X64 },
+];
+
+/// Tile selection for the NT GEMM: the family's tile table — the search space
+/// [`Self::tuned`] measures on first use — and, for the static choice, the
+/// device's compute-unit count, which sets how small a launch grid counts as
+/// starving the machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GemmPolicy {
-    /// SMs on the device.
+    /// Compute units (SMs, CUs) on the device.
     pub compute_units: usize,
-}
-
-impl Default for GemmPolicy {
-    /// The RTX 3060 (sm_86, 28 SMs) the tile table was measured on.
-    fn default() -> Self {
-        Self { compute_units: 28 }
-    }
-}
-
-/// The tiles [`GemmPolicy`] chooses between, widest first.
-pub const GEMM_TILES: [GemmCfg; 2] = [NT_128X64, NT_64X64];
-
-/// The gate/up row-block width an [`Epilogue::SwiGlu`] fused weight must be laid
-/// out in: `reg_n/2` — half a wave's N tile, the two halves its accumulator holds
-/// side by side — common to every tile in [`GEMM_TILES`], or `None` when they
-/// disagree (the caller then keeps a separate SwiGLU pass). The GEMM's `M` is not
-/// known when the weight is loaded, and `M` is what picks the tile, so the row
-/// arrangement has to be one that **every** candidate tile reads.
-pub fn swiglu_pair_width() -> Option<usize> {
-    let pair = GEMM_TILES[0].reg_n() / 2;
-    GEMM_TILES.iter().all(|cfg| cfg.reg_n() / 2 == pair).then_some(pair)
+    /// The tiles to choose between: the widest first, then the finer ones in
+    /// preference order; empty where no one has measured the family (the policy
+    /// then declines every shape rather than run another family's constants).
+    pub tiles: &'static [GemmCfg],
+    /// Blocks of the widest tile per compute unit below which a finer tile wins.
+    /// On CUDA the blocks resident per SM (~116 registers and 24 KiB of shared
+    /// memory against 64 K and 100 KiB); on RDNA measured (the wide tile leads
+    /// at 12.8 blocks per CU and trails at 6.4).
+    pub resident: usize,
 }
 
 impl GemmPolicy {
-    /// Blocks of the 128-thread tiles that fit on one SM at once (~116 registers
-    /// and 24 KiB of shared memory per block against sm_86's 64 K registers and
-    /// 100 KiB). Sets the grid below which a wider tile leaves SMs idle.
-    const RESIDENT: usize = 4;
+    /// The family's tile table with its measured part's compute-unit count (an
+    /// RTX 3060's 28 SMs, Strix Halo's 40 CUs); [`Self::for_device`] reads the
+    /// real count. A family nobody measured declines.
+    pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
+        match crate::arch::Family::of(arch) {
+            crate::arch::Family::Cuda => Self { compute_units: 28, tiles: &CUDA_TILES, resident: 4 },
+            crate::arch::Family::Rdna => Self { compute_units: 40, tiles: &RDNA_TILES, resident: 8 },
+            crate::arch::Family::Cdna | crate::arch::Family::Metal => {
+                Self { compute_units: 1, tiles: &[], resident: 1 }
+            }
+        }
+    }
 
-    /// [`Self::default`] with the SM count of the device behind `spec`, when the
-    /// backend reports it.
-    pub fn for_device(spec: &svod_dtype::DeviceSpec) -> Self {
-        let mut policy = Self::default();
+    /// [`Self::for_arch`] with the compute-unit count of the device behind
+    /// `spec`, when the backend reports it.
+    pub fn for_device(spec: &svod_dtype::DeviceSpec, arch: svod_dtype::GpuArch) -> Self {
+        let mut policy = Self::for_arch(arch);
         if let Some(compute_units) = crate::target::compute_units(spec) {
             policy.compute_units = compute_units;
         }
         policy
     }
 
-    /// The tile for an `m × k × n` NT GEMM, or `None` when neither tiles it exactly
-    /// (the caller pads to 128, or falls back). [`NT_128X64`] unless its grid would
-    /// not even fill the device once, in which case the finer [`NT_64X64`] — which
-    /// also covers an `m` that only divides by 64.
+    /// The tile for an `m × k × n` NT GEMM, or `None` when none tiles it exactly
+    /// (the caller pads, or falls back). The widest tile unless its grid would not
+    /// even fill the device once, in which case it is tried last — the finer
+    /// tiles also cover an `m` the widest does not divide.
     pub fn cfg(&self, m: usize, k: usize, n: usize) -> Option<GemmCfg> {
-        let mut table = GEMM_TILES;
-        if NT_128X64.blocks(m, n) < self.compute_units * Self::RESIDENT {
-            table.reverse();
+        let (widest, finer) = self.tiles.split_first()?;
+        let starved = widest.blocks(m, n) < self.compute_units * self.resident;
+        let mut table: SmallVec<[GemmCfg; 4]> = finer.iter().copied().collect();
+        if starved {
+            table.push(*widest)
+        } else {
+            table.insert(0, *widest)
         }
         table.into_iter().find(|cfg| cfg.tiles(m, k, n))
     }
+
+    /// The tile for an `m × k × n` NT GEMM under `epi` as measured on this device
+    /// ([`crate::tune`]): every table tile that tiles the shape and carries the
+    /// epilogue is timed once, with that epilogue, on synthetic operands, and
+    /// the fastest kept in `store`; the static [`Self::cfg`] choice where only
+    /// one fits or nothing measured. The launch entry consults
+    /// [`crate::tune::enabled`] before coming here.
+    pub fn tuned(
+        &self,
+        store: &crate::tune::TuneStore,
+        spec: &svod_dtype::DeviceSpec,
+        arch: svod_dtype::GpuArch,
+        dtype: &DType,
+        (m, k, n): (usize, usize, usize),
+        epi: Epilogue<()>,
+    ) -> Option<GemmCfg> {
+        let caps = crate::ArchCaps::for_arch(arch);
+        let frag = caps.frag(crate::arch::FragRole::Accumulator).map(|f| f.base.cols);
+        let fits = |cfg: &GemmCfg| cfg.tiles(m, k, n) && cfg.carries(epi, frag);
+        let candidates: Vec<GemmCfg> = self.tiles.iter().copied().filter(fits).collect();
+        let fallback = || self.cfg(m, k, n).filter(fits);
+        if candidates.len() < 2 {
+            return fallback();
+        }
+        let cols = epi.out_cols(n);
+        let build = move |ker: &Kernel, cfg: GemmCfg| {
+            build_gemm_nt(ker, (m, k, n), cfg, dtype.clone(), dtype.clone(), epi);
+            ker.finish(cfg.acc_m)
+        };
+        // The key covers the candidate kernels themselves: their graphs, built
+        // against placeholder buffers, fingerprinted in table order.
+        let placeholders = || {
+            let mut sizes = vec![m * cols, m * k, n * k];
+            if let Epilogue::Add(()) = epi {
+                sizes.push(m * cols);
+            }
+            sizes.into_iter().map(|size| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dtype.clone())).collect()
+        };
+        let builds: Vec<u128> = candidates
+            .iter()
+            .map(|&cfg| {
+                let ker =
+                    Kernel::new("gemm_nt", cfg.grid_dims(m, n), cfg.threads(caps.wave_size), placeholders(), caps);
+                crate::kernel_fingerprint(&build(&ker, cfg)).digest
+            })
+            .collect();
+        let shape = [m, k, n, dtype.bytes(), epi.code()];
+        let key = crate::tune::TuneKey::new("gemm_nt", spec, arch, &shape, &builds);
+        let compile = |i: usize| {
+            let cfg = candidates[i];
+            let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
+            let (x, w) = (operand(&[m, k])?, operand(&[n, k])?);
+            let mut ins = vec![x, w];
+            if let Epilogue::Add(()) = epi {
+                ins.push(operand(&[m, cols])?);
+            }
+            let ins: Vec<&Tensor> = ins.iter().collect();
+            let mut y = Tensor::empty(&[m, cols], dtype.clone()).to(spec.clone());
+            let (grid, block) = (cfg.grid_dims(m, n), cfg.threads(caps.wave_size));
+            crate::launch::compile_kernel("gemm_nt_tune", grid, block, &mut [&mut y], &ins, move |ker| build(ker, cfg))
+                .ok()
+        };
+        store.select(&key, candidates.len(), compile).map(|i| candidates[i]).or_else(fallback)
+    }
+
+    /// The gate/up row-block width an [`Epilogue::SwiGlu`] fused weight must be
+    /// laid out in: `reg_n/2` — half a wave's N tile, the two halves its
+    /// accumulator holds side by side — common to every tile in the table, or
+    /// `None` when they disagree or the table is empty (the caller then keeps a
+    /// separate SwiGLU pass). The GEMM's `M` is not known when the weight is
+    /// loaded, and `M` is what picks the tile, so the row arrangement has to be
+    /// one that **every** candidate tile reads.
+    pub fn swiglu_pair_width(&self) -> Option<usize> {
+        let pair = self.tiles.first()?.reg_n() / 2;
+        self.tiles.iter().all(|cfg| cfg.reg_n() / 2 == pair).then_some(pair)
+    }
 }
 
-/// [`GemmPolicy::cfg`] for the default (28-SM) policy — the device-free predicate
-/// the applicability tests and [`gemm_nt`]'s docs are written against.
+/// [`GemmPolicy::swiglu_pair_width`] for the device behind `spec` — `None` off
+/// the supported arches, where the weight stays plainly stacked. The row order
+/// is fixed when the weight is loaded, so a model loaded on the host and moved
+/// to a GPU afterwards keeps the plain stacking (and the separate SwiGLU pass).
+pub fn swiglu_pair_width(spec: &svod_dtype::DeviceSpec) -> Option<usize> {
+    let arch = crate::target::resolve_supported_arch(spec, GEMM_NT_SUPPORTED_ARCHS).ok()?;
+    GemmPolicy::for_arch(arch).swiglu_pair_width()
+}
+
+/// [`GemmPolicy::cfg`] for the CUDA table on its measured 28-SM part — the
+/// device-free predicate the applicability tests and [`gemm_nt`]'s docs are
+/// written against.
 pub fn select_cfg(m: usize, k: usize, n: usize) -> Option<GemmCfg> {
-    GemmPolicy::default().cfg(m, k, n)
+    GemmPolicy::for_arch(svod_dtype::GpuArch::Cuda(svod_dtype::CudaArch::from_compute_capability(8, 6))).cfg(m, k, n)
 }
 
 /// **Graph-native** `y[M, N] = x[M, K] · w[N, K]ᵀ` — the linear-layer GEMM, the
@@ -673,11 +864,16 @@ pub fn select_cfg(m: usize, k: usize, n: usize) -> Option<GemmCfg> {
 ///
 /// The outcome is three-way (via [`crate::launch_custom`]):
 ///
-/// - `Ok(None)` — *doesn't apply here:* the device is not CUDA sm_80+ with its
-///   LLVM backend ([`GEMM_NT_SUPPORTED_ARCHS`]), **or** no tile covers the shape
-///   ([`select_cfg`]): `M` and `N` must be multiples of 64, `K` a multiple of the
-///   32-wide strip and at least 64 (two strips, one per pipeline stage). The
-///   caller pads to 128 or substitutes `Tensor::linear`.
+/// - `Ok(None)` — *doesn't apply here:* the device is not one of
+///   [`GEMM_NT_SUPPORTED_ARCHS`] with its LLVM backend, **or** no tile of its
+///   table covers the shape ([`GemmPolicy::cfg`]): `M` and `N` must be multiples
+///   of 64, `K` a multiple of the 32-wide strip and at least 64 (two strips, one
+///   per pipeline stage). The caller pads to 128 or substitutes `Tensor::linear`.
+///
+/// The tile is the one measured fastest on this device for the shape
+/// ([`GemmPolicy::tuned`]): the first request of a shape times every candidate
+/// once and caches the winner on disk ([`crate::tune`]); `SVOD_TK_TUNE=0` keeps
+/// the table's static choice instead.
 /// - `Err` — *malformed request:* a symbolic dim, `x` below rank 2 or `w` not
 ///   rank 2, a dtype outside {bf16, f16}, a dtype mismatch between `x` and `w`,
 ///   or `w`'s K disagreeing with `x`'s.
@@ -704,7 +900,7 @@ pub fn gemm_nt_with(
     w: &Tensor,
     cfg: impl Fn(usize, usize, usize) -> Option<GemmCfg> + Copy,
 ) -> crate::LaunchResult<Option<Tensor>> {
-    build_gemm(x, w, Epilogue::Plain, cfg)
+    build_gemm(x, w, Epilogue::Plain, move |_, m, k, n| cfg(m, k, n))
 }
 
 /// [`gemm_nt`] with `epilogue` folded into its store, so the fused value is the
@@ -722,7 +918,8 @@ pub fn gemm_nt_with(
 ///
 /// - `Ok(None)` — the selected tile cannot carry the epilogue: split-K (its
 ///   store is f32 partials), or, for SwiGLU, a tile whose `reg_n/2` is not the
-///   `pair` width the weight rows were arranged in (see [`swiglu_pair_width`]).
+///   `pair` width the weight rows were arranged in (see
+///   [`GemmPolicy::swiglu_pair_width`]).
 /// - `Err` — a `residual` whose shape or dtype is not `y`'s, or a SwiGLU `pair`
 ///   that does not divide `N/2`.
 pub fn gemm_nt_with_epilogue(
@@ -730,8 +927,15 @@ pub fn gemm_nt_with_epilogue(
     w: &Tensor,
     epilogue: Epilogue<&Tensor>,
 ) -> crate::LaunchResult<Option<Tensor>> {
-    let policy = GemmPolicy::for_device(&x.device());
-    build_gemm(x, w, epilogue, move |m, k, n| policy.cfg(m, k, n))
+    let (spec, dtype, kind) = (x.device(), x.uop().dtype(), epilogue.kind());
+    build_gemm(x, w, epilogue, |arch, m, k, n| {
+        let policy = GemmPolicy::for_device(&spec, arch);
+        if !crate::tune::enabled() {
+            let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator);
+            return policy.cfg(m, k, n).filter(|c| c.carries(kind, frag.map(|f| f.base.cols)));
+        }
+        policy.tuned(crate::tune::TuneStore::global(), &spec, arch, &dtype, (m, k, n), kind)
+    })
 }
 
 /// The shared launcher body of the three entries above.
@@ -739,7 +943,7 @@ fn build_gemm(
     x: &Tensor,
     w: &Tensor,
     epi: Epilogue<&Tensor>,
-    cfg: impl Fn(usize, usize, usize) -> Option<GemmCfg> + Copy,
+    cfg: impl Fn(svod_dtype::GpuArch, usize, usize, usize) -> Option<GemmCfg> + Copy,
 ) -> crate::LaunchResult<Option<Tensor>> {
     let xd = crate::launch::concrete_dims_at_least(x, "gemm-nt", "x", 2)?;
     let wd = crate::launch::concrete_dims(w, "gemm-nt", "w", 2)?;
@@ -810,11 +1014,11 @@ fn build_gemm(
         },
         move |arch| {
             let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator);
-            cfg(m, k, n).is_some_and(|c| c.carries(kind, frag.map(|f| f.base.cols)))
+            cfg(arch, m, k, n).is_some_and(|c| c.carries(kind, frag.map(|f| f.base.cols)))
         },
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
-            let cfg = cfg(m, k, n).expect("checked by the tiling predicate");
+            let cfg = cfg(arch, m, k, n).expect("checked by the tiling predicate");
             let (grid, block) = (cfg.grid_dims(m, n), cfg.threads(caps.wave_size));
             let (in_dt, split) = (dtype.clone(), cfg.split_k);
             let out_dt = if split > 1 { DType::Float32 } else { dtype.clone() };
@@ -1049,7 +1253,8 @@ pub fn cfg_for_arch(arch: svod_dtype::GpuArch, n: usize) -> MatmulCfg {
 /// gfx1151 (RDNA3.5 WMMA, wave32 — the `_W32_*` fragment shapes) and CUDA sm_80+
 /// (`mma.sync.m16n8k16`, warp32 — the two-half `RT_16X16_MMA` fragment). The
 /// launcher gates against this; see [`crate::target::check_target`]. Validated on
-/// gfx942 (CDNA3), gfx1151 (RDNA3.5) and sm_86 (Ampere).
+/// gfx942 (CDNA3), gfx1151 (RDNA3.5) and sm_86 (Ampere) — gfx942 before the
+/// vector LDS gathers (PR #177), not re-run since.
 pub const MATMUL_SUPPORTED_ARCHS: crate::ArchSet =
     crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151])
         .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0))

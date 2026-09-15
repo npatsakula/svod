@@ -17,6 +17,8 @@ mod embed;
 mod embedder;
 mod error;
 mod feed_forward;
+#[cfg(test)]
+pub(crate) use feed_forward::pair_rows;
 mod jit;
 mod linear;
 mod model;

@@ -3,7 +3,7 @@
 //! broadcast apply) on transformer row shapes. See [`common`] for device-time
 //! stamping and self-skip.
 //!
-//! Run: `SVOD_DEVICE=CUDA:0 cargo bench -p svod-tk --bench norm`
+//! Run: `SVOD_DEVICE={CUDA,AMD}:0 cargo bench -p svod-tk --bench norm`
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use svod_tensor::nn::{Layer, RmsNorm};

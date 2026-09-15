@@ -101,10 +101,14 @@ fn add_war_barrier(ctx: &mut BarrierContext, end: &Arc<UOp>) -> Option<Arc<UOp>>
     }
 
     // Only a loop body that stores to local memory pays for the ordered walk:
-    // BARRIER sources keep the loads in `backward_slice_with_self` order.
+    // BARRIER sources keep the loads in `backward_slice_with_self` order. A load
+    // outside the loop's scope (reached through an ordering edge, as a gather the
+    // fill of a double buffer is threaded after) is not re-run against the loop's
+    // stores, so it carries no per-iteration hazard; the loop's own END fences it.
     let loads: SmallVec<[Arc<UOp>; 4]> = computation
         .toposort()
         .iter()
+        .filter(|uop| uop.in_scope_ranges().iter().any(|id| loop_range_ids.contains(id)))
         .filter(|uop| match uop.op() {
             Op::Load(ops::Load { index, .. }) => {
                 access_buffer(index).is_some_and(|buffer| store_buffers.contains(&UOpKey(buffer)))

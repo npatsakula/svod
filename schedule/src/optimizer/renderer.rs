@@ -203,6 +203,23 @@ impl Renderer {
         }
     }
 
+    /// Bytes one vector global access may move on this target: 16 on the LLVM GPU
+    /// targets, whose `<8 x half>` load is one `global_load_dwordx4` /
+    /// `ld.global.v4.b32`; 8 for a 16-bit type elsewhere, where the source
+    /// languages stop at four lanes. Read by the late memory coalescing.
+    pub fn access_bytes(&self) -> usize {
+        match self.device {
+            RendererDevice::AmdRdna3
+            | RendererDevice::AmdRdna4
+            | RendererDevice::AmdCdna3
+            | RendererDevice::AmdCdna4
+            | RendererDevice::CudaSm75
+            | RendererDevice::CudaSm80
+            | RendererDevice::CudaSm89 => 16,
+            RendererDevice::Cpu | RendererDevice::Metal | RendererDevice::IntelXe | RendererDevice::WebGpu => 8,
+        }
+    }
+
     /// How the hand heuristic sizes the per-warp output tile once a tensor core
     /// has landed.
     ///

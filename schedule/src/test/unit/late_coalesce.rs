@@ -241,6 +241,20 @@ fn coalescing_groups_scalar_loads_by_run(sink: Arc<UOp>, renderer: Renderer, gro
     assert_eq!(shrink_count(&result), shrinks, "{}", result.tree());
 }
 
+/// The widest fold is a 16-byte access on the LLVM GPU targets — eight 16-bit
+/// lanes, four f32 — and four lanes where the source language stops there.
+#[test_case(ScalarDType::BFloat16, Renderer::amd_rdna3(), vec![8]; "eight bf16 lanes are one access on RDNA")]
+#[test_case(ScalarDType::Float16, Renderer::cuda_sm80(false), vec![8]; "eight f16 lanes are one access on CUDA")]
+#[test_case(ScalarDType::Float32, Renderer::amd_rdna3(), vec![4, 4]; "f32 stays at four lanes")]
+#[test_case(ScalarDType::BFloat16, Renderer::metal(), vec![4, 4]; "MSL stops at four lanes")]
+#[test_case(ScalarDType::BFloat16, Renderer::cpu(), vec![4, 4]; "the host keeps four lanes")]
+fn the_widest_fold_is_the_target_access_width(scalar: ScalarDType, renderer: Renderer, widths: Vec<usize>) {
+    let buffer = UOp::param(0, 16, DType::Scalar(scalar), None);
+    let accesses = (0..8).map(|offset| load_at(&buffer, UOp::index_const(offset))).collect();
+    let result = memory_coalescing(UOp::sink(accesses), &renderer);
+    assert_eq!(group_layout(&result), (widths, vec![]), "{}", result.tree());
+}
+
 /// Only the allowlisted element types are grouped; everything else stays scalar.
 #[test_case(ScalarDType::Float16, 1 ; "float16 folds")]
 #[test_case(ScalarDType::BFloat16, 1 ; "bfloat16 folds")]

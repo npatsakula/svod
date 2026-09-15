@@ -1319,6 +1319,11 @@ fn qk_pv_chain_contract() {
         eprintln!("skip qk_pv_chain_contract: no fragment device");
         return;
     };
+    // The handoff under test is the register copy; RDNA relayouts through LDS.
+    if !caps.acc_reusable_as_input() {
+        eprintln!("skip qk_pv_chain_contract: the accumulator is not an operand fragment on this arch");
+        return;
+    }
     let (kv, q, d) = (16usize, 16usize, 16usize);
     let dt = DType::BFloat16;
     let bdt = dt.clone();
@@ -1394,6 +1399,11 @@ fn fa_output_store_contract() {
         eprintln!("skip fa_output_store_contract: no fragment device");
         return;
     };
+    // The handoff under test is the register copy; RDNA relayouts through LDS.
+    if !caps.acc_reusable_as_input() {
+        eprintln!("skip fa_output_store_contract: the accumulator is not an operand fragment on this arch");
+        return;
+    }
     let (kv, q, d) = (16usize, 16usize, 16usize);
     let dt = DType::BFloat16;
     let bdt = dt.clone();

@@ -196,6 +196,42 @@ pub fn load_off(buf: &Arc<UOp>, offset: Arc<UOp>) -> Arc<UOp> {
     UOp::load().index(idx).call()
 }
 
+/// `[off, off+1, …, off+w-1]` as one shaped index: the `w` consecutive elements
+/// the late coalescing folds into one vector access.
+fn spread(off: &Arc<UOp>, w: usize) -> Arc<UOp> {
+    UOp::stack(
+        (0..w as i64).map(|l| if l == 0 { off.clone() } else { off.try_add(&cidx(l)).expect("spread") }).collect(),
+    )
+}
+
+/// A `w`-wide LOAD of the consecutive elements at flat `off` — one shaped access
+/// (a scalar LOAD at `w = 1`).
+pub fn load_off_vec(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize) -> Arc<UOp> {
+    if w == 1 {
+        return load_off(buf, off.clone());
+    }
+    let idx = UOp::index().buffer(buf.clone()).indices(vec![spread(off, w)]).call().expect("vector load INDEX");
+    UOp::load().index(idx).call()
+}
+
+/// Element `j` of a [`load_off_vec`] result.
+pub fn vec_elem(v: &Arc<UOp>, j: usize, w: usize) -> Arc<UOp> {
+    if w == 1 { v.clone() } else { v.index_axes(vec![j]) }
+}
+
+/// A `vals.len()`-wide STORE of consecutive elements at flat `off`.
+pub fn store_off_vec(buf: &Arc<UOp>, off: &Arc<UOp>, vals: Vec<Arc<UOp>>) -> Arc<UOp> {
+    if vals.len() == 1 {
+        return index_off(buf, off.clone()).store(vals.into_iter().next().expect("one value"));
+    }
+    UOp::index()
+        .buffer(buf.clone())
+        .indices(vec![spread(off, vals.len())])
+        .call()
+        .expect("vector store INDEX")
+        .store(UOp::stack(vals.into_iter().collect()))
+}
+
 /// Validity-encoded INDEX at a flat `offset`: a STORE through it writes only when
 /// `gate` is true (out-of-bounds writes are dropped) — the masked-store form.
 pub fn index_off_gated(buf: &Arc<UOp>, offset: Arc<UOp>, gate: Arc<UOp>) -> Arc<UOp> {

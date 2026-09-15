@@ -1990,6 +1990,9 @@ fn beam_search_optimize(
     };
 
     let dev_runtime = device.runtime.clone();
+    // The first candidate lifts the clock for the search; the rest run under
+    // its load.
+    let cold = std::cell::Cell::new(true);
     let benchmark = |candidate: &CompiledBeamProgram, early_stop: Option<Duration>| -> Option<Duration> {
         use std::panic::{AssertUnwindSafe, catch_unwind};
         match catch_unwind(AssertUnwindSafe(|| {
@@ -2027,6 +2030,7 @@ fn beam_search_optimize(
             let factor = if shrunk_size > 0 { original_size as f64 / shrunk_size as f64 } else { 1.0 };
 
             let mut config = bench_config.clone();
+            config.warmup_budget = cold.replace(false).then_some(svod_runtime::benchmark::CLOCK_WARMUP);
             config.early_stop = early_stop
                 .map(|timing| Duration::from_nanos((timing.as_nanos() as f64 / factor).min(u64::MAX as f64) as u64));
             config.clear_l2 = renderer.device.has_hardware_cache_invalidate();

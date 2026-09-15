@@ -22,6 +22,7 @@ const EPS: f64 = 1e-6;
 /// Whether the env-selected device is one the prologue is built for, with its
 /// LLVM backend present — the self-skip gate for the `#[ignore]`d HW tests.
 fn device_supported() -> bool {
+    svod_tk::tune::set_enabled(false);
     let spec = Tensor::empty(&[1], DType::Float32).device();
     svod_tk::target::check_target(&spec, NORM_SUPPORTED_ARCHS).is_ok()
 }

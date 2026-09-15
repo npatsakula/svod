@@ -61,6 +61,7 @@ pub mod swizzle;
 pub mod target;
 pub mod tile;
 pub mod tiles;
+pub mod tune;
 
 /// Threads per warp/wave the **register-tile fragment-layout tables**
 /// ([`tiles`] strides, [`group`]'s per-lane WMMA upcast counts) are calibrated
