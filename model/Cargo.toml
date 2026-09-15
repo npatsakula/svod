@@ -22,7 +22,7 @@ svod-tensor = { path = "../tensor", version = "=0.1.0-alpha.7" }
 svod-tk = { path = "../tk", version = "=0.1.0-alpha.7" }
 ndarray.workspace = true
 prost = "0.14.3"
-nom = "7.1"
+nom = "8.0"
 repugnant-pickle = { version = "0.0.1", features = ["torch"] }
 safetensors = "0.8"
 zip = { version = "8", default-features = false }
