@@ -15,7 +15,7 @@ use crate::optimizer::heuristics::{
     try_warp_row_reduction,
 };
 use crate::optimizer::renderer::TcTilePolicy;
-use crate::optimizer::{Opt, OptArg, OptOps, Renderer, Scheduler, apply_opt};
+use crate::optimizer::{Opt, OptArg, OptArgExt, OptOps, Renderer, Scheduler, apply_opt};
 use crate::test::support::prelude::*;
 use crate::test::unit::optimizer::kernels::{
     Ranged, matmul_accum, matmul_with, plus, row_major, row_reduce, times, two_n_matmul,
@@ -321,6 +321,27 @@ fn try_tensor_cores_default_matches_strict_on_plain_matmul() {
     };
     assert_eq!(HeuristicsConfig::default().tc_opt, TcOpt::Padded);
     assert_eq!(plan(TcOpt::default()), plan(TcOpt::Strict));
+}
+
+/// A 40-wide spatial axis misses CUDA's 16-side but divides the 8-side: the padding
+/// levels take the operands the other way round instead of padding 40 to 48, and pad
+/// only when no assignment divides.
+#[test_case(40, 64, TcOpt::Padded, 1, 0; "padded prefers the unpadded side")]
+#[test_case(40, 64, TcOpt::Unbounded, 1, 0; "unbounded prefers the unpadded side")]
+#[test_case(20, 64, TcOpt::Padded, 2, 2; "pads when neither side divides")]
+fn try_tensor_cores_pads_only_when_no_axis_choice_divides(m: i64, n: i64, tc_opt: TcOpt, level: usize, masks: usize) {
+    let (applied, scheduler) = run(
+        conv_like_weak(m, n, 64, 3),
+        Renderer::cuda(),
+        &HeuristicsConfig::builder().tc_opt(tc_opt).build(),
+        try_tensor_cores,
+    );
+    assert!(applied);
+    let tc = scheduler.applied_opts.iter().find(|opt| opt.op == OptOps::TC).expect("TC opt recorded");
+    let (_, opt_level, _) = tc.arg.tc().expect("tensor-core arg");
+    assert_eq!(opt_level, level, "the recorded level is the one that applied the choice");
+    let where_count = count(scheduler.ast(), |node| matches!(node.op(), Op::Ternary(svod_ir::TernaryOp::Where, ..)));
+    assert_eq!(where_count, masks, "an unpadded choice carries no padding mask");
 }
 
 /// Two N axes, a bad one first: `Metal`'s retry must commit the axis choice that divides.

@@ -203,3 +203,37 @@ proptest! {
         prop_assert!(fed, "accumulator init must take exactly the non-reduce RANGEs, wanted {expected:?}");
     }
 }
+/// A STAGE's fill ranges are closed by `pm_add_local_buffers`; counting one as an input range sequences the
+/// accumulator's init inside the fill loop and so inside every enclosing reduce loop, which re-zeroes it.
+#[test]
+fn a_staged_fill_range_is_not_an_accumulator_input_range() {
+    let reduce_rng = reduce_range(16, 9);
+    let open = range(8, AxisType::Global, 0);
+    let pass = range(4, AxisType::Loop, 1);
+    let tile = stage_with(
+        load(index_of(param(0, 1024, DType::Float32), pass.clone())),
+        vec![pass.clone()],
+        svod_ir::BufferizeOpts::local(),
+    );
+    let src = load(index_of(tile, reduce_rng.clone())).add(&open.cast(DType::Float32));
+    let result = apply_pm_reduce(&reduce(src, vec![reduce_rng], ReduceOp::Add));
+
+    assert!(!matches!(result.op(), Op::Reduce(..)));
+    assert_eq!(regs(&result), 1, "one reduce range, one accumulator");
+    for node in result.toposort() {
+        let Op::After(ops::After { passthrough, deps }) = node.op() else { continue };
+        assert!(
+            passthrough.addrspace() != Some(AddrSpace::Reg) || !deps.iter().any(|dep| dep.id == pass.id),
+            "the accumulator must not be sequenced after the fill's pass loop:\n{}",
+            result.tree()
+        );
+    }
+    let expected: BTreeSet<u64> = [open.id].into_iter().collect();
+    assert!(
+        result.toposort().into_iter().any(|node| matches!(node.op(),
+            Op::After(ops::After { passthrough, deps })
+                if passthrough.addrspace() == Some(AddrSpace::Reg)
+                    && deps.iter().map(|dep| dep.id).collect::<BTreeSet<_>>() == expected)),
+        "the init still takes the genuinely open RANGEs, wanted {expected:?}"
+    );
+}

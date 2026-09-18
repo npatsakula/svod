@@ -13,3 +13,4 @@ mod parity;
 mod pose;
 mod segment;
 mod semseg;
+mod weight_layout;

@@ -143,7 +143,9 @@ impl ClsBranch {
         let x = scoped("0.0", || self.dw0.forward(x))?;
         let x = scoped("0.1", || self.conv0.forward(&x))?;
         let x = scoped("1.0", || self.dw1.forward(&x))?;
-        let x = scoped("1.1", || self.conv1.forward(&x))?;
+        // The logits conv ends its own kernel: fused into the 1x1 before it, the
+        // two reduces nest and the pair runs without a tensor core.
+        let x = scoped("1.1", || self.conv1.forward(&x))?.contiguous();
         Ok(scoped("2", || self.conv2.forward(&x))?)
     }
 }

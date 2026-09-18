@@ -74,12 +74,20 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
     in1_ranges.sort_by_key(|r| std::cmp::Reverse(get_axis_id(r)));
     red_ranges.sort_by_key(|r| std::cmp::Reverse(get_axis_id(r)));
 
-    // Generate all axis choices (N, M, K) using explicit loops to avoid closure ownership issues
-    let mut axis_choices = Vec::with_capacity(in1_ranges.len() * in0_ranges.len() * red_ranges.len());
-    for n in &in1_ranges {
-        for m in &in0_ranges {
-            for k in &red_ranges {
-                axis_choices.push((n.clone(), m.clone(), k.clone()));
+    // Every (N, M, K) with N drawn from in1 and M from in0, as tinygrad orders
+    // them, then the same with the operands' roles exchanged. The core's N and
+    // M tiles differ (8 and 16 on CUDA), so which operand takes which side
+    // decides what a non-divisible axis pads to: a conv's 20-wide spatial axis
+    // pads to 32 on the M side and to 24 on the N side. Applying a swapped
+    // choice commutes the MUL so the WMMA's A operand still carries M.
+    let sides = [(&in1_ranges, &in0_ranges), (&in0_ranges, &in1_ranges)];
+    let mut axis_choices = Vec::with_capacity(2 * in1_ranges.len() * in0_ranges.len() * red_ranges.len());
+    for (ns, ms) in sides {
+        for n in ns {
+            for m in ms {
+                for k in &red_ranges {
+                    axis_choices.push((n.clone(), m.clone(), k.clone()));
+                }
             }
         }
     }
@@ -361,6 +369,22 @@ fn apply_axis_choice_impl(
     // Clone the TensorCore to avoid borrow conflicts when applying PADTO
     let tc = scheduler.ren.tensor_cores[tc_selection.tc_index].clone();
     let (n_range, m_range, k_range) = &tc_selection.axes;
+
+    // A choice that takes N from in0 wants the operands the other way round:
+    // the WMMA below reads A from the MUL's first source and B from its second,
+    // and each has its own fragment layout.
+    if pattern.in0_ranges.iter().any(|r| Arc::ptr_eq(r, n_range)) {
+        let reduce =
+            scheduler.reduceop().ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "REDUCE missing" }.build())?;
+        let Op::Reduce(svod_ir::ops::Reduce { src, .. }) = reduce.op() else { unreachable!() };
+        let mul = src.unwrap_cast();
+        let Op::Binary(BinaryOp::Mul, a, b) = mul.op() else {
+            return ValidationFailedSnafu { op: "TC", reason: "expected MUL inside REDUCE" }.fail();
+        };
+        let commuted = mul.with_sources(vec![b.clone(), a.clone()]);
+        let new_ast = scheduler.ast().substitute(&HashMap::from([(UOpKey(mul.clone()), commuted)]));
+        scheduler.set_ast(new_ast);
+    }
     // Mutable axes array - may be updated after PADTO
     let mut axes = [n_range.clone(), m_range.clone(), k_range.clone()];
 
@@ -683,6 +707,21 @@ pub fn apply_with_axis_choice(
 
     let pattern = detect_matmul(scheduler)?
         .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "no matmul pattern detected" }.build())?;
+
+    // A tensor core splits M and N into warp, local and upcast fragments. An
+    // output axis a downstream REDUCE still sums over (`min_over_K(x @ cᵀ)`, a
+    // 1x1 conv fused into the conv it feeds) is then only partly summed: each
+    // lane keeps its own fragment columns and the group's lanes race onto one
+    // element, or the shared loop closes twice (an invalid LLVM phi). The
+    // generic reduce path takes the fused kernel, whoever asks for the core.
+    if pattern
+        .in0_ranges
+        .iter()
+        .chain(&pattern.in1_ranges)
+        .any(|r| matches!(r.op(), Op::Range(svod_ir::ops::Range { axis_type: AxisType::Reduce, .. })))
+    {
+        return ValidationFailedSnafu { op: "TC", reason: "a matmul output axis is a reduce axis" }.fail();
+    }
 
     let choices: Vec<usize> = if let Some(choice) = axis_choice {
         if choice >= pattern.axis_choices.len() {

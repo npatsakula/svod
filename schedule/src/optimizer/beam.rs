@@ -84,10 +84,13 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
     actions.push(Opt::local(0, 32));
     actions.push(Opt::local(6, 2));
 
-    // TC: tensor cores. 1 default-axis action + 9 axis variants = 10 actions.
-    // Survivors after post-compile dedup are unchanged compared to a wider
-    // brute-force enumeration because `seen_libs` collapses duplicate kernels.
-    const TC_AXIS_CHOICES: usize = 9;
+    // TC: tensor cores. 1 default-axis action + 18 axis variants = 19 actions.
+    // `detect_matmul` lists every (N, M, K) with the operands one way round and
+    // then the other; a conv with two spatial axes and a three-axis reduce has
+    // twelve. Survivors after post-compile dedup are unchanged compared to a
+    // wider brute-force enumeration because `seen_libs` collapses duplicate
+    // kernels, and an out-of-range choice fails in `apply_opt` at no cost.
+    const TC_AXIS_CHOICES: usize = 18;
     const TC_OPT_DEFAULT: usize = 0;
     const TC_OPT_AXIS: usize = 2;
     let use_tc = std::env::var("TC").ok().and_then(|value| value.parse().ok()).unwrap_or(1);
@@ -274,15 +277,27 @@ fn generate_actions(scheduler: &Scheduler, config: &BeamConfig) -> Vec<Scheduler
     out
 }
 
-/// The hand-coded kernel, as a first-wave BEAM candidate.
+/// The hand-coded kernel, timed with the first BEAM wave and held against the
+/// search's answer.
 ///
 /// Greedy width-K expansion prunes a lineage whose single actions each lose,
 /// so a multi-opt heuristic stack (e.g. the matvec GROUP+LOCAL+UPCAST+UNROLL
-/// one) is unreachable from the bare scheduler. Timing it alongside the first
-/// wave makes the search's answer never worse than the heuristic one.
+/// one) is unreachable from the bare scheduler. Timing it makes the search's
+/// answer never worse than the heuristic one. It does not join the beam: a
+/// complete plan outruns every single action in the first wave, its children
+/// fill the second, and the search then ends as soon as nothing beats it, so
+/// at width 4 a 40x40 stride-2 conv stayed on the heuristics' padded 2.0 ms
+/// tile where the same search without the seed reached 1.2 ms. Held aside,
+/// the seed can still win but cannot steer.
 ///
-/// `None` when the heuristics add nothing or land outside the search's limits.
+/// `None` when the heuristics add nothing or land outside the search's limits,
+/// or under `BEAM_SEED=0`, which measures what the seed is worth.
 fn heuristic_seed(scheduler: &Scheduler, config: &BeamConfig) -> Option<Scheduler> {
+    static ENABLED: Lazy<bool> =
+        Lazy::new(|| std::env::var("BEAM_SEED").ok().map(|value| value.parse::<u8>().unwrap_or(1) > 0).unwrap_or(true));
+    if !*ENABLED {
+        return None;
+    }
     let mut seed = scheduler.clone();
     super::heuristics::hand_coded_optimizations(&mut seed, &HeuristicsConfig::from_env());
     (seed.applied_opts != scheduler.applied_opts && validate_limits(&seed, config)).then_some(seed)
@@ -290,10 +305,33 @@ fn heuristic_seed(scheduler: &Scheduler, config: &BeamConfig) -> Option<Schedule
 
 /// Under `BEAM_DEBUG`, report once whether the [`heuristic_seed`] survived
 /// compilation and how its timing compares to the wave's winner.
-fn debug_seed_fate(seed: &mut Option<Vec<Opt>>, timed: &[(Scheduler, Duration)]) {
-    let Some(opts) = seed.take().filter(|_| beam_debug_enabled()) else { return };
+fn debug_seed_fate(seed: Option<&[Opt]>, first_wave: bool, timed: &[(Scheduler, Duration)]) {
+    let Some(opts) = seed.filter(|_| first_wave && beam_debug_enabled()) else { return };
     let timing = timed.iter().find(|(state, _)| state.applied_opts == opts).map(|(_, timing)| *timing);
     eprintln!("[beam] seed {opts:?}: timing={timing:?} wave best={:?}", timed.first().map(|(_, timing)| *timing));
+}
+
+/// The faster of the search's answer and the [`heuristic_seed`], if it was timed.
+fn better(
+    searched: Option<(Scheduler, Duration)>,
+    seed: Option<(Scheduler, Duration)>,
+) -> Option<(Scheduler, Duration)> {
+    match (searched, seed) {
+        (Some(searched), Some(seed)) => Some(if seed.1 < searched.1 { seed } else { searched }),
+        (searched, seed) => searched.or(seed),
+    }
+}
+
+/// Pull the seed's timing out of the first wave, so it competes at the end
+/// rather than in the beam.
+fn hold_seed(
+    timed: &mut Vec<(Scheduler, Duration)>,
+    seed: Option<&[Opt]>,
+    first_wave: bool,
+) -> Option<(Scheduler, Duration)> {
+    let seed = seed.filter(|_| first_wave)?;
+    let at = timed.iter().position(|(state, _)| state.applied_opts == seed)?;
+    Some(timed.remove(at))
 }
 
 /// Validate that a scheduler state is within configured limits.
@@ -509,7 +547,8 @@ where
     // invocation (also charged on cache replay through `OPT_CACHE`).
     let mut beam: Vec<(Scheduler, Duration)> = vec![(scheduler.clone(), Duration::MAX)];
     let mut seed = heuristic_seed(&scheduler, config);
-    let mut seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
+    let seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
+    let mut held_seed = None;
 
     // `seen_libs` and `least_compute_ops` persist across the entire beam
     // search. Identity-keyed dedup carries across iterations, so a kernel
@@ -592,7 +631,13 @@ where
         // 3. SORT: Sort by timing (best first)
         let mut sorted = timed;
         sorted.sort_by_key(|(_, t)| *t);
-        debug_seed_fate(&mut seed_opts, &sorted);
+        debug_seed_fate(seed_opts.as_deref(), iterations == 1, &sorted);
+        if let Some(seed) = hold_seed(&mut sorted, seed_opts.as_deref(), iterations == 1) {
+            held_seed = Some(seed);
+        }
+        if sorted.is_empty() {
+            break;
+        }
 
         // 4. CHECK TERMINATION — exit when the new best is already below
         //    the progress floor (fast-enough kernel) OR when the gain over
@@ -617,7 +662,8 @@ where
         beam = sorted.into_iter().take(config.beam_width).collect();
     }
 
-    let (best_scheduler, best_timing) = beam.into_iter().next().unwrap_or((scheduler, Duration::MAX));
+    let (best_scheduler, best_timing) =
+        better(beam.into_iter().next(), held_seed).unwrap_or((scheduler, Duration::MAX));
 
     Ok(BeamResult {
         scheduler: best_scheduler,
@@ -663,7 +709,8 @@ where
     };
     let mut beam = vec![(scheduler.clone(), Duration::MAX)];
     let mut seed = heuristic_seed(&scheduler, config);
-    let mut seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
+    let seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
+    let mut held_seed = None;
     let mut seen_binary = std::collections::HashSet::new();
 
     loop {
@@ -715,7 +762,13 @@ where
         }
 
         timed.sort_by_key(|(_, timing)| *timing);
-        debug_seed_fate(&mut seed_opts, &timed);
+        debug_seed_fate(seed_opts.as_deref(), result.iterations == 1, &timed);
+        if let Some(seed) = hold_seed(&mut timed, seed_opts.as_deref(), result.iterations == 1) {
+            held_seed = Some(seed);
+        }
+        if timed.is_empty() {
+            break;
+        }
         let best_new = timed[0].1;
         let best_old = beam.first().map(|(_, timing)| *timing).unwrap_or(Duration::MAX);
         let min_progress = Duration::from_nanos(config.min_progress_ns);
@@ -728,7 +781,8 @@ where
         beam = timed.into_iter().take(config.beam_width).collect();
     }
 
-    let (best_scheduler, best_timing) = beam.into_iter().next().unwrap_or((scheduler, Duration::MAX));
+    let (best_scheduler, best_timing) =
+        better(beam.into_iter().next(), held_seed).unwrap_or((scheduler, Duration::MAX));
     result.scheduler = best_scheduler;
     result.timing = best_timing;
     Ok(result)
@@ -760,7 +814,8 @@ where
     };
     let mut beam = vec![(scheduler.clone(), Duration::MAX)];
     let mut seed = heuristic_seed(&scheduler, config);
-    let mut seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
+    let seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
+    let mut held_seed = None;
     let mut seen_binary = std::collections::HashSet::new();
 
     loop {
@@ -807,7 +862,13 @@ where
             break;
         }
         timed.sort_by_key(|(_, timing)| *timing);
-        debug_seed_fate(&mut seed_opts, &timed);
+        debug_seed_fate(seed_opts.as_deref(), result.iterations == 1, &timed);
+        if let Some(seed) = hold_seed(&mut timed, seed_opts.as_deref(), result.iterations == 1) {
+            held_seed = Some(seed);
+        }
+        if timed.is_empty() {
+            break;
+        }
         let best_new = timed[0].1;
         let best_old = beam.first().map(|(_, timing)| *timing).unwrap_or(Duration::MAX);
         let min_progress = Duration::from_nanos(config.min_progress_ns);
@@ -820,7 +881,7 @@ where
         beam = timed.into_iter().take(config.beam_width).collect();
     }
 
-    let (winner, timing) = beam.into_iter().next().unwrap_or((scheduler, Duration::MAX));
+    let (winner, timing) = better(beam.into_iter().next(), held_seed).unwrap_or((scheduler, Duration::MAX));
     result.scheduler = winner;
     result.timing = timing;
     Ok(result)
@@ -956,7 +1017,7 @@ impl CacheKey {
         let ast_hash = hasher.finish();
 
         Self {
-            schema: 11,
+            schema: 12,
             ast_hash,
             beam_width: config.beam_width,
             device: scheduler.ren.device,

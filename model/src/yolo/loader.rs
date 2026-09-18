@@ -80,11 +80,33 @@ pub fn fold_batchnorm(sd: &StateDict) -> Result<StateDict> {
 /// saves fp16 and the converters widen it on the way in, so the f32 on disk
 /// carries no more information than the f16 it came from.
 pub fn load_weights(sd: &StateDict, dtype: &DType) -> Result<StateDict> {
-    let cast = cast_weights(&fold_batchnorm(sd)?, dtype);
-    for tensor in cast.values() {
-        tensor.realize()?;
-    }
-    Ok(cast)
+    cast_weights(&fold_batchnorm(sd)?, dtype)
+        .into_iter()
+        .map(|(key, tensor)| {
+            let tensor = if key.ends_with("weight") && tensor.ndim()? == 4 {
+                channels_innermost(&tensor)?
+            } else {
+                tensor.realize()?;
+                tensor
+            };
+            Ok((key, tensor))
+        })
+        .collect()
+}
+
+/// Store a conv weight channels-innermost (`[cout, kh, kw, cin]`) behind its
+/// `[cout, cin, kh, kw]` view.
+///
+/// A tensor-core fragment pairs consecutive reduce elements, and a conv
+/// reduces over `cin`. With `cin` adjacent in memory each pair is one 32-bit
+/// load; in the checkpoint's layout the pair sits `kh·kw` elements apart and
+/// every element loads on its own, which leaves the 3×3 kernels L1-bound
+/// (backbone.3 of YOLO26x at f16: 1.26 → 0.90 ms at BEAM=4 on an RTX 3060).
+/// Only the layout changes; every consumer still sees `[cout, cin, kh, kw]`.
+pub fn channels_innermost(weight: &Tensor) -> Result<Tensor> {
+    let physical = weight.try_permute(&[0, 2, 3, 1])?.contiguous();
+    physical.realize()?;
+    Ok(physical.try_permute(&[0, 3, 1, 2])?)
 }
 
 /// Bring a freshly built model's placeholder weights to `dtype`.

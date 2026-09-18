@@ -1905,15 +1905,16 @@ fn reduce_to_acc(red: &Arc<UOp>, ctx: &mut ReduceContext) -> Option<Arc<UOp>> {
     let horizontal_inp =
         if *num_axes != 0 { horizontal_reduce(inp, *reduce_op, *num_axes, &out_dtype)? } else { inp.clone() };
 
-    // Find input_ranges: ranges in topo that are not reduce_range and not ended
+    // Find input_ranges: ranges in topo that are not reduce_range and not ended. A STAGE binds
+    // its ranges like an END does (its fill loop is closed by `pm_add_local_buffers`); counting
+    // one as an input would sink the accumulator's init into every enclosing reduce loop.
     let topo = inp.toposort();
-    let ended: HashSet<u64> = topo
-        .iter()
-        .filter_map(|n| {
-            if let Op::End(ops::End { ranges, .. }) = n.op() { Some(ranges.iter().map(|r| r.id)) } else { None }
-        })
-        .flatten()
-        .collect();
+    let mut ended: HashSet<u64> = HashSet::new();
+    for node in &topo {
+        if matches!(node.op(), Op::End(..) | Op::Stage(..)) {
+            ended.extend(node.op().ended_ranges().iter().map(|rng| rng.id));
+        }
+    }
     let reduce_ids: HashSet<u64> = reduce_range.iter().map(|r| r.id).collect();
     let input_ranges: SmallVec<[Arc<UOp>; 4]> = topo
         .iter()

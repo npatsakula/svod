@@ -136,7 +136,7 @@ fn beam_actions_cover_every_opt_kind_in_amount_major_order() {
         padding != 0,
         "PADTO is offered iff BEAM_PADTO is set"
     );
-    assert_eq!(BEAM_ACTIONS.len(), 48 + 15 + 42 + 24 + 12 + 2 + 10 + 10 + 30 + padding, "grid size");
+    assert_eq!(BEAM_ACTIONS.len(), 48 + 15 + 42 + 24 + 12 + 2 + 19 + 10 + 30 + padding, "grid size");
     assert_eq!(BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::THREAD).count(), 30);
     let upcasts: Vec<_> = BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::UPCAST).collect();
     assert_eq!(upcasts.len(), 48);
@@ -148,7 +148,7 @@ fn beam_actions_cover_every_opt_kind_in_amount_major_order() {
     let use_tc = std::env::var("TC").ok().and_then(|value| value.parse().ok()).unwrap_or(1usize);
     let tc_opt = std::env::var("TC_OPT").ok().and_then(|value| value.parse().ok()).unwrap_or(2usize);
     let tensor_cores: Vec<_> = BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::TC).collect();
-    assert_eq!(tensor_cores.len(), 10);
+    assert_eq!(tensor_cores.len(), 19, "a strict default plus eighteen axis choices, both ways round");
     assert_eq!(tensor_cores.iter().filter(|action| action.arg.tc().unwrap().1 == 0).count(), 1);
     assert!(tensor_cores[1..].iter().all(|action| action.arg.tc() == Ok((-1, tc_opt, use_tc))));
 }
@@ -590,6 +590,39 @@ fn beam_search_seeds_the_hand_coded_kernel() {
         1,
         "the seed is timed once, in the first wave"
     );
+}
+
+/// A seed the field cannot beat neither ends the search nor steers it: the beam
+/// keeps improving from the bare kernel for as many waves as it would unseeded,
+/// and the seed wins only at the end.
+#[test]
+fn the_seed_competes_at_the_end_and_never_steers() {
+    let scheduler = matvec_scheduler();
+    let config = BeamConfig { beam_width: 2, disable_cache: true, ..Default::default() };
+    let seed_opts = unreachable_seed(&scheduler, &config);
+    let scored = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let score = {
+        let (seed_opts, scored) = (seed_opts.clone(), std::sync::Arc::clone(&scored));
+        move |candidate: &Scheduler, _early_stop: Option<Duration>| {
+            let opts = &candidate.applied_opts;
+            scored.lock().unwrap().push(opts.clone());
+            // The seed is far ahead; every other plan improves on its parent a little.
+            let timing = if *opts == seed_opts { 100 } else { 100_000 - 20 * opts.len() as u64 };
+            Some(CandidateMetrics {
+                timing: Duration::from_nanos(timing),
+                ir_hash: plan_identity(opts),
+                compute_ops: Some(1),
+            })
+        }
+    };
+    let result = beam_search(scheduler.clone(), &config, score).expect("beam search");
+    assert_eq!(result.scheduler.applied_opts, seed_opts, "the fastest plan still wins");
+    assert_eq!(result.timing, Duration::from_nanos(100));
+    let scored = scored.lock().unwrap();
+    assert!(!scored.iter().any(|opts| opts.len() > seed_opts.len() && opts.starts_with(&seed_opts)), "never expanded");
+    let deepest = scored.iter().filter(|opts| **opts != seed_opts).map(Vec::len).max().unwrap_or(0);
+    assert!(deepest >= 3, "the search must go on past the seed's wave: deepest plan {deepest}");
+    assert!(result.iterations >= 3, "iterations {}", result.iterations);
 }
 
 /// A seed nobody can use must not divert the search: scoring it slowest leaves the
