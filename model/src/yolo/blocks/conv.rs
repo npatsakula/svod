@@ -135,7 +135,7 @@ impl YoloConv {
                 .conv
                 .weight
                 .dims()
-                .is_ok_and(|d| d.len() == 4 && d[0].is_multiple_of(64) && d[1].is_multiple_of(32) && d[2] * d[3] > 1)
+                .is_ok_and(|d| d.len() == 4 && d[0].is_multiple_of(32) && d[1].is_multiple_of(16) && d[2] * d[3] > 1)
     }
 
     /// Emit `[B, H, W, C]` — the tensor itself, not an NCHW view of it, which is
