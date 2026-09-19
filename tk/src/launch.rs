@@ -288,6 +288,16 @@ impl CompiledLaunch {
         }
     }
 
+    /// What the compiled kernel asks of the hardware: registers per lane, LDS,
+    /// and the scratch (private-segment) bytes that a register spill lands in.
+    /// `None` on a backend with no kernel descriptor to decode (CPU).
+    ///
+    /// This is static — the backend reads it off the compiled program, so a
+    /// candidate can be judged before it is ever timed.
+    pub fn resources(&self) -> Option<svod_device::KernelResources> {
+        self.prog.resource_usage()
+    }
+
     /// Dispatch once through a profiling execution context and return the
     /// **GPU device time** in nanoseconds (`end_ns − start_ns`) from the
     /// HW-stamped dispatch timestamps, or `Ok(None)` when the backend does not

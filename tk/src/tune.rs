@@ -186,12 +186,33 @@ impl TuneStore {
     ) -> Option<usize> {
         self.select_with(key, count, builds, || {
             let launches: Vec<Option<CompiledLaunch>> = (0..count).map(compile).collect();
+            for (i, launch) in launches.iter().enumerate() {
+                let Some(res) = launch.as_ref().and_then(CompiledLaunch::resources) else { continue };
+                tracing::debug!(
+                    kernel = key.kernel,
+                    candidate = i,
+                    vgprs = res.vgprs,
+                    lds = res.lds_bytes,
+                    scratch = res.scratch_bytes,
+                    occupancy = res.occupancy,
+                    "tune: candidate resources"
+                );
+            }
             if let Some(first) = launches.iter().flatten().next() {
                 // SAFETY: the launch's buffers live in `first` for the whole loop.
                 warm_clock(CLOCK_WARMUP, || first.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos));
             }
             let time = |i: usize| launches[i].as_ref()?.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos);
-            round_robin_min(count, ROUNDS, time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
+            let times: Vec<_> = round_robin_min(count, ROUNDS, time);
+            for (i, t) in times.iter().enumerate() {
+                tracing::debug!(
+                    kernel = key.kernel,
+                    candidate = i,
+                    ns = t.map(|t| t.as_nanos() as u64),
+                    "tune: candidate time"
+                );
+            }
+            times.into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
         })
     }
 }

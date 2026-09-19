@@ -22,6 +22,7 @@ use svod_runtime::{ExecutionPlan, ProfileOptions, RunProfile};
 use svod_tensor::Tensor;
 
 /// A realized random bf16 tensor on the env-selected device.
+#[allow(dead_code)]
 pub fn randn_bf16(shape: &[usize]) -> Tensor {
     let t = Tensor::randn(shape).expect("randn").cast(DType::BFloat16);
     t.realize().expect("realize");
