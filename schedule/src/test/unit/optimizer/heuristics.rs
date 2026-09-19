@@ -206,10 +206,14 @@ fn try_tensor_cores_accepts_fused_operands() {
     assert!(has_op(scheduler.ast(), |op| matches!(op, Op::Wmma(..))));
 }
 
-/// A conv-shaped reduce over (channels, taps) takes the tensor core by default:
+/// A conv-shaped reduce over (channels, taps) takes the tensor core by default,
+/// and the axis it puts on K is the one that pads least — at equal padding, the
+/// deeper reduce. The ranges carry taps innermost, so the detection order offers
+/// the taps first; taking them would pad a narrow tap axis to the core's K edge
+/// and leave the channels as a scalar loop.
 #[test_case(64, 5, TcOpt::Relaxed, Some(5); "wide channels with five taps")]
 #[test_case(16, 25, TcOpt::Relaxed, Some(25); "narrow channels with many taps")]
-#[test_case(64, 16, TcOpt::Relaxed, Some(64); "both reduce axes divisible")]
+#[test_case(64, 16, TcOpt::Relaxed, Some(16); "both divisible takes the deeper reduce")]
 #[test_case(12, 5, TcOpt::Relaxed, None; "no reduce axis divisible")]
 #[test_case(64, 5, TcOpt::Strict, None; "strict declines the second reduce axis")]
 fn try_tensor_cores_on_conv_shaped_double_reduce(channels: i64, taps: i64, tc_opt: TcOpt, leftover: Option<i64>) {
@@ -226,6 +230,23 @@ fn try_tensor_cores_on_conv_shaped_double_reduce(channels: i64, taps: i64, tc_op
     let loops: Vec<_> =
         scheduler.rngs().iter().filter_map(range_axis).filter(|(_, extent)| *extent == leftover).collect();
     assert_eq!(loops, vec![(AxisType::Reduce, leftover)], "the other reduce axis must survive as a loop");
+}
+
+/// A conv compute-bound enough to pad past the budget still reduces over its
+/// channels. `COMPUTE_BOUND_INTENSITY` waives the padding budget so a tensor
+/// core can take an axis it does not divide, which is what offers the taps —
+/// 3 padded to the core's 16-wide K edge is 5.3x the MACs, and it leaves the
+/// channels as a scalar loop and `k_tiles` at 1, so the warp tile cannot grow
+/// either. These shapes run at 75-92 FLOP per operand byte, past the waiver.
+#[test_case(3; "three taps")]
+#[test_case(5; "five taps")]
+#[test_case(9; "nine taps, a 3x3 conv")]
+fn compute_bound_conv_reduces_over_channels_not_padded_taps(taps: i64) {
+    let (applied, scheduler) =
+        run(conv_like_weak(512, 128, 96, taps), Renderer::cuda(), &HeuristicsConfig::default(), try_tensor_cores);
+    assert!(applied, "the conv takes a tensor core");
+    let loops: Vec<_> = scheduler.rngs().iter().filter_map(range_axis).filter(|(_, extent)| *extent == taps).collect();
+    assert_eq!(loops, vec![(AxisType::Reduce, taps)], "the taps stay a loop rather than being padded onto the core");
 }
 
 /// The CUDA `m16n8k16` core holds four accumulators per lane and the lane count picks the tile.

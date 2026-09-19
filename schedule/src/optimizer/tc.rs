@@ -342,6 +342,40 @@ fn arithmetic_intensity(pattern: &MatmulPattern) -> Option<f64> {
     Some(2.0 * m * n * k / (bytes * (m * k + n * k + m * n)))
 }
 
+/// How an axis choice ranks against its siblings: the MAC work it pays for
+/// padding, as a multiple of what its unpadded shape would do, and then the
+/// extent of the reduce it puts on K.
+///
+/// [`detect_matmul`] enumerates the `(N, M, K)` triples by descending axis id,
+/// which for a convolution puts the innermost tap on K. Padding a 3-wide tap to
+/// a 16-wide core edge is 5.3x the MACs, where reducing over the channels
+/// instead divides exactly — so the order the axes happen to carry must not
+/// decide which choice is applied. The reduce extent breaks a tie because the
+/// accumulator is set up and written back once per K loop, and a short one
+/// cannot amortise a lane full of them.
+///
+/// `None` when the choice has no compatible core or any of its three extents is
+/// symbolic — such a choice cannot be applied at all.
+pub fn axis_choice_rank(
+    pattern: &MatmulPattern,
+    renderer: &Renderer,
+    tc_select: i32,
+    axis_choice: usize,
+) -> Option<(f64, i64)> {
+    let selection = select_tensor_core(pattern, renderer, tc_select, axis_choice).ok()??;
+    let tc = &renderer.tensor_cores[selection.tc_index];
+    let (n_range, m_range, k_range) = &selection.axes;
+    let padded: f64 = [(n_range, tc.dims.0), (m_range, tc.dims.1), (k_range, tc.dims.2)]
+        .into_iter()
+        .map(|(axis, edge)| {
+            let size = get_range_size(axis)?;
+            let size = usize::try_from(size).ok().filter(|&s| s > 0)?;
+            Some((size.div_ceil(edge) * edge) as f64 / size as f64)
+        })
+        .product::<Option<f64>>()?;
+    Some((padded, get_range_size(k_range)?))
+}
+
 fn apply_axis_choice_impl(
     scheduler: &mut Scheduler,
     pattern: &MatmulPattern,

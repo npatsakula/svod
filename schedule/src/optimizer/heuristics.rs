@@ -1600,9 +1600,30 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
 
     let axis_choice_count = pattern.axis_choices.len();
 
+    // Take the choices in increasing padded work, and at equal work the deeper
+    // reduce first ([`tc::axis_choice_rank`]). The detection order is the axes'
+    // own, which for a conv offers the 3-wide tap as K before the channels;
+    // applying whichever of those happens to come first pads the taps to the
+    // core's K edge and leaves the channels as a scalar loop. Sorting is stable,
+    // so choices the rank cannot compare keep that detection order.
+    let order = {
+        let renderer = scheduler.renderer();
+        let rank: Vec<_> = (0..axis_choice_count)
+            .map(|choice| tc::axis_choice_rank(&pattern, renderer, config.tc_select.as_i32(), choice))
+            .collect();
+        let mut order: Vec<usize> = (0..axis_choice_count).collect();
+        order.sort_by(|&a, &b| match (rank[a], rank[b]) {
+            (Some((pad_a, k_a)), Some((pad_b, k_b))) => pad_a.total_cmp(&pad_b).then(k_b.cmp(&k_a)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        order
+    };
+
     let mut rejections = Vec::new();
 
-    for axis_choice in 0..axis_choice_count {
+    for axis_choice in order {
         // Clone the scheduler for trial - if this axis choice fails, no partial mutations.
         let mut trial = scheduler.clone();
         let tc_result = tc::apply_with_axis_choice(
