@@ -56,9 +56,19 @@ fn const_extent(rng: &Arc<UOp>) -> Option<usize> {
     }
 }
 
-/// Product of the constant extents of every axis of `axis_type`.
-fn extent_product(scheduler: &Scheduler, axis_type: AxisType) -> usize {
-    scheduler.ranges_of(&[axis_type]).iter().filter_map(const_extent).product::<usize>().max(1)
+/// Product of the constant extents of every axis of one of `axis_types`.
+fn extent_product(scheduler: &Scheduler, axis_types: &[AxisType]) -> usize {
+    scheduler.ranges_of(axis_types).iter().filter_map(const_extent).product::<usize>().max(1)
+}
+
+/// Trips the accumulator is reused over: every reduce axis the kernel still
+/// carries, which is what the core left of its own K times the reduces it did
+/// not take. A convolution's taps stay as loops around the WMMA and the
+/// accumulator is set up and written back once for all of them, so counting the
+/// core's K axis alone understates the depth ninefold on a 3x3 — and then caps
+/// the warp tile far below what the register budget allows.
+fn reduce_depth(scheduler: &Scheduler) -> usize {
+    extent_product(scheduler, &[AxisType::Reduce, AxisType::GroupReduce])
 }
 
 /// LOCAL size for a global axis none of the standard sizes divides, with the
@@ -1524,12 +1534,8 @@ fn apply_tc_tiling(scheduler: &mut Scheduler, growth: &TcGrowth, axes: &[Arc<UOp
                 &tc,
                 accum_max,
                 scheduler.renderer().upcast_max,
-                extent_product(scheduler, AxisType::Global),
-                [
-                    const_extent(&rngs[1]).unwrap_or(1),
-                    const_extent(&rngs[0]).unwrap_or(1),
-                    const_extent(&axes[2]).unwrap_or(1),
-                ],
+                extent_product(scheduler, &[AxisType::Global]),
+                [const_extent(&rngs[1]).unwrap_or(1), const_extent(&rngs[0]).unwrap_or(1), reduce_depth(scheduler)],
             );
             for (dim, sz) in [(1usize, m_grow), (0, n_grow)] {
                 if sz > 1 {
