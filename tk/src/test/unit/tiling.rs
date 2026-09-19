@@ -110,6 +110,34 @@ fn every_candidate_fits_the_device() {
     }
 }
 
+/// Every step off a tile lands on a tile: the walk may not produce a strip
+/// shallower than the matrix core's K edge, a block the wave grid does not
+/// divide, or anything the device cannot launch. A `k_step` under the edge is
+/// not a smaller tile, it is not a tile — the kernel asserts on it.
+#[test]
+fn no_step_leaves_the_lattice() {
+    let budget = rtx_3060();
+    let bytes = DType::Float16.bytes();
+    let (m, k, n) = (4096usize, 1024usize, 6144usize);
+    let seeds = budget.ranked(&NT_128X64, bytes, TripCost::Free, (m, n), 8, |cfg| cfg.tiles(m, k, n));
+    assert!(!seeds.is_empty(), "the GEMM must have somewhere to start");
+    let mut frontier: Vec<GemmCfg> = seeds.into_iter().collect();
+    for _ in 0..3 {
+        let next: Vec<GemmCfg> =
+            frontier.iter().flat_map(|cfg| budget.neighbours(cfg, bytes, |c| c.tiles(m, k, n))).collect();
+        for cfg in &next {
+            assert!(cfg.k_step.is_multiple_of(budget.mma_edge), "{cfg:?} has a strip under the core's K edge");
+            assert!(cfg.reg_m().is_multiple_of(budget.mma_edge), "{cfg:?} has a fragment-ragged M");
+            assert!(cfg.reg_n().is_multiple_of(budget.mma_edge), "{cfg:?} has a fragment-ragged N");
+            assert!(budget.fits(cfg, bytes), "{cfg:?} does not fit the device it was stepped on");
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+}
+
 /// A shape no tile divides yields nothing rather than something that would fail
 /// to launch.
 #[test]

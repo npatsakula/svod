@@ -34,11 +34,15 @@
 //! register allocation — is not analytic and should not be guessed.
 
 use std::ops::Not;
+use std::time::Duration;
 
 use smallvec::SmallVec;
+use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
 
 use super::gemm::GemmCfg;
+use crate::launch::CompiledLaunch;
 use crate::target::WorkgroupLimits;
+use crate::tune::ROUNDS as TUNE_ROUNDS;
 
 /// What one K trip costs a kernel beyond the MACs of the trip itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -136,6 +140,75 @@ const STRIP_FRAGMENTS: [usize; 4] = [1, 2, 4, 8];
 const STAGES: usize = 2;
 
 impl TileBudget {
+    /// Beam width: tiles kept between rounds. Two is enough for a lattice this
+    /// shallow, and every extra one is a compile and a timing run per round.
+    const BEAM_WIDTH: usize = 2;
+    /// Rounds of expansion. The walk stops early once a round finds nothing faster,
+    /// so this only bounds a search that keeps improving.
+    const BEAM_ROUNDS: usize = 3;
+
+    /// Walk the tile lattice from `seeds`, measuring: time the frontier, keep the
+    /// fastest [`BEAM_WIDTH`], expand those by [`Self::neighbours`], repeat.
+    ///
+    /// This is the same shape as the graph optimizer's BEAM, and for the same
+    /// reason. The cost [`Self::cost`] computes stops short of what decides the
+    /// winner — where the compiler begins spilling is a step, not a slope, and
+    /// depends on addressing the tile knows nothing about. A measured walk does
+    /// not need to know: it only needs the lattice to be connected, which
+    /// one-step doublings make it. The model still chooses where to start, which
+    /// is what keeps the walk short.
+    pub fn search(
+        &self,
+        seeds: &[GemmCfg],
+        in_bytes: usize,
+        accept: impl Fn(&GemmCfg) -> bool + Copy,
+        mut compile: impl FnMut(GemmCfg) -> Option<CompiledLaunch>,
+    ) -> Option<(GemmCfg, u64)> {
+        let mut timed: Vec<(GemmCfg, u64)> = Vec::new();
+        let mut warmed = false;
+        // One round of the walk: compile what has not been timed yet, then time
+        // the whole round in turn rather than each candidate to exhaustion, so
+        // the clock a tile is judged at is the clock its rivals were judged at
+        // — the same reason [`crate::tune::TuneStore::select`] round-robins.
+        let mut measure = |cfgs: &[GemmCfg], timed: &mut Vec<(GemmCfg, u64)>| {
+            let fresh: Vec<GemmCfg> =
+                cfgs.iter().copied().filter(|cfg| !timed.iter().any(|(seen, _)| seen == cfg)).collect();
+            let launches: Vec<Option<CompiledLaunch>> = fresh.iter().map(|&cfg| compile(cfg)).collect();
+            if !warmed && let Some(first) = launches.iter().flatten().next() {
+                warm_clock(CLOCK_WARMUP, || first.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos));
+                warmed = true;
+            }
+            let time = |i: usize| launches[i].as_ref()?.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos);
+            for (i, ns) in round_robin_min(launches.len(), TUNE_ROUNDS, time).into_iter().enumerate() {
+                if let Some(ns) = ns {
+                    timed.push((fresh[i], ns.as_nanos() as u64));
+                }
+            }
+        };
+
+        measure(seeds, &mut timed);
+        let mut best = timed.iter().copied().min_by_key(|(_, ns)| *ns)?;
+        let mut frontier: Vec<GemmCfg> = vec![best.0];
+        for _ in 0..Self::BEAM_ROUNDS {
+            let next: Vec<GemmCfg> =
+                frontier.iter().flat_map(|cfg| self.neighbours(cfg, in_bytes, accept).into_iter()).collect();
+            if next.is_empty() {
+                break;
+            }
+            measure(&next, &mut timed);
+            let round = timed.iter().copied().min_by_key(|(_, ns)| *ns)?;
+            if round.1 >= best.1 {
+                break;
+            }
+            best = round;
+            let mut ranked = timed.clone();
+            ranked.sort_by_key(|(_, ns)| *ns);
+            frontier = ranked.into_iter().take(Self::BEAM_WIDTH).map(|(cfg, _)| cfg).collect();
+        }
+        tracing::debug!(cfg = ?best.0, ns = best.1, timed = timed.len(), "tile search settled");
+        Some(best)
+    }
+
     /// The budget of the device behind `spec`, when the backend reports its
     /// limits and the arch has a matrix core to tile for.
     pub fn for_device(spec: &svod_dtype::DeviceSpec, arch: svod_dtype::GpuArch) -> Option<Self> {
@@ -334,13 +407,17 @@ impl TileBudget {
         out
     }
 
-    /// Whether the wave grid divides the tile into whole matrix-core fragments.
+    /// Whether the tile divides into whole matrix-core fragments: the wave grid
+    /// over the block, and the strip over the core's K edge.
     fn well_formed(&self, cfg: &GemmCfg) -> bool {
         let rows = cfg.warps_m * cfg.acc_m;
         cfg.block_m.is_multiple_of(rows)
             && cfg.block_n.is_multiple_of(cfg.warps_n)
             && cfg.reg_m().is_multiple_of(self.mma_edge)
             && cfg.reg_n().is_multiple_of(self.mma_edge)
+            // The strip is reduced by whole matrix-core steps, so a `k_step`
+            // under the core's K edge is not a smaller tile — it is not a tile.
+            && cfg.k_step.is_multiple_of(self.mma_edge)
     }
 }
 
