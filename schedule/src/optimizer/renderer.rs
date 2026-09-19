@@ -331,8 +331,25 @@ impl Renderer {
     /// Create a CUDA GPU renderer configuration (SM80/Ampere by default).
     ///
     /// For specific architectures, use `cuda_sm75()`, `cuda_sm80()`, or `cuda_sm89()`.
+    /// The tf32 shapes follow [`Self::tf32_enabled`].
     pub fn cuda() -> Self {
-        Self::cuda_sm80(false) // Default to SM80 (A100) without TF32
+        Self::cuda_sm80(Self::tf32_enabled())
+    }
+
+    /// Whether the CUDA profiles carry the f32-in (tf32) tensor-core shapes.
+    ///
+    /// tf32 truncates both operands of an f32 matrix product to a 10-bit
+    /// mantissa while keeping f32 accumulation — fp16-class operand precision
+    /// at HMMA speed. Withheld by default (matching cuBLAS's `CUBLAS_TF32`
+    /// default and tinygrad's f32 cores); `SVOD_TF32` (or `TF32`) set to any
+    /// non-empty value other than `0`/`false` opts in. Read once per profile
+    /// construction, and the extra core moves [`Self::cache_fingerprint`], so
+    /// beam plans tuned without it are never replayed with it.
+    fn tf32_enabled() -> bool {
+        ["SVOD_TF32", "TF32"].iter().find_map(|key| std::env::var(key).ok()).is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
     }
 
     /// Create a CUDA GPU renderer for SM75 (Turing - RTX 20xx, T4).
@@ -586,10 +603,11 @@ impl Renderer {
     /// lower), and anything older runs without tensor cores. The sm_89 fp8
     /// profile is withheld from every capability until the NVPTX renderer
     /// lowers the `cvt.*.e4m3x2` conversions; its fp8 storage dtype would fail
-    /// at render time today.
+    /// at render time today. The tf32 f32-in shapes join every sm_80+ profile
+    /// when [`Self::tf32_enabled`] opts in.
     pub fn for_cuda_arch(arch: CudaArch) -> Self {
         let sm = arch.sm();
-        let mut renderer = if arch.has_bf16_mma() { Self::cuda_sm80(false) } else { Self::cuda_sm75() };
+        let mut renderer = if arch.has_bf16_mma() { Self::cuda_sm80(Self::tf32_enabled()) } else { Self::cuda_sm75() };
         if sm < 75 {
             renderer.tensor_cores.clear();
         }

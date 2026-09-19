@@ -12,6 +12,7 @@ use svod_tensor::Tensor;
 use crate::gigaam::GigaAm;
 use crate::state::StateDict;
 use crate::whisper::{ModelDimensions, Whisper, WhisperSize};
+use crate::yolo::{Yolo26Detect, YoloConfig, YoloScale};
 use svod_tensor::nn::Module as _;
 
 use super::batch::test_config;
@@ -131,6 +132,35 @@ fn whisper_encoder_module_scopes_match_the_state_dict() {
         keys(&model.state_dict("")).into_iter().filter(|key| key.starts_with("encoder.")).collect();
     assert_paths_are_state_dict_prefixes(&paths, &encoder_keys);
     for expected in ["encoder", "encoder.conv1", "encoder.blocks.0.attn", "encoder.blocks.0.attn.query"] {
+        assert!(paths.contains(expected), "missing {expected} in {paths:?}");
+    }
+}
+
+/// YOLO nests every layer under a stage frame (`backbone`, `neck`, `head`)
+/// that owns no weights of its own. Beneath it the path is the state-dict
+/// prefix: `backbone.2.m.0.cv1` for `2.m.0.cv1.conv.weight`, and the head,
+/// which loads at `23`, is `head.one2one_cv2.0.0` for `23.one2one_cv2.0.0.*`.
+#[test]
+fn yolo_module_scopes_match_the_state_dict() {
+    let _capture = origin::capture_for_thread(true);
+    let model = Yolo26Detect::with_zero_weights(YoloConfig::new(YoloScale::Nano, 80));
+    let images = Tensor::zeros(&[1, 3, 64, 64], DType::Float32);
+
+    let out = model.forward(&images).expect("yolo forward");
+    let paths: BTreeSet<String> = module_paths(&out)
+        .into_iter()
+        .filter_map(|path| match path.split_once('.') {
+            Some(("backbone" | "neck", layer)) => Some(layer.to_owned()),
+            Some(("head", branch)) => Some(format!("23.{branch}")),
+            Some((stage, _)) => panic!("{path} sits under an unknown stage frame {stage}"),
+            None => None,
+        })
+        .collect();
+
+    assert_paths_are_state_dict_prefixes(&paths, &keys(&model.state_dict("")));
+    for expected in
+        ["0", "2.m.0.cv1", "9.cv2", "10.m.0.attn.qkv", "10.m.0.ffn.1", "13", "23.one2one_cv2.0.0", "23.one2one_cv3.2.2"]
+    {
         assert!(paths.contains(expected), "missing {expected} in {paths:?}");
     }
 }

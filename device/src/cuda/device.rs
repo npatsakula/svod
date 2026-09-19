@@ -84,6 +84,11 @@ pub struct CudaLimits {
     /// Blocks one SM keeps resident, whatever their size.
     pub max_blocks_per_sm: u32,
     pub shared_per_block: u32,
+    /// Shared memory the whole SM has to divide between resident blocks — the
+    /// limit a wide tile hits long before [`Self::shared_per_block`] does.
+    pub shared_per_sm: u32,
+    /// Registers the whole SM has to divide between resident threads.
+    pub registers_per_sm: u32,
     pub warp_size: u32,
     /// `cuMemAllocManaged` is usable and host access is coherent with running
     /// kernels: the backing of host-visible buffers.
@@ -288,6 +293,8 @@ impl CudaDevice {
             max_threads_per_sm: attribute(attribute::MAX_THREADS_PER_MULTIPROCESSOR)?,
             max_blocks_per_sm: attribute(attribute::MAX_BLOCKS_PER_MULTIPROCESSOR)?,
             shared_per_block: attribute(attribute::MAX_SHARED_MEMORY_PER_BLOCK)?,
+            shared_per_sm: attribute(attribute::MAX_SHARED_MEMORY_PER_MULTIPROCESSOR)?,
+            registers_per_sm: attribute(attribute::MAX_REGISTERS_PER_MULTIPROCESSOR)?,
             warp_size: attribute(attribute::WARP_SIZE)?,
             managed_memory: attribute(attribute::MANAGED_MEMORY)? == 1
                 && attribute(attribute::CONCURRENT_MANAGED_ACCESS)? == 1,

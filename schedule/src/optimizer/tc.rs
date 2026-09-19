@@ -37,10 +37,17 @@ pub struct MatmulPattern {
 pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, OptError> {
     let reduce_op = match scheduler.reduceop() {
         Some(op) => op,
-        None => return Ok(None),
+        None => {
+            tracing::debug!("no matmul: the kernel has no REDUCE");
+            return Ok(None);
+        }
     };
 
     let Some((in0, in1)) = matmul_operands(&reduce_op) else {
+        tracing::debug!(
+            src = reduce_op.op().sources().first().map(|s| AsRef::<str>::as_ref(s.op())),
+            "no matmul: the REDUCE is not an ADD over a MUL, modulo casts"
+        );
         return Ok(None);
     };
     let in0_all_ranges = get_ranges(&in0);
@@ -78,6 +85,15 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
     }
 
     if axis_choices.is_empty() {
+        // M and N are the ranges exclusive to one operand; K comes from the
+        // REDUCE itself. A fused producer that makes both operands reach the
+        // same ranges empties one of these and the matmul disappears.
+        tracing::debug!(
+            m = in0_ranges.len(),
+            n = in1_ranges.len(),
+            k = red_ranges.len(),
+            "no matmul: no (N, M, K) triple, so an operand has no exclusive range"
+        );
         return Ok(None);
     }
 
@@ -308,6 +324,58 @@ fn within_pad_budget(size: usize, tile: usize) -> bool {
     (padded - size) * 100 <= size * TC_PAD_BUDGET_PERCENT
 }
 
+/// FLOP per operand byte, at the unpadded shape, past which the budget no
+/// longer applies: such a kernel is compute-bound on every tensor-core GPU, so
+/// even a tile padded well beyond the budget beats the scalar kernel it
+/// displaces (a 20x20 conv output pads 20 -> 32 for 1.6x the MACs on a core
+/// several times faster), where a beam-width GEMV at a few FLOP per byte only
+/// pays for the padding.
+const COMPUTE_BOUND_INTENSITY: f64 = 64.0;
+
+/// `2·M·N·K / bytes(A + B + C)` over the pattern's whole M, N and K extents;
+/// `None` when any of them is symbolic.
+fn arithmetic_intensity(pattern: &MatmulPattern) -> Option<f64> {
+    let extent =
+        |ranges: &[Arc<UOp>]| ranges.iter().map(|r| get_range_size(r).map(|s| s as f64)).product::<Option<f64>>();
+    let (m, n, k) = (extent(&pattern.in0_ranges)?, extent(&pattern.in1_ranges)?, extent(&pattern.red_ranges)?);
+    let bytes = pattern.in0.dtype().bytes().max(pattern.in1.dtype().bytes()) as f64;
+    Some(2.0 * m * n * k / (bytes * (m * k + n * k + m * n)))
+}
+
+/// How an axis choice ranks against its siblings: the MAC work it pays for
+/// padding, as a multiple of what its unpadded shape would do, and then the
+/// extent of the reduce it puts on K.
+///
+/// [`detect_matmul`] enumerates the `(N, M, K)` triples by descending axis id,
+/// which for a convolution puts the innermost tap on K. Padding a 3-wide tap to
+/// a 16-wide core edge is 5.3x the MACs, where reducing over the channels
+/// instead divides exactly — so the order the axes happen to carry must not
+/// decide which choice is applied. The reduce extent breaks a tie because the
+/// accumulator is set up and written back once per K loop, and a short one
+/// cannot amortise a lane full of them.
+///
+/// `None` when the choice has no compatible core or any of its three extents is
+/// symbolic — such a choice cannot be applied at all.
+pub fn axis_choice_rank(
+    pattern: &MatmulPattern,
+    renderer: &Renderer,
+    tc_select: i32,
+    axis_choice: usize,
+) -> Option<(f64, i64)> {
+    let selection = select_tensor_core(pattern, renderer, tc_select, axis_choice).ok()??;
+    let tc = &renderer.tensor_cores[selection.tc_index];
+    let (n_range, m_range, k_range) = &selection.axes;
+    let padded: f64 = [(n_range, tc.dims.0), (m_range, tc.dims.1), (k_range, tc.dims.2)]
+        .into_iter()
+        .map(|(axis, edge)| {
+            let size = get_range_size(axis)?;
+            let size = usize::try_from(size).ok().filter(|&s| s > 0)?;
+            Some((size.div_ceil(edge) * edge) as f64 / size as f64)
+        })
+        .product::<Option<f64>>()?;
+    Some((padded, get_range_size(k_range)?))
+}
+
 fn apply_axis_choice_impl(
     scheduler: &mut Scheduler,
     pattern: &MatmulPattern,
@@ -337,6 +405,8 @@ fn apply_axis_choice_impl(
         // Collect padding operations needed (can't mutate axes while iterating)
         let tc_dims = [tc.dims.0, tc.dims.1, tc.dims.2];
         let mut padding_ops: Vec<(usize, usize, usize)> = Vec::new(); // (axes_idx, scheduler_idx, tc_dim)
+        let compute_bound =
+            arithmetic_intensity(pattern).is_some_and(|flop_per_byte| flop_per_byte >= COMPUTE_BOUND_INTENSITY);
 
         for (i, (axis, &tc_dim)) in axes.iter().zip(&tc_dims).enumerate() {
             match get_range_size(axis) {
@@ -346,8 +416,10 @@ fn apply_axis_choice_impl(
                         // and multiply the MACs. A 5-row M on a 16-row core is
                         // 3.2x the work of a memory-bound GEMV, and BEAM times
                         // it as a win only because the tile it displaces is
-                        // worse still.
-                        if tc_opt == 2 && !within_pad_budget(size as usize, tc_dim) {
+                        // worse still. A compute-bound kernel is the other way
+                        // round: the padded core still runs several times faster
+                        // than the scalar loop, so the budget steps aside.
+                        if tc_opt == 2 && !compute_bound && !within_pad_budget(size as usize, tc_dim) {
                             return ValidationFailedSnafu {
                                 op: "TC",
                                 reason: "padding to the tensor-core tile would add too much work",

@@ -50,8 +50,10 @@ let optimized = graph_rewrite(&matcher, graph, &mut ());
 | Term combining | ✅ | x+x→2*x, (c1*x)+(c2\*x)→(c1+c2)\*x |
 | Division distribution | ✅ | (a+b)//c → a//c + b//c when exact |
 | Dead code elimination | ✅ | WHERE(true,t,f)→t, dead loops |
+| Reduce gate lifting | ✅ | REDUCE(WHERE(c,x,Invalid))→WHERE(c,REDUCE(x),Invalid) |
 | **Kernel Optimization** | | |
 | Tensor cores (TC) | ✅ | WMMA for matmul patterns |
+| BEAM search | ✅ | `BEAM=n` candidate search, cached per kernel |
 | Upcasting | ✅ | Vectorization (float4, etc.) |
 | Loop unrolling | ✅ | Unroll reductions ≤32 |
 | Local memory | ✅ | GPU shared memory allocation |
@@ -59,6 +61,8 @@ let optimized = graph_rewrite(&matcher, graph, &mut ());
 | Matvec optimization | ✅ | Specialized MV pattern |
 | CPU threading | ✅ | `core_id` split, `SVOD_THREADS` ways by default |
 | Axis reordering | ✅ | SWAP for memory access |
+| PADTO | ✅ | Pad an axis to TC alignment; `BEAM_PADTO` adds it to BEAM |
+| Kernel caching | ✅ | In-process dedup, plus a persistent compiled-object cache |
 | **RANGEIFY** | | |
 | Movement op removal | ✅ | RESHAPE, PERMUTE, EXPAND, etc. |
 | Buffer folding | ✅ | Remove noop BUFFERIZE |
@@ -68,12 +72,10 @@ let optimized = graph_rewrite(&matcher, graph, &mut ());
 | Kernel splitting | ✅ | Split by STORE operations |
 | Reduce splitting | ✅ | 2-stage large reductions |
 | Buffer cost analysis | ✅ | PContig cost model |
+| Multi-device shard | ✅ | Single-axis `Op::Multi`, host-staged allreduce |
 | **Planned** | | |
-| BEAM search | ❌ | Exhaustive optimization search |
 | Image float4 | ❌ | Image type vectorization |
-| Multi-device | ❌ | Ring allreduce, multi-rank |
-| Kernel caching | ❌ | Compile cache |
-| PADTO | ❌ | Axis padding for alignment |
+| Ring allreduce | ❌ | Multi-rank collectives; the shard subset above is host-staged |
 
 ## Testing
 

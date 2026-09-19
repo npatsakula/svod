@@ -2,6 +2,7 @@ use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
 
 use super::conv::YoloConv;
+use crate::state::scoped;
 use crate::yolo::error::Result;
 
 /// Spatial Pyramid Pooling - Fast: 1×1 conv → `pools` chained MaxPool(k) →
@@ -32,7 +33,7 @@ impl Sppf {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let p = (self.kernel / 2) as isize;
-        let mut y = self.cv1.forward(x)?;
+        let mut y = scoped("cv1", || self.cv1.forward(x))?;
         let mut ys = Vec::with_capacity(self.pools + 1);
         ys.push(y.clone());
         for _ in 0..self.pools {
@@ -44,7 +45,8 @@ impl Sppf {
                 .call()?;
             ys.push(y.clone());
         }
-        let out = self.cv2.forward(&Tensor::cat(&ys.iter().collect::<Vec<_>>(), 1)?)?;
+        let cat = Tensor::cat(&ys.iter().collect::<Vec<_>>(), 1)?;
+        let out = scoped("cv2", || self.cv2.forward(&cat))?;
         if self.add { Ok(out.try_add(x)?) } else { Ok(out) }
     }
 }

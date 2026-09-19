@@ -1,4 +1,6 @@
+mod bn_fold;
 mod classify;
+mod compute_dtype;
 mod config;
 mod depth;
 mod detect_p2;

@@ -18,7 +18,7 @@ use crate::optimizer::renderer::TcTilePolicy;
 use crate::optimizer::{Opt, OptArg, OptOps, Renderer, Scheduler, apply_opt};
 use crate::test::support::prelude::*;
 use crate::test::unit::optimizer::kernels::{
-    Ranged, matmul_accum, matmul_with, plus, row_major, row_reduce, times, two_n_matmul,
+    Ranged, matmul_accum, matmul_with, plus, row_major, row_reduce, taps_conv, times, two_n_matmul,
 };
 
 // THE KERNEL SHAPES THIS PASS IS RANKED AGAINST
@@ -138,6 +138,49 @@ fn opt(op: OptOps, axis: usize, arg: usize) -> (OptOps, Option<usize>, OptArg) {
     (op, Some(axis), OptArg::Int(arg))
 }
 
+/// The 192->192 3x3 convolution over a 40x40 image the layout probe measures.
+const PROBE_CONV: (i64, i64, i64, i64, i64) = (40, 40, 192, 192, 9);
+
+/// Tensor-core tiles one warp's output covers under `plan`: every UPCAST
+/// multiplies it, and a lane holds an accumulator per element of each tile.
+fn warp_tiles(plan: &[(OptOps, Option<usize>, OptArg)]) -> usize {
+    plan.iter()
+        .filter_map(|(op, _, arg)| match (op, arg) {
+            (OptOps::UPCAST, OptArg::Int(amount)) => Some(*amount),
+            _ => None,
+        })
+        .product()
+}
+
+/// The post-TC opt sequence a `(m1, m2, n, k, taps)` convolution gets on the
+/// RDNA4 WMMA for operands laid out `channels_last`; `None` when the shape
+/// declines the tensor core.
+fn conv_plan(
+    shape: (i64, i64, i64, i64, i64),
+    channels_last: (bool, bool),
+) -> Option<Vec<(OptOps, Option<usize>, OptArg)>> {
+    conv_plan_on(shape, channels_last, Renderer::amd_rdna4())
+}
+
+/// [`conv_plan`] against an explicit renderer, so the CUDA `LaneBudget` tiling
+/// can be pinned beside RDNA4's fixed step.
+fn conv_plan_on(
+    shape: (i64, i64, i64, i64, i64),
+    channels_last: (bool, bool),
+    renderer: Renderer,
+) -> Option<Vec<(OptOps, Option<usize>, OptArg)>> {
+    let (m1, m2, n, k, taps) = shape;
+    let mut scheduler = Scheduler::new(taps_conv(m1, m2, n, k, taps, channels_last), renderer);
+    try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()).then(|| {
+        scheduler
+            .applied_opts
+            .iter()
+            .filter(|opt| opt.op != OptOps::TC)
+            .map(|opt| (opt.op, opt.axis, opt.arg.clone()))
+            .collect()
+    })
+}
+
 /// `(axis type, constant extent)` of a RANGE; `None` when it is not a RANGE.
 fn range_axis(range: &Arc<UOp>) -> Option<(AxisType, i64)> {
     matches!(range.op(), Op::Range(..)).then(|| (range_axis_type(range), expect_range_extent(range)))
@@ -173,10 +216,14 @@ fn try_tensor_cores_accepts_fused_operands() {
     assert!(has_op(scheduler.ast(), |op| matches!(op, Op::Wmma(..))));
 }
 
-/// A conv-shaped reduce over (channels, taps) takes the tensor core by default:
+/// A conv-shaped reduce over (channels, taps) takes the tensor core by default,
+/// and the axis it puts on K is the one that pads least — at equal padding, the
+/// deeper reduce. The ranges carry taps innermost, so the detection order offers
+/// the taps first; taking them would pad a narrow tap axis to the core's K edge
+/// and leave the channels as a scalar loop.
 #[test_case(64, 5, TcOpt::Relaxed, Some(5); "wide channels with five taps")]
 #[test_case(16, 25, TcOpt::Relaxed, Some(25); "narrow channels with many taps")]
-#[test_case(64, 16, TcOpt::Relaxed, Some(64); "both reduce axes divisible")]
+#[test_case(64, 16, TcOpt::Relaxed, Some(16); "both divisible takes the deeper reduce")]
 #[test_case(12, 5, TcOpt::Relaxed, None; "no reduce axis divisible")]
 #[test_case(64, 5, TcOpt::Strict, None; "strict declines the second reduce axis")]
 fn try_tensor_cores_on_conv_shaped_double_reduce(channels: i64, taps: i64, tc_opt: TcOpt, leftover: Option<i64>) {
@@ -193,6 +240,23 @@ fn try_tensor_cores_on_conv_shaped_double_reduce(channels: i64, taps: i64, tc_op
     let loops: Vec<_> =
         scheduler.rngs().iter().filter_map(range_axis).filter(|(_, extent)| *extent == leftover).collect();
     assert_eq!(loops, vec![(AxisType::Reduce, leftover)], "the other reduce axis must survive as a loop");
+}
+
+/// A conv compute-bound enough to pad past the budget still reduces over its
+/// channels. `COMPUTE_BOUND_INTENSITY` waives the padding budget so a tensor
+/// core can take an axis it does not divide, which is what offers the taps —
+/// 3 padded to the core's 16-wide K edge is 5.3x the MACs, and it leaves the
+/// channels as a scalar loop and `k_tiles` at 1, so the warp tile cannot grow
+/// either. These shapes run at 75-92 FLOP per operand byte, past the waiver.
+#[test_case(3; "three taps")]
+#[test_case(5; "five taps")]
+#[test_case(9; "nine taps, a 3x3 conv")]
+fn compute_bound_conv_reduces_over_channels_not_padded_taps(taps: i64) {
+    let (applied, scheduler) =
+        run(conv_like_weak(512, 128, 96, taps), Renderer::cuda(), &HeuristicsConfig::default(), try_tensor_cores);
+    assert!(applied, "the conv takes a tensor core");
+    let loops: Vec<_> = scheduler.rngs().iter().filter_map(range_axis).filter(|(_, extent)| *extent == taps).collect();
+    assert_eq!(loops, vec![(AxisType::Reduce, taps)], "the taps stay a loop rather than being padded onto the core");
 }
 
 /// The CUDA `m16n8k16` core holds four accumulators per lane and the lane count picks the tile.
@@ -243,6 +307,61 @@ fn non_cuda_tiling_matches_the_shipped_fixed_step(renderer: Renderer, dims: (usi
             let expected: Vec<_> = plan.iter().map(|&(op, axis, arg)| opt(op, axis, arg)).collect();
             for k in FIXED_STEP_GRID_K {
                 assert_eq!(tc_plan(m, n, k, renderer.clone()), expected, "{m}x{n}x{k}");
+            }
+        }
+    }
+}
+
+const PLAIN_STEP: &[(OptOps, usize, usize)] = &[(OptOps::UPCAST, 1, 3), (OptOps::UPCAST, 1, 4)];
+
+#[test_case((false, false), PLAIN_STEP; "both channels-first keeps the plain step")]
+#[test_case((true, true), PLAIN_STEP; "both channels-last keeps the plain step")]
+#[test_case((false, true), PLAIN_STEP; "a strided activation is already what N holds")]
+#[test_case((true, false), &[(OptOps::UPCAST, 1, 3), (OptOps::LOCAL, 0, 4)]; "a strided weight is stacked over the second spatial axis")]
+fn conv_warp_tile_grows_where_the_pricier_fragment_is_reused(
+    channels_last: (bool, bool),
+    expected: &[(OptOps, usize, usize)],
+) {
+    let expected: Vec<_> = expected.iter().map(|&(op, axis, arg)| opt(op, axis, arg)).collect();
+    assert_eq!(conv_plan(PROBE_CONV, channels_last), Some(expected));
+}
+
+/// On CUDA the warp tile is capped by the trips the accumulator is reused over,
+/// and a convolution's taps are trips: they stay a loop around the WMMA while
+/// the accumulator is set up and written back once for all of them. Counting
+/// only what the core left of its own K axis divides that depth by the tap
+/// count — at `k = 16` the core consumes the whole channel axis and the tile
+/// cannot grow at all, though nine taps of reuse sit behind it.
+///
+/// The single-tap row is the control: with no taps there is genuinely nothing to
+/// amortise a wider tile, and the cap must still bite.
+#[test_case((40, 40, 192, 16, 9), 9; "the core takes the whole channel axis, the taps carry the reuse")]
+#[test_case((40, 40, 192, 32, 9), 12; "two channel trips and nine taps")]
+#[test_case(PROBE_CONV, 12; "192 channels, nine taps, 40x40")]
+#[test_case((40, 40, 192, 16, 1), 1; "one tap and one channel trip cannot amortise a wider tile")]
+fn cuda_conv_warp_tile_counts_the_taps_as_reduce_trips(shape: (i64, i64, i64, i64, i64), tiles: usize) {
+    let plan = conv_plan_on(shape, (true, true), Renderer::cuda()).expect("the conv takes a tensor core");
+    assert_eq!(warp_tiles(&plan), tiles, "warp tile for {shape:?}: {plan:?}");
+}
+
+// Growing the tile along the axis that reuses the pricier operand fragment is a
+// choice of direction and not of size: whatever the operands' layouts, one warp
+// still holds at most the accumulators the plain step would give it, and every
+// UPCAST the plan records stays replayable.
+proptest! {
+    #![proptest_config(cheap())]
+    #[test]
+    fn conv_warp_tile_never_outgrows_the_plain_step(m1 in 8i64..=64, m2 in 8i64..=64, n in 1i64..=8, taps in 1i64..=9) {
+        let shape = (m1, m2, n * 16, 192, taps);
+        let Some(plain) = conv_plan(shape, (false, false)).map(|plan| warp_tiles(&plan)) else { return Ok(()) };
+        for channels_last in [(true, false), (false, true), (true, true)] {
+            let Some(plan) = conv_plan(shape, channels_last) else { continue };
+            let tiles = warp_tiles(&plan);
+            prop_assert!(tiles <= plain, "{channels_last:?} grows to {tiles} over the plain step's {plain}");
+            prop_assert_eq!(conv_plan(shape, channels_last), Some(plan.clone()), "the plan is a function of the shape");
+            for (op, _, arg) in plan {
+                let OptArg::Int(amount) = arg else { continue };
+                prop_assert!(op != OptOps::UPCAST || amount <= Renderer::amd_rdna4().upcast_max);
             }
         }
     }

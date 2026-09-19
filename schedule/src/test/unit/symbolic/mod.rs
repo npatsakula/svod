@@ -7,12 +7,12 @@ mod index_lowering;
 use std::sync::Arc;
 
 use smallvec::smallvec;
-use svod_dtype::DType;
+use svod_dtype::{DType, ScalarDType};
 use svod_ir::pattern::TypedPatternMatcher;
 use svod_ir::uop::cached_property::CachedProperty;
 use svod_ir::uop::properties::HasWeakFloatProperty;
 use svod_ir::uop::range_eval::compute_sound_vmin_vmax;
-use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp, ops};
+use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, TernaryOp, UOp, UnaryOp, ops};
 use test_case::test_case;
 
 use crate::pattern::RewriteResult;
@@ -963,6 +963,86 @@ fn a_bare_invalid_operand_poisons_arithmetic_but_not_a_comparison() {
     let compared = UOp::new(Op::Binary(BinaryOp::Lt, index, marker), DType::Bool);
     let kept = rewrite(propagate_invalid(), compared);
     assert_op!(kept, Op::Binary(BinaryOp::Lt, _, _));
+}
+
+/// A reduce gate lifts out only when no reduce range can move it: then every
+/// contribution is valid together or invalid together, so the gate says the same
+/// thing about the sum as about each term. A gate the reduce ranges *can* move
+/// selects per contribution and has to stay inside.
+///
+/// This is what keeps a REDUCE reading `CAST(MUL(..))` once a conv fuses into a
+/// concat — the only shape `tc::matmul_operands` accepts before every
+/// tensor-core opt is declined.
+#[test_case(false, true ; "a gate the reduce ranges cannot move")]
+#[test_case(true, false ; "a gate they can move")]
+fn a_reduce_gate_lifts_out_of_the_reduce_when_no_reduce_range_moves_it(reads_k: bool, lifts: bool) {
+    let k = reduce_range(16, 0);
+    let gate = if reads_k {
+        k.lt(&UOp::const_(DType::WeakInt, ConstValue::Int(4)))
+    } else {
+        global_range(64, 1).lt(&index_const(32))
+    };
+    let value = load(index(buffer_of(1024, ScalarDType::Float16), 0));
+    let gated = where_(&gate, value, UOp::invalid_marker());
+
+    let result = rewrite(propagate_invalid(), reduce(gated, vec![k], ReduceOp::Add));
+
+    if lifts {
+        let Op::Ternary(TernaryOp::Where, condition, reduced, invalid) = result.op() else {
+            panic!("the gate should be outside the reduce, got: {}", result.tree());
+        };
+        assert!(Arc::ptr_eq(condition, &gate));
+        assert_op!(reduced, Op::Reduce(..));
+        assert!(UOp::is_invalid_marker(invalid));
+    } else {
+        assert_op!(result, Op::Reduce(..));
+    }
+}
+
+/// `num_axes > 0` also reduces leading shaped axes, which carry no RANGE to test
+/// the gate against, so the rule leaves those alone rather than guessing.
+#[test]
+fn a_reduce_over_shaped_axes_keeps_its_gate() {
+    let gated = where_(&global_range(64, 1).lt(&index_const(32)), float_values([1.0, 2.0]), UOp::invalid_marker());
+    let result = rewrite(propagate_invalid(), gated.reduce_with_num_axes(smallvec![], ReduceOp::Add, 1));
+
+    assert_op!(result, Op::Reduce(..));
+}
+
+/// Lifting the gate makes it dominate the body, so a second copy of the same test
+/// inside is redundant — and it has to go, because while it is there the body
+/// still reads the gate's range and `tc::detect_matmul` reads that as the operand
+/// varying along it.
+///
+/// Inside an INDEX the same test is not redundant: it guards an address, a WHERE
+/// lowers to a select rather than a branch, so the load runs for every lane and
+/// discharging that copy reads out of bounds.
+#[test]
+fn lifting_a_reduce_gate_discharges_it_in_the_body_but_not_in_an_address() {
+    let k = reduce_range(16, 0);
+    let gate = global_range(64, 1).lt(&index_const(32));
+    let buffer = buffer_of(1024, ScalarDType::Float16);
+    let addressed = load(index_of(buffer, where_(&gate, index_const(3), UOp::invalid_marker())));
+    let guarded = where_(&gate.and_(&global_range(8, 2).lt(&index_const(4))), addressed, UOp::invalid_marker());
+
+    let result = rewrite(propagate_invalid(), reduce(guarded, vec![k], ReduceOp::Add));
+
+    let Op::Ternary(TernaryOp::Where, _, reduced, _) = result.op() else {
+        panic!("the gate should be outside the reduce, got: {}", result.tree());
+    };
+    let body = &unwrap_op!(reduced, Op::Reduce(r) => r).src;
+    let guards_an_address = |node: &Arc<UOp>| match node.op() {
+        Op::Index(ops::Index { indices, .. }) => {
+            indices.iter().any(|idx| idx.any_in_subtree(|n| Arc::ptr_eq(n, &gate)))
+        }
+        _ => false,
+    };
+    assert!(body.any_in_subtree(guards_an_address), "the address keeps its guard: {}", result.tree());
+    assert!(
+        !matches!(body.op(), Op::Ternary(TernaryOp::Where, ..)),
+        "the value gate should be discharged: {}",
+        result.tree()
+    );
 }
 
 #[test]

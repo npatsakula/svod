@@ -143,6 +143,51 @@ pub fn resident_waves_per_cu(spec: &DeviceSpec) -> Option<usize> {
     }
 }
 
+/// What the device behind `spec` allows one workgroup and one compute unit:
+/// `(max threads per workgroup, shared bytes per workgroup, shared bytes per
+/// compute unit, registers per compute unit)`. `None` for a field the backend
+/// does not report.
+///
+/// These are the limits a tile is generated against: threads and shared memory
+/// bound the tile that *fits*, and the per-compute-unit pair bounds how many of
+/// those tiles stay resident, which is what a latency-bound kernel lives on.
+/// AMD publishes its LDS but not its register file — KFD has no field for it —
+/// so the register term comes back `None` there and a caller that needs one
+/// falls back to its own floor.
+pub fn workgroup_limits(spec: &DeviceSpec) -> Option<WorkgroupLimits> {
+    match spec {
+        DeviceSpec::Amd { device_id } => {
+            let node = svod_device::amd::topology::enumerate().into_iter().nth(*device_id)?;
+            let lds = (node.lds_size_in_kb as usize) * 1024;
+            (lds > 0).then_some(WorkgroupLimits {
+                max_threads: 1024,
+                shared_per_workgroup: lds,
+                shared_per_cu: lds,
+                registers_per_cu: None,
+            })
+        }
+        DeviceSpec::Cuda { device_id } => {
+            let limits = svod_device::registry::resolve_cuda_limits(*device_id).ok()?;
+            Some(WorkgroupLimits {
+                max_threads: limits.max_threads_per_block as usize,
+                shared_per_workgroup: limits.shared_per_block as usize,
+                shared_per_cu: limits.shared_per_sm as usize,
+                registers_per_cu: Some(limits.registers_per_sm as usize).filter(|&r| r > 0),
+            })
+        }
+        DeviceSpec::Metal { .. } | DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => None,
+    }
+}
+
+/// See [`workgroup_limits`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkgroupLimits {
+    pub max_threads: usize,
+    pub shared_per_workgroup: usize,
+    pub shared_per_cu: usize,
+    pub registers_per_cu: Option<usize>,
+}
+
 /// Gate the kernel inputs' device `spec` to the kernel's `supported` arches
 /// **and** verify the matching LLVM GPU backend (`clang` amdgcn / nvptx64) —
 /// returning the resolved arch so the launcher can build

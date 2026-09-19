@@ -159,6 +159,8 @@ pub mod attribute {
     pub const MULTIPROCESSOR_COUNT: i32 = 16;
     pub const MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
     pub const MAX_BLOCKS_PER_MULTIPROCESSOR: i32 = 106;
+    pub const MAX_SHARED_MEMORY_PER_MULTIPROCESSOR: i32 = 81;
+    pub const MAX_REGISTERS_PER_MULTIPROCESSOR: i32 = 82;
     pub const COMPUTE_CAPABILITY_MAJOR: i32 = 75;
     pub const COMPUTE_CAPABILITY_MINOR: i32 = 76;
     pub const MANAGED_MEMORY: i32 = 83;

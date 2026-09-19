@@ -11,9 +11,11 @@ use test_case::test_case;
 use crate::optimizer::error::OptError;
 use crate::optimizer::renderer::{AMD_CDNA_161632, CUDA_81616, METAL_888, SwizzleAxis, TcTilePolicy, TensorCore};
 use crate::optimizer::tc::{TcSelection, apply, apply_with_axis_choice, matching, selection, swizzle, tc_operand};
-use crate::optimizer::{Opt, Renderer, Scheduler};
+use crate::optimizer::{Opt, Renderer, Scheduler, prepare_scheduler};
 use crate::test::support::prelude::*;
-use crate::test::unit::optimizer::kernels::{Ranged, matmul_accum, matmul_with, plus, times, two_n_matmul};
+use crate::test::unit::optimizer::kernels::{
+    Ranged, matmul_accum, matmul_with, plus, times, two_m_matmul, two_n_matmul,
+};
 
 /// A MUL under a REDUCE whose M extent is `m_end` (possibly symbolic).
 fn symbolic_m(m_end: Arc<UOp>, n: i64, k: i64) -> Arc<UOp> {
@@ -86,6 +88,32 @@ fn detect_matmul_matches_a_mul_under_the_reduce(fused: bool) {
 
     assert_eq!((pattern.in0_ranges.len(), pattern.in1_ranges.len(), pattern.red_ranges.len()), (1, 1, 1));
     assert_eq!(pattern.axis_choices.len(), 1);
+}
+
+/// A concat gate lands between the REDUCE and its MUL, and `matmul_operands`
+/// sees through casts and nothing else, so the matmul disappears and every
+/// tensor-core opt is declined with no log line to say why. Pre-optimization
+/// lifts a gate no reduce range can move back out, which is what keeps a conv
+/// fused into a concat eligible.
+#[test]
+fn a_concat_gate_costs_the_matmul_until_pre_optimization_lifts_it() {
+    let kernel = Ranged::new(&[(16, AxisType::Global), (16, AxisType::Global), (16, AxisType::Reduce)]);
+    let a = kernel.index(&DType::Float16, 256, plus(times(&kernel.range(0), 16), kernel.range(2)));
+    let b = kernel.index(&DType::Float16, 256, plus(times(&kernel.range(2), 16), kernel.range(1)));
+    let product = a.try_mul(&b).expect("mul").cast(DType::Float32);
+    // Reads the output range, never a reduce range — the concat's own gate.
+    let gate = kernel.range(0).lt(&UOp::index_const(8));
+    let gated = UOp::try_where(gate, product, UOp::invalid_marker()).expect("gate should build");
+    let sink = kernel.sink(gated.reduce(vec![kernel.range(2)].into(), ReduceOp::Add), &[0, 1]);
+
+    let unlifted = Scheduler::new(sink.clone(), Renderer::cuda());
+    assert!(matching::detect_matmul(&unlifted).expect("detection must not fail").is_none());
+
+    let lifted = prepare_scheduler(sink, &Renderer::cuda()).expect("pre-optimization");
+    assert!(
+        matching::detect_matmul(&lifted).expect("detection must not fail").is_some(),
+        "lifting the gate should give the matmul back"
+    );
 }
 
 /// The detected ranges are sorted by axis id descending, so axis choice 0 is
@@ -274,7 +302,8 @@ fn apply_in_shape_only_mode_splits_the_axes_without_a_wmma() {
 }
 
 /// `tc_opt = 2` pads each non-divisible dimension to the core's tile, as long
-/// as the tail stays inside the padding budget.
+/// as the tail stays inside the padding budget — or the kernel is compute-bound
+/// enough that the padded core still beats the scalar loop by a wide margin.
 #[test_case(15, 16, 16, 2, 2; "one padded axis")]
 #[test_case(30, 30, 30, 2, 6; "every axis padded")]
 #[test_case(5, 16, 16, 3, 2; "unbounded padding tiles a beam width of five")]
@@ -309,6 +338,26 @@ fn apply_rejects_a_non_divisible_dimension(m: i64, n: i64, k: i64, tc_opt: usize
         "{error:?}"
     );
     assert!(!has_op(scheduler.ast(), |op| matches!(op, Op::Wmma(..))));
+}
+
+/// The budget is for memory-bound kernels. A convolution over a 20x20 output
+/// shares every weight across 400 rows, so padding one spatial axis to the tile
+/// (20 -> 32, 1.6x the MACs) still leaves the core far ahead of the scalar loop
+/// it displaces; the same 20-row tail on a 16-column GEMV is only more work.
+#[test_case(768, 6912, true; "a 20x20 conv output pads past the budget")]
+#[test_case(16, 32, false; "a memory-bound kernel keeps to the budget")]
+fn the_pad_budget_yields_to_a_compute_bound_kernel(n: i64, k: i64, pads: bool) {
+    let mut scheduler = Scheduler::new(two_m_matmul(20, 20, n, k), Renderer::cuda());
+    let result = apply_with_axis_choice(&mut scheduler, 0, 2, 1, None);
+    assert_eq!(result.is_ok(), pads, "{result:?}");
+    assert_eq!(has_op(scheduler.ast(), |op| matches!(op, Op::Wmma(..))), pads);
+    if !pads {
+        let error = result.expect_err("refused");
+        assert!(
+            matches!(&error, OptError::ValidationFailed { reason, .. } if *reason == "padding to the tensor-core tile would add too much work"),
+            "{error:?}"
+        );
+    }
 }
 
 /// Automatic core selection trials every core; the cores whose dtypes cannot

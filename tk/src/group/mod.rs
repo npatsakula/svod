@@ -48,24 +48,35 @@ pub struct MoveIdx {
     /// tile-aligned (the gate is elided at build time). Only the GLOBAL↔REG hops
     /// honor it; LDS hops are always tile-sized.
     pub masked: bool,
+    /// Gate the row axis even when its extent divides the tile: the launch grid
+    /// overshoots it by whole tiles (a GEMM whose `M` is not a multiple of its
+    /// block, tiled by the block's register tiles), so the elision `masked`
+    /// relies on would let the tail block run past the tensor.
+    pub clipped: bool,
 }
 
 impl MoveIdx {
     /// A wave/global `block` offset at `axis` (the common fill/gather/store case).
     pub fn block<I: crate::index::IntoIdxs>(idxs: I, axis: usize) -> Self {
-        Self { block: idxs.into_idxs(), frag: SmallVec::new(), axis, masked: false }
+        Self { block: idxs.into_idxs(), frag: SmallVec::new(), axis, masked: false, clipped: false }
     }
     /// A REG-side `frag` offset only.
     pub fn frag<I: crate::index::IntoIdxs>(idxs: I) -> Self {
-        Self { frag: idxs.into_idxs(), block: SmallVec::new(), axis: 0, masked: false }
+        Self { frag: idxs.into_idxs(), block: SmallVec::new(), axis: 0, masked: false, clipped: false }
     }
     /// Both a `block` and a `frag` offset at `axis`.
     pub fn at<B: crate::index::IntoIdxs, F: crate::index::IntoIdxs>(block: B, frag: F, axis: usize) -> Self {
-        Self { block: block.into_idxs(), frag: frag.into_idxs(), axis, masked: false }
+        Self { block: block.into_idxs(), frag: frag.into_idxs(), axis, masked: false, clipped: false }
     }
     /// Boundary-mask this GLOBAL↔REG hop (see [`MoveIdx::masked`]).
     pub fn masked(mut self) -> Self {
         self.masked = true;
+        self
+    }
+    /// Gate the row axis unconditionally (see [`MoveIdx::clipped`]).
+    pub fn clipped(mut self) -> Self {
+        self.masked = true;
+        self.clipped = true;
         self
     }
 }

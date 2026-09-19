@@ -173,6 +173,36 @@ impl TuneStore {
         Some(chosen)
     }
 
+    /// [`Self::select_with`] over a space the caller searches itself rather than
+    /// a list it enumerates: `search` walks the space, measuring as it goes, and
+    /// returns the winner encoded as an integer beside the time that won.
+    ///
+    /// The store keeps that integer exactly as it keeps a candidate index — the
+    /// caller decodes it — so a measured search survives the process without the
+    /// space having to be reproducible, which a search steered by measurement is
+    /// not.
+    pub fn searched(
+        &self,
+        key: &TuneKey,
+        builds: impl FnOnce() -> Vec<u128>,
+        search: impl FnOnce() -> Option<(usize, u64)>,
+    ) -> Option<usize> {
+        if let Some(found) = self.memo.lock().expect("tune memo").get(key) {
+            return Some(*found);
+        }
+        let line = key.line(&builds());
+        let chosen = match self.get(key, &line) {
+            Some(found) => found,
+            None => {
+                let (found, ns) = search()?;
+                self.put(key, line, found, ns);
+                found
+            }
+        };
+        self.memo.lock().expect("tune memo").insert(key.clone(), chosen);
+        Some(chosen)
+    }
+
     /// [`Self::select_with`] over kernels: `compile(i)` builds candidate `i` (or
     /// `None` when it cannot be built); the first that built lifts the clock,
     /// then every candidate is timed in turn for [`ROUNDS`] rounds and its
@@ -186,12 +216,33 @@ impl TuneStore {
     ) -> Option<usize> {
         self.select_with(key, count, builds, || {
             let launches: Vec<Option<CompiledLaunch>> = (0..count).map(compile).collect();
+            for (i, launch) in launches.iter().enumerate() {
+                let Some(res) = launch.as_ref().and_then(CompiledLaunch::resources) else { continue };
+                tracing::debug!(
+                    kernel = key.kernel,
+                    candidate = i,
+                    vgprs = res.vgprs,
+                    lds = res.lds_bytes,
+                    scratch = res.scratch_bytes,
+                    occupancy = res.occupancy,
+                    "tune: candidate resources"
+                );
+            }
             if let Some(first) = launches.iter().flatten().next() {
                 // SAFETY: the launch's buffers live in `first` for the whole loop.
                 warm_clock(CLOCK_WARMUP, || first.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos));
             }
             let time = |i: usize| launches[i].as_ref()?.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos);
-            round_robin_min(count, ROUNDS, time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
+            let times: Vec<_> = round_robin_min(count, ROUNDS, time);
+            for (i, t) in times.iter().enumerate() {
+                tracing::debug!(
+                    kernel = key.kernel,
+                    candidate = i,
+                    ns = t.map(|t| t.as_nanos() as u64),
+                    "tune: candidate time"
+                );
+            }
+            times.into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
         })
     }
 }

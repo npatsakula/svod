@@ -442,6 +442,12 @@ mod dlopen_impl {
             Ok(Self { _lib: lib, fn_ptr, name: name.to_string(), var_names, cif, _tmp_dir: tmp_dir })
         }
 
+        /// Execute the kernel with buffer pointers and variable values.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure buffer pointers are valid/aligned and `vals` length
+        /// matches `var_names`.
         pub unsafe fn execute_with_vals(&self, buffers: &[*mut u8], vals: &[i64]) -> Result<()> {
             unsafe { self.cif.dispatch(self.fn_ptr, buffers, vals, None)? };
             Ok(())

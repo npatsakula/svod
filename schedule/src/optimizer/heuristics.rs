@@ -12,7 +12,7 @@ use svod_ir::{AxisId, AxisType, BinaryOp, Op, RendererDevice, TernaryOp, UOp};
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
 use crate::optimizer::error::OptError;
 use crate::optimizer::renderer::{Renderer, TcTilePolicy, TensorCore};
-use crate::optimizer::tc::matmul_operands;
+use crate::optimizer::tc::{MatmulPattern, matmul_operands};
 use crate::optimizer::{Opt, Scheduler, apply_opt};
 use svod_ir::ops;
 
@@ -56,9 +56,19 @@ fn const_extent(rng: &Arc<UOp>) -> Option<usize> {
     }
 }
 
-/// Product of the constant extents of every axis of `axis_type`.
-fn extent_product(scheduler: &Scheduler, axis_type: AxisType) -> usize {
-    scheduler.ranges_of(&[axis_type]).iter().filter_map(const_extent).product::<usize>().max(1)
+/// Product of the constant extents of every axis of one of `axis_types`.
+fn extent_product(scheduler: &Scheduler, axis_types: &[AxisType]) -> usize {
+    scheduler.ranges_of(axis_types).iter().filter_map(const_extent).product::<usize>().max(1)
+}
+
+/// Trips the accumulator is reused over: every reduce axis the kernel still
+/// carries, which is what the core left of its own K times the reduces it did
+/// not take. A convolution's taps stay as loops around the WMMA and the
+/// accumulator is set up and written back once for all of them, so counting the
+/// core's K axis alone understates the depth ninefold on a 3x3 — and then caps
+/// the warp tile far below what the register budget allows.
+fn reduce_depth(scheduler: &Scheduler) -> usize {
+    extent_product(scheduler, &[AxisType::Reduce, AxisType::GroupReduce])
 }
 
 /// LOCAL size for a global axis none of the standard sizes divides, with the
@@ -1401,12 +1411,14 @@ fn tc_warp_tile_growth(
     (m, grow(n_tiles, (growth / m).min(upcast_max)))
 }
 
-/// Split `rngs[dim]` (`0` = N, `1` = M) by `sz`, recording the opt.
-fn tc_split(scheduler: &mut Scheduler, rngs: &mut [Arc<UOp>; 2], dim: usize, sz: usize, new_type: AxisType) {
-    let Some(idx) = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, &rngs[dim])) else { return };
-    let Ok((replaced, _)) = scheduler.shift_to(rngs[dim].clone(), sz, new_type, false, None) else { return };
+/// Split `rngs[dim]` (`0` = N, `1` = M, then the extra growth axes) by `sz`,
+/// recording the opt. `false` when the axis is no longer in the kernel.
+fn tc_split(scheduler: &mut Scheduler, rngs: &mut [Arc<UOp>], dim: usize, sz: usize, new_type: AxisType) -> bool {
+    let Some(idx) = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, &rngs[dim])) else { return false };
+    let Ok((replaced, _)) = scheduler.shift_to(rngs[dim].clone(), sz, new_type, false, None) else { return false };
     scheduler.applied_opts.push(if new_type == AxisType::Upcast { Opt::upcast(idx, sz) } else { Opt::local(idx, sz) });
     rngs[dim] = replaced;
+    true
 }
 
 /// Whether `rng`'s extent divides by `sz`.
@@ -1414,30 +1426,105 @@ fn divides(rng: &Arc<UOp>, sz: usize) -> bool {
     matches!(rng.op(), Op::Range(ops::Range { end, .. }) if end.divides(sz as i64).is_some())
 }
 
+/// Factors the fixed step grows the warp tile by, best first.
+const TC_STEP_FACTORS: [usize; 4] = [5, 4, 3, 2];
+
+/// The load instructions a lane issues for one tensor-core fragment of
+/// `operand`: a fragment whose run along the reduce axis `k` is contiguous
+/// arrives as vector accesses, a strided one costs an access per element.
+fn fragment_cost(operand: &Arc<UOp>, k: &Arc<UOp>, elements: usize, access_bytes: usize) -> usize {
+    let bufs: Vec<Arc<UOp>> =
+        operand.backward_slice().into_iter().filter(|node| matches!(node.op(), Op::Index(..))).collect();
+    match min_stride(&linearized_indices(&bufs), k) {
+        Some(1) => elements.div_ceil((access_bytes / operand.dtype().base().bytes().max(1)).max(1)),
+        _ => elements,
+    }
+}
+
+/// Where the output of a matmul may grow once the tensor core has landed.
+///
+/// Growing along an output axis re-reads the fragments of the operands that
+/// axis indexes and holds the fragment of the operand it does not: an M-like
+/// axis re-reads A and reuses B, an N-like axis the other way round. So each
+/// direction is worth what one fragment of the operand it reuses costs a lane
+/// to load ([`fragment_cost`]), and the widest reuse is the growth that saves
+/// the most memory traffic.
+struct TcGrowth {
+    /// What one A / B fragment costs a lane.
+    costs: (usize, usize),
+    /// Output axes outside the tensor core's own M and N — a convolution's
+    /// second spatial axis, a batch — with the cost each one's growth reuses.
+    extra: Vec<(Arc<UOp>, usize)>,
+}
+
+impl TcGrowth {
+    /// The axis outside the tensor core's M and N whose growth holds a pricier
+    /// fragment than N's does, if the kernel has one: where the step's second
+    /// UPCAST would re-read that fragment once per lane tile, stacking warps
+    /// along this axis leaves one fragment for the whole block.
+    fn stacking_axis(&self, scheduler: &Scheduler) -> Option<Arc<UOp>> {
+        self.extra
+            .iter()
+            .filter(|(rng, reuse)| *reuse > self.costs.0 && scheduler.rngs().iter().any(|r| Arc::ptr_eq(r, rng)))
+            .max_by_key(|(_, reuse)| *reuse)
+            .map(|(rng, _)| rng.clone())
+    }
+
+    /// The growth of `pattern` under `axis_choice` on a tensor core with
+    /// `ept` elements per thread and `access_bytes`-wide vector accesses.
+    fn of(pattern: &MatmulPattern, axis_choice: usize, ept: (usize, usize), access_bytes: usize) -> Self {
+        let (n_axis, m_axis, k_axis) = &pattern.axis_choices[axis_choice];
+        let costs = (
+            fragment_cost(&pattern.in0, k_axis, ept.0, access_bytes),
+            fragment_cost(&pattern.in1, k_axis, ept.1, access_bytes),
+        );
+        let others = |ranges: &[Arc<UOp>], taken: &Arc<UOp>, reuse: usize| {
+            ranges.iter().filter(|r| !Arc::ptr_eq(r, taken)).map(|r| (r.clone(), reuse)).collect::<Vec<_>>()
+        };
+        let mut extra = others(&pattern.in0_ranges, m_axis, costs.1);
+        extra.extend(others(&pattern.in1_ranges, n_axis, costs.0));
+        Self { costs, extra }
+    }
+}
+
 /// Tile the matmul left over by [`tc::apply`](crate::optimizer::tc) across
 /// warps and blocks, following the renderer's [`TcTilePolicy`]. `axes` is the
-/// `[N, M, K]` the tensor core returned.
-fn apply_tc_tiling(scheduler: &mut Scheduler, axes: &[Arc<UOp>; 3]) {
-    let mut rngs = [axes[0].clone(), axes[1].clone()];
+/// `[N, M, K]` the tensor core returned, `growth` the directions the warp tile
+/// may take.
+fn apply_tc_tiling(scheduler: &mut Scheduler, growth: &TcGrowth, axes: &[Arc<UOp>; 3]) {
+    let mut rngs = vec![axes[0].clone(), axes[1].clone()];
     let tc = scheduler.renderer().tensor_cores[scheduler.selected_tc_index.unwrap_or(0)].clone();
 
     match scheduler.renderer().tc_tile_policy() {
         TcTilePolicy::FixedStep => {
-            // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2].
-            for dim in [1usize, 0] {
-                for &sz in &[5usize, 4, 3, 2] {
-                    if divides(&rngs[dim], sz) {
-                        tc_split(scheduler, &mut rngs, dim, sz, AxisType::Upcast);
-                        break;
-                    }
+            // One step of the ladder on `rngs[dim]`: UPCAST by [5,4,3,2], LOCAL by [4,2].
+            let step = |scheduler: &mut Scheduler, rngs: &mut Vec<Arc<UOp>>, dim: usize, new_type| {
+                let factors: &[usize] = if new_type == AxisType::Upcast { &TC_STEP_FACTORS } else { &[4, 2] };
+                if let Some(&sz) = factors.iter().find(|&&sz| divides(&rngs[dim], sz)) {
+                    tc_split(scheduler, rngs, dim, sz, new_type);
                 }
-            }
-            // LOCAL N (dim=0) with factors [4,2].
-            if scheduler.renderer().has_local {
-                for &sz in &[4usize, 2] {
-                    if divides(&rngs[0], sz) {
-                        tc_split(scheduler, &mut rngs, 0, sz, AxisType::Local);
-                        break;
+            };
+            // UPCAST M (dim=1), as the step has always started.
+            step(scheduler, &mut rngs, 1, AxisType::Upcast);
+
+            // The rest of the growth goes to the axis that holds the pricier
+            // operand fragment. An axis outside the tensor core's M and N takes
+            // it into the block: the warps of a block then share that fragment
+            // through one cache line each, where UPCASTing N would have every
+            // lane re-read it once per tile it holds. This is what a
+            // channels-last convolution's second spatial axis does against a
+            // weight the reduce strides over — with N's own fragment cheap,
+            // there is nothing for a wider lane tile to save.
+            match growth.stacking_axis(scheduler).filter(|_| scheduler.renderer().has_local) {
+                Some(stack) => {
+                    rngs.push(stack);
+                    step(scheduler, &mut rngs, 2, AxisType::Local);
+                }
+                // UPCAST N (dim=0) with factors [5,4,3,2], then LOCAL N with [4,2].
+                None => {
+                    step(scheduler, &mut rngs, 0, AxisType::Upcast);
+                    if scheduler.renderer().has_local {
+                        step(scheduler, &mut rngs, 0, AxisType::Local);
                     }
                 }
             }
@@ -1447,12 +1534,8 @@ fn apply_tc_tiling(scheduler: &mut Scheduler, axes: &[Arc<UOp>; 3]) {
                 &tc,
                 accum_max,
                 scheduler.renderer().upcast_max,
-                extent_product(scheduler, AxisType::Global),
-                [
-                    const_extent(&rngs[1]).unwrap_or(1),
-                    const_extent(&rngs[0]).unwrap_or(1),
-                    const_extent(&axes[2]).unwrap_or(1),
-                ],
+                extent_product(scheduler, &[AxisType::Global]),
+                [const_extent(&rngs[1]).unwrap_or(1), const_extent(&rngs[0]).unwrap_or(1), reduce_depth(scheduler)],
             );
             for (dim, sz) in [(1usize, m_grow), (0, n_grow)] {
                 if sz > 1 {
@@ -1523,9 +1606,30 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
 
     let axis_choice_count = pattern.axis_choices.len();
 
+    // Take the choices in increasing padded work, and at equal work the deeper
+    // reduce first ([`tc::axis_choice_rank`]). The detection order is the axes'
+    // own, which for a conv offers the 3-wide tap as K before the channels;
+    // applying whichever of those happens to come first pads the taps to the
+    // core's K edge and leaves the channels as a scalar loop. Sorting is stable,
+    // so choices the rank cannot compare keep that detection order.
+    let order = {
+        let renderer = scheduler.renderer();
+        let rank: Vec<_> = (0..axis_choice_count)
+            .map(|choice| tc::axis_choice_rank(&pattern, renderer, config.tc_select.as_i32(), choice))
+            .collect();
+        let mut order: Vec<usize> = (0..axis_choice_count).collect();
+        order.sort_by(|&a, &b| match (rank[a], rank[b]) {
+            (Some((pad_a, k_a)), Some((pad_b, k_b))) => pad_a.total_cmp(&pad_b).then(k_b.cmp(&k_a)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        order
+    };
+
     let mut rejections = Vec::new();
 
-    for axis_choice in 0..axis_choice_count {
+    for axis_choice in order {
         // Clone the scheduler for trial - if this axis choice fails, no partial mutations.
         let mut trial = scheduler.clone();
         let tc_result = tc::apply_with_axis_choice(
@@ -1555,7 +1659,11 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         );
         trial.applied_opts.push(opt);
 
-        apply_tc_tiling(&mut trial, &axes);
+        let (ept, access_bytes) = {
+            let renderer = trial.renderer();
+            (renderer.tensor_cores[trial.selected_tc_index.unwrap_or(0)].elements_per_thread, renderer.access_bytes())
+        };
+        apply_tc_tiling(&mut trial, &TcGrowth::of(&pattern, axis_choice, (ept.0, ept.1), access_bytes), &axes);
 
         *scheduler = trial;
         return true;

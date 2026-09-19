@@ -33,6 +33,7 @@ impl SemSegClassifier {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = &super::head::in_head_dtype(x);
         let x = self.conv0.forward(x)?;
         Ok(self.conv2.forward(&x)?)
     }
@@ -61,13 +62,16 @@ impl Yolo26SemSeg {
         let nc = config.nc;
         let d = |yaml_n| make_depth(yaml_n, scale);
         let [_, _, c2, c3, c4] = super::backbone::scaled_channels(scale);
-        Self {
+        let mut model = Self {
             config: config.clone(),
             backbone: YoloBackbone::empty(scale),
             c3k2_13: C3k2::empty(c4 + c3, c3, d(2), true, 0.5, true, false),
             c3k2_16: C3k2::empty(c3 + c3, c2, d(2), true, 0.5, true, false),
             classifier: SemSegClassifier::empty(c2, nc),
-        }
+        };
+        loader::cast_placeholders(&mut model, &config.compute_dtype)
+            .expect("a freshly built model round-trips its own state dict");
+        model
     }
 
     pub fn from_hub(model_id: &str, config: YoloConfig) -> Result<Self> {
@@ -85,13 +89,15 @@ impl Yolo26SemSeg {
     }
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
+        let sd = loader::load_weights(sd, &config.compute_dtype)?;
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "")?;
+        model.load_state_dict(&sd, "")?;
         Ok(model)
     }
 
     /// Run the full network. Returns `[B, nc, H/8, W/8]` per-pixel logits.
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let images = &self.config.cast_input(images);
         let (l4, l6, l10) = self.backbone.forward(images)?;
 
         // Partial FPN top-down (layers 11–16)

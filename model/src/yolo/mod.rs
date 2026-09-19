@@ -40,7 +40,7 @@ mod detect;
 mod error;
 pub(crate) mod head;
 mod jit;
-mod loader;
+pub(crate) mod loader;
 mod neck;
 mod obb;
 mod pose;

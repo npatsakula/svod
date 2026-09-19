@@ -121,6 +121,52 @@ impl<'k> Group<'k> {
         stage.after(smallvec![stored])
     }
 
+    /// [`Self::stage_global_to_reg`] for a strip whose rows are not consecutive
+    /// in `src`: `rows` maps a strip row (`0..st.rows`) to the flat offset of that
+    /// row's first strip element and a validity gate; the strip's columns follow
+    /// that offset consecutively. An invalid row reads element `0` and lands as
+    /// zeros, so a gathered operand (a convolution's padded taps, the rows past a
+    /// ragged `M`) never touches memory it does not own, and a lane's `ept` run
+    /// stays one shaped load.
+    pub fn stage_global_rows_to_reg(
+        &self,
+        st: &ST,
+        src: &GL,
+        rows: impl Fn(&Arc<UOp>) -> (Arc<UOp>, Arc<UOp>),
+    ) -> Arc<UOp> {
+        let geom = self.lds_fill_geom(st);
+        let stage = self.ker.alloc_reg((geom.total_calls * geom.ept) as usize, st.elem().clone());
+        let stage_shape = [geom.total_calls as usize, geom.ept as usize];
+        let ept = geom.ept as usize;
+        let mut stores = Vec::with_capacity(stage_shape[0] * ept);
+        for pass in 0..geom.total_calls {
+            let (height, width, row, col) = self.fill_lane_rc(&geom, &cidx(pass), &cidx(0));
+            let strip_row = iadd(&imul(&height, geom.base_rows), &row);
+            let strip_col = iadd(&imul(&width, geom.base_cols), &col);
+            let (row_off, valid) = rows(&strip_row);
+            let off = iadd(&row_off, &strip_col);
+            let safe = UOp::try_where(valid.clone(), off, cidx(0)).expect("gathered row: safe offset");
+            let run = load_off_vec(src.uop(), &safe, ept);
+            // The fill is a multiply by the gate, not a select: a `WHERE` over a
+            // load is rewritten into a gated load, whose gate the index
+            // simplifier may then discharge against the clamped offset.
+            // Through f32: the backends select a bool -> f32 conversion, not a
+            // bool -> bf16 one.
+            let mask = valid.cast(svod_dtype::DType::Float32).cast(st.elem().clone());
+            for e in 0..ept {
+                let mut v = vec_elem(&run, e, ept);
+                if src.elem() != st.elem() {
+                    v = v.cast(st.elem().clone());
+                }
+                let v = v.try_mul(&mask).expect("gathered row: zero fill");
+                stores.push(flat_index(&stage, &stage_shape, &[Idx::Const(pass), Idx::Const(e as i64)]).store(v));
+            }
+        }
+        let stored = super::group_or_single(stores);
+        self.ker.push_store(stored.clone(), stage.clone());
+        stage.after(smallvec![stored])
+    }
+
     /// Commit staged register buffers (from [`Self::stage_global_to_reg`]) into
     /// their swizzled LDS tiles — the VGPR→LDS `ds_write` half of the prefetch —
     /// as ONE store node, returned for the caller to fence: wrap it in the
@@ -696,10 +742,11 @@ impl<'k> Group<'k> {
         col_tile: i64,
         srow: &Arc<UOp>,
         scol: &Arc<UOp>,
+        clipped: bool,
     ) -> Option<Arc<UOp>> {
         let mut gate: Option<Arc<UOp>> = None;
         let bound_row = shape[axis] as i64;
-        if bound_row % row_tile != 0 {
+        if clipped || bound_row % row_tile != 0 {
             let blk = idxs.get(axis).map(|i| i.to_uop()).unwrap_or_else(|| cidx(0));
             let g = iadd(&imul(&blk, row_tile), srow).try_cmplt(&cidx(bound_row)).expect("boundary row gate");
             gate = Some(g);
@@ -762,7 +809,9 @@ impl<'k> Group<'k> {
             let scol = iadd(&imul(&ix[1].to_uop(), base_cols), &col);
             let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
             let gate = masked
-                .then(|| self.boundary_gate(src.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
+                .then(|| {
+                    self.boundary_gate(src.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol, false)
+                })
                 .flatten();
             let mut load = match gate {
                 Some(g) => {
@@ -833,7 +882,7 @@ impl<'k> Group<'k> {
         axis: usize,
         masked: bool,
     ) -> GL {
-        self.store_reg_to_global_with(dst, rt, idxs, src_idxs, axis, masked, |v, _| v.clone())
+        self.store_reg_to_global_with(dst, rt, idxs, src_idxs, axis, masked, false, |v, _| v.clone())
     }
 
     /// [`Self::store`]'s REG→GLOBAL hop with a per-element **value transform**:
@@ -851,7 +900,7 @@ impl<'k> Group<'k> {
     where
         F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
     {
-        self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, value)
+        self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, ix.clipped, value)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -863,6 +912,7 @@ impl<'k> Group<'k> {
         src_idxs: &[Idx],
         axis: usize,
         masked: bool,
+        clipped: bool,
         value: F,
     ) -> GL
     where
@@ -908,7 +958,9 @@ impl<'k> Group<'k> {
             }
             let load = value(&load, &off);
             let gate = masked
-                .then(|| self.boundary_gate(dst.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
+                .then(|| {
+                    self.boundary_gate(dst.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol, clipped)
+                })
                 .flatten();
             let target = match gate {
                 Some(g) => index_off_gated(dst.uop(), off, g),

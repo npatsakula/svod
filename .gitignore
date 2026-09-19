@@ -4,3 +4,6 @@ book/build
 website/node_modules/
 website/.docusaurus/
 website/build/
+__pycache__/
+.venv/
+/data
