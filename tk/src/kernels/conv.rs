@@ -81,10 +81,10 @@ impl ConvGeom {
 /// off: the grid is the plain 2-D one and `M` may be ragged.
 pub fn select_conv_cfg(policy: &GemmPolicy, geom: &ConvGeom) -> Option<GemmCfg> {
     let plain = |cfg: &GemmCfg| GemmCfg { l2_swizzle: false, ..*cfg };
-    let widest = policy.tiles.first()?;
+    let widest = policy.conv_tiles.first()?;
     let starved = geom.blocks(widest) < policy.compute_units * policy.resident;
     let wide = |cfg: &GemmCfg| cfg.block_m * cfg.block_n >= widest.block_m * widest.block_n;
-    let mut table: Vec<GemmCfg> = policy.tiles.iter().map(plain).collect();
+    let mut table: Vec<GemmCfg> = policy.conv_tiles.iter().map(plain).collect();
     if starved {
         table.sort_by_key(wide);
     }
@@ -104,8 +104,12 @@ pub fn tuned_conv_cfg(
 ) -> Option<GemmCfg> {
     let policy = GemmPolicy::for_device(spec, arch);
     let caps = crate::ArchCaps::for_arch(arch);
-    let candidates: Vec<GemmCfg> =
-        policy.tiles.iter().map(|cfg| GemmCfg { l2_swizzle: false, ..*cfg }).filter(|cfg| geom.tiles(cfg)).collect();
+    let candidates: Vec<GemmCfg> = policy
+        .conv_tiles
+        .iter()
+        .map(|cfg| GemmCfg { l2_swizzle: false, ..*cfg })
+        .filter(|cfg| geom.tiles(cfg))
+        .collect();
     let fallback = || select_conv_cfg(&policy, &geom);
     if candidates.len() < 2 {
         return fallback();

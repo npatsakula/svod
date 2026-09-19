@@ -764,6 +764,18 @@ pub const NT_128X64: GemmCfg = GemmCfg {
 /// grid is already big enough, so [`GemmPolicy`] picks it only when that grid is not.
 pub const NT_64X64: GemmCfg = GemmCfg { block_m: 64, acc_m: 1, ..NT_128X64 };
 
+/// [`NT_64X64`] over a 64-deep strip: 32 KiB of shared memory, the same 32
+/// accumulators per lane, and half as many K trips.
+///
+/// A trip is not free on every kernel that reads this table. The implicit-GEMM
+/// convolution rebuilds each strip row's source index per trip — decoding the
+/// output pixel and the tap out of `(pid_m, r, tile)` — so halving the trips
+/// halves that work per MAC. Measured on an RTX 3060, yolo26x f16: it wins 8 of
+/// the 9 convolution shapes the model tunes, by 33-65% (a 768-channel stride-2
+/// 3x3 at 977 us against 1589 for [`NT_128X64`]), and the shape it loses is the
+/// one whose `cin` a 64-deep strip does not divide.
+pub const NT_64X64_K64: GemmCfg = GemmCfg { k_step: 64, ..NT_64X64 };
+
 /// The split-K tile: [`NT_128X64`] over two K-slabs, writing `[2, M, N]` f32
 /// partials that a second pass sums. **Never selected by [`GemmPolicy`]**: the
 /// partials' round trip costs more than the wider grid saves (122 vs 98 µs on a
@@ -773,6 +785,16 @@ pub const NT_SPLIT_K: GemmCfg = GemmCfg { split_k: 2, l2_swizzle: false, ..NT_12
 
 /// The CUDA sm_80+ tiles, widest first.
 pub const CUDA_TILES: [GemmCfg; 2] = [NT_128X64, NT_64X64];
+
+/// [`CUDA_TILES`] plus the 64-deep strip, for the kernels that pay per K trip.
+///
+/// The GEMM does not: its strip rows are a base pointer and a stride, so trip
+/// count is nearly free and [`NT_64X64_K64`] only costs it shared memory. The
+/// implicit-GEMM convolution rebuilds every strip row's source index per trip,
+/// so the same tile halves its addressing work per MAC. Kept apart rather than
+/// merged because measurement says the two kernels want different tables, not
+/// because one of them is wrong.
+pub const CUDA_CONV_TILES: [GemmCfg; 3] = [NT_128X64, NT_64X64, NT_64X64_K64];
 
 /// The RDNA (wave32 WMMA) tiles, measured on gfx1151: the CUDA tiles without the
 /// L2 swizzle, plus the fine tile on a 64-deep strip, which halves the barriers
@@ -815,6 +837,9 @@ pub struct GemmPolicy {
     /// preference order; empty where no one has measured the family (the policy
     /// then declines every shape rather than run another family's constants).
     pub tiles: &'static [GemmCfg],
+    /// The tiles a convolution chooses among — [`Self::tiles`] where no kernel of
+    /// the family pays per K trip, wider where one does.
+    pub conv_tiles: &'static [GemmCfg],
     /// Blocks of the widest tile per compute unit below which a finer tile wins.
     /// On CUDA the blocks resident per SM (~116 registers and 24 KiB of shared
     /// memory against 64 K and 100 KiB); on RDNA measured (the wide tile leads
@@ -830,13 +855,17 @@ impl GemmPolicy {
     /// real count. A family nobody measured declines.
     pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
         match crate::arch::Family::of(arch) {
-            crate::arch::Family::Cuda => Self { compute_units: 28, tiles: &CUDA_TILES, resident: 4 },
-            crate::arch::Family::Rdna if matches!(arch, svod_dtype::GpuArch::Amd(amd) if amd.is_rdna4()) => {
-                Self { compute_units: 64, tiles: &RDNA4_TILES, resident: 1 }
+            crate::arch::Family::Cuda => {
+                Self { compute_units: 28, tiles: &CUDA_TILES, conv_tiles: &CUDA_CONV_TILES, resident: 4 }
             }
-            crate::arch::Family::Rdna => Self { compute_units: 40, tiles: &RDNA_TILES, resident: 8 },
+            crate::arch::Family::Rdna if matches!(arch, svod_dtype::GpuArch::Amd(amd) if amd.is_rdna4()) => {
+                Self { compute_units: 64, tiles: &RDNA4_TILES, conv_tiles: &RDNA4_TILES, resident: 1 }
+            }
+            crate::arch::Family::Rdna => {
+                Self { compute_units: 40, tiles: &RDNA_TILES, conv_tiles: &RDNA_TILES, resident: 8 }
+            }
             crate::arch::Family::Cdna | crate::arch::Family::Metal => {
-                Self { compute_units: 1, tiles: &[], resident: 1 }
+                Self { compute_units: 1, tiles: &[], conv_tiles: &[], resident: 1 }
             }
         }
     }
