@@ -23,6 +23,7 @@ mod scaffold;
 mod shuffle;
 mod sq_attention;
 mod swizzle;
+mod tiling;
 mod tune;
 
 /// The env-selected device's caps when tk defines its matrix-core fragment layouts

@@ -13,3 +13,4 @@ pub mod kmeans;
 pub mod knn;
 pub mod norm;
 pub mod sq_attention;
+pub mod tiling;
