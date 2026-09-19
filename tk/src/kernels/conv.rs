@@ -11,15 +11,19 @@
 use std::cell::OnceCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use snafu::{ResultExt, ensure};
 use svod_dtype::DType;
 use svod_ir::UOp;
+use svod_runtime::benchmark::{CLOCK_WARMUP, warm_clock};
 use svod_tensor::Tensor;
 
 use super::gemm::{Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmCfg, GemmPolicy, RowSource, gemm_core_with};
+use super::tiling::{self, TileBudget, TripCost};
 use crate::group::{iadd, idiv, imod, imul};
 use crate::index::cidx;
+use crate::tune::ROUNDS as TUNE_ROUNDS;
 use crate::{GlSpec, Kernel};
 
 /// The arches the kernel runs on: the NT GEMM's, whose tile tables it reads.
@@ -81,19 +85,53 @@ impl ConvGeom {
 /// off: the grid is the plain 2-D one and `M` may be ragged.
 pub fn select_conv_cfg(policy: &GemmPolicy, geom: &ConvGeom) -> Option<GemmCfg> {
     let plain = |cfg: &GemmCfg| GemmCfg { l2_swizzle: false, ..*cfg };
-    let widest = policy.conv_tiles.first()?;
+    let widest = policy.tiles.first()?;
     let starved = geom.blocks(widest) < policy.compute_units * policy.resident;
     let wide = |cfg: &GemmCfg| cfg.block_m * cfg.block_n >= widest.block_m * widest.block_n;
-    let mut table: Vec<GemmCfg> = policy.conv_tiles.iter().map(plain).collect();
+    let mut table: Vec<GemmCfg> = policy.tiles.iter().map(plain).collect();
     if starved {
         table.sort_by_key(wide);
     }
     table.into_iter().find(|cfg| geom.tiles(cfg))
 }
 
-/// [`select_conv_cfg`] as measured on this device ([`crate::tune`]): every
-/// table tile that fits is timed once on synthetic operands and the fastest
-/// kept in `store`; the static choice where only one fits or nothing measured.
+/// The tiles worth measuring for `geom`: what the device's own limits allow,
+/// ranked by what a kernel that rebuilds a row index per K trip pays for them
+/// ([`crate::kernels::tiling`]).
+///
+/// These are where the beam starts, not what it settles on. The model only has
+/// to start it somewhere sensible; [`beam`] measures its way from there.
+fn conv_candidates(
+    policy: &GemmPolicy,
+    spec: &svod_dtype::DeviceSpec,
+    arch: svod_dtype::GpuArch,
+    dtype: &DType,
+    geom: &ConvGeom,
+) -> Vec<GemmCfg> {
+    let (m, _, n) = geom.mkn();
+    let plain = |cfg: &GemmCfg| GemmCfg { l2_swizzle: false, ..*cfg };
+    let base = plain(policy.tiles.first().unwrap_or(&crate::kernels::gemm::NT_128X64));
+    let generated = TileBudget::for_device(spec, arch).map(|budget| {
+        budget.ranked(&base, dtype.bytes(), TripCost::PerStripRow, (m, n), CONV_SEEDS, |cfg| geom.tiles(cfg))
+    });
+    match generated {
+        Some(seeds) if !seeds.is_empty() => seeds.into_iter().collect(),
+        // No limits to generate against: fall back to the family's own table,
+        // which is what the kernel ran on before there was a model.
+        _ => policy.tiles.iter().map(plain).filter(|cfg| geom.tiles(cfg)).collect(),
+    }
+}
+
+/// Tiles the model offers the beam to start from. Only the best few matter —
+/// the walk reaches the rest — and every extra seed is a compile on first use.
+const CONV_SEEDS: usize = 4;
+
+/// The tile for `geom` as measured on this device: [`beam`] walks the lattice
+/// from the seeds [`conv_candidates`] ranks, timing each on synthetic operands,
+/// and `store` keeps the winner so the next process starts tuned.
+///
+/// Falls back to the static [`select_conv_cfg`] when nothing measured — a device
+/// that stamps no timings, or one whose limits the backend does not report.
 pub fn tuned_conv_cfg(
     store: &crate::tune::TuneStore,
     spec: &svod_dtype::DeviceSpec,
@@ -104,12 +142,7 @@ pub fn tuned_conv_cfg(
 ) -> Option<GemmCfg> {
     let policy = GemmPolicy::for_device(spec, arch);
     let caps = crate::ArchCaps::for_arch(arch);
-    let candidates: Vec<GemmCfg> = policy
-        .conv_tiles
-        .iter()
-        .map(|cfg| GemmCfg { l2_swizzle: false, ..*cfg })
-        .filter(|cfg| geom.tiles(cfg))
-        .collect();
+    let candidates: Vec<GemmCfg> = conv_candidates(&policy, spec, arch, dtype, &geom);
     let fallback = || select_conv_cfg(&policy, &geom);
     if candidates.len() < 2 {
         return fallback();
@@ -151,8 +184,7 @@ pub fn tuned_conv_cfg(
         epi.code(),
     ];
     let key = crate::tune::TuneKey::new("conv2d_nhwc", spec, arch, &shape, &(&candidates, dtype));
-    let compile = |i: usize| {
-        let cfg = candidates[i];
+    let compile = |cfg: GemmCfg| {
         let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
         let (x, w, b) = (
             operand(&[geom.batch, geom.h, geom.w, geom.cin])?,
@@ -169,7 +201,91 @@ pub fn tuned_conv_cfg(
         crate::launch::compile_kernel("conv2d_nhwc_tune", grid, block, &mut [&mut y], &ins, move |ker| build(ker, cfg))
             .ok()
     };
-    store.select(&key, candidates.len(), builds, compile).map(|i| candidates[i]).or_else(fallback)
+    let budget = TileBudget::for_device(spec, arch);
+    let seed = candidates.first().copied();
+    let search = || {
+        let (budget, seed) = (budget?, seed?);
+        beam(&budget, seed, &candidates, dtype.bytes(), |cfg| geom.tiles(cfg), compile)
+            .map(|(cfg, ns)| (tiling::pack(&cfg), ns))
+    };
+    store
+        .searched(&key, builds, search)
+        .map(|bits| tiling::unpack(&candidates.first().copied().unwrap_or(crate::kernels::gemm::NT_128X64), bits))
+        .filter(|cfg| geom.tiles(cfg))
+        .or_else(fallback)
+}
+
+/// Beam width: tiles kept between rounds. Two is enough for a lattice this
+/// shallow, and every extra one is a compile and a timing run per round.
+const BEAM_WIDTH: usize = 2;
+/// Rounds of expansion. The walk stops early once a round finds nothing faster,
+/// so this only bounds a search that keeps improving.
+const BEAM_ROUNDS: usize = 3;
+
+/// Walk the tile lattice from `seeds`, measuring: time the frontier, keep the
+/// fastest [`BEAM_WIDTH`], expand those by [`TileBudget::neighbours`], repeat.
+///
+/// This is the same shape as the graph optimizer's BEAM, and for the same
+/// reason. The cost a tile model can compute stops short of what decides the
+/// winner — where the compiler begins spilling is a step, not a slope, and
+/// depends on addressing the tile knows nothing about. A measured walk does not
+/// need to know: it only needs the lattice to be connected, which one-step
+/// doublings make it. The model still chooses where to start, which is what
+/// keeps the walk short.
+fn beam(
+    budget: &TileBudget,
+    seed: GemmCfg,
+    seeds: &[GemmCfg],
+    in_bytes: usize,
+    accept: impl Fn(&GemmCfg) -> bool + Copy,
+    mut compile: impl FnMut(GemmCfg) -> Option<crate::launch::CompiledLaunch>,
+) -> Option<(GemmCfg, u64)> {
+    let mut timed: Vec<(GemmCfg, u64)> = Vec::new();
+    let mut frontier: Vec<GemmCfg> = seeds.iter().copied().take(BEAM_WIDTH.max(1)).collect();
+    if frontier.is_empty() {
+        frontier.push(seed);
+    }
+    let mut measure = |cfgs: &[GemmCfg], timed: &mut Vec<(GemmCfg, u64)>| {
+        for &cfg in cfgs {
+            if timed.iter().any(|(seen, _)| *seen == cfg) {
+                continue;
+            }
+            let Some(launch) = compile(cfg) else { continue };
+            if timed.is_empty() {
+                warm_clock(CLOCK_WARMUP, || launch.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos));
+            }
+            let mut best = None;
+            for _ in 0..TUNE_ROUNDS {
+                if let Ok(Some(ns)) = launch.dispatch_gpu_ns() {
+                    best = Some(best.map_or(ns, |seen: u64| seen.min(ns)));
+                }
+            }
+            if let Some(ns) = best {
+                tracing::debug!(?cfg, ns, "conv2d_nhwc: timed a tile");
+                timed.push((cfg, ns));
+            }
+        }
+    };
+
+    measure(&frontier, &mut timed);
+    let mut best = timed.iter().copied().min_by_key(|(_, ns)| *ns)?;
+    for _ in 0..BEAM_ROUNDS {
+        let next: Vec<GemmCfg> =
+            frontier.iter().flat_map(|cfg| budget.neighbours(cfg, in_bytes, accept).into_iter()).collect();
+        if next.is_empty() {
+            break;
+        }
+        measure(&next, &mut timed);
+        let round = timed.iter().copied().min_by_key(|(_, ns)| *ns)?;
+        if round.1 >= best.1 {
+            break;
+        }
+        best = round;
+        let mut ranked = timed.clone();
+        ranked.sort_by_key(|(_, ns)| *ns);
+        frontier = ranked.into_iter().take(BEAM_WIDTH).map(|(cfg, _)| cfg).collect();
+    }
+    Some(best)
 }
 
 /// The tile for `geom` on the device behind `spec`: measured when tuning is on

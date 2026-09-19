@@ -173,6 +173,36 @@ impl TuneStore {
         Some(chosen)
     }
 
+    /// [`Self::select_with`] over a space the caller searches itself rather than
+    /// a list it enumerates: `search` walks the space, measuring as it goes, and
+    /// returns the winner encoded as an integer beside the time that won.
+    ///
+    /// The store keeps that integer exactly as it keeps a candidate index — the
+    /// caller decodes it — so a measured search survives the process without the
+    /// space having to be reproducible, which a search steered by measurement is
+    /// not.
+    pub fn searched(
+        &self,
+        key: &TuneKey,
+        builds: impl FnOnce() -> Vec<u128>,
+        search: impl FnOnce() -> Option<(usize, u64)>,
+    ) -> Option<usize> {
+        if let Some(found) = self.memo.lock().expect("tune memo").get(key) {
+            return Some(*found);
+        }
+        let line = key.line(&builds());
+        let chosen = match self.get(key, &line) {
+            Some(found) => found,
+            None => {
+                let (found, ns) = search()?;
+                self.put(key, line, found, ns);
+                found
+            }
+        };
+        self.memo.lock().expect("tune memo").insert(key.clone(), chosen);
+        Some(chosen)
+    }
+
     /// [`Self::select_with`] over kernels: `compile(i)` builds candidate `i` (or
     /// `None` when it cannot be built); the first that built lifts the clock,
     /// then every candidate is timed in turn for [`ROUNDS`] rounds and its
