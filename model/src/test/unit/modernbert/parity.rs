@@ -217,12 +217,17 @@ fn row_drift(got: &[f32], want: &[f32], mask: &[i64], l: usize, d: usize) -> Vec
 /// forward and the JIT with its batch pinned (flash attention, the local layers
 /// banded, tk's GEMMs where the rows tile), the JIT with its batch free (SDPA,
 /// the generic GEMMs), and the full row alone with no mask (the attention masks
-/// its own tile padding, if any). Each row's mean drift stays within 1.5×
-/// PyTorch's, and so does its 95th-percentile token. Not the single worst token:
-/// a few tokens amplify bf16 rounding chaotically, in PyTorch's run as in ours
-/// (0.8 mean |Δ| on one of the 512), and which ones blow up differs by path.
-/// The control — the same forward ignoring the padding — must break the short
-/// row's bound, or the bound proves nothing.
+/// its own tile padding, if any). Each row's mean drift, and its 95th-percentile
+/// token, stays within a quarter over the worst of PyTorch's bf16 paths on that
+/// row — SDPA and eager on the CPU and on CUDA, batched and each row alone. They
+/// differ by rounding alone, yet on the full row at 512 one lands at 1.61×
+/// another's p95, so a single run is no yardstick; svod's own tile and kernel
+/// choices spread as wide and reach PyTorch's worst, and a seventh draw from one
+/// spread passes six draws' worst one time in seven — hence the quarter. Not the
+/// single worst token either: a few tokens amplify bf16 rounding chaotically
+/// (0.8 mean |Δ| on one of the 512), and which ones blow up differs by path. The
+/// control — the same forward ignoring the padding — must break the short row's
+/// bound, or the bound proves nothing.
 #[test_case::test_case(500; "ragged")]
 #[test_case::test_case(512; "tile aligned")]
 #[ignore = "heavy: real ModernBERT-base weights + the long PyTorch golden, on a bf16 GPU"]
@@ -239,10 +244,15 @@ fn bf16_drift_tracks_pytorch_bf16(length: usize) {
         crate::state::load_safetensors(&real_file(&format!("golden_long_{length}.safetensors"))).expect("golden_long");
     let (ids, mask): (Vec<i64>, Vec<i64>) =
         (load_golden_vec(&golden, "input_ids"), load_golden_vec(&golden, "attention_mask"));
-    let (want, pytorch): (Vec<f32>, Vec<f32>) =
-        (load_golden_vec(&golden, "last_hidden_state"), load_golden_vec(&golden, "last_hidden_state_bf16"));
+    let want: Vec<f32> = load_golden_vec(&golden, "last_hidden_state");
     let (b, l) = (2usize, ids.len() / 2);
     let d = want.len() / ids.len();
+    let mut pytorch: Vec<&String> = golden.keys().filter(|k| k.starts_with("last_hidden_state_bf16.")).collect();
+    pytorch.sort();
+    assert!(
+        !pytorch.is_empty(),
+        "golden_long_{length} predates PyTorch's bf16 paths: rerun convert_modernbert.py --long"
+    );
 
     let mut cfg = ModernBertConfig::from_json(&real_file("config.json")).expect("parse config.json");
     (cfg.dtype, cfg.max_batch_size) = (dtype, b);
@@ -270,9 +280,16 @@ fn bf16_drift_tracks_pytorch_bf16(length: usize) {
         raw.as_chunks::<2>().0.iter().map(|&h| f32::from_bits(u32::from(u16::from_le_bytes(h)) << 16)).collect()
     };
 
-    let bound = row_drift(&pytorch, &want, &mask, l, d);
-    eprintln!("pytorch bf16 per row (mean, p95 token) |Δ|: {bound:.3?}");
-    let within = |drift: &[(f32, f32)]| drift.iter().zip(&bound).all(|(r, p)| r.0 <= 1.5 * p.0 && r.1 <= 1.5 * p.1);
+    let mut bound = vec![(0f32, 0f32); b];
+    for key in pytorch {
+        let drift = row_drift(&load_golden_vec(&golden, key), &want, &mask, l, d);
+        eprintln!("pytorch {} per row (mean, p95 token) |Δ|: {drift:.3?}", &key["last_hidden_state_bf16.".len()..]);
+        for (edge, row) in bound.iter_mut().zip(drift) {
+            *edge = (edge.0.max(row.0), edge.1.max(row.1));
+        }
+    }
+    eprintln!("bound, pytorch's worst per row (mean, p95 token) |Δ|: {bound:.3?}");
+    let within = |drift: &[(f32, f32)]| drift.iter().zip(&bound).all(|(r, p)| r.0 <= 1.25 * p.0 && r.1 <= 1.25 * p.1);
     let mut paths: Vec<(&str, Vec<(f32, f32)>)> = Vec::new();
     for (name, got) in [("eager", eager(&mask)), ("jit pinned", jit(true)), ("jit free batch", jit(false))] {
         assert!(got.iter().all(|x| x.is_finite()), "{name}: non-finite output");
