@@ -10,12 +10,13 @@
 //! state-dict key is absent), so `attn_norm` is `Option` and `None` for layer 0.
 
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Layer, LayerNorm, Module};
+use svod_tensor::nn::{LayerNorm, Module};
 
 use super::attention::ModernBertAttention;
 use super::error::Result;
 
 use super::mlp::ModernBertGlu;
+use super::norm::layer_norm;
 
 #[derive(Clone, Module)]
 pub struct EncoderLayer {
@@ -50,11 +51,10 @@ impl EncoderLayer {
     /// Forward. `x`: `(B, L, D)` → `(B, L, D)`.
     pub fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor), padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let normed = match &self.attn_norm {
-            Some(ln) => ln.forward(x)?,
+            Some(ln) => layer_norm(x, ln)?,
             None => x.clone(),
         };
-        let h = x.try_add(&self.attention.forward(&normed, rope, padding_mask)?)?;
-        let delta = self.mlp.forward(&self.mlp_norm.forward(&h)?)?;
-        Ok(h.try_add(&delta)?)
+        let h = self.attention.forward(&normed, rope, padding_mask, Some(x))?;
+        self.mlp.forward(&layer_norm(&h, &self.mlp_norm)?, Some(&h))
     }
 }

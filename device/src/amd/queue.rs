@@ -299,7 +299,11 @@ pub fn finalize_hcq_aql_timeline_submission(
             finalized.push(crate::hcq::Command::Timestamp { dst: end });
         }
     }
-    finalized.push(crate::hcq::Command::Store { dst: counter_address, value: next });
+    finalized.push(crate::hcq::Command::Store {
+        dst: counter_address,
+        value: next,
+        scope: crate::hcq::StoreScope::System,
+    });
     Ok(finalized)
 }
 
@@ -468,7 +472,11 @@ pub struct Pm4LoweringState {
 /// its next poll tier. No-op on backends without a KFD event.
 fn push_queue_event_mailbox(submission: &mut crate::hcq::Submission, core: &AmdDeviceCore) {
     if let Some(mailbox) = core.queue_event_mailbox() {
-        submission.push(crate::hcq::Command::Store { dst: mailbox.address, value: mailbox.event_id.into() });
+        submission.push(crate::hcq::Command::Store {
+            dst: mailbox.address,
+            value: mailbox.event_id.into(),
+            scope: crate::hcq::StoreScope::System,
+        });
     }
 }
 
@@ -512,14 +520,19 @@ pub fn lower_hcq_pm4(submission: &crate::hcq::Submission, state: Pm4LoweringStat
                     q.extend_from_slice(&pm4::acquire_mem());
                 }
             }
-            crate::hcq::Command::Store { dst, value } => {
+            crate::hcq::Command::Store { dst, value, scope } => {
                 if let Some(mask) = state.completion_xcc_mask {
                     q.extend_from_slice(&pm4::pred_exec(mask, 8));
                 }
                 if state.queue_event_mailbox == Some(*dst) {
                     q.extend_from_slice(&pm4::release_mem_event(*dst, value_u32("event id", *value)?, is_gfx9));
                 } else {
-                    q.extend_from_slice(&pm4::release_mem_write(*dst, *value, true, true, false, is_gfx9));
+                    // Work later on this queue reads through the same L2: a PM4
+                    // queue has one XCC and every dispatch first invalidates the
+                    // CU caches, and an AQL dispatch carries its own system-scope
+                    // fences. Only a store someone else waits on writes L2 back.
+                    let flush = *scope == crate::hcq::StoreScope::System;
+                    q.extend_from_slice(&pm4::release_mem_write(*dst, *value, true, flush, false, is_gfx9));
                 }
             }
             crate::hcq::Command::Timestamp { dst } => {
@@ -613,7 +626,7 @@ pub fn lower_hcq_sdma(
                 }
             }
             crate::hcq::Command::Timestamp { dst } => q.extend_from_slice(&sdma::timestamp_global(*dst)),
-            crate::hcq::Command::Store { dst, value } => {
+            crate::hcq::Command::Store { dst, value, .. } => {
                 let value = value_u32("store", *value)?;
                 q.extend_from_slice(&sdma::fence(*dst, value, target_major));
                 if queue_event_mailbox == Some(*dst) {
@@ -1599,7 +1612,11 @@ impl AmdComputeQueue {
                 finalized.push(crate::hcq::Command::Timestamp { dst: end_addr });
             }
         }
-        finalized.push(crate::hcq::Command::Store { dst: counter_addr, value: next });
+        finalized.push(crate::hcq::Command::Store {
+            dst: counter_addr,
+            value: next,
+            scope: crate::hcq::StoreScope::System,
+        });
         push_queue_event_mailbox(&mut finalized, &self.core);
 
         let state = Pm4LoweringState {

@@ -81,13 +81,13 @@ pub use kernels::conv::{
     select_conv_cfg,
 };
 pub use kernels::fa::{
-    FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaMask, FaOpts, flash_attention, flash_attention_supported,
-    flash_attention_tuned, flash_attention_with,
+    FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaMask, FaOperands, FaOpts, flash_attention, flash_attention_packed,
+    flash_attention_packed_tuned, flash_attention_supported, flash_attention_tuned, flash_attention_with,
 };
 pub use kernels::gemm::{Epilogue, GemmCfg, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, matmul, swiglu_pair_width};
 pub use kernels::kmeans::{kmeans_assign, kmeans_update};
 pub use kernels::knn::knn;
-pub use kernels::norm::{NORM_SUPPORTED_ARCHS, NormCfg, add_rms_norm, rms_norm, select_norm_cfg};
+pub use kernels::norm::{NORM_SUPPORTED_ARCHS, NormCfg, add_rms_norm, layer_norm, rms_norm, select_norm_cfg};
 pub use kernels::sq_attention::{SqAttentionOpts, SqPolicy, single_query_attention, single_query_attention_packed};
 pub use launch::{Error as LaunchError, Result as LaunchResult};
 pub use target::ArchSet;

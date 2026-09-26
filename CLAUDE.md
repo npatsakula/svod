@@ -88,6 +88,17 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
   (`TileBudget::search`, `tiling::agreement`): ranked by time alone it once handed m's bodies a
   tile that computed garbage fast (16 px of box drift). The check reads every candidate back on a
   tune-store miss only; do not trade it for a faster first run.
+- **ModernBERT realizes its RoPE tables, its rotated Q/K and every GEMM operand**
+  (`.contiguous()` in `model/src/modernbert/{encoder,attention,linear}.rs`). Rangeify inlines a
+  staged value into its consumer whenever it reads ≤ 3 buffers — tinygrad's rule, with no count of
+  how often the consumer re-evaluates it — so left lazy, RoPE's sin/cos/pow ran once per key
+  inside every QKᵀ and GELU's erf once per output feature inside `Wo`: 1×512 took 64 ms instead of
+  15 at BEAM=4 on the RTX 3060. `state::cast_all` realizes its casts for the same reason (every GEMM
+  otherwise re-reads the f32 checkpoint: 11.1 → 9.8 ms).
+- **ModernBERT pads to the flash-attention tile inside the attention, not the sequence**
+  (`ModernBertAttention::flash`): the kernel copies its operands anyway, so only those copies grow.
+  Padding the sequence makes every GEMM run the padded rows too — 8×300 at 53.7 ms against 43.5,
+  8×400 at 72.0 against 56.0.
 
 ## Task evaluation
 

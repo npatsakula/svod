@@ -13,12 +13,14 @@
 //!   two coordinates exchanged, so both strips fill and gather identically and the
 //!   orientation is carried entirely by the `mma` variant.
 //! - [`GemmCfg::stages`] — `1` keeps the single-buffered fill/barrier/gather/mma
-//!   loop; `2` runs the software pipeline (the flash-attention K/V pattern): the
-//!   next K strip is in flight under the current strip's gathers and MMAs, under
-//!   one workgroup barrier per trip. The fill primitive is the arch's, chosen
-//!   through [`Group`]: `cp.async` straight into the other shared half where it
-//!   applies (CUDA sm_80+), else the register-staged stream — `global_load`
-//!   before the MMAs, `ds_write` into the other half after them.
+//!   loop; more runs a software pipeline (the flash-attention K/V pattern): the
+//!   next K strips are in flight under the current strip's gathers and MMAs,
+//!   under one workgroup barrier per trip. The fill primitive is the arch's,
+//!   chosen through [`Group`]: `cp.async` straight into another shared strip
+//!   where it applies (CUDA sm_80+), else the two-deep register-staged stream —
+//!   `global_load` before the MMAs, `ds_write` into the other half after them.
+//!   Under `cp.async`, [`GemmCfg::stepped`] consumes each strip one MMA step at a
+//!   time instead of gathering it whole — cutlass's multistage main loop.
 //!
 //! The output dtype is the bound C buffer's: a bf16 `c_gl` makes the epilogue cast
 //! the f32 accumulators on the way out, with no f32 round trip through memory.
@@ -38,7 +40,7 @@ use svod_dtype::DType;
 use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
-use crate::index::{Idx, cidx, load_at, load_off};
+use crate::index::{Idx, cidx, load_at, load_off_vec, vec_elem};
 use crate::tiles::TileLayout;
 use crate::{GL, GlSpec, Group, Kernel, Loop, MoveIdx, RT, RegTile, ST};
 
@@ -75,6 +77,16 @@ pub enum Epilogue<T> {
     /// dtype, and `act` applies SiLU. Every step rounds to the output dtype
     /// where the graph's conv → bias → silu → add chain rounds.
     BiasAct { bias: T, residual: Option<T>, act: bool },
+    /// `y = x·wᵀ` with its first `heads` heads of `head_dim` columns rotated as
+    /// [`Tensor::apply_rotary_emb`] rotates split halves, by the `[seq,
+    /// head_dim/2]` tables `cos` and `sin` in the operand dtype — row `m` at
+    /// position `m % seq` — and the columns after them (a fused projection's
+    /// values) stored as they are. The rotation runs op for op in the output
+    /// dtype on the rounded GEMM output, as the graph's does, so the two agree bit
+    /// for bit. A head's halves lie in different waves' accumulators, so only
+    /// the staged store ([`GemmCfg::stage_out`]), whose band holds whole heads
+    /// side by side, carries it.
+    Rope { cos: T, sin: T, seq: usize, head_dim: usize, heads: usize },
 }
 
 impl<T> Epilogue<T> {
@@ -88,6 +100,7 @@ impl<T> Epilogue<T> {
             Epilogue::BiasAct { residual, act, .. } => {
                 Epilogue::BiasAct { bias: (), residual: residual.as_ref().map(|_| ()), act: *act }
             }
+            &Epilogue::Rope { seq, head_dim, heads, .. } => Epilogue::Rope { cos: (), sin: (), seq, head_dim, heads },
         }
     }
 
@@ -110,6 +123,7 @@ impl<T> Epilogue<T> {
             Epilogue::BiasAct { residual: None, act: true, .. } => 4,
             Epilogue::BiasAct { residual: Some(_), act: false, .. } => 5,
             Epilogue::BiasAct { residual: Some(_), act: true, .. } => 6,
+            Epilogue::Rope { .. } => 7,
         }
     }
 }
@@ -135,6 +149,26 @@ pub struct GemmCfg {
     /// double-buffered software pipeline (`cp.async` where the arch has it, the
     /// register-staged stream elsewhere; deeper pipelines are `cp.async`-only).
     pub stages: usize,
+    /// Consume each `cp.async` strip in MMA steps, cutlass's way: the next
+    /// step's fragments gathered under the current step's MMAs, the trip's
+    /// barrier before its last step, and the next strip's first fragments
+    /// carried across the back edge, so the matrix core never idles behind the
+    /// barrier and a burst of copies — which cost the whole-strip 128×128 tile
+    /// ~180 ns a trip on sm_86. The carried fragments cost registers, and the whole-strip
+    /// loop still wins where enough blocks are resident to cover its trip head.
+    /// Ignored where the strips do not go through `cp.async`.
+    pub stepped: bool,
+    /// Store C through shared memory a band at a time: every wave scatters its
+    /// narrowed accumulator into the operand strips, which the loop is done
+    /// with, and the workgroup writes the band back in whole 16-byte runs of a
+    /// row. A lane of an `mma.sync` fragment holds two-element pieces of rows,
+    /// so the direct store fills half of every sector it touches. On sm_86 no
+    /// tile got slower, and the best tile of each ModernBERT/Qwen3 shape got
+    /// faster: 512×768×768 34.8 → 32.7 µs, 512×1152×768 49.9 → 46.3,
+    /// 512×768×2304 86.2 → 83.0, 1-2.5% at `M` of 1024 to 4096. The direct store
+    /// still runs where the band does not fit the strips, `M` is ragged or C is
+    /// split into f32 partials.
+    pub stage_out: bool,
     /// B's global layout.
     pub b_order: BOrder,
     /// Drive `(pid_m, pid_n)` from a flattened 1-D grid via the chiplet/L2
@@ -151,19 +185,32 @@ pub struct GemmCfg {
 }
 
 impl GemmCfg {
-    /// Whether this tile can carry `epi`. The fused epilogues write the operand
-    /// dtype, so they need the direct (un-split) store; [`Epilogue::SwiGlu`]
-    /// additionally needs each wave's accumulator to hold a gate block beside its
-    /// matching up block — its `reg_n/2` must be the `pair` width the weight rows
-    /// were arranged in, and a whole number of `frag_cols`-wide fragments, so the
-    /// gate/up split falls on a fragment boundary. `frag_cols` is the arch's
-    /// accumulator-fragment width (`None` on an arch with no matrix core).
-    pub fn carries(&self, epi: Epilogue<()>, frag_cols: Option<usize>) -> bool {
+    /// Whether this tile can carry `epi` on `caps`' arch. The fused epilogues
+    /// write the operand dtype, so they need the un-split store;
+    /// [`Epilogue::SwiGlu`] additionally needs each wave's accumulator to hold a
+    /// gate block beside its matching up block — its `reg_n/2` must be the `pair`
+    /// width the weight rows were arranged in, and a whole number of accumulator
+    /// fragments, so the gate/up split falls on a fragment boundary (an arch with
+    /// no matrix core has none). [`Epilogue::Rope`] needs the staged store, a
+    /// band that fits the strips, whole heads per block and whole runs per half
+    /// head.
+    pub fn carries(&self, epi: Epilogue<()>, caps: &crate::ArchCaps) -> bool {
+        let frag_cols = caps.frag(crate::arch::FragRole::Accumulator).map(|f| f.base.cols);
         match epi {
             Epilogue::Plain => true,
             Epilogue::Add(()) | Epilogue::BiasAct { .. } => self.split_k == 1,
             Epilogue::SwiGlu { pair } => {
                 self.split_k == 1 && self.reg_n() == 2 * pair && frag_cols.is_some_and(|c| pair.is_multiple_of(c))
+            }
+            // The band's head pairs, a pair of runs each, divide over the threads.
+            Epilogue::Rope { head_dim, .. } => {
+                let pairs = self.block_m / self.acc_m * self.block_n / (2 * RUN_ELEMS);
+                self.split_k == 1
+                    && self.stage_out
+                    && head_dim.is_multiple_of(2 * RUN_ELEMS)
+                    && self.block_n.is_multiple_of(head_dim)
+                    && pairs.is_multiple_of(self.threads(caps.wave_size) as usize)
+                    && band_base(caps, self, self.block_n).is_some()
             }
         }
     }
@@ -354,9 +401,14 @@ pub fn gemm_core_with(
     let in_dt = a_gl.elem().clone();
 
     // A strip [block_m × k_step]; B strip per `b_order`; both XOR-swizzled, and
-    // `stages`-deep when the pipeline runs.
-    let a_smem = ker.shared_sw_stages((cfg.block_m, k_step), in_dt.clone(), TileLayout::Row, cfg.stages);
-    let b_smem = ker.shared_sw_stages(b_strip(&cfg), in_dt.clone(), TileLayout::Row, cfg.stages);
+    // `stages`-deep when the pipeline runs. A strip the waves take by row bands
+    // (A always, B when it arrives `[N, K]`) is laid out in whole rows where the
+    // arch has such a strip, so each row's fill lands contiguously.
+    let a_smem = ker.shared_rows_stages((cfg.block_m, k_step), in_dt.clone(), TileLayout::Row, cfg.stages);
+    let b_smem = match cfg.b_order {
+        BOrder::Nk => ker.shared_rows_stages(b_strip(&cfg), in_dt.clone(), TileLayout::Row, cfg.stages),
+        BOrder::Kn => ker.shared_sw_stages(b_strip(&cfg), in_dt.clone(), TileLayout::Row, cfg.stages),
+    };
 
     let (row, col) = block_coords(ker, m, n, &cfg); // (pid_m, pid_n) in block units
     let warp_row = g.warp_row();
@@ -371,149 +423,198 @@ pub fn gemm_core_with(
 
     let lp = ker.loop_static(trips);
     let strip = Strips { cfg: &cfg, a_gl: &a_gl, b_gl: &b_gl, row: &row, col: &col, slab: slab.clone(), trips, a_rows };
-
-    let (a_cur, b_cur, stream) =
-        if cfg.stages > 1 { strip.pipelined(&g, &lp, a_smem, b_smem) } else { strip.single(&g, &lp, a_smem, b_smem) };
-    let ragged_m = m % cfg.block_m != 0;
-
-    // Shared B sub-tile (N col-block {warp_col}, same for every accumulator), and
-    // per-accumulator A sub-tiles (M row-block {warp_row + a·warps_m}).
-    let (b_reg, b_view) = b_operand(ker, &cfg, &in_dt, &warp_col, &b_cur);
-    let bb = g.load(b_reg, b_view, MoveIdx::default());
-    let a_subs: Vec<RT> = (0..cfg.acc_m)
-        .map(|a| {
-            g.load(
-                ker.operand((reg_m, k_step), in_dt.clone(), TileLayout::Row),
-                a_cur.subtile((reg_m, k_step), (acc_row(&warp_row, a, &cfg), 0)),
-                MoveIdx::default(),
-            )
-        })
-        .collect();
-
-    // Cross-wave WAR barrier: every wave must finish reading LDS before the next
-    // K iteration's collaborative fill overwrites it. The pipelines fence
-    // elsewhere — at the loop top (`cp.async`) or in the tail commit (staged) —
-    // with one barrier covering both the RAW and the WAR.
-    let (bb, a_subs) = if matches!(stream, Stream::Single) {
-        let mut bar_deps: SmallVec<[Arc<UOp>; 4]> = smallvec![bb.uop().clone()];
-        bar_deps.extend(a_subs.iter().skip(1).map(|t| t.uop().clone()));
-        let sync = a_subs[0].uop().barrier(bar_deps);
-        let bb = bb.after(smallvec![sync.clone()]);
-        (bb, a_subs.into_iter().map(|t| t.after(smallvec![sync.clone()])).collect())
+    let wave = Wave { ker, cfg: &cfg, in_dt, row: warp_row.clone(), col: warp_col.clone(), k_edge: wmma_k };
+    let copies = cfg.stages > 1 && g.cp_async_fill_applies(&a_smem, &a_gl) && g.cp_async_fill_applies(&b_smem, &b_gl);
+    let a_strips = a_smem.clone();
+    let ended = if copies && cfg.stepped {
+        strip.stepped(&g, &lp, a_smem, b_smem, &wave, &accs)
     } else {
-        (bb, a_subs)
+        strip.whole(&g, &lp, a_smem, b_smem, &wave, &accs, copies)
     };
-
-    // MMA-accumulate each accumulator over the K sub-steps; chain accumulator `a`'s
-    // A-input through accumulator `a-1`'s MMA so a single `END` scopes them all
-    // inside the K-loop.
-    let mut prev_out: Option<Arc<UOp>> = None;
-    for (a, a_sub) in a_subs.iter().enumerate() {
-        let a_sub = match &prev_out {
-            Some(p) => a_sub.after(smallvec![p.clone()]),
-            None => a_sub.clone(),
-        };
-        let acc = accs[a].clone();
-        let out = match cfg.b_order {
-            BOrder::Kn => g.mma_ab(acc, &a_sub, &bb),
-            BOrder::Nk => g.mma_abt(acc, &a_sub, &bb),
-        };
-        prev_out = Some(out.uop().clone());
-    }
-    let ended = match &stream {
-        // The staged stream's `ds_write` of the next strip lands after this trip's
-        // MMAs (ordered through the last one), and the one barrier-wrapped commit
-        // of both strips is the loop's terminal store: one fence per trip,
-        // covering the RAW on the half just written and the WAR on the half every
-        // wave just gathered.
-        Stream::Staged { stage, nxt } => {
-            let after_mma = prev_out.clone().expect("at least one accumulator");
-            // Pin the trip's shape against the AMDGPU machine scheduler. Left to
-            // itself it hoists the whole commit — the `ds_write`s, their
-            // `s_wait_loadcnt` on the prefetch, and the barrier that closes them —
-            // *above* the MMAs, which is the one order the double buffer must not
-            // have: the workgroup then waits on global memory at a barrier with no
-            // MMAs in flight to cover it, so every wave's stall becomes the whole
-            // group's. The `mask = 0` fence forbids the move, leaving the trip's
-            // MMAs between the prefetch issue and the wait that consumes it.
-            let after_mma = if ker.caps.needs_pipeline_commit_fence() {
-                crate::asm::sched_barrier(0, after_mma)
-            } else {
-                after_mma
-            };
-            let (a_nxt, b_nxt) = (nxt[0].after(&after_mma), nxt[1].after(&after_mma));
-            let fenced = g.commit_regs_to_local(&[(&a_nxt, &stage[0]), (&b_nxt, &stage[1])]).barrier(smallvec![]);
-            ker.push_store(fenced, a_nxt.uop().clone());
-            lp.close()
-        }
-        _ => lp.close(),
-    };
+    let ragged_m = m % cfg.block_m != 0;
     // Each accumulator reads its fully-reduced register value *outside* the loop.
     let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
     // No copy may be outstanding at exit: drain the last trip's wrapped prefetch
     // before the epilogue writes (threaded through the GLOBAL tile, so the carried
     // accumulators keep their plain post-loop reads).
-    let c_gl = if matches!(stream, Stream::Async) {
-        let drained = cp_async_wait_all(smallvec![final_accs[0].uop().clone()]);
-        c_gl.rewrap(c_gl.uop().after(smallvec![drained]))
-    } else {
-        c_gl
+    let drained = copies.then(|| cp_async_wait_all(smallvec![final_accs[0].uop().clone()]));
+    let c_gl = match &drained {
+        Some(drained) => c_gl.rewrap(c_gl.uop().after(smallvec![drained.clone()])),
+        None => c_gl,
     };
 
-    // Epilogue: narrow each col-major accumulator to C's dtype in registers, fold
-    // in the fusion, then store it at its reg-block coords.
-    let nidx = col.mul(&cidx(cfg.blocks_n() as i64)).add(&warp_col);
-    let zslab: Idx = match &slab {
-        // Split-K writes one `[split_k, M, N]` partial per grid-z (summed by the
-        // second pass), so the slab index is the leading axis.
-        Some(_) => Idx::from(ker.grid_z()),
-        None => Idx::Const(0),
-    };
+    // Epilogue: narrow each col-major accumulator to C's dtype in registers (and
+    // fold SwiGLU's pairs there), then store it — straight from the fragments at
+    // its reg-block coords, or staged through the strips (`GemmCfg::stage_out`) —
+    // reading the fusion's other operand at the store's own position.
     let out_dt = c_gl.elem().clone();
+    let fused = fusion(&epi, n, ragged_m.then_some(m), &out_dt);
+    let rope = match &epi {
+        &Epilogue::Rope { ref cos, ref sin, seq, head_dim, heads } => {
+            Some((head_dim / 2, rope(cos, sin, n, seq, head_dim, heads)))
+        }
+        _ => None,
+    };
+    let outs = final_accs.into_iter().map(|c| match epi {
+        Epilogue::SwiGlu { .. } => swiglu(ker, &g, c, &out_dt),
+        _ => narrow(ker, &g, c, &out_dt),
+    });
+    let staging = (cfg.stage_out && !ragged_m && slab.is_none() && &out_dt == a_strips.elem())
+        .then(|| out_band(ker, &cfg, &a_strips, epi.out_cols(cfg.block_n)))
+        .flatten();
     let mut c_t = c_gl;
-    for (a, c) in final_accs.into_iter().enumerate() {
-        let mrow = row.mul(&cidx(cfg.blocks_m() as i64)).add(&acc_row(&warp_row, a, &cfg));
-        let ix = MoveIdx::block((Idx::Const(0), zslab.clone(), mrow, nidx.clone()), 2);
-        let ix = if ragged_m { ix.clipped() } else { ix };
-        c_t = match &epi {
-            Epilogue::Plain => g.store(c_t, narrow(ker, &g, c, &out_dt), ix),
-            // The residual is read at the store's own global offset — the same
-            // coalesced block the GEMM is about to overwrite — and added **in the
-            // output dtype**, which is what the graph's `try_add` over two
-            // operand-dtype tensors does. Folding it into the store's pass keeps
-            // the narrowed tile in registers (a second pass over it spills).
-            Epilogue::Add(res) => {
-                let buf = res.uop().clone();
-                let c = narrow(ker, &g, c, &out_dt);
-                g.store_global_with(c_t, &c, ix, move |v, off| {
-                    v.try_add(&load_off(&buf, off.clone())).expect("gemm epilogue: residual add")
-                })
-            }
-            Epilogue::SwiGlu { .. } => g.store(c_t, swiglu(ker, &g, c, &out_dt), ix),
-            // The column's bias, the activation and the residual, in the output
-            // dtype and in the store's own pass, as for `Add`.
-            Epilogue::BiasAct { bias, residual, act } => {
-                let (bias, res, act) = (bias.uop().clone(), residual.as_ref().map(|r| r.uop().clone()), *act);
-                let (c, dt, cols) = (narrow(ker, &g, c, &out_dt), out_dt.clone(), cidx(n as i64));
-                // A row past a ragged `M` is dropped by the store's gate, but its
-                // residual read still happens: clamp it into the operand.
-                let end = ragged_m.then(|| cidx((m * epi.out_cols(n)) as i64));
-                g.store_global_with(c_t, &c, ix, move |v, off| {
-                    let col = off.try_mod(&cols).expect("gemm epilogue: bias column");
-                    let v = v.try_add(&load_off(&bias, col)).expect("gemm epilogue: bias add");
-                    let v = if act { silu(&v, &dt) } else { v };
-                    let Some(r) = &res else { return v };
-                    let at = match &end {
-                        Some(end) => {
-                            let inside = off.try_cmplt(end).expect("gemm epilogue: residual bound");
-                            UOp::try_where(inside, off.clone(), cidx(0)).expect("gemm epilogue: residual clamp")
-                        }
-                        None => off.clone(),
-                    };
-                    v.try_add(&load_off(r, at)).expect("gemm epilogue: residual add")
-                })
-            }
+    let Some(band) = staging else {
+        assert!(rope.is_none(), "gemm epilogue: only the staged store holds a head's two halves together");
+        let nidx = col.mul(&cidx(cfg.blocks_n() as i64)).add(&warp_col);
+        let zslab: Idx = match &slab {
+            // Split-K writes one `[split_k, M, N]` partial per grid-z (summed by the
+            // second pass), so the slab index is the leading axis.
+            Some(_) => Idx::from(ker.grid_z()),
+            None => Idx::Const(0),
         };
+        for (a, c) in outs.enumerate() {
+            let mrow = row.mul(&cidx(cfg.blocks_m() as i64)).add(&acc_row(&warp_row, a, &cfg));
+            let ix = MoveIdx::block((Idx::Const(0), zslab.clone(), mrow, nidx.clone()), 2);
+            let ix = if ragged_m { ix.clipped() } else { ix };
+            c_t = g.store_global_with(c_t, &c, ix, |v, off| fused(vec![v.clone()], off).remove(0));
+        }
+        return;
+    };
+    // Staged: every wave's accumulator `a` makes up band `a` of the block — rows
+    // `a·block_m/acc_m ..` — which the waves scatter into the strips, fence, and
+    // store back a 16-byte run at a time. The strips are free once every copy has
+    // landed and every wave is past its last gather; a band is free again once
+    // the workgroup has read it back.
+    let mut free = drained.unwrap_or(ended).barrier(smallvec![]);
+    for (a, c) in outs.enumerate() {
+        let st = g.store_local_fenced(
+            band.after(&free),
+            &c,
+            MoveIdx::block((Idx::from(&warp_row), Idx::from(&warp_col)), 0),
+            smallvec![],
+        );
+        let brow = row.mul(&cidx(cfg.acc_m as i64)).add(&cidx(a as i64));
+        let ix = MoveIdx::block((Idx::Const(0), Idx::Const(0), Idx::from(&brow), Idx::from(&col)), 2);
+        c_t = match &rope {
+            Some((half, rope)) => g.store_local_vec_paired(c_t, &st, ix, *half, rope),
+            None => g.store_local_vec(c_t, &st, ix, &fused),
+        };
+        free = c_t.uop().barrier(smallvec![]);
+    }
+}
+
+/// Elements of a 16-bit operand in one 16-byte run of the staged store.
+const RUN_ELEMS: usize = 8;
+
+/// The base tile of the band C is staged through ([`GemmCfg::stage_out`]):
+/// `block_m / acc_m` rows of `cols` 16-bit output columns in whole rows of
+/// 16-byte runs, laid over the A strips — `None` where a band does not fit them
+/// or does not divide into whole runs per thread.
+fn band_base(caps: &crate::ArchCaps, cfg: &GemmCfg, cols: usize) -> Option<crate::tiles::STBaseShape> {
+    let (rows, threads) = (cfg.block_m / cfg.acc_m, cfg.threads(caps.wave_size) as usize);
+    let base = [64, 32].into_iter().find(|w| cols.is_multiple_of(*w))?;
+    let base = caps.shared_rows(base, 2)?;
+    (rows * cols <= cfg.stages * cfg.block_m * cfg.k_step
+        && rows.is_multiple_of(base.base.rows)
+        && base.swizzle.keeps_16b_chunks()
+        && (rows * cols / RUN_ELEMS).is_multiple_of(threads))
+    .then_some(base)
+}
+
+/// The shared tile C is staged through a band at a time: the A strips, which
+/// the loop is done with, seen as [`band_base`]'s band.
+fn out_band(ker: &Kernel, cfg: &GemmCfg, a_strips: &ST, cols: usize) -> Option<ST> {
+    assert_eq!(a_strips.elem().bytes(), 2, "the GEMM's operands are 16-bit");
+    let base = band_base(&ker.caps, cfg, cols)?;
+    Some(a_strips.view((cfg.block_m / cfg.acc_m, cols), TileLayout::Row, base))
+}
+
+/// What the epilogue stores for `vals`, consecutive output elements (already in
+/// the output dtype) from flat offset `off` on: the fusion's other operand is
+/// read at the store's own position — the same block the GEMM is about to
+/// overwrite — `vals.len()` elements at a time, and added **in the output
+/// dtype**, which is what the graph's `try_add` over two operand-dtype tensors
+/// does; a convolution's bias, activation and residual round where its graph
+/// rounds. Folding it into the store's pass keeps the narrowed tile in registers
+/// (a second pass over it spills). A row past a ragged `m` is dropped by the
+/// store's gate, but its residual read still happens, so it is clamped into the
+/// operand.
+fn fusion(
+    epi: &Epilogue<GL>,
+    n: usize,
+    ragged_m: Option<usize>,
+    out_dt: &DType,
+) -> impl Fn(Vec<Arc<UOp>>, &Arc<UOp>) -> Vec<Arc<UOp>> + use<> {
+    let (bias, res, act) = match epi {
+        Epilogue::Plain | Epilogue::SwiGlu { .. } | Epilogue::Rope { .. } => (None, None, false),
+        Epilogue::Add(res) => (None, Some(res.uop().clone()), false),
+        Epilogue::BiasAct { bias, residual, act } => {
+            (Some(bias.uop().clone()), residual.as_ref().map(|r| r.uop().clone()), *act)
+        }
+    };
+    let (dt, cols) = (out_dt.clone(), cidx(n as i64));
+    let end = ragged_m.map(|m| cidx((m * epi.out_cols(n)) as i64));
+    move |vals, off| {
+        let add = |vals: Vec<Arc<UOp>>, buf: &Arc<UOp>, at: &Arc<UOp>, what: &str| {
+            let w = vals.len();
+            let other = load_off_vec(buf, at, w);
+            vals.iter().enumerate().map(|(j, v)| v.try_add(&vec_elem(&other, j, w)).expect(what)).collect()
+        };
+        let mut vals = vals;
+        if let Some(bias) = &bias {
+            let col = off.try_mod(&cols).expect("gemm epilogue: bias column");
+            vals = add(vals, bias, &col, "gemm epilogue: bias add");
+            if act {
+                vals = vals.iter().map(|v| silu(v, &dt)).collect();
+            }
+        }
+        let Some(res) = &res else { return vals };
+        let at = match &end {
+            Some(end) => {
+                let inside = off.try_cmplt(end).expect("gemm epilogue: residual bound");
+                UOp::try_where(inside, off.clone(), cidx(0)).expect("gemm epilogue: residual clamp")
+            }
+            None => off.clone(),
+        };
+        add(vals, res, &at, "gemm epilogue: residual add")
+    }
+}
+
+/// [`Epilogue::Rope`] on one staged pair of runs ([`Group::store_local_vec_paired`]):
+/// `x1`, consecutive output elements (already in the output dtype) from flat
+/// offset `off` in the first half of a head, and `x2`, the run half a head
+/// along. A rotated head's pair turns as [`Tensor::apply_rotary_emb`] turns it,
+/// op for op in the output dtype — `x1·cos − x2·sin` into the first half,
+/// `x1·sin + x2·cos` into the second — by the table row of the output row's
+/// position; a pair past the rotated heads stores as it is. Each product feeds
+/// one sum, as in the graph's kernel, so the backend contracts the same ones.
+#[allow(clippy::type_complexity)]
+fn rope(
+    cos: &GL,
+    sin: &GL,
+    n: usize,
+    seq: usize,
+    head_dim: usize,
+    heads: usize,
+) -> impl Fn([Vec<Arc<UOp>>; 2], &Arc<UOp>) -> [Vec<Arc<UOp>>; 2] + use<> {
+    let (cos, sin, half) = (cos.uop().clone(), sin.uop().clone(), (head_dim / 2) as i64);
+    move |[x1, x2], off| {
+        let w = x1.len();
+        let col = off.try_mod(&cidx(n as i64)).expect("rope: output column");
+        let pos = off.try_div(&cidx(n as i64)).and_then(|r| r.try_mod(&cidx(seq as i64))).expect("rope: position");
+        let freq = col.try_mod(&cidx(head_dim as i64)).expect("rope: frequency");
+        let at = pos.mul(&cidx(half)).add(&freq);
+        let (cos, sin) = (load_off_vec(&cos, &at, w), load_off_vec(&sin, &at, w));
+        let rotated = col.lt(&cidx(heads as i64 * head_dim as i64));
+        let mul = |a: &Arc<UOp>, b: &Arc<UOp>| a.try_mul(b).expect("rope: product");
+        let keep = |turned: Arc<UOp>, x: &Arc<UOp>| UOp::try_where(rotated.clone(), turned, x.clone()).expect("rope");
+        let (mut real, mut imag) = (Vec::with_capacity(w), Vec::with_capacity(w));
+        for (j, (a, b)) in x1.iter().zip(&x2).enumerate() {
+            let (c, s) = (vec_elem(&cos, j, w), vec_elem(&sin, j, w));
+            real.push(keep(mul(a, &c).try_sub(&mul(b, &s)).expect("rope: x1·cos − x2·sin"), a));
+            imag.push(keep(mul(a, &s).try_add(&mul(b, &c)).expect("rope: x1·sin + x2·cos"), b));
+        }
+        [real, imag]
     }
 }
 
@@ -575,14 +676,13 @@ pub(crate) fn silu(x: &Arc<UOp>, dt: &DType) -> Arc<UOp> {
 /// explicitly unrolled copy into a same-layout tile, so the store that follows
 /// moves plain elements.
 ///
-/// Storing the f32 tile and letting the store's own cast do it is a 3.4× cliff on
-/// NVPTX: an f32→bf16 cast lowers to a 17-instruction integer round-to-nearest-even
-/// ([`svod_ir::decompositions`]), and with that body inside the store's rolled
-/// `[height, width, inner]` loops LLVM stops unrolling them — the register tile is
-/// then indexed dynamically, falls out of registers into local memory, and the
-/// whole K-loop pays for it (measured on sm_86: 256 B/lane of spill, 13.7 → 4.0
+/// Storing the f32 tile and letting the store's own cast do it once cost 3.4× on
+/// NVPTX, back when an f32→bf16 cast lowered to a 17-instruction integer rounding:
+/// with that body inside the store's rolled `[height, width, inner]` loops LLVM
+/// stopped unrolling them, the register tile was indexed dynamically and fell out
+/// of registers into local memory (sm_86: 256 B/lane of spill, 13.7 → 4.0
 /// TFLOP/s). Every index here is a constant, so the accumulator stays in registers
-/// and only the narrow result reaches the store.
+/// whatever the cast costs, and only the narrow result reaches the store.
 pub(super) fn narrow<'k>(ker: &'k Kernel, g: &Group<'k>, acc: RT<'k>, out_dt: &DType) -> RT<'k> {
     if acc.elem() == out_dt {
         return acc;
@@ -596,10 +696,15 @@ pub(super) fn narrow<'k>(ker: &'k Kernel, g: &Group<'k>, acc: RT<'k>, out_dt: &D
     out
 }
 
-/// How the K strips reach shared memory, and what [`gemm_core`] owes each stream
-/// after the trip's MMAs.
+/// Shared strip `p` of the `stages`-deep `st`.
+fn half(st: &ST, p: &Arc<UOp>) -> ST {
+    st.with_base_offset(p.mul(&cidx(st.half_elems() as i64)))
+}
+
+/// How [`Strips::whole`] gets its strips into shared memory, and what it owes
+/// each stream after the trip's MMAs.
 enum Stream {
-    /// Single-buffered: the caller fences the gathers against the next fill.
+    /// Single-buffered: the gathers are fenced against the next fill.
     Single,
     /// The `cp.async` pipeline: fenced at the loop top; drained after the loop.
     Async,
@@ -607,6 +712,90 @@ enum Stream {
     /// and is committed into the `nxt` halves after the MMAs, under the trip's
     /// one barrier.
     Staged { stage: [Arc<UOp>; 2], nxt: Box<[ST; 2]> },
+}
+
+/// One wave's share of the workgroup: the accumulators it owns (M row-blocks
+/// `row + a·warps_m`, N col-block `col`) and the operand fragments it gathers
+/// for them out of the shared strips.
+struct Wave<'a, 'k> {
+    ker: &'k Kernel,
+    cfg: &'a GemmCfg,
+    in_dt: DType,
+    row: Arc<UOp>,
+    col: Arc<UOp>,
+    /// The matrix core's K-edge: the depth of one MMA step.
+    k_edge: usize,
+}
+
+/// A wave's operand fragments over one slice of K: B's, then A's per accumulator.
+#[derive(Clone)]
+struct Frags<'k> {
+    b: RT<'k>,
+    a: Vec<RT<'k>>,
+}
+
+impl<'k> Frags<'k> {
+    fn map(&self, f: impl Fn(&RT<'k>) -> RT<'k>) -> Self {
+        Self { b: f(&self.b), a: self.a.iter().map(f).collect() }
+    }
+
+    fn uops(&self) -> impl Iterator<Item = Arc<UOp>> + '_ {
+        std::iter::once(&self.b).chain(&self.a).map(|t| t.uop().clone())
+    }
+}
+
+impl<'k> Wave<'_, 'k> {
+    /// Fresh fragments `depth` deep in K.
+    fn frags(&self, depth: usize) -> Frags<'k> {
+        let (cfg, dt) = (self.cfg, &self.in_dt);
+        let b = match cfg.b_order {
+            BOrder::Kn => self.ker.operand_b((depth, cfg.reg_n()), dt.clone(), TileLayout::Col),
+            BOrder::Nk => self.ker.operand_b((cfg.reg_n(), depth), dt.clone(), TileLayout::Row),
+        };
+        let a = (0..cfg.acc_m).map(|_| self.ker.operand((cfg.reg_m(), depth), dt.clone(), TileLayout::Row)).collect();
+        Frags { b, a }
+    }
+
+    /// Gather K step `step` — `dst`'s depth deep — of the strips `a_st` and `b_st`
+    /// into `dst`, each tile after the one before, so the last one orders after
+    /// all of them.
+    fn gather(&self, g: &Group<'k>, dst: Frags<'k>, a_st: &ST, b_st: &ST, step: usize) -> Frags<'k> {
+        let (cfg, step) = (self.cfg, Idx::Const(step as i64));
+        let (b_view, b_at) = match cfg.b_order {
+            BOrder::Kn => {
+                (b_st.subtile((cfg.k_step, cfg.reg_n()), (0, self.col.clone())), (step.clone(), Idx::Const(0)))
+            }
+            BOrder::Nk => {
+                (b_st.subtile((cfg.reg_n(), cfg.k_step), (self.col.clone(), 0)), (Idx::Const(0), step.clone()))
+            }
+        };
+        let b = g.load(dst.b, b_view, MoveIdx::block(b_at, 0));
+        let mut prev = b.uop().clone();
+        let a = (dst.a.into_iter().enumerate())
+            .map(|(i, t)| {
+                let view = a_st.subtile((cfg.reg_m(), cfg.k_step), (acc_row(&self.row, i, cfg), 0));
+                let t = g.load(t.after(&prev), view, MoveIdx::block((Idx::Const(0), step.clone()), 0));
+                prev = t.uop().clone();
+                t
+            })
+            .collect();
+        Frags { b, a }
+    }
+
+    /// Accumulate `f` into `accs`, one accumulator after another (the first after
+    /// `deps`), so the update returned — the last one — orders after them all and
+    /// a single `END` scopes them inside the K loop.
+    fn mma(&self, g: &Group<'k>, accs: &mut [RT<'k>], f: &Frags<'k>, mut deps: SmallVec<[Arc<UOp>; 4]>) -> Arc<UOp> {
+        for (acc, a) in accs.iter_mut().zip(&f.a) {
+            let a = if deps.is_empty() { a.clone() } else { a.after(deps) };
+            *acc = match self.cfg.b_order {
+                BOrder::Kn => g.mma_ab(acc.clone(), &a, &f.b),
+                BOrder::Nk => g.mma_abt(acc.clone(), &a, &f.b),
+            };
+            deps = smallvec![acc.uop().clone()];
+        }
+        deps.pop().expect("at least one accumulator")
+    }
 }
 
 /// The K-strip stream: everything the fill strategies share (the operand
@@ -644,6 +833,18 @@ impl Strips<'_> {
         [a, g.stage_global_to_reg(b_smem, self.b_gl, &bi, 2)]
     }
 
+    /// Issue the `cp.async` copies of K-strip `tile` of both operands into
+    /// `a_smem` / `b_smem` (one commit group each): A through its row source when
+    /// it has one.
+    fn copy(&self, g: &Group<'_>, a_smem: &ST, b_smem: &ST, tile: &Arc<UOp>) -> [Arc<UOp>; 2] {
+        let (ai, bi) = self.at(tile);
+        let a = match self.a_rows {
+            Some(rows) => g.cp_async_fill_rows(a_smem, self.a_gl, |r| rows(r, self.row, tile)),
+            None => g.cp_async_fill(a_smem, self.a_gl, &ai, 2),
+        };
+        [a, g.cp_async_fill(b_smem, self.b_gl, &bi, 2)]
+    }
+
     /// Single-buffered: one collaborative GLOBAL→LDS fill per trip, the two strips
     /// sharing ONE barrier (the RAW edge) before the gathers; the WAR edge back to
     /// the next fill is the barrier the caller puts after them (`fence = true`).
@@ -666,15 +867,83 @@ impl Strips<'_> {
         (a_f.after(smallvec![filled.clone()]), b_f.after(smallvec![filled]), Stream::Single)
     }
 
-    /// The software pipeline, on the fill primitive the arch has: `cp.async`
-    /// where it applies to both strips ([`Group::cp_async_fill_applies`]), else
-    /// the two-deep register-staged stream.
-    fn pipelined(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
-        if g.cp_async_fill_applies(&a_smem, self.a_gl) && g.cp_async_fill_applies(&b_smem, self.b_gl) {
-            self.async_pipelined(g, lp, a_smem, b_smem)
+    /// The K loop over whole strips: each trip fills a strip — single-buffered,
+    /// through the `cp.async` pipeline where `copies` says both strips take it,
+    /// else the register-staged double buffer — gathers all of it, then runs its
+    /// MMAs. Returns the loop's `END`.
+    #[allow(clippy::too_many_arguments)]
+    fn whole<'k>(
+        &self,
+        g: &Group<'k>,
+        lp: &Loop<'_>,
+        a_smem: ST,
+        b_smem: ST,
+        wave: &Wave<'_, 'k>,
+        accs: &[RT<'k>],
+        copies: bool,
+    ) -> Arc<UOp> {
+        let (ker, cfg) = (g.kernel(), self.cfg);
+        let (a_cur, b_cur, stream) = match cfg.stages {
+            1 => self.single(g, lp, a_smem, b_smem),
+            _ if copies => self.async_pipelined(g, lp, a_smem, b_smem),
+            _ => {
+                assert_eq!(cfg.stages, 2, "the register-staged pipeline is two-deep (one strip in flight)");
+                self.staged(g, lp, a_smem, b_smem)
+            }
+        };
+        // Shared B sub-tile (N col-block {warp_col}, same for every accumulator), and
+        // per-accumulator A sub-tiles (M row-block {warp_row + a·warps_m}).
+        let (b_reg, b_view) = b_operand(ker, cfg, &wave.in_dt, &wave.col, &b_cur);
+        let b = g.load(b_reg, b_view, MoveIdx::default());
+        let a: Vec<RT> = (0..cfg.acc_m)
+            .map(|i| {
+                g.load(
+                    ker.operand((cfg.reg_m(), cfg.k_step), wave.in_dt.clone(), TileLayout::Row),
+                    a_cur.subtile((cfg.reg_m(), cfg.k_step), (acc_row(&wave.row, i, cfg), 0)),
+                    MoveIdx::default(),
+                )
+            })
+            .collect();
+        let frags = Frags { b, a };
+        // Cross-wave WAR barrier: every wave must finish reading LDS before the next
+        // K iteration's collaborative fill overwrites it. The pipelines fence
+        // elsewhere — at the loop top (`cp.async`) or in the tail commit (staged) —
+        // with one barrier covering both the RAW and the WAR.
+        let frags = if matches!(stream, Stream::Single) {
+            let mut bar_deps: SmallVec<[Arc<UOp>; 4]> = frags.uops().collect();
+            let first = bar_deps.remove(1);
+            let sync = first.barrier(bar_deps);
+            frags.map(|t| t.after(smallvec![sync.clone()]))
         } else {
-            assert_eq!(self.cfg.stages, 2, "the register-staged pipeline is two-deep (one strip in flight)");
-            self.staged(g, lp, a_smem, b_smem)
+            frags
+        };
+        let after_mma = wave.mma(g, &mut accs.to_vec(), &frags, SmallVec::new());
+        match &stream {
+            // The staged stream's `ds_write` of the next strip lands after this trip's
+            // MMAs (ordered through the last one), and the one barrier-wrapped commit
+            // of both strips is the loop's terminal store: one fence per trip,
+            // covering the RAW on the half just written and the WAR on the half every
+            // wave just gathered.
+            Stream::Staged { stage, nxt } => {
+                // Pin the trip's shape against the AMDGPU machine scheduler. Left to
+                // itself it hoists the whole commit — the `ds_write`s, their
+                // `s_wait_loadcnt` on the prefetch, and the barrier that closes them —
+                // *above* the MMAs, which is the one order the double buffer must not
+                // have: the workgroup then waits on global memory at a barrier with no
+                // MMAs in flight to cover it, so every wave's stall becomes the whole
+                // group's. The `mask = 0` fence forbids the move, leaving the trip's
+                // MMAs between the prefetch issue and the wait that consumes it.
+                let after_mma = if ker.caps.needs_pipeline_commit_fence() {
+                    crate::asm::sched_barrier(0, after_mma)
+                } else {
+                    after_mma
+                };
+                let (a_nxt, b_nxt) = (nxt[0].after(&after_mma), nxt[1].after(&after_mma));
+                let fenced = g.commit_regs_to_local(&[(&a_nxt, &stage[0]), (&b_nxt, &stage[1])]).barrier(smallvec![]);
+                ker.push_store(fenced, a_nxt.uop().clone());
+                lp.close()
+            }
+            Stream::Single | Stream::Async => lp.close(),
         }
     }
 
@@ -686,7 +955,6 @@ impl Strips<'_> {
     /// index wraps modulo the trip count, so the last trip re-reads strip 0
     /// (never gathered) instead of running off the operand.
     fn staged(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
-        let half = |st: &ST, p: &Arc<UOp>| st.with_base_offset(p.mul(&cidx(st.half_elems() as i64)));
         let [s_a, s_b] = self.stage(g, &a_smem, &b_smem, &cidx(0));
         let (a_half, b_half) = (half(&a_smem, &cidx(0)), half(&b_smem, &cidx(0)));
         let landed = g.commit_regs_to_local(&[(&a_half, &s_a), (&b_half, &s_b)]).barrier(smallvec![]);
@@ -720,19 +988,10 @@ impl Strips<'_> {
     /// trips re-read strip 0 (never gathered) instead of running off the operand.
     fn async_pipelined(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
         let stages = self.cfg.stages as i64;
-        let half = |st: &ST, p: &Arc<UOp>| st.with_base_offset(p.mul(&cidx(st.half_elems() as i64)));
-        let issue = |a: &ST, b: &ST, t: &Arc<UOp>| {
-            let (ai, bi) = self.at(t);
-            let a_copy = match self.a_rows {
-                Some(rows) => g.cp_async_fill_rows(a, self.a_gl, |r| rows(r, self.row, t)),
-                None => g.cp_async_fill(a, self.a_gl, &ai, 2),
-            };
-            [a_copy, g.cp_async_fill(b, self.b_gl, &bi, 2)]
-        };
         // Prologue: strips `0..stages-1`, each into its own half.
         let mut deps: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
         for j in 0..stages - 1 {
-            deps.extend(issue(&half(&a_smem, &cidx(j)), &half(&b_smem, &cidx(j)), &cidx(j % self.trips)));
+            deps.extend(self.copy(g, &half(&a_smem, &cidx(j)), &half(&b_smem, &cidx(j)), &cidx(j % self.trips)));
         }
         let a_smem = a_smem.after(deps.clone());
         let b_smem = b_smem.after(deps);
@@ -747,8 +1006,103 @@ impl Strips<'_> {
         // one per operand) in flight and retires everything older, i.e. strip `idx`.
         let landed = cp_async_wait(2 * (stages as u32).saturating_sub(2), smallvec![idx]).barrier(smallvec![]);
         let mut issued: SmallVec<[Arc<UOp>; 4]> = smallvec![landed.clone()];
-        issued.extend(issue(&half(&a_smem, &par_nxt).after(&landed), &half(&b_smem, &par_nxt).after(&landed), &pf));
+        issued.extend(self.copy(
+            g,
+            &half(&a_smem, &par_nxt).after(&landed),
+            &half(&b_smem, &par_nxt).after(&landed),
+            &pf,
+        ));
         (half(&a_smem, &par_cur).after(issued.clone()), half(&b_smem, &par_cur).after(issued), Stream::Async)
+    }
+
+    /// The K loop over the `cp.async` pipeline, in the shape of cutlass's
+    /// multistage main loop: a strip is consumed in `k_step / k_edge` MMA steps,
+    /// each step's fragments gathered while the step before it runs, so no MMA
+    /// waits on its own gather. The trip's one barrier sits before its last step
+    /// rather than at its head, and the next strip's first fragments are gathered
+    /// there, under the last step's MMAs, and carried across the back edge — the
+    /// matrix core is never left idle behind the barrier and a burst of copies,
+    /// which cost the whole-strip loop ~340 cycles a trip on sm_86.
+    ///
+    /// A prologue issues strips `0..stages`, one per shared half, waits for the
+    /// first and gathers its first step. At trip `t`'s barrier strip `t + 1` has
+    /// landed (`wait_group` leaves the `stages - 2` newer strips in flight) and
+    /// every wave is past its gathers of strip `t`, so the copy of strip
+    /// `t + stages` goes into strip `t`'s half right there, `stages - 1` whole
+    /// trips ahead of its own barrier. Prefetch indices wrap modulo the trip
+    /// count, so the tail re-reads the first strips (never gathered) instead of
+    /// running off the operand; the copies still in flight at exit are the
+    /// caller's to drain.
+    fn stepped<'k>(
+        &self,
+        g: &Group<'k>,
+        lp: &Loop<'_>,
+        a_smem: ST,
+        b_smem: ST,
+        wave: &Wave<'_, 'k>,
+        accs: &[RT<'k>],
+    ) -> Arc<UOp> {
+        let ker = g.kernel();
+        let (stages, depth) = (self.cfg.stages as i64, wave.k_edge);
+        let steps = self.cfg.k_step / depth;
+        // Wait until only the `newer` newest strips (two commits each, one per
+        // operand) are in flight, then fence the workgroup.
+        let fence = |newer: i64, deps| cp_async_wait(2 * newer as u32, deps).barrier(smallvec![]);
+
+        let mut copies: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
+        for j in 0..stages {
+            copies.extend(self.copy(g, &half(&a_smem, &cidx(j)), &half(&b_smem, &cidx(j)), &cidx(j % self.trips)));
+        }
+        let landed = fence(stages - 1, copies);
+        let (a_smem, b_smem) = (a_smem.after(&landed), b_smem.after(&landed));
+        let carried = wave.gather(g, wave.frags(depth), &half(&a_smem, &cidx(0)), &half(&b_smem, &cidx(0)), 0);
+
+        let idx = lp.index();
+        let par = |ahead: i64| idx.add(&cidx(ahead)).try_mod(&cidx(stages)).expect("stage parity");
+        let (a_cur, b_cur) = (half(&a_smem, &par(0)), half(&b_smem, &par(0)));
+        let pf = idx.add(&cidx(stages)).try_mod(&cidx(self.trips)).expect("prefetch strip % trips");
+        let prefetch =
+            |deps: SmallVec<[Arc<UOp>; 4]>| self.copy(g, &a_cur.after(deps.clone()), &b_cur.after(deps), &pf);
+
+        // Every register index of an unrolled MMA is a constant, which the carried
+        // fragments need to stay in registers across the back edge.
+        let rolled = ker.unrolled();
+        ker.set_unroll(true);
+        let first = carried.map(|t| lp.reinit(t.clone()));
+        let mut accs = accs.to_vec();
+        // The barrier stays in the loop even when no gather of this strip is left
+        // to order it (a strip of one step).
+        let (mut frags, mut reads) = (first.clone(), smallvec![idx.clone()]);
+        let (mut step0, mut after) = (None, SmallVec::new());
+        for s in 1..steps {
+            let next = wave.gather(g, wave.frags(depth), &a_cur, &b_cur, s);
+            reads.extend(next.uops());
+            after = smallvec![wave.mma(g, &mut accs, &frags, after)];
+            step0.get_or_insert_with(|| after.clone());
+            frags = next;
+        }
+        let landed = fence(stages - 2, reads);
+        let (a_nxt, b_nxt) = (half(&a_smem, &par(1)).after(&landed), half(&b_smem, &par(1)).after(&landed));
+        // The next strip's first step overwrites the carried fragments step 0 read,
+        // and the copy of strip `t + stages` the half every wave has now finished
+        // gathering; the last step's MMAs order after both — or, with a single step,
+        // the reload after the MMAs and the copy — so they end the trip.
+        match step0 {
+            Some(step0) => {
+                let reload = wave.gather(g, first.map(|t| t.after(step0.clone())), &a_nxt, &b_nxt, 0);
+                after.extend(reload.uops());
+                after.extend(prefetch(reload.uops().collect()));
+                wave.mma(g, &mut accs, &frags, after);
+            }
+            None => {
+                let done = wave.mma(g, &mut accs, &frags, after);
+                let copies = prefetch(smallvec![landed]);
+                let deps: SmallVec<[Arc<UOp>; 4]> = [done].into_iter().chain(copies).collect();
+                wave.gather(g, first.map(|t| t.after(deps.clone())), &a_nxt, &b_nxt, 0);
+            }
+        }
+        ker.set_unroll(rolled);
+        lp.close()
     }
 }
 
@@ -761,9 +1115,9 @@ pub const GEMM_NT_SUPPORTED_ARCHS: crate::ArchSet =
     crate::ArchSet::amd(crate::target::RDNA_WMMA).with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
 
 /// The CUDA default tile: 128×64, a 2×2 wave grid (128 threads), two 32×32 f32
-/// accumulators per wave, `k_step = 32` and the two-stage `cp.async` pipeline.
-/// 24 KiB of shared memory and ~116 registers, so four blocks are resident per
-/// sm_86 SM. Measured fastest on every shape in `benches/gemm.rs`: the
+/// accumulators per wave, `k_step = 32`, the two-stage `cp.async` pipeline and
+/// the staged store. 24 KiB of shared memory and ~120 registers, so four blocks
+/// are resident per sm_86 SM. Measured fastest on every shape in `benches/gemm.rs`: the
 /// 128×128 tile (256 threads, 32 KiB) loses 2-14% — its grid is half as wide, and
 /// on the narrow-N shapes that costs more than the extra operand reuse gains.
 pub const NT_128X64: GemmCfg = GemmCfg {
@@ -774,6 +1128,8 @@ pub const NT_128X64: GemmCfg = GemmCfg {
     acc_m: 2,
     k_step: 32,
     stages: 2,
+    stepped: false,
+    stage_out: true,
     b_order: BOrder::Nk,
     l2_swizzle: true,
     vec_load: true,
@@ -813,22 +1169,32 @@ pub const NT_32X32: GemmCfg = GemmCfg { block_m: 32, block_n: 32, acc_m: 1, k_st
 /// still). Kept for a device with more bandwidth per FLOP, which flips the sign.
 pub const NT_SPLIT_K: GemmCfg = GemmCfg { split_k: 2, l2_swizzle: false, ..NT_128X64 };
 
-/// The CUDA sm_80+ tiles, widest first. The two fine ones are never the static
+/// [`NT_64X64`] on the stepped main loop ([`GemmCfg::stepped`]) over three
+/// strips. Measured on sm_86 against the best whole-strip tile, both on the
+/// staged store: ModernBERT's `512×768×2304` 83.0 against 85.0 µs and Qwen3's
+/// `4096×3072×1024` down projection 977 against 994, a tie at `512×768×768`,
+/// and 1-6% behind on ModernBERT's `M ≥ 2048` shapes, which keep the
+/// whole-strip tiles.
+pub const NT_64X64_STEPPED: GemmCfg = GemmCfg { stages: 3, stepped: true, ..NT_64X64 };
+
+/// The CUDA sm_80+ tiles, widest first. The last three are never the static
 /// choice ([`GemmPolicy::cfg`] keeps its order among the tiles narrower than the
-/// widest): they are there for [`GemmPolicy::tuned`] to measure on a shape whose
-/// grid starves the device, which the convolutions at 20² and 40² do.
-pub const CUDA_TILES: [GemmCfg; 4] = [NT_128X64, NT_64X64, NT_64X64_W8, NT_32X32];
+/// widest, and [`NT_64X64`] tiles every shape the stepped one does): they are
+/// there for [`GemmPolicy::tuned`] to measure — the two fine ones on a shape
+/// whose grid starves the device, which the convolutions at 20² and 40² do, the
+/// stepped one on the short linear layers.
+pub const CUDA_TILES: [GemmCfg; 5] = [NT_128X64, NT_64X64, NT_64X64_W8, NT_32X32, NT_64X64_STEPPED];
 
 /// The RDNA (wave32 WMMA) tiles, measured on gfx1151: the CUDA tiles without the
-/// L2 swizzle, plus the fine tile on a 64-deep strip, which halves the barriers
+/// L2 swizzle or the staged store (never measured on RDNA), plus the fine tile on a 64-deep strip, which halves the barriers
 /// per K and wins once the grid is short (batch-1 down projection 12.3 vs 7.1
 /// TFLOP/s); the 32-deep 64×64 keeps a `K` of 64 or 96 servable. Not candidates:
 /// 128×128 (10-15% behind) and `k_step = 64` on the wide tile (48 KiB of LDS,
 /// half the throughput).
 pub const RDNA_TILES: [GemmCfg; 3] = [
-    GemmCfg { l2_swizzle: false, ..NT_128X64 },
-    GemmCfg { l2_swizzle: false, k_step: 64, ..NT_64X64 },
-    GemmCfg { l2_swizzle: false, ..NT_64X64 },
+    GemmCfg { l2_swizzle: false, stage_out: false, ..NT_128X64 },
+    GemmCfg { l2_swizzle: false, stage_out: false, k_step: 64, ..NT_64X64 },
+    GemmCfg { l2_swizzle: false, stage_out: false, ..NT_64X64 },
 ];
 
 /// The RDNA4 (gfx12) tiles, measured on gfx1201 (64 CUs): every one a 4-row wave
@@ -839,13 +1205,14 @@ pub const RDNA_TILES: [GemmCfg; 3] = [
 /// short grids it starves on (128×1024×6144: 24.2 vs 26.5 µs) and the `M`s it
 /// does not divide; the L2 swizzle splits by `N`, so both forms are candidates.
 /// The 64-deep strip lost on every shape here.
-pub const NT_128X128_RDNA4: GemmCfg = GemmCfg { block_n: 128, warps_m: 4, warps_n: 2, acc_m: 1, ..NT_128X64 };
+pub const NT_128X128_RDNA4: GemmCfg =
+    GemmCfg { block_n: 128, warps_m: 4, warps_n: 2, acc_m: 1, stage_out: false, ..NT_128X64 };
 pub const RDNA4_TILES: [GemmCfg; 5] = [
     NT_128X128_RDNA4,
     GemmCfg { l2_swizzle: false, ..NT_128X128_RDNA4 },
-    GemmCfg { warps_m: 4, warps_n: 1, acc_m: 1, l2_swizzle: false, ..NT_128X64 },
-    GemmCfg { warps_n: 1, l2_swizzle: false, ..NT_64X64 },
-    GemmCfg { block_m: 64, warps_m: 4, warps_n: 1, acc_m: 1, l2_swizzle: false, ..NT_128X64 },
+    GemmCfg { warps_m: 4, warps_n: 1, acc_m: 1, l2_swizzle: false, stage_out: false, ..NT_128X64 },
+    GemmCfg { warps_n: 1, l2_swizzle: false, stage_out: false, ..NT_64X64 },
+    GemmCfg { block_m: 64, warps_m: 4, warps_n: 1, acc_m: 1, l2_swizzle: false, stage_out: false, ..NT_128X64 },
 ];
 
 /// Tile selection for the NT GEMM: the family's tile table — the search space
@@ -928,8 +1295,7 @@ impl GemmPolicy {
         epi: Epilogue<()>,
     ) -> Option<GemmCfg> {
         let caps = crate::ArchCaps::for_arch(arch);
-        let frag = caps.frag(crate::arch::FragRole::Accumulator).map(|f| f.base.cols);
-        let fits = |cfg: &GemmCfg| cfg.tiles(m, k, n) && cfg.carries(epi, frag);
+        let fits = |cfg: &GemmCfg| cfg.tiles(m, k, n) && cfg.carries(epi, &caps);
         let candidates: Vec<GemmCfg> = self.tiles.iter().copied().filter(fits).collect();
         let fallback = || self.cfg(m, k, n).filter(fits);
         if candidates.len() < 2 {
@@ -946,9 +1312,7 @@ impl GemmPolicy {
         let builds = || {
             let placeholders = || {
                 let mut sizes = vec![m * cols, m * k, n * k];
-                if let Epilogue::Add(()) = epi {
-                    sizes.push(m * cols);
-                }
+                sizes.extend(epi_operand_shapes(epi, m, cols).iter().map(|s| s.iter().product::<usize>()));
                 sizes.into_iter().map(|s| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, s, dtype.clone())).collect()
             };
             candidates
@@ -967,8 +1331,8 @@ impl GemmPolicy {
             let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
             let (x, w) = (operand(&[m, k])?, operand(&[n, k])?);
             let mut ins = vec![x, w];
-            if let Epilogue::Add(()) = epi {
-                ins.push(operand(&[m, cols])?);
+            for shape in epi_operand_shapes(epi, m, cols) {
+                ins.push(operand(&shape)?);
             }
             let ins: Vec<&Tensor> = ins.iter().collect();
             let mut y = Tensor::empty(&[m, cols], dtype.clone()).to(spec.clone());
@@ -1034,7 +1398,8 @@ pub fn select_cfg(m: usize, k: usize, n: usize) -> Option<GemmCfg> {
 /// ([`GemmPolicy::tuned`]): the first request of a shape times every candidate
 /// once and caches the winner on disk ([`crate::tune`]); `SVOD_TK_TUNE=0` keeps
 /// the table's static choice instead.
-/// - `Err` — *malformed request:* a symbolic dim, `x` below rank 2 or `w` not
+/// - `Err` — *malformed request:* a symbolic dim (one a JIT variable pins to a
+///   single value counts as static), `x` below rank 2 or `w` not
 ///   rank 2, a dtype outside {bf16, f16}, a dtype mismatch between `x` and `w`,
 ///   or `w`'s K disagreeing with `x`'s.
 /// - `Ok(Some(y))` — it ran.
@@ -1073,15 +1438,20 @@ pub fn gemm_nt_with(
 /// - [`Epilogue::SwiGlu`] gives `y = silu(gate)·up` off a fused gate/up weight,
 ///   so the `[M, 2I]` intermediate is never written and no separate SwiGLU pass
 ///   reads it back.
+/// - [`Epilogue::Rope`] gives a fused QKV projection with its query and key
+///   heads already rotated, so attention reads them straight from `y`.
 ///
 /// Shapes, dtypes and the three-way outcome are [`gemm_nt`]'s, plus:
 ///
 /// - `Ok(None)` — the selected tile cannot carry the epilogue: split-K (its
-///   store is f32 partials), or, for SwiGLU, a tile whose `reg_n/2` is not the
+///   store is f32 partials), for SwiGLU a tile whose `reg_n/2` is not the
 ///   `pair` width the weight rows were arranged in (see
-///   [`GemmPolicy::swiglu_pair_width`]).
-/// - `Err` — a `residual` whose shape or dtype is not `y`'s, or a SwiGLU `pair`
-///   that does not divide `N/2`.
+///   [`GemmPolicy::swiglu_pair_width`]), for RoPE a tile without the staged
+///   store or narrower than a head, or a head dim that is not a whole number
+///   of 16-byte runs per half.
+/// - `Err` — a `residual` whose shape or dtype is not `y`'s, a SwiGLU `pair`
+///   that does not divide `N/2`, RoPE tables that are not `[seq, head_dim/2]`
+///   in `x`'s dtype, a `seq` that does not divide `M`, or rotated heads past `N`.
 pub fn gemm_nt_with_epilogue(
     x: &Tensor,
     w: &Tensor,
@@ -1091,15 +1461,14 @@ pub fn gemm_nt_with_epilogue(
     build_gemm(x, w, epilogue, |arch, m, k, n| {
         let policy = GemmPolicy::for_device(&spec, arch);
         if !crate::tune::enabled() {
-            let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator);
-            return policy.cfg(m, k, n).filter(|c| c.carries(kind, frag.map(|f| f.base.cols)));
+            return policy.cfg(m, k, n).filter(|c| c.carries(kind, &crate::ArchCaps::for_arch(arch)));
         }
         policy.tuned(crate::tune::TuneStore::global(), &spec, arch, &dtype, (m, k, n), kind)
     })
 }
 
 /// The shared launcher body of the three entries above.
-fn build_gemm(
+pub(crate) fn build_gemm(
     x: &Tensor,
     w: &Tensor,
     epi: Epilogue<&Tensor>,
@@ -1107,6 +1476,7 @@ fn build_gemm(
 ) -> crate::LaunchResult<Option<Tensor>> {
     let xd = crate::launch::concrete_dims_at_least(x, "gemm-nt", "x", 2)?;
     let wd = crate::launch::concrete_dims(w, "gemm-nt", "w", 2)?;
+    let (x, w) = (&crate::launch::statically(x, &xd)?, &crate::launch::statically(w, &wd)?);
     // `x` is `[lead..., K]`: the leading dims are the GEMM's rows and come back
     // on `y` as `[lead..., N]`.
     let (lead, k) = (xd[..xd.len() - 1].to_vec(), xd[xd.len() - 1]);
@@ -1115,19 +1485,24 @@ fn build_gemm(
     let (w_dtype, kw) = (w.uop().dtype(), wd[1]);
     let err_dtype = dtype.clone();
 
-    // The epilogue's own operand: its dims are resolved up front (a symbolic one
-    // is an `Err` like any other operand's), the rest is checked by `validate`.
+    // The epilogue's own operands: their dims are resolved up front (a symbolic
+    // one is an `Err` like any other operand's), the rest is checked by
+    // `validate` against the shape each must have.
     let kind = epi.kind();
     let y_shape: Vec<usize> = lead.iter().copied().chain([kind.out_cols(n)]).collect();
-    let res_dims = match epi {
-        Epilogue::Add(r) => Some(crate::launch::concrete_dims_at_least(r, "gemm-nt", "residual", 2)?),
-        _ => None,
+    let epi_operands = match epi {
+        Epilogue::Add(r) => vec![("residual", r, y_shape.clone())],
+        Epilogue::Rope { cos, sin, seq, head_dim, .. } => {
+            vec![("cos", cos, vec![seq, head_dim / 2]), ("sin", sin, vec![seq, head_dim / 2])]
+        }
+        Epilogue::Plain | Epilogue::SwiGlu { .. } | Epilogue::BiasAct { .. } => vec![],
     };
-    let res_dtype = match epi {
-        Epilogue::Add(r) => Some(r.uop().dtype()),
-        _ => None,
-    };
-    let want_res = y_shape.clone();
+    let (mut extra, mut extra_checks) = (Vec::new(), Vec::new());
+    for (operand, t, want) in epi_operands {
+        let dims = crate::launch::concrete_dims_at_least(t, "gemm-nt", operand, 2)?;
+        extra.push(crate::launch::statically(t, &dims)?);
+        extra_checks.push((operand, t.uop().dtype(), dims, want));
+    }
     // The chooser measures on first use, so it runs once per launch: the tiling
     // predicate and the build share its answer.
     let chosen: Rc<OnceCell<Option<GemmCfg>>> = Rc::default();
@@ -1149,36 +1524,45 @@ fn build_gemm(
                 kw == k,
                 crate::launch::OperandShapeSnafu { kernel: "gemm-nt", operand: "w", expected: vec![n, k], got: wd }
             );
-            if let Some(got) = res_dims {
+            for (operand, got_dtype, got, expected) in extra_checks {
                 ensure!(
-                    res_dtype == Some(err_dtype.clone()),
-                    crate::launch::DtypeSnafu {
-                        kernel: "gemm-nt",
-                        got: res_dtype.unwrap_or(err_dtype),
-                        expected: "the dtype of x"
-                    }
+                    got_dtype == err_dtype,
+                    crate::launch::DtypeSnafu { kernel: "gemm-nt", got: got_dtype, expected: "the dtype of x" }
                 );
                 ensure!(
-                    got == want_res,
-                    crate::launch::OperandShapeSnafu {
-                        kernel: "gemm-nt",
-                        operand: "residual",
-                        expected: want_res,
-                        got
-                    }
+                    got == expected,
+                    crate::launch::OperandShapeSnafu { kernel: "gemm-nt", operand, expected, got }
                 );
             }
-            if let Epilogue::SwiGlu { pair } = kind {
-                ensure!(
+            match kind {
+                Epilogue::SwiGlu { pair } => ensure!(
                     pair > 0 && n.is_multiple_of(2 * pair),
                     crate::launch::DimMultipleSnafu { kernel: "gemm-nt", dim: "N", value: n, multiple: 2 * pair }
-                );
+                ),
+                // Every output row has a table row, and `w` has a row for every
+                // column the rotated heads take.
+                Epilogue::Rope { seq, head_dim, heads, .. } => {
+                    ensure!(
+                        seq > 0 && m.is_multiple_of(seq),
+                        crate::launch::DimMultipleSnafu { kernel: "gemm-nt", dim: "M", value: m, multiple: seq }
+                    );
+                    ensure!(
+                        head_dim > 0 && heads * head_dim <= n,
+                        crate::launch::OperandShapeSnafu {
+                            kernel: "gemm-nt",
+                            operand: "w",
+                            expected: vec![heads * head_dim, k],
+                            got: wd
+                        }
+                    );
+                }
+                _ => {}
             }
             Ok(())
         },
         move |arch| {
-            let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator);
-            fit_chosen.get_or_init(|| cfg(arch, m, k, n)).is_some_and(|c| c.carries(kind, frag.map(|f| f.base.cols)))
+            let caps = crate::ArchCaps::for_arch(arch);
+            fit_chosen.get_or_init(|| cfg(arch, m, k, n)).is_some_and(|c| c.carries(kind, &caps))
         },
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
@@ -1190,14 +1574,13 @@ fn build_gemm(
             let name = match kind {
                 Epilogue::Add(()) => "gemm_nt_add",
                 Epilogue::SwiGlu { .. } => "gemm_nt_swiglu",
+                Epilogue::Rope { .. } => "gemm_nt_rope",
                 Epilogue::Plain if split > 1 => "gemm_nt_split",
                 Epilogue::Plain => "gemm_nt",
                 Epilogue::BiasAct { .. } => unreachable!("a conv epilogue enters through conv2d_nhwc"),
             };
             let mut ins = vec![x, w];
-            if let Epilogue::Add(r) = epi {
-                ins.push(r);
-            }
+            ins.extend(&extra);
             let y = crate::graph_launch(name, grid, block, out, &ins, caps, move |ker| {
                 build_gemm_nt(ker, (m, k, n), cfg, in_dt, out_dt, kind);
                 ker.finish(cfg.acc_m)
@@ -1230,17 +1613,29 @@ pub fn build_gemm_nt(
     let cols = epi.out_cols(n);
     let out_shape = if cfg.split_k > 1 { vec![1, cfg.split_k, m, cols] } else { vec![1, 1, m, cols] };
     let mut in_specs = vec![GlSpec::new(&[1, 1, m, k], in_dt.clone()), GlSpec::new(&[1, 1, n, k], in_dt.clone())];
-    if let Epilogue::Add(()) = epi {
-        in_specs.push(GlSpec::new(&[1, 1, m, cols], out_dt.clone()));
-    }
+    in_specs.extend(epi_operand_shapes(epi, m, cols).iter().map(|shape| GlSpec::new(shape, out_dt.clone())));
     let (outs, ins) = ker.bind_abi(&[GlSpec::new(&out_shape, out_dt)], &in_specs);
     let epi = match epi {
         Epilogue::Plain => Epilogue::Plain,
         Epilogue::Add(()) => Epilogue::Add(ins[2].clone()),
         Epilogue::SwiGlu { pair } => Epilogue::SwiGlu { pair },
+        Epilogue::Rope { seq, head_dim, heads, .. } => {
+            Epilogue::Rope { cos: ins[2].clone(), sin: ins[3].clone(), seq, head_dim, heads }
+        }
         Epilogue::BiasAct { .. } => unreachable!("a conv epilogue enters through build_conv"),
     };
     gemm_core(ker, (m, k, n), cfg, outs[0].clone(), ins[0].clone(), ins[1].clone(), epi);
+}
+
+/// The shapes of the NT GEMM's epilogue operands, bound after `x` and `w` in
+/// this order and in the output dtype: [`Epilogue::Add`]'s `m × cols`
+/// residual, [`Epilogue::Rope`]'s `[seq, head_dim/2]` cosine and sine tables.
+fn epi_operand_shapes(epi: Epilogue<()>, m: usize, cols: usize) -> Vec<Vec<usize>> {
+    match epi {
+        Epilogue::Add(()) => vec![vec![1, 1, m, cols]],
+        Epilogue::Rope { seq, head_dim, .. } => vec![vec![seq, head_dim / 2]; 2],
+        Epilogue::Plain | Epilogue::SwiGlu { .. } | Epilogue::BiasAct { .. } => vec![],
+    }
 }
 
 // ── The square matmul (`c = a · b`, n×n) ─────────────────────────────────────
@@ -1334,6 +1729,8 @@ impl MatmulCfg {
             acc_m: self.n_accum,
             k_step,
             stages: 1,
+            stepped: false,
+            stage_out: false,
             b_order: BOrder::Kn,
             l2_swizzle: self.l2_swizzle,
             vec_load: self.vec_load,

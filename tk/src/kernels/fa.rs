@@ -112,30 +112,67 @@ pub struct FaConfig {
     /// Causal masking + KV block-skip. `false` is the full (bidirectional) attention
     /// sweep over every KV super-block.
     pub causal: bool,
+    /// Sliding-window band `(left, right)`: query `q` sees keys `q - left ..= q + right`,
+    /// and each workgroup sweeps only the KV super-blocks its band touches.
+    pub window: Option<(usize, usize)>,
 }
 
 impl Default for FaConfig {
     fn default() -> Self {
-        Self { q_blk: Q_BLK, kv_blk: KV_BLK, unroll: false, causal: true }
+        Self { q_blk: Q_BLK, kv_blk: KV_BLK, unroll: false, causal: true, window: None }
     }
 }
 
 /// The optional score masks a build binds, each a trailing global after
 /// `o, q, k, v` in this order: the `[B]` valid-key counts of
 /// [`FaOpts::key_lens`], then the `[B, N]` segment starts of
-/// [`FaOpts::seg_start`].
+/// [`FaOpts::seg_start`], then the `[B, N]` key validity of [`FaOpts::key_mask`]
+/// (as an f32 bias where it seeds the scores, [`key_mask_seeds`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FaMask {
     pub key_lens: bool,
     pub seg_start: bool,
+    pub key_mask: bool,
 }
 
 impl FaMask {
-    pub const NONE: Self = Self { key_lens: false, seg_start: false };
+    pub const NONE: Self = Self { key_lens: false, seg_start: false, key_mask: false };
 
     /// The masks as a bit set, the tune key's shape component.
     pub const fn code(self) -> usize {
-        self.key_lens as usize | (self.seg_start as usize) << 1
+        self.key_lens as usize | (self.seg_start as usize) << 1 | (self.key_mask as usize) << 2
+    }
+}
+
+/// Where a build reads Q, K and V from, bound right after `o`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FaOperands {
+    /// Three globals: Q `[B, N, H, D]`, K and V `[B, N, H_kv, D]`.
+    #[default]
+    Split,
+    /// One `[B, N, H + 2·H_kv, D]` global — a fused QKV projection's output read
+    /// by head: Q's heads, then K's, then V's. A block's rows then lie
+    /// `H + 2·H_kv` heads apart instead of `H_kv`, which the 16-byte copies do
+    /// not notice, and the projection's output needs no split into three
+    /// tensors first.
+    Packed,
+}
+
+impl FaOperands {
+    /// The kernel's name, which keys its tuning apart from the other layout's.
+    const fn kernel(self) -> &'static str {
+        match self {
+            FaOperands::Split => "flash_attention",
+            FaOperands::Packed => "flash_attention_packed",
+        }
+    }
+
+    /// The input globals' head counts, in binding order.
+    fn heads(self, h: usize, h_kv: usize) -> Vec<usize> {
+        match self {
+            FaOperands::Split => vec![h, h_kv, h_kv],
+            FaOperands::Packed => vec![h + 2 * h_kv],
+        }
     }
 }
 
@@ -177,9 +214,15 @@ struct FaCtx<'a, 'k> {
     q_blk: &'a Arc<UOp>,
     warpid: &'a Arc<UOp>,
     causal: bool,
+    window: Option<(usize, usize)>,
     valid_len: Option<Arc<UOp>>,
     /// The `[B, N]` segment-start table and the batch index it is read at.
     seg_start: Option<(crate::tile::GL, Arc<UOp>)>,
+    /// The `[B, N]` key-validity table and the batch index it is read at.
+    key_mask: Option<(crate::tile::GL, Arc<UOp>)>,
+    /// The key mask is the f32 bias the `QKᵀ` accumulator starts from
+    /// ([`key_mask_seeds`]), not an `i32` table the scores are masked by.
+    seed_key_mask: bool,
     /// `log2(e)/sqrt(d)` — the softmax scale, folded with the `exp2` base change.
     /// Applied to the f32 `QKᵀ` accumulator rather than to `Q`: scaling `Q` costs a
     /// second rounding to the 16-bit mma input dtype, and that error enters the
@@ -189,41 +232,79 @@ struct FaCtx<'a, 'k> {
     score_scale: f64,
 }
 
-/// Apply the FA score-mask (causal + optional padding + optional segments) to
-/// the `att` tile. The causal mask zeros (via `−∞`) keys ahead of this warp's
-/// own query rows (`kv_pos > q_pos`); the padding mask zeros keys at/after the
-/// per-batch valid length (`kv_pos >= valid_len`); the segment mask zeros keys
-/// before the query's own segment (`kv_pos < seg_start[batch, q_pos]`). With
-/// none, the tile is returned unchanged (the early-return avoids emitting any
-/// mask IR when masking is off). The per-element `(kv_pos, q_pos)` is computed
-/// arch-correctly inside [`Group::mask_where`].
-fn score_mask<'k>(
-    warp: &Group<'k>,
-    att: RT<'k>,
-    slice_idx: &Arc<UOp>,
-    q_blk: &Arc<UOp>,
-    causal: bool,
-    valid_len: Option<&Arc<UOp>>,
-    seg_start: Option<&(crate::tile::GL, Arc<UOp>)>,
-) -> RT<'k> {
-    if !causal && valid_len.is_none() && seg_start.is_none() {
+/// Whether the `[B, N]` key mask reaches the kernel as an f32 bias (`0` for a
+/// valid key, `−∞` for a hidden one) that the `QKᵀ` accumulator starts from,
+/// rather than as an `i32` validity table the scores are masked by after it. A
+/// key's validity is one value per column, so the seed costs a load per key a
+/// lane holds and nothing per score: at 1×8192 on sm_86 the masked kernel runs
+/// within 1% of the unmasked one instead of 3% behind it; on gfx1201, where the
+/// table's compare and select cost registers too, 2796 µs instead of 3229. The
+/// scores are bit-identical — `0 + s = s`, and a hidden key stays `−∞` through
+/// the MMA and the scale. Validated on CUDA and gfx12 only.
+fn key_mask_seeds(caps: &crate::ArchCaps) -> bool {
+    caps.cuda().is_some() || caps.amd().is_some_and(svod_dtype::AmdArch::is_rdna4)
+}
+
+/// The dtype the kernel reads the key mask in ([`key_mask_seeds`]).
+fn key_mask_dtype(caps: &crate::ArchCaps) -> DType {
+    if key_mask_seeds(caps) { DType::Float32 } else { DType::Int32 }
+}
+
+/// A `[B, N]` key validity (any integer or bool dtype, non-zero = valid) as the
+/// kernel reads it ([`key_mask_seeds`]).
+fn key_mask_operand(valid: &Tensor, caps: &crate::ArchCaps) -> Tensor {
+    if !key_mask_seeds(caps) {
+        return valid.cast(DType::Int32);
+    }
+    let shape = [valid.dim_const(0).expect("static key mask"), valid.dim_const(1).expect("static key mask")];
+    let bias = |v: f64| Tensor::full(&shape, ConstValue::Float(v), DType::Float32);
+    bias(0.0).where_(&valid.cast(DType::Bool), bias(f64::NEG_INFINITY)).expect("key-mask bias")
+}
+
+/// Apply the FA score-mask (causal + optional padding + optional segments +
+/// optional window + optional key mask) to the `att` tile. The causal mask zeros
+/// (via `−∞`) keys ahead of this warp's own query rows (`kv_pos > q_pos`); the
+/// padding mask zeros keys at/after the per-batch valid length
+/// (`kv_pos >= valid_len`); the segment mask zeros keys before the query's own
+/// segment (`kv_pos < seg_start[batch, q_pos]`); the window zeros keys outside
+/// `q_pos - left ..= q_pos + right`; the key mask zeros keys whose
+/// `key_mask[batch, kv_pos]` is `0`. With none, the tile is returned unchanged
+/// (the early-return avoids emitting any mask IR when masking is off). The
+/// per-element `(kv_pos, q_pos)` is computed arch-correctly inside
+/// [`Group::mask_where`].
+fn score_mask<'k>(ctx: &FaCtx<'_, 'k>, att: RT<'k>, slice_idx: &Arc<UOp>) -> RT<'k> {
+    /// `(kv_pos, q_pos) → hidden`.
+    type Hidden<'a> = &'a dyn Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>;
+    let FaCtx { warp, causal, window, .. } = *ctx;
+    let key_mask = ctx.key_mask.as_ref().filter(|_| !ctx.seed_key_mask);
+    let (valid_len, seg_start) = (ctx.valid_len.as_ref(), ctx.seg_start.as_ref());
+    if !causal && valid_len.is_none() && seg_start.is_none() && window.is_none() && key_mask.is_none() {
         return att;
     }
     let row_blk = Idx::Uop(slice_idx.clone());
-    let col_blk = Idx::Uop(q_blk.clone());
-    let att = if causal {
-        warp.mask_where(att, row_blk.clone(), col_blk.clone(), f64::NEG_INFINITY, |kv_pos, q_pos| kv_pos.gt(q_pos))
-    } else {
-        att
+    let col_blk = Idx::Uop(ctx.q_blk.clone());
+    let mask = |att, predicate: Hidden<'_>| {
+        warp.mask_where(att, row_blk.clone(), col_blk.clone(), f64::NEG_INFINITY, predicate)
     };
-    let att = if let Some(vl) = valid_len {
-        warp.mask_where(att, row_blk.clone(), col_blk.clone(), f64::NEG_INFINITY, move |kv_pos, _| kv_pos.ge(vl))
-    } else {
-        att
-    };
-    if let Some((table, batch)) = seg_start {
-        warp.mask_where(att, row_blk, col_blk, f64::NEG_INFINITY, move |kv_pos, q_pos| {
+    let att = if causal { mask(att, &|kv_pos, q_pos| kv_pos.gt(q_pos)) } else { att };
+    let att = if let Some(vl) = valid_len { mask(att, &|kv_pos, _| kv_pos.ge(vl)) } else { att };
+    let att = if let Some((table, batch)) = seg_start {
+        mask(att, &|kv_pos, q_pos| {
             kv_pos.lt(&load_at(table.uop(), table.shape(), &[Idx::from(batch), Idx::from(q_pos)]))
+        })
+    } else {
+        att
+    };
+    let att = if let Some((left, right)) = window {
+        let att = mask(att, &|kv_pos, q_pos| kv_pos.add(&iconst(left as i64)).lt(q_pos));
+        mask(att, &|kv_pos, q_pos| kv_pos.gt(&q_pos.add(&iconst(right as i64))))
+    } else {
+        att
+    };
+    if let Some((table, batch)) = key_mask {
+        mask(att, &|kv_pos, _| {
+            load_at(table.uop(), table.shape(), &[Idx::from(batch), Idx::from(kv_pos)])
+                .eq(&UOp::const_(DType::Int32, ConstValue::Int(0)))
         })
     } else {
         att
@@ -263,14 +344,24 @@ fn fa_qk<'k>(
         None => (k_reg, v_reg),
     };
 
-    // QKᵀ into a freshly-zeroed att tile (re-zeroed each trip via the loop scope).
-    let att = warp.zero(ctx.lp.reinit(att));
+    // QKᵀ into a freshly-seeded att tile (re-seeded each trip via the loop scope):
+    // zeros, or the key mask's `0`/`−∞` bias ([`key_mask_seeds`]).
+    let att = ctx.lp.reinit(att);
+    let att = match ctx.key_mask.as_ref().filter(|_| ctx.seed_key_mask) {
+        Some((table, batch)) => {
+            let (kv_blk, q_blk) = (Idx::Uop(slice_idx.clone()), Idx::Uop(ctx.q_blk.clone()));
+            warp.map_position(att, kv_blk, q_blk, |_, _, kv_pos, _| {
+                load_at(table.uop(), table.shape(), &[Idx::from(batch), Idx::from(kv_pos)])
+            })
+        }
+        None => warp.zero(att),
+    };
     let k_reg_t = warp.transpose(k_reg_t, &k_reg);
     let att = warp.mma_atb(att, &k_reg_t, ctx.q_reg_t);
     // Scale in f32, on the accumulator — see `FaCtx::score_scale`.
     let att = att * ctx.score_scale;
 
-    let att = score_mask(warp, att, slice_idx, ctx.q_blk, ctx.causal, ctx.valid_len.as_ref(), ctx.seg_start.as_ref());
+    let att = score_mask(ctx, att, slice_idx);
     (att, v_reg)
 }
 
@@ -296,7 +387,7 @@ fn fa_softmax_pv<'k>(
     let FaAcc { mut max_vec, mut norm_vec, mut o_reg } = acc;
 
     let max_vec_last = warp.copy(lp.reinit(max_vec_last), &max_vec);
-    max_vec = warp.col_reduce(max_vec.after(&max_vec_last), &att, |a, b| a.max(b), f64::NEG_INFINITY);
+    max_vec = warp.col_reduce(max_vec.after(&max_vec_last), &att, |a, b| warp.max_num(a, b), f64::NEG_INFINITY);
 
     // Online-softmax rescale `exp2(prev_max - new_max)` as a same-shape vec−vec op
     // — reuses `max_vec_last`'s buffer (dead after this), so no scratch `scale_vec`
@@ -318,8 +409,10 @@ fn fa_softmax_pv<'k>(
     // store the accumulator (matrix `(kv,q)` order), barrier, reload under the input
     // map (on gfx11 `K=kv=element`, `N=q=lane%16`). Both lane maps are the
     // matmul-validated ones, so the relayout is correct by construction.
+    // `att` narrows as if never NaN ([`Group::narrow_finite`]): a NaN score
+    // still reaches the output through `norm_vec`, summed from the f32 `att`.
     let att_mma = match att_smem {
-        None => warp.copy(att_mma.after((lp.index(), &norm_vec)), &att),
+        None => warp.narrow_finite(att_mma.after((lp.index(), &norm_vec)), &att),
         Some(att_smem) => {
             // This warp's `(kv_blk × q_blk)` band of the shared relayout buffer, as a
             // zero-copy subtile — so the store and the reload address the warp's band
@@ -371,7 +464,19 @@ pub(crate) fn build_fa_mw_rdb(
     in_dtype: DType,
     mask: FaMask,
 ) {
-    let FaConfig { q_blk: q_blk_rows, kv_blk: kv_blk_rows, unroll, causal, .. } = cfg;
+    build_fa(ker, (b, n, h, h_kv, d), cfg, in_dtype, mask, FaOperands::Split);
+}
+
+/// [`build_fa_mw_rdb`] with Q, K and V bound per `operands`.
+fn build_fa(
+    ker: &Kernel,
+    (b, n, h, h_kv, d): (usize, usize, usize, usize, usize),
+    cfg: FaConfig,
+    in_dtype: DType,
+    mask: FaMask,
+    operands: FaOperands,
+) {
+    let FaConfig { q_blk: q_blk_rows, kv_blk: kv_blk_rows, unroll, causal, window } = cfg;
     // Flat compute (unrolled QKᵀ/softmax/A·V) is the prerequisite for the Stage-2
     // attention scheduling comb; the rolled (`unroll = false`) form is the iglp
     // baseline. Same numerics either way (the unroll only changes the loop
@@ -389,16 +494,16 @@ pub(crate) fn build_fa_mw_rdb(
     let g = ker.group(NUM_WARPS);
     let warp = ker.warp();
 
-    // ABI: outputs (o) then inputs (q, k, v), fixed by construction.
-    let (outs, ins) = ker.bind_abi(
-        &[GlSpec::new(&[b, n, h, d], in_dtype.clone())],
-        &[
-            GlSpec::new(&[b, n, h, d], in_dtype.clone()),
-            GlSpec::new(&[b, n, h_kv, d], in_dtype.clone()),
-            GlSpec::new(&[b, n, h_kv, d], in_dtype.clone()),
-        ],
-    );
-    let (o, q, k, v) = (outs[0].clone(), ins[0].clone(), ins[1].clone(), ins[2].clone());
+    // ABI: outputs (o) then inputs (q, k, v — or the one packed qkv), fixed by
+    // construction.
+    let in_specs: Vec<GlSpec> =
+        operands.heads(h, h_kv).into_iter().map(|heads| GlSpec::new(&[b, n, heads, d], in_dtype.clone())).collect();
+    let (outs, ins) = ker.bind_abi(&[GlSpec::new(&[b, n, h, d], in_dtype.clone())], &in_specs);
+    let (o, q) = (outs[0].clone(), ins[0].clone());
+    let (k, v) = match operands {
+        FaOperands::Split => (ins[1].clone(), ins[2].clone()),
+        FaOperands::Packed => (q.clone(), q.clone()),
+    };
     // Per-batch valid key-length buffer (padding mask), bound AFTER o,q,k,v (trailing —
     // never interleaved) so the ABI slot order stays stable; only bound when `masked`.
     // The scalar `lens[batch]` is already int32, matching the concrete SPECIAL
@@ -410,9 +515,17 @@ pub(crate) fn build_fa_mw_rdb(
     // The `[B, N]` segment starts, bound after `lens`; read per query row inside
     // the score mask at this workgroup's batch.
     let seg_start = mask.seg_start.then(|| (ker.gl(&[b, n], DType::Int32), ker.block_idx[2].clone()));
+    // The `[B, N]` key validity, bound last: the scores' seed, or read per key
+    // inside the score mask ([`key_mask_seeds`]).
+    let key_mask = mask.key_mask.then(|| (ker.gl(&[b, n], key_mask_dtype(&ker.caps)), ker.block_idx[2].clone()));
 
     let head = ker.grid_x();
     let head_kv = head.floor_div(&iconst(group_size));
+    // K's and V's heads in their globals: packed, they follow Q's `h` heads.
+    let (k_head, v_head) = match operands {
+        FaOperands::Split => (head_kv.clone(), head_kv.clone()),
+        FaOperands::Packed => (head_kv.add(&iconst(h as i64)), head_kv.add(&iconst((h + h_kv) as i64))),
+    };
     let batch = ker.grid_z();
     let block_q_base = ker.grid_y();
     let warpid = g.warpid_in_group();
@@ -478,13 +591,30 @@ pub(crate) fn build_fa_mw_rdb(
 
     // Total KV super-blocks (the full bidirectional sweep). With `causal`, the
     // per-q-block bound is the causal block-skip `(block_q_base+1)*NUM_WARPS*Q_BLK/KV_BLK`
-    // super-blocks; without it every q-block attends to all `total_kv_blocks`.
+    // super-blocks; without it every q-block attends to all `total_kv_blocks`. A
+    // window starts the sweep at the first super-block its band touches and ends it
+    // at the last (`kv_start` + `kv_bound` trips), so a local layer reads
+    // `(q_rows + left + right) / KV_BLK` blocks instead of all of them.
     let total_kv_blocks = (n / kv_blk_rows) as i64;
-    let kv_bound = if causal {
-        let blocks_mult = (NUM_WARPS * q_blk_rows / kv_blk_rows) as i64;
-        block_q_base.add(&iconst(1)).mul(&iconst(blocks_mult))
-    } else {
-        iconst(total_kv_blocks)
+    let blocks_mult = (NUM_WARPS * q_blk_rows / kv_blk_rows) as i64;
+    let causal_end = || block_q_base.add(&iconst(1)).mul(&iconst(blocks_mult));
+    let (kv_start, kv_bound) = match window {
+        None if causal => (None, causal_end()),
+        None => (None, iconst(total_kv_blocks)),
+        Some((left, right)) => {
+            let (left, right, kv) = (left as i64, right as i64, kv_blk_rows as i64);
+            let q_rows = blocks_mult * kv;
+            let q0 = block_q_base.mul(&iconst(q_rows));
+            // `max(q0 - left, 0)` and `min(a, b) = a - max(a - b, 0)`: every
+            // intermediate stays non-negative, so floor and truncating division agree.
+            let start = q0.max(&iconst(left)).sub(&iconst(left)).floor_div(&iconst(kv));
+            let min = |a: Arc<UOp>, b: Arc<UOp>| a.sub(&a.sub(&b).max(&iconst(0)));
+            let end = q0.add(&iconst(q_rows + right + kv - 1)).floor_div(&iconst(kv));
+            let end = min(end, iconst(total_kv_blocks));
+            let end = if causal { min(end, causal_end()) } else { end };
+            let trips = end.sub(&start);
+            (Some(start), trips)
+        }
     };
 
     // The K/V stream: `cp.async` (sm_80+ — the copy lands in LDS with no register
@@ -492,16 +622,18 @@ pub(crate) fn build_fa_mw_rdb(
     // register-staged prefetch (AMD).
     let async_stream = g.cp_async_fill_applies(&k_smem, &k) && g.cp_async_fill_applies(&v_smem, &v);
 
-    // Prologue: block 0 → buf[0]. Register-staged: stage → VGPR, commit, barrier;
+    // Prologue: the sweep's first block → buf[0]. Register-staged: stage → VGPR, commit, barrier;
     // cp.async: issue + commit only (the loop top retires and fences it).
-    let p_kidx = [Idx::from(&batch), Idx::Const(0), Idx::from(&head_kv), Idx::Const(0)];
+    let first_blk = kv_start.as_ref().map_or(Idx::Const(0), Idx::from);
+    let p_kidx = [Idx::from(&batch), first_blk.clone(), Idx::from(&k_head), Idx::Const(0)];
+    let p_vidx = [Idx::from(&batch), first_blk, Idx::from(&v_head), Idx::Const(0)];
     let (k_smem, v_smem) = if async_stream {
         let c_k = g.cp_async_fill(&k_smem, &k, &p_kidx, 1);
-        let c_v = g.cp_async_fill(&v_smem, &v, &p_kidx, 1);
+        let c_v = g.cp_async_fill(&v_smem, &v, &p_vidx, 1);
         (k_smem.after(c_k), v_smem.after(c_v))
     } else {
         let s0_k = g.stage_global_to_reg(&k_smem, &k, &p_kidx, 1);
-        let s0_v = g.stage_global_to_reg(&v_smem, &v, &p_kidx, 1);
+        let s0_v = g.stage_global_to_reg(&v_smem, &v, &p_vidx, 1);
         let landed = g.commit_regs_to_local(&[(&k_smem, &s0_k), (&v_smem, &s0_v)]).barrier(smallvec![]);
         ker.push_store(landed.clone(), k_smem.uop().clone());
         (k_smem.after(&landed), v_smem.after(&landed))
@@ -523,7 +655,11 @@ pub(crate) fn build_fa_mw_rdb(
     let lp = ker.loop_dynamic(kv_bound);
     let kv_idx = lp.index().clone();
     let kvp1 = kv_idx.add(&iconst(1));
-    let pf = kvp1.try_mod(&iconst(total_kv_blocks)).expect("(kv+1) % total blocks");
+    // The super-block this trip reads and the one it prefetches; the trip index
+    // alone picks the buffer half.
+    let blk = kv_start.as_ref().map_or_else(|| kv_idx.clone(), |s| s.add(&kv_idx));
+    let pf = kv_start.as_ref().map_or_else(|| kvp1.clone(), |s| s.add(&kvp1));
+    let pf = pf.try_mod(&iconst(total_kv_blocks)).expect("(kv+1) % total blocks");
     let par_cur = kv_idx.try_mod(&iconst(2)).expect("kv % 2");
     let par_nxt = kvp1.try_mod(&iconst(2)).expect("(kv+1) % 2");
 
@@ -537,7 +673,8 @@ pub(crate) fn build_fa_mw_rdb(
     // prefetch load and stays loop-scoped (dep = `kv_idx`). The prologue keeps the
     // un-rewrapped `k`/`v`. The post-linearization scheduling pass brackets the MFMAs
     // and (Stage 2) weaves the softmax under them (supersedes the prior `iglp_opt(0)`).
-    let pf_kidx = [Idx::from(&batch), Idx::from(&pf), Idx::from(&head_kv), Idx::Const(0)];
+    let pf_kidx = [Idx::from(&batch), Idx::from(&pf), Idx::from(&k_head), Idx::Const(0)];
+    let pf_vidx = [Idx::from(&batch), Idx::from(&pf), Idx::from(&v_head), Idx::Const(0)];
     let mark = crate::sched::pipeline(crate::sched::SchedKind::Attention, kv_idx.clone());
     let k_l = k.rewrap(k.uop().after(smallvec![mark.clone()]));
     let v_l = v.rewrap(v.uop().after(smallvec![mark]));
@@ -559,12 +696,12 @@ pub(crate) fn build_fa_mw_rdb(
     let (k_cur, v_cur, fence) = if async_stream {
         let landed = cp_async_wait(0, smallvec![kv_idx.clone()]).barrier(smallvec![]);
         let c_k = g.cp_async_fill(&k_nxt.after(&landed), &k_l, &pf_kidx, 1);
-        let c_v = g.cp_async_fill(&v_nxt.after(&landed), &v_l, &pf_kidx, 1);
+        let c_v = g.cp_async_fill(&v_nxt.after(&landed), &v_l, &pf_vidx, 1);
         let issued: smallvec::SmallVec<[Arc<UOp>; 4]> = smallvec![landed, c_k, c_v];
         (k_cur.after(issued.clone()), v_cur.after(issued), None)
     } else {
         let s_k = g.stage_global_to_reg(&k_smem, &k_l, &pf_kidx, 1);
-        let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_kidx, 1);
+        let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_vidx, 1);
         // One store node for both strips; the gathers' WAR fence below is the
         // barrier that covers it.
         let committed = g.commit_regs_to_local(&[(&k_nxt, &s_k), (&v_nxt, &s_v)]);
@@ -582,13 +719,16 @@ pub(crate) fn build_fa_mw_rdb(
         q_blk: &q_blk,
         warpid: &warpid,
         causal,
+        window,
         valid_len,
         seg_start,
+        key_mask,
+        seed_key_mask: key_mask_seeds(&ker.caps),
         score_scale,
     };
     // The two pipeline stages: gather + QKᵀ + mask, then online-softmax + A·V.
     let FaScratch { k_reg, k_reg_t, v_reg, att, att_mma, max_vec_last, att_smem } = sc;
-    let (att, v_reg) = fa_qk(&ctx, k_reg, k_reg_t, v_reg, att, k_cur, v_cur, &kv_idx, fence.as_ref().map(|f| &f[..]));
+    let (att, v_reg) = fa_qk(&ctx, k_reg, k_reg_t, v_reg, att, k_cur, v_cur, &blk, fence.as_ref().map(|f| &f[..]));
     let FaAcc { norm_vec, o_reg, .. } = fa_softmax_pv(&ctx, acc, att_mma, att_smem, max_vec_last, att, &v_reg);
 
     let o_reg = lp.close_carry(o_reg);
@@ -602,6 +742,14 @@ pub(crate) fn build_fa_mw_rdb(
         o
     };
 
+    // A row the masks hide entirely (a padded query under a window, or a key mask
+    // with no valid key) sums to 0: floor its norm so it stores exact zeros, as
+    // SDPA does, instead of `0/0`. A row that sees any key sums to at least 1.
+    let norm_vec = if mask.key_mask || window.is_some() {
+        norm_vec.maximum(&warp.clear_rv(ker.acc_vec(q_blk_rows), f64::from(f32::MIN_POSITIVE)))
+    } else {
+        norm_vec
+    };
     let o_reg = o_reg / &norm_vec;
     let o_reg_t = warp.transpose(o_reg_t, &o_reg);
     let _ = warp.store(o, o_reg_t, MoveIdx::block((batch.clone(), q_blk.clone(), head.clone(), 0), 1));
@@ -733,9 +881,17 @@ impl FaPolicy {
     }
 
     /// The builder config for a `[b, n, h, d]` attention; `None` as [`Self::tile`].
-    pub fn config(&self, b: usize, n: usize, h: usize, d: usize, causal: bool) -> Option<FaConfig> {
+    pub fn config(
+        &self,
+        b: usize,
+        n: usize,
+        h: usize,
+        d: usize,
+        causal: bool,
+        window: Option<(usize, usize)>,
+    ) -> Option<FaConfig> {
         let (q_blk, kv_blk) = self.tile(b, n, h, d)?;
-        Some(FaConfig { q_blk, kv_blk, unroll: self.unroll, causal })
+        Some(FaConfig { q_blk, kv_blk, unroll: self.unroll, causal, window })
     }
 
     /// The config for a `[b, n, h, d]` attention over `h_kv` key heads as measured
@@ -754,7 +910,9 @@ impl FaPolicy {
         dtype: &DType,
         (b, n, h, h_kv, d): (usize, usize, usize, usize, usize),
         causal: bool,
+        window: Option<(usize, usize)>,
         mask: FaMask,
+        operands: FaOperands,
     ) -> Option<FaConfig> {
         let fits = |&(q_blk, kv_blk): &(usize, usize)| {
             self.shared_bytes((q_blk, kv_blk), d) <= self.shared_max && n.is_multiple_of(q_blk * NUM_WARPS)
@@ -762,9 +920,9 @@ impl FaPolicy {
         let candidates: Vec<FaConfig> = FA_TILES
             .into_iter()
             .filter(fits)
-            .map(|(q_blk, kv_blk)| FaConfig { q_blk, kv_blk, unroll: self.unroll, causal })
+            .map(|(q_blk, kv_blk)| FaConfig { q_blk, kv_blk, unroll: self.unroll, causal, window })
             .collect();
-        let fallback = || self.config(b, n, h, d, causal);
+        let fallback = || self.config(b, n, h, d, causal, window);
         if candidates.len() < 2 {
             return fallback();
         }
@@ -772,12 +930,12 @@ impl FaPolicy {
         let block = (NUM_WARPS * caps.wave_size) as i64;
         let grid = |cfg: &FaConfig| [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
         let build = move |ker: &Kernel, cfg: FaConfig| {
-            build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, dtype.clone(), mask);
+            build_fa(ker, (b, n, h, h_kv, d), cfg, dtype.clone(), mask, operands);
             ker.finish(1)
         };
         let placeholders = || {
-            let mut bufs: Vec<Arc<UOp>> = [h, h, h_kv, h_kv]
-                .into_iter()
+            let mut bufs: Vec<Arc<UOp>> = std::iter::once(h)
+                .chain(operands.heads(h, h_kv))
                 .map(|heads| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b * n * heads * d, dtype.clone()))
                 .collect();
             if mask.key_lens {
@@ -785,6 +943,9 @@ impl FaPolicy {
             }
             if mask.seg_start {
                 bufs.push(UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b * n, DType::Int32));
+            }
+            if mask.key_mask {
+                bufs.push(UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b * n, key_mask_dtype(&caps)));
             }
             bufs
         };
@@ -794,26 +955,46 @@ impl FaPolicy {
             candidates
                 .iter()
                 .map(|&cfg| {
-                    let ker = Kernel::new("flash_attention", grid(&cfg), block, placeholders(), caps);
+                    let ker = Kernel::new(operands.kernel(), grid(&cfg), block, placeholders(), caps);
                     crate::kernel_fingerprint(&build(&ker, cfg)).digest
                 })
                 .collect()
         };
         let shape = [b, n, h, h_kv, d, usize::from(causal), mask.code(), dtype.bytes()];
-        let key = crate::tune::TuneKey::new("flash_attention", spec, arch, &shape, &(&candidates, dtype));
-        let compile = |i: usize| {
-            let cfg = candidates[i];
+        let key = crate::tune::TuneKey::new(operands.kernel(), spec, arch, &shape, &(&candidates, dtype));
+        // One operand set for every candidate: each then reads what the previous one
+        // left in the cache, as the model's attention reads the Q/K/V the kernel before
+        // it just wrote. Fresh operands per candidate (25 MB each at 8×512 on gfx1201)
+        // outgrow the 64 MB MALL and time every dispatch cold, which ranked `{16,16}`
+        // (126 µs) over `{32,32}` (108 µs warm). Built at the first compile, i.e. on a
+        // store miss only: `randn` advances the global RNG counter.
+        let operands = || {
             let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
-            let mut ins = vec![operand(&[b, n, h, d])?, operand(&[b, n, h_kv, d])?, operand(&[b, n, h_kv, d])?];
+            let mut ins = Vec::new();
+            for heads in operands.heads(h, h_kv) {
+                ins.push(operand(&[b, n, heads, d])?);
+            }
             if mask.key_lens {
                 ins.push(Tensor::full(&[b], ConstValue::Int(n as i64), DType::Int32).to(spec.clone()));
             }
             if mask.seg_start {
                 ins.push(Tensor::full(&[b, n], ConstValue::Int(0), DType::Int32).to(spec.clone()));
             }
+            if mask.key_mask {
+                let valid = Tensor::full(&[b, n], ConstValue::Int(1), DType::Int32);
+                ins.push(key_mask_operand(&valid, &caps).to(spec.clone()));
+            }
+            Some((ins, Tensor::empty(&[b, n, h, d], dtype.clone()).to(spec.clone())))
+        };
+        let mut shared = None;
+        let compile = |i: usize| {
+            let cfg = candidates[i];
+            if shared.is_none() {
+                shared = operands();
+            }
+            let (ins, o) = shared.as_mut()?;
             let ins: Vec<&Tensor> = ins.iter().collect();
-            let mut o = Tensor::empty(&[b, n, h, d], dtype.clone()).to(spec.clone());
-            crate::launch::compile_kernel("flash_attention_tune", grid(&cfg), block, &mut [&mut o], &ins, move |ker| {
+            crate::launch::compile_kernel("flash_attention_tune", grid(&cfg), block, &mut [o], &ins, move |ker| {
                 build(ker, cfg)
             })
             .ok()
@@ -847,7 +1028,7 @@ pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v:
     let h_kv = kd[2];
     let caps = crate::ArchCaps::GFX942;
     let cfg = FaPolicy::for_device(&q.device(), caps.arch)
-        .config(b, n, h, d, true)
+        .config(b, n, h, d, true, None)
         .expect("the gfx942 tiles fit its LDS at every head dim the builder accepts");
     let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
 
@@ -867,7 +1048,9 @@ pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v:
 /// the valid length are still computed (the kernel does not mask query rows); the
 /// caller is expected to discard those padded output rows. The scheduler fallback
 /// mirrors this exactly with a `[B,1,1,N]` key mask, so the hand kernel and the
-/// fallback agree on every row (valid and padded alike).
+/// fallback agree on every row (valid and padded alike). `key_mask` is the general
+/// form of `key_lens` — any per-key pattern — and `window` restricts each query to
+/// a band of keys and skips the KV blocks outside it.
 #[derive(Clone, Copy)]
 pub struct FaOpts<'a> {
     /// Causal (triangular) attention when `true`; full bidirectional when `false`.
@@ -881,11 +1064,21 @@ pub struct FaOpts<'a> {
     /// does not hide (a padding token pointing at itself stays finite); a row
     /// with no visible key is `NaN`.
     pub seg_start: Option<&'a Tensor>,
+    /// Optional `[B, N]` key validity (any integer or bool dtype, non-zero =
+    /// valid): key `k` of batch `b` is hidden from every query where
+    /// `key_mask[b, k] == 0`, the polarity of SDPA's `key_padding_mask`. A row
+    /// left with no visible key is exact zeros, as SDPA's.
+    pub key_mask: Option<&'a Tensor>,
+    /// Optional sliding window `(left, right)`: query `q` sees keys
+    /// `q - left ..= q + right` only, and the sweep skips every KV block outside
+    /// that band — the local layers of ModernBERT-style encoders. A row the band
+    /// and the masks leave with no visible key is exact zeros.
+    pub window: Option<(usize, usize)>,
 }
 
 impl Default for FaOpts<'_> {
     fn default() -> Self {
-        Self { causal: true, key_lens: None, seg_start: None }
+        Self { causal: true, key_lens: None, seg_start: None, key_mask: None, window: None }
     }
 }
 
@@ -898,8 +1091,9 @@ impl Default for FaOpts<'_> {
 ///
 /// - `Ok(Some(out))` — ran: a lazy output [`Tensor`] (`custom_kernel` / `Op::Call`
 ///   node) from the rolled double-buffered kernel ([`build_fa_mw_rdb`]) via
-///   [`crate::graph_launch`], honoring `opts.causal` and the optional
-///   `opts.key_lens` **key-only** mask (a 5th `[B]` `i32` global after `o,q,k,v`).
+///   [`crate::graph_launch`], honoring `opts.causal`, `opts.window` and the
+///   optional masks (trailing globals after `o,q,k,v`: `key_lens`, `seg_start`,
+///   `key_mask`).
 /// - `Ok(None)` — *doesn't apply here:* the device isn't a supported arch
 ///   ([`FA_SUPPORTED_ARCHS`] — gfx942/gfx1151/CUDA sm_80+ with its LLVM backend), **or** the
 ///   runtime sequence length doesn't tile (`N % (q_blk·NUM_WARPS) != 0`). The caller
@@ -907,8 +1101,9 @@ impl Default for FaOpts<'_> {
 ///   The per-warp tile is the one measured fastest on this device for the shape
 ///   ([`FaPolicy::tuned`]; `SVOD_TK_TUNE=0` keeps the policy's static choice).
 /// - `Err` — *malformed request* on a supported device: a FIXED property is wrong —
-///   `q`/`k` not a statically-shaped rank-4 tensor, operand dtype ∉ {bf16, f16},
-///   `D % 16 != 0`, or `H % H_KV != 0` (GQA). These are
+///   `q`/`k` not a statically-shaped rank-4 tensor (a dim a JIT variable pins to
+///   one value counts as static), operand dtype ∉ {bf16, f16}, `D % 16 != 0`,
+///   `H % H_KV != 0` (GQA), or a `key_mask` not shaped `[B, N]`. These are
 ///   caller bugs, raised loudly instead of silently routed to the slow path. (A
 ///   genuine kernel build/dispatch failure also returns `Err`.)
 ///
@@ -919,7 +1114,7 @@ impl Default for FaOpts<'_> {
 /// let q = Tensor::randn(&[1, 128, 16, 64]).unwrap().cast(DType::BFloat16);
 /// let (k, v) = (q.clone(), q.clone());
 /// // `None` ⇒ the kernel doesn't apply here; the caller picks the fallback.
-/// let opts = FaOpts { causal: false, key_lens: None, seg_start: None };
+/// let opts = FaOpts { causal: false, ..Default::default() };
 /// if let Some(mut o) = svod_tk::flash_attention_with(&q, &k, &v, opts).unwrap() {
 ///     o.prepare().unwrap();
 /// }
@@ -945,9 +1140,9 @@ pub fn flash_attention_tuned(
     let vd = crate::launch::concrete_dims(v, "flash-attention", "v", 4)?;
     let (b, n, h, d) = (qd[0], qd[1], qd[2], qd[3]);
     let h_kv = kd[2];
+    let statically = crate::launch::statically;
+    let (q, k, v) = (&statically(q, &qd)?, &statically(k, &kd)?, &statically(v, &vd)?);
     let dtype = q.uop().dtype();
-    let dtype_ok = dtype == DType::BFloat16 || dtype == DType::Float16;
-    let err_dtype = dtype.clone();
     // The builder binds k and v to q's dtype and to `[B, N, H_kv, D]`; a mismatch
     // would pass `Kernel::gl` (which checks only the byte width) and then
     // silently change which K/V stream the body takes.
@@ -962,18 +1157,94 @@ pub fn flash_attention_tuned(
         .find(|(_, dims)| [dims[0], dims[2], dims[3]] != [b, h_kv, d])
         .map(|(operand, dims)| (operand, dims.clone(), vec![b, dims[1], h_kv, d]));
     let kv_seq_match = kd[1] == n && vd[1] == n;
+    let layout = move || -> crate::LaunchResult<()> {
+        if let Some(got) = kv_dtype {
+            return crate::launch::DtypeSnafu { kernel: "flash-attention", got, expected: "the dtype of q" }.fail();
+        }
+        if let Some((operand, got, expected)) = kv_shape {
+            return crate::launch::OperandShapeSnafu { kernel: "flash-attention", operand, expected, got }.fail();
+        }
+        Ok(())
+    };
+    launch_fa(&[q, k, v], FaOperands::Split, (b, n, h, h_kv, d), opts, policy, layout, kv_seq_match)
+}
+
+/// **Graph-native** flash attention over a fused QKV projection's output:
+/// `qkv` is `[B, N, H + 2·H_kv, D]` — Q's `h` heads, then K's and V's `h_kv`
+/// each — read in place ([`FaOperands::Packed`]). Split into three head views
+/// instead, each would be copied into a buffer of its own before the kernel
+/// runs. Options and outcomes are [`flash_attention_with`]'s, plus an `Err` when
+/// `qkv`'s head count is not `h + 2·h_kv`.
+pub fn flash_attention_packed(
+    qkv: &Tensor,
+    heads: (usize, usize),
+    opts: FaOpts,
+) -> crate::LaunchResult<Option<Tensor>> {
+    flash_attention_packed_tuned(qkv, heads, opts, FaPolicy::for_device)
+}
+
+/// [`flash_attention_packed`] with the caller's tile policy, as
+/// [`flash_attention_tuned`] is to [`flash_attention_with`].
+pub fn flash_attention_packed_tuned(
+    qkv: &Tensor,
+    (h, h_kv): (usize, usize),
+    opts: FaOpts,
+    policy: impl Fn(&svod_dtype::DeviceSpec, svod_dtype::GpuArch) -> FaPolicy + Copy,
+) -> crate::LaunchResult<Option<Tensor>> {
+    let dims = crate::launch::concrete_dims(qkv, "flash-attention", "qkv", 4)?;
+    let (b, n, d) = (dims[0], dims[1], dims[3]);
+    let qkv = &crate::launch::statically(qkv, &dims)?;
+    let expected = vec![b, n, h + 2 * h_kv, d];
+    let layout = move || -> crate::LaunchResult<()> {
+        let (operand, got) = ("qkv", dims);
+        ensure!(
+            got == expected,
+            crate::launch::OperandShapeSnafu { kernel: "flash-attention", operand, expected, got }
+        );
+        Ok(())
+    };
+    launch_fa(&[qkv], FaOperands::Packed, (b, n, h, h_kv, d), opts, policy, layout, true)
+}
+
+/// The launch both layouts share: `ins` are the Q/K/V globals `operands`
+/// binds, `layout` validates them, and `kv_seq_match` says the keys are the
+/// queries' sequence (this kernel is self-attention only).
+#[allow(clippy::too_many_arguments)]
+fn launch_fa(
+    ins: &[&Tensor],
+    operands: FaOperands,
+    (b, n, h, h_kv, d): (usize, usize, usize, usize, usize),
+    opts: FaOpts,
+    policy: impl Fn(&svod_dtype::DeviceSpec, svod_dtype::GpuArch) -> FaPolicy + Copy,
+    layout: impl FnOnce() -> crate::LaunchResult<()>,
+    kv_seq_match: bool,
+) -> crate::LaunchResult<Option<Tensor>> {
+    let statically = crate::launch::statically;
+    let q = ins[0];
+    let key_mask_shape = opts
+        .key_mask
+        .map(|m| crate::launch::concrete_dims(m, "flash-attention", "key_mask", 2))
+        .transpose()?
+        .filter(|dims| *dims != [b, n]);
+    let dtype = q.uop().dtype();
+    let dtype_ok = dtype == DType::BFloat16 || dtype == DType::Float16;
+    let err_dtype = dtype.clone();
     let (tiling_device, build_device) = (q.device(), q.device());
     let tiling_dtype = dtype.clone();
-    let mask = FaMask { key_lens: opts.key_lens.is_some(), seg_start: opts.seg_start.is_some() };
+    let mask = FaMask {
+        key_lens: opts.key_lens.is_some(),
+        seg_start: opts.seg_start.is_some(),
+        key_mask: opts.key_mask.is_some(),
+    };
     // The policy's config, measured on first use where tuning is on. Measuring
     // is what the first call costs, so it runs once per launch: the tiling
     // predicate and the build share its answer.
     let chosen = move |policy: &FaPolicy, device: &svod_dtype::DeviceSpec, arch, dtype: &DType| {
         if !crate::tune::enabled() {
-            return policy.config(b, n, h, d, opts.causal);
+            return policy.config(b, n, h, d, opts.causal, opts.window);
         }
         let store = crate::tune::TuneStore::global();
-        policy.tuned(store, device, arch, dtype, (b, n, h, h_kv, d), opts.causal, mask)
+        policy.tuned(store, device, arch, dtype, (b, n, h, h_kv, d), opts.causal, opts.window, mask, operands)
     };
     let cfg_cell: Rc<OnceCell<Option<FaConfig>>> = Rc::default();
     let fit_cell = cfg_cell.clone();
@@ -988,10 +1259,9 @@ pub fn flash_attention_tuned(
                 dtype_ok,
                 crate::launch::DtypeSnafu { kernel: "flash-attention", got: err_dtype, expected: "bf16 or f16" }
             );
-            if let Some(got) = kv_dtype {
-                return crate::launch::DtypeSnafu { kernel: "flash-attention", got, expected: "the dtype of q" }.fail();
-            }
-            if let Some((operand, got, expected)) = kv_shape {
+            layout()?;
+            if let Some(got) = key_mask_shape {
+                let (operand, expected) = ("key_mask", vec![b, n]);
                 return crate::launch::OperandShapeSnafu { kernel: "flash-attention", operand, expected, got }.fail();
             }
             ensure!(
@@ -1004,7 +1274,7 @@ pub fn flash_attention_tuned(
                 }
             );
             ensure!(
-                h % h_kv == 0,
+                h_kv > 0 && h % h_kv == 0,
                 crate::launch::DimDivisibleSnafu {
                     kernel: "flash-attention",
                     dim: "H",
@@ -1034,9 +1304,9 @@ pub fn flash_attention_tuned(
             let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
             let out = Tensor::empty(&[b, n, h, d], dtype.clone());
             let build_dtype = dtype.clone();
-            // ABI/global order is o, q, k, v, (lens), (seg_start) — `out` is global[0],
-            // inputs map to global[1..] in order, so the masks go last, `key_lens`
-            // before `seg_start`.
+            // ABI/global order is o, the Q/K/V globals, (lens), (seg_start),
+            // (key_mask) — `out` is global[0], inputs map to global[1..] in order,
+            // so the masks go last, in `FaMask` order.
             //
             // Clamp key_lens to >= 1. A fully key-masked row (key_lens[b] == 0, an
             // inactive zero-padded lane) has no valid key, so the online-softmax
@@ -1049,22 +1319,28 @@ pub fn flash_attention_tuned(
             //
             // The clamp is a property of `key_lens`, not of the calling layer: every
             // layer sharing one `key_lens` must share one clamp kernel, so it is
-            // built outside the caller's origin scope.
-            let key_lens_clamped = opts.key_lens.map(|lens| {
-                let _shared = svod_ir::origin::OriginScope::suspend();
-                let ones = Tensor::full(&[b], ConstValue::Int(1), DType::Int32);
-                lens.maximum(&ones).expect("clamp key_lens >= 1")
-            });
-            let mut ins: Vec<&Tensor> = vec![q, k, v];
-            if let Some(lens) = &key_lens_clamped {
-                ins.push(lens);
-            }
-            if let Some(seg_start) = opts.seg_start {
-                ins.push(seg_start);
-            }
+            // built outside the caller's origin scope — as is the key mask's cast.
+            let key_lens_clamped = opts
+                .key_lens
+                .map(|lens| -> crate::LaunchResult<Tensor> {
+                    let _shared = svod_ir::origin::OriginScope::suspend();
+                    let ones = Tensor::full(&[b], ConstValue::Int(1), DType::Int32);
+                    Ok(statically(lens, &[b])?.maximum(&ones).expect("clamp key_lens >= 1"))
+                })
+                .transpose()?;
+            let seg_start = opts.seg_start.map(|t| statically(t, &[b, n])).transpose()?;
+            let key_mask = opts
+                .key_mask
+                .map(|m| -> crate::LaunchResult<Tensor> {
+                    let _shared = svod_ir::origin::OriginScope::suspend();
+                    Ok(key_mask_operand(&statically(m, &[b, n])?, &caps))
+                })
+                .transpose()?;
+            let mut ins: Vec<&Tensor> = ins.to_vec();
+            ins.extend([&key_lens_clamped, &seg_start, &key_mask].into_iter().flatten());
             let block = (NUM_WARPS * caps.wave_size) as i64;
-            crate::graph_launch("flash_attention", grid, block, out, &ins, caps, move |ker| {
-                build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, build_dtype.clone(), mask);
+            crate::graph_launch(operands.kernel(), grid, block, out, &ins, caps, move |ker| {
+                build_fa(ker, (b, n, h, h_kv, d), cfg, build_dtype.clone(), mask, operands);
                 ker.finish(1)
             })
         },

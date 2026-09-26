@@ -206,7 +206,7 @@ fn sq_attention_renders_per_arch(arch: GpuArch, reduce_intrinsics: &[&str], broa
 }
 
 fn supported_device() -> bool {
-    crate::target::check_target(&Tensor::empty(&[1], DType::Float32).device(), SQ_ATTENTION_SUPPORTED_ARCHS).is_ok()
+    super::device_supported(SQ_ATTENTION_SUPPORTED_ARCHS)
 }
 
 #[test]

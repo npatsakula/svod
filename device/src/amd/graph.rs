@@ -20,8 +20,8 @@ use crate::device::{Graph, GraphKernel};
 use crate::error::{Error, Result};
 use crate::hcq::{
     AmdPm4Dispatch, Command, CommandField, ComputeDispatch, KERNARG_ALIGN, LinkPatchValues, LinkedCommandBuffer,
-    PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, Submission, SystemField, SystemPatchValues,
-    kernarg_offsets,
+    PatchSource, QueueKind, ReplayCommandBuffer, RuntimePatchValues, StoreScope, Submission, SystemField,
+    SystemPatchValues, kernarg_offsets,
 };
 
 struct KernargSlot {
@@ -289,7 +289,7 @@ impl AmdGraph {
             let _ = (index, &kernel.deps); // FIFO barriers conservatively satisfy every dependency edge.
         }
         let store = submission.commands.len();
-        submission.push(Command::Store { dst: 0, value: 0 });
+        submission.push(Command::Store { dst: 0, value: 0, scope: StoreScope::System });
         submission.bind(store, CommandField::StoreDst, PatchSource::System(SystemField::TimelineSignal(0)))?;
         submission.bind(store, CommandField::StoreValue, PatchSource::System(SystemField::TimelineValue(1)))?;
 

@@ -406,6 +406,13 @@ impl ST {
     /// imul(a·k, stride)`), so it is correct-by-construction but changes the kernel's
     /// content hash.
     pub fn subtile<R: Into<Idx>, C: Into<Idx>>(&self, dims: (usize, usize), blk: (R, C)) -> ST {
+        let (rows, cols) = (self.base.base.rows, self.base.base.cols);
+        assert!(
+            dims.0.is_multiple_of(rows) && dims.1.is_multiple_of(cols),
+            "subtile: a {}×{} view does not split into the {rows}×{cols} base tiles",
+            dims.0,
+            dims.1
+        );
         let blk = (blk.0.into(), blk.1.into());
         let frag_h = (dims.0 / self.base.base.rows) as i64;
         let frag_w = (dims.1 / self.base.base.cols) as i64;

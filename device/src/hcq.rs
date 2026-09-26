@@ -378,6 +378,17 @@ pub struct AmdPm4Dispatch {
     pub target_major: u32,
 }
 
+/// Who reads, through a [`Command::Store`]'s signal, the memory the queue
+/// wrote before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreScope {
+    /// Only later commands on the same queue, which already run behind it: a
+    /// progress mark that no other lane or host waits on for data.
+    Queue,
+    /// Whoever waits on the signal: the host, another queue or engine.
+    System,
+}
+
 /// One command in a hardware queue submission. Vector order is semantic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -404,6 +415,7 @@ pub enum Command {
     Store {
         dst: u64,
         value: u64,
+        scope: StoreScope,
     },
 }
 
@@ -446,7 +458,7 @@ impl Submission {
     }
 
     pub fn signal(&mut self, point: TimelinePoint) -> &mut Self {
-        self.push(Command::Store { dst: point.signal_address, value: point.value })
+        self.push(Command::Store { dst: point.signal_address, value: point.value, scope: StoreScope::System })
     }
 
     /// Insert a command while preserving semantic patch bindings.
@@ -573,7 +585,7 @@ impl CpuQueueExecutor {
                     self.signals.insert(*dst, self.clock_ns);
                     self.clock_ns = self.clock_ns.wrapping_add(self.clock_step_ns);
                 }
-                Command::Store { dst, value } => {
+                Command::Store { dst, value, .. } => {
                     self.signals.insert(*dst, *value);
                 }
             }
@@ -945,8 +957,23 @@ impl SemanticLinkedPlan {
             .enumerate()
             .map(|(index, lane)| ((lane.lane.clone(), lane.signal_value), index))
             .collect::<HashMap<_, _>>();
+        let producer_of = |wait: &LaneWait| {
+            producers.get(&(wait.lane.clone(), wait.value)).copied().ok_or_else(|| Error::Runtime {
+                message: format!("native HCQ wait has no producer: {:?} value {}", wait.lane, wait.value),
+            })
+        };
+        let final_lane = DeviceQueue { device, queue: QueueKind::Compute(0) };
+        let latest =
+            self.lanes.iter().enumerate().map(|(index, lane)| (lane.lane.clone(), index)).collect::<HashMap<_, _>>();
+        // A store publishes its lane's writes only to the lanes that wait on it,
+        // the finalizer's among them; any other store just marks progress for
+        // work its own queue already runs in order behind it.
+        let mut published = HashSet::new();
+        for wait in self.lanes.iter().flat_map(|lane| &lane.waits) {
+            published.insert(producer_of(wait)?);
+        }
+        published.extend(latest.iter().filter(|(lane, _)| **lane != final_lane).map(|(_, &index)| index));
         let mut first_use = HashSet::new();
-        let mut latest = HashMap::new();
         let mut submissions = Vec::with_capacity(self.lanes.len() + 1);
 
         for (index, lane) in self.lanes.iter().enumerate() {
@@ -958,22 +985,24 @@ impl SemanticLinkedPlan {
                 bind_point(&mut submission, command, 0, false)?;
             }
             for wait in &lane.waits {
-                let producer = producers.get(&(wait.lane.clone(), wait.value)).ok_or_else(|| Error::Runtime {
-                    message: format!("native HCQ wait has no producer: {:?} value {}", wait.lane, wait.value),
-                })?;
                 let command = submission.commands.len();
                 submission.push(Command::Wait { signal_address: 0, value: 0 });
-                bind_point(&mut submission, command, *producer as u32 + 1, false)?;
+                bind_point(&mut submission, command, producer_of(wait)? as u32 + 1, false)?;
+            }
+            // The producers' writes reached memory, but this queue's caches may
+            // still hold what was there before: its queue-scoped stores leave
+            // them in place.
+            if !lane.waits.is_empty() {
+                submission.push(Command::MemoryBarrier);
             }
             submission.push(Command::Execute { operation: lane.commands[0].operation });
             let command = submission.commands.len();
-            submission.push(Command::Store { dst: 0, value: 0 });
+            let scope = if published.contains(&index) { StoreScope::System } else { StoreScope::Queue };
+            submission.push(Command::Store { dst: 0, value: 0, scope });
             bind_point(&mut submission, command, index as u32 + 1, true)?;
-            latest.insert(lane.lane.clone(), index);
             submissions.push(SemanticLinkedSubmission::new_for_lane(lane.lane.clone(), submission)?);
         }
 
-        let final_lane = DeviceQueue { device, queue: QueueKind::Compute(0) };
         let mut finalizer = Submission::new(final_lane.queue);
         if !first_use.contains(&final_lane) {
             finalizer.push(Command::MemoryBarrier);
@@ -994,7 +1023,7 @@ impl SemanticLinkedPlan {
             }
         }
         let command = finalizer.commands.len();
-        finalizer.push(Command::Store { dst: 0, value: 0 });
+        finalizer.push(Command::Store { dst: 0, value: 0, scope: StoreScope::System });
         bind_point(&mut finalizer, command, self.lanes.len() as u32 + 1, true)?;
         submissions.push(SemanticLinkedSubmission::new_for_lane(final_lane, finalizer)?);
         Ok(submissions)
@@ -1445,7 +1474,7 @@ impl NullHcq {
             if let Command::Execute { operation } = command {
                 execute(*operation).map_err(SubmissionExecutionError::Execute)?;
             }
-            if let Command::Store { dst, value } = command {
+            if let Command::Store { dst, value, .. } = command {
                 self.signals.insert(*dst, *value);
             }
             if let Command::Timestamp { dst } = command {

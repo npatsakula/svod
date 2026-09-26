@@ -113,14 +113,20 @@ fn convert_dtype(dt: safetensors::Dtype) -> Result<DType> {
 
 /// Cast every tensor in a state dict to `dtype`, leaving any tensor that cannot
 /// be cast (e.g. an int embedding key) at its original dtype. Shared by the
-/// ModernBERT backbone and MLM loaders so weight casting stays in one place.
-pub fn cast_all(sd: &StateDict, dtype: DType) -> StateDict {
-    sd.iter()
+/// loaders so weight casting stays in one place.
+///
+/// The casts are realized here, once: left lazy, every forward re-reads the
+/// checkpoint-dtype weight and casts it inside each kernel that reads it.
+pub fn cast_all(sd: &StateDict, dtype: DType) -> Result<StateDict> {
+    let out: StateDict = sd
+        .iter()
         .map(|(k, v)| {
-            let t = if v.dtype() == dtype { v.clone() } else { v.cast(dtype.clone()) };
+            let t = if v.dtype() == dtype { v.clone() } else { v.cast(dtype.clone()).contiguous() };
             (k.clone(), t)
         })
-        .collect()
+        .collect();
+    Tensor::realize_batch(out.iter().filter(|(k, t)| sd[*k].dtype() != t.dtype()).map(|(_, t)| t))?;
+    Ok(out)
 }
 
 /// Build a child module's graph under its own origin scope, named by the same

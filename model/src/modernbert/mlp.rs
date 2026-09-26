@@ -12,6 +12,7 @@ use svod_tensor::nn::Module;
 use crate::init::fan_in_uniform;
 
 use super::error::Result;
+use super::linear::linear;
 
 #[derive(Clone, Module)]
 pub struct ModernBertGlu {
@@ -30,13 +31,14 @@ impl ModernBertGlu {
         Self { hidden_size, intermediate_size, wi_weight, wo_weight }
     }
 
-    /// Forward. `x`: `(B, L, D)` → `(B, L, D)`.
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// Forward. `x`: `(B, L, D)` → `(B, L, D)`, plus `residual` when given (the
+    /// add rides the output projection).
+    pub fn forward(&self, x: &Tensor, residual: Option<&Tensor>) -> Result<Tensor> {
         // (., 2I) → [input (., I) | gate (., I)].
-        let h = x.linear().weight(&self.wi_weight).call()?;
+        let h = linear(x, &self.wi_weight, None)?;
         let i = self.intermediate_size;
         // GELU(input) * gate — exact (erf) GELU matches PyTorch's nn.GELU default.
         let gated = h.narrow(-1, 0usize, i)?.gelu_exact()?.try_mul(&h.narrow(-1, i, i)?)?;
-        Ok(gated.linear().weight(&self.wo_weight).call()?)
+        linear(&gated, &self.wo_weight, residual)
     }
 }

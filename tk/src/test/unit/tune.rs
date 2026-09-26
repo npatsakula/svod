@@ -152,6 +152,26 @@ fn a_stale_index_is_ignored_and_a_memory_store_memoizes() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `set_enabled` reaches the launches of its own thread only. The test runner
+/// gives each test a thread, so a kernel test that turns tuning off leaves the
+/// model test running beside it tuning as a user's process would.
+#[test]
+fn set_enabled_reaches_only_its_own_thread() {
+    let environment = std::env::var("SVOD_TK_TUNE").map(|v| v != "0").unwrap_or(true);
+    crate::tune::set_enabled(false);
+    assert!(!crate::tune::enabled(), "the setting holds on its own thread");
+    let (before, after) = std::thread::spawn(|| {
+        let before = crate::tune::enabled();
+        crate::tune::set_enabled(true);
+        (before, crate::tune::enabled())
+    })
+    .join()
+    .expect("the other thread");
+    assert_eq!(before, environment, "another thread follows the environment, not this thread's setting");
+    assert!(after, "and holds its own setting");
+    assert!(!crate::tune::enabled(), "whose setting does not come back here");
+}
+
 /// On a supported GPU, a first request measures the GEMM table for a shape and
 /// records one line; the winner is a table tile that tiles the shape.
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::gemm_first_use -- --ignored`.

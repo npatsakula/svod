@@ -46,3 +46,14 @@ attributes #0 = { alwaysinline nounwind "no-builtins" "amdgpu-flat-work-group-si
     assert!(validate_amd_object(&obj, AmdArch::Gfx1101, "amd_smoke").is_err(), "wrong target arch must fail");
     assert!(validate_amd_object(&obj, AmdArch::Gfx1100, "other_kernel").is_err(), "wrong kernel must fail");
 }
+
+/// AMD kernels narrow f32 to bf16 in integers under a clang older than LLVM 21,
+/// or one whose version cannot be read, and leave it to the backend from 21 on.
+#[test_case::test_case(None => true; "unknown version")]
+#[test_case::test_case(Some(18) => true; "llvm 18")]
+#[test_case::test_case(Some(20) => true; "llvm 20")]
+#[test_case::test_case(Some(21) => false; "llvm 21")]
+#[test_case::test_case(Some(22) => false; "llvm 22")]
+fn amd_bf16_narrowing_follows_the_llvm_version(major: Option<u32>) -> bool {
+    crate::devices::amd::amd_bf16_casts_in_integers(major)
+}

@@ -1,16 +1,17 @@
 //! Tests for the row-norm kernels ([`crate::kernels::norm`]): the GPU-free
 //! applicability predicate, and the hardware-gated comparison of `rms_norm` /
-//! `add_rms_norm` against the graph they replace.
+//! `add_rms_norm` / `layer_norm` against the graph they replace.
 //!
 //! `SVOD_DEVICE=CUDA cargo test -p svod-tk --lib norm -- --ignored --nocapture`.
 
 use proptest::prelude::*;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Layer, RmsNorm};
+use svod_tensor::nn::{Layer, LayerNorm, RmsNorm};
+use svod_tensor::{Variable, jit::shrink_batch};
 use test_case::test_case;
 
-use crate::kernels::norm::{NORM_SUPPORTED_ARCHS, add_rms_norm, rms_norm, select_norm_cfg};
+use crate::kernels::norm::{NORM_SUPPORTED_ARCHS, add_rms_norm, layer_norm, rms_norm, select_norm_cfg};
 
 use super::device_supported;
 
@@ -45,6 +46,17 @@ fn rms_norm_low_rank_operand_is_operand_rank_err() {
     assert!(matches!(e, crate::launch::Error::OperandRank { operand: "x", .. }), "got {e:?}");
     let e = rms_norm(&m, &m, 1e-6).expect_err("rank-2 weight must error, not panic");
     assert!(matches!(e, crate::launch::Error::OperandRank { operand: "weight", .. }), "got {e:?}");
+}
+
+/// `layer_norm` resolves the same preconditions GPU-free, its bias included.
+#[test]
+fn layer_norm_low_rank_operand_is_operand_rank_err() {
+    let v = Tensor::randn(&[128]).expect("randn");
+    let m = Tensor::randn(&[8, 128]).expect("randn");
+    let e = layer_norm(&v, &v, None, 1e-5).expect_err("rank-1 x must error, not panic");
+    assert!(matches!(e, crate::launch::Error::OperandRank { kernel: "layer-norm", operand: "x", .. }), "got {e:?}");
+    let e = layer_norm(&m, &v, Some(&m), 1e-5).expect_err("rank-2 bias must error, not panic");
+    assert!(matches!(e, crate::launch::Error::OperandRank { operand: "bias", .. }), "got {e:?}");
 }
 
 proptest! {
@@ -168,6 +180,75 @@ fn rms_norm_f16_matches_the_graph_gpu() {
     assert!(err < BF16_REL_TOL / 8.0, "f16: relative error {err}");
 }
 
+/// `layer_norm` of `x` against `LayerNorm::forward` of `reference` — the same
+/// values, `x` possibly behind a JIT-pinned view — with `y` in `x`'s dtype. The
+/// kernel's parameters are `x`'s dtype and the graph widens them the same way,
+/// so the two differ only in the order of the two row reduces.
+fn check_layer_norm(x: &Tensor, reference: &Tensor, dtype: DType, bias: bool, tol: f32) {
+    let dims = reference.dims().expect("dims");
+    let d = *dims.last().expect("a last axis");
+    let w = operand(&[d], dtype.clone(), 0.17);
+    let b = bias.then(|| operand(&[d], dtype.clone(), 0.71));
+    let y = layer_norm(x, &w, b.as_ref(), EPS).expect("layer_norm build").expect("the kernel applies to this shape");
+    assert_eq!(y.dims().expect("dims"), dims, "the output has x's shape, static");
+    assert_eq!(y.uop().dtype(), dtype, "the output keeps the operand dtype");
+    let want = to_f32_vec(&LayerNorm::new(w, b, EPS).forward(reference).expect("reference layer norm"));
+    let err = rel_err(&to_f32_vec(&y), &want);
+    println!("layer_norm {dims:?} bias {bias}: relative error {err:e}");
+    assert!(err < tol, "{dims:?} bias {bias}: relative error {err} exceeds {tol}");
+}
+
+/// `layer_norm` against the graph at ModernBERT's 768-wide rows and the other
+/// widths the ladder serves, with and without a bias.
+#[test_case(&[512, 768], false; "modernbert rows at 1x512")]
+#[test_case(&[4096, 768], false; "modernbert rows at 8x512")]
+#[test_case(&[8, 512, 768], true; "a rank-3 activation with a bias")]
+#[test_case(&[128, 1024], true; "a 1024-wide row with a bias")]
+#[test_case(&[4, 32], false; "a row one wave wide")]
+#[test_case(&[3, 2048], true; "the widest row at a prime row count")]
+#[ignore]
+fn layer_norm_matches_the_graph_gpu(shape: &[usize], bias: bool) {
+    if !device_supported(NORM_SUPPORTED_ARCHS) {
+        eprintln!("skip layer_norm_matches_the_graph_gpu: no CUDA sm_80+ device / toolchain");
+        return;
+    }
+    let x = operand(shape, DType::BFloat16, 0.31);
+    check_layer_norm(&x, &x, DType::BFloat16, bias, BF16_REL_TOL);
+}
+
+/// Rows whose mean is thousands of times their spread: the kernel centers before it
+/// squares, as the graph does. A one-pass `E[x²] − E[x]²` in f32 would lose the
+/// variance to cancellation here (f32's ulp at `E[x²] ≈ 10⁶` is half of it).
+/// f16, since bf16 cannot hold the spread at that offset.
+#[test]
+#[ignore]
+fn layer_norm_f16_far_from_zero_mean_matches_the_graph_gpu() {
+    if !device_supported(NORM_SUPPORTED_ARCHS) {
+        eprintln!("skip layer_norm_f16_far_from_zero_mean_matches_the_graph_gpu: no CUDA sm_80+ device / toolchain");
+        return;
+    }
+    let x = operand(&[256, 768], DType::Float16, 0.31).try_add(Tensor::const_(1000.0, DType::Float16)).expect("shift");
+    let x = x.contiguous();
+    x.realize().expect("realize shifted operand");
+    check_layer_norm(&x, &x, DType::Float16, true, BF16_REL_TOL / 8.0);
+}
+
+/// A batch the JIT pins to one value is that value to the kernel, as it is to
+/// the GEMM: the operand still carries it symbolically, and the launcher
+/// reshapes it static.
+#[test]
+#[ignore]
+fn layer_norm_takes_a_jit_pinned_batch_gpu() {
+    if !device_supported(NORM_SUPPORTED_ARCHS) {
+        eprintln!("skip layer_norm_takes_a_jit_pinned_batch_gpu: no CUDA sm_80+ device / toolchain");
+        return;
+    }
+    let x = operand(&[2, 128, 768], DType::BFloat16, 0.31);
+    let pinned = shrink_batch(&x, &Variable::new("b", 2, 2).bind(2).expect("bind")).expect("shrink");
+    assert_eq!(pinned.shape().expect("shape")[0].as_const(), None, "the batch stays symbolic");
+    check_layer_norm(&pinned, &x, DType::BFloat16, false, BF16_REL_TOL);
+}
+
 /// A row no block shape covers declines (`Ok(None)`) so the caller keeps its
 /// graph; a malformed request is a structured `Err`. Both need a supported
 /// device: on anything else `launch_custom` declines before it looks at the
@@ -195,4 +276,14 @@ fn norm_outcomes_gpu() {
     let e = add_rms_norm(&x, &operand(&[8, 512], DType::BFloat16, 0.5), &w, EPS)
         .expect_err("a residual of another shape is a caller bug");
     assert!(matches!(e, crate::launch::Error::OperandShape { operand: "residual", .. }), "got {e:?}");
+
+    let b = operand(&[1024], DType::BFloat16, 0.71);
+    assert!(layer_norm(&ragged, &w1000, None, EPS).expect("ragged D builds").is_none(), "D % 32 != 0 must decline");
+    let e = layer_norm(&x, &w, Some(&w1000), EPS).expect_err("a bias that is not [D] is a caller bug");
+    assert!(matches!(e, crate::launch::Error::OperandShape { kernel: "layer-norm", operand: "bias", .. }), "got {e:?}");
+    let e = layer_norm(&x, &w, Some(&operand(&[1024], DType::Float16, 0.71)), EPS)
+        .expect_err("a bias in another dtype is a caller bug");
+    assert!(matches!(e, crate::launch::Error::Dtype { kernel: "layer-norm", .. }), "got {e:?}");
+    let e = layer_norm(&f32x, &w, Some(&b), EPS).expect_err("an f32 operand is a caller bug");
+    assert!(matches!(e, crate::launch::Error::Dtype { kernel: "layer-norm", .. }), "got {e:?}");
 }

@@ -118,26 +118,16 @@ pub fn get_transcendental_patterns(supported: &crate::RendererOps, force: bool) 
 }
 
 /// f32 → bf16 round-to-nearest-even done in the integer domain, emitting no
-/// `fptrunc`. amdgcn (LLVM 18) cannot select the vectorized bf16 truncstore that
-/// `-O3` forms by fusing `fptrunc float to bfloat` + `store bfloat`; routing the
-/// bits through integers and a final `bitcast i16 → bfloat` keeps `fptrunc` away
-/// from the store. Port of Tinygrad's `cast_float_to_bf16` (`renderer/cstyle.py`),
-/// bit-exact with the native conversion and vector-count-preserving.
+/// `fptrunc`. Port of Tinygrad's `cast_float_to_bf16` (`renderer/cstyle.py`),
+/// bit-exact with the native conversion and vector-count-preserving; see
+/// [`bf16_integer_cast_patterns`] for who needs it.
 fn cast_float_to_bf16(x: &Arc<UOp>) -> Arc<UOp> {
-    use crate::DType;
-    use svod_dtype::ScalarDType;
-
-    let n = x.dtype().vcount();
-    let vec = |s: ScalarDType| DType::Scalar(s).vec(n).expect("scalar dtype is vectorizable");
-
     // The XLA/Tinygrad round-half-to-even encoding. The two branches don't split
     // cleanly along finite/NaN lines (most NaN and Inf take the `rnd` branch); the
     // whole expression is opaque on purpose and is verified bit-exact, so the
     // bindings below are named after their arithmetic, not a semantic gloss.
-    let u = x.bitcast(vec(ScalarDType::UInt32));
-    // rnd = u + ((u >> 16) & 1) + 0x7fff.
-    let lsb = u.try_shr_op(&u.const_like(16)).and_then(|s| s.try_and_op(&u.const_like(1))).expect("bf16: rne lsb");
-    let rnd = u.try_add(&lsb).and_then(|r| r.try_add(&u.const_like(0x7fff))).expect("bf16: rne bias");
+    let u = f32_bits(x);
+    let rnd = rne_bias(&u);
     // alt = (u & 0xffff) != 0 ? (u | 0x10000) : u.
     let low_nz =
         u.try_and_op(&u.const_like(0xffff)).and_then(|lo| lo.try_cmpne(&u.const_like(0))).expect("bf16: low16 != 0");
@@ -149,12 +139,59 @@ fn cast_float_to_bf16(x: &Arc<UOp>) -> Arc<UOp> {
         .try_and_op(&u.const_like(0x7f80_0000))
         .and_then(|e| e.try_cmpne(&u.const_like(0)))
         .expect("bf16: exponent test");
-    let bits = UOp::try_where(exp_nz, rnd, alt).expect("bf16: rnd/alt select");
-    // High 16 bits are the bf16 payload: truncate to u16, reinterpret as bf16.
+    bf16_payload(&UOp::try_where(exp_nz, rnd, alt).expect("bf16: rnd/alt select"))
+}
+
+/// f32 → bf16 round-to-nearest-even for a source that is never NaN: the high
+/// half of [`rne_bias`], two integer ops a value where [`cast_float_to_bf16`]
+/// and a backend's own expansion of `fptrunc` spend a compare and a select on
+/// keeping a NaN a NaN. Exact for every finite value and `±∞`; a NaN may come
+/// out as `±∞` or `±0`. For a caller that knows its values finite, or carries
+/// their NaNs on another path, on a backend without a bf16 convert instruction.
+pub fn cast_finite_float_to_bf16(x: &Arc<UOp>) -> Arc<UOp> {
+    bf16_payload(&rne_bias(&f32_bits(x)))
+}
+
+/// `x`'s f32 lanes reinterpreted as `u32`.
+fn f32_bits(x: &Arc<UOp>) -> Arc<UOp> {
+    assert_eq!(x.dtype().base(), svod_dtype::ScalarDType::Float32, "bf16 narrowing takes f32");
+    x.bitcast(lanes(x, svod_dtype::ScalarDType::UInt32))
+}
+
+/// `u + ((u >> 16) & 1) + 0x7fff`: the f32 bits `u` biased so that their high
+/// half is the round-half-to-even bf16 of every finite value and of `±∞`.
+fn rne_bias(u: &Arc<UOp>) -> Arc<UOp> {
+    let lsb = u.try_shr_op(&u.const_like(16)).and_then(|s| s.try_and_op(&u.const_like(1))).expect("bf16: rne lsb");
+    u.try_add(&lsb).and_then(|r| r.try_add(&u.const_like(0x7fff))).expect("bf16: rne bias")
+}
+
+/// The high 16 bits of each `u32` lane, the bf16 payload: truncated to `u16`
+/// and reinterpreted as bf16.
+fn bf16_payload(bits: &Arc<UOp>) -> Arc<UOp> {
     bits.try_shr_op(&bits.const_like(16))
         .expect("bf16: extract high half")
-        .cast(vec(ScalarDType::UInt16))
-        .bitcast(vec(ScalarDType::BFloat16))
+        .cast(lanes(bits, svod_dtype::ScalarDType::UInt16))
+        .bitcast(lanes(bits, svod_dtype::ScalarDType::BFloat16))
+}
+
+/// `scalar` with as many lanes as `x`.
+fn lanes(x: &Arc<UOp>, scalar: svod_dtype::ScalarDType) -> crate::DType {
+    crate::DType::Scalar(scalar).vec(x.dtype().vcount()).expect("scalar dtype is vectorizable")
+}
+
+/// f32 → bf16 narrowing in integers ([`cast_float_to_bf16`]) instead of an
+/// `fptrunc`, for a backend that cannot select the native one: amdgcn before
+/// LLVM 21 fails on the vectorized bf16 truncating store `-O3` makes of an
+/// `fptrunc float to bfloat` feeding a `store bfloat` (LLVM 18 is known to; the
+/// cutoff at 21 is assumed, not bisected), and Metal takes it too. The result is
+/// a `BitCast`, never a matching `Cast`, so the rewrite cannot recurse.
+pub fn bf16_integer_cast_patterns() -> TypedPatternMatcher<()> {
+    patterns! {
+        node @ Cast { src, .. }
+            if node.dtype().base() == svod_dtype::ScalarDType::BFloat16
+                && src.dtype().base() == svod_dtype::ScalarDType::Float32
+            => cast_float_to_bf16(src),
+    }
 }
 
 /// Decomposition patterns for the AMD backend.
@@ -191,23 +228,15 @@ pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
         Cos(src)  => xcos(&src.cast(DType::Float32)).cast(src.dtype()),
         Tan(src)  => xtan(&src.cast(DType::Float32)).cast(src.dtype()),
         Pow(base, exp) => xpow(&base.cast(DType::Float32), &exp.cast(DType::Float32)).cast(base.dtype()),
-
-        // f32 → bf16: integer round (see `cast_float_to_bf16`) instead of the
-        // `fptrunc` whose vectorized truncstore amdgcn can't select. The result
-        // is a BitCast, never a matching Cast, so the rewrite can't recurse.
-        node @ Cast { src, .. }
-            if node.dtype().base() == svod_dtype::ScalarDType::BFloat16
-                && src.dtype().base() == svod_dtype::ScalarDType::Float32
-            => cast_float_to_bf16(src),
     }
 }
 
 /// Decomposition patterns for the NVPTX backend.
 ///
-/// The AMD set (transcendentals over native `exp2`/`log2`, integer-domain bf16
-/// rounding) plus the f64 `Exp2`/`Log2` expansions: NVPTX lowers
-/// `@llvm.exp2` for f16/f32 only and `Log2` rides the f32-only
-/// `lg2.approx.f32`, so double precision takes the polynomial path.
+/// The AMD set (transcendentals over native `exp2`/`log2`) plus the f64
+/// `Exp2`/`Log2` expansions: NVPTX lowers `@llvm.exp2` for f16/f32 only and
+/// `Log2` rides the f32-only `lg2.approx.f32`, so double precision takes the
+/// polynomial path.
 pub fn nvptx_decomposition_patterns() -> TypedPatternMatcher<()> {
     fn f64(d: &crate::DType) -> bool {
         d.base() == svod_dtype::ScalarDType::Float64

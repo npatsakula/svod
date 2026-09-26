@@ -40,7 +40,7 @@ pub struct Qwen3Attention {
 pub(crate) fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, seg_start: Option<&Tensor>) -> Result<Tensor> {
     if matches!(q.dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16)
         && let Some(out) =
-            svod_tk::flash_attention_with(q, k, v, svod_tk::FaOpts { causal: true, key_lens: None, seg_start })
+            svod_tk::flash_attention_with(q, k, v, svod_tk::FaOpts { causal: true, seg_start, ..Default::default() })
                 .context(TkSnafu)?
     {
         return Ok(out);

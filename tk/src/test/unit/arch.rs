@@ -18,8 +18,8 @@ use crate::arch::FragRole;
 use crate::arch::FragRole::{Accumulator, AccumulatorT, Operand, OperandB};
 use crate::layout::ReduceTree;
 use crate::tiles::{
-    RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, ST_16X16,
-    ST_16X16_MMA, ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32,
+    RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_MMA_HALVES, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN,
+    ST_16X16, ST_16X16_MMA, ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32,
 };
 
 const SM_86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
@@ -65,9 +65,10 @@ fn gfx1151_caps_are_wave32() {
 }
 
 /// CUDA sm_86 gets the warp32 control path — the same lane math as gfx1151 — and
-/// the `mma.sync` fragment table: every role is the two-half [`RT_16X16_MMA`] (an
-/// accumulator IS an A operand, so it is reusable as an input), both LDS strips are
-/// the swizzled [`ST_16X16_MMA`], and the arch accessors classify it.
+/// the `mma.sync` fragment table: every role is the two-half [`RT_16X16_MMA`] map (an
+/// accumulator IS an A operand, so it is reusable as an input), the A position read
+/// by the core in n-halves ([`RT_16X16_MMA_HALVES`]), both LDS strips are the
+/// swizzled [`ST_16X16_MMA`], and the arch accessors classify it.
 #[test]
 fn cuda_sm86_caps_resolve_mma_sync_fragments() {
     let c = ArchCaps::for_arch(SM_86);
@@ -75,9 +76,11 @@ fn cuda_sm86_caps_resolve_mma_sync_fragments() {
     assert_eq!(c.amd(), None);
     assert_eq!(c.cuda(), Some(CudaArch::from_compute_capability(8, 6)));
     assert!(c.has_matrix_core_layouts());
-    for role in [Accumulator, Operand, AccumulatorT] {
+    for role in [Accumulator, OperandB, AccumulatorT] {
         assert_eq!(c.frag(role), Some(RT_16X16_MMA), "{role:?}");
     }
+    assert_eq!(c.frag(Operand), Some(RT_16X16_MMA_HALVES));
+    assert_eq!(RT_16X16_MMA_HALVES.map, RT_16X16_MMA.map, "one register map, read in another order");
     assert_eq!(c.shared_default(), Some(ST_16X16_MMA));
     assert_eq!(c.shared_swizzled(), Some(ST_16X16_MMA));
     assert!(c.acc_reusable_as_input(), "the two-half f32 accumulator is the A-fragment register order");

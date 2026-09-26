@@ -5,6 +5,7 @@ use std::sync::Arc;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::uop::eval::eval_binary_op;
 use svod_ir::{ConstValue, Op, UOp};
+use test_case::test_case;
 
 use crate::swizzle::Swizzle;
 use crate::tiles::ST_16X16;
@@ -96,10 +97,89 @@ fn test_sw16x16_mma_conflict_free() {
     }
 }
 
+/// On a row of `C` 16-byte chunks (16, 32 or 64 16-bit columns: the fragment-wide
+/// strip and the full-row GEMM strips) the chunk swizzle keeps the row and every
+/// chunk whole, and both 128-byte phases a warp issues land on the 8 distinct
+/// 16-byte bank slots of a line: an `ldmatrix` phase (8 consecutive rows, one
+/// logical chunk) and a `cp.async` phase (8 consecutive lanes filling `8/C` whole
+/// rows, chunk by chunk).
+#[test_case(16; "32-byte rows")]
+#[test_case(32; "64-byte rows")]
+#[test_case(64; "128-byte rows")]
+fn chunk_swizzle_phases_are_conflict_free(cols: usize) {
+    let cidx = |v: usize| UOp::index_const(v as i64);
+    let chunks = cols / 8;
+    // The 16-byte bank slot of logical chunk `c` of row `r`.
+    let slot = |r: usize, c: usize| {
+        let at = |e: usize| {
+            let (srow, scol) = Swizzle::Sw16x16Mma.swizzle_rc(cidx(r), cidx(8 * c + e), cols, ScalarDType::BFloat16);
+            assert_eq!(eval_const(&srow), r as i64, "the chunk swizzle keeps the row");
+            eval_const(&scol) as usize
+        };
+        let first = at(0);
+        assert_eq!(first % 8, 0, "row {r} chunk {c} stays 16-byte aligned");
+        assert!((1..8).all(|e| at(e) == first + e), "row {r} chunk {c} stays contiguous");
+        (r * cols + first) / 8 % 8
+    };
+    let distinct = |slots: Vec<usize>| slots.iter().collect::<std::collections::HashSet<_>>().len();
+    for r0 in (0..16).step_by(8) {
+        for c in 0..chunks {
+            assert_eq!(distinct((0..8).map(|i| slot(r0 + i, c)).collect()), 8, "ldmatrix rows {r0}.. chunk {c}");
+        }
+    }
+    for r0 in (0..16).step_by(8 / chunks) {
+        let lanes = (0..8).map(|l| slot(r0 + l / chunks, l % chunks)).collect();
+        assert_eq!(distinct(lanes), 8, "cp.async from row {r0}");
+    }
+}
+
+/// `swizzle_chunk` puts every 16-byte chunk where `swizzle_rc` puts its first
+/// element, and builds the column so that `divides` sees it is a whole number of
+/// chunks: the check the late memory coalescing makes before it folds the chunk
+/// into one vector access. `swizzle_rc`'s element-wise XOR hides it.
+#[test_case(Swizzle::Identity, 16, ScalarDType::BFloat16; "identity")]
+#[test_case(Swizzle::Sw16x16Mma, 16, ScalarDType::BFloat16; "32-byte rows")]
+#[test_case(Swizzle::Sw16x16Mma, 32, ScalarDType::BFloat16; "64-byte rows")]
+#[test_case(Swizzle::Sw16x16Mma, 64, ScalarDType::BFloat16; "128-byte rows")]
+#[test_case(Swizzle::Sw16x16Mma, 16, ScalarDType::Float32; "f32 64-byte rows")]
+fn swizzle_chunk_is_swizzle_rc_provably_aligned(sw: Swizzle, cols: usize, scalar: ScalarDType) {
+    let cidx = |v: usize| UOp::index_const(v as i64);
+    let run = 16 / scalar.bytes();
+    for r in 0..16 {
+        for c in 0..cols / run {
+            let (srow, scol) = sw.swizzle_chunk(cidx(r), &cidx(c), cols, scalar);
+            let (wrow, wcol) = sw.swizzle_rc(cidx(r), cidx(c * run), cols, scalar);
+            assert_eq!(
+                (eval_const(&srow), eval_const(&scol)),
+                (eval_const(&wrow), eval_const(&wcol)),
+                "row {r} chunk {c}"
+            );
+        }
+    }
+    let row = UOp::var("row", DType::Int32, 0, 15);
+    let chunk = UOp::var("chunk", DType::Int32, 0, (cols / run - 1) as i64);
+    let (_, scol) = sw.swizzle_chunk(row.clone(), &chunk, cols, scalar);
+    assert!(scol.divides(run as i64).is_some(), "{sw:?}: the chunk's column divides by its {run} elements");
+    if sw == Swizzle::Sw16x16Mma {
+        let (_, wcol) = sw.swizzle_rc(row, chunk.mul(&cidx(run)), cols, scalar);
+        assert!(wcol.divides(run as i64).is_none(), "the element-wise XOR is opaque to `divides`");
+    }
+}
+
+/// A swizzle that moves 8-byte halves of a chunk apart has no chunk form.
+#[test]
+#[should_panic(expected = "splits 16-byte chunks")]
+fn swizzle_chunk_refuses_a_chunk_splitting_swizzle() {
+    let cidx = |v: usize| UOp::index_const(v as i64);
+    let _ = Swizzle::Sw16x16.swizzle_chunk(cidx(0), &cidx(0), 16, ScalarDType::BFloat16);
+}
+
 #[test]
 fn test_swizzle_is_bijection() {
     assert_bijection(Swizzle::Sw16x16, 16, 16, ScalarDType::BFloat16);
     assert_bijection(Swizzle::Sw16x16Mma, 16, 16, ScalarDType::BFloat16);
+    assert_bijection(Swizzle::Sw16x16Mma, 16, 32, ScalarDType::BFloat16);
+    assert_bijection(Swizzle::Sw16x16Mma, 16, 64, ScalarDType::BFloat16);
     assert_bijection(Swizzle::Sw16x16Mma, 16, 16, ScalarDType::Float32);
     assert_bijection(Swizzle::Sw32x32, 32, 32, ScalarDType::BFloat16);
     assert_bijection(Swizzle::Sw16x32, 16, 32, ScalarDType::BFloat16);

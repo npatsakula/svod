@@ -26,6 +26,7 @@ pub(crate) struct ClangToolchain {
     executable: PathBuf,
     executable_digest: [u8; 32],
     identity: String,
+    llvm_major: Option<u32>,
 }
 
 impl ClangToolchain {
@@ -41,9 +42,15 @@ impl ClangToolchain {
         };
         let version = String::from_utf8(version)
             .map_err(|error| Error::JitCompilation { reason: format!("clang --version was not UTF-8: {error}") })?;
+        let llvm_major = clang_major_version(&version);
         let identity =
             format!("path={};sha256={};version={}", executable.display(), hex(&executable_digest), version.trim());
-        Ok(Self { executable, executable_digest, identity })
+        Ok(Self { executable, executable_digest, identity, llvm_major })
+    }
+
+    /// The LLVM major version this clang reports, when its banner names one.
+    pub(crate) fn llvm_major(&self) -> Option<u32> {
+        self.llvm_major
     }
 
     pub(crate) fn identity(&self) -> &str {
@@ -352,6 +359,13 @@ pub(crate) fn resolve_executable(name: &str) -> Result<PathBuf> {
         }
     }
     Err(Error::JitCompilation { reason: format!("{name} not found in PATH") })
+}
+
+/// The LLVM major version `clang --version` names (`clang version 22.1.8`,
+/// `Ubuntu clang version 22.1.0 (…)`); `None` when it names none.
+pub(crate) fn clang_major_version(version: &str) -> Option<u32> {
+    let (_, rest) = version.split_once("clang version ")?;
+    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
 }
 
 pub(crate) fn run_probe(executable: &Path, args: &[&str]) -> Result<Vec<u8>> {

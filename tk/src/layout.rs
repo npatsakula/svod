@@ -200,14 +200,15 @@ impl LaneMap {
     }
 
     /// The `ldmatrix.x4` load of a 16×16 16-bit fragment held under this map
-    /// (`transpose` as in [`Self::rc`]), if one exists: the four 8×8 matrices the
-    /// warp fetches (lane `L` addressing row `L % 16`, columns `8·(L / 16)..` — TL,
-    /// BL, TR, BR) each land as one 32-bit register pair of adjacent elements, so
-    /// the map must give lane `L` register pair `p` = elements `(L/4, 2(L%4) + e)`
-    /// of one matrix (or its transpose under `.trans`). Proved by evaluating the
-    /// closed form over every lane and register — the plan is derived, never
+    /// (`transpose` as in [`Self::rc`]), if one exists: the fragment's four 8×8
+    /// matrices (numbered `rb + 2·cb` by their row and column block — TL, BL, TR,
+    /// BR) each land as one 32-bit register pair of adjacent elements, so the map
+    /// must give lane `L` register pair `p` = elements `(L/4, 2(L%4) + e)` of one
+    /// matrix (or its transpose under `.trans`). Proved by evaluating the closed
+    /// form over every lane and register — the plan is derived, never
     /// hand-permuted: [`Self::MmaSync`] reads `[0, 1, 2, 3]` plain and `[0, 2, 1,
     /// 3]` transposed (ThunderKittens `ldsm4t(tmp[0], tmp[2], tmp[1], tmp[3])`).
+    /// The order the warp fetches them in is [`LdmatrixX4::fetch`]'s.
     pub fn ldmatrix_x4(&self, transpose: bool) -> Option<LdmatrixX4> {
         // `ldmatrix` is a PTX instruction over a 16x16 fragment; an 8x8 simdgroup
         // matrix has no such load (its analog is `simdgroup_load`, which the WMMA
@@ -238,10 +239,20 @@ impl LaneMap {
 }
 
 /// How one `ldmatrix.sync.aligned.m8n8.x4[.trans]` fills a 16×16 fragment: register
-/// pair `p` (elements `2p, 2p+1`) is the fetched matrix `words[p]` (see
+/// pair `p` (elements `2p, 2p+1`) is the fragment's matrix `words[p]` (see
 /// [`LaneMap::ldmatrix_x4`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LdmatrixX4 {
     pub trans: bool,
     pub words: [usize; 4],
+}
+
+impl LdmatrixX4 {
+    /// The matrices in the order the warp fetches them for a fragment the core
+    /// reads as `feed` ([`crate::tiles::RTBaseShape::feed`]): the instruction's
+    /// result `i` is matrix `fetch[i]`, lands in register pair `feed[i]`, and
+    /// comes from the addresses of lanes `8i..8i+8` (one per matrix row).
+    pub fn fetch(&self, feed: [usize; 4]) -> [usize; 4] {
+        feed.map(|p| self.words[p])
+    }
 }

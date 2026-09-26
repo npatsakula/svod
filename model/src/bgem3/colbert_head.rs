@@ -41,7 +41,7 @@ impl ColbertHead {
 
     /// Build from a preloaded state dict, casting to `dtype`.
     pub fn from_state_dict(sd: &StateDict, prefix: &str, colbert_dim: usize, dtype: DType) -> Result<Self> {
-        let sd = state::cast_all(sd, dtype.clone());
+        let sd = state::cast_all(sd, dtype.clone())?;
         let mut head = Self::empty(0, colbert_dim, dtype);
         head.load_state_dict(&sd, prefix)?;
         Ok(head)

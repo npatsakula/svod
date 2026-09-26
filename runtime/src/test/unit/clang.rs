@@ -73,3 +73,15 @@ fn unfingerprintable_host_disables_probe_sharing_for_native_flags() {
     assert!(probe_key(&executable, &["-march=native".into()], None).is_none());
     assert!(probe_key(&executable, &["-march=x86-64".into()], None).is_some());
 }
+
+/// The LLVM major is read off the `clang version` line whoever packaged it; a
+/// banner without one has no version to check.
+#[test_case::test_case("clang version 22.1.8\nTarget: x86_64-pc-linux-gnu\n" => Some(22); "upstream")]
+#[test_case::test_case("Ubuntu clang version 18.1.3 (1ubuntu1)\n" => Some(18); "distro prefix")]
+#[test_case::test_case("Homebrew clang version 22.1.0\n" => Some(22); "homebrew")]
+#[test_case::test_case("Apple clang version 17.0.0 (clang-1700.0.13.5)\n" => Some(17); "apple")]
+#[test_case::test_case("AMD clang version 19.0.0git (https://github.com/RadeonOpenCompute/llvm-project roc-6.4.0)\n" => Some(19); "rocm")]
+#[test_case::test_case("gcc (GCC) 15.2.1\n" => None; "not clang")]
+fn clang_major_version_reads_the_banner(banner: &str) -> Option<u32> {
+    crate::clang::clang_major_version(banner)
+}

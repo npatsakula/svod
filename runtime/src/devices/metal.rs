@@ -143,7 +143,10 @@ impl Renderer for MetalRendererWrapper {
 
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
         // Transcendental + bf16 lowering over native exp2/log2; not amdgcn-specific.
-        Some(svod_ir::decompositions::amd_decomposition_patterns())
+        Some(
+            svod_ir::decompositions::amd_decomposition_patterns()
+                + svod_ir::decompositions::bf16_integer_cast_patterns(),
+        )
     }
 
     fn extra_matcher(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {

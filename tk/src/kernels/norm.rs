@@ -1,4 +1,4 @@
-//! Row-wise RMS normalization — the *elementwise* peer of
+//! Row-wise RMS and layer normalization — the *elementwise* peers of
 //! [`gemm_nt`](super::gemm::gemm_nt) and
 //! [`flash_attention_with`](crate::flash_attention_with).
 //!
@@ -6,9 +6,11 @@
 //! `(h, y) = (x + residual, rms_norm(x + residual))`, so a pre-norm decoder
 //! layer writes and reads its residual stream once instead of recomputing the
 //! lazy add in the reduce, in the apply, and again in the next layer.
+//! [`layer_norm`] is one pass where the graph takes three kernels (the mean,
+//! the variance, the apply).
 //!
-//! Both have the same shape: **one wave per row**, the row held in registers,
-//! the sum of squares completed by a butterfly shuffle (no LDS, no barrier),
+//! All have the same shape: **one wave per row**, the row held in registers,
+//! the row's sums completed by a butterfly shuffle (no LDS, no barrier),
 //! and every global access a `vec`-wide contiguous run per lane so a wave's
 //! load is one coalesced transaction. The bodies are straight-line — there is
 //! no `RANGE` anywhere, so every register index is a compile-time constant and
@@ -20,6 +22,8 @@
 //! one agree to the last bf16 rounding *except* for the summation order of the
 //! row reduce (a butterfly tree here, the scheduler's tree there):
 //! `y = bf16((f32(x)·rsqrt(Σx²/D + eps))·f32(w))` — one rounding, at the end.
+//! The layer norm centers first, `c = f32(x) − Σf32(x)/D`, and normalizes `c`
+//! the same way, adding `f32(b)` before the rounding when it has a bias.
 
 use std::sync::Arc;
 
@@ -119,6 +123,19 @@ pub fn scale_by(x: &Arc<UOp>, inv: &Arc<UOp>, w: &Arc<UOp>, dt: &DType) -> Arc<U
     x.try_mul(inv).expect("rms: normalize").try_mul(&w.cast(DType::Float32)).expect("rms: weight").cast(dt.clone())
 }
 
+/// `Σvals/n` over the row, replicated in every lane — the graph's f32 `mean`:
+/// this lane's fold in emission order, then the wave butterfly.
+fn row_mean(warp: &Group<'_>, vals: &[Arc<UOp>], n: usize) -> Arc<UOp> {
+    let partial = vals
+        .iter()
+        .cloned()
+        .reduce(|a, b| a.try_add(&b).expect("layer norm: accumulate"))
+        .expect("layer norm: a row has at least one element");
+    warp.wave_reduce_scalar(partial, |a, b| a.try_add(b).expect("layer norm: f32 sum"))
+        .try_div(&f32c(n as f64))
+        .expect("layer norm: mean")
+}
+
 // ── The row-norm kernel ──────────────────────────────────────────────────────
 
 /// Block shape of the row-norm kernel: `rows_per_block` waves per workgroup,
@@ -141,14 +158,25 @@ pub fn select_norm_cfg(rows: usize, d: usize, lanes: usize) -> Option<NormCfg> {
     Some(NormCfg { rows_per_block })
 }
 
-/// The row-norm body: `y[r] = rms_norm(x[r])`, and with `residual` bound also
+/// Which normalization a row-norm body computes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowNorm {
+    /// `rms_norm(x)`; with `fuse_add`, of `h = x + residual`, which is stored too.
+    Rms { fuse_add: bool },
+    /// `layer_norm(x)`, shifted by a `[D]` bias when `bias`.
+    Layer { bias: bool },
+}
+
+/// The row-norm body: `y[r] = norm(x[r])`, and with `residual` bound also
 /// `h[r] = x[r] + residual[r]` (the normed row is then `h`'s). ABI is
-/// `[y (, h)]` out, `[x (, residual), weight]` in — `h` trails `y` so the
-/// one-output kernel keeps slot 0.
-fn build_row_norm(ker: &Kernel, rows: usize, d: usize, dt: DType, eps: f64, cfg: NormCfg, fuse_add: bool) {
+/// `[y (, h)]` out, `[x (, residual), weight (, bias)]` in — `h` trails `y` so
+/// the one-output kernel keeps slot 0.
+fn build_row_norm(ker: &Kernel, rows: usize, d: usize, dt: DType, eps: f64, cfg: NormCfg, kind: RowNorm) {
     let lanes = ker.caps.wave_size;
     let (vec, chunks) = plan(d, lanes).expect("checked by the applicability predicate");
     let row_shape = [rows, d];
+    let fuse_add = kind == RowNorm::Rms { fuse_add: true };
+    let bias = kind == RowNorm::Layer { bias: true };
 
     let mut out_specs = vec![GlSpec::new(&row_shape, dt.clone())];
     let mut in_specs = vec![GlSpec::new(&row_shape, dt.clone())];
@@ -157,10 +185,14 @@ fn build_row_norm(ker: &Kernel, rows: usize, d: usize, dt: DType, eps: f64, cfg:
         in_specs.push(GlSpec::new(&row_shape, dt.clone()));
     }
     in_specs.push(GlSpec::new(&[d], dt.clone()));
+    if bias {
+        in_specs.push(GlSpec::new(&[d], dt.clone()));
+    }
     let (outs, ins) = ker.bind_abi(&out_specs, &in_specs);
     let (y_gl, h_gl) = (outs[0].clone(), fuse_add.then(|| outs[1].clone()));
     let (x_gl, res_gl) = (ins[0].clone(), fuse_add.then(|| ins[1].clone()));
-    let w_gl = ins.last().expect("weight global").clone();
+    let w_gl = ins[1 + usize::from(fuse_add)].clone();
+    let b_gl = bias.then(|| ins[2].clone());
 
     let warp = ker.warp();
     let lane = ker.laneid();
@@ -190,13 +222,35 @@ fn build_row_norm(ker: &Kernel, rows: usize, d: usize, dt: DType, eps: f64, cfg:
             vals.push(v);
         }
     }
-    let inv = inv_rms(&warp, sum_squares(&wide), d, eps);
+    let normed = match kind {
+        RowNorm::Rms { .. } => wide,
+        RowNorm::Layer { .. } => {
+            let mean = row_mean(&warp, &wide, d);
+            wide.iter().map(|v| v.try_sub(&mean).expect("layer norm: center")).collect()
+        }
+    };
+    let inv = inv_rms(&warp, sum_squares(&normed), d, eps);
 
     let mut h_stores = Vec::with_capacity(chunks);
     let mut y_stores = Vec::with_capacity(chunks);
     for (c, (off, winner)) in chunk_off.iter().enumerate() {
         let wv = vload(w_gl.uop(), winner, vec);
-        let ys = (0..vec).map(|j| scale_by(&wide[c * vec + j], &inv, &vpick(&wv, j, vec), &dt)).collect();
+        let bv = b_gl.as_ref().map(|g| vload(g.uop(), winner, vec));
+        let ys = (0..vec)
+            .map(|j| {
+                let x = &normed[c * vec + j];
+                let w = vpick(&wv, j, vec);
+                let Some(bv) = &bv else { return scale_by(x, &inv, &w, &dt) };
+                // The graph's `affine_f32` with its shift: both in f32, one rounding.
+                x.try_mul(&inv)
+                    .expect("layer norm: normalize")
+                    .try_mul(&w.cast(DType::Float32))
+                    .expect("layer norm: weight")
+                    .try_add(&vpick(bv, j, vec).cast(DType::Float32))
+                    .expect("layer norm: bias")
+                    .cast(dt.clone())
+            })
+            .collect();
         if let Some(h_gl) = &h_gl {
             h_stores.push(vstore(h_gl.uop(), off, vals[c * vec..(c + 1) * vec].to_vec()));
         }
@@ -216,25 +270,72 @@ fn rows_and_d(dims: &[usize]) -> (usize, usize) {
     (dims[..dims.len() - 1].iter().product(), d)
 }
 
-/// Structural checks shared by [`rms_norm`] and [`add_rms_norm`]: a matrix-core
-/// operand dtype, and a `[D]` weight in that dtype.
-fn check_norm_operands(
-    kernel: &'static str,
-    dtype: &DType,
-    w_dtype: &DType,
-    wd: &[usize],
-    d: usize,
-) -> crate::LaunchResult<()> {
+/// A rank-1 `[D]` parameter of a row norm (`weight`, `bias`): its name, dtype
+/// and dims.
+type NormParam = (&'static str, DType, Vec<usize>);
+
+/// The `[D]` parameter `t`, or `Err` when it is not rank 1 and concrete.
+fn norm_param(kernel: &'static str, operand: &'static str, t: &Tensor) -> crate::LaunchResult<NormParam> {
+    Ok((operand, t.uop().dtype(), crate::launch::concrete_dims(t, kernel, operand, 1)?))
+}
+
+/// Structural checks shared by every row norm: a matrix-core operand dtype,
+/// and each parameter `[D]` in that dtype.
+fn check_norm_operands(kernel: &'static str, dtype: &DType, params: &[NormParam], d: usize) -> crate::LaunchResult<()> {
     ensure!(
         *dtype == DType::BFloat16 || *dtype == DType::Float16,
         crate::launch::DtypeSnafu { kernel, got: dtype.clone(), expected: "bf16 or f16" }
     );
-    ensure!(w_dtype == dtype, crate::launch::DtypeSnafu { kernel, got: w_dtype.clone(), expected: "the dtype of x" });
-    ensure!(
-        wd == [d],
-        crate::launch::OperandShapeSnafu { kernel, operand: "weight", expected: vec![d], got: wd.to_vec() }
-    );
+    for (operand, p_dtype, pd) in params {
+        ensure!(
+            p_dtype == dtype,
+            crate::launch::DtypeSnafu { kernel, got: p_dtype.clone(), expected: "the dtype of x" }
+        );
+        ensure!(
+            *pd == [d],
+            crate::launch::OperandShapeSnafu { kernel, operand: *operand, expected: vec![d], got: pd.clone() }
+        );
+    }
     Ok(())
+}
+
+/// The one-output row norms, [`rms_norm`] and [`layer_norm`]: `kernel` names
+/// the request in errors, `name` the launched kernel.
+fn row_norm(
+    (kernel, name): (&'static str, &'static str),
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    eps: f64,
+    kind: RowNorm,
+) -> crate::LaunchResult<Option<Tensor>> {
+    let xd = crate::launch::concrete_dims_at_least(x, kernel, "x", 2)?;
+    let mut params = vec![norm_param(kernel, "weight", weight)?];
+    if let Some(bias) = bias {
+        params.push(norm_param(kernel, "bias", bias)?);
+    }
+    let (rows, d) = rows_and_d(&xd);
+    let dtype = x.uop().dtype();
+    let check_dtype = dtype.clone();
+
+    crate::launch_custom(
+        &x.device(),
+        NORM_SUPPORTED_ARCHS,
+        move |_arch| check_norm_operands(kernel, &check_dtype, &params, d),
+        move |arch| select_norm_cfg(rows, d, crate::ArchCaps::for_arch(arch).wave_size).is_some(),
+        move |arch| {
+            let caps = crate::ArchCaps::for_arch(arch);
+            let cfg = select_norm_cfg(rows, d, caps.wave_size).expect("checked by the fit predicate");
+            let (grid, block) = launch_dims(rows, cfg.rows_per_block, caps.wave_size);
+            let x = crate::launch::statically(x, &xd)?;
+            let ins: Vec<&Tensor> = [&x, weight].into_iter().chain(bias).collect();
+            let out = Tensor::empty(&xd, dtype.clone());
+            crate::graph_launch(name, grid, block, out, &ins, caps, move |ker| {
+                build_row_norm(ker, rows, d, dtype, eps, cfg, kind);
+                ker.finish(1)
+            })
+        },
+    )
 }
 
 /// **Graph-native** `y = rms_norm(x, weight, eps)` over the last axis — the
@@ -257,33 +358,24 @@ fn check_norm_operands(
 ///   ([`select_norm_cfg`]): `D` must be a multiple of the wave (32) and at most
 ///   `64·32 = 2048` (a row lives in registers). The caller substitutes
 ///   `Tensor::rms_norm_with`.
-/// - `Err` — *malformed request:* a symbolic dim, `x` below rank 2, `weight`
-///   not rank 1 or not `[D]`, a dtype outside {bf16, f16}, or a dtype mismatch.
+/// - `Err` — *malformed request:* an unpinned symbolic dim, `x` below rank 2,
+///   `weight` not rank 1 or not `[D]`, a dtype outside {bf16, f16}, or a dtype
+///   mismatch.
 /// - `Ok(Some(y))` — it ran.
 pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> crate::LaunchResult<Option<Tensor>> {
-    let xd = crate::launch::concrete_dims_at_least(x, "rms-norm", "x", 2)?;
-    let wd = crate::launch::concrete_dims(weight, "rms-norm", "weight", 1)?;
-    let (rows, d) = rows_and_d(&xd);
-    let (dtype, w_dtype) = (x.uop().dtype(), weight.uop().dtype());
-    let check = (dtype.clone(), w_dtype, wd, d);
+    row_norm(("rms-norm", "rms_norm"), x, weight, None, eps, RowNorm::Rms { fuse_add: false })
+}
 
-    crate::launch_custom(
-        &x.device(),
-        NORM_SUPPORTED_ARCHS,
-        move |_arch| check_norm_operands("rms-norm", &check.0, &check.1, &check.2, check.3),
-        move |arch| select_norm_cfg(rows, d, crate::ArchCaps::for_arch(arch).wave_size).is_some(),
-        move |arch| {
-            let caps = crate::ArchCaps::for_arch(arch);
-            let cfg = select_norm_cfg(rows, d, caps.wave_size).expect("checked by the fit predicate");
-            let (grid, block) = launch_dims(rows, cfg.rows_per_block, caps.wave_size);
-            let out = Tensor::empty(&xd, dtype.clone());
-            let dt = dtype.clone();
-            crate::graph_launch("rms_norm", grid, block, out, &[x, weight], caps, move |ker| {
-                build_row_norm(ker, rows, d, dt, eps, cfg, false);
-                ker.finish(1)
-            })
-        },
-    )
+/// **Graph-native** `y = layer_norm(x)·weight (+ bias)` over the last axis, in
+/// one pass where the graph's [`Tensor::layernorm_with`] takes three kernels.
+///
+/// Shapes, dtypes and the three-way outcome are [`rms_norm`]'s; `bias`, when
+/// given, is `[D]` in `x`'s dtype like `weight`. The math is the graph's, op for
+/// op: `c = f32(x) − Σf32(x)/D`,
+/// `y = dtype((c·rsqrt(Σc²/D + eps))·f32(weight) + f32(bias))`, one rounding at
+/// the end — only the summation order of the two row reduces differs.
+pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>, eps: f64) -> crate::LaunchResult<Option<Tensor>> {
+    row_norm(("layer-norm", "layer_norm"), x, weight, bias, eps, RowNorm::Layer { bias: bias.is_some() })
 }
 
 /// **Graph-native** residual-fused RMS norm: `h = x + residual` (rounded as the
@@ -302,27 +394,27 @@ pub fn add_rms_norm(
 ) -> crate::LaunchResult<Option<(Tensor, Tensor)>> {
     let xd = crate::launch::concrete_dims_at_least(x, "add-rms-norm", "x", 2)?;
     let rd = crate::launch::concrete_dims_at_least(residual, "add-rms-norm", "residual", 2)?;
-    let wd = crate::launch::concrete_dims(weight, "add-rms-norm", "weight", 1)?;
+    let params = [norm_param("add-rms-norm", "weight", weight)?];
     let (rows, d) = rows_and_d(&xd);
-    let (dtype, w_dtype, r_dtype) = (x.uop().dtype(), weight.uop().dtype(), residual.uop().dtype());
-    let check = (dtype.clone(), w_dtype, wd, d, r_dtype, rd, xd.clone());
+    let (dtype, r_dtype) = (x.uop().dtype(), residual.uop().dtype());
+    let check = (dtype.clone(), r_dtype, rd, xd.clone());
 
     crate::launch_custom(
         &x.device(),
         NORM_SUPPORTED_ARCHS,
         move |_arch| {
-            check_norm_operands("add-rms-norm", &check.0, &check.1, &check.2, check.3)?;
+            check_norm_operands("add-rms-norm", &check.0, &params, d)?;
             ensure!(
-                check.4 == check.0,
-                crate::launch::DtypeSnafu { kernel: "add-rms-norm", got: check.4, expected: "the dtype of x" }
+                check.1 == check.0,
+                crate::launch::DtypeSnafu { kernel: "add-rms-norm", got: check.1, expected: "the dtype of x" }
             );
             ensure!(
-                check.5 == check.6,
+                check.2 == check.3,
                 crate::launch::OperandShapeSnafu {
                     kernel: "add-rms-norm",
                     operand: "residual",
-                    expected: check.6,
-                    got: check.5
+                    expected: check.3,
+                    got: check.2
                 }
             );
             Ok(())
@@ -343,7 +435,7 @@ pub fn add_rms_norm(
                 &[x, residual, weight],
                 caps,
                 move |ker| {
-                    build_row_norm(ker, rows, d, dt, eps, cfg, true);
+                    build_row_norm(ker, rows, d, dt, eps, cfg, RowNorm::Rms { fuse_add: true });
                     ker.finish(2)
                 },
             )?;

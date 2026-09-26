@@ -277,3 +277,40 @@ fn test_tensor_custom_op_amd_end_to_end() {
     let result = out.as_vec::<f32>().unwrap();
     assert_close_f32(&result, &[7.0], 1e-6);
 }
+
+/// A hand-ranged `out[i, j] = 1 + Σ in[i, j]` body over `[rows, cols]` operands.
+fn hand_ranged_sum_plus1_body(rows: usize, cols: usize) -> impl FnOnce(Vec<Arc<UOp>>) -> Arc<UOp> {
+    move |ph| {
+        let (i, j) = (UOp::range_const(rows as i64, 0), UOp::range_const(cols as i64, 1));
+        let at = |buf: &Arc<UOp>| UOp::index().buffer(buf.clone()).indices(vec![i.clone(), j.clone()]).call().unwrap();
+        let val = ph[1..].iter().fold(UOp::const_(DType::Float32, ConstValue::Float(1.0)), |acc, input| {
+            acc.try_add(&UOp::load().index(at(input)).call()).unwrap()
+        });
+        let store = at(&ph[0]).store(val).end(smallvec![i, j]);
+        UOp::sink_with_info(vec![store], KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() })
+    }
+}
+
+/// A custom kernel's output read twice — by an elementwise graph op and whole,
+/// as the next custom kernel's argument. The output's reshape is one node for
+/// both readers, so indexing it for the elementwise op used to leave an INDEX as
+/// the CALL argument, which the kernel graph rejects; the CALL must bind the
+/// buffer.
+#[test]
+fn test_custom_kernel_output_shared_with_an_elementwise_reader() {
+    test_setup();
+    svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || {
+        let (rows, cols) = (4usize, 8usize);
+        let x: Vec<f32> = (0..rows * cols).map(|v| v as f32 / 8.0).collect();
+        let src = Tensor::from_slice(&x).try_reshape([rows as isize, cols as isize]).unwrap();
+        let empty = || Tensor::empty(&[rows, cols], DType::Float32);
+
+        let h = empty().custom_kernel(&[&src], hand_ranged_sum_plus1_body(rows, cols)).unwrap().remove(0);
+        let squared = h.try_mul(&h).unwrap();
+        let out = empty().custom_kernel(&[&squared, &h], hand_ranged_sum_plus1_body(rows, cols)).unwrap().remove(0);
+        out.realize_with(&PrepareConfig::for_cpu_backend(CpuBackend::Clang)).unwrap();
+
+        let expected: Vec<f32> = x.iter().map(|v| (v + 1.0) * (v + 1.0) + (v + 1.0) + 1.0).collect();
+        assert_close_f32(&out.as_vec::<f32>().unwrap(), &expected, 1e-5);
+    });
+}

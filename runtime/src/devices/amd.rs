@@ -117,9 +117,10 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
 /// queues. Clean BEAM workers use this path with device usage disabled.
 pub fn create_amd_codegen(device_id: usize, arch: AmdArch) -> Result<(Arc<dyn Renderer>, Arc<dyn Compiler>)> {
     let spec = DeviceSpec::Amd { device_id };
-    let renderer = Arc::new(AmdRendererWrapper { device: spec, arch });
     let cache = ObjectCache::from_env().map_err(runtime_as_device)?.map(Arc::new);
     let toolchain = ClangToolchain::discover(cache.as_deref()).map_err(runtime_as_device)?;
+    let integer_bf16 = amd_bf16_casts_in_integers(toolchain.llvm_major());
+    let renderer = Arc::new(AmdRendererWrapper { device: spec, arch, integer_bf16 });
     // The per-kernel `-nogpulib` decision comes from the IR, which is already
     // part of every object-cache key; the persisted identity records the
     // arch-stable, ocml-free flag set.
@@ -138,9 +139,21 @@ pub fn create_amd_codegen(device_id: usize, arch: AmdArch) -> Result<(Arc<dyn Re
     Ok((renderer, compiler))
 }
 
+/// The oldest LLVM whose amdgcn backend is taken to select a plain f32 → bf16
+/// `fptrunc` ([`svod_ir::decompositions::bf16_integer_cast_patterns`]).
+const AMD_NATIVE_BF16_CAST_LLVM: u32 = 21;
+
+/// Whether kernels for a clang of LLVM `major` narrow f32 to bf16 in integers:
+/// below [`AMD_NATIVE_BF16_CAST_LLVM`], or when the version is unknown.
+pub(crate) fn amd_bf16_casts_in_integers(major: Option<u32>) -> bool {
+    major.is_none_or(|major| major < AMD_NATIVE_BF16_CAST_LLVM)
+}
+
 struct AmdRendererWrapper {
     device: DeviceSpec,
     arch: AmdArch,
+    /// Narrow f32 to bf16 in integers ([`amd_bf16_casts_in_integers`]).
+    integer_bf16: bool,
 }
 
 impl Renderer for AmdRendererWrapper {
@@ -178,8 +191,14 @@ impl Renderer for AmdRendererWrapper {
 
     fn decompositor(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {
         // Target Exp2/Log2/Sin/Sqrt selection is centralized in the scheduler.
-        // This matcher only handles Morok's additional transcendental ops.
-        Some(svod_ir::decompositions::amd_decomposition_patterns())
+        // This matcher handles Morok's additional transcendental ops, and the
+        // bf16 narrowing an old amdgcn backend cannot select.
+        let patterns = svod_ir::decompositions::amd_decomposition_patterns();
+        Some(if self.integer_bf16 {
+            patterns + svod_ir::decompositions::bf16_integer_cast_patterns()
+        } else {
+            patterns
+        })
     }
 
     fn extra_matcher(&self) -> Option<svod_ir::pattern::TypedPatternMatcher<()>> {

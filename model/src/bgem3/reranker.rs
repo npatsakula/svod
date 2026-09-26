@@ -106,7 +106,7 @@ impl BgeRerankerV2M3 {
     pub fn from_state_dict(sd: &StateDict, config: XlmRobertaConfig) -> Result<Self> {
         let dtype = config.dtype.clone();
         let mut model = Self::empty(config);
-        model.load_state_dict(&cast_all(sd, dtype), "")?;
+        model.load_state_dict(&cast_all(sd, dtype)?, "")?;
         Ok(model)
     }
 }

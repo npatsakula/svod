@@ -1650,30 +1650,26 @@ fn late_buffer_slice(compute: &Arc<UOp>, stage: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(UOp::stage(new_sources[0].clone(), new_sources[1..].to_vec(), opts.clone()))
 }
 
-fn strip_reshape_on_callable_sources(callable: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let strip = |sources: &[Arc<UOp>]| {
-        let mut changed = false;
-        let rewritten: SmallVec<[Arc<UOp>; 4]> = sources
-            .iter()
-            .map(|src| {
-                if let Op::Reshape(ops::Reshape { src: inner, .. }) = src.op() {
-                    changed = true;
-                    inner.clone()
-                } else {
-                    src.clone()
-                }
-            })
-            .collect();
-        (changed, rewritten)
-    };
-
+/// A CALL argument is a whole buffer, so the views rangeify can leave on one come
+/// off: a RESHAPE wrapper (tinygrad's "remove any RESHAPEs on KERNEL"), and an
+/// INDEX (its `pm_no_indexing_calls`). The INDEX appears when the argument is
+/// shared with a ranged consumer: `push_op_through_after` lifts a custom kernel
+/// output's reshape into one node that is both the next CALL's argument and,
+/// say, an elementwise op's source, and indexing it for the op indexes the
+/// argument too.
+fn strip_views_on_callable_sources(callable: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Call(ops::Call { body, args, info }) = callable.op() else {
         return None;
     };
-    let (changed, rewritten) = strip(args);
-    if !changed {
+    let whole = |src: &Arc<UOp>| match src.op() {
+        Op::Reshape(ops::Reshape { src: inner, .. }) => Some(inner.clone()),
+        Op::Index(ops::Index { buffer, .. }) => Some(buffer.clone()),
+        _ => None,
+    };
+    if !args.iter().any(|src| whole(src).is_some()) {
         return None;
     }
+    let rewritten: SmallVec<[Arc<UOp>; 4]> = args.iter().map(|src| whole(src).unwrap_or_else(|| src.clone())).collect();
     Some(body.call(rewritten, info.clone()).rtag(callable.tag().clone()).rorigin(callable.origin()))
 }
 
@@ -1702,7 +1698,7 @@ fn build_add_buffers_patterns() -> crate::TypedPatternMatcher<super::kernel::Ran
             buf @ Stage { compute: _ } => {
                 bufferize_to_store(buf, ctx)
             },
-            // Strip RESHAPE wrappers on CALL sources.
-            c @ Call { body: _, args: _, info: _ } => { strip_reshape_on_callable_sources(c) },
+            // Strip RESHAPE / INDEX views on CALL sources.
+            c @ Call { body: _, args: _, info: _ } => { strip_views_on_callable_sources(c) },
         }
 }

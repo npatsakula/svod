@@ -9,7 +9,7 @@ use crate::amd::sys::hsa::{
     hsa_fence_scope_t_HSA_FENCE_SCOPE_SYSTEM, hsa_kernel_dispatch_packet_t, kernel_dispatch_header,
 };
 use crate::error::Error;
-use crate::hcq::{AmdPm4Dispatch, Command, ComputeDispatch, QueueKind, Submission};
+use crate::hcq::{AmdPm4Dispatch, Command, ComputeDispatch, QueueKind, StoreScope, Submission};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------- packet forms
@@ -638,7 +638,7 @@ fn hcq_pm4_command_goldens_concatenate_in_submission_order() {
             ],
         ),
         (
-            Command::Store { dst: ADDRESS, value: 0xaabb_ccdd_eeff_0011 },
+            Command::Store { dst: ADDRESS, value: 0xaabb_ccdd_eeff_0011, scope: StoreScope::System },
             &[0xc006_4900, 0x70f514, 0x4000_0000, 0x5566_7788, 0x1122_3344, 0xeeff_0011, 0xaabb_ccdd, 0],
         ),
     ];
@@ -649,6 +649,26 @@ fn hcq_pm4_command_goldens_concatenate_in_submission_order() {
     let mixed = compute_of(goldens.iter().map(|(command, _)| command.clone()));
     let concatenated = goldens.iter().flat_map(|(_, dwords)| dwords.iter().copied()).collect::<Vec<_>>();
     assert_eq!(lower_hcq_pm4(&mixed, pm4_state()).unwrap(), concatenated);
+}
+
+/// A queue-scoped store is the same end-of-pipe write without the GCR
+/// writeback and invalidate, on gfx10+ and gfx9 alike.
+#[test]
+fn hcq_pm4_queue_scoped_store_leaves_the_caches() {
+    const ADDRESS: u64 = 0x1122_3344_5566_7788;
+    let store = |scope| compute_of([Command::Store { dst: ADDRESS, value: 0xaabb_ccdd_eeff_0011, scope }]);
+    assert_eq!(
+        lower_hcq_pm4(&store(StoreScope::Queue), pm4_state()).unwrap(),
+        [0xc006_4900, 0x514, 0x4000_0000, 0x5566_7788, 0x1122_3344, 0xeeff_0011, 0xaabb_ccdd, 0]
+    );
+    for state in [pm4_state(), aql_control_state(false), aql_control_state(true)] {
+        let queue = lower_hcq_pm4(&store(StoreScope::Queue), state).unwrap();
+        let system = lower_hcq_pm4(&store(StoreScope::System), state).unwrap();
+        let differing: Vec<usize> = (0..system.len()).filter(|&i| queue[i] != system[i]).collect();
+        let event = usize::from(state.completion_xcc_mask.is_some()) * 2 + 1;
+        assert_eq!(differing, [event], "target {}", state.target_major);
+        assert_eq!(queue[event], system[event] & queue[event], "only cache bits drop");
+    }
 }
 
 #[test]
@@ -729,7 +749,7 @@ fn hcq_sdma_mixed_submission_golden() {
         .push(Command::Wait { signal_address: 0x1_0000_1000, value: 9 })
         .push(Command::Copy { dst: 0x2_0000_2000, src: 0x3_0000_3000, bytes: 16 })
         .push(Command::Timestamp { dst: 0x4_0000_4000 })
-        .push(Command::Store { dst: 0x5_0000_5000, value: 0x5566_7788 });
+        .push(Command::Store { dst: 0x5_0000_5000, value: 0x5566_7788, scope: StoreScope::System });
     assert_eq!(
         lower_hcq_sdma(&submission, 11, None).unwrap(),
         [
@@ -766,8 +786,10 @@ fn hcq_queue_event_mailbox_stores_raise_the_kfd_interrupt() {
     // PM4: the polled timeline store stays interrupt-free; only the mailbox
     // store interrupts, carrying the event id in both value and ctxid and no
     // cache flush (tinygrad ops_amd.py:388-393).
-    let submission =
-        compute_of([Command::Store { dst: 0x1_0000_1000, value: 7 }, Command::Store { dst: MAILBOX, value: 9 }]);
+    let submission = compute_of([
+        Command::Store { dst: 0x1_0000_1000, value: 7, scope: StoreScope::System },
+        Command::Store { dst: MAILBOX, value: 9, scope: StoreScope::System },
+    ]);
     let q = lower_hcq_pm4(&submission, Pm4LoweringState { queue_event_mailbox: Some(MAILBOX), ..pm4_state() }).unwrap();
     assert_eq!(q.len(), 16);
     assert_eq!(int_sel(q[2]), 0);
@@ -779,7 +801,7 @@ fn hcq_queue_event_mailbox_stores_raise_the_kfd_interrupt() {
 
     // SDMA: mailbox fence followed by SDMA_OP_TRAP (ops_amd.py:490-492).
     let mut copy = Submission::new(QueueKind::Copy(0));
-    copy.push(Command::Store { dst: MAILBOX, value: 9 });
+    copy.push(Command::Store { dst: MAILBOX, value: 9, scope: StoreScope::System });
     assert_eq!(
         lower_hcq_sdma(&copy, 11, Some(MAILBOX)).unwrap(),
         [0x0003_0005, MAILBOX as u32, (MAILBOX >> 32) as u32, 9, 6, 9]
@@ -787,7 +809,7 @@ fn hcq_queue_event_mailbox_stores_raise_the_kfd_interrupt() {
     assert_eq!(lower_hcq_sdma(&copy, 11, None).unwrap().len(), 4);
     // The extra TRAP dwords keep the SDMA patch cursor aligned.
     copy.bind(0, CommandField::StoreDst, PatchSource::LinkAddress(0)).unwrap();
-    copy.push(Command::Store { dst: 0x2000, value: 1 });
+    copy.push(Command::Store { dst: 0x2000, value: 1, scope: StoreScope::System });
     copy.bind(1, CommandField::StoreDst, PatchSource::LinkAddress(1)).unwrap();
     let lowered = lower_hcq_sdma_command_buffer(&copy, 11, Some(MAILBOX)).unwrap();
     assert_eq!(lowered.patches.link.iter().map(|site| site.byte_offset).collect::<Vec<_>>(), [4, 8, 28, 32]);
@@ -880,7 +902,7 @@ fn hcq_sdma_replay_patches_every_chunk_of_a_split_copy() {
     submission
         .push(Command::Copy { dst: 0, src: 0, bytes: MAX_COPY + 8 })
         .push(Command::Timestamp { dst: 0 })
-        .push(Command::Store { dst: 0, value: 0 });
+        .push(Command::Store { dst: 0, value: 0, scope: StoreScope::System });
     submission.bind(0, CommandField::CopySrc, PatchSource::RuntimeBuffer(0)).unwrap();
     submission.bind(0, CommandField::CopyDst, PatchSource::RuntimeBuffer(1)).unwrap();
     submission.bind(1, CommandField::TimestampDst, PatchSource::System(SystemField::Timestamp(0))).unwrap();
@@ -953,7 +975,7 @@ fn hcq_aql_submission_program_keeps_wait_store_and_dispatch_on_device() {
         Command::Wait { signal_address: 0, value: 0 },
         Command::MemoryBarrier,
         Command::Compute(dispatch(0, 0)),
-        Command::Store { dst: 0, value: 0 },
+        Command::Store { dst: 0, value: 0, scope: StoreScope::System },
     ]);
     submission.bind(0, CommandField::WaitAddress, PatchSource::System(SystemField::TimelineSignal(0))).unwrap();
     submission.bind(0, CommandField::WaitValue, PatchSource::System(SystemField::TimelineValue(0))).unwrap();
@@ -997,8 +1019,10 @@ fn hcq_aql_submission_program_keeps_wait_store_and_dispatch_on_device() {
 fn hcq_aql_control_only_finalizer_predicates_by_xcc_count(multi_xcc: bool, pred_execs: usize) {
     use crate::hcq::{CommandField, PatchSource, SystemField};
 
-    let mut submission =
-        compute_of([Command::Wait { signal_address: 0, value: 0 }, Command::Store { dst: 0, value: 0 }]);
+    let mut submission = compute_of([
+        Command::Wait { signal_address: 0, value: 0 },
+        Command::Store { dst: 0, value: 0, scope: StoreScope::System },
+    ]);
     submission.bind(0, CommandField::WaitAddress, PatchSource::System(SystemField::TimelineSignal(0))).unwrap();
     submission.bind(0, CommandField::WaitValue, PatchSource::System(SystemField::TimelineValue(0))).unwrap();
     submission.bind(1, CommandField::StoreDst, PatchSource::System(SystemField::TimelineSignal(1))).unwrap();

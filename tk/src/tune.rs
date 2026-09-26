@@ -9,9 +9,9 @@
 //! judged at a clock the others were not — and the winner is kept, in the
 //! store's memo and on disk so the next process starts tuned. Measurement is
 //! skipped, and the table's static choice used, when tuning is off
-//! (`SVOD_TK_TUNE=0`, or [`set_enabled`], which the test harnesses use), when
-//! the device stamps no timings, or when no candidate runs; nothing unmeasured
-//! is ever cached.
+//! (`SVOD_TK_TUNE=0`, or [`set_enabled`] on the launching thread, which the test
+//! harnesses use), when the device stamps no timings, or when no candidate runs;
+//! nothing unmeasured is ever cached.
 //!
 //! The store is one line per entry (`key index ns`) in `$SVOD_TK_TUNE_DIR`
 //! (else `$XDG_CACHE_HOME/svod/tk_tune`, else `$HOME/.cache/svod/tk_tune`), one
@@ -23,10 +23,10 @@
 //! caller has in hand, and a warm memo answers a launch without touching a
 //! kernel.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -247,22 +247,22 @@ impl TuneStore {
     }
 }
 
-/// `0`: follow the environment; `1`: off; `2`: on.
-static OVERRIDE: AtomicU8 = AtomicU8::new(0);
-
-/// Whether first-use measurement is on: [`set_enabled`]'s last setting, else
-/// `SVOD_TK_TUNE` is not `0`.
-pub fn enabled() -> bool {
-    match OVERRIDE.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => std::env::var("SVOD_TK_TUNE").map(|v| v != "0").unwrap_or(true),
-    }
+thread_local! {
+    /// [`set_enabled`]'s setting on this thread; `None` follows the environment.
+    static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// Force measurement on or off for this process, over the environment — the
-/// test harnesses turn it off so a kernel test does not tune every shape it
-/// touches.
+/// Whether first-use measurement is on for a launch from this thread:
+/// [`set_enabled`]'s last setting here, else `SVOD_TK_TUNE` is not `0`.
+pub fn enabled() -> bool {
+    OVERRIDE.get().unwrap_or_else(|| std::env::var("SVOD_TK_TUNE").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Force measurement on or off for launches from the calling thread, over the
+/// environment. The test harnesses turn it off so a kernel test does not tune
+/// every shape it touches; the test runner gives each test a thread of its own,
+/// so that reaches no test running beside it — a model test measures its tiles
+/// as a user's process would. The launchers read it where they are called.
 pub fn set_enabled(on: bool) {
-    OVERRIDE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    OVERRIDE.set(Some(on));
 }

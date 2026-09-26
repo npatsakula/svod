@@ -50,12 +50,19 @@ fn fa_bufs(mask: FaMask) -> Vec<Arc<UOp>> {
         bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b, DType::Int32)); // key_lens [B], trailing
     }
     if mask.seg_start {
-        bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b * n, DType::Int32)); // seg_start [B, N], last
+        bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b * n, DType::Int32)); // seg_start [B, N]
+    }
+    if mask.key_mask {
+        bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b * n, DType::Int32)); // key_mask [B, N], last
     }
     bufs
 }
 
 fn fa_sink_cfg(causal: bool, mask: FaMask) -> Arc<UOp> {
+    fa_sink_windowed(causal, None, mask)
+}
+
+fn fa_sink_windowed(causal: bool, window: Option<(usize, usize)>, mask: FaMask) -> Arc<UOp> {
     let (b, h, h_kv, d, n) = FA_DIMS;
     let ker =
         Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], 8 * 64, fa_bufs(mask), ArchCaps::GFX942);
@@ -66,7 +73,7 @@ fn fa_sink_cfg(causal: bool, mask: FaMask) -> Arc<UOp> {
         h,
         h_kv,
         d,
-        FaConfig { q_blk: 16, kv_blk: 16, causal, ..Default::default() },
+        FaConfig { q_blk: 16, kv_blk: 16, causal, window, ..Default::default() },
         DType::BFloat16,
         mask,
     );
@@ -88,8 +95,12 @@ fn fa_sink() -> Arc<UOp> {
 // FA graphs lose the per-commit `After`s and their fences).
 const MATMUL_DIGEST: u128 = 0xbd81_3d05_5b61_250e_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 1208;
-const FA_DIGEST: u128 = 0x85de_2edf_a698_58df_0000_0000_0000_0000;
-const FA_NODES: usize = 808;
+const FA_DIGEST: u128 = 0x1ace_1f69_0db4_e959_0000_0000_0000_0000;
+const FA_NODES: usize = 818;
+// Every FA digest moved, 10 nodes more, when the softmax weights began narrowing
+// to bf16 through the integer rounding bias on AMD (`Group::narrow_finite`).
+// Every FA digest moved, node counts unchanged, when tk's f32 `exp2` became the bare
+// `v_exp_f32` on AMD (`exp2_flush`: one CUSTOM in place of each EXP2).
 // The FA digests moved again for the packed-row segment mask: the running max
 // starts at the finite f32 floor instead of `-∞` (one constant node per graph).
 // Non-causal and non-causal+key-masked build variants (pin the `causal:false` and
@@ -98,14 +109,21 @@ const FA_NODES: usize = 808;
 // Before #177 the FA digests moved when the Q tile lost its f32 staging copy: the
 // gather lands the 16-bit operand dtype straight in registers (the softmax scale
 // already rides on the f32 `QKᵀ` accumulator), so each variant drops those 16 nodes.
-const FA_NONCAUSAL_DIGEST: u128 = 0x6475_0068_12c9_1094_0000_0000_0000_0000;
-const FA_NONCAUSAL_NODES: usize = 782;
-const FA_MASKED_DIGEST: u128 = 0x80ff_e175_34fa_12b5_0000_0000_0000_0000;
-const FA_MASKED_NODES: usize = 806;
+const FA_NONCAUSAL_DIGEST: u128 = 0x7cb4_8621_0f71_d50c_0000_0000_0000_0000;
+const FA_NONCAUSAL_NODES: usize = 792;
+const FA_MASKED_DIGEST: u128 = 0xf9f1_a064_2f80_e35d_0000_0000_0000_0000;
+const FA_MASKED_NODES: usize = 816;
 // Causal + segment-masked (packed rows): the `seg_start:Some` branch, a per-row
 // table read inside the score mask.
-const FA_SEGMENTED_DIGEST: u128 = 0x332c_6e0e_d894_ad5a_0000_0000_0000_0000;
-const FA_SEGMENTED_NODES: usize = 836;
+const FA_SEGMENTED_DIGEST: u128 = 0x4f29_9e69_ce5e_992b_0000_0000_0000_0000;
+const FA_SEGMENTED_NODES: usize = 846;
+// Sliding window (the band's KV block range per workgroup, the band mask and the
+// empty-row norm floor) and the general `[B, N]` key mask (a per-key table read
+// inside the score mask, and the same floor).
+const FA_WINDOWED_DIGEST: u128 = 0xddbb_d6b9_f92d_aa3d_0000_0000_0000_0000;
+const FA_WINDOWED_NODES: usize = 882;
+const FA_KEY_MASKED_DIGEST: u128 = 0xe7dc_a488_18f9_e689_0000_0000_0000_0000;
+const FA_KEY_MASKED_NODES: usize = 839;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
     let fp = kernel_fingerprint(&sink);
@@ -137,14 +155,26 @@ fn golden_fa_mw_rdb_noncausal() {
 
 #[test]
 fn golden_fa_mw_rdb_masked() {
-    let mask = FaMask { key_lens: true, seg_start: false };
+    let mask = FaMask { key_lens: true, ..FaMask::NONE };
     check("fa_mw_rdb[noncausal,masked]", fa_sink_cfg(false, mask), FA_MASKED_DIGEST, FA_MASKED_NODES);
 }
 
 #[test]
 fn golden_fa_mw_rdb_segmented() {
-    let mask = FaMask { key_lens: false, seg_start: true };
+    let mask = FaMask { seg_start: true, ..FaMask::NONE };
     check("fa_mw_rdb[causal,segmented]", fa_sink_cfg(true, mask), FA_SEGMENTED_DIGEST, FA_SEGMENTED_NODES);
+}
+
+#[test]
+fn golden_fa_mw_rdb_windowed() {
+    let sink = fa_sink_windowed(false, Some((64, 64)), FaMask::NONE);
+    check("fa_mw_rdb[noncausal,window]", sink, FA_WINDOWED_DIGEST, FA_WINDOWED_NODES);
+}
+
+#[test]
+fn golden_fa_mw_rdb_key_masked() {
+    let mask = FaMask { key_mask: true, ..FaMask::NONE };
+    check("fa_mw_rdb[noncausal,key_mask]", fa_sink_cfg(false, mask), FA_KEY_MASKED_DIGEST, FA_KEY_MASKED_NODES);
 }
 
 /// The fingerprint is invariant to the global id counter: building the same kernel

@@ -28,18 +28,23 @@ impl Encoder {
     }
 
     /// Run the encoder stack. `x`: `(B, L, D)` → `(B, L, D)`.
-    /// `padding_mask`: optional bool `(B, L)` where `true` = real token,
-    /// `false` = padding — the polarity SDPA's `key_padding_mask` wants.
+    /// `padding_mask`: optional `(B, L)` where non-zero = real token, zero =
+    /// padding — the polarity SDPA's `key_padding_mask` wants.
     pub fn forward(&self, x: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let seq_len = x.dim_const(1)?;
         let head_dim = self.config.head_dim();
         let dtype = self.config.dtype.clone();
 
-        // Two rotary bases (global / local) → two tables. Build them once
-        // before the loop and select per layer; every global layer shares one,
-        // every local layer the other.
-        let global = Tensor::rope_table(self.config.global_rope_theta, seq_len, head_dim, dtype.clone())?;
-        let local = Tensor::rope_table(self.config.local_rope_theta, seq_len, head_dim, dtype)?;
+        // Two rotary bases (global / local) → two tables, selected per layer;
+        // every global layer shares one, every local layer the other.
+        // Realized once: left lazy, every layer's rotation recomputes the table's
+        // pow/sin/cos.
+        let table = |theta: f64| -> Result<(Tensor, Tensor)> {
+            let (cos, sin) = Tensor::rope_table(theta, seq_len, head_dim, dtype.clone())?;
+            Ok((cos.contiguous(), sin.contiguous()))
+        };
+        let global = table(self.config.global_rope_theta)?;
+        let local = table(self.config.local_rope_theta)?;
 
         let mut h = x.clone();
         for (layer_id, layer) in self.layers.iter().enumerate() {

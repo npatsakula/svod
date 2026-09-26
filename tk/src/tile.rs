@@ -268,6 +268,28 @@ impl ST {
     pub fn base_offset(&self) -> Option<&Arc<UOp>> {
         self.base_offset.as_ref()
     }
+    /// This tile's buffer seen from its first element as a `dims` tile of `base`
+    /// fragments: shared memory taken over by another tile once every lane is
+    /// done with this one (the GEMM stages its output through its operand
+    /// strips). The caller orders the view's accesses after this tile's last.
+    ///
+    /// # Panics
+    /// Panics unless `dims` tiles into `base` fragments and fits the buffer.
+    pub fn view(&self, dims: (usize, usize), layout: TileLayout, base: STBaseShape) -> ST {
+        let (rows, cols) = dims;
+        assert!(
+            rows.is_multiple_of(base.base.rows) && cols.is_multiple_of(base.base.cols),
+            "ST view {rows}×{cols} does not tile into {}×{} fragments",
+            base.base.rows,
+            base.base.cols
+        );
+        let size: Option<usize> =
+            self.buf.shape().ok().flatten().and_then(|dims| dims.iter().map(|d| d.as_const()).product());
+        let size = size.expect("a shared tile's buffer has a static size");
+        assert!(rows * cols <= size, "ST view {rows}×{cols} overruns its {size}-element buffer");
+        let shape = vec![rows / base.base.rows, cols / base.base.cols, base.base.rows, base.base.cols];
+        ST { buf: self.buf.clone(), shape, rows, cols, layout, base, elem: self.elem.clone(), base_offset: None }
+    }
 }
 
 /// A register (per-lane) tile: a grid of [`RTBaseShape`] fragments. Logical

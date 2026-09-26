@@ -17,8 +17,8 @@ use crate::arch::FragRole;
 use crate::index::Idx;
 use crate::layout::{LaneMap, LdmatrixX4, ReduceTree};
 use crate::tiles::{
-    RT_8X8_SIMD, RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN,
-    RTBaseShape,
+    PAIRS_IN_ORDER, RT_8X8_SIMD, RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_MMA_HALVES, RT_16X16_W32_ACC,
+    RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape,
 };
 
 const SM_86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
@@ -263,10 +263,9 @@ fn rv_slots_follow_the_accumulator_map(arch: GpuArch, slots: usize) {
 }
 
 /// The `ldmatrix.x4` plan of the `mma.sync` fragment (`fa_cuda_references.md` §(c)):
-/// lane `L` addresses row `L % 16`, columns `8·(L/16)..` — matrices TL, BL, TR, BR
-/// — so a `Row` read takes the words in order, and a `Col` read (V) needs `.trans`
-/// with the ThunderKittens `ldsm4t(tmp[0], tmp[2], tmp[1], tmp[3])` permutation.
-/// The AMD maps have no `ldmatrix` form.
+/// with the matrices numbered TL, BL, TR, BR, a `Row` read takes them in order,
+/// and a `Col` read (V) needs `.trans` with the ThunderKittens `ldsm4t(tmp[0],
+/// tmp[2], tmp[1], tmp[3])` permutation. The AMD maps have no `ldmatrix` form.
 #[test_case(RT_16X16_MMA, false, Some(LdmatrixX4 { trans: false, words: [0, 1, 2, 3] }); "mma.sync row")]
 #[test_case(RT_16X16_MMA, true, Some(LdmatrixX4 { trans: true, words: [0, 2, 1, 3] }); "mma.sync col is ldsm4t")]
 #[test_case(RT_16X16, false, None; "gfx942")]
@@ -275,6 +274,19 @@ fn rv_slots_follow_the_accumulator_map(arch: GpuArch, slots: usize) {
 #[test_case(RT_16X16_GFX12, false, None; "gfx1201")]
 fn ldmatrix_x4_plan(f: RTBaseShape, transpose: bool, plan: Option<LdmatrixX4>) {
     assert_eq!(f.map.ldmatrix_x4(transpose), plan);
+}
+
+/// The fetch order puts each run the core reads in consecutive results: read
+/// whole ([`PAIRS_IN_ORDER`]), a `Row` fragment fetches TL, BL, TR, BR and a `Col`
+/// one TL, TR, BL, BR; read in n-halves (pairs `{0, 2}`, `{1, 3}`), the other way
+/// round.
+#[test_case(false, PAIRS_IN_ORDER, [0, 1, 2, 3]; "row whole")]
+#[test_case(true, PAIRS_IN_ORDER, [0, 2, 1, 3]; "col whole")]
+#[test_case(false, RT_16X16_MMA_HALVES.feed, [0, 2, 1, 3]; "row in n-halves")]
+#[test_case(true, RT_16X16_MMA_HALVES.feed, [0, 1, 2, 3]; "col in n-halves")]
+fn ldmatrix_x4_fetch_order(transpose: bool, feed: [usize; 4], fetch: [usize; 4]) {
+    let plan = RT_16X16_MMA.map.ldmatrix_x4(transpose).expect("mma.sync has an ldmatrix form");
+    assert_eq!(plan.fetch(feed), fetch);
 }
 
 /// Following the plan reproduces the map: register pair `p` of lane `L` is what the

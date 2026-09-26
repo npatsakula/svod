@@ -199,6 +199,16 @@ pub fn concrete_dims(t: &Tensor, kernel: &'static str, operand: &'static str, ra
     (0..rank).map(|i| pinned_dim(&shape[i]).context(OperandSymbolicDimSnafu { kernel, operand, axis: i })).collect()
 }
 
+/// `t` reshaped to the static `dims` [`concrete_dims`] resolved it to. A dim a
+/// JIT variable pins to one value is that value, but the tensor still carries it
+/// symbolically, and a kernel placeholder needs a static shape.
+pub fn statically(t: &Tensor, dims: &[usize]) -> Result<Tensor> {
+    if t.shape().is_ok_and(|s| s.iter().all(|d| d.as_const().is_some())) {
+        return Ok(t.clone());
+    }
+    t.try_reshape(dims.iter().map(|&d| d as isize).collect::<Vec<_>>()).context(OperandSnafu)
+}
+
 /// A dimension's compile-time value: its own when it is a constant, and the
 /// single value a symbolic dim is pinned to when its bounds coincide — a JIT
 /// `batch_var` of `(1, 1)` is the constant `1`, and a kernel that needs a

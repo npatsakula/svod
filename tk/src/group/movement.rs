@@ -640,11 +640,18 @@ impl<'k> Group<'k> {
         // SI-1 off-by-one guard: the wave's RT sub-tile must fit inside the ST.
         let sn = st.shape().len();
         let (st_h, st_w) = (st.shape()[sn - 4] as i64, st.shape()[sn - 3] as i64);
-        assert!(rt_h <= st_h && rt_w <= st_w, "load LOCAL→REG: RT {rt_h}×{rt_w} exceeds ST {st_h}×{st_w}");
+        let (rows, cols) = ((rt_h * rt.base.base.rows as i64), (rt_w * rt.base.base.cols as i64));
+        let (st_rows, st_cols) = (st_h * st.base.base.rows as i64, st_w * st.base.base.cols as i64);
+        assert!(rows <= st_rows && cols <= st_cols, "load LOCAL→REG: RT {rows}×{cols} exceeds ST {st_rows}×{st_cols}");
         let transpose = rt.layout != st.layout;
         if let Some(plan) = self.ldmatrix_plan(&rt, st, transpose) {
             return self.ldmatrix_local_to_reg(rt, st, dst_idxs, idxs, plan);
         }
+        assert_eq!(
+            (st.base.base.rows, st.base.base.cols),
+            (rt.base.base.rows, rt.base.base.cols),
+            "load LOCAL→REG: only the ldmatrix gather reads a fragment out of a wider shared base tile"
+        );
         if let Some(group) = self.lds_vec_plan(&rt, st, transpose) {
             return self.vec_local_to_reg(rt, st, dst_idxs, idxs, group);
         }
@@ -725,36 +732,38 @@ impl<'k> Group<'k> {
     }
 
     /// The `ldmatrix.x4` plan for the LOCAL→REG hop, when it applies: a CUDA
-    /// target, a 16-bit fragment with no cast, the 16×16 / 8-per-lane base, a lane
-    /// map [`LaneMap::ldmatrix_x4`](crate::layout::LaneMap::ldmatrix_x4) covers,
-    /// and a swizzle that keeps 16-byte row chunks contiguous. The CUDA guard is
-    /// load-bearing: gfx12's fragment passes the shape test too, and only its
-    /// strided map having no `ldmatrix` form would otherwise keep it out.
+    /// target, a 16-bit fragment with no cast, the 16×16 / 8-per-lane base, a
+    /// shared base tile as tall as the fragment and a whole number of fragments
+    /// wide, a lane map [`LaneMap::ldmatrix_x4`](crate::layout::LaneMap::ldmatrix_x4)
+    /// covers, and a swizzle that keeps 16-byte row chunks contiguous. The CUDA
+    /// guard is load-bearing: gfx12's fragment passes the shape test too, and only
+    /// its strided map having no `ldmatrix` form would otherwise keep it out.
     fn ldmatrix_plan(&self, rt: &RT<'k>, st: &ST, transpose: bool) -> Option<LdmatrixX4> {
         let base = &rt.base.base;
         (self.ker.caps.cuda().is_some()
             && rt.elem().bytes() == 2
             && st.elem() == rt.elem()
             && (base.rows, base.cols, base.elements_per_thread()) == (16, 16, 8)
-            && st.base.base == *base
+            && st.base.base.rows == base.rows
+            && st.base.base.cols.is_multiple_of(base.cols)
             && st.base.swizzle.keeps_16b_chunks())
         .then(|| rt.base.map.ldmatrix_x4(transpose))
         .flatten()
     }
 
     /// LOCAL→REG fragment gather as one warp-collective `ldmatrix.x4[.trans]` per
-    /// 16×16 fragment: lane `L` supplies the (swizzled) address of row `L % 16`,
-    /// columns `8·(L/16)..+8`, and the four returned 32-bit words are scattered onto
-    /// the fragment's register pairs per the plan (every register index constant,
-    /// so the fragment stays in registers). Replaces the eight scalar `ld.shared.b16`
-    /// per fragment of the generic gather.
+    /// 16×16 fragment: lane `L` supplies the (swizzled) address of one row of the
+    /// `L/8`-th matrix fetched ([`ldmatrix_lane_rc`]), and the four returned 32-bit
+    /// words land on the fragment's register pairs in the order the core reads them
+    /// ([`crate::tiles::RTBaseShape::feed`]; every register index constant, so the
+    /// fragment stays in registers). Replaces the eight scalar `ld.shared.b16` per
+    /// fragment of the generic gather.
     fn ldmatrix_local_to_reg(&self, rt: RT<'k>, st: &ST, dst_idxs: &[Idx], idxs: &[Idx], plan: LdmatrixX4) -> RT<'k> {
         let laneid = self.ker.laneid();
         let n = rt.shape().len();
         let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
-        let row = imod(&laneid, 16);
-        let col = imul(&idiv(&laneid, 16), 8);
-        let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
+        let feed = rt.base.feed;
+        let (row, col) = ldmatrix_lane_rc(&laneid, plan.fetch(feed));
         let pair = rt.elem().vec(2).expect("16-bit element pair");
         let at = |block: Option<&Idx>, frags: i64, i: i64| match block {
             None => Idx::Const(i),
@@ -763,18 +772,15 @@ impl<'k> Group<'k> {
         let mut stores = Vec::with_capacity((rt_h * rt_w * 8) as usize);
         for h in 0..rt_h {
             for w in 0..rt_w {
-                let src_idx = [
-                    at(idxs.first(), rt_h, h),
-                    at(idxs.get(1), rt_w, w),
-                    Idx::Uop(srow.clone()),
-                    Idx::Uop(scol.clone()),
-                ];
+                let (w_blk, col) = frag_in_base(st, &rt, at(idxs.get(1), rt_w, w), &col);
+                let (srow, scol) = st.base.swizzle.swizzle_rc(row.clone(), col, st.base.base.cols, st.elem().base());
+                let src_idx = [at(idxs.first(), rt_h, h), w_blk, Idx::Uop(srow), Idx::Uop(scol)];
                 let words = ldmatrix(&st_index(st, &src_idx), 4, plan.trans, pair.clone());
-                for (p, &m) in plan.words.iter().enumerate() {
+                for (word, &p) in words.iter().zip(&feed) {
                     for e in 0..2 {
                         let mut didx = dst_idxs.to_vec();
                         didx.extend([Idx::Const(h), Idx::Const(w), Idx::Const(2 * p as i64 + e as i64)]);
-                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(words[m].index_axes(vec![e])));
+                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(word.index_axes(vec![e])));
                     }
                 }
             }
@@ -810,25 +816,26 @@ impl<'k> Group<'k> {
         let laneid = self.ker.laneid();
         let n = rt.shape().len();
         let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
-        let lane_row = imod(&laneid, 16);
-        let col = imul(&idiv(&laneid, 16), 8);
+        let feed = rt.base.feed;
+        let (lane_row, col) = ldmatrix_lane_rc(&laneid, plan.fetch(feed));
         let pair = rt.elem().vec(2).expect("16-bit element pair");
         let mut stores = Vec::with_capacity((rt_h * rt_w * 8) as usize);
         for h in 0..rt_h {
             let logical = row(&iadd(&lane_row, &cidx(h * 16)));
             let (frag, within) = (idiv(&logical, 16), imod(&logical, 16));
-            let (srow, scol) = st.base.swizzle.swizzle_rc(within, col.clone(), st.base.base.cols, st.elem().base());
             for w in 0..rt_w {
                 let wblk = match col_blk {
                     None => Idx::Const(w),
                     Some(b) => Idx::Uop(iadd(&imul(&b.to_uop(), rt_w), &cidx(w))),
                 };
-                let src_idx = [Idx::Uop(frag.clone()), wblk, Idx::Uop(srow.clone()), Idx::Uop(scol.clone())];
+                let (wblk, col) = frag_in_base(st, &rt, wblk, &col);
+                let (srow, scol) = st.base.swizzle.swizzle_rc(within.clone(), col, st.base.base.cols, st.elem().base());
+                let src_idx = [Idx::Uop(frag.clone()), wblk, Idx::Uop(srow), Idx::Uop(scol)];
                 let words = ldmatrix(&st_index(st, &src_idx), 4, plan.trans, pair.clone());
-                for (p, &m) in plan.words.iter().enumerate() {
+                for (word, &p) in words.iter().zip(&feed) {
                     for e in 0..2 {
                         let didx = [Idx::Const(h), Idx::Const(w), Idx::Const(2 * p as i64 + e as i64)];
-                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(words[m].index_axes(vec![e])));
+                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(word.index_axes(vec![e])));
                     }
                 }
             }
@@ -958,6 +965,7 @@ impl<'k> Group<'k> {
     }
 
     fn scatter_reg_to_local(&self, st: &ST, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx]) -> Arc<UOp> {
+        assert_eq!(st.base.base.rows, rt.base.base.rows, "store REG→LOCAL: a shared base tile one fragment tall");
         let laneid = self.ker.laneid();
         let ept = rt.base.base.elements_per_thread() as i64;
         let n = rt.shape().len();
@@ -966,7 +974,11 @@ impl<'k> Group<'k> {
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
 
+        // Wave sub-tile fragment offset (SI-1), symmetric with `load_local_to_reg`;
+        // a shared base tile may span several fragments of a row.
         let (row, col) = rt.lane_rc(rt.layout != st.layout, &laneid, &inner);
+        let h_idx = wave_offset(idxs.first(), rt_h, &height);
+        let (w_idx, col) = frag_in_base(st, rt, wave_offset(idxs.get(1), rt_w, &width), &col);
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         let mut sidx: Vec<Idx> = src_idxs.to_vec();
@@ -975,9 +987,6 @@ impl<'k> Group<'k> {
         if rt.elem() != st.elem() {
             load = load.cast(st.elem().clone());
         }
-        // Wave sub-tile fragment offset (SI-1), symmetric with `load_local_to_reg`.
-        let h_idx = wave_offset(idxs.first(), rt_h, &height);
-        let w_idx = wave_offset(idxs.get(1), rt_w, &width);
         let didx = [h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)];
         st_index(st, &didx).store(load).end(smallvec![height, width, inner])
     }
@@ -1012,6 +1021,118 @@ impl<'k> Group<'k> {
         F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
     {
         self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, ix.clipped, None, value)
+    }
+
+    /// Coalesced LOCAL→GLOBAL write-back of `st` into the `st`-sized block
+    /// `ix.block` of `dst` — the second hop of an output staged through shared
+    /// memory, whose first is [`Self::store`]'s RT→ST scatter. Every group thread
+    /// moves whole 16-byte runs of a row, so a warp's store covers whole sectors
+    /// instead of the two-element pieces of a row a fragment's lane holds. `value`
+    /// receives a run's elements (cast to `dst`'s dtype) and the flat global
+    /// offset of its first, and returns what is stored, so an epilogue reading a
+    /// second tensor at the store's own position reads it a run at a time.
+    ///
+    /// # Panics
+    /// Panics unless `st`'s swizzle keeps 16-byte runs contiguous, its runs
+    /// divide evenly over the group, `dst`'s rows are whole runs, and `ix` is
+    /// unmasked: the block lies inside `dst`.
+    pub fn store_local_vec<F>(&self, dst: GL, st: &ST, ix: MoveIdx, value: F) -> GL
+    where
+        F: Fn(Vec<Arc<UOp>>, &Arc<UOp>) -> Vec<Arc<UOp>>,
+    {
+        self.store_local_runs(dst, st, ix, None, |mut runs, off| vec![value(runs.remove(0), off)])
+    }
+
+    /// [`Self::store_local_vec`] a pair of runs at a time: a thread takes a run
+    /// in the first half of each `2·half`-column group of a row together with
+    /// the run `half` columns along it, and `value` receives both (and the flat
+    /// global offset of the first) and returns both. Two columns that different
+    /// waves computed — a rotary embedding's halves of a head — meet in one
+    /// thread, each read once.
+    ///
+    /// # Panics
+    /// As [`Self::store_local_vec`], and unless `half` is a whole number of runs
+    /// and a row a whole number of `2·half` groups whose pairs divide evenly over
+    /// the group.
+    pub fn store_local_vec_paired<F>(&self, dst: GL, st: &ST, ix: MoveIdx, half: usize, value: F) -> GL
+    where
+        F: Fn([Vec<Arc<UOp>>; 2], &Arc<UOp>) -> [Vec<Arc<UOp>>; 2],
+    {
+        self.store_local_runs(dst, st, ix, Some(half), |runs, off| {
+            let pair: [Vec<Arc<UOp>>; 2] = runs.try_into().expect("a pair of runs");
+            value(pair, off).into()
+        })
+    }
+
+    /// The body of both staged stores: each thread moves a unit of runs of one
+    /// row per pass — one run, or a run and its partner `half` columns along.
+    fn store_local_runs(
+        &self,
+        dst: GL,
+        st: &ST,
+        ix: MoveIdx,
+        half: Option<usize>,
+        value: impl Fn(Vec<Vec<Arc<UOp>>>, &Arc<UOp>) -> Vec<Vec<Arc<UOp>>>,
+    ) -> GL {
+        let run = lds_group(st);
+        let row_stride: i64 = dst.shape()[ix.axis + 1..].iter().product::<usize>() as i64;
+        let runs_per_row = (st.cols / run) as i64;
+        let half_runs = half.map(|half| {
+            assert!(
+                half.is_multiple_of(run) && st.cols.is_multiple_of(2 * half),
+                "store LOCAL→GLOBAL: a {half}-column half is not whole runs of a {}-column row",
+                st.cols
+            );
+            (half / run) as i64
+        });
+        let units_per_row = if half_runs.is_some() { runs_per_row / 2 } else { runs_per_row };
+        let threads = self.group_threads() as i64;
+        assert!(
+            st.base.swizzle.keeps_16b_chunks()
+                && (st.rows as i64 * units_per_row) % threads == 0
+                && row_stride % run as i64 == 0
+                && !ix.masked,
+            "store LOCAL→GLOBAL: 16-byte runs over {threads} threads into whole rows of an unmasked block"
+        );
+        let (base_rows, base_cols) = (st.base.base.rows as i64, st.base.base.cols as i64);
+        let base = Self::tile_base(st, &dst, &ix.block, ix.axis);
+        // The run at `(row, chunk)` of `st`, `chunk` counted in runs, cast to `dst`'s dtype.
+        let read = |row: &Arc<UOp>, chunk: &Arc<UOp>| -> Vec<Arc<UOp>> {
+            let col = imul(chunk, run as i64);
+            let (srow, scol) = st.base.swizzle.swizzle_chunk(
+                imod(row, base_rows),
+                &imod(chunk, base_cols / run as i64),
+                st.base.base.cols,
+                st.elem().base(),
+            );
+            let lds = st_swizzled_offset(st, idiv(row, base_rows), idiv(&col, base_cols), srow, scol);
+            let loaded = load_off_vec(st.uop(), &lds, run);
+            (0..run)
+                .map(|j| {
+                    let v = vec_elem(&loaded, j, run);
+                    if st.elem() == dst.elem() { v } else { v.cast(dst.elem().clone()) }
+                })
+                .collect()
+        };
+        let stores = (0..st.rows as i64 * units_per_row / threads)
+            .flat_map(|pass| {
+                let at = iadd(&cidx(pass * threads), &self.laneid());
+                let (row, unit) = (idiv(&at, units_per_row), imod(&at, units_per_row));
+                let chunks = match half_runs {
+                    None => vec![unit],
+                    Some(h) => {
+                        let first = iadd(&imul(&idiv(&unit, h), 2 * h), &imod(&unit, h));
+                        let second = iadd(&first, &cidx(h));
+                        vec![first, second]
+                    }
+                };
+                let offs: Vec<_> =
+                    chunks.iter().map(|c| iadd(&base, &iadd(&imul(&row, row_stride), &imul(c, run as i64)))).collect();
+                let vals = value(chunks.iter().map(|c| read(&row, c)).collect(), &offs[0]);
+                offs.into_iter().zip(vals).map(|(off, v)| store_off_vec(dst.uop(), &off, v)).collect::<Vec<_>>()
+            })
+            .collect();
+        self.finalize_gl(dst, super::group_or_single(stores))
     }
 
     /// [`Self::store_global_with`] for a tile whose M rows are **scattered**:
@@ -1105,6 +1226,34 @@ impl<'k> Group<'k> {
             target.store(load)
         });
         self.finalize_gl(dst, ended)
+    }
+}
+
+/// Fragment column block `w` of `rt` inside `st`, whose base tile may span several
+/// fragments of a row: the shared base-tile column block holding it, and the lane's
+/// fragment column `col` moved to the fragment's place within that base tile.
+fn frag_in_base(st: &ST, rt: &RT<'_>, w: Idx, col: &Arc<UOp>) -> (Idx, Arc<UOp>) {
+    let (cols, span) = (rt.base.base.cols as i64, (st.base.base.cols / rt.base.base.cols) as i64);
+    match w {
+        _ if span == 1 => (w, col.clone()),
+        Idx::Const(w) if w % span == 0 => (Idx::Const(w / span), col.clone()),
+        Idx::Const(w) => (Idx::Const(w / span), iadd(&cidx(w % span * cols), col)),
+        Idx::Uop(w) => (Idx::Uop(idiv(&w, span)), iadd(&imul(&imod(&w, span), cols), col)),
+    }
+}
+
+/// Lane `L`'s `(row, col)` in a 16×16 fragment for an `ldmatrix.x4` that fetches
+/// the fragment's matrices in `fetch` order ([`LdmatrixX4::fetch`]): row `L % 8`
+/// of matrix `fetch[L/8]`, whose row and column blocks are its number's low and
+/// high bits.
+fn ldmatrix_lane_rc(laneid: &Arc<UOp>, fetch: [usize; 4]) -> (Arc<UOp>, Arc<UOp>) {
+    match fetch {
+        // TL, BL, TR, BR: row `L % 16`, column block `L / 16`.
+        [0, 1, 2, 3] => (imod(laneid, 16), imul(&idiv(laneid, 16), 8)),
+        // TL, TR, BL, BR: row block `L / 16`, column block `(L / 8) % 2`.
+        [0, 2, 1, 3] => (iadd(&imod(laneid, 8), &imul(&idiv(laneid, 16), 8)), imul(&imod(&idiv(laneid, 8), 2), 8)),
+        // A feed and a plan each keep TL and BR in place, so their composition does.
+        other => unreachable!("ldmatrix fetch order {other:?} moves a diagonal matrix"),
     }
 }
 

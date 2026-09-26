@@ -12,8 +12,8 @@ use test_case::test_case;
 
 use crate::kernels::gemm::{
     CUDA_TILES, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmCfg, GemmPolicy, NT_64X64, NT_128X64, NT_128X128_RDNA4,
-    NT_SPLIT_K, RDNA_TILES, RDNA4_TILES, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, select_cfg, silu,
-    swiglu_pair_width,
+    NT_SPLIT_K, RDNA_TILES, RDNA4_TILES, build_gemm, build_gemm_nt, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue,
+    select_cfg, silu, swiglu_pair_width,
 };
 
 use super::device_supported;
@@ -22,7 +22,7 @@ use super::device_supported;
 /// when one of these tiles it, so the predicate tests are written against the
 /// same list the policy searches rather than a restatement of its divisibility
 /// rules.
-const TABLE: [GemmCfg; 4] = CUDA_TILES;
+const TABLE: [GemmCfg; 5] = CUDA_TILES;
 
 /// The accumulator fragment width of every arch the GEMM is built for
 /// (`mma.sync`'s and gfx11 WMMA's 16×16).
@@ -191,7 +191,7 @@ fn swiglu_pair_width_is_the_widest_tiles(arch: GpuArch, table: &[GemmCfg]) {
     assert_eq!(pair, table[0].reg_n() / 2);
     for cfg in table {
         assert_eq!(
-            cfg.carries(Epilogue::SwiGlu { pair }, Some(FRAG_COLS)),
+            cfg.carries(Epilogue::SwiGlu { pair }, &crate::ArchCaps::for_arch(arch)),
             cfg.reg_n() / 2 == pair,
             "{cfg:?} must read the table's gate/up block width or refuse the epilogue"
         );
@@ -216,6 +216,42 @@ fn epilogue_out_cols_and_kind() {
     assert_eq!(Epilogue::<&Tensor>::SwiGlu { pair: 16 }.out_cols(6144), 3072);
     assert_eq!(Epilogue::Add(&t).kind(), Epilogue::Add(()));
     assert_eq!(Epilogue::<&Tensor>::SwiGlu { pair: 16 }.kind(), Epilogue::SwiGlu { pair: 16 });
+    let rope = Epilogue::Rope { cos: &t, sin: &t, seq: 512, head_dim: 64, heads: 24 };
+    assert_eq!(rope.out_cols(2304), 2304);
+    assert_eq!(rope.kind(), ROPE_64);
+    assert_ne!(rope.code(), Epilogue::<()>::Plain.code(), "the tuning key tells the two apart");
+}
+
+/// The staged store is on for every CUDA tile, where it was measured, and off
+/// on the RDNA tables, where it never was.
+#[test]
+fn the_staged_store_is_on_where_it_was_measured() {
+    assert!(CUDA_TILES.iter().all(|cfg| cfg.stage_out), "{CUDA_TILES:?}");
+    assert!(RDNA_TILES.iter().chain(&RDNA4_TILES).all(|cfg| !cfg.stage_out));
+}
+
+/// `stage_out` changes the kernel only where the staged store can run: a
+/// single strip too short to hold an output band, and split-K's f32 partials,
+/// build the direct store's kernel either way.
+#[test_case(NT_64X64, true; "the band fits the strips")]
+#[test_case(NT_128X64, true; "two accumulator bands")]
+#[test_case(GemmCfg { stages: 1, block_n: 128, warps_n: 4, ..NT_64X64 }, false; "one strip, shorter than the band")]
+#[test_case(NT_SPLIT_K, false; "split-K partials")]
+fn stage_out_changes_the_kernel_only_where_the_band_fits(cfg: GemmCfg, staged: bool) {
+    let caps = crate::ArchCaps::for_arch(SM86);
+    let (m, k, n) = (256usize, 256usize, 256usize);
+    let out_dt = if cfg.split_k > 1 { DType::Float32 } else { DType::BFloat16 };
+    let fingerprint = |stage_out: bool| {
+        let cfg = GemmCfg { stage_out, ..cfg };
+        let bufs = [(cfg.split_k * m * n, out_dt.clone()), (m * k, DType::BFloat16), (n * k, DType::BFloat16)]
+            .into_iter()
+            .map(|(size, dt)| svod_ir::UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dt))
+            .collect();
+        let ker = crate::Kernel::new("gemm_nt", cfg.grid_dims(m, n), cfg.threads(caps.wave_size), bufs, caps);
+        build_gemm_nt(&ker, (m, k, n), cfg, DType::BFloat16, out_dt.clone(), Epilogue::Plain);
+        crate::kernel_fingerprint(&ker.finish(cfg.acc_m)).digest
+    };
+    assert_eq!(fingerprint(true) != fingerprint(false), staged, "{cfg:?}");
 }
 
 /// A tile carries an epilogue only when its store can: split-K writes f32
@@ -231,8 +267,33 @@ fn epilogue_out_cols_and_kind() {
 #[test_case(NT_128X64, Epilogue::SwiGlu { pair: 32 }, false; "swiglu declines a wider pair")]
 #[test_case(NT_128X64, Epilogue::SwiGlu { pair: 8 }, false; "swiglu declines a narrower pair")]
 #[test_case(NT_SPLIT_K, Epilogue::SwiGlu { pair: 16 }, false; "swiglu declines split-K")]
+#[test_case(NT_128X64, ROPE_64, true; "rope on the default tile")]
+#[test_case(NT_64X64, ROPE_64, true; "rope on the finer tile")]
+#[test_case(CUDA_TILES[2], ROPE_64, true; "rope on the eight-wave tile")]
+#[test_case(CUDA_TILES[4], ROPE_64, true; "rope on the stepped tile")]
+#[test_case(CUDA_TILES[3], ROPE_64, false; "rope declines a block narrower than a head")]
+#[test_case(NT_128X64, Epilogue::Rope { cos: (), sin: (), seq: 512, head_dim: 128, heads: 8 }, false; "rope declines a head wider than the block")]
+#[test_case(NT_128X64, Epilogue::Rope { cos: (), sin: (), seq: 512, head_dim: 40, heads: 8 }, false; "rope declines a half head off the runs")]
+#[test_case(GemmCfg { stage_out: false, ..NT_128X64 }, ROPE_64, false; "rope declines the direct store")]
+#[test_case(GemmCfg { stages: 1, block_n: 128, warps_n: 4, ..NT_64X64 }, ROPE_64, false; "rope declines a band the strips cannot hold")]
+#[test_case(NT_SPLIT_K, ROPE_64, false; "rope declines split-K")]
 fn cfg_carries_epilogue(cfg: GemmCfg, epi: Epilogue<()>, carries: bool) {
-    assert_eq!(cfg.carries(epi, Some(FRAG_COLS)), carries, "{cfg:?} carrying {epi:?}");
+    assert_eq!(cfg.carries(epi, &crate::ArchCaps::for_arch(SM86)), carries, "{cfg:?} carrying {epi:?}");
+}
+
+/// ModernBERT's rotary epilogue: 64-wide heads, the query and key heads of a
+/// 12-head projection.
+const ROPE_64: Epilogue<()> = Epilogue::Rope { cos: (), sin: (), seq: 512, head_dim: 64, heads: 24 };
+
+/// No RDNA tile stages its store, so none carries the rotary epilogue there:
+/// the projection keeps the separate rotation.
+#[test_case(RDNA; "rdna")]
+#[test_case(RDNA4; "rdna4")]
+fn rope_rides_no_rdna_tile(arch: GpuArch) {
+    let caps = crate::ArchCaps::for_arch(arch);
+    for cfg in GemmPolicy::for_arch(arch).tiles {
+        assert!(!cfg.carries(ROPE_64, &caps), "{cfg:?}");
+    }
 }
 
 /// A `pair` the fragment width does not divide would split the gate block inside
@@ -240,8 +301,13 @@ fn cfg_carries_epilogue(cfg: GemmCfg, epi: Epilogue<()>, carries: bool) {
 #[test]
 fn swiglu_declines_a_pair_off_the_fragment_grid() {
     let odd = GemmCfg { block_n: 48, warps_n: 2, ..NT_128X64 }; // reg_n = 24, pair = 12
-    assert!(!odd.carries(Epilogue::SwiGlu { pair: 12 }, Some(FRAG_COLS)));
-    assert!(!NT_128X64.carries(Epilogue::SwiGlu { pair: 16 }, None), "no matrix core, no SwiGLU");
+    assert_eq!(
+        crate::ArchCaps::for_arch(SM86).frag(crate::arch::FragRole::Accumulator).map(|f| f.base.cols),
+        Some(FRAG_COLS)
+    );
+    assert!(!odd.carries(Epilogue::SwiGlu { pair: 12 }, &crate::ArchCaps::for_arch(SM86)));
+    let sm75 = crate::ArchCaps::for_arch(GpuArch::Cuda(svod_dtype::CudaArch::from_compute_capability(7, 5)));
+    assert!(!NT_128X64.carries(Epilogue::SwiGlu { pair: 16 }, &sm75), "no matrix core, no SwiGLU");
 }
 
 // ── Hardware-gated correctness (CUDA sm_80+, RDNA) ───────────────────────────
@@ -342,6 +408,91 @@ fn every_table_tile_matches_linear_gpu(index: usize) {
     assert!(err < BF16_REL_TOL, "tile {index}: relative error {err} exceeds the bf16 tolerance {BF16_REL_TOL}");
 }
 
+/// Both `cp.async` loops — whole strips and stepped — at every strip depth the
+/// stepped one runs through (one, two and four 16-deep MMA steps) and every
+/// pipeline depth, down to a K slab exactly one pipeline long (the prologue then
+/// fills every shared half and the tail's prefetches all wrap), on a 64×64 tile
+/// with two accumulators per wave — at most 48 KiB of shared memory in every
+/// case. Each sums every output in the same order as the single-buffered loop
+/// over the same tile, so all three must agree bit for bit.
+#[test_case(16, 2, 2; "one step, two stages, K of one pipeline")]
+#[test_case(16, 3, 7; "one step, three stages")]
+#[test_case(32, 2, 5; "two steps, two stages")]
+#[test_case(32, 3, 3; "two steps, three stages, K of one pipeline")]
+#[test_case(32, 4, 9; "two steps, four stages")]
+#[test_case(64, 2, 4; "four steps, two stages")]
+#[test_case(64, 3, 3; "four steps, three stages, K of one pipeline")]
+#[ignore]
+fn cp_async_loops_match_single_buffered_gpu(k_step: usize, stages: usize, trips: usize) {
+    if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
+        eprintln!("skip cp_async_loops_match_single_buffered_gpu: no supported device / toolchain");
+        return;
+    }
+    let (m, k, n) = (256usize, k_step * trips, 128usize);
+    let (x, w) = (operand(m, k, DType::BFloat16, 0.31), operand(n, k, DType::BFloat16, 0.17));
+    let arch = crate::target::resolve_supported_arch(&x.device(), GEMM_NT_SUPPORTED_ARCHS).expect("supported");
+    if arch.cuda().is_none() {
+        eprintln!("skip cp_async_loops_match_single_buffered_gpu: {arch:?} has no cp.async");
+        return;
+    }
+    let cfg = GemmCfg { acc_m: 2, k_step, stages, ..NT_64X64 };
+    assert!(cfg.shared_bytes(2) <= SHARED_MAX, "{cfg:?} must fit static shared memory");
+    let run = |cfg: GemmCfg| {
+        let y = gemm_nt_with(&x, &w, move |_, _, _| Some(cfg)).expect("gemm_nt build").expect("the tile applies");
+        to_f32_vec(&y)
+    };
+    let single = run(GemmCfg { stages: 1, ..cfg });
+    let want = to_f32_vec(&x.linear().weight(&w).call().expect("reference linear"));
+    for stepped in [false, true] {
+        let cfg = GemmCfg { stepped, ..cfg };
+        let got = run(cfg);
+        let err = rel_err(&got, &want);
+        println!("{cfg:?}: relative error {err:e}");
+        assert!(err < BF16_REL_TOL, "{cfg:?}: relative error {err} exceeds the bf16 tolerance {BF16_REL_TOL}");
+        assert_eq!(got, single, "{cfg:?} and its single-buffered form sum in the same order");
+    }
+}
+
+/// Every table tile's staged store against its direct store, under each fused
+/// epilogue the linear layers use: the accumulators narrow, pair and add exactly
+/// as they did and only the route to memory changes, so the two agree bit for
+/// bit. SwiGLU runs on the tiles that carry it.
+#[test_case(0; "tile 0")]
+#[test_case(1; "tile 1")]
+#[test_case(2; "tile 2")]
+#[test_case(3; "tile 3")]
+#[test_case(4; "tile 4")]
+#[ignore]
+fn staged_store_matches_the_direct_store_gpu(index: usize) {
+    if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
+        eprintln!("skip staged_store_matches_the_direct_store_gpu: no supported device / toolchain");
+        return;
+    }
+    let (m, k, n) = (512usize, 192usize, 384usize);
+    let (x, w) = (operand(m, k, DType::BFloat16, 0.31), operand(n, k, DType::BFloat16, 0.17));
+    let arch = crate::target::resolve_supported_arch(&x.device(), GEMM_NT_SUPPORTED_ARCHS).expect("supported");
+    let Some(&cfg) = GemmPolicy::for_arch(arch).tiles.get(index).filter(|cfg| cfg.stage_out) else {
+        eprintln!("skip staged_store_matches_the_direct_store_gpu: tile {index} is absent or stores directly");
+        return;
+    };
+    let caps = crate::ArchCaps::for_arch(arch);
+    let pair = swiglu_pair_width(&x.device()).expect("a common pair width");
+    let (res, paired) = (operand(m, n, DType::BFloat16, 0.53), pair_rows(&w, pair));
+    for epi in [Epilogue::Plain, Epilogue::Add(&res), Epilogue::SwiGlu { pair }] {
+        if !cfg.carries(epi.kind(), &caps) {
+            continue;
+        }
+        let w = if let Epilogue::SwiGlu { .. } = epi { &paired } else { &w };
+        let run = |cfg: GemmCfg| {
+            let y = build_gemm(&x, w, epi, move |_, _, _, _| Some(cfg)).expect("build").expect("the tile applies");
+            to_f32_vec(&y)
+        };
+        let staged = run(cfg);
+        assert!(staged.iter().all(|v| v.is_finite()), "tile {index} {:?}: a non-finite output", epi.kind());
+        assert_eq!(staged, run(GemmCfg { stage_out: false, ..cfg }), "tile {index} {:?}", epi.kind());
+    }
+}
+
 /// A `[B, L, K]` activation is `B·L` rows: the output is `[B, L, N]` and equals
 /// the rank-2 kernel on the flattened rows.
 #[test]
@@ -423,6 +574,114 @@ fn gemm_nt_add_matches_graph_gpu(m: usize, k: usize, n: usize) {
     let err = rel_err(&to_f32_vec(&y), &to_f32_vec(&want));
     println!("gemm_nt+add {m}x{k}x{n}: relative error {err:e}");
     assert!(err < BF16_REL_TOL, "{m}x{k}x{n}: relative error {err} exceeds {BF16_REL_TOL}");
+}
+
+/// ModernBERT's `[seq, head_dim/2]` bf16 rotary tables, as the epilogue reads them.
+fn rope_tables(seq: usize, head_dim: usize) -> (Tensor, Tensor) {
+    let (cos, sin) = Tensor::rope_table(10_000.0, seq, head_dim, DType::BFloat16).expect("rope table");
+    let flat = |t: Tensor| {
+        let t = t.try_reshape([seq as isize, head_dim as isize / 2]).expect("reshape the table").contiguous();
+        t.realize().expect("realize the table");
+        t
+    };
+    (flat(cos), flat(sin))
+}
+
+/// The graph's rotation of a plain `[b·seq, n]` projection: its first `heads`
+/// heads through [`Tensor::apply_rotary_emb`] as `[b, seq, heads, head_dim]`
+/// (the tables broadcast per position), the columns after them as they are.
+fn graph_rope(y: &Tensor, (cos, sin): (&Tensor, &Tensor), b: usize, head_dim: usize, heads: usize) -> Tensor {
+    let (seq, n, rot) = (cos.dims().expect("dims")[0], y.dims().expect("dims")[1], heads * head_dim);
+    let dim = |v: &[usize]| v.iter().map(|&d| d as isize).collect::<Vec<_>>();
+    let table = |t: &Tensor| t.try_reshape(dim(&[1, seq, 1, head_dim / 2])).expect("broadcast the table");
+    let rotated = y
+        .narrow(-1, 0usize, rot)
+        .and_then(|t| t.try_reshape(dim(&[b, seq, heads, head_dim])))
+        .and_then(|t| t.apply_rotary_emb(&table(cos), &table(sin), false))
+        .and_then(|t| t.try_reshape(dim(&[b * seq, rot])))
+        .expect("the graph's rotation");
+    if rot == n {
+        return rotated;
+    }
+    let values = y.narrow(-1, rot, n - rot).expect("the columns past the heads");
+    Tensor::cat(&[&rotated, &values], -1).expect("rotated heads, then the rest")
+}
+
+/// `SVOD_DEVICE=CUDA:0 cargo test --release -p svod-tk --lib gemm::gemm_nt_rope -- --ignored --nocapture`.
+///
+/// The rotary epilogue against the graph's rotation of the same tile's plain
+/// output, bit for bit, on every table tile that carries it: both round the
+/// same accumulators once and then rotate in bf16 op for op. ModernBERT's QKV
+/// projection, a batch of two whose positions restart at the second sequence
+/// and whose projection carries two heads of values past the rotated ones, and
+/// a projection rotated whole. Where no tile stages its store, the epilogue
+/// declines instead.
+#[test_case(1, 512, 768, 2304, 24; "modernbert qkv")]
+#[test_case(2, 256, 192, 384, 4; "a batch of two with values past the rotated heads")]
+#[test_case(1, 128, 256, 256, 4; "every head rotated")]
+#[ignore]
+fn gemm_nt_rope_matches_the_graph_rotation_gpu(b: usize, seq: usize, k: usize, n: usize, heads: usize) {
+    if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
+        eprintln!("skip gemm_nt_rope_matches_the_graph_rotation_gpu: no supported device / toolchain");
+        return;
+    }
+    let (m, head_dim) = (b * seq, 64);
+    let (x, w) = (operand(m, k, DType::BFloat16, 0.31), operand(n, k, DType::BFloat16, 0.17));
+    let arch = crate::target::resolve_supported_arch(&x.device(), GEMM_NT_SUPPORTED_ARCHS).expect("supported");
+    let caps = crate::ArchCaps::for_arch(arch);
+    let (cos, sin) = rope_tables(seq, head_dim);
+    let epi = Epilogue::Rope { cos: &cos, sin: &sin, seq, head_dim, heads };
+    let bits = |t: &Tensor| to_f32_vec(t).into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    let mut carried = 0;
+    for &cfg in
+        GemmPolicy::for_arch(arch).tiles.iter().filter(|cfg| cfg.tiles(m, k, n) && cfg.carries(epi.kind(), &caps))
+    {
+        let run = |epi| build_gemm(&x, &w, epi, move |_, _, _, _| Some(cfg)).expect("build").expect("the tile applies");
+        let got = bits(&run(epi));
+        assert!(got.iter().all(|v| f32::from_bits(*v).is_finite()), "{cfg:?}: a non-finite output");
+        let want = bits(&graph_rope(&run(Epilogue::Plain), (&cos, &sin), b, head_dim, heads));
+        let off: Vec<usize> = (0..got.len()).filter(|&i| got[i] != want[i]).collect();
+        let at = |i: usize| (i / n, i % n, f32::from_bits(got[i]), f32::from_bits(want[i]));
+        assert!(
+            off.is_empty(),
+            "{cfg:?}: {} of {} outputs differ from the graph's rotation, first (row, col, got, want) {:?}, last {:?}",
+            off.len(),
+            got.len(),
+            off.first().map(|&i| at(i)),
+            off.last().map(|&i| at(i))
+        );
+        carried += 1;
+    }
+    let tuned = gemm_nt_with_epilogue(&x, &w, epi).expect("build");
+    assert_eq!(tuned.is_some(), carried > 0, "the entry runs exactly where some tile carries the epilogue");
+    println!("rope {b}x{seq}x{k}x{n}: {carried} tiles bit-identical to the graph");
+}
+
+/// Malformed rotary operands are the caller's bug, raised as `Err`: tables not
+/// `[seq, head_dim/2]`, tables in another dtype, a `seq` that does not divide
+/// the rows, and rotated heads past the projection's columns.
+#[test]
+#[ignore]
+fn gemm_nt_rope_rejects_malformed_operands_gpu() {
+    if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
+        eprintln!("skip gemm_nt_rope_rejects_malformed_operands_gpu: no supported device / toolchain");
+        return;
+    }
+    let (m, k, n) = (256usize, 128usize, 384usize);
+    let (x, w) = (operand(m, k, DType::BFloat16, 0.31), operand(n, k, DType::BFloat16, 0.17));
+    let (cos, sin) = rope_tables(128, 64);
+    let rope = |cos, sin, seq, heads| Epilogue::Rope { cos, sin, seq, head_dim: 64, heads };
+    let wide = rope_tables(128, 128).0;
+    let e = gemm_nt_with_epilogue(&x, &w, rope(&wide, &sin, 128, 4)).expect_err("a table off [seq, head_dim/2]");
+    assert!(matches!(e, crate::launch::Error::OperandShape { operand: "cos", .. }), "got {e:?}");
+    let f16 = cos.cast(DType::Float16);
+    let e = gemm_nt_with_epilogue(&x, &w, rope(&cos, &f16, 128, 4)).expect_err("a table in another dtype");
+    assert!(matches!(e, crate::launch::Error::Dtype { .. }), "got {e:?}");
+    let (cos96, sin96) = rope_tables(96, 64);
+    let e = gemm_nt_with_epilogue(&x, &w, rope(&cos96, &sin96, 96, 4)).expect_err("a seq that does not divide M");
+    assert!(matches!(e, crate::launch::Error::DimMultiple { dim: "M", .. }), "got {e:?}");
+    let e = gemm_nt_with_epilogue(&x, &w, rope(&cos, &sin, 128, 7)).expect_err("heads past N");
+    assert!(matches!(e, crate::launch::Error::OperandShape { operand: "w", .. }), "got {e:?}");
 }
 
 /// The `[2I, K]` gate/up weight rearranged into the alternating `pair`-row blocks

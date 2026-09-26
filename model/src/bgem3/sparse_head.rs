@@ -48,7 +48,7 @@ impl SparseHead {
 
     /// Build from a preloaded state dict, casting to `dtype`.
     pub fn from_state_dict(sd: &StateDict, prefix: &str, vocab_size: usize, dtype: DType) -> Result<Self> {
-        let sd = state::cast_all(sd, dtype.clone());
+        let sd = state::cast_all(sd, dtype.clone())?;
         let mut head = Self::empty(0, vocab_size, dtype);
         head.load_state_dict(&sd, prefix)?;
         Ok(head)
