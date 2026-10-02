@@ -3,6 +3,7 @@ use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
 
 use super::conv::YoloConv;
+use crate::state::{scoped, scoped_index};
 use crate::yolo::error::Result;
 
 /// Multi-head attention with a depthwise-conv positional encoding.
@@ -50,7 +51,7 @@ impl Attention {
 
         // QKV 1×1 conv, then flatten spatial and separate heads:
         // [B, C, H, W] → [B, nh*(2kd+hd), H, W] → [B, nh, 2kd+hd, H*W]
-        let qkv = self.qkv.forward(x)?;
+        let qkv = scoped("qkv", || self.qkv.forward(x))?;
         let qkv = qkv.try_reshape([b.clone(), SInt::from(nh), SInt::from(kd * 2 + hd), SInt::from(hw)])?;
 
         // q [B,nh,kd,N], k [B,nh,kd,N], v [B,nh,hd,N]
@@ -65,9 +66,11 @@ impl Attention {
         let out = spatial(&v.matmul(&attn.try_transpose(-2, -1)?)?)?;
 
         // Positional encoding: depthwise conv on v reshaped to spatial.
-        let pe = self.pe.forward(&spatial(v)?)?;
+        let v = spatial(v)?;
+        let pe = scoped("pe", || self.pe.forward(&v))?;
 
-        self.proj.forward(&out.try_add(&pe)?)
+        let out = out.try_add(&pe)?;
+        scoped("proj", || self.proj.forward(&out))
     }
 }
 
@@ -93,8 +96,9 @@ impl PSABlock {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = x.try_add(&self.attn.forward(x)?)?;
-        let ffn_out = self.ffn1.forward(&self.ffn0.forward(&x)?)?;
+        let x = x.try_add(&scoped("attn", || self.attn.forward(x))?)?;
+        let h = scoped("ffn.0", || self.ffn0.forward(&x))?;
+        let ffn_out = scoped("ffn.1", || self.ffn1.forward(&h))?;
         Ok(x.try_add(&ffn_out)?)
     }
 }
@@ -125,10 +129,11 @@ impl C2PSA {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = self.cv1.forward(x)?;
+        let y = scoped("cv1", || self.cv1.forward(x))?;
         let a = y.narrow(1, 0usize, self.c_hidden)?;
         let b = y.narrow(1, self.c_hidden, self.c_hidden)?;
-        let b = self.m.iter().try_fold(b, |acc, blk| blk.forward(&acc))?;
-        self.cv2.forward(&Tensor::cat(&[&a, &b], 1)?)
+        let b = self.m.iter().enumerate().try_fold(b, |acc, (i, blk)| scoped_index("m", i, || blk.forward(&acc)))?;
+        let cat = Tensor::cat(&[&a, &b], 1)?;
+        scoped("cv2", || self.cv2.forward(&cat))
     }
 }

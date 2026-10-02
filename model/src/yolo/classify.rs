@@ -38,6 +38,7 @@ impl ClassifyHead {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = &super::head::in_head_dtype(x);
         let b = x.shape()?[0].clone();
         let x = self.conv.forward(x)?;
         // GAP: mean over H,W (axes 2,3)
@@ -66,11 +67,14 @@ impl Yolo26Classify {
     pub fn with_zero_weights(config: YoloConfig) -> Self {
         let scale = config.scale;
         let [_, _, _, _, c4] = super::backbone::scaled_channels(scale);
-        Self {
+        let mut model = Self {
             config: config.clone(),
             backbone: YoloBackboneCls::empty(scale),
             head: ClassifyHead::empty(c4, config.nc),
-        }
+        };
+        loader::cast_placeholders(&mut model, &config.compute_dtype)
+            .expect("a freshly built model round-trips its own state dict");
+        model
     }
 
     pub fn from_hub(model_id: &str, config: YoloConfig) -> Result<Self> {
@@ -88,13 +92,15 @@ impl Yolo26Classify {
     }
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
+        let sd = loader::load_weights(sd, &config.compute_dtype)?;
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "")?;
+        model.load_state_dict(&sd, "")?;
         Ok(model)
     }
 
     /// Run the full network. Returns `[B, nc]` softmax probabilities.
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let images = &self.config.cast_input(images);
         let feat = self.backbone.forward(images)?;
         self.head.forward(&feat)
     }

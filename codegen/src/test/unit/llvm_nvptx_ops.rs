@@ -166,23 +166,24 @@ fn nvptx_direct_global_axis_reads_the_block_index() {
     assert!(!result.code.contains("sreg.tid"), "{}", result.code);
 }
 
+/// The barrier is `bar.sync` and nothing else. It used to carry a
+/// `fence syncscope("block")` on either side, which ptxas renders as a
+/// `MEMBAR.ALL.CTA` behind four predicated-off `LDS RZ, [RZ]` — eleven
+/// instructions for a barrier instead of one, and redundant twice over:
+/// `llvm.nvvm.barrier0` declares no memory attributes, so LLVM will not move an
+/// access across it, and `bar.sync` orders every prior access of the
+/// participating threads before it completes.
 #[test]
-fn nvptx_barrier_emits_block_scope_fences_around_bar_sync() {
+fn nvptx_barrier_is_bar_sync_alone() {
     let barrier = UOp::noop().barrier(smallvec::SmallVec::new());
     let result = render_nvptx_linearized(&UOp::sink(vec![barrier]), SM86, "nvptx_barrier");
 
-    let body: Vec<&str> = result.code.lines().map(str::trim).collect();
-    let at = |needle: &str| {
-        body.iter().position(|line| *line == needle).unwrap_or_else(|| panic!("missing {needle}:\n{}", result.code))
-    };
-    let release = at("fence syncscope(\"block\") release");
-    let barrier = at("tail call void @llvm.nvvm.barrier0()");
-    let acquire = at("fence syncscope(\"block\") acquire");
-    assert!(release < barrier && barrier < acquire, "{}", result.code);
+    assert!(result.code.contains("tail call void @llvm.nvvm.barrier0()"), "{}", result.code);
     assert!(result.code.contains("declare void @llvm.nvvm.barrier0()"), "{}", result.code);
-    assert!(!result.code.contains("workgroup"), "NVPTX rejects syncscope(\"workgroup\"):\n{}", result.code);
+    assert!(!result.code.contains("fence "), "the barrier needs no fence:\n{}", result.code);
     if let Some(ptx) = assert_ptx_compiles(&result.code, SM86) {
         assert!(ptx.contains("bar.sync"), "{ptx}");
+        assert!(!ptx.contains("membar"), "a fence-free barrier emits no membar:\n{ptx}");
     }
 }
 

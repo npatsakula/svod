@@ -307,6 +307,12 @@ impl ScalarDType {
         matches!(self, Self::FP8E4M3 | Self::FP8E4M3FNUZ | Self::FP8E5M2 | Self::FP8E5M2FNUZ)
     }
 
+    /// A float with fewer mantissa bits than fp32, so every arithmetic step taken
+    /// in it rounds away bits fp32 would have kept.
+    pub const fn is_narrow_float(&self) -> bool {
+        self.is_fp8() || matches!(self, Self::Float16 | Self::BFloat16)
+    }
+
     pub const fn is_fp8_fnuz(&self) -> bool {
         matches!(self, Self::FP8E4M3FNUZ | Self::FP8E5M2FNUZ)
     }
@@ -648,6 +654,21 @@ impl DType {
         self.base().is_fp8()
     }
 
+    pub fn is_narrow_float(&self) -> bool {
+        matches!(self, Self::Scalar(s) | Self::Vector { scalar: s, .. } if s.is_narrow_float())
+    }
+
+    /// The width a pointwise chain over this dtype should be *evaluated* in —
+    /// PyTorch's `opmath_type`.
+    ///
+    /// A narrow float widens to fp32 so a multi-step chain rounds once, where it
+    /// leaves, rather than once per step; every other dtype, integers included,
+    /// computes in itself. The vector count is preserved, so a widened chain keeps
+    /// whatever lane structure it had.
+    pub fn math_dtype(&self) -> Self {
+        if self.is_narrow_float() { self.with_base(ScalarDType::Float32) } else { self.clone() }
+    }
+
     pub fn is_weak(&self) -> bool {
         self.base().is_weak()
     }
@@ -823,3 +844,7 @@ impl HasDType for u64 {
 impl HasDType for bool {
     const DTYPE: DType = DType::Bool;
 }
+
+#[cfg(test)]
+#[path = "test/unit/math_dtype.rs"]
+mod tests;

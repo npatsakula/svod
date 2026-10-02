@@ -122,6 +122,73 @@ fn a_ne_gated_body_collapses_to_the_indexed_value() {
     assert_const_float(&folded, 2.5);
 }
 
+/// The compared side is hardly ever the bare range: a `gather`'s arange arrives
+/// wrapped in whatever its own collapse left behind. Solving `idx == r + k` for
+/// `r` — and taking the step the solved index names, not the one the comparison
+/// spells — is what lets a real gather collapse at all.
+#[test_case(5, 8, 3.0 ; "index above the offset")]
+#[test_case(2, 2, 0.0 ; "index at the offset picks the first step")]
+#[test_case(1, 9, 8.0 ; "index at the last step")]
+fn an_offset_range_is_solved_for(offset: i64, index: i64, expect: f32) {
+    let range = reduce_range(END, 0);
+    let idx = UOp::define_var("idx".to_string(), index, index);
+    let shifted = range.try_add(&UOp::index_const(offset)).expect("r + k");
+    let step = range.cast(DType::Float32);
+    let body = UOp::try_where(idx.try_cmpeq(&shifted).expect("cmpeq"), step, zero()).expect("gate");
+    let folded = reduce_load_collapse(&body, &[range]).expect("an offset range must still collapse");
+    assert_const_float(&folded, expect);
+}
+
+/// `gather` compares in the index dtype, so the range reaches the comparison
+/// under a cast. Peeling it is only sound while the cast keeps the range's
+/// values apart, which is what makes the narrowing one here safe: the extent
+/// fits the destination many times over.
+#[test]
+fn a_cast_between_the_range_and_the_comparison_is_peeled() {
+    let range = reduce_range(END, 0);
+    let idx = UOp::define_var("idx".to_string(), 7, 7);
+    let widened = range.cast(DType::Int64).cast(DType::Int32);
+    let body =
+        UOp::try_where(idx.cast(DType::Int32).try_cmpeq(&widened).expect("cmpeq"), range.cast(DType::Float32), zero())
+            .expect("gate");
+    let folded = reduce_load_collapse(&body, &[range]).expect("a cast chain must not block the collapse");
+    assert_const_float(&folded, 7.0);
+}
+
+/// Orientation is decided by which side carries the range, not by which operand
+/// the comparison happens to store first.
+#[test]
+fn the_range_may_be_either_operand() {
+    let range = reduce_range(END, 0);
+    let idx = UOp::define_var("idx".to_string(), 6, 6);
+    let body = UOp::try_where(range.try_cmpeq(&idx).expect("cmpeq"), range.cast(DType::Float32), zero()).expect("gate");
+    let folded = reduce_load_collapse(&body, &[range]).expect("either orientation must collapse");
+    assert_const_float(&folded, 6.0);
+}
+
+/// Only additive wrapping is inverted here. `idx == r * 2` still names at most
+/// one step, but reading it off needs a divisibility test the collapse does not
+/// emit, so the reduce stays.
+#[test]
+fn a_scaled_range_keeps_its_reduce() {
+    let range = reduce_range(END, 0);
+    let idx = UOp::define_var("idx".to_string(), 6, 6);
+    let scaled = range.try_mul(&UOp::index_const(2)).expect("r * 2");
+    let body = UOp::try_where(idx.try_cmpeq(&scaled).expect("cmpeq"), one(), zero()).expect("gate");
+    assert!(reduce_load_collapse(&body, &[range]).is_none(), "a scaled range has no additive inverse");
+}
+
+/// An index that is itself a function of the range names no single step, so the
+/// gate is a bound on the reduction rather than a pick out of it.
+#[test]
+fn an_index_that_reaches_the_range_does_not_collapse() {
+    let range = reduce_range(END, 0);
+    let scaled = range.try_mul(&UOp::index_const(2)).expect("r * 2");
+    let shifted = range.try_add(&UOp::index_const(3)).expect("r + 3");
+    let body = UOp::try_where(shifted.try_cmpeq(&scaled).expect("cmpeq"), one(), zero()).expect("gate");
+    assert!(reduce_load_collapse(&body, &[range]).is_none(), "both sides carry the range");
+}
+
 /// The gate may depend on a scalar PARAM: `sum(where(p == 1 && r < 5, 2, 0))`
 /// factors the parameter out of the collapsed count. Pinning the exact tree is
 /// what catches a factor that silently disappears.

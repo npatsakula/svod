@@ -8,7 +8,7 @@
 //!
 //! 1. Start with base scheduler
 //! 2. Generate all valid actions (OptOps applications)
-//! 3. Compile and time each candidate
+//! 3. Compile the candidates; time them in batches, each at a lifted clock
 //! 4. Keep top K (beam width) by timing
 //! 5. Repeat until the best time stops improving by `min_progress`, or no candidate remains
 //!
@@ -84,10 +84,13 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
     actions.push(Opt::local(0, 32));
     actions.push(Opt::local(6, 2));
 
-    // TC: tensor cores. 1 default-axis action + 9 axis variants = 10 actions.
-    // Survivors after post-compile dedup are unchanged compared to a wider
-    // brute-force enumeration because `seen_libs` collapses duplicate kernels.
-    const TC_AXIS_CHOICES: usize = 9;
+    // TC: tensor cores. 1 default-axis action + 18 axis variants = 19 actions.
+    // `detect_matmul` lists every (N, M, K) with the operands one way round and
+    // then the other; a conv with two spatial axes and a three-axis reduce has
+    // twelve. Survivors after post-compile dedup are unchanged compared to a
+    // wider brute-force enumeration because `seen_libs` collapses duplicate
+    // kernels, and an out-of-range choice fails in `apply_opt` at no cost.
+    const TC_AXIS_CHOICES: usize = 18;
     const TC_OPT_DEFAULT: usize = 0;
     const TC_OPT_AXIS: usize = 2;
     let use_tc = std::env::var("TC").ok().and_then(|value| value.parse().ok()).unwrap_or(1);
@@ -274,15 +277,27 @@ fn generate_actions(scheduler: &Scheduler, config: &BeamConfig) -> Vec<Scheduler
     out
 }
 
-/// The hand-coded kernel, as a first-wave BEAM candidate.
+/// The hand-coded kernel, timed with the first BEAM wave and held against the
+/// search's answer.
 ///
 /// Greedy width-K expansion prunes a lineage whose single actions each lose,
 /// so a multi-opt heuristic stack (e.g. the matvec GROUP+LOCAL+UPCAST+UNROLL
-/// one) is unreachable from the bare scheduler. Timing it alongside the first
-/// wave makes the search's answer never worse than the heuristic one.
+/// one) is unreachable from the bare scheduler. Timing it makes the search's
+/// answer never worse than the heuristic one. It does not join the beam: a
+/// complete plan outruns every single action in the first wave, its children
+/// fill the second, and the search then ends as soon as nothing beats it, so
+/// at width 4 a 40x40 stride-2 conv stayed on the heuristics' padded 2.0 ms
+/// tile where the same search without the seed reached 1.2 ms. Held aside,
+/// the seed can still win but cannot steer.
 ///
-/// `None` when the heuristics add nothing or land outside the search's limits.
+/// `None` when the heuristics add nothing or land outside the search's limits,
+/// or under `BEAM_SEED=0`, which measures what the seed is worth.
 fn heuristic_seed(scheduler: &Scheduler, config: &BeamConfig) -> Option<Scheduler> {
+    static ENABLED: Lazy<bool> =
+        Lazy::new(|| std::env::var("BEAM_SEED").ok().map(|value| value.parse::<u8>().unwrap_or(1) > 0).unwrap_or(true));
+    if !*ENABLED {
+        return None;
+    }
     let mut seed = scheduler.clone();
     super::heuristics::hand_coded_optimizations(&mut seed, &HeuristicsConfig::from_env());
     (seed.applied_opts != scheduler.applied_opts && validate_limits(&seed, config)).then_some(seed)
@@ -290,10 +305,33 @@ fn heuristic_seed(scheduler: &Scheduler, config: &BeamConfig) -> Option<Schedule
 
 /// Under `BEAM_DEBUG`, report once whether the [`heuristic_seed`] survived
 /// compilation and how its timing compares to the wave's winner.
-fn debug_seed_fate(seed: &mut Option<Vec<Opt>>, timed: &[(Scheduler, Duration)]) {
-    let Some(opts) = seed.take().filter(|_| beam_debug_enabled()) else { return };
+fn debug_seed_fate(seed: Option<&[Opt]>, first_wave: bool, timed: &[(Scheduler, Duration)]) {
+    let Some(opts) = seed.filter(|_| first_wave && beam_debug_enabled()) else { return };
     let timing = timed.iter().find(|(state, _)| state.applied_opts == opts).map(|(_, timing)| *timing);
     eprintln!("[beam] seed {opts:?}: timing={timing:?} wave best={:?}", timed.first().map(|(_, timing)| *timing));
+}
+
+/// The faster of the search's answer and the [`heuristic_seed`], if it was timed.
+fn better(
+    searched: Option<(Scheduler, Duration)>,
+    seed: Option<(Scheduler, Duration)>,
+) -> Option<(Scheduler, Duration)> {
+    match (searched, seed) {
+        (Some(searched), Some(seed)) => Some(if seed.1 < searched.1 { seed } else { searched }),
+        (searched, seed) => searched.or(seed),
+    }
+}
+
+/// Pull the seed's timing out of the first wave, so it competes at the end
+/// rather than in the beam.
+fn hold_seed(
+    timed: &mut Vec<(Scheduler, Duration)>,
+    seed: Option<&[Opt]>,
+    first_wave: bool,
+) -> Option<(Scheduler, Duration)> {
+    let seed = seed.filter(|_| first_wave)?;
+    let at = timed.iter().position(|(state, _)| state.applied_opts == seed)?;
+    Some(timed.remove(at))
 }
 
 /// Validate that a scheduler state is within configured limits.
@@ -509,7 +547,8 @@ where
     // invocation (also charged on cache replay through `OPT_CACHE`).
     let mut beam: Vec<(Scheduler, Duration)> = vec![(scheduler.clone(), Duration::MAX)];
     let mut seed = heuristic_seed(&scheduler, config);
-    let mut seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
+    let seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
+    let mut held_seed = None;
 
     // `seen_libs` and `least_compute_ops` persist across the entire beam
     // search. Identity-keyed dedup carries across iterations, so a kernel
@@ -592,7 +631,13 @@ where
         // 3. SORT: Sort by timing (best first)
         let mut sorted = timed;
         sorted.sort_by_key(|(_, t)| *t);
-        debug_seed_fate(&mut seed_opts, &sorted);
+        debug_seed_fate(seed_opts.as_deref(), iterations == 1, &sorted);
+        if let Some(seed) = hold_seed(&mut sorted, seed_opts.as_deref(), iterations == 1) {
+            held_seed = Some(seed);
+        }
+        if sorted.is_empty() {
+            break;
+        }
 
         // 4. CHECK TERMINATION — exit when the new best is already below
         //    the progress floor (fast-enough kernel) OR when the gain over
@@ -617,7 +662,8 @@ where
         beam = sorted.into_iter().take(config.beam_width).collect();
     }
 
-    let (best_scheduler, best_timing) = beam.into_iter().next().unwrap_or((scheduler, Duration::MAX));
+    let (best_scheduler, best_timing) =
+        better(beam.into_iter().next(), held_seed).unwrap_or((scheduler, Duration::MAX));
 
     Ok(BeamResult {
         scheduler: best_scheduler,
@@ -633,21 +679,83 @@ where
     })
 }
 
-/// Run BEAM with unordered compile completions and serialized immediate timing.
+/// Compiled candidates on their way to the device, timed together: the backend
+/// lifts the clock once per batch and times the members in rounds, so a
+/// candidate is never judged at a clock the others were not. Timed one by one
+/// as their compiles landed, every candidate but the first ran on a clock that
+/// had sagged during the compile gap before it — by a median 1.5x and up to 6x
+/// on gfx1201, the short kernels worst — and the ranking followed the gaps
+/// rather than the kernels.
+struct TimingBatch<C> {
+    capacity: usize,
+    indices: Vec<usize>,
+    artifacts: Vec<C>,
+    /// `(candidate index, timing)` for every member the backend could time.
+    timed: Vec<(usize, Duration)>,
+    elapsed: Duration,
+}
+
+impl<C> TimingBatch<C> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            indices: Vec::new(),
+            artifacts: Vec::new(),
+            timed: Vec::new(),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    /// Queue a compiled candidate, timing the batch once it is full.
+    fn push(
+        &mut self,
+        index: usize,
+        artifact: C,
+        benchmark: &mut impl FnMut(&[C], Option<Duration>) -> Vec<Option<Duration>>,
+        early_stop: Option<Duration>,
+    ) {
+        self.indices.push(index);
+        self.artifacts.push(artifact);
+        if self.artifacts.len() >= self.capacity {
+            self.flush(benchmark, early_stop);
+        }
+    }
+
+    /// Time whatever is queued. `benchmark` answers one timing per member,
+    /// `None` for one it could not run.
+    fn flush(
+        &mut self,
+        benchmark: &mut impl FnMut(&[C], Option<Duration>) -> Vec<Option<Duration>>,
+        early_stop: Option<Duration>,
+    ) {
+        if self.artifacts.is_empty() {
+            return;
+        }
+        let started = Instant::now();
+        let timings = benchmark(&self.artifacts, early_stop);
+        debug_assert_eq!(timings.len(), self.artifacts.len(), "one timing per batch member");
+        self.timed.extend(self.indices.drain(..).zip(timings).filter_map(|(index, timing)| Some((index, timing?))));
+        self.artifacts.clear();
+        self.elapsed += started.elapsed();
+    }
+}
+
+/// One BEAM over compiles the backend finishes in any order.
 ///
 /// `compile_wave` mirrors Tinygrad's `imap_unordered`: it emits one completed
-/// compile at a time with the original candidate index. The callback benchmarks
-/// that artifact before the next completion is accepted, so no compiled wave is
-/// retained in the parent.
-pub fn beam_search_staged<C, FC, FT>(
+/// compile at a time with the original candidate index, and its error ends the
+/// search. Completions are deduped by binary and queued into a [`TimingBatch`]
+/// of `config.timing_batch`; `benchmark` times each full batch and the wave's
+/// remainder, answering one timing per member.
+fn staged_search<C, FC, FT>(
     scheduler: Scheduler,
     config: &BeamConfig,
     mut compile_wave: FC,
-    benchmark: FT,
+    mut benchmark: FT,
 ) -> Result<BeamResult, OptError>
 where
-    FC: FnMut(&[Scheduler], &mut dyn FnMut(usize, CompiledCandidate<C>)),
-    FT: Fn(&C, Option<Duration>) -> Option<Duration>,
+    FC: FnMut(&[Scheduler], &mut dyn FnMut(usize, CompiledCandidate<C>)) -> Result<(), OptError>,
+    FT: FnMut(&[C], Option<Duration>) -> Vec<Option<Duration>>,
 {
     let mut result = BeamResult {
         scheduler: scheduler.clone(),
@@ -663,12 +771,12 @@ where
     };
     let mut beam = vec![(scheduler.clone(), Duration::MAX)];
     let mut seed = heuristic_seed(&scheduler, config);
-    let mut seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
+    let seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
+    let mut held_seed = None;
     let mut seen_binary = std::collections::HashSet::new();
 
     loop {
         result.iterations += 1;
-
         let started = Instant::now();
         let mut candidates: Vec<Scheduler> =
             beam.iter().flat_map(|(state, _)| generate_actions(state, config)).collect();
@@ -679,12 +787,11 @@ where
             break;
         }
 
-        let beam_best = beam.first().map(|(_, timing)| *timing);
-        let early_stop = beam_best.and_then(|timing| timing.checked_mul(3));
-        let mut timed = Vec::new();
+        let early_stop = beam.first().and_then(|(_, timing)| timing.checked_mul(3));
         // Tinygrad resets this for each candidate wave and updates it in
         // completion order, before adding the binary to `seen_libs`.
         let mut least_compute_ops = u64::MAX;
+        let mut batch = TimingBatch::new(config.timing_batch);
         compile_wave(&candidates, &mut |index, compiled| {
             if index >= candidates.len() {
                 return;
@@ -696,26 +803,32 @@ where
                 return;
             }
             let started = Instant::now();
-            if !seen_binary.insert(compiled.binary_key) {
-                result.stage_timings.binary_dedup += started.elapsed();
+            let fresh = seen_binary.insert(compiled.binary_key);
+            result.stage_timings.binary_dedup += started.elapsed();
+            if !fresh {
                 return;
             }
-            result.stage_timings.binary_dedup += started.elapsed();
             result.unique_binary += 1;
-            let started = Instant::now();
-            if let Some(timing) = benchmark(&compiled.artifact, early_stop) {
-                result.benchmarked += 1;
-                timed.push((candidates[index].clone(), timing));
-            }
-            result.stage_timings.benchmarking += started.elapsed();
-        });
+            batch.push(index, compiled.artifact, &mut benchmark, early_stop);
+        })?;
+        batch.flush(&mut benchmark, early_stop);
+        result.stage_timings.benchmarking += batch.elapsed;
+        result.benchmarked += batch.timed.len();
         result.candidates_evaluated = result.benchmarked;
+        let mut timed: Vec<(Scheduler, Duration)> =
+            batch.timed.into_iter().map(|(index, timing)| (candidates[index].clone(), timing)).collect();
         if timed.is_empty() {
             break;
         }
 
         timed.sort_by_key(|(_, timing)| *timing);
-        debug_seed_fate(&mut seed_opts, &timed);
+        debug_seed_fate(seed_opts.as_deref(), result.iterations == 1, &timed);
+        if let Some(seed) = hold_seed(&mut timed, seed_opts.as_deref(), result.iterations == 1) {
+            held_seed = Some(seed);
+        }
+        if timed.is_empty() {
+            break;
+        }
         let best_new = timed[0].1;
         let best_old = beam.first().map(|(_, timing)| *timing).unwrap_or(Duration::MAX);
         let min_progress = Duration::from_nanos(config.min_progress_ns);
@@ -728,14 +841,42 @@ where
         beam = timed.into_iter().take(config.beam_width).collect();
     }
 
-    let (best_scheduler, best_timing) = beam.into_iter().next().unwrap_or((scheduler, Duration::MAX));
-    result.scheduler = best_scheduler;
-    result.timing = best_timing;
+    let (winner, timing) = better(beam.into_iter().next(), held_seed).unwrap_or((scheduler, Duration::MAX));
+    result.scheduler = winner;
+    result.timing = timing;
     Ok(result)
 }
 
-/// BEAM search whose candidate scheduler construction and compilation happen
-/// in external workers. The parent retains only optimization sequences.
+/// The plans of `candidates`, which is all a remote worker receives.
+fn plans(candidates: &[Scheduler]) -> Vec<Vec<Opt>> {
+    candidates.iter().map(|candidate| candidate.applied_opts.clone()).collect()
+}
+
+/// [`staged_search`] whose compiles happen in this process and cannot fail as a wave.
+pub fn beam_search_staged<C, FC, FT>(
+    scheduler: Scheduler,
+    config: &BeamConfig,
+    mut compile_wave: FC,
+    benchmark: FT,
+) -> Result<BeamResult, OptError>
+where
+    FC: FnMut(&[Scheduler], &mut dyn FnMut(usize, CompiledCandidate<C>)),
+    FT: FnMut(&[C], Option<Duration>) -> Vec<Option<Duration>>,
+{
+    staged_search(
+        scheduler,
+        config,
+        |candidates, emit| {
+            compile_wave(candidates, emit);
+            Ok(())
+        },
+        benchmark,
+    )
+}
+
+/// [`staged_search`] whose candidate construction and compilation happen in
+/// external workers: they receive optimization sequences alone and rebuild each
+/// candidate from the base AST ([`apply_remote_candidate`]).
 pub fn beam_search_remote_staged<C, FC, FT>(
     scheduler: Scheduler,
     config: &BeamConfig,
@@ -744,86 +885,9 @@ pub fn beam_search_remote_staged<C, FC, FT>(
 ) -> Result<BeamResult, OptError>
 where
     FC: FnMut(&[Vec<Opt>], &mut dyn FnMut(usize, CompiledCandidate<C>)) -> Result<(), OptError>,
-    FT: Fn(&C, Option<Duration>) -> Option<Duration>,
+    FT: FnMut(&[C], Option<Duration>) -> Vec<Option<Duration>>,
 {
-    let mut result = BeamResult {
-        scheduler: scheduler.clone(),
-        timing: Duration::MAX,
-        iterations: 0,
-        candidates_evaluated: 0,
-        generated: 0,
-        unique_ir: 0,
-        compiled: 0,
-        unique_binary: 0,
-        benchmarked: 0,
-        stage_timings: BeamStageTimings::default(),
-    };
-    let mut beam = vec![(scheduler.clone(), Duration::MAX)];
-    let mut seed = heuristic_seed(&scheduler, config);
-    let mut seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
-    let mut seen_binary = std::collections::HashSet::new();
-
-    loop {
-        result.iterations += 1;
-        let started = Instant::now();
-        let mut candidates = beam.iter().flat_map(|(state, _)| generate_actions(state, config)).collect::<Vec<_>>();
-        candidates.extend(seed.take());
-        let candidate_opts = candidates.iter().map(|candidate| candidate.applied_opts.clone()).collect::<Vec<_>>();
-        result.stage_timings.generation += started.elapsed();
-        result.generated += candidates.len();
-        if candidates.is_empty() {
-            break;
-        }
-
-        let early_stop = beam.first().and_then(|(_, timing)| timing.checked_mul(3));
-        let mut timed = Vec::new();
-        let mut least_compute_ops = u64::MAX;
-        compile_wave(&candidate_opts, &mut |index, compiled| {
-            if index >= candidates.len() {
-                return;
-            }
-            result.compiled += 1;
-            result.stage_timings.filtering += compiled.preparation;
-            result.stage_timings.compilation += compiled.compilation;
-            if bloated(&mut least_compute_ops, compiled.compute_ops) {
-                return;
-            }
-            let started = Instant::now();
-            if !seen_binary.insert(compiled.binary_key) {
-                result.stage_timings.binary_dedup += started.elapsed();
-                return;
-            }
-            result.stage_timings.binary_dedup += started.elapsed();
-            result.unique_binary += 1;
-            let started = Instant::now();
-            if let Some(timing) = benchmark(&compiled.artifact, early_stop) {
-                result.benchmarked += 1;
-                timed.push((candidates[index].clone(), timing));
-            }
-            result.stage_timings.benchmarking += started.elapsed();
-        })?;
-        result.candidates_evaluated = result.benchmarked;
-        if timed.is_empty() {
-            break;
-        }
-        timed.sort_by_key(|(_, timing)| *timing);
-        debug_seed_fate(&mut seed_opts, &timed);
-        let best_new = timed[0].1;
-        let best_old = beam.first().map(|(_, timing)| *timing).unwrap_or(Duration::MAX);
-        let min_progress = Duration::from_nanos(config.min_progress_ns);
-        if best_new < min_progress || best_old.saturating_sub(best_new) < min_progress {
-            if best_new < best_old {
-                beam = timed.into_iter().take(1).collect();
-            }
-            break;
-        }
-        beam = timed.into_iter().take(config.beam_width).collect();
-    }
-
-    let (winner, timing) = beam.into_iter().next().unwrap_or((scheduler, Duration::MAX));
-    result.scheduler = winner;
-    result.timing = timing;
-    Ok(result)
+    staged_search(scheduler, config, |candidates, emit| compile_wave(&plans(candidates), emit), benchmark)
 }
 
 // ============================================================================
@@ -889,7 +953,9 @@ static CACHE_DB: Lazy<Option<sled::Db>> = Lazy::new(|| {
 /// looser cap could reintroduce a kernel that no longer satisfies the new cap.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
-    /// On-disk key schema. Bump whenever replay semantics change.
+    /// On-disk key schema. Bump whenever replay semantics change, or the timing
+    /// that ranked every stored plan: a plan found under the old ranking would
+    /// otherwise replay over the fix and look like its confirmation.
     schema: u32,
     /// Hash of the AST structure.
     ast_hash: u64,
@@ -956,7 +1022,7 @@ impl CacheKey {
         let ast_hash = hasher.finish();
 
         Self {
-            schema: 11,
+            schema: 14,
             ast_hash,
             beam_width: config.beam_width,
             device: scheduler.ren.device,
@@ -1119,7 +1185,85 @@ where
     Ok(result)
 }
 
-/// Run staged BEAM with persistent caching and exact compiler identity.
+/// [`staged_search`] behind the persistent cache: a stored plan is replayed and
+/// timed instead of searched, and one that no longer replays, fails its limits,
+/// or cannot be timed is dropped and searched afresh. A worker error during the
+/// replay drops the entry and ends the search.
+fn cached_staged_search<C, FC, FT>(
+    scheduler: Scheduler,
+    config: &BeamConfig,
+    compiler_identity: &str,
+    behavior_fingerprint: u64,
+    mut compile_wave: FC,
+    mut benchmark: FT,
+) -> Result<BeamResult, OptError>
+where
+    FC: FnMut(&[Scheduler], &mut dyn FnMut(usize, CompiledCandidate<C>)) -> Result<(), OptError>,
+    FT: FnMut(&[C], Option<Duration>) -> Vec<Option<Duration>>,
+{
+    let key = CacheKey::from_scheduler(&scheduler, config, compiler_identity, behavior_fingerprint);
+    if !config.disable_cache
+        && let Some(cached_opts) = cache_get(&key)
+    {
+        match replay_cached(&scheduler, &cached_opts) {
+            Ok(replayed) if validate_limits(&replayed, config) => {
+                let mut stage_timings = BeamStageTimings::default();
+                let mut compiled = 0;
+                let mut timing = Duration::MAX;
+                let replay = compile_wave(std::slice::from_ref(&replayed), &mut |index, candidate| {
+                    if index != 0 {
+                        return;
+                    }
+                    compiled += 1;
+                    stage_timings.filtering += candidate.preparation;
+                    stage_timings.compilation += candidate.compilation;
+                    let started = Instant::now();
+                    timing = benchmark(std::slice::from_ref(&candidate.artifact), None)
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .unwrap_or(Duration::MAX);
+                    stage_timings.benchmarking += started.elapsed();
+                });
+                if let Err(error) = replay {
+                    cache_invalidate(&key);
+                    return Err(error);
+                }
+                if timing != Duration::MAX {
+                    return Ok(BeamResult {
+                        scheduler: replayed,
+                        timing,
+                        iterations: 0,
+                        candidates_evaluated: 1,
+                        generated: 0,
+                        unique_ir: 0,
+                        compiled,
+                        unique_binary: compiled,
+                        benchmarked: 1,
+                        stage_timings,
+                    });
+                }
+                cache_invalidate(&key);
+            }
+            Ok(_) => {
+                tracing::warn!("Beam cache replayed scheduler violates limits - invalidating");
+                cache_invalidate(&key);
+            }
+            Err(error) => {
+                tracing::warn!(?error, "Beam cache replay failed (stale entry?) - invalidating");
+                cache_invalidate(&key);
+            }
+        }
+    }
+
+    let result = staged_search(scheduler, config, compile_wave, benchmark)?;
+    if !config.disable_cache && cacheable(&result) {
+        cache_put(&key, &result.scheduler.applied_opts);
+    }
+    Ok(result)
+}
+
+/// Cached [`beam_search_staged`].
 pub fn beam_search_cached_staged<C, FC, FT>(
     scheduler: Scheduler,
     config: &BeamConfig,
@@ -1130,67 +1274,23 @@ pub fn beam_search_cached_staged<C, FC, FT>(
 ) -> Result<BeamResult, OptError>
 where
     FC: FnMut(&[Scheduler], &mut dyn FnMut(usize, CompiledCandidate<C>)),
-    FT: Fn(&C, Option<Duration>) -> Option<Duration>,
+    FT: FnMut(&[C], Option<Duration>) -> Vec<Option<Duration>>,
 {
-    let key = CacheKey::from_scheduler(&scheduler, config, compiler_identity, behavior_fingerprint);
-    if !config.disable_cache
-        && let Some(cached_opts) = cache_get(&key)
-    {
-        let replayed = replay_cached(&scheduler, &cached_opts);
-        match replayed {
-            Ok(replayed) if validate_limits(&replayed, config) => {
-                let mut compiled_count = 0;
-                let mut filtering = Duration::ZERO;
-                let mut compilation = Duration::ZERO;
-                let mut benchmarking = Duration::ZERO;
-                let mut timing = Duration::MAX;
-                compile_wave(std::slice::from_ref(&replayed), &mut |index, candidate| {
-                    if index != 0 {
-                        return;
-                    }
-                    compiled_count += 1;
-                    filtering += candidate.preparation;
-                    compilation += candidate.compilation;
-                    let started = Instant::now();
-                    timing = benchmark(&candidate.artifact, None).unwrap_or(Duration::MAX);
-                    benchmarking += started.elapsed();
-                });
-                let benchmarked = usize::from(timing != Duration::MAX);
-                if benchmarked > 0 {
-                    return Ok(BeamResult {
-                        scheduler: replayed,
-                        timing,
-                        iterations: 0,
-                        candidates_evaluated: benchmarked,
-                        generated: 0,
-                        unique_ir: 0,
-                        compiled: compiled_count,
-                        unique_binary: compiled_count,
-                        benchmarked,
-                        stage_timings: BeamStageTimings {
-                            filtering,
-                            compilation,
-                            benchmarking,
-                            ..BeamStageTimings::default()
-                        },
-                    });
-                }
-                cache_invalidate(&key);
-            }
-            Ok(_) => cache_invalidate(&key),
-            Err(_) => cache_invalidate(&key),
-        }
-    }
-
-    let result = beam_search_staged(scheduler, config, &mut compile_wave, &benchmark)?;
-    if !config.disable_cache && cacheable(&result) {
-        cache_put(&key, &result.scheduler.applied_opts);
-    }
-    Ok(result)
+    cached_staged_search(
+        scheduler,
+        config,
+        compiler_identity,
+        behavior_fingerprint,
+        |candidates, emit| {
+            compile_wave(candidates, emit);
+            Ok(())
+        },
+        benchmark,
+    )
 }
 
-/// Cached variant of [`beam_search_remote_staged`]. Cache replay constructs
-/// only the single winning scheduler in the parent.
+/// Cached [`beam_search_remote_staged`]. Cache replay constructs only the
+/// single winning scheduler in the parent.
 pub fn beam_search_cached_remote<C, FC, FT>(
     scheduler: Scheduler,
     config: &BeamConfig,
@@ -1201,61 +1301,16 @@ pub fn beam_search_cached_remote<C, FC, FT>(
 ) -> Result<BeamResult, OptError>
 where
     FC: FnMut(&[Vec<Opt>], &mut dyn FnMut(usize, CompiledCandidate<C>)) -> Result<(), OptError>,
-    FT: Fn(&C, Option<Duration>) -> Option<Duration>,
+    FT: FnMut(&[C], Option<Duration>) -> Vec<Option<Duration>>,
 {
-    let key = CacheKey::from_scheduler(&scheduler, config, compiler_identity, behavior_fingerprint);
-    if !config.disable_cache
-        && let Some(cached_opts) = cache_get(&key)
-    {
-        let replayed = replay_cached(&scheduler, &cached_opts);
-        match replayed {
-            Ok(replayed) if validate_limits(&replayed, config) => {
-                let mut timing = Duration::MAX;
-                let mut compiled_count = 0;
-                let mut filtering = Duration::ZERO;
-                let mut compilation = Duration::ZERO;
-                let mut benchmarking = Duration::ZERO;
-                let replay_result = compile_wave(std::slice::from_ref(&cached_opts), &mut |index, candidate| {
-                    if index != 0 {
-                        return;
-                    }
-                    compiled_count += 1;
-                    filtering += candidate.preparation;
-                    compilation += candidate.compilation;
-                    let started = Instant::now();
-                    timing = benchmark(&candidate.artifact, None).unwrap_or(Duration::MAX);
-                    benchmarking += started.elapsed();
-                });
-                if let Err(error) = replay_result {
-                    cache_invalidate(&key);
-                    return Err(error);
-                }
-                let benchmarked = usize::from(timing != Duration::MAX);
-                if benchmarked > 0 {
-                    return Ok(BeamResult {
-                        scheduler: replayed,
-                        timing,
-                        iterations: 0,
-                        candidates_evaluated: benchmarked,
-                        generated: 0,
-                        unique_ir: 0,
-                        compiled: compiled_count,
-                        unique_binary: compiled_count,
-                        benchmarked,
-                        stage_timings: BeamStageTimings { filtering, compilation, benchmarking, ..Default::default() },
-                    });
-                }
-                cache_invalidate(&key);
-            }
-            Ok(_) | Err(_) => cache_invalidate(&key),
-        }
-    }
-
-    let result = beam_search_remote_staged(scheduler, config, &mut compile_wave, &benchmark)?;
-    if !config.disable_cache && cacheable(&result) {
-        cache_put(&key, &result.scheduler.applied_opts);
-    }
-    Ok(result)
+    cached_staged_search(
+        scheduler,
+        config,
+        compiler_identity,
+        behavior_fingerprint,
+        |candidates, emit| compile_wave(&plans(candidates), emit),
+        benchmark,
+    )
 }
 
 /// Clear the beam search cache.

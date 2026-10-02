@@ -424,7 +424,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 }
                 kernel.push(format!("  br label %loop_footer_{id}"));
                 kernel.push(format!("loop_footer_{id}:"));
-                kernel.push(format!("  br label %loop_latch_{id}"));
+                kernel.push(ctx.back_edge(range, &id));
                 kernel.push(format!("loop_exit_{id}:"));
             }
 

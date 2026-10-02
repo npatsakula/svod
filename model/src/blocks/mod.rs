@@ -15,7 +15,7 @@ pub mod remap;
 mod stage;
 
 pub use basic_block::{BasicBlock, BlockKind};
-pub use batchnorm::{BN_EPS, batchnorm2d};
+pub use batchnorm::{BN_EPS, batchnorm2d, batchnorm2d_with_eps};
 pub use bottleneck::Bottleneck;
 pub use conv::{conv2d, conv2d_grouped};
 pub use error::{Error, Result};

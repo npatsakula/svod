@@ -112,7 +112,8 @@ pub enum TcOpt {
 
     /// [`Self::Relaxed`] plus PADTO on non-divisible M/N/K (TC_OPT=2, default)
     /// inside the tensor-core padding budget, so a 1500-row GEMM still tiles
-    /// at 1504 while a 5-row GEMV never pays for 16.
+    /// at 1504 while a 5-row GEMV never pays for 16; a compute-bound kernel
+    /// pads past the budget, so a 20x20 conv output still tiles at 32.
     #[default]
     Padded,
 
@@ -175,8 +176,13 @@ pub struct BeamConfig {
     pub max_local: usize,
     /// Maximum UOps in kernel before rejecting.
     pub max_uops: usize,
-    /// Number of benchmark runs per kernel.
+    /// Timing rounds per candidate; each keeps its minimum.
     pub num_runs: usize,
+    /// Compiled candidates timed together: the backend lifts the device clock
+    /// once per batch and times the members in rounds, so none is judged at a
+    /// clock the others were not. Larger batches pay the lift less often and
+    /// hold more binaries in the parent.
+    pub timing_batch: usize,
     /// Minimum improvement in nanoseconds required to continue searching.
     pub min_progress_ns: u64,
     /// Whether the NOLOCALS action is part of the search space.
@@ -199,6 +205,7 @@ impl Default for BeamConfig {
             max_local: 1024,
             max_uops: 3000,
             num_runs: 3,
+            timing_batch: 128,
             min_progress_ns: 10,
             enable_nolocals: false,
             compile_workers: 0,
@@ -226,6 +233,8 @@ impl BeamConfig {
         #[builder(default = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000))]
         max_uops: usize,
         #[builder(default = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3))] num_runs: usize,
+        #[builder(default = std::env::var("BEAM_TIMING_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(128))]
+        timing_batch: usize,
         #[builder(default = beam_min_progress_from_env())] min_progress_ns: u64,
         #[builder(default = std::env::var("NOLOCALS").is_ok() || std::env::var("SVOD_NOLOCALS").is_ok())]
         enable_nolocals: bool,
@@ -243,6 +252,7 @@ impl BeamConfig {
             max_local,
             max_uops,
             num_runs,
+            timing_batch,
             min_progress_ns,
             enable_nolocals,
             compile_workers,
@@ -260,7 +270,8 @@ impl BeamConfig {
     /// * `BEAM_UPCAST_MAX` - Max upcast size (default: 256)
     /// * `BEAM_LOCAL_MAX` - Max local memory elements (default: 1024)
     /// * `BEAM_UOPS_MAX` - Max UOps before rejecting (default: 3000)
-    /// * `BEAM_RUNS` - Benchmark runs per kernel (default: 3)
+    /// * `BEAM_RUNS` - Timing rounds per candidate (default: 3)
+    /// * `BEAM_TIMING_BATCH` - Candidates timed together at one clock lift (default: 128)
     /// * `BEAM_MIN_PROGRESS` - Minimum progress in microseconds (default: 0.01)
     /// * `NOLOCALS` / `SVOD_NOLOCALS` - Include the NOLOCALS action if set
     /// * `PARALLEL` - Maximum concurrent candidate compilations (default: 0 for CPU; GPU resolves to host parallelism)
@@ -272,6 +283,7 @@ impl BeamConfig {
         let max_local = std::env::var("BEAM_LOCAL_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
         let max_uops = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
         let num_runs = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let timing_batch = std::env::var("BEAM_TIMING_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(128);
         let min_progress_ns = beam_min_progress_from_env();
         let enable_nolocals = std::env::var("NOLOCALS").is_ok() || std::env::var("SVOD_NOLOCALS").is_ok();
         let compile_workers = std::env::var("PARALLEL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -286,6 +298,7 @@ impl BeamConfig {
             max_local,
             max_uops,
             num_runs,
+            timing_batch,
             min_progress_ns,
             enable_nolocals,
             compile_workers,
@@ -320,8 +333,9 @@ pub struct HeuristicsConfig {
     /// divisible reduce axis (convolutions lower to a reduce over channels and
     /// taps, and the scalar path there runs at a fraction of the WMMA's), and a
     /// non-divisible M/N/K is padded when the padding adds at most a quarter
-    /// to the axis, so a 1500-row GEMM tiles at 1504
-    /// while a 5-row GEMV stays scalar. `TC_OPT=3` pads without the budget,
+    /// to the axis or the kernel is compute-bound, so a 1500-row GEMM tiles at
+    /// 1504 and a 20x20 conv output at 32 while a 5-row GEMV stays scalar.
+    /// `TC_OPT=3` pads without the budget,
     /// tinygrad's `TC_OPT=2`; `TC_OPT=1` never pads.
     pub tc_opt: TcOpt,
     /// Tensor core selection mode.

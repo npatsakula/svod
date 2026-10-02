@@ -37,10 +37,17 @@ pub struct MatmulPattern {
 pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, OptError> {
     let reduce_op = match scheduler.reduceop() {
         Some(op) => op,
-        None => return Ok(None),
+        None => {
+            tracing::debug!("no matmul: the kernel has no REDUCE");
+            return Ok(None);
+        }
     };
 
     let Some((in0, in1)) = matmul_operands(&reduce_op) else {
+        tracing::debug!(
+            src = reduce_op.op().sources().first().map(|s| AsRef::<str>::as_ref(s.op())),
+            "no matmul: the REDUCE is not an ADD over a MUL, modulo casts"
+        );
         return Ok(None);
     };
     let in0_all_ranges = get_ranges(&in0);
@@ -67,17 +74,34 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
     in1_ranges.sort_by_key(|r| std::cmp::Reverse(get_axis_id(r)));
     red_ranges.sort_by_key(|r| std::cmp::Reverse(get_axis_id(r)));
 
-    // Generate all axis choices (N, M, K) using explicit loops to avoid closure ownership issues
-    let mut axis_choices = Vec::with_capacity(in1_ranges.len() * in0_ranges.len() * red_ranges.len());
-    for n in &in1_ranges {
-        for m in &in0_ranges {
-            for k in &red_ranges {
-                axis_choices.push((n.clone(), m.clone(), k.clone()));
+    // Every (N, M, K) with N drawn from in1 and M from in0, as tinygrad orders
+    // them, then the same with the operands' roles exchanged. The core's N and
+    // M tiles differ (8 and 16 on CUDA), so which operand takes which side
+    // decides what a non-divisible axis pads to: a conv's 20-wide spatial axis
+    // pads to 32 on the M side and to 24 on the N side. Applying a swapped
+    // choice commutes the MUL so the WMMA's A operand still carries M.
+    let sides = [(&in1_ranges, &in0_ranges), (&in0_ranges, &in1_ranges)];
+    let mut axis_choices = Vec::with_capacity(2 * in1_ranges.len() * in0_ranges.len() * red_ranges.len());
+    for (ns, ms) in sides {
+        for n in ns {
+            for m in ms {
+                for k in &red_ranges {
+                    axis_choices.push((n.clone(), m.clone(), k.clone()));
+                }
             }
         }
     }
 
     if axis_choices.is_empty() {
+        // M and N are the ranges exclusive to one operand; K comes from the
+        // REDUCE itself. A fused producer that makes both operands reach the
+        // same ranges empties one of these and the matmul disappears.
+        tracing::debug!(
+            m = in0_ranges.len(),
+            n = in1_ranges.len(),
+            k = red_ranges.len(),
+            "no matmul: no (N, M, K) triple, so an operand has no exclusive range"
+        );
         return Ok(None);
     }
 
@@ -308,6 +332,24 @@ fn within_pad_budget(size: usize, tile: usize) -> bool {
     (padded - size) * 100 <= size * TC_PAD_BUDGET_PERCENT
 }
 
+/// FLOP per operand byte, at the unpadded shape, past which the budget no
+/// longer applies: such a kernel is compute-bound on every tensor-core GPU, so
+/// even a tile padded well beyond the budget beats the scalar kernel it
+/// displaces (a 20x20 conv output pads 20 -> 32 for 1.6x the MACs on a core
+/// several times faster), where a beam-width GEMV at a few FLOP per byte only
+/// pays for the padding.
+const COMPUTE_BOUND_INTENSITY: f64 = 64.0;
+
+/// `2·M·N·K / bytes(A + B + C)` over the pattern's whole M, N and K extents;
+/// `None` when any of them is symbolic.
+fn arithmetic_intensity(pattern: &MatmulPattern) -> Option<f64> {
+    let extent =
+        |ranges: &[Arc<UOp>]| ranges.iter().map(|r| get_range_size(r).map(|s| s as f64)).product::<Option<f64>>();
+    let (m, n, k) = (extent(&pattern.in0_ranges)?, extent(&pattern.in1_ranges)?, extent(&pattern.red_ranges)?);
+    let bytes = pattern.in0.dtype().bytes().max(pattern.in1.dtype().bytes()) as f64;
+    Some(2.0 * m * n * k / (bytes * (m * k + n * k + m * n)))
+}
+
 fn apply_axis_choice_impl(
     scheduler: &mut Scheduler,
     pattern: &MatmulPattern,
@@ -327,6 +369,22 @@ fn apply_axis_choice_impl(
     // Clone the TensorCore to avoid borrow conflicts when applying PADTO
     let tc = scheduler.ren.tensor_cores[tc_selection.tc_index].clone();
     let (n_range, m_range, k_range) = &tc_selection.axes;
+
+    // A choice that takes N from in0 wants the operands the other way round:
+    // the WMMA below reads A from the MUL's first source and B from its second,
+    // and each has its own fragment layout.
+    if pattern.in0_ranges.iter().any(|r| Arc::ptr_eq(r, n_range)) {
+        let reduce =
+            scheduler.reduceop().ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "REDUCE missing" }.build())?;
+        let Op::Reduce(svod_ir::ops::Reduce { src, .. }) = reduce.op() else { unreachable!() };
+        let mul = src.unwrap_cast();
+        let Op::Binary(BinaryOp::Mul, a, b) = mul.op() else {
+            return ValidationFailedSnafu { op: "TC", reason: "expected MUL inside REDUCE" }.fail();
+        };
+        let commuted = mul.with_sources(vec![b.clone(), a.clone()]);
+        let new_ast = scheduler.ast().substitute(&HashMap::from([(UOpKey(mul.clone()), commuted)]));
+        scheduler.set_ast(new_ast);
+    }
     // Mutable axes array - may be updated after PADTO
     let mut axes = [n_range.clone(), m_range.clone(), k_range.clone()];
 
@@ -337,6 +395,8 @@ fn apply_axis_choice_impl(
         // Collect padding operations needed (can't mutate axes while iterating)
         let tc_dims = [tc.dims.0, tc.dims.1, tc.dims.2];
         let mut padding_ops: Vec<(usize, usize, usize)> = Vec::new(); // (axes_idx, scheduler_idx, tc_dim)
+        let compute_bound =
+            arithmetic_intensity(pattern).is_some_and(|flop_per_byte| flop_per_byte >= COMPUTE_BOUND_INTENSITY);
 
         for (i, (axis, &tc_dim)) in axes.iter().zip(&tc_dims).enumerate() {
             match get_range_size(axis) {
@@ -346,8 +406,10 @@ fn apply_axis_choice_impl(
                         // and multiply the MACs. A 5-row M on a 16-row core is
                         // 3.2x the work of a memory-bound GEMV, and BEAM times
                         // it as a win only because the tile it displaces is
-                        // worse still.
-                        if tc_opt == 2 && !within_pad_budget(size as usize, tc_dim) {
+                        // worse still. A compute-bound kernel is the other way
+                        // round: the padded core still runs several times faster
+                        // than the scalar loop, so the budget steps aside.
+                        if tc_opt == 2 && !compute_bound && !within_pad_budget(size as usize, tc_dim) {
                             return ValidationFailedSnafu {
                                 op: "TC",
                                 reason: "padding to the tensor-core tile would add too much work",
@@ -645,6 +707,21 @@ pub fn apply_with_axis_choice(
 
     let pattern = detect_matmul(scheduler)?
         .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "no matmul pattern detected" }.build())?;
+
+    // A tensor core splits M and N into warp, local and upcast fragments. An
+    // output axis a downstream REDUCE still sums over (`min_over_K(x @ cᵀ)`, a
+    // 1x1 conv fused into the conv it feeds) is then only partly summed: each
+    // lane keeps its own fragment columns and the group's lanes race onto one
+    // element, or the shared loop closes twice (an invalid LLVM phi). The
+    // generic reduce path takes the fused kernel, whoever asks for the core.
+    if pattern
+        .in0_ranges
+        .iter()
+        .chain(&pattern.in1_ranges)
+        .any(|r| matches!(r.op(), Op::Range(svod_ir::ops::Range { axis_type: AxisType::Reduce, .. })))
+    {
+        return ValidationFailedSnafu { op: "TC", reason: "a matmul output axis is a reduce axis" }.fail();
+    }
 
     let choices: Vec<usize> = if let Some(choice) = axis_choice {
         if choice >= pattern.axis_choices.len() {

@@ -54,6 +54,41 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
   code duplication and simplify test understanding.
 - We add test infrastructure to the `.tokeignore` file in order to understand the codebase size better.
 
+## Settled decisions
+
+- **BEAM times candidates in batches on a lifted clock** (`TimingBatch` in
+  `schedule/src/optimizer/beam.rs`; `warm_clock` + `round_robin_min` in the benchmark closure of
+  `tensor/src/realize.rs`). Timing each candidate the moment its compile lands ranks the GPU's
+  idle clock, not the kernels: a median 1.5x and up to 6x error on gfx1201, which once made
+  BEAM=8 pick a 6x slower plan. The per-batch clock lift is deliberate and not a removable
+  extra; the search is not slower with it.
+- **The tk convolution gate is a measured rule the kernel owns, not a channel bound the
+  model carries** (`svod_tk::conv2d_nhwc_worth_asking`, asked by `YoloConv::tk_eligible`): the
+  lattice's edges (`cout % 32`, `cin % 16`) plus `CONV_K_FLOOR = 576` on gfx1201 — K = 288 loses
+  ~29 µs a conv to the graph's kernel, K = 864 wins ~8 at BEAM=4 and ties at BEAM=8, K ≥ 3456
+  wins outright. On CUDA the kernel also declines a shape only a 32-wide tile serves (the
+  table's fine tile or the lattice's edge) unless its grid starves the device: on sm86 in the x
+  frame `384→96 k3 @80²` ran 320 µs against the graph's 229 and `96→96 k3 @80²` 64.5 against
+  57.3, while `768→96 k3 @20²` ran 63 against 95. The global lattice bound (`a7c2a1fc`) loses at
+  m/l and a per-site allowlist cannot tell the shapes apart, so neither replaces this. The
+  96-channel bodies are a lever at BEAM=4 and a wash at BEAM=8; do not re-open them per width.
+  Measured x/b1: gfx1201 4.767 → 4.515 ms (−5.3%, BEAM=4 under BEAM=8's frame), RTX 3060 −0.6%.
+  Re-checked in the frame under clang 22: a floor of 1152 loses at s/m/l/x (+1.7…+5.6%). The conv
+  bench's isolated graph arm flatters K = 864 (18 µs against 21.8 in the frame); it cannot move it.
+- **Every loop the AMD renderer emits carries `amdgpu.loop.unroll.threshold = 300`, except a loop
+  whose counter indexes a register array** (`LOOP_HINT` and `register_indexing_ranges` in
+  `codegen/src/llvm/amd/mod.rs`). Without the cap, AMDGPU's +200 per branch on the loop's own
+  index fully unrolls a reduce loop over gated loads (a cat, padding): YOLO26-n's `neck.13.cv1`
+  became 72 WMMAs and 843 spilled VGPRs, 99 µs instead of 27, and clang 20.1.2 compiled that
+  spill into NaN — at BEAM=0 and at BEAM=4 alike, which picks the same kernel. With it, n is right
+  and BEAM=4 is −12.4% at n, −0.7…−1.8% at s/m/l and a wash at x; the plans BEAM finds under it
+  need it (replayed without it, x runs +45% with NaN boxes). The exemption is not optional:
+  capped too, every tk convolution kept 132 B of its register tiles in scratch.
+- **The tk tile search times a tile only once its output agrees with its rivals'**
+  (`TileBudget::search`, `tiling::agreement`): ranked by time alone it once handed m's bodies a
+  tile that computed garbage fast (16 px of box drift). The check reads every candidate back on a
+  tune-store miss only; do not trade it for a faster first run.
+
 ## Task evaluation
 
 - `cargo fmt`, `cargo clippy` and `cargo test` should pass before I can perform review.

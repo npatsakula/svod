@@ -219,6 +219,21 @@ fn pipeline_commit_fence_is_gfx12_only(arch: GpuArch, want: bool) {
     assert_eq!(ArchCaps::for_arch(arch).needs_pipeline_commit_fence(), want);
 }
 
+/// The async-copy cap: only CUDA has `cp.async`. The conv rewrites whose fills
+/// have no register-staged form are offered on this answer alone, and the tuner
+/// *builds every candidate it is offered* to fingerprint it — so a wrong answer
+/// here is a panic in `cp_async_fill`, not a slower kernel. `every_plan_builds`
+/// in the conv tests pins the other half of that contract.
+#[test_case(SM_86, true; "sm_86")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx1201), false; "gfx1201")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx1200), false; "gfx1200")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx1151), false; "gfx1151")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx942), false; "gfx942")]
+#[test_case(GpuArch::Metal(svod_dtype::MetalFamily::Apple(9)), false; "metal")]
+fn async_copy_is_cuda_only(arch: GpuArch, want: bool) {
+    assert_eq!(ArchCaps::for_arch(arch).has_async_copy(), want);
+}
+
 /// Every kernel bar the gfx942-only direct-launch FA wrapper admits the RDNA4
 /// parts; the RDNA-only sets (norm, NT gemm) admit them without admitting CDNA.
 #[test]

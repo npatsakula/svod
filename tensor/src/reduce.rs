@@ -118,22 +118,9 @@ impl Tensor {
 
     /// Check if dtype should be cast back after sum accumulation.
     ///
-    /// Tinygrad casts back to original dtype for:
-    /// - float16
-    /// - bfloat16
-    /// - fp8 variants
+    /// Tinygrad casts back to the original dtype for exactly the narrow floats.
     fn should_cast_back_after_sum(dtype: &DType) -> bool {
-        matches!(
-            dtype.scalar(),
-            Some(
-                ScalarDType::Float16
-                    | ScalarDType::BFloat16
-                    | ScalarDType::FP8E4M3
-                    | ScalarDType::FP8E4M3FNUZ
-                    | ScalarDType::FP8E5M2
-                    | ScalarDType::FP8E5M2FNUZ
-            )
-        )
+        dtype.is_narrow_float()
     }
 
     /// Check if dtype is an integer or bool type.

@@ -116,6 +116,68 @@ fn llvm_rejects_malformed_range_nesting(build: fn() -> std::sync::Arc<UOp>, reas
     assert!(format!("{err}").contains(reason), "unexpected error: {err}");
 }
 
+/// Two nested loops storing through the inner one's index.
+fn nested_loops_linear() -> std::sync::Arc<UOp> {
+    let bound = UOp::const_(DType::Int32, ConstValue::Int(24));
+    let outer = UOp::range_axis_dtype(bound.clone(), AxisId::Renumbered(0), AxisType::Loop, DType::Int32);
+    let inner = UOp::range_axis_dtype(bound, AxisId::Renumbered(1), AxisType::Loop, DType::Int32);
+    let out = UOp::index().buffer(UOp::param(0, 24, DType::Float32, None)).indices(vec![inner.clone()]).call().unwrap();
+    let store = out.store(UOp::const_(DType::Float32, ConstValue::Float(1.0)));
+    let sink = UOp::sink(vec![store.end(smallvec::smallvec![inner]).end(smallvec::smallvec![outer])]);
+    UOp::linear(svod_schedule::linearize_with_cfg(sink).into())
+}
+
+/// Every loop the AMD renderer closes carries a loop ID of its own pointing at
+/// the unroll hint, on the back edge and nowhere else; CPU loops stay bare.
+#[test]
+fn amd_loop_back_edges_carry_the_unroll_hint() {
+    let linear = nested_loops_linear();
+    let amd = LlvmTextRenderer::amd(AmdArch::Gfx1201).render(&linear, Some("amd_loops")).expect("AMD render").code;
+    let lines: Vec<&str> = amd.lines().collect();
+    let back_edges: Vec<&str> =
+        lines.windows(2).filter(|pair| pair[0].starts_with("loop_footer_")).map(|pair| pair[1]).collect();
+    assert_eq!(back_edges.len(), 2, "{amd}");
+    let mut ids: Vec<&str> =
+        back_edges.iter().map(|edge| edge.split_once(", !llvm.loop ").unwrap_or_else(|| panic!("{amd}")).1).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["!1", "!2"], "{amd}");
+    assert_eq!(amd.matches("!llvm.loop").count(), 2, "only back edges carry a loop ID:\n{amd}");
+    for line in
+        ["!0 = !{!\"amdgpu.loop.unroll.threshold\", i32 300}", "!1 = distinct !{!1, !0}", "!2 = distinct !{!2, !0}"]
+    {
+        assert!(lines.contains(&line), "missing `{line}`:\n{amd}");
+    }
+    assert_amd_ir_compiles(&amd, "gfx1201");
+
+    let cpu = render(&linear, Some("cpu_loops")).expect("CPU render").code;
+    assert!(!cpu.contains("!llvm.loop"), "CPU loops carry no unroll hint:\n{cpu}");
+}
+
+/// A loop whose counter indexes a register array keeps LLVM's private-memory
+/// boost — the unroll is what promotes the array — while the loop around it
+/// does not index registers and carries the hint.
+#[test]
+fn amd_loops_indexing_registers_stay_unhinted() {
+    let bound = UOp::const_(DType::Int32, ConstValue::Int(8));
+    let outer = UOp::range_axis_dtype(bound.clone(), AxisId::Renumbered(0), AxisType::Loop, DType::Int32);
+    let inner = UOp::range_axis_dtype(bound, AxisId::Renumbered(1), AxisType::Loop, DType::Int32);
+    let reg = UOp::buffer(0, 8, DType::Float32, AddrSpace::Reg, None);
+    let slot = UOp::index().buffer(reg).indices(vec![inner.clone()]).call().unwrap();
+    let store = slot.store(UOp::const_(DType::Float32, ConstValue::Float(1.0)));
+    let sink = UOp::sink(vec![store.end(smallvec::smallvec![inner]).end(smallvec::smallvec![outer])]);
+    let linear = UOp::linear(svod_schedule::linearize_with_cfg(sink).into());
+
+    let amd = LlvmTextRenderer::amd(AmdArch::Gfx1201).render(&linear, Some("amd_reg_loop")).expect("AMD render").code;
+    let lines: Vec<&str> = amd.lines().collect();
+    let back_edge = |id: &str| {
+        let footer = lines.iter().position(|line| *line == format!("loop_footer_{id}:")).expect("footer");
+        lines[footer + 1]
+    };
+    assert_eq!(back_edge("1"), "  br label %loop_latch_1", "{amd}");
+    assert_eq!(back_edge("0"), "  br label %loop_latch_0, !llvm.loop !1", "{amd}");
+    assert_amd_ir_compiles(&amd, "gfx1201");
+}
+
 // ── AMD target tests ───────────────────────────────────────────────────────
 //
 // These exercise the AMDLLVMRenderer codegen path; `assert_amd_ir_compiles`

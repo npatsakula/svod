@@ -18,7 +18,7 @@ use smallvec::SmallVec;
 use svod_device::DeviceSpec;
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::uop::cached_property::CachedProperty;
-use svod_ir::uop::properties::SoundVminVmaxProperty;
+use svod_ir::uop::properties::{RangesProperty, SoundVminVmaxProperty};
 use svod_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey, UnaryOp};
 
 use crate::TypedPatternMatcher;
@@ -1297,6 +1297,63 @@ fn gated_collapse_core(idx: &Arc<UOp>, range: &Arc<UOp>, end: &Arc<UOp>, expr: &
     UOp::try_where(in_bounds, substituted, zero_like).ok()
 }
 
+/// Whether `node` depends on `range` — the question the reduce-collapse family
+/// actually asks, where `no_range` asks the stricter "depends on no range at all".
+///
+/// `RangesProperty` is the cached backward slice of RANGEs and excludes the node
+/// itself, so a bare range is tested separately. Reading the cache beats a
+/// memoized walk here: this runs per candidate inside the rewrite fixed point,
+/// and a slice holds a handful of ranges.
+fn reaches(node: &Arc<UOp>, range: &Arc<UOp>) -> bool {
+    Arc::ptr_eq(node, range) || RangesProperty::get(node).iter().any(|r| Arc::ptr_eq(r, range))
+}
+
+/// Whether casting `src` to `dtype` keeps its values distinct — either the
+/// destination covers the source format outright, or it covers the values this
+/// node can actually take. A cast that merged two values would let several steps
+/// of the reduction satisfy the equality, and keeping one would drop the rest.
+fn cast_is_injective(src: &Arc<UOp>, dtype: &DType) -> bool {
+    if !dtype.is_int() || !src.dtype().is_int() {
+        return false;
+    }
+    let (lo, hi) = (dtype.min_value(), dtype.max_value());
+    if src.dtype().min_value() >= lo && src.dtype().max_value() <= hi {
+        return true;
+    }
+    let bound = |value: &ConstValue| match value {
+        ConstValue::Int(v) => Some(*v as f64),
+        ConstValue::UInt(v) => Some(*v as f64),
+        _ => None,
+    };
+    bound(src.vmin()).is_some_and(|v| v >= lo) && bound(src.vmax()).is_some_and(|v| v <= hi)
+}
+
+/// Rewrite `idx == cmp` into the equivalent `idx' == range`, peeling casts and
+/// range-invariant arithmetic off `cmp` and applying the inverse to `idx`.
+///
+/// The compared side is hardly ever the bare range: `gather` builds its arange
+/// from a reduce that collapses to `(r + 1) + (-1)` under the index-dtype casts,
+/// which is `r` and does not match as `r`.
+fn solve_for_range(idx: &Arc<UOp>, cmp: &Arc<UOp>, range: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let (mut idx, mut cmp) = (idx.clone(), cmp.clone());
+    // Every step replaces `cmp` with one of its sources, so its depth bounds the walk.
+    loop {
+        if Arc::ptr_eq(&cmp, range) {
+            return Some(idx);
+        }
+        let step = match cmp.op() {
+            Op::Cast(ops::Cast { src, .. }) if cast_is_injective(src, &cmp.dtype()) => {
+                (idx.cast(src.dtype()), src.clone())
+            }
+            Op::Binary(BinaryOp::Add, x, y) if !reaches(y, range) => (idx.try_sub(y).ok()?, x.clone()),
+            Op::Binary(BinaryOp::Add, x, y) if !reaches(x, range) => (idx.try_sub(x).ok()?, y.clone()),
+            Op::Binary(BinaryOp::Sub, x, y) if !reaches(y, range) => (idx.try_add(y).ok()?, x.clone()),
+            _ => return None,
+        };
+        (idx, cmp) = step;
+    }
+}
+
 /// Reduction collapse patterns:
 /// 1. Sum of `where(r < cut, 0, val)` → `clamp(end-cut, 0, end) * val`
 /// 2. Sum of `where(r < cut, val, 0)` → `clamp(cut, 0, end) * val`
@@ -1392,30 +1449,33 @@ fn try_reduce_collapse(
     // Both collapse to: where(in_bounds, expr[r:=idx.valid(v)], 0)
     // NE: idx != r with zero in true_val, expression in false_val
     // EQ: idx == r with expression in true_val, zero in false_val
-    // Also handles .or_casted(): unwraps CAST around the range operand.
+    //
+    // Which side carries the range decides the orientation. `no_range` cannot
+    // decide it: it asks whether a node reaches *any* range, and a gather's
+    // index reaches the output ranges by construction — it is a different index
+    // per output element — so neither side is range-free, both tests fail and
+    // the arm gives up on the very shape it was written for. `solve_for_range`
+    // then moves whatever wraps the range over onto the index.
     //
     // A shape that is not NE/EQ over this range must FALL THROUGH to Pattern 4:
     // an `And` condition is exactly what the two-sided rule below is written for.
-    if let Some((idx, cmp_range, expr)) = match cond.op() {
-        // NE: where(idx != range_side, 0, expr).
-        Op::Binary(BinaryOp::Ne, idx, ne_range) if is_const_zero(true_val) && no_range(idx) => {
-            Some((idx, ne_range, false_val))
-        }
-        // EQ: where(idx == range_side, expr, 0) — Svod-specific
-        Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => {
-            if no_range(lhs) {
-                Some((lhs, rhs, true_val))
-            } else if no_range(rhs) {
-                Some((rhs, lhs, true_val))
-            } else {
-                None
-            }
-        }
+    if let Some((lhs, rhs, expr)) = match cond.op() {
+        Op::Binary(BinaryOp::Ne, lhs, rhs) if is_const_zero(true_val) => Some((lhs, rhs, false_val)),
+        Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => Some((lhs, rhs, true_val)),
         _ => None,
     } {
-        let actual_range = if let Op::Cast(ops::Cast { src, .. }) = cmp_range.op() { src } else { cmp_range };
-        if Arc::ptr_eq(actual_range, range) {
-            return gated_collapse_core(idx, range, end, expr);
+        // Exactly one side may carry the range; with it on both there is no
+        // single step to pick out, and with it on neither there is nothing to
+        // pick it out of.
+        let oriented = match (reaches(lhs, range), reaches(rhs, range)) {
+            (false, true) => Some((lhs, rhs)),
+            (true, false) => Some((rhs, lhs)),
+            _ => None,
+        };
+        if let Some((idx, cmp)) = oriented
+            && let Some(idx) = solve_for_range(idx, cmp, range)
+        {
+            return gated_collapse_core(&idx, range, end, expr);
         }
     }
 

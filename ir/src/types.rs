@@ -1409,21 +1409,19 @@ impl RendererDevice {
         }
     }
 
-    /// True if the device exposes a hardware cache-invalidation primitive.
-    /// Only NV CUDA and AMD runtimes implement `invalidate_caches`; Metal,
-    /// IntelXe, WebGpu, and CPU have no such primitive and must
-    /// rely on the software fallback (or run warm-cache).
-    pub const fn has_hardware_cache_invalidate(&self) -> bool {
-        matches!(
-            self,
-            Self::CudaSm75
-                | Self::CudaSm80
-                | Self::CudaSm89
-                | Self::AmdRdna3
-                | Self::AmdRdna4
-                | Self::AmdCdna3
-                | Self::AmdCdna4
-        )
+    /// True when a benchmark's software cache eviction — a stream through a
+    /// *host* scratch buffer — reaches the cache the timed kernel runs against.
+    /// Only the CPU executes out of host memory: on every GPU backend the
+    /// stream costs host time, leaves the device caches hot, and evicts the
+    /// host lines the next dispatch's submit path is about to touch.
+    pub const fn benchmark_evicts_via_host_stream(&self) -> bool {
+        matches!(self, Self::Cpu)
+    }
+
+    /// True when the device drops its clock between dispatches and needs a
+    /// stretch of load before a timing means anything; the CPU is timed as it is.
+    pub const fn idles_its_clock(&self) -> bool {
+        !matches!(self, Self::Cpu)
     }
 }
 

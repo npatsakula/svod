@@ -70,6 +70,11 @@ pub enum Epilogue<T> {
     /// accumulator holds a gate block beside its matching up block and `y` comes
     /// out `[lead..., N/2]`. `pair` is [`swiglu_pair_width`].
     SwiGlu { pair: usize },
+    /// `y = act(x·wᵀ + bias) [+ residual]` — a convolution's tail: `bias` is
+    /// `[N]`, `residual` (when present) `[lead..., N]`, both in the operand
+    /// dtype, and `act` applies SiLU. Every step rounds to the output dtype
+    /// where the graph's conv → bias → silu → add chain rounds.
+    BiasAct { bias: T, residual: Option<T>, act: bool },
 }
 
 impl<T> Epilogue<T> {
@@ -80,6 +85,9 @@ impl<T> Epilogue<T> {
             Epilogue::Plain => Epilogue::Plain,
             Epilogue::Add(_) => Epilogue::Add(()),
             Epilogue::SwiGlu { pair } => Epilogue::SwiGlu { pair: *pair },
+            Epilogue::BiasAct { residual, act, .. } => {
+                Epilogue::BiasAct { bias: (), residual: residual.as_ref().map(|_| ()), act: *act }
+            }
         }
     }
 
@@ -98,6 +106,10 @@ impl<T> Epilogue<T> {
             Epilogue::Plain => 0,
             Epilogue::Add(_) => 1,
             Epilogue::SwiGlu { .. } => 2,
+            Epilogue::BiasAct { residual: None, act: false, .. } => 3,
+            Epilogue::BiasAct { residual: None, act: true, .. } => 4,
+            Epilogue::BiasAct { residual: Some(_), act: false, .. } => 5,
+            Epilogue::BiasAct { residual: Some(_), act: true, .. } => 6,
         }
     }
 }
@@ -149,7 +161,7 @@ impl GemmCfg {
     pub fn carries(&self, epi: Epilogue<()>, frag_cols: Option<usize>) -> bool {
         match epi {
             Epilogue::Plain => true,
-            Epilogue::Add(()) => self.split_k == 1,
+            Epilogue::Add(()) | Epilogue::BiasAct { .. } => self.split_k == 1,
             Epilogue::SwiGlu { pair } => {
                 self.split_k == 1 && self.reg_n() == 2 * pair && frag_cols.is_some_and(|c| pair.is_multiple_of(c))
             }
@@ -222,7 +234,7 @@ fn block_coords(ker: &Kernel, m: usize, n: usize, cfg: &GemmCfg) -> (Arc<UOp>, A
 }
 
 /// The `(rows, cols)` of B's shared strip.
-fn b_strip(cfg: &GemmCfg) -> (usize, usize) {
+pub(super) fn b_strip(cfg: &GemmCfg) -> (usize, usize) {
     match cfg.b_order {
         BOrder::Kn => (cfg.k_step, cfg.block_n),
         BOrder::Nk => (cfg.block_n, cfg.k_step),
@@ -230,7 +242,7 @@ fn b_strip(cfg: &GemmCfg) -> (usize, usize) {
 }
 
 /// B's global block index at K-strip `tile` of N-block `col`.
-fn b_index(cfg: &GemmCfg, col: &Arc<UOp>, tile: &Arc<UOp>) -> [Idx; 4] {
+pub(super) fn b_index(cfg: &GemmCfg, col: &Arc<UOp>, tile: &Arc<UOp>) -> [Idx; 4] {
     let (r, c) = match cfg.b_order {
         BOrder::Kn => (tile, col),
         BOrder::Nk => (col, tile),
@@ -239,7 +251,13 @@ fn b_index(cfg: &GemmCfg, col: &Arc<UOp>, tile: &Arc<UOp>) -> [Idx; 4] {
 }
 
 /// This wave's B register tile and its shared sub-tile view, per [`BOrder`].
-fn b_operand<'k>(ker: &'k Kernel, cfg: &GemmCfg, in_dt: &DType, warp_col: &Arc<UOp>, b_smem: &ST) -> (RT<'k>, ST) {
+pub(super) fn b_operand<'k>(
+    ker: &'k Kernel,
+    cfg: &GemmCfg,
+    in_dt: &DType,
+    warp_col: &Arc<UOp>,
+    b_smem: &ST,
+) -> (RT<'k>, ST) {
     let (reg_n, k_step) = (cfg.reg_n(), cfg.k_step);
     match cfg.b_order {
         BOrder::Kn => (
@@ -275,6 +293,46 @@ pub fn gemm_core(
     epi: Epilogue<GL>,
 ) {
     assert_eq!(m % cfg.block_m, 0, "gemm M={m} must be a multiple of the {} block", cfg.block_m);
+    gemm_core_with(ker, (m, k, n), cfg, c_gl, a_gl, b_gl, epi, None);
+}
+
+/// Where the A strip's rows come from when they are not `A[m, k]`'s: given a
+/// strip row `r` (`0..block_m`, an `Index` UOp), this workgroup's M block and
+/// the K trip, the flat offset in the bound A buffer of that row's first strip
+/// element and whether the row exists at all (a row past a ragged `M`, or a
+/// convolution tap that falls in the padding, reads as zeros). The strip's
+/// columns follow that offset consecutively.
+///
+/// Every offset must be a multiple of the per-lane run (16 bytes, 8 elements at
+/// f16), because a row starts a lane's `cp.async` chunk wherever the arch has
+/// one: an unaligned row would fault the copy, not merely slow it. A
+/// convolution gets the alignment from `cin % k_step == 0`.
+pub type RowSource<'a> = dyn Fn(&Arc<UOp>, &Arc<UOp>, &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) + 'a;
+
+/// [`gemm_core`] with the A strip optionally gathered through `a_rows`
+/// ([`RowSource`]), and `m` may then be ragged — the grid covers
+/// `ceil(m / block_m)` row blocks, the rows past `m` load as zeros and their
+/// stores are dropped. A gathered strip takes the same pipeline as any other:
+/// `cp.async` where the arch has it (the gate rides in the copy's `src_size`,
+/// so a rejected row zero-fills without a read), else the register-staged one.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_core_with(
+    ker: &Kernel,
+    (m, k, n): (usize, usize, usize),
+    cfg: GemmCfg,
+    c_gl: GL,
+    a_gl: GL,
+    b_gl: GL,
+    epi: Epilogue<GL>,
+    a_rows: Option<&RowSource<'_>>,
+) {
+    assert!(
+        a_rows.is_some() || m % cfg.block_m == 0,
+        "gemm M={m} must be a multiple of the {} block unless the rows are gathered",
+        cfg.block_m
+    );
+    // A gathered strip that cannot go asynchronous falls to the staged pipeline,
+    // which is two-deep; `Strips::pipelined` asserts that where it chooses.
     assert_eq!(n % cfg.block_n, 0, "gemm N={n} must be a multiple of the {} block", cfg.block_n);
     // The K-edge is the A fragment's column count — 16 on MFMA/`mma.sync`, 8 on
     // Apple's `simdgroup_matrix`.
@@ -312,10 +370,11 @@ pub fn gemm_core(
     let accs: Vec<RT> = (0..cfg.acc_m).map(|_| g.zero(ker.acc((reg_m, reg_n), TileLayout::Col))).collect();
 
     let lp = ker.loop_static(trips);
-    let strip = Strips { cfg: &cfg, a_gl: &a_gl, b_gl: &b_gl, row: &row, col: &col, slab: slab.clone(), trips };
+    let strip = Strips { cfg: &cfg, a_gl: &a_gl, b_gl: &b_gl, row: &row, col: &col, slab: slab.clone(), trips, a_rows };
 
     let (a_cur, b_cur, stream) =
         if cfg.stages > 1 { strip.pipelined(&g, &lp, a_smem, b_smem) } else { strip.single(&g, &lp, a_smem, b_smem) };
+    let ragged_m = m % cfg.block_m != 0;
 
     // Shared B sub-tile (N col-block {warp_col}, same for every accumulator), and
     // per-accumulator A sub-tiles (M row-block {warp_row + a·warps_m}).
@@ -415,6 +474,7 @@ pub fn gemm_core(
     for (a, c) in final_accs.into_iter().enumerate() {
         let mrow = row.mul(&cidx(cfg.blocks_m() as i64)).add(&acc_row(&warp_row, a, &cfg));
         let ix = MoveIdx::block((Idx::Const(0), zslab.clone(), mrow, nidx.clone()), 2);
+        let ix = if ragged_m { ix.clipped() } else { ix };
         c_t = match &epi {
             Epilogue::Plain => g.store(c_t, narrow(ker, &g, c, &out_dt), ix),
             // The residual is read at the store's own global offset — the same
@@ -430,6 +490,29 @@ pub fn gemm_core(
                 })
             }
             Epilogue::SwiGlu { .. } => g.store(c_t, swiglu(ker, &g, c, &out_dt), ix),
+            // The column's bias, the activation and the residual, in the output
+            // dtype and in the store's own pass, as for `Add`.
+            Epilogue::BiasAct { bias, residual, act } => {
+                let (bias, res, act) = (bias.uop().clone(), residual.as_ref().map(|r| r.uop().clone()), *act);
+                let (c, dt, cols) = (narrow(ker, &g, c, &out_dt), out_dt.clone(), cidx(n as i64));
+                // A row past a ragged `M` is dropped by the store's gate, but its
+                // residual read still happens: clamp it into the operand.
+                let end = ragged_m.then(|| cidx((m * epi.out_cols(n)) as i64));
+                g.store_global_with(c_t, &c, ix, move |v, off| {
+                    let col = off.try_mod(&cols).expect("gemm epilogue: bias column");
+                    let v = v.try_add(&load_off(&bias, col)).expect("gemm epilogue: bias add");
+                    let v = if act { silu(&v, &dt) } else { v };
+                    let Some(r) = &res else { return v };
+                    let at = match &end {
+                        Some(end) => {
+                            let inside = off.try_cmplt(end).expect("gemm epilogue: residual bound");
+                            UOp::try_where(inside, off.clone(), cidx(0)).expect("gemm epilogue: residual clamp")
+                        }
+                        None => off.clone(),
+                    };
+                    v.try_add(&load_off(r, at)).expect("gemm epilogue: residual add")
+                })
+            }
         };
     }
 }
@@ -472,13 +555,20 @@ fn col_at(ix: &Idx, w: usize) -> Idx {
     }
 }
 
-/// `x·sigmoid(x)` in `x`'s dtype, op for op as [`Tensor::silu`] builds it:
-/// `sigmoid(x) = 1/(1 + exp2(x·(−1/ln 2)))`, every step in the operand dtype.
-fn silu(x: &Arc<UOp>, dt: &DType) -> Arc<UOp> {
-    let c = |v: f64| UOp::const_(dt.clone(), ConstValue::Float(v));
+/// `x·sigmoid(x)`, op for op as [`Tensor::silu`] builds it:
+/// `sigmoid(x) = 1/(1 + exp2(x·(−1/ln 2)))`.
+///
+/// The chain runs at [`DType::math_dtype`] and rounds once on the way out, which
+/// is what `Tensor` does and what PyTorch's elementwise kernels do: a narrow
+/// operand left to round at every step costs three roundings it need not pay.
+/// Both casts are no-ops for an operand that is already wide.
+pub(crate) fn silu(x: &Arc<UOp>, dt: &DType) -> Arc<UOp> {
+    let math = dt.math_dtype();
+    let x = x.cast(math.clone());
+    let c = |v: f64| UOp::const_(math.clone(), ConstValue::Float(v));
     let e = x.try_mul(&c(-1.0 / std::f64::consts::LN_2)).and_then(|s| s.try_exp2()).expect("silu: exp2");
     let sig = UOp::try_reciprocal(&c(1.0).try_add(&e).expect("silu: 1 + exp2")).expect("silu: reciprocal");
-    x.try_mul(&sig).expect("silu: x·sigmoid(x)")
+    x.try_mul(&sig).expect("silu: x·sigmoid(x)").cast(dt.clone())
 }
 
 /// Convert a finished f32 accumulator to the output dtype **in registers**, as an
@@ -493,7 +583,7 @@ fn silu(x: &Arc<UOp>, dt: &DType) -> Arc<UOp> {
 /// whole K-loop pays for it (measured on sm_86: 256 B/lane of spill, 13.7 → 4.0
 /// TFLOP/s). Every index here is a constant, so the accumulator stays in registers
 /// and only the narrow result reaches the store.
-fn narrow<'k>(ker: &'k Kernel, g: &Group<'k>, acc: RT<'k>, out_dt: &DType) -> RT<'k> {
+pub(super) fn narrow<'k>(ker: &'k Kernel, g: &Group<'k>, acc: RT<'k>, out_dt: &DType) -> RT<'k> {
     if acc.elem() == out_dt {
         return acc;
     }
@@ -529,6 +619,8 @@ struct Strips<'a> {
     col: &'a Arc<UOp>,
     slab: Option<Arc<UOp>>,
     trips: i64,
+    /// The A strip's rows, gathered ([`RowSource`]) instead of read from `A[m, k]`.
+    a_rows: Option<&'a RowSource<'a>>,
 }
 
 impl Strips<'_> {
@@ -539,6 +631,17 @@ impl Strips<'_> {
             None => tile.clone(),
         };
         ([Idx::Const(0), Idx::Const(0), Idx::from(self.row), Idx::from(&t)], b_index(self.cfg, self.col, &t))
+    }
+
+    /// Stage K-strip `tile` of both operands into registers (the staged pipeline's
+    /// prefetch): A through its row source when it has one.
+    fn stage(&self, g: &Group<'_>, a_smem: &ST, b_smem: &ST, tile: &Arc<UOp>) -> [Arc<UOp>; 2] {
+        let (ai, bi) = self.at(tile);
+        let a = match self.a_rows {
+            Some(rows) => g.stage_global_rows_to_reg(a_smem, self.a_gl, |r| rows(r, self.row, tile)),
+            None => g.stage_global_to_reg(a_smem, self.a_gl, &ai, 2),
+        };
+        [a, g.stage_global_to_reg(b_smem, self.b_gl, &bi, 2)]
     }
 
     /// Single-buffered: one collaborative GLOBAL→LDS fill per trip, the two strips
@@ -584,9 +687,7 @@ impl Strips<'_> {
     /// (never gathered) instead of running off the operand.
     fn staged(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
         let half = |st: &ST, p: &Arc<UOp>| st.with_base_offset(p.mul(&cidx(st.half_elems() as i64)));
-        let (a0, b0) = self.at(&cidx(0));
-        let s_a = g.stage_global_to_reg(&a_smem, self.a_gl, &a0, 2);
-        let s_b = g.stage_global_to_reg(&b_smem, self.b_gl, &b0, 2);
+        let [s_a, s_b] = self.stage(g, &a_smem, &b_smem, &cidx(0));
         let (a_half, b_half) = (half(&a_smem, &cidx(0)), half(&b_smem, &cidx(0)));
         let landed = g.commit_regs_to_local(&[(&a_half, &s_a), (&b_half, &s_b)]).barrier(smallvec![]);
         g.kernel().push_store(landed.clone(), a_smem.uop().clone());
@@ -597,9 +698,7 @@ impl Strips<'_> {
         let par = |t: &Arc<UOp>| t.try_mod(&cidx(2)).expect("stage parity");
         let (par_cur, par_nxt) = (par(&idx), par(&nxt));
         let pf = nxt.try_mod(&cidx(self.trips)).expect("prefetch strip % trips");
-        let (ai, bi) = self.at(&pf);
-        let stage =
-            [g.stage_global_to_reg(&a_smem, self.a_gl, &ai, 2), g.stage_global_to_reg(&b_smem, self.b_gl, &bi, 2)];
+        let stage = self.stage(g, &a_smem, &b_smem, &pf);
         // The gathers order after the issue, so the loads are in flight under them.
         let issued: SmallVec<[Arc<UOp>; 4]> = smallvec![stage[0].clone(), stage[1].clone()];
         let nxt = Box::new([half(&a_smem, &par_nxt), half(&b_smem, &par_nxt)]);
@@ -624,7 +723,11 @@ impl Strips<'_> {
         let half = |st: &ST, p: &Arc<UOp>| st.with_base_offset(p.mul(&cidx(st.half_elems() as i64)));
         let issue = |a: &ST, b: &ST, t: &Arc<UOp>| {
             let (ai, bi) = self.at(t);
-            [g.cp_async_fill(a, self.a_gl, &ai, 2), g.cp_async_fill(b, self.b_gl, &bi, 2)]
+            let a_copy = match self.a_rows {
+                Some(rows) => g.cp_async_fill_rows(a, self.a_gl, |r| rows(r, self.row, t)),
+                None => g.cp_async_fill(a, self.a_gl, &ai, 2),
+            };
+            [a_copy, g.cp_async_fill(b, self.b_gl, &bi, 2)]
         };
         // Prologue: strips `0..stages-1`, each into its own half.
         let mut deps: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
@@ -683,6 +786,26 @@ pub const NT_128X64: GemmCfg = GemmCfg {
 /// grid is already big enough, so [`GemmPolicy`] picks it only when that grid is not.
 pub const NT_64X64: GemmCfg = GemmCfg { block_m: 64, acc_m: 1, ..NT_128X64 };
 
+/// 64×64 over a 4×2 wave grid (8 waves, 256 threads), one 16×32 accumulator per
+/// wave and a 64-deep strip: half the barriers per K element, and four times the
+/// waves to hide the fill behind. 32 KiB of shared memory, so three blocks per
+/// sm_86 SM — fewer than [`NT_64X64`]'s six, which is why it only leads where the
+/// grid cannot fill the device anyway. Measured on the YOLO26x convolutions
+/// (RTX 3060): `768→768 k3s2 @20²` 244 → 235 µs, the `192→192 k3 @40²`
+/// bottleneck 67.5 → 62.5, `768→768 k3s2 @40²` a wash, and 2% behind on the
+/// wide-grid `384→384 k3s2 @80²`.
+pub const NT_64X64_W8: GemmCfg = GemmCfg { block_m: 64, warps_m: 4, acc_m: 1, k_step: 64, ..NT_128X64 };
+
+/// 32×32 over a 2×2 wave grid, one 16×16 accumulator per wave, a 64-deep strip:
+/// the tile for a shape whose N is too narrow to tile the device — four times
+/// [`NT_64X64`]'s blocks out of the same C. 16 KiB of shared memory and ~half
+/// the operand reuse per fill, so it loses badly wherever the grid is already
+/// wide (`768→768 k3s2 @20²` 244 → 378 µs). Measured where it is not: the
+/// `192→192 k3 @20²` bottleneck 34.6 → 25.3 µs (75 blocks over 28 SMs becomes
+/// 300; ncu puts the 64×64 form at 0.54 waves per SM and 19% achieved
+/// occupancy), `384→192 k3 @20²` 59.4 → 46.8.
+pub const NT_32X32: GemmCfg = GemmCfg { block_m: 32, block_n: 32, acc_m: 1, k_step: 64, ..NT_128X64 };
+
 /// The split-K tile: [`NT_128X64`] over two K-slabs, writing `[2, M, N]` f32
 /// partials that a second pass sums. **Never selected by [`GemmPolicy`]**: the
 /// partials' round trip costs more than the wider grid saves (122 vs 98 µs on a
@@ -690,8 +813,11 @@ pub const NT_64X64: GemmCfg = GemmCfg { block_m: 64, acc_m: 1, ..NT_128X64 };
 /// still). Kept for a device with more bandwidth per FLOP, which flips the sign.
 pub const NT_SPLIT_K: GemmCfg = GemmCfg { split_k: 2, l2_swizzle: false, ..NT_128X64 };
 
-/// The CUDA sm_80+ tiles, widest first.
-pub const CUDA_TILES: [GemmCfg; 2] = [NT_128X64, NT_64X64];
+/// The CUDA sm_80+ tiles, widest first. The two fine ones are never the static
+/// choice ([`GemmPolicy::cfg`] keeps its order among the tiles narrower than the
+/// widest): they are there for [`GemmPolicy::tuned`] to measure on a shape whose
+/// grid starves the device, which the convolutions at 20² and 40² do.
+pub const CUDA_TILES: [GemmCfg; 4] = [NT_128X64, NT_64X64, NT_64X64_W8, NT_32X32];
 
 /// The RDNA (wave32 WMMA) tiles, measured on gfx1151: the CUDA tiles without the
 /// L2 swizzle, plus the fine tile on a 64-deep strip, which halves the barriers
@@ -855,14 +981,16 @@ impl GemmPolicy {
 
     /// The gate/up row-block width an [`Epilogue::SwiGlu`] fused weight must be
     /// laid out in: `reg_n/2` — half a wave's N tile, the two halves its
-    /// accumulator holds side by side — common to every tile in the table, or
-    /// `None` when they disagree or the table is empty (the caller then keeps a
-    /// separate SwiGLU pass). The GEMM's `M` is not known when the weight is
-    /// loaded, and `M` is what picks the tile, so the row arrangement has to be
-    /// one that **every** candidate tile reads.
+    /// accumulator holds side by side — taken from the widest tile, or `None`
+    /// when the table is empty or holds a tile wider than its first (the caller
+    /// then keeps a separate SwiGLU pass). The GEMM's `M` is not known when the
+    /// weight is loaded, and `M` is what picks the tile, so the row arrangement
+    /// has to be one every tile that may be picked reads. A *narrower* tile
+    /// cannot be: [`GemmCfg::carries`] admits a `SwiGlu` only at its own
+    /// `reg_n/2`, so a finer tile simply never serves a fused GEMM.
     pub fn swiglu_pair_width(&self) -> Option<usize> {
         let pair = self.tiles.first()?.reg_n() / 2;
-        self.tiles.iter().all(|cfg| cfg.reg_n() / 2 == pair).then_some(pair)
+        self.tiles.iter().all(|cfg| cfg.reg_n() / 2 <= pair).then_some(pair)
     }
 }
 
@@ -1064,6 +1192,7 @@ fn build_gemm(
                 Epilogue::SwiGlu { .. } => "gemm_nt_swiglu",
                 Epilogue::Plain if split > 1 => "gemm_nt_split",
                 Epilogue::Plain => "gemm_nt",
+                Epilogue::BiasAct { .. } => unreachable!("a conv epilogue enters through conv2d_nhwc"),
             };
             let mut ins = vec![x, w];
             if let Epilogue::Add(r) = epi {
@@ -1109,6 +1238,7 @@ pub fn build_gemm_nt(
         Epilogue::Plain => Epilogue::Plain,
         Epilogue::Add(()) => Epilogue::Add(ins[2].clone()),
         Epilogue::SwiGlu { pair } => Epilogue::SwiGlu { pair },
+        Epilogue::BiasAct { .. } => unreachable!("a conv epilogue enters through build_conv"),
     };
     gemm_core(ker, (m, k, n), cfg, outs[0].clone(), ins[0].clone(), ins[1].clone(), epi);
 }

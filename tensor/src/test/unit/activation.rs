@@ -92,6 +92,83 @@ fn test_silu_alias() {
 }
 
 // =========================================================================
+// The width a transcendental chain is evaluated in
+// =========================================================================
+
+/// The dtypes a built chain evaluates its transcendentals at, and every cast it
+/// mints, source-to-target, in topological order.
+fn chain_widths(y: &Tensor) -> (Vec<DType>, Vec<(DType, DType)>) {
+    use svod_ir::{Op, UnaryOp};
+    let (mut math, mut casts) = (Vec::new(), Vec::new());
+    for node in y.uop().toposort() {
+        match node.op() {
+            Op::Unary(UnaryOp::Exp | UnaryOp::Exp2 | UnaryOp::Reciprocal | UnaryOp::Erf, src) => math.push(src.dtype()),
+            Op::Cast(cast) => casts.push((cast.src.dtype(), cast.dtype.clone())),
+            _ => {}
+        }
+    }
+    (math, casts)
+}
+
+/// Every transcendental chain a narrow stream enters is evaluated in fp32 and
+/// rounded once, where it leaves — PyTorch's `opmath_type`, and the difference
+/// between YOLO26's P5/32 drift at 7.2× a fair PyTorch and at 1.3×.
+///
+/// The nesting is what the single pair of casts pins: `gelu` calls `tanh` calls
+/// `sigmoid`, and only the outermost widens.
+#[test]
+fn a_narrow_chain_is_evaluated_in_fp32_and_rounded_once() {
+    let x = Tensor::empty(&[5], DType::Float16);
+    let chains: [(&str, Result<Tensor>); 8] = [
+        ("sigmoid", x.sigmoid()),
+        ("tanh", x.tanh()),
+        ("swish", x.swish()),
+        ("silu", x.silu()),
+        ("gelu", x.gelu()),
+        ("gelu_exact", x.gelu_exact()),
+        ("elu", x.elu(1.0)),
+        ("selu", x.selu(1.673_263_2, 1.050_701)),
+    ];
+
+    for (name, built) in chains {
+        let y = built.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(y.dtype(), DType::Float16, "{name} hands back the stream's own width");
+
+        let (math, casts) = chain_widths(&y);
+        assert!(!math.is_empty(), "{name} has no transcendental — it does not belong in this table");
+        assert!(math.iter().all(|d| *d == DType::Float32), "{name} still evaluates at {math:?}");
+        assert_eq!(
+            casts,
+            [(DType::Float16, DType::Float32), (DType::Float32, DType::Float16)],
+            "{name} should round once, on the way out"
+        );
+    }
+}
+
+/// A stream that is already wide is left exactly as it was: the promotion mints
+/// no casts, so an fp32 graph keeps the AST it had before.
+#[test]
+fn a_wide_chain_is_untouched() {
+    let x = Tensor::empty(&[5], DType::Float32);
+    let chains: [(&str, Result<Tensor>); 8] = [
+        ("sigmoid", x.sigmoid()),
+        ("tanh", x.tanh()),
+        ("swish", x.swish()),
+        ("silu", x.silu()),
+        ("gelu", x.gelu()),
+        ("gelu_exact", x.gelu_exact()),
+        ("elu", x.elu(1.0)),
+        ("selu", x.selu(1.673_263_2, 1.050_701)),
+    ];
+
+    for (name, built) in chains {
+        let y = built.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(y.dtype(), DType::Float32, "{name} preserves fp32");
+        assert_eq!(chain_widths(&y).1, [], "{name} mints a cast on an fp32 stream");
+    }
+}
+
+// =========================================================================
 // Batch Normalization Tests
 // =========================================================================
 

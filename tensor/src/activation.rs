@@ -14,6 +14,29 @@ use crate::{Result, Tensor, error::UOpSnafu};
 
 #[bon]
 impl Tensor {
+    /// Evaluate a transcendental chain at [`DType::math_dtype`] and round the
+    /// result once on the way out, the way PyTorch's CUDA elementwise kernels do
+    /// (`opmath_type`).
+    ///
+    /// Left in a narrow stream, a chain rounds at every step: fp16 `x·sigmoid(x)`
+    /// is four roundings against one, which is what put YOLO26's P5/32 drift at
+    /// 7.2× a fair PyTorch. Widening is exact and the one cast back usually folds
+    /// into the consumer, so the price is an fp32 transcendental where the
+    /// hardware offers a narrow — possibly 2-wide — one.
+    ///
+    /// A stream that is already wide is handed to `chain` untouched, so the
+    /// chains nest for free: [`Self::gelu`] widens once and the [`Self::tanh`]
+    /// and [`Self::sigmoid`] inside it see fp32 and add nothing.
+    #[track_caller]
+    fn in_math_dtype(&self, chain: impl FnOnce(&Self) -> Result<Self>) -> Result<Self> {
+        let dtype = self.dtype();
+        let math = dtype.math_dtype();
+        if math == dtype {
+            return chain(self);
+        }
+        Ok(chain(&self.cast(math))?.cast(dtype))
+    }
+
     /// Rectified Linear Unit: `max(0, x)`.
     ///
     /// ReLU is one of the most common activation functions in deep learning.
@@ -48,13 +71,14 @@ impl Tensor {
         origin_call!("sigmoid");
         // sigmoid(x) = 1 / (1 + exp(-x)) = 1 / (1 + 2^(-x/ln2))
         // Using exp2 matches Tinygrad's implementation for better hardware mapping.
-        let scale = self.broadcast_scalar(ConstValue::Float(-1.0 / std::f64::consts::LN_2))?;
-        let scaled = self.try_mul(&scale)?;
-        let exp2_val = scaled.try_exp2()?;
-        let one = exp2_val.one()?;
-        let denominator = one.try_add(&exp2_val)?;
-        let recip = Self::new(UOp::try_reciprocal(&denominator.uop()).context(UOpSnafu)?);
-        Ok(recip)
+        self.in_math_dtype(|x| {
+            let scale = x.broadcast_scalar(ConstValue::Float(-1.0 / std::f64::consts::LN_2))?;
+            let scaled = x.try_mul(&scale)?;
+            let exp2_val = scaled.try_exp2()?;
+            let one = exp2_val.one()?;
+            let denominator = one.try_add(&exp2_val)?;
+            Ok(Self::new(UOp::try_reciprocal(&denominator.uop()).context(UOpSnafu)?))
+        })
     }
 
     /// Hyperbolic tangent: `tanh(x)`.
@@ -73,12 +97,14 @@ impl Tensor {
         // Check if tanh is a UOp primitive
         // tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
         // Or: tanh(x) = 2*sigmoid(2x) - 1
-        let two = self.broadcast_scalar(ConstValue::Int(2))?;
-        let two_x = self.try_mul(&two)?;
-        let sig = two_x.sigmoid()?;
-        let two_sig = two.try_mul(&sig)?;
-        let one = sig.one()?;
-        two_sig.try_sub(&one)
+        self.in_math_dtype(|x| {
+            let two = x.broadcast_scalar(ConstValue::Int(2))?;
+            let two_x = x.try_mul(&two)?;
+            let sig = two_x.sigmoid()?;
+            let two_sig = two.try_mul(&sig)?;
+            let one = sig.one()?;
+            two_sig.try_sub(&one)
+        })
     }
 
     /// Softmax activation: `exp(x - max(x)) / sum(exp(x - max(x)))`.
@@ -186,47 +212,34 @@ impl Tensor {
         origin_call!("gelu");
         // gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
         // sqrt(2/π) ≈ 0.7978845608
+        self.in_math_dtype(|x| {
+            let half = x.broadcast_scalar(ConstValue::Float(0.5))?;
+            let one = x.broadcast_scalar(ConstValue::Float(1.0))?;
+            let coef1 = x.broadcast_scalar(ConstValue::Float(0.7978845608))?;
+            let coef2 = x.broadcast_scalar(ConstValue::Float(0.044715))?;
 
-        let half = self.broadcast_scalar(ConstValue::Float(0.5))?;
-        let one = self.broadcast_scalar(ConstValue::Float(1.0))?;
-        let coef1 = self.broadcast_scalar(ConstValue::Float(0.7978845608))?;
-        let coef2 = self.broadcast_scalar(ConstValue::Float(0.044715))?;
+            // 0.044715 * x^3
+            let cubic_term = coef2.try_mul(&x.try_mul(x)?.try_mul(x)?)?;
 
-        // x^3
-        let x_squared = self.try_mul(self)?;
-        let x_cubed = x_squared.try_mul(self)?;
+            // sqrt(2/π) * (x + 0.044715 * x^3)
+            let scaled = coef1.try_mul(&x.try_add(&cubic_term)?)?;
 
-        // 0.044715 * x^3
-        let cubic_term = coef2.try_mul(&x_cubed)?;
-
-        // x + 0.044715 * x^3
-        let inner = self.try_add(&cubic_term)?;
-
-        // sqrt(2/π) * (x + 0.044715 * x^3)
-        let scaled = coef1.try_mul(&inner)?;
-
-        // tanh(...)
-        let tanh_part = scaled.tanh()?;
-
-        // 1 + tanh(...)
-        let one_plus_tanh = one.try_add(&tanh_part)?;
-
-        // x * (1 + tanh(...))
-        let x_times = self.try_mul(&one_plus_tanh)?;
-
-        // 0.5 * x * (1 + tanh(...))
-        half.try_mul(&x_times)
+            // 0.5 * x * (1 + tanh(...))
+            half.try_mul(&x.try_mul(&one.try_add(&scaled.tanh()?)?)?)
+        })
     }
 
     /// Exact GELU: `0.5 * x * (1 + erf(x / sqrt(2)))`.
     #[track_caller]
     pub fn gelu_exact(&self) -> Result<Self> {
         origin_call!("gelu_exact");
-        let dtype = self.uop().dtype();
-        let half = Tensor::const_(0.5f64, dtype.clone());
-        let one = Tensor::const_(1.0f64, dtype.clone());
-        let sqrt2 = Tensor::const_(std::f64::consts::SQRT_2, dtype);
-        half.try_mul(self)?.try_mul(&one.try_add(&self.try_div(&sqrt2)?.erf()?)?)
+        self.in_math_dtype(|x| {
+            let dtype = x.dtype();
+            let half = Tensor::const_(0.5f64, dtype.clone());
+            let one = Tensor::const_(1.0f64, dtype.clone());
+            let sqrt2 = Tensor::const_(std::f64::consts::SQRT_2, dtype);
+            half.try_mul(x)?.try_mul(&one.try_add(&x.try_div(&sqrt2)?.erf()?)?)
+        })
     }
 
     /// Hard Sigmoid: `clamp(alpha * x + beta, 0, 1)`.
@@ -296,13 +309,15 @@ impl Tensor {
     #[track_caller]
     pub fn elu(&self, alpha: f64) -> Result<Self> {
         origin_call!("elu");
-        let zero = self.zero()?;
-        let one = self.one()?;
-        let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
-        let condition = self.try_gt(&zero)?;
-        let exp_minus_1 = self.try_exp()?.try_sub(&one)?;
-        let neg_branch = alpha_t.try_mul(&exp_minus_1)?;
-        self.where_(&condition, &neg_branch)
+        self.in_math_dtype(|x| {
+            let zero = x.zero()?;
+            let one = x.one()?;
+            let alpha_t = x.broadcast_scalar(ConstValue::Float(alpha))?;
+            let condition = x.try_gt(&zero)?;
+            let exp_minus_1 = x.try_exp()?.try_sub(&one)?;
+            let neg_branch = alpha_t.try_mul(&exp_minus_1)?;
+            x.where_(&condition, &neg_branch)
+        })
     }
 
     /// SELU: `gamma * (alpha * exp(x) - alpha) if x <= 0, gamma * x if x > 0`.
@@ -315,15 +330,16 @@ impl Tensor {
     #[track_caller]
     pub fn selu(&self, alpha: f64, gamma: f64) -> Result<Self> {
         origin_call!("selu");
-        let zero = self.zero()?;
-        let alpha_t = self.broadcast_scalar(ConstValue::Float(alpha))?;
-        let gamma_t = self.broadcast_scalar(ConstValue::Float(gamma))?;
-        let condition = self.try_ge(&zero)?;
-        // neg: alpha * exp(x) - alpha
-        let neg_branch =
-            alpha_t.try_mul(&self.try_exp()?)?.try_sub(&self.broadcast_scalar(ConstValue::Float(alpha))?)?;
-        let selected = self.where_(&condition, &neg_branch)?;
-        gamma_t.try_mul(&selected)
+        self.in_math_dtype(|x| {
+            let zero = x.zero()?;
+            let alpha_t = x.broadcast_scalar(ConstValue::Float(alpha))?;
+            let gamma_t = x.broadcast_scalar(ConstValue::Float(gamma))?;
+            let condition = x.try_ge(&zero)?;
+            // neg: alpha * exp(x) - alpha
+            let neg_branch = alpha_t.try_mul(&x.try_exp()?)?.try_sub(&alpha_t)?;
+            let selected = x.where_(&condition, &neg_branch)?;
+            gamma_t.try_mul(&selected)
+        })
     }
 
     /// Swish/SiLU activation: `x * sigmoid(x)`.
@@ -340,8 +356,7 @@ impl Tensor {
     pub fn swish(&self) -> Result<Self> {
         origin_call!("swish");
         // swish(x) = x * sigmoid(x)
-        let sig = self.sigmoid()?;
-        self.try_mul(&sig)
+        self.in_math_dtype(|x| x.try_mul(&x.sigmoid()?))
     }
 
     /// Alias for `swish` (matches PyTorch naming).

@@ -386,6 +386,8 @@ fn identity_and_zero_patterns_unchecked() -> &'static TypedPatternMatcher {
 /// - ALU(WHERE(cond, x, Invalid), y) → WHERE(cond, ALU(x, y), Invalid)
 /// - ALU(y, WHERE(cond, x, Invalid)) → WHERE(cond, ALU(y, x), Invalid)
 /// - ALU(Invalid, y) → Invalid (non-comparison binary ops, left position only)
+/// - REDUCE(op, WHERE(cond, x, Invalid)) → WHERE(cond, REDUCE(op, x), Invalid),
+///   for a `cond` no reduce range can move
 ///
 /// Upstream only propagates bare Invalid from the left position. Right-position
 /// bare Invalid is not propagated.
@@ -483,6 +485,29 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
             let marker = UOp::invalid_marker();
             UOp::try_where(cond.clone(), inner, marker).ok()
         },
+
+        // A gate no reduce range can move is the same for every contribution, so
+        // the whole reduction is valid or invalid together and the gate lifts out.
+        // Without this the gate stays wedged between the REDUCE and its MUL, where
+        // `tc::matmul_operands` — which sees through casts and nothing else —
+        // stops recognising a matmul and every tensor-core opt is declined.
+        // `num_axes > 0` also reduces leading shaped axes, which carry no RANGE to
+        // test `cond` against, so those are left alone.
+        //
+        // It fires far more often than it pays: a concat-heavy graph triggers it
+        // dozens of times and mostly reaches the same kernels anyway. Where it
+        // does change the kernel it only reorders the loop nest — the extents are
+        // the same multiset — so a graph with no matmul to unblock gets the
+        // reorder and nothing for it, and inception-style branches measurably
+        // lose a couple of percent. The payoff is specific to the tensor-core
+        // matcher while this rule is general symbolic rewriting; see 49d264b2 for
+        // the measurements on both sides.
+        Reduce { src: Where(cond, x, invalid), ranges, reduce_op, num_axes }
+            if UOp::is_invalid_marker(invalid) && *num_axes == 0 && !moved_by_ranges(cond, ranges)
+            => {
+                let reduced = assuming(x, cond).reduce_with_num_axes(ranges.clone(), *reduce_op, *num_axes);
+                UOp::try_where(cond.clone(), reduced, UOp::invalid_marker()).ok()
+            },
 
         // Push binary ALU through WHERE-with-Invalid (left operand)
         // ALU(WHERE(cond, x, Invalid), y) → WHERE(cond, ALU(x, y), Invalid)
@@ -2311,6 +2336,57 @@ fn reduce_mul_chain_sym(
     let reduced = inside_prod.reduce_with_num_axes(ranges.clone(), reduce_op, num_axes);
     let outside_prod = outside.into_iter().reduce(|a, b| a.try_mul(&b).expect("mul failed")).unwrap();
     reduced.try_mul(&outside_prod).ok()
+}
+
+/// `body` as it reads under a `cond` that now dominates it, which makes every
+/// copy of the same test inside redundant. A conv fused into a concat keeps one
+/// in the gate on its own input, and left there that gate still reads the
+/// concatenated output range — enough for `tc::detect_matmul` to decide the
+/// input varies along the output channel and to lose the matmul's N axis.
+///
+/// INDEX subtrees are left alone. The same test also guards the address of the
+/// out-of-range half, and a WHERE lowers to a select rather than a branch, so
+/// the load still runs for every lane and dropping that copy reads out of
+/// bounds. Value redundancy and address validity are not the same redundancy.
+fn assuming(body: &Arc<UOp>, cond: &Arc<UOp>) -> Arc<UOp> {
+    let known: std::collections::HashSet<u64> =
+        cond.split_uop(BinaryOp::And).iter().chain([cond]).map(|clause| clause.id).collect();
+    let truth = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let mut done = std::collections::HashMap::new();
+    discharge(body, &known, &truth, &mut done)
+}
+
+fn discharge(
+    uop: &Arc<UOp>,
+    known: &std::collections::HashSet<u64>,
+    truth: &Arc<UOp>,
+    done: &mut std::collections::HashMap<u64, Arc<UOp>>,
+) -> Arc<UOp> {
+    if known.contains(&uop.id) {
+        return Arc::clone(truth);
+    }
+    if matches!(uop.op(), Op::Index { .. }) {
+        return Arc::clone(uop);
+    }
+    if let Some(built) = done.get(&uop.id) {
+        return Arc::clone(built);
+    }
+    let sources: Vec<Arc<UOp>> =
+        uop.op().sources().into_iter().map(|src| discharge(&src, known, truth, done)).collect();
+    let built = if sources.iter().zip(uop.op().sources()).all(|(new, old)| Arc::ptr_eq(new, &old)) {
+        Arc::clone(uop)
+    } else {
+        uop.with_sources(sources)
+    };
+    done.insert(uop.id, Arc::clone(&built));
+    built
+}
+
+/// Whether `uop` reads any of `ranges`, i.e. whether a reduction over them can
+/// change its value.
+fn moved_by_ranges(uop: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> bool {
+    let range_ids: std::collections::HashSet<u64> = ranges.iter().map(|r| r.id).collect();
+    uop.any_in_subtree(|node| range_ids.contains(&node.id))
 }
 
 /// REMOVE_FROM_SINK_LIKE = {Ops.NOOP, Ops.STACK, Ops.SINK}

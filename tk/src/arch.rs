@@ -280,4 +280,26 @@ impl ArchCaps {
     pub fn needs_pipeline_commit_fence(&self) -> bool {
         self.arch.amd().is_some_and(AmdArch::is_rdna4)
     }
+
+    /// Whether a GLOBAL→LOCAL tile fill can be issued as asynchronous copies
+    /// retired as one group (`cp.async` on CUDA). A plan whose body is built
+    /// *entirely* out of those copies — the tap-unrolled and image-staged
+    /// convolutions — exists only where this holds; every other fill stages
+    /// through registers and runs anywhere. A plan offered without it reaches
+    /// [`crate::Group::cp_async_fill`] and panics rather than lowering.
+    ///
+    /// False on AMD, and on RDNA3/RDNA4 that is the ISA and not a gap in this
+    /// tree: VMEM→LDS direct loads (`global_load … lds`, `buffer_load … lds`)
+    /// exist through GFX10, were removed in GFX11, are absent from GFX12, and
+    /// return only in GFX12.5 as a different `global_load_async_to_lds_*`
+    /// family — `llvm.amdgcn.load.to.lds` lowers on gfx942 and gfx1030 and
+    /// fails instruction selection on gfx1100 and gfx1201. CDNA does have the
+    /// instruction, so wiring it there remains open. False on Metal, which has
+    /// no counterpart at all.
+    pub fn has_async_copy(&self) -> bool {
+        match self.arch {
+            GpuArch::Cuda(_) => true,
+            GpuArch::Amd(_) | GpuArch::Metal(_) => false,
+        }
+    }
 }

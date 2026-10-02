@@ -3985,6 +3985,8 @@ dependencies = [
  "svod-schedule",
  "svod-tensor",
  "test-case",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

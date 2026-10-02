@@ -132,15 +132,24 @@ fn render_special(uop: &Arc<UOp>, name: &str, ctx: &mut RenderContext, kernel: &
     Some(())
 }
 
-// ── BARRIER: block-scope fences around bar.sync 0 ─────────────────────────
+// ── BARRIER: bar.sync 0 ───────────────────────────────────────────────────
 
-/// NVPTX names the work-group scope `"block"` (`syncscope("workgroup")` is
-/// rejected). `@llvm.nvvm.barrier0` is the form every LLVM release lowers to
-/// `bar.sync 0` (newer ones auto-upgrade it to `barrier.cta.sync.aligned.all`).
+/// `@llvm.nvvm.barrier0` is the form every LLVM release lowers to `bar.sync 0`
+/// (newer ones auto-upgrade it to `barrier.cta.sync.aligned.all`), and it is
+/// the whole barrier: the intrinsic carries no memory attributes, so LLVM
+/// treats it as clobbering all memory and will not move an access across it,
+/// and `bar.sync` itself orders every prior access of the participating threads
+/// before the barrier completes (PTX ISA 9.7.12.1). This is what clang emits
+/// for `__syncthreads()`.
+///
+/// Wrapping it in `fence syncscope("block") release/acquire` — which is what
+/// this used to do — is therefore redundant, and not free: ptxas renders each
+/// fence as a `MEMBAR.ALL.CTA` preceded by four predicated-off `LDS RZ, [RZ]`,
+/// so a barrier cost **eleven** instructions instead of one. In a
+/// software-pipelined K loop that was 14% of the body (measured on the sm_86
+/// `conv2d_nhwc` patch kernel: 126 of 692 instructions per trip).
 fn render_barrier(kernel: &mut Vec<String>) -> Option<()> {
-    kernel.push("  fence syncscope(\"block\") release".to_string());
     kernel.push("  tail call void @llvm.nvvm.barrier0()".to_string());
-    kernel.push("  fence syncscope(\"block\") acquire".to_string());
     Some(())
 }
 

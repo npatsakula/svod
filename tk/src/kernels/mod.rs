@@ -6,9 +6,11 @@
 //! [`group`](crate::group), [`tile`](crate::tile), …); this module is the place
 //! for concrete kernels built from those primitives.
 
+pub mod conv;
 pub mod fa;
 pub mod gemm;
 pub mod kmeans;
 pub mod knn;
 pub mod norm;
 pub mod sq_attention;
+pub mod tiling;

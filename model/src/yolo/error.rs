@@ -17,6 +17,11 @@ pub enum Error {
     Hub { source: hf_hub::HFError },
     #[snafu(display("invalid yolo config: {message}"))]
     Config { message: String },
+    #[snafu(display("hand kernel: {source}"), context(false))]
+    Tk {
+        #[snafu(source(from(svod_tk::LaunchError, Box::new)))]
+        source: Box<svod_tk::LaunchError>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

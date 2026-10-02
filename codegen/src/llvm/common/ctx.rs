@@ -3,7 +3,7 @@
 //! Maps UOp IDs to LLVM variable names and manages naming.
 //! Shared between CPU and GPU backends.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use svod_ir::{ConstValue, Op, prelude::*};
@@ -26,6 +26,13 @@ pub struct RenderContext {
     /// by AMD LOCAL BUFFER rendering to emit `@local_N = addrspace(3) global ...`
     /// declarations, which cannot be expressed inline in the function body.
     module_prefix: Vec<String>,
+    /// Metadata tuple a loop's back edge carries (an unroll hint); `None`
+    /// renders loops bare.
+    loop_hint: Option<&'static str>,
+    /// RANGE ids whose loops stay bare even with a hint set.
+    unhinted: HashSet<u64>,
+    /// Loop IDs handed out so far, one per hinted back edge.
+    loops: usize,
 }
 
 impl RenderContext {
@@ -36,6 +43,39 @@ impl RenderContext {
             range_stack: Vec::new(),
             pending_error: None,
             module_prefix: Vec::new(),
+            loop_hint: None,
+            unhinted: HashSet::new(),
+            loops: 0,
+        }
+    }
+
+    /// Attach `hint`, a metadata tuple such as `!{!"llvm.loop.unroll.disable"}`,
+    /// to every loop rendered from here on except those over the RANGEs in
+    /// `unhinted`.
+    pub fn set_loop_hint(&mut self, hint: &'static str, unhinted: HashSet<u64>) {
+        self.loop_hint = Some(hint);
+        self.unhinted = unhinted;
+    }
+
+    /// The branch that closes the loop over `range` (axis `id`) — back to its
+    /// latch, with a loop ID of its own when it carries the hint.
+    pub fn back_edge(&mut self, range: &Arc<UOp>, id: &str) -> String {
+        let branch = format!("  br label %loop_latch_{id}");
+        if self.loop_hint.is_none() || self.unhinted.contains(&range.id) {
+            return branch;
+        }
+        self.loops += 1;
+        format!("{branch}, !llvm.loop !{}", self.loops)
+    }
+
+    /// The module-level nodes the back edges refer to: the hint as `!0`, then
+    /// one distinct, self-referential loop ID per loop, as LLVM requires.
+    pub fn loop_metadata(&self) -> Vec<String> {
+        match self.loop_hint {
+            Some(hint) if self.loops > 0 => std::iter::once(format!("!0 = {hint}"))
+                .chain((1..=self.loops).map(|n| format!("!{n} = distinct !{{!{n}, !0}}")))
+                .collect(),
+            _ => Vec::new(),
         }
     }
 

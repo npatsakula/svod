@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
-use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_commit, cp_async_wait, ldmatrix};
+use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill, cp_async_commit, cp_async_wait, ldmatrix};
 use svod_ir::{AxisType, ConstValue, Op, UOp};
 
 use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, wave_offset};
@@ -20,6 +20,13 @@ use crate::layout::{LaneMap, LdmatrixX4};
 use crate::tile::{GL, RT, ST};
 use crate::tiles::TileLayout;
 use svod_ir::ops;
+
+/// Where a scattered store's rows land: given the tile-local row, the flat
+/// element offset of that row's start in the destination and, for a tiling that
+/// overhangs the tensor, whether the row exists. The offset is always inside the
+/// tensor (a rejected row clamps), so the epilogue's own reads at it are safe;
+/// only the write is dropped.
+pub type RowStore<'a> = dyn Fn(&Arc<UOp>) -> (Arc<UOp>, Option<Arc<UOp>>) + 'a;
 
 /// Scalar geometry of the coalesced GLOBAL↔LDS fill for one ST tile (the part
 /// independent of the global source / tile position). Shared by the direct fill
@@ -113,6 +120,52 @@ impl<'k> Group<'k> {
                 if src.elem() != st.elem() {
                     v = v.cast(st.elem().clone());
                 }
+                stores.push(flat_index(&stage, &stage_shape, &[Idx::Const(pass), Idx::Const(e as i64)]).store(v));
+            }
+        }
+        let stored = super::group_or_single(stores);
+        self.ker.push_store(stored.clone(), stage.clone());
+        stage.after(smallvec![stored])
+    }
+
+    /// [`Self::stage_global_to_reg`] for a strip whose rows are not consecutive
+    /// in `src`: `rows` maps a strip row (`0..st.rows`) to the flat offset of that
+    /// row's first strip element and a validity gate; the strip's columns follow
+    /// that offset consecutively. An invalid row reads element `0` and lands as
+    /// zeros, so a gathered operand (a convolution's padded taps, the rows past a
+    /// ragged `M`) never touches memory it does not own, and a lane's `ept` run
+    /// stays one shaped load.
+    pub fn stage_global_rows_to_reg(
+        &self,
+        st: &ST,
+        src: &GL,
+        rows: impl Fn(&Arc<UOp>) -> (Arc<UOp>, Arc<UOp>),
+    ) -> Arc<UOp> {
+        let geom = self.lds_fill_geom(st);
+        let stage = self.ker.alloc_reg((geom.total_calls * geom.ept) as usize, st.elem().clone());
+        let stage_shape = [geom.total_calls as usize, geom.ept as usize];
+        let ept = geom.ept as usize;
+        let mut stores = Vec::with_capacity(stage_shape[0] * ept);
+        for pass in 0..geom.total_calls {
+            let (height, width, row, col) = self.fill_lane_rc(&geom, &cidx(pass), &cidx(0));
+            let strip_row = iadd(&imul(&height, geom.base_rows), &row);
+            let strip_col = iadd(&imul(&width, geom.base_cols), &col);
+            let (row_off, valid) = rows(&strip_row);
+            let off = iadd(&row_off, &strip_col);
+            let safe = UOp::try_where(valid.clone(), off, cidx(0)).expect("gathered row: safe offset");
+            let run = load_off_vec(src.uop(), &safe, ept);
+            // The fill is a multiply by the gate, not a select: a `WHERE` over a
+            // load is rewritten into a gated load, whose gate the index
+            // simplifier may then discharge against the clamped offset.
+            // Through f32: the backends select a bool -> f32 conversion, not a
+            // bool -> bf16 one.
+            let mask = valid.cast(svod_dtype::DType::Float32).cast(st.elem().clone());
+            for e in 0..ept {
+                let mut v = vec_elem(&run, e, ept);
+                if src.elem() != st.elem() {
+                    v = v.cast(st.elem().clone());
+                }
+                let v = v.try_mul(&mask).expect("gathered row: zero fill");
                 stores.push(flat_index(&stage, &stage_shape, &[Idx::Const(pass), Idx::Const(e as i64)]).store(v));
             }
         }
@@ -330,7 +383,8 @@ impl<'k> Group<'k> {
     }
 
     /// Whether the collaborative fill of `st` from `src` can be `cp.async`
-    /// 16-byte copies: a CUDA target, one lane's `elements_per_thread` run is
+    /// 16-byte copies: a target with an asynchronous copy
+    /// ([`crate::ArchCaps::has_async_copy`]), one lane's `elements_per_thread` run is
     /// exactly 16 bytes, no element cast, the swizzle keeps 16-byte chunks
     /// contiguous ([`crate::swizzle::Swizzle::keeps_16b_chunks`]), and every
     /// lane has its own chunk on every pass. The register-staged fill lets an
@@ -339,7 +393,7 @@ impl<'k> Group<'k> {
     /// guarantee, so a tile that does not divide into whole passes stays on
     /// the staged path.
     pub fn cp_async_fill_applies(&self, st: &ST, src: &GL) -> bool {
-        self.ker.caps.cuda().is_some()
+        self.ker.caps.has_async_copy()
             && st.base.base.elements_per_thread() * st.elem().bytes() == 16
             && src.elem() == st.elem()
             && st.base.swizzle.keeps_16b_chunks()
@@ -360,7 +414,10 @@ impl<'k> Group<'k> {
     /// are 16-byte aligned (`axis` row stride and the innermost extent multiples of
     /// the per-lane run — `D % 8 == 0` for bf16).
     pub fn cp_async_fill(&self, st: &ST, src: &GL, idxs: &[Idx], axis: usize) -> Arc<UOp> {
-        assert!(self.cp_async_fill_applies(st, src), "cp.async fill: CUDA, 16-byte lane runs, no cast, chunk swizzle");
+        assert!(
+            self.cp_async_fill_applies(st, src),
+            "cp.async fill: async-copy target, 16-byte lane runs, no cast, chunk swizzle"
+        );
         let geom = self.lds_fill_geom(st);
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
         let inner = *src.shape().last().expect("GL rank") as i64;
@@ -383,6 +440,52 @@ impl<'k> Group<'k> {
                     ),
                 );
                 cp_async_16(&dst, &index_off(src.uop(), off))
+            })
+            .collect();
+        cp_async_commit(copies)
+    }
+
+    /// [`Self::cp_async_fill`] for a strip whose rows are not consecutive in
+    /// `src` — the asynchronous counterpart of
+    /// [`Self::stage_global_rows_to_reg`], with the same `rows` contract. A row
+    /// the gate rejects copies **zero bytes**: its 16-byte chunk zero-fills in
+    /// the copy engine, so the padded taps cost neither a read nor the mask
+    /// multiply the staged path pays, and the strip never lands in a register on
+    /// its way to LDS.
+    ///
+    /// # Panics
+    /// Panics unless [`Self::cp_async_fill_applies`]. Each row offset `rows`
+    /// returns must be a multiple of the per-lane run (16 bytes), which is what
+    /// lets a row start a lane's chunk; a convolution gets that from
+    /// `cin % k_step == 0`.
+    pub fn cp_async_fill_rows(&self, st: &ST, src: &GL, rows: impl Fn(&Arc<UOp>) -> (Arc<UOp>, Arc<UOp>)) -> Arc<UOp> {
+        assert!(
+            self.cp_async_fill_applies(st, src),
+            "cp.async row fill: async-copy target, 16-byte lane runs, no cast, chunk swizzle"
+        );
+        let geom = self.lds_fill_geom(st);
+        let run_bytes = geom.ept * st.elem().bytes() as i64;
+
+        let copies: SmallVec<[Arc<UOp>; 4]> = (0..geom.total_calls)
+            .map(|pass| {
+                let (height, width, row, col) = self.fill_lane_rc(&geom, &cidx(pass), &cidx(0));
+                let (srow, scol) =
+                    st.base.swizzle.swizzle_rc(row.clone(), col.clone(), st.base.base.cols, st.elem().base());
+                let dst =
+                    st_index(st, &[Idx::Uop(height.clone()), Idx::Uop(width.clone()), Idx::Uop(srow), Idx::Uop(scol)]);
+                let strip_row = iadd(&imul(&height, geom.base_rows), &row);
+                let strip_col = iadd(&imul(&width, geom.base_cols), &col);
+                let (row_off, valid) = rows(&strip_row);
+                let off = iadd(&row_off, &strip_col);
+                // The gate is the copy's `src_size`, never a mask on a loaded
+                // value. The address is still clamped to element 0 so that no
+                // lane forms one outside the operand, even though a zero-byte
+                // copy does not dereference it.
+                let safe = UOp::try_where(valid.clone(), off, cidx(0)).expect("gathered row: safe offset");
+                let src_bytes = UOp::try_where(valid, cidx(run_bytes), cidx(0))
+                    .expect("gathered row: src_size")
+                    .cast(svod_dtype::DType::Int32);
+                cp_async_16_zfill(&dst, &index_off(src.uop(), safe), &src_bytes)
             })
             .collect();
         cp_async_commit(copies)
@@ -680,6 +783,60 @@ impl<'k> Group<'k> {
         self.finalize_reg(rt, ended)
     }
 
+    /// LOCAL→REG fragment gather whose M rows are **gathered**: `row` maps this
+    /// lane's tile-local M row to a logical row of `st`, so one shared tile
+    /// serves several shifted views of itself — the `kh·kw` taps of a
+    /// convolution over one staged image patch. `col_blk` is the wave's column
+    /// block, as [`Self::load`] takes it in `idxs[1]`.
+    ///
+    /// The gather is `ldmatrix.x4`-only, and that is the whole point: there a
+    /// lane supplies its own row address, so an arbitrary row costs nothing,
+    /// while the scalar and vector gathers address through a fragment-blocked
+    /// subtile that cannot express one. Every row `row` returns is decoded once,
+    /// outside any K loop it is built in.
+    ///
+    /// # Panics
+    /// Panics unless the `ldmatrix.x4` plan applies to `(rt, st)` read
+    /// untransposed (CUDA, 16-bit, the 16×16/8-per-lane base, a chunk-keeping
+    /// swizzle), and unless `row` stays inside `st`.
+    pub fn load_local_rows(
+        &self,
+        rt: RT<'k>,
+        st: &ST,
+        col_blk: Option<&Idx>,
+        row: impl Fn(&Arc<UOp>) -> Arc<UOp>,
+    ) -> RT<'k> {
+        let plan = self.ldmatrix_plan(&rt, st, false).expect("gathered LOCAL→REG gather needs ldmatrix.x4");
+        let laneid = self.ker.laneid();
+        let n = rt.shape().len();
+        let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
+        let lane_row = imod(&laneid, 16);
+        let col = imul(&idiv(&laneid, 16), 8);
+        let pair = rt.elem().vec(2).expect("16-bit element pair");
+        let mut stores = Vec::with_capacity((rt_h * rt_w * 8) as usize);
+        for h in 0..rt_h {
+            let logical = row(&iadd(&lane_row, &cidx(h * 16)));
+            let (frag, within) = (idiv(&logical, 16), imod(&logical, 16));
+            let (srow, scol) = st.base.swizzle.swizzle_rc(within, col.clone(), st.base.base.cols, st.elem().base());
+            for w in 0..rt_w {
+                let wblk = match col_blk {
+                    None => Idx::Const(w),
+                    Some(b) => Idx::Uop(iadd(&imul(&b.to_uop(), rt_w), &cidx(w))),
+                };
+                let src_idx = [Idx::Uop(frag.clone()), wblk, Idx::Uop(srow.clone()), Idx::Uop(scol.clone())];
+                let words = ldmatrix(&st_index(st, &src_idx), 4, plan.trans, pair.clone());
+                for (p, &m) in plan.words.iter().enumerate() {
+                    for e in 0..2 {
+                        let didx = [Idx::Const(h), Idx::Const(w), Idx::Const(2 * p as i64 + e as i64)];
+                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(words[m].index_axes(vec![e])));
+                    }
+                }
+            }
+        }
+        let ended = super::group_or_single(stores);
+        self.finalize_reg(rt, ended)
+    }
+
     /// The boundary gate for a GLOBAL↔REG hop: `global_row < shape[axis] &
     /// global_col < shape[last]`, restricted to the axes that are actually ragged
     /// (the extent is not a multiple of the per-block tile span — known at build
@@ -696,10 +853,11 @@ impl<'k> Group<'k> {
         col_tile: i64,
         srow: &Arc<UOp>,
         scol: &Arc<UOp>,
+        clipped: bool,
     ) -> Option<Arc<UOp>> {
         let mut gate: Option<Arc<UOp>> = None;
         let bound_row = shape[axis] as i64;
-        if bound_row % row_tile != 0 {
+        if clipped || bound_row % row_tile != 0 {
             let blk = idxs.get(axis).map(|i| i.to_uop()).unwrap_or_else(|| cidx(0));
             let g = iadd(&imul(&blk, row_tile), srow).try_cmplt(&cidx(bound_row)).expect("boundary row gate");
             gate = Some(g);
@@ -762,7 +920,9 @@ impl<'k> Group<'k> {
             let scol = iadd(&imul(&ix[1].to_uop(), base_cols), &col);
             let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
             let gate = masked
-                .then(|| self.boundary_gate(src.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
+                .then(|| {
+                    self.boundary_gate(src.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol, false)
+                })
                 .flatten();
             let mut load = match gate {
                 Some(g) => {
@@ -833,7 +993,7 @@ impl<'k> Group<'k> {
         axis: usize,
         masked: bool,
     ) -> GL {
-        self.store_reg_to_global_with(dst, rt, idxs, src_idxs, axis, masked, |v, _| v.clone())
+        self.store_reg_to_global_with(dst, rt, idxs, src_idxs, axis, masked, false, None, |v, _| v.clone())
     }
 
     /// [`Self::store`]'s REG→GLOBAL hop with a per-element **value transform**:
@@ -851,7 +1011,22 @@ impl<'k> Group<'k> {
     where
         F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
     {
-        self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, value)
+        self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, ix.clipped, None, value)
+    }
+
+    /// [`Self::store_global_with`] for a tile whose M rows are **scattered**:
+    /// `rows` maps the tile-local row to the flat element offset of that row's
+    /// start in `dst` and whether it exists — a convolution whose block is a
+    /// 2-D window of the output image, whose rows are `wo` apart. The offset a
+    /// rejected row returns is still dereferenced by the `value` transform's
+    /// reads (the bias column, the residual), so `rows` returns one inside the
+    /// tensor and the gate only drops the write. `ix.block` must carry
+    /// `Idx::Const(0)` at `ix.axis`: the row offset is `rows`' alone.
+    pub fn store_global_rows<F>(&self, dst: GL, rt: &RT<'k>, ix: MoveIdx, rows: &RowStore<'_>, value: F) -> GL
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, ix.clipped, Some(rows), value)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -863,6 +1038,8 @@ impl<'k> Group<'k> {
         src_idxs: &[Idx],
         axis: usize,
         masked: bool,
+        clipped: bool,
+        rows: Option<&RowStore<'_>>,
         value: F,
     ) -> GL
     where
@@ -898,7 +1075,12 @@ impl<'k> Group<'k> {
             let (row, col) = rt.lane_rc(transpose, &laneid, &ix[2].to_uop());
             let srow = iadd(&imul(&ix[0].to_uop(), base_rows), &row);
             let scol = iadd(&imul(&ix[1].to_uop(), base_cols), &col);
-            let off = iadd(&dst_i_base, &iadd(&imul(&srow, row_stride), &scol));
+            let scattered = rows.map(|f| f(&srow));
+            let row_off = match &scattered {
+                Some((off, _)) => off.clone(),
+                None => imul(&srow, row_stride),
+            };
+            let off = iadd(&dst_i_base, &iadd(&row_off, &scol));
 
             let mut sidx: Vec<Idx> = src_idxs.to_vec();
             sidx.extend(ix.iter().cloned());
@@ -907,9 +1089,15 @@ impl<'k> Group<'k> {
                 load = load.cast(dst.elem().clone());
             }
             let load = value(&load, &off);
-            let gate = masked
-                .then(|| self.boundary_gate(dst.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
+            let edge = masked
+                .then(|| {
+                    self.boundary_gate(dst.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol, clipped)
+                })
                 .flatten();
+            let gate = match (edge, scattered.and_then(|(_, valid)| valid)) {
+                (Some(a), Some(b)) => Some(a.try_and_op(&b).expect("scattered store: gate")),
+                (g, None) | (None, g) => g,
+            };
             let target = match gate {
                 Some(g) => index_off_gated(dst.uop(), off, g),
                 None => index_off(dst.uop(), off),

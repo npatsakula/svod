@@ -228,6 +228,41 @@ impl Tensor {
             };
         }
 
+        // Nearest at an integer scale is "repeat each element" wherever the
+        // coordinate transform and the rounding compose to `floor(o / s)`, and
+        // `repeat_interleave` is that as a view. The general path below would
+        // spend a one-hot masked sum-reduce per axis instead — the neck's two
+        // upsamples are 101 µs of a 4.87 ms YOLO26x frame on gfx1201, and
+        // 222 µs on an RTX 3060, for an operation that moves nothing.
+        //
+        // Only the two combinations that are exactly `floor(o / s)` are taken.
+        // `half_pixel` gives `ceil((o + 0.5)/s - 1)`, and `(r + 0.5)/s - 1` is
+        // in `(-1, 0)` for every `r < s`, so it is `o / s` exactly; `asymmetric`
+        // with `floor` is `floor(o / s)` by construction. The four other pairings
+        // are not — `asymmetric` with `round_prefer_floor` reads the next input
+        // element once `r / s > 0.5` — and they keep the gather.
+        if mode == ResizeMode::Nearest
+            && matches!(
+                (coordinate_transformation_mode, nearest_mode),
+                (CoordinateTransformMode::HalfPixel, NearestMode::RoundPreferFloor)
+                    | (CoordinateTransformMode::Asymmetric, NearestMode::Floor)
+            )
+            && let Some(repeats) = input_shape
+                .iter()
+                .zip(&output_sizes)
+                .map(|(&inp, &out)| (inp > 0 && out >= inp && out.is_multiple_of(inp)).then_some(out / inp))
+                .collect::<Option<Vec<_>>>()
+        {
+            for (i, repeat) in repeats.into_iter().enumerate() {
+                x = x.repeat_interleave(repeat, (ndim - n_axes + active_idx[i]) as isize)?;
+            }
+            return if perm.iter().enumerate().any(|(i, &p)| p != i as isize) {
+                x.try_permute(&inv_perm_i)
+            } else {
+                Ok(x)
+            };
+        }
+
         let n_spatial = active_idx.len();
 
         // Extract per-spatial-dim ROI (start, end) pairs
