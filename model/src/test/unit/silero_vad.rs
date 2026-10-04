@@ -33,7 +33,7 @@ fn forward_chunk_zero_weights_shape() {
 }
 
 // ---------------------------------------------------------------------------
-// SIMD scan parity: 8-lane exp/tanh vs the scalar LSTM reference.
+// SIMD scan parity: lane-wise exp/tanh vs the scalar LSTM reference.
 // ---------------------------------------------------------------------------
 
 /// Deterministic ~U(-1,1) stream (LCG); the test needs reproducibility, not
@@ -43,7 +43,7 @@ fn lcg(seed: &mut u64) -> f32 {
     ((*seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
 }
 
-/// `VadHead::scan` is 8-lane SIMD with polynomial `exp`/`tanh`. The recurrence
+/// `VadHead::scan` is lane-wise SIMD with polynomial `exp`/`tanh`. The recurrence
 /// compounds drift over steps, so a 200-step scan over O(1) gate inputs must
 /// agree with a scalar `f32::exp`/`tanh` reference well below the VAD
 /// threshold's meaningful resolution (probs only feed a 0.5 cut).

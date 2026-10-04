@@ -2,96 +2,12 @@
 //!
 //! Provides pretty-printing of UOp computation graphs as ASCII trees.
 
-use std::cell::RefCell;
 use std::collections::HashSet;
-use std::io;
+use std::fmt::Write;
 use std::sync::Arc;
-use std::{borrow::Cow, rc::Rc};
-
-use ptree::{Style, TreeItem};
 
 use crate::ops;
 use crate::{ConstValue, ConstValueHash, Op, UOp};
-
-/// Wrapper for compact tree rendering with back-references for shared nodes.
-///
-/// Since UOp is a DAG (hash-consed), nodes can appear multiple times in the graph.
-/// This renderer shows `[id] → (see above)` for already-visited nodes.
-#[derive(Clone)]
-pub struct UOpTreeCompact {
-    uop: Arc<UOp>,
-    visited: Rc<RefCell<HashSet<u64>>>,
-    /// True if this node was already visited when write_self was called
-    is_backref: RefCell<bool>,
-}
-
-impl UOpTreeCompact {
-    /// Create a new compact tree renderer.
-    pub fn new(uop: &Arc<UOp>) -> Self {
-        Self { uop: uop.clone(), visited: Rc::new(RefCell::new(HashSet::new())), is_backref: RefCell::new(false) }
-    }
-
-    fn from_child(uop: Arc<UOp>, visited: Rc<RefCell<HashSet<u64>>>) -> Self {
-        Self { uop, visited, is_backref: RefCell::new(false) }
-    }
-}
-
-impl TreeItem for UOpTreeCompact {
-    type Child = UOpTreeCompact;
-
-    fn write_self<W: io::Write>(&self, f: &mut W, _style: &Style) -> io::Result<()> {
-        let mut visited = self.visited.borrow_mut();
-        if visited.contains(&self.uop.id) {
-            // Already visited - show back-reference
-            *self.is_backref.borrow_mut() = true;
-            write!(f, "[{}] → (see above)", self.uop.id)
-        } else {
-            visited.insert(self.uop.id);
-            write!(f, "{}", format_node(&self.uop))
-        }
-    }
-
-    fn children(&self) -> Cow<'_, [Self::Child]> {
-        // Don't show children for back-references
-        if *self.is_backref.borrow() {
-            return Cow::Borrowed(&[]);
-        }
-
-        let sources = self.uop.op().sources();
-        let children: Vec<_> =
-            sources.iter().map(|src| UOpTreeCompact::from_child(src.clone(), self.visited.clone())).collect();
-        Cow::Owned(children)
-    }
-}
-
-/// Wrapper for full tree rendering that expands shared nodes every time.
-///
-/// This is more verbose but shows the complete subtree for every occurrence.
-#[derive(Clone)]
-pub struct UOpTreeFull {
-    uop: Arc<UOp>,
-}
-
-impl UOpTreeFull {
-    /// Create a new full tree renderer.
-    pub fn new(uop: &Arc<UOp>) -> Self {
-        Self { uop: uop.clone() }
-    }
-}
-
-impl TreeItem for UOpTreeFull {
-    type Child = UOpTreeFull;
-
-    fn write_self<W: io::Write>(&self, f: &mut W, _style: &Style) -> io::Result<()> {
-        write!(f, "{}", format_node(&self.uop))
-    }
-
-    fn children(&self) -> Cow<'_, [Self::Child]> {
-        let sources = self.uop.op().sources();
-        let children: Vec<_> = sources.iter().map(|src| UOpTreeFull { uop: src.clone() }).collect();
-        Cow::Owned(children)
-    }
-}
 
 /// Truncate a code/source string to a fixed number of leading chars for display.
 fn truncate_for_display(code: &str) -> String {
@@ -200,18 +116,33 @@ fn format_node(uop: &Arc<UOp>) -> String {
 /// Shared nodes (appearing multiple times due to hash-consing) are shown
 /// as back-references: `[id] → (see above)`
 pub fn render_tree_compact(uop: &Arc<UOp>) -> String {
-    let tree = UOpTreeCompact::new(uop);
-    let mut buf = Vec::new();
-    ptree::write_tree(&tree, &mut buf).expect("tree rendering failed");
-    String::from_utf8(buf).expect("invalid utf8 in tree")
+    render(uop, Some(HashSet::new()))
 }
 
 /// Render a UOp graph as a full ASCII tree string.
 ///
 /// Shared nodes are expanded every time they appear (verbose but complete).
 pub fn render_tree_full(uop: &Arc<UOp>) -> String {
-    let tree = UOpTreeFull::new(uop);
-    let mut buf = Vec::new();
-    ptree::write_tree(&tree, &mut buf).expect("tree rendering failed");
-    String::from_utf8(buf).expect("invalid utf8 in tree")
+    render(uop, None)
+}
+
+/// With `visited`, a node printed once is shown as a back-reference afterwards.
+fn render(uop: &Arc<UOp>, mut visited: Option<HashSet<u64>>) -> String {
+    let mut out = String::new();
+    write_node(&mut out, uop, "", "", &mut visited);
+    out
+}
+
+fn write_node(out: &mut String, uop: &Arc<UOp>, lead: &str, child_lead: &str, visited: &mut Option<HashSet<u64>>) {
+    let backref = visited.as_mut().is_some_and(|seen| !seen.insert(uop.id));
+    let label = if backref { format!("[{}] → (see above)", uop.id) } else { format_node(uop) };
+    writeln!(out, "{lead}{label}").expect("writing to a String cannot fail");
+    if backref {
+        return;
+    }
+    let sources = uop.op().sources();
+    for (i, src) in sources.iter().enumerate() {
+        let (branch, rest) = if i + 1 == sources.len() { ("└── ", "    ") } else { ("├── ", "│   ") };
+        write_node(out, src, &format!("{child_lead}{branch}"), &format!("{child_lead}{rest}"), visited);
+    }
 }

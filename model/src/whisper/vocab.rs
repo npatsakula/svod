@@ -13,43 +13,17 @@
 
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 
+use crate::simd::exp_nonpos;
+
 /// Widest top-`k` the lane network handles before the scalar scan is cheaper.
 const TOP_K_MAX: usize = 8;
 
 /// Below this the dispatch preamble (~50 ns) costs more than the vectors save.
 const SIMD_FLOOR: usize = 64;
 
-/// `exp(x)` for `x <= 0`, lane-wise.
-///
-/// Cephes' `expf` reduction: `x = n*ln2 + r` with `ln2` split so `n * C1` is
-/// exact, a degree-5 minimax polynomial on `r`, and `2^n` assembled directly
-/// into the exponent field. Within one ulp of `f32::exp` across the range --
-/// this is the algorithm libm itself uses, not a fast approximation.
-// The coefficients are Cephes' published `expf` constants; they are written at
-// their documented precision so they stay recognizable against the reference,
-// and every one of them rounds to the same f32 either way.
-#[allow(clippy::excessive_precision)]
-#[inline(always)]
-fn exp_nonpos<S: Simd>(x: S::f32s) -> S::f32s {
-    const C1: f32 = 0.693_359_375;
-    const C2: f32 = -2.121_944_4e-4;
-
-    let n = (x * std::f32::consts::LOG2_E).round_ties_even();
-    let r = n.mul_add(-C2, n.mul_add(-C1, x));
-    let p = r.mul_add(1.987_569_1e-4, 1.398_199_9e-3);
-    let p = p.mul_add(r, 8.333_452e-3);
-    let p = p.mul_add(r, 4.166_579_6e-2);
-    let p = p.mul_add(r, 1.666_666_6e-1);
-    let p = p.mul_add(r, 5.000_000_1e-1);
-    let p = (p * r).mul_add(r, r) + 1.0;
-
-    let bits: S::i32s = n.to_int();
-    p * ((bits + 127) << 23u32).bitcast::<S::f32s>()
-}
-
 #[inline(always)]
 fn max_inner<S: Simd>(simd: S, arr: &[f32]) -> f32 {
-    let lanes = S::f32s::N;
+    let lanes = S::f32s::LEN;
     let mut acc = S::f32s::splat(simd, f32::NEG_INFINITY);
     let mut pass = arr.chunks_exact(lanes);
     for chunk in &mut pass {
@@ -63,7 +37,7 @@ fn max_inner<S: Simd>(simd: S, arr: &[f32]) -> f32 {
 /// about `1.6e-38` instead of zero: unreachable by the sampler at f32 spacing.
 #[inline(always)]
 fn scaled_exp_inner<S: Simd>(simd: S, arr: &[f32], scale: f32, out: &mut [f32]) -> f32 {
-    let lanes = S::f32s::N;
+    let lanes = S::f32s::LEN;
     let max_val = max_inner(simd, arr);
     if max_val == f32::NEG_INFINITY {
         out.fill(0.0);
@@ -88,7 +62,7 @@ fn scaled_exp_inner<S: Simd>(simd: S, arr: &[f32], scale: f32, out: &mut [f32]) 
 
 #[inline(always)]
 fn logsumexp_inner<S: Simd>(simd: S, arr: &[f32]) -> f32 {
-    let lanes = S::f32s::N;
+    let lanes = S::f32s::LEN;
     let max_val = max_inner(simd, arr);
     if max_val == f32::NEG_INFINITY {
         return f32::NEG_INFINITY;
@@ -113,7 +87,7 @@ fn logsumexp_inner<S: Simd>(simd: S, arr: &[f32]) -> f32 {
 
 #[inline(always)]
 fn top_k_inner<S: Simd>(simd: S, logits: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let lanes = S::f32s::N;
+    let lanes = S::f32s::LEN;
     // Each lane keeps its own top-`k` through an insertion network. Their union
     // contains the global top-`k`: an element outside its own lane's top-`k`
     // already has `k` larger elements in that lane alone.

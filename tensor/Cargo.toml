@@ -17,7 +17,6 @@ svod-codegen = { path = "../codegen", version = "=0.1.0-alpha.7" }
 svod-macros = { path = "../macros", version = "=0.1.0-alpha.7" }
 svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.7" }
 svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.7" }
-once_cell = "1.21.3"
 snafu = "0.9"
 bon = "3.10"
 smallvec = { workspace = true }
@@ -34,13 +33,8 @@ rayon = "1.12.0"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[features]
-default = []
-# Enable trace-level spans in hot paths (compile-time control)
-tracing-verbose = []
-
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = "0.8"
 test-case = "3.3.1"
 svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.7", features = [
   "testing",

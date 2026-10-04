@@ -17,6 +17,7 @@ pub use splitter::{SileroVadSplitter, SileroVadSplitterError};
 
 use std::path::Path;
 
+use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use snafu::Snafu;
 use svod_dtype::DType;
 use svod_macros::jit_wrapper;
@@ -220,17 +221,21 @@ fn sigmoid(x: f32) -> f32 {
 impl VadHead {
     /// Recurrent LSTM + sigmoid head over `[n, 4H]` pre-activation gates from
     /// the feature JIT (`W_ih·feat + biases`, PyTorch `[i,f,g,o]` order),
-    /// 8-lane SIMD activations.
+    /// SIMD activations at the widest ISA the CPU has.
     pub(crate) fn scan(&self, gates_x: &[f32], n: usize) -> Vec<f32> {
-        use wide::f32x8;
-        const L: usize = 8;
-        let h = self.final_w.len();
-        debug_assert_eq!(h % L, 0, "HIDDEN must be a multiple of the SIMD width");
-        debug_assert_eq!(gates_x.len(), n * 4 * h, "gates shape");
+        debug_assert_eq!(gates_x.len(), n * 4 * self.final_w.len(), "gates shape");
+        dispatch!(Level::new(), simd => self.scan_inner(simd, gates_x, n))
+    }
 
-        let lanes = |v: &[f32], j: usize| f32x8::from(<[f32; L]>::try_from(&v[j..j + L]).expect("lane"));
-        let sig = |x: f32x8| ((-x).exp() + 1.0).recip();
+    #[inline(always)]
+    fn scan_inner<S: Simd>(&self, simd: S, gates_x: &[f32], n: usize) -> Vec<f32> {
+        let lanes_n = S::f32s::LEN;
+        let h = self.final_w.len();
+        debug_assert_eq!(h % lanes_n, 0, "HIDDEN must be a multiple of the SIMD width");
+
+        let lanes = |v: &[f32], j: usize| S::f32s::from_slice(simd, &v[j..j + lanes_n]);
         let w = self.final_w.as_slice().expect("final_w");
+        let zero = S::f32s::splat(simd, 0.0);
 
         let mut hs = ndarray::Array1::<f32>::zeros(h);
         let mut cs = vec![0.0f32; h];
@@ -242,20 +247,20 @@ impl VadHead {
             ndarray::linalg::general_mat_vec_mul(1.0, &self.w_hh, &hs, 0.0, &mut gh);
             let ghs = gh.as_slice().expect("contiguous gh");
             let hss = hs.as_slice_mut().expect("contiguous hs");
-            let mut p = f32x8::ZERO;
-            for j in (0..h).step_by(L) {
+            let mut p = zero;
+            for j in (0..h).step_by(lanes_n) {
                 let gate = |k: usize| lanes(gx, k) + lanes(ghs, k);
-                let i = sig(gate(j));
-                let f = sig(gate(h + j));
-                let g = gate(2 * h + j).tanh();
-                let o = sig(gate(3 * h + j));
+                let i = crate::simd::sigmoid(simd, gate(j));
+                let f = crate::simd::sigmoid(simd, gate(h + j));
+                let g = crate::simd::tanh(simd, gate(2 * h + j));
+                let o = crate::simd::sigmoid(simd, gate(3 * h + j));
                 let c = f * lanes(&cs, j) + i * g;
-                let hv = o * c.tanh();
-                cs[j..j + L].copy_from_slice(&c.to_array());
-                hss[j..j + L].copy_from_slice(&hv.to_array());
-                p += lanes(w, j) * hv.max(f32x8::ZERO);
+                let hv = o * crate::simd::tanh(simd, c);
+                c.store_slice(&mut cs[j..j + lanes_n]);
+                hv.store_slice(&mut hss[j..j + lanes_n]);
+                p += lanes(w, j) * hv.max(zero);
             }
-            probs.push(sigmoid(self.final_b + p.reduce_add()));
+            probs.push(sigmoid(self.final_b + p.as_slice().iter().sum::<f32>()));
         }
         probs
     }

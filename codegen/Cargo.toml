@@ -17,10 +17,5 @@ snafu = "0.9"
 tracing = "0.1"
 smallvec.workspace = true
 
-[features]
-default = []
-# Enable trace-level spans in hot paths (compile-time control)
-tracing-verbose = []
-
 [dev-dependencies]
 test-case = "3.3.1"

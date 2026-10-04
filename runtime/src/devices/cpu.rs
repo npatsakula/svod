@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use std::sync::LazyLock;
 use svod_device::Result;
 use svod_device::device::{Compiler, Device, Program, ProgramSpec, Renderer, RuntimeFactory};
 use svod_device::registry::DeviceRegistry;
@@ -415,7 +415,7 @@ pub fn create_cpu_device_with_backend(registry: &DeviceRegistry, backend: CpuBac
 /// Building a CPU device probes the clang toolchain (`ClangToolchain::discover`
 /// plus `target_identity`), which costs ~20 ms. Callers that resolve a device
 /// per schedule item must not pay that per item.
-static CPU_DEVICES: Lazy<RwLock<HashMap<CpuBackend, Arc<Device>>>> = Lazy::new(Default::default);
+static CPU_DEVICES: LazyLock<RwLock<HashMap<CpuBackend, Arc<Device>>>> = LazyLock::new(Default::default);
 
 /// Get or create the shared CPU device for `backend`.
 ///

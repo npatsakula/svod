@@ -520,13 +520,10 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
     }
 
     // Partial unroll by 4
-    for splits in [4] {
-        if size % splits == 0 {
-            debug!(last_unrollable, size, splits, "apply_unroll: partial unroll");
-            if apply_opt(scheduler, &Opt::unroll(logical_idx, splits), true).is_ok() {
-                return true;
-            }
-        }
+    const SPLITS: usize = 4;
+    if size % SPLITS == 0 {
+        debug!(last_unrollable, size, splits = SPLITS, "apply_unroll: partial unroll");
+        return apply_opt(scheduler, &Opt::unroll(logical_idx, SPLITS), true).is_ok();
     }
 
     false
