@@ -341,6 +341,12 @@ impl GigaAmTranscriber {
 
         Ok(Self { model, mel, mel_jit, framed, head_decoder, encoder_jit, max_batch, max_t_mel })
     }
+
+    /// Windows one compiled dispatch decodes. Every dispatch runs at this batch
+    /// shape, so a caller pooling windows fills batches of exactly this size.
+    pub fn max_batch(&self) -> usize {
+        self.max_batch
+    }
 }
 
 impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
