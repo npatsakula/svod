@@ -16,7 +16,7 @@
 
 use std::cell::RefCell;
 
-use once_cell::sync::OnceCell;
+use std::sync::OnceLock;
 
 use crate::DeviceSpec;
 
@@ -24,7 +24,7 @@ thread_local! {
     static THREAD_DEFAULT: RefCell<Option<DeviceSpec>> = const { RefCell::new(None) };
 }
 
-static PROCESS_DEFAULT: OnceCell<DeviceSpec> = OnceCell::new();
+static PROCESS_DEFAULT: OnceLock<DeviceSpec> = OnceLock::new();
 
 /// Set the current thread's default device.
 pub fn set_default_device(spec: DeviceSpec) {

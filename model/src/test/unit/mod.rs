@@ -16,6 +16,7 @@ mod qwen3;
 mod remap;
 mod resnet;
 mod silero_vad;
+mod simd;
 mod state;
 mod state_dict;
 mod transcribe;

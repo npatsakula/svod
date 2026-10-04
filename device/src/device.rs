@@ -407,11 +407,25 @@ fn sha256(bytes: &[u8]) -> StageDigest {
     StageDigest(Sha256::digest(bytes).into())
 }
 
+/// `io::Write` over a hasher: sha2 0.11 no longer implements it.
+struct HashWriter(Sha256);
+
+impl std::io::Write for HashWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn linear_sha256(linear: &Arc<UOp>) -> Result<StageDigest> {
     let graph = svod_ir::CanonicalGraph::from_root("source-stage-linear-v2", linear).map_err(|error| {
         Error::ProgramStageMismatch { stage: "SOURCE", reason: format!("cannot encode LINEAR identity: {error}") }
     })?;
-    let mut hasher = digest_io::IoWrapper(Sha256::new());
+    let mut hasher = HashWriter(Sha256::new());
     graph.encode_into(&mut hasher).map_err(|error| Error::ProgramStageMismatch {
         stage: "SOURCE",
         reason: format!("cannot serialize LINEAR identity: {error}"),

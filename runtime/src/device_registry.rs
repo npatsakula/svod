@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use std::sync::LazyLock;
 use svod_device::Result as DeviceResult;
 use svod_device::device::Device;
 use svod_device::registry::DeviceRegistry;
@@ -210,4 +210,4 @@ impl Default for DeviceFactoryRegistry {
 /// let device = svod_runtime::DEVICE_FACTORIES
 ///     .device(&DeviceSpec::Cpu, svod_device::registry::registry())?;
 /// ```
-pub static DEVICE_FACTORIES: Lazy<DeviceFactoryRegistry> = Lazy::new(DeviceFactoryRegistry::new);
+pub static DEVICE_FACTORIES: LazyLock<DeviceFactoryRegistry> = LazyLock::new(DeviceFactoryRegistry::new);

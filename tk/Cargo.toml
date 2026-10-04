@@ -23,7 +23,7 @@ svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.7" }
 svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.7", features = ["testing"] }
 proptest = "1.9"
 test-case = "3.3.1"
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = "0.8"
 ndarray.workspace = true # native CPU baseline for the knn bench
 
 # GPU device-time benches (criterion), one binary per kernel sharing `benches/common.rs`.

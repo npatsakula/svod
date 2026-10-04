@@ -21,7 +21,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use svod_ir::{AxisType, ConstValue, Op, UOp};
 
 use super::Scheduler;
@@ -36,7 +36,7 @@ use svod_ir::ops;
 // ============================================================================
 
 /// Pre-computed action space for beam search.
-pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
+pub static BEAM_ACTIONS: LazyLock<Vec<Opt>> = LazyLock::new(|| {
     let mut actions = Vec::with_capacity(600);
 
     // UPCAST: axes 0-7, amounts [0, 2, 3, 4, 5, 7]
@@ -122,7 +122,7 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
 /// `(op, axis)` pairs that have an `arg=0` (full-axis) variant in
 /// [`BEAM_ACTIONS`]. Used by [`passes_prefilter`] to dedup the explicit
 /// `arg=axis_size` variants whenever the `arg=0` variant covers the same case.
-static FULL_AXIS_VARIANTS: Lazy<std::collections::HashSet<(OptOps, usize)>> = Lazy::new(|| {
+static FULL_AXIS_VARIANTS: LazyLock<std::collections::HashSet<(OptOps, usize)>> = LazyLock::new(|| {
     BEAM_ACTIONS
         .iter()
         .filter_map(|opt| {
@@ -175,7 +175,7 @@ fn passes_prefilter(scheduler: &Scheduler, action: &Opt) -> bool {
 /// the prefilter/apply/limit/time stages. Cheap when disabled (one env-cached
 /// bool check per call); useful for diagnosing why an action class never wins.
 fn beam_debug_enabled() -> bool {
-    static CACHED: Lazy<bool> = Lazy::new(|| {
+    static CACHED: LazyLock<bool> = LazyLock::new(|| {
         std::env::var("BEAM_DEBUG").ok().map(|value| value.parse::<u8>().unwrap_or(1) > 0).unwrap_or(false)
     });
     *CACHED
@@ -862,7 +862,7 @@ pub fn get_applied_opts(scheduler: &Scheduler) -> &[Opt] {
 /// `dirs::cache_dir()` reads `XDG_CACHE_HOME` on Linux but returns
 /// `~/Library/Caches` unconditionally on macOS, so redirecting that variable
 /// isolates the tests on one platform and silently does nothing on the other.
-static CACHE_DB: Lazy<Option<sled::Db>> = Lazy::new(|| {
+static CACHE_DB: LazyLock<Option<sled::Db>> = LazyLock::new(|| {
     let cache_dir = match std::env::var_os("SVOD_BEAM_CACHE_DIR") {
         Some(path) => std::path::PathBuf::from(path),
         None => dirs::cache_dir()?.join("svod"),

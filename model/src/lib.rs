@@ -13,6 +13,7 @@ pub mod qwen3;
 pub mod resnet;
 pub mod sentencepiece;
 pub mod silero_vad;
+mod simd;
 pub mod state;
 pub mod wavlm;
 pub mod wespeaker;

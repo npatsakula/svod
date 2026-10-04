@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use std::sync::LazyLock;
 
 pub use svod_dtype::DeviceSpec;
 
@@ -114,7 +114,7 @@ impl DeviceRegistry {
 }
 
 /// Global device registry instance.
-static REGISTRY: Lazy<DeviceRegistry> = Lazy::new(DeviceRegistry::default);
+static REGISTRY: LazyLock<DeviceRegistry> = LazyLock::new(DeviceRegistry::default);
 
 /// Get the global device registry.
 pub fn registry() -> &'static DeviceRegistry {

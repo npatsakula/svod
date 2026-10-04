@@ -24,9 +24,6 @@ prost-build = "0.14"
 
 [dev-dependencies]
 ndarray.workspace = true
-proptest = "1.11"
-test-case = "3.3.1"
 svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.7", features = [
   "testing",
 ] }
-svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.7" }

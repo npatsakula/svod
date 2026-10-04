@@ -18,8 +18,8 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use std::sync::LazyLock;
 use svod_dtype::AmdArch;
 use tracing::debug;
 
@@ -36,18 +36,18 @@ use crate::error::{Error, Result};
 /// The cached `Arc<AmdDevice>` carries the shared `Arc<AmdDeviceCore>` —
 /// per-plan and per-graph callers reach the core via `AmdDevice::core()` and
 /// are assigned a shared `PoolQueue` against it (no extra KFD opens).
-static DEVICE_CACHE: Lazy<Mutex<HashMap<usize, Arc<AmdDevice>>>> = Lazy::new(Default::default);
+static DEVICE_CACHE: LazyLock<Mutex<HashMap<usize, Arc<AmdDevice>>>> = LazyLock::new(Default::default);
 
 /// Process-wide `/dev/kfd` handle. KFD is opened once per process and all
 /// devices share it — events created on a per-device basis are addressed by
 /// `event_id` against this shared fd.
-static GLOBAL_KFD: Lazy<Mutex<Option<Arc<OwnedFd>>>> = Lazy::new(Default::default);
+static GLOBAL_KFD: LazyLock<Mutex<Option<Arc<OwnedFd>>>> = LazyLock::new(Default::default);
 
 /// Process-wide event-page state. The 0x8000 GTT event page is allocated
 /// exactly once per process; the first device
 /// allocates+binds it via `CREATE_EVENT(event_page_offset=handle)`,
 /// subsequent devices just `MAP_MEMORY_TO_GPU` it to their `gpu_id`.
-static EVENT_PAGE: Lazy<Mutex<Option<EventPageState>>> = Lazy::new(Default::default);
+static EVENT_PAGE: LazyLock<Mutex<Option<EventPageState>>> = LazyLock::new(Default::default);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EventPageState {

@@ -1,11 +1,11 @@
 use crate::Buffer;
 use crate::allocator::{Allocator, BufferSpec, CpuAllocator, LruAllocator};
 use proptest::prelude::*;
+use smallvec::SmallVec;
 use std::sync::Arc;
 use strum::VariantArray;
 use svod_dtype::test::proptests::generators;
 use svod_dtype::{DType, ScalarDType};
-use tinyvec::ArrayVec;
 
 /// Helper to create an LRU allocator for testing.
 fn allocator() -> Arc<LruAllocator> {
@@ -17,7 +17,7 @@ fn allocator() -> Arc<LruAllocator> {
 #[derive(Debug, Clone)]
 struct AllocCase {
     dtype: DType,
-    shape: ArrayVec<[usize; 4]>,
+    shape: SmallVec<[usize; 4]>,
     zero_init: bool,
 }
 
@@ -48,7 +48,7 @@ impl Arbitrary for AllocCase {
             prop::collection::vec(1usize..50, 1..=4),
             any::<bool>(),
         )
-            .prop_map(|(dtype, shape, zero_init)| AllocCase { dtype, shape: ArrayVec::from_iter(shape), zero_init })
+            .prop_map(|(dtype, shape, zero_init)| AllocCase { dtype, shape: SmallVec::from_vec(shape), zero_init })
             .prop_filter("total size must be reasonable", |spec| (1..=10 * 1024 * 1024).contains(&spec.size()))
             .boxed()
     }
@@ -75,7 +75,7 @@ fn same_size_specs() -> impl Strategy<Value = (AllocCase, AllocCase)> {
         let dtype = spec.dtype.clone();
         same_size_dtypes(dtype).prop_map(move |dtype| {
             let num_elements = total_bytes / dtype.bytes();
-            let shape = ArrayVec::from_iter(vec![num_elements]);
+            let shape = SmallVec::from_elem(num_elements, 1);
             let spec2 = AllocCase { dtype, shape, zero_init: spec.zero_init };
             (spec.clone(), spec2)
         })
