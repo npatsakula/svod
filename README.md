@@ -91,12 +91,13 @@ jit_wrapper! {
 // jit.execute()?;     // replay on every chunk
 ```
 
-### Rewrites proven with Z3
+### Rewrites checked with Z3
 
-Every optimization is a declarative rewrite in the `patterns!` DSL. The
-algebraic and index simplifications are checked with the **Z3 SMT solver**: it
-proves that the rewritten expression equals the original for every input, or
-returns a counterexample. Property-based tests cover the rest of the pipeline.
+Graph transformations are written as declarative rules in the `patterns!` DSL.
+Core symbolic simplification rules are pinned by **Z3** equivalence proofs, and
+property tests use Z3 as an oracle on random expressions: the solver proves that
+the simplified expression equals the original or returns a counterexample. These
+checks run in CI (`--features z3`), not at runtime.
 See [Pattern system](https://svod.vpermilp.online/docs/architecture/optimizations/pattern-system).
 
 ### Platform-specific code generation

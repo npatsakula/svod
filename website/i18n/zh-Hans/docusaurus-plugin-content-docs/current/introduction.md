@@ -89,11 +89,11 @@ jit_wrapper! {
 // jit.execute()?;     // replay on every chunk
 ```
 
-### 经 Z3 证明的重写
+### 经 Z3 检查的重写
 
-每一项优化都是 `patterns!` DSL 中的一条声明式重写。代数与索引化简由
-**Z3 SMT 求解器**检查：它证明重写后的表达式对任意输入都与原式相等，否则给出反例。
-流水线的其余部分由基于属性的测试覆盖。
+图变换以声明式规则写在 `patterns!` DSL 中。核心符号化简规则由 **Z3** 等价性证明固定，
+属性测试则把 Z3 当作随机表达式的判定器：求解器证明化简后的表达式与原式相等，否则给出反例。
+这些检查在 CI 中运行（`--features z3`），而非运行时。
 参见[模式系统](https://svod.vpermilp.online/docs/architecture/optimizations/pattern-system)。
 
 ### 面向平台的代码生成
