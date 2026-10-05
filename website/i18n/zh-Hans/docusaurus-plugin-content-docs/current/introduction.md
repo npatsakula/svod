@@ -8,7 +8,7 @@ sidebar_label: 简介
 
 **用 Rust 编写的深度学习编译器与推理引擎。**
 
-[![CI](https://github.com/npatsakula/svod/actions/workflows/ci.yml/badge.svg)](https://github.com/npatsakula/svod/actions/workflows/ci.yml)
+[![CI](https://github.com/npatsakula/svod/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/npatsakula/svod/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-svod.vpermilp.online-blue)](https://svod.vpermilp.online/docs/introduction)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/npatsakula/svod/tree/main/LICENSE)
 

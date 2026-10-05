@@ -4,7 +4,7 @@
 
 **A deep learning compiler and inference engine written in Rust.**
 
-[![CI](https://github.com/npatsakula/svod/actions/workflows/ci.yml/badge.svg)](https://github.com/npatsakula/svod/actions/workflows/ci.yml)
+[![CI](https://github.com/npatsakula/svod/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/npatsakula/svod/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-svod.vpermilp.online-blue)](https://svod.vpermilp.online/docs/introduction)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
