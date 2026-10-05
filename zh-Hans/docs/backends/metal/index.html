@@ -1,0 +1,221 @@
+<!doctype html><html lang=zh-CN dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-backends/metal" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>Metal 后端 | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/zh-Hans/docs/backends/metal /><meta data-rh=true property=og:locale content=zh_CN /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=zh-Hans /><meta data-rh=true name=docsearch:language content=zh-Hans /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="Metal 后端 | Svod"/><meta data-rh=true name=description content="Svod 通过 Metal 在 Apple GPU 上运行。该后端直接针对 Objective-C 运行时编写："/><meta data-rh=true property=og:description content="Svod 通过 Metal 在 Apple GPU 上运行。该后端直接针对 Objective-C 运行时编写："/><link data-rh=true rel=icon href=/zh-Hans/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/zh-Hans/docs/backends/metal /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/metal hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/backends/metal hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/backends/metal hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/backends/metal hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/metal hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/zh-Hans/docs/backends/metal","name":"Metal","position":1}]}</script><link rel=stylesheet href=/zh-Hans/assets/css/styles.e76ef093.css /><script src=/zh-Hans/assets/js/runtime~main.53f2793a.js defer></script><script src=/zh-Hans/assets/js/main.b4210e06.js defer></script></head><body><svg style="display: none;"><defs>
+<symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
+</defs></svg>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-5c8")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/zh-Hans/img/logo.svg /><div role=region aria-label=跳到主要内容><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>跳到主要内容</a></div><nav aria-label=主导航 class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label=切换导航栏 aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/zh-Hans/><div class=navbar__logo><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/zh-Hans/docs/introduction>文档</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>简体中文</a><ul class=dropdown__menu><li><a href=/docs/backends/metal target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/backends/metal target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=zh-CN>简体中文</a><li><a href=/ru/docs/backends/metal target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/backends/metal target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="切换浅色/暗黑模式（当前为system mode）"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=搜索 aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label=回到顶部 class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label=文档侧边栏 class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/zh-Hans/docs/introduction><span class=linkLabel_WmDU>简介</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/examples><span class=categoryLinkLabel_W154>快速上手</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/architecture/ir-design><span class=categoryLinkLabel_W154>架构</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile 内核 (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/zh-Hans/docs/backends/overview><span class=categoryLinkLabel_W154>后端</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/overview><span class=linkLabel_WmDU>概览</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/cpu><span class=linkLabel_WmDU>CPU</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/jit-loader><span class=linkLabel_WmDU>ELF JIT 加载器</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/zh-Hans/docs/backends/metal><span class=linkLabel_WmDU>Metal</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/zh-Hans/docs/backends/amd/overview><span class=categoryLinkLabel_W154>AMD 后端</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/zh-Hans/docs/backends/cuda/overview><span class=categoryLinkLabel_W154>CUDA 后端</span></a></div></ul></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=页面路径><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label=主页面 class=breadcrumbs__link href=/zh-Hans/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>后端</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>Metal</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">本页总览</button></div><div class="theme-doc-markdown markdown"><header><h1>Metal 后端</h1></header>
+<p>Svod 通过 Metal 在 Apple GPU 上运行。该后端直接针对 Objective-C 运行时编写：
+<code>libobjc</code>、<code>Metal.framework</code> 和私有的 <code>MTLCompiler.framework</code> 在运行时被
+<code>dlopen</code>，每次调用都是一个带有手工声明 C 签名的 <code>objc_msgSend</code>
+（<code>device/src/metal/objc.rs</code>）。没有 <code>objc2</code> 或 <code>metal</code> crate，没有 cargo feature，
+也没有 <code>cfg(target_os)</code> 门控：该模块在每台宿主上都能编译并通过类型检查，Linux 机器
+只是 <code>dlopen</code> 失败，从不注册该设备。内核由 C 渲染器的 Metal 方言
+（<code>codegen/src/c/metal.rs</code>）渲染为 Metal Shading Language，并在进程内编译为
+metallib。</p>
+<p>代码位于 <code>device/src/metal/</code>（设备、分配器、编译、程序、graph、Metal 4 性能
+分析器）、<code>runtime/src/devices/metal.rs</code>（设备工厂）以及
+<code>codegen/src/c/metal.rs</code>（方言）。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=状态>状态<a href=#状态 class=hash-link aria-label=状态的直接链接 title=状态的直接链接 translate=no>​</a></h2>
+<p>该后端于 2026 年 9 月合入，并已在一个硬件系列上得到实际运行：macOS 26 下的
+<strong>Apple9</strong>（M3/M4 级别），在其上张量测试套件、ONNX 测试套件和 <code>tk</code> 硬件测试全部
+通过，flash attention 和 GEMM 通过 <code>simdgroup_matrix</code> 运行。为旧系统编写的路径
+（公开的 <code>newLibraryWithSource:</code> 编译回退、Apple9 之前的间接命令缓冲区变通方案、
+<code>metal3.x</code> / <code>metal2.0</code> 语言标准）已实现，但尚未在此类硬件上验证。没有 Metal 设备
+时硬件测试会自动跳过，因此 Linux CI 只运行宿主侧测试。</p>
+<p>只支持系统默认设备（<code>METAL:0</code>）；<code>MTLCopyAllDevices</code> 枚举是后续工作
+（<code>device/src/metal/device.rs</code>）。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=选择设备>选择设备<a href=#选择设备 class=hash-link aria-label=选择设备的直接链接 title=选择设备的直接链接 translate=no>​</a></h2>
+<p><code>METAL[:N]</code> 是唯一的写法（AMD 和 CUDA 有 <code>HIP</code> 式别名，Metal 没有）。在 macOS 上它
+也是<strong>平台默认值</strong>：没有任何东西选择设备时，<code>default_device()</code> 解析为 <code>METAL:0</code>，
+因此在 Mac 上通过 <code>SVOD_DEVICE=CPU</code> 重新选用 CPU 后端
+（<code>dtype/src/default_device.rs</code>）。</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=METAL:0 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav</span><br/></div></code></pre></div></div>
+<p><code>svod_device::metal::has_devices()</code> 加载 Objective-C 运行时并调用
+<code>MTLCreateSystemDefaultDevice</code>；只有成功时，运行时的设备注册表才会注册 <code>"METAL"</code>
+工厂。打开设备时会记录一行包含设备名和 GPU 系列的 <code>info</code> 日志
+（<code>RUST_LOG=svod_device=info</code>）。</p>
+<p>GPU 系列通过 <code>supportsFamily:</code> 从 Apple12 向下探测到 Apple1，再探测 Mac2，并保存为
+<code>MetalFamily { Unknown, Mac2, Apple(n) }</code>。它是渲染器的 <code>gpu_arch</code>，作为目标缓存的
+键，并选择优化器配置（<code>OptimizerRenderer::for_metal_family</code>）：<code>simdgroup_matrix</code>
+tensor core 需要 Apple7 或更新的系列。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=代码生成msl-方言>代码生成：MSL 方言<a href=#代码生成msl-方言 class=hash-link aria-label="代码生成：MSL 方言的直接链接" title="代码生成：MSL 方言的直接链接" translate=no>​</a></h2>
+<p><code>CRenderer::metal()</code> 就是带 <code>CDialect::Metal</code> 的 CPU C 渲染器；它的存在不改变 Clang
+的输出。一个内核渲染为</p>
+<div class="language-c codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-c codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token macro property directive-hash" style=color:#36acaa>#</span><span class="token macro property directive keyword" style=color:#00009f>include</span><span class="token macro property" style=color:#36acaa> </span><span class="token macro property string" style=color:#e3116c>&lt;metal_stdlib></span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">using namespace metal</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">kernel </span><span class="token keyword" style=color:#00009f>void</span><span class="token plain"> </span><span class="token function" style=color:#d73a49>r_64_32</span><span class="token punctuation" style=color:#393A34>(</span><span class="token plain">device </span><span class="token keyword" style=color:#00009f>float</span><span class="token operator" style=color:#393A34>*</span><span class="token plain"> data0</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> device </span><span class="token keyword" style=color:#00009f>float</span><span class="token operator" style=color:#393A34>*</span><span class="token plain"> data1</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> constant </span><span class="token keyword" style=color:#00009f>int</span><span class="token operator" style=color:#393A34>&</span><span class="token plain"> data2</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                    uint3 gid </span><span class="token punctuation" style=color:#393A34>[</span><span class="token punctuation" style=color:#393A34>[</span><span class="token plain">threadgroup_position_in_grid</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                    uint3 lid </span><span class="token punctuation" style=color:#393A34>[</span><span class="token punctuation" style=color:#393A34>[</span><span class="token plain">thread_position_in_threadgroup</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  threadgroup </span><span class="token keyword" style=color:#00009f>__attribute__</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>(</span><span class="token function" style=color:#d73a49>aligned</span><span class="token punctuation" style=color:#393A34>(</span><span class="token number" style=color:#36acaa>16</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token keyword" style=color:#00009f>float</span><span class="token plain"> local0</span><span class="token punctuation" style=color:#393A34>[</span><span class="token number" style=color:#36acaa>32</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  </span><span class="token punctuation" style=color:#393A34>.</span><span class="token punctuation" style=color:#393A34>.</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token punctuation" style=color:#393A34>}</span><br/></div></code></pre></div></div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>概念<th>Clang 方言<th>Metal 方言<tbody><tr><td>缓冲区参数<td><code>float* restrict data0</code><td><code>device float* data0</code><tr><td>标量参数<td><code>const int data2</code><td><code>constant int& data2</code><tr><td>启动 ID<td><code>core_id</code> 变量<td><code>gid.xyz</code>（<code>gidx*</code> / <code>idx*</code>）、<code>lid.xyz</code>（<code>lidx*</code>），追加在 PARAM 列表之后<tr><td>local 缓冲区<td>栈数组<td><code>threadgroup __attribute__((aligned(16))) T localN[size]</code><tr><td>屏障<td>无<td><code>threadgroup_barrier(mem_flags::mem_threadgroup)</code><tr><td>地址空间<td>无<td>指针转换上的 <code>device</code> / <code>threadgroup</code> / <code>thread</code><tr><td>16 位浮点<td><code>_Float16</code><td><code>half</code>、<code>bfloat</code><tr><td>位转换<td>union / memcpy<td><code>as_type&lt;T>()</code></table>
+<p>没有 <code>[[buffer(n)]]</code> 属性：Metal <strong>按位置</strong>绑定参数，因此参数的绑定索引就是它在
+签名中的位置，加载器也照此对应（见下文）。最多存在三个网格轴；调度器会折叠更多的
+全局轴（Metal 优化器配置中的 <code>global_max</code>）。</p>
+<p><strong>类型。</strong> Float64、所有 fp8 格式以及宽于 4 的向量在渲染时被拒绝
+（<code>reject_unsupported_metal_dtypes</code>，<code>codegen/src/c/types.rs</code>）；调度器事先把内部的
+f64 降为 f32。bf16 算术经由 <code>float</code> 提升，bf16 收窄使用整数就近舍入到偶数的模式集。</p>
+<p><strong>数学函数。</strong> <code>sqrt</code>、<code>exp2</code> 和 <code>log2</code> 是原生的；<code>sin</code> 渲染为 <code>precise::sin</code>；
+<code>exp</code>、<code>log</code>、<code>cos</code>、<code>tan</code> 和 <code>erf</code>（MSL 没有 <code>erf</code>）由共享的
+<code>amd_decomposition_patterns()</code> 基于原生 <code>exp2</code>/<code>log2</code> 分解，与 AMD 上相同。渲染器的
+<code>extra_matcher</code> 是 CPU 的那个（<code>cpu_extra_matcher()</code>）。快速数学在所有地方都关闭
+（<code>-fno-fast-math</code>，公开路径上为 <code>MTLMathModeSafe</code>），以保证共享的测试容差成立。</p>
+<p><strong>Tensor core。</strong> <code>Wmma</code> 降级为基于 <code>simdgroup_&lt;T>8x8</code> 和
+<code>simdgroup_multiply_accumulate</code> 的逐形状辅助函数：只有一种形状，在 32 个线程上做
+8×8×8，每个通道两个元素，支持 f32→f32、f16→f32、f16→f16、bf16→f32 和 bf16→bf16
+（优化器配置中的 <code>METAL_888</code>）。<code>tk</code> 增加了 <code>simd_shuffle</code>、
+<code>simd_shuffle_xor</code> 和 <code>simdgroup_barrier</code> 构建器（<code>codegen/src/c/metal.rs</code>），
+Apple 的 flash-attention 和 GEMM 内核正是由它们构建的。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=编译路径>编译路径<a href=#编译路径 class=hash-link aria-label=编译路径的直接链接 title=编译路径的直接链接 translate=no>​</a></h2>
+<p><code>compile_msl</code>（<code>device/src/metal/compile.rs</code>）把源码发送给 Apple 私有的
+<code>MTLCodeGenService</code>——与 tinygrad 使用的路径相同——并通过一个手工构建的 Objective-C
+block 回调接收 metallib（<code>MTLB</code> 魔数，<code>ENDT</code> 尾部），超时 60 秒，每次只处理一个
+请求。标志为</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">-fno-fast-math -std=&lt;std> --driver-mode=metal -x metal -fno-caret-diagnostics</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">-fmodules-cache-path=&lt;cache>/metal-modules</span><br/></div></code></pre></div></div>
+<p>其中 <code>&lt;std></code> 随 macOS 主版本而定（26+ 上为 <code>metal4.0</code>，14–25 上为 <code>metal3.1</code>，
+13 上为 <code>metal3.0</code>，更早为 <code>macos-metal2.0</code>），模块缓存把 <code>metal_stdlib</code> 的解析
+从约 250 ms 降到约 8 ms。</p>
+<p><code>MTLCompiler.framework</code> 以 <code>RTLD_GLOBAL</code> 加载自己的 libLLVM，它无法与 CPU 后端的
+进程内 libLLVM 共存，因此两者争用一个槽位（<code>claim_inprocess_llvm</code>）。竞争的失败方，
+或没有该私有框架的系统，会采用 <code>compile_msl_public</code>：执行一次
+<code>newLibraryWithSource:options:error:</code> 编译以便暴露诊断信息，此后 <strong>MSL 源码本身</strong>
+就是载荷，程序加载器在加载时再编译一次。两种载荷共享同一个目标缓存条目：</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">backend:             metal</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">target_architecture: Apple9/air64</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">toolchain:           macos=26.0</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">flags:               -fno-fast-math -std=metal4.0 --driver-mode=metal -x metal -fno-caret-diagnostics</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">abi:                 msl-kernel-abi-v1</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">object_format:       metallib-or-msl-v1</span><br/></div></code></pre></div></div>
+<p>传输方式被刻意排除在身份之外：赢得 libLLVM 槽位的 BEAM 工作进程与输掉槽位的父
+进程必须在键上达成一致。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=程序与启动>程序与启动<a href=#程序与启动 class=hash-link aria-label=程序与启动的直接链接 title=程序与启动的直接链接 translate=no>​</a></h2>
+<p><code>MetalProgram::load</code> 接受任一种载荷（metallib 用 <code>newLibraryWithData:</code>，MSL 用
+<code>newLibraryWithSource:</code>），用 <code>newFunctionWithName:</code> 绑定函数，并以
+<code>setSupportIndirectCommandBuffers:YES</code> 构建管线，读取
+<code>maxTotalThreadsPerThreadgroup</code>、<code>threadExecutionWidth</code> 和
+<code>staticThreadgroupMemoryLength</code>。</p>
+<p>参数按位置绑定：缓冲区用 <code>setBuffer:offset:atIndex:</code>——宿主指针通过设备的
+<code>PointerRegistry</code>（一个以缓冲区基址为键的 <code>BTreeMap</code>）解析为其
+<code>(MTLBuffer, offset)</code>——标量用 <code>setBytes</code> 作为 4 字节 <code>i32</code>；超出 <code>i32</code> 范围的值是
+运行时错误。ABI 槽位必须递增，可以有空缺，最多 31 个绑定（<code>MAX_BUFFER_BINDINGS</code>）。
+<code>global_size</code> 是线程组数，<code>local_size</code> 是每组线程数，经由
+<code>dispatchThreadgroups:threadsPerThreadgroup:</code> 发送；没有 local 轴的内核每组运行一个
+线程，超过 <code>maxTotalThreadsPerThreadgroup</code> 的组会被拒绝。</p>
+<p>每次派发是一个以内核名标注的命令缓冲区，提交到一个深度为 1024 的单一队列。当
+<code>wait = false</code> 时它加入设备的 <code>in_flight</code> 列表；<code>MetalDevice::synchronize</code> 用
+<code>waitUntilCompleted</code> 等待每个条目，并报告第一个 <code>NSError</code>。宿主访问缓冲区前会先
+排空设备。<code>execute_timed</code> 读取命令缓冲区的 <code>GPUStartTime</code> / <code>GPUEndTime</code>，BEAM 正是
+据此对候选排序。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=内存>内存<a href=#内存 class=hash-link aria-label=内存的直接链接 title=内存的直接链接 translate=no>​</a></h2>
+<p>每次分配都是一个 <code>MTLResourceStorageModeShared</code> 模式的 <code>MTLBuffer</code>：Apple
+silicon 是统一内存，因此 <code>BufferSpec</code> 标志被忽略，<code>copyin</code> / <code>copyout</code> /
+<code>_transfer</code> 在 <code>synchronize()</code> 之后对 <code>contents</code> 执行宿主 <code>memcpy</code> / <code>memmove</code>。
+没有 private 或 managed 缓冲区，也没有 blit 编码器。释放前会先排空设备；若排空
+失败，该分配会被泄漏，而不是在仍有内核运行时被释放。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=graph>Graph<a href=#graph class=hash-link aria-label=Graph的直接链接 title=Graph的直接链接 translate=no>​</a></h2>
+<p><code>MetalGraph::capture</code> 把一条内核链记录进一个由 <code>ConcurrentDispatch</code> 命令组成的
+<code>MTLIndirectCommandBuffer</code>，每条命令都带 <code>setBarrier</code>，从而保持捕获顺序。一次重放
+就是一个命令缓冲区：先对绑定的缓冲区调用 <code>useResources:count:usage:</code>，再调用
+<code>executeCommandsInBuffer:withRange:</code>。<code>replay</code> 等待上一次重放，并只重新绑定缓冲区
+发生变化的槽位。以下情况捕获会放弃（返回 <code>Ok(None)</code>，改为逐次派发）：空链、不是
+<code>MetalProgram</code> 的程序、名称中包含 "virtual" 的设备（半虚拟化的 CI GPU 会破坏
+ICB）、超过 32 位的偏移，或<strong>任何标量参数</strong>——带符号形状的链不会被 graph 化。在
+Apple9 以下会应用 tinygrad 的 <code>FIX_METAL_ICB</code> 变通方案（每个管线一次空派发）。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=性能分析>性能分析<a href=#性能分析 class=hash-link aria-label=性能分析的直接链接 title=性能分析的直接链接 translate=no>​</a></h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>层级<th>Metal 上<th>来源<tbody><tr><td>1 — 设备时间<td>是<td>每个命令缓冲区的 <code>GPUStartTime</code> / <code>GPUEndTime</code>；在 graph 内部，使用 Metal 4 计数器堆（macOS 26+）或每个内核一个命令缓冲区<tr><td>2 — roofline<td>是<td>与后端无关<tr><td>3 — 静态资源<td>部分<td><code>lds_bytes</code> 来自 <code>staticThreadgroupMemoryLength</code>，<code>wave_size</code> 来自 <code>threadExecutionWidth</code>，<code>occupancy</code> 为 <code>maxTotalThreadsPerThreadgroup / 1024</code>；没有寄存器计数<tr><td>4 — 硬件计数器<td>否<td></table>
+<p><code>Mtl4Profiler</code>（<code>device/src/metal/mtl4.rs</code>）只用于带性能分析的 graph 重放：它在
+Metal 4 命令缓冲区中、于两个精确时间戳之间单独运行每条间接命令，对绑定的缓冲区
+使用驻留集，并等待一个共享事件。MTL4 编码器会静默跳过其管线未事先提供给它的间接
+命令的首次执行，因此每个管线都会先设置到编码器上。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=限制>限制<a href=#限制 class=hash-link aria-label=限制的直接链接 title=限制的直接链接 translate=no>​</a></h2>
+<ul>
+<li class="">一个设备（<code>METAL:0</code>）、一个命令队列、只有共享存储；</li>
+<li class="">标量为 <code>i32</code>；没有 f64、没有 fp8、没有宽于 4 的向量；</li>
+<li class="">只有一种 tensor core 形状（<code>simdgroup</code> 8×8×8）；</li>
+<li class="">graph 不包括带标量参数的链；</li>
+<li class="">没有硬件计数器、没有寄存器计数，graph 之外的逐次派发计时是整个命令缓冲区的
+时间戳；</li>
+<li class="">快速路径是 Apple 未公开文档的 <code>MTLCodeGenService</code>；公开 API 是回退方案。</li>
+</ul>
+<p>没有 Metal 专属的环境变量。适用的是共享变量：<code>SVOD_DEVICE</code>、
+<code>SVOD_OBJECT_CACHE</code> / <code>SVOD_OBJECT_CACHE_DIR</code>、用于模块缓存的 <code>XDG_CACHE_HOME</code>，
+以及用于 graph 捕获与放弃信息的 <code>RUST_LOG=svod_device=debug</code>。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=测试>测试<a href=#测试 class=hash-link aria-label=测试的直接链接 title=测试的直接链接 translate=no>​</a></h2>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">cargo test -p svod-device metal          # host tests everywhere; hardware tests self-skip</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">cargo test -p svod-codegen metal         # MSL golden tests</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=METAL:0 cargo test -p svod-tensor   # codegen_tests! `metal` variants</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=METAL:0 cargo test -p svod-onnx</span><br/></div></code></pre></div></div></div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/backends/metal.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>编辑此页</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label=文件选项卡><a class="pagination-nav__link pagination-nav__link--prev" href=/zh-Hans/docs/backends/jit-loader><div class=pagination-nav__sublabel>上一页</div><div class=pagination-nav__label>ELF JIT 加载器</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/zh-Hans/docs/backends/amd/overview><div class=pagination-nav__sublabel>下一页</div><div class=pagination-nav__label>概览</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#状态 class="table-of-contents__link toc-highlight">状态</a><li><a href=#选择设备 class="table-of-contents__link toc-highlight">选择设备</a><li><a href=#代码生成msl-方言 class="table-of-contents__link toc-highlight">代码生成：MSL 方言</a><li><a href=#编译路径 class="table-of-contents__link toc-highlight">编译路径</a><li><a href=#程序与启动 class="table-of-contents__link toc-highlight">程序与启动</a><li><a href=#内存 class="table-of-contents__link toc-highlight">内存</a><li><a href=#graph class="table-of-contents__link toc-highlight">Graph</a><li><a href=#性能分析 class="table-of-contents__link toc-highlight">性能分析</a><li><a href=#限制 class="table-of-contents__link toc-highlight">限制</a><li><a href=#测试 class="table-of-contents__link toc-highlight">测试</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>文档</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/zh-Hans/docs/introduction>简介</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>社区</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

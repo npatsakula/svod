@@ -1,8 +1,8 @@
-<!doctype html><html lang=hi dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-architecture/optimizations/algebraic-simplification" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>अल्जेब्रिक सिम्प्लिफ़िकेशन पैटर्न | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/hi/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/hi/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification /><meta data-rh=true property=og:locale content=hi /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true name=docusaurus_locale content=hi /><meta data-rh=true name=docsearch:language content=hi /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="अल्जेब्रिक सिम्प्लिफ़िकेशन पैटर्न | Svod"/><meta data-rh=true name=description content="Svod का symbolic simplifier UOp computation graphs को 140+ अल्जेब्रिक पैटर्न से रीराइट करता है, जो schedule/src/symbolic/patterns.rs में डिफ़ाइन हैं। ये पैटर्न पाइपलाइन में कई जगह फ़ायर होते हैं:"/><meta data-rh=true property=og:description content="Svod का symbolic simplifier UOp computation graphs को 140+ अल्जेब्रिक पैटर्न से रीराइट करता है, जो schedule/src/symbolic/patterns.rs में डिफ़ाइन हैं। ये पैटर्न पाइपलाइन में कई जगह फ़ायर होते हैं:"/><link data-rh=true rel=icon href=/hi/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification","name":"अल्जेब्रिक सिम्प्लिफ़िकेशन","position":1}]}</script><link rel=stylesheet href=/hi/assets/css/styles.e76ef093.css /><script src=/hi/assets/js/runtime~main.a440fb89.js defer></script><script src=/hi/assets/js/main.d7dc3331.js defer></script></head><body><svg style="display: none;"><defs>
+<!doctype html><html lang=hi dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-architecture/optimizations/algebraic-simplification" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>बीजगणितीय सरलीकरण (Algebraic Simplification) | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/hi/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/hi/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification /><meta data-rh=true property=og:locale content=hi /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true name=docusaurus_locale content=hi /><meta data-rh=true name=docsearch:language content=hi /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="बीजगणितीय सरलीकरण (Algebraic Simplification) | Svod"/><meta data-rh=true name=description content=algebraic-simplification} /><meta data-rh=true property=og:description content=algebraic-simplification} /><link data-rh=true rel=icon href=/hi/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification","name":"बीजगणितीय सरलीकरण","position":1}]}</script><link rel=stylesheet href=/hi/assets/css/styles.e76ef093.css /><script src=/hi/assets/js/runtime~main.8668cc51.js defer></script><script src=/hi/assets/js/main.67b15077.js defer></script></head><body><svg style="display: none;"><defs>
 <symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
 </defs></svg>
-<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-007")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/hi/img/logo.svg /><div role=region aria-label="मुख्य कंटेंट तक स्किप करें"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>मुख्य कंटेंट तक स्किप करें</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Toggle navigation bar" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/hi/><div class=navbar__logo><img src=/hi/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/hi/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/hi/docs/introduction>डॉक्स</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>हिन्दी</a><ul class=dropdown__menu><li><a href=/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Switch between dark and light mode (currently system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Scroll back to top" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/hi/docs/introduction><span class=linkLabel_WmDU>परिचय</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/examples><span class=categoryLinkLabel_W154>शुरुआत</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/hi/docs/architecture/pipeline><span class=categoryLinkLabel_W154>आर्किटेक्चर</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/pipeline><span class=linkLabel_WmDU>एक्ज़ीक्यूशन पाइपलाइन</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/jit-graphs><span class=linkLabel_WmDU>JIT ग्राफ़</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/kernel-origins><span class=linkLabel_WmDU>कर्नेल Origins</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/hi/docs/architecture/codegen/overview><span class=categoryLinkLabel_W154>कोडजेन पाइपलाइन</span></a></div><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/ir-design><span class=linkLabel_WmDU>IR डिज़ाइन फ़िलॉसफ़ी</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/hi/docs/architecture/optimizations/pattern-system><span class=categoryLinkLabel_W154>ऑप्टिमाइज़ेशन</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/optimizations/pattern-system><span class=linkLabel_WmDU>पैटर्न इंजन</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/hi/docs/architecture/optimizations/algebraic-simplification><span class=linkLabel_WmDU>अल्जेब्रिक सिम्प्लिफ़िकेशन</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/optimizations/index-arithmetic><span class=linkLabel_WmDU>इंडेक्स अरिथमेटिक</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/optimizations/range-optimization><span class=linkLabel_WmDU>Range और Reduce</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/optimizations/strength-reduction><span class=linkLabel_WmDU>Strength Reduction</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/optimizations/kernel-search><span class=linkLabel_WmDU>कर्नेल सर्च</span></a></ul><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/op-bestiary><span class=linkLabel_WmDU>Op Bestiary</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile कर्नेल (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/backends/jit-loader><span class=categoryLinkLabel_W154>बैकएंड</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=Breadcrumbs><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Home page" class=breadcrumbs__link href=/hi/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>आर्किटेक्चर</span><li class=breadcrumbs__item><span class=breadcrumbs__link>ऑप्टिमाइज़ेशन</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>अल्जेब्रिक सिम्प्लिफ़िकेशन</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">इस पेज पर</button></div><div class="theme-doc-markdown markdown"><header><h1>अल्जेब्रिक सिम्प्लिफ़िकेशन पैटर्न</h1></header>
-<p>Svod का symbolic simplifier UOp computation graphs को 140+ अल्जेब्रिक पैटर्न से रीराइट करता है, जो <code>schedule/src/symbolic/patterns.rs</code> में डिफ़ाइन हैं। ये पैटर्न पाइपलाइन में कई जगह फ़ायर होते हैं:</p>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-007")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/hi/img/logo.svg /><div role=region aria-label="मुख्य कंटेंट तक स्किप करें"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>मुख्य कंटेंट तक स्किप करें</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Toggle navigation bar" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/hi/><div class=navbar__logo><img src=/hi/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/hi/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/hi/docs/introduction>डॉक्स</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>हिन्दी</a><ul class=dropdown__menu><li><a href=/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Switch between dark and light mode (currently system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Scroll back to top" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/hi/docs/introduction><span class=linkLabel_WmDU>परिचय</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/examples><span class=categoryLinkLabel_W154>शुरुआत</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/hi/docs/architecture/ir-design><span class=categoryLinkLabel_W154>आर्किटेक्चर</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/ir-design><span class=linkLabel_WmDU>IR डिज़ाइन फ़िलॉसफ़ी</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/pipeline><span class=linkLabel_WmDU>एक्ज़ीक्यूशन पाइपलाइन</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/jit-graphs><span class=linkLabel_WmDU>JIT ग्राफ़</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/kernel-origins><span class=linkLabel_WmDU>कर्नेल Origins</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/hi/docs/architecture/codegen/overview><span class=categoryLinkLabel_W154>कोडजेन पाइपलाइन</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/hi/docs/architecture/optimizations/pattern-system><span class=categoryLinkLabel_W154>ऑप्टिमाइज़ेशन</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/optimizations/pattern-system><span class=linkLabel_WmDU>पैटर्न इंजन</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/hi/docs/architecture/optimizations/algebraic-simplification><span class=linkLabel_WmDU>बीजगणितीय सरलीकरण</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/optimizations/index-arithmetic><span class=linkLabel_WmDU>इंडेक्स अंकगणित</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/optimizations/range-optimization><span class=linkLabel_WmDU>Range और reduce</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/optimizations/strength-reduction><span class=linkLabel_WmDU>स्ट्रेंथ रिडक्शन</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/optimizations/kernel-search><span class=linkLabel_WmDU>कर्नेल सर्च</span></a></ul><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/architecture/op-bestiary><span class=linkLabel_WmDU>Op Bestiary</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile कर्नेल (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/backends/overview><span class=categoryLinkLabel_W154>बैकएंड</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=Breadcrumbs><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Home page" class=breadcrumbs__link href=/hi/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>आर्किटेक्चर</span><li class=breadcrumbs__item><span class=breadcrumbs__link>ऑप्टिमाइज़ेशन</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>बीजगणितीय सरलीकरण</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">इस पेज पर</button></div><div class="theme-doc-markdown markdown"><header><h1>बीजगणितीय सरलीकरण (Algebraic Simplification)</h1></header>
+<p>सिम्बॉलिक सरलीकारक (symbolic simplifier) <code>schedule/src/symbolic/patterns.rs</code> में तीन नेस्टेड मैचरों से बना है। कौन-सा स्तर (tier) कहाँ चलता है:</p>
 
 
 
@@ -28,35 +28,21 @@
 
 
 
+<table><thead><tr><th>मैचर<th>संरचना<th>कहाँ चलता है<tbody><tr><td><code>symbolic_simple()</code><td><code>symbolic_simple_base() + dead_loop_patterns()</code><td>add-loads (13), devectorize (14), image पास (17), index lowering (17), शुरुआती decompositions (19b), और अंतिम rewrite के भीतर <code>pm_decomp</code> सेट<tr><td><code>symbolic()</code><td><code>symbolic_simple</code> + tier-2 समूह<td>rangeify मेगा-पास, range splitting/merging (<code>+ pm_fold_cast_const</code>), <code>indexing_simplify</code>, अंतिम symbolic (18)<tr><td><code>sym()</code><td><code>symbolic</code> + tier 3<td>pre-optimization (<code>+ pm_fold_cast_const + pm_flatten_range</code>), post-opt symbolic (08), early symbolic (15), extra symbolic (16, <code>+ indexing_simplify</code>)</table>
+<p><code>pm_fold_cast_const</code> (<code>CAST(CONST) → CONST</code>) जानबूझकर किसी भी tier के भीतर <em>नहीं</em> है; जिन स्थानों को इसकी ज़रूरत है वे इसे स्पष्ट रूप से जोड़ते हैं, ठीक वैसे ही जैसे Tinygrad <code>symbolic + pm_fold_cast_const</code> को केवल वहीं जोड़ता है जहाँ <code>UOp.simplify</code> ऐसा करता है।</p>
+<p>पूर्णांक अंकगणित को फिर से लिखने वाला हर नियम <code>exact_integer_rewrite</code> से होकर गुज़रता है, जो एक टाइप्ड no-wrap प्रमाण (<code>typed_integer_rewrite_is_exact</code>) है: यदि मूल या प्रतिस्थापन अपने ठोस dtype में overflow कर सकता है, तो वह rewrite को अस्वीकार कर देता है। <em>value-sensitive</em> चिह्नित समूह अतिरिक्त रूप से <code>value_sensitive</code> में लिपटे होते हैं, जो उन्हें तब तक निष्क्रिय रखता है जब तक subtree के लिए <code>weak_float_values_are_committed</code> सत्य न हो। सीमाएँ (bounds) <code>VminVmaxProperty</code> (हमेशा उपलब्ध) और <code>SoundVminVmaxProperty</code> (उन ops के लिए <code>None</code> जिनकी सीमाएँ भरोसेमंद नहीं: loads, <code>Pow</code>, <code>Fdiv</code>) से आती हैं; दोनों प्रति नोड कैश होती हैं।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=composition>संरचना<a href=#composition class=hash-link aria-label="संरचना का सीधा लिंक" title="संरचना का सीधा लिंक" translate=no>​</a></h2>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple_base()         tier 1</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  propagate_invalid                     must be first (before x*0 → 0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  fold_invalid_load_store</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  constant_folding_dsl_patterns         value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vconst_folding_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  bool_arithmetic_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  identity_and_zero_patterns            value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  self_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  zero_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  division_dsl_patterns                 value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  uint_pack_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  div_mod_recombine_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  power_dsl_patterns                    value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_simple_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple() = base + dead_loop_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic() = symbolic_simple + tier 2 (with_tier2)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  commutative_canonicalization</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  term_combining_dsl_patterns           value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_alu_combining_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vmin_vmax_collapse_patterns           value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  minmax_dsl_patterns                   value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_folding_dsl_patterns              value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  comparison_dsl_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_mod_div_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  advanced_division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_cast_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  long_to_int_narrowing_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  after_simplification_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_bound_patterns                  value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">sym() = symbolic + tier 3</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  pm_simplify_valid                     (symbolic/valid_simplification.rs)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_vectorize_reorder_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  ne_zero_fold_patterns                 value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_where_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  store_load_folding_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  reduce_sym_patterns                   value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  sym_phase3_patterns</span><br/></div></code></pre></div></div>
+<p>क्रम मायने रखता है: term combining से पहले canonicalization, comparison और range नियमों से पहले ALU folding, क्योंकि हर समूह अगले समूह के लिए मैच उजागर करता है। Tinygrad के reciprocal distribution नियम (<code>uop/symbolic.py</code> <code>sym</code>) जानबूझकर अनुपस्थित हैं: सभी छह IEEE के अनुसार अयथार्थ (inexact) हैं।</p>
+<p><strong>संकेतन।</strong> <code>OP[a, b]</code> क्रमविनिमेय (commutative) है, <code>OP(a, b)</code> क्रमबद्ध; <code>@zero</code>/<code>@one</code>/<code>c</code> स्थिरांक हैं; दोहराया गया नाम एक ही नोड है (<code>Arc::ptr_eq</code>)। <code>//</code> का अर्थ <code>FloorDiv</code> है, <code>%</code> का अर्थ <code>FloorMod</code>; truncating <code>CDiv</code>/<code>CMod</code> केवल late decompositions के बाद दिखाई देते हैं।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tier-1>Tier 1<a href=#tier-1 class=hash-link aria-label="Tier 1 का सीधा लिंक" title="Tier 1 का सीधा लिंक" translate=no>​</a></h2>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=invalid-propagation-propagate_invalid>Invalid का प्रसार (<code>propagate_invalid</code>)<a href=#invalid-propagation-propagate_invalid class=hash-link aria-label="invalid-propagation-propagate_invalid का सीधा लिंक" title="invalid-propagation-propagate_invalid का सीधा लिंक" translate=no>​</a></h3>
+<p><code>Invalid</code> है <code>UOp::invalid_marker()</code>, एक <code>ConstValue::Invalid</code> स्थिरांक; <code>is_invalid_marker</code> पूरी तरह <code>Invalid</code> वाले <code>VCONST</code> या <code>STACK</code> और उसके चारों ओर के movement wrappers को भी पहचानता है। वैधता (validity) <code>WHERE(cond, x, Invalid)</code> के रूप में रखी जाती है, और ये नियम उस आकार को बरकरार रखते हैं जबकि अंकगणित उसके इर्द-गिर्द घूमता है:</p>
 
 
 
 
 
-<table><thead><tr><th>कहाँ<th>Matcher<th>Context<tbody><tr><td>Pre-optimization<td><code>sym()</code><td>Rangeify + range splitting के बाद, कर्नेल ऑप्टिमाइज़ेशन से पहले<tr><td>Post-opt (Stage 8)<td><code>sym()</code> + <code>pm_move_where_on_load</code><td>ऑप्टिमाइज़ेशन actions के बाद, expansion से पहले<tr><td>Post-index (Stage 16)<td><code>sym()</code> + <code>indexing_simplify()</code><td>Index dtype lowering के बाद, फ़ाइनल cleanup<tr><td>Decomp+Render (Stage 18-19)<td><code>symbolic_simple()</code><td>Late rewrites और renderer के अपने matchers के साथ combined</table>
-<p>Matchers तीन tiers में आते हैं: <code>symbolic_simple()</code> tier-1 base है (identities, constant folding, size-1 RANGE collapse), <code>symbolic()</code> उस पर tier-2 groups जोड़ता है (canonicalization, comparisons, range bounds के ख़िलाफ़ div/mod), और <code>sym()</code> tier 3 जोड़ता है (<code>pm_simplify_valid</code>, ALU/STACK reordering, opinionated term combining)। सिर्फ़ फ़ाइनल decomp+render पास अकेले tier-1 सेट चलाता है।</p>
-<p><strong>Range analysis</strong>: हर UOp अपनी runtime minimum (<code>vmin</code>) और maximum (<code>vmax</code>) वैल्यूज़ ट्रैक करता है, जो नोड construction के दौरान inputs के bounds से eagerly कम्प्यूट होती हैं। कई पैटर्न इन bounds का इस्तेमाल करते हैं compile time पर conditions prove करने के लिए (जैसे, "x हमेशा non-negative है" या "x &lt; n सभी values के लिए")।</p>
-<p><strong>Notation</strong>: <code>OP[a, b]</code> commutative पैटर्न है (दोनों operand orderings ट्राई होती हैं)। <code>OP(a, b)</code> ordered है। <code>@zero</code>/<code>@one</code>/<code>c @const(v)</code> constant values मैच करते हैं। जब एक ही variable name दो बार आए (जैसे, <code>Idiv(x, x)</code>), दोनों operands एक ही नोड होने चाहिए (<code>Arc::ptr_eq</code> — यानी hash consing से structurally deduplicated)।</p>
-<p><strong>Tinygrad reference</strong>: <code>tinygrad/uop/symbolic.py</code>, <code>tinygrad/uop/divandmod.py</code></p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=worked-example-ऑप्टिमाइज़ेशन-कैस्केड>Worked Example: ऑप्टिमाइज़ेशन कैस्केड<a href=#worked-example-ऑप्टिमाइज़ेशन-कैस्केड class=hash-link aria-label="Worked Example: ऑप्टिमाइज़ेशन कैस्केड का सीधा लिंक" title="Worked Example: ऑप्टिमाइज़ेशन कैस्केड का सीधा लिंक" translate=no>​</a></h2>
-<p>एक सिम्पल एक्सप्रेशन जो दिखाता है कि पैटर्न कैसे compose होते हैं:</p>
-<p>पहले:</p>
-<!-- -->
-<p>चरण:</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Step 1 (identity):    ADD(x, 0) -> x</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 2 (identity):    MUL(x, 1) -> x</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 3 (const fold):  ADD(3, 4) -> CONST(7)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 4 (result):      ADD(x, 7)</span><br/></div></code></pre></div></div>
-<p>बाद में:</p>
-<!-- -->
-<p>रीराइट इंजन पैटर्न bottom-up अप्लाई करता है: पहले children सिम्प्लिफ़ाई होते हैं, फिर parent री-मैच करता है। यह सिंगल traversal में मल्टी-स्टेप cascades सक्षम करता है।</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=पैटर्न-ऑर्डरिंग>पैटर्न ऑर्डरिंग<a href=#पैटर्न-ऑर्डरिंग class=hash-link aria-label="पैटर्न ऑर्डरिंग का सीधा लिंक" title="पैटर्न ऑर्डरिंग का सीधा लिंक" translate=no>​</a></h2>
-<p>हर matcher पैटर्न ग्रुप्स को एक स्पेसिफ़िक ऑर्डर में compose करता है — ऑर्डर load-bearing है, क्योंकि एक ग्रुप बाद वाले के लिए नए matches खोल सकता है। एक ग्रुप के अंदर, पैटर्न sequentially ट्राई होते हैं जब तक कोई मैच न हो। ग्रुप्स <code>+</code> ऑपरेटर से concatenate होते हैं:</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple() = symbolic_simple_base() + dead_loop_patterns()</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple_base()          -- tier 1</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  propagate_invalid             -- MUST be first (before x*0=0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  fold_invalid_load_store</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  constant_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vconst_folding_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  bool_arithmetic_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  identity_and_zero_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  self_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  zero_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  uint_pack_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  div_mod_recombine_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  power_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic() = symbolic_simple() + tier 2</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  commutative_canonicalization</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  term_combining_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_alu_combining_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vmin_vmax_collapse_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  minmax_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  comparison_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_mod_div_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  advanced_division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_cast_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  long_to_int_narrowing_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  after_simplification_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_bound_patterns</span><br/></div></code></pre></div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=1-constant-folding>1. Constant Folding<a href=#1-constant-folding class=hash-link aria-label="1. Constant Folding का सीधा लिंक" title="1. Constant Folding का सीधा लिंक" translate=no>​</a></h2>
-<p>Compile-time constants पर ऑपरेशन evaluate करता है dtype-aware arithmetic से। Results type boundaries respect करते हैं (जैसे, Int32 32 bits पर wrap करता है)।</p>
-<p><strong>Tinygrad</strong>: <code>symbolic.py:40-118</code></p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=scalar-constants>Scalar Constants<a href=#scalar-constants class=hash-link aria-label="Scalar Constants का सीधा लिंक" title="Scalar Constants का सीधा लिंक" translate=no>​</a></h3>
 
 
 
@@ -82,8 +68,6 @@
 
 
 
-<table><thead><tr><th>कैटेगरी<th>Ops<th>पैटर्न<tbody><tr><td>Unary (7)<td>Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc<td><code>op(CONST(c))</code> -> <code>CONST(eval(op, c))</code><tr><td>Binary (13)<td>Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr<td><code>op(CONST(a), CONST(b))</code> -> <code>CONST(eval(op, a, b))</code><tr><td>Ternary (2)<td>Where, MulAcc<td><code>op(CONST(a), CONST(b), CONST(c))</code> -> <code>CONST(eval(op, a, b, c))</code></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=vector-constants>Vector Constants<a href=#vector-constants class=hash-link aria-label="Vector Constants का सीधा लिंक" title="Vector Constants का सीधा लिंक" translate=no>​</a></h3>
 
 
 
@@ -99,6 +83,15 @@
 
 
 
+<table><thead><tr><th>पैटर्न<th>परिणाम<tbody><tr><td><code>WHERE(Invalid, _, _)</code><td><code>Invalid</code><tr><td><code>WHERE(WHERE(c, x, Inv), a, b)</code><td><code>WHERE(c, WHERE(x, a, b), Inv)</code><tr><td><code>WHERE(c, Inv, x)</code><td><code>WHERE(!c, x, Inv)</code> (<code>WHERE(c, Inv, Inv)</code> → <code>Inv</code>)<tr><td><code>WHERE(c1, WHERE(c2, x, d), d)</code><td><code>WHERE(c1 & c2, x, d)</code><tr><td><code>WHERE(a, WHERE(c, x, Inv), y)</code>, <code>y</code> <code>Invalid</code> नहीं<td><code>WHERE(!a | c, WHERE(a, x, y), Inv)</code> — और false शाखा के लिए इसका दर्पण रूप<tr><td><code>unary(Inv)</code>, <code>CAST(Inv)</code>, <code>BITCAST(Inv)</code><td><code>Inv</code><tr><td><code>unary(WHERE(c, x, Inv))</code>, <code>CAST</code>, <code>BITCAST</code><td><code>WHERE(c, unary(x), Inv)</code><tr><td><code>op(WHERE(c, x, Inv), y)</code>, <code>op(y, WHERE(c, x, Inv))</code> <strong>हर</strong> binary op के लिए, comparisons सहित<td><code>WHERE(c, op(x, y), Inv)</code><tr><td><code>op(Inv, y)</code>, <code>op(y, Inv)</code> 13 non-comparison binary ops के लिए<td><code>Inv</code></table>
+<p>पहले क्यों: <code>MUL(0, WHERE(c, x, Inv))</code> को <code>WHERE(c, 0, Inv)</code> बनना चाहिए, न कि <code>0</code>।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=dead-loads-and-stores-fold_invalid_load_store>मृत loads और stores (<code>fold_invalid_load_store</code>)<a href=#dead-loads-and-stores-fold_invalid_load_store class=hash-link aria-label="dead-loads-and-stores-fold_invalid_load_store का सीधा लिंक" title="dead-loads-and-stores-fold_invalid_load_store का सीधा लिंक" translate=no>​</a></h3>
+<p><code>LOAD(INDEX(buf, Invalid, ..))</code> (<code>CAST</code> के पीछे भी) → load का <code>alt</code> यदि हो, अन्यथा उचित आकार का शून्य; gate के बिना <code>STORE(INDEX(buf, Invalid, ..), v)</code> → <code>NOOP</code>।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=constant-folding>स्थिरांक folding<a href=#constant-folding class=hash-link aria-label="स्थिरांक folding का सीधा लिंक" title="स्थिरांक folding का सीधा लिंक" translate=no>​</a></h3>
+<p>Unary: <code>Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc</code> (<code>Neg</code> यहाँ कोई op नहीं है — <code>neg()</code> <code>MUL(x, -1)</code> बनाता है)। Binary: <code>Add, Mul, Sub, FloorMod, Max, Pow, FloorDiv, Fdiv, And, Or, Xor, Shl, Shr</code>, साथ में <code>Bool</code> देने वाले छह comparisons। Ternary: <code>Where</code>, <code>MulAcc</code>। परिणाम dtype के storage format से होकर commit होते हैं (<code>Int32</code> wrap होता है), सिवाय weak dtypes के, जो बिना truncate किया मान रखते हैं। <code>vconst_folding_patterns</code> यही काम lane-दर-lane <code>VCONST ⊕ VCONST</code> और <code>CONST</code>/<code>VCONST</code> broadcast मिश्रण के लिए करता है (11 binary ops + comparisons, 6 unary), weak lanes को छोड़ते हुए।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=bool-arithmetic>Bool अंकगणित<a href=#bool-arithmetic class=hash-link aria-label="Bool अंकगणित का सीधा लिंक" title="Bool अंकगणित का सीधा लिंक" translate=no>​</a></h3>
+<p>जब दोनों <code>Bool</code> हों: <code>Mul[x, y]</code> → <code>x & y</code>, <code>Add[x, y]</code> → <code>x | y</code>, <code>Max(x, y)</code> → <code>x | y</code>।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=identity-and-zero>Identity और शून्य<a href=#identity-and-zero class=hash-link aria-label="Identity और शून्य का सीधा लिंक" title="Identity और शून्य का सीधा लिंक" translate=no>​</a></h3>
 
 
 
@@ -109,10 +102,6 @@
 
 
 
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<tbody><tr><td><code>op(VCONST(a), VCONST(b))</code><td><code>VCONST(eval(op, a, b))</code> element-wise<tr><td><code>op(CONST(a), VCONST(b))</code><td><code>VCONST(eval(op, broadcast(a), b))</code><tr><td><code>op(VCONST(a), CONST(b))</code><td><code>VCONST(eval(op, a, broadcast(b)))</code><tr><td><code>unary_op(VCONST(v))</code><td><code>VCONST(eval(op, v))</code> element-wise</table>
-<p>VConst folding 11 binary ops कवर करता है (Pow और Fdiv exclude) और सभी 7 unary ops।</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=2-identity-और-zero-propagation>2. Identity और Zero Propagation<a href=#2-identity-और-zero-propagation class=hash-link aria-label="2. Identity और Zero Propagation का सीधा लिंक" title="2. Identity और Zero Propagation का सीधा लिंक" translate=no>​</a></h2>
 
 
 
@@ -148,6 +137,21 @@
 
 
 
+<table><thead><tr><th>पैटर्न<th>परिणाम<th>शर्त<tbody><tr><td><code>Add[x, 0]</code><td><code>x</code><td>float नहीं, या शून्य <code>-0.0</code> है (<code>x = -0.0</code> के लिए <code>x + 0.0</code> identity नहीं है)<tr><td><code>Sub(x, 0)</code><td><code>x</code><td>float नहीं, या शून्य <code>+0.0</code> है<tr><td><code>Mul[x, 1]</code>, <code>Or[x, 0]</code>, <code>Xor[x, 0]</code>, <code>FloorDiv(x, 1)</code>, <code>Fdiv(x, 1)</code><td><code>x</code><td><tr><td><code>FloorMod(x, 1)</code><td><code>0</code><td><tr><td><code>Floor/Ceil/Trunc/Round(x)</code><td><code>x</code><td>पूर्णांक <code>x</code><tr><td><code>Mul[x, 0]</code><td><code>0</code><td>float नहीं (<code>NaN * 0</code>, <code>Inf * 0</code> का परिणाम <code>NaN</code> है)<tr><td><code>And[_, 0]</code><td><code>0</code><td></table>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=self-and-zero-folding>Self और शून्य folding<a href=#self-and-zero-folding class=hash-link aria-label="Self और शून्य folding का सीधा लिंक" title="Self और शून्य folding का सीधा लिंक" translate=no>​</a></h3>
+<p><code>FloorDiv(x, x)</code> → <code>1</code>; <code>FloorDiv(x, -1)</code> → <code>MUL(x, -1)</code>; <code>FloorMod(FloorMod(x, y), y)</code> → <code>FloorMod(x, y)</code>; <code>And(x, x)</code>, <code>Or(x, x)</code>, <code>Max(x, x)</code> → <code>x</code>; <code>FloorMod(x, x)</code> → <code>0</code>; <code>Lt(x, x)</code> → <code>false</code> non-floats के लिए, और floats के लिए तब जब sound bounds सिद्ध करें कि <code>x</code> <code>NaN</code> नहीं है; <code>Ne(x, x)</code> → <code>false</code> ints और bools के लिए।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=division>भाग (Division)<a href=#division class=hash-link aria-label="भाग (Division) का सीधा लिंक" title="भाग (Division) का सीधा लिंक" translate=no>​</a></h3>
+<p><code>Fdiv(0.0, 0.0)</code> और <code>Fdiv(MUL[_, 0.0], 0.0)</code> → <code>NaN</code> (पहले सूचीबद्ध ताकि ये अगले नियम से पहले लागू हों); <code>Fdiv(x, x)</code> → <code>1.0</code> केवल तब जब <code>x</code> सिद्ध रूप से परिमित और शून्येतर हो; <code>FloorDiv(Mul(x, y), y)</code> → <code>x</code>। float के लिए <code>(x*y)/y → x</code> नहीं है।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=casts>Casts<a href=#casts class=hash-link aria-label="Casts का सीधा लिंक" title="Casts का सीधा लिंक" translate=no>​</a></h3>
+<p><code>CAST(x, dt)</code> → <code>x</code> जब dtype पहले से मेल खाता हो; <code>CAST(CAST(x, a), b)</code> → <code>x</code> जब <code>x: b</code> और <code>can_safe_cast(b, a)</code> (<code>a</code> में <code>b</code> का हर मान समा जाता है: समान signedness और कम-से-कम उतना चौड़ा, unsigned→signed के लिए एक अतिरिक्त bit चाहिए, float↔int कभी नहीं); <code>CAST(CAST(x, a), b)</code> → <code>CAST(x, b)</code> जब <code>a</code> <code>x</code> को संकीर्ण न करे। <code>uint_pack_dsl_patterns</code> Threefry द्वारा बनाई गई <code>(hi.cast(u64) &lt;&lt; 32) | lo.cast(u64)</code> packing को रद्द करता है, ताकि PRNG 32-bit ALU में ही रहे।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=div-mod-recombination>Div-mod पुनर्संयोजन<a href=#div-mod-recombination class=hash-link aria-label="Div-mod पुनर्संयोजन का सीधा लिंक" title="Div-mod पुनर्संयोजन का सीधा लिंक" translate=no>​</a></h3>
+<p>हर <code>Add</code> पर एक नियम: <code>fold_add_divmod_recombine</code>, Tinygrad का port। यह <code>Add</code> श्रृंखला को सपाट करता है, एक पद <code>(base % div) * mul</code> और एक साथी <code>q * (div * mul)</code> ढूँढता है जिसका <code>q</code> किसी ऐसी चीज़ का भागफल है जो <code>div</code> मॉड्यूलो <code>base</code> के सर्वांगसम है (<code>quotient_base</code>: <code>q == b // div</code>, संभवतः merged <code>(x//c + a)//div</code> और shifted स्थिरांकों के साथ), और इस जोड़ी को <code>b * mul</code> से बदल देता है; <code>q == (b // div) % d</code> होने पर यह इसे चौड़े <code>(b % (div*d)) * mul</code> में fold करता है। यह <code>x%n + (x//n)*n → x</code> परिवार और उसके scaled, offset और तीन-पद वाले रूप हैं, जो अलग-अलग नियमों के बजाय श्रृंखला के माध्यम से मिलते हैं।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=power-booleans-dce>Power, booleans, DCE<a href=#power-booleans-dce class=hash-link aria-label="Power, booleans, DCE का सीधा लिंक" title="Power, booleans, DCE का सीधा लिंक" translate=no>​</a></h3>
+<p><code>Pow(x, 0)</code> → <code>1</code>, <code>Pow(x, 1)</code> → <code>x</code>, <code>Pow(1, x)</code> → <code>1</code> (केवल scalars; कोई अन्य घातांक नहीं बदला जाता — reciprocal/sqrt रूप IEEE rounding बदल देते हैं)। <code>Not(Not(x))</code> → <code>x</code>, <code>Xor(x, x)</code> → <code>0</code>, <code>true | _</code> → <code>true</code>, <code>false & _</code> → <code>false</code>, <code>true & x</code> → <code>x</code>, <code>false | x</code> → <code>x</code> (केवल bool स्थिरांक)। सिद्ध रूप से स्थिर शर्त (sound bounds) वाला <code>WHERE</code> शाखा चुन लेता है; <code>WHERE(_, t, t)</code> → <code>t</code>; <code>WHERE(x, true, false)</code> → <code>x</code>; <code>WHERE(x, false, true)</code> → <code>!x</code>; <code>WHERE(a, WHERE(b, c, d), d)</code> → <code>WHERE(a & b, c, d)</code>। <code>dead_loop_patterns</code>: <code>vmax &lt; 0</code> वाला <code>RANGE</code> → <code>CONST(0)</code>, <code>vmin == vmax</code> वाला <code>RANGE(CONST)</code> → वही स्थिरांक। यहाँ कोई <code>END</code>/<code>REDUCE</code> खाली-range fold नहीं है; उन्हें <code>reduce_to_acc</code> संभालता है।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tier-2>Tier 2<a href=#tier-2 class=hash-link aria-label="Tier 2 का सीधा लिंक" title="Tier 2 का सीधा लिंक" translate=no>​</a></h2>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=commutative-canonicalization>क्रमविनिमेय canonicalization<a href=#commutative-canonicalization class=hash-link aria-label="क्रमविनिमेय canonicalization का सीधा लिंक" title="क्रमविनिमेय canonicalization का सीधा लिंक" translate=no>​</a></h3>
+<p><code>Add, Mul, Max, And, Or, Xor</code> (और नाममात्र के लिए <code>Eq</code>/<code>Ne</code>, जो कभी लागू नहीं होते क्योंकि उनका परिणाम <code>Bool</code> है) के लिए, जिनका <strong>परिणाम</strong> dtype <code>WeakInt</code> है: operands की अदला-बदली तब होती है जब <code>tinygrad_tuplize_cmp(b, a) == Less</code> हो — यह संरचनात्मक <code>(op, arg, dtype, *src)</code> key क्रम है जिसे linearizer भी उपयोग करता है। इसके बाद commutativity तक समान index expressions hash-cons होकर एक ही नोड बन जाते हैं, जिस पर पुनर्संयोजन और expander निर्भर हैं। अन्य dtypes लिखा गया क्रम बनाए रखते हैं।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=term-combining-addmul-with-constants>पद संयोजन (स्थिरांकों के साथ <code>Add</code>/<code>Mul</code>)<a href=#term-combining-addmul-with-constants class=hash-link aria-label="term-combining-addmul-with-constants का सीधा लिंक" title="term-combining-addmul-with-constants का सीधा लिंक" translate=no>​</a></h3>
 
 
 
@@ -178,14 +182,6 @@
 
 
 
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>ADD[x, 0]</code><td><code>x</code><td>Commutative<tr><td><code>MUL[x, 1]</code><td><code>x</code><td>Commutative<tr><td><code>OR[x, 0]</code><td><code>x</code><td>Commutative<tr><td><code>XOR[x, 0]</code><td><code>x</code><td>Commutative<tr><td><code>SUB(x, 0)</code><td><code>x</code><td>Ordered<tr><td><code>IDIV(x, 1)</code><td><code>x</code><td>Ordered<tr><td><code>FDIV(x, 1)</code><td><code>x</code><td>Ordered<tr><td><code>MOD(x, 1)</code><td><code>0</code><td>कुछ भी mod 1 ज़ीरो है<tr><td><code>Floor/Ceil/Trunc/Round(x)</code><td><code>x</code><td>सिर्फ़ जब <code>x</code> integer हो (rounding no-op है)<tr><td><code>MUL[x, 0]</code><td><code>0</code><td>सिर्फ़ जब float NOT हो<tr><td><code>AND[_, 0]</code><td><code>0</code><td>Commutative</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>IEEE 754: MUL by zero</div><div class=admonitionContent_BuS1><p><code>MUL[x, 0]</code> floats के लिए <strong>सिम्प्लिफ़ाई नहीं</strong> होता क्योंकि IEEE 754 require करता है:<ul>
-<li class=""><code>NaN * 0 = NaN</code></li>
-<li class=""><code>Inf * 0 = NaN</code></li>
-</ul><p>गार्ड <code>!x.dtype().is_float()</code> floating-point types के लिए यह ऑप्टिमाइज़ेशन रोकता है।</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=3-self-folding>3. Self-Folding<a href=#3-self-folding class=hash-link aria-label="3. Self-Folding का सीधा लिंक" title="3. Self-Folding का सीधा लिंक" translate=no>​</a></h2>
-<p>ऐसे पैटर्न जहाँ एक ही operand दोनों तरफ़ दिखता है। <code>Arc::ptr_eq</code> चेक इस्तेमाल करते हैं (hash consing गारंटी देता है कि structurally equal subexpressions एक ही pointer शेयर करते हैं)।</p>
 
 
 
@@ -197,991 +193,32 @@
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>IDIV(x, x)</code><td><code>1</code><td><tr><td><code>IDIV(x, -1)</code><td><code>NEG(x)</code><td>RHS पर constant चेक<tr><td><code>MOD(MOD(x, y), y)</code><td><code>MOD(x, y)</code><td>Idempotent mod<tr><td><code>AND(x, x)</code><td><code>x</code><td><tr><td><code>OR(x, x)</code><td><code>x</code><td></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=4-zero-folding>4. Zero Folding<a href=#4-zero-folding class=hash-link aria-label="4. Zero Folding का सीधा लिंक" title="4. Zero Folding का सीधा लिंक" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>MOD(x, x)</code><td><code>0</code><td><tr><td><code>LT(x, x)</code><td><code>false</code><td>Floats के लिए NOT (NaN &lt; NaN false है, लेकिन soundness के लिए गार्ड ज़रूरी)<tr><td><code>NE(x, x)</code><td><code>false</code><td>सिर्फ़ ints — IEEE 754 में <code>NaN != NaN</code> <code>true</code> है</table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=5-division-सिम्प्लिफ़िकेशन>5. Division सिम्प्लिफ़िकेशन<a href=#5-division-सिम्प्लिफ़िकेशन class=hash-link aria-label="5. Division सिम्प्लिफ़िकेशन का सीधा लिंक" title="5. Division सिम्प्लिफ़िकेशन का सीधा लिंक" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>FDIV(0.0, 0.0)</code><td><code>NaN</code><td>IEEE 754 indeterminate form<tr><td><code>FDIV(MUL[_, 0], 0)</code><td><code>NaN</code><td>कोई भी zero-expression / zero<tr><td><code>FDIV(x, x)</code><td><code>1.0</code><td>Float self-division<tr><td><code>FDIV(MUL(x, y), y)</code><td><code>x</code><td>Cancellation (float)<tr><td><code>IDIV(MUL(x, y), y)</code><td><code>x</code><td>Cancellation (integer)</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>पैटर्न प्रायोरिटी</div><div class=admonitionContent_BuS1><p><code>FDIV(0, 0) -> NaN</code> matcher में <code>FDIV(x, x) -> 1</code> से पहले होना ज़रूरी ताकि priority ले सके। <code>division_dsl_patterns()</code> के अंदर ऑर्डरिंग यह ensure करता है।</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=6-cast-ऑप्टिमाइज़ेशन>6. Cast ऑप्टिमाइज़ेशन<a href=#6-cast-ऑप्टिमाइज़ेशन class=hash-link aria-label="6. Cast ऑप्टिमाइज़ेशन का सीधा लिंक" title="6. Cast ऑप्टिमाइज़ेशन का सीधा लिंक" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>CAST(CONST(c), dtype)</code><td><code>CONST(c.cast(dtype))</code><td>Compile-time cast folding<tr><td><code>CAST(x, dtype)</code><td><code>x</code><td>जब <code>x.dtype() == dtype</code> (noop)<tr><td><code>CAST(CAST(x, a), b)</code><td><code>x</code><td>जब <code>x.dtype() == b</code> और <code>a</code> <code>b</code> की सभी values preserve करे<tr><td><code>CAST(CAST(x, a), b)</code><td><code>CAST(x, b)</code><td>जब <code>a</code> <code>x</code> को narrow न करे (widening chain)<tr><td><code>CAST(WHERE(s, a, b), dtype)</code><td><code>WHERE(s, CAST(a, dtype), CAST(b, dtype))</code><td>Cast को branches से push करे</table>
-<p><code>can_safe_cast(to, from)</code> फ़ंक्शन determine करता है कि intermediate type सभी values hold कर सकता है या नहीं। यह bit widths, signedness, और float/int categories चेक करता है।</p>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Truncation kills round-trips</div><div class=admonitionContent_BuS1><p><code>CAST(CAST(x, i8), i64)</code> जब <code>x</code> <code>i64</code> हो तो <code>x</code> में collapse <strong>नहीं</strong> होता। Intermediate <code>i8</code> values truncate करता है — <code>can_safe_cast(i64, i8)</code> <code>false</code> रिटर्न करता है क्योंकि <code>i8</code> सभी <code>i64</code> values hold नहीं कर सकता।<p>सेफ़ example: <code>CAST(CAST(x, i32), bool)</code> -> <code>CAST(x, bool)</code> जब <code>x</code> <code>bool</code> हो, क्योंकि <code>i32</code> <code>true</code> और <code>false</code> दोनों represent कर सकता है।</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=7-term-combining>7. Term Combining<a href=#7-term-combining class=hash-link aria-label="7. Term Combining का सीधा लिंक" title="7. Term Combining का सीधा लिंक" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<tbody><tr><td><code>ADD(x, x)</code><td><code>MUL(2, x)</code><tr><td><code>ADD(MUL(c1, x), MUL(c2, x))</code><td><code>MUL(c1+c2, x)</code><tr><td><code>ADD(MUL(x, c1), MUL(x, c2))</code><td><code>MUL(x, c1+c2)</code></table>
-<p>दोनों ordered variants मैच होते हैं (MUL में constant left या right पर)।</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=8-alu-chain-folding>8. ALU Chain Folding<a href=#8-alu-chain-folding class=hash-link aria-label="8. ALU Chain Folding का सीधा लिंक" title="8. ALU Chain Folding का सीधा लिंक" translate=no>​</a></h2>
-<p>Associative ऑपरेशन chains में constants fold करता है और canonical form के लिए constants बाहर push करता है।</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=constant-folding>Constant Folding<a href=#constant-folding class=hash-link aria-label="Constant Folding का सीधा लिंक" title="Constant Folding का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>ADD[ADD[x, c1], c2]</code><td><code>ADD(x, c1+c2)</code><td>Commutative outer Add<tr><td><code>MUL[MUL[x, c1], c2]</code><td><code>MUL(x, c1*c2)</code><td>Commutative outer Mul<tr><td><code>ADD[SUB(x, c1), c2]</code><td><code>ADD(x, c2-c1)</code> या <code>SUB(x, c1-c2)</code><td>Sign-normalized<tr><td><code>SUB(ADD(x, c1), c2)</code><td><code>ADD(x, c1-c2)</code> या <code>SUB(x, c2-c1)</code><td>Sign-normalized<tr><td><code>SUB(SUB(x, c1), c2)</code><td><code>SUB(x, c1+c2)</code><td></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=constant-pushing>Constant Pushing<a href=#constant-pushing class=hash-link aria-label="Constant Pushing का सीधा लिंक" title="Constant Pushing का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>ADD[ADD[x, c], y]</code><td><code>ADD(ADD(x, y), c)</code><td>Constant बाहर push करे; <code>y</code> const नहीं होना चाहिए</table>
-<p>Constant pushing index extraction के लिए ज़रूरी है। यह ensure करता है कि constants outermost level पर bubble हों, जिससे downstream पैटर्न (जैसे div-mod simplification) clean <code>variable + offset</code> forms देख सकें।</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=sub-canonicalization>Sub Canonicalization<a href=#sub-canonicalization class=hash-link aria-label="Sub Canonicalization का सीधा लिंक" title="Sub Canonicalization का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>SUB(a, SUB(b, x))</code><td><code>ADD(x, SUB(a, b))</code><td>Inner variable expose करे</table>
-<p>Svod <code>SUB</code> को first-class IR op रखता है (Tinygrad से अलग जो <code>a-b</code> को <code>ADD(a, NEG(b))</code> में canonicalize करता है)। यह पैटर्न ensure करता है कि nested <code>SUB</code> आगे की simplification ब्लॉक न करें।</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=9-boolean-logic>9. Boolean Logic<a href=#9-boolean-logic class=hash-link aria-label="9. Boolean Logic का सीधा लिंक" title="9. Boolean Logic का सीधा लिंक" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>NOT(NOT(x))</code><td><code>x</code><td>Double negation elimination<tr><td><code>XOR(x, x)</code><td><code>0</code><td>Self-cancellation<tr><td><code>OR[x, NOT(x)]</code><td><code>true</code><td>Tautology (सिर्फ़ bool)<tr><td><code>AND[x, NOT(x)]</code><td><code>false</code><td>Contradiction (सिर्फ़ bool)<tr><td><code>OR[true, x]</code><td><code>true</code><td>Absorbing element<tr><td><code>AND[false, x]</code><td><code>false</code><td>Absorbing element<tr><td><code>AND[true, x]</code><td><code>x</code><td>Identity<tr><td><code>OR[false, x]</code><td><code>x</code><td>Identity<tr><td><code>AND[NOT(x), NOT(y)]</code><td><code>NOT(OR(x, y))</code><td>De Morgan<tr><td><code>OR[NOT(x), NOT(y)]</code><td><code>NOT(AND(x, y))</code><td>De Morgan</table>
-<p><code>[]</code> वाले सभी पैटर्न commutative हैं (दोनों operand orderings ट्राई होती हैं)।</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=10-comparison-सिम्प्लिफ़िकेशन>10. Comparison सिम्प्लिफ़िकेशन<a href=#10-comparison-सिम्प्लिफ़िकेशन class=hash-link aria-label="10. Comparison सिम्प्लिफ़िकेशन का सीधा लिंक" title="10. Comparison सिम्प्लिफ़िकेशन का सीधा लिंक" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=self-comparison-non-float-ptr_eq>Self-Comparison (non-float, ptr_eq)<a href=#self-comparison-non-float-ptr_eq class=hash-link aria-label="Self-Comparison (non-float, ptr_eq) का सीधा लिंक" title="Self-Comparison (non-float, ptr_eq) का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Op<th>रिज़ल्ट<tbody><tr><td><code>LT(x, x)</code>, <code>GT(x, x)</code>, <code>NE(x, x)</code><td><code>false</code><tr><td><code>LE(x, x)</code>, <code>GE(x, x)</code>, <code>EQ(x, x)</code><td><code>true</code></table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Float self-comparison</div><div class=admonitionContent_BuS1><p>Self-comparison पैटर्न <code>!x.dtype().is_float()</code> से guarded हैं। Floats में, <code>NaN != NaN</code> <code>true</code> है और <code>NaN == NaN</code> <code>false</code> है, तो ये identities hold नहीं करतीं।</div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=constant-और-range-based>Constant और Range-Based<a href=#constant-और-range-based class=hash-link aria-label="Constant और Range-Based का सीधा लिंक" title="Constant और Range-Based का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>op(CONST(a), CONST(b))</code><td><code>CONST(eval(op, a, b))</code><td>Direct constant fold<tr><td><code>op(x, y)</code> जब bounds prove करें<td><code>true</code> या <code>false</code><td><code>ComparisonAnalyzer</code> vmin/vmax इस्तेमाल करता है</table>
-<p><code>ComparisonAnalyzer</code> चेक करता है: अगर <code>x.vmax &lt; y.vmin</code> तो <code>LT(x, y)</code> provably <code>true</code> है।</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=algebraic-transforms>Algebraic Transforms<a href=#algebraic-transforms class=hash-link aria-label="Algebraic Transforms का सीधा लिंक" title="Algebraic Transforms का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>LT(ADD[c0, x], c1)</code><td><code>LT(x, c1-c0)</code><td>Offset elimination<tr><td><code>LT(NEG(x), NEG(y))</code><td><code>LT(y, x)</code><td>Negation flip<tr><td><code>LT(IDIV(x, d), c)</code><td><code>LT(x, c*d)</code><td>Division lift (d > 0)</table>
-<p><code>LT(x//d, c)</code> के लिए division lifting positive और non-positive <code>c</code> दोनों handle करता है:</p>
+<table><thead><tr><th>पैटर्न<th>परिणाम<tbody><tr><td><code>Add(x, x)</code><td><code>x * 2</code><tr><td><code>Add(Mul[x, c1], Mul[x, c2])</code><td><code>x * (c1 + c2)</code><tr><td><code>Add[x, Mul[x, c]]</code><td><code>x * (c + 1)</code><tr><td><code>Add[Add[y, Mul[x, c0]], Mul[x, c1]]</code><td><code>y + x * (c0 + c1)</code><tr><td><code>Add[Add[y, x], Mul[x, c]]</code>, <code>Add[Add[y, Mul[x, c]], x]</code><td><code>y + x * (c + 1)</code><tr><td><code>Add[Add[y, x], x]</code><td><code>y + x * 2</code><tr><td><code>Mul[-1, Add[x, c]]</code><td><code>-x + (-c)</code><tr><td><code>Mul[c, Add[x, k]]</code>, <code>x: WeakInt</code><td><code>c*x + c*k</code></table>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=boolean-boolean_dsl_patterns>Boolean (<code>boolean_dsl_patterns</code>)<a href=#boolean-boolean_dsl_patterns class=hash-link aria-label="boolean-boolean_dsl_patterns का सीधा लिंक" title="boolean-boolean_dsl_patterns का सीधा लिंक" translate=no>​</a></h3>
+<p><code>Or[x, Not(x)]</code> → <code>true</code>, <code>And[x, Not(x)]</code> → <code>false</code> (केवल bool); दोनों दिशाओं में De Morgan, <code>And[Not(x), Not(y)]</code> → <code>!(x | y)</code> और <code>Or[Not(x), Not(y)]</code> → <code>!(x & y)</code>।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=where>WHERE<a href=#where class=hash-link aria-label="WHERE का सीधा लिंक" title="WHERE का सीधा लिंक" translate=no>​</a></h3>
+<p><code>dce_dsl_patterns</code>: <code>WHERE(Not(c), t, f)</code> → <code>WHERE(c, f, t)</code>, जब तक <code>f</code> में <code>Invalid</code> न हो (scalar या <code>STACK</code> lane) — अदला-बदली marker को true शाखा में ले जाएगी जहाँ gate नियम उसे देख नहीं सकते। <code>where_alu_combining_patterns</code>: <code>op(WHERE(c, a, b), WHERE(c, d, e))</code> → <code>WHERE(c, op(a, d), op(b, e))</code> <code>Add, Mul, Sub, Max, And, Or, Xor</code> के लिए, जब दोनों true शाखाएँ या दोनों false शाखाएँ स्थिरांक हों, और साहचर्य (associative) रूप <code>Add(Add(y, WHERE(c, ..)), WHERE(c, ..))</code>। <code>where_bound_patterns</code>: <code>WHERE(Lt(x, c), t, f)</code> → <code>t</code> जब <code>x.vmax &lt; c.vmin</code>, <code>f</code> जब <code>x.vmin >= c.vmax</code>।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=bounds-collapse-and-minmax>सीमाओं का संकुचन और min/max<a href=#bounds-collapse-and-minmax class=hash-link aria-label="सीमाओं का संकुचन और min/max का सीधा लिंक" title="सीमाओं का संकुचन और min/max का सीधा लिंक" translate=no>​</a></h3>
+<p><code>vmin_vmax_collapse_patterns</code>: एक <code>Mul</code>, <code>FloorDiv</code>, <code>FloorMod</code>, comparison, <code>PARAM</code> या <code>SPECIAL</code> जिसकी sound bounds एक ही मान हों, वह स्थिरांक बन जाता है (floats बाहर; <code>Add</code>/<code>Sub</code>/<code>Max</code> जानबूझकर बाहर ताकि trip-1 loop carry fold न हो जाए)। <code>minmax_dsl_patterns</code>: <code>Max(x, y)</code> → <code>x</code> जब <code>x.vmin >= y.vmax</code> (floats के लिए सख्ती से बड़ा, ताकि शून्य का चिह्न बना रहे), <code>y</code> के लिए सममित। कोई <code>Min</code> op नहीं है: <code>Tensor::minimum</code> एक <code>WHERE</code> है।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=alu-chain-folding-alu_folding_dsl_patterns>ALU श्रृंखला folding (<code>alu_folding_dsl_patterns</code>)<a href=#alu-chain-folding-alu_folding_dsl_patterns class=hash-link aria-label="alu-chain-folding-alu_folding_dsl_patterns का सीधा लिंक" title="alu-chain-folding-alu_folding_dsl_patterns का सीधा लिंक" translate=no>​</a></h3>
+<p>साहचर्य folding <code>(x ⊕ c1) ⊕ c2</code> → <code>x ⊕ (c1 ⊕ c2)</code> <code>Add</code>, <code>Mul</code>, <code>And</code>, <code>Or</code>, <code>Xor</code>, <code>Max</code> के लिए; स्थिरांक को आगे धकेलना <code>(x + c) + y</code> → <code>(x + y) + c</code> और <code>(x * c) * y</code> → <code>(x * y) * c</code> जब <code>y</code> स्थिरांक न हो; <code>(x - c1) + c2</code>, <code>(x + c1) - c2</code> को <code>x + k</code> या <code>x - |k|</code> में सामान्यीकृत किया जाता है; <code>(x - c1) - c2</code> → <code>x - (c1 + c2)</code>; <code>Sub(a, Sub(b, x))</code> → <code>x + (a - b)</code>। Svod में <code>Sub</code> एक प्रथम-श्रेणी op है (Tinygrad <code>a - b</code> को <code>a + b*-1</code> लिखता है)।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=comparisons-comparison_dsl_patterns>Comparisons (<code>comparison_dsl_patterns</code>)<a href=#comparisons-comparison_dsl_patterns class=hash-link aria-label="comparisons-comparison_dsl_patterns का सीधा लिंक" title="comparisons-comparison_dsl_patterns का सीधा लिंक" translate=no>​</a></h3>
+<p>सभी छह comparisons के लिए: non-floats पर <code>x op x</code> fold होता है (<code>Lt/Gt/Ne</code> → <code>false</code>, <code>Le/Ge/Eq</code> → <code>true</code>); स्थिरांक operands fold होते हैं; अन्यथा <code>ComparisonAnalyzer::analyze</code> (<code>ir/src/uop/comparison_analysis.rs</code>) sound bounds से <code>true</code> या <code>false</code> सिद्ध करता है — दोनों केवल non-weak dtypes के लिए। फिर: <code>Lt(Add[c0, x], c1)</code> → <code>Lt(x, c1 - c0)</code>; <code>Lt(Mul[x, -1], Mul[y, -1])</code> → <code>Lt(y, x)</code>; <code>Lt(FloorDiv(x, d), c)</code> → <code>Lt(x, c * d)</code> <code>d > 0</code> के लिए no-wrap जाँच के तहत (floor division के लिए सटीक, <code>c</code> का कोई भी चिह्न); <code>WeakInt</code> के लिए: <code>Lt(Mul[c0, x], c1)</code> → <code>±x &lt; ceil(c1 / |c0|)</code> और GCD fold <code>lt_folding</code> (<code>x = d*q + r</code>, <code>r ∈ [0, d)</code>, <code>d | c</code> ⇒ <code>x &lt; c ⇔ q &lt; c/d</code>)।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=ranges-and-division>Ranges और भाग<a href=#ranges-and-division class=hash-link aria-label="Ranges और भाग का सीधा लिंक" title="Ranges और भाग का सीधा लिंक" translate=no>​</a></h3>
+<p><code>range_based_mod_div_patterns</code> और <code>advanced_division_dsl_patterns</code> index बीजगणित हैं; वे <a class="" href=/hi/docs/architecture/optimizations/index-arithmetic>index arithmetic</a> पृष्ठ पर हैं। <code>range_based_cast_patterns</code> strong integer <code>x</code> के लिए <code>CAST(CAST(x, a), b)</code> को संकुचित करता है जिसकी सीमाएँ <code>a</code> में समाती हैं। <code>long_to_int_narrowing_patterns</code> एक <code>Int64</code> binary op को, जिसके operands और परिणाम <code>i32</code> में समाते हों, <code>Int32</code> op और वापसी cast के रूप में फिर से लिखता है, और signed-int cast को <code>WeakInt + c</code> पर वितरित करता है।</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=after>AFTER<a href=#after class=hash-link aria-label="AFTER का सीधा लिंक" title="AFTER का सीधा लिंक" translate=no>​</a></h3>
+<p><code>after_simplification_patterns</code>: जो deps side effects नहीं हैं (<code>RANGE</code>, <code>STORE</code>, <code>END</code>, <code>CALL</code>, <code>BARRIER</code>, <code>CUSTOM</code>, <code>FUNCTION</code>), उन्हें उनके अपने sources से बदला जाता है और दोहराव हटाया जाता है; <code>NOOP</code> deps और <code>END(NOOP)</code> श्रृंखलाएँ हटा दी जाती हैं; <code>AFTER(x, [])</code> → <code>x</code>।</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tier-3-sym>Tier 3 (<code>sym</code>)<a href=#tier-3-sym class=hash-link aria-label="tier-3-sym का सीधा लिंक" title="tier-3-sym का सीधा लिंक" translate=no>​</a></h2>
 <ul>
-<li class=""><code>c > 0</code>: equivalent to <code>x &lt; c*d</code></li>
-<li class=""><code>c &lt;= 0</code>: equivalent to <code>x &lt; c*d - (d-1)</code></li>
+<li class=""><strong><code>pm_simplify_valid</code></strong> (<code>valid_simplification.rs</code>): <code>Bool</code> validity clauses की <code>And</code> श्रृंखला को clause-दर-clause सरल किया जाता है (<code>simplify_valid</code>), और <code>x: WeakInt</code> वाला <code>WHERE(cond, x, Invalid)</code> <code>x</code> को उन सीमाओं के तहत फिर से लिखता है जो <code>cond</code> से निहित हैं (<code>uop_given_valid</code>): <code>parse_valid</code> हर clause को <code>expr &lt; c</code> / <code>expr >= c</code> के रूप में पढ़ता है, एक सीमित चर प्रतिस्थापित करता है और फिर से सरल करता है।</li>
+<li class=""><strong><code>alu_vectorize_reorder_patterns</code></strong>: <code>op(STACK(x, x, ..), STACK(y, y, ..))</code> → <code>STACK(op(x, y), ..)</code> 13 अंकगणितीय/bitwise ops और छह comparisons के लिए, जब दोनों operands एक ही नोड के broadcasts हों और lane संख्या समान तथा 1 से अधिक हो।</li>
+<li class=""><strong><code>ne_zero_fold_patterns</code></strong>: <code>Ne(x, 0)</code> → <code>x.cast(bool)</code>।</li>
+<li class=""><strong><code>cast_where_dsl_patterns</code></strong>: <code>CAST(WHERE(s, a, b))</code> → <code>WHERE(s, CAST(a), CAST(b))</code>।</li>
+<li class=""><strong><code>store_load_folding_patterns</code></strong>: <code>STORE(_, Invalid)</code> → <code>NOOP</code>; <code>STORE(INDEX, WHERE(c, v, Invalid))</code> → gated index <code>INDEX(buf, WHERE(c, idx, Invalid))</code> जो <code>v</code> store करता है; <code>STORE(idx, LOAD(idx))</code> → <code>NOOP</code>; <code>STORE(INDEX, WHERE(g, alt, LOAD(same INDEX)))</code> → <code>alt</code> का gated store।</li>
+<li class=""><strong><code>reduce_sym_patterns</code></strong>: <code>REDUCE(x * c, Add)</code> → <code>REDUCE(x, Add) * c</code> और <code>reduce_mul_chain_sym</code> (range-स्वतंत्र गुणनखंड <code>Add</code>/<code>Max</code> reduce से बाहर निकाले जाते हैं; <code>Max</code> के लिए केवल अऋणात्मक), केवल पूर्णांक।</li>
+<li class=""><strong><code>sym_phase3_patterns</code></strong>: <code>-1 * (x + y)</code> → <code>-x + -y</code>; <code>WeakInt</code> के लिए <code>(x + y) * c</code> → <code>x*c + y*c</code>; एकल-source <code>GROUP</code> का unwrap; <code>NOOP</code>/<code>STACK</code>/<code>SINK</code> को <code>SINK</code>/<code>GROUP</code> में सपाट करना; <code>END(NOOP)</code> → <code>NOOP</code>।</li>
 </ul>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=11-minmax-elimination>11. Min/Max Elimination<a href=#11-minmax-elimination class=hash-link aria-label="11. Min/Max Elimination का सीधा लिंक" title="11. Min/Max Elimination का सीधा लिंक" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>MAX(x, x)</code><td><code>x</code><td>Self-max identity है<tr><td><code>MAX(x, y)</code><td><code>x</code><td>जब <code>x.vmin >= y.vmax</code> (bounds dominance prove करते हैं)<tr><td><code>MAX(x, y)</code><td><code>y</code><td>जब <code>y.vmin >= x.vmax</code></table>
-<p>Range analysis के लिए <code>VminVmaxProperty</code> इस्तेमाल करता है। अलग <code>MIN</code> पैटर्न नहीं — Svod <code>MIN(a,b)</code> को <code>NEG(MAX(NEG(a), NEG(b)))</code> में lower करता है इन पैटर्न से पहले।</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=12-where-ऑप्टिमाइज़ेशन>12. WHERE ऑप्टिमाइज़ेशन<a href=#12-where-ऑप्टिमाइज़ेशन class=hash-link aria-label="12. WHERE ऑप्टिमाइज़ेशन का सीधा लिंक" title="12. WHERE ऑप्टिमाइज़ेशन का सीधा लिंक" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=condition-elimination>Condition Elimination<a href=#condition-elimination class=hash-link aria-label="Condition Elimination का सीधा लिंक" title="Condition Elimination का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>WHERE(cond, t, f)</code><td><code>t</code><td>जब <code>cond.vmin == cond.vmax == true</code><tr><td><code>WHERE(cond, t, f)</code><td><code>f</code><td>जब <code>cond.vmin == cond.vmax == false</code><tr><td><code>WHERE(LT(x, c), t, f)</code><td><code>t</code><td>जब <code>x.vmax &lt; c.vmin</code> (हमेशा true)<tr><td><code>WHERE(LT(x, c), t, f)</code><td><code>f</code><td>जब <code>x.vmin >= c.vmax</code> (हमेशा false)</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=branch-सिम्प्लिफ़िकेशन>Branch सिम्प्लिफ़िकेशन<a href=#branch-सिम्प्लिफ़िकेशन class=hash-link aria-label="Branch सिम्प्लिफ़िकेशन का सीधा लिंक" title="Branch सिम्प्लिफ़िकेशन का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>WHERE(_, t, t)</code><td><code>t</code><td>Same branches<tr><td><code>WHERE(x, true, false)</code><td><code>x</code><td>Bool identity<tr><td><code>WHERE(x, false, true)</code><td><code>NOT(x)</code><td>Bool negation<tr><td><code>WHERE(NOT(cond), t, f)</code><td><code>WHERE(cond, f, t)</code><td>Condition flip<tr><td><code>WHERE(a, WHERE(b, c, d), d)</code><td><code>WHERE(AND(a, b), c, d)</code><td>Branch merging (<code>d</code> पर ptr_eq)</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Condition flip पर Invalid गार्ड</div><div class=admonitionContent_BuS1><p><code>WHERE(NOT(cond), t, f) -> WHERE(cond, f, t)</code> जब <code>f</code> में <code>Invalid</code> हो तब <strong>अप्लाई नहीं</strong> होता। Padding <code>WHERE(valid, idx, Invalid)</code> structures बनाता है, और swap करने से <code>Invalid</code> true branch में चला जाएगा जहाँ downstream पैटर्न उसे मैच नहीं कर सकते। Scalar <code>Invalid</code> और vectorized <code>VECTORIZE(Invalid, ...)</code> दोनों चेक होते हैं।<p>Tinygrad में भी यही गार्ड है: <code>symbolic.py:201-202</code>।</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=13-invalid-propagation>13. Invalid Propagation<a href=#13-invalid-propagation class=hash-link aria-label="13. Invalid Propagation का सीधा लिंक" title="13. Invalid Propagation का सीधा लिंक" translate=no>​</a></h2>
-<p>Invalid Svod का sentinel है out-of-bounds tensor regions के लिए जो padding operations बनाती हैं। ये पैटर्न identity पैटर्न जैसे <code>x*0=0</code> से <strong>पहले</strong> चलने चाहिए, वरना validity markers destroy हो जाते हैं।</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=पैटर्न-प्रायोरिटी-example>पैटर्न प्रायोरिटी Example<a href=#पैटर्न-प्रायोरिटी-example class=hash-link aria-label="पैटर्न प्रायोरिटी Example का सीधा लिंक" title="पैटर्न प्रायोरिटी Example का सीधा लिंक" translate=no>​</a></h3>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Without ordering:  MUL(0, WHERE(cond, x, Invalid)) -> 0    (x*0=0 fires, loses Invalid)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">With ordering:     MUL(0, WHERE(cond, x, Invalid))</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                 -> WHERE(cond, MUL(0, x), Invalid)         (Invalid propagation fires first)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                 -> WHERE(cond, 0, Invalid)                  (then x*0=0 is safe)</span><br/></div></code></pre></div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=where-invalid-merging>WHERE-Invalid Merging<a href=#where-invalid-merging class=hash-link aria-label="WHERE-Invalid Merging का सीधा लिंक" title="WHERE-Invalid Merging का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<tbody><tr><td><code>WHERE(c1, WHERE(c2, x, Inv), Inv)</code><td><code>WHERE(AND(c1, c2), x, Inv)</code><tr><td><code>WHERE(c1, WHERE(c2, x, Inv), y)</code><td><code>WHERE(AND(c1, c2), x, y)</code></table>
-<p>Multi-dimensional padding linearized index arithmetic से propagation के बाद nested WHERE-Invalid बनाता है। Single level में merge करने से <code>pm_lower_index_dtype</code> एक step में consume कर सकता है।</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=where-invalid-से-ऑपरेशन-push-करना>WHERE-Invalid से ऑपरेशन Push करना<a href=#where-invalid-से-ऑपरेशन-push-करना class=hash-link aria-label="WHERE-Invalid से ऑपरेशन Push करना का सीधा लिंक" title="WHERE-Invalid से ऑपरेशन Push करना का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>Ops<tbody><tr><td><code>CAST(WHERE(c, x, Inv))</code><td><code>WHERE(c, CAST(x), Inv)</code><td><tr><td><code>op(WHERE(c, x, Inv), y)</code><td><code>WHERE(c, op(x, y), Inv)</code><td>13 binary ops (non-comparison)<tr><td><code>op(y, WHERE(c, x, Inv))</code><td><code>WHERE(c, op(y, x), Inv)</code><td>13 binary ops (non-comparison)<tr><td><code>cmp(WHERE(c, x, Inv), y)</code><td><code>cmp(x, y)</code><td>Lt, Le, Eq, Ne, Gt, Ge<tr><td><code>cmp(y, WHERE(c, x, Inv))</code><td><code>cmp(y, x)</code><td>Lt, Le, Eq, Ne, Gt, Ge</table>
-<p>Comparisons के लिए, WHERE-Invalid strip होता है — Invalid region पहले से downstream gated है।</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=bare-invalid-propagation>Bare Invalid Propagation<a href=#bare-invalid-propagation class=hash-link aria-label="Bare Invalid Propagation का सीधा लिंक" title="Bare Invalid Propagation का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>गार्ड<tbody><tr><td><code>op(Invalid, y)</code><td><code>Invalid</code><td><code>y.dtype() == DType::Index</code>, सिर्फ़ left position</table>
-<p>Tinygrad alignment: <code>symbolic.py:37</code>। Right-position bare Invalid propagate <strong>नहीं</strong> होता ताकि non-index computations contaminate न हों।</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=invalid-indices-से-dead-loadsstores>Invalid Indices से Dead Loads/Stores<a href=#invalid-indices-से-dead-loadsstores class=hash-link aria-label="Invalid Indices से Dead Loads/Stores का सीधा लिंक" title="Invalid Indices से Dead Loads/Stores का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<tbody><tr><td><code>LOAD(INDEX(buf, Invalid))</code><td><code>CONST(0)</code><tr><td><code>LOAD(CAST(INDEX(buf, Invalid)))</code><td><code>CONST(0)</code><tr><td><code>STORE(INDEX(buf, Invalid), val)</code><td><code>NOOP</code><tr><td><code>STORE(CAST(INDEX(buf, Invalid)), val)</code><td><code>NOOP</code></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=14-dead-code-elimination>14. Dead Code Elimination<a href=#14-dead-code-elimination class=hash-link aria-label="14. Dead Code Elimination का सीधा लिंक" title="14. Dead Code Elimination का सीधा लिंक" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=dead-ranges>Dead Ranges<a href=#dead-ranges class=hash-link aria-label="Dead Ranges का सीधा लिंक" title="Dead Ranges का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>RANGE(end)</code> जहाँ <code>vmax &lt; 0</code><td><code>CONST(0)</code><td>Empty range (कभी execute नहीं होती)<tr><td><code>RANGE(CONST)</code> जहाँ <code>vmin == vmax</code><td><code>CONST(vmin)</code><td>Trivial range (single value)<tr><td><code>END(computation, ranges)</code><td><code>END(computation, live_ranges)</code><td>Dead ranges END से filter<tr><td><code>END(computation, [])</code><td><code>computation</code><td>सभी ranges dead — unwrap</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=dead-reduces>Dead Reduces<a href=#dead-reduces class=hash-link aria-label="Dead Reduces का सीधा लिंक" title="Dead Reduces का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Reduce Op<th>Identity Element<tbody><tr><td>Add<td><code>0</code><tr><td>Mul<td><code>1</code><tr><td>Max<td><code>-inf</code> (dtype minimum)<tr><td>Min<td><code>+inf</code> (dtype maximum)</table>
-<p>जब REDUCE की सभी ranges dead (empty) हों, REDUCE अपने identity element से replace होता है।</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=dependency-सिम्प्लिफ़िकेशन>Dependency सिम्प्लिफ़िकेशन<a href=#dependency-सिम्प्लिफ़िकेशन class=hash-link aria-label="Dependency सिम्प्लिफ़िकेशन का सीधा लिंक" title="Dependency सिम्प्लिफ़िकेशन का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<tbody><tr><td><code>AFTER(x, [])</code><td><code>x</code></table>
-<p>कोई dependencies नहीं मतलब कोई ordering constraint नहीं।</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=15-power-और-negation>15. Power और Negation<a href=#15-power-और-negation class=hash-link aria-label="15. Power और Negation का सीधा लिंक" title="15. Power और Negation का सीधा लिंक" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<tbody><tr><td><code>POW(x, 0)</code><td><code>1</code><tr><td><code>POW(x, 1)</code><td><code>x</code><tr><td><code>NEG(NEG(x))</code><td><code>x</code></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=16-lane-folds--stack-के-ऊपर-index>16. Lane Folds — STACK के ऊपर INDEX<a href=#16-lane-folds--stack-के-ऊपर-index class=hash-link aria-label="16. Lane Folds — STACK के ऊपर INDEX का सीधा लिंक" title="16. Lane Folds — STACK के ऊपर INDEX का सीधा लिंक" translate=no>​</a></h2>
-<p>Svod में GEP op नहीं है: shaped value दरअसल lanes का एक <code>STACK</code> है, और <code>INDEX</code> उसमें से lane उसी तरह चुनता है जैसे वह buffer से address चुनता है। इसलिए Tinygrad के <code>gep_pushing</code> का यहाँ कोई सीधा counterpart नहीं है। Svod के पास इसकी जगह ऐसे folds हैं जो <code>INDEX</code>/<code>STACK</code> structure को collapse कर देते हैं ताकि devectorizer को scalars दिखें।</p>
-<p>इनमें से ज़्यादातर folds structural हैं और devectorizer की movement cleanup में रहते हैं (<code>schedule/src/devectorize.rs</code>), <code>symbolic_simple()</code> में नहीं। symbolic tier का इकलौता rule <code>alu_vectorize_reorder_patterns</code> है, जो tier-3 <code>sym()</code> का हिस्सा है।</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=lane-चुनना-और-collapse-करना>Lane चुनना और Collapse करना<a href=#lane-चुनना-और-collapse-करना class=hash-link aria-label="Lane चुनना और Collapse करना का सीधा लिंक" title="Lane चुनना और Collapse करना का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>INDEX(STACK([a, b, c]), 2)</code><td><code>c</code><td>Constant lane index सीधे stacked source में fold हो जाता है<tr><td><code>INDEX(STACK([...]), c0, rest...)</code><td><code>INDEX(sources[c0], rest...)</code><td>अग्रणी constant recursively एक STACK level छीलता है<tr><td><code>STACK([INDEX(b, 0), INDEX(b, 1), ...])</code><td><code>b</code><td>क्रमिक lane reads source को वापस बना देते हैं<tr><td><code>INDEX(INDEX(b, i), j)</code><td><code>INDEX(b, i, j)</code><td>Scalar index chains को compose करता है<tr><td><code>INDEX(AFTER(STACK([...]), deps), c)</code><td>चुनी हुई lane, <code>deps</code> दोबारा जुड़े हुए<td>Register-stack lane selection ordering बनाए रखता है</table>
-<p><code>const_index_into_stack</code> recursive है: index list के जितने अग्रणी entries constants हैं, हर एक पर <code>STACK</code> की एक level छिलती है।</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=stack-पर-alu>STACK पर ALU<a href=#stack-पर-alu class=hash-link aria-label="STACK पर ALU का सीधा लिंक" title="STACK पर ALU का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>गार्ड<tbody><tr><td><code>op(STACK(x,x,x,x), STACK(y,y,y,y))</code><td><code>STACK(op(x,y), op(x,y), ...)</code><td>दोनों operands broadcast हों (सभी lanes <code>ptr_eq</code>), बराबर लंबाई > 1</table>
-<p>यह अठारह binary ops पर लागू होता है — Add, Mul, Sub, FloorMod, Max, FloorDiv, Fdiv, Pow, And, Or, Xor, Shl, Shr और छह comparisons। एक ही scalar operation के <code>STACK</code> में collapse होने से operands constant folding और scalar simplification के सामने आ जाते हैं।</p>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>सिर्फ़ Tier-3</div><div class=admonitionContent_BuS1><p><code>alu_vectorize_reorder_patterns</code> <code>sym()</code> का हिस्सा है, <code>symbolic()</code> या <code>symbolic_simple()</code> का नहीं। यह उन्हीं stages पर fire करता है जहाँ <code>sym()</code> चलता है — pre-optimization, Stage 8 और devectorizer — इसलिए फ़ाइनल decomp+render पास तक reordering हो चुकी होती है।</div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=stack-के-इर्द-गिर्द-movement-cleanup>STACK के इर्द-गिर्द Movement Cleanup<a href=#stack-के-इर्द-गिर्द-movement-cleanup class=hash-link aria-label="STACK के इर्द-गिर्द Movement Cleanup का सीधा लिंक" title="STACK के इर्द-गिर्द Movement Cleanup का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<tbody><tr><td><code>RESHAPE(STACK([x]))</code><td><code>x</code> — जब shapes पहले से मेल खाती हों<tr><td>अग्रणी 1-dims जोड़ने वाला <code>RESHAPE(x)</code><td>हर जोड़े गए dimension पर एक <code>STACK([x])</code> wrapper<tr><td><code>EXPAND(STACK([x]))</code><td><code>STACK([x, x, ..., x])</code> — broadcast को materialize करता है<tr><td><code>PERMUTE(PERMUTE(x, a), b)</code><td><code>PERMUTE(x, a∘b)</code>; identity permutes हट जाते हैं</table>
-<p>ये <code>movement_cleanup_patterns()</code> / <code>mop_cleanup_patterns()</code> में रहते हैं, जिन्हें devectorizer scalarization से पहले लगाता है। WMMA lanes भी वहीं हैंडल होती हैं — <code>stack_wmma_sources</code> और <code>broadcast_and_devec_wmma</code> से, किसी symbolic पैटर्न से नहीं।</p>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=17-where-on-load-सिर्फ़-stage-8>17. WHERE on LOAD (सिर्फ़ Stage 8)<a href=#17-where-on-load-सिर्फ़-stage-8 class=hash-link aria-label="17. WHERE on LOAD (सिर्फ़ Stage 8) का सीधा लिंक" title="17. WHERE on LOAD (सिर्फ़ Stage 8) का सीधा लिंक" translate=no>​</a></h2>
-<p><strong>Function</strong>: <code>pm_move_where_on_load()</code></p>
-<p>Masked loads को transform करता है condition को INDEX ऑपरेशन में embed करके:</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Before:  WHERE(cond, INDEX(buf, idx), 0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">After:   INDEX(buf, WHERE(combined_cond, idx, Invalid))</span><br/></div></code></pre></div></div>
-<p>यह hardware predication सक्षम करता है masked loads के लिए और WHERE overhead eliminate करता है।</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=कैसे-काम-करता-है>कैसे काम करता है<a href=#कैसे-काम-करता-है class=hash-link aria-label="कैसे काम करता है का सीधा लिंक" title="कैसे काम करता है का सीधा लिंक" translate=no>​</a></h3>
-<ol>
-<li class="">Condition को AND clauses में <strong>split</strong> करें</li>
-<li class="">Clauses को moveable vs. remaining में <strong>partition</strong> करें:
-<ul>
-<li class="">Moveable: सभी RANGE dependencies INDEX scope में, कोई external INDEX dependencies नहीं</li>
-<li class="">Remaining: बाकी सब</li>
-</ul>
-</li>
-<li class="">Moveable clauses को <code>WHERE(cond, idx, Invalid)</code> के रूप में <code>indices[0]</code> में <strong>embed</strong> करें</li>
-<li class="">Remaining clauses हों तो outer WHERE में <strong>wrap</strong> करें</li>
-</ol>
-<p>Partial clause movement सपोर्ट करता है — सिर्फ़ वो clauses move होते हैं जिनकी ranges index scope में हैं। <code>indices[0]</code> में existing validity clauses deduplicate होते हैं।</p>
-<p>Inverted पैटर्न <code>WHERE(cond, 0, INDEX(buf, idx))</code> भी condition negate करके handle होता है।</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=18-commutative-canonicalization>18. Commutative Canonicalization<a href=#18-commutative-canonicalization class=hash-link aria-label="18. Commutative Canonicalization का सीधा लिंक" title="18. Commutative Canonicalization का सीधा लिंक" translate=no>​</a></h2>
-<p>Commutative binary ops पर Index dtype के लिए, operands UOp id से sort होते हैं (smaller id left पर):</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Ops<th>गार्ड<tbody><tr><td>Add, Mul, Max, Eq, Ne, And, Or, Xor<td><code>dtype == DType::Index && b.id &lt; a.id</code></table>
-<p>इसके बिना, mathematically equivalent expressions जैसे <code>R1*8000 + R2*16</code> और <code>R2*16 + R1*8000</code> hash consing से deduplicate नहीं होते, जो <code>expand_vector_index</code> में grouping तोड़ता है।</p>
-<p>सिर्फ़ Index dtype पर apply ताकि vector math merging न टूटे। Tinygrad: <code>symbolic.py:178-182</code>।</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=19-div-mod-सिम्प्लिफ़िकेशन>19. Div-Mod सिम्प्लिफ़िकेशन<a href=#19-div-mod-सिम्प्लिफ़िकेशन class=hash-link aria-label="19. Div-Mod सिम्प्लिफ़िकेशन का सीधा लिंक" title="19. Div-Mod सिम्प्लिफ़िकेशन का सीधा लिंक" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=range-based-fast-paths>Range-Based Fast Paths<a href=#range-based-fast-paths class=hash-link aria-label="Range-Based Fast Paths का सीधा लिंक" title="Range-Based Fast Paths का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>Condition<tbody><tr><td><code>MOD(x, n)</code><td><code>x</code><td><code>0 &lt;= vmin(x)</code> और <code>vmax(x) &lt; n</code><tr><td><code>IDIV(x, n)</code><td><code>k</code><td>Range में सभी values एक ही <code>k</code> को divide करती हैं<tr><td><code>MOD(ADD[MUL[a, m], b], n)</code><td><code>MOD(b, n)</code><td><code>m == n</code> (multiples factor out)<tr><td><code>IDIV(ADD[MUL[a, m], b], n)</code><td><code>a + IDIV(b, n)</code><td><code>m == n</code><tr><td><code>IDIV(ADD[MUL[a, m], b], n)</code><td><code>a</code><td><code>m == n</code> और <code>0 &lt;= b &lt; n</code></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=unified-div-mod-engine-fold_divmod_general>Unified Div-Mod Engine (<code>fold_divmod_general</code>)<a href=#unified-div-mod-engine-fold_divmod_general class=hash-link aria-label="unified-div-mod-engine-fold_divmod_general का सीधा लिंक" title="unified-div-mod-engine-fold_divmod_general का सीधा लिंक" translate=no>​</a></h3>
-<p>Index dtype पर IDIV और MOD के लिए, एक unified engine priority order में simplification rules ट्राई करता है। Tinygrad के <code>fold_divmod_general</code> (<code>divandmod.py:8-96</code>) पर based।</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>प्रायोरिटी<th>Rule<th>Description<tbody><tr><td>1<td>cancel_divmod<td>Range single denominator interval में<tr><td>2<td>nested_div<td><code>(a % (k*c)) // c -> (a // c) % k</code><tr><td>3<td>remove_nested_mod<td><code>(a%4 + b)%2 -> (a+b)%2</code> जब `2<tr><td>4<td>fold_divmod_congruence<td>Factor congruence modular arithmetic<tr><td>5<td>gcd_with_remainder<td>Numerator से common GCD factor out<tr><td>6<td>nest_div_by_smallest_factor<td>सबसे छोटे common factor से recursive split<tr><td>7<td>divide_by_gcd<td>किसी भी denominator के लिए GCD factoring<tr><td>8<td>factor_remainder<td><code>(d*x+y)//d -> x + y//d</code> (last resort)</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=div-mod-recombination>Div-Mod Recombination<a href=#div-mod-recombination class=hash-link aria-label="Div-Mod Recombination का सीधा लिंक" title="Div-Mod Recombination का सीधा लिंक" translate=no>​</a></h3>
-<p>Separated div और mod operations को वापस original expression में recombine करने वाले पैटर्न:</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>गार्ड<tbody><tr><td><code>ADD[MOD(x, n), MUL[IDIV(x, n), n]]</code><td><code>x</code><td>x, n पर ptr_eq<tr><td><code>ADD[MOD(IDIV(x, a), c), MUL[IDIV(x, b), c]]</code><td><code>IDIV(x, a)</code><td><code>a * c == b</code><tr><td><code>ADD[MUL[MOD(x, c1), c2], MUL[IDIV(x, c1), c3]]</code><td><code>MUL(x, c2)</code><td><code>c1 * c2 == c3</code><tr><td><code>ADD[ADD[y, MOD(x, n)], MUL[IDIV(x, n), n]]</code><td><code>ADD(y, x)</code><td>x, n पर ptr_eq<tr><td><code>IDIV(ADD[IDIV(a, c1), c2], c3)</code><td><code>IDIV(ADD(a, c1*c2), c1*c3)</code><td>Nested division</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=advanced-division>Advanced Division<a href=#advanced-division class=hash-link aria-label="Advanced Division का सीधा लिंक" title="Advanced Division का सीधा लिंक" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>पैटर्न<th>रिज़ल्ट<th>नोट्स<tbody><tr><td><code>IDIV(IDIV(a, b), c)</code><td><code>IDIV(a, b*c)</code><td>Nested division compose<tr><td><code>IDIV(expr, d)</code><td><code>expr.divides(d)</code><td>Generic exact division<tr><td><code>IDIV(ADD(a, b), c)</code><td><code>IDIV(a, c) + IDIV(b, c)</code><td>जब दोनों evenly divide हों<tr><td><code>IDIV(SUB(a, b), c)</code><td><code>IDIV(a, c) - IDIV(b, c)</code><td>जब दोनों evenly divide हों<tr><td><code>MUL(c, ADD(a, b))</code><td><code>ADD(MUL(c, a), MUL(c, b))</code><td>Multiplication distribute</table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=cross-references>Cross-References<a href=#cross-references class=hash-link aria-label="Cross-References का सीधा लिंक" title="Cross-References का सीधा लिंक" translate=no>​</a></h2>
-<ul>
-<li class=""><a class="" href=/hi/docs/architecture/pipeline>Execution Pipeline</a> -- stages जहाँ ये पैटर्न चलते हैं</li>
-<li class=""><a class="" href=/hi/docs/architecture/optimizations/pattern-system>Pattern Engine</a> — पैटर्न मैचिंग इंजन कैसे काम करता है</li>
-<li class=""><a class="" href=/hi/docs/architecture/codegen/rangeify>Rangeify</a> -- Stage 4 context (movement op lowering के बाद पैटर्न चलते हैं)</li>
-<li class=""><a class="" href=/hi/docs/architecture/codegen/expander>Expander</a> -- Stage 8 context (optimization actions के बाद पैटर्न चलते हैं)</li>
-<li class=""><a class="" href=/hi/docs/architecture/codegen/linearizer>Linearizer</a> -- Stage 16 context (फ़ाइनल cleanup)</li>
-</ul></div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/architecture/optimizations/algebraic-simplification.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>इस पेज को बदलें</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="डॉक्स पेज"><a class="pagination-nav__link pagination-nav__link--prev" href=/hi/docs/architecture/optimizations/pattern-system><div class=pagination-nav__sublabel>पिछ्ला</div><div class=pagination-nav__label>पैटर्न इंजन</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/hi/docs/architecture/optimizations/index-arithmetic><div class=pagination-nav__sublabel>अगला</div><div class=pagination-nav__label>इंडेक्स अरिथमेटिक</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#worked-example-ऑप्टिमाइज़ेशन-कैस्केड class="table-of-contents__link toc-highlight">Worked Example: ऑप्टिमाइज़ेशन कैस्केड</a><li><a href=#पैटर्न-ऑर्डरिंग class="table-of-contents__link toc-highlight">पैटर्न ऑर्डरिंग</a><li><a href=#1-constant-folding class="table-of-contents__link toc-highlight">1. Constant Folding</a><ul><li><a href=#scalar-constants class="table-of-contents__link toc-highlight">Scalar Constants</a><li><a href=#vector-constants class="table-of-contents__link toc-highlight">Vector Constants</a></ul><li><a href=#2-identity-और-zero-propagation class="table-of-contents__link toc-highlight">2. Identity और Zero Propagation</a><li><a href=#3-self-folding class="table-of-contents__link toc-highlight">3. Self-Folding</a><li><a href=#4-zero-folding class="table-of-contents__link toc-highlight">4. Zero Folding</a><li><a href=#5-division-सिम्प्लिफ़िकेशन class="table-of-contents__link toc-highlight">5. Division सिम्प्लिफ़िकेशन</a><li><a href=#6-cast-ऑप्टिमाइज़ेशन class="table-of-contents__link toc-highlight">6. Cast ऑप्टिमाइज़ेशन</a><li><a href=#7-term-combining class="table-of-contents__link toc-highlight">7. Term Combining</a><li><a href=#8-alu-chain-folding class="table-of-contents__link toc-highlight">8. ALU Chain Folding</a><ul><li><a href=#constant-folding class="table-of-contents__link toc-highlight">Constant Folding</a><li><a href=#constant-pushing class="table-of-contents__link toc-highlight">Constant Pushing</a><li><a href=#sub-canonicalization class="table-of-contents__link toc-highlight">Sub Canonicalization</a></ul><li><a href=#9-boolean-logic class="table-of-contents__link toc-highlight">9. Boolean Logic</a><li><a href=#10-comparison-सिम्प्लिफ़िकेशन class="table-of-contents__link toc-highlight">10. Comparison सिम्प्लिफ़िकेशन</a><ul><li><a href=#self-comparison-non-float-ptr_eq class="table-of-contents__link toc-highlight">Self-Comparison (non-float, ptr_eq)</a><li><a href=#constant-और-range-based class="table-of-contents__link toc-highlight">Constant और Range-Based</a><li><a href=#algebraic-transforms class="table-of-contents__link toc-highlight">Algebraic Transforms</a></ul><li><a href=#11-minmax-elimination class="table-of-contents__link toc-highlight">11. Min/Max Elimination</a><li><a href=#12-where-ऑप्टिमाइज़ेशन class="table-of-contents__link toc-highlight">12. WHERE ऑप्टिमाइज़ेशन</a><ul><li><a href=#condition-elimination class="table-of-contents__link toc-highlight">Condition Elimination</a><li><a href=#branch-सिम्प्लिफ़िकेशन class="table-of-contents__link toc-highlight">Branch सिम्प्लिफ़िकेशन</a></ul><li><a href=#13-invalid-propagation class="table-of-contents__link toc-highlight">13. Invalid Propagation</a><ul><li><a href=#पैटर्न-प्रायोरिटी-example class="table-of-contents__link toc-highlight">पैटर्न प्रायोरिटी Example</a><li><a href=#where-invalid-merging class="table-of-contents__link toc-highlight">WHERE-Invalid Merging</a><li><a href=#where-invalid-से-ऑपरेशन-push-करना class="table-of-contents__link toc-highlight">WHERE-Invalid से ऑपरेशन Push करना</a><li><a href=#bare-invalid-propagation class="table-of-contents__link toc-highlight">Bare Invalid Propagation</a><li><a href=#invalid-indices-से-dead-loadsstores class="table-of-contents__link toc-highlight">Invalid Indices से Dead Loads/Stores</a></ul><li><a href=#14-dead-code-elimination class="table-of-contents__link toc-highlight">14. Dead Code Elimination</a><ul><li><a href=#dead-ranges class="table-of-contents__link toc-highlight">Dead Ranges</a><li><a href=#dead-reduces class="table-of-contents__link toc-highlight">Dead Reduces</a><li><a href=#dependency-सिम्प्लिफ़िकेशन class="table-of-contents__link toc-highlight">Dependency सिम्प्लिफ़िकेशन</a></ul><li><a href=#15-power-और-negation class="table-of-contents__link toc-highlight">15. Power और Negation</a><li><a href=#16-lane-folds--stack-के-ऊपर-index class="table-of-contents__link toc-highlight">16. Lane Folds — STACK के ऊपर INDEX</a><ul><li><a href=#lane-चुनना-और-collapse-करना class="table-of-contents__link toc-highlight">Lane चुनना और Collapse करना</a><li><a href=#stack-पर-alu class="table-of-contents__link toc-highlight">STACK पर ALU</a><li><a href=#stack-के-इर्द-गिर्द-movement-cleanup class="table-of-contents__link toc-highlight">STACK के इर्द-गिर्द Movement Cleanup</a></ul><li><a href=#17-where-on-load-सिर्फ़-stage-8 class="table-of-contents__link toc-highlight">17. WHERE on LOAD (सिर्फ़ Stage 8)</a><ul><li><a href=#कैसे-काम-करता-है class="table-of-contents__link toc-highlight">कैसे काम करता है</a></ul><li><a href=#18-commutative-canonicalization class="table-of-contents__link toc-highlight">18. Commutative Canonicalization</a><li><a href=#19-div-mod-सिम्प्लिफ़िकेशन class="table-of-contents__link toc-highlight">19. Div-Mod सिम्प्लिफ़िकेशन</a><ul><li><a href=#range-based-fast-paths class="table-of-contents__link toc-highlight">Range-Based Fast Paths</a><li><a href=#unified-div-mod-engine-fold_divmod_general class="table-of-contents__link toc-highlight">Unified Div-Mod Engine (<code>fold_divmod_general</code>)</a><li><a href=#div-mod-recombination class="table-of-contents__link toc-highlight">Div-Mod Recombination</a><li><a href=#advanced-division class="table-of-contents__link toc-highlight">Advanced Division</a></ul><li><a href=#cross-references class="table-of-contents__link toc-highlight">Cross-References</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>डॉक्स</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/hi/docs/introduction>परिचय</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>समुदाय</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=worked-cascade>उदाहरण: सरलीकरण की श्रृंखला<a href=#worked-cascade class=hash-link aria-label="उदाहरण: सरलीकरण की श्रृंखला का सीधा लिंक" title="उदाहरण: सरलीकरण की श्रृंखला का सीधा लिंक" translate=no>​</a></h2>
+<p><code>x: Int32</code> के साथ <code>(x + 0) * 1 + (3 + 4)</code>:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Add(x, 0)        → x          identity_and_zero</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Mul(x, 1)        → x          identity_and_zero</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Add(3, 4)        → 7          constant_folding</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Add(x, 7)                     stays: no rule</span><br/></div></code></pre></div></div>
+<p>इंजन parents से पहले children को फिर से लिखता है और पुनर्निर्मित parent को फिर से मैच करता है, इसलिए तीनों चरण एक ही <code>graph_rewrite</code> में होते हैं। Identity वाले चरण वही हैं जिन्हें <a class="" href=/hi/docs/architecture/optimizations/pattern-system#verifying-rewrites-with-z3>Z3 oracles</a> सिद्ध करते हैं।</div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/architecture/optimizations/algebraic-simplification.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>इस पेज को बदलें</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="डॉक्स पेज"><a class="pagination-nav__link pagination-nav__link--prev" href=/hi/docs/architecture/optimizations/pattern-system><div class=pagination-nav__sublabel>पिछ्ला</div><div class=pagination-nav__label>पैटर्न इंजन</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/hi/docs/architecture/optimizations/index-arithmetic><div class=pagination-nav__sublabel>अगला</div><div class=pagination-nav__label>इंडेक्स अंकगणित</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#composition class="table-of-contents__link toc-highlight">संरचना</a><li><a href=#tier-1 class="table-of-contents__link toc-highlight">Tier 1</a><ul><li><a href=#invalid-propagation-propagate_invalid class="table-of-contents__link toc-highlight">Invalid का प्रसार (<code>propagate_invalid</code>)</a><li><a href=#dead-loads-and-stores-fold_invalid_load_store class="table-of-contents__link toc-highlight">मृत loads और stores (<code>fold_invalid_load_store</code>)</a><li><a href=#constant-folding class="table-of-contents__link toc-highlight">स्थिरांक folding</a><li><a href=#bool-arithmetic class="table-of-contents__link toc-highlight">Bool अंकगणित</a><li><a href=#identity-and-zero class="table-of-contents__link toc-highlight">Identity और शून्य</a><li><a href=#self-and-zero-folding class="table-of-contents__link toc-highlight">Self और शून्य folding</a><li><a href=#division class="table-of-contents__link toc-highlight">भाग (Division)</a><li><a href=#casts class="table-of-contents__link toc-highlight">Casts</a><li><a href=#div-mod-recombination class="table-of-contents__link toc-highlight">Div-mod पुनर्संयोजन</a><li><a href=#power-booleans-dce class="table-of-contents__link toc-highlight">Power, booleans, DCE</a></ul><li><a href=#tier-2 class="table-of-contents__link toc-highlight">Tier 2</a><ul><li><a href=#commutative-canonicalization class="table-of-contents__link toc-highlight">क्रमविनिमेय canonicalization</a><li><a href=#term-combining-addmul-with-constants class="table-of-contents__link toc-highlight">पद संयोजन (स्थिरांकों के साथ <code>Add</code>/<code>Mul</code>)</a><li><a href=#boolean-boolean_dsl_patterns class="table-of-contents__link toc-highlight">Boolean (<code>boolean_dsl_patterns</code>)</a><li><a href=#where class="table-of-contents__link toc-highlight">WHERE</a><li><a href=#bounds-collapse-and-minmax class="table-of-contents__link toc-highlight">सीमाओं का संकुचन और min/max</a><li><a href=#alu-chain-folding-alu_folding_dsl_patterns class="table-of-contents__link toc-highlight">ALU श्रृंखला folding (<code>alu_folding_dsl_patterns</code>)</a><li><a href=#comparisons-comparison_dsl_patterns class="table-of-contents__link toc-highlight">Comparisons (<code>comparison_dsl_patterns</code>)</a><li><a href=#ranges-and-division class="table-of-contents__link toc-highlight">Ranges और भाग</a><li><a href=#after class="table-of-contents__link toc-highlight">AFTER</a></ul><li><a href=#tier-3-sym class="table-of-contents__link toc-highlight">Tier 3 (<code>sym</code>)</a><li><a href=#worked-cascade class="table-of-contents__link toc-highlight">उदाहरण: सरलीकरण की श्रृंखला</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>डॉक्स</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/hi/docs/introduction>परिचय</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>समुदाय</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

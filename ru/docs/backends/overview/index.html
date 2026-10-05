@@ -1,0 +1,208 @@
+<!doctype html><html lang=ru dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-backends/overview" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>Бэкенды | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/ru/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/ru/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/ru/docs/backends/overview /><meta data-rh=true property=og:locale content=ru /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=ru /><meta data-rh=true name=docsearch:language content=ru /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="Бэкенды | Svod"/><meta data-rh=true name=description content="Бэкенд — это всё, что лежит ниже отрендеренного ядра: рендерер, превращающий"/><meta data-rh=true property=og:description content="Бэкенд — это всё, что лежит ниже отрендеренного ядра: рендерер, превращающий"/><link data-rh=true rel=icon href=/ru/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/ru/docs/backends/overview /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/overview hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/backends/overview hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/backends/overview hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/backends/overview hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/overview hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/ru/docs/backends/overview","name":"Обзор","position":1}]}</script><link rel=stylesheet href=/ru/assets/css/styles.e76ef093.css /><script src=/ru/assets/js/runtime~main.48b5c01b.js defer></script><script src=/ru/assets/js/main.10acc0e1.js defer></script></head><body><svg style="display: none;"><defs>
+<symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
+</defs></svg>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-fe0")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/ru/img/logo.svg /><div role=region aria-label="Перейти к основному содержимому"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>Перейти к основному содержимому</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Переключить навигационную панель" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/ru/><div class=navbar__logo><img src=/ru/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/ru/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/ru/docs/introduction>Документация</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>Русский</a><ul class=dropdown__menu><li><a href=/docs/backends/overview target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/backends/overview target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/backends/overview target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=ru>Русский</a><li><a href=/hi/docs/backends/overview target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Переключение между темным и светлым режимом (сейчас используется system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Прокрутка к началу" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/ru/docs/introduction><span class=linkLabel_WmDU>Введение</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/examples><span class=categoryLinkLabel_W154>Начало работы</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/architecture/ir-design><span class=categoryLinkLabel_W154>Архитектура</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile-ядра (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/ru/docs/backends/overview><span class=categoryLinkLabel_W154>Бэкенды</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/ru/docs/backends/overview><span class=linkLabel_WmDU>Обзор</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/backends/cpu><span class=linkLabel_WmDU>CPU</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/backends/jit-loader><span class=linkLabel_WmDU>ELF JIT-загрузчик</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/backends/metal><span class=linkLabel_WmDU>Metal</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/ru/docs/backends/amd/overview><span class=categoryLinkLabel_W154>Бэкенд AMD</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/ru/docs/backends/cuda/overview><span class=categoryLinkLabel_W154>Бэкенд CUDA</span></a></div></ul></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label="Навигационная цепочка текущей страницы"><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Главная страница" class=breadcrumbs__link href=/ru/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>Бэкенды</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>Обзор</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">Содержание этой страницы</button></div><div class="theme-doc-markdown markdown"><header><h1>Бэкенды</h1></header>
+<p>Бэкенд — это всё, что лежит ниже отрендеренного ядра: рендерер, превращающий
+UOp IR в исходный код, компилятор, превращающий исходник в объект, загрузчик,
+превращающий объект в вызываемую <code>Program</code>, аллокатор и, опционально, граф.
+Svod поставляет четыре бэкенда, все в одном бинарнике; какие из них существуют
+на конкретном хосте, решается во время выполнения.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Устройство<th>Железо<th>Рендерер<th>Путь компиляции<th>Воспроизведение графа<th>Статус<tbody><tr><td><a class="" href=/ru/docs/backends/cpu><code>CPU</code></a><td>x86_64, aarch64, riscv64, loongarch64, ppc64le<td>Текст LLVM IR (по умолчанию) или C<td>libLLVM в процессе, иначе <code>clang -c</code>; <a class="" href=/ru/docs/backends/jit-loader>ELF-загрузчик в памяти</a><td>нет (синхронные вызовы)<td>в эксплуатации<tr><td><a class="" href=/ru/docs/backends/amd/overview><code>AMD:N</code></a><td>CDNA3, RDNA3, RDNA3.5, RDNA4 (Linux, KFD)<td>Текст LLVM IR, таргет AMDGPU<td><code>clang</code> с таргетом <code>amdgcn</code> → ELF code object, загружаемый в VRAM<td>командный поток AQL (PM4 по запросу)<td>в эксплуатации<tr><td><a class="" href=/ru/docs/backends/cuda/overview><code>CUDA:N</code></a><td>NVIDIA, драйвер CUDA 12.0+<td>Текст LLVM IR, таргет NVPTX<td><code>clang</code> с таргетом NVPTX → PTX, <code>ptxas</code>, если установлен, иначе JIT драйвера<td>CUDA-графы<td>в эксплуатации<tr><td><a class="" href=/ru/docs/backends/metal><code>METAL:N</code></a><td>GPU Apple<td>C, диалект Metal<td>Apple <code>MTLCodeGenService</code> в процессе → metallib<td>indirect command buffers<td>проверен на Apple9 / macOS 26</table>
+<p>Скомпилированные объекты всех бэкендов проходят через один дисковый кэш
+объектов с ключом из исходника и <code>CompilerIdentity</code> конкретного бэкенда
+(<a class="" href=/ru/docs/backends/cpu>страница CPU</a>).</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=выбор-устройства>Выбор устройства<a href=#выбор-устройства class=hash-link aria-label="Прямая ссылка на Выбор устройства" title="Прямая ссылка на Выбор устройства" translate=no>​</a></h2>
+<p><code>SVOD_DEVICE</code> задаёт устройство по умолчанию для тензоров и ядер. Значение
+разбирается без учёта регистра как <code>NAME[:N]</code> (<code>dtype/src/default_device.rs</code>):</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Значение<th>Устройство<tbody><tr><td><code>CPU</code><td><code>DeviceSpec::Cpu</code><tr><td><code>AMD[:N]</code>, <code>HIP[:N]</code><td><code>DeviceSpec::Amd { device_id }</code> — N-й GPU-узел топологии KFD<tr><td><code>CUDA[:N]</code>, <code>GPU[:N]</code><td><code>DeviceSpec::Cuda { device_id }</code><tr><td><code>METAL[:N]</code><td><code>DeviceSpec::Metal { device_id }</code> (существует только <code>0</code>)</table>
+<p><code>NAME</code> без номера — это устройство 0. <code>NV</code> отвергается намеренно — это имя
+зарезервировано для будущего userspace-драйвера NVIDIA. Если устройство ничем
+не выбрано, действует платформенное значение по умолчанию: <strong><code>METAL:0</code> на
+macOS, <code>CPU</code> везде остальном</strong>. Полный порядок приоритета: область
+<code>with_default_device</code>, затем thread-local <code>set_default_device</code>, затем
+<code>SVOD_DEVICE</code> (читается один раз за процесс), затем платформенное значение по
+умолчанию. Архитектура GPU никогда не входит в спецификацию: это свойство
+открытого устройства, поэтому у одного физического GPU одна идентичность, а
+кэш ядер ключуется тем, что сообщает устройство.</p>
+<p><code>DeviceSpecExt::parse</code> в <code>svod-device</code> принимает те же написания, а также
+<code>DISK:&lt;path></code> (read-only устройство над файлом, отображённым в память, которое
+не умеет запускать ядра) и <code>WEBGPU</code>, у которого пока нет аллокатора и который
+завершается ошибкой <code>DeviceUnavailable</code>.</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=регистрация-определяемая-во-время-выполнения>Регистрация, определяемая во время выполнения<a href=#регистрация-определяемая-во-время-выполнения class=hash-link aria-label="Прямая ссылка на Регистрация, определяемая во время выполнения" title="Прямая ссылка на Регистрация, определяемая во время выполнения" translate=no>​</a></h2>
+<p>Каждый бэкенд компилируется на каждом хосте — нет cargo-фичи ни для AMD, ни для
+CUDA, ни для Metal (модули AMD, работающие с ядром ОС, и привязки Objective-C и
+драйверов для Metal/CUDA либо находятся под <code>cfg(unix)</code>, либо являются обычным
+Rust поверх <code>libloading</code>, поэтому <code>cargo check</code> на Linux или macOS проверяет
+типы во всех них). Будет ли бэкенд <em>доступен</em>, решается при первом обращении к
+реестру фабрик устройств (<code>runtime/src/device_registry.rs</code>):</p>
+<div class="language-rust codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-rust codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">registry</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>register_factory</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"CPU"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>...</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain">                        </span><span class="token comment" style=color:#999988;font-style:italic>// always</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>if</span><span class="token plain"> </span><span class="token namespace" style=opacity:0.7>svod_device</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token namespace" style=opacity:0.7>amd</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token function" style=color:#d73a49>has_devices</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain">   </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"> registry</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>register_factory</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"AMD"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>...</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>}</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>if</span><span class="token plain"> </span><span class="token namespace" style=opacity:0.7>svod_device</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token namespace" style=opacity:0.7>metal</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token function" style=color:#d73a49>has_devices</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"> registry</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>register_factory</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"METAL"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>...</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>}</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>if</span><span class="token plain"> </span><span class="token namespace" style=opacity:0.7>svod_device</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token namespace" style=opacity:0.7>cuda</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token function" style=color:#d73a49>has_devices</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain">  </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"> registry</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>register_factory</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"CUDA"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>...</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>}</span><br/></div></code></pre></div></div>
+<p>Каждая проба не имеет побочных эффектов и мемоизируется: AMD читает топологию
+KFD из sysfs и проверяет, есть ли узел поддерживаемой архитектуры; Metal
+<code>dlopen</code>-ит фреймворки Apple и запрашивает системное устройство по умолчанию;
+CUDA загружает <code>libcuda.so.1</code>, привязывает все используемые точки входа,
+вызывает <code>cuInit</code> и считает устройства. У хоста без соответствующего железа
+такого типа устройства просто нет, и запрос его завершается ошибкой
+<code>UnsupportedDevice</code>. Смысл компиляции всего везде в том, что изменение общих
+трейтов <code>Program</code> / <code>PlanContext</code> / <code>Graph</code> ломает сборку на любой машине
+разработчика, а не только на той, где есть GPU.</p>
+<p>Реестр кэширует один <code>Device</code> на <code>DeviceSpec</code> (<code>DEVICE_FACTORIES</code>);
+конструирование — открытие KFD, проба тулчейна — выполняется вне блокировок
+карты, сериализованно для каждой спецификации, а неудачное конструирование
+оставляет слот пустым для повторной попытки. Аллокаторы живут в отдельном
+реестре в <code>svod-device</code> (<code>registry::registry()</code>), где каждый вычислительный
+аллокатор обёрнут в <code>LruAllocator</code>, который пулит освобождённые буферы по
+размеру и спецификации.</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=что-реализует-бэкенд>Что реализует бэкенд<a href=#что-реализует-бэкенд class=hash-link aria-label="Прямая ссылка на Что реализует бэкенд" title="Прямая ссылка на Что реализует бэкенд" translate=no>​</a></h2>
+<p><code>Device</code> (<code>device/src/device.rs</code>) состоит из пяти частей:</p>
+<div class="language-rust codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-rust codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> </span><span class="token keyword" style=color:#00009f>struct</span><span class="token plain"> </span><span class="token type-definition class-name">Device</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> device</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">DeviceSpec</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> allocator</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Arc</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token keyword" style=color:#00009f>dyn</span><span class="token plain"> </span><span class="token class-name">Allocator</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> compilers</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Vec</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token class-name">CompilerPair</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain">     </span><span class="token comment" style=color:#999988;font-style:italic>// (Arc&lt;dyn Renderer>, Arc&lt;dyn Compiler>)</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> renderer</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Arc</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token keyword" style=color:#00009f>dyn</span><span class="token plain"> </span><span class="token class-name">Renderer</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> compiler</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Arc</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token keyword" style=color:#00009f>dyn</span><span class="token plain"> </span><span class="token class-name">Compiler</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> runtime</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">RuntimeFactory</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain">          </span><span class="token comment" style=color:#999988;font-style:italic>// Fn(&CompiledSpec) -> Result&lt;Box&lt;dyn Program>></span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> graph</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Option</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token class-name">GraphFactory</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain">      </span><span class="token comment" style=color:#999988;font-style:italic>// Fn(&[GraphKernel]) -> Result&lt;Option&lt;Box&lt;dyn Graph>>></span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token punctuation" style=color:#393A34>}</span><br/></div></code></pre></div></div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Трейт<th>Обязательные<th>Роль<tbody><tr><td><code>Renderer</code><td><code>render</code>, <code>device</code>, <code>supported_ops</code><td>граф UOp → <code>ProgramSpec</code> (исходник, точка входа, ABI, размеры запуска). <code>gpu_arch</code> выбирает профиль оптимизатора; <code>decompositor</code> и <code>extra_matcher</code> понижают то, что таргет не умеет выбрать<tr><td><code>Compiler</code><td><code>compile</code>, <code>cache_key</code><td><code>ProgramSpec</code> → байты <code>CompiledSpec</code>; <code>cache_key</code> — это <code>CompilerIdentity</code>, ключующий кэш объектов<tr><td><code>RuntimeFactory</code><td>—<td>загружает <code>CompiledSpec</code> в <code>Program</code>; <code>Device::new</code> оборачивает её так, чтобы идентичность стадии каждой спецификации сначала проверялась<tr><td><code>Program</code><td><code>execute</code>, <code>name</code><td>один запуск ядра; <code>execute_timed</code> (длительность по часам GPU для BEAM), <code>new_exec_context</code>, <code>resource_usage</code> и <code>as_any</code> опциональны<tr><td><code>PlanContext</code><td><code>dispatch</code>, <code>synchronize</code><td>состояние плана, создаваемое <code>Program::new_exec_context</code>: полосы, токены завершения, временные метки, счётчики (<code>set_pmc</code>), нативное связанное воспроизведение (<code>replay_linked_plan</code>)<tr><td><code>Allocator</code><td><code>_alloc</code>, <code>name</code>, <code>device_spec</code><td><code>_copyin</code> / <code>_copyout</code> / <code>_transfer</code> / <code>_free</code> / <code>synchronize</code> / <code>supports_device_local</code> опциональны и по умолчанию имеют семантику памяти хоста<tr><td><code>Graph</code><td><code>replay</code><td>захваченная цепочка ядер, воспроизводимая одной отправкой; <code>completion_token</code>, <code>replay_profiled</code> опциональны<tr><td><code>CompletionToken</code>, <code>TimelineSignal</code>, <code>DispatchTimestamps</code><td><td>дескрипторы синхронизации и профилирования, которые потребляет исполнитель (<code>device/src/sync.rs</code>)</table>
+<p>Соглашение о запуске общее для всех GPU-бэкендов: <code>global_size</code> — это сетка в
+рабочих группах, <code>local_size</code> — рабочая группа в потоках; CPU использует
+<code>global_size[0]</code> как разбиение по <code>core_id</code>. Аргументы ядра — это слоты <code>PARAM</code>
+ABI по порядку — сначала указатели, затем скаляры <code>i32</code>, — и каждый загрузчик
+упаковывает их одинаково (<code>ClikeKernargLayout</code> на AMD и CUDA, позиционные
+<code>setBuffer</code>/<code>setBytes</code> на Metal, CIF libffi на CPU).</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=добавление-бэкенда>Добавление бэкенда<a href=#добавление-бэкенда class=hash-link aria-label="Прямая ссылка на Добавление бэкенда" title="Прямая ссылка на Добавление бэкенда" translate=no>​</a></h3>
+<p>Четыре фабрики в <code>runtime/src/devices/</code> служат шаблоном. Каждая
+<code>create_*_device</code> делает одни и те же пять вещей:</p>
+<ol>
+<li class="">получает аллокатор из реестра для своего <code>DeviceSpec</code>;</li>
+<li class="">строит обёртку рендерера вокруг точки входа codegen
+(<code>LlvmTextRenderer::amd(arch)</code>, <code>LlvmTextRenderer::nvptx(arch)</code>,
+<code>CRenderer::metal()</code> или рендереры CPU), объявляя <code>supported_ops</code>,
+паттерны декомпозиции и <code>gpu_arch</code>;</li>
+<li class="">строит компилятор с <code>CompilerIdentity</code> и <code>ObjectCache</code>, выдающий байты,
+которые загрузчик может проверить (<code>validate_amd_object</code>, <code>validate_ptx</code> /
+<code>validate_cubin</code>, <code>validate_metallib</code>, ELF-проверки на CPU);</li>
+<li class="">устанавливает <code>RuntimeFactory</code>, загружающую эти байты в <code>Program</code> бэкенда;</li>
+<li class="">опционально вызывает <code>with_graph(...)</code> для захвата/воспроизведения.</li>
+</ol>
+<p>Затем фабрика регистрируется под строкой своего типа устройства, с проверкой
+пробой <code>has_devices()</code>, а планировщику нужен профиль оптимизатора для нового
+таргета (<code>OptimizerRenderer::for_*</code>: размер волны, формы тензорных ядер,
+лимиты разделяемой памяти и local). <code>create_*_codegen</code> существует отдельно у
+каждого бэкенда, чтобы воркеры BEAM могли рендерить и компилировать, не
+открывая устройство.</div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/backends/overview.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>Отредактировать эту страницу</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="Страница документа"><a class="pagination-nav__link pagination-nav__link--prev" href=/ru/docs/tile-kernels/comparison><div class=pagination-nav__sublabel>Предыдущая страница</div><div class=pagination-nav__label>tk против HipKittens против CuTile</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/ru/docs/backends/cpu><div class=pagination-nav__sublabel>Следующая страница</div><div class=pagination-nav__label>CPU</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#выбор-устройства class="table-of-contents__link toc-highlight">Выбор устройства</a><li><a href=#регистрация-определяемая-во-время-выполнения class="table-of-contents__link toc-highlight">Регистрация, определяемая во время выполнения</a><li><a href=#что-реализует-бэкенд class="table-of-contents__link toc-highlight">Что реализует бэкенд</a><ul><li><a href=#добавление-бэкенда class="table-of-contents__link toc-highlight">Добавление бэкенда</a></ul></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Документация</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/ru/docs/introduction>Введение</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Сообщество</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

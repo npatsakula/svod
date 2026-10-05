@@ -1,0 +1,214 @@
+<!doctype html><html lang=hi dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-backends/cpu" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>CPU बैकएंड | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/hi/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/hi/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/hi/docs/backends/cpu /><meta data-rh=true property=og:locale content=hi /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true name=docusaurus_locale content=hi /><meta data-rh=true name=docsearch:language content=hi /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="CPU बैकएंड | Svod"/><meta data-rh=true name=description content="CPU बैकएंड हर कर्नेल को run time पर native machine code में compile करता है और उसे process"/><meta data-rh=true property=og:description content="CPU बैकएंड हर कर्नेल को run time पर native machine code में compile करता है और उसे process"/><link data-rh=true rel=icon href=/hi/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/hi/docs/backends/cpu /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/cpu hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/backends/cpu hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/backends/cpu hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/backends/cpu hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/cpu hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/hi/docs/backends/cpu","name":"CPU","position":1}]}</script><link rel=stylesheet href=/hi/assets/css/styles.e76ef093.css /><script src=/hi/assets/js/runtime~main.8668cc51.js defer></script><script src=/hi/assets/js/main.67b15077.js defer></script></head><body><svg style="display: none;"><defs>
+<symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
+</defs></svg>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-007")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/hi/img/logo.svg /><div role=region aria-label="मुख्य कंटेंट तक स्किप करें"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>मुख्य कंटेंट तक स्किप करें</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Toggle navigation bar" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/hi/><div class=navbar__logo><img src=/hi/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/hi/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/hi/docs/introduction>डॉक्स</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>हिन्दी</a><ul class=dropdown__menu><li><a href=/docs/backends/cpu target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/backends/cpu target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/backends/cpu target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/backends/cpu target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Switch between dark and light mode (currently system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Scroll back to top" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/hi/docs/introduction><span class=linkLabel_WmDU>परिचय</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/examples><span class=categoryLinkLabel_W154>शुरुआत</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/architecture/ir-design><span class=categoryLinkLabel_W154>आर्किटेक्चर</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile कर्नेल (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/hi/docs/backends/overview><span class=categoryLinkLabel_W154>बैकएंड</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/backends/overview><span class=linkLabel_WmDU>अवलोकन</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/hi/docs/backends/cpu><span class=linkLabel_WmDU>CPU</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/backends/jit-loader><span class=linkLabel_WmDU>ELF JIT लोडर</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/backends/metal><span class=linkLabel_WmDU>Metal</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/hi/docs/backends/amd/overview><span class=categoryLinkLabel_W154>AMD बैकएंड</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/hi/docs/backends/cuda/overview><span class=categoryLinkLabel_W154>CUDA बैकएंड</span></a></div></ul></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=Breadcrumbs><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Home page" class=breadcrumbs__link href=/hi/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>बैकएंड</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>CPU</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">इस पेज पर</button></div><div class="theme-doc-markdown markdown"><header><h1>CPU बैकएंड</h1></header>
+<p>CPU बैकएंड हर कर्नेल को run time पर native machine code में compile करता है और उसे process
+के भीतर call करता है। इसके दो code paths हैं, जिन्हें <code>SVOD_CPU_BACKEND</code> चुनता है:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th><code>SVOD_CPU_BACKEND</code><th>Renderer<th>Compiler<th>Cache backend<tbody><tr><td><code>llvm</code> (default; unset या खाली होने पर यही चुना जाता है)<td>LLVM IR text (<code>codegen/src/llvm/cpu/</code>)<td>process में bound libLLVM, या load न हो तो <code>clang -x ir</code><td><code>cpu-llvm-inprocess</code> / <code>cpu-llvm-clang</code><tr><td><code>clang</code><td>C source (<code>codegen/src/c/</code>, Clang dialect)<td><code>clang -x c</code> subprocess<td><code>cpu-clang</code></table>
+<p>केवल ये दो spellings और उनके upper-case रूप स्वीकार होते हैं (<code>CpuBackend::parse</code>); कुछ भी
+और एक warning log करता है और LLVM चुनता है। दोनों paths एक relocatable ELF object बनाते हैं,
+जिसे <a class="" href=/hi/docs/backends/jit-loader>JIT loader</a> memory में map और relocate करता है; कोई भी temporary file
+नहीं लिखता या shared library को <code>dlopen</code> नहीं करता। wiring <code>runtime/src/devices/cpu.rs</code> में है।</p>
+<p><code>"CPU"</code> device factory बिना शर्त register होती है, और CPU macOS को छोड़कर हर जगह default
+डिवाइस है; macOS पर default <code>METAL:0</code> है (<a class="" href=/hi/docs/backends/overview>बैकएंड</a> देखें)।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=llvm-path>LLVM path<a href=#llvm-path class=hash-link aria-label="LLVM path का सीधा लिंक" title="LLVM path का सीधा लिंक" translate=no>​</a></h2>
+<p>renderer प्रति कर्नेल एक LLVM function emit करता है, buffers <code>ptr noalias align 32</code>
+parameters के रूप में और scalars <code>i32</code> के रूप में, attributes
+<code>nounwind "no-builtins" "no-trapping-math"="true"</code> के साथ:</p>
+<div class="language-llvm codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-llvm codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">define void @r_64_32(ptr noalias align 32 %data0, ptr noalias align 32 %data1, i32 %core_id) #0 {</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">entry:</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  ...</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  ret void</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">}</span><br/></div></code></pre></div></div>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=in-process-libllvm>In-process libLLVM<a href=#in-process-libllvm class=hash-link aria-label="In-process libLLVM का सीधा लिंक" title="In-process libLLVM का सीधा लिंक" translate=no>​</a></h3>
+<p><code>runtime/src/llvm_inprocess.rs</code> <code>libloading</code> के साथ एक shared libLLVM से LLVM-C API bind
+करता है। library प्रति process एक बार, इस क्रम में खोजी जाती है:</p>
+<ol>
+<li class=""><code>SVOD_LLVM_LIB=&lt;path></code> — तब वही file एकमात्र candidate है;</li>
+<li class=""><code>llvm-config --libdir</code> हर candidate नाम के साथ जोड़कर;</li>
+<li class="">dynamic loader के अपने search path से हर candidate नाम;</li>
+<li class="">macOS पर, <code>/opt/homebrew/opt/llvm/lib/libLLVM.dylib</code> और versioned <code>llvm@N</code> kegs।</li>
+</ol>
+<p>candidate नाम हैं <code>libLLVM.so</code> / <code>libLLVM.dylib</code>, फिर 30 से 16 तक हर major के लिए distro
+SONAMEs (<code>libLLVM.so.N.1</code>, <code>libLLVM-N.so.1</code>, <code>libLLVM-N.so</code>, <code>libLLVM.so.N</code>;
+<code>libLLVM-N.dylib</code>, <code>libLLVM.N.dylib</code>)। version <code>LLVMGetVersion</code> से पढ़ा जाता है और
+<strong>16 या नया</strong> होना चाहिए।</p>
+<p>एक compile IR को memory buffer से parse करता है (<code>LLVMParseIRInContext</code>), उसे verify करता
+है, loop unrolling, loop vectorization और SLP vectorization enabled के साथ
+<code>LLVMRunPasses("default&lt;O2>")</code> चलाता है, और <code>LLVMTargetMachineEmitToMemoryBuffer</code> से object
+emit करता है। target machine <code>&lt;arch>-none-unknown-elf</code> है, host CPU नाम और feature string
+(<code>LLVMGetHostCPUName</code> / <code>LLVMGetHostCPUFeatures</code>), PIC relocation और default code model के
+साथ; macOS aarch64 पर feature string में <code>+reserve-x18</code> जुड़ता है। context के handler से
+error-severity diagnostics compile को fail करते हैं। हर thread एक thread-local में अपना
+<code>Session</code> (context, target machine, data layout, pass options) रखता है, इसलिए कर्नेल
+concurrently compile होते हैं।</p>
+<p><code>SVOD_LLVM_INPROCESS=0</code> (ठीक value <code>0</code>) in-process path को disable करता है। library bind
+करने में कोई भी विफलता — नहीं मिली, बहुत पुरानी, symbol गायब — नीचे के clang producer पर
+fallback करती है; fallback <code>warn</code> पर log होता है, जब तक कि variable ने इसे जान-बूझकर disable
+न किया हो।</p>
+<div class="theme-admonition theme-admonition-note admonition_xJq3 alert alert--secondary"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 14 16"><path fill-rule=evenodd d="M6.3 5.69a.942.942 0 0 1-.28-.7c0-.28.09-.52.28-.7.19-.18.42-.28.7-.28.28 0 .52.09.7.28.18.19.28.42.28.7 0 .28-.09.52-.28.7a1 1 0 0 1-.7.3c-.28 0-.52-.11-.7-.3zM8 7.99c-.02-.25-.11-.48-.31-.69-.2-.19-.42-.3-.69-.31H6c-.27.02-.48.13-.69.31-.2.2-.3.44-.31.69h1v3c.02.27.11.5.31.69.2.2.42.31.69.31h1c.27 0 .48-.11.69-.31.2-.19.3-.42.31-.69H8V7.98v.01zM7 2.3c-3.14 0-5.7 2.54-5.7 5.68 0 3.14 2.56 5.7 5.7 5.7s5.7-2.55 5.7-5.7c0-3.15-2.56-5.69-5.7-5.69v.01zM7 .98c3.86 0 7 3.14 7 7s-3.14 7-7 7-7-3.12-7-7 3.14-7 7-7z"/></svg></span>प्रति process एक libLLVM</div><div class=admonitionContent_BuS1><p>Apple का Metal compiler framework अपना libLLVM <code>RTLD_GLOBAL</code> load करता है, जो दूसरी copy के
+साथ process साझा नहीं कर सकता। इसलिए CPU और <a class="" href=/hi/docs/backends/metal>Metal</a> बैकएंड एक slot
+(<code>svod_device::claim_inprocess_llvm</code>) पर मध्यस्थता करते हैं: जो पहले compile करता है वह उसे
+रखता है, और दूसरा अपना subprocess या public-API fallback लेता है।</div></div>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=clang-fallback>clang fallback<a href=#clang-fallback class=hash-link aria-label="clang fallback का सीधा लिंक" title="clang fallback का सीधा लिंक" translate=no>​</a></h3>
+<p><code>compile_ir_to_object_with</code> IR को clang से pipe करता है, stdin से stdout:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">clang -x ir -c -O2 -march=native -fPIC -fno-math-errno -fno-stack-protector \</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">      -funroll-loops -fvectorize -fslp-vectorize --target=&lt;arch>-none-unknown-elf [-ffixed-x18] - -o -</span><br/></div></code></pre></div></div>
+<p>in-process और clang producers की object-cache identities अलग हैं (<code>cpu-llvm-inprocess</code>
+<code>library=&lt;path>;version=x.y.z</code> और host CPU/features के साथ, बनाम <code>cpu-llvm-clang</code> clang
+identity के साथ), इसलिए objects कभी producers के बीच पार नहीं होते।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=clang-c-path>clang C path<a href=#clang-c-path class=hash-link aria-label="clang C path का सीधा लिंक" title="clang C path का सीधा लिंक" translate=no>​</a></h2>
+<p><code>SVOD_CPU_BACKEND=clang</code> इसके बजाय C render करता है — <code>void name(T* restrict data0, ..., const int dataN)</code> <code>__builtin_*</code> math के साथ — और उसे इससे compile करता है</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">clang -c -x c -O2 &lt;cpu flag> -fPIC -ffreestanding -fno-math-errno -fno-stack-protector \</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">      -nostdlib -fno-ident --target=&lt;arch>-none-unknown-elf [-ffixed-x18] - -o -</span><br/></div></code></pre></div></div>
+<p>जहाँ <code>&lt;cpu flag></code> x86_64 और loongarch64 पर <code>-march=native</code>, riscv64 पर <code>-march=rv64g</code>, और
+बाकी जगह <code>-mcpu=native</code> है (ARM पर <code>-march=native</code> केवल ISA family set करता है)। source
+पढ़ने योग्य है, और यही इस path का उद्देश्य है: LLVM IR पढ़े बिना यह देखना कि कर्नेल क्या
+करता है।</p>
+<p><code>clang</code> केवल <code>PATH</code> पर resolve होता है (<code>ClangToolchain::discover</code>); कोई <code>SVOD_CLANG</code> या
+<code>CC</code> override नहीं है। object cache के लिए इसकी identity
+<code>path=...;sha256=&lt;binary digest>;version=&lt;clang --version></code> है, और C path अतिरिक्त रूप से
+<code>clang -###</code> से resolved <code>-target-cpu</code> और features record करता है (जब कोई flag <code>native</code>
+कहता है तो <code>/proc/cpuinfo</code> से fingerprint किया गया), इसलिए एक machine पर compiled object
+दूसरे CPU पर reuse नहीं होता।</p>
+<div class="theme-admonition theme-admonition-tip admonition_xJq3 alert alert--success"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 12 16"><path fill-rule=evenodd d="M6.5 0C3.48 0 1 2.19 1 5c0 .92.55 2.25 1 3 1.34 2.25 1.78 2.78 2 4v1h5v-1c.22-1.22.66-1.75 2-4 .45-.75 1-2.08 1-3 0-2.81-2.48-5-5.5-5zm3.64 7.48c-.25.44-.47.8-.67 1.11-.86 1.41-1.25 2.06-1.45 3.23-.02.05-.02.11-.02.17H5c0-.06 0-.13-.02-.17-.2-1.17-.59-1.83-1.45-3.23-.2-.31-.42-.67-.67-1.11C2.44 6.78 2 5.65 2 5c0-2.2 2.02-4 4.5-4 1.22 0 2.36.42 3.22 1.19C10.55 2.94 11 3.94 11 5c0 .66-.44 1.78-.86 2.48zM4 14h5c-.23 1.14-1.3 2-2.5 2s-2.27-.86-2.5-2z"/></svg></span>dlopen fallback</div><div class=admonitionContent_BuS1><p><code>svod-runtime</code> का <code>dlopen-fallback</code> cargo feature <strong>केवल C path</strong> के लिए ELF loader को
+बदलता है: <code>clang -shared ... -lm</code> एक temporary directory में <code>kernel.so</code> लिखता है, जिसे
+<code>libloading</code> खोलता है। यह धीमा है और उन platforms के लिए है जहाँ in-memory loader काम नहीं
+करता; object cache इसे <code>elf-shared-dlopen-v1</code> के रूप में record करता है, और CI इसे
+<code>test-dlopen-fallback</code> check के रूप में चलाता है। LLVM path हमेशा in-memory loader उपयोग
+करता है।</div></div>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=math>Math<a href=#math class=hash-link aria-label="Math का सीधा लिंक" title="Math का सीधा लिंक" translate=no>​</a></h2>
+<p>CPU renderers transcendentals रखते हैं: <code>exp</code>, <code>log</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>pow</code> आदि
+<code>@llvm.*</code> intrinsics या <code>__builtin_*</code> calls के रूप में render होते हैं। <code>sqrt</code>, <code>fma</code>,
+<code>floor</code>, <code>rint</code> जैसे host ISA में होने पर instructions में lower होते हैं; बाकी <code>libm</code> calls
+बन जाते हैं जिन्हें loader load time पर <code>dlsym(RTLD_DEFAULT)</code> से resolve करता है।
+LLVM path अपने supported ops से <code>Erf</code> हटा देता है (वह decompose होता है), C path उसे रखता
+है; दोनों <code>Threefry</code> और <code>Max</code> छोड़ देते हैं, जो एक bare XOR और एक select में decompose होते हैं।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=threads>Threads<a href=#threads class=hash-link aria-label="Threads का सीधा लिंक" title="Threads का सीधा लिंक" translate=no>​</a></h2>
+<p><code>SVOD_THREADS</code> (एक positive integer; default: host का available parallelism) एकमात्र thread
+budget है। यह rayon के global pool का आकार तय करता है, जो कर्नेल cache misses को parallel में
+compile करता है और CPU कर्नेल चलाता है, और यह हर CPU कर्नेल का default <strong><code>core_id</code> split</strong> है:</p>
+<ul>
+<li class="">optimizer का THREAD opt (<code>schedule/src/optimizer/opts.rs</code>) एक global loop axis को सबसे
+बाहरी स्थिति में ले जाता है और उसे split करता है; heuristic 32, 16, 12, 8, 6, 5, 4, 3 और 2
+chunks आज़माता है, budget और प्रति 131072 elements एक chunk से सीमित, और पहली ऐसी count
+चुनता है जो किसी axis को divide करे (अन्यथा एक को pad करता है)। split कर्नेल और उसकी cache
+identity में baked होता है।</li>
+<li class=""><code>gpudims</code> उस axis को <code>gidx</code>/<code>lidx</code> के बजाय <code>[0, N-1]</code> में एक <code>core_id</code> variable में lower
+करता है, और <code>global_size[0]</code> <code>N</code> बन जाता है।</li>
+<li class="">run time पर <code>execute_kernel</code> देखता है कि <code>global_size[0] > 1</code> है और
+<code>(0..N).into_par_iter()</code> चलाता है, उसी function pointer को उन्हीं buffers के साथ call करते
+हुए, हर task के लिए <code>core_id</code> overwrite करके। हर <code>core_id</code> एक disjoint output range लिखता
+है, इसलिए किसी synchronization की ज़रूरत नहीं। किसी मौजूदा rayon worker के भीतर loop nest
+होने के बजाय serially चलता है।</li>
+</ul>
+<p>कर्नेल split और pool size अलग हो सकते हैं: 8 तरह split किया गया कर्नेल 4 threads पर सही
+चलता है। <code>SVOD_THREADS=1</code> split को disable करता है। Rayon अपना global pool एक बार बनाता है,
+इसलिए पहले caller का size जीतता है और बाद का अलग request एक warning log करता है
+(<code>ensure_thread_pool</code>)। <code>RAYON_NUM_THREADS</code> नहीं देखा जाता।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=कर्नेल-call-करना>कर्नेल call करना<a href=#कर्नेल-call-करना class=hash-link aria-label="कर्नेल call करना का सीधा लिंक" title="कर्नेल call करना का सीधा लिंक" translate=no>​</a></h2>
+<p>एक loaded कर्नेल <code>JitKernel</code> (C path, <code>ClangKernel</code> के रूप में re-exported) या
+<code>LlvmKernel</code> है: mapped object, entry pointer, var names और एक <code>KernelCif</code>। ABI ABI slot
+क्रम में <code>void kernel(ptr..., i32...)</code> है: storage parameters <code>Type::pointer()</code> हैं, scalars
+<code>Type::i32()</code>, और executor जो <code>i64</code> values रखता है वे <code>i32</code> में truncate होती हैं। call ख़ुद
+<strong>libffi</strong> से होकर जाता है (<code>cif.call(CodePtr(fn_ptr), &args)</code>, <code>runtime/src/dispatch.rs</code>),
+इसीलिए कर्नेल signature प्रति arity transmute के बिना प्रति कर्नेल बदल सकता है।</p>
+<p>CPU के पास कोई graph factory, कोई plan context और कोई timestamps नहीं हैं: हर कर्नेल एक
+synchronous call है, <code>wait</code> ignore होता है, और profiler का device-time tier wall-clock है।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=object-cache>Object cache<a href=#object-cache class=hash-link aria-label="Object cache का सीधा लिंक" title="Object cache का सीधा लिंक" translate=no>​</a></h2>
+<p>compiled objects disk पर cache होते हैं (<code>runtime/src/object_cache.rs</code>)
+<code>SVOD_OBJECT_CACHE_DIR</code> के अंतर्गत, अन्यथा <code>$XDG_CACHE_HOME/svod/objects</code>, अन्यथा
+<code>~/.cache/svod/objects</code>; <code>SVOD_OBJECT_CACHE=0</code> इसे disable करता है और
+<code>SVOD_OBJECT_CACHE_MAX_BYTES</code> budget set करता है (default 1 GiB, mtime के अनुसार
+oldest-first eviction)। एक entry की key source का SHA-256 और एक <code>CompilerIdentity</code>
+(<code>schema</code>, <code>backend</code>, <code>target_architecture</code>, <code>toolchain</code>, <code>flags</code>, <code>abi</code>,
+<code>object_format</code>) है, जो <code>&lt;hex>.obj</code> के रूप में एक magic, key, payload digest और payload के
+साथ stored है; failed integrity check एक miss है। हर object, cached या fresh, load होने से
+पहले host ELF architecture, endianness, object kind और entry symbol के विरुद्ध validate होता
+है। यही cache AMD, CUDA और Metal objects को उनकी अपनी identities के तहत रखता है।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=environment-variables>Environment variables<a href=#environment-variables class=hash-link aria-label="Environment variables का सीधा लिंक" title="Environment variables का सीधा लिंक" translate=no>​</a></h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Variable<th>Default<th>प्रभाव<tbody><tr><td><code>SVOD_CPU_BACKEND</code><td><code>llvm</code><td><code>clang</code> C path चुनता है<tr><td><code>SVOD_LLVM_INPROCESS</code><td>on<td><code>0</code> <code>clang -x ir</code> subprocess को मजबूर करता है<tr><td><code>SVOD_LLVM_LIB</code><td>unset<td>bind करने के लिए libLLVM का path; set होने पर एकमात्र candidate<tr><td><code>SVOD_THREADS</code><td>host parallelism<td>thread budget और default <code>core_id</code> split<tr><td><code>SVOD_OBJECT_CACHE</code><td>on<td><code>0</code> on-disk object cache को disable करता है<tr><td><code>SVOD_OBJECT_CACHE_DIR</code><td><code>$XDG_CACHE_HOME/svod/objects</code><td>cache को relocate करता है<tr><td><code>SVOD_OBJECT_CACHE_MAX_BYTES</code><td>1 GiB<td>cache budget<tr><td><code>SVOD_DUMP_LLVM_IR</code><td>unset<td>वह directory जो हर कर्नेल का rendered LLVM IR प्राप्त करती है<tr><td><code>SVOD_DUMP_POST_O2_IR</code><td>unset<td>वह directory जो clang की <code>-O2</code> pipeline के बाद का IR प्राप्त करती है<tr><td><code>RUST_LOG</code><td>unset<td><code>svod_runtime=debug</code> बताता है कि कौन-सा producer compile करता है (libLLVM या clang) और हर कर्नेल compile और load log करता है; clang पर अनचाहा fallback एक <code>warn</code> है</table></div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/backends/cpu.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>इस पेज को बदलें</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="डॉक्स पेज"><a class="pagination-nav__link pagination-nav__link--prev" href=/hi/docs/backends/overview><div class=pagination-nav__sublabel>पिछ्ला</div><div class=pagination-nav__label>अवलोकन</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/hi/docs/backends/jit-loader><div class=pagination-nav__sublabel>अगला</div><div class=pagination-nav__label>ELF JIT लोडर</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#llvm-path class="table-of-contents__link toc-highlight">LLVM path</a><ul><li><a href=#in-process-libllvm class="table-of-contents__link toc-highlight">In-process libLLVM</a><li><a href=#clang-fallback class="table-of-contents__link toc-highlight">clang fallback</a></ul><li><a href=#clang-c-path class="table-of-contents__link toc-highlight">clang C path</a><li><a href=#math class="table-of-contents__link toc-highlight">Math</a><li><a href=#threads class="table-of-contents__link toc-highlight">Threads</a><li><a href=#कर्नेल-call-करना class="table-of-contents__link toc-highlight">कर्नेल call करना</a><li><a href=#object-cache class="table-of-contents__link toc-highlight">Object cache</a><li><a href=#environment-variables class="table-of-contents__link toc-highlight">Environment variables</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>डॉक्स</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/hi/docs/introduction>परिचय</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>समुदाय</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

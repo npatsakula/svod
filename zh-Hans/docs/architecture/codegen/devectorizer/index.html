@@ -1,221 +1,129 @@
-<!doctype html><html lang=zh-CN dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-architecture/codegen/devectorizer" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>阶段 3：Devectorizer | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/zh-Hans/docs/architecture/codegen/devectorizer /><meta data-rh=true property=og:locale content=zh_CN /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=zh-Hans /><meta data-rh=true name=docsearch:language content=zh-Hans /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="阶段 3：Devectorizer | Svod"/><meta data-rh=true name=description content=目标：从硬件无关的向量降低到硬件特定的指令。 /><meta data-rh=true property=og:description content=目标：从硬件无关的向量降低到硬件特定的指令。 /><link data-rh=true rel=icon href=/zh-Hans/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/zh-Hans/docs/architecture/codegen/devectorizer /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/codegen/devectorizer hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/architecture/codegen/devectorizer hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/architecture/codegen/devectorizer hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/architecture/codegen/devectorizer hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/codegen/devectorizer hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/zh-Hans/docs/architecture/codegen/devectorizer","name":"阶段 3 — Devectorizer","position":1}]}</script><link rel=stylesheet href=/zh-Hans/assets/css/styles.e76ef093.css /><script src=/zh-Hans/assets/js/runtime~main.e3d1fb96.js defer></script><script src=/zh-Hans/assets/js/main.82bf176e.js defer></script></head><body><svg style="display: none;"><defs>
+<!doctype html><html lang=zh-CN dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-architecture/codegen/devectorizer" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>GPU 维度、去向量化与索引降级（阶段 12–18） | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/zh-Hans/docs/architecture/codegen/devectorizer /><meta data-rh=true property=og:locale content=zh_CN /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=zh-Hans /><meta data-rh=true name=docsearch:language content=zh-Hans /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="GPU 维度、去向量化与索引降级（阶段 12–18） | Svod"/><meta data-rh=true name=description content="归约降级之后，内核仍然使用带形状的值和 WeakInt 索引。这些阶段把 range 映射到硬件索引，让每次内存访问都成为显式的标量 LOAD/STORE，把连续访问重新加宽，并确定索引 dtype。源码：gpudims.rs、devectorize.rs、late/coalesce.rs、symbolic/index_lowering.rs。"/><meta data-rh=true property=og:description content="归约降级之后，内核仍然使用带形状的值和 WeakInt 索引。这些阶段把 range 映射到硬件索引，让每次内存访问都成为显式的标量 LOAD/STORE，把连续访问重新加宽，并确定索引 dtype。源码：gpudims.rs、devectorize.rs、late/coalesce.rs、symbolic/index_lowering.rs。"/><link data-rh=true rel=icon href=/zh-Hans/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/zh-Hans/docs/architecture/codegen/devectorizer /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/codegen/devectorizer hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/architecture/codegen/devectorizer hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/architecture/codegen/devectorizer hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/architecture/codegen/devectorizer hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/codegen/devectorizer hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/zh-Hans/docs/architecture/codegen/devectorizer","name":"Devectorizer 与索引降级","position":1}]}</script><link rel=stylesheet href=/zh-Hans/assets/css/styles.e76ef093.css /><script src=/zh-Hans/assets/js/runtime~main.53f2793a.js defer></script><script src=/zh-Hans/assets/js/main.b4210e06.js defer></script></head><body><svg style="display: none;"><defs>
 <symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
 </defs></svg>
-<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-5c8")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/zh-Hans/img/logo.svg /><div role=region aria-label=跳到主要内容><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>跳到主要内容</a></div><nav aria-label=主导航 class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label=切换导航栏 aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/zh-Hans/><div class=navbar__logo><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/zh-Hans/docs/introduction>文档</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>简体中文</a><ul class=dropdown__menu><li><a href=/docs/architecture/codegen/devectorizer target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/architecture/codegen/devectorizer target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=zh-CN>简体中文</a><li><a href=/ru/docs/architecture/codegen/devectorizer target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/architecture/codegen/devectorizer target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="切换浅色/暗黑模式（当前为system mode）"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=搜索 aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label=回到顶部 class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label=文档侧边栏 class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/zh-Hans/docs/introduction><span class=linkLabel_WmDU>简介</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/examples><span class=categoryLinkLabel_W154>快速上手</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/zh-Hans/docs/architecture/pipeline><span class=categoryLinkLabel_W154>架构</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/pipeline><span class=linkLabel_WmDU>执行流水线</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/jit-graphs><span class=linkLabel_WmDU>JIT 图</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/kernel-origins><span class=linkLabel_WmDU>内核来源</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/zh-Hans/docs/architecture/codegen/overview><span class=categoryLinkLabel_W154>代码生成流水线</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/codegen/overview><span class=linkLabel_WmDU>概览</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/codegen/rangeify><span class=linkLabel_WmDU>阶段 1 — Rangeify</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/codegen/expander><span class=linkLabel_WmDU>阶段 2 — Expander</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/zh-Hans/docs/architecture/codegen/devectorizer><span class=linkLabel_WmDU>阶段 3 — Devectorizer</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/codegen/linearizer><span class=linkLabel_WmDU>阶段 4 — Linearizer</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/codegen/worked-example><span class=linkLabel_WmDU>实例演练与参考</span></a></ul><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/ir-design><span class=linkLabel_WmDU>IR 设计哲学</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/zh-Hans/docs/architecture/optimizations/pattern-system><span class=categoryLinkLabel_W154>优化</span></a></div><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/op-bestiary><span class=linkLabel_WmDU>操作图鉴</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile 内核 (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/backends/jit-loader><span class=categoryLinkLabel_W154>后端</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=页面路径><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label=主页面 class=breadcrumbs__link href=/zh-Hans/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>架构</span><li class=breadcrumbs__item><span class=breadcrumbs__link>代码生成流水线</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>阶段 3 — Devectorizer</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">本页总览</button></div><div class="theme-doc-markdown markdown"><header><h1>阶段 3：Devectorizer</h1></header>
-<p><strong>目标</strong>：从硬件无关的向量降低到硬件特定的指令。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=stage-11移除-reduce>Stage 11：移除 Reduce<a href=#stage-11移除-reduce class=hash-link aria-label="Stage 11：移除 Reduce的直接链接" title="Stage 11：移除 Reduce的直接链接" translate=no>​</a></h2>
-<blockquote>
-<p><strong>阶段速览</strong></p>
-<p><strong>目标</strong>：将声明式 REDUCE 转换为命令式累加
-<strong>关键模式</strong>：Reduce 到累加器、水平规约
-<strong>影响</strong>：映射到硬件规约指令</p>
-</blockquote>
-<p><strong>做了什么</strong>：将高层 REDUCE 转换为累加器模式。</p>
-<p><strong>为什么重要</strong>：声明式的"对这些值求和"需要变成命令式指令：初始化累加器、循环、逐个相加。</p>
-<p><strong>模式</strong>：<code>movement_cleanup_patterns + pm_reduce_local</code></p>
-<p><code>pm_reduce_local</code> 打包了 WMMA-add 融合、<code>pm_group_for_reduce</code>、
-累加器和水平规约规则，以及 group-SINK 清理。</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">// Before: declarative reduction</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">REDUCE(Add, values, range)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">// After: imperative accumulation</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">acc = placeholder(AddrSpace::Reg)   // initialized to the reduce identity</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">for i in range:</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    acc = STORE(acc, ADD(LOAD(acc), values[i]))</span><br/></div></code></pre></div></div>
-<p>累加器循环是一条 AFTER / STORE / END 链，由一个覆盖规约 range 的 <code>END</code> 收尾——
-在这一层没有单独的循环构造。</p>
-<p><strong>水平规约</strong>：</p>
-<p>在循环遍历规约维度之前，我们先合并一个带形状值的各条 lane。这样可以创建更大的规约，更好地映射到硬件指令。</p>
-<!-- -->
-<p><strong>WMMA 张量核心融合</strong>：</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">// Fuse tensor core accumulation inline</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">WMMA(a, b, c) + add → WMMA(a, b, c + add)</span><br/></div></code></pre></div></div>
-<p>该模式实现了张量核心上高效的 FMA 式累加。另有两条分支分别穿过 <code>PERMUTE</code> 包装器以及 <code>PERMUTE(RESHAPE(...))</code> 包装器进行融合。</p>
-<p><strong>Svod</strong>：<code>devectorize.rs</code></p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=stage-12添加-gpu-维度>Stage 12：添加 GPU 维度<a href=#stage-12添加-gpu-维度 class=hash-link aria-label="Stage 12：添加 GPU 维度的直接链接" title="Stage 12：添加 GPU 维度的直接链接" translate=no>​</a></h2>
-<blockquote>
-<p><strong>阶段速览</strong></p>
-<p><strong>目标</strong>：将抽象 range 映射到 GPU 线程索引
-<strong>关键模式</strong>：Range 到 SPECIAL 的替换
-<strong>影响</strong>：在 GPU 上实现并行执行</p>
-</blockquote>
-<p><strong>做了什么</strong>：将 range 替换为 GPU 线程索引。</p>
-<p><strong>为什么重要</strong>：GPU 有硬性限制：每个块最多 1024 个线程、共享内存最多 48KB。如果你的计算需要 2000 个线程，编译器必须将其分割成多个块。维度限制会自动处理这些。</p>
-<p><strong>模式</strong>：先是 <code>pm_lower_device_ranges</code>，然后是 <code>pm_add_gpudims</code>（仅当渲染器有 local 或 thread 维度时）</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">// Before: abstract range</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">RANGE(end=256, Global)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">// After: GPU-specific</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">SPECIAL(gidx0)  // global thread index</span><br/></div></code></pre></div></div>
-<p><strong>映射</strong>：</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Range 类型<th>GPU 等价物<tbody><tr><td>Global, Thread<td><code>gidx</code>（全局索引）<tr><td>Local, Warp, GroupReduce<td><code>lidx</code>（本地/工作组索引）<tr><td>Device<td>PARAM 变量 <code>"_device_num"</code>（在启动时绑定）<tr><td>Reduce<td>循环（不映射）</table>
-<p>Warp range 会被排到本地维度的最前面，因此它们占据线程索引的低位。</p>
-<p><strong>维度限制</strong>：</p>
-<p>GPU 有硬件限制（如每个块最多 1024 个线程）。当 range 超过这些限制时，编译器会：</p>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-5c8")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/zh-Hans/img/logo.svg /><div role=region aria-label=跳到主要内容><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>跳到主要内容</a></div><nav aria-label=主导航 class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label=切换导航栏 aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/zh-Hans/><div class=navbar__logo><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/zh-Hans/docs/introduction>文档</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>简体中文</a><ul class=dropdown__menu><li><a href=/docs/architecture/codegen/devectorizer target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/architecture/codegen/devectorizer target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=zh-CN>简体中文</a><li><a href=/ru/docs/architecture/codegen/devectorizer target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/architecture/codegen/devectorizer target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="切换浅色/暗黑模式（当前为system mode）"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=搜索 aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label=回到顶部 class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label=文档侧边栏 class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/zh-Hans/docs/introduction><span class=linkLabel_WmDU>简介</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/examples><span class=categoryLinkLabel_W154>快速上手</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/zh-Hans/docs/architecture/ir-design><span class=categoryLinkLabel_W154>架构</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/ir-design><span class=linkLabel_WmDU>IR 设计哲学</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/pipeline><span class=linkLabel_WmDU>执行流水线</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/jit-graphs><span class=linkLabel_WmDU>JIT 图</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/kernel-origins><span class=linkLabel_WmDU>内核来源</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/zh-Hans/docs/architecture/codegen/overview><span class=categoryLinkLabel_W154>代码生成流水线</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/codegen/overview><span class=linkLabel_WmDU>概览</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/codegen/rangeify><span class=linkLabel_WmDU>Rangeify 与内核切分</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/codegen/expander><span class=linkLabel_WmDU>Expander 与归约</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/zh-Hans/docs/architecture/codegen/devectorizer><span class=linkLabel_WmDU>Devectorizer 与索引降级</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/codegen/linearizer><span class=linkLabel_WmDU>后期重写与线性化器</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/codegen/worked-example><span class=linkLabel_WmDU>完整示例</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/zh-Hans/docs/architecture/optimizations/pattern-system><span class=categoryLinkLabel_W154>优化</span></a></div><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/op-bestiary><span class=linkLabel_WmDU>操作图鉴</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile 内核 (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/backends/overview><span class=categoryLinkLabel_W154>后端</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=页面路径><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label=主页面 class=breadcrumbs__link href=/zh-Hans/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>架构</span><li class=breadcrumbs__item><span class=breadcrumbs__link>代码生成流水线</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>Devectorizer 与索引降级</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">本页总览</button></div><div class="theme-doc-markdown markdown"><header><h1>GPU 维度、去向量化与索引降级（阶段 12–18）</h1></header>
+<p>归约降级之后，内核仍然使用带形状的值和 <code>WeakInt</code> 索引。这些阶段把 range 映射到硬件索引，让每次内存访问都成为显式的标量 <code>LOAD</code>/<code>STORE</code>，把连续访问重新加宽，并确定索引 dtype。源码：<code>gpudims.rs</code>、<code>devectorize.rs</code>、<code>late/coalesce.rs</code>、<code>symbolic/index_lowering.rs</code>。</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=12--gpu-维度>12 —— GPU 维度<a href=#12--gpu-维度 class=hash-link aria-label="12 —— GPU 维度的直接链接" title="12 —— GPU 维度的直接链接" translate=no>​</a></h2>
+<p>两个匹配器。<code>pm_lower_device_ranges</code> 对每个 renderer 都运行：<code>Device</code> range 变成带该 range 界限的标量 <code>PARAM</code> 变量 <code>_device_num</code>，关闭它的 <code>END</code> 去掉对应条目。<code>pm_add_gpudims</code> 仅在 <code>renderer.has_local || renderer.has_threads</code> 时运行；它只匹配一次 <code>SINK</code>（<code>GpuDimsContext</code> 记住已降级 sink 的 id，使引擎的再次访问成为空操作）。</p>
+<p><code>add_gpudims</code>：</p>
 <ol>
-<li class="">当相邻维度的乘积仍然放得下时把它们<strong>分组</strong>：<code>[16, 16, 256]</code> 在上限 <code>[256, 256]</code> 下 → <code>[256, 256]</code></li>
-<li class=""><strong>分割</strong>过大维度：<code>[2048]</code> 在上限 <code>[1024, 1024, 1024]</code> 下 → <code>[1024, 2]</code></li>
-<li class="">通过 divmod <strong>重建</strong>索引</li>
+<li class="">收集每个 <code>RANGE</code>，以 <code>(axis_id, axis_type)</code> 为键；如果已存在 <code>SPECIAL</code> 则放弃。</li>
+<li class="">全局维度 = <code>Global</code> 和 <code>Thread</code> 轴；局部维度 = <code>Local</code>、<code>Warp</code>、<code>GroupReduce</code>。两者都按轴 id 排序；<code>Warp</code> 轴被移到局部维度的最前面，使其占据线性线程索引的低位（<code>mma.sync</code> 按硬件 lane 寻址 fragment）。</li>
+<li class="">构建索引表达式：
+<ul>
+<li class=""><code>has_threads</code>（CPU）：必须恰好一个全局轴且没有局部轴，否则该 pass 发出警告并放弃。该轴变成 <code>PARAM("core_id", 0..N-1)</code>。</li>
+<li class=""><code>KernelInfo.dont_use_locals</code>：只有全局维度，<code>get_grouped_dims("idx", ..)</code>。</li>
+<li class="">其他情况：先在 <code>local_max_axes()</code>（或逐轴的 <code>local_max</code>；首个上限被固定为 warp 的 extent，使其他维度不会折叠进 <code>lidx0</code>）约束下由局部形状生成 <code>lidx*</code>，然后在 <code>global_max</code> 约束下由全局形状生成 <code>gidx*</code>；当 renderer 声明了工作项乘积上限时，再进一步以 <code>global_prod_max / hardware_local_extents</code> 为上限。</li>
+</ul>
+</li>
+<li class=""><code>get_grouped_dims</code> 与 Tinygrad 相同：若维度超出逐轴上限，<code>group_dims</code> 合并乘积不超限的相邻维度；若无法分组，<code>split_dims</code> 用最小因子拆分过大的维度，放入下一个槽位。任一失败都会在调度时 panic，而不是在代码生成时（<code>"cannot limit dims to N axes"</code>）。结果是每个受限维度一个 <code>SPECIAL(end, "gidxN")</code>；发生分组或拆分时，每个原始维度通过 <code>FloorDiv</code>/<code>FloorMod</code> 从扁平索引重建，并用 <code>symbolic</code> 化简。全局索引以 <code>reverse = true</code> 生成（递归会同时反转输入<em>和</em>输出，因此名称保持迭代顺序）。</li>
+<li class=""><strong>Store 掩码</strong>（<code>compute_store_masks</code>）：若写入全局内存的 <code>STORE</code> 的索引不在每个局部 range 的作用域内，则其索引会得到 <code>WHERE((l1 == 0) & (l2 == 0) & .., idx, Invalid)</code>，使每个未使用的局部轴只有一个工作项执行写入。掩码留在索引表达式内部，这样 RANGE → SPECIAL 的替换会把它带到硬件索引上。</li>
+<li class="">把每个 GPU range 替换为其索引；<code>Reduce</code> range 仍为循环。</li>
 </ol>
-<p><strong>Store 掩码</strong>：</p>
-<p>不使用所有本地维度的全局 store 会被掩码：</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">// If STORE doesn't use lidx1, restrict its index validity:</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">STORE(INDEX(buf, idx), value) → STORE(INDEX(buf, WHERE(lidx1 == 0, idx, Invalid)), value)</span><br/></div></code></pre></div></div>
-<p>这确保 store 仅在未使用的本地索引为 0 时执行。掩码留在索引表达式中，这样 RANGE 替换就会把它带到对应的硬件索引上。</p>
-<p><strong>Svod</strong>：<code>gpudims.rs</code></p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=stage-13添加-load>Stage 13：添加 Load<a href=#stage-13添加-load class=hash-link aria-label="Stage 13：添加 Load的直接链接" title="Stage 13：添加 Load的直接链接" translate=no>​</a></h2>
-<blockquote>
-<p><strong>阶段速览</strong></p>
-<p><strong>目标</strong>：用显式 LOAD 包装 INDEX 操作
-<strong>关键模式</strong>：为取值的操作数添加 LOAD
-<strong>影响</strong>：为代码生成显式化内存操作</p>
-</blockquote>
-<p><strong>做了什么</strong>：用显式 LOAD 包装 INDEX 操作。</p>
-<p><strong>为什么重要</strong>：INDEX 操作计算地址。LOAD 才真正读取内存。将这一点显式化有助于代码生成器理解需要哪些内存访问。</p>
-<p><strong>模式</strong>：<code>symbolic_simple + pm_expand_broadcast + pm_add_loads</code></p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">// Before: bare index</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">INDEX(ptr, i)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">// After: explicit load</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">LOAD(INDEX(ptr, i))</span><br/></div></code></pre></div></div>
-<p>当 STORE 的值操作数本身就是一个地址时，也会为它加上 load。</p>
-<p>注意：只有<em>作为值</em>被消费的操作数才会被包装——纯粹作为地址使用的 INDEX（STORE 的目标、WMMA 片段地址）保持裸露。</p>
-<p><strong>Svod</strong>：<code>devectorize.rs</code></p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=stage-14devectorize>Stage 14：Devectorize<a href=#stage-14devectorize class=hash-link aria-label="Stage 14：Devectorize的直接链接" title="Stage 14：Devectorize的直接链接" translate=no>​</a></h2>
-<blockquote>
-<p><strong>阶段速览</strong></p>
-<p><strong>目标</strong>：把带形状的操作变成标量操作
-<strong>关键阶段</strong>：一次合并的重写
-<strong>影响</strong>：每个操作都变成后端能够发射的东西</p>
-</blockquote>
-<p><strong>做了什么</strong>：处理从带形状的值到标量硬件操作的转换。</p>
-<p><strong>为什么重要</strong>：Devectorize 把 <code>STACK</code> 和 <code>INDEX</code> 的 lane 结构下降为
-逐 lane 的标量操作，同时保留连续的内存访问。</p>
-<p><strong>标量化是无条件的</strong>：<code>devectorize_alu</code> 把静态形状的乘积作为
-lane 数量，为每个坐标发射一个操作，然后用 <code>STACK</code> 重新组装结果
-（store 则用 <code>GROUP</code>）。这里没有逐设备的折叠长度表——重新向量化
-留给后端，在那里 LLVM 的 SLP 向量化器可以在有利时把标量重新拓宽。</p>
-<p>注意：Svod 始终运行 devectorizer；没有跳过它的环境变量。</p>
-<p><strong>模式</strong>：<code>symbolic_simple + devectorize_patterns + bool_storage_patterns + indexing_simplify</code></p>
-<p><strong>分割带形状的 ALU</strong>：</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">// A shaped add becomes one op per lane</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">ADD(shaped_a, shaped_b) → STACK(ADD(a[0], b[0]), ADD(a[1], b[1]), ...)</span><br/></div></code></pre></div></div>
-<p><strong>Bool 存储</strong>：bool 的 LOAD/STORE 通过 <code>uint8</code> 进行，因为 LLVM 的 <code>i1</code> 高位可能带有垃圾数据。</p>
-<p><strong>索引化简</strong>：<code>indexing_simplify</code> 折叠标量化暴露出来的寻址运算。</p>
-<p><strong>Svod</strong>：<code>devectorize.rs</code></p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=stage-15降低-index-dtype>Stage 15：降低 Index DType<a href=#stage-15降低-index-dtype class=hash-link aria-label="Stage 15：降低 Index DType的直接链接" title="Stage 15：降低 Index DType的直接链接" translate=no>​</a></h2>
-<blockquote>
-<p><strong>阶段速览</strong></p>
-<p><strong>目标</strong>：将弱索引类型转换为具体整数
-<strong>关键模式</strong>：基于值范围的操作特定降低
-<strong>影响</strong>：索引使用硬件原生整数类型（i32 或 i64）</p>
-</blockquote>
-<p><strong>做了什么</strong>：将抽象的弱（<code>WeakInt</code>）dtype 转换为具体整数。</p>
-<p><strong>为什么重要</strong>：弱索引类型是抽象的——硬件没有这个类型。我们需要转换为硬件实际支持的 i32 或 i64。（Tinygrad 把这个 dtype 叫做 <code>Index</code>；在 Svod 中它是 <code>ScalarDType::WeakInt</code>。）</p>
-<p><strong>模式</strong>：<code>lower_index_patterns</code> = <code>symbolic_simple + pm_fold_cast_const + pm_lower_index_dtype + indexing_simplify</code></p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">// Before: weak index type</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">idx: WeakInt</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">// After: concrete type</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">idx: i32  // or i64, based on bounds</span><br/></div></code></pre></div></div>
-<p><strong>操作特定的降低</strong>：</p>
-<p>Index 类型降低使用 3 阶段级联方法：</p>
+<p>在<a class="" href=/zh-Hans/docs/architecture/codegen/worked-example>完整示例</a>页面的 CPU 例子中，这里什么也不发生：行轴是 <code>Weak</code>（没有创建 <code>Thread</code> 轴），并且该 renderer 没有局部维度。</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=13--loads>13 —— loads<a href=#13--loads class=hash-link aria-label="13 —— loads的直接链接" title="13 —— loads的直接链接" translate=no>​</a></h2>
+<p><code>PM_ADD_LOADS = symbolic_simple() + pm_expand_broadcast() + pm_add_loads()</code>。</p>
+<ul>
+<li class=""><code>pm_expand_broadcast</code> 先再次运行 <code>pm_wmma_add</code>，然后把广播显式化：若 <code>Binary</code>/<code>Ternary</code>/<code>STORE</code> 的源形状不同，每个源都被 <code>RESHAPE</code>（前导 1）并 <code>EXPAND</code> 到广播形状；操作数前缀不同的 <code>WMMA</code> 按输出坐标展开（<code>broadcast_and_devec_wmma</code>）。</li>
+<li class=""><code>pm_add_loads</code> 把每个<em>作为值被消费</em>的操作数包进 <code>LOAD</code>：带地址空间的 ALU 算子、类型转换、<code>REDUCE</code>、<code>WMMA</code> 和 <code>STACK</code> 的源（<code>maybe_load</code>），以及本身是地址的 <code>STORE</code> 值。用作地址的 <code>INDEX</code> —— <code>STORE</code> 的目标、<code>WMMA</code> 的 fragment 指针 —— 保持原样。阶段 10 创建的累加器读取（<code>AFTER(acc, ..)</code>）在这里变成 <code>LOAD(AFTER(acc, ..))</code>。</li>
+</ul>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=14--去向量化>14 —— 去向量化<a href=#14--去向量化 class=hash-link aria-label="14 —— 去向量化的直接链接" title="14 —— 去向量化的直接链接" translate=no>​</a></h2>
+<p><code>devectorize()</code> 是基于 <code>symbolic_simple + devectorize_patterns + bool_storage_patterns + indexing_simplify</code> 的一次 <code>graph_rewrite</code>（<code>Renderer</code> 上下文，规则并不使用它）。没有外层循环：引擎会对每个替换结果重新匹配。</p>
+<p><code>devectorize_patterns</code>（Tinygrad 中的 <code>devectorizer2</code>），按源码顺序：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>组<th>规则<tbody><tr><td><code>movement_cleanup_patterns</code><td><code>mop_cleanup_patterns</code>，加上 <code>RESHAPE(STACK([x]))</code> 和前导单例维度的物化<tr><td><code>movement_op_patterns</code><td>rangeify 的 movement 规则（穿过 <code>INDEX</code>、<code>AFTER</code>、<code>END</code>）<tr><td><code>no_vectorized_alu</code><td>形状非空的每个一元/二元/三元算子、<code>CAST</code>、<code>BITCAST</code> → <code>devectorize_alu</code><tr><td><code>mixed_representation_alu</code><td>源中混有 <code>STACK</code> 和向量 dtype 值的 ALU：向量源被拆成 <code>STACK(INDEX(src, lane)..)</code>，然后 <code>devectorize_alu</code><tr><td>带形状的 <code>LOAD</code> / <code>STORE</code><td>→ <code>devectorize_alu</code>（逐 lane 的 <code>LOAD(INDEX)</code>；逐 lane 的 store 收集到一个 <code>GROUP</code> 中）<tr><td><code>INDEX(buf, [])</code><td>→ <code>buf</code><tr><td><code>WMMA</code><td><code>stack_wmma_sources</code>：操作数变成已加载 lane 的 <code>STACK</code><tr><td><code>PARAM</code>/<code>BUFFER</code> 上的 <code>INDEX(buf, STACK(i0, i1, ..))</code><td>→ <code>STACK(INDEX(buf, i0), INDEX(buf, i1), ..)</code> —— lane 仍是地址；外围的 <code>LOAD</code>/<code>STORE</code> 负责将其物化<tr><td><code>INDEX(buf, RESHAPE(i))</code><td>→ <code>RESHAPE(INDEX(buf, i))</code><tr><td><code>Void</code> 值的 <code>RESHAPE</code><td>→ 该值（围绕 <code>AFTER</code>/<code>STORE</code> 的形状簿记）<tr><td>被 reshape 为标量的单元素带形状值<td>→ <code>INDEX(src, 0)</code><tr><td><code>EXPAND</code><td><code>materialize_stack_broadcast</code>（广播到 N 个 lane 的 <code>STACK([x])</code> → <code>STACK([x; N])</code>）或 <code>expand_scalar_to_stack</code></table>
+<p><code>devectorize_alu</code> 即 Tinygrad 的 <code>do_devectorize</code>：它要求每个源都具有结果形状（或者是 <code>Invalid</code> 基值，其标量是多态的），枚举静态形状的所有坐标，为每个坐标构建一个以 <code>INDEX(source, c0, c1, ..)</code> 为操作数的标量算子，再用 <code>stack_with_shape</code>（与形状对应的嵌套 <code>STACK</code>）重新组装 —— 对 <code>STORE</code> 则用 <code>GROUP</code>。lane 数是形状的完整乘积；没有按设备区分的折叠宽度。重新向量化是后端的工作（LLVM 的 SLP 向量化器，或对内存访问而言是两个阶段之后的 <code>memory_coalescing</code>）。</p>
+<p><code>bool_storage_patterns</code>：bool 的 <code>STORE</code> 转换为 <code>uint8</code>，bool 的 <code>LOAD</code> 加载 <code>uint8</code> 后再转换回来，涉及 bool 的 <code>BITCAST</code> 变成 <code>CAST</code>。LLVM 的 <code>i1</code> 高位可能带有垃圾值。</p>
+<p><code>indexing_simplify</code>（<code>late/coalesce.rs</code>）：对于 <code>INDEX(buf, WHERE(valid, idx, Invalid))</code>，<code>uop_given_valid</code> 在 <code>valid</code> 成立的假设下重写 <code>idx</code>（<code>symbolic/valid_simplification.rs</code>）；双坐标的图像形式还会丢弃图像边界已经蕴含的有效性子句（<code>drop_valid_stmts</code>）。</p>
+<p>此阶段之后，每个 ALU 算子都是标量的。在完整示例中，索引表达式的四个 lane 变成四个 <code>LOAD(INDEX(PARAM, R0*4 + R1*64 + k))</code>，水平 <code>Add</code> 链也变得显式。</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=15--早期符号化简>15 —— 早期符号化简<a href=#15--早期符号化简 class=hash-link aria-label="15 —— 早期符号化简的直接链接" title="15 —— 早期符号化简的直接链接" translate=no>​</a></h2>
+<p>再运行一次 <code>sym()</code>，这次是在标量代码上。它存在的理由在于下一阶段：索引表达式必须处于规范的 <code>base + const</code> 形式，合并访存才能对其分组。</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=16--内存合并访问>16 —— 内存合并访问<a href=#16--内存合并访问 class=hash-link aria-label="16 —— 内存合并访问的直接链接" title="16 —— 内存合并访问的直接链接" translate=no>​</a></h2>
+<p><code>memory_coalescing</code>（<code>late/coalesce.rs</code>）是图遍历，不是匹配器。它按 <code>(op, buffer, index base, validity)</code> 对无 gate 的 <code>LOAD</code> 和 <code>STORE</code> 分组，其中索引被拆成 <code>base + integer_offset</code>（<code>Invalid</code> 或常量索引自成一个 base）。组内连续的偏移构成若干段；每段被切成能整除 base 偏移的最宽折叠长度：</p>
+<ul>
+<li class="">图像缓冲区：4；</li>
+<li class=""><code>supports_float4</code> 的 renderer：当 <code>access_bytes() >= 16</code> 时从 <code>16 / sizeof(dtype)</code> 起向下取 2 的幂（8 个 16 位 lane、4 个 <code>f32</code>），否则从 4 起；</li>
+<li class="">其他情况：只能是标量。<code>Reg</code> 缓冲区和不可折叠的 dtype（f32/f16/bf16/i32/u32/fp8 以外的一切）保持标量。</li>
+</ul>
+<p>宽度为 <code>n > 1</code> 的折叠变成 <code>LOAD(SHRINK(buf, offset, n))</code>，旧的 load 被替换为 <code>INDEX(load, lane)</code>；或变成 <code>STORE(SHRINK(..), STACK(values))</code>。<code>SHRINK</code> 携带分组形状；内存 dtype 仍为标量。<code>DMC=1</code> 禁用此 pass。在完整示例中，四个展开的 load 变成一个 <code>LOAD(SHRINK(PARAM(1), R0*4 + R1*64, 4))</code>，LLVM 后端将其渲染为 <code>load &lt;4 x float></code>。</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=17--自底向上的逐元素--图像-pass>17 —— 自底向上的逐元素 / 图像 pass<a href=#17--自底向上的逐元素--图像-pass class=hash-link aria-label="17 —— 自底向上的逐元素 / 图像 pass的直接链接" title="17 —— 自底向上的逐元素 / 图像 pass的直接链接" translate=no>​</a></h2>
+<p><code>symbolic_simple + no_vectorized_alu + pm_simplify_add_image</code>，通过 <code>graph_rewrite_bottom_up</code> 和 <code>AddImageContext</code> 应用。图像规则把对 f32 图像缓冲区的 f16 访问规范化（<code>LOAD</code> → <code>LOAD.cast(f16)</code>、<code>STORE(value.cast(f32))</code>，并去掉 <code>CAST(CAST(x, f16), f32)</code> 往返转换）。图像缓冲区的<em>创建</em>在 Svod 中没有对应目标；这些规则只服务于已有的图像访问。<code>no_vectorized_alu</code> 再次运行，因为图像重写可能重新引入带形状的算子。</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=16--额外符号化简>16 —— 额外符号化简<a href=#16--额外符号化简 class=hash-link aria-label="16 —— 额外符号化简的直接链接" title="16 —— 额外符号化简的直接链接" translate=no>​</a></h2>
+<p><code>extra_symbolic_patterns = sym() + indexing_simplify()</code>。这里的索引有意仍为 <code>WeakInt</code>：<code>sym</code> 和 <code>indexing_simplify</code> 的分配律规则与索引有效性规则需要弱 dtype，所以这是它们最后的机会。（该标签与内存合并访问的标签冲突；两者都在 <code>SVOD_DUMP_STAGE=16</code> 下打印。）</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=17--索引-dtype-降级>17 —— 索引 dtype 降级<a href=#17--索引-dtype-降级 class=hash-link aria-label="17 —— 索引 dtype 降级的直接链接" title="17 —— 索引 dtype 降级的直接链接" translate=no>​</a></h2>
+<p><code>lower_index_patterns = symbolic_simple + pm_fold_cast_const + pm_lower_index_dtype + indexing_simplify</code>，每个内核一个 <code>WeakMemo</code>（对应 Tinygrad 的单个 <code>ctx={}</code>）。移植自 <code>tinygrad/uop/weak.py</code>。</p>
+<p><code>select_dtype(u)</code>：<code>WeakFloat</code> → 默认浮点类型；<code>vmin</code>/<code>vmax</code> 落在 <code>i32</code> 范围内的整数 → 默认整数类型，否则为 <code>Int64</code>；向量数量保持不变。</p>
+<p><code>pm_lower_index_dtype</code> 组合了：</p>
 <ol>
-<li class=""><strong>为叶节点创建具体包装器</strong>（CONST、VCONST、PARAM）——每个都变成 <code>concrete.cast(weak)</code></li>
-<li class=""><strong>向上处理包装值</strong>（Unary、Binary、WHERE、RANGE、STACK、SPECIAL）——在树中传播具体类型</li>
-<li class=""><strong>在任何非弱类型的消费者处吸收这些 cast</strong>，消费者在自己的边上采用具体 dtype</li>
+<li class=""><code>pm_commit_weak</code> —— 若 <code>Binary</code>/<code>Ternary</code> 带有弱类型源且 <code>least_upper_dtype</code> 非弱，则把弱类型源确定为该类型（<code>commit_weak</code>：<code>CONST</code> 直接改类型，其他一律做类型转换）；值为弱类型的 <code>STORE</code> 把值确定为索引的 dtype。</li>
+<li class=""><code>pm_cast_weak</code> —— <code>CAST(weak_alu, concrete)</code> 把具体 dtype 推入该 ALU 的源。</li>
+<li class=""><code>SHRINK</code> 的偏移/大小用 <code>select_dtype</code> 确定。</li>
+<li class="">任何带弱类型源的非弱节点 → <code>lower_weak_srcs</code>：每个弱类型源用 <code>pm_lower_weak</code> 重写（按源 id 记忆化），末尾的弱 <code>CAST</code> 由消费者自己的边吸收。<code>pm_lower_weak</code> 是三阶段级联：
+<ul>
+<li class="">叶子：<code>CONST</code>/<code>VCONST</code>/标量 <code>PARAM</code> 变成 <code>concrete.cast(weak)</code>；</li>
+<li class=""><code>Unary</code>、<code>Binary</code>、<code>WHERE</code>（跳过条件）、<code>RANGE</code>、<code>STACK</code>、<code>SPECIAL</code>（<code>lower_weak_node</code>）：解开源上的弱类型转换，计算具体 dtype（二元算子取 <code>select_dtype(u)</code> 与各源的 <code>least_upper_dtype</code>；其他情况用 <code>dtype_from_op</code>），把每个源转换为该类型，除 <code>STACK</code> 外在结果上保留一个弱 <code>CAST</code>；</li>
+<li class="">弱 dtype 的 <code>INDEX</code>：缓冲区转换为选定的 dtype，每个弱索引被确定；</li>
+<li class=""><code>CAST(weak, CAST(weak, x))</code>：确定内层转换，保留外层。</li>
+</ul>
+</li>
+<li class="">若 <code>INDEX</code>（或 <code>SHRINK</code>）的带 gate 索引已经是 <code>Int64</code>，当缓冲区元素数落在 <code>i32</code> 范围内时会被收窄回 <code>Int32</code>。</li>
 </ol>
-<p>每种操作类型有特定的模式：</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>操作<th>之前<th>之后<tbody><tr><td>二元操作<td><code>ADD(WeakInt, WeakInt)</code><td><code>ADD(i32, i32)</code> 带类型转换<tr><td>CONST<td><code>CONST(5): WeakInt</code><td><code>CONST(5): i32</code> 包在 <code>.cast(WeakInt)</code> 中<tr><td>WHERE<td><code>WHERE(c, WeakInt, WeakInt)</code><td><code>WHERE(c, i32, i32)</code>（条件被跳过）<tr><td>RANGE<td><code>RANGE(end: WeakInt)</code><td><code>RANGE(end: i32)</code> 带类型转换<tr><td>SPECIAL<td><code>SPECIAL(gidx)</code><td>由该操作的取值范围得出的具体整数（实践中是默认整数类型）<tr><td>PARAM（变量）<td><code>PARAM: WeakInt</code><td>如果范围适合则 i32，否则 i64<tr><td>STACK<td><code>STACK(WeakInt...)</code><td>STACK 上是标量 dtype，每条 lane 单独转换<tr><td>双重弱 CAST<td><code>CAST(weak, CAST(weak, x))</code><td>内层 cast 落实为具体 dtype，外层弱 cast 保留</table>
-<p><code>select_dtype()</code> 函数使用 vmin/vmax 范围分析来确定 i32 还是 i64：</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">dtype = default_int if bounds fit in [-2^31, 2^31-1] else i64</span><br/></div></code></pre></div></div>
-<p>它同时还把 <code>WeakFloat</code> 解析为默认浮点类型，并为无符号和布尔范围提供了独立的分支。</p>
-<p><strong>Svod</strong>：<code>symbolic/index_lowering.rs</code></p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=devectorizer-周边的额外-pass>Devectorizer 周边的额外 Pass<a href=#devectorizer-周边的额外-pass class=hash-link aria-label="Devectorizer 周边的额外 Pass的直接链接" title="Devectorizer 周边的额外 Pass的直接链接" translate=no>​</a></h2>
-<p>Svod 在 Stage 14 和 index lowering 之间运行了几个 pass，22 阶段编号并没有为它们命名：</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pass<th>用途<tbody><tr><td><code>sym()</code>（早期符号化）<td>图变成标量之后做完整的符号化简<tr><td><code>memory_coalescing</code><td>把相邻访问合并成更宽的访问<tr><td><code>pm_simplify_add_image</code>（自底向上）<td>image 数据类型的地址化简，与 <code>no_vectorized_alu</code> 一起<tr><td><code>extra_symbolic_patterns</code><td><code>sym() + indexing_simplify</code>，在索引有效性规则还能触发的时候让索引保持弱类型</table></div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/architecture/codegen/devectorizer.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>编辑此页</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label=文件选项卡><a class="pagination-nav__link pagination-nav__link--prev" href=/zh-Hans/docs/architecture/codegen/expander><div class=pagination-nav__sublabel>上一页</div><div class=pagination-nav__label>阶段 2 — Expander</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/zh-Hans/docs/architecture/codegen/linearizer><div class=pagination-nav__sublabel>下一页</div><div class=pagination-nav__label>阶段 4 — Linearizer</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#stage-11移除-reduce class="table-of-contents__link toc-highlight">Stage 11：移除 Reduce</a><li><a href=#stage-12添加-gpu-维度 class="table-of-contents__link toc-highlight">Stage 12：添加 GPU 维度</a><li><a href=#stage-13添加-load class="table-of-contents__link toc-highlight">Stage 13：添加 Load</a><li><a href=#stage-14devectorize class="table-of-contents__link toc-highlight">Stage 14：Devectorize</a><li><a href=#stage-15降低-index-dtype class="table-of-contents__link toc-highlight">Stage 15：降低 Index DType</a><li><a href=#devectorizer-周边的额外-pass class="table-of-contents__link toc-highlight">Devectorizer 周边的额外 Pass</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>文档</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/zh-Hans/docs/introduction>简介</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>社区</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>
+<p>在这一阶段 <code>WHERE(valid, idx, Invalid)</code> 保持其形状：<code>lower_weak_node</code> 不会触碰 <code>Invalid</code> 源。在完整示例中，每个 <code>WeakInt</code> 都变成 <code>Int32</code>（<code>RANGE(R0, Reduce) : Scalar(Int32)</code>），<code>PARAM</code> 的大小也变成 <code>Int32</code> 常量。</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=18--最终符号化简>18 —— 最终符号化简<a href=#18--最终符号化简 class=hash-link aria-label="18 —— 最终符号化简的直接链接" title="18 —— 最终符号化简的直接链接" translate=no>​</a></h2>
+<p>在具体类型的图上运行 <code>symbolic()</code>（第 2 层，没有 <code>pm_simplify_valid</code>/lane 折叠）。开启 <code>SVOD_SPEC</code> 时，<code>verify_no_legacy_index_dtype</code> 断言没有 <code>WeakInt</code> 残留。</div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/architecture/codegen/devectorizer.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>编辑此页</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label=文件选项卡><a class="pagination-nav__link pagination-nav__link--prev" href=/zh-Hans/docs/architecture/codegen/expander><div class=pagination-nav__sublabel>上一页</div><div class=pagination-nav__label>Expander 与归约</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/zh-Hans/docs/architecture/codegen/linearizer><div class=pagination-nav__sublabel>下一页</div><div class=pagination-nav__label>后期重写与线性化器</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#12--gpu-维度 class="table-of-contents__link toc-highlight">12 —— GPU 维度</a><li><a href=#13--loads class="table-of-contents__link toc-highlight">13 —— loads</a><li><a href=#14--去向量化 class="table-of-contents__link toc-highlight">14 —— 去向量化</a><li><a href=#15--早期符号化简 class="table-of-contents__link toc-highlight">15 —— 早期符号化简</a><li><a href=#16--内存合并访问 class="table-of-contents__link toc-highlight">16 —— 内存合并访问</a><li><a href=#17--自底向上的逐元素--图像-pass class="table-of-contents__link toc-highlight">17 —— 自底向上的逐元素 / 图像 pass</a><li><a href=#16--额外符号化简 class="table-of-contents__link toc-highlight">16 —— 额外符号化简</a><li><a href=#17--索引-dtype-降级 class="table-of-contents__link toc-highlight">17 —— 索引 dtype 降级</a><li><a href=#18--最终符号化简 class="table-of-contents__link toc-highlight">18 —— 最终符号化简</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>文档</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/zh-Hans/docs/introduction>简介</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>社区</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

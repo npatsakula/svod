@@ -1,0 +1,250 @@
+<!doctype html><html lang=ru dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-backends/metal" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>Metal-бэкенд | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/ru/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/ru/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/ru/docs/backends/metal /><meta data-rh=true property=og:locale content=ru /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=ru /><meta data-rh=true name=docsearch:language content=ru /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="Metal-бэкенд | Svod"/><meta data-rh=true name=description content="Svod работает на GPU Apple через Metal. Бэкенд написан напрямую поверх"/><meta data-rh=true property=og:description content="Svod работает на GPU Apple через Metal. Бэкенд написан напрямую поверх"/><link data-rh=true rel=icon href=/ru/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/ru/docs/backends/metal /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/metal hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/backends/metal hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/backends/metal hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/backends/metal hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/metal hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/ru/docs/backends/metal","name":"Metal","position":1}]}</script><link rel=stylesheet href=/ru/assets/css/styles.e76ef093.css /><script src=/ru/assets/js/runtime~main.48b5c01b.js defer></script><script src=/ru/assets/js/main.10acc0e1.js defer></script></head><body><svg style="display: none;"><defs>
+<symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
+</defs></svg>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-fe0")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/ru/img/logo.svg /><div role=region aria-label="Перейти к основному содержимому"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>Перейти к основному содержимому</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Переключить навигационную панель" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/ru/><div class=navbar__logo><img src=/ru/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/ru/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/ru/docs/introduction>Документация</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>Русский</a><ul class=dropdown__menu><li><a href=/docs/backends/metal target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/backends/metal target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/backends/metal target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=ru>Русский</a><li><a href=/hi/docs/backends/metal target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Переключение между темным и светлым режимом (сейчас используется system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Прокрутка к началу" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/ru/docs/introduction><span class=linkLabel_WmDU>Введение</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/examples><span class=categoryLinkLabel_W154>Начало работы</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/architecture/ir-design><span class=categoryLinkLabel_W154>Архитектура</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile-ядра (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/ru/docs/backends/overview><span class=categoryLinkLabel_W154>Бэкенды</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/backends/overview><span class=linkLabel_WmDU>Обзор</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/backends/cpu><span class=linkLabel_WmDU>CPU</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/backends/jit-loader><span class=linkLabel_WmDU>ELF JIT-загрузчик</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/ru/docs/backends/metal><span class=linkLabel_WmDU>Metal</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/ru/docs/backends/amd/overview><span class=categoryLinkLabel_W154>Бэкенд AMD</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/ru/docs/backends/cuda/overview><span class=categoryLinkLabel_W154>Бэкенд CUDA</span></a></div></ul></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label="Навигационная цепочка текущей страницы"><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Главная страница" class=breadcrumbs__link href=/ru/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>Бэкенды</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>Metal</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">Содержание этой страницы</button></div><div class="theme-doc-markdown markdown"><header><h1>Metal-бэкенд</h1></header>
+<p>Svod работает на GPU Apple через Metal. Бэкенд написан напрямую поверх
+рантайма Objective-C: <code>libobjc</code>, <code>Metal.framework</code> и приватный
+<code>MTLCompiler.framework</code> <code>dlopen</code>-ятся во время выполнения, и каждый вызов — это
+<code>objc_msgSend</code> с вручную объявленной C-сигнатурой (<code>device/src/metal/objc.rs</code>).
+Нет ни крейта <code>objc2</code> или <code>metal</code>, ни cargo-фичи, ни гейта <code>cfg(target_os)</code>:
+модуль компилируется и проходит проверку типов на любом хосте, а машина с
+Linux просто проваливает <code>dlopen</code> и никогда не регистрирует устройство. Ядра
+рендерятся в Metal Shading Language диалектом Metal C-рендерера
+(<code>codegen/src/c/metal.rs</code>) и компилируются в metallib в процессе.</p>
+<p>Код находится в <code>device/src/metal/</code> (устройство, аллокатор, компиляция,
+программа, граф, профилировщик Metal 4), <code>runtime/src/devices/metal.rs</code>
+(фабрика устройства) и <code>codegen/src/c/metal.rs</code> (диалект).</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=статус>Статус<a href=#статус class=hash-link aria-label="Прямая ссылка на Статус" title="Прямая ссылка на Статус" translate=no>​</a></h2>
+<p>Бэкенд появился в сентябре 2026 года и опробован на одном семействе железа:
+<strong>Apple9</strong> (класс M3/M4) под macOS 26, где зелёные тестовый набор тензоров,
+набор ONNX (<code>METAL:0</code> и <code>CPU</code> проходят одни и те же 4577 случаев) и
+аппаратные тесты <code>tk</code>, а flash attention и GEMM работают через
+<code>simdgroup_matrix</code>. Пути, написанные для старых систем (публичный запасной путь
+компиляции <code>newLibraryWithSource:</code>, обход для indirect command buffers до
+Apple9, языковые стандарты <code>metal3.x</code> / <code>metal2.0</code>), реализованы, но не
+проверены на таком железе. Аппаратные тесты сами себя пропускают, когда
+устройства Metal нет, поэтому CI на Linux запускает только тесты на стороне
+хоста.</p>
+<p>Поддерживается только системное устройство по умолчанию (<code>METAL:0</code>); перечисление
+через <code>MTLCopyAllDevices</code> — задача на будущее (<code>device/src/metal/device.rs</code>).</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=выбор-устройства>Выбор устройства<a href=#выбор-устройства class=hash-link aria-label="Прямая ссылка на Выбор устройства" title="Прямая ссылка на Выбор устройства" translate=no>​</a></h2>
+<p><code>METAL[:N]</code> — единственное написание (псевдонимы в стиле <code>HIP</code> есть для AMD и
+CUDA, для Metal их нет). На macOS это ещё и <strong>платформенное устройство по
+умолчанию</strong>: <code>default_device()</code> разрешается в <code>METAL:0</code>, когда устройство ничем
+не выбрано, поэтому <code>SVOD_DEVICE=CPU</code> — это способ вернуть Mac на CPU-бэкенд
+(<code>dtype/src/default_device.rs</code>).</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=METAL:0 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav</span><br/></div></code></pre></div></div>
+<p><code>svod_device::metal::has_devices()</code> загружает рантайм Objective-C и вызывает
+<code>MTLCreateSystemDefaultDevice</code>; реестр устройств рантайма регистрирует фабрику
+<code>"METAL"</code>, только если это удалось. Открытие пишет в лог одну строку <code>info</code> с
+именем устройства и семейством GPU (<code>RUST_LOG=svod_device=info</code>).</p>
+<p>Семейство определяется через <code>supportsFamily:</code> от Apple12 вниз до Apple1, затем
+Mac2, и хранится как <code>MetalFamily { Unknown, Mac2, Apple(n) }</code>. Это <code>gpu_arch</code>
+рендерера; оно входит в ключ кэша объектов и выбирает профиль оптимизатора
+(<code>OptimizerRenderer::for_metal_family</code>): тензорным ядрам <code>simdgroup_matrix</code>
+нужен Apple7 или новее.</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=codegen-диалект-msl>Codegen: диалект MSL<a href=#codegen-диалект-msl class=hash-link aria-label="Прямая ссылка на Codegen: диалект MSL" title="Прямая ссылка на Codegen: диалект MSL" translate=no>​</a></h2>
+<p><code>CRenderer::metal()</code> — это C-рендерер CPU с <code>CDialect::Metal</code>; вывод Clang от
+его существования не меняется. Ядро рендерится как</p>
+<div class="language-c codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-c codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token macro property directive-hash" style=color:#36acaa>#</span><span class="token macro property directive keyword" style=color:#00009f>include</span><span class="token macro property" style=color:#36acaa> </span><span class="token macro property string" style=color:#e3116c>&lt;metal_stdlib></span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">using namespace metal</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">kernel </span><span class="token keyword" style=color:#00009f>void</span><span class="token plain"> </span><span class="token function" style=color:#d73a49>r_64_32</span><span class="token punctuation" style=color:#393A34>(</span><span class="token plain">device </span><span class="token keyword" style=color:#00009f>float</span><span class="token operator" style=color:#393A34>*</span><span class="token plain"> data0</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> device </span><span class="token keyword" style=color:#00009f>float</span><span class="token operator" style=color:#393A34>*</span><span class="token plain"> data1</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> constant </span><span class="token keyword" style=color:#00009f>int</span><span class="token operator" style=color:#393A34>&</span><span class="token plain"> data2</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                    uint3 gid </span><span class="token punctuation" style=color:#393A34>[</span><span class="token punctuation" style=color:#393A34>[</span><span class="token plain">threadgroup_position_in_grid</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                    uint3 lid </span><span class="token punctuation" style=color:#393A34>[</span><span class="token punctuation" style=color:#393A34>[</span><span class="token plain">thread_position_in_threadgroup</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  threadgroup </span><span class="token keyword" style=color:#00009f>__attribute__</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>(</span><span class="token function" style=color:#d73a49>aligned</span><span class="token punctuation" style=color:#393A34>(</span><span class="token number" style=color:#36acaa>16</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token keyword" style=color:#00009f>float</span><span class="token plain"> local0</span><span class="token punctuation" style=color:#393A34>[</span><span class="token number" style=color:#36acaa>32</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  </span><span class="token punctuation" style=color:#393A34>.</span><span class="token punctuation" style=color:#393A34>.</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token punctuation" style=color:#393A34>}</span><br/></div></code></pre></div></div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Понятие<th>Диалект Clang<th>Диалект Metal<tbody><tr><td>параметр-буфер<td><code>float* restrict data0</code><td><code>device float* data0</code><tr><td>скалярный параметр<td><code>const int data2</code><td><code>constant int& data2</code><tr><td>идентификаторы запуска<td>переменная <code>core_id</code><td><code>gid.xyz</code> (<code>gidx*</code> / <code>idx*</code>), <code>lid.xyz</code> (<code>lidx*</code>), добавляются после списка PARAM<tr><td>локальный буфер<td>массив на стеке<td><code>threadgroup __attribute__((aligned(16))) T localN[size]</code><tr><td>барьер<td>нет<td><code>threadgroup_barrier(mem_flags::mem_threadgroup)</code><tr><td>адресные пространства<td>нет<td><code>device</code> / <code>threadgroup</code> / <code>thread</code> в приведениях указателей<tr><td>16-битные float<td><code>_Float16</code><td><code>half</code>, <code>bfloat</code><tr><td>bitcast<td>union / memcpy<td><code>as_type&lt;T>()</code></table>
+<p>Атрибутов <code>[[buffer(n)]]</code> нет: Metal связывает аргументы <strong>позиционно</strong>, так что
+индекс привязки параметра — это его позиция в сигнатуре, и загрузчик это
+отражает (см. ниже). Осей сетки не больше трёх; планировщик сворачивает
+дополнительные глобальные оси (<code>global_max</code> в профиле оптимизатора Metal).</p>
+<p><strong>Типы.</strong> Float64, все форматы fp8 и векторы шире 4 отвергаются при рендеринге
+(<code>reject_unsupported_metal_dtypes</code>, <code>codegen/src/c/types.rs</code>); планировщик
+заранее понижает внутренние f64 до f32. Арифметика bf16 повышается через
+<code>float</code>, а сужение до bf16 использует набор паттернов целочисленного округления
+к ближайшему чётному.</p>
+<p><strong>Математика.</strong> <code>sqrt</code>, <code>exp2</code> и <code>log2</code> нативные; <code>sin</code> рендерится как
+<code>precise::sin</code>; <code>exp</code>, <code>log</code>, <code>cos</code>, <code>tan</code> и <code>erf</code> (в MSL нет <code>erf</code>)
+декомпозируются общими <code>amd_decomposition_patterns()</code> поверх нативных
+<code>exp2</code>/<code>log2</code>, как на AMD. <code>extra_matcher</code> рендерера — тот же, что у CPU
+(<code>cpu_extra_matcher()</code>). Fast math выключен везде (<code>-fno-fast-math</code> или
+<code>MTLMathModeSafe</code> на публичном пути), чтобы держались общие допуски тестов.</p>
+<p><strong>Тензорные ядра.</strong> <code>Wmma</code> понижается в хелпер для каждой формы поверх
+<code>simdgroup_&lt;T>8x8</code> и <code>simdgroup_multiply_accumulate</code>: одна форма, 8×8×8 на 32
+потоках по два элемента на полосу, для f32→f32, f16→f32, f16→f16, bf16→f32 и
+bf16→bf16 (<code>METAL_888</code> в профиле оптимизатора). <code>tk</code> добавляет билдеры
+<code>simd_shuffle</code>, <code>simd_shuffle_xor</code> и <code>simdgroup_barrier</code>
+(<code>codegen/src/c/metal.rs</code>), из которых и собраны ядра flash attention и GEMM
+для Apple.</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=путь-компиляции>Путь компиляции<a href=#путь-компиляции class=hash-link aria-label="Прямая ссылка на Путь компиляции" title="Прямая ссылка на Путь компиляции" translate=no>​</a></h2>
+<p><code>compile_msl</code> (<code>device/src/metal/compile.rs</code>) отправляет исходник в приватный
+<code>MTLCodeGenService</code> Apple — тот же путь, что использует tinygrad, — и получает
+metallib (magic <code>MTLB</code>, трейлер <code>ENDT</code>) через вручную собранный
+callback-блок Objective-C, с таймаутом 60 с и по одному запросу за раз. Флаги:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">-fno-fast-math -std=&lt;std> --driver-mode=metal -x metal -fno-caret-diagnostics</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">-fmodules-cache-path=&lt;cache>/metal-modules</span><br/></div></code></pre></div></div>
+<p>где <code>&lt;std></code> следует мажорной версии macOS (<code>metal4.0</code> на 26+, <code>metal3.1</code> на
+14–25, <code>metal3.0</code> на 13, <code>macos-metal2.0</code> раньше), а кэш модулей сокращает
+разбор <code>metal_stdlib</code> примерно с 250 мс примерно до 8 мс.</p>
+<p><code>MTLCompiler.framework</code> загружает собственную libLLVM с <code>RTLD_GLOBAL</code>, которая не
+может сосуществовать с libLLVM CPU-бэкенда в процессе, поэтому оба
+соревнуются за один слот (<code>claim_inprocess_llvm</code>). Проигравший эту гонку или
+система без приватного фреймворка идёт по <code>compile_msl_public</code>: одна компиляция
+<code>newLibraryWithSource:options:error:</code>, чтобы всплыли диагностики, после чего
+полезной нагрузкой становится <strong>сам исходник MSL</strong>, и загрузчик программы
+компилирует его снова при загрузке. Обе нагрузки делят одну запись кэша
+объектов:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">backend:             metal</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">target_architecture: Apple9/air64</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">toolchain:           macos=26.0</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">flags:               -fno-fast-math -std=metal4.0 --driver-mode=metal -x metal -fno-caret-diagnostics</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">abi:                 msl-kernel-abi-v1</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">object_format:       metallib-or-msl-v1</span><br/></div></code></pre></div></div>
+<p>Транспорт намеренно не входит в идентичность: воркер BEAM, выигравший слот
+libLLVM, и его родитель, проигравший его, должны сходиться в ключе.</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=программы-и-запуски>Программы и запуски<a href=#программы-и-запуски class=hash-link aria-label="Прямая ссылка на Программы и запуски" title="Прямая ссылка на Программы и запуски" translate=no>​</a></h2>
+<p><code>MetalProgram::load</code> принимает любую из нагрузок (<code>newLibraryWithData:</code> для
+metallib, <code>newLibraryWithSource:</code> для MSL), связывает функцию через
+<code>newFunctionWithName:</code> и строит пайплайн с
+<code>setSupportIndirectCommandBuffers:YES</code>, читая <code>maxTotalThreadsPerThreadgroup</code>,
+<code>threadExecutionWidth</code> и <code>staticThreadgroupMemoryLength</code>.</p>
+<p>Аргументы связываются по позиции: буферы — через <code>setBuffer:offset:atIndex:</code>
+(указатель хоста разрешается в свою пару <code>(MTLBuffer, offset)</code> через
+<code>PointerRegistry</code> устройства — <code>BTreeMap</code> с ключом по базе буфера), скаляры —
+через <code>setBytes</code> как 4-байтные <code>i32</code>; значение вне <code>i32</code> — ошибка времени
+выполнения. Слоты ABI должны возрастать и могут иметь пропуски, до 31 привязки
+(<code>MAX_BUFFER_BINDINGS</code>). <code>global_size</code> — это число threadgroup, а <code>local_size</code> —
+число потоков в группе; они передаются через
+<code>dispatchThreadgroups:threadsPerThreadgroup:</code>; ядро без локальных осей
+выполняет один поток на группу, а группа больше
+<code>maxTotalThreadsPerThreadgroup</code> отвергается.</p>
+<p>Каждая диспетчеризация — это один command buffer, помеченный именем ядра, в
+единственной очереди глубиной 1024. При <code>wait = false</code> он попадает в список
+<code>in_flight</code> устройства; <code>MetalDevice::synchronize</code> ждёт каждую запись через
+<code>waitUntilCompleted</code> и поднимает первый <code>NSError</code>. Доступ хоста к буферу
+сначала дренирует устройство. <code>execute_timed</code> читает <code>GPUStartTime</code> /
+<code>GPUEndTime</code> command buffer'а, и именно по ним BEAM ранжирует кандидатов.</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=память>Память<a href=#память class=hash-link aria-label="Прямая ссылка на Память" title="Прямая ссылка на Память" translate=no>​</a></h2>
+<p>Каждое выделение — это один <code>MTLBuffer</code> в <code>MTLResourceStorageModeShared</code>:
+Apple silicon имеет унифицированную память, поэтому флаги <code>BufferSpec</code>
+игнорируются, а <code>copyin</code> / <code>copyout</code> / <code>_transfer</code> — это <code>memcpy</code> / <code>memmove</code>
+хоста над <code>contents</code> после <code>synchronize()</code>. Нет ни private-, ни
+managed-буферов и нет blit-энкодеров. Освобождение сначала дренирует
+устройство; если дренирование не удалось, выделение утекает, а не
+освобождается из-под работающего ядра.</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=графы>Графы<a href=#графы class=hash-link aria-label="Прямая ссылка на Графы" title="Прямая ссылка на Графы" translate=no>​</a></h2>
+<p><code>MetalGraph::capture</code> записывает цепочку ядер в один <code>MTLIndirectCommandBuffer</code>
+из команд <code>ConcurrentDispatch</code>, каждая с <code>setBarrier</code>, так что порядок захвата
+сохраняется. Воспроизведение — это один command buffer:
+<code>useResources:count:usage:</code> на связанных буферах, затем
+<code>executeCommandsInBuffer:withRange:</code>. <code>replay</code> ждёт предыдущее воспроизведение
+и перепривязывает только слоты, у которых сменился буфер. Захват отказывается
+(<code>Ok(None)</code>, вместо этого — диспетчеризация по вызовам) для пустой цепочки,
+программы, не являющейся <code>MetalProgram</code>, устройства, в имени которого есть
+«virtual» (паравиртуализированные GPU в CI ломают ICB), смещения больше 32 бит
+или <strong>любого скалярного аргумента</strong> — цепочка с символьными формами не
+превращается в граф. Ниже Apple9 применяется обход tinygrad <code>FIX_METAL_ICB</code>
+(одна пустая диспетчеризация на пайплайн).</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=профилирование>Профилирование<a href=#профилирование class=hash-link aria-label="Прямая ссылка на Профилирование" title="Прямая ссылка на Профилирование" translate=no>​</a></h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Уровень<th>На Metal<th>Источник<tbody><tr><td>1 — время устройства<td>да<td><code>GPUStartTime</code> / <code>GPUEndTime</code> на command buffer; внутри графа — counter heap Metal 4 (macOS 26+) или по одному command buffer на ядро<tr><td>2 — roofline<td>да<td>не зависит от бэкенда<tr><td>3 — статические ресурсы<td>частично<td><code>lds_bytes</code> из <code>staticThreadgroupMemoryLength</code>, <code>wave_size</code> из <code>threadExecutionWidth</code>, <code>occupancy</code> как <code>maxTotalThreadsPerThreadgroup / 1024</code>; числа регистров нет<tr><td>4 — аппаратные счётчики<td>нет<td></table>
+<p><code>Mtl4Profiler</code> (<code>device/src/metal/mtl4.rs</code>) существует только для
+профилированного воспроизведения графа: он выполняет каждую косвенную команду
+отдельно в command buffer Metal 4 между двумя точными временными метками, с
+residency set над связанными буферами и ожиданием shared event. Энкодер MTL4
+молча пропускает первое выполнение косвенной команды, чей пайплайн ему не
+передали, поэтому все пайплайны сначала устанавливаются на энкодер.</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=ограничения>Ограничения<a href=#ограничения class=hash-link aria-label="Прямая ссылка на Ограничения" title="Прямая ссылка на Ограничения" translate=no>​</a></h2>
+<ul>
+<li class="">одно устройство (<code>METAL:0</code>), одна очередь команд, только shared-хранилище;</li>
+<li class="">скаляры — <code>i32</code>; нет f64, нет fp8, нет векторов шире 4;</li>
+<li class="">одна форма тензорных ядер (<code>simdgroup</code> 8×8×8);</li>
+<li class="">графы исключают цепочки со скалярными аргументами;</li>
+<li class="">нет аппаратных счётчиков, нет числа регистров, а тайминг каждой
+диспетчеризации вне графа — это метка всего command buffer;</li>
+<li class="">быстрый путь — недокументированный <code>MTLCodeGenService</code> Apple; публичный API —
+запасной путь.</li>
+</ul>
+<p>Специфичных для Metal переменных окружения нет. Действуют общие:
+<code>SVOD_DEVICE</code>, <code>SVOD_OBJECT_CACHE</code> / <code>SVOD_OBJECT_CACHE_DIR</code>, <code>XDG_CACHE_HOME</code>
+для кэша модулей и <code>RUST_LOG=svod_device=debug</code> для сообщений о захвате графа
+и отказах.</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=тесты>Тесты<a href=#тесты class=hash-link aria-label="Прямая ссылка на Тесты" title="Прямая ссылка на Тесты" translate=no>​</a></h2>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">cargo test -p svod-device metal          # host tests everywhere; hardware tests self-skip</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">cargo test -p svod-codegen metal         # MSL golden tests</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=METAL:0 cargo test -p svod-tensor   # codegen_tests! `metal` variants</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=METAL:0 cargo test -p svod-onnx</span><br/></div></code></pre></div></div></div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/backends/metal.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>Отредактировать эту страницу</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="Страница документа"><a class="pagination-nav__link pagination-nav__link--prev" href=/ru/docs/backends/jit-loader><div class=pagination-nav__sublabel>Предыдущая страница</div><div class=pagination-nav__label>ELF JIT-загрузчик</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/ru/docs/backends/amd/overview><div class=pagination-nav__sublabel>Следующая страница</div><div class=pagination-nav__label>Обзор</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#статус class="table-of-contents__link toc-highlight">Статус</a><li><a href=#выбор-устройства class="table-of-contents__link toc-highlight">Выбор устройства</a><li><a href=#codegen-диалект-msl class="table-of-contents__link toc-highlight">Codegen: диалект MSL</a><li><a href=#путь-компиляции class="table-of-contents__link toc-highlight">Путь компиляции</a><li><a href=#программы-и-запуски class="table-of-contents__link toc-highlight">Программы и запуски</a><li><a href=#память class="table-of-contents__link toc-highlight">Память</a><li><a href=#графы class="table-of-contents__link toc-highlight">Графы</a><li><a href=#профилирование class="table-of-contents__link toc-highlight">Профилирование</a><li><a href=#ограничения class="table-of-contents__link toc-highlight">Ограничения</a><li><a href=#тесты class="table-of-contents__link toc-highlight">Тесты</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Документация</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/ru/docs/introduction>Введение</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Сообщество</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

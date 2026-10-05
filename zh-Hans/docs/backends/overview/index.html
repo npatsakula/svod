@@ -1,0 +1,195 @@
+<!doctype html><html lang=zh-CN dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-backends/overview" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>后端 | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/zh-Hans/docs/backends/overview /><meta data-rh=true property=og:locale content=zh_CN /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=zh-Hans /><meta data-rh=true name=docsearch:language content=zh-Hans /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="后端 | Svod"/><meta data-rh=true name=description content="后端是渲染后内核之下的一切：把 UOp IR 变成源码的渲染器、把源码变成目标文件的"/><meta data-rh=true property=og:description content="后端是渲染后内核之下的一切：把 UOp IR 变成源码的渲染器、把源码变成目标文件的"/><link data-rh=true rel=icon href=/zh-Hans/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/zh-Hans/docs/backends/overview /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/overview hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/backends/overview hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/backends/overview hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/backends/overview hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/overview hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/zh-Hans/docs/backends/overview","name":"概览","position":1}]}</script><link rel=stylesheet href=/zh-Hans/assets/css/styles.e76ef093.css /><script src=/zh-Hans/assets/js/runtime~main.53f2793a.js defer></script><script src=/zh-Hans/assets/js/main.b4210e06.js defer></script></head><body><svg style="display: none;"><defs>
+<symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
+</defs></svg>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-5c8")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/zh-Hans/img/logo.svg /><div role=region aria-label=跳到主要内容><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>跳到主要内容</a></div><nav aria-label=主导航 class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label=切换导航栏 aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/zh-Hans/><div class=navbar__logo><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/zh-Hans/docs/introduction>文档</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>简体中文</a><ul class=dropdown__menu><li><a href=/docs/backends/overview target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/backends/overview target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=zh-CN>简体中文</a><li><a href=/ru/docs/backends/overview target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/backends/overview target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="切换浅色/暗黑模式（当前为system mode）"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=搜索 aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label=回到顶部 class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label=文档侧边栏 class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/zh-Hans/docs/introduction><span class=linkLabel_WmDU>简介</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/examples><span class=categoryLinkLabel_W154>快速上手</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/architecture/ir-design><span class=categoryLinkLabel_W154>架构</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile 内核 (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/zh-Hans/docs/backends/overview><span class=categoryLinkLabel_W154>后端</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/zh-Hans/docs/backends/overview><span class=linkLabel_WmDU>概览</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/cpu><span class=linkLabel_WmDU>CPU</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/jit-loader><span class=linkLabel_WmDU>ELF JIT 加载器</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/metal><span class=linkLabel_WmDU>Metal</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/zh-Hans/docs/backends/amd/overview><span class=categoryLinkLabel_W154>AMD 后端</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/zh-Hans/docs/backends/cuda/overview><span class=categoryLinkLabel_W154>CUDA 后端</span></a></div></ul></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=页面路径><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label=主页面 class=breadcrumbs__link href=/zh-Hans/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>后端</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>概览</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">本页总览</button></div><div class="theme-doc-markdown markdown"><header><h1>后端</h1></header>
+<p>后端是渲染后内核之下的一切：把 UOp IR 变成源码的渲染器、把源码变成目标文件的
+编译器、把目标文件变成可调用 <code>Program</code> 的加载器、一个分配器，以及可选的
+graph。Svod 提供四个后端，全部位于同一个二进制文件中；给定宿主上具体存在哪些，
+在运行时决定。</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>设备<th>硬件<th>渲染器<th>编译路径<th>Graph 重放<th>状态<tbody><tr><td><a class="" href=/zh-Hans/docs/backends/cpu><code>CPU</code></a><td>x86_64、aarch64、riscv64、loongarch64、ppc64le<td>LLVM IR 文本（默认）或 C<td>进程内 libLLVM，否则 <code>clang -c</code>；<a class="" href=/zh-Hans/docs/backends/jit-loader>内存内 ELF 加载器</a><td>无（同步调用）<td>生产可用<tr><td><a class="" href=/zh-Hans/docs/backends/amd/overview><code>AMD:N</code></a><td>CDNA3、RDNA3、RDNA3.5、RDNA4（Linux，KFD）<td>LLVM IR 文本，AMDGPU 目标<td>以 <code>amdgcn</code> 目标调用 <code>clang</code> → 加载进 VRAM 的 ELF 代码对象<td>AQL 命令流（PM4 需显式启用）<td>生产可用<tr><td><a class="" href=/zh-Hans/docs/backends/cuda/overview><code>CUDA:N</code></a><td>NVIDIA，驱动 CUDA 12.0+<td>LLVM IR 文本，NVPTX 目标<td>以 NVPTX 目标调用 <code>clang</code> → PTX，已安装时用 <code>ptxas</code>，否则用驱动 JIT<td>CUDA graphs<td>生产可用<tr><td><a class="" href=/zh-Hans/docs/backends/metal><code>METAL:N</code></a><td>Apple GPU<td>C，Metal 方言<td>进程内的 Apple <code>MTLCodeGenService</code> → metallib<td>间接命令缓冲区<td>已在 Apple9 / macOS 26 上验证</table>
+<p>每个后端编译出的目标文件都经过同一个磁盘目标缓存，其键由源码和每个后端各自的
+<code>CompilerIdentity</code> 组成（<a class="" href=/zh-Hans/docs/backends/cpu>CPU 页面</a>）。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=选择设备>选择设备<a href=#选择设备 class=hash-link aria-label=选择设备的直接链接 title=选择设备的直接链接 translate=no>​</a></h2>
+<p><code>SVOD_DEVICE</code> 选择张量与内核的默认设备。其值按 <code>NAME[:N]</code> 不区分大小写地解析
+（<code>dtype/src/default_device.rs</code>）：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>值<th>设备<tbody><tr><td><code>CPU</code><td><code>DeviceSpec::Cpu</code><tr><td><code>AMD[:N]</code>、<code>HIP[:N]</code><td><code>DeviceSpec::Amd { device_id }</code>——KFD 拓扑中的第 N 个 GPU 节点<tr><td><code>CUDA[:N]</code>、<code>GPU[:N]</code><td><code>DeviceSpec::Cuda { device_id }</code><tr><td><code>METAL[:N]</code><td><code>DeviceSpec::Metal { device_id }</code>（只有 <code>0</code> 存在）</table>
+<p>只写 <code>NAME</code> 即设备 0。<code>NV</code> 被刻意拒绝——这个名字保留给未来的用户态 NVIDIA 驱动。
+没有任何东西选择设备时，采用平台默认值：<strong>macOS 上为 <code>METAL:0</code>，其他地方为
+<code>CPU</code></strong>。完整的优先级依次是：<code>with_default_device</code> 作用域、线程局部的
+<code>set_default_device</code>、<code>SVOD_DEVICE</code>（每个进程读取一次）、平台默认值。GPU 架构
+从不是 spec 的一部分：它是已打开设备的属性，因此一块物理 GPU 只有一个身份，
+内核缓存以设备报告的内容为键。</p>
+<p><code>svod-device</code> 中的 <code>DeviceSpecExt::parse</code> 接受同样的写法，另外还有
+<code>DISK:&lt;path></code>（一个只读、内存映射的文件设备，不能运行内核）和 <code>WEBGPU</code>，
+后者尚无分配器，会以 <code>DeviceUnavailable</code> 失败。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=运行时检测的注册>运行时检测的注册<a href=#运行时检测的注册 class=hash-link aria-label=运行时检测的注册的直接链接 title=运行时检测的注册的直接链接 translate=no>​</a></h2>
+<p>每个后端都在每台宿主上编译——AMD、CUDA 或 Metal 都没有 cargo feature。CUDA 和
+Metal 绑定是基于 <code>libloading</code> 的纯 Rust 代码，可在任何地方编译；面向 AMD 内核
+驱动的模块是 <code>cfg(unix)</code>。因此 Linux 或 macOS 上的 <code>cargo check</code> 会对它们全部做
+类型检查。后端是否<em>可用</em>，
+在设备工厂注册表首次被访问时决定
+（<code>runtime/src/device_registry.rs</code>）：</p>
+<div class="language-rust codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-rust codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">registry</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>register_factory</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"CPU"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>...</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain">                        </span><span class="token comment" style=color:#999988;font-style:italic>// always</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>if</span><span class="token plain"> </span><span class="token namespace" style=opacity:0.7>svod_device</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token namespace" style=opacity:0.7>amd</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token function" style=color:#d73a49>has_devices</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain">   </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"> registry</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>register_factory</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"AMD"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>...</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>}</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>if</span><span class="token plain"> </span><span class="token namespace" style=opacity:0.7>svod_device</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token namespace" style=opacity:0.7>metal</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token function" style=color:#d73a49>has_devices</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"> registry</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>register_factory</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"METAL"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>...</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>}</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>if</span><span class="token plain"> </span><span class="token namespace" style=opacity:0.7>svod_device</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token namespace" style=opacity:0.7>cuda</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token function" style=color:#d73a49>has_devices</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain">  </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"> registry</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>register_factory</span><span class="token punctuation" style=color:#393A34>(</span><span class="token string" style=color:#e3116c>"CUDA"</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>...</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>}</span><br/></div></code></pre></div></div>
+<p>每个探测都无副作用且带记忆化：AMD 读取 KFD sysfs 拓扑并询问是否有节点属于受支持
+的架构；Metal 对 Apple 框架执行 <code>dlopen</code> 并请求系统默认设备；CUDA 加载
+<code>libcuda.so.1</code>，绑定它用到的每个入口点，调用 <code>cuInit</code> 并统计设备数。没有对应硬件
+的宿主就根本没有这种设备类型，请求它会以 <code>UnsupportedDevice</code> 失败。到处编译一切
+的意义在于：对共享的 <code>Program</code> / <code>PlanContext</code> / <code>Graph</code> trait 的改动会在任何
+开发者机器上打破构建，而不仅仅是在装有 GPU 的那台上。</p>
+<p>注册表为每个 <code>DeviceSpec</code> 缓存一个 <code>Device</code>（<code>DEVICE_FACTORIES</code>）；构造过程——
+打开 KFD、探测工具链——在映射锁之外运行，按 spec 串行化，构造失败会让槽位保持
+为空以便重试。分配器位于 <code>svod-device</code> 中一个独立的注册表
+（<code>registry::registry()</code>），其中每个计算分配器都被包装在 <code>LruAllocator</code> 中，
+按大小和 spec 池化已释放的缓冲区。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=后端需要实现什么>后端需要实现什么<a href=#后端需要实现什么 class=hash-link aria-label=后端需要实现什么的直接链接 title=后端需要实现什么的直接链接 translate=no>​</a></h2>
+<p>一个 <code>Device</code>（<code>device/src/device.rs</code>）由五部分组成：</p>
+<div class="language-rust codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-rust codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> </span><span class="token keyword" style=color:#00009f>struct</span><span class="token plain"> </span><span class="token type-definition class-name">Device</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> device</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">DeviceSpec</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> allocator</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Arc</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token keyword" style=color:#00009f>dyn</span><span class="token plain"> </span><span class="token class-name">Allocator</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> compilers</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Vec</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token class-name">CompilerPair</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain">     </span><span class="token comment" style=color:#999988;font-style:italic>// (Arc&lt;dyn Renderer>, Arc&lt;dyn Compiler>)</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> renderer</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Arc</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token keyword" style=color:#00009f>dyn</span><span class="token plain"> </span><span class="token class-name">Renderer</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> compiler</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Arc</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token keyword" style=color:#00009f>dyn</span><span class="token plain"> </span><span class="token class-name">Compiler</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> runtime</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">RuntimeFactory</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain">          </span><span class="token comment" style=color:#999988;font-style:italic>// Fn(&CompiledSpec) -> Result&lt;Box&lt;dyn Program>></span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> graph</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Option</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token class-name">GraphFactory</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain">      </span><span class="token comment" style=color:#999988;font-style:italic>// Fn(&[GraphKernel]) -> Result&lt;Option&lt;Box&lt;dyn Graph>>></span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token punctuation" style=color:#393A34>}</span><br/></div></code></pre></div></div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Trait<th>必需方法<th>作用<tbody><tr><td><code>Renderer</code><td><code>render</code>、<code>device</code>、<code>supported_ops</code><td>UOp 图 → <code>ProgramSpec</code>（源码、入口、ABI、启动尺寸）。<code>gpu_arch</code> 选择优化器配置；<code>decompositor</code> 和 <code>extra_matcher</code> 降级目标无法选择的操作<tr><td><code>Compiler</code><td><code>compile</code>、<code>cache_key</code><td><code>ProgramSpec</code> → <code>CompiledSpec</code> 字节；<code>cache_key</code> 是作为目标缓存键的 <code>CompilerIdentity</code><tr><td><code>RuntimeFactory</code><td>—<td>把 <code>CompiledSpec</code> 加载为 <code>Program</code>；<code>Device::new</code> 对它进行包装，使每个 spec 的阶段身份先被校验<tr><td><code>Program</code><td><code>execute</code>、<code>name</code><td>一次内核启动；<code>execute_timed</code>（供 BEAM 使用的 GPU 时钟时长）、<code>new_exec_context</code>、<code>resource_usage</code> 和 <code>as_any</code> 是可选的<tr><td><code>PlanContext</code><td><code>dispatch</code>、<code>synchronize</code><td>由 <code>Program::new_exec_context</code> 创建的每个计划的状态：通道、完成令牌、时间戳、计数器（<code>set_pmc</code>）、原生链接重放（<code>replay_linked_plan</code>）<tr><td><code>Allocator</code><td><code>_alloc</code>、<code>name</code>、<code>device_spec</code><td><code>_copyin</code> / <code>_copyout</code> / <code>_transfer</code> / <code>_free</code> / <code>synchronize</code> / <code>supports_device_local</code> 是可选的，默认采用宿主内存语义<tr><td><code>Graph</code><td><code>replay</code><td>以一次提交重放的已捕获内核链；<code>completion_token</code>、<code>replay_profiled</code> 可选<tr><td><code>CompletionToken</code>、<code>TimelineSignal</code>、<code>DispatchTimestamps</code><td><td>执行器消费的同步与性能分析句柄（<code>device/src/sync.rs</code>）</table>
+<p>启动约定由所有 GPU 后端共享：<code>global_size</code> 是以工作组为单位的网格，<code>local_size</code>
+是以线程为单位的工作组；CPU 把 <code>global_size[0]</code> 用作 <code>core_id</code> 切分。内核参数是
+ABI 的 <code>PARAM</code> 槽位，按顺序排列——先指针，后 <code>i32</code> 标量——每个加载器都以同样方式
+打包（AMD 和 CUDA 上为 <code>ClikeKernargLayout</code>，Metal 上为按位置的
+<code>setBuffer</code>/<code>setBytes</code>，CPU 上为 libffi CIF）。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=添加后端>添加后端<a href=#添加后端 class=hash-link aria-label=添加后端的直接链接 title=添加后端的直接链接 translate=no>​</a></h3>
+<p><code>runtime/src/devices/</code> 中的四个工厂就是模板。每个 <code>create_*_device</code> 都做同样的
+五件事：</p>
+<ol>
+<li class="">从注册表获取其 <code>DeviceSpec</code> 对应的分配器；</li>
+<li class="">围绕一个代码生成入口点构建渲染器包装
+（<code>LlvmTextRenderer::amd(arch)</code>、<code>LlvmTextRenderer::nvptx(arch)</code>、
+<code>CRenderer::metal()</code> 或 CPU 渲染器），声明 <code>supported_ops</code>、
+分解模式和 <code>gpu_arch</code>；</li>
+<li class="">构建带有 <code>CompilerIdentity</code> 和 <code>ObjectCache</code> 的编译器，产出加载器能够校验的
+字节（<code>validate_amd_object</code>、<code>validate_ptx</code> /
+<code>validate_cubin</code>、<code>validate_metallib</code>，CPU 上为 ELF 检查）；</li>
+<li class="">安装一个 <code>RuntimeFactory</code>，把这些字节加载为该后端的
+<code>Program</code>；</li>
+<li class="">可选地调用 <code>with_graph(...)</code> 以支持捕获/重放。</li>
+</ol>
+<p>然后它以自己的设备类型字符串注册工厂，并以 <code>has_devices()</code> 探测作为门控；调度器
+还需要为新目标提供一份优化器配置（<code>OptimizerRenderer::for_*</code>：wave 大小、
+tensor core 形状、共享内存与 local 限制）。每个后端都另有一个 <code>create_*_codegen</code>，
+以便 BEAM 工作进程无需打开设备即可渲染和编译。</div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/backends/overview.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>编辑此页</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label=文件选项卡><a class="pagination-nav__link pagination-nav__link--prev" href=/zh-Hans/docs/tile-kernels/comparison><div class=pagination-nav__sublabel>上一页</div><div class=pagination-nav__label>tk、HipKittens 与 CuTile 对比</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/zh-Hans/docs/backends/cpu><div class=pagination-nav__sublabel>下一页</div><div class=pagination-nav__label>CPU</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#选择设备 class="table-of-contents__link toc-highlight">选择设备</a><li><a href=#运行时检测的注册 class="table-of-contents__link toc-highlight">运行时检测的注册</a><li><a href=#后端需要实现什么 class="table-of-contents__link toc-highlight">后端需要实现什么</a><ul><li><a href=#添加后端 class="table-of-contents__link toc-highlight">添加后端</a></ul></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>文档</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/zh-Hans/docs/introduction>简介</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>社区</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

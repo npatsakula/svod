@@ -1,8 +1,8 @@
-<!doctype html><html lang=zh-CN dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-architecture/optimizations/algebraic-simplification" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>代数化简模式 | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification /><meta data-rh=true property=og:locale content=zh_CN /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=zh-Hans /><meta data-rh=true name=docsearch:language content=zh-Hans /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="代数化简模式 | Svod"/><meta data-rh=true name=description content="Svod 的符号化简器使用 schedule/src/symbolic/patterns.rs 中定义的 140+ 个代数模式重写 UOp 计算图。这些模式在流水线的多个阶段触发："/><meta data-rh=true property=og:description content="Svod 的符号化简器使用 schedule/src/symbolic/patterns.rs 中定义的 140+ 个代数模式重写 UOp 计算图。这些模式在流水线的多个阶段触发："/><link data-rh=true rel=icon href=/zh-Hans/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification","name":"代数化简","position":1}]}</script><link rel=stylesheet href=/zh-Hans/assets/css/styles.e76ef093.css /><script src=/zh-Hans/assets/js/runtime~main.e3d1fb96.js defer></script><script src=/zh-Hans/assets/js/main.82bf176e.js defer></script></head><body><svg style="display: none;"><defs>
+<!doctype html><html lang=zh-CN dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-architecture/optimizations/algebraic-simplification" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>代数化简 | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification /><meta data-rh=true property=og:locale content=zh_CN /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=zh-Hans /><meta data-rh=true name=docsearch:language content=zh-Hans /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="代数化简 | Svod"/><meta data-rh=true name=description content="符号化简器是 schedule/src/symbolic/patterns.rs 中三个嵌套的匹配器。各层级在何处运行："/><meta data-rh=true property=og:description content="符号化简器是 schedule/src/symbolic/patterns.rs 中三个嵌套的匹配器。各层级在何处运行："/><link data-rh=true rel=icon href=/zh-Hans/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification","name":"代数化简","position":1}]}</script><link rel=stylesheet href=/zh-Hans/assets/css/styles.e76ef093.css /><script src=/zh-Hans/assets/js/runtime~main.53f2793a.js defer></script><script src=/zh-Hans/assets/js/main.b4210e06.js defer></script></head><body><svg style="display: none;"><defs>
 <symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
 </defs></svg>
-<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-5c8")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/zh-Hans/img/logo.svg /><div role=region aria-label=跳到主要内容><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>跳到主要内容</a></div><nav aria-label=主导航 class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label=切换导航栏 aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/zh-Hans/><div class=navbar__logo><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/zh-Hans/docs/introduction>文档</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>简体中文</a><ul class=dropdown__menu><li><a href=/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=zh-CN>简体中文</a><li><a href=/ru/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="切换浅色/暗黑模式（当前为system mode）"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=搜索 aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label=回到顶部 class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label=文档侧边栏 class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/zh-Hans/docs/introduction><span class=linkLabel_WmDU>简介</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/examples><span class=categoryLinkLabel_W154>快速上手</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/zh-Hans/docs/architecture/pipeline><span class=categoryLinkLabel_W154>架构</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/pipeline><span class=linkLabel_WmDU>执行流水线</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/jit-graphs><span class=linkLabel_WmDU>JIT 图</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/kernel-origins><span class=linkLabel_WmDU>内核来源</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/zh-Hans/docs/architecture/codegen/overview><span class=categoryLinkLabel_W154>代码生成流水线</span></a></div><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/ir-design><span class=linkLabel_WmDU>IR 设计哲学</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/zh-Hans/docs/architecture/optimizations/pattern-system><span class=categoryLinkLabel_W154>优化</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/optimizations/pattern-system><span class=linkLabel_WmDU>模式引擎</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/zh-Hans/docs/architecture/optimizations/algebraic-simplification><span class=linkLabel_WmDU>代数化简</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/optimizations/index-arithmetic><span class=linkLabel_WmDU>索引算术</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/optimizations/range-optimization><span class=linkLabel_WmDU>Range 与 Reduce</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/optimizations/strength-reduction><span class=linkLabel_WmDU>强度削减</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/optimizations/kernel-search><span class=linkLabel_WmDU>内核搜索</span></a></ul><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/op-bestiary><span class=linkLabel_WmDU>操作图鉴</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile 内核 (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/backends/jit-loader><span class=categoryLinkLabel_W154>后端</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=页面路径><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label=主页面 class=breadcrumbs__link href=/zh-Hans/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>架构</span><li class=breadcrumbs__item><span class=breadcrumbs__link>优化</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>代数化简</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">本页总览</button></div><div class="theme-doc-markdown markdown"><header><h1>代数化简模式</h1></header>
-<p>Svod 的符号化简器使用 <code>schedule/src/symbolic/patterns.rs</code> 中定义的 140+ 个代数模式重写 UOp 计算图。这些模式在流水线的多个阶段触发：</p>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-5c8")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/zh-Hans/img/logo.svg /><div role=region aria-label=跳到主要内容><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>跳到主要内容</a></div><nav aria-label=主导航 class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label=切换导航栏 aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/zh-Hans/><div class=navbar__logo><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/zh-Hans/docs/introduction>文档</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>简体中文</a><ul class=dropdown__menu><li><a href=/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=zh-CN>简体中文</a><li><a href=/ru/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="切换浅色/暗黑模式（当前为system mode）"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=搜索 aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label=回到顶部 class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label=文档侧边栏 class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/zh-Hans/docs/introduction><span class=linkLabel_WmDU>简介</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/examples><span class=categoryLinkLabel_W154>快速上手</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/zh-Hans/docs/architecture/ir-design><span class=categoryLinkLabel_W154>架构</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/ir-design><span class=linkLabel_WmDU>IR 设计哲学</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/pipeline><span class=linkLabel_WmDU>执行流水线</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/jit-graphs><span class=linkLabel_WmDU>JIT 图</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/kernel-origins><span class=linkLabel_WmDU>内核来源</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/zh-Hans/docs/architecture/codegen/overview><span class=categoryLinkLabel_W154>代码生成流水线</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/zh-Hans/docs/architecture/optimizations/pattern-system><span class=categoryLinkLabel_W154>优化</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/optimizations/pattern-system><span class=linkLabel_WmDU>模式引擎</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/zh-Hans/docs/architecture/optimizations/algebraic-simplification><span class=linkLabel_WmDU>代数化简</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/optimizations/index-arithmetic><span class=linkLabel_WmDU>索引算术</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/optimizations/range-optimization><span class=linkLabel_WmDU>Range 与归约</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/optimizations/strength-reduction><span class=linkLabel_WmDU>强度削减</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/optimizations/kernel-search><span class=linkLabel_WmDU>内核搜索</span></a></ul><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/architecture/op-bestiary><span class=linkLabel_WmDU>操作图鉴</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile 内核 (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/backends/overview><span class=categoryLinkLabel_W154>后端</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=页面路径><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label=主页面 class=breadcrumbs__link href=/zh-Hans/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>架构</span><li class=breadcrumbs__item><span class=breadcrumbs__link>优化</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>代数化简</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">本页总览</button></div><div class="theme-doc-markdown markdown"><header><h1>代数化简</h1></header>
+<p>符号化简器是 <code>schedule/src/symbolic/patterns.rs</code> 中三个嵌套的匹配器。各层级在何处运行：</p>
 
 
 
@@ -28,35 +28,21 @@
 
 
 
+<table><thead><tr><th>匹配器<th>组成<th>运行位置<tbody><tr><td><code>symbolic_simple()</code><td><code>symbolic_simple_base() + dead_loop_patterns()</code><td>add-loads（13）、devectorize（14）、图像 pass（17）、索引降级（17）、早期分解（19b），以及最终重写中的 <code>pm_decomp</code> 规则集<tr><td><code>symbolic()</code><td><code>symbolic_simple</code> + 第 2 层各组<td>rangeify mega-pass、range 拆分/合并（<code>+ pm_fold_cast_const</code>）、<code>indexing_simplify</code>、最终符号化简（18）<tr><td><code>sym()</code><td><code>symbolic</code> + 第 3 层<td>预优化（<code>+ pm_fold_cast_const + pm_flatten_range</code>）、post-opt 符号化简（08）、早期符号化简（15）、额外符号化简（16，<code>+ indexing_simplify</code>）</table>
+<p><code>pm_fold_cast_const</code>（<code>CAST(CONST) → CONST</code>）有意<em>不</em>放在任何层级中；需要它的位置显式添加，正如 Tinygrad 只在 <code>UOp.simplify</code> 所在之处组合 <code>symbolic + pm_fold_cast_const</code>。</p>
+<p>每条重写整数运算的规则都经过 <code>exact_integer_rewrite</code>，这是一个带类型的无回绕证明（<code>typed_integer_rewrite_is_exact</code>）：只要原表达式或替换表达式可能溢出其具体 dtype，就放弃该重写。标记为<em>值敏感</em>的组还额外被 <code>value_sensitive</code> 包装，在子树满足 <code>weak_float_values_are_committed</code> 之前禁用它们。界限来自 <code>VminVmaxProperty</code>（总是可用）和 <code>SoundVminVmaxProperty</code>（对界限不可信的算子返回 <code>None</code>：load、<code>Pow</code>、<code>Fdiv</code>），两者都按节点缓存。</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=组成>组成<a href=#组成 class=hash-link aria-label=组成的直接链接 title=组成的直接链接 translate=no>​</a></h2>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple_base()         tier 1</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  propagate_invalid                     must be first (before x*0 → 0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  fold_invalid_load_store</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  constant_folding_dsl_patterns         value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vconst_folding_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  bool_arithmetic_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  identity_and_zero_patterns            value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  self_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  zero_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  division_dsl_patterns                 value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  uint_pack_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  div_mod_recombine_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  power_dsl_patterns                    value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_simple_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple() = base + dead_loop_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic() = symbolic_simple + tier 2 (with_tier2)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  commutative_canonicalization</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  term_combining_dsl_patterns           value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_alu_combining_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vmin_vmax_collapse_patterns           value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  minmax_dsl_patterns                   value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_folding_dsl_patterns              value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  comparison_dsl_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_mod_div_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  advanced_division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_cast_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  long_to_int_narrowing_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  after_simplification_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_bound_patterns                  value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">sym() = symbolic + tier 3</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  pm_simplify_valid                     (symbolic/valid_simplification.rs)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_vectorize_reorder_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  ne_zero_fold_patterns                 value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_where_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  store_load_folding_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  reduce_sym_patterns                   value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  sym_phase3_patterns</span><br/></div></code></pre></div></div>
+<p>顺序至关重要：规范化在项合并之前，ALU 折叠在比较规则和 range 规则之前，因为每一组都会为下一组暴露出匹配机会。Tinygrad 的倒数分配规则（<code>uop/symbolic.py</code> 中的 <code>sym</code>）被有意省略：六条全都不满足 IEEE 精确性。</p>
+<p><strong>记号。</strong> <code>OP[a, b]</code> 表示可交换，<code>OP(a, b)</code> 表示有序；<code>@zero</code>/<code>@one</code>/<code>c</code> 是常量；重复的名称表示同一节点（<code>Arc::ptr_eq</code>）。<code>//</code> 是 <code>FloorDiv</code>，<code>%</code> 是 <code>FloorMod</code>；截断式的 <code>CDiv</code>/<code>CMod</code> 只在后期分解之后出现。</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=第-1-层>第 1 层<a href=#第-1-层 class=hash-link aria-label="第 1 层的直接链接" title="第 1 层的直接链接" translate=no>​</a></h2>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=invalid-传播propagate_invalid>Invalid 传播（<code>propagate_invalid</code>）<a href=#invalid-传播propagate_invalid class=hash-link aria-label=invalid-传播propagate_invalid的直接链接 title=invalid-传播propagate_invalid的直接链接 translate=no>​</a></h3>
+<p><code>Invalid</code> 即 <code>UOp::invalid_marker()</code>，一个 <code>ConstValue::Invalid</code> 常量；<code>is_invalid_marker</code> 也能识别全为 <code>Invalid</code> 的 <code>VCONST</code> 或 <code>STACK</code>，以及包裹它们的 movement 外壳。有效性以 <code>WHERE(cond, x, Invalid)</code> 的形式保存，这些规则在算术运算围绕它移动时保持该形状不变：</p>
 
 
 
 
 
-<table><thead><tr><th>位置<th>匹配器<th>上下文<tbody><tr><td>预优化<td><code>sym()</code><td>rangeify + 范围分割之后，内核优化之前<tr><td>后优化（阶段 8）<td><code>sym()</code> + <code>pm_move_where_on_load</code><td>优化动作之后，展开之前<tr><td>索引后处理（阶段 16）<td><code>sym()</code> + <code>indexing_simplify()</code><td>索引 dtype 降级之后，最终清理<tr><td>分解+渲染（阶段 18-19）<td><code>symbolic_simple()</code><td>与晚期重写和渲染器自带的匹配器组合</table>
-<p>匹配器分为三层：<code>symbolic_simple()</code> 是第 1 层基础（恒等式、常量折叠、size-1 RANGE 折叠），<code>symbolic()</code> 在其上加入第 2 层分组（规范化、比较、按范围边界化简 div/mod），<code>sym()</code> 再加入第 3 层（<code>pm_simplify_valid</code>、ALU/STACK 重排、带取向的同类项合并）。只有最终的分解+渲染 pass 单独运行第 1 层集合。</p>
-<p><strong>范围分析</strong>：每个 UOp 跟踪它在运行时可取的最小值（<code>vmin</code>）和最大值（<code>vmax</code>），在节点构造时从输入的边界急切地计算。许多模式使用这些边界在编译期证明条件（例如"x 始终非负"或"x &lt; n 对所有值成立"）。</p>
-<p><strong>符号约定</strong>：<code>OP[a, b]</code> 表示交换律模式（两种操作数顺序都会尝试）。<code>OP(a, b)</code> 表示有序。<code>@zero</code>/<code>@one</code>/<code>c @const(v)</code> 匹配常量值。当同一变量名出现两次时（例如 <code>Idiv(x, x)</code>），两个操作数必须是同一节点（<code>Arc::ptr_eq</code>——即通过 hash consing 进行结构去重）。</p>
-<p><strong>Tinygrad 参考</strong>：<code>tinygrad/uop/symbolic.py</code>、<code>tinygrad/uop/divandmod.py</code></p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=示例优化级联>示例：优化级联<a href=#示例优化级联 class=hash-link aria-label=示例：优化级联的直接链接 title=示例：优化级联的直接链接 translate=no>​</a></h2>
-<p>一个简单表达式展示模式如何组合：</p>
-<p>优化前：</p>
-<!-- -->
-<p>步骤：</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Step 1 (identity):    ADD(x, 0) -> x</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 2 (identity):    MUL(x, 1) -> x</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 3 (const fold):  ADD(3, 4) -> CONST(7)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 4 (result):      ADD(x, 7)</span><br/></div></code></pre></div></div>
-<p>优化后：</p>
-<!-- -->
-<p>重写引擎自底向上应用模式：先化简子节点，再重新匹配父节点。这使得多步级联优化在一次遍历中完成。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=模式排序>模式排序<a href=#模式排序 class=hash-link aria-label=模式排序的直接链接 title=模式排序的直接链接 translate=no>​</a></h2>
-<p>每个匹配器都按特定顺序组合模式组——顺序是关键的，因为一个组可能为后面的组暴露出新的匹配。在组内，模式按顺序尝试直到有一个匹配。组通过 <code>+</code> 运算符串联：</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple() = symbolic_simple_base() + dead_loop_patterns()</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple_base()          -- tier 1</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  propagate_invalid             -- MUST be first (before x*0=0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  fold_invalid_load_store</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  constant_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vconst_folding_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  bool_arithmetic_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  identity_and_zero_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  self_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  zero_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  uint_pack_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  div_mod_recombine_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  power_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic() = symbolic_simple() + tier 2</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  commutative_canonicalization</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  term_combining_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_alu_combining_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vmin_vmax_collapse_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  minmax_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  comparison_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_mod_div_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  advanced_division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_cast_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  long_to_int_narrowing_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  after_simplification_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_bound_patterns</span><br/></div></code></pre></div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=1-常量折叠>1. 常量折叠<a href=#1-常量折叠 class=hash-link aria-label="1. 常量折叠的直接链接" title="1. 常量折叠的直接链接" translate=no>​</a></h2>
-<p>在编译期常量上使用 dtype 感知的算术求值。结果遵循类型边界（例如 Int32 在 32 位处回绕）。</p>
-<p><strong>Tinygrad</strong>：<code>symbolic.py:40-118</code></p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=标量常量>标量常量<a href=#标量常量 class=hash-link aria-label=标量常量的直接链接 title=标量常量的直接链接 translate=no>​</a></h3>
 
 
 
@@ -82,8 +68,6 @@
 
 
 
-<table><thead><tr><th>类别<th>操作<th>模式<tbody><tr><td>一元（7）<td>Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc<td><code>op(CONST(c))</code> -> <code>CONST(eval(op, c))</code><tr><td>二元（13）<td>Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr<td><code>op(CONST(a), CONST(b))</code> -> <code>CONST(eval(op, a, b))</code><tr><td>三元（2）<td>Where, MulAcc<td><code>op(CONST(a), CONST(b), CONST(c))</code> -> <code>CONST(eval(op, a, b, c))</code></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=向量常量>向量常量<a href=#向量常量 class=hash-link aria-label=向量常量的直接链接 title=向量常量的直接链接 translate=no>​</a></h3>
 
 
 
@@ -99,265 +83,15 @@
 
 
 
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<tbody><tr><td><code>op(VCONST(a), VCONST(b))</code><td><code>VCONST(eval(op, a, b))</code> 逐元素<tr><td><code>op(CONST(a), VCONST(b))</code><td><code>VCONST(eval(op, broadcast(a), b))</code><tr><td><code>op(VCONST(a), CONST(b))</code><td><code>VCONST(eval(op, a, broadcast(b)))</code><tr><td><code>unary_op(VCONST(v))</code><td><code>VCONST(eval(op, v))</code> 逐元素</table>
-<p>VConst 折叠覆盖 11 个二元操作（不含 Pow 和 Fdiv）以及全部 7 个一元操作。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=2-恒等与零值传播>2. 恒等与零值传播<a href=#2-恒等与零值传播 class=hash-link aria-label="2. 恒等与零值传播的直接链接" title="2. 恒等与零值传播的直接链接" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>ADD[x, 0]</code><td><code>x</code><td>交换律<tr><td><code>MUL[x, 1]</code><td><code>x</code><td>交换律<tr><td><code>OR[x, 0]</code><td><code>x</code><td>交换律<tr><td><code>XOR[x, 0]</code><td><code>x</code><td>交换律<tr><td><code>SUB(x, 0)</code><td><code>x</code><td>有序<tr><td><code>IDIV(x, 1)</code><td><code>x</code><td>有序<tr><td><code>FDIV(x, 1)</code><td><code>x</code><td>有序<tr><td><code>MOD(x, 1)</code><td><code>0</code><td>任何数模 1 为零<tr><td><code>Floor/Ceil/Trunc/Round(x)</code><td><code>x</code><td>仅当 <code>x</code> 为整数时（取整为空操作）<tr><td><code>MUL[x, 0]</code><td><code>0</code><td>仅非浮点数<tr><td><code>AND[_, 0]</code><td><code>0</code><td>交换律</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>IEEE 754：乘以零</div><div class=admonitionContent_BuS1><p><code>MUL[x, 0]</code> 对浮点数<strong>不做</strong>化简，因为 IEEE 754 要求：<ul>
-<li class=""><code>NaN * 0 = NaN</code></li>
-<li class=""><code>Inf * 0 = NaN</code></li>
-</ul><p>守卫条件 <code>!x.dtype().is_float()</code> 阻止此优化用于浮点类型。</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=3-自折叠>3. 自折叠<a href=#3-自折叠 class=hash-link aria-label="3. 自折叠的直接链接" title="3. 自折叠的直接链接" translate=no>​</a></h2>
-<p>同一操作数出现在两侧的模式。使用 <code>Arc::ptr_eq</code> 检查（hash consing 保证结构相等的子表达式共享同一指针）。</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>IDIV(x, x)</code><td><code>1</code><td><tr><td><code>IDIV(x, -1)</code><td><code>NEG(x)</code><td>常量检查右操作数<tr><td><code>MOD(MOD(x, y), y)</code><td><code>MOD(x, y)</code><td>幂等取模<tr><td><code>AND(x, x)</code><td><code>x</code><td><tr><td><code>OR(x, x)</code><td><code>x</code><td></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=4-零值折叠>4. 零值折叠<a href=#4-零值折叠 class=hash-link aria-label="4. 零值折叠的直接链接" title="4. 零值折叠的直接链接" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>MOD(x, x)</code><td><code>0</code><td><tr><td><code>LT(x, x)</code><td><code>false</code><td>非浮点数（NaN &lt; NaN 为 false，但需要守卫以确保正确性）<tr><td><code>NE(x, x)</code><td><code>false</code><td>仅整数——IEEE 754 中 <code>NaN != NaN</code> 为 <code>true</code></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=5-除法化简>5. 除法化简<a href=#5-除法化简 class=hash-link aria-label="5. 除法化简的直接链接" title="5. 除法化简的直接链接" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>FDIV(0.0, 0.0)</code><td><code>NaN</code><td>IEEE 754 不定型<tr><td><code>FDIV(MUL[_, 0], 0)</code><td><code>NaN</code><td>零表达式除以零<tr><td><code>FDIV(x, x)</code><td><code>1.0</code><td>浮点自除<tr><td><code>FDIV(MUL(x, y), y)</code><td><code>x</code><td>消去（浮点）<tr><td><code>IDIV(MUL(x, y), y)</code><td><code>x</code><td>消去（整数）</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>模式优先级</div><div class=admonitionContent_BuS1><p><code>FDIV(0, 0) -> NaN</code> 必须在匹配器中排在 <code>FDIV(x, x) -> 1</code> 之前以获得优先权。<code>division_dsl_patterns()</code> 中的排序保证了这一点。</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=6-类型转换优化>6. 类型转换优化<a href=#6-类型转换优化 class=hash-link aria-label="6. 类型转换优化的直接链接" title="6. 类型转换优化的直接链接" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>CAST(CONST(c), dtype)</code><td><code>CONST(c.cast(dtype))</code><td>编译期类型转换折叠<tr><td><code>CAST(x, dtype)</code><td><code>x</code><td>当 <code>x.dtype() == dtype</code> 时（空操作）<tr><td><code>CAST(CAST(x, a), b)</code><td><code>x</code><td>当 <code>x.dtype() == b</code> 且 <code>a</code> 保留 <code>b</code> 的所有值<tr><td><code>CAST(CAST(x, a), b)</code><td><code>CAST(x, b)</code><td>当 <code>a</code> 不窄化 <code>x</code>（宽化链）<tr><td><code>CAST(WHERE(s, a, b), dtype)</code><td><code>WHERE(s, CAST(a, dtype), CAST(b, dtype))</code><td>将类型转换推入分支</table>
-<p><code>can_safe_cast(to, from)</code> 函数判断中间类型是否能容纳所有值。它检查位宽、符号性以及浮点/整数类别。</p>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>截断破坏往返</div><div class=admonitionContent_BuS1><p><code>CAST(CAST(x, i8), i64)</code> 当 <code>x</code> 为 <code>i64</code> 时<strong>不会</strong>折叠为 <code>x</code>。中间的 <code>i8</code> 截断值——<code>can_safe_cast(i64, i8)</code> 返回 <code>false</code>，因为 <code>i8</code> 无法容纳所有 <code>i64</code> 值。<p>安全示例：<code>CAST(CAST(x, i32), bool)</code> -> <code>CAST(x, bool)</code>，当 <code>x</code> 为 <code>bool</code> 时，因为 <code>i32</code> 能表示 <code>true</code> 和 <code>false</code>。</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=7-同类项合并>7. 同类项合并<a href=#7-同类项合并 class=hash-link aria-label="7. 同类项合并的直接链接" title="7. 同类项合并的直接链接" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<tbody><tr><td><code>ADD(x, x)</code><td><code>MUL(2, x)</code><tr><td><code>ADD(MUL(c1, x), MUL(c2, x))</code><td><code>MUL(c1+c2, x)</code><tr><td><code>ADD(MUL(x, c1), MUL(x, c2))</code><td><code>MUL(x, c1+c2)</code></table>
-<p>两种有序变体都会匹配（常量在 MUL 的左侧或右侧）。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=8-alu-链折叠>8. ALU 链折叠<a href=#8-alu-链折叠 class=hash-link aria-label="8. ALU 链折叠的直接链接" title="8. ALU 链折叠的直接链接" translate=no>​</a></h2>
-<p>折叠结合律运算链中的常量，并将常量推向外层以获得规范形式。</p>
+<table><thead><tr><th>模式<th>结果<tbody><tr><td><code>WHERE(Invalid, _, _)</code><td><code>Invalid</code><tr><td><code>WHERE(WHERE(c, x, Inv), a, b)</code><td><code>WHERE(c, WHERE(x, a, b), Inv)</code><tr><td><code>WHERE(c, Inv, x)</code><td><code>WHERE(!c, x, Inv)</code>（<code>WHERE(c, Inv, Inv)</code> → <code>Inv</code>）<tr><td><code>WHERE(c1, WHERE(c2, x, d), d)</code><td><code>WHERE(c1 & c2, x, d)</code><tr><td><code>WHERE(a, WHERE(c, x, Inv), y)</code>，<code>y</code> 不是 <code>Invalid</code><td><code>WHERE(!a | c, WHERE(a, x, y), Inv)</code> —— 假分支有对称的规则<tr><td><code>unary(Inv)</code>、<code>CAST(Inv)</code>、<code>BITCAST(Inv)</code><td><code>Inv</code><tr><td><code>unary(WHERE(c, x, Inv))</code>、<code>CAST</code>、<code>BITCAST</code><td><code>WHERE(c, unary(x), Inv)</code><tr><td>对<strong>每个</strong>二元算子（包括比较）的 <code>op(WHERE(c, x, Inv), y)</code>、<code>op(y, WHERE(c, x, Inv))</code><td><code>WHERE(c, op(x, y), Inv)</code><tr><td>对 13 个非比较二元算子的 <code>op(Inv, y)</code>、<code>op(y, Inv)</code><td><code>Inv</code></table>
+<p>为什么放在最前：<code>MUL(0, WHERE(c, x, Inv))</code> 必须变成 <code>WHERE(c, 0, Inv)</code>，而不是 <code>0</code>。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=死-load-与死-storefold_invalid_load_store>死 load 与死 store（<code>fold_invalid_load_store</code>）<a href=#死-load-与死-storefold_invalid_load_store class=hash-link aria-label=死-load-与死-storefold_invalid_load_store的直接链接 title=死-load-与死-storefold_invalid_load_store的直接链接 translate=no>​</a></h3>
+<p><code>LOAD(INDEX(buf, Invalid, ..))</code>（也包括位于 <code>CAST</code> 之后的情形）→ 若 load 有 <code>alt</code> 则取之，否则为带形状的零；不带 gate 的 <code>STORE(INDEX(buf, Invalid, ..), v)</code> → <code>NOOP</code>。</p>
 <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=常量折叠>常量折叠<a href=#常量折叠 class=hash-link aria-label=常量折叠的直接链接 title=常量折叠的直接链接 translate=no>​</a></h3>
+<p>一元：<code>Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc</code>（这里 <code>Neg</code> 不是算子 —— <code>neg()</code> 构建的是 <code>MUL(x, -1)</code>）。二元：<code>Add, Mul, Sub, FloorMod, Max, Pow, FloorDiv, Fdiv, And, Or, Xor, Shl, Shr</code>，外加结果为 <code>Bool</code> 的六种比较。三元：<code>Where</code>、<code>MulAcc</code>。结果按 dtype 的存储格式确定（<code>Int32</code> 会回绕），弱 dtype 除外，它们保留未截断的值。<code>vconst_folding_patterns</code> 对 <code>VCONST ⊕ VCONST</code> 以及 <code>CONST</code>/<code>VCONST</code> 广播混合逐 lane 做同样的事（11 个二元算子 + 比较，6 个一元算子），跳过弱类型 lane。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=bool-运算>Bool 运算<a href=#bool-运算 class=hash-link aria-label="Bool 运算的直接链接" title="Bool 运算的直接链接" translate=no>​</a></h3>
+<p>当两者都是 <code>Bool</code> 时，<code>Mul[x, y]</code> → <code>x & y</code>，<code>Add[x, y]</code> → <code>x | y</code>，<code>Max(x, y)</code> → <code>x | y</code>。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=恒等与零>恒等与零<a href=#恒等与零 class=hash-link aria-label=恒等与零的直接链接 title=恒等与零的直接链接 translate=no>​</a></h3>
 
 
 
@@ -393,8 +127,6 @@
 
 
 
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>ADD[ADD[x, c1], c2]</code><td><code>ADD(x, c1+c2)</code><td>外层 Add 交换律<tr><td><code>MUL[MUL[x, c1], c2]</code><td><code>MUL(x, c1*c2)</code><td>外层 Mul 交换律<tr><td><code>ADD[SUB(x, c1), c2]</code><td><code>ADD(x, c2-c1)</code> 或 <code>SUB(x, c1-c2)</code><td>符号归一化<tr><td><code>SUB(ADD(x, c1), c2)</code><td><code>ADD(x, c1-c2)</code> 或 <code>SUB(x, c2-c1)</code><td>符号归一化<tr><td><code>SUB(SUB(x, c1), c2)</code><td><code>SUB(x, c1+c2)</code><td></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=常量外推>常量外推<a href=#常量外推 class=hash-link aria-label=常量外推的直接链接 title=常量外推的直接链接 translate=no>​</a></h3>
 
 
 
@@ -405,14 +137,26 @@
 
 
 
+<table><thead><tr><th>模式<th>结果<th>条件<tbody><tr><td><code>Add[x, 0]</code><td><code>x</code><td>非浮点，或该零是 <code>-0.0</code>（对 <code>x = -0.0</code>，<code>x + 0.0</code> 不是恒等变换）<tr><td><code>Sub(x, 0)</code><td><code>x</code><td>非浮点，或该零是 <code>+0.0</code><tr><td><code>Mul[x, 1]</code>、<code>Or[x, 0]</code>、<code>Xor[x, 0]</code>、<code>FloorDiv(x, 1)</code>、<code>Fdiv(x, 1)</code><td><code>x</code><td><tr><td><code>FloorMod(x, 1)</code><td><code>0</code><td><tr><td><code>Floor/Ceil/Trunc/Round(x)</code><td><code>x</code><td>整数 <code>x</code><tr><td><code>Mul[x, 0]</code><td><code>0</code><td>非浮点（<code>NaN * 0</code>、<code>Inf * 0</code> 为 <code>NaN</code>）<tr><td><code>And[_, 0]</code><td><code>0</code><td></table>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=自身折叠与零折叠>自身折叠与零折叠<a href=#自身折叠与零折叠 class=hash-link aria-label=自身折叠与零折叠的直接链接 title=自身折叠与零折叠的直接链接 translate=no>​</a></h3>
+<p><code>FloorDiv(x, x)</code> → <code>1</code>；<code>FloorDiv(x, -1)</code> → <code>MUL(x, -1)</code>；<code>FloorMod(FloorMod(x, y), y)</code> → <code>FloorMod(x, y)</code>；<code>And(x, x)</code>、<code>Or(x, x)</code>、<code>Max(x, x)</code> → <code>x</code>；<code>FloorMod(x, x)</code> → <code>0</code>；<code>Lt(x, x)</code> → <code>false</code>，对非浮点成立，对浮点则需可靠界限证明 <code>x</code> 不是 <code>NaN</code>；<code>Ne(x, x)</code> → <code>false</code>，对整数和 bool 成立。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=除法>除法<a href=#除法 class=hash-link aria-label=除法的直接链接 title=除法的直接链接 translate=no>​</a></h3>
+<p><code>Fdiv(0.0, 0.0)</code> 和 <code>Fdiv(MUL[_, 0.0], 0.0)</code> → <code>NaN</code>（列在最前，以便优先于下一条规则）；<code>Fdiv(x, x)</code> → <code>1.0</code> 仅当 <code>x</code> 可证明为有限且非零；<code>FloorDiv(Mul(x, y), y)</code> → <code>x</code>。没有浮点版本的 <code>(x*y)/y → x</code>。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=类型转换>类型转换<a href=#类型转换 class=hash-link aria-label=类型转换的直接链接 title=类型转换的直接链接 translate=no>​</a></h3>
+<p>dtype 已经匹配时 <code>CAST(x, dt)</code> → <code>x</code>；当 <code>x: b</code> 且 <code>can_safe_cast(b, a)</code>（<code>a</code> 能容纳 <code>b</code> 的每个值：符号性相同且至少同样宽，无符号→有符号需要多一位，浮点↔整数永远不行）时，<code>CAST(CAST(x, a), b)</code> → <code>x</code>；当 <code>a</code> 不会收窄 <code>x</code> 时，<code>CAST(CAST(x, a), b)</code> → <code>CAST(x, b)</code>。<code>uint_pack_dsl_patterns</code> 消除 Threefry 构建的 <code>(hi.cast(u64) &lt;&lt; 32) | lo.cast(u64)</code> 打包，使 PRNG 保持在 32 位 ALU 中。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=除法与取模的重组>除法与取模的重组<a href=#除法与取模的重组 class=hash-link aria-label=除法与取模的重组的直接链接 title=除法与取模的重组的直接链接 translate=no>​</a></h3>
+<p>作用于每个 <code>Add</code> 的一条规则：<code>fold_add_divmod_recombine</code>，移植自 Tinygrad。它展平 <code>Add</code> 链，寻找一个项 <code>(base % div) * mul</code>，以及一个伙伴项 <code>q * (div * mul)</code>，其中 <code>q</code> 是某个模 <code>div</code> 与 <code>base</code> 同余之量的商（<code>quotient_base</code>：<code>q == b // div</code>，可能带有合并后的 <code>(x//c + a)//div</code> 和平移常量），并把这对项替换为 <code>b * mul</code>；若 <code>q == (b // div) % d</code>，则折叠为更宽的 <code>(b % (div*d)) * mul</code>。这就是 <code>x%n + (x//n)*n → x</code> 这一族规则及其缩放、偏移和三项变体，通过遍历链来发现，而不是写成单独的规则。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=幂布尔与-dce>幂、布尔与 DCE<a href=#幂布尔与-dce class=hash-link aria-label="幂、布尔与 DCE的直接链接" title="幂、布尔与 DCE的直接链接" translate=no>​</a></h3>
+<p><code>Pow(x, 0)</code> → <code>1</code>、<code>Pow(x, 1)</code> → <code>x</code>、<code>Pow(1, x)</code> → <code>1</code>（仅限标量；其他指数都不重写 —— 倒数/平方根形式会改变 IEEE 舍入）。<code>Not(Not(x))</code> → <code>x</code>、<code>Xor(x, x)</code> → <code>0</code>、<code>true | _</code> → <code>true</code>、<code>false & _</code> → <code>false</code>、<code>true & x</code> → <code>x</code>、<code>false | x</code> → <code>x</code>（仅限 bool 常量）。条件可证明为常量（可靠界限）的 <code>WHERE</code> 选择对应分支；<code>WHERE(_, t, t)</code> → <code>t</code>；<code>WHERE(x, true, false)</code> → <code>x</code>；<code>WHERE(x, false, true)</code> → <code>!x</code>；<code>WHERE(a, WHERE(b, c, d), d)</code> → <code>WHERE(a & b, c, d)</code>。<code>dead_loop_patterns</code>：<code>vmax &lt; 0</code> 的 <code>RANGE</code> → <code>CONST(0)</code>，<code>vmin == vmax</code> 的 <code>RANGE(CONST)</code> → 该常量。这里没有针对 <code>END</code>/<code>REDUCE</code> 空 range 的折叠；那由 <code>reduce_to_acc</code> 处理。</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=第-2-层>第 2 层<a href=#第-2-层 class=hash-link aria-label="第 2 层的直接链接" title="第 2 层的直接链接" translate=no>​</a></h2>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=交换律规范化>交换律规范化<a href=#交换律规范化 class=hash-link aria-label=交换律规范化的直接链接 title=交换律规范化的直接链接 translate=no>​</a></h3>
+<p>对于<strong>结果</strong> dtype 为 <code>WeakInt</code> 的 <code>Add, Mul, Max, And, Or, Xor</code>（名义上还有 <code>Eq</code>/<code>Ne</code>，但它们的结果是 <code>Bool</code>，因而从不触发）：当 <code>tinygrad_tuplize_cmp(b, a) == Less</code> 时交换操作数，即线性化器也使用的结构化 <code>(op, arg, dtype, *src)</code> 键序。于是，在交换律意义下相等的索引表达式会哈希共享为同一个节点，重组规则和 expander 都依赖这一点。其他 dtype 保持编写时的顺序。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=项合并带常量的-addmul>项合并（带常量的 <code>Add</code>/<code>Mul</code>）<a href=#项合并带常量的-addmul class=hash-link aria-label=项合并带常量的-addmul的直接链接 title=项合并带常量的-addmul的直接链接 translate=no>​</a></h3>
 
 
 
 
 
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>ADD[ADD[x, c], y]</code><td><code>ADD(ADD(x, y), c)</code><td>将常量推向外层；<code>y</code> 不能是常量</table>
-<p>常量外推对索引提取至关重要。它确保常量冒泡到最外层，使下游模式（如 div-mod 化简）能看到干净的 <code>variable + offset</code> 形式。</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=sub-规范化>Sub 规范化<a href=#sub-规范化 class=hash-link aria-label="Sub 规范化的直接链接" title="Sub 规范化的直接链接" translate=no>​</a></h3>
 
 
 
@@ -428,10 +172,6 @@
 
 
 
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>SUB(a, SUB(b, x))</code><td><code>ADD(x, SUB(a, b))</code><td>暴露内部变量</table>
-<p>Svod 保留 <code>SUB</code> 作为一等 IR 操作（不同于 Tinygrad 将 <code>a-b</code> 规范化为 <code>ADD(a, NEG(b))</code>）。此模式确保嵌套 <code>SUB</code> 不会阻断进一步化简。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=9-布尔逻辑>9. 布尔逻辑<a href=#9-布尔逻辑 class=hash-link aria-label="9. 布尔逻辑的直接链接" title="9. 布尔逻辑的直接链接" translate=no>​</a></h2>
 
 
 
@@ -453,735 +193,32 @@
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>NOT(NOT(x))</code><td><code>x</code><td>双重否定消除<tr><td><code>XOR(x, x)</code><td><code>0</code><td>自消去<tr><td><code>OR[x, NOT(x)]</code><td><code>true</code><td>重言式（仅布尔）<tr><td><code>AND[x, NOT(x)]</code><td><code>false</code><td>矛盾（仅布尔）<tr><td><code>OR[true, x]</code><td><code>true</code><td>吸收元<tr><td><code>AND[false, x]</code><td><code>false</code><td>吸收元<tr><td><code>AND[true, x]</code><td><code>x</code><td>单位元<tr><td><code>OR[false, x]</code><td><code>x</code><td>单位元<tr><td><code>AND[NOT(x), NOT(y)]</code><td><code>NOT(OR(x, y))</code><td>德摩根定律<tr><td><code>OR[NOT(x), NOT(y)]</code><td><code>NOT(AND(x, y))</code><td>德摩根定律</table>
-<p>所有使用 <code>[]</code> 的模式都是交换律的（两种操作数顺序都会尝试）。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=10-比较化简>10. 比较化简<a href=#10-比较化简 class=hash-link aria-label="10. 比较化简的直接链接" title="10. 比较化简的直接链接" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=自比较非浮点ptr_eq>自比较（非浮点，ptr_eq）<a href=#自比较非浮点ptr_eq class=hash-link aria-label=自比较（非浮点，ptr_eq）的直接链接 title=自比较（非浮点，ptr_eq）的直接链接 translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>操作<th>结果<tbody><tr><td><code>LT(x, x)</code>, <code>GT(x, x)</code>, <code>NE(x, x)</code><td><code>false</code><tr><td><code>LE(x, x)</code>, <code>GE(x, x)</code>, <code>EQ(x, x)</code><td><code>true</code></table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>浮点自比较</div><div class=admonitionContent_BuS1><p>自比较模式受 <code>!x.dtype().is_float()</code> 守卫。对于浮点数，<code>NaN != NaN</code> 为 <code>true</code>，<code>NaN == NaN</code> 为 <code>false</code>，因此这些恒等式不成立。</div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=常量与范围分析>常量与范围分析<a href=#常量与范围分析 class=hash-link aria-label=常量与范围分析的直接链接 title=常量与范围分析的直接链接 translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>op(CONST(a), CONST(b))</code><td><code>CONST(eval(op, a, b))</code><td>直接常量折叠<tr><td><code>op(x, y)</code> 当边界可证明时<td><code>true</code> 或 <code>false</code><td><code>ComparisonAnalyzer</code> 使用 vmin/vmax</table>
-<p><code>ComparisonAnalyzer</code> 检查：如果 <code>x.vmax &lt; y.vmin</code>，则 <code>LT(x, y)</code> 可证明为 <code>true</code>。</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=代数变换>代数变换<a href=#代数变换 class=hash-link aria-label=代数变换的直接链接 title=代数变换的直接链接 translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>LT(ADD[c0, x], c1)</code><td><code>LT(x, c1-c0)</code><td>偏移消除<tr><td><code>LT(NEG(x), NEG(y))</code><td><code>LT(y, x)</code><td>取反翻转<tr><td><code>LT(IDIV(x, d), c)</code><td><code>LT(x, c*d)</code><td>提升除法（d > 0）</table>
-<p><code>LT(x//d, c)</code> 的除法提升处理正数和非正数 <code>c</code>：</p>
+<table><thead><tr><th>模式<th>结果<tbody><tr><td><code>Add(x, x)</code><td><code>x * 2</code><tr><td><code>Add(Mul[x, c1], Mul[x, c2])</code><td><code>x * (c1 + c2)</code><tr><td><code>Add[x, Mul[x, c]]</code><td><code>x * (c + 1)</code><tr><td><code>Add[Add[y, Mul[x, c0]], Mul[x, c1]]</code><td><code>y + x * (c0 + c1)</code><tr><td><code>Add[Add[y, x], Mul[x, c]]</code>、<code>Add[Add[y, Mul[x, c]], x]</code><td><code>y + x * (c + 1)</code><tr><td><code>Add[Add[y, x], x]</code><td><code>y + x * 2</code><tr><td><code>Mul[-1, Add[x, c]]</code><td><code>-x + (-c)</code><tr><td><code>Mul[c, Add[x, k]]</code>，<code>x: WeakInt</code><td><code>c*x + c*k</code></table>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=布尔boolean_dsl_patterns>布尔（<code>boolean_dsl_patterns</code>）<a href=#布尔boolean_dsl_patterns class=hash-link aria-label=布尔boolean_dsl_patterns的直接链接 title=布尔boolean_dsl_patterns的直接链接 translate=no>​</a></h3>
+<p><code>Or[x, Not(x)]</code> → <code>true</code>，<code>And[x, Not(x)]</code> → <code>false</code>（仅限 bool）；两个方向的德摩根律，<code>And[Not(x), Not(y)]</code> → <code>!(x | y)</code> 以及 <code>Or[Not(x), Not(y)]</code> → <code>!(x & y)</code>。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=where>WHERE<a href=#where class=hash-link aria-label=WHERE的直接链接 title=WHERE的直接链接 translate=no>​</a></h3>
+<p><code>dce_dsl_patterns</code>：<code>WHERE(Not(c), t, f)</code> → <code>WHERE(c, f, t)</code>，除非 <code>f</code> 含有 <code>Invalid</code>（标量或某个 <code>STACK</code> lane）—— 交换会把标记移到真分支，gate 规则就看不到它了。<code>where_alu_combining_patterns</code>：当两个真分支或两个假分支都是常量时，对 <code>Add, Mul, Sub, Max, And, Or, Xor</code>，<code>op(WHERE(c, a, b), WHERE(c, d, e))</code> → <code>WHERE(c, op(a, d), op(b, e))</code>，还有结合形式 <code>Add(Add(y, WHERE(c, ..)), WHERE(c, ..))</code>。<code>where_bound_patterns</code>：<code>WHERE(Lt(x, c), t, f)</code> 在 <code>x.vmax &lt; c.vmin</code> 时 → <code>t</code>，在 <code>x.vmin >= c.vmax</code> 时 → <code>f</code>。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=界限坍缩与-minmax>界限坍缩与 min/max<a href=#界限坍缩与-minmax class=hash-link aria-label="界限坍缩与 min/max的直接链接" title="界限坍缩与 min/max的直接链接" translate=no>​</a></h3>
+<p><code>vmin_vmax_collapse_patterns</code>：可靠界限只有单一取值的 <code>Mul</code>、<code>FloorDiv</code>、<code>FloorMod</code>、比较、<code>PARAM</code> 或 <code>SPECIAL</code> 变成该常量（排除浮点；有意排除 <code>Add</code>/<code>Sub</code>/<code>Max</code>，以免只迭代一次的循环携带值被折叠掉）。<code>minmax_dsl_patterns</code>：当 <code>x.vmin >= y.vmax</code> 时 <code>Max(x, y)</code> → <code>x</code>（浮点要求严格大于，以保留零的符号），对 <code>y</code> 对称。没有 <code>Min</code> 算子：<code>Tensor::minimum</code> 是一个 <code>WHERE</code>。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=alu-链折叠alu_folding_dsl_patterns>ALU 链折叠（<code>alu_folding_dsl_patterns</code>）<a href=#alu-链折叠alu_folding_dsl_patterns class=hash-link aria-label=alu-链折叠alu_folding_dsl_patterns的直接链接 title=alu-链折叠alu_folding_dsl_patterns的直接链接 translate=no>​</a></h3>
+<p>结合律折叠 <code>(x ⊕ c1) ⊕ c2</code> → <code>x ⊕ (c1 ⊕ c2)</code>，适用于 <code>Add</code>、<code>Mul</code>、<code>And</code>、<code>Or</code>、<code>Xor</code>、<code>Max</code>；当 <code>y</code> 不是常量时，常量外推 <code>(x + c) + y</code> → <code>(x + y) + c</code> 和 <code>(x * c) * y</code> → <code>(x * y) * c</code>；<code>(x - c1) + c2</code>、<code>(x + c1) - c2</code> 规范化为 <code>x + k</code> 或 <code>x - |k|</code>；<code>(x - c1) - c2</code> → <code>x - (c1 + c2)</code>；<code>Sub(a, Sub(b, x))</code> → <code>x + (a - b)</code>。<code>Sub</code> 在 Svod 中是一等算子（Tinygrad 把 <code>a - b</code> 写作 <code>a + b*-1</code>）。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=比较comparison_dsl_patterns>比较（<code>comparison_dsl_patterns</code>）<a href=#比较comparison_dsl_patterns class=hash-link aria-label=比较comparison_dsl_patterns的直接链接 title=比较comparison_dsl_patterns的直接链接 translate=no>​</a></h3>
+<p>对全部六种比较：非浮点上的 <code>x op x</code> 被折叠（<code>Lt/Gt/Ne</code> → <code>false</code>，<code>Le/Ge/Eq</code> → <code>true</code>）；常量操作数被折叠；否则由 <code>ComparisonAnalyzer::analyze</code>（<code>ir/src/uop/comparison_analysis.rs</code>）根据可靠界限证明 <code>true</code> 或 <code>false</code> —— 两者都仅限非弱 dtype。然后：<code>Lt(Add[c0, x], c1)</code> → <code>Lt(x, c1 - c0)</code>；<code>Lt(Mul[x, -1], Mul[y, -1])</code> → <code>Lt(y, x)</code>；在无回绕检查下，对 <code>d > 0</code> 有 <code>Lt(FloorDiv(x, d), c)</code> → <code>Lt(x, c * d)</code>（对向下取整除法精确成立，<code>c</code> 可为任意符号）；对 <code>WeakInt</code>：<code>Lt(Mul[c0, x], c1)</code> → <code>±x &lt; ceil(c1 / |c0|)</code>，以及 GCD 折叠 <code>lt_folding</code>（<code>x = d*q + r</code>，<code>r ∈ [0, d)</code>，<code>d | c</code> ⇒ <code>x &lt; c ⇔ q &lt; c/d</code>）。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=range-与除法>Range 与除法<a href=#range-与除法 class=hash-link aria-label="Range 与除法的直接链接" title="Range 与除法的直接链接" translate=no>​</a></h3>
+<p><code>range_based_mod_div_patterns</code> 和 <code>advanced_division_dsl_patterns</code> 属于索引代数，见<a class="" href=/zh-Hans/docs/architecture/optimizations/index-arithmetic>索引算术</a>页面。<code>range_based_cast_patterns</code> 对界限能放入 <code>a</code> 的强整数 <code>x</code> 坍缩 <code>CAST(CAST(x, a), b)</code>。<code>long_to_int_narrowing_patterns</code> 把操作数和结果都能放入 <code>i32</code> 的 <code>Int64</code> 二元算子重写为 <code>Int32</code> 算子再转换回来，并把有符号整数类型转换分配到 <code>WeakInt + c</code> 上。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=after>AFTER<a href=#after class=hash-link aria-label=AFTER的直接链接 title=AFTER的直接链接 translate=no>​</a></h3>
+<p><code>after_simplification_patterns</code>：不是副作用的 deps（<code>RANGE</code>、<code>STORE</code>、<code>END</code>、<code>CALL</code>、<code>BARRIER</code>、<code>CUSTOM</code>、<code>FUNCTION</code>）被替换为它们自己的源并去重；<code>NOOP</code> deps 和 <code>END(NOOP)</code> 链被丢弃；<code>AFTER(x, [])</code> → <code>x</code>。</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=第-3-层sym>第 3 层（<code>sym</code>）<a href=#第-3-层sym class=hash-link aria-label=第-3-层sym的直接链接 title=第-3-层sym的直接链接 translate=no>​</a></h2>
 <ul>
-<li class=""><code>c > 0</code>：等价于 <code>x &lt; c*d</code></li>
-<li class=""><code>c &lt;= 0</code>：等价于 <code>x &lt; c*d - (d-1)</code></li>
+<li class=""><strong><code>pm_simplify_valid</code></strong>（<code>valid_simplification.rs</code>）：由 <code>Bool</code> 有效性子句构成的 <code>And</code> 链逐子句化简（<code>simplify_valid</code>），而 <code>x: WeakInt</code> 的 <code>WHERE(cond, x, Invalid)</code> 会在 <code>cond</code> 蕴含的界限下重写 <code>x</code>（<code>uop_given_valid</code>）：<code>parse_valid</code> 把每个子句读作 <code>expr &lt; c</code> / <code>expr >= c</code>，代入一个有界变量后重新化简。</li>
+<li class=""><strong><code>alu_vectorize_reorder_patterns</code></strong>：对 13 个算术/位运算算子和六种比较，当两个操作数都是同一节点、lane 数相同且 > 1 的广播时，<code>op(STACK(x, x, ..), STACK(y, y, ..))</code> → <code>STACK(op(x, y), ..)</code>。</li>
+<li class=""><strong><code>ne_zero_fold_patterns</code></strong>：<code>Ne(x, 0)</code> → <code>x.cast(bool)</code>。</li>
+<li class=""><strong><code>cast_where_dsl_patterns</code></strong>：<code>CAST(WHERE(s, a, b))</code> → <code>WHERE(s, CAST(a), CAST(b))</code>。</li>
+<li class=""><strong><code>store_load_folding_patterns</code></strong>：<code>STORE(_, Invalid)</code> → <code>NOOP</code>；<code>STORE(INDEX, WHERE(c, v, Invalid))</code> → 向带 gate 的索引 <code>INDEX(buf, WHERE(c, idx, Invalid))</code> 存储 <code>v</code>；<code>STORE(idx, LOAD(idx))</code> → <code>NOOP</code>；<code>STORE(INDEX, WHERE(g, alt, LOAD(same INDEX)))</code> → 带 gate 地存储 <code>alt</code>。</li>
+<li class=""><strong><code>reduce_sym_patterns</code></strong>：<code>REDUCE(x * c, Add)</code> → <code>REDUCE(x, Add) * c</code>，以及 <code>reduce_mul_chain_sym</code>（把与 range 无关的因子提出 <code>Add</code>/<code>Max</code> 归约；对 <code>Max</code> 只提出非负因子），仅限整数。</li>
+<li class=""><strong><code>sym_phase3_patterns</code></strong>：<code>-1 * (x + y)</code> → <code>-x + -y</code>；对 <code>WeakInt</code>，<code>(x + y) * c</code> → <code>x*c + y*c</code>；单源 <code>GROUP</code> 解包；把 <code>NOOP</code>/<code>STACK</code>/<code>SINK</code> 展平进 <code>SINK</code>/<code>GROUP</code>；<code>END(NOOP)</code> → <code>NOOP</code>。</li>
 </ul>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=11-minmax-消除>11. Min/Max 消除<a href=#11-minmax-消除 class=hash-link aria-label="11. Min/Max 消除的直接链接" title="11. Min/Max 消除的直接链接" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>MAX(x, x)</code><td><code>x</code><td>自身取最大值为恒等<tr><td><code>MAX(x, y)</code><td><code>x</code><td>当 <code>x.vmin >= y.vmax</code>（边界证明占优）<tr><td><code>MAX(x, y)</code><td><code>y</code><td>当 <code>y.vmin >= x.vmax</code></table>
-<p>使用 <code>VminVmaxProperty</code> 进行范围分析。没有单独的 <code>MIN</code> 模式——Svod 在这些模式触发之前将 <code>MIN(a,b)</code> 降级为 <code>NEG(MAX(NEG(a), NEG(b)))</code>。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=12-where-优化>12. WHERE 优化<a href=#12-where-优化 class=hash-link aria-label="12. WHERE 优化的直接链接" title="12. WHERE 优化的直接链接" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=条件消除>条件消除<a href=#条件消除 class=hash-link aria-label=条件消除的直接链接 title=条件消除的直接链接 translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>WHERE(cond, t, f)</code><td><code>t</code><td>当 <code>cond.vmin == cond.vmax == true</code><tr><td><code>WHERE(cond, t, f)</code><td><code>f</code><td>当 <code>cond.vmin == cond.vmax == false</code><tr><td><code>WHERE(LT(x, c), t, f)</code><td><code>t</code><td>当 <code>x.vmax &lt; c.vmin</code>（始终为真）<tr><td><code>WHERE(LT(x, c), t, f)</code><td><code>f</code><td>当 <code>x.vmin >= c.vmax</code>（始终为假）</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=分支化简>分支化简<a href=#分支化简 class=hash-link aria-label=分支化简的直接链接 title=分支化简的直接链接 translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>WHERE(_, t, t)</code><td><code>t</code><td>相同分支<tr><td><code>WHERE(x, true, false)</code><td><code>x</code><td>布尔恒等<tr><td><code>WHERE(x, false, true)</code><td><code>NOT(x)</code><td>布尔取反<tr><td><code>WHERE(NOT(cond), t, f)</code><td><code>WHERE(cond, f, t)</code><td>条件翻转<tr><td><code>WHERE(a, WHERE(b, c, d), d)</code><td><code>WHERE(AND(a, b), c, d)</code><td>分支合并（<code>d</code> 上使用 ptr_eq）</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>条件翻转的 Invalid 守卫</div><div class=admonitionContent_BuS1><p><code>WHERE(NOT(cond), t, f) -> WHERE(cond, f, t)</code> 当 <code>f</code> 包含 <code>Invalid</code> 时<strong>不会</strong>应用。填充操作创建 <code>WHERE(valid, idx, Invalid)</code> 结构，交换后会将 <code>Invalid</code> 移到真分支，使下游模式无法匹配。标量 <code>Invalid</code> 和向量化 <code>VECTORIZE(Invalid, ...)</code> 都会被检查。<p>Tinygrad 有相同的守卫：<code>symbolic.py:201-202</code>。</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=13-invalid-传播>13. Invalid 传播<a href=#13-invalid-传播 class=hash-link aria-label="13. Invalid 传播的直接链接" title="13. Invalid 传播的直接链接" translate=no>​</a></h2>
-<p>Invalid 是 Svod 对填充操作创建的越界张量区域的哨兵值。这些模式必须在恒等模式（如 <code>x*0=0</code>）<strong>之前</strong>运行，否则有效性标记会被破坏。</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=模式优先级示例>模式优先级示例<a href=#模式优先级示例 class=hash-link aria-label=模式优先级示例的直接链接 title=模式优先级示例的直接链接 translate=no>​</a></h3>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Without ordering:  MUL(0, WHERE(cond, x, Invalid)) -> 0    (x*0=0 fires, loses Invalid)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">With ordering:     MUL(0, WHERE(cond, x, Invalid))</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                 -> WHERE(cond, MUL(0, x), Invalid)         (Invalid propagation fires first)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                 -> WHERE(cond, 0, Invalid)                  (then x*0=0 is safe)</span><br/></div></code></pre></div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=where-invalid-合并>WHERE-Invalid 合并<a href=#where-invalid-合并 class=hash-link aria-label="WHERE-Invalid 合并的直接链接" title="WHERE-Invalid 合并的直接链接" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<tbody><tr><td><code>WHERE(c1, WHERE(c2, x, Inv), Inv)</code><td><code>WHERE(AND(c1, c2), x, Inv)</code><tr><td><code>WHERE(c1, WHERE(c2, x, Inv), y)</code><td><code>WHERE(AND(c1, c2), x, y)</code></table>
-<p>多维填充在通过线性化索引算术传播后会创建嵌套 WHERE-Invalid。合并为单层确保 <code>pm_lower_index_dtype</code> 能一步处理。</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=将操作推入-where-invalid>将操作推入 WHERE-Invalid<a href=#将操作推入-where-invalid class=hash-link aria-label="将操作推入 WHERE-Invalid的直接链接" title="将操作推入 WHERE-Invalid的直接链接" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>操作<tbody><tr><td><code>CAST(WHERE(c, x, Inv))</code><td><code>WHERE(c, CAST(x), Inv)</code><td><tr><td><code>op(WHERE(c, x, Inv), y)</code><td><code>WHERE(c, op(x, y), Inv)</code><td>13 个二元操作（非比较）<tr><td><code>op(y, WHERE(c, x, Inv))</code><td><code>WHERE(c, op(y, x), Inv)</code><td>13 个二元操作（非比较）<tr><td><code>cmp(WHERE(c, x, Inv), y)</code><td><code>cmp(x, y)</code><td>Lt, Le, Eq, Ne, Gt, Ge<tr><td><code>cmp(y, WHERE(c, x, Inv))</code><td><code>cmp(y, x)</code><td>Lt, Le, Eq, Ne, Gt, Ge</table>
-<p>对于比较操作，WHERE-Invalid 被剥离——Invalid 区域已在下游被门控。</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=裸-invalid-传播>裸 Invalid 传播<a href=#裸-invalid-传播 class=hash-link aria-label="裸 Invalid 传播的直接链接" title="裸 Invalid 传播的直接链接" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>守卫<tbody><tr><td><code>op(Invalid, y)</code><td><code>Invalid</code><td><code>y.dtype() == DType::Index</code>，仅左侧位置</table>
-<p>Tinygrad 对齐：<code>symbolic.py:37</code>。右侧位置的裸 Invalid <strong>不会</strong>传播，以避免污染非索引计算。</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=invalid-索引的死加载存储>Invalid 索引的死加载/存储<a href=#invalid-索引的死加载存储 class=hash-link aria-label="Invalid 索引的死加载/存储的直接链接" title="Invalid 索引的死加载/存储的直接链接" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<tbody><tr><td><code>LOAD(INDEX(buf, Invalid))</code><td><code>CONST(0)</code><tr><td><code>LOAD(CAST(INDEX(buf, Invalid)))</code><td><code>CONST(0)</code><tr><td><code>STORE(INDEX(buf, Invalid), val)</code><td><code>NOOP</code><tr><td><code>STORE(CAST(INDEX(buf, Invalid)), val)</code><td><code>NOOP</code></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=14-死代码消除>14. 死代码消除<a href=#14-死代码消除 class=hash-link aria-label="14. 死代码消除的直接链接" title="14. 死代码消除的直接链接" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=死范围>死范围<a href=#死范围 class=hash-link aria-label=死范围的直接链接 title=死范围的直接链接 translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>RANGE(end)</code> 且 <code>vmax &lt; 0</code><td><code>CONST(0)</code><td>空范围（永不执行）<tr><td><code>RANGE(CONST)</code> 且 <code>vmin == vmax</code><td><code>CONST(vmin)</code><td>平凡范围（单一值）<tr><td><code>END(computation, ranges)</code><td><code>END(computation, live_ranges)</code><td>从 END 过滤死范围<tr><td><code>END(computation, [])</code><td><code>computation</code><td>所有范围已死——展开</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=死规约>死规约<a href=#死规约 class=hash-link aria-label=死规约的直接链接 title=死规约的直接链接 translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>规约操作<th>单位元<tbody><tr><td>Add<td><code>0</code><tr><td>Mul<td><code>1</code><tr><td>Max<td><code>-inf</code>（dtype 最小值）<tr><td>Min<td><code>+inf</code>（dtype 最大值）</table>
-<p>当 REDUCE 的所有范围都为死（空）时，REDUCE 被替换为其单位元。</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=依赖化简>依赖化简<a href=#依赖化简 class=hash-link aria-label=依赖化简的直接链接 title=依赖化简的直接链接 translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<tbody><tr><td><code>AFTER(x, [])</code><td><code>x</code></table>
-<p>无依赖意味着无排序约束。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=15-幂与取反>15. 幂与取反<a href=#15-幂与取反 class=hash-link aria-label="15. 幂与取反的直接链接" title="15. 幂与取反的直接链接" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<tbody><tr><td><code>POW(x, 0)</code><td><code>1</code><tr><td><code>POW(x, 1)</code><td><code>x</code><tr><td><code>NEG(NEG(x))</code><td><code>x</code></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=16-通道折叠index-作用于-stack>16. 通道折叠——INDEX 作用于 STACK<a href=#16-通道折叠index-作用于-stack class=hash-link aria-label="16. 通道折叠——INDEX 作用于 STACK的直接链接" title="16. 通道折叠——INDEX 作用于 STACK的直接链接" translate=no>​</a></h2>
-<p>Svod 没有 GEP 操作：带形状的值就是一个由通道组成的 <code>STACK</code>，而 <code>INDEX</code> 从中选取通道，方式与它从 buffer 中选取地址完全一致。因此 Tinygrad 的 <code>gep_pushing</code> 在这里没有直接对应物。Svod 拥有的是一组折叠规则，用来把 <code>INDEX</code>/<code>STACK</code> 结构塌缩掉，好让去向量化器只看到标量。</p>
-<p>这些折叠大多是结构性的，位于去向量化器的 movement 清理中（<code>schedule/src/devectorize.rs</code>），而不在 <code>symbolic_simple()</code> 里。唯一属于符号层的规则是 <code>alu_vectorize_reorder_patterns</code>，它属于第 3 层的 <code>sym()</code>。</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=通道选取与塌缩>通道选取与塌缩<a href=#通道选取与塌缩 class=hash-link aria-label=通道选取与塌缩的直接链接 title=通道选取与塌缩的直接链接 translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>INDEX(STACK([a, b, c]), 2)</code><td><code>c</code><td>常量通道下标直接折叠到被堆叠的源<tr><td><code>INDEX(STACK([...]), c0, rest...)</code><td><code>INDEX(sources[c0], rest...)</code><td>前导常量递归地剥掉一层 STACK<tr><td><code>STACK([INDEX(b, 0), INDEX(b, 1), ...])</code><td><code>b</code><td>顺序的通道读取重建出源<tr><td><code>INDEX(INDEX(b, i), j)</code><td><code>INDEX(b, i, j)</code><td>组合标量索引链<tr><td><code>INDEX(AFTER(STACK([...]), deps), c)</code><td>选中的通道，并重新挂回 <code>deps</code><td>寄存器栈的通道选取保留顺序依赖</table>
-<p><code>const_index_into_stack</code> 是递归的：索引列表中前导的每个常量都会剥掉一层 <code>STACK</code>。</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=作用于-stack-的-alu>作用于 STACK 的 ALU<a href=#作用于-stack-的-alu class=hash-link aria-label="作用于 STACK 的 ALU的直接链接" title="作用于 STACK 的 ALU的直接链接" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>守卫<tbody><tr><td><code>op(STACK(x,x,x,x), STACK(y,y,y,y))</code><td><code>STACK(op(x,y), op(x,y), ...)</code><td>两个操作数都是广播（所有通道 <code>ptr_eq</code>），长度相等且 > 1</table>
-<p>适用于十八个二元操作——Add、Mul、Sub、FloorMod、Max、FloorDiv、Fdiv、Pow、And、Or、Xor、Shl、Shr 以及六个比较操作。塌缩为「单个标量操作的 <code>STACK</code>」之后，操作数就暴露给常量折叠和标量化简了。</p>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>仅第 3 层</div><div class=admonitionContent_BuS1><p><code>alu_vectorize_reorder_patterns</code> 属于 <code>sym()</code>，不属于 <code>symbolic()</code> 或 <code>symbolic_simple()</code>。它在运行 <code>sym()</code> 的那些阶段触发——预优化、阶段 8 和去向量化器——所以到最终的分解+渲染 pass 时，重排已经发生过了。</div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=stack-周边的-movement-清理>STACK 周边的 Movement 清理<a href=#stack-周边的-movement-清理 class=hash-link aria-label="STACK 周边的 Movement 清理的直接链接" title="STACK 周边的 Movement 清理的直接链接" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<tbody><tr><td><code>RESHAPE(STACK([x]))</code><td><code>x</code>——当形状本就一致时<tr><td>添加前导 1 维的 <code>RESHAPE(x)</code><td>每增加一维就套一层 <code>STACK([x])</code><tr><td><code>EXPAND(STACK([x]))</code><td><code>STACK([x, x, ..., x])</code>——物化该广播<tr><td><code>PERMUTE(PERMUTE(x, a), b)</code><td><code>PERMUTE(x, a∘b)</code>；恒等置换被消掉</table>
-<p>这些规则位于 <code>movement_cleanup_patterns()</code> / <code>mop_cleanup_patterns()</code>，由去向量化器在标量化之前应用。WMMA 的通道同样在那里处理，由 <code>stack_wmma_sources</code> 和 <code>broadcast_and_devec_wmma</code> 负责，而不是由任何符号模式负责。</p>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=17-load-上的-where仅阶段-8>17. LOAD 上的 WHERE（仅阶段 8）<a href=#17-load-上的-where仅阶段-8 class=hash-link aria-label="17. LOAD 上的 WHERE（仅阶段 8）的直接链接" title="17. LOAD 上的 WHERE（仅阶段 8）的直接链接" translate=no>​</a></h2>
-<p><strong>函数</strong>：<code>pm_move_where_on_load()</code></p>
-<p>通过将条件嵌入 INDEX 操作来变换带掩码的加载：</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Before:  WHERE(cond, INDEX(buf, idx), 0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">After:   INDEX(buf, WHERE(combined_cond, idx, Invalid))</span><br/></div></code></pre></div></div>
-<p>这启用了硬件谓词化的带掩码加载，消除了 WHERE 开销。</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=工作原理>工作原理<a href=#工作原理 class=hash-link aria-label=工作原理的直接链接 title=工作原理的直接链接 translate=no>​</a></h3>
-<ol>
-<li class=""><strong>拆分</strong>条件为 AND 子句</li>
-<li class=""><strong>分区</strong>子句为可移动与剩余：
-<ul>
-<li class="">可移动：所有 RANGE 依赖在 INDEX 作用域内，无外部 INDEX 依赖</li>
-<li class="">剩余：其他一切</li>
-</ul>
-</li>
-<li class=""><strong>嵌入</strong>可移动子句为 <code>indices[0]</code> 中的 <code>WHERE(cond, idx, Invalid)</code></li>
-<li class="">如果存在剩余子句，<strong>包装</strong>外层 WHERE</li>
-</ol>
-<p>支持部分子句移动——仅移动范围在索引作用域内的子句。<code>indices[0]</code> 中已有的有效性子句会被去重。</p>
-<p>反转模式 <code>WHERE(cond, 0, INDEX(buf, idx))</code> 也通过取反条件来处理。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=18-交换律规范化>18. 交换律规范化<a href=#18-交换律规范化 class=hash-link aria-label="18. 交换律规范化的直接链接" title="18. 交换律规范化的直接链接" translate=no>​</a></h2>
-<p>对于 Index dtype 上的交换二元操作，操作数按 UOp id 排序（较小 id 在左）：</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>操作<th>守卫<tbody><tr><td>Add, Mul, Max, Eq, Ne, And, Or, Xor<td><code>dtype == DType::Index && b.id &lt; a.id</code></table>
-<p>没有此规范化，数学等价的表达式如 <code>R1*8000 + R2*16</code> 和 <code>R2*16 + R1*8000</code> 不会被 hash consing 去重，从而破坏 <code>expand_vector_index</code> 中的分组。</p>
-<p>仅应用于 Index dtype 以避免破坏向量数学合并。Tinygrad：<code>symbolic.py:178-182</code>。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=19-div-mod-化简>19. Div-Mod 化简<a href=#19-div-mod-化简 class=hash-link aria-label="19. Div-Mod 化简的直接链接" title="19. Div-Mod 化简的直接链接" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=基于范围的快速路径>基于范围的快速路径<a href=#基于范围的快速路径 class=hash-link aria-label=基于范围的快速路径的直接链接 title=基于范围的快速路径的直接链接 translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>条件<tbody><tr><td><code>MOD(x, n)</code><td><code>x</code><td><code>0 &lt;= vmin(x)</code> 且 <code>vmax(x) &lt; n</code><tr><td><code>IDIV(x, n)</code><td><code>k</code><td>范围内所有值除以同一个 <code>k</code><tr><td><code>MOD(ADD[MUL[a, m], b], n)</code><td><code>MOD(b, n)</code><td><code>m == n</code>（提取倍数）<tr><td><code>IDIV(ADD[MUL[a, m], b], n)</code><td><code>a + IDIV(b, n)</code><td><code>m == n</code><tr><td><code>IDIV(ADD[MUL[a, m], b], n)</code><td><code>a</code><td><code>m == n</code> 且 <code>0 &lt;= b &lt; n</code></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=统一-div-mod-引擎fold_divmod_general>统一 Div-Mod 引擎（<code>fold_divmod_general</code>）<a href=#统一-div-mod-引擎fold_divmod_general class=hash-link aria-label=统一-div-mod-引擎fold_divmod_general的直接链接 title=统一-div-mod-引擎fold_divmod_general的直接链接 translate=no>​</a></h3>
-<p>对于 Index dtype 上的 IDIV 和 MOD，统一引擎按优先级顺序尝试化简规则。基于 Tinygrad 的 <code>fold_divmod_general</code>（<code>divandmod.py:8-96</code>）。</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>优先级<th>规则<th>描述<tbody><tr><td>1<td>cancel_divmod<td>范围位于单个除数区间内<tr><td>2<td>nested_div<td><code>(a % (k*c)) // c -> (a // c) % k</code><tr><td>3<td>remove_nested_mod<td><code>(a%4 + b)%2 -> (a+b)%2</code>，当 `2<tr><td>4<td>fold_divmod_congruence<td>因子同余模算术<tr><td>5<td>gcd_with_remainder<td>从分子中提取公共 GCD<tr><td>6<td>nest_div_by_smallest_factor<td>按最小公共因子递归拆分<tr><td>7<td>divide_by_gcd<td>任意分母的 GCD 分解<tr><td>8<td>factor_remainder<td><code>(d*x+y)//d -> x + y//d</code>（最后手段）</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=div-mod-重组合>Div-Mod 重组合<a href=#div-mod-重组合 class=hash-link aria-label="Div-Mod 重组合的直接链接" title="Div-Mod 重组合的直接链接" translate=no>​</a></h3>
-<p>将分离的 div 和 mod 操作重组合回原始表达式的模式：</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>守卫<tbody><tr><td><code>ADD[MOD(x, n), MUL[IDIV(x, n), n]]</code><td><code>x</code><td>x, n 上使用 ptr_eq<tr><td><code>ADD[MOD(IDIV(x, a), c), MUL[IDIV(x, b), c]]</code><td><code>IDIV(x, a)</code><td><code>a * c == b</code><tr><td><code>ADD[MUL[MOD(x, c1), c2], MUL[IDIV(x, c1), c3]]</code><td><code>MUL(x, c2)</code><td><code>c1 * c2 == c3</code><tr><td><code>ADD[ADD[y, MOD(x, n)], MUL[IDIV(x, n), n]]</code><td><code>ADD(y, x)</code><td>x, n 上使用 ptr_eq<tr><td><code>IDIV(ADD[IDIV(a, c1), c2], c3)</code><td><code>IDIV(ADD(a, c1*c2), c1*c3)</code><td>嵌套除法</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=高级除法>高级除法<a href=#高级除法 class=hash-link aria-label=高级除法的直接链接 title=高级除法的直接链接 translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>模式<th>结果<th>说明<tbody><tr><td><code>IDIV(IDIV(a, b), c)</code><td><code>IDIV(a, b*c)</code><td>组合嵌套除法<tr><td><code>IDIV(expr, d)</code><td><code>expr.divides(d)</code><td>通用精确除法<tr><td><code>IDIV(ADD(a, b), c)</code><td><code>IDIV(a, c) + IDIV(b, c)</code><td>两边都能整除时<tr><td><code>IDIV(SUB(a, b), c)</code><td><code>IDIV(a, c) - IDIV(b, c)</code><td>两边都能整除时<tr><td><code>MUL(c, ADD(a, b))</code><td><code>ADD(MUL(c, a), MUL(c, b))</code><td>分配乘法</table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=交叉引用>交叉引用<a href=#交叉引用 class=hash-link aria-label=交叉引用的直接链接 title=交叉引用的直接链接 translate=no>​</a></h2>
-<ul>
-<li class=""><a class="" href=/zh-Hans/docs/architecture/pipeline>执行流水线</a>——这些模式运行的阶段</li>
-<li class=""><a class="" href=/zh-Hans/docs/architecture/optimizations/pattern-system>模式引擎</a>——模式匹配引擎的工作原理</li>
-<li class=""><a class="" href=/zh-Hans/docs/architecture/codegen/rangeify>Rangeify</a>——阶段 4 上下文（模式在变换操作降级后运行）</li>
-<li class=""><a class="" href=/zh-Hans/docs/architecture/codegen/expander>Expander</a>——阶段 8 上下文（模式在优化动作后运行）</li>
-<li class=""><a class="" href=/zh-Hans/docs/architecture/codegen/linearizer>Linearizer</a>——阶段 16 上下文（最终清理）</li>
-</ul></div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/architecture/optimizations/algebraic-simplification.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>编辑此页</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label=文件选项卡><a class="pagination-nav__link pagination-nav__link--prev" href=/zh-Hans/docs/architecture/optimizations/pattern-system><div class=pagination-nav__sublabel>上一页</div><div class=pagination-nav__label>模式引擎</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/zh-Hans/docs/architecture/optimizations/index-arithmetic><div class=pagination-nav__sublabel>下一页</div><div class=pagination-nav__label>索引算术</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#示例优化级联 class="table-of-contents__link toc-highlight">示例：优化级联</a><li><a href=#模式排序 class="table-of-contents__link toc-highlight">模式排序</a><li><a href=#1-常量折叠 class="table-of-contents__link toc-highlight">1. 常量折叠</a><ul><li><a href=#标量常量 class="table-of-contents__link toc-highlight">标量常量</a><li><a href=#向量常量 class="table-of-contents__link toc-highlight">向量常量</a></ul><li><a href=#2-恒等与零值传播 class="table-of-contents__link toc-highlight">2. 恒等与零值传播</a><li><a href=#3-自折叠 class="table-of-contents__link toc-highlight">3. 自折叠</a><li><a href=#4-零值折叠 class="table-of-contents__link toc-highlight">4. 零值折叠</a><li><a href=#5-除法化简 class="table-of-contents__link toc-highlight">5. 除法化简</a><li><a href=#6-类型转换优化 class="table-of-contents__link toc-highlight">6. 类型转换优化</a><li><a href=#7-同类项合并 class="table-of-contents__link toc-highlight">7. 同类项合并</a><li><a href=#8-alu-链折叠 class="table-of-contents__link toc-highlight">8. ALU 链折叠</a><ul><li><a href=#常量折叠 class="table-of-contents__link toc-highlight">常量折叠</a><li><a href=#常量外推 class="table-of-contents__link toc-highlight">常量外推</a><li><a href=#sub-规范化 class="table-of-contents__link toc-highlight">Sub 规范化</a></ul><li><a href=#9-布尔逻辑 class="table-of-contents__link toc-highlight">9. 布尔逻辑</a><li><a href=#10-比较化简 class="table-of-contents__link toc-highlight">10. 比较化简</a><ul><li><a href=#自比较非浮点ptr_eq class="table-of-contents__link toc-highlight">自比较（非浮点，ptr_eq）</a><li><a href=#常量与范围分析 class="table-of-contents__link toc-highlight">常量与范围分析</a><li><a href=#代数变换 class="table-of-contents__link toc-highlight">代数变换</a></ul><li><a href=#11-minmax-消除 class="table-of-contents__link toc-highlight">11. Min/Max 消除</a><li><a href=#12-where-优化 class="table-of-contents__link toc-highlight">12. WHERE 优化</a><ul><li><a href=#条件消除 class="table-of-contents__link toc-highlight">条件消除</a><li><a href=#分支化简 class="table-of-contents__link toc-highlight">分支化简</a></ul><li><a href=#13-invalid-传播 class="table-of-contents__link toc-highlight">13. Invalid 传播</a><ul><li><a href=#模式优先级示例 class="table-of-contents__link toc-highlight">模式优先级示例</a><li><a href=#where-invalid-合并 class="table-of-contents__link toc-highlight">WHERE-Invalid 合并</a><li><a href=#将操作推入-where-invalid class="table-of-contents__link toc-highlight">将操作推入 WHERE-Invalid</a><li><a href=#裸-invalid-传播 class="table-of-contents__link toc-highlight">裸 Invalid 传播</a><li><a href=#invalid-索引的死加载存储 class="table-of-contents__link toc-highlight">Invalid 索引的死加载/存储</a></ul><li><a href=#14-死代码消除 class="table-of-contents__link toc-highlight">14. 死代码消除</a><ul><li><a href=#死范围 class="table-of-contents__link toc-highlight">死范围</a><li><a href=#死规约 class="table-of-contents__link toc-highlight">死规约</a><li><a href=#依赖化简 class="table-of-contents__link toc-highlight">依赖化简</a></ul><li><a href=#15-幂与取反 class="table-of-contents__link toc-highlight">15. 幂与取反</a><li><a href=#16-通道折叠index-作用于-stack class="table-of-contents__link toc-highlight">16. 通道折叠——INDEX 作用于 STACK</a><ul><li><a href=#通道选取与塌缩 class="table-of-contents__link toc-highlight">通道选取与塌缩</a><li><a href=#作用于-stack-的-alu class="table-of-contents__link toc-highlight">作用于 STACK 的 ALU</a><li><a href=#stack-周边的-movement-清理 class="table-of-contents__link toc-highlight">STACK 周边的 Movement 清理</a></ul><li><a href=#17-load-上的-where仅阶段-8 class="table-of-contents__link toc-highlight">17. LOAD 上的 WHERE（仅阶段 8）</a><ul><li><a href=#工作原理 class="table-of-contents__link toc-highlight">工作原理</a></ul><li><a href=#18-交换律规范化 class="table-of-contents__link toc-highlight">18. 交换律规范化</a><li><a href=#19-div-mod-化简 class="table-of-contents__link toc-highlight">19. Div-Mod 化简</a><ul><li><a href=#基于范围的快速路径 class="table-of-contents__link toc-highlight">基于范围的快速路径</a><li><a href=#统一-div-mod-引擎fold_divmod_general class="table-of-contents__link toc-highlight">统一 Div-Mod 引擎（<code>fold_divmod_general</code>）</a><li><a href=#div-mod-重组合 class="table-of-contents__link toc-highlight">Div-Mod 重组合</a><li><a href=#高级除法 class="table-of-contents__link toc-highlight">高级除法</a></ul><li><a href=#交叉引用 class="table-of-contents__link toc-highlight">交叉引用</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>文档</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/zh-Hans/docs/introduction>简介</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>社区</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=级联示例>级联示例<a href=#级联示例 class=hash-link aria-label=级联示例的直接链接 title=级联示例的直接链接 translate=no>​</a></h2>
+<p><code>x: Int32</code> 时的 <code>(x + 0) * 1 + (3 + 4)</code>：</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Add(x, 0)        → x          identity_and_zero</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Mul(x, 1)        → x          identity_and_zero</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Add(3, 4)        → 7          constant_folding</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Add(x, 7)                     stays: no rule</span><br/></div></code></pre></div></div>
+<p>引擎先重写子节点再重写父节点，并对重建后的父节点重新匹配，因此这三步在一次 <code>graph_rewrite</code> 中完成。其中的恒等步骤正是 <a class="" href=/zh-Hans/docs/architecture/optimizations/pattern-system#verifying-rewrites-with-z3>Z3 预言测试</a>所证明的那些。</div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/architecture/optimizations/algebraic-simplification.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>编辑此页</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label=文件选项卡><a class="pagination-nav__link pagination-nav__link--prev" href=/zh-Hans/docs/architecture/optimizations/pattern-system><div class=pagination-nav__sublabel>上一页</div><div class=pagination-nav__label>模式引擎</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/zh-Hans/docs/architecture/optimizations/index-arithmetic><div class=pagination-nav__sublabel>下一页</div><div class=pagination-nav__label>索引算术</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#组成 class="table-of-contents__link toc-highlight">组成</a><li><a href=#第-1-层 class="table-of-contents__link toc-highlight">第 1 层</a><ul><li><a href=#invalid-传播propagate_invalid class="table-of-contents__link toc-highlight">Invalid 传播（<code>propagate_invalid</code>）</a><li><a href=#死-load-与死-storefold_invalid_load_store class="table-of-contents__link toc-highlight">死 load 与死 store（<code>fold_invalid_load_store</code>）</a><li><a href=#常量折叠 class="table-of-contents__link toc-highlight">常量折叠</a><li><a href=#bool-运算 class="table-of-contents__link toc-highlight">Bool 运算</a><li><a href=#恒等与零 class="table-of-contents__link toc-highlight">恒等与零</a><li><a href=#自身折叠与零折叠 class="table-of-contents__link toc-highlight">自身折叠与零折叠</a><li><a href=#除法 class="table-of-contents__link toc-highlight">除法</a><li><a href=#类型转换 class="table-of-contents__link toc-highlight">类型转换</a><li><a href=#除法与取模的重组 class="table-of-contents__link toc-highlight">除法与取模的重组</a><li><a href=#幂布尔与-dce class="table-of-contents__link toc-highlight">幂、布尔与 DCE</a></ul><li><a href=#第-2-层 class="table-of-contents__link toc-highlight">第 2 层</a><ul><li><a href=#交换律规范化 class="table-of-contents__link toc-highlight">交换律规范化</a><li><a href=#项合并带常量的-addmul class="table-of-contents__link toc-highlight">项合并（带常量的 <code>Add</code>/<code>Mul</code>）</a><li><a href=#布尔boolean_dsl_patterns class="table-of-contents__link toc-highlight">布尔（<code>boolean_dsl_patterns</code>）</a><li><a href=#where class="table-of-contents__link toc-highlight">WHERE</a><li><a href=#界限坍缩与-minmax class="table-of-contents__link toc-highlight">界限坍缩与 min/max</a><li><a href=#alu-链折叠alu_folding_dsl_patterns class="table-of-contents__link toc-highlight">ALU 链折叠（<code>alu_folding_dsl_patterns</code>）</a><li><a href=#比较comparison_dsl_patterns class="table-of-contents__link toc-highlight">比较（<code>comparison_dsl_patterns</code>）</a><li><a href=#range-与除法 class="table-of-contents__link toc-highlight">Range 与除法</a><li><a href=#after class="table-of-contents__link toc-highlight">AFTER</a></ul><li><a href=#第-3-层sym class="table-of-contents__link toc-highlight">第 3 层（<code>sym</code>）</a><li><a href=#级联示例 class="table-of-contents__link toc-highlight">级联示例</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>文档</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/zh-Hans/docs/introduction>简介</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>社区</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

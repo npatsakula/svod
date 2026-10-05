@@ -1,0 +1,232 @@
+<!doctype html><html lang=hi dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-backends/metal" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>Metal बैकएंड | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/hi/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/hi/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/hi/docs/backends/metal /><meta data-rh=true property=og:locale content=hi /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true name=docusaurus_locale content=hi /><meta data-rh=true name=docsearch:language content=hi /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="Metal बैकएंड | Svod"/><meta data-rh=true name=description content="Svod Metal के माध्यम से Apple GPUs पर चलता है। बैकएंड सीधे Objective-C runtime के विरुद्ध"/><meta data-rh=true property=og:description content="Svod Metal के माध्यम से Apple GPUs पर चलता है। बैकएंड सीधे Objective-C runtime के विरुद्ध"/><link data-rh=true rel=icon href=/hi/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/hi/docs/backends/metal /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/metal hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/backends/metal hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/backends/metal hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/backends/metal hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/metal hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/hi/docs/backends/metal","name":"Metal","position":1}]}</script><link rel=stylesheet href=/hi/assets/css/styles.e76ef093.css /><script src=/hi/assets/js/runtime~main.8668cc51.js defer></script><script src=/hi/assets/js/main.67b15077.js defer></script></head><body><svg style="display: none;"><defs>
+<symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
+</defs></svg>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-007")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/hi/img/logo.svg /><div role=region aria-label="मुख्य कंटेंट तक स्किप करें"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>मुख्य कंटेंट तक स्किप करें</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Toggle navigation bar" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/hi/><div class=navbar__logo><img src=/hi/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/hi/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/hi/docs/introduction>डॉक्स</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>हिन्दी</a><ul class=dropdown__menu><li><a href=/docs/backends/metal target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/backends/metal target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/backends/metal target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/backends/metal target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Switch between dark and light mode (currently system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Scroll back to top" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/hi/docs/introduction><span class=linkLabel_WmDU>परिचय</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/examples><span class=categoryLinkLabel_W154>शुरुआत</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/architecture/ir-design><span class=categoryLinkLabel_W154>आर्किटेक्चर</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/hi/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile कर्नेल (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/hi/docs/backends/overview><span class=categoryLinkLabel_W154>बैकएंड</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/backends/overview><span class=linkLabel_WmDU>अवलोकन</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/backends/cpu><span class=linkLabel_WmDU>CPU</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/hi/docs/backends/jit-loader><span class=linkLabel_WmDU>ELF JIT लोडर</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/hi/docs/backends/metal><span class=linkLabel_WmDU>Metal</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/hi/docs/backends/amd/overview><span class=categoryLinkLabel_W154>AMD बैकएंड</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/hi/docs/backends/cuda/overview><span class=categoryLinkLabel_W154>CUDA बैकएंड</span></a></div></ul></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=Breadcrumbs><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Home page" class=breadcrumbs__link href=/hi/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>बैकएंड</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>Metal</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">इस पेज पर</button></div><div class="theme-doc-markdown markdown"><header><h1>Metal बैकएंड</h1></header>
+<p>Svod Metal के माध्यम से Apple GPUs पर चलता है। बैकएंड सीधे Objective-C runtime के विरुद्ध
+लिखा गया है: <code>libobjc</code>, <code>Metal.framework</code> और private <code>MTLCompiler.framework</code> run time पर
+<code>dlopen</code> किए जाते हैं और हर call एक hand-declared C signature के साथ <code>objc_msgSend</code> है
+(<code>device/src/metal/objc.rs</code>)। कोई <code>objc2</code> या <code>metal</code> crate नहीं, कोई cargo feature नहीं और
+कोई <code>cfg(target_os)</code> gate नहीं: module हर host पर compile और type-check होता है, और Linux
+machine बस <code>dlopen</code> में fail होती है और डिवाइस कभी register नहीं करती। कर्नेल C renderer की
+Metal dialect (<code>codegen/src/c/metal.rs</code>) द्वारा Metal Shading Language के रूप में render होते
+हैं और process में एक metallib में compile होते हैं।</p>
+<p>code <code>device/src/metal/</code> (device, allocator, compile, program, graph, Metal 4 profiler),
+<code>runtime/src/devices/metal.rs</code> (device factory) और <code>codegen/src/c/metal.rs</code> (dialect) में
+रहता है।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=स्थिति>स्थिति<a href=#स्थिति class=hash-link aria-label="स्थिति का सीधा लिंक" title="स्थिति का सीधा लिंक" translate=no>​</a></h2>
+<p>बैकएंड सितंबर 2026 में आया और इसे एक hardware family पर परखा गया है: macOS 26 के अंतर्गत
+<strong>Apple9</strong> (M3/M4 class), जहाँ tensor suite, ONNX suite और <code>tk</code> hardware tests green हैं,
+और flash attention व GEMM <code>simdgroup_matrix</code> के माध्यम से चलते हैं। पुराने systems के लिए
+लिखे गए paths (public <code>newLibraryWithSource:</code> compile fallback, pre-Apple9
+indirect-command-buffer workaround, <code>metal3.x</code> / <code>metal2.0</code> language standards) implement
+किए गए हैं पर ऐसे hardware पर validated नहीं हैं। कोई Metal डिवाइस मौजूद न होने पर hardware
+tests ख़ुद skip हो जाते हैं, इसलिए Linux CI केवल host-side tests चलाता है।</p>
+<p>केवल system default डिवाइस (<code>METAL:0</code>) supported है; <code>MTLCopyAllDevices</code> enumeration एक
+follow-up है (<code>device/src/metal/device.rs</code>)।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=डिवाइस-चुनना>डिवाइस चुनना<a href=#डिवाइस-चुनना class=hash-link aria-label="डिवाइस चुनना का सीधा लिंक" title="डिवाइस चुनना का सीधा लिंक" translate=no>​</a></h2>
+<p><code>METAL[:N]</code> एकमात्र spelling है (<code>HIP</code>-style aliases AMD और CUDA के लिए मौजूद हैं, Metal के
+लिए कोई नहीं)। macOS पर यह <strong>platform default</strong> भी है: जब कुछ भी डिवाइस नहीं चुनता तो
+<code>default_device()</code> <code>METAL:0</code> पर resolve होता है, इसलिए Mac पर CPU बैकएंड पर वापस जाने का
+तरीका <code>SVOD_DEVICE=CPU</code> है (<code>dtype/src/default_device.rs</code>)।</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=METAL:0 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav</span><br/></div></code></pre></div></div>
+<p><code>svod_device::metal::has_devices()</code> Objective-C runtime load करता है और
+<code>MTLCreateSystemDefaultDevice</code> call करता है; runtime की device registry <code>"METAL"</code> factory को
+केवल तभी register करती है जब यह सफल हो। खोलने पर डिवाइस नाम और GPU family के साथ एक <code>info</code>
+line log होती है (<code>RUST_LOG=svod_device=info</code>)।</p>
+<p>family को <code>supportsFamily:</code> से Apple12 से नीचे Apple1 तक, फिर Mac2, probe किया जाता है, और
+<code>MetalFamily { Unknown, Mac2, Apple(n) }</code> के रूप में रखा जाता है। यह renderer का
+<code>gpu_arch</code> है, object cache की key बनाता है और optimizer profile चुनता है
+(<code>OptimizerRenderer::for_metal_family</code>): <code>simdgroup_matrix</code> tensor cores को Apple7 या नया
+चाहिए।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=codegen-msl-dialect>Codegen: MSL dialect<a href=#codegen-msl-dialect class=hash-link aria-label="Codegen: MSL dialect का सीधा लिंक" title="Codegen: MSL dialect का सीधा लिंक" translate=no>​</a></h2>
+<p><code>CRenderer::metal()</code> <code>CDialect::Metal</code> के साथ CPU C renderer है; इसके अस्तित्व से Clang
+output नहीं बदलता। एक कर्नेल इस तरह render होता है</p>
+<div class="language-c codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-c codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token macro property directive-hash" style=color:#36acaa>#</span><span class="token macro property directive keyword" style=color:#00009f>include</span><span class="token macro property" style=color:#36acaa> </span><span class="token macro property string" style=color:#e3116c>&lt;metal_stdlib></span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">using namespace metal</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">kernel </span><span class="token keyword" style=color:#00009f>void</span><span class="token plain"> </span><span class="token function" style=color:#d73a49>r_64_32</span><span class="token punctuation" style=color:#393A34>(</span><span class="token plain">device </span><span class="token keyword" style=color:#00009f>float</span><span class="token operator" style=color:#393A34>*</span><span class="token plain"> data0</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> device </span><span class="token keyword" style=color:#00009f>float</span><span class="token operator" style=color:#393A34>*</span><span class="token plain"> data1</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> constant </span><span class="token keyword" style=color:#00009f>int</span><span class="token operator" style=color:#393A34>&</span><span class="token plain"> data2</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                    uint3 gid </span><span class="token punctuation" style=color:#393A34>[</span><span class="token punctuation" style=color:#393A34>[</span><span class="token plain">threadgroup_position_in_grid</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                    uint3 lid </span><span class="token punctuation" style=color:#393A34>[</span><span class="token punctuation" style=color:#393A34>[</span><span class="token plain">thread_position_in_threadgroup</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  threadgroup </span><span class="token keyword" style=color:#00009f>__attribute__</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>(</span><span class="token function" style=color:#d73a49>aligned</span><span class="token punctuation" style=color:#393A34>(</span><span class="token number" style=color:#36acaa>16</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token keyword" style=color:#00009f>float</span><span class="token plain"> local0</span><span class="token punctuation" style=color:#393A34>[</span><span class="token number" style=color:#36acaa>32</span><span class="token punctuation" style=color:#393A34>]</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  </span><span class="token punctuation" style=color:#393A34>.</span><span class="token punctuation" style=color:#393A34>.</span><span class="token punctuation" style=color:#393A34>.</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token punctuation" style=color:#393A34>}</span><br/></div></code></pre></div></div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>अवधारणा<th>Clang dialect<th>Metal dialect<tbody><tr><td>buffer parameter<td><code>float* restrict data0</code><td><code>device float* data0</code><tr><td>scalar parameter<td><code>const int data2</code><td><code>constant int& data2</code><tr><td>launch ids<td><code>core_id</code> variable<td><code>gid.xyz</code> (<code>gidx*</code> / <code>idx*</code>), <code>lid.xyz</code> (<code>lidx*</code>), PARAM list के बाद जोड़े गए<tr><td>local buffer<td>stack array<td><code>threadgroup __attribute__((aligned(16))) T localN[size]</code><tr><td>barrier<td>कोई नहीं<td><code>threadgroup_barrier(mem_flags::mem_threadgroup)</code><tr><td>address spaces<td>कोई नहीं<td>pointer casts पर <code>device</code> / <code>threadgroup</code> / <code>thread</code><tr><td>16-bit floats<td><code>_Float16</code><td><code>half</code>, <code>bfloat</code><tr><td>bitcast<td>union / memcpy<td><code>as_type&lt;T>()</code></table>
+<p>कोई <code>[[buffer(n)]]</code> attributes नहीं हैं: Metal arguments को <strong>positionally</strong> bind करता है,
+इसलिए किसी parameter का binding index signature में उसकी स्थिति है, जिसे loader mirror करता
+है (नीचे)। अधिकतम तीन grid axes होते हैं; scheduler अतिरिक्त global axes को fold करता है
+(Metal optimizer profile में <code>global_max</code>)।</p>
+<p><strong>Types.</strong> Float64, हर fp8 format और 4 से चौड़े vectors render पर reject होते हैं
+(<code>reject_unsupported_metal_dtypes</code>, <code>codegen/src/c/types.rs</code>); scheduler पहले ही internal
+f64 को f32 में demote कर देता है। bf16 arithmetic <code>float</code> के माध्यम से promote होता है, और
+bf16 narrowing integer round-to-nearest-even pattern set उपयोग करता है।</p>
+<p><strong>Math.</strong> <code>sqrt</code>, <code>exp2</code> और <code>log2</code> native हैं; <code>sin</code> <code>precise::sin</code> के रूप में render होता
+है; <code>exp</code>, <code>log</code>, <code>cos</code>, <code>tan</code> और <code>erf</code> (MSL में <code>erf</code> नहीं है) साझा
+<code>amd_decomposition_patterns()</code> द्वारा native <code>exp2</code>/<code>log2</code> के ऊपर decompose होते हैं, जैसे
+AMD पर। renderer का <code>extra_matcher</code> CPU वाला है (<code>cpu_extra_matcher()</code>)। Fast math हर जगह
+off है (<code>-fno-fast-math</code>, या public path पर <code>MTLMathModeSafe</code>) ताकि साझा test tolerances
+बनी रहें।</p>
+<p><strong>Tensor cores.</strong> <code>Wmma</code> <code>simdgroup_&lt;T>8x8</code> और <code>simdgroup_multiply_accumulate</code> के ऊपर एक
+प्रति-shape helper में lower होता है: एक shape, 32 threads पर 8×8×8, प्रति लेन दो elements,
+f32→f32, f16→f32, f16→f16, bf16→f32 और bf16→bf16 के लिए (optimizer profile में
+<code>METAL_888</code>)। <code>tk</code> <code>simd_shuffle</code>, <code>simd_shuffle_xor</code> और <code>simdgroup_barrier</code> builders जोड़ता
+है (<code>codegen/src/c/metal.rs</code>), और Apple flash-attention व GEMM कर्नेल इन्हीं से बने हैं।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=compile-path>Compile path<a href=#compile-path class=hash-link aria-label="Compile path का सीधा लिंक" title="Compile path का सीधा लिंक" translate=no>​</a></h2>
+<p><code>compile_msl</code> (<code>device/src/metal/compile.rs</code>) source को Apple के private
+<code>MTLCodeGenService</code> को भेजता है — वही path जो tinygrad उपयोग करता है — और एक hand-built
+Objective-C block callback के माध्यम से metallib (<code>MTLB</code> magic, <code>ENDT</code> trailer) प्राप्त करता
+है, 60 s timeout और एक समय में एक request के साथ। flags हैं</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">-fno-fast-math -std=&lt;std> --driver-mode=metal -x metal -fno-caret-diagnostics</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">-fmodules-cache-path=&lt;cache>/metal-modules</span><br/></div></code></pre></div></div>
+<p>जहाँ <code>&lt;std></code> macOS major version का अनुसरण करता है (26+ पर <code>metal4.0</code>, 14–25 पर
+<code>metal3.1</code>, 13 पर <code>metal3.0</code>, उससे पहले <code>macos-metal2.0</code>) और module cache <code>metal_stdlib</code>
+parse को लगभग 250 ms से लगभग 8 ms कर देता है।</p>
+<p><code>MTLCompiler.framework</code> अपना libLLVM <code>RTLD_GLOBAL</code> load करता है, जो CPU बैकएंड के
+in-process libLLVM के साथ coexist नहीं कर सकता, इसलिए दोनों एक slot
+(<code>claim_inprocess_llvm</code>) के लिए होड़ करते हैं। उस race का हारने वाला, या private framework
+के बिना system, <code>compile_msl_public</code> लेता है: एक <code>newLibraryWithSource:options:error:</code>
+compile ताकि diagnostics सामने आएँ, जिसके बाद <strong>MSL source ख़ुद</strong> payload है और program
+loader उसे load पर फिर से compile करता है। दोनों payloads एक object-cache entry साझा करते हैं:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">backend:             metal</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">target_architecture: Apple9/air64</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">toolchain:           macos=26.0</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">flags:               -fno-fast-math -std=metal4.0 --driver-mode=metal -x metal -fno-caret-diagnostics</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">abi:                 msl-kernel-abi-v1</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">object_format:       metallib-or-msl-v1</span><br/></div></code></pre></div></div>
+<p>transport जान-बूझकर identity से अनुपस्थित है: एक BEAM worker जिसने libLLVM slot जीता और
+उसका parent जो हार गया, दोनों को key पर सहमत होना चाहिए।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=programs-और-launches>Programs और launches<a href=#programs-और-launches class=hash-link aria-label="Programs और launches का सीधा लिंक" title="Programs और launches का सीधा लिंक" translate=no>​</a></h2>
+<p><code>MetalProgram::load</code> कोई भी payload स्वीकार करता है (metallib के लिए
+<code>newLibraryWithData:</code>, MSL के लिए <code>newLibraryWithSource:</code>), function को
+<code>newFunctionWithName:</code> से bind करता है और pipeline को
+<code>setSupportIndirectCommandBuffers:YES</code> के साथ बनाता है, <code>maxTotalThreadsPerThreadgroup</code>,
+<code>threadExecutionWidth</code> और <code>staticThreadgroupMemoryLength</code> पढ़ते हुए।</p>
+<p>Arguments स्थिति के अनुसार bind होते हैं: buffers <code>setBuffer:offset:atIndex:</code> से — एक host
+pointer डिवाइस के <code>PointerRegistry</code> के माध्यम से अपने <code>(MTLBuffer, offset)</code> पर resolve होता
+है, जो buffer base से keyed एक <code>BTreeMap</code> है — और scalars <code>setBytes</code> से 4-byte <code>i32</code> के रूप
+में; <code>i32</code> से बाहर की value एक run-time error है। ABI slots बढ़ते क्रम में होने चाहिए और
+उनमें gaps हो सकते हैं, 31 bindings तक (<code>MAX_BUFFER_BINDINGS</code>)। <code>global_size</code> threadgroup
+count है और <code>local_size</code> प्रति group threads, जो
+<code>dispatchThreadgroups:threadsPerThreadgroup:</code> से भेजे जाते हैं; बिना local axes वाला कर्नेल
+प्रति group एक thread चलाता है, और <code>maxTotalThreadsPerThreadgroup</code> से बड़ा group reject होता
+है।</p>
+<p>हर dispatch एक command buffer है, कर्नेल नाम से labelled, depth 1024 की एक single queue पर।
+<code>wait = false</code> के साथ यह डिवाइस की <code>in_flight</code> list में जुड़ता है;
+<code>MetalDevice::synchronize</code> हर entry का <code>waitUntilCompleted</code> से इंतज़ार करता है और पहला
+<code>NSError</code> सामने लाता है। किसी buffer तक host access पहले डिवाइस को drain करता है।
+<code>execute_timed</code> command buffer का <code>GPUStartTime</code> / <code>GPUEndTime</code> पढ़ता है, और इसी पर BEAM
+candidates को rank करता है।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=memory>Memory<a href=#memory class=hash-link aria-label="Memory का सीधा लिंक" title="Memory का सीधा लिंक" translate=no>​</a></h2>
+<p>हर allocation <code>MTLResourceStorageModeShared</code> में एक <code>MTLBuffer</code> है: Apple silicon unified
+memory है, इसलिए <code>BufferSpec</code> flags ignore होते हैं और <code>copyin</code> / <code>copyout</code> / <code>_transfer</code>
+एक <code>synchronize()</code> के बाद <code>contents</code> पर host <code>memcpy</code> / <code>memmove</code> हैं। कोई private या
+managed buffers नहीं और कोई blit encoders नहीं। एक free पहले डिवाइस को drain करता है; यदि
+drain fail हो तो allocation को in-flight कर्नेल के नीचे release करने के बजाय leak कर दिया
+जाता है।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=graphs>Graphs<a href=#graphs class=hash-link aria-label="Graphs का सीधा लिंक" title="Graphs का सीधा लिंक" translate=no>​</a></h2>
+<p><code>MetalGraph::capture</code> एक कर्नेल chain को <code>ConcurrentDispatch</code> commands के एक
+<code>MTLIndirectCommandBuffer</code> में record करता है, हर एक <code>setBarrier</code> के साथ, ताकि capture क्रम
+बना रहे। एक replay एक command buffer है: bound buffers पर <code>useResources:count:usage:</code>, फिर
+<code>executeCommandsInBuffer:withRange:</code>। <code>replay</code> पिछले replay का इंतज़ार करता है और केवल उन
+slots को rebind करता है जिनका buffer बदला। Capture मना करता है (<code>Ok(None)</code>, बदले में प्रति-call
+dispatch) खाली chain, ऐसे program जो <code>MetalProgram</code> नहीं है, ऐसे डिवाइस जिसके नाम में
+"virtual" है (paravirtualized CI GPUs ICBs को तोड़ते हैं), 32 bits से बड़े offset, या <strong>किसी
+भी scalar argument</strong> के लिए — symbolic shapes वाली chain graph नहीं होती। Apple9 से नीचे
+tinygrad का <code>FIX_METAL_ICB</code> workaround (प्रति pipeline एक खाली dispatch) लागू होता है।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=profiling>Profiling<a href=#profiling class=hash-link aria-label="Profiling का सीधा लिंक" title="Profiling का सीधा लिंक" translate=no>​</a></h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Tier<th>Metal पर<th>स्रोत<tbody><tr><td>1 — device time<td>हाँ<td>प्रति command buffer <code>GPUStartTime</code> / <code>GPUEndTime</code>; graph के भीतर, एक Metal 4 counter heap (macOS 26+) या प्रति कर्नेल एक command buffer<tr><td>2 — roofline<td>हाँ<td>backend-neutral<tr><td>3 — static resources<td>आंशिक<td><code>staticThreadgroupMemoryLength</code> से <code>lds_bytes</code>, <code>threadExecutionWidth</code> से <code>wave_size</code>, <code>occupancy</code> <code>maxTotalThreadsPerThreadgroup / 1024</code> के रूप में; कोई register counts नहीं<tr><td>4 — hardware counters<td>नहीं<td></table>
+<p><code>Mtl4Profiler</code> (<code>device/src/metal/mtl4.rs</code>) केवल profiled graph replay के लिए मौजूद है: यह हर
+indirect command को अकेले एक Metal 4 command buffer में दो precise timestamps के बीच चलाता
+है, bound buffers पर एक residency set और एक shared event wait के साथ। एक MTL4 encoder चुपचाप
+उस indirect command का पहला execution skip कर देता है जिसकी pipeline उसे नहीं दी गई थी, इसलिए
+हर pipeline पहले encoder पर set की जाती है।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=सीमाएँ>सीमाएँ<a href=#सीमाएँ class=hash-link aria-label="सीमाएँ का सीधा लिंक" title="सीमाएँ का सीधा लिंक" translate=no>​</a></h2>
+<ul>
+<li class="">एक डिवाइस (<code>METAL:0</code>), एक command queue, केवल shared storage;</li>
+<li class="">scalars <code>i32</code> हैं; कोई f64 नहीं, कोई fp8 नहीं, 4 से चौड़े vectors नहीं;</li>
+<li class="">एक tensor-core shape (<code>simdgroup</code> 8×8×8);</li>
+<li class="">graphs scalar arguments वाली chains को बाहर रखते हैं;</li>
+<li class="">कोई hardware counters नहीं, कोई register counts नहीं, और graph के बाहर प्रति-dispatch timing
+पूरे command buffer का stamp है;</li>
+<li class="">fast path Apple का undocumented <code>MTLCodeGenService</code> है; public API fallback है।</li>
+</ul>
+<p>कोई Metal-specific environment variables नहीं हैं। साझा वाले लागू होते हैं: <code>SVOD_DEVICE</code>,
+<code>SVOD_OBJECT_CACHE</code> / <code>SVOD_OBJECT_CACHE_DIR</code>, module cache के लिए <code>XDG_CACHE_HOME</code>, और
+graph capture व decline messages के लिए <code>RUST_LOG=svod_device=debug</code>।</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tests>Tests<a href=#tests class=hash-link aria-label="Tests का सीधा लिंक" title="Tests का सीधा लिंक" translate=no>​</a></h2>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">cargo test -p svod-device metal          # host tests everywhere; hardware tests self-skip</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">cargo test -p svod-codegen metal         # MSL golden tests</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=METAL:0 cargo test -p svod-tensor   # codegen_tests! `metal` variants</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=METAL:0 cargo test -p svod-onnx</span><br/></div></code></pre></div></div></div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/backends/metal.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>इस पेज को बदलें</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="डॉक्स पेज"><a class="pagination-nav__link pagination-nav__link--prev" href=/hi/docs/backends/jit-loader><div class=pagination-nav__sublabel>पिछ्ला</div><div class=pagination-nav__label>ELF JIT लोडर</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/hi/docs/backends/amd/overview><div class=pagination-nav__sublabel>अगला</div><div class=pagination-nav__label>अवलोकन</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#स्थिति class="table-of-contents__link toc-highlight">स्थिति</a><li><a href=#डिवाइस-चुनना class="table-of-contents__link toc-highlight">डिवाइस चुनना</a><li><a href=#codegen-msl-dialect class="table-of-contents__link toc-highlight">Codegen: MSL dialect</a><li><a href=#compile-path class="table-of-contents__link toc-highlight">Compile path</a><li><a href=#programs-और-launches class="table-of-contents__link toc-highlight">Programs और launches</a><li><a href=#memory class="table-of-contents__link toc-highlight">Memory</a><li><a href=#graphs class="table-of-contents__link toc-highlight">Graphs</a><li><a href=#profiling class="table-of-contents__link toc-highlight">Profiling</a><li><a href=#सीमाएँ class="table-of-contents__link toc-highlight">सीमाएँ</a><li><a href=#tests class="table-of-contents__link toc-highlight">Tests</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>डॉक्स</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/hi/docs/introduction>परिचय</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>समुदाय</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

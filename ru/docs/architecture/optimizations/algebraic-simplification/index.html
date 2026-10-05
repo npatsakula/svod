@@ -1,8 +1,8 @@
-<!doctype html><html lang=ru dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-architecture/optimizations/algebraic-simplification" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>Паттерны алгебраического упрощения | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/ru/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/ru/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification /><meta data-rh=true property=og:locale content=ru /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=ru /><meta data-rh=true name=docsearch:language content=ru /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="Паттерны алгебраического упрощения | Svod"/><meta data-rh=true name=description content="Символьный упрощитель Svod перезаписывает вычислительные графы UOp с помощью 140+ алгебраических паттернов, определённых в schedule/src/symbolic/patterns.rs. Эти паттерны срабатывают в нескольких точках пайплайна:"/><meta data-rh=true property=og:description content="Символьный упрощитель Svod перезаписывает вычислительные графы UOp с помощью 140+ алгебраических паттернов, определённых в schedule/src/symbolic/patterns.rs. Эти паттерны срабатывают в нескольких точках пайплайна:"/><link data-rh=true rel=icon href=/ru/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification","name":"Алгебраическое упрощение","position":1}]}</script><link rel=stylesheet href=/ru/assets/css/styles.e76ef093.css /><script src=/ru/assets/js/runtime~main.5a063d97.js defer></script><script src=/ru/assets/js/main.135fffa7.js defer></script></head><body><svg style="display: none;"><defs>
+<!doctype html><html lang=ru dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-architecture/optimizations/algebraic-simplification" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>Алгебраическое упрощение | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/ru/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/ru/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification /><meta data-rh=true property=og:locale content=ru /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=ru /><meta data-rh=true name=docsearch:language content=ru /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="Алгебраическое упрощение | Svod"/><meta data-rh=true name=description content="Символьный упроститель — это три вложенных матчера в schedule/src/symbolic/patterns.rs. Какой уровень где выполняется:"/><meta data-rh=true property=og:description content="Символьный упроститель — это три вложенных матчера в schedule/src/symbolic/patterns.rs. Какой уровень где выполняется:"/><link data-rh=true rel=icon href=/ru/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification","name":"Алгебраическое упрощение","position":1}]}</script><link rel=stylesheet href=/ru/assets/css/styles.e76ef093.css /><script src=/ru/assets/js/runtime~main.48b5c01b.js defer></script><script src=/ru/assets/js/main.10acc0e1.js defer></script></head><body><svg style="display: none;"><defs>
 <symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
 </defs></svg>
-<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-fe0")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/ru/img/logo.svg /><div role=region aria-label="Перейти к основному содержимому"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>Перейти к основному содержимому</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Переключить навигационную панель" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/ru/><div class=navbar__logo><img src=/ru/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/ru/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/ru/docs/introduction>Документация</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>Русский</a><ul class=dropdown__menu><li><a href=/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=ru>Русский</a><li><a href=/hi/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Переключение между темным и светлым режимом (сейчас используется system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Прокрутка к началу" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/ru/docs/introduction><span class=linkLabel_WmDU>Введение</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/examples><span class=categoryLinkLabel_W154>Начало работы</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/ru/docs/architecture/pipeline><span class=categoryLinkLabel_W154>Архитектура</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/pipeline><span class=linkLabel_WmDU>Пайплайн выполнения</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/jit-graphs><span class=linkLabel_WmDU>JIT-графы</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/kernel-origins><span class=linkLabel_WmDU>Происхождение ядер</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/ru/docs/architecture/codegen/overview><span class=categoryLinkLabel_W154>Пайплайн кодогенерации</span></a></div><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/ir-design><span class=linkLabel_WmDU>Философия IR</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/ru/docs/architecture/optimizations/pattern-system><span class=categoryLinkLabel_W154>Оптимизации</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/optimizations/pattern-system><span class=linkLabel_WmDU>Движок паттернов</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/ru/docs/architecture/optimizations/algebraic-simplification><span class=linkLabel_WmDU>Алгебраическое упрощение</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/optimizations/index-arithmetic><span class=linkLabel_WmDU>Индексная арифметика</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/optimizations/range-optimization><span class=linkLabel_WmDU>Range и Reduce</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/optimizations/strength-reduction><span class=linkLabel_WmDU>Снижение стоимости</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/optimizations/kernel-search><span class=linkLabel_WmDU>Поиск по ядрам</span></a></ul><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/op-bestiary><span class=linkLabel_WmDU>Бестиарий операций</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile-ядра (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/backends/jit-loader><span class=categoryLinkLabel_W154>Бэкенды</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label="Навигационная цепочка текущей страницы"><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Главная страница" class=breadcrumbs__link href=/ru/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>Архитектура</span><li class=breadcrumbs__item><span class=breadcrumbs__link>Оптимизации</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>Алгебраическое упрощение</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">Содержание этой страницы</button></div><div class="theme-doc-markdown markdown"><header><h1>Паттерны алгебраического упрощения</h1></header>
-<p>Символьный упрощитель Svod перезаписывает вычислительные графы UOp с помощью 140+ алгебраических паттернов, определённых в <code>schedule/src/symbolic/patterns.rs</code>. Эти паттерны срабатывают в нескольких точках пайплайна:</p>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-fe0")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/ru/img/logo.svg /><div role=region aria-label="Перейти к основному содержимому"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>Перейти к основному содержимому</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Переключить навигационную панель" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/ru/><div class=navbar__logo><img src=/ru/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/ru/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/ru/docs/introduction>Документация</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>Русский</a><ul class=dropdown__menu><li><a href=/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=ru>Русский</a><li><a href=/hi/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Переключение между темным и светлым режимом (сейчас используется system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Прокрутка к началу" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/ru/docs/introduction><span class=linkLabel_WmDU>Введение</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/examples><span class=categoryLinkLabel_W154>Начало работы</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/ru/docs/architecture/ir-design><span class=categoryLinkLabel_W154>Архитектура</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/ir-design><span class=linkLabel_WmDU>Философия IR</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/pipeline><span class=linkLabel_WmDU>Пайплайн выполнения</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/jit-graphs><span class=linkLabel_WmDU>JIT-графы</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/kernel-origins><span class=linkLabel_WmDU>Происхождение ядер</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/ru/docs/architecture/codegen/overview><span class=categoryLinkLabel_W154>Пайплайн кодогенерации</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/ru/docs/architecture/optimizations/pattern-system><span class=categoryLinkLabel_W154>Оптимизации</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/optimizations/pattern-system><span class=linkLabel_WmDU>Движок паттернов</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/ru/docs/architecture/optimizations/algebraic-simplification><span class=linkLabel_WmDU>Алгебраическое упрощение</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/optimizations/index-arithmetic><span class=linkLabel_WmDU>Индексная арифметика</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/optimizations/range-optimization><span class=linkLabel_WmDU>Диапазоны и редукции</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/optimizations/strength-reduction><span class=linkLabel_WmDU>Снижение стоимости операций</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/optimizations/kernel-search><span class=linkLabel_WmDU>Поиск ядер</span></a></ul><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/ru/docs/architecture/op-bestiary><span class=linkLabel_WmDU>Бестиарий операций</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile-ядра (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/ru/docs/backends/overview><span class=categoryLinkLabel_W154>Бэкенды</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label="Навигационная цепочка текущей страницы"><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Главная страница" class=breadcrumbs__link href=/ru/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>Архитектура</span><li class=breadcrumbs__item><span class=breadcrumbs__link>Оптимизации</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>Алгебраическое упрощение</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">Содержание этой страницы</button></div><div class="theme-doc-markdown markdown"><header><h1>Алгебраическое упрощение</h1></header>
+<p>Символьный упроститель — это три вложенных матчера в <code>schedule/src/symbolic/patterns.rs</code>. Какой уровень где выполняется:</p>
 
 
 
@@ -28,35 +28,21 @@
 
 
 
+<table><thead><tr><th>Матчер<th>Состав<th>Где выполняется<tbody><tr><td><code>symbolic_simple()</code><td><code>symbolic_simple_base() + dead_loop_patterns()</code><td>add-loads (13), devectorize (14), проход изображений (17), понижение индексов (17), ранние декомпозиции (19b) и набор <code>pm_decomp</code> внутри финальной перезаписи<tr><td><code>symbolic()</code><td><code>symbolic_simple</code> + группы уровня 2<td>мега-проход rangeify, разбиение/слияние диапазонов (<code>+ pm_fold_cast_const</code>), <code>indexing_simplify</code>, финальное символьное упрощение (18)<tr><td><code>sym()</code><td><code>symbolic</code> + уровень 3<td>предоптимизация (<code>+ pm_fold_cast_const + pm_flatten_range</code>), post-opt символьное упрощение (08), раннее символьное упрощение (15), дополнительное символьное упрощение (16, <code>+ indexing_simplify</code>)</table>
+<p><code>pm_fold_cast_const</code> (<code>CAST(CONST) → CONST</code>) намеренно <em>не</em> входит ни в один уровень; места, которым он нужен, добавляют его явно — ровно так же, как Tinygrad компонует <code>symbolic + pm_fold_cast_const</code> только там, где это делает <code>UOp.simplify</code>.</p>
+<p>Каждое правило, переписывающее целочисленную арифметику, проходит через <code>exact_integer_rewrite</code> — типизированное доказательство отсутствия переполнения (<code>typed_integer_rewrite_is_exact</code>), которое отклоняет перезапись, если исходное выражение или замена могут переполнить свой конкретный dtype. Группы, помеченные как <em>зависящие от значений</em>, дополнительно обёрнуты в <code>value_sensitive</code>, который отключает их, пока для поддерева не выполнено <code>weak_float_values_are_committed</code>. Границы берутся из <code>VminVmaxProperty</code> (доступно всегда) и <code>SoundVminVmaxProperty</code> (<code>None</code> для операций, чьим границам нельзя доверять: загрузки, <code>Pow</code>, <code>Fdiv</code>); оба кешируются на узел.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=состав>Состав<a href=#состав class=hash-link aria-label="Прямая ссылка на Состав" title="Прямая ссылка на Состав" translate=no>​</a></h2>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple_base()         tier 1</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  propagate_invalid                     must be first (before x*0 → 0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  fold_invalid_load_store</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  constant_folding_dsl_patterns         value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vconst_folding_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  bool_arithmetic_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  identity_and_zero_patterns            value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  self_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  zero_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  division_dsl_patterns                 value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  uint_pack_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  div_mod_recombine_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  power_dsl_patterns                    value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_simple_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple() = base + dead_loop_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic() = symbolic_simple + tier 2 (with_tier2)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  commutative_canonicalization</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  term_combining_dsl_patterns           value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_alu_combining_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vmin_vmax_collapse_patterns           value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  minmax_dsl_patterns                   value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_folding_dsl_patterns              value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  comparison_dsl_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_mod_div_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  advanced_division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_cast_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  long_to_int_narrowing_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  after_simplification_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_bound_patterns                  value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">sym() = symbolic + tier 3</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  pm_simplify_valid                     (symbolic/valid_simplification.rs)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_vectorize_reorder_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  ne_zero_fold_patterns                 value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_where_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  store_load_folding_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  reduce_sym_patterns                   value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  sym_phase3_patterns</span><br/></div></code></pre></div></div>
+<p>Порядок несущий: канонизация перед объединением слагаемых, свёртка ALU перед правилами сравнения и диапазонов, потому что каждая группа открывает сопоставления для следующей. Правила дистрибуции обратной величины из Tinygrad (<code>sym</code> в <code>uop/symbolic.py</code>) намеренно отсутствуют: все шесть неточны с точки зрения IEEE.</p>
+<p><strong>Обозначения.</strong> <code>OP[a, b]</code> — коммутативная, <code>OP(a, b)</code> — упорядоченная; <code>@zero</code>/<code>@one</code>/<code>c</code> — константы; повторяющееся имя — тот же узел (<code>Arc::ptr_eq</code>). <code>//</code> — это <code>FloorDiv</code>, <code>%</code> — <code>FloorMod</code>; усекающие <code>CDiv</code>/<code>CMod</code> появляются только после поздних декомпозиций.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=уровень-1>Уровень 1<a href=#уровень-1 class=hash-link aria-label="Прямая ссылка на Уровень 1" title="Прямая ссылка на Уровень 1" translate=no>​</a></h2>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=распространение-invalid-propagate_invalid>Распространение Invalid (<code>propagate_invalid</code>)<a href=#распространение-invalid-propagate_invalid class=hash-link aria-label="Прямая ссылка на распространение-invalid-propagate_invalid" title="Прямая ссылка на распространение-invalid-propagate_invalid" translate=no>​</a></h3>
+<p><code>Invalid</code> — это <code>UOp::invalid_marker()</code>, константа <code>ConstValue::Invalid</code>; <code>is_invalid_marker</code> также распознаёт <code>VCONST</code> или <code>STACK</code>, целиком состоящие из <code>Invalid</code>, и обёртки перемещения вокруг них. Валидность хранится как <code>WHERE(cond, x, Invalid)</code>, и эти правила сохраняют эту форму, пока вокруг неё перемещается арифметика:</p>
 
 
 
 
 
-<table><thead><tr><th>Где<th>Матчер<th>Контекст<tbody><tr><td>Пре-оптимизация<td><code>sym()</code><td>После rangeify + range splitting, перед оптимизацией ядра<tr><td>Пост-оптимизация (Стадия 8)<td><code>sym()</code> + <code>pm_move_where_on_load</code><td>После оптимизационных действий, перед раскрытием<tr><td>Пост-индекс (Стадия 16)<td><code>sym()</code> + <code>indexing_simplify()</code><td>После снижения типа индексов, финальная очистка<tr><td>Декомпозиция+Рендер (Стадия 18-19)<td><code>symbolic_simple()</code><td>Совместно с поздними перезаписями и собственными матчерами рендерера</table>
-<p>Матчеры образуют три уровня: <code>symbolic_simple()</code> — база уровня 1 (тождества, свёртка констант, схлопывание RANGE размера 1), <code>symbolic()</code> добавляет группы уровня 2 (канонизация, сравнения, div/mod по границам диапазона), а <code>sym()</code> добавляет уровень 3 (<code>pm_simplify_valid</code>, переупорядочивание ALU/STACK, «опинионированное» объединение слагаемых). Только финальный проход декомпозиция+рендер запускает набор уровня 1 сам по себе.</p>
-<p><strong>Анализ диапазонов</strong>: Каждый UOp отслеживает минимальное (<code>vmin</code>) и максимальное (<code>vmax</code>) значения, которые он может принять во время выполнения. Эти границы вычисляются жадно при создании узла на основе границ входов. Многие паттерны используют эти границы для доказательства условий на этапе компиляции (например, «x всегда неотрицателен» или «x &lt; n для всех значений»).</p>
-<p><strong>Нотация</strong>: <code>OP[a, b]</code> обозначает коммутативный паттерн (пробуются оба порядка операндов). <code>OP(a, b)</code> — упорядоченный. <code>@zero</code>/<code>@one</code>/<code>c @const(v)</code> сопоставляются с константными значениями. Когда одно и то же имя переменной появляется дважды (например, <code>Idiv(x, x)</code>), оба операнда должны быть одним и тем же узлом (<code>Arc::ptr_eq</code> — т.е. структурно дедуплицированы через hash consing).</p>
-<p><strong>Ссылка на Tinygrad</strong>: <code>tinygrad/uop/symbolic.py</code>, <code>tinygrad/uop/divandmod.py</code></p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=рабочий-пример-каскад-оптимизаций>Рабочий пример: каскад оптимизаций<a href=#рабочий-пример-каскад-оптимизаций class=hash-link aria-label="Прямая ссылка на Рабочий пример: каскад оптимизаций" title="Прямая ссылка на Рабочий пример: каскад оптимизаций" translate=no>​</a></h2>
-<p>Простое выражение, демонстрирующее, как паттерны компонуются:</p>
-<p>До:</p>
-<!-- -->
-<p>Шаги:</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Step 1 (identity):    ADD(x, 0) -> x</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 2 (identity):    MUL(x, 1) -> x</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 3 (const fold):  ADD(3, 4) -> CONST(7)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 4 (result):      ADD(x, 7)</span><br/></div></code></pre></div></div>
-<p>После:</p>
-<!-- -->
-<p>Движок перезаписи применяет паттерны снизу вверх: сначала упрощаются потомки, затем родитель повторно сопоставляется. Это позволяет многошаговым каскадам сработать за один обход.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=порядок-паттернов>Порядок паттернов<a href=#порядок-паттернов class=hash-link aria-label="Прямая ссылка на Порядок паттернов" title="Прямая ссылка на Порядок паттернов" translate=no>​</a></h2>
-<p>Каждый матчер компонует группы паттернов в определённом порядке — порядок несущий, поскольку одна группа может открыть совпадения для следующей. Внутри группы паттерны пробуются последовательно до первого совпадения. Группы конкатенируются оператором <code>+</code>:</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple() = symbolic_simple_base() + dead_loop_patterns()</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple_base()          -- tier 1</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  propagate_invalid             -- MUST be first (before x*0=0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  fold_invalid_load_store</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  constant_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vconst_folding_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  bool_arithmetic_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  identity_and_zero_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  self_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  zero_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  uint_pack_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  div_mod_recombine_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  power_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic() = symbolic_simple() + tier 2</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  commutative_canonicalization</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  term_combining_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_alu_combining_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vmin_vmax_collapse_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  minmax_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  comparison_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_mod_div_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  advanced_division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_cast_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  long_to_int_narrowing_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  after_simplification_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_bound_patterns</span><br/></div></code></pre></div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=1-свёртка-констант>1. Свёртка констант<a href=#1-свёртка-констант class=hash-link aria-label="Прямая ссылка на 1. Свёртка констант" title="Прямая ссылка на 1. Свёртка констант" translate=no>​</a></h2>
-<p>Вычисление операций над константами времени компиляции с использованием арифметики, учитывающей dtype. Результаты соблюдают границы типов (например, Int32 оборачивается на 32 битах).</p>
-<p><strong>Tinygrad</strong>: <code>symbolic.py:40-118</code></p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=скалярные-константы>Скалярные константы<a href=#скалярные-константы class=hash-link aria-label="Прямая ссылка на Скалярные константы" title="Прямая ссылка на Скалярные константы" translate=no>​</a></h3>
 
 
 
@@ -82,8 +68,6 @@
 
 
 
-<table><thead><tr><th>Категория<th>Операции<th>Паттерн<tbody><tr><td>Унарные (7)<td>Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc<td><code>op(CONST(c))</code> -> <code>CONST(eval(op, c))</code><tr><td>Бинарные (13)<td>Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr<td><code>op(CONST(a), CONST(b))</code> -> <code>CONST(eval(op, a, b))</code><tr><td>Тернарные (2)<td>Where, MulAcc<td><code>op(CONST(a), CONST(b), CONST(c))</code> -> <code>CONST(eval(op, a, b, c))</code></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=векторные-константы>Векторные константы<a href=#векторные-константы class=hash-link aria-label="Прямая ссылка на Векторные константы" title="Прямая ссылка на Векторные константы" translate=no>​</a></h3>
 
 
 
@@ -99,265 +83,15 @@
 
 
 
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<tbody><tr><td><code>op(VCONST(a), VCONST(b))</code><td><code>VCONST(eval(op, a, b))</code> поэлементно<tr><td><code>op(CONST(a), VCONST(b))</code><td><code>VCONST(eval(op, broadcast(a), b))</code><tr><td><code>op(VCONST(a), CONST(b))</code><td><code>VCONST(eval(op, a, broadcast(b)))</code><tr><td><code>unary_op(VCONST(v))</code><td><code>VCONST(eval(op, v))</code> поэлементно</table>
-<p>Свёртка VConst покрывает 11 бинарных операций (исключая Pow и Fdiv) и все 7 унарных.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=2-свёртка-тождеств-и-нулей>2. Свёртка тождеств и нулей<a href=#2-свёртка-тождеств-и-нулей class=hash-link aria-label="Прямая ссылка на 2. Свёртка тождеств и нулей" title="Прямая ссылка на 2. Свёртка тождеств и нулей" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>ADD[x, 0]</code><td><code>x</code><td>Коммутативно<tr><td><code>MUL[x, 1]</code><td><code>x</code><td>Коммутативно<tr><td><code>OR[x, 0]</code><td><code>x</code><td>Коммутативно<tr><td><code>XOR[x, 0]</code><td><code>x</code><td>Коммутативно<tr><td><code>SUB(x, 0)</code><td><code>x</code><td>Упорядочено<tr><td><code>IDIV(x, 1)</code><td><code>x</code><td>Упорядочено<tr><td><code>FDIV(x, 1)</code><td><code>x</code><td>Упорядочено<tr><td><code>MOD(x, 1)</code><td><code>0</code><td>Остаток от деления на 1 всегда равен нулю<tr><td><code>Floor/Ceil/Trunc/Round(x)</code><td><code>x</code><td>Только когда <code>x</code> целочисленное (округление — нет операции)<tr><td><code>MUL[x, 0]</code><td><code>0</code><td>Только когда НЕ float<tr><td><code>AND[_, 0]</code><td><code>0</code><td>Коммутативно</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>IEEE 754: MUL на ноль</div><div class=admonitionContent_BuS1><p><code>MUL[x, 0]</code> <strong>не</strong> упрощается для чисел с плавающей точкой, поскольку IEEE 754 требует:<ul>
-<li class=""><code>NaN * 0 = NaN</code></li>
-<li class=""><code>Inf * 0 = NaN</code></li>
-</ul><p>Защита <code>!x.dtype().is_float()</code> предотвращает эту оптимизацию для типов с плавающей точкой.</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=3-свёртка-по-совпадению-операндов>3. Свёртка по совпадению операндов<a href=#3-свёртка-по-совпадению-операндов class=hash-link aria-label="Прямая ссылка на 3. Свёртка по совпадению операндов" title="Прямая ссылка на 3. Свёртка по совпадению операндов" translate=no>​</a></h2>
-<p>Паттерны, где один и тот же операнд появляется с обеих сторон. Используются проверки <code>Arc::ptr_eq</code> (hash consing гарантирует, что структурно равные подвыражения разделяют один указатель).</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>IDIV(x, x)</code><td><code>1</code><td><tr><td><code>IDIV(x, -1)</code><td><code>NEG(x)</code><td>Проверка константы правого операнда<tr><td><code>MOD(MOD(x, y), y)</code><td><code>MOD(x, y)</code><td>Идемпотентный mod<tr><td><code>AND(x, x)</code><td><code>x</code><td><tr><td><code>OR(x, x)</code><td><code>x</code><td></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=4-свёртка-в-ноль>4. Свёртка в ноль<a href=#4-свёртка-в-ноль class=hash-link aria-label="Прямая ссылка на 4. Свёртка в ноль" title="Прямая ссылка на 4. Свёртка в ноль" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>MOD(x, x)</code><td><code>0</code><td><tr><td><code>LT(x, x)</code><td><code>false</code><td>НЕ для float (NaN &lt; NaN — false, но защита нужна для корректности)<tr><td><code>NE(x, x)</code><td><code>false</code><td>Только целочисленные — <code>NaN != NaN</code> даёт <code>true</code> в IEEE 754</table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=5-упрощение-деления>5. Упрощение деления<a href=#5-упрощение-деления class=hash-link aria-label="Прямая ссылка на 5. Упрощение деления" title="Прямая ссылка на 5. Упрощение деления" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>FDIV(0.0, 0.0)</code><td><code>NaN</code><td>Неопределённая форма IEEE 754<tr><td><code>FDIV(MUL[_, 0], 0)</code><td><code>NaN</code><td>Любое нулевое выражение / ноль<tr><td><code>FDIV(x, x)</code><td><code>1.0</code><td>Деление float на себя<tr><td><code>FDIV(MUL(x, y), y)</code><td><code>x</code><td>Сокращение (float)<tr><td><code>IDIV(MUL(x, y), y)</code><td><code>x</code><td>Сокращение (целочисленное)</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Приоритет паттернов</div><div class=admonitionContent_BuS1><p><code>FDIV(0, 0) -> NaN</code> должен стоять перед <code>FDIV(x, x) -> 1</code> в матчере для получения приоритета. Порядок внутри <code>division_dsl_patterns()</code> это гарантирует.</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=6-оптимизация-cast>6. Оптимизация CAST<a href=#6-оптимизация-cast class=hash-link aria-label="Прямая ссылка на 6. Оптимизация CAST" title="Прямая ссылка на 6. Оптимизация CAST" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>CAST(CONST(c), dtype)</code><td><code>CONST(c.cast(dtype))</code><td>Свёртка приведения на этапе компиляции<tr><td><code>CAST(x, dtype)</code><td><code>x</code><td>Когда <code>x.dtype() == dtype</code> (нет операции)<tr><td><code>CAST(CAST(x, a), b)</code><td><code>x</code><td>Когда <code>x.dtype() == b</code> и <code>a</code> сохраняет все значения <code>b</code><tr><td><code>CAST(CAST(x, a), b)</code><td><code>CAST(x, b)</code><td>Когда <code>a</code> не сужает <code>x</code> (цепочка расширений)<tr><td><code>CAST(WHERE(s, a, b), dtype)</code><td><code>WHERE(s, CAST(a, dtype), CAST(b, dtype))</code><td>Проталкивание приведения через ветви</table>
-<p>Функция <code>can_safe_cast(to, from)</code> определяет, может ли промежуточный тип вместить все значения. Проверяются разрядность, знаковость и категория float/int.</p>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Усечение ломает обратные преобразования</div><div class=admonitionContent_BuS1><p><code>CAST(CAST(x, i8), i64)</code> НЕ сворачивается до <code>x</code>, когда <code>x</code> имеет тип <code>i64</code>. Промежуточный <code>i8</code> усекает значения — <code>can_safe_cast(i64, i8)</code> возвращает <code>false</code>, потому что <code>i8</code> не может вместить все значения <code>i64</code>.<p>Безопасный пример: <code>CAST(CAST(x, i32), bool)</code> -> <code>CAST(x, bool)</code>, когда <code>x</code> имеет тип <code>bool</code>, поскольку <code>i32</code> может представить и <code>true</code>, и <code>false</code>.</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=7-объединение-термов>7. Объединение термов<a href=#7-объединение-термов class=hash-link aria-label="Прямая ссылка на 7. Объединение термов" title="Прямая ссылка на 7. Объединение термов" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<tbody><tr><td><code>ADD(x, x)</code><td><code>MUL(2, x)</code><tr><td><code>ADD(MUL(c1, x), MUL(c2, x))</code><td><code>MUL(c1+c2, x)</code><tr><td><code>ADD(MUL(x, c1), MUL(x, c2))</code><td><code>MUL(x, c1+c2)</code></table>
-<p>Сопоставляются оба упорядоченных варианта (константа слева или справа от MUL).</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=8-свёртка-цепочек-alu>8. Свёртка цепочек ALU<a href=#8-свёртка-цепочек-alu class=hash-link aria-label="Прямая ссылка на 8. Свёртка цепочек ALU" title="Прямая ссылка на 8. Свёртка цепочек ALU" translate=no>​</a></h2>
-<p>Свёртка констант в цепочках ассоциативных операций и вынос констант наружу для канонической формы.</p>
+<table><thead><tr><th>Паттерн<th>Результат<tbody><tr><td><code>WHERE(Invalid, _, _)</code><td><code>Invalid</code><tr><td><code>WHERE(WHERE(c, x, Inv), a, b)</code><td><code>WHERE(c, WHERE(x, a, b), Inv)</code><tr><td><code>WHERE(c, Inv, x)</code><td><code>WHERE(!c, x, Inv)</code> (<code>WHERE(c, Inv, Inv)</code> → <code>Inv</code>)<tr><td><code>WHERE(c1, WHERE(c2, x, d), d)</code><td><code>WHERE(c1 & c2, x, d)</code><tr><td><code>WHERE(a, WHERE(c, x, Inv), y)</code>, <code>y</code> не <code>Invalid</code><td><code>WHERE(!a | c, WHERE(a, x, y), Inv)</code> — и зеркально для ложной ветви<tr><td><code>unary(Inv)</code>, <code>CAST(Inv)</code>, <code>BITCAST(Inv)</code><td><code>Inv</code><tr><td><code>unary(WHERE(c, x, Inv))</code>, <code>CAST</code>, <code>BITCAST</code><td><code>WHERE(c, unary(x), Inv)</code><tr><td><code>op(WHERE(c, x, Inv), y)</code>, <code>op(y, WHERE(c, x, Inv))</code> для <strong>каждой</strong> бинарной операции, включая сравнения<td><code>WHERE(c, op(x, y), Inv)</code><tr><td><code>op(Inv, y)</code>, <code>op(y, Inv)</code> для 13 бинарных операций, не являющихся сравнениями<td><code>Inv</code></table>
+<p>Почему первым: <code>MUL(0, WHERE(c, x, Inv))</code> должен стать <code>WHERE(c, 0, Inv)</code>, а не <code>0</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=мёртвые-загрузки-и-записи-fold_invalid_load_store>Мёртвые загрузки и записи (<code>fold_invalid_load_store</code>)<a href=#мёртвые-загрузки-и-записи-fold_invalid_load_store class=hash-link aria-label="Прямая ссылка на мёртвые-загрузки-и-записи-fold_invalid_load_store" title="Прямая ссылка на мёртвые-загрузки-и-записи-fold_invalid_load_store" translate=no>​</a></h3>
+<p><code>LOAD(INDEX(buf, Invalid, ..))</code> (также за <code>CAST</code>) → <code>alt</code> загрузки, если он есть, иначе ноль с формой; <code>STORE(INDEX(buf, Invalid, ..), v)</code> без гейта → <code>NOOP</code>.</p>
 <h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=свёртка-констант>Свёртка констант<a href=#свёртка-констант class=hash-link aria-label="Прямая ссылка на Свёртка констант" title="Прямая ссылка на Свёртка констант" translate=no>​</a></h3>
+<p>Унарные: <code>Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc</code> (<code>Neg</code> здесь не операция — <code>neg()</code> строит <code>MUL(x, -1)</code>). Бинарные: <code>Add, Mul, Sub, FloorMod, Max, Pow, FloorDiv, Fdiv, And, Or, Xor, Shl, Shr</code>, плюс шесть сравнений в <code>Bool</code>. Тернарные: <code>Where</code>, <code>MulAcc</code>. Результаты фиксируются через формат хранения dtype (<code>Int32</code> переполняется с заворачиванием), кроме слабых dtype, которые сохраняют неусечённое значение. <code>vconst_folding_patterns</code> делает то же самое по линиям для <code>VCONST ⊕ VCONST</code> и смеси broadcast <code>CONST</code>/<code>VCONST</code> (11 бинарных операций + сравнения, 6 унарных), пропуская слабые линии.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=булева-арифметика>Булева арифметика<a href=#булева-арифметика class=hash-link aria-label="Прямая ссылка на Булева арифметика" title="Прямая ссылка на Булева арифметика" translate=no>​</a></h3>
+<p><code>Mul[x, y]</code> → <code>x & y</code>, <code>Add[x, y]</code> → <code>x | y</code>, <code>Max(x, y)</code> → <code>x | y</code>, когда оба — <code>Bool</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=тождество-и-ноль>Тождество и ноль<a href=#тождество-и-ноль class=hash-link aria-label="Прямая ссылка на Тождество и ноль" title="Прямая ссылка на Тождество и ноль" translate=no>​</a></h3>
 
 
 
@@ -393,8 +127,6 @@
 
 
 
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>ADD[ADD[x, c1], c2]</code><td><code>ADD(x, c1+c2)</code><td>Коммутативный внешний Add<tr><td><code>MUL[MUL[x, c1], c2]</code><td><code>MUL(x, c1*c2)</code><td>Коммутативный внешний Mul<tr><td><code>ADD[SUB(x, c1), c2]</code><td><code>ADD(x, c2-c1)</code> или <code>SUB(x, c1-c2)</code><td>С нормализацией знака<tr><td><code>SUB(ADD(x, c1), c2)</code><td><code>ADD(x, c1-c2)</code> или <code>SUB(x, c2-c1)</code><td>С нормализацией знака<tr><td><code>SUB(SUB(x, c1), c2)</code><td><code>SUB(x, c1+c2)</code><td></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=вынос-констант>Вынос констант<a href=#вынос-констант class=hash-link aria-label="Прямая ссылка на Вынос констант" title="Прямая ссылка на Вынос констант" translate=no>​</a></h3>
 
 
 
@@ -405,14 +137,26 @@
 
 
 
+<table><thead><tr><th>Паттерн<th>Результат<th>Guard<tbody><tr><td><code>Add[x, 0]</code><td><code>x</code><td>не float, или ноль — это <code>-0.0</code> (<code>x + 0.0</code> не тождество для <code>x = -0.0</code>)<tr><td><code>Sub(x, 0)</code><td><code>x</code><td>не float, или ноль — это <code>+0.0</code><tr><td><code>Mul[x, 1]</code>, <code>Or[x, 0]</code>, <code>Xor[x, 0]</code>, <code>FloorDiv(x, 1)</code>, <code>Fdiv(x, 1)</code><td><code>x</code><td><tr><td><code>FloorMod(x, 1)</code><td><code>0</code><td><tr><td><code>Floor/Ceil/Trunc/Round(x)</code><td><code>x</code><td>целый <code>x</code><tr><td><code>Mul[x, 0]</code><td><code>0</code><td>не float (<code>NaN * 0</code>, <code>Inf * 0</code> дают <code>NaN</code>)<tr><td><code>And[_, 0]</code><td><code>0</code><td></table>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=свёртка-с-собой-и-с-нулём>Свёртка с собой и с нулём<a href=#свёртка-с-собой-и-с-нулём class=hash-link aria-label="Прямая ссылка на Свёртка с собой и с нулём" title="Прямая ссылка на Свёртка с собой и с нулём" translate=no>​</a></h3>
+<p><code>FloorDiv(x, x)</code> → <code>1</code>; <code>FloorDiv(x, -1)</code> → <code>MUL(x, -1)</code>; <code>FloorMod(FloorMod(x, y), y)</code> → <code>FloorMod(x, y)</code>; <code>And(x, x)</code>, <code>Or(x, x)</code>, <code>Max(x, x)</code> → <code>x</code>; <code>FloorMod(x, x)</code> → <code>0</code>; <code>Lt(x, x)</code> → <code>false</code> для не-float, а для float — когда надёжные границы доказывают, что <code>x</code> не <code>NaN</code>; <code>Ne(x, x)</code> → <code>false</code> для целых и bool.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=деление>Деление<a href=#деление class=hash-link aria-label="Прямая ссылка на Деление" title="Прямая ссылка на Деление" translate=no>​</a></h3>
+<p><code>Fdiv(0.0, 0.0)</code> и <code>Fdiv(MUL[_, 0.0], 0.0)</code> → <code>NaN</code> (стоят первыми, чтобы опередить следующее правило); <code>Fdiv(x, x)</code> → <code>1.0</code> только когда <code>x</code> доказуемо конечен и ненулевой; <code>FloorDiv(Mul(x, y), y)</code> → <code>x</code>. Для float правила <code>(x*y)/y → x</code> нет.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=приведения-типов>Приведения типов<a href=#приведения-типов class=hash-link aria-label="Прямая ссылка на Приведения типов" title="Прямая ссылка на Приведения типов" translate=no>​</a></h3>
+<p><code>CAST(x, dt)</code> → <code>x</code>, когда dtype уже совпадает; <code>CAST(CAST(x, a), b)</code> → <code>x</code>, когда <code>x: b</code> и <code>can_safe_cast(b, a)</code> (<code>a</code> вмещает любое значение <code>b</code>: та же знаковость и не меньшая ширина, беззнаковый→знаковый требует одного дополнительного бита, float↔int — никогда); <code>CAST(CAST(x, a), b)</code> → <code>CAST(x, b)</code>, когда <code>a</code> не сужает <code>x</code>. <code>uint_pack_dsl_patterns</code> отменяет упаковку <code>(hi.cast(u64) &lt;&lt; 32) | lo.cast(u64)</code>, которую строит Threefry, чтобы ГПСЧ оставался в 32-битном ALU.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=рекомбинация-div-mod>Рекомбинация div-mod<a href=#рекомбинация-div-mod class=hash-link aria-label="Прямая ссылка на Рекомбинация div-mod" title="Прямая ссылка на Рекомбинация div-mod" translate=no>​</a></h3>
+<p>Одно правило на каждом <code>Add</code>: <code>fold_add_divmod_recombine</code>, порт из Tinygrad. Оно сплющивает цепочку <code>Add</code>, находит слагаемое <code>(base % div) * mul</code> и партнёра <code>q * (div * mul)</code>, у которого <code>q</code> — частное от чего-то, сравнимого с <code>base</code> по модулю <code>div</code> (<code>quotient_base</code>: <code>q == b // div</code>, возможно со слитыми <code>(x//c + a)//div</code> и сдвинутыми константами), и заменяет пару на <code>b * mul</code>; при <code>q == (b // div) % d</code> оно сворачивается в более широкое <code>(b % (div*d)) * mul</code>. Это семейство <code>x%n + (x//n)*n → x</code> и его масштабированные, смещённые и трёхчленные варианты, находимые через цепочку, а не отдельными правилами.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=степени-булевы-выражения-dce>Степени, булевы выражения, DCE<a href=#степени-булевы-выражения-dce class=hash-link aria-label="Прямая ссылка на Степени, булевы выражения, DCE" title="Прямая ссылка на Степени, булевы выражения, DCE" translate=no>​</a></h3>
+<p><code>Pow(x, 0)</code> → <code>1</code>, <code>Pow(x, 1)</code> → <code>x</code>, <code>Pow(1, x)</code> → <code>1</code> (только скаляры; другие показатели не переписываются — формы с обратной величиной и sqrt меняют округление IEEE). <code>Not(Not(x))</code> → <code>x</code>, <code>Xor(x, x)</code> → <code>0</code>, <code>true | _</code> → <code>true</code>, <code>false & _</code> → <code>false</code>, <code>true & x</code> → <code>x</code>, <code>false | x</code> → <code>x</code> (только bool-константы). <code>WHERE</code> с доказуемо константным условием (надёжные границы) выбирает ветвь; <code>WHERE(_, t, t)</code> → <code>t</code>; <code>WHERE(x, true, false)</code> → <code>x</code>; <code>WHERE(x, false, true)</code> → <code>!x</code>; <code>WHERE(a, WHERE(b, c, d), d)</code> → <code>WHERE(a & b, c, d)</code>. <code>dead_loop_patterns</code>: <code>RANGE</code> с <code>vmax &lt; 0</code> → <code>CONST(0)</code>, <code>RANGE(CONST)</code> с <code>vmin == vmax</code> → эта константа. Свёртки <code>END</code>/<code>REDUCE</code> с пустым диапазоном здесь нет; такие случаи обрабатывает <code>reduce_to_acc</code>.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=уровень-2>Уровень 2<a href=#уровень-2 class=hash-link aria-label="Прямая ссылка на Уровень 2" title="Прямая ссылка на Уровень 2" translate=no>​</a></h2>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=коммутативная-канонизация>Коммутативная канонизация<a href=#коммутативная-канонизация class=hash-link aria-label="Прямая ссылка на Коммутативная канонизация" title="Прямая ссылка на Коммутативная канонизация" translate=no>​</a></h3>
+<p>Для <code>Add, Mul, Max, And, Or, Xor</code> (и номинально <code>Eq</code>/<code>Ne</code>, которые никогда не срабатывают, потому что их результат — <code>Bool</code>), чей dtype <strong>результата</strong> — <code>WeakInt</code>: поменять операнды местами, если <code>tinygrad_tuplize_cmp(b, a) == Less</code>, — это структурный порядок ключа <code>(op, arg, dtype, *src)</code>, который использует и линеаризатор. Индексные выражения, равные с точностью до коммутативности, после этого хеш-консируются в один узел, на что полагаются рекомбинация и expander. Остальные dtype сохраняют авторский порядок.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=объединение-слагаемых-addmul-с-константами>Объединение слагаемых (<code>Add</code>/<code>Mul</code> с константами)<a href=#объединение-слагаемых-addmul-с-константами class=hash-link aria-label="Прямая ссылка на объединение-слагаемых-addmul-с-константами" title="Прямая ссылка на объединение-слагаемых-addmul-с-константами" translate=no>​</a></h3>
 
 
 
 
 
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>ADD[ADD[x, c], y]</code><td><code>ADD(ADD(x, y), c)</code><td>Выносит константу наружу; <code>y</code> не должен быть константой</table>
-<p>Вынос констант критически важен для извлечения индексов. Он гарантирует, что константы всплывают на самый внешний уровень, позволяя нижестоящим паттернам (вроде упрощения div-mod) видеть чистые формы <code>переменная + смещение</code>.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=канонизация-sub>Канонизация Sub<a href=#канонизация-sub class=hash-link aria-label="Прямая ссылка на Канонизация Sub" title="Прямая ссылка на Канонизация Sub" translate=no>​</a></h3>
 
 
 
@@ -428,10 +172,6 @@
 
 
 
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>SUB(a, SUB(b, x))</code><td><code>ADD(x, SUB(a, b))</code><td>Экспонирует внутреннюю переменную</table>
-<p>Svod сохраняет <code>SUB</code> как полноценную операцию IR (в отличие от Tinygrad, который канонизирует <code>a-b</code> в <code>ADD(a, NEG(b))</code>). Этот паттерн гарантирует, что вложенные <code>SUB</code> не блокируют дальнейшее упрощение.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=9-булева-логика>9. Булева логика<a href=#9-булева-логика class=hash-link aria-label="Прямая ссылка на 9. Булева логика" title="Прямая ссылка на 9. Булева логика" translate=no>​</a></h2>
 
 
 
@@ -453,735 +193,32 @@
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>NOT(NOT(x))</code><td><code>x</code><td>Устранение двойного отрицания<tr><td><code>XOR(x, x)</code><td><code>0</code><td>Самоуничтожение<tr><td><code>OR[x, NOT(x)]</code><td><code>true</code><td>Тавтология (только bool)<tr><td><code>AND[x, NOT(x)]</code><td><code>false</code><td>Противоречие (только bool)<tr><td><code>OR[true, x]</code><td><code>true</code><td>Поглощающий элемент<tr><td><code>AND[false, x]</code><td><code>false</code><td>Поглощающий элемент<tr><td><code>AND[true, x]</code><td><code>x</code><td>Тождество<tr><td><code>OR[false, x]</code><td><code>x</code><td>Тождество<tr><td><code>AND[NOT(x), NOT(y)]</code><td><code>NOT(OR(x, y))</code><td>Закон де Моргана<tr><td><code>OR[NOT(x), NOT(y)]</code><td><code>NOT(AND(x, y))</code><td>Закон де Моргана</table>
-<p>Все паттерны с <code>[]</code> коммутативны (пробуются оба порядка операндов).</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=10-упрощение-сравнений>10. Упрощение сравнений<a href=#10-упрощение-сравнений class=hash-link aria-label="Прямая ссылка на 10. Упрощение сравнений" title="Прямая ссылка на 10. Упрощение сравнений" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=самосравнение-не-float-ptr_eq>Самосравнение (не float, ptr_eq)<a href=#самосравнение-не-float-ptr_eq class=hash-link aria-label="Прямая ссылка на Самосравнение (не float, ptr_eq)" title="Прямая ссылка на Самосравнение (не float, ptr_eq)" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Операция<th>Результат<tbody><tr><td><code>LT(x, x)</code>, <code>GT(x, x)</code>, <code>NE(x, x)</code><td><code>false</code><tr><td><code>LE(x, x)</code>, <code>GE(x, x)</code>, <code>EQ(x, x)</code><td><code>true</code></table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Самосравнение для float</div><div class=admonitionContent_BuS1><p>Паттерны самосравнения защищены проверкой <code>!x.dtype().is_float()</code>. Для чисел с плавающей точкой <code>NaN != NaN</code> даёт <code>true</code>, а <code>NaN == NaN</code> даёт <code>false</code>, поэтому эти тождества не выполняются.</div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=на-основе-констант-и-диапазонов>На основе констант и диапазонов<a href=#на-основе-констант-и-диапазонов class=hash-link aria-label="Прямая ссылка на На основе констант и диапазонов" title="Прямая ссылка на На основе констант и диапазонов" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>op(CONST(a), CONST(b))</code><td><code>CONST(eval(op, a, b))</code><td>Прямая свёртка констант<tr><td><code>op(x, y)</code> когда границы доказывают<td><code>true</code> или <code>false</code><td><code>ComparisonAnalyzer</code> использует vmin/vmax</table>
-<p><code>ComparisonAnalyzer</code> проверяет: если <code>x.vmax &lt; y.vmin</code>, то <code>LT(x, y)</code> доказуемо равно <code>true</code>.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=алгебраические-преобразования>Алгебраические преобразования<a href=#алгебраические-преобразования class=hash-link aria-label="Прямая ссылка на Алгебраические преобразования" title="Прямая ссылка на Алгебраические преобразования" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>LT(ADD[c0, x], c1)</code><td><code>LT(x, c1-c0)</code><td>Устранение смещения<tr><td><code>LT(NEG(x), NEG(y))</code><td><code>LT(y, x)</code><td>Инверсия знака<tr><td><code>LT(IDIV(x, d), c)</code><td><code>LT(x, c*d)</code><td>Подъём деления (d > 0)</table>
-<p>Подъём деления для <code>LT(x//d, c)</code> обрабатывает как положительные, так и неположительные <code>c</code>:</p>
+<table><thead><tr><th>Паттерн<th>Результат<tbody><tr><td><code>Add(x, x)</code><td><code>x * 2</code><tr><td><code>Add(Mul[x, c1], Mul[x, c2])</code><td><code>x * (c1 + c2)</code><tr><td><code>Add[x, Mul[x, c]]</code><td><code>x * (c + 1)</code><tr><td><code>Add[Add[y, Mul[x, c0]], Mul[x, c1]]</code><td><code>y + x * (c0 + c1)</code><tr><td><code>Add[Add[y, x], Mul[x, c]]</code>, <code>Add[Add[y, Mul[x, c]], x]</code><td><code>y + x * (c + 1)</code><tr><td><code>Add[Add[y, x], x]</code><td><code>y + x * 2</code><tr><td><code>Mul[-1, Add[x, c]]</code><td><code>-x + (-c)</code><tr><td><code>Mul[c, Add[x, k]]</code>, <code>x: WeakInt</code><td><code>c*x + c*k</code></table>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=булевы-правила-boolean_dsl_patterns>Булевы правила (<code>boolean_dsl_patterns</code>)<a href=#булевы-правила-boolean_dsl_patterns class=hash-link aria-label="Прямая ссылка на булевы-правила-boolean_dsl_patterns" title="Прямая ссылка на булевы-правила-boolean_dsl_patterns" translate=no>​</a></h3>
+<p><code>Or[x, Not(x)]</code> → <code>true</code>, <code>And[x, Not(x)]</code> → <code>false</code> (только bool); законы де Моргана в обе стороны, <code>And[Not(x), Not(y)]</code> → <code>!(x | y)</code> и <code>Or[Not(x), Not(y)]</code> → <code>!(x & y)</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=where>WHERE<a href=#where class=hash-link aria-label="Прямая ссылка на WHERE" title="Прямая ссылка на WHERE" translate=no>​</a></h3>
+<p><code>dce_dsl_patterns</code>: <code>WHERE(Not(c), t, f)</code> → <code>WHERE(c, f, t)</code>, если только <code>f</code> не содержит <code>Invalid</code> (скаляр или линию <code>STACK</code>) — перестановка перенесла бы маркер в истинную ветвь, где его не видят правила гейтов. <code>where_alu_combining_patterns</code>: <code>op(WHERE(c, a, b), WHERE(c, d, e))</code> → <code>WHERE(c, op(a, d), op(b, e))</code> для <code>Add, Mul, Sub, Max, And, Or, Xor</code>, когда обе истинные ветви или обе ложные ветви — константы, а также ассоциативная форма <code>Add(Add(y, WHERE(c, ..)), WHERE(c, ..))</code>. <code>where_bound_patterns</code>: <code>WHERE(Lt(x, c), t, f)</code> → <code>t</code>, когда <code>x.vmax &lt; c.vmin</code>, и <code>f</code>, когда <code>x.vmin >= c.vmax</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=схлопывание-по-границам-и-minmax>Схлопывание по границам и min/max<a href=#схлопывание-по-границам-и-minmax class=hash-link aria-label="Прямая ссылка на Схлопывание по границам и min/max" title="Прямая ссылка на Схлопывание по границам и min/max" translate=no>​</a></h3>
+<p><code>vmin_vmax_collapse_patterns</code>: <code>Mul</code>, <code>FloorDiv</code>, <code>FloorMod</code>, сравнение, <code>PARAM</code> или <code>SPECIAL</code>, чьи надёжные границы сводятся к одному значению, становятся этой константой (float исключены; <code>Add</code>/<code>Sub</code>/<code>Max</code> намеренно исключены, чтобы перенос значения в цикле с одной итерацией не был свёрнут). <code>minmax_dsl_patterns</code>: <code>Max(x, y)</code> → <code>x</code>, когда <code>x.vmin >= y.vmax</code> (для float — строго больше, чтобы сохранить знак нуля), симметрично для <code>y</code>. Операции <code>Min</code> нет: <code>Tensor::minimum</code> — это <code>WHERE</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=свёртка-цепочек-alu-alu_folding_dsl_patterns>Свёртка цепочек ALU (<code>alu_folding_dsl_patterns</code>)<a href=#свёртка-цепочек-alu-alu_folding_dsl_patterns class=hash-link aria-label="Прямая ссылка на свёртка-цепочек-alu-alu_folding_dsl_patterns" title="Прямая ссылка на свёртка-цепочек-alu-alu_folding_dsl_patterns" translate=no>​</a></h3>
+<p>Ассоциативная свёртка <code>(x ⊕ c1) ⊕ c2</code> → <code>x ⊕ (c1 ⊕ c2)</code> для <code>Add</code>, <code>Mul</code>, <code>And</code>, <code>Or</code>, <code>Xor</code>, <code>Max</code>; проталкивание констант <code>(x + c) + y</code> → <code>(x + y) + c</code> и <code>(x * c) * y</code> → <code>(x * y) * c</code>, когда <code>y</code> не константа; <code>(x - c1) + c2</code>, <code>(x + c1) - c2</code> нормализуются в <code>x + k</code> или <code>x - |k|</code>; <code>(x - c1) - c2</code> → <code>x - (c1 + c2)</code>; <code>Sub(a, Sub(b, x))</code> → <code>x + (a - b)</code>. <code>Sub</code> — полноценная операция в Svod (Tinygrad записывает <code>a - b</code> как <code>a + b*-1</code>).</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=сравнения-comparison_dsl_patterns>Сравнения (<code>comparison_dsl_patterns</code>)<a href=#сравнения-comparison_dsl_patterns class=hash-link aria-label="Прямая ссылка на сравнения-comparison_dsl_patterns" title="Прямая ссылка на сравнения-comparison_dsl_patterns" translate=no>​</a></h3>
+<p>Для всех шести сравнений: <code>x op x</code> на не-float сворачивается (<code>Lt/Gt/Ne</code> → <code>false</code>, <code>Le/Ge/Eq</code> → <code>true</code>); константные операнды сворачиваются; иначе <code>ComparisonAnalyzer::analyze</code> (<code>ir/src/uop/comparison_analysis.rs</code>) доказывает <code>true</code> или <code>false</code> по надёжным границам — оба только для неслабых dtype. Далее: <code>Lt(Add[c0, x], c1)</code> → <code>Lt(x, c1 - c0)</code>; <code>Lt(Mul[x, -1], Mul[y, -1])</code> → <code>Lt(y, x)</code>; <code>Lt(FloorDiv(x, d), c)</code> → <code>Lt(x, c * d)</code> для <code>d > 0</code> при проверке отсутствия переполнения (точно для деления с округлением вниз, при любом знаке <code>c</code>); для <code>WeakInt</code>: <code>Lt(Mul[c0, x], c1)</code> → <code>±x &lt; ceil(c1 / |c0|)</code> и GCD-свёртка <code>lt_folding</code> (<code>x = d*q + r</code>, <code>r ∈ [0, d)</code>, <code>d | c</code> ⇒ <code>x &lt; c ⇔ q &lt; c/d</code>).</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=диапазоны-и-деление>Диапазоны и деление<a href=#диапазоны-и-деление class=hash-link aria-label="Прямая ссылка на Диапазоны и деление" title="Прямая ссылка на Диапазоны и деление" translate=no>​</a></h3>
+<p><code>range_based_mod_div_patterns</code> и <code>advanced_division_dsl_patterns</code> — это алгебра индексов; они описаны на странице <a class="" href=/ru/docs/architecture/optimizations/index-arithmetic>индексной арифметики</a>. <code>range_based_cast_patterns</code> схлопывает <code>CAST(CAST(x, a), b)</code> для сильного целого <code>x</code>, чьи границы укладываются в <code>a</code>. <code>long_to_int_narrowing_patterns</code> переписывает бинарную операцию <code>Int64</code>, чьи операнды и результат укладываются в <code>i32</code>, как операцию <code>Int32</code> с обратным приведением, и распределяет знаковое целочисленное приведение по <code>WeakInt + c</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=after>AFTER<a href=#after class=hash-link aria-label="Прямая ссылка на AFTER" title="Прямая ссылка на AFTER" translate=no>​</a></h3>
+<p><code>after_simplification_patterns</code>: зависимости, не являющиеся побочными эффектами (<code>RANGE</code>, <code>STORE</code>, <code>END</code>, <code>CALL</code>, <code>BARRIER</code>, <code>CUSTOM</code>, <code>FUNCTION</code>), заменяются их собственными источниками и дедуплицируются; зависимости <code>NOOP</code> и цепочки <code>END(NOOP)</code> отбрасываются; <code>AFTER(x, [])</code> → <code>x</code>.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=уровень-3-sym>Уровень 3 (<code>sym</code>)<a href=#уровень-3-sym class=hash-link aria-label="Прямая ссылка на уровень-3-sym" title="Прямая ссылка на уровень-3-sym" translate=no>​</a></h2>
 <ul>
-<li class=""><code>c > 0</code>: эквивалентно <code>x &lt; c*d</code></li>
-<li class=""><code>c &lt;= 0</code>: эквивалентно <code>x &lt; c*d - (d-1)</code></li>
+<li class=""><strong><code>pm_simplify_valid</code></strong> (<code>valid_simplification.rs</code>): цепочка <code>And</code> из клауз валидности <code>Bool</code> упрощается клауза за клаузой (<code>simplify_valid</code>), а <code>WHERE(cond, x, Invalid)</code> с <code>x: WeakInt</code> переписывает <code>x</code> при границах, которые следуют из <code>cond</code> (<code>uop_given_valid</code>): <code>parse_valid</code> читает каждую клаузу как <code>expr &lt; c</code> / <code>expr >= c</code>, подставляет ограниченную переменную и упрощает заново.</li>
+<li class=""><strong><code>alu_vectorize_reorder_patterns</code></strong>: <code>op(STACK(x, x, ..), STACK(y, y, ..))</code> → <code>STACK(op(x, y), ..)</code> для 13 арифметических/битовых операций и шести сравнений, когда оба операнда — broadcast одного узла с одинаковым числом линий > 1.</li>
+<li class=""><strong><code>ne_zero_fold_patterns</code></strong>: <code>Ne(x, 0)</code> → <code>x.cast(bool)</code>.</li>
+<li class=""><strong><code>cast_where_dsl_patterns</code></strong>: <code>CAST(WHERE(s, a, b))</code> → <code>WHERE(s, CAST(a), CAST(b))</code>.</li>
+<li class=""><strong><code>store_load_folding_patterns</code></strong>: <code>STORE(_, Invalid)</code> → <code>NOOP</code>; <code>STORE(INDEX, WHERE(c, v, Invalid))</code> → индекс с гейтом <code>INDEX(buf, WHERE(c, idx, Invalid))</code>, записывающий <code>v</code>; <code>STORE(idx, LOAD(idx))</code> → <code>NOOP</code>; <code>STORE(INDEX, WHERE(g, alt, LOAD(same INDEX)))</code> → запись <code>alt</code> с гейтом.</li>
+<li class=""><strong><code>reduce_sym_patterns</code></strong>: <code>REDUCE(x * c, Add)</code> → <code>REDUCE(x, Add) * c</code> и <code>reduce_mul_chain_sym</code> (множители, не зависящие от диапазона, выносятся из редукции <code>Add</code>/<code>Max</code>; для <code>Max</code> — только неотрицательные), только для целых.</li>
+<li class=""><strong><code>sym_phase3_patterns</code></strong>: <code>-1 * (x + y)</code> → <code>-x + -y</code>; <code>(x + y) * c</code> → <code>x*c + y*c</code> для <code>WeakInt</code>; разворачивание <code>GROUP</code> с одним источником; сплющивание <code>NOOP</code>/<code>STACK</code>/<code>SINK</code> в <code>SINK</code>/<code>GROUP</code>; <code>END(NOOP)</code> → <code>NOOP</code>.</li>
 </ul>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=11-устранение-minmax>11. Устранение Min/Max<a href=#11-устранение-minmax class=hash-link aria-label="Прямая ссылка на 11. Устранение Min/Max" title="Прямая ссылка на 11. Устранение Min/Max" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>MAX(x, x)</code><td><code>x</code><td>Max от себя — тождество<tr><td><code>MAX(x, y)</code><td><code>x</code><td>Когда <code>x.vmin >= y.vmax</code> (границы доказывают доминирование)<tr><td><code>MAX(x, y)</code><td><code>y</code><td>Когда <code>y.vmin >= x.vmax</code></table>
-<p>Используется <code>VminVmaxProperty</code> для анализа диапазонов. Отдельных паттернов для <code>MIN</code> нет — Svod снижает <code>MIN(a,b)</code> до <code>NEG(MAX(NEG(a), NEG(b)))</code> до срабатывания этих паттернов.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=12-оптимизация-where>12. Оптимизация WHERE<a href=#12-оптимизация-where class=hash-link aria-label="Прямая ссылка на 12. Оптимизация WHERE" title="Прямая ссылка на 12. Оптимизация WHERE" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=устранение-условия>Устранение условия<a href=#устранение-условия class=hash-link aria-label="Прямая ссылка на Устранение условия" title="Прямая ссылка на Устранение условия" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>WHERE(cond, t, f)</code><td><code>t</code><td>Когда <code>cond.vmin == cond.vmax == true</code><tr><td><code>WHERE(cond, t, f)</code><td><code>f</code><td>Когда <code>cond.vmin == cond.vmax == false</code><tr><td><code>WHERE(LT(x, c), t, f)</code><td><code>t</code><td>Когда <code>x.vmax &lt; c.vmin</code> (всегда true)<tr><td><code>WHERE(LT(x, c), t, f)</code><td><code>f</code><td>Когда <code>x.vmin >= c.vmax</code> (всегда false)</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=упрощение-ветвей>Упрощение ветвей<a href=#упрощение-ветвей class=hash-link aria-label="Прямая ссылка на Упрощение ветвей" title="Прямая ссылка на Упрощение ветвей" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>WHERE(_, t, t)</code><td><code>t</code><td>Одинаковые ветви<tr><td><code>WHERE(x, true, false)</code><td><code>x</code><td>Тождество bool<tr><td><code>WHERE(x, false, true)</code><td><code>NOT(x)</code><td>Отрицание bool<tr><td><code>WHERE(NOT(cond), t, f)</code><td><code>WHERE(cond, f, t)</code><td>Инверсия условия<tr><td><code>WHERE(a, WHERE(b, c, d), d)</code><td><code>WHERE(AND(a, b), c, d)</code><td>Слияние ветвей (ptr_eq на <code>d</code>)</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Защита от Invalid при инверсии условия</div><div class=admonitionContent_BuS1><p><code>WHERE(NOT(cond), t, f) -> WHERE(cond, f, t)</code> <strong>не</strong> применяется, когда <code>f</code> содержит <code>Invalid</code>. Паддинг создаёт структуры <code>WHERE(valid, idx, Invalid)</code>, и перестановка переместила бы <code>Invalid</code> в ветвь true, где нижестоящие паттерны не смогут его сопоставить. Проверяются как скалярный <code>Invalid</code>, так и векторизованный <code>VECTORIZE(Invalid, ...)</code>.<p>У Tinygrad та же защита: <code>symbolic.py:201-202</code>.</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=13-распространение-invalid>13. Распространение Invalid<a href=#13-распространение-invalid class=hash-link aria-label="Прямая ссылка на 13. Распространение Invalid" title="Прямая ссылка на 13. Распространение Invalid" translate=no>​</a></h2>
-<p>Invalid — это сигнальное значение Svod для областей тензора за пределами допустимых границ, создаваемых операциями паддинга. Эти паттерны должны выполняться <strong>перед</strong> паттернами тождеств вроде <code>x*0=0</code>, иначе маркеры валидности будут уничтожены.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=пример-приоритета-паттернов>Пример приоритета паттернов<a href=#пример-приоритета-паттернов class=hash-link aria-label="Прямая ссылка на Пример приоритета паттернов" title="Прямая ссылка на Пример приоритета паттернов" translate=no>​</a></h3>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Without ordering:  MUL(0, WHERE(cond, x, Invalid)) -> 0    (x*0=0 fires, loses Invalid)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">With ordering:     MUL(0, WHERE(cond, x, Invalid))</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                 -> WHERE(cond, MUL(0, x), Invalid)         (Invalid propagation fires first)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                 -> WHERE(cond, 0, Invalid)                  (then x*0=0 is safe)</span><br/></div></code></pre></div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=слияние-where-invalid>Слияние WHERE-Invalid<a href=#слияние-where-invalid class=hash-link aria-label="Прямая ссылка на Слияние WHERE-Invalid" title="Прямая ссылка на Слияние WHERE-Invalid" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<tbody><tr><td><code>WHERE(c1, WHERE(c2, x, Inv), Inv)</code><td><code>WHERE(AND(c1, c2), x, Inv)</code><tr><td><code>WHERE(c1, WHERE(c2, x, Inv), y)</code><td><code>WHERE(AND(c1, c2), x, y)</code></table>
-<p>Многомерный паддинг создаёт вложенные WHERE-Invalid после распространения через линеаризованную индексную арифметику. Слияние до одного уровня обеспечивает потребление <code>pm_lower_index_dtype</code> за один шаг.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=проталкивание-операций-через-where-invalid>Проталкивание операций через WHERE-Invalid<a href=#проталкивание-операций-через-where-invalid class=hash-link aria-label="Прямая ссылка на Проталкивание операций через WHERE-Invalid" title="Прямая ссылка на Проталкивание операций через WHERE-Invalid" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Операции<tbody><tr><td><code>CAST(WHERE(c, x, Inv))</code><td><code>WHERE(c, CAST(x), Inv)</code><td><tr><td><code>op(WHERE(c, x, Inv), y)</code><td><code>WHERE(c, op(x, y), Inv)</code><td>13 бинарных операций (не сравнения)<tr><td><code>op(y, WHERE(c, x, Inv))</code><td><code>WHERE(c, op(y, x), Inv)</code><td>13 бинарных операций (не сравнения)<tr><td><code>cmp(WHERE(c, x, Inv), y)</code><td><code>cmp(x, y)</code><td>Lt, Le, Eq, Ne, Gt, Ge<tr><td><code>cmp(y, WHERE(c, x, Inv))</code><td><code>cmp(y, x)</code><td>Lt, Le, Eq, Ne, Gt, Ge</table>
-<p>Для сравнений WHERE-Invalid отбрасывается — область Invalid уже ограждена ниже по потоку.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=распространение-голого-invalid>Распространение голого Invalid<a href=#распространение-голого-invalid class=hash-link aria-label="Прямая ссылка на Распространение голого Invalid" title="Прямая ссылка на Распространение голого Invalid" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Защита<tbody><tr><td><code>op(Invalid, y)</code><td><code>Invalid</code><td><code>y.dtype() == DType::Index</code>, только левая позиция</table>
-<p>Согласование с Tinygrad: <code>symbolic.py:37</code>. Правосторонний голый Invalid НЕ распространяется, чтобы не загрязнять неиндексные вычисления.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=мёртвые-загрузкизаписи-из-invalid-индексов>Мёртвые загрузки/записи из Invalid-индексов<a href=#мёртвые-загрузкизаписи-из-invalid-индексов class=hash-link aria-label="Прямая ссылка на Мёртвые загрузки/записи из Invalid-индексов" title="Прямая ссылка на Мёртвые загрузки/записи из Invalid-индексов" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<tbody><tr><td><code>LOAD(INDEX(buf, Invalid))</code><td><code>CONST(0)</code><tr><td><code>LOAD(CAST(INDEX(buf, Invalid)))</code><td><code>CONST(0)</code><tr><td><code>STORE(INDEX(buf, Invalid), val)</code><td><code>NOOP</code><tr><td><code>STORE(CAST(INDEX(buf, Invalid)), val)</code><td><code>NOOP</code></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=14-удаление-мёртвого-кода>14. Удаление мёртвого кода<a href=#14-удаление-мёртвого-кода class=hash-link aria-label="Прямая ссылка на 14. Удаление мёртвого кода" title="Прямая ссылка на 14. Удаление мёртвого кода" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=мёртвые-диапазоны>Мёртвые диапазоны<a href=#мёртвые-диапазоны class=hash-link aria-label="Прямая ссылка на Мёртвые диапазоны" title="Прямая ссылка на Мёртвые диапазоны" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>RANGE(end)</code> где <code>vmax &lt; 0</code><td><code>CONST(0)</code><td>Пустой диапазон (никогда не выполняется)<tr><td><code>RANGE(CONST)</code> где <code>vmin == vmax</code><td><code>CONST(vmin)</code><td>Тривиальный диапазон (одно значение)<tr><td><code>END(computation, ranges)</code><td><code>END(computation, live_ranges)</code><td>Фильтрация мёртвых диапазонов из END<tr><td><code>END(computation, [])</code><td><code>computation</code><td>Все диапазоны мертвы — разворачиваем</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=мёртвые-редукции>Мёртвые редукции<a href=#мёртвые-редукции class=hash-link aria-label="Прямая ссылка на Мёртвые редукции" title="Прямая ссылка на Мёртвые редукции" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Операция редукции<th>Нейтральный элемент<tbody><tr><td>Add<td><code>0</code><tr><td>Mul<td><code>1</code><tr><td>Max<td><code>-inf</code> (минимум dtype)<tr><td>Min<td><code>+inf</code> (максимум dtype)</table>
-<p>Когда ВСЕ диапазоны REDUCE мертвы (пусты), REDUCE заменяется своим нейтральным элементом.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=упрощение-зависимостей>Упрощение зависимостей<a href=#упрощение-зависимостей class=hash-link aria-label="Прямая ссылка на Упрощение зависимостей" title="Прямая ссылка на Упрощение зависимостей" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<tbody><tr><td><code>AFTER(x, [])</code><td><code>x</code></table>
-<p>Отсутствие зависимостей означает отсутствие ограничений порядка.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=15-степень-и-отрицание>15. Степень и отрицание<a href=#15-степень-и-отрицание class=hash-link aria-label="Прямая ссылка на 15. Степень и отрицание" title="Прямая ссылка на 15. Степень и отрицание" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<tbody><tr><td><code>POW(x, 0)</code><td><code>1</code><tr><td><code>POW(x, 1)</code><td><code>x</code><tr><td><code>NEG(NEG(x))</code><td><code>x</code></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=16-свёртки-полос--index-над-stack>16. Свёртки полос — INDEX над STACK<a href=#16-свёртки-полос--index-над-stack class=hash-link aria-label="Прямая ссылка на 16. Свёртки полос — INDEX над STACK" title="Прямая ссылка на 16. Свёртки полос — INDEX над STACK" translate=no>​</a></h2>
-<p>В Svod нет операции GEP: значение с формой — это <code>STACK</code> полос, а <code>INDEX</code> выбирает из него полосу ровно так же, как выбирает адрес в буфере. Поэтому у <code>gep_pushing</code> из Tinygrad здесь нет прямого аналога. Вместо этого в Svod есть свёртки, схлопывающие структуру <code>INDEX</code>/<code>STACK</code>, чтобы девекторизатор видел скаляры.</p>
-<p>Большинство таких свёрток структурные и живут в очистке movement-операций девекторизатора (<code>schedule/src/devectorize.rs</code>), а не в <code>symbolic_simple()</code>. Единственное правило символьного уровня — <code>alu_vectorize_reorder_patterns</code>, относящееся к уровню 3, <code>sym()</code>.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=выбор-и-схлопывание-полос>Выбор и схлопывание полос<a href=#выбор-и-схлопывание-полос class=hash-link aria-label="Прямая ссылка на Выбор и схлопывание полос" title="Прямая ссылка на Выбор и схлопывание полос" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечания<tbody><tr><td><code>INDEX(STACK([a, b, c]), 2)</code><td><code>c</code><td>Константный индекс полосы сворачивается к соответствующему источнику<tr><td><code>INDEX(STACK([...]), c0, rest...)</code><td><code>INDEX(sources[c0], rest...)</code><td>Ведущая константа рекурсивно снимает один уровень STACK<tr><td><code>STACK([INDEX(b, 0), INDEX(b, 1), ...])</code><td><code>b</code><td>Последовательные чтения полос восстанавливают источник<tr><td><code>INDEX(INDEX(b, i), j)</code><td><code>INDEX(b, i, j)</code><td>Композиция цепочек скалярной индексации<tr><td><code>INDEX(AFTER(STACK([...]), deps), c)</code><td>выбранная полоса с переприсоединёнными <code>deps</code><td>Выбор полосы из регистрового стека сохраняет порядок</table>
-<p><code>const_index_into_stack</code> работает рекурсивно: список индексов, ведущие элементы которого — константы, снимает по одному уровню <code>STACK</code> на элемент.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=alu-над-stack>ALU над STACK<a href=#alu-над-stack class=hash-link aria-label="Прямая ссылка на ALU над STACK" title="Прямая ссылка на ALU над STACK" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Защита<tbody><tr><td><code>op(STACK(x,x,x,x), STACK(y,y,y,y))</code><td><code>STACK(op(x,y), op(x,y), ...)</code><td>Оба операнда — broadcast (все полосы <code>ptr_eq</code>), одинаковая длина > 1</table>
-<p>Применяется к восемнадцати бинарным операциям — Add, Mul, Sub, FloorMod, Max, FloorDiv, Fdiv, Pow, And, Or, Xor, Shl, Shr и шести сравнениям. Схлопывание к <code>STACK</code> из одной скалярной операции открывает операнды для свёртки констант и скалярных упрощений.</p>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Только уровень 3</div><div class=admonitionContent_BuS1><p><code>alu_vectorize_reorder_patterns</code> входит в <code>sym()</code>, а не в <code>symbolic()</code> или <code>symbolic_simple()</code>. Правило срабатывает на стадиях, где запускается <code>sym()</code> — пред-оптимизация, Стадия 8 и девекторизатор, — так что к финальному проходу декомпозиция+рендер переупорядочивание уже произошло.</div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=очистка-movement-операций-вокруг-stack>Очистка movement-операций вокруг STACK<a href=#очистка-movement-операций-вокруг-stack class=hash-link aria-label="Прямая ссылка на Очистка movement-операций вокруг STACK" title="Прямая ссылка на Очистка movement-операций вокруг STACK" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<tbody><tr><td><code>RESHAPE(STACK([x]))</code><td><code>x</code> — когда формы уже совпадают<tr><td><code>RESHAPE(x)</code>, добавляющий ведущие единичные измерения<td>по одной обёртке <code>STACK([x])</code> на каждое добавленное измерение<tr><td><code>EXPAND(STACK([x]))</code><td><code>STACK([x, x, ..., x])</code> — материализация broadcast<tr><td><code>PERMUTE(PERMUTE(x, a), b)</code><td><code>PERMUTE(x, a∘b)</code>; тождественные перестановки исчезают</table>
-<p>Эти правила живут в <code>movement_cleanup_patterns()</code> / <code>mop_cleanup_patterns()</code>, которые девекторизатор применяет перед скаляризацией. Полосы WMMA обрабатываются там же — функциями <code>stack_wmma_sources</code> и <code>broadcast_and_devec_wmma</code>, а не каким-либо символьным паттерном.</p>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=17-where-на-load-только-стадия-8>17. WHERE на LOAD (только Стадия 8)<a href=#17-where-на-load-только-стадия-8 class=hash-link aria-label="Прямая ссылка на 17. WHERE на LOAD (только Стадия 8)" title="Прямая ссылка на 17. WHERE на LOAD (только Стадия 8)" translate=no>​</a></h2>
-<p><strong>Функция</strong>: <code>pm_move_where_on_load()</code></p>
-<p>Преобразует маскированные загрузки, встраивая условие в операцию INDEX:</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Before:  WHERE(cond, INDEX(buf, idx), 0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">After:   INDEX(buf, WHERE(combined_cond, idx, Invalid))</span><br/></div></code></pre></div></div>
-<p>Это позволяет аппаратную предикацию для маскированных загрузок и устраняет накладные расходы WHERE.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=как-это-работает>Как это работает<a href=#как-это-работает class=hash-link aria-label="Прямая ссылка на Как это работает" title="Прямая ссылка на Как это работает" translate=no>​</a></h3>
-<ol>
-<li class=""><strong>Разделить</strong> условие на AND-клаузы</li>
-<li class=""><strong>Разбить</strong> клаузы на переносимые и остающиеся:
-<ul>
-<li class="">Переносимые: все зависимости RANGE в области INDEX, нет внешних зависимостей INDEX</li>
-<li class="">Остающиеся: всё остальное</li>
-</ul>
-</li>
-<li class=""><strong>Встроить</strong> переносимые клаузы как <code>WHERE(cond, idx, Invalid)</code> в <code>indices[0]</code></li>
-<li class=""><strong>Обернуть</strong> во внешний WHERE, если остающиеся клаузы существуют</li>
-</ol>
-<p>Поддерживается частичный перенос клауз — переносятся только клаузы, чьи диапазоны находятся в области индекса. Существующие клаузы валидности в <code>indices[0]</code> дедуплицируются.</p>
-<p>Инвертированный паттерн <code>WHERE(cond, 0, INDEX(buf, idx))</code> также обрабатывается через отрицание условия.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=18-коммутативная-канонизация>18. Коммутативная канонизация<a href=#18-коммутативная-канонизация class=hash-link aria-label="Прямая ссылка на 18. Коммутативная канонизация" title="Прямая ссылка на 18. Коммутативная канонизация" translate=no>​</a></h2>
-<p>Для коммутативных бинарных операций над Index dtype операнды сортируются по идентификатору UOp (меньший id слева):</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Операции<th>Защита<tbody><tr><td>Add, Mul, Max, Eq, Ne, And, Or, Xor<td><code>dtype == DType::Index && b.id &lt; a.id</code></table>
-<p>Без этого математически эквивалентные выражения вроде <code>R1*8000 + R2*16</code> и <code>R2*16 + R1*8000</code> не будут дедуплицированы через hash consing, нарушая группировку в <code>expand_vector_index</code>.</p>
-<p>Применяется только к Index dtype, чтобы не нарушить слияние векторной математики. Tinygrad: <code>symbolic.py:178-182</code>.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=19-упрощение-div-mod>19. Упрощение Div-Mod<a href=#19-упрощение-div-mod class=hash-link aria-label="Прямая ссылка на 19. Упрощение Div-Mod" title="Прямая ссылка на 19. Упрощение Div-Mod" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=быстрые-пути-на-основе-диапазонов>Быстрые пути на основе диапазонов<a href=#быстрые-пути-на-основе-диапазонов class=hash-link aria-label="Прямая ссылка на Быстрые пути на основе диапазонов" title="Прямая ссылка на Быстрые пути на основе диапазонов" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Условие<tbody><tr><td><code>MOD(x, n)</code><td><code>x</code><td><code>0 &lt;= vmin(x)</code> и <code>vmax(x) &lt; n</code><tr><td><code>IDIV(x, n)</code><td><code>k</code><td>Все значения в диапазоне делятся до одного <code>k</code><tr><td><code>MOD(ADD[MUL[a, m], b], n)</code><td><code>MOD(b, n)</code><td><code>m == n</code> (вынос кратных)<tr><td><code>IDIV(ADD[MUL[a, m], b], n)</code><td><code>a + IDIV(b, n)</code><td><code>m == n</code><tr><td><code>IDIV(ADD[MUL[a, m], b], n)</code><td><code>a</code><td><code>m == n</code> и <code>0 &lt;= b &lt; n</code></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=унифицированный-движок-div-mod-fold_divmod_general>Унифицированный движок Div-Mod (<code>fold_divmod_general</code>)<a href=#унифицированный-движок-div-mod-fold_divmod_general class=hash-link aria-label="Прямая ссылка на унифицированный-движок-div-mod-fold_divmod_general" title="Прямая ссылка на унифицированный-движок-div-mod-fold_divmod_general" translate=no>​</a></h3>
-<p>Для IDIV и MOD над Index dtype унифицированный движок пробует правила упрощения в порядке приоритета. Основан на <code>fold_divmod_general</code> из Tinygrad (<code>divandmod.py:8-96</code>).</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Приоритет<th>Правило<th>Описание<tbody><tr><td>1<td>cancel_divmod<td>Диапазон лежит в одном интервале знаменателя<tr><td>2<td>nested_div<td><code>(a % (k*c)) // c -> (a // c) % k</code><tr><td>3<td>remove_nested_mod<td><code>(a%4 + b)%2 -> (a+b)%2</code> когда `2<tr><td>4<td>fold_divmod_congruence<td>Модулярная арифметика конгруэнтности множителей<tr><td>5<td>gcd_with_remainder<td>Вынос общего GCD из числителя<tr><td>6<td>nest_div_by_smallest_factor<td>Рекурсивное расщепление по наименьшему общему множителю<tr><td>7<td>divide_by_gcd<td>GCD-факторизация при любом знаменателе<tr><td>8<td>factor_remainder<td><code>(d*x+y)//d -> x + y//d</code> (крайний вариант)</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=рекомбинация-div-mod>Рекомбинация Div-Mod<a href=#рекомбинация-div-mod class=hash-link aria-label="Прямая ссылка на Рекомбинация Div-Mod" title="Прямая ссылка на Рекомбинация Div-Mod" translate=no>​</a></h3>
-<p>Паттерны, рекомбинирующие разделённые операции div и mod обратно в исходное выражение:</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Защита<tbody><tr><td><code>ADD[MOD(x, n), MUL[IDIV(x, n), n]]</code><td><code>x</code><td>ptr_eq на x, n<tr><td><code>ADD[MOD(IDIV(x, a), c), MUL[IDIV(x, b), c]]</code><td><code>IDIV(x, a)</code><td><code>a * c == b</code><tr><td><code>ADD[MUL[MOD(x, c1), c2], MUL[IDIV(x, c1), c3]]</code><td><code>MUL(x, c2)</code><td><code>c1 * c2 == c3</code><tr><td><code>ADD[ADD[y, MOD(x, n)], MUL[IDIV(x, n), n]]</code><td><code>ADD(y, x)</code><td>ptr_eq на x, n<tr><td><code>IDIV(ADD[IDIV(a, c1), c2], c3)</code><td><code>IDIV(ADD(a, c1*c2), c1*c3)</code><td>Вложенное деление</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=продвинутое-деление>Продвинутое деление<a href=#продвинутое-деление class=hash-link aria-label="Прямая ссылка на Продвинутое деление" title="Прямая ссылка на Продвинутое деление" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Паттерн<th>Результат<th>Примечание<tbody><tr><td><code>IDIV(IDIV(a, b), c)</code><td><code>IDIV(a, b*c)</code><td>Композиция вложенного деления<tr><td><code>IDIV(expr, d)</code><td><code>expr.divides(d)</code><td>Обобщённое точное деление<tr><td><code>IDIV(ADD(a, b), c)</code><td><code>IDIV(a, c) + IDIV(b, c)</code><td>Когда оба делятся нацело<tr><td><code>IDIV(SUB(a, b), c)</code><td><code>IDIV(a, c) - IDIV(b, c)</code><td>Когда оба делятся нацело<tr><td><code>MUL(c, ADD(a, b))</code><td><code>ADD(MUL(c, a), MUL(c, b))</code><td>Распределение умножения</table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=перекрёстные-ссылки>Перекрёстные ссылки<a href=#перекрёстные-ссылки class=hash-link aria-label="Прямая ссылка на Перекрёстные ссылки" title="Прямая ссылка на Перекрёстные ссылки" translate=no>​</a></h2>
-<ul>
-<li class=""><a class="" href=/ru/docs/architecture/pipeline>Пайплайн исполнения</a> — стадии, на которых выполняются эти паттерны</li>
-<li class=""><a class="" href=/ru/docs/architecture/optimizations/pattern-system>Движок паттернов</a> — как работает движок сопоставления паттернов</li>
-<li class=""><a class="" href=/ru/docs/architecture/codegen/rangeify>Rangeify</a> — контекст Стадии 4 (паттерны выполняются после снижения movement-операций)</li>
-<li class=""><a class="" href=/ru/docs/architecture/codegen/expander>Expander</a> — контекст Стадии 8 (паттерны выполняются после оптимизационных действий)</li>
-<li class=""><a class="" href=/ru/docs/architecture/codegen/linearizer>Linearizer</a> — контекст Стадии 16 (финальная очистка)</li>
-</ul></div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/architecture/optimizations/algebraic-simplification.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>Отредактировать эту страницу</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="Страница документа"><a class="pagination-nav__link pagination-nav__link--prev" href=/ru/docs/architecture/optimizations/pattern-system><div class=pagination-nav__sublabel>Предыдущая страница</div><div class=pagination-nav__label>Движок паттернов</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/ru/docs/architecture/optimizations/index-arithmetic><div class=pagination-nav__sublabel>Следующая страница</div><div class=pagination-nav__label>Индексная арифметика</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#рабочий-пример-каскад-оптимизаций class="table-of-contents__link toc-highlight">Рабочий пример: каскад оптимизаций</a><li><a href=#порядок-паттернов class="table-of-contents__link toc-highlight">Порядок паттернов</a><li><a href=#1-свёртка-констант class="table-of-contents__link toc-highlight">1. Свёртка констант</a><ul><li><a href=#скалярные-константы class="table-of-contents__link toc-highlight">Скалярные константы</a><li><a href=#векторные-константы class="table-of-contents__link toc-highlight">Векторные константы</a></ul><li><a href=#2-свёртка-тождеств-и-нулей class="table-of-contents__link toc-highlight">2. Свёртка тождеств и нулей</a><li><a href=#3-свёртка-по-совпадению-операндов class="table-of-contents__link toc-highlight">3. Свёртка по совпадению операндов</a><li><a href=#4-свёртка-в-ноль class="table-of-contents__link toc-highlight">4. Свёртка в ноль</a><li><a href=#5-упрощение-деления class="table-of-contents__link toc-highlight">5. Упрощение деления</a><li><a href=#6-оптимизация-cast class="table-of-contents__link toc-highlight">6. Оптимизация CAST</a><li><a href=#7-объединение-термов class="table-of-contents__link toc-highlight">7. Объединение термов</a><li><a href=#8-свёртка-цепочек-alu class="table-of-contents__link toc-highlight">8. Свёртка цепочек ALU</a><ul><li><a href=#свёртка-констант class="table-of-contents__link toc-highlight">Свёртка констант</a><li><a href=#вынос-констант class="table-of-contents__link toc-highlight">Вынос констант</a><li><a href=#канонизация-sub class="table-of-contents__link toc-highlight">Канонизация Sub</a></ul><li><a href=#9-булева-логика class="table-of-contents__link toc-highlight">9. Булева логика</a><li><a href=#10-упрощение-сравнений class="table-of-contents__link toc-highlight">10. Упрощение сравнений</a><ul><li><a href=#самосравнение-не-float-ptr_eq class="table-of-contents__link toc-highlight">Самосравнение (не float, ptr_eq)</a><li><a href=#на-основе-констант-и-диапазонов class="table-of-contents__link toc-highlight">На основе констант и диапазонов</a><li><a href=#алгебраические-преобразования class="table-of-contents__link toc-highlight">Алгебраические преобразования</a></ul><li><a href=#11-устранение-minmax class="table-of-contents__link toc-highlight">11. Устранение Min/Max</a><li><a href=#12-оптимизация-where class="table-of-contents__link toc-highlight">12. Оптимизация WHERE</a><ul><li><a href=#устранение-условия class="table-of-contents__link toc-highlight">Устранение условия</a><li><a href=#упрощение-ветвей class="table-of-contents__link toc-highlight">Упрощение ветвей</a></ul><li><a href=#13-распространение-invalid class="table-of-contents__link toc-highlight">13. Распространение Invalid</a><ul><li><a href=#пример-приоритета-паттернов class="table-of-contents__link toc-highlight">Пример приоритета паттернов</a><li><a href=#слияние-where-invalid class="table-of-contents__link toc-highlight">Слияние WHERE-Invalid</a><li><a href=#проталкивание-операций-через-where-invalid class="table-of-contents__link toc-highlight">Проталкивание операций через WHERE-Invalid</a><li><a href=#распространение-голого-invalid class="table-of-contents__link toc-highlight">Распространение голого Invalid</a><li><a href=#мёртвые-загрузкизаписи-из-invalid-индексов class="table-of-contents__link toc-highlight">Мёртвые загрузки/записи из Invalid-индексов</a></ul><li><a href=#14-удаление-мёртвого-кода class="table-of-contents__link toc-highlight">14. Удаление мёртвого кода</a><ul><li><a href=#мёртвые-диапазоны class="table-of-contents__link toc-highlight">Мёртвые диапазоны</a><li><a href=#мёртвые-редукции class="table-of-contents__link toc-highlight">Мёртвые редукции</a><li><a href=#упрощение-зависимостей class="table-of-contents__link toc-highlight">Упрощение зависимостей</a></ul><li><a href=#15-степень-и-отрицание class="table-of-contents__link toc-highlight">15. Степень и отрицание</a><li><a href=#16-свёртки-полос--index-над-stack class="table-of-contents__link toc-highlight">16. Свёртки полос — INDEX над STACK</a><ul><li><a href=#выбор-и-схлопывание-полос class="table-of-contents__link toc-highlight">Выбор и схлопывание полос</a><li><a href=#alu-над-stack class="table-of-contents__link toc-highlight">ALU над STACK</a><li><a href=#очистка-movement-операций-вокруг-stack class="table-of-contents__link toc-highlight">Очистка movement-операций вокруг STACK</a></ul><li><a href=#17-where-на-load-только-стадия-8 class="table-of-contents__link toc-highlight">17. WHERE на LOAD (только Стадия 8)</a><ul><li><a href=#как-это-работает class="table-of-contents__link toc-highlight">Как это работает</a></ul><li><a href=#18-коммутативная-канонизация class="table-of-contents__link toc-highlight">18. Коммутативная канонизация</a><li><a href=#19-упрощение-div-mod class="table-of-contents__link toc-highlight">19. Упрощение Div-Mod</a><ul><li><a href=#быстрые-пути-на-основе-диапазонов class="table-of-contents__link toc-highlight">Быстрые пути на основе диапазонов</a><li><a href=#унифицированный-движок-div-mod-fold_divmod_general class="table-of-contents__link toc-highlight">Унифицированный движок Div-Mod (<code>fold_divmod_general</code>)</a><li><a href=#рекомбинация-div-mod class="table-of-contents__link toc-highlight">Рекомбинация Div-Mod</a><li><a href=#продвинутое-деление class="table-of-contents__link toc-highlight">Продвинутое деление</a></ul><li><a href=#перекрёстные-ссылки class="table-of-contents__link toc-highlight">Перекрёстные ссылки</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Документация</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/ru/docs/introduction>Введение</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Сообщество</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=пример-каскада>Пример каскада<a href=#пример-каскада class=hash-link aria-label="Прямая ссылка на Пример каскада" title="Прямая ссылка на Пример каскада" translate=no>​</a></h2>
+<p><code>(x + 0) * 1 + (3 + 4)</code> с <code>x: Int32</code>:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Add(x, 0)        → x          identity_and_zero</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Mul(x, 1)        → x          identity_and_zero</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Add(3, 4)        → 7          constant_folding</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Add(x, 7)                     stays: no rule</span><br/></div></code></pre></div></div>
+<p>Движок переписывает потомков раньше родителей и заново сопоставляет пересобранного родителя, поэтому все три шага происходят за один <code>graph_rewrite</code>. Шаги с тождествами — именно те, что доказывают <a class="" href=/ru/docs/architecture/optimizations/pattern-system#verifying-rewrites-with-z3>оракулы Z3</a>.</div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/architecture/optimizations/algebraic-simplification.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>Отредактировать эту страницу</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="Страница документа"><a class="pagination-nav__link pagination-nav__link--prev" href=/ru/docs/architecture/optimizations/pattern-system><div class=pagination-nav__sublabel>Предыдущая страница</div><div class=pagination-nav__label>Движок паттернов</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/ru/docs/architecture/optimizations/index-arithmetic><div class=pagination-nav__sublabel>Следующая страница</div><div class=pagination-nav__label>Индексная арифметика</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#состав class="table-of-contents__link toc-highlight">Состав</a><li><a href=#уровень-1 class="table-of-contents__link toc-highlight">Уровень 1</a><ul><li><a href=#распространение-invalid-propagate_invalid class="table-of-contents__link toc-highlight">Распространение Invalid (<code>propagate_invalid</code>)</a><li><a href=#мёртвые-загрузки-и-записи-fold_invalid_load_store class="table-of-contents__link toc-highlight">Мёртвые загрузки и записи (<code>fold_invalid_load_store</code>)</a><li><a href=#свёртка-констант class="table-of-contents__link toc-highlight">Свёртка констант</a><li><a href=#булева-арифметика class="table-of-contents__link toc-highlight">Булева арифметика</a><li><a href=#тождество-и-ноль class="table-of-contents__link toc-highlight">Тождество и ноль</a><li><a href=#свёртка-с-собой-и-с-нулём class="table-of-contents__link toc-highlight">Свёртка с собой и с нулём</a><li><a href=#деление class="table-of-contents__link toc-highlight">Деление</a><li><a href=#приведения-типов class="table-of-contents__link toc-highlight">Приведения типов</a><li><a href=#рекомбинация-div-mod class="table-of-contents__link toc-highlight">Рекомбинация div-mod</a><li><a href=#степени-булевы-выражения-dce class="table-of-contents__link toc-highlight">Степени, булевы выражения, DCE</a></ul><li><a href=#уровень-2 class="table-of-contents__link toc-highlight">Уровень 2</a><ul><li><a href=#коммутативная-канонизация class="table-of-contents__link toc-highlight">Коммутативная канонизация</a><li><a href=#объединение-слагаемых-addmul-с-константами class="table-of-contents__link toc-highlight">Объединение слагаемых (<code>Add</code>/<code>Mul</code> с константами)</a><li><a href=#булевы-правила-boolean_dsl_patterns class="table-of-contents__link toc-highlight">Булевы правила (<code>boolean_dsl_patterns</code>)</a><li><a href=#where class="table-of-contents__link toc-highlight">WHERE</a><li><a href=#схлопывание-по-границам-и-minmax class="table-of-contents__link toc-highlight">Схлопывание по границам и min/max</a><li><a href=#свёртка-цепочек-alu-alu_folding_dsl_patterns class="table-of-contents__link toc-highlight">Свёртка цепочек ALU (<code>alu_folding_dsl_patterns</code>)</a><li><a href=#сравнения-comparison_dsl_patterns class="table-of-contents__link toc-highlight">Сравнения (<code>comparison_dsl_patterns</code>)</a><li><a href=#диапазоны-и-деление class="table-of-contents__link toc-highlight">Диапазоны и деление</a><li><a href=#after class="table-of-contents__link toc-highlight">AFTER</a></ul><li><a href=#уровень-3-sym class="table-of-contents__link toc-highlight">Уровень 3 (<code>sym</code>)</a><li><a href=#пример-каскада class="table-of-contents__link toc-highlight">Пример каскада</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Документация</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/ru/docs/introduction>Введение</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Сообщество</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

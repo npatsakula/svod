@@ -1,232 +1,174 @@
-<!doctype html><html lang=zh-CN dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-backends/amd/am-driver" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>AM 驱动（用户态） | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/zh-Hans/docs/backends/amd/am-driver /><meta data-rh=true property=og:locale content=zh_CN /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=zh-Hans /><meta data-rh=true name=docsearch:language content=zh-Hans /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="AM 驱动（用户态） | Svod"/><meta data-rh=true name=description content="AM 驱动是第二个 AmdIface 后端，它直接驱动"/><meta data-rh=true property=og:description content="AM 驱动是第二个 AmdIface 后端，它直接驱动"/><link data-rh=true rel=icon href=/zh-Hans/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/zh-Hans/docs/backends/amd/am-driver /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/amd/am-driver hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/backends/amd/am-driver hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/backends/amd/am-driver hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/backends/amd/am-driver hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/amd/am-driver hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/zh-Hans/docs/backends/amd/am-driver","name":"AM 驱动","position":1}]}</script><link rel=stylesheet href=/zh-Hans/assets/css/styles.e76ef093.css /><script src=/zh-Hans/assets/js/runtime~main.e3d1fb96.js defer></script><script src=/zh-Hans/assets/js/main.82bf176e.js defer></script></head><body><svg style="display: none;"><defs>
+<!doctype html><html lang=zh-CN dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-backends/amd/am-driver" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>AM 驱动（用户态） | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/zh-Hans/docs/backends/amd/am-driver /><meta data-rh=true property=og:locale content=zh_CN /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=zh-Hans /><meta data-rh=true name=docsearch:language content=zh-Hans /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="AM 驱动（用户态） | Svod"/><meta data-rh=true name=description content="AM 是位于 device/src/amd/am/ 之下、实验性的、尚不可选择的用户态驱动，它直接"/><meta data-rh=true property=og:description content="AM 是位于 device/src/amd/am/ 之下、实验性的、尚不可选择的用户态驱动，它直接"/><link data-rh=true rel=icon href=/zh-Hans/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/zh-Hans/docs/backends/amd/am-driver /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/amd/am-driver hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/backends/amd/am-driver hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/backends/amd/am-driver hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/backends/amd/am-driver hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/backends/amd/am-driver hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/zh-Hans/docs/backends/amd/am-driver","name":"AM 驱动","position":1}]}</script><link rel=stylesheet href=/zh-Hans/assets/css/styles.e76ef093.css /><script src=/zh-Hans/assets/js/runtime~main.53f2793a.js defer></script><script src=/zh-Hans/assets/js/main.b4210e06.js defer></script></head><body><svg style="display: none;"><defs>
 <symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
 </defs></svg>
-<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-5c8")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/zh-Hans/img/logo.svg /><div role=region aria-label=跳到主要内容><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>跳到主要内容</a></div><nav aria-label=主导航 class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label=切换导航栏 aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/zh-Hans/><div class=navbar__logo><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/zh-Hans/docs/introduction>文档</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>简体中文</a><ul class=dropdown__menu><li><a href=/docs/backends/amd/am-driver target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/backends/amd/am-driver target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=zh-CN>简体中文</a><li><a href=/ru/docs/backends/amd/am-driver target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/backends/amd/am-driver target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="切换浅色/暗黑模式（当前为system mode）"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=搜索 aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label=回到顶部 class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label=文档侧边栏 class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/zh-Hans/docs/introduction><span class=linkLabel_WmDU>简介</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/examples><span class=categoryLinkLabel_W154>快速上手</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/architecture/pipeline><span class=categoryLinkLabel_W154>架构</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile 内核 (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/zh-Hans/docs/backends/jit-loader><span class=categoryLinkLabel_W154>后端</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/jit-loader><span class=linkLabel_WmDU>JIT 编译器</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/zh-Hans/docs/backends/amd/overview><span class=categoryLinkLabel_W154>AMD 后端</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/overview><span class=linkLabel_WmDU>概览</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/kfd-bindings><span class=linkLabel_WmDU>KFD 绑定</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/queues-and-dispatch><span class=linkLabel_WmDU>队列与调度</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/compile-and-graph><span class=linkLabel_WmDU>编译与图</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/zh-Hans/docs/backends/amd/am-driver><span class=linkLabel_WmDU>AM 驱动</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/debugging><span class=linkLabel_WmDU>调试</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/zh-Hans/docs/backends/cuda/overview><span class=categoryLinkLabel_W154>CUDA 后端</span></a></div></ul></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=页面路径><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label=主页面 class=breadcrumbs__link href=/zh-Hans/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>后端</span><li class=breadcrumbs__item><span class=breadcrumbs__link>AMD 后端</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>AM 驱动</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">本页总览</button></div><div class="theme-doc-markdown markdown"><header><h1>AM 驱动（用户态）</h1></header>
-<p><strong>AM</strong> 驱动是第二个 <a class="" href=/zh-Hans/docs/backends/amd/overview><code>AmdIface</code></a> 后端，它直接驱动
-GPU 的 PCI BAR，彻底绕过内核的 <code>amdgpu</code>/KFD 驱动。它
-是 tinygrad 用户态 AM 驱动的移植。其动机很具体：在单 XCC 的
-gfx11+ 硬件上，无锁的 <a class="" href=/zh-Hans/docs/backends/amd/queues-and-dispatch>多队列调度</a> 路径会把 CP
-微引擎停在内核 MES 固件无法抢占的等待中，从而把它卡进一次
-不可恢复的复位。内核调度器是那个共同的弱点——正是同一类故障
-迫使通道池在每一种硬件上都保持保守。如果我们拥有 GPU——页表、
-固件、调度——内核就永不处于调度路径中，也就无法被卡死。</p>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>开发中——尚不可选</div><div class=admonitionContent_BuS1><p>本页同时记录当下存在什么，以及其余部分的路线图。
-<strong><code>SVOD_AMD_BACKEND=am</code> 目前会返回错误</strong>（<code>device.rs</code> 只接受
-<code>kfd</code>）：尚无 AM 类型实现 <a class="" href=/zh-Hans/docs/backends/amd/overview><code>AmdIface</code></a> 接缝，因此
-今天能够触及的启动只能通过 <code>am_*</code> 示例驱动，而非通过
-<code>AmdDevice</code>。已存在的部分验证<strong>到引擎交接为止</strong>；尚无 GPU 引擎
-被确认在目标上消费工作（见 <a href=#the-vf-boundary class="">VF 边界</a>）。下面各节
-明确标注每个部件的状态。</div></div>
-<p>代码位于 <code>device/src/amd/am/</code> 之下。它在<strong>每一台 Unix 宿主上</strong>编译
-（<code>cfg(unix)</code>，与后端其余部分一样——见 <a class="" href=/zh-Hans/docs/backends/amd/overview>运行时检测的提供者
-模型</a>），因此始终被类型检查、lint 和单元测试——
-后端在<em>运行时</em>选择，绝不藏在一个可能腐烂的 cargo feature 之后。</p>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-5c8")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/zh-Hans/img/logo.svg /><div role=region aria-label=跳到主要内容><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>跳到主要内容</a></div><nav aria-label=主导航 class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label=切换导航栏 aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/zh-Hans/><div class=navbar__logo><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/zh-Hans/docs/introduction>文档</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>简体中文</a><ul class=dropdown__menu><li><a href=/docs/backends/amd/am-driver target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/backends/amd/am-driver target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=zh-CN>简体中文</a><li><a href=/ru/docs/backends/amd/am-driver target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/backends/amd/am-driver target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="切换浅色/暗黑模式（当前为system mode）"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=搜索 aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label=回到顶部 class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label=文档侧边栏 class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/zh-Hans/docs/introduction><span class=linkLabel_WmDU>简介</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/examples><span class=categoryLinkLabel_W154>快速上手</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/architecture/ir-design><span class=categoryLinkLabel_W154>架构</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile 内核 (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/zh-Hans/docs/backends/overview><span class=categoryLinkLabel_W154>后端</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/overview><span class=linkLabel_WmDU>概览</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/cpu><span class=linkLabel_WmDU>CPU</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/jit-loader><span class=linkLabel_WmDU>ELF JIT 加载器</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/metal><span class=linkLabel_WmDU>Metal</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/zh-Hans/docs/backends/amd/overview><span class=categoryLinkLabel_W154>AMD 后端</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/overview><span class=linkLabel_WmDU>概览</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/kfd-bindings><span class=linkLabel_WmDU>KFD 绑定</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/queues-and-dispatch><span class=linkLabel_WmDU>队列与调度</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/compile-and-graph><span class=linkLabel_WmDU>编译与图</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/zh-Hans/docs/backends/amd/am-driver><span class=linkLabel_WmDU>AM 驱动</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/debugging><span class=linkLabel_WmDU>调试</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/zh-Hans/docs/backends/cuda/overview><span class=categoryLinkLabel_W154>CUDA 后端</span></a></div></ul></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=页面路径><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label=主页面 class=breadcrumbs__link href=/zh-Hans/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>后端</span><li class=breadcrumbs__item><span class=breadcrumbs__link>AMD 后端</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>AM 驱动</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">本页总览</button></div><div class="theme-doc-markdown markdown"><header><h1>AM 驱动（用户态）</h1></header>
+<p><strong>AM</strong> 是位于 <code>device/src/amd/am/</code> 之下、实验性的、尚不可选择的用户态驱动，它直接
+与 AMD GPU 的 PCI BAR 对话，而不经过 <code>amdgpu</code>/KFD。它在思路上追随 tinygrad 的 AM
+驱动，但面向的是另一类硬件（虚拟功能而非裸机）。它只是<strong>脚手架</strong>：纯逻辑部分已
+实现并有单元测试，初始化流程曾在一块真实 GPU 上运行过一次，但从未有任何内核通过
+它执行。</p>
+<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>不可选择，不可运行</div><div class=admonitionContent_BuS1><p><code>SVOD_AMD_BACKEND=am</code> 会被拒绝（<code>unknown SVOD_AMD_BACKEND=am (only 'kfd' supported)</code>，<code>device/src/amd/device.rs</code>）：<code>am/</code> 中没有任何部分实现
+<a class="" href=/zh-Hans/docs/backends/amd/overview><code>AmdIface</code></a> 接缝，因此 <code>AmdDevice</code> 无法使用它。这些代码只能通过
+独立的 <code>device/examples/am_*.rs</code> 程序访问。它最后一次功能性改动是在 2026 年 6 月；
+之后的提交都是清理。下面的状态描述的是那次提交实际运行到的内容，而不是持续性的
+保证——它没有 CI 或硬件测试。</div></div>
+<p>该模块在每台 Unix 宿主上编译（<code>cfg(unix)</code>，与后端其余部分一样），因此它总会经过
+类型检查和 lint，其逻辑也有单元测试（<code>device/src/test/unit/amd/am/</code> 下约 40 个
+测试：页表、TLSF、内存管理器、寄存器表、discovery 解析器）。</p>
 <hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=目标硬件一块-cdna3-sr-iov-vfgfx943>目标硬件：一块 CDNA3 SR-IOV VF（gfx9.4.3）<a href=#目标硬件一块-cdna3-sr-iov-vfgfx943 class=hash-link aria-label="目标硬件：一块 CDNA3 SR-IOV VF（gfx9.4.3）的直接链接" title="目标硬件：一块 CDNA3 SR-IOV VF（gfx9.4.3）的直接链接" translate=no>​</a></h2>
-<p>该驱动的目标是一块 <strong>CDNA3</strong> GPU——<strong>gfx9.4.3</strong>，SPX 模式下的
-8 个 XCC——并且特指其 **SR-IOV 虚拟功能（Virtual Function，VF）**形态
-（该 GPU 是一个被透传进 KVM 客户机的 VF）。<code>AmDev::open</code> 会直接拒绝
-其他一切：非 VF 的功能，或 major.minor 不是 <code>(9, 4)</code> 的 GC 版本，
-都会快速失败（<code>device/src/amd/am/dev.rs</code>）。gfx1151（RDNA3.5）不再是
-<em>目标</em>，但 gfx11 的 arch 分支仍保持已实现且有单元测试——而且正是
-它的页表几何与 palloc 范围辅助函数被 gfx9 路径复用。</p>
-<blockquote>
-<p>启动用硬件：一块 AMD Instinct MI300X（gfx942 / GC 9.4.3）的 SR-IOV VF。
-<code>AmDev::open</code> 不接受其他任何东西。</p>
-</blockquote>
-<p><strong>VF</strong>（而非裸金属）这一身份是决定性的约束，它决定了
-整个驱动的形态：</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=目标cdna3-sr-iov-vfgfx94x>目标：CDNA3 SR-IOV VF（gfx9.4.x）<a href=#目标cdna3-sr-iov-vfgfx94x class=hash-link aria-label="目标：CDNA3 SR-IOV VF（gfx9.4.x）的直接链接" title="目标：CDNA3 SR-IOV VF（gfx9.4.x）的直接链接" translate=no>​</a></h2>
+<p><code>AmDev::open</code> 只接受 GC IP 版本为 9.4（CDNA3）的 GPU 的 <strong>SR-IOV 虚拟功能</strong>——
+初始化所用硬件是一个直通进 KVM 客户机的 MI300 级 VF。非 VF 的功能或其他 GC 版本会被
+拒绝（<code>device/src/amd/am/dev.rs</code>）。gfx11 页表编码仍然保留实现并有单元测试，gfx9
+路径复用的正是它的几何结构与物理范围辅助函数。</p>
+<p>作为 VF 而非裸机，这一点塑造了整个驱动：</p>
 <ul>
-<li class=""><strong>GC MMIO 是宿主门控的。</strong> 每一次对 GC 寄存器的<em>直接</em>读取都返回
-<code>0xffffffff</code>。所有 GC / GCVM 寄存器访问都必须<strong>经由 RLC 间接进行</strong>
-（RLCG 路径）——把值暂存进 RLC scratch，触发 <code>RLC_SPARE_INT</code>，
-轮询完成。</li>
-<li class=""><strong>VRAM/discovery 在被授予前是门控的。</strong> 帧缓冲区（以及由此而来的
-IP-discovery 表）在宿主 <strong>GIM</strong>（SR-IOV 宿主驱动）通过一次
-<strong>mailbox 握手</strong>授予访问权之前都不可读，因此该握手会运行在
-discovery <em>之前</em>。</li>
-<li class=""><strong>宿主 PF 拥有那些特权子系统：</strong> PSP、SMU、时钟、固件 /
-world-switch、L2 缓存配置、系统 aperture，以及——关键地——
-<strong>doorbell aperture 路由</strong>。AM 只编程客户机被允许触碰的那些每 VF 状态
-（页表 context0、每引擎失效范围、TLB 刷新、ring/queue MQD），
-这恰如内核的 <code>*_v*</code> IP 代码在 <code>amdgpu_sriov_vf</code> 下跳过这些块一样。</li>
+<li class=""><strong>GC MMIO 由宿主把关。</strong> 直接读取 GC 寄存器会返回 <code>0xffffffff</code>；GC / GCVM
+寄存器要<strong>经由 RLC 间接</strong>访问（把值暂存到 RLC scratch，触发 <code>RLC_SPARE_INT</code>，
+然后轮询）。</li>
+<li class=""><strong>VRAM 和 IP discovery 在获得授权前不可访问。</strong> 宿主的 <strong>GIM</strong>（SR-IOV 宿主
+驱动）必须通过一次 <strong>mailbox 握手</strong> 授予访问权限，该握手在 discovery 之前运行。</li>
+<li class=""><strong>宿主 PF 拥有特权子系统：</strong> PSP、SMU、时钟、固件 / world-switch，以及
+<strong>doorbell aperture 路由</strong>。AM 编程每个 VF 的状态（页表 context0、每个引擎的
+失效范围、TLB 刷新、环/队列 MQD），并尽力写入少数归 PF 所有的寄存器（L2 缓存
+配置、系统与身份 aperture、<code>GB_ADDR_CONFIG</code>、<code>RLC_CNTL</code>、<code>SH_MEM_BASES</code>），
+忽略被拒绝的写入。</li>
 </ul>
-<p>这与 tinygrad 的 AM 相反，后者是<strong>仅裸金属</strong>的（它 unbind
-<code>amdgpu</code> 并拥有整张设备）。VF 形态是一个不同的驱动：mailbox</p>
+<p>tinygrad 的 AM 正好相反：只支持裸机，解绑 <code>amdgpu</code> 并独占整个设备。VF 变体需要
+mailbox、RLCG 间接路径以及仅限单个 VF 的 hub 编程，并且永远无法独占各个引擎。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=已有内容>已有内容<a href=#已有内容 class=hash-link aria-label=已有内容的直接链接 title=已有内容的直接链接 translate=no>​</a></h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>分组<th>模块<th>作用<th>状态<tbody><tr><td>Discovery<td><code>pci.rs</code>、<code>discovery.rs</code><td>sysfs BAR mmap（BAR0 VRAM / BAR2 doorbell / BAR5 MMIO）、配置空间读写、带边界检查的 IP-discovery 解析器（每个 XCC 的段基址，<code>gc_info</code> v1/v2）<td>已在 VF 上运行；解析器有单元测试<tr><td>寄存器访问<td><code>regaccess.rs</code>、<code>rlcg.rs</code>、<code>mailbox.rs</code>、<code>regs.rs</code>、<code>regs_gen.rs</code><td>VF↔GIM mailbox 握手、按 XCC 的 RLCG 间接 GC/GCVM 读写、MMIO/RLCG 路由器、带 <code>select</code> / <code>find</code> / <code>encode</code> 的 vendored 寄存器表<td>已在 VF 上运行（scratch 回显、每个 XCC 上的 <code>GRBM_STATUS</code>）；表逻辑有单元测试<tr><td>内存（GMMU）<td><code>mm/{tlsf,pagetable,manager,mod}.rs</code><td>用于 VA、物理 VRAM 和页表池的 TLSF 分配器；4 级 / 48 位遍历（<code>va_shifts = [12, 21, 30, 39]</code>）；gfx9 和 gfx11 的 PTE/PDE 编码；大页；表回收；<code>valloc</code> / <code>vfree</code><td>有单元测试；页表经 BAR0 写入 VRAM 并由 CPU 回读遍历——尚未确认有 GPU 通过它们进行地址转换<tr><td>GMC 初始化<td><code>ip/gmc.rs</code><td>两个 hub 的 context0（base/start/end + CNTL）、MX_L1_TLB、每个引擎的失效范围、ENG17 TLB 刷新、HDP 刷新、原始故障状态读取<td>已在 VF 上运行到上下文编程，每个 XCC 上都收到刷新 ACK<tr><td>GFX 初始化<td><code>ip/gfx.rs</code><td>MEC 启用（不检查的写入）、v9 计算 MQD、HQD 激活、<code>WRITE_DATA</code> PM4<td><code>CP_HQD_ACTIVE</code> 读到 1；队列从未消费过数据包<tr><td>SDMA 初始化<td><code>ip/sdma.rs</code><td>解除 F32 停机，编程 RB base/rptr/wptr + doorbell，提交，<code>wait_idle</code><td>已编程；拷贝从未完成<tr><td>编排器<td><code>dev.rs</code><td><code>AmDev::open</code> = mailbox → discovery → GMMU → GMC context0 → 刷新；<code>valloc</code>、<code>vram_read</code> / <code>vram_write</code>、<code>release</code><td>已在 VF 上运行至 GMC</table>
+<p>页表由一个可注入的 <code>PhysMem</code> trait 提供后备存储——测试中是普通缓冲区，驱动中是
+BAR 映射的 VRAM（<code>VramPhys</code>）。叶子编码是唯一与架构相关的部分：gfx9 把 MTYPE 放在
+第 57 位，在 PDB1 表项上设置 <code>bfs</code>、在 PDB0 表项上设置 translate-further，并把
+PDB1/PDB2 叶子标记为 <code>PDE_PTE</code>；gfx12 为 <code>unimplemented!</code>（常量已记录；有一个测试
+断言该 panic）。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=寄存器表只生成一次然后-vendored>寄存器表只生成一次，然后 vendored<a href=#寄存器表只生成一次然后-vendored class=hash-link aria-label="寄存器表只生成一次，然后 vendored的直接链接" title="寄存器表只生成一次，然后 vendored的直接链接" translate=no>​</a></h3>
+<p>tinygrad 是一个有时不存在的子模块，因此构建从不依赖它。
+<code>device/tools/gen_am_regs.py</code> 需手动运行：它解析 tinygrad 的
+<code>autogen/am/regs.py</code>，并输出已提交的 <code>am/regs_gen.rs</code>。启动时 <code>select</code> 选择主版本
+相同且 <code>≤ ip_ver</code> 的最大表版本。已提交的表涵盖 gfx9.4.3 集合（<code>gc_9_4_3</code>、
+<code>mmhub_1_8_0</code>、<code>osssys_4_4_2</code>、<code>sdma_4_4_2</code>、<code>nbio_7_9_0</code>、<code>hdp_4_4_2</code>、
+<code>mp_11_0_0</code>、<code>mp_13_0_0</code>）和 gfx11.5.0 集合（<code>gc_11_5_0</code>、<code>mmhub_3_3_0</code>、
+<code>mp_14_0_2</code>、<code>nbio_7_11_0</code>、<code>hdp_6_0_0</code>、<code>osssys_6_0_0</code>）；KFD 路径的硬件计数器
+（<code>amd/pmc.rs</code>）用的也是 gfx11 GC 表。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=示例>示例<a href=#示例 class=hash-link aria-label=示例的直接链接 title=示例的直接链接 translate=no>​</a></h2>
+<p>每个 <code>device/examples/am_*.rs</code> 程序都是一个独立的初始化验证工具。2026 年 6 月那次
+运行确认了以下结果：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>示例<th>作用<th>结果<tbody><tr><td><code>am_discovery</code><td>BAR 映射 + IP discovery，只读；可与已绑定的 <code>amdgpu</code> 共存<td>枚举出 8 个 GC 9.4.3 实例、SDMA 和 AID<tr><td><code>am_own</code><td>mailbox 授权 + RLCG scratch 回显 + 每个 XCC 上的 <code>GRBM_STATUS</code><td>断言通过<tr><td><code>am_gmc</code><td>编程 GC + MM context0；每个 XCC 上的 ENG17 TLB 刷新 ACK；打印故障状态<td>每个 XCC 都收到 ACK<tr><td><code>am_sdma</code><td>SDMA 环设置 + 经由它的一次拷贝<td>引擎不消费该环<tr><td><code>am_compute</code><td>MEC 启用 + MQD 激活 + <code>WRITE_DATA</code>，同时通过 doorbell 和直接写 <code>CP_HQD_PQ_WPTR</code> 触发<td>HQD 被激活；哨兵值始终没有写入</table>
+<p>障碍在于引擎交接：doorbell aperture 路由和引擎启动归宿主 PF 所有。从 VF 启用该
+aperture（<code>_PF</code> BIF doorbell 寄存器）会卡死 VF↔GIM mailbox，需要重启虚拟机，因此
+<code>enable_doorbell_aperture</code> 虽存在于 <code>ip/gfx.rs</code> 中，但在 VF 上被标记为禁止调用，
+并在 <code>am_compute</code> 中被注释掉。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=尚不存在的内容>尚不存在的内容<a href=#尚不存在的内容 class=hash-link aria-label=尚不存在的内容的直接链接 title=尚不存在的内容的直接链接 translate=no>​</a></h2>
 <ul>
-<li class="">RLCG 间接寄存器访问 + 仅每 VF 的 hub 编程。</li>
+<li class=""><strong><code>AmdIface</code> 实现</strong>——因此 AM 不能作为设备后端。</li>
+<li class=""><strong>PSP 固件加载</strong>、<strong>SMU / 时钟</strong>——在 VF 上归 GIM 所有；在裸机上它们将是规模最大、
+风险最高的移植部分。</li>
+<li class=""><strong>中断处理程序</strong>——没有 <code>ip/ih.rs</code>；OSSSYS 表只被 <code>am_discovery</code> 使用。初始化
+采用轮询。</li>
+<li class=""><strong>GPU 引擎通过 AM 页表执行工作的证据</strong>。</li>
 </ul>
+<p>仅为 GMC 初始化存在两个调试开关：<code>SVOD_AM_DEBUG</code>（任意值）在写入寄存器后回读并
+记录被拒绝的 GC 写入，<code>SVOD_AM_MCBASE</code>（<code>raw</code>、<code>fb</code> 或 <code>fbxgmi</code>）覆盖 MC
+aperture 基址。</p>
 <hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=当下存在什么>当下存在什么<a href=#当下存在什么 class=hash-link aria-label=当下存在什么的直接链接 title=当下存在什么的直接链接 translate=no>​</a></h2>
-<p>凡是纯逻辑之处，一切都<strong>在没有 GPU 的情况下编译并单元测试</strong>；
-面向硬件的部分还额外通过 <code>device/examples/am_*.rs</code> 程序在活动的 VF 上
-验证。页表以一个可注入的 <code>PhysMem</code> trait 作为后备存储（测试中是一个普通缓冲区，
-真实驱动中是 BAR 映射的 VRAM）。</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>分组<th>模块<th>它实现什么<th>状态<tbody><tr><td><strong>Discovery</strong><td><code>pci.rs</code>, <code>discovery.rs</code><td>sysfs BAR mmap（BAR0 VRAM / BAR2 doorbell / BAR5 MMIO）、配置空间读写、带边界检查的 IP-discovery 解析器（每 XCC 段基址，<code>gc_info</code> v1/v2）<td><strong>HW 验证</strong>；discovery 解析器有单元测试<tr><td><strong>寄存器访问</strong><td><code>regaccess.rs</code>, <code>rlcg.rs</code>, <code>mailbox.rs</code>, <code>regs.rs</code>, <code>regs_gen.rs</code><td>mxgpu VF↔GIM mailbox 握手、RLCG 间接 GC/GCVM 读写（每 XCC）、MMIO/RLCG 路由器、vendored 寄存器表<td><strong>HW 验证</strong>；寄存器表的选择/编码逻辑有单元测试<tr><td><strong>内存（GMMU）</strong><td><code>mm/{tlsf,pagetable,manager,mod}.rs</code><td>TLSF VA/PA/页表分配器、4 级/48 位遍历、gfx9 <strong>与</strong> gfx11 的 PTE/PDE 编码、大页选择、表回收、<code>valloc</code>/<code>vfree</code><td><strong>完成</strong> + 测试（PTE 写路径已硬件演练）<tr><td><strong>GMC 启动</strong><td><code>ip/gmc.rs</code><td>编程两个 hub 的 context0（start/end/base + CNTL）、MX_L1_TLB 使能、每引擎失效范围、ENG17 TLB 刷新、HDP 刷新、故障状态解码<td><strong>HW 验证</strong>到 context 编程级别<tr><td><strong>GFX 启动</strong><td><code>ip/gfx.rs</code><td>使能 MEC（icache 失效、golden <code>GB_ADDR_CONFIG</code>、doorbell 范围、unhalt）、构建一个 v9 compute MQD、激活 HQD（<code>CP_HQD_ACTIVE=1</code>）、<code>WRITE_DATA</code> PM4<td><strong>MEC HQD 激活</strong>；队列尚不运行<tr><td><strong>SDMA 启动</strong><td><code>ip/sdma.rs</code><td>unhalt F32、编程 RB base/rptr/wptr + doorbell、提交 + <code>wait_idle</code><td><strong>ring 已编程</strong>；引擎尚不消费<tr><td><strong>编排器</strong><td><code>dev.rs</code><td><code>AmDev::open</code> = mailbox → discovery → GMMU → GMC context0 → flush；<code>valloc</code>、<code>vram_read/write</code>、<code>release</code><td><strong>HW 验证</strong>至 GMC</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=gmmu-与-gfx9>GMMU 与 gfx9<a href=#gmmu-与-gfx9 class=hash-link aria-label="GMMU 与 gfx9的直接链接" title="GMMU 与 gfx9的直接链接" translate=no>​</a></h3>
-<p>页表几何是 <strong>4 级 / 48 位</strong>（<code>va_shifts = [12, 21, 30, 39]</code>），
-一种<strong>跨 gfx9/11/12 共享</strong>的形状——因此几何本身不随 arch 分支。
-只有叶 PTE 编码（尤其是 MTYPE 内存类型字段）才是 arch 特定的，而
-<strong>gfx9（CDNA）与 gfx11（RDNA3）现已实现并单元测试</strong>——
-gfx9 把 MTYPE 放在第 57–58 位，在 PDB1 表项上置 <code>bfs</code>、在 PDB0 表项上置
-translate-further 位，并用 <code>PDE_PTE</code> 标记 PDB1/PDB2 的叶（一个 2 MiB 的
-PDB0 叶恰恰是 translate-further 的<em>缺席</em>）。<strong>gfx12 是唯一
-剩下的 <code>unimplemented!</code></strong>（常量已捕获，尚未经过硬件验证；
-有一个测试断言它 panic）。<code>MemoryManager</code> 运行三个 TLSF 子分配器
-（VA 空间、物理 VRAM、页表池），并以 <code>Inspect</code> / <code>Create</code> /
-<code>Free</code> 模式遍历表，在 unmap 时回收空表。</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=寄存器表是生成一次然后-vendored>寄存器表是生成一次，然后 vendored<a href=#寄存器表是生成一次然后-vendored class=hash-link aria-label="寄存器表是生成一次，然后 vendored的直接链接" title="寄存器表是生成一次，然后 vendored的直接链接" translate=no>​</a></h3>
-<p>tinygrad 是一个有时缺席的子模块，因此构建绝不能依赖它。
-取而代之，<code>device/tools/gen_am_regs.py</code> 在添加或更新一个 arch 时
-被<strong>手动</strong>运行：它解析 tinygrad 的 <code>autogen/am/regs.py</code> 并发出已提交的
-<code>am/regs_gen.rs</code>。<code>regs.rs</code> 只是 <code>include!</code> 它。在启动时，正确的表由
-发现到的 <code>ip_ver</code> 选定（<code>select</code> 挑选共享同一 major 的最大版本 <code>≤ ip_ver</code>
-——tinygrad 的 <code>import_module</code> 规则）。已提交的表如今同时覆盖
-gfx9.4.3/CDNA3 集（<code>gc 9.4.3</code>、<code>mmhub 1.8.0</code>、<code>osssys 4.4.2</code>、
-<code>sdma 4.4.2</code>、<code>nbio 7.9.0</code>、<code>hdp 4.4.2</code>、<code>mp 11.0.0</code>/<code>13.0.0</code>）与 gfx11.5.0
-集。添加一个 arch 就是拓宽生成器的模块列表并重新运行它——没有
-构建或运行时逻辑改动。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=the-vf-boundary>VF 边界<a href=#the-vf-boundary class=hash-link aria-label="VF 边界的直接链接" title="VF 边界的直接链接" translate=no>​</a></h2>
-<p>这就是当前启动止步的那道墙。客户机能<strong>编程</strong>引擎，
-但无法<strong>驱动</strong>它们，因为把 ring 写指针送达命令处理器的那个
-doorbell aperture 归 <strong>PF 所有</strong>。从 VF 启用它（写那些 <code>_PF</code>
-BIF doorbell-access 寄存器）会卡住 VF↔GIM mailbox，并需要一次完整的
-VM 重启——因此 <code>enable_doorbell_aperture</code> 在 <code>ip/gfx.rs</code> 中存在，
-但被明确标注为<strong>在 VF 上不可调用</strong>。</p>
-<p>具体后果，二者都由示例复现：</p>
-<ul>
-<li class=""><strong>MEC compute 队列激活但不执行</strong>（<code>am_compute</code>）：HQD
-报告 <code>CP_HQD_ACTIVE = 1</code>，但 <code>WRITE_DATA</code> 数据包始终没有把它的哨兵值
-写入 VRAM——CP 从未看到 doorbell。</li>
-<li class=""><strong>SDMA ring 已编程但不消费</strong>（<code>am_sdma</code>）：读指针保持
-卡住；MM-hub 页表遍历故障仍被门控。</li>
-</ul>
-<p>所以今天的 AM <strong>HW 验证到引擎交接为止</strong>——discovery、所有权、
-GMMU 和 GMC 都已在活动的 VF 上得到证实——而 KFD 仍是那个可工作的 VF
-后端。跨越这条边界正是其余里程碑的主题。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=今天什么在硬件上运行>今天什么在硬件上运行<a href=#今天什么在硬件上运行 class=hash-link aria-label=今天什么在硬件上运行的直接链接 title=今天什么在硬件上运行的直接链接 translate=no>​</a></h2>
-<p>每个 <code>am_*</code> 示例都是一个独立的启动检验器，在活动的 VF 上运行：</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>示例<th>它证明了什么<th>状态<tbody><tr><td><code>am_discovery</code><td>BAR map + IP discovery（8× GC 9.4.3、SDMA、AID），只读——与一个已绑定的 <code>amdgpu</code> 共存<td><strong>可工作</strong><tr><td><code>am_own</code><td>mailbox 授予 + RLCG scratch 回声 + 全部 8 个 XCC 上非门控的 <code>GRBM_STATUS</code><td><strong>可工作</strong><tr><td><code>am_gmc</code><td>GC + MM context0 已编程；全部 8 个 XCC 上 ENG17 TLB 刷新 ACK；无保护故障被锁存<td><strong>可工作</strong><tr><td><code>am_sdma</code><td>SDMA ring 设置 + 提交<td>ring 已编程，<strong>引擎不消费</strong><tr><td><code>am_compute</code><td>MEC 使能 + MQD 激活 + <code>WRITE_DATA</code><td><strong>HQD 激活</strong>，队列不执行</table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=还推迟了什么>还推迟了什么<a href=#还推迟了什么 class=hash-link aria-label=还推迟了什么的直接链接 title=还推迟了什么的直接链接 translate=no>​</a></h2>
-<p>那些特权、PF 拥有的子系统<strong>不在代码树中</strong>——在 VF 上它们
-由 GIM 拥有，客户机无事可做；在裸金属上它们则是最后、风险最高的
-移植：</p>
-<ul>
-<li class=""><strong>PSP 固件加载</strong>——sOS bootloader 握手 / TMR / 每 IP 固件
-加载。在 VF 上由 GIM 拥有。</li>
-<li class=""><strong>SMU / 时钟</strong>——电源与时钟管理。在 VF 上由 GIM 拥有。</li>
-<li class=""><strong>中断处理器（IH）</strong>——不存在 <code>ip/ih.rs</code>；OSSSYS 寄存器表
-已 vendored 但未使用。启动改为轮询，而非接收中断。</li>
-<li class=""><strong><code>AmIface</code> 接缝实现者</strong>——尚无 AM 类型实现
-<a class="" href=/zh-Hans/docs/backends/amd/overview><code>AmdIface</code></a>，因此 AM 无法被选为设备后端；
-<code>AmDev</code> 仅可通过示例触及。</li>
-</ul>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=路线图>路线图<a href=#路线图 class=hash-link aria-label=路线图的直接链接 title=路线图的直接链接 translate=no>​</a></h2>
-<p>工作被分阶段为里程碑，每个都可在活动的 VF 上独立测试
-（并且，对于那些 PF 拥有的块，以裸金属 tinygrad AM 作为检验器）。早先的里程碑
-均已实现；完整的 AM 端到端集成尚属未来工作。</p>
-<p>一旦某个引擎消费工作且接缝接好，AM 便可
-经由 <code>SVOD_AMD_BACKEND=am</code> 选择，并原封不动地运行整个现有的上半部。
-催生 AM 的那种诱发崩溃的并发那时就无法崩溃了——内核被绕过了。</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=为什么这很重要>为什么这很重要<a href=#为什么这很重要 class=hash-link aria-label=为什么这很重要的直接链接 title=为什么这很重要的直接链接 translate=no>​</a></h2>
-<p>AM 驱动是对那个固件卡死问题的真正答案，而把通道池夹紧
-（<a class="" href=/zh-Hans/docs/backends/amd/queues-and-dispatch><code>SVOD_AMD_HW_QUEUES=1</code></a>）只是绕开了它。那些昂贵、
-不需 GPU 的部分——GMMU、寄存器表、mailbox/RLCG 间接访问
-机制——已经在活动的 VF 上构建并验证，而页表、GMC 与
-所有权握手全都可工作。剩下的差距是一道硬件边界（PF 拥有的
-doorbell aperture），而非设计上的。而且因为它接在同一道
-<a class="" href=/zh-Hans/docs/backends/amd/overview>接缝</a> 之后——五个必需方法加三个默认实现的钩子方法——
-当它落地时，调度、编译或图机制没有一样需要改动。</div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/backends/amd/am-driver.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>编辑此页</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label=文件选项卡><a class="pagination-nav__link pagination-nav__link--prev" href=/zh-Hans/docs/backends/amd/compile-and-graph><div class=pagination-nav__sublabel>上一页</div><div class=pagination-nav__label>编译与图</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/zh-Hans/docs/backends/amd/debugging><div class=pagination-nav__sublabel>下一页</div><div class=pagination-nav__label>调试</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#目标硬件一块-cdna3-sr-iov-vfgfx943 class="table-of-contents__link toc-highlight">目标硬件：一块 CDNA3 SR-IOV VF（gfx9.4.3）</a><li><a href=#当下存在什么 class="table-of-contents__link toc-highlight">当下存在什么</a><ul><li><a href=#gmmu-与-gfx9 class="table-of-contents__link toc-highlight">GMMU 与 gfx9</a><li><a href=#寄存器表是生成一次然后-vendored class="table-of-contents__link toc-highlight">寄存器表是生成一次，然后 vendored</a></ul><li><a href=#the-vf-boundary class="table-of-contents__link toc-highlight">VF 边界</a><li><a href=#今天什么在硬件上运行 class="table-of-contents__link toc-highlight">今天什么在硬件上运行</a><li><a href=#还推迟了什么 class="table-of-contents__link toc-highlight">还推迟了什么</a><li><a href=#路线图 class="table-of-contents__link toc-highlight">路线图</a><li><a href=#为什么这很重要 class="table-of-contents__link toc-highlight">为什么这很重要</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>文档</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/zh-Hans/docs/introduction>简介</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>社区</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=为什么保留它>为什么保留它<a href=#为什么保留它 class=hash-link aria-label=为什么保留它的直接链接 title=为什么保留它的直接链接 translate=no>​</a></h2>
+<p>动机来自内核调度器：在单 XCC 的 gfx11+ 部件上，激进的多队列派发可能让 CP 微引擎
+停在 MES 固件无法抢占的等待中，这正是 <a class="" href=/zh-Hans/docs/backends/amd/queues-and-dispatch>通道池</a> 保持保守
+的原因。独占 GPU 就能把内核从派发路径中移除。这一论点目前还不适用于 AM 所支持的
+场景——在 VF 上，调度、world-switch 和 doorbell 仍归宿主所有——而要在裸机上做到，
+则需要在现有内容之上再加上 PSP、SMU、中断以及接缝实现。如今的设计价值在于接缝本身：
+如果某天 AM 后端真正落地，它实现的是与 <code>KfdIface</code> 相同的五个方法和三个钩子，接缝
+之上的一切都无需改变。</div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/backends/amd/am-driver.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>编辑此页</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label=文件选项卡><a class="pagination-nav__link pagination-nav__link--prev" href=/zh-Hans/docs/backends/amd/compile-and-graph><div class=pagination-nav__sublabel>上一页</div><div class=pagination-nav__label>编译与图</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/zh-Hans/docs/backends/amd/debugging><div class=pagination-nav__sublabel>下一页</div><div class=pagination-nav__label>调试</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#目标cdna3-sr-iov-vfgfx94x class="table-of-contents__link toc-highlight">目标：CDNA3 SR-IOV VF（gfx9.4.x）</a><li><a href=#已有内容 class="table-of-contents__link toc-highlight">已有内容</a><ul><li><a href=#寄存器表只生成一次然后-vendored class="table-of-contents__link toc-highlight">寄存器表只生成一次，然后 vendored</a></ul><li><a href=#示例 class="table-of-contents__link toc-highlight">示例</a><li><a href=#尚不存在的内容 class="table-of-contents__link toc-highlight">尚不存在的内容</a><li><a href=#为什么保留它 class="table-of-contents__link toc-highlight">为什么保留它</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>文档</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/zh-Hans/docs/introduction>简介</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>社区</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

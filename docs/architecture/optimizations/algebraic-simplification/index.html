@@ -1,8 +1,8 @@
-<!doctype html><html lang=en dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-architecture/optimizations/algebraic-simplification" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>Algebraic Simplification Patterns | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification /><meta data-rh=true property=og:locale content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=en /><meta data-rh=true name=docsearch:language content=en /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="Algebraic Simplification Patterns | Svod"/><meta data-rh=true name=description content="Svod's symbolic simplifier rewrites UOp computation graphs using 140+ algebraic patterns defined in schedule/src/symbolic/patterns.rs. These patterns fire at multiple points in the pipeline:"/><meta data-rh=true property=og:description content="Svod's symbolic simplifier rewrites UOp computation graphs using 140+ algebraic patterns defined in schedule/src/symbolic/patterns.rs. These patterns fire at multiple points in the pipeline:"/><link data-rh=true rel=icon href=/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification","name":"Algebraic Simplification","position":1}]}</script><link rel=stylesheet href=/assets/css/styles.e76ef093.css /><script src=/assets/js/runtime~main.f50a76eb.js defer></script><script src=/assets/js/main.d2c78e8f.js defer></script></head><body><svg style="display: none;"><defs>
+<!doctype html><html lang=en dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-architecture/optimizations/algebraic-simplification" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.2"><title data-rh=true>Algebraic Simplification | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://svod.vpermilp.online/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://svod.vpermilp.online/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification /><meta data-rh=true property=og:locale content=en /><meta data-rh=true property=og:locale:alternate content=zh_CN /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=en /><meta data-rh=true name=docsearch:language content=en /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="Algebraic Simplification | Svod"/><meta data-rh=true name=description content="The symbolic simplifier is three nested matchers in schedule/src/symbolic/patterns.rs. Which tier runs where:"/><meta data-rh=true property=og:description content="The symbolic simplifier is three nested matchers in schedule/src/symbolic/patterns.rs. Which tier runs where:"/><link data-rh=true rel=icon href=/img/favicon.ico /><link data-rh=true rel=canonical href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=en /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/zh-Hans/docs/architecture/optimizations/algebraic-simplification hreflang=zh-CN /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/ru/docs/architecture/optimizations/algebraic-simplification hreflang=ru /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/hi/docs/architecture/optimizations/algebraic-simplification hreflang=hi /><link data-rh=true rel=alternate href=https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://svod.vpermilp.online/docs/architecture/optimizations/algebraic-simplification","name":"Algebraic simplification","position":1}]}</script><link rel=stylesheet href=/assets/css/styles.e76ef093.css /><script src=/assets/js/runtime~main.c46268e7.js defer></script><script src=/assets/js/main.4684e46d.js defer></script></head><body><svg style="display: none;"><defs>
 <symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
 </defs></svg>
-<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-f0d")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/img/logo.svg /><div role=region aria-label="Skip to main content"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>Skip to main content</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Toggle navigation bar" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/><div class=navbar__logo><img src=/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/docs/introduction>Docs</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>English</a><ul class=dropdown__menu><li><a href=/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=en>English</a><li><a href=/zh-Hans/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Switch between dark and light mode (currently system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Scroll back to top" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/docs/introduction><span class=linkLabel_WmDU>Introduction</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/docs/examples><span class=categoryLinkLabel_W154>Getting Started</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/docs/architecture/pipeline><span class=categoryLinkLabel_W154>Architecture</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/pipeline><span class=linkLabel_WmDU>Execution Pipeline</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/jit-graphs><span class=linkLabel_WmDU>JIT Graphs</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/kernel-origins><span class=linkLabel_WmDU>Kernel Origins</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/docs/architecture/codegen/overview><span class=categoryLinkLabel_W154>Codegen Pipeline</span></a></div><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/ir-design><span class=linkLabel_WmDU>IR Design Philosophy</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/docs/architecture/optimizations/pattern-system><span class=categoryLinkLabel_W154>Optimizations</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/optimizations/pattern-system><span class=linkLabel_WmDU>Pattern Engine</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/docs/architecture/optimizations/algebraic-simplification><span class=linkLabel_WmDU>Algebraic Simplification</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/optimizations/index-arithmetic><span class=linkLabel_WmDU>Index Arithmetic</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/optimizations/range-optimization><span class=linkLabel_WmDU>Range & Reduce</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/optimizations/strength-reduction><span class=linkLabel_WmDU>Strength Reduction</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/optimizations/kernel-search><span class=linkLabel_WmDU>Kernel Search</span></a></ul><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/op-bestiary><span class=linkLabel_WmDU>Op Bestiary</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile Kernels (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/docs/backends/jit-loader><span class=categoryLinkLabel_W154>Backends</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=Breadcrumbs><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Home page" class=breadcrumbs__link href=/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>Architecture</span><li class=breadcrumbs__item><span class=breadcrumbs__link>Optimizations</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>Algebraic Simplification</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">On this page</button></div><div class="theme-doc-markdown markdown"><header><h1>Algebraic Simplification Patterns</h1></header>
-<p>Svod's symbolic simplifier rewrites UOp computation graphs using 140+ algebraic patterns defined in <code>schedule/src/symbolic/patterns.rs</code>. These patterns fire at multiple points in the pipeline:</p>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-f0d")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/img/logo.svg /><div role=region aria-label="Skip to main content"><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>Skip to main content</a></div><nav aria-label=Main class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label="Toggle navigation bar" aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/><div class=navbar__logo><img src=/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/docs/introduction>Docs</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>English</a><ul class=dropdown__menu><li><a href=/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=en>English</a><li><a href=/zh-Hans/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=zh-CN>简体中文</a><li><a href=/ru/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/architecture/optimizations/algebraic-simplification target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="Switch between dark and light mode (currently system mode)"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1><div class="navbar__search searchBarContainer_NW3z" dir=ltr><svg aria-hidden=true class=searchIcon_T3tP focusable=false viewBox="0 0 16 16"><path fill=currentColor d="M6.02945 10.20327a4.17382 4.17382 0 1 1 4.17382-4.17382 4.15609 4.15609 0 0 1-4.17382 4.17382Zm9.69195 4.2199-4.8225-4.82338A5.88021 5.88021 0 0 0 12.058 6.02856 6.00467 6.00467 0 1 0 9.59979 10.8989l4.82338 4.82338a.89729.89729 0 0 0 1.29912 0 .89749.89749 0 0 0-.00087-1.29909Z"/></svg><input placeholder=Search aria-label=Search class="navbar__search-input searchInput_YFbd" value="" /><div class="loadingRing_RJI3 searchBarLoadingRing_YnHq"><div></div><div></div><div></div><div></div></div></div></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label="Scroll back to top" class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label="Docs sidebar" class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/docs/introduction><span class=linkLabel_WmDU>Introduction</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/docs/examples><span class=categoryLinkLabel_W154>Getting Started</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/docs/architecture/ir-design><span class=categoryLinkLabel_W154>Architecture</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/ir-design><span class=linkLabel_WmDU>IR Design Philosophy</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/pipeline><span class=linkLabel_WmDU>Execution Pipeline</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/jit-graphs><span class=linkLabel_WmDU>JIT Graphs</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/kernel-origins><span class=linkLabel_WmDU>Kernel Origins</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false tabindex=0 href=/docs/architecture/codegen/overview><span class=categoryLinkLabel_W154>Codegen Pipeline</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/docs/architecture/optimizations/pattern-system><span class=categoryLinkLabel_W154>Optimizations</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/optimizations/pattern-system><span class=linkLabel_WmDU>Pattern engine</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/docs/architecture/optimizations/algebraic-simplification><span class=linkLabel_WmDU>Algebraic simplification</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/optimizations/index-arithmetic><span class=linkLabel_WmDU>Index arithmetic</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/optimizations/range-optimization><span class=linkLabel_WmDU>Range & reduce</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/optimizations/strength-reduction><span class=linkLabel_WmDU>Strength reduction</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/optimizations/kernel-search><span class=linkLabel_WmDU>Kernel search</span></a></ul><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/docs/architecture/op-bestiary><span class=linkLabel_WmDU>Op Bestiary</span></a></ul><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/docs/tile-kernels/overview><span class=categoryLinkLabel_W154>Tile Kernels (tk)</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/docs/backends/overview><span class=categoryLinkLabel_W154>Backends</span></a></div></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=Breadcrumbs><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label="Home page" class=breadcrumbs__link href=/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>Architecture</span><li class=breadcrumbs__item><span class=breadcrumbs__link>Optimizations</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>Algebraic simplification</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">On this page</button></div><div class="theme-doc-markdown markdown"><header><h1>Algebraic Simplification</h1></header>
+<p>The symbolic simplifier is three nested matchers in <code>schedule/src/symbolic/patterns.rs</code>. Which tier runs where:</p>
 
 
 
@@ -28,35 +28,21 @@
 
 
 
+<table><thead><tr><th>Matcher<th>Composition<th>Runs at<tbody><tr><td><code>symbolic_simple()</code><td><code>symbolic_simple_base() + dead_loop_patterns()</code><td>add-loads (13), devectorize (14), the image pass (17), index lowering (17), early decompositions (19b), and the <code>pm_decomp</code> set inside the final rewrite<tr><td><code>symbolic()</code><td><code>symbolic_simple</code> + the tier-2 groups<td>the rangeify mega-pass, range splitting/merging (<code>+ pm_fold_cast_const</code>), <code>indexing_simplify</code>, final symbolic (18)<tr><td><code>sym()</code><td><code>symbolic</code> + tier 3<td>pre-optimization (<code>+ pm_fold_cast_const + pm_flatten_range</code>), post-opt symbolic (08), early symbolic (15), extra symbolic (16, <code>+ indexing_simplify</code>)</table>
+<p><code>pm_fold_cast_const</code> (<code>CAST(CONST) → CONST</code>) is deliberately <em>not</em> inside any tier; the sites that want it add it explicitly, exactly as Tinygrad composes <code>symbolic + pm_fold_cast_const</code> only where <code>UOp.simplify</code> does.</p>
+<p>Every rule that rewrites integer arithmetic goes through <code>exact_integer_rewrite</code>, a typed no-wrap proof (<code>typed_integer_rewrite_is_exact</code>) that declines the rewrite when either the original or the replacement could overflow its concrete dtype. The groups marked <em>value-sensitive</em> are additionally wrapped by <code>value_sensitive</code>, which disables them until <code>weak_float_values_are_committed</code> holds for the subtree. Bounds come from <code>VminVmaxProperty</code> (always available) and <code>SoundVminVmaxProperty</code> (<code>None</code> for ops whose bounds are not trustworthy: loads, <code>Pow</code>, <code>Fdiv</code>), both cached per node.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=composition>Composition<a href=#composition class=hash-link aria-label="Direct link to Composition" title="Direct link to Composition" translate=no>​</a></h2>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple_base()         tier 1</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  propagate_invalid                     must be first (before x*0 → 0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  fold_invalid_load_store</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  constant_folding_dsl_patterns         value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vconst_folding_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  bool_arithmetic_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  identity_and_zero_patterns            value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  self_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  zero_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  division_dsl_patterns                 value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  uint_pack_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  div_mod_recombine_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  power_dsl_patterns                    value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_simple_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple() = base + dead_loop_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic() = symbolic_simple + tier 2 (with_tier2)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  commutative_canonicalization</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  term_combining_dsl_patterns           value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_alu_combining_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vmin_vmax_collapse_patterns           value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  minmax_dsl_patterns                   value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_folding_dsl_patterns              value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  comparison_dsl_patterns               value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_mod_div_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  advanced_division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_cast_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  long_to_int_narrowing_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  after_simplification_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_bound_patterns                  value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">sym() = symbolic + tier 3</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  pm_simplify_valid                     (symbolic/valid_simplification.rs)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_vectorize_reorder_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  ne_zero_fold_patterns                 value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_where_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  store_load_folding_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  reduce_sym_patterns                   value-sensitive</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  sym_phase3_patterns</span><br/></div></code></pre></div></div>
+<p>The order is load-bearing: canonicalization before term combining, ALU folding before the comparison and range rules, because each group exposes matches for the next. Tinygrad's reciprocal distribution rules (<code>uop/symbolic.py</code> <code>sym</code>) are deliberately absent: all six are IEEE-inexact.</p>
+<p><strong>Notation.</strong> <code>OP[a, b]</code> is commutative, <code>OP(a, b)</code> ordered; <code>@zero</code>/<code>@one</code>/<code>c</code> are constants; a repeated name is the same node (<code>Arc::ptr_eq</code>). <code>//</code> is <code>FloorDiv</code>, <code>%</code> is <code>FloorMod</code>; the truncating <code>CDiv</code>/<code>CMod</code> only appear after the late decompositions.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tier-1>Tier 1<a href=#tier-1 class=hash-link aria-label="Direct link to Tier 1" title="Direct link to Tier 1" translate=no>​</a></h2>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=invalid-propagation-propagate_invalid>Invalid propagation (<code>propagate_invalid</code>)<a href=#invalid-propagation-propagate_invalid class=hash-link aria-label="Direct link to invalid-propagation-propagate_invalid" title="Direct link to invalid-propagation-propagate_invalid" translate=no>​</a></h3>
+<p><code>Invalid</code> is <code>UOp::invalid_marker()</code>, a <code>ConstValue::Invalid</code> constant; <code>is_invalid_marker</code> also recognises an all-<code>Invalid</code> <code>VCONST</code> or <code>STACK</code> and movement wrappers around one. Validity is kept as <code>WHERE(cond, x, Invalid)</code> and these rules keep that shape intact while arithmetic moves around it:</p>
 
 
 
 
 
-<table><thead><tr><th>Where<th>Matcher<th>Context<tbody><tr><td>Pre-optimization<td><code>sym()</code><td>After rangeify + range splitting, before kernel optimization<tr><td>Post-opt (Stage 8)<td><code>sym()</code> + <code>pm_move_where_on_load</code><td>After optimization actions, before expansion<tr><td>Post-index (Stage 16)<td><code>sym()</code> + <code>indexing_simplify()</code><td>After index dtype lowering, final cleanup<tr><td>Decomp+Render (Stage 18-19)<td><code>symbolic_simple()</code><td>Combined with late rewrites and the renderer's own matchers</table>
-<p>The matchers come in three tiers: <code>symbolic_simple()</code> is the tier-1 base (identities, constant folding, the size-1 RANGE collapse), <code>symbolic()</code> adds the tier-2 groups (canonicalization, comparisons, div/mod against range bounds), and <code>sym()</code> adds tier 3 (<code>pm_simplify_valid</code>, ALU/STACK reordering, opinionated term combining). Only the final decomp+render pass runs the tier-1 set on its own.</p>
-<p><strong>Range analysis</strong>: Each UOp tracks the minimum (<code>vmin</code>) and maximum (<code>vmax</code>) values it can take at runtime, computed eagerly during node construction from its inputs' bounds. Many patterns use these bounds to prove conditions at compile time (e.g., "x is always non-negative" or "x &lt; n for all values").</p>
-<p><strong>Notation</strong>: <code>OP[a, b]</code> denotes a commutative pattern (both operand orderings tried). <code>OP(a, b)</code> is ordered. <code>@zero</code>/<code>@one</code>/<code>c @const(v)</code> match constant values. When the same variable name appears twice (e.g., <code>Idiv(x, x)</code>), both operands must be the same node (<code>Arc::ptr_eq</code> — i.e., structurally deduplicated via hash consing).</p>
-<p><strong>Tinygrad reference</strong>: <code>tinygrad/uop/symbolic.py</code>, <code>tinygrad/uop/divandmod.py</code></p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=worked-example-optimization-cascade>Worked Example: Optimization Cascade<a href=#worked-example-optimization-cascade class=hash-link aria-label="Direct link to Worked Example: Optimization Cascade" title="Direct link to Worked Example: Optimization Cascade" translate=no>​</a></h2>
-<p>A simple expression showing how patterns compose:</p>
-<p>Before:</p>
-<!-- -->
-<p>Steps:</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Step 1 (identity):    ADD(x, 0) -> x</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 2 (identity):    MUL(x, 1) -> x</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 3 (const fold):  ADD(3, 4) -> CONST(7)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Step 4 (result):      ADD(x, 7)</span><br/></div></code></pre></div></div>
-<p>After:</p>
-<!-- -->
-<p>The rewrite engine applies patterns bottom-up: children simplify first, then the parent re-matches. This enables multi-step cascades in a single traversal.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=pattern-ordering>Pattern Ordering<a href=#pattern-ordering class=hash-link aria-label="Direct link to Pattern Ordering" title="Direct link to Pattern Ordering" translate=no>​</a></h2>
-<p>Each matcher composes pattern groups in a specific order — the order is load-bearing, since a group can expose matches for a later one. Within a group, patterns are tried sequentially until one matches. Groups are concatenated with the <code>+</code> operator:</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple() = symbolic_simple_base() + dead_loop_patterns()</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic_simple_base()          -- tier 1</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  propagate_invalid             -- MUST be first (before x*0=0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  fold_invalid_load_store</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  constant_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vconst_folding_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  bool_arithmetic_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  identity_and_zero_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  self_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  zero_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cast_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  uint_pack_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  div_mod_recombine_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  power_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_simple_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">symbolic() = symbolic_simple() + tier 2</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  commutative_canonicalization</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  boolean_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  term_combining_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  dce_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_alu_combining_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  vmin_vmax_collapse_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  minmax_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  alu_folding_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  comparison_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_mod_div_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  advanced_division_dsl_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  range_based_cast_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  long_to_int_narrowing_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  after_simplification_patterns</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  where_bound_patterns</span><br/></div></code></pre></div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=1-constant-folding>1. Constant Folding<a href=#1-constant-folding class=hash-link aria-label="Direct link to 1. Constant Folding" title="Direct link to 1. Constant Folding" translate=no>​</a></h2>
-<p>Evaluates operations on compile-time constants using dtype-aware arithmetic. Results respect type boundaries (e.g., Int32 wraps at 32 bits).</p>
-<p><strong>Tinygrad</strong>: <code>symbolic.py:40-118</code></p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=scalar-constants>Scalar Constants<a href=#scalar-constants class=hash-link aria-label="Direct link to Scalar Constants" title="Direct link to Scalar Constants" translate=no>​</a></h3>
 
 
 
@@ -82,8 +68,6 @@
 
 
 
-<table><thead><tr><th>Category<th>Ops<th>Pattern<tbody><tr><td>Unary (7)<td>Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc<td><code>op(CONST(c))</code> -> <code>CONST(eval(op, c))</code><tr><td>Binary (13)<td>Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr<td><code>op(CONST(a), CONST(b))</code> -> <code>CONST(eval(op, a, b))</code><tr><td>Ternary (2)<td>Where, MulAcc<td><code>op(CONST(a), CONST(b), CONST(c))</code> -> <code>CONST(eval(op, a, b, c))</code></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=vector-constants>Vector Constants<a href=#vector-constants class=hash-link aria-label="Direct link to Vector Constants" title="Direct link to Vector Constants" translate=no>​</a></h3>
 
 
 
@@ -99,6 +83,15 @@
 
 
 
+<table><thead><tr><th>Pattern<th>Result<tbody><tr><td><code>WHERE(Invalid, _, _)</code><td><code>Invalid</code><tr><td><code>WHERE(WHERE(c, x, Inv), a, b)</code><td><code>WHERE(c, WHERE(x, a, b), Inv)</code><tr><td><code>WHERE(c, Inv, x)</code><td><code>WHERE(!c, x, Inv)</code> (<code>WHERE(c, Inv, Inv)</code> → <code>Inv</code>)<tr><td><code>WHERE(c1, WHERE(c2, x, d), d)</code><td><code>WHERE(c1 & c2, x, d)</code><tr><td><code>WHERE(a, WHERE(c, x, Inv), y)</code>, <code>y</code> not <code>Invalid</code><td><code>WHERE(!a | c, WHERE(a, x, y), Inv)</code> — and the mirror for the false branch<tr><td><code>unary(Inv)</code>, <code>CAST(Inv)</code>, <code>BITCAST(Inv)</code><td><code>Inv</code><tr><td><code>unary(WHERE(c, x, Inv))</code>, <code>CAST</code>, <code>BITCAST</code><td><code>WHERE(c, unary(x), Inv)</code><tr><td><code>op(WHERE(c, x, Inv), y)</code>, <code>op(y, WHERE(c, x, Inv))</code> for <strong>every</strong> binary op, comparisons included<td><code>WHERE(c, op(x, y), Inv)</code><tr><td><code>op(Inv, y)</code>, <code>op(y, Inv)</code> for the 13 non-comparison binary ops<td><code>Inv</code></table>
+<p>Why first: <code>MUL(0, WHERE(c, x, Inv))</code> must become <code>WHERE(c, 0, Inv)</code>, not <code>0</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=dead-loads-and-stores-fold_invalid_load_store>Dead loads and stores (<code>fold_invalid_load_store</code>)<a href=#dead-loads-and-stores-fold_invalid_load_store class=hash-link aria-label="Direct link to dead-loads-and-stores-fold_invalid_load_store" title="Direct link to dead-loads-and-stores-fold_invalid_load_store" translate=no>​</a></h3>
+<p><code>LOAD(INDEX(buf, Invalid, ..))</code> (also behind a <code>CAST</code>) → the load's <code>alt</code> if it has one, else a shaped zero; <code>STORE(INDEX(buf, Invalid, ..), v)</code> without a gate → <code>NOOP</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=constant-folding>Constant folding<a href=#constant-folding class=hash-link aria-label="Direct link to Constant folding" title="Direct link to Constant folding" translate=no>​</a></h3>
+<p>Unary: <code>Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc</code> (<code>Neg</code> is not an op here — <code>neg()</code> builds <code>MUL(x, -1)</code>). Binary: <code>Add, Mul, Sub, FloorMod, Max, Pow, FloorDiv, Fdiv, And, Or, Xor, Shl, Shr</code>, plus the six comparisons to <code>Bool</code>. Ternary: <code>Where</code>, <code>MulAcc</code>. Results are committed through the dtype's storage format (<code>Int32</code> wraps) except for weak dtypes, which keep the untruncated value. <code>vconst_folding_patterns</code> does the same lane-wise for <code>VCONST ⊕ VCONST</code> and the <code>CONST</code>/<code>VCONST</code> broadcast mix (11 binary ops + comparisons, 6 unary), skipping weak lanes.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=bool-arithmetic>Bool arithmetic<a href=#bool-arithmetic class=hash-link aria-label="Direct link to Bool arithmetic" title="Direct link to Bool arithmetic" translate=no>​</a></h3>
+<p><code>Mul[x, y]</code> → <code>x & y</code>, <code>Add[x, y]</code> → <code>x | y</code>, <code>Max(x, y)</code> → <code>x | y</code> when both are <code>Bool</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=identity-and-zero>Identity and zero<a href=#identity-and-zero class=hash-link aria-label="Direct link to Identity and zero" title="Direct link to Identity and zero" translate=no>​</a></h3>
 
 
 
@@ -109,10 +102,6 @@
 
 
 
-<table><thead><tr><th>Pattern<th>Result<tbody><tr><td><code>op(VCONST(a), VCONST(b))</code><td><code>VCONST(eval(op, a, b))</code> element-wise<tr><td><code>op(CONST(a), VCONST(b))</code><td><code>VCONST(eval(op, broadcast(a), b))</code><tr><td><code>op(VCONST(a), CONST(b))</code><td><code>VCONST(eval(op, a, broadcast(b)))</code><tr><td><code>unary_op(VCONST(v))</code><td><code>VCONST(eval(op, v))</code> element-wise</table>
-<p>VConst folding covers 11 binary ops (excludes Pow and Fdiv) and all 7 unary ops.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=2-identity-and-zero-propagation>2. Identity and Zero Propagation<a href=#2-identity-and-zero-propagation class=hash-link aria-label="Direct link to 2. Identity and Zero Propagation" title="Direct link to 2. Identity and Zero Propagation" translate=no>​</a></h2>
 
 
 
@@ -148,6 +137,21 @@
 
 
 
+<table><thead><tr><th>Pattern<th>Result<th>Guard<tbody><tr><td><code>Add[x, 0]</code><td><code>x</code><td>not float, or the zero is <code>-0.0</code> (<code>x + 0.0</code> is not an identity for <code>x = -0.0</code>)<tr><td><code>Sub(x, 0)</code><td><code>x</code><td>not float, or the zero is <code>+0.0</code><tr><td><code>Mul[x, 1]</code>, <code>Or[x, 0]</code>, <code>Xor[x, 0]</code>, <code>FloorDiv(x, 1)</code>, <code>Fdiv(x, 1)</code><td><code>x</code><td><tr><td><code>FloorMod(x, 1)</code><td><code>0</code><td><tr><td><code>Floor/Ceil/Trunc/Round(x)</code><td><code>x</code><td>integer <code>x</code><tr><td><code>Mul[x, 0]</code><td><code>0</code><td>not float (<code>NaN * 0</code>, <code>Inf * 0</code> are <code>NaN</code>)<tr><td><code>And[_, 0]</code><td><code>0</code><td></table>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=self-and-zero-folding>Self and zero folding<a href=#self-and-zero-folding class=hash-link aria-label="Direct link to Self and zero folding" title="Direct link to Self and zero folding" translate=no>​</a></h3>
+<p><code>FloorDiv(x, x)</code> → <code>1</code>; <code>FloorDiv(x, -1)</code> → <code>MUL(x, -1)</code>; <code>FloorMod(FloorMod(x, y), y)</code> → <code>FloorMod(x, y)</code>; <code>And(x, x)</code>, <code>Or(x, x)</code>, <code>Max(x, x)</code> → <code>x</code>; <code>FloorMod(x, x)</code> → <code>0</code>; <code>Lt(x, x)</code> → <code>false</code> for non-floats, and for floats when the sound bounds prove <code>x</code> is not <code>NaN</code>; <code>Ne(x, x)</code> → <code>false</code> for ints and bools.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=division>Division<a href=#division class=hash-link aria-label="Direct link to Division" title="Direct link to Division" translate=no>​</a></h3>
+<p><code>Fdiv(0.0, 0.0)</code> and <code>Fdiv(MUL[_, 0.0], 0.0)</code> → <code>NaN</code> (listed first so they beat the next rule); <code>Fdiv(x, x)</code> → <code>1.0</code> only when <code>x</code> is provably finite and nonzero; <code>FloorDiv(Mul(x, y), y)</code> → <code>x</code>. There is no float <code>(x*y)/y → x</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=casts>Casts<a href=#casts class=hash-link aria-label="Direct link to Casts" title="Direct link to Casts" translate=no>​</a></h3>
+<p><code>CAST(x, dt)</code> → <code>x</code> when the dtype already matches; <code>CAST(CAST(x, a), b)</code> → <code>x</code> when <code>x: b</code> and <code>can_safe_cast(b, a)</code> (<code>a</code> holds every value of <code>b</code>: same signedness and at least as wide, unsigned→signed needs one extra bit, float↔int never); <code>CAST(CAST(x, a), b)</code> → <code>CAST(x, b)</code> when <code>a</code> does not narrow <code>x</code>. <code>uint_pack_dsl_patterns</code> cancels the <code>(hi.cast(u64) &lt;&lt; 32) | lo.cast(u64)</code> packing Threefry builds so the PRNG stays in 32-bit ALU.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=div-mod-recombination>Div-mod recombination<a href=#div-mod-recombination class=hash-link aria-label="Direct link to Div-mod recombination" title="Direct link to Div-mod recombination" translate=no>​</a></h3>
+<p>One rule on every <code>Add</code>: <code>fold_add_divmod_recombine</code>, a port of Tinygrad's. It flattens the <code>Add</code> chain, finds a term <code>(base % div) * mul</code> and a partner <code>q * (div * mul)</code> whose <code>q</code> is a quotient of something congruent to <code>base</code> modulo <code>div</code> (<code>quotient_base</code>: <code>q == b // div</code>, possibly with merged <code>(x//c + a)//div</code> and shifted constants), and replaces the pair by <code>b * mul</code>; with <code>q == (b // div) % d</code> it folds into the wider <code>(b % (div*d)) * mul</code>. This is the family <code>x%n + (x//n)*n → x</code> and its scaled, offset and three-term variants, found through the chain rather than as separate rules.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=power-booleans-dce>Power, booleans, DCE<a href=#power-booleans-dce class=hash-link aria-label="Direct link to Power, booleans, DCE" title="Direct link to Power, booleans, DCE" translate=no>​</a></h3>
+<p><code>Pow(x, 0)</code> → <code>1</code>, <code>Pow(x, 1)</code> → <code>x</code>, <code>Pow(1, x)</code> → <code>1</code> (scalars only; no other exponent is rewritten — reciprocal/sqrt forms change IEEE rounding). <code>Not(Not(x))</code> → <code>x</code>, <code>Xor(x, x)</code> → <code>0</code>, <code>true | _</code> → <code>true</code>, <code>false & _</code> → <code>false</code>, <code>true & x</code> → <code>x</code>, <code>false | x</code> → <code>x</code> (bool constants only). <code>WHERE</code> with a provably constant condition (sound bounds) selects the branch; <code>WHERE(_, t, t)</code> → <code>t</code>; <code>WHERE(x, true, false)</code> → <code>x</code>; <code>WHERE(x, false, true)</code> → <code>!x</code>; <code>WHERE(a, WHERE(b, c, d), d)</code> → <code>WHERE(a & b, c, d)</code>. <code>dead_loop_patterns</code>: a <code>RANGE</code> with <code>vmax &lt; 0</code> → <code>CONST(0)</code>, a <code>RANGE(CONST)</code> with <code>vmin == vmax</code> → that constant. There is no <code>END</code>/<code>REDUCE</code> empty-range fold here; <code>reduce_to_acc</code> handles those.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tier-2>Tier 2<a href=#tier-2 class=hash-link aria-label="Direct link to Tier 2" title="Direct link to Tier 2" translate=no>​</a></h2>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=commutative-canonicalization>Commutative canonicalization<a href=#commutative-canonicalization class=hash-link aria-label="Direct link to Commutative canonicalization" title="Direct link to Commutative canonicalization" translate=no>​</a></h3>
+<p>For <code>Add, Mul, Max, And, Or, Xor</code> (and nominally <code>Eq</code>/<code>Ne</code>, which never fire because their result is <code>Bool</code>) whose <strong>result</strong> dtype is <code>WeakInt</code>: swap the operands when <code>tinygrad_tuplize_cmp(b, a) == Less</code>, the structural <code>(op, arg, dtype, *src)</code> key order the linearizer also uses. Index expressions that are equal up to commutativity then hash-cons to one node, which the recombination and the expander rely on. Other dtypes keep authored order.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=term-combining-addmul-with-constants>Term combining (<code>Add</code>/<code>Mul</code> with constants)<a href=#term-combining-addmul-with-constants class=hash-link aria-label="Direct link to term-combining-addmul-with-constants" title="Direct link to term-combining-addmul-with-constants" translate=no>​</a></h3>
 
 
 
@@ -178,14 +182,6 @@
 
 
 
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>ADD[x, 0]</code><td><code>x</code><td>Commutative<tr><td><code>MUL[x, 1]</code><td><code>x</code><td>Commutative<tr><td><code>OR[x, 0]</code><td><code>x</code><td>Commutative<tr><td><code>XOR[x, 0]</code><td><code>x</code><td>Commutative<tr><td><code>SUB(x, 0)</code><td><code>x</code><td>Ordered<tr><td><code>IDIV(x, 1)</code><td><code>x</code><td>Ordered<tr><td><code>FDIV(x, 1)</code><td><code>x</code><td>Ordered<tr><td><code>MOD(x, 1)</code><td><code>0</code><td>Anything mod 1 is zero<tr><td><code>Floor/Ceil/Trunc/Round(x)</code><td><code>x</code><td>Only when <code>x</code> is integer (rounding is no-op)<tr><td><code>MUL[x, 0]</code><td><code>0</code><td>Only when NOT float<tr><td><code>AND[_, 0]</code><td><code>0</code><td>Commutative</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>IEEE 754: MUL by zero</div><div class=admonitionContent_BuS1><p><code>MUL[x, 0]</code> is <strong>not</strong> simplified for floats because IEEE 754 requires:<ul>
-<li class=""><code>NaN * 0 = NaN</code></li>
-<li class=""><code>Inf * 0 = NaN</code></li>
-</ul><p>The guard <code>!x.dtype().is_float()</code> prevents this optimization for floating-point types.</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=3-self-folding>3. Self-Folding<a href=#3-self-folding class=hash-link aria-label="Direct link to 3. Self-Folding" title="Direct link to 3. Self-Folding" translate=no>​</a></h2>
-<p>Patterns where the same operand appears on both sides. Uses <code>Arc::ptr_eq</code> checks (hash consing guarantees structurally equal subexpressions share the same pointer).</p>
 
 
 
@@ -197,991 +193,32 @@
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>IDIV(x, x)</code><td><code>1</code><td><tr><td><code>IDIV(x, -1)</code><td><code>NEG(x)</code><td>Constant check on RHS<tr><td><code>MOD(MOD(x, y), y)</code><td><code>MOD(x, y)</code><td>Idempotent mod<tr><td><code>AND(x, x)</code><td><code>x</code><td><tr><td><code>OR(x, x)</code><td><code>x</code><td></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=4-zero-folding>4. Zero Folding<a href=#4-zero-folding class=hash-link aria-label="Direct link to 4. Zero Folding" title="Direct link to 4. Zero Folding" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>MOD(x, x)</code><td><code>0</code><td><tr><td><code>LT(x, x)</code><td><code>false</code><td>NOT for floats (NaN &lt; NaN is false, but guard needed for soundness)<tr><td><code>NE(x, x)</code><td><code>false</code><td>Only ints -- <code>NaN != NaN</code> is <code>true</code> in IEEE 754</table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=5-division-simplification>5. Division Simplification<a href=#5-division-simplification class=hash-link aria-label="Direct link to 5. Division Simplification" title="Direct link to 5. Division Simplification" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>FDIV(0.0, 0.0)</code><td><code>NaN</code><td>IEEE 754 indeterminate form<tr><td><code>FDIV(MUL[_, 0], 0)</code><td><code>NaN</code><td>Any zero-expression / zero<tr><td><code>FDIV(x, x)</code><td><code>1.0</code><td>Float self-division<tr><td><code>FDIV(MUL(x, y), y)</code><td><code>x</code><td>Cancellation (float)<tr><td><code>IDIV(MUL(x, y), y)</code><td><code>x</code><td>Cancellation (integer)</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Pattern priority</div><div class=admonitionContent_BuS1><p><code>FDIV(0, 0) -> NaN</code> must come before <code>FDIV(x, x) -> 1</code> in the matcher to take priority. The ordering within <code>division_dsl_patterns()</code> ensures this.</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=6-cast-optimization>6. Cast Optimization<a href=#6-cast-optimization class=hash-link aria-label="Direct link to 6. Cast Optimization" title="Direct link to 6. Cast Optimization" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>CAST(CONST(c), dtype)</code><td><code>CONST(c.cast(dtype))</code><td>Compile-time cast folding<tr><td><code>CAST(x, dtype)</code><td><code>x</code><td>When <code>x.dtype() == dtype</code> (noop)<tr><td><code>CAST(CAST(x, a), b)</code><td><code>x</code><td>When <code>x.dtype() == b</code> and <code>a</code> preserves all values of <code>b</code><tr><td><code>CAST(CAST(x, a), b)</code><td><code>CAST(x, b)</code><td>When <code>a</code> doesn't narrow <code>x</code> (widening chain)<tr><td><code>CAST(WHERE(s, a, b), dtype)</code><td><code>WHERE(s, CAST(a, dtype), CAST(b, dtype))</code><td>Push cast through branches</table>
-<p>The <code>can_safe_cast(to, from)</code> function determines whether an intermediate type can hold all values. It checks bit widths, signedness, and float/int categories.</p>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Truncation kills round-trips</div><div class=admonitionContent_BuS1><p><code>CAST(CAST(x, i8), i64)</code> is NOT collapsed to <code>x</code> when <code>x</code> is <code>i64</code>. The intermediate <code>i8</code> truncates values -- <code>can_safe_cast(i64, i8)</code> returns <code>false</code> because <code>i8</code> cannot hold all <code>i64</code> values.<p>Safe example: <code>CAST(CAST(x, i32), bool)</code> -> <code>CAST(x, bool)</code> when <code>x</code> is <code>bool</code>, because <code>i32</code> can represent both <code>true</code> and <code>false</code>.</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=7-term-combining>7. Term Combining<a href=#7-term-combining class=hash-link aria-label="Direct link to 7. Term Combining" title="Direct link to 7. Term Combining" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<tbody><tr><td><code>ADD(x, x)</code><td><code>MUL(2, x)</code><tr><td><code>ADD(MUL(c1, x), MUL(c2, x))</code><td><code>MUL(c1+c2, x)</code><tr><td><code>ADD(MUL(x, c1), MUL(x, c2))</code><td><code>MUL(x, c1+c2)</code></table>
-<p>Both ordered variants are matched (constant on left or right of MUL).</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=8-alu-chain-folding>8. ALU Chain Folding<a href=#8-alu-chain-folding class=hash-link aria-label="Direct link to 8. ALU Chain Folding" title="Direct link to 8. ALU Chain Folding" translate=no>​</a></h2>
-<p>Folds constants in associative operation chains and pushes constants outward for canonical form.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=constant-folding>Constant Folding<a href=#constant-folding class=hash-link aria-label="Direct link to Constant Folding" title="Direct link to Constant Folding" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>ADD[ADD[x, c1], c2]</code><td><code>ADD(x, c1+c2)</code><td>Commutative outer Add<tr><td><code>MUL[MUL[x, c1], c2]</code><td><code>MUL(x, c1*c2)</code><td>Commutative outer Mul<tr><td><code>ADD[SUB(x, c1), c2]</code><td><code>ADD(x, c2-c1)</code> or <code>SUB(x, c1-c2)</code><td>Sign-normalized<tr><td><code>SUB(ADD(x, c1), c2)</code><td><code>ADD(x, c1-c2)</code> or <code>SUB(x, c2-c1)</code><td>Sign-normalized<tr><td><code>SUB(SUB(x, c1), c2)</code><td><code>SUB(x, c1+c2)</code><td></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=constant-pushing>Constant Pushing<a href=#constant-pushing class=hash-link aria-label="Direct link to Constant Pushing" title="Direct link to Constant Pushing" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>ADD[ADD[x, c], y]</code><td><code>ADD(ADD(x, y), c)</code><td>Pushes constant outward; <code>y</code> must not be const</table>
-<p>Constant pushing is essential for index extraction. It ensures constants bubble to the outermost level, enabling downstream patterns (like div-mod simplification) to see clean <code>variable + offset</code> forms.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=sub-canonicalization>Sub Canonicalization<a href=#sub-canonicalization class=hash-link aria-label="Direct link to Sub Canonicalization" title="Direct link to Sub Canonicalization" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>SUB(a, SUB(b, x))</code><td><code>ADD(x, SUB(a, b))</code><td>Exposes inner variable</table>
-<p>Svod keeps <code>SUB</code> as a first-class IR op (unlike Tinygrad which canonicalizes <code>a-b</code> to <code>ADD(a, NEG(b))</code>). This pattern ensures nested <code>SUB</code>s don't block further simplification.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=9-boolean-logic>9. Boolean Logic<a href=#9-boolean-logic class=hash-link aria-label="Direct link to 9. Boolean Logic" title="Direct link to 9. Boolean Logic" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>NOT(NOT(x))</code><td><code>x</code><td>Double negation elimination<tr><td><code>XOR(x, x)</code><td><code>0</code><td>Self-cancellation<tr><td><code>OR[x, NOT(x)]</code><td><code>true</code><td>Tautology (bool only)<tr><td><code>AND[x, NOT(x)]</code><td><code>false</code><td>Contradiction (bool only)<tr><td><code>OR[true, x]</code><td><code>true</code><td>Absorbing element<tr><td><code>AND[false, x]</code><td><code>false</code><td>Absorbing element<tr><td><code>AND[true, x]</code><td><code>x</code><td>Identity<tr><td><code>OR[false, x]</code><td><code>x</code><td>Identity<tr><td><code>AND[NOT(x), NOT(y)]</code><td><code>NOT(OR(x, y))</code><td>De Morgan<tr><td><code>OR[NOT(x), NOT(y)]</code><td><code>NOT(AND(x, y))</code><td>De Morgan</table>
-<p>All patterns using <code>[]</code> are commutative (both operand orderings are tried).</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=10-comparison-simplification>10. Comparison Simplification<a href=#10-comparison-simplification class=hash-link aria-label="Direct link to 10. Comparison Simplification" title="Direct link to 10. Comparison Simplification" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=self-comparison-non-float-ptr_eq>Self-Comparison (non-float, ptr_eq)<a href=#self-comparison-non-float-ptr_eq class=hash-link aria-label="Direct link to Self-Comparison (non-float, ptr_eq)" title="Direct link to Self-Comparison (non-float, ptr_eq)" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Op<th>Result<tbody><tr><td><code>LT(x, x)</code>, <code>GT(x, x)</code>, <code>NE(x, x)</code><td><code>false</code><tr><td><code>LE(x, x)</code>, <code>GE(x, x)</code>, <code>EQ(x, x)</code><td><code>true</code></table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Float self-comparison</div><div class=admonitionContent_BuS1><p>Self-comparison patterns are guarded by <code>!x.dtype().is_float()</code>. For floats, <code>NaN != NaN</code> is <code>true</code> and <code>NaN == NaN</code> is <code>false</code>, so these identities do not hold.</div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=constant-and-range-based>Constant and Range-Based<a href=#constant-and-range-based class=hash-link aria-label="Direct link to Constant and Range-Based" title="Direct link to Constant and Range-Based" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>op(CONST(a), CONST(b))</code><td><code>CONST(eval(op, a, b))</code><td>Direct constant fold<tr><td><code>op(x, y)</code> when bounds prove it<td><code>true</code> or <code>false</code><td><code>ComparisonAnalyzer</code> uses vmin/vmax</table>
-<p>The <code>ComparisonAnalyzer</code> checks: if <code>x.vmax &lt; y.vmin</code> then <code>LT(x, y)</code> is provably <code>true</code>.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=algebraic-transforms>Algebraic Transforms<a href=#algebraic-transforms class=hash-link aria-label="Direct link to Algebraic Transforms" title="Direct link to Algebraic Transforms" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>LT(ADD[c0, x], c1)</code><td><code>LT(x, c1-c0)</code><td>Offset elimination<tr><td><code>LT(NEG(x), NEG(y))</code><td><code>LT(y, x)</code><td>Negation flip<tr><td><code>LT(IDIV(x, d), c)</code><td><code>LT(x, c*d)</code><td>Lift division (d > 0)</table>
-<p>The division lifting for <code>LT(x//d, c)</code> handles both positive and non-positive <code>c</code>:</p>
+<table><thead><tr><th>Pattern<th>Result<tbody><tr><td><code>Add(x, x)</code><td><code>x * 2</code><tr><td><code>Add(Mul[x, c1], Mul[x, c2])</code><td><code>x * (c1 + c2)</code><tr><td><code>Add[x, Mul[x, c]]</code><td><code>x * (c + 1)</code><tr><td><code>Add[Add[y, Mul[x, c0]], Mul[x, c1]]</code><td><code>y + x * (c0 + c1)</code><tr><td><code>Add[Add[y, x], Mul[x, c]]</code>, <code>Add[Add[y, Mul[x, c]], x]</code><td><code>y + x * (c + 1)</code><tr><td><code>Add[Add[y, x], x]</code><td><code>y + x * 2</code><tr><td><code>Mul[-1, Add[x, c]]</code><td><code>-x + (-c)</code><tr><td><code>Mul[c, Add[x, k]]</code>, <code>x: WeakInt</code><td><code>c*x + c*k</code></table>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=boolean-boolean_dsl_patterns>Boolean (<code>boolean_dsl_patterns</code>)<a href=#boolean-boolean_dsl_patterns class=hash-link aria-label="Direct link to boolean-boolean_dsl_patterns" title="Direct link to boolean-boolean_dsl_patterns" translate=no>​</a></h3>
+<p><code>Or[x, Not(x)]</code> → <code>true</code>, <code>And[x, Not(x)]</code> → <code>false</code> (bool only); De Morgan in both directions, <code>And[Not(x), Not(y)]</code> → <code>!(x | y)</code> and <code>Or[Not(x), Not(y)]</code> → <code>!(x & y)</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=where>WHERE<a href=#where class=hash-link aria-label="Direct link to WHERE" title="Direct link to WHERE" translate=no>​</a></h3>
+<p><code>dce_dsl_patterns</code>: <code>WHERE(Not(c), t, f)</code> → <code>WHERE(c, f, t)</code> unless <code>f</code> contains <code>Invalid</code> (scalar or a <code>STACK</code> lane) — swapping would move the marker to the true branch where the gate rules cannot see it. <code>where_alu_combining_patterns</code>: <code>op(WHERE(c, a, b), WHERE(c, d, e))</code> → <code>WHERE(c, op(a, d), op(b, e))</code> for <code>Add, Mul, Sub, Max, And, Or, Xor</code> when both true branches or both false branches are constants, and the associative <code>Add(Add(y, WHERE(c, ..)), WHERE(c, ..))</code> form. <code>where_bound_patterns</code>: <code>WHERE(Lt(x, c), t, f)</code> → <code>t</code> when <code>x.vmax &lt; c.vmin</code>, <code>f</code> when <code>x.vmin >= c.vmax</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=bounds-collapse-and-minmax>Bounds collapse and min/max<a href=#bounds-collapse-and-minmax class=hash-link aria-label="Direct link to Bounds collapse and min/max" title="Direct link to Bounds collapse and min/max" translate=no>​</a></h3>
+<p><code>vmin_vmax_collapse_patterns</code>: a <code>Mul</code>, <code>FloorDiv</code>, <code>FloorMod</code>, comparison, <code>PARAM</code> or <code>SPECIAL</code> whose sound bounds are a single value becomes that constant (floats excluded; <code>Add</code>/<code>Sub</code>/<code>Max</code> deliberately excluded so a trip-1 loop carry is not folded away). <code>minmax_dsl_patterns</code>: <code>Max(x, y)</code> → <code>x</code> when <code>x.vmin >= y.vmax</code> (strictly greater for floats, to keep the sign of zero), symmetric for <code>y</code>. There is no <code>Min</code> op: <code>Tensor::minimum</code> is a <code>WHERE</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=alu-chain-folding-alu_folding_dsl_patterns>ALU chain folding (<code>alu_folding_dsl_patterns</code>)<a href=#alu-chain-folding-alu_folding_dsl_patterns class=hash-link aria-label="Direct link to alu-chain-folding-alu_folding_dsl_patterns" title="Direct link to alu-chain-folding-alu_folding_dsl_patterns" translate=no>​</a></h3>
+<p>Associative folding <code>(x ⊕ c1) ⊕ c2</code> → <code>x ⊕ (c1 ⊕ c2)</code> for <code>Add</code>, <code>Mul</code>, <code>And</code>, <code>Or</code>, <code>Xor</code>, <code>Max</code>; constant pushing <code>(x + c) + y</code> → <code>(x + y) + c</code> and <code>(x * c) * y</code> → <code>(x * y) * c</code> when <code>y</code> is not a constant; <code>(x - c1) + c2</code>, <code>(x + c1) - c2</code> normalised to <code>x + k</code> or <code>x - |k|</code>; <code>(x - c1) - c2</code> → <code>x - (c1 + c2)</code>; <code>Sub(a, Sub(b, x))</code> → <code>x + (a - b)</code>. <code>Sub</code> is a first-class op in Svod (Tinygrad spells <code>a - b</code> as <code>a + b*-1</code>).</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=comparisons-comparison_dsl_patterns>Comparisons (<code>comparison_dsl_patterns</code>)<a href=#comparisons-comparison_dsl_patterns class=hash-link aria-label="Direct link to comparisons-comparison_dsl_patterns" title="Direct link to comparisons-comparison_dsl_patterns" translate=no>​</a></h3>
+<p>For all six comparisons: <code>x op x</code> on non-floats folds (<code>Lt/Gt/Ne</code> → <code>false</code>, <code>Le/Ge/Eq</code> → <code>true</code>); constant operands fold; otherwise <code>ComparisonAnalyzer::analyze</code> (<code>ir/src/uop/comparison_analysis.rs</code>) proves <code>true</code> or <code>false</code> from the sound bounds — both only for non-weak dtypes. Then: <code>Lt(Add[c0, x], c1)</code> → <code>Lt(x, c1 - c0)</code>; <code>Lt(Mul[x, -1], Mul[y, -1])</code> → <code>Lt(y, x)</code>; <code>Lt(FloorDiv(x, d), c)</code> → <code>Lt(x, c * d)</code> for <code>d > 0</code> under a no-wrap check (exact for floor division, any sign of <code>c</code>); for <code>WeakInt</code>: <code>Lt(Mul[c0, x], c1)</code> → <code>±x &lt; ceil(c1 / |c0|)</code> and the GCD fold <code>lt_folding</code> (<code>x = d*q + r</code>, <code>r ∈ [0, d)</code>, <code>d | c</code> ⇒ <code>x &lt; c ⇔ q &lt; c/d</code>).</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=ranges-and-division>Ranges and division<a href=#ranges-and-division class=hash-link aria-label="Direct link to Ranges and division" title="Direct link to Ranges and division" translate=no>​</a></h3>
+<p><code>range_based_mod_div_patterns</code> and <code>advanced_division_dsl_patterns</code> are the index algebra; they are on the <a class="" href=/docs/architecture/optimizations/index-arithmetic>index arithmetic</a> page. <code>range_based_cast_patterns</code> collapses <code>CAST(CAST(x, a), b)</code> for strong integer <code>x</code> whose bounds fit <code>a</code>. <code>long_to_int_narrowing_patterns</code> rewrites an <code>Int64</code> binary op whose operands and result fit <code>i32</code> as the <code>Int32</code> op cast back, and distributes a signed-int cast over <code>WeakInt + c</code>.</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=after>AFTER<a href=#after class=hash-link aria-label="Direct link to AFTER" title="Direct link to AFTER" translate=no>​</a></h3>
+<p><code>after_simplification_patterns</code>: deps that are not side effects (<code>RANGE</code>, <code>STORE</code>, <code>END</code>, <code>CALL</code>, <code>BARRIER</code>, <code>CUSTOM</code>, <code>FUNCTION</code>) are replaced by their own sources and deduplicated; <code>NOOP</code> deps and <code>END(NOOP)</code> chains are dropped; <code>AFTER(x, [])</code> → <code>x</code>.</p>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=tier-3-sym>Tier 3 (<code>sym</code>)<a href=#tier-3-sym class=hash-link aria-label="Direct link to tier-3-sym" title="Direct link to tier-3-sym" translate=no>​</a></h2>
 <ul>
-<li class=""><code>c > 0</code>: equivalent to <code>x &lt; c*d</code></li>
-<li class=""><code>c &lt;= 0</code>: equivalent to <code>x &lt; c*d - (d-1)</code></li>
+<li class=""><strong><code>pm_simplify_valid</code></strong> (<code>valid_simplification.rs</code>): an <code>And</code> chain of <code>Bool</code> validity clauses is simplified clause by clause (<code>simplify_valid</code>), and <code>WHERE(cond, x, Invalid)</code> with <code>x: WeakInt</code> rewrites <code>x</code> under the bounds <code>cond</code> implies (<code>uop_given_valid</code>): <code>parse_valid</code> reads each clause as <code>expr &lt; c</code> / <code>expr >= c</code>, substitutes a bounded variable and re-simplifies.</li>
+<li class=""><strong><code>alu_vectorize_reorder_patterns</code></strong>: <code>op(STACK(x, x, ..), STACK(y, y, ..))</code> → <code>STACK(op(x, y), ..)</code> for the 13 arithmetic/bitwise ops and the six comparisons, when both operands are broadcasts of one node with the same lane count > 1.</li>
+<li class=""><strong><code>ne_zero_fold_patterns</code></strong>: <code>Ne(x, 0)</code> → <code>x.cast(bool)</code>.</li>
+<li class=""><strong><code>cast_where_dsl_patterns</code></strong>: <code>CAST(WHERE(s, a, b))</code> → <code>WHERE(s, CAST(a), CAST(b))</code>.</li>
+<li class=""><strong><code>store_load_folding_patterns</code></strong>: <code>STORE(_, Invalid)</code> → <code>NOOP</code>; <code>STORE(INDEX, WHERE(c, v, Invalid))</code> → the gated index <code>INDEX(buf, WHERE(c, idx, Invalid))</code> storing <code>v</code>; <code>STORE(idx, LOAD(idx))</code> → <code>NOOP</code>; <code>STORE(INDEX, WHERE(g, alt, LOAD(same INDEX)))</code> → gated store of <code>alt</code>.</li>
+<li class=""><strong><code>reduce_sym_patterns</code></strong>: <code>REDUCE(x * c, Add)</code> → <code>REDUCE(x, Add) * c</code> and <code>reduce_mul_chain_sym</code> (range-independent factors pulled out of an <code>Add</code>/<code>Max</code> reduce; for <code>Max</code> only non-negative ones), integers only.</li>
+<li class=""><strong><code>sym_phase3_patterns</code></strong>: <code>-1 * (x + y)</code> → <code>-x + -y</code>; <code>(x + y) * c</code> → <code>x*c + y*c</code> for <code>WeakInt</code>; single-source <code>GROUP</code> unwrap; <code>NOOP</code>/<code>STACK</code>/<code>SINK</code> flattening into a <code>SINK</code>/<code>GROUP</code>; <code>END(NOOP)</code> → <code>NOOP</code>.</li>
 </ul>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=11-minmax-elimination>11. Min/Max Elimination<a href=#11-minmax-elimination class=hash-link aria-label="Direct link to 11. Min/Max Elimination" title="Direct link to 11. Min/Max Elimination" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>MAX(x, x)</code><td><code>x</code><td>Self-max is identity<tr><td><code>MAX(x, y)</code><td><code>x</code><td>When <code>x.vmin >= y.vmax</code> (bounds prove dominance)<tr><td><code>MAX(x, y)</code><td><code>y</code><td>When <code>y.vmin >= x.vmax</code></table>
-<p>Uses <code>VminVmaxProperty</code> for range analysis. No separate <code>MIN</code> patterns -- Svod lowers <code>MIN(a,b)</code> to <code>NEG(MAX(NEG(a), NEG(b)))</code> before these patterns fire.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=12-where-optimization>12. WHERE Optimization<a href=#12-where-optimization class=hash-link aria-label="Direct link to 12. WHERE Optimization" title="Direct link to 12. WHERE Optimization" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=condition-elimination>Condition Elimination<a href=#condition-elimination class=hash-link aria-label="Direct link to Condition Elimination" title="Direct link to Condition Elimination" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>WHERE(cond, t, f)</code><td><code>t</code><td>When <code>cond.vmin == cond.vmax == true</code><tr><td><code>WHERE(cond, t, f)</code><td><code>f</code><td>When <code>cond.vmin == cond.vmax == false</code><tr><td><code>WHERE(LT(x, c), t, f)</code><td><code>t</code><td>When <code>x.vmax &lt; c.vmin</code> (always true)<tr><td><code>WHERE(LT(x, c), t, f)</code><td><code>f</code><td>When <code>x.vmin >= c.vmax</code> (always false)</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=branch-simplification>Branch Simplification<a href=#branch-simplification class=hash-link aria-label="Direct link to Branch Simplification" title="Direct link to Branch Simplification" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>WHERE(_, t, t)</code><td><code>t</code><td>Same branches<tr><td><code>WHERE(x, true, false)</code><td><code>x</code><td>Bool identity<tr><td><code>WHERE(x, false, true)</code><td><code>NOT(x)</code><td>Bool negation<tr><td><code>WHERE(NOT(cond), t, f)</code><td><code>WHERE(cond, f, t)</code><td>Condition flip<tr><td><code>WHERE(a, WHERE(b, c, d), d)</code><td><code>WHERE(AND(a, b), c, d)</code><td>Branch merging (ptr_eq on <code>d</code>)</table>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Invalid guard on condition flip</div><div class=admonitionContent_BuS1><p><code>WHERE(NOT(cond), t, f) -> WHERE(cond, f, t)</code> is <strong>not</strong> applied when <code>f</code> contains <code>Invalid</code>. Padding creates <code>WHERE(valid, idx, Invalid)</code> structures, and swapping would move <code>Invalid</code> to the true branch where downstream patterns cannot match it. Both scalar <code>Invalid</code> and vectorized <code>VECTORIZE(Invalid, ...)</code> are checked.<p>Tinygrad has the same guard: <code>symbolic.py:201-202</code>.</div></div>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=13-invalid-propagation>13. Invalid Propagation<a href=#13-invalid-propagation class=hash-link aria-label="Direct link to 13. Invalid Propagation" title="Direct link to 13. Invalid Propagation" translate=no>​</a></h2>
-<p>Invalid is Svod's sentinel for out-of-bounds tensor regions created by padding operations. These patterns must run <strong>before</strong> identity patterns like <code>x*0=0</code>, otherwise validity markers are destroyed.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=pattern-priority-example>Pattern Priority Example<a href=#pattern-priority-example class=hash-link aria-label="Direct link to Pattern Priority Example" title="Direct link to Pattern Priority Example" translate=no>​</a></h3>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Without ordering:  MUL(0, WHERE(cond, x, Invalid)) -> 0    (x*0=0 fires, loses Invalid)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">With ordering:     MUL(0, WHERE(cond, x, Invalid))</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                 -> WHERE(cond, MUL(0, x), Invalid)         (Invalid propagation fires first)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">                 -> WHERE(cond, 0, Invalid)                  (then x*0=0 is safe)</span><br/></div></code></pre></div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=where-invalid-merging>WHERE-Invalid Merging<a href=#where-invalid-merging class=hash-link aria-label="Direct link to WHERE-Invalid Merging" title="Direct link to WHERE-Invalid Merging" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<tbody><tr><td><code>WHERE(c1, WHERE(c2, x, Inv), Inv)</code><td><code>WHERE(AND(c1, c2), x, Inv)</code><tr><td><code>WHERE(c1, WHERE(c2, x, Inv), y)</code><td><code>WHERE(AND(c1, c2), x, y)</code></table>
-<p>Multi-dimensional padding creates nested WHERE-Invalid after propagation through linearized index arithmetic. Merging to a single level ensures <code>pm_lower_index_dtype</code> can consume it in one step.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=push-operations-through-where-invalid>Push Operations Through WHERE-Invalid<a href=#push-operations-through-where-invalid class=hash-link aria-label="Direct link to Push Operations Through WHERE-Invalid" title="Direct link to Push Operations Through WHERE-Invalid" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Ops<tbody><tr><td><code>CAST(WHERE(c, x, Inv))</code><td><code>WHERE(c, CAST(x), Inv)</code><td><tr><td><code>op(WHERE(c, x, Inv), y)</code><td><code>WHERE(c, op(x, y), Inv)</code><td>13 binary ops (non-comparison)<tr><td><code>op(y, WHERE(c, x, Inv))</code><td><code>WHERE(c, op(y, x), Inv)</code><td>13 binary ops (non-comparison)<tr><td><code>cmp(WHERE(c, x, Inv), y)</code><td><code>cmp(x, y)</code><td>Lt, Le, Eq, Ne, Gt, Ge<tr><td><code>cmp(y, WHERE(c, x, Inv))</code><td><code>cmp(y, x)</code><td>Lt, Le, Eq, Ne, Gt, Ge</table>
-<p>For comparisons, WHERE-Invalid is stripped -- the Invalid region is already gated downstream.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=bare-invalid-propagation>Bare Invalid Propagation<a href=#bare-invalid-propagation class=hash-link aria-label="Direct link to Bare Invalid Propagation" title="Direct link to Bare Invalid Propagation" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Guard<tbody><tr><td><code>op(Invalid, y)</code><td><code>Invalid</code><td><code>y.dtype() == DType::Index</code>, left position only</table>
-<p>Tinygrad alignment: <code>symbolic.py:37</code>. Right-position bare Invalid is NOT propagated to avoid contaminating non-index computations.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=dead-loadsstores-from-invalid-indices>Dead Loads/Stores from Invalid Indices<a href=#dead-loadsstores-from-invalid-indices class=hash-link aria-label="Direct link to Dead Loads/Stores from Invalid Indices" title="Direct link to Dead Loads/Stores from Invalid Indices" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<tbody><tr><td><code>LOAD(INDEX(buf, Invalid))</code><td><code>CONST(0)</code><tr><td><code>LOAD(CAST(INDEX(buf, Invalid)))</code><td><code>CONST(0)</code><tr><td><code>STORE(INDEX(buf, Invalid), val)</code><td><code>NOOP</code><tr><td><code>STORE(CAST(INDEX(buf, Invalid)), val)</code><td><code>NOOP</code></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=14-dead-code-elimination>14. Dead Code Elimination<a href=#14-dead-code-elimination class=hash-link aria-label="Direct link to 14. Dead Code Elimination" title="Direct link to 14. Dead Code Elimination" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=dead-ranges>Dead Ranges<a href=#dead-ranges class=hash-link aria-label="Direct link to Dead Ranges" title="Direct link to Dead Ranges" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>RANGE(end)</code> where <code>vmax &lt; 0</code><td><code>CONST(0)</code><td>Empty range (never executes)<tr><td><code>RANGE(CONST)</code> where <code>vmin == vmax</code><td><code>CONST(vmin)</code><td>Trivial range (single value)<tr><td><code>END(computation, ranges)</code><td><code>END(computation, live_ranges)</code><td>Filter dead ranges from END<tr><td><code>END(computation, [])</code><td><code>computation</code><td>All ranges dead -- unwrap</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=dead-reduces>Dead Reduces<a href=#dead-reduces class=hash-link aria-label="Direct link to Dead Reduces" title="Direct link to Dead Reduces" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Reduce Op<th>Identity Element<tbody><tr><td>Add<td><code>0</code><tr><td>Mul<td><code>1</code><tr><td>Max<td><code>-inf</code> (dtype minimum)<tr><td>Min<td><code>+inf</code> (dtype maximum)</table>
-<p>When ALL ranges of a REDUCE are dead (empty), the REDUCE is replaced by its identity element.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=dependency-simplification>Dependency Simplification<a href=#dependency-simplification class=hash-link aria-label="Direct link to Dependency Simplification" title="Direct link to Dependency Simplification" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<tbody><tr><td><code>AFTER(x, [])</code><td><code>x</code></table>
-<p>No dependencies means no ordering constraint.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=15-power-and-negation>15. Power and Negation<a href=#15-power-and-negation class=hash-link aria-label="Direct link to 15. Power and Negation" title="Direct link to 15. Power and Negation" translate=no>​</a></h2>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<tbody><tr><td><code>POW(x, 0)</code><td><code>1</code><tr><td><code>POW(x, 1)</code><td><code>x</code><tr><td><code>NEG(NEG(x))</code><td><code>x</code></table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=16-lane-folds--index-over-a-stack>16. Lane Folds — INDEX over a STACK<a href=#16-lane-folds--index-over-a-stack class=hash-link aria-label="Direct link to 16. Lane Folds — INDEX over a STACK" title="Direct link to 16. Lane Folds — INDEX over a STACK" translate=no>​</a></h2>
-<p>Svod has no GEP op: a shaped value is a <code>STACK</code> of lanes, and <code>INDEX</code> selects a lane from it exactly as it selects an address from a buffer. Tinygrad's <code>gep_pushing</code> therefore has no direct counterpart. What Svod has instead are folds that collapse <code>INDEX</code>/<code>STACK</code> structure so the devectorizer sees scalars.</p>
-<p>Most of these folds are structural and live in the devectorizer's movement cleanup (<code>schedule/src/devectorize.rs</code>), not in <code>symbolic_simple()</code>. The one symbolic-tier rule is <code>alu_vectorize_reorder_patterns</code>, which belongs to tier-3 <code>sym()</code>.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=lane-selection-and-collapse>Lane Selection and Collapse<a href=#lane-selection-and-collapse class=hash-link aria-label="Direct link to Lane Selection and Collapse" title="Direct link to Lane Selection and Collapse" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>INDEX(STACK([a, b, c]), 2)</code><td><code>c</code><td>Constant lane index folds to the stacked source<tr><td><code>INDEX(STACK([...]), c0, rest...)</code><td><code>INDEX(sources[c0], rest...)</code><td>Leading constant peels one STACK level, recursively<tr><td><code>STACK([INDEX(b, 0), INDEX(b, 1), ...])</code><td><code>b</code><td>Sequential lane reads rebuild the source<tr><td><code>INDEX(INDEX(b, i), j)</code><td><code>INDEX(b, i, j)</code><td>Compose scalar index chains<tr><td><code>INDEX(AFTER(STACK([...]), deps), c)</code><td>selected lane, <code>deps</code> re-attached<td>Register-stack lane selection preserves ordering</table>
-<p><code>const_index_into_stack</code> recurses: an index list whose leading entries are constants peels one <code>STACK</code> level per entry.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=alu-over-stack>ALU over STACK<a href=#alu-over-stack class=hash-link aria-label="Direct link to ALU over STACK" title="Direct link to ALU over STACK" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Guard<tbody><tr><td><code>op(STACK(x,x,x,x), STACK(y,y,y,y))</code><td><code>STACK(op(x,y), op(x,y), ...)</code><td>Both operands broadcast (all lanes <code>ptr_eq</code>), equal length > 1</table>
-<p>Applies to eighteen binary ops — Add, Mul, Sub, FloorMod, Max, FloorDiv, Fdiv, Pow, And, Or, Xor, Shl, Shr and the six comparisons. Collapsing to a <code>STACK</code> of one scalar operation exposes the operands to constant folding and scalar simplification.</p>
-<div class="theme-admonition theme-admonition-caution admonition_xJq3 alert alert--warning"><div class=admonitionHeading_Gvgb><span class=admonitionIcon_Rf37><svg viewBox="0 0 16 16"><path fill-rule=evenodd d="M8.893 1.5c-.183-.31-.52-.5-.887-.5s-.703.19-.886.5L.138 13.499a.98.98 0 0 0 0 1.001c.193.31.53.501.886.501h13.964c.367 0 .704-.19.877-.5a1.03 1.03 0 0 0 .01-1.002L8.893 1.5zm.133 11.497H6.987v-2.003h2.039v2.003zm0-3.004H6.987V5.987h2.039v4.006z"/></svg></span>Tier-3 only</div><div class=admonitionContent_BuS1><p><code>alu_vectorize_reorder_patterns</code> is part of <code>sym()</code>, not of <code>symbolic()</code> or <code>symbolic_simple()</code>. It fires at the stages that run <code>sym()</code> — pre-optimization, Stage 8 and the devectorizer — so by the final decomp+render pass the reordering has already happened.</div></div>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=movement-cleanup-around-stack>Movement Cleanup Around STACK<a href=#movement-cleanup-around-stack class=hash-link aria-label="Direct link to Movement Cleanup Around STACK" title="Direct link to Movement Cleanup Around STACK" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<tbody><tr><td><code>RESHAPE(STACK([x]))</code><td><code>x</code> — when the shapes already agree<tr><td><code>RESHAPE(x)</code> adding leading 1-dims<td>one <code>STACK([x])</code> wrapper per added dimension<tr><td><code>EXPAND(STACK([x]))</code><td><code>STACK([x, x, ..., x])</code> — materialize the broadcast<tr><td><code>PERMUTE(PERMUTE(x, a), b)</code><td><code>PERMUTE(x, a∘b)</code>; identity permutes drop out</table>
-<p>These live in <code>movement_cleanup_patterns()</code> / <code>mop_cleanup_patterns()</code>, which the devectorizer applies before scalarization. WMMA lanes are handled there too, by <code>stack_wmma_sources</code> and <code>broadcast_and_devec_wmma</code>, rather than by any symbolic pattern.</p>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=17-where-on-load-stage-8-only>17. WHERE on LOAD (Stage 8 only)<a href=#17-where-on-load-stage-8-only class=hash-link aria-label="Direct link to 17. WHERE on LOAD (Stage 8 only)" title="Direct link to 17. WHERE on LOAD (Stage 8 only)" translate=no>​</a></h2>
-<p><strong>Function</strong>: <code>pm_move_where_on_load()</code></p>
-<p>Transforms masked loads by embedding the condition into the INDEX operation:</p>
-<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Before:  WHERE(cond, INDEX(buf, idx), 0)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">After:   INDEX(buf, WHERE(combined_cond, idx, Invalid))</span><br/></div></code></pre></div></div>
-<p>This enables hardware predication for masked loads and eliminates WHERE overhead.</p>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=how-it-works>How It Works<a href=#how-it-works class=hash-link aria-label="Direct link to How It Works" title="Direct link to How It Works" translate=no>​</a></h3>
-<ol>
-<li class=""><strong>Split</strong> condition into AND clauses</li>
-<li class=""><strong>Partition</strong> clauses into moveable vs. remaining:
-<ul>
-<li class="">Moveable: all RANGE dependencies within INDEX scope, no external INDEX dependencies</li>
-<li class="">Remaining: everything else</li>
-</ul>
-</li>
-<li class=""><strong>Embed</strong> moveable clauses as <code>WHERE(cond, idx, Invalid)</code> in <code>indices[0]</code></li>
-<li class=""><strong>Wrap</strong> in outer WHERE if remaining clauses exist</li>
-</ol>
-<p>Supports partial clause movement -- only clauses whose ranges are within the index scope are moved. Existing validity clauses in <code>indices[0]</code> are deduplicated.</p>
-<p>The inverted pattern <code>WHERE(cond, 0, INDEX(buf, idx))</code> is also handled by negating the condition.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=18-commutative-canonicalization>18. Commutative Canonicalization<a href=#18-commutative-canonicalization class=hash-link aria-label="Direct link to 18. Commutative Canonicalization" title="Direct link to 18. Commutative Canonicalization" translate=no>​</a></h2>
-<p>For commutative binary ops on Index dtype, operands are sorted by UOp id (smaller id on left):</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Ops<th>Guard<tbody><tr><td>Add, Mul, Max, Eq, Ne, And, Or, Xor<td><code>dtype == DType::Index && b.id &lt; a.id</code></table>
-<p>Without this, mathematically equivalent expressions like <code>R1*8000 + R2*16</code> and <code>R2*16 + R1*8000</code> would not be deduplicated by hash consing, breaking grouping in <code>expand_vector_index</code>.</p>
-<p>Only applied to Index dtype to avoid breaking vector math merging. Tinygrad: <code>symbolic.py:178-182</code>.</p>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=19-div-mod-simplification>19. Div-Mod Simplification<a href=#19-div-mod-simplification class=hash-link aria-label="Direct link to 19. Div-Mod Simplification" title="Direct link to 19. Div-Mod Simplification" translate=no>​</a></h2>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=range-based-fast-paths>Range-Based Fast Paths<a href=#range-based-fast-paths class=hash-link aria-label="Direct link to Range-Based Fast Paths" title="Direct link to Range-Based Fast Paths" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Condition<tbody><tr><td><code>MOD(x, n)</code><td><code>x</code><td><code>0 &lt;= vmin(x)</code> and <code>vmax(x) &lt; n</code><tr><td><code>IDIV(x, n)</code><td><code>k</code><td>All values in range divide to same <code>k</code><tr><td><code>MOD(ADD[MUL[a, m], b], n)</code><td><code>MOD(b, n)</code><td><code>m == n</code> (factor out multiples)<tr><td><code>IDIV(ADD[MUL[a, m], b], n)</code><td><code>a + IDIV(b, n)</code><td><code>m == n</code><tr><td><code>IDIV(ADD[MUL[a, m], b], n)</code><td><code>a</code><td><code>m == n</code> and <code>0 &lt;= b &lt; n</code></table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=unified-div-mod-engine-fold_divmod_general>Unified Div-Mod Engine (<code>fold_divmod_general</code>)<a href=#unified-div-mod-engine-fold_divmod_general class=hash-link aria-label="Direct link to unified-div-mod-engine-fold_divmod_general" title="Direct link to unified-div-mod-engine-fold_divmod_general" translate=no>​</a></h3>
-<p>For IDIV and MOD on Index dtype, a unified engine tries simplification rules in priority order. Based on Tinygrad's <code>fold_divmod_general</code> (<code>divandmod.py:8-96</code>).</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Priority<th>Rule<th>Description<tbody><tr><td>1<td>cancel_divmod<td>Range lies in single denominator interval<tr><td>2<td>nested_div<td><code>(a % (k*c)) // c -> (a // c) % k</code><tr><td>3<td>remove_nested_mod<td><code>(a%4 + b)%2 -> (a+b)%2</code> when `2<tr><td>4<td>fold_divmod_congruence<td>Factor congruence modular arithmetic<tr><td>5<td>gcd_with_remainder<td>Factor out common GCD from numerator<tr><td>6<td>nest_div_by_smallest_factor<td>Recursive split by the smallest shared factor<tr><td>7<td>divide_by_gcd<td>Variable denominator GCD factoring (any denominator)<tr><td>8<td>factor_remainder<td><code>(d*x+y)//d -> x + y//d</code> (last resort)</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=div-mod-recombination>Div-Mod Recombination<a href=#div-mod-recombination class=hash-link aria-label="Direct link to Div-Mod Recombination" title="Direct link to Div-Mod Recombination" translate=no>​</a></h3>
-<p>Patterns that recombine separated div and mod operations back into the original expression:</p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Guard<tbody><tr><td><code>ADD[MOD(x, n), MUL[IDIV(x, n), n]]</code><td><code>x</code><td>ptr_eq on x, n<tr><td><code>ADD[MOD(IDIV(x, a), c), MUL[IDIV(x, b), c]]</code><td><code>IDIV(x, a)</code><td><code>a * c == b</code><tr><td><code>ADD[MUL[MOD(x, c1), c2], MUL[IDIV(x, c1), c3]]</code><td><code>MUL(x, c2)</code><td><code>c1 * c2 == c3</code><tr><td><code>ADD[ADD[y, MOD(x, n)], MUL[IDIV(x, n), n]]</code><td><code>ADD(y, x)</code><td>ptr_eq on x, n<tr><td><code>IDIV(ADD[IDIV(a, c1), c2], c3)</code><td><code>IDIV(ADD(a, c1*c2), c1*c3)</code><td>Nested division</table>
-<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=advanced-division>Advanced Division<a href=#advanced-division class=hash-link aria-label="Direct link to Advanced Division" title="Direct link to Advanced Division" translate=no>​</a></h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Pattern<th>Result<th>Notes<tbody><tr><td><code>IDIV(IDIV(a, b), c)</code><td><code>IDIV(a, b*c)</code><td>Compose nested division<tr><td><code>IDIV(expr, d)</code><td><code>expr.divides(d)</code><td>Generic exact division<tr><td><code>IDIV(ADD(a, b), c)</code><td><code>IDIV(a, c) + IDIV(b, c)</code><td>When both divide evenly<tr><td><code>IDIV(SUB(a, b), c)</code><td><code>IDIV(a, c) - IDIV(b, c)</code><td>When both divide evenly<tr><td><code>MUL(c, ADD(a, b))</code><td><code>ADD(MUL(c, a), MUL(c, b))</code><td>Distribute multiplication</table>
-<hr/>
-<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=cross-references>Cross-References<a href=#cross-references class=hash-link aria-label="Direct link to Cross-References" title="Direct link to Cross-References" translate=no>​</a></h2>
-<ul>
-<li class=""><a class="" href=/docs/architecture/pipeline>Execution Pipeline</a> -- stages where these patterns run</li>
-<li class=""><a class="" href=/docs/architecture/optimizations/pattern-system>Pattern Engine</a> — how the pattern matching engine works</li>
-<li class=""><a class="" href=/docs/architecture/codegen/rangeify>Rangeify</a> -- Stage 4 context (patterns run after movement op lowering)</li>
-<li class=""><a class="" href=/docs/architecture/codegen/expander>Expander</a> -- Stage 8 context (patterns run after optimization actions)</li>
-<li class=""><a class="" href=/docs/architecture/codegen/linearizer>Linearizer</a> -- Stage 16 context (final cleanup)</li>
-</ul></div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/architecture/optimizations/algebraic-simplification.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>Edit this page</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="Docs pages"><a class="pagination-nav__link pagination-nav__link--prev" href=/docs/architecture/optimizations/pattern-system><div class=pagination-nav__sublabel>Previous</div><div class=pagination-nav__label>Pattern Engine</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/docs/architecture/optimizations/index-arithmetic><div class=pagination-nav__sublabel>Next</div><div class=pagination-nav__label>Index Arithmetic</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#worked-example-optimization-cascade class="table-of-contents__link toc-highlight">Worked Example: Optimization Cascade</a><li><a href=#pattern-ordering class="table-of-contents__link toc-highlight">Pattern Ordering</a><li><a href=#1-constant-folding class="table-of-contents__link toc-highlight">1. Constant Folding</a><ul><li><a href=#scalar-constants class="table-of-contents__link toc-highlight">Scalar Constants</a><li><a href=#vector-constants class="table-of-contents__link toc-highlight">Vector Constants</a></ul><li><a href=#2-identity-and-zero-propagation class="table-of-contents__link toc-highlight">2. Identity and Zero Propagation</a><li><a href=#3-self-folding class="table-of-contents__link toc-highlight">3. Self-Folding</a><li><a href=#4-zero-folding class="table-of-contents__link toc-highlight">4. Zero Folding</a><li><a href=#5-division-simplification class="table-of-contents__link toc-highlight">5. Division Simplification</a><li><a href=#6-cast-optimization class="table-of-contents__link toc-highlight">6. Cast Optimization</a><li><a href=#7-term-combining class="table-of-contents__link toc-highlight">7. Term Combining</a><li><a href=#8-alu-chain-folding class="table-of-contents__link toc-highlight">8. ALU Chain Folding</a><ul><li><a href=#constant-folding class="table-of-contents__link toc-highlight">Constant Folding</a><li><a href=#constant-pushing class="table-of-contents__link toc-highlight">Constant Pushing</a><li><a href=#sub-canonicalization class="table-of-contents__link toc-highlight">Sub Canonicalization</a></ul><li><a href=#9-boolean-logic class="table-of-contents__link toc-highlight">9. Boolean Logic</a><li><a href=#10-comparison-simplification class="table-of-contents__link toc-highlight">10. Comparison Simplification</a><ul><li><a href=#self-comparison-non-float-ptr_eq class="table-of-contents__link toc-highlight">Self-Comparison (non-float, ptr_eq)</a><li><a href=#constant-and-range-based class="table-of-contents__link toc-highlight">Constant and Range-Based</a><li><a href=#algebraic-transforms class="table-of-contents__link toc-highlight">Algebraic Transforms</a></ul><li><a href=#11-minmax-elimination class="table-of-contents__link toc-highlight">11. Min/Max Elimination</a><li><a href=#12-where-optimization class="table-of-contents__link toc-highlight">12. WHERE Optimization</a><ul><li><a href=#condition-elimination class="table-of-contents__link toc-highlight">Condition Elimination</a><li><a href=#branch-simplification class="table-of-contents__link toc-highlight">Branch Simplification</a></ul><li><a href=#13-invalid-propagation class="table-of-contents__link toc-highlight">13. Invalid Propagation</a><ul><li><a href=#pattern-priority-example class="table-of-contents__link toc-highlight">Pattern Priority Example</a><li><a href=#where-invalid-merging class="table-of-contents__link toc-highlight">WHERE-Invalid Merging</a><li><a href=#push-operations-through-where-invalid class="table-of-contents__link toc-highlight">Push Operations Through WHERE-Invalid</a><li><a href=#bare-invalid-propagation class="table-of-contents__link toc-highlight">Bare Invalid Propagation</a><li><a href=#dead-loadsstores-from-invalid-indices class="table-of-contents__link toc-highlight">Dead Loads/Stores from Invalid Indices</a></ul><li><a href=#14-dead-code-elimination class="table-of-contents__link toc-highlight">14. Dead Code Elimination</a><ul><li><a href=#dead-ranges class="table-of-contents__link toc-highlight">Dead Ranges</a><li><a href=#dead-reduces class="table-of-contents__link toc-highlight">Dead Reduces</a><li><a href=#dependency-simplification class="table-of-contents__link toc-highlight">Dependency Simplification</a></ul><li><a href=#15-power-and-negation class="table-of-contents__link toc-highlight">15. Power and Negation</a><li><a href=#16-lane-folds--index-over-a-stack class="table-of-contents__link toc-highlight">16. Lane Folds — INDEX over a STACK</a><ul><li><a href=#lane-selection-and-collapse class="table-of-contents__link toc-highlight">Lane Selection and Collapse</a><li><a href=#alu-over-stack class="table-of-contents__link toc-highlight">ALU over STACK</a><li><a href=#movement-cleanup-around-stack class="table-of-contents__link toc-highlight">Movement Cleanup Around STACK</a></ul><li><a href=#17-where-on-load-stage-8-only class="table-of-contents__link toc-highlight">17. WHERE on LOAD (Stage 8 only)</a><ul><li><a href=#how-it-works class="table-of-contents__link toc-highlight">How It Works</a></ul><li><a href=#18-commutative-canonicalization class="table-of-contents__link toc-highlight">18. Commutative Canonicalization</a><li><a href=#19-div-mod-simplification class="table-of-contents__link toc-highlight">19. Div-Mod Simplification</a><ul><li><a href=#range-based-fast-paths class="table-of-contents__link toc-highlight">Range-Based Fast Paths</a><li><a href=#unified-div-mod-engine-fold_divmod_general class="table-of-contents__link toc-highlight">Unified Div-Mod Engine (<code>fold_divmod_general</code>)</a><li><a href=#div-mod-recombination class="table-of-contents__link toc-highlight">Div-Mod Recombination</a><li><a href=#advanced-division class="table-of-contents__link toc-highlight">Advanced Division</a></ul><li><a href=#cross-references class="table-of-contents__link toc-highlight">Cross-References</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Docs</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/docs/introduction>Introduction</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Community</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=worked-cascade>Worked cascade<a href=#worked-cascade class=hash-link aria-label="Direct link to Worked cascade" title="Direct link to Worked cascade" translate=no>​</a></h2>
+<p><code>(x + 0) * 1 + (3 + 4)</code> with <code>x: Int32</code>:</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Add(x, 0)        → x          identity_and_zero</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Mul(x, 1)        → x          identity_and_zero</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Add(3, 4)        → 7          constant_folding</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Add(x, 7)                     stays: no rule</span><br/></div></code></pre></div></div>
+<p>The engine rewrites children before parents and re-matches a rebuilt parent, so the three steps happen in one <code>graph_rewrite</code>. The identity steps are the ones the <a class="" href=/docs/architecture/optimizations/pattern-system#verifying-rewrites-with-z3>Z3 oracles</a> prove.</div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/architecture/optimizations/algebraic-simplification.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>Edit this page</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label="Docs pages"><a class="pagination-nav__link pagination-nav__link--prev" href=/docs/architecture/optimizations/pattern-system><div class=pagination-nav__sublabel>Previous</div><div class=pagination-nav__label>Pattern engine</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/docs/architecture/optimizations/index-arithmetic><div class=pagination-nav__sublabel>Next</div><div class=pagination-nav__label>Index arithmetic</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#composition class="table-of-contents__link toc-highlight">Composition</a><li><a href=#tier-1 class="table-of-contents__link toc-highlight">Tier 1</a><ul><li><a href=#invalid-propagation-propagate_invalid class="table-of-contents__link toc-highlight">Invalid propagation (<code>propagate_invalid</code>)</a><li><a href=#dead-loads-and-stores-fold_invalid_load_store class="table-of-contents__link toc-highlight">Dead loads and stores (<code>fold_invalid_load_store</code>)</a><li><a href=#constant-folding class="table-of-contents__link toc-highlight">Constant folding</a><li><a href=#bool-arithmetic class="table-of-contents__link toc-highlight">Bool arithmetic</a><li><a href=#identity-and-zero class="table-of-contents__link toc-highlight">Identity and zero</a><li><a href=#self-and-zero-folding class="table-of-contents__link toc-highlight">Self and zero folding</a><li><a href=#division class="table-of-contents__link toc-highlight">Division</a><li><a href=#casts class="table-of-contents__link toc-highlight">Casts</a><li><a href=#div-mod-recombination class="table-of-contents__link toc-highlight">Div-mod recombination</a><li><a href=#power-booleans-dce class="table-of-contents__link toc-highlight">Power, booleans, DCE</a></ul><li><a href=#tier-2 class="table-of-contents__link toc-highlight">Tier 2</a><ul><li><a href=#commutative-canonicalization class="table-of-contents__link toc-highlight">Commutative canonicalization</a><li><a href=#term-combining-addmul-with-constants class="table-of-contents__link toc-highlight">Term combining (<code>Add</code>/<code>Mul</code> with constants)</a><li><a href=#boolean-boolean_dsl_patterns class="table-of-contents__link toc-highlight">Boolean (<code>boolean_dsl_patterns</code>)</a><li><a href=#where class="table-of-contents__link toc-highlight">WHERE</a><li><a href=#bounds-collapse-and-minmax class="table-of-contents__link toc-highlight">Bounds collapse and min/max</a><li><a href=#alu-chain-folding-alu_folding_dsl_patterns class="table-of-contents__link toc-highlight">ALU chain folding (<code>alu_folding_dsl_patterns</code>)</a><li><a href=#comparisons-comparison_dsl_patterns class="table-of-contents__link toc-highlight">Comparisons (<code>comparison_dsl_patterns</code>)</a><li><a href=#ranges-and-division class="table-of-contents__link toc-highlight">Ranges and division</a><li><a href=#after class="table-of-contents__link toc-highlight">AFTER</a></ul><li><a href=#tier-3-sym class="table-of-contents__link toc-highlight">Tier 3 (<code>sym</code>)</a><li><a href=#worked-cascade class="table-of-contents__link toc-highlight">Worked cascade</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Docs</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/docs/introduction>Introduction</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>Community</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>
