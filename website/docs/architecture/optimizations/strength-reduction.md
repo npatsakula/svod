@@ -1,281 +1,96 @@
 ---
-sidebar_label: Strength Reduction
+sidebar_label: Strength reduction
 ---
 
-# Strength Reduction and Late Rewrite Patterns
+# Strength Reduction and Late Decompositions
 
-Strength reduction replaces expensive operations with cheaper equivalents. These patterns run late in the pipeline (Stages 18-19) because earlier passes need to see the original operation structure. For example, `Add(Mul(a, b), c)` must remain visible for algebraic simplification before being fused into `MULACC(a, b, c)`.
+The late rewrites replace operations with cheaper equivalents and operations the backend lacks with ones it has. They run after index lowering, in stages `19b`–`20` of the [post-optimization pipeline](../codegen/linearizer.md), because the earlier passes need the original structure: `Add(Mul(a, b), c)` must stay visible to term combining before it becomes `MulAcc`. Source: `early_decomposition_patterns`, `get_late_rewrite_patterns`, `pm_mod_to_idiv` in `schedule/src/optimizer/mod.rs`; the rules in `schedule/src/rangeify/patterns.rs` and `schedule/src/symbolic/fast_div.rs`; `ir/src/decompositions/`. Tinygrad: `codegen/decomp/op.py` (`get_late_rewrite_patterns`, `fast_idiv`).
 
-Tinygrad source: `tinygrad/uop/decompositions.py:438-480` (`get_late_rewrite_patterns`).
-Svod source: `schedule/src/rangeify/patterns.rs` (late decomposition group) + `schedule/src/symbolic/fast_div.rs`.
+## Composition
 
-*Cycle estimates throughout this page are approximate for modern x86-64. Actual latencies vary by microarchitecture and pipeline state.*
+```text
+19b  early_decomposition_patterns(supported)
+       symbolic_simple + pm_fold_cast_const + pm_mod_to_and + divmod_decomposition_patterns
+       + pm_threefry_decomp              if !supports(Threefry)
+       + pm_max_decomposition            if !supports(Max) && supports(Lt)
+       + pm_erf_decomposition            if !supports(Erf)
 
-All patterns are combined into a single fixed-point rewrite pass (`PM_FINAL`) together with `symbolic_simple()` (algebraic cleanup).
+19d  pm_decomp = early
+       + get_late_rewrite_patterns(renderer, disable_fast_idiv)
+           pm_mod_to_and + pm_half_bf16_cast
+           + pm_demorgan                   if supports(Or)
+           + pm_mul_to_shl                 if supports(Shl)
+           + pm_div_to_shr                 if supports(Shr)
+             + fast_division_patterns + pm_mod_to_idiv    if also DISABLE_FAST_IDIV=0
+           + pm_neg_from_mul               if supports(Neg)
+           + pm_comparison_negations       if supports(Lt) || supports(Eq)
+           + pm_fma_decomposition          if supports(MulAcc)
+             + pm_shl_add_to_mulacc        if also supports(Shl)
+           + pm_fdiv_to_mul                if supports(Fdiv)
+       + get_transcendental_patterns(supported, TRANSCENDENTAL >= 2)
+       + renderer.decomposition_matcher()  if the device defines one
 
----
-
-## 1. Power-of-Two Optimization
-
-The most impactful strength reduction. Integer division and modulo by constants are extremely common in tensor indexing -- stride calculations, tiling, and coordinate recovery from flat indices all produce them.
-
-| Pattern | Before | After | Cycle savings |
-|---------|--------|-------|---------------|
-| `x % 2^n` | `idiv` + `imul` + `isub` (~25 cycles) | `and` (1 cycle) | ~24x |
-| `x * 2^n` | `imul` (~3-4 cycles) | `shl` (1 cycle) | ~3x |
-| `x // 2^n` (unsigned) | `idiv` (~20-40 cycles) | `shr` (1 cycle) | ~20-40x |
-
-The modulo optimization works because `2^n - 1` is a bitmask of the lower n bits. Example: `x % 8` = `x & 0b111`.
-
-Tinygrad: `decompositions.py:448-454`. Svod: `pm_mod_to_and`, `pm_mul_to_shl`, `pm_div_to_shr` in `rangeify/patterns.rs`.
-
-:::caution[Signed Division]
-For signed integers, `x // 2^n` is NOT simply `x >> n`. Arithmetic right shift rounds toward negative infinity, but integer division rounds toward zero.
-
-Fix: `(x + (x < 0 ? 2^n - 1 : 0)) >> n`
-
-The bias `2^n - 1` added for negative values corrects the rounding direction. This matches the identity:
-
-```
-floor(x / 2^n) = (x + 2^n - 1) >> n    when x < 0
-                  x >> n                  when x >= 0
+20   pm_final = pm_commit_weak + pm_cast_weak + pm_decomp (+ extra_matcher) + pm_split_ends
 ```
 
-Svod checks `vmin >= 0` via range analysis (`VminVmaxProperty`) to skip the bias when the dividend is provably non-negative. Tinygrad uses dtype membership (`dtypes.uints`) for the same purpose.
+`supports(..)` is the renderer's `RendererOps` table. Everything is one fixpoint per stage, so the rules feed each other: `pm_mul_to_shl` turns `R1 * 64` into `R1 << 6`, and `pm_shl_add_to_mulacc` then fuses `(R0 << 2) + (R1 << 6)` into `MulAcc(R0, 4, R1 << 6)` — the integer FMA in the [worked example](../codegen/worked-example.md). `DISABLE_FAST_IDIV` defaults to **1**: the magic-number division below is opt-in.
 
-Tinygrad: `decompositions.py:452-454`. Svod: `pm_div_to_shr` in `rangeify/patterns.rs`.
-:::
+## Floor to truncating division
 
-Generated C output for signed power-of-two division:
+`divmod_decomposition_patterns` (`ir/src/decompositions/mod.rs`) lowers `FloorDiv`/`FloorMod` to the C-style `CDiv`/`CMod` every backend has, adding the sign correction `q - (r != 0 && (a < 0) != (b < 0))` / `r + (correction ? b : 0)` unless both operands provably sit on one side of zero (`same_truncating_bucket`). All power-of-two and magic-number rules below match `CDiv`/`CMod` (or `FloorMod`, for `pm_mod_to_and`, which also runs in `19b` so power-of-two modulos fold before the lowering).
 
-```c
-// Before: x / 8
-int result = x / 8;
+## Power-of-two rules
 
-// After: strength reduction (signed path)
-int result = (x + ((x >> 31) & 7)) >> 3;
-//           bias for negatives ^^^   ^shift
-```
+| Rule | Pattern | Result | Guard |
+|------|---------|--------|-------|
+| `pm_mod_to_and` | `FloorMod(x, 2^n)` | `x & (2^n - 1)` | integer `x` (exact for floor modulo, any sign) |
+| `pm_mul_to_shl` | `Mul[x, 2^n]` | `x << n` | integer `x` |
+| `pm_div_to_shr` | `CDiv(x, 2^n)` | `x >> n` | `vmin(x) >= 0` or unsigned |
+| | | `(x + WHERE(x < 0, 2^n - 1, 0)) >> n` | signed `x` that may be negative |
 
-When `x` is provably non-negative (common in index calculations), the signed path is eliminated entirely:
+The bias corrects the arithmetic shift's rounding toward −∞ to the truncating division's rounding toward zero. On the LLVM backend a signed `Shr` renders as `ashr`, so the bias is required whenever `vmin` cannot be proven.
 
-```c
-// After: strength reduction (unsigned path, vmin >= 0)
-int result = x >> 3;
-```
+## Magic-number division (`fast_division_patterns`, `fast_div.rs`)
 
----
+For `CDiv(x, d)` with a positive non-power-of-two constant `d` and `x` unsigned or `vmin(x) >= 0`:
 
-## 2. Fast Integer Division (Hacker's Delight)
+1. `magic_unsigned(vmax, d)` — Hacker's Delight: `nc = (vmax + 1) / d * d - 1`, `nbits = 64 - leading_zeros(vmax)`, and the smallest `s ∈ 0..=2*nbits` with `2^s > nc * (d - 1 - (2^s - 1) % d)`; `M = (2^s + d - 1 - (2^s - 1) % d) / d`. The result `(x * M) >> s` equals `x / d` for all `0 <= x <= vmax`. The call uses `max(vmax, |vmin|)`.
+2. If `M * vmin` and `M * vmax` fit the dtype: emit `(x * M) >> s`.
+3. Else take the power-of-two factor out: `d = 2^k * d'` becomes `CDiv(x, 2^k)` (a shift after the previous rule) and recurse on `d'` without widening.
+4. Else widen to the next integer dtype (`i8 → i16 → i32 → i64 → u64`, `u8 → u16 → u32 → u64`) when the renderer supports it and the product fits there, and cast back.
 
-For non-power-of-2 constants, replace `x / d` with multiply-and-shift: `(x * M) >> S`.
+`pm_mod_to_idiv` then rewrites the matching `CMod(x, d)` as `x - d * CDiv(x, d)` so the remainder goes through the same path. A signed correction (`+ (x < 0)`) exists in `fast_idiv` but the pattern guard makes it unreachable. Example: `x ∈ [0, 255]`, `d = 7` → `M = 293`, `s = 11`; `(255 * 293) >> 11 = 36 = 255 / 7`.
 
-### The math
+## Float and FMA
 
-For a positive constant `d` and value range `[0, max_val]`, find magic number `M` and shift `S` such that:
+- `pm_fdiv_to_mul`: `Fdiv(x, c)` → `x * (1/c)` for a float constant with `c != 0` and a finite reciprocal.
+- `pm_fma_decomposition`: `Add[Mul(a, b), c]` → `MulAcc(a, b, c)` when all three share one float dtype. Integers are not fused here.
+- `pm_shl_add_to_mulacc`: `Add[Shl(x, n), c]` → `MulAcc(x, 2^n, c)` — no float guard, so this is the integer path (`0 <= n < 64`).
+- `pm_neg_from_mul`: `Mul[x, -1]` → `Neg(x)` (the only place a `Neg` op is created; `neg()` elsewhere builds `MUL(x, -1)`), and `Add[x, Neg(y)]` → `Sub(x, y)`.
+- `pm_half_bf16_cast`: a same-width float cast (`f16 ↔ bf16`) has no single LLVM instruction and a plain `cast(f32).cast(dst)` chain would be folded back by the cast rules, so it is spelled through bits: `f16 → f32 → RNE-round the low 16 bits → bf16`, and `bf16 → (u16 << 16 as f32) → f16`.
 
-```
-(x * M) >> S == x / d    for all 0 <= x <= max_val
-```
+## Comparison negations (`pm_comparison_negations`)
 
-**Why this works**: Division by `d` is equivalent to multiplication by `1/d`. We approximate `1/d` as `M / 2^S` where `M` and `S` are chosen so the approximation is exact over the value range. The key insight is that integer truncation makes exact representation possible -- we only need `floor(x * M / 2^S) == floor(x / d)`, not real-valued equality.
+Integers only; the constant arithmetic uses `checked_*` and declines on overflow.
 
-### The algorithm
+| Pattern | Result |
+|---------|--------|
+| `Not(Lt(x, c))` | `Lt(c - 1, x)` |
+| `Not(Lt(c, x))` | `Lt(x, c + 1)` |
+| `And[Lt(c1, x), Lt(x, c2)]`, `c2 == c1 + 2` | `Eq(x, c1 + 1)` |
+| `Lt(Mul(x, -1), c)` | `Lt(-c, x)` |
+| `Lt(Mul(x, -1), Mul(y, c))` | `Lt(y * -c, x)` |
 
-From Hacker's Delight Chapter 10 (Tinygrad's `magicgu`, `decompositions.py:272-280`):
+`pm_demorgan` is the late `And[Not(x), Not(y)]` → `Not(Or(x, y))`, bool only, gated on `Or`; both De Morgan directions also live in `symbolic()`'s `boolean_dsl_patterns`, which `symbolic_simple` (and therefore the late fixpoint's own tier-1 set) does not include.
 
-1. Compute `nc = floor((max_val + 1) / d) * d - 1` (the critical threshold)
-2. Compute `nbits = bit_length(max_val)`
-3. For `s` from 0 to `2 * nbits`:
-   - If `2^s > nc * (d - 1 - (2^s - 1) mod d)`: found valid shift
-   - Compute `M = ceil((2^s + d - 1 - (2^s - 1) mod d) / d)`
-4. Return `(M, s)` -- the smallest valid `(multiplier, shift)` pair
+## Op decompositions
 
-The loop finds the smallest `s` that produces a valid magic number. Smaller `s` means smaller `M`, which is critical for fitting the intermediate product `x * M` in narrow integer types.
+- `pm_max_decomposition`: `Max(a, b)` → `WHERE(a < b, b, a)`.
+- `pm_erf_decomposition`: Abramowitz–Stegun 7.1.26, `erf(x) = sign(x) * (1 - t * P(t) * exp(-x²))` with `t = 1 / (1 + 0.3275911 |x|)` and `P` the Horner polynomial `1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592`; maximum error about 1.5e-7. `Erf` stays a UOp until here because `@llvm.erf` is a libm call the in-process JIT does not link.
+- `pm_threefry_decomp`: Threefry2x32, five rounds in `u32` arithmetic.
+- `get_transcendental_patterns`: `Exp2`/`Log2`/`Sin` → `xexp2`/`xlog2`/`xsin` (`ir/src/decompositions/transcendentals.rs`) for f16/f32/f64, other floats routed through f32; `Sqrt` → `xpow(x, 0.5)`; each only when the renderer lacks the op, all of them when `TRANSCENDENTAL=2`.
+- Device `decompositor()` (Metal: `amd_decomposition_patterns` — `Exp`, `Log`, `Cos`, `Tan`, binary `Pow` over native `exp2`/`log2`).
 
-Svod implementation: `magic_unsigned()` in `schedule/src/symbolic/fast_div.rs`.
+## Dtype emulation (`19c`)
 
-### Three-stage strategy
-
-Matching Tinygrad `decompositions.py:282-300` (`fast_idiv`):
-
-| Stage | Condition | Transform | Example |
-|-------|-----------|-----------|---------|
-| 1. Same-dtype | `M * vmax` fits in dtype range | `(x * M) >> S` | `x / 3` with `x` in i32 |
-| 2. Factor pow2 | `d = 2^k * d'` where `d' > 1` | `(x >> k) / d'` then magic on `d'` | `x / 6` becomes `(x >> 1) / 3` |
-| 3. Widen to i64 | Int32 overflow in `x * M` | cast to i64, multiply, shift, cast back | Fallback for large `M` |
-
-The factorization stage (2) is important: dividing by 12 (`= 4 * 3`) becomes a shift-right by 2 followed by magic division by 3, which often fits in the original dtype where direct magic division by 12 would overflow.
-
-For signed values, add correction: `((x * M) >> S) + (x < 0 ? 1 : 0)`. This accounts for truncation-toward-zero semantics -- without it, negative dividends round in the wrong direction.
-
-### Concrete example
-
-```
-x / 7 where x in [0, 255]:
-  magic_unsigned(255, 7) → M = 293, S = 11
-
-  Verify: (100 * 293) >> 11 = 29300 >> 11 = 14 = floor(100 / 7)
-  Verify: (  7 * 293) >> 11 =  2051 >> 11 =  1 = floor(  7 / 7)
-  Verify: (255 * 293) >> 11 = 74715 >> 11 = 36 = floor(255 / 7)
-
-  Generated: (x * 293) >> 11  instead of  x / 7
-  Cost: 1 imul + 1 shr (~4-5 cycles) vs 1 idiv (~20-40 cycles)
-```
-
-### Generated LLVM IR
-
-```llvm
-; Before: x / 7
-%result = sdiv i32 %x, 7
-
-; After: fast integer division (unsigned path)
-%mul = mul i32 %x, 293
-%result = lshr i32 %mul, 11
-```
-
----
-
-## 3. Float Division to Multiply
-
-`x / c` becomes `x * (1/c)` for float constant `c`.
-
-Float multiply is 1-2 cycles (fully pipelined), while float divide is 10-20 cycles (not pipelined on most hardware). This is a straightforward 5-10x speedup for a common pattern.
-
-**Guards**:
-- Skip if `c == 0.0` -- division by zero must remain to preserve IEEE 754 semantics (`x / 0.0` produces `+/-inf` or `NaN`)
-- Skip if `1/c` is not finite (overflow to `inf` means `c` is too small)
-- Only for float types
-
-Tinygrad: `decompositions.py:477-479` (FDIV-based backends emit `RECIP` as `1/x`). Svod: `pm_fdiv_to_mul` in `rangeify/patterns.rs`.
-
-```c
-// Before
-float result = x / 3.14159f;
-
-// After
-float result = x * 0.31831f;  // 1/pi
-```
-
----
-
-## 4. FMA Fusion (Fused Multiply-Add)
-
-`a * b + c` becomes `MULACC(a, b, c)`.
-
-This maps to hardware FMA instructions (`vfmadd` on x86 AVX, `fmadd` on ARM NEON, `fma.rn` on CUDA). A single instruction replaces two, with a single rounding step instead of two -- making FMA both faster and more precise than separate multiply + add.
-
-**Why applied late**: Earlier passes need to see `Add(Mul(a, b), c)` structure for algebraic simplification. If fused early, patterns like `(x*2 + x*3)` could not simplify to `x*5` because the `Mul` nodes would be buried inside MULACC.
-
-**Shift-add fusion**: `(x << n) + c` is also fused to `MULACC(x, 2^n, c)`, catching cases where MUL-to-SHL ran first in the same fixed-point pass. Svod's `pm_shl_add_to_mulacc` is added alongside `pm_fma_decomposition` whenever the renderer supports both `MulAcc` and `Shl`.
-
-**Guards**: Only matches when all three operands (`a`, `b`, `c`) share the same float dtype. Integer FMA is not fused because hardware FMA instructions are float-only.
-
-Tinygrad: `decompositions.py:472-475`. Svod: `pm_fma_decomposition` in `rangeify/patterns.rs`.
-
----
-
-## 5. Negation Extraction
-
-`x * -1` becomes `NEG(x)`.
-
-NEG is a single instruction (flip sign bit for float via `xorps`, negate for int via `neg`). Multiplication by -1 unnecessarily occupies the multiplier pipeline for 3-4 cycles.
-
-Only fires when the backend supports `NEG` as a native op. Tinygrad: `decompositions.py:458-459`. Svod: `pm_neg_from_mul`.
-
----
-
-## 6. Comparison Negations
-
-Late rewrites for negated and compound comparisons on integers. These patterns simplify instruction sequences that arise from boolean logic optimizations in earlier passes.
-
-| Pattern | Before | After | Savings |
-|---------|--------|-------|---------|
-| `!(x < c)` | NOT + CMP | `(c-1) < x` | Eliminate NOT |
-| `!(c < x)` | NOT + CMP | `x < (c+1)` | Eliminate NOT |
-| `(c1 < x) & (x < c2)` where `c2 == c1+2` | 2 CMPs + AND | `x == (c1+1)` | 2 ops eliminated |
-| `x * -1 < c` | MUL + CMP | `-c < x` | Eliminate MUL |
-| `x * -1 < y * c` | 2 MULs + CMP | `y * (-c) < x` | Eliminate 1 MUL |
-
-The range compression (row 3) is particularly valuable. When the open interval `(c1, c2)` contains exactly one integer value, two comparisons and a logical AND collapse to a single equality check. This arises naturally in tiled index calculations where a range variable selects exactly one tile.
-
-:::caution[Integer Overflow in Constants]
-The negation patterns guard against overflow: `!(x < c)` becomes `(c-1) < x` only if `c-1` does not underflow, and `!(c < x)` becomes `x < (c+1)` only if `c+1` does not overflow. Both use `checked_sub` / `checked_add` and return `None` (no transformation) on overflow.
-:::
-
-Tinygrad: `decompositions.py:461-470`. Svod: `pm_comparison_negations` in `rangeify/patterns.rs`.
-
----
-
-## 7. De Morgan's Laws (Late)
-
-```
-!a & !b  -->  !(a | b)
-!a | !b  -->  !(a & b)
-```
-
-These appear in *two* places in the pipeline:
-
-1. **Early** (Stage 4-5): `boolean_dsl_patterns()` in `schedule/src/symbolic/patterns.rs`, part of the full `symbolic()` matcher. Catches De Morgan opportunities in the original expression structure.
-
-2. **Late** (Stage 18-19): `symbolic_simple()` includes boolean patterns and runs alongside the strength reduction patterns in `PM_FINAL`. This catches new De Morgan opportunities created by comparison negation patterns -- for example, after `!(x < 3)` and `!(x < 7)` are rewritten to `2 < x` and `6 < x`, any AND/OR combining them may now have new NOT-elimination opportunities.
-
-Svod: `boolean_dsl_patterns()` in `schedule/src/symbolic/patterns.rs`.
-
----
-
-## 8. ERF Decomposition
-
-`erf(x)` is replaced with a polynomial approximation (Abramowitz & Stegun 7.1.26):
-
-```
-erf(x) = sign(x) * (1 - t * P(t) * exp(-x^2))
-where t = 1 / (1 + 0.3275911 * |x|)
-      P(t) = Horner(t, [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592])
-```
-
-**Why**: `@llvm.erf` is a libcall intrinsic (requires libm linkage), not a native hardware instruction. The LLVM JIT backend does not link libm, so `erf` must be decomposed before codegen. Tinygrad decomposes `erf` at the tensor level (`elementwise.py`), so it never reaches the renderer; Svod keeps `Erf` as a UOp until this late pass.
-
-Maximum error: ~1.5e-7 (sufficient for float32 ML workloads).
-
-Svod: `pm_erf_decomposition` in `rangeify/patterns.rs`.
-
----
-
-## Pattern Composition: When Each Pattern Runs
-
-All strength reduction patterns are composed into a single `PM_FINAL` matcher that runs as a fixed-point graph rewrite:
-
-```
-PM_FINAL = pm_commit_weak() + pm_cast_weak() + pm_decomp
-         + renderer.extra_matcher()   -- optional, per-backend
-         + pm_split_ends()
-```
-
-Where `pm_decomp` chains the early decompositions (which start from `symbolic_simple()`), the transcendental decompositions, and `get_late_rewrite_patterns()`:
-
-```
-Stage 18-19 (PM_FINAL fixed-point rewrite):
-  symbolic_simple()              -- algebraic cleanup (identities, constant folding)
-  + pm_erf_decomposition         -- erf(x) -> polynomial approx
-  + pm_mod_to_and                -- x % 2^n -> x & (2^n-1)
-  + pm_demorgan                  -- !a & !b -> !(a | b)
-  + pm_mul_to_shl                -- x * 2^n -> x << n
-  + pm_div_to_shr                -- x // 2^n -> x >> n
-  + fast_division_patterns       -- x // d -> (x * M) >> S
-  + pm_neg_from_mul              -- x * -1 -> NEG(x)
-  + pm_comparison_negations      -- !(x<c) -> (c-1)<x, etc.
-  + pm_fma_decomposition         -- a*b+c -> MULACC(a,b,c)
-  + pm_shl_add_to_mulacc         -- (x<<n)+c -> MULACC(x, 2^n, c)
-  + pm_fdiv_to_mul               -- x / c -> x * (1/c)
-```
-
-Because the rewriter runs to a fixed point, patterns can feed into each other. For example:
-
-1. `pm_mul_to_shl` converts `x * 4` to `x << 2`
-2. On the next iteration, `pm_fma_decomposition` fuses `(x << 2) + c` into `MULACC(x, 4, c)`
-3. `symbolic_simple()` cleans up any identities created by the transformations
-
-Every entry below `pm_mod_to_and` is conditional: `get_late_rewrite_patterns()` adds it only when the renderer declares support for the ops it produces (`Shl` for the shift rewrites, `MulAcc` for the FMA fusions, `Fdiv` for the reciprocal rewrite). `pm_split_ends` runs inside the same fixed point, splitting multi-range ENDs into nested single-range ENDs for the linearizer; a final `pm_remove_invalid()` rewrite then clears any leftover Invalid markers.
-
-Cross-reference: [Codegen Pipeline Overview](../codegen/overview.md) for the full stage listing.
+Between the early and late decompositions, `pm_dtype_decomp_commit` emulates dtypes the renderer does not support: `Int64`/`UInt64` as pairs of 32-bit words (`pm_long_decomp`, with carries from `Lt` and a 64-step shift-subtract divider for `CDiv`/`CMod`), and FP8/`Float16`/`BFloat16` as `Float16` or `Float32` compute over the original storage word (`pm_float_decomp`, bit-exact `f2f` conversions). The selection is made per graph by walking it once (`DTypeDecompCtx`); `get_dtype_decomps` exposes the same list for the compile cache key.

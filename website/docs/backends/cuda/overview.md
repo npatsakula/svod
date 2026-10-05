@@ -34,9 +34,12 @@ clang --print-targets | grep nvptx64     # the NVPTX backend
 
 A clang without NVPTX yields a clean `JitCompilation` error naming the fix
 (`-DLLVM_TARGETS_TO_BUILD='X86;AArch64;NVPTX'`). No CUDA toolkit is needed to
-run: a `ptxas` on the path is used to pre-assemble kernels when it happens to
-be there (`SVOD_CUDA_PTXAS=0` opts out) and `compute-sanitizer` is useful for
-[debugging](./debugging.md), but neither is required.
+run: a `ptxas` found on `PATH`, in `/opt/cuda/bin` or in `$CUDA_PATH/bin` is
+used to pre-assemble kernels when it happens to be there (`SVOD_CUDA_PTXAS=0`
+opts out; an unusable one logs a warning and the driver JIT takes over) and
+`compute-sanitizer` is useful for [debugging](./debugging.md), but neither is
+required. There is no compute-capability floor in the code: `CudaArch` is
+open-ended, and what runs is what the driver and clang's `-march` accept.
 
 ---
 
@@ -48,7 +51,9 @@ runtime: `svod_device::cuda::has_devices()` loads `libcuda.so.1`, resolves every
 bound entry point, calls `cuInit(0)` and `cuDeviceGetCount`, and memoizes the
 answer. The runtime's device registry registers the `"CUDA"` factory only when
 that is `true`; a host without the driver simply has no `CUDA` device type and
-the hardware tests self-skip.
+the hardware tests self-skip. A driver older than 12.0 ends up the same way —
+one of the `_v2` graph symbols is missing, so the load fails and the backend
+stays unregistered without a warning.
 
 This is the same contract as the [AMD backend](../amd/overview.md): the driver
 call sites type-check in every `cargo check`, so an API change in the generic
@@ -58,9 +63,9 @@ call sites type-check in every `cargo check`, so an API change in the generic
 
 ## Running on CUDA
 
-Select the GPU with `SVOD_DEVICE` (`CUDA:N`; `GPU` is an accepted alias,
-`CUDA` alone means device 0). `NV` is deliberately **not** accepted — the name
-stays reserved for a future userspace driver backend:
+Select the GPU with `SVOD_DEVICE` (`CUDA:N`, case-insensitive; `GPU` is an
+accepted alias, `CUDA` alone means device 0). `NV` is deliberately **not**
+accepted — the name stays reserved for a future userspace driver backend:
 
 ```bash
 SVOD_DEVICE=CUDA:0 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
@@ -77,9 +82,9 @@ open-ended `CudaArch { major, minor }` (`sm_86`, `sm_120`, ...). It selects
 
 | Capability | Tensor cores in the profile |
 |---|---|
-| below `sm_75` | none |
-| `sm_75` | f16 `m16n8k8` |
-| `sm_80`+ | f16 and bf16 `m16n8k16`, f16 `m16n8k8`, int8 `m16n8k32` accumulating into i32; bf16 storage. tf32 stays opt-in (`cuda_sm80(true)`) |
+| below `sm_75` | none (Volta's `mma.sync` is not used); no bf16 storage dtype either |
+| `sm_75` | f16 `m16n8k8` into f32 or f16 |
+| `sm_80`+ | f16 and bf16 `m16n8k16`, f16 `m16n8k8`, int8 `m16n8k32` accumulating into i32; bf16 storage. The tf32 row exists in the renderer but `for_cuda_arch` never enables it and there is no switch |
 | `sm_89`+ | the sm_80 set unchanged: the fp8 `m16n8k32` cores exist (`sm89_tensor_cores`) but `for_cuda_arch` withholds them while the renderer cannot lower fp8 casts (see [Limitations](./limitations.md)) |
 
 ---

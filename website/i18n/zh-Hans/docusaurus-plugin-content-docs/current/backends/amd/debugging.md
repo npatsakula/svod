@@ -47,8 +47,8 @@ GPU VA 范围映射回其所属的分配。它是纯记账——没有 GPU
 | 标签 | 涵盖 |
 |---|---|
 | `Vram` | 通用设备 VRAM——张量数据、code object、EOP/ctx-save |
-| `Gtt` | GTT 固定的宿主可见控制内存 |
-| `Kernarg` | kernarg arena——每调度、图以及已链接 plan 的参数页 |
+| `Gtt` | 宿主可见的控制内存——GTT，以及图 / 已链接 plan 的 IB 与控制缓冲区 |
+| `Kernarg` | kernarg arena（宿主可见的 VRAM）——每调度、图以及已链接 plan 的参数页 |
 | `SignalPool` | GTT 信号槽池 |
 | `QueueRing` / `QueueGart` / `QueueInactive` | 一个队列的环、GART 页与 queue-inactive 信号 |
 | `Staging` | GTT 上的 SDMA 反弹缓冲区 |
@@ -56,7 +56,8 @@ GPU VA 范围映射回其所属的分配。它是纯记账——没有 GPU
 
 真正要紧的区别是 **scratch 与其他一切**：scratch 是
 唯一一个共享、仅 GPU、被动态重分配并释放的区域，也是历史上的
-`NotPresent` 元凶。
+`NotPresent` 元凶。每进程的 KFD 事件页在 `alloc_raw` 之外分配，
+不被追踪：发生在那里的故障会被归类为未映射。
 
 ### 分类
 
@@ -94,8 +95,8 @@ Unmapped: va is in NO tracked allocation; nearest live below: VRAM buffer
 复制进局部变量，VA 被分类，并构建出一条丰富化的消息：
 
 ```text
-AMD GPU memory fault on gpu_id=… va=0x… (NotPresent=1 ReadOnly=0 NoExecute=0
-Imprecise=0 ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
+AMD GPU memory fault on gpu_id=… va=0x… (NotPresent=true ReadOnly=false NoExecute=false
+Imprecise=false ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
 ```
 
 它通过一个 `fault_logged: AtomicBool` 闩锁和一个
@@ -103,7 +104,9 @@ Imprecise=0 ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
 自动重置，因此后续的 poll-fault 调用（`wait_events(0)`）会重新观测到同一个
 故障——每次都记录会刷屏。它随后作为一个有类型的
 `Error::GpuFault` 返回，其 `Display` 就是上面那个字符串；poison 闩锁
-则会在此后的每一个入口点把同样的文本重抛为 `Error::Runtime`。
+则会记录该文本，并在此后的每一个入口点把它重抛为 `Error::Runtime`（带有
+`runtime error: ` 前缀）。一次未遇故障而超时的等待则是另一个不同的错误
+`Error::TimelineTimeout`。
 （一个硬件异常事件，槽 `[2]`，改为报告
 `reset_type`/`reset_cause`/`memory_lost`——这些没有可分类的故障 VA。）
 
@@ -119,10 +122,11 @@ Imprecise=0 ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
 - `poison(msg)` 把消息记录一次并置位标志；
 - `is_poisoned()` 是热路径上的门；
 - `poison_error()` 在被毒化时返回已记录的 `Error::Runtime`；
-- `poll_faults_nonblocking()` 从一次停滞的信号等待中发出
-  `wait_events(0)`，这样附到那个 30 秒超时上的就是真实错误，而不是
-  一个光秃秃的截止时间。（自旋升级路径同样会在故障时提前跳出，
-  但走的是一次短暂的*阻塞式* `wait_events`，而非这个 poll。）
+- `poll_faults_nonblocking()` 在一次信号等待到达其截止时间时（调度、复制与
+  通道获取均为 30 秒）发出 `wait_events(0)`，这样附到超时上的就是真实错误，
+  而不是一个光秃秃的截止时间。（自旋升级路径同样会在故障时提前跳出，
+  但走的是一次短暂的*阻塞式* `wait_events`，而非这个 poll。）`poison()` 还会
+  唤醒每一个停驻在通道池上的线程。
 
 一旦被毒化，对该设备上任何通道的每一次 `synchronize`/`execute`
 都会快速失败——GPU 状态和缓存的映射不再可信。

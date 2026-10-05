@@ -33,9 +33,11 @@ clang --print-targets | grep nvptx64     # the NVPTX backend
 
 一个不带 NVPTX 的 clang 会给出一个干净的 `JitCompilation` 错误，其中点名了
 修复方式（`-DLLVM_TARGETS_TO_BUILD='X86;AArch64;NVPTX'`）。运行时不需要 CUDA
-toolkit：路径上碰巧有 `ptxas` 时会拿它来预汇编内核（`SVOD_CUDA_PTXAS=0` 可以
-不用它），而 `compute-sanitizer` 对[调试](./debugging.md)很有用，但两者都不是
-必需的。
+toolkit：在 `PATH`、`/opt/cuda/bin` 或 `$CUDA_PATH/bin` 中碰巧找到 `ptxas` 时
+会拿它来预汇编内核（`SVOD_CUDA_PTXAS=0` 可以不用它；一个不可用的 `ptxas`
+会记录一条警告，并改由驱动 JIT 接手），而 `compute-sanitizer` 对[调试](./debugging.md)
+很有用，但两者都不是必需的。代码中没有计算能力的下限：`CudaArch` 是开放式的，
+能运行什么取决于驱动和 clang 的 `-march` 接受什么。
 
 ---
 
@@ -46,7 +48,9 @@ toolkit：路径上碰巧有 `ptxas` 时会拿它来预汇编内核（`SVOD_CUDA
 `svod_device::cuda::has_devices()` 加载 `libcuda.so.1`，解析每一个被绑定的
 入口点，调用 `cuInit(0)` 与 `cuDeviceGetCount`，并把答案记忆下来。运行时的
 设备注册表仅在其为 `true` 时才注册 `"CUDA"` 工厂；一台没有该驱动的宿主
-干脆就没有 `CUDA` 设备类型，而硬件测试会自行跳过。
+干脆就没有 `CUDA` 设备类型，而硬件测试会自行跳过。版本低于 12.0 的驱动
+也落得同样结果——缺少某个 `_v2` graph 符号，于是加载失败，后端在没有任何
+警告的情况下保持未注册。
 
 这与 [AMD 后端](../amd/overview.md) 是同一套约定：驱动调用点在每一次
 `cargo check` 中都会通过类型检查，因此通用的 `Program` / `PlanContext` /
@@ -56,7 +60,7 @@ toolkit：路径上碰巧有 `ptxas` 时会拿它来预汇编内核（`SVOD_CUDA
 
 ## 在 CUDA 上运行
 
-用 `SVOD_DEVICE` 选择 GPU（`CUDA:N`；`GPU` 是被接受的别名，单独的 `CUDA`
+用 `SVOD_DEVICE` 选择 GPU（`CUDA:N`，不区分大小写；`GPU` 是被接受的别名，单独的 `CUDA`
 表示设备 0）。`NV` 被刻意**不**接受——这个名字留给未来的用户态驱动后端：
 
 ```bash
@@ -74,9 +78,9 @@ SVOD_DEVICE=CUDA:0 cargo run --release -p svod-model --example gigaam_infer -- .
 
 | 计算能力 | profile 中的 tensor core |
 |---|---|
-| 低于 `sm_75` | 无 |
-| `sm_75` | f16 `m16n8k8` |
-| `sm_80`+ | f16 与 bf16 `m16n8k16`、f16 `m16n8k8`、累加到 i32 的 int8 `m16n8k32`；bf16 存储。tf32 保持为选择启用（`cuda_sm80(true)`） |
+| 低于 `sm_75` | 无（不使用 Volta 的 `mma.sync`）；也没有 bf16 存储 dtype |
+| `sm_75` | f16 `m16n8k8`，累加到 f32 或 f16 |
+| `sm_80`+ | f16 与 bf16 `m16n8k16`、f16 `m16n8k8`、累加到 i32 的 int8 `m16n8k32`；bf16 存储。渲染器中存在 tf32 那一行，但 `for_cuda_arch` 从不启用它，也没有开关 |
 | `sm_89`+ | 原封不动的 sm_80 那一组：fp8 `m16n8k32` 的核心是存在的（`sm89_tensor_cores`），但只要渲染器还降不了 fp8 的 cast，`for_cuda_arch` 就扣着不给（见[限制](./limitations.md)） |
 
 ---

@@ -44,7 +44,7 @@ let ta = Tensor::from_slice(&a);
 let tb = Tensor::from_slice(&b);
 let mut out = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
 
-// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA and CUDA.
+// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA, CUDA and Metal.
 let arch = svod_tk::target::resolve_arch(&ta.device()).expect("a GPU device");
 let w = svod_tk::ArchCaps::for_arch(arch).wave_size as i64;
 
@@ -94,8 +94,8 @@ run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| { /* bo
 The `[1, 1, 1]` grid and `w` block are the launch geometry. We use **one workgroup of one wave**:
 the whole `16×16` tile fits in a single wave's registers, so there is nothing to spread across
 blocks. The block size is `w`, the **wave width** — which we queried from the device up front
-(`ArchCaps::for_arch(resolve_arch(&ta.device())).wave_size`), because a wave is 64 lanes on CDNA but 32 on RDNA and
-on NVIDIA, and the block dimension *is* that lane count. The output slice comes first, the inputs second — and
+(`ArchCaps::for_arch(resolve_arch(&ta.device())).wave_size`), because a wave is 64 lanes on CDNA but 32 on RDNA,
+on NVIDIA and on Apple, and the block dimension *is* that lane count. The output slice comes first, the inputs second — and
 **that order is the contract** the next step depends on.
 
 ### 2. Get a wave to work with
@@ -132,13 +132,16 @@ output tensor carries its shape, for allocation.)
 let frag = ker.frag(FragRole::Accumulator);
 ```
 
-This is the portability move from [Wave32 vs Wave64](./wave-portability), and it matters even in a
-kernel with no matrix multiply: the same logical `16×16` f32 tile has a *different physical lane
+This is the portability move from [Layouts and Wave Sizes](./wave-portability), and it matters even
+in a kernel with no matrix multiply: the same logical `16×16` f32 tile has a *different physical lane
 layout* on each supported architecture, so naming a **role** instead of a hardcoded fragment lets one
 body compile for all of them. We ask the kernel for the `Accumulator` role — simply the role for a
 full-precision result tile, which is what an add produces too, not only an MMA — and `Kernel::frag`
-forwards to `ArchCaps::frag` to resolve the physical fragment for the target: wave64 on CDNA, the
-even/odd wave32 layout on RDNA, the two-half `mma.sync` layout on CUDA.
+forwards to `ArchCaps::frag` to resolve the physical fragment for the target: the wave64 stride map
+on CDNA, the even/odd wave32 layout on RDNA3, a strided 8-per-lane map on RDNA4, the two-half
+`mma.sync` layout on CUDA, a 2×2 grid of 8×8 fragments on Apple. (`ker.acc((16, 16), TileLayout::Row)`
+is the one-call shortcut for `ker.rt(.., DType::Float32, .., ker.frag(FragRole::Accumulator))`; the
+library kernels use it.)
 
 ### 5. Load: global → register
 
@@ -206,8 +209,8 @@ wrong answer:
 |------|-----|
 | **Tile dims are a multiple of `16`** | A tile is a whole number of `16×16` matrix-core fragments; `ker.rt` asserts it. |
 | **`gl()` order = launch buffer order** | Outputs first, then inputs. The bind is positional; a mismatch silently swaps buffers — wrong numbers, no error, so the compiler can't catch it. |
-| **Request fragments by role, not by constant** | `ker.frag(role)` is what makes one body run on wave32, on wave64, *and* on NVIDIA's warp32. |
-| **It's a GPU kernel** | The builder mints real lane indices (`Op::Special`), so execution targets a GPU — AMD or CUDA — not the CPU. |
+| **Request fragments by role, not by constant** | `ker.frag(role)` is what makes one body run on wave32, on wave64, on NVIDIA's warp32 *and* on Apple's SIMD group. |
+| **It's a GPU kernel** | The builder mints real lane indices (`Op::Special`), so execution targets a GPU — AMD, CUDA or Metal — not the CPU. |
 
 ---
 
@@ -222,26 +225,28 @@ kernel the IR can express.
 Because the kernel emits `Special` ops, it *is* a fully hand-lowered GPU kernel — the optimizer and
 the workgroup-dimension passes treat a `Special`-bearing graph as already-lowered and pass it
 through (the same gate `opts_to_apply: Some(vec![])` enforces). That is also why it renders only on
-a GPU backend — AMD or NVPTX: the lane index has no meaning on the scalar CPU
-path. *Building* the `SINK`,
-though, is pure UOp construction — that needs no GPU; only executing it does. That split is what
-lets a kernel be guarded by a host-side shape check on every build, with a separate gated test for
-the on-device numbers.
+a GPU backend — AMD, NVPTX or Metal: the lane index has no meaning on the scalar CPU path.
+*Building* the `SINK`, though, is pure UOp construction — that needs no GPU; only executing it does.
+That split is what lets a kernel be guarded by a host-side shape check on every build, with a
+separate gated test for the on-device numbers: `tk/src/test/unit/guide.rs` holds this exact body,
+checks its graph shape on every `cargo test`, and runs it on hardware under `--ignored`
+([Debugging](./debugging)).
 :::
 
 ---
 
 ## Why this matters
 
-This tiny kernel is the template every tk kernel is poured into. The matmul kernel adds an `mma`
-and a K-loop, and the worked [Flash Attention](./flash-attention) example puts the matrix core to
-work alongside an online-softmax recurrence, double-buffered streaming, and a wave-size branch. But
-the bones are exactly what you just wrote: declare globals in launch order, request tiles by role,
-move data between memory spaces, compute on tiles, `finish`. Learn this skeleton and the harder
-kernels add to it rather than replace it.
+This tiny kernel is the template every tk kernel is poured into. The GEMM adds an `mma`, a
+shared-memory strip and a K-loop, and the worked [Flash Attention](./flash-attention) example puts
+the matrix core to work alongside an online-softmax recurrence, double-buffered streaming, and a
+layout branch. But the bones are exactly what you just wrote: declare globals in launch order,
+request tiles by role, move data between memory spaces, compute on tiles, `finish`. Learn this
+skeleton and the harder kernels add to it rather than replace it.
 
 And all of it is the one UOp IR. The `SINK` you built is the same kind of object the compiler
 produces for an autotuned kernel — which is the whole point of the section.
 
-Next, the wrinkle that makes hand-authoring genuinely hard — keeping a kernel correct across wave
-sizes and fragment layouts: [Wave32 vs Wave64](./wave-portability).
+Next, the rest of the vocabulary — [The Builder API](./builder-reference) — and then the wrinkle
+that makes hand-authoring genuinely hard, keeping a kernel correct across wave sizes and fragment
+layouts: [Layouts and Wave Sizes](./wave-portability).

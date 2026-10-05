@@ -25,6 +25,7 @@ plans.
 | GigaAM v3 (CTC + RN-T) | Speech | `gigaam` | [salute-developers/GigaAM](https://github.com/salute-developers/GigaAM) | [`vpermilp/GigaAM-v3`](https://huggingface.co/vpermilp/GigaAM-v3) |
 | FireRedVAD (batch + streaming) | Voice activity | `firered_vad` | [FireRedTeam/FireRedVAD](https://github.com/FireRedTeam/FireRedVAD) | [`vpermilp/firered_vad`](https://huggingface.co/vpermilp/firered_vad) |
 | Silero VAD 16k | Voice activity | `silero_vad` | [snakers4/silero-vad](https://github.com/snakers4/silero-vad) | [`vpermilp/silero-vad`](https://huggingface.co/vpermilp/silero-vad) |
+| GTCRN (offline / streaming) | Speech enhancement | `gtcrn` | [Xiaobin-Rong/gtcrn](https://github.com/Xiaobin-Rong/gtcrn) | [`vpermilp/gtcrn`](https://huggingface.co/vpermilp/gtcrn) |
 | DiariZen segmentation (WavLM + Conformer) | Speaker diarization | `diarizen` | [BUT-FIT/DiariZen](https://github.com/BUTSpeechFIT/DiariZen) | [`BUT-FIT/diarizen-wavlm-large-s80-md-v2`](https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2) |
 | ModernBERT (base / large) | Text embeddings, fill-mask (MLM) | `modernbert` | [Answer.AI ModernBERT](https://github.com/AnswerDotAI/ModernBERT) | [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) |
 | BGE-M3 (dense / sparse / ColBERT) | Text embeddings, retrieval | `bgem3` | [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (XLM-RoBERTa-large) | [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) |
@@ -49,4 +50,6 @@ cargo run -p svod-model --release --example yolo_detect -- --hub
 cargo run -p svod-model --release --example yolo_detect -- --hub --scale small --image photo.bin --side 640
 cargo run -p svod-model --release --example whisper_infer -- audio.wav [--size tiny|base|small] [--profile]
 cargo run -p svod-model --release --example whisper_infer -- audio.wav --language auto --timestamps
+cargo run -p svod-model --release --example gtcrn_enhance -- --hub --in noisy.wav --out enhanced.wav
+cargo run -p svod-model --release --example qwen3_embed -- --texts texts.txt
 ```

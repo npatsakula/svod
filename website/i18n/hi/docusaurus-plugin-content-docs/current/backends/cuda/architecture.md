@@ -54,16 +54,18 @@ assertions के साथ mirror करता है।
 `CudaDevice::open(id)` प्रति process cached है। यह `cuInit` चलाता है, device के
 **primary context** को retain करता है (`cuDevicePrimaryCtxRetain`), उन `CudaLimits` को
 पढ़ता है जिनकी उसे ज़रूरत है (`cuDeviceGetAttribute`: SM count, प्रति block और प्रति SM
-threads, प्रति block shared memory, warp size, और यह कि managed memory coherently
-accessible है या नहीं), दो
-non-blocking streams बनाता है (allocator के लिए एक **copy stream** और per-call
-`Program::execute` के लिए एक **dispatch stream**), और एक **base event** record करता है जो
-हर GPU-clock timestamp का शून्य है।
+threads, प्रति SM blocks, प्रति block shared memory, warp size, और यह कि managed memory
+supported और concurrently accessible दोनों है या नहीं), दो non-blocking streams बनाता है
+(allocator के लिए एक **copy stream** और per-call `Program::execute` के लिए एक **dispatch
+stream**), और legacy default stream पर एक **base event** record करता है — device return
+होने से पहले उसकी प्रतीक्षा की जाती है — जो हर GPU-clock timestamp का शून्य है।
 
 Driver current context को प्रति thread रखता है, इसलिए बैकएंड का हर entry point `enter()`
 से शुरू होता है: यदि device poisoned है तो मना कर दो, फिर `cuCtxSetCurrent`। एक **sticky**
-`CUresult` (`ILLEGAL_ADDRESS`, `LAUNCH_FAILED`, `ILLEGAL_INSTRUCTION`, `ECC_UNCORRECTABLE`,
-... वे codes जिन्हें driver context के लिए घातक बताता है) poison flag को अपने message के
+`CUresult` (`ILLEGAL_ADDRESS`, `LAUNCH_FAILED`, `ILLEGAL_INSTRUCTION`, `MISALIGNED_ADDRESS`,
+`ECC_UNCORRECTABLE`, `LAUNCH_TIMEOUT`, `ASSERT`, `HARDWARE_STACK_ERROR`,
+`INVALID_ADDRESS_SPACE`, `INVALID_PC`, `DEINITIALIZED`, और सावधानीवश `UNKNOWN` — `sys.rs`)
+poison flag को अपने message के
 साथ latch कर देता है; device पर हर बाद की call उसी message के साथ fail-fast होती है, जैसा
 AMD पर होता है।
 
@@ -77,7 +79,7 @@ kind रखता है, जिसे `BufferSpec` से चुना जा�
 | `BufferSpec` | Kind | Driver call |
 |---|---|---|
 | default | `Device` | `cuMemAlloc` — device memory, कोई host mapping नहीं |
-| `cpu_access` | `Managed` यदि device concurrent managed access report करता हो, अन्यथा `Pinned` (WDDM, pre-Pascal) | `cuMemAllocManaged`, एक ही address दोनों ओर valid |
+| `cpu_access` | `Managed` यदि device concurrent managed access report करता हो, अन्यथा `Pinned` | `cuMemAllocManaged(ATTACH_GLOBAL)`, एक ही address दोनों ओर valid; अन्यथा `cuMemHostAlloc(PORTABLE \| DEVICEMAP)` + `cuMemHostGetDevicePointer` |
 | `host` | `Pinned` | `cuMemHostAlloc(PORTABLE \| DEVICEMAP)`, kernels इसे bus के ऊपर से पढ़ते हैं |
 
 `supports_device_local()` `true` है, इसलिए intermediates device पर ही रहते हैं।
@@ -93,8 +95,9 @@ driver एक pageable source को return करने से पहले sta
 करते हुए। Pinned buffers सीधे `memcpy` कर दिए जाते हैं। Device-to-device `_transfer` और
 zero-fills copy lane पर asynchronous हैं: `cuStreamWaitEvent` से producers के बाद ordered,
 दोनों ranges के नए producer के रूप में publish, और किसी भी lane पर हर बाद के launch द्वारा
-प्रतीक्षित, इसलिए वे host को कभी block नहीं करतीं; एक allocation के अंदर overlapping range
-`memmove` semantics बनाए रखने के लिए एक temporary से होकर गुज़रती है। Free करना पहले
+प्रतीक्षित, इसलिए वे host को block नहीं करतीं — सिवाय एक allocation के अंदर overlapping range
+के, जो `memmove` semantics बनाए रखने के लिए एक temporary से होकर गुज़रती है और उस temporary
+के free होने पर प्रतीक्षा करती है। Free करना पहले
 storage के producers की प्रतीक्षा करता है; यदि यह प्रतीक्षा fail होती है (poisoned context)
 तो allocation को एक in-flight kernel के नीचे free करने के बजाय **quarantine** (leak) कर
 दिया जाता है। हर compute allocator की तरह यह `LruAllocator` के नीचे बैठता है, जो एक
@@ -144,9 +147,9 @@ Lanes आपस में एक-दूसरे के विरुद्ध or
 (`device/src/cuda/device.rs` के module docs):
 
 - **producers** — storage base -> प्रति lane वह नवीनतम completion token जिसने उसे पढ़ा या
-  लिखा (एक host overwrite in-flight readers के विरुद्ध भी एक WAR hazard है)। Executor हर
-  execute के बाद plan के या graph के token को उन सभी storages पर publish करता है जिन्हें
-  plan छूता है; allocator हर transfer या memset के बाद एक copy-lane token publish करता है।
+  लिखा (एक host overwrite in-flight readers के विरुद्ध भी एक WAR hazard है)। Execution plan हर
+  execute के बाद अपना या अपने graph का token उन सभी storages पर publish करता है जिन्हें वह
+  छूता है; allocator हर transfer या memset के बाद एक copy-lane token publish करता है।
   `wait_storage(base)` नीचे बताई गई lanes को drain करता है, फिर उन tokens की प्रतीक्षा
   करता है, फिर उन्हें table से हटा देता है। जिस storage को table नहीं जानता — इसमें वह भी
   शामिल है जिसका नवीनतम token किसी दूसरे backend का हो — वह `cuCtxSynchronize` पर वापस
@@ -179,7 +182,9 @@ work के विरुद्ध `cuStreamWaitEvent` से order करती 
 अनावश्यक बना देता है)। हर node के params उसी `extra` protocol के माध्यम से उस kernel के
 kernarg blob की ओर इशारा करते हैं जो eager launches में है; graph को
 `cuGraphInstantiateWithFlags` से instantiate किया जाता है। Capture एक ख़ाली chain, एक
-non-CUDA program, या किसी दूसरे device के program के लिए मना कर देता है (`Ok(None)`)।
+non-CUDA program, या किसी दूसरे device के program के लिए मना कर देता है (`Ok(None)`), और एक
+poisoned device या किसी बाद वाले kernel पर dependency होने पर fail (`Err`) होता है; plan
+दोनों को per-call dispatch मानता है।
 
 `replay(buffers, vals)` केवल उन kernels को फिर से pack करता है जिनका `(buffers, vals)`
 slice बदला है और उन nodes को `cuGraphExecKernelNodeSetParams_v2` से update करता है, फिर
@@ -202,6 +207,7 @@ Compiled PTX साझा on-disk object cache से होकर जाता 
 `CompilerIdentity` है:
 
 ```text
+schema:              OBJECT_CACHE_SCHEMA
 backend:             nvptx-clang
 target_architecture: nvptx64-nvidia-cuda/sm_86
 toolchain:           <clang identity>[;ptxas:path=...;version=...]
@@ -219,8 +225,9 @@ object_format:       ptx-text-v1 | cubin-v1
 जाँच compile time पर उन्हीं के विरुद्ध होती है। हर cache hit को driver तक पहुँचने से पहले
 उसके format के validator द्वारा फिर से validate किया जाता है — `validate_cubin` या
 `validate_ptx`, देखें [Codegen](./codegen.md)।
-`SVOD_OBJECT_CACHE=0` cache को disable करता है और `SVOD_OBJECT_CACHE_DIR` उसे स्थानांतरित
-करता है।
+`SVOD_OBJECT_CACHE=0` cache को disable करता है, `SVOD_OBJECT_CACHE_DIR` उसे स्थानांतरित
+करता है और `SVOD_OBJECT_CACHE_MAX_BYTES` उसका budget तय करता है (देखें
+[CPU पेज](../cpu.md))।
 
 Device factory (`create_cuda_device`) ऐसे device को भी मना कर देता है जिसकी per-block
 shared memory limit optimizer profile की static `shared_max` से कम हो, क्योंकि profile के

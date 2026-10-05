@@ -1,52 +1,52 @@
 # svod-runtime
 
-Kernel execution interface bridging codegen to hardware.
+The execution layer of the Svod ML compiler. It builds a `Device` per
+`DeviceSpec` (renderer, compiler, program loader, allocator), compiles rendered
+kernels, loads them, and runs prepared kernels and copies in dependency order
+through `ExecutionPlan`. It also owns the on-disk object cache, BEAM
+benchmarking and the kernel profiler. Most users reach it through `svod-tensor`.
 
 ## Example
 
 ```rust
-use svod_runtime::CompiledKernel;
+use svod_dtype::DeviceSpec;
+use svod_runtime::DEVICE_FACTORIES;
 
-let kernel = compile(code)?;
-kernel.execute(&[buf_a.ptr(), buf_b.ptr(), buf_out.ptr()])?;
+// One `Device` per spec, created on first request and cached.
+let cpu = DEVICE_FACTORIES.device(&DeviceSpec::Cpu, svod_device::registry::registry())?;
+assert_eq!(cpu.device.canonicalize(), "CPU");
 ```
 
 ## Backends
 
-| Backend | How it works | Feature |
-|---------|-------------|---------|
-| **LLVM** (default) | Compiles LLVM IR in-process through `libLLVM` (falls back to `clang -x ir`), loads via JIT ELF loader | always |
-| **Clang** | Compiles C via `clang -c`, loads via JIT ELF loader | always |
-
-Select at runtime: `SVOD_CPU_BACKEND=clang|llvm` (any other value warns and keeps the LLVM default).
-
-libLLVM is taken from `SVOD_LLVM_LIB` when set, else searched in `llvm-config --libdir`, then on the
-loader's default path (dev symlink and runtime SONAMEs such as `libLLVM.so.18.1`, `libLLVM-18.so.1`),
-then Homebrew kegs; `SVOD_LLVM_INPROCESS=0` forces the `clang` subprocess.
-
-CPU kernels are split `core_id` ways and run on rayon's global pool. `SVOD_THREADS`
-(default: host parallelism) is the single budget for that pool, for the parallel
-kernel preparation in `svod-tensor`, and for the default kernel split;
-`RAYON_NUM_THREADS` is not consulted. Compiled objects are cached on disk
-(`SVOD_OBJECT_CACHE=0` disables, `SVOD_OBJECT_CACHE_DIR` relocates); entries are
-published atomically and never locked — concurrent compilers of one key both
-publish identical bytes, last rename wins.
-
-## GPU backends
-
-Always compiled, registered only when the hardware is present:
-
 | Device | Compile | Dispatch |
 |--------|---------|----------|
-| `AMD:N` | `clang --target=amdgcn-amd-amdhsa` → ELF code object | KFD-direct PM4/AQL rings (`svod_device::amd`) |
-| `CUDA:N` | `clang --target=nvptx64-nvidia-cuda` → PTX, assembled by `ptxas` when installed (`SVOD_CUDA_PTXAS=0` opts out), else JIT'd by `libcuda.so.1` | streams and CUDA graphs (`svod_device::cuda`) |
-| `METAL:N` | MSL → `metallib` through `MTLCodeGenService` | `MTLCommandQueue` (`svod_device::metal`) |
+| `CPU` | LLVM IR through in-process libLLVM (default), else `clang -x ir`; `SVOD_CPU_BACKEND=clang` renders C for `clang -c` | in-memory ELF loader, libffi call; `core_id`-split kernels run on rayon |
+| `AMD:N` | `clang --target=amdgcn-amd-amdhsa` → ELF code object | KFD queues |
+| `CUDA:N` | `clang --target=nvptx64-nvidia-cuda` → PTX, `ptxas` when installed, else driver JIT | runtime-loaded `libcuda.so.1`, streams and CUDA graphs |
+| `METAL:N` | MSL → metallib through `MTLCodeGenService` | `MTLCommandQueue` |
 
-Select with `SVOD_DEVICE=AMD:0`, `CUDA:0`, or `METAL:0`. `SVOD_DUMP_AMD_IR` /
-`SVOD_DUMP_NVPTX_IR` name a directory that receives each kernel's LLVM IR.
+The CPU factory is always registered; the GPU factories are registered only
+when the hardware is present. `SVOD_DEVICE` selects the default device;
+without it the default is `METAL:0` on macOS and `CPU` elsewhere.
 
-## Testing
+## Environment variables
 
-```bash
-cargo test -p svod-runtime
-```
+| Variable | Effect |
+|----------|--------|
+| `SVOD_CPU_BACKEND` | `llvm` (default) or `clang` |
+| `SVOD_LLVM_LIB` | path of the libLLVM to bind; otherwise `llvm-config --libdir`, the loader path, then Homebrew kegs |
+| `SVOD_LLVM_INPROCESS=0` | always compile LLVM IR with the `clang` subprocess |
+| `SVOD_THREADS` | thread budget and default CPU kernel split (default: host parallelism) |
+| `SVOD_OBJECT_CACHE=0` / `SVOD_OBJECT_CACHE_DIR` | disable / relocate the on-disk object cache |
+| `SVOD_CUDA_PTXAS=0` | hand PTX to the driver JIT even when `ptxas` is installed |
+| `SVOD_DUMP_AMD_IR` / `SVOD_DUMP_NVPTX_IR` | directory that receives each kernel's LLVM IR |
+
+The `dlopen-fallback` feature loads C-path kernels as shared libraries through
+`dlopen` instead of the in-memory ELF loader.
+
+Documentation:
+
+- CPU backend: <https://svod.vpermilp.online/docs/backends/cpu>
+- Backends: <https://svod.vpermilp.online/docs/backends/overview>
+- JIT loader: <https://svod.vpermilp.online/docs/backends/jit-loader>

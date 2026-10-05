@@ -100,20 +100,24 @@ recover real performance for free.
 
 ## The arch angle: MFMA vs WMMA vs `mma.sync`, wave32 vs wave64
 
-Three hardware facts shape every tile kernel `tk` builds, and they're worth holding onto:
+A few hardware facts shape every tile kernel `tk` builds, and they're worth holding onto:
 
-- **CDNA** (datacenter, e.g. gfx942) issues matrix multiplies via **MFMA** instructions and
+- **CDNA** (datacenter, gfx942) issues matrix multiplies via **MFMA** instructions and
   runs **wave64** — 64 lanes per wavefront.
-- **RDNA** (e.g. gfx1151, RDNA3.5, wave32) issues **WMMA** instructions and
-  runs **wave32** — 32 lanes.
+- **RDNA** (gfx1151 on RDNA3.5, gfx1200/gfx1201 on RDNA4) issues **WMMA** instructions and
+  runs **wave32** — 32 lanes. RDNA3 and RDNA4 do not even agree with each other: gfx11
+  replicates operands across the two wave halves and interleaves the accumulator's rows,
+  gfx12 drops both.
 - **NVIDIA** (`sm_80+`) issues **`mma.sync`** and runs a **warp32** — 32 lanes, but a fragment
   layout of its own again: a 16×16 tile held as two `m16n8` halves.
+- **Apple** (Apple7+) runs `simdgroup_matrix` over a 32-lane SIMD group on an 8×8 fragment,
+  a quarter of everyone else's.
 
 The lane count changes how a tile's elements are distributed across the wave, which changes the
 register layout, which changes the reductions — and even at the same width the fragment layout
 differs. A kernel written for one and run on another — without accounting for this — is silently
-wrong. Keeping a single kernel correct on all three is its own chapter:
-[Wave32 vs Wave64](./wave-portability).
+wrong. Keeping a single kernel correct on all of them is its own chapter:
+[Layouts and Wave Sizes](./wave-portability).
 
 :::tip[For GPU experts]
 HipKittens' `analysis/paper_experiments/` micro-benchmarks quantify the gaps above. They justify
@@ -126,18 +130,22 @@ the design:
 | gap 5 (chiplet swizzle) | Remapping workgroup IDs for XCD locality yields a measurable large-GEMM speedup. |
 
 `tk` implements these levers directly: the XOR swizzles live in `tk/src/swizzle.rs` (ported from
-HipKittens' shared-tile layouts), the L2/chiplet remap in `tk/src/grid.rs` (`l2_swizzle`), and
-the compute/memory overlap is expressed as a `sched::pipeline(SchedKind::Attention, …)` marker
-on the Flash Attention KV loop that a post-linearization scheduling pass consumes.
+HipKittens' shared-tile layouts, plus the 16-byte-chunk `Sw16x16Mma` that `ldmatrix`, `cp.async`
+and the gfx12 gather need), the L2/chiplet remap in `tk/src/grid.rs` (`l2_swizzle`, on in the CUDA
+GEMM tiles, the widest RDNA4 tile and the gfx942 matmul config), and the compute/memory overlap is expressed as a
+`sched::pipeline(SchedKind::Attention, …)` marker on the Flash Attention KV loop that a
+post-linearization pass in `codegen/src/llvm/sched.rs` consumes. Today that pass lowers both
+`SchedKind`s to `@llvm.amdgcn.iglp.opt(0)` on CDNA — delegating the MFMA/memory interleave to
+the AMDGPU machine scheduler — and is a no-op elsewhere; the measured result on gfx942 was that
+hand-placed `sched.barrier` fences *regress* a dataflow-scheduled GEMM to 0.6–0.9× of iglp alone,
+because they pin the very load/MFMA overlap the double buffer exists to create.
 
-When that high-level marker isn't enough, the AUTHOR face also exposes the raw machine-scheduler
-intrinsics directly (as `Op::Custom`) for squeezing the last few percent out of gap 4:
-
-- control wave issue priority around MFMA bursts,
-- defer LDS waits for register-staged prefetch,
-- pin a cluster's loads, MFMAs, and stores against the machine scheduler.
-
-`sched::pipeline` is the default; these are the manual override for placing the schedule by hand.
+Where a fence does pay, the AUTHOR face exposes the raw controls as typed `Op::Custom` nodes in
+`tk/src/asm.rs` — `s_setprio`, `s_waitcnt_lgkmcnt`, `sched_barrier`, `iglp_opt`, each threaded on
+a dependency so it lands where the author put it. The one in-tree use is the RDNA4 GEMM:
+`ArchCaps::needs_pipeline_commit_fence()` names the arch whose scheduler hoists the pipeline's
+whole LDS commit above the trip's MMAs, and `gemm_core` answers with `sched_barrier(0, after_mma)`
+so the prefetch stays in flight under the matrix work.
 :::
 
 ---
@@ -150,7 +158,7 @@ Everything in the rest of this section is a response to one of these five gaps:
   layout, in the right memory, conflict-free.
 - [Flash Attention](./flash-attention) shows gaps 2 and 4 in action: double-buffered streaming
   and an explicit pipeline.
-- [Wave32 vs Wave64](./wave-portability) is the portability tax that gap 1, the lane-count
+- [Layouts and Wave Sizes](./wave-portability) is the portability tax that gap 1, the lane-count
   difference, and the per-arch fragment layouts impose.
 
 The headline: a fast GPU kernel is not "the math, written down." It is *the math, plus an

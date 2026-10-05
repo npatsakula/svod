@@ -48,8 +48,8 @@ by the `alloc_*_tagged` call sites:
 | Tag | Covers |
 |---|---|
 | `Vram` | General device VRAM — tensor data, code objects, EOP/ctx-save |
-| `Gtt` | GTT-pinned host-visible control memory |
-| `Kernarg` | Kernarg arenas — the per-dispatch, graph, and linked-plan argument pages |
+| `Gtt` | Host-visible control memory — GTT, and the graph / linked-plan IB and control buffers |
+| `Kernarg` | Kernarg arenas (host-visible VRAM) — the per-dispatch, graph, and linked-plan argument pages |
 | `SignalPool` | The GTT signal-slot pool |
 | `QueueRing` / `QueueGart` / `QueueInactive` | A queue's ring, GART page, and queue-inactive signal |
 | `Staging` | The GTT SDMA bounce buffer |
@@ -57,7 +57,8 @@ by the `alloc_*_tagged` call sites:
 
 The distinction that matters is **scratch vs everything else**: scratch is the
 only shared, GPU-only, dynamically realloc'd-and-freed region, and the historical
-`NotPresent` culprit.
+`NotPresent` culprit. The per-process KFD event page is allocated outside
+`alloc_raw` and is not tracked: a fault there classifies as unmapped.
 
 ### Classification
 
@@ -96,8 +97,8 @@ event has fired (`gpu_id != 0`), the fields are copied out of the bindgen union
 payload into locals, the VA is classified, and an enriched message is built:
 
 ```text
-AMD GPU memory fault on gpu_id=… va=0x… (NotPresent=1 ReadOnly=0 NoExecute=0
-Imprecise=0 ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
+AMD GPU memory fault on gpu_id=… va=0x… (NotPresent=true ReadOnly=false NoExecute=false
+Imprecise=false ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
 ```
 
 It is logged **once** via a `fault_logged: AtomicBool` latch and a
@@ -105,7 +106,9 @@ It is logged **once** via a `fault_logged: AtomicBool` latch and a
 auto-reset, so subsequent poll-fault calls (`wait_events(0)`) re-observe the same
 fault — logging every time would spam. It is then returned as a typed
 `Error::GpuFault`, whose `Display` is the string above; the poison latch
-re-throws the same text as an `Error::Runtime` at every later entry point.
+records that text and re-throws it as an `Error::Runtime` (prefixed
+`runtime error: `) at every later entry point. A wait that expires without a
+fault is a distinct `Error::TimelineTimeout`.
 (A hardware-exception event, slot `[2]`, reports
 `reset_type`/`reset_cause`/`memory_lost` instead — those have no faulting VA to
 classify.)
@@ -122,10 +125,12 @@ dispatch and synchronize entry point:
 - `poison(msg)` records the message once and sets the flag;
 - `is_poisoned()` is the hot-path gate;
 - `poison_error()` returns the recorded `Error::Runtime` if poisoned;
-- `poll_faults_nonblocking()` issues `wait_events(0)` from a stalled signal
-  wait, so the real error is attached to the 30 s timeout rather than a bare
-  deadline. (The spin-escalation path also breaks out early on a fault, but
-  through a short *blocking* `wait_events` instead of this poll.)
+- `poll_faults_nonblocking()` issues `wait_events(0)` when a signal wait
+  reaches its deadline (30 s for dispatch, copy and lane acquisition), so the
+  real error is attached to the timeout rather than a bare deadline. (The
+  spin-escalation path also breaks out early on a fault, but through a short
+  *blocking* `wait_events` instead of this poll.) `poison()` also wakes every
+  thread parked on the lane pool.
 
 Once poisoned, every `synchronize`/`execute` against any lane on the device
 fails fast — the GPU state and cached mappings are no longer trustworthy.

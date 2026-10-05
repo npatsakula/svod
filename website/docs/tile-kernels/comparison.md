@@ -35,22 +35,24 @@ like HipKittens, but instead of being a standalone backend it lowers into Svod's
 |------|--------|----------------|------------|
 | **Authoring surface** | Rust *builder API* (`Kernel`/`Group` mint UOps) | C++ *templates* | Rust *macro DSL* — write plain Rust in `#[cutile::module]`, the macro captures the AST |
 | **IR target** | Svod's **one UOp IR** — same as the whole compiler | none (templates → clang amdgcn) | a *separate* MLIR `cuda_tile` dialect, serialized to Tile IR bytecode |
-| **Lowering** | Svod render → LLVM → AMD binary, or → PTX (assembled to a cubin by `ptxas`, else JIT by the driver) | clang | bytecode → external `tileiras` assembler → cubin (JIT at first launch) |
+| **Lowering** | Svod render → LLVM → AMD binary, or → PTX (assembled to a cubin by `ptxas`, else JIT by the driver), or → MSL | clang | bytecode → external `tileiras` assembler → cubin (JIT at first launch) |
 | **Memory model** | **explicit** register *and* shared tiles | explicit register *and* shared tiles | **one** tile type (register-resident); shared-mem staging is implicit, chosen by the compiler |
 | **Matrix-core API** | explicit `WMMA` op + role-based fragments | typed tiles → `__builtin_amdgcn_mfma_*` | a single functional `mma()` intrinsic |
 | **Compute/memory overlap** | a `sched::pipeline` marker + a codegen pass | hand-written per kernel (raw scheduling intrinsics) | delegated to `tileiras` |
 | **Headline differentiator** | one IR ⇒ hand kernels and autotuned kernels are peers | "built from the hardware up" | memory safety across the launch boundary |
-| **Target** | AMD CDNA / RDNA **and** NVIDIA `sm_80+` | AMD CDNA / RDNA | NVIDIA `sm_80+` only |
+| **Target** | AMD CDNA3 / RDNA3 / RDNA4, NVIDIA `sm_80+`, Apple7+ | AMD CDNA / RDNA | NVIDIA `sm_80+` only |
 
-Each `tk` kernel declares its own arch set on top of that: matmul, Flash Attention and single-query
-attention are built for gfx942, gfx1151 and CUDA `sm_80+`; the k-means and k-NN kernels are AMD-only.
+Each `tk` kernel declares its own arch set on top of that: flash attention and the square
+`matmul` run on every family, `gemm_nt` and the norms on RDNA and CUDA, single-query attention on
+AMD and CUDA, k-means and k-NN on AMD — the matrix is in [The Kernel Library](./kernel-library).
 
 ---
 
 ## What the code looks like
 
-The authoring surfaces are genuinely different in feel. These snippets are illustrative — they
-convey the *shape* of each model, not an exact API.
+The authoring surfaces are genuinely different in feel. The HipKittens and CuTile snippets are
+illustrative — they convey the *shape* of each model, not an exact API; the `tk` one is the
+real API.
 
 **HipKittens** — C++ templates; you name tiles and call the multiply directly:
 
@@ -84,17 +86,23 @@ mod kernels {
 }
 ```
 
-**tk** — a Rust builder that mints IR; you request fragments by role and emit `Group` ops:
+**tk** — a Rust builder that mints IR; you request fragments by role and emit `Group` ops (the
+single-buffered strip of `gemm_core` in `tk/src/kernels/gemm.rs`, condensed):
 
 ```rust
-let ker = Kernel::new(grid, block, caps);
-let a   = ker.gl(a_spec);                       // global layout
-let mut acc = ker.rt(FragRole::Accumulator);    // role, not a hardcoded shape
-let g   = ker.group();
+let (outs, ins) = ker.bind_abi(&[GlSpec::new(&[1, 1, n, n], DType::Float32)], &[a_spec, b_spec]);
+let g = ker.group_2d(cfg.warps_m, cfg.warps_n);
+let a_smem = ker.shared_sw((cfg.block_m, k_step), bf16, TileLayout::Row);   // swizzled LDS strip
+let acc = g.zero(ker.acc((reg_m, reg_n), TileLayout::Col));                 // role, not a hardcoded shape
 
-g.load(&shared_a, &a, idx);                      // global → LDS (swizzled)
-g.mma(&mut acc, &operand_a, &operand_b);         // → WMMA UOp
-let sink = ker.finish(stores);                   // SINK { opts_to_apply: Some(vec![]) }
+let lp = ker.loop_static(trips);
+let a_f = g.fill_local_nobar(a_smem, a_gl, &a_idx, 2);                      // global → LDS, collaborative
+let a_sub = g.load(ker.operand((reg_m, k_step), bf16, TileLayout::Row),    // LDS → registers
+                   a_f.subtile((reg_m, k_step), (warp_row, 0)), MoveIdx::default());
+let acc = g.mma_ab(acc, &a_sub, &bb);                                      // → WMMA UOp
+let ended = lp.close();
+let _ = g.store(c_gl, acc.after(&ended), MoveIdx::block((0, 0, mrow, nidx), 2));
+ker.finish(1)                                                               // SINK { opts_to_apply: Some(vec![]) }
 ```
 
 The CuTile example reads like a normal program; the `tk` example reads like building a graph.
@@ -123,7 +131,7 @@ next to every autotuned kernel.
 :::tip[For GPU experts]
 The IR-target difference is concrete at the toolchain level. `tk` renders its `SINK` through
 `svod-codegen` to LLVM IR and then to an AMD binary or to PTX (assembled by `ptxas`, else JIT-ed by
-the driver) — the same path graph kernels take. CuTile instead
+the driver), or to MSL on Metal — the same path graph kernels take. CuTile instead
 serializes its tile dialect to bytecode that an *external* `tileiras` assembler turns into a cubin,
 JIT-compiled at first launch; HipKittens is C++ templates compiled by clang. So "one IR" for `tk`
 literally means one render-and-compile pipeline, where the others bridge into a separate compiler.

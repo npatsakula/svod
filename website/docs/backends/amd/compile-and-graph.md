@@ -26,12 +26,19 @@ flowchart TD
 
 ### Rendering
 
-`AmdRendererWrapper::render` uses `LlvmTextRenderer::amd(arch)` to emit AMD LLVM
-IR. It also installs an AMD-specific decomposition pass
-(`amd_decomposition_patterns`) that routes `exp`, `log`, `cos`, `tan`, and `pow`
-through SLEEF polynomials. `exp2`, `log2`, `sin`, and `sqrt` are deliberately
-absent, so there is exactly one approximation-selection path; only `f16`/`f32`/
-`f64` take the polynomials, everything else keeps its native lowering.
+`AmdRendererWrapper` (`runtime/src/devices/amd.rs`) renders with
+`LlvmTextRenderer::amd(arch)`. Its `supported_ops` removes `Exp`, `Log`,
+`Sin`, `Cos`, `Tan` and `Erf` (plus `Pow`, `Max` and `Threefry`, as on every
+GPU renderer), so the scheduler decomposes them before rendering: its
+`decompositor` is `svod_ir::decompositions::amd_decomposition_patterns()`,
+which lowers `exp`, `log`, `cos`, `tan` and `pow` to SLEEF-style polynomials
+over the native `exp2`/`log2` for `f16`/`f32`/`f64` — bf16, fp8 and integer
+operands are cast to f32 around the polynomial — and rewrites f32→bf16 casts
+into the integer round-to-nearest-even form; `sin` goes through the shared
+transcendental patterns for the same reason (`v_sin_f32` is only accurate for
+small arguments). Only `exp2`, `log2` and `sqrt` stay native `@llvm.*`
+intrinsics (~1 ulp on AMD hardware). The renderer-local `amd_extra_matcher()`
+runs last.
 
 ### Compiling
 
@@ -46,8 +53,11 @@ clang -x ir -c -O3 --target=amdgcn-amd-amdhsa -mcpu=<arch> \
 
 `-nogpulib` is added only when the IR references no `@__ocml_*` entry point:
 the renderer emits `@llvm.*` intrinsics for every float unary the AMDGPU backend
-can select, so the ROCm device libraries are needed only for the f64 fallbacks.
-The IR is part of the object-cache key, so keying a flag off it stays sound.
+can select, so the ROCm device libraries are needed only for f64 non-`sqrt`
+unaries. The IR is part of the object-cache key, so keying a flag off it stays
+sound. The result is validated (`validate_amd_object`: ELF64-LE, `EM_AMDGPU`,
+the arch in `e_flags`, a defined `<name>.kd`) before it is cached under the
+`amd-clang` identity or loaded.
 
 `clang` invokes `lld` internally for a single translation unit, so the output is
 a directly-loadable AMDGPU ELF — no separate link step. A per-process memoized
@@ -72,7 +82,7 @@ From the 64-byte `AmdHsaKernelDescriptor` it derives everything dispatch needs:
 |---|---|
 | `aql_prog_addr` | `code_gpu + kd_offset` (the AQL `kernel_object`) |
 | `pm4_prog_addr` | `aql_prog_addr + kernel_code_entry_byte_offset` (the shader entry; the LO/HI registers carry `>> 8`) |
-| `rsrc1 / rsrc2 / rsrc3` | `compute_pgm_rsrc{1,2,3}`, patched with the gfx11 cwsr-priv bit and the LDS-size field |
+| `rsrc1 / rsrc2 / rsrc3` | `compute_pgm_rsrc{1,2,3}`; `rsrc1` gets the cwsr-priv bit on gfx11, `rsrc2` the LDS-size field, `rsrc3` is used as is |
 | `wave32` | `kernel_code_properties & 0x400` (RDNA3/4 default) |
 | `target_major` | 9 / 11 / 12, from the device arch |
 | kernarg / scratch / group sizes | `kernarg_size`, `private_segment_fixed_size`, `group_segment_fixed_size` |
@@ -93,24 +103,38 @@ wait, profile)` is the lane-scoped dispatch path that plans and graphs use —
 leased `PoolQueue`. (The `Program::execute` trait method builds a throwaway
 `OwnerCtx`, which leases a lane, and delegates here.) It:
 
-1. **Validates** the buffer and scalar counts against the kernel, and checks the
-   kernarg layout fits: `buf_count*8 + var_count*4 ≤ kernarg_size`.
-2. **Fills a kernarg slot** by bumping the lane's arena, writing each
-   buffer VA as 8 bytes and each scalar as a 4-byte `i32`. The `i32` packing is
-   deliberate — the renderer lowers `Index → i32`, so the descriptor's
-   `kernarg_size` reflects 4-byte vars; packing 8 bytes would overflow into the
-   next slot.
+1. **Validates** the buffer and scalar counts against the kernel, and checks
+   that the packed kernarg layout fits: `ClikeKernargLayout::from_abi(abi)`
+   lays the parameters out in ABI slot order with natural alignment (8-byte
+   pointers, 4-byte scalars) and its `packed_size()` must not exceed the
+   descriptor's `kernarg_size`.
+2. **Fills a kernarg slot** by bumping the device's 16 MiB kernarg arena
+   (shared by every lane, 16-byte aligned; a wrap drains all lanes first),
+   writing each buffer VA as 8 bytes and each scalar as a 4-byte `i32`. The
+   `i32` packing is deliberate — the renderer lowers `Index → i32`, so the
+   descriptor's `kernarg_size` reflects 4-byte vars; packing 8 bytes would
+   overflow into the next slot.
 3. **Builds a submission** — an `hcq::Submission` of `MemoryBarrier` then
    `Compute`, carrying the kernarg VA, the `rsrc` triple, and the PM4 program
    address.
-4. **Dispatches** through `queue.submit_hcq_dispatch(pool, &submission, …)`,
-   which lowers that submission to raw PM4 dwords (`build_exec_pm4`) or to a
-   64-byte AQL packet (`build_dispatch_packet`) depending on the queue kind. On
-   the PM4 side the optional 4-dword scratch descriptor is prepended to
-   `COMPUTE_USER_DATA_0` from the same `scratch_address` snapshot that is written
-   into `COMPUTE_DISPATCH_SCRATCH_BASE` — so a concurrent scratch realloc can't
-   make the descriptor and the register disagree.
-5. If `wait`, drains through the owner's `synchronize()`.
+4. **Dispatches** through `queue.submit_hcq_dispatch(pool, &submission, …)`.
+   On a PM4 queue `lower_hcq_pm4` → `build_exec_pm4` emits raw dwords, and the
+   optional 4-dword scratch descriptor is prepended to `COMPUTE_USER_DATA_0`
+   from the same `scratch_address` snapshot that is written into
+   `COMPUTE_DISPATCH_SCRATCH_BASE` — so a concurrent scratch realloc can't make
+   the descriptor and the register disagree. On an AQL queue
+   `lower_hcq_aql_submission_program` emits the wait/barrier as vendor-IB PM4
+   packets, the 64-byte dispatch packet (`build_dispatch_packet_barrier`) and a
+   vendor-IB timeline store, with the control bytes staged in the kernarg
+   arena.
+5. Retains the code object, registers the finalizer in flight and records it
+   as the owner's newest completion. If `wait`, drains through the owner's
+   `synchronize()`.
+
+`Program::execute` (the per-call trait path) goes through
+`PlanContext::dispatch`: it waits the prior epoch, leases a lane, dispatches
+as above, and with `wait = false` ends the epoch and records the finalizer as
+an unattributed token that `wait_storage` later observes.
 
 ---
 
@@ -118,10 +142,10 @@ leased `PoolQueue`. (The `Program::execute` trait method builds a throwaway
 
 When the same kernel chain runs repeatedly (streaming inference), paying the
 per-kernel `wait → barrier → exec → signal → doorbell` round-trip N times is
-waste. `AmdGraph` (`device/src/amd/graph.rs`) — a 1:1 port of tinygrad's
-`HCQGraph` — captures the whole chain into **one command stream** (PM4 or AQL,
-whichever the queue uses), binds it into a host-visible page, and replays it with
-**one doorbell**.
+waste. `AmdGraph` (`device/src/amd/graph.rs`) — modelled on tinygrad's
+`HCQGraph`, but with one barrier and no inter-kernel signals — captures the
+whole chain into **one command stream** (PM4 or AQL, whichever the queue uses),
+binds it into a host-visible page, and replays it with **one doorbell**.
 
 ### Structure
 
@@ -151,17 +175,21 @@ finalizer, acquires an exclusive compute lane, ensures lane scratch, patches the
 current kernargs and system fields, then publishes the resident PM4 IB or AQL
 submission program. Identical arguments skip the kernarg pack entirely. It
 returns asynchronously; the next replay waits before reusing that storage.
+`replay_profiled` runs a variant with a per-kernel `SystemField::Timestamp`
+slot and synchronizes before returning the stamps.
 
 ### When capture happens
 
-Capture is gated several ways, and falls back to per-call dispatch
-(`Ok(None)`) if any fails:
+Capture is gated several ways, and falls back to per-call dispatch — on
+`Ok(None)`, and also on a capture error, which the plan swallows — if any
+fails:
 
-- The chain must be **all compiled kernels with no runtime vars** — copies,
-  views, and dynamic launch dims keep the host in the loop.
+- The chain must be **all compiled kernels with no unbound vars** — copies,
+  views, and dynamic launch dims keep the host in the loop; a bound variable
+  (a schedule-loop counter, say) is allowed and passed as `vals` on replay.
 - The chain must be **single-device** and every current replay buffer must be
   backed by that exact physical allocation owner. `AmdGraph::capture` re-checks
-  this below: every kernel must be an `AmdProgram` on the same device core
+  this below: every kernel must be an `AmdProgram` on the same `Arc<AmdDevice>`
   (`Arc::ptr_eq`).
 - AQL graph capture is supported. PM4 graph capture is opt-in through
   `SVOD_PM4_GRAPH=1` because it is not a performance win on every gfx11/12 GPU.
@@ -175,8 +203,10 @@ graph-owned resident/control memory; every replay leases a bounded pool lane.
 
 ## Why this matters
 
-Compilation is one `clang` subprocess and an in-process ELF load — no ROCm, no
-temp files, the same minimalism as the CPU path. Dispatch reuses the entire
+Compilation is one `clang` subprocess and an in-VRAM ELF load — no ROCm
+runtime, no temporary files (the object cache persists the result on disk),
+the same minimalism as the CPU path. The plan tries a graph first, then native
+linked replay, then direct dispatch. Dispatch reuses the entire
 lane/timeline machinery from [Queues & Dispatch](./queues-and-dispatch.md),
 so the [JIT Graphs](../../architecture/jit-graphs.md) layer's compile-once / replay-many promise
 lands on AMD with one doorbell per replay: on AQL hardware by default, and on

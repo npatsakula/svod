@@ -16,7 +16,7 @@ CUDA backend puts into those handles, and which tiers exist.
 | **4 — hardware counters** | yes | CUPTI range profiler (`libcupti.so.13`) |
 
 ```bash
-SVOD_DEVICE=CUDA:0 SVOD_PROFILE_ITERS=20 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
+SVOD_DEVICE=CUDA:0 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
 ```
 
 ---
@@ -61,7 +61,7 @@ attributes read at load:
 | `SGPR` | `sgprs` | `-` (no scalar register file on NVIDIA) |
 | `LDS` | `lds_bytes` | `CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES` (static `.shared`) |
 | `scratch` | `scratch_bytes` | `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES` (`.local` per thread) |
-| `occ%` | `occupancy` | `cuOccupancyMaxActiveBlocksPerMultiprocessor(block) × block / max threads per SM` |
+| `occ%` | `occupancy` | `cuOccupancyMaxActiveBlocksPerMultiprocessor(block) × block / max threads per SM`, clamped to 1 |
 
 `wave_size` is the device's warp size (32). The occupancy query needs a block
 size: the program remembers the block of its **latest launch** and falls back
@@ -88,8 +88,8 @@ one-line note.
 Two of the params structs grew in CUDA 13.3, so each call sends the newest
 `struct_size` first and steps back one size on `CUPTI_ERROR_INVALID_PARAMETER`
 — `cuptiProfilerGetCounterAvailability` (41 then 40) and
-`cuptiProfilerHostInitialize` (56 then 48) — and `abi_ladder` remembers
-whichever size the installed CUPTI accepted.
+`cuptiProfilerHostInitialize` (56 then 48) — and `abi_ladder` remembers the
+first size the installed CUPTI did not reject as a bad parameter.
 
 `SVOD_PMC=1` selects the backend default:
 

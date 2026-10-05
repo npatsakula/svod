@@ -15,17 +15,18 @@ sidebar_label: Отладка
 
 | Переменная | По умолчанию | Эффект |
 |---|---|---|
-| `SVOD_DEVICE` | `CPU` | `CUDA:N` (алиас `GPU`) выбирает тензорное устройство по умолчанию; `NV` *не* алиас, это имя остаётся зарезервированным под userspace-драйвер |
+| `SVOD_DEVICE` | `CPU` (`METAL:0` на macOS) | `CUDA:N` (алиас `GPU`) выбирает тензорное устройство по умолчанию; `NV` *не* алиас, это имя остаётся зарезервированным под userspace-драйвер |
 | `SVOD_DUMP_NVPTX_IR` | не задана | Каталог, куда попадает NVPTX LLVM IR каждого ядра в виде `sm_XY_<kernel>.ll` |
 | `SVOD_CUDA_PTXAS` | включён | `0` пропускает предассемблирование через `ptxas` и отдаёт текст PTX в JIT драйвера |
 | `SVOD_CUDA_SCOPED_SYNC` | включён | `0` заменяет каждое ожидание с областью видимости полным `cuCtxSynchronize` и делает копии синхронными ([Архитектура](./architecture.md)) |
 | `SVOD_CUDA_CUPTI` | включён | `0` пропускает загрузку `libcupti.so.13`, так что аппаратных счётчиков нет |
 | `SVOD_PMC` | не задана | `1` — набор счётчиков бэкенда по умолчанию, либо список токенов через запятую, см. [Профилирование](./profiling.md) |
 | `SVOD_OBJECT_CACHE` | включён | `0` отключает дисковый кэш скомпилированных объектов |
-| `SVOD_OBJECT_CACHE_DIR` | `$XDG_CACHE_HOME` / `~/.cache` | Переносит кэш в другое место |
-| `CUDA_PATH` | не задана | Последнее место, где ищутся `ptxas` (`$CUDA_PATH/bin`) и CUPTI (`$CUDA_PATH/lib64`) |
+| `SVOD_OBJECT_CACHE_DIR` | `$XDG_CACHE_HOME/svod/objects`, иначе `~/.cache/svod/objects` | Переносит кэш в другое место |
+| `SVOD_OBJECT_CACHE_MAX_BYTES` | 1 ГиБ | Бюджет кэша |
+| `CUDA_PATH` | не задана | Последнее место, где ищутся `ptxas` (`$CUDA_PATH/bin`, после `PATH` и `/opt/cuda/bin`) и CUPTI (`$CUDA_PATH/lib64`, `$CUDA_PATH/extras/CUPTI/lib64`) |
 | `SVOD_PROFILE_ITERS`, `SVOD_ORIGIN`, `SVOD_ORIGIN_DEPTH` | | Рычаги профайлера, см. [Профилирование](./profiling.md) |
-| `RUST_LOG` | не задана | `svod_device=info` несёт строку открытия устройства; `svod_device=debug` добавляет информационный лог JIT, захват графа и откаты переигрывания; `svod_runtime=debug` логирует вызов clang для каждого ядра |
+| `RUST_LOG` | не задана | `svod_device=info` несёт строку открытия устройства; `svod_device=debug` добавляет информационный лог JIT, захват графа и откаты переигрывания; `svod_runtime=debug` логирует каждую компиляцию NVPTX (арку и размер IR) и непригодный `ptxas` |
 
 CUDA-специфичного дампа диспетчеризации нет; лог JIT драйвера и `tracing`
 покрывают то, что на AMD делает `SVOD_DEBUG_DISPATCH`.
@@ -55,7 +56,7 @@ PTX, который драйвер отвергает, всплывает как
 причина, за которой следует лог ошибок драйвера:
 
 ```text
-CUDA JIT of kernel "r_64_32" failed: CUDA_ERROR_INVALID_PTX (218): a PTX JIT compilation failed
+CUDA JIT of kernel "r_64_32" failed: CUDA_ERROR_INVALID_PTX: a PTX JIT compilation failed
 ptxas application ptx input, line 27; error   : ...
 ```
 
@@ -84,6 +85,10 @@ clang, она становится внешним вызовом. Исправл
 Запись cubin проверяется иначе — через `validate_cubin` (little-endian ELF64 для
 `EM_CUDA`, определяющий точку входа как код), а её список `.param` сверяется с
 ABI на тексте PTX до ассемблирования, поскольку cubin такого списка не несёт.
+На PTX-пути эту проверку `.param` выполняет сам загрузчик; несовпадение
+выглядит как `PTX entry declares N parameters, the ABI describes M`. Построитель
+`llvm.nvvm.*`, добравшийся до не-NVPTX таргета, падает с
+`Error::ForeignIntrinsic`.
 
 ---
 
@@ -108,8 +113,7 @@ nvdisasm r_64_32.cubin | less                         # это SASS
 `.maxntid`. Соответствующая ошибка времени выполнения называет цифры:
 
 ```text
-CUDA kernel 'r_64_32' block [512, 1, 1] (512 threads) exceeds its maxThreadsPerBlock 256
-  (numRegs 96, sharedSizeBytes 4096, localSizeBytes 0)
+CUDA kernel 'r_64_32' block [512, 1, 1] (512 threads) exceeds its maxThreadsPerBlock 256 (numRegs 96, sharedSizeBytes 4096, localSizeBytes 0)
 ```
 
 ---

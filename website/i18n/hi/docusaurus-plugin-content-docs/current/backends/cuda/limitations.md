@@ -19,7 +19,7 @@ sidebar_label: Limitations और Roadmap
 | **Dynamic shared memory** | Launches `shared_mem_bytes = 0` पास करते हैं; केवल static `.shared` उपयोग होती है और `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` कभी call नहीं होता, इसलिए एक kernel जिसे default per-block limit से ज़्यादा चाहिए वह JIT पर fail होता है। Device factory ऐसे device को पहले ही मना कर देता है जिसकी limit profile की `shared_max` (48 KiB) से नीचे हो। | `device/src/cuda/program.rs`, `runtime/src/devices/cuda.rs` |
 | **Hopper / Blackwell matrix paths** | केवल `mma.sync` (`m16n8kK`) lower होता है; कोई `wgmma` नहीं, कोई `tcgen05` नहीं। | `codegen/src/llvm/nvptx/wmma.rs` |
 | **`ptxas` के बिना hosts पर cubins** | बिना CUDA toolkit के object cache PTX text store करता है और हर ताज़ा load driver JIT की क़ीमत चुकाता है (driver द्वारा `~/.nv/ComputeCache` में cached)। कोई bundled assembler नहीं है: `ptxas` तभी उपयोग होता है जब वह installed हो (`object_format: cubin-v1`), अन्यथा काम driver करता है। | `runtime/src/cuda/compile.rs` |
-| **Userspace NV driver** | Tinygrad के `ops_nv` (सीधी GPU-FIFO submission) को प्रति driver branch एक generated ABI चाहिए; Svod stable `libcuda.so.1` API पर ही रहता है। `SVOD_DEVICE` में `NV` जान-बूझकर स्वीकार *नहीं* किया जाता (केवल `CUDA` और `GPU` हैं); यह नाम उसी भविष्य के बैकएंड के लिए आरक्षित है। | `nvidia_backend_plan.md` |
+| **Userspace NV driver** | Tinygrad के `ops_nv` (सीधी GPU-FIFO submission) को प्रति driver branch एक generated ABI चाहिए; Svod stable `libcuda.so.1` API पर ही रहता है। `SVOD_DEVICE` में `NV` जान-बूझकर स्वीकार *नहीं* किया जाता (केवल `CUDA` और `GPU` हैं); यह नाम उसी भविष्य के बैकएंड के लिए आरक्षित है। | `device/src/registry.rs` |
 
 कमियों के बजाय numerical टिप्पणियाँ: f64 `Exp2` / `Log2` और सभी transcendentals polynomial
 path लेते हैं ([Codegen](./codegen.md)); `lg2.approx.f32` renderer के लिए उपलब्ध है लेकिन
@@ -30,7 +30,7 @@ path लेते हैं ([Codegen](./codegen.md)); `lg2.approx.f32` renderer
 ## वे आवश्यकताएँ जिन पर आज कोई समझौता नहीं
 
 - Driver कम से कम CUDA 12.0 / R525 होना चाहिए: CUDA graph के entry points अपने 12.0
-  versioned नामों से bind हैं। PTX ISA का pin (`--cuda-feature`) compute capability का
+  versioned नामों से bind हैं, और पुराना driver बैकएंड को चुपचाप unregistered छोड़ देता है। PTX ISA का pin (`--cuda-feature`) compute capability का
   अनुसरण करता है — sm_88 तक 7.8, sm_89 और sm_90 पर 8.4 (CUDA 12.4 / R550), फिर Blackwell भर में 8.6,
   8.7 और 8.8 (CUDA 12.9 तक) — यानी कोई Blackwell part floor को अपनी ही ISA वाले driver तक उठा
   देता है, पर नया clang उसे नहीं बढ़ाता।
@@ -40,8 +40,7 @@ path लेते हैं ([Codegen](./codegen.md)); `lg2.approx.f32` renderer
 
 ## Roadmap
 
-Plan के optional phase (`nvidia_backend_plan.md`, phase 5) में से जो बचा है, प्राथमिकता के
-क्रम में:
+जो बचा है, प्राथमिकता के क्रम में:
 
 1. **Stream-ordered frees**: device memory के लिए copy lane पर `cuMemFreeAsync`, ताकि एक
    free device को drain करना बंद कर दे।

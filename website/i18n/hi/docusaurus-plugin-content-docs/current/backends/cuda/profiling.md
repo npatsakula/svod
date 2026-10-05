@@ -16,7 +16,7 @@ handles में क्या डालता है, और कौन-से t
 | **4 — hardware counters** | हाँ | CUPTI range profiler (`libcupti.so.13`) |
 
 ```bash
-SVOD_DEVICE=CUDA:0 SVOD_PROFILE_ITERS=20 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
+SVOD_DEVICE=CUDA:0 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
 ```
 
 ---
@@ -61,7 +61,7 @@ captured kernel एक handle return करता है ([Architecture](./archi
 | `SGPR` | `sgprs` | `-` (NVIDIA पर कोई scalar register file नहीं) |
 | `LDS` | `lds_bytes` | `CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES` (static `.shared`) |
 | `scratch` | `scratch_bytes` | `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES` (प्रति thread `.local`) |
-| `occ%` | `occupancy` | `cuOccupancyMaxActiveBlocksPerMultiprocessor(block) × block / max threads per SM` |
+| `occ%` | `occupancy` | `cuOccupancyMaxActiveBlocksPerMultiprocessor(block) × block / max threads per SM`, 1 पर clamp किया गया |
 
 `wave_size` device का warp size (32) है। Occupancy query को एक block size चाहिए: program
 अपने **नवीनतम launch** का block याद रखता है और किसी भी launch से पहले function के
@@ -86,8 +86,8 @@ optional है जितना `ptxas`: library न हो, काम की �
 CUDA 13.3 में params वाले दो structs बड़े हो गए, इसलिए हर call पहले सबसे नया
 `struct_size` भेजती है और `CUPTI_ERROR_INVALID_PARAMETER` पर एक size पीछे हट जाती है —
 `cuptiProfilerGetCounterAvailability` (41, फिर 40) और `cuptiProfilerHostInitialize`
-(56, फिर 48) — और `abi_ladder` याद रखता है कि installed CUPTI ने कौन-सा size स्वीकार
-किया।
+(56, फिर 48) — और `abi_ladder` वह पहला size याद रखता है जिसे installed CUPTI ने bad parameter
+के रूप में reject नहीं किया।
 
 `SVOD_PMC=1` इस backend का default set चुनता है:
 

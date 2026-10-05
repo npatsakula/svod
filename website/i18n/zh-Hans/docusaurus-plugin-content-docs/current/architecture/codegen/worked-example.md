@@ -1,256 +1,393 @@
 ---
-sidebar_label: 实例演练与参考
+sidebar_label: 完整示例
 ---
 
-# 实例演练与参考
+# 完整示例：CPU 上的行求和
 
----
+本页的每一棵树都是真实输出。程序如下：
 
-## 实例演练：遍历全部 22 个阶段
-
-让我们追踪 `c = a + b`（其中 a、b 是 [100, 100] 的张量）在流水线中的全过程。
-
-### 初始张量图
-```mermaid
-flowchart TD
-  ADD["ADD"] --> BA["BUFFER(a) : Float32"]
-  ADD --> BB["BUFFER(b) : Float32"]
+```rust
+let data = Array2::from_shape_fn((8, 64), |(r, c)| (r * 64 + c) as f32);
+let x = Tensor::from_ndarray(&data);
+let y = x.sum(1)?;
+y.realize()?;
 ```
 
-### Stage 1 之后：早期移动操作
-（无变化——此示例中没有移动操作）
+在默认 CPU 后端（LLVM，进程内）上，用 `SVOD_PER_STAGE_UOPS=1 SVOD_DUMP_STAGE=`（每个 post-opt 阶段）以及 JSON subscriber 下的 `RUST_LOG=svod_schedule::rangeify::transforms=debug,svod_schedule::optimizer=debug`（更早的 pass）捕获。节点 id 是分配顺序，每次运行会有所不同；结构则不会变。
 
-### Stage 2 之后：Load Collapse
-（无变化——此示例中没有规约）
+## 张量图
 
-### Stage 3 之后：分割 Range
-（无变化——没有取模运算）
+`sum(1)` 是一个张量形式的 `REDUCE`，作用在对 512 元素扁平缓冲区做 `RESHAPE` 再 `PERMUTE` 的结果上；由于结果是输出，它被包在 `CONTIGUOUS` 中：
 
-### Stage 4 之后：初始符号化简
-（无变化——不需要化简）
-
-### Stage 5 之后：简化 Range
-（无变化——还没有相邻 range）
-
-### Stage 6 之后：分割 Store
-（不适用——GPU 后端）
-
-### Stage 7 之后：应用优化
-应用的优化动作：
-- 对 j 维度 UPCAST 4（向量化）
-- 对输入 buffer 使用 LOCAL（如果有利）
-
-### Stage 8 之后：优化后符号化简
-无变化——符号已经是干净的。
-
-### Stage 9 之后：Expander
-UPCAST 展开直接用 STACK/INDEX 结构来表示：
-```mermaid
-flowchart TD
-  V["STACK"] --> ADD["ADD"]
-  ADD --> LA["LOAD(a)"]
-  ADD --> LB["LOAD(b)"]
-  LA --> IA["INDEX"]
-  LB --> IB["INDEX"]
-  IA --> BA["BUFFER(a)"]
-  IA --> RG["RANGE(i, Global, 0..100)"]
-  IA --> UN["RANGE(j, Upcast, 0..4)"]
-  IB --> BB["BUFFER(b)"]
-  IB --> RG
-  IB --> UN
+```text
+[16] SINK : Scalar(Void)
+└── [15] CONTIGUOUS : Scalar(Float32) shape=[Const(8)]
+    └── [14] REDUCE(Add, num_axes=1, ranges=[]) : Scalar(Float32) shape=[Const(8)]
+        └── [13] PERMUTE(axes=[1, 0]) : Scalar(Float32) shape=[Const(64), Const(8)]
+            └── [12] RESHAPE : Scalar(Float32) shape=[Const(8), Const(64)]
+                ├── [11] PARAM(slot=0) : Scalar(Float32) shape=[Const(512)]
+                │   └── [0] CONST(Int(512)) : Scalar(WeakInt) shape=[]
+                └── [4] STACK(len=2) : Scalar(WeakInt) shape=[Const(2)]
+                    ├── [2] CONST(Int(8)) : Scalar(WeakInt) shape=[]
+                    └── [3] CONST(Int(64)) : Scalar(WeakInt) shape=[]
 ```
 
-注意：共享的 range 和索引表达式会通过 hash consing 去重。
+`STACK` 是 reshape 的形状载荷 —— 形状本身也是 UOp。
 
-### Stage 10 之后：添加本地 Buffer
-（如果选择了 LOCAL 优化）
+## Rangeify 之后
 
-### Stage 11 之后：移除 Reduce
-（无变化——没有规约）
+range 分配为输出赋予一个 `Weak` range `U0`（8），为归约赋予一个 `Reduce` range `U1`（64）；movement 算子坍缩为索引 `U0 * 64 + U1`（树见 [Rangeify 页面](./rangeify.md)）。内核切分把 `STAGE` 变成 `STORE`/`END`，把缓冲区编号为 `PARAM`，并重新编号 range。进入 `apply_pre_optimization` 的内核体：
 
-### Stage 12 之后：添加 GPU 维度
-```
-[SPECIAL(gidx0)] : WeakInt  // replaces RANGE(i)
-```
-
-### Stage 13 之后：添加 Load
-（无变化——load 已经存在）
-
-### Stage 14 之后：Devectorize
-devectorize 之后的向量结构（展示效果，不是精确的 UOp 结构）：
-```mermaid
-flowchart TD
-  V["STACK : 4 lanes of Float32"] --> A0["ADD(a[0], b[0])"]
-  V --> A1["ADD(a[1], b[1])"]
-  V --> A2["ADD(a[2], b[2])"]
-  V --> A3["ADD(a[3], b[3])"]
-```
-
-### Stage 15 之后：降低 Index DType
-```
-[SPECIAL(gidx0)] : i32  // concrete type
+```text
+[97] SINK[KERNEL] : Scalar(Void)
+└── [96] END : Scalar(Void) shape=[]
+    ├── [95] STORE : Scalar(Void) shape=[]
+    │   ├── [94] INDEX : Scalar(Float32) shape=[]
+    │   │   ├── [84] PARAM(slot=0) : Scalar(Float32) shape=[Const(8)]
+    │   │   │   └── [2] CONST(Int(8)) : Scalar(WeakInt) shape=[]
+    │   │   └── [89] RANGE(R1, Weak) : Scalar(WeakInt) shape=[]
+    │   │       └── [2] → (see above)
+    │   └── [93] REDUCE(Add, num_axes=0, ranges=[88]) : Scalar(Float32) shape=[]
+    │       ├── [92] INDEX : Scalar(Float32) shape=[]
+    │       │   ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    │       │   │   └── [0] CONST(Int(512)) : Scalar(WeakInt) shape=[]
+    │       │   └── [91] Add : Scalar(WeakInt) shape=[]
+    │       │       ├── [90] Mul : Scalar(WeakInt) shape=[]
+    │       │       │   ├── [89] → (see above)
+    │       │       │   └── [3] CONST(Int(64)) : Scalar(WeakInt) shape=[]
+    │       │       └── [88] RANGE(R0, Reduce) : Scalar(WeakInt) shape=[]
+    │       │           └── [3] → (see above)
+    │       └── [88] → (see above)
+    └── [89] → (see above)
 ```
 
-### Stage 16 之后：索引降低后符号化简
-不需要变化。
+slot 0 是输出（`STAGE` 的缓冲区先被映射），slot 1 是输入。五个预优化步骤不会改动这张图：没有 movement 算子，没有可折叠的 reduce，没有可拆分的取模，没有可合并的内容。
 
-### Stage 17 之后：Pre-Matcher
-（标准后端没有模式）
+## 优化器之后（`00-initial`）
 
-### Stage 18 之后：分解
-不需要分解——所有操作都支持。
+CPU renderer 没有局部维度，因此 `convert_loop_to_global` 让 `R1` 保持为 `Weak`。`hand_coded_optimizations` 跳过 tensor core、图像 upcast、matvec 路径和分组归约；`apply_unroll` 看到 64 宽的 reduce（超过 32），于是应用 `UNROLL(0, 4)`；内核已被展开，因此 `apply_default_upcast` 什么也不做；512 个元素远低于每线程 131072 的阈值，因此没有 `THREAD`。内核被命名为 `r_8_16_4`（reduce；extent 为 8、16、4）：
 
-### Stage 19 之后：最终重写
-不需要变化。
-
-### Stage 20 之后：添加控制流
-依赖已追踪——没有问题。
-
-### Stage 21 之后：线性化
-线性指令序列（简化）：
-```
-1. PARAM(0)  // Output buffer c
-2. PARAM(1)  // Input buffer a
-3. PARAM(2)  // Input buffer b
-4. RANGE(i, 0..100, Global)  // gidx0
-5. LOAD(a, i*4+0..i*4+3)  // Vector load (vec4)
-6. LOAD(b, i*4+0..i*4+3)  // Vector load (vec4)
-7. ADD(vec_a, vec_b)  // Vector add (vec4)
-8. STORE(c, i*4+0..i*4+3, result)  // Vector store
-9. END(RANGE(i))
-```
-
-注意：UPCAST 已在 Stage 9（expander）中被消耗，所以没有单独的 RANGE(j) 循环。向量化隐含在 vec4 操作中。
-
-### Stage 22 之后：清理 IF/ENDIF
-不需要变化——没有门控 store。
-
-**结果**：代码生成就绪！LLVM/CUDA 或其他后端会将其编译为实际的机器码。
-
----
-
-## 模式应用策略
-
-每个阶段使用以下两种重写策略之一：
-
-**自顶向下**（默认）：先处理父节点再处理子节点。当变换会创建新的可匹配子项时使用。
-
-**自底向上**：先处理子节点再处理父节点。当子节点状态影响父节点匹配时使用（Stage 1、20）。
-
-两者都迭代到不动点——模式持续触发直到没有更多匹配。
-
----
-
-## 调试流水线
-
-当内核产生错误结果时，bug 在这 22 个阶段中的某一个。每个阶段都通过 `tracing` 记录自己的 UOp 树；`scripts/extract-ir.sh` 会把这些日志变成可读的转储：
-
-```bash
-# See IR after each transformation
-./scripts/extract-ir.sh failing_test -p svod-tensor -o /tmp/ir.txt
-
-# Or dump a single stage straight to stderr (no tracing subscriber needed)
-SVOD_PER_STAGE_UOPS=1 SVOD_DUMP_STAGE=09 cargo test failing_test -- --nocapture
+```text
+[135] SINK[KERNEL] : Scalar(Void)
+└── [131] END : Scalar(Void) shape=[]
+    ├── [130] STORE : Scalar(Void) shape=[]
+    │   ├── [94] INDEX : Scalar(Float32) shape=[]
+    │   │   ├── [84] PARAM(slot=0) : Scalar(Float32) shape=[Const(8)]
+    │   │   │   └── [2] CONST(Int(8)) : Scalar(WeakInt) shape=[]
+    │   │   └── [89] RANGE(R1, Weak) : Scalar(WeakInt) shape=[]
+    │   │       └── [2] → (see above)
+    │   └── [128] REDUCE(Add, num_axes=0, ranges=[118, 117]) : Scalar(Float32) shape=[]
+    │       ├── [122] INDEX : Scalar(Float32) shape=[]
+    │       │   ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    │       │   │   └── [0] CONST(Int(512)) : Scalar(WeakInt) shape=[]
+    │       │   └── [121] Add : Scalar(WeakInt) shape=[]
+    │       │       ├── [90] Mul : Scalar(WeakInt) shape=[]
+    │       │       │   ├── [89] → (see above)
+    │       │       │   └── [3] CONST(Int(64)) : Scalar(WeakInt) shape=[]
+    │       │       └── [120] Add : Scalar(WeakInt) shape=[]
+    │       │           ├── [119] Mul : Scalar(WeakInt) shape=[]
+    │       │           │   ├── [118] RANGE(R0, Reduce) : Scalar(WeakInt) shape=[]
+    │       │           │   │   └── [115] CONST(Int(16)) : Scalar(WeakInt) shape=[]
+    │       │           │   └── [116] CONST(Int(4)) : Scalar(WeakInt) shape=[]
+    │       │           └── [117] RANGE(R2, Unroll) : Scalar(WeakInt) shape=[]
+    │       │               └── [116] → (see above)
+    │       ├── [118] → (see above)
+    │       └── [117] → (see above)
+    └── [89] → (see above)
 ```
 
-### 速查表
+`apply_opt` 把 64 宽的 `R0` 拆成 `R0 * 4 + R2`，其中 `R0: Reduce(16)`、`R2: Unroll(4)`，`pm_flatten_range` 把两者都列在 `REDUCE` 上。节点数 20。
 
-| 现象 | 可能的阶段 | 检查什么 |
-|---------|---------------|---------------|
-| 输出值错误 | 4, 9, 11, 18 | 符号化简、展开、devectorization |
-| 性能差 | 7, 9, 14, 21 | 优化、展开、devectorization、线性化 |
-| 崩溃/panic | 11, 12 | Reduce、GPU 维度 |
-| 循环次数错误 | 3, 5, 12 | 分割 range、简化 range、GPU 维度 |
-| 缺少向量化 | 9, 14 | Expander、devectorizer |
+## `08-post_opt_sym`
 
-### 常见问题
+只有 `commutative_canonicalization` 生效：索引变为 `(R0*4 + R2) + R1*64`（操作数的 tuplize 顺序）。仍为 20 个节点。
 
-1. **Stage 3-4**：Range 分割/符号化简可能丢失约束
-2. **Stage 9**：展开顺序影响向量化正确性
-3. **Stage 11**：累加器初始化必须匹配规约的单位元
-4. **Stage 14**：硬件宽度不匹配——检查向量折叠长度
-5. **Stage 18**：缺少分解——检查后端的 supported_ops 列表
-6. **Stage 21**：优先级 bug 导致数据竞争——验证依赖关系
+## `09-pre_expand`
 
----
+`R2` 被替换为 `RESHAPE(STACK(0,1,2,3), [4])`，其每个消费者都变成带形状的，`expand_reduce` 把 lane 轴移入 `num_axes`：
 
-## 总结
+```text
+[157] SINK[KERNEL] : Scalar(Void)
+└── [155] END : Scalar(Void) shape=[]
+    ├── [154] STORE : Scalar(Void) shape=[]
+    │   ├── [94] INDEX : Scalar(Float32) shape=[]
+    │   │   ├── [84] PARAM(slot=0) : Scalar(Float32) shape=[Const(8)]
+    │   │   │   └── [2] CONST(Int(8)) : Scalar(WeakInt) shape=[]
+    │   │   └── [89] RANGE(R1, Weak) : Scalar(WeakInt) shape=[]
+    │   │       └── [2] → (see above)
+    │   └── [152] RESHAPE : Scalar(Float32) shape=[Const(1)]
+    │       ├── [151] REDUCE(Add, num_axes=1, ranges=[118]) : Scalar(Float32) shape=[]
+    │       │   ├── [149] INDEX : Scalar(Float32) shape=[Const(4)]
+    │       │   │   ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    │       │   │   │   └── [0] CONST(Int(512)) : Scalar(WeakInt) shape=[]
+    │       │   │   └── [148] Add : Scalar(WeakInt) shape=[Const(4)]
+    │       │   │       ├── [147] Add : Scalar(WeakInt) shape=[Const(4)]
+    │       │   │       │   ├── [119] Mul : Scalar(WeakInt) shape=[]
+    │       │   │       │   │   ├── [118] RANGE(R0, Reduce) : Scalar(WeakInt) shape=[]
+    │       │   │       │   │   │   └── [115] CONST(Int(16)) : Scalar(WeakInt) shape=[]
+    │       │   │       │   │   └── [116] CONST(Int(4)) : Scalar(WeakInt) shape=[]
+    │       │   │       │   └── [146] STACK(len=4) : Scalar(WeakInt) shape=[Const(4)]
+    │       │   │       │       ├── [29] CONST(Int(0)) : Scalar(WeakInt) shape=[]
+    │       │   │       │       ├── [28] CONST(Int(1)) : Scalar(WeakInt) shape=[]
+    │       │   │       │       ├── [144] CONST(Int(2)) : Scalar(WeakInt) shape=[]
+    │       │   │       │       └── [145] CONST(Int(3)) : Scalar(WeakInt) shape=[]
+    │       │   │       └── [90] Mul : Scalar(WeakInt) shape=[]
+    │       │   │           ├── [89] → (see above)
+    │       │   │           └── [3] CONST(Int(64)) : Scalar(WeakInt) shape=[]
+    │       │   └── [118] → (see above)
+    │       └── [28] → (see above)
+    └── [89] → (see above)
+```
 
-22 阶段流水线通过系统化的精炼将张量表达式变换为机器码：
+reshape 为 `[1]` 的 `RESHAPE` 是 `expand_reduce` 为已归约 lane 轴留下的占位；devectorizer 会移除它。
 
-1. **Stages 1-7**：显式化迭代，优化 range
-2. **Stages 8-10**：展开优化原语
-3. **Stages 11-15**：降低到硬件特定操作
-4. **Stages 16-22**：序列化为可执行指令
+## `10-pm_reduce`
 
-每个阶段有单一职责。每个阶段建立在前一个之上。结果是：高层张量代码在各种硬件上以接近最优的速度运行。
+`reduce_to_acc` 构建累加器。`horizontal_reduce` 先折叠四个 lane（`((a0 + a1) + a2) + a3`，每个 lane 是对带形状索引表达式的一次 `INDEX`），然后在 `R0` 上的循环累加到一个寄存器缓冲区中：
 
----
+```text
+[193] SINK[KERNEL] : Scalar(Void)
+└── [192] END : Scalar(Void) shape=[]
+    ├── [191] STORE : Scalar(Void) shape=[]
+    │   ├── [94] INDEX : Scalar(Float32) shape=[]          ← PARAM(slot=0)[R1]
+    │   └── [189] AFTER : Scalar(Float32) shape=[Const(1)]
+    │       ├── [165] BUFFER(slot=0, addrspace=Some(Reg)) : Scalar(Float32) shape=[Const(1)]
+    │       │   └── [28] CONST(Int(1)) : Scalar(WeakInt) shape=[]
+    │       └── [188] END : Scalar(Void) shape=[Const(1)]
+    │           ├── [187] STORE : Scalar(Void) shape=[Const(1)]
+    │           │   ├── [165] → (see above)
+    │           │   └── [186] Add : Scalar(Float32) shape=[Const(1)]
+    │           │       ├── [169] AFTER : Scalar(Float32) shape=[Const(1)]
+    │           │       │   ├── [165] → (see above)
+    │           │       │   ├── [168] STORE : Scalar(Void) shape=[Const(1)]
+    │           │       │   │   ├── [167] AFTER : Scalar(Float32) shape=[Const(1)]
+    │           │       │   │   │   ├── [165] → (see above)
+    │           │       │   │   │   └── [89] → (see above)          ← init inside the R1 loop
+    │           │       │   │   └── [166] CONST(Float(0.0)) : Scalar(Float32) shape=[]
+    │           │       │   └── [118] RANGE(R0, Reduce) : Scalar(WeakInt) shape=[]
+    │           │       │       └── [115] CONST(Int(16)) : Scalar(WeakInt) shape=[]
+    │           │       └── [185] Add : Scalar(Float32) shape=[]
+    │           │           ├── [182] Add : Scalar(Float32) shape=[]
+    │           │           │   ├── [179] Add : Scalar(Float32) shape=[]
+    │           │           │   │   ├── [176] INDEX : Scalar(Float32) shape=[]
+    │           │           │   │   │   ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    │           │           │   │   │   └── [175] INDEX : Scalar(WeakInt) shape=[]
+    │           │           │   │   │       ├── [148] Add : Scalar(WeakInt) shape=[Const(4)]   ← shaped index
+    │           │           │   │   │       └── [29] CONST(Int(0))                             ← lane 0
+    │           │           │   │   └── [178] INDEX ... lane 1
+    │           │           │   └── [181] INDEX ... lane 2
+    │           │           └── [184] INDEX ... lane 3
+    │           └── [118] → (see above)
+    └── [89] → (see above)
+```
 
-## Tinygrad 与 Svod：架构差异
+（已裁剪：四个 lane 除常量 lane 索引外完全相同。）注意初始化 store 上的 `AFTER(acc, [R1])`：`input_ranges` 把清零放在行循环内部。阶段 `11` 和 `12` 不做任何改动 —— 没有 local stage，也没有 GPU range。
 
-本章描述的是基于 Tinygrad 实现的"理想" 22 阶段流水线。Svod 目前紧密遵循此设计，差异极小。
+## `13-pm_add_loads` 与 `14-devectorize`
 
-### 剩余的架构差异
+`pm_expand_broadcast` 把带形状索引中的标量项显式化（`EXPAND(RESHAPE(R0*4, [1]), [4])`，`R1*64` 同理），`pm_add_loads` 把寄存器读取和四个输入 lane 包进 `LOAD`（55 个节点）。随后 `devectorize` 把一切标量化：带形状的索引坍缩为四个标量 `Add`，逐 lane 的 `STORE` 被分组。`15-early_symbolic` 之后，各 lane 读作 `LOAD(INDEX(PARAM(1), (R0*4 + R1*64) + k))`：
 
-| 阶段 | Tinygrad | Svod | 备注 |
-|--------|-----------|-------|--------|
-| 17: Pre-Matcher | 后端钩子集中在一个 `Renderer` 类上 | 拆成两个 trait：`svod_codegen::traits::Renderer` 负责渲染，`svod_device::device::Renderer` 承载 `decompositor()`、`extra_matcher()`、`pre_isel_matcher()`、`isel_matcher()` | 钩子相同，归属不同 |
+```text
+[269] LOAD : Scalar(Float32) shape=[]
+└── [268] INDEX : Scalar(Float32) shape=[]
+    ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    └── [253] Add : Scalar(WeakInt) shape=[]
+        ├── [119] Mul : Scalar(WeakInt) shape=[]      ← R0 * 4
+        └── [90] Mul : Scalar(WeakInt) shape=[]       ← R1 * 64
+[305] LOAD : Scalar(Float32) shape=[]
+└── [304] INDEX : Scalar(Float32) shape=[]
+    ├── [87] → (see above)
+    └── [303] Add : Scalar(WeakInt) shape=[]
+        ├── [253] → (see above)
+        └── [28] CONST(Int(1))
+```
 
-### 已对齐的阶段（此前不同）
+`sym` 把索引整理成下一阶段需要的 `base + const` 形式（49 个节点）。
 
-以下阶段在本次实现中已与 Tinygrad 对齐：
+## `16-memory_coalescing`
 
-| 阶段 | 变更内容 |
-|-------|--------------|
-| 15: Index DType 降低 | Svod 现在有 `pm_lower_index_dtype()`，完整覆盖：Binary 操作、CONST/VCONST、WHERE、STACK、SPECIAL、PARAM、RANGE、双重弱 CAST |
-| 18: 分解 | 新增：`fast_division_patterns()`、`pm_div_to_shr()`、`pm_fdiv_to_mul()`、`pm_comparison_negations()`、德摩根定律 |
-| 19: 最终重写 | `renderer.extra_matcher()` 和 `pm_split_ends()` 被汇总进 schedule 流水线的最终重写，而不再在 codegen 中运行 |
+四个 load 共享 base `R0*4 + R1*64`，偏移为 0..3，且 base 能被 4 整除，因此它们变成一次 4 宽访问；各 lane 为 `INDEX(load, k)`：
 
-### 仅 Tinygrad 的模式
+```text
+[341] Add : Scalar(Float32) shape=[]
+├── [340] Add : Scalar(Float32) shape=[]
+│   ├── [339] Add : Scalar(Float32) shape=[]
+│   │   ├── [335] INDEX : Scalar(Float32) shape=[]
+│   │   │   ├── [334] LOAD : Scalar(Float32) shape=[Const(4)]
+│   │   │   │   └── [333] SHRINK : Scalar(Float32) shape=[Const(4)]
+│   │   │   │       ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+│   │   │   │       ├── [253] Add : Scalar(WeakInt) shape=[]          ← R0*4 + R1*64
+│   │   │   │       └── [116] CONST(Int(4))                            ← width
+│   │   │   └── [29] CONST(Int(0))
+│   │   └── [336] INDEX ... [334], CONST(1)
+│   └── [337] INDEX ... [334], CONST(2)
+└── [338] INDEX ... [334], CONST(3)
+```
 
-Svod 有意不实现以下 Tinygrad 特有模式：
+44 个节点。`17-bottom_up_ew_image` 和 `16-extra_symbolic` 在这里是空操作。
 
-| 模式 | 用途 | Svod 为何不需要 |
-|----------|-----------|-----------------------------|
-| `pm_regalloc_rewrite` | 面向 ISA 后端的线性扫描寄存器分配 | Svod 发射的是 LLVM IR / 源码，寄存器分配属于后端编译器的工作 |
+## `17-pm_lower_index_dtype` 与 `18-final_symbolic`
 
-### Svod 增强
+每个 `WeakInt` 都被确定为 `Int32` —— range、常量、`PARAM` 的大小：
 
-Svod 有一些 Tinygrad 没有的模式/增强：
+```text
+[386] RANGE(R1, Weak) : Scalar(Int32) shape=[]
+└── [351] CONST(Int(8)) : Scalar(Int32) shape=[]
+[377] RANGE(R0, Reduce) : Scalar(Int32) shape=[]
+└── [373] CONST(Int(16)) : Scalar(Int32) shape=[]
+[391] Add : Scalar(Int32) shape=[]
+├── [390] Mul : Scalar(Int32) shape=[]
+│   ├── [377] → (see above)
+│   └── [366] CONST(Int(4)) : Scalar(Int32) shape=[]
+└── [389] Mul : Scalar(Int32) shape=[]
+    ├── [386] → (see above)
+    └── [381] CONST(Int(64)) : Scalar(Int32) shape=[]
+```
 
-| 增强 | 位置 | 用途 |
-|-------------|---------|---------|
-| 通过 `uint8` 存储 bool | `devectorize.rs` 中的 `bool_storage_patterns()` | LLVM 的 `i1` 高位可能带有垃圾数据，因此 bool 的 LOAD/STORE 通过 `uint8` 进行 |
-| 宽浮点降级 | `late/dtype.rs` 中的 `demote_unsupported_floats()` | 没有宽浮点的渲染器（Metal、WebGPU）用 f32 计算内部的 f64 |
+`18-final_symbolic`、`19-cast_float_alu`、`19b` 和 `19c` 不做任何改动：没有超越函数，也没有需要模拟的 dtype。
 
----
+## 从 `19d-late_decompositions` 到 `20-final_rewrite`
 
-## 术语表
+后期重写把 `R1 * 64` 变成 `R1 << 6`（`pm_mul_to_shl`），把 `R0 * 4` 变成 `R0 << 2`，再把 `(R0 << 2) + (R1 << 6)` 变成整数 `MulAcc`（`pm_shl_add_to_mulacc`）。gate 移动无事可做（任何地方都没有 `Invalid`），最终重写中的 `pm_split_ends` 也无可拆分（每个 `END` 已经只关闭一个 range）。最终的图，43 个节点：
 
-| 术语 | 简单定义 | 示例 |
-|------|------------------|---------|
-| **累加器** | 保存运行总和的变量 | `acc = acc + value`（在规约中） |
-| **轴** | 张量的一个维度 | Shape [100, 200] 有 2 个轴 |
-| **AxisType** | 循环的执行方式 | Global=并行，Reduce=累加 |
-| **Buffer** | 保存数据的已分配内存 | 张量的数据存在 buffer 中 |
-| **Bufferize** | 将结果存到内存而非按需计算 | 物化中间值 |
-| **Devectorize** | 分割向量以匹配硬件 | `vec8 → vec4, vec4` |
-| **Divmod** | 除法和取余运算 | `x // 7, x % 7` |
-| **不动点** | 模式应用不再改变任何东西时 | 模式触发直到不动点 |
-| **STACK** | 把多条 lane 收集成一个带形状的值（Tinygrad 的 VECTORIZE） | `STACK(a, b, c, d)` |
-| **Hash consing** | 复用相同的表达式 | `ADD(x, 0) + ADD(x, 0)` 共享内存 |
-| **WeakInt** | 索引使用的抽象整数类型，在 Stage 15 降低 | i32 或 i64，取决于已证明的取值范围 |
-| **Load** | 从内存读取 | `value = arr[i]` |
-| **Pattern** | 代码的查找替换规则 | `ADD(x, 0) → x` |
-| **谓词写入** | 条件性写入内存 | 有效则写，否则跳过 |
-| **Range** | 循环迭代规格 | `for i in 0..100` |
-| **规约** | 将多个值合并为一个 | 求和、求最大值、求最小值 |
-| **Store** | 写入内存 | `arr[i] = value` |
-| **符号化简** | 使用代数规则简化 | `(x/4)*4 → x`（当 `x%4=0` 时） |
-| **张量核心** | 快速矩阵乘法的硬件 | NVIDIA、AMD、Apple Metal、Intel Xe |
-| **拓扑排序** | 按依赖排序节点 | 如果 B 用了 A 的结果，A 排在 B 前面 |
-| **UNROLL** | 标记某个循环要被展开的轴类型 | `RANGE(0..4, Unroll)` |
-| **UPCAST** | 标记向量化意图的轴类型 | `RANGE(0..4, Upcast)` |
-| **向量化** | 同时处理多个值 | SIMD：一次加 4 个数 |
-| **WHERE** | 条件选择 | `WHERE(cond, x, y) = x if cond else y` |
+```text
+[455] SINK[KERNEL] : Scalar(Void)
+└── [454] END : Scalar(Void) shape=[]
+    ├── [453] STORE : Scalar(Void) shape=[]
+    │   ├── [428] INDEX : Scalar(Float32) shape=[]
+    │   │   ├── [353] PARAM(slot=0) : Scalar(Float32) shape=[Const(8)]
+    │   │   │   └── [351] CONST(Int(8)) : Scalar(Int32) shape=[]
+    │   │   └── [386] RANGE(R1, Weak) : Scalar(Int32) shape=[]
+    │   │       └── [351] → (see above)
+    │   └── [452] LOAD : Scalar(Float32) shape=[]
+    │       └── [451] INDEX : Scalar(Float32) shape=[]
+    │           ├── [450] AFTER : Scalar(Float32) shape=[Const(1)]
+    │           │   ├── [356] BUFFER(slot=0, addrspace=Some(Reg)) : Scalar(Float32) shape=[Const(1)]
+    │           │   │   └── [354] CONST(Int(1)) : Scalar(Int32) shape=[]
+    │           │   └── [449] END : Scalar(Void) shape=[]
+    │           │       ├── [448] STORE : Scalar(Void) shape=[]
+    │           │       │   ├── [363] INDEX : Scalar(Float32) shape=[]
+    │           │       │   │   ├── [356] → (see above)
+    │           │       │   │   └── [361] CONST(Int(0)) : Scalar(Int32) shape=[]
+    │           │       │   └── [447] Add : Scalar(Float32) shape=[]
+    │           │       │       ├── [418] LOAD : Scalar(Float32) shape=[]
+    │           │       │       │   └── [417] INDEX : Scalar(Float32) shape=[]
+    │           │       │       │       ├── [415] AFTER : Scalar(Float32) shape=[Const(1)]
+    │           │       │       │       │   ├── [356] → (see above)
+    │           │       │       │       │   ├── [413] STORE : Scalar(Void) shape=[]
+    │           │       │       │       │   │   ├── [412] INDEX : Scalar(Float32) shape=[]
+    │           │       │       │       │   │   │   ├── [410] AFTER : Scalar(Float32) shape=[Const(1)]
+    │           │       │       │       │   │   │   │   ├── [356] → (see above)
+    │           │       │       │       │   │   │   │   └── [386] → (see above)
+    │           │       │       │       │   │   │   └── [361] → (see above)
+    │           │       │       │       │   │   └── [166] CONST(Float(0.0)) : Scalar(Float32) shape=[]
+    │           │       │       │       │   └── [377] RANGE(R0, Reduce) : Scalar(Int32) shape=[]
+    │           │       │       │       │       └── [373] CONST(Int(16)) : Scalar(Int32) shape=[]
+    │           │       │       │       └── [361] → (see above)
+    │           │       │       └── [446] Add : Scalar(Float32) shape=[]
+    │           │       │           ├── [445] Add : Scalar(Float32) shape=[]
+    │           │       │           │   ├── [444] Add : Scalar(Float32) shape=[]
+    │           │       │           │   │   ├── [443] INDEX : Scalar(Float32) shape=[]
+    │           │       │           │   │   │   ├── [439] LOAD : Scalar(Float32) shape=[Const(4)]
+    │           │       │           │   │   │   │   └── [438] SHRINK : Scalar(Float32) shape=[Const(4)]
+    │           │       │           │   │   │   │       ├── [359] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    │           │       │           │   │   │   │       │   └── [357] CONST(Int(512)) : Scalar(Int32) shape=[]
+    │           │       │           │   │   │   │       ├── [437] MulAcc : Scalar(Int32) shape=[]
+    │           │       │           │   │   │   │       │   ├── [377] → (see above)
+    │           │       │           │   │   │   │       │   ├── [366] CONST(Int(4)) : Scalar(Int32) shape=[]
+    │           │       │           │   │   │   │       │   └── [435] Shl : Scalar(Int32) shape=[]
+    │           │       │           │   │   │   │       │       ├── [386] → (see above)
+    │           │       │           │   │   │   │       │       └── [434] CONST(Int(6)) : Scalar(Int32) shape=[]
+    │           │       │           │   │   │   │       └── [366] → (see above)
+    │           │       │           │   │   │   └── [361] → (see above)
+    │           │       │           │   │   └── [442] INDEX : Scalar(Float32) shape=[]
+    │           │       │           │   │       ├── [439] → (see above)
+    │           │       │           │   │       └── [354] → (see above)
+    │           │       │           │   └── [441] INDEX : Scalar(Float32) shape=[]
+    │           │       │           │       ├── [439] → (see above)
+    │           │       │           │       └── [399] CONST(Int(2)) : Scalar(Int32) shape=[]
+    │           │       │           └── [440] INDEX : Scalar(Float32) shape=[]
+    │           │       │               ├── [439] → (see above)
+    │           │       │               └── [395] CONST(Int(3)) : Scalar(Int32) shape=[]
+    │           │       └── [377] → (see above)
+    │           └── [361] → (see above)
+    └── [386] → (see above)
+```
+
+自底向上阅读：`BUFFER(Reg)` 是累加器；`STORE([412], 0.0)` 在 `AFTER(acc, R1)` 之后将其清零，即每行一次；循环体 `STORE([363], LOAD(acc) + lanes)` 由 `END(.., R0)` 关闭；最后的 `LOAD` 在该 `END` 之后读取累加器，并在 `R1` 处存入输出；外层 `END` 关闭 `R1`。
+
+## 线性化与渲染
+
+`linearize` 按 `(run_count, priority, slot, tuplize)` 顺序输出 43 条指令：首先是两个 `PARAM`（各自前面是其大小常量）、寄存器 `BUFFER` 及其 `INDEX`（`run_count` 为 1，优先级 −20/−18），然后是 `RANGE(R1)`、清零 store、`RANGE(R0)`、循环体、`END(R0)`、输出 store、`END(R1)`、`SINK`。CPU renderer 把该列表变成：
+
+```llvm
+define void @r_8_16_4(ptr noalias align 32 %data0, ptr noalias align 32 %data1) #0 {
+entry:
+  %reg0 = alloca [1 x float]
+  %v1 = getelementptr inbounds float, ptr %reg0, i32 0
+  br label %loop_entry_1
+loop_entry_1:
+  br label %loop_latch_1
+loop_latch_1:
+  %r1 = phi i32 [ 0, %loop_entry_1 ], [ %r1phi, %loop_footer_1 ]
+  %r1phi = add i32 %r1, 1
+  %r1cmp = icmp ult i32 %r1, 8
+  br i1 %r1cmp, label %loop_body_1, label %loop_exit_1
+loop_body_1:
+  %v3 = getelementptr inbounds float, ptr %reg0, i32 0
+  %v4 = shl i32 %r1, 6
+  store float 0x0000000000000000, ptr %v3
+  br label %loop_entry_0
+loop_entry_0:
+  br label %loop_latch_0
+loop_latch_0:
+  %r0 = phi i32 [ 0, %loop_entry_0 ], [ %r0phi, %loop_footer_0 ]
+  %r0phi = add i32 %r0, 1
+  %r0cmp = icmp ult i32 %r0, 16
+  br i1 %r0cmp, label %loop_body_0, label %loop_exit_0
+loop_body_0:
+  %v7 = getelementptr inbounds float, ptr %reg0, i32 0
+  %v8 = load float, ptr %v7
+  %v9.mul = mul i32 %r0, 4
+  %v9 = add i32 %v9.mul, %v4
+  %v10 = getelementptr inbounds float, ptr %data1, i32 %v9
+  %v11 = load <4 x float>, ptr %v10
+  %v12 = extractelement <4 x float> %v11, i32 0
+  %v13 = extractelement <4 x float> %v11, i32 1
+  %v14 = extractelement <4 x float> %v11, i32 2
+  %v15 = extractelement <4 x float> %v11, i32 3
+  %v16 = fadd nsz arcp contract afn float %v12, %v13
+  %v17 = fadd nsz arcp contract afn float %v16, %v14
+  %v18 = fadd nsz arcp contract afn float %v17, %v15
+  %v19 = fadd nsz arcp contract afn float %v8, %v18
+  store float %v19, ptr %v1
+  br label %loop_footer_0
+loop_footer_0:
+  br label %loop_latch_0
+loop_exit_0:
+  %v23 = getelementptr inbounds float, ptr %reg0, i32 0
+  %v24 = load float, ptr %v23
+  %v25 = getelementptr inbounds float, ptr %data0, i32 %r1
+  store float %v24, ptr %v25
+  br label %loop_footer_1
+loop_footer_1:
+  br label %loop_latch_1
+loop_exit_1:
+  ret void
+}
+```
+
+宽度为 4 的 `SHRINK` 变成了 `load <4 x float>`，整数 `MulAcc` 变成 `mul` + `add`，寄存器缓冲区变成 `alloca`；LLVM 自身的优化器随后会把累加器保留在寄存器中。结果为 `[2016, 6112, 10208, 14304, 18400, 22496, 26592, 30688]`。
+
+## 阅读 dump
+
+| 症状 | 优先查看的阶段 |
+|---------|-------------------------|
+| 数值错误 | `08`（符号化简）、`09`（展开）、`10`（累加器初始化/单位元）、`19d`（分解） |
+| 循环次数错误或缺少循环 | 预优化中的拆分/化简 range、`12`（gpudims）、`10`（`END` 合并） |
+| 预期向量 load 却得到标量 load | `15`/`16`：索引必须是 `base + const` 形式，base 可整除，同一缓冲区，相同有效性，没有 gate |
+| 最终图中出现 `WeakInt` | `17-pm_lower_index_dtype`（`SVOD_SPEC` 会在 `18` 捕获） |
+| 最终图中出现 `Invalid` | `19e` gate 移动、`20` `pm_remove_invalid`（调试断言） |
+| 后端拒绝某个算子 | `19b`/`19d` 能力表（`supported_ops`） |
+
+每个阶段的 `node_count` 是最廉价的信号：在小内核上让节点数翻倍的阶段就是该 dump 的那个。

@@ -1,246 +1,107 @@
 ---
-sidebar_label: Phase 3 — Devectorizer
+sidebar_label: Devectorizer & index lowering
 ---
 
-# Phase 3: Devectorizer
+# GPU Dimensions, Devectorization and Index Lowering (stages 12–18)
 
-**Goal**: Lower from hardware-agnostic vectors to hardware-specific instructions.
+After reduction lowering the kernel still speaks in shaped values and `WeakInt` indices. These stages map ranges to hardware indices, make every memory access an explicit scalar `LOAD`/`STORE`, re-widen contiguous accesses, and commit the index dtype. Source: `gpudims.rs`, `devectorize.rs`, `late/coalesce.rs`, `symbolic/index_lowering.rs`.
 
----
+## 12 — GPU dimensions
 
-## Stage 11: Remove Reduce
+Two matchers. `pm_lower_device_ranges` runs for every renderer: a `Device` range becomes the scalar `PARAM` variable `_device_num` with the range's bounds, and an `END` that closed it drops that entry. `pm_add_gpudims` runs only when `renderer.has_local || renderer.has_threads`; it matches the `SINK` once (`GpuDimsContext` remembers the lowered sink id so the engine's re-visit is a no-op).
 
-> **Stage at a Glance**
->
-> **Goal**: Convert declarative REDUCE to imperative accumulation
-> **Key Patterns**: Reduce to accumulator, horizontal reduction
-> **Impact**: Maps to hardware reduction instructions
+`add_gpudims`:
 
-**What This Does**: Converts high-level REDUCE to accumulator pattern.
+1. Collects every `RANGE` keyed by `(axis_id, axis_type)`; bails if a `SPECIAL` already exists.
+2. Global dims = `Global` and `Thread` axes; local dims = `Local`, `Warp`, `GroupReduce`. Both sorted by axis id; the `Warp` axis is moved to the front of the locals so it owns the low bits of the linear thread index (`mma.sync` addresses fragments by hardware lane).
+3. Builds the index expressions:
+   - `has_threads` (CPU): exactly one global axis and no locals, else the pass declines with a warning. The axis becomes `PARAM("core_id", 0..N-1)`.
+   - `KernelInfo.dont_use_locals`: globals only, `get_grouped_dims("idx", ..)`.
+   - otherwise `lidx*` from the local shape under `local_max_axes()` (or `local_max` per axis; the leading cap is pinned to the warp extent so nothing else folds into `lidx0`), then `gidx*` from the global shape under `global_max`, further capped by `global_prod_max / hardware_local_extents` when the renderer declares a work-item product limit.
+4. `get_grouped_dims` is Tinygrad's: if the dims do not fit the per-axis caps, `group_dims` merges adjacent dims whose product fits; if nothing could be grouped, `split_dims` factors an oversized dim by its smallest divisor into the next slot. Either failure panics at scheduling time rather than at codegen (`"cannot limit dims to N axes"`). The result is one `SPECIAL(end, "gidxN")` per limited dim; when grouping or splitting happened, each original dim is reconstructed from the flat index with `FloorDiv`/`FloorMod` and simplified with `symbolic`. Global indices are produced with `reverse = true` (the recursion reverses the input *and* the output, so the names stay in iteration order).
+5. **Store masking** (`compute_store_masks`): a `STORE` to global memory whose index is not in scope of every local range gets `WHERE((l1 == 0) & (l2 == 0) & .., idx, Invalid)` on its index, so only one work-item per unused local axis writes. The mask stays inside the index expression so the RANGE → SPECIAL substitution carries it to the hardware index.
+6. Substitutes every GPU range with its index; `Reduce` ranges stay loops.
 
-**Why This Matters**: A declarative "sum these values" needs to become imperative instructions: initialize accumulator, loop, add each value.
+On the CPU example on the [worked example](./worked-example.md) page nothing happens: the row axis is `Weak` (no `Thread` axis was created) and the renderer has no locals.
 
-**Pattern**: `movement_cleanup_patterns + pm_reduce_local`
+## 13 — loads
 
-`pm_reduce_local` bundles the WMMA-add fusion, `pm_group_for_reduce`, the
-accumulator and horizontal-reduce rules, and the group-SINK cleanup.
+`PM_ADD_LOADS = symbolic_simple() + pm_expand_broadcast() + pm_add_loads()`.
 
-```text
-// Before: declarative reduction
-REDUCE(Add, values, range)
+- `pm_expand_broadcast` starts with `pm_wmma_add` again, then makes broadcasting explicit: a `Binary`/`Ternary`/`STORE` whose sources have different shapes gets each source `RESHAPE`d (leading 1s) and `EXPAND`ed to the broadcast shape; a `WMMA` whose operand prefixes differ is expanded per output coordinate (`broadcast_and_devec_wmma`).
+- `pm_add_loads` wraps every operand *consumed as a value* in `LOAD`: the sources of ALU ops, casts, `REDUCE`, `WMMA` and `STACK` that have an address space (`maybe_load`), and a `STORE` value that is itself an address. An `INDEX` used as an address — the `STORE` target, a `WMMA` fragment pointer — stays bare. The accumulator reads created at stage 10 (`AFTER(acc, ..)`) become `LOAD(AFTER(acc, ..))` here.
 
-// After: imperative accumulation
-acc = placeholder(AddrSpace::Reg)   // initialized to the reduce identity
-for i in range:
-    acc = STORE(acc, ADD(LOAD(acc), values[i]))
-```
+## 14 — devectorize
 
-The accumulator loop is an AFTER / STORE / END chain, closed by an `END` over the
-reduce ranges—there is no separate loop construct at this level.
+`devectorize()` is one `graph_rewrite` over `symbolic_simple + devectorize_patterns + bool_storage_patterns + indexing_simplify` (`Renderer` context, unused by the rules). There is no outer loop: the engine re-matches every replacement.
 
-**Horizontal reduction**:
+`devectorize_patterns` (`devectorizer2` in Tinygrad), in source order:
 
-Before we loop through a reduction dimension, we first combine the lanes of a shaped value. This creates larger reductions that map better to hardware instructions.
+| Group | Rules |
+|-------|-------|
+| `movement_cleanup_patterns` | `mop_cleanup_patterns` plus the `RESHAPE(STACK([x]))` and leading-singleton materializations |
+| `movement_op_patterns` | the rangeify movement rules (through `INDEX`, `AFTER`, `END`) |
+| `no_vectorized_alu` | every unary/binary/ternary op, `CAST`, `BITCAST` with a non-empty shape → `devectorize_alu` |
+| `mixed_representation_alu` | an ALU whose sources mix `STACK` and vector-dtype values: vector sources are unpacked into `STACK(INDEX(src, lane)..)`, then `devectorize_alu` |
+| shaped `LOAD` / `STORE` | → `devectorize_alu` (per-lane `LOAD(INDEX)`; per-lane stores collected in a `GROUP`) |
+| `INDEX(buf, [])` | → `buf` |
+| `WMMA` | `stack_wmma_sources`: operands become `STACK`s of loaded lanes |
+| `INDEX(buf, STACK(i0, i1, ..))` on a `PARAM`/`BUFFER` | → `STACK(INDEX(buf, i0), INDEX(buf, i1), ..)` — lanes stay addresses; the enclosing `LOAD`/`STORE` materializes them |
+| `INDEX(buf, RESHAPE(i))` | → `RESHAPE(INDEX(buf, i))` |
+| `RESHAPE` of a `Void` value | → the value (shape bookkeeping around `AFTER`/`STORE`) |
+| one-element shaped value reshaped to scalar | → `INDEX(src, 0)` |
+| `EXPAND` | `materialize_stack_broadcast` (a `STACK([x])` broadcast to N lanes → `STACK([x; N])`) or `expand_scalar_to_stack` |
 
-```mermaid
-flowchart TD
-  A["Before: [a, b, c, d, e, f, g, h] (8 lanes)"]
-  A -->|"Horizontal reduction"| B["Fold left-to-right in row-major lane order: ((((((a+b)+c)+d)+e)+f)+g)+h"]
-  B -->|"Accumulator pattern"| C["After: acc = acc + horizontal_result"]
-```
+`devectorize_alu` is Tinygrad's `do_devectorize`: it requires every source to have the result shape (or to be an `Invalid` base, whose scalar is polymorphic), enumerates the coordinates of the static shape, builds one scalar op per coordinate with `INDEX(source, c0, c1, ..)` operands, and reassembles with `stack_with_shape` (nested `STACK`s mirroring the shape) — or `GROUP` for a `STORE`. The lane count is the full product of the shape; there is no per-device fold width. Re-vectorization is the backend's job (LLVM's SLP vectorizer, or `memory_coalescing` two stages later for memory).
 
-**WMMA Tensor Core Fusion**:
-```text
-// Fuse tensor core accumulation inline
-WMMA(a, b, c) + add → WMMA(a, b, c + add)
-```
-This pattern enables efficient FMA-style accumulation on tensor cores. Two extra arms fuse through a `PERMUTE`, and through a `PERMUTE(RESHAPE(...))`, wrapper.
+`bool_storage_patterns`: a bool `STORE` casts to `uint8`, a bool `LOAD` loads `uint8` and casts back, a `BITCAST` touching bool becomes a `CAST`. LLVM's `i1` may carry garbage in the upper bits.
 
-**Svod**: `devectorize.rs`
+`indexing_simplify` (`late/coalesce.rs`): for `INDEX(buf, WHERE(valid, idx, Invalid))`, `uop_given_valid` rewrites `idx` under the assumption `valid` holds (`symbolic/valid_simplification.rs`); the two-coordinate image form additionally drops validity clauses that the image bounds already imply (`drop_valid_stmts`).
 
----
+After this stage every ALU op is scalar. In the worked example the four lanes of the index expression become four `LOAD(INDEX(PARAM, R0*4 + R1*64 + k))` and the horizontal `Add` chain is explicit.
 
-## Stage 12: Add GPU Dims
+## 15 — early symbolic
 
-> **Stage at a Glance**
->
-> **Goal**: Map abstract ranges to GPU thread indices
-> **Key Patterns**: Range to SPECIAL replacement
-> **Impact**: Enables parallel execution on GPU
+`sym()` once more, now on scalar code. Its reason for existing is the next stage: index expressions must be in canonical `base + const` form before coalescing can group them.
 
-**What This Does**: Replaces ranges with GPU thread indices.
+## 16 — memory coalescing
 
-**Why This Matters**: GPUs have hard limits: max 1024 threads per block, max 48KB shared memory. If your computation needs 2000 threads, the compiler must split it into multiple blocks. Dimension limiting handles this automatically.
+`memory_coalescing` (`late/coalesce.rs`) is a graph walk, not a matcher. It groups ungated `LOAD`s and `STORE`s by `(op, buffer, index base, validity)`, where the index is split into `base + integer_offset` (an `Invalid` or constant index is its own base). Within a group, consecutive offsets form runs; each run is cut into the widest fold length that divides the base offset:
 
-**Pattern**: `pm_lower_device_ranges`, then `pm_add_gpudims` (only when the renderer has local or thread dimensions)
+- image buffers: 4;
+- `supports_float4` renderers: powers of two down from `16 / sizeof(dtype)` when `access_bytes() >= 16` (eight 16-bit lanes, four `f32`), else from 4;
+- otherwise scalar only. `Reg` buffers and non-foldable dtypes (anything but f32/f16/bf16/i32/u32/fp8) stay scalar.
 
-```text
-// Before: abstract range
-RANGE(end=256, Global)
+A fold of width `n > 1` becomes `LOAD(SHRINK(buf, offset, n))` with the old loads replaced by `INDEX(load, lane)`, or `STORE(SHRINK(..), STACK(values))`. `SHRINK` carries the group shape; the memory dtype stays scalar. `DMC=1` disables the pass. In the worked example the four unrolled loads become one `LOAD(SHRINK(PARAM(1), R0*4 + R1*64, 4))`, which the LLVM backend renders as `load <4 x float>`.
 
-// After: GPU-specific
-SPECIAL(gidx0)  // global thread index
-```
+## 17 — bottom-up elementwise / image pass
 
-**Mapping**:
+`symbolic_simple + no_vectorized_alu + pm_simplify_add_image`, applied with `graph_rewrite_bottom_up` and an `AddImageContext`. The image rules canonicalize f16 accesses to f32 image buffers (`LOAD` → `LOAD.cast(f16)`, `STORE(value.cast(f32))`, drop a `CAST(CAST(x, f16), f32)` round-trip). Image buffer *creation* has no Svod target; the rules only serve existing image accesses. `no_vectorized_alu` runs again because an image rewrite can reintroduce a shaped op.
 
-| Range Type | GPU Equivalent |
-|------------|----------------|
-| Global, Thread | `gidx` (global index) |
-| Local, Warp, GroupReduce | `lidx` (local/workgroup index) |
-| Device | PARAM variable `"_device_num"` (bound at launch) |
-| Reduce | Loop (no mapping) |
+## 16 — extra symbolic
 
-Warp ranges are sorted to the front of the local dimensions, so they own the low bits of the thread index.
+`extra_symbolic_patterns = sym() + indexing_simplify()`. Indices are still `WeakInt` here on purpose: the distributive and index-validity rules of `sym` and `indexing_simplify` need the weak dtype, so this is their last chance. (The label collides with memory coalescing's; both print under `SVOD_DUMP_STAGE=16`.)
 
-**Dimension Limiting**:
+## 17 — index dtype lowering
 
-GPUs have hardware limits (e.g., max 1024 threads per block). When ranges exceed these limits, the compiler:
+`lower_index_patterns = symbolic_simple + pm_fold_cast_const + pm_lower_index_dtype + indexing_simplify`, with one `WeakMemo` per kernel (Tinygrad's single `ctx={}`). Port of `tinygrad/uop/weak.py`.
 
-1. **Groups** adjacent dimensions when their product still fits: `[16, 16, 256]` with max `[256, 256]` → `[256, 256]`
-2. **Splits** large dimensions: `[2048]` with max `[1024, 1024, 1024]` → `[1024, 2]`
-3. **Reconstructs** indices via divmod
+`select_dtype(u)`: `WeakFloat` → the default float; an integer whose `vmin`/`vmax` fit `i32` → the default int, otherwise `Int64`; vector count preserved.
 
-**Store Masking**:
+`pm_lower_index_dtype` composes:
 
-Global stores that don't use all local dimensions are masked:
-```text
-// If STORE doesn't use lidx1, restrict its index validity:
-STORE(INDEX(buf, idx), value) → STORE(INDEX(buf, WHERE(lidx1 == 0, idx, Invalid)), value)
-```
-This ensures stores only execute when unused local indices are 0. The mask stays in the index expression so that RANGE substitution carries it to the corresponding hardware index.
+1. `pm_commit_weak` — a `Binary`/`Ternary` with a weak source and a non-weak `least_upper_dtype` commits the weak sources to it (`commit_weak`: a `CONST` is retyped, anything else is cast); a `STORE` whose value is weak commits it to the index's dtype.
+2. `pm_cast_weak` — `CAST(weak_alu, concrete)` pushes the concrete dtype into the ALU's sources.
+3. `SHRINK` offsets/sizes are committed with `select_dtype`.
+4. Any non-weak node with weak sources → `lower_weak_srcs`: each weak source is rewritten with `pm_lower_weak` (memoized by source id) and the trailing weak `CAST` is absorbed by the consumer's own edge. `pm_lower_weak` is the three-phase cascade:
+   - leaves: `CONST`/`VCONST`/scalar `PARAM` become `concrete.cast(weak)`;
+   - `Unary`, `Binary`, `WHERE` (condition skipped), `RANGE`, `STACK`, `SPECIAL` (`lower_weak_node`): unwrap the weak casts on the sources, compute the concrete dtype (`least_upper_dtype` of `select_dtype(u)` and the sources for binary ops; `dtype_from_op` otherwise), cast every source to it, keep a weak `CAST` on the result unless it is a `STACK`;
+   - `INDEX` with a weak dtype: the buffer is cast to the selected dtype and each weak index committed;
+   - `CAST(weak, CAST(weak, x))`: the inner cast is committed, the outer kept.
+5. An `INDEX` (or `SHRINK`) whose gated index already came out as `Int64` is narrowed back to `Int32` when the buffer's element count fits `i32`.
 
-**Svod**: `gpudims.rs`
+This is the stage where `WHERE(valid, idx, Invalid)` keeps its shape: `Invalid` sources are left alone by `lower_weak_node`. In the worked example every `WeakInt` becomes `Int32` (`RANGE(R0, Reduce) : Scalar(Int32)`), and the `PARAM` sizes become `Int32` constants.
 
----
+## 18 — final symbolic
 
-## Stage 13: Add Loads
-
-> **Stage at a Glance**
->
-> **Goal**: Wrap INDEX operations in explicit LOAD
-> **Key Patterns**: Add LOAD to value operands
-> **Impact**: Makes memory operations explicit for codegen
-
-**What This Does**: Wraps INDEX operations in explicit LOAD.
-
-**Why This Matters**: Index operations compute addresses. LOAD actually reads memory. Making this explicit helps the code generator understand what memory accesses are needed.
-
-**Pattern**: `symbolic_simple + pm_expand_broadcast + pm_add_loads`
-
-```text
-// Before: bare index
-INDEX(ptr, i)
-
-// After: explicit load
-LOAD(INDEX(ptr, i))
-```
-
-Also loads a STORE's value operand when that value is itself an address.
-
-Note: only operands consumed *as values* are wrapped—an INDEX used purely as an address (a STORE target, a WMMA fragment address) stays bare.
-
-**Svod**: `devectorize.rs`
-
----
-
-## Stage 14: Devectorize
-
-> **Stage at a Glance**
->
-> **Goal**: Turn shaped operations into scalar ones
-> **Key Phases**: One combined rewrite
-> **Impact**: Every op becomes something the backend can emit
-
-**What This Does**: Handles the transition from shaped values to scalar hardware operations.
-
-**Why This Matters**: Devectorize lowers `STACK` and `INDEX` lane structure into
-per-lane scalar operations, while preserving contiguous memory accesses.
-
-**Scalarization is unconditional**: `devectorize_alu` computes the lane count as
-the product of the static shape and emits one operation per coordinate, then
-reassembles the result with `STACK` (or `GROUP`, for stores). There is no
-per-device fold-length table—re-vectorization is left to the backend, where
-LLVM's SLP vectorizer can widen the scalars again when profitable.
-
-Note: Svod always runs the devectorizer; there is no env var to skip it.
-
-**Pattern**: `symbolic_simple + devectorize_patterns + bool_storage_patterns + indexing_simplify`
-
-**Split shaped ALUs**:
-```text
-// A shaped add becomes one op per lane
-ADD(shaped_a, shaped_b) → STACK(ADD(a[0], b[0]), ADD(a[1], b[1]), ...)
-```
-
-**Bool storage**: bool LOAD/STORE go through `uint8`, because LLVM's `i1` can carry garbage in the upper bits.
-
-**Index simplification**: `indexing_simplify` folds the addressing arithmetic the scalarization exposes.
-
-**Svod**: `devectorize.rs`
-
----
-
-## Stage 15: Lower Index Dtype
-
-> **Stage at a Glance**
->
-> **Goal**: Convert the weak index type to concrete integers
-> **Key Patterns**: Operation-specific lowering based on value bounds
-> **Impact**: Indices use hardware-native integer types (i32 or i64)
-
-**What This Does**: Converts the abstract weak (`WeakInt`) dtype to concrete integers.
-
-**Why This Matters**: The weak index type is abstract—hardware doesn't have it. We need to convert to i32 or i64, which the hardware actually supports. (Tinygrad calls this dtype `Index`; in Svod it is `ScalarDType::WeakInt`.)
-
-**Pattern**: `lower_index_patterns` = `symbolic_simple + pm_fold_cast_const + pm_lower_index_dtype + indexing_simplify`
-
-```text
-// Before: weak index type
-idx: WeakInt
-
-// After: concrete type
-idx: i32  // or i64, based on bounds
-```
-
-**Operation-Specific Lowering**:
-
-Index type lowering uses a 3-phase cascade approach:
-
-1. **Create concrete wrappers** for leaf nodes (CONST, VCONST, PARAM) — each becomes `concrete.cast(weak)`
-2. **Process wrapped values upward** (Unary, Binary, WHERE, RANGE, STACK, SPECIAL) — propagates concrete types through the tree
-3. **Absorb the casts** at any non-weak consumer, which takes the concrete dtype on its own edge
-
-Each operation type has specific patterns:
-
-| Operation | Before | After |
-|-----------|--------|-------|
-| Binary ops | `ADD(WeakInt, WeakInt)` | `ADD(i32, i32)` with casts |
-| CONST | `CONST(5): WeakInt` | `CONST(5): i32` wrapped in `.cast(WeakInt)` |
-| WHERE | `WHERE(c, WeakInt, WeakInt)` | `WHERE(c, i32, i32)` (the condition is skipped) |
-| RANGE | `RANGE(end: WeakInt)` | `RANGE(end: i32)` with cast |
-| SPECIAL | `SPECIAL(gidx)` | Concrete integer from the op's bounds (in practice the default int) |
-| PARAM (variable) | `PARAM: WeakInt` | i32 if bounds fit, else i64 |
-| STACK | `STACK(WeakInt...)` | Scalar dtype on the STACK, each lane cast individually |
-| Double weak CAST | `CAST(weak, CAST(weak, x))` | Inner cast committed to a concrete dtype, outer weak cast kept |
-
-The `select_dtype()` function determines i32 vs i64 using vmin/vmax bounds analysis:
-```text
-dtype = default_int if bounds fit in [-2^31, 2^31-1] else i64
-```
-It also resolves `WeakFloat` to the default float, and has separate arms for unsigned and bool bounds.
-
-**Svod**: `symbolic/index_lowering.rs`
-
----
-
-## Additional Passes Around the Devectorizer
-
-Svod runs several passes between Stage 14 and index lowering that the 22-stage numbering doesn't name:
-
-| Pass | Purpose |
-|------|---------|
-| `sym()` (early symbolic) | Full symbolic simplification once the graph is scalar |
-| `memory_coalescing` | Merge neighbouring accesses into wider ones |
-| `pm_simplify_add_image` (bottom-up) | Image-dtype address simplification, together with `no_vectorized_alu` |
-| `extra_symbolic_patterns` | `sym() + indexing_simplify`, keeping indices weak while the index-validity rules can still fire |
+`symbolic()` (tier 2, no `pm_simplify_valid`/lane folds) on the concretely typed graph. With `SVOD_SPEC` on, `verify_no_legacy_index_dtype` asserts no `WeakInt` survived.
