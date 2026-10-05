@@ -1662,12 +1662,12 @@ impl ExecutionPlan {
     /// are updated. Buffers must be allocated to max variable values (which is
     /// the default when using `Variable::bind()`).
     ///
-    /// # Safety contract
+    /// # Errors
     ///
-    /// Variable values **must** fall within `[min_val, max_val]` bounds defined
-    /// at `Variable::new()` time. Exceeding `max_val` causes out-of-bounds buffer
-    /// access (buffers are allocated to `max_val`). Use `Variable::bind()` to
-    /// validate bounds before calling this method.
+    /// A value outside the `[min_val, max_val]` bounds declared at
+    /// `Variable::new()` is rejected before anything runs: buffers are
+    /// allocated to `max_val`, so the plan's bindings are left untouched and
+    /// an [`Error::Execution`](crate::error::Error::Execution) is returned.
     ///
     /// Variables not present in `var_vals` keep their existing values from
     /// `prepare()` (or the previous `execute_with_vars` call). Internal

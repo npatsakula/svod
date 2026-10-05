@@ -1,10 +1,9 @@
 //! SDMA (copy engine) ring bring-up for gfx942 (SDMA IP 4.4.2).
 //!
-//! SDMA registers are direct MMIO (not RLCG-gated). The ring is driven
-//! by the `RB_WPTR` register directly with the doorbell disabled — amdgpu's
-//! `use_doorbell=false` path: `RB_WPTR = wptr_dwords << 2` (a byte offset), and
-//! `RB_RPTR` reports progress the same way. This sidesteps the NBIO doorbell
-//! aperture (deferred until the compute queue needs it).
+//! SDMA registers are direct MMIO (not RLCG-gated). The ring's doorbell is
+//! enabled (SDMA 4.4.2 advances via the BAR2 doorbell, whose aperture the GIM
+//! routes on a VF); `submit` writes the byte-offset write pointer to both
+//! `RB_WPTR` and the doorbell, and `RB_RPTR` reports progress in bytes.
 
 use crate::error::Error;
 

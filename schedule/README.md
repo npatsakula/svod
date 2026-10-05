@@ -1,115 +1,43 @@
 # svod-schedule
 
-Pattern matching engine and RANGEIFY transformation for kernel generation.
+The scheduling and optimization passes of the Svod ML compiler, all written as
+`graph_rewrite` over `patterns!` matchers. RANGEIFY turns movement ops into
+explicit `RANGE` loops and `STAGE` / `INDEX` nodes, the kernel cut
+(`try_get_kernel_graph`) splits the graph into one `CALL` per kernel, and the
+optimizer picks each kernel's `Opt`s (`UPCAST`, `UNROLL`, `LOCAL`, `THREAD`,
+`GROUP`/`GROUPTOP`, `TC`, `PADTO`, `SWAP`, `NOLOCALS`) with hand-coded
+heuristics or BEAM search (`BEAM=N`, results cached in a sled database). Later
+passes expand, devectorize, assign GPU dimensions and linearize the kernel for
+`svod-codegen`. The symbolic simplifier covers constant folding, identities,
+term combining, division and modulo reasoning over value ranges, and dead-branch
+removal.
 
 ## Example
 
 ```rust
-use svod_schedule::{patterns, graph_rewrite};
+use svod_ir::{UOp, uop::eval::eval_add};
+use svod_schedule::{TypedPatternMatcher, graph_rewrite, patterns};
 
-let matcher = patterns! {
-    // Identity folding
+let matcher: TypedPatternMatcher = patterns! {
     Add[x, @zero] => x,
     Mul[x, @one] => x,
-
-    // Constant folding (fallible)
-    Add(a @const(a_val), b @const(b_val))
-      => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
-
-    // Self-folding
-    Neg(Neg(x)) => x,
+    Add(a @const(a_val), _b @const(b_val))
+        => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 };
+// Rewrites `graph: Arc<UOp>` to a fixed point.
 let optimized = graph_rewrite(&matcher, graph, &mut ());
 ```
 
 ## Features
 
-**Supported:**
+| Feature | Effect |
+|---------|--------|
+| `z3` | `svod_schedule::z3::verify_equivalence`: proves rewrites with the Z3 SMT solver |
+| `proptest` | enables `svod-ir`'s proptest strategies |
+| `testing` | tracing-subscriber helpers for tests |
 
-- Declarative `patterns!` DSL for rewrite rules
-- Fixed-point graph rewriting
-- RANGEIFY: movement ops -> BUFFERIZE+INDEX -> kernels
-- Symbolic simplification (17+ pattern categories)
-- Heuristic-based kernel optimization
+Documentation:
 
-**Planned:**
-
-- BEAM search optimization
-- Multi-device kernel splitting
-
-## Optimizations
-
-| Optimization | Status | Description |
-|--------------|--------|-------------|
-| **Symbolic Simplification** | | |
-| Constant folding | ✅ | Fold unary/binary/ternary ops on constants |
-| Identity elimination | ✅ | x+0, x*1, x/1, x|0, x^0 → x |
-| Zero propagation | ✅ | x*0, x&0 → 0 |
-| Self-folding | ✅ | x//x→1, x&x→x, x|x→x, x^x→0 |
-| ALU folding | ✅ | (x+c1)+c2 → x+(c1+c2) |
-| Term combining | ✅ | x+x→2*x, (c1*x)+(c2\*x)→(c1+c2)\*x |
-| Division distribution | ✅ | (a+b)//c → a//c + b//c when exact |
-| Dead code elimination | ✅ | WHERE(true,t,f)→t, dead loops |
-| **Kernel Optimization** | | |
-| Tensor cores (TC) | ✅ | WMMA for matmul patterns |
-| Upcasting | ✅ | Vectorization (float4, etc.) |
-| Loop unrolling | ✅ | Unroll reductions ≤32 |
-| Local memory | ✅ | GPU shared memory allocation |
-| Grouped reduction | ✅ | 2-stage GROUP/GROUPTOP |
-| Matvec optimization | ✅ | Specialized MV pattern |
-| CPU threading | ✅ | `core_id` split, `SVOD_THREADS` ways by default |
-| Axis reordering | ✅ | SWAP for memory access |
-| **RANGEIFY** | | |
-| Movement op removal | ✅ | RESHAPE, PERMUTE, EXPAND, etc. |
-| Buffer folding | ✅ | Remove noop BUFFERIZE |
-| Dead axis removal | ✅ | Eliminate unused dimensions |
-| Range flattening | ✅ | Flatten nested RANGE ops |
-| Reduce simplification | ✅ | Optimize reduction patterns |
-| Kernel splitting | ✅ | Split by STORE operations |
-| Reduce splitting | ✅ | 2-stage large reductions |
-| Buffer cost analysis | ✅ | PContig cost model |
-| **Planned** | | |
-| BEAM search | ❌ | Exhaustive optimization search |
-| Image float4 | ❌ | Image type vectorization |
-| Multi-device | ❌ | Ring allreduce, multi-rank |
-| Kernel caching | ❌ | Compile cache |
-| PADTO | ❌ | Axis padding for alignment |
-
-## Testing
-
-```bash
-cargo test -p svod-schedule
-cargo test -p svod-schedule --features z3  # with Z3 verification
-```
-
-### Property-Based Testing
-
-Uses [proptest](https://github.com/proptest-rs/proptest) to verify algebraic properties across randomly generated expression trees (1000+ cases per property):
-
-| Category | Properties |
-|----------|------------|
-| Identity | x+0→x, x*1→x, x-0→x, x/1→x, x|0→x, x^0→x |
-| Zero | x*0→0, x&0→0, 0/x→0 |
-| Self-fold | x/x→1, x&x→x, x|x→x, x\<x→false, x==x→true |
-| Structural | Idempotence, dtype preservation, cost bounds |
-
-### Z3 Verification
-
-Uses [Z3](https://github.com/Z3Prover/z3) SMT solver to formally prove semantic equivalence of rewrites. Z3 is a theorem prover from Microsoft Research that can verify mathematical properties by constraint solving.
-
-**How it works:**
-
-1. Convert original and simplified UOps to Z3 expressions
-2. Assert `NOT(original == simplified)`
-3. If UNSAT → rewrite is proven correct
-4. If SAT → found counterexample (bug)
-
-```bash
-cargo test -p svod-schedule --features z3
-```
-
-**Resources:**
-
-- [Z3 GitHub](https://github.com/Z3Prover/z3)
-- [Z3 Guide](https://microsoft.github.io/z3guide/)
-- [z3.rs bindings](https://github.com/prove-rs/z3.rs)
+- Pattern engine: <https://svod.vpermilp.online/docs/architecture/optimizations/pattern-system>
+- Rangeify and the kernel cut: <https://svod.vpermilp.online/docs/architecture/codegen/rangeify>
+- Kernel search (heuristics, BEAM, tensor cores): <https://svod.vpermilp.online/docs/architecture/optimizations/kernel-search>

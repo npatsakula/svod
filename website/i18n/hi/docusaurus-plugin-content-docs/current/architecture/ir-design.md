@@ -2,11 +2,11 @@
 sidebar_label: IR डिज़ाइन फ़िलॉसफ़ी
 ---
 
-# एक IR सबके लिए
+# एक IR सबके लिए {#one-ir-to-rule-them-all}
 
-आप एक स्लो मॉडल डीबग कर रहे हैं। प्रोफ़ाइलर कहता है "kernel X 200ms लेता है" लेकिन आपको कोई आइडिया नहीं कि kernel X असल में *करता* क्या है। आप PyTorch के dispatcher से ट्रेस करते हैं, फिर ATen, फिर TorchInductor, फिर Triton IR, और आख़िर में LLVM IR पर लैंड करते हैं। पाँच अलग-अलग रिप्रेज़ेंटेशन, पाँच अलग-अलग मेंटल मॉडल, पाँच अलग-अलग डीबगिंग टूल।
+आप एक स्लो मॉडल डीबग कर रहे हैं। प्रोफ़ाइलर कहता है "kernel X 200ms लेता है" लेकिन आपको कोई आइडिया नहीं कि kernel X असल में *करता* क्या है। आप PyTorch के dispatcher से ट्रेस करते हैं, फिर ATen, फिर TorchInductor, फिर Triton IR, और आख़िर में LLVM IR पर पहुँचते हैं। पाँच अलग-अलग रिप्रेज़ेंटेशन, पाँच अलग-अलग मेंटल मॉडल, पाँच अलग-अलग डीबगिंग टूल।
 
-यह मॉडर्न ML कम्पाइलेशन की हक़ीक़त है। TensorFlow के XLA की भी ऐसी ही कहानी है: Python → Graph → XLA HLO → MLIR → LLVM IR। हर लेयर एक असली प्रॉब्लम सॉल्व करने के लिए जोड़ी गई, लेकिन जमा होती कॉम्प्लेक्सिटी बहुत ज़्यादा है।
+यह मॉडर्न ML कम्पाइलेशन की हक़ीक़त है। TensorFlow के XLA की भी ऐसी ही कहानी है: Python → Graph → XLA HLO → MLIR → LLVM IR। हर लेयर एक असली प्रॉब्लम सॉल्व करने के लिए जोड़ी गई, लेकिन जमा होती कॉम्प्लेक्सिटी हैरान करने वाली है।
 
 Svod एक अलग तरीका अपनाता है, [Tinygrad](https://github.com/tinygrad/tinygrad) से उधार लिया हुआ: **tensor से मशीन कोड तक एक ही IR**।
 
@@ -18,7 +18,7 @@ flowchart TD
     TF2 --> TF3["XLA HLO"]
     TF3 --> TF4["MLIR dialects"]
     TF4 --> TF5["LLVM IR"]
-    TF5 --> TF6["Machine code"]
+    TF5 --> TF6["मशीन कोड"]
   end
   subgraph PT["PyTorch (4 IRs)"]
     direction TB
@@ -26,24 +26,24 @@ flowchart TD
     PT2 --> PT3["Inductor IR"]
     PT3 --> PT4["Triton IR"]
     PT4 --> PT5["LLVM/PTX"]
-    PT5 --> PT6["Machine code"]
+    PT5 --> PT6["मशीन कोड"]
   end
   subgraph SV["Svod (1 IR)"]
     direction TB
-    SV1["Rust/Python"] --> SV2["UOp IR"]
-    SV2 --> SV3["Machine code"]
+    SV1["Rust tensor API / ONNX import"] --> SV2["UOp IR"]
+    SV2 --> SV3["मशीन कोड"]
   end
 ```
 
-सबसे सिंपल आर्किटेक्चर अक्सर जीतता है। यह चैप्टर बताता है कि कैसे एक सोच-समझकर डिज़ाइन किया गया IR पूरे कम्पाइलर स्टैक की जगह ले सकता है।
+अक्सर सबसे सरल आर्किटेक्चर ही जीतता है। यह चैप्टर समझाता है कि एक सोच-समझकर डिज़ाइन किया गया IR पूरे कम्पाइलर स्टैक की जगह कैसे ले सकता है।
 
 ---
 
-## UOp: यूनिवर्सल नोड
+## UOp: यूनिवर्सल नोड {#uop-the-universal-node}
 
-**UOp** (micro-operation) कम्प्यूटेशन ग्राफ़ में एक नोड है। लेकिन दूसरे IRs के नोड्स से अलग, UOp *किसी भी* ऐब्स्ट्रैक्शन लेवल पर ऑपरेशन रिप्रेज़ेंट कर सकता है — हाई-लेवल tensor reshapes से लेकर इंडिविजुअल CPU इंस्ट्रक्शन तक।
+एक **UOp** (micro-operation) कम्प्यूटेशन ग्राफ़ का एक नोड है। लेकिन दूसरे IRs के नोड्स के उलट, एक UOp *किसी भी* abstraction लेवल पर ऑपरेशन रिप्रेज़ेंट कर सकता है — हाई-लेवल tensor reshapes से लेकर अलग-अलग CPU instructions तक।
 
-मुख्य इनसाइट यह है: "tensor ऑपरेशन" और "लूप स्ट्रक्चर" और "मेमोरी एक्सेस" के लिए अलग-अलग IR रखने की बजाय, हम सब एक ही enum में डालते हैं:
+मुख्य बात यह है: "tensor operations", "loop structures" और "memory accesses" के लिए अलग-अलग IRs रखने की बजाय, हम इन सबको एक enum में रखते हैं (`ir/src/op.rs`):
 
 ```rust
 pub enum Op {
@@ -64,29 +64,34 @@ pub enum Op {
     Binary(BinaryOp, Arc<UOp>, Arc<UOp>),  // Add, Mul, etc.
     Unary(UnaryOp, Arc<UOp>),              // Sqrt, Exp, etc.
     Ternary(TernaryOp, Arc<UOp>, Arc<UOp>, Arc<UOp>),  // Where, MulAcc, etc.
+
+    // Compilation stages are nodes too
+    Program { sink: Arc<UOp>, info: Box<ProgramInfo>, linear: Option<Arc<UOp>>, source: Option<Arc<UOp>>, binary: Option<Arc<UOp>> },
+    // ... 60 variants in all
 }
 ```
 
-enum में ~60 Op वैरिएंट हैं जो ऐब्स्ट्रैक्शन लेवल के अनुसार ऑर्गनाइज़ हैं (~80+ इंडिविजुअल UnaryOp/BinaryOp/TernaryOp वैल्यूज़ सहित):
+Enum में abstraction लेवल के हिसाब से व्यवस्थित 60 variants हैं (अलग-अलग `UnaryOp`/`BinaryOp`/`TernaryOp` kinds गिनें तो लगभग 100 ऑपरेशन); [op bestiary](./op-bestiary.md) हर एक को दर्ज करता है:
 
 | कैटेगरी | उदाहरण | क्या रिप्रेज़ेंट करता है |
-|---------|--------|----------------------|
+|----------|----------|-------------------|
 | **Movement** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD` | Tensor shape ट्रांसफ़ॉर्मेशन |
-| **Reduction** | `REDUCE_AXIS`, `REDUCE` | मैथमैटिकल एग्रीगेशन |
-| **Control** | `RANGE`, `END`, `IF`, `BARRIER` | लूप और ब्रांच स्ट्रक्चर |
+| **Reduction** | `REDUCE_AXIS`, `REDUCE` | गणितीय aggregations |
+| **Control** | `RANGE`, `END`, `IF`, `BARRIER` | लूप और branch स्ट्रक्चर |
 | **Memory** | `LOAD`, `STORE`, `INDEX`, `BUFFER` | हार्डवेयर मेमोरी एक्सेस |
-| **ALU** | `ADD`, `MUL`, `SQRT`, `EXP`, `WHERE` | CPU/GPU इंस्ट्रक्शन |
+| **ALU** | `ADD`, `MUL`, `SQRT`, `EXP`, `WHERE` | CPU/GPU instructions |
+| **Callable** | `CALL`, `FUNCTION`, `PROGRAM`, `LINEAR`, `SOURCE` | Kernels और उनकी कम्पाइलेशन स्टेजें |
 | **Advanced** | `WMMA` | Tensor cores और उनका expansion metadata |
 
-जब आप UOp ग्राफ़ प्रिंट करते हैं, आपको उसका tree स्ट्रक्चर दिखता है:
+जब आप `uop.tree()` से UOp ग्राफ़ प्रिंट करते हैं, तो उसका स्ट्रक्चर ASCII tree के रूप में दिखता है:
 
 ```mermaid
 flowchart TD
   N42["[42] STORE : Void"] --> N35["[35] INDEX : Float32"]
-  N42 --> N40["[40] REDUCE(Add, num_axes=1) : Float32"]
+  N42 --> N40["[40] REDUCE(Add, num_axes=1, ranges=[30]) : Float32"]
   N35 --> N10["[10] PARAM(slot=0) : Float32"]
   N35 --> N31["[31] RANGE(R0, Global) : Index"]
-  N31 --> N5["[5] CONST(4) : Index"]
+  N31 --> N5["[5] CONST(Int(4)) : Index"]
   N40 --> N38["[38] MUL : Float32"]
   N40 --> N30["[30] RANGE(R1, Reduce) : Index"]
   N30 --> N5
@@ -94,119 +99,131 @@ flowchart TD
   N38 --> N37["[37] LOAD : Float32"]
 ```
 
-उन arrows पर ध्यान दें जो "(same RANGE as above)" को पॉइंट करते हैं? यह सिर्फ़ pretty-printing नहीं है — यह एक फ़ंडामेंटल प्रॉपर्टी है जिसे **hash consing** कहते हैं।
+Text रूप `├── `, `│   ` और `└── ` glyphs इस्तेमाल करता है, हर नोड को `[id] NAME : dtype shape=[...]` के रूप में लेबल करता है, और जो नोड पहले आ चुका है उसे back-reference के रूप में प्रिंट करता है। सबसे छोटा असली उदाहरण, `1.0 + 1.0`:
+
+```text
+[1] Add : Scalar(Float32) shape=[]
+├── [0] CONST(Float(1.0)) : Scalar(Float32) shape=[]
+└── [0] → (see above)
+```
+
+दोनों operands नोड `[0]` हैं। यह सिर्फ़ सुंदर प्रिंटिंग नहीं — यह एक बुनियादी property है जिसे **hash consing** कहते हैं।
 
 ---
 
-## Hash Consing: स्ट्रक्चरल शेयरिंग
+## Hash Consing: स्ट्रक्चरल शेयरिंग {#hash-consing-structural-sharing}
 
-जब आप Svod में एक ही एक्सप्रेशन दो बार बनाते हैं, आपको *वही पॉइंटर* मिलता है। इक्वल वैल्यूज़ नहीं — वही मेमोरी एड्रेस।
+जब आप Svod में एक ही expression दो बार बनाते हैं, तो आपको *वही pointer* मिलता है। बराबर values नहीं — वही मेमोरी address।
 
 ```rust
 let a = x.try_add(&y)?;
 let b = x.try_add(&y)?;
 
-assert!(Arc::ptr_eq(&a, &b));  // Same pointer!
+assert!(Arc::ptr_eq(&a.uop(), &b.uop()));  // Same pointer!
 ```
 
 :::note[Origin नोड की आइडेंटिटी का हिस्सा है]
-`SVOD_ORIGIN=1` के साथ हर नोड वह `OriginScope` भी साथ रखता है जिसके अंदर वह बना था, और यह origin
-उसके content hash में घुल जाता है। तब अलग-अलग scopes में बने दो एक जैसे सबग्राफ़ *अलग* नोड होते
-हैं और तब तक शेयर नहीं होते जब तक kernel cut origins हटा नहीं देता। लिटरल इसका अपवाद हैं, और
-इनके साथ `BUFFER`/`PARAM`/`UNIQUE` भी: एक ही कॉन्स्टेंट दो scopes अपने-अपने तौर पर बनाते हैं,
-इसलिए वहाँ origin रखने से वही नोड बँट जाता जिसे cut बाद में फिर से जोड़ देता है। इस ट्रेड-ऑफ़ के लिए
-[Profiling और Benchmarking](../tile-kernels/profiling.md#attributing-kernels-to-model-code) में “कर्नेल को model code से जोड़ना”
-सेक्शन देखें।
+`SVOD_ORIGIN=1` के साथ हर नोड वह `OriginScope` भी रखता है जिसके नीचे वह बना था, उसके
+content hash में मिलाकर। तब अलग-अलग scopes में बने दो एक जैसे subgraphs *अलग* नोड होते हैं
+और तब तक शेयर नहीं होते जब तक kernel cut origins हटा न दे। Origin-opaque नोड अपवाद हैं:
+`CONST`, `VCONST`, `BUFFER`, `PARAM`, `UNIQUE`, `LUNIQUE`, `STACK`, `BIND`, `DEFINE_VAR`, `NOOP`
+और `Index` dtype वाली हर चीज़ — दो scopes एक ही constant स्वतंत्र रूप से बनाते हैं, इसलिए वहाँ
+origin बस उस नोड को बाँट देता जिसे cut फिर से मिला देता है। देखें
+[कर्नेल Origins](./kernel-origins.md#costs-and-trade-offs)।
 :::
 
-यह एक ग्लोबल lock-free cache (papaya crate इस्तेमाल करके, मेमोरी लीक से बचने के लिए `Weak` रेफ़रेंस के साथ) से काम करता है। UOp बनाते समय, पहले चेक करते हैं कि आइडेंटिकल पहले से मौजूद है या नहीं:
+Intern table (`ir/src/uop/hash_consing.rs`) एक lock-free `papaya::HashMap` है जिसकी keys में पहले से गिना हुआ structural hash और एक `Weak<UOp>` होता है, इसलिए कोई unreferenced नोड leak होने की बजाय अपना आख़िरी `Arc` drop होते ही table से निकल जाता है:
 
 ```rust
+// Simplified from ir/src/uop/hash_consing.rs
+struct InternKey { hash: u64, node: Weak<UOp> }
+static UOPS: OnceLock<papaya::HashMap<InternKey, (), PrecomputedHash>>;
+
 pub fn new(op: Op, dtype: DType) -> Arc<Self> {
-    let key = UOpKey::new(&op, dtype);
-
-    // Check cache first
-    if let Some(existing) = CACHE.get(&key) {
-        return existing;
+    let hash = xxh64(&(dtype, &op, origin::current()));
+    if let Some(existing) = UOPS.get_key_value(&Probe { hash, op: &op, dtype, .. })
+        .and_then(|(key, _)| key.node.upgrade())
+    {
+        return existing;                       // same structure → same Arc
     }
-
-    // Create new and cache it
-    let uop = Arc::new(UOp { op, dtype, ... });
-    CACHE.insert(key, uop.clone());
-    uop
+    let node = Arc::new(UOp { op, dtype, .. });
+    UOPS.compute(InternKey { hash, node: Arc::downgrade(&node) }, /* abort if a racing thread inserted first */);
+    node
 }
 ```
 
-ML इंजीनियरों के लिए यह क्यों ज़रूरी है?
+ML इंजीनियरों के लिए यह क्यों मायने रखता है?
 
-- **पॉइंटर इक्वैलिटी ही सिमैंटिक इक्वैलिटी है।** दो subexpressions आइडेंटिकल हैं या नहीं चेक करने के लिए, बस पॉइंटर कम्पेयर करें: `Arc::ptr_eq(&a, &b)`। कोई tree traversal नहीं चाहिए।
+- **Pointer equality ही semantic equality है।** यह जाँचने के लिए कि दो subexpressions एक जैसे हैं, बस pointers की तुलना करें: `Arc::ptr_eq(&a, &b)`। Tree traversal की ज़रूरत नहीं।
 
-- **पैटर्न मैचिंग O(1) है।** जब ऑप्टिमाइज़र पूछता है "क्या मैंने यह पैटर्न पहले देखा है?", पॉइंटर कम्पेरिज़न तुरंत जवाब देता है।
+- **Pattern matching O(1) है।** जब ऑप्टिमाइज़र पूछता है "क्या मैंने यह pattern पहले देखा है?", pointer तुलना तुरंत जवाब देती है।
 
-- **मेमोरी एफ़िशिएंसी।** कॉमन subexpressions (सोचें: attention में शेयर्ड कम्प्यूटेशन, gradient ग्राफ़) एक बार स्टोर होते हैं, डुप्लिकेट नहीं।
+- **मेमोरी की बचत।** Common subexpressions (जैसे attention में शेयर्ड कम्प्यूटेशन, gradient graphs) एक बार स्टोर होते हैं, दोहराए नहीं जाते।
 
-- **Thread सेफ़्टी।** अलग-अलग threads से एक ही कम्प्यूटेशन एक ही ऑब्जेक्ट प्रोड्यूस करता है — कोई सिंक्रोनाइज़ेशन बग नहीं।
+- **Thread safety।** अलग-अलग threads से आया एक ही कम्प्यूटेशन एक ही object बनाता है — कोई synchronization bugs नहीं।
 
-Tree printout यह दिखाता है: जब आप `[10] → (same as above)` देखते हैं, वो कॉपी नहीं है — वो *वही नोड* है जो मल्टीपल जगहों से रेफ़रेंस होता है।
+Tree printout यही दिखाता है: जब आप `[10] → (see above)` देखते हैं, तो वह copy नहीं — वह कई जगहों से refer किया गया *वही नोड* है।
 
 ---
 
-## एक्सप्लिसिट लूप: `RANGE` ऑपरेशन
+## एक्सप्लिसिट लूप: `RANGE` ऑपरेशन {#explicit-loops-the-range-operation}
 
-ज़्यादातर ML IRs लूप्स को ऑपरेशन के अंदर छिपाते हैं। ONNX में, रिडक्शन ऐसा दिखता है:
+ज़्यादातर ML IRs लूप्स को ऑपरेशनों के अंदर छिपा देते हैं। ONNX में एक reduction ऐसा दिखता है:
 
 ```python
 ReduceSum(data, axes=[1], keepdims=0)
 ```
 
-लूप कहाँ है? यह implicit है — `ReduceSum` के रनटाइम इम्प्लीमेंटेशन के अंदर कहीं। आप इसे देख नहीं सकते, मॉडिफ़ाई नहीं कर सकते, रीज़न नहीं कर सकते।
+लूप कहाँ है? वह implicit है — runtime के `ReduceSum` implementation में कहीं अंदर। आप उसे देख नहीं सकते, बदल नहीं सकते, उसके बारे में तर्क नहीं कर सकते।
 
-Svod `RANGE` ऑपरेशन से लूप्स को *explicit* बनाता है। वही रिडक्शन बनती है:
+Svod `RANGE` ऑपरेशनों से लूप्स को *एक्सप्लिसिट* बनाता है। वही reduction बन जाता है:
 
 ```mermaid
 flowchart TD
   RED["REDUCE(Add)"] --> LD["LOAD"]
-  RED --> R1["RANGE(axis=1, Reduce) reduction loop"]
+  RED --> R1["RANGE(axis=1, Reduce) reduction लूप"]
   LD --> IDX["INDEX"]
   IDX --> BUF["BUFFER"]
-  IDX --> R0["RANGE(axis=0, Global) outer loop, parallelized"]
+  IDX --> R0["RANGE(axis=0, Global) बाहरी लूप, parallelized"]
   IDX --> R1
   R0 --> C128["CONST(128)"]
   R1 --> C64["CONST(64)"]
 ```
 
-हर `RANGE` का एक **AxisType** होता है जो code generator को बताता है कि इसे कैसे कम्पाइल करना है:
+हर `RANGE` के पास एक **AxisType** होता है जो ऑप्टिमाइज़र और कोड जनरेटर को बताता है कि उसे कैसे compile करना है:
 
-| AxisType | CPU | CUDA | मतलब |
-|----------|-----|------|------|
-| **Weak** | `for` loop | `for` loop | अनपैरेललाइज़्ड रेंज; rangeify का डिफ़ॉल्ट |
-| **Loop** | `for` loop | `for` loop | एक्सप्लिसिट रेगुलर लूप |
-| **Global** | Thread pool | `blockIdx` | आउटर पैरेलल डायमेंशन |
-| **Thread** | Thread pool | — | CPU पैरेलिज़्म |
-| **Warp** | (N/A) | warp/wavefront | सब-ग्रुप पैरेलिज़्म |
-| **Local** | (N/A) | `threadIdx` | वर्कग्रुप पैरेलिज़्म |
-| **GroupReduce** | (N/A) | Shared memory | टू-स्टेज रिडक्शन |
-| **Upcast** | SIMD vector | Register tile | वेक्टराइज़ेशन |
-| **Reduce** | Accumulator | Warp reduce | रिडक्शन डायमेंशन |
-| **Unroll** | Unrolled | Unrolled | लूप अनरोलिंग |
+| AxisType | Priority | किसमें lower होता है | मतलब |
+|----------|----------|------------|---------|
+| **Placeholder** | -3 | — | RESHAPE lowering को cache करते समय इस्तेमाल होने वाला अस्थायी canonical range |
+| **Device** | -2 | launch पर per-device bind | multi-device tensor का device axis |
+| **Weak** | -1 | serial `for` लूप | बिना parallelization का range; rangeify का default, जिसमें से ऑप्टिमाइज़र चुनता है |
+| **Loop** | -1 | serial `for` लूप | एक्सप्लिसिट सामान्य लूप |
+| **Global** | 0 | `gidx` (`SPECIAL`) | GPU grid dimension |
+| **Thread** | 0 | thread pool पर `gidx` (`SPECIAL`) | CPU parallelism |
+| **Warp** | 1 | सबसे आगे की local dimension | हार्डवेयर lane (tensor-core fragments) |
+| **Local** | 2 | `lidx` (`SPECIAL`) | GPU workgroup dimension |
+| **GroupReduce** | 2 | local dimension + shared-memory stage | दो-स्टेज reduction |
+| **Upcast** | 3 | vector lanes (`STACK`) | Vectorization |
+| **Reduce** | 4 | accumulator लूप | Reduction dimension |
+| **Unroll** | 5 | unrolled copies | लूप unrolling |
 
-AxisType हाइरार्की (Weak/Loop → Global/Thread → Warp → Local/GroupReduce → Upcast → Reduce → Unroll) हार्डवेयर एक्ज़ीक्यूशन मॉडल से मैप करती है — आउटर लूप्स की प्रायोरिटी कम होती है। `AxisType::Global` वाला `RANGE` CUDA में `blockIdx.x` बनता है। `AxisType::Local` वाला `RANGE` `threadIdx.x` बनता है।
+Priority लूप nesting का क्रम है — कम values बाहरी लूप्स हैं। `AxisType::Global` वाला `RANGE` CUDA पर `blockIdx.x` बनता है; `AxisType::Local` वाला `RANGE` `threadIdx.x` बनता है; वही `Global` range CPU पर एक work item होगा जिसे thread pool बाँटता है। ऑप्टिमाइज़र किसी range का type बदलता है (`Weak` → `Upcast`, `Weak` → `Local`, …) और वही एक field तय करता है कि लूप कैसे compile होगा।
 
-एक्सप्लिसिट लूप्स क्यों ज़रूरी हैं:
+एक्सप्लिसिट लूप्स क्यों मायने रखते हैं:
 
-- **ऑप्टिमाइज़ेशन विज़िबल है।** आप *देख* सकते हैं कि कौन से लूप पैरेललाइज़ होंगे, कौन से अनरोल होंगे, कौन से SIMD इस्तेमाल करेंगे।
+- **ऑप्टिमाइज़ेशन दिखाई देता है।** आप *देख* सकते हैं कि कौन-से लूप parallelize होंगे, कौन-से unroll होंगे, कौन-से SIMD इस्तेमाल करेंगे।
 
-- **शेड्यूलिंग ग्राफ़ रीराइटिंग है।** लूप ऑर्डर बदलना, tiling, या अनरोलिंग बस एक पैटर्न ट्रांसफ़ॉर्मेशन है — कोई स्पेशल "scheduling pass" नहीं।
+- **Scheduling ग्राफ़ रीराइटिंग है।** लूप का क्रम, tiling या unrolling बदलना बस एक pattern ट्रांसफ़ॉर्मेशन है — कोई ख़ास "scheduling pass" नहीं।
 
-- **हर स्टेज पर वही IR।** tensor लेवल पर "iterate over batch dimension" रिप्रेज़ेंट करने वाला `RANGE` *वही* `RANGE` है जो जनरेटेड कोड में `for (int i = 0; i < N; i++)` बनता है।
+- **हर स्टेज पर वही IR।** Tensor लेवल पर "batch dimension पर iterate करो" को रिप्रेज़ेंट करने वाला `RANGE` *वही* `RANGE` है जो generated code में `for (int i = 0; i < N; i++)` बनता है।
 
 ---
 
-## ग्राफ़ रीराइटिंग: एक ट्रांसफ़ॉर्मेशन मैकेनिज़्म
+## ग्राफ़ रीराइटिंग: एक ट्रांसफ़ॉर्मेशन मैकेनिज़्म {#graph-rewriting-one-transformation-mechanism}
 
-ट्रेडिशनल कम्पाइलरों में दर्जनों स्पेशलाइज़्ड पासेज़ होते हैं: constant folding, dead code elimination, loop unrolling, operator fusion। हर पास का अपना कस्टम लॉजिक, कस्टम डेटा स्ट्रक्चर, कस्टम बग्स।
+पारंपरिक कम्पाइलरों में दर्जनों ख़ास passes होते हैं: constant folding, dead code elimination, loop unrolling, operator fusion। हर pass का अपना logic, अपने data structures, अपने bugs।
 
-Svod एक मैकेनिज़्म इस्तेमाल करता है: **पैटर्न-आधारित ग्राफ़ रीराइटिंग**।
+Svod एक ही मैकेनिज़्म इस्तेमाल करता है: **pattern-based ग्राफ़ रीराइटिंग**, `patterns!` DSL में लिखी और `graph_rewrite` से लागू की जाती है:
 
 ```rust
 patterns! {
@@ -225,16 +242,9 @@ patterns! {
 }
 ```
 
-DSL बहुत एक्सप्रेसिव है:
+`[x, y]` commutative है, `(x, y)` ordered, `@zero`/`@one` किसी भी dtype के constant से match करते हैं, `c @const(val)` value को bind करता है, दोहराया गया नाम (`x, x`) वही नोड माँगता है, और right-hand side `Arc<UOp>`, `Option<Arc<UOp>>` (`None` यानी मना) या `RewriteResult` लौटाता है। Production rules ऐसी ही दिखती हैं लेकिन उनमें guards होते हैं (असली `x + 0` rule `-0.0` के लिए मना कर देता है); पूरा syntax [पैटर्न इंजन](./optimizations/pattern-system.md) चैप्टर में है।
 
-- **`[x, y]` — commutative।** दोनों orderings ट्राई करता है (`ADD`, `MUL`, वगैरह के लिए)
-- **`(x, y)` — ordered।** बिल्कुल इसी ऑर्डर में मैच करता है।
-- **`@zero`, `@one` — सिमैंटिक कॉन्स्टेंट।** किसी भी dtype के लिए काम करता है।
-- **`c @const(val)` — वैल्यू एक्सट्रैक्ट करें।** कम्पाइल-टाइम कम्प्यूटेशन के लिए।
-- **`x, x` — same operand।** पॉइंटर इक्वैलिटी डिटेक्ट करता है।
-- **`=>` — रीराइट।** `Arc<UOp>`, `Option<Arc<UOp>>` (`None` का मतलब स्किप) या `RewriteResult` रिटर्न करता है।
-
-रीराइट इंजन बॉटम-अप पैटर्न अप्लाई करता है जब तक कोई और मैच न हो:
+`graph_rewrite` पहले children पर जाता है (post-order), हर फिर से बने नोड पर matcher लागू करता है, और हर replacement पर उसे तब तक दोबारा लागू करता है जब तक वह नोड fixpoint पर न पहुँच जाए; नतीजे हर नोड के लिए memoize होते हैं:
 
 ```text
 Original:       Add(Mul(x, 1), 0)
@@ -242,40 +252,44 @@ After Mul:      Add(x, 0)         # Mul(x, 1) → x
 After Add:      x                 # Add(x, 0) → x
 ```
 
-यह सिंगल मैकेनिज़्म हैंडल करता है:
+(`graph_rewrite_bottom_up`, उलझाने वाले ढंग से, *दूसरा* mode है: यह नीचे उतरने से पहले patterns लागू करता है, इसलिए वे मूल children देखते हैं — यह नामकरण Tinygrad का है।)
 
-- **एल्जेब्रिक सिम्प्लिफ़िकेशन** — constant folding, identity removal
-- **Rangeify ट्रांसफ़ॉर्मेशन** — movement ops → explicit लूप्स
-- **कर्नेल ऑप्टिमाइज़ेशन** — vectorization, unrolling, tensor cores
-- **कोड जनरेशन** — हार्डवेयर प्रिमिटिव्स में लोअरिंग
+यह एक मैकेनिज़्म सँभालता है:
 
-वही पैटर्न, वही इंजन, हर स्टेज के लिए अलग पैटर्न सेट।
+- **Algebraic simplification** — constant folding, identity हटाना
+- **Rangeify ट्रांसफ़ॉर्मेशन** — movement ops → एक्सप्लिसिट लूप्स
+- **Kernel ऑप्टिमाइज़ेशन** — vectorization, unrolling, tensor cores
+- **कोड जनरेशन** — हार्डवेयर primitives तक lowering
+
+वही patterns, वही इंजन, हर स्टेज के लिए अलग pattern sets।
 
 ---
 
-## वर्क्ड उदाहरण: Matmul की यात्रा
+## वर्क्ड उदाहरण: Matmul की यात्रा {#worked-example-matmul-journey}
 
-चलिए `C = A @ B` (4×4 मैट्रिक्स मल्टिप्लाई) को पूरी पाइपलाइन से ट्रेस करते हैं।
+चलिए `C = A @ B` (4×4 मैट्रिक्स गुणा) को पूरी पाइपलाइन से ट्रेस करते हैं।
 
-### स्टेज 1: Tensor कंस्ट्रक्शन
+### स्टेज 1: Tensor कंस्ट्रक्शन {#stage-1-tensor-construction}
 
-जब आप `A.matmul(&B)` लिखते हैं, Svod एक हाई-लेवल UOp ग्राफ़ बनाता है:
+जब आप `A.matmul(&B)?` लिखते हैं, Svod दोनों operands को एक साझा rank तक reshape करता है, `B` को transpose करता है, गुणा करता है (broadcast `EXPAND`s डालता है) और आख़िरी axis पर sum करता है:
 
 ```mermaid
 flowchart TD
   RA["REDUCE_AXIS(Add, axes=[2])"] --> MUL["MUL"]
-  MUL --> EA["EXPAND (A: [4,4] to [4,4,4])"]
-  MUL --> EB["EXPAND (B: [4,4] to [4,4,4])"]
-  EA --> BA["BUFFER(A)"]
-  EB --> PERM["PERMUTE (transpose for broadcasting)"]
-  PERM --> BB["BUFFER(B)"]
+  MUL --> EA["EXPAND (A: [4,1,4] से [4,4,4])"]
+  MUL --> EB["EXPAND (B: [1,4,4] से [4,4,4])"]
+  EA --> RSA["RESHAPE [4,4] से [4,1,4]"]
+  RSA --> BA["BUFFER(A)"]
+  EB --> PERM["PERMUTE (transpose)"]
+  PERM --> RSB["RESHAPE [4,4] से [1,4,4]"]
+  RSB --> BB["BUFFER(B)"]
 ```
 
-यह प्योर math है: "A और B को expand करो ताकि डायमेंशन अलाइन हों, elementwise मल्टिप्लाई करो, contracted axis पर sum करो।"
+यह शुद्ध गणित है: "dimensions मिलाने के लिए A और B को expand करो, elementwise गुणा करो, contracted axis पर sum करो।"
 
-### स्टेज 2: Rangeify
+### स्टेज 2: Rangeify {#stage-2-rangeify}
 
-Rangeify पास movement ops (`EXPAND`, `PERMUTE`) को `RANGE` लूप्स के साथ एक्सप्लिसिट index कम्प्यूटेशन में बदलता है:
+Rangeify pass movement ops (`EXPAND`, `PERMUTE`, `RESHAPE`) को `RANGE` लूप्स के साथ एक्सप्लिसिट index कम्प्यूटेशन में बदलता है:
 
 ```mermaid
 flowchart TD
@@ -299,15 +313,15 @@ flowchart TD
   RK --> C4
 ```
 
-अब हम लूप स्ट्रक्चर देख सकते हैं: `i` और `j` `Global` हैं (parallelized), `k` `Reduce` है (accumulated)।
+अब लूप स्ट्रक्चर दिखता है: `i` और `j` output ranges हैं (rangeify उन्हें `Weak` के रूप में emit करता है; GPU पर ऑप्टिमाइज़र उन्हें `Global` में promote करता है), `k` `Reduce` है (accumulated)।
 
-### स्टेज 3: Symbolic सिम्प्लिफ़िकेशन
+### स्टेज 3: Symbolic सिम्प्लिफ़िकेशन {#stage-3-symbolic-simplification}
 
-पैटर्न रीराइट्स redundant ऑपरेशन हटाते हैं, constants फ़ोल्ड करते हैं, और index अरिथमेटिक सिम्प्लिफ़ाई करते हैं।
+Pattern rewrites फ़ालतू ऑपरेशन साफ़ करते हैं, constants fold करते हैं और index अरिथमेटिक को सरल बनाते हैं।
 
-### स्टेज 4: कोड जनरेशन
+### स्टेज 4: कोड जनरेशन {#stage-4-code-generation}
 
-फ़ाइनल IR सीधे लूप्स में ट्रांसलेट होता है:
+अंतिम IR सीधे लूप्स में translate होता है:
 
 ```c
 // GPU kernel (conceptual)
@@ -322,76 +336,76 @@ __global__ void matmul(float* C, float* A, float* B) {
 }
 ```
 
-मुख्य observation: **स्ट्रक्चर हर स्टेज पर विज़िबल है**। कोई जादुई fusion पास नहीं जो तीन nested लूप्स को कुछ अनरिकॉग्निज़ेबल बना दे। स्टेज 2 में दिखने वाला `RANGE` स्ट्रक्चर बिल्कुल वही है जो स्टेज 4 में लूप्स बनता है।
+मुख्य बात: **हर स्टेज पर स्ट्रक्चर दिखाई देता है**। कोई जादुई fusion pass नहीं जो तीन nested लूप्स को किसी पहचान में न आने वाली चीज़ में बदल दे। स्टेज 2 में दिखने वाला `RANGE` स्ट्रक्चर ठीक वही है जो स्टेज 4 में लूप्स बनता है। [एक्ज़ीक्यूशन पाइपलाइन](./pipeline.md) पेज उसी kernel को scheduling, caching और execution से होकर आगे ट्रेस करता है।
 
 ---
 
-## तुलना: दूसरे IR कैसे अलग हैं
+## तुलना: दूसरे IR कैसे अलग हैं {#comparison-how-other-irs-differ}
 
-अलग-अलग IR अलग-अलग tradeoffs बनाते हैं। यह रहा तुलनात्मक अवलोकन:
+अलग-अलग IRs अलग-अलग समझौते करते हैं। तुलना ऐसी है:
 
 | पहलू | ONNX | XLA HLO | Triton | **Svod** |
-|-------|------|---------|--------|-----------|
-| **उद्देश्य** | मॉडल इंटरचेंज | बैकएंड ऑप्टिमाइज़ेशन | GPU कर्नेल DSL | पूर्ण कम्पाइलेशन |
-| **ऑपरेटर** | ~200 हाई-लेवल | ~100–150 हाई-लेवल | Tile ऑपरेशन | ~80 मल्टी-लेवल |
+|--------|------|---------|--------|-----------|
+| **उद्देश्य** | मॉडल interchange | Backend ऑप्टिमाइज़ेशन | GPU kernel DSL | पूरा कम्पाइलेशन |
+| **Operators** | ~200 हाई-लेवल | ~100–150 हाई-लेवल | Tile operations | 60 multi-level |
 | **लूप मॉडल** | Implicit | Implicit | Tile-based | **एक्सप्लिसिट `RANGE`** |
-| **मेमोरी** | प्योर values | प्योर values → buffers | एक्सप्लिसिट pointers | **एक्सप्लिसिट `LOAD`/`STORE`** |
-| **ऑप्टिमाइज़ेशन** | कोई नहीं | स्पेशलाइज़्ड पासेज़ | MLIR पैटर्न | **यूनिफ़ाइड रीराइटिंग** |
-| **टारगेट** | रनटाइम इंजन | CPU/GPU/TPU | सिर्फ़ GPU | CPU/GPU |
+| **मेमोरी** | Pure values | Pure values → buffers | एक्सप्लिसिट pointers | **एक्सप्लिसिट `LOAD`/`STORE`** |
+| **ऑप्टिमाइज़ेशन** | कोई नहीं | ख़ास passes | MLIR patterns | **एकीकृत रीराइटिंग** |
+| **Targets** | Runtime engines | CPU/GPU/TPU | सिर्फ़ GPU | CPU/GPU |
 
-**ONNX** पोर्टेबिलिटी मैक्सिमाइज़ करता है। `Conv` और `MatMul` जैसे ऑपरेशन सभी इम्प्लीमेंटेशन डिटेल्स छिपाते हैं। मॉडल एक्सचेंज के लिए बढ़िया, लेकिन जो नहीं दिखता उसे ऑप्टिमाइज़ नहीं कर सकते।
+**ONNX** portability को अधिकतम करता है। `Conv` और `MatMul` जैसे ऑपरेशन implementation की हर detail छिपा देते हैं। मॉडल exchange के लिए बढ़िया, लेकिन जो दिखता नहीं उसे ऑप्टिमाइज़ नहीं कर सकते।
 
-**XLA HLO** फ़ंक्शनल और प्योर है — कोई साइड इफ़ेक्ट नहीं, immutable tensor। यह एल्जेब्रिक ऑप्टिमाइज़ेशन सक्षम करता है लेकिन कोड जनरेशन से पहले एक अलग "buffer assignment" फ़ेज़ की ज़रूरत है। HLO से LMHLO (buffer-based) का ट्रांज़िशन एक फ़ंडामेंटल बाउंड्री है।
+**XLA HLO** functional और pure है — कोई side effects नहीं, immutable tensors। इससे algebraic ऑप्टिमाइज़ेशन संभव होता है, लेकिन कोड जनरेशन से पहले एक अलग "buffer assignment" phase चाहिए। HLO से LMHLO (buffer-based) तक का बदलाव एक बुनियादी सीमा है।
 
-**Triton** ONNX से ज़्यादा एक्सपोज़ करता है लेकिन Svod से कम। आप "tile-level" कोड लिखते हैं — डेटा के ब्लॉक पर ऑपरेशन — और कम्पाइलर thread-level डिटेल्स हैंडल करता है। एक्सप्लिसिट मेमोरी (`tl.load`, `tl.store`) लेकिन tiles के अंदर implicit पैरेललाइज़ेशन।
+**Triton** ONNX से ज़्यादा लेकिन Svod से कम दिखाता है। आप "tile-level" कोड लिखते हैं — डेटा के blocks पर ऑपरेशन — और कम्पाइलर thread-level details सँभालता है। मेमोरी एक्सप्लिसिट है (`tl.load`, `tl.store`), लेकिन tiles के अंदर parallelization implicit।
 
-**Svod** सब कुछ एक्सपोज़ करता है: लूप्स एक्सप्लिसिट हैं (`RANGE`), मेमोरी एक्सप्लिसिट है (`LOAD`/`STORE`), पैरेललाइज़ेशन एक्सप्लिसिट है (`AxisType`)। इसका मतलब सीखने को ज़्यादा है, लेकिन कुछ भी छिपा नहीं है।
+**Svod** सब कुछ दिखाता है: लूप्स एक्सप्लिसिट हैं (`RANGE`), मेमोरी एक्सप्लिसिट है (`LOAD`/`STORE`), parallelization एक्सप्लिसिट है (`AxisType`)। इसका मतलब सीखने को ज़्यादा है, लेकिन कुछ भी छिपा नहीं।
 
 ---
 
-## यह क्यों ज़रूरी है: प्रैक्टिकल फ़ायदे
+## यह क्यों ज़रूरी है: प्रैक्टिकल फ़ायदे {#why-this-matters-practical-benefits}
 
-Svod का ट्रांसपैरेंट IR ML इंजीनियरों के लिए प्रैक्टिकल फ़ायदे रखता है:
+Svod के पारदर्शी IR के ML इंजीनियरों के लिए प्रैक्टिकल फ़ायदे हैं:
 
-**डीबगिंग डायरेक्ट है।** किसी भी स्टेज पर ग्राफ़ प्रिंट करें:
+**डीबगिंग सीधी है।** किसी भी स्टेज पर ग्राफ़ प्रिंट करें:
 
 ```rust
 println!("{}", tensor.uop().tree());
 ```
 
-आपको एक्ज़ैक्टली दिखेगा कि कौन से ऑपरेशन मौजूद हैं, कैसे कनेक्ट हैं, और कम्प्यूटेशन कहाँ होता है। कोई "kernel X" मिस्ट्री नहीं।
+आप ठीक-ठीक देखेंगे कि कौन-से ऑपरेशन मौजूद हैं, वे कैसे जुड़े हैं और कम्प्यूटेशन कहाँ होता है। कोई "kernel X" रहस्य नहीं। इसकी बजाय `SVOD_DUMP_STAGE=<prefix>` हर ऑप्टिमाइज़र स्टेज के बाद kernel प्रिंट करता है; [codegen वर्क्ड उदाहरण](./codegen/worked-example.md) स्टेजों के नाम बताता है।
 
-**परफ़ॉर्मेंस ट्यूनिंग इन्फ़ॉर्म्ड है।** देखें कौन से लूप पैरेललाइज़ हैं:
+**Performance tuning जानकारी के साथ होती है।** देखें कि कौन-से लूप्स parallelized हैं:
 
 ```text
-[RANGE(batch, Global)]    # parallelized across GPU blocks
-[RANGE(channel, Local)]   # parallelized within blocks
-[RANGE(pixel, Loop)]      # sequential — might be slow!
+[31] RANGE(R0, Global) : Index    # parallelized across GPU blocks
+[32] RANGE(R1, Local) : Index     # parallelized within a block
+[33] RANGE(R2, Loop) : Index      # sequential — might be slow!
 ```
 
-अगर कुछ पैरेलल होना चाहिए लेकिन नहीं है, आप इसे देख सकते हैं।
+अगर कुछ parallel होना चाहिए लेकिन नहीं है, तो आप उसे देख सकते हैं।
 
-**मेंटल मॉडल सिंपल है।** एक IR, एक ट्रांसफ़ॉर्मेशन मैकेनिज़्म, ऑपरेशन का एक सेट। आपको XLA HLO *और* MLIR *और* Triton *और* LLVM सीखने की ज़रूरत नहीं। बस UOps।
+**मेंटल मॉडल सरल है।** एक IR, एक ट्रांसफ़ॉर्मेशन मैकेनिज़्म, ऑपरेशनों का एक set। आपको XLA HLO *और* MLIR *और* Triton *और* LLVM सीखने की ज़रूरत नहीं। बस UOps।
 
-**ऑप्टिमाइज़ेशन composable है।** कस्टम रीराइट चाहिए? एक पैटर्न जोड़ें:
+**ऑप्टिमाइज़ेशन composable है।** कोई custom rewrite चाहिए? एक pattern जोड़ें:
 
 ```rust
 patterns! {
-    // Your custom optimization
-    MyPattern(x, y) => better_version(x, y),
+    // Illustrative: x - x → 0 (op names must be real Op / ALU variants)
+    Sub(x, x) => 0.into_uop(x.dtype()),
 }
 ```
 
-यह उसी इंजन के साथ काम करता है जो constant folding, fusion, और बाकी सब कुछ करता है।
+यह उसी इंजन के साथ काम करता है जिससे constant folding, fusion और बाक़ी सब कुछ होता है।
 
 ---
 
-## गहरी समझ
+## गहरी समझ {#the-deeper-insight}
 
-Svod/Tinygrad साबित करता है कि कम्पाइलर कॉम्प्लेक्सिटी अक्सर *accidental* होती है, essential नहीं। TensorFlow और PyTorch में मल्टी-लेयर IR स्टैक ऑर्गैनिकली जमा हुए — हर लेयर ने एक असली प्रॉब्लम सॉल्व की, लेकिन कंबाइंड सिस्टम किसी भी इंडिविजुअल पार्ट से ज़्यादा मुश्किल है।
+Svod/Tinygrad साबित करते हैं कि कम्पाइलर की कॉम्प्लेक्सिटी अक्सर *आकस्मिक* होती है, ज़रूरी नहीं। TensorFlow और PyTorch के multi-layer IR stacks स्वाभाविक रूप से जमा होते गए — हर लेयर ने एक असली प्रॉब्लम सॉल्व की, लेकिन पूरा सिस्टम किसी भी अकेले हिस्से से समझने में कठिन है।
 
-एक अच्छी तरह डिज़ाइन किया गया IR, एक ट्रांसफ़ॉर्मेशन मैकेनिज़्म, और principled composition हज़ारों लाइनों के स्पेशलाइज़्ड पासेज़ की जगह ले सकती है। यह Unix philosophy है जो कम्पाइलरों पर लागू है: एक काम अच्छे से करो, और compose करो।
+एक अच्छी तरह डिज़ाइन किया गया IR, एक ट्रांसफ़ॉर्मेशन मैकेनिज़्म और सिद्धांतबद्ध composition ख़ास passes की हज़ारों लाइनों की जगह ले सकते हैं। यह कम्पाइलरों पर लागू Unix philosophy है: एक काम अच्छे से करो, और जोड़ो।
 
-कीमत explicitness है — आप लूप्स, मेमोरी एक्सेसेज़, और पैरेललाइज़ेशन हिंट्स देखते हैं जो दूसरे IR छिपाते हैं। लेकिन visibility एक feature है, bug नहीं। जब आपका मॉडल स्लो हो, आप *क्यों* देखना चाहते हैं, कम्पाइलर पर उम्मीद नहीं करना कि वो ख़ुद समझ ले।
+क़ीमत है स्पष्टता — आप लूप्स, मेमोरी एक्सेस और parallelization hints देखते हैं जिन्हें दूसरे IRs छिपाते हैं। लेकिन दिखाई देना एक feature है, bug नहीं। जब आपका मॉडल स्लो हो, तो आप देखना चाहते हैं *क्यों*, न कि यह उम्मीद करना कि कम्पाइलर ख़ुद समझ लेगा।
 
-Svod यही दाँव लगाता है: transparent complexity, hidden complexity से बेहतर है।
+Svod यही दाँव लगाता है: पारदर्शी कॉम्प्लेक्सिटी छिपी कॉम्प्लेक्सिटी से बेहतर है।

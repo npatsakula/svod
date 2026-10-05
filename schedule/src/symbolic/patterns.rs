@@ -385,10 +385,8 @@ fn identity_and_zero_patterns_unchecked() -> &'static TypedPatternMatcher {
 /// - CAST(WHERE(cond, x, Invalid)) → WHERE(cond, CAST(x), Invalid)
 /// - ALU(WHERE(cond, x, Invalid), y) → WHERE(cond, ALU(x, y), Invalid)
 /// - ALU(y, WHERE(cond, x, Invalid)) → WHERE(cond, ALU(y, x), Invalid)
-/// - ALU(Invalid, y) → Invalid (non-comparison binary ops, left position only)
-///
-/// Upstream only propagates bare Invalid from the left position. Right-position
-/// bare Invalid is not propagated.
+/// - ALU(Invalid, y) / ALU(y, Invalid) → Invalid (non-comparison binary ops,
+///   either operand position, as tinygrad's order-insensitive match)
 ///
 /// MUST be first in `symbolic_simple()` — before `x*0→0` which would eat
 /// `MUL(0, WHERE(cond, x, Invalid))` → `0`, losing validity tracking.

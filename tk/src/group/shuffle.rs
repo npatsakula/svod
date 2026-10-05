@@ -62,7 +62,7 @@ impl<'k> Group<'k> {
         value
     }
 
-    /// Per-element cross-lane gather (the public face of [`Self::shuffle_lane`]): for
+    /// Per-element cross-lane gather (the public face of `shuffle_lane`): for
     /// each logical element, `dst` receives `src`'s value at the SAME position but
     /// from lane `src_lane(laneid)`. Single-warp; one `ds_bpermute` per element (no
     /// LDS, no barrier). The shared foundation for `shuffle_xor`/`compare_exchange`

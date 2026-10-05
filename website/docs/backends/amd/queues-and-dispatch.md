@@ -22,9 +22,14 @@ bitset tracks leases:
 - dropping `QueueLease` clears the bit and wakes one waiter;
 - queues never co-tenant host publishers.
 
-The `QueueLease` is deliberately not stored in programs or graph templates.
-`OwnerCtx` contains logical plan state: completion, profiling configuration,
-and an optional linked replay template.
+Programs and graph templates never hold a `QueueLease`. `OwnerCtx` holds the
+logical plan state — the device core and allocator, the newest completion,
+the PMC selection, an optional linked replay template — and a `session` slot
+that only the direct-dispatch fallback fills with its epoch lease.
+
+A thread parks at most 30 s per wait; two consecutive expiries return
+`Error::TimelineTimeout` for "AMD lane acquisition", and a poisoned device
+wakes every waiter with its poison error.
 
 Direct semantic fallback keeps one lease across all kernels in a replay epoch,
 then `PlanContext::finish_replay` releases it. A later epoch waits the prior
@@ -44,7 +49,8 @@ AQL = otherwise
 ```
 
 - PM4 queues publish raw dwords and ring the next dword index.
-- AQL queues publish 64-byte packets and ring the last completed packet index.
+- AQL queues publish 64-byte packets and ring the index of the last packet
+  written.
 - AQL kernel `completion_signal` remains zero. Vendor-IB PM4 waits/stores own
   timeline completion, with XCC0 `PRED_EXEC` on multi-XCC hardware.
 
@@ -55,7 +61,7 @@ different plans may share it.
 
 ## Publication
 
-Submission is split into preparation and publication:
+Native linked replay splits a submission into preparation and publication:
 
 1. Validate program identity, concrete buffer ownership, ABI, launch geometry,
    patch tables, and hardware stream limits.
@@ -72,10 +78,17 @@ terminal store that was never published. The physical device is then poisoned,
 so the lane cannot be reused and hardware-referenced allocations are
 quarantined.
 
-PM4, AQL, and SDMA publication all check monotonically increasing KFD read
-pointers before wrapping their rings. Ordinary dispatch additionally bounds
-in-flight timeline values. PM4 timeline values drain and reset at the 2^31
-watermark because hardware wait/store packets compare the low 32 bits.
+Ordinary per-kernel dispatch (`submit_hcq_dispatch`) is simpler: its finalizer
+is born published after the doorbell and the caller registers it in flight; a
+failure before the doorbell rolls the ring and the timeline reservation back
+instead.
+
+PM4, AQL, and SDMA publication all check the KFD read pointer before wrapping
+their rings (AQL and SDMA read a monotonic value; the PM4 pointer is
+queue-relative and its epoch is rebuilt from the producer index). Ordinary
+dispatch additionally bounds in-flight timeline values. PM4 timeline values
+drain and reset at the 2^31 watermark because hardware wait/store packets
+compare the low 32 bits.
 
 ## Resource lifetime
 
@@ -104,9 +117,12 @@ fail, `setup_ring` returns `AmdQueueStillActive`. The caller poisons the device
 before allocation guards unwind, preventing a live KFD queue from observing
 freed ring memory.
 
-Panic abandonment also poisons the device. Signal slots are not returned to the
-pool while panicking or after poison, so a caught panic cannot recycle a slot
-that an abandoned queue may still target.
+A panic that unwinds through a lane quarantines that lane but does not poison
+the device; only a reservation abandoned *after* its doorbell rang
+(`TimelineReservation`, `PreparedPublication`) poisons, whether the cause was
+an error or a panic. Signal slots return to the pool unconditionally unless the
+device is poisoned, in which case they are withheld because an abandoned queue
+may still target them.
 
 ## Device-wide drains
 
@@ -129,42 +145,56 @@ KFD operations are isolated behind `AmdIface`:
 
 ```rust
 pub trait AmdIface: Send + Sync + std::fmt::Debug {
-    fn alloc_raw(/* ... */) -> Result<AllocResult>;
+    fn alloc_raw(
+        &self,
+        size: usize,
+        kind: AllocKind,
+        tag: AllocTag,
+        cpu_access: bool,
+        zero: bool,
+    ) -> Result<AllocResult>;
     fn free_raw(&self, gpu_va: u64, size: usize, handle: u64);
     fn setup_ring(&self, desc: &RingDesc) -> Result<QueueHandle>;
-    fn teardown_ring(
-        &self,
-        queue_id: u32,
-        doorbell_base: NonNull<u8>,
-    ) -> Result<QueueTeardown>;
+    fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) -> Result<QueueTeardown>;
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
 
-    // Defaulted hooks; only `KfdIface` and the host mock override them.
-    fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> { None }
-    fn publication_checkpoint(&self, stage: PublicationStage) -> Result<()> { Ok(()) }
-    fn update_queue_percentage(/* ... */) -> Result<()> { Ok(()) }
+    // Defaulted hooks. `KfdIface` overrides the first and the last; the
+    // test mock overrides `publication_checkpoint`.
+    fn queue_event_mailbox(&self) -> Option<QueueEventMailbox> {
+        None
+    }
+    fn publication_checkpoint(&self, _stage: PublicationStage) -> Result<()> {
+        Ok(())
+    }
+    fn update_queue_percentage(&self, _queue_id: u32, _ring_gpu: u64, _ring_size: u32, _percentage: u32) -> Result<()> {
+        Ok(())
+    }
 }
 ```
 
 Ring, GART, EOP, context-save, and inactive-signal buffers are allocated above
 this seam. `setup_ring` activates those resources and maps the doorbell.
 `update_queue_percentage` is what re-maps an AQL queue so CP firmware re-reads
-its cached `amd_queue_t` scratch descriptor.
+its cached `amd_queue_t` scratch descriptor — at lane creation and whenever
+scratch grows; a failed remap poisons the device. When `queue_event_mailbox`
+is present, every completion store carries a KFD event-interrupt companion so
+`wait_events` wakes without polling.
 
 ## Configuration
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SVOD_DEVICE` | `CPU` | Select default tensor device, for example `AMD:0` |
+| `SVOD_DEVICE` | `CPU` (`METAL:0` on macOS) | Select default tensor device, for example `AMD:0` (`HIP` is an alias) |
 | `SVOD_AMD_BACKEND` | `kfd` | AMD backend; only `kfd` is currently accepted |
 | `SVOD_AMD_HW_QUEUES` | 4 on multi-XCC, else 1 | Bounded compute-lane count, clamped to 1 through 64 |
-| `SVOD_AMD_AQL` | unset | Any value other than `0` forces AQL on single-XCC hardware |
-| `SVOD_AMD_SCOPED_SYNC` | unset | `=0` replaces every storage-scoped host wait with a full device drain |
-| `SVOD_PM4_GRAPH` | unset | `=1` enables PM4 graph capture; only `1` counts |
+| `SVOD_AMD_AQL` | unset | Any value other than `0` forces AQL on single-XCC hardware; read at each queue creation |
+| `SVOD_AMD_SCOPED_SYNC` | unset | `=0` replaces every storage-scoped host wait with a full device drain and stops producer recording; latched once per process |
+| `SVOD_PM4_GRAPH` | unset | `=1` enables PM4 graph capture; only `1` counts; read once at device creation |
 | `AMD_DISABLE_SDMA` | unset | Set to anything to skip the SDMA copy queue, forcing host-visible buffers |
 | `SVOD_KFD_TOPOLOGY` | sysfs | Override KFD topology root for tests |
 | `SVOD_DEBUG_DISPATCH` | unset | Set to anything to print program-load and dispatch grid, kernarg, scratch, and buffer addresses |
-| `SVOD_DUMP_AMD_IR` | unset | Directory for generated AMD LLVM IR |
+| `SVOD_DUMP_AMD_IR` | unset | Directory receiving each kernel's AMD LLVM IR as `<mcpu>_<module>.ll` |
+| `SVOD_OBJECT_CACHE`, `SVOD_OBJECT_CACHE_DIR`, `SVOD_OBJECT_CACHE_MAX_BYTES` | on | The shared on-disk object cache, see the [CPU page](../cpu.md) |
 | `SVOD_AM_DEBUG` | unset | AM bring-up only: read registers back after writing them |
 | `SVOD_AM_MCBASE` | unset | AM bring-up only: `raw`, `fb`, or `fbxgmi` MC aperture base |
 

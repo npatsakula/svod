@@ -41,11 +41,12 @@ attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true" "nvvm.maxntid
   standalone (`opt`, `llvm-as`, IR dumps).
 - `"nvvm.maxntid"` is the PTX `.maxntid` **launch bound**, one bound per axis:
   the kernel's local sizes render as `nx[, ny[, nz]]` (`"16,8"` becomes
-  `.maxntid 16, 8`; missing axes default to 1), so `ptxas` budgets registers
-  per thread against it instead of the 1024-thread worst case. A local extent
-  that is not a constant drops the attribute — the hardware maximum applies,
-  rather than a bound the launch would exceed. An older LLVM ignores the
-  string attribute and merely loses the hint.
+  `.maxntid 16, 8`; trailing axes of 1 are trimmed), so `ptxas` budgets
+  registers per thread against it instead of the 1024-thread worst case. The
+  bound is each extent's `vmax`, so a symbolic extent with an integer upper
+  bound still gets one; an extent with no integer bound drops the attribute
+  and the hardware maximum applies. An older LLVM ignores the string attribute
+  and merely loses the hint.
 
 | Concept | AMD | NVPTX |
 |---|---|---|
@@ -76,14 +77,18 @@ division as well.
 
 NVPTX has **no lowering** for the generic `@llvm.{exp,log,sin,cos,pow}`
 intrinsics (instruction selection fails) and emits `@llvm.erf` as an external
-call that only fails inside `ptxas`. The renderer therefore removes `Exp`,
-`Log`, `Log2`, `Sin`, `Cos`, `Tan`, `Erf`, `Pow`, `Max` and `Threefry` from its
-`supported_ops`, and the scheduler decomposes them with
-`nvptx_decomposition_patterns()`: the AMD set (polynomial `exp`/`log`/trig over
-native `exp2`/`log2`, integer-domain bf16 rounding) plus f64 `Exp2`/`Log2`
-expansions, because NVPTX lowers `@llvm.exp2` for f16/f32 only. `Max`, `Pow`
-and `Threefry` are dropped for every GPU renderer rather than as an NVPTX
-choice: they decompose to a select and to a bare XOR.
+call that only fails inside `ptxas`. The CUDA renderer wrapper
+(`runtime/src/devices/cuda.rs`) therefore removes `Exp`, `Log`, `Log2`, `Sin`,
+`Cos`, `Tan`, `Erf`, `Pow`, `Max` and `Threefry` from its `supported_ops`, and
+the scheduler decomposes them before rendering. Its `decompositor` is
+`nvptx_decomposition_patterns()`: the AMD set (polynomial `exp`/`log`/`cos`/
+`tan`/`pow` over native `exp2`/`log2`, integer-domain bf16 rounding) plus f64
+`Exp2`/`Log2` expansions, because NVPTX lowers `@llvm.exp2` for f16/f32 only.
+`Sin` and f32/f16 `Log2` go through the shared transcendental patterns keyed
+on `supported_ops`; `Erf`, `Max` and `Threefry` are rewritten by the
+optimizer's own passes (a polynomial, a select, the full `threefry2x32`
+mixing). `Max`, `Pow` and `Threefry` are dropped for every GPU renderer rather
+than as an NVPTX choice.
 
 What stays native: `@llvm.exp2.f32` selects `ex2.approx.f32`, `@llvm.sqrt`
 selects `sqrt.rn`, `fma`/`floor`/`rint`/`maxnum` lower directly.
@@ -127,9 +132,10 @@ another backend's kernels.
 Any other tuple, or an arch below the minimum, returns `None` and the caller
 raises `InvalidGraph` so the optimizer decomposes upstream. Fragments follow
 the PTX register split (A is 16×K, B is K×8, C/D 16×8, all over 32 lanes in
-32-bit registers): f16 operands travel as `<2 x half>` pairs, bf16 / tf32 /
-int8 / fp8 as `i32` words, f32 accumulators as `float`; the aggregate result
-is reassembled into the WMMA's natural vector. The matching `declare` lines
+32-bit registers): f16 operands and f16 accumulators travel as `<2 x half>`
+pairs, bf16 / tf32 / int8 / fp8 operands and i32 accumulators as `i32` words,
+f32 accumulators as `float`; the aggregate result is reassembled into the
+WMMA's natural vector. The matching `declare` lines
 are synthesized from each call site's operand types
 (`wmma_declaration_from_call`), the same mechanism as the AMD WMMA/MFMA
 intrinsics.
@@ -180,8 +186,10 @@ little-endian ELF64 for `EM_CUDA` defining the entry as code) instead.
 The PTX ISA version is pinned per arch rather than left to clang, whose
 default follows the CUDA toolkit it finds (clang 22 with CUDA 13: `.version
 8.8`, which needs a CUDA 12.9 driver; with no toolkit: a version too old for
-any tensor core). `ptx_isa` is monotone in the compute capability: `+ptx78` up
-to sm_88, `+ptx84` from sm_89 through every 9.x (the fp8 `mma.sync` shapes
-exist from 8.4), `+ptx86` on sm_100 to sm_102, `+ptx87` on sm_120, `+ptx88` on
-sm_103, sm_121 and newer. Clang refuses an older one: `PTX version 8.4 does not
-support target 'sm_120'. Minimum required PTX version is 8.7`.
+any tensor core). `ptx_isa` (`codegen/src/llvm/nvptx/mod.rs`) maps the
+capability to the oldest ISA that knows the part: `+ptx78` up to sm_88,
+`+ptx84` from sm_89 through every 9.x (the fp8 `mma.sync` shapes exist from
+8.4), `+ptx86` on sm_100 to sm_102, `+ptx87` on sm_120, and `+ptx88` on every
+other 10.x and newer part (sm_103, sm_110, sm_121, ...). Clang refuses an older
+one: `PTX version 8.4 does not support target 'sm_120'. Minimum required PTX
+version is 8.7`.

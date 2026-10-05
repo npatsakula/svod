@@ -77,7 +77,7 @@ impl Default for TranscribeOpts {
 
 #[bon]
 impl TranscribeOpts {
-    /// Build via the [`bon`] builder. Each field default consults its
+    /// Build via the [`bon`](mod@bon) builder. Each field default consults its
     /// `SVOD_*` env var (see the struct docs for the full table) before
     /// falling back to a literal — so `builder().build()` produces the same
     /// values as [`from_env`](Self::from_env), and partial overrides

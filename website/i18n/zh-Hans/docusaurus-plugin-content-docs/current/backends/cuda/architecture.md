@@ -53,15 +53,18 @@ CUDA cuLaunchKernel failed: CUDA_ERROR_INVALID_VALUE (1): invalid argument
 
 `CudaDevice::open(id)` 每进程缓存一次。它运行 `cuInit`，保持住设备的
 **主上下文**（`cuDevicePrimaryCtxRetain`），读取它需要的 `CudaLimits`
-（`cuDeviceGetAttribute`：SM 数量、每 block 与每 SM 的线程数、每 block 的
-共享内存、warp 大小，以及托管内存是否可被一致地访问），创建两个非阻塞流
+（`cuDeviceGetAttribute`：SM 数量、每 block 与每 SM 的线程数、每 SM 的 block 数、
+每 block 的共享内存、warp 大小，以及托管内存是否既受支持又可被并发访问），创建两个非阻塞流
 （供分配器用的**复制流**，以及供每调用 `Program::execute` 用的**调度流**），
-并记录一个**基准 event**，它是每个 GPU 时钟时间戳的零点。
+并在旧式（legacy）默认流上记录一个**基准 event**——在返回设备之前会等待它——
+它是每个 GPU 时钟时间戳的零点。
 
 驱动按线程保存当前上下文，因此后端的每一个入口点都以 `enter()` 开始：
 若设备已被毒化则拒绝，然后 `cuCtxSetCurrent`。一个**粘性**的 `CUresult`
-（`ILLEGAL_ADDRESS`、`LAUNCH_FAILED`、`ILLEGAL_INSTRUCTION`、
-`ECC_UNCORRECTABLE`……即驱动文档中记为对上下文致命的那些码）会连同它的
+（`ILLEGAL_ADDRESS`、`LAUNCH_FAILED`、`ILLEGAL_INSTRUCTION`、`MISALIGNED_ADDRESS`、
+`ECC_UNCORRECTABLE`、`LAUNCH_TIMEOUT`、`ASSERT`、`HARDWARE_STACK_ERROR`、
+`INVALID_ADDRESS_SPACE`、`INVALID_PC`、`DEINITIALIZED`，以及出于保守考虑的
+`UNKNOWN`——见 `sys.rs`）会连同它的
 消息闩上 poison 标志；此后该设备上的每一次调用都会带着那条消息快速失败，
 与 AMD 上一样。
 
@@ -75,7 +78,7 @@ CUDA cuLaunchKernel failed: CUDA_ERROR_INVALID_VALUE (1): invalid argument
 | `BufferSpec` | 种类 | 驱动调用 |
 |---|---|---|
 | 默认 | `Device` | `cuMemAlloc`——设备内存，没有宿主映射 |
-| `cpu_access` | 若设备报告支持并发的托管访问则为 `Managed`，否则为 `Pinned`（WDDM、Pascal 之前） | `cuMemAllocManaged`，一个地址在两侧都有效 |
+| `cpu_access` | 若设备报告支持并发的托管访问则为 `Managed`，否则为 `Pinned` | `cuMemAllocManaged(ATTACH_GLOBAL)`，一个地址在两侧都有效；否则为 `cuMemHostAlloc(PORTABLE \| DEVICEMAP)` + `cuMemHostGetDevicePointer` |
 | `host` | `Pinned` | `cuMemHostAlloc(PORTABLE \| DEVICEMAP)`，内核经由总线读取它 |
 
 `supports_device_local()` 为 `true`，因此中间结果留在设备上。
@@ -90,8 +93,8 @@ CUDA cuLaunchKernel failed: CUDA_ERROR_INVALID_VALUE (1): invalid argument
 `cuMemcpyDtoHAsync` 搬运，每块同步一次该流。固定缓冲区则直接 `memcpy`。
 设备到设备的 `_transfer` 与清零在复制车道上是异步的：用 `cuStreamWaitEvent`
 排在那些生产者之后，被发布为两个范围新的生产者，并被此后任意车道上的每一次
-启动等待，因此它们从不阻塞宿主；一次分配内部相互重叠的范围会经由一个临时
-缓冲区中转，以保持 `memmove` 语义。释放会先等待该存储的生产者；若等待失败
+启动等待，因此它们不会阻塞宿主——例外是一次分配内部相互重叠的范围：它会经由一个临时
+缓冲区中转以保持 `memmove` 语义，并在释放该临时缓冲区时等待。释放会先等待该存储的生产者；若等待失败
 （上下文已被毒化），该分配会被**隔离**（泄漏），而不是在一个仍在飞行中的
 内核之下被释放。与每个计算分配器一样，它坐落在 `LruAllocator` 之下，而后者
 会把一个被回收的分配栅栏在其上一位所有者的生产者上。
@@ -139,8 +142,8 @@ PTX 文本走入口的 `.param` 检查——两者都抵达同一个 `cuModuleLo
 （`device/src/cuda/device.rs` 的模块文档）：
 
 - **producers**——存储基址 -> 每条车道上读过或写过它的最新完成令牌
-  （一次宿主覆写对在飞行中的读者也是一个 WAR 冒险）。执行器在每次 execute
-  之后，把一个 plan 或图的令牌发布到该 plan 触及的每一处存储上；分配器在
+  （一次宿主覆写对在飞行中的读者也是一个 WAR 冒险）。执行 plan 在每次 execute
+  之后，把它自己或其图的令牌发布到它触及的每一处存储上；分配器在
   每次传输或 memset 之后发布一个复制车道的令牌。`wait_storage(base)` 先排空
   下面说的那些车道，再等待这些令牌，然后把它们从表里丢掉。一处表里不认识的
   存储——包括其最新令牌属于另一个后端的那种——会回落到 `cuCtxSynchronize`。
@@ -169,7 +172,8 @@ CUDA 也不例外；并没有它自己的 `TimelineSignal` 实现。把这个宿
 重叠执行（AMD 后端丢弃 `deps`，因为单条顺序环让它们变得多余）。每个节点的
 params 经由与即时启动相同的 `extra` 协议指向该内核的 kernarg blob；图用
 `cuGraphInstantiateWithFlags` 实例化。对于空链、非 CUDA 程序，或另一个设备的
-程序，捕获会谢绝（`Ok(None)`）。
+程序，捕获会谢绝（`Ok(None)`）；在设备已被毒化或依赖于一个更靠后的内核时，
+捕获会失败（`Err`）；plan 对这两种情况都按每调用调度处理。
 
 `replay(buffers, vals)` 只重新打包那些 `(buffers, vals)` 切片发生了变化的
 内核，并用 `cuGraphExecKernelNodeSetParams_v2` 更新那些节点，然后在图自己的
@@ -191,6 +195,7 @@ params 经由与即时启动相同的 `extra` 协议指向该内核的 kernarg b
 `CompilerIdentity` 为键：
 
 ```text
+schema:              OBJECT_CACHE_SCHEMA
 backend:             nvptx-clang
 target_architecture: nvptx64-nvidia-cuda/sm_86
 toolchain:           <clang identity>[;ptxas:path=...;version=...]
@@ -207,7 +212,8 @@ object_format:       ptx-text-v1 | cubin-v1
 全部：ABI 描述符会被追加到它后面，因为一个 cubin 的入口是在编译期对着它们
 校验的。每一次缓存命中在抵达驱动之前，都会被其格式对应的校验器重新校验——
 `validate_cubin` 或 `validate_ptx`，见[代码生成](./codegen.md)。
-`SVOD_OBJECT_CACHE=0` 关闭该缓存，`SVOD_OBJECT_CACHE_DIR` 则可迁移它的位置。
+`SVOD_OBJECT_CACHE=0` 关闭该缓存，`SVOD_OBJECT_CACHE_DIR` 可迁移它的位置，
+`SVOD_OBJECT_CACHE_MAX_BYTES` 则设定它的容量预算（见 [CPU 页面](../cpu.md)）。
 
 设备工厂（`create_cuda_device`）还会拒绝一台每 block 共享内存上限低于优化器
 profile 静态 `shared_max` 的设备，否则一个按该 profile 定尺的内核就只会在

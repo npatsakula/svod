@@ -40,9 +40,10 @@ attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true" "nvvm.maxntid
   不匹配的值，所以这一行的存在是为了那些独立读取该模块的工具
   （`opt`、`llvm-as`、IR 转储）。
 - `"nvvm.maxntid"` 就是 PTX 的 `.maxntid` **launch bound**，每根轴一个界：内核的各个
-  local size 渲染成 `nx[, ny[, nz]]`（`"16,8"` 得到 `.maxntid 16, 8`；缺失的轴默认为 1），
-  于是 `ptxas` 会照着它而不是 1024 线程的最坏情况来给每线程分配寄存器预算。若某根 local
-  轴的长度不是常量，这个属性就干脆不加——按硬件上限来，而不是声明一个启动本身就会超出的界。
+  local size 渲染成 `nx[, ny[, nz]]`（`"16,8"` 得到 `.maxntid 16, 8`；末尾为 1 的轴会被裁掉），
+  于是 `ptxas` 会照着它而不是 1024 线程的最坏情况来给每线程分配寄存器预算。这个界取的是
+  每个长度的 `vmax`，因此一个带有整数上界的符号长度依然能得到界；没有整数上界的长度则会让
+  这个属性干脆不加，按硬件上限来。
   更老的 LLVM 会忽略这个字符串属性，只是丢掉这条提示而已。
 
 | 概念 | AMD | NVPTX |
@@ -73,13 +74,14 @@ NVPTX 会把 `fdiv ... arcp afn` 降低为 `rcp.approx.f32`，而单纯的 `cont
 
 NVPTX 对通用的 `@llvm.{exp,log,sin,cos,pow}` intrinsic **没有降低**（指令选择
 失败），并且会把 `@llvm.erf` 发射成一个只会在 `ptxas` 内部失败的外部调用。
-因此渲染器把 `Exp`、`Log`、`Log2`、`Sin`、`Cos`、`Tan`、`Erf`、`Pow`、`Max`
-和 `Threefry` 从它的 `supported_ops` 中移除，由调度器用
-`nvptx_decomposition_patterns()` 将它们分解：AMD 的那一套（在原生 `exp2` /
-`log2` 之上做多项式 `exp`/`log`/三角函数、整数域的 bf16 舍入），外加 f64 的
-`Exp2`/`Log2` 展开，因为 NVPTX 只为 f16/f32 降低 `@llvm.exp2`。`Max`、`Pow`
-与 `Threefry` 是每一个 GPU 渲染器都会丢弃的，而非 NVPTX 自己的选择：它们分别
-分解成一次 select 和一次裸 XOR。
+因此 CUDA 渲染器包装（`runtime/src/devices/cuda.rs`）把 `Exp`、`Log`、`Log2`、`Sin`、
+`Cos`、`Tan`、`Erf`、`Pow`、`Max` 和 `Threefry` 从它的 `supported_ops` 中移除，由调度器
+在渲染之前将它们分解。它的 `decompositor` 是 `nvptx_decomposition_patterns()`：AMD 的
+那一套（在原生 `exp2` / `log2` 之上做多项式 `exp`/`log`/`cos`/`tan`/`pow`、整数域的
+bf16 舍入），外加 f64 的 `Exp2`/`Log2` 展开，因为 NVPTX 只为 f16/f32 降低 `@llvm.exp2`。
+`Sin` 与 f32/f16 的 `Log2` 走以 `supported_ops` 为键的共享超越函数模式；`Erf`、`Max` 与
+`Threefry` 由优化器自己的 pass 改写（一个多项式、一次 select、完整的 `threefry2x32`
+混合）。`Max`、`Pow` 与 `Threefry` 是每一个 GPU 渲染器都会丢弃的，而非 NVPTX 自己的选择。
 
 保持原生的是：`@llvm.exp2.f32` 选出 `ex2.approx.f32`，`@llvm.sqrt` 选出
 `sqrt.rn`，`fma`/`floor`/`rint`/`maxnum` 直接降低。
@@ -122,7 +124,7 @@ PTX ISA 为每一行规定了最低计算能力：
 任何别的元组，或者一个低于最低要求的 arch，都会返回 `None`，于是调用方抛出
 `InvalidGraph`，让优化器在上游做分解。片段遵循 PTX 的寄存器切分（A 是
 16×K，B 是 K×8，C/D 是 16×8，全都摊在 32 个 lane 的 32 位寄存器上）：f16
-操作数以 `<2 x half>` 对的形式传递，bf16 / tf32 / int8 / fp8 以 `i32` 字传递，
+操作数和 f16 累加器以 `<2 x half>` 对的形式传递，bf16 / tf32 / int8 / fp8 操作数和 i32 累加器以 `i32` 字传递，
 f32 累加器以 `float` 传递；聚合结果会被重新组装回 WMMA 天然的向量。匹配的
 `declare` 行由每个调用点的操作数类型合成而来
 （`wmma_declaration_from_call`），与 AMD 的 WMMA/MFMA intrinsic 是同一套机制。
@@ -169,7 +171,8 @@ clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx
 
 PTX ISA 版本按架构锁定，而不是交给 clang——它的默认值取决于它找到的 CUDA toolkit
 （带 CUDA 13 的 clang 22：`.version 8.8`，需要一个 CUDA 12.9 驱动；没有 toolkit 时：
-一个对任何 tensor core 都太老的版本）。`ptx_isa` 随算力单调递增：直到 sm_88 为 `+ptx78`，
-从 sm_89 起直到每一个 9.x 为 `+ptx84`（fp8 的 `mma.sync` 形状自 8.4 起才存在），sm_100 到
-sm_102 为 `+ptx86`，sm_120 为 `+ptx87`，sm_103、sm_121 及更新为 `+ptx88`。更老的会被 clang 拒绝：
+一个对任何 tensor core 都太老的版本）。`ptx_isa`（`codegen/src/llvm/nvptx/mod.rs`）把算力映射到认识该型号的最老 ISA：
+直到 sm_88 为 `+ptx78`，从 sm_89 起直到每一个 9.x 为 `+ptx84`（fp8 的 `mma.sync` 形状自 8.4
+起才存在），sm_100 到 sm_102 为 `+ptx86`，sm_120 为 `+ptx87`，其余每一个 10.x 及更新的型号
+（sm_103、sm_110、sm_121……）为 `+ptx88`。更老的会被 clang 拒绝：
 `PTX version 8.4 does not support target 'sm_120'. Minimum required PTX version is 8.7`。

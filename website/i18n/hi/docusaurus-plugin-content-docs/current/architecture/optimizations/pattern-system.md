@@ -3,233 +3,130 @@ sidebar_label: पैटर्न इंजन
 sidebar_position: 0
 ---
 
-# पैटर्न इंजन
+# पैटर्न इंजन {#the-pattern-engine}
 
-कोई भी प्रोडक्शन ML कम्पाइलर खोलिए और आपको दर्जनों ऑप्टिमाइज़ेशन पासेज़ मिलेंगे: constant folding, dead code elimination, operator fusion, loop tiling, vectorization, memory layout optimization। हर पास के अपने डेटा स्ट्रक्चर, अपना traversal लॉजिक, अपने बग्स।
+Svod का लगभग हर पास `patterns!` macro से बने मैचर पर एक `graph_rewrite` है: rangeify के चरण, सिम्बॉलिक सरलीकारक, expander, devectorizer, decompositions, gate movement। अपवाद कुछ साधारण graph walks हैं (`memory_coalescing`, `merge_register_read_ends`, `linearize`) और line rewrite, जो रैखिक instruction सूची पर चलता है। यह पृष्ठ macro और इंजन का संदर्भ है। स्रोत: `macros/src/patterns/`, `ir/src/pattern/`, `ir/src/rewrite/engine.rs`; Tinygrad में इनके समकक्ष `tinygrad/uop/ops.py` में `UPat` और `graph_rewrite` हैं।
 
-Svod एक अलग तरीका अपनाता है: **हर चीज़ के लिए एक मैकेनिज़्म**।
+## `patterns!` DSL {#the-patterns-dsl}
 
-```mermaid
-flowchart LR
-  subgraph T["Traditional Compiler (custom logic each)"]
-    direction TB
-    T1["Constant Folding"]
-    T2["Dead Code Elimination"]
-    T3["Loop Unrolling"]
-    T4["Operator Fusion"]
-    T5["Vectorization"]
-    T6["Memory Planning"]
-    T7["...20 more passes"]
-  end
-  subgraph S["Svod (one mechanism)"]
-    direction TB
-    S1["patterns! (Add, Mul, ...more)"] --> S2["graph_rewrite(...)"]
-  end
-```
-
-Svod में हर ऑप्टिमाइज़ेशन एक **पैटर्न** के रूप में एक्सप्रेस होता है: "जब यह स्ट्रक्चर दिखे, उसे इस स्ट्रक्चर से बदल दो।" वही `graph_rewrite()` फ़ंक्शन [अल्जेब्रिक सिम्प्लिफ़िकेशन](./algebraic-simplification.md), [इंडेक्स अरिथमेटिक](./index-arithmetic.md), [strength reduction](./strength-reduction.md), और [range ऑप्टिमाइज़ेशन](./range-optimization.md) अप्लाई करता है।
-
----
-
-## `patterns!` DSL
-
-Svod ऑप्टिमाइज़ेशन पैटर्न लिखने के लिए एक domain-specific language प्रदान करता है:
+एक ब्लॉक `pattern [if guard] => body` नियमों की सूची है, जिसके पहले वैकल्पिक रूप से `@context Type;` हो सकता है। बायाँ पक्ष Rust pattern syntax है, जिसे उन चीज़ों के लिए विस्तारित किया गया है जो Rust pattern `Arc<UOp>` किनारे के पार व्यक्त नहीं कर सकता। `schedule/src/symbolic/patterns.rs` से वास्तविक नियम:
 
 ```rust
-patterns! {
-    // Identity folding: x + 0 → x
-    Add[x, @zero] => x,
+// constant folding over thirteen binary ops, one rule body
+for op in binary [Add, Mul, Sub, FloorMod, Max, Pow, FloorDiv, Fdiv, And, Or, Xor, Shl, Shr] {
+    op(a @const(a_val), _b @const(b_val))
+      => eval_binary_op(op, a_val, b_val).and_then(|r| folded_const(a.dtype(), r)),
+},
 
-    // Constant folding: 3 + 4 → 7
-    Add(a @const(a_val), _b @const(b_val))
-        => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
+// commutative identity with a guard; `name @ @zero` binds the constant node too
+Add[x, zero @ @zero]
+    if !x.dtype().is_float()
+        || matches!(zero.op(), Op::Const(ConstValueHash(ConstValue::Float(v))) if v.is_sign_negative())
+    => x.clone(),
+Mul[x, @one] => x.clone(),
 
-    // Self-folding: x / x → 1
-    Idiv(x, x) => UOp::one(x.dtype()),
+// a repeated name means the same node (Arc::ptr_eq), here across a struct field
+original @ FloorDiv(x, x) => exact_integer_rewrite(original, 1.into_uop(x.dtype())),
+original @ FloorMod(range @ Range { end, .. }, end) => exact_integer_rewrite(original, range.clone()),
 
-    // Dead code elimination: if(true) { t } else { f } → t
-    Where(Const(ConstValue::Bool(true)), t, _f) => t,
+// struct ops match by field; `..` skips the rest
+Cast { src: Cast { src: x, dtype: intermediate }, dtype: outer }
+    if x.dtype() == *outer && can_safe_cast(outer, intermediate)
+    => x.clone(),
+```
+
+`schedule/src/expand.rs` से एक stateful मैचर:
+
+```rust
+crate::cached_patterns! {
+    @context RangeMap;
+    reduce @ Reduce { .. } => expand_reduce(reduce),
+    range @ Range { end: _, axis_id, axis_type }
+        if matches!(axis_type, AxisType::Upcast | AxisType::Unroll) && ctx.contains_key(axis_id)
+        => expand_range(ctx, range),
+    Wmma { a, b, c, metadata } if metadata.upcast_axes.is_some() => expand_wmma(ctx, a, b, c, metadata),
 }
 ```
 
-मैक्रो इन पैटर्न को एफ़िशिएंट Rust कोड में कम्पाइल करता है:
+| रूप | अर्थ |
+|------|---------|
+| `Add(x, y)` | प्रकार के अनुसार ALU op, स्थितीय, क्रमबद्ध। नाम `svod_ir::op::alu` से resolve होते हैं, इसलिए गलत नाम या arity compile error है। `UnaryOp`, `BinaryOp` (`Add, Mul, Sub, FloorMod, CMod, Max, Pow, FloorDiv, CDiv, Fdiv, Lt, Le, Eq, Ne, Gt, Ge, And, Or, Xor, Shl, Shr, Threefry`), `TernaryOp` (`Where`, `MulAcc`)। |
+| `Add[x, y]` | क्रमविनिमेय: ठीक दो children, दोनों क्रम आज़माए जाते हैं; guard और body एक बार उत्पन्न होते हैं और हर क्रम के लिए दोबारा आज़माए जाते हैं। |
+| `Cast { src: x, dtype }` | field के अनुसार struct op। एक field child pattern है जब वह `_`, `@..`, snake_case नाम, या `(..)`/`[..]`/`{..}`/`@` पर लागू identifier हो; बाकी सब शब्दशः Rust pattern है (`axis_type: AxisType::Upcast`, `index: 2`)। `Some(pat)`/`None` `Option<Arc<UOp>>` children से मेल खाते हैं (`Load { alt: None, gate: Some(g), .. }`)। Unit ops बिना कोष्ठक के लिखे जाते हैं (`Noop`)। |
+| `x` / `_` / `name @ pattern` | नोड को bind करना / अनदेखा करना / पूरे sub-match को bind करना |
+| `c @const(v)` | एक `CONST` नोड और उसका `ConstValue` bind करना |
+| `c @vconst(vs)` / `c @anyconst(vs)` | `VCONST` lanes / `CONST` या `VCONST` को `Vec<ConstValue>` के रूप में |
+| `Const(<rust pattern>)` | `ConstValue` पर एक Rust pattern |
+| `@zero` / `@one` | किसी भी संख्यात्मक dtype का scalar `CONST` 0 / 1 (`is_zero` `-0.0` और `false` से भी मेल खाता है) |
+| दोहराया गया नाम | एक ही नोड (`Arc::ptr_eq`); दोहराया गया `@const` value नाम मानों की तुलना करता है |
+| `for op in binary [A, B]` / `[*]` | कई ops (या किसी प्रकार के सभी) के लिए एक नियम body; `op` runtime op मान है, guard और body में उपयोगी |
+| `pat if guard => body` | guard हर binding और `ctx` देखता है |
+| `=> body` | `Arc<UOp>`, `Option<Arc<UOp>>` (`None` अस्वीकार करता है) या `RewriteResult`; `?` काम करता है, अकेली binding एक clone लौटाती है |
+| `@context Type;` | पहला आइटम; closure को `ctx: &mut Type` मिलता है |
 
-| सिंटैक्स | मतलब | उदाहरण |
-|----------|------|--------|
-| `(x, y)` | **Ordered।** एक्ज़ैक्ट ऑर्डर में मैच। | `Sub(x, @zero) => x` |
-| `[x, y]` | **Commutative।** दोनों orderings ट्राई करे। | `Add[x, @zero] => x` |
-| `@zero` | **ज़ीरो कॉन्स्टेंट।** 0 या 0.0 मैच करे। | `Mul[_, z @ @zero] => z` |
-| `@one` | **वन कॉन्स्टेंट।** 1 या 1.0 मैच करे। | `Mul[x, @one] => x` |
-| `c @const(val)` | **कॉन्स्टेंट एक्सट्रैक्ट।** वैल्यू बाइंड करे। | `Add(a @const(av), _b @const(bv))` |
-| `x, x` | **Same operand।** ptr_eq चेक ऑटो-जनरेट। | `Idiv(x, x) => UOp::one(...)` |
-| `=>` | **रीराइट।** `Arc<UOp>`, `Option<Arc<UOp>>` (`None` का मतलब स्किप) या `RewriteResult` रिटर्न। | `=> eval(...).map(...)` |
-| `for op in binary [...]` | **Template।** मल्टीपल ops के लिए पैटर्न जनरेट। | नीचे देखें |
-| `@context Type` | **Stateful।** पैटर्न में mutable context एक्सेस। | नीचे देखें |
+`cached_patterns!` का व्याकरण वही है और यह `LazyLock` से `&'static TypedPatternMatcher<C>` लौटाता है; `patterns!` एक नया मैचर बनाता है। दोनों `svod_schedule` से re-export होते हैं।
 
-### Template एक्सपैंशन
+### Macro क्या उत्पन्न करता है {#what-the-macro-generates}
 
-हर binary ऑपरेशन के लिए एक ही पैटर्न लिखने की बजाय, for-loop इस्तेमाल करें:
+`Op` पर `#[op_enum]`/`PatternEnum` लगा है, जो `svod_ir::op::pattern_derived::OpKey` उत्पन्न करता है — हर op प्रकार के लिए एक सघन index, समूहित `Unary`/`Binary`/`Ternary` के लिए हर sub-op का एक slot — और `OpMask`। एक `patterns!` ब्लॉक **एक closure** में compile होता है, जो `SimplifiedPatternMatcher::add_block` से पंजीकृत होता है, साथ में हर नियम के लिए `(root mask, early-reject mask)` की एक स्थिर तालिका:
+
+- एक ही स्थिर root प्रकार वाले लगातार नियम एक `match __key { __KEY_Add => { .. } .. }` साझा करते हैं; किसी arm के भीतर नियम स्रोत क्रम बनाए रखते हैं।
+- बिना स्थिर root वाले नियम — wildcards (`x if ..`), `for` ब्लॉक, `@anyconst` roots — उन `match`es के *बीच* क्रमिक चरणों के रूप में उत्पन्न होते हैं, इसलिए प्राथमिकता शुद्ध स्रोत क्रम है, न कि "पहले indexed, अंत में wildcards"।
+- हर नियम एक early-reject परीक्षण से शुरू होता है: उसकी निश्चित child स्थितियों को जिन op प्रकारों की ज़रूरत है, वे एक bit mask हैं जिसे root के `src_ops` के विरुद्ध जाँचा जाता है (Tinygrad का `UPat.early_reject`)।
+- क्रमविनिमेय स्थान आलसी रूप से जुड़े candidate iterators बन जाते हैं; नेस्टेड क्रमविनिमेय नोड नेस्टेड loops बनते हैं; body हर क्रम के लिए दोबारा आज़माई जाती है।
+- एक `for` ब्लॉक हर नियम body के लिए एक बार compile होता है; op चर runtime पर root से bind होता है।
+
+`SimplifiedPatternMatcher<C>` (`TypedPatternMatcher<C = ()>` इसका alias है) segments की एक सूची है, हर ब्लॉक का एक, प्रत्येक के साथ एक root `OpMask` और closure। `rewrite(node, ctx)` segments को स्कैन करता है, उन्हें छोड़ देता है जिनके mask में नोड का प्रकार नहीं है, और पहला non-`NoMatch` लौटाता है। `a + b` `b` के segments को `a` के बाद जोड़ता है, इसलिए बाएँ operand के नियम जीतते हैं। `with_context::<D>()` एक `TypedPatternMatcher<()>` को `D`-context मैचर में उठाता है (यह `&self` लेता है); हाथ से लिखे closures `add`, `add_rejecting`, `add_wildcard` से जोड़े जाते हैं। `Matcher<C>` trait है (`fn rewrite(&self, &Arc<UOp>, &mut C) -> RewriteResult`); `late/dtype.rs` में `DemoteFloat` इसे सीधे implement करता है।
+
+## Rewrite इंजन {#the-rewrite-engine}
+
+`ir/src/rewrite/engine.rs` Tinygrad के `unified_rewrite` का stack-आधारित port है। हर नोड तीन चरणों से गुज़रता है:
+
+| चरण | क्या होता है |
+|-------|--------------|
+| 0 — PushChildren | यदि `bpm` मैचर दिया गया है, तो नीचे उतरने से *पहले* इसे इस नोड पर fixpoint तक लागू करें (patterns मूल children देखते हैं)। `Gate(node)` एक प्रतिस्थापन दर्ज करता है और children को छोड़ देता है। फिर children को push करें, फिर इस नोड के लिए एक stage-1 प्रविष्टि। |
+| 1 — ApplyPatterns | children को replacement map से resolve करें (यदि कोई तैयार नहीं है तो waitlist)। यदि कोई child बदला, तो नोड को फिर से बनाएँ और पुनर्निर्मित नोड को stage 0 पर वापस भेजें। अन्यथा `pm` लागू करें; `Rewritten` परिणाम stage 0 पर push होता है — पूरी तरह फिर से traverse और फिर से match, यही fixpoint है — एक stage-2 link के साथ। |
+| 2 — Link | मूल नोड को उसके प्रतिस्थापन के अंतिम परिणाम से map करें। |
+
+परिणाम `UOp::id` द्वारा memoize होते हैं (`replace`, `bpm_cache`; `Gate` कभी cache नहीं होता)। दो सीमाएँ: `REWRITE_STACK_LIMIT = 500_000` stack प्रविष्टियाँ (`"infinite loop in graph_rewrite (stack too big: ..)"`), और प्रति-नोड `bpm_seen` सेट जो तब panic करता है जब bottom-up fixpoint किसी नोड पर दोबारा आता है। कोई iteration सीमा नहीं है।
+
+| प्रवेश बिंदु | मैचर |
+|-------------|----------|
+| `graph_rewrite(pm, root, ctx)` | stage 1 पर `pm` — नियम rewrite किए गए children देखते हैं (Tinygrad डिफ़ॉल्ट) |
+| `graph_rewrite_bottom_up(bpm, root, ctx)` | stage 0 पर `bpm` — नियम मूल children देखते हैं (Tinygrad `bottom_up=True`); `Gate` का सम्मान होता है |
+| `graph_rewrite_with_bpm(pm, bpm, root, ctx)` | दोनों; केवल tests में उपयोग |
+| `graph_rewrite_walk(bpm, root, ctx)` | एक पास, प्रतिस्थापन फिर से traverse नहीं होते (Tinygrad `walk=True`) |
+| `*_preserve_calls` रूप | वही, लेकिन `CALL`/`FUNCTION` bodies या `PROGRAM` के आंतरिक भाग में प्रवेश किए बिना (Tinygrad `enter_calls=False`) |
+
+`RewriteResult` या तो `NoMatch`, `Rewritten(Arc<UOp>)` या `Gate(Arc<UOp>)` है; `pm` मैचर में `Gate` को `NoMatch` माना जाता है। Kernel cut `Gate` का उपयोग `split_all_stores` को पहले से बने kernel `SINK` में उतरने से रोकने के लिए करता है (`rangeify/kernel.rs`)। यदि कोई नियम वही नोड लौटाता है जो उसे दिया गया था, तो एक `debug_assert` चल जाता है।
+
+एकमात्र non-graph driver `line_rewrite` (`linearize/mod.rs`) है: यह रैखिक instruction सूची पर एक बार चलता है, हर प्रविष्टि को कई में फैलने देता है, और बाद के sources को एक map के माध्यम से प्रतिस्थापित करता है। इसका एकमात्र उपयोगकर्ता `line_rewrite_cleanups` है, यानी gated-`STORE` → `IF`/`STORE`/`ENDIF` विस्तार।
+
+`RUST_LOG=svod_ir::pattern=trace` हर match (`op_key`) को log करता है; यह log नहीं करता कि कौन-सा नियम चला या कौन-से आज़माए गए।
+
+## संयोजन क्रमबद्ध है {#composition-is-ordered}
+
+मैचर `+` द्वारा एक निश्चित क्रम में जोड़े जाते हैं, और क्रम का अर्थ होता है। `symbolic_simple()` `propagate_invalid` से शुरू होता है, क्योंकि अन्यथा `x * 0 → 0` `MUL(0, WHERE(c, x, Invalid))` को उसकी validity सहित मिटा देगा; `with_tier2` term combining से पहले canonicalization और comparison नियमों से पहले ALU folding रखता है, क्योंकि हर समूह अगले के लिए मैच उजागर करता है (देखें [बीजगणितीय सरलीकरण](./algebraic-simplification.md))। नया नियम जोड़ने का अर्थ है यह चुनना कि उस क्रम में वह कहाँ लागू होगा।
+
+## Z3 से rewrites का सत्यापन {#verifying-rewrites-with-z3}
+
+`schedule/src/z3/` (feature `z3`, वैकल्पिक निर्भरता `z3 = "0.21"`, सिस्टम `libz3`; nix flake इसे प्रदान करता है) rewrites पर भरोसा करने के बजाय उन्हें जाँचता है:
+
+- `convert.rs` एक UOp tree को Z3 term में अनुवादित करता है: `CONST` (int, uint, bool; floats और `Invalid` अस्वीकार), `DefineVar` एक सीमित पूर्णांक के रूप में, `RANGE` `0 <= r < end` वाले नए चर के रूप में, `Neg`, पूर्णांक binary ops `Add, Sub, Mul, FloorDiv, FloorMod, CDiv, CMod, Max, Lt, Eq, Ne` (bools पर `And`/`Or`), पूर्णांकों पर `WHERE` और `MulAcc`, और `CAST` एक dtype-सीमित नए चर के रूप में, जो source range फिट होने पर अपने source से बँधा होता है। `alu.rs` `CDiv`/`CMod` को C truncation semantics देता है; floor division उन्हीं पर बना है। बाकी सब `ConversionError` है।
+- `verify_equivalence(original, simplified)` दोनों को एक context में बदलता है और `original != simplified` assert करता है: `UNSAT` rewrite को सिद्ध करता है, `SAT` `CounterExample::Found { model, .. }` लौटाता है, timeout पर `Unknown`।
 
 ```rust
-patterns! {
-    for op in binary [Add, Mul, Sub, Idiv, Fdiv, Max] {
-        op(a @const(a_val), _b @const(b_val))
-            => eval_binary(op, a_val, b_val)
-                .map(|r| UOp::const_(a.dtype(), r))
-    }
+/// The identity elimination `x + 0 = x` is pointer-identical and Z3-proven.
+#[test]
+fn z3_verify_identity_add_zero(x in arb_var_uop(DType::Int32)) {
+    let zero = UOp::native_const(0i32);
+    let expr = x.try_add(&zero).expect("ADD accepts matching dtypes");
+    let simplified = rewrite(Matchers::simple(), expr.clone());
+    prop_assert!(Arc::ptr_eq(&simplified, &x));
+    verify_equivalence(&expr, &simplified).expect("Z3 should verify x + 0 = x");
 }
 ```
 
-यह कम्पाइल टाइम पर छह अलग-अलग पैटर्न में एक्सपैंड होता है — हर ऑपरेशन के लिए एक।
+क्या कवर है (`schedule/src/test/`): `symbolic_simple` से गुज़रती हाथ से लिखी पंक्तियाँ (`unit/z3/symbolic_patterns.rs`), `symbolic_simple` और `symbolic` से गुज़रते `arb_arithmetic_tree_bounded_up_to` और `arb_known_property_graph` पर proptest oracles (`property/oracles.rs`, प्रत्येक 300–500 cases), और संरचनात्मक symbolic tests का दोहरा रन, जो convert होने पर हर पंक्ति को Z3 से दोबारा जाँचता है (`unit/symbolic/mod.rs`)। केवल `Found` test को विफल करता है; `Unknown` और `ConversionFailed` सहन किए जाते हैं, और एक liveness test सुनिश्चित करता है कि अंकगणितीय core अब भी convert होता है। इसे `cargo test -p svod-schedule --features z3,proptest` से चलाएँ; CI वही features `nix flake check` के माध्यम से चलाता है।
 
-### Stateful पैटर्न
-
-कुछ ऑप्टिमाइज़ेशन को context चाहिए (जैसे, हम किस कर्नेल में हैं, कौन सी ranges एक्टिव हैं):
-
-```rust
-patterns! {
-    @context KernelContext;
-
-    reduce @ ReduceAxis { src, .. } => {
-        ctx.record_reduction(reduce);
-        transform_reduce(reduce, src, ctx)
-    }
-}
-```
-
-Context पैटर्न closures को लास्ट आर्ग्युमेंट के रूप में पास होता है।
-
-### Context Lifting
-
-अलग-अलग context types वाले matchers को combine करते समय, `.with_context()` इस्तेमाल करें:
-
-```rust
-let pm_add_images = symbolic_simple().clone().with_context::<AddImageContext>()
-    + no_vectorized_alu().clone().with_context()
-    + pm_simplify_add_image();
-```
-
----
-
-## पैटर्न मैचिंग कैसे काम करता है
-
-`patterns!` मैक्रो एक ब्लॉक को एक फ़ंक्शन में कम्पाइल करता है जो रूट के operation kind पर `match` से डिस्पैच करता है, फिर उस kind के पैटर्न source order में ट्राई करता है।
-
-### OpKey इंडेक्स
-
-हर UOp का एक ऑपरेशन टाइप होता है (Add, Mul, Load, वगैरह)। मैक्रो एक `OpKey` enum जनरेट करता है जो ऑपरेशन को hashable keys में मैप करता है:
-
-```rust
-match OpKey::from_op(tree.op()).index() {
-    KEY_ADD => { /* rules rooted at Add, in source order */ }
-    KEY_MUL => { /* rules rooted at Mul */ }
-    _ => {}
-}
-// wildcard rules (`x if cond`) run as sequential steps between the matches
-```
-
-UOp मैच करते समय:
-1. UOp के ऑपरेशन से **OpKey एक्सट्रैक्ट** करें
-2. उस kind के `match` arm पर **जंप** करें
-3. हर closure **ट्राई** करें जब तक कोई मैच न हो
-4. कोई indexed पैटर्न मैच न हो तो **wildcards पर फ़ॉलबैक**
-
-### Commutative हैंडलिंग
-
-`Add[x, @zero]` जैसे पैटर्न के लिए, मैक्रो ऐसा कोड जनरेट करता है जो दोनों orderings ट्राई करे:
-
-```rust
-// Try (x, @zero)
-if let Some(result) = try_match_ordered(&children[0], &children[1]) {
-    return result;
-}
-// Try (@zero, x)
-if let Some(result) = try_match_ordered(&children[1], &children[0]) {
-    return result;
-}
-```
-
-### डुप्लिकेट डिटेक्शन
-
-जब आप `Idiv(x, x)` लिखते हैं, पैटर्न सिर्फ़ तभी मैच होता है जब दोनों operands *एक ही* UOp हों (pointer equality via `Arc::ptr_eq`, structural equality नहीं)। यह hash consing का फ़ायदा उठाता है — आइडेंटिकल subexpressions एक ही पॉइंटर शेयर करते हैं।
-
----
-
-## रीराइट इंजन
-
-सिर्फ़ पैटर्न मैचिंग काफ़ी नहीं है। यह एक्सप्रेशन देखें:
-
-```text
-WHERE(Lt(3, 5), t, f)
-```
-
-इसे सिम्प्लिफ़ाई करने के लिए, दो स्टेप चाहिए:
-1. `Lt(3, 5)` → `true` (constant folding)
-2. `WHERE(true, t, f)` → `t` (dead code elimination)
-
-लेकिन `WHERE` पैटर्न तब तक मैच नहीं करेगा जब तक उसका child सिम्प्लिफ़ाई न हो। रीराइट इंजन इसे **टू-स्टेज एल्गोरिदम** से सॉल्व करता है।
-
-### स्टेज 0: पैटर्न अप्लिकेशन
-
-हर नोड पर पैटर्न अप्लाई करें। कोई पैटर्न मैच न हो तो children को पहले प्रोसेस करने का सिग्नल दें।
-
-### स्टेज 1: सोर्स रीकंस्ट्रक्शन
-
-Children रीराइट होने के बाद, नए children के साथ नोड रीबिल्ड करें और पैटर्न फिर ट्राई करें:
-
-```mermaid
-flowchart TD
-  A["Stage 0: WHERE(Lt(3, 5), t, f)"] -->|"no match, process children"| B["Gate"]
-  A --> C["Lt(3, 5)"]
-  C -->|"constant folding matches"| D["true"]
-  D --> E["Stage 1: WHERE(true, t, f)"]
-  E -->|"dead code elimination matches"| F["t"]
-```
-
-रीकंस्ट्रक्शन स्टेज पैटर्न री-अप्लाई करता है, जो सिंगल traversal में मल्टी-स्टेप ऑप्टिमाइज़ेशन सक्षम करता है।
-
-### रीराइट स्ट्रैटेजीज़
-
-तीन रीराइट फ़ंक्शन, Tinygrad के `graph_rewrite` से मैच करते हुए:
-
-| स्ट्रैटेजी | पैटर्न क्या देखते हैं | कब इस्तेमाल करें |
-|------------|----------------------|------------------|
-| `graph_rewrite(pm)` (डिफ़ॉल्ट) | OPTIMIZED children | अल्जेब्रिक सिम्प्लिफ़िकेशन, expansion |
-| `graph_rewrite_bottom_up(bpm)` | ORIGINAL children | Nested structure matching, buffer removal |
-| `graph_rewrite_with_bpm(pm, bpm)` | दोनों (bpm: original, pm: optimized) | कर्नेल splitting (gate + transform एक पास में) |
-
-इंजन हमेशा bottom-up traverse करता है; फ़र्क यह है कि पैटर्न *कब* फ़ायर होते हैं: Stage 0 में (children प्रोसेस होने से पहले — originals देखते हैं) या Stage 1 में (children के बाद — optimized results देखते हैं)। Matchers को `+` ऑपरेटर से combine किया जाता है: `matcher_a() + matcher_b()` उनके पैटर्न सेट्स को एक में मर्ज करता है।
-
-### सेफ़्टी लिमिट्स
-
-इन्फ़िनिट लूप रोकने के लिए:
-- अधिकतम **500,000 rewrite-stack entries** (`REWRITE_STACK_LIMIT`)
-- लिमिट पार होने पर डायग्नोस्टिक इन्फ़ो के साथ panic
-
-प्रैक्टिस में, ठीक से बने पैटर्न जल्दी converge करते हैं।
-
----
-
-## यह क्यों ज़रूरी है
-
-**डीबगिंग डायरेक्ट है।** पैटर्न पढ़ने योग्य कोड हैं। किसी भी पैटर्न में `println!` जोड़ें ताकि पता चले कब फ़ायर होता है।
-
-**एक्सटेंसिबिलिटी आसान है।** कस्टम ऑप्टिमाइज़ेशन जोड़ना दो लाइन है — कम्पाइलर इंटरनल्स समझने, visitors लिखने, या pass managers मॉडिफ़ाई करने की ज़रूरत नहीं।
-
-**करेक्टनेस लोकल है।** हर पैटर्न एक छोटा theorem है: "अगर यह स्ट्रक्चर दिखे, उसे इससे बदलने से सिमैंटिक्स preserve होते हैं।" हर पैटर्न को इंडिपेंडेंटली वेरिफ़ाई करें। करेक्ट पैटर्न का composition करेक्ट प्रोग्राम देता है।
-
-**परफ़ॉर्मेंस ट्यूनेबल है।** O(1) पैटर्न dispatch डिफ़ॉल्ट से तेज़ है। प्रोडक्शन वर्कलोड के लिए [beam search](./kernel-search.md) से combine करें।
-
----
-
-## गहरी समझ
-
-पैटर्न मैचिंग generality को composability से ट्रेड करता है।
-
-एक general-purpose ऑप्टिमाइज़ेशन पास कुछ भी कर सकता है — लेकिन यही प्रॉब्लम है। इसे वेरिफ़ाई करना मुश्किल, extend करना मुश्किल, दूसरे passes के साथ compose करना मुश्किल। ऑर्डरिंग मैटर करती है। इंटरैक्शन सटल हैं।
-
-पैटर्न constrained है: यह एक स्पेसिफ़िक स्ट्रक्चर मैच करता है और स्पेसिफ़िक replacement प्रोड्यूस करता है। लेकिन constraints composition सक्षम करते हैं। ठीक से डिज़ाइन किए गए पैटर्न सेट्स के लिए, पैटर्न को fixed point तक चलाने से deterministic रिज़ल्ट मिलता है। नए पैटर्न localized impact के साथ जोड़े जा सकते हैं, और cascading failures के बिना हटाए जा सकते हैं — हालाँकि प्रैक्टिस में, convergence सुनिश्चित करने के लिए पैटर्न इंटरैक्शन टेस्ट करने चाहिए।
-
-हर पैटर्न semantic equivalence का एक theorem है। रीराइट इंजन एक theorem prover है, जो इनपुट से ऑप्टिमाइज़्ड आउटपुट तक derivations ढूँढता है। करेक्टनेस individual steps की करेक्टनेस से आती है।
-
-यह Unix philosophy है जो कम्पाइलरों पर लागू है: छोटे, focused टूल जो compose करें।
+प्रमाण सीमित op उपसमुच्चय के नमूना expressions पर असीमित पूर्णांकों के लिए है — यह index सरलीकारक के लिए एक मज़बूत regression जाल है, हर pattern का सत्यापन नहीं।

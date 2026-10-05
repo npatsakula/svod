@@ -107,9 +107,10 @@ attributes #0 = { alwaysinline nounwind "no-trapping-math"="true" }
     assert!(validate_ptx(&ptx, CudaArch { major: 8, minor: 9 }, "nvptx_smoke").is_err(), "wrong arch must fail");
     assert!(validate_ptx(&ptx, SM86, "other_kernel").is_err(), "wrong kernel must fail");
 
-    // A misspelt intrinsic is accepted by clang but lands in the PTX as an
-    // external call; the validator is what catches it.
-    let bogus = ir.replace("@llvm.exp2.f32", "@llvm.nvvm.lg2.approx.f32");
+    // A call to a symbol nothing defines compiles, but lands in the PTX as an
+    // external call; the validator is what catches it. (A misspelt `llvm.nvvm.*`
+    // intrinsic no longer works here: LLVM 23 rejects it in the backend.)
+    let bogus = ir.replace("@llvm.exp2.f32", "@svod_unresolved_exp2");
     let ptx = compile_ir_to_ptx(&bogus, SM86).expect("clang accepts the module");
     let err = validate_ptx(&ptx, SM86, "nvptx_smoke").expect_err("unresolved intrinsic must fail validation");
     assert!(format!("{err}").contains("unresolved"), "{err}");

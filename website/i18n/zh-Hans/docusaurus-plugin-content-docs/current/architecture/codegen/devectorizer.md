@@ -1,245 +1,107 @@
 ---
-sidebar_label: 阶段 3 — Devectorizer
+sidebar_label: Devectorizer 与索引降级
 ---
 
-# 阶段 3：Devectorizer
+# GPU 维度、去向量化与索引降级（阶段 12–18）
 
-**目标**：从硬件无关的向量降低到硬件特定的指令。
+归约降级之后，内核仍然使用带形状的值和 `WeakInt` 索引。这些阶段把 range 映射到硬件索引，让每次内存访问都成为显式的标量 `LOAD`/`STORE`，把连续访问重新加宽，并确定索引 dtype。源码：`gpudims.rs`、`devectorize.rs`、`late/coalesce.rs`、`symbolic/index_lowering.rs`。
 
----
+## 12 —— GPU 维度
 
-## Stage 11：移除 Reduce
+两个匹配器。`pm_lower_device_ranges` 对每个 renderer 都运行：`Device` range 变成带该 range 界限的标量 `PARAM` 变量 `_device_num`，关闭它的 `END` 去掉对应条目。`pm_add_gpudims` 仅在 `renderer.has_local || renderer.has_threads` 时运行；它只匹配一次 `SINK`（`GpuDimsContext` 记住已降级 sink 的 id，使引擎的再次访问成为空操作）。
 
-> **阶段速览**
->
-> **目标**：将声明式 REDUCE 转换为命令式累加
-> **关键模式**：Reduce 到累加器、水平规约
-> **影响**：映射到硬件规约指令
+`add_gpudims`：
 
-**做了什么**：将高层 REDUCE 转换为累加器模式。
+1. 收集每个 `RANGE`，以 `(axis_id, axis_type)` 为键；如果已存在 `SPECIAL` 则放弃。
+2. 全局维度 = `Global` 和 `Thread` 轴；局部维度 = `Local`、`Warp`、`GroupReduce`。两者都按轴 id 排序；`Warp` 轴被移到局部维度的最前面，使其占据线性线程索引的低位（`mma.sync` 按硬件 lane 寻址 fragment）。
+3. 构建索引表达式：
+   - `has_threads`（CPU）：必须恰好一个全局轴且没有局部轴，否则该 pass 发出警告并放弃。该轴变成 `PARAM("core_id", 0..N-1)`。
+   - `KernelInfo.dont_use_locals`：只有全局维度，`get_grouped_dims("idx", ..)`。
+   - 其他情况：先在 `local_max_axes()`（或逐轴的 `local_max`；首个上限被固定为 warp 的 extent，使其他维度不会折叠进 `lidx0`）约束下由局部形状生成 `lidx*`，然后在 `global_max` 约束下由全局形状生成 `gidx*`；当 renderer 声明了工作项乘积上限时，再进一步以 `global_prod_max / hardware_local_extents` 为上限。
+4. `get_grouped_dims` 与 Tinygrad 相同：若维度超出逐轴上限，`group_dims` 合并乘积不超限的相邻维度；若无法分组，`split_dims` 用最小因子拆分过大的维度，放入下一个槽位。任一失败都会在调度时 panic，而不是在代码生成时（`"cannot limit dims to N axes"`）。结果是每个受限维度一个 `SPECIAL(end, "gidxN")`；发生分组或拆分时，每个原始维度通过 `FloorDiv`/`FloorMod` 从扁平索引重建，并用 `symbolic` 化简。全局索引以 `reverse = true` 生成（递归会同时反转输入*和*输出，因此名称保持迭代顺序）。
+5. **Store 掩码**（`compute_store_masks`）：若写入全局内存的 `STORE` 的索引不在每个局部 range 的作用域内，则其索引会得到 `WHERE((l1 == 0) & (l2 == 0) & .., idx, Invalid)`，使每个未使用的局部轴只有一个工作项执行写入。掩码留在索引表达式内部，这样 RANGE → SPECIAL 的替换会把它带到硬件索引上。
+6. 把每个 GPU range 替换为其索引；`Reduce` range 仍为循环。
 
-**为什么重要**：声明式的"对这些值求和"需要变成命令式指令：初始化累加器、循环、逐个相加。
+在[完整示例](./worked-example.md)页面的 CPU 例子中，这里什么也不发生：行轴是 `Weak`（没有创建 `Thread` 轴），并且该 renderer 没有局部维度。
 
-**模式**：`movement_cleanup_patterns + pm_reduce_local`
+## 13 —— loads
 
-`pm_reduce_local` 打包了 WMMA-add 融合、`pm_group_for_reduce`、
-累加器和水平规约规则，以及 group-SINK 清理。
+`PM_ADD_LOADS = symbolic_simple() + pm_expand_broadcast() + pm_add_loads()`。
 
-```text
-// Before: declarative reduction
-REDUCE(Add, values, range)
+- `pm_expand_broadcast` 先再次运行 `pm_wmma_add`，然后把广播显式化：若 `Binary`/`Ternary`/`STORE` 的源形状不同，每个源都被 `RESHAPE`（前导 1）并 `EXPAND` 到广播形状；操作数前缀不同的 `WMMA` 按输出坐标展开（`broadcast_and_devec_wmma`）。
+- `pm_add_loads` 把每个*作为值被消费*的操作数包进 `LOAD`：带地址空间的 ALU 算子、类型转换、`REDUCE`、`WMMA` 和 `STACK` 的源（`maybe_load`），以及本身是地址的 `STORE` 值。用作地址的 `INDEX` —— `STORE` 的目标、`WMMA` 的 fragment 指针 —— 保持原样。阶段 10 创建的累加器读取（`AFTER(acc, ..)`）在这里变成 `LOAD(AFTER(acc, ..))`。
 
-// After: imperative accumulation
-acc = placeholder(AddrSpace::Reg)   // initialized to the reduce identity
-for i in range:
-    acc = STORE(acc, ADD(LOAD(acc), values[i]))
-```
+## 14 —— 去向量化
 
-累加器循环是一条 AFTER / STORE / END 链，由一个覆盖规约 range 的 `END` 收尾——
-在这一层没有单独的循环构造。
+`devectorize()` 是基于 `symbolic_simple + devectorize_patterns + bool_storage_patterns + indexing_simplify` 的一次 `graph_rewrite`（`Renderer` 上下文，规则并不使用它）。没有外层循环：引擎会对每个替换结果重新匹配。
 
-**水平规约**：
+`devectorize_patterns`（Tinygrad 中的 `devectorizer2`），按源码顺序：
 
-在循环遍历规约维度之前，我们先合并一个带形状值的各条 lane。这样可以创建更大的规约，更好地映射到硬件指令。
+| 组 | 规则 |
+|-------|-------|
+| `movement_cleanup_patterns` | `mop_cleanup_patterns`，加上 `RESHAPE(STACK([x]))` 和前导单例维度的物化 |
+| `movement_op_patterns` | rangeify 的 movement 规则（穿过 `INDEX`、`AFTER`、`END`） |
+| `no_vectorized_alu` | 形状非空的每个一元/二元/三元算子、`CAST`、`BITCAST` → `devectorize_alu` |
+| `mixed_representation_alu` | 源中混有 `STACK` 和向量 dtype 值的 ALU：向量源被拆成 `STACK(INDEX(src, lane)..)`，然后 `devectorize_alu` |
+| 带形状的 `LOAD` / `STORE` | → `devectorize_alu`（逐 lane 的 `LOAD(INDEX)`；逐 lane 的 store 收集到一个 `GROUP` 中） |
+| `INDEX(buf, [])` | → `buf` |
+| `WMMA` | `stack_wmma_sources`：操作数变成已加载 lane 的 `STACK` |
+| `PARAM`/`BUFFER` 上的 `INDEX(buf, STACK(i0, i1, ..))` | → `STACK(INDEX(buf, i0), INDEX(buf, i1), ..)` —— lane 仍是地址；外围的 `LOAD`/`STORE` 负责将其物化 |
+| `INDEX(buf, RESHAPE(i))` | → `RESHAPE(INDEX(buf, i))` |
+| `Void` 值的 `RESHAPE` | → 该值（围绕 `AFTER`/`STORE` 的形状簿记） |
+| 被 reshape 为标量的单元素带形状值 | → `INDEX(src, 0)` |
+| `EXPAND` | `materialize_stack_broadcast`（广播到 N 个 lane 的 `STACK([x])` → `STACK([x; N])`）或 `expand_scalar_to_stack` |
 
-```mermaid
-flowchart TD
-  A["Before: [a, b, c, d, e, f, g, h] (8 lanes)"]
-  A -->|"Horizontal reduction"| B["Fold left-to-right in row-major lane order: ((((((a+b)+c)+d)+e)+f)+g)+h"]
-  B -->|"Accumulator pattern"| C["After: acc = acc + horizontal_result"]
-```
+`devectorize_alu` 即 Tinygrad 的 `do_devectorize`：它要求每个源都具有结果形状（或者是 `Invalid` 基值，其标量是多态的），枚举静态形状的所有坐标，为每个坐标构建一个以 `INDEX(source, c0, c1, ..)` 为操作数的标量算子，再用 `stack_with_shape`（与形状对应的嵌套 `STACK`）重新组装 —— 对 `STORE` 则用 `GROUP`。lane 数是形状的完整乘积；没有按设备区分的折叠宽度。重新向量化是后端的工作（LLVM 的 SLP 向量化器，或对内存访问而言是两个阶段之后的 `memory_coalescing`）。
 
-**WMMA 张量核心融合**：
-```text
-// Fuse tensor core accumulation inline
-WMMA(a, b, c) + add → WMMA(a, b, c + add)
-```
-该模式实现了张量核心上高效的 FMA 式累加。另有两条分支分别穿过 `PERMUTE` 包装器以及 `PERMUTE(RESHAPE(...))` 包装器进行融合。
+`bool_storage_patterns`：bool 的 `STORE` 转换为 `uint8`，bool 的 `LOAD` 加载 `uint8` 后再转换回来，涉及 bool 的 `BITCAST` 变成 `CAST`。LLVM 的 `i1` 高位可能带有垃圾值。
 
-**Svod**：`devectorize.rs`
+`indexing_simplify`（`late/coalesce.rs`）：对于 `INDEX(buf, WHERE(valid, idx, Invalid))`，`uop_given_valid` 在 `valid` 成立的假设下重写 `idx`（`symbolic/valid_simplification.rs`）；双坐标的图像形式还会丢弃图像边界已经蕴含的有效性子句（`drop_valid_stmts`）。
 
----
+此阶段之后，每个 ALU 算子都是标量的。在完整示例中，索引表达式的四个 lane 变成四个 `LOAD(INDEX(PARAM, R0*4 + R1*64 + k))`，水平 `Add` 链也变得显式。
 
-## Stage 12：添加 GPU 维度
+## 15 —— 早期符号化简
 
-> **阶段速览**
->
-> **目标**：将抽象 range 映射到 GPU 线程索引
-> **关键模式**：Range 到 SPECIAL 的替换
-> **影响**：在 GPU 上实现并行执行
+再运行一次 `sym()`，这次是在标量代码上。它存在的理由在于下一阶段：索引表达式必须处于规范的 `base + const` 形式，合并访存才能对其分组。
 
-**做了什么**：将 range 替换为 GPU 线程索引。
+## 16 —— 内存合并访问
 
-**为什么重要**：GPU 有硬性限制：每个块最多 1024 个线程、共享内存最多 48KB。如果你的计算需要 2000 个线程，编译器必须将其分割成多个块。维度限制会自动处理这些。
+`memory_coalescing`（`late/coalesce.rs`）是图遍历，不是匹配器。它按 `(op, buffer, index base, validity)` 对无 gate 的 `LOAD` 和 `STORE` 分组，其中索引被拆成 `base + integer_offset`（`Invalid` 或常量索引自成一个 base）。组内连续的偏移构成若干段；每段被切成能整除 base 偏移的最宽折叠长度：
 
-**模式**：先是 `pm_lower_device_ranges`，然后是 `pm_add_gpudims`（仅当渲染器有 local 或 thread 维度时）
+- 图像缓冲区：4；
+- `supports_float4` 的 renderer：当 `access_bytes() >= 16` 时从 `16 / sizeof(dtype)` 起向下取 2 的幂（8 个 16 位 lane、4 个 `f32`），否则从 4 起；
+- 其他情况：只能是标量。`Reg` 缓冲区和不可折叠的 dtype（f32/f16/bf16/i32/u32/fp8 以外的一切）保持标量。
 
-```text
-// Before: abstract range
-RANGE(end=256, Global)
+宽度为 `n > 1` 的折叠变成 `LOAD(SHRINK(buf, offset, n))`，旧的 load 被替换为 `INDEX(load, lane)`；或变成 `STORE(SHRINK(..), STACK(values))`。`SHRINK` 携带分组形状；内存 dtype 仍为标量。`DMC=1` 禁用此 pass。在完整示例中，四个展开的 load 变成一个 `LOAD(SHRINK(PARAM(1), R0*4 + R1*64, 4))`，LLVM 后端将其渲染为 `load <4 x float>`。
 
-// After: GPU-specific
-SPECIAL(gidx0)  // global thread index
-```
+## 17 —— 自底向上的逐元素 / 图像 pass
 
-**映射**：
+`symbolic_simple + no_vectorized_alu + pm_simplify_add_image`，通过 `graph_rewrite_bottom_up` 和 `AddImageContext` 应用。图像规则把对 f32 图像缓冲区的 f16 访问规范化（`LOAD` → `LOAD.cast(f16)`、`STORE(value.cast(f32))`，并去掉 `CAST(CAST(x, f16), f32)` 往返转换）。图像缓冲区的*创建*在 Svod 中没有对应目标；这些规则只服务于已有的图像访问。`no_vectorized_alu` 再次运行，因为图像重写可能重新引入带形状的算子。
 
-| Range 类型 | GPU 等价物 |
-|------------|----------------|
-| Global, Thread | `gidx`（全局索引） |
-| Local, Warp, GroupReduce | `lidx`（本地/工作组索引） |
-| Device | PARAM 变量 `"_device_num"`（在启动时绑定） |
-| Reduce | 循环（不映射） |
+## 16 —— 额外符号化简
 
-Warp range 会被排到本地维度的最前面，因此它们占据线程索引的低位。
+`extra_symbolic_patterns = sym() + indexing_simplify()`。这里的索引有意仍为 `WeakInt`：`sym` 和 `indexing_simplify` 的分配律规则与索引有效性规则需要弱 dtype，所以这是它们最后的机会。（该标签与内存合并访问的标签冲突；两者都在 `SVOD_DUMP_STAGE=16` 下打印。）
 
-**维度限制**：
+## 17 —— 索引 dtype 降级
 
-GPU 有硬件限制（如每个块最多 1024 个线程）。当 range 超过这些限制时，编译器会：
+`lower_index_patterns = symbolic_simple + pm_fold_cast_const + pm_lower_index_dtype + indexing_simplify`，每个内核一个 `WeakMemo`（对应 Tinygrad 的单个 `ctx={}`）。移植自 `tinygrad/uop/weak.py`。
 
-1. 当相邻维度的乘积仍然放得下时把它们**分组**：`[16, 16, 256]` 在上限 `[256, 256]` 下 → `[256, 256]`
-2. **分割**过大维度：`[2048]` 在上限 `[1024, 1024, 1024]` 下 → `[1024, 2]`
-3. 通过 divmod **重建**索引
+`select_dtype(u)`：`WeakFloat` → 默认浮点类型；`vmin`/`vmax` 落在 `i32` 范围内的整数 → 默认整数类型，否则为 `Int64`；向量数量保持不变。
 
-**Store 掩码**：
+`pm_lower_index_dtype` 组合了：
 
-不使用所有本地维度的全局 store 会被掩码：
-```text
-// If STORE doesn't use lidx1, restrict its index validity:
-STORE(INDEX(buf, idx), value) → STORE(INDEX(buf, WHERE(lidx1 == 0, idx, Invalid)), value)
-```
-这确保 store 仅在未使用的本地索引为 0 时执行。掩码留在索引表达式中，这样 RANGE 替换就会把它带到对应的硬件索引上。
+1. `pm_commit_weak` —— 若 `Binary`/`Ternary` 带有弱类型源且 `least_upper_dtype` 非弱，则把弱类型源确定为该类型（`commit_weak`：`CONST` 直接改类型，其他一律做类型转换）；值为弱类型的 `STORE` 把值确定为索引的 dtype。
+2. `pm_cast_weak` —— `CAST(weak_alu, concrete)` 把具体 dtype 推入该 ALU 的源。
+3. `SHRINK` 的偏移/大小用 `select_dtype` 确定。
+4. 任何带弱类型源的非弱节点 → `lower_weak_srcs`：每个弱类型源用 `pm_lower_weak` 重写（按源 id 记忆化），末尾的弱 `CAST` 由消费者自己的边吸收。`pm_lower_weak` 是三阶段级联：
+   - 叶子：`CONST`/`VCONST`/标量 `PARAM` 变成 `concrete.cast(weak)`；
+   - `Unary`、`Binary`、`WHERE`（跳过条件）、`RANGE`、`STACK`、`SPECIAL`（`lower_weak_node`）：解开源上的弱类型转换，计算具体 dtype（二元算子取 `select_dtype(u)` 与各源的 `least_upper_dtype`；其他情况用 `dtype_from_op`），把每个源转换为该类型，除 `STACK` 外在结果上保留一个弱 `CAST`；
+   - 弱 dtype 的 `INDEX`：缓冲区转换为选定的 dtype，每个弱索引被确定；
+   - `CAST(weak, CAST(weak, x))`：确定内层转换，保留外层。
+5. 若 `INDEX`（或 `SHRINK`）的带 gate 索引已经是 `Int64`，当缓冲区元素数落在 `i32` 范围内时会被收窄回 `Int32`。
 
-**Svod**：`gpudims.rs`
+在这一阶段 `WHERE(valid, idx, Invalid)` 保持其形状：`lower_weak_node` 不会触碰 `Invalid` 源。在完整示例中，每个 `WeakInt` 都变成 `Int32`（`RANGE(R0, Reduce) : Scalar(Int32)`），`PARAM` 的大小也变成 `Int32` 常量。
 
----
+## 18 —— 最终符号化简
 
-## Stage 13：添加 Load
-
-> **阶段速览**
->
-> **目标**：用显式 LOAD 包装 INDEX 操作
-> **关键模式**：为取值的操作数添加 LOAD
-> **影响**：为代码生成显式化内存操作
-
-**做了什么**：用显式 LOAD 包装 INDEX 操作。
-
-**为什么重要**：INDEX 操作计算地址。LOAD 才真正读取内存。将这一点显式化有助于代码生成器理解需要哪些内存访问。
-
-**模式**：`symbolic_simple + pm_expand_broadcast + pm_add_loads`
-
-```text
-// Before: bare index
-INDEX(ptr, i)
-
-// After: explicit load
-LOAD(INDEX(ptr, i))
-```
-
-当 STORE 的值操作数本身就是一个地址时，也会为它加上 load。
-
-注意：只有*作为值*被消费的操作数才会被包装——纯粹作为地址使用的 INDEX（STORE 的目标、WMMA 片段地址）保持裸露。
-
-**Svod**：`devectorize.rs`
-
----
-
-## Stage 14：Devectorize
-
-> **阶段速览**
->
-> **目标**：把带形状的操作变成标量操作
-> **关键阶段**：一次合并的重写
-> **影响**：每个操作都变成后端能够发射的东西
-
-**做了什么**：处理从带形状的值到标量硬件操作的转换。
-
-**为什么重要**：Devectorize 把 `STACK` 和 `INDEX` 的 lane 结构下降为
-逐 lane 的标量操作，同时保留连续的内存访问。
-
-**标量化是无条件的**：`devectorize_alu` 把静态形状的乘积作为
-lane 数量，为每个坐标发射一个操作，然后用 `STACK` 重新组装结果
-（store 则用 `GROUP`）。这里没有逐设备的折叠长度表——重新向量化
-留给后端，在那里 LLVM 的 SLP 向量化器可以在有利时把标量重新拓宽。
-
-注意：Svod 始终运行 devectorizer；没有跳过它的环境变量。
-
-**模式**：`symbolic_simple + devectorize_patterns + bool_storage_patterns + indexing_simplify`
-
-**分割带形状的 ALU**：
-```text
-// A shaped add becomes one op per lane
-ADD(shaped_a, shaped_b) → STACK(ADD(a[0], b[0]), ADD(a[1], b[1]), ...)
-```
-
-**Bool 存储**：bool 的 LOAD/STORE 通过 `uint8` 进行，因为 LLVM 的 `i1` 高位可能带有垃圾数据。
-
-**索引化简**：`indexing_simplify` 折叠标量化暴露出来的寻址运算。
-
-**Svod**：`devectorize.rs`
-
----
-
-## Stage 15：降低 Index DType
-
-> **阶段速览**
->
-> **目标**：将弱索引类型转换为具体整数
-> **关键模式**：基于值范围的操作特定降低
-> **影响**：索引使用硬件原生整数类型（i32 或 i64）
-
-**做了什么**：将抽象的弱（`WeakInt`）dtype 转换为具体整数。
-
-**为什么重要**：弱索引类型是抽象的——硬件没有这个类型。我们需要转换为硬件实际支持的 i32 或 i64。（Tinygrad 把这个 dtype 叫做 `Index`；在 Svod 中它是 `ScalarDType::WeakInt`。）
-
-**模式**：`lower_index_patterns` = `symbolic_simple + pm_fold_cast_const + pm_lower_index_dtype + indexing_simplify`
-
-```text
-// Before: weak index type
-idx: WeakInt
-
-// After: concrete type
-idx: i32  // or i64, based on bounds
-```
-
-**操作特定的降低**：
-
-Index 类型降低使用 3 阶段级联方法：
-
-1. **为叶节点创建具体包装器**（CONST、VCONST、PARAM）——每个都变成 `concrete.cast(weak)`
-2. **向上处理包装值**（Unary、Binary、WHERE、RANGE、STACK、SPECIAL）——在树中传播具体类型
-3. **在任何非弱类型的消费者处吸收这些 cast**，消费者在自己的边上采用具体 dtype
-
-每种操作类型有特定的模式：
-
-| 操作 | 之前 | 之后 |
-|-----------|--------|-------|
-| 二元操作 | `ADD(WeakInt, WeakInt)` | `ADD(i32, i32)` 带类型转换 |
-| CONST | `CONST(5): WeakInt` | `CONST(5): i32` 包在 `.cast(WeakInt)` 中 |
-| WHERE | `WHERE(c, WeakInt, WeakInt)` | `WHERE(c, i32, i32)`（条件被跳过） |
-| RANGE | `RANGE(end: WeakInt)` | `RANGE(end: i32)` 带类型转换 |
-| SPECIAL | `SPECIAL(gidx)` | 由该操作的取值范围得出的具体整数（实践中是默认整数类型） |
-| PARAM（变量） | `PARAM: WeakInt` | 如果范围适合则 i32，否则 i64 |
-| STACK | `STACK(WeakInt...)` | STACK 上是标量 dtype，每条 lane 单独转换 |
-| 双重弱 CAST | `CAST(weak, CAST(weak, x))` | 内层 cast 落实为具体 dtype，外层弱 cast 保留 |
-
-`select_dtype()` 函数使用 vmin/vmax 范围分析来确定 i32 还是 i64：
-```text
-dtype = default_int if bounds fit in [-2^31, 2^31-1] else i64
-```
-它同时还把 `WeakFloat` 解析为默认浮点类型，并为无符号和布尔范围提供了独立的分支。
-
-**Svod**：`symbolic/index_lowering.rs`
-
----
-
-## Devectorizer 周边的额外 Pass
-
-Svod 在 Stage 14 和 index lowering 之间运行了几个 pass，22 阶段编号并没有为它们命名：
-
-| Pass | 用途 |
-|------|------|
-| `sym()`（早期符号化） | 图变成标量之后做完整的符号化简 |
-| `memory_coalescing` | 把相邻访问合并成更宽的访问 |
-| `pm_simplify_add_image`（自底向上） | image 数据类型的地址化简，与 `no_vectorized_alu` 一起 |
-| `extra_symbolic_patterns` | `sym() + indexing_simplify`，在索引有效性规则还能触发的时候让索引保持弱类型 |
+在具体类型的图上运行 `symbolic()`（第 2 层，没有 `pm_simplify_valid`/lane 折叠）。开启 `SVOD_SPEC` 时，`verify_no_legacy_index_dtype` 断言没有 `WeakInt` 残留。

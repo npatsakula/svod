@@ -14,17 +14,18 @@ sidebar_label: 调试
 
 | 变量 | 默认 | 效果 |
 |---|---|---|
-| `SVOD_DEVICE` | `CPU` | `CUDA:N`（别名 `GPU`）选择默认的张量设备；`NV` *不是*别名，它留给未来的用户态驱动 |
+| `SVOD_DEVICE` | `CPU`（macOS 上为 `METAL:0`） | `CUDA:N`（别名 `GPU`）选择默认的张量设备；`NV` *不是*别名，它留给未来的用户态驱动 |
 | `SVOD_DUMP_NVPTX_IR` | 未设置 | 接收每个内核 NVPTX LLVM IR 的目录，文件名为 `sm_XY_<kernel>.ll` |
 | `SVOD_CUDA_PTXAS` | 开 | `0` 跳过 `ptxas` 的预汇编，把 PTX 文本交给驱动 JIT |
 | `SVOD_CUDA_SCOPED_SYNC` | 开 | `0` 把每一次带作用域的等待换成一次完整的 `cuCtxSynchronize`，并让复制变为同步（[架构](./architecture.md)） |
 | `SVOD_CUDA_CUPTI` | 开 | `0` 跳过加载 `libcupti.so.13`，于是没有硬件计数器 |
 | `SVOD_PMC` | 未设置 | `1` 表示该后端的默认计数器集合，也可以是一个逗号分隔的令牌列表，见[剖析](./profiling.md) |
 | `SVOD_OBJECT_CACHE` | 开 | `0` 关闭编译产物在磁盘上的缓存 |
-| `SVOD_OBJECT_CACHE_DIR` | `$XDG_CACHE_HOME` / `~/.cache` | 迁移缓存位置 |
-| `CUDA_PATH` | 未设置 | 查找 `ptxas`（`$CUDA_PATH/bin`）与 CUPTI（`$CUDA_PATH/lib64`）时最后搜索的地方 |
+| `SVOD_OBJECT_CACHE_DIR` | `$XDG_CACHE_HOME/svod/objects`，否则为 `~/.cache/svod/objects` | 迁移缓存位置 |
+| `SVOD_OBJECT_CACHE_MAX_BYTES` | 1 GiB | 缓存容量预算 |
+| `CUDA_PATH` | 未设置 | 查找 `ptxas`（`$CUDA_PATH/bin`，在 `PATH` 与 `/opt/cuda/bin` 之后）与 CUPTI（`$CUDA_PATH/lib64`、`$CUDA_PATH/extras/CUPTI/lib64`）时最后搜索的地方 |
 | `SVOD_PROFILE_ITERS`、`SVOD_ORIGIN`、`SVOD_ORIGIN_DEPTH` | | profiler 旋钮，见[剖析](./profiling.md) |
-| `RUST_LOG` | 未设置 | `svod_device=info` 带上设备打开那一行；`svod_device=debug` 再加上 JIT 信息日志、图捕获与重放回退；`svod_runtime=debug` 记录每个内核的 clang 调用 |
+| `RUST_LOG` | 未设置 | `svod_device=info` 带上设备打开那一行；`svod_device=debug` 再加上 JIT 信息日志、图捕获与重放回退；`svod_runtime=debug` 记录每一次 NVPTX 编译（arch 与 IR 大小）以及不可用的 `ptxas` |
 
 没有 CUDA 专属的调度转储；驱动 JIT 日志与 `tracing` 覆盖了
 `SVOD_DEBUG_DISPATCH` 在 AMD 上所做的事。
@@ -53,7 +54,7 @@ no CUDA GPU available: CUDA cuInit failed: ...           # driver loaded, no usa
 驱动的错误日志：
 
 ```text
-CUDA JIT of kernel "r_64_32" failed: CUDA_ERROR_INVALID_PTX (218): a PTX JIT compilation failed
+CUDA JIT of kernel "r_64_32" failed: CUDA_ERROR_INVALID_PTX: a PTX JIT compilation failed
 ptxas application ptx input, line 27; error   : ...
 ```
 
@@ -77,7 +78,9 @@ cached PTX targets sm_80, not sm_86                          # a corrupt or fore
 
 一条 cubin 缓存项则改由 `validate_cubin` 检查（一个面向 `EM_CUDA` 的小端
 ELF64，且把入口定义为代码），而它的 `.param` 列表是在汇编之前就在 PTX 文本上
-对着 ABI 检查过的，因为 cubin 并不携带这份信息。
+对着 ABI 检查过的，因为 cubin 并不携带这份信息。在 PTX 路径上，加载器自己执行这项
+`.param` 检查；不匹配时报 `PTX entry declares N parameters, the ABI describes M`。一个落到
+非 NVPTX target 上的 `llvm.nvvm.*` 构建器会以 `Error::ForeignIntrinsic` 失败。
 
 ---
 
@@ -100,8 +103,7 @@ nvdisasm r_64_32.cubin | less                         # the SASS
 压力顶上了 `.maxntid` 这个 launch bound。对应的运行时错误会把数字点出来：
 
 ```text
-CUDA kernel 'r_64_32' block [512, 1, 1] (512 threads) exceeds its maxThreadsPerBlock 256
-  (numRegs 96, sharedSizeBytes 4096, localSizeBytes 0)
+CUDA kernel 'r_64_32' block [512, 1, 1] (512 threads) exceeds its maxThreadsPerBlock 256 (numRegs 96, sharedSizeBytes 4096, localSizeBytes 0)
 ```
 
 ---

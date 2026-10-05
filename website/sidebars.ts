@@ -10,12 +10,13 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Getting Started',
-      items: ['examples', 'onnx'],
+      items: ['examples', 'models', 'onnx'],
     },
     {
       type: 'category',
       label: 'Architecture',
       items: [
+        'architecture/ir-design',
         'architecture/pipeline',
         'architecture/jit-graphs',
         'architecture/kernel-origins',
@@ -31,7 +32,6 @@ const sidebars: SidebarsConfig = {
             'architecture/codegen/worked-example',
           ],
         },
-        'architecture/ir-design',
         {
           type: 'category',
           label: 'Optimizations',
@@ -56,8 +56,11 @@ const sidebars: SidebarsConfig = {
         'tile-kernels/tiling',
         'tile-kernels/lowering',
         'tile-kernels/first-kernel',
+        'tile-kernels/builder-reference',
         'tile-kernels/wave-portability',
+        'tile-kernels/kernel-library',
         'tile-kernels/flash-attention',
+        'tile-kernels/tuning',
         'tile-kernels/debugging',
         'tile-kernels/profiling',
         'tile-kernels/comparison',
@@ -67,7 +70,10 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Backends',
       items: [
+        'backends/overview',
+        'backends/cpu',
         'backends/jit-loader',
+        'backends/metal',
         {
           type: 'category',
           label: 'AMD Backend',

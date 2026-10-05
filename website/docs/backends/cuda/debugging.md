@@ -15,17 +15,18 @@ error.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SVOD_DEVICE` | `CPU` | `CUDA:N` (alias `GPU`) selects the default tensor device; `NV` is *not* an alias, it stays reserved for a userspace driver |
+| `SVOD_DEVICE` | `CPU` (`METAL:0` on macOS) | `CUDA:N` (alias `GPU`) selects the default tensor device; `NV` is *not* an alias, it stays reserved for a userspace driver |
 | `SVOD_DUMP_NVPTX_IR` | unset | Directory receiving each kernel's NVPTX LLVM IR as `sm_XY_<kernel>.ll` |
 | `SVOD_CUDA_PTXAS` | on | `0` skips the `ptxas` pre-assembly and hands PTX text to the driver JIT |
 | `SVOD_CUDA_SCOPED_SYNC` | on | `0` replaces every scoped wait with a full `cuCtxSynchronize` and makes copies synchronous ([Architecture](./architecture.md)) |
 | `SVOD_CUDA_CUPTI` | on | `0` skips loading `libcupti.so.13`, so there are no hardware counters |
 | `SVOD_PMC` | unset | `1` for the backend's default counter set, or a comma-separated token list, see [Profiling](./profiling.md) |
 | `SVOD_OBJECT_CACHE` | on | `0` disables the on-disk cache of compiled objects |
-| `SVOD_OBJECT_CACHE_DIR` | `$XDG_CACHE_HOME` / `~/.cache` | Relocates the cache |
-| `CUDA_PATH` | unset | Last place searched for `ptxas` (`$CUDA_PATH/bin`) and CUPTI (`$CUDA_PATH/lib64`) |
+| `SVOD_OBJECT_CACHE_DIR` | `$XDG_CACHE_HOME/svod/objects`, else `~/.cache/svod/objects` | Relocates the cache |
+| `SVOD_OBJECT_CACHE_MAX_BYTES` | 1 GiB | Cache budget |
+| `CUDA_PATH` | unset | Last place searched for `ptxas` (`$CUDA_PATH/bin`, after `PATH` and `/opt/cuda/bin`) and CUPTI (`$CUDA_PATH/lib64`, `$CUDA_PATH/extras/CUPTI/lib64`) |
 | `SVOD_PROFILE_ITERS`, `SVOD_ORIGIN`, `SVOD_ORIGIN_DEPTH` | | Profiler knobs, see [Profiling](./profiling.md) |
-| `RUST_LOG` | unset | `svod_device=info` carries the device open line; `svod_device=debug` adds the JIT info log, graph capture and replay fallbacks; `svod_runtime=debug` logs each kernel's clang invocation |
+| `RUST_LOG` | unset | `svod_device=info` carries the device open line; `svod_device=debug` adds the JIT info log, graph capture and replay fallbacks; `svod_runtime=debug` logs each NVPTX compile (arch and IR size) and an unusable `ptxas` |
 
 There is no CUDA-specific dispatch dump; the driver JIT log and `tracing` cover
 what `SVOD_DEBUG_DISPATCH` does on AMD.
@@ -54,7 +55,7 @@ A PTX the driver rejects surfaces as `Error::CudaJit`, whose display is the
 cause followed by the driver's error log:
 
 ```text
-CUDA JIT of kernel "r_64_32" failed: CUDA_ERROR_INVALID_PTX (218): a PTX JIT compilation failed
+CUDA JIT of kernel "r_64_32" failed: CUDA_ERROR_INVALID_PTX: a PTX JIT compilation failed
 ptxas application ptx input, line 27; error   : ...
 ```
 
@@ -82,7 +83,10 @@ not a clang error, it becomes an external call. The fix is in
 A cubin entry is checked instead by `validate_cubin` (a little-endian ELF64
 for `EM_CUDA` defining the entry as code), and its `.param` list is checked
 against the ABI on the PTX text before assembly, since a cubin does not
-carry one.
+carry one. On the PTX path the loader runs that `.param` check itself; a
+mismatch reads `PTX entry declares N parameters, the ABI describes M`. An
+`llvm.nvvm.*` builder that reaches a non-NVPTX target fails as
+`Error::ForeignIntrinsic`.
 
 ---
 
@@ -107,8 +111,7 @@ smaller than the launch wants: register pressure against the `.maxntid`
 launch bound. The corresponding run-time error names the numbers:
 
 ```text
-CUDA kernel 'r_64_32' block [512, 1, 1] (512 threads) exceeds its maxThreadsPerBlock 256
-  (numRegs 96, sharedSizeBytes 4096, localSizeBytes 0)
+CUDA kernel 'r_64_32' block [512, 1, 1] (512 threads) exceeds its maxThreadsPerBlock 256 (numRegs 96, sharedSizeBytes 4096, localSizeBytes 0)
 ```
 
 ---

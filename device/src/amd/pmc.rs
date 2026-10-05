@@ -168,7 +168,7 @@ pub fn build_streams(counters: &[AmdCounter], grid: &PmcGrid, buf_va: u64) -> (V
 }
 
 /// A profiled-dispatch handle that also carries PMC counters. Holds the GTT
-/// readback buffer alive until [`counters`](Self::counters) is read after sync,
+/// readback buffer alive until `counters` is read after sync,
 /// and delegates timestamps to the dispatch's timestamp signal.
 pub struct PmcHandle {
     ts: Arc<AmdSignal>,

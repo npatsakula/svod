@@ -6,13 +6,13 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Architecture-level algorithms for the Svod ML compiler"
+description = "Host-side speech decoding for Svod: CTC and RNN-T decoders, VAD-driven chunking, and a long-form ASR pipeline"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"], optional = true }
 snafu = "0.9"
-svod-ir = { path = "../ir", version = "=0.1.0-alpha.7" }
-svod-runtime = { path = "../runtime", version = "=0.1.0-alpha.7" }
+svod-ir = { path = "../ir", version = "=0.1.0" }
+svod-runtime = { path = "../runtime", version = "=0.1.0" }
 
 [dev-dependencies]
 proptest = "1.9"

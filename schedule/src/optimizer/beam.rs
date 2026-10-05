@@ -318,7 +318,7 @@ fn validate_limits(scheduler: &Scheduler, config: &BeamConfig) -> bool {
 /// the parent process.
 ///
 /// The suffix past `base_opt_count` is replayed whole: one action for an
-/// expanded candidate, the full stack for a [`heuristic_seed`]. [`passes_prefilter`]
+/// expanded candidate, the full stack for a `heuristic_seed`. `passes_prefilter`
 /// is not re-run here — it is a parent-side generation filter, and a seed's opts
 /// never went through it.
 pub fn apply_remote_candidate(

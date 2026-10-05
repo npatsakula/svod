@@ -33,10 +33,12 @@ clang --print-targets | grep nvptx64     # the NVPTX backend
 
 NVPTX के बिना एक clang एक साफ़ `JitCompilation` error देता है जो fix का नाम बताता है
 (`-DLLVM_TARGETS_TO_BUILD='X86;AArch64;NVPTX'`)। चलाने के लिए किसी CUDA toolkit की ज़रूरत
-नहीं है: path पर मौजूद `ptxas` का उपयोग kernels को पहले से assemble करने के लिए तब होता
-है जब वह संयोग से वहाँ हो (`SVOD_CUDA_PTXAS=0` से इससे बाहर निकला जा सकता है), और
-`compute-sanitizer` [debugging](./debugging.md) के लिए उपयोगी है, पर इनमें से कोई भी
-आवश्यक नहीं है।
+नहीं है: `PATH` पर, `/opt/cuda/bin` में या `$CUDA_PATH/bin` में मिला `ptxas` kernels को पहले
+से assemble करने के लिए तब उपयोग होता है जब वह संयोग से वहाँ हो (`SVOD_CUDA_PTXAS=0` से
+इससे बाहर निकला जा सकता है; अनुपयोगी `ptxas` एक warning log करता है और driver JIT काम सँभाल
+लेता है), और `compute-sanitizer` [debugging](./debugging.md) के लिए उपयोगी है, पर इनमें से
+कोई भी आवश्यक नहीं है। कोड में कोई compute-capability floor नहीं है: `CudaArch` open-ended है,
+और वही चलता है जिसे driver और clang का `-march` स्वीकार करते हैं।
 
 ---
 
@@ -48,7 +50,9 @@ NVPTX के बिना एक clang एक साफ़ `JitCompilation` erro
 resolve करता है, `cuInit(0)` और `cuDeviceGetCount` call करता है, और उत्तर को memoize करता
 है। Runtime की device registry `"CUDA"` factory को केवल तभी register करती है जब वह `true`
 हो; बिना driver वाले host पर स्वाभाविक रूप से कोई `CUDA` device type नहीं होता और hardware
-tests ख़ुद को skip कर देते हैं।
+tests ख़ुद को skip कर देते हैं। 12.0 से पुराने driver का भी यही हाल होता है — `_v2` graph
+symbols में से एक ग़ायब होता है, इसलिए load fail होता है और बैकएंड बिना किसी warning के
+unregistered रह जाता है।
 
 यह वही contract है जो [AMD बैकएंड](../amd/overview.md) का है: driver call sites हर
 `cargo check` में type-check होते हैं, इसलिए generic `Program` / `PlanContext` / `Graph`
@@ -58,7 +62,7 @@ traits में एक API change बिना GPU के भी पकड़�
 
 ## CUDA पर चलाना
 
-GPU को `SVOD_DEVICE` से चुनें (`CUDA:N`; `GPU` एक स्वीकृत alias है, अकेला `CUDA` का अर्थ
+GPU को `SVOD_DEVICE` से चुनें (`CUDA:N`, case-insensitive; `GPU` एक स्वीकृत alias है, अकेला `CUDA` का अर्थ
 है device 0)। `NV` जान-बूझकर **स्वीकार नहीं** किया जाता — यह नाम भविष्य के एक userspace
 driver बैकएंड के लिए सुरक्षित रखा गया है:
 
@@ -77,9 +81,9 @@ Compute capability को open पर driver से पढ़ा जाता �
 
 | Capability | profile में tensor cores |
 |---|---|
-| `sm_75` से नीचे | कोई नहीं |
-| `sm_75` | f16 `m16n8k8` |
-| `sm_80`+ | f16 और bf16 `m16n8k16`, f16 `m16n8k8`, i32 में accumulate होने वाला int8 `m16n8k32`; bf16 storage। tf32 opt-in ही रहता है (`cuda_sm80(true)`) |
+| `sm_75` से नीचे | कोई नहीं (Volta का `mma.sync` उपयोग नहीं होता); bf16 storage dtype भी नहीं |
+| `sm_75` | f32 या f16 में f16 `m16n8k8` |
+| `sm_80`+ | f16 और bf16 `m16n8k16`, f16 `m16n8k8`, i32 में accumulate होने वाला int8 `m16n8k32`; bf16 storage। tf32 row renderer में मौजूद है पर `for_cuda_arch` उसे कभी enable नहीं करता और कोई switch नहीं है |
 | `sm_89`+ | sm_80 वाला set अपरिवर्तित: fp8 `m16n8k32` cores मौजूद तो हैं (`sm89_tensor_cores`), पर जब तक renderer fp8 casts को lower नहीं कर सकता तब तक `for_cuda_arch` उन्हें रोके रखता है (देखें [Limitations](./limitations.md)) |
 
 ---

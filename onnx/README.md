@@ -7,52 +7,44 @@ tensor graphs that can be compiled once and executed repeatedly.
 
 ## Quick Start
 
-```rust
-let mut importer = OnnxImporter::new();
-let OnnxModel { mut outputs, .. } = importer.import("model.onnx", &[])?;
+Build the input tensors yourself and hand them to the importer: the graph is
+traced on them, so the buffers you hold are the ones the kernels read.
 
-let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
-Tensor::realize_batch(&mut outs)?;
+```rust
+use std::collections::HashMap;
+
+use prost::Message;
+use svod_onnx::parser::onnx::ModelProto;
+use svod_onnx::{OnnxImporter, OnnxModel};
+use svod_tensor::Tensor;
+
+let proto = ModelProto::decode(std::fs::read("model.onnx")?.as_slice())?;
+let input = Tensor::from_ndarray(&first_batch); // same shape and dtype as the graph input
+
+let OnnxModel { outputs, variables, .. } = OnnxImporter::new().import_model_with_inputs(
+    proto,
+    HashMap::from([("input".to_string(), input.clone())]),
+    &[("batch_size", 1), ("sequence_length", 512)], // bind dim_param dimensions
+)?;
 ```
 
-## Import with Dynamic Dimensions
+`variables` holds one `Variable` per named `dim_param`. `import(path, ..)`
+memory-maps weights lazily from the file instead of decoding them up front.
 
-When the model has symbolic dimensions (e.g., `batch_size`), bind them at
-import time:
+## Compile Once, Run Many
 
 ```rust
-let model = importer.import("model.onnx", &[
-    ("batch_size", 1),
-    ("sequence_length", 512),
-])?;
+let plan = Tensor::prepare_batch(outputs.values())?; // schedule + compile, once
+plan.execute()?;
 
-// Variables are auto-extracted from dim_param annotations
-for (name, var) in &model.variables {
-    println!("{name}: bounds {:?}", var.bounds());
+for batch in batches {
+    input.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    plan.execute()?; // replay: no tracing, no compilation
 }
 ```
 
-## Prepare / Execute — Compile Once, Run Many
-
-For repeated inference (tested in `tensor/src/test/unit/variable.rs::test_prepare_execute_loop`):
-
-```rust
-let OnnxModel { mut inputs, mut outputs, variables } =
-    importer.import("model.onnx", &[("batch", 1)])?;
-
-// 1. Assign initial data (lazy — no allocation yet)
-let input = inputs.remove("input").unwrap();
-input.assign(&Tensor::from_slice(&initial_data));
-
-// 2. Compile the execution plan (resolves assigns, allocates buffers)
-let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
-let mut plan = Tensor::prepare_batch(&mut outs)?;
-plan.execute()?;  // first run
-
-// 3. Fast loop: zero-copy writes via array_view_mut
-input.array_view_mut::<f32>()?[..new_data.len()].copy_from_slice(&new_data);
-plan.execute()?;
-```
+See the [ONNX guide](https://svod.vpermilp.online/docs/onnx) for entry points,
+dynamic dimensions and the supported contrib ops.
 
 ## Control Flow — If via Where
 

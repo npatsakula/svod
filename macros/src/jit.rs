@@ -1112,19 +1112,25 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                     .map_err(|e| #jit_path::JitError::Runtime { source: e })
             }
 
+            // Values are recorded only once the plan accepted them: a binding
+            // the plan rejects (out of its declared bounds) must not move the
+            // shapes the outputs still report for the last successful run.
             fn execute_with_vars(&mut self, vars: &[(&str, i64)]) -> #jit_path::Result<()> {
+                self.plan.execute_with_vars(vars).map_err(|e| #jit_path::JitError::Runtime { source: e })?;
                 self.record_var_values(vars);
-                self.plan.execute_with_vars(vars).map_err(|e| #jit_path::JitError::Runtime { source: e })
+                Ok(())
             }
 
             fn execute_with_vars_profiled(
                 &mut self,
                 vars: &[(&str, i64)],
             ) -> #jit_path::Result<Vec<#rt::KernelProfile>> {
-                self.record_var_values(vars);
-                self.plan
+                let profiles = self
+                    .plan
                     .execute_with_vars_profiled(vars)
-                    .map_err(|e| #jit_path::JitError::Runtime { source: e })
+                    .map_err(|e| #jit_path::JitError::Runtime { source: e })?;
+                self.record_var_values(vars);
+                Ok(profiles)
             }
 
             fn replicate(&self) -> #jit_path::Result<Self> {

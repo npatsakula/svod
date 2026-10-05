@@ -39,7 +39,7 @@ impl CpuBackend {
     /// Accepted `SVOD_CPU_BACKEND` spellings.
     const SPELLINGS: &str = "clang, CLANG, llvm, LLVM";
 
-    /// Parse a `SVOD_CPU_BACKEND` value; `None` for anything but [`Self::SPELLINGS`].
+    /// Parse a `SVOD_CPU_BACKEND` value; `None` for anything but `SPELLINGS`.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "clang" | "CLANG" => Some(CpuBackend::Clang),

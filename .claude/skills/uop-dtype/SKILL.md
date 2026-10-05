@@ -1,428 +1,179 @@
 ---
 name: uop-dtype
-description: Reference for UOp and DType constructors, methods, and usage patterns. Use when constructing IR, debugging UOp creation, or understanding type system.
+description: Verified constructor and accessor signatures for `svod_ir::UOp`, `Op`, `DType`/`ScalarDType`/`AddrSpace`/`DeviceSpec`, plus the Tensor-level entry points. Use when building IR by hand (tests, passes, custom kernels), fixing a "no method" or type-mismatch error on UOp/DType, or checking which constructor is fallible, which takes `&Arc<Self>` vs an owned `Arc`, and what an Op's fields are named.
 ---
 
-# UOp and DType Reference
+# UOp and DType reference
 
-## UOp Constructors by Category
+Source: `ir/src/uop/constructors/{data,compute,control,memory,shape,reduce,hardware,graph}.rs`, `ir/src/uop/core.rs`,
+`ir/src/op.rs`, `ir/src/types.rs`, `dtype/src/{lib,cast}.rs`. Op semantics: `website/docs/architecture/op-bestiary.md`,
+`ir-design.md`. Import `svod_ir::prelude::*` (`UOp, Op, DType, DeviceSpec, SInt, IndexSpec, IntoUOp, ...`).
 
-### Data Constructors (`ir/src/uop/constructors/data.rs`)
+Conventions: `try_*` returns `svod_ir::Result<Arc<UOp>>`; the un-prefixed twin panics on a type error and is for rewrite
+bodies after validation. `self: &Arc<Self>` methods are called on an `Arc<UOp>`; associated fns take owned `Arc`s.
+Children live in `SmallVec<[Arc<UOp>; 4]>` — build them with `smallvec![..]`. `UOp` is hash-consed: equal structure ⇒
+same `Arc` ⇒ `Arc::ptr_eq`.
 
-| Method | Purpose | Signature |
-|---------|---------|------------|
-| `const_(dtype, value)` | Create constant with explicit dtype | `pub fn const_(dtype: DType, value: ConstValue) -> Arc<Self>` |
-| `native_const<T>(value)` | Auto-infer dtype from Rust type | `pub fn native_const<T: HasDType + IntoUOp>(value: T) -> Arc<Self>` |
-| `index_const(value)` | Create Index constant | `pub fn index_const(value: i64) -> Arc<Self>` |
-| `const_like<T>(self, value)` | Create constant with same dtype as self | `pub fn const_like<T: IntoUOp>(self: &Arc<Self>, value: T) -> Arc<Self>` |
-| `vconst(values)` | Vector constant from multiple values | `pub fn vconst(values: Vec<ConstValue>) -> Arc<Self>` |
-| `new_buffer(device, size, dtype)` | Create buffer with device spec | `pub fn new_buffer(device: DeviceSpec, size: usize, dtype: DType) -> Arc<Self>` |
-| `view(self, size, offset)` | Create buffer view | `pub fn view(self: &Arc<Self>, size: usize, offset: usize) -> Arc<Self>` |
-| `device(device_spec)` | Create device specification | `pub fn device(device: DeviceSpec) -> Arc<Self>` |
-| `noop()` | No-operation | `pub fn noop() -> Arc<Self>` |
-| `cast(self, dtype)` | Cast to different dtype | `pub fn cast(self: &Arc<Self>, dtype: DType) -> Arc<Self>` |
-| `bitcast(self, dtype)` | Reinterpret bits as different type | `pub fn bitcast(self: &Arc<Self>, dtype: DType) -> Arc<Self>` |
+## Accessors (`core.rs`, `helpers.rs`)
 
-### Compute Operations (`ir/src/uop/constructors/compute.rs`)
+`op() -> &Op`, `dtype() -> DType`, `id: u64`, `src_ops() -> OpMask`, `shape() -> Result<Option<&Shape>>`, `vmin()/vmax() -> &ConstValue`,
+`toposort() -> Vec<Arc<UOp>>` (`toposort_filtered`, `_call_aware`), `node_count()`, `tree()/tree_full() -> String`, `ranges()`,
+`in_scope_ranges()`, `get_consumer_map()`, `backward_slice()`, `with_sources(Vec)`, `replace(Option<DType>, Option<Vec>)`,
+`substitute(&HashMap<UOpKey, Arc<UOp>>)` (+ `_walk`, `_preserve_calls`, `_gated`), `base()`, `buf_uop()`, `unwrap_after()`,
+`unwrap_cast()`, `ptrdtype()`, `addrspace()`, `device_spec()`, `buffer_size()`, `get_idx()/get_valid()` (split
+`WHERE(valid, idx, Invalid)`), `UOp::invalid_marker()`, `UOp::is_invalid_marker(&u)`, `const_factor()`, `divides(v)`,
+`split_uop(BinaryOp)`, `pop_const(BinaryOp)`, `tag()/rtag()`, `origin()/rorigin()`.
 
-**Binary** (`Result<Arc<Self>>`): `try_add`, `try_sub`, `try_mul`, `try_div`, `try_mod`, `try_max`, `try_pow`, comparisons (`eq/ne/lt/le/gt/ge`), bitwise (`and_op/or_op/xor_op`), shifts (`shl_op/shr_op`), `try_mulacc(a,b,c)` (fused multiply-accumulate)
+## Constructors
 
-**Unary** (infallible, return `Arc<Self>`): `neg`, `abs`, `square`, `sign`, `not`
+### Constants and storage (`data.rs`)
+| Signature | Notes |
+|-----------|-------|
+| `const_(dtype, ConstValue) -> Arc` / `try_const_` | `ConstValue::{Int(i64), UInt(u64), Float(f64), Bool, Invalid}` |
+| `native_const<T: HasDType + IntoUOp>(v)` | dtype from the Rust type (`1i32`, `0.5f32`) |
+| `index_const(i64)` | `WeakInt` constant (weak until it meets a concrete dtype, like Tinygrad `UOp.const`) |
+| `u.const_like<T: IntoUOp>(v)` / `u.vconst_like(v)` | same dtype as `u` (vector: broadcast lanes) |
+| `vconst(Vec<ConstValue>, scalar_dtype) -> Arc` / `try_vconst` | VCONST; dtype is `scalar.vec(len)` |
+| `new_buffer(DeviceSpec, size, dtype)` | fresh slot, `AddrSpace::Global`; `buffer(slot, size, dtype, addrspace, Option<DeviceSpec>)` for Local/Reg (device must be `None`) |
+| `param(slot, size, dtype, Option<DeviceSpec>)`, `param_with_shape(slot, &Shape, dtype, dev)`, `scalar_param(slot, name, dtype, min, max)` | PARAM = positional buffer; what kernels see after the cut |
+| `placeholder(&Shape, dtype, slot, addrspace, dev) -> Result` | PARAM/BUFFER reshaped to `shape` (Tinygrad `UOp.placeholder`) |
+| `u.contiguous_slice(size, offset_elems, dtype)` | SLICE view |
+| `u.cast(dtype)`, `u.bitcast(dtype)`, `noop()`, `buffer_id(Option<usize>)`, `lunique(..)` | |
 
-**Transcendental** (`Result<Arc<Self>>`, require float): `try_sqrt`, `try_rsqrt`, `try_exp/exp2`, `try_log/log2`, `try_sin/cos/tan`, `try_erf`, `try_reciprocal`
+### Arithmetic (`compute.rs`), all `self: &Arc<Self>, rhs: &Arc<Self>` unless noted
+- Fallible binary: `try_add try_mul try_sub try_div(FloorDiv) try_mod(FloorMod) try_cdiv try_cmod try_max try_pow`; bitwise `try_and_op try_or_op try_xor_op`; shifts `try_shl_op try_shr_op`; comparisons `try_cmplt try_cmple try_cmpeq try_cmpne try_cmpgt try_cmpge` (→ `Bool`, vector-aware). Promotion via `promote_and_cast`; shapes must match exactly (no broadcasting at IR level); constant zero divisor is an error.
+- Scalar rhs: `UOp::try_add_scalar(lhs: Arc, v: impl IntoUOp)`, `try_sub_scalar`, `try_mul_scalar`, `try_mod_scalar`; or `1.into_uop(dtype)`.
+- Panicking: `add sub mul floor_div mod_ cdiv cmod max and_ or_ xor shl shr lt le gt ge eq ne`, `alu(BinaryOp, lhs, rhs)`.
+- Ternary: `UOp::try_where(cond, t, f)`, `UOp::try_mulacc(a, b, c)`, `UOp::threefry(lhs, rhs) -> Result`.
+- Unary infallible methods: `neg abs square sign not`; rounding are associated fns on owned values: `UOp::trunc(x)`, `floor`, `ceil`, `round`.
+- Float-only `Result`: `try_sqrt try_rsqrt try_exp try_exp2 try_log try_log2 try_sin try_cos try_tan`, `erf()`, `UOp::try_reciprocal(&x)`.
 
-**Rounding** (infallible, return `Arc<Self>`): `trunc`, `floor`, `ceil`, `round`
+### Ranges and control (`control.rs`)
+| Signature | Notes |
+|-----------|-------|
+| `range_axis(end: Arc, AxisId, AxisType)` / `range_axis_dtype(.., dtype)` | general RANGE |
+| `range(end: Arc, axis_id: usize)`, `range_const(end: i64, axis_id: usize)` | `AxisType::Loop`, `AxisId::Renumbered(id)` |
+| `u.end(smallvec![ranges])` | END closes ranges |
+| `if_(cond, smallvec![body])`, `endif(if_op)`, `u.barrier(smallvec![deps])` | |
+| `var(name, dtype, min, max)`, `define_var(name: String, min, max)` (Index), `variable(name, min, max, dtype)`, `u.bind(value)` | symbolic vars |
+| `special(end, name: String)`, `special_dtype(..)` | GPU id (`gidx0`, ...) |
 
-### Control Flow (`ir/src/uop/constructors/control.rs`)
+`AxisType::{Device, Global, Warp, Local, Weak, Loop, GroupReduce, Reduce, Upcast, Unroll, Thread, Placeholder}`;
+`AxisId::{Unrenumbered(usize), Renumbered(usize), UnrenumberedPath(..), RenumberedPath(..)}`; `ReduceOp::{Add, Mul, Max, Min}`.
 
-| Method | Purpose |
-|---------|---------|
-| `range_axis(end, axis_id, axis_type)` | Create RANGE with specific axis type |
-| `range(end, axis_id)` | Convenience: Loop axis type |
-| `range_const(end_value, axis_id)` | RANGE with constant end (Loop type) |
-| `range_outer_const(end_value, axis_id)` | RANGE with Outer axis type |
-| `if_(condition, body)` | Conditional block |
-| `endif(if_op)` | End IF block |
-| `end(self, ranges)` | End of range/reduce scope |
-| `barrier(self, deps)` | Synchronization barrier |
-| `var(name, dtype, min_val, max_val)` | Define symbolic variable with bounds |
-| `define_var(name, min_val, max_val)` | Define variable (Index dtype) |
-| `bind(self, value)` | Bind value to variable |
-| `special(end, name)` | GPU dimension variable (e.g., blockIdx.x) |
-
-### Memory Operations (`ir/src/uop/constructors/memory.rs`)
-
-**Indexing**:
+### Memory (`memory.rs`, `bon` builders)
 ```rust
-// Builder pattern for INDEX
-UOp::index()
-    .buffer(buffer_uop)
-    .indices(vec![index1, index2])
-    .call()?              // Returns Result<Arc<Self>>
-
-// Index validity
-idx.valid(condition)  // Equivalent to WHERE(condition, idx, INVALID)
+let idx = UOp::index().buffer(buf).indices(vec![i, j]).call()?;      // Result; .dtype(..) optional; indices must be int dtype
+let gated = UOp::index().buffer(buf).indices(vec![i.valid(cond)]).call()?;   // valid = WHERE(cond, i, Invalid)
+let v = UOp::load().index(idx).call();                                // infallible; dtype = index dtype
+let g = UOp::load().index(idx).alt(zero).gate(cond).call();           // alt and gate go together
+let st = idx.store(value);  let st = idx.store_gated(value, gate);    // STORE, dtype Void
+buf.index_axes(vec![2])  // constant-position INDEX (several → STACK index)
+UOp::slice(buffer, Vec<IndexSpec>)?;  u.getaddr(Option<DeviceSpec>);  u.copy_to_device(dev) / u.copy(dev)
+UOp::stage(compute, Vec<ranges>, BufferizeOpts) / stage_global(compute, ranges) / stage_local(compute, ranges)   // STAGE
 ```
+`BufferizeOpts { device: Option<DeviceSpec>, local_axis: Option<AxisId>, addrspace: AddrSpace, removable: bool }` (`BufferizeOpts::local()`).
 
-**Load/Store**:
-```rust
-// Builder pattern for LOAD
-UOp::load()
-    .buffer(buffer_uop)
-    .index(index_uop)
-    .dtype(vec4_dtype)  // Optional: explicit dtype
-    .alt(zero_uop)      // Optional: alternative value for gated loads
-    .call()             // Returns Arc<Self>
+### Shapes (`shape.rs`), all `self: &Arc<Self>`
+`try_reshape(&Shape)`, `try_expand(&Shape)`, `try_permute(Vec<usize>)`, `try_pad(&[(SInt, SInt)])`, `try_shrink(&[(SInt, SInt)])`,
+`try_flip(Vec<bool>)`; `UOp::stack(smallvec![..])` (STACK: shaped lane value, the only "vector" op); `UOp::multi(src, axis)`.
+`Shape = SmallVec<[SInt; _]>` (`Shape::from_iter(dims.map(SInt::Const))`); shapes are UOps inside `Reshape/Expand/Pad/Shrink` (`shape_to_uop`).
 
-// STORE operations
-index_uop.store(value_uop)              // Simple store
-index_uop.store_with_ranges(value_uop, ranges)  // With ranges for output upcasting
-```
+### Reductions (`reduce.rs`)
+`u.try_reduce_axis(ReduceOp, Vec<usize>)` (tensor-level REDUCE_AXIS; returns `u` if every axis is 1),
+`u.reduce(smallvec![ranges], ReduceOp)` (kernel-level REDUCE over RANGEs), `reduce_with_num_axes(..)`, `UOp::allreduce(src, DeviceSpec, ReduceOp)`.
 
-**Memory Definitions**:
-- `define_global(id, dtype)` - Global memory allocation
-- `define_local(id, dtype)` - Local/shared memory allocation
-- `define_reg(size)` - Register memory (void pointer)
-- `define_reg_typed(size, element_dtype)` - Typed register accumulator
+### Kernel / program level (`hardware.rs`, `graph.rs`)
+| Signature | Notes |
+|-----------|-------|
+| `sink(Vec)`, `sink_with_info(Vec, KernelInfo)`, `group(Vec)` | `SINK[KERNEL]` is a sink with `KernelInfo` |
+| `body.call(smallvec![args], CallInfo)`, `body.function(args, info)` / `try_function`, `tuple(..)`, `u.gettuple(i)` / `try_gettuple` | a kernel is `CALL(SINK[KERNEL], args)` wrapped in `AFTER` |
+| `u.after(smallvec![deps])` | AFTER: `u` ordered after `deps` |
+| `program(..)`, `linear(smallvec![ops])`, `source(String)`, `binary(Vec<u8>)`, `ins(srcs, dtype, InsArg)` | codegen stages |
+| `wmma(a, b, c, WmmaMetadata)`, `u.broadcast(n)` / `try_broadcast`, `mstack(..)`, `u.mselect(i)` | |
+| `u.detach()`, `u.contiguous()`, `contiguous_with_opts(hints)`, `contiguous_backward()`, `precast()` | frontend markers |
+| `custom(deps, code, dtype)`, `customi(..)`, `custom_function(kind, attrs)`, `custom_kernel(srcs, fxn, info)`, `placeholder_like(src, slot, addrspace)` | custom code |
 
-**Bufferization**:
-- `bufferize(compute, ranges, opts)` - Materialize to buffer
-- `bufferize_global(compute, ranges)` - Bufferize to global memory
-- `bufferize_local(compute, ranges)` - Bufferize to local/shared memory
+Removed/renamed — do not look for: `define_global/local/reg` (→ `param`/`buffer` with `AddrSpace`), `bufferize*` (→ `stage*`),
+`vectorize/gep/unroll/contract` (→ `stack`, `index_axes`, expander `RangeMap`), `view` (→ `contiguous_slice`), `device()`,
+`assign` (→ `store` on an INDEX of the target + `after`), `range_outer_const`.
 
-### Shape Operations (`ir/src/uop/constructors/shape.rs`)
+## Op enum (`ir/src/op.rs`, `#[op_enum]` gives `svod_ir::ops::<Variant>` structs)
 
-| Method | Validation | Purpose |
-|---------|------------|---------|
-| `try_reshape(new_shape)` | No negative dims, product matches | Change shape preserving elements |
-| `try_permute(axes)` | Valid permutation (0..n each exactly once) | Reorder dimensions |
-| `try_expand(new_shape)` | Size-1 dims can expand, same rank | Broadcast from size-1 dims |
-| `try_pad(padding)` | Concrete padding values only | Add padding |
-| `try_shrink(ranges)` | Concrete ranges, begin ≤ end | Slice/subset |
-| `try_flip(axes)` | Length matches shape dims | Reverse axes |
+`Const(ConstValueHash) Unique LUnique Noop Sink{sources,info} Group{sources} Unary(UnaryOp, a) Binary(BinaryOp, a, b)
+Ternary(TernaryOp, a, b, c) Cast{src,dtype} BitCast{src,dtype} MSelect{buffer,device_index} Special{end,name}
+Param{shape,arg} Buffer{shape,arg} Slice{buffer,offset,size} Stage{compute,ranges,opts} Index{buffer,indices}
+GetAddr{src,device} Copy{src,device} MStack{buffers} Reshape{src,new_shape} Permute{src,axes} Expand{src,new_shape}
+Pad{src,begin_pads,end_pads} Shrink{src,offsets,sizes} Flip{src,axes} Multi{src,axis} ReduceAxis{src,reduce_op,axes}
+Reduce{src,ranges,reduce_op,num_axes} AllReduce{src,device,reduce_op} If{condition,body} EndIf{if_op}
+Range{end,axis_id,axis_type,deps} End{computation,ranges} Barrier{src,deps} Stack{sources} VConst{values}
+DefineVar{name,min_val,max_val} Bind{var,value} Wmma{a,b,c,metadata} Call{body,args,info} Function{body,args,info}
+Tuple{src} GetTuple{src,index} Program{sink,info,linear,source,binary} Linear{ops} Source{code,identity}
+ProgramBinary{bytes,identity} Detach{src} Contiguous{src,opts} ContiguousBackward{src} After{passthrough,deps}
+Precast{src} Custom{deps,code} CustomFunction{kind,attrs} CustomI{deps,code} Load{index,alt,gate} Store{index,value,gate}
+Ins{sources,arg}`
 
-### Reduction Operations (`ir/src/uop/constructors/reduce.rs`)
+Match with `Op::Load(ops::Load { index, gate: Some(g), .. })`; `op.children()` gives the child list; `OpKey::from_op(op)`
+(`svod_ir::op::pattern_derived`) is the dispatch key used by `patterns!` (see `/patterns`).
 
-| Method | Behavior |
-|---------|-----------|
-| `try_reduce_axis(reduce_op, axes)` | Reduces along tensor axes; early-returns self if all axes have dim=1 |
-| `reduce(ranges, reduce_op)` | Reduces across loop ranges (for kernels) |
-| `allreduce(src, device, reduce_op)` | All-reduce across devices |
-
-### Hardware Operations (`ir/src/uop/constructors/hardware.rs`)
-
-**Vectorization**:
-```rust
-// Create vector from scalars
-UOp::try_vectorize(vec![a, b, c, d])?  // Returns Result<Arc<Self>>
-
-// Broadcast scalar to vector
-scalar_uop.broadcast(count)  // Replicates scalar count times
-
-// Extract element(s) from vector
-vector_uop.gep(vec![0])          // Single element
-vector_uop.gep(vec![0, 2])        // Multiple elements (sub-vector)
-
-// Unroll expansion
-UOp::unroll(src, vec![(0, 4), (1, 8)])  // For axes 0 and 1
-```
-
-**WMMA (Tensor Cores)**:
-```rust
-UOp::wmma(a, b, c, WmmaMetadata {
-    dtype_out: DType::Float32,
-    upcast_axes: vec![(0, 16), (1, 16)],
-})
-```
-
-### Graph Organization (`ir/src/uop/constructors/graph.rs`)
-
-| Method | Purpose |
-|---------|---------|
-| `sink(sources)` | Graph termination mark, all sources are dependencies |
-| `group(sources)` | Organize related operations, passes through first source |
-| `assign(target, value)` | In-place assignment at INDEX location |
-| `assign_with_mops(target, value, movement_ops)` | Assignment with movement ops for bufferization |
-| `after(self, deps)` | Ordering constraint: self depends on deps completing |
-| `detach(self)` | Detach from gradient flow / force materialization |
-| `contiguous(self)` | Ensure contiguous memory layout |
-| `contiguous_with_opts(self, opts)` | Contiguous with optimization hints |
-| `precast(self)` | Force materialization before BITCAST |
-| `custom(deps, code, dtype)` | Inject custom code as statement |
-| `customi(deps, code, dtype)` | Inject custom code as expression |
-
-## DType Reference
-
-### DType Variants
-
-| Variant | Description |
-|---------|-------------|
-| `Scalar(dtype)` | Base scalar type (Float32, Int32, etc.) |
-| `Ptr { base, addrspace, size, vcount }` | Pointer to memory |
-| `Void` | No type (for operations like STORE) |
-| `Index` | Abstract integer type for indices (lowered to i32/i64) |
-
-### Address Spaces
+## DType (`svod_dtype`)
 
 ```rust
-use svod_dtype::AddrSpace::*;
-
-AddrSpace::Global    // GPU global memory / CPU main memory
-AddrSpace::Local     // GPU shared memory / CPU L1 cache
-AddrSpace::Reg       // Register memory
-AddrSpace::Texture   // Texture memory
-AddrSpace::Constant  // Constant memory
+pub enum DType { Scalar(ScalarDType), Vector { scalar: ScalarDType, count: usize },
+                 Ptr { base: Box<DType>, addrspace: AddrSpace, size: Option<usize>, vcount: usize },
+                 Image { kind: ImageKind, shape: Vec<usize> } }
+pub enum ScalarDType { Bool, WeakInt, Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64, WeakFloat,
+                       FP8E4M3, FP8E4M3FNUZ, FP8E5M2, FP8E5M2FNUZ, Float16, BFloat16, Float32, Float64, Void, Index }
+pub enum AddrSpace { Global, Local, Reg }
+pub enum DeviceSpec { Cpu, Cuda { device_id }, Amd { device_id }, Metal { device_id }, WebGpu, Disk { path } }
 ```
+Associated consts: `DType::Float32`, `DType::Int32`, `DType::Bool`, `DType::Index`, `DType::WeakInt`, `DType::WeakFloat`, `DType::Void`, ...
+(`DEFAULT_INT = Int32`, `DEFAULT_FLOAT = Float32`). `WeakInt`/`WeakFloat` are untyped literals: `is_weak()`, `strong_dtype()`,
+`weak_dtype()`; index arithmetic stays `WeakInt` until `pm_lower_index_dtype` (`17-pm_lower_index_dtype`) commits it to
+`Int32`/`Int64`.
 
-### DType Methods
+| Method | Returns |
+|--------|---------|
+| `vec(count)` | `Option<DType>` (`None` for non-scalar); `ScalarDType::vec(count)` is infallible |
+| `ptr(size: Option<usize>, AddrSpace)` | `Option<DType>` |
+| `scalar()` | `Option<ScalarDType>`; `base()` → `ScalarDType` through Vector/Ptr; `scalar_dtype()` → `DType` |
+| `count()` / `vcount()`, `is_vector()`, `is_image()` | lane count |
+| `bytes()`, `is_bool/is_int/is_float/is_signed/is_unsigned/is_fp8/is_weak()` | |
+| `min_value()/max_value()`, `c_style()`, `with_base(ScalarDType)`, `with_ptr_base(DType)` | |
+| `DType::least_upper_dtype(&[DType]) -> Option<DType>` (`cast.rs`) | promotion |
+| `HasDType` (Rust type → dtype), `IntoUOp` (`v.into_uop(dtype)`) | traits behind `native_const`/`const_like` |
 
-| Method | Returns | Description |
-|---------|----------|-------------|
-| `.is_float()` | `bool` | Is floating-point type? |
-| `.is_int()` | `bool` | Is integer type? |
-| `.is_bool()` | `bool` | Is boolean type? |
-| `.scalar()` | `Option<ScalarDType>` | Extract scalar dtype |
-| `.vcount()` | `usize` | Vector width (1 = scalar, >1 = vector) |
-| `.bytes()` | `usize` | Size in bytes |
-| `.base()` | `&DType` | Base type for Ptr, scalar for Scalar |
+`DeviceSpec::canonicalize()` gives `"CPU"`, `"CUDA:0"`; the default device is `svod_dtype::default_device::default_device()`
+(`SVOD_DEVICE` or platform default), scoped with `with_default_device(spec, || ..)`.
 
-### DType Conversion
+## Validation and errors
+
+`promote_and_cast`, `check_bitwise_dtype`, `check_division_by_zero`, `validate_binary_shapes`, `validate_permutation`,
+`validate_reduce_axes`, `validate_flip_axes` (`constructors/mod.rs`) are `pub(crate)` — outside `svod_ir` rely on the `try_*`
+result. Errors are `svod_ir::Error` (snafu): `DTypeMismatch`, `IndexTypeMismatch`, `InvalidDTypeForUnaryOp`,
+`WhereConditionNotBool`, `SymbolicShapeUnsupported`, ...; add context with `.context(MySnafu)`.
+
+## Tensor layer (`tensor/src`)
 
 ```rust
-// Get vector type with specified width
-let vec4_dtype = DType::Float32.vec(4);  // <4 x float32>
-
-// Create pointer type
-let ptr_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global);
-
-// Type promotion (find common type)
-let common = DType::least_upper_dtype(&[a.dtype(), b.dtype()]);
+let c = (&a + &b)?;                                     // std::ops on &Tensor → Result<Tensor> (+ - * / % & | ^ << >>; scalar lhs too)
+let r = a.try_reshape([2, 3])?;  let t = a.try_transpose(0, 1)?;
+let s = a.sum(())?;  let s1 = a.sum(1)?;  let m = a.max_with().axes(0).keepdim(true).call()?;
+let y = a.matmul(&b)?;  let d = a.dot(&b)?;             // matmul_with(&b, Some(dtype))
+y.realize()?;  y.realize_with(&PrepareConfig::for_cpu_backend(CpuBackend::Llvm))?;
+let plan = y.prepare()?;                                // ExecutionPlan without executing
+let v: Vec<f32> = y.to_vec()?;  let x: f32 = y.item()?;  let g = y.uop();   // Arc<UOp> from the registry
 ```
 
-## Validation Helpers (`ir/src/uop/constructors/mod.rs`)
-
-The constructors module provides validation helpers:
-
-| Function | Validates | Example Usage |
-|-----------|------------|---------------|
-| `promote_and_cast(lhs, rhs)` | Type promotion for binary ops | `let (lhs, rhs, dtype) = UOp::promote_and_cast(a, b)?;` |
-| `check_bitwise_dtype(dtype, op)` | Int/bool requirement | Bitwise ops only on int/bool types |
-| `check_division_by_zero(divisor)` | Constant zero divisor check | Compile-time check for division by zero |
-| `validate_binary_shapes(lhs, rhs, op)` | Shape matching | Binary ops require exact shape match (no broadcasting at IR level) |
-| `validate_ternary_shapes(true_val, false_val)` | Branch shape matching | WHERE/MULACC branches must match shapes |
-| `validate_permutation(axes, expected_dims)` | Permutation validity | Check each index 0..n appears exactly once |
-| `validate_reduce_axes(axes, shape_dims)` | Axis bounds | All reduction axes must be < ndim |
-| `validate_flip_axes(axes, expected_dims)` | Flip spec length | Must have exactly one bool per dimension |
-
-## Common Patterns
-
-### Creating Constants
+## Checking what you built
 
 ```rust
-use svod_ir::{UOp, ConstValue, DType};
-
-// Float constant
-let float_zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-
-// Integer constant with auto-inference
-let int_one = UOp::native_const(1i32);
-
-// Vector constant
-let vec4_zero = UOp::vconst(vec![
-    ConstValue::Float(0.0),
-    ConstValue::Float(0.0),
-    ConstValue::Float(0.0),
-    ConstValue::Float(0.0),
-]);
-
-// Const-like operation (same dtype as another UOp)
-let like_zero = some_uop.const_like(0.0);
+println!("{}", u.tree());                     // [id] OP : dtype shape=[..] with → (see above) back-refs
+assert_eq!(u.dtype(), DType::Float32);
+let shape = u.shape()?;                       // Option<&Shape>; Err for unshapeable graphs
+svod_schedule::spec::type_verify(&u, &spec)?; // the boundary checks the pipeline runs (SVOD_SPEC)
 ```
-
-### Building Index Operations
-
-```rust
-use svod_ir::UOp;
-
-// Simple index
-let index = UOp::index()
-    .buffer(buffer_uop)
-    .indices(vec![idx_i, idx_j])
-    .call()?;
-
-// With validity
-let gated_index = UOp::index()
-    .buffer(buffer_uop)
-    .indices(vec![idx.valid(gate_uop)])
-    .call()?;
-```
-
-### Building Buffers
-
-```rust
-use svod_ir::{UOp, DeviceSpec, DType, AddrSpace};
-use svod_dtype::DeviceSpec::*;
-
-// Global memory buffer
-let global_buf = UOp::new_buffer(
-    DeviceSpec::Cpu,
-    1024,
-    DType::Float32,
-);
-
-// Local (shared) memory buffer
-let local_buf = UOp::bufferize_local(compute_uop, ranges);
-
-// Pointer type
-let ptr_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global);
-```
-
-### Vector Operations
-
-```rust
-use svod_ir::UOp;
-
-// Create vector from elements
-let vec4 = UOp::try_vectorize(vec![x, y, z, w])?;
-
-// Broadcast scalar to vector
-let vec8 = scalar_uop.broadcast(8);
-
-// Extract element
-let first = vec4.gep(vec![0]);
-
-// Contract (combine after unroll)
-let combined = unrolled_uop.contract(vec![(0, 16)]);
-```
-
-### Range Operations
-
-```rust
-use svod_ir::{UOp, AxisId, AxisType};
-
-// Loop range (inside kernel)
-let loop_range = UOp::range_const(64, 0);
-
-// Outer range (wraps entire kernel)
-let outer_range = UOp::range_outer_const(10, 0);
-
-// With explicit axis type
-let global_range = UOp::range_axis(
-    end_uop,
-    AxisId::Renumbered(0),
-    AxisType::Global,
-);
-
-// GPU dimension variable
-let block_idx = UOp::special(end_uop, "blockIdx.x".to_string());
-```
-
-### Control Flow
-
-```rust
-use svod_ir::UOp;
-use smallvec::smallvec;
-
-// Create computation with ranges
-let computation = ...;
-
-// Wrap in END to close ranges
-let result = computation.end(smallvec![range_a, range_b]);
-
-// IF block
-let if_block = UOp::if_(condition, smallvec![body_op1, body_op2]);
-let end_if = UOp::endif(if_block);
-```
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `ir/src/uop/constructors/mod.rs` | Validation helpers and module organization |
-| `ir/src/uop/constructors/compute.rs` | Arithmetic, transcendental, bitwise, comparison ops |
-| `ir/src/uop/constructors/data.rs` | Constants, buffers, device specifications |
-| `ir/src/uop/constructors/control.rs` | Loop constructs, conditionals, variables |
-| `ir/src/uop/constructors/memory.rs` | Load/store, indexing, bufferization |
-| `ir/src/uop/constructors/reduce.rs` | Reduction operations |
-| `ir/src/uop/constructors/shape.rs` | Shape manipulation |
-| `ir/src/uop/constructors/graph.rs` | Graph organization |
-| `ir/src/uop/constructors/hardware.rs` | WMMA, vectorization |
-| `svod_dtype/src/lib.rs` | DType enum and methods |
-
-## Tensor API Layer (`tensor/src/`)
-
-The tensor layer provides ergonomic APIs on top of UOp constructors:
-
-```rust
-use svod_tensor::Tensor;
-
-// Arithmetic operations (auto-broadcasting)
-let c = &a + &b;  // Calls UOp::try_add with broadcasting
-
-// Shape operations
-let reshaped = a.try_reshape(&[2, 3])?;
-let transposed = a.try_transpose(0, 1)?;
-
-// Reductions
-let sum_result = a.sum(())?;
-let max_result = a.max_with().axes(0).keepdim(true).call()?;
-
-// Matrix multiplication
-let c = a.matmul(&b)?;
-let c = a.dot(&b)?;  // Alias
-
-// Realization
-let result = (&a + &b).realize()?;
-```
-
-## Error Handling Patterns
-
-Most constructors return `Result<Arc<Self>>` for type validation:
-
-```rust
-use snafu::ResultExt;
-
-// Use context() to add error context
-let result = UOp::try_add(&a, &b).context(MyErrorSnafu)?;
-
-// Use expect() for panics in rewrites (after validation)
-let result = UOp::add(&a, &b);  // Panics on type mismatch
-```
-
-## Debugging UOp Creation
-
-### Enable UOp logging
-
-```bash
-# Log UOp construction (useful for pattern matching debugging)
-RUST_LOG=svod_ir::uop=trace cargo test test_name
-```
-
-### Validate IR structure
-
-```rust
-use svod_ir::UOp;
-
-// Check UOp tree structure
-println!("{}", uop.tree());           // Compact with back-references
-println!("{}", uop.tree_full());      // Full expanded tree
-
-// Check dtype
-println!("dtype: {:?}", uop.dtype());
-
-// Check shape
-if let Some(shape) = uop.shape()? {
-    println!("shape: {:?}", shape);
-}
-```
-
-### Common Issues
-
-| Issue | Likely Cause | Check |
-|--------|--------------|--------|
-| Type mismatch error | Wrong dtype for operation | Verify operands support the operation (e.g., bitwise needs int) |
-| Shape validation failure | Broadcasting incompatible | Check if shapes can align |
-| Division by zero at compile time | Constant zero divisor | Use `check_division_by_zero` before creating DIV |
-| Invalid permutation | Duplicate or missing axis | Use `validate_permutation` or `normalize_axes` |
-| Index type mismatch | Non-Index in indices | Ensure all indices have Index dtype |
-| Buffer size mismatch | Size doesn't match allocation | Verify size × dtype.bytes() matches expected |
+Common errors: `IndexTypeMismatch` (an index that is not an int dtype — use `index_const` or an int-typed UOp), `DTypeMismatch`
+on `load().dtype(..)` (must equal the INDEX dtype), `assert_eq!(alt.is_some(), gate.is_some())` on LOAD, `BUFFER dtype is
+the stored element dtype, not a pointer` (pass `Float32`, not `Float32.ptr(..)`), shape mismatch on binary ops (broadcast
+at the Tensor layer, not in IR).

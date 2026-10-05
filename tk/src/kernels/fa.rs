@@ -4,10 +4,10 @@
 //! One workgroup (single wave64 warp) owns one `(head, q_block, batch)` triple:
 //! it loads its Q tile into registers, then streams the K/V blocks, computing
 //! `QKᵀ` with [`mma_atb`](crate::Group::mma_atb), applying the causal mask, the
-//! running-max online softmax (the LDS cross-lane [`row_reduce`]s), and the `A·V`
+//! running-max online softmax (the LDS cross-lane [`row_reduce`](crate::Group::row_reduce)s), and the `A·V`
 //! accumulation, before normalizing and writing the transposed output tile back.
 //!
-//! The K/V stream is arch-selected inside [`build_fa_mw_rdb`]: register-staged
+//! The K/V stream is arch-selected inside `build_fa_mw_rdb`: register-staged
 //! (`global_load` early, `ds_write` late) on AMD, `cp.async` into the other LDS half
 //! with the copy in flight under the current block's compute on CUDA sm_80+, where
 //! the LDS→register gathers are `ldmatrix.x4` (see [`crate::Group::load`]).
@@ -67,7 +67,7 @@ fn iconst(v: i64) -> Arc<UOp> {
 }
 
 /// The GPU arch(es) the **production graph** flash-attention ([`flash_attention_with`]
-/// → [`build_fa_mw_rdb`]) is enabled for: gfx942 (CDNA MFMA, wave64), the wave32
+/// → `build_fa_mw_rdb`) is enabled for: gfx942 (CDNA MFMA, wave64), the wave32
 /// RDNA parts (gfx1151 gfx11 WMMA, gfx1200/gfx1201 RDNA4 WMMA), CUDA sm_80+
 /// (`mma.sync`, warp32) and Apple7+
 /// (`simdgroup_matrix`, SIMD-group 32). The launcher gates
@@ -94,7 +94,7 @@ fn fa_check_target(t: &Tensor) -> crate::LaunchResult<()> {
     crate::target::check_target(&t.device(), FA_DIRECT_SUPPORTED_ARCHS)
 }
 
-/// Tuning knobs for [`build_fa_mw_rdb`] — the structured replacement for its former
+/// Tuning knobs for `build_fa_mw_rdb` — the structured replacement for its former
 /// positional `bool`/tile args (mirrors [`crate::kernels::gemm::MatmulCfg`]).
 /// [`Default`] is the production baseline: `{16,16}` per-warp tile, rolled (looped)
 /// causal compute. The shape (`b,n,h,h_kv,d`) stays a positional arg since it's
@@ -709,7 +709,7 @@ impl FaPolicy {
         policy
     }
 
-    /// Shared memory [`build_fa_mw_rdb`] takes for a `(q_blk, kv_blk)` tile at
+    /// Shared memory `build_fa_mw_rdb` takes for a `(q_blk, kv_blk)` tile at
     /// head dim `d`: the K and V double buffers, plus the per-warp softmax band
     /// where the arch stages it.
     pub fn shared_bytes(&self, (q_blk, kv_blk): (usize, usize), d: usize) -> usize {
@@ -823,8 +823,8 @@ impl FaPolicy {
 }
 
 /// Run the rolled double-buffered multi-wave flash-attention forward into `o`
-/// ([`build_fa_mw_rdb`]). One rolled KV loop over a parity-indexed 2× LDS double
-/// buffer (one [`FaScratch`]); the per-warp tile is [`FaPolicy::tile`]. `o` is an
+/// (`build_fa_mw_rdb`). One rolled KV loop over a parity-indexed 2× LDS double
+/// buffer (one `FaScratch`); the per-warp tile is [`FaPolicy::tile`]. `o` is an
 /// **output parameter**: the result is written in place into the supplied tensor.
 ///
 /// ```text
@@ -897,7 +897,7 @@ impl Default for FaOpts<'_> {
 /// "this request is malformed" (`Err`, a caller bug):
 ///
 /// - `Ok(Some(out))` — ran: a lazy output [`Tensor`] (`custom_kernel` / `Op::Call`
-///   node) from the rolled double-buffered kernel ([`build_fa_mw_rdb`]) via
+///   node) from the rolled double-buffered kernel (`build_fa_mw_rdb`) via
 ///   [`crate::graph_launch`], honoring `opts.causal` and the optional
 ///   `opts.key_lens` **key-only** mask (a 5th `[B]` `i32` global after `o,q,k,v`).
 /// - `Ok(None)` — *doesn't apply here:* the device isn't a supported arch

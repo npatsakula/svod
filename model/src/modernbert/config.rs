@@ -95,7 +95,8 @@ impl ModernBertConfig {
 }
 
 impl Default for ModernBertConfig {
-    /// Placeholder config — structural fields are zero since [`from_hub`]
+    /// Placeholder config — structural fields are zero since
+    /// [`ModernBert::from_hub`](super::ModernBert::from_hub)
     /// overwrites them all from `config.json`. Only `dtype` and
     /// `max_batch_size` are caller-chosen.
     fn default() -> Self {

@@ -36,7 +36,7 @@ NVIDIA 的 CuTile 和 HazyResearch 的 ThunderKittens 采用的就是这套心�
 
 ## 一个 tile 就是一格格矩阵核心片段
 
-为什么是 `16×16`，而不是 `100×100` 这样的整数？因为矩阵核心工作在一个固定的*片段*尺寸上，这个尺寸固化在硬件里，通常是 `16×16` 或 `32×32`。tile 的大小被定成这些片段的整数倍：
+为什么是 `16×16`，而不是 `100×100` 这样的整数？因为矩阵核心工作在一个固定的*片段*尺寸上，这个尺寸固化在硬件里：AMD 的 MFMA 与 WMMA 核心以及 NVIDIA 的 `mma.sync`（作为两个 `16×8` 半块）上是 `16×16`，Apple 的 `simdgroup_matrix` 上是 `8×8`。tile 的大小被定成这些片段的整数倍：
 
 ```mermaid
 block-beta
@@ -80,11 +80,11 @@ block-beta
 :::tip[面向 GPU 专家]
 `tk` 把一个 tile 的*形状*与它所绑定的*缓冲区*拆开。
 
-纯形状描述符在 `tk/src/tiles.rs`。基础片段是 `BaseShape { rows, cols, ept }`，其中 `ept`（每线程元素数）是被**显式**携带的，而非按 `rows*cols / wave_size` 算出来；因为在 RDNA 上，矩阵指令会把操作数*跨 lane 复制*，所以拿操作数 tile 的元素数除以 wave 大小是错的。寄存器 tile 额外加上一个 `LaneMap`（`RTBaseShape`），也就是该片段那个闭式的 `(lane, j) → (row, col)` 映射，用来编码任何普通 stride 都表达不出来的布局：RDNA 累加器的偶/奇行交织，以及 CUDA 的 `mma.sync` 把一个 16×16 tile 拆成两个 `m16n8` 半块来持有的布局。
+纯形状描述符在 `tk/src/tiles.rs`。基础片段是 `BaseShape { rows, cols, ept }`，其中 `ept`（每线程元素数）是被**显式**携带的，而非按 `rows*cols / wave_size` 算出来；因为在 RDNA3 上，矩阵指令会在两个半 wave 之间*复制*操作数，所以拿操作数 tile 的元素数除以 wave 大小得到的是错误答案（每 lane 16 个，而不是 8 个）。寄存器 tile 额外加上一个 `LaneMap`（`RTBaseShape`），也就是该片段那个闭式的 `(lane, j) → (row, col)` 映射，位于 `tk/src/layout.rs`；于是布局只以数据的形式描述一次，每个消费者（LDS 与全局内存之间的搬运、感知位置的掩码、规约树）都读取它。变体有 `Strided`（CDNA、gfx12，以及 stride 为 0 的 gfx11 复制操作数）、`Interleaved` / `InterleavedT`（gfx11 累加器的偶/奇行交织及其 N 主序转置）、`MmaSync`（把一个 16×16 tile 拆成两个 `m16n8` 半块）以及 `SimdgroupMatrix` / `SimdgroupMatrixT`（Apple 的 8×8，在硬件上实测得出）。共享 tile 则改为加上一个 `Swizzle`（`STBaseShape`）。
 
-绑定缓冲区的包装器在 `tk/src/tile.rs`：`GL`（全局布局）、`ST`（共享 / LDS，可选双缓冲）、`RT`（寄存器 tile）、`RV`（寄存器向量，用于 softmax 所需的行/列规约）。每一种都是一个扁平的 `Arc<UOp>` 缓冲区，外加一个逻辑形状和一个 dtype。
+绑定缓冲区的包装器在 `tk/src/tile.rs`：`GL`（全局布局）、`ST`（共享 / LDS，可选多级）、`RT`（寄存器 tile）、`RV`（寄存器向量，用于 softmax 所需的行/列规约）。每一种都是一个扁平的 `Arc<UOp>` 缓冲区，外加一个逻辑形状和一个 dtype。
 
-至关重要的是，内核从不直接点名 `RT_16X16` 这类片段常量。它们请求的是一个**角色**（`FragRole::{Accumulator, Operand, AccumulatorT}`），再由 `tk/src/arch.rs` 中的 `ArchCaps::frag(role)` 把它解析成目标平台（CDNA、RDNA，或 CUDA 的 `mma.sync`）上正确的物理形状。正是这层间接，让同一个内核能在不同 wave 大小与片段布局间移植；见 [Wave32 与 Wave64](./wave-portability)。矩阵乘法本身则降级为 [操作图鉴](../architecture/op-bestiary) 中记录的 `WMMA` 操作。
+至关重要的是，内核从不直接点名 `RT_16X16` 这类片段常量。它们请求的是一个**角色**（`FragRole::{Accumulator, Operand, OperandB, AccumulatorT}`），再由 `tk/src/arch.rs` 中的 `ArchCaps::frag(role)` 把它解析成目标平台上正确的物理形状。正是这层间接，让同一个内核能在不同 wave 大小与片段布局间移植；见 [布局与 wave 宽度](./wave-portability)。矩阵乘法本身则降级为 [操作图鉴](../architecture/op-bestiary) 中记录的 `WMMA` 操作，其描述符取自调度器自己的逐架构 `TensorCore` 表，也就是 BEAM 的 `TC` 动作所读取的同一张表。
 :::
 
 ---

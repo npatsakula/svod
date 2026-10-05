@@ -12,7 +12,7 @@ profiler साझा करता है — और ML application बनान
 एक `Tensor` add से लेकर नीचे एक hand-tuned attention कर्नेल तक।
 
 यह chapter दिखाता है कि यह कैसे काम करता है। यह मानकर चलता है कि आप
-[IR डिज़ाइन फ़िलॉसफ़ी](../architecture/ir-design) और
+[एक IR सबके लिए](../architecture/ir-design) और
 [एक्ज़ीक्यूशन पाइपलाइन](../architecture/pipeline) पढ़ चुके हैं — आपको पता होना चाहिए कि UOp क्या है और कैसे एक
 lazy `Tensor` compiled कर्नेल बनता है। वह philosophy हम दोबारा नहीं समझाएँगे; हम बस यह दिखाएँगे कि एक
 हाथ से लिखा कर्नेल उसमें कैसे *slot* हो जाता है।
@@ -48,8 +48,9 @@ flowchart LR
 UOps *ही है*, इसलिए compiler का सारा infrastructure इसे अपने-आप मिल जाता है — कुछ भी tk-specific न बनाना
 पड़ता है, न सीखना:
 
-- **एक ही renderer।** जो `svod-codegen` path graph कर्नेल को LLVM IR में — और वहाँ से एक AMD binary या PTX में — lower करता है,
-  वही आपके `tk` कर्नेल को render करता है। न कोई दूसरा backend लिखना है, न port करना, न sync में रखना।
+- **एक ही renderer।** जो `svod-codegen` path graph कर्नेल को LLVM IR में — और वहाँ से एक AMD binary या PTX में —
+  या Metal पर MSL में lower करता है, वही आपके `tk` कर्नेल को render करता है। न कोई दूसरा backend लिखना है,
+  न port करना, न sync में रखना।
 - **एक ही debugger।** आप एक `tk` कर्नेल को बाक़ी किसी भी computation की तरह ही inspect करते हैं: UOp tree
   print कर लीजिए। हाथ से लिखा Flash Attention और एक autotuned matmul, दोनों *एक ही* textual रूप में, एक ही
   op names के साथ दिखते हैं — न कोई अलग dump format, न "यह kernel X आख़िर है क्या" वाली पहेली।
@@ -70,7 +71,7 @@ UOps *ही है*, इसलिए compiler का सारा infrastructur
 
 ## Builder: `Kernel` और `Group`
 
-आप दो types से author करते हैं (`tk/src/lib.rs` में AUTHOR चेहरे से):
+आप तीन types से author करते हैं (`tk/src/lib.rs` में AUTHOR चेहरे से):
 
 - **`Kernel`** (`tk/src/kernel.rs`) eager builder है। यह आपको कच्चा माल देता है — grid/block dimensions
   (जो `SPECIAL` ops बनते हैं), loop ranges (`RANGE`), shared-memory और register buffers (दोनों ही
@@ -80,13 +81,15 @@ UOps *ही है*, इसलिए compiler का सारा infrastructur
   `shuffle`, `elementwise`) एक साथ काम करने वाली wave (या waves का समूह) है। यह *compute* वाली
   शब्दावली साथ रखता है: memory spaces के बीच loads और stores, `mma` matrix multiply, reductions, shuffles,
   और elementwise maps।
+- **`Loop`** (`tk/src/loop_scope.rs`) एक tracked `RANGE` है, जिसमें loop-carried हिसाब-किताब declarative बना
+  दिया गया है: हर trip पर re-initialization के लिए `reinit`, और loop बंद करने वाले इकलौते edge के लिए `close`।
 
 हर `Group` operation सीधे UOp nodes बनाता है। एक load ज़रूरी `RANGE`s खोलता है, एक `STORE` emit करता है
 जो उन्हें बंद करता है, और destination tile को एक dependency edge के साथ दोबारा wrap करके लौटाता है, ताकि
 अगला operation इसके बाद ही order हो। आप दरअसल eagerly एक graph लिख रहे होते हैं, एक बार में एक tile op।
 
 जब काम पूरा हो जाए, आप `Kernel::finish(...)` कॉल करते हैं, जो खुली ranges को बंद करता है और सब कुछ एक
-terminal `SINK` में wrap कर देता है।
+terminal `SINK` में wrap कर देता है। पूरी surface [Builder API](./builder-reference) में है।
 
 ---
 
@@ -138,7 +141,8 @@ scheduler कर्नेल के `Op::Call` को बाक़ी किस�
 
 `compile` / `launch` / `run_kernel` (`tk/src/launch.rs`) एक finished `SINK` लेते हैं, इसे concrete device
 buffers से bind करते हैं, और फिर render, compile, और dispatch करते हैं — tensor scheduler को पूरी तरह
-bypass करते हुए। एक कर्नेल को isolation में test और benchmark आप इसी तरह करते हैं; देखें [डीबगिंग](./debugging)।
+bypass करते हुए। एक कर्नेल को isolation में test और benchmark आप इसी तरह करते हैं; देखें
+[डीबगिंग](./debugging)।
 
 ### Graph node (USE चेहरा)
 
@@ -157,7 +161,8 @@ finished `SINK` एक `Op::Call` node की `body` बन जाता है 
 [Op Bestiary](../architecture/op-bestiary) में `Op::Call`)। हर output tensor एक `AFTER(Call)` के रूप में
 लौटाया जाता है — यानी एक आम dependency edge। scheduler की नज़र में आपका कर्नेल बस inputs और outputs वाला
 DAG का एक और node है। यह scheduled होता है, इसके buffers allocate होते हैं, इसकी dependencies track होती
-हैं — और वह भी उसी machinery से जिसका वर्णन [एक्ज़ीक्यूशन पाइपलाइन](../architecture/pipeline) में है।
+हैं — और वह भी उसी machinery से जिसका वर्णन
+[एक्ज़ीक्यूशन पाइपलाइन](../architecture/pipeline) में है।
 
 यही "एक IR" का फ़ायदा है: हाथ से लिखा कर्नेल और autotuned कर्नेल बराबर के *peers* हैं।
 
@@ -167,19 +172,21 @@ DAG का एक और node है। यह scheduled होता है, �
 
 कर्नेल libraries में एक बारीक failure mode होता है: आप fast path कॉल करते हैं, यह चुपचाप तय कर लेता है कि
 आपके input को handle नहीं कर सकता, और आपको बिना किसी warning के slow path मिल जाता है — या उससे भी बुरा,
-एक ग़लत जवाब। `tk` के public कर्नेल (`tk/src/kernels/` — single-output वाले `tk/src/launch.rs` के
-`launch_custom` के ज़रिए, और multi-output k-means तथा k-NN वही policy inline करके) इसी को नामुमकिन बनाने
-के लिए बने हैं। हर entry point तीन में से एक result लौटाता है:
+एक ग़लत जवाब। `tk` के public कर्नेल (`tk/src/kernels/`, `tk/src/launch.rs` के `launch_custom` के ज़रिए;
+k-means और k-NN वही policy inline करते हैं) इसी को नामुमकिन बनाने के लिए बने हैं। हर entry point तीन में से
+एक result लौटाता है:
 
 | Result | मतलब | आप क्या करें |
 |--------|---------|-------------|
 | `Ok(Some(tensor))` | कर्नेल चल गया। | tensor इस्तेमाल करें। |
-| `Ok(None)` | "यहाँ लागू नहीं होता" — unsupported arch, या shape साफ़-सुथरे tile नहीं होता। | जान-बूझकर, एक graph implementation पर fall back करें। |
-| `Err(...)` | *request* ही ग़लत है — ग़लत dtype, dimensions divisible नहीं, non-square operands। | call ठीक करें। यह एक bug है, जिसे ज़ोर-शोर से उठाया जाता है। |
+| `Ok(None)` | "यहाँ लागू नहीं होता" — unsupported arch, toolchain मौजूद नहीं, या shape साफ़-सुथरे tile नहीं होता। | जान-बूझकर, एक graph implementation पर fall back करें। |
+| `Err(...)` | *request* ही ग़लत है — ग़लत dtype, dimensions divisible नहीं, कोई symbolic dim, non-square operands। | call ठीक करें। यह एक bug है, जिसे ज़ोर-शोर से उठाया जाता है। |
 
 `Ok(None)` (एक जायज़ "मैं नहीं") और `Err` (caller की ग़लती) के बीच का यही फ़र्क़ असल मुद्दा है। Unsupported
 hardware एक fallback की ओर चला जाता है; पर जिस dtype को कर्नेल स्वीकार ही नहीं कर सकता, वह एक error है जो
-आपको तुरंत दिखता है — न कि slow path की ओर एक चुपचाप किया गया चक्कर।
+आपको तुरंत दिखता है — न कि slow path की ओर एक चुपचाप किया गया चक्कर। Errors structured हैं
+(`LaunchError::Dtype { kernel, got, expected }`, `DimMultiple`, `OperandShape`, …), ताकि कोई model उन पर
+match कर सके; [कर्नेल लाइब्रेरी](./kernel-library) हर कर्नेल के नियम गिनाती है।
 
 ---
 
@@ -203,9 +210,9 @@ flowchart TD
 ```
 
 न कोई नए node types, न कोई अलग dialect — वही operations जिन पर
-[IR chapter में matmul की यात्रा](../architecture/ir-design) ख़त्म होती है। एक असली कर्नेल `WMMA` और
-`Local` (LDS) तथा `Reg` (registers) address spaces वाले `BUFFER` nodes जोड़ता है, पर shape वही रहता है:
-ranges से scoped एक STORE पर एक SINK।
+[IR chapter में matmul की यात्रा](../architecture/ir-design)
+ख़त्म होती है। एक असली कर्नेल `WMMA` और `Local` (LDS) तथा `Reg` (registers) address spaces वाले `BUFFER`
+nodes जोड़ता है, पर shape वही रहता है: ranges से scoped एक STORE पर एक SINK।
 
 ---
 

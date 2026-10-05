@@ -10,8 +10,8 @@ description = "Device abstraction layer for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.7", features = ["serde"] }
-svod-ir = { path = "../ir", version = "=0.1.0-alpha.7" }
+svod-dtype = { path = "../dtype", version = "=0.1.0", features = ["serde"] }
+svod-ir = { path = "../ir", version = "=0.1.0" }
 
 ndarray.workspace = true
 
@@ -40,7 +40,7 @@ nix = { version = "0.31", features = ["ioctl", "fs"] }
 bindgen = "0.73"
 
 [dev-dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.7", features = ["proptest"] }
+svod-dtype = { path = "../dtype", version = "=0.1.0", features = ["proptest"] }
 proptest = "1.9"
 strum = "0.28"
 test-case = "3.3.1"

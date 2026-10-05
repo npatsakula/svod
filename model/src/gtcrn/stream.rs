@@ -211,7 +211,7 @@ impl GtcrnStream {
     // Loaders (the offline gtcrn.safetensors, unmodified)
     // ----------------------------------------------------------------------- //
 
-    /// Download [`CHECKPOINT`](super::CHECKPOINT) from [`HUB_REPO`] and load it.
+    /// Download `CHECKPOINT` from [`HUB_REPO`] and load it.
     pub fn from_hub() -> Result<Self> {
         Self::from_hub_with_revision("main")
     }

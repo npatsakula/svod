@@ -123,20 +123,27 @@ impl OnnxGraph {
 /// Contains the lazy computation graph as input/output Tensors and any
 /// dynamic dimension Variables extracted from the ONNX graph.
 ///
+/// Inputs the caller does not supply are uninitialized buffer-backed
+/// placeholders (`Tensor::empty_dynamic`, dynamic dims sized to their max).
+/// To run on real data, pass the input tensors to
+/// [`OnnxImporter::import_model_with_inputs`].
+///
 /// # Example
 ///
 /// ```ignore
-/// let model = OnnxImporter::new().import("model.onnx", &[("batch", 4)])?;
+/// use prost::Message;
+/// use svod_onnx::parser::ModelProto;
 ///
-/// // Inputs are zero-filled tensors matching the model's input shapes
-/// let input_data: Vec<f32> = load_my_data();
-/// model.inputs["x"].copyin(&input_data);
+/// let proto = ModelProto::decode(std::fs::read("model.onnx")?.as_slice())?;
+/// let x = Tensor::from_slice(load_my_data()).try_reshape([1, 3, 224, 224])?;
+/// let model = OnnxImporter::new().import_model_with_inputs(proto, HashMap::from([("x".into(), x)]), &[])?;
 ///
 /// // Outputs are lazy — realize to execute
 /// let result = model.outputs["prob"].realize()?;
 /// ```
 pub struct OnnxModel {
-    /// Model inputs: name → zero-filled Tensor with correct shape/dtype.
+    /// Model inputs: name → caller-supplied Tensor, or an uninitialized
+    /// placeholder with the model's shape/dtype.
     pub inputs: HashMap<String, Tensor>,
     /// Model outputs: name → lazy Tensor (realize to execute).
     pub outputs: HashMap<String, Tensor>,

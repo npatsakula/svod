@@ -137,7 +137,7 @@ fn reject_64_bit(op: &str, dtype: &svod_dtype::DType) {
 /// `simd_shuffle(value, lane)` — read `value` from `lane` of the SIMD group.
 ///
 /// # Panics
-/// Panics on a value wider than 32 bits (see [`reject_64_bit`]).
+/// Panics on a value wider than 32 bits (see `reject_64_bit`).
 pub fn simd_shuffle(value: &Arc<UOp>, lane: &Arc<UOp>) -> Arc<UOp> {
     let dtype = value.dtype();
     reject_64_bit("simd_shuffle", &dtype);
@@ -147,7 +147,7 @@ pub fn simd_shuffle(value: &Arc<UOp>, lane: &Arc<UOp>) -> Arc<UOp> {
 /// `simd_shuffle_xor(value, mask)` — the butterfly exchange with lane `L ^ mask`.
 ///
 /// # Panics
-/// Panics on a value wider than 32 bits (see [`reject_64_bit`]).
+/// Panics on a value wider than 32 bits (see `reject_64_bit`).
 pub fn simd_shuffle_xor(value: &Arc<UOp>, mask: &Arc<UOp>) -> Arc<UOp> {
     let dtype = value.dtype();
     reject_64_bit("simd_shuffle_xor", &dtype);

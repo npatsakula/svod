@@ -19,7 +19,7 @@ sidebar_label: 限制与路线图
 | **动态共享内存** | 启动传的是 `shared_mem_bytes = 0`；只用到静态 `.shared`，而 `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` 从不被调用，因此一个需要超过每 block 默认上限的内核会在 JIT 时失败。设备工厂会预先拒绝一台上限低于 profile `shared_max`（48 KiB）的设备。 | `device/src/cuda/program.rs`、`runtime/src/devices/cuda.rs` |
 | **Hopper / Blackwell 矩阵路径** | 只降低了 `mma.sync`（`m16n8kK`）；没有 `wgmma`，没有 `tcgen05`。 | `codegen/src/llvm/nvptx/wmma.rs` |
 | **没有 `ptxas` 的宿主上的 cubin** | 没有 CUDA toolkit 时，对象缓存存的是 PTX 文本，每一次新鲜加载都要付出驱动 JIT 的代价（驱动会把它缓存在 `~/.nv/ComputeCache`）。并不附带汇编器：`ptxas` 装了才用（`object_format: cubin-v1`），否则这活儿交给驱动。 | `runtime/src/cuda/compile.rs` |
-| **用户态 NV 驱动** | Tinygrad 的 `ops_nv`（直接的 GPU-FIFO 提交）需要为每个驱动分支生成一套 ABI；Svod 留在稳定的 `libcuda.so.1` API 上。`NV` 在 `SVOD_DEVICE` 中被刻意*不*接受（只接受 `CUDA` 和 `GPU`）；这个名字为那个未来的后端保留。 | `nvidia_backend_plan.md` |
+| **用户态 NV 驱动** | Tinygrad 的 `ops_nv`（直接的 GPU-FIFO 提交）需要为每个驱动分支生成一套 ABI；Svod 留在稳定的 `libcuda.so.1` API 上。`NV` 在 `SVOD_DEVICE` 中被刻意*不*接受（只接受 `CUDA` 和 `GPU`）；这个名字为那个未来的后端保留。 | `device/src/registry.rs` |
 
 算是数值上的注记而非缺口：f64 的 `Exp2` / `Log2` 以及全部超越函数都走多项式
 路径（[代码生成](./codegen.md)）；`lg2.approx.f32` 对渲染器可用，但普通的图
@@ -29,7 +29,8 @@ sidebar_label: 限制与路线图
 
 ## 今天没得商量的要求
 
-- 驱动至少要到 CUDA 12.0 / R525：CUDA graph 的入口点按其 12.0 的版本化名称绑定。
+- 驱动至少要到 CUDA 12.0 / R525：CUDA graph 的入口点按其 12.0 的版本化名称绑定，
+  更旧的驱动会让后端悄无声息地保持未注册。
   PTX ISA 由 `--cuda-feature` 锁定，且随算力递增——sm_88 及更早为 7.8，sm_89 与 sm_90 为 8.4
   （需要 CUDA 12.4 / R550），Blackwell 上依次为 8.6、8.7 和 8.8（最高到 CUDA 12.9）——因此一块
   Blackwell 卡会把下限抬到它自己那版 ISA 的驱动，而更新的 clang 不会。
@@ -39,7 +40,7 @@ sidebar_label: 限制与路线图
 
 ## 路线图
 
-计划中可选阶段（`nvidia_backend_plan.md`，第 5 阶段）剩下的部分，按优先级排列：
+剩下的部分，按优先级排列：
 
 1. **流序释放**：在复制通道上对设备内存使用 `cuMemFreeAsync`，让一次释放不再
    排空整台设备。

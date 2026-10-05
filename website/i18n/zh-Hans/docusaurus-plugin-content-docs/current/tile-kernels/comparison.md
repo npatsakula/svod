@@ -25,20 +25,20 @@ sidebar_label: tk、HipKittens 与 CuTile 对比
 |------|--------|----------------|------------|
 | **编写界面** | Rust *构建器 API*（`Kernel`/`Group` 铸造 UOp） | C++ *模板* | Rust *宏 DSL*，在 `#[cutile::module]` 里写普通 Rust，由宏捕获 AST |
 | **IR 目标** | Svod 的**唯一 UOp IR**，与整个编译器一致 | 无（模板 → clang amdgcn） | 一个*单独*的 MLIR `cuda_tile` 方言，序列化为 Tile IR 字节码 |
-| **降级** | Svod render → LLVM → AMD 二进制，或 → PTX（由 `ptxas` 汇编成 cubin，否则由驱动 JIT） | clang | 字节码 → 外部 `tileiras` 汇编器 → cubin（首次启动时 JIT） |
+| **降级** | Svod render → LLVM → AMD 二进制，或 → PTX（由 `ptxas` 汇编成 cubin，否则由驱动 JIT），或 → MSL | clang | 字节码 → 外部 `tileiras` 汇编器 → cubin（首次启动时 JIT） |
 | **内存模型** | **显式**的寄存器*和*共享 tile | 显式的寄存器*和*共享 tile | **一种** tile 类型（寄存器驻留）；共享内存分阶段是隐式的，由编译器选择 |
 | **矩阵核心 API** | 显式的 `WMMA` 操作 + 基于角色的片段 | 带类型的 tile → `__builtin_amdgcn_mfma_*` | 单个函数式的 `mma()` 内建函数 |
 | **计算/内存重叠** | 一个 `sched::pipeline` 标记 + 一个 codegen 遍 | 逐内核手写（原始调度内建函数） | 委托给 `tileiras` |
 | **核心差异** | 一套 IR ⇒ 手写内核与自动调优内核平级 | 「从硬件向上构建」 | 跨越启动边界的内存安全 |
-| **目标** | AMD CDNA / RDNA **以及** NVIDIA `sm_80+` | AMD CDNA / RDNA | 仅 NVIDIA `sm_80+` |
+| **目标** | AMD CDNA3 / RDNA3 / RDNA4、NVIDIA `sm_80+`、Apple7+ | AMD CDNA / RDNA | 仅 NVIDIA `sm_80+` |
 
-在此之上，每个 `tk` 内核还各自声明自己的架构集合：matmul、Flash Attention 和单查询注意力面向 gfx942、gfx1151 与 CUDA `sm_80+` 构建；k-means 与 k-NN 内核则仅限 AMD。
+在此之上，每个 `tk` 内核还各自声明自己的架构集合：flash attention 和方阵 `matmul` 在所有家族上运行，`gemm_nt` 和各个 norm 在 RDNA 与 CUDA 上运行，单查询注意力在 AMD 与 CUDA 上运行，k-means 与 k-NN 仅限 AMD——完整矩阵见 [内核库](./kernel-library)。
 
 ---
 
 ## 代码长什么样
 
-这几种编写界面的使用体验确实大不相同。下面的片段只作示意，传达的是各模型的*形态*，并非精确的 API。
+这几种编写界面的使用体验确实大不相同。HipKittens 和 CuTile 的片段只作示意，传达的是各模型的*形态*，并非精确的 API；`tk` 的片段则是真实的 API。
 
 **HipKittens**：C++ 模板；你给 tile 命名，直接调用乘法：
 
@@ -71,17 +71,22 @@ mod kernels {
 }
 ```
 
-**tk**：一个铸造 IR 的 Rust 构建器；你按角色请求片段，再发射 `Group` 操作：
+**tk**：一个铸造 IR 的 Rust 构建器；你按角色请求片段，再发射 `Group` 操作（取自 `tk/src/kernels/gemm.rs` 中 `gemm_core` 的单缓冲条带，有所精简）：
 
 ```rust
-let ker = Kernel::new(grid, block, caps);
-let a   = ker.gl(a_spec);                       // global layout
-let mut acc = ker.rt(FragRole::Accumulator);    // role, not a hardcoded shape
-let g   = ker.group();
+let (outs, ins) = ker.bind_abi(&[GlSpec::new(&[1, 1, n, n], DType::Float32)], &[a_spec, b_spec]);
+let g = ker.group_2d(cfg.warps_m, cfg.warps_n);
+let a_smem = ker.shared_sw((cfg.block_m, k_step), bf16, TileLayout::Row);   // swizzled LDS strip
+let acc = g.zero(ker.acc((reg_m, reg_n), TileLayout::Col));                 // role, not a hardcoded shape
 
-g.load(&shared_a, &a, idx);                      // global → LDS (swizzled)
-g.mma(&mut acc, &operand_a, &operand_b);         // → WMMA UOp
-let sink = ker.finish(stores);                   // SINK { opts_to_apply: Some(vec![]) }
+let lp = ker.loop_static(trips);
+let a_f = g.fill_local_nobar(a_smem, a_gl, &a_idx, 2);                      // global → LDS, collaborative
+let a_sub = g.load(ker.operand((reg_m, k_step), bf16, TileLayout::Row),    // LDS → registers
+                   a_f.subtile((reg_m, k_step), (warp_row, 0)), MoveIdx::default());
+let acc = g.mma_ab(acc, &a_sub, &bb);                                      // → WMMA UOp
+let ended = lp.close();
+let _ = g.store(c_gl, acc.after(&ended), MoveIdx::block((0, 0, mrow, nidx), 2));
+ker.finish(1)                                                               // SINK { opts_to_apply: Some(vec![]) }
 ```
 
 CuTile 的例子读起来像一段普通程序，`tk` 的例子读起来像在搭一张图。这就是其中的权衡：CuTile 的宏捕获你的*语法*再重新解析，而 `tk` 是一个库，它的方法调用*本身*就是 IR 构造。
@@ -97,7 +102,7 @@ CuTile 的例子读起来像一段普通程序，`tk` 的例子读起来像在�
 **IR 驻留在哪里。** 这才是 `tk` 真正与众不同的一招。HipKittens 是一个独立的 C++ 框架，它产出内核，仅此而已。CuTile 降级到一个*单独*的 MLIR 方言，只有它自己的工具链才消费它。`tk` 降级进的，是 **Svod 其余部分早已通晓的那同一套 UOp IR**。一个 `tk` 内核不是一件交给另一个编译器的产物，而是那唯一 IR 中的一个子图，就紧挨着每一个自动调优内核。
 
 :::tip[面向 GPU 专家]
-IR 目标的差异，在工具链层面是实打实的。`tk` 把它的 `SINK` 经 `svod-codegen` 渲染到 LLVM IR，再到一个 AMD 二进制、或到 PTX（由 `ptxas` 汇编，否则由驱动 JIT），走的与图内核是同一条路。CuTile 则把它的 tile 方言序列化为字节码，由一个*外部*的 `tileiras` 汇编器变成 cubin，并在首次启动时 JIT 编译；HipKittens 则是由 clang 编译的 C++ 模板。所以 `tk` 的「一套 IR」，字面上就意味着一条渲染加编译的流水线，而其他两者都要桥接进一个单独的编译器。
+IR 目标的差异，在工具链层面是实打实的。`tk` 把它的 `SINK` 经 `svod-codegen` 渲染到 LLVM IR，再到一个 AMD 二进制、或到 PTX（由 `ptxas` 汇编，否则由驱动 JIT），在 Metal 上则到 MSL，走的与图内核是同一条路。CuTile 则把它的 tile 方言序列化为字节码，由一个*外部*的 `tileiras` 汇编器变成 cubin，并在首次启动时 JIT 编译；HipKittens 则是由 clang 编译的 C++ 模板。所以 `tk` 的「一套 IR」，字面上就意味着一条渲染加编译的流水线，而其他两者都要桥接进一个单独的编译器。
 :::
 
 ---

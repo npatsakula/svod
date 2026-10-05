@@ -14,17 +14,18 @@ knobs की सूची देता है और बताता है क�
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SVOD_DEVICE` | `CPU` | `CUDA:N` (alias `GPU`) default tensor device चुनता है; `NV` alias *नहीं* है, वह एक userspace driver के लिए सुरक्षित रहता है |
+| `SVOD_DEVICE` | `CPU` (macOS पर `METAL:0`) | `CUDA:N` (alias `GPU`) default tensor device चुनता है; `NV` alias *नहीं* है, वह एक userspace driver के लिए सुरक्षित रहता है |
 | `SVOD_DUMP_NVPTX_IR` | unset | वह directory जिसमें हर kernel का NVPTX LLVM IR `sm_XY_<kernel>.ll` के रूप में जाता है |
 | `SVOD_CUDA_PTXAS` | on | `0` `ptxas` वाली pre-assembly छोड़ देता है और PTX text को driver JIT को सौंप देता है |
 | `SVOD_CUDA_SCOPED_SYNC` | on | `0` हर scoped wait को एक पूरे `cuCtxSynchronize` से बदल देता है और copies को synchronous बना देता है ([Architecture](./architecture.md)) |
 | `SVOD_CUDA_CUPTI` | on | `0` `libcupti.so.13` को load करना छोड़ देता है, इसलिए कोई hardware counters नहीं होते |
 | `SVOD_PMC` | unset | बैकएंड के default counter set के लिए `1`, या एक comma-separated token list, देखें [Profiling](./profiling.md) |
 | `SVOD_OBJECT_CACHE` | on | `0` compiled objects की on-disk cache को disable करता है |
-| `SVOD_OBJECT_CACHE_DIR` | `$XDG_CACHE_HOME` / `~/.cache` | cache को स्थानांतरित करता है |
-| `CUDA_PATH` | unset | `ptxas` (`$CUDA_PATH/bin`) और CUPTI (`$CUDA_PATH/lib64`) के लिए आख़िरी में खोजी जाने वाली जगह |
+| `SVOD_OBJECT_CACHE_DIR` | `$XDG_CACHE_HOME/svod/objects`, अन्यथा `~/.cache/svod/objects` | cache को स्थानांतरित करता है |
+| `SVOD_OBJECT_CACHE_MAX_BYTES` | 1 GiB | cache का budget |
+| `CUDA_PATH` | unset | `ptxas` (`$CUDA_PATH/bin`, `PATH` और `/opt/cuda/bin` के बाद) और CUPTI (`$CUDA_PATH/lib64`, `$CUDA_PATH/extras/CUPTI/lib64`) के लिए आख़िरी में खोजी जाने वाली जगह |
 | `SVOD_PROFILE_ITERS`, `SVOD_ORIGIN`, `SVOD_ORIGIN_DEPTH` | | Profiler knobs, देखें [Profiling](./profiling.md) |
-| `RUST_LOG` | unset | `svod_device=info` device open line देता है; `svod_device=debug` उसमें JIT info log, graph capture और replay fallbacks जोड़ देता है; `svod_runtime=debug` हर kernel की clang invocation log करता है |
+| `RUST_LOG` | unset | `svod_device=info` device open line देता है; `svod_device=debug` उसमें JIT info log, graph capture और replay fallbacks जोड़ देता है; `svod_runtime=debug` हर NVPTX compile (arch और IR size) और एक अनुपयोगी `ptxas` log करता है |
 
 कोई CUDA-specific dispatch dump नहीं है; driver JIT log और `tracing` वही कवर करते हैं जो
 AMD पर `SVOD_DEBUG_DISPATCH` करता है।
@@ -53,7 +54,7 @@ no CUDA GPU available: CUDA cuInit failed: ...           # driver loaded, no usa
 cause है और उसके बाद driver का error log:
 
 ```text
-CUDA JIT of kernel "r_64_32" failed: CUDA_ERROR_INVALID_PTX (218): a PTX JIT compilation failed
+CUDA JIT of kernel "r_64_32" failed: CUDA_ERROR_INVALID_PTX: a PTX JIT compilation failed
 ptxas application ptx input, line 27; error   : ...
 ```
 
@@ -79,7 +80,9 @@ cached PTX targets sm_80, not sm_86                          # a corrupt or fore
 एक cubin entry की जाँच इसके बजाय `validate_cubin` करता है (एक little-endian ELF64,
 `EM_CUDA` के लिए, जो entry को code के रूप में define करता है), और उसकी `.param` list की
 जाँच assembly से पहले PTX text पर ABI के विरुद्ध होती है, क्योंकि एक cubin वह साथ नहीं
-रखता।
+रखता। PTX वाले रास्ते पर loader वह `.param` जाँच ख़ुद चलाता है; mismatch होने पर संदेश
+`PTX entry declares N parameters, the ABI describes M` होता है। एक `llvm.nvvm.*` builder जो
+किसी non-NVPTX target तक पहुँच जाए, `Error::ForeignIntrinsic` के रूप में fail होता है।
 
 ---
 
@@ -104,8 +107,7 @@ nvdisasm r_64_32.cubin | less                         # the SASS
 run-time error आँकड़ों का नाम लेती है:
 
 ```text
-CUDA kernel 'r_64_32' block [512, 1, 1] (512 threads) exceeds its maxThreadsPerBlock 256
-  (numRegs 96, sharedSizeBytes 4096, localSizeBytes 0)
+CUDA kernel 'r_64_32' block [512, 1, 1] (512 threads) exceeds its maxThreadsPerBlock 256 (numRegs 96, sharedSizeBytes 4096, localSizeBytes 0)
 ```
 
 ---

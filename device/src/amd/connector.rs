@@ -3,11 +3,11 @@
 //! A `PoolQueue` bundles the dispatch state that backs a single KFD compute
 //! queue: the queue itself (ring + doorbell), a kernarg bump arena, the scratch
 //! backing, the compute timeline counter, and linked-plan finalizers. A queue is
-//! published through only while a non-clone [`QueueLease`] owns its lane bit.
+//! published through only while a non-clone `QueueLease` owns its lane bit.
 //! Uncontended acquisition is one atomic compare-exchange; bounded contention
 //! parks instead of co-tenanting a mutable hardware ring.
 //!
-//! [`OwnerCtx`] is logical per-plan state. It owns completion bookkeeping,
+//! `OwnerCtx` is logical per-plan state. It owns completion bookkeeping,
 //! profiling configuration, and replay templates, but not a queue. The whole-
 //! pool drain
 //! (`PoolQueue::drain_all`, reached via `AmdDeviceCore::synchronize_all`) is the

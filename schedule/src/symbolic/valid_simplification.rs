@@ -394,8 +394,6 @@ fn drop_and_clauses(cond: &Arc<UOp>, x: &Arc<UOp>, invalid: &Arc<UOp>) -> Option
 }
 
 /// Pattern matcher that drops irrelevant AND clauses from WHERE-Invalid gates.
-///
-/// pm_drop_and_clauses`.
 pub fn pm_drop_and_clauses() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         Where(cond, x, inv) if UOp::is_invalid_marker(inv)

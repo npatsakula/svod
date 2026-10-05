@@ -1,256 +1,393 @@
 ---
-sidebar_label: Worked Example & Reference
+sidebar_label: Worked example
 ---
 
-# Worked Example & Reference
+# Worked Example: a Row Sum on the CPU
 
----
+Every tree on this page is real output. The program:
 
-## Worked Example: Tracing Through All 22 Stages
-
-Let's trace `c = a + b` (where a, b are [100, 100] tensors) through the pipeline.
-
-### Initial Tensor Graph
-```mermaid
-flowchart TD
-  ADD["ADD"] --> BA["BUFFER(a) : Float32"]
-  ADD --> BB["BUFFER(b) : Float32"]
+```rust
+let data = Array2::from_shape_fn((8, 64), |(r, c)| (r * 64 + c) as f32);
+let x = Tensor::from_ndarray(&data);
+let y = x.sum(1)?;
+y.realize()?;
 ```
 
-### After Stage 1: Early Movement Ops
-(No change—no movement ops in this example)
+captured with `SVOD_PER_STAGE_UOPS=1 SVOD_DUMP_STAGE=` (every post-opt stage) and `RUST_LOG=svod_schedule::rangeify::transforms=debug,svod_schedule::optimizer=debug` under the JSON subscriber for the earlier passes, on the default CPU backend (LLVM, in-process). Node ids are allocation order and will differ between runs; the structure will not.
 
-### After Stage 2: Load Collapse
-(No change—no reductions in this example)
+## Tensor graph
 
-### After Stage 3: Split Ranges
-(No change—no modulo operations)
+`sum(1)` is a tensor-form `REDUCE` over a `PERMUTE`d `RESHAPE` of the flat 512-element buffer, wrapped in `CONTIGUOUS` because the result is an output:
 
-### After Stage 4: Initial Symbolic
-(No change—no simplification needed)
-
-### After Stage 5: Simplify Ranges
-(No change—no adjacent ranges yet)
-
-### After Stage 6: Split Store
-(Not applicable—GPU backend)
-
-### After Stage 7: Apply Opts
-Optimization actions applied:
-- UPCAST j dimension by 4 (vectorization)
-- LOCAL for input buffers (if beneficial)
-
-### After Stage 8: Post-Opt Symbolic
-No changes—symbolic already clean.
-
-### After Stage 9: Expander
-UPCAST expansion is represented directly with STACK/INDEX structure:
-```mermaid
-flowchart TD
-  V["STACK"] --> ADD["ADD"]
-  ADD --> LA["LOAD(a)"]
-  ADD --> LB["LOAD(b)"]
-  LA --> IA["INDEX"]
-  LB --> IB["INDEX"]
-  IA --> BA["BUFFER(a)"]
-  IA --> RG["RANGE(i, Global, 0..100)"]
-  IA --> UN["RANGE(j, Upcast, 0..4)"]
-  IB --> BB["BUFFER(b)"]
-  IB --> RG
-  IB --> UN
+```text
+[16] SINK : Scalar(Void)
+└── [15] CONTIGUOUS : Scalar(Float32) shape=[Const(8)]
+    └── [14] REDUCE(Add, num_axes=1, ranges=[]) : Scalar(Float32) shape=[Const(8)]
+        └── [13] PERMUTE(axes=[1, 0]) : Scalar(Float32) shape=[Const(64), Const(8)]
+            └── [12] RESHAPE : Scalar(Float32) shape=[Const(8), Const(64)]
+                ├── [11] PARAM(slot=0) : Scalar(Float32) shape=[Const(512)]
+                │   └── [0] CONST(Int(512)) : Scalar(WeakInt) shape=[]
+                └── [4] STACK(len=2) : Scalar(WeakInt) shape=[Const(2)]
+                    ├── [2] CONST(Int(8)) : Scalar(WeakInt) shape=[]
+                    └── [3] CONST(Int(64)) : Scalar(WeakInt) shape=[]
 ```
 
-Note: shared ranges and index expressions are deduplicated by hash consing.
+The `STACK` is the reshape's shape payload — shapes are UOps too.
 
-### After Stage 10: Add Local Buffers
-(If LOCAL opt was chosen)
+## After rangeify
 
-### After Stage 11: Remove Reduce
-(No change—no reductions)
+Range assignment gives the output a `Weak` range `U0` (8) and the reduction a `Reduce` range `U1` (64); the movement ops collapse into the index `U0 * 64 + U1` (see the [rangeify page](./rangeify.md) for the tree). The kernel cut turns the `STAGE` into `STORE`/`END`, numbers the buffers as `PARAM`s and renumbers the ranges. The kernel body that enters `apply_pre_optimization`:
 
-### After Stage 12: Add GPU Dims
-```
-[SPECIAL(gidx0)] : WeakInt  // replaces RANGE(i)
-```
-
-### After Stage 13: Add Loads
-(No change—loads already present)
-
-### After Stage 14: Devectorize
-Vector structure after devectorize (shows effect, not exact UOp structure):
-```mermaid
-flowchart TD
-  V["STACK : 4 lanes of Float32"] --> A0["ADD(a[0], b[0])"]
-  V --> A1["ADD(a[1], b[1])"]
-  V --> A2["ADD(a[2], b[2])"]
-  V --> A3["ADD(a[3], b[3])"]
-```
-
-### After Stage 15: Lower Index Dtype
-```
-[SPECIAL(gidx0)] : i32  // concrete type
+```text
+[97] SINK[KERNEL] : Scalar(Void)
+└── [96] END : Scalar(Void) shape=[]
+    ├── [95] STORE : Scalar(Void) shape=[]
+    │   ├── [94] INDEX : Scalar(Float32) shape=[]
+    │   │   ├── [84] PARAM(slot=0) : Scalar(Float32) shape=[Const(8)]
+    │   │   │   └── [2] CONST(Int(8)) : Scalar(WeakInt) shape=[]
+    │   │   └── [89] RANGE(R1, Weak) : Scalar(WeakInt) shape=[]
+    │   │       └── [2] → (see above)
+    │   └── [93] REDUCE(Add, num_axes=0, ranges=[88]) : Scalar(Float32) shape=[]
+    │       ├── [92] INDEX : Scalar(Float32) shape=[]
+    │       │   ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    │       │   │   └── [0] CONST(Int(512)) : Scalar(WeakInt) shape=[]
+    │       │   └── [91] Add : Scalar(WeakInt) shape=[]
+    │       │       ├── [90] Mul : Scalar(WeakInt) shape=[]
+    │       │       │   ├── [89] → (see above)
+    │       │       │   └── [3] CONST(Int(64)) : Scalar(WeakInt) shape=[]
+    │       │       └── [88] RANGE(R0, Reduce) : Scalar(WeakInt) shape=[]
+    │       │           └── [3] → (see above)
+    │       └── [88] → (see above)
+    └── [89] → (see above)
 ```
 
-### After Stage 16: Post-Index Symbolic
-No changes needed.
+Slot 0 is the output (the `STAGE`'s buffer was mapped first), slot 1 the input. The five pre-optimization steps leave this graph untouched: no movement op, no collapsible reduce, no modulo to split, nothing to merge.
 
-### After Stage 17: Pre-Matcher
-(No patterns for standard backends)
+## After the optimizer (`00-initial`)
 
-### After Stage 18: Decompositions
-No decompositions needed—all ops supported.
+The CPU renderer has no locals, so `convert_loop_to_global` leaves `R1` as `Weak`. `hand_coded_optimizations` skips tensor cores, image upcasts, the matvec path and grouped reductions; `apply_unroll` sees a 64-wide reduce (above 32) and applies `UNROLL(0, 4)`; the kernel is already unrolled, so `apply_default_upcast` does nothing; 512 elements are far below the 131072-per-thread threshold, so no `THREAD`. The kernel is named `r_8_16_4` (reduce; extents 8, 16, 4):
 
-### After Stage 19: Final Rewrite
-No changes needed.
-
-### After Stage 20: Add Control Flow
-Dependencies tracked—no issues.
-
-### After Stage 21: Linearize
-Linear instruction sequence (simplified):
-```
-1. PARAM(0)  // Output buffer c
-2. PARAM(1)  // Input buffer a
-3. PARAM(2)  // Input buffer b
-4. RANGE(i, 0..100, Global)  // gidx0
-5. LOAD(a, i*4+0..i*4+3)  // Vector load (vec4)
-6. LOAD(b, i*4+0..i*4+3)  // Vector load (vec4)
-7. ADD(vec_a, vec_b)  // Vector add (vec4)
-8. STORE(c, i*4+0..i*4+3, result)  // Vector store
-9. END(RANGE(i))
-```
-
-Note: UPCAST was consumed by Stage 9 (expander), so there's no separate RANGE(j) loop. Vectorization is implicit in the vec4 operations.
-
-### After Stage 22: Cleanup IF/ENDIF
-No changes needed—no gated stores.
-
-**Result**: Ready for code generation! The LLVM/CUDA/other backend will compile this to actual machine code.
-
----
-
-## Pattern Application Strategy
-
-Each stage uses one of two rewrite strategies:
-
-**Top-down** (default): Process parents before children. Use when transformations create new matchable subterms.
-
-**Bottom-up**: Process children before parents. Use when child state affects parent matching (stages 1, 20).
-
-Both iterate to fixpoint—patterns fire until no more match.
-
----
-
-## Debugging the Pipeline
-
-When a kernel produces wrong results, the bug lives in one of these 22 stages. Every stage logs its UOp tree through `tracing`; `scripts/extract-ir.sh` turns those logs into a readable dump:
-
-```bash
-# See IR after each transformation
-./scripts/extract-ir.sh failing_test -p svod-tensor -o /tmp/ir.txt
-
-# Or dump a single stage straight to stderr (no tracing subscriber needed)
-SVOD_PER_STAGE_UOPS=1 SVOD_DUMP_STAGE=09 cargo test failing_test -- --nocapture
+```text
+[135] SINK[KERNEL] : Scalar(Void)
+└── [131] END : Scalar(Void) shape=[]
+    ├── [130] STORE : Scalar(Void) shape=[]
+    │   ├── [94] INDEX : Scalar(Float32) shape=[]
+    │   │   ├── [84] PARAM(slot=0) : Scalar(Float32) shape=[Const(8)]
+    │   │   │   └── [2] CONST(Int(8)) : Scalar(WeakInt) shape=[]
+    │   │   └── [89] RANGE(R1, Weak) : Scalar(WeakInt) shape=[]
+    │   │       └── [2] → (see above)
+    │   └── [128] REDUCE(Add, num_axes=0, ranges=[118, 117]) : Scalar(Float32) shape=[]
+    │       ├── [122] INDEX : Scalar(Float32) shape=[]
+    │       │   ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    │       │   │   └── [0] CONST(Int(512)) : Scalar(WeakInt) shape=[]
+    │       │   └── [121] Add : Scalar(WeakInt) shape=[]
+    │       │       ├── [90] Mul : Scalar(WeakInt) shape=[]
+    │       │       │   ├── [89] → (see above)
+    │       │       │   └── [3] CONST(Int(64)) : Scalar(WeakInt) shape=[]
+    │       │       └── [120] Add : Scalar(WeakInt) shape=[]
+    │       │           ├── [119] Mul : Scalar(WeakInt) shape=[]
+    │       │           │   ├── [118] RANGE(R0, Reduce) : Scalar(WeakInt) shape=[]
+    │       │           │   │   └── [115] CONST(Int(16)) : Scalar(WeakInt) shape=[]
+    │       │           │   └── [116] CONST(Int(4)) : Scalar(WeakInt) shape=[]
+    │       │           └── [117] RANGE(R2, Unroll) : Scalar(WeakInt) shape=[]
+    │       │               └── [116] → (see above)
+    │       ├── [118] → (see above)
+    │       └── [117] → (see above)
+    └── [89] → (see above)
 ```
 
-### Quick Reference
+`apply_opt` split the 64-wide `R0` into `R0 * 4 + R2` with `R0: Reduce(16)` and `R2: Unroll(4)`, and `pm_flatten_range` listed both on the `REDUCE`. Node count 20.
 
-| Symptom | Likely Stages | What to Check |
-|---------|---------------|---------------|
-| Wrong values in output | 4, 9, 11, 18 | Symbolic simplification, expansion, devectorization |
-| Slow performance | 7, 9, 14, 21 | Optimization, expansion, devectorization, linearization |
-| Crashes/panics | 11, 12 | Reduce, GPU dims |
-| Wrong loop count | 3, 5, 12 | Split ranges, simplify ranges, GPU dims |
-| Missing vectorization | 9, 14 | Expander, devectorizer |
+## `08-post_opt_sym`
 
-### Common Issues
+Only `commutative_canonicalization` fires: the index becomes `(R0*4 + R2) + R1*64` (the tuplize order of the operands). Still 20 nodes.
 
-1. **Stage 3-4**: Range splitting/symbolic may lose constraints
-2. **Stage 9**: Expansion order affects vectorization correctness
-3. **Stage 11**: Accumulator initialization must match reduction identity
-4. **Stage 14**: Hardware width mismatch—check vector fold length
-5. **Stage 18**: Missing decomposition—check supported_ops list for backend
-6. **Stage 21**: Priority bugs cause data races—verify dependencies
+## `09-pre_expand`
 
----
+`R2` is replaced by `RESHAPE(STACK(0,1,2,3), [4])`, every consumer becomes shaped, and `expand_reduce` moves the lane axis into `num_axes`:
 
-## Summary
+```text
+[157] SINK[KERNEL] : Scalar(Void)
+└── [155] END : Scalar(Void) shape=[]
+    ├── [154] STORE : Scalar(Void) shape=[]
+    │   ├── [94] INDEX : Scalar(Float32) shape=[]
+    │   │   ├── [84] PARAM(slot=0) : Scalar(Float32) shape=[Const(8)]
+    │   │   │   └── [2] CONST(Int(8)) : Scalar(WeakInt) shape=[]
+    │   │   └── [89] RANGE(R1, Weak) : Scalar(WeakInt) shape=[]
+    │   │       └── [2] → (see above)
+    │   └── [152] RESHAPE : Scalar(Float32) shape=[Const(1)]
+    │       ├── [151] REDUCE(Add, num_axes=1, ranges=[118]) : Scalar(Float32) shape=[]
+    │       │   ├── [149] INDEX : Scalar(Float32) shape=[Const(4)]
+    │       │   │   ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    │       │   │   │   └── [0] CONST(Int(512)) : Scalar(WeakInt) shape=[]
+    │       │   │   └── [148] Add : Scalar(WeakInt) shape=[Const(4)]
+    │       │   │       ├── [147] Add : Scalar(WeakInt) shape=[Const(4)]
+    │       │   │       │   ├── [119] Mul : Scalar(WeakInt) shape=[]
+    │       │   │       │   │   ├── [118] RANGE(R0, Reduce) : Scalar(WeakInt) shape=[]
+    │       │   │       │   │   │   └── [115] CONST(Int(16)) : Scalar(WeakInt) shape=[]
+    │       │   │       │   │   └── [116] CONST(Int(4)) : Scalar(WeakInt) shape=[]
+    │       │   │       │   └── [146] STACK(len=4) : Scalar(WeakInt) shape=[Const(4)]
+    │       │   │       │       ├── [29] CONST(Int(0)) : Scalar(WeakInt) shape=[]
+    │       │   │       │       ├── [28] CONST(Int(1)) : Scalar(WeakInt) shape=[]
+    │       │   │       │       ├── [144] CONST(Int(2)) : Scalar(WeakInt) shape=[]
+    │       │   │       │       └── [145] CONST(Int(3)) : Scalar(WeakInt) shape=[]
+    │       │   │       └── [90] Mul : Scalar(WeakInt) shape=[]
+    │       │   │           ├── [89] → (see above)
+    │       │   │           └── [3] CONST(Int(64)) : Scalar(WeakInt) shape=[]
+    │       │   └── [118] → (see above)
+    │       └── [28] → (see above)
+    └── [89] → (see above)
+```
 
-The 22-stage pipeline transforms tensor expressions into machine code through systematic refinement:
+The `RESHAPE` to `[1]` is the placeholder `expand_reduce` leaves for the reduced lane axis; the devectorizer removes it.
 
-1. **Stages 1-7**: Make iteration explicit, optimize ranges
-2. **Stages 8-10**: Expand optimization primitives
-3. **Stages 11-15**: Lower to hardware-specific operations
-4. **Stages 16-22**: Serialize to executable instructions
+## `10-pm_reduce`
 
-Each stage has a single responsibility. Each builds on the last. The result: high-level tensor code runs at near-optimal speed on diverse hardware.
+`reduce_to_acc` builds the accumulator. `horizontal_reduce` folds the four lanes first (`((a0 + a1) + a2) + a3`, each lane an `INDEX` into the shaped index expression), then the loop over `R0` accumulates into a register buffer:
 
----
+```text
+[193] SINK[KERNEL] : Scalar(Void)
+└── [192] END : Scalar(Void) shape=[]
+    ├── [191] STORE : Scalar(Void) shape=[]
+    │   ├── [94] INDEX : Scalar(Float32) shape=[]          ← PARAM(slot=0)[R1]
+    │   └── [189] AFTER : Scalar(Float32) shape=[Const(1)]
+    │       ├── [165] BUFFER(slot=0, addrspace=Some(Reg)) : Scalar(Float32) shape=[Const(1)]
+    │       │   └── [28] CONST(Int(1)) : Scalar(WeakInt) shape=[]
+    │       └── [188] END : Scalar(Void) shape=[Const(1)]
+    │           ├── [187] STORE : Scalar(Void) shape=[Const(1)]
+    │           │   ├── [165] → (see above)
+    │           │   └── [186] Add : Scalar(Float32) shape=[Const(1)]
+    │           │       ├── [169] AFTER : Scalar(Float32) shape=[Const(1)]
+    │           │       │   ├── [165] → (see above)
+    │           │       │   ├── [168] STORE : Scalar(Void) shape=[Const(1)]
+    │           │       │   │   ├── [167] AFTER : Scalar(Float32) shape=[Const(1)]
+    │           │       │   │   │   ├── [165] → (see above)
+    │           │       │   │   │   └── [89] → (see above)          ← init inside the R1 loop
+    │           │       │   │   └── [166] CONST(Float(0.0)) : Scalar(Float32) shape=[]
+    │           │       │   └── [118] RANGE(R0, Reduce) : Scalar(WeakInt) shape=[]
+    │           │       │       └── [115] CONST(Int(16)) : Scalar(WeakInt) shape=[]
+    │           │       └── [185] Add : Scalar(Float32) shape=[]
+    │           │           ├── [182] Add : Scalar(Float32) shape=[]
+    │           │           │   ├── [179] Add : Scalar(Float32) shape=[]
+    │           │           │   │   ├── [176] INDEX : Scalar(Float32) shape=[]
+    │           │           │   │   │   ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    │           │           │   │   │   └── [175] INDEX : Scalar(WeakInt) shape=[]
+    │           │           │   │   │       ├── [148] Add : Scalar(WeakInt) shape=[Const(4)]   ← shaped index
+    │           │           │   │   │       └── [29] CONST(Int(0))                             ← lane 0
+    │           │           │   │   └── [178] INDEX ... lane 1
+    │           │           │   └── [181] INDEX ... lane 2
+    │           │           └── [184] INDEX ... lane 3
+    │           └── [118] → (see above)
+    └── [89] → (see above)
+```
 
-## Tinygrad vs Svod: Architectural Differences
+(Trimmed: the four lanes are identical except for the constant lane index.) Note `AFTER(acc, [R1])` on the init store: `input_ranges` places the zeroing inside the row loop. Stages `11` and `12` change nothing — no local stage, no GPU ranges.
 
-This chapter describes the "ideal" 22-stage pipeline based on Tinygrad's implementation. Svod now closely follows this design with minimal differences.
+## `13-pm_add_loads` and `14-devectorize`
 
-### Remaining Architectural Differences
+`pm_expand_broadcast` makes the scalar terms of the shaped index explicit (`EXPAND(RESHAPE(R0*4, [1]), [4])`, same for `R1*64`) and `pm_add_loads` wraps the register reads and the four input lanes in `LOAD` (55 nodes). `devectorize` then scalarizes everything: the shaped index collapses into four scalar `Add`s and the per-lane `STORE`s are grouped. After `15-early_symbolic` the lanes read as `LOAD(INDEX(PARAM(1), (R0*4 + R1*64) + k))`:
 
-| Stage | Tinygrad | Svod | Notes |
-|--------|-----------|-------|--------|
-| 17: Pre-Matcher | Backend hooks sit on one `Renderer` class | Split across two traits: `svod_codegen::traits::Renderer` renders, `svod_device::device::Renderer` carries `decompositor()`, `extra_matcher()`, `pre_isel_matcher()`, `isel_matcher()` | Same hooks, different ownership |
+```text
+[269] LOAD : Scalar(Float32) shape=[]
+└── [268] INDEX : Scalar(Float32) shape=[]
+    ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    └── [253] Add : Scalar(WeakInt) shape=[]
+        ├── [119] Mul : Scalar(WeakInt) shape=[]      ← R0 * 4
+        └── [90] Mul : Scalar(WeakInt) shape=[]       ← R1 * 64
+[305] LOAD : Scalar(Float32) shape=[]
+└── [304] INDEX : Scalar(Float32) shape=[]
+    ├── [87] → (see above)
+    └── [303] Add : Scalar(WeakInt) shape=[]
+        ├── [253] → (see above)
+        └── [28] CONST(Int(1))
+```
 
-### Aligned Stages (Previously Different)
+`sym` put the index into the `base + const` form the next stage needs (49 nodes).
 
-The following stages were aligned with Tinygrad as of this implementation:
+## `16-memory_coalescing`
 
-| Stage | What Changed |
-|-------|--------------|
-| 15: Index Dtype Lowering | Svod now has `pm_lower_index_dtype()` with full pattern coverage: Binary ops, CONST/VCONST, WHERE, STACK, SPECIAL, PARAM, RANGE, double weak CAST |
-| 18: Decompositions | Added: `fast_division_patterns()`, `pm_div_to_shr()`, `pm_fdiv_to_mul()`, `pm_comparison_negations()`, De Morgan's law |
-| 19: Final Rewrite | `renderer.extra_matcher()` and `pm_split_ends()` are summed into the schedule pipeline's final rewrite instead of running in codegen |
+The four loads share base `R0*4 + R1*64`, offsets 0..3, and the base is divisible by 4, so they become one 4-wide access; the lanes are `INDEX(load, k)`:
 
-### Tinygrad-Only Patterns
+```text
+[341] Add : Scalar(Float32) shape=[]
+├── [340] Add : Scalar(Float32) shape=[]
+│   ├── [339] Add : Scalar(Float32) shape=[]
+│   │   ├── [335] INDEX : Scalar(Float32) shape=[]
+│   │   │   ├── [334] LOAD : Scalar(Float32) shape=[Const(4)]
+│   │   │   │   └── [333] SHRINK : Scalar(Float32) shape=[Const(4)]
+│   │   │   │       ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+│   │   │   │       ├── [253] Add : Scalar(WeakInt) shape=[]          ← R0*4 + R1*64
+│   │   │   │       └── [116] CONST(Int(4))                            ← width
+│   │   │   └── [29] CONST(Int(0))
+│   │   └── [336] INDEX ... [334], CONST(1)
+│   └── [337] INDEX ... [334], CONST(2)
+└── [338] INDEX ... [334], CONST(3)
+```
 
-Svod intentionally does not implement these Tinygrad-specific patterns:
+44 nodes. `17-bottom_up_ew_image` and `16-extra_symbolic` are no-ops here.
 
-| Pattern | Purpose | Why Svod Doesn't Need It |
-|----------|-----------|-----------------------------|
-| `pm_regalloc_rewrite` | Linear-scan register allocation for ISA backends | Svod emits LLVM IR / source, so register allocation belongs to the backend compiler |
+## `17-pm_lower_index_dtype` and `18-final_symbolic`
 
-### Svod Enhancements
+Every `WeakInt` commits to `Int32` — the ranges, the constants, the `PARAM` sizes:
 
-Svod has some patterns/enhancements not in Tinygrad:
+```text
+[386] RANGE(R1, Weak) : Scalar(Int32) shape=[]
+└── [351] CONST(Int(8)) : Scalar(Int32) shape=[]
+[377] RANGE(R0, Reduce) : Scalar(Int32) shape=[]
+└── [373] CONST(Int(16)) : Scalar(Int32) shape=[]
+[391] Add : Scalar(Int32) shape=[]
+├── [390] Mul : Scalar(Int32) shape=[]
+│   ├── [377] → (see above)
+│   └── [366] CONST(Int(4)) : Scalar(Int32) shape=[]
+└── [389] Mul : Scalar(Int32) shape=[]
+    ├── [386] → (see above)
+    └── [381] CONST(Int(64)) : Scalar(Int32) shape=[]
+```
 
-| Enhancement | Location | Purpose |
-|-------------|---------|---------|
-| Bool storage via `uint8` | `bool_storage_patterns()` in `devectorize.rs` | LLVM's `i1` can carry garbage in the upper bits, so bool LOAD/STORE go through `uint8` |
-| Wide-float demotion | `demote_unsupported_floats()` in `late/dtype.rs` | Renderers without a wide float (Metal, WebGPU) compute internal f64 in f32 |
+`18-final_symbolic`, `19-cast_float_alu`, `19b` and `19c` change nothing: no transcendental, no emulated dtype.
 
----
+## `19d-late_decompositions` to `20-final_rewrite`
 
-## Glossary
+The late rewrites turn `R1 * 64` into `R1 << 6` (`pm_mul_to_shl`), `R0 * 4` into `R0 << 2`, and `(R0 << 2) + (R1 << 6)` into an integer `MulAcc` (`pm_shl_add_to_mulacc`). Gate movement has nothing to move (no `Invalid` anywhere), and the final rewrite's `pm_split_ends` has nothing to split (every `END` already closes one range). The final graph, 43 nodes:
 
-| Term | Simple Definition | Example |
-|------|------------------|---------|
-| **Accumulator** | Variable holding running total | `acc = acc + value` (in reduction) |
-| **Axis** | One dimension of a tensor | Shape [100, 200] has 2 axes |
-| **AxisType** | How a loop executes | Global=parallel, Reduce=accumulate |
-| **Buffer** | Allocated memory holding data | A tensor's data lives in a buffer |
-| **Bufferize** | Store result in memory instead of computing on-demand | Materialize intermediate value |
-| **Devectorize** | Split vectors to match hardware | `vec8 → vec4, vec4` |
-| **Divmod** | Division and remainder operations | `x // 7, x % 7` |
-| **Fixpoint** | When applying patterns no longer changes anything | Patterns fire until fixpoint |
-| **STACK** | Collect lanes into one shaped value (Tinygrad's VECTORIZE) | `STACK(a, b, c, d)` |
-| **Hash consing** | Reuse identical expressions | `ADD(x, 0) + ADD(x, 0)` shares memory |
-| **WeakInt** | Abstract integer type for indices, lowered at Stage 15 | i32 or i64, depending on the proven bounds |
-| **Load** | Read from memory | `value = arr[i]` |
-| **Pattern** | Find-and-replace rule for code | `ADD(x, 0) → x` |
-| **Predicated store** | Write to memory conditionally | Write if valid else skip |
-| **Range** | Loop iteration specification | `for i in 0..100` |
-| **Reduction** | Combine many values into one | Sum, max, min |
-| **Store** | Write to memory | `arr[i] = value` |
-| **Symbolic** | Simplify using algebra rules | `(x/4)*4 → x` (when `x%4=0`) |
-| **Tensor core** | Hardware for fast matrix multiply | NVIDIA, AMD, Apple Metal, Intel Xe |
-| **Topological sort** | Order nodes respecting dependencies | A before B if B uses A's result |
-| **UNROLL** | Axis type marking a loop to be unrolled | `RANGE(0..4, Unroll)` |
-| **UPCAST** | Axis type marking intent to vectorize | `RANGE(0..4, Upcast)` |
-| **Vectorize** | Process multiple values together | SIMD: add 4 numbers at once |
-| **WHERE** | Conditional selection | `WHERE(cond, x, y) = x if cond else y` |
+```text
+[455] SINK[KERNEL] : Scalar(Void)
+└── [454] END : Scalar(Void) shape=[]
+    ├── [453] STORE : Scalar(Void) shape=[]
+    │   ├── [428] INDEX : Scalar(Float32) shape=[]
+    │   │   ├── [353] PARAM(slot=0) : Scalar(Float32) shape=[Const(8)]
+    │   │   │   └── [351] CONST(Int(8)) : Scalar(Int32) shape=[]
+    │   │   └── [386] RANGE(R1, Weak) : Scalar(Int32) shape=[]
+    │   │       └── [351] → (see above)
+    │   └── [452] LOAD : Scalar(Float32) shape=[]
+    │       └── [451] INDEX : Scalar(Float32) shape=[]
+    │           ├── [450] AFTER : Scalar(Float32) shape=[Const(1)]
+    │           │   ├── [356] BUFFER(slot=0, addrspace=Some(Reg)) : Scalar(Float32) shape=[Const(1)]
+    │           │   │   └── [354] CONST(Int(1)) : Scalar(Int32) shape=[]
+    │           │   └── [449] END : Scalar(Void) shape=[]
+    │           │       ├── [448] STORE : Scalar(Void) shape=[]
+    │           │       │   ├── [363] INDEX : Scalar(Float32) shape=[]
+    │           │       │   │   ├── [356] → (see above)
+    │           │       │   │   └── [361] CONST(Int(0)) : Scalar(Int32) shape=[]
+    │           │       │   └── [447] Add : Scalar(Float32) shape=[]
+    │           │       │       ├── [418] LOAD : Scalar(Float32) shape=[]
+    │           │       │       │   └── [417] INDEX : Scalar(Float32) shape=[]
+    │           │       │       │       ├── [415] AFTER : Scalar(Float32) shape=[Const(1)]
+    │           │       │       │       │   ├── [356] → (see above)
+    │           │       │       │       │   ├── [413] STORE : Scalar(Void) shape=[]
+    │           │       │       │       │   │   ├── [412] INDEX : Scalar(Float32) shape=[]
+    │           │       │       │       │   │   │   ├── [410] AFTER : Scalar(Float32) shape=[Const(1)]
+    │           │       │       │       │   │   │   │   ├── [356] → (see above)
+    │           │       │       │       │   │   │   │   └── [386] → (see above)
+    │           │       │       │       │   │   │   └── [361] → (see above)
+    │           │       │       │       │   │   └── [166] CONST(Float(0.0)) : Scalar(Float32) shape=[]
+    │           │       │       │       │   └── [377] RANGE(R0, Reduce) : Scalar(Int32) shape=[]
+    │           │       │       │       │       └── [373] CONST(Int(16)) : Scalar(Int32) shape=[]
+    │           │       │       │       └── [361] → (see above)
+    │           │       │       └── [446] Add : Scalar(Float32) shape=[]
+    │           │       │           ├── [445] Add : Scalar(Float32) shape=[]
+    │           │       │           │   ├── [444] Add : Scalar(Float32) shape=[]
+    │           │       │           │   │   ├── [443] INDEX : Scalar(Float32) shape=[]
+    │           │       │           │   │   │   ├── [439] LOAD : Scalar(Float32) shape=[Const(4)]
+    │           │       │           │   │   │   │   └── [438] SHRINK : Scalar(Float32) shape=[Const(4)]
+    │           │       │           │   │   │   │       ├── [359] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+    │           │       │           │   │   │   │       │   └── [357] CONST(Int(512)) : Scalar(Int32) shape=[]
+    │           │       │           │   │   │   │       ├── [437] MulAcc : Scalar(Int32) shape=[]
+    │           │       │           │   │   │   │       │   ├── [377] → (see above)
+    │           │       │           │   │   │   │       │   ├── [366] CONST(Int(4)) : Scalar(Int32) shape=[]
+    │           │       │           │   │   │   │       │   └── [435] Shl : Scalar(Int32) shape=[]
+    │           │       │           │   │   │   │       │       ├── [386] → (see above)
+    │           │       │           │   │   │   │       │       └── [434] CONST(Int(6)) : Scalar(Int32) shape=[]
+    │           │       │           │   │   │   │       └── [366] → (see above)
+    │           │       │           │   │   │   └── [361] → (see above)
+    │           │       │           │   │   └── [442] INDEX : Scalar(Float32) shape=[]
+    │           │       │           │   │       ├── [439] → (see above)
+    │           │       │           │   │       └── [354] → (see above)
+    │           │       │           │   └── [441] INDEX : Scalar(Float32) shape=[]
+    │           │       │           │       ├── [439] → (see above)
+    │           │       │           │       └── [399] CONST(Int(2)) : Scalar(Int32) shape=[]
+    │           │       │           └── [440] INDEX : Scalar(Float32) shape=[]
+    │           │       │               ├── [439] → (see above)
+    │           │       │               └── [395] CONST(Int(3)) : Scalar(Int32) shape=[]
+    │           │       └── [377] → (see above)
+    │           └── [361] → (see above)
+    └── [386] → (see above)
+```
+
+Reading it bottom-up: `BUFFER(Reg)` is the accumulator; `STORE([412], 0.0)` zeroes it after `AFTER(acc, R1)`, i.e. once per row; the loop body `STORE([363], LOAD(acc) + lanes)` is closed by `END(.., R0)`; the final `LOAD` reads the accumulator after that `END` and is stored to the output at `R1`; the outer `END` closes `R1`.
+
+## Linearize and render
+
+`linearize` emits 43 instructions in `(run_count, priority, slot, tuplize)` order: the two `PARAM`s (each preceded by its size constant), the register `BUFFER` and its `INDEX` first (`run_count` 1, priorities −20/−18), then `RANGE(R1)`, the zero store, `RANGE(R0)`, the body, `END(R0)`, the output store, `END(R1)`, `SINK`. The CPU renderer turns that list into:
+
+```llvm
+define void @r_8_16_4(ptr noalias align 32 %data0, ptr noalias align 32 %data1) #0 {
+entry:
+  %reg0 = alloca [1 x float]
+  %v1 = getelementptr inbounds float, ptr %reg0, i32 0
+  br label %loop_entry_1
+loop_entry_1:
+  br label %loop_latch_1
+loop_latch_1:
+  %r1 = phi i32 [ 0, %loop_entry_1 ], [ %r1phi, %loop_footer_1 ]
+  %r1phi = add i32 %r1, 1
+  %r1cmp = icmp ult i32 %r1, 8
+  br i1 %r1cmp, label %loop_body_1, label %loop_exit_1
+loop_body_1:
+  %v3 = getelementptr inbounds float, ptr %reg0, i32 0
+  %v4 = shl i32 %r1, 6
+  store float 0x0000000000000000, ptr %v3
+  br label %loop_entry_0
+loop_entry_0:
+  br label %loop_latch_0
+loop_latch_0:
+  %r0 = phi i32 [ 0, %loop_entry_0 ], [ %r0phi, %loop_footer_0 ]
+  %r0phi = add i32 %r0, 1
+  %r0cmp = icmp ult i32 %r0, 16
+  br i1 %r0cmp, label %loop_body_0, label %loop_exit_0
+loop_body_0:
+  %v7 = getelementptr inbounds float, ptr %reg0, i32 0
+  %v8 = load float, ptr %v7
+  %v9.mul = mul i32 %r0, 4
+  %v9 = add i32 %v9.mul, %v4
+  %v10 = getelementptr inbounds float, ptr %data1, i32 %v9
+  %v11 = load <4 x float>, ptr %v10
+  %v12 = extractelement <4 x float> %v11, i32 0
+  %v13 = extractelement <4 x float> %v11, i32 1
+  %v14 = extractelement <4 x float> %v11, i32 2
+  %v15 = extractelement <4 x float> %v11, i32 3
+  %v16 = fadd nsz arcp contract afn float %v12, %v13
+  %v17 = fadd nsz arcp contract afn float %v16, %v14
+  %v18 = fadd nsz arcp contract afn float %v17, %v15
+  %v19 = fadd nsz arcp contract afn float %v8, %v18
+  store float %v19, ptr %v1
+  br label %loop_footer_0
+loop_footer_0:
+  br label %loop_latch_0
+loop_exit_0:
+  %v23 = getelementptr inbounds float, ptr %reg0, i32 0
+  %v24 = load float, ptr %v23
+  %v25 = getelementptr inbounds float, ptr %data0, i32 %r1
+  store float %v24, ptr %v25
+  br label %loop_footer_1
+loop_footer_1:
+  br label %loop_latch_1
+loop_exit_1:
+  ret void
+}
+```
+
+The `SHRINK` of width 4 became `load <4 x float>`, the integer `MulAcc` became `mul` + `add`, the register buffer an `alloca`; LLVM's own optimizer later keeps the accumulator in a register. The result is `[2016, 6112, 10208, 14304, 18400, 22496, 26592, 30688]`.
+
+## Reading a dump
+
+| Symptom | Stages to look at first |
+|---------|-------------------------|
+| wrong values | `08` (symbolic), `09` (expansion), `10` (accumulator init/identity), `19d` (decompositions) |
+| wrong loop count or missing loop | pre-opt split/simplify ranges, `12` (gpudims), `10` (`END` merging) |
+| scalar loads where vector loads were expected | `15`/`16`: the index must be `base + const` with a divisible base, same buffer, same validity, no gate |
+| `WeakInt` in the final graph | `17-pm_lower_index_dtype` (`SVOD_SPEC` catches it at `18`) |
+| `Invalid` in the final graph | `19e` gate movement, `20` `pm_remove_invalid` (debug assertion) |
+| a backend rejects an op | `19b`/`19d` capability table (`supported_ops`) |
+
+`node_count` per stage is the cheapest signal: a stage that doubles the count on a small kernel is the one to dump.

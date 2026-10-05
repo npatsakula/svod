@@ -1,146 +1,82 @@
 ---
-sidebar_label: Phase 2 — Expander
+sidebar_label: Expander और reductions
 ---
 
-# Phase 2: Expander
+# Expander और Reduction Lowering (स्टेज 08–11)
 
-**गोल**: ऑप्टिमाइज़ेशन primitives (UPCAST/UNROLL ranges) को एक्सप्लिसिट shaped ऑपरेशन में बदलें।
+पहले चार post-optimization स्टेज ऑप्टिमाइज़र का आउटपुट लेते हैं — एक kernel जिसके `RANGE`s अब `Upcast`/`Unroll`/`Global`/`Local`/`GroupReduce` axis types रखते हैं — और उस इरादे को ठोस बनाते हैं: unrolled ranges आकार वाले constants बन जाते हैं, `REDUCE` एक accumulator लूप बन जाता है, local `STAGE`s local buffers बन जाते हैं। ये सभी `apply_post_optimization_configured_with_capture` (`optimizer/mod.rs`) के अंदर चलते हैं।
 
----
+## 08 — post-opt symbolic
 
-## Stage 8: Post-Opt Symbolic
+`POST_OPT_SYM = sym() + pm_move_where_on_load() + pm_flatten_range() + pm_reduce_unparented()`, एक top-down fixpoint। सोर्स में क्रम मायने रखता है: बाद वाले समूह वह उपभोग करते हैं जो पहले वाले बनाते हैं।
 
-> **स्टेज एक नज़र में**
->
-> **गोल**: ऑप्टिमाइज़ेशन के बाद symbolic सिम्प्लीफ़िकेशन
-> **मुख्य Patterns**: WHERE मूवमेंट, constant folding
-> **प्रभाव**: बेहतर load combining और वेक्टराइज़ेशन सक्षम करता है
+- `sym()` पूरा tier-3 simplifier है ([बीजगणितीय सरलीकरण](../optimizations/algebraic-simplification.md))।
+- `pm_move_where_on_load` (`symbolic/patterns.rs`) `WHERE(cond, INDEX(buf, idx), 0)` को `INDEX(buf, WHERE(cond', idx, Invalid))` में बदलता है। शर्त को `AND` पर विभाजित किया जाता है; कोई clause index में तभी जाता है जब उसके सभी ranges `INDEX` के scope में हों और उसकी अपनी कोई `INDEX` निर्भरता न हो; बाकी clauses एक बाहरी `WHERE` में रहते हैं। उल्टे रूप `WHERE(cond, 0, INDEX(..))` को negated शर्त के साथ संभाला जाता है। Validity अब index एक्सप्रेशन के अंदर चलती है, जहाँ devectorizer और `indexing_simplify` उसे देख सकते हैं; यह LOAD/STORE `gate` केवल `19e` पर बनती है।
+- `pm_flatten_range` `END`/`REDUCE` की range सूचियाँ फिर से बनाता है।
+- `pm_reduce_unparented` उन reduce ranges को हटाता है जिन्हें body संदर्भित नहीं करती: `Add` extent से गुणा करता है, `Mul` extent की घात लेता है, `Max` बस range हटा देता है (कोई `Min` शाखा नहीं है; `Min` reductions का मिलान नहीं होता)।
 
-**यह क्या करता है**: ऑप्टिमाइज़ेशन के बाद symbolic सिम्प्लीफ़िकेशन, साथ में WHERE मूवमेंट।
+## 09 — expander (`pre_expand`)
 
-**यह क्यों ज़रूरी है**: WHERE ऑपरेशन `if` स्टेटमेंट जैसे हैं। यह स्टेज `if` चेक को indexed रीड के इर्द-गिर्द से हटाकर ख़ुद index एक्सप्रेशन में ले जाता है। जब कंडीशन false हो, हार्डवेयर loading स्किप कर सकता है — मेमोरी बैंडविड्थ बचती है।
+`RangeMap` context (`expand.rs`) के साथ `expander2() + pm_flatten_range() + mop_cleanup_patterns()`। `build_range_map` हर `Upcast`/`Unroll` `RANGE` को toposort क्रम में एक coordinate स्थान देता है; map की लंबाई उन आकार वाले मानों की rank है जो यह स्टेज बनाता है।
 
-**Pattern**: `sym + pm_move_where_on_load + pm_flatten_range + pm_reduce_unparented` (`POST_OPT_SYM` matcher)
+तीन नियम, सोर्स क्रम में:
+
+| नियम | प्रभाव |
+|------|--------|
+| `Reduce { .. }` → `expand_reduce` | लूप-रूप वाला `REDUCE` जिसकी range सूची में आकार वाली non-`RANGE` प्रविष्टियाँ हों, उन प्रविष्टियों के axes (extent > 1) को आगे के *क्षैतिज* axes में बदल देता है: source को permute किया जाता है ताकि वे पहले आएँ और `num_axes` उन्हें गिनता है; परिणाम को size-1 placeholders बनाए रखने के लिए reshape किया जाता है। |
+| `Range { axis_type: Upcast \| Unroll }` → `expand_range` | Range `RESHAPE(STACK(CONST(0), ..., CONST(end-1)), shape)` बन जाता है, जहाँ `shape` में range के अपने coordinate को छोड़कर सब 1 हैं। Range का हर उपभोक्ता broadcasting से आकार वाला बन जाता है; अभी कुछ भी दोहराया नहीं जाता। |
+| `Wmma { metadata.upcast_axes: Some(..) }` → `expand_wmma` | `contract_axis` A/B upcast coordinates को अंत में ले जाता है और उन्हें fragment operands में समतल करता है; `unroll_axis` आउटपुट पर C coordinates वापस लाता है। Metadata का `upcast_axes` साफ़ कर दिया जाता है। |
+
+`mop_cleanup_patterns` (`devectorize.rs`) Tinygrad का `mop_cleanup` है: नेस्टेड `RESHAPE`s को मिलाना, identity `RESHAPE`/`PERMUTE` हटाना, `PERMUTE` शृंखलाओं को मिलाना, `STACK(INDEX(b,0), INDEX(b,1), ..)` को वापस `b` में समेटना, `INDEX(STACK(..), const)` को lane में fold करना, और indices scalar होने पर `INDEX(INDEX(b, i), j)` को `INDEX(b, i, j)` में जोड़ना। यहाँ कोई symbolic matcher नहीं चलता।
+
+उदाहरण में reduce range `R2` (`Unroll`, extent 4) गायब हो जाता है और index आकार वाला बन जाता है:
 
 ```text
-// Before: WHERE guards an indexed read
-WHERE(cond, INDEX(buf, idx), 0)
-
-// After: validity moved into INDEX
-INDEX(buf, WHERE(cond, idx, Invalid))
+[151] REDUCE(Add, num_axes=1, ranges=[118]) : Scalar(Float32) shape=[]
+├── [149] INDEX : Scalar(Float32) shape=[Const(4)]
+│   ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+│   └── [148] Add : Scalar(WeakInt) shape=[Const(4)]
+│       ├── [147] Add : Scalar(WeakInt) shape=[Const(4)]
+│       │   ├── [119] Mul : Scalar(WeakInt) shape=[]          ← R0 * 4
+│       │   └── [146] STACK(len=4) : Scalar(WeakInt) shape=[Const(4)]
+│       └── [90] Mul : Scalar(WeakInt) shape=[]              ← R1 * 64
+└── [118] RANGE(R0, Reduce)
 ```
 
-Validity को INDEX में मूव करने से बेहतर load combining और वेक्टराइज़ेशन मिलता है।
+`expand_reduce` पहले ही 4-चौड़े lane axis को `num_axes=1` में बदल चुका है, इसलिए lanes पर reduction क्षैतिज है और बचा हुआ लूप केवल `R0` पर है।
 
-**नोट**: यह pattern तभी मैच होता है जब alternative वैल्यू `0` हो; एक दूसरा arm उलटे रूप `WHERE(cond, 0, INDEX(...))` को negated कंडीशन के साथ हैंडल करता है। ट्रांसफ़ॉर्मेशन में कॉम्प्लेक्स clause एनालिसिस होता है: duplicate डिटेक्शन, range डिपेंडेंसी चेक, और data-dependent load वेरिफ़िकेशन।
+:::tip[STACK ही एकमात्र vector op है]
+आकार वाला मान lanes का एक `STACK` होता है (संभवतः नेस्टेड, संभवतः किसी `RESHAPE` के पीछे)। `INDEX(STACK(..), c)` उसी op से lane चुनता है जो buffer को address करता है। कोई vectorize/contract op जोड़ी नहीं है, और `Upcast`/`Unroll` `AxisType`s हैं, ops नहीं।
+:::
 
-**नोट**: Svod validity को index एक्सप्रेशन के अंदर `WHERE(cond, idx, Invalid)` के रूप में रखता है। यह बहुत बाद में, `pm_move_gates_from_index` (`late/gater.rs`) में जाकर LOAD/STORE का `gate` फ़ील्ड बनता है; ख़ुद INDEX में कोई gate फ़ील्ड नहीं है।
+## 10 — reduction lowering (`pm_reduce`)
 
-**Svod**: `pm_move_where_on_load()` in `symbolic/patterns.rs`
+`ReduceContext` के साथ `movement_cleanup_patterns() + pm_reduce_local()`। `movement_cleanup_patterns` में `mop_cleanup_patterns` के साथ दो केवल-devectorizer नियम हैं (shapes मेल खाने पर `RESHAPE(STACK([x]))` → `x`; केवल आगे के 1-dims जोड़ने वाला `RESHAPE` → हर जोड़े गए dim के लिए एक `STACK([..])` wrapper)।
 
----
+`pm_reduce_local` (`devectorize.rs`) क्रम से इन्हें जोड़ता है:
 
-## Stage 9: Expander
+1. **`pm_wmma_add`** — `WMMA(a, b, c) + add` → `WMMA(a, b, c + add)`, उस `PERMUTE` और `PERMUTE(RESHAPE(..))` wrapper के पार भी जो `expand_wmma` ने आउटपुट पर छोड़ा था। dtype मेल न खाने पर `try_add` assert करने के बजाय मना कर देता है।
+2. **`pm_group_for_reduce`** (`expand.rs`) — `GroupReduce` ranges वाला `REDUCE` यह बन जाता है: अन्य ranges पर आंशिक `REDUCE` → scope में मौजूद `Local` ranges और group ranges के साथ आंशिक का `STAGE` (`BufferizeOpts::local_for_axis`) → locals और नए `Reduce` लूपों (`axis_id.group_reduce_loop()`) के साथ उस stage का `INDEX` → उन लूपों पर अंतिम `REDUCE`।
+3. **`reduce_to_acc`** — ranges वाला `REDUCE`। यदि `num_axes > 0` है तो lanes को पहले row-major क्रम में बाएँ से दाएँ fold किया जाता है (`horizontal_reduce`)। फिर:
 
-> **स्टेज एक नज़र में**
->
-> **गोल**: UPCAST और UNROLL ranges को shaped STACK coordinates में एक्सपैंड करें
-> **मुख्य कॉन्सेप्ट**: range axis types, STACK, INDEX, pattern ऑर्डर
-> **प्रभाव**: वेक्टराइज़ेशन एक्सप्लिसिट बनाता है और हार्डवेयर के लिए तैयार करता है
+   ```text
+   acc        = BUFFER(slot, AddrSpace::Reg)                       // placeholder_like(red)
+   acc_init   = STORE(AFTER(acc, input_ranges), identity)           // 0 for Add, 1 for Mul, dtype min/max for Max/Min
+   acc_loop   = AFTER(acc, [acc_init, reduce_ranges..])
+   body       = op(acc_loop, horizontal_inp)                        // Add/Mul/Max; float Min is -(max(-a, -b))
+   store_end  = END(STORE(acc, body), reduce_ranges)   tag=TAG_MERGEABLE
+   result     = AFTER(acc, [store_end])
+   ```
 
-**यह क्या करता है**: UPCAST/UNROLL range क्लासिफ़िकेशन को shaped coordinates में ट्रांसफ़ॉर्म करता है।
+   `input_ranges` वे ranges हैं जो input पर scope में हैं और न तो reduce हुए हैं न पहले से बंद हैं, इसलिए init घेरने वाले लूपों के अंदर आता है। कोई लूप संरचना नहीं है: `END` reduce ranges को बंद करता है और `AFTER` शृंखला डेटा निर्भरता है।
+4. **`expand_horizontal_reduce`** — बिना ranges वाला `REDUCE` केवल lane fold है।
+5. **END विलय** — `SINK` पर, `merge_reduce_ends` `TAG_MERGEABLE` `END`s को उनके reduce-range समूह और nesting context से समूहित करता है और हर समूह को `END(GROUP(computations), ranges)` से बदलता है; अलग nesting गहराई वाले समूहों को नए axis ids वाले cloned `RANGE`s मिलते हैं ताकि हर range ठीक एक `END` से बंद हो।
+6. **`clean_up_group_sink`** — एकल-source `GROUP`s खुल जाते हैं; किसी `SINK` या `GROUP` के `NOOP`/`STACK`/`SINK`/`GROUP` sources समतल कर दिए जाते हैं।
 
-**यह क्यों ज़रूरी है**: UPCAST और UNROLL इंटेंट मार्क करते हैं — हम क्या करना चाहते हैं। यह स्टेज उस इंटेंट को एक्सप्लिसिट बनाता है ताकि हार्डवेयर वाकई कर सके।
+Floats पर `Min` को `Max` के ज़रिए lower किया जाता है (`-(max(-a, -b))`) ताकि NaN वैसा ही व्यवहार करे जैसा max reduce में; integers पर यह `WHERE(a < b, a, b)` है।
 
-**Pattern**: `expander2 + pm_flatten_range + mop_cleanup_patterns` (`pre_expand()` एंट्री पॉइंट)
+## 11 — local buffers
 
-नोट: `pre_expand` के अंदर कोई symbolic matcher नहीं चलता। `sym` Stage 8 पर चल चुका है, और `symbolic_simple` Stage 13 व 14 पर दोबारा चलता है।
+`pm_add_local_buffers = { Stage => add_local_buffer } + movement_op_patterns` (`optimizer/mod.rs`)। इस बिंदु तक बचा हर `STAGE` वही है जिसे `pm_group_for_reduce` ने अभी बनाया है (global वाले cut पर `STORE`s बन गए, और `bufferize_to_store` ने `Local` वालों को जानबूझकर छोड़ा)। `add_local_buffer` `UOp::placeholder(max_shape, dtype, slot, opts.addrspace)` आवंटित करता है — slot group axis का `LocalBufferContext::axis_slot` है, नेस्टेड axis पथों के लिए एक नियतात्मक hash — और stage को `AFTER(buffer, [END(STORE(INDEX(buffer, ranges), compute), ranges)])` में बदलता है। फिर `movement_op_patterns` नए `INDEX` के ऊपर मौजूद किसी भी movement op को index एक्सप्रेशन में धकेल देता है।
 
-⚠️ **ज़रूरी: Pattern Precedence**
-
-Patterns कम्बाइन होकर fixpoint तक चलते हैं। ऑर्डर तय करता है कि कई मैच होने पर कौन सा pattern पहले ट्राई हो:
-1. `expander2` पहले (UPCAST/UNROLL ranges, REDUCE और WMMA operands एक्सपैंड करता है)
-2. `pm_flatten_range` दूसरा (ranges हटने के बाद END की range लिस्ट दोबारा बनाता है)
-3. `mop_cleanup_patterns` आखिर में (expansion से बचे movement ops साफ़ करता है)
-
-गलत precedence से गलत वेक्टराइज़ेशन या reduction scoping हो सकती है।
-
-एक्सपैंड हुई lanes `STACK` से इकट्ठी होती हैं और `INDEX` से चुनी जाती हैं। UPCAST और
-UNROLL `RANGE` पर लगे `AxisType` हैं, अलग ऑपरेशन नहीं। (Tinygrad जिसे VECTORIZE
-कहता है, Svod में उसका नाम `STACK` है; VECTORIZE नाम का कोई op नहीं है।)
-
-**UPCAST / UNROLL range → shaped coordinate**:
-```mermaid
-flowchart TD
-  A["Before: RANGE(end=4, Upcast) marks vectorization intent"]
-  A -->|"expander2"| B["After: RESHAPE(STACK(0, 1, 2, 3), [4])"]
-```
-
-Upcast और unroll ranges एक ही रास्ते से गुज़रते हैं — एक ही नियम दोनों axis types पर
-मैच होता है। ख़ुद RANGE नोड की जगह एक shaped constant coordinate आ जाता है, इसलिए
-उसे कंज़्यूम करने वाला हर ऑपरेशन बस shaped बन जाता है। प्रति-lane ऑपरेशन बाद में,
-Stage 14 पर `devectorize_alu` से बनते हैं।
-
-जब हम "ऑपरेशन डुप्लीकेट होते हैं" कहते हैं, तो ऐसा नहीं है कि कॉपी-पेस्ट होता है। कम्पाइलर एक सिंगल SIMD इंस्ट्रक्शन बनाता है जो सभी N एलिमेंट एक साथ प्रोसेस करती है। SIMD रजिस्टर को 4 नंबर रखने वाला बॉक्स सोचें; दो बॉक्स जोड़ने से सभी 8 नंबर एक साथ जुड़ते हैं।
-
-**एक्सपैंड हुए END का इंटरैक्शन**:
-```mermaid
-flowchart TD
-  A["Before: END(STORE(...), [RANGE(Upcast)])"]
-  A -->|"expander2 + pm_flatten_range"| B["After: END(shaped STORE(...), [])"]
-```
-
-`pm_flatten_range` किसी END की range लिस्ट को उन RANGE नोड्स से दोबारा बनाता है जो
-अब भी उसके sources के ज़रिए पहुँच में हैं। Expansion के बाद upcast range बची नहीं
-रहती, इसलिए लिस्ट खाली हो जाती है। प्रति-lane stores Stage 14 पर `GROUP` में लिपटकर आते हैं।
-
-**GROUP_REDUCE हैंडलिंग** (`pm_group_for_reduce`):
-
-GROUP_REDUCE tensor core reductions के लिए एक स्पेशल axis type है:
-
-```mermaid
-flowchart TD
-  A["Before: REDUCE with GROUP_REDUCE ranges. REDUCE(src, [range(GROUP_REDUCE)])"]
-  A -->|"pm_group_for_reduce"| B["After: Shared memory reduction pattern"]
-  B --> S1["1. Track upstream LOCAL ranges"]
-  B --> S2["2. STAGE the partial result with the group ranges (AddrSpace::Local)"]
-  B --> S3["3. INDEX into that buffer with the transformed ranges"]
-  B --> S4["4. Final REDUCE over derived loops (axis_id.group_reduce_loop(), AxisType::Reduce)"]
-```
-
-यह shared memory से एफ़िशिएंट tensor core accumulation सक्षम करता है। हालाँकि
-`pm_group_for_reduce` `expand.rs` में रहता है, यह `pm_reduce_local` में कम्पोज़ होता है
-और इसलिए reduction हटाने के दौरान चलता है, `pre_expand` के अंदर नहीं।
-
-**Svod**: `expand.rs`
-
----
-
-## Stage 10: Add Local Buffers
-
-> **स्टेज एक नज़र में**
->
-> **गोल**: फ़ास्ट मेमोरी (shared / L1) के लिए बफ़र तैयार करें
-> **मुख्य Patterns**: लोकल बफ़र एलोकेशन, movement op पुशडाउन
-> **प्रभाव**: बार-बार एक्सेस होने वाला डेटा फ़ास्ट मेमोरी में रहता है
-
-**यह क्या करता है**: हर staged इंटरमीडिएट को असली लोकल बफ़र में बदल देता है।
-
-**यह क्यों ज़रूरी है**: **लोकल बफ़र** = कम्प्यूट यूनिट के पास फ़ास्ट मेमोरी:
-- GPU: Shared memory (LDS) — global memory से 100x तेज़
-- CPU: L1 cache — main memory से 10x तेज़
-
-कम्पाइलर बार-बार एक्सेस होने वाले डेटा को लोकल बफ़र में ले जाता है — ठीक वैसे जैसे ज़रूरी फ़ाइलें नेटवर्क ड्राइव के बजाय डेस्कटॉप पर रखना।
-
-**Pattern**: `pm_add_local_buffers`
-
-| ट्रांसफ़ॉर्म | उद्देश्य |
-|-------------|----------|
-| `add_local_buffer` | हर STAGE नोड के लिए एक लोकल `placeholder` एलोकेट करें और उसे INDEX / STORE / END / AFTER में बदलें |
-| `movement_op_patterns` | Movement ops नीचे धकेलें ताकि नए बफ़र के indices सरल रहें |
-
-**ऑर्डर पर नोट**: reduction हटाना (Stage 11) असल में इस स्टेज से *पहले* चलता है —
-`add_local_buffer` उन्हीं STAGE नोड्स को कंज़्यूम करता है जो reduce lowering बनाता है।
-Tinygrad भी दोनों passes को इसी क्रम में चलाता है।
-
-**Svod**: `optimizer/mod.rs`, `rangeify/patterns.rs`
+Tinygrad भी इसी कारण local buffers जोड़ने से पहले reductions को lower करता है: grouped-reduce stage तब तक मौजूद नहीं होता जब तक `pm_reduce_local` का चरण 2 नहीं चल जाता।

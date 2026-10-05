@@ -256,7 +256,7 @@ impl Default for BeamOpts {
 ///
 /// Pure log-space; never exponentiates intermediate values. NaN handling is
 /// controlled by [`BeamOpts::on_nan`]. Owns mutable scratch buffers (the
-/// suffix tree, beam/next [`SearchPoint`] vectors, sort buffers) that are
+/// suffix tree, beam/next `SearchPoint` vectors, sort buffers) that are
 /// reused across [`decode`](Self::decode) calls — after warm-up the hot path
 /// is allocation-free.
 #[derive(Debug)]

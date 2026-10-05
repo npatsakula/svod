@@ -1,6 +1,12 @@
 # svod-device
 
-Device abstraction with lazy buffer allocation, zero-copy views, and LRU caching.
+The device layer of the Svod ML compiler: buffers with lazy allocation and
+zero-copy views, per-device allocators, the `Device` / `Program` / `Graph`
+traits the runtime implements, and the hardware bindings for every backend.
+All backends are compiled on every host and opened at run time: AMD through KFD
+ioctls (Linux), NVIDIA through a runtime-loaded `libcuda.so.1`, and Apple GPUs
+through runtime-loaded Metal frameworks. Opening a device whose hardware is
+absent returns an error instead of failing the build.
 
 ## Example
 
@@ -8,20 +14,21 @@ Device abstraction with lazy buffer allocation, zero-copy views, and LRU caching
 use svod_device::{Buffer, BufferSpec, registry};
 use svod_dtype::DType;
 
-// CPU buffer (lazy allocation)
+// Allocated on first use.
 let cpu = registry::cpu()?;
-let buf = Buffer::new(cpu, DType::Float32, vec![1024], BufferSpec::default());
+let mut dst = Buffer::new(cpu.clone(), DType::Float32, vec![1024], BufferSpec::default());
+let src = Buffer::allocate(cpu, DType::Float32, vec![1024], BufferSpec::default())?;
 
-// AMD buffer without a host mapping (device-only VRAM)
-let amd = registry::get_device("AMD:0")?;
-let opts = BufferSpec { cpu_access: false, ..Default::default() };
-let vram = Buffer::allocate(amd, DType::Float32, vec![1024], opts)?;
+// A view shares storage with its parent; offset and size are in bytes.
+let half = src.view(0, 512 * 4)?;
+assert_eq!(half.size(), 2048);
 
-// Zero-copy view
-let view = buf.view(0, 512)?;
-
-// Device-to-device copy
 dst.copy_from(&src)?;
+
+// Device strings are case-insensitive `NAME[:N]` (or `DISK:<path>`) and cached per spec;
+// `cpu_access: false` asks for device-only memory, e.g. VRAM without a host mapping.
+let amd = registry::get_device("amd:0")?;
+let vram = Buffer::allocate(amd, DType::Float32, vec![1024], BufferSpec { cpu_access: false, ..Default::default() })?;
 ```
 
 ## Allocators
@@ -29,29 +36,12 @@ dst.copy_from(&src)?;
 | Device | Allocator | Backing |
 |--------|-----------|---------|
 | `CPU` | `CpuAllocator` | 64-byte aligned host memory |
-| `AMD:N` | `AmdAllocator` | KFD ioctls: VRAM or GTT, optional host BAR mmap |
-| `METAL:N` | `MetalAllocator` | `MTLBuffer` with shared storage |
-| `DISK:path` | `DiskAllocator` | read-only mmap, no LRU cache |
-| `CUDA:N` | `CudaAllocator` | CUDA driver API: device memory, managed for host-visible, pinned for `host` |
+| `AMD:N` | `AmdAllocator` | KFD: VRAM or GTT, optional host BAR mapping |
+| `CUDA:N` | `CudaAllocator` | device memory; managed or pinned host memory when host-visible |
+| `METAL:N` | `MetalAllocator` | `MTLBuffer` in shared storage mode |
+| `DISK:path` | `DiskAllocator` | read-only mmap, cannot run kernels |
 
-Every compute allocator is wrapped in `LruAllocator`, which pools freed
-buffers by `(size, BufferSpec)` and re-zeroes on demand. GPU backends are
-always compiled and self-register only when their hardware is present.
+Every allocator except `DISK` is wrapped in `LruAllocator`, which pools freed
+buffers by `(size, BufferSpec)` and re-zeroes reused ones on demand.
 
-## Device Registry
-
-```rust
-registry::cpu()                 // CPU allocator
-registry::get_device("AMD:1")   // Parse string, cached per spec
-
-DeviceSpec::parse("amd:0")      // Case-insensitive parsing
-spec.canonicalize()             // → "AMD:0"
-```
-
-## Testing
-
-```bash
-cargo test -p svod-device
-```
-
-GPU tests self-skip when no supported device is present.
+Documentation: <https://svod.vpermilp.online/docs/backends/overview>

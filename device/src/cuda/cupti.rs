@@ -647,7 +647,7 @@ impl Session {
     /// Arm the hardware for the next launch on this context.
     ///
     /// The counter-data image must be re-initialized per capture, and the
-    /// caller must run exactly one launch and synchronize before [`stop`].
+    /// caller must run exactly one launch and synchronize before [`stop`](Self::stop).
     pub fn start(&mut self) -> Result<(), String> {
         let api = api().ok_or("CUPTI is not loaded")?;
         self.counter_data.fill(0);

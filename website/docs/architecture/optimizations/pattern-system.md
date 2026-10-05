@@ -1,233 +1,132 @@
 ---
-sidebar_label: Pattern Engine
+sidebar_label: Pattern engine
 sidebar_position: 0
 ---
 
 # The Pattern Engine
 
-Open any production ML compiler and you'll find dozens of optimization passes: constant folding, dead code elimination, operator fusion, loop tiling, vectorization, memory layout optimization. Each pass has its own data structures, its own traversal logic, its own bugs.
-
-Svod takes a different approach: **one mechanism for everything**.
-
-```mermaid
-flowchart LR
-  subgraph T["Traditional Compiler (custom logic each)"]
-    direction TB
-    T1["Constant Folding"]
-    T2["Dead Code Elimination"]
-    T3["Loop Unrolling"]
-    T4["Operator Fusion"]
-    T5["Vectorization"]
-    T6["Memory Planning"]
-    T7["...20 more passes"]
-  end
-  subgraph S["Svod (one mechanism)"]
-    direction TB
-    S1["patterns! (Add, Mul, ...more)"] --> S2["graph_rewrite(...)"]
-  end
-```
-
-Every optimization in Svod is expressed as a **pattern**: "when you see this structure, replace it with that structure." The same `graph_rewrite()` function applies [algebraic simplification](./algebraic-simplification.md), [index arithmetic](./index-arithmetic.md), [strength reduction](./strength-reduction.md), and [range optimization](./range-optimization.md).
-
----
+Nearly every pass in Svod is a `graph_rewrite` over a matcher built with the `patterns!` macro: the rangeify stages, the symbolic simplifier, the expander, the devectorizer, the decompositions, the gate movement. The exceptions are a few plain graph walks (`memory_coalescing`, `merge_register_read_ends`, `linearize`) and the line rewrite that runs over the linear instruction list. This page is the reference for the macro and the engine. Source: `macros/src/patterns/`, `ir/src/pattern/`, `ir/src/rewrite/engine.rs`; the Tinygrad counterparts are `UPat` and `graph_rewrite` in `tinygrad/uop/ops.py`.
 
 ## The `patterns!` DSL
 
-Svod provides a domain-specific language for writing optimization patterns:
+A block is a list of `pattern [if guard] => body` rules, optionally preceded by `@context Type;`. The left-hand side is Rust pattern syntax extended with what a Rust pattern cannot say across an `Arc<UOp>` edge. Real rules from `schedule/src/symbolic/patterns.rs`:
 
 ```rust
-patterns! {
-    // Identity folding: x + 0 → x
-    Add[x, @zero] => x,
+// constant folding over thirteen binary ops, one rule body
+for op in binary [Add, Mul, Sub, FloorMod, Max, Pow, FloorDiv, Fdiv, And, Or, Xor, Shl, Shr] {
+    op(a @const(a_val), _b @const(b_val))
+      => eval_binary_op(op, a_val, b_val).and_then(|r| folded_const(a.dtype(), r)),
+},
 
-    // Constant folding: 3 + 4 → 7
-    Add(a @const(a_val), _b @const(b_val))
-        => eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
+// commutative identity with a guard; `name @ @zero` binds the constant node too
+Add[x, zero @ @zero]
+    if !x.dtype().is_float()
+        || matches!(zero.op(), Op::Const(ConstValueHash(ConstValue::Float(v))) if v.is_sign_negative())
+    => x.clone(),
+Mul[x, @one] => x.clone(),
 
-    // Self-folding: x / x → 1
-    Idiv(x, x) => UOp::one(x.dtype()),
+// a repeated name means the same node (Arc::ptr_eq), here across a struct field
+original @ FloorDiv(x, x) => exact_integer_rewrite(original, 1.into_uop(x.dtype())),
+original @ FloorMod(range @ Range { end, .. }, end) => exact_integer_rewrite(original, range.clone()),
 
-    // Dead code elimination: if(true) { t } else { f } → t
-    Where(Const(ConstValue::Bool(true)), t, _f) => t,
+// struct ops match by field; `..` skips the rest
+Cast { src: Cast { src: x, dtype: intermediate }, dtype: outer }
+    if x.dtype() == *outer && can_safe_cast(outer, intermediate)
+    => x.clone(),
+```
+
+A stateful matcher, from `schedule/src/expand.rs`:
+
+```rust
+crate::cached_patterns! {
+    @context RangeMap;
+    reduce @ Reduce { .. } => expand_reduce(reduce),
+    range @ Range { end: _, axis_id, axis_type }
+        if matches!(axis_type, AxisType::Upcast | AxisType::Unroll) && ctx.contains_key(axis_id)
+        => expand_range(ctx, range),
+    Wmma { a, b, c, metadata } if metadata.upcast_axes.is_some() => expand_wmma(ctx, a, b, c, metadata),
 }
 ```
 
-The macro compiles these patterns into efficient Rust code:
+| Form | Meaning |
+|------|---------|
+| `Add(x, y)` | ALU op by kind, positional, ordered. Names resolve through `svod_ir::op::alu`, so a wrong name or arity is a compile error. `UnaryOp`, `BinaryOp` (`Add, Mul, Sub, FloorMod, CMod, Max, Pow, FloorDiv, CDiv, Fdiv, Lt, Le, Eq, Ne, Gt, Ge, And, Or, Xor, Shl, Shr, Threefry`), `TernaryOp` (`Where`, `MulAcc`). |
+| `Add[x, y]` | Commutative: exactly two children, both orders tried; the guard and body are emitted once and retried per ordering. |
+| `Cast { src: x, dtype }` | Struct op by field. A field is a child pattern when it is `_`, `@..`, a snake_case name, or an identifier applied to `(..)`/`[..]`/`{..}`/`@`; anything else is a verbatim Rust pattern (`axis_type: AxisType::Upcast`, `index: 2`). `Some(pat)`/`None` match `Option<Arc<UOp>>` children (`Load { alt: None, gate: Some(g), .. }`). Unit ops are bare (`Noop`). |
+| `x` / `_` / `name @ pattern` | bind a node / ignore / bind the whole sub-match |
+| `c @const(v)` | bind a `CONST` node and its `ConstValue` |
+| `c @vconst(vs)` / `c @anyconst(vs)` | `VCONST` lanes / `CONST` or `VCONST` as `Vec<ConstValue>` |
+| `Const(<rust pattern>)` | a Rust pattern over the `ConstValue` |
+| `@zero` / `@one` | scalar `CONST` 0 / 1 of any numeric dtype (`is_zero` also matches `-0.0` and `false`) |
+| repeated name | the same node (`Arc::ptr_eq`); a repeated `@const` value name compares values |
+| `for op in binary [A, B]` / `[*]` | one rule body for several ops (or all of a kind); `op` is the runtime op value, usable in guard and body |
+| `pat if guard => body` | the guard sees every binding and `ctx` |
+| `=> body` | `Arc<UOp>`, `Option<Arc<UOp>>` (`None` declines) or `RewriteResult`; `?` works, a bare binding returns a clone |
+| `@context Type;` | first item; the closure receives `ctx: &mut Type` |
 
-| Syntax | Meaning | Example |
-|--------|---------|---------|
-| `(x, y)` | **Ordered.** Match in exact order. | `Sub(x, @zero) => x` |
-| `[x, y]` | **Commutative.** Try both orderings. | `Add[x, @zero] => x` |
-| `@zero` | **Zero constant.** Matches 0 or 0.0. | `Mul[_, z @ @zero] => z` |
-| `@one` | **One constant.** Matches 1 or 1.0. | `Mul[x, @one] => x` |
-| `c @const(val)` | **Extract constant.** Binds the value. | `Add(a @const(av), _b @const(bv))` |
-| `x, x` | **Same operand.** Auto-generates ptr_eq check. | `Idiv(x, x) => UOp::one(...)` |
-| `=>` | **Rewrite.** Returns `Arc<UOp>`, `Option<Arc<UOp>>` (`None` declines) or `RewriteResult`. | `=> eval(...).map(...)` |
-| `for op in binary [...]` | **Template.** Generate patterns for multiple ops. | See below |
-| `@context Type` | **Stateful.** Access mutable context in patterns. | See below |
+`cached_patterns!` has the same grammar and returns `&'static TypedPatternMatcher<C>` from a `LazyLock`; `patterns!` builds a fresh matcher. Both are re-exported from `svod_schedule`.
 
-### Template Expansion
+### What the macro generates
 
-Instead of writing the same pattern for every binary operation, use a for-loop:
+`Op` carries `#[op_enum]`/`PatternEnum`, which generates `svod_ir::op::pattern_derived::OpKey` — one dense index per op kind, with one slot per sub-op for the grouped `Unary`/`Binary`/`Ternary` — and `OpMask`. A `patterns!` block compiles into **one closure** registered with `SimplifiedPatternMatcher::add_block`, plus a constant table of `(root mask, early-reject mask)` per rule:
+
+- Consecutive rules with one constant root kind share a `match __key { __KEY_Add => { .. } .. }`; within an arm the rules keep source order.
+- Rules without a constant root — wildcards (`x if ..`), `for` blocks, `@anyconst` roots — are emitted as sequential steps *between* those `match`es, so priority is pure source order, not "indexed first, wildcards last".
+- Each rule starts with an early-reject test: the op kinds its fixed child positions require are a bit mask checked against the root's `src_ops` (Tinygrad's `UPat.early_reject`).
+- Commutative sites become lazily chained candidate iterators; nested commutative nodes become nested loops; the body is retried per ordering.
+- A `for` block is compiled once per rule body; the op variable is bound from the root at runtime.
+
+`SimplifiedPatternMatcher<C>` (`TypedPatternMatcher<C = ()>` is the alias) is a list of segments, one per block, each with a root `OpMask` and the closure. `rewrite(node, ctx)` scans the segments, skips those whose mask lacks the node's kind, and returns the first non-`NoMatch`. `a + b` appends `b`'s segments after `a`'s, so the left operand's rules win. `with_context::<D>()` lifts a `TypedPatternMatcher<()>` into a `D`-context matcher (it takes `&self`); hand-written closures go in with `add`, `add_rejecting`, `add_wildcard`. `Matcher<C>` is the trait (`fn rewrite(&self, &Arc<UOp>, &mut C) -> RewriteResult`); `DemoteFloat` in `late/dtype.rs` implements it directly.
+
+## The rewrite engine
+
+`ir/src/rewrite/engine.rs` is a stack-based port of Tinygrad's `unified_rewrite`. Each node goes through three stages:
+
+| Stage | What happens |
+|-------|--------------|
+| 0 — PushChildren | If a `bpm` matcher is given, apply it to this node to a fixpoint *before* descending (patterns see the original children). `Gate(node)` records a replacement and skips the children. Then push the children, then a stage-1 entry for this node. |
+| 1 — ApplyPatterns | Resolve the children through the replacement map (waitlist if one is not ready). If a child changed, rebuild the node and send the rebuilt node back to stage 0. Otherwise apply `pm`; a `Rewritten` result is pushed at stage 0 — fully re-traversed and re-matched, which is the fixpoint — with a stage-2 link. |
+| 2 — Link | Map the original node to the final result of its replacement. |
+
+Results are memoized by `UOp::id` (`replace`, `bpm_cache`; `Gate` is never cached). Two limits: `REWRITE_STACK_LIMIT = 500_000` stack entries (`"infinite loop in graph_rewrite (stack too big: ..)"`), and a per-node `bpm_seen` set that panics when a bottom-up fixpoint revisits a node. There is no iteration cap.
+
+| Entry point | Matchers |
+|-------------|----------|
+| `graph_rewrite(pm, root, ctx)` | `pm` at stage 1 — rules see rewritten children (Tinygrad default) |
+| `graph_rewrite_bottom_up(bpm, root, ctx)` | `bpm` at stage 0 — rules see original children (Tinygrad `bottom_up=True`); `Gate` is honoured |
+| `graph_rewrite_with_bpm(pm, bpm, root, ctx)` | both; only used by tests |
+| `graph_rewrite_walk(bpm, root, ctx)` | one pass, replacements not re-traversed (Tinygrad `walk=True`) |
+| `*_preserve_calls` variants | the same without entering `CALL`/`FUNCTION` bodies or `PROGRAM` internals (Tinygrad `enter_calls=False`) |
+
+`RewriteResult` is `NoMatch`, `Rewritten(Arc<UOp>)` or `Gate(Arc<UOp>)`; in a `pm` matcher `Gate` is treated as `NoMatch`. The kernel cut uses `Gate` to stop `split_all_stores` from descending into an already-formed kernel `SINK` (`rangeify/kernel.rs`). A `debug_assert` fires if a rule returns the node it was given.
+
+The one non-graph driver is `line_rewrite` (`linearize/mod.rs`): it walks the linear instruction list once, lets each entry expand into several, and substitutes later sources through a map. Its only client is `line_rewrite_cleanups`, the gated-`STORE` → `IF`/`STORE`/`ENDIF` expansion.
+
+`RUST_LOG=svod_ir::pattern=trace` logs every match (`op_key`); it does not log which rule fired or which were tried.
+
+## Composition is ordered
+
+Matchers are composed by `+` in a fixed order, and the order carries meaning. `symbolic_simple()` starts with `propagate_invalid` because `x * 0 → 0` would otherwise erase `MUL(0, WHERE(c, x, Invalid))` together with its validity; `with_tier2` orders canonicalization before term combining and ALU folding before the comparison rules because each group exposes matches for the next (see [algebraic simplification](./algebraic-simplification.md)). Adding a rule means choosing where in that order it fires.
+
+## Verifying rewrites with Z3
+
+`schedule/src/z3/` (feature `z3`, optional dependency `z3 = "0.21"`, system `libz3`; the nix flake provides it) checks rewrites instead of trusting them:
+
+- `convert.rs` translates a UOp tree into a Z3 term: `CONST` (int, uint, bool; floats and `Invalid` are rejected), `DefineVar` as a bounded integer, `RANGE` as a fresh variable with `0 <= r < end`, `Neg`, the integer binary ops `Add, Sub, Mul, FloorDiv, FloorMod, CDiv, CMod, Max, Lt, Eq, Ne` (`And`/`Or` on bools), `WHERE` and `MulAcc` on integers, and `CAST` as a dtype-bounded fresh variable tied to its source when the source range fits. `alu.rs` gives `CDiv`/`CMod` C truncation semantics; floor division is built on them. Anything else is a `ConversionError`.
+- `verify_equivalence(original, simplified)` converts both into one context and asserts `original != simplified`: `UNSAT` proves the rewrite, `SAT` returns `CounterExample::Found { model, .. }`, a timeout `Unknown`.
 
 ```rust
-patterns! {
-    for op in binary [Add, Mul, Sub, Idiv, Fdiv, Max] {
-        op(a @const(a_val), _b @const(b_val))
-            => eval_binary(op, a_val, b_val)
-                .map(|r| UOp::const_(a.dtype(), r))
-    }
+/// The identity elimination `x + 0 = x` is pointer-identical and Z3-proven.
+#[test]
+fn z3_verify_identity_add_zero(x in arb_var_uop(DType::Int32)) {
+    let zero = UOp::native_const(0i32);
+    let expr = x.try_add(&zero).expect("ADD accepts matching dtypes");
+    let simplified = rewrite(Matchers::simple(), expr.clone());
+    prop_assert!(Arc::ptr_eq(&simplified, &x));
+    verify_equivalence(&expr, &simplified).expect("Z3 should verify x + 0 = x");
 }
 ```
 
-This expands to six separate patterns at compile time — one for each operation.
+What is covered (`schedule/src/test/`): hand-written rows through `symbolic_simple` (`unit/z3/symbolic_patterns.rs`), proptest oracles over `arb_arithmetic_tree_bounded_up_to` and `arb_known_property_graph` through `symbolic_simple` and `symbolic` (`property/oracles.rs`, 300–500 cases each), and a dual run of the structural symbolic tests that re-checks each row with Z3 when it converts (`unit/symbolic/mod.rs`). Only `Found` fails a test; `Unknown` and `ConversionFailed` are tolerated, and a liveness test guards that the arithmetic core still converts. Run it with `cargo test -p svod-schedule --features z3,proptest`; CI runs the same features through `nix flake check`.
 
-### Stateful Patterns
-
-Some optimizations need context (e.g., which kernel we're in, what ranges are active):
-
-```rust
-patterns! {
-    @context KernelContext;
-
-    reduce @ ReduceAxis { src, .. } => {
-        ctx.record_reduction(reduce);
-        transform_reduce(reduce, src, ctx)
-    }
-}
-```
-
-### Context Lifting
-
-When combining matchers with different context types, use `.with_context()`:
-
-```rust
-let pm_add_images = symbolic_simple().clone().with_context::<AddImageContext>()
-    + no_vectorized_alu().clone().with_context()
-    + pm_simplify_add_image();
-```
-
----
-
-## How Pattern Matching Works
-
-The `patterns!` macro compiles a block into one function that dispatches on the root's operation kind with a `match`, then tries that kind's patterns in source order.
-
-### The OpKey Index
-
-Every UOp has an operation type (Add, Mul, Load, etc.). The macro generates an `OpKey` enum that maps operations to hashable keys:
-
-```rust
-match OpKey::from_op(tree.op()).index() {
-    KEY_ADD => { /* rules rooted at Add, in source order */ }
-    KEY_MUL => { /* rules rooted at Mul */ }
-    _ => {}
-}
-// wildcard rules (`x if cond`) run as sequential steps between the matches
-```
-
-When matching a UOp:
-1. **Extract OpKey** from the UOp's operation
-2. **Jump** to that kind's `match` arm
-3. **Try each closure** until one matches
-4. **Fall back** to wildcards if no indexed pattern matches
-
-### Commutative Handling
-
-For patterns like `Add[x, @zero]`, the macro generates code that tries both orderings:
-
-```rust
-// Try (x, @zero)
-if let Some(result) = try_match_ordered(&children[0], &children[1]) {
-    return result;
-}
-// Try (@zero, x)
-if let Some(result) = try_match_ordered(&children[1], &children[0]) {
-    return result;
-}
-```
-
-### Duplicate Detection
-
-When you write `Idiv(x, x)`, the pattern only matches if both operands are the *same* UOp (pointer equality via `Arc::ptr_eq`, not structural equality). This leverages hash consing — identical subexpressions share the same pointer.
-
----
-
-## The Rewrite Engine
-
-Pattern matching alone isn't enough. Consider:
-
-```text
-WHERE(Lt(3, 5), t, f)
-```
-
-To simplify it, we need two steps:
-1. `Lt(3, 5)` → `true` (constant folding)
-2. `WHERE(true, t, f)` → `t` (dead code elimination)
-
-But the `WHERE` pattern won't match until its child is simplified. The rewrite engine solves this with a **two-stage algorithm**.
-
-### Stage 0: Pattern Application
-
-Apply patterns to each node. If no pattern matches, signal to process children first.
-
-### Stage 1: Source Reconstruction
-
-After children are rewritten, rebuild the node with new children and try patterns again:
-
-```mermaid
-flowchart TD
-  A["Stage 0: WHERE(Lt(3, 5), t, f)"] -->|"no match, process children"| B["Gate"]
-  A --> C["Lt(3, 5)"]
-  C -->|"constant folding matches"| D["true"]
-  D --> E["Stage 1: WHERE(true, t, f)"]
-  E -->|"dead code elimination matches"| F["t"]
-```
-
-The reconstruction stage re-applies patterns, enabling multi-step optimizations in a single traversal.
-
-### Rewrite Strategies
-
-Three rewrite functions, matching Tinygrad's `graph_rewrite`:
-
-| Strategy | Patterns see | Use when |
-|----------|-------------|----------|
-| `graph_rewrite(pm)` (default) | OPTIMIZED children | Algebraic simplification, expansion |
-| `graph_rewrite_bottom_up(bpm)` | ORIGINAL children | Nested structure matching, buffer removal |
-| `graph_rewrite_with_bpm(pm, bpm)` | Both (bpm: original, pm: optimized) | Kernel splitting (gate + transform in one pass) |
-
-The engine always traverses bottom-up; the distinction is *when* patterns fire: in Stage 0 (before children are processed — sees originals) or Stage 1 (after children — sees optimized results). Matchers are combined with the `+` operator: `matcher_a() + matcher_b()` merges their pattern sets into one.
-
-### Safety Limits
-
-To prevent infinite loops:
-- **500,000 rewrite-stack entries** maximum (`REWRITE_STACK_LIMIT`)
-- Panics with diagnostic info if limits exceeded
-
-In practice, well-formed patterns converge quickly.
-
----
-
-## Why This Matters
-
-**Debugging is direct.** Patterns are readable code. Add a `println!` to any pattern to trace when it fires.
-
-**Extensibility is easy.** Adding a custom optimization is two lines — no need to understand compiler internals, write visitors, or modify pass managers.
-
-**Correctness is local.** Each pattern is a small theorem: "if this structure appears, replacing it with that structure preserves semantics." Verify each pattern independently. Composition of correct patterns yields correct programs.
-
-**Performance is tunable.** O(1) pattern dispatch is fast by default. Combine with [beam search](./kernel-search.md) for production workloads.
-
----
-
-## The Deeper Insight
-
-Pattern matching trades generality for composability.
-
-A general-purpose optimization pass can do anything — but that's exactly the problem. It's hard to verify, hard to extend, hard to compose with other passes. Ordering matters. Interactions are subtle.
-
-A pattern is constrained: it matches a specific structure and produces a specific replacement. But constraints enable composition. For well-designed pattern sets, running patterns to a fixed point yields deterministic results. New patterns can be added with localized impact, and deleted without cascading failures — though in practice, pattern interactions should be tested to ensure convergence.
-
-Each pattern is a theorem about semantic equivalence. The rewrite engine is a theorem prover, finding derivations from input to optimized output. Correctness follows from the correctness of individual steps.
-
-This is the Unix philosophy applied to compilers: small, focused tools that compose.
+The proof is over unbounded integers on sampled expressions of a limited op subset — a strong regression net for the index simplifier, not a verification of every pattern.

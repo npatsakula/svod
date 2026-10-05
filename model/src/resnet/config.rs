@@ -35,8 +35,8 @@ impl ResNetDepth {
     }
 }
 
-/// Which forward tail the model executes. Switch with [`ResNet::with_output`]
-/// or set at construction time.
+/// Which forward tail the model executes; fixed at construction time
+/// ([`ResNetConfig::new`], [`ResNet::from_hub`](super::ResNet::from_hub)).
 #[derive(Copy, Clone, Debug)]
 pub enum OutputMode {
     /// Add the FC head; forward returns logits `[B, num_classes]`. The FC

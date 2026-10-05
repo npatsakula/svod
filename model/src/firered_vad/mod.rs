@@ -417,7 +417,7 @@ pub struct FireRedVadProbs {
 
 impl FireRedVadProbs {
     /// Wrap a loaded model into the waveform→probs front-end. `smooth_window`
-    /// is the trailing moving-average span ([`DEFAULT_SMOOTH_WINDOW`] upstream).
+    /// is the trailing moving-average span (`DEFAULT_SMOOTH_WINDOW` upstream).
     pub fn new(model: FireRedVad, smooth_window: usize) -> crate::jit::Result<Self> {
         Ok(Self { fbank: FireRedFbank::new(BATCH, CHUNK_T)?, vad: FireRedVadInference::new(model)?, smooth_window })
     }

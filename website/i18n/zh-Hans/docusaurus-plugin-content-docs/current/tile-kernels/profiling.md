@@ -23,7 +23,7 @@ flowchart TD
   P["Tensor::profile / ExecutionPlan::profile"] --> T1["Tier 1 - device time (GPU-clock timestamps)"]
   P --> T2["Tier 2 - roofline (GFLOP/s, GB/s)"]
   P --> T3["Tier 3 - static occupancy (VGPR/SGPR/LDS, occ%)"]
-  P --> T4["Tier 4 - HW counters / PMC (AMD SQ 块, CUDA CUPTI)"]
+  P --> T4["Tier 4 - HW counters / PMC (AMD SQ block, CUDA CUPTI)"]
 ```
 
 | 层级 | 报告什么 | 来源 | 需要执行吗？ |
@@ -123,7 +123,7 @@ SVOD_DEVICE=AMD:0 SVOD_PROFILE_ITERS=20 SVOD_PMC=1 ...
 # Only VALU instructions and SQ-busy cycles.
 SVOD_DEVICE=AMD:0 SVOD_PMC=valu,sqbusy ...
 
-# CUDA 上的 tensor core 利用率与 DRAM 流量。
+# Tensor-core utilization and DRAM traffic on CUDA.
 SVOD_DEVICE=CUDA:0 SVOD_PMC=tensor,dram ...
 ```
 
@@ -163,34 +163,34 @@ origin rollup (depth 3, exclusive; rows sum to the total):
 
 `tk` 的基准通过每个内核公开的 `Tensor` 接口来测量内核，计时用的是 profiler 所用的那同一批每内核 GPU 时间戳（`tk/benches/common.rs`）。普通的 `cargo bench` 只报告每个基准的 GPU 设备时间。但 criterion 有一个 `--profile-time <seconds>` 模式，而这些基准通过 criterion 的自定义 `Profiler` trait 把**完整的分层 profiler** 挂接了进去——这正是火焰图生成所用的那同一个扩展点。
 
-这个挂钩就是 `tk/benches/common.rs` 里的 `PlanProfiler`。在剖析某个基准期间，`bench_plan` 会在每次调用时通过进程全局的 `bench_profiler()` 捕获该基准的 plan，每次捕获都经 `ProfileOptions::from_env()` 剖析，并按每内核最小值合并进会话累加器。停止时，合并后的表用 `render_table()` 渲染，写入 criterion 输出目录下的一个文件，并回显到 stderr：
+这个挂钩就是 `tk/benches/common.rs` 里的 `PlanProfiler`。在剖析某个基准期间，`bench_plan`（或 `bench_kernel`——它只统计入口点带有手写内核名字的那些 dispatch，因此实现单个输出时额外加上的那次拷贝不会算到内核头上）会在每次调用时通过进程全局的 `bench_profiler()` 捕获该基准的 plan，每次捕获都经 `ProfileOptions::from_env()` 剖析，并按每内核最小值合并进会话累加器。停止时，合并后的表用 `render_table()` 渲染，写入 criterion 输出目录下的一个文件，并回显到 stderr：
 
 ```
 target/criterion/<id>/profile/svod-profile.txt
 ```
 
-接入它只需在每个基准的 `criterion_group!` 里加一行——这一行把共享 profiler 设为 criterion 的配置（取自 `tk/benches/kmeans.rs`）：
+接入它只需在每个基准的 `criterion_group!` 里加一行——这一行把共享 profiler 设为 criterion 的配置（取自 `tk/benches/fa.rs`）：
 
 ```rust
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(common::bench_profiler());
-    targets = bench_kmeans
+    targets = bench_fa
 }
 criterion_main!(benches);
 ```
 
-像跑任何 criterion 基准那样运行它，再加上 `--profile-time`（以及任何层级环境变量）：
+像跑任何 criterion 基准那样运行它，再加上 `--profile-time`（以及任何层级环境变量）。每个内核一个二进制：`fa`、`gemm`、`matmul`、`norm`、`sq_attention`、`knn`、`kmeans`。
 
 ```bash
 # Plain bench: GPU device time per benchmark, profiler dormant.
-SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench kmeans
+SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench fa
 
 # Drive the layered profiler for ~5s per benchmark, with hardware counters.
-SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench kmeans -- --profile-time 5
+SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench fa -- --profile-time 5
 ```
 
-由于 `bench_profiler()` 在 criterion 不剖析时处于休眠，普通的 `cargo bench` 完全不受影响——还是同样的数字，没有额外的趟数。
+由于 `bench_profiler()` 在 criterion 不剖析时处于休眠，普通的 `cargo bench` 完全不受影响——还是同样的数字，没有额外的趟数。在内核 `ArchSet` 之外的设备上，基准会自行跳过。注意，除非设置 `SVOD_TK_TUNE=0`，基准中的 [自动调优器](./tuning) 是*开启*的：新形状的第一个样本包含分块测量的时间，这部分会被 criterion 的预热吸收掉。
 
 ---
 
