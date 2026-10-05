@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/npatsakula/svod/main/website/static/img/logo.svg" width="120" alt="Svod logo" />
-
 # Svod
 
 **A deep learning compiler and inference engine written in Rust.**

@@ -4,8 +4,6 @@ sidebar_label: परिचय
 
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/npatsakula/svod/main/website/static/img/logo.svg" width="120" alt="Svod लोगो" />
-
 # Svod
 
 **Rust में लिखा गया डीप लर्निंग कंपाइलर और इन्फ़रेंस इंजन।**

@@ -4,8 +4,6 @@ sidebar_label: 简介
 
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/npatsakula/svod/main/website/static/img/logo.svg" width="120" alt="Svod 标志" />
-
 # Svod
 
 **用 Rust 编写的深度学习编译器与推理引擎。**
