@@ -193,7 +193,7 @@ impl AmdSignal {
     /// CP-written dispatch timestamps in nanoseconds, valid only after the
     /// signal retired. `None` until then, or when
     /// the slot was never targeted by timestamp commands (both stamps
-    /// zeroed by [`reset`](Self::reset)).
+    /// zeroed by `reset`).
     pub fn timestamps_ns(&self) -> Option<(u64, u64)> {
         // SAFETY: the full 64-byte slot is mapped; value lives at +8, so the
         // slot base is host_ptr − SIGNAL_VALUE_OFFSET.

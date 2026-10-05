@@ -335,7 +335,7 @@ pub fn validate_cubin(cubin: &[u8], entry: &str) -> Result<()> {
     Ok(())
 }
 
-/// [`check_entry_params`] on the entry of `ptx`, when the text declares one:
+/// `check_entry_params` on the entry of `ptx`, when the text declares one:
 /// the guard the PTX loader applies, exposed so a compiler that assembles
 /// PTX to a cubin (whose parameter list is not readable) can apply it first.
 pub fn check_ptx_entry_abi(ptx: &str, entry: &str, abi: &[AbiParamDescriptor]) -> Result<()> {

@@ -1,5 +1,5 @@
 //! GTCRN speech enhancement — a pure-Rust port of the upstream
-//! [GTCRN](https://github.com/Xiaobin-Guang/GTCRN) (ShuffleNetV2-style ultra-
+//! [GTCRN](https://github.com/Xiaobin-Rong/gtcrn) (ShuffleNetV2-style ultra-
 //! tiny model, 23.67K params). A noisy waveform in → an enhanced waveform out.
 //!
 //! ## Recipe
@@ -179,7 +179,7 @@ impl Gtcrn {
     // Loaders
     // -----------------------------------------------------------------------
 
-    /// Download [`CHECKPOINT`] from [`HUB_REPO`] and load it.
+    /// Download `CHECKPOINT` from [`HUB_REPO`] and load it.
     pub fn from_hub() -> Result<Self> {
         Self::from_hub_with_revision("main")
     }

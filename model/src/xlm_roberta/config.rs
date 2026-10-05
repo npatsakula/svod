@@ -1,7 +1,7 @@
 //! XLM-RoBERTa configuration, parsed from HuggingFace `config.json`.
 //!
 //! Mirrors the published schema of `BAAI/bge-m3` (XLM-RoBERTa-large). The
-//! [`RawXlmRobertaConfig`] serde mirror captures the on-disk shape; the clean
+//! `RawXlmRobertaConfig` serde mirror captures the on-disk shape; the clean
 //! [`XlmRobertaConfig`] keeps only the fields the Rust backbone consumes and
 //! adds a caller-chosen compute [`DType`] (defaults to [`crate::default_compute_dtype`];
 //! f32 for CPU parity tests).

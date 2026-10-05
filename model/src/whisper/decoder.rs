@@ -328,9 +328,9 @@ impl TextDecoder {
     /// - `self_v_cache`: [B, max_len, n_layer*H, Dh] self-attn V cache
     /// - `cross_k`: [K, n_audio_ctx, n_layer*H, Dh] cross-attn K (fixed)
     /// - `cross_v`: [K, n_audio_ctx, n_layer*H, Dh] cross-attn V (fixed)
-    /// - `self_key_lens`: [B] i32 valid cached-key counts, which is also each
+    /// - `self_key_lens`: `[B]` i32 valid cached-key counts, which is also each
     ///   row's position and therefore selects its positional embedding
-    /// - `cross_cache_map`: [B] i32 cross-cache row each lane reads
+    /// - `cross_cache_map`: `[B]` i32 cross-cache row each lane reads
     ///
     /// Returns `(logits[B, n_vocab], new_self_k[B, 1, n_layer*H, Dh], new_self_v[...])`.
     #[allow(clippy::too_many_arguments)]

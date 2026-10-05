@@ -99,10 +99,11 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
         Ok(Box::new(prg) as Box<dyn Program>)
     });
 
-    // Graph factory: pre-build a PM4 indirect buffer for a captured kernel
-    // chain and replay it with one doorbell (`svod_device::amd::AmdGraph`).
-    // Returns `Ok(None)` when the chain isn't graphable (AQL queue, non-AMD
-    // program), so the caller falls back to per-call dispatch. A fresh
+    // Graph factory: pre-build the command stream for a captured kernel chain
+    // and replay it with one doorbell (`svod_device::amd::AmdGraph`). AQL
+    // queues capture by default; PM4 queues only with `SVOD_PM4_GRAPH=1`.
+    // Returns `Ok(None)` when the chain isn't graphable (PM4 without the
+    // opt-in, non-AMD program), so the caller falls back to per-call dispatch. A fresh
     // AmdAllocator shares the cached `Arc<AmdDevice>`, so capture allocates the
     // IB page through the same KFD VM with no extra device open.
     let graph: GraphFactory = Arc::new(move |kernels: &[GraphKernel]| -> Result<Option<Box<dyn Graph>>> {

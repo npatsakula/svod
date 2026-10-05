@@ -10,12 +10,12 @@
 //! in (an augmentation that smuggled it through a bf16 WMMA operand would lose its
 //! precision), replicated along the query axis so every `(m, n)` reads `c_sq[m]`.
 //!
-//! **Stage 2** ([`build_knn_topk`]) streams the corpus in [`TM`]-tall tiles and
+//! **Stage 2** ([`build_knn_topk`]) streams the corpus in `TM`-tall tiles and
 //! keeps, per query, the running unsorted top-K nearest corpus rows via a
 //! flashlib-style **argmin-insert**: no score recompute, no in-kernel sort. The
 //! final K-ordering is offloaded to the generic graph in Stage 3.
 //!
-//! Orientation (mirrors [`crate::kernels::fa::fa_qk`]'s `QKᵀ`): the **corpus `m`
+//! Orientation (mirrors `fa_qk`'s `QKᵀ`): the **corpus `m`
 //! is the reduced / row axis** and the query `n` the column, so Stage 2's running
 //! top-K over the corpus folds the score tile's row — the inner-carrying axis on
 //! both the gfx942 normal accumulator (matrix-col reduce) and the gfx1151 wave32
@@ -159,7 +159,7 @@ fn score_tile<'k>(
 /// - `c_sq_rep` (`[1, 1, corpus, query]`, f32) — `‖c[m]‖²` precomputed outside the
 ///   kernel and replicated along the query axis (each `(m, n)` holds `c_sq[m]`).
 ///
-/// Single-warp; `corpus`, `query`, `d` must each be a multiple of [`BLK`] (16).
+/// Single-warp; `corpus`, `query`, `d` must each be a multiple of `BLK` (16).
 ///
 /// # Panics
 /// Panics unless `corpus`, `query`, and `d` are each a multiple of 16.
@@ -230,11 +230,11 @@ struct TopK<'k> {
 /// - `c_sq_rep` (`[1, 1, corpus, query]`, f32) — `‖c[m]‖²` replicated along query.
 ///
 /// Single-warp, correctness-first, arch-portable via role fragments. The corpus is
-/// streamed in [`TM`]-tall tiles through a [`crate::loop_scope::Loop`]; per tile
+/// streamed in `TM`-tall tiles through a [`crate::loop_scope::Loop`]; per tile
 /// the running top-K is updated by up to `k` argmin-insert steps. Built **rolled**
 /// (`arg_reduce` panics under unroll).
 ///
-/// **Query-block grid tiling:** each workgroup processes ONE `query`(= [`BLK`]) block,
+/// **Query-block grid tiling:** each workgroup processes ONE `query`(= `BLK`) block,
 /// selected by `block_idx[0]` — the grid is `[ceil(Npad/16), 1, 1]`, so it covers a
 /// wide `[Npad, *]` query input. The block index offsets ONLY the query (x) load and
 /// the output store (query-independent steps — the corpus stream, score, `c_sq` load,
@@ -243,7 +243,7 @@ struct TopK<'k> {
 /// the offset rides the (identical) row stride, not the declared extent.
 ///
 /// # Panics
-/// Panics unless `query`/`d` are multiples of [`BLK`], `corpus > 0`, `1 ≤ k ≤ BLK`,
+/// Panics unless `query`/`d` are multiples of `BLK`, `corpus > 0`, `1 ≤ k ≤ BLK`,
 /// and `query ≤ BLK` (the v1 single-query-fragment constraint: a wider query would
 /// fold distinct queries together in the per-query `arg_reduce`).
 pub fn build_knn_topk(ker: &Kernel, corpus: usize, query: usize, d: usize, k: usize) {

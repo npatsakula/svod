@@ -25,7 +25,7 @@ use super::linear::{Projected, linear, linear_add};
 pub struct Qwen3MLP {
     pub intermediate_size: usize,
     /// `gate_proj.weight` over `up_proj.weight`, `[2I, H]` — in alternating
-    /// `pair`-row gate/up blocks when [`Qwen3MLP::pair`] is set, plainly stacked
+    /// `pair`-row gate/up blocks when `Qwen3MLP::pair` is set, plainly stacked
     /// otherwise.
     pub gate_up_weight: Tensor,
     pub down_weight: Tensor,

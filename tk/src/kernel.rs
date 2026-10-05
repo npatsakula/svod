@@ -53,7 +53,7 @@ impl Kernel {
     /// the `BUFFER` UOps of the realized tensors in declaration order (output(s)
     /// first, then inputs). Each is converted to a flat 1-D `Param` placeholder
     /// (slot = declaration index); [`Kernel::next_global`] hands those out as GL
-    /// tiles bind them, and [`crate::launch`] binds the concrete buffers
+    /// tiles bind them, and [`crate::launch()`] binds the concrete buffers
     /// positionally at dispatch — the svod analog of tinygrad `sink.call(bufs)`.
     ///
     /// # Panics

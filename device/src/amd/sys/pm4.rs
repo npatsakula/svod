@@ -11,7 +11,7 @@
 //! would obscure that pattern.
 #![allow(clippy::identity_op)]
 //!
-//! Used by [`AmdComputeQueue`] to emit signal/barrier/wait packets through
+//! Used by [`AmdComputeQueue`](crate::amd::AmdComputeQueue) to emit signal/barrier/wait packets through
 //! the AQL vendor-specific indirect-buffer mechanism. The AQL kernel-dispatch
 //! packet's HSA `completion_signal` is deliberately unused; PM4 `RELEASE_MEM`
 //! inside a barriered AQL vendor IB advances the queue-owned timeline instead.

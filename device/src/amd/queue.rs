@@ -1432,8 +1432,9 @@ impl AmdComputeQueue {
     /// dwords directly into the ring; multi-XCC CDNA uses AQL, where each
     /// dispatch is a 64-byte AQL packet and PM4 helpers are wrapped via the
     /// vendor IB packet. `SVOD_AMD_AQL` set to anything but `"0"` forces AQL.
-    /// Used by `AmdGraph::capture` to skip the (multi-MiB) per-graph queue
-    /// build on AQL hardware where the graph path is unsupported anyway.
+    /// Used by `AmdGraph::capture` to skip the (multi-MiB) per-graph build on
+    /// PM4 queues unless PM4 graph capture is opted into (`SVOD_PM4_GRAPH=1`);
+    /// AQL queues are always captured.
     pub fn will_use_pm4(core: &AmdDeviceCore) -> bool {
         let force_aql = std::env::var("SVOD_AMD_AQL").ok().map(|s| s != "0").unwrap_or(false);
         !force_aql && core.node.num_xcc.max(1) == 1
@@ -1773,7 +1774,7 @@ impl AmdComputeQueue {
     }
 
     /// Re-blit a captured sequence of 64-byte AQL packets into the ring with ONE
-    /// doorbell — the AQL (multi-XCC) analogue of [`submit_dwords`], used by the
+    /// doorbell — the AQL (multi-XCC) analogue of [`submit_dwords`](Self::submit_dwords), used by the
     /// graph replay. Each packet is either a vendor IB (pointing at a captured
     /// PM4 run) or a native kernel-dispatch packet; the AQL packet processor runs
     /// them in order. Back-pressure is the graph's per-replay timeline wait (one

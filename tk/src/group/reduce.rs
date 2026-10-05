@@ -287,7 +287,7 @@ impl<'k> Group<'k> {
         (val, idx)
     }
 
-    /// Argmin/argmax `src` into `(val, idx)` — the index-carrying [`Self::reduce`]:
+    /// Argmin/argmax `src` into `(val, idx)` — the index-carrying `reduce`:
     /// threads an `Int32` index accumulator alongside the value through the in-lane
     /// fold and the cross-lane tree, keeping the extremum's value AND its global
     /// index along the folded axis (ties → smaller index, matching
@@ -297,10 +297,10 @@ impl<'k> Group<'k> {
     /// trip is a **fresh** reduce (the output pair re-seeds per the enclosing tracked
     /// range), not a running extremum folded across trips.
     ///
-    /// Unlike [`Self::reduce`], whose row/col orientation the caller picks, there is
+    /// Unlike `reduce`, whose row/col orientation the caller picks, there is
     /// no orientation to pick here: a fragment map folds exactly one axis, and the
     /// reduce must report an index along that same axis. So the folded axis is read
-    /// off the map ([`LaneMap::folds_cols`]) — the same source [`Self::axis_index_of`]
+    /// off the map ([`LaneMap::folds_cols`]) — the same source `axis_index_of`
     /// derives the element's global index from, so the fold and the index it reports
     /// cannot disagree. It is the tile's **columns** for a `Row` tile under the CDNA
     /// stride, `mma.sync` and `simdgroup_matrix` maps and its **rows** for a `Col`

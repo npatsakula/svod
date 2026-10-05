@@ -255,9 +255,9 @@ where
                     // Apply bpm rewrite rules until a fixed point is reached.
                     // The scratch set is reused across nodes rather than freshly
                     // allocated per node — a deliberate improvement over tinygrad's
-                    // per-node `seen = set()` (ops.py:1732), which costs ~280k
-                    // allocations on a resnet50 schedule for a set that almost
-                    // always holds a single element.
+                    // per-node `seen = set()` (`RewriteContext.unified_rewrite` in
+                    // `uop/ops.py`), which costs ~280k allocations on a resnet50
+                    // schedule for a set that almost always holds a single element.
                     self.bpm_seen.clear();
                     let mut gated = false;
                     loop {

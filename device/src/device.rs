@@ -46,8 +46,9 @@ pub trait Program: Send + Sync {
     ///
     /// * `buffers` - Raw pointers to buffer data (input and output buffers)
     /// * `vals` - Variable values in positional order (matches `var_names` in CompiledSpec)
-    /// * `global_size` - Global work size (for GPU backends, None for CPU)
-    /// * `local_size` - Local work size (for GPU backends, None for CPU)
+    /// * `global_size` - Global work size; the CPU backend reads `[0]` as its
+    ///   thread count (`None` or 1 runs single-threaded)
+    /// * `local_size` - Local work size (GPU backends; CPU ignores it)
     /// * `wait` - Block until this dispatch completes before returning. GPU
     ///   backends submit asynchronously and rely on the device timeline for
     ///   ordering, so `wait=false` returns right after submit. Pass `true`
@@ -219,7 +220,7 @@ pub trait PlanContext: Send + Sync {
     /// this context (empty disables), returning how many of `counters` this
     /// backend collects: those naming another backend are dropped. Default
     /// collects none. Counters are reported via
-    /// [`DispatchTimestamps::counters`].
+    /// [`DispatchTimestamps::counters`](crate::DispatchTimestamps::counters).
     fn set_pmc(&self, _counters: &[crate::profile::PmcCounter]) -> usize {
         0
     }

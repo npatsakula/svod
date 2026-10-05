@@ -21,7 +21,7 @@ use crate::optimizer::{
 // ============================================================================
 
 /// Information about a detected matmul pattern. `in0`/`in1` are the tensor-core
-/// operands: the MUL inputs with an exact integer widening peeled ([`tc_operand`]).
+/// operands: the MUL inputs with an exact integer widening peeled (`tc_operand`).
 #[derive(Debug, Clone)]
 pub struct MatmulPattern {
     pub reduce_op: Arc<UOp>,

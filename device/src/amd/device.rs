@@ -202,10 +202,9 @@ pub struct AmdDeviceCore {
     /// Backend implementation (KFD today). All ioctls route through this.
     iface: Arc<dyn crate::amd::iface::AmdIface>,
     /// Whether an SDMA copy queue is available on this physical device. Set
-    /// by the factory after it tries to create one.
-    /// Today every AMD buffer is host-visible + memcpy'd, so this stays
-    /// `false` and the SDMA queue is dead code — kept on the core for the
-    /// future SDMA revival.
+    /// by the factory once it installs one (every AMD part unless
+    /// `AMD_DISABLE_SDMA` is set or creation fails); while `false`, every
+    /// buffer is forced host-visible.
     has_sdma_queue: AtomicBool,
     /// Opt-in for PM4 single-XCC graph capture (see `AmdGraph::capture`). Default
     /// `false` (per-call dispatch) — capture is a measured regression on gfx1151
@@ -272,7 +271,7 @@ pub struct AmdDeviceCore {
 /// routes through `dev.synchronize() → core.synchronize_all()`, which drains
 /// EVERY pool queue registered on the core.
 ///
-/// Immutable Core fields stay reachable via [`Deref`] — `self.dev.node`,
+/// Immutable Core fields stay reachable via [`Deref`](std::ops::Deref) — `self.dev.node`,
 /// `self.dev.kfd_fd`, `self.dev.poison_error()`, etc.
 #[derive(Debug)]
 pub struct AmdDevice {

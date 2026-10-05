@@ -278,7 +278,8 @@ pub struct KernelProfile {
     pub gpu_end_ns: Option<u64>,
     /// Tier-2/3 static analysis (estimated flops/bytes + decoded GPU resources),
     /// populated by [`ExecutionPlan::profile`](crate::ExecutionPlan::profile) when
-    /// `static_analysis` is set. `None` from [`ExecutionPlan::execute_profiled`].
+    /// `static_analysis` is set. `None` from
+    /// [`ExecutionPlan::execute_profiled`](crate::ExecutionPlan::execute_profiled).
     pub static_info: Option<KernelStaticInfo>,
     /// Tier-4 hardware performance counters, populated when PMC was enabled.
     pub counters: Option<CounterSet>,
@@ -361,7 +362,7 @@ pub struct ProfileOptions {
     pub counters: PmcSelection,
     /// Depth of the origin rollup ([`aggregate_origins`]): `None` rolls up to
     /// the leaf scope (the full module path), `Some(d)` to the `d` outermost
-    /// frames. [`OriginFrame::Call`](svod_ir::origin::OriginFrame::Call) frames
+    /// frames. [`OriginFrame::Call`] frames
     /// are always dropped from the rollup key — they are the flat `file:line`
     /// layer under a module path, shown as per-row detail instead.
     pub origin_depth: Option<usize>,
@@ -649,7 +650,7 @@ const ORIGIN_DETAIL_KERNELS: usize = 3;
 /// Columns are `total ms | count | mean µs | % | origin path`, matching
 /// [`render_histogram`]'s shape with the path in the name slot; each exclusive
 /// row lists its top kernels while the section has fewer than
-/// [`ORIGIN_DETAIL_ROWS`] rows.
+/// `ORIGIN_DETAIL_ROWS` rows.
 ///
 /// Empty when no dispatch carries a scope, which keeps a capture-off profile
 /// byte-identical to one rendered by a build without origin tracking.
@@ -759,7 +760,7 @@ pub struct RunProfile {
     pub stages: Vec<StageProfile>,
     /// Rollup depth this profile was produced at, from
     /// [`ProfileOptions::origin_depth`]; `None` rolls up to the leaf scope. The
-    /// no-argument renderers ([`Self::render_table`], [`Display`],
+    /// no-argument renderers ([`Self::render_table`], [`Display`](std::fmt::Display),
     /// [`Self::to_json`]) use it; the `_at` variants override it.
     pub origin_depth: Option<usize>,
 }

@@ -7,16 +7,16 @@
 //! once and the head flows through the type system.
 //!
 //! Submodules:
-//! - [`model`] — unified `GigaAm` + `Head` enum + `RnntRuntime` + all loaders.
-//! - [`jit`] — shared `GigaAmEncoderJit` (encoder-only, fp32 output).
-//! - [`ctc`] — `CTCHead` + `CtcHeadJit` (head-only; chains after the encoder JIT).
-//! - [`rnnt`] — `RnntHead`, predictor / joint step JITs, `RnntStepBackend`.
+//! - `model` — unified `GigaAm` + `Head` enum + `RnntRuntime` + all loaders.
+//! - `jit` — shared `GigaAmEncoderJit` (encoder-only, fp32 output).
+//! - `ctc` — `CTCHead` + `CtcHeadJit` (head-only; chains after the encoder JIT).
+//! - `rnnt` — `RnntHead`, predictor / joint step JITs, `RnntStepBackend`.
 //!
 //! Shared infrastructure:
-//! - [`config`] — `GigaAmConfig` JSON parsing.
-//! - [`encoder`] — `Encoder` + Conformer building blocks (also owns the RoPE cache).
-//! - [`remap`] — PyTorch state-dict key remapping.
-//! - [`error`] — `Error` / `Result`.
+//! - `config` — `GigaAmConfig` JSON parsing.
+//! - `encoder` — `Encoder` + Conformer building blocks (also owns the RoPE cache).
+//! - `remap` — PyTorch state-dict key remapping.
+//! - `error` — `Error` / `Result`.
 
 mod config;
 mod ctc;

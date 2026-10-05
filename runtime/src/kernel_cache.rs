@@ -1,6 +1,7 @@
 //! Global kernel deduplication cache.
 //!
-//! This module provides a global concurrent cache that maps (UOp ID, device) pairs to compiled kernels.
+//! This module provides a global concurrent cache that maps (program content hash,
+//! compiler key) pairs to compiled kernels.
 //! Uses papaya's lock-free HashMap for thread-safe access across parallel tensor operations.
 //!
 //! # Thread Safety
@@ -10,10 +11,10 @@
 //!
 //! # Deduplication
 //!
-//! Thanks to hash consing in `ir/src/uop/hash_consing.rs`, identical ASTs automatically
-//! have identical IDs, making kernel deduplication trivial. The key includes both the
-//! AST ID and the device string to support multi-GPU systems where the same kernel
-//! might be compiled differently for different devices.
+//! Callers key by the structural content hash of the rendered program
+//! (`UOp::content_hash`) plus the compiler's `cache_key()`, so
+//! identical programs share one compiled kernel while different compilers
+//! (backend, target arch, options) never collide.
 
 use std::sync::{Arc, OnceLock};
 
@@ -52,15 +53,12 @@ pub struct CachedKernel {
     pub local_size: Option<[Arc<UOp>; 3]>,
 }
 
-/// Cache key: (AST ID, device string).
-///
-/// Using both AST ID and device allows the same logical kernel to be compiled
-/// differently for different devices (e.g., CPU vs CUDA, or CUDA:0 vs CUDA:1).
+/// Cache key: (program content hash, compiler cache key).
 type KernelKey = (u64, String);
 
 // Global kernel dedup cache using lock-free concurrent HashMap.
 //
-// Maps (UOp ID, device) -> Arc<CachedKernel>.
+// Maps (program hash, compiler key) -> Arc<CachedKernel>.
 // Kernels live for the process lifetime — the cache is never torn down.
 static KERNELS: OnceLock<HashMap<KernelKey, Arc<CachedKernel>>> = OnceLock::new();
 
@@ -68,7 +66,7 @@ fn kernels() -> &'static HashMap<KernelKey, Arc<CachedKernel>> {
     KERNELS.get_or_init(HashMap::new)
 }
 
-/// Get or compile a kernel by UOp ID and device.
+/// Get or compile a kernel by program hash and compiler key.
 ///
 /// Thread-safe: if multiple threads call this with the same key concurrently,
 /// exactly one will compile the kernel, and all others will receive a clone
@@ -76,8 +74,8 @@ fn kernels() -> &'static HashMap<KernelKey, Arc<CachedKernel>> {
 ///
 /// # Arguments
 ///
-/// * `ast_id` - The UOp ID of the kernel AST (from hash consing)
-/// * `device` - Device string (e.g., "CPU", "CUDA:0")
+/// * `program_hash` - Content hash of the rendered program
+/// * `compiler_key` - The compiler's `cache_key()`
 /// * `compile_fn` - Function to compile the kernel if not cached
 ///
 /// # Returns
@@ -87,11 +85,11 @@ fn kernels() -> &'static HashMap<KernelKey, Arc<CachedKernel>> {
 /// # Errors
 ///
 /// Returns error if compilation fails
-pub fn get_or_compile_kernel<F, E>(ast_id: u64, device: &str, compile_fn: F) -> Result<Arc<CachedKernel>, E>
+pub fn get_or_compile_kernel<F, E>(program_hash: u64, compiler_key: &str, compile_fn: F) -> Result<Arc<CachedKernel>, E>
 where
     F: FnOnce() -> Result<CachedKernel, E>,
 {
-    let key = (ast_id, device.to_string());
+    let key = (program_hash, compiler_key.to_string());
     let map = kernels();
     let guard = map.guard();
 
@@ -121,7 +119,7 @@ where
 }
 
 // No `clear_all` / `gc_unused_kernels`: the cache is intentionally
-// process-static and deduped by `(ast_id, device)`. Identical ASTs share an
+// process-static and deduped by `(program_hash, compiler_key)`. Identical programs share an
 // `Arc<CachedKernel>` so cross-test interference is moot; a public bulk
 // drop would burst `AmdProgram::Drop` (and equivalents) through the cache
 // while in-flight dispatches still resolve through it — exactly the

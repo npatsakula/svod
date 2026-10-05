@@ -37,7 +37,7 @@ impl<'k> Group<'k> {
     pub fn neg_inf(&self, reg: RT<'k>) -> RT<'k> {
         self.clear(reg, f64::NEG_INFINITY)
     }
-    /// Fill a register *vector* with `value` (the [`RV`] analog of [`clear`]).
+    /// Fill a register *vector* with `value` (the [`RV`] analog of `clear`).
     ///
     /// # Panics
     /// Panics if the group has more than one warp.

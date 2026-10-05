@@ -1,7 +1,7 @@
 //! UOp → Z3 conversion.
 //!
 //! Converts Svod IR (UOps) to Z3 expressions for verification.
-//! Uses z3 crate v0.19.4's global context model.
+//! Uses the z3 crate's (0.21) implicit thread-local context.
 
 use std::collections::HashMap;
 use std::sync::Arc;

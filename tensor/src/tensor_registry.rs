@@ -258,7 +258,7 @@ pub fn get_tensor(id: u64) -> Option<Arc<TensorEntry>> {
 ///
 /// Tensors: removes entries whose `Weak<TensorEntry>` can no longer be
 /// upgraded. Buffer entries need no sweep — they expire automatically via the
-/// UOp drop hook installed in [`buffers`].
+/// UOp drop hook installed in `buffers`.
 pub fn gc_dead_refs() {
     let map = tensors();
     let guard = map.guard();

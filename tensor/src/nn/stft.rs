@@ -10,8 +10,8 @@
 //! and when the window is known on the host (a named one, or a `Custom`
 //! buffer) the kernel is tabulated there in f64 and uploaded once, like the
 //! mel filterbank, so no launch rebuilds it per run. Both operands are also
-//! zero-padded to extents the optimizer can tile ([`FRAME_ALIGN`],
-//! [`BIN_ALIGN`]) and the surplus trimmed afterwards; the padded form never
+//! zero-padded to extents the optimizer can tile (`FRAME_ALIGN`,
+//! `BIN_ALIGN`) and the surplus trimmed afterwards; the padded form never
 //! leaves this crate.
 //!
 //! ## Conventions
@@ -764,7 +764,7 @@ impl Tensor {
     /// the synthesis window, overlap-added, and divided by the overlap-add of
     /// the squared window. The first three steps are one `conv1d` over the
     /// frame axis against a host-built `[hop, 2F, ⌈n_fft/hop⌉]` kernel (see
-    /// [`ola_table`]) and the divisor is a host-built `[L]` table, so the
+    /// `ola_table`) and the divisor is a host-built `[L]` table, so the
     /// transform is one reduce of `2F·⌈n_fft/hop⌉` per output sample plus an
     /// elementwise epilogue.
     ///

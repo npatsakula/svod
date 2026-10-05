@@ -97,7 +97,7 @@ impl std::fmt::Debug for CudaAllocator {
 }
 
 impl Allocator for CudaAllocator {
-    /// See [`Self::memory_kind`].
+    /// See `memory_kind`.
     fn _alloc(&self, size: usize, options: &BufferSpec, zero: bool) -> Result<RawBuffer> {
         let api = self.dev.enter()?;
         let alloc_len = size.max(1);

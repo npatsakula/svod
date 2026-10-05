@@ -6,7 +6,7 @@
 //! that address?* This registry closes that gap. [`KfdIface::alloc_raw`] records
 //! each mapped range; [`KfdIface::free_raw`] removes it (and retains it in a
 //! bounded freed-history ring for use-after-free triage); on a fault,
-//! [`KfdIface::wait_events`] calls [`VaRegistry::classify`] to enrich the fault
+//! [`KfdIface::wait_events`] calls `VaRegistry::classify` to enrich the fault
 //! message — "this VA is +0x40 into a LIVE scratch alloc", "this VA is in a
 //! RECENTLY-FREED region (stale/use-after-free)", or "this VA is in no tracked
 //! allocation; nearest live neighbours are …".

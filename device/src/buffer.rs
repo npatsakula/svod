@@ -685,7 +685,7 @@ impl Buffer {
     }
 
     /// Copy `src` into this buffer starting at byte `dst_off`. Partial-write
-    /// counterpart to [`copyout_prefix`] — used to seed a region of a
+    /// counterpart to [`copyout_prefix`](Self::copyout_prefix) — used to seed a region of a
     /// device-local buffer (e.g. one lane's KV-cache row) from host memory
     /// via the copy engine, without a host-visible mapping.
     pub fn copyin_at(&mut self, dst_off: usize, src: &[u8]) -> Result<()> {
