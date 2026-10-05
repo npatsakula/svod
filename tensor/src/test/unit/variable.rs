@@ -552,3 +552,71 @@ crate::codegen_tests! {
         assert_close_f32(&result.as_vec::<f32>().unwrap(), &[32.0], 1e-5);
     }
 }
+
+// ==========================================================================
+// Placeholder storage identity: one BUFFER, one storage, across plans
+// ==========================================================================
+
+crate::codegen_tests! {
+    /// `y` captured the placeholder before the assign; realizing the assign
+    /// stores into that identity (no copy), so `y` reads the data.
+    fn test_empty_assign_realize_keeps_identity_for_dependents(config) {
+        test_setup();
+        let x = Tensor::empty(&[3], DType::Float32);
+        let placeholder = x.uop().base().id;
+        let y = (&x * &Tensor::from_slice([2.0f32, 2.0, 2.0])).unwrap();
+
+        x.assign(&Tensor::from_slice([10.0f32, 20.0, 30.0]));
+        x.realize_with(&config).unwrap();
+        assert_eq!(x.uop().base().id, placeholder);
+        assert_close_f32(&x.as_vec::<f32>().unwrap(), &[10.0, 20.0, 30.0], 1e-6);
+        assert_close_f32(&y.realize_with_and(&config).as_vec::<f32>().unwrap(), &[20.0, 40.0, 60.0], 1e-6);
+    }
+
+    /// A plan prepared over a placeholder binds its storage; host writes through
+    /// the placeholder's `array_view_mut` are what the next execute reads.
+    fn test_empty_placeholder_host_writes_reach_prepared_plan(config) {
+        test_setup();
+        let x = Tensor::empty(&[3], DType::Float32);
+        let y = (&x + &Tensor::from_slice([1.0f32, 1.0, 1.0])).unwrap();
+        let plan = y.prepare_with(&config).unwrap();
+
+        for (frame, expected) in [([1.0f32, 2.0, 3.0], [2.0f32, 3.0, 4.0]), ([4.0, 5.0, 6.0], [5.0, 6.0, 7.0])] {
+            x.array_view_mut::<f32>().unwrap().as_slice_mut().unwrap().copy_from_slice(&frame);
+            plan.execute().unwrap();
+            assert_close_f32(&y.as_vec::<f32>().unwrap(), &expected, 1e-6);
+        }
+    }
+
+    /// Every realized assign lands in the storage the prepared plan reads.
+    fn test_assign_realize_replays_through_prepared_plan(config) {
+        test_setup();
+        let x = Tensor::from_slice([0.0f32, 0.0, 0.0]);
+        let y = (&x * &Tensor::from_slice([2.0f32, 2.0, 2.0])).unwrap();
+        let plan = y.prepare_with(&config).unwrap();
+
+        for (frame, expected) in [([1.0f32, 2.0, 3.0], [2.0f32, 4.0, 6.0]), ([4.0, 5.0, 6.0], [8.0, 10.0, 12.0])] {
+            x.assign(&Tensor::from_slice(frame));
+            x.realize_with(&config).unwrap();
+            plan.execute().unwrap();
+            assert_close_f32(&y.as_vec::<f32>().unwrap(), &expected, 1e-6);
+        }
+    }
+
+    /// Two plans over one placeholder share its storage rather than each
+    /// allocating a private one.
+    fn test_empty_placeholder_shared_by_two_plans(config) {
+        test_setup();
+        let x = Tensor::empty(&[2], DType::Float32);
+        let double = (&x + &x).unwrap();
+        let negate = (&Tensor::from_slice([0.0f32, 0.0]) - &x).unwrap();
+        let plan_double = double.prepare_with(&config).unwrap();
+        let plan_negate = negate.prepare_with(&config).unwrap();
+
+        x.array_view_mut::<f32>().unwrap().as_slice_mut().unwrap().copy_from_slice(&[1.5, -2.0]);
+        plan_double.execute().unwrap();
+        plan_negate.execute().unwrap();
+        assert_close_f32(&double.as_vec::<f32>().unwrap(), &[3.0, -4.0], 1e-6);
+        assert_close_f32(&negate.as_vec::<f32>().unwrap(), &[-1.5, 2.0], 1e-6);
+    }
+}

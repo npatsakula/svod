@@ -230,6 +230,28 @@ fn test_if_shape_mismatch_errors() {
 // Trace API tests
 // =========================================================================
 
+/// `y = x * [2, 2, 2]` with `x` a runtime input: a non-identity graph, so the
+/// output's trace captures the placeholder rather than aliasing it.
+fn make_mul_by_two_model() -> ModelProto {
+    let mut g = GraphProto::default();
+    g.name = "runtime_input_mul".to_string();
+    g.input.push(make_typed_input("x", tensor_proto::DataType::Float as i32, &[3]));
+    let mut two = TensorProto::default();
+    two.name = "two".to_string();
+    two.data_type = tensor_proto::DataType::Float as i32;
+    two.dims = vec![3];
+    two.float_data = vec![2.0, 2.0, 2.0];
+    g.initializer.push(two);
+    g.output.push(ValueInfoProto { name: "y".to_string(), ..Default::default() });
+    g.node.push(NodeProto {
+        op_type: "Mul".to_string(),
+        input: vec!["x".to_string(), "two".to_string()],
+        output: vec!["y".to_string()],
+        ..Default::default()
+    });
+    ModelProto { graph: Some(g), ..Default::default() }
+}
+
 fn make_typed_input(name: &str, dtype: i32, dims: &[i64]) -> ValueInfoProto {
     use crate::parser::onnx::{TensorShapeProto, TypeProto, tensor_shape_proto};
     let shape = TensorShapeProto {
@@ -1448,40 +1470,60 @@ svod_tensor::codegen_tests! {
         assert_eq!(view.as_slice().unwrap(), &[1.0, 2.0, 3.0]);
     }
 
-    /// onnx.md "Models with Runtime Inputs" — inputs.remove + assign + realize_batch
+    /// onnx.md "Placeholder inputs" — inputs.remove + assign + realize the
+    /// input + realize_batch. `y = x * 2` captured the placeholder before the
+    /// assign; the realized write lands in that identity, so it sees the data.
     fn test_doc_runtime_input_assign_realize_batch(config) {
         use crate::importer::OnnxModel;
 
-        // Build model with a runtime input (not an initializer)
-        let importer = OnnxImporter::new();
-        let model = {
-            let mut m = ModelProto::default();
-            let mut g = GraphProto::default();
-            g.name = "runtime_input_test".to_string();
-            g.input.push(make_typed_input("x", tensor_proto::DataType::Float as i32, &[3]));
-            let mut output = ValueInfoProto::default();
-            output.name = "y".to_string();
-            g.output.push(output);
-            let mut node = NodeProto::default();
-            node.op_type = "Identity".to_string();
-            node.input.push("x".to_string());
-            node.output.push("y".to_string());
-            g.node.push(node);
-            m.graph = Some(g);
-            m
-        };
-
-        let OnnxModel { mut inputs, outputs, .. } = importer.import_model(model, &[]).unwrap();
-
-        // Doc pattern: take ownership of input, assign data
+        let OnnxModel { mut inputs, outputs, .. } =
+            OnnxImporter::new().import_model(make_mul_by_two_model(), &[]).unwrap();
         let input = inputs.remove("x").unwrap();
-        input.assign(&Tensor::from_slice([10.0f32, 20.0, 30.0]));
+        let placeholder = input.uop().base().id;
 
-        // realize_batch resolves assigns internally
+        input.assign(&Tensor::from_slice([10.0f32, 20.0, 30.0]));
+        input.realize_with(&config).unwrap();
+        assert_eq!(input.uop().base().id, placeholder, "an in-place assign keeps the placeholder identity");
+        assert_eq!(input.as_vec::<f32>().unwrap(), [10.0, 20.0, 30.0]);
+
         let outs: Vec<&Tensor> = outputs.values().collect();
         Tensor::realize_batch_with(outs, &config).unwrap();
-
         let view = outputs["y"].array_view::<f32>().unwrap();
-        assert_eq!(view.as_slice().unwrap(), &[10.0, 20.0, 30.0]);
+        assert_eq!(view.as_slice().unwrap(), &[20.0, 40.0, 60.0]);
+    }
+
+    /// onnx.md "Replay" — prepare_batch over the placeholder, then write the
+    /// input through `array_view_mut` before every execute.
+    fn test_doc_runtime_input_prepare_replay(config) {
+        use crate::importer::OnnxModel;
+
+        let OnnxModel { inputs, outputs, .. } =
+            OnnxImporter::new().import_model(make_mul_by_two_model(), &[]).unwrap();
+        let plan = Tensor::prepare_batch_with(outputs.values(), &config).unwrap();
+
+        let input = &inputs["x"];
+        for (frame, expected) in [([1.0f32, 2.0, 3.0], [2.0f32, 4.0, 6.0]), ([4.0, 5.0, 6.0], [8.0, 10.0, 12.0])] {
+            input.array_view_mut::<f32>().unwrap().as_slice_mut().unwrap().copy_from_slice(&frame);
+            plan.execute().unwrap();
+            assert_eq!(outputs["y"].as_vec::<f32>().unwrap(), expected);
+        }
+    }
+
+    /// Replay through assign: every realized assign stores into the storage the
+    /// prepared plan reads, so each execute sees the latest value.
+    fn test_doc_runtime_input_assign_replay(config) {
+        use crate::importer::OnnxModel;
+
+        let OnnxModel { inputs, outputs, .. } =
+            OnnxImporter::new().import_model(make_mul_by_two_model(), &[]).unwrap();
+        let plan = Tensor::prepare_batch_with(outputs.values(), &config).unwrap();
+
+        let input = &inputs["x"];
+        for (frame, expected) in [([1.0f32, 2.0, 3.0], [2.0f32, 4.0, 6.0]), ([4.0, 5.0, 6.0], [8.0, 10.0, 12.0])] {
+            input.assign(&Tensor::from_slice(frame));
+            input.realize_with(&config).unwrap();
+            plan.execute().unwrap();
+            assert_eq!(outputs["y"].as_vec::<f32>().unwrap(), expected);
+        }
     }
 }

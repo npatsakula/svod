@@ -60,7 +60,7 @@ impl Tensor {
         Self::from_bytes_shaped_spec(bytes, shape, dtype, device, Default::default())
     }
 
-    /// [`from_bytes_shaped`](Self::from_bytes_shaped) with an explicit
+    /// `from_bytes_shaped` with an explicit
     /// [`svod_device::BufferSpec`]. `cpu_access: false` keeps the buffer
     /// device-local (no host mapping): the init bytes and any later host
     /// access stage through the backend's copy engine (`copyin`/`copyout`),
@@ -363,9 +363,7 @@ impl Tensor {
     /// cannot outlive a materialized copy — so only a buffer identity is
     /// viewable; use [`as_ndarray`](Self::as_ndarray) for anything else.
     pub fn array_view<T: HasDType>(&self) -> Result<ndarray::ArrayViewD<'_, T>> {
-        snafu::ensure!(self.uop().has_buffer_identity(), NoBufferSnafu);
-        let buffer_arc = self.entry.buffer().ok_or(ErrorKind::NoBuffer)?;
-        let flat = buffer_arc.as_array::<T>().context(DeviceSnafu)?;
+        let flat = self.storage()?.as_array::<T>().context(DeviceSnafu)?;
         // Reshape to tensor's logical shape if concrete
         if let Ok(shape) = self.shape() {
             let dims: Vec<usize> = shape.iter().filter_map(|d| d.as_const()).collect();
@@ -377,6 +375,14 @@ impl Tensor {
             }
         }
         Ok(flat)
+    }
+
+    /// Storage behind a buffer identity: this tensor's own, or the one a plan
+    /// bound to the identity when a placeholder's dependents were scheduled.
+    fn storage(&self) -> Result<&Arc<Buffer>> {
+        snafu::ensure!(self.uop().has_buffer_identity(), NoBufferSnafu);
+        self.ensure_buffer();
+        self.entry.buffer().ok_or_else(|| ErrorKind::NoBuffer.into())
     }
 
     /// Typed mutable view into the buffer, shaped by the tensor's logical shape.
@@ -393,9 +399,7 @@ impl Tensor {
     /// buffer-identity requirement — writing through a view would land the
     /// values at the wrong offsets in the base buffer.
     pub fn array_view_mut<T: HasDType>(&self) -> Result<ndarray::ArrayViewMutD<'_, T>> {
-        snafu::ensure!(self.uop().has_buffer_identity(), NoBufferSnafu);
-        let buffer_arc = self.entry.buffer().ok_or(ErrorKind::NoBuffer)?;
-        let flat = buffer_arc.as_array_mut::<T>().context(DeviceSnafu)?;
+        let flat = self.storage()?.as_array_mut::<T>().context(DeviceSnafu)?;
         if let Ok(shape) = self.shape() {
             let dims: Vec<usize> = shape.iter().filter_map(|d| d.as_const()).collect();
             if dims.len() == shape.len() {
