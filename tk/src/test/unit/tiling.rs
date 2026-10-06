@@ -6,15 +6,20 @@
 //! convolution shapes YOLO26-x tunes on it, whose per-candidate times were
 //! measured on the hardware.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use svod_dtype::DType;
+use svod_dtype::{AmdArch, CudaArch, DType, GpuArch};
+use svod_ir::UOp;
 use test_case::test_case;
 
-use crate::kernels::conv::ConvGeom;
-use crate::kernels::gemm::{GemmCfg, NT_128X64};
-use crate::kernels::tiling::{TileBudget, Trial, TripCost, agreement, pack};
+use crate::kernels::conv::{ConvGeom, build_conv, stored_tile};
+use crate::kernels::gemm::{Epilogue, GemmCfg, NT_128X64};
+use crate::kernels::tiling::{TileBudget, Trial, TripCost, pack};
 use crate::target::WorkgroupLimits;
+
+const SM86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
+const RDNA4: GpuArch = GpuArch::Amd(AmdArch::Gfx1201);
 
 /// An RTX 3060 (GA106): 28 SMs, 48 KiB of shared memory a workgroup, 100 KiB an
 /// SM, a 64 K register file an SM, `m16n8k16` on a 32-lane warp.
@@ -186,54 +191,78 @@ fn an_untileable_shape_yields_no_candidate() {
     assert!(tiles.is_empty(), "expected no candidate for {m}x{k}x{n}, got {tiles:?}");
 }
 
-/// The one tile class the convolution kernel computes wrong — a wave holding a
-/// single 16x16 accumulator over a 16-deep strip — is neither seeded nor
-/// reached. On gfx1201 all 480 such tiles the walk could reach for YOLO26-m's
-/// shapes returned garbage and one of them won the search for the `64→64 k3
-/// @80²` bodies; `every_lattice_tile_matches_the_graph_gpu` is the sweep that
-/// found it, and this is what keeps it out of the walk on every device.
-#[test_case(yolo_conv(64, 64, 80, 1); "m bodies, where the search picked one")]
-#[test_case(yolo_conv(64, 64, 160, 2); "n backbone.3, where the store held one")]
-#[test_case(yolo_conv(96, 96, 80, 1); "x bodies")]
-#[test_case(yolo_conv(512, 64, 20, 1); "m head at 20, a starved grid")]
-fn the_single_fragment_tile_is_never_reached(g: ConvGeom) {
-    let single = |cfg: &GemmCfg| cfg.reg_m() == 16 && cfg.reg_n() == 16 && cfg.k_step == 16;
-    for budget in [rx_9070_xt(), rtx_3060()] {
-        let tiles = reachable(&budget, &g);
-        assert!(!tiles.is_empty(), "the walk has somewhere to start");
-        let reached: Vec<_> = tiles.iter().filter(|cfg| single(cfg)).collect();
-        assert!(reached.is_empty(), "{reached:?}");
-        // The step onto it from its nearest neighbour is the one refused: every
-        // other move from that tile still stands.
-        let from = GemmCfg { block_m: 32, block_n: 32, warps_m: 2, warps_n: 2, acc_m: 1, k_step: 32, ..NT_128X64 };
-        let moves = budget.neighbours(&from, 2, |cfg| g.tiles(cfg));
-        assert!(moves.iter().all(|cfg| !single(cfg)), "{moves:?}");
-        assert!(!moves.is_empty(), "the other moves from that tile still stand");
-        // The deeper strip stays on offer wherever the channels fill it.
-        assert_eq!(moves.iter().any(|cfg| cfg.k_step == 64), g.cin.is_multiple_of(64), "{moves:?}");
+/// Every tile the walk can reach keeps its accumulator read inside the K loop,
+/// on both devices, checked off the GPU. Where the read lands depends only on
+/// which of `mma`'s height, width and K loops are trip-1 (a trip-1 loop folds
+/// away), so one tile of each of those classes is built. Among them is the
+/// single-fragment tile (one 16x16 accumulator over a 16-deep strip), whose read
+/// once hoisted out of the loop and computed garbage fast enough to win the
+/// search for m's `64→64 k3 @80²` bodies.
+#[test]
+fn every_lattice_tile_keeps_its_accumulator_in_the_k_loop() {
+    let shapes =
+        [yolo_conv(64, 64, 80, 1), yolo_conv(64, 64, 160, 2), yolo_conv(96, 96, 80, 1), yolo_conv(512, 64, 20, 1)];
+    for (budget, arch) in [(rx_9070_xt(), RDNA4), (rtx_3060(), SM86)] {
+        let mut classes: Vec<([bool; 3], ConvGeom, GemmCfg)> = Vec::new();
+        for g in shapes {
+            for cfg in reachable(&budget, &g) {
+                let class = [cfg.reg_m(), cfg.reg_n(), cfg.k_step].map(|edge| edge == budget.mma_edge);
+                if classes.iter().all(|(seen, ..)| *seen != class) {
+                    classes.push((class, g, cfg));
+                }
+            }
+        }
+        assert!(classes.iter().any(|(class, ..)| *class == [true; 3]), "{arch:?} reaches the single-fragment tile");
+        for (class, g, cfg) in classes {
+            let escaped = super::escaped_accumulator_reads(&super::lowered_program(conv_sink(arch, g, cfg), arch));
+            assert!(escaped.is_empty(), "{arch:?} {class:?} {cfg:?}: {escaped:#?}");
+        }
     }
 }
 
-/// A tile whose time and answer are scripted, so the search's own walk runs
-/// without a device.
-struct Scripted {
-    ns: u64,
-    output: Option<Vec<f32>>,
+/// A stored search result decodes to its tile only while the walk could still
+/// reach it: a lattice tile the device admits and the kernel tiles.
+#[test]
+fn a_stored_tile_outside_the_lattice_is_a_miss() {
+    let (budget, g) = (rx_9070_xt(), yolo_conv(96, 96, 80, 1));
+    let base = GemmCfg { l2_swizzle: false, ..NT_128X64 };
+    let stored = |cfg: GemmCfg| stored_tile(&budget, &g, &base, 2, pack(&cfg));
+    let deepened = |cfg: &GemmCfg| GemmCfg { k_step: 64, ..*cfg };
+    let reached = reachable(&budget, &g)
+        .into_iter()
+        .find(|cfg| cfg.k_step == 32 && budget.admits(&deepened(cfg), 2))
+        .expect("a 32-deep tile whose 64-deep strip still fits");
+    assert_eq!(stored(reached).map(|cfg| pack(&cfg)), Some(pack(&reached)), "a tile the walk reaches");
+    assert_eq!(stored(GemmCfg { k_step: 8, ..reached }), None, "a strip under the core's K edge");
+    let huge = GemmCfg { block_m: 256, block_n: 256, warps_m: 1, warps_n: 1, acc_m: 1, ..reached };
+    assert!(!budget.fits(&huge, 2) && stored(huge).is_none(), "a tile past the device's limits");
+    assert_eq!(stored(deepened(&reached)), None, "a strip 96 channels do not divide into");
+    assert_eq!(stored_tile(&budget, &g, &base, 2, pack(&reached) | 1 << 30), None, "bits past the lattice's");
 }
+
+/// `build_conv`'s graph of `cfg` on `arch` over placeholder buffers, with the
+/// unsearched fields the walk's own seeds take.
+fn conv_sink(arch: GpuArch, g: ConvGeom, cfg: GemmCfg) -> Arc<UOp> {
+    let cfg = GemmCfg { l2_swizzle: false, ..cfg };
+    let caps = crate::ArchCaps::for_arch(arch);
+    let (m, k, n) = g.mkn();
+    let dt = DType::Float16;
+    let bufs = [m * n, g.batch * g.h * g.w * g.cin, n * k, n]
+        .into_iter()
+        .map(|size| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dt.clone()))
+        .collect();
+    let ker = crate::Kernel::new("conv2d_nhwc", g.grid_dims(&cfg), cfg.threads(caps.wave_size), bufs, caps);
+    build_conv(&ker, g, cfg, dt, Epilogue::BiasAct { bias: (), residual: None, act: true });
+    ker.finish(cfg.acc_m)
+}
+
+/// A tile whose time is scripted, so the search's own walk runs without a device.
+struct Scripted(Option<u64>);
 
 impl Trial for Scripted {
     fn time(&self) -> Option<Duration> {
-        Some(Duration::from_nanos(self.ns))
+        self.0.map(Duration::from_nanos)
     }
-
-    fn output(&self) -> Option<Vec<f32>> {
-        self.output.clone()
-    }
-}
-
-/// The answer a right tile computes, off by up to `rounding` of each value.
-fn answer(rounding: f32) -> Vec<f32> {
-    (0..256).map(|i| (i as f32 * 0.37).sin() * (1.0 + rounding * ((i % 7) as f32 - 3.0) / 3.0)).collect()
 }
 
 /// m's `64→64 k3 @80²` bodies on gfx1201, where a wrong tile once won, and
@@ -245,106 +274,29 @@ fn m_bodies() -> (TileBudget, ConvGeom, Vec<GemmCfg>) {
     (budget, g, seeds)
 }
 
-/// What a right tile costs: fixed by its config, never the 1 ns of `walk`'s odd one.
+/// What a tile costs in `walk`: fixed by its config, never the 1 ns of a scripted winner.
 fn right_ns(cfg: &GemmCfg) -> u64 {
     1000 + (pack(cfg) % 997) as u64
 }
 
-/// The walk from `seeds` where every tile answers right, each with rounding of
-/// its own (up to 4e-3, above the 2.5e-3 the sweep saw), except `odd`: the
-/// fastest of all, answering `odd_output`.
-fn walk(seeds: &[GemmCfg], odd: GemmCfg, odd_output: Option<Vec<f32>>) -> Option<(GemmCfg, u64)> {
-    let (budget, g, _) = m_bodies();
-    budget.search(
-        seeds,
-        2,
-        agreement(&DType::Float16),
-        |cfg| g.tiles(cfg),
-        |cfg| {
-            Some(match cfg == odd {
-                true => Scripted { ns: 1, output: odd_output.clone() },
-                false => Scripted { ns: right_ns(&cfg), output: Some(answer((pack(&cfg) % 5) as f32 * 1e-3)) },
-            })
-        },
-    )
+/// The walk over m's bodies, where `time` scripts each tile's device time.
+fn walk(time: impl Fn(&GemmCfg) -> Option<u64>) -> Option<(GemmCfg, u64)> {
+    let (budget, g, seeds) = m_bodies();
+    budget.search(&seeds, 2, |cfg| g.tiles(cfg), |cfg| Some(Scripted(time(&cfg))))
 }
 
-fn garbage() -> Vec<f32> {
-    answer(0.0).iter().map(|v| 0.2 - 0.7 * v).collect()
-}
-
-/// A tile that computes garbage faster than anything right never wins: the
-/// seeds agree on the answer without it and it is dropped. Answering right, the
-/// same tile wins, so its output is all that sinks it.
+/// The walk keeps the fastest tile it times, a step off the seeds included, and
+/// never one it could not time, even the seed that would otherwise be fastest.
 #[test]
-fn a_fast_wrong_seed_never_wins() {
-    let (_, _, seeds) = m_bodies();
-    assert!(seeds.len() >= 3, "a majority needs rivals: {seeds:?}");
-    for odd in seeds.clone() {
-        let won = walk(&seeds, odd, Some(garbage())).expect("the right seeds agree");
-        assert!(won.0 != odd && won.1 > 1, "{odd:?} won: {won:?}");
-        assert_eq!(walk(&seeds, odd, Some(answer(0.0))), Some((odd, 1)));
-    }
-}
-
-/// The seeds' answer holds for the rest of the walk: a wrong tile one step from
-/// the fastest seed, where the walk goes next, is dropped the same way.
-#[test]
-fn a_fast_wrong_tile_met_later_is_dropped() {
+fn the_walk_keeps_the_fastest_tile_it_times() {
     let (budget, g, seeds) = m_bodies();
     let fastest = *seeds.iter().min_by_key(|cfg| right_ns(cfg)).expect("seeds");
-    let odd = budget
+    let step = budget
         .neighbours(&fastest, 2, |cfg| g.tiles(cfg))
         .into_iter()
         .find(|cfg| !seeds.contains(cfg))
         .expect("a step off the seeds");
-    let won = walk(&seeds, odd, Some(garbage())).expect("the right seeds agree");
-    assert!(won.0 != odd && won.1 > 1, "{odd:?} won: {won:?}");
-    assert_eq!(walk(&seeds, odd, Some(answer(0.0))), Some((odd, 1)));
-}
-
-/// A NaN agrees with nothing, itself included — not even as the seed the
-/// ranking put first, which a tie would otherwise favour — and an output that
-/// cannot be read back is no answer either.
-#[test_case(Some(vec![f32::NAN; 256]); "NaN")]
-#[test_case(Some(vec![f32::INFINITY; 256]); "infinity")]
-#[test_case(None; "unreadable")]
-fn an_output_that_is_no_number_never_wins(odd_output: Option<Vec<f32>>) {
-    let (_, _, seeds) = m_bodies();
-    let won = walk(&seeds, seeds[0], odd_output).expect("the other seeds agree");
-    assert!(won.0 != seeds[0] && won.1 > 1, "{won:?}");
-}
-
-/// Seeds that agree on nothing leave no way to tell a right tile from a wrong
-/// one: the search gives up and the caller's static tile stands.
-#[test]
-fn seeds_that_cannot_agree_end_the_search() {
-    let (budget, g, seeds) = m_bodies();
-    let found = budget.search(
-        &seeds,
-        2,
-        agreement(&DType::Float16),
-        |cfg| g.tiles(cfg),
-        |cfg| {
-            let phase = seeds.iter().position(|seed| *seed == cfg).unwrap_or(seeds.len()) as f32;
-            Some(Scripted {
-                ns: right_ns(&cfg),
-                output: Some((0..256).map(|i| (i as f32 * 0.37 + phase).sin()).collect()),
-            })
-        },
-    );
-    assert_eq!(found, None);
-}
-
-/// The line between one answer and two sits above what rounding moves two right
-/// tiles apart (the sweep: within 2.5e-3 of the graph each, so 5e-3 of each
-/// other) and below the wrong tile class (0.78 and up), for every dtype the
-/// kernel stores, and it widens with a coarser one.
-#[test]
-fn the_agreement_line_sits_between_rounding_and_the_wrong_class() {
-    for dtype in [DType::Float16, DType::BFloat16, DType::Float32] {
-        let line = agreement(&dtype);
-        assert!(line > 5e-3 && line < 0.78, "{dtype:?}: {line}");
-    }
-    assert!(agreement(&DType::BFloat16) > agreement(&DType::Float16));
+    assert_eq!(walk(|cfg| Some(if *cfg == step { 1 } else { right_ns(cfg) })), Some((step, 1)));
+    let (won, _) = walk(|cfg| (*cfg != fastest).then(|| right_ns(cfg))).expect("the other seeds time");
+    assert_ne!(won, fastest, "an untimed tile never wins");
 }

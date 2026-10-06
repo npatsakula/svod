@@ -13,7 +13,7 @@ use crate::kernels::conv::{
     conv2d_nhwc_worth_asking, declines, select_conv_cfg,
 };
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmPolicy};
-use crate::kernels::tiling::{Launched, TileBudget, Trial, agreement};
+use crate::kernels::tiling::TileBudget;
 
 const RDNA4: GpuArch = GpuArch::Amd(AmdArch::Gfx1201);
 const SM86: GpuArch = GpuArch::Cuda(svod_dtype::CudaArch::from_compute_capability(8, 6));
@@ -403,63 +403,4 @@ fn every_lattice_tile_matches_the_graph_gpu(g: ConvGeom) {
     }
     println!("{} tiles reachable for {g:?}, {} wrong", tiles.len(), wrong.len());
     assert!(wrong.is_empty(), "tiles that compute the wrong thing: {wrong:?}");
-}
-
-/// The lattice search on the device, with one seed made fast and wrong: it runs
-/// its tile as a 1x1 over the same pixels — a ninth of the work, the same output
-/// shape, another answer. The real tiles read back one answer, the odd one is
-/// dropped however fast it ran, and the winner computes the graph's `conv2d`.
-#[test_case(geom(80, 64, 64, 3, 1); "m bodies")]
-#[test_case(geom(40, 128, 128, 3, 2); "n neck.20, stride 2")]
-#[ignore]
-fn the_lattice_search_drops_a_fast_wrong_tile_gpu(g: ConvGeom) {
-    if !device_supported(CONV_SUPPORTED_ARCHS) {
-        eprintln!("skip the_lattice_search_drops_a_fast_wrong_tile_gpu: no supported device / toolchain");
-        return;
-    }
-    let spec = Tensor::empty(&[1], DType::Float32).device();
-    let arch = crate::target::resolve_supported_arch(&spec, CONV_SUPPORTED_ARCHS).expect("a supported arch");
-    let caps = crate::ArchCaps::for_arch(arch);
-    let Some(budget) = TileBudget::for_device(&spec, arch) else {
-        eprintln!("skip the_lattice_search_drops_a_fast_wrong_tile_gpu: the device reports no limits");
-        return;
-    };
-    let dt = DType::Float16;
-    let x = operand(&[g.batch, g.h, g.w, g.cin], dt.clone(), 0.31);
-    let w = operand(&[g.cout, g.kh, g.kw, g.cin], dt.clone(), 0.17);
-    let bias = operand(&[g.cout], dt.clone(), 0.53);
-    let pointwise = ConvGeom { h: g.ho(), w: g.wo(), kh: 1, kw: 1, stride: 1, pad: 0, ..g };
-    let w1 = operand(&[g.cout, 1, 1, g.cin], dt.clone(), 0.29);
-    let seeds = conv_tile_seeds(&budget, &GemmPolicy::for_device(&spec, arch), &dt, &g);
-    let odd = *seeds.iter().find(|cfg| pointwise.tiles(cfg)).expect("a seed that also tiles the 1x1");
-    let x1 = operand(&[g.batch, g.ho(), g.wo(), g.cin], dt.clone(), 0.37);
-
-    let (m, n) = (g.mkn().0, g.mkn().2);
-    let epi = Epilogue::BiasAct { bias: (), residual: None, act: true };
-    let mut compile = |cfg: GemmCfg| {
-        let (geom, x, w) = if cfg == odd { (pointwise, &x1, &w1) } else { (g, &x, &w) };
-        let mut y = Tensor::empty(&[m, n], dt.clone()).to(spec.clone());
-        let plan = ConvPlan::Gathered(cfg);
-        let (grid, block) = (plan.grid_dims(&geom), cfg.threads(caps.wave_size));
-        let dtc = dt.clone();
-        let launch = crate::launch::compile_kernel("conv2d_nhwc_search", grid, block, &mut [&mut y], &[x, w, &bias], {
-            move |ker| {
-                plan.build(ker, geom, dtc, epi);
-                ker.finish(cfg.acc_m)
-            }
-        })
-        .ok()?;
-        Some(Launched { launch, output: y })
-    };
-    let (won, _) = budget.search(&seeds, dt.bytes(), agreement(&dt), |cfg| g.tiles(cfg), &mut compile).expect("a tile");
-    assert_ne!(won, odd, "the fast wrong tile won");
-    // Its answer is all that kept it out: timed against the winner, it is faster.
-    let best = |trial: &Launched| (0..20).filter_map(|_| trial.time()).min().expect("a device time");
-    let (odd_trial, won_trial) = (compile(odd).expect("the odd tile"), compile(won).expect("the winner"));
-    let (odd_time, won_time) = (best(&odd_trial), best(&won_trial));
-    assert!(odd_time < won_time, "the odd tile ({odd_time:?}) was not faster than the winner ({won_time:?})");
-
-    let got = won_trial.output().expect("the winner's output");
-    let err = rel_err(&got, &to_f32_vec(&reference(&g, &x, &w, &bias, None)));
-    assert!(err < 4e-3, "the winner {won:?} is off the graph by {err:e}");
 }

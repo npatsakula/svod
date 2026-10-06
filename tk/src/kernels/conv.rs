@@ -314,8 +314,7 @@ pub fn tuned_conv_plan(
         dtype.bytes(),
         epi.code(),
     ];
-    // One set of operands for every candidate, drawn on first use, so their
-    // outputs are one answer to check each other against.
+    // One set of operands, drawn on first use and shared by every candidate.
     let operands: OnceCell<Option<Vec<Tensor>>> = OnceCell::new();
     let compile = |plan: ConvPlan| {
         let ins = operands.get_or_init(|| {
@@ -333,11 +332,8 @@ pub fn tuned_conv_plan(
         let ins: Vec<&Tensor> = ins.as_ref()?.iter().collect();
         let mut y = Tensor::empty(&[m, n], dtype.clone()).to(spec.clone());
         let (grid, block) = (plan.grid_dims(&geom), plan.cfg().threads(caps.wave_size));
-        let launch = crate::launch::compile_kernel("conv2d_nhwc_tune", grid, block, &mut [&mut y], &ins, move |ker| {
-            build(ker, plan)
-        })
-        .ok()?;
-        Some(tiling::Launched { launch, output: y })
+        crate::launch::compile_kernel("conv2d_nhwc_tune", grid, block, &mut [&mut y], &ins, move |ker| build(ker, plan))
+            .ok()
     };
 
     // The tap-unrolled and image-staged rewrites are the other half of the
@@ -359,15 +355,14 @@ pub fn tuned_conv_plan(
             let key = crate::tune::TuneKey::new("conv2d_nhwc", spec, arch, &shape, &(&seeds, dtype));
             let builds = || seeds.iter().map(|&cfg| fingerprint(ConvPlan::Gathered(cfg))).collect();
             let search = || {
-                let (bytes, tolerance) = (dtype.bytes(), tiling::agreement(dtype));
                 budget
-                    .search(&seeds, bytes, tolerance, |cfg| geom.tiles(cfg), |cfg| compile(ConvPlan::Gathered(cfg)))
+                    .search(&seeds, dtype.bytes(), |cfg| geom.tiles(cfg), |cfg| compile(ConvPlan::Gathered(cfg)))
                     .map(|(cfg, ns)| (tiling::pack(&cfg), ns))
             };
+            let stored = |bits| stored_tile(&budget, &geom, &first, dtype.bytes(), bits);
             return store
-                .searched(&key, builds, search)
-                .map(|bits| tiling::unpack(&first, bits))
-                .filter(|cfg| geom.tiles(cfg))
+                .searched(&key, builds, |bits| stored(bits).is_some(), search)
+                .and_then(stored)
                 .map(ConvPlan::Gathered)
                 .or_else(fallback);
         }
@@ -378,10 +373,20 @@ pub fn tuned_conv_plan(
     }
     let key = crate::tune::TuneKey::new("conv2d_nhwc", spec, arch, &shape, &(&candidates, dtype));
     let builds = || candidates.iter().map(|&plan| fingerprint(plan)).collect();
-    store
-        .select(&key, candidates.len(), builds, |i| compile(candidates[i]).map(|trial| trial.launch))
-        .map(|i| candidates[i])
-        .or_else(fallback)
+    store.select(&key, candidates.len(), builds, |i| compile(candidates[i])).map(|i| candidates[i]).or_else(fallback)
+}
+
+/// The tile a stored search result names, while the walk could still reach it:
+/// a lattice tile (it packs back to `bits`) the device admits and `geom` tiles.
+pub(crate) fn stored_tile(
+    budget: &TileBudget,
+    geom: &ConvGeom,
+    base: &GemmCfg,
+    in_bytes: usize,
+    bits: usize,
+) -> Option<GemmCfg> {
+    let cfg = tiling::unpack(base, bits);
+    (tiling::pack(&cfg) == bits && budget.admits(&cfg, in_bytes) && geom.tiles(&cfg)).then_some(cfg)
 }
 
 /// The plan for `geom` on the device behind `spec`: measured when tuning is on

@@ -180,18 +180,21 @@ impl TuneStore {
     /// The store keeps that integer exactly as it keeps a candidate index — the
     /// caller decodes it — so a measured search survives the process without the
     /// space having to be reproducible, which a search steered by measurement is
-    /// not.
+    /// not. A stored value `valid` rejects — written for a space that has since
+    /// changed — is searched again and overwritten, so the memo only ever holds a
+    /// value that passed.
     pub fn searched(
         &self,
         key: &TuneKey,
         builds: impl FnOnce() -> Vec<u128>,
+        valid: impl Fn(usize) -> bool,
         search: impl FnOnce() -> Option<(usize, u64)>,
     ) -> Option<usize> {
         if let Some(found) = self.memo.lock().expect("tune memo").get(key) {
             return Some(*found);
         }
         let line = key.line(&builds());
-        let chosen = match self.get(key, &line) {
+        let chosen = match self.get(key, &line).filter(|found| valid(*found)) {
             Some(found) => found,
             None => {
                 let (found, ns) = search()?;

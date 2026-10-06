@@ -38,88 +38,31 @@ use std::time::Duration;
 
 use smallvec::SmallVec;
 use svod_device::KernelResources;
-use svod_dtype::DType;
 use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
-use svod_tensor::Tensor;
 
 use super::gemm::GemmCfg;
 use crate::launch::CompiledLaunch;
 use crate::target::WorkgroupLimits;
 use crate::tune::ROUNDS as TUNE_ROUNDS;
 
-/// One compiled tile, as [`TileBudget::search`] sees it. Every trial of a search
-/// computes on the same operands, so right ones agree.
+/// One compiled tile, as [`TileBudget::search`] sees it.
 pub trait Trial {
     /// One dispatch's device time; `None` when the backend stamps none.
     fn time(&self) -> Option<Duration>;
-    /// What the last dispatch wrote, widened to f32; `None` when unreadable.
-    fn output(&self) -> Option<Vec<f32>>;
     /// The registers, LDS and scratch the tile compiled to, when known.
     fn resources(&self) -> Option<KernelResources> {
         None
     }
 }
 
-/// A tile compiled against a search's shared operands, and the tensor it writes.
-pub struct Launched {
-    pub launch: CompiledLaunch,
-    pub output: Tensor,
-}
-
-impl Trial for Launched {
+impl Trial for CompiledLaunch {
     fn time(&self) -> Option<Duration> {
-        self.launch.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos)
-    }
-
-    fn output(&self) -> Option<Vec<f32>> {
-        let wide = self.output.cast(DType::Float32).contiguous();
-        wide.realize().ok()?;
-        wide.as_vec::<f32>().ok()
+        self.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos)
     }
 
     fn resources(&self) -> Option<KernelResources> {
-        self.launch.resources()
+        CompiledLaunch::resources(self)
     }
-}
-
-/// How far two tiles' outputs of `dtype` may be apart ([`distance`]) and still
-/// be one answer: sixteen units in its last place, never under 1e-2.
-///
-/// Right tiles differ in rounding alone: the sweep that found the wrong tile
-/// class put all 4769 right m tiles within 2.5e-3 of the graph's answer (median
-/// 9.8e-4), so within 5e-3 of each other, and every wrong one at 0.78 or more.
-pub fn agreement(dtype: &DType) -> f32 {
-    let mantissa = dtype.base().finfo().map_or(23, |(_, bits)| bits);
-    (16.0f32 * (-(mantissa as f32)).exp2()).max(1e-2)
-}
-
-/// How far `a` is from `b`: the largest element difference over the larger
-/// magnitude either holds — the sweep's measure — and infinite when either holds
-/// a value that is not finite.
-fn distance(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || !a.iter().chain(b).all(|v| v.is_finite()) {
-        return f32::INFINITY;
-    }
-    let scale = a.iter().chain(b).fold(0f32, |m, v| m.max(v.abs())).max(f32::MIN_POSITIVE);
-    a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / scale
-}
-
-/// The answer a round agrees on: the output within `tolerance` of the most
-/// others (the earliest on a tie, which the ranking put first), as its index and
-/// every output's distance from it. `None` when nothing ran, or when two or more
-/// did and no two agree — there is then no telling a right tile from a wrong one.
-fn consensus(outputs: &[Option<Vec<f32>>], tolerance: f32) -> Option<(usize, Vec<f32>)> {
-    let distances: Vec<Vec<f32>> = outputs
-        .iter()
-        .map(|a| {
-            let from = |b: &Option<Vec<f32>>| a.as_ref().zip(b.as_ref()).map_or(f32::INFINITY, |(a, b)| distance(a, b));
-            outputs.iter().map(from).collect()
-        })
-        .collect();
-    let votes = |i: usize| distances[i].iter().filter(|&&d| d <= tolerance).count();
-    let center = (0..outputs.len()).rev().max_by_key(|&i| votes(i))?;
-    let (agreed, ran) = (votes(center), outputs.iter().flatten().count());
-    (agreed > 1 || (agreed == 1 && ran == 1)).then(|| (center, distances[center].clone()))
 }
 
 /// What one K trip costs a kernel beyond the MACs of the trip itself.
@@ -245,59 +188,30 @@ impl TileBudget {
     /// one-step doublings make it. The model still chooses where to start, which
     /// is what keeps the walk short.
     ///
-    /// A tile is timed only once its output agrees with its rivals': time alone
-    /// once handed m's bodies a tile that computed garbage fast. The seeds settle
-    /// what the answer is — the output the most of them agree with — and a tile
-    /// further from it than `tolerance` ([`agreement`]), then or in any later
-    /// round, is dropped with a warning, never timed and never stepped from.
-    /// Seeds that cannot agree on an answer end the search with nothing, and the
-    /// caller's static tile stands.
+    /// It ranks by time alone. A tile that computes wrong is a kernel bug, held
+    /// off by the kernel's tests, not one the search can see.
     pub fn search<T: Trial>(
         &self,
         seeds: &[GemmCfg],
         in_bytes: usize,
-        tolerance: f32,
         accept: impl Fn(&GemmCfg) -> bool + Copy,
         mut compile: impl FnMut(GemmCfg) -> Option<T>,
     ) -> Option<(GemmCfg, u64)> {
         let mut timed: Vec<(GemmCfg, u64)> = Vec::new();
-        let mut dropped: Vec<GemmCfg> = Vec::new();
-        let mut answer: Option<Vec<f32>> = None;
         let mut warmed = false;
-        // One round of the walk: compile what has not been seen yet, then time
+        // One round of the walk: compile what has not been timed yet, then time
         // the whole round in turn rather than each candidate to exhaustion, so
         // the clock a tile is judged at is the clock its rivals were judged at
-        // — the same reason [`crate::tune::TuneStore::select`] round-robins —
-        // and read back what each computed.
-        let mut measure = |cfgs: &[GemmCfg], timed: &mut Vec<(GemmCfg, u64)>| -> Option<()> {
-            let fresh: Vec<GemmCfg> = cfgs
-                .iter()
-                .copied()
-                .filter(|cfg| !timed.iter().any(|(seen, _)| seen == cfg) && !dropped.contains(cfg))
-                .collect();
+        // — the same reason [`crate::tune::TuneStore::select`] round-robins.
+        let mut measure = |cfgs: &[GemmCfg], timed: &mut Vec<(GemmCfg, u64)>| {
+            let fresh: Vec<GemmCfg> =
+                cfgs.iter().copied().filter(|cfg| !timed.iter().any(|(seen, _)| seen == cfg)).collect();
             let trials: Vec<Option<T>> = fresh.iter().map(|&cfg| compile(cfg)).collect();
             if !warmed && let Some(first) = trials.iter().flatten().next() {
                 warm_clock(CLOCK_WARMUP, || first.time());
                 warmed = true;
             }
             let times = round_robin_min(trials.len(), TUNE_ROUNDS, None, |i| trials[i].as_ref()?.time());
-            let mut outputs: Vec<Option<Vec<f32>>> = trials.iter().map(|trial| trial.as_ref()?.output()).collect();
-            let distances: Vec<f32> = match &answer {
-                Some(answer) => outputs
-                    .iter()
-                    .map(|output| output.as_deref().map_or(f32::INFINITY, |output| distance(output, answer)))
-                    .collect(),
-                None => {
-                    let Some((center, distances)) = consensus(&outputs, tolerance) else {
-                        if outputs.iter().flatten().count() > 1 {
-                            tracing::warn!(seeds = ?fresh, "tile search: the seeds agree on no answer; none is kept");
-                        }
-                        return None;
-                    };
-                    answer = outputs[center].take();
-                    distances
-                }
-            };
             for (i, ns) in times.into_iter().enumerate() {
                 let Some(trial) = &trials[i] else { continue };
                 // What the tile cost in registers and LDS beside what it cost in
@@ -314,22 +228,13 @@ impl TileBudget {
                         "tile search: candidate"
                     );
                 }
-                if distances[i] > tolerance {
-                    tracing::warn!(
-                        cfg = ?fresh[i],
-                        distance = distances[i],
-                        tolerance,
-                        "tile search: the tile's output disagrees with its rivals'; dropped"
-                    );
-                    dropped.push(fresh[i]);
-                } else if let Some(ns) = ns {
+                if let Some(ns) = ns {
                     timed.push((fresh[i], ns.as_nanos() as u64));
                 }
             }
-            Some(())
         };
 
-        measure(seeds, &mut timed)?;
+        measure(seeds, &mut timed);
         let mut best = timed.iter().copied().min_by_key(|(_, ns)| *ns)?;
         let mut frontier: Vec<GemmCfg> = vec![best.0];
         for _ in 0..Self::BEAM_ROUNDS {
@@ -338,7 +243,7 @@ impl TileBudget {
             if next.is_empty() {
                 break;
             }
-            measure(&next, &mut timed)?;
+            measure(&next, &mut timed);
             let round = timed.iter().copied().min_by_key(|(_, ns)| *ns)?;
             if round.1 >= best.1 {
                 break;
@@ -393,7 +298,7 @@ impl TileBudget {
             for next in [read(cfg) * 2, read(cfg) / 2] {
                 let mut moved = *cfg;
                 write(&mut moved, next);
-                let runnable = next > 0 && self.well_formed(&moved) && self.fits(&moved, in_bytes);
+                let runnable = next > 0 && self.admits(&moved, in_bytes);
                 if runnable && accept(&moved) && !out.contains(&moved) {
                     out.push(moved);
                 }
@@ -423,6 +328,12 @@ impl TileBudget {
         let accumulators = self.accumulators(cfg);
         let by_registers = registers / (threads * accumulators * ACCUMULATOR_SHARE).max(1);
         by_shared.min(by_registers)
+    }
+
+    /// Whether `cfg` is a lattice tile this device can launch: whole fragments
+    /// ([`Self::well_formed`]) that fit ([`Self::fits`]).
+    pub fn admits(&self, cfg: &GemmCfg, in_bytes: usize) -> bool {
+        self.well_formed(cfg) && self.fits(cfg, in_bytes)
     }
 
     /// Whether `cfg` is one this device can launch: the threads, the shared
@@ -491,7 +402,7 @@ impl TileBudget {
                                     split_k: 1,
                                     ..*base
                                 };
-                                if self.well_formed(&cfg) && self.fits(&cfg, in_bytes) && accept(&cfg) {
+                                if self.admits(&cfg, in_bytes) && accept(&cfg) {
                                     found.push(cfg);
                                 }
                             }
@@ -550,25 +461,10 @@ impl TileBudget {
         out
     }
 
-    /// Whether the tile divides into whole matrix-core fragments — the wave grid
-    /// over the block, and the strip over the core's K edge — and into more than
-    /// a single one.
-    ///
-    /// A wave holding one accumulator fragment over a one-fragment strip
-    /// (`reg_m = reg_n = k_step = mma_edge`) is the one tile class the
-    /// convolution kernel computes wrong: on gfx1201 every such tile the walk
-    /// could reach for thirteen YOLO26-m shapes returned garbage (480 of 480,
-    /// relative error 0.8-1.4) while no tile outside the class did, and one of
-    /// them won the search for m's `64→64 k3 @80²` bodies and moved the model's
-    /// boxes by 16 px. The walk ranks by time alone and cannot see that. It is
-    /// also the cost model's worst tile — one matrix-core step per trip, the
-    /// maximal decode overhead — so nothing is lost by never offering it. The
-    /// kernel bug behind it is a separate item; `every_lattice_tile_matches_the_graph_gpu`
-    /// in the conv tests reproduces it.
+    /// Whether the tile divides into whole matrix-core fragments: the wave grid
+    /// over the block, and the strip over the core's K edge.
     fn well_formed(&self, cfg: &GemmCfg) -> bool {
         let rows = cfg.warps_m * cfg.acc_m;
-        let single_fragment =
-            cfg.reg_m() == self.mma_edge && cfg.reg_n() == self.mma_edge && cfg.k_step == self.mma_edge;
         cfg.block_m.is_multiple_of(rows)
             && cfg.block_n.is_multiple_of(cfg.warps_n)
             && cfg.reg_m().is_multiple_of(self.mma_edge)
@@ -576,7 +472,6 @@ impl TileBudget {
             // The strip is reduced by whole matrix-core steps, so a `k_step`
             // under the core's K edge is not a smaller tile — it is not a tile.
             && cfg.k_step.is_multiple_of(self.mma_edge)
-            && !single_fragment
     }
 }
 

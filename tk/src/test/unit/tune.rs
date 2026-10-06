@@ -152,6 +152,37 @@ fn a_stale_index_is_ignored_and_a_memory_store_memoizes() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A stored search result the caller no longer accepts, written for a space that
+/// has since changed, is searched again; the new value overwrites the line and is
+/// what the memo and the next store read.
+#[test]
+fn a_searched_value_the_caller_rejects_is_searched_again() {
+    let dir = scratch("rejected");
+    let k = key("conv2d_nhwc", &[1, 80, 80, 64], &[1]);
+    let seen = std::cell::Cell::new(false);
+    let first = TuneStore::at(Some(dir.clone()));
+    assert_eq!(first.searched(&k, builds(&[1], &seen), |_| true, || Some((7, 100))), Some(7));
+
+    let stricter = TuneStore::at(Some(dir.clone()));
+    let mut searched = false;
+    let found = stricter.searched(
+        &k,
+        builds(&[1], &seen),
+        |found| found != 7,
+        || {
+            searched = true;
+            Some((9, 120))
+        },
+    );
+    assert_eq!((found, searched), (Some(9), true), "a rejected line is searched again");
+    let memo = stricter.searched(&k, builds(&[1], &seen), |_| true, || panic!("the memo answers"));
+    assert_eq!(memo, Some(9), "the rejected value never reaches the memo");
+
+    let third = TuneStore::at(Some(dir.clone()));
+    assert_eq!(third.searched(&k, builds(&[1], &seen), |_| true, || panic!("the new line is read")), Some(9));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// On a supported GPU, a first request measures the GEMM table for a shape and
 /// records one line; the winner is a table tile that tiles the shape.
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::gemm_first_use -- --ignored`.

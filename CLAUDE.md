@@ -84,10 +84,14 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
   and BEAM=4 is −12.4% at n, −0.7…−1.8% at s/m/l and a wash at x; the plans BEAM finds under it
   need it (replayed without it, x runs +45% with NaN boxes). The exemption is not optional:
   capped too, every tk convolution kept 132 B of its register tiles in scratch.
-- **The tk tile search times a tile only once its output agrees with its rivals'**
-  (`TileBudget::search`, `tiling::agreement`): ranked by time alone it once handed m's bodies a
-  tile that computed garbage fast (16 px of box drift). The check reads every candidate back on a
-  tune-store miss only; do not trade it for a faster first run.
+- **The tk tile search ranks by time alone; a wrong tile is a kernel bug, fixed and pinned by a
+  test, never voted out at run time** (`TileBudget::search`). The single-fragment tile
+  (`reg_m = reg_n = k_step = 16`) that won m's bodies on gfx1201 (16 px of box drift) was
+  `Group::mma`'s accumulator read hoisting above the K loop once its trip-1 ranges folded. The read
+  now carries the tracked loops, the class is back in the lattice, and
+  `every_lattice_tile_keeps_its_accumulator_in_the_k_loop` (CPU) and
+  `a_single_fragment_tile_matches_linear_gpu` hold the contract. An output vote had no ground truth
+  and never saw replayed store lines; do not reintroduce it or a tile-class exclusion.
 
 ## Task evaluation
 
