@@ -833,8 +833,7 @@ impl Program for AmdProgram {
     /// The probes are not free: each lowers to an end-of-pipe fence, the clock
     /// write, and an `acquire_mem` that invalidates and writes back the whole
     /// cache hierarchy, and the pre-kernel one falls inside the span. So every
-    /// timed run here starts cache-cold — what [`BenchmarkConfig::clear_l2`]
-    /// only ever approximated from the host — at a fixed cost per dispatch.
+    /// timed run here starts cache-cold, at a fixed cost per dispatch.
     ///
     /// # Safety
     ///

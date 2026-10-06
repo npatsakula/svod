@@ -529,8 +529,8 @@ pub use svod_ir::compute_ops_estimate;
 /// let compile_and_time = |s: &Scheduler, early_stop: Option<Duration>| {
 ///     let ast = s.get_optimized_ast(None);
 ///     let kernel = compile_kernel(&ast)?;
-///     let bench = benchmark_kernel(&kernel, ..., early_stop)?;
-///     Some(CandidateMetrics { timing: bench.min, ir_hash: ..., compute_ops: ... })
+///     let timing = unsafe { time_kernel(&kernel, ..., false) }.ok()??;
+///     Some(CandidateMetrics { timing, ir_hash: ..., compute_ops: ... })
 /// };
 ///
 /// let result = beam_search(scheduler, &config, compile_and_time)?;

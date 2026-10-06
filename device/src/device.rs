@@ -73,9 +73,11 @@ pub trait Program: Send + Sync {
     /// Get the kernel name (for debugging/profiling).
     fn name(&self) -> &str;
 
-    /// Run synchronously and report the dispatch's duration on the GPU clock
-    /// when the backend stamps it; `None` leaves timing to the caller's wall
-    /// clock (the default, which just executes with `wait=true`).
+    /// Run synchronously and report the dispatch's duration: on the GPU's own
+    /// clock where the backend stamps it, else the wall clock around the
+    /// synchronous dispatch (the default). A stamping backend returns `None`
+    /// only for a dispatch whose stamp it lost, so a caller never times one
+    /// kernel on two clocks.
     ///
     /// # Safety
     ///
@@ -87,7 +89,8 @@ pub trait Program: Send + Sync {
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
     ) -> Result<Option<std::time::Duration>> {
-        unsafe { self.execute(buffers, vals, global_size, local_size, true) }.map(|()| None)
+        let start = std::time::Instant::now();
+        unsafe { self.execute(buffers, vals, global_size, local_size, true) }.map(|()| Some(start.elapsed()))
     }
 
     /// Downcast hook so a backend graph factory can recover its concrete

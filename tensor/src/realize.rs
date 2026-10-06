@@ -2035,11 +2035,7 @@ fn beam_search_optimize(
 
     let dev_runtime = device.runtime.clone();
     let lifts_clock = renderer.device.idles_its_clock();
-    let run_config = svod_runtime::BenchmarkConfig {
-        timing_runs: 1,
-        clear_l2: renderer.device.benchmark_evicts_via_host_stream(),
-        ..Default::default()
-    };
+    let evict_host_cache = renderer.device.benchmark_evicts_via_host_stream();
     // A batch is loaded whole, the clock lifted on its first member, and the
     // members timed in rounds, each keeping its minimum — the search's
     // `TimingBatch` says why one at a time ranked the clock, not the kernels.
@@ -2066,20 +2062,22 @@ fn beam_search_optimize(
             let Loaded { program, grid, factor } = loaded[i].as_ref()?;
             let candidate = &batch[i];
             let timed = catch_unwind(AssertUnwindSafe(|| unsafe {
-                svod_runtime::benchmark_kernel(
+                svod_runtime::time_kernel(
                     program.as_ref(),
                     &buffer_ptrs,
                     &candidate.vals,
                     Some(*grid),
                     candidate.local_size,
-                    &run_config,
+                    evict_host_cache,
                 )
             }));
             match timed {
-                Ok(Ok(result)) => {
-                    Some(Duration::from_nanos((result.min.as_nanos() as f64 * factor).min(u64::MAX as f64) as u64))
+                Ok(Ok(Some(t))) => {
+                    Some(Duration::from_nanos((t.as_nanos() as f64 * factor).min(u64::MAX as f64) as u64))
                 }
-                Ok(Err(_)) => None,
+                // A lost stamp drops the candidate: its other rounds ran on the
+                // device clock, and a wall time beside them would be a second one.
+                Ok(Ok(None) | Err(_)) => None,
                 Err(_) => {
                     if log_surpass {
                         eprintln!("[BEAM drop] panic_in_benchmark opts={:?}", candidate.opts);

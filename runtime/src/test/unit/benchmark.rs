@@ -23,16 +23,13 @@ impl Program for MockKernel {
     }
 }
 
+/// A backend that stamps nothing is timed on the wall clock around its
+/// synchronous dispatch.
 #[test]
-fn test_benchmark_basic() {
+fn a_backend_without_stamps_is_timed_on_the_wall_clock() {
     let kernel = MockKernel { name: "test".into(), sleep_micros: 100 };
-    let config = BenchmarkConfig { warmup_runs: 1, timing_runs: 3, take_minimum: true, clear_l2: false };
-
-    let result = unsafe { benchmark_kernel(&kernel, &[], &[], None, None, &config) }.unwrap();
-
-    assert_eq!(result.runs.len(), 3);
-    assert!(result.min >= Duration::from_micros(100));
-    assert!(result.min <= result.mean);
+    let time = unsafe { time_kernel(&kernel, &[], &[], None, None, false) }.unwrap();
+    assert!(time.is_some_and(|t| t >= Duration::from_micros(100)), "{time:?}");
 }
 
 /// A backend with GPU stamps reports the device time, not the (longer) wall
@@ -69,15 +66,12 @@ impl Program for StampedKernel {
 }
 
 #[test]
-fn benchmark_prefers_gpu_stamped_durations() {
-    let result =
-        unsafe { benchmark_kernel(&StampedKernel, &[], &[], None, None, &BenchmarkConfig::default()) }.unwrap();
-    assert!(result.runs.iter().all(|run| *run == Duration::from_micros(7)), "{:?}", result.runs);
+fn a_stamping_backend_is_timed_on_its_stamp() {
+    let time = unsafe { time_kernel(&StampedKernel, &[], &[], None, None, false) }.unwrap();
+    assert_eq!(time, Some(Duration::from_micros(7)));
 }
 
-/// A backend that stamps its first run and then stops — the shape that would
-/// let a 7 µs device time win the minimum against 5 ms wall times taken on a
-/// different clock.
+/// A backend that stamps its first run and then loses its stamps.
 struct FlakyStampKernel(std::sync::atomic::AtomicUsize);
 
 impl Program for FlakyStampKernel {
@@ -110,20 +104,16 @@ impl Program for FlakyStampKernel {
     }
 }
 
-/// One candidate is timed on one clock or the other, never a mixture: a partial
-/// stamp drops back to the wall clock for every run, because a GPU stamp is
-/// shorter than a wall time for reasons that have nothing to do with the kernel.
+/// A candidate is timed on one clock only: a stamp it loses in a later round
+/// drops it from the search, where a wall time in its place would put a second
+/// clock beside its own and its rivals' stamps.
 #[test]
-fn benchmark_refuses_to_mix_clocks_within_a_candidate() {
-    let kernel = FlakyStampKernel(std::sync::atomic::AtomicUsize::new(0));
-    let result = unsafe { benchmark_kernel(&kernel, &[], &[], None, None, &BenchmarkConfig::default()) }.unwrap();
-
-    assert_eq!(result.runs.len(), 3);
-    assert!(
-        result.runs.iter().all(|run| *run >= Duration::from_millis(5)),
-        "the 7 µs stamp must not survive alongside wall times: {:?}",
-        result.runs
-    );
+fn a_lost_stamp_drops_the_candidate_instead_of_mixing_clocks() {
+    let flaky = FlakyStampKernel(std::sync::atomic::AtomicUsize::new(0));
+    let kernels: [&dyn Program; 2] = [&flaky, &StampedKernel];
+    let best =
+        round_robin_min(2, 3, None, |i| unsafe { time_kernel(kernels[i], &[], &[], None, None, false) }.ok().flatten());
+    assert_eq!(best, vec![None, Some(Duration::from_micros(7))]);
 }
 
 /// The clock warm-up stops the moment a dispatch fails, so a broken kernel does
