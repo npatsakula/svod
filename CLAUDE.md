@@ -92,6 +92,13 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
   `every_lattice_tile_keeps_its_accumulator_in_the_k_loop` (CPU) and
   `a_single_fragment_tile_matches_linear_gpu` hold the contract. An output vote had no ground truth
   and never saw replayed store lines; do not reintroduce it or a tile-class exclusion.
+- **On CUDA the image-staged convolution (`ConvPlan::Patch`) stays and the tap-unrolled one is
+  gone** (`conv_candidates` in `tk/src/kernels/conv.rs`). RTX 3060, x at f16, BEAM=4, the graph's
+  plans held fixed, arms alternating: without Patch x/b8 ran +1.4% (every round slower) and x/b1
+  +0.4%; without Tapwise x/b1 −1.3% and x/b8 −0.1%, and again with each arm's tk plans pinned b1
+  +0.4% (median) and b8 −0.5%. The lattice walk takes the stride-2 downsamples Tapwise won and
+  matches it. Patch earns its pipeline on the 40x40 bottleneck bodies; re-measure b8 before
+  touching it, and do not bring a tap-unrolled form back for stride 2.
 
 ## Task evaluation
 
