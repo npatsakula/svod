@@ -1,259 +1,85 @@
 ---
-sidebar_label: 阶段 1 — Rangeify
+sidebar_label: Rangeify 与内核切分
 ---
 
-# 阶段 1：Rangeify
+# Rangeify、内核切分与预优化
 
-**目标**：将高层移动操作转换为显式循环结构，并优化 range。
+本页的所有内容都在优化器看到内核之前运行。源码：`schedule/src/rangeify/` 以及 `schedule/src/optimizer/mod.rs` 中的 `apply_pre_optimization`。
 
----
+## Rangeify（`rangeify_with_map`）
 
-## Stage 1：早期移动操作
+输入：一次 `realize()` 调用产生的张量图（movement 算子、`num_axes > 0` 的张量形式 `REDUCE`、`CONTIGUOUS`、`COPY` 等）。输出：每个循环都是显式 `RANGE`、每次物化都是 `STAGE`、每次读取都是 `INDEX` 的图。
 
-> **阶段速览**
->
-> **目标**：在 range 分配之前清理移动操作
-> **关键模式**：INDEX 上的移动操作、穿过包装器的移动操作、嵌套 INDEX 简化
-> **影响**：防止流水线后续阶段遗漏优化
+各 pass 按顺序如下（`rangeify/transforms.rs`）：
 
-**做了什么**：此阶段通过将索引操作推到实际需要的位置来清理移动操作。可以类比为在整理文件之前先清理桌面——把指令挪到数据实际使用的地方。
+1. **多设备解析** —— 先 `multi_pm` 再 `lower_allreduce_pm`（均为 `graph_rewrite_preserve_calls`）；`validate_supported_subset` 拒绝后端无法运行的内容。
+2. **`add_tags_patterns`**（自底向上）为每个可打标签的节点编号 `[i]`。标签就是张量的身份：切分之后，输出映射由幸存下来的标签重建。`PARAM`、`CONST`、`RANGE`、`END`、`CALL`、movement 算子以及全部由 PARAM 构成的 `MSTACK`/`MSELECT` 不打标签。
+3. **`resolve_calls`** 用 `FUNCTION` 的函数体替换其参数，并折叠 `GETTUPLE(TUPLE(..), i)`。预编译函数和 `CALL` 参数保持不透明。
+4. **最早期重写**（自底向上，一个匹配器）：`movement_op_patterns + early_rewrites + split_reduceop_patterns`。`early_rewrites` 去掉 `DETACH`/`CONTIGUOUS_BACKWARD`，合并未打标签的 `RESHAPE` 链，在加宽类型转换之下加宽整数乘积，用 `CONTIGUOUS` 物化被改变大小/重排的 `COPY` 源，删除同设备的 `COPY`，并把零大小张量折叠为常量。`split_reduceop` 是两阶段归约拆分（参见 [range 优化](../optimizations/range-optimization.md)）。
+5. **`run_rangeify`**（`rangeify/indexing.rs`）：
+   - `pm_generate_realize_map`（自底向上）：标记必须成为缓冲区的内容 —— `STORE`、`CONTIGUOUS`、`COPY` 及其非连续源、`MSTACK`/`MSELECT` 的源，以及手写内核 `CALL` 的输入（固定为不可移除）。
+   - `assign_ranges`：从根到叶的遍历。被物化的节点为每个输出维度获得新的 `Weak` range（`IndexingContext::new_range`；大小为 1 的维度是 `CONST(0)`）。其他节点继承其消费者的 range；当消费者之间不一致时，`merge_consumer_ranges` 要么合并兼容的索引表达式（有效部分被 OR 进 `WHERE(valid, idx, Invalid)`），要么分配新的 range 并标记该轴需要物化。movement 算子通过 `apply_movement_op` 把输出 range 映射为输入 range（`PERMUTE` 对其置换，`EXPAND` 把广播轴置零，`PAD` 把 range 包进有效性 `WHERE`，`RESHAPE` 经由 `apply_reshape_ranges`）。`ending_ranges` 把广播决策反向传播，使得喂给广播的 `REDUCE` 在广播之前被物化（layernorm 的情形）。
+   - `apply_rangeify_patterns`（自底向上）：张量形式 `REDUCE` → 循环形式 `REDUCE(src, ranges)`，`num_axes = 0`；`PAD` → `WHERE(valid, src, 0)`；带形状的 `STACK` → 基于其首个 range 的 `WHERE` 链；每个算子的被物化源都被包进 `STAGE` + `INDEX`（`transform_sources_with_bufferize`）；随后删除 movement 算子。类缓冲区的源（`BUFFER`、`PARAM`、`SLICE`、`AFTER` 等）在形状静态时得到单个行主序 `INDEX`（`linearize_static_indices`）；图像和符号形状则对每个坐标保留一个索引。
+6. **Mega-pass** —— 对 `symbolic + pm_reduce_simplify + movement_op_patterns + buffer_folding + dead_axis_removal + pm_remove_bufferize` 做一次不动点迭代。这些组相互促进：内联一个 `STAGE` 会暴露出 `symbolic` 能折叠的 range 算术，进而可能让某个 reduce 变得可折叠。具体规则见 [range 优化](../optimizations/range-optimization.md)页面。
+7. 基于带标签的反向切片**重建 SINK**：只有携带输出标签的 `STAGE`、`MSTACK`、`CONST`、`PARAM` 和 `AFTER` 节点作为 sink 的源保留下来，并保持原始输出顺序。
+8. **缓冲区上限** —— 如果设备报告了 `max_buffers`，`buffer_limit_patterns` 会强制把逐元素源放进全局 `STAGE`，使任何内核都不超过参数数量上限。
 
-**为什么重要**：移动操作（RESHAPE、PERMUTE 等）是方便的抽象，但硬件需要具体的索引计算。尽早清理它们，可以确保后续阶段的模式能正确匹配。
-
-**模式**：`movement_op_patterns()`（自底向上）
-
-| 模式 | 变换 | 示意 | 位置 |
-|----------|---------------|--------|----------|
-| INDEX 上的移动操作 | 将移动应用到索引表达式 | `INDEX(PERMUTE(arr), [i, j]) → INDEX(arr, [j, i])` | `movement_op_patterns()` |
-| 穿过 AFTER 的移动操作 | 将移动操作（或 INDEX）穿过时序包装器，保留每一个依赖 | `AFTER(RESHAPE(x, arg), deps) → RESHAPE(AFTER(x, deps), arg)` | `movement_op_patterns()` |
-| 穿过 END 的移动操作 | 从 END 包装器中解除移动操作 | `END(RESHAPE(x), ranges) → END(x, ranges)` | `movement_op_patterns()` |
-
-**为什么自底向上？** 子节点必须先清理好，父节点才能匹配。移动操作嵌套很深；从底部开始清理可以防止遗漏模式。
-
-**注意**：`is_movement()` 恰好涵盖 RESHAPE、PERMUTE、EXPAND、PAD、SHRINK 和 FLIP。嵌套 INDEX 的展平（`INDEX(INDEX(ptr, i), j) → INDEX(ptr, i, j)`）*不*属于这个阶段；它位于 `mop_cleanup_patterns()` 中，随 Stage 9 的 expander 和 devectorizer 一起运行。
-
-**Svod**：`rangeify/patterns.rs` 中的 `movement_op_patterns()`
-
----
-
-## Stage 2：Load Collapse
-
-> **阶段速览**
->
-> **目标**：通过检测与 range 无关的计算来消除 REDUCE 操作
-> **关键模式**：有界求和、门控 load collapse、通用 reduce 消除
-> **影响**：将循环迭代转换为算术运算
-
-**做了什么**：通过识别何时可以不迭代直接完成计算来消除 REDUCE 操作。使用与 range 无关的计算检测和符号化简。
-
-**为什么重要**：将迭代转换为算术运算可以消除循环开销。与其运行 1000 次循环，不如直接算出答案。
-
-**模式**：`pm_load_collapse`
+对 `[8, 64]` 张量执行 `x.sum(1)` 的结果：
 
 ```text
-// Before: Sum with bounds check
-sum(1 for k in 0..64 if k >= length)
-
-// After: Compute count directly (NO LOOP!)
-count = clamp(64 - length, 0, 64)
+[67] SINK : Scalar(Void)
+└── [66] STAGE : Scalar(Float32) shape=[Const(8)]
+    ├── [65] CONTIGUOUS : Scalar(Float32) shape=[]
+    │   └── [64] REDUCE(Add, num_axes=0, ranges=[27]) : Scalar(Float32) shape=[]
+    │       ├── [62] INDEX : Scalar(Float32) shape=[]
+    │       │   ├── [11] PARAM(slot=0) : Scalar(Float32) shape=[Const(512)]
+    │       │   │   └── [0] CONST(Int(512)) : Scalar(WeakInt) shape=[]
+    │       │   └── [55] Add : Scalar(WeakInt) shape=[]
+    │       │       ├── [54] Mul : Scalar(WeakInt) shape=[]
+    │       │       │   ├── [26] RANGE(U0, Weak) : Scalar(WeakInt) shape=[]
+    │       │       │   │   └── [2] CONST(Int(8)) : Scalar(WeakInt) shape=[]
+    │       │       │   └── [3] CONST(Int(64)) : Scalar(WeakInt) shape=[]
+    │       │       └── [27] RANGE(U1, Reduce) : Scalar(WeakInt) shape=[]
+    │       │           └── [3] → (see above)
+    │       └── [27] → (see above)
+    └── [26] → (see above)
 ```
 
-其机制是：
-1. 识别不依赖 REDUCE range 的子表达式
-2. 用携带其已证明的 vmin/vmax 的合成标量 PARAM 变量替换这些外部输入
-3. 把替换后的主体包进一个在同一 range 上的合成 REDUCE，并运行 reduce-collapse 匹配器
-4. 如果化简后的表达式不再包含 range，则 REDUCE 被消除（临时的 PARAM 会被替换回去）
+`U0`/`U1` 是 `AxisId::Unrenumbered`：range 会在切分时按内核重新编号。输入的 `PERMUTE`/`RESHAPE` 已经消失 —— 它们变成了索引表达式 `U0 * 64 + U1`。
 
-**注意**：WHERE 穿过 INDEX 的移动（`pm_move_where_on_load`）是一个独立的优化，它在 Stage 8 运行，把条件以 `WHERE(cond, idx, Invalid)` 的形式嵌入到 `INDEX.indices[0]` 中。它不会消除 REDUCE 操作。
+## 内核切分（`try_get_kernel_graph`）
 
-**Svod**：`rangeify/patterns.rs` 中的 `pm_load_collapse()`
+首先执行 `kernel_graph_pre_cut`：
 
----
+- **`pm_add_buffers_patterns`**（自底向上，`RangeifyBufferContext`）：先 `movement_op_patterns`，然后 `flatten_bufferize`（多 range 的 `STAGE` 变成单个扁平 range 加一个还原形状的 `RESHAPE`）、`late_buffer_slice`（DISK 上的 `STAGE(BITCAST|CONTIGUOUS)` 变成 `SLICE`），以及 `bufferize_to_store`。最后这个规则分配一个调度局部的 `BUFFER`（`new_lunique_buffer`，slot 位于高位命名空间），并把 `STAGE(compute, ranges)` 重写为 `AFTER(BUFFER, [END(STORE(INDEX(BUFFER, idx), compute), ranges)])`。`STAGE(AFTER(..))` 复用底层缓冲区；`Local` 的 `STAGE` 保持不动，留给之后的 `pm_add_local_buffers`。已经成形的内核 `SINK`（带有 `KernelInfo` 的）会被屏蔽，重写不会深入其中。
+- **`pm_flatten_range`** 对整张图执行一次（自底向上）：根据从源可达的 `RANGE` 重新推导每个 `END`/`REDUCE` 的 range 列表，这样下面的逐内核 pass 就不必重复遍历共享子图。
 
-## Stage 3：分割 Range
+然后是 **`split_all_stores`**（自底向上）：每个不再有未关闭计算 range 的 `STORE` 或 `END(STORE)` 都变成一个 `CALL`。`split_store` 在内核体上运行 `local_to_param_patterns + rangeify_codegen_patterns`：全局 `BUFFER`/`PARAM` → 代码生成用的 `PARAM(slot)`，由 `LocalAddBufferContext::param_slot` 按匹配顺序编号；`BIND(var, value)` → 该变量，绑定作为 `CALL` 参数保留；`AFTER`/`MSTACK`/`MSELECT` → 其缓冲区；`RANGE(end=0)` → `CONST(0)`；`Unrenumbered` 轴 id → `Renumbered(n)`；`NOOP` → 带类型的零；`CONTIGUOUS` → 其源，并收集 hint。内核体被包进带默认 `KernelInfo` 的 `SINK`；`COPY`/`SLICE` 值仍作为直接的调用体。`Device` range 是“没有未关闭 range”这一条件的唯一例外：它们是启动 lane，会跨越边界保留下来。
 
-> **阶段速览**
->
-> **目标**：通过 divmod 分解实现更好的优化
-> **关键模式**：带取模的 range 分割、range 展平
-> **影响**：内层 range 可向量化，外层可并行化
+最后是 **`validate_normal_kernel_devices`**（每个非拷贝内核只能有一个设备）和 **`fix_assign`**：当内核 B 读取内核 A 写入的缓冲区时，A 的 `AFTER` 被追加到 B 的 `AFTER` 依赖中；出现环则报 `KernelSplitDependencyCycle`。开启 `SVOD_SPEC` 时，`verify_kernel_graph` 会检查结果。
 
-**做了什么**：通过将一个 range 分成外层和内层两部分来处理取模模式。
+## 逐内核预优化（`apply_pre_optimization`）
 
-**为什么重要**：分割 range 就像分工——如果有 12 项任务，每人做 4 项，就变成 3 人 × 4 项。内层循环（一个人的 4 项）可以很快；外层循环（3 个人）可以并行运行。
+在启发式或 BEAM 之前对每个内核体运行，两条路径都会执行（`optimize_kernel_with_config_impl`、`optimize_kernel_beam`、`prepare_scheduler`）。开启 `SVOD_SPEC` 时，会先针对 `spec_tensor` 运行 `type_verify`。
 
-**模式**：`pm_split_ranges + pm_flatten_range`
+| 步骤 | 匹配器 | 方向 |
+|------|---------|-----------|
+| movement 算子 | `movement_op_patterns` | 自底向上 |
+| load collapse | `pm_load_collapse` | 自顶向下 |
+| 拆分 range | `pm_split_ranges + pm_flatten_range`（`SplitRangesContext`） | 自顶向下 |
+| 符号化简 | `sym + pm_fold_cast_const + pm_flatten_range` | 自顶向下 |
+| 化简 range | `pm_flatten_range + pm_simplify_ranges`（`SimplifyRangesContext`） | 自顶向下 |
 
-```mermaid
-flowchart TD
-  B["Before: RANGE(end=12) % 4 (one loop with modulo, slow)"] -->|"split into outer x inner"| A["After: RANGE(end=3) * 4 + RANGE(end=4)"]
-  A --> O["RANGE(end=3): outer, Parallel"]
-  A --> I["RANGE(end=4): inner, Sequential"]
-```
+**`movement_op_patterns`** 有三条规则：`INDEX(mop(x), idx)` → `INDEX(x, mop⁻¹(idx))`（`transform_movement_through_index`）、`AFTER(mop(x) | INDEX(x), deps)` → `mop(AFTER(x, deps))`（`push_op_through_after`），以及 `END(mop(x), ranges)` → `END(x, ranges)`。`is_movement()` 恰好是 `RESHAPE`、`PERMUTE`、`EXPAND`、`PAD`、`SHRINK`、`FLIP`。它以自底向上方式应用，因为内层 movement 算子必须先被重写，其消费者才能匹配。
 
-这使得：
-- 内层 range 可向量化（SIMD）
-- 外层 range 可并行化（GPU 块 / CPU 线程）
+**`pm_load_collapse`** 消除这样的 `REDUCE(Add)`：经过符号推理后其主体与 range 无关（`reduce_load_collapse`）。reduce 作用域之外的节点被替换为标量 `PARAM` 变量（`UOp::variable("in{n}", vmin, vmax)`），主体被包进一个只覆盖该 range 的合成 `REDUCE`，运行 `build_reduce_load_collapse_matcher`，如果没有 `RANGE` 幸存，就撤销替换。它使用的界限模式见 [range 优化](../optimizations/range-optimization.md)页面。
 
-`pm_flatten_range` 会根据仍然可以通过 REDUCE 和 END 节点的源到达的 RANGE 节点，重新推导它们的 range 操作数列表。（合并 range 是 Stage 5 的工作。）
+**`pm_split_ranges`** 记录每个其 end 能被常量整除的 `RANGE % const`（排除 `Warp` 和 `Device` range；图像 `STORE` 索引到的每个 range 都被固定），并在 `SINK` 处一次性替换 `r → outer * c + inner`，轴 id 为 `r.child(0)` / `r.child(1)`。替换后的图再用 `symbolic + pm_fold_cast_const` 化简。
 
-**上下文**：`SplitRangesContext` 标记每一处 `RANGE % const`；divmod 替换只在 SINK 处执行一次。
+**`sym`** 是完整的第 3 层化简器（[代数化简](../optimizations/algebraic-simplification.md)）；`pm_fold_cast_const` 折叠 `CAST(CONST)`；`pm_flatten_range` 在 range 消失后保持 range 列表的准确。
 
-**注意**：分割仅在 `end % mod == 0`（整除检查）时适用。Warp 和 Device range 永远不会被分割，并且被 image STORE 索引的每一个 range 都会被固定住，不参与分割。
+**`pm_simplify_ranges`** 在合并后的形式不增加 `FloorDiv`/`FloorMod` 数量时，合并某个 `END`/`REDUCE` 的相邻 range（`simplify_merge_adjacent`），并把一个 range 收窄到任意 `INDEX` gate 能为其证明的最大界限（`mark_gated`；只要有一处未加 gate 的使用就会固定原始 end；`REDUCE` 的 range 受保护）。两种替换都在 `SINK` 处进行。
 
-**Svod**：`rangeify/transforms.rs` 中的 `pm_split_ranges()` + `pm_flatten_range()`
+## 交给优化器
 
----
-
-## Stage 4：初始符号化简
-
-> **阶段速览**
->
-> **目标**：使用代数规则简化表达式
-> **关键模式**：常量折叠、恒等消除、div-mod 重组
-> **影响**：消除昂贵的操作，减少代码量
-
-**做了什么**：应用 100 多条常量折叠和代数化简规则。
-
-**为什么重要**：计算机擅长简单运算。除法和取余是慢操作。这个阶段用代数规则尽可能消除慢操作。
-
-**模式**：`sym() + pm_fold_cast_const() + pm_flatten_range()`
-
-注意：`symbolic()`（第 2 层）是 `sym()`（第 3 层）的严格子集；同一个 `sym` 会在 Stage 8 再次运行。
-
-**常量折叠**：
-```text
-ADD(CONST(2), CONST(3)) → CONST(5)
-MUL(x, CONST(1)) → x
-ADD(x, CONST(0)) → x
-```
-
-**Div-mod 重组**：
-```text
-(x / c) * c + (x % c) → x
-```
-*为什么？* 用 3 个操作计算出与 `x` 相同的值。这个模式找到并消除这种冗余（常见于步长计算）。
-
-**布尔代数**：
-```text
-x AND x → x
-x OR FALSE → x
-NOT(NOT(x)) → x
-```
-
-**其他类别**：
-- 恒等消除（自折叠、冗余操作）
-- 比较简化
-- Cast 优化
-- ALU/STACK 重排（`ALU(STACK, STACK) → STACK(ALU)`）
-- Where 折叠（合并相同条件的 WHERE）
-- Reduce mul 链（将乘法移到 reduce 外面）
-
-**Svod**：`symbolic/patterns.rs` 中的 `sym()`
-
----
-
-## Stage 5：简化 Range
-
-> **阶段速览**
->
-> **目标**：合并相邻 range 以减少循环开销
-> **关键模式**：带成本分析的 range 合并
-> **影响**：更少的循环 = 更少的开销
-
-**做了什么**：在有利可图时合并相邻 range。
-
-**为什么重要**：合并 range 就像把多趟小跑腿合成一趟。与其跑 4 趟买 4 样东西，不如一趟全买了。省去了启动和停止的开销。
-
-**模式**：`pm_flatten_range() + pm_simplify_ranges()`
-
-```text
-// Before: two separate ranges
-RANGE(0..4), RANGE(0..8)
-
-// After: merged (if compatible)
-RANGE(0..32)
-```
-
-`pm_simplify_ranges` 还会收窄那些被每个 INDEX 有效性门证明有界的 range。
-
-合并条件：
-1. 轴类型必须兼容（都是输出、都是 reduce 等）
-2. REDUCE 作用域必须保持一致
-3. **基于成本**：仅在 divmod 操作数量不增加时才接受
-
-编译器只在能节省操作时才合并。合并可能需要除法/取模来重算索引。如果代价大于收益，就跳过合并。
-
-**Svod**：`rangeify/transforms.rs` 中的 `simplify_merge_adjacent()`
-
----
-
-## Stage 6：分割 Store
-
-> **阶段速览**
->
-> **目标**：在 STORE 边界分割图为独立内核
-> **关键函数**：`split_all_stores()` + `split_store()`
-> **影响**：支持逐内核优化
-
-**做了什么**：在 STORE 边界分割 UOp 图，为每个输出创建独立的内核。
-
-**为什么重要**：bufferization 之后，图可能包含多个 STORE 操作。每个 STORE 变成自己的内核，拥有自己的 buffer、range 和依赖集合。
-
-**函数**：`schedule/src/rangeify/kernel.rs` 中的 `try_get_kernel_graph()`
-
-在 `kernel_graph_pre_cut` 内部，当 STAGE 节点变成 STORE 之后，会在**整个图上执行一次** `pm_flatten_range` 预处理（自底向上）。这会在一次遍历中重新推导所有内核的 range 列表，避免在重叠子图上的重复工作。这个预处理是编译速度的关键优化——没有它，每个内核的 `split_store` 都会独立重新遍历共享子图。
-
-预处理之后，`split_all_stores` 在 STORE 边界进行分割——每个内核通过 `LocalAddBufferContext::param_slot` 为自己的 PARAM 槽位编号——然后 `fix_assign` 连接内核之间的依赖，并拒绝依赖环。
-
----
-
-## Stage 7：应用优化
-
-> **阶段速览**
->
-> **目标**：找到向量化、展开、内存使用的最优组合
-> **关键算法**：Beam search 或启发式搜索
-> **影响**：可以显著提升性能
-
-**做了什么**：优化搜索——无论是 beam search 还是启发式——探索不同的优化动作组合。
-
-**为什么重要**：编译器尝试不同的优化组合（这里向量化？那里展开？），然后选最快的。找到正确的组合可以让代码快 10 倍。
-
-**函数**：`optimize_kernel(ast, renderer)`
-
-**优化动作**：
-
-| 动作 | 效果 | 硬件目标 |
-|--------|--------|-----------------|
-| TC | 启用张量核心 | NVIDIA、AMD、Apple Metal 与 Intel GPU |
-| UPCAST | 向量化某个维度 | 全部（SIMD） |
-| LOCAL | 使用本地/共享内存 | 仅 GPU（需要 `has_local`） |
-| UNROLL | 展开某个循环维度 | 全部（避免循环开销） |
-| GROUP | 分组 reduce 的内层分割 | GPU（共享内存；应用 TC 后被拒绝） |
-| GROUPTOP | 分组 reduce 的外层分割 | GPU（共享内存；应用 TC 后被拒绝） |
-| THREAD | 基于线程的并行 | CPU |
-| NOLOCALS | 禁用本地内存使用 | 全部（约束，阻止后续 LOCAL 动作） |
-| SWAP | 交换两个 Global range 分配 | GPU/CPU 全局轴（尝试不同 tiling） |
-| PADTO | 对齐填充 | 全部（内存对齐） |
-
-**优化搜索详解**：
-
-编译器搜索最优组合：
-- **启发式模式**（BEAM=0）：快速的手写优化模式，无需编译
-- **Beam search**（BEAM≥1）：编译并运行候选方案来测量实际性能
-
-```mermaid
-flowchart TD
-  S["Optimization Search"] --> H["Heuristic mode (BEAM=0): Hand-coded optimizations"]
-  S --> B["Beam search (BEAM≥1)"]
-  B --> B1["Generate all possible actions (193 fixed base actions; 200 with BEAM_PADTO)"]
-  B --> B2["Apply to all top-K candidates in parallel"]
-  B --> B3["Filter based on constraints"]
-  B --> B4["Compile and run each candidate, measure actual time"]
-  B --> B5["Pick fastest"]
-```
-
-**注意**：NOLOCALS 是一个约束，设置 `dont_use_locals = true`，阻止后续 LOCAL 动作并影响共享内存使用决策。它不属于基础动作列表——启用时会为每个候选方案追加。
-
-**Svod**：`optimizer/mod.rs`、`optimizer/opts.rs`
+`Scheduler::new(ast, renderer)` 收集 extent > 1 的 `RANGE`，按 `(axis_type.priority(), axis_id)` 排序；在具备 `has_local` 的 renderer 上，`convert_loop_to_global` 把 `Weak` 输出轴变成 `Global`（在 CPU 上它是空操作，这就是上例中行轴仍为 `Weak` 的原因）。之后 `hand_coded_optimizations` 或 BEAM 应用若干 `Opt`，`get_optimized_ast_with_naming` 输出带 `KernelInfo` 元数据的内核 `SINK`（名称如 `r_8_16_4`、`dont_use_locals`、`opts_to_apply`）。`SVOD_NOOPT` 会跳过启发式，但不会跳过本页内容，也不会跳过 post-optimization 各阶段。搜索本身在[内核搜索](../optimizations/kernel-search.md)中介绍。

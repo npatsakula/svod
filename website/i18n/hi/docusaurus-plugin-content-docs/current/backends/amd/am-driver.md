@@ -4,185 +4,129 @@ sidebar_label: AM Driver
 
 # AM Driver (Userspace)
 
-**AM** driver एक दूसरा [`AmdIface`](./overview.md) बैकएंड है जो GPU के PCI BARs को सीधे drive
-करता है, kernel `amdgpu`/KFD driver को पूरी तरह bypass करते हुए। यह tinygrad के userspace AM
-driver का एक port है। प्रेरणा ठोस है: single-XCC gfx11+ parts पर lock-free
-[multi-queue dispatch](./queues-and-dispatch.md) path CP micro-engines को ऐसे waits में
-park कर सकता है जिन्हें kernel का MES firmware preempt नहीं कर पाता, और यह उसे एक
-unrecoverable reset में wedge कर देता है। kernel scheduler ही साझा कमज़ोरी है — इसी श्रेणी की
-failure वह वजह है जो lane pool को हर part पर conservative बनाए रखने पर मजबूर करती है। यदि हम
-GPU के मालिक हैं — page tables, firmware, scheduling — तो kernel कभी dispatch path में नहीं
-होता और wedge नहीं हो सकता।
+**AM** `device/src/amd/am/` के अंतर्गत एक experimental, अभी तक न चुना जा सकने वाला userspace
+driver है जो `amdgpu`/KFD से होकर जाने के बजाय AMD GPU के PCI BARs से सीधे बात करता है। यह
+भावना में tinygrad के AM driver का अनुसरण करता है, लेकिन एक अलग प्रकार के hardware को target
+करता है (bare metal के बजाय एक virtual function)। यह **scaffolding** है: pure-logic हिस्से
+implement और unit-tested हैं, bring-up एक बार एक live GPU पर परखा गया, और इसके माध्यम से कभी
+कोई कर्नेल execute नहीं हुआ।
 
-:::caution[Work in progress — अभी selectable नहीं]
-यह पेज आज जो मौजूद है और बाक़ी के लिए roadmap, दोनों का दस्तावेज़ीकरण करता है।
-**`SVOD_AMD_BACKEND=am` फ़िलहाल एक error देता है** (`device.rs` केवल `kfd` स्वीकार करता है):
-अभी तक कोई AM type [`AmdIface`](./overview.md) seam को implement नहीं करता, इसलिए आज पहुँच
-योग्य bring-up केवल `am_*` examples के माध्यम से चलाया जाता है, `AmdDevice` के माध्यम से नहीं।
-जो मौजूद है वह **engine hand-off तक** validated है; target पर अभी तक कोई GPU engine work
-consume करने के लिए पुष्ट नहीं है (देखें [the VF boundary](#the-vf-boundary))। नीचे के
-sections हर टुकड़े की status को explicit रूप से चिह्नित करते हैं।
+:::caution[न चुना जा सकता है, न चलाया जा सकता है]
+`SVOD_AMD_BACKEND=am` reject होता है (`unknown SVOD_AMD_BACKEND=am (only 'kfd'
+supported)`, `device/src/amd/device.rs`): `am/` में कुछ भी [`AmdIface`](./overview.md) seam
+implement नहीं करता, इसलिए `AmdDevice` इसका उपयोग नहीं कर सकता। code केवल standalone
+`device/examples/am_*.rs` programs के माध्यम से पहुँचा जा सकता है। इसका अंतिम functional
+बदलाव जून 2026 का है; बाद के commits cleanups हैं। नीचे के स्थिति-कथन बताते हैं कि उस commit
+ने क्या परखा, कोई चालू गारंटी नहीं — इसके लिए कोई CI या hardware test नहीं है।
 :::
 
-कोड `device/src/amd/am/` के अंतर्गत रहता है। यह **हर Unix host पर** compile होता है
-(`cfg(unix)`, बाक़ी बैकएंड की तरह — देखें [runtime-detected provider model](./overview.md)),
-इसलिए यह हमेशा type-checked, linted, और unit-tested होता है — बैकएंड को *runtime* पर चुना
-जाता है, कभी किसी ऐसे cargo feature के पीछे नहीं जो rot हो सकता है।
+module हर Unix host पर compile होता है (`cfg(unix)`, बाकी बैकएंड की तरह), इसलिए यह हमेशा
+type-checked, linted होता है, और इसका logic unit-tested है (`device/src/test/unit/amd/am/`
+के अंतर्गत लगभग 40 tests: page tables, TLSF, memory manager, register tables, discovery
+parser)।
 
 ---
 
-## Target hardware: एक CDNA3 SR-IOV VF (gfx9.4.3)
+## Target: एक CDNA3 SR-IOV VF (gfx9.4.x)
 
-driver का target है एक **CDNA3** GPU — **gfx9.4.3**, SPX mode में 8 XCCs — और
-विशेष रूप से उसका **SR-IOV Virtual Function** रूप (GPU एक VF है जो एक KVM guest में pass किया
-गया है)। `AmDev::open` बाक़ी हर चीज़ को सीधे अस्वीकार कर देता है: एक non-VF function, या एक
-ऐसा GC version जिसका major.minor `(9, 4)` नहीं है, fast fail करता है
-(`device/src/amd/am/dev.rs`)। gfx1151 (RDNA3.5) अब *target* नहीं है, पर gfx11 arch branch
-implemented और unit-tested बनी रहती है — और उसकी page-table geometry तथा palloc-range
-helpers ही वे चीज़ें हैं जिन्हें gfx9 path दोबारा उपयोग करता है।
+`AmDev::open` केवल ऐसे GPU का **SR-IOV virtual function** स्वीकार करता है जिसका GC IP version
+9.4 (CDNA3) हो — bring-up hardware एक KVM guest में pass किया गया MI300-class VF था। non-VF
+function या कोई दूसरा GC version reject होता है (`device/src/amd/am/dev.rs`)। gfx11
+page-table encoding implemented और unit-tested बनी हुई है, और इसके geometry व
+physical-range helpers वही हैं जिन्हें gfx9 path reuse करता है।
 
-> Bring-up hardware: एक AMD Instinct MI300X (gfx942 / GC 9.4.3) का SR-IOV VF।
-> `AmDev::open` इसके अलावा कुछ भी स्वीकार नहीं करता।
+bare metal के बजाय VF होना पूरे driver को आकार देता है:
 
-एक **VF** होना (bare metal के बजाय) defining constraint है, और यह पूरे driver को आकार देता
-है:
+- **GC MMIO host-gated है।** GC register का direct read `0xffffffff` लौटाता है; GC / GCVM
+  registers **RLC के माध्यम से indirectly** जाते हैं (value को RLC scratch में stage करें,
+  `RLC_SPARE_INT` kick करें, poll करें)।
+- **VRAM और IP discovery grant होने तक gated हैं।** host **GIM** (SR-IOV host driver) को एक
+  **mailbox handshake** के माध्यम से access grant करना होता है, जो discovery से पहले चलता है।
+- **host PF privileged subsystems का स्वामी है:** PSP, SMU, clocks, firmware / world-switch,
+  और **doorbell aperture routing**। AM प्रति-VF state program करता है (page-table context0,
+  प्रति-engine invalidation ranges, TLB flushes, ring/queue MQDs) और कुछ PF-owned registers
+  (L2 cache config, system और identity apertures, `GB_ADDR_CONFIG`, `RLC_CNTL`,
+  `SH_MEM_BASES`) best-effort लिखता है, rejections को ignore करते हुए।
 
-- **GC MMIO host-gated है।** किसी GC register का हर *direct* read `0xffffffff` लौटाता है।
-  सभी GC / GCVM register access को **RLC के माध्यम से indirectly** जाना ही होता है (RLCG
-  path) — value को RLC scratch में stage करें, `RLC_SPARE_INT` kick करें, completion के लिए
-  poll करें।
-- **VRAM/discovery grant तक gated है।** framebuffer (और इसलिए IP-discovery table) तब तक
-  unreadable है जब तक host **GIM** (SR-IOV host driver) एक **mailbox handshake** के माध्यम
-  से access न दे दे, जो इसलिए discovery से *पहले* चलता है।
-- **host PF privileged subsystems का मालिक है:** PSP, SMU, clocks, firmware / world-switch,
-  L2 cache config, system aperture, और — सबसे अहम — **doorbell aperture routing**। AM केवल
-  उस per-VF state को program करता है जिसे guest को छूने की अनुमति है (page-table context0,
-  per-engine invalidation ranges, TLB flushes, ring/queue MQDs), ठीक वैसे ही जैसे kernel का
-  `*_v*` IP code `amdgpu_sriov_vf` के तहत इन blocks को skip कर देता है।
-
-यह tinygrad के AM का उलट है, जो **केवल bare-metal** है (यह `amdgpu` को unbind करता है और
-पूरे device का मालिक होता है)। VF रूप एक अलग driver है: mailbox + RLCG indirect register
-access + per-VF-only hub programming।
+tinygrad का AM इसका उल्टा है: केवल bare-metal, `amdgpu` को unbind करके पूरे डिवाइस का स्वामी
+बनता है। VF प्रकार को mailbox, RLCG indirect path और केवल प्रति-VF hub programming चाहिए, और
+यह कभी engines का स्वामी नहीं बन पाता।
 
 ---
 
-## आज क्या मौजूद है
+## क्या मौजूद है
 
-जहाँ यह pure logic है वहाँ सब कुछ **बिना GPU के compile और unit-tested** है;
-hardware-facing टुकड़े अतिरिक्त रूप से live VF पर `device/examples/am_*.rs` programs के
-माध्यम से validated हैं। page tables एक injectable `PhysMem` trait से back होते हैं (tests
-में एक plain buffer, असली driver में BAR-mapped VRAM)।
-
-| Group | Module(s) | यह क्या करता है | Status |
+| समूह | Module(s) | क्या करता है | स्थिति |
 |---|---|---|---|
-| **Discovery** | `pci.rs`, `discovery.rs` | sysfs BAR mmap (BAR0 VRAM / BAR2 doorbell / BAR5 MMIO), config-space r/w, bounds-checked IP-discovery parser (per-XCC segment bases, `gc_info` v1/v2) | **HW-validated**; discovery parser unit-tested है |
-| **Register access** | `regaccess.rs`, `rlcg.rs`, `mailbox.rs`, `regs.rs`, `regs_gen.rs` | mxgpu VF↔GIM mailbox handshake, RLCG indirect GC/GCVM r/w (per-XCC), MMIO/RLCG router, vendored register tables | **HW-validated**; register-table select/encode logic unit-tested है |
-| **Memory (GMMU)** | `mm/{tlsf,pagetable,manager,mod}.rs` | TLSF VA/PA/page-table allocators, 4-level/48-bit walk, gfx9 **और** gfx11 PTE/PDE encoding, huge-page selection, table reclaim, `valloc`/`vfree` | **Done** + tests (PTE write path HW-exercised) |
-| **GMC bring-up** | `ip/gmc.rs` | दोनों hubs का context0 program करें (start/end/base + CNTL), MX_L1_TLB enable, per-engine invalidation ranges, ENG17 TLB flush, HDP flush, fault-status decode | **HW-validated** context-program level तक |
-| **GFX bring-up** | `ip/gfx.rs` | MEC enable करें (icache invalidate, golden `GB_ADDR_CONFIG`, doorbell range, unhalt), एक v9 compute MQD बनाएँ, HQD activate करें (`CP_HQD_ACTIVE=1`), `WRITE_DATA` PM4 | **MEC HQD activate होता है**; queue अभी नहीं चलती |
-| **SDMA bring-up** | `ip/sdma.rs` | F32 unhalt करें, RB base/rptr/wptr + doorbell program करें, submit + `wait_idle` | **ring programmed**; engine अभी consume नहीं करता |
-| **Orchestrator** | `dev.rs` | `AmDev::open` = mailbox → discovery → GMMU → GMC context0 → flush; `valloc`, `vram_read/write`, `release` | **HW-validated** GMC तक |
+| Discovery | `pci.rs`, `discovery.rs` | sysfs BAR mmap (BAR0 VRAM / BAR2 doorbell / BAR5 MMIO), config-space r/w, bounds-checked IP-discovery parser (प्रति-XCC segment bases, `gc_info` v1/v2) | VF पर चला; parser unit-tested |
+| Register access | `regaccess.rs`, `rlcg.rs`, `mailbox.rs`, `regs.rs`, `regs_gen.rs` | VF↔GIM mailbox handshake, प्रति XCC RLCG indirect GC/GCVM r/w, MMIO/RLCG router, `select` / `find` / `encode` के साथ vendored register tables | VF पर चला (scratch echo, हर XCC पर `GRBM_STATUS`); table logic unit-tested |
+| Memory (GMMU) | `mm/{tlsf,pagetable,manager,mod}.rs` | VA, physical VRAM और page-table pool के लिए TLSF allocators; 4-level / 48-bit walk (`va_shifts = [12, 21, 30, 39]`); gfx9 और gfx11 PTE/PDE encoding; huge pages; table reclaim; `valloc` / `vfree` | unit-tested; page tables BAR0 पर VRAM में लिखी गईं और CPU द्वारा वापस walk की गईं — उनके माध्यम से कोई GPU translation पुष्ट नहीं है |
+| GMC bring-up | `ip/gmc.rs` | दोनों hubs का context0 (base/start/end + CNTL), MX_L1_TLB, प्रति-engine invalidation ranges, ENG17 TLB flush, HDP flush, raw fault-status read | VF पर context programming तक चला, हर XCC पर flush ACK के साथ |
+| GFX bring-up | `ip/gfx.rs` | MEC enable (unchecked writes), v9 compute MQD, HQD activation, `WRITE_DATA` PM4 | `CP_HQD_ACTIVE` 1 पढ़ता है; queue ने कभी कोई packet consume नहीं किया |
+| SDMA bring-up | `ip/sdma.rs` | F32 को unhalt करना, RB base/rptr/wptr + doorbell program करना, submit, `wait_idle` | programmed; कोई copy कभी पूरी नहीं हुई |
+| Orchestrator | `dev.rs` | `AmDev::open` = mailbox → discovery → GMMU → GMC context0 → flush; `valloc`, `vram_read` / `vram_write`, `release` | VF पर GMC तक चला |
 
-### GMMU और gfx9
+Page tables एक injectable `PhysMem` trait पर आधारित हैं — tests में एक plain buffer, driver
+में BAR-mapped VRAM (`VramPhys`)। leaf encoding ही एकमात्र arch-specific हिस्सा है: gfx9
+MTYPE को bit 57 पर रखता है, PDB1 table entries पर `bfs` और PDB0 table entries पर
+translate-further set करता है, और PDB1/PDB2 leaves को `PDE_PTE` mark करता है; gfx12
+`unimplemented!` है (constants captured; एक test panic को assert करता है)।
 
-page-table geometry **4-level / 48-bit** है (`va_shifts = [12, 21, 30, 39]`), एक आकार जो
-**gfx9/11/12 में साझा है** — इसलिए geometry ख़ुद arch पर branch नहीं करती। केवल leaf PTE
-encoding (विशेष रूप से MTYPE memory-type field) arch-specific है, और **अब gfx9 (CDNA)
-और gfx11 (RDNA3) दोनों implement और unit-tested हैं** — gfx9 MTYPE को bits 57–58 पर रखता
-है, PDB1 table entries पर `bfs` और PDB0 table entries पर translate-further bit set करता है,
-और PDB1/PDB2 leaves को `PDE_PTE` से चिह्नित करता है (एक 2 MiB PDB0 leaf का मतलब है
-translate-further का *अभाव*)। **gfx12 ही एकमात्र शेष `unimplemented!` है** (constants captured हैं, अभी तक
-hardware-validated नहीं; एक test assert करता है कि यह panic करता है)। `MemoryManager` तीन
-TLSF sub-allocators (VA space, physical VRAM, page-table pool) चलाता है और table को `Inspect`
-/ `Create` / `Free` modes में walk करता है, unmap पर empty tables को reclaim करते हुए।
+### Register tables एक बार generate होती हैं, फिर vendored
 
-### Register tables एक-बार generate होते हैं, फिर vendor किए जाते हैं
-
-tinygrad एक कभी-कभी-अनुपस्थित submodule है, इसलिए build को कभी उस पर निर्भर नहीं होना चाहिए।
-इसके बजाय `device/tools/gen_am_regs.py` को एक arch जोड़ते या update करते समय **manually**
-चलाया जाता है: यह tinygrad के `autogen/am/regs.py` को parse करता है और committed
-`am/regs_gen.rs` emit करता है। `regs.rs` बस उसे `include!` करता है। boot पर सही table को
-discovered `ip_ver` से चुना जाता है (`select` वह सबसे बड़ा version `≤ ip_ver` चुनता है जो वही
-major साझा करता है — tinygrad का `import_module` नियम)। committed tables अब gfx9.4.3/CDNA3
-set (`gc 9.4.3`, `mmhub 1.8.0`, `osssys 4.4.2`, `sdma 4.4.2`, `nbio 7.9.0`, `hdp 4.4.2`,
-`mp 11.0.0`/`13.0.0`) और gfx11.5.0 set दोनों को कवर करते हैं। एक arch जोड़ना generator की
-module list को widen करना और उसे re-run करना है — कोई build या runtime logic change नहीं।
+tinygrad एक कभी-कभी अनुपस्थित submodule है, इसलिए build कभी उस पर निर्भर नहीं करता।
+`device/tools/gen_am_regs.py` हाथ से चलाया जाता है: यह tinygrad का `autogen/am/regs.py`
+parse करता है और committed `am/regs_gen.rs` emit करता है। boot पर `select` उसी major वाला
+सबसे बड़ा table version `≤ ip_ver` चुनता है। committed tables gfx9.4.3 set (`gc_9_4_3`,
+`mmhub_1_8_0`, `osssys_4_4_2`, `sdma_4_4_2`, `nbio_7_9_0`, `hdp_4_4_2`, `mp_11_0_0`,
+`mp_13_0_0`) और gfx11.5.0 set (`gc_11_5_0`, `mmhub_3_3_0`, `mp_14_0_2`, `nbio_7_11_0`,
+`hdp_6_0_0`, `osssys_6_0_0`) को cover करती हैं; gfx11 GC table वही है जिसे KFD path के
+hardware counters उपयोग करते हैं (`amd/pmc.rs`)।
 
 ---
 
-## The VF boundary
+## Examples
 
-यह वह दीवार है जहाँ bring-up फ़िलहाल रुक जाता है। guest engines को **program** कर सकता है पर
-उन्हें **drive** नहीं कर सकता, क्योंकि वह doorbell aperture जो किसी ring का write-pointer
-command processor तक पहुँचाता है **PF-owned** है। VF से इसे enable करना (`_PF` BIF
-doorbell-access registers लिखना) VF↔GIM mailbox को wedge कर देता है और एक full VM reboot
-चाहता है — इसलिए `enable_doorbell_aperture` `ip/gfx.rs` में मौजूद है पर explicit रूप से **VF
-पर do-not-call** चिह्नित है।
+हर `device/examples/am_*.rs` program एक standalone bring-up oracle है। जून 2026 के run ने
+क्या स्थापित किया:
 
-ठोस परिणाम, दोनों examples द्वारा reproduce किए गए:
-
-- **MEC compute queue activate होती है पर execute नहीं करती** (`am_compute`): HQD
-  `CP_HQD_ACTIVE = 1` report करता है, पर एक `WRITE_DATA` packet अपना sentinel VRAM में कभी
-  land नहीं करता — CP कभी doorbell नहीं देखता।
-- **SDMA ring programmed है पर consume नहीं करता** (`am_sdma`): read pointer अटका रहता है;
-  MM-hub page-table walk faults अब भी gated हैं।
-
-तो आज AM **engine hand-off तक HW-validated** है — discovery, ownership, GMMU, और GMC live VF
-पर सिद्ध हैं — और KFD काम करता हुआ VF backend बना रहता है। इस boundary को पार करना ही बचे हुए
-milestones का विषय है।
-
----
-
-## आज hardware पर क्या चलता है
-
-हर `am_*` example एक standalone bring-up oracle है, जो live VF पर चलाया गया है:
-
-| Example | यह क्या सिद्ध करता है | Status |
+| Example | क्या करता है | परिणाम |
 |---|---|---|
-| `am_discovery` | BAR map + IP discovery (8× GC 9.4.3, SDMA, AIDs), read-only — एक bound `amdgpu` के साथ coexist करता है | **works** |
-| `am_own` | mailbox grant + RLCG scratch echo + सभी 8 XCC पर non-gated `GRBM_STATUS` | **works** |
-| `am_gmc` | GC + MM context0 programmed; सभी 8 XCC पर ENG17 TLB-flush ACK; कोई protection fault latch नहीं हुआ | **works** |
-| `am_sdma` | SDMA ring setup + submit | ring programmed, **engine consume नहीं करता** |
-| `am_compute` | MEC enable + MQD activate + `WRITE_DATA` | **HQD activate होता है**, queue execute नहीं करती |
+| `am_discovery` | BAR map + IP discovery, read-only; bound `amdgpu` के साथ coexist करता है | 8 GC 9.4.3 instances, SDMA और AIDs enumerated |
+| `am_own` | mailbox grant + RLCG scratch echo + हर XCC पर `GRBM_STATUS` | asserts pass |
+| `am_gmc` | GC + MM context0 programmed; हर XCC पर ENG17 TLB-flush ACK; fault status printed | हर XCC पर ACKs |
+| `am_sdma` | SDMA ring setup + उसके माध्यम से एक copy | engine ring consume नहीं करता |
+| `am_compute` | MEC enable + MQD activate + `WRITE_DATA`, doorbell और direct `CP_HQD_PQ_WPTR` write दोनों से kicked | HQD activate होता है; sentinel कभी नहीं पहुँचता |
+
+दीवार engine hand-off है: doorbell aperture routing और engine boot host PF के स्वामित्व में
+हैं। VF से aperture enable करना (`_PF` BIF doorbell registers) VF↔GIM mailbox को अटका देता है
+और VM reboot की ज़रूरत पड़ती है, इसलिए `enable_doorbell_aperture` `ip/gfx.rs` में मौजूद है पर
+VF पर do-not-call mark है और `am_compute` में commented out है।
 
 ---
 
-## अभी भी क्या स्थगित है
+## क्या मौजूद नहीं है
 
-privileged, PF-owned subsystems **tree से अनुपस्थित हैं** — एक VF पर वे GIM के मालिकाने में
-हैं और guest के लिए करने को कुछ नहीं है; bare metal पर वे आख़िरी, सबसे-अधिक-जोखिम वाला port
-हैं:
+- **एक `AmdIface` implementation** — इसलिए AM device बैकएंड नहीं बन सकता।
+- **PSP firmware load**, **SMU / clocks** — VF पर GIM के स्वामित्व में; bare metal पर ये
+  सबसे बड़ा और सबसे जोखिम भरा port होंगे।
+- **एक interrupt handler** — कोई `ip/ih.rs` नहीं है; OSSSYS table केवल `am_discovery`
+  उपयोग करता है। Bring-up poll करता है।
+- **प्रमाण कि कोई GPU engine AM की page tables के माध्यम से काम execute करता है।**
 
-- **PSP firmware load** — sOS bootloader handshake / TMR / per-IP firmware load। VF पर
-  GIM-owned।
-- **SMU / clocks** — power और clock management। VF पर GIM-owned।
-- **interrupt handler (IH)** — कोई `ip/ih.rs` मौजूद नहीं; OSSSYS register table vendored है
-  पर unused। bring-up interrupts लेने के बजाय poll करता है।
-- **`AmIface` seam implementor** — अभी तक कोई AM type [`AmdIface`](./overview.md) implement
-  नहीं करता, इसलिए AM को एक device backend के रूप में नहीं चुना जा सकता; `AmDev` केवल
-  examples के माध्यम से पहुँच योग्य है।
+दो debug knobs केवल GMC bring-up के लिए मौजूद हैं: `SVOD_AM_DEBUG` (कोई भी value) registers
+लिखने के बाद उन्हें वापस पढ़ता है और rejected GC writes log करता है, और `SVOD_AM_MCBASE`
+(`raw`, `fb` या `fbxgmi`) MC aperture base को override करता है।
 
 ---
 
-## Roadmap
+## यह यहाँ क्यों है
 
-काम milestones के रूप में staged है, हर एक live VF पर स्वतंत्र रूप से testable (और, PF-owned
-blocks के लिए, bare-metal tinygrad AM को oracle मानकर)। पहले वाले milestones implement हो चुके
-हैं; पूरा AM end-to-end integration भविष्य का काम है।
-
-एक बार जब कोई engine work consume कर ले और seam wire हो जाए, AM
-`SVOD_AMD_BACKEND=am` के माध्यम से selectable बन जाता है और पूरे मौजूदा ऊपरी हिस्से को
-unchanged चलाता है। तब वह crash-inducing concurrency जिसने AM को प्रेरित किया crash नहीं कर
-सकती — kernel को bypass कर दिया गया है।
-
----
-
-## यह क्यों ज़रूरी है
-
-AM driver उस firmware-wedge समस्या का असली उत्तर है जिसे lane pool को clamp करना
-([`SVOD_AMD_HW_QUEUES=1`](./queues-and-dispatch.md)) केवल sidestep करता है। महँगे, GPU-free हिस्से — GMMU, register tables, mailbox/RLCG
-indirect-access machinery — live VF पर built और validated हैं, और page tables, GMC, और
-ownership handshake सभी काम करते हैं। बचा हुआ gap एक hardware boundary है (PF-owned doorbell
-aperture), design वाला नहीं। और चूँकि यह उसी [seam](./overview.md) के पीछे slot होता है —
-पाँच required methods और तीन defaulted hooks — इसके उतरने पर dispatch, compile, या graph
-machinery में से किसी को बदलना नहीं पड़ता।
+प्रेरणा kernel scheduler है: single-XCC gfx11+ parts पर, aggressive multi-queue dispatch CP
+micro-engines को ऐसे waits में अटका सकता है जिन्हें MES firmware preempt नहीं कर सकता, यही
+कारण है कि [lane pool](./queues-and-dispatch.md) conservative रहता है। GPU का स्वामी बनना
+kernel को dispatch path से बाहर कर देगा। वह तर्क अभी उस पर लागू नहीं होता जिसे AM support करता
+है — VF पर host अब भी scheduling, world-switch और doorbells का स्वामी है — और bare metal पर
+वहाँ पहुँचने का अर्थ है मौजूदा चीज़ों के ऊपर PSP, SMU, interrupts और seam implementation। आज
+design का मूल्य ख़ुद seam है: यदि कभी कोई AM बैकएंड आता है, तो वह `KfdIface` जैसे ही पाँच
+methods और तीन hooks implement करेगा, और seam के ऊपर कुछ नहीं बदलेगा।

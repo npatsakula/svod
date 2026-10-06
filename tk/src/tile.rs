@@ -19,7 +19,7 @@ use svod_ir::UOp;
 use crate::Kernel;
 use crate::tiles::{RTBaseShape, STBaseShape, TileLayout, VecLayout};
 
-/// A register-backed tile ([`RT`] or [`RV`]) that the elementwise [`map`] /
+/// A register-backed tile ([`RT`] or [`RV`]) that the elementwise [`map`](crate::Group::map) /
 /// math / reduce ops manipulate uniformly: a flat buffer, a logical shape, an
 /// element dtype, and a `rewrap` to swap the backing buffer after a store.
 pub trait RegTile<'k>: Clone {

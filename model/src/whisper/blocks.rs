@@ -1,6 +1,6 @@
 //! Whisper building blocks: the mixed-precision linear epilogue and the
 //! sinusoidal positional embedding. The layer constructors live in
-//! [`crate::init`].
+//! `init`.
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;

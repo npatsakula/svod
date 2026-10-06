@@ -16,7 +16,7 @@ sidebar_label: 剖析
 | **4 — 硬件计数器** | 有 | CUPTI range profiler（`libcupti.so.13`） |
 
 ```bash
-SVOD_DEVICE=CUDA:0 SVOD_PROFILE_ITERS=20 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
+SVOD_DEVICE=CUDA:0 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
 ```
 
 ---
@@ -60,7 +60,7 @@ BEAM 所用的 `Program::execute_timed` 是调度流上的同一对 event，以
 | `SGPR` | `sgprs` | `-`（NVIDIA 上没有标量寄存器堆） |
 | `LDS` | `lds_bytes` | `CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES`（静态 `.shared`） |
 | `scratch` | `scratch_bytes` | `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES`（每线程的 `.local`） |
-| `occ%` | `occupancy` | `cuOccupancyMaxActiveBlocksPerMultiprocessor(block) × block / 每 SM 最大线程数` |
+| `occ%` | `occupancy` | `cuOccupancyMaxActiveBlocksPerMultiprocessor(block) × block / 每 SM 最大线程数`，上限截断为 1 |
 
 `wave_size` 就是设备的 warp 大小（32）。占用率查询需要一个 block 尺寸：程序
 记住了它**最近一次启动**的 block，在任何启动之前则回落到函数的
@@ -85,7 +85,7 @@ BEAM 所用的 `Program::execute_timed` 是调度流上的同一对 event，以
 `struct_size`，遇到 `CUPTI_ERROR_INVALID_PARAMETER` 就退回一档 ——
 `cuptiProfilerGetCounterAvailability`（41 然后 40）与
 `cuptiProfilerHostInitialize`（56 然后 48）—— 而 `abi_ladder` 会记住已安装的
-CUPTI 究竟接受了哪个尺寸。
+CUPTI 第一个没有以参数错误拒绝的尺寸。
 
 `SVOD_PMC=1` 选择该后端的默认集合：
 

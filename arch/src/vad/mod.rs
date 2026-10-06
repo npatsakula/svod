@@ -223,7 +223,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `strict_limit + 2·trough_radius` (split_long_runs slack) `+ 2·pad +
 /// 2·align_to` (post-process slack at waveform edges + alignment snap).
 /// The `2·align_to` term covers both snaps a decode window takes in
-/// [`post_process`]: `decode_start` floors and `decode_end` ceils, each
+/// `post_process`: `decode_start` floors and `decode_end` ceils, each
 /// moving the boundary by up to `align_to − 1`. Single source of truth for
 /// downstream callers that need to size buffers or assert the contract.
 pub fn strict_chunk_sample_bound(

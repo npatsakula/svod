@@ -7,7 +7,7 @@
 //!
 //! - **Per-iteration re-init** must depend on the loop RANGE, or the linearizer
 //!   schedules it with `run_count = 1` (outside the loop) and it carries stale state
-//!   every trip (the same hazard [`crate::Group::anchor`] guards for unrolled reads).
+//!   every trip (the same hazard `anchor` guards for unrolled reads).
 //! - **Loop close** must end *exactly one* terminal store ([`Kernel::endrange_to`]);
 //!   carried tiles then read their final value outside the loop via `t.after([end])`.
 //!

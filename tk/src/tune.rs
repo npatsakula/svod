@@ -49,7 +49,7 @@ fn digest(value: &impl Hash) -> u64 {
 /// of the candidates' configs and of anything else the built graphs vary with
 /// that `shape` does not spell out, such as the operand dtype). Every field is
 /// cheap, so the memo answers without building a kernel; what the graphs
-/// themselves fingerprint to joins the key only in [`Self::line`], the store's
+/// themselves fingerprint to joins the key only in `line`, the store's
 /// form.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct TuneKey {
@@ -205,7 +205,7 @@ impl TuneStore {
 
     /// [`Self::select_with`] over kernels: `compile(i)` builds candidate `i` (or
     /// `None` when it cannot be built); the first that built lifts the clock,
-    /// then every candidate is timed in turn for [`ROUNDS`] rounds and its
+    /// then every candidate is timed in turn for `ROUNDS` rounds and its
     /// minimum kept.
     pub fn select(
         &self,

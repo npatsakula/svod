@@ -41,7 +41,7 @@ flowchart TD
 | **1 — device time** | हर कर्नेल का GPU execution time | GPU-clock dispatch timestamps | हाँ |
 | **2 — roofline** | derived **GFLOP/s** और **GB/s** | कर्नेल के IR से FLOP estimate; bytes plan के buffers से | हाँ (rates के लिए time चाहिए) |
 | **3 — static occupancy** | VGPR / SGPR / LDS / scratch usage और **occupancy %** | AMD: kernel descriptor से decoded। CUDA: `cuFuncGetAttribute` के साथ `cuOccupancyMaxActiveBlocksPerMultiprocessor` | कोई dispatch नहीं — AMD पर एक static decode, CUDA पर एक driver query |
-| **4 — hardware counters (PMC)** | AMD: SQ busy cycles, waves, VALU instructions. CUDA: SM cycles, warps, instructions, tensor-pipe cycles, DRAM bytes | AMD: PM4 packets, grid भर में summed. CUDA: CUPTI range profiler | हाँ, और counters unlocked होने चाहिए |
+| **4 — hardware counters (PMC)** | AMD: SQ busy cycles, waves, VALU instructions. CUDA: SM cycles, warps, instructions, tensor-pipe cycles, DRAM bytes | AMD: PM4 perf-counter packets, grid भर में summed. CUDA: CUPTI range profiler | हाँ, और counters unlocked होने चाहिए |
 
 कुछ बातें जानने लायक़:
 
@@ -159,7 +159,7 @@ SVOD_DEVICE=AMD:0 SVOD_PROFILE_ITERS=20 SVOD_PMC=1 ...
 # Only VALU instructions and SQ-busy cycles.
 SVOD_DEVICE=AMD:0 SVOD_PMC=valu,sqbusy ...
 
-# CUDA पर tensor-core utilization और DRAM traffic।
+# Tensor-core utilization and DRAM traffic on CUDA.
 SVOD_DEVICE=CUDA:0 SVOD_PMC=tensor,dram ...
 ```
 
@@ -232,8 +232,9 @@ criterion के custom `Profiler` trait के ज़रिए इसमें 
 extension point जिसे flamegraph generation इस्तेमाल करता है।
 
 वह hook `tk/benches/common.rs` का `PlanProfiler` है। जब किसी benchmark को profile किया जा रहा होता है,
-`bench_plan` हर invocation पर process-global `bench_profiler()` के ज़रिए benchmark का plan capture करता है,
-हर capture को `ProfileOptions::from_env()` से profile किया जाता है और per-kernel min से session accumulator
+`bench_plan` (या `bench_kernel`, जो सिर्फ़ उन dispatches को गिनता है जिनका entry point हाथ से लिखे कर्नेल का
+नाम रखता है, ताकि अकेले output को realize करने से जुड़ने वाली copy उसके खाते में न जाए) हर invocation पर
+process-global `bench_profiler()` के ज़रिए benchmark का plan capture करता है, हर capture को `ProfileOptions::from_env()` से profile किया जाता है और per-kernel min से session accumulator
 में merge किया जाता है। stop पर, merged table को `render_table()` से render किया जाता है, criterion की output
 directory के नीचे एक file में लिखा जाता है, और stderr पर echo किया जाता है:
 
@@ -242,29 +243,32 @@ target/criterion/<id>/profile/svod-profile.txt
 ```
 
 wiring हर bench के `criterion_group!` में बस एक line है — यह shared profiler को criterion config के रूप में
-install करती है (`tk/benches/kmeans.rs` से):
+install करती है (`tk/benches/fa.rs` से):
 
 ```rust
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(common::bench_profiler());
-    targets = bench_kmeans
+    targets = bench_fa
 }
 criterion_main!(benches);
 ```
 
-इसे किसी भी criterion bench की तरह चलाएँ, बस `--profile-time` जोड़कर (और कोई भी tier env vars):
+इसे किसी भी criterion bench की तरह चलाएँ, बस `--profile-time` जोड़कर (और कोई भी tier env vars)। हर कर्नेल के
+लिए एक binary है: `fa`, `gemm`, `matmul`, `norm`, `sq_attention`, `knn`, `kmeans`।
 
 ```bash
 # Plain bench: GPU device time per benchmark, profiler dormant.
-SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench kmeans
+SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench fa
 
 # Drive the layered profiler for ~5s per benchmark, with hardware counters.
-SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench kmeans -- --profile-time 5
+SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench fa -- --profile-time 5
 ```
 
 चूँकि `bench_profiler()` तब तक dormant रहता है जब तक criterion profile न कर रहा हो, सादा `cargo bench` पूरी
-तरह unaffected रहता है — वही numbers, कोई extra passes नहीं।
+तरह unaffected रहता है — वही numbers, कोई extra passes नहीं। कर्नेल के `ArchSet` से बाहर के device पर bench ख़ुद
+skip हो जाता है। ध्यान दें कि bench में [autotuner](./tuning) *on* रहता है, जब तक `SVOD_TK_TUNE=0` न हो: किसी
+नए shape के पहले sample में tile measurement शामिल होता है, जिसे criterion का warm-up सोख लेता है।
 
 ---
 
@@ -282,13 +286,12 @@ version एक matmul को hardware peak से दसियों गुन�
 IR से नहीं।) हाथ से लिखे कर्नेल के लिए roofline को algorithm की जानी-पहचानी FLOP count और Tier-1 device time
 से ख़ुद हाथ से compute करें।
 
-**Tier 4 को एक stable power state चाहिए।** PM4 hardware counters तभी अर्थपूर्ण होते हैं जब GPU एक fixed clock
-पकड़े रखे। default `auto` power state पर profiler *fail नहीं होता* — यह degrade होता है: यह सिर्फ़ timing
-report करता है और एक one-line note print करता है कि counters के लिए `profile_standard` state चाहिए। पहले GPU
-को उस state में डालें (जैसे `amd-smi set -l stable_std`), फिर `SVOD_PMC` के साथ दोबारा चलाएँ। CUDA पर
-शर्त अलग है: जब तक `NVreg_RestrictProfilingToAdminUsers=0` सेट न हो, driver counter collection सिर्फ़
-admin users को देता है, और CUPTI load होने लायक़ होनी चाहिए (`SVOD_CUDA_CUPTI=0` उसे जानबूझकर बंद कर
-देता है)। NVIDIA की बारीक़ियाँ
+**Tier 4 को unlock करना पड़ता है, और शर्त vendor के हिसाब से अलग है।** AMD पर PM4 counters सिर्फ़ fixed
+clock पर ही अर्थपूर्ण होते हैं, इसलिए GPU को `profile_standard` power state पकड़े रखनी चाहिए
+(`amd-smi set -l stable_std`)। CUDA पर, जब तक `NVreg_RestrictProfilingToAdminUsers=0` सेट न हो, driver counter
+collection सिर्फ़ admin users को देता है, और CUPTI load होने लायक़ होनी चाहिए (`SVOD_CUDA_CUPTI=0` उसे
+जानबूझकर बंद कर देता है)। दोनों में से किसी भी हालत में profiler fail नहीं होता: यह सिर्फ़ timing report करता
+है और एक one-line note print करता है कि क्या कमी है। NVIDIA की बारीक़ियाँ
 [CUDA पर Profiling](../backends/cuda/profiling.md) में हैं, यह भी कि वहाँ counters इकट्ठा करने में एक
 अतिरिक्त pass क्यों लगता है।
 :::

@@ -57,9 +57,9 @@ OUTPUT="${OUTPUT:-ir_${TEST_NAME}.txt}"
 RUST_LOG="svod_schedule::rangeify::transforms=debug,\
 svod_schedule::rangeify::indexing=debug,\
 svod_schedule::rangeify::kernel=debug,\
-svod_schedule::optimizer=debug,\
+svod_schedule::optimizer=trace,\
 svod_schedule::linearize=debug,\
-svod_codegen=debug"
+svod_codegen=trace"
 
 CARGO_ARGS=(test --release "$TEST_NAME" -- --nocapture --test-threads=1)
 [[ -n "$PACKAGE" ]] && CARGO_ARGS=(test --release "$TEST_NAME" -p "$PACKAGE" --lib -- --nocapture --test-threads=1)
@@ -97,7 +97,7 @@ def section(title):
 def target_ok:
   if $tfilter == "" then true else (.target | test($tfilter)) end;
 
-[ .[] | select(.level == "DEBUG") | select(target_ok) ] |
+[ .[] | select(.level == "DEBUG" or .level == "TRACE") | select(target_ok) ] |
 reduce .[] as $e (
 
   { out: "", phase: "", kernel: 0, last_initial: null };

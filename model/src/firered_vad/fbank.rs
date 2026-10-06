@@ -130,7 +130,7 @@ jit_wrapper! {
     }
 }
 
-/// Host driver over a fixed-shape [`KaldiFbankJit`]: `batch` windows of
+/// Host driver over a fixed-shape `KaldiFbankJit`: `batch` windows of
 /// `capacity` frames per execute, frames being independent under
 /// `snip_edges`. The output buffer is shaped for a device copy into a model
 /// JIT's `[batch, capacity, N_MELS]` input, so features never round-trip

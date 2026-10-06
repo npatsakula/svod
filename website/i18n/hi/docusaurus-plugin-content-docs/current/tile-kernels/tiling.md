@@ -44,7 +44,8 @@ flowchart LR
 ## एक tile दरअसल matrix-core fragments का एक grid है
 
 `16×16` ही क्यों, `100×100` जैसा कोई गोल-सा number क्यों नहीं? क्योंकि matrix core एक fixed *fragment* size
-पर काम करता है, जो hardware में ही baked होता है — आम तौर पर `16×16` या `32×32`। एक tile को इतना बड़ा रखा
+पर काम करता है, जो hardware में ही baked होता है — AMD के MFMA और WMMA cores पर और NVIDIA के `mma.sync` पर
+(दो `16×8` halves के रूप में) `16×16`, Apple के `simdgroup_matrix` पर `8×8`। एक tile को इतना बड़ा रखा
 जाता है कि वह उन fragments की पूरी संख्या बन सके:
 
 ```mermaid
@@ -100,21 +101,26 @@ Tiling बस "loop को blocking करना" नहीं है। यह 
 
 विशुद्ध shape descriptors `tk/src/tiles.rs` में रहते हैं। base fragment है
 `BaseShape { rows, cols, ept }`, जहाँ `ept` (elements-per-thread) को `rows*cols / wave_size` के रूप में
-compute करने के बजाय **explicitly** साथ रखा जाता है, क्योंकि RDNA पर matrix instruction operands को lanes
-भर में *replicate* करता है — इसलिए एक operand tile की element count को wave size से भाग देना ग़लत जवाब देता
-है। Register tiles एक `LaneMap` (`RTBaseShape`) जोड़ते हैं — fragment का closed-form `(lane, j) → (row, col)`
-map — ताकि वे layouts encode हो सकें जिन्हें कोई plain stride express नहीं कर सकता: RDNA accumulator का
-even/odd row interleave, और CUDA का `mma.sync` 16×16 tile जो दो `m16n8` halves के रूप में रखा जाता है।
+compute करने के बजाय **explicitly** साथ रखा जाता है, क्योंकि RDNA3 पर matrix instruction operands को wave के
+दोनों हिस्सों में *replicate* करता है — इसलिए एक operand tile की element count को wave size से भाग देना ग़लत
+जवाब देता है (प्रति lane 16, 8 नहीं)। Register tiles एक `LaneMap` (`RTBaseShape`) जोड़ते हैं — fragment का
+closed-form `(lane, j) → (row, col)` map, जो `tk/src/layout.rs` में है — ताकि एक layout एक ही बार data के रूप
+में वर्णित हो और हर consumer (LDS और global hops, position-aware masks, reduce tree) उसे पढ़े। Variants हैं
+`Strided` (CDNA, gfx12, और stride 0 पर replicated gfx11 operand), `Interleaved` / `InterleavedT` (gfx11
+accumulator का even/odd row interleave और उसका N-major transpose), `MmaSync` (दो `m16n8` halves के रूप में एक
+16×16 tile) और `SimdgroupMatrix` / `SimdgroupMatrixT` (Apple का 8×8, hardware पर मापा गया)। Shared tiles इसके
+बजाय एक `Swizzle` जोड़ते हैं (`STBaseShape`)।
 
 buffer-bound wrappers `tk/src/tile.rs` में रहते हैं: `GL` (global layout), `ST` (shared / LDS,
-optionally double-buffered), `RT` (register tile), और `RV` (register vector, उन row/column reductions के
+optionally multi-stage), `RT` (register tile), और `RV` (register vector, उन row/column reductions के
 लिए जो softmax को चाहिए होती हैं)। हर एक एक flat `Arc<UOp>` buffer, साथ में एक logical shape और एक dtype है।
 
 सबसे अहम बात, कर्नेल कभी `RT_16X16` जैसे किसी fragment constant को सीधे नाम नहीं देते। वे एक **role** माँगते
-हैं — `FragRole::{Accumulator, Operand, AccumulatorT}` — और `tk/src/arch.rs` में `ArchCaps::frag(role)` इसे
-target (CDNA, RDNA, या CUDA का `mma.sync`) के लिए सही physical shape में resolve करता है। यही indirection एक कर्नेल को wave
-sizes और fragment layouts भर में portable बनाती है; देखें [Wave32 बनाम Wave64](./wave-portability)। matrix multiply ख़ुद उस
-`WMMA` op में lower होता है जो [Op Bestiary](../architecture/op-bestiary) में documented है।
+हैं — `FragRole::{Accumulator, Operand, OperandB, AccumulatorT}` — और `tk/src/arch.rs` में `ArchCaps::frag(role)`
+इसे target के लिए सही physical shape में resolve करता है। यही indirection एक कर्नेल को wave sizes और fragment
+layouts भर में portable बनाती है; देखें [Layouts और wave size](./wave-portability)। matrix multiply ख़ुद उस
+`WMMA` op में lower होता है जो [Op Bestiary](../architecture/op-bestiary) में documented है, और उसका descriptor
+scheduler की अपनी per-arch `TensorCore` table से लिया जाता है — वही table जिसे BEAM का `TC` action पढ़ता है।
 :::
 
 ---
@@ -123,4 +129,4 @@ sizes और fragment layouts भर में portable बनाती है; 
 
 अब आपके पास शब्दावली है: memory में tensors, registers में tiles, matrix core में fragments।
 [IR में authoring](./lowering) दिखाता है कि जब आप असल में इन टुकड़ों से एक कर्नेल *लिखते* हैं तो क्या होता है —
-कैसे `Kernel`/`Group` builder tile operations को उसी UOp IR में बदल देता है जिसे बाक़ी Svod compile करता है।
+कैसे `Kernel`/`Group` builder tile operations को ठीक उसी UOp IR में बदल देता है जिसे बाक़ी Svod compile करता है।

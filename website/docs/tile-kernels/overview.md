@@ -8,7 +8,8 @@ Svod is built around automation. You build a lazy graph, call `realize()`, and t
 decides how to tile, vectorize, and parallelize every loop — with [beam search](../architecture/optimizations/kernel-search)
 it will even compile and time hundreds of candidate schedules to find a fast one. You never write a loop.
 
-So why does Svod ship a crate — `tk` — whose entire job is letting you write GPU kernels by hand?
+So why does Svod ship a crate — `svod-tk`, `tk` for short — whose entire job is letting you
+write GPU kernels by hand?
 
 Because some kernels can't be discovered by searching over loop transformations. The
 optimizer's action space is "take this reduction and tile it, unroll it, put it in shared
@@ -48,13 +49,34 @@ re-exported from `tk/src/lib.rs`):
 
 | Face | You are… | What you touch |
 |------|----------|----------------|
-| **USE** | an application author who just wants a fast kernel | `matmul`, `flash_attention`, `flash_attention_with`, `single_query_attention`, and the AMD-only `kmeans_assign` / `knn` — they return lazy `Tensor`s, no kernel knowledge required |
-| **AUTHOR** | writing a new tile kernel | the `Kernel` / `Group` builder, `ArchCaps`, the tile types (`GL`/`ST`/`RT`/`RV`), `Swizzle`, `graph_launch` |
-| **DEBUG** | testing or benchmarking a kernel in isolation | `compile`, `launch`, `run_kernel`, `CompiledLaunch`, and structural `KernelFingerprint`s |
+| **USE** | an application author who just wants a fast kernel | `flash_attention`, `gemm_nt` with its fused `Epilogue`s, `rms_norm` / `add_rms_norm`, `single_query_attention`, `knn`, `kmeans_assign`, the square `matmul` — they return lazy `Tensor`s, no kernel knowledge required |
+| **AUTHOR** | writing a new tile kernel | the `Kernel` / `Group` / `Loop` builder, `ArchCaps` and `FragRole`, the tile types (`GL`/`ST`/`RT`/`RV`), `MoveIdx`, `graph_launch` and `launch_custom` |
+| **DEBUG** | testing or benchmarking a kernel in isolation | `run_kernel`, `compile_kernel`, `CompiledLaunch`, structural `KernelFingerprint`s, the `tune` store |
 
 The USE face is the important one for most readers: `flash_attention(q, k, v)` gives you back
 an ordinary `Tensor` that participates in the lazy graph like any other. You never see a tile.
-[What Tiling Is](./tiling) opens up the AUTHOR face; [Debugging](./debugging) covers DEBUG.
+[The Kernel Library](./kernel-library) lists every kernel; [What Tiling Is](./tiling) opens up
+the AUTHOR face; [Debugging](./debugging) covers DEBUG.
+
+---
+
+## Targets
+
+A `tk` kernel is built for a matrix-core family, and each kernel declares the parts it has
+been validated on as an `ArchSet` (`tk/src/target.rs`). On any other device its launcher
+returns `Ok(None)` and the caller falls back to the graph.
+
+| Family | Parts | Matrix op | Wave |
+|---|---|---|---|
+| AMD CDNA3 | gfx942 | MFMA | 64 lanes |
+| AMD RDNA3.5 | gfx1151 | gfx11 WMMA | 32 lanes |
+| AMD RDNA4 | gfx1200, gfx1201 | gfx12 WMMA | 32 lanes |
+| NVIDIA | sm_80 and newer | `mma.sync.m16n8k16` | 32 lanes |
+| Apple | Apple7 and newer (flash attention and `matmul` only) | `simdgroup_matrix` 8×8 | 32 lanes |
+
+Inputs are bf16 or f16, accumulation is f32. Which kernel runs where is the table in
+[The Kernel Library](./kernel-library); why one body runs on all of them is
+[Layouts and Wave Sizes](./wave-portability).
 
 ---
 
@@ -73,12 +95,13 @@ So:
 
 > If a kernel needs only a good **schedule** of a fixed dataflow, let BEAM find it. If it needs
 > a **different algorithm** than the naive one — something no reordering of the existing ops can
-> produce — you have to write it.
+> produce — or a **fusion across a kernel boundary** the scheduler keeps, you have to write it.
 
 | Property of the kernel | Built by | Examples |
 |------------------------|----------|----------|
-| **Fixed dataflow** — elementwise ops and reductions over a rectangular iteration space; only the *schedule* (tiling, vectorization, data placement, matrix-core mapping) is open | graph ops + **BEAM** | matmul / GEMM, feed-forward, layernorm, softmax |
-| **Needs a reformulated algorithm** — a loop-carried recurrence, or restructured numerics, that no reschedule of the naive ops can produce | **hand-authored in `tk`** | Flash Attention (online softmax); brute-force k-means assignment (`kmeans_assign`) — a cross-term WMMA fused with a running argmin over streamed centroid tiles, so the full `[N, K]` distance matrix is never formed |
+| **Fixed dataflow** — elementwise ops and reductions over a rectangular iteration space; only the *schedule* (tiling, vectorization, data placement, matrix-core mapping) is open | graph ops + **BEAM** | a plain matmul, a feed-forward block, layernorm, softmax |
+| **Needs a reformulated algorithm** — a loop-carried recurrence, or restructured numerics, that no reschedule of the naive ops can produce | **hand-authored in `tk`** | Flash Attention (online softmax); single-query attention (one-pass softmax over a streamed cache); k-NN and k-means assignment — a cross-term WMMA fused with a running top-K / argmin over streamed tiles, so the full `[N, M]` distance matrix is never formed |
+| **Needs a fusion the scheduler cannot express** — work folded into a matrix-core kernel's own store, or a residual stream written once | **hand-authored in `tk`** | `gemm_nt` with a residual-add or SwiGLU `Epilogue`; `add_rms_norm` |
 
 ### What BEAM can't reach
 
@@ -93,8 +116,12 @@ block reads state the previous block wrote. No `UPCAST`/`UNROLL`/`TC` sequence c
 recurrence, so online softmax lies outside BEAM's search space. The gap is one of algorithm, not
 schedule, and that is what `tk` fills.
 
-`tk` also ships a hand-written `matmul`, but it belongs in the first row of the table: it is a
-performance canary for the DSL, not the production matmul, which goes through the graph.
+The third row is a narrower gap. The graph's linear layer is a matrix-core kernel BEAM tunes
+well, but the residual add after it, or the `silu(gate) · up` that follows a fused gate/up
+projection, is a second pass over the output that the scheduler will not fold into the GEMM's
+epilogue. `gemm_nt` folds it, so the intermediate is never written. The square `matmul` in the
+first row is different again: it is a performance canary for the DSL, not the production
+matmul, which goes through the graph.
 
 :::tip[For GPU experts]
 The structural difference between a hand-authored kernel and a BEAM-tuned one is a single field
@@ -116,10 +143,14 @@ The rest of this section builds up from the hardware problem to the design compa
 3. **[Authoring into the IR](./lowering)** — how a `tk` kernel becomes UOps and joins the
    lazy graph.
 4. **[Writing a Kernel](./first-kernel)** — authoring and running the simplest kernel, step by step.
-5. **[Wave32 vs Wave64](./wave-portability)** — keeping one kernel correct across AMD's two
-   wave widths and NVIDIA's warp32.
-6. **[Flash Attention](./flash-attention)** — the worked example that motivated all of this.
-7. **[Debugging](./debugging)** — running and verifying kernels by hand.
-8. **[Profiling & Benchmarking](./profiling)** — the layered profiler and criterion integration,
-   for any `Tensor` or `ExecutionPlan`.
-9. **[tk vs HipKittens vs CuTile](./comparison)** — where this design sits in the landscape.
+5. **[The Builder API](./builder-reference)** — every type and method of the AUTHOR face.
+6. **[Layouts and Wave Sizes](./wave-portability)** — keeping one kernel correct across
+   five fragment layouts and two wave widths.
+7. **[The Kernel Library](./kernel-library)** — the shipped kernels, their contracts, and how
+   a model uses them.
+8. **[Flash Attention](./flash-attention)** — the worked example that motivated all of this.
+9. **[Autotuning](./tuning)** — how a kernel's tile is measured on first use and cached.
+10. **[Debugging](./debugging)** — running and verifying kernels by hand.
+11. **[Profiling & Benchmarking](./profiling)** — the layered profiler and criterion integration,
+    for any `Tensor` or `ExecutionPlan`.
+12. **[tk vs HipKittens vs CuTile](./comparison)** — where this design sits in the landscape.

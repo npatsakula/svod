@@ -46,8 +46,9 @@ pub trait Program: Send + Sync {
     ///
     /// * `buffers` - Raw pointers to buffer data (input and output buffers)
     /// * `vals` - Variable values in positional order (matches `var_names` in CompiledSpec)
-    /// * `global_size` - Global work size (for GPU backends, None for CPU)
-    /// * `local_size` - Local work size (for GPU backends, None for CPU)
+    /// * `global_size` - Global work size; the CPU backend reads `[0]` as its
+    ///   thread count (`None` or 1 runs single-threaded)
+    /// * `local_size` - Local work size (GPU backends; CPU ignores it)
     /// * `wait` - Block until this dispatch completes before returning. GPU
     ///   backends submit asynchronously and rely on the device timeline for
     ///   ordering, so `wait=false` returns right after submit. Pass `true`
@@ -219,7 +220,7 @@ pub trait PlanContext: Send + Sync {
     /// this context (empty disables), returning how many of `counters` this
     /// backend collects: those naming another backend are dropped. Default
     /// collects none. Counters are reported via
-    /// [`DispatchTimestamps::counters`].
+    /// [`DispatchTimestamps::counters`](crate::DispatchTimestamps::counters).
     fn set_pmc(&self, _counters: &[crate::profile::PmcCounter]) -> usize {
         0
     }
@@ -407,11 +408,25 @@ fn sha256(bytes: &[u8]) -> StageDigest {
     StageDigest(Sha256::digest(bytes).into())
 }
 
+/// `io::Write` over a hasher: sha2 0.11 no longer implements it.
+struct HashWriter(Sha256);
+
+impl std::io::Write for HashWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn linear_sha256(linear: &Arc<UOp>) -> Result<StageDigest> {
     let graph = svod_ir::CanonicalGraph::from_root("source-stage-linear-v2", linear).map_err(|error| {
         Error::ProgramStageMismatch { stage: "SOURCE", reason: format!("cannot encode LINEAR identity: {error}") }
     })?;
-    let mut hasher = digest_io::IoWrapper(Sha256::new());
+    let mut hasher = HashWriter(Sha256::new());
     graph.encode_into(&mut hasher).map_err(|error| Error::ProgramStageMismatch {
         stage: "SOURCE",
         reason: format!("cannot serialize LINEAR identity: {error}"),

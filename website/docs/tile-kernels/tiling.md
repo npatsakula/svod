@@ -44,8 +44,9 @@ the one `tk` adopts. Pull a tile in, do matrix math on it in registers, write th
 ## A tile is a grid of matrix-core fragments
 
 Why `16×16` and not some round number like `100×100`? Because the matrix core works on a
-fixed *fragment* size baked into the hardware — typically `16×16` or `32×32`. A tile is sized
-to be a whole number of those fragments:
+fixed *fragment* size baked into the hardware — `16×16` on AMD's MFMA and WMMA cores and on
+NVIDIA's `mma.sync` (as two `16×8` halves), `8×8` on Apple's `simdgroup_matrix`. A tile is
+sized to be a whole number of those fragments:
 
 ```mermaid
 block-beta
@@ -101,24 +102,28 @@ index calculation.
 
 The pure shape descriptors live in `tk/src/tiles.rs`. The base fragment is
 `BaseShape { rows, cols, ept }`, where `ept` (elements-per-thread) is carried **explicitly**
-rather than computed as `rows*cols / wave_size`, because on RDNA the matrix instruction
-*replicates* operands across lanes — so an operand tile's element count divided by the wave
-size is the wrong answer. Register tiles add
-a `LaneMap` (`RTBaseShape`) — the closed-form `(lane, j) → (row, col)` map of the fragment — to
-encode layouts no plain stride can express: the RDNA accumulator's even/odd row interleave, and
-CUDA's `mma.sync` 16×16 tile held as two `m16n8` halves.
+rather than computed as `rows*cols / wave_size`, because on RDNA3 the matrix instruction
+*replicates* operands across the two wave halves — so an operand tile's element count divided
+by the wave size is the wrong answer (16 per lane, not 8). Register tiles add a `LaneMap`
+(`RTBaseShape`) — the closed-form `(lane, j) → (row, col)` map of the fragment, in
+`tk/src/layout.rs` — so a layout is described once as data and every consumer (the LDS and
+global hops, the position-aware masks, the reduce tree) reads it. The variants are `Strided`
+(CDNA, gfx12, and the replicated gfx11 operand at stride 0), `Interleaved` / `InterleavedT`
+(the gfx11 accumulator's even/odd row interleave and its N-major transpose), `MmaSync` (a 16×16
+tile as two `m16n8` halves) and `SimdgroupMatrix` / `SimdgroupMatrixT` (Apple's 8×8, measured on
+hardware). Shared tiles add a `Swizzle` instead (`STBaseShape`).
 
 The buffer-bound wrappers live in `tk/src/tile.rs`: `GL` (global layout), `ST` (shared / LDS,
-optionally double-buffered), `RT` (register tile), `RV` (register vector, for the row/column
+optionally multi-stage), `RT` (register tile), `RV` (register vector, for the row/column
 reductions softmax needs). Each is a flat `Arc<UOp>` buffer plus a logical shape plus a dtype.
 
 Crucially, kernels never name a fragment constant like `RT_16X16` directly. They request a
-**role** — `FragRole::{Accumulator, Operand, AccumulatorT}` — and `ArchCaps::frag(role)` in
-`tk/src/arch.rs` resolves it to the right physical shape for the target (CDNA, RDNA, or CUDA's
-`mma.sync`). That
-indirection is what makes one kernel portable across wave sizes and fragment layouts; see
-[Wave32 vs Wave64](./wave-portability). The matrix multiply itself lowers to the `WMMA` op
-documented in the [Op Bestiary](../architecture/op-bestiary).
+**role** — `FragRole::{Accumulator, Operand, OperandB, AccumulatorT}` — and `ArchCaps::frag(role)`
+in `tk/src/arch.rs` resolves it to the right physical shape for the target. That indirection is
+what makes one kernel portable across wave sizes and fragment layouts; see
+[Layouts and Wave Sizes](./wave-portability). The matrix multiply itself lowers to the `WMMA`
+op documented in the [Op Bestiary](../architecture/op-bestiary), with its descriptor taken from
+the scheduler's own per-arch `TensorCore` table — the same table BEAM's `TC` action reads.
 :::
 
 ---

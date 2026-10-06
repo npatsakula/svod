@@ -229,39 +229,45 @@ benches hook the **full layered profiler** into it via criterion's custom `Profi
 same extension point flamegraph generation uses.
 
 The hook is `PlanProfiler` in `tk/benches/common.rs`. While a benchmark is being profiled,
-`bench_plan` captures the benchmark's plan on every invocation through the process-global
-`bench_profiler()`, each capture profiled via `ProfileOptions::from_env()` and merged into the
-session accumulator by per-kernel min. On stop, the merged table is rendered with `render_table()`,
-written to a file under criterion's output directory, and echoed to stderr:
+`bench_plan` (or `bench_kernel`, which counts only the dispatches whose entry point carries the
+hand kernel's name, so the copy that realizing a lone output adds is not charged to it) captures
+the benchmark's plan on every invocation through the process-global `bench_profiler()`, each
+capture profiled via `ProfileOptions::from_env()` and merged into the session accumulator by
+per-kernel min. On stop, the merged table is rendered with `render_table()`, written to a file
+under criterion's output directory, and echoed to stderr:
 
 ```
 target/criterion/<id>/profile/svod-profile.txt
 ```
 
 The wiring is one line in each bench's `criterion_group!` — it installs the shared profiler as the
-criterion config (from `tk/benches/kmeans.rs`):
+criterion config (from `tk/benches/fa.rs`):
 
 ```rust
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(common::bench_profiler());
-    targets = bench_kmeans
+    targets = bench_fa
 }
 criterion_main!(benches);
 ```
 
-Run it like any criterion bench, adding `--profile-time` (and any tier env vars):
+Run it like any criterion bench, adding `--profile-time` (and any tier env vars). There is one
+binary per kernel: `fa`, `gemm`, `matmul`, `norm`, `sq_attention`, `knn`, `kmeans`.
 
 ```bash
 # Plain bench: GPU device time per benchmark, profiler dormant.
-SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench kmeans
+SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench fa
 
 # Drive the layered profiler for ~5s per benchmark, with hardware counters.
-SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench kmeans -- --profile-time 5
+SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench fa -- --profile-time 5
 ```
 
 Because `bench_profiler()` is dormant unless criterion is profiling, plain `cargo bench` is
-completely unaffected — same numbers, no extra passes.
+completely unaffected — same numbers, no extra passes. A bench self-skips on a device outside the
+kernel's `ArchSet`. Note that the [autotuner](./tuning) is *on* in a bench unless
+`SVOD_TK_TUNE=0`: the first sample of a new shape includes the tile measurement, which criterion's
+warm-up absorbs.
 
 ---
 

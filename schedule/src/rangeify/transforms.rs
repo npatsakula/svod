@@ -224,14 +224,17 @@ pub struct RangeifyResult {
 ///
 /// # Pipeline
 ///
-/// **Pre-stage**: multi_pm + supported-subset validation, then add_tags
+/// **Pre-stage**: multi_pm + allreduce lowering, add_tags, resolve_function +
+/// supported-subset validation, then one bottom-up pass of movement ops,
+/// early rewrites and reduction splitting
 /// **Stage 0**: Range assignment (run_rangeify)
-/// **Stage 1**: movement_op_patterns (BOTTOM_UP) - Early movement ops
-/// **Stage 2**: pm_load_collapse - Collapse load tensor indexing
-/// **Stage 3**: pm_split_ranges + pm_flatten_range - Range splitting
-/// **Stage 4**: sym + pm_flatten_range - Initial symbolic (TOP_DOWN)
-/// **Stage 5**: pm_simplify_ranges - Simplify/merge ranges
-/// **Stage 6**: apply_opts - Post-range optimization (happens in optimizer)
+/// **Fixpoint**: symbolic + reduce-simplify + movement ops + const folding +
+/// dead-axis pruning + stage removal
+/// **Post**: SINK rebuilt from the tagged outputs, buffer-limit enforcement
+///
+/// Per-kernel movement ops, load collapse, range splitting/flattening and
+/// range simplification run later in `optimizer::apply_pre_optimization`,
+/// followed by `apply_opts`.
 #[tracing::instrument(skip_all)]
 pub fn rangeify_with_map(sink: Arc<UOp>) -> svod_ir::Result<RangeifyResult> {
     // Scheduling is not part of any caller's scope: a graph realized inside one must

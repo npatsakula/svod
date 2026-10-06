@@ -1142,7 +1142,7 @@ impl TensorCore {
         tcs
     }
 
-    /// Get all tensor cores for NVIDIA SM89 architecture (Hopper).
+    /// Get all tensor cores for NVIDIA SM89 architecture (Ada Lovelace).
     pub fn sm89_tensor_cores(allow_tf32: bool) -> Vec<TensorCore> {
         let mut tcs = Self::sm80_tensor_cores(allow_tf32);
         tcs.push(CUDA_81632.build(DType::FP8E4M3, DType::Float32));

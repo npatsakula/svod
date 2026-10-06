@@ -1,259 +1,85 @@
 ---
-sidebar_label: Phase 1 — Rangeify
+sidebar_label: Rangeify और कर्नेल कट
 ---
 
-# Phase 1: Rangeify
+# Rangeify, कर्नेल कट और प्री-ऑप्टिमाइज़ेशन
 
-**गोल**: हाई-लेवल movement ऑपरेशनों को एक्सप्लिसिट लूप स्ट्रक्चर में बदलें और ranges ऑप्टिमाइज़ करें।
+इस पेज पर सब कुछ ऑप्टिमाइज़र के कर्नेल देखने से पहले चलता है। स्रोत: `schedule/src/rangeify/` और `schedule/src/optimizer/mod.rs` में `apply_pre_optimization`।
 
----
+## Rangeify (`rangeify_with_map`)
 
-## Stage 1: Early Movement Ops
+इनपुट: वह टेंसर ग्राफ़ जो `realize()` कॉल ने बनाया (मूवमेंट ops, टेंसर रूप में `num_axes > 0` वाला `REDUCE`, `CONTIGUOUS`, `COPY`, ...)। आउटपुट: ऐसा ग्राफ़ जिसमें हर लूप एक स्पष्ट `RANGE` है, हर मटीरियलाइज़ेशन एक `STAGE` है, और हर रीड एक `INDEX` है।
 
-> **स्टेज एक नज़र में**
->
-> **गोल**: Range असाइनमेंट से पहले movement ऑपरेशन साफ़ करें
-> **मुख्य Patterns**: INDEX पर movement, wrappers के ज़रिए movement, nested INDEX सिम्प्लीफ़िकेशन
-> **प्रभाव**: बाद में पाइपलाइन में मिस्ड ऑप्टिमाइज़ेशन रोकता है
+पास, क्रम से (`rangeify/transforms.rs`):
 
-**यह क्या करता है**: यह स्टेज movement ऑपरेशन को साफ़ करता है — index मैनिपुलेशन को वहाँ पुश करता है जहाँ वाकई ज़रूरत है। इसे ऐसे सोचें जैसे पेपर फ़ाइल करने से पहले डेस्क साफ़ करना — इंस्ट्रक्शन को उस जगह ले जाना जहाँ डेटा इस्तेमाल होता है।
+1. **मल्टी-डिवाइस समाधान** — `multi_pm` फिर `lower_allreduce_pm` (दोनों `graph_rewrite_preserve_calls`); `validate_supported_subset` उसे अस्वीकार करता है जिसे बैकएंड नहीं चला सकते।
+2. **`add_tags_patterns`** (bottom-up) हर टैग-योग्य नोड को `[i]` नंबर देता है। टैग टेंसर की पहचान हैं: कट के बाद आउटपुट मैप बचे हुए टैग से फिर से बनाया जाता है। `PARAM`, `CONST`, `RANGE`, `END`, `CALL`, मूवमेंट ops और सभी-PARAM वाले `MSTACK`/`MSELECT` टैग नहीं किए जाते।
+3. **`resolve_calls`** `FUNCTION` बॉडी में उनके आर्ग्युमेंट प्रतिस्थापित करता है और `GETTUPLE(TUPLE(..), i)` को फ़ोल्ड करता है। प्रीकंपाइल्ड फ़ंक्शन और `CALL` आर्ग्युमेंट अपारदर्शी रहते हैं।
+4. **सबसे शुरुआती रीराइट** (bottom-up, एक मैचर): `movement_op_patterns + early_rewrites + split_reduceop_patterns`। `early_rewrites` `DETACH`/`CONTIGUOUS_BACKWARD` हटाता है, बिना टैग वाली `RESHAPE` शृंखलाओं को मिलाता है, widening cast के तहत पूर्णांक गुणनफलों को चौड़ा करता है, आकार बदले/पुनर्क्रमित `COPY` स्रोत को `CONTIGUOUS` से मटीरियलाइज़ करता है, समान-डिवाइस `COPY` हटाता है, और शून्य-आकार टेंसर को स्थिरांकों में फ़ोल्ड करता है। `split_reduceop` दो-चरणीय रिडक्शन विभाजन है (देखें [रेंज ऑप्टिमाइज़ेशन](../optimizations/range-optimization.md))।
+5. **`run_rangeify`** (`rangeify/indexing.rs`):
+   - `pm_generate_realize_map` (bottom-up): चिह्नित करता है कि क्या बफ़र बनना चाहिए — `STORE`, `CONTIGUOUS`, `COPY` और उनके non-contiguous स्रोत, `MSTACK`/`MSELECT` स्रोत, और हाथ से लिखे कर्नेल `CALL` के इनपुट (पिन किए गए, हटाए नहीं जा सकते)।
+   - `assign_ranges`: रूट से पत्ती तक की यात्रा। रियलाइज़्ड नोड को हर आउटपुट डाइमेंशन के लिए नई `Weak` रेंज मिलती हैं (`IndexingContext::new_range`; आकार-1 डाइमेंशन `CONST(0)` है)। बाकी नोड अपने उपभोक्ताओं की रेंज विरासत में लेते हैं; जब उपभोक्ता असहमत हों, तो `merge_consumer_ranges` या तो संगत इंडेक्स एक्सप्रेशन मिलाता है (वैध भाग `WHERE(valid, idx, Invalid)` में OR किए जाते हैं) या नई रेंज आवंटित करके अक्ष को रियलाइज़ेशन के लिए चिह्नित करता है। मूवमेंट ops `apply_movement_op` से आउटपुट रेंज को इनपुट रेंज पर मैप करते हैं (`PERMUTE` उन्हें क्रमचयित करता है, `EXPAND` ब्रॉडकास्ट अक्ष को शून्य करता है, `PAD` रेंज को वैधता `WHERE` में लपेटता है, `RESHAPE` `apply_reshape_ranges` से गुज़रता है)। `ending_ranges` ब्रॉडकास्ट निर्णयों को पीछे की ओर फैलाते हैं ताकि ब्रॉडकास्ट को पोषित करने वाला `REDUCE` उससे पहले रियलाइज़ हो (layernorm का मामला)।
+   - `apply_rangeify_patterns` (bottom-up): टेंसर-रूप `REDUCE` → `num_axes = 0` वाला लूप-रूप `REDUCE(src, ranges)`; `PAD` → `WHERE(valid, src, 0)`; आकार वाला `STACK` → उसकी अग्रणी रेंज पर `WHERE` शृंखला; हर op के रियलाइज़्ड स्रोत `STAGE` + `INDEX` में लपेटे जाते हैं (`transform_sources_with_bufferize`); फिर मूवमेंट ops हटा दिए जाते हैं। बफ़र-जैसे स्रोत (`BUFFER`, `PARAM`, `SLICE`, `AFTER`, ...) को स्थिर आकार होने पर एक row-major `INDEX` मिलता है (`linearize_static_indices`); इमेज और सिम्बॉलिक आकार प्रति निर्देशांक एक इंडेक्स रखते हैं।
+6. **मेगा-पास** — `symbolic + pm_reduce_simplify + movement_op_patterns + buffer_folding + dead_axis_removal + pm_remove_bufferize` पर एक फ़िक्सपॉइंट। समूह एक-दूसरे को पोषित करते हैं: `STAGE` को इनलाइन करने से रेंज अंकगणित उजागर होता है जिसे `symbolic` फ़ोल्ड करता है, जिससे reduce संकुचित होने योग्य बन सकता है। अलग-अलग नियम [रेंज ऑप्टिमाइज़ेशन](../optimizations/range-optimization.md) पेज पर हैं।
+7. **SINK पुनर्निर्माण** टैग किए गए backward slice से: सिर्फ़ आउटपुट टैग वाले `STAGE`, `MSTACK`, `CONST`, `PARAM` और `AFTER` नोड sink स्रोत के रूप में रहते हैं, मूल आउटपुट क्रम में।
+8. **बफ़र सीमा** — यदि डिवाइस `max_buffers` बताता है, तो `buffer_limit_patterns` elementwise स्रोतों को global `STAGE` में बाध्य करता है ताकि कोई कर्नेल आर्ग्युमेंट सीमा से अधिक न हो।
 
-**यह क्यों ज़रूरी है**: Movement ऑपरेशन (RESHAPE, PERMUTE, आदि) सुविधाजनक abstractions हैं, लेकिन हार्डवेयर को कॉन्क्रीट index कैलकुलेशन चाहिए। इन्हें जल्दी साफ़ करने से बाद के स्टेजों में patterns सही से मैच होते हैं।
-
-**Pattern**: `movement_op_patterns()` (bottom-up)
-
-| Pattern | ट्रांसफ़ॉर्मेशन | विज़ुअल | लोकेशन |
-|---------|----------------|--------|---------|
-| INDEX पर Movement | Index एक्सप्रेशन पर movement अप्लाई करें | `INDEX(PERMUTE(arr), [i, j]) → INDEX(arr, [j, i])` | `movement_op_patterns()` |
-| AFTER के ज़रिए Movement | Movement (या INDEX) को टाइमिंग wrapper से गुज़ारें, हर dep बरक़रार रखते हुए | `AFTER(RESHAPE(x, arg), deps) → RESHAPE(AFTER(x, deps), arg)` | `movement_op_patterns()` |
-| END के ज़रिए Movement | END wrapper से movement हटाएँ | `END(RESHAPE(x), ranges) → END(x, ranges)` | `movement_op_patterns()` |
-
-**Bottom-up क्यों?** चाइल्ड नोड्स पहले साफ़ होने चाहिए ताकि parents मैच कर सकें। Movement ops गहराई में नेस्ट होते हैं; नीचे से साफ़ करने से मिस्ड patterns नहीं होते।
-
-**नोट**: `is_movement()` में ठीक RESHAPE, PERMUTE, EXPAND, PAD, SHRINK और FLIP आते हैं। Nested INDEX फ़्लैटनिंग (`INDEX(INDEX(ptr, i), j) → INDEX(ptr, i, j)`) इस स्टेज का हिस्सा *नहीं* है; वह `mop_cleanup_patterns()` में रहती है और Stage 9 expander व devectorizer के साथ चलती है।
-
-**Svod**: `movement_op_patterns()` in `rangeify/patterns.rs`
-
----
-
-## Stage 2: Load Collapse
-
-> **स्टेज एक नज़र में**
->
-> **गोल**: Range-independent कम्प्यूटेशन डिटेक्ट करके REDUCE ऑपरेशन एलिमिनेट करें
-> **मुख्य Patterns**: Bounded sum, gated load collapse, general reduce elimination
-> **प्रभाव**: लूप इटरेशन को अरिथमेटिक ऑपरेशन में बदलता है
-
-**यह क्या करता है**: REDUCE ऑपरेशन को यह पहचान कर एलिमिनेट करता है कि कम्प्यूटेशन इटरेशन के बिना किया जा सकता है। Range-independent कम्प्यूटेशन डिटेक्शन और symbolic सिम्प्लीफ़िकेशन इस्तेमाल करता है।
-
-**यह क्यों ज़रूरी है**: इटरेशन को अरिथमेटिक ऑपरेशन में बदलने से लूप ओवरहेड खत्म होता है। 1000 बार लूप चलाने के बजाय, सीधे जवाब कैलकुलेट करो।
-
-**Pattern**: `pm_load_collapse`
+`[8, 64]` टेंसर पर `x.sum(1)` का परिणाम:
 
 ```text
-// Before: Sum with bounds check
-sum(1 for k in 0..64 if k >= length)
-
-// After: Compute count directly (NO LOOP!)
-count = clamp(64 - length, 0, 64)
+[67] SINK : Scalar(Void)
+└── [66] STAGE : Scalar(Float32) shape=[Const(8)]
+    ├── [65] CONTIGUOUS : Scalar(Float32) shape=[]
+    │   └── [64] REDUCE(Add, num_axes=0, ranges=[27]) : Scalar(Float32) shape=[]
+    │       ├── [62] INDEX : Scalar(Float32) shape=[]
+    │       │   ├── [11] PARAM(slot=0) : Scalar(Float32) shape=[Const(512)]
+    │       │   │   └── [0] CONST(Int(512)) : Scalar(WeakInt) shape=[]
+    │       │   └── [55] Add : Scalar(WeakInt) shape=[]
+    │       │       ├── [54] Mul : Scalar(WeakInt) shape=[]
+    │       │       │   ├── [26] RANGE(U0, Weak) : Scalar(WeakInt) shape=[]
+    │       │       │   │   └── [2] CONST(Int(8)) : Scalar(WeakInt) shape=[]
+    │       │       │   └── [3] CONST(Int(64)) : Scalar(WeakInt) shape=[]
+    │       │       └── [27] RANGE(U1, Reduce) : Scalar(WeakInt) shape=[]
+    │       │           └── [3] → (see above)
+    │       └── [27] → (see above)
+    └── [26] → (see above)
 ```
 
-यह मैकेनिज़्म इस तरह काम करता है:
-1. ऐसे subexpressions पहचानें जो REDUCE range पर डिपेंड नहीं करते
-2. उन external inputs को synthetic scalar PARAM वेरिएबल से बदलें, जो अपने proven vmin/vmax साथ रखते हैं
-3. Substituted body को उसी range पर एक synthetic REDUCE में लपेटें और reduce-collapse matcher चलाएँ
-4. अगर simplified एक्सप्रेशन में कोई range नहीं बची, तो REDUCE एलिमिनेट हो गया (और अस्थायी PARAMs वापस substitute हो जाते हैं)
+`U0`/`U1` `AxisId::Unrenumbered` हैं: कट पर रेंज प्रति कर्नेल फिर से नंबर की जाती हैं। इनपुट का `PERMUTE`/`RESHAPE` गायब है — वे इंडेक्स एक्सप्रेशन `U0 * 64 + U1` बन गए।
 
-**नोट**: INDEX पर WHERE मूवमेंट (`pm_move_where_on_load`) एक अलग ऑप्टिमाइज़ेशन है जो Stage 8 पर चलता है और कंडीशन को `INDEX.indices[0]` में `WHERE(cond, idx, Invalid)` के रूप में एम्बेड करता है। यह REDUCE ऑपरेशन एलिमिनेट नहीं करता।
+## कर्नेल कट (`try_get_kernel_graph`)
 
-**Svod**: `pm_load_collapse()` in `rangeify/patterns.rs`
+पहले `kernel_graph_pre_cut`:
 
----
+- **`pm_add_buffers_patterns`** (bottom-up, `RangeifyBufferContext`): `movement_op_patterns`, फिर `flatten_bufferize` (बहु-रेंज `STAGE` एक फ़्लैट रेंज और वापस `RESHAPE` बन जाता है), `late_buffer_slice` (DISK `STAGE(BITCAST|CONTIGUOUS)` एक `SLICE` बन जाता है), और `bufferize_to_store`। आख़िरी वाला एक शेड्यूल-लोकल `BUFFER` आवंटित करता है (`new_lunique_buffer`, high-bit नेमस्पेस में स्लॉट) और `STAGE(compute, ranges)` को `AFTER(BUFFER, [END(STORE(INDEX(BUFFER, idx), compute), ranges)])` में बदलता है। `STAGE(AFTER(..))` अंतर्निहित बफ़र का पुन: उपयोग करता है; `Local` `STAGE` को बाद में `pm_add_local_buffers` के लिए छोड़ दिया जाता है। पहले से बना कर्नेल `SINK` (जिसमें `KernelInfo` हो) गेट किया जाता है ताकि रीराइट उसमें न उतरे।
+- **`pm_flatten_range`** पूरे ग्राफ़ पर एक बार (bottom-up): हर `END`/`REDUCE` की रेंज सूची को उसके स्रोतों से पहुँचने योग्य `RANGE` से फिर से निकालता है, ताकि नीचे का प्रति-कर्नेल पास साझा सबग्राफ़ को फिर से न खंगाले।
 
-## Stage 3: Split Ranges
+फिर **`split_all_stores`** (bottom-up): हर `STORE` या `END(STORE)` जिसकी कोई कम्प्यूटेशनल रेंज खुली न हो, एक `CALL` बन जाता है। `split_store` कर्नेल बॉडी पर `local_to_param_patterns + rangeify_codegen_patterns` चलाता है: global `BUFFER`/`PARAM` → codegen `PARAM(slot)`, जिसे `LocalAddBufferContext::param_slot` मैच क्रम में नंबर देता है; `BIND(var, value)` → वेरिएबल, बाइंडिंग `CALL` आर्ग्युमेंट के रूप में रखी जाती है; `AFTER`/`MSTACK`/`MSELECT` → उनका बफ़र; `RANGE(end=0)` → `CONST(0)`; `Unrenumbered` अक्ष ids → `Renumbered(n)`; `NOOP` → टाइप वाला शून्य; `CONTIGUOUS` → उसका स्रोत, hints एकत्रित। बॉडी को डिफ़ॉल्ट `KernelInfo` के साथ `SINK` में लपेटा जाता है; `COPY`/`SLICE` मान सीधे call बॉडी रहता है। `Device` रेंज "कोई खुली रेंज नहीं" का एकमात्र अपवाद हैं: वे लॉन्च लेन हैं और सीमा के पार बची रहती हैं।
 
-> **स्टेज एक नज़र में**
->
-> **गोल**: Divmod डीकम्पोज़िशन से बेहतर ऑप्टिमाइज़ेशन सक्षम करें
-> **मुख्य Patterns**: Modulo के साथ ranges स्प्लिट, ranges फ़्लैटन
-> **प्रभाव**: Inner ranges वेक्टराइज़ हो सकती हैं, outer पैरेलाइज़
+अंत में **`validate_normal_kernel_devices`** (हर non-copy कर्नेल के लिए एक डिवाइस) और **`fix_assign`**: जब कर्नेल B वह बफ़र पढ़ता है जिसे कर्नेल A लिखता है, तो A का `AFTER` B के `AFTER` deps में जोड़ा जाता है; चक्र `KernelSplitDependencyCycle` है। `SVOD_SPEC` चालू होने पर `verify_kernel_graph` परिणाम जाँचता है।
 
-**यह क्या करता है**: Modulo patterns को हैंडल करता है — एक range को outer और inner कंपोनेंट में स्प्लिट करता है।
+## प्रति-कर्नेल प्री-ऑप्टिमाइज़ेशन (`apply_pre_optimization`)
 
-**यह क्यों ज़रूरी है**: Ranges स्प्लिट करना ऐसा है जैसे एक बड़ा काम टीम में बाँटना। अगर 12 आइटम हैं और हर व्यक्ति 4 करता है, तो 3 लोग × 4 आइटम मिलता है। Inner loops (एक व्यक्ति के 4 आइटम) फ़ास्ट हो सकते हैं; outer loops (3 लोग) पैरेलल चल सकते हैं।
+ह्यूरिस्टिक्स या BEAM से पहले हर कर्नेल बॉडी पर चलता है, दोनों पथों में (`optimize_kernel_with_config_impl`, `optimize_kernel_beam`, `prepare_scheduler`)। `SVOD_SPEC` चालू होने पर पहले `spec_tensor` के विरुद्ध `type_verify` चलता है।
 
-**Pattern**: `pm_split_ranges + pm_flatten_range`
+| चरण | मैचर | दिशा |
+|------|---------|-----------|
+| मूवमेंट ops | `movement_op_patterns` | bottom-up |
+| load collapse | `pm_load_collapse` | top-down |
+| रेंज विभाजन | `pm_split_ranges + pm_flatten_range` (`SplitRangesContext`) | top-down |
+| symbolic | `sym + pm_fold_cast_const + pm_flatten_range` | top-down |
+| रेंज सरलीकरण | `pm_flatten_range + pm_simplify_ranges` (`SimplifyRangesContext`) | top-down |
 
-```mermaid
-flowchart TD
-  B["Before: RANGE(end=12) % 4 (one loop with modulo, slow)"] -->|"split into outer x inner"| A["After: RANGE(end=3) * 4 + RANGE(end=4)"]
-  A --> O["RANGE(end=3): outer, Parallel"]
-  A --> I["RANGE(end=4): inner, Sequential"]
-```
+**`movement_op_patterns`** में तीन नियम हैं: `INDEX(mop(x), idx)` → `INDEX(x, mop⁻¹(idx))` (`transform_movement_through_index`), `AFTER(mop(x) | INDEX(x), deps)` → `mop(AFTER(x, deps))` (`push_op_through_after`), और `END(mop(x), ranges)` → `END(x, ranges)`। `is_movement()` ठीक-ठीक `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` है। इसे bottom-up लागू किया जाता है क्योंकि भीतरी मूवमेंट op को उसके उपभोक्ता के मैच होने से पहले फिर से लिखा जाना चाहिए।
 
-इससे मिलता है:
-- Inner ranges SIMD से वेक्टराइज़ हो सकती हैं
-- Outer ranges GPU blocks / CPU threads से पैरेलाइज़ हो सकती हैं
+**`pm_load_collapse`** ऐसा `REDUCE(Add)` हटाता है जिसकी बॉडी सिम्बॉलिक तर्क के बाद रेंज-स्वतंत्र हो (`reduce_load_collapse`): reduce दायरे के बाहर के नोड स्केलर `PARAM` वेरिएबल (`UOp::variable("in{n}", vmin, vmax)`) से बदले जाते हैं, बॉडी को एक रेंज पर एक कृत्रिम `REDUCE` में लपेटा जाता है, `build_reduce_load_collapse_matcher` चलता है, और यदि कोई `RANGE` बचता नहीं तो प्रतिस्थापन उलट दिया जाता है। इसके द्वारा उपयोग किए जाने वाले बाउंड पैटर्न [रेंज ऑप्टिमाइज़ेशन](../optimizations/range-optimization.md) पेज पर हैं।
 
-`pm_flatten_range` REDUCE और END नोड्स की range operand लिस्ट को उन RANGE नोड्स से दोबारा बनाता है जो अब भी उनके sources के ज़रिए पहुँच में हैं। (Ranges मर्ज करना Stage 5 का काम है।)
+**`pm_split_ranges`** हर `RANGE % const` दर्ज करता है जिसका end स्थिरांक से विभाज्य हो (`Warp` और `Device` रेंज को छोड़कर; इमेज `STORE` द्वारा इंडेक्स की गई हर रेंज पिन होती है) और `SINK` पर एक बार `r → outer * c + inner` प्रतिस्थापित करता है, अक्ष ids `r.child(0)` / `r.child(1)` के साथ। प्रतिस्थापित ग्राफ़ फिर `symbolic + pm_fold_cast_const` से सरल किया जाता है।
 
-**कॉन्टेक्स्ट**: एक `SplitRangesContext` हर `RANGE % const` जगह को मार्क करता है; divmod substitution एक बार, SINK पर होती है।
+**`sym`** पूरा tier-3 सरलीकारक है ([बीजगणितीय सरलीकरण](../optimizations/algebraic-simplification.md)); `pm_fold_cast_const` `CAST(CONST)` फ़ोल्ड करता है; `pm_flatten_range` रेंज गायब होने के बाद रेंज सूचियों को सही रखता है।
 
-**नोट**: स्प्लिट तभी अप्लाई होता है जब `end % mod == 0` (divisibility check)। Warp और Device ranges कभी स्प्लिट नहीं होतीं, और जिन ranges को कोई image STORE index करता है वे स्प्लिटिंग से पिन कर दी जाती हैं।
+**`pm_simplify_ranges`** `END`/`REDUCE` की आसन्न रेंज को मिलाता है जब मिला हुआ रूप `FloorDiv`/`FloorMod` की गिनती नहीं बढ़ाता (`simplify_merge_adjacent`), और रेंज को उस सबसे बड़े बाउंड तक संकुचित करता है जिसे कोई `INDEX` गेट उसके लिए सिद्ध करे (`mark_gated`; एक भी बिना गेट उपयोग मूल end को पिन कर देता है; `REDUCE` रेंज सुरक्षित हैं)। दोनों प्रतिस्थापन `SINK` पर होते हैं।
 
-**Svod**: `pm_split_ranges()` + `pm_flatten_range()` in `rangeify/transforms.rs`
+## ऑप्टिमाइज़र को सौंपना
 
----
-
-## Stage 4: Initial Symbolic
-
-> **स्टेज एक नज़र में**
->
-> **गोल**: अलजेब्रा नियमों से एक्सप्रेशन सिम्प्लीफ़ाई करें
-> **मुख्य Patterns**: Constant folding, identity removal, div-mod recombine
-> **प्रभाव**: महँगे ऑपरेशन एलिमिनेट करता है, कोड साइज़ कम करता है
-
-**यह क्या करता है**: 100+ constant folding और algebraic सिम्प्लीफ़िकेशन नियम अप्लाई करता है।
-
-**यह क्यों ज़रूरी है**: कंप्यूटर सिंपल मैथ में फ़ास्ट हैं। Division और remainder स्लो ऑपरेशन हैं। यह स्टेज अलजेब्रा नियमों से जहाँ भी हो सके स्लो ऑपरेशन एलिमिनेट करता है।
-
-**Pattern**: `sym() + pm_fold_cast_const() + pm_flatten_range()`
-
-नोट: `symbolic()` (tier 2), `sym()` (tier 3) का सख़्त सबसेट है; वही `sym` Stage 8 पर दोबारा चलता है।
-
-**Constant folding**:
-```text
-ADD(CONST(2), CONST(3)) → CONST(5)
-MUL(x, CONST(1)) → x
-ADD(x, CONST(0)) → x
-```
-
-**Div-mod recombination**:
-```text
-(x / c) * c + (x % c) → x
-```
-*क्यों?* `x` जैसी ही वैल्यू कैलकुलेट करता है लेकिन 1 के बजाय 3 ऑपरेशन से। यह pattern रिडंडेंसी पहचान कर हटाता है (stride कैलकुलेशन में आम)।
-
-**Boolean अलजेब्रा**:
-```text
-x AND x → x
-x OR FALSE → x
-NOT(NOT(x)) → x
-```
-
-**अतिरिक्त कैटेगरी**:
-- Identity removal (self-folding, रिडंडेंट ऑपरेशन)
-- Comparison सिम्प्लीफ़िकेशन
-- Cast ऑप्टिमाइज़ेशन
-- ALU/STACK रीऑर्डरिंग (`ALU(STACK, STACK) → STACK(ALU)`)
-- Where folding (एक ही condition वाले WHERE कम्बाइन करना)
-- Reduce mul chain (reduce से बाहर multiplications ले जाना)
-
-**Svod**: `sym()` in `symbolic/patterns.rs`
-
----
-
-## Stage 5: Simplify Ranges
-
-> **स्टेज एक नज़र में**
->
-> **गोल**: लूप ओवरहेड कम करने के लिए adjacent ranges मर्ज करें
-> **मुख्य Patterns**: कॉस्ट एनालिसिस के साथ range मर्जिंग
-> **प्रभाव**: कम loops = कम ओवरहेड
-
-**यह क्या करता है**: प्रॉफ़िटेबल होने पर adjacent ranges मर्ज करता है।
-
-**यह क्यों ज़रूरी है**: Ranges मर्ज करना ऐसा है जैसे कई छोटी ट्रिप्स को एक बड़ी में जोड़ना। 4 आइटम के लिए 4 बार स्टोर जाने के बजाय, एक बार जाकर सब ले आओ। शुरू-रुकने का ओवरहेड बचता है।
-
-**Pattern**: `pm_flatten_range() + pm_simplify_ranges()`
-
-```text
-// Before: two separate ranges
-RANGE(0..4), RANGE(0..8)
-
-// After: merged (if compatible)
-RANGE(0..32)
-```
-
-`pm_simplify_ranges` उन ranges को भी सँकरा करता है जो हर INDEX validity gate से bounded साबित होती हैं।
-
-मर्ज के मापदंड:
-1. Axis types कम्पैटिबल होने चाहिए (दोनों output, दोनों reduce, आदि)
-2. REDUCE स्कोप कंसिस्टेंट रहना चाहिए
-3. **कॉस्ट-बेस्ड**: तभी स्वीकार करें जब divmod ऑपरेशन काउंट न बढ़े
-
-कम्पाइलर तभी मर्ज करता है जब ऑपरेशन बचते हैं। मर्जिंग के लिए indices recalculate करने में division/modulo लग सकता है। अगर इसकी कॉस्ट बचत से ज़्यादा है, तो मर्ज स्किप होता है।
-
-**Svod**: `simplify_merge_adjacent()` in `rangeify/transforms.rs`
-
----
-
-## Stage 6: Split Store
-
-> **स्टेज एक नज़र में**
->
-> **गोल**: STORE बाउंड्री पर ग्राफ़ को अलग कर्नेल में स्प्लिट करें
-> **मुख्य फ़ंक्शन**: `split_all_stores()` + `split_store()`
-> **प्रभाव**: प्रति-कर्नेल ऑप्टिमाइज़ेशन सक्षम करता है
-
-**यह क्या करता है**: STORE बाउंड्री पर UOp ग्राफ़ स्प्लिट करता है, हर आउटपुट के लिए अलग कर्नेल बनाता है।
-
-**यह क्यों ज़रूरी है**: Bufferization के बाद, ग्राफ़ में कई STORE ऑपरेशन हो सकते हैं। हर STORE अपना कर्नेल बनता है — अपने बफ़र, ranges, और डिपेंडेंसी के साथ।
-
-**फ़ंक्शन**: `try_get_kernel_graph()` in `schedule/src/rangeify/kernel.rs`
-
-`kernel_graph_pre_cut` के अंदर, STAGE नोड्स के STORE बन जाने के बाद, `pm_flatten_range` pre-pass **पूरे ग्राफ़ पर एक बार** चलता है (bottom-up)। यह सभी kernels की range लिस्ट एक ही traversal में दोबारा बनाता है, overlapping subgraphs पर redundant काम से बचता है। यह pre-pass compilation speed की एक key optimization है — इसके बिना, हर kernel का `split_store` shared subgraphs को independently re-traverse करता।
-
-Pre-pass के बाद, `split_all_stores` STORE boundaries पर split करता है — हर kernel अपने PARAM slots `LocalAddBufferContext::param_slot` से नंबर करता है — और फिर `fix_assign` inter-kernel dependencies जोड़ता है, dependency cycles को रिजेक्ट करते हुए।
-
----
-
-## Stage 7: Apply Opts
-
-> **स्टेज एक नज़र में**
->
-> **गोल**: वेक्टराइज़ेशन, अनरोलिंग, मेमोरी यूज़ का ऑप्टिमल कॉम्बिनेशन ढूँढें
-> **मुख्य अल्गोरिदम**: Beam search या heuristics
-> **प्रभाव**: परफ़ॉर्मेंस में काफ़ी सुधार ला सकता है
-
-**यह क्या करता है**: ऑप्टिमाइज़ेशन सर्च — beam search या heuristic — ऑप्टिमाइज़ेशन एक्शन के अलग-अलग कॉम्बिनेशन एक्सप्लोर करता है।
-
-**यह क्यों ज़रूरी है**: कम्पाइलर ऑप्टिमाइज़ेशन के अलग-अलग कॉम्बिनेशन (यहाँ vectorize? वहाँ unroll?) ट्राई करता है और सबसे फ़ास्ट चुनता है। सही कॉम्बिनेशन ढूँढने से कोड 10x तेज़ हो सकता है।
-
-**फ़ंक्शन**: `optimize_kernel(ast, renderer)`
-
-**ऑप्टिमाइज़ेशन एक्शन**:
-
-| एक्शन | इफ़ेक्ट | हार्डवेयर टारगेट |
-|--------|--------|-----------------|
-| TC | Tensor core यूज़ सक्षम करें | NVIDIA, AMD, Apple Metal और Intel GPUs |
-| UPCAST | एक डायमेंशन वेक्टराइज़ करें | सभी (SIMD) |
-| LOCAL | लोकल/shared मेमोरी इस्तेमाल करें | केवल GPU (`has_local` ज़रूरी) |
-| UNROLL | एक लूप डायमेंशन अनरोल करें | सभी (लूप ओवरहेड से बचें) |
-| GROUP | Grouped reduce का inner split | GPU (shared memory; TC लगने पर रिजेक्ट) |
-| GROUPTOP | Grouped reduce का outer split | GPU (shared memory; TC लगने पर रिजेक्ट) |
-| THREAD | Thread-बेस्ड पैरेललिज़्म | CPU |
-| NOLOCALS | लोकल मेमोरी यूज़ बंद करें | सभी (constraint, आगे LOCAL एक्शन रोकता है) |
-| SWAP | दो Global range असाइनमेंट स्वैप करें | GPU/CPU global axes (अलग tiling ट्राई करें) |
-| PADTO | अलाइनमेंट के लिए पैड | सभी (मेमोरी अलाइनमेंट) |
-
-**ऑप्टिमाइज़ेशन सर्च कैसे काम करता है**:
-
-कम्पाइलर सबसे अच्छा कॉम्बिनेशन ढूँढता है:
-- **Heuristic मोड** (BEAM=0): फ़ास्ट हैंड-कोडेड ऑप्टिमाइज़ेशन patterns, कोई कम्पाइलेशन नहीं
-- **Beam search** (BEAM>=1): कैंडिडेट्स कम्पाइल करके रन करता है ताकि असली परफ़ॉर्मेंस मापी जा सके
-
-```mermaid
-flowchart TD
-  S["Optimization Search"] --> H["Heuristic mode (BEAM=0): Hand-coded optimizations"]
-  S --> B["Beam search (BEAM≥1)"]
-  B --> B1["Generate all possible actions (193 fixed base actions; 200 with BEAM_PADTO)"]
-  B --> B2["Apply to all top-K candidates in parallel"]
-  B --> B3["Filter based on constraints"]
-  B --> B4["Compile and run each candidate, measure actual time"]
-  B --> B5["Pick fastest"]
-```
-
-**नोट**: NOLOCALS एक constraint है जो `dont_use_locals = true` सेट करता है, जिससे आगे LOCAL एक्शन और shared memory यूज़ डिसीज़न प्रभावित होते हैं। यह base action लिस्ट का हिस्सा नहीं है — enabled होने पर हर candidate के साथ जोड़ा जाता है।
-
-**Svod**: `optimizer/mod.rs`, `optimizer/opts.rs`
+`Scheduler::new(ast, renderer)` extent > 1 वाली `RANGE` एकत्र करता है, `(axis_type.priority(), axis_id)` के क्रम में; `convert_loop_to_global` `has_local` वाले रेंडरर पर `Weak` आउटपुट अक्षों को `Global` में बदलता है (CPU पर यह no-op है, इसीलिए ऊपर के उदाहरण में row अक्ष `Weak` रहता है)। फिर `hand_coded_optimizations` या BEAM `Opt` लागू करता है और `get_optimized_ast_with_naming` `KernelInfo` मेटाडेटा (नाम जैसे `r_8_16_4`, `dont_use_locals`, `opts_to_apply`) के साथ कर्नेल `SINK` बनाता है। `SVOD_NOOPT` ह्यूरिस्टिक्स छोड़ देता है, लेकिन न यह पेज और न ही post-optimization चरण। सर्च स्वयं [कर्नेल सर्च](../optimizations/kernel-search.md) में वर्णित है।

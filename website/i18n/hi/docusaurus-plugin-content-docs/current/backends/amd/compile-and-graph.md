@@ -25,12 +25,17 @@ flowchart TD
 
 ### Rendering
 
-`AmdRendererWrapper::render` AMD LLVM IR emit करने के लिए `LlvmTextRenderer::amd(arch)` का
-उपयोग करता है। यह एक AMD-specific decomposition pass (`amd_decomposition_patterns`) भी
-install करता है जो `exp`, `log`, `cos`, `tan`, और `pow` को SLEEF polynomials के माध्यम से
-route करता है। `exp2`, `log2`, `sin`, और `sqrt` जान-बूझकर अनुपस्थित हैं, ताकि
-approximation-selection का ठीक एक ही path रहे; केवल `f16`/`f32`/`f64` polynomials लेते हैं,
-बाक़ी सब अपनी native lowering ही रखते हैं।
+`AmdRendererWrapper` (`runtime/src/devices/amd.rs`) `LlvmTextRenderer::amd(arch)` से render
+करता है। इसका `supported_ops` `Exp`, `Log`, `Sin`, `Cos`, `Tan` और `Erf` को हटा देता है
+(साथ ही `Pow`, `Max` और `Threefry` को, जैसा हर GPU renderer पर होता है), इसलिए scheduler उन्हें
+rendering से पहले decompose करता है: इसका `decompositor`
+`svod_ir::decompositions::amd_decomposition_patterns()` है, जो `f16`/`f32`/`f64` के लिए `exp`,
+`log`, `cos`, `tan` और `pow` को native `exp2`/`log2` के ऊपर SLEEF-style polynomials में lower
+करता है — bf16, fp8 और integer operands polynomial के इर्द-गिर्द f32 में cast किए जाते हैं — और
+f32→bf16 casts को integer round-to-nearest-even रूप में rewrite करता है; `sin` इसी कारण से
+साझा transcendental patterns से होकर जाता है (`v_sin_f32` केवल छोटे arguments के लिए सटीक है)।
+केवल `exp2`, `log2` और `sqrt` native `@llvm.*` intrinsics रहते हैं (AMD hardware पर ~1 ulp)।
+renderer-local `amd_extra_matcher()` सबसे अंत में चलता है।
 
 ### Compiling
 
@@ -45,8 +50,10 @@ clang -x ir -c -O3 --target=amdgcn-amd-amdhsa -mcpu=<arch> \
 
 `-nogpulib` केवल तभी जोड़ा जाता है जब IR किसी `@__ocml_*` entry point को reference न करता हो:
 renderer हर उस float unary के लिए `@llvm.*` intrinsics emit करता है जिसे AMDGPU backend select
-कर सकता है, इसलिए ROCm device libraries केवल f64 fallbacks के लिए चाहिए। IR ख़ुद object-cache
-key का हिस्सा है, इसलिए उससे एक flag को key करना sound बना रहता है।
+कर सकता है, इसलिए ROCm device libraries केवल f64 के गैर-`sqrt` unaries के लिए चाहिए। IR ख़ुद
+object-cache key का हिस्सा है, इसलिए उससे एक flag को key करना sound बना रहता है। परिणाम को
+`amd-clang` identity के तहत cache या load किए जाने से पहले validate किया जाता है
+(`validate_amd_object`: ELF64-LE, `EM_AMDGPU`, `e_flags` में arch, एक defined `<name>.kd`)।
 
 `clang` एक single translation unit के लिए internally `lld` invoke करता है, इसलिए output एक
 directly-loadable AMDGPU ELF है — कोई अलग link step नहीं। एक per-process memoized
@@ -70,7 +77,7 @@ image को उसी तरह lay out करता है जैसे tinygr
 |---|---|
 | `aql_prog_addr` | `code_gpu + kd_offset` (AQL `kernel_object`) |
 | `pm4_prog_addr` | `aql_prog_addr + kernel_code_entry_byte_offset` (shader entry; LO/HI registers `>> 8` carry करते हैं) |
-| `rsrc1 / rsrc2 / rsrc3` | `compute_pgm_rsrc{1,2,3}`, gfx11 cwsr-priv bit और LDS-size field के साथ patched |
+| `rsrc1 / rsrc2 / rsrc3` | `compute_pgm_rsrc{1,2,3}`; gfx11 पर `rsrc1` को cwsr-priv bit मिलता है, `rsrc2` को LDS-size field, `rsrc3` जैसा है वैसा उपयोग होता है |
 | `wave32` | `kernel_code_properties & 0x400` (RDNA3/4 default) |
 | `target_major` | 9 / 11 / 12, device arch से |
 | kernarg / scratch / group sizes | `kernarg_size`, `private_segment_fixed_size`, `group_segment_fixed_size` |
@@ -92,20 +99,32 @@ kernargs के साथ एक HSA dispatch packet चाहिए होग�
 और यहाँ delegate करता है।) यह:
 
 1. kernel के विरुद्ध buffer और scalar counts को **validate** करता है, और जाँचता है कि
-   kernarg layout फ़िट होता है: `buf_count*8 + var_count*4 ≤ kernarg_size`।
-2. lane की arena को bump करके एक **kernarg slot भरता है**, हर buffer VA को 8 bytes और
-   हर scalar को एक 4-byte `i32` के रूप में लिखते हुए। `i32` packing जान-बूझकर है — renderer
+   packed kernarg layout फ़िट होता है: `ClikeKernargLayout::from_abi(abi)` parameters को ABI
+   slot order में natural alignment (8-byte pointers, 4-byte scalars) के साथ lay out करता है,
+   और उसका `packed_size()` descriptor के `kernarg_size` से अधिक नहीं होना चाहिए।
+2. device की 16 MiB kernarg arena (हर lane द्वारा साझा, 16-byte aligned; wrap होने पर पहले
+   सभी lanes drain होती हैं) को bump करके एक **kernarg slot भरता है**, हर buffer VA को 8 bytes
+   और हर scalar को एक 4-byte `i32` के रूप में लिखते हुए। `i32` packing जान-बूझकर है — renderer
    `Index → i32` lower करता है, इसलिए descriptor का `kernarg_size` 4-byte vars को reflect
    करता है; 8 bytes pack करना अगले slot में overflow कर जाता।
 3. एक **submission बनाता है** — `MemoryBarrier` और फिर `Compute` का एक `hcq::Submission`, जो
    kernarg VA, `rsrc` triple, और PM4 program address साथ ले जाता है।
-4. `queue.submit_hcq_dispatch(pool, &submission, …)` के माध्यम से **dispatch करता है**, जो उस
-   submission को queue kind के अनुसार raw PM4 dwords (`build_exec_pm4`) या एक 64-byte AQL
-   packet (`build_dispatch_packet`) में lower करता है। PM4 side पर optional 4-dword scratch
-   descriptor को `COMPUTE_USER_DATA_0` में उसी `scratch_address` snapshot से prepend किया जाता
-   है जो `COMPUTE_DISPATCH_SCRATCH_BASE` में लिखा जाता है — ताकि एक concurrent scratch realloc
-   descriptor और register को असहमत न बना सके।
-5. यदि `wait`, तो owner के `synchronize()` के माध्यम से drain करता है।
+4. `queue.submit_hcq_dispatch(pool, &submission, …)` के माध्यम से **dispatch करता है**। एक
+   PM4 queue पर `lower_hcq_pm4` → `build_exec_pm4` raw dwords emit करता है, और optional
+   4-dword scratch descriptor को `COMPUTE_USER_DATA_0` में उसी `scratch_address` snapshot से
+   prepend किया जाता है जो `COMPUTE_DISPATCH_SCRATCH_BASE` में लिखा जाता है — ताकि एक
+   concurrent scratch realloc descriptor और register को असहमत न बना सके। एक AQL queue पर
+   `lower_hcq_aql_submission_program` wait/barrier को vendor-IB PM4 packets के रूप में, 64-byte
+   dispatch packet (`build_dispatch_packet_barrier`) और एक vendor-IB timeline store emit करता
+   है, जिसमें control bytes kernarg arena में stage किए जाते हैं।
+5. code object को retain करता है, finalizer को in flight register करता है और उसे owner के
+   सबसे नए completion के रूप में record करता है। यदि `wait`, तो owner के `synchronize()` के
+   माध्यम से drain करता है।
+
+`Program::execute` (per-call trait path) `PlanContext::dispatch` से होकर जाता है: यह पिछले
+epoch का wait करता है, एक lane lease करता है, ऊपर की तरह dispatch करता है, और `wait = false`
+होने पर epoch समाप्त करके finalizer को एक unattributed token के रूप में record करता है जिसे
+`wait_storage` बाद में observe करता है।
 
 ---
 
@@ -113,7 +132,8 @@ kernargs के साथ एक HSA dispatch packet चाहिए होग�
 
 जब वही kernel chain बार-बार चलती है (streaming inference), तो per-kernel
 `wait → barrier → exec → signal → doorbell` round-trip N बार चुकाना बर्बादी है। `AmdGraph`
-(`device/src/amd/graph.rs`) — tinygrad के `HCQGraph` का 1:1 port — पूरी chain को **एक command
+(`device/src/amd/graph.rs`) — tinygrad के `HCQGraph` पर आधारित, पर एक barrier और बिना
+inter-kernel signals के — पूरी chain को **एक command
 stream** (PM4 या AQL, जो भी queue उपयोग करती हो) में capture करता है, उसे एक host-visible page
 में bind करता है, और उसे **एक doorbell** के साथ replay करता है।
 
@@ -144,18 +164,20 @@ finalizer का wait करता है, एक exclusive compute lane acquire
 करता है, मौजूदा kernargs और system fields को patch करता है, फिर resident PM4 IB या AQL
 submission program publish करता है। एक-जैसे arguments होने पर kernarg pack पूरी तरह skip हो
 जाता है। यह asynchronously return करता है; अगला replay उस storage को दोबारा उपयोग करने से
-पहले wait करता है।
+पहले wait करता है। `replay_profiled` एक ऐसा variant चलाता है जिसमें प्रति kernel एक
+`SystemField::Timestamp` slot होता है, और stamps return करने से पहले synchronize करता है।
 
 ### Capture कब होता है
 
-Capture कई तरीक़ों से gated है, और यदि कोई fail होता है तो per-call dispatch (`Ok(None)`) पर
-fall back करता है:
+Capture कई तरीक़ों से gated है, और यदि कोई fail होता है तो per-call dispatch पर fall back करता
+है — `Ok(None)` पर, और capture error पर भी, जिसे plan निगल लेता है:
 
-- chain में **बिना runtime vars वाले सभी compiled kernels** होने चाहिए — copies, views, और
-  dynamic launch dims host को loop में बनाए रखते हैं।
+- chain में **बिना unbound vars वाले सभी compiled kernels** होने चाहिए — copies, views, और
+  dynamic launch dims host को loop में बनाए रखते हैं; एक bound variable (जैसे एक
+  schedule-loop counter) की अनुमति है और replay पर `vals` के रूप में pass होता है।
 - chain को **single-device** होना चाहिए और हर current replay buffer को ठीक उसी physical
   allocation owner से backed होना चाहिए। `AmdGraph::capture` इसे नीचे फिर से जाँचता है: हर
-  kernel को उसी device core पर एक `AmdProgram` होना चाहिए (`Arc::ptr_eq`)।
+  kernel को उसी `Arc<AmdDevice>` पर एक `AmdProgram` होना चाहिए (`Arc::ptr_eq`)।
 - AQL graph capture supported है। PM4 graph capture `SVOD_PM4_GRAPH=1` के माध्यम से opt-in है,
   क्योंकि यह हर gfx11/12 GPU पर performance win नहीं है।
 
@@ -168,8 +190,9 @@ resident/control memory रखता है; हर replay bounded pool की �
 
 ## यह क्यों ज़रूरी है
 
-Compilation एक `clang` subprocess और एक in-process ELF load है — कोई ROCm नहीं, कोई temp
-files नहीं, वही minimalism जो CPU path का है। Dispatch [Queues और Dispatch](./queues-and-dispatch.md)
+Compilation एक `clang` subprocess और एक in-VRAM ELF load है — कोई ROCm runtime नहीं, कोई
+temporary files नहीं (object cache परिणाम को disk पर persist करता है), वही minimalism जो CPU
+path का है। plan पहले graph आज़माता है, फिर native linked replay, फिर direct dispatch। Dispatch [Queues और Dispatch](./queues-and-dispatch.md)
 से पूरी lane/timeline machinery को reuse करता है, इसलिए [JIT ग्राफ़](../../architecture/jit-graphs.md)
 layer का compile-once / replay-many वादा AMD पर प्रति replay एक doorbell के साथ उतरता है:
 AQL hardware पर by default, और PM4 hardware पर तब जब `SVOD_PM4_GRAPH=1` opt in करे।

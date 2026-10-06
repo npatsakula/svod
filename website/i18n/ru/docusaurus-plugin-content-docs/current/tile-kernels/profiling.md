@@ -35,7 +35,7 @@ flowchart TD
   P["Tensor::profile / ExecutionPlan::profile"] --> T1["Tier 1 - device time (GPU-clock timestamps)"]
   P --> T2["Tier 2 - roofline (GFLOP/s, GB/s)"]
   P --> T3["Tier 3 - static occupancy (VGPR/SGPR/LDS, occ%)"]
-  P --> T4["Tier 4 - HW counters / PMC (блок SQ на AMD, CUPTI на CUDA)"]
+  P --> T4["Tier 4 - HW counters / PMC (AMD SQ block, CUDA CUPTI)"]
 ```
 
 | Уровень | Что сообщает | Источник | Нужно исполнение? |
@@ -164,7 +164,7 @@ SVOD_DEVICE=AMD:0 SVOD_PROFILE_ITERS=20 SVOD_PMC=1 ...
 # Only VALU instructions and SQ-busy cycles.
 SVOD_DEVICE=AMD:0 SVOD_PMC=valu,sqbusy ...
 
-# Утилизация тензорных ядер и трафик DRAM на CUDA.
+# Tensor-core utilization and DRAM traffic on CUDA.
 SVOD_DEVICE=CUDA:0 SVOD_PMC=tensor,dram ...
 ```
 
@@ -239,8 +239,10 @@ origin rollup (depth 3, exclusive; rows sum to the total):
 пользовательский трейт `Profiler` из criterion — ту же точку расширения, что использует генерация
 flamegraph.
 
-Точка подключения — `PlanProfiler` в `tk/benches/common.rs`. Пока бенчмарк профилируется, `bench_plan` на
-каждом вызове захватывает план бенчмарка через глобальный для процесса `bench_profiler()`; каждый
+Точка подключения — `PlanProfiler` в `tk/benches/common.rs`. Пока бенчмарк профилируется, `bench_plan`
+(или `bench_kernel`, который учитывает только диспатчи, чья точка входа несёт имя рукописного ядра,
+чтобы копия, добавляемая реализацией одиночного выхода, не записывалась на его счёт) на каждом вызове
+захватывает план бенчмарка через глобальный для процесса `bench_profiler()`; каждый
 захват профилируется через `ProfileOptions::from_env()` и сливается в накопитель сессии по минимуму
 на ядро. При остановке слитая таблица рендерится через `render_table()`, записывается в файл в
 выходном каталоге criterion и дублируется в stderr:
@@ -250,30 +252,34 @@ target/criterion/<id>/profile/svod-profile.txt
 ```
 
 Вся обвязка — одна строка в `criterion_group!` каждого бенчмарка: она задаёт общий профайлер в
-качестве конфигурации criterion (из `tk/benches/kmeans.rs`):
+качестве конфигурации criterion (из `tk/benches/fa.rs`):
 
 ```rust
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(common::bench_profiler());
-    targets = bench_kmeans
+    targets = bench_fa
 }
 criterion_main!(benches);
 ```
 
 Запускайте как любой бенчмарк criterion, добавив `--profile-time` (и любые переменные окружения
-для уровней):
+для уровней). На каждое ядро — свой бинарник: `fa`, `gemm`, `matmul`, `norm`, `sq_attention`,
+`knn`, `kmeans`.
 
 ```bash
 # Plain bench: GPU device time per benchmark, profiler dormant.
-SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench kmeans
+SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench fa
 
 # Drive the layered profiler for ~5s per benchmark, with hardware counters.
-SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench kmeans -- --profile-time 5
+SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench fa -- --profile-time 5
 ```
 
 Поскольку `bench_profiler()` дремлет, пока criterion не профилирует, обычный `cargo bench` остаётся
-совершенно нетронутым — те же числа, никаких лишних проходов.
+совершенно нетронутым — те же числа, никаких лишних проходов. На устройстве вне `ArchSet` ядра
+бенчмарк сам себя пропускает. Учтите, что [автотюнер](./tuning) в бенчмарке *включён*, если не задано
+`SVOD_TK_TUNE=0`: первый образец новой формы включает замер тайлов, который поглощает прогрев
+criterion.
 
 ---
 
@@ -291,16 +297,14 @@ SVOD_DEVICE=AMD:0 SVOD_PMC=1 cargo bench -p svod-tk --bench kmeans -- --profile-
 байты берутся из буферов плана, а не из IR.) Roofline для написанных руками ядер считайте сами — по
 известному числу FLOP алгоритма и времени на устройстве с уровня 1.
 
-**Уровню 4 нужно стабильное состояние питания.** Аппаратные счётчики PM4 осмысленны, только когда
-GPU держит фиксированную тактовую частоту. В выбранном по умолчанию состоянии питания `auto`
-профайлер *не* падает — он деградирует: сообщает лишь время и печатает однострочное замечание, что счётчикам нужно
-состояние `profile_standard`. Сначала переведите GPU в это состояние (например,
-`amd-smi set -l stable_std`), затем перезапустите с `SVOD_PMC`. На CUDA требование другое: драйвер
-разрешает сбор счётчиков только администратору, пока не выставлен
-`NVreg_RestrictProfilingToAdminUsers=0`, и CUPTI должен загружаться (`SVOD_CUDA_CUPTI=0` выключает
-его намеренно) — подробности в
-[Профилировании на CUDA](../backends/cuda/profiling.md), включая то, почему там сбор счётчиков стоит
-дополнительного прохода.
+**Уровень 4 нужно разблокировать, и требование у каждого вендора своё.** На AMD счётчики PM4
+осмысленны только при фиксированной тактовой частоте, поэтому GPU должен держать состояние питания
+`profile_standard` (`amd-smi set -l stable_std`). На CUDA драйвер разрешает сбор счётчиков только
+администраторам, пока не выставлен `NVreg_RestrictProfilingToAdminUsers=0`, и CUPTI должен
+загружаться (`SVOD_CUDA_CUPTI=0` выключает его намеренно). Ни в том, ни в другом случае профайлер не
+падает: он сообщает лишь время и печатает однострочное замечание о том, чего не хватает. Подробности
+для NVIDIA, включая то, почему там сбор счётчиков стоит дополнительного прохода, — в
+[Профилировании на CUDA](../backends/cuda/profiling.md).
 :::
 
 ---

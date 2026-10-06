@@ -9,7 +9,7 @@
 //! in bf16-augmentation-free (same trick as KNN — an f32 `c_sq` smuggled through
 //! a bf16 WMMA operand would lose its precision).
 //!
-//! The assignment kernel streams `K` centroids in [`TM`]-tall tiles through a
+//! The assignment kernel streams `K` centroids in `TM`-tall tiles through a
 //! [`crate::loop_scope::Loop`] and keeps, per point, the running argmin — a
 //! flashlib-style top-1 fold (the degenerate case of KNN's argmin-insert top-K).
 //! Each tile produces a `(tile_min, tile_arg)` pair via [`Group::arg_reduce`];
@@ -312,9 +312,9 @@ fn store_best<'k>(
 /// - `c_sq_rep` (`[1, 1, K, BLK]`, f32) — `‖c[k]‖²` precomputed outside the kernel
 ///   and replicated along the point axis (each `(k, n)` holds `c_sq[k]`).
 ///
-/// Single-warp; `N`, `d` must each be a multiple of [`BLK`] (16). Each workgroup
-/// processes one [`BLK`]-point block selected by `block_idx[0]`; `K` is streamed
-/// in [`TM`]-tall tiles (ragged-K is masked). Built **rolled** (`arg_reduce`
+/// Single-warp; `N`, `d` must each be a multiple of `BLK` (16). Each workgroup
+/// processes one `BLK`-point block selected by `block_idx[0]`; `K` is streamed
+/// in `TM`-tall tiles (ragged-K is masked). Built **rolled** (`arg_reduce`
 /// panics under unroll).
 ///
 /// # Panics

@@ -1311,14 +1311,14 @@ impl MatmulCfg {
         (n / self.block) as i64
     }
     /// Launch grid for a general `m × n` C: a flattened 1-D `[gm·gn, 1, 1]` when
-    /// the chiplet swizzle ([`l2_swizzle`]) is on (it re-derives `(pid_m, pid_n)`), else
+    /// the chiplet swizzle ([`l2_swizzle`](Self::l2_swizzle)) is on (it re-derives `(pid_m, pid_n)`), else
     /// the plain 2-D `[gn, gm, 1]` (x = n-blocks → `block_idx[0]` = pid_n, y = m-blocks
-    /// → `block_idx[1]` = pid_m — matching [`block_coords`]).
+    /// → `block_idx[1]` = pid_m — matching `block_coords`).
     pub const fn grid_dims_mn(&self, m: usize, n: usize) -> [i64; 3] {
         let (gm, gn) = ((m / self.block) as i64, (n / self.block) as i64);
         if self.l2_swizzle { [gm * gn, 1, 1] } else { [gn, gm, 1] }
     }
-    /// Square convenience: [`grid_dims_mn`] with `m = n` (the `[grid², 1, 1]` /
+    /// Square convenience: [`grid_dims_mn`](Self::grid_dims_mn) with `m = n` (the `[grid², 1, 1]` /
     /// `[grid, grid, 1]` the square matmul launches with).
     pub const fn grid_dims(&self, n: usize) -> [i64; 3] {
         self.grid_dims_mn(n, n)
@@ -1419,8 +1419,9 @@ pub fn cfg_for_arch(arch: svod_dtype::GpuArch, n: usize) -> MatmulCfg {
 
 /// The GPU arch(es) the tile matmul is built for: gfx942 (CDNA MFMA, wave64),
 /// the wave32 RDNA parts (gfx11 WMMA — the `_W32_*` fragment shapes — and gfx12's
-/// strided `RT_16X16_GFX12`) and CUDA sm_80+ (`mma.sync.m16n8k16`, warp32 — the
-/// two-half `RT_16X16_MMA` fragment). The launcher gates against this; see
+/// strided `RT_16X16_GFX12`), CUDA sm_80+ (`mma.sync.m16n8k16`, warp32 — the
+/// two-half `RT_16X16_MMA` fragment) and Metal Apple7+ (`simdgroup_matrix`, the
+/// 8×8 `RT_8X8_SIMD` fragment). The launcher gates against this; see
 /// [`crate::target::check_target`]. Validated on gfx942 (CDNA3), gfx1151
 /// (RDNA3.5), gfx1201 (RDNA4) and sm_86 (Ampere) — gfx942 before the vector LDS
 /// gathers (PR #177), not re-run since.

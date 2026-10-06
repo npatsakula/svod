@@ -2,53 +2,79 @@
 sidebar_label: ONNX 推理
 ---
 
-# ONNX 模型推理
+# ONNX 推理
 
-Svod 的 ONNX 导入器是运行模型推理的推荐方式。它加载标准的 `.onnx` 文件，将算子分解为 Svod 的惰性张量操作，并通过完整的优化流水线编译执行——无需 C++ 运行时。
-
-**当前状态：**
+`svod-onnx` 把一个 `.onnx` 文件变成与手写模型相同的惰性张量图：每个算子都被分解为
+`svod-tensor` 操作，因此导入的图会经过完整的调度器、优化器和代码生成器，并在每个后端
+上运行。底下没有 ONNX Runtime。
 
 | 能力 | 状态 |
-|------|------|
-| 前向推理 | 已支持 |
-| 162 / 200 个 ONNX 算子 | [算子对齐详情](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md) |
-| CNN 架构（ResNet、DenseNet、VGG 等） | 已验证 9 个模型 |
-| Microsoft 扩展（Attention、RotaryEmbedding） | 已支持 |
-| 动态批大小 | 已支持（Variable API） |
+|---|---|
+| 前向推理 | 支持 |
+| 算子 | 162 / 200 个标准算子（[覆盖表](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)） |
+| 一致性 | 1357 个 ONNX 后端节点测试在两个 CPU 后端（Clang、LLVM）上通过；当 `SVOD_DEVICE` 选择 AMD 或 CUDA 时测试套件也在其上运行 |
+| 动态维度 | 在导入时绑定（见[动态维度](#dynamic-dimensions)） |
+| Microsoft contrib 算子 | `Attention`、`RotaryEmbedding`、`SkipLayerNormalization`、`EmbedLayerNormalization`、`BiasGelu`、`FastGelu` |
 | 训练 / 反向传播 | 不支持 |
 
-**与其他框架的比较**
-
-在纯 Rust 框架中，Svod 的 ONNX 算子覆盖面最广——162 个算子，两个 CPU 后端（Clang 与 LLVM）上通过 1357 项一致性测试；当 `SVOD_DEVICE` 选择了 AMD 或 CUDA 设备时，同一套测试也会在该设备上运行。`candle` 和 `burn` 支持的算子更少，也没有同等规模的测试套件。如果需要与生产环境 ONNX 模型的最大兼容性，用 `ort`——C++ ONNX Runtime 的 Rust 封装，覆盖完整的 ONNX 规范。
+对于表外的算子，`ort`（C++ ONNX Runtime 的封装）覆盖完整规范。
 
 ---
 
 ## 快速开始
 
-在你的 `Cargo.toml` 中添加 `svod-onnx` 和 `svod-tensor`：
-
 ```toml
 [dependencies]
-svod-onnx = { git = "https://github.com/npatsakula/svod" }
-svod-tensor = { git = "https://github.com/npatsakula/svod" }
+svod-onnx   = "0.1"
+svod-tensor = "0.1"
+prost       = "0.14"            # ModelProto::decode
 ```
 
-### 简单用法：全初始化器模型
+导入器有三个入口：
 
-对于所有输入都内嵌在文件中（无运行时输入）的模型：
+| 调用 | 权重 | 输入 |
+|---|---|---|
+| `import(path, dim_bindings)` | 浮点初始化器从文件惰性内存映射；`data_location = EXTERNAL` 相对文件所在目录解析 | 未分配的占位符，由你 `assign` |
+| `import_model_with_inputs(proto, inputs, dim_bindings)` | 从解码后的 `ModelProto` 读取 | 你自己的张量，直接追踪进图 |
+| `import_model(proto, dim_bindings)` | 从解码后的 `ModelProto` 读取 | 占位符，同 `import` |
+
+三者都返回一个 `OnnxModel`：
 
 ```rust
+pub struct OnnxModel {
+    pub inputs: HashMap<String, Tensor>,      // graph inputs that are not initializers
+    pub outputs: HashMap<String, Tensor>,     // lazy; nothing has run yet
+    pub variables: HashMap<String, Variable>, // one per named dim_param
+}
+```
+
+### 运行时输入
+
+自己构建输入张量并交给导入器。图在这些张量上追踪，所以你持有的张量就是内核读取的
+缓冲区：
+
+```rust
+use std::collections::HashMap;
+
+use prost::Message;
+use svod_onnx::parser::onnx::ModelProto;
 use svod_onnx::{OnnxImporter, OnnxModel};
 use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut importer = OnnxImporter::new();
-    let OnnxModel { outputs, .. } = importer.import("model.onnx", &[])?;
+    let proto = ModelProto::decode(std::fs::read("model.onnx")?.as_slice())?;
 
-    // 一次性调度所有输出，统一执行
-    let outs: Vec<&Tensor> = outputs.values().collect();
-    Tensor::realize_batch(outs)?;
+    // Same shape and dtype as the graph input "input"
+    let image = Tensor::from_ndarray(&load_image_nchw());    // [1, 3, 224, 224] f32
 
+    let OnnxModel { outputs, .. } = OnnxImporter::new().import_model_with_inputs(
+        proto,
+        HashMap::from([("input".to_string(), image.clone())]),
+        &[("batch", 1)],
+    )?;
+
+    // Schedule every output together, run once
+    Tensor::realize_batch(outputs.values())?;
     for (name, tensor) in &outputs {
         println!("{name}: {:?}", tensor.as_ndarray::<f32>()?);
     }
@@ -56,66 +82,105 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### 带运行时输入的模型
+`Tensor::from_ndarray` 和 `Tensor::from_raw_bytes(bytes, &dims, dtype)` 给出一个拥有
+声明形状缓冲区的张量；`Tensor::from_slice` 始终是一维的，因此只能通过前两者之一
+得到正确形状。
 
-大多数模型需要运行时数据（图像、token、音频）。解构 `OnnxModel` 并使用 `remove()` 获取输入张量的所有权：
+### 编译一次，重放
+
+对于反复推理，把输出编译成一个计划，并在两次运行之间把新数据直接写进输入缓冲区：
 
 ```rust
-use svod_onnx::{OnnxImporter, OnnxModel};
-use svod_tensor::Tensor;
+let plan = Tensor::prepare_batch(outputs.values())?;   // schedule + compile, once
+plan.execute()?;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut importer = OnnxImporter::new();
-    let OnnxModel { mut inputs, outputs, .. } = importer.import("model.onnx", &[])?;
-
-    // 分配输入数据（惰性——暂不分配内存）
-    let input = inputs.remove("input").unwrap();
-    input.assign(&Tensor::from_slice(&my_data));
-
-    // 一次性调度所有输出，统一执行
-    //（内部自动解析输入的 assign——无需单独 realize）
-    let outs: Vec<&Tensor> = outputs.values().collect();
-    Tensor::realize_batch(outs)?;
-    Ok(())
+for batch in batches {
+    image.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    plan.execute()?;                                   // replay: no tracing, no compilation
+    let logits = outputs["output"].as_vec::<f32>()?;
 }
 ```
 
+`array_view_mut` 是输入宿主映射上的零拷贝 `ndarray` 视图；`prepare_batch` 把每个输出
+张量接到计划的缓冲区上，所以 `as_vec` / `as_ndarray` 读到的是最近一次运行的结果。
+
+### 占位符输入
+
+`import(path)` 是会内存映射权重并解析外部数据的入口。它的输入是占位符：`assign`
+一个相同形状的值，并在输出*之前*先执行输入。占位符在所有计划之间保持同一个 buffer，
+因此已准备好的计划也能看到之后的 `assign` + `realize` 以及通过 `array_view_mut` 的写入。
+
+```rust
+let OnnxModel { mut inputs, outputs, .. } = OnnxImporter::new().import("model.onnx", &[])?;
+
+let input = inputs.remove("input").unwrap();
+input.assign(&Tensor::from_ndarray(&image));
+input.realize()?;
+Tensor::realize_batch(outputs.values())?;
+```
+
+输入全是初始化器的模型不需要这些：`Tensor::realize_batch(model.outputs.values())?`
+即可运行它。
+
 ---
 
-## 架构
+## 动态维度 {#dynamic-dimensions}
 
-### 两阶段设计
+有名字的 `dim_param`（`"batch"`、`"sequence_length"`）会变成一个边界为
+`(1, default_max_dim)` 的 `Variable`；`default_max_dim` 是 `OnnxImporter` 的公开字段，
+默认 32767。没有名字或大小为零的维度变为 1。
 
-导入器分两个阶段处理 ONNX 模型：
+在导入时绑定每一个动态维度。绑定后的维度在追踪出的图中是一个普通常量，因此内核会
+针对它特化：
 
-**`import(path, dim_bindings)`** 在一次调用中完成两个阶段：解析 protobuf，提取初始化器和输入规格，按拓扑顺序遍历图并将每个 ONNX 节点分派给对应的 Tensor 实现，返回 `OnnxModel { inputs, outputs, variables }`。不会执行任何计算——结果是一组惰性 `Tensor` 句柄，调用 `realize()` 时才会编译并执行。
+```rust
+let model = importer.import("model.onnx", &[("batch", 8), ("sequence_length", 512)])?;
+println!("{:?}", model.inputs["input_ids"]);   // Tensor { shape: [8, 512], dtype: Scalar(Int64), .. }
+```
+
+未绑定的维度保持符号化：其缓冲区按上界分配，`dims()` 以 `SymbolicShape` 失败
+（`Debug` 输出打印 `shape: symbolic`）。导入的图不支持通过 `ExecutionPlan::execute_with_vars`
+重新绑定——绑定过的维度已经是常量，而未绑定的维度编译出的内核会忽略运行时的值。
+要服务多种批大小，就为每种大小导入一次，或者调低 `default_max_dim` 让未绑定的缓冲区
+保持小巧。越界的绑定在导入时以 `IrConstruction` 失败；模型未声明的名字的绑定会被
+忽略。
+
+---
+
+## 导入器如何工作
 
 ```mermaid
 flowchart LR
-  A["model.onnx"] -->|"import(path, dims)"| B["OnnxModel (inputs, outputs, variables)"]
-  B -->|"realize()"| C["results"]
+  A["model.onnx"] -->|"parse: initializers, input specs, opsets"| B["OnnxGraph"]
+  B -->|"trace: one tensor op per node"| C["OnnxModel (inputs, outputs, variables)"]
+  C -->|"realize / prepare"| D["kernels"]
 ```
 
-对于高级用例（在导入前检查图结构），`import_model()` 接受预解析的 `ModelProto`。
+**解析。**解码 protobuf，初始化器变成张量，图输入变成形状规格，并记录每个域的
+opset。通过 `import`，每个元素数大于一的浮点初始化器都是指向文件的惰性视图
+（`SHRINK → BITCAST → RESHAPE → COPY` 到默认设备），因此大模型不花任何宿主拷贝；
+标量被折叠为常量。
+
+**追踪。**按拓扑序访问节点，每个节点分派到它的张量实现。结果是一组惰性输出张量。
+少数算子在追踪时读取一个*数据*输入——`Reshape` 的 shape、`Tile` 的 repeats、`TopK`
+的 k、`Range`、`ConstantOfShape`，以及从 opset 13（`ReduceSum`）或 18（其余）起归约的
+`axes` 输入——因此这些小张量会在导入期间被执行。当其中一个是图输入时，通过
+`import_model_with_inputs` 提供它。
 
 ### 算子分解
 
-每个 ONNX 算子都会分解为 Svod Tensor 操作，复杂程度不一：
-
-**直接映射** — 约 60 个算子与 tensor 方法一一对应：
+大约五十个算子 1:1 映射到张量方法：
 
 ```rust
-// In the registry:
-"Add" => x.try_add(y)?
-"Relu" => x.relu()?
+"Add"     => x.try_add(y)?
+"Relu"    => x.relu()?
 "Sigmoid" => x.sigmoid()?
-"Equal" => x.try_eq(y)?
+"Equal"   => x.try_eq(y)?
 ```
 
-**Builder 模式** — 带有多个可选参数的复杂算子使用流式 API：
+带有许多可选属性的算子使用张量 crate 的构建器：
 
 ```rust
-// Conv with optional bias, padding, dilation, groups
 x.conv()
     .weight(w)
     .maybe_bias(bias)
@@ -125,206 +190,119 @@ x.conv()
     .call()?
 ```
 
-**多步分解** — BatchNormalization、Attention 和 Mod 等算子需要中间计算。`Mod` 会根据 `fmod` 属性和输入 dtype 从四种分解中挑一种；浮点的 Python 风格分支是 `x - floor(x / y) * y`：
+其余的是多步分解。例如 `Mod` 根据 `fmod` 属性和输入 dtype 在四种形式中选一种；
+浮点的 Python 风格分支是 `x - floor(x / y) * y`：
 
 ```rust
 let div = x.try_div(y)?;
 x.try_sub(&div.floor().try_mul(y)?)?
 ```
 
-注意 `floor()` 后面没有 `?`。一元舍入操作（`floor`、`ceil`、`round`、`trunc`），以及 `cast`、`neg`、`abs`、`square` 和 `sign`，都不会失败，直接返回普通的 `Tensor`。`BitwiseAnd`/`Or`/`Xor` 和 `BitShift` 用到的位运算是 `try_bitand`、`try_bitor`、`try_bitxor`、`try_shl` 和 `try_shr`（也可以写成 `&`、`|`、`^`、`<<`、`>>`，它们返回 `Result<Tensor>`）。
+`floor()` 没有 `?`：取整操作、`cast`、`neg`、`abs`、`square` 和 `sign` 不会失败。
+`BitwiseAnd`/`Or`/`Xor` 和 `BitShift` 背后的位运算符是 `try_bitand`、`try_bitor`、
+`try_bitxor`、`try_shl` 和 `try_shr`。
 
-### 属性验证
+### 属性与 opset
 
-`Attrs` 辅助工具使用弹出式提取——每次调用 `attrs.int("axis", -1)` 或 `attrs.float("epsilon", 1e-5)` 都会从映射中移除该属性。算子处理完成后，`attrs.done()` 断言映射为空。任何剩余属性都会触发错误，在 trace 时捕获不完整的算子实现，而不是产生静默的错误结果。
+属性在读取时被弹出——`attrs.int("axis", -1)`、`attrs.float("epsilon", 1e-5)`——
+如果还有剩余，`attrs.done()` 返回 `UnhandledAttributes`，因此实现遗漏的属性是导入错误，
+而不是悄无声息的错误结果。
 
-### Opset 版本管理
+算子按其域导入的 opset 切换行为：`Softmax` 和 `LogSoftmax` 在 opset 13 之前默认轴为
+`1`，从 13 起为 `-1`；`ReduceSum` 从 opset 13 起把 axes 作为输入，其他归约从 18 起。
+`""` 和 `ai.onnx` 域共用一个 opset。
 
-ONNX 模型按域声明 opset 导入。导入器跟踪这些信息并将版本传递给每个算子处理器。算子根据版本切换行为——例如，`Softmax` 的默认轴从 `1`（opset < 13）变为 `-1`（opset >= 13），而 `ReduceSum` 在 opset 13 时将其轴从属性移至输入张量。
+### Transformer 算子
 
----
+ONNX Runtime 导出的 `com.microsoft` contrib 算子：
 
-## 使用模型
+| 算子 | 说明 |
+|---|---|
+| `Attention` | 打包的 QKV，支持 `mask_index`（一维、二维或 n 维）、`unidirectional`、`qkv_hidden_sizes` 和 past KV 缓存 |
+| `RotaryEmbedding` | 交错与非交错 |
+| `SkipLayerNormalization` | 残差 + LayerNorm；可选的均值 / 逆标准差输出为零 |
+| `EmbedLayerNormalization` | token + position + segment 嵌入 → LayerNorm；忽略 mask 输入 |
+| `BiasGelu`、`FastGelu` | 融合的 bias + GELU |
 
-### 动态维度
-
-ONNX 输入可以有符号维度，如 `"batch_size"` 或 `"sequence_length"`。在导入时通过 `dim_bindings` 参数绑定它们：
-
-```rust
-let model = importer.import("model.onnx", &[
-    ("batch_size", 1),
-    ("sequence_length", 512),
-])?;
-
-// Variables are auto-extracted from dim_param annotations
-for (name, var) in &model.variables {
-    println!("{name}: bounds {:?}", var.bounds());
-}
-```
-
-未绑定的动态维度会在导入时产生明确的错误。你可以通过 `InputSpec::shape` 检查哪些维度是动态的：
-
-```rust
-for (name, spec) in &graph.inputs {
-    for dim in &spec.shape {
-        match dim {
-            DimValue::Static(n) => print!("{n} "),
-            DimValue::Dynamic(name) => print!("{name}? "),
-        }
-    }
-}
-```
-
-### 外部权重与预构建输入
-
-存放在 `.onnx` 文件之外的权重（`data_location = EXTERNAL`）无需额外调用：`import()` 会相对模型自身所在目录解析它们。
-
-如果要自己把输入张量交给导入器——例如算子在 trace 阶段就要读取的具体值——请对预解析的 `ModelProto` 使用 `import_model_with_inputs()`：
-
-```rust
-let model_proto = ModelProto::decode(bytes)?;
-let model = importer.import_model_with_inputs(
-    model_proto,
-    inputs,  // HashMap<String, Tensor>
-    &[],
-)?;
-```
-
-### Microsoft 扩展
-
-导入器支持多个 `com.microsoft` 贡献算子，这些算子常见于从 ONNX Runtime 导出的 transformer 模型中：
-
-| 扩展 | 功能说明 |
-|------|---------|
-| `Attention` | 打包的 QKV 投影，支持掩码和历史 KV cache |
-| `RotaryEmbedding` | 旋转位置编码（交错/非交错） |
-| `SkipLayerNormalization` | 融合的残差 + LayerNorm + 缩放 |
-| `EmbedLayerNormalization` | Token + 位置 + 段落嵌入 → LayerNorm |
-
-标准 ONNX transformer 算子（ai.onnx 域的 `Attention`）同样支持，包括分组查询注意力（GQA）、因果掩码、历史 KV cache 和 softcap。
+标准 `ai.onnx` `Attention` 支持分组查询注意力、因果掩码、past KV 缓存、softcap、
+所有 `qk_matmul_output_mode`、`softmax_precision`、`nonpad_kv_seqlen` 和三维输入；其
+输出为 `[output, present_key, present_value, qk]`。
 
 ---
 
-## 控制流与局限性
+## 控制流与限制
 
-### 语义 If：两个分支始终执行
+### `If` 追踪两个分支
 
-ONNX 的 `If` 算子具有数据依赖的控制流——条件决定执行哪个分支。Svod 的惰性求值模型与此从根本上不兼容：由于 trace 时不执行任何计算，条件值是未知的。
-
-**Svod 的解决方案：** 同时 trace *两个*分支，然后使用 `Tensor::where_()` 合并结果：
+追踪时什么都不执行，所以 `If` 节点的条件是未知的。导入器追踪*两个*分支，并用 `where_`
+合并：
 
 ```text
-ONNX:    if condition { then_branch } else { else_branch }
-Svod:   then_result.where_(&condition, &else_result)
+ONNX:   if condition { then_branch } else { else_branch }
+Svod:   then_result.where_(&condition, else_result)
 ```
 
-`where_` 读作"在条件成立的地方保留 `self`"；`condition.select(&then_result, &else_result)` 是同一个操作从掩码一侧的写法，两个分支中的任意一个都可以是裸标量。
+`where_` 读作"在条件成立处保留 `self`"；`condition.select(&a, &b)` 是从掩码一侧拼写的
+同一操作。编译出的图随后可以处理任何条件值，只有一个约束：两个分支必须产生相同的形状
+和 dtype。形状多态的 `If` 在导入时被拒绝。
 
-这实现了**一次 trace，多次运行**——编译后的图在运行时可以处理任何条件值。但它有一个硬性约束：**两个分支必须产生相同的输出形状和 DType。** 形状多态的模型（即 then 分支产生 `[3, 4]` 而 else 分支产生 `[5, 6]`）无法 trace。
+### 未实现
 
-在实践中，大多数带有 `If` 节点的 ONNX 模型都满足此约束，因为它们使用条件逻辑进行值选择，而非改变形状的控制流。
-
-### 不支持 Loop 和 Scan
-
-迭代控制流（`Loop`、`Scan`）尚未实现。这些算子需要重复 trace 或展开，这与单次 trace 架构冲突。使用循环模式的模型通常通过展开的算子工作（LSTM、GRU、RNN 已作为原生算子实现）。
-
-### 批处理执行
-
-多个张量可以一起 realize，共享跨输出的计算（测试位于 `tensor/src/test/unit/batch.rs`）：
-
-```rust
-// Realize all outputs at once (shares compilation and execution)
-let outputs: Vec<&Tensor> = model.outputs.values().collect();
-Tensor::realize_batch(outputs)?;
-```
-
-对于重复推理，使用 prepare/execute 模式（测试位于
-`tensor/src/test/unit/variable.rs::test_prepare_execute_loop`）：
-
-```rust
-let OnnxModel { mut inputs, outputs, variables } =
-    importer.import("model.onnx", &[("batch", 1)])?;
-
-// 1. Assign initial data (lazy — no allocation yet)
-let input = inputs.remove("audio").unwrap();
-input.assign(&Tensor::from_slice(&first_frame));
-
-// 2. Compile the execution plan (resolves assigns, allocates buffers)
-let outs: Vec<&Tensor> = outputs.values().collect();
-let mut plan = Tensor::prepare_batch(outs)?;
-plan.execute()?;  // first run
-
-// 3. Fast loop: zero-copy writes via array_view_mut, no recompilation
-for frame in audio_frames {
-    input.array_view_mut::<f32>()?[..frame.len()].copy_from_slice(&frame);
-    plan.execute()?;
-}
-
-// Re-execute with different variable bindings
-let bound = variables["batch"].bind(8)?;
-plan.execute_with_vars(&[bound.as_var_val()])?;
-```
-
-### 不支持训练
-
-导入器仅支持推理。没有反向传播、梯度计算或优化器支持。
-
-### 缺失的算子类别
+- `Loop` 和 `Scan`：迭代控制流需要反复追踪或展开。`RNN`、`GRU` 和 `LSTM` 则是原生
+  算子；它们的 `direction` 由 `W` 的首维推断（`bidirectional` 可用，`reverse` 会按前向
+  运行），`activations` 和 `clip` 属性被忽略。
+- 训练：没有反向传播、梯度或优化器。
 
 | 类别 | 示例 | 原因 |
-|------|------|------|
-| 量化 | DequantizeLinear、QuantizeLinear | 需要 IR 中的量化 DType 支持 |
-| 序列操作 | SequenceConstruct、SequenceAt | 非张量类型不在 Svod 的类型系统中 |
-| 随机数 | RandomNormal、RandomUniform | 有状态 RNG 尚未实现 |
-| 信号处理 | DFT、STFT、MelWeightMatrix | 尚未接入导入器（tensor crate 自身提供了 `stft` / `istft`） |
-| 文本 | StringNormalizer、TfIdfVectorizer | 不支持字符串类型 |
-
-用到这些算子的模型，可以用 `ort`（ONNX Runtime 封装），它覆盖完整规范。
+|---|---|---|
+| 动态量化 | `QuantizeLinear`、`DequantizeLinear`、`DynamicQuantizeLinear`（`QLinearConv`、`QLinearMatMul`、`ConvInteger` 和 `MatMulInteger` 已实现） | 尚未移植 |
+| 序列算子 | `SequenceConstruct`、`SequenceAt` | 非张量类型不在类型系统之内 |
+| 随机 | `RandomNormal`、`RandomUniform`、`Bernoulli` | 图中没有有状态的 RNG |
+| 信号处理 | `DFT`、`STFT`、`MelWeightMatrix` | 尚未接入导入器（张量 crate 有 `stft` / `istft` / `mel_spectrogram`） |
+| 文本 | `StringNormalizer`、`TfIdfVectorizer` | 没有字符串类型 |
 
 ---
 
 ## 调试
 
-### 逐节点输出追踪
-
-设置 trace 日志级别以输出中间结果：
+**逐节点追踪。**在 `trace` 级别，导入器在追踪时执行每个节点的输出并记录其形状和
+前五个值——这是模型输出错误时做数值二分的工具。它会破坏融合，所以只用于调试，并在
+你的程序里安装带 `EnvFilter` 的 `tracing-subscriber`：
 
 ```bash
 RUST_LOG=svod_onnx::importer=trace cargo run
 ```
 
-这会逐个 realize 每个节点的输出并打印前 5 个值——模型输出有误时可以用来做数值二分。注意这会破坏内核融合（每个节点单独运行），纯粹是调试用途。
+追踪发生在导入调用内部，因此只有通过 `import_model_with_inputs` 提供输入时才会出现
+真实的输入值；占位符输入追踪出来是空缓冲区。
 
-### 检查图结构
-
-用 `OnnxModel` 结构查看模型需要什么：
+**查看图。**`Tensor` 的 `Debug` 打印形状、dtype、设备和执行状态，从不打印数据：
 
 ```rust
 let model = importer.import("model.onnx", &[])?;
-
-println!("Inputs:");
 for (name, tensor) in &model.inputs {
-    // Tensor's Debug prints shape, dtype, device and whether it is realized
-    println!("  {name}: {tensor:?}");
+    println!("input {name}: {tensor:?}");
 }
-
-println!("Outputs: {:?}", model.outputs.keys().collect::<Vec<_>>());
-println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
+println!("outputs:   {:?}", model.outputs.keys().collect::<Vec<_>>());
+println!("variables: {:?}", model.variables);
 ```
+
+**内核归因。**导入器生成的每个内核都把它的 ONNX 节点记录为来源，因此性能分析器按
+节点报告设备时间——见[内核来源](./architecture/kernel-origins)。
 
 ---
 
-## 总结
+## 小结
 
-| 方面 | 详情 |
-|------|------|
-| **入口点** | `OnnxImporter::new()` |
-| **简单导入** | `importer.import("model.onnx", &[])?` |
-| **动态维度** | `importer.import(path, &[("batch", 4)])?` |
-| **算子** | 162 / 200（[完整对齐表](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)） |
-| **已验证模型** | ResNet50、DenseNet121、VGG19、Inception v1/v2、AlexNet、ShuffleNet、SqueezeNet、ZFNet |
-| **后端** | CPU 上的 Clang + LLVM（结果一致）；`SVOD_DEVICE` 选择 GPU 时为 AMD 与 CUDA |
-| **扩展** | com.microsoft Attention、RotaryEmbedding、SkipLayerNorm、EmbedLayerNorm |
-| **局限性** | 不支持训练、不支持 Loop/Scan、形状多态的 If |
+| 方面 | 细节 |
+|---|---|
+| **入口** | `import(path, dims)`、`import_model_with_inputs(proto, inputs, dims)`、`import_model(proto, dims)` |
+| **运行时输入** | 构建张量，传给 `import_model_with_inputs`，两次运行之间通过 `array_view_mut` 写入 |
+| **动态维度** | 导入时绑定：`&[("batch", 8)]`；每种批大小导入一次 |
+| **算子** | 162 / 200（[覆盖表](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)） |
+| **一致性** | 1357 个节点测试在 Clang 和 LLVM 上通过；AMD 和 CUDA 通过 `SVOD_DEVICE` |
+| **扩展** | com.microsoft `Attention`、`RotaryEmbedding`、`SkipLayerNormalization`、`EmbedLayerNormalization`、`BiasGelu`、`FastGelu` |
+| **限制** | 不支持训练、`Loop` / `Scan`、形状多态的 `If`，也不支持运行时重新绑定动态维度 |
 
-**下一步：** [实践示例](./examples)——张量基础，或 [执行流水线](./architecture/pipeline)——了解编译工作原理。
+**下一步：**[张量 API](./examples) 了解这些模型所落入的图，或 [运行模型](./models)
+了解原生移植的模型。

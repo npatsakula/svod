@@ -2,268 +2,301 @@
 sidebar_label: एक्ज़ीक्यूशन पाइपलाइन
 ---
 
-# Tensor से मशीन कोड तक
+# Tensor से मशीन कोड तक {#from-tensor-to-machine-code}
 
-ज़्यादातर ML फ़्रेमवर्क में कम्प्यूटेशन तुरंत होता है। PyTorch में `a + b` लिखें और यह *अभी* चलता है — GPU नंबर क्रंच करता है इससे पहले कि आप रिज़ल्ट देख सकें। यह eager execution समझने में आसान है, लेकिन ऑप्टिमाइज़ेशन के मौके छूट जाते हैं। कम्पाइलर उस कम्प्यूटेशन को कैसे ऑप्टिमाइज़ करे जो उसने अभी देखा ही नहीं?
+ज़्यादातर ML फ़्रेमवर्क में कम्प्यूटेशन तुरंत होता है। PyTorch में `a + b` लिखें और यह *अभी* चलता है — GPU नंबर क्रंच कर देता है इससे पहले कि आप रिज़ल्ट देख भी सकें। यह eager execution समझने में आसान है, लेकिन ऑप्टिमाइज़ेशन के मौके छूट जाते हैं। कम्पाइलर उस कम्प्यूटेशन को कैसे ऑप्टिमाइज़ करे जो उसने अभी देखा ही नहीं?
 
-Svod उलटा तरीका अपनाता है: **lazy evaluation**। जब आप `a.try_add(&b)?` लिखते हैं, कुछ भी कम्प्यूट नहीं होता। Svod एक ग्राफ़ बनाता है जो बताता है *क्या* कम्प्यूट करना है, *कब* नहीं। जादू तब होता है जब आप `realize()` कॉल करते हैं — वो एक मेथड पूरी कम्पाइलेशन पाइपलाइन ट्रिगर करता है, हाई-लेवल tensor ऑपरेशनों से लेकर JIT-कम्पाइल्ड मशीन कोड तक।
+Svod उलटा तरीका अपनाता है: **lazy evaluation**। जब आप `a.try_add(&b)?` लिखते हैं, कुछ भी कम्प्यूट नहीं होता। Svod एक ग्राफ़ बनाता है जो बताता है *क्या* कम्प्यूट करना है, *कब* नहीं। काम तब होता है जब आप `realize()` कॉल करते हैं — वह एक मेथड पूरी कम्पाइलेशन पाइपलाइन ट्रिगर करता है, हाई-लेवल tensor ऑपरेशनों से लेकर JIT-कम्पाइल्ड मशीन कोड तक।
 
-यह चैप्टर उस पूरी यात्रा को ट्रेस करता है।
+यह चैप्टर उस यात्रा को ट्रेस करता है। [IR डिज़ाइन](./ir-design.md) पेज उस node type को समझाता है जिसे हर स्टेज साझा करती है; [codegen चैप्टर](./codegen/overview.md) per-kernel ऑप्टिमाइज़र को पास-दर-पास दिखाते हैं; यह पेज उनके बीच का नक्शा है।
 
 ```mermaid
 flowchart TD
-  Start["tensor.realize()"] --> LG["LAZY GRAPH: Tensor ops build UOp DAG (no computation yet)"]
-  LG --> RG["RANGEIFY: Movement ops to explicit RANGE loops"]
-  RG --> KS["KERNEL SPLITTING: Split at STORE boundaries to multiple KERNELs"]
-  KS --> OC["OPTIMIZATION and CODEGEN: Heuristics/beam to LLVM IR to JIT compile"]
-  OC --> EX["EXECUTION: Parallel kernel launch to result buffer"]
+  Start["tensor.realize()"] --> LG["LAZY GRAPH: tensor ops एक UOp DAG बनाते हैं (अभी कोई कम्प्यूटेशन नहीं)"]
+  LG --> SC["SCHEDULE (ग्राफ़ की shape से cached): rangeify, kernel cut, pre-schedule"]
+  SC --> IN["INSTANTIATE: cached schedule से असली बफ़र और symbolic values bind"]
+  IN --> PL["PREPARE PLAN: memory planner, हर kernel का optimize + render + compile (cached)"]
+  PL --> EX["EXECUTE: graph replay, या plan की queue पर level-क्रम से dispatch"]
 ```
-
-हर बॉक्स एक अलग फ़ेज़ है। चलिए इन्हें एक-एक करके देखते हैं।
 
 ---
 
-## Lazy Evaluation: ग्राफ़ बनाना
+## Lazy Evaluation: ग्राफ़ बनाना {#lazy-evaluation-building-the-graph}
 
-Svod में `Tensor` काफ़ी हल्का होता है:
+Svod में `Tensor` एक हैंडल है:
 
 ```rust
 pub struct Tensor {
-    entry: Arc<TensorEntry>,  // Computation graph + its realized buffer
+    entry: Arc<TensorEntry>,
+}
+
+pub struct TensorEntry {
+    pub id: u64,
+    pub uop: RwLock<Arc<UOp>>,     // the computation this tensor represents
+    buffer: OnceLock<Arc<Buffer>>, // filled by realization
 }
 ```
 
-`entry` में `TensorEntry` होता है जिसमें UOp ग्राफ़ है — वो कम्प्यूटेशन जो यह tensor रिप्रेज़ेंट करता है — और वो `OnceLock` बफ़र जिसे realization भरता है। Lazy tensor के पास अभी बफ़र नहीं होता; realized के पास होता है, और चूँकि बफ़र हैंडल में नहीं बल्कि शेयर्ड entry में रहता है, इसलिए tensor को clone करने पर उसका realization भी शेयर होता है। इसीलिए `realize()`, `prepare()` और `profile()` `&self` लेते हैं।
+UOp एक `RwLock` के पीछे रहता है ताकि ग्राफ़ को उसी जगह बदला जा सके (नीचे रजिस्ट्री देखें), और बफ़र हैंडल में नहीं बल्कि शेयर्ड entry में रहता है, इसलिए tensor को clone करने पर उसका realization भी शेयर होता है। इसीलिए `realize()`, `prepare()` और `profile()` `&self` लेते हैं।
 
-### Tensor बनाने के तीन तरीके
+### Tensor बनाने के तीन तरीके {#three-ways-to-create-tensors}
 
-**1. इनपुट tensor** — बफ़र तुरंत एलोकेट होता है:
+**1. इनपुट tensor** — बफ़र तुरंत एलोकेट और भरा जाता है:
 
 ```rust
 let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-// `a.buffer` = Some(Arc<Buffer>) with actual data
+// a.buffer() is Some(..): device memory allocated, bytes copied in
 ```
 
-जब आप डेटा से tensor बनाते हैं, Svod डिवाइस मेमोरी एलोकेट करता है और आपके bytes कॉपी करता है। UOp ग्राफ़ में एक `BUFFER` नोड होता है जो इस एलोकेशन को पॉइंट करता है।
+`from_slice` (और `from_ndarray`, जो C-contiguous इनपुट के लिए एक बार copy करता है) एक device `Buffer` एलोकेट करता है, आपके bytes `copyin` से copy करता है, और ग्राफ़ `BUFFER.reshape(shape)` बनाता है। कोई टाला हुआ host copy नहीं है।
 
 **2. Lazy ऑपरेशन** — कोई बफ़र नहीं, सिर्फ़ ग्राफ़:
 
 ```rust
-let b = a.try_add(&a)?;   // b.buffer = None
-let c = b.try_mul(&a)?;   // c.buffer = None
+let b = a.try_add(&a)?;   // b.buffer() is None
+let c = b.try_mul(&a)?;   // c.buffer() is None
 ```
 
-अरिथमेटिक ऑपरेशन कुछ भी कम्प्यूट नहीं करते। ये एक UOp ग्राफ़ बनाते हैं: `Binary(Add, a.uop, a.uop)`। Tensor पूरी तरह से भविष्य के काम की डिस्क्रिप्शन के रूप में मौजूद होता है।
+अरिथमेटिक ऑपरेशन कुछ कम्प्यूट नहीं करते। वे एक UOp ग्राफ़ बनाते हैं: `Binary(Add, a.uop, a.uop)`। Tensor सिर्फ़ भविष्य के काम के विवरण के रूप में मौजूद है।
 
-**3. Movement ऑपरेशन** — ओरिजिनल बफ़र शेयर करता है:
+**3. Movement ऑपरेशन** — मूल storage पर views:
 
 ```rust
-let d = a.try_reshape(&[1, 3])?;  // d.buffer = same as a.buffer
+let d = a.try_reshape(&[1, 3])?;  // d.buffer() resolves to a's storage
 ```
 
-Reshape, permute, और इसी तरह के ऑपरेशन मौजूदा डेटा के नए *views* बनाते हैं। बफ़र शेयर होता है; सिर्फ़ UOp ग्राफ़ बदलता है नई indexing को डिस्क्राइब करने के लिए।
+Reshape, permute और ऐसे ही ऑपरेशन एक नई lazy entry बनाते हैं जिसका ग्राफ़ `RESHAPE(a.uop)` है। Entry के पास अपना कोई बफ़र नहीं होता; `buffer()` base `BUFFER` node तक जाता है और रजिस्ट्री के ज़रिए `a` का storage ढूँढता है।
 
-### ग्लोबल रजिस्ट्री
+### ग्लोबल रजिस्ट्री {#the-global-registry}
 
-Svod दो ग्लोबल maps मेंटेन करता है (lock-free, thread-safe):
+`tensor/src/tensor_registry.rs` दो lock-free `papaya` maps रखता है:
 
 | Map | Key → Value | उद्देश्य |
 |-----|-------------|---------|
-| `TENSORS` | tensor_id → `Weak<TensorEntry>` | ग्राफ़ सब्स्टिट्यूशन के लिए सभी tensor ट्रैक करें |
-| `BUFFERS` | uop_id → `Arc<Buffer>` | शेड्यूलिंग के दौरान बफ़र खोजें |
+| `TENSORS` | tensor id → `Weak<TensorEntry>` | हर ज़िंदा tensor, ग्राफ़ substitution के लिए |
+| `BUFFERS` | `BUFFER` UOp id → `Arc<Buffer>` | scheduling और `buffer()` lookups के दौरान device storage ढूँढना |
 
-यह रजिस्ट्री एक ज़रूरी फ़ीचर देती है: **ग्लोबल ग्राफ़ सब्स्टिट्यूशन**। जब ऑप्टिमाइज़ेशन कोई UOp ट्रांसफ़ॉर्म करता है, उस UOp को रेफ़रेंस करने वाले सभी tensor ऑटोमैटिकली अपडेटेड वर्शन देखते हैं। कोई stale रेफ़रेंस नहीं, कोई मैन्युअल अपडेट नहीं।
+यह रजिस्ट्री **ग्लोबल ग्राफ़ substitution** संभव बनाती है: जब `realize()` पूरा होता है, realized subgraph हर उस tensor में उसके `BUFFER` से बदल दिया जाता है जो उसे refer करता था (`apply_map_to_tensors_realized`), इसलिए किसी dependent tensor पर बाद का `realize()` नतीजा दोबारा कम्प्यूट करने की बजाय पढ़ लेता है। `BUFFERS` entries एक UOp drop hook के ज़रिए तब ख़त्म होती हैं जब `BUFFER` node ख़ुद drop होता है।
 
-### Hash Consing इन एक्शन
+### Hash Consing इन एक्शन {#hash-consing-in-action}
 
-क्योंकि UOps hash consing (content-based deduplication) इस्तेमाल करते हैं, आइडेंटिकल कम्प्यूटेशन मेमोरी शेयर करते हैं:
+चूँकि UOps hash-consed हैं (content-based interning), एक जैसे कम्प्यूटेशन मेमोरी शेयर करते हैं:
 
 ```rust
 let x = a.try_add(&b)?;
 let y = a.try_add(&b)?;
-// x.uop() and y.uop() point to the SAME Arc<UOp>
+// x.uop() and y.uop() are the SAME Arc<UOp>
 ```
 
-यह कैशिंग के लिए ज़रूरी है: जब हम कर्नेल कम्पाइल करते हैं, UOp ID से कैश करते हैं। Hash consing से आइडेंटिकल कम्प्यूटेशन ऑटोमैटिकली कैश हिट करते हैं, भले ही अलग-अलग बनाए गए हों।
+यही नीचे के कैश को सस्ता बनाता है: एक जैसी shape वाले कम्प्यूटेशन के दो tensors scheduler तक एक ही node के रूप में पहुँचते हैं, और हर cache key ग्राफ़ का एक structural `content_hash` है, इसलिए अलग-अलग बने ग्राफ़ (या किसी दूसरे process run में बने) भी hit करते हैं।
 
 ---
 
-## Rangeify: लूप्स को एक्सप्लिसिट बनाना
+## `realize()` क्या करता है {#what-realize-does}
 
-जब आप `tensor.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)` लिखते हैं, ये movement ऑपरेशन (reshape, expand) हाई-लेवल डिस्क्रिप्शन हैं। असल लूप जनरेट करने के लिए, हमें एक्सप्लिसिट इटरेशन स्ट्रक्चर चाहिए।
+`Tensor::realize` (`tensor/src/realize.rs`) छोटा है:
 
-**Rangeify** movement ऑपरेशन को `RANGE` लूप्स और `INDEX` अरिथमेटिक में ट्रांसफ़ॉर्म करता है। एंट्री पॉइंट `schedule/src/rangeify/transforms.rs` में `rangeify()` है।
+```rust
+pub fn realize(&self) -> Result<()> {
+    if self.uop().has_buffer_identity() { self.ensure_buffer(); return Ok(()); }
+    if is_any_const(&self.uop()) { self.set_uop(self.uop().contiguous()); }  // force a buffer
+    if self.has_zero_elements() { return Ok(()); }
 
-### Rangeify पाइपलाइन
+    let old_uop = self.uop();
+    let plan = self.prepare_plan_with(&PrepareConfig::from_env())?;  // schedule + compile
+    plan.execute()?;
+    self.finalize_realize(&plan, &old_uop)?;      // tensor ← BUFFER.reshape(shape)
+    apply_map_to_tensors_realized(&{old_uop => realized_uop});
+    Ok(())
+}
+```
 
-Rangeify सिंगल ट्रांसफ़ॉर्मेशन नहीं है — यह एक मल्टी-स्टेज पाइपलाइन है:
+`prepare_plan_with` ग्राफ़ को `SINK(CONTIGUOUS(uop))` में लपेटता है और दो कदम चलाता है: `schedule_result_from_sink_with_cache` (अगला सेक्शन) और `prepare_execution_plan` (उसके बाद वाला)। `prepare()` यही दो कदम चलाता है और `ExecutionPlan` आपको सौंप देता है ताकि आप ख़ुद execute करें; `realize_batch` / `prepare_batch` कई tensors के लिए यही काम एक `SINK(CONTIGUOUS(t1), …, CONTIGUOUS(tN))` से करते हैं, ताकि एक से ज़्यादा output को feed करने वाले kernels शेयर हों। `PrepareConfig::from_env()` ऑप्टिमाइज़र strategy, thread budget और memory-planner mode environment से पढ़ता है (तालिका अंत में); `realize_with` / `prepare_with` explicit config लेते हैं।
 
-| स्टेज | उद्देश्य |
-|-------|---------|
-| **0. Range असाइनमेंट** | हर tensor डायमेंशन के लिए RANGE UOps बनाएँ |
-| **1. Early Movement Ops** | Range असाइनमेंट से पहले movement ऑपरेशन साफ़ करें |
-| **2. Load Collapse** | Range-इंडिपेंडेंट डिटेक्शन से REDUCE ऑपरेशन एलिमिनेट करें |
-| **3. Split Ranges** | Modulo वाली ranges को स्प्लिट करें, ranges को flatten करें |
-| **4. Initial Symbolic** | एल्जेब्रिक सिम्प्लिफ़िकेशन, कॉन्स्टेंट फ़ोल्डिंग |
-| **5. Simplify Ranges** | कॉस्ट एनालिसिस के साथ एडजेसेंट ranges को मर्ज करें |
-| **6. Split Store** | STORE बाउंड्रीज़ पर ग्राफ़ स्प्लिट करें |
-| **7. Apply Opts** | ऑप्टिमाइज़ेशन सर्च (beam या heuristic) |
-| **Mega-pass** | Symbolic + reduce + बफ़र फ़ोल्डिंग + बफ़र रिमूवल + रिडक्शन सिम्प्लिफ़िकेशन |
+---
 
-Mega-pass कई symbolic और स्ट्रक्चरल ऑप्टिमाइज़ेशन को एक सिंगल fixpoint लूप में कम्बाइन करता है। Per-kernel पासेज़ फिर `apply_pre_optimization()` में चलते हैं।
+## Scheduling: ग्राफ़ से कर्नेल तक {#scheduling-from-graph-to-kernels}
 
-हर पास पैटर्न-आधारित रीराइटिंग इस्तेमाल करता है (देखें [पैटर्न इंजन](./optimizations/pattern-system) चैप्टर)। पैटर्न तब तक फ़ायर होते हैं जब तक कोई और मैच न हो, फिर अगला पास शुरू होता है।
+### शेड्यूल कैश {#the-schedule-cache}
 
-### पहले और बाद
+Scheduling (rangeify और kernel cut) सबसे महँगा compile कदम है और सिर्फ़ ग्राफ़ की *shape* पर निर्भर करता है, इस पर नहीं कि वह कौन-से बफ़र पढ़ता है। इसलिए `schedule_result_from_sink_with_cache` पहले sink को **normalize** करता है — हर `BUFFER` एक positional `PARAM` बन जाता है, हर `BIND(DEFINE_VAR, CONST)` अपनी runtime value खो देता है — और नतीजे को `(content_hash(normalized sink), compiler identity)` key वाले process-wide cache में ढूँढता है। Hits सीधे instantiation पर पहुँचते हैं; misses हर key के लिए rangeify एक ही बार चलाते हैं, भले कई threads होड़ करें (single-flight)। `SVOD_DISABLE_SCHEDULE_CACHE=1` इसे बंद करता है।
 
-यह tensor एक्सप्रेशन देखें:
+Cache miss क्रम से चलाता है: `rangeify_with_map` → `try_get_kernel_graph` → `wrap_scan_loops` (scan ops के लिए schedule-level loops) → `create_pre_schedule`।
+
+### Rangeify: लूप्स को एक्सप्लिसिट बनाना {#rangeify-making-loops-explicit}
+
+जब आप `tensor.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)` लिखते हैं, तो ये movement ऑपरेशन हाई-लेवल विवरण हैं। लूप्स बनाने के लिए iteration को एक्सप्लिसिट होना होगा। **Rangeify** (`rangeify_with_map`, `schedule/src/rangeify/transforms.rs`) movement ops को `RANGE` लूप्स और `INDEX` अरिथमेटिक में बदलता है:
+
+| कदम | कोड | उद्देश्य |
+|------|------|---------|
+| Multi-device | `multi_pm()`, `lower_allreduce_pm()` | multi-device tensors की sharding resolve करना, `ALLREDUCE` lower करना |
+| Tags | `add_tags_patterns()` | हर node को नंबर देना ताकि rewrites के पार tensor identity बची रहे |
+| Calls | `resolve_calls()` | non-precompiled `FUNCTION`s को inline करना, `GETTUPLE(TUPLE)` fold करना |
+| शुरुआती rewrites | `movement_op_patterns() + early_rewrites() + split_reduceop_patterns()` | movement ops साफ़ करना; बड़े reductions को दो स्टेज में बाँटना |
+| Range assignment | `indexing::run_rangeify` | तय करना कि क्या materialize होगा (`pm_generate_realize_map`), हर output axis को एक `RANGE` देना, फिर `REDUCE_AXIS` → `REDUCE`, `PAD` → `WHERE`, `STACK` → `WHERE` lower करना, और जहाँ values materialize होती हैं वहाँ `STAGE` + `INDEX` डालना |
+| Mega-pass | `symbolic() + pm_reduce_simplify() + movement_op_patterns() + buffer_folding() + dead_axis_removal() + pm_remove_bufferize()` | एक fixpoint loop: algebra, reduction simplification, buffer folding, dead-axis removal, fuse हो सकने वाले `STAGE`s को हटाना |
+| Outputs | `SINK` फिर से बनाना | सिर्फ़ public outputs रखना |
+| Buffer limit | `buffer_limit_patterns(limit)` | उन kernels को बाँटना जो device की argument limit पार कर जाते |
+
+हर कदम pattern-based rewriting है ([पैटर्न इंजन](./optimizations/pattern-system.md) देखें)। जिन per-kernel passes को [Rangeify चैप्टर](./codegen/rangeify.md) स्टेज 1–7 कहता है (early movement ops, load collapse, split ranges, initial symbolic, simplify ranges), वे बाद में `apply_pre_optimization()` में चलते हैं, जब ग्राफ़ kernels में कट चुका होता है।
+
+हर movement op एक ख़ास index transformation में lower होता है (`apply_movement_op`, `schedule/src/rangeify/indexing.rs`):
+
+| ऑपरेशन | Transformation |
+|-----------|----------------|
+| **RESHAPE** | output strides से flatten, फिर input shape के हिसाब से `/` और `%` से वापस बाँटना |
+| **PERMUTE** | inverse permutation से ranges का क्रम बदलना |
+| **EXPAND** | expanded axis का index `0` बन जाता है (range अब address को प्रभावित नहीं करता) |
+| **PAD** | index `WHERE(valid, rng - begin, INVALID)` बन जाता है; padded value `WHERE(valid, src, 0)` है |
+| **SHRINK** | `rng + begin` |
+| **FLIP** | `(size - 1) - rng` |
+
+Rangeify के बाद कोई movement ops नहीं बचते — सिर्फ़ indices पर अरिथमेटिक। ऊपर वाले expression के लिए पहले और बाद:
 
 ```text
 Before: BUFFER.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)
 ```
 
-Rangeify के बाद, movement ops एक्सप्लिसिट index कम्प्यूटेशन बन जाते हैं:
-
 ```mermaid
 flowchart TD
-  STORE["STORE"] --> IDX["INDEX(RANGE(0..2), RANGE(0..3)) -- index (src[0])"]
-  STORE --> RED["REDUCE(Add) -- value (src[1])"]
-  STORE --> R2["RANGE(0..2, Global) -- output dim 0"]
-  STORE --> R3["RANGE(0..3, Global) -- output dim 1"]
+  STAGE["STAGE"] --> RED["REDUCE(Add) -- value"]
+  STAGE --> R2["RANGE(0..2, Weak) -- output dim 0"]
+  STAGE --> R3["RANGE(0..3, Weak) -- output dim 1"]
   RED --> LOAD["LOAD"]
   RED --> RR["RANGE(0..4, Reduce)"]
-  LOAD --> LIDX["INDEX(RANGE(0..4), RANGE(0..2), RANGE(0..3))"]
+  LOAD --> LIDX["INDEX(BUFFER, R2 * 3 + R3)"]
 ```
 
-`EXPAND` एक `RANGE(0..4)` बन गया जो बफ़र index को अफ़ेक्ट नहीं करता — broadcasting। `RESHAPE` अलग index अरिथमेटिक बन गया। `SUM` `REDUCE(Add)` बन गया जिसमें पहली range `Reduce` टाइप की मार्क है।
+`EXPAND` एक `RANGE(0..4)` बन गया जो बफ़र index में नहीं दिखता — यही broadcasting है। `RESHAPE` index अरिथमेटिक बन गया। `SUM` एक `Reduce` range को बंद करने वाला `REDUCE(Add)` बन गया। यहाँ output ranges `Weak` हैं: ऑप्टिमाइज़र बाद में तय करता है कि कौन `Global`, `Local` या `Upcast` बनेगा।
 
-### Movement → Index अरिथमेटिक
+### कर्नेल कट {#the-kernel-cut}
 
-हर movement ऑपरेशन का एक स्पेसिफ़िक ट्रांसफ़ॉर्मेशन है:
+`try_get_kernel_graph` (`schedule/src/rangeify/kernel.rs`) rangeified ग्राफ़ को kernels में बाँटता है:
 
-| ऑपरेशन | ट्रांसफ़ॉर्मेशन |
-|---------|----------------|
-| **RESHAPE** | Index एक्सप्रेशन को Flatten/unflatten करें |
-| **PERMUTE** | INDEX में डायमेंशन रीऑर्डर करें |
-| **EXPAND** | Index 0 बन जाता है (या range index को अफ़ेक्ट नहीं करती) |
-| **PAD** | WHERE(in_bounds, LOAD, pad_value) |
-| **SHRINK** | INDEX में ऑफ़सेट एडजस्टमेंट |
-| **FLIP** | `size - 1 - index` |
-
-Rangeify के बाद, कोई movement ops नहीं बचते — सिर्फ़ indices पर अरिथमेटिक ऑपरेशन।
-
----
-
-## कर्नेल स्प्लिटिंग: बाउंड्रीज़ ढूँढना
-
-एक कम्प्यूटेशन ग्राफ़ में कई आउटपुट हो सकते हैं, या इंटरमीडिएट वैल्यूज़ जिन्हें materialize करना पड़े। **कर्नेल स्प्लिटिंग** इन बाउंड्रीज़ को पहचानती है और अलग-अलग कर्नेल बनाती है।
-
-एंट्री पॉइंट `schedule/src/rangeify/kernel.rs` में `try_get_kernel_graph()` है।
-
-### कर्नेल स्प्लिटिंग पाइपलाइन
-
-स्प्लिटिंग कई कोऑर्डिनेटेड स्टेप्स से गुज़रती है:
-
-**स्टेप 1: STAGE → STORE**
-
-`STAGE` नोड मार्क करते हैं कि वैल्यूज़ को कहाँ materialize होना चाहिए। `pm_add_buffers_patterns()` उन्हें एक्सप्लिसिट `STORE` ऑपरेशन में बदलता है:
+**कदम 1: STAGE → STORE** (`pm_add_buffers_patterns`, `bufferize_to_store`)। हर `STAGE` को एक नया `BUFFER` node मिलता है (अभी कोई device मेमोरी नहीं) और वह अपनी ranges के नीचे एक store बन जाता है, उस बफ़र पर एक `AFTER` में लिपटा हुआ:
 
 ```text
-Before: STAGE(computation, ranges)
-After:  END(STORE(INDEX(...), computation), ranges)
+Before: STAGE(compute, ranges)
+After:  AFTER(BUFFER, [END(STORE(INDEX(BUFFER, flat_idx), compute), ranges)])
 ```
 
-`END` रैपर कैप्चर करता है कि कौन सी ranges इस store को scope करती हैं। इस फ़ेज़ में बफ़र एलोकेट और ID असाइन होते हैं।
-
-**स्टेप 2: Stores को कर्नेल में स्प्लिट करें**
-
-`split_all_stores()` और `split_store()` ग्राफ़ को STORE बाउंड्रीज़ पर स्प्लिट करते हैं, अलग-अलग कर्नेल बनाते हैं। बफ़र नंबरिंग स्प्लिटिंग के दौरान `LocalAddBufferContext.param_slot` काउंटर से असाइन होती है।
+**कदम 2: Stores को kernels में बाँटना** (`split_all_stores` → `split_store`)। हर store एक callable बन जाता है। Body के अंदर global `BUFFER`s pattern-match क्रम में `PARAM(slot = N)` बन जाते हैं (`LocalAddBufferContext.param_slot` counter), body `KernelInfo` वाले `SINK` के रूप में सील होती है, और kernel एक `CALL` है जिसके arguments बफ़र (`AFTER`s के रूप में) और ज़रूरी `BIND`s हैं:
 
 ```text
-Before: END(STORE(...), ranges)
-After:  KERNEL(SINK(STORE(...)), ranges, buffer_list)
+After:  AFTER(BUFFER, [CALL(SINK[KERNEL](END(STORE(...), ranges)), args = [AFTER(BUFFER..), BIND..])])
 ```
 
-`KERNEL` नोड सब कुछ रैप करता है: कम्प्यूटेशन (`SINK` के रूप में), इटरेशन ranges, और उन बफ़र्स की लिस्ट जो यह कर्नेल रीड और राइट करता है।
+कोई `KERNEL` op नहीं है: kernel एक `SINK[KERNEL]` का `CALL` है। Cut वह जगह भी है जहाँ origin attribution `CALL` पर harvest होता है ([कर्नेल Origins](./kernel-origins.md) देखें)।
 
-**स्टेप 3: असाइनमेंट ठीक करें**
+**कदम 3: Assignments ठीक करना** (`fix_assign`)। जब kernel B वह बफ़र पढ़ता है जिसे kernel A लिखता है, तो B का `AFTER` A के `AFTER` deps में जोड़ दिया जाता है, ताकि एक ही बफ़र पर write-after-read अपना क्रम बनाए रखे। Dependencies `AFTER` nodes में रहती हैं; schedule बनने तक कोई अलग dependency ग्राफ़ नहीं होता।
 
-`fix_assign()` हर buffer_id को उस कर्नेल से मैप करता है जो उसे लिखता है और डिपेंडेंसी ग्राफ़ बनाता है।
+### Pre-schedule और instantiation {#pre-schedule-and-instantiation}
 
-### डिपेंडेंसी ट्रैकिंग
-
-जब एक कर्नेल का आउटपुट दूसरे कर्नेल का इनपुट बनता है, हमें डिपेंडेंसी ट्रैकिंग चाहिए:
-
-1. `fix_assign()` हर buffer_id को लिखने वाले कर्नेल से मैप करता है और डिपेंडेंसी ग्राफ़ बनाता है
-2. जब कर्नेल B कोई बफ़र रीड करता है जो कर्नेल A ने लिखा है, तो B, A पर निर्भर है
-3. डिपेंडेंसीज़ IR में `AFTER` नोड के रूप में दिखती हैं
-
-डिपेंडेंसीज़ IR में `AFTER` नोड के रूप में दिखती हैं, जो सुनिश्चित करती हैं कि कर्नेल सही क्रम में एक्ज़ीक्यूट हों।
-
-### बफ़र नंबरिंग
-
-बफ़र नंबरिंग `split_store()` में `LocalAddBufferContext.param_slot` काउंटर हैंडल करता है। हर kernel argument एक `PARAM(slot=N)` बनता है, और ये slots स्प्लिट प्रोसेस में पैटर्न-मैच ऑर्डर में असाइन होते हैं — अलग रीनंबरिंग पास की ज़रूरत नहीं।
-
----
-
-## शेड्यूल बनाना: एक्ज़ीक्यूशन की तैयारी
-
-कर्नेल स्प्लिट होने के बाद, हमें उन्हें **शेड्यूल** करना है: एक्ज़ीक्यूशन ऑर्डर तय करें, बफ़र एलोकेट करें, और कम्पाइलेशन के लिए तैयार करें।
-
-`tensor/src/schedule.rs` में `create_schedule()` एक `Vec<ScheduleItem>` प्रोड्यूस करता है:
+`create_pre_schedule` (`tensor/src/schedule.rs`) kernel ग्राफ़ पर चलता है, callables को उनकी `AFTER` dependencies से Kahn-sort करता है और हर kernel के लिए AST और उसके छुए बफ़रों की *identities* दर्ज करता है — लेकिन बफ़र नहीं। Cache यही रखता है। फिर `instantiate_schedule` असली `BUFFER`s वापस लाता है, intermediates और outputs के लिए `Buffer` हैंडल एलोकेट करता है (outputs host-visible रहते हैं जब तक `PrepareConfig::device_local_outputs` न हो), symbolic values bind करता है और बनाता है:
 
 ```rust
+pub struct ScheduleResult {
+    pub items: Vec<ScheduleItem>,
+    pub output_uop_ids: Vec<u64>,
+    pub alias_output_buffers: HashMap<u64, Buffer>,  // outputs that alias an input
+}
+
 pub struct ScheduleItem {
-    pub kernel: Arc<UOp>,              // Callable (CALL) wrapper: dependency identity
-    pub ast: Arc<UOp>,                 // Inner computation (for codegen)
-    pub buffers: Vec<Buffer>,          // Device buffers
-    pub buffer_uop_ids: Vec<u64>,      // UOp IDs for registry cleanup
-    pub fixedvars: HashMap<String, i64>,  // Bound iteration variables
+    pub kernel: Arc<UOp>,              // the CALL: dependency identity
+    pub ast: Arc<UOp>,                 // the SINK[KERNEL] body (for codegen)
+    pub buffers: Vec<Buffer>,          // device buffers, in CALL argument order
+    pub buffer_uop_ids: Vec<u64>,      // their BUFFER UOp ids
+    pub fixedvars: HashMap<String, i64>,  // bound symbolic variables
     pub loop_var_names: HashSet<String>,  // fixedvars fed by schedule-loop counters
-    pub dependencies: Vec<u64>,        // Producer callable UOp IDs
-    pub instance_dependencies: Vec<usize>, // Producer schedule-item indices
+    pub dependencies: Vec<u64>,        // producer CALL ids
+    pub instance_dependencies: Vec<usize>, // producer schedule-item indices
 }
 ```
 
-### बफ़र एलोकेशन स्ट्रैटेजी
+---
 
-- **इनपुट बफ़र**: पहले से एलोकेटेड (`Tensor::from_slice` से)
-- **इंटरमीडिएट बफ़र**: शेड्यूलिंग के दौरान एलोकेटेड (कर्नेल आउटपुट के लिए जो दूसरे कर्नेल को फ़ीड करते हैं)
-- **आउटपुट बफ़र**: एलोकेटेड और फ़ाइनल tensor के साथ रजिस्टर्ड
+## प्लान तैयार करना {#preparing-the-plan}
 
-### पैरेलल ग्रुप एनालिसिस
+`prepare_execution_plan` (`tensor/src/realize.rs`) schedule items को एक `ExecutionPlan` में बदलता है। यह किसी भी origin scope से अलग होकर चलता है और सबसे पहले शेयर्ड thread pool का आकार `PrepareConfig::threads` से तय करता है।
 
-सभी कर्नेल को सीक्वेंशियल एक्ज़ीक्यूशन की ज़रूरत नहीं। इंडिपेंडेंट कर्नेल पैरेलल चल सकते हैं:
+### मेमोरी प्लानर {#memory-planner}
 
-```mermaid
-flowchart TD
-  A["Kernel A (writes buf0)"] -->|"depends on A"| C["Kernel C (reads buf0, buf1)"]
-  B["Kernel B (writes buf1)"] -->|"depends on B"| C
-  A -.->|"no dependency, run in parallel"| B
+कुछ भी एलोकेट होने से पहले प्लानर (`tensor/src/memory_planner/`) तय करता है कि कौन-से intermediate बफ़र storage शेयर कर सकते हैं। Liveness **execution levels** में मापी जाती है — kernel DAG की Kahn waves (`compute_topological_levels`, runtime के साथ शेयर्ड) — और जो बफ़र आख़िरी बार level *L* में इस्तेमाल हुआ, वह उस storage को फिर इस्तेमाल कर सकता है जो पहली बार *L* के बाद वाले level में इस्तेमाल हुआ। प्लानर कोई ordering edges नहीं जोड़ता; सुरक्षा उस level barrier से आती है जिसे executor पहले से लागू करता है।
+
+| `SVOD_MEMORY_PLANNER` | Mode | असर |
+|---|---|---|
+| unset, `1`, `arena` | `Arena` (default) | प्लान होने लायक बफ़रों को हर device के एक TLSF arena में pack करना; हर logical बफ़र उसमें एक `Buffer::view` बन जाता है |
+| `remap`, `pool` | `Remap` | पूरे बफ़रों को `(device, dtype, size rounded to 256 B)` से pool करना और `Arc<Buffer>`s बदलना |
+| `0`, `off`, `none`, `disabled` | `Disabled` | हर बफ़र अपना अलग allocation रखता है |
+
+Inputs, outputs, aliased storage, disk बफ़र और copy/custom-function operands कभी प्लान नहीं होते।
+
+### Per-kernel कम्पाइलेशन और कैश {#per-kernel-compilation-and-the-caches}
+
+हर non-copy item एक `KernelSite` में resolve होता है: उसका device, renderer और एक `OptKey`। Cache में न मिलने वाले kernels parallel में optimize होते हैं, schedule क्रम में नाम पाते हैं (`n1`, `n2` suffixes source text का हिस्सा हैं, इसलिए नामकरण thread timing पर निर्भर नहीं होना चाहिए), फिर render और compile होते हैं:
+
+```text
+ast ──► apply_pre_optimization ──► heuristics | BEAM ──► post-optimization ──► PROGRAM ──► LINEAR ──► SOURCE ──► BINARY
 ```
 
-शेड्यूलर पैरेलल ग्रुप ढूँढने के लिए **Kahn's algorithm** इस्तेमाल करता है:
+- `apply_pre_optimization()`: movement-op cleanup, `pm_load_collapse`, `pm_split_ranges + pm_flatten_range`, `sym + pm_fold_cast_const`, `pm_simplify_ranges`।
+- ऑप्टिमाइज़र axis types और tiling चुनता है: default में [heuristics](./optimizations/kernel-search.md), `BEAM=N` के साथ [BEAM search](./optimizations/kernel-search.md), या हाथ से lower किए kernels के लिए एक explicit `opts_to_apply` सूची।
+- Post-optimization kernel को उन स्टेजों से lower करता है जिन्हें [codegen overview](./codegen/overview.md) 08–20 लेबल देता है: post-opt symbolic, expander (`Upcast`/`Unroll` ranges → lanes), local बफ़र, `pm_add_gpudims` (`Global`/`Local` ranges → `SPECIAL`), `pm_add_loads`, devectorizer (`bool_storage_patterns` के साथ), memory coalescing, index-dtype lowering, dtype decompositions (`pm_float_decomp`, `pm_long_decomp`), late rewrites (target में `MulAcc` हो तो `pm_fma_decomposition`, fast division, …), `pm_move_gates_from_index`, और final rewrite (`pm_split_ends`, implicit barriers)। `SVOD_DUMP_STAGE=<prefix>` इनमें से किसी के भी बाद kernel print करता है।
+- `program_from_sink_with_renderer` control flow जोड़ता है, बचे हुए `PARAM` slots को नंबर देता है और `PROGRAM` node बनाता है; `do_linearize` / `do_render` / `do_compile` उसके `LINEAR`, `SOURCE` और `BINARY` fields भरते हैं (`codegen/src/program_pipeline.rs`)।
 
-1. कर्नेल डिपेंडेंसी DAG बनाएँ
-2. बिना incoming edges वाले सभी कर्नेल ढूँढें → ग्रुप 1
-3. ग्रुप 1 हटाएँ, दोहराएँ → ग्रुप 2, वगैरह
+तीन in-process कैश और एक on-disk कैश दोहराए जाने वाले काम को मुफ़्त बना देते हैं:
 
-हर ग्रुप के कर्नेल पैरेलल एक्ज़ीक्यूट होते हैं, फिर अगला ग्रुप शुरू होता है।
+| Cache | Key | दायरा |
+|-------|-----|-------|
+| Schedule cache | `content_hash(normalized SINK)` + compiler identity | rangeify + kernel cut |
+| `OPT_CACHE` | `content_hash(kernel AST)` + device + compiler key + renderer fingerprint + optimizer fingerprint | optimized AST और compiled program; `SVOD_OPT_CACHE_MAX` (4096) से FIFO-bounded |
+| Compiled-program cache | `content_hash(PROGRAM)` + compiler key | `CachedKernel`: program handle, source, entry point, ABI slots; process भर ज़िंदा |
+| Object cache (CPU) | source का SHA-256 + `CompilerIdentity` (backend, target, toolchain, flags, ABI) | `~/.cache/svod/objects` के नीचे relocatable objects (`SVOD_OBJECT_CACHE_DIR`, बंद करने के लिए `SVOD_OBJECT_CACHE=0`) |
+
+सभी keys structural hashes हैं, UOp ids नहीं, इसलिए शुरू से दोबारा बना ग्राफ़ — या किसी दूसरे process में बना — भी hit करता है। BEAM नतीजों का अपना on-disk कैश है (`SVOD_BEAM_CACHE_DIR`)।
+
+### ExecutionPlan {#the-executionplan}
+
+नतीजा (`runtime/src/execution_plan.rs`):
+
+```rust
+pub struct ExecutionPlan {
+    ops: Vec<PreparedOp>,               // CompiledProgram | BufferCopy | CustomFunction
+    op_order: Vec<usize>,               // topological order
+    op_levels: Vec<Vec<usize>>,         // Kahn levels: ops in one level are independent
+    buffers: Vec<Buffer>,
+    ast_to_buffer: HashMap<u64, usize>, // BUFFER UOp id -> buffer index
+    output_buffer_indices: Vec<usize>,  // plan outputs, in SINK source order
+    device: DeviceSpec,
+    runtime_var_vals: HashMap<String, i64>,
+    graph: OnceLock<Option<Box<dyn Graph>>>,          // captured on first execute (GPU)
+    plan_ctx: OnceLock<Option<Box<dyn PlanContext>>>, // the plan's own queue
+    // ... HCQ executor state elided
+}
+```
+
+| मेथड | उद्देश्य |
+|--------|---------|
+| `execute()` | मौजूदा बफ़रों और variable values के साथ हर op एक बार चलाना |
+| `execute_with_vars(&[(name, value)])` | symbolic variables फिर से bind करना (उनके `[min, max]` से जाँचकर), फिर execute — कोई recompilation नहीं |
+| `output_buffer()` / `output_buffer_at(i)` / `num_outputs()` | प्लान के outputs (`i` SINK source क्रम का पालन करता है) |
+| `profile(&ProfileOptions)` | replay किया गया, timestamped run जो `RunProfile` लौटाता है |
+| `declare_input(idx)` / `replicate()` | जिन पर [JIT wrapper](./jit-graphs.md) टिका है |
+
+प्लान **दोबारा इस्तेमाल होने लायक** है: एक बार compile करें, उन्हीं बफ़रों में अलग-अलग डेटा के साथ कई बार execute करें।
 
 ---
 
-## कोड जनरेशन: UOp से LLVM IR तक
+## कोड जनरेशन {#code-generation}
 
-कर्नेल शेड्यूल होने के बाद, हम असल कोड जनरेट करते हैं। Svod के दो renderer हैं, और कौन-सा चलेगा यह डिवाइस बैकएंड तय करता है:
+दो renderers (`svod_codegen::Renderer`) चारों device backends को कवर करते हैं; device चुनता है:
 
-| डिवाइस बैकएंड | Renderer | आउटपुट |
-|---------------|----------|--------|
-| **CPU** | LLVM text (डिफ़ॉल्ट) या C | LLVM IR, या C सोर्स |
-| **CUDA** | LLVM text, NVPTX टारगेट | LLVM IR (`ptx_kernel`) |
-| **AMD** | LLVM text, AMDGPU टारगेट | LLVM IR (`amdgpu_kernel`) |
-| **Metal** | C, Metal डायलेक्ट | Metal Shading Language |
-
-`Renderer` trait कोड जनरेशन को ऐब्स्ट्रैक्ट करता है:
+| Device backend | Renderer | Output |
+|----------------|----------|--------|
+| **CPU** | `LlvmTextRenderer` (default) या `CRenderer` (`SVOD_CPU_BACKEND=clang`) | LLVM IR text, या C source |
+| **CUDA** | `LlvmTextRenderer::nvptx(arch)` | LLVM IR, `ptx_kernel` ABI |
+| **AMD** | `LlvmTextRenderer::amd(arch)` | LLVM IR, `amdgpu_kernel` ABI |
+| **Metal** | `CRenderer::metal()` | Metal Shading Language |
 
 ```rust
 pub trait Renderer {
@@ -273,12 +306,12 @@ pub trait Renderer {
 }
 ```
 
-### LLVM CPU Renderer
+Runtime हर एक को device-level `svod_device::device::Renderer` में लपेटता है, जो target की capabilities (`supported_ops`, `gpu_arch`, extra और ISA matchers) जोड़ता है और एक `ProgramSpec` लौटाता है: source, entry point, variable names और वे `globals` / `outs` / `ins` बफ़र slots जिनसे प्लान arguments bind करता है।
 
-LLVM renderer (`codegen/src/llvm/cpu/`) UOp ग्राफ़ ट्रैवर्स करता है और LLVM IR एमिट करता है:
+LLVM renderer (`codegen/src/llvm/text/`) `LINEAR` op stream पर चलता है और हर kernel के लिए एक function emit करता है। हर बफ़र एक direct `ptr noalias align 32 %dataN` parameter है — कोई args array नहीं — और symbolic variables (साथ में CPU threading के लिए `core_id`) typed scalar parameters हैं:
 
 ```llvm
-define void @kernel_0(ptr noalias align 32 %buf0, ptr noalias align 32 %buf1) #0 {
+define void @E_128(ptr noalias align 32 %data0, ptr noalias align 32 %data1, i32 %N) #0 {
 entry:
   br label %loop_0
 
@@ -294,252 +327,169 @@ exit:
 }
 ```
 
-हर buffer एक direct `ptr noalias align 32` parameter है — args array के through कोई indirection नहीं। Symbolic variables (dynamic shapes के लिए) और thread ID अतिरिक्त typed parameters के रूप में पास होते हैं (जैसे `i32 %N`)।
-
-### पोस्ट-ऑप्टिमाइज़ेशन पासेज़
-
-कोड जनरेशन से पहले, ~15 पैटर्न-आधारित पासेज़ IR को साफ़ करते हैं:
-
-| पास | उद्देश्य |
-|------|---------|
-| `pm_add_loads` | INDEX ऑपरेशन को LOAD में रैप करें |
-| `pre_expand` | UNROLL/UPCAST ranges को एक्सप्लिसिट ऑपरेशन में बदलें |
-| `devectorize` | कॉन्टिग्युअस मेमोरी एक्सेसेज़ ग्रुप करें |
-| `pm_reduce_devectorize` | वेक्टर रिडक्शन हैंडल करें (K-vec, bool, horizontal) |
-| `pm_bool_devectorize` | Boolean वेक्टर पैटर्न हैंडल करें |
-| `pm_split_ends` | मल्टी-रेंज END को nested सिंगल-रेंज END में बाँटें |
-| `pm_fma_decomposition` | `a*b+c` को fused multiply-add में बदलें (सपोर्ट करने वाले बैकएंड के लिए) |
-| `pm_float_decomp` | फ़्लोटिंग-पॉइंट ऑपरेशन डीकम्पोज़ करें |
-| `bool_storage_patterns` | मेमोरी ऑपरेशन के लिए bool ↔ uint8 कन्वर्ट करें |
-
-ये पासेज़ ऑप्टिमाइज़्ड AST को कोड जनरेशन के लिए उपयुक्त रूप में ट्रांसफ़ॉर्म करते हैं। नतीजा क्लीन, वेक्टराइज़्ड कोड होता है जिसमें प्रॉपर मेमोरी एक्सेस पैटर्न हैं।
-
-### बैकएंड सपोर्ट
-
-दो renderer चार डिवाइस बैकएंड को कवर करते हैं:
-
-| Renderer | आउटपुट | कौन इस्तेमाल करता है |
-|----------|--------|----------------------|
-| **LLVM text** | CPU, AMDGPU और NVPTX टारगेट के लिए LLVM IR | CPU (डिफ़ॉल्ट), AMD, CUDA |
-| **C** | C सोर्स, या Metal Shading Language | CPU (`SVOD_CPU_BACKEND=clang`), Metal |
-
 ---
 
-## एक्ज़ीक्यूशन: कर्नेल चलाना
+## कम्पाइलेशन और लोडिंग {#compilation-and-loading}
 
-कोड जनरेशन सोर्स स्ट्रिंग प्रोड्यूस करता है — LLVM IR, C या Metal Shading Language। एक्ज़ीक्यूशन में उन्हें रनटाइम पर कम्पाइल करना और कर्नेल लॉन्च करना शामिल है।
+CPU पर IR text एक relocatable object बनता है और in-process लोड होता है; कोई LLVM `ExecutionEngine` नहीं और कोई अस्थायी shared library नहीं:
 
-### ExecutionPlan
-
-`prepare()` (सिंगल tensor) या `prepare_batch()` (मल्टीपल tensor) एक `ExecutionPlan` (`runtime/src/execution_plan.rs`) बनाता है:
-
-```rust
-pub struct ExecutionPlan {
-    ops: Vec<PreparedOp>,               // Compiled kernels and buffer copies
-    op_order: Vec<usize>,               // Topological execution order
-    op_levels: Vec<Vec<usize>>,         // Parallel groups (Kahn levels)
-    buffers: Vec<Buffer>,
-    ast_to_buffer: HashMap<u64, usize>, // AST id -> buffer index mapping
-    output_buffer_indices: Vec<usize>,  // Indices of output buffers (multi-output)
-    device: DeviceSpec,
-    // ... graph/queue state elided
-}
-```
-
-Plans अब `realize_batch()` / `prepare_batch()` के ज़रिए **मल्टीपल आउटपुट** सपोर्ट करते हैं। जब कई tensor सबग्राफ़ शेयर करते हैं, बैच शेड्यूलिंग कम्पाइलर को आउटपुट के बीच कर्नेल शेयर करने देती है।
-
-मुख्य मेथड:
-
-| मेथड | उद्देश्य |
-|------|---------|
-| `output_buffer_at(i)` | i-वाँ आउटपुट बफ़र लें (SINK source ऑर्डर से मैच) |
-| `num_outputs()` | इस प्लान में आउटपुट बफ़र की संख्या |
-| `execute_with_vars(var_vals)` | अलग symbolic variable values के साथ फिर से एक्ज़ीक्यूट करें (कोई रीकम्पाइलेशन नहीं) |
-
-प्लान **रीयूज़ेबल** है: एक बार कम्पाइल करें, अलग-अलग डेटा के साथ कई बार एक्ज़ीक्यूट करें।
-
-### JIT कम्पाइलेशन
-
-LLVM रनटाइम (`runtime/src/llvm.rs`) IR को मशीन कोड में कम्पाइल करता है। यहाँ कोई LLVM `ExecutionEngine` नहीं है: IR एक relocatable ऑब्जेक्ट बनता है, जिसे इन-प्रोसेस ELF लोडर मैप और relocate करता है।
-
-1. IR टेक्स्ट को `-O2` पर relocatable ऑब्जेक्ट में **कम्पाइल** करें — उपलब्ध हो तो `dlopen` की गई libLLVM से इन-प्रोसेस, वरना `clang -x ir -c -O2` से
-2. सोर्स डाइजेस्ट + कम्पाइलर आइडेंटिटी की key पर डिस्क कैश से ऑब्जेक्ट **रीयूज़** करें
-3. ELF लोडर से **लोड** करें: सेक्शन anonymous mmap में, relocations लागू
-4. मिली हुई फ़ंक्शन को (AST ID, device) से रीयूज़ के लिए **कैश** करें
+1. **Compile** `-O2` पर — `libloading` से in-process bind की गई libLLVM के ज़रिए, जब वह उपलब्ध हो (`SVOD_LLVM_INPROCESS=0` से opt out, `SVOD_LLVM_LIB` किसी library की ओर इशारा करता है), वरना stdin/stdout पर `clang -x ir -c -O2 … -o -`।
+2. **Reuse** — जब source और compiler identity मेल खाते हों तो on-disk कैश से object।
+3. **Load** — ELF loader से: sections एक anonymous mmap में, relocations लागू, pages executable किए जाते हैं (`runtime/src/jit_loader.rs`; [JIT Compiler](../backends/jit-loader.md) देखें)।
 
 ```rust
-// Simplified compile flow
-let object = producer.compile_object(ir_string)?;  // libLLVM in-process, or `clang -x ir -c -O2`
-validate_relocatable_object(&object, &entry_point)?;
+let object = cache.get_or_compile(key, validate_relocatable_object, |ir| producer.compile(ir))?;
 let (fn_ptr, _mmap) = jit_load(&object, &entry_point)?;  // ELF loader, no linker
-// Cache: (ast_id, device) → function
 ```
 
-### कर्नेल एक्ज़ीक्यूशन
-
-कर्नेल कम्पाइल होने के बाद, एक्ज़ीक्यूशन टोपोलॉजिकल ऑर्डर में कर्नेल इटरेट करता है, डिपेंडेंसीज़ का ध्यान रखते हुए:
-
-```rust
-for kernel in &plan.kernels {
-    // Dependencies tracked per-kernel via kernel.dependencies
-    kernel.execute(buffers);
-}
-```
-
-कर्नेल अपना डिवाइस स्पेसिफ़िकेशन रखते हैं, इसलिए एक प्लान मल्टीपल डिवाइसेज़ को स्पैन कर सकता है।
-
-### कर्नेल कैशिंग
-
-Hash consing कर्नेल कैशिंग को बहुत इफ़ेक्टिव बनाता है:
-
-- **Key**: `(UOp ID, device string)`
-- **Storage**: Lock-free HashMap (papaya crate)
-- **Hit rate**: ज़्यादा, क्योंकि आइडेंटिकल कम्प्यूटेशन UOp IDs शेयर करते हैं
-
-जब आप एक ही एक्सप्रेशन दो बार कम्प्यूट करते हैं, दूसरी बार कैश हिट होता है — कोई रीकम्पाइलेशन नहीं।
+GPU backends वही LLVM IR driver को सौंपते हैं: PTX को CUDA driver (या install हो तो `ptxas`) JIT करता है, AMDGPU code objects KFD के ज़रिए लोड होते हैं, Metal source को Metal framework compile करता है।
 
 ---
 
-## वर्क्ड उदाहरण: मैट्रिक्स मल्टिप्लाई
+## एक्ज़ीक्यूशन {#execution}
 
-चलिए `C = A @ B` को पूरी पाइपलाइन से ट्रेस करते हैं। मान लें 4×4 matrices हैं।
+`ExecutionPlan::execute()` तीन में से एक रास्ता चुनता है, सभी प्लान के executor lock के नीचे:
 
-### स्टेज 1: Lazy ग्राफ़ कंस्ट्रक्शन
+1. **Graph replay।** अगर हर op प्लान के device पर बिना unbound symbolic variable वाला compiled kernel है, और device के पास graph factory है (CUDA Graphs, AMD PM4/AQL graph, Metal indirect command buffer), तो प्लान पहले `execute()` पर पूरी dispatch sequence capture करता है और उसके बाद उसे replay करता है, सिर्फ़ बदले हुए kernel arguments patch करते हुए। [JIT ग्राफ़](./jit-graphs.md#graph-capture-and-replay) पेज backends और उनके switches को दर्ज करता है।
+2. **Native linked plan** (AMD)। जिन प्लान को graph capture नहीं कर सकता — runtime variables, copies या custom functions वाले — वे एक linked HCQ command stream के रूप में capture होते हैं जिसके kernel arguments हर replay पर फिर से pack होते हैं।
+3. **Per-op dispatch।** वरना प्लान `op_levels` पर level-दर-level चलता है और हर op को प्लान की अपनी queue में submit करता है (`PlanContext::dispatch`, GPUs पर asynchronous) या CPU program को सीधे call करता है।
+
+एक प्लान के अंदर, एक level के ops अलग host threads पर *नहीं* चलते: levels मेमोरी प्लानर का reuse barrier और graph capture का क्रम हैं। CPU parallelism kernel के अंदर है (`Thread` axes rayon pool पर बँटते हैं) और अलग-अलग प्लानों के बीच। हर `PreparedKernel` अपना device रखता है, इसलिए एक प्लान कई devices पर फैल सकता है, और `BufferCopy` ops उनके बीच डेटा ले जाते हैं।
+
+---
+
+## वर्क्ड उदाहरण: मैट्रिक्स मल्टिप्लाई {#worked-example-matrix-multiply}
+
+चलिए 4×4 मैट्रिक्स के लिए `C = A.matmul(&B)?` को पाइपलाइन से ट्रेस करते हैं।
+
+### स्टेज 1: Lazy ग्राफ़ कंस्ट्रक्शन {#stage-1-lazy-graph-construction}
 
 ```rust
-let a = Tensor::from_slice(a_data);  // Input buffer allocated
-let b = Tensor::from_slice(b_data);  // Input buffer allocated
-let c = a.matmul(&b);                 // Graph built, no computation
+let a = Tensor::from_slice(a_data).try_reshape(&[4, 4])?;  // input buffer allocated
+let b = Tensor::from_slice(b_data).try_reshape(&[4, 4])?;  // input buffer allocated
+let c = a.matmul(&b)?;                                     // graph built, no computation
 ```
 
-इस पॉइंट पर, `c` एक lazy tensor है जिसका UOp ग्राफ़ यह है:
+`matmul` `A` को `[4, 1, 4]` और `B` को `[1, 4, 4]` में reshape करता है, `B` को transpose करता है, गुणा करता है (broadcast `EXPAND`s डालता है) और आख़िरी axis पर sum करता है:
 
 ```mermaid
 flowchart TD
-  RA["REDUCE_AXIS(Add, axis=2)"] --> MUL["MUL"]
-  MUL --> EA["EXPAND(A, [4, 4, 4]) -- A: [4, 4] to [4, 1, 4] to [4, 4, 4]"]
-  MUL --> EB["EXPAND(B, [4, 4, 4]) -- B: [4, 4] to [1, 4, 4] to [4, 4, 4]"]
+  RA["REDUCE_AXIS(Add, axes=[2])"] --> MUL["MUL"]
+  MUL --> EA["EXPAND(A, [4, 4, 4]) -- A: [4, 4] से [4, 1, 4] से [4, 4, 4]"]
+  MUL --> EB["EXPAND(PERMUTE(B), [4, 4, 4]) -- B: [4, 4] से [1, 4, 4] से [4, 4, 4]"]
 ```
 
-### स्टेज 2: Rangeify
+### स्टेज 2: Rangeify {#stage-2-rangeify}
 
 Movement ops एक्सप्लिसिट लूप्स बन जाते हैं:
 
 ```mermaid
 flowchart TD
-  STORE["STORE"] --> CIDX["INDEX(BUFFER(C), RANGE(i, 0..4), RANGE(j, 0..4)) -- index"]
-  STORE --> RED["REDUCE(Add) -- value"]
-  STORE --> RI["RANGE(i, Global) -- output dim 0"]
-  STORE --> RJ["RANGE(j, Global) -- output dim 1"]
+  STAGE["STAGE"] --> RED["REDUCE(Add) -- value"]
+  STAGE --> RI["RANGE(i, 0..4) -- output dim 0"]
+  STAGE --> RJ["RANGE(j, 0..4) -- output dim 1"]
   RED --> MUL["MUL"]
-  RED --> RK["RANGE(k, Reduce)"]
+  RED --> RK["RANGE(k, 0..4, Reduce)"]
   MUL --> LA["LOAD(A)"]
   MUL --> LB["LOAD(B)"]
-  LA --> AIDX["INDEX(BUFFER(A), RANGE(i), RANGE(k, 0..4, Reduce))"]
-  LB --> BIDX["INDEX(BUFFER(B), RANGE(k), RANGE(j))"]
+  LA --> AIDX["INDEX(BUFFER(A), i * 4 + k)"]
+  LB --> BIDX["INDEX(BUFFER(B), k * 4 + j)"]
 ```
 
-`i` और `j` ranges आउटपुट डायमेंशन हैं। `k` range रिडक्शन (contracted) डायमेंशन है।
+`i` और `j` ranges output dimensions हैं। `k` range reduction (contracted) dimension है।
 
-### स्टेज 3: कर्नेल स्प्लिटिंग
+### स्टेज 3: कर्नेल कट {#stage-3-kernel-cut}
 
-सिंगल STORE → सिंगल KERNEL:
+एक `STAGE` → एक store → एक `CALL`:
 
 ```mermaid
 flowchart TD
-  KERNEL["KERNEL"] --> SINK["SINK(STORE(...))"]
-  KERNEL --> RANGES["ranges: [i: 0..4, j: 0..4]"]
-  KERNEL --> BUFS["buffers: [C (output), A (input), B (input)]"]
+  AF["AFTER(BUFFER(C))"] --> CALL["CALL"]
+  CALL --> SINK["SINK[KERNEL](END(STORE(INDEX(PARAM(0), i*4+j), REDUCE(...)), [i, j]))"]
+  CALL --> ARGS["args: AFTER(BUFFER(C)), BUFFER(A), BUFFER(B)"]
 ```
 
-### स्टेज 4: शेड्यूल
+### स्टेज 4: शेड्यूल {#stage-4-schedule}
 
-एक `ScheduleItem` जिसमें:
-- `kernel`: KERNEL UOp
-- `ast`: इनर SINK/STORE
-- `buffers`: [C, A, B]
-- `dependencies`: [] (कोई पिछला कर्नेल नहीं)
+एक `ScheduleItem`:
+- `kernel`: `CALL`
+- `ast`: `SINK[KERNEL]`
+- `buffers`: `[C, A, B]` — `C` अभी एलोकेट हुआ, `A` और `B` पहले से resident
+- `dependencies`: `[]` (कोई producer kernel नहीं)
 
-### स्टेज 5: ऑप्टिमाइज़ेशन
+### स्टेज 5: ऑप्टिमाइज़ेशन {#stage-5-optimization}
 
-Heuristic ऑप्टिमाइज़र अप्लाई करता है:
-- वेक्टराइज़ेशन: j डायमेंशन को 4 से UPCAST
-- लूप ऑर्डरिंग: अच्छे cache बिहेवियर को सुनिश्चित करें
+Heuristic ऑप्टिमाइज़र, उदाहरण के लिए, `j` पर 4 से `Upcast` (हर store पर एक `float4` vector) और `k` पर `Unroll` चुनता है; GPU पर `i` `Global` बन जाता है।
 
-### स्टेज 6: कोड जनरेशन
+### स्टेज 6: कोड जनरेशन {#stage-6-code-generation}
 
-जनरेटेड LLVM IR (सरलीकृत):
+Generated LLVM IR, पढ़ने में आसानी के लिए scalar रूप में:
 
 ```llvm
-define void @matmul(ptr noalias align 32 %C, ptr noalias align 32 %A, ptr noalias align 32 %B) #0 {
+define void @r_4_4_4(ptr noalias align 32 %data0, ptr noalias align 32 %data1, ptr noalias align 32 %data2) #0 {
 entry:
   br label %loop_i
 
 loop_i:
-  %i = phi i64 [ 0, %entry ], [ %i.next, %loop_i.end ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop_i.end ]
   br label %loop_j
 
 loop_j:
-  %j = phi i64 [ 0, %loop_i ], [ %j.next, %loop_k.end ]
-  %acc = ... ; initialize accumulator
+  %j = phi i32 [ 0, %loop_i ], [ %j.next, %loop_k.end ]
   br label %loop_k
 
 loop_k:
-  %k = phi i64 [ 0, %loop_j ], [ %k.next, %loop_k ]
-  %a_val = load float, ptr ...  ; A[i, k]
-  %b_val = load float, ptr ...  ; B[k, j]
+  %k = phi i32 [ 0, %loop_j ], [ %k.next, %loop_k ]
+  %acc = phi float [ 0.0, %loop_j ], [ %acc.new, %loop_k ]
+  %a_val = load float, ptr ...  ; A[i, k]  (data1)
+  %b_val = load float, ptr ...  ; B[k, j]  (data2)
   %prod = fmul float %a_val, %b_val
   %acc.new = fadd float %acc, %prod
-  %k.next = add i64 %k, 1
-  %k.cond = icmp slt i64 %k.next, 4
+  %k.next = add nsw i32 %k, 1
+  %k.cond = icmp slt i32 %k.next, 4
   br i1 %k.cond, label %loop_k, label %loop_k.end
 
 loop_k.end:
-  store float %acc.new, ptr ...  ; C[i, j]
+  store float %acc.new, ptr ...  ; C[i, j]  (data0)
   ; ... continue j, i loops
 }
 ```
 
-### स्टेज 7: एक्ज़ीक्यूशन
+### स्टेज 7: एक्ज़ीक्यूशन {#stage-7-execution}
 
-1. LLVM IR को JIT कम्पाइल करें
-2. एक्ज़ीक्यूट करें: `kernel([C_ptr, A_ptr, B_ptr], [])`
-3. रिज़ल्ट C बफ़र में है
-
-कुल: एक फ़ंक्शन कॉल, रिज़ल्ट तैयार।
+1. IR compile करें (या cached object लें) और लोड करें।
+2. `execute()`: एक `PreparedKernel`, `ProgramSpec.globals` क्रम में `[C_ptr, A_ptr, B_ptr]` के साथ call होता है।
+3. `finalize_realize` `c` को `BUFFER(C).reshape([4, 4])` से फिर जोड़ता है।
 
 ---
 
-## तुलना: दूसरे फ़्रेमवर्क कैसे एक्ज़ीक्यूट करते हैं
+## Environment संदर्भ {#environment-reference}
 
-| पहलू | PyTorch | JAX | TVM | **Svod** |
-|-------|---------|-----|-----|-----------|
-| **इवैल्यूएशन** | Eager (तुरंत) | Traced (jit decorator) | Lazy (te.compute) | Lazy (realize) |
-| **ग्राफ़ कैप्चर** | torch.compile | jax.jit trace | एक्सप्लिसिट schedule | Implicit via ops |
-| **कम्पाइलेशन** | TorchInductor | XLA बैकएंड | Auto-scheduler | Pattern + beam |
-| **कैशिंग** | प्रति-ग्राफ़ hash | प्रति-trace | प्रति-schedule | प्रति-AST (hash consing) |
-| **पैरेलिज़्म** | DataParallel/DDP | pmap/pjit | Parallel schedule | Parallel groups |
+वे variables जो इस पाइपलाइन को चलाते हैं (ऑप्टिमाइज़र और backend के knobs उनके अपने पेजों पर दिए हैं):
 
-**PyTorch**: डिफ़ॉल्ट रूप से eager, ऑप्टिमाइज़ेशन के लिए torch.compile। TorchInductor Triton या C++ कोड जनरेट करता है।
-
-**JAX**: फ़ंक्शनल ट्रांसफ़ॉर्मेशन (jit, grad, vmap) कम्प्यूटेशन ट्रेस करते हैं। XLA ऑप्टिमाइज़्ड कर्नेल में कम्पाइल करता है।
-
-**TVM**: कम्प्यूटेशन और schedule का एक्सप्लिसिट अलगाव। Auto-scheduler अच्छे schedules सर्च करता है।
-
-**Svod**: पूरी तरह lazy — `realize()` तक कुछ एक्ज़ीक्यूट नहीं होता। Hash consing ऑटोमैटिक कैशिंग देता है। ऑप्शनल beam search के साथ पैटर्न-आधारित ऑप्टिमाइज़ेशन प्रोडक्शन क्वालिटी के लिए।
+| Variable | असर |
+|----------|--------|
+| `SVOD_DEVICE` | default device (`CPU`, `CUDA:0`, `AMD:0`, `METAL`); unset हो तो macOS पर Metal, बाक़ी जगह CPU |
+| `SVOD_CPU_BACKEND` | `llvm` (default) या `clang` |
+| `SVOD_THREADS` | compile और CPU-kernel thread budget (default: उपलब्ध parallelism) |
+| `SVOD_NOOPT`, `BEAM=N` | ऑप्टिमाइज़र strategy: कोई नहीं, या width N का beam search (default: heuristics) |
+| `SVOD_MEMORY_PLANNER` | `arena` (default), `remap`, `off` |
+| `SVOD_DISABLE_SCHEDULE_CACHE=1`, `SVOD_OPT_CACHE_MAX` | schedule cache बंद; optimized-kernel cache की क्षमता |
+| `SVOD_OBJECT_CACHE=0`, `SVOD_OBJECT_CACHE_DIR`, `SVOD_OBJECT_CACHE_MAX_BYTES` | on-disk object cache |
+| `SVOD_LLVM_INPROCESS=0`, `SVOD_LLVM_LIB` | `clang` subprocess को ज़बरदस्ती चलाना; bind करने के लिए libLLVM चुनना |
+| `SVOD_PER_STAGE_UOPS=1`, `SVOD_DUMP_STAGE=<prefix>`, `SVOD_DUMP_LINEAR=<dir>`, `SVOD_DUMP_LLVM_IR=<dir>` | हर या किसी एक ऑप्टिमाइज़र स्टेज के बाद kernel, linearized stream, rendered IR dump करना |
+| `SVOD_SPEC=1` | हर phase के बाद IR को kernel-graph spec से जाँचना |
+| `SVOD_ORIGIN=1` | kernels को model code के खाते में डालना ([कर्नेल Origins](./kernel-origins.md)) |
+| `RUST_LOG` | `tracing` filter; `debug` per-phase timings print करता है, `trace` बफ़र mappings |
 
 ---
 
-## गहरी समझ
+## गहरी समझ {#the-deeper-insight}
 
-पाइपलाइन कई डिज़ाइन सिद्धांतों को मूर्त रूप देती है:
+**Lazy evaluation ग्लोबल ऑप्टिमाइज़ेशन संभव बनाता है।** कम्प्यूटेशन टालकर scheduler kernels काटने से पहले पूरा ग्राफ़ देखता है; fusion default है और materialization अपवाद।
 
-**Lazy evaluation ग्लोबल ऑप्टिमाइज़ेशन सक्षम करता है।** कम्प्यूटेशन को डिफ़र करके, हम कोड जनरेट करने से पहले पूरा ग्राफ़ देखते हैं। कोई लोकल डिसीज़न ग्लोबल ऑप्टिमाइज़ेशन को सीमित नहीं करता।
+**एक्सप्लिसिट लूप्स हार्डवेयर-विशिष्ट scheduling संभव बनाते हैं।** Movement ops सुविधाजनक abstractions हैं, लेकिन हार्डवेयर को लूप्स चाहिए। Rangeify यह खाई पाटता है, और ऑप्टिमाइज़र को सिर्फ़ किसी range का `AxisType` बदलना होता है।
 
-**एक्सप्लिसिट लूप्स हार्डवेयर-स्पेसिफ़िक शेड्यूलिंग सक्षम करते हैं।** Movement ops सुविधाजनक ऐब्स्ट्रैक्शन हैं, लेकिन GPU को लूप्स चाहिए। Rangeify इस गैप को पाटता है।
+**Structural hashing कैशिंग को अपने आप बना देता है।** हर कैश — schedule, optimized kernel, compiled program, object file — एक UOp ग्राफ़ के content hash से keyed है, इसलिए उसी shape के दूसरे model की क़ीमत बस allocation और dispatch है, उससे ज़्यादा कुछ नहीं।
 
-**Hash consing कैशिंग को ऑटोमैटिक बनाता है।** आइडेंटिकल कम्प्यूटेशन पॉइंटर शेयर करते हैं, इसलिए cache keys ट्रिवियल हैं। कॉम्प्लेक्स ग्राफ़ हैशिंग की ज़रूरत नहीं।
-
-**कंसर्न का अलगाव हर स्टेज को सिंपल रखता है।** Rangeify को LLVM की जानकारी नहीं। कोड जनरेशन को tensor सिमैंटिक्स की जानकारी नहीं। हर स्टेज एक काम अच्छे से करता है।
-
-नतीजा: एक कम्पाइलेशन पाइपलाइन जो शक्तिशाली और मेंटेन करने योग्य दोनों है। `tensor.realize()` से मशीन कोड तक, हर स्टेप विज़िबल, डिबगेबल, और एक्सटेंसिबल है।
+**ज़िम्मेदारियों का बँटवारा हर स्टेज को सरल रखता है।** Rangeify को LLVM के बारे में नहीं पता। कोड जनरेशन को tensor semantics के बारे में नहीं पता। हर स्टेज एक काम करती है, उसी IR पर।

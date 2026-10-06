@@ -55,18 +55,21 @@ compile-time size and offset assertions.
 `CudaDevice::open(id)` is cached per process. It runs `cuInit`, retains the
 device's **primary context** (`cuDevicePrimaryCtxRetain`), reads the
 `CudaLimits` it needs (`cuDeviceGetAttribute`: SM count, threads per block and
-per SM, shared memory per block, warp size, and whether managed memory is
-coherently accessible), creates two non-blocking streams (a **copy stream** for the
-allocator and a **dispatch stream** for per-call `Program::execute`), and
-records one **base event** that is the zero of every GPU-clock timestamp.
+per SM, blocks per SM, shared memory per block, warp size, and whether managed
+memory is both supported and concurrently accessible), creates two non-blocking
+streams (a **copy stream** for the allocator and a **dispatch stream** for
+per-call `Program::execute`), and records one **base event** on the legacy
+default stream — waited before the device is returned — that is the zero of
+every GPU-clock timestamp.
 
 The driver keeps the current context per thread, so every entry point of the
 backend starts with `enter()`: refuse if the device is poisoned, then
 `cuCtxSetCurrent`. A **sticky** `CUresult` (`ILLEGAL_ADDRESS`,
-`LAUNCH_FAILED`, `ILLEGAL_INSTRUCTION`, `ECC_UNCORRECTABLE`, ... the codes the
-driver documents as fatal to the context) latches the poison flag with its
-message; every later call on the device fails fast with that message, as on
-AMD.
+`LAUNCH_FAILED`, `ILLEGAL_INSTRUCTION`, `MISALIGNED_ADDRESS`,
+`ECC_UNCORRECTABLE`, `LAUNCH_TIMEOUT`, `ASSERT`, `HARDWARE_STACK_ERROR`,
+`INVALID_ADDRESS_SPACE`, `INVALID_PC`, `DEINITIALIZED`, and conservatively
+`UNKNOWN` — `sys.rs`) latches the poison flag with its message; every later
+call on the device fails fast with that message, as on AMD.
 
 ---
 
@@ -78,7 +81,7 @@ A `RawBuffer::Cuda` carries a device pointer, an optional host pointer, and its
 | `BufferSpec` | Kind | Driver call |
 |---|---|---|
 | default | `Device` | `cuMemAlloc` — device memory, no host mapping |
-| `cpu_access` | `Managed` when the device reports concurrent managed access, else `Pinned` (WDDM, pre-Pascal) | `cuMemAllocManaged`, one address valid on both sides |
+| `cpu_access` | `Managed` when the device reports concurrent managed access, else `Pinned` | `cuMemAllocManaged(ATTACH_GLOBAL)`, one address valid on both sides; else `cuMemHostAlloc(PORTABLE \| DEVICEMAP)` + `cuMemHostGetDevicePointer` |
 | `host` | `Pinned` | `cuMemHostAlloc(PORTABLE \| DEVICEMAP)`, kernels read it over the bus |
 
 `supports_device_local()` is `true`, so intermediates stay on the device.
@@ -95,9 +98,10 @@ lazily allocated **pinned staging buffer** with `cuMemcpyHtoDAsync` /
 `memcpy`'d directly. Device-to-device `_transfer` and zero-fills are asynchronous on
 the copy lane: ordered after the producers with `cuStreamWaitEvent`,
 published as the new producer of both ranges, and waited by every later
-launch on any lane, so they never block the host; an overlapping range
-inside one allocation bounces through a temporary to keep `memmove`
-semantics. Freeing waits the storage's producers first; if the wait fails
+launch on any lane, so they do not block the host — except an overlapping
+range inside one allocation, which bounces through a temporary to keep
+`memmove` semantics and waits when that temporary is freed. Freeing waits the
+storage's producers first; if the wait fails
 (poisoned context) the allocation is **quarantined** (leaked) rather than
 freed under an in-flight kernel. Like every compute allocator it sits under
 `LruAllocator`, which fences a recycled allocation on its previous owner's
@@ -150,8 +154,8 @@ tables (module docs of `device/src/cuda/device.rs`):
 
 - **producers** — storage base -> the newest completion token per lane that
   read or wrote it (a host overwrite is a WAR hazard against in-flight
-  readers too). The executor publishes a plan's or graph's token on every
-  storage the plan touches after each execute; the allocator publishes a
+  readers too). The execution plan publishes its or its graph's token on every
+  storage it touches after each execute; the allocator publishes a
   copy-lane token after each transfer or memset. `wait_storage(base)` drains
   the lanes below, then waits those tokens, then drops them from the table. A
   storage the table does not know — including one whose newest token belongs
@@ -185,7 +189,8 @@ single in-order ring makes them redundant). Each node's params point at that
 kernel's kernarg blob through the same `extra` protocol as eager launches; the
 graph is instantiated with `cuGraphInstantiateWithFlags`. Capture declines
 (`Ok(None)`) for an empty chain, a non-CUDA program, or a program of another
-device.
+device, and fails (`Err`) on a poisoned device or a dependency on a later
+kernel; the plan treats both as per-call dispatch.
 
 `replay(buffers, vals)` re-packs only the kernels whose `(buffers, vals)` slice
 changed and updates those nodes with `cuGraphExecKernelNodeSetParams_v2`,
@@ -209,6 +214,7 @@ Compiled PTX goes through the shared on-disk object cache, keyed by the
 rendered IR and a `CompilerIdentity`:
 
 ```text
+schema:              OBJECT_CACHE_SCHEMA
 backend:             nvptx-clang
 target_architecture: nvptx64-nvidia-cuda/sm_86
 toolchain:           <clang identity>[;ptxas:path=...;version=...]
@@ -226,8 +232,9 @@ The rendered IR is not the whole key either: the ABI descriptors are appended
 to it, because a cubin's entry is checked against them at compile time. Every
 cache hit is re-validated by its format's validator — `validate_cubin` or
 `validate_ptx`, see [Codegen](./codegen.md) — before it reaches the driver.
-`SVOD_OBJECT_CACHE=0` disables the cache and `SVOD_OBJECT_CACHE_DIR`
-relocates it.
+`SVOD_OBJECT_CACHE=0` disables the cache, `SVOD_OBJECT_CACHE_DIR` relocates
+it and `SVOD_OBJECT_CACHE_MAX_BYTES` sets its budget (see the
+[CPU page](../cpu.md)).
 
 The device factory (`create_cuda_device`) also refuses a device whose
 per-block shared memory limit is below the optimizer profile's static

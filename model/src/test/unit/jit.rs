@@ -343,6 +343,33 @@ fn test_jit_batch_var_shrinks_and_rebinds() {
     assert_eq!(jit.scaled_to_vec::<f32>().unwrap(), vec![101.0, 202.0, 103.0, 204.0]);
 }
 
+/// A binding the plan rejects leaves the recorded values alone: the output
+/// shape keeps reporting the last run that executed.
+#[test]
+fn test_jit_rejected_var_keeps_last_output_shape() {
+    let mut jit = BatchJit::new(BatchModel);
+    jit.prepare(InputSpec::f32(&[4, 2]), InputSpec::f32(&[2])).unwrap();
+    copy_tensor_to_buffer(&Tensor::from_slice([100.0f32, 200.0]), jit.bias_mut().unwrap());
+    let rows = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).try_reshape([4, 2]).unwrap();
+    copy_tensor_to_buffer(&rows, jit.rows_mut().unwrap());
+
+    jit.execute_bound(3).unwrap();
+    assert_eq!(jit.scaled_shape().unwrap(), vec![3, 2]);
+
+    // `b` is declared on (1, 4): both directions are rejected by the plan.
+    for rejected in [5, 0] {
+        assert!(matches!(jit.execute_bound(rejected), Err(JitError::Runtime { .. })));
+        assert_eq!(jit.scaled_shape().unwrap(), vec![3, 2]);
+        assert_eq!(jit.scaled_to_vec::<f32>().unwrap(), vec![101.0, 202.0, 103.0, 204.0, 105.0, 206.0]);
+        assert!(matches!(jit.execute_with_vars_profiled(&[("b", rejected)]), Err(JitError::Runtime { .. })));
+        assert_eq!(jit.scaled_shape().unwrap(), vec![3, 2]);
+    }
+
+    // An accepted rebinding still moves it.
+    jit.execute_bound(2).unwrap();
+    assert_eq!(jit.scaled_shape().unwrap(), vec![2, 2]);
+}
+
 fn ramp(n: usize, scale: f32) -> Tensor {
     Tensor::from_slice((0..n).map(|i| ((i % 7) as f32 - 3.0) * scale).collect::<Vec<f32>>())
 }

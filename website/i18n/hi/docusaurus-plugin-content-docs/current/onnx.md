@@ -2,53 +2,81 @@
 sidebar_label: ONNX इन्फ़रेंस
 ---
 
-# ONNX मॉडल इन्फ़रेंस
+# ONNX इन्फ़रेंस
 
-Svod का ONNX इम्पोर्टर मॉडल इन्फ़रेंस का सबसे अच्छा तरीका है। यह स्टैंडर्ड `.onnx` फ़ाइलें लोड करता है, ऑपरेटरों को Svod के lazy tensor ऑपरेशनों में तोड़ता है, और पूरी ऑप्टिमाइज़ेशन पाइपलाइन से कम्पाइल करता है — कोई C++ रनटाइम नहीं चाहिए।
-
-**वर्तमान स्थिति:**
+`svod-onnx` एक `.onnx` फ़ाइल को उसी लेज़ी टेंसर ग्राफ़ में बदलता है जो हाथ से लिखा
+मॉडल बनाता है: हर ऑपरेटर `svod-tensor` ऑपरेशनों में विघटित होता है, इसलिए
+इम्पोर्ट किया गया ग्राफ़ पूरे शेड्यूलर, ऑप्टिमाइज़र और कोड जनरेटर से गुज़रता है और
+हर बैकएंड पर चलता है। नीचे कोई ONNX Runtime नहीं है।
 
 | क्षमता | स्थिति |
-|--------|--------|
+|---|---|
 | फ़ॉरवर्ड इन्फ़रेंस | समर्थित |
-| 162 / 200 ONNX ऑपरेटर | [पैरिटी विवरण](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md) |
-| CNN आर्किटेक्चर (ResNet, DenseNet, VGG, ...) | 9 मॉडल सत्यापित |
-| Microsoft एक्सटेंशन (Attention, RotaryEmbedding) | समर्थित |
-| डायनामिक बैच साइज़ | समर्थित (Variable API) |
+| ऑपरेटर | 200 में से 162 मानक ऑप ([पैरिटी तालिका](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
+| अनुरूपता | 1357 ONNX backend node टेस्ट दोनों CPU बैकएंड (Clang, LLVM) पर पास होते हैं; जब `SVOD_DEVICE` AMD या CUDA चुनता है तो सूट उन पर भी चलता है |
+| डायनामिक आयाम | इम्पोर्ट के समय बाँधे जाते हैं (देखें [डायनामिक आयाम](#dynamic-dimensions)) |
+| Microsoft contrib ऑप | `Attention`, `RotaryEmbedding`, `SkipLayerNormalization`, `EmbedLayerNormalization`, `BiasGelu`, `FastGelu` |
 | ट्रेनिंग / बैकवर्ड पास | समर्थित नहीं |
 
-**दूसरे फ़्रेमवर्क से तुलना**
-
-Pure-Rust फ़्रेमवर्कों में Svod का ONNX ऑपरेटर कवरेज सबसे ज़्यादा है — 162 ऑपरेटर, दोनों CPU बैकएंड (Clang और LLVM) पर 1357 पासिंग conformance टेस्ट; जब `SVOD_DEVICE` कोई AMD या CUDA डिवाइस चुनता है तो वही सूट उस पर भी चलता है। `candle` और `burn` में ऑपरेटर कम हैं और इतने बड़े टेस्ट सूट नहीं हैं। अगर प्रोडक्शन ONNX मॉडलों के साथ पूरी कम्पैटिबिलिटी चाहिए, तो `ort` इस्तेमाल करें — C++ ONNX Runtime का Rust रैपर, जो पूरा ONNX स्पेक कवर करता है।
+तालिका से बाहर के ऑपरेटर के लिए `ort` (C++ ONNX
+Runtime का रैपर) पूरा स्पेसिफ़िकेशन कवर करता है।
 
 ---
 
 ## त्वरित शुरुआत
 
-अपनी `Cargo.toml` में `svod-onnx` और `svod-tensor` जोड़ें:
-
 ```toml
 [dependencies]
-svod-onnx = { git = "https://github.com/npatsakula/svod" }
-svod-tensor = { git = "https://github.com/npatsakula/svod" }
+svod-onnx   = "0.1"
+svod-tensor = "0.1"
+prost       = "0.14"            # ModelProto::decode
 ```
 
-### सरल: ऑल-इनिशियलाइज़र मॉडल
+इम्पोर्टर के तीन प्रवेश बिंदु हैं:
 
-उन मॉडलों के लिए जहाँ सभी इनपुट फ़ाइल में अंतर्निहित हैं (कोई रनटाइम इनपुट नहीं):
+| कॉल | Weights | इनपुट |
+|---|---|---|
+| `import(path, dim_bindings)` | Float initializers फ़ाइल से लेज़ी रूप से memory-map होते हैं; `data_location = EXTERNAL` फ़ाइल की डायरेक्टरी के सापेक्ष resolve होता है | बिना आवंटन वाले placeholders, जिन पर आप `assign` करते हैं |
+| `import_model_with_inputs(proto, inputs, dim_bindings)` | डिकोड किए गए `ModelProto` से पढ़े जाते हैं | आपके अपने टेंसर, सीधे ग्राफ़ में trace किए जाते हैं |
+| `import_model(proto, dim_bindings)` | डिकोड किए गए `ModelProto` से पढ़े जाते हैं | Placeholders, `import` की तरह |
+
+तीनों एक `OnnxModel` लौटाते हैं:
 
 ```rust
+pub struct OnnxModel {
+    pub inputs: HashMap<String, Tensor>,      // graph inputs that are not initializers
+    pub outputs: HashMap<String, Tensor>,     // lazy; nothing has run yet
+    pub variables: HashMap<String, Variable>, // one per named dim_param
+}
+```
+
+### रनटाइम इनपुट
+
+इनपुट टेंसर खुद बनाएँ और उन्हें इम्पोर्टर को दें। ग्राफ़ उन्हीं पर
+trace होता है, इसलिए आपके पास जो टेंसर हैं वही बफ़र हैं जिन्हें कर्नेल पढ़ते हैं:
+
+```rust
+use std::collections::HashMap;
+
+use prost::Message;
+use svod_onnx::parser::onnx::ModelProto;
 use svod_onnx::{OnnxImporter, OnnxModel};
 use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut importer = OnnxImporter::new();
-    let OnnxModel { outputs, .. } = importer.import("model.onnx", &[])?;
+    let proto = ModelProto::decode(std::fs::read("model.onnx")?.as_slice())?;
 
-    // सभी आउटपुट एक साथ शेड्यूल करें, एक ही पास में एक्ज़ीक्यूट करें
-    let outs: Vec<&Tensor> = outputs.values().collect();
-    Tensor::realize_batch(outs)?;
+    // Same shape and dtype as the graph input "input"
+    let image = Tensor::from_ndarray(&load_image_nchw());    // [1, 3, 224, 224] f32
 
+    let OnnxModel { outputs, .. } = OnnxImporter::new().import_model_with_inputs(
+        proto,
+        HashMap::from([("input".to_string(), image.clone())]),
+        &[("batch", 1)],
+    )?;
+
+    // Schedule every output together, run once
+    Tensor::realize_batch(outputs.values())?;
     for (name, tensor) in &outputs {
         println!("{name}: {:?}", tensor.as_ndarray::<f32>()?);
     }
@@ -56,66 +84,114 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### रनटाइम इनपुट वाले मॉडल
+`Tensor::from_ndarray` और `Tensor::from_raw_bytes(bytes, &dims, dtype)` ऐसा
+टेंसर देते हैं जो घोषित shape के बफ़र का मालिक हो; `Tensor::from_slice`
+हमेशा 1-D होता है, इसलिए reshape केवल इन्हीं में से किसी के ज़रिए करें।
 
-अधिकांश मॉडलों को रनटाइम डेटा (इमेज, टोकन, ऑडियो) की आवश्यकता होती है। `OnnxModel` को destructure करें और इनपुट tensor की ownership लेने के लिए `remove()` इस्तेमाल करें:
+### एक बार कंपाइल, बार-बार चलाना
+
+बार-बार इन्फ़रेंस के लिए outputs को एक प्लान में कंपाइल करें और रनों के बीच नया डेटा
+सीधे इनपुट बफ़र में लिखें:
 
 ```rust
-use svod_onnx::{OnnxImporter, OnnxModel};
-use svod_tensor::Tensor;
+let plan = Tensor::prepare_batch(outputs.values())?;   // schedule + compile, once
+plan.execute()?;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut importer = OnnxImporter::new();
-    let OnnxModel { mut inputs, outputs, .. } = importer.import("model.onnx", &[])?;
-
-    // इनपुट डेटा असाइन करें (lazy — अभी कोई एलोकेशन नहीं)
-    let input = inputs.remove("input").unwrap();
-    input.assign(&Tensor::from_slice(&my_data));
-
-    // सभी आउटपुट एक साथ शेड्यूल करें, एक ही पास में एक्ज़ीक्यूट करें
-    // (इनपुट के assign को इंटरनली रिज़ॉल्व करता है — अलग से realize की ज़रूरत नहीं)
-    let outs: Vec<&Tensor> = outputs.values().collect();
-    Tensor::realize_batch(outs)?;
-    Ok(())
+for batch in batches {
+    image.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    plan.execute()?;                                   // replay: no tracing, no compilation
+    let logits = outputs["output"].as_vec::<f32>()?;
 }
 ```
 
+`array_view_mut` इनपुट की host mapping पर एक zero-copy `ndarray` view है;
+`prepare_batch` हर output टेंसर को प्लान के बफ़र से जोड़ता है, इसलिए `as_vec` /
+`as_ndarray` नवीनतम रन का परिणाम पढ़ते हैं।
+
+### Placeholder इनपुट
+
+`import(path)` वह प्रवेश बिंदु है जो weights को memory-map करता है और
+external data resolve करता है। इसके इनपुट placeholders हैं: उसी shape का मान `assign` करें
+और इनपुट को outputs से *पहले* realize करें। Placeholder सभी plans में एक ही बफ़र रखता है, इसलिए prepare किया गया
+प्लान बाद के `assign` + `realize` और `array_view_mut` से लिखा गया डेटा भी देखता है।
+
+```rust
+let OnnxModel { mut inputs, outputs, .. } = OnnxImporter::new().import("model.onnx", &[])?;
+
+let input = inputs.remove("input").unwrap();
+input.assign(&Tensor::from_ndarray(&image));
+input.realize()?;
+Tensor::realize_batch(outputs.values())?;
+```
+
+जिस मॉडल के सभी इनपुट initializers हैं, उसे इसमें से कुछ नहीं चाहिए:
+`Tensor::realize_batch(model.outputs.values())?` उसे चला देता है।
+
 ---
 
-## आर्किटेक्चर
+## डायनामिक आयाम {#dynamic-dimensions}
 
-### दो-चरणीय डिज़ाइन
+नामित `dim_param` (`"batch"`, `"sequence_length"`) एक `Variable` बन जाता है जिसकी
+सीमाएँ `(1, default_max_dim)` होती हैं; `default_max_dim` `OnnxImporter` का एक public
+फ़ील्ड है और इसका डिफ़ॉल्ट 32767 है। बिना नाम का या शून्य-आकार का आयाम
+1 बन जाता है।
 
-इम्पोर्टर ONNX मॉडलों को दो अलग-अलग चरणों में प्रोसेस करता है:
+हर डायनामिक आयाम को इम्पोर्ट के समय बाँधें। बँधा हुआ आयाम trace किए गए ग्राफ़ में
+एक साधारण स्थिरांक होता है, इसलिए कर्नेल उसके लिए विशिष्ट हो जाते हैं:
 
-**`import(path, dim_bindings)`** दोनों चरणों को एक ही कॉल में करता है: protobuf को पार्स करता है, इनिशियलाइज़र और इनपुट स्पेक्स निकालता है, ग्राफ़ को टोपोलॉजिकल क्रम में ट्रैवर्स करते हुए प्रत्येक ONNX नोड को उसके Tensor इम्प्लीमेंटेशन पर डिस्पैच करता है, और एक `OnnxModel { inputs, outputs, variables }` लौटाता है। कोई एक्ज़ीक्यूशन नहीं होता — रिज़ल्ट lazy `Tensor` हैंडल का सेट है जो `realize()` करने पर कम्पाइल और एक्ज़ीक्यूट होता है।
+```rust
+let model = importer.import("model.onnx", &[("batch", 8), ("sequence_length", 512)])?;
+println!("{:?}", model.inputs["input_ids"]);   // Tensor { shape: [8, 512], dtype: Scalar(Int64), .. }
+```
+
+जिस आयाम को आप नहीं बाँधते वह symbolic रहता है: उसका बफ़र
+ऊपरी सीमा के लिए आवंटित होता है और `dims()` `SymbolicShape` के साथ विफल होता है (`Debug` output
+`shape: symbolic` प्रिंट करता है)। `ExecutionPlan::execute_with_vars` के ज़रिए फिर से बाँधना
+इम्पोर्ट किए गए ग्राफ़ के लिए समर्थित नहीं है — बँधा हुआ आयाम पहले से ही स्थिरांक है, और
+न बँधा आयाम ऐसा कर्नेल कंपाइल करता है जो रनटाइम मान को अनदेखा करता है। कई
+batch sizes सर्व करने के लिए हर size के लिए एक बार इम्पोर्ट करें, या `default_max_dim` कम करें ताकि न बँधे
+बफ़र छोटे रहें। सीमा से बाहर की bindings इम्पोर्ट पर `IrConstruction` के साथ विफल होती हैं;
+ऐसे नाम की binding जिसे मॉडल घोषित नहीं करता, अनदेखी की जाती है।
+
+---
+
+## इम्पोर्टर कैसे काम करता है
 
 ```mermaid
 flowchart LR
-  A["model.onnx"] -->|"import(path, dims)"| B["OnnxModel (inputs, outputs, variables)"]
-  B -->|"realize()"| C["results"]
+  A["model.onnx"] -->|"parse: initializers, input specs, opsets"| B["OnnxGraph"]
+  B -->|"trace: one tensor op per node"| C["OnnxModel (inputs, outputs, variables)"]
+  C -->|"realize / prepare"| D["kernels"]
 ```
 
-एडवांस्ड यूज़ केस के लिए (इम्पोर्ट से पहले ग्राफ़ स्ट्रक्चर जाँचना), `import_model()` एक पहले से पार्स्ड `ModelProto` स्वीकार करता है।
+**Parse.** protobuf डिकोड होता है, initializers टेंसर बनते हैं, graph inputs
+shape specs बनते हैं और हर domain का opset दर्ज होता है। `import` के ज़रिए, एक से अधिक
+एलिमेंट वाला हर float initializer फ़ाइल में एक लेज़ी view होता है
+(डिफ़ॉल्ट डिवाइस पर `SHRINK → BITCAST → RESHAPE → COPY`), इसलिए बड़े मॉडल
+की कोई host कॉपी नहीं बनती; scalars स्थिरांकों में fold हो जाते हैं।
+
+**Trace.** नोड्स topological क्रम में देखे जाते हैं और हर नोड अपने
+टेंसर implementation पर dispatch होता है। परिणाम लेज़ी output टेंसरों का एक समूह है। कुछ
+ऑपरेटर trace के समय एक *data* इनपुट पढ़ते हैं — `Reshape` का shape, `Tile` के
+repeats, `TopK` का k, `Range`, `ConstantOfShape`, और opset 13 (`ReduceSum`) या 18 (बाकी) से
+reductions का `axes` इनपुट — इसलिए ये छोटे
+टेंसर इम्पोर्ट के दौरान realize होते हैं। जब इनमें से कोई graph input हो, तो उसे
+`import_model_with_inputs` के ज़रिए दें।
 
 ### ऑपरेटर विघटन
 
-हर ONNX ऑपरेटर Svod Tensor ऑपरेशनों में टूटता है। कॉम्प्लेक्सिटी अलग-अलग होती है:
-
-**प्रत्यक्ष मैपिंग** — लगभग 60 ऑपरेटर एक tensor मेथड पर 1:1 मैप होते हैं:
+लगभग पचास ऑपरेटर 1:1 किसी टेंसर मेथड से मैप होते हैं:
 
 ```rust
-// In the registry:
-"Add" => x.try_add(y)?
-"Relu" => x.relu()?
+"Add"     => x.try_add(y)?
+"Relu"    => x.relu()?
 "Sigmoid" => x.sigmoid()?
-"Equal" => x.try_eq(y)?
+"Equal"   => x.try_eq(y)?
 ```
 
-**बिल्डर पैटर्न** — कई वैकल्पिक पैरामीटर वाले जटिल ऑपरेटर fluent API का उपयोग करते हैं:
+कई वैकल्पिक attributes वाले ऑपरेटर टेंसर क्रेट के builders का उपयोग करते हैं:
 
 ```rust
-// Conv with optional bias, padding, dilation, groups
 x.conv()
     .weight(w)
     .maybe_bias(bias)
@@ -125,210 +201,132 @@ x.conv()
     .call()?
 ```
 
-**मल्टी-स्टेप डीकम्पोज़िशन** — BatchNormalization, Attention, और Mod जैसे ऑपरेटरों को बीच में कई कैलकुलेशन करनी पड़ती हैं। `Mod` `fmod` एट्रिब्यूट और इनपुट dtype के आधार पर चार डीकम्पोज़िशन में से एक चुनता है; फ़्लोटिंग-पॉइंट Python-स्टाइल ब्रांच `x - floor(x / y) * y` है:
+बाकी बहु-चरणीय विघटन हैं। उदाहरण के लिए, `Mod` `fmod` attribute और इनपुट dtype के आधार पर
+चार रूपों में से एक चुनता है; floating-point
+Python-शैली की शाखा `x - floor(x / y) * y` है:
 
 ```rust
 let div = x.try_div(y)?;
 x.try_sub(&div.floor().try_mul(y)?)?
 ```
 
-`floor()` पर ध्यान दें — कोई `?` नहीं। यूनरी राउंडिंग ऑप्स (`floor`, `ceil`, `round`, `trunc`), साथ ही `cast`, `neg`, `abs`, `square` और `sign`, फ़ेल नहीं हो सकते और सादा `Tensor` लौटाते हैं। `BitwiseAnd`/`Or`/`Xor` और `BitShift` जिन बिटवाइज़ ऑपरेटरों का उपयोग करते हैं वे `try_bitand`, `try_bitor`, `try_bitxor`, `try_shl` और `try_shr` हैं (इन्हें `&`, `|`, `^`, `<<`, `>>` के रूप में भी लिखा जा सकता है, जो `Result<Tensor>` लौटाते हैं)।
+`floor()` पर `?` नहीं है: rounding ऑप, `cast`, `neg`, `abs`, `square`
+और `sign` विफल नहीं हो सकते। `BitwiseAnd`/`Or`/`Xor`
+और `BitShift` के पीछे के bitwise ऑपरेटर `try_bitand`, `try_bitor`, `try_bitxor`, `try_shl` और
+`try_shr` हैं।
 
-### एट्रिब्यूट वैलिडेशन
+### Attributes और opsets
 
-`Attrs` हेल्पर पॉप-आधारित एक्सट्रैक्शन का उपयोग करता है — `attrs.int("axis", -1)` या `attrs.float("epsilon", 1e-5)` के प्रत्येक कॉल पर एट्रिब्यूट मैप से हटा दिया जाता है। ऑपरेटर पूरा होने के बाद, `attrs.done()` सुनिश्चित करता है कि मैप खाली है। कोई भी बचा हुआ एट्रिब्यूट एक एरर ट्रिगर करता है, जो अधूरे ऑपरेटर इम्प्लीमेंटेशन को चुपचाप गलत परिणाम देने के बजाय ट्रेस टाइम पर ही पकड़ लेता है।
+Attributes पढ़े जाते ही निकाल दिए जाते हैं — `attrs.int("axis", -1)`,
+`attrs.float("epsilon", 1e-5)` — और कोई बचा हो तो `attrs.done()`
+`UnhandledAttributes` लौटाता है, इसलिए जिस attribute को implementation भूल गया
+वह चुपचाप गलत परिणाम के बजाय इम्पोर्ट त्रुटि बनता है।
 
-### Opset वर्शनिंग
+ऑपरेटर अपने domain द्वारा इम्पोर्ट किए गए opset के अनुसार व्यवहार बदलते हैं: `Softmax` और
+`LogSoftmax` का डिफ़ॉल्ट axis opset 13 से पहले `1` और 13 से `-1` है; `ReduceSum`
+opset 13 से और बाकी reductions 18 से अपने axes इनपुट के रूप में लेते हैं।
+`""` और `ai.onnx` domains एक ही opset साझा करते हैं।
 
-ONNX मॉडल प्रति डोमेन opset इम्पोर्ट घोषित करते हैं। इम्पोर्टर इन्हें ट्रैक करता है और प्रत्येक ऑपरेटर हैंडलर को वर्शन पास करता है। ऑपरेटर वर्शन के आधार पर व्यवहार बदलते हैं — उदाहरण के लिए, `Softmax` का डिफ़ॉल्ट axis `1` (opset < 13) से `-1` (opset >= 13) में बदल गया, और `ReduceSum` ने अपने axes को opset 13 पर एक एट्रिब्यूट से इनपुट tensor में स्थानांतरित किया।
+### Transformer ऑपरेटर
 
----
+`com.microsoft` contrib ऑपरेटर जिन्हें ONNX Runtime export करता है:
 
-## मॉडलों के साथ काम करना
+| ऑपरेटर | टिप्पणी |
+|---|---|
+| `Attention` | `mask_index` (1-D, 2-D या n-D), `unidirectional`, `qkv_hidden_sizes` और past KV cache के साथ packed QKV |
+| `RotaryEmbedding` | Interleaved और non-interleaved |
+| `SkipLayerNormalization` | Residual + LayerNorm; वैकल्पिक mean / inverse-std outputs शून्य होते हैं |
+| `EmbedLayerNormalization` | Token + position + segment embeddings → LayerNorm; mask इनपुट अनदेखा होता है |
+| `BiasGelu`, `FastGelu` | Fused bias + GELU |
 
-### डायनामिक डायमेंशन
-
-ONNX इनपुट में `"batch_size"` या `"sequence_length"` जैसे सिम्बॉलिक डायमेंशन हो सकते हैं। इन्हें इम्पोर्ट टाइम पर `dim_bindings` पैरामीटर के ज़रिए बाइंड करें:
-
-```rust
-let model = importer.import("model.onnx", &[
-    ("batch_size", 1),
-    ("sequence_length", 512),
-])?;
-
-// Variables are auto-extracted from dim_param annotations
-for (name, var) in &model.variables {
-    println!("{name}: bounds {:?}", var.bounds());
-}
-```
-
-अनबाउंड डायनामिक डायमेंशन इम्पोर्ट टाइम पर एक स्पष्ट एरर देते हैं। आप `InputSpec::shape` के ज़रिए जाँच सकते हैं कि कौन से डायमेंशन डायनामिक हैं:
-
-```rust
-for (name, spec) in &graph.inputs {
-    for dim in &spec.shape {
-        match dim {
-            DimValue::Static(n) => print!("{n} "),
-            DimValue::Dynamic(name) => print!("{name}? "),
-        }
-    }
-}
-```
-
-### एक्सटर्नल वेट्स और पहले से बने इनपुट
-
-`.onnx` फ़ाइल के बाहर रखे गए वेट्स (`data_location = EXTERNAL`) के लिए अलग कॉल की
-ज़रूरत नहीं है: `import()` उन्हें मॉडल की अपनी डायरेक्टरी के सापेक्ष हल कर लेता है।
-
-अगर आप इनपुट टेंसर खुद देना चाहते हैं — जैसे वे कंक्रीट वैल्यू जिन्हें ऑपरेटर trace
-के समय पढ़ते हैं — तो पहले से पार्स्ड `ModelProto` के साथ
-`import_model_with_inputs()` इस्तेमाल करें:
-
-```rust
-let model_proto = ModelProto::decode(bytes)?;
-let model = importer.import_model_with_inputs(
-    model_proto,
-    inputs,  // HashMap<String, Tensor>
-    &[],
-)?;
-```
-
-### Microsoft एक्सटेंशन
-
-इम्पोर्टर कई `com.microsoft` contrib ऑपरेटरों को सपोर्ट करता है जो आमतौर पर ONNX Runtime से एक्सपोर्ट किए गए ट्रांसफ़ॉर्मर मॉडलों में पाए जाते हैं:
-
-| एक्सटेंशन | विवरण |
-|-----------|-------|
-| `Attention` | पैक्ड QKV प्रोजेक्शन, मास्किंग, पास्ट KV cache के साथ |
-| `RotaryEmbedding` | रोटरी पोज़िशनल एम्बेडिंग (इंटरलीव्ड/नॉन-इंटरलीव्ड) |
-| `SkipLayerNormalization` | फ़्यूज़्ड रेसिड्यूअल + LayerNorm + स्केल |
-| `EmbedLayerNormalization` | टोकन + पोज़िशन + सेगमेंट एम्बेडिंग → LayerNorm |
-
-मानक ONNX ट्रांसफ़ॉर्मर ऑपरेटर (ai.onnx डोमेन से `Attention`) भी GQA, कॉज़ल मास्किंग, पास्ट KV cache, और softcap के साथ समर्थित हैं।
+मानक `ai.onnx` `Attention` grouped-query attention, causal
+masking, past KV caching, softcap, हर `qk_matmul_output_mode`,
+`softmax_precision`, `nonpad_kv_seqlen` और 3-D इनपुट का समर्थन करता है; इसके outputs
+`[output, present_key, present_value, qk]` हैं।
 
 ---
 
 ## कंट्रोल फ़्लो और सीमाएँ
 
-### सिमैंटिक If: दोनों ब्रांच हमेशा एक्ज़ीक्यूट होती हैं
+### `If` दोनों शाखाओं को trace करता है
 
-ONNX के `If` ऑपरेटर में डेटा-डिपेंडेंट कंट्रोल फ़्लो होता है — कंडीशन तय करती है कि कौन सी ब्रांच चलेगी। Svod का lazy इवैल्यूएशन मॉडल इसके साथ मौलिक रूप से असंगत है: चूँकि ट्रेस टाइम पर कुछ भी एक्ज़ीक्यूट नहीं होता, कंडीशन का मान अज्ञात होता है।
-
-**Svod का समाधान:** *दोनों* ब्रांचों को ट्रेस करें, फिर `Tensor::where_()` से परिणामों को मर्ज करें:
+trace के समय कुछ भी नहीं चलता, इसलिए `If` नोड की शर्त अज्ञात होती है।
+इम्पोर्टर *दोनों* शाखाओं को trace करता है और उन्हें `where_` से मिलाता है:
 
 ```text
-ONNX:    if condition { then_branch } else { else_branch }
-Svod:   then_result.where_(&condition, &else_result)
+ONNX:   if condition { then_branch } else { else_branch }
+Svod:   then_result.where_(&condition, else_result)
 ```
 
-`where_` को ऐसे पढ़ें: "जहाँ कंडीशन सही है वहाँ `self` रखो"; `condition.select(&then_result, &else_result)` वही ऑप है, बस mask की तरफ़ से लिखा गया, और कोई भी ब्रांच सादा scalar हो सकती है।
+`where_` का अर्थ है "जहाँ शर्त सत्य हो वहाँ `self` रखो";
+`condition.select(&a, &b)` वही ऑप है जिसे mask की ओर से लिखा गया है।
+कंपाइल किया गया ग्राफ़ फिर किसी भी शर्त-मान को संभालता है, एक बाधा के साथ: दोनों
+शाखाओं को समान shapes और dtypes देने चाहिए। shape-polymorphic `If`
+इम्पोर्ट पर अस्वीकार किया जाता है।
 
-यह **एक बार ट्रेस करो, कई बार चलाओ** सक्षम करता है — कम्पाइल्ड ग्राफ़ रनटाइम पर किसी भी कंडीशन वैल्यू को हैंडल करता है। लेकिन इसकी एक कठोर बाधा है: **दोनों ब्रांचों को समान आउटपुट शेप और DType प्रोड्यूस करना चाहिए।** शेप-पॉलीमॉर्फ़िक ब्रांचों वाले मॉडल (जहाँ then-ब्रांच `[3, 4]` और else-ब्रांच `[5, 6]` प्रोड्यूस करती है) को ट्रेस नहीं किया जा सकता।
+### लागू नहीं किया गया
 
-व्यवहार में, `If` नोड वाले अधिकांश ONNX मॉडल इस बाधा को पूरा करते हैं क्योंकि वे कंडीशनल लॉजिक का उपयोग वैल्यू सिलेक्शन के लिए करते हैं, शेप-बदलने वाले कंट्रोल फ़्लो के लिए नहीं।
-
-### कोई Loop या Scan नहीं
-
-इटरेटिव कंट्रोल फ़्लो (`Loop`, `Scan`) इम्प्लीमेंट नहीं है। इन ऑपरेटरों को बार-बार ट्रेसिंग या अनरोलिंग की आवश्यकता होती है, जो सिंगल-ट्रेस आर्किटेक्चर से टकराता है। रिकरेंट पैटर्न उपयोग करने वाले मॉडल आमतौर पर अनरोल्ड ऑपरेटरों के ज़रिए काम करते हैं (LSTM, GRU, RNN नेटिव ops के रूप में इम्प्लीमेंट हैं)।
-
-### बैच एक्ज़ीक्यूशन
-
-कई tensor को एक साथ realize किया जा सकता है, जिससे आउटपुट के बीच कम्प्यूटेशन शेयर होता है
-(`tensor/src/test/unit/batch.rs` में टेस्ट किया गया):
-
-```rust
-// Realize all outputs at once (shares compilation and execution)
-let outputs: Vec<&Tensor> = model.outputs.values().collect();
-Tensor::realize_batch(outputs)?;
-```
-
-बार-बार इन्फ़रेंस के लिए, prepare/execute पैटर्न इस्तेमाल करें
-(`tensor/src/test/unit/variable.rs::test_prepare_execute_loop` में टेस्ट किया गया):
-
-```rust
-let OnnxModel { mut inputs, outputs, variables } =
-    importer.import("model.onnx", &[("batch", 1)])?;
-
-// 1. Assign initial data (lazy — no allocation yet)
-let input = inputs.remove("audio").unwrap();
-input.assign(&Tensor::from_slice(&first_frame));
-
-// 2. Compile the execution plan (resolves assigns, allocates buffers)
-let outs: Vec<&Tensor> = outputs.values().collect();
-let mut plan = Tensor::prepare_batch(outs)?;
-plan.execute()?;  // first run
-
-// 3. Fast loop: zero-copy writes via array_view_mut, no recompilation
-for frame in audio_frames {
-    input.array_view_mut::<f32>()?[..frame.len()].copy_from_slice(&frame);
-    plan.execute()?;
-}
-
-// Re-execute with different variable bindings
-let bound = variables["batch"].bind(8)?;
-plan.execute_with_vars(&[bound.as_var_val()])?;
-```
-
-### कोई ट्रेनिंग नहीं
-
-इम्पोर्टर केवल इन्फ़रेंस के लिए है। कोई बैकवर्ड पास, ग्रेडिएंट कम्प्यूटेशन, या ऑप्टिमाइज़र सपोर्ट नहीं है।
-
-### अनुपलब्ध ऑपरेटर श्रेणियाँ
+- `Loop` और `Scan`: पुनरावृत्त कंट्रोल फ़्लो को बार-बार trace करने या
+  unrolling की ज़रूरत है। `RNN`, `GRU` और `LSTM` इसके बजाय native ऑप हैं; उनकी `direction`
+  `W` के पहले आयाम से निकाली जाती है (`bidirectional` काम करता है, `reverse`
+  forward चलता है) और `activations` तथा `clip` attributes अनदेखे होते हैं।
+- ट्रेनिंग: कोई backward pass, gradients या optimizers नहीं।
 
 | श्रेणी | उदाहरण | कारण |
-|--------|--------|------|
-| क्वांटाइज़ेशन | DequantizeLinear, QuantizeLinear | IR में क्वांटाइज़्ड DType सपोर्ट आवश्यक |
-| सीक्वेंस ऑप्स | SequenceConstruct, SequenceAt | नॉन-tensor टाइप Svod के टाइप सिस्टम में नहीं हैं |
-| रैंडम | RandomNormal, RandomUniform | स्टेटफ़ुल RNG अभी तक इम्प्लीमेंट नहीं |
-| सिग्नल प्रोसेसिंग | DFT, STFT, MelWeightMatrix | इम्पोर्टर से जुड़ा नहीं है (tensor क्रेट में स्वयं `stft` / `istft` मौजूद हैं) |
-| टेक्स्ट | StringNormalizer, TfIdfVectorizer | स्ट्रिंग टाइप समर्थित नहीं |
-
-इन ऑपरेटरों वाले मॉडलों के लिए `ort` (ONNX Runtime रैपर) इस्तेमाल करें, जो पूरा स्पेक कवर करता है।
+|---|---|---|
+| डायनामिक quantization | `QuantizeLinear`, `DequantizeLinear`, `DynamicQuantizeLinear` (`QLinearConv`, `QLinearMatMul`, `ConvInteger` और `MatMulInteger` लागू हैं) | अभी port नहीं हुए |
+| Sequence ऑप | `SequenceConstruct`, `SequenceAt` | non-tensor टाइप टाइप सिस्टम से बाहर हैं |
+| Random | `RandomNormal`, `RandomUniform`, `Bernoulli` | ग्राफ़ में stateful RNG नहीं है |
+| सिग्नल प्रोसेसिंग | `DFT`, `STFT`, `MelWeightMatrix` | इम्पोर्टर से जुड़े नहीं हैं (टेंसर क्रेट में `stft` / `istft` / `mel_spectrogram` हैं) |
+| टेक्स्ट | `StringNormalizer`, `TfIdfVectorizer` | string टाइप नहीं है |
 
 ---
 
-## डीबगिंग
+## डिबगिंग
 
-### प्रति-नोड आउटपुट ट्रेसिंग
-
-मध्यवर्ती आउटपुट डंप करने के लिए ट्रेस लॉग लेवल सेट करें:
+**हर नोड का tracing।** `trace` स्तर पर इम्पोर्टर हर नोड के
+output को trace होते ही realize करता है और उसका shape और पहले पाँच मान लॉग करता है — गलत परिणाम देने वाले
+मॉडल के लिए एक संख्यात्मक bisection टूल। यह फ़्यूज़न तोड़ता है, इसलिए
+इसे केवल डिबगिंग के लिए उपयोग करें, और अपनी binary में `EnvFilter` के साथ एक
+`tracing-subscriber` इंस्टॉल करें:
 
 ```bash
 RUST_LOG=svod_onnx::importer=trace cargo run
 ```
 
-यह प्रत्येक नोड के आउटपुट को अलग-अलग realize करता है और पहले 5 मान प्रिंट करता है — जब कोई मॉडल गलत परिणाम देता है तो न्यूमेरिकल बाइसेक्शन के लिए उपयोगी है। ध्यान दें कि यह कर्नेल फ़्यूज़न को तोड़ता है (प्रत्येक नोड अलग से चलता है), इसलिए यह पूरी तरह से एक डीबगिंग टूल है।
+Tracing इम्पोर्ट कॉल के अंदर होता है, इसलिए असली इनपुट मान तभी दिखते हैं जब
+इनपुट `import_model_with_inputs` के ज़रिए दिए गए हों; placeholder इनपुट
+खाली बफ़र के रूप में trace होते हैं।
 
-### ग्राफ़ का निरीक्षण
-
-मॉडल को क्या चाहिए, यह जानने के लिए `OnnxModel` स्ट्रक्चर इस्तेमाल करें:
+**ग्राफ़ की जाँच।** `Tensor` का `Debug` shape, dtype, डिवाइस और
+realization स्थिति प्रिंट करता है, डेटा कभी नहीं:
 
 ```rust
 let model = importer.import("model.onnx", &[])?;
-
-println!("Inputs:");
 for (name, tensor) in &model.inputs {
-    // Tensor's Debug prints shape, dtype, device and whether it is realized
-    println!("  {name}: {tensor:?}");
+    println!("input {name}: {tensor:?}");
 }
-
-println!("Outputs: {:?}", model.outputs.keys().collect::<Vec<_>>());
-println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
+println!("outputs:   {:?}", model.outputs.keys().collect::<Vec<_>>());
+println!("variables: {:?}", model.variables);
 ```
+
+**कर्नेल का श्रेय।** इम्पोर्टर द्वारा बनाया गया हर कर्नेल अपने ONNX
+नोड को अपने origin के रूप में दर्ज करता है, इसलिए प्रोफ़ाइलर हर नोड का डिवाइस समय बताता है — देखें
+[कर्नेल origins](./architecture/kernel-origins)।
 
 ---
 
 ## सारांश
 
 | पहलू | विवरण |
-|------|-------|
-| **एंट्री पॉइंट** | `OnnxImporter::new()` |
-| **सरल इम्पोर्ट** | `importer.import("model.onnx", &[])?` |
-| **डायनामिक dims** | `importer.import(path, &[("batch", 4)])?` |
-| **ऑपरेटर** | 162 / 200 ([पूर्ण पैरिटी तालिका](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
-| **सत्यापित मॉडल** | ResNet50, DenseNet121, VGG19, Inception v1/v2, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
-| **बैकएंड** | CPU पर Clang + LLVM (समान परिणाम); `SVOD_DEVICE` से GPU चुनने पर AMD और CUDA |
-| **एक्सटेंशन** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |
-| **सीमाएँ** | कोई ट्रेनिंग नहीं, कोई Loop/Scan नहीं, शेप-पॉलीमॉर्फ़िक If |
+|---|---|
+| **प्रवेश बिंदु** | `import(path, dims)`, `import_model_with_inputs(proto, inputs, dims)`, `import_model(proto, dims)` |
+| **रनटाइम इनपुट** | टेंसर बनाएँ, उन्हें `import_model_with_inputs` को दें, रनों के बीच `array_view_mut` के ज़रिए लिखें |
+| **डायनामिक आयाम** | इम्पोर्ट पर बाँधें: `&[("batch", 8)]`; हर batch size के लिए एक इम्पोर्ट |
+| **ऑपरेटर** | 200 में से 162 ([पैरिटी तालिका](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
+| **अनुरूपता** | Clang और LLVM पर 1357 node टेस्ट; `SVOD_DEVICE` के ज़रिए AMD और CUDA |
+| **एक्सटेंशन** | com.microsoft `Attention`, `RotaryEmbedding`, `SkipLayerNormalization`, `EmbedLayerNormalization`, `BiasGelu`, `FastGelu` |
+| **सीमाएँ** | ट्रेनिंग नहीं, `Loop` / `Scan` नहीं, shape-polymorphic `If` नहीं, डायनामिक आयामों का रनटाइम पर फिर से बाँधना नहीं |
 
-**आगे:** [प्रैक्टिकल उदाहरण](./examples) — tensor बेसिक्स, या [एक्ज़ीक्यूशन पाइपलाइन](./architecture/pipeline) — कम्पाइलेशन कैसे काम करता है।
+**आगे:** इन मॉडलों के ग्राफ़ के लिए [टेंसर API](./examples), या
+native ports के लिए [मॉडल चलाना](./models)।

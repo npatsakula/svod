@@ -8,8 +8,8 @@
 //! `After([END(STORE)])` dependency — so a later read of the tile is ordered
 //! after the write (tinygrad's `dst.after(dst_store)`).
 //!
-//! The per-concern op bodies live in submodules — [`elementwise`], [`reduce`],
-//! [`shuffle`], [`mma`], [`movement`] — each a single `impl Group<'k>` block;
+//! The per-concern op bodies live in submodules — `elementwise`, `reduce`,
+//! `shuffle`, `mma`, `movement` — each a single `impl Group<'k>` block;
 //! this module holds the shared scaffolding (the [`Group`] struct, the public
 //! types, the i64-index helpers, and the low-level methods every concern calls).
 
@@ -37,7 +37,7 @@ mod shuffle;
 /// block offset (the old `idxs`); `frag` is the REG-side fragment offset (the old
 /// `dst_idxs` on load / `src_idxs` on store). `axis` is the global-tile row-stride
 /// split (ignored by the LOCAL↔REG hops). Owned `SmallVec` — constructed from any
-/// [`IntoIdxs`] (a tuple of `Into<Idx>` elements or a back-compat `&[Idx]`).
+/// [`IntoIdxs`](crate::IntoIdxs) (a tuple of `Into<Idx>` elements or a back-compat `&[Idx]`).
 #[derive(Clone, Default)]
 pub struct MoveIdx {
     pub block: SmallVec<[Idx; 4]>,

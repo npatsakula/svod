@@ -1,146 +1,82 @@
 ---
-sidebar_label: Phase 2 — Expander
+sidebar_label: Expander & reductions
 ---
 
-# Phase 2: Expander
+# Expander and Reduction Lowering (stages 08–11)
 
-**Goal**: Transform optimization primitives (UPCAST/UNROLL ranges) into explicit shaped operations.
+The first four post-optimization stages take the optimizer's output — a kernel whose `RANGE`s now carry `Upcast`/`Unroll`/`Global`/`Local`/`GroupReduce` axis types — and make the intent concrete: unrolled ranges become shaped constants, `REDUCE` becomes an accumulator loop, local `STAGE`s become local buffers. All of them run inside `apply_post_optimization_configured_with_capture` (`optimizer/mod.rs`).
 
----
+## 08 — post-opt symbolic
 
-## Stage 8: Post-Opt Symbolic
+`POST_OPT_SYM = sym() + pm_move_where_on_load() + pm_flatten_range() + pm_reduce_unparented()`, one top-down fixpoint. Source order matters: later groups consume what earlier ones produce.
 
-> **Stage at a Glance**
->
-> **Goal**: Symbolic simplification after optimization
-> **Key Patterns**: WHERE movement, constant folding
-> **Impact**: Enables better load combining and vectorization
+- `sym()` is the full tier-3 simplifier ([algebraic simplification](../optimizations/algebraic-simplification.md)).
+- `pm_move_where_on_load` (`symbolic/patterns.rs`) rewrites `WHERE(cond, INDEX(buf, idx), 0)` into `INDEX(buf, WHERE(cond', idx, Invalid))`. The condition is split on `AND`; a clause moves into the index only if all its ranges are in scope of the `INDEX` and it has no `INDEX` dependency of its own; the remaining clauses stay in an outer `WHERE`. The inverted form `WHERE(cond, 0, INDEX(..))` is handled with the negated condition. Validity now rides inside the index expression, where the devectorizer and `indexing_simplify` can see it; it becomes a LOAD/STORE `gate` only at `19e`.
+- `pm_flatten_range` rebuilds `END`/`REDUCE` range lists.
+- `pm_reduce_unparented` drops reduce ranges the body does not reference: `Add` multiplies by the extent, `Mul` raises to the extent, `Max` just drops the range (there is no `Min` arm; `Min` reductions are not matched).
 
-**What This Does**: Symbolic simplification after optimization, plus WHERE movement.
+## 09 — expander (`pre_expand`)
 
-**Why This Matters**: WHERE operations are like `if` statements. This stage moves `if` checks from around an indexed read into the index expression itself. Hardware can skip loading when the condition is false, saving memory bandwidth.
+`expander2() + pm_flatten_range() + mop_cleanup_patterns()` with a `RangeMap` context (`expand.rs`). `build_range_map` assigns every `Upcast`/`Unroll` `RANGE` a coordinate position in toposort order; the map's length is the rank of the shaped values this stage creates.
 
-**Pattern**: `sym + pm_move_where_on_load + pm_flatten_range + pm_reduce_unparented` (the `POST_OPT_SYM` matcher)
+Three rules, in source order:
+
+| Rule | Effect |
+|------|--------|
+| `Reduce { .. }` → `expand_reduce` | A loop-form `REDUCE` whose range list contains shaped non-`RANGE` entries turns those entries' axes (extent > 1) into leading *horizontal* axes: the source is permuted so they come first and `num_axes` counts them; the result is reshaped to keep size-1 placeholders. |
+| `Range { axis_type: Upcast \| Unroll }` → `expand_range` | The range becomes `RESHAPE(STACK(CONST(0), ..., CONST(end-1)), shape)` where `shape` is all 1s except the range's own coordinate. Every consumer of the range becomes shaped by broadcasting; nothing is duplicated yet. |
+| `Wmma { metadata.upcast_axes: Some(..) }` → `expand_wmma` | `contract_axis` moves the A/B upcast coordinates to the tail and flattens them into the fragment operands; `unroll_axis` restores the C coordinates on the output. The metadata's `upcast_axes` is cleared. |
+
+`mop_cleanup_patterns` (`devectorize.rs`) is Tinygrad's `mop_cleanup`: merge nested `RESHAPE`s, drop identity `RESHAPE`/`PERMUTE`, merge `PERMUTE` chains, collapse `STACK(INDEX(b,0), INDEX(b,1), ..)` back to `b`, fold `INDEX(STACK(..), const)` to the lane, and compose `INDEX(INDEX(b, i), j)` into `INDEX(b, i, j)` when the indices are scalar. No symbolic matcher runs here.
+
+For the worked example the reduce range `R2` (`Unroll`, extent 4) disappears and the index becomes shaped:
 
 ```text
-// Before: WHERE guards an indexed read
-WHERE(cond, INDEX(buf, idx), 0)
-
-// After: validity moved into INDEX
-INDEX(buf, WHERE(cond, idx, Invalid))
+[151] REDUCE(Add, num_axes=1, ranges=[118]) : Scalar(Float32) shape=[]
+├── [149] INDEX : Scalar(Float32) shape=[Const(4)]
+│   ├── [87] PARAM(slot=1) : Scalar(Float32) shape=[Const(512)]
+│   └── [148] Add : Scalar(WeakInt) shape=[Const(4)]
+│       ├── [147] Add : Scalar(WeakInt) shape=[Const(4)]
+│       │   ├── [119] Mul : Scalar(WeakInt) shape=[]          ← R0 * 4
+│       │   └── [146] STACK(len=4) : Scalar(WeakInt) shape=[Const(4)]
+│       └── [90] Mul : Scalar(WeakInt) shape=[]              ← R1 * 64
+└── [118] RANGE(R0, Reduce)
 ```
 
-Moving validity into INDEX enables better load combining and vectorization.
+`expand_reduce` has already turned the 4-wide lane axis into `num_axes=1`, so the reduction over the lanes is horizontal and the remaining loop is over `R0` only.
 
-**Note**: This pattern only matches when the alternative value is `0`; a second arm handles the inverted form `WHERE(cond, 0, INDEX(...))` with the negated condition. The transformation involves complex clause analysis: duplicate detection, range dependency checks, and data-dependent load verification.
+:::tip[STACK is the only vector op]
+A shaped value is a `STACK` of lanes (possibly nested, possibly behind a `RESHAPE`). `INDEX(STACK(..), c)` selects a lane with the same op that addresses a buffer. There is no vectorize/contract op pair, and `Upcast`/`Unroll` are `AxisType`s, not ops.
+:::
 
-**Note**: Svod keeps validity inside the index expression, as `WHERE(cond, idx, Invalid)`. It only becomes a `gate` field on LOAD/STORE much later, in `pm_move_gates_from_index` (`late/gater.rs`); INDEX itself has no gate field.
+## 10 — reduction lowering (`pm_reduce`)
 
-**Svod**: `pm_move_where_on_load()` in `symbolic/patterns.rs`
+`movement_cleanup_patterns() + pm_reduce_local()` with a `ReduceContext`. `movement_cleanup_patterns` is `mop_cleanup_patterns` plus two devectorizer-only rules (`RESHAPE(STACK([x]))` → `x` when shapes agree; a `RESHAPE` that only adds leading 1-dims → one `STACK([..])` wrapper per added dim).
 
----
+`pm_reduce_local` (`devectorize.rs`) composes, in order:
 
-## Stage 9: Expander
+1. **`pm_wmma_add`** — `WMMA(a, b, c) + add` → `WMMA(a, b, c + add)`, also through a `PERMUTE` and a `PERMUTE(RESHAPE(..))` wrapper that `expand_wmma` left on the output. `try_add` declines on a dtype mismatch instead of asserting.
+2. **`pm_group_for_reduce`** (`expand.rs`) — a `REDUCE` with `GroupReduce` ranges becomes: partial `REDUCE` over the other ranges → `STAGE` of the partial with the in-scope `Local` ranges plus the group ranges (`BufferizeOpts::local_for_axis`) → `INDEX` of that stage with the locals and fresh `Reduce` loops (`axis_id.group_reduce_loop()`) → final `REDUCE` over those loops.
+3. **`reduce_to_acc`** — a `REDUCE` with ranges. If `num_axes > 0` the lanes are first folded left-to-right in row-major order (`horizontal_reduce`). Then:
 
-> **Stage at a Glance**
->
-> **Goal**: Expand UPCAST and UNROLL ranges into shaped STACK coordinates
-> **Key Concepts**: range axis types, STACK, INDEX, pattern order
-> **Impact**: Makes vectorization explicit and ready for hardware
+   ```text
+   acc        = BUFFER(slot, AddrSpace::Reg)                       // placeholder_like(red)
+   acc_init   = STORE(AFTER(acc, input_ranges), identity)           // 0 for Add, 1 for Mul, dtype min/max for Max/Min
+   acc_loop   = AFTER(acc, [acc_init, reduce_ranges..])
+   body       = op(acc_loop, horizontal_inp)                        // Add/Mul/Max; float Min is -(max(-a, -b))
+   store_end  = END(STORE(acc, body), reduce_ranges)   tag=TAG_MERGEABLE
+   result     = AFTER(acc, [store_end])
+   ```
 
-**What This Does**: Transforms UPCAST/UNROLL range classifications into shaped coordinates.
+   `input_ranges` are the ranges in scope at the input that are neither reduced nor already ended, so the init lands inside the enclosing loops. There is no loop construct: the `END` closes the reduce ranges and the `AFTER` chain is the data dependency.
+4. **`expand_horizontal_reduce`** — a `REDUCE` with no ranges left is the lane fold alone.
+5. **END merging** — at the `SINK`, `merge_reduce_ends` groups the `TAG_MERGEABLE` `END`s by their reduce-range set and nesting context and replaces each group by `END(GROUP(computations), ranges)`; groups at a different nesting depth get cloned `RANGE`s with fresh axis ids so a range is closed by exactly one `END`.
+6. **`clean_up_group_sink`** — single-source `GROUP`s unwrap; `NOOP`/`STACK`/`SINK`/`GROUP` sources of a `SINK` or `GROUP` are flattened.
 
-**Why This Matters**: UPCAST and UNROLL mark intent—what we want to do. This stage makes that intent explicit so the hardware can actually do it.
+`Min` is lowered through `Max` on floats (`-(max(-a, -b))`) so NaN behaves as in a max reduce; on integers it is `WHERE(a < b, a, b)`.
 
-**Pattern**: `expander2 + pm_flatten_range + mop_cleanup_patterns` (the `pre_expand()` entry point)
+## 11 — local buffers
 
-Note: no symbolic matcher runs inside `pre_expand`. `sym` already ran at Stage 8, and `symbolic_simple` runs again at Stages 13 and 14.
+`pm_add_local_buffers = { Stage => add_local_buffer } + movement_op_patterns` (`optimizer/mod.rs`). Every `STAGE` that survived to this point is one `pm_group_for_reduce` just created (global ones became `STORE`s at the cut, and `bufferize_to_store` skipped `Local` ones on purpose). `add_local_buffer` allocates `UOp::placeholder(max_shape, dtype, slot, opts.addrspace)` — the slot is `LocalBufferContext::axis_slot` of the group axis, a deterministic hash for nested axis paths — and rewrites the stage into `AFTER(buffer, [END(STORE(INDEX(buffer, ranges), compute), ranges)])`. `movement_op_patterns` then pushes any movement op the new `INDEX` sits under into the index expression.
 
-⚠️ **Important: Pattern Precedence**
-
-The patterns are combined and run to fixpoint. The order affects which pattern is tried first when multiple could match:
-1. `expander2` first (expands UPCAST/UNROLL ranges, REDUCE and WMMA operands)
-2. `pm_flatten_range` second (rebuilds END range lists once ranges disappear)
-3. `mop_cleanup_patterns` last (cleans up the movement ops expansion leaves behind)
-
-Wrong precedence can cause incorrect vectorization or reduction scoping.
-
-Expanded lanes are collected with `STACK` and selected with `INDEX`. UPCAST and
-UNROLL are `AxisType`s on `RANGE`, not standalone operations. (`STACK` is Svod's
-name for what Tinygrad calls VECTORIZE; there is no VECTORIZE op.)
-
-**UPCAST / UNROLL range → shaped coordinate**:
-```mermaid
-flowchart TD
-  A["Before: RANGE(end=4, Upcast) marks vectorization intent"]
-  A -->|"expander2"| B["After: RESHAPE(STACK(0, 1, 2, 3), [4])"]
-```
-
-Upcast and unroll ranges take the same path—one rule matches both axis types. The
-RANGE node itself is replaced by a shaped constant coordinate, so every operation
-that consumed it simply becomes shaped. Per-lane operations are materialized
-later, by `devectorize_alu` at Stage 14.
-
-When we say "operations duplicated," it sounds like copy-paste. But that's not what happens. The compiler creates a single SIMD instruction that processes all N elements together. Think of a SIMD register as a box holding 4 numbers; adding two boxes adds all 8 numbers at once.
-
-**Expanded END interaction**:
-```mermaid
-flowchart TD
-  A["Before: END(STORE(...), [RANGE(Upcast)])"]
-  A -->|"expander2 + pm_flatten_range"| B["After: END(shaped STORE(...), [])"]
-```
-
-`pm_flatten_range` rebuilds an END's range list from the RANGE nodes still
-reachable through its sources. After expansion the upcast range is gone, so the
-list empties. The per-lane stores appear at Stage 14, wrapped in `GROUP`.
-
-**GROUP_REDUCE Handling** (`pm_group_for_reduce`):
-
-GROUP_REDUCE is a special axis type for tensor core reductions:
-
-```mermaid
-flowchart TD
-  A["Before: REDUCE with GROUP_REDUCE ranges. REDUCE(src, [range(GROUP_REDUCE)])"]
-  A -->|"pm_group_for_reduce"| B["After: Shared memory reduction pattern"]
-  B --> S1["1. Track upstream LOCAL ranges"]
-  B --> S2["2. STAGE the partial result with the group ranges (AddrSpace::Local)"]
-  B --> S3["3. INDEX into that buffer with the transformed ranges"]
-  B --> S4["4. Final REDUCE over derived loops (axis_id.group_reduce_loop(), AxisType::Reduce)"]
-```
-
-This enables efficient tensor core accumulation via shared memory. Although
-`pm_group_for_reduce` lives in `expand.rs`, it is composed into `pm_reduce_local`
-and therefore fires during reduction removal, not inside `pre_expand`.
-
-**Svod**: `expand.rs`
-
----
-
-## Stage 10: Add Local Buffers
-
-> **Stage at a Glance**
->
-> **Goal**: Prepare buffers for fast memory (shared / L1)
-> **Key Patterns**: Local buffer allocation, movement op pushdown
-> **Impact**: Frequently-accessed data stays in fast memory
-
-**What This Does**: Turns each staged intermediate into a real local buffer.
-
-**Why This Matters**: **Local buffers** = fast memory close to the compute unit:
-- GPU: Shared memory (LDS) — 100x faster than global memory
-- CPU: L1 cache — 10x faster than main memory
-
-The compiler moves frequently-accessed data to local buffers, similar to keeping important files on your desktop instead of a network drive.
-
-**Pattern**: `pm_add_local_buffers`
-
-| Transform | Purpose |
-|-----------|---------|
-| `add_local_buffer` | Allocate a local `placeholder` per STAGE node and rewrite it into INDEX / STORE / END / AFTER |
-| `movement_op_patterns` | Push movement ops down so the new buffer's indices stay simple |
-
-**Note on ordering**: reduction removal (Stage 11) actually runs *before* this
-stage—`add_local_buffer` consumes the STAGE nodes that reduce lowering produces.
-Tinygrad orders the two passes the same way.
-
-**Svod**: `optimizer/mod.rs`, `rangeify/patterns.rs`
+Tinygrad lowers reductions before adding local buffers for the same reason: the grouped-reduce stage does not exist until step 2 of `pm_reduce_local` has run.

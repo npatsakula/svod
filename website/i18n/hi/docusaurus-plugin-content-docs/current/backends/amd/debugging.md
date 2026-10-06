@@ -47,15 +47,17 @@ faulting `va`, failure flags (`NotPresent`, `ReadOnly`, `NoExecute`, `imprecise`
 | Tag | किसे cover करता है |
 |---|---|
 | `Vram` | General device VRAM — tensor data, code objects, EOP/ctx-save |
-| `Gtt` | GTT-pinned host-visible control memory |
-| `Kernarg` | Kernarg arenas — per-dispatch, graph, और linked-plan argument pages |
+| `Gtt` | Host-visible control memory — GTT, और graph / linked-plan IB तथा control buffers |
+| `Kernarg` | Kernarg arenas (host-visible VRAM) — per-dispatch, graph, और linked-plan argument pages |
 | `SignalPool` | GTT signal-slot pool |
 | `QueueRing` / `QueueGart` / `QueueInactive` | एक queue का ring, GART page, और queue-inactive signal |
 | `Staging` | GTT SDMA bounce buffer |
 | `Scratch` | Register-spill scratch — GPU-only VRAM, प्रति kernel realloc'd |
 
 जो भेद मायने रखता है वह है **scratch बनाम बाक़ी सब कुछ**: scratch एकमात्र shared, GPU-only,
-dynamically realloc'd-and-freed region है, और ऐतिहासिक `NotPresent` अपराधी।
+dynamically realloc'd-and-freed region है, और ऐतिहासिक `NotPresent` अपराधी। per-process KFD
+event page `alloc_raw` के बाहर allocate होता है और track नहीं किया जाता: वहाँ का fault unmapped
+के रूप में classify होता है।
 
 ### Classification
 
@@ -93,16 +95,17 @@ Unmapped: va is in NO tracked allocation; nearest live below: VRAM buffer
 classify किया जाता है, और एक enriched message बनाया जाता है:
 
 ```text
-AMD GPU memory fault on gpu_id=… va=0x… (NotPresent=1 ReadOnly=0 NoExecute=0
-Imprecise=0 ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
+AMD GPU memory fault on gpu_id=… va=0x… (NotPresent=true ReadOnly=false NoExecute=false
+Imprecise=false ErrorType=…) — va is at offset +0x40 within a LIVE scratch …
 ```
 
 इसे एक `fault_logged: AtomicBool` latch और एक `tracing::error!` के माध्यम से **एक बार** log
 किया जाता है। one-shot मायने रखता है: memory-fault event auto-reset नहीं होता, इसलिए बाद की
 poll-fault calls (`wait_events(0)`) वही fault फिर से observe करती हैं — हर बार log करना spam
 करता। फिर इसे एक typed `Error::GpuFault` के रूप में return किया जाता है, जिसका `Display` ऊपर
-वाली string ही है; poison latch हर बाद के entry point पर वही text एक `Error::Runtime` के रूप
-में फिर से throw करता है। (एक hardware-exception event, slot `[2]`, इसके बजाय
+वाली string ही है; poison latch उस text को record करता है और हर बाद के entry point पर उसे एक
+`Error::Runtime` (prefix `runtime error: ` के साथ) के रूप में फिर से throw करता है। बिना fault के
+expire होने वाला wait एक अलग `Error::TimelineTimeout` है। (एक hardware-exception event, slot `[2]`, इसके बजाय
 `reset_type`/`reset_cause`/`memory_lost` report करता है — उनके पास classify करने के लिए कोई
 faulting VA नहीं होती।)
 
@@ -118,10 +121,11 @@ point पर check होता है:
 - `poison(msg)` message को एक बार record करता है और flag सेट करता है;
 - `is_poisoned()` hot-path gate है;
 - `poison_error()` poisoned होने पर record किया गया `Error::Runtime` return करता है;
-- `poll_faults_nonblocking()` एक stalled signal wait से `wait_events(0)` जारी करता है, ताकि
-  असली error एक नंगी deadline के बजाय 30 s timeout से attach हो जाए। (spin-escalation path भी
-  एक fault पर जल्दी बाहर निकलता है, पर इस poll के बजाय एक छोटे *blocking* `wait_events` के
-  माध्यम से।)
+- `poll_faults_nonblocking()` तब `wait_events(0)` जारी करता है जब कोई signal wait अपनी deadline
+  (dispatch, copy और lane acquisition के लिए 30 s) तक पहुँच जाए, ताकि असली error एक नंगी
+  deadline के बजाय timeout से attach हो जाए। (spin-escalation path भी एक fault पर जल्दी बाहर
+  निकलता है, पर इस poll के बजाय एक छोटे *blocking* `wait_events` के माध्यम से।) `poison()`
+  lane pool पर parked हर thread को भी जगा देता है।
 
 एक बार poisoned हो जाने पर, device पर किसी भी lane के विरुद्ध हर `synchronize`/`execute`
 fail-fast होता है — GPU state और cached mappings अब भरोसेमंद नहीं रहते।

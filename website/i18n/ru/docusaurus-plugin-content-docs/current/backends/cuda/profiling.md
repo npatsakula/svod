@@ -16,7 +16,7 @@ CUDA-бэкенд кладёт в эти хендлы и какие уровни
 | **4 — аппаратные счётчики** | да | range-профайлер CUPTI (`libcupti.so.13`) |
 
 ```bash
-SVOD_DEVICE=CUDA:0 SVOD_PROFILE_ITERS=20 cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav
+SVOD_DEVICE=CUDA:0 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
 ```
 
 ---
@@ -61,7 +61,7 @@ end      = start + duration
 | `SGPR` | `sgprs` | `-` (у NVIDIA нет скалярного регистрового файла) |
 | `LDS` | `lds_bytes` | `CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES` (статический `.shared`) |
 | `scratch` | `scratch_bytes` | `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES` (`.local` на поток) |
-| `occ%` | `occupancy` | `cuOccupancyMaxActiveBlocksPerMultiprocessor(block) × block / максимум потоков на SM` |
+| `occ%` | `occupancy` | `cuOccupancyMaxActiveBlocksPerMultiprocessor(block) × block / максимум потоков на SM`, с ограничением сверху единицей |
 
 `wave_size` — это размер варпа устройства (32). Запросу занятости нужен размер
 блока: программа запоминает блок своего **последнего запуска** и до первого
@@ -89,7 +89,8 @@ host-API PerfWorks вложили в сам CUPTI, поэтому всю пос�
 отправляет новейший `struct_size` и отступает на один размер назад при
 `CUPTI_ERROR_INVALID_PARAMETER` — `cuptiProfilerGetCounterAvailability` (41,
 затем 40) и `cuptiProfilerHostInitialize` (56, затем 48), — а `abi_ladder`
-запоминает тот размер, который принял установленный CUPTI.
+запоминает первый размер, который установленный CUPTI не отверг как неверный
+параметр.
 
 `SVOD_PMC=1` выбирает набор по умолчанию для этого бэкенда:
 

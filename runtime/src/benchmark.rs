@@ -55,7 +55,7 @@ const WARM_FLOOR: Duration = Duration::from_millis(50);
 /// dispatch fails. `dispatch` returns one run's duration (`None` on failure).
 /// The time is checked one window of runs against the previous: once a window's
 /// minimum no longer beats the last by 5%, the clock is up. A device already
-/// under load plateaus in its first windows and pays only [`WARM_FLOOR`], so a
+/// under load plateaus in its first windows and pays only `WARM_FLOOR`, so a
 /// tuner touching many shapes does not spend the budget on each. A GPU idles at
 /// a fraction of its boost clock and takes about a second of load to lift it,
 /// so a kernel timed cold measures the clock, not the kernel; the CPU needs no

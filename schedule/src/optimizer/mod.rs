@@ -210,8 +210,8 @@ pub fn optimize_kernel(ast: Arc<svod_ir::UOp>, renderer: &Renderer) -> Result<Ar
 /// - devectorize: `symbolic_simple + devectorizer2 + indexing_simplify`
 /// - target-selected dtype decomposition
 ///
-/// NOTE: We do NOT apply FMA decomposition (a*b+c → MulAcc) — let LLVM's
-/// optimizer fuse MUL+ADD into FMA when beneficial.
+/// The late decompositions include FMA fusion (`a*b+c → MulAcc`) whenever the
+/// renderer supports `MulAcc` (see `get_late_rewrite_patterns`).
 ///
 /// # Arguments
 ///

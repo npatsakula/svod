@@ -271,7 +271,7 @@ impl Tensor {
     ///
     /// `mask` covers `self`'s *leading* axes — `[B, L]` against a `[B, L, D]`
     /// input — and is unsqueezed over the trailing ones. The denominator is
-    /// floored at [`MASKED_MEAN_EPS`], so an all-masked row yields `0` rather
+    /// floored at `MASKED_MEAN_EPS`, so an all-masked row yields `0` rather
     /// than `NaN`. Sums promote to the accumulator dtype (float32 for
     /// f16/bf16 inputs), which is also the result dtype.
     #[track_caller]

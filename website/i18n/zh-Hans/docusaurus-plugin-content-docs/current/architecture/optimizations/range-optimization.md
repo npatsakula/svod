@@ -1,232 +1,62 @@
 ---
-sidebar_label: Range 与 Reduce
+sidebar_label: Range 与归约
 ---
 
-# Range 与 Reduce 优化
+# Range 与归约优化
 
-循环结构是张量编译器优化的首要目标。对两个 `[1024, 1024]` 张量的逐元素加法，朴素实现生成一个遍历 1M 元素的循环。优化后变为 1024 个并行线程，每个处理 1024 个元素并使用向量化加载/存储。Range 优化就是达成这一目标的手段。
+这些规则决定哪些循环存在：拆分、合并和收窄 range，把归约折叠为闭式解，内联或物化中间结果。它们位于 `schedule/src/rangeify/{patterns,transforms,kernel}.rs`，在 rangeify 的 mega-pass、内核切分以及 `apply_pre_optimization` 中运行（顺序见 [Rangeify](../codegen/rangeify.md)）。Tinygrad：`schedule/rangeify.py`、`codegen/simplify.py`。
 
-这些模式位于 `schedule/src/rangeify/` 中，在[代码生成流水线](../codegen/overview.md)的阶段 1-5 运行。
+## Range 拆分（`pm_split_ranges`）
 
-Tinygrad 源码：`tinygrad/codegen/simplify.py`。
+满足 `end % c == 0` 的 `RANGE % c` 会标记该 range；在 `SINK` 处，每个被标记的 range 被替换为 `outer * c + inner`，其中 `outer = RANGE(end / c)`、`inner = RANGE(c)`，两者都保留原轴类型，轴 id 分别为 `axis.child(0)` / `axis.child(1)`（不分配全局 id）。`Warp` 和 `Device` range 从不拆分；图像 `STORE` 索引到的每个 range 都被固定，因为图像地址是坐标对，而不是扁平偏移。替换后的图用 `symbolic + pm_fold_cast_const` 化简，因此 `inner % c → inner` 和 `(outer*c + inner) // c → outer` 会立即触发。
 
----
+## Range 合并与收窄（`pm_simplify_ranges`）
 
-## Range 分割
+`simplify_merge_adjacent` 在每个至少有两个 range 的 `END` 和 `REDUCE` 上运行。对 `END` 它尝试相邻的对；对 `REDUCE` 则尝试每个有序对。当一对 `(r0, r1)` 轴类型相同、end 为常量、且出现在相同的 `REDUCE` 中（作用域一致）时，它们会被合并：合并后的 range `R(s0*s1)` 用 `R // s1` 替换 `r0`、用 `R % s1` 替换 `r1`，图用 `symbolic + pm_fold_cast_const + pm_flatten_range` 化简，并且只有当 `FloorDiv`/`FloorMod` 的数量没有增加时才保留合并（`count_divmod`，逐节点记忆化）。符号 end 从不合并：divmod 数量不会改变，而符号乘积会把常量轴对之后所有只接受常量的优化（upcast、unroll、locals、tensor core）隐藏起来。
 
-**功能**：通过 divmod 将单个范围分解为外层和内层组件。
+`mark_gated` 从每个 `INDEX` 收集每条有效性子句 `range < c` 为某个 range 证明的界限；只要某个 range 在任何地方有一处无 guard 的使用，就被固定为其自身的 end，并且 `REDUCE` 的 range 受保护。在 `SINK` 处，每个有界的 range 用已证明的最大界限重建，并化简结果。连同 `pm_flatten_range`（由经源可达的 `RANGE` 重新推导 range 列表，保留 `Bool`/`Void` 回边），这就是“化简 range”阶段的全部内容。
 
-**触发条件**：范围变量与取模一起使用：`RANGE(end) % c`，其中 `end % c == 0`。
+## Load collapse（`pm_load_collapse`）
 
-```mermaid
-flowchart TD
-  A["Before: RANGE(end=12) % 4 (one loop, modulo in body, slow)"]
-  A -->|"split: end/c outer, c inner"| B["After: RANGE(end=3) * 4 + RANGE(end=4)"]
-  B --> C["outer: RANGE(end=3) (Parallel)"]
-  B --> D["inner: RANGE(end=4) (Sequential / Vectorize)"]
-```
+`reduce_load_collapse(src, ranges)`，对每个 range：取该 range 作用域内的节点（遇到嵌套的 `REDUCE` 或 `STORE` 则放弃），把每个不是常量或 `PARAM` 的外部输入替换为携带其 `vmin`/`vmax` 的标量 `PARAM` 变量 `in{n}`（`UOp::variable`），把主体包进覆盖该 range 的合成 `REDUCE(Add)`，然后运行 `build_reduce_load_collapse_matcher`。若没有 `RANGE` 幸存，则把变量替换回去。该匹配器是 `pm_reduce_collapse` 加上 `.or_casted()` 形式以及 `NE` 提升。
 
-**原因**：分割后，内层范围可以向量化（UPCAST 到 SIMD 宽度），外层范围可以并行化（GPU 块、CPU 线程）。不分割的话，取模会阻止这两种优化。
+界限规则（`reduce_collapse_inner_patterns`，Tinygrad `simplify.py`）：
 
-**机制**：`pm_split_ranges` 模式匹配器收集带取模用法的范围但**不立即变换**。它等到看到 SINK 节点时再一次性执行所有替换（避免不一致的局部重写）。外层和内层范围在原有轴路径后分别追加 `0` 和 `1`，与 Tinygrad 一致，不分配全局范围 ID。
+| 归约主体（在 `r ∈ [0, N)` 上） | 闭式解 |
+|---------------------------------|-------------|
+| `WHERE(r < cut, 0, v)` | `clamp(N - cut, 0, N) * v` |
+| `WHERE(r < cut, v, 0)` | `clamp(cut, 0, N) * v` |
+| `WHERE(r >= lo & r < hi, v, 0)` | 双侧 clamp 乘以 `v` |
+| `WHERE(idx != r, 0, e)`、`WHERE(idx == r, e, 0)`（gather） | `WHERE(0 <= idx < N, e[r := idx], 0)` |
 
-**守卫**：仅当 `end % c == 0`（精确整除）时触发。不可整除的情况保持不变。
-
-Tinygrad：`simplify.py:60-64`。Svod：`rangeify/transforms.rs` 中的 `pm_split_ranges()`。
-
----
-
-## Range 合并
-
-**功能**：将两个相邻范围合并为一个，减少循环开销。
-
-```mermaid
-flowchart TD
-  A["Before: RANGE(0..4), RANGE(0..8) (two loops, 12 iterations overhead)"]
-  A -->|"merge: 4 * 8 = 32"| B["After: RANGE(0..32) (one loop, indices via divmod)"]
-```
-
-**原因**：循环开销（分支预测、计数器递增）是按迭代计算的。合并减少循环数量，代价是需要 divmod 操作来重建原始索引。
-
-**决策标准**：仅当 divmod 操作总数不增加时才接受合并。编译器统计合并前后的 divmod 操作数——如果合并引入的除法多于消除的循环开销，则拒绝合并。
-
-**约束条件**：
-- 两个范围必须具有兼容的轴类型（都是输出、都是规约等）
-- REDUCE 作用域必须保持一致
-- 两个范围必须出现在相同的 REDUCE 作用域中
-
-Tinygrad：`simplify.py:39-41`（`simplify_merge_adjacent`）。Svod：`pm_simplify_ranges()`。
-
----
-
-## Range 展平
-
-**功能**：将嵌套的 END/REDUCE/STORE 链展平为平坦的范围列表。
+（clamp 内部的 `min` 写作 `-max(-a, -b)`，以便 `Max` 界限规则能处理边界情况。）围绕它们的还有：`pm_reduce_unparented`；暴露界限的提升变换 —— `(x + y) < c → x < c - y` 和 `(x*y) < c → x < ceil(c/y)`，也能穿过 `CAST`，`>=` 和 `==` 同理，load-collapse 变体中还包括 `!=`；分配律 `sum(x + y) → sum(x) + sum(y)`；`x * bool.cast() → WHERE(bool, x, 0)`；对于“与 range 无关的 `PARAM` 子句 AND 一个 range 子句”这种条件，使用 `try_param_factor`。外层的 `pm_load_collapse` 还会在 `x` 含有 load 时撤销已提升的 `(x + y) < c`，使被加载的索引永不溢出。使用更窄匹配器（没有 `!=` 提升）的同一引擎是 `reduce_collapse`，由 mega-pass 中的 `pm_reduce_simplify` 用于 `num_axes == 0` 的 `REDUCE(Add)`。
 
 ```text
-Before:  END(END(END(comp, [r0]), [r1]), [r2])
-After:   END(comp, [r0, r1, r2])
+sum(1 for k in 0..64 if k >= length)   →   max(0, 64 - length)
 ```
 
-**原因**：嵌套 END 链产生于连续变换。展平将结构归一化，使其他模式（合并、分割）能在干净的范围列表上操作。
+## 未引用的归约与因子外提（`pm_reduce_simplify`）
 
-Tinygrad：`simplify.py:14-17`。Svod：`pm_flatten_range()`。
+`pm_reduce_unparented`：主体未引用的 reduce range 被移除 —— `Add` 把结果乘以 extent，`Mul` 把结果取 extent 次幂，`Max` 直接丢弃该 range；`Min` 不会被匹配。`reduce_mul_chain`：在 `REDUCE(a * b * .., Add | Max)` 中，不依赖任何 reduce range 的因子被移到外面（对 `Max` 只移出可证明非负的因子），仅限整数。两者也都在 `POST_OPT_SYM`（阶段 08）和 `sym` 层级中运行。
 
----
+## 缓冲区移除（`pm_remove_bufferize`）
 
-## 加载折叠
+`INDEX(STAGE(src, ranges, opts), indices)` 通过用消费者的索引替换 stage 的 range 来内联（`substitute_gated`；跳过 `CONST` range 和 `Invalid` 索引），除非：
 
-**功能**：当计算可以表达为闭合形式的算术时，完全消除 REDUCE 循环。
+1. `src` 是总是运行的算子（`CONTIGUOUS`、`COPY`、`NOOP`），或者该 stage 不可移除（`COPY` 的消费者、总是连续的源、多消费者的 realize 边界、自定义内核的输入）；
+2. 计算读取了三个以上不同的缓冲区（`AFTER` 缓冲区、全局 `STAGE`、`MSTACK`、`PARAM`/`BUFFER`），这会让内核的参数列表膨胀；
+3. 计算内部的某个 `REDUCE` 读取了缓冲区（`PARAM`、`BUFFER` 或 `STAGE`）—— 内联会在每次迭代中重新执行读取（`argmax(-x)` 会加载 `x` N 次而不是一次）。对不涉及任何缓冲区的值做归约仍然可以内联。
 
-```text
-Before:  sum(1 for k in 0..64 if k >= length)    // Loop: 64 iterations
-After:   clamp(64 - length, 0, 64)                // Arithmetic: 3 ops
-```
+替换之后有两条清理规则：`STORE(x, x)` → `NOOP`，`END(NOOP)` → `NOOP`。
 
-**工作原理**：
-1. 识别独立于 REDUCE 范围的子表达式
-2. 为这些子表达式创建 `DEFINE_VAR`（视为循环不变量）
-3. 用 `DEFINE_VAR` 替换范围并运行符号化简
-4. 如果化简后的表达式没有剩余范围，则 REDUCE 被消除
+`buffer_folding`：`STAGE(CONST)`、`INDEX(CONST)`、`COPY(CONST)` 和 `INDEX(MSTACK(CONST, ..))` 折叠为该常量；range 相同的 `INDEX(STAGE(compute, ranges), ranges)` 即为收缩到 stage 形状的 `compute`，并合并标签。
 
-这是最强大的单项优化——它可以消除整个规约循环，将 O(N) 计算转换为 O(1)。
+`dead_axis_removal`：可移除的 `STAGE`（不位于 `AFTER` 或总是运行的算子之上，没有符号 end）丢弃为 `CONST` 或计算中未使用的 range，然后用 `RESHAPE` 补回大小为 1 的维度，再 `EXPAND` 到原始形状。一个 stage 可以最终没有任何 range；但它必须仍然存在，否则切分时不会产生 `STORE`。
 
-Tinygrad：`simplify.py:145-149`。Svod：`pm_load_collapse()`。
+## 两阶段归约（`split_reduceop`）
 
----
+在最早期重写中，输入/输出比达到 `SplitReduceOpConfig::split_threshold`（32768）的张量形式 `REDUCE` 会被拆分：若某个被归约维度没有被广播（`detect_expanded_dimensions`），且能被 `[8, 256]` 中的某个因子整除（从最大的开始），并使中间输出保持在 `2^22` 个元素以下，则它被 reshape 为 `[.., divisor, rest, ..]`，在原始轴上归约，用 `CONTIGUOUS` 物化，再在 divisor 轴上归约一次。第一阶段于是有 `divisor` 个输出可供并行；第二阶段很小。
 
-## Reduce 折叠
+## 分组归约
 
-ADD 规约的解析消除。比加载折叠更精细——在规约体内应用代数变换。
-
-### 边界模式
-
-处理比较限制哪些迭代参与的门控规约：
-
-| 模式 | 之前 | 之后 |
-|---------|--------|-------|
-| 下界 | `sum(r < cut ? 0 : val, r=0..N)` | `max(0, N - cut) * val` |
-| 上界 | `sum(r < cut ? val : 0, r=0..N)` | `max(0, min(N, cut)) * val` |
-| 双侧 | `sum(r >= lo & r < hi ? val : 0, r=0..N)` | `max(0, min(N,hi) - max(0,lo)) * val` |
-| NE 门控（聚集） | `sum(idx != r ? 0 : expr, r=0..N)` | `in_bounds ? expr[r:=idx] : 0` |
-
-NE 门控模式对聚集操作特别重要——它识别出对所有 `idx == r` 的索引求和等价于单次索引访问。
-
-### 提升变换
-
-将比较移到规约作用域外以暴露边界模式：
-
-| 变换 | 之前 | 之后 |
-|-----------|--------|-------|
-| Lt 提升 | `(x + y) < c` | `x < (c - y)` |
-| Ge 提升 | `(x + y) >= c` | `x >= (c - y)` |
-| EQ 提升 | `(x + y) == c` | `x == (c - y)` |
-
-### 分配律
-
-`sum(x + y)` -> `sum(x) + sum(y)`——将规约在加法上拆分。这使得每一半都能被边界模式独立折叠。
-
-### MUL-casted-bool
-
-`x * bool.cast()` -> `WHERE(bool, x, 0)`——将布尔 cast 的乘法转换为 WHERE，然后可以被边界模式分析。
-
-Tinygrad：`simplify.py:82-142`。Svod：`pm_reduce_simplify()` + `reduce_collapse_inner_patterns()`。
-
----
-
-## 缓冲区移除（部分连续）
-
-**功能**：通过把被缓冲的范围替换为读取方索引所用的范围，决定是否将中间结果物化到缓冲区还是内联计算。
-
-当 rangeify pass 创建 `STAGE` 节点（标记"这需要一个缓冲区"）时，缓冲区移除 pass 评估实际分配内存是否值得。`STAGE` 是 Svod 在"这需要一个缓冲区"和最终 `STORE`+`BUFFER`+`AFTER` 之间的中间表示——它让这个 pass 决定物化是否真正必要。如果计算足够廉价，它替换范围变量并直接内联表达式。
-
-### 决策树
-
-```mermaid
-flowchart TD
-  Q1["Always-run op (CONTIGUOUS, COPY), or a non-removable STAGE?"]
-  Q1 -->|"YES"| K1["Keep buffer (always materialized)"]
-  Q1 -->|"NO"| Q2["More than 3 distinct buffers accessed?"]
-  Q2 -->|"YES"| K2["Keep buffer"]
-  Q2 -->|"NO"| Q3["Does a REDUCE in the body read a buffer?"]
-  Q3 -->|"YES"| K3["Keep buffer (reduce recomputation too expensive)"]
-  Q3 -->|"NO"| I1["Inline: substitute the STAGE ranges with the INDEX ranges"]
-```
-
-:::caution[规约内部的缓冲区读取]
-这条规约守卫看的不是操作有多廉价——只要函数体中任何 REDUCE 读取了缓冲区（`Param`、`Buffer` 或 `Stage`），它就会触发。原因：如果 `argmax(-x)` 内联取反，`-x` 会在每次规约迭代中被重新计算——N 次额外的读取和取反，而不是一次缓冲区读取。若规约所涉及的值不接触任何缓冲区，它仍然可以被内联。
-:::
-
-### 相关模式
-
-| 模式 | 说明 |
-|---------|------|
-| STAGE 折叠 | `STAGE(CONST)` -> `CONST`——常量的 stage 就是常量本身 |
-| 索引折叠 | `INDEX(CONST)` -> `CONST`——索引常量就是常量 |
-| COPY 折叠 | `COPY(CONST)` -> `CONST`——常量的拷贝就是常量本身 |
-| MSTACK 折叠 | `INDEX(MSTACK([CONST, ...]))` -> `CONST`——常量的多设备堆叠 |
-| 恒等折叠 | `INDEX(STAGE(compute, ranges), ranges)` -> `compute`——相同范围消去 |
-
-Svod：`rangeify/patterns.rs` 中的 `pm_remove_bufferize()` 和 `buffer_folding()`。
-
----
-
-## 死轴移除
-
-**功能**：从 STAGE 操作中移除未使用的维度。
-
-维度为"死"的条件：
-- 大小为 1（不贡献任何东西）
-- 在索引中以常量出现（不是变量）
-- 计算表达式不引用它
-
-死轴从 STAGE 中移除，然后通过 RESHAPE（插入大小为 1 的维度）和 EXPAND（广播到原始大小）恢复形状。这减少了缓冲区分配的维度数。
-
-:::caution[标量情况]
-即使所有范围都为死（标量输出），STAGE 也必须以空范围保留——完全移除会导致 `NoKernelsFound`，因为内核分割期间不会创建 STORE。
-:::
-
-Svod：`rangeify/patterns.rs` 中的 `dead_axis_removal()`。
-
----
-
-## Reduce 去父化
-
-**功能**：从 REDUCE 中移除未被规约体引用的范围。
-
-| 规约操作 | 未引用的大小为 N 的范围 | 变换 |
-|-----------|------|-----------|
-| ADD | 范围未在体内使用 | 结果乘以 N |
-| MUL | 范围未在体内使用 | 结果取 N 次幂 |
-| MAX / MIN | 范围未在体内使用 | 直接移除范围 |
-
-示例：`sum(x, r=0..N)`，其中 `x` 不依赖于 `r` -> `x * N`。常量在 N 次迭代上的和是 N 乘以该常量。
-
-Tinygrad：`simplify.py:82-86`。Svod：`pm_reduce_simplify()`。
-
----
-
-## Split ReduceOp
-
-**功能**：将大规约拆分为两阶段以获得更好的并行性。
-
-**触发条件**：输入/输出比超过 32768。
-
-```text
-Before:  REDUCE(data, axes=[0])       // shape [65536] → scalar
-After:   REDUCE(                       // shape [256] → scalar (second stage)
-           CONTIGUOUS(
-             REDUCE(                   // shape [65536] → [256] (first stage)
-               RESHAPE(data, [256, 256]),
-               axes=[1]
-             )
-           ),
-           axes=[0]
-         )
-```
-
-**原因**：单个大规约无法并行化。拆分为两阶段允许第一阶段并行运行（256 个线程各规约 256 个元素），然后第二阶段规约 256 个部分结果。
-
-**守卫**：仅当规约维度可因式分解且输入/输出比超过阈值时应用。不可因式分解的维度被跳过。
-
-Svod：`rangeify/kernel.rs` 中的 `split_reduceop()`。
+这不是 rangeify 规则，但属于同一家族：`GROUP`/`GROUPTOP` 优化把 `Reduce` 轴的一部分变成 `GroupReduce`，`pm_group_for_reduce`（阶段 10）将其降级为一个暂存在 local 内存中的部分 `REDUCE`，再用新的 `Reduce` 循环（`axis_id.group_reduce_loop()`）读回并再次归约。参见 [Expander 页面](../codegen/expander.md)。

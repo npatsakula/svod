@@ -1,5 +1,5 @@
 //! `clang --target=nvptx64-nvidia-cuda` driver: lowers NVPTX LLVM text-IR to
-//! PTX text, which [`Ptxas`] assembles to a cubin when the CUDA toolkit is
+//! PTX text, which `Ptxas` assembles to a cubin when the CUDA toolkit is
 //! installed and the driver JITs otherwise.
 
 use std::path::{Path, PathBuf};

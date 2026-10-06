@@ -85,7 +85,7 @@ impl<'k> Group<'k> {
 
     /// Stage one tile of `src` (GLOBAL) into a fresh per-lane register buffer —
     /// the GLOBAL→VGPR half of the register prefetch. Uses the *same*
-    /// coalesced per-lane addressing as [`Self::load_global_to_local`], but lands
+    /// coalesced per-lane addressing as `load_global_to_local`, but lands
     /// the loaded (unswizzled) values in a flat `[total_calls, ept]` DEFINE_REG
     /// instead of LDS, so the load can be issued ahead of the consuming MFMAs.
     /// Commit it with [`Self::commit_reg_to_local`] (same `st`/`idxs`/`axis`).
@@ -184,7 +184,7 @@ impl<'k> Group<'k> {
     /// hand its store to that fence instead of an ordering edge. Recomputes the
     /// fill's per-lane addressing, unrolled over the passes (constant register
     /// indices), each lane's run as `ept / group` swizzle-safe vector stores
-    /// ([`lds_group`]).
+    /// (`lds_group`).
     pub fn commit_regs_to_local(&self, commits: &[(&ST, &Arc<UOp>)]) -> Arc<UOp> {
         let mut stores = Vec::new();
         for (st, stage) in commits {
@@ -491,7 +491,7 @@ impl<'k> Group<'k> {
         cp_async_commit(copies)
     }
 
-    /// Stackd GLOBAL→LOCAL fill: the [`Self::load_global_to_local`]
+    /// Stackd GLOBAL→LOCAL fill: the `load_global_to_local`
     /// counterpart that issues **128-bit** (`vec8` bf16) coalesced global loads
     /// (one `global_load_dwordx4`/lane) and commits each into the XOR-swizzled
     /// LDS as `vec8/sw` contiguous `vec_sw` stores. The swizzle's XOR delta is

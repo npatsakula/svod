@@ -174,7 +174,8 @@ pub(crate) fn disabled_by_env() -> bool {
 
 impl LlvmLibrary {
     /// Load the first usable candidate: `override_path` alone when given,
-    /// otherwise the loader search path, then `llvm-config --libdir`.
+    /// otherwise `llvm-config --libdir`, then the loader search path (plus
+    /// Homebrew prefixes on macOS).
     pub(crate) fn discover(override_path: Option<OsString>) -> Result<Self> {
         let candidates = match override_path {
             Some(path) => vec![PathBuf::from(path)],

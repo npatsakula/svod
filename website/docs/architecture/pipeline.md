@@ -6,264 +6,297 @@ sidebar_label: Execution Pipeline
 
 In most ML frameworks, computation happens immediately. Write `a + b` in PyTorch and it runs *now*—the GPU crunches numbers before you can even inspect the result. This eager execution is simple to understand, but it leaves optimization opportunities on the table. How can a compiler optimize a computation it hasn't seen yet?
 
-Svod takes the opposite approach: **lazy evaluation**. When you write `a.try_add(&b)?`, nothing computes. Svod builds a graph describing *what* to compute, not *when*. The magic happens when you call `realize()`—that single method triggers the entire compilation pipeline, from high-level tensor operations down to JIT-compiled machine code.
+Svod takes the opposite approach: **lazy evaluation**. When you write `a.try_add(&b)?`, nothing computes. Svod builds a graph describing *what* to compute, not *when*. The work happens when you call `realize()`—that single method triggers the entire compilation pipeline, from high-level tensor operations down to JIT-compiled machine code.
 
-This chapter traces that journey.
+This chapter traces that journey. The [IR design](./ir-design.md) page explains the node type every stage shares; the [codegen chapters](./codegen/overview.md) go pass by pass through the per-kernel optimizer; this page is the map between them.
 
 ```mermaid
 flowchart TD
-  Start["tensor.realize()"] --> LG["LAZY GRAPH: Tensor ops build UOp DAG (no computation yet)"]
-  LG --> RG["RANGEIFY: Movement ops to explicit RANGE loops"]
-  RG --> KS["KERNEL SPLITTING: Split at STORE boundaries to multiple KERNELs"]
-  KS --> OC["OPTIMIZATION and CODEGEN: Heuristics/beam to LLVM IR to JIT compile"]
-  OC --> EX["EXECUTION: Parallel kernel launch to result buffer"]
+  Start["tensor.realize()"] --> LG["LAZY GRAPH: tensor ops build a UOp DAG (no computation yet)"]
+  LG --> SC["SCHEDULE (cached by graph shape): rangeify, kernel cut, pre-schedule"]
+  SC --> IN["INSTANTIATE: bind real buffers and symbolic values to the cached schedule"]
+  IN --> PL["PREPARE PLAN: memory planner, per-kernel optimize + render + compile (cached)"]
+  PL --> EX["EXECUTE: graph replay, or level-ordered dispatch on the plan's queue"]
 ```
-
-Each box is a distinct phase. Let's walk through them.
 
 ---
 
 ## Lazy Evaluation: Building the Graph
 
-A `Tensor` in Svod is surprisingly lightweight:
+A `Tensor` in Svod is a handle:
 
 ```rust
 pub struct Tensor {
-    entry: Arc<TensorEntry>,  // Computation graph + its realized buffer
+    entry: Arc<TensorEntry>,
+}
+
+pub struct TensorEntry {
+    pub id: u64,
+    pub uop: RwLock<Arc<UOp>>,     // the computation this tensor represents
+    buffer: OnceLock<Arc<Buffer>>, // filled by realization
 }
 ```
 
-The `entry` holds a `TensorEntry` containing the UOp graph—the computation this tensor represents—and the `OnceLock` buffer that realization fills in. A lazy tensor has no buffer yet; a realized one does, and because the buffer lives in the shared entry rather than in the handle, cloning a tensor shares its realization. That is why `realize()`, `prepare()` and `profile()` take `&self`.
+The UOp sits behind an `RwLock` so the graph can be swapped in place (see the registry below), and the buffer lives in the shared entry rather than in the handle, so cloning a tensor shares its realization. That is why `realize()`, `prepare()` and `profile()` take `&self`.
 
 ### Three Ways to Create Tensors
 
-**1. Input tensors** — buffer allocated immediately:
+**1. Input tensors** — buffer allocated and filled immediately:
 
 ```rust
 let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-// `a.buffer` = Some(Arc<Buffer>) with actual data
+// a.buffer() is Some(..): device memory allocated, bytes copied in
 ```
 
-When you create a tensor from data, Svod allocates device memory and copies your bytes. The UOp graph contains a `BUFFER` node pointing to this allocation.
+`from_slice` (and `from_ndarray`, which copies once for C-contiguous input) allocates a device `Buffer`, copies your bytes with `copyin`, and builds the graph `BUFFER.reshape(shape)`. There is no deferred host copy.
 
 **2. Lazy operations** — no buffer, only graph:
 
 ```rust
-let b = a.try_add(&a)?;   // b.buffer = None
-let c = b.try_mul(&a)?;   // c.buffer = None
+let b = a.try_add(&a)?;   // b.buffer() is None
+let c = b.try_mul(&a)?;   // c.buffer() is None
 ```
 
 Arithmetic operations don't compute anything. They build a UOp graph: `Binary(Add, a.uop, a.uop)`. The tensor exists purely as a description of future work.
 
-**3. Movement operations** — shares the original buffer:
+**3. Movement operations** — views over the original storage:
 
 ```rust
-let d = a.try_reshape(&[1, 3])?;  // d.buffer = same as a.buffer
+let d = a.try_reshape(&[1, 3])?;  // d.buffer() resolves to a's storage
 ```
 
-Reshape, permute, and similar operations create new *views* of existing data. The buffer is shared; only the UOp graph changes to describe the new indexing.
+Reshape, permute, and similar operations create a new lazy entry whose graph is `RESHAPE(a.uop)`. The entry owns no buffer; `buffer()` walks to the base `BUFFER` node and finds `a`'s storage through the registry.
 
 ### The Global Registry
 
-Svod maintains two global maps (lock-free, thread-safe):
+`tensor/src/tensor_registry.rs` keeps two lock-free `papaya` maps:
 
 | Map | Key → Value | Purpose |
 |-----|-------------|---------|
-| `TENSORS` | tensor_id → `Weak<TensorEntry>` | Track all tensors for graph substitution |
-| `BUFFERS` | uop_id → `Arc<Buffer>` | Find buffers during scheduling |
+| `TENSORS` | tensor id → `Weak<TensorEntry>` | Every live tensor, for graph substitution |
+| `BUFFERS` | `BUFFER` UOp id → `Arc<Buffer>` | Find device storage during scheduling and `buffer()` lookups |
 
-This registry enables a critical feature: **global graph substitution**. When an optimization transforms a UOp, all tensors referencing that UOp automatically see the updated version. No stale references, no manual updates.
+This registry enables **global graph substitution**: when `realize()` finishes, the realized subgraph is replaced by its `BUFFER` in every tensor that referenced it (`apply_map_to_tensors_realized`), so a later `realize()` on a dependent tensor reads the result instead of recomputing it. `BUFFERS` entries expire through a UOp drop hook when the `BUFFER` node itself is dropped.
 
 ### Hash Consing in Action
 
-Because UOps use hash consing (content-based deduplication), identical computations share memory:
+Because UOps are hash-consed (content-based interning), identical computations share memory:
 
 ```rust
 let x = a.try_add(&b)?;
 let y = a.try_add(&b)?;
-// x.uop() and y.uop() point to the SAME Arc<UOp>
+// x.uop() and y.uop() are the SAME Arc<UOp>
 ```
 
-This matters for caching: when we compile kernels, we cache by UOp ID. Hash consing means identical computations automatically hit the cache, even if constructed separately.
+This is what makes the caches below cheap: two tensors with the same shape of computation reach the scheduler as the same node, and every cache key is a structural `content_hash` of the graph, so even graphs built separately (or in another process run) hit.
 
 ---
 
-## Rangeify: Making Loops Explicit
+## What `realize()` Does
 
-When you write `tensor.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)`, those movement operations (reshape, expand) are high-level descriptions. To generate actual loops, we need explicit iteration structure.
+`Tensor::realize` (`tensor/src/realize.rs`) is short:
 
-**Rangeify** transforms movement operations into `RANGE` loops and `INDEX` arithmetic. The entry point is `rangeify()` in `schedule/src/rangeify/transforms.rs`.
+```rust
+pub fn realize(&self) -> Result<()> {
+    if self.uop().has_buffer_identity() { self.ensure_buffer(); return Ok(()); }
+    if is_any_const(&self.uop()) { self.set_uop(self.uop().contiguous()); }  // force a buffer
+    if self.has_zero_elements() { return Ok(()); }
 
-### The Rangeify Pipeline
+    let old_uop = self.uop();
+    let plan = self.prepare_plan_with(&PrepareConfig::from_env())?;  // schedule + compile
+    plan.execute()?;
+    self.finalize_realize(&plan, &old_uop)?;      // tensor ← BUFFER.reshape(shape)
+    apply_map_to_tensors_realized(&{old_uop => realized_uop});
+    Ok(())
+}
+```
 
-Rangeify isn't a single transformation—it's a multi-stage pipeline:
+`prepare_plan_with` wraps the graph as `SINK(CONTIGUOUS(uop))` and runs two steps: `schedule_result_from_sink_with_cache` (next section) and `prepare_execution_plan` (the section after). `prepare()` runs the same two steps and hands you the `ExecutionPlan` to execute yourself; `realize_batch` / `prepare_batch` do it for several tensors through one `SINK(CONTIGUOUS(t1), …, CONTIGUOUS(tN))`, so kernels that feed more than one output are shared. `PrepareConfig::from_env()` reads the optimizer strategy, thread budget and memory-planner mode from the environment (table at the end); `realize_with` / `prepare_with` take an explicit config.
 
-| Stage | Purpose |
-|-------|---------|
-| **0. Range Assignment** | Create RANGE UOps for each tensor dimension |
-| **1. Early Movement Ops** | Clean up movement operations before range assignment |
-| **2. Load Collapse** | Eliminate REDUCE operations via range-independent detection |
-| **3. Split Ranges** | Split ranges with modulo, flatten ranges |
-| **4. Initial Symbolic** | Algebraic simplification, constant folding |
-| **5. Simplify Ranges** | Merge adjacent ranges with cost analysis |
-| **6. Split Store** | Split graph at STORE boundaries |
-| **7. Apply Opts** | Optimization search (beam or heuristic) |
-| **Mega-pass** | Symbolic + reduce + buffer folding + buffer removal + reduction simplification |
+---
 
-The mega-pass combines multiple symbolic and structural optimizations into a single fixpoint loop. Per-kernel passes then run in `apply_pre_optimization()`.
+## Scheduling: From Graph to Kernels
 
-Each pass uses pattern-based rewriting (see the [Pattern Engine](./optimizations/pattern-system) chapter). Patterns fire until no more match, then the next pass begins.
+### The schedule cache
 
-### Before and After
+Scheduling (rangeify plus the kernel cut) is the most expensive compile step and depends only on the *shape* of the graph, not on which buffers it reads. `schedule_result_from_sink_with_cache` therefore first **normalizes** the sink — every `BUFFER` becomes a positional `PARAM`, every `BIND(DEFINE_VAR, CONST)` loses its runtime value — and looks the result up in a process-wide cache keyed by `(content_hash(normalized sink), compiler identity)`. Hits skip straight to instantiation; misses run rangeify once per key even when several threads race (single-flight). `SVOD_DISABLE_SCHEDULE_CACHE=1` turns it off.
 
-Consider this tensor expression:
+A cache miss runs, in order: `rangeify_with_map` → `try_get_kernel_graph` → `wrap_scan_loops` (schedule-level loops for scan ops) → `create_pre_schedule`.
+
+### Rangeify: Making Loops Explicit
+
+When you write `tensor.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)`, those movement operations are high-level descriptions. To generate loops, iteration has to be explicit. **Rangeify** (`rangeify_with_map`, `schedule/src/rangeify/transforms.rs`) turns movement ops into `RANGE` loops and `INDEX` arithmetic:
+
+| Step | Code | Purpose |
+|------|------|---------|
+| Multi-device | `multi_pm()`, `lower_allreduce_pm()` | Resolve sharding of multi-device tensors, lower `ALLREDUCE` |
+| Tags | `add_tags_patterns()` | Number every node so tensor identity survives the rewrites |
+| Calls | `resolve_calls()` | Inline non-precompiled `FUNCTION`s, fold `GETTUPLE(TUPLE)` |
+| Early rewrites | `movement_op_patterns() + early_rewrites() + split_reduceop_patterns()` | Clean up movement ops; split large reductions in two stages |
+| Range assignment | `indexing::run_rangeify` | Decide what materializes (`pm_generate_realize_map`), assign a `RANGE` per output axis, then lower `REDUCE_AXIS` → `REDUCE`, `PAD` → `WHERE`, `STACK` → `WHERE`, and insert `STAGE` + `INDEX` where values materialize |
+| Mega-pass | `symbolic() + pm_reduce_simplify() + movement_op_patterns() + buffer_folding() + dead_axis_removal() + pm_remove_bufferize()` | One fixpoint loop: algebra, reduction simplification, buffer folding, dead-axis removal, removal of `STAGE`s that can be fused |
+| Outputs | rebuild `SINK` | Keep only the public outputs |
+| Buffer limit | `buffer_limit_patterns(limit)` | Split kernels that would exceed the device's argument limit |
+
+Every step is pattern-based rewriting (see the [Pattern Engine](./optimizations/pattern-system.md)). The per-kernel passes the [Rangeify chapter](./codegen/rangeify.md) describes as stages 1–7 (early movement ops, load collapse, split ranges, initial symbolic, simplify ranges) run later, in `apply_pre_optimization()`, once the graph is cut into kernels.
+
+Each movement op lowers to a specific index transformation (`apply_movement_op`, `schedule/src/rangeify/indexing.rs`):
+
+| Operation | Transformation |
+|-----------|----------------|
+| **RESHAPE** | Flatten by output strides, split back with `/` and `%` by input shape |
+| **PERMUTE** | Reorder the ranges by the inverse permutation |
+| **EXPAND** | Index of an expanded axis becomes `0` (the range no longer affects the address) |
+| **PAD** | Index becomes `WHERE(valid, rng - begin, INVALID)`; the padded value is `WHERE(valid, src, 0)` |
+| **SHRINK** | `rng + begin` |
+| **FLIP** | `(size - 1) - rng` |
+
+After rangeify, there are no movement ops—just arithmetic on indices. Before and after, for the expression above:
 
 ```text
 Before: BUFFER.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)
 ```
 
-After rangeify, movement ops become explicit index computations:
-
 ```mermaid
 flowchart TD
-  STORE["STORE"] --> IDX["INDEX(RANGE(0..2), RANGE(0..3)) -- index (src[0])"]
-  STORE --> RED["REDUCE(Add) -- value (src[1])"]
-  STORE --> R2["RANGE(0..2, Global) -- output dim 0"]
-  STORE --> R3["RANGE(0..3, Global) -- output dim 1"]
+  STAGE["STAGE"] --> RED["REDUCE(Add) -- value"]
+  STAGE --> R2["RANGE(0..2, Weak) -- output dim 0"]
+  STAGE --> R3["RANGE(0..3, Weak) -- output dim 1"]
   RED --> LOAD["LOAD"]
   RED --> RR["RANGE(0..4, Reduce)"]
-  LOAD --> LIDX["INDEX(RANGE(0..4), RANGE(0..2), RANGE(0..3))"]
+  LOAD --> LIDX["INDEX(BUFFER, R2 * 3 + R3)"]
 ```
 
-The `EXPAND` became a `RANGE(0..4)` that doesn't affect the buffer index—broadcasting. The `RESHAPE` became different index arithmetic. The `SUM` became `REDUCE(Add)` with the first range marked as `Reduce` type.
+The `EXPAND` became a `RANGE(0..4)` that does not appear in the buffer index—broadcasting. The `RESHAPE` became index arithmetic. The `SUM` became `REDUCE(Add)` closing a `Reduce` range. Output ranges are `Weak` here: the optimizer decides later which become `Global`, `Local` or `Upcast`.
 
-### Movement → Index Arithmetic
+### The Kernel Cut
 
-Each movement operation has a specific transformation:
+`try_get_kernel_graph` (`schedule/src/rangeify/kernel.rs`) splits the rangeified graph into kernels:
 
-| Operation | Transformation |
-|-----------|----------------|
-| **RESHAPE** | Flatten/unflatten index expressions |
-| **PERMUTE** | Reorder dimensions in INDEX |
-| **EXPAND** | Index becomes 0 (or range doesn't affect index) |
-| **PAD** | WHERE(in_bounds, LOAD, pad_value) |
-| **SHRINK** | Offset adjustment in INDEX |
-| **FLIP** | `size - 1 - index` |
-
-After rangeify, there are no more movement ops—just arithmetic operations on indices.
-
----
-
-## Kernel Splitting: Finding the Boundaries
-
-A computation graph might have multiple outputs, or intermediate values that need materialization. **Kernel splitting** identifies these boundaries and creates separate kernels.
-
-The entry point is `try_get_kernel_graph()` in `schedule/src/rangeify/kernel.rs`.
-
-### Kernel Splitting Pipeline
-
-The splitting proceeds through several coordinated steps:
-
-**Step 1: STAGE → STORE**
-
-`STAGE` nodes mark where values should materialize. `pm_add_buffers_patterns()` converts them to explicit `STORE` operations:
+**Step 1: STAGE → STORE** (`pm_add_buffers_patterns`, `bufferize_to_store`). Each `STAGE` gets a fresh `BUFFER` node (no device memory yet) and becomes a store under its ranges, wrapped in an `AFTER` on that buffer:
 
 ```text
-Before: STAGE(computation, ranges)
-After:  END(STORE(INDEX(...), computation), ranges)
+Before: STAGE(compute, ranges)
+After:  AFTER(BUFFER, [END(STORE(INDEX(BUFFER, flat_idx), compute), ranges)])
 ```
 
-The `END` wrapper captures which ranges scope this store. Buffers are allocated and assigned IDs during this phase.
-
-**Step 2: Split stores into kernels**
-
-`split_all_stores()` and `split_store()` split the graph at STORE boundaries, creating separate kernels. Buffer numbering is assigned via `LocalAddBufferContext.param_slot` counter during splitting.
+**Step 2: Split stores into kernels** (`split_all_stores` → `split_store`). Each store becomes a callable. Inside the body, global `BUFFER`s turn into `PARAM(slot = N)` in pattern-match order (the `LocalAddBufferContext.param_slot` counter), the body is sealed as a `SINK` carrying `KernelInfo`, and the kernel is a `CALL` whose arguments are the buffers (as `AFTER`s) and the `BIND`s it needs:
 
 ```text
-Before: END(STORE(...), ranges)
-After:  KERNEL(SINK(STORE(...)), ranges, buffer_list)
+After:  AFTER(BUFFER, [CALL(SINK[KERNEL](END(STORE(...), ranges)), args = [AFTER(BUFFER..), BIND..])])
 ```
 
-The `KERNEL` node wraps everything: the computation (as a `SINK`), the iteration ranges, and the list of buffers this kernel reads and writes.
+There is no `KERNEL` op: a kernel is a `CALL` of a `SINK[KERNEL]`. The cut is also where origin attribution is harvested onto the `CALL` (see [Kernel Origins](./kernel-origins.md)).
 
-**Step 3: Fix assignments**
+**Step 3: Fix assignments** (`fix_assign`). When kernel B reads a buffer kernel A writes, B's `AFTER` is appended to A's `AFTER` deps, so a write-after-read on the same buffer keeps its order. Dependencies live in `AFTER` nodes; no separate dependency graph exists until the schedule is built.
 
-`fix_assign()` maps each buffer_id to the kernel that writes it and builds the dependency graph.
+### Pre-schedule and instantiation
 
-### Tracking Dependencies
-
-When one kernel's output feeds another kernel's input, we need dependency tracking:
-
-1. `fix_assign()` maps each buffer_id to the kernel that writes it and builds the dependency graph
-2. When kernel B reads a buffer written by kernel A, B depends on A
-3. Dependencies appear as `AFTER` nodes in the IR
-
-Dependencies appear as `AFTER` nodes in the IR, ensuring kernels execute in valid order.
-
-### Buffer Numbering
-
-Buffer numbering is handled by the `LocalAddBufferContext.param_slot` counter in `split_store()`. Each kernel argument becomes a `PARAM(slot=N)`, and the slots are assigned during the split process in pattern-match order—no separate renumbering pass is needed.
-
----
-
-## Schedule Creation: Preparing for Execution
-
-Once kernels are split, we need to **schedule** them: determine execution order, allocate buffers, and prepare for compilation.
-
-`create_schedule()` in `tensor/src/schedule.rs` produces a `Vec<ScheduleItem>`:
+`create_pre_schedule` (`tensor/src/schedule.rs`) walks the kernel graph, Kahn-sorts the callables by their `AFTER` dependencies and records, per kernel, the AST and the buffer *identities* it touches — but no buffers. That is what the cache stores. `instantiate_schedule` then restores the real `BUFFER`s, allocates `Buffer` handles for intermediates and outputs (outputs stay host-visible unless `PrepareConfig::device_local_outputs`), binds the symbolic values and produces:
 
 ```rust
+pub struct ScheduleResult {
+    pub items: Vec<ScheduleItem>,
+    pub output_uop_ids: Vec<u64>,
+    pub alias_output_buffers: HashMap<u64, Buffer>,  // outputs that alias an input
+}
+
 pub struct ScheduleItem {
-    pub kernel: Arc<UOp>,              // Callable (CALL) wrapper: dependency identity
-    pub ast: Arc<UOp>,                 // Inner computation (for codegen)
-    pub buffers: Vec<Buffer>,          // Device buffers
-    pub buffer_uop_ids: Vec<u64>,      // UOp IDs for registry cleanup
-    pub fixedvars: HashMap<String, i64>,  // Bound iteration variables
+    pub kernel: Arc<UOp>,              // the CALL: dependency identity
+    pub ast: Arc<UOp>,                 // the SINK[KERNEL] body (for codegen)
+    pub buffers: Vec<Buffer>,          // device buffers, in CALL argument order
+    pub buffer_uop_ids: Vec<u64>,      // their BUFFER UOp ids
+    pub fixedvars: HashMap<String, i64>,  // bound symbolic variables
     pub loop_var_names: HashSet<String>,  // fixedvars fed by schedule-loop counters
-    pub dependencies: Vec<u64>,        // Producer callable UOp IDs
-    pub instance_dependencies: Vec<usize>, // Producer schedule-item indices
+    pub dependencies: Vec<u64>,        // producer CALL ids
+    pub instance_dependencies: Vec<usize>, // producer schedule-item indices
 }
 ```
 
-### Buffer Allocation Strategy
+---
 
-- **Input buffers**: Already allocated (from `Tensor::from_slice`)
-- **Intermediate buffers**: Allocated during scheduling (for kernel outputs that feed other kernels)
-- **Output buffer**: Allocated and registered with the final tensor
+## Preparing the Plan
 
-### Parallel Group Analysis
+`prepare_execution_plan` (`tensor/src/realize.rs`) turns schedule items into an `ExecutionPlan`. It runs detached from any origin scope and sizes the shared thread pool from `PrepareConfig::threads` first.
 
-Not all kernels need sequential execution. Independent kernels can run in parallel:
+### Memory planner
 
-```mermaid
-flowchart TD
-  A["Kernel A (writes buf0)"] -->|"depends on A"| C["Kernel C (reads buf0, buf1)"]
-  B["Kernel B (writes buf1)"] -->|"depends on B"| C
-  A -.->|"no dependency, run in parallel"| B
+Before anything is allocated, the planner (`tensor/src/memory_planner/`) decides which intermediate buffers can share storage. Liveness is measured in **execution levels** — Kahn waves of the kernel DAG (`compute_topological_levels`, shared with the runtime) — and a buffer last used in level *L* may reuse storage first used in a level after *L*. The planner injects no ordering edges; safety comes from the level barrier the executor already enforces.
+
+| `SVOD_MEMORY_PLANNER` | Mode | Effect |
+|---|---|---|
+| unset, `1`, `arena` | `Arena` (default) | Pack plannable buffers into one per-device TLSF arena; each logical buffer becomes a `Buffer::view` into it |
+| `remap`, `pool` | `Remap` | Pool whole buffers by `(device, dtype, size rounded to 256 B)` and swap `Arc<Buffer>`s |
+| `0`, `off`, `none`, `disabled` | `Disabled` | Every buffer keeps its own allocation |
+
+Inputs, outputs, aliased storage, disk buffers and copy/custom-function operands are never planned.
+
+### Per-kernel compilation and the caches
+
+Each non-copy item resolves to a `KernelSite`: its device, renderer and an `OptKey`. Kernels missing from the cache are optimized in parallel, named in schedule order (the `n1`, `n2` suffixes are part of the source text, so naming must not depend on thread timing), then rendered and compiled:
+
+```text
+ast ──► apply_pre_optimization ──► heuristics | BEAM ──► post-optimization ──► PROGRAM ──► LINEAR ──► SOURCE ──► BINARY
 ```
 
-The scheduler uses **Kahn's algorithm** to find parallel groups:
+- `apply_pre_optimization()`: movement-op cleanup, `pm_load_collapse`, `pm_split_ranges + pm_flatten_range`, `sym + pm_fold_cast_const`, `pm_simplify_ranges`.
+- The optimizer picks axis types and tiling: the [heuristics](./optimizations/kernel-search.md) by default, [BEAM search](./optimizations/kernel-search.md) with `BEAM=N`, or an explicit `opts_to_apply` list for hand-lowered kernels.
+- Post-optimization lowers the kernel through the stages the [codegen overview](./codegen/overview.md) labels 08–20: post-opt symbolic, the expander (`Upcast`/`Unroll` ranges → lanes), local buffers, `pm_add_gpudims` (`Global`/`Local` ranges → `SPECIAL`), `pm_add_loads`, the devectorizer (with `bool_storage_patterns`), memory coalescing, index-dtype lowering, dtype decompositions (`pm_float_decomp`, `pm_long_decomp`), late rewrites (`pm_fma_decomposition` when the target has `MulAcc`, fast division, …), `pm_move_gates_from_index`, and the final rewrite (`pm_split_ends`, implicit barriers). `SVOD_DUMP_STAGE=<prefix>` prints the kernel after any one of them.
+- `program_from_sink_with_renderer` adds control flow, numbers any remaining `PARAM` slots and builds the `PROGRAM` node; `do_linearize` / `do_render` / `do_compile` fill its `LINEAR`, `SOURCE` and `BINARY` fields (`codegen/src/program_pipeline.rs`).
 
-1. Build the kernel dependency DAG
-2. Find all kernels with no incoming edges → Group 1
-3. Remove Group 1, repeat → Group 2, etc.
+Three in-process caches and one on disk make repeated work free:
 
-Each group's kernels execute in parallel, then the next group starts.
+| Cache | Key | Scope |
+|-------|-----|-------|
+| Schedule cache | `content_hash(normalized SINK)` + compiler identity | rangeify + kernel cut |
+| `OPT_CACHE` | `content_hash(kernel AST)` + device + compiler key + renderer fingerprint + optimizer fingerprint | optimized AST and compiled program; FIFO-bounded by `SVOD_OPT_CACHE_MAX` (4096) |
+| Compiled-program cache | `content_hash(PROGRAM)` + compiler key | `CachedKernel`: program handle, source, entry point, ABI slots; lives for the process |
+| Object cache (CPU) | SHA-256 of the source + `CompilerIdentity` (backend, target, toolchain, flags, ABI) | relocatable objects under `~/.cache/svod/objects` (`SVOD_OBJECT_CACHE_DIR`, `SVOD_OBJECT_CACHE=0` to disable) |
+
+All keys are structural hashes, not UOp ids, so a graph rebuilt from scratch — or in another process — still hits. BEAM results have their own on-disk cache (`SVOD_BEAM_CACHE_DIR`).
+
+### The ExecutionPlan
+
+The result (`runtime/src/execution_plan.rs`):
+
+```rust
+pub struct ExecutionPlan {
+    ops: Vec<PreparedOp>,               // CompiledProgram | BufferCopy | CustomFunction
+    op_order: Vec<usize>,               // topological order
+    op_levels: Vec<Vec<usize>>,         // Kahn levels: ops in one level are independent
+    buffers: Vec<Buffer>,
+    ast_to_buffer: HashMap<u64, usize>, // BUFFER UOp id -> buffer index
+    output_buffer_indices: Vec<usize>,  // plan outputs, in SINK source order
+    device: DeviceSpec,
+    runtime_var_vals: HashMap<String, i64>,
+    graph: OnceLock<Option<Box<dyn Graph>>>,          // captured on first execute (GPU)
+    plan_ctx: OnceLock<Option<Box<dyn PlanContext>>>, // the plan's own queue
+    // ... HCQ executor state elided
+}
+```
+
+| Method | Purpose |
+|--------|---------|
+| `execute()` | Run every op once with the current buffers and variable values |
+| `execute_with_vars(&[(name, value)])` | Rebind symbolic variables (validated against their `[min, max]`), then execute — no recompilation |
+| `output_buffer()` / `output_buffer_at(i)` / `num_outputs()` | The plan's outputs (`i` follows SINK source order) |
+| `profile(&ProfileOptions)` | Replayed, timestamped run returning a `RunProfile` |
+| `declare_input(idx)` / `replicate()` | What the [JIT wrapper](./jit-graphs.md) builds on |
+
+The plan is **reusable**: compile once, execute many times with different data in the same buffers.
 
 ---
 
-## Code Generation: From UOp to LLVM IR
+## Code Generation
 
-With kernels scheduled, we generate actual code. Svod has two renderers, and the device backend decides which one runs:
+Two renderers (`svod_codegen::Renderer`) cover the four device backends; the device picks:
 
 | Device backend | Renderer | Output |
 |----------------|----------|--------|
-| **CPU** | LLVM text (default) or C | LLVM IR, or C source |
-| **CUDA** | LLVM text, NVPTX target | LLVM IR (`ptx_kernel`) |
-| **AMD** | LLVM text, AMDGPU target | LLVM IR (`amdgpu_kernel`) |
-| **Metal** | C, Metal dialect | Metal Shading Language |
-
-The `Renderer` trait abstracts code generation:
+| **CPU** | `LlvmTextRenderer` (default) or `CRenderer` (`SVOD_CPU_BACKEND=clang`) | LLVM IR text, or C source |
+| **CUDA** | `LlvmTextRenderer::nvptx(arch)` | LLVM IR, `ptx_kernel` ABI |
+| **AMD** | `LlvmTextRenderer::amd(arch)` | LLVM IR, `amdgpu_kernel` ABI |
+| **Metal** | `CRenderer::metal()` | Metal Shading Language |
 
 ```rust
 pub trait Renderer {
@@ -273,12 +306,12 @@ pub trait Renderer {
 }
 ```
 
-### LLVM CPU Renderer
+The runtime wraps each in the device-level `svod_device::device::Renderer`, which adds the target's capabilities (`supported_ops`, `gpu_arch`, the extra and ISA matchers) and returns a `ProgramSpec`: source, entry point, the variable names and the `globals` / `outs` / `ins` buffer slots the plan binds arguments with.
 
-The LLVM renderer (`codegen/src/llvm/cpu/`) traverses the UOp graph and emits LLVM IR:
+The LLVM renderer (`codegen/src/llvm/text/`) walks the `LINEAR` op stream and emits one function per kernel. Every buffer is a direct `ptr noalias align 32 %dataN` parameter — no args array — and symbolic variables (plus `core_id` for CPU threading) are typed scalar parameters:
 
 ```llvm
-define void @kernel_0(ptr noalias align 32 %buf0, ptr noalias align 32 %buf1) #0 {
+define void @E_128(ptr noalias align 32 %data0, ptr noalias align 32 %data1, i32 %N) #0 {
 entry:
   br label %loop_0
 
@@ -294,131 +327,56 @@ exit:
 }
 ```
 
-Each buffer is a direct `ptr noalias align 32` parameter — no indirection through an args array. Symbolic variables (for dynamic shapes) and thread IDs are passed as additional typed parameters (e.g. `i32 %N`).
+---
 
-### Post-Optimization Passes
+## Compilation and Loading
 
-Before code generation, ~15 pattern-based passes clean up the IR:
+On the CPU, the IR text becomes a relocatable object and is loaded in-process; there is no LLVM `ExecutionEngine` and no temporary shared library:
 
-| Pass | Purpose |
-|------|---------|
-| `pm_add_loads` | Wrap INDEX operations in LOAD |
-| `pre_expand` | Convert UNROLL/UPCAST ranges to explicit operations |
-| `devectorize` | Group contiguous memory accesses |
-| `pm_reduce_devectorize` | Handle vector reductions (K-vec, bool, horizontal) |
-| `pm_bool_devectorize` | Handle boolean vector patterns |
-| `pm_split_ends` | Split multi-range ENDs into nested single-range ENDs |
-| `pm_fma_decomposition` | Convert `a*b+c` to fused multiply-add (for backends that support it) |
-| `pm_float_decomp` | Decompose floating-point operations |
-| `bool_storage_patterns` | Convert bool ↔ uint8 for memory operations |
+1. **Compile** at `-O2` — through libLLVM bound in-process with `libloading` when it is available (`SVOD_LLVM_INPROCESS=0` opts out, `SVOD_LLVM_LIB` points at a library), otherwise `clang -x ir -c -O2 … -o -` on stdin/stdout.
+2. **Reuse** the object from the on-disk cache when the source and compiler identity match.
+3. **Load** it with the ELF loader: sections into an anonymous mmap, relocations applied, pages flipped executable (`runtime/src/jit_loader.rs`; see [JIT Compiler](../backends/jit-loader.md)).
 
-These passes transform the optimized AST into a form suitable for code generation. The result is clean, vectorized code with proper memory access patterns.
+```rust
+let object = cache.get_or_compile(key, validate_relocatable_object, |ir| producer.compile(ir))?;
+let (fn_ptr, _mmap) = jit_load(&object, &entry_point)?;  // ELF loader, no linker
+```
 
-### Backend Support
-
-Two renderers cover the four device backends:
-
-| Renderer | Output | Used by |
-|----------|--------|---------|
-| **LLVM text** | LLVM IR for the CPU, AMDGPU and NVPTX targets | CPU (default), AMD, CUDA |
-| **C** | C source, or Metal Shading Language | CPU (`SVOD_CPU_BACKEND=clang`), Metal |
+GPU backends hand the same LLVM IR to the driver instead: PTX JIT-ed by the CUDA driver (or `ptxas` when installed), AMDGPU code objects loaded through KFD, Metal source compiled by the Metal framework.
 
 ---
 
-## Execution: Running the Kernels
+## Execution
 
-Code generation produces source strings — LLVM IR, C, or Metal Shading Language. Execution involves compiling them at runtime and launching the kernels.
+`ExecutionPlan::execute()` picks one of three paths, all under the plan's executor lock:
 
-### The ExecutionPlan
+1. **Graph replay.** If every op is a compiled kernel on the plan's device with no unbound symbolic variable, and the device has a graph factory (CUDA Graphs, AMD PM4/AQL graph, Metal indirect command buffer), the plan captures the whole dispatch sequence on the first `execute()` and replays it afterwards, patching only the kernel arguments that changed. The [JIT Graphs](./jit-graphs.md#graph-capture-and-replay) page documents the backends and their switches.
+2. **Native linked plan** (AMD). Plans a graph cannot capture — those with runtime variables, copies, or custom functions — are captured as one linked HCQ command stream whose kernel arguments are repacked per replay.
+3. **Per-op dispatch.** Otherwise the plan walks `op_levels` level by level and submits each op to the plan's own queue (`PlanContext::dispatch`, asynchronous on GPUs) or calls the CPU program directly.
 
-`prepare()` (single tensor) or `prepare_batch()` (multiple tensors) builds an `ExecutionPlan` (`runtime/src/execution_plan.rs`):
-
-```rust
-pub struct ExecutionPlan {
-    ops: Vec<PreparedOp>,               // Compiled kernels and buffer copies
-    op_order: Vec<usize>,               // Topological execution order
-    op_levels: Vec<Vec<usize>>,         // Parallel groups (Kahn levels)
-    buffers: Vec<Buffer>,
-    ast_to_buffer: HashMap<u64, usize>, // AST id -> buffer index mapping
-    output_buffer_indices: Vec<usize>,  // Indices of output buffers (multi-output)
-    device: DeviceSpec,
-    // ... graph/queue state elided
-}
-```
-
-Plans now support **multiple outputs** via `realize_batch()` / `prepare_batch()`. When several tensors share subgraphs, batch scheduling lets the compiler share kernels across outputs.
-
-Key methods:
-
-| Method | Purpose |
-|--------|---------|
-| `output_buffer_at(i)` | Get the i-th output buffer (matches SINK source order) |
-| `num_outputs()` | Number of output buffers in this plan |
-| `execute_with_vars(var_vals)` | Re-execute with different symbolic variable values (no recompilation) |
-
-The plan is **reusable**: compile once, execute many times with different data.
-
-### JIT Compilation
-
-The LLVM runtime (`runtime/src/llvm.rs`) compiles IR to machine code. There is no LLVM `ExecutionEngine`: the IR becomes a relocatable object, which an in-process ELF loader maps and relocates.
-
-1. **Compile** the IR text to a relocatable object at `-O2` — in-process through a `dlopen`ed libLLVM when one is available, otherwise `clang -x ir -c -O2`
-2. **Reuse** the object from the on-disk cache, keyed by the source digest plus compiler identity
-3. **Load** it with the ELF loader: sections into an anonymous mmap, relocations applied
-4. **Cache** the resulting function by (AST ID, device) for reuse
-
-```rust
-// Simplified compile flow
-let object = producer.compile_object(ir_string)?;  // libLLVM in-process, or `clang -x ir -c -O2`
-validate_relocatable_object(&object, &entry_point)?;
-let (fn_ptr, _mmap) = jit_load(&object, &entry_point)?;  // ELF loader, no linker
-// Cache: (ast_id, device) → function
-```
-
-### Kernel Execution
-
-With kernels compiled, execution iterates through kernels in topological order, respecting dependencies:
-
-```rust
-for kernel in &plan.kernels {
-    // Dependencies tracked per-kernel via kernel.dependencies
-    kernel.execute(buffers);
-}
-```
-
-Kernels carry their own device specification, so a plan can span multiple devices.
-
-### Kernel Caching
-
-Hash consing makes kernel caching highly effective:
-
-- **Key**: `(UOp ID, device string)`
-- **Storage**: Lock-free HashMap (papaya crate)
-- **Hit rate**: High, because identical computations share UOp IDs
-
-When you compute the same expression twice, the second call hits the cache—no recompilation.
+Within one plan, ops in a level are *not* run on separate host threads: the levels are the memory planner's reuse barrier and the graph capture order. CPU parallelism is inside a kernel (`Thread` axes split over the rayon pool) and across distinct plans. Each `PreparedKernel` carries its own device, so a plan can span devices, with `BufferCopy` ops moving data between them.
 
 ---
 
 ## Worked Example: Matrix Multiply
 
-Let's trace `C = A @ B` through the entire pipeline. Assume 4×4 matrices.
+Let's trace `C = A.matmul(&B)?` through the pipeline for 4×4 matrices.
 
 ### Stage 1: Lazy Graph Construction
 
 ```rust
-let a = Tensor::from_slice(a_data);  // Input buffer allocated
-let b = Tensor::from_slice(b_data);  // Input buffer allocated
-let c = a.matmul(&b);                 // Graph built, no computation
+let a = Tensor::from_slice(a_data).try_reshape(&[4, 4])?;  // input buffer allocated
+let b = Tensor::from_slice(b_data).try_reshape(&[4, 4])?;  // input buffer allocated
+let c = a.matmul(&b)?;                                     // graph built, no computation
 ```
 
-At this point, `c` is a lazy tensor with this UOp graph:
+`matmul` reshapes `A` to `[4, 1, 4]` and `B` to `[1, 4, 4]`, transposes `B`, multiplies (broadcast inserts the `EXPAND`s) and sums the last axis:
 
 ```mermaid
 flowchart TD
-  RA["REDUCE_AXIS(Add, axis=2)"] --> MUL["MUL"]
+  RA["REDUCE_AXIS(Add, axes=[2])"] --> MUL["MUL"]
   MUL --> EA["EXPAND(A, [4, 4, 4]) -- A: [4, 4] to [4, 1, 4] to [4, 4, 4]"]
-  MUL --> EB["EXPAND(B, [4, 4, 4]) -- B: [4, 4] to [1, 4, 4] to [4, 4, 4]"]
+  MUL --> EB["EXPAND(PERMUTE(B), [4, 4, 4]) -- B: [4, 4] to [1, 4, 4] to [4, 4, 4]"]
 ```
 
 ### Stage 2: Rangeify
@@ -427,119 +385,111 @@ Movement ops become explicit loops:
 
 ```mermaid
 flowchart TD
-  STORE["STORE"] --> CIDX["INDEX(BUFFER(C), RANGE(i, 0..4), RANGE(j, 0..4)) -- index"]
-  STORE --> RED["REDUCE(Add) -- value"]
-  STORE --> RI["RANGE(i, Global) -- output dim 0"]
-  STORE --> RJ["RANGE(j, Global) -- output dim 1"]
+  STAGE["STAGE"] --> RED["REDUCE(Add) -- value"]
+  STAGE --> RI["RANGE(i, 0..4) -- output dim 0"]
+  STAGE --> RJ["RANGE(j, 0..4) -- output dim 1"]
   RED --> MUL["MUL"]
-  RED --> RK["RANGE(k, Reduce)"]
+  RED --> RK["RANGE(k, 0..4, Reduce)"]
   MUL --> LA["LOAD(A)"]
   MUL --> LB["LOAD(B)"]
-  LA --> AIDX["INDEX(BUFFER(A), RANGE(i), RANGE(k, 0..4, Reduce))"]
-  LB --> BIDX["INDEX(BUFFER(B), RANGE(k), RANGE(j))"]
+  LA --> AIDX["INDEX(BUFFER(A), i * 4 + k)"]
+  LB --> BIDX["INDEX(BUFFER(B), k * 4 + j)"]
 ```
 
 The `i` and `j` ranges are output dimensions. The `k` range is the reduction (contracted) dimension.
 
-### Stage 3: Kernel Splitting
+### Stage 3: Kernel Cut
 
-Single STORE → single KERNEL:
+One `STAGE` → one store → one `CALL`:
 
 ```mermaid
 flowchart TD
-  KERNEL["KERNEL"] --> SINK["SINK(STORE(...))"]
-  KERNEL --> RANGES["ranges: [i: 0..4, j: 0..4]"]
-  KERNEL --> BUFS["buffers: [C (output), A (input), B (input)]"]
+  AF["AFTER(BUFFER(C))"] --> CALL["CALL"]
+  CALL --> SINK["SINK[KERNEL](END(STORE(INDEX(PARAM(0), i*4+j), REDUCE(...)), [i, j]))"]
+  CALL --> ARGS["args: AFTER(BUFFER(C)), BUFFER(A), BUFFER(B)"]
 ```
 
 ### Stage 4: Schedule
 
-One `ScheduleItem` with:
-- `kernel`: The KERNEL UOp
-- `ast`: The inner SINK/STORE
-- `buffers`: [C, A, B]
-- `dependencies`: [] (no prior kernels)
+One `ScheduleItem`:
+- `kernel`: the `CALL`
+- `ast`: the `SINK[KERNEL]`
+- `buffers`: `[C, A, B]` — `C` allocated now, `A` and `B` already resident
+- `dependencies`: `[]` (no producer kernels)
 
 ### Stage 5: Optimization
 
-Heuristic optimizer applies:
-- Vectorization: UPCAST j dimension by 4
-- Loop ordering: Ensure good cache behavior
+The heuristic optimizer picks, for example, `Upcast` on `j` by 4 (a `float4` vector per store) and `Unroll` on `k`; on a GPU `i` becomes `Global`.
 
 ### Stage 6: Code Generation
 
-Generated LLVM IR (simplified):
+Generated LLVM IR, scalar form for readability:
 
 ```llvm
-define void @matmul(ptr noalias align 32 %C, ptr noalias align 32 %A, ptr noalias align 32 %B) #0 {
+define void @r_4_4_4(ptr noalias align 32 %data0, ptr noalias align 32 %data1, ptr noalias align 32 %data2) #0 {
 entry:
   br label %loop_i
 
 loop_i:
-  %i = phi i64 [ 0, %entry ], [ %i.next, %loop_i.end ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop_i.end ]
   br label %loop_j
 
 loop_j:
-  %j = phi i64 [ 0, %loop_i ], [ %j.next, %loop_k.end ]
-  %acc = ... ; initialize accumulator
+  %j = phi i32 [ 0, %loop_i ], [ %j.next, %loop_k.end ]
   br label %loop_k
 
 loop_k:
-  %k = phi i64 [ 0, %loop_j ], [ %k.next, %loop_k ]
-  %a_val = load float, ptr ...  ; A[i, k]
-  %b_val = load float, ptr ...  ; B[k, j]
+  %k = phi i32 [ 0, %loop_j ], [ %k.next, %loop_k ]
+  %acc = phi float [ 0.0, %loop_j ], [ %acc.new, %loop_k ]
+  %a_val = load float, ptr ...  ; A[i, k]  (data1)
+  %b_val = load float, ptr ...  ; B[k, j]  (data2)
   %prod = fmul float %a_val, %b_val
   %acc.new = fadd float %acc, %prod
-  %k.next = add i64 %k, 1
-  %k.cond = icmp slt i64 %k.next, 4
+  %k.next = add nsw i32 %k, 1
+  %k.cond = icmp slt i32 %k.next, 4
   br i1 %k.cond, label %loop_k, label %loop_k.end
 
 loop_k.end:
-  store float %acc.new, ptr ...  ; C[i, j]
+  store float %acc.new, ptr ...  ; C[i, j]  (data0)
   ; ... continue j, i loops
 }
 ```
 
 ### Stage 7: Execution
 
-1. JIT compile the LLVM IR
-2. Execute: `kernel([C_ptr, A_ptr, B_ptr], [])`
-3. Result is in C buffer
-
-Total: one function call, result ready.
+1. Compile the IR (or take the cached object) and load it.
+2. `execute()`: one `PreparedKernel`, called with `[C_ptr, A_ptr, B_ptr]` in `ProgramSpec.globals` order.
+3. `finalize_realize` rewires `c` to `BUFFER(C).reshape([4, 4])`.
 
 ---
 
-## Comparison: How Other Frameworks Execute
+## Environment Reference
 
-| Aspect | PyTorch | JAX | TVM | **Svod** |
-|--------|---------|-----|-----|-----------|
-| **Evaluation** | Eager (immediate) | Traced (jit decorator) | Lazy (te.compute) | Lazy (realize) |
-| **Graph capture** | torch.compile | jax.jit trace | Explicit schedule | Implicit via ops |
-| **Compilation** | TorchInductor | XLA backend | Auto-scheduler | Pattern + beam |
-| **Caching** | Per-graph hash | Per-trace | Per-schedule | Per-AST (hash consing) |
-| **Parallelism** | DataParallel/DDP | pmap/pjit | Parallel schedule | Parallel groups |
+The variables that steer this pipeline (optimizer and backend knobs are listed on their own pages):
 
-**PyTorch**: Eager by default, torch.compile for optimization. TorchInductor generates Triton or C++ code.
-
-**JAX**: Functional transformations (jit, grad, vmap) trace computations. XLA compiles to optimized kernels.
-
-**TVM**: Explicit separation of computation and schedule. Auto-scheduler searches for good schedules.
-
-**Svod**: Fully lazy—nothing executes until `realize()`. Hash consing provides automatic caching. Pattern-based optimization with optional beam search for production quality.
+| Variable | Effect |
+|----------|--------|
+| `SVOD_DEVICE` | Default device (`CPU`, `CUDA:0`, `AMD:0`, `METAL`); Metal on macOS, CPU elsewhere when unset |
+| `SVOD_CPU_BACKEND` | `llvm` (default) or `clang` |
+| `SVOD_THREADS` | Compile and CPU-kernel thread budget (default: available parallelism) |
+| `SVOD_NOOPT`, `BEAM=N` | Optimizer strategy: none, or beam search of width N (default: heuristics) |
+| `SVOD_MEMORY_PLANNER` | `arena` (default), `remap`, `off` |
+| `SVOD_DISABLE_SCHEDULE_CACHE=1`, `SVOD_OPT_CACHE_MAX` | Schedule cache off; optimized-kernel cache capacity |
+| `SVOD_OBJECT_CACHE=0`, `SVOD_OBJECT_CACHE_DIR`, `SVOD_OBJECT_CACHE_MAX_BYTES` | On-disk object cache |
+| `SVOD_LLVM_INPROCESS=0`, `SVOD_LLVM_LIB` | Force the `clang` subprocess; pick the libLLVM to bind |
+| `SVOD_PER_STAGE_UOPS=1`, `SVOD_DUMP_STAGE=<prefix>`, `SVOD_DUMP_LINEAR=<dir>`, `SVOD_DUMP_LLVM_IR=<dir>` | Dump the kernel after each or one optimizer stage, the linearized stream, the rendered IR |
+| `SVOD_SPEC=1` | Verify the IR against the kernel-graph spec after each phase |
+| `SVOD_ORIGIN=1` | Attribute kernels to model code ([Kernel Origins](./kernel-origins.md)) |
+| `RUST_LOG` | `tracing` filter; `debug` prints per-phase timings, `trace` the buffer mappings |
 
 ---
 
 ## The Deeper Insight
 
-The pipeline embodies several design principles:
+**Lazy evaluation enables global optimization.** By deferring computation, the scheduler sees the entire graph before cutting kernels; fusion is the default and materialization the exception.
 
-**Lazy evaluation enables global optimization.** By deferring computation, we see the entire graph before generating code. No local decision limits global optimization.
+**Explicit loops enable hardware-specific scheduling.** Movement ops are convenient abstractions, but hardware needs loops. Rangeify bridges the gap, and the optimizer only has to change a range's `AxisType`.
 
-**Explicit loops enable hardware-specific scheduling.** Movement ops are convenient abstractions, but GPUs need loops. Rangeify bridges the gap.
+**Structural hashing makes caching automatic.** Every cache — schedule, optimized kernel, compiled program, object file — is keyed by the content hash of a UOp graph, so the second model of the same shape costs allocation and dispatch, nothing more.
 
-**Hash consing makes caching automatic.** Identical computations share pointers, so cache keys are trivial. No complex graph hashing needed.
-
-**Separation of concerns keeps each stage simple.** Rangeify doesn't know about LLVM. Code generation doesn't know about tensor semantics. Each stage does one thing well.
-
-The result: a compilation pipeline that's both powerful and maintainable. From `tensor.realize()` to machine code, every step is visible, debuggable, and extensible.
+**Separation of concerns keeps each stage simple.** Rangeify doesn't know about LLVM. Code generation doesn't know about tensor semantics. Each stage does one thing, on the same IR.

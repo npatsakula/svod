@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'website/**'
+      - 'README.md'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 

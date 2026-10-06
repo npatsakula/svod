@@ -62,8 +62,9 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// page (`doorbell_base` is the mmap base from [`QueueHandle`]).
     fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) -> Result<QueueTeardown>;
     /// Block up to `timeout_ms` on the device's completion + fault events.
-    /// `Ok(Some(Error::Runtime{..}))` on a fault, `Ok(None)` on a normal
-    /// wake-up/timeout, `Err` if the WAIT_EVENTS ioctl itself failed.
+    /// `Ok(Some(Error::GpuFault{..}))` on a memory fault,
+    /// `Ok(Some(Error::Runtime{..}))` on a hardware exception, `Ok(None)` on a
+    /// normal wake-up/timeout, `Err` if the WAIT_EVENTS ioctl itself failed.
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
 
     /// The KFD queue-completion event mailbox, when this backend has one.

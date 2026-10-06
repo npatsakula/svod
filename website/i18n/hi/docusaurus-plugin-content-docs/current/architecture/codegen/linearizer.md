@@ -1,227 +1,120 @@
 ---
-sidebar_label: Phase 4 — Linearizer
+sidebar_label: Late rewrites और linearizer
 ---
 
-# Phase 4: Linearizer
+# Late Rewrites, प्रोग्राम सीमा और Linearizer (स्टेज 19–20 और आगे)
 
-**गोल**: DAG को लीनियर इंस्ट्रक्शन सीक्वेंस में बदलें।
+आख़िरी post-optimization स्टेज ग्राफ़ को एक ठोस backend के लिए render करने योग्य बनाते हैं: जो operations target में नहीं हैं उन्हें decompose किया जाता है, validity एक `gate` बन जाती है, weak dtypes commit किए जाते हैं। फिर `svod-codegen` control-flow edges जोड़ता है, parameters को क्रमांकित करता है और DAG को instruction सूची में समतल करता है। सोर्स: `optimizer/mod.rs`, `late/gater.rs`, `late/dtype.rs`, `optimizer/implicit_barriers.rs`, `linearize/`, `codegen/src/program_pipeline.rs`।
 
----
+नीचे का हर matcher renderer की क्षमता तालिका (`renderer.supported_ops()`, `supports_dtype`) से बनता है, इसीलिए `optimize_kernel_with_config` ऐसे renderer को अस्वीकार करता है जिसके पास यह तालिका नहीं है (`OptError::MissingRendererCapabilities`)।
 
-## Stage 16: Post-Index Symbolic
+## 19 — float ALU operands का cast
 
-> **स्टेज एक नज़र में**
->
-> **गोल**: Index lowering के बाद पूर्ण symbolic सिम्प्लीफ़िकेशन
-> **मुख्य Patterns**: सभी symbolic नियम (140+)
-> **प्रभाव**: सीरियलाइज़ेशन से पहले फ़ाइनल क्लीनअप
+`pm_cast_float_alu`: `Sin`, `Log2`, `Exp2`, `Sqrt`, `Reciprocal` के लिए operand को परिणाम dtype में cast करना। Transcendental decompositions dtype-समरूप polynomials में फैलते हैं और उन्हें मिश्रित-dtype operand नहीं दिखना चाहिए।
 
-**यह क्या करता है**: Index lowering के बाद पूर्ण symbolic सिम्प्लीफ़िकेशन।
+## 19b — early decompositions
 
-**यह क्यों ज़रूरी है**: अब indices कॉन्क्रीट integers (i32/i64) हैं, अरिथमेटिक पूरी तरह सिम्प्लीफ़ाई हो सकता है। लीनियराइज़ेशन से पहले एक्सप्रेशन साफ़ करने का यह आखिरी मौका है।
-
-**Pattern**: `symbolic`
-
-Svod में कोई GEP op नहीं है — addressing `INDEX(STACK(...))` है — इसलिए Tinygrad के
-`gep_pushing` का यहाँ कोई समकक्ष नहीं। सबसे नज़दीकी analogue `alu_vectorize_reorder_patterns` है:
-```text
-Before:  ADD(STACK(x, x, x, x), STACK(y, y, y, y))
-              ↓ [Reorder ALU over STACK]
-After:   STACK(ADD(x, y), ADD(x, y), ADD(x, y), ADD(x, y))
-```
-*क्यों?* Collapse हुए ऑपरेशन पर constant folding और scalar ऑप्टिमाइज़ेशन सक्षम करता है। वह नियम tier-3 `sym()` में रहता है, इसलिए वह पहले ही Stage 14 पर चल चुका होता है, यहाँ नहीं।
-
----
-
-## Stage 17: Pre-Matcher (ऑप्शनल)
-
-> **स्टेज एक नज़र में**
->
-> **गोल**: Decomposition से पहले बैकएंड-स्पेसिफ़िक patterns
-> **मुख्य Patterns**: Renderer-स्पेसिफ़िक
-> **प्रभाव**: हार्डवेयर-स्पेसिफ़िक ऑप्टिमाइज़ेशन
-
-**यह क्या करता है**: Decomposition से पहले renderer-स्पेसिफ़िक patterns अप्लाई करता है।
-
-**यह क्यों ज़रूरी है**: हर बैकएंड अपने patterns जोड़ सकता है। उदाहरण के लिए, DSP बैकएंड इसे जेनेरिक patterns को DSP-स्पेसिफ़िक SIMD intrinsics से बदलने के लिए इस्तेमाल करता है। इससे जेनेरिक पाइपलाइन बदले बिना हार्डवेयर-स्पेसिफ़िक ऑप्टिमाइज़ेशन मिलते हैं।
-
-**Pattern**: `renderer.pre_matcher`
-
-ज़्यादातर बैकएंड (CPU, GPU) को इसकी ज़रूरत नहीं। सिर्फ़ स्पेशलाइज़्ड हार्डवेयर इस्तेमाल करता है।
-
-**नोट**: Svod में `pre_matcher` नहीं है। बैकएंड hooks `svod_device::device::Renderer` trait (`device/src/device.rs`) पर रहते हैं: `decompositor()`, `extra_matcher()`, `pre_isel_matcher()` और `isel_matcher()`। आखिरी दोनों PROGRAM बाउंड्री पर, Stage 20 और 21 के बीच चलते हैं, decomposition से पहले नहीं। (`svod_codegen::traits::Renderer` एक अलग, संकरा trait है जिसमें `render()`, `backend_name()` और `decompositor()` हैं।)
-
----
-
-## Stage 18: Decompositions
-
-> **स्टेज एक नज़र में**
->
-> **गोल**: जो ऑपरेशन टारगेट सपोर्ट नहीं करता उन्हें रीराइट करें
-> **मुख्य Patterns**: Power-of-2, transcendental approximations
-> **प्रभाव**: हाई-लेवल ops को हार्डवेयर इंस्ट्रक्शन से मैप करता है
-
-**यह क्या करता है**: जो ऑपरेशन टारगेट सपोर्ट नहीं करता, उनके लिए late rewrites।
-
-**यह क्यों ज़रूरी है**: हार्डवेयर में हर ऑपरेशन नहीं होता। उदाहरण के लिए, ज़्यादातर CPUs में डायरेक्ट `sin` इंस्ट्रक्शन नहीं है। हम इसे उन ऑपरेशनों से approximate करते हैं जो मौजूद हैं (addition, multiplication, आदि)।
-
-**Pattern**: `early_decomposition_patterns() + get_late_rewrite_patterns() + get_transcendental_patterns()` (साथ में `renderer.decompositor()`, जब बैकएंड दे)। `early_decomposition_patterns()` ख़ुद `symbolic_simple()` से शुरू होता है।
-
-नोट: `pm_split_ends()` इस पास का हिस्सा नहीं है — वह Stage 19 के matcher में जुड़ता है और Stage 20 की शुरुआत में दोबारा चलता है।
-
-| Pattern | उदाहरण | कब इस्तेमाल |
-|---------|--------|-------------|
-| `MOD → AND` | `x % 8 → x & 7` | Power-of-2 divisor |
-| `MUL → SHL` | `x * 16 → x << 4` | Power-of-2 multiplier |
-| `DIV → SHR` | `x / 8 → x >> 3` | Power-of-2 divisor (C-स्टाइल CDIV) |
-| `FDIV → MUL` | `x / 2.0 → x * 0.5` | Float constant divisor (कॉन्स्टेंट भाजक) |
-| `NEG` | `x * -1 → NEG(x)` | जब NEG सपोर्टेड हो |
-| `MULACC` | `a * b + c → MULACC(a, b, c)` | जब FMA सपोर्टेड हो |
-| Fast integer division | `x // 7 → (x * M) >> S` | Non-power-of-2 भाजक |
-| De Morgan's law | `(!x) & (!y) → !(x \| y)` | Boolean सिम्प्लीफ़िकेशन (केवल AND-of-NOTs) |
-| Comparison negations | `!(x < c) → (c-1) < x` | Integer comparisons |
-
-Transcendental approximations (EXP2, LOG2, SIN, …) `get_transcendental_patterns()` से आते हैं (`ir/src/decompositions/mod.rs`, इम्प्लीमेंटेशन `ir/src/decompositions/transcendentals.rs` में)। ये हर ऑपरेशन के लिए तब चालू होते हैं जब renderer के पास वह इंस्ट्रक्शन न हो, या `TRANSCENDENTAL=2` पर हर ऑपरेशन के लिए। ऑप्शनल `Renderer::decompositor()` hook ऊपर से बैकएंड-स्पेसिफ़िक नियम जोड़ता है; in-tree कोई बैकएंड इसे इस्तेमाल नहीं करता।
-
-**Svod**: `optimizer/mod.rs`
-
----
-
-## Stage 19: Final Rewrite
-
-> **स्टेज एक नज़र में**
->
-> **गोल**: लीनियराइज़ेशन की तैयारी
-> **मुख्य Patterns**: Weak-cast commit, renderer rewrites, END splitting
-> **प्रभाव**: लीनियराइज़ेशन के लिए साफ़ representation
-
-**यह क्या करता है**: लीनियराइज़ेशन की तैयारी।
-
-**यह क्यों ज़रूरी है**: कुछ patterns decomposition के बाद अप्लाई करना आसान होता है। यह स्टेज लीनियर सीक्वेंस में कन्वर्ट करने से पहले फ़ाइनल क्लीनअप करता है।
-
-**Pattern**: `pm_commit_weak() + pm_cast_weak() + pm_decomp` (Stage 18 के decompositions), साथ में `renderer.extra_matcher()` और `pm_split_ends()` — सब एक ही matcher में जुड़े। इसके बाद `pm_remove_invalid()` और `add_implicit_barriers()` अलग passes के रूप में चलते हैं।
-
-नोट: `extra_matcher` और `pm_split_ends` इसी combined matcher का हिस्सा हैं, अलग passes नहीं। Svod में कोई CONST-वेक्टराइज़ेशन या GEP-resolution स्टेप नहीं है; Tinygrad के `pm_render` का यहाँ कोई समकक्ष नहीं।
-
-**मल्टी-range ENDs स्प्लिट करें**:
-```text
-// Before: END closing multiple ranges
-END(op, [range_a, range_b])
-
-// After: nested single ENDs
-END(END(op, range_a), range_b)
-```
-
-Ranges `(axis_id, axis_type.priority())` के अनुसार descending सॉर्ट होती हैं, इसलिए सबसे भीतरी END पहले बनता है। Void/Bool "backedge" sources अलग किए जाते हैं और मूल tag बरक़रार रखते हुए सबसे बाहरी END पर दोबारा जोड़े जाते हैं।
-
-**extra_matcher**: हर बैकएंड अपने फ़ाइनल patterns जोड़ सकता है। इससे जेनेरिक पाइपलाइन बदले बिना हार्डवेयर-स्पेसिफ़िक ऑप्टिमाइज़ेशन मिलते हैं।
-
-**Svod**: `optimizer/mod.rs`, `linearize/mod.rs`
-
----
-
-## Stage 20: Add Control Flow
-
-> **स्टेज एक नज़र में**
->
-> **गोल**: कंट्रोल फ़्लो ग्राफ़ बनाएँ और range डिपेंडेंसी जोड़ें
-> **मुख्य कॉन्सेप्ट**: तीन रिलेशनशिप टाइप (nested, dependent, independent)
-> **प्रभाव**: सही इंस्ट्रक्शन ऑर्डरिंग
-
-**यह क्या करता है**: कंट्रोल फ़्लो ग्राफ़ बनाता है और range डिपेंडेंसी जोड़ता है।
-
-**यह क्यों ज़रूरी है**: ऑपरेशन सही ऑर्डर में एक्ज़ीक्यूट होने चाहिए। अगर load कोई RANGE की वैल्यू इस्तेमाल करता है, तो RANGE पहले आना चाहिए। यह स्टेज इन डिपेंडेंसीज़ को ट्रैक और एनफ़ोर्स करता है।
-
-**Pattern**: `pm_add_control_flow` (bottom-up), जिससे पहले `pm_split_ends` दोबारा चलता है
+`early_decomposition_patterns(supported_ops)`:
 
 ```text
-// Analyze which END operations depend on which
-END(computation, [RANGE_A]) and END(other_computation, [RANGE_B]) are siblings
-→ Creates edge: RANGE_B.src += END(computation)
-
-// Add explicit dependency
-RANGE_B waits for RANGE_A to complete
+symbolic_simple + pm_fold_cast_const + pm_mod_to_and + divmod_decomposition_patterns
+  + pm_threefry_decomp        if !supports(Threefry)
+  + pm_max_decomposition      if !supports(Max) && supports(Lt)
+  + pm_erf_decomposition      if !supports(Erf)
 ```
 
-**तीन रिलेशनशिप टाइप**:
+`divmod_decomposition_patterns` (`ir/src/decompositions/mod.rs`) floor division और modulo (`FloorDiv`/`FloorMod`) को sign सुधार के साथ truncating `CDiv`/`CMod` में lower करता है — वह रूप जो हर backend के पास है। `pm_mod_to_and` यहाँ भी है और late सेट में भी, ताकि दो की घात वाले modulo truncating lowering के देखने से पहले fold हो जाएँ।
 
-| रिलेशनशिप | शर्त | मतलब |
-|------------|------|------|
-| Nested | END_A, END_B की dep है **और** RANGE_B, END_A की dep है | A का लूप B के अंदर है, इसलिए A, B से पहले बंद होता है |
-| Dependent | END_A, END_B की dep है पर वह nesting नहीं है | B का लूप A के बाद एमिट होना चाहिए |
-| Independent | कोई END दूसरे पर निर्भर नहीं | ऑर्डर आज़ाद है; पैरेलल चल सकते हैं |
+## 19c — dtype decompositions
 
-Bottom-up ट्रैवर्सल सुनिश्चित करता है कि डिपेंडेंसी leaves से roots तक सही बहे।
+`DTypeDecompCtx` के साथ `pm_dtype_decomp_commit = pm_dtype_decomps + pm_commit_weak`। पहला नियम केवल यह दर्ज करता है कि `FP8E4M3`, `FP8E4M3FNUZ`, `FP8E5M2`, `FP8E5M2FNUZ`, `Float16`, `BFloat16`, `Int64`/`UInt64` में से कौन से ग्राफ़ में आते हैं; फिर `SINK` नियम bottom-up और dtype क्रम में हर उस दर्ज dtype को फिर से लिखता है जिसे renderer समर्थन नहीं देता:
 
-**Svod**: `schedule/src/linearize/mod.rs`, `schedule/src/linearize/cfg_context.rs`
+| असमर्थित | किस रूप में emulate | Matcher |
+|-------------|-------------|---------|
+| `Int64`, `UInt64` | दो `Int32`/`UInt32` words: `PARAM`/`BUFFER` का आकार दोगुना, `INDEX` पर word का tag, `Lt` से बने carry और borrow, `CDiv`/`CMod` के लिए 64-चरण shift-subtract divider | `pm_long_decomp` (`devectorize.rs`) |
+| FP8 | समर्थित हो तो `Float16`, अन्यथा `Float32`; storage 8-bit unsigned word रहता है, `f2f` bit-सटीक रूपांतरण करता है (RNE rounding, FNUZ NaN encoding, `f2f_clamp` में saturation) | `pm_float_decomp` |
+| `Float16`, `BFloat16` | `Float32` गणना, वही `f2f` storage रूपांतरण | `pm_float_decomp` |
 
----
+`get_dtype_decomps` renderer की compile cache key के लिए वही चयन एक सूची के रूप में लौटाता है।
 
-## Stage 21: Linearize
+## 19d — late decompositions
 
-> **स्टेज एक नज़र में**
->
-> **गोल**: DAG को लीनियर इंस्ट्रक्शन सीक्वेंस में बदलें
-> **मुख्य अल्गोरिदम**: Priority-aware topological sort
-> **प्रभाव**: वैलिड एक्ज़ीक्यूशन ऑर्डर
-
-**यह क्या करता है**: DAG को priority-aware topological sort से लीनियर इंस्ट्रक्शन सीक्वेंस में बदलता है।
-
-**यह क्यों ज़रूरी है**: ग्राफ़ स्ट्रक्चर एक्ज़ीक्यूशन ऑर्डर specify नहीं करता। हमें डिपेंडेंसी respect करते हुए फ़्लैटन करना होगा। Priorities सेंसिबल ऑर्डरिंग सुनिश्चित करती हैं (definitions uses से पहले, loads कम्प्यूटेशन से पहले, stores बाद में)।
-
-**फ़ंक्शन**: `linearize(sink)`
-
-| ऑपरेशन | प्रायोरिटी | क्यों |
-|---------|-----------|------|
-| PARAM | -20 | Kernel आर्ग्युमेंट (और symbolic वेरिएबल) पहले डिफ़ाइन होने चाहिए; बराबरी पर parameter slot से तय |
-| BUFFER | -18 | एलोकेशन पहले |
-| BUFFER (`AddrSpace::Local`) | -17 | Global वालों के ठीक बाद लोकल एलोकेशन |
-| END | -5 | Ranges बंद करता है |
-| LOAD | -1 | इस्तेमाल से पहले Loads |
-| बाकी सब (CONST, ALU, …) | 0 | अपने कंज़्यूमर के पास जाकर बैठता है |
-| STORE | +1 | कम्प्यूटेशन के बाद Stores |
-| RANGE | +5 | इस्तेमाल से पहले Ranges खुलें |
-
-कम प्रायोरिटी = सीक्वेंस में पहले। इससे सुनिश्चित होता है:
-- Definitions पहले आएँ
-- Loads कम्प्यूटेशन से पहले हों
-- Stores आखिर में हों
-- Ranges अपने contents से पहले खुलें, बाद में बंद हों
-
-**Run_count ऑर्डरिंग**: ऑपरेशन मुख्य रूप से एक्ज़ीक्यूशन फ़्रीक्वेंसी (run_count) से सॉर्ट होते हैं, फिर प्रायोरिटी से, फिर PARAM slot और tuplize rank से। कम एक्ज़ीक्यूशन फ़्रीक्वेंसी वाले ऑपरेशन (inner loops के बाहर) पहले शेड्यूल होते हैं, जबकि inner loops वाले (ज़्यादा run_count) बाद में। उदाहरण: 100 बार एक्ज़ीक्यूट होने वाला CONST, 1M बार वाले से पहले आता है।
-
-**run_count कैलकुलेशन**:
-```text
-run_count = prod(int(r.vmax) + 1 for r in u.in_scope_ranges())
-```
-यह कैलकुलेट करता है कि enclosing in-scope ranges के आधार पर ऑपरेशन कितनी बार एक्ज़ीक्यूट होता है; जिस range का `vmax` कॉन्क्रीट integer न हो, वह 1 गिना जाता है।
-
-**Svod**: `linearize()` in `schedule/src/linearize/linearize.rs`
-
----
-
-## Stage 22: Cleanup IF/ENDIF
-
-> **स्टेज एक नज़र में**
->
-> **गोल**: लीनियर इंस्ट्रक्शन लिस्ट का फ़ाइनल क्लीनअप
-> **मुख्य ट्रांसफ़ॉर्मेशन**: Gated STORE → IF/STORE/ENDIF
-> **प्रभाव**: बिना predicated stores वाले हार्डवेयर को हैंडल करता है
-
-**यह क्या करता है**: लीनियर इंस्ट्रक्शन लिस्ट का फ़ाइनल क्लीनअप।
-
-**यह क्यों ज़रूरी है**: कुछ हार्डवेयर (मॉडर्न GPUs) "predicated stores" सपोर्ट करता है — मेमोरी में तभी लिखो जब condition true हो। पुराना हार्डवेयर नहीं करता। उनके लिए, store को IF स्टेटमेंट में रैप करना पड़ता है। यह स्टेज सिर्फ़ उन बैकएंड के लिए ज़रूरी है जिनमें predicated store सपोर्ट नहीं; LLVM, CUDA और Metal gate को नेटिवली हैंडल करते हैं, इसलिए `linearize_with_cfg()` इसे नहीं चलाता।
-
-**Pattern**: `line_rewrite_cleanups` (`line_rewrite` से, `graph_rewrite` नहीं)
+`pm_decomp = early_decomposition_patterns + get_late_rewrite_patterns(renderer, disable_fast_idiv) + get_transcendental_patterns(supported_ops, TRANSCENDENTAL >= 2) (+ renderer.decomposition_matcher())`, fixpoint तक चलाया जाता है। Late सेट क्षमता-आधारित है ([strength reduction](../optimizations/strength-reduction.md) में हर नियम है):
 
 ```text
-// Gated STORE becomes a conditional store
-STORE(INDEX(ptr, idx), value, gate=cond)
-→ IF(cond) { STORE(INDEX(ptr, idx), value) } ENDIF
+pm_mod_to_and + pm_half_bf16_cast                       always
++ pm_demorgan                                           if supports(Or)
++ pm_mul_to_shl                                         if supports(Shl)
++ pm_div_to_shr                                         if supports(Shr)
+  + fast_division_patterns + pm_mod_to_idiv             if supports(Shr) && DISABLE_FAST_IDIV=0
++ pm_neg_from_mul                                       if supports(Neg)
++ pm_comparison_negations                               if supports(Lt) || supports(Eq)
++ pm_fma_decomposition                                  if supports(MulAcc)
+  + pm_shl_add_to_mulacc                                if supports(MulAcc) && supports(Shl)
++ pm_fdiv_to_mul                                        if supports(Fdiv)
 ```
 
-**नोट**: यह स्टेज `graph_rewrite` के बजाय `line_rewrite` इस्तेमाल करता है क्योंकि यह DAG के बजाय पहले से लीनियराइज़्ड इंस्ट्रक्शन लिस्ट पर ऑपरेट करता है।
+`get_transcendental_patterns` (`ir/src/decompositions/`) f16/f32/f64 के लिए `Exp2`, `Log2`, `Sin` को `xexp2`/`xlog2`/`xsin` polynomial सन्निकटनों से बदलता है (अन्य floats f32 में गणना करते हैं) और `Sqrt` को `xpow(x, 0.5)` से — हर उस op के लिए जो renderer में नहीं है, या `TRANSCENDENTAL=2` होने पर सभी के लिए। `decomposition_matcher` डिवाइस के `Renderer::decompositor()` hook की ऑप्टिमाइज़र-पक्ष वाली प्रति है; Metal वहाँ `amd_decomposition_patterns` स्थापित करता है (native `exp2`/`log2` के ऊपर `Exp`, `Log`, `Cos`, `Tan` और binary `Pow`)।
 
-इस पॉइंट पर, इंस्ट्रक्शन लिस्ट कोड जनरेशन के लिए तैयार है।
+उदाहरण में यह स्टेज `R1 * 64` को `R1 << 6` में और `R0 * 4 + (R1 << 6)` को `MulAcc(R0, 4, R1 << 6)` में बदलता है — `pm_shl_add_to_mulacc` द्वारा बनाया गया integer FMA।
 
-**Svod**: `line_rewrite_cleanups()` in `schedule/src/linearize/mod.rs`
+## 19e — gates, register lanes, float demotion
+
+`pm_move_gates_from_index` (`late/gater.rs`, Tinygrad के `gater.py` का port) अंततः validity को index से बाहर ले जाता है:
+
+| पहले | बाद में |
+|--------|-------|
+| `LOAD(INDEX(buf, WHERE(g, idx, Invalid)))` (कोई `alt` नहीं, कोई `gate` नहीं) | `LOAD { index: INDEX(buf, idx), alt: 0, gate: g }` |
+| `STORE(INDEX(buf, WHERE(g, idx, Invalid)), v)` (कोई `gate` नहीं) | `STORE { index: INDEX(buf, idx), value: v, gate: g }` |
+| `SHRINK` पर वही दो रूप (coalesced समूह) | साफ़ किए गए `SHRINK` पर gated `LOAD`/`STORE` |
+| एक साझा शर्त वाला image दो-coordinate `INDEX` | एक gated एक्सेस (पहले जाँचा जाता है) |
+| `WHERE(g, LOAD{gate: g}, alt)` और उल्टा रूप | `alt` load में fold हो जाता है |
+
+`valid_index` को तीसरे `WHERE` स्लॉट में शाब्दिक `Invalid` constant चाहिए। फिर `pm_scalarize_register_stack_index_preserve_deps` `INDEX(AFTER(STACK(..), deps), c)` — कुछ stores के बाद पढ़ा गया register stack का एक lane — को चुने गए `LOAD` में बदलता है, जिसके address पर deps फिर से जोड़े जाते हैं, और `merge_register_read_ends` उन `END`s को मिलाता है जो एक ही register `AFTER` के तहत समान ranges बंद करते हैं (एक debug assertion जाँचता है कि कोई register-stack `INDEX` नहीं बचा)। `demote_unsupported_floats` (`late/dtype.rs`) सबसे अंत में चलता है: `Float64` ALU रहित renderer (Metal, WebGPU) पर हर आंतरिक f64 मान f32 में गणना होता है, जबकि global f64 storage, उसके loads और उनके `alt` मान चौड़ा dtype बनाए रखते हैं।
+
+## 20 — final rewrite
+
+```text
+pm_final = pm_commit_weak + pm_cast_weak + pm_decomp (+ renderer.extra_matcher()) + pm_split_ends
+```
+
+एक fixpoint (debug builds में `assert_target_renderer_boundary` पहले चलता है: कोई स्थिर multi-index `INDEX` नहीं, कोई बचा हुआ singleton broadcast नहीं, कोई मिश्रित `STACK`/vector ALU नहीं)। `pm_split_ends` `END(x, [r1, r2, r3])` को `END(END(END(x, r3), r2), r1)` में बदलता है, ranges `(axis_id, axis_type.priority())` के घटते क्रम में; `Void`/`Bool` sources (reduction backedges) अलग किए जाते हैं और सबसे बाहरी `END` पर फिर से जोड़े जाते हैं, और मूल tag बनाए रखा जाता है ताकि बाद के merge चरण उसे फिर भी ढूँढ सकें। `extra_matcher` `svod_device::device::Renderer` पर प्रति-backend hook है; यह decompositions वाले उसी fixpoint के अंदर चलता है। CPU और NVPTX renderers फिर से `bool_storage_patterns` स्थापित करते हैं (`cpu_extra_matcher`), AMD `amd_non_native_fp8_patterns` स्थापित करता है (OCP FP8 ALU को f32 तक चौड़ा किया जाता है; storage, रूपांतरण और MFMA operands अछूते रहते हैं)।
+
+फिर, अलग पासों के रूप में: `pm_remove_invalid` बचे हुए हर data-typed `WHERE(c, x, Invalid)` को `WHERE(c, x, 0)` से और हर `Invalid` `STACK` lane को शून्य से बदलता है (एक debug assertion जाँचता है कि कोई नहीं बचा), और `add_implicit_barriers` local मेमोरी के लिए `BARRIER`s डालता है: local buffer पर ऐसे `AFTER` से पहले एक RAW barrier जिसके deps में बिना barrier वाला local `STORE` हो, और ऐसे लूप body के अंत में एक WAR barrier जो उस local buffer में store करता है जिसे उसी लूप का कोई अन्य load पढ़ता है। `optimize_kernel_with_config_and_final_rewrite` parity टूलिंग के लिए barriers से ठीक पहले capture किया गया ग्राफ़ लौटाता है। `graph_rewrite` द्वारा गिराया गया `KernelInfo` metadata फिर से जोड़ा जाता है।
+
+## प्रोग्राम सीमा (`program_from_sink`)
+
+`svod-codegen` कमान सँभालता है (`program_pipeline.rs`):
+
+1. **`add_control_flow`** (`linearize/mod.rs`): फिर से `pm_split_ends` (idempotent), फिर `CFGContext::new(sink)` और bottom-up `pm_add_control_flow`। Context हर `END` के लिए गणना करता है कि वह किस `END`/`SINK` में नेस्टेड है — `END x` `u` में नेस्टेड है जब `u` `x` पर निर्भर हो और `u` का range `x` की निर्भरताओं में हो — siblings को parent के अनुसार समूहित करता है, उन्हें इस आधार पर क्रमित करता है कि वे कितने siblings पर निर्भर हैं, और हर बाद वाले sibling के `RANGE` से उसके पूर्ववर्ती तक एक edge दर्ज करता है (पिछले sibling का `END`, या पहले वाले के लिए parent का `RANGE`)। `pm_add_control_flow` पूर्ववर्ती को `RANGE` के sources में जोड़ता है; तब `InScopeRangesProperty` nesting देखता है, और यही नीचे नेस्टेड ranges को बड़ा `run_count` देता है। ऐसा पूर्ववर्ती जिसमें पहले से range हो, panic करता है (`"edge would create cycle"`)।
+2. **`number_params`** अंतिम `PARAM` स्लॉट असाइन करता है (`validate_param_slots` असाइन न हुए या दोहराए गए स्लॉट को अस्वीकार करता है)।
+3. `SVOD_SPEC` चालू होने पर `spec_program` के विरुद्ध **`verify_final_sink`**; `ProgramInfo::from_sink` ABI पढ़ता है।
+4. **`pre_isel_matcher` / `isel_matcher`** — `svod_device::device::Renderer` पर दो instruction-selection hooks, दोनों bottom-up (`PreIselContext`, `IselContext`)। ये ISA-स्तर के backends के लिए हैं; LLVM और C renderers इन्हें `None` छोड़ते हैं।
+5. `UOp::program(sink, info, None, None, None)` — `PROGRAM` नोड, जिसके बाद वाले sources `LINEAR`, `SOURCE` और `ProgramBinary` स्टेज हैं।
+
+## `linearize`
+
+`do_linearize` `svod_schedule::linearize(sink)` (`linearize/linearize.rs`, Tinygrad के `linearizer.py` का सीधा port) को बुलाता है, फिर `line_rewrite_cleanups`, फिर `spec_program` के विरुद्ध `verify_linear_list`।
+
+हर नोड की sort key `(run_count, priority, extra, tuplize rank)` है:
+
+| Op | प्राथमिकता |
+|----|----------|
+| `PARAM` | −20, बराबरी स्लॉट (`extra`) से तय |
+| `BUFFER` (global, register) | −18 |
+| `BUFFER` (`AddrSpace::Local`) | −17 |
+| `END` | −5 |
+| `LOAD` | −1 |
+| बाकी सब (`CONST`, ALU, `SPECIAL`, …) | 0 |
+| `STORE` | +1 |
+| `RANGE` | +5 |
+
+`run_count = prod(vmax + 1)` नोड के scope वाले ranges पर (symbolic extent 1 गिना जाता है), इसलिए लूप के बाहर का कोड लूप body से पहले आता है। Tuplize rank Tinygrad की `(op, arg, dtype, *src.tuplize)` key है, जो toposort (`TuplizeKeys`) पर पुनरावृत्त रूप से गणना की जाती है, जिससे क्रम पूर्ण और नियतात्मक बनता है। फिर इन ranks पर `SINK` से max-heap toposort द्वारा रैखिक सूची बनाई जाती है, जिसे अंत में उलट दिया जाता है: कोई नोड तब निकलता है जब उसके सभी उपभोक्ता निकल चुके हों, इसलिए परिभाषाएँ पहले आती हैं, `LOAD`s अपने उपयोगों से पहले, `STORE`s गणना के बाद, और हर `RANGE` अपनी body से ठीक पहले खुलता है।
+
+`SVOD_DUMP_LINEAR=<dir>` scope वाले range ids के साथ toposort (`tree_<id>.txt`) और अंतिम सूची (`linear_<id>.txt`) लिखता है।
+
+## `line_rewrite_cleanups`
+
+`line_rewrite` instruction सूची पर एक बार चलता है; हर प्रविष्टि को कई से बदला जा सकता है। एकमात्र cleanup `linearize_cleanup_pattern` है: `Bool` gate वाला ऐसा `STORE` जिसका address `INDEX`/`SHRINK` है (संभवतः किसी `CAST` के पीछे), `IF(gate)`, बिना gate वाला `STORE`, `ENDIF` बन जाता है। `IF` और `ENDIF` दोनों केवल सूची में मौजूद होते हैं, ग्राफ़ में कभी नहीं (`"if not allowed in graph"`), इसीलिए `spec_program` को sink के साथ-साथ सूची पर भी जाँचा जाता है। जो backends store को predicate कर सकते हैं (LLVM, CUDA, Metal) वे इस तिकड़ी को conditional store के रूप में render करते हैं।
+
+यह सूची `PROGRAM` का `LINEAR` स्टेज है; `do_render` इसे `Renderer::render` को सौंपता है, और `do_compile` binary बनाता है। [उदाहरण सहित विवरण](./worked-example.md) row-sum kernel के लिए CPU renderer द्वारा उत्पन्न LLVM IR दिखाता है।

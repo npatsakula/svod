@@ -18,17 +18,15 @@ KFD का ABI एक C header है, `kfd_ioctl.h`, जिसे kernel से
 `device/include/kfd_ioctl.h` में vendor किया गया है (upstream AMD फ़ाइल, अपने ABI version
 history के साथ पूरी)। उससे build time पर `bindgen` द्वारा Rust bindings जनरेट होती हैं:
 
-- `device/build.rs` `bindgen` को **हर host पर unconditionally** चलाता है — कोई platform
-  gate नहीं और कोई empty-stub branch नहीं। यह **hermetic** है: इसे किसी system kernel headers
-  की ज़रूरत नहीं। वे दो headers जिन्हें `kfd_ioctl.h` transitively खींचता है
+- `device/build.rs` `bindgen` को हर Unix host पर चलाता है (`bindgen` एक `cfg(unix)`
+  build-dependency है), बिना किसी empty-stub branch के। यह **hermetic** है: इसे किसी system
+  kernel headers की ज़रूरत नहीं। वे दो headers जिन्हें `kfd_ioctl.h` transitively खींचता है
   (`_IOC`/`_IO*` macros के लिए `<linux/ioctl.h>`, `__uNN`/`__sNN` aliases के लिए
   `<linux/types.h>`) plus एक stub `<drm/drm.h>` (vestigial — body केवल `__u32 drm_fd` fields
   का उपयोग करता है) — ये ख़ुद `device/include/` के अंतर्गत vendored हैं, और `build.rs`
-  `-Iinclude` pass करता है ताकि bindgen इन्हें `/usr/include` के बजाय resolve करे। vendored
-  headers की ओर इस switch को byte-equivalent रूप में verify किया गया: regenerated bindings system-header
-  baseline से केवल 8 fixed-width type-alias spellings में भिन्न हैं (`__u32 = u32` बनाम
-  `c_uint`, identically sized) — सभी 60 structs और 34 constants identical हैं। (bindgen को
-  `libclang` चाहिए, जो macOS पर Xcode CLT के साथ आता है।)
+  `-I<crate>/include` pass करता है ताकि bindgen इन्हें `/usr/include` के बजाय resolve करे।
+  जनरेट की गई फ़ाइल में 60 structs और 34 constants हैं। (bindgen को `libclang` चाहिए, जो
+  macOS पर Xcode CLT के साथ आता है।)
 
   यह ठीक-ठीक उन KFD types और constants को allow-list करता है जिनकी बैकएंड को ज़रूरत है:
 
@@ -37,8 +35,7 @@ history के साथ पूरी)। उससे build time पर `bindge
                    kfd_event_data, kfd_hsa_signal_event_data,
                    kfd_hsa_memory_exception_data, kfd_hsa_hw_exception_data,
                    kfd_memory_exception_failure, __u\d+, __s\d+
-  allowlist_var:   KFD_IOC_.*, KFD_MMAP_TYPE.*, KFD_MAX_QUEUE_PERCENTAGE,
-                   AMDKFD_IOC_.*
+  allowlist_var:   KFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE, AMDKFD_IOC_.*
   ```
 
   (`AMDKFD_IOC_*` request codes allow-listed हैं पर कभी materialize नहीं होते: bindgen उनके
@@ -53,15 +50,15 @@ history के साथ पूरी)। उससे build time पर `bindge
 - एक **दूसरा bindgen pass** AQL/HSA side को cover करता है: `include/amd_hsa_wrapper.h`
   vendored ROCm `hsa/` headers खींचता है और `$OUT_DIR/hsa_sys.rs` देता है
   (`hsa_kernel_dispatch_packet_t`, `hsa_queue_t`, `amd_queue_t`, `amd_signal_t` और उनके
-  साथी), जिसे `device/src/amd/sys/hsa.rs` `include!` करता है। यहाँ `layout_tests` जान-बूझकर
+  साथी, enums constants के रूप में), जिसे `device/src/amd/sys/hsa.rs` `include!` करता है। यहाँ `layout_tests` जान-बूझकर
   **on** छोड़ा गया है: 256-byte `amd_queue_t` और 64-byte AQL packet layout-critical हैं,
   इसलिए एक mis-sized struct को build fail करनी ही चाहिए।
 
-bindings को हर जगह compile करना ही वह चीज़ है जो AMD बैकएंड को एक compile-time feature के
-बजाय एक [runtime-detected execution provider](./overview.md) बनाती है: bindings हर जगह
-generate होती हैं, हर Unix `cargo check` उनके ऊपर के KFD call sites को type-check करता है
-(`nix` ioctl wrappers ही एकमात्र `cfg(unix)` हिस्सा हैं), और बिना GPU वाला host बस कभी factory
-register नहीं करता।
+bindings को हर Unix host पर compile करना ही वह चीज़ है जो AMD बैकएंड को एक compile-time
+feature के बजाय एक [runtime-detected execution provider](./overview.md) बनाती है: हर Unix
+`cargo check` उनके ऊपर के KFD call sites को type-check करता है (kernel-facing modules
+`cfg(unix)` हैं; topology parser और packet builders हर जगह compile होते हैं), और बिना GPU
+वाला host बस कभी factory register नहीं करता।
 
 :::note[hand-written ioctl macros क्यों]
 `bindgen` argument *structs* emit करता है लेकिन `_IOWR` ioctl-number macros नहीं। वे
@@ -127,8 +124,10 @@ mappings के लिए `mmap` fd के रूप में। doorbell, इ�
 GPU nodes को sysfs से enumerate किया जाता है, किसी ioctl के माध्यम से नहीं।
 `device/src/amd/topology.rs`
 `/sys/devices/virtual/kfd/kfd/topology/nodes/<N>/properties` पढ़ता है — प्रति line एक
-`key value` pair — साथ ही sibling `<N>/gpu_id`, और एक `Vec<AmdNode>` return करता है,
-CPU nodes (`gpu_id == 0`) को छोड़ते हुए। यह कभी panic नहीं करता: बिना `/dev/kfd` वाला host एक empty vector देता है।
+`key value` pair — साथ ही sibling `<N>/gpu_id` (जो न हो तो inline `gpu_id` property पर
+fallback), और node id के अनुसार sorted एक `Vec<AmdNode>` return करता है, CPU nodes
+(`gpu_id == 0`) को छोड़ते हुए। यह कभी panic नहीं करता: जिस host पर वह sysfs tree नहीं है,
+वह एक empty vector देता है।
 
 यही enumeration वह चीज़ है जो runtime पर पूरे बैकएंड को gate करती है।
 `topology::has_devices()` — "कोई भी ऐसा node जिसका `gfx_target_version` एक supported
@@ -138,11 +137,13 @@ call करता है कि `"AMD"` device factory को register करन
 और यदि किसी ऐसे node के लिए factory माँगी जाए जो वहाँ नहीं है, तो वह एक स्पष्ट `Err(NoAmdGpu)`
 return करती है।
 
-हर `AmdNode` वे fields रखता है जिनकी बाक़ी बैकएंड को ज़रूरत होती है:
-`gpu_id`, `drm_render_minor`, `gfx_target_version` (जैसे `110000` → gfx1100),
-`simd_count`, `simd_per_cu`, `max_waves_per_simd`, `num_xcc`, `lds_size_in_kb`,
-`max_slots_scratch_cu`, और उनके साथी — ये scratch sizing और PM4-बनाम-AQL decision को
-feed करते हैं।
+हर `AmdNode` वे fields रखता है जिनकी बाक़ी बैकएंड को ज़रूरत होती है: `node_id`,
+`gpu_id`, `drm_render_minor`, `gfx_target_version` (जैसे `110000` → gfx1100, देखें
+[supported-GPU table](./overview.md)), `simd_count`, `array_count`,
+`simd_arrays_per_engine`, `simd_per_cu`, `max_waves_per_simd`, `lds_size_in_kb`,
+`wave_front_size`, `num_xcc`, `num_cp_queues` और `max_slots_scratch_cu` — ये scratch sizing
+और PM4-बनाम-AQL decision को feed करते हैं। बैकएंड जिस wave size का उपयोग करता है वह arch से
+आता है, `wave_front_size` से नहीं।
 
 :::tip[बिना hardware के testing]
 sysfs root को **`SVOD_KFD_TOPOLOGY`** से override किया जा सकता है, इसलिए parser को बिना
@@ -163,9 +164,10 @@ implement है:
 4. MAP_MEMORY_TO_GPU(handle)            bind into the GPU page table
 ```
 
-host VA पहले एक anonymous `PROT_NONE` mapping से reserve किया जाता है ताकि step 3 का
-host-visible `mmap` ठीक उसी address पर land कर सके (`MAP_FIXED`)। Free करना इसे उलट देता है:
-`UNMAP_MEMORY_FROM_GPU` → `munmap` → `FREE_MEMORY_OF_GPU`।
+size को पहले 4 KiB तक round up किया जाता है। host VA एक anonymous `PROT_NONE` mapping से
+reserve किया जाता है ताकि step 3 का host-visible `mmap` ठीक उसी address पर land कर सके
+(`MAP_FIXED`)। माँगा गया zero-fill map के बाद होता है और उसके लिए host visibility ज़रूरी है।
+Free करना इसे उलट देता है: `UNMAP_MEMORY_FROM_GPU` → `munmap` → `FREE_MEMORY_OF_GPU`।
 
 ### Allocation flavors
 
@@ -174,28 +176,31 @@ compose होते हैं:
 
 | `AllocKind` | Flags | किसके लिए उपयोग होता है |
 |---|---|---|
-| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ code के लिए `EXECUTABLE`, + host-visible होने पर `PUBLIC`) | Tensor data, code objects, scratch |
-| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, event page |
+| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ code के लिए `EXECUTABLE`, + host-visible होने पर `PUBLIC`) | Tensor data, code objects, scratch; host-visible kernarg arenas और graph / linked-plan control buffers |
+| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, SDMA staging buffer |
 
 `UNCACHED | COHERENT` GTT flavor मायने रखता है: command ring और signal slots CPU और GPU के
 बीच तुरंत visible होने चाहिए, वरना host एक ऐसे completion value पर हमेशा के लिए spin करता
 रहता है जो GPU L2 में अटका रह जाता है। KFD एक plain-VRAM ring पर `CREATE_QUEUE` को `EINVAL`
-के साथ reject कर देता है।
+के साथ reject कर देता है। `alloc_raw` के बाहर का एकमात्र allocation per-process event page है
+(`device.rs` में `alloc_event_page`), जो वही uncached-GTT flags raw ioctls के साथ compose
+करता है और इसलिए [VA registry](./debugging.md) में नहीं है।
 
 ### `cpu_access` copy queue का अनुसरण करता है
 
 allocator (`device/src/amd/allocator.rs`)
 `cpu_access = options.cpu_access || !self.dev.has_sdma_queue()` compute करता है। जब एक SDMA
-copy queue install होती है (CDNA पर default — देखें [अवलोकन](./overview.md)), एक intermediate
-**device-only** VRAM हो सकता है और copies DMA के माध्यम से जाती हैं: `_copyin`/`_copyout`
-copy queue के माध्यम से stage होती हैं, `_transfer` एक direct device→device copy है। जब कोई
+copy queue install होती है (हर part पर default — देखें [अवलोकन](./overview.md)), एक
+intermediate **device-only** VRAM हो सकता है और copies DMA के माध्यम से जाती हैं:
+`_copyin`/`_copyout` copy queue के माध्यम से stage होती हैं, और जब कोई भी side device-only
+हो तो `_transfer` एक device→device DMA है। जब कोई
 copy queue मौजूद न हो, `has_sdma_queue()` `false` होता है, इसलिए हर buffer को ज़बरन
 host-visible बना दिया जाता है और copies scoped `wait_storage` के बाद एक सादे host `memmove` पर
 वापस आ जाती हैं। generic `LruAllocator` (`device/src/allocator.rs`) freed buffers को `(size,
-BufferSpec)` के अनुसार pool करता है; `nolru` spec code objects और EOP / CWSR context-save
-buffers के लिए pool को bypass करता है, जबकि rings, GART pages, signal slots और scratch pooled
-allocator को पूरी तरह छोड़कर `alloc_uncached_tagged` / `alloc_host_visible_tagged` /
-`alloc_scratch` के माध्यम से सीधे seam तक जाते हैं।
+BufferSpec)` के अनुसार pool करता है; code objects, EOP / CWSR context-save buffers, rings,
+GART pages, signal slots और scratch कभी उस pool में प्रवेश नहीं करते — वे `AmdAllocator` को
+सीधे call करते हैं (`alloc_uncached_tagged` / `alloc_host_visible_tagged` /
+`alloc_scratch`) और सीधे seam तक जाते हैं।
 
 :::note[Process-shared state]
 `/dev/kfd` प्रति process एक बार खोला जाता है और सभी devices द्वारा साझा होता है (events को

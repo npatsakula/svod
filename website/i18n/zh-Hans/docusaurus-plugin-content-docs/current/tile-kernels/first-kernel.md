@@ -38,7 +38,7 @@ let ta = Tensor::from_slice(&a);
 let tb = Tensor::from_slice(&b);
 let mut out = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
 
-// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA and CUDA.
+// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA, CUDA and Metal.
 let arch = svod_tk::target::resolve_arch(&ta.device()).expect("a GPU device");
 let w = svod_tk::ArchCaps::for_arch(arch).wave_size as i64;
 
@@ -83,7 +83,7 @@ let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
 run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| { /* body */ })
 ```
 
-`[1, 1, 1]` 网格与 `w` 块是这次启动的几何。我们用**一个工作组、一个 wave**：整个 `16×16` tile 装得进单个 wave 的寄存器，没有什么需要分散到多个块上。块大小取 `w`，即 **wave 宽度**，这是我们事先从设备查到的（`ArchCaps::for_arch(resolve_arch(&ta.device())).wave_size`）；因为一个 wave 在 CDNA 上是 64 个 lane，而在 RDNA 和 NVIDIA 上是 32 个 lane，块维度*就是*这个 lane 数。输出切片在前，输入在后，**这个顺序就是契约**，下一步要靠它。
+`[1, 1, 1]` 网格与 `w` 块是这次启动的几何。我们用**一个工作组、一个 wave**：整个 `16×16` tile 装得进单个 wave 的寄存器，没有什么需要分散到多个块上。块大小取 `w`，即 **wave 宽度**，这是我们事先从设备查到的（`ArchCaps::for_arch(resolve_arch(&ta.device())).wave_size`）；因为一个 wave 在 CDNA 上是 64 个 lane，而在 RDNA、NVIDIA 和 Apple 上是 32 个 lane，块维度*就是*这个 lane 数。输出切片在前，输入在后，**这个顺序就是契约**，下一步要靠它。
 
 ### 2. 拿一个 wave 来干活
 
@@ -111,7 +111,7 @@ let gb = ker.gl(&[1, 1, 16, 16], DType::Float32);
 let frag = ker.frag(FragRole::Accumulator);
 ```
 
-这是 [Wave32 与 Wave64](./wave-portability) 里那一招可移植性手法，即便在一个没有矩阵乘法的内核里它也很关键：同一个逻辑 `16×16` f32 tile，在每一种受支持的架构上都有着*不同的物理 lane 布局*，所以点名一个**角色**而非一个硬编码片段，才能让同一个内核体为它们全都编译。我们向内核索要 `Accumulator` 角色，它说白了就是一个全精度结果 tile 的角色，而加法产出的恰恰也是这种 tile，并不只限于 MMA；`Kernel::frag` 转发给 `ArchCaps::frag`，替目标平台解析出物理片段：CDNA 上是 wave64，RDNA 上是偶/奇 wave32 布局，CUDA 上是两半式的 `mma.sync` 布局。
+这是 [布局与 wave 宽度](./wave-portability) 里那一招可移植性手法，即便在一个没有矩阵乘法的内核里它也很关键：同一个逻辑 `16×16` f32 tile，在每一种受支持的架构上都有着*不同的物理 lane 布局*，所以点名一个**角色**而非一个硬编码片段，才能让同一个内核体为它们全都编译。我们向内核索要 `Accumulator` 角色，它说白了就是一个全精度结果 tile 的角色，而加法产出的恰恰也是这种 tile，并不只限于 MMA；`Kernel::frag` 转发给 `ArchCaps::frag`，替目标平台解析出物理片段：CDNA 上是 wave64 的 stride 映射，RDNA3 上是偶/奇 wave32 布局，RDNA4 上是每 lane 8 个元素的 stride 映射，CUDA 上是两半式的 `mma.sync` 布局，Apple 上是 8×8 片段排成的 2×2 网格。（`ker.acc((16, 16), TileLayout::Row)` 是 `ker.rt(.., DType::Float32, .., ker.frag(FragRole::Accumulator))` 的一次调用简写；库内核用的就是它。）
 
 ### 5. 加载：全局 → 寄存器
 
@@ -122,7 +122,7 @@ let rb = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), gb, 
 
 `ker.rt(...)` 在我们刚解析出的片段布局中分配一个寄存器 tile，`warp.load` 再从全局把它填满。`MoveIdx::block((0, 0, 0, 0), 2)` 指明读取全局的*哪个* tile：这个元组是 tile 沿四个维度各自的坐标，这里全是零，因为单个 `16×16` tile 只有 `(0, 0)` 这一个位置；而那个 `2` 是这些 tile 堆叠所沿的轴，即维度 2，也就是 `[1, 1, 16, 16]` 视图的行维度。（一个 `[1, 1, 32, 16]` 的全局会容纳两个行 tile，读取第二个就把那个坐标设为 `1`。）wave 协作着把这 256 个元素直接拉进寄存器，一进来便已是计算所要的布局。
 
-这是那条*直接的* `全局 → 寄存器` 路径，中间不停共享内存这一站。一个流式处理大张量的内核会先经一个共享 tile 分阶段（为了合并访问和一个无冲突的 swizzle，即 [FLOPS 藏在哪里](./where-flops-hide) 里那些瓶颈）；这里跳过它，因为单个常驻 tile 两样都不需要。
+这是那条*直接的* `global → register` 路径，中间不停共享内存这一站。一个流式处理大张量的内核会先经一个共享 tile 分阶段（为了合并访问和一个无冲突的 swizzle，即 [FLOPS 藏在哪里](./where-flops-hide) 里那些瓶颈）；这里跳过它，因为单个常驻 tile 两样都不需要。
 
 ### 6. 计算：就这一个操作
 
@@ -161,23 +161,23 @@ let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
 |------|-----|
 | **tile 维度是 `16` 的倍数** | 一个 tile 是整数个 `16×16` 矩阵核心片段；`ker.rt` 会断言这一点。 |
 | **`gl()` 顺序 = 启动缓冲区顺序** | 输出在前，再到输入。绑定是位置式的；一处不匹配就会悄无声息地把缓冲区调换，数字错了却没有报错，编译器也抓不住。 |
-| **按角色请求片段，而非按常量** | 正是 `ker.frag(role)` 让同一个内核体能在 wave32、wave64 *以及* NVIDIA 的 warp32 上都跑起来。 |
-| **它是 GPU 内核** | 构建器铸出真实的 lane 索引（`Op::Special`），所以执行瞄准的是 GPU——AMD 或 CUDA——而非 CPU。 |
+| **按角色请求片段，而非按常量** | 正是 `ker.frag(role)` 让同一个内核体能在 wave32、wave64、NVIDIA 的 warp32 *以及* Apple 的 SIMD group 上都跑起来。 |
+| **它是 GPU 内核** | 构建器铸出真实的 lane 索引（`Op::Special`），所以执行瞄准的是 GPU（AMD、CUDA 或 Metal），而非 CPU。 |
 
 ---
 
 :::tip[面向 GPU 专家]
 内核体降级成的，恰好是 [向 IR 中编写](./lowering) 里那副 `RANGE` / `INDEX` / `LOAD` / `STORE` 形状，没有新节点类型。内核铸出一个 lane 索引 `Op::Special`，wave 的各次加载搭在它上面；每次 `warp.load` 在那个 lane 下变成一个全局 `LOAD`，`warp.add` 是单个 `Op::Binary(Add)`，存储则是 `SINK` 罩住的那唯一一个 `STORE`。这里**没有** `Wmma`，也**没有**位于 `Local` 地址空间的 `BUFFER`：它是一次纯寄存器的往返，是 IR 所能表达的最精简内核。
 
-因为内核发射 `Special` 操作，它*就是*一个完全手工降级的 GPU 内核：优化器和工作组维度遍把带 `Special` 的图当成已降级的来对待并直接放行（即 `opts_to_apply: Some(vec![])` 所把守的那同一道关卡）。这也正是它只在 GPU 后端（AMD 或 NVPTX）上渲染的原因：lane 索引在标量 CPU 路径上毫无意义。不过，*构建*那个 `SINK` 纯粹是 UOp 构造，不需要 GPU；只有执行它才需要。正是这道分割，让一个内核能在每次构建时由主机侧的形状检查把守，再由一个单独的、受门控的测试来检验设备上的数字。
+因为内核发射 `Special` 操作，它*就是*一个完全手工降级的 GPU 内核：优化器和工作组维度遍把带 `Special` 的图当成已降级的来对待并直接放行（即 `opts_to_apply: Some(vec![])` 所把守的那同一道关卡）。这也正是它只在 GPU 后端（AMD、NVPTX 或 Metal）上渲染的原因：lane 索引在标量 CPU 路径上毫无意义。不过，*构建*那个 `SINK` 纯粹是 UOp 构造，不需要 GPU；只有执行它才需要。正是这道分割，让一个内核能在每次构建时由主机侧的形状检查把守，再由一个单独的、受门控的测试来检验设备上的数字：`tk/src/test/unit/guide.rs` 里放着的正是这个内核体，它在每次 `cargo test` 时检查图的形状，并在 `--ignored` 下于硬件上运行（[调试](./debugging)）。
 :::
 
 ---
 
 ## 为什么这很重要
 
-这个小内核是每个 tk 内核浇注其中的模板。matmul 内核加上一个 `mma` 和一个 K 循环；而实战范例 [Flash Attention](./flash-attention) 则让矩阵核心与一个在线 softmax 递推、双缓冲流式传输和一个 wave 大小分支一同运转。但骨架恰恰就是你刚写下的这些：按启动顺序声明全局，按角色请求 tile，在内存空间之间搬数据，对 tile 计算，`finish`。学会这副骨架，更难的内核是在它之上添东西，而不是另起炉灶。
+这个小内核是每个 tk 内核浇注其中的模板。GEMM 加上一个 `mma`、一条共享内存条带和一个 K 循环；而实战范例 [Flash Attention](./flash-attention) 则让矩阵核心与一个在线 softmax 递推、双缓冲流式传输和一个布局分支一同运转。但骨架恰恰就是你刚写下的这些：按启动顺序声明全局，按角色请求 tile，在内存空间之间搬数据，对 tile 计算，`finish`。学会这副骨架，更难的内核是在它之上添东西，而不是另起炉灶。
 
 而所有这些都是那一套 UOp IR。你构建的那个 `SINK`，与编译器为自动调优内核所产出的是同一类对象，这正是本节的全部要点。
 
-接下来，是那个让手工编写真正变难的细节——让一个内核跨不同 wave 大小与片段布局保持正确：[Wave32 与 Wave64](./wave-portability)。
+接下来，先是其余的词汇（[构建器 API](./builder-reference)），再是那个让手工编写真正变难的细节——让一个内核跨不同 wave 宽度与片段布局保持正确：[布局与 wave 宽度](./wave-portability)。

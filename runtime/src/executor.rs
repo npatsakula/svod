@@ -470,8 +470,8 @@ impl UnifiedExecutor {
 ///
 /// For most use cases, a single global executor is sufficient.
 /// Thread-safety is handled by timeline signals and dependency tracking.
-static EXECUTOR: once_cell::sync::Lazy<parking_lot::Mutex<UnifiedExecutor>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(UnifiedExecutor::new(svod_device::registry::registry())));
+static EXECUTOR: std::sync::LazyLock<parking_lot::Mutex<UnifiedExecutor>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(UnifiedExecutor::new(svod_device::registry::registry())));
 
 /// Get access to the global executor.
 pub fn global_executor() -> parking_lot::MutexGuard<'static, UnifiedExecutor> {

@@ -23,7 +23,9 @@ FLOPS 并没有凭空蒸发，它们只是藏了起来。把它们找出来，�
 - 以矩阵核心要求的*确切*布局把它们送进寄存器，
 - 而且这一切都得在不让数学单元空等的前提下完成。
 
-> **Roofline 直觉。** 每个内核的上限，要么取决于它算得多快（计算受限），要么取决于它搬数据多快（内存受限）。朴素的 matmul 是内存受限的：时间都耗在等加载上，昂贵的矩阵核心却被饿着。分块的目标就是把内核推向计算受限，让数学单元始终有料可吃。
+> **Roofline 直觉。** 每个内核的上限，要么取决于它算得多快（计算受限），要么取决于它搬数据多快（内存受限）。
+> 朴素的 matmul 是内存受限的：时间都耗在等加载上，昂贵的矩阵核心却被饿着。
+> 分块的目标就是把内核推向计算受限，让数学单元始终有料可吃。
 
 所以「FLOPS 都去哪了？」这个问题，真正问的是：**是什么妨碍了矩阵指令一条接一条地发射？** 答案反复出现的有五个。
 
@@ -64,13 +66,14 @@ NVIDIA 靠高*占用率*隐藏延迟：常驻许多 warp，一个停顿了另一
 
 ## 架构的视角：MFMA、WMMA 与 `mma.sync`，wave32 与 wave64
 
-有三个硬件事实塑造了 `tk` 构建的每一个 tile 内核，值得记牢：
+有几个硬件事实塑造了 `tk` 构建的每一个 tile 内核，值得记牢：
 
-- **CDNA**（数据中心，例如 gfx942）经 **MFMA** 指令发射矩阵乘法，跑 **wave64**，即每个波前 64 个 lane。
-- **RDNA**（例如 gfx1151，RDNA3.5，wave32）发射 **WMMA** 指令，跑 **wave32**，即 32 个 lane。
+- **CDNA**（数据中心，gfx942）经 **MFMA** 指令发射矩阵乘法，跑 **wave64**，即每个波前 64 个 lane。
+- **RDNA**（RDNA3.5 上的 gfx1151，RDNA4 上的 gfx1200/gfx1201）发射 **WMMA** 指令，跑 **wave32**，即 32 个 lane。RDNA3 与 RDNA4 彼此都不一致：gfx11 在两个半 wave 之间复制操作数，并交错排布累加器的行；gfx12 两者都不做。
 - **NVIDIA**（`sm_80+`）发射 **`mma.sync`**，跑一个 **warp32**，即 32 个 lane，但片段布局又是自成一套：一个 16×16 tile 被当作两个 `m16n8` 半块来持有。
+- **Apple**（Apple7+）在 32 lane 的 SIMD group 上运行 `simdgroup_matrix`，片段为 8×8，只有其他平台的四分之一。
 
-lane 数一变，tile 的元素在 wave 上的分布就跟着变，寄存器布局随之改变，规约也随之改变；而即便宽度相同，片段布局也各不相同。一个为其中一种写、却在另一种上运行、又没把这点考虑进去的内核，会悄无声息地算错。让同一个内核在三者上都正确，自成一章：[Wave32 与 Wave64](./wave-portability)。
+lane 数一变，tile 的元素在 wave 上的分布就跟着变，寄存器布局随之改变，规约也随之改变；而即便宽度相同，片段布局也各不相同。一个为其中一种写、却在另一种上运行、又没把这点考虑进去的内核，会悄无声息地算错。让同一个内核在所有这些平台上都正确，自成一章：[布局与 wave 宽度](./wave-portability)。
 
 :::tip[面向 GPU 专家]
 HipKittens 的 `analysis/paper_experiments/` 微基准把上述瓶颈逐一量化，为设计提供了依据：
@@ -81,15 +84,9 @@ HipKittens 的 `analysis/paper_experiments/` 微基准把上述瓶颈逐一量�
 | 瓶颈 4（重叠并非通用） | 一个 BF16 GEMM 在 8-wave 乒乓下达到峰值；一个 FP8 GEMM 则在 4-wave 交织下达到峰值。最优的 wave 重叠策略因 dtype 而异。 |
 | 瓶颈 5（小芯片 swizzle） | 为 XCD 局部性重映射工作组 ID，可在一个大 GEMM 上带来可观测的加速。 |
 
-`tk` 把这些调节杆逐一落地：XOR swizzle 在 `tk/src/swizzle.rs`（移植自 HipKittens 的共享 tile 布局），L2/小芯片重映射在 `tk/src/grid.rs`（`l2_swizzle`）；计算/内存的重叠则表达为 Flash Attention KV 循环上的一个 `sched::pipeline(SchedKind::Attention, …)` 标记，由线性化之后的一个调度遍来消费。
+`tk` 把这些调节杆逐一落地：XOR swizzle 在 `tk/src/swizzle.rs`（移植自 HipKittens 的共享 tile 布局，外加 `ldmatrix`、`cp.async` 与 gfx12 gather 所需的 16 字节块 `Sw16x16Mma`），L2/小芯片重映射在 `tk/src/grid.rs`（`l2_swizzle`，在 CUDA GEMM tile、最宽的 RDNA4 tile 和 gfx942 matmul 配置中开启）；计算/内存的重叠则表达为 Flash Attention KV 循环上的一个 `sched::pipeline(SchedKind::Attention, …)` 标记，由 `codegen/src/llvm/sched.rs` 中线性化之后的一个遍来消费。目前该遍在 CDNA 上把两种 `SchedKind` 都降级为 `@llvm.amdgcn.iglp.opt(0)`，把 MFMA/内存的交织交给 AMDGPU 机器调度器，在其他平台上则不做任何事；在 gfx942 上实测发现，手动摆放的 `sched.barrier` 栅栏会让一个按数据流调度的 GEMM *退化*到单用 iglp 时的 0.6–0.9×，因为它们恰恰钉死了双缓冲本该创造出的加载/MFMA 重叠。
 
-当这个高层标记还不够用时，AUTHOR 面孔还直接暴露了原始的机器调度器内建函数（以 `Op::Custom` 形式），用来从瓶颈 4 里再榨出最后几个百分点：
-
-- 控制 MFMA 突发前后的 wave 发射优先级，
-- 为寄存器分阶段的预取推迟 LDS 等待，
-- 把一簇加载、MFMA、存储钉死在机器调度器面前。
-
-`sched::pipeline` 是默认方式；上面这些则是手动覆盖，用来亲手摆放调度。
+在栅栏确实有收益的地方，AUTHOR 面孔以 `tk/src/asm.rs` 中带类型的 `Op::Custom` 节点暴露原始控制：`s_setprio`、`s_waitcnt_lgkmcnt`、`sched_barrier`、`iglp_opt`，每个都串在一个依赖上，从而落在作者放置的位置。树内唯一的用例是 RDNA4 GEMM：`ArchCaps::needs_pipeline_commit_fence()` 指出那种调度器会把流水线的整个 LDS 提交提升到本轮 MMA 之前的架构，`gemm_core` 则以 `sched_barrier(0, after_mma)` 应对，让预取在矩阵运算期间保持在途。
 :::
 
 ---
@@ -100,7 +97,7 @@ HipKittens 的 `analysis/paper_experiments/` 微基准把上述瓶颈逐一量�
 
 - 下一章 [什么是分块](./tiling) 回应瓶颈 1–3：把数据放进正确的布局、正确的内存，且无冲突。
 - [Flash Attention](./flash-attention) 展示瓶颈 2 和 4 的实战：双缓冲流式传输，加一条显式流水线。
-- [Wave32 与 Wave64](./wave-portability) 则是瓶颈 1、lane 数差异，以及各架构片段布局一并强加的那笔可移植性税。
+- [布局与 wave 宽度](./wave-portability) 则是瓶颈 1、lane 数差异，以及各架构片段布局一并强加的那笔可移植性税。
 
 一句话：快 GPU 内核不是「把数学写下来」那么简单。它是*数学，再加上一份答案——两条矩阵指令之间的每一个周期都去了哪里*。FLOPS 就藏在那里。
 

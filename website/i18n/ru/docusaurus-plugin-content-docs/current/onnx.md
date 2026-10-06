@@ -2,53 +2,83 @@
 sidebar_label: ONNX-инференс
 ---
 
-# Инференс ONNX-моделей
+# ONNX-инференс
 
-ONNX-импортёр Svod — рекомендуемый способ инференса моделей. Он загружает стандартные `.onnx`-файлы, раскладывает операторы на ленивые тензорные операции Svod и компилирует их через полный пайплайн оптимизаций — без C++ рантайма.
-
-**Текущий статус:**
+`svod-onnx` превращает файл `.onnx` в такой же ленивый тензорный граф, какой
+строит модель, написанная вручную: каждый оператор раскладывается на операции
+`svod-tensor`, поэтому импортированный граф проходит через весь планировщик,
+оптимизатор и генератор кода и выполняется на любом бэкенде. ONNX Runtime под
+капотом нет.
 
 | Возможность | Статус |
-|-------------|--------|
+|---|---|
 | Прямой инференс | Поддерживается |
-| 162 / 200 операторов ONNX | [Таблица паритета](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md) |
-| CNN-архитектуры (ResNet, DenseNet, VGG, ...) | Проверено 9 моделей |
-| Расширения Microsoft (Attention, RotaryEmbedding) | Поддерживается |
-| Динамический размер батча | Поддерживается (Variable API) |
+| Операторы | 162 из 200 стандартных операторов ([таблица соответствия](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
+| Соответствие стандарту | 1357 тестов узлов из ONNX backend test suite проходят на обоих CPU-бэкендах (Clang, LLVM); набор также запускается на AMD и CUDA, если `SVOD_DEVICE` выбирает одно из этих устройств |
+| Динамические размерности | Привязываются при импорте (см. [Динамические размерности](#dynamic-dimensions)) |
+| Contrib-операторы Microsoft | `Attention`, `RotaryEmbedding`, `SkipLayerNormalization`, `EmbedLayerNormalization`, `BiasGelu`, `FastGelu` |
 | Обучение / обратный проход | Не поддерживается |
 
-**Сравнение с другими фреймворками**
-
-Среди чистых Rust-фреймворков у Svod самое широкое покрытие операторов ONNX — 162 оператора, 1357 пройденный conformance-тест на обоих CPU-бэкендах (Clang и LLVM); тот же набор запускается и на устройствах AMD и CUDA, когда их выбирает `SVOD_DEVICE`. У `candle` и `burn` операторов меньше, а тестовых наборов сопоставимого масштаба нет. Если же нужна максимальная совместимость с продакшн-моделями ONNX — используйте `ort`, Rust-обёртку вокруг C++ ONNX Runtime, которая покрывает полную спецификацию.
+Для операторов вне этой таблицы спецификацию целиком покрывает `ort` (обёртка
+над ONNX Runtime на C++).
 
 ---
 
 ## Быстрый старт
 
-Добавьте `svod-onnx` и `svod-tensor` в `Cargo.toml`:
-
 ```toml
 [dependencies]
-svod-onnx = { git = "https://github.com/npatsakula/svod" }
-svod-tensor = { git = "https://github.com/npatsakula/svod" }
+svod-onnx   = "0.1"
+svod-tensor = "0.1"
+prost       = "0.14"            # ModelProto::decode
 ```
 
-### Простой вариант: модели со встроенными весами
+У импортёра три точки входа:
 
-Для моделей, у которых все входы уже вшиты в файл (без рантайм-входов):
+| Вызов | Веса | Входы |
+|---|---|---|
+| `import(path, dim_bindings)` | Инициализаторы с плавающей точкой лениво отображаются из файла в память; `data_location = EXTERNAL` разрешается относительно каталога файла | Невыделенные заглушки, которым вы делаете `assign` |
+| `import_model_with_inputs(proto, inputs, dim_bindings)` | Читаются из декодированного `ModelProto` | Ваши собственные тензоры, трассируемые прямо в граф |
+| `import_model(proto, dim_bindings)` | Читаются из декодированного `ModelProto` | Заглушки, как в `import` |
+
+Все три возвращают `OnnxModel`:
 
 ```rust
+pub struct OnnxModel {
+    pub inputs: HashMap<String, Tensor>,      // graph inputs that are not initializers
+    pub outputs: HashMap<String, Tensor>,     // lazy; nothing has run yet
+    pub variables: HashMap<String, Variable>, // one per named dim_param
+}
+```
+
+### Входы во время выполнения
+
+Создайте входные тензоры сами и передайте их импортёру. Граф трассируется на
+них, поэтому тензоры, которые вы держите, — это и есть буферы, из которых читают
+ядра:
+
+```rust
+use std::collections::HashMap;
+
+use prost::Message;
+use svod_onnx::parser::onnx::ModelProto;
 use svod_onnx::{OnnxImporter, OnnxModel};
 use svod_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut importer = OnnxImporter::new();
-    let OnnxModel { outputs, .. } = importer.import("model.onnx", &[])?;
+    let proto = ModelProto::decode(std::fs::read("model.onnx")?.as_slice())?;
 
-    // Подготавливаем все выходы вместе, выполняем за один проход
-    let outs: Vec<&Tensor> = outputs.values().collect();
-    Tensor::realize_batch(outs)?;
+    // Same shape and dtype as the graph input "input"
+    let image = Tensor::from_ndarray(&load_image_nchw());    // [1, 3, 224, 224] f32
 
+    let OnnxModel { outputs, .. } = OnnxImporter::new().import_model_with_inputs(
+        proto,
+        HashMap::from([("input".to_string(), image.clone())]),
+        &[("batch", 1)],
+    )?;
+
+    // Schedule every output together, run once
+    Tensor::realize_batch(outputs.values())?;
     for (name, tensor) in &outputs {
         println!("{name}: {:?}", tensor.as_ndarray::<f32>()?);
     }
@@ -56,66 +86,123 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Модели с рантайм-входами
+`Tensor::from_ndarray` и `Tensor::from_raw_bytes(bytes, &dims, dtype)` дают
+тензор, владеющий буфером объявленной формы; `Tensor::from_slice` всегда
+одномерный, поэтому меняйте форму только через один из этих конструкторов.
 
-Большинству моделей нужны данные на этапе выполнения (изображения, токены, аудио). Деструктурируйте `OnnxModel` и используйте `remove()`, чтобы взять владение входными тензорами:
+### Скомпилировать один раз, запускать повторно
+
+Для многократного инференса скомпилируйте выходы в план и между запусками
+записывайте новые данные прямо во входной буфер:
 
 ```rust
-use svod_onnx::{OnnxImporter, OnnxModel};
-use svod_tensor::Tensor;
+let plan = Tensor::prepare_batch(outputs.values())?;   // schedule + compile, once
+plan.execute()?;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut importer = OnnxImporter::new();
-    let OnnxModel { mut inputs, outputs, .. } = importer.import("model.onnx", &[])?;
-
-    // Назначаем входные данные (лениво — без аллокации)
-    let input = inputs.remove("input").unwrap();
-    input.assign(&Tensor::from_slice(&my_data));
-
-    // Подготавливаем все выходы вместе, выполняем за один проход
-    // (внутренне резолвит assign входов — отдельный realize не нужен)
-    let outs: Vec<&Tensor> = outputs.values().collect();
-    Tensor::realize_batch(outs)?;
-    Ok(())
+for batch in batches {
+    image.array_view_mut::<f32>()?.as_slice_mut().unwrap().copy_from_slice(&batch);
+    plan.execute()?;                                   // replay: no tracing, no compilation
+    let logits = outputs["output"].as_vec::<f32>()?;
 }
 ```
 
+`array_view_mut` — представление `ndarray` без копирования поверх отображения
+входа на хост; `prepare_batch` связывает каждый выходной тензор с буфером
+плана, поэтому `as_vec` / `as_ndarray` читают результат последнего запуска.
+
+### Входы-заглушки
+
+`import(path)` — точка входа, которая отображает веса в память и разрешает
+внешние данные. Её входы — заглушки: сделайте `assign` значения той же формы и
+выполните (realize) вход *до* выходов. Заглушка сохраняет один буфер во всех
+планах, поэтому подготовленный план видит и последующие `assign` + `realize`,
+и записи через `array_view_mut`.
+
+```rust
+let OnnxModel { mut inputs, outputs, .. } = OnnxImporter::new().import("model.onnx", &[])?;
+
+let input = inputs.remove("input").unwrap();
+input.assign(&Tensor::from_ndarray(&image));
+input.realize()?;
+Tensor::realize_batch(outputs.values())?;
+```
+
+Модели, у которой все входы — инициализаторы, ничего из этого не нужно:
+её запускает `Tensor::realize_batch(model.outputs.values())?`.
+
 ---
 
-## Архитектура
+## Динамические размерности {#dynamic-dimensions}
 
-### Двухфазный дизайн
+Именованный `dim_param` (`"batch"`, `"sequence_length"`) становится `Variable`
+с границами `(1, default_max_dim)`; `default_max_dim` — публичное поле
+`OnnxImporter`, по умолчанию равное 32767. Безымянная размерность или
+размерность нулевого размера становится равной 1.
 
-Импортёр обрабатывает ONNX-модели в два этапа:
+Привязывайте все динамические размерности при импорте. Привязанная размерность
+становится обычной константой в трассированном графе, поэтому ядра
+специализируются под неё:
 
-**`import(path, dim_bindings)`** выполняет обе фазы одним вызовом: парсит protobuf, извлекает инициализаторы и спецификации входов, обходит граф в топологическом порядке, диспатчит каждый ONNX-узел в соответствующую реализацию Tensor и возвращает `OnnxModel { inputs, outputs, variables }`. Никаких вычислений — результат представляет собой набор ленивых хэндлов `Tensor`, которые компилируются и выполняются при вызове `realize()`.
+```rust
+let model = importer.import("model.onnx", &[("batch", 8), ("sequence_length", 512)])?;
+println!("{:?}", model.inputs["input_ids"]);   // Tensor { shape: [8, 512], dtype: Scalar(Int64), .. }
+```
+
+Непривязанная размерность остаётся символьной: её буфер выделяется под верхнюю
+границу, а `dims()` завершается ошибкой `SymbolicShape` (вывод `Debug`
+показывает `shape: symbolic`). Перепривязка через
+`ExecutionPlan::execute_with_vars` для импортированных графов не
+поддерживается — привязанная размерность уже стала константой, а для
+непривязанной компилируется ядро, которое игнорирует значение во время
+выполнения. Чтобы обслуживать несколько размеров батча, импортируйте модель
+отдельно для каждого размера или уменьшите `default_max_dim`, чтобы буферы
+непривязанных размерностей оставались небольшими. Привязки вне допустимого
+диапазона завершаются ошибкой `IrConstruction` при импорте; привязка для имени,
+которое модель не объявляет, игнорируется.
+
+---
+
+## Как работает импортёр
 
 ```mermaid
 flowchart LR
-  A["model.onnx"] -->|"import(path, dims)"| B["OnnxModel (inputs, outputs, variables)"]
-  B -->|"realize()"| C["results"]
+  A["model.onnx"] -->|"parse: initializers, input specs, opsets"| B["OnnxGraph"]
+  B -->|"trace: one tensor op per node"| C["OnnxModel (inputs, outputs, variables)"]
+  C -->|"realize / prepare"| D["kernels"]
 ```
 
-Для продвинутых сценариев (изучение структуры графа до импорта) метод `import_model()` принимает предварительно распарсенный `ModelProto`.
+**Разбор.** Protobuf декодируется, инициализаторы становятся тензорами, входы
+графа — спецификациями форм, а для каждого домена записывается версия opset.
+При импорте через `import` каждый инициализатор с плавающей точкой, в котором
+больше одного элемента, становится ленивым представлением файла
+(`SHRINK → BITCAST → RESHAPE → COPY` на устройство по умолчанию), поэтому
+большая модель не требует копирования на хосте; скаляры сворачиваются в
+константы.
+
+**Трассировка.** Узлы обходятся в топологическом порядке, и каждый
+диспетчеризуется в свою тензорную реализацию. Результат — набор ленивых
+выходных тензоров. Некоторые операторы читают *данные* входа во время
+трассировки — форму у `Reshape`, число повторов у `Tile`, k у `TopK`, `Range`,
+`ConstantOfShape` и вход `axes` у редукций начиная с opset 13 (`ReduceSum`) или
+18 (остальные), — поэтому эти небольшие тензоры выполняются (realize) во время
+импорта. Если один из них является входом графа, передайте его через
+`import_model_with_inputs`.
 
 ### Декомпозиция операторов
 
-Каждый оператор ONNX раскладывается на операции Svod Tensor. Степень сложности разная:
-
-**Прямые отображения** — около 60 операторов напрямую соответствуют одному методу тензора:
+Около пятидесяти операторов один к одному отображаются на метод тензора:
 
 ```rust
-// In the registry:
-"Add" => x.try_add(y)?
-"Relu" => x.relu()?
+"Add"     => x.try_add(y)?
+"Relu"    => x.relu()?
 "Sigmoid" => x.sigmoid()?
-"Equal" => x.try_eq(y)?
+"Equal"   => x.try_eq(y)?
 ```
 
-**Паттерны-билдеры** — сложные операторы с множеством необязательных параметров используют fluent API:
+Операторы с множеством необязательных атрибутов используют builder-методы
+тензорного крейта:
 
 ```rust
-// Conv with optional bias, padding, dilation, groups
 x.conv()
     .weight(w)
     .maybe_bias(bias)
@@ -125,210 +212,134 @@ x.conv()
     .call()?
 ```
 
-**Многошаговые декомпозиции** — операторы вроде BatchNormalization, Attention и Mod требуют промежуточных вычислений. `Mod` выбирает одну из четырёх декомпозиций по атрибуту `fmod` и типу входа; ветка для чисел с плавающей точкой в стиле Python — это `x - floor(x / y) * y`:
+Остальные раскладываются в несколько шагов. `Mod`, например, выбирает одну из
+четырёх форм по атрибуту `fmod` и dtype входа; ветка для чисел с плавающей
+точкой с семантикой Python — `x - floor(x / y) * y`:
 
 ```rust
 let div = x.try_div(y)?;
 x.try_sub(&div.floor().try_mul(y)?)?
 ```
 
-Обратите внимание на `floor()` — без `?`. Унарные операции округления (`floor`, `ceil`, `round`, `trunc`), а также `cast`, `neg`, `abs`, `square` и `sign` не могут завершиться ошибкой и возвращают обычный `Tensor`. Побитовые операторы, которые используют `BitwiseAnd`/`Or`/`Xor` и `BitShift`, — это `try_bitand`, `try_bitor`, `try_bitxor`, `try_shl` и `try_shr` (доступны также как `&`, `|`, `^`, `<<`, `>>`, возвращающие `Result<Tensor>`).
+После `floor()` нет `?`: операции округления, `cast`, `neg`, `abs`, `square`
+и `sign` не могут завершиться ошибкой. Побитовые операторы, стоящие за
+`BitwiseAnd`/`Or`/`Xor` и `BitShift`, — это `try_bitand`, `try_bitor`,
+`try_bitxor`, `try_shl` и `try_shr`.
 
-### Валидация атрибутов
+### Атрибуты и opset
 
-Хелпер `Attrs` работает по принципу pop — каждый вызов `attrs.int("axis", -1)` или `attrs.float("epsilon", 1e-5)` забирает атрибут из словаря. После обработки оператора `attrs.done()` проверяет, что словарь пуст. Оставшиеся атрибуты вызывают ошибку — так неполные реализации операторов ловятся на этапе трассировки, а не приводят к молчаливо неверным результатам.
+Атрибуты извлекаются по мере чтения — `attrs.int("axis", -1)`,
+`attrs.float("epsilon", 1e-5)`, — а `attrs.done()` возвращает
+`UnhandledAttributes`, если какие-то остались, поэтому атрибут, забытый в
+реализации, приводит к ошибке импорта, а не к молча неверному результату.
 
-### Версионирование opset
+Операторы меняют поведение в зависимости от версии opset, которую импортирует их
+домен: `Softmax` и `LogSoftmax` по умолчанию используют ось `1` до opset 13 и
+`-1` начиная с 13; `ReduceSum` принимает оси как вход начиная с opset 13, а
+остальные редукции — начиная с 18. Домены `""` и `ai.onnx` используют общую
+версию opset.
 
-ONNX-модели объявляют импорты opset для каждого домена. Импортёр отслеживает их и передаёт версию каждому обработчику. Операторы переключают поведение в зависимости от версии — например, ось по умолчанию у Softmax сменилась с `1` (opset < 13) на `-1` (opset >= 13), а `ReduceSum` перенёс оси из атрибута во входной тензор в opset 13.
+### Операторы трансформеров
 
----
+Contrib-операторы `com.microsoft`, которые экспортирует ONNX Runtime:
 
-## Работа с моделями
+| Оператор | Примечания |
+|---|---|
+| `Attention` | Упакованный QKV с `mask_index` (1-D, 2-D или n-D), `unidirectional`, `qkv_hidden_sizes` и KV-кешем прошлых шагов |
+| `RotaryEmbedding` | Чередующийся и нечередующийся варианты |
+| `SkipLayerNormalization` | Residual + LayerNorm; необязательные выходы среднего / обратного стандартного отклонения заполнены нулями |
+| `EmbedLayerNormalization` | Эмбеддинги токенов + позиций + сегментов → LayerNorm; вход маски игнорируется |
+| `BiasGelu`, `FastGelu` | Слитые смещение + GELU |
 
-### Динамические размерности
-
-Входы ONNX могут содержать символические размерности вроде `"batch_size"` или `"sequence_length"`. Привяжите их при импорте через параметр `dim_bindings`:
-
-```rust
-let model = importer.import("model.onnx", &[
-    ("batch_size", 1),
-    ("sequence_length", 512),
-])?;
-
-// Variables are auto-extracted from dim_param annotations
-for (name, var) in &model.variables {
-    println!("{name}: bounds {:?}", var.bounds());
-}
-```
-
-Непривязанные динамические размерности дают понятную ошибку при импорте. Какие размерности динамические, можно узнать через `InputSpec::shape`:
-
-```rust
-for (name, spec) in &graph.inputs {
-    for dim in &spec.shape {
-        match dim {
-            DimValue::Static(n) => print!("{n} "),
-            DimValue::Dynamic(name) => print!("{name}? "),
-        }
-    }
-}
-```
-
-### Внешние веса и готовые входы
-
-Веса, лежащие вне файла `.onnx` (`data_location = EXTERNAL`), не требуют
-отдельного вызова: `import()` находит их относительно каталога самой модели.
-
-Чтобы передать импортёру входные тензоры самостоятельно — например, конкретные
-значения, которые операторы читают во время трассировки, — используйте
-`import_model_with_inputs()` с уже распарсенным `ModelProto`:
-
-```rust
-let model_proto = ModelProto::decode(bytes)?;
-let model = importer.import_model_with_inputs(
-    model_proto,
-    inputs,  // HashMap<String, Tensor>
-    &[],
-)?;
-```
-
-### Расширения Microsoft
-
-Импортёр поддерживает несколько contrib-операторов `com.microsoft`, которые часто встречаются в трансформерных моделях, экспортированных из ONNX Runtime:
-
-| Расширение | Назначение |
-|------------|-----------|
-| `Attention` | Упакованная QKV-проекция с маскированием, past KV cache |
-| `RotaryEmbedding` | Ротационные позиционные эмбеддинги (interleaved/non-interleaved) |
-| `SkipLayerNormalization` | Fused residual + LayerNorm + масштабирование |
-| `EmbedLayerNormalization` | Эмбеддинги токенов + позиций + сегментов → LayerNorm |
-
-Стандартные трансформерные операторы ONNX (`Attention` из домена ai.onnx) тоже поддерживаются — с grouped query attention (GQA), каузальным маскированием, past KV cache и softcap.
+Стандартный `Attention` из `ai.onnx` поддерживает grouped-query attention,
+каузальную маску, KV-кеш прошлых шагов, softcap, все варианты
+`qk_matmul_output_mode`, `softmax_precision`, `nonpad_kv_seqlen` и трёхмерные
+входы; его выходы — `[output, present_key, present_value, qk]`.
 
 ---
 
-## Control flow и ограничения
+## Управление потоком и ограничения
 
-### Семантика If: обе ветки всегда выполняются
+### `If` трассирует обе ветви
 
-Оператор `If` в ONNX — это data-dependent control flow: условие определяет, какая ветка выполняется. Ленивые вычисления Svod принципиально несовместимы с этим: на этапе трассировки ничего не выполняется, и значение условия неизвестно.
-
-**Решение Svod:** Трассировать *обе* ветки, а потом объединить результаты через `Tensor::where_()`:
+Во время трассировки ничего не выполняется, поэтому условие узла `If`
+неизвестно. Импортёр трассирует *обе* ветви и объединяет их через `where_`:
 
 ```text
-ONNX:    if condition { then_branch } else { else_branch }
-Svod:   then_result.where_(&condition, &else_result)
+ONNX:   if condition { then_branch } else { else_branch }
+Svod:   then_result.where_(&condition, else_result)
 ```
 
-`where_` читается как «оставить `self` там, где условие выполняется»; `condition.select(&then_result, &else_result)` — та же операция, записанная со стороны маски, и любая из веток может быть просто скаляром.
+`where_` читается как «оставить `self` там, где условие выполняется»;
+`condition.select(&a, &b)` — та же операция, записанная со стороны маски.
+Скомпилированный граф затем обрабатывает любое значение условия с одним
+ограничением: обе ветви должны давать одинаковые формы и dtype. `If` с
+полиморфными по форме ветвями отклоняется при импорте.
 
-Это даёт подход **«трассируй один раз — запускай многократно»** — скомпилированный граф обрабатывает любое значение условия в рантайме. Но есть жёсткое ограничение: **обе ветки должны возвращать одинаковые формы и типы данных.** Модели с shape-полиморфными ветками (then-ветка возвращает `[3, 4]`, а else-ветка — `[5, 6]`) трассировать нельзя.
+### Не реализовано
 
-На практике большинство ONNX-моделей с узлами `If` укладываются в это ограничение — условная логика в них выбирает значения, а не меняет форму данных.
-
-### Нет Loop и Scan
-
-Итеративный control flow (`Loop`, `Scan`) не реализован. Эти операторы требуют многократной трассировки или развёртки, что не ложится на архитектуру однократной трассировки. Модели с рекуррентными паттернами обычно работают через развёрнутые операторы (LSTM, GRU, RNN реализованы как нативные ops).
-
-### Батч-выполнение
-
-Несколько тензоров можно реализовать одновременно, разделяя вычисления между выходами
-(тестируется в `tensor/src/test/unit/batch.rs`):
-
-```rust
-// Realize all outputs at once (shares compilation and execution)
-let outputs: Vec<&Tensor> = model.outputs.values().collect();
-Tensor::realize_batch(outputs)?;
-```
-
-Для повторного инференса используйте паттерн prepare/execute (тестируется в
-`tensor/src/test/unit/variable.rs::test_prepare_execute_loop`):
-
-```rust
-let OnnxModel { mut inputs, outputs, variables } =
-    importer.import("model.onnx", &[("batch", 1)])?;
-
-// 1. Assign initial data (lazy — no allocation yet)
-let input = inputs.remove("audio").unwrap();
-input.assign(&Tensor::from_slice(&first_frame));
-
-// 2. Compile the execution plan (resolves assigns, allocates buffers)
-let outs: Vec<&Tensor> = outputs.values().collect();
-let mut plan = Tensor::prepare_batch(outs)?;
-plan.execute()?;  // first run
-
-// 3. Fast loop: zero-copy writes via array_view_mut, no recompilation
-for frame in audio_frames {
-    input.array_view_mut::<f32>()?[..frame.len()].copy_from_slice(&frame);
-    plan.execute()?;
-}
-
-// Re-execute with different variable bindings
-let bound = variables["batch"].bind(8)?;
-plan.execute_with_vars(&[bound.as_var_val()])?;
-```
-
-### Нет обучения
-
-Импортёр только для инференса. Обратного прохода, вычисления градиентов и оптимизаторов нет.
-
-### Нереализованные категории операторов
+- `Loop` и `Scan`: итеративное управление потоком требует повторной
+  трассировки или развёртки. `RNN`, `GRU` и `LSTM` вместо этого реализованы как
+  нативные операции; их `direction` выводится из ведущей размерности `W`
+  (`bidirectional` работает, `reverse` выполняется в прямом направлении), а
+  атрибуты `activations` и `clip` игнорируются.
+- Обучение: нет обратного прохода, градиентов и оптимизаторов.
 
 | Категория | Примеры | Причина |
-|-----------|---------|---------|
-| Квантизация | DequantizeLinear, QuantizeLinear | Нужна поддержка квантизованных типов в IR |
-| Операции с последовательностями | SequenceConstruct, SequenceAt | Нетензорные типы не входят в систему типов Svod |
-| Случайные числа | RandomNormal, RandomUniform | Stateful RNG пока не реализован |
-| Обработка сигналов | DFT, STFT, MelWeightMatrix | Не подключены к импортёру (в самом крейте tensor есть `stft` / `istft`) |
-| Текст | StringNormalizer, TfIdfVectorizer | Строковые типы не поддерживаются |
-
-Для моделей с такими операторами используйте `ort` (обёртку над ONNX Runtime) — она покрывает полную спецификацию.
+|---|---|---|
+| Динамическое квантование | `QuantizeLinear`, `DequantizeLinear`, `DynamicQuantizeLinear` (`QLinearConv`, `QLinearMatMul`, `ConvInteger` и `MatMulInteger` реализованы) | Ещё не портированы |
+| Операции над последовательностями | `SequenceConstruct`, `SequenceAt` | Нетензорные типы не входят в систему типов |
+| Случайные числа | `RandomNormal`, `RandomUniform`, `Bernoulli` | В графе нет ГСЧ с состоянием |
+| Обработка сигналов | `DFT`, `STFT`, `MelWeightMatrix` | Не подключены к импортёру (в тензорном крейте есть `stft` / `istft` / `mel_spectrogram`) |
+| Текст | `StringNormalizer`, `TfIdfVectorizer` | Нет строкового типа |
 
 ---
 
 ## Отладка
 
-### Поузловая трассировка выходов
-
-Установите уровень логирования trace, чтобы выводить промежуточные результаты:
+**Трассировка по узлам.** На уровне `trace` импортёр выполняет (realize) выход
+каждого узла по мере трассировки и записывает в лог его форму и первые пять
+значений — инструмент численной бисекции для модели, которая выдаёт неверные
+результаты. Это ломает слияние ядер, поэтому используйте его только для
+отладки и установите в своём бинарнике `tracing-subscriber` с `EnvFilter`:
 
 ```bash
 RUST_LOG=svod_onnx::importer=trace cargo run
 ```
 
-Это вызывает `realize()` для выхода каждого узла отдельно и печатает первые 5 значений — помогает при числовой бисекции, когда модель выдаёт неверные результаты. Учтите, что это ломает фьюзинг ядер (каждый узел выполняется отдельно), так что это чисто отладочный инструмент.
+Трассировка происходит внутри вызова импорта, поэтому реальные значения входов
+видны, только если входы переданы через `import_model_with_inputs`;
+входы-заглушки трассируются как пустые буферы.
 
-### Исследование графа
-
-Чтобы понять, что нужно модели, используйте структуру `OnnxModel`:
+**Просмотр графа.** `Debug` для `Tensor` выводит форму, dtype, устройство и
+состояние выполнения, но никогда не данные:
 
 ```rust
 let model = importer.import("model.onnx", &[])?;
-
-println!("Inputs:");
 for (name, tensor) in &model.inputs {
-    // Debug у Tensor печатает форму, dtype, устройство и признак реализованности
-    println!("  {name}: {tensor:?}");
+    println!("input {name}: {tensor:?}");
 }
-
-println!("Outputs: {:?}", model.outputs.keys().collect::<Vec<_>>());
-println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
+println!("outputs:   {:?}", model.outputs.keys().collect::<Vec<_>>());
+println!("variables: {:?}", model.variables);
 ```
+
+**Атрибуция ядер.** Каждое ядро, созданное импортёром, записывает свой узел
+ONNX как источник происхождения, поэтому профилировщик показывает время на
+устройстве по каждому узлу — см. [Происхождение ядер](./architecture/kernel-origins).
 
 ---
 
-## Итого
+## Итоги
 
-| Аспект | Детали |
-|--------|--------|
-| **Точка входа** | `OnnxImporter::new()` |
-| **Простой импорт** | `importer.import("model.onnx", &[])?` |
-| **Динамические размерности** | `importer.import(path, &[("batch", 4)])?` |
-| **Операторы** | 162 / 200 ([полная таблица паритета](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
-| **Проверенные модели** | ResNet50, DenseNet121, VGG19, Inception v1/v2, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
-| **Бэкенды** | Clang + LLVM на CPU (идентичные результаты); AMD и CUDA, когда `SVOD_DEVICE` выбирает GPU |
-| **Расширения** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |
-| **Ограничения** | Нет обучения, нет Loop/Scan, shape-полиморфный If |
+| Аспект | Подробности |
+|---|---|
+| **Точки входа** | `import(path, dims)`, `import_model_with_inputs(proto, inputs, dims)`, `import_model(proto, dims)` |
+| **Входы во время выполнения** | Создайте тензоры, передайте их в `import_model_with_inputs`, между запусками пишите через `array_view_mut` |
+| **Динамические размерности** | Привязка при импорте: `&[("batch", 8)]`; один импорт на каждый размер батча |
+| **Операторы** | 162 из 200 ([таблица соответствия](https://github.com/npatsakula/svod/blob/main/onnx/PARITY.md)) |
+| **Соответствие стандарту** | 1357 тестов узлов на Clang и LLVM; AMD и CUDA через `SVOD_DEVICE` |
+| **Расширения** | com.microsoft `Attention`, `RotaryEmbedding`, `SkipLayerNormalization`, `EmbedLayerNormalization`, `BiasGelu`, `FastGelu` |
+| **Ограничения** | Нет обучения, нет `Loop` / `Scan`, нет `If` с полиморфными по форме ветвями, нет перепривязки динамических размерностей во время выполнения |
 
-**Далее:** [Практические примеры](./examples) — основы работы с тензорами, или [Пайплайн выполнения](./architecture/pipeline) — чтобы разобраться, как устроена компиляция.
+**Далее:** [Тензорный API](./examples) — граф, в который попадают эти модели, или
+[Запуск моделей](./models) — нативные порты моделей.

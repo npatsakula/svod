@@ -70,6 +70,65 @@ fn collect_pending_indices(tensors: &[&Tensor]) -> Vec<usize> {
         .collect()
 }
 
+/// The view a pending assign writes into: `AFTER(view, [STORE(view, ..)])`
+/// over a buffer identity. Realized in place, its sink root is the AFTER itself
+/// (no copy kernel) and the tensor resumes the view — the same identity every
+/// dependent built before the assign already reads, so they see the write.
+fn assign_target(uop: &Arc<UOp>) -> Option<&Arc<UOp>> {
+    match uop.op() {
+        Op::After(ops::After { passthrough, .. }) if passthrough.has_buffer_identity() => Some(passthrough),
+        _ => None,
+    }
+}
+
+fn sink_source(uop: &Arc<UOp>) -> Arc<UOp> {
+    if assign_target(uop).is_some() { uop.clone() } else { uop.contiguous() }
+}
+
+/// The identity a realized tensor adopts: `(buffer uop id, uop, storage)`.
+/// A plan output gets a fresh BUFFER over the plan's buffer; an in-place assign
+/// keeps the identity it stored into (bound by [`bind_graph_buffers`]).
+fn realized_identity(old_uop: &Arc<UOp>, output_buf: Buffer) -> Result<(u64, Arc<UOp>, Arc<Buffer>)> {
+    if let Some(view) = assign_target(old_uop) {
+        let id = view.base().id;
+        let storage =
+            crate::tensor_registry::get_buffer_arc(id).expect("assign target storage is bound before scheduling");
+        debug_assert_eq!(storage.id(), output_buf.id(), "in-place assign output must be its target storage");
+        return Ok((id, view.clone(), storage));
+    }
+    let dtype = old_uop.dtype();
+    let device = output_buf.allocator().device_spec();
+    let buffer_uop = UOp::new_buffer(device, output_buf.size() / dtype.bytes(), dtype);
+    let shape = old_uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
+    let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
+    Ok((buffer_uop.id, realized_uop, Arc::new(output_buf)))
+}
+
+/// Bind storage to every graph-level BUFFER of `sink` before scheduling. A
+/// placeholder (`Tensor::empty`) carries none until first use; binding it in
+/// the global registry makes the identity mean one storage for every plan and
+/// tensor referencing it: a store realized through it is what later readers
+/// see, and a host write through `array_view_mut` reaches the plans prepared
+/// from it. Matches Tinygrad, where a BUFFER uop owns its `Buffer`.
+fn bind_graph_buffers(sink: &Arc<UOp>) -> Result<()> {
+    for node in sink.toposort() {
+        let Op::Buffer(ops::Buffer { arg, .. }) = node.op() else { continue };
+        let Some(device) = arg.device.as_ref().filter(|device| !device.is_disk()) else { continue };
+        if arg.addrspace != Some(svod_ir::AddrSpace::Global)
+            || crate::tensor_registry::get_buffer_arc(node.id).is_some()
+        {
+            continue;
+        }
+        let Some(size) = node.buffer_size().filter(|&size| size > 0) else { continue };
+        let allocator = svod_device::registry::registry().get(device).context(DeviceSnafu)?;
+        let buffer = Buffer::new(allocator, arg.dtype.clone(), vec![size], Default::default());
+        // Allocated storage is an input to every plan: the memory planner never packs it.
+        buffer.ensure_allocated().context(DeviceSnafu)?;
+        crate::tensor_registry::register_buffer_by_uop_id(node.id, Arc::new(buffer));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BufferStorageKey {
     id: u64,
@@ -251,36 +310,12 @@ impl Tensor {
     /// find buffers during the substitution window.
     fn finalize_realize(&self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<()> {
         let output_buf = plan.output_buffer().expect("realized plan must have an output buffer").clone();
-
-        trace!(
-            buffer.id = ?output_buf.id(),
-            buffer.size = output_buf.size(),
-            "Realized output buffer"
-        );
-
-        let output_dtype = uop.dtype();
-        let output_device = output_buf.allocator().device_spec();
-        let num_elements = output_buf.size() / output_dtype.bytes();
-
-        let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype.clone());
-        let output_buf_arc = Arc::new(output_buf);
-
-        crate::tensor_registry::register_buffer(buffer_uop.id, self.entry.id, output_buf_arc.clone());
-
-        let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
-        let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
-
-        debug!(
-            buffer_uop.id = buffer_uop.id,
-            num_elements,
-            shape = ?shape,
-            realized_uop.id = realized_uop.id,
-            realized_uop.base_id = realized_uop.base().id,
-            "Tensor realized"
-        );
-
+        trace!(buffer.id = ?output_buf.id(), buffer.size = output_buf.size(), "Realized output buffer");
+        let (buffer_id, realized_uop, storage) = realized_identity(uop, output_buf)?;
+        crate::tensor_registry::register_buffer(buffer_id, self.entry.id, storage.clone());
+        debug!(buffer_id, realized_uop.id = realized_uop.id, "Tensor realized");
         self.set_uop(realized_uop);
-        self.entry.set_buffer(output_buf_arc);
+        self.entry.set_buffer(storage);
         Ok(())
     }
 
@@ -331,22 +366,22 @@ impl Tensor {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// use svod_tensor::PrepareConfig;
-    /// use svod_schedule::{OptimizerConfig, OptStrategy, BeamConfig};
+    /// ```no_run
+    /// use svod_schedule::{BeamConfig, OptStrategy, OptimizerConfig};
+    /// use svod_tensor::{PrepareConfig, Tensor};
     ///
-    /// // Beam search with width 8 and 120s timeout
+    /// # let tensor = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    /// // Beam search with width 8 and a 120 s per-candidate compile timeout
     /// let config = PrepareConfig::from(
     ///     OptimizerConfig::builder()
     ///         .strategy(OptStrategy::Beam { width: 8 })
-    ///         .beam(BeamConfig::builder()
-    ///             .timeout_secs(120)
-    ///             .build())
-    ///         .build()
+    ///         .beam(BeamConfig::builder().compile_timeout_secs(120).build())
+    ///         .build(),
     /// );
     ///
     /// let plan = tensor.prepare_with(&config)?;
     /// plan.execute()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn prepare_with(&self, config: &PrepareConfig) -> Result<ExecutionPlan> {
         let uop = self.uop();
@@ -360,7 +395,7 @@ impl Tensor {
         let t_total = std::time::Instant::now();
         let uop = self.uop();
 
-        let sink = UOp::sink(vec![uop.contiguous()]);
+        let sink = UOp::sink(vec![sink_source(&uop)]);
         let schedule_result = schedule_result_from_sink_with_cache(sink, extract_var_vals(&uop)?, config)?;
         // Per-kernel optimization+compilation is cached globally in prepare_execution_plan
         // via OPT_CACHE keyed by content_hash(ast). Identical kernel ASTs across calls
@@ -373,14 +408,11 @@ impl Tensor {
 
     fn wire_output_tensor(&self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<()> {
         if plan.num_outputs() > 0 {
-            let buf = Arc::new(plan.output_buffer().expect("plan with num_outputs > 0 must expose output").clone());
-            let dtype = uop.dtype();
-            let device = buf.allocator().device_spec();
-            let buffer_uop = UOp::new_buffer(device, buf.size() / dtype.bytes(), dtype);
-            crate::tensor_registry::register_buffer(buffer_uop.id, self.entry.id, buf.clone());
-            let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
-            self.set_uop(buffer_uop.try_reshape(shape).context(UOpSnafu)?);
-            self.entry.set_buffer(buf);
+            let buf = plan.output_buffer().expect("plan with num_outputs > 0 must expose output").clone();
+            let (buffer_id, realized_uop, storage) = realized_identity(uop, buf)?;
+            crate::tensor_registry::register_buffer(buffer_id, self.entry.id, storage.clone());
+            self.set_uop(realized_uop);
+            self.entry.set_buffer(storage);
         }
         Ok(())
     }
@@ -441,8 +473,7 @@ impl Tensor {
         }
 
         // Create merged SINK(CONTIGUOUS(t1), ..., CONTIGUOUS(tN))
-        let contiguouses: Vec<Arc<UOp>> = old_uops.iter().map(|u| u.contiguous()).collect();
-        let sink = UOp::sink(contiguouses);
+        let sink = UOp::sink(old_uops.iter().map(sink_source).collect());
 
         let mut var_vals = HashMap::new();
         for uop in &old_uops {
@@ -468,14 +499,9 @@ impl Tensor {
         let mut realized: Vec<(u64, Arc<UOp>, Arc<Buffer>)> = Vec::with_capacity(old_uops.len());
         for (buf_idx, old_uop) in old_uops.iter().enumerate() {
             let output_buf = plan.output_buffer_at(buf_idx).expect("buf_idx in range").clone();
-            let output_dtype = old_uop.dtype();
-            let output_device = output_buf.allocator().device_spec();
-            let num_elements = output_buf.size() / output_dtype.bytes();
-            let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype);
-            let shape = old_uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
-            let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
-            becomes_map.insert(UOpKey(old_uop.clone()), realized_uop.clone());
-            realized.push((buffer_uop.id, realized_uop, Arc::new(output_buf)));
+            let identity = realized_identity(old_uop, output_buf)?;
+            becomes_map.insert(UOpKey(old_uop.clone()), identity.1.clone());
+            realized.push(identity);
         }
         for (&orig_idx, &slot) in pending_indices.iter().zip(&output_slot) {
             let (buffer_id, realized_uop, buf_arc) = &realized[slot];
@@ -536,8 +562,7 @@ impl Tensor {
         }
 
         // Create merged SINK(CONTIGUOUS(t1), ..., CONTIGUOUS(tN)) from pending tensors
-        let contiguouses: Vec<Arc<UOp>> = uops.iter().map(|u| u.contiguous()).collect();
-        let sink = UOp::sink(contiguouses);
+        let sink = UOp::sink(uops.iter().map(sink_source).collect());
 
         let schedule_result = schedule_result_from_sink_with_cache(sink, var_vals, config)?;
 
@@ -558,18 +583,11 @@ impl Tensor {
         // After execute/execute_with_vars, tensor.array_view() reads the result directly.
         for (buf_idx, &orig_idx) in pending_indices.iter().enumerate() {
             let output_buf = plan.output_buffer_at(buf_idx).expect("buf_idx in range").clone();
-            let buf_arc = Arc::new(output_buf);
-            let old_uop = &uops[buf_idx];
-            let output_dtype = old_uop.dtype();
-            let output_device = buf_arc.allocator().device_spec();
-            let num_elements = buf_arc.size() / output_dtype.bytes();
-            let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype);
+            let (buffer_id, realized_uop, storage) = realized_identity(&uops[buf_idx], output_buf)?;
             let t = tensors[orig_idx];
-            crate::tensor_registry::register_buffer(buffer_uop.id, t.entry.id, buf_arc.clone());
-            let shape = old_uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
-            let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
+            crate::tensor_registry::register_buffer(buffer_id, t.entry.id, storage.clone());
             t.set_uop(realized_uop);
-            t.entry.set_buffer(buf_arc);
+            t.entry.set_buffer(storage);
         }
 
         Ok(plan)
@@ -648,6 +666,7 @@ fn schedule_result_from_sink_with_cache(
     // scope the caller is realizing inside so kernel bodies stay origin-free.
     let _detached = svod_ir::origin::OriginScope::suspend();
     svod_ir::dump_canonical_stage("tensor", &sink);
+    bind_graph_buffers(&sink)?;
     if config.disable_schedule_cache || schedule_cache_disabled_by_env() {
         return schedule_result_from_sink_uncached(sink, var_vals, config);
     }

@@ -1,3 +1,9 @@
+//! Svod's type system: scalar, vector, pointer and image dtypes (including bf16 and
+//! the FP8 formats), promotion rules, GPU architecture enums and device specs.
+//!
+//! [`default_device::default_device`] resolves the device used when nothing selects one:
+//! `SVOD_DEVICE` if set, otherwise Metal on macOS and the CPU elsewhere.
+
 pub mod amd_arch;
 pub mod cast;
 pub mod cuda_arch;

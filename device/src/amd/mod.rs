@@ -44,13 +44,13 @@
 pub mod sys;
 pub mod topology;
 
-/// Userspace AMD ("AM") driver — a second [`iface::AmdIface`] backend that
-/// drives the GPU's PCI BARs directly, bypassing the kernel amdgpu/KFD driver
-/// (selected at runtime via `SVOD_AMD_BACKEND=am`). The memory-manager
-/// submodules (`am::mm`) are pure logic — page-table / PTE encoding + the TLSF
-/// allocator — and unit-test without a GPU. The privileged bring-up
-/// (PCI/PSP/dispatch) is added incrementally. Compiled on all Unix hosts (no
-/// extra deps) so it's always type-checked, linted, and tested.
+/// Userspace AMD ("AM") driver — groundwork for a second [`iface::AmdIface`]
+/// backend that drives the GPU's PCI BARs directly, bypassing the kernel
+/// amdgpu/KFD driver. Not wired into [`AmdDevice`] yet (`SVOD_AMD_BACKEND`
+/// accepts only `kfd`). The memory-manager submodules (`am::mm`) are pure
+/// logic and unit-test without a GPU; the privileged bring-up targets the
+/// gfx9.4.x SR-IOV VF. Compiled on all Unix hosts (no extra deps) so it's
+/// always type-checked, linted, and tested.
 #[cfg(unix)]
 pub mod am;
 

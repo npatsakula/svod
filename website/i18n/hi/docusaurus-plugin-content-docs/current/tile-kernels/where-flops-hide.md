@@ -98,20 +98,23 @@ remap करके कि कौन-सा workgroup ID कहाँ run हो�
 
 ## arch का पहलू: MFMA बनाम WMMA बनाम `mma.sync`, wave32 बनाम wave64
 
-तीन hardware facts हर उस tile कर्नेल को आकार देते हैं जो `tk` बनाता है, और इन्हें ध्यान में रखना ज़रूरी है:
+कुछ hardware facts हर उस tile कर्नेल को आकार देते हैं जो `tk` बनाता है, और इन्हें ध्यान में रखना ज़रूरी है:
 
-- **CDNA** (datacenter, जैसे gfx942) matrix multiplies को **MFMA** instructions के ज़रिए issue करता है और
+- **CDNA** (datacenter, gfx942) matrix multiplies को **MFMA** instructions के ज़रिए issue करता है और
   **wave64** चलाता है — प्रति wavefront 64 lanes।
-- **RDNA** (जैसे gfx1151, RDNA3.5, wave32) **WMMA** instructions issue करता है और
-  **wave32** चलाता है — 32 lanes।
+- **RDNA** (RDNA3.5 पर gfx1151, RDNA4 पर gfx1200/gfx1201) **WMMA** instructions issue करता है और
+  **wave32** चलाता है — 32 lanes। RDNA3 और RDNA4 आपस में भी मेल नहीं खाते: gfx11 operands को wave के
+  दोनों हिस्सों में replicate करता है और accumulator की rows को interleave करता है, gfx12 दोनों छोड़ देता है।
 - **NVIDIA** (`sm_80+`) **`mma.sync`** issue करता है और एक **warp32** चलाता है — 32 lanes, पर fragment
   layout फिर से अपना ही: एक 16×16 tile जो दो `m16n8` halves के रूप में रखा जाता है।
+- **Apple** (Apple7+) एक 32-lane SIMD group पर 8×8 fragment के साथ `simdgroup_matrix` चलाता है,
+  जो बाक़ी सबके fragment का एक-चौथाई है।
 
 lane count बदलते ही यह बदल जाता है कि एक tile के elements wave भर में कैसे बँटते हैं; इससे register layout
 बदलता है, और उसके साथ reductions भी — और एक ही width पर भी fragment layout अलग होता है। एक के लिए लिखा कर्नेल
 अगर किसी दूसरे पर — इसका हिसाब रखे बिना — चला दिया जाए, तो वह चुपचाप ग़लत नतीजे देता है। एक ही कर्नेल को
-तीनों पर correct रखना अपने आप में एक पूरा chapter है:
-[Wave32 बनाम Wave64](./wave-portability)।
+इन सब पर correct रखना अपने आप में एक पूरा chapter है:
+[Layouts और wave size](./wave-portability)।
 
 :::tip[GPU विशेषज्ञों के लिए]
 HipKittens के `analysis/paper_experiments/` micro-benchmarks ऊपर बताए gaps को आँकड़ों में ढालते हैं। यही design को
@@ -124,18 +127,22 @@ justify करते हैं:
 | gap 5 (chiplet swizzle) | XCD locality के लिए workgroup IDs को remap करना एक बड़े GEMM पर एक मापने योग्य speedup देता है। |
 
 `tk` इन levers को सीधे implement करता है: XOR swizzles `tk/src/swizzle.rs` में रहते हैं (HipKittens के
-shared-tile layouts से ported), L2/chiplet remap `tk/src/grid.rs` में रहता है (`l2_swizzle`), और
-compute/memory overlap को Flash Attention KV loop पर एक `sched::pipeline(SchedKind::Attention, …)` marker के
-रूप में व्यक्त किया जाता है, जिसे एक post-linearization scheduling pass consume करता है।
+shared-tile layouts से ported, साथ में 16-byte-chunk वाला `Sw16x16Mma` जिसकी `ldmatrix`, `cp.async`
+और gfx12 gather को ज़रूरत होती है), L2/chiplet remap `tk/src/grid.rs` में (`l2_swizzle`, जो CUDA GEMM tiles,
+सबसे चौड़े RDNA4 tile और gfx942 matmul config में चालू है), और compute/memory overlap को Flash Attention KV
+loop पर एक `sched::pipeline(SchedKind::Attention, …)` marker के रूप में व्यक्त किया जाता है, जिसे
+`codegen/src/llvm/sched.rs` का एक post-linearization pass consume करता है। आज यह pass CDNA पर दोनों
+`SchedKind`s को `@llvm.amdgcn.iglp.opt(0)` में lower करता है — यानी MFMA/memory interleave AMDGPU machine
+scheduler को सौंप देता है — और बाक़ी जगह कुछ नहीं करता; gfx942 पर मापा गया नतीजा यह था कि हाथ से रखे
+`sched.barrier` fences एक dataflow-scheduled GEMM को अकेले iglp के मुक़ाबले 0.6–0.9× तक *regress* कर देते हैं,
+क्योंकि वे ठीक उसी load/MFMA overlap को pin कर देते हैं जिसे पैदा करने के लिए double buffer मौजूद है।
 
-जब यह high-level marker काफ़ी न पड़े, तो AUTHOR चेहरा raw machine-scheduler intrinsics को भी सीधे
-expose करता है (`Op::Custom` के रूप में), ताकि gap 4 से आख़िरी चंद percent तक निचोड़े जा सकें:
-
-- MFMA bursts के इर्द-गिर्द wave issue priority को नियंत्रित करना,
-- register-staged prefetch के लिए LDS waits को defer करना,
-- machine scheduler के मुक़ाबले एक cluster के loads, MFMAs, और stores को pin करना।
-
-default तो `sched::pipeline` ही है; ये manual override तब काम आते हैं जब schedule को हाथ से बिठाना हो।
+जहाँ fence सचमुच फ़ायदा देता है, वहाँ AUTHOR चेहरा raw controls को `tk/src/asm.rs` में typed `Op::Custom`
+nodes के रूप में expose करता है — `s_setprio`, `s_waitcnt_lgkmcnt`, `sched_barrier`, `iglp_opt` — और हर एक किसी
+dependency पर पिरोया होता है ताकि वह वहीं land हो जहाँ author ने उसे रखा। tree में इसका इकलौता इस्तेमाल RDNA4 GEMM
+है: `ArchCaps::needs_pipeline_commit_fence()` उस arch का नाम बताता है जिसका scheduler pipeline का पूरा LDS commit
+trip के MMAs के ऊपर hoist कर देता है, और `gemm_core` इसका जवाब `sched_barrier(0, after_mma)` से देता है ताकि
+prefetch matrix work के नीचे in flight बना रहे।
 :::
 
 ---
@@ -148,7 +155,8 @@ default तो `sched::pipeline` ही है; ये manual override तब �
   सही memory में, और conflict-free रखता है।
 - [Flash Attention](./flash-attention) gaps 2 और 4 को असल काम में दिखाता है: double-buffered streaming
   और एक explicit pipeline।
-- [Wave32 बनाम Wave64](./wave-portability) वह portability tax है जो gap 1, lane-count का फ़र्क़, और per-arch fragment layouts आप पर थोपते हैं।
+- [Layouts और wave size](./wave-portability) वह portability tax है जो gap 1, lane-count का फ़र्क़,
+  और per-arch fragment layouts आप पर थोपते हैं।
 
 लब्बोलुआब: एक तेज़ GPU कर्नेल बस "गणित, लिख दिया गया" नहीं होता। वह है *गणित, साथ में इस बात का जवाब कि दो
 matrix instructions के बीच का हर cycle आख़िर कहाँ जाता है।* FLOPS ठीक वहीं छिपते हैं।

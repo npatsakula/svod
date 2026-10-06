@@ -19,18 +19,16 @@ KFD's ABI is a C header, `kfd_ioctl.h`, vendored verbatim from the kernel into
 version history). Rust bindings are generated from it at build time by
 `bindgen`:
 
-- `device/build.rs` runs `bindgen` **unconditionally on every host** — there is
-  no platform gate and no empty-stub branch. It is **hermetic**: it needs no
-  system kernel headers. The two headers `kfd_ioctl.h` transitively pulls
-  (`<linux/ioctl.h>` for the `_IOC`/`_IO*` macros, `<linux/types.h>` for the
-  `__uNN`/`__sNN` aliases) plus a stub `<drm/drm.h>` (vestigial — the body uses
-  only `__u32 drm_fd` fields) are themselves vendored under `device/include/`,
-  and `build.rs` passes `-Iinclude` so bindgen resolves them instead of
-  `/usr/include`. The switch to vendored headers was verified byte-equivalent:
-  the regenerated bindings differ from the system-header baseline only in 8
-  fixed-width type-alias spellings (`__u32 = u32` vs `c_uint`, identically
-  sized) — all 60 structs and 34 constants are identical. (bindgen needs
-  `libclang`, which ships with the Xcode CLT on macOS.)
+- `device/build.rs` runs `bindgen` on every Unix host (`bindgen` is a
+  `cfg(unix)` build-dependency) with no empty-stub branch. It is **hermetic**:
+  it needs no system kernel headers. The two headers `kfd_ioctl.h`
+  transitively pulls (`<linux/ioctl.h>` for the `_IOC`/`_IO*` macros,
+  `<linux/types.h>` for the `__uNN`/`__sNN` aliases) plus a stub `<drm/drm.h>`
+  (vestigial — the body uses only `__u32 drm_fd` fields) are themselves vendored
+  under `device/include/`, and `build.rs` passes `-I<crate>/include` so bindgen
+  resolves them instead of `/usr/include`. The generated file has 60 structs
+  and 34 constants. (bindgen needs `libclang`, which ships with the Xcode CLT
+  on macOS.)
 
   It allow-lists exactly the KFD types and constants the backend needs:
 
@@ -39,8 +37,7 @@ version history). Rust bindings are generated from it at build time by
                    kfd_event_data, kfd_hsa_signal_event_data,
                    kfd_hsa_memory_exception_data, kfd_hsa_hw_exception_data,
                    kfd_memory_exception_failure, __u\d+, __s\d+
-  allowlist_var:   KFD_IOC_.*, KFD_MMAP_TYPE.*, KFD_MAX_QUEUE_PERCENTAGE,
-                   AMDKFD_IOC_.*
+  allowlist_var:   KFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE, AMDKFD_IOC_.*
   ```
 
   (The `AMDKFD_IOC_*` request codes are allow-listed but never materialize:
@@ -56,15 +53,17 @@ version history). Rust bindings are generated from it at build time by
 - A **second bindgen pass** covers the AQL/HSA side: `include/amd_hsa_wrapper.h`
   pulls the vendored ROCm `hsa/` headers and yields `$OUT_DIR/hsa_sys.rs`
   (`hsa_kernel_dispatch_packet_t`, `hsa_queue_t`, `amd_queue_t`, `amd_signal_t`
-  and friends), `include!`d by `device/src/amd/sys/hsa.rs`. Here `layout_tests`
-  is deliberately left **on**: the 256-byte `amd_queue_t` and the 64-byte AQL
-  packet are layout-critical, so a mis-sized struct must fail the build.
+  and friends, enums as constants), `include!`d by `device/src/amd/sys/hsa.rs`.
+  Here `layout_tests` is deliberately left **on**: the 256-byte `amd_queue_t`
+  and the 64-byte AQL packet are layout-critical, so a mis-sized struct must
+  fail the build.
 
-Compiling the bindings everywhere is what makes the AMD backend a
+Compiling the bindings on every Unix host is what makes the AMD backend a
 [runtime-detected execution provider](./overview.md) rather than a compile-time
-feature: the bindings are generated everywhere, every Unix `cargo check`
-type-checks the KFD call sites above them (the `nix` ioctl wrappers are the only
-`cfg(unix)` part), and a host with no GPU simply never registers the factory.
+feature: every Unix `cargo check` type-checks the KFD call sites above them
+(the kernel-facing modules are `cfg(unix)`; the topology parser and packet
+builders compile everywhere), and a host with no GPU simply never registers
+the factory.
 
 :::note[Why hand-written ioctl macros]
 `bindgen` emits the argument *structs* but not the `_IOWR` ioctl-number macros.
@@ -131,9 +130,10 @@ fd.
 GPU nodes are enumerated from sysfs, not via an ioctl.
 `device/src/amd/topology.rs` reads
 `/sys/devices/virtual/kfd/kfd/topology/nodes/<N>/properties` — one
-`key value` pair per line — plus the sibling `<N>/gpu_id`, and returns a
-`Vec<AmdNode>`, skipping CPU nodes (`gpu_id == 0`). It never panics: a host with
-no `/dev/kfd` yields an empty vector.
+`key value` pair per line — plus the sibling `<N>/gpu_id` (falling back to an
+inline `gpu_id` property), and returns a `Vec<AmdNode>` sorted by node id,
+skipping CPU nodes (`gpu_id == 0`). It never panics: a host without that sysfs
+tree yields an empty vector.
 
 This same enumeration is what gates the whole backend at runtime.
 `topology::has_devices()` — "any node whose `gfx_target_version` resolves to a
@@ -143,11 +143,14 @@ whether to register the `"AMD"` device factory at all (the
 if a factory is asked for a node that isn't there, it returns a clean
 `Err(NoAmdGpu)`.
 
-Each `AmdNode` carries the fields the rest of the backend needs:
-`gpu_id`, `drm_render_minor`, `gfx_target_version` (e.g. `110000` → gfx1100),
-`simd_count`, `simd_per_cu`, `max_waves_per_simd`, `num_xcc`, `lds_size_in_kb`,
-`max_slots_scratch_cu`, and friends — these feed scratch sizing and the PM4-vs-
-AQL decision.
+Each `AmdNode` carries the fields the rest of the backend needs: `node_id`,
+`gpu_id`, `drm_render_minor`, `gfx_target_version` (e.g. `110000` → gfx1100,
+see the [supported-GPU table](./overview.md)), `simd_count`, `array_count`,
+`simd_arrays_per_engine`, `simd_per_cu`, `max_waves_per_simd`,
+`lds_size_in_kb`, `wave_front_size`, `num_xcc`, `num_cp_queues` and
+`max_slots_scratch_cu` — these feed scratch sizing and the PM4-vs-AQL
+decision. The wave size the backend uses comes from the arch, not from
+`wave_front_size`.
 
 :::tip[Testing without hardware]
 The sysfs root is overridable with **`SVOD_KFD_TOPOLOGY`**, so the parser is
@@ -168,9 +171,11 @@ Every buffer follows the same four-step path, implemented once in
 4. MAP_MEMORY_TO_GPU(handle)            bind into the GPU page table
 ```
 
-The host VA is reserved first with an anonymous `PROT_NONE` mapping so the
-host-visible `mmap` in step 3 can land at exactly that address (`MAP_FIXED`).
-Freeing reverses it: `UNMAP_MEMORY_FROM_GPU` → `munmap` → `FREE_MEMORY_OF_GPU`.
+The size is rounded up to 4 KiB first. The host VA is reserved with an
+anonymous `PROT_NONE` mapping so the host-visible `mmap` in step 3 can land at
+exactly that address (`MAP_FIXED`). A requested zero-fill happens after the
+map and requires host visibility. Freeing reverses it:
+`UNMAP_MEMORY_FROM_GPU` → `munmap` → `FREE_MEMORY_OF_GPU`.
 
 ### Allocation flavors
 
@@ -179,30 +184,32 @@ place those flags are composed:
 
 | `AllocKind` | Flags | Used for |
 |---|---|---|
-| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ `EXECUTABLE` for code, + `PUBLIC` when host-visible) | Tensor data, code objects, scratch |
-| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, the event page |
+| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE` (+ `EXECUTABLE` for code, + `PUBLIC` when host-visible) | Tensor data, code objects, scratch; host-visible kernarg arenas and graph / linked-plan control buffers |
+| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | Command rings, GART pages, signal slots, the SDMA staging buffer |
 
 The `UNCACHED | COHERENT` GTT flavor matters: the command ring and the signal
 slots must be immediately visible between CPU and GPU, or the host spins forever
 waiting on a completion value stuck in GPU L2. KFD rejects `CREATE_QUEUE` on a
-plain-VRAM ring with `EINVAL`.
+plain-VRAM ring with `EINVAL`. The one allocation outside `alloc_raw` is the
+per-process event page (`alloc_event_page` in `device.rs`), which composes the
+same uncached-GTT flags with raw ioctls and is therefore not in the
+[VA registry](./debugging.md).
 
 ### `cpu_access` follows the copy queue
 
 The allocator (`device/src/amd/allocator.rs`) computes
 `cpu_access = options.cpu_access || !self.dev.has_sdma_queue()`. When an SDMA copy
-queue is installed (the default on CDNA — see [Overview](./overview.md)), an
-intermediate can be **device-only** VRAM and copies go through DMA:
-`_copyin`/`_copyout` stage
-through the copy queue, `_transfer` is a direct device→device copy. When no copy
-queue is present, `has_sdma_queue()` is `false`, so every buffer is forced
-host-visible and copies fall back to a plain host `memmove` after the scoped
-`wait_storage`. The generic `LruAllocator` (`device/src/allocator.rs`) pools
-freed buffers by `(size, BufferSpec)`; the `nolru` spec bypasses the pool for
-code objects and the EOP / CWSR context-save buffers, while rings, GART pages,
-signal slots and scratch skip the pooled allocator entirely and go straight to
-the seam through `alloc_uncached_tagged` / `alloc_host_visible_tagged` /
-`alloc_scratch`.
+queue is installed (the default on every part — see [Overview](./overview.md)),
+an intermediate can be **device-only** VRAM and copies go through DMA:
+`_copyin`/`_copyout` stage through the copy queue, and `_transfer` is a
+device→device DMA when either side is device-only. When no copy queue is
+present, `has_sdma_queue()` is `false`, so every buffer is forced host-visible
+and copies fall back to a plain host `memmove` after the scoped `wait_storage`.
+The generic `LruAllocator` (`device/src/allocator.rs`) pools freed buffers by
+`(size, BufferSpec)`; code objects, the EOP / CWSR context-save buffers, rings,
+GART pages, signal slots and scratch never enter that pool — they call the
+`AmdAllocator` directly (`alloc_uncached_tagged` / `alloc_host_visible_tagged`
+/ `alloc_scratch`) and go straight to the seam.
 
 :::note[Process-shared state]
 `/dev/kfd` is opened once per process and shared by all devices (events are

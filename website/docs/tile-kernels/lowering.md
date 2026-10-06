@@ -49,7 +49,8 @@ kernel *is* just more UOps, it inherits all of the compiler's infrastructure for
 nothing tk-specific to build or to learn:
 
 - **One renderer.** The same `svod-codegen` path that lowers graph kernels to LLVM IR — and from
-  there to an AMD binary or to PTX — renders your `tk` kernel. There is no second backend to write, port, or keep in sync.
+  there to an AMD binary or to PTX — or to MSL on Metal, renders your `tk` kernel. There is no
+  second backend to write, port, or keep in sync.
 - **One debugger.** You inspect a `tk` kernel exactly like any computation: print the UOp tree.
   A hand-written Flash Attention and an autotuned matmul appear in the *same* textual form, with
   the same op names — no separate dump format, no "what is kernel X" mystery.
@@ -70,7 +71,7 @@ that is the cost it refuses to pay.
 
 ## The builder: `Kernel` and `Group`
 
-You author with two types (from the AUTHOR face in `tk/src/lib.rs`):
+You author with three types (from the AUTHOR face in `tk/src/lib.rs`):
 
 - **`Kernel`** (`tk/src/kernel.rs`) is the eager builder. It hands you the raw materials —
   grid/block dimensions (which become `SPECIAL` ops), loop ranges (`RANGE`), shared-memory and
@@ -80,13 +81,16 @@ You author with two types (from the AUTHOR face in `tk/src/lib.rs`):
   `shuffle`, `elementwise`) is the cooperating wave (or group of waves). It carries the
   *compute* vocabulary: loads and stores between memory spaces, the `mma` matrix multiply,
   reductions, shuffles, elementwise maps.
+- **`Loop`** (`tk/src/loop_scope.rs`) is a tracked `RANGE` with the loop-carried bookkeeping
+  made declarative: `reinit` for a per-trip re-initialization, `close` for the one loop-closing
+  edge.
 
 Every `Group` operation builds UOp nodes directly. A load opens the necessary `RANGE`s, emits a
 `STORE` that closes them, and returns the destination tile re-wrapped with a dependency edge so
 the next operation orders after it. You're writing a graph, eagerly, one tile op at a time.
 
 When you're done, you call `Kernel::finish(...)`, which closes the open ranges and wraps
-everything in a terminal `SINK`.
+everything in a terminal `SINK`. [The Builder API](./builder-reference) is the full surface.
 
 ---
 
@@ -170,19 +174,21 @@ That's the payoff of "one IR": the hand-written kernel and the autotuned kernel 
 
 A subtle failure mode in kernel libraries: you call the fast path, it quietly decides it can't
 handle your input, and you get the slow path with no warning — or worse, a wrong answer. `tk`'s
-public kernels (`tk/src/kernels/`, the single-output ones via `launch_custom` in
-`tk/src/launch.rs`, the multi-output k-means and k-NN inlining the same policy) are
-built to make that impossible. Every entry point returns a three-way result:
+public kernels (`tk/src/kernels/`, through `launch_custom` in `tk/src/launch.rs`; k-means and
+k-NN inline the same policy) are built to make that impossible. Every entry point returns a
+three-way result:
 
 | Result | Meaning | What you do |
 |--------|---------|-------------|
 | `Ok(Some(tensor))` | The kernel ran. | Use the tensor. |
-| `Ok(None)` | "Doesn't apply here" — unsupported arch, or the shape doesn't tile cleanly. | Fall back to a graph implementation, deliberately. |
-| `Err(...)` | The *request* is malformed — wrong dtype, dimensions not divisible, non-square operands. | Fix the call. This is a bug, raised loudly. |
+| `Ok(None)` | "Doesn't apply here" — unsupported arch, missing toolchain, or the shape doesn't tile cleanly. | Fall back to a graph implementation, deliberately. |
+| `Err(...)` | The *request* is malformed — wrong dtype, dimensions not divisible, a symbolic dim, non-square operands. | Fix the call. This is a bug, raised loudly. |
 
 The distinction between `Ok(None)` (a legitimate "not me") and `Err` (a caller mistake) is the
 point. Unsupported hardware routes to a fallback; a dtype the kernel can't accept is an error
-you see immediately, not a silent detour to the slow path.
+you see immediately, not a silent detour to the slow path. The errors are structured
+(`LaunchError::Dtype { kernel, got, expected }`, `DimMultiple`, `OperandShape`, …), so a model
+can match on them; [The Kernel Library](./kernel-library) lists each kernel's rules.
 
 ---
 

@@ -1,3 +1,8 @@
+//! Lazy tensor API for Svod. Operations build a UOp graph and run nothing;
+//! [`Tensor::realize`] schedules, compiles and executes it, and [`Tensor::prepare`]
+//! compiles it once into an [`ExecutionPlan`](svod_runtime::ExecutionPlan) to replay.
+//! See <https://svod.vpermilp.online/docs/examples>.
+
 use bon::bon;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -288,8 +293,10 @@ impl Tensor {
 
     /// Create an uninitialized buffer-backed tensor with the given shape and dtype.
     ///
-    /// No device memory is allocated — only the BUFFER UOp is created.
-    /// Use `assign()` to bind real data before `realize()`.
+    /// Only the BUFFER UOp is created; its storage is bound the first time a
+    /// plan is prepared over it and is then shared by every graph that
+    /// references the identity. Fill it with `assign()` + `realize()`, or
+    /// write through `array_view_mut` once a plan is prepared.
     /// Matches Tinygrad's `Tensor.empty(*shape)`.
     #[track_caller]
     pub fn empty(shape: &[usize], dtype: DType) -> Self {
@@ -836,7 +843,11 @@ fn uint_for_bytes(n: usize) -> svod_dtype::ScalarDType {
 impl Tensor {
     /// Assign a value tensor to this tensor in-place.
     ///
-    /// Embeds the write as `AFTER(target, STORE(target, value))`.
+    /// Embeds the write as `AFTER(target, STORE(target, value))`: a pending
+    /// store that `realize()` lands in the target's storage, keeping its
+    /// identity. Dependents built earlier read that identity, so they see the
+    /// value once the assign is realized (and the old one if they realize
+    /// first) — the same ordering as Tinygrad.
     ///
     /// # Example
     ///

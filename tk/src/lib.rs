@@ -21,22 +21,27 @@
 //! either wrap its SINK as a lazy graph node ([`graph_launch`], production wiring)
 //! or dispatch it directly against concrete buffers for isolation/debug
 //! ([`run_kernel`] / [`compile_kernel`] / [`CompiledLaunch`]). The built-in
-//! [`matmul`](kernels::gemm::matmul) is the worked reference kernel.
+//! [`matmul`] is the worked reference kernel.
 //!
 //! It is a thin eager builder, not a backend: tiles wrap UOp buffers and emit the
 //! same lowered-kernel IR (`Range` + `index().store(..).end(..)`) the normal
 //! renderer consumes. Port of tinygrad's `extra/thunder/tiny/tk`.
 //!
 //! # Supported targets
-//! - **gfx942** (CDNA3) — wave64, MFMA.
+//! - **gfx942** (CDNA3) — wave64, MFMA: [`matmul`], [`flash_attention`] (and the
+//!   gfx942-only direct-launch [`kernels::fa::flash_attention_forward_mw_rdb`]),
+//!   [`single_query_attention`], [`knn`], [`kmeans_assign`].
 //! - **gfx1151** (RDNA3.5) — wave32, gfx11 WMMA (replicated inputs, even/odd
-//!   accumulator — the `_W32_*` shapes).
-//! - **gfx1200 / gfx1201** (RDNA4) — wave32, gfx12 WMMA (one strided 8/lane
-//!   [`tiles::RT_16X16_GFX12`] for every role). Every kernel bar the direct-launch
-//!   flash-attention wrapper, which builds a wave64 block and stays gfx942-only.
+//!   accumulator — the `_W32_*` shapes) — and **gfx1200 / gfx1201** (RDNA4) —
+//!   wave32, gfx12 WMMA (one strided 8/lane [`tiles::RT_16X16_GFX12`] for every
+//!   role): every kernel bar the direct-launch flash-attention wrapper, adding
+//!   [`gemm_nt`] and [`rms_norm`] / [`add_rms_norm`] to the gfx942 set.
 //! - **CUDA sm_80+** — warp32, `mma.sync.m16n8k16` (a 16×16 tile as two m16n8
-//!   halves, [`layout::LaneMap::MmaSync`]); [`matmul`], [`flash_attention`] and the
-//!   shuffle-only [`single_query_attention`].
+//!   halves, [`layout::LaneMap::MmaSync`]): [`matmul`], [`flash_attention`],
+//!   [`gemm_nt`], [`rms_norm`] / [`add_rms_norm`] and the shuffle-only
+//!   [`single_query_attention`].
+//! - **Metal Apple7+** — SIMD-group 32, `simdgroup_matrix` (an 8×8 fragment at
+//!   2/lane, [`tiles::RT_8X8_SIMD`]): [`matmul`] and [`flash_attention`].
 //!
 //! Each kernel declares the arches it is built for as an [`ArchSet`]. Inputs are
 //! bf16/f16, accumulation is f32, the WMMA/MFMA K-edge is 16; the per-arch

@@ -44,7 +44,7 @@ let ta = Tensor::from_slice(&a);
 let tb = Tensor::from_slice(&b);
 let mut out = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
 
-// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA and CUDA.
+// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA, CUDA and Metal.
 let arch = svod_tk::target::resolve_arch(&ta.device()).expect("a GPU device");
 let w = svod_tk::ArchCaps::for_arch(arch).wave_size as i64;
 
@@ -95,8 +95,8 @@ run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| { /* bo
 पूरा `16×16` tile एक ही wave के registers में समा जाता है, इसलिए blocks भर में फैलाने को कुछ है ही नहीं।
 block size `w` है, यानी **wave width** — जिसे हमने पहले ही device से query कर लिया था
 (`ArchCaps::for_arch(resolve_arch(&ta.device())).wave_size`), क्योंकि एक wave CDNA पर 64 lanes की होती है पर
-RDNA और NVIDIA पर 32, और block dimension *वही* lane count है। output slice पहले आता है, inputs बाद में — और **यही order वह contract
-है** जिस पर अगला step टिका है।
+RDNA, NVIDIA और Apple पर 32, और block dimension *वही* lane count है। output slice पहले आता है, inputs बाद
+में — और **यही order वह contract है** जिस पर अगला step टिका है।
 
 ### 2. काम के लिए एक wave लें
 
@@ -132,13 +132,16 @@ tensor साथ रखता है, allocation के लिए।)
 let frag = ker.frag(FragRole::Accumulator);
 ```
 
-यह [Wave32 बनाम Wave64](./wave-portability) वाली portability की चाल है, और यह उस कर्नेल में भी मायने रखती है
-जिसमें कोई matrix multiply है ही नहीं: वही logical `16×16` f32 tile हर supported architecture पर एक *अलग
+यह [Layouts और wave size](./wave-portability) वाली portability की चाल है, और यह उस कर्नेल में भी मायने रखती
+है जिसमें कोई matrix multiply है ही नहीं: वही logical `16×16` f32 tile हर supported architecture पर एक *अलग
 physical lane layout* रखता है, इसलिए किसी hardcoded fragment के बजाय एक **role** का नाम लेने से एक ही body
 उन सबके लिए compile हो जाती है। हम कर्नेल से `Accumulator` role माँगते हैं — यानी बस एक
 full-precision result tile का role, जो एक add भी produce करता है, सिर्फ़ MMA ही नहीं — और `Kernel::frag`
-इसे `ArchCaps::frag` को आगे सौंप देता है ताकि target के लिए physical fragment resolve हो सके: CDNA पर
-wave64, RDNA पर even/odd wave32 layout, और CUDA पर two-half `mma.sync` layout।
+इसे `ArchCaps::frag` को आगे सौंप देता है ताकि target के लिए physical fragment resolve हो सके: CDNA पर wave64
+stride map, RDNA3 पर even/odd wave32 layout, RDNA4 पर प्रति lane 8 वाला strided map, CUDA पर two-half
+`mma.sync` layout, और Apple पर 8×8 fragments का 2×2 grid। (`ker.acc((16, 16), TileLayout::Row)`
+`ker.rt(.., DType::Float32, .., ker.frag(FragRole::Accumulator))` का एक-call वाला shortcut है; library
+कर्नेल इसी को इस्तेमाल करते हैं।)
 
 ### 5. Load: global → register
 
@@ -206,8 +209,8 @@ let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
 |------|-----|
 | **Tile dims `16` के गुणक हों** | एक tile `16×16` matrix-core fragments की पूरी संख्या है; `ker.rt` इसे assert करता है। |
 | **`gl()` order = launch buffer order** | पहले outputs, फिर inputs। bind positional है; एक mismatch चुपचाप buffers swap कर देता है — ग़लत numbers, कोई error नहीं, इसलिए compiler इसे पकड़ नहीं पाता। |
-| **fragments role से माँगें, constant से नहीं** | `ker.frag(role)` ही वह चीज़ है जो एक body को wave32 पर, wave64 पर, *और* NVIDIA के warp32 पर चलाती है। |
-| **यह एक GPU कर्नेल है** | builder असली lane indices (`Op::Special`) mint करता है, इसलिए execution एक GPU को target करता है — AMD या CUDA — CPU को नहीं। |
+| **fragments role से माँगें, constant से नहीं** | `ker.frag(role)` ही वह चीज़ है जो एक body को wave32 पर, wave64 पर, NVIDIA के warp32 पर *और* Apple के SIMD group पर चलाती है। |
+| **यह एक GPU कर्नेल है** | builder असली lane indices (`Op::Special`) mint करता है, इसलिए execution एक GPU को target करता है — AMD, CUDA या Metal — CPU को नहीं। |
 
 ---
 
@@ -215,30 +218,33 @@ let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
 body बिल्कुल [IR में authoring](./lowering) वाले `RANGE` / `INDEX` / `LOAD` / `STORE` shape में lower होता
 है — कोई नए node types नहीं। कर्नेल एक lane-index `Op::Special` mint करता है जिस पर wave के loads सवार होते
 हैं; हर `warp.load` उस lane के तहत एक global `LOAD` बनता है, `warp.add` एक अकेला `Op::Binary(Add)` है, और
-store एक `STORE` है जिस पर `SINK` close होता है। यहाँ **न** कोई `Wmma` है **न** `Local` address space वाला कोई `BUFFER`: यह
-एक register-only round-trip है, सबसे compact कर्नेल जिसे IR express कर सकता है।
+store एक `STORE` है जिस पर `SINK` close होता है। यहाँ **न** कोई `Wmma` है **न** `Local` address space वाला
+कोई `BUFFER`: यह एक register-only round-trip है, सबसे compact कर्नेल जिसे IR express कर सकता है।
 
 चूँकि कर्नेल `Special` ops emit करता है, यह एक पूरी तरह hand-lowered GPU कर्नेल *है* — optimizer और
 workgroup-dimension passes एक `Special`-bearing graph को already-lowered मानकर उसे pass through कर देते हैं
-(वही gate जिसे `opts_to_apply: Some(vec![])` enforce करता है)। इसीलिए यह सिर्फ़ किसी GPU backend — AMD या NVPTX — पर render
-होता है: lane index का scalar CPU path पर कोई मतलब नहीं। हालाँकि `SINK` *बनाना* तो विशुद्ध UOp construction
-है — इसके लिए किसी GPU की ज़रूरत नहीं; ज़रूरत सिर्फ़ इसे execute करने में पड़ती है। यही बँटवारा एक कर्नेल को
-हर build पर एक host-side shape check से guarded रहने देता है, और on-device numbers के लिए एक अलग gated test रखता है।
+(वही gate जिसे `opts_to_apply: Some(vec![])` enforce करता है)। इसीलिए यह सिर्फ़ किसी GPU backend — AMD, NVPTX
+या Metal — पर render होता है: lane index का scalar CPU path पर कोई मतलब नहीं। हालाँकि `SINK` *बनाना* तो
+विशुद्ध UOp construction है — इसके लिए किसी GPU की ज़रूरत नहीं; ज़रूरत सिर्फ़ इसे execute करने में पड़ती है।
+यही बँटवारा एक कर्नेल को हर build पर एक host-side shape check से guarded रहने देता है, और on-device numbers
+के लिए एक अलग gated test रखता है: `tk/src/test/unit/guide.rs` में ठीक यही body है, जो हर `cargo test` पर
+इसका graph shape जाँचती है, और `--ignored` के तहत इसे hardware पर चलाती है ([डीबगिंग](./debugging))।
 :::
 
 ---
 
 ## यह क्यों ज़रूरी है
 
-यह नन्हा कर्नेल वही template है जिसमें हर tk कर्नेल ढाला जाता है। matmul कर्नेल इसमें एक `mma` और एक K-loop
-जोड़ता है, और worked [Flash Attention](./flash-attention) example matrix core को एक online-softmax
-recurrence, double-buffered streaming, और एक wave-size branch के साथ काम पर लगाता है। पर बुनियादी ढाँचा
-ठीक वही है जो आपने अभी लिखा: globals को launch order में declare करो, tiles को role से माँगो, memory spaces
-के बीच data move करो, tiles पर compute करो, और `finish`। इस skeleton को सीख लीजिए, फिर मुश्किल कर्नेल इसे
-बदलते नहीं, बस इसमें और जोड़ते जाते हैं।
+यह नन्हा कर्नेल वही template है जिसमें हर tk कर्नेल ढाला जाता है। GEMM इसमें एक `mma`, एक shared-memory
+strip और एक K-loop जोड़ता है, और worked [Flash Attention](./flash-attention) example matrix core को एक
+online-softmax recurrence, double-buffered streaming, और एक layout branch के साथ काम पर लगाता है। पर बुनियादी
+ढाँचा ठीक वही है जो आपने अभी लिखा: globals को launch order में declare करो, tiles को role से माँगो, memory
+spaces के बीच data move करो, tiles पर compute करो, और `finish`। इस skeleton को सीख लीजिए, फिर मुश्किल कर्नेल
+इसे बदलते नहीं, बस इसमें और जोड़ते जाते हैं।
 
 और यह सब एक ही UOp IR है। जो `SINK` आपने बनाया, वह उसी तरह की object है जो compiler एक autotuned कर्नेल के
 लिए produce करता है — और यही इस पूरे section का असल मक़सद है।
 
-आगे वह बारीकी है जो हाथ से authoring को सचमुच मुश्किल बना देती है — एक कर्नेल को wave sizes और fragment
-layouts भर में correct रखना: [Wave32 बनाम Wave64](./wave-portability)।
+आगे बाक़ी शब्दावली — [Builder API](./builder-reference) — और फिर वह बारीकी जो हाथ से authoring को सचमुच
+मुश्किल बना देती है, यानी एक कर्नेल को wave sizes और fragment layouts भर में correct रखना:
+[Layouts और wave size](./wave-portability)।

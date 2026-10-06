@@ -1,232 +1,62 @@
 ---
-sidebar_label: Range & Reduce
+sidebar_label: Range & reduce
 ---
 
 # Range and Reduce Optimization
 
-Loop structures are the primary target for optimization in tensor compilers. A naive element-wise addition of two `[1024, 1024]` tensors generates a single loop over 1M elements. After optimization, it becomes 1024 parallel threads each processing 1024 elements with vectorized loads/stores. Range optimization is how we get there.
+The rules that decide which loops exist: splitting, merging and narrowing ranges, collapsing reductions to closed forms, inlining or materializing intermediates. They live in `schedule/src/rangeify/{patterns,transforms,kernel}.rs` and run in the rangeify mega-pass, at the kernel cut and in `apply_pre_optimization` (see [Rangeify](../codegen/rangeify.md) for the order). Tinygrad: `schedule/rangeify.py`, `codegen/simplify.py`.
 
-These patterns live in `schedule/src/rangeify/` and run during Stages 1-5 of the [codegen pipeline](../codegen/overview.md).
+## Range splitting (`pm_split_ranges`)
 
-Tinygrad source: `tinygrad/codegen/simplify.py`.
+A `RANGE % c` with `end % c == 0` marks the range; at the `SINK` every marked range is replaced by `outer * c + inner` with `outer = RANGE(end / c)` and `inner = RANGE(c)`, both keeping the axis type and taking the axis ids `axis.child(0)` / `axis.child(1)` (no global id allocation). `Warp` and `Device` ranges are never split; every range an image `STORE` indexes is pinned, because an image address is a coordinate pair, not a flat offset. The substituted graph is simplified with `symbolic + pm_fold_cast_const`, so `inner % c → inner` and `(outer*c + inner) // c → outer` fire immediately.
 
----
+## Range merging and narrowing (`pm_simplify_ranges`)
 
-## Range Splitting
+`simplify_merge_adjacent` runs on every `END` and `REDUCE` with at least two ranges. For an `END` it tries adjacent pairs; for a `REDUCE` every ordered pair. A pair `(r0, r1)` merges when both have the same axis type, constant ends, and appear in the same `REDUCE`s (consistent scoping): the merged range `R(s0*s1)` replaces `r0` by `R // s1` and `r1` by `R % s1`, the graph is simplified with `symbolic + pm_fold_cast_const + pm_flatten_range`, and the merge is kept only if the `FloorDiv`/`FloorMod` count did not grow (`count_divmod`, memoized per node). A symbolic end is never merged: the divmod count would not change, and the symbolic product would hide the constant axis from every later const-only opt (upcast, unroll, locals, tensor cores).
 
-**What**: Decompose a single range into outer and inner components via divmod.
+`mark_gated` collects, from every `INDEX`, the bound each validity clause `range < c` proves for a range; a range used anywhere without a guard is pinned to its own end, and `REDUCE` ranges are protected. At the `SINK` each bounded range is rebuilt with the largest proven bound and the result simplified. Together with `pm_flatten_range` (range lists re-derived from the `RANGE`s reachable through the sources, `Bool`/`Void` backedges kept) this is the whole of stage "simplify ranges".
 
-**When**: A range variable is used with modulo: `RANGE(end) % c` where `end % c == 0`.
+## Load collapse (`pm_load_collapse`)
 
-```mermaid
-flowchart TD
-  A["Before: RANGE(end=12) % 4 (one loop, modulo in body, slow)"]
-  A -->|"split: end/c outer, c inner"| B["After: RANGE(end=3) * 4 + RANGE(end=4)"]
-  B --> C["outer: RANGE(end=3) (Parallel)"]
-  B --> D["inner: RANGE(end=4) (Sequential / Vectorize)"]
-```
+`reduce_load_collapse(src, ranges)`, per range: take the nodes in scope of the range (bail on a nested `REDUCE` or `STORE`), replace every external input that is not a constant or `PARAM` by a scalar `PARAM` variable `in{n}` carrying its `vmin`/`vmax` (`UOp::variable`), wrap the body in a synthetic `REDUCE(Add)` over that range, and run `build_reduce_load_collapse_matcher`. If no `RANGE` survives, substitute the variables back. The matcher is `pm_reduce_collapse` plus the `.or_casted()` forms and the `NE` lifting.
 
-**Why**: After splitting, the inner range can be vectorized (UPCAST to SIMD width) while the outer range can be parallelized (GPU blocks, CPU threads). Without splitting, the modulo prevents both optimizations.
+The bound rules (`reduce_collapse_inner_patterns`, Tinygrad `simplify.py`):
 
-**Mechanism**: The `pm_split_ranges` pattern matcher collects ranges with modulo usage but does NOT transform immediately. It waits until it sees the SINK node, then performs all substitutions at once (avoids inconsistent partial rewrites). The outer and inner ranges append `0` and `1` to the original axis path, matching Tinygrad without allocating global range IDs.
+| Reduce body (over `r ∈ [0, N)`) | Closed form |
+|---------------------------------|-------------|
+| `WHERE(r < cut, 0, v)` | `clamp(N - cut, 0, N) * v` |
+| `WHERE(r < cut, v, 0)` | `clamp(cut, 0, N) * v` |
+| `WHERE(r >= lo & r < hi, v, 0)` | two-sided clamp times `v` |
+| `WHERE(idx != r, 0, e)`, `WHERE(idx == r, e, 0)` (gather) | `WHERE(0 <= idx < N, e[r := idx], 0)` |
 
-**Guard**: Only fires when `end % c == 0` (exact divisibility). Non-divisible cases are left as-is.
-
-Tinygrad: `simplify.py:60-64`. Svod: `pm_split_ranges()` in `rangeify/transforms.rs`.
-
----
-
-## Range Merging
-
-**What**: Merge two adjacent ranges into one, reducing loop overhead.
-
-```mermaid
-flowchart TD
-  A["Before: RANGE(0..4), RANGE(0..8) (two loops, 12 iterations overhead)"]
-  A -->|"merge: 4 * 8 = 32"| B["After: RANGE(0..32) (one loop, indices via divmod)"]
-```
-
-**Why**: Loop overhead (branch prediction, counter increment) is per-iteration. Merging reduces the number of loops at the cost of divmod operations to reconstruct the original indices.
-
-**Decision criterion**: Accept merge only if the total divmod operation count does not increase. The compiler counts divmod operations before and after — if merging introduces more divisions than it eliminates loop overhead, the merge is rejected.
-
-**Constraints**:
-- Both ranges must have compatible axis types (both output, both reduce, etc.)
-- REDUCE scope must remain consistent
-- Both ranges must appear in the same REDUCE scopes
-
-Tinygrad: `simplify.py:39-41` (`simplify_merge_adjacent`). Svod: `pm_simplify_ranges()`.
-
----
-
-## Range Flattening
-
-**What**: Flatten nested END/REDUCE/STORE chains into flat range lists.
+(`min` inside the clamps is spelled `-max(-a, -b)` so the `Max` bounds rule can close boundary cases.) Around them: `pm_reduce_unparented`; the lifting transforms that expose the bounds — `(x + y) < c → x < c - y` and `(x*y) < c → x < ceil(c/y)`, also through a `CAST`, `>=` and `==` likewise, `!=` in the load-collapse variant; the distributive `sum(x + y) → sum(x) + sum(y)`; `x * bool.cast() → WHERE(bool, x, 0)`; `try_param_factor` for a condition that is a range-free `PARAM` clause ANDed with a range clause. The outer `pm_load_collapse` also undoes a lifted `(x + y) < c` when `x` contains a load, so loaded indices never overflow. The same engine with the narrower matcher (no `!=` lifting) is `reduce_collapse`, used by `pm_reduce_simplify` in the mega-pass for `REDUCE(Add)` with `num_axes == 0`.
 
 ```text
-Before:  END(END(END(comp, [r0]), [r1]), [r2])
-After:   END(comp, [r0, r1, r2])
+sum(1 for k in 0..64 if k >= length)   →   max(0, 64 - length)
 ```
 
-**Why**: Nested END chains arise from successive transformations. Flattening normalizes the structure so other patterns (merging, splitting) can operate on a clean range list.
+## Reduce unparented and factor hoisting (`pm_reduce_simplify`)
 
-Tinygrad: `simplify.py:14-17`. Svod: `pm_flatten_range()`.
+`pm_reduce_unparented`: a reduce range the body does not reference is removed — `Add` multiplies the result by the extent, `Mul` raises it to the extent, `Max` drops the range; `Min` is not matched. `reduce_mul_chain`: in `REDUCE(a * b * .., Add | Max)` the factors that depend on no reduce range move outside (for `Max` only provably non-negative ones), integers only. Both also run in `POST_OPT_SYM` (stage 08) and the `sym` tier.
 
----
+## Buffer removal (`pm_remove_bufferize`)
 
-## Load Collapse
+`INDEX(STAGE(src, ranges, opts), indices)` is inlined by substituting the stage ranges with the consumer's indices (`substitute_gated`; `CONST` ranges and `Invalid` indices are skipped) unless:
 
-**What**: Eliminate a REDUCE loop entirely when the computation can be expressed as closed-form arithmetic.
+1. `src` is an always-run op (`CONTIGUOUS`, `COPY`, `NOOP`) or the stage is non-removable (a `COPY` consumer, an always-contiguous source, a multi-consumer realize boundary, a custom-kernel input);
+2. the compute reads more than three distinct buffers (`AFTER` buffers, global `STAGE`s, `MSTACK`, `PARAM`/`BUFFER`), which would blow up the kernel's argument list;
+3. a `REDUCE` inside the compute reads a buffer (`PARAM`, `BUFFER` or `STAGE`) — inlining would re-run the read on every iteration (`argmax(-x)` would load `x` N times instead of once). A reduce over values that touch no buffer is still inlinable.
 
-```text
-Before:  sum(1 for k in 0..64 if k >= length)    // Loop: 64 iterations
-After:   clamp(64 - length, 0, 64)                // Arithmetic: 3 ops
-```
+Two cleanup rules follow the substitution: `STORE(x, x)` → `NOOP`, `END(NOOP)` → `NOOP`.
 
-**How it works**:
-1. Identify subexpressions independent of the REDUCE range
-2. Create `DEFINE_VAR` for those subexpressions (treat as loop-invariant)
-3. Substitute the range with `DEFINE_VAR` and run symbolic simplification
-4. If the simplified expression has no remaining ranges, the REDUCE is eliminated
+`buffer_folding`: `STAGE(CONST)`, `INDEX(CONST)`, `COPY(CONST)` and `INDEX(MSTACK(CONST, ..))` fold to the constant; `INDEX(STAGE(compute, ranges), ranges)` with the same ranges is `compute` shrunk to the stage shape, tags merged.
 
-This is the most powerful single optimization — it can eliminate entire reduction loops, converting O(N) computation to O(1).
+`dead_axis_removal`: a removable `STAGE` (not over `AFTER` or an always-run op, no symbolic end) drops ranges that are `CONST` or unused by the compute, then `RESHAPE`s size-1 dims back in and `EXPAND`s to the original shape. A stage can end with zero ranges; it must still exist, or no `STORE` is produced at the cut.
 
-Tinygrad: `simplify.py:145-149`. Svod: `pm_load_collapse()`.
+## Two-stage reductions (`split_reduceop`)
 
----
+In the earliest rewrite, a tensor-form `REDUCE` whose input/output ratio reaches `SplitReduceOpConfig::split_threshold` (32768) is split: a reduced dimension that is not broadcast (`detect_expanded_dimensions`) and divisible by a divisor in `[8, 256]` (largest first) such that the intermediate output stays under `2^22` elements is reshaped into `[.., divisor, rest, ..]`, reduced over the original axes, materialized with `CONTIGUOUS`, and reduced again over the divisor axis. The first stage then has `divisor` outputs to parallelize over; the second is small.
 
-## Reduce Collapse
+## Grouped reductions
 
-Analytical elimination of ADD reductions. More sophisticated than load collapse — applies algebraic transformations within the reduce body.
-
-### Bound Patterns
-
-These handle gated reductions where a comparison limits which iterations contribute:
-
-| Pattern | Before | After |
-|---------|--------|-------|
-| Lower bound | `sum(r < cut ? 0 : val, r=0..N)` | `max(0, N - cut) * val` |
-| Upper bound | `sum(r < cut ? val : 0, r=0..N)` | `max(0, min(N, cut)) * val` |
-| Two-sided | `sum(r >= lo & r < hi ? val : 0, r=0..N)` | `max(0, min(N,hi) - max(0,lo)) * val` |
-| NE-gated (gather) | `sum(idx != r ? 0 : expr, r=0..N)` | `in_bounds ? expr[r:=idx] : 0` |
-
-The NE-gated pattern is particularly important for gather operations — it recognizes that summing over all indices where `idx == r` is equivalent to a single indexed access.
-
-### Lifting Transforms
-
-Move comparisons outside the reduce scope to expose bound patterns:
-
-| Transform | Before | After |
-|-----------|--------|-------|
-| Lt lifting | `(x + y) < c` | `x < (c - y)` |
-| Ge lifting | `(x + y) >= c` | `x >= (c - y)` |
-| EQ lifting | `(x + y) == c` | `x == (c - y)` |
-
-### Distributive Law
-
-`sum(x + y) → sum(x) + sum(y)` — split reduce over addition. This enables each half to be independently collapsed by the bound patterns.
-
-### MUL-casted-bool
-
-`x * bool.cast() → WHERE(bool, x, 0)` — converts multiplication by a boolean cast into a WHERE, which can then be analyzed by the bound patterns.
-
-Tinygrad: `simplify.py:82-142`. Svod: `pm_reduce_simplify()` + `reduce_collapse_inner_patterns()`.
-
----
-
-## Buffer Removal (Partial Contiguous)
-
-**What**: Decide whether to materialize an intermediate result to a buffer or inline the computation, by substituting the bufferized ranges with the ranges the reader indexes with.
-
-When the rangeify pass creates a `STAGE` node (marking "this needs a buffer"), the buffer removal pass evaluates whether actually allocating memory is worthwhile. A `STAGE` is Svod's intermediate representation between "this needs a buffer" and the final `STORE`+`BUFFER`+`AFTER` — it lets this pass decide if materialization is actually needed. If the computation is cheap enough, it substitutes the range variables and inlines the expression directly.
-
-### Decision Tree
-
-```mermaid
-flowchart TD
-  Q1["Always-run op (CONTIGUOUS, COPY), or a non-removable STAGE?"]
-  Q1 -->|"YES"| K1["Keep buffer (always materialized)"]
-  Q1 -->|"NO"| Q2["More than 3 distinct buffers accessed?"]
-  Q2 -->|"YES"| K2["Keep buffer"]
-  Q2 -->|"NO"| Q3["Does a REDUCE in the body read a buffer?"]
-  Q3 -->|"YES"| K3["Keep buffer (reduce recomputation too expensive)"]
-  Q3 -->|"NO"| I1["Inline: substitute the STAGE ranges with the INDEX ranges"]
-```
-
-:::caution[Buffer Reads Inside a Reduce]
-The reduce guard is not about how cheap the operation is — it fires whenever any REDUCE in the body reads a buffer (`Param`, `Buffer` or a `Stage`). Reason: if `argmax(-x)` inlines the negation, `-x` is recomputed on every reduction iteration — N extra loads and negations instead of one buffer read. A reduce over values that touch no buffer is still inlinable.
-:::
-
-### Related Patterns
-
-| Pattern | What |
-|---------|------|
-| Stage folding | `STAGE(CONST) → CONST` — a stage of a constant is just the constant |
-| Index folding | `INDEX(CONST) → CONST` — indexing into a constant is the constant |
-| Copy folding | `COPY(CONST) → CONST` — copying a constant is the constant |
-| MStack folding | `INDEX(MSTACK([CONST, ...])) → CONST` — a multi-device stack of constants |
-| Identity fold | `INDEX(STAGE(compute, ranges), ranges) → compute` — same ranges cancel |
-
-Svod: `pm_remove_bufferize()` and `buffer_folding()` in `rangeify/patterns.rs`.
-
----
-
-## Dead Axis Removal
-
-**What**: Remove unused dimensions from STAGE operations.
-
-A dimension is "dead" when:
-- It has size 1 (contributes nothing)
-- It appears as a constant in the index (not a variable)
-- The compute expression doesn't reference it
-
-Dead axes are removed from STAGE, then the shape is restored via RESHAPE (insert size-1 dims) and EXPAND (broadcast to original size). This reduces the dimensionality of the buffer allocation.
-
-:::caution[Scalar Case]
-Even when ALL ranges are dead (scalar output), STAGE must be kept with empty ranges — removing it entirely causes `NoKernelsFound` since no STORE gets created during kernel splitting.
-:::
-
-Svod: `dead_axis_removal()` in `rangeify/patterns.rs`.
-
----
-
-## Reduce Unparented
-
-**What**: Remove ranges from a REDUCE that aren't referenced by the reduce body.
-
-| Reduce Op | Unreferenced range of size N | Transform |
-|-----------|------|-----------|
-| ADD | Range not used in body | Multiply result by N |
-| MUL | Range not used in body | Raise result to N-th power |
-| MAX / MIN | Range not used in body | Just remove range |
-
-Example: `sum(x, r=0..N)` where `x` doesn't depend on `r` → `x * N`. The sum of a constant over N iterations is N times the constant.
-
-Tinygrad: `simplify.py:82-86`. Svod: `pm_reduce_simplify()`.
-
----
-
-## Split ReduceOp
-
-**What**: Split large reductions into two stages for better parallelism.
-
-**When**: Input/output ratio exceeds 32768.
-
-```text
-Before:  REDUCE(data, axes=[0])       // shape [65536] → scalar
-After:   REDUCE(                       // shape [256] → scalar (second stage)
-           CONTIGUOUS(
-             REDUCE(                   // shape [65536] → [256] (first stage)
-               RESHAPE(data, [256, 256]),
-               axes=[1]
-             )
-           ),
-           axes=[0]
-         )
-```
-
-**Why**: A single huge reduction cannot be parallelized. Splitting into two stages allows the first stage to run in parallel (256 threads each reducing 256 elements), then the second stage reduces the 256 partial results.
-
-**Guard**: Only applies when the reduction dimension can be factored and the input/output ratio exceeds the threshold. Non-factorizable dimensions are skipped.
-
-Svod: `split_reduceop()` in `rangeify/kernel.rs`.
+Not a rangeify rule but the same family: `GROUP`/`GROUPTOP` opts turn part of a `Reduce` axis into `GroupReduce`, and `pm_group_for_reduce` (stage 10) lowers it to a partial `REDUCE` staged in local memory, read back with fresh `Reduce` loops (`axis_id.group_reduce_loop()`) and reduced again. See the [expander page](../codegen/expander.md).

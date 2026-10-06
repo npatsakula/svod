@@ -17,18 +17,15 @@ KFD 的 ABI 是一个 C 头文件 `kfd_ioctl.h`，从内核原样 vendored 进
 `device/include/kfd_ioctl.h`（即上游 AMD 文件，连同其完整的 ABI
 版本历史）。Rust 绑定由 `bindgen` 在构建时从它生成：
 
-- `device/build.rs` **在每一台宿主上无条件**运行 `bindgen`——
-  没有平台门控，也没有空桩分支。它是**封闭自洽的**：它不需要
+- `device/build.rs` 在每一台 Unix 宿主上运行 `bindgen`（`bindgen` 是一个
+  `cfg(unix)` 构建依赖），没有空桩分支。它是**封闭自洽的**：它不需要
   任何系统内核头文件。`kfd_ioctl.h` 传递性拉入的两个头文件
   （`<linux/ioctl.h>` 提供 `_IOC`/`_IO*` 宏，`<linux/types.h>` 提供
   `__uNN`/`__sNN` 别名）再加一个桩 `<drm/drm.h>`（残留——主体只用到
   `__u32 drm_fd` 字段）本身都被 vendored 在 `device/include/` 之下，
-  而 `build.rs` 传入 `-Iinclude`，使 bindgen 解析它们而非
-  `/usr/include`。切换到 vendored 头文件经验证为逐字节等价：
-  重新生成的绑定与系统头文件基线的差异仅在于 8 处定宽
-  类型别名的拼写（`__u32 = u32` 对 `c_uint`，尺寸相同）——全部
-  60 个结构体和 34 个常量都相同。（bindgen 需要 `libclang`，
-  在 macOS 上它随 Xcode CLT 一同发布。）
+  而 `build.rs` 传入 `-I<crate>/include`，使 bindgen 解析它们而非
+  `/usr/include`。生成的文件包含 60 个结构体和 34 个常量。
+  （bindgen 需要 `libclang`，在 macOS 上它随 Xcode CLT 一同发布。）
 
   它用 allow-list 精确圈定后端所需的 KFD 类型与常量：
 
@@ -37,8 +34,7 @@ KFD 的 ABI 是一个 C 头文件 `kfd_ioctl.h`，从内核原样 vendored 进
                    kfd_event_data, kfd_hsa_signal_event_data,
                    kfd_hsa_memory_exception_data, kfd_hsa_hw_exception_data,
                    kfd_memory_exception_failure, __u\d+, __s\d+
-  allowlist_var:   KFD_IOC_.*, KFD_MMAP_TYPE.*, KFD_MAX_QUEUE_PERCENTAGE,
-                   AMDKFD_IOC_.*
+  allowlist_var:   KFD_IOC_.*, KFD_MAX_QUEUE_PERCENTAGE, AMDKFD_IOC_.*
   ```
 
   （`AMDKFD_IOC_*` 请求码虽已列入 allow-list 却从不实体化：
@@ -53,14 +49,14 @@ KFD 的 ABI 是一个 C 头文件 `kfd_ioctl.h`，从内核原样 vendored 进
 - **第二遍 bindgen** 覆盖 AQL/HSA 那一侧：`include/amd_hsa_wrapper.h`
   拉入 vendored 的 ROCm `hsa/` 头文件，产出 `$OUT_DIR/hsa_sys.rs`
   （`hsa_kernel_dispatch_packet_t`、`hsa_queue_t`、`amd_queue_t`、`amd_signal_t`
-  及其同伴），由 `device/src/amd/sys/hsa.rs` `include!`。这里 `layout_tests`
-  被刻意**保持开启**：256 字节的 `amd_queue_t` 与 64 字节的 AQL
+  及其同伴，枚举以常量形式生成），由 `device/src/amd/sys/hsa.rs` `include!`。
+  这里 `layout_tests` 被刻意**保持开启**：256 字节的 `amd_queue_t` 与 64 字节的 AQL
   数据包对布局极为敏感，因此一个尺寸不对的结构体必须让构建失败。
 
-在每个平台上都编译这些绑定，正是使 AMD 后端成为一个
+在每一台 Unix 宿主上都编译这些绑定，正是使 AMD 后端成为一个
 [运行时检测的执行提供者](./overview.md) 而非编译期 feature 的原因：
-绑定在所有平台上都会生成，每一次 Unix 上的 `cargo check` 都对其上的
-KFD 调用点做类型检查（`nix` 的 ioctl 包装器是唯一 `cfg(unix)` 的部分），
+每一次 Unix 上的 `cargo check` 都对其上的 KFD 调用点做类型检查
+（面向内核的模块是 `cfg(unix)` 的；拓扑解析器和数据包构建器在所有平台上都能编译），
 而一台没有 GPU 的宿主则根本不会注册那个工厂。
 
 :::note[为什么手写 ioctl 宏]
@@ -127,9 +123,9 @@ DRM render fd 很有意思：这里**没有任何 DRM ioctl**。`drm_fd` 仅以
 GPU 节点是从 sysfs 枚举的，而不是通过 ioctl。
 `device/src/amd/topology.rs` 读取
 `/sys/devices/virtual/kfd/kfd/topology/nodes/<N>/properties`——每行一个
-`key value` 对——外加同级的 `<N>/gpu_id`，并返回一个 `Vec<AmdNode>`，
-跳过 CPU 节点（`gpu_id == 0`）。它从不 panic：没有 `/dev/kfd` 的宿主会
-产生一个空向量。
+`key value` 对——外加同级的 `<N>/gpu_id`（回退到内联的 `gpu_id` 属性），
+并返回一个按节点 id 排序的 `Vec<AmdNode>`，跳过 CPU 节点（`gpu_id == 0`）。
+它从不 panic：没有该 sysfs 树的宿主会产生一个空向量。
 
 正是这同一套枚举在运行时门控了整个后端。
 `topology::has_devices()`——「任何 `gfx_target_version` 能解析为
@@ -139,11 +135,13 @@ GPU 节点是从 sysfs 枚举的，而不是通过 ioctl。
 而如果向工厂请求一个并不存在的节点，它会返回一个明确的
 `Err(NoAmdGpu)`。
 
-每个 `AmdNode` 携带后端其余部分所需的字段：
-`gpu_id`、`drm_render_minor`、`gfx_target_version`（如 `110000` → gfx1100）、
-`simd_count`、`simd_per_cu`、`max_waves_per_simd`、`num_xcc`、`lds_size_in_kb`、
-`max_slots_scratch_cu` 等等——这些用于 scratch 尺寸计算以及 PM4 与
-AQL 的抉择。
+每个 `AmdNode` 携带后端其余部分所需的字段：`node_id`、
+`gpu_id`、`drm_render_minor`、`gfx_target_version`（如 `110000` → gfx1100，
+见[受支持 GPU 表](./overview.md)）、`simd_count`、`array_count`、
+`simd_arrays_per_engine`、`simd_per_cu`、`max_waves_per_simd`、
+`lds_size_in_kb`、`wave_front_size`、`num_xcc`、`num_cp_queues` 与
+`max_slots_scratch_cu`——这些用于 scratch 尺寸计算以及 PM4 与 AQL 的抉择。
+后端使用的 wave 宽度来自架构（arch），而不是 `wave_front_size`。
 
 :::tip[无硬件测试]
 sysfs 根目录可用 **`SVOD_KFD_TOPOLOGY`** 覆盖，因此解析器可针对一个
@@ -164,9 +162,9 @@ sysfs 根目录可用 **`SVOD_KFD_TOPOLOGY`** 覆盖，因此解析器可针对�
 4. MAP_MEMORY_TO_GPU(handle)            bind into the GPU page table
 ```
 
-宿主 VA 先用一个匿名的 `PROT_NONE` 映射预留，使得第 3 步中宿主可见的
-`mmap` 能恰好落在那个地址（`MAP_FIXED`）。
-释放则反向进行：`UNMAP_MEMORY_FROM_GPU` → `munmap` → `FREE_MEMORY_OF_GPU`。
+尺寸先向上取整到 4 KiB。宿主 VA 用一个匿名的 `PROT_NONE` 映射预留，使得第 3 步中宿主可见的
+`mmap` 能恰好落在那个地址（`MAP_FIXED`）。被请求的清零在映射之后进行，
+且要求宿主可见。释放则反向进行：`UNMAP_MEMORY_FROM_GPU` → `munmap` → `FREE_MEMORY_OF_GPU`。
 
 ### 分配种类
 
@@ -175,28 +173,30 @@ sysfs 根目录可用 **`SVOD_KFD_TOPOLOGY`** 覆盖，因此解析器可针对�
 
 | `AllocKind` | 标志 | 用于 |
 |---|---|---|
-| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE`（代码额外加 `EXECUTABLE`，宿主可见时额外加 `PUBLIC`） | 张量数据、code object、scratch |
-| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | 命令环、GART 页、信号槽、事件页 |
+| `DeviceVram { executable }` | `VRAM \| WRITABLE \| NO_SUBSTITUTE`（代码额外加 `EXECUTABLE`，宿主可见时额外加 `PUBLIC`） | 张量数据、code object、scratch；宿主可见的 kernarg 区（arena）以及 graph / linked-plan 控制缓冲区 |
+| `UncachedGtt` | `GTT \| WRITABLE \| EXECUTABLE \| NO_SUBSTITUTE \| PUBLIC \| COHERENT \| UNCACHED` | 命令环、GART 页、信号槽、SDMA 暂存缓冲区 |
 
 `UNCACHED | COHERENT` 的这种 GTT 变体很关键：命令环和信号
 槽必须在 CPU 与 GPU 之间立即可见，否则宿主会永远自旋
 等待一个卡在 GPU L2 中的完成值。KFD 会以 `EINVAL`
-拒绝对一个纯 VRAM 环执行 `CREATE_QUEUE`。
+拒绝对一个纯 VRAM 环执行 `CREATE_QUEUE`。唯一不经过 `alloc_raw` 的分配是
+每进程的事件页（`device.rs` 中的 `alloc_event_page`），它用原始 ioctl 组装
+同样的 uncached-GTT 标志，因此不在 [VA 注册表](./debugging.md) 中。
 
 ### `cpu_access` 跟随复制队列
 
 分配器（`device/src/amd/allocator.rs`）计算
 `cpu_access = options.cpu_access || !self.dev.has_sdma_queue()`。当安装了一个
-SDMA 复制队列时（在 CDNA 上即默认情形——见 [概览](./overview.md)），一个中间结果
+SDMA 复制队列时（在所有型号上都是默认情形——见 [概览](./overview.md)），一个中间结果
 可以是**仅设备的** VRAM，而复制走 DMA：`_copyin`/`_copyout` 经由复制
-队列暂存，`_transfer` 是一次直接的 设备→设备 复制。当没有复制
+队列暂存，而当任一侧是仅设备缓冲区时，`_transfer` 是一次 设备→设备 DMA。当没有复制
 队列存在时，`has_sdma_queue()` 为 `false`，因此每个缓冲区都被强制为
 宿主可见，而复制回落到作用域化的 `wait_storage` 之后的普通宿主
 `memmove`。通用的 `LruAllocator`（`device/src/allocator.rs`）按
-`(size, BufferSpec)` 池化已释放的缓冲区；`nolru` spec 对 code object 以及
-EOP / CWSR 上下文保存缓冲区绕过该池，而环、GART 页、信号槽与 scratch
-则完全跳过池化分配器，经由 `alloc_uncached_tagged` /
-`alloc_host_visible_tagged` / `alloc_scratch` 直达接缝。
+`(size, BufferSpec)` 池化已释放的缓冲区；code object、EOP / CWSR 上下文保存缓冲区、
+环、GART 页、信号槽与 scratch 从不进入该池——它们直接调用
+`AmdAllocator`（`alloc_uncached_tagged` / `alloc_host_visible_tagged`
+/ `alloc_scratch`）并直达接缝。
 
 :::note[进程共享状态]
 `/dev/kfd` 每进程只打开一次，并由所有设备共享（事件

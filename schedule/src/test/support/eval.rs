@@ -140,8 +140,7 @@ pub fn range_points(vars: &[Arc<UOp>], cap: usize) -> impl Iterator<Item = Bindi
 /// A stride coprime to `total`, near the golden-ratio split so short prefixes
 /// spread over every coordinate rather than clustering in the first.
 fn coprime_stride(total: usize) -> usize {
-    const GOLDEN: f64 = 1.618_033_988_749_895;
-    let mut stride = (((total as f64) / GOLDEN) as usize).max(1);
+    let mut stride = (((total as f64) / std::f64::consts::GOLDEN_RATIO) as usize).max(1);
     while stride < total && gcd(stride, total) != 1 {
         stride += 1;
     }

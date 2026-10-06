@@ -40,10 +40,10 @@ attributes #0 = { nounwind "no-builtins" "no-trapping-math"="true" "nvvm.maxntid
   (`opt`, `llvm-as`, IR dumps)।
 - `"nvvm.maxntid"` PTX का `.maxntid` **launch bound** है, हर axis पर एक bound: kernel के
   local sizes `nx[, ny[, nz]]` की तरह render होते हैं (`"16,8"` से `.maxntid 16, 8` बनता है;
-  छूटी हुई axes default में 1 होती हैं), और `ptxas` 1024-thread worst case के बजाय उसके
-  विरुद्ध प्रति thread registers का बजट बनाता है। जहाँ किसी local axis की लंबाई constant नहीं
-  है, वहाँ attribute छोड़ ही दिया जाता है — hardware maximum लागू होता है, ऐसा bound नहीं
-  जिसे launch खुद ही पार कर जाए। एक पुराना LLVM string attribute को नज़रअंदाज़ कर देता है
+  अंत की 1 वाली axes हटा दी जाती हैं), और `ptxas` 1024-thread worst case के बजाय उसके
+  विरुद्ध प्रति thread registers का बजट बनाता है। bound हर extent का `vmax` है, इसलिए integer
+  upper bound वाले symbolic extent को भी एक bound मिलता है; जिस extent का कोई integer bound
+  नहीं, वहाँ attribute छोड़ दिया जाता है और hardware maximum लागू होता है। एक पुराना LLVM string attribute को नज़रअंदाज़ कर देता है
   और केवल hint खो देता है।
 
 | Concept | AMD | NVPTX |
@@ -75,13 +75,16 @@ Renderer GPU targets पर ` nsz arcp contract afn ` को घटाकर ` c
 
 NVPTX के पास generic `@llvm.{exp,log,sin,cos,pow}` intrinsics के लिए **कोई lowering नहीं**
 है (instruction selection fail हो जाती है) और वह `@llvm.erf` को एक external call के रूप में
-emit करता है जो केवल `ptxas` के अंदर fail होती है। इसलिए renderer `Exp`, `Log`, `Log2`,
-`Sin`, `Cos`, `Tan`, `Erf`, `Pow`, `Max` और `Threefry` को अपने `supported_ops` से हटा देता
-है, और scheduler उन्हें `nvptx_decomposition_patterns()` से decompose करता है: AMD वाला set
-(native `exp2`/`log2` के ऊपर polynomial `exp`/`log`/trig, integer-domain bf16 rounding) साथ
-में f64 `Exp2`/`Log2` expansions, क्योंकि NVPTX `@llvm.exp2` को केवल f16/f32 के लिए lower
-करता है। `Max`, `Pow` और `Threefry` हर GPU renderer के लिए हटाए जाते हैं, किसी NVPTX-विशिष्ट
-निर्णय के रूप में नहीं: वे एक select में और एक सादे XOR में decompose हो जाते हैं।
+emit करता है जो केवल `ptxas` के अंदर fail होती है। इसलिए CUDA renderer wrapper
+(`runtime/src/devices/cuda.rs`) `Exp`, `Log`, `Log2`, `Sin`, `Cos`, `Tan`, `Erf`, `Pow`, `Max`
+और `Threefry` को अपने `supported_ops` से हटा देता है, और scheduler उन्हें rendering से पहले
+decompose करता है। इसका `decompositor` `nvptx_decomposition_patterns()` है: AMD वाला set
+(native `exp2`/`log2` के ऊपर polynomial `exp`/`log`/`cos`/`tan`/`pow`, integer-domain bf16
+rounding) साथ में f64 `Exp2`/`Log2` expansions, क्योंकि NVPTX `@llvm.exp2` को केवल f16/f32 के
+लिए lower करता है। `Sin` और f32/f16 `Log2` `supported_ops` पर keyed साझा transcendental
+patterns से होकर जाते हैं; `Erf`, `Max` और `Threefry` को optimizer के अपने passes rewrite
+करते हैं (एक polynomial, एक select, पूरा `threefry2x32` mixing)। `Max`, `Pow` और `Threefry`
+हर GPU renderer के लिए हटाए जाते हैं, किसी NVPTX-विशिष्ट निर्णय के रूप में नहीं।
 
 जो native रहता है: `@llvm.exp2.f32` `ex2.approx.f32` select करता है, `@llvm.sqrt` `sqrt.rn`
 select करता है, `fma`/`floor`/`rint`/`maxnum` सीधे lower होते हैं।
@@ -123,8 +126,8 @@ shape है; PTX ISA प्रति row न्यूनतम capability त�
 कोई भी दूसरा tuple, या न्यूनतम से नीचे का arch, `None` return करता है और caller
 `InvalidGraph` उठाता है ताकि optimizer ऊपर की ओर decompose करे। Fragments PTX register
 split का अनुसरण करते हैं (A 16×K है, B K×8, C/D 16×8, सब 32 lanes पर 32-bit registers में):
-f16 operands `<2 x half>` जोड़ियों के रूप में जाते हैं, bf16 / tf32 / int8 / fp8 `i32` words
-के रूप में, f32 accumulators `float` के रूप में; aggregate result को WMMA के स्वाभाविक
+f16 operands और f16 accumulators `<2 x half>` जोड़ियों के रूप में जाते हैं, bf16 / tf32 /
+int8 / fp8 operands और i32 accumulators `i32` words के रूप में, f32 accumulators `float` के रूप में; aggregate result को WMMA के स्वाभाविक
 vector में फिर से जोड़ दिया जाता है। मेल खाती `declare` lines हर call site के operand types
 से synthesize होती हैं (`wmma_declaration_from_call`), वही mechanism जो AMD WMMA/MFMA
 intrinsics का है।
@@ -173,7 +176,8 @@ little-endian ELF64, `EM_CUDA` के लिए, जो entry को code के
 PTX ISA version arch के अनुसार pin है, clang पर नहीं छोड़ा जाता, जिसका default उस CUDA
 toolkit पर निर्भर है जो उसे मिलता है (CUDA 13 के साथ clang 22: `.version 8.8`, जिसे एक
 CUDA 12.9 driver चाहिए; बिना toolkit: किसी भी tensor core के लिए बहुत पुराना version)।
-`ptx_isa` compute capability में monotone है: sm_88 तक `+ptx78`, sm_89 से लेकर हर 9.x तक
-`+ptx84` (fp8 `mma.sync` shapes 8.4 से मौजूद हैं), sm_100 से sm_102 पर `+ptx86`, sm_120 पर
-`+ptx87`, और sm_103, sm_121 तथा उससे नए पर `+ptx88`। Clang इससे पुराने को मना कर देता है:
+`ptx_isa` (`codegen/src/llvm/nvptx/mod.rs`) capability को उस सबसे पुराने ISA से map करता है
+जो उस part को जानता है: sm_88 तक `+ptx78`, sm_89 से लेकर हर 9.x तक `+ptx84` (fp8 `mma.sync`
+shapes 8.4 से मौजूद हैं), sm_100 से sm_102 पर `+ptx86`, sm_120 पर `+ptx87`, और हर दूसरे 10.x
+तथा नए part पर `+ptx88` (sm_103, sm_110, sm_121, ...)। Clang इससे पुराने को मना कर देता है:
 `PTX version 8.4 does not support target 'sm_120'. Minimum required PTX version is 8.7`।

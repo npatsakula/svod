@@ -64,7 +64,7 @@ pub struct GcInfo {
 pub struct Discovery {
     pub vram_size: u64,
     pub reserved_vram_size: u64,
-    /// `hwip → version` for the blocks in [`HW_ID_MAP`].
+    /// `hwip → version` for the blocks in `HW_ID_MAP`.
     pub ip_ver: BTreeMap<u16, (u8, u8, u8)>,
     /// `hwip → instance → register segment bases`.
     pub regs_offset: BTreeMap<u16, BTreeMap<u16, Vec<u64>>>,

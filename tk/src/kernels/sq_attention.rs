@@ -119,7 +119,7 @@ impl SqPolicy {
 
     /// The policy of the device behind `spec`: its compute units and the waves
     /// each keeps resident ([`crate::target::resident_waves_per_cu`]), or
-    /// [`UNREPORTED_BUDGET`] when the backend reports neither.
+    /// `UNREPORTED_BUDGET` when the backend reports neither.
     pub fn for_device(spec: &svod_dtype::DeviceSpec, arch: svod_dtype::GpuArch) -> Self {
         let budget = crate::target::compute_units(spec).zip(crate::target::resident_waves_per_cu(spec));
         let (compute_units, waves_per_cu) = budget.unwrap_or(UNREPORTED_BUDGET);

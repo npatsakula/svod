@@ -4,7 +4,7 @@
 //! our page-table context.
 //!
 //! DESTRUCTIVE — amdgpu must be unbound (device/tools/am_unbind.sh); recovery
-//! needs a VM reboot (see memory amd-am-kfd-recovery).
+//! needs a VM reboot.
 //!     sudo ./target/debug/examples/am_gmc
 
 use svod_device::amd::am::dev::AmDev;

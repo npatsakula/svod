@@ -4,11 +4,13 @@ sidebar_label: Op Bestiary
 
 # Op Bestiary: A Field Guide to UOp Operations
 
-When debugging Svod IR dumps, you'll encounter operations that aren't obvious from their names. This chapter documents non-trivial operations with signatures, field explanations, and examples.
+When debugging Svod IR dumps, you'll encounter operations that aren't obvious from their names. This chapter documents the non-trivial operations with their exact fields (as declared in `ir/src/op.rs`), the metadata structs they carry (`ir/src/types.rs`), and examples.
 
 **What's covered:** Operations that require explanation—loop control, reductions, memory operations, kernel structure, vectorization, tensor cores.
 
-**What's NOT covered:** Trivial ALU operations (`Add`, `Mul`, `Sqrt`, etc.) that work exactly as you'd expect.
+**What's NOT covered:** Trivial ALU operations (`Add`, `Mul`, `Sqrt`, etc.) that work exactly as you'd expect. `Op` has 60 variants; three of them (`Unary`, `Binary`, `Ternary`) carry an op kind, so counted per kind there are about 100 operations.
+
+Node labels in the examples use the `UOp::tree()` spelling: `[id] NAME : dtype`, so `RANGE(R0, Global)` is a renumbered axis `R0` of type `Global`, and `[10] → (see above)` is a shared node printed earlier.
 
 ---
 
@@ -29,36 +31,34 @@ Range {
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `end` | `Arc<UOp>` | Upper bound (exclusive), typically a `CONST` |
-| `axis_id` | `AxisId` | `Unrenumbered(n)` before kernel splitting, `Renumbered(n)` after |
+| `end` | `Arc<UOp>` | Upper bound (exclusive), typically a `CONST` or a symbolic expression |
+| `axis_id` | `AxisId` | `Unrenumbered(n)` (printed `U<n>`) before kernel splitting, `Renumbered(n)` (`R<n>`) after; the `UnrenumberedPath` / `RenumberedPath` forms (`U0_1`) identify a range derived structurally from a parent range |
 | `axis_type` | `AxisType` | Determines how the loop is scheduled (see below) |
 | `deps` | `SmallVec<[Arc<UOp>; 2]>` | Other ranges this range depends on |
 
-**AxisType Hierarchy:**
+**AxisType Hierarchy** (`AxisType::priority()`; `Ord` compares by it, lower values are outer loops):
 
-| Type | Priority | GPU Mapping | Purpose |
-|------|----------|-------------|---------|
-| `Placeholder` | -3 | — | Transient canonical range used during RESHAPE caching |
-| `Device` | -2 | — | Device-selection dimension, bound per device at launch |
-| `Weak` | -1 | `for` loop | Unparallelized range produced by rangeify |
-| `Loop` | -1 | `for` loop | Explicit regular loop; schedule-level wrappers paired with `END(Call)` |
-| `Global` | 0 | `blockIdx` | Grid parallelism |
-| `Thread` | 0 | thread pool | CPU parallelism |
-| `Warp` | 1 | warp/wavefront | Sub-group parallelism |
-| `Local` | 2 | `threadIdx` | Workgroup parallelism |
-| `GroupReduce` | 2 | shared memory | Two-stage reduction |
-| `Upcast` | 3 | SIMD | Vectorization |
-| `Reduce` | 4 | accumulator | Reduction dimension |
-| `Unroll` | 5 | unrolled | Loop unrolling |
+| Type | Priority | Letter | Lowered to | Purpose |
+|------|----------|--------|------------|---------|
+| `Placeholder` | -3 | `P` | — | Transient canonical range used during RESHAPE caching |
+| `Device` | -2 | `d` | per-device bind at launch | Device-selection dimension of a multi-device tensor |
+| `Weak` | -1 | `L` | serial `for` loop | Unparallelized range produced by rangeify; what the optimizer picks from |
+| `Loop` | -1 | `L` | serial `for` loop | Explicit regular loop; schedule-level wrappers paired with `END(CALL)` |
+| `Global` | 0 | `g` | `gidx` (`SPECIAL`) | GPU grid dimension |
+| `Thread` | 0 | `t` | `gidx` (`SPECIAL`) | CPU work-item dimension, dispatched over the thread pool |
+| `Warp` | 1 | `w` | leading local dimension | Hardware lane; `mma.sync` fragments address by it |
+| `Local` | 2 | `l` | `lidx` (`SPECIAL`) | GPU workgroup dimension |
+| `GroupReduce` | 2 | `G` | local dimension + shared-memory stage | Two-stage reduction |
+| `Upcast` | 3 | `u` | vector lanes (`STACK`) | Vectorization |
+| `Reduce` | 4 | `R` | accumulator loop | Reduction dimension |
+| `Unroll` | 5 | `r` | unrolled copies | Loop unrolling |
 
-Priority determines loop nesting order — lower values are outer loops.
-Kernel-boundary framing is structural via `Call`/`Function`, not a dedicated
-axis type.
+`is_parallel()` is `Global | Thread | Local | Warp`; `is_reduce()` is `Reduce | GroupReduce | Unroll`. `pm_add_gpudims` turns `Global`/`Thread` ranges into the global `SPECIAL`s and `Local`/`Warp`/`GroupReduce` ranges into the local ones; the CPU renderer has `has_threads` but no `has_local`, so it only ever sees `Thread`. Kernel-boundary framing is structural via `CALL`/`FUNCTION`, not a dedicated axis type. The letters are what kernel names such as `r_128_3_32_4…` are built from.
 
 **Example:**
 ```mermaid
 flowchart TD
-  R["RANGE(end=128, axis_id=R0, type=Global)"] --> C["CONST(128) : Index"]
+  R["RANGE(R0, Global) : Index"] --> C["CONST(128) : Index"]
 ```
 
 ### END — Loop Scope Closer
@@ -117,7 +117,7 @@ Reduce {
 }
 ```
 
-Used **after** rangeify. Accumulates values across RANGE iterations and closes the specified ranges.
+Used **after** rangeify. Accumulates values across RANGE iterations and closes the specified ranges. The tree prints it as `REDUCE(Add, num_axes=1, ranges=[30])` with the ids of the ranges it closes.
 
 **ReduceOp Variants:**
 
@@ -165,7 +165,17 @@ Buffer {
 }
 ```
 
-Declares a buffer for tensor storage. The `arg.slot` field ensures distinct buffers even with identical size/device. `arg.addrspace` picks the memory the buffer lives in: `Global` for device memory, `Local` for GPU shared memory (LDS), `Reg` for a register/scratch allocation.
+Declares a buffer for tensor storage. `ParamArg` is shared with `PARAM`:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `slot` | `usize` | Distinguishes buffers of identical size/device; the kernel argument position for a `PARAM` |
+| `dtype` | `DType` | Element type |
+| `addrspace` | `Option<AddrSpace>` | `Global` for device memory, `Local` for GPU shared memory (LDS), `Reg` for a register/scratch allocation; `None` for a scalar parameter |
+| `device` | `Option<DeviceSpec>` | Device the buffer lives on; `None` for `Local`/`Reg` |
+| `name`, `vmin_vmax`, `multiple_of` | `Option<_>` | Scalar-parameter metadata: name and value bounds (`UOp::scalar_param`) |
+| `axis` | `Option<usize>` | Shard axis of a multi-device buffer |
+| `volatile` | `bool` | Reads must not be hoisted or merged |
 
 ### STAGE — Materialization Marker
 
@@ -205,12 +215,12 @@ Index {
 }
 ```
 
-Computes memory address from multi-dimensional indices. Returns element dtype (not pointer). An index can be made conditional with `idx.valid(cond)`, which wraps it in `WHERE(cond, idx, INVALID)`. INDEX over a `STACK` selects a lane instead of an address: a constant scalar index folds directly to the stacked source.
+Computes memory address from multi-dimensional indices. Returns element dtype (not pointer). An index can be made conditional with `idx.valid(cond)`, which wraps it in `WHERE(cond, idx, INVALID)` — `INVALID` is the poison constant `CONST(Invalid)` of dtype `Bool`, printed as `INVALID` by the tree. INDEX over a `STACK` selects a lane instead of an address: a constant scalar index folds directly to the stacked source.
 
 **Example:**
 ```mermaid
 flowchart TD
-  IDX["INDEX : Float32"] --> P["PARAM(0)"]
+  IDX["INDEX : Float32"] --> P["PARAM(slot=0)"]
   IDX -->|"index for dim 0"| R0["RANGE(R0, Global)"]
   IDX -->|"index for dim 1"| R1["RANGE(R1, Loop)"]
   IDX -->|"index for dim 2"| M["MUL(...)"]
@@ -226,13 +236,13 @@ Load {
 }
 ```
 
-Read value from buffer at index; there is no separate `buffer` field, the buffer is reached through the INDEX node. For gated loads, `alt` provides the value when `gate` is false (avoiding the memory access entirely). `alt` and `gate` are always set together: a load carries both or neither. Renderers require a single-axis `INDEX`, so multi-index accesses must be flattened during rangeify before the load reaches code generation.
+Read value from buffer at index; there is no separate `buffer` field, the buffer is reached through the INDEX node. For gated loads, `alt` provides the value when `gate` is false (avoiding the memory access entirely). `alt` and `gate` are always set together: a load carries both or neither, the gate is `Bool`, and `alt` may be the `INVALID` marker. Renderers require a single-axis `INDEX`, so multi-index accesses must be flattened before the load reaches code generation.
 
 **Example:**
 ```mermaid
 flowchart TD
   L["LOAD : Float32"] --> IDX["INDEX"]
-  IDX --> P1["PARAM(1)"]
+  IDX --> P1["PARAM(slot=1)"]
   IDX --> R0["RANGE(R0)"]
   IDX --> R2["RANGE(R2)"]
 ```
@@ -247,7 +257,7 @@ Store {
 }
 ```
 
-Write value to buffer. The buffer is accessed through the INDEX node (via `index.src[0]`), not a separate field. `UPCAST` and `UNROLL` remain range axis classifications during expansion.
+Write value to buffer. The buffer is accessed through the INDEX node (via `index.src[0]`), not a separate field. `Upcast` and `Unroll` remain range axis types through expansion.
 
 For gated stores, `store_gated` sets `gate`; `pm_move_gates_from_index` is what lifts a gate off the address expression onto the LOAD/STORE.
 
@@ -270,7 +280,9 @@ Schedule-level work is expressed as a callable IR mirroring tinygrad's
 `CALL`/`FUNCTION`/`PROGRAM` model: a `Function` defines a body (typically a
 `Sink` of stores) parametrized by arguments, a `Call` invokes it with concrete
 arguments, and a `Program` carries the body through the strict
-`SINK → LINEAR → SOURCE → BINARY` compilation staging.
+`SINK → LINEAR → SOURCE → BINARY` compilation staging. There is no `KERNEL`
+op: a kernel is a `CALL` whose body is a `SINK[KERNEL]` (a SINK carrying
+`KernelInfo`).
 
 ### CALL — Invoke a Function Body
 
@@ -296,7 +308,7 @@ operations in `args` (range_start_index = 1; `body=0`, `args=1+`).
 | `precompile` / `precompile_backward` | `bool` | Eager-compile hints |
 
 The kernel CALL is where a dispatch keeps the attribution the profiler rollups read; see
-[Profiling and benchmarking kernels](../tile-kernels/profiling.md).
+[Kernel Origins](./kernel-origins.md).
 
 ### FUNCTION — Reusable Body
 
@@ -339,10 +351,12 @@ Program {
 Carries a kernel through the `SINK → LINEAR → SOURCE → PROGRAM_BINARY`
 staging enforced by `codegen/src/program_pipeline.rs`
 (`do_linearize`/`do_render`/`do_compile`/`get_program`). Each stage fills in
-the next field. The C/LLVM renderers expect `Op::Linear` input and
-surface `Error::InvalidGraph` via per-context `pending_error` rather than
-panicking; a multi-index `INDEX` reaching a renderer is rejected the same way,
-so indices must already be flattened to a single axis.
+the next field. `ProgramInfo` holds `name`, the symbolic `global_size` /
+`local_size`, the `vars` the kernel takes, the `globals` / `outs` / `ins`
+buffer slots and the `target` device. The C/LLVM renderers expect `Op::Linear`
+input and surface `Error::InvalidGraph` via per-context `pending_error` rather
+than panicking; a multi-index `INDEX` reaching a renderer is rejected the same
+way, so indices must already be flattened to a single axis.
 
 ### LINEAR — Linearized Op Stream
 
@@ -365,7 +379,7 @@ optional `identity` is the semantic proof that binds a stage to the exact
 preceding one (`SourceStageIdentity` carries the ABI, target, entry name and
 the LINEAR/SOURCE digests; `BinaryStageIdentity` wraps it with the compiler key
 and the binary digest), so a cached artifact cannot be reused across a changed
-graph.
+graph. The tree prints the binary as `BINARY(len=…, identity=…)`.
 
 ### SINK — Multiple Root Collector
 
@@ -378,8 +392,11 @@ Sink {
 
 Collects multiple outputs into a single root. A `Function`'s body is
 typically a `Sink` of stores. The `info` field is a hash-consed structural
-marker that distinguishes kernel-AST SINKs from otherwise-identical bare
-SINKs without relying on type-erased side-channel metadata.
+marker that distinguishes kernel-AST SINKs (printed `SINK[KERNEL]`) from
+otherwise-identical bare SINKs. `KernelInfo` carries `opts_to_apply`
+(`None`: the optimizer chooses; `Some([])`: hand-lowered, leave untouched;
+`Some(opts)`: apply exactly these), the `applied_opts`, `dont_use_locals` and
+the kernel `name`.
 
 **Example:**
 ```mermaid
@@ -404,9 +421,9 @@ Expresses execution dependencies between kernels without data dependency. The `p
 ```mermaid
 flowchart TD
   SINK["SINK"] --> AF["AFTER"]
-  AF -->|"passthrough (buffer reference)"| P0["PARAM(0)"]
-  AF -->|"must complete first"| K1["KERNEL(...)"]
-  SINK -->|"can use buffer after AFTER"| K2["KERNEL(...)"]
+  AF -->|"passthrough (buffer reference)"| P0["PARAM(slot=0)"]
+  AF -->|"must complete first"| K1["CALL(...)"]
+  SINK -->|"can use buffer after AFTER"| K2["CALL(...)"]
 ```
 
 ### BARRIER — Synchronization Fence
@@ -498,7 +515,7 @@ Hardware tensor core operation: `D = A × B + C`. Requires specific matrix shape
 | `dims` | `(N, M, K)` | Matrix dimensions (e.g., `(16, 16, 16)`) |
 | `dtype_in` | `DType` | Input matrix precision (e.g., `Float16`) |
 | `dtype_out` | `DType` | Output precision (e.g., `Float32`) |
-| `device` | `RendererDevice` | Renderer / TC backend that produced this WMMA |
+| `device` | `RendererDevice` | Renderer / TC backend that produced this WMMA (`CudaSm80`, `AmdRdna3`, `Metal`, …) |
 | `threads` | `usize` | Threads per warp (typically 32) |
 | `upcast_axes` | `Option<WmmaUpcastAxes>` | Per-source expansion axes (fields: `a`, `b`, `c`); cleared once `expander2` has shaped the sources and output |
 | `reduce_axes` | `Vec<AxisId>` | TC reduce axis IDs, used as `exclude_args` during expansion |
@@ -543,6 +560,16 @@ flowchart TD
 
 ## Definition Operations
 
+### CONST — Literal
+
+```rust
+Const(ConstValueHash)        // Int(i64), UInt(u64), Float(f64), Bool(bool), Invalid
+```
+
+A compile-time scalar. `Invalid` is the poison value every `valid()` gate falls
+back to; its dtype is always `Bool`. Constants, like buffers and params, never
+carry an origin.
+
 ### PARAM — Buffer Parameter
 
 ```rust
@@ -554,7 +581,7 @@ Created by pre-schedule normalization (BUFFER→PARAM) to erase buffer identity,
 enabling structural deduplication of identical computations on different buffers.
 `arg.slot` is the position in the kernel argument list, `shape` carries the
 element count. `ParamArg` also covers scalar parameters (`UOp::scalar_param`),
-which carry a name and value bounds instead of an address space.
+which carry an optional name and value bounds and no address space.
 
 ### Shared Memory and Registers
 
@@ -577,7 +604,7 @@ Runtime variable with known bounds. Used for dynamic shapes where bounds are kno
 
 **Example:**
 ```text
-DEFINE_VAR(name="batch_size", min=1, max=128) : Index
+DEFINE_VAR('batch_size', min=1, max=128) : Index
 ```
 
 ### BIND — Variable Binding
@@ -600,7 +627,7 @@ Binds a symbolic variable to a concrete value at runtime.
 ```rust
 Special {
     end: Arc<UOp>,           // upper bound for this dimension
-    name: String,            // e.g., "blockIdx.x", "threadIdx.y"
+    name: String,            // e.g., "gidx0", "lidx1"
 }
 ```
 
@@ -609,7 +636,7 @@ Accesses hardware-provided values (thread/block indices). Not a loop—the hardw
 **Example:**
 ```mermaid
 flowchart TD
-  SP["SPECIAL(name=blockIdx.x, end=128) : Index"] --> C["CONST(128)"]
+  SP["SPECIAL('gidx0') : Index"] --> C["CONST(128)"]
 ```
 
 ### UNIQUE / LUNIQUE — Identity Markers
@@ -647,7 +674,7 @@ High-level tensor shape transformations. These are converted to explicit INDEX o
 **Example:** RESHAPE
 ```mermaid
 flowchart TD
-  RS["RESHAPE(new_shape=[6, 4]) : Shape[6, 4]"] --> B["BUFFER[2, 3, 4] : Float32"]
+  RS["RESHAPE : Float32 shape=[6, 4]"] --> B["BUFFER(slot=0, addrspace=Global) shape=[2, 3, 4]"]
   RS --> C["CONST([6, 4]) : Shape"]
 ```
 
@@ -659,21 +686,21 @@ The following operations exist in the `Op` enum but are either internal or rarel
 
 | Operation | Purpose |
 |-----------|---------|
-| `Copy` | `{ src, device }` - explicit copy of a value to another device |
-| `Slice` | `{ buffer, offset, size }` - contiguous typed slice metadata over a buffer |
+| `Copy` | `{ src, device }` - explicit copy of a value to another device; closes every range of its source |
+| `Slice` | `{ buffer, offset, size }` - contiguous typed slice metadata over a buffer (offset in source elements); closes every range of its source |
 | `GetAddr` | `{ src, device }` - the `UInt64` address of a buffer-like source |
 | `MStack` | `{ buffers }` - the per-device buffers of a multi-device tensor |
 | `MSelect` | `{ buffer, device_index }` - one device's buffer out of a multi-device tensor |
 | `Multi` | `{ src, axis }` - shard marker: the axis a multi-device tensor is split along |
-| `Group` | Group operations for scheduling |
+| `Group` | `{ sources }` - groups operations for scheduling |
 | `Noop` | Placeholder with no operands and no effect |
 | `Detach` | Detach from graph (prevent optimization through) |
-| `Contiguous` | Hint that data is contiguous |
+| `Contiguous` | `{ src, opts: Vec<ContiguousHint> }` - force materialization into its own buffer, with optional optimizer hints; what `realize()` wraps its root in |
 | `ContiguousBackward` | Backward pass for contiguous hint |
 | `Precast` | Pre-cast for type conversion |
-| `Custom` / `CustomI` | Inline custom operation extensibility (C only for `Custom`) |
-| `CustomFunction` | Runtime custom-function hook (kinds: `EncDec`, `Graph`, `AllReduce`) |
-| `Ins` | `{ sources, arg }` - a target instruction selected by an ISA renderer |
+| `Custom` / `CustomI` | `{ deps, code }` - inline backend code (C or LLVM IR), rendered by both renderers |
+| `CustomFunction` | `{ kind, attrs }` - runtime custom-function hook; kinds: `EncDec`, `Graph`, `AllReduce { reduce_op }` |
+| `Ins` | `{ sources, arg: InsArg }` - a target instruction (`opcode` plus sorted attributes) selected by an ISA renderer |
 
 ---
 
@@ -683,21 +710,25 @@ The following operations exist in the `Op` enum but are either internal or rarel
 
 | Category | Operations |
 |----------|------------|
+| **Nullary** | `CONST`, `VCONST`, `UNIQUE`, `LUNIQUE`, `NOOP`, `DEFINE_VAR` |
 | **Loop Control** | `RANGE`, `END` |
 | **Reduction** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **Memory** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE`, `GETADDR` |
-| **Kernel & Callable** | `SINK`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
+| **Memory** | `BUFFER`, `SLICE`, `STAGE`, `INDEX`, `LOAD`, `STORE`, `GETADDR`, `COPY` |
+| **Multi-device** | `MSTACK`, `MSELECT`, `MULTI` |
+| **Kernel & Callable** | `SINK`, `GROUP`, `CALL`, `FUNCTION`, `TUPLE`, `GET_TUPLE`, `PROGRAM`, `LINEAR`, `SOURCE`, `PROGRAM_BINARY`, `AFTER`, `BARRIER` |
 | **Vector** | `STACK`, `INDEX`, `VCONST` |
 | **Expansion** | `RANGE` with `AxisType::Upcast` or `AxisType::Unroll` |
-| **Hardware** | `WMMA`, `SPECIAL` |
+| **Hardware** | `WMMA`, `SPECIAL`, `INS` |
 | **Control** | `IF`, `ENDIF` |
 | **Definition** | `PARAM`, `DEFINE_VAR`, `BIND`, `UNIQUE`, `LUNIQUE` |
 | **Movement** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
+| **Graph hints** | `CONTIGUOUS`, `CONTIGUOUS_BACKWARD`, `DETACH`, `PRECAST` |
+| **Extension** | `CUSTOM`, `CUSTOMI`, `CUSTOM_FUNCTION` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 
 ### Range-Ending Operations
 
-Operations that close RANGE scopes (remove ranges from active set):
+Operations that close RANGE scopes (`Op::range_ending_src_index`):
 
 | Operation | Range Start Index |
 |-----------|-------------------|
@@ -707,9 +738,11 @@ Operations that close RANGE scopes (remove ranges from active set):
 | `END` | 1 (computation=0, ranges=1+) |
 | `CALL` / `FUNCTION` | 1 (body=0, args=1+) |
 
+`Op::ended_ranges()` adds two indirect cases: `AFTER` ends whatever its `deps` end, and `COPY` / `SLICE` end every range in scope at their source.
+
 ### Expandable Operations
 
-Operations that propagate expanded lanes through the computation graph:
+Operations that propagate expanded lanes through the computation graph (`Op::is_expandable`):
 
 - ALU: `Unary`, `Binary`, `Ternary`
 - Type: `Cast`, `BitCast`

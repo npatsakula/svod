@@ -530,13 +530,10 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
     }
 
     // Partial unroll by 4
-    for splits in [4] {
-        if size % splits == 0 {
-            debug!(last_unrollable, size, splits, "apply_unroll: partial unroll");
-            if apply_opt(scheduler, &Opt::unroll(logical_idx, splits), true).is_ok() {
-                return true;
-            }
-        }
+    const SPLITS: usize = 4;
+    if size % SPLITS == 0 {
+        debug!(last_unrollable, size, splits = SPLITS, "apply_unroll: partial unroll");
+        return apply_opt(scheduler, &Opt::unroll(logical_idx, SPLITS), true).is_ok();
     }
 
     false
@@ -639,7 +636,7 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
 /// walk one row together. The gate is a memory-layout question, not a shape
 /// one: the axis must be addressed with stride 1 by some buffer (so the lanes
 /// of a wave are contiguous), and long enough after the split to keep a serial
-/// loop over whole waves ([`MIN_WARP_REDUCE`]). The output axes stay in the
+/// loop over whole waves (`MIN_WARP_REDUCE`). The output axes stay in the
 /// grid, so the block is exactly one wave and the two-stage reduction shares a
 /// single wave's worth of scratch.
 ///
@@ -1242,7 +1239,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
 ///
 /// In a kernel that is nothing but its memory traffic, `lidx0` — the
 /// fastest-moving thread index — goes to the axis every buffer keeps within one
-/// [`SECTOR_BYTES`] ([`lane_span_bytes`]), so the lanes of a wave cover one
+/// `SECTOR_BYTES` (`lane_span_bytes`), so the lanes of a wave cover one
 /// contiguous run of memory instead of landing one row apart. It only reorders:
 /// the sizes are the ones this heuristic always picked, and a kernel with no
 /// such axis — a transposing copy, strided on one side whichever axis leads —
@@ -1251,7 +1248,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
 /// in some buffer = broadcast, then higher axis indices), with sizes from
 /// [32, 16, 8, 4, 3, 2] for axis 0 and [16, 8, 4, 3, 2] for the others and a
 /// cumulative LOCAL size ≤ 128. An axis none of the sizes divides (Whisper's
-/// 51865 = 5·11·23·41 vocabulary) falls back to [`local_fallback`] instead of
+/// 51865 = 5·11·23·41 vocabulary) falls back to `local_fallback` instead of
 /// running one thread per block.
 pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     if !scheduler.renderer().has_local || config.disable_locals {
@@ -1560,7 +1557,7 @@ fn apply_tc_tiling(scheduler: &mut Scheduler, growth: &TcGrowth, axes: &[Arc<UOp
 ///
 /// - Guard: skip when >1 reduce axis under [`TcOpt::Strict`]
 /// - Apply TC opts via tc::apply, capturing returned axes `[N, M, K]`
-/// - Post-TC: tile across warps and blocks ([`apply_tc_tiling`])
+/// - Post-TC: tile across warps and blocks (`apply_tc_tiling`)
 pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     use crate::optimizer::config::TcUsage;
     use crate::optimizer::tc;
@@ -1572,9 +1569,10 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         return false;
     }
 
-    // Strict keeps tinygrad's TC_OPT=0 rule: one reduce axis only. The default
-    // Relaxed level lets `tc::apply` pick a divisible reduce axis and leave the
-    // rest as loops, which is what a conv's (channels, taps) reduce needs.
+    // Strict keeps tinygrad's TC_OPT=0 rule: one reduce axis only. Relaxed and
+    // above (the default is Padded) let `tc::apply` pick a divisible reduce
+    // axis and leave the rest as loops, which is what a conv's (channels, taps)
+    // reduce needs.
     let reduce_count = scheduler.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).len();
     if reduce_count != 1 && config.tc_opt == TcOpt::Strict {
         return false;

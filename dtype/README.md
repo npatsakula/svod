@@ -1,33 +1,35 @@
 # svod-dtype
 
-Type system for the svod compiler: scalar types, vectors, pointers, and images.
+The type system of the Svod ML compiler, and the lowest crate in its dependency
+graph. `DType` covers scalars (`Bool`, `Int8`–`Int64`, `UInt8`–`UInt64`, the FP8
+formats `FP8E4M3`/`FP8E5M2` and their `FNUZ` variants, `Float16`, `BFloat16`,
+`Float32`, `Float64`, `Index`, `Void`, and the weak literal types), vectors,
+pointers tagged with an address space (`Global`, `Local`, `Reg`) and image types,
+together with Tinygrad's promotion lattice (`DType::least_upper_dtype`) and
+safe-cast rules. It also defines `DeviceSpec`, the GPU arch enums (`AmdArch`,
+`CudaArch`, `MetalFamily`) and the process default device
+(`default_device::default_device`: `SVOD_DEVICE`, else `METAL:0` on macOS and
+`CPU` elsewhere).
 
 ## Example
 
 ```rust
-use svod_dtype::{DType, AddrSpace};
+use svod_dtype::{AddrSpace, DType};
 
-let f32_type = DType::float32();
-let vec4 = f32_type.vec(4);
-let ptr = f32_type.ptr(AddrSpace::Global);
+let vec4 = DType::Float32.vec(4).expect("a scalar vectorizes");
+let ptr = DType::Float32.ptr(None, AddrSpace::Global).expect("a scalar has a pointer type");
+assert_eq!(vec4.bytes(), 16);
+assert_eq!(ptr.base(), DType::Float32.base());
+
+// Mixed operands promote along the lattice.
+assert_eq!(DType::least_upper_dtype(&[DType::Int8, DType::Float16]), Some(DType::Float16));
 ```
 
 ## Features
 
-**Supported:**
+| Feature | Default | Effect |
+|---------|---------|--------|
+| `serde` | yes | `Serialize`/`Deserialize` for the public types |
+| `proptest` | no | `Arbitrary` derives and strategies for property tests |
 
-- Scalar types: Bool, Int8-64, UInt8-64, Float16/32/64, BFloat16, Index
-- Vector types with configurable width
-- Pointer types with address spaces (Global, Local, Register)
-- Image types for texture-based computation
-
-**Planned:**
-
-- FP8 variants (e4m3, e5m2)
-- Type promotion lattice
-
-## Testing
-
-```bash
-cargo test -p svod-dtype
-```
+Documentation: <https://svod.vpermilp.online/docs/architecture/ir-design>

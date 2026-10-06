@@ -170,8 +170,10 @@ impl ArchCaps {
     /// gfx12 (RDNA4) shares one strided 8/lane [`RT_16X16_GFX12`] across all four; CUDA
     /// sm_80+ resolves every role to the two-half [`RT_16X16_MMA`] (an accumulator
     /// IS the A-operand register order, and the transposed store is the `Col`
-    /// reading of the same map). `None` where tk has no fragment table (Metal,
-    /// pre-Ampere CUDA) — see the module docs.
+    /// reading of the same map); Apple7+ Metal resolves to the 8×8
+    /// [`RT_8X8_SIMD`], flipped to [`RT_8X8_SIMD_T`] for the A operand. `None` where tk has
+    /// no fragment table (pre-Ampere CUDA, pre-Apple7 Metal) — see the module
+    /// docs.
     pub fn frag(&self, role: FragRole) -> Option<RTBaseShape> {
         if !self.has_matrix_core_layouts() {
             return None;

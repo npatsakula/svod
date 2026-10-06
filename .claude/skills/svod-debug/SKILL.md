@@ -1,315 +1,161 @@
 ---
 name: svod-debug
-description: Debug Svod tensor pipeline issues by extracting IR at each stage, visualizing UOp trees, and comparing with Tinygrad. Use when tests fail, produce wrong results, or crash.
+description: Debug the Svod tensor → rangeify → kernel → codegen pipeline. Use when a test fails, a model gives wrong numbers, a kernel crashes or miscompiles, or you need the UOp tree at a specific pass, the generated LLVM IR / C / PTX, or the env vars and RUST_LOG targets that expose them. Covers SVOD_DUMP_STAGE, scripts/extract-ir.sh, SVOD_DUMP_*_IR, tracing in tests, ONNX node bisection.
 ---
 
-# Svod Pipeline Debugging
+# Svod pipeline debugging
 
-## Three-Step Analysis
+Pass-by-pass reference with real trees: `website/docs/architecture/codegen/{overview,worked-example}.md`. Backend-specific
+knobs: `website/docs/backends/{cuda,amd}/debugging.md`. Compare against Tinygrad with `/tinygrad-debug`.
 
-There are three places where errors can occur:
-  - Frontend: we can create incorrect IR.
-  - Transformation pipeline: we can incorrectly transform IR between stages.
-  - Codegen: we can incorrectly generate target IR.
-Most of the issues are in the transformation pipeline, and unfortunately it's the hardest
-to debug.
+## Quick start
 
-The first step during investigation is to isolate the place where the error occurs. This
-will allow you to simplify the investigation and reduce the context. You can do it by
-extracting IR from an operation (`tensor.uop().tree()`); by extracting IR before codegen;
-by extracting kernel code before execution.
+Tests written with `svod_tensor::codegen_tests!` expand to `<name>::{clang,llvm,amd,cuda,metal}`; GPU variants self-skip
+without a device. Filter on the full path to run one backend.
 
-Sometimes it's hard to understand if IR is correct, but we have two sources of information:
-  - Compare it with Tinygrad IR for the same code: use Python code; they should be identical.
-  - Read the @book/src/path-of-the-uop.md to understand if it's correct.
+| Question | Command |
+|----------|---------|
+| Which post-opt pass changes/bloats the kernel? | `SVOD_PER_STAGE_UOPS=1 cargo test -p svod-tensor --lib test_x::llvm -- --nocapture` |
+| Tree after one post-opt pass (prefix match on label) | `SVOD_DUMP_STAGE=14 cargo test ...` (`SVOD_DUMP_STAGE=` empty = every stage) |
+| Trees for rangeify, kernel cut, pre-opt and post-opt in one file | `./scripts/extract-ir.sh test_x::llvm -p svod-tensor -o /tmp/ir.txt` (needs `rg`, `jaq`; builds `--release`) |
+| LLVM IR as compiled (CPU) / after -O2 | `SVOD_DUMP_LLVM_IR=/tmp/ll` / `SVOD_DUMP_POST_O2_IR=/tmp/ll` → `<kernel>.ll` / `<kernel>.post.ll` |
+| AMD / NVPTX LLVM IR | `SVOD_DUMP_AMD_IR=/tmp/amd` / `SVOD_DUMP_NVPTX_IR=/tmp/ptx` (one `.ll` per kernel) |
+| Linearized instruction list | `SVOD_DUMP_LINEAR=/tmp/lin` → `tree_<id>.txt`, `linear_<id>.txt` from `do_linearize` |
+| Is the optimizer the culprit? | `SVOD_NOOPT=1` (no opts; pre/post passes still run), `SVOD_TC=0`, `BEAM=4` |
+| Is the backend the culprit? | run `::clang` vs `::llvm`; `SVOD_CPU_BACKEND=clang\|llvm`; `SVOD_LLVM_INPROCESS=0` (shell out instead of in-process LLVM); `SVOD_DEVICE=CPU\|CUDA:0\|AMD:0\|METAL:0` |
+| Spec verification | `SVOD_SPEC=0` skips it; `SVOD_SPEC_DEBUG=1` prints the rejected uop and its tree |
+| Stale cache suspicion | `SVOD_DISABLE_SCHEDULE_CACHE=1`, `SVOD_OBJECT_CACHE=0`, `IGNORE_BEAM_CACHE=1` |
+| Which tensor op produced a kernel | `SVOD_ORIGIN=1` (origin capture; `SVOD_ORIGIN_DEPTH` for the profiler) |
+| BEAM action survival / worker drops | `BEAM_DEBUG=1` |
+| Canonical JSON of a stage (parity tooling) | `SVOD_DUMP_CANONICAL_STAGE=<prefix>` |
 
-### Step 1: Extract all pipeline stages
-```bash
-# Uses JSON structured logging (rg + jaq required)
-./scripts/extract-ir.sh test_name -p svod-tensor -o /tmp/debug_ir.txt
+Isolate first: frontend (`tensor.uop().tree()` wrong), transformation (a pass turns a right tree into a wrong one — most
+bugs, hardest), or codegen (final tree right, IR/source wrong). Then compare the failing stage with Tinygrad.
 
-# Filter to specific module (e.g., only optimizer stages)
-./scripts/extract-ir.sh test_name -p svod-tensor -t optimizer
+## Pipeline map
+
+`tensor/src/realize.rs` chains: `rangeify_with_map` (`schedule/src/rangeify/transforms.rs`, once per SINK) →
+`try_get_kernel_graph` (`rangeify/kernel.rs`, STAGE → STORE/END/AFTER, one `CALL(SINK[KERNEL])` per kernel) → per kernel
+`apply_pre_optimization` → heuristics or BEAM → `apply_post_optimization_configured_with_capture` (`optimizer/mod.rs`) →
+`program_from_sink` → `do_linearize` → `do_render` → `do_compile` (`codegen/src/program_pipeline.rs`).
+
+Two numberings exist for post-opt stages: the `SVOD_DUMP_STAGE` label (also `[per-stage]` lines, follows Tinygrad's
+`codegen/__init__.py`) and the `tracing` message. Both listed; `tracing` trees arrive as JSON fields.
+
+| Phase (target) | Field | `SVOD_DUMP_STAGE` label | `tracing` message (debug level) |
+|-------|-------|-------|-------|
+| rangeify (`svod_schedule::rangeify::transforms`) | `uop.tree` | — | `add_tags complete`, `resolve_function complete`, `earliest rewrites complete`, `Stage 0: range assignment + apply rangeify complete`, `mega-pass complete` (count only), `Stage 7b: buffer limit enforcement complete` (conditional) |
+| kernel cut (`svod_schedule::rangeify::kernel`) | — (trace: `tree` after `pm_add_buffers`) | — | `kernel split: pm_add_buffers complete`, `... pm_flatten_range pre-pass complete`, `... split_all_stores complete`, `... fix_assign complete` |
+| pre-opt (`svod_schedule::optimizer`) | `ast.initial` (trace), `ast.pre` | — | `kernel initial`; `pre-opt: movement ops complete`, `load collapse`, `split ranges`, `symbolic + flatten`, `simplify ranges` |
+| post-opt (`svod_schedule::optimizer`) | `ast.optimized` | `00-initial` | (trace) `kernel initial` |
+| | | `08-post_opt_sym` | `Stage 8: after post-opt symbolic` |
+| | | `09-pre_expand` | `Stage 9: after pre_expand` |
+| | | `10-pm_reduce` | `after pm_reduce` |
+| | | `11-local_buffers` | `after add local buffers` |
+| | | `12-pm_add_gpudims` | `after pm_add_gpudims` |
+| | | `13-pm_add_loads` | `after pm_add_loads` |
+| | | `14-devectorize` | `after devectorize` |
+| | | `15-early_symbolic` | `after early symbolic` |
+| | | `16-memory_coalescing` | `after memory coalescing` |
+| | | `17-bottom_up_ew_image` | `after bottom-up elementwise/image pass` |
+| | | `16-extra_symbolic` | `after extra symbolic` |
+| | | `17-pm_lower_index_dtype` | `after pm_lower_index_dtype` |
+| | | `18-final_symbolic` | `after post-index symbolic` |
+| | | `19-cast_float_alu` | `after cast float ALU operands` |
+| | | `19b-early_decompositions` | `after early decompositions` |
+| | | `19c-dtype_decompositions` | `after dtype decompositions` |
+| | | `19d-late_decompositions` | `Stage 18: after late decompositions` |
+| | | `19e-move_gates_from_index` | `Stage 19: after move gates from index` |
+| | | `20-final_rewrite` | `Stage 20: after final rewrite` |
+| linearize / render (`svod_codegen::llvm::text`, `svod_codegen::c`) | `generated_code`, `generated_c` (trace) | — | `linearized node` (trace, per op), `llvm codegen: final generated code`, `c codegen: final generated code` |
+
+Labels `16` and `17` repeat, so `SVOD_DUMP_STAGE=16` prints two stages. Output format:
 ```
-
-### Step 2: Check LLVM IR
-```bash
-RUST_LOG=svod_codegen::llvm::text=debug cargo test test_name -- --nocapture 2>&1 | rg 'linearized node'
+[per-stage] 13-pm_add_loads : node_count=30
+[dump-stage] 20-final_rewrite :
+[282] SINK[KERNEL] : Scalar(Void)
+└── [281] END : Scalar(Void) shape=[]
+    ├── [279] STORE : Scalar(Void) shape=[]
+    │   ├── [278] INDEX : Scalar(Float32) shape=[]
+    │   │   ├── [229] PARAM(slot=0) : Scalar(Float32) shape=[Const(2)]
+    │   │   │   └── [227] CONST(Int(2)) : Scalar(Int32) shape=[]
+    │   │   └── [239] RANGE(R1, Weak) : Scalar(Int32) shape=[]
+    │   │       └── [227] → (see above)
+    │   └── [273] Add : Scalar(Float32) shape=[]
+    ...
+    └── [239] → (see above)
+[dump-stage] 20-final_rewrite : end
 ```
+`UOp::tree()` prints `[id] OP(args) : dtype shape=[..]` with `├── `/`│   `/`└── ` and `[id] → (see above)` for a node already
+printed (hash consing makes sharing visible); `tree_full()` re-expands shared nodes. Ids are allocation order and differ
+between runs. Index dtype is `WeakInt` until `17-pm_lower_index_dtype` commits it to `Int32`/`Int64`.
 
-### Step 3: Compare with Tinygrad
-Compare with Tinygrad's output using the `/tinygrad-debug` skill to isolate broken patterns.
+## Tracing
 
----
-
-## Pipeline Structure
-
-The pipeline has three phases. Rangeify runs once for the entire SINK.
-After kernel splitting, pre-opt and post-opt run once per kernel.
-
-1. **Rangeify** (`schedule/src/rangeify/transforms.rs`) — field: `uop.tree`
-2. **Per-kernel pre-optimization** (`schedule/src/optimizer/mod.rs: apply_pre_optimization`) — field: `ast.pre`
-3. **Per-kernel post-optimization** (`schedule/src/optimizer/mod.rs: apply_post_optimization_with_renderer`) — field: `ast.optimized`
-4. **Linearizer** — no tree tracing (linear instruction lists)
-
-## Stage-by-Stage Tree Extraction
-
-### Quick Reference Table
-
-| Phase | Field | Debug Message |
-|-------|-------|---------------|
-| **RANGEIFY** (`rangeify/transforms.rs`) | | |
-| | `uop.tree` | `early rewrites + replace contiguous complete` |
-| | `uop.tree` | `Stage 0: range assignment complete` |
-| | `uop.tree` | `split reduceops complete` |
-| | `uop.tree` | `Stage 1: rangeify + movement ops complete` |
-| | — | `mega-pass complete` *(node_count, no tree)* |
-| | `uop.tree` | `Stage 7b: buffer limit enforcement complete` *(conditional)* |
-| **PRE-OPT** (`optimizer/mod.rs: apply_pre_optimization`) | | |
-| | `ast.initial` | `kernel initial` |
-| | `ast.pre` | `pre-opt: movement ops complete` |
-| | `ast.pre` | `pre-opt: load collapse complete` |
-| | `ast.pre` | `pre-opt: split ranges complete` |
-| | `ast.pre` | `pre-opt: symbolic + flatten complete` |
-| | `ast.pre` | `pre-opt: simplify ranges complete` |
-| **POST-OPT** (`optimizer/mod.rs: apply_post_optimization_with_renderer`) | | |
-| | `ast.initial` | `kernel initial` *(trace level)* |
-| | `ast.optimized` | `Stage 8: after post-opt symbolic` |
-| | `ast.optimized` | `Stage 9: after pre_expand` |
-| | `ast.optimized` | `after pm_reduce` |
-| | `ast.optimized` | `after add local buffers` |
-| | `ast.optimized` | `after pm_add_gpudims` |
-| | `ast.optimized` | `after pm_add_loads` |
-| | `ast.optimized` | `after devectorize` |
-| | `ast.optimized` | `after early symbolic` |
-| | `ast.optimized` | `after memory coalescing` |
-| | `ast.optimized` | `after bottom-up elementwise/image pass` *(image renderers only)* |
-| | `ast.optimized` | `after extra symbolic` |
-| | `ast.optimized` | `after pm_lower_index_dtype` |
-| | `ast.optimized` | `after post-index symbolic` |
-| | `ast.optimized` | `after cast float ALU operands` |
-| | `ast.optimized` | `after early decompositions` |
-| | `ast.optimized` | `after dtype decompositions` |
-| | `ast.optimized` | `Stage 18: after late decompositions` |
-| | `ast.optimized` | `Stage 19: after move gates from index` |
-| | `ast.optimized` | `Stage 20: after final rewrite` |
-| **LINEARIZER** | — | *No tree tracing (linear instruction lists)* |
-
-### Extract All Stages at Once (Recommended)
-
-Use `scripts/extract-ir.sh` to extract all pipeline stage trees into a single readable file:
+`RUST_LOG` needs a subscriber. `codegen_tests!` installs one; a hand-written test calls
+`svod_schedule::testing::setup_test_tracing()` (feature `testing`, already enabled in the `svod-tensor` and `svod-onnx`
+dev-dependencies). It is a JSON-lines subscriber on the test writer, so add `-- --nocapture`.
 
 ```bash
-# Basic: extract IR for a specific test
-./scripts/extract-ir.sh test_sum_axis1_value -p svod-tensor
-
-# With custom output file
-./scripts/extract-ir.sh test_argmax_value_1d -p svod-tensor -o /tmp/argmax_ir.txt
-
-# ONNX model tests
-./scripts/extract-ir.sh light_densenet121 -p svod-onnx
-
-# Filter to specific pipeline phase
-./scripts/extract-ir.sh test_name -p svod-tensor -t optimizer
+RUST_LOG=svod_schedule::optimizer=debug cargo test -p svod-tensor --lib test_x::llvm -- --nocapture 2>&1 \
+  | rg '^\{' | jaq -r 'select(.fields["ast.optimized"]) | "--- \(.fields.message)\n\(.fields["ast.optimized"])"'
 ```
 
-**Prerequisites**: `rg` (ripgrep) and `jaq` must be installed. Tests use JSON
-tracing via `svod_schedule::testing::setup_test_tracing()`.
-
-The script extracts fields: `uop.tree`, `ast.pre`, `ast.optimized`, `ast.initial`, `generated_c`.
-
-**Pipeline structure** (why the output is organized this way):
-- `rangeify_with_map` runs **once** for the entire SINK before kernel splitting
-- `apply_pre_optimization` and `apply_post_optimization_with_renderer` run **once per kernel** after splitting
-- Linearizer produces linear instruction lists, not trees — no tree tracing
-
-### Method 1: In-Code Tree Extraction
-
-Add temporary debugging code directly in your test or tensor operation:
-
-```rust
-use svod_ir::prelude::*;
-
-// After each pipeline stage
-println!("--- After Stage N ---");
-println!("{}", uop.tree());  // Compact tree with back-references
-// println!("{}", uop.tree_full());  // Full tree expanding all nodes
-```
-
-### Method 2: Programmatic IR Extraction
-
-For debugging existing tests, use the tensor `prepare()` API:
-
-```rust
-let plan = tensor.prepare().expect("prepare should succeed");
-
-for kernel in plan.kernels() {
-    println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
-    println!("{}", kernel.code);  // LLVM IR or device code
-}
-```
-
-See `tensor/src/test/unit/matmul.rs:180` for a complete example.
-
-### Method 3: Manual Tracing with rg
-
-For quick single-stage checks without the full extraction script:
-
-```bash
-# Extract IR after Stage 0 (Rangeify)
-RUST_LOG=svod_schedule::rangeify::transforms=debug cargo test test_name -- --nocapture 2>&1 | rg 'range assignment complete'
-
-# Extract IR after a specific optimizer stage
-RUST_LOG=svod_schedule::optimizer=debug cargo test test_name -- --nocapture 2>&1 | rg 'Stage 18'
-```
-
-**Note**: Output is JSON. Use `scripts/extract-ir.sh` for readable, formatted output.
-
----
-
-## Enabling Traces in Tests
-
-### Why traces don't appear
-
-`RUST_LOG` sets a filter level but requires a tracing subscriber. Tests don't have one by default.
-
-### Enable tracing in a test
-
-Call the shared initializer from `svod-schedule` (requires `testing` feature):
-
-```rust
-#[test]
-fn test_my_failing_test() {
-    svod_schedule::testing::setup_test_tracing();
-    // ... test code
-}
-```
-
-This registers a JSON subscriber controlled by `RUST_LOG`.
-
-### Run with output visible
-```bash
-cargo test test_name -- --nocapture
-```
-
----
-
-## ONNX Model Debugging
-
-### Node-level tracing
-
-The ONNX importer has per-node tracing spans (`onnx_node` with `idx` and `op` fields):
-
-```bash
-# Non-intrusive: log node names and ops
-RUST_LOG=svod_onnx::importer=debug cargo test light_densenet121 -p svod-onnx -- --nocapture
-
-# Intrusive bisection: realize every node, dump first 5 values
-# WARNING: breaks fusion — use only for numerical debugging
-RUST_LOG=svod_onnx::importer=trace cargo test light_densenet121 -p svod-onnx -- --nocapture
-```
-
-At `trace` level, each node output is realized and its shape + first 5 f32 values are logged
-(`out_name`, `shape`, `first5` fields).
-
----
-
-## UOp Visualization
-
-### In code
-```rust
-use svod_ir::prelude::*;
-
-println!("{}", uop.tree());       // Compact tree with back-references
-println!("{}", uop.tree_full());  // Full tree expanding all nodes
-```
-
-### Example output
-```
-[42] STORE : Void
-├── [10] DEFINE_GLOBAL(0) : Ptr<Float32>
-├── [35] INDEX : Ptr<Float32>
-│   ├── [10] → (see above)
-│   └── [30] RANGE(0, Reduce) : Index
-└── [40] REDUCE(Add) : Float32
-    └── [35] → (see above)
-```
-
-## Programmatic LLVM IR Extraction
-
-### Using render() API
-```rust
-use svod_codegen::llvm::text::render;
-
-let rendered = render(&uop_graph, Some("my_kernel"))?;
-println!("{}", rendered.code);
-```
-
-### From tensor
-```rust
-let plan = tensor.prepare().expect("prepare should succeed");
-
-for kernel in plan.kernels() {
-    println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
-    println!("{}", kernel.code);
-}
-```
-
-## RUST_LOG Targets
+`scripts/extract-ir.sh <test> [-p crate] [-o file] [-t target-regex]` runs this for
+`rangeify::{transforms,indexing,kernel}` and `linearize` at `debug`, `optimizer` and `svod_codegen` at `trace`
+(`kernel initial` and the generated code are trace events), and writes per-stage sections with `[nodes=N] [ms]`
+headers, a `KERNEL n` section per kernel, and its generated source.
 
 | Target | Information |
 |--------|-------------|
-| `svod_onnx::importer=debug` | ONNX node processing (idx, op_type) |
-| `svod_onnx::importer=trace` | ONNX node values (intrusive realization) |
-| `svod_schedule::rangeify::transforms=debug` | Rangeify stages (`uop.tree` field) |
-| `svod_schedule::rangeify::indexing=debug` | Range assignment details |
-| `svod_schedule::rangeify::kernel=debug` | Kernel splitting |
-| `svod_schedule::optimizer=debug` | Pre-opt (`ast.pre`) + Post-opt (`ast.optimized`) stages |
-| `svod_schedule::linearize=debug` | Linearization passes |
-| `svod_codegen=debug` | LLVM rendering and codegen |
-| `svod_ir::pattern::simplified=trace` | Pattern matching details |
+| `svod_schedule::rangeify::transforms=debug` | rangeify stage trees (`uop.tree`) |
+| `svod_schedule::rangeify::indexing=debug` | range assignment decisions (`merge_consumer_ranges`, realize axes) |
+| `svod_schedule::rangeify::kernel=debug` / `=trace` | kernel split timings / tree after `pm_add_buffers`, `split_store` entries |
+| `svod_schedule::optimizer=debug` / `=trace` | `ast.pre`, `ast.optimized` / plus `ast.initial`, dtype emulation decisions |
+| `svod_codegen::llvm::text=trace`, `svod_codegen::c=trace` | per-op `linearized node`, final `generated_code` / `generated_c` |
+| `svod_tensor::realize=debug` | prepare/realize timings |
+| `svod_onnx::importer=debug` / `=trace` | per-node span (`onnx_node{idx, op}`) / realize every node and log `out_name`, `shape`, `first5` (breaks fusion; numerical bisection only) |
+| `svod_device=debug`, `svod_runtime=debug` | driver, JIT, graph capture/replay, compile logs |
+| `svod_ir::pattern::simplified=trace` | one `pattern matched` event per rewrite (matches only, not attempts) |
 
-The `scripts/extract-ir.sh` script sets all relevant targets automatically.
+## In code
 
-## Common Debug Scenarios
+```rust
+use svod_ir::prelude::*;
+println!("{}", tensor.uop().tree());                   // frontend graph (Tensor::uop reads the registry)
+let plan = tensor.prepare()?;                          // ExecutionPlan, nothing executed
+for k in plan.kernels() {                              // &CachedKernel
+    println!("{} on {}\n{}", k.entry_point, k.device, k.code);   // generated LLVM IR / C / PTX
+}
+for pk in plan.prepared_kernels() { println!("{}", pk.ast.tree()); }   // kernel AST per PreparedKernel (+ .kernel, .device)
 
-### Wrong numerical result
-
-1. Extract IR before/after optimization
-2. Check if UNROLL/UPCAST expansion is correct
-3. Compare vector widths with expected
-4. Check LLVM IR for correct horizontal reduce
-
-### ONNX model gives wrong output
-
-1. Run with `RUST_LOG=svod_onnx::importer=trace` to dump per-node values
-2. Compare values with ONNX runtime reference output
-3. Find the first diverging node, then investigate its op implementation
-
-### SIGSEGV / Memory error
-
-1. Check buffer sizes and indices
-2. Look for mismatched vector widths
-3. Check CAT expansion creating oversized vectors
-
-### Pattern not matching
-
-```bash
-RUST_LOG=svod_ir::pattern::simplified=trace cargo test test_name 2>&1 | rg 'pattern'
+// render a kernel SINK directly (CPU text renderer)
+let rendered = svod_codegen::llvm::text::render(&sink, Some("k"))?;    // RenderedKernel { code, name, buffer_args, .. }
 ```
+Other useful accessors: `uop.node_count()`, `uop.toposort()`, `uop.shape()? -> Option<&Shape>`, `uop.src_ops()`,
+`uop.vmin()/vmax()`, `uop.ranges()`, `uop.get_consumer_map()`.
 
-## Key Files
+## Scenario notes
+
+- Wrong numbers, CPU: diff `::clang` against `::llvm`; then `SVOD_NOOPT=1`; then bisect post-opt with `SVOD_DUMP_STAGE=` and look at `14-devectorize` (lane layout, `STACK`/`INDEX(STACK, c)`), `19e` (gates moved onto `LOAD`/`STORE`), `20`.
+- Wrong numbers, ONNX model: `RUST_LOG=svod_onnx::importer=trace`, compare `first5` per node with onnxruntime, fix the first diverging op.
+- Crash / SIGSEGV: `SVOD_DUMP_LLVM_IR` + inspect the index arithmetic at `17-pm_lower_index_dtype` (i32 overflow) and `PARAM` sizes vs buffer sizes; try `SVOD_LLVM_INPROCESS=0`.
+- Spec failure at a boundary: `SVOD_SPEC_DEBUG=1`, read `schedule/src/spec.rs` for the rule that rejected.
+- Slow compile or BEAM stall: `SVOD_PER_STAGE_UOPS=1` for node blow-up per pass; `BEAM_DEBUG=1`, `BEAM_TIMEOUT_SEC`, `PARALLEL`.
+
+## Key files
 
 | File | Purpose |
-|------|----------|
-| `scripts/extract-ir.sh` | Pipeline IR extraction (JSON + rg + jaq) |
-| `schedule/src/testing.rs` | Shared test tracing setup (`testing` feature) |
-| `ir/src/uop/tree.rs` | UOp tree visualization, format_node() |
-| `ir/src/op.rs` | Op enum with AsRefStr derive |
-| `schedule/src/rangeify/transforms.rs` | Rangeify pipeline (`uop.tree` tracing) |
-| `schedule/src/optimizer/mod.rs` | Pre-opt (`ast.pre`) + Post-opt (`ast.optimized`) tracing |
-| `schedule/src/expand.rs` | UNROLL/UPCAST expansion |
-| `schedule/src/optimizer/heuristics.rs` | Optimization decisions |
-| `codegen/src/llvm/text/mod.rs` | LLVM IR generation (render() function) |
-| `codegen/src/llvm/cpu/ops.rs` | CPU operation rendering |
-| `codegen/src/types.rs` | RenderedKernel struct |
+|------|---------|
+| `tensor/src/realize.rs` | pipeline driver, schedule cache, BEAM dispatch |
+| `schedule/src/rangeify/{transforms,indexing,kernel,patterns}.rs` | rangeify, range assignment, kernel cut |
+| `schedule/src/optimizer/mod.rs` | pre-opt, post-opt stages, `SVOD_DUMP_STAGE`/`SVOD_PER_STAGE_UOPS` |
+| `schedule/src/optimizer/{heuristics,beam,config}.rs` | opt selection and env knobs |
+| `schedule/src/{expand,devectorize,gpudims}.rs`, `schedule/src/late/` | expander, devectorizer, gates, coalescing |
+| `schedule/src/spec.rs` | type verification (`SVOD_SPEC`) |
+| `codegen/src/program_pipeline.rs` | `program_from_sink`, `do_linearize` (`SVOD_DUMP_LINEAR`), `do_render`, `do_compile` |
+| `codegen/src/llvm/text/mod.rs`, `codegen/src/c/mod.rs` | renderers (`render()`), `generated_code` trace |
+| `runtime/src/llvm.rs`, `runtime/src/{amd,cuda}/compile.rs` | `SVOD_DUMP_LLVM_IR`, `SVOD_DUMP_POST_O2_IR`, `SVOD_DUMP_AMD_IR`, `SVOD_DUMP_NVPTX_IR` |
+| `ir/src/uop/tree.rs`, `ir/src/uop/canonical.rs` | tree rendering, canonical JSON dump |
+| `schedule/src/testing.rs`, `tensor/src/config.rs` | `setup_test_tracing`, `codegen_tests!` |
+| `scripts/extract-ir.sh` | JSON trace → readable per-stage file |

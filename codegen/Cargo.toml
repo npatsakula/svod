@@ -9,18 +9,13 @@ description = "Backend code generation for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.0-alpha.7" }
-svod-ir = { path = "../ir", version = "=0.1.0-alpha.7" }
-svod-device = { path = "../device", version = "=0.1.0-alpha.7" }
-svod-schedule = { path = "../schedule", version = "=0.1.0-alpha.7" }
+svod-dtype = { path = "../dtype", version = "=0.1.0" }
+svod-ir = { path = "../ir", version = "=0.1.0" }
+svod-device = { path = "../device", version = "=0.1.0" }
+svod-schedule = { path = "../schedule", version = "=0.1.0" }
 snafu = "0.9"
 tracing = "0.1"
 smallvec.workspace = true
-
-[features]
-default = []
-# Enable trace-level spans in hot paths (compile-time control)
-tracing-verbose = []
 
 [dev-dependencies]
 test-case = "3.3.1"
