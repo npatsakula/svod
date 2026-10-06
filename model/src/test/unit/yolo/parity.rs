@@ -6,13 +6,16 @@
 //! ```text
 //! # fetch the weights, generate the golden once, then run
 //! python scripts/convert_yolo.py
-//! cargo test -p svod-model --lib yolo::parity -- --ignored
+//! SVOD_DEVICE=CUDA:0 cargo test --release -p svod-model --lib yolo::parity -- --ignored
 //! ```
 
 use std::path::PathBuf;
 
+use svod_dtype::DType;
 use svod_tensor::Tensor;
+use test_case::test_case;
 
+use super::tk_gate::{tk_convs, tk_device};
 use crate::state::StateDict;
 use crate::state::load_safetensors;
 use crate::yolo::{Yolo26Detect, YoloConfig, YoloScale};
@@ -32,6 +35,16 @@ const BOX_TOL_PX: f32 = 0.05;
 /// 1000x tighter than the score the reference run reports (0.966). A wrong
 /// batch-norm epsilon moves a score by ~0.2, three orders of magnitude past it.
 const SCORE_TOL: f32 = 1e-3;
+
+/// Ultralytics' default detection threshold: a box is read only where the best
+/// class score clears it, so that is where an f16 box has to be right. An anchor
+/// scoring 5e-7 can drift by tens of pixels at f16 and no detection sees it.
+const CONFIDENT: f32 = 0.25;
+
+/// The f16 score band: twice what the x scale measures against the f32 golden
+/// (8.7e-4), and still two hundred times under what a wrong batch-norm epsilon
+/// moves a score by.
+const F16_SCORE_TOL: f32 = 2e-3;
 
 /// Resolve a fixture from the local directories, falling back to the Hub.
 ///
@@ -62,21 +75,45 @@ fn load_golden_vec<T: Clone + Default + svod_dtype::ext::HasDType>(sd: &StateDic
     t.as_vec::<T>().unwrap()
 }
 
-/// Decoded box coordinates live in pixel space, up to the image side; scores
-/// are sigmoid outputs in [0, 1]. One absolute tolerance cannot serve both, so
-/// split the deviation by channel: `4 + nc` channels of `anchors` each, boxes
-/// first.
-fn deltas_by_channel(got: &[f32], want: &[f32], channels: usize, anchors: usize) -> (f32, f32) {
-    got.iter().zip(want).enumerate().fold((0.0f32, 0.0f32), |(boxes, scores), (i, (a, b))| {
+/// Decoded box coordinates live in pixel space, up to the image side; scores are
+/// sigmoid outputs in [0, 1], so one absolute tolerance cannot serve both. Over
+/// `[B, 4 + nc, A]` predictions this is the largest box deviation among anchors
+/// whose golden best class score exceeds `floor`, the largest score deviation
+/// over every anchor, and how many anchors' boxes were compared. A deviation a
+/// NaN is part of counts as infinite.
+fn deltas(got: &[f32], want: &[f32], channels: usize, anchors: usize, floor: f32) -> (f32, f32, usize) {
+    let delta = |a: f32, b: f32| {
         let d = (a - b).abs();
-        if (i / anchors) % channels < 4 { (boxes.max(d), scores) } else { (boxes, scores.max(d)) }
-    })
+        if d.is_nan() { f32::INFINITY } else { d }
+    };
+    let at =
+        |v: &[f32], image: usize, channel: usize, anchor: usize| v[(image * channels + channel) * anchors + anchor];
+    let (mut boxes, mut scores, mut compared) = (0f32, 0f32, 0usize);
+    for image in 0..want.len() / (channels * anchors) {
+        for anchor in 0..anchors {
+            let best = (4..channels).map(|c| at(want, image, c, anchor)).fold(f32::NEG_INFINITY, f32::max);
+            for c in 4..channels {
+                scores = scores.max(delta(at(got, image, c, anchor), at(want, image, c, anchor)));
+            }
+            if best > floor {
+                compared += 1;
+                for c in 0..4 {
+                    boxes = boxes.max(delta(at(got, image, c, anchor), at(want, image, c, anchor)));
+                }
+            }
+        }
+    }
+    (boxes, scores, compared)
 }
 
-#[test]
+/// The f32 model against the golden over every anchor, and the f16 one over the
+/// anchors a detection reads, with the tk convolution checked to have run where
+/// the device has it.
+#[test_case(DType::Float32, f32::NEG_INFINITY, SCORE_TOL; "f32, every anchor")]
+#[test_case(DType::Float16, CONFIDENT, F16_SCORE_TOL; "f16, confident anchors")]
 #[ignore = "heavy: 236 MB YOLO26x weights + PyTorch golden (see scripts/convert_yolo.py)"]
-fn detect_output_matches_pytorch() {
-    let cfg = YoloConfig::new(YoloScale::XLarge, 80);
+fn detect_output_matches_pytorch(dtype: DType, floor: f32, score_tol: f32) {
+    let cfg = YoloConfig::new(YoloScale::XLarge, 80).with_compute_dtype(dtype.clone());
     let weights = resolve_file("model.safetensors", true);
     let golden_path = resolve_file("golden.safetensors", false);
 
@@ -89,16 +126,19 @@ fn detect_output_matches_pytorch() {
         .unwrap();
 
     let out = model.forward(&images).expect("forward");
-    out.realize().unwrap();
-
-    let got = out.as_vec::<f32>().unwrap();
+    if dtype != DType::Float32 && tk_device(&images.device()) {
+        assert!(tk_convs(&out) > 0, "the tk convolution runs on this device");
+    }
+    let got = out.cast(DType::Float32).to_vec::<f32>().unwrap();
     let want = load_golden_vec::<f32>(&golden, "output");
     assert_eq!(got.len(), want.len(), "output length mismatch");
 
     let dims = out.dims().unwrap();
     let (channels, anchors) = (dims[1], dims[2]);
-    let (box_delta, score_delta) = deltas_by_channel(&got, &want, channels, anchors);
+    let (box_delta, score_delta, compared) = deltas(&got, &want, channels, anchors, floor);
+    println!("{dtype:?}: box {box_delta:.4} px over {compared} anchors, score {score_delta:.2e}");
 
+    assert!(compared > 0, "no anchor clears {floor}");
     assert!(box_delta < BOX_TOL_PX, "max box |delta| = {box_delta:.6} px exceeds {BOX_TOL_PX}");
-    assert!(score_delta < SCORE_TOL, "max score |delta| = {score_delta:.6} exceeds {SCORE_TOL:e}");
+    assert!(score_delta < score_tol, "max score |delta| = {score_delta:.6} exceeds {score_tol:e}");
 }

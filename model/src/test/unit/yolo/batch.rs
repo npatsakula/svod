@@ -143,7 +143,11 @@ fn input(batch: &[usize]) -> Tensor {
 
 /// Forward `batch` and split the `[B, 4+nc, A]` predictions into per-image slices.
 fn predictions(model: &Yolo26Detect, batch: &[usize]) -> Vec<Vec<f32>> {
-    let out = model.forward(&input(batch)).expect("forward");
+    let images = input(batch);
+    let out = model.forward(&images).expect("forward");
+    if model.config.compute_dtype != DType::Float32 && super::tk_gate::tk_device(&images.device()) {
+        assert!(super::tk_gate::tk_convs(&out) > 0, "the tk convolution runs on this device");
+    }
     let dims = out.dims().expect("concrete prediction dims");
     assert_eq!(dims[0], batch.len(), "predictions lost the batch axis: {dims:?}");
     let flat = out.to_vec::<f32>().expect("realize predictions");

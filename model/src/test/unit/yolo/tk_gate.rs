@@ -1,11 +1,28 @@
 //! Where the tk convolution is asked for, per scale: the gate's reach as a test
 //! rather than a census script, and the residual that rides its epilogue.
 
-use svod_dtype::DType;
+use svod_dtype::{DType, DeviceSpec};
+use svod_ir::{Op, ops};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::yolo::{C3k2, C3k2Inner, Yolo26Detect, YoloBottleneck, YoloConfig, YoloScale};
+
+/// Whether `device` runs the tk convolution at all: an arch the kernel supports,
+/// with its LLVM backend present. A shape can still be declined on it.
+pub(super) fn tk_device(device: &DeviceSpec) -> bool {
+    svod_tk::target::check_target(device, svod_tk::CONV_SUPPORTED_ARCHS).is_ok()
+}
+
+/// The tk convolutions in `t`'s graph, counted before it is realized.
+pub(super) fn tk_convs(t: &Tensor) -> usize {
+    let is_tk = |info: &svod_ir::CallInfo| info.name.as_deref().is_some_and(|name| name.starts_with("conv2d_nhwc"));
+    t.uop()
+        .toposort()
+        .iter()
+        .filter(|node| matches!(node.op(), Op::Call(ops::Call { info, .. }) if is_tk(info)))
+        .count()
+}
 
 /// Whether every 3x3 body of the block's first inner unit runs the kernel.
 fn bodies_on_tk(block: &C3k2) -> bool {
