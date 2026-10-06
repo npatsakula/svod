@@ -79,6 +79,11 @@ pub(crate) fn rel_err(got: &[f32], want: &[f32]) -> f32 {
     max_abs_err(got, want) / scale
 }
 
+/// The positions of `values` that are not finite.
+pub(crate) fn non_finite(values: &[f32]) -> Vec<usize> {
+    values.iter().enumerate().filter_map(|(at, value)| (!value.is_finite()).then_some(at)).collect()
+}
+
 /// The instructions a tk kernel compiles to on `arch`, in program order: the
 /// optimizer and the target-graph lowering `launch_custom` runs, with no device.
 pub(crate) fn lowered_program(

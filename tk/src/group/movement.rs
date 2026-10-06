@@ -153,19 +153,19 @@ impl<'k> Group<'k> {
             let (row_off, valid) = rows(&strip_row);
             let off = iadd(&row_off, &strip_col);
             let safe = UOp::try_where(valid.clone(), off, cidx(0)).expect("gathered row: safe offset");
-            let run = load_off_vec(src.uop(), &safe, ept);
-            // The fill is a multiply by the gate, not a select: a `WHERE` over a
-            // load is rewritten into a gated load, whose gate the index
-            // simplifier may then discharge against the clamped offset.
-            // Through f32: the backends select a bool -> f32 conversion, not a
-            // bool -> bf16 one.
-            let mask = valid.cast(svod_dtype::DType::Float32).cast(st.elem().clone());
+            // An invalid row reads element 0, whatever it holds, and lands as
+            // zeros by one select over the whole run: a multiply by the gate
+            // turns an Inf there into NaN, and a select per extracted lane is a
+            // WHERE over an INDEX, which `pm_move_where_on_load` folds into a
+            // gated read.
+            let zero = UOp::const_(src.elem().clone(), ConstValue::zero(src.elem().base()));
+            let run =
+                UOp::try_where(valid, load_off_vec(src.uop(), &safe, ept), zero).expect("gathered row: zero fill");
             for e in 0..ept {
                 let mut v = vec_elem(&run, e, ept);
                 if src.elem() != st.elem() {
                     v = v.cast(st.elem().clone());
                 }
-                let v = v.try_mul(&mask).expect("gathered row: zero fill");
                 stores.push(flat_index(&stage, &stage_shape, &[Idx::Const(pass), Idx::Const(e as i64)]).store(v));
             }
         }
@@ -449,9 +449,9 @@ impl<'k> Group<'k> {
     /// `src` — the asynchronous counterpart of
     /// [`Self::stage_global_rows_to_reg`], with the same `rows` contract. A row
     /// the gate rejects copies **zero bytes**: its 16-byte chunk zero-fills in
-    /// the copy engine, so the padded taps cost neither a read nor the mask
-    /// multiply the staged path pays, and the strip never lands in a register on
-    /// its way to LDS.
+    /// the copy engine, so the padded taps cost neither a read nor the select
+    /// the staged path pays, and the strip never lands in a register on its way
+    /// to LDS.
     ///
     /// # Panics
     /// Panics unless [`Self::cp_async_fill_applies`]. Each row offset `rows`

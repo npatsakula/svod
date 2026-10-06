@@ -7,7 +7,7 @@ use svod_ir::UOp;
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use super::{device_supported, rel_err};
+use super::{device_supported, non_finite, rel_err};
 use crate::kernels::conv::{
     CONV_SUPPORTED_ARCHS, ConvGeom, ConvPlan, build_conv, conv_candidates, conv_tile_seeds, conv2d_nhwc,
     conv2d_nhwc_worth_asking, declines, select_conv_cfg,
@@ -111,6 +111,92 @@ fn the_kernel_builds(arch: GpuArch, g: ConvGeom, residual: bool) {
     build_conv(&ker, g, cfg, dt, Epilogue::BiasAct { bias: (), residual: residual.then_some(()), act: true });
     let sink = ker.finish(cfg.acc_m);
     assert!(crate::kernel_fingerprint(&sink).digest != 0);
+}
+
+/// An 80x80 3x3 padded conv over a 32x64 tile on 2x2 waves with a 16-deep
+/// strip: its A strip (512 elements) does not fill a lane's 8-wide run on each of
+/// the 128 lanes, so even sm86 takes the register-staged fill, as AMD always does.
+const PADDED: ConvGeom = ConvGeom { batch: 1, h: 80, w: 80, cin: 64, cout: 128, kh: 3, kw: 3, stride: 1, pad: 1 };
+const STAGED: GemmCfg = GemmCfg {
+    block_m: 32,
+    block_n: 64,
+    warps_m: 2,
+    warps_n: 2,
+    acc_m: 1,
+    k_step: 16,
+    stages: 2,
+    b_order: crate::kernels::gemm::BOrder::Nk,
+    l2_swizzle: false,
+    vec_load: false,
+    split_k: 1,
+};
+
+/// A padded tap is zeroed by one select over its run, never by a multiply with
+/// the gate (an Inf or NaN at the clamped address times zero is NaN) and never by
+/// a gated load (a branch in the staged loop on AMD).
+#[test_case(SM86; "sm86")]
+#[test_case(RDNA4; "rdna4")]
+fn the_staged_fill_selects_a_padded_tap_to_zero(arch: GpuArch) {
+    use std::sync::Arc;
+
+    use svod_ir::{BinaryOp, Op, TernaryOp, ops};
+
+    let caps = crate::ArchCaps::for_arch(arch);
+    let (m, k, n) = PADDED.mkn();
+    let dt = DType::Float16;
+    let x_size = PADDED.batch * PADDED.h * PADDED.w * PADDED.cin;
+    let bufs =
+        [m * n, x_size, n * k, n].into_iter().map(|s| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, s, dt.clone()));
+    let ker = crate::Kernel::new(
+        "conv2d_nhwc",
+        PADDED.grid_dims(&STAGED),
+        STAGED.threads(caps.wave_size),
+        bufs.collect(),
+        caps,
+    );
+    build_conv(&ker, PADDED, STAGED, dt, Epilogue::BiasAct { bias: (), residual: None, act: true });
+    let program = super::lowered_program(ker.finish(STAGED.acc_m), arch);
+
+    let reads_x = |load: &Arc<UOp>| {
+        let Op::Load(ops::Load { index, .. }) = load.op() else { return false };
+        let mut at = index.clone();
+        loop {
+            at = match at.op() {
+                Op::Index(ops::Index { buffer, .. }) => buffer.clone(),
+                Op::Shrink(ops::Shrink { src, .. }) | Op::Cast(ops::Cast { src, .. }) => src.clone(),
+                Op::After(ops::After { passthrough, .. }) => passthrough.clone(),
+                _ => return matches!(at.op(), Op::Param(..)) && at.buffer_size() == Some(x_size),
+            };
+        }
+    };
+    // A value read out of an x load: the load, a lane of it, or a cast of either.
+    let from_x = |value: &Arc<UOp>| {
+        let mut at = value.clone();
+        loop {
+            if reads_x(&at) {
+                return true;
+            }
+            at = match at.op() {
+                Op::Cast(ops::Cast { src, .. }) => src.clone(),
+                Op::Index(ops::Index { buffer, .. }) if buffer.addrspace().is_none() => buffer.clone(),
+                _ => return false,
+            };
+        }
+    };
+    let is_zero = |value: &Arc<UOp>| matches!(value.op(), Op::Const(c) if c.0.is_zero());
+
+    let x_loads: Vec<&Arc<UOp>> = program.iter().filter(|op| reads_x(op)).collect();
+    assert!(!x_loads.is_empty(), "the kernel reads x");
+    assert!(
+        x_loads.iter().all(|load| matches!(load.op(), Op::Load(ops::Load { gate: None, .. }))),
+        "an x read is never a gated load"
+    );
+    let multiplied =
+        program.iter().any(|op| matches!(op.op(), Op::Binary(BinaryOp::Mul, a, b) if from_x(a) || from_x(b)));
+    assert!(!multiplied, "no padded tap is zeroed by a multiply");
+    let selected =
+        program.iter().any(|op| matches!(op.op(), Op::Ternary(TernaryOp::Where, _, t, f) if from_x(t) && is_zero(f)));
+    assert!(selected, "a padded tap is zeroed by a select");
 }
 
 // ── Hardware-gated numerics ─────────────────────────────────────────────────
@@ -311,6 +397,54 @@ fn every_plan_matches_the_graph_gpu(g: ConvGeom, residual: bool) {
         println!("conv2d_nhwc {plan:?}: relative error {err:e}");
         assert!(err < 4e-3, "{plan:?}: relative error {err} exceeds 4e-3");
     }
+}
+
+/// An Inf in the activation reaches exactly the outputs whose window covers it,
+/// on the staged fill too: a padded tap reads the clamped address (where the Inf
+/// sits) and must still land as zero, not as `Inf * 0 = NaN`.
+#[test]
+#[ignore]
+fn an_inf_in_the_activation_stays_where_the_graph_puts_it_gpu() {
+    if !device_supported(CONV_SUPPORTED_ARCHS) {
+        eprintln!("skip an_inf_in_the_activation_stays_where_the_graph_puts_it_gpu: no supported device / toolchain");
+        return;
+    }
+    let g = PADDED;
+    let spec = Tensor::empty(&[1], DType::Float32).device();
+    let arch = crate::target::resolve_supported_arch(&spec, CONV_SUPPORTED_ARCHS).expect("a supported arch");
+    let caps = crate::ArchCaps::for_arch(arch);
+    let dt = DType::Float16;
+    let mut data: Vec<f32> = (0..g.batch * g.h * g.w * g.cin).map(|i| ((i as f32 + 1.0) * 0.31).sin() * 0.5).collect();
+    data[0] = f32::INFINITY;
+    let x =
+        Tensor::from_slice(data).try_reshape([1, g.h as isize, g.w as isize, g.cin as isize]).unwrap().cast(dt.clone());
+    let x = x.contiguous();
+    x.realize().expect("realize x");
+    let w = operand(&[g.cout, g.kh, g.kw, g.cin], dt.clone(), 0.17);
+    let bias = operand(&[g.cout], dt.clone(), 0.53);
+    let want = to_f32_vec(&reference(&g, &x, &w, &bias, None));
+    let corners: Vec<usize> = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        .into_iter()
+        .flat_map(|(y, x)| (0..g.cout).map(move |c| (y * g.wo() + x) * g.cout + c))
+        .collect();
+    let mut reached = non_finite(&want);
+    reached.sort_unstable();
+    let mut expected = corners;
+    expected.sort_unstable();
+    assert_eq!(reached, expected, "the graph puts the Inf in the four windows that cover it");
+
+    let (m, n) = (g.mkn().0, g.mkn().2);
+    let mut y = Tensor::empty(&[m, n], dt.clone()).to(spec.clone());
+    let (grid, block) = (g.grid_dims(&STAGED), STAGED.threads(caps.wave_size));
+    crate::launch::run_kernel("conv2d_nhwc_inf", grid, block, &mut [&mut y], &[&x, &w, &bias], move |ker| {
+        build_conv(ker, g, STAGED, dt, Epilogue::BiasAct { bias: (), residual: None, act: true });
+        ker.finish(STAGED.acc_m)
+    })
+    .expect("run the staged tile");
+    let got = to_f32_vec(&y);
+    assert_eq!(non_finite(&got), non_finite(&want), "the kernel's non-finite outputs are the graph's");
+    let err = rel_err(&got, &want);
+    assert!(err < 4e-3, "relative error {err} exceeds 4e-3");
 }
 
 /// Every tile the lattice walk can reach for `g` computes what the graph does.
