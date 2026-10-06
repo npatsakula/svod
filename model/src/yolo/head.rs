@@ -100,8 +100,7 @@ impl BoxBranch {
             // The one branch conv the tk kernel can serve: `conv1` holds an f32
             // accumulator the kernel has no way to keep, and the logits conv is
             // a 1x1. Its input is a neck feature at most 512 channels wide, so
-            // the permute into `[B, H, W, C]` is small beside the win — on
-            // gfx1201 `512→64 k3 @20²` is 20.8 µs against the graph's 85.4.
+            // the permute into `[B, H, W, C]` is small beside the win.
             conv0: YoloConv::empty(in_ch, hidden, 3, 1, true).tk(),
             conv1: YoloConv::empty(hidden, hidden, 3, 1, true).with_acc_dtype(HEAD_DTYPE),
             conv2: conv2d_bias(hidden, 4 * reg_max, 1, 1).with_acc_dtype(HEAD_DTYPE),

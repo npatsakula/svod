@@ -123,10 +123,9 @@ const REGISTERS_PER_LANE_FLOOR: usize = 128;
 /// This is the one number here that measurement fixes rather than the device
 /// reports: a decode is a handful of integer divisions and a bounds test, and
 /// what it is worth depends on how much integer throughput the part has spare.
-/// Calibrated on an RTX 3060 against the nine convolutions YOLO26-x tunes,
-/// where a 64-deep strip beats a 32-deep one by 33-65%. The ranking only has to
-/// put the winner among the few candidates the tuner then measures, so it is a
-/// weight, not a threshold, and it does not have to be exact.
+/// The ranking only has to put the winner among the few candidates the tuner
+/// then measures, so it is a weight, not a threshold, and it does not have to
+/// be exact.
 const DECODE_WEIGHT: f64 = 64.0;
 
 /// Blocks a compute unit must keep resident for a tile to be worth launching

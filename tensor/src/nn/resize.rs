@@ -231,9 +231,8 @@ impl Tensor {
         // Nearest at an integer scale is "repeat each element" wherever the
         // coordinate transform and the rounding compose to `floor(o / s)`, and
         // `repeat_interleave` is that as a view. The general path below would
-        // spend a one-hot masked sum-reduce per axis instead — the neck's two
-        // upsamples are 101 µs of a 4.87 ms YOLO26x frame on gfx1201, and
-        // 222 µs on an RTX 3060, for an operation that moves nothing.
+        // spend a one-hot masked sum-reduce per axis instead, for an operation
+        // that moves nothing.
         //
         // Only the two combinations that are exactly `floor(o / s)` are taken.
         // `half_pixel` gives `ceil((o + 0.5)/s - 1)`, and `(r + 0.5)/s - 1` is

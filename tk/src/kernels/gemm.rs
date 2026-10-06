@@ -790,20 +790,14 @@ pub const NT_64X64: GemmCfg = GemmCfg { block_m: 64, acc_m: 1, ..NT_128X64 };
 /// wave and a 64-deep strip: half the barriers per K element, and four times the
 /// waves to hide the fill behind. 32 KiB of shared memory, so three blocks per
 /// sm_86 SM — fewer than [`NT_64X64`]'s six, which is why it only leads where the
-/// grid cannot fill the device anyway. Measured on the YOLO26x convolutions
-/// (RTX 3060): `768→768 k3s2 @20²` 244 → 235 µs, the `192→192 k3 @40²`
-/// bottleneck 67.5 → 62.5, `768→768 k3s2 @40²` a wash, and 2% behind on the
-/// wide-grid `384→384 k3s2 @80²`.
+/// grid cannot fill the device anyway.
 pub const NT_64X64_W8: GemmCfg = GemmCfg { block_m: 64, warps_m: 4, acc_m: 1, k_step: 64, ..NT_128X64 };
 
 /// 32×32 over a 2×2 wave grid, one 16×16 accumulator per wave, a 64-deep strip:
 /// the tile for a shape whose N is too narrow to tile the device — four times
 /// [`NT_64X64`]'s blocks out of the same C. 16 KiB of shared memory and ~half
-/// the operand reuse per fill, so it loses badly wherever the grid is already
-/// wide (`768→768 k3s2 @20²` 244 → 378 µs). Measured where it is not: the
-/// `192→192 k3 @20²` bottleneck 34.6 → 25.3 µs (75 blocks over 28 SMs becomes
-/// 300; ncu puts the 64×64 form at 0.54 waves per SM and 19% achieved
-/// occupancy), `384→192 k3 @20²` 59.4 → 46.8.
+/// the operand reuse per fill, so it loses wherever the grid is already wide and
+/// leads only where the wider tile leaves the device short of blocks.
 pub const NT_32X32: GemmCfg = GemmCfg { block_m: 32, block_n: 32, acc_m: 1, k_step: 64, ..NT_128X64 };
 
 /// The split-K tile: [`NT_128X64`] over two K-slabs, writing `[2, M, N]` f32

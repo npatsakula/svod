@@ -104,14 +104,9 @@ pub enum TcTilePolicy {
 /// operand addresses and the pipeline sit on top of them, and a lane addresses
 /// no more than 256 VGPRs before the rest spills to scratch.
 ///
-/// Swept on a Radeon RX 9070 XT (gfx1201) against YOLO26x at f16, 640, b1:
-/// 12 tensor-core tiles' worth of accumulators runs it in 6.61 ms against
-/// 12.43 for [`TcTilePolicy::FixedStep`], which sized 20 of the 196 dispatches
-/// past the ceiling and spilled 204 to 620 bytes a thread, holding them to 5
-/// resident waves of 16. The plateau runs to 120 and 128 falls off it (6.95
-/// ms, six kernels spilling again), so the budget sits at the near edge, where
-/// a kernel whose fragments and addressing cost more than a convolution's
-/// still has somewhere to put them.
+/// The value is the near edge of the plateau a sweep found (96 to 120; at 128
+/// kernels spill again), so a kernel whose fragments and addressing cost more
+/// than a convolution's still has somewhere to put them.
 const RDNA4_LANE_ACCUM_MAX: usize = 96;
 
 /// Backend renderer capabilities.
@@ -246,9 +241,7 @@ impl Renderer {
     /// once its register file has been measured on hardware:
     ///
     /// * **CUDA** — 128 accumulators per lane, half of the 255 registers an
-    ///   NVIDIA lane addresses, is the optimum on GA106 (RTX 3060, f16 in /
-    ///   f32 out `mma.sync`), where it runs GigaAM's 768->3072 projection at
-    ///   20.8 TFLOPS against 15.9 for the fixed step.
+    ///   NVIDIA lane addresses.
     /// * **RDNA4** — [`RDNA4_LANE_ACCUM_MAX`].
     ///
     /// Everything else keeps [`TcTilePolicy::FixedStep`], which grows the tile

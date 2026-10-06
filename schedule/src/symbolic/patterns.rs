@@ -496,10 +496,9 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
         // dozens of times and mostly reaches the same kernels anyway. Where it
         // does change the kernel it only reorders the loop nest — the extents are
         // the same multiset — so a graph with no matmul to unblock gets the
-        // reorder and nothing for it, and inception-style branches measurably
-        // lose a couple of percent. The payoff is specific to the tensor-core
-        // matcher while this rule is general symbolic rewriting; see 49d264b2 for
-        // the measurements on both sides.
+        // reorder and nothing for it, and inception-style branches lose a little.
+        // The payoff is specific to the tensor-core matcher while this rule is
+        // general symbolic rewriting.
         Reduce { src: Where(cond, x, invalid), ranges, reduce_op, num_axes }
             if UOp::is_invalid_marker(invalid) && *num_axes == 0 && !moved_by_ranges(cond, ranges)
             => {

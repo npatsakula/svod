@@ -66,7 +66,7 @@ impl YoloNeck {
         // be realized first, so that fusing into it could not run each over the
         // whole concatenated channel range — but a tk convolution's output is
         // already its own kernel's, and copying the NCHW view of it back out
-        // costs 17 µs for nothing (net -28 µs over the two, measured).
+        // costs a copy for nothing.
         let l17 = scoped("17", || self.conv17.forward(&l16))?;
         let cat = Tensor::cat(&[&l17, &l13], 1)?;
         let l19 = scoped("19", || self.c3k2_19.forward(&cat))?;

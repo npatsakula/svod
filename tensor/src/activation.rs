@@ -19,10 +19,9 @@ impl Tensor {
     /// (`opmath_type`).
     ///
     /// Left in a narrow stream, a chain rounds at every step: fp16 `x·sigmoid(x)`
-    /// is four roundings against one, which is what put YOLO26's P5/32 drift at
-    /// 7.2× a fair PyTorch. Widening is exact and the one cast back usually folds
-    /// into the consumer, so the price is an fp32 transcendental where the
-    /// hardware offers a narrow — possibly 2-wide — one.
+    /// is four roundings against one. Widening is exact and the one cast back
+    /// usually folds into the consumer, so the price is an fp32 transcendental
+    /// where the hardware offers a narrow — possibly 2-wide — one.
     ///
     /// A stream that is already wide is handed to `chain` untouched, so the
     /// chains nest for free: [`Self::gelu`] widens once and the [`Self::tanh`]

@@ -145,9 +145,8 @@ fn render_special(uop: &Arc<UOp>, name: &str, ctx: &mut RenderContext, kernel: &
 /// Wrapping it in `fence syncscope("block") release/acquire` — which is what
 /// this used to do — is therefore redundant, and not free: ptxas renders each
 /// fence as a `MEMBAR.ALL.CTA` preceded by four predicated-off `LDS RZ, [RZ]`,
-/// so a barrier cost **eleven** instructions instead of one. In a
-/// software-pipelined K loop that was 14% of the body (measured on the sm_86
-/// `conv2d_nhwc` patch kernel: 126 of 692 instructions per trip).
+/// so a barrier cost **eleven** instructions instead of one, a real share of a
+/// software-pipelined K loop's body.
 fn render_barrier(kernel: &mut Vec<String>) -> Option<()> {
     kernel.push("  tail call void @llvm.nvvm.barrier0()".to_string());
     Some(())

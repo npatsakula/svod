@@ -16,7 +16,7 @@
 //! channels-last, which inside a C3k chain it is.
 //!
 //! Read the `generic` rows under `BEAM=4`: unset, they are the heuristics
-//! path, which is not what the model gets and is 3-7x slower than what it does.
+//! path, which is not what the model gets.
 //!
 //! Run: `SVOD_DEVICE={CUDA,AMD}:0 cargo bench -p svod-tk --bench conv`
 
@@ -33,9 +33,8 @@ use common::{bench_kernel, bench_plan, requirements_met};
 /// than NCHW (the downsamples, the head, the 1x1s), which decides what the
 /// graph arm is measured over.
 ///
-/// The first four are the shapes commit 7f6e8134 measured on gfx1201, so the
-/// numbers here sit beside that message's. The rest are YOLO26 shapes on either
-/// side of the gate, largest MAC share first.
+/// The first four are the shapes the kernel was first measured on. The rest are
+/// YOLO26 shapes on either side of the gate, largest MAC share first.
 const SHAPES: &[(usize, usize, usize, usize, usize, bool, &str)] = &[
     (768, 768, 80, 2, 3, false, "768-768-s2-80"),
     (768, 768, 20, 1, 3, true, "768-768-s1-20"),

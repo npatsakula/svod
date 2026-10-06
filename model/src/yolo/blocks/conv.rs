@@ -120,10 +120,9 @@ impl YoloConv {
         self
     }
 
-    /// Run [`svod_tk::conv2d_nhwc`], which on gfx1201 under BEAM is 1.6-2.3x the
-    /// best kernel the graph gets for a 3x3. The kernel reads and writes
-    /// `[B, H, W, C]`: an NCHW input is permuted first, which costs a copy the
-    /// win pays for several times over, while an NCHW output is only the view.
+    /// Run [`svod_tk::conv2d_nhwc`]. The kernel reads and writes `[B, H, W, C]`:
+    /// an NCHW input is permuted first, which costs a copy the win pays for
+    /// several times over, while an NCHW output is only the view.
     /// Where the kernel declines (a dtype or shape it does not serve, another
     /// device) the block runs the graph conv, so this is a performance flag and
     /// never a correctness one.
@@ -163,9 +162,8 @@ impl YoloConv {
     }
 
     /// Store the output channels-last, handing on the NCHW view every consumer
-    /// expects. Under BEAM a 3x3 stride-1 conv reading it is 1.5-2.7x faster on
-    /// gfx1201, a stride-2 conv 2-3x slower, so the producer chooses by what
-    /// consumes it.
+    /// expects. A stride-1 3x3 reads it faster and a stride-2 one slower, so the
+    /// producer chooses by what consumes it.
     pub fn channels_last(mut self) -> Self {
         self.channels_last = true;
         self
@@ -186,8 +184,8 @@ impl YoloConv {
 
     /// Accumulate the conv in `dtype` and keep the block's output there, so
     /// half-width operands still leave the norm and activation at full width.
-    /// (Doing so for every block costs 5% of the forward for 0.01 px, so the
-    /// default rounds the epilogue to the operand dtype.)
+    /// (The default rounds the epilogue to the operand dtype: every block at full
+    /// width costs more time than the accuracy it buys.)
     pub fn with_acc_dtype(mut self, dtype: DType) -> Self {
         self.conv = self.conv.with_acc_dtype(dtype);
         self

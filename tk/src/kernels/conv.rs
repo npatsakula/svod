@@ -84,12 +84,10 @@ impl ConvGeom {
 }
 
 /// The K below which the tap walk's per-trip index decode outweighs what the
-/// matrix core saves over the graph's own kernel, so a caller should not ask.
-/// Measured on gfx1201 under BEAM=4 against the kernel BEAM finds, in the frame:
-/// K = 288 (`32→32 k3 @160²`) loses ~29 µs a convolution, K = 864 (`96→96 k3
-/// @80²`) wins ~8 (33.9 µs against ~26), K ≥ 3456 wins outright. The floor sits
-/// between the two, at the first K a 64-channel 3x3 reaches; `benches/conv.rs`
-/// carries rows on both sides of it.
+/// matrix core saves over the graph's own kernel, so a caller should not ask:
+/// the first K a 64-channel 3x3 reaches, between the K = 288 bodies that lose to
+/// the kernel BEAM finds and the K = 864 ones that win. `benches/conv.rs` carries
+/// rows on both sides of it.
 pub const CONV_K_FLOOR: usize = 576;
 
 /// Whether [`conv2d_nhwc`] is worth asking for on the channel counts alone — the
@@ -108,17 +106,13 @@ fn starves(policy: &GemmPolicy, geom: &ConvGeom, cfg: &GemmCfg) -> bool {
 }
 
 /// A shape only a fine tile serves, on a grid that already fills the device.
-/// The fine tiles exist for a short grid — [`super::gemm::NT_32X32`] is measured
-/// winning at 75 blocks over 28 SMs and losing badly wherever the grid is wide —
-/// and there the kernel loses to the graph's own convolution outright. On sm_86,
-/// in the YOLO26-x frame: from the table, `384→96 k3 @80²` (600 blocks) runs
-/// 320 µs against the graph's 229 and `768→96 k3 @40²` (150) 190 against 178,
-/// while `768→96 k3 @20²` (39) runs 63 against 95; from the lattice, which is
-/// where a shape the table cannot tile at all ends up, `96→96 k3 @80²` (150 on
-/// its 32-wide edge) runs 64.5 against 57.3. So a shape whose only tiles are
-/// finer than the table's widest — the table's own fine tiles, or the lattice's
-/// narrowest edge when the table has nothing — is declined unless that tile's
-/// grid falls short of what the device keeps resident.
+/// The fine tiles exist for a short grid — [`super::gemm::NT_32X32`] wins where
+/// the wider tile leaves the device short of blocks and loses wherever the grid
+/// is wide — and on a wide grid the kernel loses to the graph's own convolution
+/// outright. So a shape whose only tiles are finer than the table's widest — the
+/// table's own fine tiles, or the lattice's narrowest edge when the table has
+/// nothing — is declined unless that tile's grid falls short of what the device
+/// keeps resident.
 fn fine_only_on_a_wide_grid(policy: &GemmPolicy, geom: &ConvGeom) -> bool {
     let Some(widest) = policy.tiles.first() else { return false };
     let wide = |cfg: &GemmCfg| cfg.block_m * cfg.block_n >= widest.block_m * widest.block_n;
@@ -607,9 +601,8 @@ pub fn conv2d_nhwc(
 /// strip, and takes all `kh·kw` taps out of that one shared tile.
 ///
 /// The tap-major [`build_conv`] pays, per K trip and per `cp.async`, a decode of
-/// the strip row into `(b, oy, ox)` and of the trip into `(ky, kx, cin0)`: on
-/// sm_86 that is 55 of the 135 instructions in the loop body, against 16 `mma`.
-/// Here the patch row decodes once — it does not depend on the trip — and a tap
+/// the strip row into `(b, oy, ox)` and of the trip into `(ky, kx, cin0)`, which
+/// outweighs the loop's `mma`s in instructions. Here the patch row decodes once — it does not depend on the trip — and a tap
 /// is a compile-time shared-memory offset, so the trip count drops by `kh·kw`
 /// and the per-tap address arithmetic disappears entirely.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -641,8 +634,7 @@ impl PatchCfg {
 /// `tile·tile` outputs covers `(tile+2)²` input pixels against `9·tile²` tap
 /// reads — a 5.8× saving at `tile = 8` — but at stride 2 it covers `(2·tile+1)²`
 /// for the same 9 reads, which is 1.8×, and the patch is then five times the
-/// strip. Measured on the sm_86 `384→384 k3s2 @160²` with the ceiling lifted:
-/// 871 µs against the gathered form's 790.
+/// strip: with the ceiling lifted, the stride-2 patch loses to the gathered form.
 fn patch_candidate(geom: &ConvGeom, cfg: &GemmCfg, wave: usize) -> Option<PatchCfg> {
     let threads = cfg.threads(wave) as usize;
     (1..=cfg.block_m)
@@ -741,8 +733,8 @@ fn patch_body(
 
     // The patch is single-buffered: it turns over once per `kh·kw` taps, so a
     // second copy would buy one fill's latency for a third of the workgroups
-    // resident per SM — measured 62.5 against 60.4 µs on the sm_86
-    // `192→192 k3 @40²`. It is refilled behind the last tap's MMAs instead.
+    // resident per SM, which costs more than it buys. It is refilled behind the
+    // last tap's MMAs instead.
     let a_smem = ker.shared_sw_stages((p.rows, k_step), in_dt.clone(), TileLayout::Row, 1);
     let b_smem = ker.shared_sw_stages(b_strip(&cfg), in_dt.clone(), TileLayout::Row, cfg.stages);
 

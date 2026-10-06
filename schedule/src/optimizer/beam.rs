@@ -285,10 +285,8 @@ fn generate_actions(scheduler: &Scheduler, config: &BeamConfig) -> Vec<Scheduler
 /// one) is unreachable from the bare scheduler. Timing it makes the search's
 /// answer never worse than the heuristic one. It does not join the beam: a
 /// complete plan outruns every single action in the first wave, its children
-/// fill the second, and the search then ends as soon as nothing beats it, so
-/// at width 4 a 40x40 stride-2 conv stayed on the heuristics' padded 2.0 ms
-/// tile where the same search without the seed reached 1.2 ms. Held aside,
-/// the seed can still win but cannot steer.
+/// fill the second, and the search then ends as soon as nothing beats it, on
+/// the heuristics' plan. Held aside, the seed can still win but cannot steer.
 ///
 /// `None` when the heuristics add nothing or land outside the search's limits,
 /// or under `BEAM_SEED=0`, which measures what the seed is worth.
@@ -684,9 +682,8 @@ where
 /// lifts the clock once per batch and times the members in rounds, so a
 /// candidate is never judged at a clock the others were not. Timed one by one
 /// as their compiles landed, every candidate but the first ran on a clock that
-/// had sagged during the compile gap before it — by a median 1.5x and up to 6x
-/// on gfx1201, the short kernels worst — and the ranking followed the gaps
-/// rather than the kernels.
+/// had sagged during the compile gap before it, the short kernels worst, and
+/// the ranking followed the gaps rather than the kernels.
 struct TimingBatch<C> {
     capacity: usize,
     indices: Vec<usize>,
