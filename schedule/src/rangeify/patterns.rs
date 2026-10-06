@@ -1308,24 +1308,38 @@ fn reaches(node: &Arc<UOp>, range: &Arc<UOp>) -> bool {
     Arc::ptr_eq(node, range) || RangesProperty::get(node).iter().any(|r| Arc::ptr_eq(r, range))
 }
 
-/// Whether casting `src` to `dtype` keeps its values distinct — either the
+/// Whether casting `value` to `dtype` keeps its values distinct — either the
 /// destination covers the source format outright, or it covers the values this
-/// node can actually take. A cast that merged two values would let several steps
+/// node provably takes. A cast that merged two values would let several steps
 /// of the reduction satisfy the equality, and keeping one would drop the rest.
-fn cast_is_injective(src: &Arc<UOp>, dtype: &DType) -> bool {
-    if !dtype.is_int() || !src.dtype().is_int() {
-        return false;
-    }
-    let (lo, hi) = (dtype.min_value(), dtype.max_value());
-    if src.dtype().min_value() >= lo && src.dtype().max_value() <= hi {
-        return true;
-    }
-    let bound = |value: &ConstValue| match value {
-        ConstValue::Int(v) => Some(*v as f64),
-        ConstValue::UInt(v) => Some(*v as f64),
+pub(crate) fn cast_is_injective(value: &Arc<UOp>, dtype: &DType) -> bool {
+    let int = |value: &ConstValue| match *value {
+        ConstValue::Int(v) => Some(i128::from(v)),
+        ConstValue::UInt(v) => Some(i128::from(v)),
         _ => None,
     };
-    bound(src.vmin()).is_some_and(|v| v >= lo) && bound(src.vmax()).is_some_and(|v| v <= hi)
+    // `ConstValue::{min, max}` give `Index` the i64 range it lowers into, where
+    // `DType::{min_value, max_value}` say `0..=0`, which any bounds would fit.
+    let limits = |dtype: &DType| -> Option<(i128, i128)> {
+        dtype.is_int().then_some(())?;
+        Some((int(&ConstValue::min(dtype.base()))?, int(&ConstValue::max(dtype.base()))?))
+    };
+    let (Some((lo, hi)), Some(format)) = (limits(dtype), limits(&value.dtype())) else { return false };
+    let fits = |(min, max): (i128, i128)| lo <= min && max <= hi;
+    fits(format)
+        || SoundVminVmaxProperty::get(value)
+            .as_ref()
+            .and_then(|(min, max)| Some((int(min)?, int(max)?)))
+            .is_some_and(fits)
+}
+
+/// `other == cast(src)` read as `other' == src`, with `other'` the inverse cast of
+/// `other`. Sound only when both casts keep their values: `cast` over `src`, so one
+/// step still matches one value, and the inverse over `other`, so nothing outside
+/// `src`'s dtype folds onto a value inside it (`2^32 + 3` onto 3 when `cast` widens
+/// i32 to i64).
+fn peel_cast(cast: &Arc<UOp>, src: &Arc<UOp>, other: &Arc<UOp>) -> Option<Arc<UOp>> {
+    (cast_is_injective(src, &cast.dtype()) && cast_is_injective(other, &src.dtype())).then(|| other.cast(src.dtype()))
 }
 
 /// Rewrite `idx == cmp` into the equivalent `idx' == range`, peeling casts and
@@ -1334,7 +1348,7 @@ fn cast_is_injective(src: &Arc<UOp>, dtype: &DType) -> bool {
 /// The compared side is hardly ever the bare range: `gather` builds its arange
 /// from a reduce that collapses to `(r + 1) + (-1)` under the index-dtype casts,
 /// which is `r` and does not match as `r`.
-fn solve_for_range(idx: &Arc<UOp>, cmp: &Arc<UOp>, range: &Arc<UOp>) -> Option<Arc<UOp>> {
+pub(crate) fn solve_for_range(idx: &Arc<UOp>, cmp: &Arc<UOp>, range: &Arc<UOp>) -> Option<Arc<UOp>> {
     let (mut idx, mut cmp) = (idx.clone(), cmp.clone());
     // Every step replaces `cmp` with one of its sources, so its depth bounds the walk.
     loop {
@@ -1342,9 +1356,7 @@ fn solve_for_range(idx: &Arc<UOp>, cmp: &Arc<UOp>, range: &Arc<UOp>) -> Option<A
             return Some(idx);
         }
         let step = match cmp.op() {
-            Op::Cast(ops::Cast { src, .. }) if cast_is_injective(src, &cmp.dtype()) => {
-                (idx.cast(src.dtype()), src.clone())
-            }
+            Op::Cast(ops::Cast { src, .. }) => (peel_cast(&cmp, src, &idx)?, src.clone()),
             Op::Binary(BinaryOp::Add, x, y) if !reaches(y, range) => (idx.try_sub(y).ok()?, x.clone()),
             Op::Binary(BinaryOp::Add, x, y) if !reaches(x, range) => (idx.try_sub(x).ok()?, y.clone()),
             Op::Binary(BinaryOp::Sub, x, y) if !reaches(y, range) => (idx.try_add(y).ok()?, x.clone()),
@@ -1652,7 +1664,7 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// - (x + y) == c → x == (c - y) or y == (c - x)
 /// - (x - y) == c → x == (c + y) or y == (x - c)
 /// - Cast(x ± y) == c → same with c cast to inner dtype
-fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
+pub(crate) fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Binary(BinaryOp::Eq, raw_lhs, raw_rhs) = cond.op() else { return None };
 
     // Normalize: range-containing side on lhs, range-free on rhs.
@@ -1666,11 +1678,10 @@ fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     };
 
-    // Unwrap optional CAST, adjusting rhs to inner dtype
-    let (inner_lhs, effective_rhs) = if let Op::Cast(ops::Cast { src, .. }) = lhs.op() {
-        (src.as_ref(), rhs.cast(src.dtype()))
-    } else {
-        (lhs.as_ref(), rhs.clone())
+    // Unwrap optional CAST, reading rhs in the inner dtype
+    let (inner_lhs, effective_rhs) = match lhs.op() {
+        Op::Cast(ops::Cast { src, .. }) => (src.as_ref(), peel_cast(lhs, src, rhs)?),
+        _ => (lhs.as_ref(), rhs.clone()),
     };
 
     match inner_lhs.op() {
@@ -1795,11 +1806,10 @@ fn ne_lifting_patterns() -> TypedPatternMatcher<()> {
         },
 
         // .or_casted() NE: Cast(x + y) != c → x != (c.cast(inner_dtype) - y)
-        Ne(Cast { src: inner, .. }, c) if no_range(c) => {
+        Ne(cast @ Cast { src: inner, .. }, c) if no_range(c) => {
             let Op::Binary(BinaryOp::Add, x, y) = inner.op() else { return None };
             if !no_range(y) { return None; }
-            let casted_c = c.cast(inner.dtype());
-            let new_c = casted_c.try_sub(y).ok()?;
+            let new_c = peel_cast(cast, inner, c)?.try_sub(y).ok()?;
             x.try_cmpne(&new_c).ok()
         },
     }

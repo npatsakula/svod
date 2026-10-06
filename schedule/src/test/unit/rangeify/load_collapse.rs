@@ -12,8 +12,12 @@ use svod_ir::{BinaryOp, ConstValue, Op, ReduceOp, UOp};
 use test_case::test_case;
 
 use super::helpers::{assert_const_float, reduce_range, rewritten};
-use crate::rangeify::patterns::{build_reduce_load_collapse_matcher, pm_load_collapse};
+use crate::rangeify::patterns::{
+    build_reduce_load_collapse_matcher, cast_is_injective, pm_load_collapse, solve_for_range,
+    try_lift_arithmetic_from_eq,
+};
 use crate::rangeify::reduce_load_collapse;
+use crate::test::support::build::global_range;
 use crate::test::support::prelude::{Bindings, fold_at};
 
 const END: i64 = 10;
@@ -325,4 +329,103 @@ fn a_multiplication_by_a_cast_bool_becomes_a_where() {
     assert!(Arc::ptr_eq(value, &UOp::native_const(3i32)), "the product keeps its scale");
     assert_eq!(super::helpers::const_value(otherwise), ConstValue::Int(0));
     assert_eq!(super::helpers::const_value(count), ConstValue::Int(END));
+}
+
+/// A loaded index as `reduce_collapse` sees it: a variable over `[lo, hi]` in i64.
+fn index_var(lo: i64, hi: i64) -> Arc<UOp> {
+    UOp::variable("idx".to_string(), lo, hi, DType::Int64)
+}
+
+/// `i64(i32(r) + offset)`: an Int32 arange widened to an i64 index, the compared
+/// side a hand-built mask or an embedding brings.
+fn widened_arange(range: &Arc<UOp>, offset: i32) -> Arc<UOp> {
+    range.cast(DType::Int32).try_add(&UOp::native_const(offset)).expect("r + k").cast(DType::Int64)
+}
+
+/// The float a folded body takes at `idx = at`.
+fn folded_at(folded: &Arc<UOp>, at: i64) -> Option<f64> {
+    fold_at(folded, &Bindings::at("idx", at)).and_then(|value| value.try_float())
+}
+
+/// `idx == i64(i32(r))` reads as `i32(idx) == i32(r)` only while `idx` fits i32;
+/// otherwise the narrowing folds `2^32 + 3` onto step 3, which it never named.
+#[test_case(i64::MIN, i64::MAX, None ; "a full-range index is not narrowed")]
+#[test_case(0, 1 << 40, None ; "an index past i32 is not narrowed")]
+#[test_case(-7, 1 << 20, Some(5) ; "an index that fits i32 is solved for")]
+fn a_widening_cast_is_peeled_only_for_an_index_that_fits(lo: i64, hi: i64, solved_at_5: Option<i64>) {
+    let range = reduce_range(END, 0);
+    let compared = range.cast(DType::Int32).cast(DType::Int64);
+    match (solve_for_range(&index_var(lo, hi), &compared, &range), solved_at_5) {
+        (None, None) => {}
+        (Some(solved), Some(want)) => {
+            assert_eq!(fold_at(&solved, &Bindings::at("idx", 5i64)), Some(ConstValue::Int(want)), "{}", solved.tree())
+        }
+        (got, want) => panic!("expected {want:?}, got {}", got.map_or("None".to_string(), |solved| solved.tree())),
+    }
+}
+
+/// The EQ lift reads `i64(i32(r) + 1) == idx` as `i32(r) == i32(idx) - 1`, which
+/// holds only while `idx` fits i32.
+#[test_case(i64::MIN, i64::MAX, false ; "a full-range index is not narrowed")]
+#[test_case(0, 100, true ; "an index that fits i32 is lifted")]
+fn the_eq_lift_never_narrows_a_wide_index(lo: i64, hi: i64, lifted: bool) {
+    let range = reduce_range(END, 0);
+    let condition = widened_arange(&range, 1).try_cmpeq(&index_var(lo, hi)).expect("cmpeq");
+    let got = try_lift_arithmetic_from_eq(&condition);
+    assert_eq!(got.is_some(), lifted, "{}", got.map_or("None".to_string(), |lifted| lifted.tree()));
+}
+
+/// The NE lift is the same reading for `Cast(r + y) != idx`.
+#[test_case(i64::MIN, i64::MAX, false ; "a full-range index is not narrowed")]
+#[test_case(0, 100, true ; "an index that fits i32 is lifted")]
+fn the_ne_lift_never_narrows_a_wide_index(lo: i64, hi: i64, lifted: bool) {
+    let range = reduce_range(END, 0);
+    let condition = widened_arange(&range, 1).try_cmpne(&index_var(lo, hi)).expect("cmpne");
+    let matcher = build_reduce_load_collapse_matcher();
+    if lifted {
+        rewritten(matcher, &condition, &mut ());
+    } else {
+        super::helpers::assert_no_match(matcher, &condition, &mut ());
+    }
+}
+
+/// The whole collapse on both gate forms: a full-range index may keep its reduce,
+/// but wherever the body folds, `2^32 + 3` and `i64::MIN` read nothing and the
+/// index naming step 3 reads step 3. An index that fits must still collapse.
+#[test_case(0 ; "plain arange")]
+#[test_case(1 ; "offset arange")]
+fn a_wide_index_never_aliases_through_the_collapse(offset: i32) {
+    let range = reduce_range(END, 0);
+    let compared = widened_arange(&range, offset);
+    let step = range.cast(DType::Float32);
+    let names_3 = 3 + i64::from(offset);
+    for (lo, hi) in [(i64::MIN, i64::MAX), (-5, 100)] {
+        let idx = index_var(lo, hi);
+        let eq = UOp::try_where(idx.try_cmpeq(&compared).expect("cmpeq"), step.clone(), zero()).expect("gate");
+        let ne = UOp::try_where(idx.try_cmpne(&compared).expect("cmpne"), zero(), step.clone()).expect("gate");
+        for body in [eq, ne] {
+            let Some(folded) = reduce_load_collapse(&body, std::slice::from_ref(&range)) else {
+                assert_eq!(lo, i64::MIN, "an index that fits i32 must collapse:\n{}", body.tree());
+                continue;
+            };
+            let probes: &[(i64, f64)] = if lo == i64::MIN {
+                &[((1 << 32) + 3, 0.0), (i64::MIN, 0.0), (names_3, 3.0)]
+            } else {
+                &[(names_3, 3.0), (-1, 0.0), (50, 0.0)]
+            };
+            for &(at, want) in probes {
+                assert_eq!(folded_at(&folded, at), Some(want), "idx = {at}:\n{}", folded.tree());
+            }
+        }
+    }
+}
+
+/// `Index` is as wide as the i64 it lowers into, so neither direction of a cast
+/// that touches it can pass on its placeholder `0..=0` bounds.
+#[test]
+fn cast_injectivity_reads_index_as_i64() {
+    assert!(cast_is_injective(&index_var(i64::MIN, i64::MAX), &DType::Index), "i64 fits Index");
+    assert!(!cast_is_injective(&global_range(1 << 40, 0), &DType::Int32), "an Index range past i32 does not fit");
+    assert!(cast_is_injective(&global_range(10, 0), &DType::Int32), "an Index range of ten fits");
+    assert!(!cast_is_injective(&UOp::var("gate", DType::Bool, 0, 1), &DType::Int32), "bool is not an integer");
 }

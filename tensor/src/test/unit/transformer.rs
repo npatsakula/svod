@@ -593,3 +593,18 @@ fn test_sdpa_scores_cuda_tc_warp_with_three_locals_matches_cpu() {
     let actual = case.run(crate::config::cuda_test_device().expect("a CUDA device is open"), &config, &forced, build);
     assert_all_close(&actual, &expected, 1e-2);
 }
+
+// =========================================================================
+// Embedding ids the vocab does not hold
+// =========================================================================
+
+crate::codegen_tests! {
+    fn test_embedding_reads_no_row_for_an_id_outside_the_vocab(config) {
+        // i64 ids past 32 bits beside in-range ones: `2^32 + 2` must not read row 2.
+        let weight = Tensor::from_ndarray(&array![[1.0f32], [2.0], [3.0], [4.0], [5.0]]);
+        let ids = Tensor::from_slice([(1i64 << 32) + 2, 2, 1 << 31, -(1i64 << 32) + 4, 4, -1]);
+        let result = weight.embedding(&ids).unwrap();
+        result.realize_with(&config).unwrap();
+        assert_eq!(result.as_vec::<f32>().unwrap(), vec![0.0, 3.0, 0.0, 0.0, 5.0, 0.0]);
+    }
+}
