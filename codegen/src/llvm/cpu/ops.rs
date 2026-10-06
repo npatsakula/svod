@@ -18,6 +18,21 @@ fn lshaped(value: &Arc<UOp>) -> String {
     ldt(&shaped_dtype(value))
 }
 
+/// A GEP index operand as `(type, value)`. GEP reads every index as signed, so an
+/// unsigned index narrower than 64 bits is zero-extended first: a `u8` id of 200
+/// would otherwise address element -56.
+fn gep_index(index: &Arc<UOp>, dst: &str, ctx: &RenderContext, kernel: &mut Vec<String>) -> (String, String) {
+    let value = ctx.get(index).to_string();
+    let dtype = index.dtype();
+    if dtype.base().is_unsigned() && dtype.base().bytes() < 8 {
+        let widened = format!("{dst}_idx");
+        kernel.push(format!("  {widened} = zext {} {value} to i64", ldt(&dtype)));
+        ("i64".to_string(), widened)
+    } else {
+        (ldt(&dtype), value)
+    }
+}
+
 /// Render a UOp to LLVM IR string.
 ///
 /// Returns None for meta-ops that don't produce instructions.
@@ -59,9 +74,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 return None;
             }
 
-            let (final_idx, final_idx_type) = if indices.len() == 1 {
-                (ctx.get(&indices[0]).to_string(), ldt(&indices[0].dtype()))
-            } else {
+            let [index] = indices.as_slice() else {
                 ctx.set_invalid_graph(format!(
                     "LLVM renderer requires linearized INDEX (single-axis), found {} indices on uop {}",
                     indices.len(),
@@ -77,24 +90,29 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 // Gate is NOT handled here — matching Tinygrad's approach where INDEX
                 // always emits a plain GEP. The gate is handled at LOAD level (branch+phi)
                 // and at STORE level (IF/ENDIF via line_rewrite_cleanups).
+                let (index_type, index) = gep_index(index, &dst, ctx, kernel);
                 kernel.push(format!(
-                    "  {dst} = getelementptr inbounds {}, ptr {buf}, {final_idx_type} {final_idx}",
+                    "  {dst} = getelementptr inbounds {}, ptr {buf}, {index_type} {index}",
                     ldt(&uop.dtype())
                 ));
             } else {
-                kernel
-                    .push(format!("  {dst} = extractelement {} {buf}, {final_idx_type} {final_idx}", lshaped(buffer)));
+                // `extractelement` reads its index as unsigned already.
+                kernel.push(format!(
+                    "  {dst} = extractelement {} {buf}, {} {}",
+                    lshaped(buffer),
+                    ldt(&index.dtype()),
+                    ctx.get(index)
+                ));
             }
             Some(())
         }
 
         Op::Shrink(ops::Shrink { src, offsets, sizes: _ }) => {
-            let buf = ctx.get(src);
-            let idx = ctx.get(offsets);
+            let buf = ctx.get(src).to_string();
+            let (offset_type, offset) = gep_index(offsets, &dst, ctx, kernel);
             kernel.push(format!(
-                "  {dst} = getelementptr inbounds {}, ptr {buf}, {} {idx}",
-                ldt(&uop.dtype()),
-                ldt(&offsets.dtype())
+                "  {dst} = getelementptr inbounds {}, ptr {buf}, {offset_type} {offset}",
+                ldt(&uop.dtype())
             ));
             Some(())
         }

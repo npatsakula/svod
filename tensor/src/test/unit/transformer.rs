@@ -607,4 +607,14 @@ crate::codegen_tests! {
         result.realize_with(&config).unwrap();
         assert_eq!(result.as_vec::<f32>().unwrap(), vec![0.0, 3.0, 0.0, 0.0, 5.0, 0.0]);
     }
+
+    fn test_embedding_u8_ids_past_127_read_their_row(config) {
+        // A vocab u8 covers exactly, so the lookup collapses into a direct read
+        // indexed by the id itself: an id past 127 must stay unsigned there.
+        let weight = Tensor::from_ndarray(&Array2::from_shape_fn((256, 1), |(row, _)| row as f32));
+        let ids = Tensor::from_slice([200u8, 5, 255, 128]);
+        let result = weight.embedding(&ids).unwrap();
+        result.realize_with(&config).unwrap();
+        assert_eq!(result.as_vec::<f32>().unwrap(), vec![200.0, 5.0, 255.0, 128.0]);
+    }
 }

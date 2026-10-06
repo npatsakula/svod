@@ -679,3 +679,21 @@ fn amd_rejects_undecomposed_sin() {
     let err = code_renderer.render(&linear, Some("amd_sin")).expect_err("un-decomposed Sin must fail the render");
     assert!(err.to_string().contains("un-decomposed Sin"), "{err}");
 }
+
+/// GEP reads every index as signed, so an unsigned index narrower than 64 bits is
+/// zero-extended first: a `u8` id of 200 addresses element 200, not -56.
+#[test_case::test_case(DType::UInt8, Some("zext i8"); "u8")]
+#[test_case::test_case(DType::UInt16, Some("zext i16"); "u16")]
+#[test_case::test_case(DType::UInt32, Some("zext i32"); "u32")]
+#[test_case::test_case(DType::Int8, None; "i8 keeps its signed reading")]
+#[test_case::test_case(DType::UInt64, None; "u64 is pointer-wide already")]
+fn an_unsigned_gep_index_is_zero_extended(index_dtype: DType, widened: Option<&str>) {
+    let id = UOp::load().index(element(UOp::param(1, 4, index_dtype, None), 0)).call();
+    let read = UOp::load().index(UOp::index().buffer(f32_param(2)).indices(vec![id]).call().unwrap()).call();
+    let code = render_linearized(UOp::sink(vec![element(f32_param(0), 0).store(read)]), "lookup").code;
+    let gep = code.lines().find(|line| line.contains("getelementptr") && line.contains("%data2")).expect("table GEP");
+    match widened {
+        Some(zext) => assert!(code.contains(zext) && gep.contains(", i64 "), "{code}"),
+        None => assert!(!code.contains("zext"), "{code}"),
+    }
+}
