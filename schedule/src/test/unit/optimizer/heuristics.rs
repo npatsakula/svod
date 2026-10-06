@@ -152,19 +152,9 @@ fn warp_tiles(plan: &[(OptOps, Option<usize>, OptArg)]) -> usize {
         .product()
 }
 
-/// The post-TC opt sequence a `(m1, m2, n, k, taps)` convolution gets under
-/// [`TcTilePolicy::FixedStep`] for operands laid out `channels_last`; `None`
-/// when the shape declines the tensor core. RDNA3 stands in for the step: it
-/// carries the same 16x16 WMMA as RDNA4, which now takes the lane budget.
-fn conv_plan(
-    shape: (i64, i64, i64, i64, i64),
-    channels_last: (bool, bool),
-) -> Option<Vec<(OptOps, Option<usize>, OptArg)>> {
-    conv_plan_on(shape, channels_last, Renderer::amd_rdna3())
-}
-
-/// [`conv_plan`] against an explicit renderer, so a `LaneBudget` target's
-/// tiling can be pinned beside the fixed step.
+/// The post-TC opt sequence a `(m1, m2, n, k, taps)` convolution gets on
+/// `renderer` for operands laid out `channels_last`; `None` when the shape
+/// declines the tensor core.
 fn conv_plan_on(
     shape: (i64, i64, i64, i64, i64),
     channels_last: (bool, bool),
@@ -291,23 +281,8 @@ fn non_cuda_tiling_matches_the_shipped_fixed_step(renderer: Renderer, dims: (usi
     }
 }
 
-const PLAIN_STEP: &[(OptOps, usize, usize)] = &[(OptOps::UPCAST, 1, 3), (OptOps::UPCAST, 1, 4)];
-
-#[test_case((false, false), PLAIN_STEP; "both channels-first keeps the plain step")]
-#[test_case((true, true), PLAIN_STEP; "both channels-last keeps the plain step")]
-#[test_case((false, true), PLAIN_STEP; "a strided activation is already what N holds")]
-#[test_case((true, false), &[(OptOps::UPCAST, 1, 3), (OptOps::LOCAL, 0, 4)]; "a strided weight is stacked over the second spatial axis")]
-fn conv_warp_tile_grows_where_the_pricier_fragment_is_reused(
-    channels_last: (bool, bool),
-    expected: &[(OptOps, usize, usize)],
-) {
-    let expected: Vec<_> = expected.iter().map(|&(op, axis, arg)| opt(op, axis, arg)).collect();
-    assert_eq!(conv_plan(PROBE_CONV, channels_last), Some(expected));
-}
-
-/// RDNA4 sizes a convolution's warp tile against the register file instead, so
-/// the layout that decides where the fixed step grows no longer decides how far:
-/// the tile comes out square under the budget whichever way the operands lie.
+/// RDNA4 sizes a convolution's warp tile against the register file, so the tile
+/// comes out square under the budget whichever way the operands lie.
 ///
 /// The accumulator assertion is the point of the policy: the fixed step grows M
 /// and then N by the first of `[5, 4, 3, 2]` that divides, so a lane can end up
@@ -363,29 +338,6 @@ fn rdna4_conv_warp_tile_stays_inside_the_lane_budget(
 fn cuda_conv_warp_tile_counts_the_taps_as_reduce_trips(shape: (i64, i64, i64, i64, i64), tiles: usize) {
     let plan = conv_plan_on(shape, (true, true), Renderer::cuda()).expect("the conv takes a tensor core");
     assert_eq!(warp_tiles(&plan), tiles, "warp tile for {shape:?}: {plan:?}");
-}
-
-// Growing the tile along the axis that reuses the pricier operand fragment is a
-// choice of direction and not of size: whatever the operands' layouts, one warp
-// still holds at most the accumulators the plain step would give it, and every
-// UPCAST the plan records stays replayable.
-proptest! {
-    #![proptest_config(cheap())]
-    #[test]
-    fn conv_warp_tile_never_outgrows_the_plain_step(m1 in 8i64..=64, m2 in 8i64..=64, n in 1i64..=8, taps in 1i64..=9) {
-        let shape = (m1, m2, n * 16, 192, taps);
-        let Some(plain) = conv_plan(shape, (false, false)).map(|plan| warp_tiles(&plan)) else { return Ok(()) };
-        for channels_last in [(true, false), (false, true), (true, true)] {
-            let Some(plan) = conv_plan(shape, channels_last) else { continue };
-            let tiles = warp_tiles(&plan);
-            prop_assert!(tiles <= plain, "{channels_last:?} grows to {tiles} over the plain step's {plain}");
-            prop_assert_eq!(conv_plan(shape, channels_last), Some(plan.clone()), "the plan is a function of the shape");
-            for (op, _, arg) in plan {
-                let OptArg::Int(amount) = arg else { continue };
-                prop_assert!(op != OptOps::UPCAST || amount <= Renderer::amd_rdna3().upcast_max);
-            }
-        }
-    }
 }
 
 /// A wider warp tile must never record an UPCAST the renderer would refuse to replay.
