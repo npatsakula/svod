@@ -103,7 +103,7 @@ fn next_signed_unit(state: &mut u64) -> f64 {
 
 /// Checkpoint-format weights over a freshly built model's own keys, so the model
 /// goes through the production `from_state_dict` path (batch-norm fold, dtype
-/// cast, channels-innermost realize) rather than a test-only shortcut.
+/// cast, realize) rather than a test-only shortcut.
 fn random_state_dict(template: &StateDict, gain: f64) -> StateDict {
     template
         .iter()

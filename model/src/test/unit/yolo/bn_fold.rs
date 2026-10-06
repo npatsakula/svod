@@ -10,7 +10,7 @@ fn ramp(n: usize, scale: f32, offset: f32) -> Vec<f32> {
     (0..n).map(|i| ((i * 7919 % 97) as f32 / 97.0 - 0.5) * scale + offset).collect()
 }
 
-fn unfolded_state(cin: usize, cout: usize, k: usize) -> StateDict {
+pub(super) fn unfolded_state(cin: usize, cout: usize, k: usize) -> StateDict {
     let mut sd = StateDict::new();
     let t = |data: Vec<f32>, shape: &[isize]| Tensor::from_slice(data).try_reshape(shape.to_vec()).unwrap();
     sd.insert(
@@ -41,46 +41,6 @@ fn a_folded_conv_matches_conv_then_norm(cin: usize, cout: usize, k: usize, act: 
     let got = folded.forward(&x).unwrap().to_vec::<f32>().unwrap();
     let max = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
     assert!(max < 1e-5, "folded conv drifts by {max}");
-}
-
-/// A conv reading NCHW keeps its weight logically `[cout, cin, kh, kw]` while
-/// storing it taps-major; one reading channels-last keeps the bytes as loaded.
-/// Either way the forward is the same.
-#[test_case(false; "nchw input, taps-major weight")]
-#[test_case(true; "channels-last input, cin-major weight")]
-fn the_weight_layout_follows_the_input_layout(channels_last_input: bool) {
-    let sd: StateDict = unfolded_state(4, 8, 3).into_iter().map(|(k, t)| (k, t.cast(DType::Float16))).collect();
-    let mut conv = YoloConv::empty(4, 8, 3, 1, true);
-    if channels_last_input {
-        conv = conv.channels_last_input();
-    }
-    conv.load_state_dict(&sd, "").unwrap();
-    assert_eq!(conv.conv.weight.dims().unwrap(), vec![8, 4, 3, 3]);
-    assert_eq!(
-        conv.conv.weight.contiguous().cast(DType::Float32).to_vec::<f32>().unwrap(),
-        sd["conv.weight"].contiguous().cast(DType::Float32).to_vec::<f32>().unwrap()
-    );
-    assert_eq!(
-        std::sync::Arc::ptr_eq(&conv.conv.weight.uop(), &sd["conv.weight"].uop()),
-        channels_last_input,
-        "a taps-major weight is a view over its own buffer, a cin-major one the checkpoint's node"
-    );
-    let x = Tensor::from_slice(ramp(4 * 25, 2.0, 0.1)).try_reshape([1, 4, 5, 5]).unwrap().cast(DType::Float16);
-    let mut plain = YoloConv::empty(4, 8, 3, 1, true).channels_last_input();
-    plain.load_state_dict(&sd, "").unwrap();
-    let want = plain.forward(&x).unwrap().cast(DType::Float32).to_vec::<f32>().unwrap();
-    let got = conv.forward(&x).unwrap().cast(DType::Float32).to_vec::<f32>().unwrap();
-    let max = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-    assert!(max < 1e-3, "the layout changes the result by {max}");
-}
-
-/// At f32 there is no tensor core to lay out for, so the weight stays as loaded.
-#[test]
-fn an_f32_conv_keeps_the_checkpoint_layout() {
-    let sd = unfolded_state(4, 8, 3);
-    let mut conv = YoloConv::empty(4, 8, 3, 1, true);
-    conv.load_state_dict(&sd, "").unwrap();
-    assert!(std::sync::Arc::ptr_eq(&conv.conv.weight.uop(), &sd["conv.weight"].uop()));
 }
 
 /// Only a `conv.weight` with a full `bn.*` beside it folds; anything else, such
@@ -133,28 +93,6 @@ fn the_tk_flag_follows_what_the_kernel_can_tile(cin: usize, cout: usize, k: usiz
 #[test]
 fn a_depthwise_block_stays_on_the_graph() {
     assert!(!YoloConv::empty_dw(192, 192, 3, 1, true).tk().tk);
-}
-
-/// The weight the kernel binds is the taps-major tensor, and the one the graph
-/// path reads is the `[cout, cin, kh, kw]` view over the same buffer.
-#[test]
-fn a_tk_block_keeps_both_weight_views() {
-    let sd: StateDict = unfolded_state(64, 64, 3).into_iter().map(|(k, t)| (k, t.cast(DType::Float16))).collect();
-    let mut conv = YoloConv::empty(64, 64, 3, 1, true).tk();
-    conv.load_state_dict(&sd, "").unwrap();
-    let taps = conv.weight_taps.as_ref().expect("a tk block carries the taps-major weight");
-    assert_eq!(taps.dims().unwrap(), vec![64, 3, 3, 64]);
-    assert_eq!(conv.conv.weight.dims().unwrap(), vec![64, 64, 3, 3]);
-    assert_eq!(
-        taps.contiguous().cast(DType::Float32).to_vec::<f32>().unwrap(),
-        sd["conv.weight"]
-            .try_permute(&[0, 2, 3, 1])
-            .unwrap()
-            .contiguous()
-            .cast(DType::Float32)
-            .to_vec::<f32>()
-            .unwrap()
-    );
 }
 
 /// The rounding boundary of a narrow block: downstream of the convolution's

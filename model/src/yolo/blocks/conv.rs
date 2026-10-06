@@ -51,16 +51,11 @@ pub fn deconv2d_2x(in_ch: usize, out_ch: usize, kernel: usize) -> ConvTranspose2
 ///
 /// [`fold_batchnorm`]: crate::yolo::loader::fold_batchnorm
 ///
-/// Layouts follow the tensor core, which reduces over the channels and wants a
-/// fragment's K elements contiguous (at f32, which has no core on RDNA4, both
-/// stay as loaded). A conv reading NCHW activations gets its
-/// `k x k` weight stored taps-major, `[cout, kh, kw, cin]`, at load (under
-/// BEAM a stride-2 3x3 runs 1.9-2.8x faster on gfx1201); one reading
-/// channels-last activations keeps the checkpoint's `[cout, cin, kh, kw]`,
-/// which measured faster there. [`Self::channels_last`] picks the output
-/// layout, [`Self::channels_last_input`] declares the input's.
+/// The weight is stored `[cout, kh, kw, cin]` behind its `[cout, cin, kh, kw]`
+/// view, at load: a tensor-core fragment pairs consecutive reduce elements, and a
+/// conv reduces over `cin`. [`Self::channels_last`] picks the output layout.
 ///
-/// [`Self::nhwc`] goes further: the block takes and returns the `[B, H, W, C]`
+/// [`Self::nhwc_in`] and [`Self::nhwc_out`] go further: the block takes and returns the `[B, H, W, C]`
 /// tensor itself rather than an NCHW view of it, which is what lets
 /// [`svod_tk::conv2d_nhwc`] bind the activation without a copy. A chain of such
 /// blocks never changes layout; a graph consumer at the end takes the NCHW view
@@ -72,17 +67,14 @@ pub struct YoloConv {
     pub act: bool,
     /// Store the output channels-last; see [`Self::channels_last`].
     pub channels_last: bool,
-    /// The input arrives channels-last; see [`Self::channels_last_input`].
-    pub channels_last_input: bool,
     /// Run [`svod_tk::conv2d_nhwc`]; see [`Self::tk`].
     pub tk: bool,
     /// The input is `[B, H, W, C]`; see [`Self::nhwc_in`].
     pub nhwc_in: bool,
     /// The output is `[B, H, W, C]`; see [`Self::nhwc_out`].
     pub nhwc_out: bool,
-    /// The `[cout, kh, kw, cin]` weight the tk kernel reads, filled at load for
-    /// a block that takes and returns `[B, H, W, C]`. Shares its buffer with
-    /// `conv.weight`.
+    /// The stored `[cout, kh, kw, cin]` weight a [`Self::tk`] block binds;
+    /// `conv.weight` is its view.
     pub weight_taps: Option<Tensor>,
     /// Cast the input to this dtype first; see [`Self::with_io_dtype`].
     pub in_dtype: Option<DType>,
@@ -108,7 +100,6 @@ impl YoloConv {
             bn: bn(out_ch),
             act,
             channels_last: false,
-            channels_last_input: false,
             tk: false,
             nhwc_in: false,
             nhwc_out: false,
@@ -178,22 +169,6 @@ impl YoloConv {
     pub fn channels_last(mut self) -> Self {
         self.channels_last = true;
         self
-    }
-
-    /// The input is stored channels-last, so the weight stays `cin`-major.
-    pub fn channels_last_input(mut self) -> Self {
-        self.channels_last_input = true;
-        self
-    }
-
-    /// Whether the weight is stored `[cout, kh, kw, cin]`: the layout the tk
-    /// kernel binds, and the one a conv reading NCHW activations wants from the
-    /// graph. A conv reading channels-last keeps the checkpoint's, which
-    /// measured faster there, and at f32 nothing moves.
-    fn taps_major(&self) -> bool {
-        (self.tk || !self.channels_last_input)
-            && tensor_core_dtype(&self.conv.weight.dtype())
-            && self.conv.weight.dims().is_ok_and(|d| d.len() == 4 && d[2] * d[3] > 1)
     }
 
     /// The tk kernel's operands, when this block can run it: a taps-major
@@ -297,8 +272,8 @@ impl YoloConv {
     }
 }
 
-/// The layouts serve the tensor core, which the half-width dtypes reach; an
-/// f32 model keeps the checkpoint's, which the scalar path reads faster.
+/// The activation layouts serve the tensor core, which the half-width dtypes
+/// reach; an f32 model keeps NCHW activations throughout.
 pub(crate) fn tensor_core_dtype(dtype: &DType) -> bool {
     *dtype == DType::Float16 || *dtype == DType::BFloat16
 }
@@ -312,16 +287,12 @@ impl Module for YoloConv {
     fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> svod_tensor::error::Result<()> {
         self.conv.load_state_dict(sd, &prefixed(prefix, "conv"))?;
         self.bn.load_state_dict(sd, &prefixed(prefix, "bn"))?;
-        if self.taps_major() {
-            let taps_major = self.conv.weight.try_permute(&[0, 2, 3, 1])?.contiguous();
-            taps_major.realize()?;
-            // The NCHW form is kept a view: realizing it would copy the bytes
-            // back cin-major, and the tk kernel binds the taps-major tensor.
-            self.conv.weight = taps_major.try_permute(&[0, 3, 1, 2])?;
-            self.weight_taps = self.tk.then_some(taps_major);
-        } else {
-            self.weight_taps = None;
-        }
+        let stored = self.conv.weight.try_permute(&[0, 2, 3, 1])?.contiguous();
+        stored.realize()?;
+        // The NCHW form stays a view: realizing it would copy the bytes back
+        // cin-major, and the tk kernel binds the stored tensor itself.
+        self.conv.weight = stored.try_permute(&[0, 3, 1, 2])?;
+        self.weight_taps = self.tk.then_some(stored);
         Ok(())
     }
 }

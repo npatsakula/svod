@@ -107,8 +107,7 @@ fn casting_weights_leaves_integer_buffers_alone() {
 }
 
 /// The f32 path must stay untouched: a dict that already matches comes back as
-/// the very same graph nodes, not as a pile of no-op CASTs, and nothing gets
-/// realized on the way through.
+/// the very same tensors, not as a pile of no-op CASTs.
 #[test]
 fn loading_weights_at_their_own_dtype_is_a_passthrough() {
     let mut sd = svod_tensor::nn::StateDict::new();

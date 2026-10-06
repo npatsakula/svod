@@ -39,8 +39,7 @@ impl YoloBottleneck {
     /// only `cv2`, a 3x3, and the block's output goes to the next block's 3x3
     /// or a 1x1. The residual add stays in `cv2`'s epilogue, ahead of the store.
     pub fn channels_last(mut self) -> Self {
-        self.cv1 = self.cv1.channels_last().channels_last_input();
-        self.cv2 = self.cv2.channels_last_input();
+        self.cv1 = self.cv1.channels_last();
         self.channels_last = true;
         self
     }
@@ -63,7 +62,7 @@ impl YoloBottleneck {
     }
 
     /// Take and return `[B, H, W, C]`, both convs on the tk kernel
-    /// ([`YoloConv::nhwc`]). The residual add rides `cv2`'s epilogue
+    /// ([`YoloConv::nhwc_in`], [`YoloConv::nhwc_out`]). The residual add rides `cv2`'s epilogue
     /// ([`YoloConv::forward_residual`]): the block's input already has the
     /// kernel's layout, so nothing reads the output back to add it.
     pub fn nhwc(mut self) -> Self {
