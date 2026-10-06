@@ -15,8 +15,10 @@
 //!
 //! The store is one line per entry (`key index ns`) in `$SVOD_TK_TUNE_DIR`
 //! (else `$XDG_CACHE_HOME/svod/tk_tune`, else `$HOME/.cache/svod/tk_tune`), one
-//! file per device and crate version. The line carries a fingerprint of the
-//! candidate kernels' graphs, so a kernel change re-measures; an unreadable or
+//! file per device, compiler, [`TUNE_SCHEMA`] and crate version. The line carries
+//! a fingerprint of the candidate kernels' graphs, so a kernel change re-measures;
+//! the file name covers what the graphs do not, so a new toolchain or a change
+//! below the builders never reads a line measured under the old one; an unreadable or
 //! unwritable store is a miss, never an error. Building those graphs is what a
 //! fingerprint costs, so it happens only on the way to the store: the
 //! process-wide memo in front of it is keyed by [`TuneKey`] alone, which every
@@ -38,14 +40,20 @@ use crate::launch::CompiledLaunch;
 /// Timed rounds over the candidates after the warm-up.
 pub(crate) const ROUNDS: usize = 3;
 
+/// The store's own version. Bump it with any change below the kernel builders
+/// that can change which candidate is fastest — the optimizer, the lowering, the
+/// backend — since a line's fingerprints cover the built graphs alone.
+pub const TUNE_SCHEMA: u32 = 1;
+
 fn digest(value: &impl Hash) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
 }
 
-/// What a measurement is keyed by: the device (arch and compute units), the
-/// kernel, its shape, and the candidate set it chooses among (`config`: a digest
+/// What a measurement is keyed by: the device (arch and compute units) and the
+/// compiler that builds for it, the kernel, its shape, and the candidate set it
+/// chooses among (`config`: a digest
 /// of the candidates' configs and of anything else the built graphs vary with
 /// that `shape` does not spell out, such as the operand dtype). Every field is
 /// cheap, so the memo answers without building a kernel; what the graphs
@@ -57,6 +65,8 @@ pub struct TuneKey {
     pub device: String,
     pub shape: Vec<usize>,
     pub config: u64,
+    /// A digest of the device's compiler identity: backend, toolchain, flags.
+    pub compiler: u64,
 }
 
 impl TuneKey {
@@ -64,11 +74,15 @@ impl TuneKey {
     /// among `config`.
     pub fn new(kernel: &'static str, spec: &DeviceSpec, arch: GpuArch, shape: &[usize], config: &impl Hash) -> Self {
         let units = crate::target::compute_units(spec).unwrap_or(0);
+        let compiler = svod_runtime::DEVICE_FACTORIES
+            .device(spec, svod_device::registry::registry())
+            .map_or(0, |device| digest(&device.compiler.cache_key()));
         Self {
             kernel,
             device: format!("{}-{units}cu", arch.target_name()),
             shape: shape.to_vec(),
             config: digest(config),
+            compiler,
         }
     }
 
@@ -112,7 +126,8 @@ impl TuneStore {
 
     fn path(&self, key: &TuneKey) -> Option<PathBuf> {
         let name: String = key.device.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-        self.root.as_ref().map(|root| root.join(format!("{name}-v{}.txt", env!("CARGO_PKG_VERSION"))))
+        let file = format!("{name}-s{TUNE_SCHEMA}-{:016x}-v{}.txt", key.compiler, env!("CARGO_PKG_VERSION"));
+        self.root.as_ref().map(|root| root.join(file))
     }
 
     /// Every `key line -> (index, ns)` the device's file holds; empty when unreadable.

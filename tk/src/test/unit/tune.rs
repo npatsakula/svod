@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use svod_dtype::{DType, DeviceSpec, GpuArch};
 use test_case::test_case;
 
-use crate::tune::{TuneKey, TuneStore};
+use crate::tune::{TUNE_SCHEMA, TuneKey, TuneStore};
 
 /// A key over `candidates` (the cheap identity of the candidate set the memo is
 /// keyed by) — `builds`, the candidate graphs' fingerprints, reaches the store
@@ -180,6 +180,31 @@ fn a_searched_value_the_caller_rejects_is_searched_again() {
 
     let third = TuneStore::at(Some(dir.clone()));
     assert_eq!(third.searched(&k, builds(&[1], &seen), |_| true, || panic!("the new line is read")), Some(9));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Another toolchain reads none of the old lines: the compiler names the file,
+/// so the same request measures again beside it.
+#[test]
+fn another_toolchain_reads_none_of_the_old_lines() {
+    let dir = scratch("toolchain");
+    let k = key("gemm_nt", &[64, 64, 192], &[1, 2]);
+    let seen = std::cell::Cell::new(false);
+    let store = TuneStore::at(Some(dir.clone()));
+    assert_eq!(store.select_with(&k, 2, builds(&[1, 2], &seen), || vec![Some(2), Some(1)]), Some(1));
+
+    let other = TuneKey { compiler: k.compiler ^ 1, ..k.clone() };
+    let fresh = TuneStore::at(Some(dir.clone()));
+    let mut measured = false;
+    let chosen = fresh.select_with(&other, 2, builds(&[1, 2], &seen), || {
+        measured = true;
+        vec![Some(1), Some(2)]
+    });
+    assert_eq!((chosen, measured), (Some(0), true), "another toolchain measures again");
+    let files: Vec<String> =
+        std::fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert!(files.iter().all(|name| name.contains(&format!("-s{TUNE_SCHEMA}-"))), "{files:?}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
