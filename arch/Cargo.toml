@@ -11,8 +11,8 @@ description = "Host-side speech decoding for Svod: CTC and RNN-T decoders, VAD-d
 [dependencies]
 serde = { version = "1.0", features = ["derive"], optional = true }
 snafu = "0.9"
-svod-ir = { path = "../ir", version = "=0.1.0" }
-svod-runtime = { path = "../runtime", version = "=0.1.0" }
+svod-ir = { path = "../ir", version = "=0.1.1" }
+svod-runtime = { path = "../runtime", version = "=0.1.1" }
 
 [dev-dependencies]
 proptest = "1.9"

@@ -10,10 +10,10 @@ description = "Optimization passes and pattern engine for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-svod-ir = { path = "../ir", version = "=0.1.0" }
-svod-dtype = { path = "../dtype", version = "=0.1.0" }
-svod-device = { path = "../device", version = "=0.1.0" }
-svod-macros = { path = "../macros", version = "=0.1.0" }
+svod-ir = { path = "../ir", version = "=0.1.1" }
+svod-dtype = { path = "../dtype", version = "=0.1.1" }
+svod-device = { path = "../device", version = "=0.1.1" }
+svod-macros = { path = "../macros", version = "=0.1.1" }
 smallvec = { workspace = true, features = ["union"] }
 sled = "0.34"
 dirs = "7"
@@ -39,7 +39,7 @@ proptest = ["svod-ir/proptest"]
 
 [dev-dependencies]
 proptest = "1.9.0"
-svod-ir = { path = "../ir", version = "=0.1.0", features = [
+svod-ir = { path = "../ir", version = "=0.1.1", features = [
   "proptest",
 ] }
 test-case = "3.3.1"
