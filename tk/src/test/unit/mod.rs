@@ -78,3 +78,93 @@ pub(crate) fn rel_err(got: &[f32], want: &[f32]) -> f32 {
     let scale = want.iter().filter(|w| w.is_finite()).fold(0f32, |a, w| a.max(w.abs())).max(f32::MIN_POSITIVE);
     max_abs_err(got, want) / scale
 }
+
+/// The instructions a tk kernel compiles to on `arch`, in program order: the
+/// optimizer and the target-graph lowering `launch_custom` runs, with no device.
+pub(crate) fn lowered_program(
+    sink: std::sync::Arc<svod_ir::UOp>,
+    arch: svod_dtype::GpuArch,
+) -> Vec<std::sync::Arc<svod_ir::UOp>> {
+    use svod_codegen::traits::Renderer;
+    use svod_dtype::GpuArch;
+
+    let optimizer = match arch {
+        GpuArch::Cuda(cuda) => svod_schedule::OptimizerRenderer::for_cuda_arch(cuda).with_rewrite_capabilities(
+            svod_ir::RendererOps::all(),
+            svod_codegen::llvm::LlvmTextRenderer::nvptx(cuda).decompositor(),
+            Some(svod_codegen::llvm::nvptx_extra_matcher()),
+        ),
+        GpuArch::Amd(amd) => svod_schedule::OptimizerRenderer::for_amd_arch(amd).with_rewrite_capabilities(
+            svod_ir::RendererOps::all(),
+            svod_codegen::llvm::LlvmTextRenderer::amd(amd).decompositor(),
+            Some(svod_codegen::llvm::amd_extra_matcher()),
+        ),
+        other => panic!("no host lowering for {other:?}"),
+    };
+    let optimized =
+        svod_schedule::optimize_kernel_with_config(sink, &optimizer, &svod_schedule::OptimizerConfig::default())
+            .expect("optimize");
+    let program = svod_codegen::program_pipeline::program_from_sink(optimized, svod_dtype::DeviceSpec::Cpu)
+        .expect("final target graph");
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+    let linear = linearized.toposort().into_iter().find(|u| matches!(u.op(), svod_ir::Op::Linear(..))).expect("LINEAR");
+    let svod_ir::Op::Linear(svod_ir::ops::Linear { ops }) = linear.op() else { unreachable!() };
+    ops.to_vec()
+}
+
+/// The accumulator reads in `program` that sit outside a loop their WMMA runs
+/// in. Such a read sees the tile as it stood before that loop, so the loop's
+/// steps overwrite the sum instead of adding to it. Empty for a sound kernel.
+pub(crate) fn escaped_accumulator_reads(program: &[std::sync::Arc<svod_ir::UOp>]) -> Vec<String> {
+    use std::collections::HashMap;
+    use svod_ir::{AddrSpace, Op, ops};
+
+    // The loops open at each instruction, by id.
+    let mut open: Vec<u64> = Vec::new();
+    let mut scope: HashMap<u64, Vec<u64>> = HashMap::new();
+    for op in program {
+        if let Op::End(ops::End { ranges, .. }) = op.op() {
+            open.retain(|id| ranges.iter().all(|range| range.id != *id));
+        }
+        scope.insert(op.id, open.clone());
+        if matches!(op.op(), Op::Range(..)) {
+            open.push(op.id);
+        }
+    }
+    let reads_a_register = |load: &svod_ir::UOp| {
+        let Op::Load(ops::Load { index, .. }) = load.op() else { return false };
+        let mut buffer = index.clone();
+        loop {
+            buffer = match buffer.op() {
+                Op::Index(ops::Index { buffer, .. }) => buffer.clone(),
+                Op::Shrink(ops::Shrink { src, .. }) | Op::Cast(ops::Cast { src, .. }) => src.clone(),
+                Op::After(ops::After { passthrough, .. }) => passthrough.clone(),
+                _ => return buffer.addrspace() == Some(AddrSpace::Reg),
+            };
+        }
+    };
+
+    let mut escaped = Vec::new();
+    for wmma in program {
+        let Op::Wmma(ops::Wmma { c, .. }) = wmma.op() else { continue };
+        let loops = &scope[&wmma.id];
+        // The fragment's lane reads: walk the accumulator operand up to the loads,
+        // never past another WMMA or a store into an earlier step's chain.
+        let mut stack = vec![c.clone()];
+        while let Some(node) = stack.pop() {
+            if reads_a_register(&node) {
+                let at = scope.get(&node.id).map_or(&[][..], Vec::as_slice);
+                let outside: Vec<u64> = loops.iter().filter(|id| !at.contains(id)).copied().collect();
+                if !outside.is_empty() {
+                    escaped.push(format!(
+                        "load {} reads the accumulator outside loops {outside:?} of wmma {}",
+                        node.id, wmma.id
+                    ));
+                }
+            } else if !matches!(node.op(), Op::Wmma(..) | Op::Store(..) | Op::Range(..) | Op::End(..)) {
+                stack.extend(node.op().sources());
+            }
+        }
+    }
+    escaped
+}

@@ -86,9 +86,9 @@ fn fa_sink() -> Arc<UOp> {
 // doubles: no gather loops, constant register indices), and the register-staged
 // K/V commit became one fenced store node handed to the gathers' WAR fence (the
 // FA graphs lose the per-commit `After`s and their fences).
-const MATMUL_DIGEST: u128 = 0xbd81_3d05_5b61_250e_0000_0000_0000_0000;
+const MATMUL_DIGEST: u128 = 0x46f1_2eba_2d20_2f85_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 1208;
-const FA_DIGEST: u128 = 0x85de_2edf_a698_58df_0000_0000_0000_0000;
+const FA_DIGEST: u128 = 0xcc62_ca0c_cd87_072f_0000_0000_0000_0000;
 const FA_NODES: usize = 808;
 // The FA digests moved again for the packed-row segment mask: the running max
 // starts at the finite f32 floor instead of `-∞` (one constant node per graph).
@@ -98,13 +98,13 @@ const FA_NODES: usize = 808;
 // Before #177 the FA digests moved when the Q tile lost its f32 staging copy: the
 // gather lands the 16-bit operand dtype straight in registers (the softmax scale
 // already rides on the f32 `QKᵀ` accumulator), so each variant drops those 16 nodes.
-const FA_NONCAUSAL_DIGEST: u128 = 0x6475_0068_12c9_1094_0000_0000_0000_0000;
+const FA_NONCAUSAL_DIGEST: u128 = 0x2ef6_f110_3b75_10d9_0000_0000_0000_0000;
 const FA_NONCAUSAL_NODES: usize = 782;
-const FA_MASKED_DIGEST: u128 = 0x80ff_e175_34fa_12b5_0000_0000_0000_0000;
+const FA_MASKED_DIGEST: u128 = 0xd0c5_244b_c74b_6a0c_0000_0000_0000_0000;
 const FA_MASKED_NODES: usize = 806;
 // Causal + segment-masked (packed rows): the `seg_start:Some` branch, a per-row
 // table read inside the score mask.
-const FA_SEGMENTED_DIGEST: u128 = 0x332c_6e0e_d894_ad5a_0000_0000_0000_0000;
+const FA_SEGMENTED_DIGEST: u128 = 0xe7bf_c1ef_e0ab_810c_0000_0000_0000_0000;
 const FA_SEGMENTED_NODES: usize = 836;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {

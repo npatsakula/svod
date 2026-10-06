@@ -335,6 +335,28 @@ fn every_table_tile_matches_linear_gpu(index: usize) {
     assert!(err < BF16_REL_TOL, "tile {index}: relative error {err} exceeds the bf16 tolerance {BF16_REL_TOL}");
 }
 
+/// A single-fragment tile against `Tensor::linear`: without its accumulator held
+/// in the K loop, each of the 36 K steps overwrote the sum, and the output was the
+/// last step's product (relative error near 1). The tile is built for whichever
+/// device runs the test.
+#[test_case(single_fragment(2); "staged")]
+#[test_case(single_fragment(1); "single-buffered")]
+#[test_case(GemmCfg { warps_m: 1, acc_m: 2, ..single_fragment(2) }; "two accumulators")]
+#[ignore]
+fn a_single_fragment_tile_matches_linear_gpu(cfg: GemmCfg) {
+    if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
+        eprintln!("skip a_single_fragment_tile_matches_linear_gpu: no supported device / toolchain");
+        return;
+    }
+    let (m, k, n) = (64usize, 576usize, 64usize);
+    let (x, w) = (operand(m, k, DType::BFloat16, 0.31), operand(n, k, DType::BFloat16, 0.17));
+    let y = gemm_nt_with(&x, &w, move |_, _, _| Some(cfg)).expect("gemm_nt build").expect("the tile applies");
+    let want = to_f32_vec(&x.linear().weight(&w).call().expect("reference linear"));
+    let err = rel_err(&to_f32_vec(&y), &want);
+    println!("single-fragment {cfg:?}: relative error {err:e}");
+    assert!(err < BF16_REL_TOL, "{cfg:?}: relative error {err} exceeds the bf16 tolerance {BF16_REL_TOL}");
+}
+
 /// A `[B, L, K]` activation is `B·L` rows: the output is `[B, L, N]` and equals
 /// the rank-2 kernel on the flattened rows.
 #[test]
@@ -611,6 +633,55 @@ fn staged_gemm_rdna4_fences_the_commit() {
 
     let fences = code.lines().filter(|l| l.contains("@llvm.amdgcn.sched.barrier(i32 0)") && !l.contains("declare"));
     assert_eq!(fences.count(), 1, "one commit fence per trip:\n{code}");
+}
+
+// ── The accumulator stays in the K loop (GPU-free) ───────────────────────────
+
+/// A 32×32 tile over 2×2 waves with one accumulator and a 16-deep strip: each
+/// wave's accumulator is one 16×16 fragment, so `Group::mma`'s height, width and
+/// K ranges are all trip-1.
+fn single_fragment(stages: usize) -> GemmCfg {
+    GemmCfg {
+        block_m: 32,
+        block_n: 32,
+        warps_m: 2,
+        warps_n: 2,
+        acc_m: 1,
+        k_step: 16,
+        stages,
+        b_order: crate::kernels::gemm::BOrder::Nk,
+        l2_swizzle: false,
+        vec_load: false,
+        split_k: 1,
+    }
+}
+
+/// Every K step's WMMA reads the accumulator the step before wrote. On a
+/// single-fragment tile the looped `mma`'s ranges are all trip-1, and a read held
+/// in the loop only by its own K range loses it when symbolic folds them: the read
+/// hoists above the K loop and every step adds onto the zeroed tile.
+#[test_case(SM86, single_fragment(2); "sm86 staged")]
+#[test_case(SM86, single_fragment(1); "sm86 single-buffered")]
+#[test_case(SM86, GemmCfg { warps_m: 1, acc_m: 2, ..single_fragment(2) }; "sm86 two accumulators")]
+#[test_case(RDNA4, single_fragment(2); "rdna4 staged")]
+#[test_case(SM86, GemmCfg { k_step: 32, ..single_fragment(2) }; "sm86 two K fragments")]
+fn a_single_fragment_gemm_keeps_its_accumulator_in_the_k_loop(arch: GpuArch, cfg: GemmCfg) {
+    use std::sync::Arc;
+
+    use svod_ir::{Op, UOp};
+
+    let (m, k, n) = (64usize, 576usize, 64usize);
+    let caps = crate::ArchCaps::for_arch(arch);
+    let buffers: Vec<Arc<UOp>> = [m * n, m * k, n * k]
+        .into_iter()
+        .map(|size| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, DType::BFloat16))
+        .collect();
+    let ker = crate::Kernel::new("gemm_nt", cfg.grid_dims(m, n), cfg.threads(caps.wave_size), buffers, caps);
+    crate::kernels::gemm::build_gemm_nt(&ker, (m, k, n), cfg, DType::BFloat16, DType::BFloat16, Epilogue::Plain);
+    let program = super::lowered_program(ker.finish(cfg.acc_m), arch);
+    assert!(program.iter().any(|op| matches!(op.op(), Op::Wmma(..))), "the tile runs on the matrix core");
+    let escaped = super::escaped_accumulator_reads(&program);
+    assert!(escaped.is_empty(), "{escaped:#?}");
 }
 
 // ── The activation's width (GPU-free) ────────────────────────────────────────
