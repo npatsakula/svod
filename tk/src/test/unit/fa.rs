@@ -554,7 +554,7 @@ fn test_fa_noncausal_f16_amd() {
     let expected = reference.as_vec::<f32>().expect("read reference");
 
     assert_eq!(got.len(), expected.len(), "length mismatch");
-    let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+    let max_abs = super::max_abs_err(&got, &expected);
     println!("fa[noncausal,f16] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
     assert!(max_abs <= 2e-2, "non-causal f16 FA exceeds tol (max abs {max_abs:e})");
 }
@@ -616,7 +616,7 @@ fn test_fa_noncausal_f16_masked_amd() {
     let expected = reference.as_vec::<f32>().expect("read reference");
 
     assert_eq!(got.len(), expected.len(), "length mismatch");
-    let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+    let max_abs = super::max_abs_err(&got, &expected);
     println!("fa[noncausal,f16,masked lens={valid}] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
     assert!(max_abs <= 2e-2, "non-causal masked f16 FA exceeds tol (max abs {max_abs:e})");
 }

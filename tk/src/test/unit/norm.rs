@@ -12,7 +12,7 @@ use test_case::test_case;
 
 use crate::kernels::norm::{NORM_SUPPORTED_ARCHS, add_rms_norm, rms_norm, select_norm_cfg};
 
-use super::device_supported;
+use super::{device_supported, rel_err};
 
 /// The wave width the tables below are written against (CUDA / RDNA).
 const W32: usize = 32;
@@ -78,13 +78,6 @@ fn operand(shape: &[usize], dtype: DType, seed: f32) -> Tensor {
     let t = Tensor::from_slice(v).try_reshape(dims).expect("reshape").cast(dtype).contiguous();
     t.realize().expect("realize operand");
     t
-}
-
-/// Largest elementwise difference relative to the reference's own magnitude.
-fn rel_err(got: &[f32], want: &[f32]) -> f32 {
-    assert_eq!(got.len(), want.len(), "length mismatch");
-    let scale = want.iter().fold(0f32, |a, b| a.max(b.abs())).max(f32::MIN_POSITIVE);
-    got.iter().zip(want).fold(0f32, |a, (g, w)| a.max((g - w).abs())) / scale
 }
 
 /// The kernel and the graph run the same ops in the same dtypes; only the row

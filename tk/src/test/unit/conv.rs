@@ -7,7 +7,7 @@ use svod_ir::UOp;
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use super::device_supported;
+use super::{device_supported, rel_err};
 use crate::kernels::conv::{
     CONV_SUPPORTED_ARCHS, ConvGeom, ConvPlan, build_conv, conv_candidates, conv_tile_seeds, conv2d_nhwc,
     conv2d_nhwc_worth_asking, declines, select_conv_cfg,
@@ -131,11 +131,6 @@ fn operand(shape: &[usize], dtype: DType, seed: f32) -> Tensor {
         .contiguous();
     t.realize().expect("realize operand");
     t
-}
-
-fn rel_err(got: &[f32], want: &[f32]) -> f32 {
-    let scale = want.iter().fold(0f32, |a, b| a.max(b.abs())).max(f32::MIN_POSITIVE);
-    got.iter().zip(want).fold(0f32, |a, (g, w)| a.max((g - w).abs())) / scale
 }
 
 /// The graph's `conv2d` over the same channels-last operands (read through

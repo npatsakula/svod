@@ -354,7 +354,7 @@ fn sq_attention_broadcast_cache_matches_a_replicated_one() {
         let shared = run(&shared_k, &shared_v);
         let replicated = run(&wide_k, &wide_v);
         assert_eq!(shared.len(), replicated.len());
-        let max_abs = shared.iter().zip(&replicated).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+        let max_abs = super::max_abs_err(&shared, &replicated);
         assert_eq!(max_abs, 0.0, "split {split}: broadcast diverged from the replicated cache by {max_abs}");
     }
 }
@@ -400,7 +400,7 @@ fn sq_attention_f16_cache_matches_f32_within_quantization() {
         let reference = run(&k_ref, &v_ref);
         let narrowed = run(&k16, &v16);
         assert_eq!(reference.len(), narrowed.len());
-        let max_abs = narrowed.iter().zip(&reference).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+        let max_abs = super::max_abs_err(&narrowed, &reference);
         assert!(max_abs < 5e-3, "split {split}: f16 cache diverged from f32 by {max_abs:e}");
     }
 }
@@ -465,7 +465,7 @@ fn sq_attention_cache_map_reads_the_row_it_names() {
 
         let a = mapped.as_vec::<f32>().expect("mapped vec");
         let e = replicated.as_vec::<f32>().expect("replicated vec");
-        let max_abs = a.iter().zip(&e).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let max_abs = super::max_abs_err(&a, &e);
         assert_eq!(max_abs, 0.0, "split {split}: mapped cache diverged from the replicated one by {max_abs}");
     }
 }
@@ -507,7 +507,7 @@ fn sq_attention_numerical_gpu() {
             got.realize().expect("realize output");
             let got = got.as_vec::<f32>().expect("output vec");
             let expected = cpu_reference(&qv, &kv, &vv, (b, n, h, h_total, d), head_offset, lens.as_deref(), None);
-            let max_abs = got.iter().zip(&expected).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+            let max_abs = super::max_abs_err(&got, &expected);
             assert!(max_abs < 2e-4, "split {split} max abs error {max_abs}");
         }
     }
@@ -541,7 +541,7 @@ fn sq_attention_numerical_gpu() {
     .expect("production supported");
     got.realize().expect("realize production output");
     let got = got.as_vec::<f32>().expect("production output vec");
-    let max_abs = got.iter().zip(&expected).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+    let max_abs = super::max_abs_err(&got, &expected);
     assert!(max_abs < 2e-4, "production split 10 max abs error {max_abs}");
 }
 
@@ -605,7 +605,7 @@ fn sq_attention_appended_key_matches_the_cpu_reference() {
             Some((&wide_ak, &wide_av)),
         );
         let got = got.as_vec::<f32>().expect("output vec");
-        let max_abs = got.iter().zip(&expected).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+        let max_abs = super::max_abs_err(&got, &expected);
         assert!(max_abs < tolerance, "{dtype:?}: appended key diverged from the reference by {max_abs:e}");
     }
 }
@@ -672,7 +672,7 @@ fn sq_attention_appended_key_matches_a_spliced_cache() {
         Tensor::realize_batch([&appended, &spliced]).expect("realize both");
 
         let (a, e) = (appended.as_vec::<f32>().expect("appended vec"), spliced.as_vec::<f32>().expect("spliced vec"));
-        let max_abs = a.iter().zip(&e).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let max_abs = super::max_abs_err(&a, &e);
         assert!(max_abs < 1e-6, "n {n}: the appended key diverged from the spliced cache by {max_abs:e}");
     }
 }
@@ -764,7 +764,7 @@ fn sq_policy_split_matches_a_single_split() {
     };
     crate::tune::set_enabled(false);
     let (whole, policy) = (run(Some(1)), run(None));
-    let max_abs = whole.iter().zip(&policy).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+    let max_abs = super::max_abs_err(&whole, &policy);
     assert!(max_abs < 1e-4, "policy split max abs error {max_abs}");
 }
 

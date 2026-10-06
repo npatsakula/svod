@@ -9,6 +9,7 @@ use svod_ir::{Op, UOp};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
+use super::max_abs_err;
 use crate::kernels::gemm::*;
 use crate::tiles::{RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_IN, TileLayout};
 use crate::{Kernel, MoveIdx};
@@ -446,11 +447,6 @@ fn matmul_reference(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> Vec<f32
     let reference = a.cast(DType::Float32).matmul(&b.cast(DType::Float32)).expect("ref matmul");
     reference.realize().expect("realize reference");
     reference.as_vec::<f32>().expect("read reference")
-}
-
-fn max_abs_err(got: &[f32], expected: &[f32]) -> f32 {
-    assert_eq!(got.len(), expected.len(), "length mismatch");
-    got.iter().zip(expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max)
 }
 
 /// The wave32 AMD matmul (gfx11 and gfx12 alike) computes exactly `A·B` — not a
@@ -977,7 +973,7 @@ fn matmul_core_contract() {
         let cpu = cpu.as_vec::<f32>().expect("read reference");
         let mine: Vec<f32> =
             (0..n * n).map(|p| (0..n).map(|k| a_data[(p / n) * n + k] * b_data[k * n + p % n]).sum()).collect();
-        let err = cpu.iter().zip(&mine).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let err = max_abs_err(&cpu, &mine);
         assert!(err < 1e-3, "the test's own reference disagrees with tensor matmul (max {err:e})");
     }
     let got = launch_matmul("matmul_contract", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);

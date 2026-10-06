@@ -137,7 +137,7 @@ fn test_knn_score_amd() {
 
         let (atol, rtol) = (0.02 * (d as f32).sqrt(), 2e-2);
         let r = allclose_f32(&got, &exp, atol, rtol);
-        let max_abs = got.iter().zip(&exp).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+        let max_abs = super::max_abs_err(&got, &exp);
         println!("knn_score corpus={corpus} query={query} d={d}: max abs error = {max_abs:e} on {arch:?}");
         assert!(r.ok, "knn_score corpus={corpus} query={query} d={d} on {arch:?}: {}", r.message);
     }
@@ -522,7 +522,7 @@ fn test_knn_amd() {
             assert!(q0.contains(&0), "tie: query 0 must keep the smaller corpus index 0, got {q0:?}");
             assert!(!q0.contains(&1), "tie: query 0 must NOT keep the duplicate index 1, got {q0:?}");
         }
-        let max_dist_err = got_dist.iter().zip(&rdist).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+        let max_dist_err = super::max_abs_err(&got_dist, &rdist);
         assert!(ok, "knn n={n} m={m} d={d} k={k} tie={tie} on {arch:?}");
         println!("knn n={n} m={m} d={d} k={k} tie={tie}: OK on {arch:?}, max dist err = {max_dist_err:e}");
     }

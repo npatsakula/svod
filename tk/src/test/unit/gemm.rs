@@ -16,7 +16,7 @@ use crate::kernels::gemm::{
     swiglu_pair_width,
 };
 
-use super::device_supported;
+use super::{device_supported, rel_err};
 
 /// Every tile the CUDA [`GemmPolicy`] can return. A shape is servable exactly
 /// when one of these tiles it, so the predicate tests are written against the
@@ -264,13 +264,6 @@ fn operand(rows: usize, cols: usize, dtype: DType, seed: f32) -> Tensor {
         .contiguous();
     t.realize().expect("realize operand");
     t
-}
-
-/// Largest elementwise difference **relative to the reference's own magnitude** —
-/// the scale a bf16 output's rounding is measured against.
-fn rel_err(got: &[f32], want: &[f32]) -> f32 {
-    let scale = want.iter().fold(0f32, |a, b| a.max(b.abs())).max(f32::MIN_POSITIVE);
-    got.iter().zip(want).fold(0f32, |a, (g, w)| a.max((g - w).abs())) / scale
 }
 
 /// Both `gemm_nt` and the generic `linear` accumulate in f32 and round the result

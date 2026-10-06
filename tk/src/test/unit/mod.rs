@@ -64,3 +64,17 @@ pub(crate) fn device_supported(archs: crate::ArchSet) -> bool {
     let spec = svod_tensor::Tensor::empty(&[1], svod_dtype::DType::Float32).device();
     crate::target::check_target(&spec, archs).is_ok()
 }
+
+/// The largest `|got - want|`, infinite where the two disagree on finiteness
+/// (`allclose_f32`'s rule). A plain `f32::max` fold drops a NaN operand, so a NaN
+/// output would pass any tolerance.
+pub(crate) fn max_abs_err(got: &[f32], want: &[f32]) -> f32 {
+    svod_tensor::testing::allclose_f32(got, want, 0.0, 0.0).max_abs_err
+}
+
+/// [`max_abs_err`] relative to the reference's largest finite magnitude, the
+/// scale a narrow output's rounding is measured against.
+pub(crate) fn rel_err(got: &[f32], want: &[f32]) -> f32 {
+    let scale = want.iter().filter(|w| w.is_finite()).fold(0f32, |a, w| a.max(w.abs())).max(f32::MIN_POSITIVE);
+    max_abs_err(got, want) / scale
+}
