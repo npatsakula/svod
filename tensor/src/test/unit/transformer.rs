@@ -617,4 +617,14 @@ crate::codegen_tests! {
         result.realize_with(&config).unwrap();
         assert_eq!(result.as_vec::<f32>().unwrap(), vec![200.0, 5.0, 255.0, 128.0]);
     }
+
+    fn test_embedding_u8_ids_never_wrap_onto_a_row(config) {
+        // A vocab past u8's range: comparing a u8 id against positions cast to u8
+        // would match id 5 at row 5 and again at row 261.
+        let weight = Tensor::from_ndarray(&Array2::from_shape_fn((300, 1), |(row, _)| row as f32));
+        let ids = Tensor::from_slice([5u8, 255, 44, 0]);
+        let result = weight.embedding(&ids).unwrap();
+        result.realize_with(&config).unwrap();
+        assert_eq!(result.as_vec::<f32>().unwrap(), vec![5.0, 255.0, 44.0, 0.0]);
+    }
 }

@@ -451,3 +451,94 @@ crate::codegen_tests! {
         assert_eq!(out.as_vec::<f32>().unwrap(), expected, "indices {values:?}");
     }
 }
+
+/// The lookups whose arange the gated-load collapse can turn into a direct read.
+#[derive(Clone, Copy, Debug)]
+enum Lookup {
+    Gather,
+    Embedding,
+    /// `x.where_(idx == arange(n).cast(dtype), 0).sum(-1)` written by hand.
+    WidenedMask,
+}
+
+impl Lookup {
+    fn build(self, vocab: usize, ids: &Tensor) -> Tensor {
+        match self {
+            Self::Gather => Tensor::empty(&[vocab], DType::Float32).gather(0, ids).unwrap(),
+            Self::Embedding => Tensor::empty(&[vocab, 8], DType::Float32).embedding(ids).unwrap(),
+            Self::WidenedMask => {
+                let positions = Tensor::arange(0, Some(vocab as i64), None).unwrap().cast(ids.uop().dtype());
+                let mask = ids.try_unsqueeze(-1).unwrap().try_eq(&positions).unwrap();
+                Tensor::empty(&[1, vocab], DType::Float32).where_(&mask, 0.0f32).unwrap().sum(-1isize).unwrap()
+            }
+        }
+    }
+}
+
+/// Reduces left in the kernels `t` schedules into, once each kernel's gated-load
+/// collapse has run.
+fn reduces_left(t: &Tensor) -> usize {
+    let sink = svod_ir::UOp::sink(vec![t.uop().contiguous()]);
+    let rangeified = svod_schedule::rangeify_with_map(sink).expect("rangeify");
+    let (kernels, _) = svod_schedule::try_get_kernel_graph(rangeified.sink).expect("kernel graph");
+    crate::schedule::create_pre_schedule(kernels)
+        .expect("pre-schedule")
+        .items
+        .iter()
+        .map(|item| {
+            let ast = svod_schedule::optimizer::apply_pre_optimization(item.ast.clone()).expect("pre-optimization");
+            ast.toposort().iter().filter(|node| matches!(node.op(), svod_ir::Op::Reduce(..))).count()
+        })
+        .sum()
+}
+
+/// A lookup collapses into a direct read whenever its arange compares in a dtype
+/// the index provably fits. A hand-built mask that widens an Int32 arange to an
+/// i64 index keeps its reduce: reading the index at 32 bits would fold `2^32 + k`
+/// onto position `k`.
+#[test_case::test_case(Lookup::Gather, DType::Int32, 0; "gather, i32")]
+#[test_case::test_case(Lookup::Gather, DType::Int64, 0; "gather, i64")]
+#[test_case::test_case(Lookup::Embedding, DType::Int32, 0; "embedding, i32")]
+#[test_case::test_case(Lookup::Embedding, DType::Int64, 0; "embedding, i64")]
+#[test_case::test_case(Lookup::Embedding, DType::UInt8, 0; "embedding, u8 against a wider vocab")]
+#[test_case::test_case(Lookup::WidenedMask, DType::Int32, 0; "a mask against i32")]
+#[test_case::test_case(Lookup::WidenedMask, DType::Int64, 1; "a mask widened to i64")]
+fn a_lookup_collapses_only_where_the_index_fits(lookup: Lookup, dtype: DType, reduces: usize) {
+    let lookup_tensor = lookup.build(300, &Tensor::empty(&[4], dtype));
+    assert_eq!(reduces_left(&lookup_tensor), reduces);
+}
+
+/// Indices around the arange, past 32 bits on either side, and at the extremes.
+fn wide_index() -> impl proptest::strategy::Strategy<Value = i64> {
+    use proptest::prelude::*;
+    prop_oneof![
+        -3i64..8,
+        (any::<i32>().prop_filter("past 32 bits", |high| *high != 0), 0i64..8)
+            .prop_map(|(high, low)| (i64::from(high) << 32) | low),
+        Just(i64::MIN),
+        Just(i64::MAX),
+        any::<i64>(),
+    ]
+}
+
+crate::codegen_tests! {
+    #[proptest_config(proptest::test_runner::Config::with_cases(24))]
+    fn test_lookups_match_a_reference(config, ids in proptest::collection::vec(wide_index(), 1..8)) {
+        let x = [10.0f32, 20.0, 30.0, 40.0, 50.0];
+        let expected: Vec<f32> =
+            ids.iter().map(|&id| usize::try_from(id).ok().and_then(|at| x.get(at)).copied().unwrap_or(0.0)).collect();
+        let index = Tensor::from_slice(&ids);
+        let table = Tensor::from_slice(x);
+        let positions = Tensor::arange(0, Some(x.len() as i64), None).unwrap().cast(DType::Int64);
+        let mask = index.try_unsqueeze(-1).unwrap().try_eq(&positions).unwrap();
+        let lookups = [
+            table.gather(0, &index).unwrap(),
+            table.try_unsqueeze(-1).unwrap().embedding(&index).unwrap().try_reshape([-1isize]).unwrap(),
+            table.try_unsqueeze(0).unwrap().where_(&mask, 0.0f32).unwrap().sum(-1isize).unwrap(),
+        ];
+        for (name, lookup) in ["gather", "embedding", "mask"].into_iter().zip(lookups) {
+            lookup.realize_with(&config).unwrap();
+            proptest::prop_assert_eq!(lookup.as_vec::<f32>().unwrap(), expected.clone(), "{} of {:?}", name, ids);
+        }
+    }
+}
