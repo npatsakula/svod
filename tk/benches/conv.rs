@@ -111,17 +111,15 @@ fn bench_conv2d_nhwc(c: &mut Criterion) {
 
         // Reference: the optimizer's own conv as the model runs it — the folded
         // bias and SiLU held at f32 and rounded once at the store — over the
-        // layout the model holds this shape in. Inside a chain the activation is
-        // channels-last (an NCHW view of `[B, H, W, C]` storage) and the weight
-        // the checkpoint's; elsewhere the activation is NCHW and the weight
-        // taps-major, as `YoloConv` stores it for a conv reading NCHW. A bare
-        // NCHW conv is 1.5x too flattering to the graph on `96-96-s1-80`.
-        let (xn, wn) = if chain {
-            let x = randn(&[1, side, side, cin], dtype.clone()).try_permute(&[0, 3, 1, 2]).expect("channels-last view");
-            (x, randn(&[cout, cin, kh, kw], dtype.clone()))
+        // layouts the model holds: the weight stored `[cout, kh, kw, cin]` behind
+        // its NCHW view, as every `YoloConv` stores it, and the activation
+        // channels-last inside a chain (an NCHW view of `[B, H, W, C]` storage),
+        // NCHW elsewhere.
+        let wn = randn(&[cout, kh, kw, cin], dtype.clone()).try_permute(&[0, 3, 1, 2]).expect("taps-major view");
+        let xn = if chain {
+            randn(&[1, side, side, cin], dtype.clone()).try_permute(&[0, 3, 1, 2]).expect("channels-last view")
         } else {
-            let w = randn(&[cout, kh, kw, cin], dtype.clone()).try_permute(&[0, 3, 1, 2]).expect("taps-major view");
-            (randn(&[1, cin, side, side], dtype.clone()), w)
+            randn(&[1, cin, side, side], dtype.clone())
         };
         let bn = randn(&[cout], dtype.clone());
         let reference = xn
