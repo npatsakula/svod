@@ -161,16 +161,13 @@ pub enum ConvPlan {
     /// The image-staged form: one patch per channel strip, every tap read out of
     /// it ([`build_conv_patch`]).
     Patch(PatchCfg),
-    /// The gathered strip with the taps unrolled, so a `cp.async` address is a
-    /// build-time delta on one decoded pixel ([`build_conv_tapwise`]).
-    Tapwise(GemmCfg),
 }
 
 impl ConvPlan {
     /// The block geometry either form computes on.
     pub fn cfg(&self) -> GemmCfg {
         match self {
-            Self::Gathered(cfg) | Self::Tapwise(cfg) => *cfg,
+            Self::Gathered(cfg) => *cfg,
             Self::Patch(pc) => pc.cfg,
         }
     }
@@ -178,7 +175,7 @@ impl ConvPlan {
     /// the gathered form, output *windows* for the patch.
     pub fn grid_dims(&self, geom: &ConvGeom) -> [i64; 3] {
         match self {
-            Self::Gathered(cfg) | Self::Tapwise(cfg) => geom.grid_dims(cfg),
+            Self::Gathered(cfg) => geom.grid_dims(cfg),
             Self::Patch(pc) => {
                 let (ty, tx) = pc.tiles(geom);
                 [(geom.cout / pc.cfg.block_n) as i64, (geom.batch * ty * tx) as i64, 1]
@@ -188,7 +185,6 @@ impl ConvPlan {
     pub fn build(&self, ker: &Kernel, geom: ConvGeom, dt: DType, epi: Epilogue<()>) {
         match self {
             Self::Gathered(cfg) => build_conv(ker, geom, *cfg, dt, epi),
-            Self::Tapwise(cfg) => build_conv_tapwise(ker, geom, *cfg, dt, epi),
             Self::Patch(pc) => build_conv_patch(ker, geom, *pc, dt, epi),
         }
     }
@@ -242,16 +238,13 @@ pub fn conv_candidates(policy: &GemmPolicy, geom: &ConvGeom, caps: &crate::ArchC
         if !plans.contains(&ConvPlan::Gathered(cfg)) {
             plans.push(ConvPlan::Gathered(cfg));
         }
-        // Both rewrites exist to take the tap out of the K index, and neither has
-        // anything to take out of a 1x1. Both fill their strips with `cp.async`
-        // and have no register-staged form, so both need a target that has it
-        // ([`crate::ArchCaps::has_async_copy`]); the patch is additionally read
-        // through `ldmatrix` (a lane addresses its own row), which only CUDA has.
-        if geom.kh * geom.kw > 1 && caps.has_async_copy() {
-            plans.push(ConvPlan::Tapwise(cfg));
-            if caps.cuda().is_some() {
-                plans.extend(patch_candidate(geom, &cfg, caps.wave_size).map(ConvPlan::Patch));
-            }
+        // The patch exists to take the tap out of the K index, and a 1x1 has none
+        // to take out. It fills its strips with `cp.async` and has no
+        // register-staged form ([`crate::ArchCaps::has_async_copy`]), and it is
+        // read through `ldmatrix` (a lane addresses its own row), which only CUDA
+        // has.
+        if geom.kh * geom.kw > 1 && caps.has_async_copy() && caps.cuda().is_some() {
+            plans.extend(patch_candidate(geom, &cfg, caps.wave_size).map(ConvPlan::Patch));
         }
     }
     plans
@@ -336,17 +329,17 @@ pub fn tuned_conv_plan(
             .ok()
     };
 
-    // The tap-unrolled and image-staged rewrites are the other half of the
-    // search space, and the product of the two searches has never been measured
-    // on any target. Where the arch offers them the form search keeps the hand
-    // table it was measured on; where the gathered form stands alone the tile is
-    // the only free variable and the lattice walk takes the table's place.
+    // The image-staged rewrite is the other half of the search space, and the
+    // product of the two searches has never been measured on any target. Where
+    // the arch offers it the form search keeps the hand table it was measured on;
+    // where the gathered form stands alone the tile is the only free variable and
+    // the lattice walk takes the table's place.
     //
-    // That covers two cases. On AMD it is every convolution, since both rewrites
-    // fill their strips with `cp.async` ([`crate::ArchCaps::has_async_copy`]).
-    // On CUDA it is the shapes the table serves with nothing at all — `candidates`
-    // is then empty and `all` holds vacuously — so a tile the table never carried
-    // is reachable there too, without disturbing a shape it did carry.
+    // That covers two cases. On AMD it is every convolution, since the patch
+    // fills its strips with `cp.async` ([`crate::ArchCaps::has_async_copy`]). On
+    // CUDA it is every shape the patch does not serve: a stride-2 convolution, or
+    // one the table serves with nothing at all (`candidates` is then empty and
+    // `all` holds vacuously), so a tile the table never carried is reachable.
     if let Some(budget) = TileBudget::for_device(spec, arch)
         && candidates.iter().all(|plan| matches!(plan, ConvPlan::Gathered(_)))
     {
@@ -952,172 +945,4 @@ pub fn build_conv_patch(ker: &Kernel, geom: ConvGeom, pc: PatchCfg, dt: DType, e
     let (outs, ins) = ker.bind_abi(&[GlSpec::new(&[1, 1, m, n], dt)], &ins);
     let epi = Epilogue::BiasAct { bias: ins[2].clone(), residual: ins.get(3).cloned(), act };
     patch_body(ker, geom, pc, p, outs[0].clone(), ins[0].clone(), ins[1].clone(), epi);
-}
-
-// ── The tap-unrolled form: the same strip, without the tap decode ────────────
-
-/// The GEMM body of a [`ConvPlan::Tapwise`] convolution — [`build_conv`]'s
-/// gathered strip with the K loop split into a channel-strip loop around an
-/// unrolled walk over the `kh·kw` taps, so `(ky, kx)` are build-time constants.
-///
-/// That is the whole change, and it is the one the SASS asks for. With the tap
-/// decoded from the trip index every `cp.async` address costs two magic-number
-/// divides for the tap, two more for `(ky, kx)`, four padding compares and the
-/// row offset — 55 of the 135 sm_86 instructions in the loop body, re-evaluated
-/// every trip against 16 `mma`. Unrolled, a lane decodes its output pixel and
-/// its `kh + kw` padding predicates **once**, and a tap is that base plus the
-/// build-time constant `(ky·w + kx)·cin`: the delta table CUTLASS's "optimized"
-/// fprop iterator carries. The shared working set is [`build_conv`]'s to the
-/// byte, so unlike [`ConvPlan::Patch`] this costs no residency and applies at
-/// any stride — which is where the stride-2 convolutions live.
-fn tapwise_body(ker: &Kernel, geom: ConvGeom, cfg: GemmCfg, c_gl: GL, x_gl: GL, w_gl: GL, epi: Epilogue<GL>) {
-    let (m_total, _, n) = geom.mkn();
-    let (reg_m, reg_n, k_step) = (cfg.reg_m(), cfg.reg_n(), cfg.k_step);
-    let in_dt = x_gl.elem().clone();
-    let out_dt = c_gl.elem().clone();
-    let g = ker.group_2d(cfg.warps_m, cfg.warps_n);
-    let (warp_row, warp_col) = (g.warp_row(), g.warp_col());
-
-    let a_smem = ker.shared_sw_stages((cfg.block_m, k_step), in_dt.clone(), TileLayout::Row, cfg.stages);
-    let b_smem = ker.shared_sw_stages(b_strip(&cfg), in_dt.clone(), TileLayout::Row, cfg.stages);
-
-    let (pid_n, pid_m) = (ker.block_idx[0].clone(), ker.block_idx[1].clone());
-    let (h, w, cin) = (geom.h as i64, geom.w as i64, geom.cin as i64);
-    let (ho, wo) = (geom.ho() as i64, geom.wo() as i64);
-    let (pad, s) = (geom.pad as i64, geom.stride as i64);
-    let (kw, taps) = (geom.kw as i64, (geom.kh * geom.kw) as i64);
-    let trips = (geom.cin / k_step) as i64;
-    let ragged = !m_total.is_multiple_of(cfg.block_m);
-
-    // Strip row `r` of tap `(ky, kx)` at channel strip `strip`. The output pixel
-    // and the two padding predicates depend on neither, so they are built once
-    // per lane and shared across the taps; the tap is a constant delta on the
-    // row offset.
-    let a_rows = |ky: i64, kx: i64, strip: &Arc<UOp>| {
-        let (pid_m, c0) = (pid_m.clone(), imul(strip, k_step as i64));
-        move |r: &Arc<UOp>| {
-            let lt = |a: &Arc<UOp>, b: &Arc<UOp>| a.try_cmplt(b).expect("conv row: compare");
-            let and = |a: Arc<UOp>, b: Arc<UOp>| a.try_and_op(&b).expect("conv row: and");
-            let m = iadd(&imul(&pid_m, cfg.block_m as i64), r);
-            let (b, rem) = (idiv(&m, ho * wo), imod(&m, ho * wo));
-            let (oy, ox) = (idiv(&rem, wo), imod(&rem, wo));
-            // Padded coordinates without the tap: `pad ≤ c + tap < extent + pad`.
-            let (iy, ix) = (imul(&oy, s), imul(&ox, s));
-            let inside = |c: &Arc<UOp>, at: i64, extent: i64| {
-                and(lt(&cidx(pad - at), &iadd(c, &cidx(1))), lt(c, &cidx(extent + pad - at)))
-            };
-            let mut valid = and(inside(&iy, ky, h), inside(&ix, kx, w));
-            if ragged {
-                valid = and(valid, lt(&m, &cidx(m_total as i64)));
-            }
-            let row = iadd(&imul(&iadd(&imul(&b, h), &iy), w), &ix);
-            let base = iadd(&imul(&row, cin), &cidx((ky * w + kx - pad * (w + 1)) * cin));
-            (iadd(&base, &c0), valid)
-        }
-    };
-    let b_idx = |tap: i64, strip: &Arc<UOp>| b_index(&cfg, &pid_n, &iadd(&imul(&cidx(tap), trips), strip));
-
-    // Prologue: tap 0 of strip 0, into half 0 of both operands.
-    let zero = cidx(0);
-    let pro: SmallVec<[Arc<UOp>; 4]> = smallvec![
-        g.cp_async_fill_rows(&a_smem, &x_gl, a_rows(0, 0, &zero)),
-        g.cp_async_fill(&b_smem, &w_gl, &b_idx(0, &zero), 2),
-    ];
-    let a_smem = a_smem.after(pro.clone());
-    let b_smem = b_smem.after(pro.clone());
-
-    let accs: Vec<RT> = (0..cfg.acc_m).map(|_| g.zero(ker.acc((reg_m, reg_n), TileLayout::Col))).collect();
-    let lp = ker.loop_static(trips);
-    // The halves alternate over the *global* `(strip, tap)` counter, so the last
-    // tap of a strip and the first of the next land in different ones.
-    let half = |st: &ST, tap: i64| {
-        let par = imod(&iadd(&imul(lp.index(), taps), &cidx(tap)), cfg.stages as i64);
-        st.with_base_offset(imul(&par, st.half_elems() as i64))
-    };
-    let nxt = imod(&iadd(lp.index(), &cidx(1)), trips);
-
-    let mut issued: SmallVec<[Arc<UOp>; 4]> = pro.clone();
-    let mut prev: Option<Arc<UOp>> = None;
-    for tap in 0..taps {
-        let fence: SmallVec<[Arc<UOp>; 4]> = prev.iter().cloned().collect();
-        let landed = cp_async_wait(0, std::mem::take(&mut issued)).barrier(fence);
-        let (a_cur, b_cur) = (half(&a_smem, tap).after(&landed), half(&b_smem, tap).after(&landed));
-        // Every tap issues what the next one reads, so nothing is ever waited for
-        // in the tap that issues it; the last tap crosses into the next strip.
-        let (next_tap, next_strip) = if tap + 1 < taps { (tap + 1, lp.index().clone()) } else { (0, nxt.clone()) };
-        let (an, bn) = (half(&a_smem, tap + 1).after(&landed), half(&b_smem, tap + 1).after(&landed));
-        let rows = a_rows(next_tap / kw, next_tap % kw, &next_strip);
-        issued.push(g.cp_async_fill_rows(&an, &x_gl, rows));
-        issued.push(g.cp_async_fill(&bn, &w_gl, &b_idx(next_tap, &next_strip), 2));
-
-        let (b_reg, b_view) = b_operand(ker, &cfg, &in_dt, &warp_col, &b_cur);
-        let bb = g.load(b_reg, b_view, MoveIdx::default());
-        for (a, acc) in accs.iter().enumerate() {
-            let a_sub = g.load(
-                ker.operand((reg_m, k_step), in_dt.clone(), TileLayout::Row),
-                a_cur.subtile((reg_m, k_step), (acc_block(&warp_row, a, &cfg), 0)),
-                MoveIdx::default(),
-            );
-            let a_sub = match &prev {
-                Some(p) => a_sub.after(smallvec![p.clone()]),
-                None => a_sub,
-            };
-            let out = match cfg.b_order {
-                BOrder::Kn => g.mma_ab(acc.clone(), &a_sub, &bb),
-                BOrder::Nk => g.mma_abt(acc.clone(), &a_sub, &bb),
-            };
-            prev = Some(out.uop().clone());
-        }
-    }
-    let tail = cp_async_wait(0, issued).barrier(smallvec![prev.clone().expect("at least one accumulator")]);
-    ker.push_store(tail, a_smem.uop().clone());
-    let ended = lp.close();
-
-    // Epilogue: [`build_conv`]'s, the M block being the same linear run of rows.
-    let nidx = pid_n.mul(&cidx(cfg.blocks_n() as i64)).add(&warp_col);
-    let end = ragged.then(|| cidx((m_total * n) as i64));
-    let mut c_t = c_gl;
-    for (a, acc) in accs.iter().enumerate() {
-        let acc = acc.after(smallvec![ended.clone()]);
-        let c = narrow(ker, &g, acc, &out_dt);
-        let mrow = pid_m.mul(&cidx(cfg.blocks_m() as i64)).add(&acc_block(&warp_row, a, &cfg));
-        let ix = MoveIdx::block((Idx::Const(0), Idx::Const(0), mrow, Idx::from(&nidx)), 2);
-        let ix = if ragged { ix.clipped() } else { ix };
-        let Epilogue::BiasAct { bias, residual, act } = &epi else { panic!("conv2d: the epilogue is BiasAct") };
-        let (bias, res, act) = (bias.uop().clone(), residual.as_ref().map(|r| r.uop().clone()), *act);
-        let (dt, cols, end) = (out_dt.clone(), cidx(n as i64), end.clone());
-        c_t = g.store_global_with(c_t, &c, ix, move |v, off| {
-            let col = off.try_mod(&cols).expect("conv epilogue: bias column");
-            let v = v.try_add(&load_off(&bias, col)).expect("conv epilogue: bias add");
-            let v = if act { silu(&v, &dt) } else { v };
-            let Some(r) = &res else { return v };
-            // A row past a ragged `M` is dropped by the store's gate, but its
-            // residual read still happens: clamp it into the operand.
-            let at = match &end {
-                Some(end) => {
-                    let inside = off.try_cmplt(end).expect("conv epilogue: residual bound");
-                    UOp::try_where(inside, off.clone(), cidx(0)).expect("conv epilogue: residual clamp")
-                }
-                None => off.clone(),
-            };
-            v.try_add(&load_off(r, at)).expect("conv epilogue: residual add")
-        });
-    }
-}
-
-/// Bind the ABI and run the tap-unrolled body — [`build_conv`]'s counterpart.
-pub fn build_conv_tapwise(ker: &Kernel, geom: ConvGeom, cfg: GemmCfg, dt: DType, epi: Epilogue<()>) {
-    let (m, k, n) = geom.mkn();
-    let Epilogue::BiasAct { residual, act, .. } = epi else { panic!("conv2d: the epilogue is BiasAct") };
-    let mut ins = vec![
-        GlSpec::new(&[1, 1, geom.batch * geom.h * geom.w, geom.cin], dt.clone()),
-        GlSpec::new(&[1, 1, n, k], dt.clone()),
-        GlSpec::new(&[1, 1, 1, n], dt.clone()),
-    ];
-    if residual.is_some() {
-        ins.push(GlSpec::new(&[1, 1, m, n], dt.clone()));
-    }
-    let (outs, ins) = ker.bind_abi(&[GlSpec::new(&[1, 1, m, n], dt)], &ins);
-    let epi = Epilogue::BiasAct { bias: ins[2].clone(), residual: ins.get(3).cloned(), act };
-    tapwise_body(ker, geom, cfg, outs[0].clone(), ins[0].clone(), ins[1].clone(), epi);
 }

@@ -294,20 +294,19 @@ fn conv_matches_the_graph_gpu(g: ConvGeom, residual: bool, dtype: DType, tol: f3
 // ── The image-staged plan ───────────────────────────────────────────────────
 
 /// The candidate list: every tile that serves the shape in its gathered form,
-/// plus the two rewrites that take the tap out of the K index. Both are for a
-/// `k > 1` convolution only — a 1x1 has no tap to take out — and the patch is
-/// additionally `ldmatrix`-only (CUDA) and bounded by the strip it replaces,
-/// which is what keeps it off the stride-2 shapes.
-#[test_case(SM86, geom(40, 192, 192, 3, 1), (true, true); "sm86 3x3")]
-#[test_case(SM86, geom(80, 768, 768, 3, 2), (false, true); "sm86 stride 2 stages five times the strip")]
-#[test_case(SM86, geom(40, 384, 192, 1, 1), (false, false); "sm86 1x1 has no tap to unroll")]
-#[test_case(RDNA4, geom(40, 192, 192, 3, 1), (false, false); "rdna4 has neither ldmatrix nor cp.async")]
-fn the_rewrites_are_offered(arch: GpuArch, g: ConvGeom, expected: (bool, bool)) {
+/// plus the patch, which takes the tap out of the K index. It is for a `k > 1`
+/// convolution only — a 1x1 has no tap to take out — `ldmatrix`-only (CUDA), and
+/// bounded by the strip it replaces, which is what keeps it off the stride-2
+/// shapes.
+#[test_case(SM86, geom(40, 192, 192, 3, 1), true; "sm86 3x3")]
+#[test_case(SM86, geom(80, 768, 768, 3, 2), false; "sm86 stride 2 stages five times the strip")]
+#[test_case(SM86, geom(40, 384, 192, 1, 1), false; "sm86 1x1 has no tap to take out")]
+#[test_case(RDNA4, geom(40, 192, 192, 3, 1), false; "rdna4 has neither ldmatrix nor cp.async")]
+fn the_patch_is_offered(arch: GpuArch, g: ConvGeom, expected: bool) {
     let caps = crate::ArchCaps::for_arch(arch);
     let plans = conv_candidates(&GemmPolicy::for_arch(arch), &g, &caps);
     let any = |f: fn(&ConvPlan) -> bool| plans.iter().any(f);
-    let got = (any(|p| matches!(p, ConvPlan::Patch(_))), any(|p| matches!(p, ConvPlan::Tapwise(_))));
-    assert_eq!(got, expected, "{plans:?}");
+    assert_eq!(any(|p| matches!(p, ConvPlan::Patch(_))), expected, "{plans:?}");
     assert!(any(|p| matches!(p, ConvPlan::Gathered(_))), "the gathered form always stands");
     for plan in &plans {
         let grid = plan.grid_dims(&g);
