@@ -1,11 +1,12 @@
-//! `x @ w^T` for the projections: the hand GEMM when it applies, else the
-//! generic `Tensor::linear`.
+//! `x @ w^T` for the transformer projections, shared by the ports: the hand
+//! GEMM (`svod_tk::gemm_nt`) when it applies, else the generic
+//! `Tensor::linear`.
 
-use snafu::ResultExt;
 use svod_dtype::ScalarDType;
 use svod_tensor::Tensor;
+use svod_tensor::error::Result;
 
-use super::error::{Result, TkSnafu};
+use crate::attention::tk_launch_error;
 
 /// Whether the hand GEMM can take these operands: concrete 16-bit, matching
 /// dtypes. The tile grid is the kernel's own call (`Ok(None)`).
@@ -25,11 +26,11 @@ fn fusable(x: &Tensor, w: &Tensor) -> bool {
 /// same for its inputs, and binds an already realized one without a copy.
 pub(crate) fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
     if fusable(x, w)
-        && let Some(y) = svod_tk::gemm_nt(x, w).context(TkSnafu)?
+        && let Some(y) = svod_tk::gemm_nt(x, w).map_err(tk_launch_error)?
     {
         return Ok(y);
     }
-    Ok(x.contiguous().linear().weight(w).call()?)
+    x.contiguous().linear().weight(w).call()
 }
 
 /// `y = silu(gate)·up` off the fused `[2I, K]` gate/up weight, computed in the
@@ -40,7 +41,7 @@ pub(crate) fn linear_swiglu(x: &Tensor, w: &Tensor, pair: usize) -> Result<Optio
     if !fusable(x, w) {
         return Ok(None);
     }
-    svod_tk::gemm_nt_with_epilogue(x, w, svod_tk::Epilogue::SwiGlu { pair }).context(TkSnafu)
+    svod_tk::gemm_nt_with_epilogue(x, w, svod_tk::Epilogue::SwiGlu { pair }).map_err(tk_launch_error)
 }
 
 /// A projection's output, with the residual add either already folded into the
@@ -70,7 +71,8 @@ impl Projected {
 pub(crate) fn linear_add(x: &Tensor, w: &Tensor, residual: Option<&Tensor>) -> Result<Projected> {
     if let Some(residual) = residual
         && fusable(x, w)
-        && let Some(y) = svod_tk::gemm_nt_with_epilogue(x, w, svod_tk::Epilogue::Add(residual)).context(TkSnafu)?
+        && let Some(y) =
+            svod_tk::gemm_nt_with_epilogue(x, w, svod_tk::Epilogue::Add(residual)).map_err(tk_launch_error)?
     {
         return Ok(Projected::Summed(y));
     }

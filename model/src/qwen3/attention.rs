@@ -17,8 +17,8 @@ use svod_tensor::nn::{Layer, Module, RmsNorm, StateDict, get_tensor, prefixed};
 use crate::init::fan_in_uniform;
 
 use super::error::{Result, TkSnafu};
-use super::linear::{Projected, linear, linear_add};
 use super::tk;
+use crate::linear::{Projected, linear, linear_add};
 
 #[derive(Clone)]
 pub struct Qwen3Attention {
@@ -117,7 +117,7 @@ impl Qwen3Attention {
             l,
             SInt::Const(self.num_heads * self.head_dim),
         ])?;
-        linear_add(&attn, &self.o_proj_weight, residual)
+        Ok(linear_add(&attn, &self.o_proj_weight, residual)?)
     }
 
     /// The fused GEMM output `[B, L, (H + 2·Hkv)·Dh]` → the three sequence-major
