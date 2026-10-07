@@ -155,6 +155,19 @@ fn fingerprint_is_build_deterministic() {
     assert_eq!(kernel_fingerprint(&fa_sink()).digest, kernel_fingerprint(&fa_sink()).digest);
 }
 
+/// An origin is a process-local id, so a kernel a model builds inside its scopes
+/// must fingerprint as it does outside them, or a tune line one process writes is
+/// never the line the next one looks up.
+#[test]
+fn a_kernel_built_inside_a_scope_fingerprints_as_outside_one() {
+    let outside = kernel_fingerprint(&matmul_sink());
+    let _capture = svod_ir::origin::capture_for_thread(true);
+    let _scope = svod_ir::OriginScope::module("layer");
+    let inside = matmul_sink();
+    assert!(inside.toposort().iter().any(|node| node.origin().is_some()), "the scope stamps the build");
+    assert_eq!(kernel_fingerprint(&inside), outside);
+}
+
 /// Sorted, de-duped local/register `BUFFER` slots in a kernel graph.
 fn local_slots_and_reg_ids(sink: &Arc<UOp>) -> (Vec<usize>, Vec<usize>) {
     let (mut locals, mut regs) = (Vec::new(), Vec::new());
