@@ -1,6 +1,7 @@
 mod arch;
 mod elementwise;
 mod fa;
+mod fa_batch_var;
 mod gemm;
 mod golden;
 mod grid;

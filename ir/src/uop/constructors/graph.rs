@@ -181,15 +181,27 @@ impl UOp {
 
     /// Create a PARAM placeholder shaped like `src` for custom kernel building.
     ///
-    /// Rejects symbolic input via `all_int`-style check and creates storage in
-    /// the requested address space with the same logical shape, matching
-    /// Tinygrad's `placeholder_like`. For multi-device wrappers (MULTI/MSELECT/MSTACK),
-    /// placeholder shape is derived from the underlying shard (analog of
-    /// tinygrad's `max_shard_shape`).
+    /// Creates storage in the requested address space with the same logical
+    /// shape, matching Tinygrad's `placeholder_like`. For multi-device wrappers
+    /// (MULTI/MSELECT/MSTACK), placeholder shape is derived from the underlying
+    /// shard (analog of tinygrad's `max_shard_shape`).
+    ///
+    /// Unlike Tinygrad, a bounded symbolic dim is sized at its `vmax`: the
+    /// scheduler allocates a symbolic buffer at that capacity, so the kernel binds
+    /// the whole allocation and reads the live extent from the variable itself.
+    /// An unbounded symbolic dim is rejected.
     pub fn placeholder_like(src: &Arc<Self>, slot: usize, addrspace: svod_dtype::AddrSpace) -> Result<Arc<Self>> {
         let anchor = Self::placeholder_like_anchor(src);
-        let shape = anchor.shape()?.cloned().ok_or_else(|| Error::MissingShape { operation: "placeholder_like" })?;
-        Self::placeholder(&shape, anchor.dtype(), slot, addrspace, None)
+        let shape = anchor.shape()?.ok_or(Error::MissingShape { operation: "placeholder_like" })?;
+        let capacity = shape
+            .iter()
+            .map(|dim| {
+                dim.vmax()
+                    .map(crate::SInt::Const)
+                    .ok_or(Error::SymbolicShapeUnsupported { operation: "placeholder_like" })
+            })
+            .collect::<Result<crate::shape::Shape>>()?;
+        Self::placeholder(&capacity, anchor.dtype(), slot, addrspace, None)
     }
 
     /// The realized node a chain of reshapes views, if the base is one.

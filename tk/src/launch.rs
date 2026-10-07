@@ -24,8 +24,8 @@ use svod_codegen::program_pipeline::{self, ProgramTarget};
 use svod_device::Buffer;
 use svod_device::device::{Device, Program, ProgramSpec};
 use svod_dtype::{DType, DeviceSpec, GpuArch};
-use svod_ir::UOp;
 use svod_ir::ops;
+use svod_ir::{SInt, UOp};
 use svod_tensor::Tensor;
 
 use crate::target::ArchSet;
@@ -211,6 +211,52 @@ pub fn concrete_dims_at_least(
     (0..shape.len())
         .map(|i| shape[i].as_const().context(OperandSymbolicDimSnafu { kernel, operand, axis: i }))
         .collect()
+}
+
+/// A leading (batch) dim bound to a runtime variable — the JIT `batch_var`.
+#[derive(Clone, Debug)]
+pub struct VarBatch {
+    /// The dim as the operand's shape spells it, to shrink an output back to.
+    pub dim: SInt,
+    /// The unbound variable, a launch-grid extent.
+    pub var: Arc<UOp>,
+}
+
+/// [`concrete_dims`] with the leading (batch) dim allowed to be a runtime
+/// variable. The dims come back at the batch's capacity (its `vmax`, which the
+/// scheduler allocates the buffer for), plus the [`VarBatch`] when it is
+/// symbolic. Any other symbolic dim, or a batch that is an expression rather
+/// than a bare variable, is an [`Error::OperandSymbolicDim`].
+pub fn batched_dims(
+    t: &Tensor,
+    kernel: &'static str,
+    operand: &'static str,
+    rank: usize,
+) -> Result<(Vec<usize>, Option<VarBatch>)> {
+    let shape = t.shape().ok().context(OperandIndeterminateShapeSnafu { kernel, operand })?;
+    snafu::ensure!(shape.len() == rank, OperandRankSnafu { kernel, operand, expected: rank, got: shape.len() });
+    let batch = match &shape[0] {
+        SInt::Symbolic(dim) => {
+            let var = match dim.op() {
+                svod_ir::Op::Bind(ops::Bind { var, .. }) => var,
+                _ => dim,
+            };
+            let bounded = match var.op() {
+                svod_ir::Op::Param(ops::Param { arg, .. }) => arg.vmin_vmax.is_some(),
+                svod_ir::Op::DefineVar(..) => true,
+                _ => false,
+            };
+            snafu::ensure!(bounded, OperandSymbolicDimSnafu { kernel, operand, axis: 0usize });
+            Some(VarBatch { dim: shape[0].clone(), var: var.clone() })
+        }
+        _ => None,
+    };
+    let dims = std::iter::once(shape[0].vmax())
+        .chain(shape[1..].iter().map(SInt::as_const))
+        .enumerate()
+        .map(|(axis, dim)| dim.context(OperandSymbolicDimSnafu { kernel, operand, axis }))
+        .collect::<Result<_>>()?;
+    Ok((dims, batch))
 }
 
 /// Compile `sink` for `device` and dispatch it against `buffers`, populating the
@@ -441,7 +487,7 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
 /// ```
 pub fn run_kernel<F>(
     name: impl Into<String>,
-    grid: [i64; 3],
+    grid: impl Into<crate::Grid>,
     block: i64,
     outs: &mut [&mut Tensor],
     ins: &[&Tensor],
@@ -492,7 +538,7 @@ where
 /// ```
 pub fn graph_launch<F>(
     name: impl Into<String>,
-    grid: [i64; 3],
+    grid: impl Into<crate::Grid>,
     block: i64,
     out: Tensor,
     ins: &[&Tensor],
@@ -531,7 +577,7 @@ where
 /// `grid`/`block`, as in [`graph_launch`].
 pub fn graph_launch_multi<F>(
     name: impl Into<String>,
-    grid: [i64; 3],
+    grid: impl Into<crate::Grid>,
     block: i64,
     outs: Vec<Tensor>,
     ins: &[&Tensor],
@@ -633,7 +679,7 @@ pub fn launch_custom<T>(
 /// ```
 pub fn compile_kernel<F>(
     name: impl Into<String>,
-    grid: [i64; 3],
+    grid: impl Into<crate::Grid>,
     block: i64,
     outs: &mut [&mut Tensor],
     ins: &[&Tensor],

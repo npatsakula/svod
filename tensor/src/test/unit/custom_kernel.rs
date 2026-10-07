@@ -62,19 +62,24 @@ fn test_tensor_custom_kernel_with_call_info() {
 }
 
 #[test]
-fn test_tensor_custom_kernel_symbolic_placeholder_error() {
-    // `placeholder_like` rejects symbolic-shaped inputs at construction
-    // time (tinygrad parity).
+fn test_tensor_custom_kernel_symbolic_placeholder_at_capacity() {
+    // Tinygrad rejects symbolic inputs; svod hands the kernel a placeholder at
+    // the dim's vmax (the buffer's allocated capacity), while the returned
+    // tensor keeps the caller's symbolic shape.
     let n = UOp::define_var("N".to_string(), 1, 8);
     let buf = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
-    let shaped = buf.try_reshape(&Shape::from_iter([SInt::from(n)])).unwrap();
+    let shaped = buf.try_reshape(&Shape::from_iter([SInt::from(n.clone())])).unwrap();
     let symbolic = Tensor::from_lazy(shaped);
 
-    let err = match symbolic.custom_kernel(&[], |placeholders| UOp::sink(vec![placeholders[0].clone()])) {
-        Ok(_) => panic!("symbolic placeholder_like should fail"),
-        Err(err) => err,
-    };
-    assert!(format!("{err}").contains("symbolic shape is not supported"));
+    let mut seen = None;
+    let outs = symbolic
+        .custom_kernel(&[], |placeholders| {
+            seen = placeholders[0].shape().unwrap().cloned();
+            UOp::sink(vec![placeholders[0].clone()])
+        })
+        .expect("bounded symbolic input");
+    assert_eq!(seen.expect("placeholder shape").to_vec(), vec![SInt::Const(8)]);
+    assert_eq!(outs[0].shape().unwrap().to_vec(), vec![SInt::from(n)]);
 }
 
 #[test]

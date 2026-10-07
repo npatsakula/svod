@@ -823,14 +823,25 @@ fn test_placeholder_like_commits_weak_storage_dtype() {
 }
 
 #[test]
-fn test_placeholder_like_symbolic_shape_fails() {
-    // Symbolic input is rejected outright — tinygrad's placeholder_like
-    // asserts the shape is all concrete ints, and we mirror that contract.
+fn test_placeholder_like_sizes_symbolic_dim_at_vmax() {
+    // Tinygrad rejects symbolic input outright; svod sizes a bounded symbolic dim
+    // at its vmax, the capacity the scheduler allocates the buffer for.
     let n = UOp::define_var("N".to_string(), 1, 8);
+    let buf = UOp::new_buffer(DeviceSpec::Cpu, 24, DType::Float32);
+    let shaped = buf.try_reshape(&Shape::from_iter([SInt::Const(8), SInt::Const(3)])).unwrap();
+    let shaped = shaped.try_shrink(&[(SInt::Const(0), SInt::from(n)), (SInt::Const(0), SInt::Const(3))]).unwrap();
+
+    let placeholder = UOp::placeholder_like(&shaped, 0, AddrSpace::Global).expect("bounded symbolic placeholder");
+    let shape = placeholder.shape().unwrap().cloned().expect("placeholder should have shape");
+    assert_eq!(shape.iter().map(SInt::as_const).collect::<Vec<_>>(), vec![Some(8), Some(3)]);
+}
+
+#[test]
+fn test_placeholder_like_negative_symbolic_dim_fails() {
+    let n = UOp::define_var("N".to_string(), -4, -1);
     let buf = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
     let shaped = buf.try_reshape(&Shape::from_iter([SInt::from(n)])).unwrap();
-
-    let err = UOp::placeholder_like(&shaped, 0, AddrSpace::Global).expect_err("symbolic placeholder_like should fail");
+    let err = UOp::placeholder_like(&shaped, 0, AddrSpace::Global).expect_err("a symbolic dim without a capacity");
     assert!(format!("{err}").contains("symbolic shape is not supported"), "unexpected error: {err}");
 }
 

@@ -97,7 +97,7 @@ pub use target::ArchSet;
 pub use arch::ArchCaps;
 pub use group::{ArgDir, Group, LoadInto, MoveIdx, StoreInto, SwapDir};
 pub use index::IntoIdxs;
-pub use kernel::Kernel;
+pub use kernel::{Grid, Kernel};
 pub use launch::{graph_launch, graph_launch_multi, launch_custom}; // wrap a hand kernel as a lazy Tensor graph node / kernel entry
 pub use layout::{LaneMap, ReduceTree};
 pub use loop_scope::Loop;
