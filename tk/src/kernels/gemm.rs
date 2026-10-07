@@ -264,7 +264,10 @@ fn b_operand<'k>(ker: &'k Kernel, cfg: &GemmCfg, in_dt: &DType, warp_col: &Arc<U
 /// cfg.split_k`; unless `block_m`/`block_n` divide into the wave grid; for a
 /// pipelined config, unless the strips admit `cp.async` fills; and, under
 /// [`Epilogue::SwiGlu`], unless `cfg.reg_n()` splits into two whole fragment
-/// blocks.
+/// blocks; and when `batched` (A, C and the residual carry a leading batch axis
+/// indexed by grid z, each batch an `m × n` GEMM of its own), unless the
+/// reduction is un-split, since split-K also rides grid z.
+#[allow(clippy::too_many_arguments)]
 pub fn gemm_core(
     ker: &Kernel,
     (m, k, n): (usize, usize, usize),
@@ -273,7 +276,9 @@ pub fn gemm_core(
     a_gl: GL,
     b_gl: GL,
     epi: Epilogue<GL>,
+    batched: bool,
 ) {
+    assert!(!batched || cfg.split_k == 1, "a batched gemm takes grid z, which split-K needs too");
     assert_eq!(m % cfg.block_m, 0, "gemm M={m} must be a multiple of the {} block", cfg.block_m);
     assert_eq!(n % cfg.block_n, 0, "gemm N={n} must be a multiple of the {} block", cfg.block_n);
     // The K-edge is the A fragment's column count — 16 on MFMA/`mma.sync`, 8 on
@@ -312,7 +317,10 @@ pub fn gemm_core(
     let accs: Vec<RT> = (0..cfg.acc_m).map(|_| g.zero(ker.acc((reg_m, reg_n), TileLayout::Col))).collect();
 
     let lp = ker.loop_static(trips);
-    let strip = Strips { cfg: &cfg, a_gl: &a_gl, b_gl: &b_gl, row: &row, col: &col, slab: slab.clone(), trips };
+    // The batch this workgroup computes; an unbatched GEMM's is the constant 0.
+    let batch = if batched { Idx::from(ker.grid_z()) } else { Idx::Const(0) };
+    let strip =
+        Strips { cfg: &cfg, a_gl: &a_gl, b_gl: &b_gl, row: &row, col: &col, slab: slab.clone(), trips, batch: &batch };
 
     let (a_cur, b_cur, stream) =
         if cfg.stages > 1 { strip.pipelined(&g, &lp, a_smem, b_smem) } else { strip.single(&g, &lp, a_smem, b_smem) };
@@ -414,7 +422,7 @@ pub fn gemm_core(
     let mut c_t = c_gl;
     for (a, c) in final_accs.into_iter().enumerate() {
         let mrow = row.mul(&cidx(cfg.blocks_m() as i64)).add(&acc_row(&warp_row, a, &cfg));
-        let ix = MoveIdx::block((Idx::Const(0), zslab.clone(), mrow, nidx.clone()), 2);
+        let ix = MoveIdx::block((batch.clone(), zslab.clone(), mrow, nidx.clone()), 2);
         c_t = match &epi {
             Epilogue::Plain => g.store(c_t, narrow(ker, &g, c, &out_dt), ix),
             // The residual is read at the store's own global offset — the same
@@ -529,6 +537,8 @@ struct Strips<'a> {
     col: &'a Arc<UOp>,
     slab: Option<Arc<UOp>>,
     trips: i64,
+    /// A's batch index (C's is the same).
+    batch: &'a Idx,
 }
 
 impl Strips<'_> {
@@ -538,7 +548,7 @@ impl Strips<'_> {
             Some(base) => base.add(tile),
             None => tile.clone(),
         };
-        ([Idx::Const(0), Idx::Const(0), Idx::from(self.row), Idx::from(&t)], b_index(self.cfg, self.col, &t))
+        ([self.batch.clone(), Idx::Const(0), Idx::from(self.row), Idx::from(&t)], b_index(self.cfg, self.col, &t))
     }
 
     /// Single-buffered: one collaborative GLOBAL→LDS fill per trip, the two strips
@@ -811,7 +821,7 @@ impl GemmPolicy {
         }
         let cols = epi.out_cols(n);
         let build = move |ker: &Kernel, cfg: GemmCfg| {
-            build_gemm_nt(ker, (m, k, n), cfg, dtype.clone(), dtype.clone(), epi);
+            build_gemm_nt(ker, (m, k, n), cfg, dtype.clone(), dtype.clone(), epi, None);
             ker.finish(cfg.acc_m)
         };
         // The store line covers the candidate kernels themselves: their graphs,
@@ -977,12 +987,19 @@ fn build_gemm(
     epi: Epilogue<&Tensor>,
     cfg: impl Fn(svod_dtype::GpuArch, usize, usize, usize) -> Option<GemmCfg> + Copy,
 ) -> crate::LaunchResult<Option<Tensor>> {
-    let xd = crate::launch::concrete_dims_at_least(x, "gemm-nt", "x", 2)?;
+    let (xd, batch) = crate::launch::batched_dims_at_least(x, "gemm-nt", "x", 2)?;
     let wd = crate::launch::concrete_dims(w, "gemm-nt", "w", 2)?;
     // `x` is `[lead..., K]`: the leading dims are the GEMM's rows and come back
     // on `y` as `[lead..., N]`.
     let (lead, k) = (xd[..xd.len() - 1].to_vec(), xd[xd.len() - 1]);
     let (m, n) = (lead.iter().product::<usize>(), wd[0]);
+    // A runtime batch (the JIT `batch_var`) stays a grid extent: each batch is a
+    // GEMM of its own `rows` static rows on grid z, and every buffer, the tile
+    // choice and its tune key take the batch's capacity (`m` rows in all).
+    let (rows, batches) = match batch {
+        Some(_) => (lead[1..].iter().product::<usize>(), Some(lead[0])),
+        None => (m, None),
+    };
     let dtype = x.uop().dtype();
     let (w_dtype, kw) = (w.uop().dtype(), wd[1]);
     let err_dtype = dtype.clone();
@@ -992,7 +1009,12 @@ fn build_gemm(
     let kind = epi.kind();
     let y_shape: Vec<usize> = lead.iter().copied().chain([kind.out_cols(n)]).collect();
     let res_dims = match epi {
-        Epilogue::Add(r) => Some(crate::launch::concrete_dims_at_least(r, "gemm-nt", "residual", 2)?),
+        Epilogue::Add(r) => {
+            let (dims, res_batch) = crate::launch::batched_dims_at_least(r, "gemm-nt", "residual", 2)?;
+            // A residual off `x`'s batch is a shape mismatch like any other.
+            let same = res_batch.map(|b| b.dim) == batch.as_ref().map(|b| b.dim.clone());
+            Some(if same { dims } else { Vec::new() })
+        }
         _ => None,
     };
     let res_dtype = match epi {
@@ -1050,12 +1072,17 @@ fn build_gemm(
         },
         move |arch| {
             let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator);
-            fit_chosen.get_or_init(|| cfg(arch, m, k, n)).is_some_and(|c| c.carries(kind, frag.map(|f| f.base.cols)))
+            fit_chosen.get_or_init(|| cfg(arch, m, k, n)).is_some_and(|c| {
+                c.carries(kind, frag.map(|f| f.base.cols))
+                    && (batches.is_none() || (c.split_k == 1 && c.tiles(rows, k, n)))
+            })
         },
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
             let cfg = chosen.get_or_init(|| cfg(arch, m, k, n)).expect("checked by the tiling predicate");
-            let (grid, block) = (cfg.grid_dims(m, n), cfg.threads(caps.wave_size));
+            let [gx, gy, gz] = cfg.grid_dims(rows, n);
+            let gz = batch.as_ref().map_or_else(|| cidx(gz), |b| b.var.clone());
+            let (grid, block) = (crate::Grid([cidx(gx), cidx(gy), gz]), cfg.threads(caps.wave_size));
             let (in_dt, split) = (dtype.clone(), cfg.split_k);
             let out_dt = if split > 1 { DType::Float32 } else { dtype.clone() };
             let out = Tensor::empty(&if split > 1 { vec![split, m, n] } else { y_shape.clone() }, out_dt.clone());
@@ -1070,9 +1097,15 @@ fn build_gemm(
                 ins.push(r);
             }
             let y = crate::graph_launch(name, grid, block, out, &ins, caps, move |ker| {
-                build_gemm_nt(ker, (m, k, n), cfg, in_dt, out_dt, kind);
+                build_gemm_nt(ker, (rows, k, n), cfg, in_dt, out_dt, kind, batches);
                 ker.finish(cfg.acc_m)
             })?;
+            // The output is allocated at capacity; consumers see the live batch.
+            if let Some(batch) = &batch {
+                let mut live = vec![None; y_shape.len()];
+                live[0] = Some((svod_ir::SInt::Const(0), batch.dim.clone()));
+                return y.try_shrink(live).context(crate::launch::OperandSnafu);
+            }
             if split == 1 {
                 return Ok(y);
             }
@@ -1089,7 +1122,10 @@ fn build_gemm(
 /// Bind the NT ABI (`y` out; `x[M, K]`, `w[N, K]`, and under [`Epilogue::Add`] a
 /// trailing `residual[M, N]`, in) and run [`gemm_core`]. `out_dt` is the output
 /// buffer's dtype — the operand dtype for the direct path, f32 for the
-/// `[split_k, M, N]` partials.
+/// `[split_k, M, N]` partials. `batches` stacks that many independent `m`-row
+/// GEMMs over one weight (`x[batches, M, K]` → `y[batches, M, N]`), one per grid
+/// z — the launch extent may be a runtime batch no larger than it; `None` is
+/// the single GEMM.
 pub fn build_gemm_nt(
     ker: &Kernel,
     (m, k, n): (usize, usize, usize),
@@ -1097,12 +1133,14 @@ pub fn build_gemm_nt(
     in_dt: DType,
     out_dt: DType,
     epi: Epilogue<()>,
+    batches: Option<usize>,
 ) {
     let cols = epi.out_cols(n);
-    let out_shape = if cfg.split_k > 1 { vec![1, cfg.split_k, m, cols] } else { vec![1, 1, m, cols] };
-    let mut in_specs = vec![GlSpec::new(&[1, 1, m, k], in_dt.clone()), GlSpec::new(&[1, 1, n, k], in_dt.clone())];
+    let lead = batches.unwrap_or(1);
+    let out_shape = if cfg.split_k > 1 { vec![1, cfg.split_k, m, cols] } else { vec![lead, 1, m, cols] };
+    let mut in_specs = vec![GlSpec::new(&[lead, 1, m, k], in_dt.clone()), GlSpec::new(&[1, 1, n, k], in_dt.clone())];
     if let Epilogue::Add(()) = epi {
-        in_specs.push(GlSpec::new(&[1, 1, m, cols], out_dt.clone()));
+        in_specs.push(GlSpec::new(&[lead, 1, m, cols], out_dt.clone()));
     }
     let (outs, ins) = ker.bind_abi(&[GlSpec::new(&out_shape, out_dt)], &in_specs);
     let epi = match epi {
@@ -1110,7 +1148,7 @@ pub fn build_gemm_nt(
         Epilogue::Add(()) => Epilogue::Add(ins[2].clone()),
         Epilogue::SwiGlu { pair } => Epilogue::SwiGlu { pair },
     };
-    gemm_core(ker, (m, k, n), cfg, outs[0].clone(), ins[0].clone(), ins[1].clone(), epi);
+    gemm_core(ker, (m, k, n), cfg, outs[0].clone(), ins[0].clone(), ins[1].clone(), epi, batches.is_some());
 }
 
 // ── The square matmul (`c = a · b`, n×n) ─────────────────────────────────────
@@ -1402,5 +1440,6 @@ pub fn build_matmul_cfg_k(ker: &Kernel, n: usize, cfg: MatmulCfg, k_step: usize)
         &[GlSpec::new(&[1, 1, n, n], DType::Float32)],
         &[GlSpec::new(&[1, 1, n, n], DType::BFloat16), GlSpec::new(&[1, 1, n, n], DType::BFloat16)],
     );
-    gemm_core(ker, (n, n, n), cfg.gemm(k_step), outs[0].clone(), ins[0].clone(), ins[1].clone(), Epilogue::Plain);
+    let (c, a, b) = (outs[0].clone(), ins[0].clone(), ins[1].clone());
+    gemm_core(ker, (n, n, n), cfg.gemm(k_step), c, a, b, Epilogue::Plain, false);
 }

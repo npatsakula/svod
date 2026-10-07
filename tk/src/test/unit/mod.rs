@@ -3,6 +3,7 @@ mod elementwise;
 mod fa;
 mod fa_batch_var;
 mod gemm;
+mod gemm_batch_var;
 mod golden;
 mod grid;
 mod guide;

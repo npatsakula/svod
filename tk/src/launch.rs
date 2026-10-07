@@ -233,8 +233,36 @@ pub fn batched_dims(
     operand: &'static str,
     rank: usize,
 ) -> Result<(Vec<usize>, Option<VarBatch>)> {
+    batched_dims_of(t, kernel, operand, rank, true)
+}
+
+/// [`batched_dims`] for an operand of any rank of at least `min_rank`.
+pub fn batched_dims_at_least(
+    t: &Tensor,
+    kernel: &'static str,
+    operand: &'static str,
+    min_rank: usize,
+) -> Result<(Vec<usize>, Option<VarBatch>)> {
+    batched_dims_of(t, kernel, operand, min_rank, false)
+}
+
+/// Whether `t`'s shape is one a hand kernel can bind: every dim static, except
+/// a leading dim that may be a bound runtime variable ([`batched_dims`]) — the
+/// gate a caller checks before handing an operand to a kernel.
+pub fn static_past_batch(t: &Tensor) -> bool {
+    batched_dims_of(t, "", "", 1, false).is_ok()
+}
+
+fn batched_dims_of(
+    t: &Tensor,
+    kernel: &'static str,
+    operand: &'static str,
+    rank: usize,
+    exact: bool,
+) -> Result<(Vec<usize>, Option<VarBatch>)> {
     let shape = t.shape().ok().context(OperandIndeterminateShapeSnafu { kernel, operand })?;
-    snafu::ensure!(shape.len() == rank, OperandRankSnafu { kernel, operand, expected: rank, got: shape.len() });
+    let ranked = if exact { shape.len() == rank } else { shape.len() >= rank };
+    snafu::ensure!(ranked, OperandRankSnafu { kernel, operand, expected: rank, got: shape.len() });
     let batch = match &shape[0] {
         SInt::Symbolic(dim) => {
             let var = match dim.op() {

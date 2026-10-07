@@ -8,12 +8,13 @@ use svod_tensor::error::Result;
 
 use crate::attention::tk_launch_error;
 
-/// Whether the hand GEMM can take these operands: concrete 16-bit, matching
-/// dtypes. The tile grid is the kernel's own call (`Ok(None)`).
+/// Whether the hand GEMM can take these operands: 16-bit, matching dtypes,
+/// `x` static past a leading batch that may be a JIT `batch_var`. The tile grid
+/// is the kernel's own call (`Ok(None)`).
 fn fusable(x: &Tensor, w: &Tensor) -> bool {
     matches!(x.dtype().base(), ScalarDType::BFloat16 | ScalarDType::Float16)
         && x.dtype() == w.dtype()
-        && x.shape().is_ok_and(|s| s.iter().all(|d| d.as_const().is_some()))
+        && svod_tk::static_past_batch(x)
 }
 
 /// `x` `[B, L, K]` · `w` `[N, K]`ᵀ → `[B, L, N]`. The tk kernel takes concrete
