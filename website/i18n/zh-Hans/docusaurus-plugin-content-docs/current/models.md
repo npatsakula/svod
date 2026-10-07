@@ -17,6 +17,7 @@ sidebar_label: 运行模型
 | 语音活动检测 | Silero VAD 16k | `silero_vad` | `vpermilp/silero-vad` |
 | 语音增强 | GTCRN | `gtcrn` | `vpermilp/gtcrn` |
 | 说话人日志 | DiariZen（WavLM + Conformer） | `diarizen` | `BUT-FIT/diarizen-wavlm-large-s80-md-v2` |
+| 说话人日志 | Nemotron-3-Diarization（离线、流式；最多 8 名说话人） | `nemotron_diar` | `nvidia/Nemotron-3-Diarization` |
 | 说话人嵌入 | WeSpeaker ResNet34 | `wespeaker` | `pyannote/wespeaker-voxceleb-resnet34-LM` |
 | 文本嵌入 | BGE-M3（dense、sparse、ColBERT）、BGE-reranker-v2-m3 | `bgem3` | `BAAI/bge-m3`、`BAAI/bge-reranker-v2-m3` |
 | 文本嵌入 | Qwen3-Embedding-0.6B、Qwen3-Reranker-0.6B | `qwen3` | `Qwen/Qwen3-Embedding-0.6B` |
@@ -65,6 +66,7 @@ cargo run -p svod-model --release --example whisper_infer  -- audio.wav [--size 
 cargo run -p svod-model --release --example vad_stream     -- audio.wav                # streaming VAD events
 cargo run -p svod-model --release --example vad_bench      -- audio.wav                # Silero vs FireRedVAD
 cargo run -p svod-model --release --example gtcrn_enhance  -- --in noisy.wav --out clean.wav --hub
+cargo run -p svod-model --release --example nemotron_diarize -- audio.wav [--stream low|very-low|ultra-low]
 cargo run -p svod-model --release --example qwen3_embed    -- --texts texts.txt --batch 8 --max-len 512
 cargo run -p svod-model --release --example resnet_classify -- --hub --image dog.bin --side 224
 cargo run -p svod-model --release --example yolo_detect    -- --hub --scale small --image photo.bin --side 640
@@ -203,6 +205,42 @@ for chunk in waveform.chunks(CHUNK) {               // pad the last one to CHUNK
     jit.output()?.copyout(bytemuck::cast_slice_mut(&mut out))?;
 }
 ```
+
+---
+
+## 说话人日志
+
+`nemotron_diar` 运行 Nemotron-3-Diarization：对每个 10 ms 帧给出最多 8 名说话人的
+活动概率，说话人按首次出现的顺序编号。录音与实时流走同一个循环——音频被切成块，
+每块与由先前帧组成的说话人缓存一起编码——两者只在块大小上不同（离线，或模型卡中的
+1.04 / 0.64 / 0.32 s 延迟）：
+
+```rust
+use svod_arch::diarization::{Binarization, write_rttm};
+use svod_dtype::DType;
+use svod_model::nemotron_diar::{Diarizer, NemotronDiar, StreamingMode};
+
+// 整段录音。
+let mut diarizer = Diarizer::offline(NemotronDiar::from_hub(DType::BFloat16, 1)?)?;
+let result = diarizer.diarize(&waveform, 16000)?;        // probs: [frames, 8], 每行 10 ms
+write_rttm(std::io::stdout(), "meeting", &result.segments(&Binarization::default()))?;
+
+// 实时流，延迟 1.04 s。
+let model = NemotronDiar::from_hub(DType::BFloat16, 1)?;
+let mut diarizer = Diarizer::streaming(model, StreamingMode::LowLatency)?;
+let mut session = diarizer.session();
+for block in microphone {
+    session.push(&block)?;
+    diarizer.run(&mut [&mut session])?;
+    let probs = session.take_probs();                    // 自上次调用以来输出的行
+}
+session.finish();
+diarizer.run(&mut [&mut session])?;
+```
+
+`run` 接受任意数量的会话，并把它们已就绪的块合成批次，批大小上限为传给 `from_hub`
+的 `max_batch`。`svod_arch::diarization` 包含与模型无关的部分：说话人缓存、把概率
+转换为片段的阈值，以及 RTTM 输出。
 
 ---
 

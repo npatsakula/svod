@@ -55,7 +55,7 @@ Svod के साथ स्पीच, टेक्स्ट और विज़
 | स्पीच रिकग्निशन | Whisper, GigaAM v3 (CTC, RN-T) |
 | वॉइस एक्टिविटी | FireRedVAD, Silero VAD |
 | स्पीच एन्हांसमेंट | GTCRN |
-| स्पीकर विश्लेषण | DiariZen, WeSpeaker |
+| स्पीकर विश्लेषण | Nemotron-3-Diarization, DiariZen, WeSpeaker |
 | टेक्स्ट एम्बेडिंग और रीरैंकिंग | BGE-M3, Qwen3-Embedding, ModernBERT |
 | विज़न | YOLO26, ResNet |
 | बाकी सब | [ONNX इम्पोर्टर](https://github.com/npatsakula/svod/tree/main/onnx/) ([ऑपरेटर कवरेज](https://github.com/npatsakula/svod/tree/main/onnx/PARITY.md)) |
