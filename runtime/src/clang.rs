@@ -25,6 +25,7 @@ use crate::{Error, Result};
 pub(crate) struct ClangToolchain {
     executable: PathBuf,
     executable_digest: [u8; 32],
+    version: String,
     identity: String,
 }
 
@@ -41,13 +42,18 @@ impl ClangToolchain {
         };
         let version = String::from_utf8(version)
             .map_err(|error| Error::JitCompilation { reason: format!("clang --version was not UTF-8: {error}") })?;
-        let identity =
-            format!("path={};sha256={};version={}", executable.display(), hex(&executable_digest), version.trim());
-        Ok(Self { executable, executable_digest, identity })
+        let version = version.trim().to_string();
+        let identity = format!("path={};sha256={};version={version}", executable.display(), hex(&executable_digest));
+        Ok(Self { executable, executable_digest, version, identity })
     }
 
     pub(crate) fn identity(&self) -> &str {
         &self.identity
+    }
+
+    /// `clang --version`'s output, trimmed.
+    pub(crate) fn version(&self) -> &str {
+        &self.version
     }
 
     /// Resolve `flags` into the concrete target description clang will use —
