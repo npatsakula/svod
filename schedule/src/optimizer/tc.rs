@@ -320,11 +320,11 @@ pub fn get_reduce_axes_count(tc: &TensorCore) -> usize {
 
 const NO_COMPATIBLE_TC: &str = "no compatible tensor core found";
 
-/// Largest padded tail a tensor-core tile may add at `tc_opt = 2`, as a
-/// percentage of the axis. Wide enough for a sequence that misses the tile by
-/// a few rows (1500 -> 1504, 15 -> 16), too tight for a beam-width M to pay
-/// for a full tile (5 -> 16), where a memory-bound kernel is the right answer.
-/// `tc_opt = 3` keeps only PADTO's own limit.
+/// Largest padded tail a tensor-core tile may add at `tc_opt = 2`, the
+/// heuristics' level, as a percentage of the axis. Wide enough for a sequence
+/// that misses the tile by a few rows (1500 -> 1504, 15 -> 16), too tight for a
+/// beam-width M to take a full tile (5 -> 16) with no timing to say it pays.
+/// `tc_opt = 3`, BEAM's level, keeps only PADTO's own limit.
 const TC_PAD_BUDGET_PERCENT: usize = 25;
 
 fn within_pad_budget(size: usize, tile: usize) -> bool {
@@ -403,12 +403,12 @@ fn apply_axis_choice_impl(
                 Some(size) => {
                     if !(size as usize).is_multiple_of(tc_dim) {
                         // Padded rows are not free: they stream the same weights
-                        // and multiply the MACs. A 5-row M on a 16-row core is
-                        // 3.2x the work of a memory-bound GEMV, and BEAM times
-                        // it as a win only because the tile it displaces is
-                        // worse still. A compute-bound kernel is the other way
-                        // round: the padded core still runs several times faster
-                        // than the scalar loop, so the budget steps aside.
+                        // and multiply the MACs, so the heuristics pad a
+                        // memory-bound kernel only within the budget, and BEAM's
+                        // own level leaves the call to its timing. A
+                        // compute-bound kernel is the other way round: the
+                        // padded core still runs several times faster than the
+                        // scalar loop, so the budget steps aside.
                         if tc_opt == 2 && !compute_bound && !within_pad_budget(size as usize, tc_dim) {
                             return ValidationFailedSnafu {
                                 op: "TC",

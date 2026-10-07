@@ -90,9 +90,11 @@ pub static BEAM_ACTIONS: LazyLock<Vec<Opt>> = LazyLock::new(|| {
     // twelve. Survivors after post-compile dedup are unchanged compared to a
     // wider brute-force enumeration because `seen_libs` collapses duplicate
     // kernels, and an out-of-range choice fails in `apply_opt` at no cost.
+    // The axis choices pad up to PADTO's own limit: whether a padded tile pays
+    // is the timing's call, and the pad budget stays with the heuristics.
     const TC_AXIS_CHOICES: usize = 18;
     const TC_OPT_DEFAULT: usize = 0;
-    const TC_OPT_AXIS: usize = 2;
+    const TC_OPT_AXIS: usize = 3;
     let use_tc = std::env::var("TC").ok().and_then(|value| value.parse().ok()).unwrap_or(1);
     let tc_opt = std::env::var("TC_OPT").ok().and_then(|value| value.parse().ok()).unwrap_or(TC_OPT_AXIS);
     actions.push(Opt::tc(Some(0), -1, TC_OPT_DEFAULT, use_tc));

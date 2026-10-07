@@ -154,11 +154,32 @@ fn beam_actions_cover_every_opt_kind_in_amount_major_order() {
     // TC: one strict default-axis action plus one action per axis choice, all
     // carrying the `TC_OPT` level the grid was built with.
     let use_tc = std::env::var("TC").ok().and_then(|value| value.parse().ok()).unwrap_or(1usize);
-    let tc_opt = std::env::var("TC_OPT").ok().and_then(|value| value.parse().ok()).unwrap_or(2usize);
+    let tc_opt = std::env::var("TC_OPT").ok().and_then(|value| value.parse().ok()).unwrap_or(3usize);
     let tensor_cores: Vec<_> = BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::TC).collect();
     assert_eq!(tensor_cores.len(), 19, "a strict default plus eighteen axis choices, both ways round");
     assert_eq!(tensor_cores.iter().filter(|action| action.arg.tc().unwrap().1 == 0).count(), 1);
     assert!(tensor_cores[1..].iter().all(|action| action.arg.tc() == Ok((-1, tc_opt, use_tc))));
+}
+
+/// BEAM's tensor-core actions pad up to PADTO's own 4x, past the budget the
+/// heuristics keep, and leave it to the timing whether a padded tile pays. A
+/// beam-width decode GEMV is the shape the budget refuses.
+#[test_case(crate::optimizer::Renderer::cuda(); "cuda")]
+#[test_case(crate::optimizer::Renderer::for_amd_arch(svod_dtype::AmdArch::Gfx1201); "rdna4")]
+fn beam_tc_actions_tile_a_beam_width_gemv(renderer: crate::optimizer::Renderer) {
+    use svod_dtype::DType;
+    let sink = crate::test::unit::optimizer::kernels::matmul_accum(5, 1536, 384, DType::Float16, DType::Float32);
+    let tc_opt = std::env::var("TC_OPT").ok().and_then(|value| value.parse().ok()).unwrap_or(3usize);
+    let tiled =
+        BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::TC && action.arg.tc().unwrap().1 != 0).any(|action| {
+            let mut scheduler = Scheduler::new(sink.clone(), renderer.clone());
+            crate::optimizer::opts::apply_opt(&mut scheduler, action, true).is_ok()
+        });
+    assert_eq!(
+        tiled,
+        tc_opt >= 3,
+        "an axis-choice TC action tiles an M = 5 GEMV exactly when it may pad past the budget"
+    );
 }
 
 /// The persistent BEAM cache replays a winning plan, so its key must separate behavior from execution-only knobs and pin the action space.

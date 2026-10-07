@@ -73,7 +73,7 @@ Results persist in a `sled` database at `$SVOD_BEAM_CACHE_DIR/beam_cache`, else 
 | `NOLOCALS` / `SVOD_NOLOCALS` | unset | add the `NOLOCALS` action |
 | `PARALLEL` | 0 | compile workers (GPU defaults to the thread budget, else 1) |
 | `BEAM_TIMEOUT_SEC`, `BEAM_MAX_TASKS_PER_CHILD` | 10, 16 | worker watchdog and recycling |
-| `TC`, `TC_OPT` | 1, 2 | BEAM's tensor-core actions (`TC_SELECT` is ignored under BEAM: always `Auto`) |
+| `TC`, `TC_OPT` | 1, 3 | BEAM's tensor-core actions (`TC_SELECT` is ignored under BEAM: always `Auto`) |
 | `BEAM_DEBUG`, `BEAM_LOG_SURPASS_MAX` | unset | diagnostics |
 | `IGNORE_BEAM_CACHE`, `SVOD_BEAM_CACHE_DIR` | unset | cache control |
 
@@ -102,7 +102,7 @@ The heuristic seed inside BEAM uses `HeuristicsConfig::from_env()`, but the sear
 
 `tc.rs`: `detect_matmul` finds `REDUCE(Add, MUL(in0, in1), reduce_ranges)`; the ranges only `in0` uses are the M candidates, those only `in1` uses are N, the reduce ranges are K, and every `(M, N, K)` triple is an axis choice (an M/N range that is itself a `Reduce` axis is rejected); `select_tensor_core` matches input and output scalar dtypes (an fp8 input without a native core falls back to the f16 core); `apply_with_axis_choice` loops over axis choices × cores within a budget of 64 trials. A core is applied by splitting the axes: one `Warp` range of extent `tc.threads`, an `Upcast` axis of size 2 per `TcOpt::Upcast` entry, each `TcOpt::Local` entry taking a digit of the warp index (`warp % 2`, `warp / 2`), K becoming `log2(K)` `Unroll` axes of size 2; leftover N/M stay `Global` and leftover reduce axes wrap the `WMMA` in a `REDUCE`. `TcUsage::ShapeOnly` (`SVOD_TC=2`) performs the splits but emits no `WMMA`.
 
-`TcOpt` levels (`TC_OPT`): **0 Strict** — one reduce axis only, M/N/K must divide; **1 Relaxed** — same divisibility rule inside `tc.rs`; **2 Padded** (default) — `PADTO` a non-divisible axis when the padding adds at most 25%; **3 Unbounded** — pad under `PADTO`'s own 4× limit. A symbolic axis never uses a tensor core.
+`TcOpt` levels (`TC_OPT`): **0 Strict** — one reduce axis only, M/N/K must divide; **1 Relaxed** — same divisibility rule inside `tc.rs`; **2 Padded** (the heuristics' default) — `PADTO` a non-divisible axis when the padding adds at most 25%, or up to `PADTO`'s limit on a compute-bound kernel; **3 Unbounded** (BEAM's default) — pad under `PADTO`'s own 4× limit, and let the timing decide whether the padded tile pays. A symbolic axis never uses a tensor core.
 
 ## Programmatic configuration
 
