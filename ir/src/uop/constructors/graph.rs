@@ -184,21 +184,42 @@ impl UOp {
     /// Creates storage in the requested address space with the same logical
     /// shape, matching Tinygrad's `placeholder_like`. For multi-device wrappers
     /// (MULTI/MSELECT/MSTACK), placeholder shape is derived from the underlying
-    /// shard (analog of tinygrad's `max_shard_shape`).
-    ///
-    /// Unlike Tinygrad, a bounded symbolic dim is sized at its `vmax`: the
-    /// scheduler allocates a symbolic buffer at that capacity, so the kernel binds
-    /// the whole allocation and reads the live extent from the variable itself.
-    /// An unbounded symbolic dim is rejected.
+    /// shard (analog of tinygrad's `max_shard_shape`). A symbolic dim is
+    /// rejected, as in Tinygrad; [`placeholder_at_capacity`](Self::placeholder_at_capacity)
+    /// is the custom-kernel form that sizes it instead.
     pub fn placeholder_like(src: &Arc<Self>, slot: usize, addrspace: svod_dtype::AddrSpace) -> Result<Arc<Self>> {
         let anchor = Self::placeholder_like_anchor(src);
         let shape = anchor.shape()?.ok_or(Error::MissingShape { operation: "placeholder_like" })?;
+        let concrete = shape
+            .iter()
+            .map(|dim| {
+                dim.as_const()
+                    .map(crate::SInt::Const)
+                    .ok_or(Error::SymbolicShapeUnsupported { operation: "placeholder_like" })
+            })
+            .collect::<Result<crate::shape::Shape>>()?;
+        Self::placeholder(&concrete, anchor.dtype(), slot, addrspace, None)
+    }
+
+    /// [`placeholder_like`](Self::placeholder_like) for a custom kernel's
+    /// operand: a bounded symbolic dim is sized at its `vmax`. The scheduler
+    /// allocates a symbolic buffer at that capacity, so the kernel binds the
+    /// whole allocation and reads the live extent from the variable itself (a
+    /// JIT `batch_var` as a launch-grid extent). An unbounded symbolic dim is
+    /// rejected. This departs from Tinygrad, which rejects any symbolic dim.
+    pub fn placeholder_at_capacity(
+        src: &Arc<Self>,
+        slot: usize,
+        addrspace: svod_dtype::AddrSpace,
+    ) -> Result<Arc<Self>> {
+        let anchor = Self::placeholder_like_anchor(src);
+        let shape = anchor.shape()?.ok_or(Error::MissingShape { operation: "placeholder_at_capacity" })?;
         let capacity = shape
             .iter()
             .map(|dim| {
                 dim.vmax()
                     .map(crate::SInt::Const)
-                    .ok_or(Error::SymbolicShapeUnsupported { operation: "placeholder_like" })
+                    .ok_or(Error::SymbolicShapeUnsupported { operation: "placeholder_at_capacity" })
             })
             .collect::<Result<crate::shape::Shape>>()?;
         Self::placeholder(&capacity, anchor.dtype(), slot, addrspace, None)
@@ -239,7 +260,7 @@ impl UOp {
         let placeholders: Vec<Arc<Self>> = srcs
             .iter()
             .enumerate()
-            .map(|(i, s)| UOp::placeholder_like(s, i, svod_dtype::AddrSpace::Global))
+            .map(|(i, s)| UOp::placeholder_at_capacity(s, i, svod_dtype::AddrSpace::Global))
             .collect::<Result<_>>()?;
         let contig_srcs: Vec<Arc<Self>> = srcs
             .into_iter()

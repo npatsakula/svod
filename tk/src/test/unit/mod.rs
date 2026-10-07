@@ -1,4 +1,5 @@
 mod arch;
+mod direct_launch;
 mod elementwise;
 mod fa;
 mod fa_batch_var;

@@ -187,6 +187,10 @@ pub enum Error {
     /// An operand has a symbolic (non-constant) dimension; the kernel needs static dims.
     #[snafu(display("{kernel}: operand {operand}: dim {axis} is not statically known"))]
     OperandSymbolicDim { kernel: &'static str, operand: &'static str, axis: usize },
+    /// A direct launch was given a variable grid extent; only a graph launch
+    /// binds variables.
+    #[snafu(display("{name}: launch grid extent {axis} is not a constant; only a graph launch binds a variable"))]
+    SymbolicGridExtent { name: String, axis: usize },
 }
 
 /// Resolve a tensor operand's shape to concrete `usize` dims, or an
@@ -716,6 +720,10 @@ pub fn compile_kernel<F>(
 where
     F: FnOnce(&crate::Kernel) -> Arc<UOp>,
 {
+    let (name, grid): (String, crate::Grid) = (name.into(), grid.into());
+    if let Some(axis) = grid.0.iter().position(|extent| !matches!(extent.op(), svod_ir::Op::Const(..))) {
+        return SymbolicGridExtentSnafu { name, axis }.fail();
+    }
     // Inputs must hold concrete DATA: realize (compute) any lazy graph first.
     // Outputs are allocated fresh by `realize_buffer` below.
     for t in ins.iter() {
