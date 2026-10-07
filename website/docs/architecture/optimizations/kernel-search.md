@@ -47,18 +47,19 @@ After `apply_pre_optimization` a kernel is a loop nest of `Weak` and `Reduce` ra
 
 The search (`beam_search_remote_staged`):
 
-1. Start with `[(scheduler, Duration::MAX)]` and add the heuristics result as an extra first-wave candidate.
+1. Start with `[(scheduler, Duration::MAX)]`.
 2. **Expand**: for every beam member, `generate_actions` tries each of the 193 `BEAM_ACTIONS` (200 with `BEAM_PADTO`): `passes_prefilter` (the axis exists; an action whose amount equals the axis size is skipped when the `0` variant exists), `apply_opt`, `validate_limits` (`upcast_prod / tc_up <= max_upcast`, `local_prod <= max_local`). `NOLOCALS` is appended per member when `enable_nolocals`.
 3. **Compile** the candidates in a pool of worker processes; a candidate is dropped there if its linearized op count reaches `max_uops` or compilation exceeds `compile_timeout_secs`.
 4. **Filter**: candidates with more than 1000× the wave's fewest `compute_ops` are dropped, then duplicates by binary (or source) key.
 5. **Time**: `num_runs` runs each, score = minimum; a run is cut short at 3× the incumbent; the global size is capped at 65536 and the time scaled back.
 6. **Keep** the best `beam_width`. Stop when the best time no longer improves by `min_progress_ns` (or is already below it); when it did improve the beam collapses to the single winner for the next wave.
+7. **Compare**: compile the search's answer and the heuristics' plan (the seed; `BEAM_SEED=0` drops it) together, time them in one batch and keep the faster, the answer on a tie (tinygrad's `BEAM_COMPARE`). The seed never enters a wave, where it would hold a binary the beam may reach later and win or lose that slot by compile order.
 
 The action list (`BEAM_ACTIONS`): `UPCAST` amounts `[0,2,3,4,5,7]` × axes 0..8 (48), `UNROLL` `[0,4,7]` × 0..5 (15), `LOCAL` `[2,3,4,8,13,16,29]` × 0..6 (42) plus `(0,32)` and `(6,2)`, `GROUPTOP` `[13,16,28,29,32,49,64,256]` × 0..3 (24), `GROUP` `[0,4,8,16]` × 0..3 (12), `TC` (one `tc_opt = 0` action plus nine axis choices at `TC_OPT`), `SWAP` pairs within 0..5 (10), `THREAD` `[2,3,4,5,8,12,16,24,32,64]` × 0..3 (30). `BEAM_PADTO` adds `PADTO(axis, 32)` for axes 0..7.
 
 ### Cache
 
-Results persist in a `sled` database at `$SVOD_BEAM_CACHE_DIR/beam_cache`, else `~/.cache/svod/beam_cache` (`dirs::cache_dir()`). The key (`CacheKey`, schema 11) is the structural AST hash plus beam width, device, `renderer.cache_fingerprint()`, the compiler identity, the limits (`max_upcast`, `max_local`, `max_uops`, `num_runs`, `min_progress_ns`, `enable_nolocals`, `compile_timeout_secs`), the behavior fingerprint (`transcendental`, `disable_fast_idiv`) and a hash of the action space. The value is the `applied_opts` list; a hit is replayed with `replay_opts`, validated and benchmarked once, and invalidated if that fails. `IGNORE_BEAM_CACHE=1` bypasses it, `clear_cache` empties it.
+Results persist in a `sled` database at `$SVOD_BEAM_CACHE_DIR/beam_cache`, else `~/.cache/svod/beam_cache` (`dirs::cache_dir()`). The key (`CacheKey`, schema 15) is the structural AST hash plus beam width, device, `renderer.cache_fingerprint()`, the compiler identity, the limits (`max_upcast`, `max_local`, `max_uops`, `num_runs`, `min_progress_ns`, `enable_nolocals`, `compile_timeout_secs`), the behavior fingerprint (`transcendental`, `disable_fast_idiv`), a hash of the action space and the seed's plan, so an answer that may be the seed replays only where the same seed would compete again. The value is the `applied_opts` list; a hit is replayed with `replay_opts`, validated and benchmarked once, and invalidated if that fails. `IGNORE_BEAM_CACHE=1` bypasses it, `clear_cache` empties it.
 
 ### Environment
 

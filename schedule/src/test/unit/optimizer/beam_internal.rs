@@ -64,7 +64,8 @@ struct CacheGuard {
 impl CacheGuard {
     /// Invalidate the entry a leftover on-disk key would otherwise hit.
     fn new(scheduler: &Scheduler, config: &BeamConfig, identity: &str, fingerprint: u64) -> Self {
-        let key = CacheKey::from_scheduler(scheduler, config, identity, fingerprint);
+        let seed = heuristic_seed(scheduler, config);
+        let key = CacheKey::from_scheduler(scheduler, config, identity, fingerprint, seed.as_ref());
         cache_invalidate(&key);
         Self { key }
     }
@@ -167,7 +168,7 @@ fn beam_cache_key_separates_behavior_and_ignores_execution_details() {
     let scheduler = weak_axis_scheduler(0x1111);
     let base = BeamConfig::default();
     let key = |config: &BeamConfig, compiler: &str, ast_hash| {
-        CacheKey::from_scheduler(&scheduler, config, compiler, ast_hash).to_bytes()
+        CacheKey::from_scheduler(&scheduler, config, compiler, ast_hash, None).to_bytes()
     };
     let variant = |config: BeamConfig| key(&config, "compiler", 0);
     let base_key = key(&base, "compiler", 0);
@@ -198,16 +199,31 @@ fn beam_cache_key_separates_behavior_and_ignores_execution_details() {
     let ast = UOp::sink(vec![UOp::native_const(1i32)]);
     let amd = |arch| Scheduler::new(ast.clone(), crate::optimizer::Renderer::for_amd_arch(arch));
     assert_ne!(
-        CacheKey::from_scheduler(&amd(AmdArch::Gfx1100), &base, "amd", 0).to_bytes(),
-        CacheKey::from_scheduler(&amd(AmdArch::Gfx1151), &base, "amd", 0).to_bytes(),
+        CacheKey::from_scheduler(&amd(AmdArch::Gfx1100), &base, "amd", 0, None).to_bytes(),
+        CacheKey::from_scheduler(&amd(AmdArch::Gfx1151), &base, "amd", 0, None).to_bytes(),
         "the exact AMD target must change the key"
     );
     // A replayed plan is only valid under the action space that produced it, and
     // `BEAM_ACTIONS` is built from `BEAM_PADTO` / `TC` / `TC_OPT`.
-    let full = CacheKey::from_scheduler(&scheduler, &base, "compiler", 0);
+    let full = CacheKey::from_scheduler(&scheduler, &base, "compiler", 0, None);
     assert_eq!(full.action_space, action_space_hash(&BEAM_ACTIONS));
     assert_ne!(full.action_space, action_space_hash(&BEAM_ACTIONS[1..]));
     assert_ne!(base_key, CacheKey { action_space: full.action_space ^ 1, ..full }.to_bytes());
+}
+
+/// A stored answer may be the hand-coded plan it was compared against, so it
+/// replays only where that plan would compete again: under `BEAM_SEED=0`, or
+/// heuristics that stack other opts on this kernel, the search runs afresh.
+#[test]
+fn the_cache_key_carries_the_plan_the_search_was_compared_against() {
+    let scheduler = matvec_scheduler();
+    let config = BeamConfig::default();
+    let seed = heuristic_seed(&scheduler, &config).expect("the matvec shape has a hand-coded stack");
+    let other = generate_actions(&scheduler, &config).into_iter().next().expect("a first-wave action");
+    let key = |seed: Option<&Scheduler>| CacheKey::from_scheduler(&scheduler, &config, "compiler", 0, seed).to_bytes();
+    assert_ne!(key(Some(&seed)), key(None), "a search without the seed must not replay a seeded answer");
+    assert_ne!(key(Some(&seed)), key(Some(&other)), "another hand-coded plan must not replay this one's answer");
+    assert_eq!(key(Some(&seed)), key(Some(&seed.clone())), "the same seed replays");
 }
 
 /// Every opt kind must survive the persistent-cache encoding unchanged.
@@ -350,14 +366,14 @@ fn test_remote_beam_parent_tracks_only_opt_sequences() {
     assert!(result.compiled > 0);
 }
 
-/// The staged loop streams out-of-order compiles, drops duplicates by binary key and bloated candidates, and serializes backend timing.
+/// The staged loop streams out-of-order compiles, drops duplicates by binary key and bloated candidates, and serializes backend timing, the closing comparison included.
 #[test]
 fn test_staged_beam_streams_unordered_compiles_dedups_and_serializes_timing() {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     struct FakeArtifact {
-        index: usize,
+        ns: u64,
     }
     let scheduler = weak_axis_scheduler(0x51a9);
     let config = BeamConfig {
@@ -367,24 +383,31 @@ fn test_staged_beam_streams_unordered_compiles_dedups_and_serializes_timing() {
         disable_cache: true,
         ..Default::default()
     };
-    let (opts_by_index, compile_calls) = (Arc::new(Mutex::new(HashMap::new())), Arc::new(AtomicUsize::new(0)));
+    let (waves, compile_calls) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicUsize::new(0)));
     let (benchmark_calls, active, maximum) =
         (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let result = beam_search_staged(
         scheduler,
         &config,
         {
-            let (opts_by_index, calls) = (Arc::clone(&opts_by_index), Arc::clone(&compile_calls));
+            let (waves, calls) = (Arc::clone(&waves), Arc::clone(&compile_calls));
+            // A plan times in the closing comparison as it did in its wave.
+            let mut times: HashMap<Vec<Opt>, u64> = HashMap::new();
             move |candidates: &[Scheduler], emit: &mut dyn FnMut(usize, CompiledCandidate<FakeArtifact>)| {
+                let mut waves = waves.lock().unwrap();
+                let first = waves.is_empty();
+                waves.push(plans(candidates));
                 for index in (0..candidates.len()).rev() {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    opts_by_index.lock().unwrap().insert(index, candidates[index].applied_opts.clone());
-                    let binary_key = if matches!(index, 3 | 4) { vec![0xdd] } else { index.to_le_bytes().to_vec() };
-                    let compute_ops = Some(if index == 2 { 1001 } else { 1 });
+                    let opts = &candidates[index].applied_opts;
+                    let ns = *times.entry(opts.clone()).or_insert(10_000 - index as u64);
+                    let binary_key =
+                        if first && matches!(index, 3 | 4) { vec![0xdd] } else { ns.to_le_bytes().to_vec() };
+                    let compute_ops = Some(if first && index == 2 { 1001 } else { 1 });
                     emit(
                         index,
                         CompiledCandidate {
-                            artifact: FakeArtifact { index },
+                            artifact: FakeArtifact { ns },
                             binary_key,
                             compute_ops,
                             preparation: Duration::ZERO,
@@ -401,22 +424,24 @@ fn test_staged_beam_streams_unordered_compiles_dedups_and_serializes_timing() {
                 maximum.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(1));
                 active.fetch_sub(1, Ordering::SeqCst);
-                batch.iter().map(|artifact| Some(Duration::from_nanos(10_000 - artifact.index as u64))).collect()
+                batch.iter().map(|artifact| Some(Duration::from_nanos(artifact.ns))).collect()
             }
         },
     )
     .unwrap();
-    assert!(compile_calls.load(Ordering::SeqCst) > 6, "the fixture scheduler must expose enough candidates");
+    let waves = waves.lock().unwrap();
+    let (first, finalists) = (&waves[0], waves.len() - 1);
+    assert!(first.len() > 6, "the fixture scheduler must expose enough candidates");
+    assert_eq!(finalists, 1, "one wave, then the closing comparison");
     assert_eq!(result.generated, compile_calls.load(Ordering::SeqCst));
     assert_eq!(result.unique_ir, 0);
     assert_eq!(result.compiled, compile_calls.load(Ordering::SeqCst));
-    assert_eq!(result.unique_binary, result.compiled - 2, "one bloated and one duplicate binary are removed");
-    assert_eq!(benchmark_calls.load(Ordering::SeqCst), result.unique_binary);
-    assert_eq!(result.benchmarked, result.unique_binary);
+    assert_eq!(result.unique_binary, first.len() - 2, "one bloated and one duplicate binary are removed");
+    assert_eq!(benchmark_calls.load(Ordering::SeqCst), result.benchmarked);
+    assert_eq!(result.benchmarked, result.unique_binary + waves[1].len(), "the finalists are timed on top");
     assert_eq!(maximum.load(Ordering::SeqCst), 1, "backend timing must be serialized");
-    let opts = opts_by_index.lock().unwrap();
-    let winning = opts.keys().copied().filter(|index| !matches!(index, 1 | 2 | 4)).max().unwrap();
-    assert_eq!(result.scheduler.applied_opts, opts[&winning]);
+    // The last candidate is the wave's fastest, and the seed (a first-wave action here) is slower.
+    assert_eq!(result.scheduler.applied_opts, first[first.len() - 1]);
 }
 
 #[test]
@@ -582,9 +607,11 @@ fn candidates_are_timed_in_batches_under_one_early_stop_bound() {
     .expect("remote beam search");
     let batches = batches.lock().unwrap();
     assert!(result.iterations > 1, "the fixture must run more than one wave: {}", result.iterations);
+    let ((finalists, bound), batches) = batches.split_last().expect("timed batches");
+    assert_eq!((finalists.len(), *bound), (2, None), "the closing comparison times the answer and the seed, unbounded");
     let timed: usize = batches.iter().map(|(batch, _)| batch.len()).sum();
     assert_eq!(timed, result.unique_binary, "every unique binary is timed exactly once");
-    assert_eq!(result.benchmarked, result.unique_binary);
+    assert_eq!(result.benchmarked, result.unique_binary + finalists.len());
     assert!(batches.iter().all(|(batch, _)| !batch.is_empty() && batch.len() <= config.timing_batch));
     let full = batches.iter().filter(|(batch, _)| batch.len() == config.timing_batch).count();
     assert!(full > 1, "a wave larger than the batch fills more than one: {batches:?}");
@@ -659,7 +686,7 @@ fn unreachable_seed(scheduler: &Scheduler, config: &BeamConfig) -> Vec<Opt> {
     seed.applied_opts
 }
 
-/// The hand-coded kernel is timed in the first wave, so a search whose scorer prefers it returns it.
+/// The hand-coded kernel is timed against the search's answer once the search is over, so a search whose scorer prefers it returns it.
 #[test]
 fn beam_search_seeds_the_hand_coded_kernel() {
     let scheduler = matvec_scheduler();
@@ -682,11 +709,8 @@ fn beam_search_seeds_the_hand_coded_kernel() {
     assert_eq!(result.scheduler.applied_opts, seed_opts, "the seeded stack must win when it is fastest");
     assert_eq!(result.timing, Duration::from_nanos(100));
     let scored = scored.lock().unwrap();
-    assert_eq!(
-        scored.iter().filter(|opts| **opts == seed_opts).count(),
-        1,
-        "the seed is timed once, in the first wave"
-    );
+    assert_eq!(scored.iter().filter(|opts| **opts == seed_opts).count(), 1, "the seed is timed once");
+    assert_eq!(scored.last(), Some(&seed_opts), "after the last wave, against the search's answer");
 }
 
 /// A seed the field cannot beat neither ends the search nor steers it: the beam
@@ -753,7 +777,8 @@ fn a_losing_seed_leaves_the_search_unchanged() {
     assert_eq!(timed.iterations, unseeded.iterations);
 }
 
-/// The staged loop seeds its first compile wave too, not just the plain one.
+/// The staged loop holds the hand-coded kernel out of every wave and times it
+/// against its answer once the search is over.
 #[test]
 fn staged_beam_seeds_the_hand_coded_kernel() {
     let scheduler = matvec_scheduler();
@@ -767,7 +792,7 @@ fn staged_beam_seeds_the_hand_coded_kernel() {
         {
             let waves = std::sync::Arc::clone(&waves);
             move |candidates: &[Scheduler], emit: &mut dyn FnMut(usize, CompiledCandidate<u64>)| {
-                waves.lock().unwrap().push(candidates.iter().map(|c| c.applied_opts.clone()).collect::<Vec<_>>());
+                waves.lock().unwrap().push(plans(candidates));
                 for (index, candidate) in candidates.iter().enumerate() {
                     emit(index, compiled(plan_identity(&candidate.applied_opts), Some(1)));
                 }
@@ -778,12 +803,17 @@ fn staged_beam_seeds_the_hand_coded_kernel() {
         }),
     )
     .expect("staged beam search");
-    assert!(waves.lock().unwrap()[0].contains(&seed_opts), "the seed belongs to the first wave");
+    let waves = waves.lock().unwrap();
+    let (finalists, search) = waves.split_last().expect("waves");
+    assert!(search.iter().all(|wave| !wave.contains(&seed_opts)), "the seed belongs to no wave");
+    assert_eq!(finalists.len(), 2, "the answer, then the seed");
+    assert_eq!(finalists[1], seed_opts);
     assert_eq!(result.scheduler.applied_opts, seed_opts);
 }
 
-/// The remote protocol carries the seed as a multi-opt suffix: the worker replays the
-/// whole stack from the recorded prefix, and the parent can return it as the winner.
+/// The remote protocol carries the seed to the closing comparison as a multi-opt
+/// suffix: the worker replays the whole stack from the recorded prefix, and the
+/// parent can return it as the winner.
 #[test]
 fn remote_beam_replays_the_multi_opt_seed() {
     let scheduler = matvec_scheduler();
@@ -797,7 +827,6 @@ fn remote_beam_replays_the_multi_opt_seed() {
         scheduler,
         &config,
         |candidates: &[Vec<Opt>], emit: &mut dyn FnMut(usize, CompiledCandidate<u64>)| {
-            assert!(candidates.contains(&seed_opts), "the first wave must carry the seed's full plan");
             for (index, opts) in candidates.iter().enumerate() {
                 // The worker rebuilds every candidate from the base AST alone.
                 let Some(candidate) = apply_remote_candidate(worker.clone(), base, opts, &config) else { continue };
@@ -812,7 +841,7 @@ fn remote_beam_replays_the_multi_opt_seed() {
         }),
     )
     .expect("remote beam search");
-    assert!(replayed.lock().unwrap().contains(&seed_opts), "the seed must survive the worker's replay");
+    assert_eq!(replayed.lock().unwrap().last(), Some(&seed_opts), "the closing comparison replays the seed last");
     assert_eq!(result.scheduler.applied_opts, seed_opts);
     assert_eq!(result.timing, Duration::from_nanos(1));
 }
@@ -833,4 +862,108 @@ fn every_seed_replays_through_the_remote_protocol(renderer: crate::optimizer::Re
     let replayed =
         apply_remote_candidate(scheduler, base, &seed.applied_opts, &config).expect("the worker must replay the seed");
     assert_eq!(replayed.applied_opts, seed.applied_opts);
+}
+
+/// A staged search whose kernels time as `timing` says, with every compile of a
+/// wave landing in index order or `reversed`. A plan's kernel is `binary(opts)`,
+/// so two plans may share one. Returns the result and the plans of every wave.
+fn scripted_search(
+    scheduler: &Scheduler,
+    config: &BeamConfig,
+    reversed: bool,
+    binary: impl Fn(&[Opt]) -> u64,
+    timing: impl Fn(&[Opt]) -> u64,
+) -> (BeamResult, Vec<Vec<Vec<Opt>>>) {
+    let waves = std::sync::Mutex::new(Vec::new());
+    let result = beam_search_staged(
+        scheduler.clone(),
+        config,
+        |candidates: &[Scheduler], emit: &mut dyn FnMut(usize, CompiledCandidate<u64>)| {
+            waves.lock().unwrap().push(plans(candidates));
+            let mut order: Vec<usize> = (0..candidates.len()).collect();
+            if reversed {
+                order.reverse();
+            }
+            for index in order {
+                let opts = &candidates[index].applied_opts;
+                let mut candidate = compiled(timing(opts), Some(1));
+                candidate.binary_key = binary(opts).to_le_bytes().to_vec();
+                emit(index, candidate);
+            }
+        },
+        each(|ns: &u64| Some(Duration::from_nanos(*ns))),
+    )
+    .expect("staged beam search");
+    (result, waves.into_inner().unwrap())
+}
+
+/// Whether `opts` strictly extends `plan`.
+fn extends(opts: &[Opt], plan: &[Opt]) -> bool {
+    opts.len() > plan.len() && opts.starts_with(plan)
+}
+
+/// A timing that falls with depth on a `fast` plan and is slower than every fast
+/// plan elsewhere. No two plans tie, since on a tie the order compiles land in
+/// picks the winner, here as in tinygrad.
+fn scripted_timing(fast: bool, opts: &[Opt]) -> u64 {
+    let jitter = plan_identity(opts) % 1_000_000;
+    if fast { 100_000_000 - 1_000_000 * opts.len() as u64 - jitter } else { 200_000_000 + jitter }
+}
+
+/// A one-opt seed is an action the first wave offers anyway. Held out of the beam
+/// as the seed, that action's lineage went unsearched, and no plan past it could win.
+#[test]
+fn a_one_opt_seed_never_takes_its_action_out_of_the_beam() {
+    let scheduler = weak_axis_scheduler(0x5eed);
+    let config = BeamConfig { beam_width: 1, min_progress_ns: 1, disable_cache: true, ..Default::default() };
+    let seed = heuristic_seed(&scheduler, &config).expect("the fixture has a hand-coded plan").applied_opts;
+    assert!(
+        generate_actions(&scheduler, &config).iter().any(|candidate| candidate.applied_opts == seed),
+        "the fixture's seed must be a first-wave action: {seed:?}"
+    );
+    // The seed's lineage gets faster with depth; any other plan is slower than the seed.
+    let timing = |opts: &[Opt]| scripted_timing(opts.starts_with(&seed), opts);
+    let (result, _) = scripted_search(&scheduler, &config, false, plan_identity, timing);
+    assert!(extends(&result.scheduler.applied_opts, &seed), "{:?} past {seed:?}", result.scheduler.applied_opts);
+}
+
+/// The beam can walk to the hand-coded plan one action at a time. While the seed
+/// held that plan's binary, the plan was dropped as a duplicate on arrival and the
+/// search ended there, never trying a step past it.
+#[test]
+fn the_beam_reaches_the_hand_coded_plan_and_searches_past_it() {
+    let scheduler = matvec_scheduler();
+    let config = BeamConfig { beam_width: 1, min_progress_ns: 1, disable_cache: true, ..Default::default() };
+    let seed = unreachable_seed(&scheduler, &config);
+    // Every step toward the seed's plan and past it is faster; any plan off that path is slower than all of them.
+    let timing = |opts: &[Opt]| scripted_timing(opts.iter().zip(&seed).all(|(step, toward)| step == toward), opts);
+    let (result, _) = scripted_search(&scheduler, &config, false, plan_identity, timing);
+    assert!(extends(&result.scheduler.applied_opts, &seed), "{:?} past {seed:?}", result.scheduler.applied_opts);
+}
+
+/// A seed that compiles to the same kernel as a first-wave action must not let
+/// compile order decide which of the two keeps that binary, and with it the
+/// action's lineage.
+#[test]
+fn compile_order_never_decides_the_search() {
+    let scheduler = matvec_scheduler();
+    let config = BeamConfig { beam_width: 1, min_progress_ns: 1, disable_cache: true, ..Default::default() };
+    let seed = unreachable_seed(&scheduler, &config);
+    let twin = generate_actions(&scheduler, &config)
+        .into_iter()
+        .map(|candidate| candidate.applied_opts)
+        .find(|opts| !seed.starts_with(opts))
+        .expect("a first-wave action off the seed's path");
+    // The seed compiles to the twin's kernel, so it times as the twin does, and
+    // the twin's lineage is the fast one.
+    let binary = |opts: &[Opt]| plan_identity(if opts == seed.as_slice() { &twin } else { opts });
+    let timing = |opts: &[Opt]| {
+        let opts = if opts == seed.as_slice() { &twin } else { opts };
+        scripted_timing(opts.starts_with(&twin), opts)
+    };
+    let (in_order, _) = scripted_search(&scheduler, &config, false, binary, timing);
+    let (reversed, _) = scripted_search(&scheduler, &config, true, binary, timing);
+    assert_eq!(in_order.scheduler.applied_opts, reversed.scheduler.applied_opts);
+    assert_eq!(in_order.timing, reversed.timing);
+    assert!(extends(&in_order.scheduler.applied_opts, &twin), "{:?} past {twin:?}", in_order.scheduler.applied_opts);
 }
