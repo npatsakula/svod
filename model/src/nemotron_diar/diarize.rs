@@ -16,8 +16,8 @@
 //! the largest step — `max_batch` sessions at the profile's full step
 //! capacity. Smaller steps (a stream's first seconds, a short recording, fewer
 //! ready sessions) run through it with their padding masked, so no length ever
-//! recompiles it. The batch is concrete, not a bound variable, because the
-//! flash-attention kernel needs a static batch.
+//! recompiles it. The batch is the plan's bound variable: a step computes only
+//! the sessions it holds.
 
 use std::time::Instant;
 
@@ -336,10 +336,10 @@ impl Diarizer {
         match &mut self.run_profile {
             Some(profile) => {
                 let started = Instant::now();
-                let kernels = jit.execute_profiled()?;
-                profile.push(StageProfile::gpu(format!("step b{batch_cap} s{seq_cap}"), started.elapsed(), kernels));
+                let kernels = jit.execute_with_vars_profiled(&[("b", batch as i64)])?;
+                profile.push(StageProfile::gpu(format!("step b{batch} s{seq_cap}"), started.elapsed(), kernels));
             }
-            None => jit.execute()?,
+            None => jit.execute_bound(batch as i64)?,
         }
 
         let row_probs = seq_cap * factor * speakers;
