@@ -12,13 +12,13 @@
 //! step's `previous` input, where the graph gathers the new context from it as
 //! the host-side [`SpeakerCache`] layout says.
 //!
-//! Plans are compiled per concrete `(batch, sequence)` bucket on first use, so
-//! short contexts (a stream's first seconds, a short recording) and partial
-//! batches don't pay for the full shape. Where the flash-attention kernel can
-//! run, sequence buckets are multiples of the length it tiles (the capacity
-//! rounded up); elsewhere they double up to the capacity.
+//! One plan serves every step: it is compiled once, in [`Diarizer::new`], for
+//! the largest step — `max_batch` sessions at the profile's full step
+//! capacity. Smaller steps (a stream's first seconds, a short recording, fewer
+//! ready sessions) run through it with their padding masked, so no length ever
+//! recompiles it. The batch is concrete, not a bound variable, because the
+//! flash-attention kernel needs a static batch.
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use svod_arch::diarization::{Binarization, ContextRow, SpeakerCache, SpeakerSegment, speaker_segments};
@@ -34,9 +34,6 @@ use super::config::{Profile, StreamingMode};
 use super::error::{FlushedSnafu, Result, SampleRateSnafu};
 use super::jit::NemotronDiarStepJit;
 use super::model::NemotronDiar;
-
-/// The smallest sequence bucket where flash attention cannot run.
-const MIN_BUCKET: usize = 64;
 
 /// Speaker probabilities of a recording, one row of `num_speakers` per mel
 /// frame, speakers numbered by first arrival.
@@ -114,11 +111,10 @@ struct StepPlan {
 pub struct Diarizer {
     model: NemotronDiar,
     profile: Profile,
-    /// Plans by `(batch, sequence)` capacity, compiled on first use.
-    plans: HashMap<(usize, usize), NemotronDiarStepJit>,
-    batch_buckets: Vec<usize>,
-    seq_buckets: Vec<usize>,
-    /// Rows of the `previous` input: the longest step.
+    /// The step plan, `max_batch` sessions of `capacity` encoder frames.
+    jit: NemotronDiarStepJit,
+    max_batch: usize,
+    /// Encoder frames of the longest step: the rows of every step input.
     capacity: usize,
     /// Encoder frames one step stages: the chunk and its look-ahead.
     step_frames: usize,
@@ -129,13 +125,6 @@ pub struct Diarizer {
     probs: Vec<f32>,
     /// Per-step kernel profiles, while profiling.
     run_profile: Option<RunProfile>,
-}
-
-/// `min, 2·min, 4·min, …` below `max`, then `max`.
-fn doubling(min: usize, max: usize) -> Vec<usize> {
-    let mut buckets: Vec<usize> = std::iter::successors(Some(min), |b| Some(b * 2)).take_while(|&b| b < max).collect();
-    buckets.push(max);
-    buckets
 }
 
 impl Diarizer {
@@ -151,24 +140,27 @@ impl Diarizer {
         Self::new(model, profile)
     }
 
+    /// Validate `profile` and compile the step plan for it.
     pub fn new(model: NemotronDiar, profile: Profile) -> Result<Self> {
         let config = &model.config;
         config.validate_profile(&profile)?;
         let step_frames = profile.chunk_len + profile.right_context;
         let framed_len = model.mel().frames_len(step_frames * config.subsampling_factor);
         let capacity = config.step_capacity(&profile);
+        let (max_batch, hidden) = (config.max_batch.max(1), config.hidden_size);
+        let mut jit = NemotronDiarStepJit::new(model.clone());
+        jit.prepare_with_config(
+            InputSpec::f32(&[max_batch, framed_len]).device_local(),
+            InputSpec::i32(&[max_batch]),
+            InputSpec::f32(&[max_batch, capacity, hidden]).device_local(),
+            InputSpec::i32(&[max_batch, capacity]).device_local(),
+            InputSpec::i32(&[max_batch]),
+            InputSpec::i32(&[max_batch]),
+            &PrepareConfig::device_local(),
+        )?;
         Ok(Self {
-            batch_buckets: doubling(1, config.max_batch.max(1)),
-            // Where flash attention runs, every bucket is a length it tiles:
-            // the multiples of its tile up to the capacity rounded up.
-            seq_buckets: match crate::attention::flash_attention_tile(
-                &svod_dtype::default_device::default_device(),
-                &config.dtype,
-            ) {
-                Some(tile) => (1..=capacity.div_ceil(tile)).map(|k| k * tile).collect(),
-                None => doubling(MIN_BUCKET.min(capacity), capacity),
-            },
-            plans: HashMap::new(),
+            jit,
+            max_batch,
             capacity,
             step_frames,
             framed_len,
@@ -246,7 +238,7 @@ impl Diarizer {
             if ready.is_empty() {
                 return Ok(steps);
             }
-            for group in ready.chunks(self.model.config.max_batch.max(1)) {
+            for group in ready.chunks(self.max_batch) {
                 let plans: Vec<StepPlan> = group.iter().map(|(_, plan)| *plan).collect();
                 let mut batch: Vec<&mut Session> = sessions
                     .iter_mut()
@@ -298,9 +290,7 @@ impl Diarizer {
         let (hidden, factor, speakers) = (config.hidden_size, config.subsampling_factor, config.num_speakers);
         let (capacity, step_frames, framed_len) = (self.capacity, self.step_frames, self.framed_len);
         let batch = sessions.len();
-        let needed = plans.iter().map(|p| p.context + p.input).max().expect("a non-empty step");
-        let batch_cap = *self.batch_buckets.iter().find(|&&b| b >= batch).expect("batch within max_batch");
-        let seq_cap = *self.seq_buckets.iter().find(|&&s| s >= needed).expect("capacity bounds a step");
+        let (batch_cap, seq_cap) = (self.max_batch, capacity);
         // Rows of `[previous | chunk | silence | zero]`.
         let (chunk_row, silence_row, zero_row) = (capacity, capacity + step_frames, capacity + step_frames + 1);
 
@@ -322,7 +312,7 @@ impl Diarizer {
             }
         }
 
-        let jit = plan_for(&mut self.plans, &self.model, (batch_cap, seq_cap), capacity, framed_len)?;
+        let jit = &mut self.jit;
         jit.framed_mut()?.copyin_at(0, bytemuck::cast_slice(&self.framed))?;
         jit.sources_mut()?.copyin(bytemuck::cast_slice(&self.sources))?;
         let row_bytes = capacity * hidden * size_of::<f32>();
@@ -398,29 +388,4 @@ impl Diarizer {
         }
         Ok(())
     }
-}
-
-/// The plan of one `(batch, sequence)` capacity, compiled on first use.
-fn plan_for<'a>(
-    plans: &'a mut HashMap<(usize, usize), NemotronDiarStepJit>,
-    model: &NemotronDiar,
-    (batch, seq): (usize, usize),
-    capacity: usize,
-    framed_len: usize,
-) -> Result<&'a mut NemotronDiarStepJit> {
-    if let std::collections::hash_map::Entry::Vacant(slot) = plans.entry((batch, seq)) {
-        let hidden = model.config.hidden_size;
-        let mut jit = NemotronDiarStepJit::new(model.clone());
-        jit.prepare_with_config(
-            InputSpec::f32(&[batch, framed_len]).device_local(),
-            InputSpec::i32(&[batch]),
-            InputSpec::f32(&[batch, capacity, hidden]).device_local(),
-            InputSpec::i32(&[batch, seq]).device_local(),
-            InputSpec::i32(&[batch]),
-            InputSpec::i32(&[batch]),
-            &PrepareConfig::device_local(),
-        )?;
-        slot.insert(jit);
-    }
-    Ok(plans.get_mut(&(batch, seq)).expect("prepared above"))
 }

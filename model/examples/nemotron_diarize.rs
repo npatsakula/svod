@@ -41,8 +41,8 @@ struct Args {
     #[arg(long)]
     dtype: Option<String>,
 
-    /// Diarize once to compile and warm every plan, then time and profile a
-    /// second run, printing its per-kernel report.
+    /// Diarize once to warm up, then time and profile a second run, printing
+    /// its per-kernel report.
     #[arg(long)]
     profile: bool,
 }
@@ -62,7 +62,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let started = Instant::now();
     let model = NemotronDiar::from_hub(dtype, 1)?;
+    eprintln!("loaded weights in {:.2}s", started.elapsed().as_secs_f32());
     let frame_sec = model.config.frame_sec();
+    let started = Instant::now();
     let mut diarizer = match args.stream {
         None => Diarizer::offline(model)?,
         Some(mode) => Diarizer::streaming(
@@ -74,12 +76,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )?,
     };
-    eprintln!("loaded in {:.2}s", started.elapsed().as_secs_f32());
+    eprintln!("compiled the step plan in {:.2}s", started.elapsed().as_secs_f32());
 
     if args.profile {
-        let started = Instant::now();
+        // Brings the GPU to its working clock and fills the kernel tuner's
+        // cache, so the timed run below measures steady state.
         diarize(&mut diarizer, &audio, sample_rate, args.stream.is_some())?;
-        eprintln!("cold run (compiles every plan): {:.2}s", started.elapsed().as_secs_f32());
     }
     let started = Instant::now();
     let probs = diarize(&mut diarizer, &audio, sample_rate, args.stream.is_some())?;

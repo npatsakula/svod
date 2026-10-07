@@ -31,6 +31,11 @@ use crate::state::{self, StateDict, scoped, scoped_index};
 use super::config::NemotronDiarConfig;
 use super::error::Result;
 
+/// Sequence multiple the encoder pads a step to where flash attention does
+/// not set one. Measured on CPU: the 541-frame streaming step runs 2x faster
+/// padded to 576 than as is, and the 684-frame offline step fastest at 704.
+const SEQ_ALIGN: usize = 64;
+
 /// The checkpoint's repository.
 pub const HUB_REPO: &str = "nvidia/Nemotron-3-Diarization";
 
@@ -282,15 +287,27 @@ impl NemotronDiar {
     pub fn classify(&self, embeds: &Tensor, seq_lens: &Tensor, key_lens: &Tensor) -> Result<Tensor> {
         let config = &self.config;
         let seq = embeds.dim_const(1)?;
+        // The encoder sees the step padded to a length the kernels tile: the
+        // flash-attention tile where that kernel runs, else `SEQ_ALIGN` (an
+        // odd length such as the 541-frame streaming step halves the
+        // scheduler's throughput). `key_lens` hides the padding, which is cut
+        // again before the head.
+        let align = crate::attention::flash_attention_tile(&embeds.device(), &config.dtype).unwrap_or(SEQ_ALIGN);
+        let padded = seq.next_multiple_of(align);
+        let embeds_padded = match padded - seq {
+            0 => embeds.clone(),
+            pad => embeds.try_pad(&[(0, 0), (0, pad as isize), (0, 0)])?,
+        };
         // [S, 1, Dh/2] → [1, S, 1, Dh/2], the seq-major head layout.
-        let table = |t: &Tensor| t.narrow(0, 0_usize, seq)?.try_unsqueeze(0);
+        let table = |t: &Tensor| t.narrow(0, 0_usize, padded)?.try_unsqueeze(0);
         let rope = (table(&self.rope.0)?, table(&self.rope.1)?);
 
-        let mut x = scoped("input_norm", || self.input_norm.forward(&embeds.cast(config.dtype.clone())))?.contiguous();
+        let mut x =
+            scoped("input_norm", || self.input_norm.forward(&embeds_padded.cast(config.dtype.clone())))?.contiguous();
         for (index, layer) in self.layers.iter().enumerate() {
             x = scoped_index("layers", index, || layer.forward(&x, &rope, key_lens))?;
         }
-        let x = scoped("final_norm", || self.final_norm.forward(&x))?.contiguous();
+        let x = scoped("final_norm", || self.final_norm.forward(&x.narrow(1, 0_usize, seq)?))?.contiguous();
 
         let valid = Tensor::sequence_mask(seq_lens, seq)?.cast(config.dtype.clone()).try_unsqueeze(-1)?;
         let hidden = scoped("proj", || project(&self.proj, &x))?.try_mul(&valid)?;
