@@ -1009,40 +1009,23 @@ fn a_reduce_over_shaped_axes_keeps_its_gate() {
     assert_op!(result, Op::Reduce(..));
 }
 
-/// Lifting the gate makes it dominate the body, so a second copy of the same test
-/// inside is redundant — and it has to go, because while it is there the body
-/// still reads the gate's range and `tc::detect_matmul` reads that as the operand
-/// varying along it.
-///
-/// Inside an INDEX the same test is not redundant: it guards an address, a WHERE
-/// lowers to a select rather than a branch, so the load runs for every lane and
-/// discharging that copy reads out of bounds.
+/// The lift moves the gate out of the reduce and leaves the body as it was: a
+/// copy of the same test inside stays where it is, as in tinygrad's
+/// `lift_reduce_gate`.
 #[test]
-fn lifting_a_reduce_gate_discharges_it_in_the_body_but_not_in_an_address() {
-    let k = reduce_range(16, 0);
+fn lifting_a_reduce_gate_leaves_the_body_as_it_was() {
     let gate = global_range(64, 1).lt(&index_const(32));
     let buffer = buffer_of(1024, ScalarDType::Float16);
-    let addressed = load(index_of(buffer, where_(&gate, index_const(3), UOp::invalid_marker())));
-    let guarded = where_(&gate.and_(&global_range(8, 2).lt(&index_const(4))), addressed, UOp::invalid_marker());
+    let body = where_(&gate, load(index_of(buffer.clone(), index_const(3))), load(index_of(buffer, index_const(5))));
+    let guarded = where_(&gate.and_(&global_range(8, 2).lt(&index_const(4))), body.clone(), UOp::invalid_marker());
 
-    let result = rewrite(propagate_invalid(), reduce(guarded, vec![k], ReduceOp::Add));
+    let result = rewrite(propagate_invalid(), reduce(guarded, vec![reduce_range(16, 0)], ReduceOp::Add));
 
     let Op::Ternary(TernaryOp::Where, _, reduced, _) = result.op() else {
         panic!("the gate should be outside the reduce, got: {}", result.tree());
     };
-    let body = &unwrap_op!(reduced, Op::Reduce(r) => r).src;
-    let guards_an_address = |node: &Arc<UOp>| match node.op() {
-        Op::Index(ops::Index { indices, .. }) => {
-            indices.iter().any(|idx| idx.any_in_subtree(|n| Arc::ptr_eq(n, &gate)))
-        }
-        _ => false,
-    };
-    assert!(body.any_in_subtree(guards_an_address), "the address keeps its guard: {}", result.tree());
-    assert!(
-        !matches!(body.op(), Op::Ternary(TernaryOp::Where, ..)),
-        "the value gate should be discharged: {}",
-        result.tree()
-    );
+    let lifted = &unwrap_op!(reduced, Op::Reduce(r) => r).src;
+    assert!(Arc::ptr_eq(lifted, &body), "the body should be untouched, got: {}", result.tree());
 }
 
 #[test]
