@@ -1334,10 +1334,11 @@ pub(crate) fn cast_is_injective(value: &Arc<UOp>, dtype: &DType) -> bool {
 }
 
 /// `other == cast(src)` read as `other' == src`, with `other'` the inverse cast of
-/// `other`. Sound only when both casts keep their values: `cast` over `src`, so one
-/// step still matches one value, and the inverse over `other`, so nothing outside
-/// `src`'s dtype folds onto a value inside it (`2^32 + 3` onto 3 when `cast` widens
-/// i32 to i64).
+/// `other` (and `<` read the same way). Sound only when both casts keep their
+/// values: `cast` over `src`, so one step still matches one value, and the inverse
+/// over `other`, so nothing outside `src`'s dtype folds onto a value inside it
+/// (`2^32 + 3` onto 3 when `cast` widens i32 to i64). A cast that keeps every value
+/// keeps their order too.
 fn peel_cast(cast: &Arc<UOp>, src: &Arc<UOp>, other: &Arc<UOp>) -> Option<Arc<UOp>> {
     (cast_is_injective(src, &cast.dtype()) && cast_is_injective(other, &src.dtype())).then(|| other.cast(src.dtype()))
 }
@@ -1592,10 +1593,11 @@ fn try_param_factor(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<
 /// - (x + y) < c → x < (c - y) when y, c are range-free
 /// - (x * y) < c → x < ceil(c/y) when y > 0, y, c range-free
 ///
-/// Also handles `.or_casted()` variants where lhs is wrapped in a CAST:
+/// Also handles `.or_casted()` variants, where lhs is wrapped in a CAST and
+/// [`peel_cast`] reads `c` in the inner dtype:
 /// - Cast(x + y) < c → x < (c.cast(inner_dtype) - y)
 /// - Cast(x * y) < c → x < ceil(c.cast(inner_dtype)/y)
-fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
+pub(crate) fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Binary(BinaryOp::Lt, lhs, rhs) = cond.op() else {
         return None;
     };
@@ -1606,13 +1608,9 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     // Unwrap optional CAST to get the inner expression (or_casted pattern).
-    // When CAST is present, we need to cast the rhs constant to the inner dtype.
-    let (inner_lhs, effective_rhs) = if let Op::Cast(ops::Cast { src, .. }) = lhs.op() {
-        let inner_dtype = src.dtype();
-        let casted_rhs = rhs.cast(inner_dtype);
-        (src.as_ref(), casted_rhs)
-    } else {
-        (lhs.as_ref(), rhs.clone())
+    let (inner_lhs, effective_rhs) = match lhs.op() {
+        Op::Cast(ops::Cast { src, .. }) => (src.as_ref(), peel_cast(lhs, src, rhs)?),
+        _ => (lhs.as_ref(), rhs.clone()),
     };
 
     // Pattern: (x + y) < c → x < (c - y). ADD is commutative, so try both

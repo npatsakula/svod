@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 use svod_dtype::{DType, DeviceSpec};
-use svod_ir::{BinaryOp, ConstValue, Op, ReduceOp, UOp};
+use svod_ir::{BinaryOp, ConstValue, Op, ReduceOp, UOp, UOpKey};
 use test_case::test_case;
 
 use super::helpers::{assert_const_float, reduce_range, rewritten};
 use crate::rangeify::patterns::{
     build_reduce_load_collapse_matcher, cast_is_injective, pm_load_collapse, solve_for_range,
-    try_lift_arithmetic_from_eq,
+    try_lift_arithmetic_from_eq, try_lift_arithmetic_from_lt,
 };
 use crate::rangeify::reduce_load_collapse;
 use crate::test::support::build::global_range;
@@ -389,6 +389,16 @@ fn the_ne_lift_never_narrows_a_wide_index(lo: i64, hi: i64, lifted: bool) {
     }
 }
 
+/// The LT lift is the same reading for `Cast(r + y) < idx`.
+#[test_case(i64::MIN, i64::MAX, false ; "a full-range bound is not narrowed")]
+#[test_case(0, 100, true ; "a bound that fits i32 is lifted")]
+fn the_lt_lift_never_narrows_a_wide_bound(lo: i64, hi: i64, lifted: bool) {
+    let range = reduce_range(END, 0);
+    let condition = widened_arange(&range, 1).try_cmplt(&index_var(lo, hi)).expect("cmplt");
+    let got = try_lift_arithmetic_from_lt(&condition);
+    assert_eq!(got.is_some(), lifted, "{}", got.map_or("None".to_string(), |lifted| lifted.tree()));
+}
+
 /// The whole collapse on both gate forms: a full-range index may keep its reduce,
 /// but wherever the body folds, `2^32 + 3` and `i64::MIN` read nothing and the
 /// index naming step 3 reads step 3. An index that fits must still collapse.
@@ -428,4 +438,64 @@ fn cast_injectivity_reads_index_as_i64() {
     assert!(!cast_is_injective(&global_range(1 << 40, 0), &DType::Int32), "an Index range past i32 does not fit");
     assert!(cast_is_injective(&global_range(10, 0), &DType::Int32), "an Index range of ten fits");
     assert!(!cast_is_injective(&UOp::var("gate", DType::Bool, 0, 1), &DType::Int32), "bool is not an integer");
+}
+
+/// An Index arange widened to u64, the compared side of a `u64` mask.
+#[derive(Clone, Copy)]
+enum U64Arange {
+    Offset,
+    Scaled,
+}
+
+impl U64Arange {
+    fn build(self, range: &Arc<UOp>) -> Arc<UOp> {
+        match self {
+            U64Arange::Offset => range.try_add(&UOp::index_const(1)).expect("r + 1"),
+            U64Arange::Scaled => range.try_mul(&UOp::index_const(2)).expect("r * 2"),
+        }
+        .cast(DType::UInt64)
+    }
+
+    /// How many steps lie below `cut`.
+    fn count_below(self, cut: u64) -> f64 {
+        let at = |step: u64| match self {
+            U64Arange::Offset => step + 1,
+            U64Arange::Scaled => step * 2,
+        };
+        (0..END as u64).filter(|&step| at(step) < cut).count() as f64
+    }
+}
+
+/// `u64(r + 1) < c` reads as `r + 1 < Index(c)` only while `c` fits the i64 an
+/// Index lowers into: past `i64::MAX` the bound wraps negative and no step counts.
+/// Wherever the body folds, a constant or a loaded bound counts what the steps
+/// say; a bound that fits must still collapse.
+#[test_case(U64Arange::Offset ; "an offset arange")]
+#[test_case(U64Arange::Scaled ; "a scaled arange")]
+fn a_u64_bound_past_i64_never_wraps_through_the_lt_collapse(arange: U64Arange) {
+    let range = reduce_range(END, 0);
+    let below = |cut: &Arc<UOp>| {
+        let gate = arange.build(&range).try_cmplt(cut).expect("cmplt");
+        reduce_load_collapse(&UOp::try_where(gate, one(), zero()).expect("gate"), std::slice::from_ref(&range))
+    };
+    let constant = |cut: u64| UOp::const_(DType::UInt64, ConstValue::UInt(cut));
+    let count = |folded: &Arc<UOp>| fold_at(folded, &Bindings::none()).and_then(|value| value.try_float());
+    let wide = [(1 << 63) + 5, u64::MAX];
+
+    for cut in wide {
+        if let Some(folded) = below(&constant(cut)) {
+            assert_eq!(count(&folded), Some(arange.count_below(cut)), "cut = {cut}:\n{}", folded.tree());
+        }
+    }
+    let folded = below(&constant(5)).expect("a bound that fits must collapse");
+    assert_eq!(count(&folded), Some(arange.count_below(5)), "{}", folded.tree());
+
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 16, DType::UInt64);
+    let loaded = UOp::load().index(crate::test::support::build::index(buffer, 0)).call();
+    if let Some(folded) = below(&loaded) {
+        for cut in wide.into_iter().chain([5]) {
+            let pinned = folded.substitute(&[(UOpKey(loaded.clone()), constant(cut))].into_iter().collect());
+            assert_eq!(count(&pinned), Some(arange.count_below(cut)), "load = {cut}:\n{}", folded.tree());
+        }
+    }
 }
