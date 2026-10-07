@@ -112,14 +112,14 @@ pub enum TcOpt {
 
     /// [`Self::Relaxed`] plus PADTO on non-divisible M/N/K (TC_OPT=2, default)
     /// inside the tensor-core padding budget, so a 1500-row GEMM still tiles
-    /// at 1504 while a 5-row GEMV never pays for 16; a compute-bound kernel
-    /// pads past the budget, so a 20x20 conv output still tiles at 32.
+    /// at 1504 while a 5-row GEMV stays scalar.
     #[default]
     Padded,
 
     /// [`Self::Padded`] with only PADTO's own 4x work limit, tinygrad's
-    /// TC_OPT=2 (TC_OPT=3): a partial tile is worth having even at a beam
-    /// width of 5, as the padded-fragment codegen tests need.
+    /// TC_OPT=2 (TC_OPT=3), and the level of BEAM's tensor-core actions: a
+    /// partial tile can pay even at a beam width of 5, and the timing says
+    /// where it does.
     Unbounded,
 }
 
@@ -333,8 +333,8 @@ pub struct HeuristicsConfig {
     /// divisible reduce axis (convolutions lower to a reduce over channels and
     /// taps, and the scalar path there runs at a fraction of the WMMA's), and a
     /// non-divisible M/N/K is padded when the padding adds at most a quarter
-    /// to the axis or the kernel is compute-bound, so a 1500-row GEMM tiles at
-    /// 1504 and a 20x20 conv output at 32 while a 5-row GEMV stays scalar.
+    /// to the axis, so a 1500-row GEMM tiles at 1504 while a 5-row GEMV stays
+    /// scalar.
     /// `TC_OPT=3` pads without the budget,
     /// tinygrad's `TC_OPT=2`; `TC_OPT=1` never pads.
     pub tc_opt: TcOpt,

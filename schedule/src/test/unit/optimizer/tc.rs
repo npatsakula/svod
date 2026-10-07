@@ -317,8 +317,8 @@ fn apply_in_shape_only_mode_splits_the_axes_without_a_wmma() {
 }
 
 /// `tc_opt = 2` pads each non-divisible dimension to the core's tile, as long
-/// as the tail stays inside the padding budget — or the kernel is compute-bound
-/// enough that the padded core still beats the scalar loop by a wide margin.
+/// as the tail stays inside the padding budget; `tc_opt = 3` up to PADTO's own
+/// limit.
 #[test_case(15, 16, 16, 2, 2; "one padded axis")]
 #[test_case(30, 30, 30, 2, 6; "every axis padded")]
 #[test_case(5, 16, 16, 3, 2; "unbounded padding tiles a beam width of five")]
@@ -355,15 +355,14 @@ fn apply_rejects_a_non_divisible_dimension(m: i64, n: i64, k: i64, tc_opt: usize
     assert!(!has_op(scheduler.ast(), |op| matches!(op, Op::Wmma(..))));
 }
 
-/// The budget is for memory-bound kernels. A convolution over a 20x20 output
-/// shares every weight across 400 rows, so padding one spatial axis to the tile
-/// (20 -> 32, 1.6x the MACs) still leaves the core far ahead of the scalar loop
-/// it displaces; the same 20-row tail on a 16-column GEMV is only more work.
-#[test_case(768, 6912, true; "a 20x20 conv output pads past the budget")]
-#[test_case(12, 32, false; "a memory-bound kernel keeps to the budget on either side")]
-fn the_pad_budget_yields_to_a_compute_bound_kernel(n: i64, k: i64, pads: bool) {
-    let mut scheduler = Scheduler::new(two_m_matmul(20, 20, n, k), Renderer::cuda());
-    let result = apply_with_axis_choice(&mut scheduler, 0, 2, 1, None);
+/// The heuristics keep the budget on a compute-bound kernel too: a convolution
+/// over a 20x20 output, its spatial axis on the core's 16-row side, pads
+/// 20 -> 32 only at BEAM's level, where the timing decides whether that pays.
+#[test_case(2, false; "the heuristics' level keeps the budget")]
+#[test_case(3, true; "BEAM's level pads past it")]
+fn a_compute_bound_kernel_pads_past_the_budget_only_at_beams_level(tc_opt: usize, pads: bool) {
+    let mut scheduler = Scheduler::new(two_m_matmul(20, 20, 768, 6912), Renderer::cuda());
+    let result = apply_with_axis_choice(&mut scheduler, 0, tc_opt, 1, Some(0));
     assert_eq!(result.is_ok(), pads, "{result:?}");
     assert_eq!(has_op(scheduler.ast(), |op| matches!(op, Op::Wmma(..))), pads);
     if !pads {

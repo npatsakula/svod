@@ -332,24 +332,6 @@ fn within_pad_budget(size: usize, tile: usize) -> bool {
     (padded - size) * 100 <= size * TC_PAD_BUDGET_PERCENT
 }
 
-/// FLOP per operand byte, at the unpadded shape, past which the budget no
-/// longer applies: such a kernel is compute-bound on every tensor-core GPU, so
-/// even a tile padded well beyond the budget beats the scalar kernel it
-/// displaces (a 20x20 conv output pads 20 -> 32 for 1.6x the MACs on a core
-/// several times faster), where a beam-width GEMV at a few FLOP per byte only
-/// pays for the padding.
-const COMPUTE_BOUND_INTENSITY: f64 = 64.0;
-
-/// `2·M·N·K / bytes(A + B + C)` over the pattern's whole M, N and K extents;
-/// `None` when any of them is symbolic.
-fn arithmetic_intensity(pattern: &MatmulPattern) -> Option<f64> {
-    let extent =
-        |ranges: &[Arc<UOp>]| ranges.iter().map(|r| get_range_size(r).map(|s| s as f64)).product::<Option<f64>>();
-    let (m, n, k) = (extent(&pattern.in0_ranges)?, extent(&pattern.in1_ranges)?, extent(&pattern.red_ranges)?);
-    let bytes = pattern.in0.dtype().bytes().max(pattern.in1.dtype().bytes()) as f64;
-    Some(2.0 * m * n * k / (bytes * (m * k + n * k + m * n)))
-}
-
 fn apply_axis_choice_impl(
     scheduler: &mut Scheduler,
     pattern: &MatmulPattern,
@@ -395,21 +377,16 @@ fn apply_axis_choice_impl(
         // Collect padding operations needed (can't mutate axes while iterating)
         let tc_dims = [tc.dims.0, tc.dims.1, tc.dims.2];
         let mut padding_ops: Vec<(usize, usize, usize)> = Vec::new(); // (axes_idx, scheduler_idx, tc_dim)
-        let compute_bound =
-            arithmetic_intensity(pattern).is_some_and(|flop_per_byte| flop_per_byte >= COMPUTE_BOUND_INTENSITY);
 
         for (i, (axis, &tc_dim)) in axes.iter().zip(&tc_dims).enumerate() {
             match get_range_size(axis) {
                 Some(size) => {
                     if !(size as usize).is_multiple_of(tc_dim) {
                         // Padded rows are not free: they stream the same weights
-                        // and multiply the MACs, so the heuristics pad a
-                        // memory-bound kernel only within the budget, and BEAM's
-                        // own level leaves the call to its timing. A
-                        // compute-bound kernel is the other way round: the
-                        // padded core still runs several times faster than the
-                        // scalar loop, so the budget steps aside.
-                        if tc_opt == 2 && !compute_bound && !within_pad_budget(size as usize, tc_dim) {
+                        // and multiply the MACs, so the heuristics pad only
+                        // within the budget, and BEAM's own level leaves the call
+                        // to its timing.
+                        if tc_opt == 2 && !within_pad_budget(size as usize, tc_dim) {
                             return ValidationFailedSnafu {
                                 op: "TC",
                                 reason: "padding to the tensor-core tile would add too much work",
