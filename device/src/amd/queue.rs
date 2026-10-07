@@ -523,15 +523,11 @@ pub fn lower_hcq_pm4(submission: &crate::hcq::Submission, state: Pm4LoweringStat
                 }
             }
             crate::hcq::Command::Timestamp { dst } => {
-                // Tinygrad: EOP drain, clock write, then acquire the timestamp.
+                // EOP drain, then the clock write. A probe touches no cache: an
+                // acquire after the start stamp would be timed with the kernel.
                 let mut timestamp = Vec::new();
                 timestamp.extend_from_slice(&pm4::release_mem_order(is_gfx9));
                 timestamp.extend_from_slice(&pm4::release_mem_timestamp(*dst, is_gfx9));
-                if is_gfx9 {
-                    timestamp.extend_from_slice(&pm4::acquire_mem_gfx9());
-                } else {
-                    timestamp.extend_from_slice(&pm4::acquire_mem());
-                }
                 if let Some(mask) = state.completion_xcc_mask {
                     q.extend_from_slice(&pm4::pred_exec(mask, timestamp.len() as u32));
                 }

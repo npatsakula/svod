@@ -830,10 +830,9 @@ impl Program for AmdProgram {
     /// `private_segment_fixed_size`, so it lands on spilling candidates
     /// specifically and no amount of repetition averages it out.
     ///
-    /// The probes are not free: each lowers to an end-of-pipe fence, the clock
-    /// write, and an `acquire_mem` that invalidates and writes back the whole
-    /// cache hierarchy, and the pre-kernel one falls inside the span. So every
-    /// timed run here starts cache-cold, at a fixed cost per dispatch.
+    /// The run is cold: like every dispatch here it goes behind the coherence
+    /// barrier, which writes back and invalidates the whole cache hierarchy, L2
+    /// included. The probes touch no cache, so the span is the kernel's alone.
     ///
     /// # Safety
     ///

@@ -99,6 +99,14 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
   +0.4% (median) and b8 −0.5%. The lattice walk takes the stride-2 downsamples Tapwise won and
   matches it. Patch earns its pipeline on the 40x40 bottleneck bodies; re-measure b8 before
   touching it, and do not bring a tap-unrolled form back for stride 2.
+- **AMD times a kernel cold, behind the barrier every dispatch carries, between stamps that flush
+  nothing** (`AmdProgram::execute_timed`; `Command::Timestamp` in `device/src/amd/queue.rs`). Warm
+  looks like the fix, since CUDA's events time warm and a replay runs on the caches its producers
+  left, but it was measured and lost: on gfx1201, YOLO26 f16 BEAM=4 tuned with an untimed run
+  ahead of each timed one replayed +1.1% at m and −4.8% at x against the old timing, cold −0.1%
+  and −3.4% (one cold tune per arm, every arm's plans replayed under one stamp). What must stay out
+  of the span is a stamp's own `acquire_mem`: it timed a full cache flush with every kernel and read
+  every profiled AMD replay 3.6-5.4% slow.
 
 ## Task evaluation
 

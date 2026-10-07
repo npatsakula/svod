@@ -79,6 +79,9 @@ pub trait Program: Send + Sync {
     /// only for a dispatch whose stamp it lost, so a caller never times one
     /// kernel on two clocks.
     ///
+    /// Whether the run starts on warm or cold caches is each backend's
+    /// documented choice; a cache flush is never inside the span.
+    ///
     /// # Safety
     ///
     /// Same contract as [`Program::execute`].
