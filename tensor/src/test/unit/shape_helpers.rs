@@ -335,8 +335,10 @@ crate::codegen_tests! {
     /// YOLO26-n's two readers of the neck's upsample view, as `YoloConv` builds
     /// them: a 1x1 convolution over `cat(up2(a), skip)` at f16 with an f32
     /// accumulator, then bias and SiLU. On gfx1201 `neck.13.cv1`'s reduce loop
-    /// carries 48 loads gated on its own index, and LLVM's unroll boost for such
-    /// branches used to unroll it whole into a spill clang 20 miscompiled to NaN.
+    /// carries 48 loads gated on its own index, and without the AMD loop hint
+    /// LLVM's unroll boost for such branches unrolls it whole: 72 WMMAs and a
+    /// 1388-byte spill under any clang, which clang 20 compiles to wrong
+    /// values. So no kernel here may spill, on any backend that reports it.
     ///
     /// Every product is a multiple of 2^-16 and every sum stays under 2^8, so the
     /// f32 accumulation is exact in any order and only the f16 store rounds.
@@ -360,9 +362,14 @@ crate::codegen_tests! {
         let (weight, bias) = (f16(&w, &[c_out, cin, 1, 1]), f16(&b, &[c_out]));
         let conv = cat.conv2d().weight(&weight).bias(&bias).acc_dtype(DType::Float32).call().unwrap();
         let y = conv.silu().unwrap().cast(DType::Float16);
-        // Realized alone so the convolution stores f16, as the model's does,
-        // instead of fusing the read-back cast.
-        y.realize_with(&config).unwrap();
+        // Run alone so the convolution stores f16, as the model's does, instead
+        // of fusing the read-back cast.
+        let plan = y.prepare_with(&config).unwrap();
+        plan.execute().unwrap();
+        for kernel in plan.prepared_kernels() {
+            let scratch = kernel.kernel.program.resource_usage().and_then(|usage| usage.scratch_bytes);
+            assert_eq!(scratch.unwrap_or(0), 0, "{} spills to scratch", kernel.kernel.entry_point);
+        }
         let got = y.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
 
         let column = |p: usize| -> Vec<f32> {

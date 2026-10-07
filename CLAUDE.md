@@ -79,11 +79,17 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
   whose counter indexes a register array** (`LOOP_HINT` and `register_indexing_ranges` in
   `codegen/src/llvm/amd/mod.rs`). Without the cap, AMDGPU's +200 per branch on the loop's own
   index fully unrolls a reduce loop over gated loads (a cat, padding): YOLO26-n's `neck.13.cv1`
-  became 72 WMMAs and 843 spilled VGPRs, 99 µs instead of 27, and clang 20.1.2 compiled that
-  spill into NaN — at BEAM=0 and at BEAM=4 alike, which picks the same kernel. With it, n is right
-  and BEAM=4 is −12.4% at n, −0.7…−1.8% at s/m/l and a wash at x; the plans BEAM finds under it
-  need it (replayed without it, x runs +45% with NaN boxes). The exemption is not optional:
-  capped too, every tk convolution kept 132 B of its register tiles in scratch.
+  became 72 WMMAs, 256 VGPRs and a 1388-byte spill, 97 µs instead of 27, under any clang
+  (`test_upsample_cat_conv_f16_matches_reference` asserts no spill; run it with
+  `SVOD_DEVICE=AMD:0`, or the AMD variant skips). With it BEAM=4 was −12.4% at n, −0.7…−1.8% at
+  s/m/l and a wash at x, and its plans need it (replayed without it, x ran +45%). The exemption
+  is not optional: capped too, every tk convolution kept 132 B of its register tiles in scratch.
+  Rendering gated loads branch-free instead (the review's `select`) was measured and lost: tuned
+  cold on gfx1201 it ran −2.7% at n, −0.4% at l and +1.2% at x at BEAM=4, +2.4…+3.5% at n and x
+  at BEAM=0, drifted more on the confident anchors at every scale, and needs a read slack on
+  every data buffer. clang 20 miscompiles spilling AMDGPU kernels with or without the hint (a
+  cold BEAM=4 tune of n came out NaN with it), so the AMD backend refuses clang < 22
+  (`check_amd_clang`).
 - **The tk tile search ranks by time alone; a wrong tile is a kernel bug, fixed and pinned by a
   test, never voted out at run time** (`TileBudget::search`). The single-fragment tile
   (`reg_m = reg_n = k_step = 16`) that won m's bodies on gfx1201 (16 px of box drift) was
