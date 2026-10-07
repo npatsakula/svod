@@ -11,6 +11,7 @@ mod gtcrn;
 mod jit;
 mod mel;
 mod modernbert;
+mod nemotron_diar;
 mod origin;
 mod qwen3;
 mod remap;

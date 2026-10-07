@@ -1,6 +1,6 @@
 //! Pretrained models on top of `svod-tensor`: speech recognition (Whisper, GigaAM),
 //! voice activity (FireRedVAD, Silero), speech enhancement (GTCRN), speaker analysis
-//! (DiariZen, WeSpeaker), text embeddings and reranking (BGE-M3, Qwen3, ModernBERT)
+//! (Nemotron-3-Diarization, DiariZen, WeSpeaker), text embeddings and reranking (BGE-M3, Qwen3, ModernBERT)
 //! and vision (YOLO26, ResNet).
 //!
 //! Weights load from the Hugging Face Hub, and each model runs through JIT plans that
@@ -16,9 +16,10 @@ pub mod gigaam;
 pub mod gtcrn;
 pub(crate) mod hub;
 pub(crate) mod init;
-pub(crate) mod linear;
 pub mod jit;
+pub(crate) mod linear;
 pub mod modernbert;
+pub mod nemotron_diar;
 pub mod qwen3;
 pub mod resnet;
 pub mod sentencepiece;

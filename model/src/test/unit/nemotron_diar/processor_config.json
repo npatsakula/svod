@@ -1,0 +1,31 @@
+{
+  "feature_extractor": {
+    "feature_extractor_type": "NemotronAsrStreamingFeatureExtractor",
+    "feature_size": 128,
+    "hop_length": 160,
+    "n_fft": 512,
+    "padding_side": "right",
+    "padding_value": 0.0,
+    "preemphasis": 0.97,
+    "return_attention_mask": true,
+    "sampling_rate": 16000,
+    "win_length": 400
+  },
+  "processor_class": "Nemotron3DiarizationProcessor",
+  "streaming_mode": "low_latency",
+  "streaming_modes": {
+    "low_latency": [
+      9,
+      4
+    ],
+    "ultra_low_latency": [
+      3,
+      1
+    ],
+    "very_low_latency": [
+      6,
+      2
+    ]
+  },
+  "subsampling_factor": 8
+}
