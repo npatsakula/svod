@@ -50,6 +50,35 @@ fn invalid_profiles_are_rejected(profile: Profile) {
     assert!(config().validate_profile(&profile).is_err());
 }
 
+/// The encoder pads a step to a tileable length, so the RoPE table must cover
+/// the padded step, not just the capacity: the published offline step is 684
+/// frames, padded to 768.
+#[test_case(768, true; "covers the padded step")]
+#[test_case(767, false; "one position short")]
+fn profiles_are_checked_at_the_padded_length(max_positions: usize, accepted: bool) {
+    let json = CONFIG_JSON
+        .replace("\"max_position_embeddings\": 5000", &format!("\"max_position_embeddings\": {max_positions}"));
+    let parsed = NemotronDiarConfig::from_json_strs(&json, PROCESSOR_JSON);
+    assert_eq!(parsed.is_ok(), accepted);
+    if let Ok(c) = parsed {
+        assert_eq!(c.step_capacity(&c.offline), 684);
+    }
+}
+
+#[test]
+fn zero_max_batch_is_rejected() {
+    let mut c = config();
+    c.max_batch = 0;
+    assert!(c.validate_profile(&c.offline).is_err());
+}
+
+#[test]
+fn grouped_query_checkpoints_are_rejected() {
+    let gqa = CONFIG_JSON.replace("\"num_key_value_heads\": 8", "\"num_key_value_heads\": 4");
+    assert!(NemotronDiarConfig::from_json_strs(&gqa, PROCESSOR_JSON).is_err());
+    assert_eq!(config().num_key_value_heads, 8);
+}
+
 #[test]
 fn malformed_configs_are_rejected() {
     assert!(NemotronDiarConfig::from_json_strs("{}", PROCESSOR_JSON).is_err());

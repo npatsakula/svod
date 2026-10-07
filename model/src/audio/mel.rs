@@ -150,6 +150,7 @@ impl MelSpectrogram {
             start: 0,
             previous: None,
             len: None,
+            first_frame: 0,
         }
     }
 
@@ -226,6 +227,8 @@ pub struct FrameCursor {
     previous: Option<f32>,
     /// The signal length once [`finish`](Self::finish)ed.
     len: Option<usize>,
+    /// The first frame [`stage`](Self::stage) may still ask for.
+    first_frame: usize,
 }
 
 impl FrameCursor {
@@ -275,12 +278,14 @@ impl FrameCursor {
     /// as padding. Panics if they precede the [`discard`](Self::discard)ed
     /// prefix.
     pub fn stage(&self, first: usize, out: &mut [f32]) {
+        assert!(first >= self.first_frame, "frame {first} precedes the discarded prefix ({})", self.first_frame);
         let origin = (first * self.hop) as isize - self.pad as isize;
         Signal { samples: &self.samples, start: self.start, len: self.len, mode: self.mode }.stage(origin, out);
     }
 
     /// Drop the samples no frame from `frame` on reads.
     pub fn discard(&mut self, frame: usize) {
+        self.first_frame = self.first_frame.max(frame);
         // A reflected tail reads back up to `pad + 1` samples before the end.
         let keep_tail = self.received().saturating_sub(self.pad + 1);
         let first_read = (frame * self.hop).saturating_sub(self.pad).min(keep_tail);

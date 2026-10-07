@@ -29,6 +29,8 @@ pub struct NemotronDiarConfig {
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub num_attention_heads: usize,
+    /// Equal to `num_attention_heads`: the stacked QKV projection assumes it.
+    pub num_key_value_heads: usize,
     pub num_hidden_layers: usize,
     pub rope_theta: f64,
     /// Longest step the RoPE table covers.
@@ -128,6 +130,7 @@ impl NemotronDiarConfig {
             hidden_size: audio.hidden_size,
             intermediate_size: audio.intermediate_size,
             num_attention_heads: audio.num_attention_heads,
+            num_key_value_heads: audio.num_key_value_heads.unwrap_or(audio.num_attention_heads),
             num_hidden_layers: audio.num_hidden_layers,
             rope_theta: audio.rope_parameters.rope_theta,
             max_positions: audio.max_position_embeddings,
@@ -162,6 +165,12 @@ impl NemotronDiarConfig {
                 self.hidden_size, self.num_attention_heads
             ));
         }
+        if self.num_key_value_heads != self.num_attention_heads {
+            return fail(format!(
+                "{} key/value heads for {} attention heads: grouped-query attention is not supported",
+                self.num_key_value_heads, self.num_attention_heads
+            ));
+        }
         if self.subsampling_factor == 0 || self.num_speakers == 0 {
             return fail("subsampling factor and speaker count must be positive".into());
         }
@@ -172,10 +181,15 @@ impl NemotronDiarConfig {
         if profile.chunk_len == 0 {
             return ConfigSnafu { message: "chunk_len must be positive" }.fail();
         }
-        if self.step_capacity(profile) > self.max_positions {
+        if self.max_batch == 0 {
+            return ConfigSnafu { message: "max_batch must be positive" }.fail();
+        }
+        // The encoder pads a step to a tileable length (see `NemotronDiar::classify`).
+        let padded = self.step_capacity(profile).next_multiple_of(svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE);
+        if padded > self.max_positions {
             return ConfigSnafu {
                 message: format!(
-                    "a step of {} frames exceeds the {} RoPE positions",
+                    "a step of {} frames (padded to {padded}) exceeds the {} RoPE positions",
                     self.step_capacity(profile),
                     self.max_positions
                 ),
@@ -266,6 +280,7 @@ struct RawAudio {
     hidden_size: usize,
     intermediate_size: usize,
     num_attention_heads: usize,
+    num_key_value_heads: Option<usize>,
     num_hidden_layers: usize,
     num_mel_bins: usize,
     subsampling_factor: usize,

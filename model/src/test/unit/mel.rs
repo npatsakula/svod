@@ -400,6 +400,17 @@ fn cursor_config(pad_mode: PadMode, preemphasis: Option<f32>, center: bool) -> M
     MelConfig { pad_mode, preemphasis, center, n_fft: 64, win_length: 48, hop_length: 16, ..nemo_config() }
 }
 
+#[test]
+#[should_panic(expected = "precedes the discarded prefix")]
+fn staging_a_discarded_frame_panics() {
+    let mel = MelSpectrogram::new(&cursor_config(PadMode::Zero, None, true));
+    let mut cursor = mel.cursor();
+    cursor.push(&synthetic(400, 3));
+    cursor.discard(8);
+    let mut out = vec![0.0f32; mel.frames_len(1)];
+    cursor.stage(7, &mut out);
+}
+
 proptest::proptest! {
     /// A signal pushed in arbitrary pieces stages, for every frame run that
     /// has arrived, exactly the samples whole-signal framing stages — across

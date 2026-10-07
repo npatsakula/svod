@@ -60,8 +60,10 @@ impl Diarization {
 pub struct Session {
     cursor: FrameCursor,
     cache: SpeakerCache,
-    /// Rows `[0, context + chunk)` of the last step input, on the device.
+    /// The last step input on the device, its first `previous_bytes` holding
+    /// the rows `[0, context + chunk)` the next layout indexes.
     previous: Option<Buffer>,
+    previous_bytes: usize,
     /// First encoder frame of the next chunk.
     next_frame: usize,
     probs: Vec<f32>,
@@ -76,6 +78,11 @@ impl Session {
     }
 
     /// End the audio: the remaining chunks become ready, the last ones shorter.
+    ///
+    /// The tail keeps the profile's chunking, as the reference's offline
+    /// forward does (its streaming session API instead folds the whole
+    /// remainder into one last chunk without look-ahead, so the last chunk of
+    /// a live stream differs from that API by its look-ahead).
     pub fn finish(&mut self) {
         if !self.cursor.is_finished() {
             self.cursor.finish();
@@ -147,7 +154,7 @@ impl Diarizer {
         let step_frames = profile.chunk_len + profile.right_context;
         let framed_len = model.mel().frames_len(step_frames * config.subsampling_factor);
         let capacity = config.step_capacity(&profile);
-        let (max_batch, hidden) = (config.max_batch.max(1), config.hidden_size);
+        let (max_batch, hidden) = (config.max_batch, config.hidden_size);
         let mut jit = NemotronDiarStepJit::new(model.clone());
         jit.prepare_with_config(
             InputSpec::f32(&[max_batch, framed_len]).device_local(),
@@ -200,6 +207,7 @@ impl Diarizer {
             cache: SpeakerCache::new(self.model.config.cache_config(&self.profile))
                 .expect("the profile was validated with the diarizer"),
             previous: None,
+            previous_bytes: 0,
             next_frame: 0,
             probs: Vec::new(),
         }
@@ -318,10 +326,12 @@ impl Diarizer {
         let row_bytes = capacity * hidden * size_of::<f32>();
         for (b, session) in sessions.iter().enumerate() {
             if let Some(previous) = &session.previous {
-                jit.previous_mut()?.copy_region_from(b * row_bytes, previous, 0, previous.size())?;
+                jit.previous_mut()?.copy_region_from(b * row_bytes, previous, 0, session.previous_bytes)?;
             }
         }
-        // Padding rows encode one zero frame, attending to itself.
+        // Padding rows encode one zero frame, attending to itself; a live row
+        // without an attended frame (a recording shorter than one hop) does the
+        // same, so every attention path sees at least one key.
         let lens = |view: ndarray::ArrayViewMutD<'_, i32>, of: &dyn Fn(&StepPlan) -> usize, pad: i32| {
             let mut view = view;
             let slots = view.as_slice_mut().expect("contiguous lengths");
@@ -332,7 +342,7 @@ impl Diarizer {
         };
         lens(jit.mel_valid_view_mut::<i32>()?, &|p| p.mel_valid, 0);
         lens(jit.seq_lens_view_mut::<i32>()?, &|p| p.context + p.input, 1);
-        lens(jit.key_lens_view_mut::<i32>()?, &|p| p.context + p.valid, 1);
+        lens(jit.key_lens_view_mut::<i32>()?, &|p| (p.context + p.valid).max(1), 1);
         match &mut self.run_profile {
             Some(profile) => {
                 let started = Instant::now();
@@ -382,6 +392,7 @@ impl Diarizer {
             };
             let offset = b * seq_cap * hidden * size_of::<f32>();
             previous.copy_region_from(0, input, offset, kept)?;
+            session.previous_bytes = kept;
 
             session.next_frame += plan.chunk;
             session.cursor.discard(session.next_frame * factor);

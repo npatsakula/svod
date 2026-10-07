@@ -52,7 +52,9 @@ fn max_diff(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 fn output_covers_every_mel_frame() {
     let mut diarizer = Diarizer::offline(model(1)).unwrap();
-    for len in [16, 200, 1000, 3333] {
+    // 5 samples: one mel frame that only the centre padding reaches, so no
+    // encoder frame is attended to.
+    for len in [5, 16, 200, 1000, 3333] {
         let out = diarizer.diarize(&audio(len, 1), SAMPLE_RATE).unwrap();
         assert_eq!(out.frames(), len / 16 + 1, "length {len}");
         assert!(out.probs.iter().all(|p| (0.0..=1.0).contains(p)));
