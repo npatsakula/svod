@@ -120,6 +120,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_mels: 64,
         center: true,
         mel_scale: MelScale::Htk,
+        periodic: true,
+        pad_mode: svod_model::audio::PadMode::Reflect,
+        preemphasis: None,
+        log: svod_model::audio::MelSpectrogram::LOG,
     };
     let mel = MelSpectrogram::new(&config);
     let frames = mel.num_frames(audio.len());

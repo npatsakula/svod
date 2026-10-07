@@ -234,6 +234,10 @@ impl GigaAmTranscriber {
             n_mels: model.config.n_mels,
             center: model.config.mel_center,
             mel_scale: crate::audio::MelScale::Htk,
+            periodic: true,
+            pad_mode: crate::audio::PadMode::Reflect,
+            preemphasis: None,
+            log: crate::audio::MelSpectrogram::LOG,
         });
 
         let subsampling_factor = model.config.subsampling_factor;
