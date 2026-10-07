@@ -10,13 +10,13 @@ description = "High-level lazy tensor API for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.1" }
-svod-ir = { path = "../ir", version = "=0.1.1" }
-svod-device = { path = "../device", version = "=0.1.1" }
-svod-codegen = { path = "../codegen", version = "=0.1.1" }
-svod-macros = { path = "../macros", version = "=0.1.1" }
-svod-runtime = { path = "../runtime", version = "=0.1.1" }
-svod-schedule = { path = "../schedule", version = "=0.1.1" }
+svod-dtype = { path = "../dtype", version = "=0.2.0" }
+svod-ir = { path = "../ir", version = "=0.2.0" }
+svod-device = { path = "../device", version = "=0.2.0" }
+svod-codegen = { path = "../codegen", version = "=0.2.0" }
+svod-macros = { path = "../macros", version = "=0.2.0" }
+svod-runtime = { path = "../runtime", version = "=0.2.0" }
+svod-schedule = { path = "../schedule", version = "=0.2.0" }
 snafu = "0.9"
 bon = "3.10"
 smallvec = { workspace = true }
@@ -36,7 +36,7 @@ libc = "0.2"
 [dev-dependencies]
 criterion = "0.8"
 test-case = "3.3.1"
-svod-schedule = { path = "../schedule", version = "=0.1.1", features = [
+svod-schedule = { path = "../schedule", version = "=0.2.0", features = [
   "testing",
 ] }
 proptest = "1.11.0"

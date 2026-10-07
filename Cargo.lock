@@ -3424,7 +3424,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "svod-arch"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "serde",
@@ -3437,7 +3437,7 @@ dependencies = [
 
 [[package]]
 name = "svod-codegen"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "smallvec",
  "snafu",
@@ -3451,7 +3451,7 @@ dependencies = [
 
 [[package]]
 name = "svod-device"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bindgen",
  "libc",
@@ -3476,7 +3476,7 @@ dependencies = [
 
 [[package]]
 name = "svod-dtype"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "enumset",
  "proptest",
@@ -3488,7 +3488,7 @@ dependencies = [
 
 [[package]]
 name = "svod-ir"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "bon",
@@ -3512,7 +3512,7 @@ dependencies = [
 
 [[package]]
 name = "svod-macros"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3521,7 +3521,7 @@ dependencies = [
 
 [[package]]
 name = "svod-model"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "bon",
@@ -3563,7 +3563,7 @@ dependencies = [
 
 [[package]]
 name = "svod-onnx"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -3581,7 +3581,7 @@ dependencies = [
 
 [[package]]
 name = "svod-runtime"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "libc",
  "libffi",
@@ -3608,7 +3608,7 @@ dependencies = [
 
 [[package]]
 name = "svod-schedule"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "bon",
@@ -3632,7 +3632,7 @@ dependencies = [
 
 [[package]]
 name = "svod-tensor"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "bon",
@@ -3662,7 +3662,7 @@ dependencies = [
 
 [[package]]
 name = "svod-tk"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "ndarray",

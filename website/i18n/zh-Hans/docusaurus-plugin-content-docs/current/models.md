@@ -34,10 +34,10 @@ sidebar_label: 运行模型
 
 ```toml
 [dependencies]
-svod-model  = "0.1"
-svod-arch   = "0.1"   # Asr, splitters, decoders
-svod-tensor = "0.1"
-svod-dtype  = "0.1"
+svod-model  = "0.2"
+svod-arch   = "0.2"   # Asr, splitters, decoders
+svod-tensor = "0.2"
+svod-dtype  = "0.2"
 ```
 
 构建需要机器上有 LLVM 和 Clang（见[简介](./introduction#building)）；CPU 不需要其他

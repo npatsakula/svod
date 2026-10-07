@@ -27,8 +27,8 @@ Runtime) covers the full specification.
 
 ```toml
 [dependencies]
-svod-onnx   = "0.1"
-svod-tensor = "0.1"
+svod-onnx   = "0.2"
+svod-tensor = "0.2"
 prost       = "0.14"            # ModelProto::decode
 ```
 

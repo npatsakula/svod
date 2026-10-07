@@ -35,10 +35,10 @@ CTC / RN-T decoders, VAD chunking और long-form ऑडियो पाइप�
 
 ```toml
 [dependencies]
-svod-model  = "0.1"
-svod-arch   = "0.1"   # Asr, splitters, decoders
-svod-tensor = "0.1"
-svod-dtype  = "0.1"
+svod-model  = "0.2"
+svod-arch   = "0.2"   # Asr, splitters, decoders
+svod-tensor = "0.2"
+svod-dtype  = "0.2"
 ```
 
 बिल्ड के लिए मशीन पर LLVM और Clang चाहिए (देखें

@@ -11,14 +11,14 @@ description = "Ready-to-run model implementations (ASR, embeddings, vision) for 
 base64 = "0.23"
 bon = "3.10"
 hf-hub = { version = "1.0", features = ["blocking"] }
-svod-arch = { path = "../arch", version = "=0.1.1" }
-svod-device = { path = "../device", version = "=0.1.1" }
-svod-dtype = { path = "../dtype", version = "=0.1.1" }
-svod-ir = { path = "../ir", version = "=0.1.1" }
-svod-macros = { path = "../macros", version = "=0.1.1" }
-svod-runtime = { path = "../runtime", version = "=0.1.1" }
-svod-tensor = { path = "../tensor", version = "=0.1.1" }
-svod-tk = { path = "../tk", version = "=0.1.1" }
+svod-arch = { path = "../arch", version = "=0.2.0" }
+svod-device = { path = "../device", version = "=0.2.0" }
+svod-dtype = { path = "../dtype", version = "=0.2.0" }
+svod-ir = { path = "../ir", version = "=0.2.0" }
+svod-macros = { path = "../macros", version = "=0.2.0" }
+svod-runtime = { path = "../runtime", version = "=0.2.0" }
+svod-tensor = { path = "../tensor", version = "=0.2.0" }
+svod-tk = { path = "../tk", version = "=0.2.0" }
 ndarray.workspace = true
 prost = "0.14.3"
 nom = "7.1"
