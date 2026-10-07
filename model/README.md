@@ -9,8 +9,8 @@ plans.
 
 | Module | Role |
 |---|---|
-| `jit` | `jit_wrapper!`-generated wrappers, `JitRecurrent<J>`, `InputSpec`, `JitError`. Build-once / run-many execution. See [JIT Graphs](../website/docs/architecture/jit-graphs.md). |
-| `audio` | Log-mel spectrogram, `Splitter` trait for long-form chunking (`FireRedVadSplitter`, `SileroVadSplitter`, `FixedLengthSplitter`). |
+| `jit` | `jit_wrapper!`-generated wrappers, `InputSpec`, `JitError`. Build-once / run-many execution. See [JIT Graphs](../website/docs/architecture/jit-graphs.md). |
+| `audio` | Log-mel spectrogram (torchaudio, Whisper and NeMo front-ends) with incremental host framing for streams (`FrameCursor`), `Splitter` trait for long-form chunking (`FireRedVadSplitter`, `SileroVadSplitter`, `FixedLengthSplitter`). |
 | `state` | Safetensors loading (single-file and sharded), dtype casting, and the origin scopes that name a module's weights. The `StateDict` / `Module` contract itself lives in `svod_tensor::nn`. |
 | `blocks` | Shared `conv2d`, `batchnorm2d`, `BasicBlock`, `Bottleneck`, `ResidualStage` reused by every ResNet-shaped backbone. timm/torchvision key convention. |
 | `wavlm` | WavLM speech-representation backbone (Conv1d feature extractor + gated rel-pos Transformer, per-layer pruning) consumed by `diarizen`. |
@@ -27,6 +27,7 @@ plans.
 | Silero VAD 16k | Voice activity | `silero_vad` | [snakers4/silero-vad](https://github.com/snakers4/silero-vad) | [`vpermilp/silero-vad`](https://huggingface.co/vpermilp/silero-vad) |
 | GTCRN (offline / streaming) | Speech enhancement | `gtcrn` | [Xiaobin-Rong/gtcrn](https://github.com/Xiaobin-Rong/gtcrn) | [`vpermilp/gtcrn`](https://huggingface.co/vpermilp/gtcrn) |
 | DiariZen segmentation (WavLM + Conformer) | Speaker diarization | `diarizen` | [BUT-FIT/DiariZen](https://github.com/BUTSpeechFIT/DiariZen) | [`BUT-FIT/diarizen-wavlm-large-s80-md-v2`](https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2) |
+| Nemotron-3-Diarization (offline + streaming Sortformer, 8 speakers) | Speaker diarization | `nemotron_diar` | [NVIDIA NeMo](https://github.com/NVIDIA-NeMo/Speech) | [`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization) |
 | ModernBERT (base / large) | Text embeddings, fill-mask (MLM) | `modernbert` | [Answer.AI ModernBERT](https://github.com/AnswerDotAI/ModernBERT) | [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) |
 | BGE-M3 (dense / sparse / ColBERT) | Text embeddings, retrieval | `bgem3` | [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (XLM-RoBERTa-large) | [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) |
 | BGE-reranker-v2-m3 | Cross-encoder reranking | `bgem3` | [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) | [`BAAI/bge-reranker-v2-m3`](https://huggingface.co/BAAI/bge-reranker-v2-m3) |
@@ -51,5 +52,6 @@ cargo run -p svod-model --release --example yolo_detect -- --hub --scale small -
 cargo run -p svod-model --release --example whisper_infer -- audio.wav [--size tiny|base|small] [--profile]
 cargo run -p svod-model --release --example whisper_infer -- audio.wav --language auto --timestamps
 cargo run -p svod-model --release --example gtcrn_enhance -- --hub --in noisy.wav --out enhanced.wav
+cargo run -p svod-model --release --example nemotron_diarize -- audio.wav [--stream low|very-low|ultra-low]  # RTTM to stdout
 cargo run -p svod-model --release --example qwen3_embed -- --texts texts.txt
 ```

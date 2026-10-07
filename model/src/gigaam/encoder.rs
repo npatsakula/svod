@@ -1,5 +1,4 @@
-use snafu::ResultExt;
-use svod_dtype::{DType, ScalarDType};
+use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
@@ -7,8 +6,6 @@ use svod_tensor::nn::{Layer, LayerNorm, Linear, Module, StateDict, get_tensor, p
 
 use crate::init::{Bias, fan_in_uniform, layer_norm, ones, zeros};
 use crate::state::{scoped, scoped_index};
-
-use super::error::TkSnafu;
 
 use super::{ConvNormType, GigaAmConfig, SubsamplingMode, subsampled_len};
 
@@ -152,9 +149,7 @@ impl MultiHeadSelfAttention {
 
     /// `key_lens`, when present, is a realized `[B]` `i32` tensor of valid
     /// (unpadded) key positions per batch — keys at index `>= key_lens[b]` are
-    /// masked. Passed to [`svod_tk::flash_attention_with`] as a key-only padding
-    /// mask; when the hand kernel doesn't apply it returns `None` and [`sdpa_attention`]
-    /// runs the same masked attention, so the result is correct on any device.
+    /// masked (see [`crate::attention::attend`]).
     pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
         let shape = x.shape()?;
         let b = shape[0].clone();
@@ -195,56 +190,12 @@ impl MultiHeadSelfAttention {
         };
         let (q, k, v) = (split(q)?, split(k)?, split(v)?);
 
-        // The hand FA kernel when it applies (a supported GPU + tiling shape), else this model's
-        // own SDPA — tk no longer falls back silently; the policy lives here.
-        let attn = if matches!(q.dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16) {
-            match svod_tk::flash_attention_with(
-                &q,
-                &k,
-                &v,
-                svod_tk::FaOpts { causal: false, key_lens, ..Default::default() },
-            )
-            .context(TkSnafu)?
-            {
-                Some(out) => out,
-                None => sdpa_attention(&q, &k, &v, key_lens)?,
-            }
-        } else {
-            sdpa_attention(&q, &k, &v, key_lens)?
-        };
+        let attn = crate::attention::attend(&q, &k, &v, false, key_lens)?;
         // Head-merge is a plain reshape here: the attention output is already
         // seq-major, so there is no transpose to undo.
         let out = attn.try_reshape([b, t, SInt::Const(d_model)])?;
         linear(&out, &self.out_proj, &self.out_bias, self.out_weight_scale.as_ref())
     }
-}
-
-/// SDPA fallback for when `svod_tk::flash_attention_with` returns `None` (non-AMD
-/// device or a non-tiling sequence length). Mirrors the kernel's contract: input
-/// and output stay `[B, T, H, d_k]`, attention is non-causal, and `key_lens` masks
-/// padded KEY positions only (`kv_pos ≥ key_lens[b]`). Permutes to the
-/// `[B, H, T, d_k]` SDPA wants and back.
-fn sdpa_attention(q: &Tensor, k: &Tensor, v: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
-    let perm = |t: &Tensor| -> Result<Tensor> { Ok(t.try_permute(&[0, 2, 1, 3])?) };
-    let (qp, kp, vp) = (perm(q)?, perm(k)?, perm(v)?);
-    let valid = match key_lens {
-        // `[B, N]` key validity, true = attend. A property of `key_lens`, shared
-        // by every layer: built outside the layer's origin scope so the layers
-        // share one mask.
-        Some(lens) => {
-            let _shared = OriginScope::suspend();
-            Some(Tensor::sequence_mask(lens, q.dim_const(1)?)?)
-        }
-        None => None,
-    };
-    let out = qp
-        .scaled_dot_product_attention()
-        .key(&kp)
-        .value(&vp)
-        .is_causal(false)
-        .maybe_key_padding_mask(valid.as_ref())
-        .call()?;
-    Ok(out.try_permute(&[0, 2, 1, 3])?)
 }
 
 // ---------------------------------------------------------------------------

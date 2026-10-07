@@ -243,7 +243,7 @@ fn swiglu_declines_a_pair_off_the_fragment_grid() {
 // ── Hardware-gated correctness (CUDA sm_80+, RDNA) ───────────────────────────
 
 /// Realize, cast to f32, and read as a host `Vec<f32>`.
-fn to_f32_vec(t: &Tensor) -> Vec<f32> {
+pub(super) fn to_f32_vec(t: &Tensor) -> Vec<f32> {
     let f = t.cast(DType::Float32).contiguous();
     f.realize().expect("realize f32");
     f.as_vec::<f32>().expect("read f32")
@@ -251,7 +251,7 @@ fn to_f32_vec(t: &Tensor) -> Vec<f32> {
 
 /// A realized pseudo-random `[rows, cols]` operand of `dtype`, deterministic in
 /// `seed` so the kernel and the reference see identical roundings.
-fn operand(rows: usize, cols: usize, dtype: DType, seed: f32) -> Tensor {
+pub(super) fn operand(rows: usize, cols: usize, dtype: DType, seed: f32) -> Tensor {
     let v: Vec<f32> = (0..rows * cols).map(|i| ((i as f32 + 1.0) * seed).sin() * 0.5).collect();
     let t = Tensor::from_slice(v)
         .try_reshape(vec![rows as isize, cols as isize])
@@ -264,7 +264,7 @@ fn operand(rows: usize, cols: usize, dtype: DType, seed: f32) -> Tensor {
 
 /// Largest elementwise difference **relative to the reference's own magnitude** —
 /// the scale a bf16 output's rounding is measured against.
-fn rel_err(got: &[f32], want: &[f32]) -> f32 {
+pub(super) fn rel_err(got: &[f32], want: &[f32]) -> f32 {
     let scale = want.iter().fold(0f32, |a, b| a.max(b.abs())).max(f32::MIN_POSITIVE);
     got.iter().zip(want).fold(0f32, |a, (g, w)| a.max((g - w).abs())) / scale
 }
@@ -273,14 +273,14 @@ fn rel_err(got: &[f32], want: &[f32]) -> f32 {
 /// to bf16, so they may differ by the rounding of a different summation order:
 /// up to two bf16 ulps, `2 · 2⁻⁸ ≈ 7.8e-3` of the output's magnitude. The measured
 /// error on these shapes is ≤ 3.1e-3 (one ulp); the bound leaves one ulp of slack.
-const BF16_REL_TOL: f32 = 8e-3;
+pub(super) const BF16_REL_TOL: f32 = 8e-3;
 
 /// The SwiGLU epilogue's band. `silu(gate)·up` carries the GEMM's two-ulp
 /// summation difference through a smooth activation (`|silu'| < 1.1`) and a
 /// bf16 multiply, and the reference's own `[M, 2I]` intermediate is rounded to
 /// bf16 exactly where the epilogue rounds its accumulators — so the error stays
 /// the product's, not a new one. Measured ≤ 4.5e-3 on the shapes below.
-const SWIGLU_REL_TOL: f32 = 1.2e-2;
+pub(super) const SWIGLU_REL_TOL: f32 = 1.2e-2;
 
 /// `gemm_nt` against the generic `Tensor::linear` over the same bf16 operands, on
 /// every tuned linear-layer shape plus the odd ones (a batch-1 M, an N that only
@@ -424,7 +424,7 @@ fn gemm_nt_add_matches_graph_gpu(m: usize, k: usize, n: usize) {
 /// The `[2I, K]` gate/up weight rearranged into the alternating `pair`-row blocks
 /// [`Epilogue::SwiGlu`] reads: `[g0.., u0.., g1.., u1.., …]`, so a wave's N tile
 /// holds a gate block beside its matching up block.
-fn pair_rows(w: &Tensor, pair: usize) -> Tensor {
+pub(super) fn pair_rows(w: &Tensor, pair: usize) -> Tensor {
     let d = w.dims().expect("dims");
     let (blocks, k) = (d[0] / (2 * pair), d[1]);
     let dim = |v: [usize; 4]| v.map(|d| d as isize).to_vec();
@@ -550,7 +550,7 @@ fn staged_gemm_gfx1151_fences_each_strip_once() {
     let buffers: Vec<Arc<UOp>> =
         [m * n, m * k, n * k].into_iter().map(|size| UOp::new_buffer(DeviceSpec::Cpu, size, DType::BFloat16)).collect();
     let ker = crate::Kernel::new("gemm_nt", cfg.grid_dims(m, n), cfg.threads(caps.wave_size), buffers, caps);
-    build_gemm_nt(&ker, (m, k, n), cfg, DType::BFloat16, DType::BFloat16, Epilogue::Plain);
+    build_gemm_nt(&ker, (m, k, n), cfg, DType::BFloat16, DType::BFloat16, Epilogue::Plain, None);
     let sink = ker.finish(cfg.acc_m);
 
     let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(AmdArch::Gfx1151);
@@ -595,7 +595,7 @@ fn staged_gemm_rdna4_fences_the_commit() {
     let buffers: Vec<Arc<UOp>> =
         [m * n, m * k, n * k].into_iter().map(|size| UOp::new_buffer(DeviceSpec::Cpu, size, DType::BFloat16)).collect();
     let ker = crate::Kernel::new("gemm_nt", cfg.grid_dims(m, n), cfg.threads(caps.wave_size), buffers, caps);
-    build_gemm_nt(&ker, (m, k, n), cfg, DType::BFloat16, DType::BFloat16, Epilogue::Plain);
+    build_gemm_nt(&ker, (m, k, n), cfg, DType::BFloat16, DType::BFloat16, Epilogue::Plain, None);
     let sink = ker.finish(cfg.acc_m);
 
     let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(AmdArch::Gfx1201);

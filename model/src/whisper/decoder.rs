@@ -10,7 +10,8 @@ use crate::state::{scope_index, scoped, scoped_index};
 use super::attention::MultiHeadAttention;
 use super::blocks::linear_forward;
 use super::config::ModelDimensions;
-use super::error::{Result, tk_launch_error};
+use super::error::Result;
+use crate::attention::tk_launch_error;
 
 #[derive(Clone, Copy)]
 struct StepAttentionConfig {

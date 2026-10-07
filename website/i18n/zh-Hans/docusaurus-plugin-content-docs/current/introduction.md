@@ -51,7 +51,7 @@ Svod 自带语音、文本和视觉模型，均已对照各自的 PyTorch 参考
 | 语音识别 | Whisper、GigaAM v3（CTC、RN-T） |
 | 语音活动检测 | FireRedVAD、Silero VAD |
 | 语音增强 | GTCRN |
-| 说话人分析 | DiariZen、WeSpeaker |
+| 说话人分析 | Nemotron-3-Diarization、DiariZen、WeSpeaker |
 | 文本嵌入与重排序 | BGE-M3、Qwen3-Embedding、ModernBERT |
 | 视觉 | YOLO26、ResNet |
 | 其他一切 | [ONNX 导入器](https://github.com/npatsakula/svod/tree/main/onnx/)（[算子覆盖](https://github.com/npatsakula/svod/tree/main/onnx/PARITY.md)） |

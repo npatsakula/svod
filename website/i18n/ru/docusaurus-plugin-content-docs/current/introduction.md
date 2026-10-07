@@ -56,7 +56,7 @@ Svod поставляется с речевыми, текстовыми и ви�
 | Распознавание речи | Whisper, GigaAM v3 (CTC, RN-T) |
 | Детекция речи (VAD) | FireRedVAD, Silero VAD |
 | Улучшение речи | GTCRN |
-| Анализ дикторов | DiariZen, WeSpeaker |
+| Анализ дикторов | Nemotron-3-Diarization, DiariZen, WeSpeaker |
 | Текстовые эмбеддинги и реранкинг | BGE-M3, Qwen3-Embedding, ModernBERT |
 | Зрение | YOLO26, ResNet |
 | Всё остальное | [Импортёр ONNX](https://github.com/npatsakula/svod/tree/main/onnx/) ([покрытие операторов](https://github.com/npatsakula/svod/tree/main/onnx/PARITY.md)) |

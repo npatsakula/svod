@@ -15,7 +15,7 @@ use crate::init::{Bias, linear};
 use crate::state::scoped;
 
 use super::blocks::linear_forward;
-use super::error::{Result, tk_launch_error};
+use super::error::Result;
 
 const MIN_PADDED_FA_SEQUENCE: usize = 1024;
 const MAX_PADDED_FA_OVERHEAD_DIVISOR: usize = 16;
@@ -93,8 +93,8 @@ impl MultiHeadAttention {
         Ok((out, k, v))
     }
 
-    /// Flash-attention path: Q/K/V in [B, S, D] → split to [B, S, H, Dh] for FA,
-    /// fall back to SDPA if FA doesn't apply. `causal` controls the mask.
+    /// Q/K/V in [B, S, D] → split to [B, S, H, Dh], the layout of
+    /// [`crate::attention::attend`]. `causal` controls the mask.
     fn fa_attention(
         &self,
         q: &Tensor,
@@ -114,39 +114,7 @@ impl MultiHeadAttention {
         };
         let (q_fa, k_fa, v_fa) = (split(q)?, split(k)?, split(v)?);
 
-        // The kernel's mma operands are 16-bit, so it can only hold the model's own
-        // precision when the activations already are. Casting fp32 down to reach it
-        // trades roughly three decimal digits for the speedup silently: on the fp32
-        // encoder that moved the output from 1.0e-3 to 1.8 against the PyTorch
-        // golden (bf16), and only to 2.6e-1 with fp16. So an fp32 model keeps SDPA.
-        let dt = q_fa.dtype();
-        let sixteen_bit = dt == DType::BFloat16 || dt == DType::Float16;
-        let direct = if sixteen_bit && (d / self.n_head).is_multiple_of(16) {
-            svod_tk::flash_attention_with(
-                &q_fa,
-                &k_fa,
-                &v_fa,
-                svod_tk::FaOpts { causal, key_lens, ..Default::default() },
-            )
-            .map_err(tk_launch_error)?
-        } else {
-            None
-        };
-        match direct {
-            Some(out) => Ok(out.try_reshape([b, s, d.into()])?),
-            None => {
-                // SDPA fallback (needs [B, H, S, Dh])
-                let valid = key_lens.map(|lens| Tensor::sequence_mask(lens, k.dim_const(1)?)).transpose()?;
-                let out = q
-                    .split_heads(self.n_head)?
-                    .scaled_dot_product_attention()
-                    .key(&k.split_heads(self.n_head)?)
-                    .value(&v.split_heads(self.n_head)?)
-                    .is_causal(causal)
-                    .maybe_key_padding_mask(valid.as_ref())
-                    .call()?;
-                Ok(out.merge_heads()?)
-            }
-        }
+        let out = crate::attention::attend(&q_fa, &k_fa, &v_fa, causal, key_lens)?;
+        Ok(out.try_reshape([b, s, d.into()])?)
     }
 }

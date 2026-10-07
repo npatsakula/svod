@@ -11,4 +11,5 @@ pub(crate) mod mel;
 
 pub(crate) use bounds::ChunkerKnobs;
 pub use bounds::{AudioChunk, EncoderBounds};
-pub use mel::{MelConfig, MelJit, MelScale, MelSpectrogram};
+pub use mel::{FrameCursor, MelConfig, MelJit, MelScale, MelSpectrogram, PadMode};
+pub use svod_tensor::nn::MelLog;

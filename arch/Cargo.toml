@@ -6,7 +6,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Host-side speech decoding for Svod: CTC and RNN-T decoders, VAD-driven chunking, and a long-form ASR pipeline"
+description = "Host-side speech decoding for Svod: CTC and RNN-T decoders, VAD-driven chunking, a long-form ASR pipeline, and diarization post-processing"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"], optional = true }

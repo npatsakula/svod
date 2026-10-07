@@ -8,6 +8,7 @@ onnx/src/test/
 runtime/src/test/
 schedule/src/test/
 schedule/proptest-regressions/
+model/proptest-regressions/
 tensor/src/test/
 tk/src/test/
 tensor/benches/

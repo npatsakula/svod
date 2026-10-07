@@ -15,6 +15,20 @@ use svod_ir::{AxisId, AxisType, KernelInfo, Op, UOp};
 use crate::ArchCaps;
 use crate::index::cidx;
 
+/// The launch grid, one `Index` extent per axis: a constant, or a bounded
+/// runtime variable (a JIT `batch_var`) that the dispatch resolves from the
+/// plan's bindings (graph launches only: the direct [`crate::launch()`] path binds
+/// no variables). A variable may only be a trip count — the body indexes with
+/// `block_idx`, never sizes a tile or buffer by it.
+#[derive(Clone, Debug)]
+pub struct Grid(pub [Arc<UOp>; 3]);
+
+impl From<[i64; 3]> for Grid {
+    fn from(grid: [i64; 3]) -> Self {
+        Self(grid.map(cidx))
+    }
+}
+
 pub struct Kernel {
     pub name: String,
     /// The arch-derived caps (wave size, reduce tree, WMMA arch) the builder
@@ -59,7 +73,13 @@ impl Kernel {
     /// # Panics
     /// In a debug build, panics if the arch wave size is neither 32 nor 64 — tk
     /// only has fragment-layout tables for wave32/wave64.
-    pub fn new(name: impl Into<String>, grid: [i64; 3], block: i64, buffers: Vec<Arc<UOp>>, caps: ArchCaps) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        grid: impl Into<Grid>,
+        block: i64,
+        buffers: Vec<Arc<UOp>>,
+        caps: ArchCaps,
+    ) -> Self {
         // tk's lane math (reduce tree, sibling folds) is calibrated for wave64
         // (gfx942 CDNA) and wave32 (gfx11 RDNA, CUDA). Any other wave size is
         // gated loudly (such an arch is also absent from every kernel's `ArchSet`
@@ -80,10 +100,11 @@ impl Kernel {
             caps.arch
         );
         let globals = buffers.iter().enumerate().map(|(slot, buf)| flat_param(slot, buf)).collect();
+        let Grid([x, y, z]) = grid.into();
         let block_idx = [
-            UOp::special(cidx(grid[0]), "gidx0".to_string()),
-            UOp::special(cidx(grid[1]), "gidx1".to_string()),
-            UOp::special(cidx(grid[2]), "gidx2".to_string()),
+            UOp::special(x, "gidx0".to_string()),
+            UOp::special(y, "gidx1".to_string()),
+            UOp::special(z, "gidx2".to_string()),
         ];
         let thread_idx = UOp::special(cidx(block), "lidx0".to_string());
         Kernel {
