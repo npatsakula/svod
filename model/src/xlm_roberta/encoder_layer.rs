@@ -40,12 +40,11 @@ impl EncoderLayer {
         }
     }
 
-    /// Forward. `x`: `(B, L, D)` → `(B, L, D)`. Post-norm.
+    /// Forward. `x`: `(B, L, D)` → `(B, L, D)`. Post-norm, each residual added
+    /// in the epilogue of the GEMM before its norm.
     pub fn forward(&self, x: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
-        let add_norm = |delta: &Tensor, x: &Tensor, ln: &LayerNorm| -> Result<Tensor> {
-            Ok(ops::add_layer_norm(delta, x, &ln.weight, ln.bias.as_ref(), ln.eps)?.1)
-        };
-        let x = add_norm(&self.attention.forward(x, padding_mask)?, x, &self.attention_norm)?;
-        add_norm(&self.feed_forward.forward(&x)?, &x, &self.ffn_norm)
+        let norm = |x: &Tensor, ln: &LayerNorm| ops::layer_norm(x, &ln.weight, ln.bias.as_ref(), ln.eps);
+        let x = norm(&self.attention.forward(x, x, padding_mask)?, &self.attention_norm)?;
+        Ok(norm(&self.feed_forward.forward(&x, &x)?, &self.ffn_norm)?)
     }
 }

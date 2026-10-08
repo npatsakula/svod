@@ -35,11 +35,12 @@ impl FeedForwardWeights {
         }
     }
 
-    /// Forward. `x`: `(B, L, D)` → `(B, L, D)`.
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// Forward. `x`: `(B, L, D)` → `residual + ffn(x)`, `(B, L, D)`, the add
+    /// in the output projection's epilogue.
+    pub fn forward(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
         let opts = ops::Linear { bias: Some(&self.intermediate_bias), act: Act::Gelu, ..ops::Linear::default() };
         let y = ops::linear(x, &self.intermediate_weight, opts)?;
-        let opts = ops::Linear { bias: Some(&self.output_bias), ..ops::Linear::default() };
+        let opts = ops::Linear { bias: Some(&self.output_bias), residual: Some(residual), ..ops::Linear::default() };
         Ok(ops::linear(&y, &self.output_weight, opts)?)
     }
 }
