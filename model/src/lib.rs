@@ -17,7 +17,6 @@ pub mod gtcrn;
 pub(crate) mod hub;
 pub(crate) mod init;
 pub mod jit;
-pub(crate) mod linear;
 pub mod modernbert;
 pub mod nemotron_diar;
 pub mod qwen3;

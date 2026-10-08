@@ -27,7 +27,7 @@ use svod_tensor::nn::{Embedding, Layer, Module, RmsNorm};
 use crate::state::{self, StateDict};
 
 use super::config::Qwen3Config;
-use super::decoder_layer::{Qwen3DecoderLayer, Residual};
+use super::decoder_layer::{Qwen3DecoderLayer, add_norm};
 use super::error::{ContextLengthSnafu, Result};
 
 #[derive(Clone, Module)]
@@ -175,13 +175,12 @@ impl Qwen3Model {
 
     /// The decoder stack and final norm over embedded `ids`.
     fn stack(&self, ids: &Tensor, rope: &(Tensor, Tensor), seg_start: Option<&Tensor>) -> Result<Tensor> {
-        // The stream travels unsummed between layers so each residual add is
-        // absorbed by the norm that reads it (see `decoder_layer::Residual`).
-        let mut h = Residual::from(self.embeddings.forward(ids)?);
+        let (mut h, mut delta) = (self.embeddings.forward(ids)?, None);
         for layer in &self.layers {
-            h = layer.forward_residual(h, rope, seg_start)?;
+            let (stream, mlp) = layer.forward_unsummed(&h, delta.as_ref(), rope, seg_start)?;
+            (h, delta) = (stream, Some(mlp));
         }
-        Ok(h.norm(&self.norm)?.1)
+        Ok(add_norm(&self.norm, delta.as_ref(), &h)?.1)
     }
 
     pub fn from_hub(model_id: &str, mut config: Qwen3Config) -> Result<Self> {

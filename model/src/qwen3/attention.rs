@@ -13,12 +13,12 @@ use svod_dtype::ScalarDType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, Module, RmsNorm, StateDict, get_tensor, prefixed};
+use svod_tk3::ops;
 
 use crate::init::fan_in_uniform;
 
 use super::error::{Result, TkSnafu};
 use super::tk;
-use crate::linear::{Projected, linear, linear_add};
 
 #[derive(Clone)]
 pub struct Qwen3Attention {
@@ -96,28 +96,25 @@ impl Qwen3Attention {
     /// `x`: `(B, L, D)` → `(B, L, D)`. `rope`: sequence-major `(cos, sin)`,
     /// `[1, L, 1, Dh/2]` by position or `[B, L, 1, Dh/2]` by token.
     pub fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor)) -> Result<Tensor> {
-        Ok(self.forward_into(x, rope, None, None)?.into_tensor())
+        self.forward_packed(x, rope, None)
     }
 
-    /// [`Self::forward`] with `residual` folded into the `o_proj` GEMM's
-    /// epilogue when that kernel takes it (see [`linear_add`]) and the packed
-    /// rows' `seg_start` (see [`causal_attention`]).
-    pub(crate) fn forward_into(
+    /// [`Self::forward`] over packed rows' `seg_start` (see [`causal_attention`]).
+    pub(crate) fn forward_packed(
         &self,
         x: &Tensor,
         rope: &(Tensor, Tensor),
-        residual: Option<&Tensor>,
         seg_start: Option<&Tensor>,
-    ) -> Result<Projected> {
+    ) -> Result<Tensor> {
         let (b, l) = (x.dim(0)?, x.dim(1)?);
-        let qkv = linear(x, &self.qkv_weight)?;
+        let qkv = ops::linear(x, &self.qkv_weight, ops::Linear::default())?;
         let (q, k, v) = self.prologue(&qkv, rope, (&b, &l))?;
         let attn = causal_attention(&q, &k, &v, seg_start)?.try_reshape([
             b,
             l,
             SInt::Const(self.num_heads * self.head_dim),
         ])?;
-        Ok(linear_add(&attn, &self.o_proj_weight, residual)?)
+        Ok(ops::linear(&attn, &self.o_proj_weight, ops::Linear::default())?)
     }
 
     /// The fused GEMM output `[B, L, (H + 2·Hkv)·Dh]` → the three sequence-major
