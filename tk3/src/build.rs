@@ -489,7 +489,8 @@ impl Kernel {
     ) -> [Regs<T>; N] {
         let pred = self.intern(pred);
         let mut merged: Option<[ValId; N]> = None;
-        let mut branch = |k: &mut Self, f: Box<dyn FnOnce(&mut Self) -> [Regs<T>; N] + '_>| {
+        type Branch<'a, T, const N: usize> = Box<dyn FnOnce(&mut Kernel) -> [Regs<T>; N] + 'a>;
+        let mut branch = |k: &mut Self, f: Branch<'_, T, N>| {
             k.with_block(|k| {
                 let vals = f(k);
                 let out = *merged.get_or_insert_with(|| {

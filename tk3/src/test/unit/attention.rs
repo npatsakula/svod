@@ -201,11 +201,11 @@ fn attention_throughput_probe() {
         }
         let flops = 4.0 * batch as f64 * heads as f64 * t as f64 * t as f64 * d as f64 / if causal { 2.0 } else { 1.0 };
         let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
-        for warps_rows in [4u32] {
+        {
             let lowering = Lowering {
                 target: target.clone(),
                 schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false },
-                grid: WarpGrid { rows: warps_rows, cols: 1 },
+                grid: WarpGrid { rows: 4, cols: 1 },
                 swizzle: true,
             };
             let o = Tensor::empty(&[batch * t * heads * d], DType::BFloat16);
