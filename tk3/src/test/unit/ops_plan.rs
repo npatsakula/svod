@@ -11,7 +11,7 @@ use crate::kernels::attention::FaCfg;
 use crate::kernels::gemm::GemmCfg;
 use crate::kernels::rows::NormCfg;
 use crate::ops::shape::{self, Extent, Fallback, Plan, extent};
-use crate::ops::{self as tk, Attn, Error, KeyMask, Linear};
+use crate::ops::{self as tk, Attn, Error, KeyMask, Linear, Qkv};
 
 const BF16: DType = DType::BFloat16;
 
@@ -188,6 +188,24 @@ fn attention_with_symbolic_keys_falls_back() {
     assert_eq!(shape::attention(Some(&sm86()), &[BF16; 3], Some(&q), None), Plan::Graph(Fallback::Symbolic));
 }
 
+// ---- heads -------------------------------------------------------------------------
+
+#[test_case(64, Ok(NormCfg { br: 4 }); "d 64")]
+#[test_case(128, Ok(NormCfg { br: 4 }); "d 128")]
+#[test_case(48, Err(Fallback::Shape); "d 48")]
+#[test_case(512, Err(Fallback::Shape); "d 512")]
+fn heads_plan(d: usize, want: Result<NormCfg, Fallback>) {
+    let x = ext(&[2, 100, 12 * d]);
+    assert_eq!(first(shape::heads(Some(&sm86()), &[BF16], Some(&x), d)), want);
+}
+
+#[test]
+fn heads_need_three_dims() {
+    let x = ext(&[200, 12 * 64]);
+    assert_eq!(shape::heads(Some(&sm86()), &[BF16], Some(&x), 64), Plan::Graph(Fallback::Shape));
+    assert_eq!(shape::heads(Some(&sm86()), &[BF16], None, 64), Plan::Graph(Fallback::Symbolic));
+}
+
 // ---- norms -------------------------------------------------------------------------
 
 #[test_case(1024, Ok(vec![4, 8, 16]); "1024")]
@@ -221,9 +239,8 @@ fn extents_take_a_bound_leading_variable_only() {
 }
 
 #[test]
-fn no_device_no_padding() {
+fn no_device_no_kernels() {
     assert!(!tk::supported(&DeviceSpec::Cpu));
-    assert_eq!(tk::preferred_len(&DeviceSpec::Cpu, &BF16, 100), 100);
 }
 
 // ---- errors ----------------------------------------------------------------------------
@@ -236,6 +253,7 @@ fn t(shape: &[usize], dtype: DType) -> Tensor {
 fn semantic_mismatches_are_errors() {
     let x = t(&[4, 64], BF16);
     let err = |r: tk::Result<Tensor>| r.expect_err("an error");
+    let err3 = |r: tk::Result<(Tensor, Tensor, Tensor)>| r.expect_err("an error");
     assert!(matches!(err(tk::linear(&x, &t(&[32, 48], BF16), Linear::default())), Error::Shape { operand: "w", .. }));
     assert!(matches!(
         err(tk::linear(&x, &t(&[32, 64], DType::Float16), Linear::default())),
@@ -267,6 +285,26 @@ fn semantic_mismatches_are_errors() {
     let seg = t(&[2, 12], DType::Int32);
     let opts = Attn { seg_start: Some(&seg), ..Attn::default() };
     assert!(matches!(err(tk::attention(&q, &kv2, &kv2, opts)), Error::Shape { operand: "seg start", .. }));
+
+    let qkv = t(&[2, 10, 8 * 64], BF16);
+    let split = Qkv { heads: 4, kv_heads: 2, head_dim: 64, q_norm: None, k_norm: None, eps: 1e-6, rope: None };
+    let bad = Qkv { kv_heads: 3, ..split };
+    assert!(matches!(err3(tk::heads(&qkv, bad)), Error::Heads { heads: 4, kv_heads: 3, .. }));
+    let bad = Qkv { heads: 8, ..split };
+    assert!(matches!(err3(tk::heads(&qkv, bad)), Error::Shape { operand: "qkv", .. }));
+    let w = t(&[32], BF16);
+    let bad = Qkv { k_norm: Some(&w), ..split };
+    assert!(matches!(err3(tk::heads(&qkv, bad)), Error::Shape { operand: "k norm", .. }));
+    let w16 = t(&[64], DType::Float16);
+    let bad = Qkv { q_norm: Some(&w16), ..split };
+    assert!(matches!(err3(tk::heads(&qkv, bad)), Error::Dtype { operand: "q norm", .. }));
+    let cos = t(&[1, 10, 1, 64], BF16);
+    let bad = Qkv { rope: Some((&cos, &cos)), ..split };
+    assert!(matches!(err3(tk::heads(&qkv, bad)), Error::Shape { operand: "cos", .. }));
+    let cos = t(&[1, 10, 1, 32], BF16);
+    let sin = t(&[2, 10, 1, 32], BF16);
+    let bad = Qkv { rope: Some((&cos, &sin)), ..split };
+    assert!(matches!(err3(tk::heads(&qkv, bad)), Error::Shape { operand: "sin", .. }));
 
     let w = t(&[32], BF16);
     assert!(matches!(err(tk::layer_norm(&x, &w, None, 1e-5)), Error::Shape { operand: "w", .. }));

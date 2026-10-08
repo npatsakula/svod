@@ -6,7 +6,7 @@ use svod_ir::{Op, SInt, ops};
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
-use crate::ops::{self as tk, Act, Attn, KeyMask, Linear};
+use crate::ops::{self as tk, Act, Attn, KeyMask, Linear, Qkv};
 
 /// A CUDA device to run on, with tuning off so a test does not measure
 /// every shape it touches (the untuned pick runs).
@@ -321,6 +321,83 @@ fn attention_under_a_batch_variable() {
     assert_kernel(&o, "flash_attention");
     let [qs, ks, vs, ls] = <[Tensor; 4]>::try_from(first(&[&q, &k, &v, &lens], live)).unwrap();
     assert_close("batched attention", &o, &tk::attention::graph(&qs, &ks, &vs, opts(&ls)).unwrap(), 2e-2);
+}
+
+// ---- heads ---------------------------------------------------------------------
+
+/// Rotary tables `[rows, t, 1, d / 2]`, realized.
+fn rope_tables(rows: usize, t: usize, d: usize, dtype: DType) -> (Tensor, Tensor) {
+    let (cos, sin) = Tensor::rope_table(10_000.0, t, d, DType::Float32).unwrap();
+    let table = |x: Tensor| {
+        let x = x.try_reshape([1, t, 1, d / 2]).unwrap();
+        let x = if rows == 1 { x } else { x.try_expand([rows, t, 1, d / 2]).unwrap() };
+        let x = x.cast(dtype.clone()).contiguous();
+        x.realize().unwrap();
+        x
+    };
+    (table(cos), table(sin))
+}
+
+#[test_case(2, 37, [4, 2, 64], true, true, false; "normed, rotated by position")]
+#[test_case(2, 20, [8, 2, 128], true, true, true; "d 128, rotated by token")]
+#[test_case(3, 9, [4, 4, 64], false, true, false; "rotated only")]
+#[test_case(1, 50, [4, 1, 64], true, false, false; "normed only")]
+#[test_case(2, 16, [2, 2, 32], false, false, false; "a split")]
+fn heads_match_the_graph(b: usize, t: usize, [h, h_kv, d]: [usize; 3], normed: bool, rotated: bool, by_token: bool) {
+    if !device() {
+        return;
+    }
+    let qkv = rand(&[b, t, (h + 2 * h_kv) * d], 30, 2.0, DType::BFloat16);
+    let q_w = rand(&[d], 31, 0.5, DType::BFloat16);
+    let k_w = rand(&[d], 32, 0.5, DType::BFloat16);
+    let tables = rotated.then(|| rope_tables(if by_token { b } else { 1 }, t, d, DType::BFloat16));
+    let opts = Qkv {
+        heads: h,
+        kv_heads: h_kv,
+        head_dim: d,
+        q_norm: normed.then_some(&q_w),
+        k_norm: normed.then_some(&k_w),
+        eps: 1e-6,
+        rope: tables.as_ref().map(|(c, s)| (c, s)),
+    };
+    let (q, k, v) = tk::heads(&qkv, opts).unwrap();
+    assert_kernel(&q, "heads");
+    let (wq, wk, wv) = tk::heads::graph(&qkv, opts).unwrap();
+    assert_close("q", &q, &wq, 2e-2);
+    assert_close("k", &k, &wk, 2e-2);
+    assert_close("v", &v, &wv, 0.0);
+}
+
+#[test]
+fn heads_under_a_batch_variable() {
+    if !device() {
+        return;
+    }
+    let (cap, live, t, [h, h_kv, d]) = (3, 2, 12, [4, 2, 64]);
+    let qkv = rand(&[cap, t, (h + 2 * h_kv) * d], 33, 2.0, DType::BFloat16);
+    let w = rand(&[d], 34, 0.5, DType::BFloat16);
+    let (cos, sin) = rope_tables(1, t, d, DType::BFloat16);
+    let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
+    let [qkv_b] = <[Tensor; 1]>::try_from(bound(&[&qkv], &var)).unwrap();
+    let opts = Qkv {
+        heads: h,
+        kv_heads: h_kv,
+        head_dim: d,
+        q_norm: Some(&w),
+        k_norm: Some(&w),
+        eps: 1e-6,
+        rope: Some((&cos, &sin)),
+    };
+    let (q, k, v) = tk::heads(&qkv_b, opts).unwrap();
+    for out in [&q, &k, &v] {
+        assert_eq!(out.shape().unwrap()[0], var.as_sint());
+    }
+    assert_kernel(&q, "heads");
+    let [qkv_s] = <[Tensor; 1]>::try_from(first(&[&qkv], live)).unwrap();
+    let (wq, wk, wv) = tk::heads::graph(&qkv_s, opts).unwrap();
+    assert_close("batched q", &q, &wq, 2e-2);
+    assert_close("batched k", &k, &wk, 2e-2);
+    assert_close("batched v", &v, &wv, 0.0);
 }
 
 // ---- norms ---------------------------------------------------------------------

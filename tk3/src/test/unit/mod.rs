@@ -2,6 +2,7 @@ mod atoms;
 mod attention;
 mod build;
 mod device;
+mod heads;
 mod interp;
 mod layout;
 mod layouts;

@@ -7,6 +7,7 @@
 
 pub(crate) mod attention;
 pub mod config;
+pub(crate) mod heads;
 pub(crate) mod linear;
 pub(crate) mod norm;
 pub mod shape;
@@ -21,6 +22,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 pub use self::attention::{Attn, KeyMask, attention};
+pub use self::heads::{Qkv, heads};
 pub use self::linear::{Linear, linear};
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
 use crate::atoms::Target;
@@ -55,12 +57,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Whether a tk3 target with kernel tables exists for `device`.
 pub fn supported(device: &DeviceSpec) -> bool {
     target(device).is_some_and(|t| config::has_tables(&t))
-}
-
-/// The length a model should pad a sequence to for the best attention
-/// throughput: the next multiple of 64 where the kernel runs, else `len`.
-pub fn preferred_len(device: &DeviceSpec, dtype: &DType, len: usize) -> usize {
-    if shape::attention_runs(target(device).as_ref(), dtype) { len.next_multiple_of(64) } else { len }
 }
 
 /// The target of a device kernels can be launched on (graph kernels lower for

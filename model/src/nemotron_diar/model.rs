@@ -285,12 +285,11 @@ impl NemotronDiar {
     pub fn classify(&self, embeds: &Tensor, seq_lens: &Tensor, key_lens: &Tensor) -> Result<Tensor> {
         let config = &self.config;
         let seq = embeds.dim_const(1)?;
-        // The encoder sees the step padded to a length the kernels like:
-        // `SEQ_ALIGN` for the scheduler (an odd length such as the 541-frame
-        // streaming step halves its throughput), and the tile kernels'
-        // preference on top. `key_lens` hides the padding, which is cut again
-        // before the head.
-        let padded = ops::preferred_len(&embeds.device(), &config.dtype, seq.next_multiple_of(SEQ_ALIGN));
+        // The encoder sees the step padded to `SEQ_ALIGN` for the scheduler
+        // (an odd length such as the 541-frame streaming step halves its
+        // throughput); the tile kernels mask any length. `key_lens` hides the
+        // padding, which is cut again before the head.
+        let padded = seq.next_multiple_of(SEQ_ALIGN);
         let embeds_padded = match padded - seq {
             0 => embeds.clone(),
             pad => embeds.try_pad(&[(0, 0), (0, pad as isize), (0, 0)])?,

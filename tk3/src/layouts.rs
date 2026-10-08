@@ -213,13 +213,15 @@ pub fn mma_layouts(atom: &MmaAtom, grid: WarpGrid, m: usize, n: usize, k: usize)
 }
 
 /// A layout for a tile nothing constrains: each lane holds a short row
-/// vector, lanes walk the columns then the rows, warps split the rows.
+/// vector, lanes walk the columns then the rows, warps split the rows. The
+/// vector is as wide as a wave can spread over one row, up to 8 elements,
+/// so a narrow row still occupies a whole warp rather than replicating.
 pub fn natural(shape: Shape, warps: u32, lanes: u32) -> Option<TileLayout> {
     let (rows, cols) = (shape.rows as u32, shape.cols as u32);
     if !rows.is_power_of_two() || !cols.is_power_of_two() {
         return None;
     }
-    let v = cols.min(8);
+    let v = (cols / lanes).clamp(1, 8);
     let lane_cols = (cols / v).min(lanes);
     let lane_rows = (lanes / lane_cols).min(rows);
     let warp_rows = (rows / lane_rows).min(warps);

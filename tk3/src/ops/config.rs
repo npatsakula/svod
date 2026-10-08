@@ -90,6 +90,14 @@ pub fn attention_candidates(target: &Target, d: usize) -> Vec<FaCfg> {
     list.into_iter().filter(|c| c.smem_bytes(d) <= target.smem_bytes).collect()
 }
 
+/// One warp per head row, the head split in halves a warp spreads over.
+pub fn heads_candidates(_target: &Target, d: usize) -> Vec<NormCfg> {
+    if !(d.is_power_of_two() && (16..=256).contains(&d)) {
+        return vec![];
+    }
+    [4, 8, 16].map(|br| NormCfg { br }).to_vec()
+}
+
 /// One warp per row of a power-of-two width a warp's vector loads span.
 pub fn norm_candidates(_target: &Target, d: usize) -> Vec<NormCfg> {
     if !(d.is_power_of_two() && (256..=2048).contains(&d)) {
