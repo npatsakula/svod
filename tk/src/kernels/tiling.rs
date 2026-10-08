@@ -166,7 +166,7 @@ impl TileBudget {
     const BEAM_ROUNDS: usize = 3;
 
     /// Walk the tile lattice from `seeds`, measuring: time the frontier, keep the
-    /// fastest [`BEAM_WIDTH`], expand those by [`Self::neighbours`], repeat.
+    /// fastest [`Self::BEAM_WIDTH`], expand those by [`Self::neighbours`], repeat.
     ///
     /// This is the same shape as the graph optimizer's BEAM, and for the same
     /// reason. The cost [`Self::cost`] computes stops short of what decides the
