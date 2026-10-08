@@ -21,7 +21,7 @@ use svod_dtype::{DType, DeviceSpec};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-pub use self::attention::{Attn, KeyMask, attention};
+pub use self::attention::{Attn, Cache, KeyMask, attention};
 pub use self::heads::{Qkv, heads};
 pub use self::linear::{Linear, linear};
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};

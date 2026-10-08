@@ -6,7 +6,7 @@ use svod_ir::{Op, SInt, ops};
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
-use crate::ops::{self as tk, Act, Attn, KeyMask, Linear, Qkv};
+use crate::ops::{self as tk, Act, Attn, Cache, KeyMask, Linear, Qkv};
 
 /// A CUDA device to run on, with tuning off so a test does not measure
 /// every shape it touches (the untuned pick runs).
@@ -241,7 +241,7 @@ impl AttnInputs {
             (None, Some(mask)) => KeyMask::Bool(mask),
             (None, None) => KeyMask::None,
         };
-        Attn { causal: c.causal, keys, window: c.window, seg_start: self.seg_start.as_ref(), scale: None }
+        Attn { causal: c.causal, keys, window: c.window, seg_start: self.seg_start.as_ref(), ..Attn::default() }
     }
 }
 
@@ -321,6 +321,39 @@ fn attention_under_a_batch_variable() {
     assert_kernel(&o, "flash_attention");
     let [qs, ks, vs, ls] = <[Tensor; 4]>::try_from(first(&[&q, &k, &v, &lens], live)).unwrap();
     assert_close("batched attention", &o, &tk::attention::graph(&qs, &ks, &vs, opts(&ls)).unwrap(), 2e-2);
+}
+
+/// A decoder step: `t` queries per lane against a cache of three layers'
+/// heads shared by two windows, each lane reading its window's row, the
+/// step's own key appended; with and without key splits.
+#[test_case(1, 64, 20, 1500, Some(4); "one query, 1500 keys, four splits")]
+#[test_case(1, 128, 8, 300, None; "d 128 unsplit")]
+#[test_case(3, 64, 4, 200, Some(2); "three queries, two splits")]
+fn cached_attention_matches_the_graph(t: usize, d: usize, h: usize, tk: usize, splits: Option<usize>) {
+    if !device() {
+        return;
+    }
+    let (b, rows, layers) = (5, 2, 3);
+    let q = rand(&[b, t, h, d], 40, 1.0, DType::BFloat16);
+    let k = rand(&[rows, tk, layers * h, d], 41, 1.0, DType::BFloat16);
+    let v = rand(&[rows, tk, layers * h, d], 42, 1.0, DType::BFloat16);
+    let k_app = rand(&[b, 1, h, d], 43, 1.0, DType::BFloat16);
+    let v_app = rand(&[b, 1, h, d], 44, 1.0, DType::BFloat16);
+    let realized = |v: Vec<i32>| {
+        let t = Tensor::from_slice(&v);
+        t.realize().unwrap();
+        t
+    };
+    let lens = realized(vec![tk as i32, 1, 37, tk as i32 - 1, 100]);
+    let row_map = realized(vec![0, 1, 1, 0, 1]);
+    let cache = Cache { head_start: h, kv_heads: h, row_map: Some(&row_map), appended: Some((&k_app, &v_app)) };
+    let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, ..Attn::default() };
+    let o = tk::attention(&q, &k, &v, opts).unwrap();
+    assert_kernel(&o, "flash_attention");
+    if splits.is_some() {
+        assert_kernel(&o, "combine_splits");
+    }
+    assert_close("cached attention", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
 }
 
 // ---- heads ---------------------------------------------------------------------

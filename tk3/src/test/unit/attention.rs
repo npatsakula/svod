@@ -10,8 +10,10 @@ use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::kernels::Batch;
-use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention, key_mask_stride};
+use crate::kernels::attention::{AttnMask, AttnSpec, Cache, CombineSpec, FaCfg, attention, combine, key_mask_stride};
+use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch;
+use crate::launch::graph_launch_all;
 
 fn flash_attention(spec: &AttnSpec) -> Program {
     attention::<BF16>(spec)
@@ -28,6 +30,7 @@ const SEGMENT: usize = 40;
 struct Case {
     spec: AttnSpec,
     q: Vec<f64>,
+    /// `[rows, tk, heads_total, d]`, the batch's own rows without a cache.
     k: Vec<f64>,
     v: Vec<f64>,
     lens: Vec<i64>,
@@ -35,6 +38,11 @@ struct Case {
     key_mask: Vec<i64>,
     /// `[batch, t]`: segments of `SEGMENT` rows.
     seg_start: Vec<i64>,
+    /// `[batch]`: batch `b` reads cache row `rows - 1 - b`.
+    row_map: Vec<i64>,
+    /// `[batch, kv_heads, d]` appended keys and values.
+    k_app: Vec<f64>,
+    v_app: Vec<f64>,
 }
 
 fn case(spec: AttnSpec, lens: &[i64]) -> Case {
@@ -43,50 +51,65 @@ fn case(spec: AttnSpec, lens: &[i64]) -> Case {
         (0..elems).map(|_| round_to(ScalarDType::BFloat16, lcg(seed))).collect()
     };
     let batch = spec.batch.capacity();
+    let (rows, heads_total) = spec.cache.map_or((batch, spec.kv_heads), |c| (c.rows, c.heads_total));
     let (q, k, v) = (
         n(batch * spec.t * spec.heads * spec.d, &mut seed),
-        n(batch * spec.tk * spec.kv_heads * spec.d, &mut seed),
-        n(batch * spec.tk * spec.kv_heads * spec.d, &mut seed),
+        n(rows * spec.tk * heads_total * spec.d, &mut seed),
+        n(rows * spec.tk * heads_total * spec.d, &mut seed),
     );
     let stride = key_mask_stride(spec.tk);
     let key_mask = (0..batch * stride).map(|x| i64::from((x / stride + x % stride) % 5 != 2)).collect();
     let seg_start = (0..batch * spec.t).map(|x| (x % spec.t - x % spec.t % SEGMENT) as i64).collect();
-    Case { spec, q, k, v, lens: lens.to_vec(), key_mask, seg_start }
+    let row_map = (0..batch).map(|b| (rows - 1 - b) as i64).collect();
+    let (k_app, v_app) = (n(batch * spec.kv_heads * spec.d, &mut seed), n(batch * spec.kv_heads * spec.d, &mut seed));
+    Case { spec, q, k, v, lens: lens.to_vec(), key_mask, seg_start, row_map, k_app, v_app }
 }
 
-/// Direct attention in f64 with the same masks.
+/// Direct attention in f64 with the same masks and cache reads.
 fn reference(c: &Case) -> Vec<f64> {
     let s = &c.spec;
     let m = s.mask;
-    let (stride, kv_stride, group) = (s.heads * s.d, s.kv_heads * s.d, s.heads / s.kv_heads);
+    let cache =
+        s.cache.unwrap_or(Cache { rows: 0, heads_total: s.kv_heads, head_start: 0, row_map: false, appended: false });
+    let (stride, kv_stride, group) = (s.heads * s.d, cache.heads_total * s.d, s.heads / s.kv_heads);
     let mut out = vec![0.0; s.batch.capacity() * s.t * stride];
     for b in 0..s.batch.capacity() {
         let len = if m.key_lens { c.lens[b].max(1) as usize } else { s.tk };
+        let row = if cache.row_map { c.row_map[b] as usize } else { b };
+        let keys = s.tk + usize::from(cache.appended);
         for h in 0..s.heads {
+            let kv_head = cache.head_start + h / group;
+            let key = |j: usize, dd: usize, cached: &[f64], appended: &[f64]| {
+                if j < s.tk {
+                    cached[(row * s.tk + j) * kv_stride + kv_head * s.d + dd]
+                } else {
+                    appended[(b * s.kv_heads + h / group) * s.d + dd]
+                }
+            };
             for i in 0..s.t {
                 let qi = &c.q[(b * s.t + i) * stride + h * s.d..][..s.d];
                 let hidden = |j: usize| {
-                    j >= len
-                        || (m.causal && j > i)
-                        || m.window.is_some_and(|(l, r)| j + l < i || j > i + r)
-                        || (m.key_mask && c.key_mask[b * key_mask_stride(s.tk) + j] == 0)
-                        || (m.seg_start && (j as i64) < c.seg_start[b * s.t + i])
+                    j < s.tk
+                        && (j >= len
+                            || (m.causal && j > i)
+                            || m.window.is_some_and(|(l, r)| j + l < i || j > i + r)
+                            || (m.key_mask && c.key_mask[b * key_mask_stride(s.tk) + j] == 0)
+                            || (m.seg_start && (j as i64) < c.seg_start[b * s.t + i]))
                 };
-                let scores: Vec<f64> = (0..s.tk)
+                let scores: Vec<f64> = (0..keys)
                     .map(|j| {
                         if hidden(j) {
                             return f64::NEG_INFINITY;
                         }
-                        let kj = &c.k[(b * s.tk + j) * kv_stride + h / group * s.d..][..s.d];
-                        qi.iter().zip(kj).map(|(a, b)| a * b).sum::<f64>() * s.scale as f64
+                        qi.iter().enumerate().map(|(dd, a)| a * key(j, dd, &c.k, &c.k_app)).sum::<f64>()
+                            * s.scale as f64
                     })
                     .collect();
                 let mx = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let w: Vec<f64> = scores.iter().map(|x| (x - mx).exp()).collect();
                 let l: f64 = w.iter().sum();
                 for dd in 0..s.d {
-                    let acc: f64 =
-                        (0..s.tk).map(|j| w[j] * c.v[(b * s.tk + j) * kv_stride + h / group * s.d + dd]).sum();
+                    let acc: f64 = (0..keys).map(|j| w[j] * key(j, dd, &c.v, &c.v_app)).sum();
                     out[(b * s.t + i) * stride + h * s.d + dd] = acc / l;
                 }
             }
@@ -95,21 +118,54 @@ fn reference(c: &Case) -> Vec<f64> {
     out
 }
 
-/// The mask parameters in order, as i64 vectors.
-fn mask_params(c: &Case) -> Vec<Vec<i64>> {
-    let m = c.spec.mask;
-    [(m.key_lens, &c.lens), (m.key_mask, &c.key_mask), (m.seg_start, &c.seg_start)]
+/// The parameters after the outputs in order, as f64 vectors.
+fn extra_params(c: &Case) -> Vec<Vec<f64>> {
+    let ints = |v: &[i64]| v.iter().map(|&x| x as f64).collect::<Vec<f64>>();
+    c.spec
+        .extra_params()
         .into_iter()
-        .filter(|(on, _)| *on)
-        .map(|(_, v)| v.clone())
+        .map(|name| match name {
+            "key_lens" => ints(&c.lens),
+            "key_mask" => ints(&c.key_mask),
+            "seg_start" => ints(&c.seg_start),
+            "row_map" => ints(&c.row_map),
+            "k_app" => c.k_app.clone(),
+            "v_app" => c.v_app.clone(),
+            other => unreachable!("{other}"),
+        })
         .collect()
 }
 
+/// Every parameter in order; partial outputs when the config splits.
 fn params(c: &Case) -> Vec<Vec<f64>> {
     let s = &c.spec;
-    let mut p = vec![c.q.clone(), c.k.clone(), c.v.clone(), vec![0.0; s.batch.capacity() * s.t * s.heads * s.d]];
-    p.extend(mask_params(c).iter().map(|v| v.iter().map(|&x| x as f64).collect()));
+    let (cap, splits) = (s.batch.capacity(), s.cfg.splits);
+    let mut p = vec![c.q.clone(), c.k.clone(), c.v.clone()];
+    if splits == 1 {
+        p.push(vec![0.0; cap * s.t * s.heads * s.d]);
+    } else {
+        p.push(vec![0.0; splits * cap * s.t * s.heads * s.d]);
+        p.push(vec![0.0; splits * cap * s.t * s.heads]);
+        p.push(vec![0.0; splits * cap * s.t * s.heads]);
+    }
+    p.extend(extra_params(c));
     p
+}
+
+/// The output: `o`, or the partials merged by the combine program.
+fn output(c: &Case, got: Vec<Vec<f64>>, live: i64) -> Vec<f64> {
+    let s = &c.spec;
+    if s.cfg.splits == 1 {
+        return got[3].clone();
+    }
+    let merge = combine_spec(s);
+    let params =
+        vec![got[3].clone(), got[4].clone(), got[5].clone(), vec![0.0; s.batch.capacity() * s.t * s.heads * s.d]];
+    run(&combine::<BF16>(&merge), params, &[("b", live)]).unwrap().swap_remove(3)
+}
+
+fn combine_spec(s: &AttnSpec) -> CombineSpec {
+    CombineSpec { batch: s.batch.clone(), t: s.t, heads: s.heads, d: s.d, splits: s.cfg.splits, cfg: NormCfg { br: 4 } }
 }
 
 fn spec(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, causal: bool, key_lens: bool) -> AttnSpec {
@@ -126,8 +182,9 @@ fn masked(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, mask: AttnMask) 
         kv_heads: 2,
         d,
         mask,
+        cache: None,
         scale: 1.0 / (d as f32).sqrt(),
-        cfg: FaCfg { bq, bkv, stages: 2 },
+        cfg: FaCfg::new(bq, bkv, 2),
     }
 }
 
@@ -155,12 +212,40 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 fn program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     let c = case(spec.clone(), lens);
     let got = run(&flash_attention(&spec), params(&c), &[("b", 2)]).unwrap();
+    let got = output(&c, got, 2);
     let want = reference(&c);
     let mut worst = 0.0f64;
-    for (g, w) in got[3].iter().zip(&want) {
+    for (g, w) in got.iter().zip(&want) {
         worst = worst.max((g - w).abs());
     }
     assert!(worst < 2e-2, "max abs diff {worst}");
+}
+
+/// A decoder step: one query row against a cache of several layers' heads,
+/// rows mapped, the step's own key appended after the prefix.
+fn cached(
+    t: usize,
+    tk: usize,
+    [heads, kv_heads, d]: [usize; 3],
+    row_map: bool,
+    appended: bool,
+    splits: usize,
+) -> AttnSpec {
+    let mut spec = masked(t, tk, d, 64, 32, AttnMask { key_lens: true, ..AttnMask::default() });
+    spec.heads = heads;
+    spec.kv_heads = kv_heads;
+    spec.cache = Some(Cache { rows: 3, heads_total: 3 * kv_heads, head_start: kv_heads, row_map, appended });
+    spec.cfg.splits = splits;
+    spec
+}
+
+#[test_case(cached(1, 100, [4, 4, 64], false, false, 1), &[100, 37]; "cache slice")]
+#[test_case(cached(1, 100, [4, 2, 64], true, true, 1), &[100, 37]; "row map, appended, gqa")]
+#[test_case(cached(1, 200, [4, 4, 64], true, true, 4), &[200, 70]; "four splits")]
+#[test_case(cached(5, 96, [2, 2, 128], false, true, 2), &[64, 96]; "d 128, two splits, five queries")]
+#[test_case(cached(1, 64, [2, 2, 64], false, false, 4), &[64, 40]; "more splits than blocks for a row")]
+fn cached_program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
+    program_matches_a_direct_softmax(spec, lens);
 }
 
 /// The live batch bound: rows of a batch past it are never written.
@@ -179,13 +264,17 @@ fn only_the_live_batch_runs() {
 #[test_case(spec(256, 256, 64, 64, 64, true, false), &[256, 256]; "causal")]
 #[test_case(spec(128, 256, 64, 64, 64, false, true), &[200, 33]; "key lengths")]
 #[test_case(spec(128, 128, 128, 64, 32, true, true), &[128, 64]; "d 128, causal with lengths")]
-#[test_case(with(FaCfg { bq: 128, bkv: 64, stages: 3 }, spec(256, 192, 64, 0, 0, true, true)), &[192, 70]; "bq 128, three stages")]
-#[test_case(with(FaCfg { bq: 128, bkv: 32, stages: 2 }, spec(200, 130, 128, 0, 0, false, true)), &[130, 99]; "d 128, bq 128, ragged")]
+#[test_case(with(FaCfg::new(128, 64, 3), spec(256, 192, 64, 0, 0, true, true)), &[192, 70]; "bq 128, three stages")]
+#[test_case(with(FaCfg::new(128, 32, 2), spec(200, 130, 128, 0, 0, false, true)), &[130, 99]; "d 128, bq 128, ragged")]
 #[test_case(masked(128, 128, 64, 64, 32, WINDOW), &[128, 90]; "window with lengths")]
 #[test_case(masked(100, 100, 64, 64, 64, KEY_MASK), &[100, 100]; "key mask, ragged")]
 #[test_case(masked(128, 128, 64, 64, 32, SEGMENTS), &[128, 128]; "causal segments")]
 #[test_case(masked(128, 128, 128, 64, 32, EVERY), &[128, 100]; "every mask, d 128")]
-#[test_case(with(FaCfg { bq: 64, bkv: 64, stages: 3 }, masked(200, 200, 48, 0, 0, SEGMENTS)), &[200, 200]; "d 48, three stages")]
+#[test_case(with(FaCfg::new(64, 64, 3), masked(200, 200, 48, 0, 0, SEGMENTS)), &[200, 200]; "d 48, three stages")]
+#[test_case(cached(1, 100, [4, 2, 64], true, true, 1), &[100, 37]; "cache: row map, appended, gqa")]
+#[test_case(cached(1, 200, [4, 4, 64], true, true, 4), &[200, 70]; "cache: four splits")]
+#[test_case(cached(5, 96, [2, 2, 128], false, true, 2), &[64, 96]; "cache: d 128, two splits")]
+#[test_case(with(FaCfg { splits: 3, ..FaCfg::new(16, 64, 2) }, cached(1, 1500, [4, 4, 64], true, false, 1)), &[1500, 1200]; "cache: bq 16, three splits of 1500 keys")]
 fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
     let device = default_device();
     let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
@@ -194,26 +283,66 @@ fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
     };
     let batch = spec.batch.capacity();
     let c = case(spec.clone(), lens);
-    let want = run(&flash_attention(&spec), params(&c), &[("b", batch as i64)]).unwrap();
-    let lowering = spec.cfg.lowering(target);
+    let raw = run(&flash_attention(&spec), params(&c), &[("b", batch as i64)]).unwrap();
+    let want = output(&c, raw.clone(), batch as i64);
+    let lowering = spec.cfg.lowering(target.clone());
     let to_bf16 = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
     let (q, k, v) = (to_bf16(&c.q), to_bf16(&c.k), to_bf16(&c.v));
-    let o = Tensor::empty(&[batch * spec.t * spec.heads * spec.d], DType::BFloat16);
-    let masks: Vec<Tensor> =
-        mask_params(&c).iter().map(|v| Tensor::from_slice(v.iter().map(|&x| x as i32).collect::<Vec<_>>())).collect();
-    let mut tensors = vec![&q, &k, &v, &o];
-    tensors.extend(&masks);
-    let out = graph_launch(flash_attention(&spec), &lowering, &tensors).unwrap();
+    let elems = batch * spec.t * spec.heads * spec.d;
+    let outputs: Vec<Tensor> = if spec.cfg.splits == 1 {
+        vec![Tensor::empty(&[elems], DType::BFloat16)]
+    } else {
+        let per = spec.cfg.splits * batch * spec.t * spec.heads;
+        vec![
+            Tensor::empty(&[per * spec.d], DType::Float32),
+            Tensor::empty(&[per], DType::Float32),
+            Tensor::empty(&[per], DType::Float32),
+        ]
+    };
+    let extras: Vec<Tensor> = spec
+        .extra_params()
+        .into_iter()
+        .zip(extra_params(&c))
+        .map(|(name, v)| match name {
+            "k_app" | "v_app" => to_bf16(&v),
+            _ => Tensor::from_slice(v.iter().map(|&x| x as i32).collect::<Vec<_>>()),
+        })
+        .collect();
+    let mut tensors = vec![&q, &k, &v];
+    tensors.extend(&outputs);
+    tensors.extend(&extras);
+    let outs = graph_launch_all(flash_attention(&spec), &lowering, &tensors).unwrap();
+    // The partials themselves, before the merge.
+    for (i, name) in
+        ["o_part", "m_part", "l_part"].into_iter().enumerate().take(if spec.cfg.splits > 1 { 3 } else { 0 })
+    {
+        let part = &outs[3 + i];
+        let mut plan = part.prepare().unwrap();
+        plan.execute_with_vars(&[("b", batch as i64)]).unwrap();
+        let mut bytes = vec![0u8; raw[3 + i].len() * 4];
+        part.buffer().unwrap().copyout(&mut bytes).unwrap();
+        let got: Vec<f64> = bytes.chunks(4).map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap()))).collect();
+        let worst = got.iter().zip(&raw[3 + i]).map(|(g, w)| (g - w).abs() / w.abs().max(1.0)).fold(0.0, f64::max);
+        let at = got.iter().zip(&raw[3 + i]).position(|(g, w)| (g - w).abs() / w.abs().max(1.0) > 1e-2);
+        eprintln!("{name}: max rel diff {worst:.3e} vs interpreter, first over 1e-2 at {at:?} of {}", got.len());
+    }
+    let out = if spec.cfg.splits == 1 {
+        outs[3].clone()
+    } else {
+        let merge = combine_spec(&spec);
+        let o = Tensor::empty(&[elems], DType::BFloat16);
+        graph_launch(combine::<BF16>(&merge), &merge.cfg.lowering(target), &[&outs[3], &outs[4], &outs[5], &o]).unwrap()
+    };
     let mut plan = out.prepare().unwrap();
     plan.execute_with_vars(&[("b", batch as i64)]).unwrap();
-    let mut bytes = vec![0u8; batch * spec.t * spec.heads * spec.d * 2];
+    let mut bytes = vec![0u8; elems * 2];
     out.buffer().unwrap().copyout(&mut bytes).unwrap();
     let got: Vec<f32> =
         bytes.chunks(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect();
     let reference = reference(&c);
     let mut worst = 0.0f64;
     let (mut over, mut worst_at) = (0usize, 0usize);
-    for (i, (g, w)) in got.iter().zip(&want[3]).enumerate() {
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
         let d = (*g as f64 - w).abs();
         if d > worst {
             worst = d;
@@ -229,6 +358,52 @@ fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
         worst_at / stride % spec.t,
         worst_at % stride / spec.d,
         worst_at % spec.d
+    );
+    assert!(worst < 2e-2, "max abs diff {worst}");
+}
+
+/// The split merge alone: random partials through the kernel against the
+/// interpreter.
+#[test_case(1, 4, 64, 4, 2; "four rows, four splits")]
+#[test_case(5, 2, 128, 2, 2; "ten rows, d 128, two splits")]
+#[test_case(1, 4, 64, 3, 1; "three splits, one batch")]
+#[test_case(7, 3, 64, 2, 2; "twenty-one rows, partial block")]
+fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, batch: usize) {
+    let device = default_device();
+    let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
+        eprintln!("skipped: no CUDA device");
+        return;
+    };
+    let spec = CombineSpec { batch: Batch::Static(batch), t, heads, d, splits, cfg: NormCfg { br: 4 } };
+    let rows = splits * batch * t * heads;
+    let mut seed = 9;
+    let f32s = |n: usize, seed: &mut u64, f: &dyn Fn(f64) -> f64| -> Vec<f64> {
+        (0..n).map(|_| round_to(ScalarDType::Float32, f(lcg(seed)))).collect()
+    };
+    let o_part = f32s(rows * d, &mut seed, &|x| 10.0 * x);
+    let m_part = f32s(rows, &mut seed, &|x| 4.0 * x);
+    let l_part = f32s(rows, &mut seed, &|x| 1.5 + x);
+    let params = vec![o_part, m_part, l_part, vec![0.0; batch * t * heads * d]];
+    let want = run(&combine::<BF16>(&spec), params.clone(), &[]).unwrap().swap_remove(3);
+    let tensors: Vec<Tensor> = params
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let t = Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>());
+            if i == 3 { t.cast(DType::BFloat16) } else { t }
+        })
+        .collect();
+    let refs: Vec<&Tensor> = tensors.iter().collect();
+    let out = graph_launch(combine::<BF16>(&spec), &spec.cfg.lowering(target), &refs).unwrap();
+    let got: Vec<f64> = out.cast(DType::Float32).to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
+    let worst = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
+    let bad: Vec<usize> =
+        got.iter().zip(&want).enumerate().filter(|(_, (g, w))| (*g - *w).abs() > 2e-2).map(|(i, _)| i).collect();
+    eprintln!(
+        "max abs diff {worst:.3e}; {} bad of {}; first bad {:?}",
+        bad.len(),
+        got.len(),
+        bad.first().map(|&i| (i / d, i % d))
     );
     assert!(worst < 2e-2, "max abs diff {worst}");
 }
@@ -252,8 +427,9 @@ fn attention_throughput_probe() {
             kv_heads: heads,
             d,
             mask: AttnMask { causal, ..AttnMask::default() },
+            cache: None,
             scale: 1.0 / (d as f32).sqrt(),
-            cfg: FaCfg { bq, bkv, stages: 2 },
+            cfg: FaCfg::new(bq, bkv, 2),
         };
         let c = case(spec.clone(), &[]);
         let to_bf16 =

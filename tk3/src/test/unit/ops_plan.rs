@@ -11,7 +11,7 @@ use crate::kernels::attention::FaCfg;
 use crate::kernels::gemm::GemmCfg;
 use crate::kernels::rows::NormCfg;
 use crate::ops::shape::{self, Extent, Fallback, Plan, extent};
-use crate::ops::{self as tk, Attn, Error, KeyMask, Linear, Qkv};
+use crate::ops::{self as tk, Attn, Cache, Error, KeyMask, Linear, Qkv};
 
 const BF16: DType = DType::BFloat16;
 
@@ -156,9 +156,9 @@ fn f16_takes_the_kernels() {
 
 // ---- attention ---------------------------------------------------------------------
 
-#[test_case(64, Ok(FaCfg { bq: 64, bkv: 64, stages: 2 }); "d 64")]
-#[test_case(128, Ok(FaCfg { bq: 64, bkv: 32, stages: 2 }); "d 128 keeps the half-width key block")]
-#[test_case(48, Ok(FaCfg { bq: 64, bkv: 64, stages: 2 }); "d 48")]
+#[test_case(64, Ok(FaCfg::new(64, 64, 2)); "d 64")]
+#[test_case(128, Ok(FaCfg::new(64, 32, 2)); "d 128 keeps the half-width key block")]
+#[test_case(48, Ok(FaCfg::new(64, 64, 2)); "d 48")]
 #[test_case(32, Err(Fallback::Shape); "d 32")]
 #[test_case(256, Err(Fallback::Shape); "d 256")]
 fn attention_plans(d: usize, want: Result<FaCfg, Fallback>) {
@@ -285,6 +285,31 @@ fn semantic_mismatches_are_errors() {
     let seg = t(&[2, 12], DType::Int32);
     let opts = Attn { seg_start: Some(&seg), ..Attn::default() };
     assert!(matches!(err(tk::attention(&q, &kv2, &kv2, opts)), Error::Shape { operand: "seg start", .. }));
+    let cache = t(&[3, 12, 6, 64], BF16);
+    let plain = Cache { head_start: 0, kv_heads: 2, row_map: None, appended: None };
+    let opts = Attn { cache: Some(plain), ..Attn::default() };
+    assert!(
+        matches!(err(tk::attention(&q, &cache, &cache, opts)), Error::Shape { operand: "k", .. }),
+        "rows need a map"
+    );
+    let map = t(&[2], DType::Int32);
+    let opts = Attn { cache: Some(Cache { head_start: 5, row_map: Some(&map), ..plain }), ..Attn::default() };
+    assert!(
+        matches!(err(tk::attention(&q, &cache, &cache, opts)), Error::Shape { operand: "k", .. }),
+        "heads past the row"
+    );
+    let app = t(&[2, 1, 2, 64], BF16);
+    let opts =
+        Attn { cache: Some(Cache { row_map: Some(&map), appended: Some((&app, &app)), ..plain }), ..Attn::default() };
+    assert!(
+        matches!(err(tk::attention(&q, &cache, &cache, opts)), Error::Shape { operand: "key lens", .. }),
+        "appended needs lens"
+    );
+    let lens = t(&[2], DType::Int32);
+    let wide = t(&[2, 1, 3, 64], BF16);
+    let with_lens = Attn { keys: KeyMask::Lens(&lens), ..Attn::default() };
+    let opts = Attn { cache: Some(Cache { row_map: Some(&map), appended: Some((&app, &wide)), ..plain }), ..with_lens };
+    assert!(matches!(err(tk::attention(&q, &cache, &cache, opts)), Error::Shape { operand: "appended v", .. }));
 
     let qkv = t(&[2, 10, 8 * 64], BF16);
     let split = Qkv { heads: 4, kv_heads: 2, head_dim: 64, q_norm: None, k_norm: None, eps: 1e-6, rope: None };

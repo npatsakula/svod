@@ -80,7 +80,7 @@ pub fn gemm_candidates(target: &Target, batches: usize, m: usize, n: usize, k: u
 /// per block leaves one block per SM. `d = 48` keeps the shapes whose K/V
 /// fills divide among the block's threads (96-byte rows, 16-byte chunks).
 pub fn attention_candidates(target: &Target, d: usize) -> Vec<FaCfg> {
-    let fa = |bq, bkv, stages| FaCfg { bq, bkv, stages };
+    let fa = FaCfg::new;
     let list = match d {
         48 => vec![fa(64, 64, 2), fa(64, 64, 3)],
         64 => vec![fa(64, 64, 2), fa(64, 64, 3), fa(128, 64, 2), fa(64, 32, 2), fa(128, 32, 2), fa(64, 32, 3)],
