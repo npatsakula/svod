@@ -10,6 +10,7 @@ pub mod build;
 pub mod interp;
 pub mod ir;
 pub mod layout;
+pub mod layouts;
 pub mod schedule;
 
 #[cfg(test)]
