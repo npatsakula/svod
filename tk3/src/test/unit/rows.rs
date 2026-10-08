@@ -261,16 +261,18 @@ proptest! {
 
 /// LayerNorm and RMSNorm on the device match the interpreter and the f64
 /// reference, with and without the fused residual, on a partial last block.
-#[test_case(Norm::Layer, 512, false; "layer 512")]
-#[test_case(Norm::Layer, 1024, true; "layer 1024 residual")]
-#[test_case(Norm::Rms, 512, true; "rms 512 residual")]
-#[test_case(Norm::Rms, 1024, false; "rms 1024")]
-fn norms_match_on_device(norm: Norm, d: usize, residual: bool) {
+#[test_case(Norm::Layer, 512, false, 4; "layer 512")]
+#[test_case(Norm::Layer, 1024, true, 4; "layer 1024 residual")]
+#[test_case(Norm::Rms, 512, true, 4; "rms 512 residual")]
+#[test_case(Norm::Rms, 1024, false, 4; "rms 1024")]
+#[test_case(Norm::Layer, 512, true, 8; "layer 512 residual, 8 rows a block")]
+#[test_case(Norm::Rms, 2048, false, 16; "rms 2048, 16 rows a block")]
+fn norms_match_on_device(norm: Norm, d: usize, residual: bool, br: usize) {
     let Some(target) = cuda_target() else {
         eprintln!("skipped: no CUDA device");
         return;
     };
-    let (rows, br, eps) = (37, 4, 1e-5);
+    let (rows, eps) = (37, 1e-5);
     let prog = norm_rows(norm, rows, d, br, eps, residual);
     let params = norm_inputs(norm, rows, d, residual, 5);
     let (want, want_sum) = norm_reference(norm, rows, d, eps, residual, &params);

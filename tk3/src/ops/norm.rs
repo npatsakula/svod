@@ -5,7 +5,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
-use super::{GraphSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, typed};
+use super::{GraphSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed};
 use crate::kernels::rows::{Norm, NormSpec, norm as kernel};
 use crate::launch;
 
@@ -67,20 +67,25 @@ fn norm(
     let (ext, var) = extent(&xs).unzip();
     let target = super::target(&x.device());
     let dtypes: Vec<_> = [Some(x), residual, Some(w), b].into_iter().flatten().map(Tensor::dtype).collect();
-    let Plan::Kernel(cfg) = shape::norm(target.as_ref(), &dtypes, ext.as_ref()) else {
+    let Plan::Kernel(cfgs) = shape::norm(target.as_ref(), &dtypes, ext.as_ref()) else {
         return graph(kind, x, residual, w, b, eps).context(GraphSnafu { op });
     };
-    let (ext, var) = (ext.expect("planned"), var.flatten());
+    let (ext, var, target) = (ext.expect("planned"), var.flatten(), target.expect("planned"));
     let (lead, d) = (&ext.dims[..ext.dims.len() - 1], ext.dims[ext.dims.len() - 1]);
     let rows = lead[usize::from(var.is_some())..].iter().product();
-    let spec = NormSpec { norm: kind, rows, d, batch: batch_of(&var, 1), eps, residual: residual.is_some(), cfg };
+    let batch = batch_of(&var, 1);
+    let spec = |cfg| NormSpec { norm: kind, rows, d, batch: batch.clone(), eps, residual: residual.is_some(), cfg };
+    let shape = [batch.capacity(), rows, d];
+    let cfg = tuned(op, &target, x.dtype(), &shape, (&batch, kind, residual.is_some()), &cfgs, |cfg| {
+        (typed!(x.dtype(), kernel, &spec(cfg)), cfg.lowering(target.clone()))
+    });
+    let spec = spec(cfg);
     let out = output(&ext.dims, &var, x.dtype());
     let sum = residual.map(|_| output(&ext.dims, &var, x.dtype()));
     let ins: Vec<&Tensor> = [Some(x), residual, Some(w), b, Some(&out), sum.as_ref()].into_iter().flatten().collect();
     let at = ins.len() - 1 - usize::from(sum.is_some());
-    let mut outs =
-        launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &cfg.lowering(target.expect("planned")), &ins)
-            .context(LaunchSnafu { op })?;
+    let mut outs = launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &cfg.lowering(target), &ins)
+        .context(LaunchSnafu { op })?;
     let sum = sum.map(|_| outs.pop().expect("the sum"));
     Ok((sum, outs.swap_remove(at)))
 }
