@@ -4,165 +4,106 @@ sidebar_label: 内核库
 
 # 内核库
 
-USE 面孔：`svod-tk` 提供的每个内核都能直接用普通张量调用，无需了解任何分块知识。每个内核都返回一个惰性 `Tensor`（一个 `Op::Call` 节点），它能组合进模型图，并通过常规的 `prepare()` 路径实现；每个内核也都遵循 [向 IR 中编写](./lowering) 中的三向契约：
+`svod_tk3::kernels` 中的每个内核都是一个函数 `fn k<T: Elem>(spec: &Spec) -> Program`，对 16 位元素类型（`BF16` 或 `F16`）泛型。每个 spec 都有一个 `batch: Batch`：`Batch::Static(n)` 启动 `n` 个批次，`Batch::Var { name, min, max }` 按名称绑定的运行时变量的实际值启动批次，缓冲区按 `max` 分配。每种配置类型都有一个 `lowering(target)`。模型通过[算子层](./op-layer)使用这些内核，由算子层选择配置。
 
-| 结果 | 含义 |
+| 内核 | Spec → 程序 | 内核名称 | 算子 |
+|---|---|---|---|
+| GEMM + 尾处理 | `GemmSpec` → `gemm::gemm` | `gemm` | `ops::linear` |
+| Flash attention 前向 | `AttnSpec` → `attention::attention` | `flash_attention` | `ops::attention` |
+| 拆分合并 | `CombineSpec` → `attention::combine` | `combine_splits` | 带 `splits` 的 `ops::attention` |
+| 注意力前处理 | `HeadsSpec` → `heads::heads` | `heads` | `ops::heads` |
+| LayerNorm / RMSNorm | `NormSpec` → `rows::norm` | `layer_norm` / `rms_norm` | `ops::{layer_norm, rms_norm, add_*}` |
+
+## GEMM {#gemm}
+
+`c = act(a·bᵀ + bias) + residual`，其中 `a [batch·m, k]`、`b [n, k]`。矩阵乘之后的所有计算都在 f32 累加器上进行，结果在存储时只舍入一次。
+
+| `Epilogue` 字段 | 作用 |
 |---|---|
-| `Ok(Some(out))` | 内核已运行 |
-| `Ok(None)` | 内核不适用：设备不在该内核的 `ArchSet` 中、缺少其 LLVM 后端，或形状无法分块——调用方应有意识地回退 |
-| `Err(LaunchError)` | 请求本身有误（dtype、秩、符号维度、整除规则）——属于调用方的 bug |
+| `bias` | 加到累加器上的 `[n]` 行（门控时为 `[2n]`） |
+| `act` | `Act::None`、`Act::Gelu`（erf 近似，误差至多 1.5e-7）、`Act::Silu` |
+| `gated` | `b` 为 `[2n, k]`，门控行在上、up 行在下；输出 `act(gate)·up`（SwiGLU、GeGLU） |
+| `residual` | 最后加上的 `[batch·m, n]` |
 
-除非另有说明，操作数为 bf16 或 f16，累加为 f32。
+`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll }`。超出 `m` 的行和超出 `n` 的列是带边界的视图，因此 `m` 和 `n` 不受限制。`k` 必须是 `bk` 的倍数。
 
----
+算子层从四个 tile 家族中抽取候选，每个家族都带有在 sm_86 上测得的最佳流水线：
 
-## 目标架构 {#targets}
+| 家族 | 级数 | Warp 网格 | 展开 | 测量说明 |
+|---|---|---|---|---|
+| 128×128×32 | 3 | 2×4 | 否 | 4096³ 在此达到峰值：25.4 TFLOP/s |
+| 128×64×32 | 2 | 2×2 | 是 | |
+| 64×128×32 | 2 | 2×2 | 否 | |
+| 64×64×32 | 3 | 2×2 | 是 | M = 704 (Nemotron)：128 行 tile 不敌 64×64 |
 
-每个内核都声明自己的 `ArchSet`（`tk/src/target.rs`）：一份显式的 AMD 列表，加上一个开放式的 CUDA 计算能力下限和一个 Apple GPU 家族下限。
+`config::gemm_candidates` 以最大的、其网格能让每个 SM 获得 8 个块且填充不超过输出面积 1/16 的家族为首（否则用 64×64）。它加入该家族的变体（另一种级数、`bk = 64`、翻转的 `unroll`、转置的 warp 网格），然后是其他家族。当 `k` 不是 `bk` 的倍数时，`bk` 减半直至 16；环形缓冲超过目标共享内存的配置被丢弃。最多保留八个候选，由[调优存储](./tuning)从中选择。
 
-| 内核 | gfx942 (CDNA3) | gfx1151 (RDNA3.5) | gfx1200 / gfx1201 (RDNA4) | CUDA sm_80+ | Metal Apple7+ |
-|---|---|---|---|---|---|
-| `flash_attention` / `_with` / `_tuned` | 是 | 是 | 是 | 是 | 是 |
-| `matmul`（方阵） | 是 | 是 | 是 | 是 | 是 |
-| `gemm_nt` / `_with` / `_with_epilogue` | — | 是 | 是 | 是 | — |
-| `rms_norm` / `add_rms_norm` | — | 是 | 是 | 是 | — |
-| `single_query_attention` / `_packed` | 是 | 是 | 是 | 是 | — |
-| `knn` | 是 | 是 | 是 | — | — |
-| `kmeans_assign` | 是 | 是 | 是 | — | — |
+## Flash attention {#flash-attention}
 
-对应的常量是 `tk/src/kernels/` 中的 `FA_SUPPORTED_ARCHS`、`MATMUL_SUPPORTED_ARCHS`、`GEMM_NT_SUPPORTED_ARCHS`、`NORM_SUPPORTED_ARCHS`、`SQ_ATTENTION_SUPPORTED_ARCHS`、`KNN_SUPPORTED_ARCHS` 和 `KMEANS_SUPPORTED_ARCHS`。一个架构家族要加入某个内核，靠的是验证，以及测出它自己的分块表——`gemm_nt` 和各个 norm 只支持 wave32，是因为还没人为它们测过 wave64 的分块表，而不是因为函数体在那里跑不了。`flash_attention_supported(&device)` 只回答架构门控这一问，供那些需要在启动前填充或分桶序列长度的调用方使用。
+在序列优先的 `q [batch, t, heads, d]` 与 `k`、`v [batch, tk, kv_heads, d]` 上计算 `o = softmax(q·kᵀ·scale)·v`。Q 驻留在寄存器中，K/V 通过共享内存环形缓冲流入。在线 softmax 状态 `(m, l, o)` 以 f32 携带，使用 `exp2`。
 
----
+| 特性 | 实现方式 |
+|---|---|
+| GQA | 查询头 `h` 读取 KV 头 `h / (heads / kv_heads)` |
+| 交叉注意力 | `tk ≠ t` 是视图的属性 |
+| 任意 `t`、`tk` | 用边界代替填充：查询 tile 和最后一个键块是带边界的视图，超出 `tk` 的键被掩码 |
+| Head 维度 | 48, 64, 128 |
+| `AttnMask::causal` | 越过对角线的键块通过迭代次数跳过 |
+| `AttnMask::window` | 每个查询周围的 `(left, right)`；窗口外的块被跳过 |
+| `AttnMask::key_lens` | `[batch]` i32 有效键数；超出长度的块被跳过 |
+| `AttnMask::key_mask` | `[batch, tk]` i32 可见键（行步长向上取整到 8），每个块都读取 |
+| `AttnMask::seg_start` | `[batch, t]` i32 打包行的段起点，沿 `t` 非递减 |
 
-## Flash attention
+掩码按 tile 类别处理。只有被因果、窗口、长度或段边缘穿过的键块才计算谓词（基于块起点的 `select_if`）；完全在内部的块不加掩码运行。bool 键掩码在每个块中应用。看不到任何键的查询得到 NaN，与空行上的 softmax 一致。
 
-```rust
-pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> LaunchResult<Option<Tensor>>
-pub fn flash_attention_with(q, k, v, opts: FaOpts) -> LaunchResult<Option<Tensor>>
-pub fn flash_attention_tuned(q, k, v, opts, policy: impl Fn(&DeviceSpec, GpuArch) -> FaPolicy + Copy) -> ..
+**缓存模式**（`AttnSpec::cache = Some(Cache { .. })`）从保存多层头的缓存 `[rows, tk, heads_total, d]` 中读取 K 和 V：
 
-pub struct FaOpts<'a> {
-    pub causal: bool,                      // default true
-    pub key_lens: Option<&'a Tensor>,      // [B] i32 valid-key counts: keys >= key_lens[b] are masked
-    pub seg_start: Option<&'a Tensor>,     // [B, N] i32: query q of batch b sees no key before seg_start[b, q]
-}
-```
+| `Cache` 字段 | 作用 |
+|---|---|
+| `head_start` | 本注意力的 `kv_heads` 个头在缓存行中的第一个 |
+| `row_map` | 一个 `[batch]` i32 参数：每个批次通道读取的缓存行 |
+| `appended` | 在缓存前缀之后计分的 `[batch, kv_heads, d]` 键和值（解码器步骤刚投影出的 token） |
 
-`q` 为 `[B, N, H, D]`，`k`/`v` 为 `[B, N, H_kv, D]`（GQA：`H % H_kv == 0`），输出为操作数 dtype 的 `[B, N, H, D]`。布局是序列优先而非头优先——模型可以把投影结果直接 reshape 进来，无需转置。
+**键拆分**（`FaCfg::splits > 1`）为少数长行（例如解码器步骤）提供更多块。每个拆分写出 f32 部分结果 `o_part`、`m_part` 和 `l_part`，由 `combine` 合并。
 
-- `Ok(None)`：不在架构集合内；`N` 不是 `q_blk · 8` 的倍数（每个 warp 的 Q 分块乘以一个工作组的八个 wave；`FLASH_ATTENTION_SEQUENCE_MULTIPLE` 是基线的 `128`）；KV 长度与 `N` 不同（交叉注意力尚未实现）；某个头维度使双缓冲的 K/V 分块超出设备的共享内存。
-- `Err`：dtype 不在 `{bf16, f16}` 之内，或 `q` 与 `k`/`v` 的 dtype 不一致；`D % 16 != 0`；`H % H_kv != 0`；`k`/`v` 的形状不是 `[B, N, H_kv, D]`。
+`FaCfg { bq, bkv, stages, splits }` 每 16 个查询行使用一个 warp。按 head 维度列出的候选，第一个是未调优时的选择：
 
-`key_lens` 只屏蔽键——填充出来的查询行照样会被计算，由调用方丢弃。`key_lens[b] == 0` 会被钳制为 `1`，以保证该行保持有限值。`seg_start` 把多条序列打包进同一行：每个条目必须落在 `0..=q` 内，并至少留下一个可见的键。[Flash Attention](./flash-attention) 是完整的演练示例；每个 warp 的分块在首次使用时测量得出（[自动调优](./tuning)）。
+| `d` | 候选 `(bq, bkv, stages)` | 测量说明 (sm_86) |
+|---|---|---|
+| 48、64、128 且 `t ≤ 16` | (16, 64, 2), (16, 64, 3), (16, 32, 2) | 解码器步骤受带宽限制：单 warp 块让每个 SM 能容纳多个块 |
+| 48 | (64, 64, 2), (64, 64, 3) | K/V 填充能在块内线程间整除的形状（96 字节行） |
+| 64 | (64, 64, 2), (64, 64, 3), (128, 64, 2), (64, 32, 2), (128, 32, 2), (64, 32, 3) | |
+| 128 | (64, 32, 2), (64, 32, 3), (128, 32, 2), (64, 64, 2), (128, 64, 2), (128, 32, 3) | `bkv = 64` 测得 18.2 TFLOP/s，`bkv = 32` 为 22.2：每块 64 KB 使每个 SM 只剩一个块 |
 
----
+每个 tile 配置都与拆分数交叉组合。`Attn::splits = Some(n)` 固定为 `n`，上限为键块数。为 `None` 时，`config::split_candidates` 提出 1、2、使每个 SM 保持两个块的附近数值，以及每个键块一个拆分。它只保留不超过键块数与该 SM 目标两倍中较小者的数值。不拆分的配置排在最前，拆分候选与其合并内核一起计时。
 
-## GEMM
+注意力吞吐量探针（B 4、H 8、T 2048、bf16）测得的 TFLOP/s，与 tk1 对比：
 
-```rust
-pub fn matmul(a: &Tensor, b: &Tensor) -> LaunchResult<Option<Tensor>>              // [n, n] · [n, n] → f32
-pub fn gemm_nt(x: &Tensor, w: &Tensor) -> LaunchResult<Option<Tensor>>             // [lead..., K] · [N, K]ᵀ → [lead..., N]
-pub fn gemm_nt_with(x, w, cfg: impl Fn(usize, usize, usize) -> Option<GemmCfg> + Copy) -> ..
-pub fn gemm_nt_with_epilogue(x, w, epilogue: Epilogue<&Tensor>) -> LaunchResult<Option<Tensor>>
+| 情形 | tk3 | tk1 |
+|---|---|---|
+| d 64 | 24.1 | 23.0 |
+| d 64 因果 | 22.6 | 20.7 |
+| d 128 | 22.3 | 22.3 |
+| d 128 因果 | 20.9 | 16.5 |
 
-pub enum Epilogue<T> {
-    Plain,               // y = x·wᵀ
-    Add(T),              // y = x·wᵀ + residual, residual [lead..., N] in the operand dtype
-    SwiGlu { pair: usize }, // y = silu(gate)·up off a fused [2I, K] gate/up weight; y is [lead..., N/2]
-}
-pub fn swiglu_pair_width(spec: &DeviceSpec) -> Option<usize>
-```
+解码探针以 µs 计时一个 Whisper large-v3 解码器步骤的注意力。内核按该模型的形状运行，但 Whisper 模型尚未调用它们：
 
-`matmul` 是方阵参考内核：输入可以是任意浮点 dtype（转换为 bf16），输出 f32，支持所有架构。它是 DSL 的性能哨兵，而不是生产用的 GEMM。
+| 情形 | tk3 | tk1 |
+|---|---|---|
+| 自注意力，200 个缓存键 + 追加的一个 | 21.5 | 89.1 |
+| 交叉注意力，1500 个共享键 | 66.3 | 78.8（不拆分为 636） |
 
-`gemm_nt` 才是生产用的线性层。`x` 为任意秩 ≥ 2 的 `[lead..., K]`（`[B, L, K]` 激活无需 reshape 或拷贝即可绑定），`w` 按权重的存储方式为 `[N, K]`，`y` 为操作数 dtype 的 `[lead..., N]`——f32 累加器在寄存器中完成窄化，因此不会经由内存往返一次 f32。`M = ∏lead` 和 `N` 必须是 64 的倍数，`K` 必须是 32 宽条带的倍数且至少有两条；否则返回 `Ok(None)`，由调用方填充到 128 或改用 `Tensor::linear`。
+## 注意力前处理 {#attention-prologue}
 
-尾声（epilogue）正是这个内核存在的理由：它们把图在 GEMM 之后本要付出的那一遍计算折叠进 GEMM 的存储中。`Add` 在存储自身的偏移处读取残差，并以输出 dtype 相加，舍入方式与图中的 `try_add` 完全相同。`SwiGlu` 要求融合权重的行按 `pair` 行一组、gate/up 交替排列——`swiglu_pair_width(&device)` 等于设备分块表中的 `reg_n / 2`，若各分块不一致则为 `None`（调用方保留一个独立的 SwiGLU 过程）。模型在加载时一次性按该顺序排好权重，因为 `M` 在启动时才选定分块，每个候选分块都必须读取同一种排列。
+`heads` 把融合投影 `qkv [batch, t, (heads + 2·kv_heads)·d]` 拆分为序列优先的 `q [batch, t, heads, d]` 以及 `k`、`v [batch, t, kv_heads, d]`。可选地，它用 `[d]` 权重在每个头上对 `q` 和 `k` 做 RMS 归一化，然后对它们施加旋转位置编码。旋转把头的两半配对，使用 `[t, d/2]` 的 `(cos, sin)` 表，可共享或按批次提供（`Rope { per_batch }`）。一个块处理一个头槽的 `br` 行。`d` 必须是 16..=256 范围内的 2 的幂，候选为 `br ∈ {4, 8, 16}`。
 
-分块来自 `GemmPolicy`（`tk/src/kernels/gemm.rs`）：一张按架构家族划分的表——`CUDA_TILES`、`RDNA_TILES`、`RDNA4_TILES`——对每个形状和尾声在首次使用时测量（[自动调优](./tuning)），关闭调优时则采用静态的 `GemmPolicy::cfg` 选择。`gemm_nt_with` 由调用方提供选择器（基准测试就是这样扫描的）。
+## 归一化 {#norms}
 
----
+`rows::norm` 每行使用一个 warp，在 f32 中执行融合的先归约后映射：
 
-## RMS norm
+| `Norm` | 公式 |
+|---|---|
+| `Layer` | `(x − mean)·rsqrt(var + eps)·w + b` |
+| `Rms` | `x·rsqrt(mean(x²) + eps)·w` |
 
-```rust
-pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> LaunchResult<Option<Tensor>>
-pub fn add_rms_norm(x, residual: &Tensor, weight, eps) -> LaunchResult<Option<(Tensor, Tensor)>>   // (h, y)
-pub fn select_norm_cfg(rows: usize, d: usize, lanes: usize) -> Option<NormCfg>
-```
-
-`x` 为 `[rows..., D]`，`weight` 为 `[D]`，二者同为一种 16 位 dtype。每行一个 wave，整行驻留在寄存器中，平方和由蝶形 shuffle 完成——没有 LDS，没有屏障，也没有 `RANGE`。数值逐操作地与图保持一致：`y = dtype((f32(x) · rsqrt(Σx²/D + eps)) · f32(w))`，只在最后舍入一次；唯一不同的是求和顺序。当 `D` 不是 wave 宽度的倍数，或每个 lane 超过 64 个元素（wave32 下为 `2048`）时，返回 `Ok(None)`。
-
-`add_rms_norm` 返回 `(h, y)`，其中 `h = x + residual` 的舍入方式与图中的加法相同，`y = rms_norm(h)`，这样一个 pre-norm 解码器层只需写、读一次残差流。若前面的投影已通过 `Epilogue::Add` 接收了残差，则两遍的 `rms_norm` 就够了；`model/src/qwen3/decoder_layer.rs` 按层在两者之间选择。
-
----
-
-## 单查询注意力
-
-```rust
-pub fn single_query_attention(q, k, v, opts: SqAttentionOpts<'_>) -> LaunchResult<Option<Tensor>>
-pub fn single_query_attention_packed(q, k, v, head_offset: usize, opts) -> LaunchResult<Option<Tensor>>
-
-pub struct SqAttentionOpts<'a> {
-    pub key_lens: Option<&'a Tensor>,                 // [B] i32, entries in 0..=N
-    pub include_last: bool,                           // also score key N-1 (Whisper's self-cache slot)
-    pub appended: Option<(&'a Tensor, &'a Tensor)>,   // the step's own [B, 1, H, D] K/V, scored after the prefix
-    pub split: Option<usize>,                         // K/V chunks; None = the device's SqPolicy, tuned on first use
-    pub cache_map: Option<&'a Tensor>,                // [B] i32: which K/V row each query row reads
-}
-```
-
-这是解码步内核：`q` 为 f32 的 `[B, 1, H, D]`，`k`/`v` 为 f32、f16 或 bf16 的 `[B, N, H_total, D]`（或 `[1, N, H_total, D]`，用一份缓存服务所有行），输出为 f32 的 `[B, 1, H, D]`。
-一个 wave 负责一个 `(batch, head)`；`Q` 留在寄存器中，K/V 沿 `N` 流过；点积是 XOR-shuffle 全归约，softmax 是一遍式在线更新。没有 LDS，也不用矩阵核心，所以它的 `ArchSet` 是最宽的 AMD 列表外加 CUDA。
-
-`_packed` 从打包缓存中选取 `head_offset..head_offset + H` 这些头，而无需对缓存切片。较长的无掩码注意力会把 K/V 切成连续的块，每块一个 wave，再在第二遍中合并它们的 softmax 状态；`SqPolicy` 根据设备的驻留 wave 预算确定切分数，并在首次使用时测量最接近的几个约数。
-
----
-
-## k-NN 与 k-means
-
-```rust
-pub fn knn(x: &Tensor, c: &Tensor, k: usize) -> LaunchResult<Option<(Tensor, Tensor)>>           // (dists [N, k] f32, idxs [N, k] i32)
-pub fn kmeans_assign(x: &Tensor, c: &Tensor) -> LaunchResult<Option<(Tensor, Tensor)>>         // (cluster_ids [N] i32, best_dist [N] f32)
-pub fn kmeans_update(x, cluster_ids, old_centroids) -> LaunchResult<(Tensor, Tensor)>           // (new_centroids [K, D], shift [K])
-```
-
-二者都让语料（质心）流经矩阵核心，并基于不含 x² 的分数 `‖c‖² − 2⟨x, c⟩` 维护一个运行中的 top-K（argmin），因此从不构造 `[N, M]` 距离矩阵；主机端负责转换为 bf16、把 `D`（以及 `N`）填充到 WMMA 边长，并加回 `‖x‖²` 以得到精确的 f32 距离。`knn` 的 `k` 取值范围为 `1..=16`。`kmeans_update` 是纯图操作——按簇的 `scatter_reduce`、空簇修补、按簇位移——因为排序/散射模式无法分块；Lloyd 循环由调用方负责。仅支持 AMD。
-
----
-
-## 在模型中使用内核
-
-策略——用哪个内核、怎么回退——属于模型，永远不属于内核。`model/src/qwen3/` 中的 Qwen3 解码器是参考集成：
-
-```rust
-// model/src/qwen3/linear.rs
-pub(crate) fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
-    if fusable(x, w)
-        && let Some(y) = svod_tk::gemm_nt(x, w).context(TkSnafu)?
-    {
-        return Ok(y);
-    }
-    Ok(x.contiguous().linear().weight(w).call()?)
-}
-```
-
-```rust
-// model/src/qwen3/attention.rs
-if matches!(q.dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16)
-    && let Some(out) =
-        svod_tk::flash_attention_with(q, k, v, svod_tk::FaOpts { causal: true, key_lens: None, seg_start })
-            .context(TkSnafu)?
-{
-    return Ok(out);
-}
-// else: permute to head-major and run scaled_dot_product_attention
-```
-
-值得照搬的三个习惯：
-
-- **先用 `fusable` 做门控。** `Err` 表示请求有误，在调用方一侧做一次 16 位检查，就能避免把合法的 f32 路径报成 bug。
-- **桥接错误。** `LaunchError` 被装箱进模型的错误枚举（`#[snafu(source(from(svod_tk::LaunchError, Box::new)))]`），因此构建失败会成为一个附带内核上下文的模型错误。
-- **在上游按内核的要求整形。** `embed.rs` 把填充后的序列长度分桶到 `FLASH_ATTENTION_SEQUENCE_MULTIPLE`，`feed_forward.rs` 在加载时按 `swiglu_pair_width` 交错 gate/up 权重，于是内核得以生效而不是拒绝。
-
-了解某个模型内存布局的融合应当放在模型旁边：`model/src/qwen3/tk/mod.rs` 是一个 QKV-norm-RoPE 前奏，用 norm 内核的行词汇编写，由 `NORM_SUPPORTED_ARCHS` 门控，并通过 `graph_launch_multi` 以三个输出启动。同样的 `launch_custom` 策略也适用于它——除了所在位置之外，它在各方面都是一个 tk 内核。
+当 `residual: true` 时，它对舍入到元素类型的 `x + residual` 做归一化，并同时写出该和，即 transformer 层的 pre-norm 残差流。`d` 必须是 256..=2048 范围内的 2 的幂，候选为每块 `br ∈ {4, 8, 16}` 行。在 sm_86 上测得达到内存带宽的 92%。

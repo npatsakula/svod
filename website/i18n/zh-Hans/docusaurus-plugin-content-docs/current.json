@@ -23,9 +23,9 @@
     "message": "优化",
     "description": "The label for category 'Optimizations' in sidebar 'defaultSidebar'"
   },
-  "sidebar.defaultSidebar.category.Tile Kernels (tk)": {
-    "message": "Tile 内核 (tk)",
-    "description": "The label for category 'Tile Kernels (tk)' in sidebar 'defaultSidebar'"
+  "sidebar.defaultSidebar.category.Tile Kernels (tk3)": {
+    "message": "Tile 内核 (tk3)",
+    "description": "The label for category 'Tile Kernels (tk3)' in sidebar 'defaultSidebar'"
   },
   "sidebar.defaultSidebar.category.Backends": {
     "message": "后端",

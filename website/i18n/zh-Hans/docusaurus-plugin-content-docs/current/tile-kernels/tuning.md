@@ -1,83 +1,66 @@
 ---
-sidebar_label: 自动调优
+sidebar_label: 调优
 ---
 
-# 首次使用时自动调优
+# 调优
 
-内核的分块表是一个搜索空间，而不是答案。GEMM 每个架构家族带三到五个分块，flash attention 带四种每 warp 分块，单查询注意力带若干种 K/V 切分——哪一个胜出取决于形状、设备的计算单元数及其时钟。因此，设备第一次遇到某个形状时，`svod-tk` 会编译并计时每个适配的候选，保留最快的那个，并把它记在磁盘上。整套机制就是 `tk/src/tune.rs`。
+每个算子在 `ops::config` 中为每种形状提供一个候选列表（表格见[内核库](./kernel-library)）。第一个候选是未调优时运行的配置。调优存储在设备第一次遇到某个形状时测量整个列表，并保留胜者。
 
----
+更好的固定默认值并不够用。Nemotron 的 GEMM（M = 704，N 512–2048）在旧的固定 tile 梯度下只有约 14 TFLOP/s：28 个 SM 上只有 48 个块。使用调优存储后，它们在 RTX 3060 上的平均时间从 76.5 µs 降到约 60 µs。
 
-## 首次启动时发生了什么
+## 何时进行测量 {#when-measurement-happens}
 
-`GemmPolicy::tuned`、`FaPolicy::tuned` 和 `SqPolicy::tuned`（位于 `tk/src/kernels/`）都通过 `TuneStore::select` 走同一套流程：
+算子在被调用的地方、即构建计算图时进行测量，从不在运行中的计划内部测量。每个候选被构建为程序，在按容量分配的临时缓冲区上启动（所有运行时变量都绑定到最大值），并计时：
 
-1. **过滤**：把表缩减到能对该形状分块（对 GEMM 而言，还要带有所请求的 `Epilogue`）的候选。若只剩一个或一个都没有：直接返回静态选择，不做任何测量。
-2. **内存缓存（memo）**：一个进程级的 `HashMap<TuneKey, usize>` 无需构建内核即可回答重复的形状——一个 plan 对每个节点都会问一次同样的形状。
-3. **存储**：memo 未命中时，针对占位缓冲区构建每个候选的 `SINK` 并计算指纹（`kernel_fingerprint`）。这些摘要会并入存储行，因此内核函数体一改就会重新测量。然后在该设备的文件中查找这一行。
-4. **测量**：存储未命中时，在该形状的合成操作数上（`Tensor::randn`，转换为目标 dtype，移到设备上）对每个候选执行 `compile_kernel`。第一个构建成功的候选负责把时钟拉起来——`warm_clock` 反复派发它，直到耗时不再下降或已过去 1.5 s；已在负载下的设备几次运行就会进入平台期。随后 `round_robin_min` 轮流对每个候选计时三轮，并保留各自的最小值，这样不会有哪个候选是在其他候选没遇到过的时钟下被评判的。
-5. **保留**最快的那个：写入 memo，也写入存储文件。无法构建或派发的候选会被跳过；若全部失败，则不缓存任何东西，改用静态选择。
+| 步骤 | 设置 |
+|---|---|
+| 预热 | 500 ms 的连续运行（RTX 3060 空闲时运行在 210 MHz） |
+| 轮次 | 对所有候选进行 4 轮轮询 |
+| 每轮 | 10 ms 的维持运行，然后 5 次剖析运行，保留每个候选的最小值 |
+| 一次运行的时间 | 最长内核的 GPU 时间戳 |
 
-只有测出的胜者才会写入文件。`select_with` 是同一套策略，只是测量由调用方提供，`tk/src/test/unit/tune.rs` 中的单元测试正是借此在没有 GPU 的情况下检验它。
+一个候选是一组程序：对拆分注意力而言是一个内核加上合并其部分结果的内核，其时间是各程序时间之和。构建或运行失败的候选被跳过。如果什么都没测到，就使用第一个候选，并且不存储任何内容。
 
----
+## 存储 {#the-store}
 
-## 键与存储
+| 项目 | 值 |
+|---|---|
+| 目录 | `$SVOD_TK3_TUNE_DIR`，否则 `$XDG_CACHE_HOME/svod/tk3_tune`，否则 `~/.cache/svod/tk3_tune` |
+| 文件 | 每个设备和 crate 版本一个，例如 `sm_86_28sm-v0.2.0.txt` |
+| 行 | `op\|device\|dtype\|shape\|candidates\|programs index ns` |
+| 键 | `tune::TuneKey { op, device, dtype, shape, candidates }`，其中 `device` 是架构和 SM 数量（`sm_86-28sm`） |
 
-```rust
-// tk/src/tune.rs
-pub struct TuneKey {
-    pub kernel: &'static str,   // "gemm_nt", "flash_attention", "sq_attention"
-    pub device: String,         // "<arch target name>-<compute units>cu"
-    pub shape: Vec<usize>,      // the kernel's own shape tuple, dtype width and flags included
-    pub config: u64,            // a digest of the candidate set (and anything else the graphs vary with)
-}
-```
-
-GEMM 以 `[m, k, n, dtype.bytes(), epilogue.code()]` 为键；flash attention 以 `[b, n, h, h_kv, d, causal, mask.code(), dtype.bytes()]` 为键。改动分块表会改变 `config`，因此新增的候选会触发重新测量。
-
-存储是每个设备、每个 crate 版本一个文件，每个条目一行：
+来自真实存储的一行：attention，bf16，形状 `[batch, t, tk, heads, kv_heads, d]`，候选 2 以 61.4 µs 胜出。
 
 ```text
-<kernel>|<device>|<shape>|<builds digest> <winning index> <ns>
+attention|sm_86-28sm|BFloat16|1x704x704x8x8x64|3733e8921b15aa79|77aee9d5c98fa463 2 61440
 ```
 
-文件位于以下位置中第一个满足条件的：
+`programs` 字段是已构建候选程序及其降级的指纹，因此内核一旦改动就会重新测量。写入时会重新读取、合并并原子地替换文件。无法读取或写入的存储视为未命中，从不报错。进程内的记忆缓存无需构建任何东西即可回答重复调用。
 
-| 位置 | 条件 |
+## 关闭调优 {#switching-it-off}
+
+| 方式 | 作用 |
 |---|---|
-| `$SVOD_TK_TUNE_DIR/` | 设置了该变量 |
-| `$XDG_CACHE_HOME/svod/tk_tune/` | 否则，若设置了 `XDG_CACHE_HOME` |
-| `$HOME/.cache/svod/tk_tune/` | 其他情况 |
+| `SVOD_TK3_TUNE=0` | 关闭测量；运行第一个候选 |
+| `svod_tk3::tune::set_enabled(false)` | 对当前进程效果相同，优先于环境变量（测试中使用） |
 
-文件名是设备字符串，其中非字母数字字符被替换（`gfx1201_64cu-v0.1.0.txt`）。写入时会重新读取、合并，并以原子方式重命名，因此两个进程同时调优时，最多丢失对方最新的那一行。目录不可读或不可写只算未命中，绝不报错；若没有可写的根目录，存储就只在内存中。
+`tune::TuneStore::at(root)` 在另一个根目录构建存储，传入 `None` 时仅存在于内存中。`tune::measure(candidates)` 以同样方式为任意 `tune::Candidate`（`Vec<(Program, Lowering)>`）列表计时。
 
----
+## 探针 {#probes}
 
-## 关闭调优
+探针是带 `#[ignore]` 的测试，只打印耗时，从不断言。在空闲的 GPU 上逐个运行：
 
-| 控制方式 | 效果 |
+```bash
+SVOD_DEVICE=CUDA:0 cargo test -p svod-tk3 --lib --release -- --ignored --nocapture --test-threads=1 gemm_candidates_probe
+```
+
+| 探针 | 输出 |
 |---|---|
-| `SVOD_TK_TUNE=0` | 不做测量；每个策略都返回其静态选择（`GemmPolicy::cfg`、`FaPolicy::config`、策略自身的切分） |
-| `svod_tk::tune::set_enabled(false)` | 效果相同，但在代码中设置，并在整个进程内覆盖环境变量——测试框架会调用它，以免一个内核测试对它碰到的每个形状都做调优 |
-| `gemm_nt_with(x, w, cfg)`、`flash_attention_tuned(q, k, v, opts, policy)`、`SqAttentionOpts::split` | 用你自己的选择器在单次启动中绕过策略 |
+| `gemm_throughput_probe` | tk3 GEMM 各配置在 4096³ 上与 tk1 对比的 TFLOP/s |
+| `gemm_candidates_probe` | Nemotron 投影形状和 4096³ 上的每个 GEMM 候选、未调优时的选择以及胜者 |
+| `attention_throughput_probe` | Flash attention（B 4、H 8、T 2048；d 64/128，因果与非因果）与 tk1 对比 |
+| `decode_throughput_probe` | 一个 Whisper large-v3 解码器步骤的自注意力和交叉注意力与 tk1 对比 |
+| `first_execution_probe` | 构建、降级和准备一个 tk3 GEMM 的主机开销，与图 GEMM 对比 |
 
-当设备不打派发时间戳（`dispatch_gpu_ns` 为 `None`）时，调优也会被跳过，因为没有可比较的东西。
-
----
-
-## 调优的对象
-
-| 内核 | 候选 | 分块表 |
-|---|---|---|
-| `gemm_nt` | 该架构家族分块表中能对 `(m, k, n)` 分块且带有该尾声的每个 `GemmCfg` | `tk/src/kernels/gemm.rs` 中的 `CUDA_TILES` (2)、`RDNA_TILES` (3)、`RDNA4_TILES` (5) |
-| `flash_attention` | `FA_TILES` 中 K/V 双缓冲能放进共享内存、且块大小能整除 `N` 的每个 `(q_blk, kv_blk)` | `tk/src/kernels/fa.rs` 中的 `[(16,16), (16,32), (16,64), (32,32)]` |
-| `single_query_attention` | `N` 的约数中最接近设备驻留 wave 预算、且每块至少留下 15 次迭代的那些 | `tk/src/kernels/sq_attention.rs` 中的 `SqPolicy::candidates` |
-
-每个策略回退时采用的静态选择本身也是测量得来的，每个架构家族在一块硬件上测过：GEMM 的 `GemmPolicy::cfg` 优先选最宽的分块，除非它的网格无法把设备的计算单元填满 `resident` 倍；`FaPolicy::tile` 只有在启动网格覆盖整台设备、且头维度低于该家族的上限时，才选更高的每 warp 分块。调优之所以存在，是因为这些交叉点会随形状移动。
-
-:::tip[解读一次测量]
-`SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::gemm_first_use -- --ignored` 会针对一个临时存储运行真实的流程，并断言：只有一个文件、一行记录，且第二次请求无需测量就能读回它。要查看你自己的运行中某个形状选了什么，直接读那个文件即可：索引是上面所列分块表中的位置。
-:::
-
-这笔开销对每个设备上的每个形状只付一次：几次编译，加上冷 GPU 大约两秒的计时。形状经过分桶的模型——Qwen3 把序列长度分桶到 `FLASH_ATTENTION_SEQUENCE_MULTIPLE`——只需调优寥寥几行，之后每个批次都直接走 memo。
+最后一个探针测得的主机开销决定了 `launch.rs` 的设计。降级一个 GEMM 主体需要 2.3 ms，因此降级后的主体按程序、降级、设备和占位符形状被记忆化缓存（命中仅需 30 µs）。在 prepare 阶段，调度一个主体仍比图 GEMM 多花约 0.35 ms。

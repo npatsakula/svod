@@ -1,183 +1,161 @@
 ---
-sidebar_label: 编写一个内核
+sidebar_label: 第一个内核
 ---
 
-# 编写你的第一个内核
+# 第一个内核
 
-[向 IR 中编写](./lowering) 在抽象层面讲了构建器：`Kernel` 把原材料交到你手上，`Group` 携带计算词汇，`finish` 把一切包进一个 `SINK`。本章把这些落到实处，写出一个真正做事的最小内核（**加载两个 `16×16` tile，相加，存储结果**），并把它跑起来。
+tk3 内核是一个 Rust 函数，它用 `Kernel` 构建器记录一个 tile 程序。每次调用都会向当前打开的块追加一条语句，并返回一个带类型的句柄。句柄携带其层级（`Gmem<T>`、`Shared<T>`、`Regs<T>`）和元素类型（`BF16`、`F16`、`F32`、`I32`、`Bool`）。形状在语句被记录时检查。块索引、偏移量和迭代次数等标量是用普通运算符构造的 `Sc` 表达式。
 
-它是有意挑出来的、仍能演练出内核完整形态的最简之物：把 [什么是分块](./tiling) 里那条 load → compute → store 的弧线写成代码。没有矩阵乘法，没有共享内存，没有循环，刚好够你看清每一步。matmul 和 Flash Attention 内核，就是这同一副骨架再往上堆东西。
+## 一个最小的内核 {#a-minimal-kernel}
 
-```mermaid
-flowchart LR
-  A["a (GL)"] -->|"load"| RA["ra (RT)"]
-  B["b (GL)"] -->|"load"| RB["rb (RT)"]
-  RA --> ADD["add"]
-  RB --> ADD
-  ADD --> RC["rc (RT)"]
-  RC -->|"store"| O["out (GL)"]
-```
-
----
-
-## 整个内核
-
-端到端就是下面这样：声明缓冲区，构建内核体，运行，再把结果读回来：
+在 `[rows, 64]` 的 f32 矩阵上计算 `y = 2·x + 1`，每个块处理 16 行。视图的行边界使最后一个块中超出 `rows` 的行读为零、写入被丢弃，因此 `rows` 不必是 16 的倍数。
 
 ```rust
-use svod_dtype::DType;
+use svod_tk3::build::*;
+use svod_tk3::interp::run;
+use svod_tk3::ir::*;
+
+fn axpb(rows: usize) -> Program {
+    let cols = 64;
+    let mut k = Kernel::new("axpb");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    k.grid([Sc::from(rows.div_ceil(16)), Sc::from(1), Sc::from(1)]);
+    k.warps(4);
+    let row0 = k.block(0) * 16;
+    let tile = |k: &mut Kernel, p: ParamRef<F32>| {
+        let v = k.view(p, 0, [cols, 1], Shape::new(16, cols), [Some(Sc::from(rows)), None]);
+        k.at(v, row0.clone(), 0)
+    };
+    let xv = tile(&mut k, x);
+    let v = k.load(xv);
+    let two = k.fill::<F32>(Shape::new(16, cols), Const::Float(2.0));
+    let one = k.fill::<F32>(Shape::new(16, cols), Const::Float(1.0));
+    let v = k.binary(v, two, BinaryOp::Mul);
+    let v = k.binary(v, one, BinaryOp::Add);
+    let yv = tile(&mut k, y);
+    k.store(yv, v);
+    k.finish()
+}
+
+// On the host, no GPU: one Vec<f64> per parameter in, every parameter out.
+let x: Vec<f64> = (0..40 * 64).map(f64::from).collect();
+let out = run(&axpb(40), vec![x, vec![0.0; 40 * 64]], &[])?;
+assert_eq!(out[1][64 * 39 + 1], 2.0 * (64.0 * 39.0 + 1.0) + 1.0);
+```
+
+`view(param, offset, [row_stride, col_stride], shape, bounds)` 是参数上的一个窗口。`at(view, rows, cols)` 移动该窗口，并让边界保持相对于新原点。
+
+## GEMM 逐步讲解 {#the-gemm-step-by-step}
+
+`kernels/gemm.rs` 计算 `c = act(a·bᵀ + bias) + residual`（门控权重时为 `act(gate)·up`），连同 spec 和配置类型在内约 180 行。下面的摘录逐字摘自源码。
+
+**参数与网格。** 缓冲区是扁平的，大小按批次容量分配。绑定的批次变量成为网格的 z 维。
+
+```rust
+let a = k.param::<T>("a", ParamKind::In, cap * m * kk);
+let b = k.param::<T>("b", ParamKind::In, halves * n * kk);
+let bias = epi.bias.then(|| k.param::<T>("bias", ParamKind::In, halves * n));
+let residual = epi.residual.then(|| k.param::<T>("residual", ParamKind::In, cap * m * n));
+let c = k.param::<T>("c", ParamKind::Out, cap * m * n);
+let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
+let (gz, bb) = batch.axis(&mut k);
+k.grid([Sc::from(gm), Sc::from(gn), gz]);
+k.warps(cfg.warps[0] * cfg.warps[1]);
+```
+
+**用边界代替填充。** 只有在 tile 网格超出 `len` 时，`bound(len, tile)` 才是 `Some(len)`。任意 `m` 和 `n` 都无需拷贝即可运行，只有 `k` 必须是 `bk` 的倍数。
+
+```rust
+let (bx, by) = tile_order(&mut k, gm, gn, cfg.group_m);
+let (row0, col0) = (bx * bm, by * bn);
+let (m_bound, n_bound) = (bound(m, bm), bound(n, bn));
+let a_view = k.view(a, batch_offset(&bb, m * kk), [kk, 1], Shape::new(bm, bk), [m_bound.clone(), None]);
+let a_view = k.at(a_view, row0.clone(), 0);
+```
+
+`tile_order` 按 `group_m` 个 tile 行为一组遍历，使驻留的块在 L2 中共享 B。
+
+**流水线。** `pipeline(extent, stages, init, produce, consume)` 在由 `stages` 个共享槽组成的环上声明一个生产者和一个消费者。作者只说明要把什么拷贝进槽、以及从槽中计算什么。[调度模板](./layouts-and-lowering#schedule-templates)决定拷贝提前多少步，并放置每一个等待和屏障。
+
+```rust
+k.pipeline(
+    trips,
+    stages,
+    init,
+    |k, step, slot| {
+        let koff = step * bk;
+        for (src, alloc, shape) in
+            std::iter::once((a, a_s, sa)).chain(bs.into_iter().zip(b_s).map(|(b, s)| (b, s, sb)))
+        {
+            let g = k.at(src, 0, koff.clone());
+            let t = k.smem_slot::<T>(alloc, slot.clone(), shape);
+            k.stage(t, g, CopyMode::Async);
+        }
+    },
+    |k, _step, slot, accs| {
+        let a_t = k.smem_slot::<T>(a_s, slot.clone(), sa);
+        let mut i = 0;
+        accs.map(|acc| {
+            let b_t = k.smem_slot::<T>(b_s[i], slot.clone(), sb);
+            i += 1;
+            k.mma(acc, a_t, false, b_t, true)
+        })
+    },
+)
+```
+
+`mma(acc, a, a_t, b, b_t)` 在 f32 累加器上计算 `acc + A·B`。它从不指名具体指令：降级会选取目标的矩阵核心原子，并把其布局赋给 `a`、`b` 和 `acc`。
+
+**尾处理（epilogue）** 在 f32 累加器上运行，结果在存储时只舍入一次。偏置是 `[1, bn]` 行向量，在整个 tile 上广播；残差是一个完整的 tile。
+
+```rust
+if let Some(residual) = residual {
+    let r = tile(&mut k, residual);
+    let r = load_f32(&mut k, r);
+    out = k.binary(out, r, BinaryOp::Add);
+}
+let out = k.cast::<F32, T>(out);
+let c_view = tile(&mut k, c);
+k.store(c_view, out);
+k.finish()
+```
+
+## 在设备上运行 {#running-it-on-the-device}
+
+`launch::graph_launch` 按顺序为每个声明的参数接收一个张量，并把第一个输出作为惰性 `Tensor` 返回。与任何图内核一样，内核在结果被 realize 时运行。
+
+```rust
+use svod_dtype::{DType, default_device::default_device};
 use svod_tensor::Tensor;
-use svod_tk::arch::FragRole;
-use svod_tk::tiles::TileLayout;
-use svod_tk::{run_kernel, MoveIdx};
+use svod_tk3::atoms::Target;
+use svod_tk3::build::BF16;
+use svod_tk3::kernels::Batch;
+use svod_tk3::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk3::launch::graph_launch;
 
-// Two 16×16 inputs and an output, as flat f32 buffers.
-let a: Vec<f32> = (0..256).map(|i| i as f32).collect();
-let b: Vec<f32> = (0..256).map(|i| (2 * i) as f32).collect();
-let ta = Tensor::from_slice(&a);
-let tb = Tensor::from_slice(&b);
-let mut out = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
-
-// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA, CUDA and Metal.
-let arch = svod_tk::target::resolve_arch(&ta.device()).expect("a GPU device");
-let w = svod_tk::ArchCaps::for_arch(arch).wave_size as i64;
-
-run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| {
-    let warp = ker.warp();
-
-    // Globals, in launch order: output first, then the two inputs.
-    let o = ker.gl(&[1, 1, 16, 16], DType::Float32);
-    let ga = ker.gl(&[1, 1, 16, 16], DType::Float32);
-    let gb = ker.gl(&[1, 1, 16, 16], DType::Float32);
-
-    // Ask for the 16×16 f32 fragment by role — arch-correct on wave32 and wave64.
-    let frag = ker.frag(FragRole::Accumulator);
-
-    // global → register
-    let ra = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), ga, MoveIdx::block((0, 0, 0, 0), 2));
-    let rb = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), gb, MoveIdx::block((0, 0, 0, 0), 2));
-
-    // the one compute op
-    let rc = warp.add(ra, &rb);
-
-    // register → global, then close the kernel around its single store
-    let _ = warp.store(o, rc, MoveIdx::block((0, 0, 0, 0), 2));
-    ker.finish(1)
-})
-.expect("tile_add launch");
-
-let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
+let (m, n, k) = (1000, 512, 256);
+let target = Target::for_device(&default_device()).expect("a GPU target");
+let cfg = GemmCfg { tile: [64, 64, 32], stages: 3, warps: [2, 2], group_m: 8, unroll: true };
+let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
+let a = Tensor::empty(&[m * k], DType::BFloat16);
+let b = Tensor::empty(&[n * k], DType::BFloat16);
+let c = Tensor::empty(&[m * n], DType::BFloat16);
+let c = graph_launch(gemm::<BF16>(&spec), &cfg.lowering(target), &[&a, &b, &c])?;
+c.realize()?;
 ```
 
-整个内核到此为止。本章余下部分逐行走过它。
+模型不会自己这样做：[`ops::linear`](./op-layer) 会选择配置、确定输出形状，并在内核不适用时回退到计算图。
 
----
+## 构建器调用 {#builder-calls}
 
-## 一步一步
+| 分组 | 调用 |
+|---|---|
+| 声明 | `param`、`var`（按名称绑定的启动变量）、`grid`、`warps`、`smem` |
+| 标量 | `block(axis)`、`warp()`、`load_scalar(param, index)`、`Sc` 运算符以及 `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
+| 视图 | `view`、`at`、`smem_view`、`smem_slot` |
+| Tile 操作 | `fill`、`zeros`、`splat`、`coord`、`unary`、`binary`（行向量或列向量会广播）、`compare`、`cast`、`where_`、`reduce`、`mma` |
+| 数据移动 | `stage`（全局 → 共享，`CopyMode::Async` 或 `Sync`）、`load`、`store` |
+| 控制 | `loop_`（携带寄存器 tile）、`pipeline`、`if_`、`select_if`（产生 tile 的分支） |
 
-### 1. 声明这次启动
-
-`run_kernel` 是 DEBUG 面孔的直接派发入口：它物化输入、分配输出、替你构建一个 `Kernel`、运行你的闭包以拿到 `SINK`，然后编译并派发，就地写入输出。
-
-```rust
-run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| { /* body */ })
-```
-
-`[1, 1, 1]` 网格与 `w` 块是这次启动的几何。我们用**一个工作组、一个 wave**：整个 `16×16` tile 装得进单个 wave 的寄存器，没有什么需要分散到多个块上。块大小取 `w`，即 **wave 宽度**，这是我们事先从设备查到的（`ArchCaps::for_arch(resolve_arch(&ta.device())).wave_size`）；因为一个 wave 在 CDNA 上是 64 个 lane，而在 RDNA、NVIDIA 和 Apple 上是 32 个 lane，块维度*就是*这个 lane 数。输出切片在前，输入在后，**这个顺序就是契约**，下一步要靠它。
-
-### 2. 拿一个 wave 来干活
-
-```rust
-let warp = ker.warp();
-```
-
-`Group` 就是那群协作的 wave（`warp` 是同一事物的 NVIDIA 叫法）。每个计算操作（加载、加法、存储）都是它上面的一个方法。`ker.warp()` 给的是单 wave 组；`ker.group(n)` 则给你 `n` 个 wave，用来处理更大的 tile。
-
-### 3. 声明全局
-
-```rust
-let o  = ker.gl(&[1, 1, 16, 16], DType::Float32);
-let ga = ker.gl(&[1, 1, 16, 16], DType::Float32);
-let gb = ker.gl(&[1, 1, 16, 16], DType::Float32);
-```
-
-**全局布局**（`GL`）是对某个缓冲区的一个带类型视图：它知道逻辑形状，于是加载能算出正确地址。每次 `gl()` 调用都按声明顺序绑定*下一个*缓冲区，而这个顺序必须与启动相符。我们传入的是 `&mut [&mut out]` 然后 `&[&ta, &tb]`，所以这里依次声明 `o`、`ga`、`gb`。顺序一旦搞错，内核就会读写错误的缓冲区。
-
-`[1, 1, 16, 16]` 这个形状是 tk 内核所用的 4 维寻址约定；开头那两个 `1` 是批/头维度，真实内核会去迭代它们，这里留作平凡值。（输入*张量*本身可以是扁平的 256 元素缓冲区，逻辑形状由 `GL` 视图提供；只有输出张量为了分配而携带它的形状。）
-
-### 4. 按角色索要 tile
-
-```rust
-let frag = ker.frag(FragRole::Accumulator);
-```
-
-这是 [布局与 wave 宽度](./wave-portability) 里那一招可移植性手法，即便在一个没有矩阵乘法的内核里它也很关键：同一个逻辑 `16×16` f32 tile，在每一种受支持的架构上都有着*不同的物理 lane 布局*，所以点名一个**角色**而非一个硬编码片段，才能让同一个内核体为它们全都编译。我们向内核索要 `Accumulator` 角色，它说白了就是一个全精度结果 tile 的角色，而加法产出的恰恰也是这种 tile，并不只限于 MMA；`Kernel::frag` 转发给 `ArchCaps::frag`，替目标平台解析出物理片段：CDNA 上是 wave64 的 stride 映射，RDNA3 上是偶/奇 wave32 布局，RDNA4 上是每 lane 8 个元素的 stride 映射，CUDA 上是两半式的 `mma.sync` 布局，Apple 上是 8×8 片段排成的 2×2 网格。（`ker.acc((16, 16), TileLayout::Row)` 是 `ker.rt(.., DType::Float32, .., ker.frag(FragRole::Accumulator))` 的一次调用简写；库内核用的就是它。）
-
-### 5. 加载：全局 → 寄存器
-
-```rust
-let ra = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), ga, MoveIdx::block((0, 0, 0, 0), 2));
-let rb = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), gb, MoveIdx::block((0, 0, 0, 0), 2));
-```
-
-`ker.rt(...)` 在我们刚解析出的片段布局中分配一个寄存器 tile，`warp.load` 再从全局把它填满。`MoveIdx::block((0, 0, 0, 0), 2)` 指明读取全局的*哪个* tile：这个元组是 tile 沿四个维度各自的坐标，这里全是零，因为单个 `16×16` tile 只有 `(0, 0)` 这一个位置；而那个 `2` 是这些 tile 堆叠所沿的轴，即维度 2，也就是 `[1, 1, 16, 16]` 视图的行维度。（一个 `[1, 1, 32, 16]` 的全局会容纳两个行 tile，读取第二个就把那个坐标设为 `1`。）wave 协作着把这 256 个元素直接拉进寄存器，一进来便已是计算所要的布局。
-
-这是那条*直接的* `global → register` 路径，中间不停共享内存这一站。一个流式处理大张量的内核会先经一个共享 tile 分阶段（为了合并访问和一个无冲突的 swizzle，即 [FLOPS 藏在哪里](./where-flops-hide) 里那些瓶颈）；这里跳过它，因为单个常驻 tile 两样都不需要。
-
-### 6. 计算：就这一个操作
-
-```rust
-let rc = warp.add(ra, &rb);
-```
-
-内核里唯一的算术。`add` 对 tile 逐元素相加，没有 lane 索引，没有地址数学，就是「把这两个 tile 加起来」。（它按值取第一个操作数、按引用取第二个，返回结果 tile。）真实内核里，`mma`、规约、逐元素映射就出现在这个位置；它们周围的机制，恰恰就是你在这里看到的样子。
-
-### 7. 存储并收尾
-
-```rust
-let _ = warp.store(o, rc, MoveIdx::block((0, 0, 0, 0), 2));
-ker.finish(1)
-```
-
-`warp.store` 把结果 tile 写回输出全局，索引和加载时一样，只是反过来。`ker.finish(1)` 围绕这**唯一一个**存储给内核收尾，产出那个 `SINK`（打上 `opts_to_apply: Some(vec![])`，好让优化器对手工降级的内核体原封不动，正如 [向 IR 中编写](./lowering) 所述）。你传给 `finish` 的数字，是要收进 `SINK` 的输出存储个数；我们只有一个输出，所以是 `1`。
-
-### 8. 运行它，再读回来
-
-`run_kernel` 在闭包返回的那一刻就编译并派发。输出是就地绑定的，所以我们直接从张量上读出它：
-
-```rust
-let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
-```
-
-在 `a[i] = i` 且 `b[i] = 2i` 的情况下，每个元素都返回 `3i`。
-
----
-
-## 不可违反的规则
-
-有几条约束是承重的，搞错一条，你换来的就是编译错误、panic，或一个错误答案：
-
-| 规则 | 为什么 |
-|------|-----|
-| **tile 维度是 `16` 的倍数** | 一个 tile 是整数个 `16×16` 矩阵核心片段；`ker.rt` 会断言这一点。 |
-| **`gl()` 顺序 = 启动缓冲区顺序** | 输出在前，再到输入。绑定是位置式的；一处不匹配就会悄无声息地把缓冲区调换，数字错了却没有报错，编译器也抓不住。 |
-| **按角色请求片段，而非按常量** | 正是 `ker.frag(role)` 让同一个内核体能在 wave32、wave64、NVIDIA 的 warp32 *以及* Apple 的 SIMD group 上都跑起来。 |
-| **它是 GPU 内核** | 构建器铸出真实的 lane 索引（`Op::Special`），所以执行瞄准的是 GPU（AMD、CUDA 或 Metal），而非 CPU。 |
-
----
-
-:::tip[面向 GPU 专家]
-内核体降级成的，恰好是 [向 IR 中编写](./lowering) 里那副 `RANGE` / `INDEX` / `LOAD` / `STORE` 形状，没有新节点类型。内核铸出一个 lane 索引 `Op::Special`，wave 的各次加载搭在它上面；每次 `warp.load` 在那个 lane 下变成一个全局 `LOAD`，`warp.add` 是单个 `Op::Binary(Add)`，存储则是 `SINK` 罩住的那唯一一个 `STORE`。这里**没有** `Wmma`，也**没有**位于 `Local` 地址空间的 `BUFFER`：它是一次纯寄存器的往返，是 IR 所能表达的最精简内核。
-
-因为内核发射 `Special` 操作，它*就是*一个完全手工降级的 GPU 内核：优化器和工作组维度遍把带 `Special` 的图当成已降级的来对待并直接放行（即 `opts_to_apply: Some(vec![])` 所把守的那同一道关卡）。这也正是它只在 GPU 后端（AMD、NVPTX 或 Metal）上渲染的原因：lane 索引在标量 CPU 路径上毫无意义。不过，*构建*那个 `SINK` 纯粹是 UOp 构造，不需要 GPU；只有执行它才需要。正是这道分割，让一个内核能在每次构建时由主机侧的形状检查把守，再由一个单独的、受门控的测试来检验设备上的数字：`tk/src/test/unit/guide.rs` 里放着的正是这个内核体，它在每次 `cargo test` 时检查图的形状，并在 `--ignored` 下于硬件上运行（[调试](./debugging)）。
-:::
-
----
-
-## 为什么这很重要
-
-这个小内核是每个 tk 内核浇注其中的模板。GEMM 加上一个 `mma`、一条共享内存条带和一个 K 循环；而实战范例 [Flash Attention](./flash-attention) 则让矩阵核心与一个在线 softmax 递推、双缓冲流式传输和一个布局分支一同运转。但骨架恰恰就是你刚写下的这些：按启动顺序声明全局，按角色请求 tile，在内存空间之间搬数据，对 tile 计算，`finish`。学会这副骨架，更难的内核是在它之上添东西，而不是另起炉灶。
-
-而所有这些都是那一套 UOp IR。你构建的那个 `SINK`，与编译器为自动调优内核所产出的是同一类对象，这正是本节的全部要点。
-
-接下来，先是其余的词汇（[构建器 API](./builder-reference)），再是那个让手工编写真正变难的细节——让一个内核跨不同 wave 宽度与片段布局保持正确：[布局与 wave 宽度](./wave-portability)。
+`role_block`、`raw` 和 `transpose` 可以被记录，但尚未被降级：降级对它们返回 `Error::Unsupported`。

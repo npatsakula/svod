@@ -1,112 +1,85 @@
 ---
-sidebar_label: Autotuning
+sidebar_label: Tuning
 ---
 
-# पहले इस्तेमाल पर Autotuning
+# Tuning
 
-किसी कर्नेल की tile table एक search space है, जवाब नहीं। GEMM हर family के लिए तीन से पाँच tiles रखता है,
-flash attention चार per-warp tiles, single-query attention कुछ K/V splits — और कौन-सा जीतता है, यह shape,
-device के compute units की गिनती और उसकी clock पर निर्भर करता है। इसलिए जब कोई device पहली बार किसी shape से
-मिलता है, `svod-tk` हर फ़िट होने वाले candidate को compile और time करता है, सबसे तेज़ को रखता है, और उसे disk
-पर याद रखता है। `tk/src/tune.rs` ही पूरा mechanism है।
+हर op के पास `ops::config` में हर shape के लिए एक candidate list है (tables के लिए
+[कर्नेल लाइब्रेरी](./kernel-library) देखें)। पहला candidate वह है जो untuned चलता है। जब कोई device
+पहली बार किसी shape से मिलता है, tune store पूरी list मापता है और विजेता को रखता है।
 
----
+बेहतर fixed default काफ़ी नहीं था। Nemotron के GEMMs (M = 704, N 512–2048) पुरानी fixed tile ladder
+के साथ लगभग 14 TFLOP/s पर चलते थे: 28 SMs पर 48 blocks। Tune store के साथ RTX 3060 पर उनका औसत समय
+76.5 से गिरकर लगभग 60 µs हो गया।
 
-## पहले launch पर क्या होता है
+## मापन कब होता है {#when-measurement-happens}
 
-`GemmPolicy::tuned`, `FaPolicy::tuned` और `SqPolicy::tuned` (`tk/src/kernels/` में) `TuneStore::select` के
-ज़रिए एक ही क्रम चलाते हैं:
+Op वहीं मापता है जहाँ उसे बुलाया जाता है, ग्राफ़ बनते समय, कभी किसी चलते हुए plan के अंदर नहीं। हर
+candidate एक program के रूप में बनता है, capacity पर scratch buffers पर launch होता है, हर runtime
+variable उसकी अधिकतम value से bound होता है, और समय मापा जाता है:
 
-1. **Filter:** table को उन candidates तक छाँटें जो shape को tile करते हैं (और, GEMM के लिए, माँगा गया
-   `Epilogue` रखते हैं)। एक candidate या कोई नहीं: static चुनाव लौटाएँ, कुछ measure न करें।
-2. **Memo:** एक process-wide `HashMap<TuneKey, usize>` दोहराए गए shape का जवाब बिना कर्नेल build किए देता
-   है — एक plan हर node पर एक ही shape एक बार पूछता है।
-3. **Store:** memo miss पर, हर candidate का `SINK` placeholder buffers के ख़िलाफ़ build करें और उसका
-   fingerprint लें (`kernel_fingerprint`)। Digests store line में जुड़ते हैं, इसलिए कर्नेल body में बदलाव
-   दोबारा measure करवाता है। Device की file में line खोजें।
-4. **Measure:** store miss पर, हर candidate को shape के synthetic operands (`Tensor::randn`, dtype में cast,
-   device पर moved) पर `compile_kernel` करें। जो पहला build हो गया, वह clock उठाता है — `warm_clock` उसे तब
-   तक dispatch करता है जब तक उसका समय गिरना बंद न हो जाए या 1.5 s न बीत जाएँ; पहले से load में चल रहा device
-   कुछ ही runs में plateau पर पहुँच जाता है। फिर `round_robin_min` तीन rounds तक हर candidate को बारी-बारी
-   time करता है और हर एक का minimum रखता है, ताकि किसी को ऐसी clock पर न आँका जाए जिस पर बाक़ी नहीं थे।
-5. **Keep:** सबसे तेज़ को memo में और store file में रखें। जो candidate build या dispatch नहीं हो पाता, उसे
-   छोड़ दिया जाता है; अगर कोई नहीं हो पाता, तो कुछ cache नहीं होता और static चुनाव इस्तेमाल होता है।
+| क़दम | सेटिंग |
+|---|---|
+| Warm-up | 500 ms के लगातार runs (RTX 3060 idle में 210 MHz पर रहता है) |
+| Rounds | सभी candidates पर 4 round-robin rounds |
+| हर round | 10 ms के sustain runs, फिर 5 profiled runs, हर candidate का न्यूनतम रखते हुए |
+| एक run का समय | सबसे लंबे कर्नेल के GPU timestamps |
 
-File तक सिर्फ़ measure किया गया विजेता पहुँचता है। `select_with` वही policy है जिसमें measurement caller
-देता है, और `tk/src/test/unit/tune.rs` के unit tests इसी तरह उसे बिना GPU के चलाते हैं।
+एक candidate programs की list है, split attention के लिए एक कर्नेल और उसके partial results का merge,
+और उसका समय उसके programs के समयों का योग है। जो candidate build या run नहीं हो पाता, उसे छोड़ दिया
+जाता है। अगर कुछ भी नहीं मपता, तो पहला candidate
+इस्तेमाल होता है और कुछ store नहीं होता।
 
----
+## Store {#the-store}
 
-## Key और store
+| क्या | मान |
+|---|---|
+| Directory | `$SVOD_TK3_TUNE_DIR`, वरना `$XDG_CACHE_HOME/svod/tk3_tune`, वरना `~/.cache/svod/tk3_tune` |
+| फ़ाइल | हर device और crate version के लिए एक, जैसे `sm_86_28sm-v0.2.0.txt` |
+| Line | `op\|device\|dtype\|shape\|candidates\|programs index ns` |
+| Key | `tune::TuneKey { op, device, dtype, shape, candidates }`, जहाँ `device` arch और SM count है (`sm_86-28sm`) |
 
-```rust
-// tk/src/tune.rs
-pub struct TuneKey {
-    pub kernel: &'static str,   // "gemm_nt", "flash_attention", "sq_attention"
-    pub device: String,         // "<arch target name>-<compute units>cu"
-    pub shape: Vec<usize>,      // the kernel's own shape tuple, dtype width and flags included
-    pub config: u64,            // a digest of the candidate set (and anything else the graphs vary with)
-}
-```
-
-GEMM की key `[m, k, n, dtype.bytes(), epilogue.code()]` है; flash attention की
-`[b, n, h, h_kv, d, causal, mask.code(), dtype.bytes()]`। Table बदलने से `config` बदलता है, इसलिए नया
-candidate दोबारा measure होता है।
-
-Store हर device और crate version के लिए एक file है, हर entry के लिए एक line:
+एक असली store की line: attention, bf16, shape `[batch, t, tk, heads, kv_heads, d]`, candidate
+2 61.4 µs पर जीता।
 
 ```text
-<kernel>|<device>|<shape>|<builds digest> <winning index> <ns>
+attention|sm_86-28sm|BFloat16|1x704x704x8x8x64|3733e8921b15aa79|77aee9d5c98fa463 2 61440
 ```
 
-इनमें से पहली जगह पर:
+`programs` field बने हुए candidate programs और उनकी lowerings का fingerprint है, इसलिए कर्नेल बदलने पर
+फिर से मापा जाता है। Writes फ़ाइल को फिर से पढ़ते हैं, merge करते हैं और atomically बदलते हैं। न पढ़ा
+जा सकने वाला या न लिखा जा सकने वाला store miss गिना जाता है, कभी error नहीं। एक process memo दोहराई
+गई कॉल्स का जवाब बिना कुछ बनाए देता है।
 
-| जगह | कब |
+## इसे बंद करना {#switching-it-off}
+
+| कैसे | असर |
 |---|---|
-| `$SVOD_TK_TUNE_DIR/` | variable set हो |
-| `$XDG_CACHE_HOME/svod/tk_tune/` | वरना, जब `XDG_CACHE_HOME` set हो |
-| `$HOME/.cache/svod/tk_tune/` | अन्यथा |
+| `SVOD_TK3_TUNE=0` | मापन बंद; पहला candidate चलता है |
+| `svod_tk3::tune::set_enabled(false)` | इस process के लिए वही, environment को override करते हुए (tests इसे इस्तेमाल करते हैं) |
 
-File का नाम device string है जिसमें non-alphanumerics बदल दिए जाते हैं
-(`gfx1201_64cu-v0.1.0.txt`)। Writes दोबारा पढ़ते हैं, merge करते हैं और atomically rename करते हैं,
-इसलिए एक साथ tune कर रहे दो processes ज़्यादा से ज़्यादा एक-दूसरे की सबसे नई line खोते हैं। न पढ़ी या न लिखी
-जा सकने वाली directory एक miss है, कभी error नहीं; कोई writable root न हो तो store सिर्फ़ memory में रहता है।
+`tune::TuneStore::at(root)` किसी दूसरे root पर store बनाता है, या `None` के साथ सिर्फ़ memory में।
+`tune::measure(candidates)` `tune::Candidate`
+(`Vec<(Program, Lowering)>`) की किसी भी list को उसी तरह मापता है।
 
----
+## Probes {#probes}
 
-## इसे बंद करना
+Probes `#[ignore]` tests हैं जो timings छापते हैं और कभी assert नहीं करते। इन्हें idle GPU पर एक-एक
+करके चलाएँ:
 
-| Control | असर |
+```bash
+SVOD_DEVICE=CUDA:0 cargo test -p svod-tk3 --lib --release -- --ignored --nocapture --test-threads=1 gemm_candidates_probe
+```
+
+| Probe | क्या छापता है |
 |---|---|
-| `SVOD_TK_TUNE=0` | कोई measurement नहीं; हर policy अपना static चुनाव लौटाती है (`GemmPolicy::cfg`, `FaPolicy::config`, policy का split) |
-| `svod_tk::tune::set_enabled(false)` | वही, code से, process के लिए environment को override करते हुए — test harnesses इसे call करते हैं ताकि कोई कर्नेल test हर छुए गए shape को tune न करे |
-| `gemm_nt_with(x, w, cfg)`, `flash_attention_tuned(q, k, v, opts, policy)`, `SqAttentionOpts::split` | एक launch के लिए अपने chooser से policy को bypass करें |
+| `gemm_throughput_probe` | 4096³ पर tk1 के मुक़ाबले tk3 GEMM configs, TFLOP/s |
+| `gemm_candidates_probe` | Nemotron के projection shapes और 4096³ पर हर GEMM candidate, untuned चुनाव और विजेता |
+| `attention_throughput_probe` | tk1 के मुक़ाबले flash attention (B 4, H 8, T 2048; d 64/128, causal और non-causal) |
+| `decode_throughput_probe` | tk1 के मुक़ाबले Whisper large-v3 decoder step का self और cross attention |
+| `first_execution_probe` | Graph GEMM के मुक़ाबले tk3 GEMM को बनाने, lower करने और prepare करने की host लागत |
 
-जब device कोई dispatch timestamps stamp नहीं करता (`dispatch_gpu_ns` `None` है), तब भी tuning छोड़ दी जाती है,
-क्योंकि तुलना करने को कुछ होगा ही नहीं।
-
----
-
-## क्या tune होता है
-
-| कर्नेल | Candidates | Table |
-|---|---|---|
-| `gemm_nt` | family की table का हर `GemmCfg` जो `(m, k, n)` को tile करता है और epilogue रखता है | `tk/src/kernels/gemm.rs` में `CUDA_TILES` (2), `RDNA_TILES` (3), `RDNA4_TILES` (5) |
-| `flash_attention` | `FA_TILES` का हर `(q_blk, kv_blk)` जिसके K/V double buffers shared memory में फ़िट हों और जिसका block `N` को divide करे | `tk/src/kernels/fa.rs` में `[(16,16), (16,32), (16,64), (32,32)]` |
-| `single_query_attention` | `N` के वे divisors जो device के resident-wave budget के सबसे नज़दीक हों और हर chunk को कम से कम 15 trips दें | `tk/src/kernels/sq_attention.rs` में `SqPolicy::candidates` |
-
-हर policy जिस static चुनाव पर लौटती है, वह ख़ुद भी हर family के एक part पर measure किया गया है: GEMM का
-`GemmPolicy::cfg` सबसे चौड़ी tile पसंद करता है, जब तक उसका grid device के compute units को `resident` गुना
-न भर दे; `FaPolicy::tile` ऊँची per-warp tile तभी चुनता है जब launch grid device को cover कर ले और head dim
-family की सीमा से नीचे हो। Tuning इसलिए है क्योंकि ये crossovers shape के साथ खिसकते हैं।
-
-:::tip[Measurement पढ़ना]
-`SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::gemm_first_use -- --ignored` एक scratch store के
-ख़िलाफ़ असली क्रम चलाता है और assert करता है: एक file, एक line, और यह कि दूसरी request बिना measure किए उसे
-वापस पढ़ती है। अपने run में किसी shape के लिए क्या चुना गया, यह देखने के लिए file पढ़ें: index ऊपर बताई गई
-table में एक position है।
-:::
-
-कीमत हर device पर हर shape के लिए एक बार चुकती है: कुछ compiles, और ठंडे GPU के लिए लगभग दो seconds की
-timing। जिस model के shapes bucketed हों — Qwen3 sequence lengths को `FLASH_ATTENTION_SEQUENCE_MULTIPLE` तक
-bucket करता है — वह मुट्ठी भर lines tune करता है और फिर हर batch memo से चलाता है।
+आख़िरी probe ने वे host लागतें मापीं जिन्होंने `launch.rs` को आकार दिया। एक GEMM body को lower करने
+में 2.3 ms लगते हैं, इसलिए lowered bodies program, lowering, device और placeholder shapes के हिसाब से
+memoize होती हैं (hit पर 30 µs)। Prepare के समय एक body को schedule करना अब भी graph GEMM से लगभग
+0.35 ms ज़्यादा लेता है।
