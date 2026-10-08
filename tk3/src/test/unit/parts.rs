@@ -178,3 +178,55 @@ fn pv_identity_probe() {
     let col: Vec<i32> = (0..d).map(|c| (got[c] as i32) % 2).collect();
     eprintln!("row 0 column halves: {col:?}");
 }
+
+/// The card's empirical tensor-core ceiling: register-resident `mma.sync`
+/// with f32 accumulation and no memory traffic.
+#[test]
+#[ignore = "perf probe: needs a CUDA device"]
+fn mma_peak_probe() {
+    let Some(target) = target() else { return };
+    let (bm, bn, bk, iters, blocks) = (64usize, 64usize, 16usize, 4096i64, 28 * 16usize);
+    let mut k = Kernel::new("mma_peak");
+    let a = k.param::<BF16>("a", ParamKind::In, bm * bk);
+    let b = k.param::<BF16>("b", ParamKind::In, bn * bk);
+    let c = k.param::<F32>("c", ParamKind::Out, blocks * bm * bn);
+    k.grid([Sc::from(blocks), Sc::from(1), Sc::from(1)]);
+    k.warps(4);
+    let a_g = k.view(a, 0, [bk, 1], Shape::new(bm, bk), [None, None]);
+    let b_g = k.view(b, 0, [bk, 1], Shape::new(bn, bk), [None, None]);
+    let a_r = k.load(a_g);
+    let b_r = k.load(b_g);
+    let acc0 = k.zeros::<F32>(Shape::new(bm, bn));
+    let [acc] = k.loop_(iters, [acc0], |k, _, [acc]| [k.mma(acc, a_r, false, b_r, true)]);
+    let block = k.block(0);
+    let c_view = k.view(c, block * (bm * bn), [bn, 1], Shape::new(bm, bn), [None, None]);
+    k.store(c_view, acc);
+    let prog = k.finish();
+    let lowering = Lowering {
+        target,
+        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false },
+        grid: WarpGrid { rows: 2, cols: 2 },
+        swizzle: true,
+    };
+    let a_t = Tensor::from_slice(vec![0.5f32; bm * bk]).cast(DType::BFloat16);
+    let b_t = Tensor::from_slice(vec![0.5f32; bn * bk]).cast(DType::BFloat16);
+    let out = Tensor::empty(&[blocks * bm * bn], DType::Float32);
+    let plan = graph_launch(prog, &lowering, &[&a_t, &b_t, &out]).unwrap().prepare().unwrap();
+    let warm = std::time::Instant::now();
+    while warm.elapsed().as_millis() < 500 {
+        plan.execute().unwrap();
+    }
+    let mut best = f64::INFINITY;
+    for _ in 0..20 {
+        // The longest kernel of the run is the one under test (inputs may cast).
+        let run = plan
+            .execute_profiled()
+            .unwrap()
+            .iter()
+            .filter_map(|kp| Some((kp.gpu_end_ns? - kp.gpu_start_ns?) as f64 * 1e-9))
+            .fold(0.0, f64::max);
+        best = best.min(run);
+    }
+    let flops = 2.0 * (bm * bn * bk) as f64 * iters as f64 * blocks as f64;
+    eprintln!("mma.sync bf16→f32 ceiling: {:.3} ms, {:.1} TFLOP/s", best * 1e3, flops / best / 1e12);
+}
