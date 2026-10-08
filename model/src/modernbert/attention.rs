@@ -43,10 +43,17 @@ impl ModernBertAttention {
         Self { hidden_size, num_heads, head_dim, window, qkv_weight, out_weight }
     }
 
-    /// Forward. `x`: `(B, L, D)`. Returns `(B, L, D)`.
-    /// `rope`: the per-layer `(cos, sin)` table. `padding_mask`: optional bool
-    /// `(B, L)` where `true` = real token, `false` = padding.
-    pub fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor), padding_mask: Option<&Tensor>) -> Result<Tensor> {
+    /// Forward. `x`: `(B, L, D)`. Returns `residual + attn(x)`, `(B, L, D)`,
+    /// the add in `Wo`'s epilogue. `rope`: the per-layer `(cos, sin)` table.
+    /// `padding_mask`: optional bool `(B, L)` where `true` = real token,
+    /// `false` = padding.
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        residual: &Tensor,
+        rope: &(Tensor, Tensor),
+        padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let d = self.hidden_size;
         let (cos, sin) = rope;
 
@@ -68,6 +75,7 @@ impl ModernBertAttention {
             .maybe_window(self.window)
             .call()?;
 
-        Ok(ops::linear(&attn.merge_heads()?, &self.out_weight, ops::Linear::default())?)
+        let opts = ops::Linear { residual: Some(residual), ..Default::default() };
+        Ok(ops::linear(&attn.merge_heads()?, &self.out_weight, opts)?)
     }
 }
