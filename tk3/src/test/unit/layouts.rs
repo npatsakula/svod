@@ -19,7 +19,7 @@ fn coords(l: &TileLayout, warps: u32, lanes: u32) -> Vec<(u32, u32)> {
 /// warp grid, and the output cast inherits it.
 #[test]
 fn gemm_accumulator_gets_the_core_layout_over_the_warp_grid() {
-    let mut prog = super::programs::gemm_nt(256, 256, 256, 128, 128, 32, 3);
+    let mut prog = super::gemm_nt(256, 256, 256, 128, 128, 32, 3);
     prog.warps = 8;
     let lay = infer(&mut prog, &sm86(), WarpGrid { rows: 2, cols: 4 }).unwrap();
     let Stmt::Pipeline(p) = &prog.body.0[1] else { panic!("pipeline") };

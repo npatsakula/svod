@@ -17,7 +17,7 @@ fn lcg(seed: &mut u64) -> f64 {
 #[test_case(128, 64, 96, 64, 32, 32, 3; "three stages")]
 #[test_case(32, 32, 32, 32, 32, 32, 2; "one trip")]
 fn gemm_matches_a_naive_reference(m: usize, n: usize, k: usize, bm: usize, bn: usize, bk: usize, stages: usize) {
-    let prog = super::programs::gemm_nt(m, n, k, bm, bn, bk, stages);
+    let prog = super::gemm_nt(m, n, k, bm, bn, bk, stages);
     let mut seed = 7;
     let a: Vec<f64> = (0..m * k).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed))).collect();
     let b: Vec<f64> = (0..n * k).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed))).collect();

@@ -7,14 +7,33 @@ use svod_dtype::{DType, DeviceSpec, ScalarDType, default_device::default_device}
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use super::programs_rows::{Act, Epilogue, Norm, gemm_nt_epilogue, norm_rows};
 use crate::atoms::{Target, sm86};
+use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::*;
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
+use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch_all;
 use crate::layouts::{WarpGrid, infer};
 use crate::lower::Lowering;
-use crate::schedule::{Prefetch, Schedule};
+
+fn gemm_nt_epilogue(
+    m: usize,
+    n: usize,
+    k: usize,
+    tile: [usize; 3],
+    stages: usize,
+    warps: [u32; 2],
+    epi: Epilogue,
+) -> Program {
+    let cfg = GemmCfg { tile, stages, warps, group_m: 0, unroll: true };
+    gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg })
+}
+
+fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: bool) -> Program {
+    norm::<BF16>(&NormSpec { norm: norm_, rows, d, batch: Batch::Static(1), eps, residual, cfg: NormCfg { br } })
+}
 
 fn cuda_target() -> Option<Target> {
     let spec = default_device();
@@ -60,7 +79,7 @@ fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>]) -> Vec<Vec
 // ---- GEMM epilogues ---------------------------------------------------------
 
 fn gemm_inputs(m: usize, n: usize, k: usize, epi: Epilogue) -> Vec<Vec<f64>> {
-    let halves = if epi.act == Act::SwiGlu { 2 } else { 1 };
+    let halves = if epi.gated { 2 } else { 1 };
     let mut seed = 17;
     let mut params = vec![bf16s(m * k, &mut seed, |x| x), bf16s(halves * n * k, &mut seed, |x| x)];
     if epi.bias {
@@ -91,19 +110,20 @@ fn gemm_reference(m: usize, n: usize, k: usize, epi: Epilogue, p: &[Vec<f64>]) -
                 Act::None => x,
                 Act::Gelu => 0.5 * x * (1.0 + libm::erf(x * std::f64::consts::FRAC_1_SQRT_2)),
                 Act::Silu => silu(x),
-                Act::SwiGlu => silu(x) * half(i, j, 1),
             };
+            let y = if epi.gated { y * half(i, j, 1) } else { y };
             round_to(ScalarDType::BFloat16, y + residual.map_or(0.0, |r| r[e]))
         })
         .collect()
 }
 
-const EPILOGUES: [Epilogue; 5] = [
-    Epilogue { bias: true, residual: false, act: Act::None },
-    Epilogue { bias: false, residual: true, act: Act::None },
-    Epilogue { bias: true, residual: false, act: Act::Gelu },
-    Epilogue { bias: true, residual: true, act: Act::Silu },
-    Epilogue { bias: true, residual: false, act: Act::SwiGlu },
+const EPILOGUES: [Epilogue; 6] = [
+    Epilogue { bias: true, residual: false, act: Act::None, gated: false },
+    Epilogue { bias: false, residual: true, act: Act::None, gated: false },
+    Epilogue { bias: true, residual: false, act: Act::Gelu, gated: false },
+    Epilogue { bias: true, residual: true, act: Act::Silu, gated: false },
+    Epilogue { bias: true, residual: false, act: Act::Silu, gated: true },
+    Epilogue { bias: false, residual: true, act: Act::Gelu, gated: true },
 ];
 
 /// The interpreter applies every epilogue as the f64 reference does.
@@ -112,9 +132,10 @@ const EPILOGUES: [Epilogue; 5] = [
 #[test_case(2; "bias gelu")]
 #[test_case(3; "bias silu residual")]
 #[test_case(4; "bias swiglu")]
+#[test_case(5; "geglu residual")]
 fn epilogue_interpreter_matches_the_reference(which: usize) {
     let (m, n, k, epi) = (64, 64, 64, EPILOGUES[which]);
-    let prog = gemm_nt_epilogue(m, n, k, [32, 32, 16], 2, 4, epi);
+    let prog = gemm_nt_epilogue(m, n, k, [32, 32, 16], 2, [2, 2], epi);
     let params = gemm_inputs(m, n, k, epi);
     let want = gemm_reference(m, n, k, epi, &params);
     let out = run(&prog, params, &[]).unwrap();
@@ -125,8 +146,8 @@ fn epilogue_interpreter_matches_the_reference(which: usize) {
 /// the accumulator's C layout, so the broadcast add reads it in place.
 #[test]
 fn bias_vector_takes_the_accumulators_column_layout() {
-    let epi = Epilogue { bias: true, residual: false, act: Act::None };
-    let mut prog = gemm_nt_epilogue(128, 128, 64, [128, 128, 32], 2, 8, epi);
+    let epi = Epilogue { bias: true, ..Epilogue::default() };
+    let mut prog = gemm_nt_epilogue(128, 128, 64, [128, 128, 32], 2, [2, 4], epi);
     let lay = infer(&mut prog, &sm86(), WarpGrid { rows: 2, cols: 4 }).unwrap();
     let add = prog
         .walk()
@@ -141,15 +162,6 @@ fn bias_vector_takes_the_accumulators_column_layout() {
     assert_eq!(lay[add.0.index()], Some(acc));
 }
 
-fn gemm_lowering(target: Target, wr: u32, wc: u32) -> Lowering {
-    Lowering {
-        target,
-        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: true },
-        grid: WarpGrid { rows: wr, cols: wc },
-        swizzle: true,
-    }
-}
-
 /// Every epilogue on the device matches the interpreter and the f64
 /// reference, on one block and on a 256³ grid of blocks.
 #[test_case(64, 64, 64, [64, 64, 32], 2, 2, 2; "small")]
@@ -160,11 +172,12 @@ fn epilogues_match_on_device(m: usize, n: usize, k: usize, tile: [usize; 3], sta
         return;
     };
     for epi in EPILOGUES {
-        let prog = gemm_nt_epilogue(m, n, k, tile, stages, wr * wc, epi);
+        let prog = gemm_nt_epilogue(m, n, k, tile, stages, [wr, wc], epi);
         let params = gemm_inputs(m, n, k, epi);
         let want = gemm_reference(m, n, k, epi, &params);
         let interp = run(&prog, params.clone(), &[]).unwrap();
-        let got = on_device(prog, &gemm_lowering(target.clone(), wr, wc), &params);
+        let cfg = GemmCfg { tile, stages, warps: [wr, wc], group_m: 0, unroll: true };
+        let got = on_device(prog, &cfg.lowering(target.clone()), &params);
         let (got, interp) = (got.last().unwrap(), interp.last().unwrap());
         let d_interp = assert_close("c vs interpreter", got, interp, 1.6e-2);
         let d_ref = assert_close("c vs reference", got, &want, 1.6e-2);
@@ -272,9 +285,8 @@ fn norms_match_on_device(norm: Norm, d: usize, residual: bool) {
     eprintln!("{norm:?} d={d} residual={residual}: max abs diff {d_interp:.3e} (interpreter), {d_ref:.3e} (f64)");
 }
 
-/// Row kernels use no matrix core; the warp grid only has to cover the warps.
 fn row_lowering(target: Target) -> Lowering {
-    gemm_lowering(target, 1, 1)
+    NormCfg { br: 4 }.lowering(target)
 }
 
 /// Fastest GPU time of `plan`'s kernels after a warm-up long enough for the

@@ -18,7 +18,7 @@ fn count(prog: &Program, pred: impl Fn(&Stmt) -> bool) -> usize {
 #[test_case(Prefetch::RegisterStaged, 2; "register staged")]
 fn expansion_preserves_the_result(prefetch: Prefetch, stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
-    let mut prog = super::programs::gemm_nt(m, n, k, 32, 32, 32, stages);
+    let mut prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
     let a: Vec<f64> = (0..m * k).map(|i| round_to(ScalarDType::BFloat16, ((i * 13) % 17) as f64 / 8.0 - 1.0)).collect();
     let b: Vec<f64> = (0..n * k).map(|i| round_to(ScalarDType::BFloat16, ((i * 7) % 19) as f64 / 8.0 - 1.0)).collect();
     let want = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[("b", 1)]).unwrap();
@@ -45,7 +45,7 @@ fn expansion_preserves_the_result(prefetch: Prefetch, stages: usize) {
 /// consumer and a store after it.
 #[test]
 fn register_staging_splits_the_copies_around_the_compute() {
-    let mut prog = super::programs::gemm_nt(32, 32, 64, 32, 32, 32, 2);
+    let mut prog = super::gemm_nt(32, 32, 64, 32, 32, 32, 2);
     expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: true });
     let Stmt::Loop(l) = &prog.body.0[1] else { panic!("the pipeline became a loop") };
     let blocks: Vec<&Block> = l

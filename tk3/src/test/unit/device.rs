@@ -6,15 +6,20 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::atoms::Target;
+use crate::build::BF16;
 use crate::interp::{round_to, run};
+use crate::ir::Program;
+use crate::kernels::Batch;
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::launch::graph_launch;
-use crate::layouts::WarpGrid;
-use crate::lower::Lowering;
-use crate::schedule::{Prefetch, Schedule};
 
 fn cuda_target() -> Option<Target> {
     let spec = default_device();
     matches!(spec, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&spec)).flatten()
+}
+
+fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
+    gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg })
 }
 
 fn lcg(seed: &mut u64) -> f32 {
@@ -43,14 +48,9 @@ fn gemm_matches_the_interpreter(
         eprintln!("skipped: no CUDA device");
         return;
     };
-    let mut prog = super::programs::gemm_nt(m, n, k, bm, bn, bk, stages);
-    prog.warps = wr * wc;
-    let lowering = Lowering {
-        target,
-        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: true },
-        grid: WarpGrid { rows: wr, cols: wc },
-        swizzle: true,
-    };
+    let cfg = GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m: 0, unroll: true };
+    let prog = plain_gemm(m, n, k, cfg);
+    let lowering = cfg.lowering(target);
 
     let mut seed = 11;
     let a: Vec<f32> = (0..m * k).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect();
@@ -58,7 +58,7 @@ fn gemm_matches_the_interpreter(
     let want = run(
         &prog,
         vec![a.iter().map(|&x| x as f64).collect(), b.iter().map(|&x| x as f64).collect(), vec![0.0; m * n]],
-        &[("b", 1)],
+        &[],
     )
     .unwrap();
 
@@ -104,14 +104,8 @@ fn gemm_throughput_probe() {
         (128, 128, 32, 3, 2, 4, 8, false),
         (128, 128, 32, 2, 2, 4, 8, false),
     ] {
-        let mut prog = super::programs::gemm_nt_ordered(m, n, k, bm, bn, bk, stages, group_m);
-        prog.warps = wr * wc;
-        let lowering = Lowering {
-            target: target.clone(),
-            schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll },
-            grid: WarpGrid { rows: wr, cols: wc },
-            swizzle: true,
-        };
+        let cfg = GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll };
+        let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(target.clone()));
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
         plans.push((
