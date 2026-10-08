@@ -58,7 +58,7 @@ fn register_staging_splits_the_copies_around_the_compute() {
         })
         .collect();
     let tier = |s: &Stmt| match s {
-        Stmt::Copy { dst, src, .. } => Some((prog.value(*src).tier(), prog.value(*dst).tier())),
+        Stmt::Copy { dst, src, mode: CopyMode::Staged } => Some((prog.value(*src).tier(), prog.value(*dst).tier())),
         _ => None,
     };
     assert!(blocks[0].0.iter().all(|s| tier(s) == Some((Tier::Global, Tier::Reg))), "issue: global → registers");

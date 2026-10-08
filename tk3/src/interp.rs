@@ -291,6 +291,7 @@ impl Frame<'_> {
                 };
                 vec![v; rows * cols]
             }
+            TileOp::Splat(id) => vec![self.must(*id) as f64; rows * cols],
             TileOp::Coord(axis) => (0..rows * cols)
                 .map(|i| match axis {
                     Axis::Row => (i / cols) as f64,

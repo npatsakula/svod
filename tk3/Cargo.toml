@@ -18,6 +18,7 @@ svod-tensor = { path = "../tensor", version = "=0.2.0" }
 svod-device = { path = "../device", version = "=0.2.0" }
 
 [dev-dependencies]
+libm = "0.2.16"
 proptest = "1.9"
 svod-runtime = { path = "../runtime" }
 svod-tk = { path = "../tk" }

@@ -180,6 +180,8 @@ pub enum ReduceOp {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TileOp {
     Fill(Const),
+    /// A scalar in every element.
+    Splat(ScalarId),
     /// The row or column index of every element, as `i32`.
     Coord(Axis),
     Unary {
@@ -229,10 +231,13 @@ pub enum TileOp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CopyMode {
-    /// Complete before the next statement.
+    /// Complete before the next statement; the sync pass fences it.
     Sync,
-    /// May complete later; the lowering waits before the first read of `dst`.
+    /// May complete later; the schedule template waits and fences it.
     Async,
+    /// One half of a register-staged copy the schedule template placed and
+    /// fences itself.
+    Staged,
 }
 
 /// A loop-carried register: `phi` holds `init` on entry, is assigned `next`

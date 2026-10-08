@@ -180,8 +180,8 @@ impl Expander<'_> {
                     let Value { dtype, shape, .. } = self.prog.value(src).clone();
                     self.prog.values.push(Value { dtype, shape, place: Place::Reg });
                     let tmp = ValId(self.prog.values.len() as u32 - 1);
-                    issue.push(Stmt::Copy { dst: tmp, src, mode: CopyMode::Sync });
-                    commit.push(Stmt::Copy { dst, src: tmp, mode: CopyMode::Sync });
+                    issue.push(Stmt::Copy { dst: tmp, src, mode: CopyMode::Staged });
+                    commit.push(Stmt::Copy { dst, src: tmp, mode: CopyMode::Staged });
                 }
                 other => issue.push(other),
             }

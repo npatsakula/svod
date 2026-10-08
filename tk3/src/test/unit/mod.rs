@@ -1,8 +1,12 @@
 mod atoms;
+mod attention;
 mod build;
 mod device;
 mod interp;
 mod layout;
 mod layouts;
+mod parts;
 mod programs;
+mod programs_rows;
+mod rows;
 mod schedule;
