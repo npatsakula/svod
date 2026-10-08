@@ -216,3 +216,76 @@ fn gemm_candidates_probe() {
         );
     }
 }
+
+/// Host-side cost of a tk3 GEMM against the graph GEMM: building, lowering
+/// (memoized after the first call) and preparing, then the wall time of the
+/// first executions of a fresh plan with dynamic and with static shared
+/// memory; prints milliseconds and never asserts.
+#[test]
+#[ignore = "perf probe: needs a CUDA device"]
+fn first_execution_probe() {
+    let Some(target) = cuda_target() else {
+        eprintln!("skipped: no CUDA device");
+        return;
+    };
+    let (m, n, k) = (704usize, 1536usize, 512usize);
+    let mut seed = 5;
+    let a: Vec<f32> = (0..m * k).map(|_| lcg(&mut seed)).collect();
+    let b: Vec<f32> = (0..n * k).map(|_| lcg(&mut seed)).collect();
+    let a_t = Tensor::from_slice(&a).cast(DType::BFloat16);
+    let b_t = Tensor::from_slice(&b).cast(DType::BFloat16);
+    a_t.realize().unwrap();
+    b_t.realize().unwrap();
+    let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
+    for (bm, bn, stages) in [(128, 128, 3), (64, 64, 2)] {
+        let cfg = GemmCfg { tile: [bm, bn, 32], stages, warps: [2, 2], group_m: 8, unroll: false };
+        let c_t = Tensor::empty(&[m * n], DType::BFloat16);
+        let out = graph_launch(plain_gemm(m, n, k, cfg), &cfg.lowering(target.clone()), &[&a_t, &b_t, &c_t]).unwrap();
+        plans.push((format!("tk3 {bm}x{bn} s{stages}"), out.prepare().unwrap()));
+    }
+    let a2 = a_t.try_reshape([m, k]).unwrap();
+    let b2 = b_t.try_reshape([n, k]).unwrap();
+    let graph = a2.matmul(&b2.try_transpose(0, 1).unwrap()).unwrap();
+    plans.push(("graph matmul".to_string(), graph.prepare().unwrap()));
+    // Host-side cost: building, lowering and scheduling the pre-linearized body.
+    let cfg = GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: false };
+    for i in 0..3 {
+        let c_t = Tensor::empty(&[m * n], DType::BFloat16);
+        let t = std::time::Instant::now();
+        let prog = plain_gemm(m, n, k, cfg);
+        let lowering = cfg.lowering(target.clone());
+        let built = t.elapsed();
+        let text = format!("{prog:?}{lowering:?}");
+        let formatted = t.elapsed();
+        let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
+        let launched = t.elapsed();
+        let _plan = out.prepare().unwrap();
+        let prepared = t.elapsed();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "tk3 #{i}: build {:.2} ms, debug text {:.2} ms ({} bytes), lower + bind {:.2} ms, prepare {:.2} ms",
+            ms(built),
+            ms(formatted - built),
+            text.len(),
+            ms(launched - formatted),
+            ms(prepared - launched)
+        );
+    }
+    for i in 0..3 {
+        let t = std::time::Instant::now();
+        let graph = a2.matmul(&b2.try_transpose(0, 1).unwrap()).unwrap();
+        let _plan = graph.prepare().unwrap();
+        eprintln!("graph build + prepare #{i}: {:.2} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+    for (label, plan) in &plans {
+        let mut times = vec![];
+        for _ in 0..4 {
+            let t = std::time::Instant::now();
+            plan.execute().unwrap();
+            let mut bytes = [0u8; 2];
+            plan.output_buffer().unwrap().copyout_prefix(&mut bytes).unwrap();
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        eprintln!("{label}: {}", times.iter().map(|t| format!("{t:.2} ms")).collect::<Vec<_>>().join(", "));
+    }
+}
