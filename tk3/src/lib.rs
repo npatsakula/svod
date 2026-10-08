@@ -7,10 +7,13 @@
 
 pub mod atoms;
 pub mod build;
+pub mod index;
 pub mod interp;
 pub mod ir;
+pub mod launch;
 pub mod layout;
 pub mod layouts;
+pub mod lower;
 pub mod schedule;
 
 #[cfg(test)]

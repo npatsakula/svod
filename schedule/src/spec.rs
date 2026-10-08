@@ -629,15 +629,17 @@ fn rule_no_tensor_reduce() -> SpecRule {
     })
 }
 
-/// `spec.py:219-220` — IF has a bool gate; ENDIF closes an IF.
+/// `spec.py:219-220` — IF has a bool gate; ENDIF closes an IF. A gated-store
+/// IF carries its one dedup source; a control IF of a pre-linearized program
+/// has none (its region is the list up to the ENDIF).
 fn rule_if() -> SpecRule {
     Box::new(|u| match u.op() {
         Op::If(ops::If { condition, body }) => Some(ok_if(
             u.dtype() == DType::Void
                 && condition.dtype() == DType::Bool
-                && body.len() == 1
-                && matches!(body[0].op(), Op::Cast(..) | Op::Index(..) | Op::Shrink(..)),
-            "IF must be void with a bool condition and one CAST/INDEX/SHRINK dedup source",
+                && (body.is_empty()
+                    || (body.len() == 1 && matches!(body[0].op(), Op::Cast(..) | Op::Index(..) | Op::Shrink(..)))),
+            "IF must be void with a bool condition and at most one CAST/INDEX/SHRINK dedup source",
         )),
         Op::EndIf(ops::EndIf { if_op }) => Some(ok_if(
             u.dtype() == DType::Void && matches!(if_op.op(), Op::If(..)),

@@ -3689,9 +3689,12 @@ dependencies = [
  "proptest",
  "smallvec",
  "snafu",
+ "svod-codegen",
+ "svod-device",
  "svod-dtype",
  "svod-ir",
  "svod-schedule",
+ "svod-tensor",
  "test-case",
 ]
 

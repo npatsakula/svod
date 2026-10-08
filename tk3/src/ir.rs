@@ -361,12 +361,19 @@ pub struct Role {
     pub regs: Option<u32>,
 }
 
+/// A bound symbolic variable of the launch, with the range it may take.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Var {
+    pub name: String,
+    pub min: i64,
+    pub max: i64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Program {
     pub name: String,
     pub params: Vec<Param>,
-    /// Bound symbolic variables the launch provides, by name.
-    pub vars: Vec<String>,
+    pub vars: Vec<Var>,
     pub grid: [ScalarId; 3],
     pub warps: u32,
     pub roles: Vec<Role>,

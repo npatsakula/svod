@@ -198,10 +198,10 @@ fn keep_axis(frag: &Layout, axis: crate::layout::Dim) -> Layout {
 pub fn mma_layouts(atom: &MmaAtom, grid: WarpGrid, m: usize, n: usize, k: usize) -> Result<[TileLayout; 3]> {
     let (wr, wc) = (grid.rows, grid.cols);
     ensure!(
-        m % (wr * atom.m) as usize == 0 && n % (wc * atom.n) as usize == 0,
+        m.is_multiple_of((wr * atom.m) as usize) && n.is_multiple_of((wc * atom.n) as usize),
         NotTileableSnafu { rows: m, cols: n, wr, wc, m: atom.m, n: atom.n }
     );
-    ensure!(k % atom.k as usize == 0, ReductionNotTileableSnafu { k, atom_k: atom.k });
+    ensure!(k.is_multiple_of(atom.k as usize), ReductionNotTileableSnafu { k, atom_k: atom.k });
     let (rm, rn, rk) =
         ((m / (wr * atom.m) as usize) as u32, (n / (wc * atom.n) as usize) as u32, (k / atom.k as usize) as u32);
     let warps = grid.layout();
