@@ -48,12 +48,11 @@ impl MultiHeadAttention {
         Ok(self.forward_return_kv(x, xa, mask)?.0)
     }
 
-    /// Bidirectional self-attention.
-    pub(crate) fn encode(&self, x: &Tensor) -> Result<Tensor> {
-        let encoder = |layer: &Linear, x: &Tensor| project(layer, x, Act::None);
-        let (q, k, v) = self.qkv(x, x, encoder)?;
+    /// Bidirectional self-attention, `residual` added in the out projection's epilogue.
+    pub(crate) fn encode(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
+        let (q, k, v) = self.qkv(x, x, |layer, x| project(layer, x, Act::None, None))?;
         let out = self.attend(&q, &k, &v, Attn::default())?;
-        scoped("out", || encoder(&self.out, &out))
+        scoped("out", || project(&self.out, &out, Act::None, Some(residual)))
     }
 
     pub fn forward_return_kv(

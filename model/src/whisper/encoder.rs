@@ -49,13 +49,10 @@ impl EncoderBlock {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = scoped("attn_ln", || norm(&self.attn_ln, x))?;
-        // The residual adds stay out of the GEMM epilogue: with the norm on
-        // the graph path, a launch whose residual operand the norm also reads
-        // fails kernel-graph verification.
-        let x = x.try_add(&scoped("attn", || self.attn.encode(&h))?)?;
+        let x = scoped("attn", || self.attn.encode(&h, x))?;
         let h = scoped("mlp_ln", || norm(&self.mlp_ln, &x))?;
-        let h = project(&self.mlp0, &h, Act::Gelu)?;
-        Ok(x.try_add(&project(&self.mlp2, &h, Act::None)?)?)
+        let h = project(&self.mlp0, &h, Act::Gelu, None)?;
+        project(&self.mlp2, &h, Act::None, Some(&x))
     }
 }
 
