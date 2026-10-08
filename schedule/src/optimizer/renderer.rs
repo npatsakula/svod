@@ -364,7 +364,12 @@ impl Renderer {
     /// construction, and the extra core moves [`Self::cache_fingerprint`], so
     /// beam plans tuned without it are never replayed with it.
     fn tf32_enabled() -> bool {
-        ["SVOD_TF32", "TF32"].iter().find_map(|key| std::env::var(key).ok()).is_some_and(|value| {
+        Self::tf32_enabled_in(|key| std::env::var(key).ok())
+    }
+
+    /// [`Self::tf32_enabled`], reading the variables through `var`.
+    fn tf32_enabled_in(var: impl Fn(&str) -> Option<String>) -> bool {
+        ["SVOD_TF32", "TF32"].into_iter().find_map(var).is_some_and(|value| {
             let value = value.trim();
             !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
         })

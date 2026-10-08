@@ -272,41 +272,18 @@ fn tf32_opt_in_changes_the_capability(allow_tf32: bool) {
     assert_eq!(Renderer::cuda_sm80(allow_tf32).tensor_cores.iter().any(|tc| tc.dtype_in == DType::Float32), allow_tf32);
 }
 
-/// The `SVOD_TF32` opt-in reaches the profiles devices actually build. The env
-/// is process-global, so each case runs in a child process with a clean
-/// environment (the `config` probe pattern); the in-process env never mutates.
-const TF32_PROBE: &str = "SVOD_TF32_PROBE";
-const TF32_PROBE_NAME: &str = "optimizer::renderer::tests::tf32_env_opt_in_reaches_the_arch_profiles";
-
-#[test]
-fn tf32_env_opt_in_reaches_the_arch_profiles() {
-    let Ok(case) = std::env::var(TF32_PROBE) else {
-        let exe = std::env::current_exe().expect("current test binary");
-        for (case, tf32) in [("off", None), ("on", Some("1")), ("zero", Some("0")), ("bare_true", Some("true"))] {
-            let mut command = std::process::Command::new(&exe);
-            command.args(["--exact", "--nocapture", TF32_PROBE_NAME]);
-            command.env_clear().env(TF32_PROBE, case);
-            if let Some(tf32) = tf32 {
-                command.env("SVOD_TF32", tf32);
-            }
-            let output = command.output().expect("probe child");
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(output.status.success() && stdout.contains("probe ok"), "probe {case}:\n{stdout}");
-        }
-        return;
-    };
-    let expected = matches!(case.as_str(), "on" | "bare_true");
-    for renderer in [Renderer::cuda(), Renderer::for_cuda_arch(CudaArch::from_compute_capability(8, 6))] {
-        assert_eq!(
-            renderer.tensor_cores.iter().any(|tc| tc.dtype_in == DType::Float32),
-            expected,
-            "{case}: tf32 shapes in the profile"
-        );
-    }
-    // `cuda()` shares every field with `cuda_sm80(flag)` but the core set, so
-    // its fingerprint pins exactly which baseline the env selected.
-    assert_eq!(Renderer::cuda().cache_fingerprint(), Renderer::cuda_sm80(expected).cache_fingerprint(), "{case}");
-    println!("probe ok");
+/// Which environments opt in to the tf32 shapes: `SVOD_TF32`, else `TF32`, set
+/// to anything but empty, `0` or `false`.
+#[test_case(&[], false; "unset")]
+#[test_case(&[("SVOD_TF32", "")], false; "empty")]
+#[test_case(&[("SVOD_TF32", " 0 ")], false; "zero")]
+#[test_case(&[("SVOD_TF32", "False")], false; "false in any case")]
+#[test_case(&[("SVOD_TF32", "1")], true; "set")]
+#[test_case(&[("TF32", "1")], true; "the bare name")]
+#[test_case(&[("SVOD_TF32", "0"), ("TF32", "1")], false; "the svod name wins")]
+fn tf32_opt_in_reads_the_documented_variables(env: &[(&str, &str)], expected: bool) {
+    let var = |key: &str| env.iter().find(|(name, _)| *name == key).map(|(_, value)| value.to_string());
+    assert_eq!(Renderer::tf32_enabled_in(var), expected);
 }
 
 /// The profile names the codegen binding per backend family, and the matcher
