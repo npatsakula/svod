@@ -11,6 +11,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
+use svod_tk3::ops;
 
 use crate::init::fan_in_uniform;
 
@@ -50,14 +51,15 @@ impl ModernBertAttention {
         let (cos, sin) = rope;
 
         // Fused QKV: (B, L, 3D) → three (B, L, D) slices → (B, H, L, hd).
-        let qkv = x.linear().weight(&self.qkv_weight).call()?;
+        let qkv = ops::linear(x, &self.qkv_weight, ops::Linear::default())?;
         let heads = |offset: usize| -> Result<Tensor> { Ok(qkv.narrow(-1, offset, d)?.split_heads(self.num_heads)?) };
         let q = heads(0)?.apply_rotary_emb(cos, sin, false)?;
         let k = heads(d)?.apply_rotary_emb(cos, sin, false)?;
         let v = heads(2 * d)?;
 
-        // Window restricts keys for local layers; the bon builder is
-        // type-stated, so chain unconditionally (None for global layers).
+        // SDPA, not the op layer: it takes key lengths only, no bool padding
+        // mask and no sliding window. The window restricts keys for local
+        // layers (`None` for global ones).
         let attn = q
             .scaled_dot_product_attention()
             .key(&k)
@@ -66,6 +68,6 @@ impl ModernBertAttention {
             .maybe_window(self.window)
             .call()?;
 
-        Ok(attn.merge_heads()?.linear().weight(&self.out_weight).call()?)
+        Ok(ops::linear(&attn.merge_heads()?, &self.out_weight, ops::Linear::default())?)
     }
 }
