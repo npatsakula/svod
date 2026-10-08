@@ -366,6 +366,43 @@ fn the_lt_lift_never_narrows_a_wide_bound(lo: i64, hi: i64, lifted: bool) {
     assert_eq!(got.is_some(), lifted, "{}", got.map_or("None".to_string(), |lifted| lifted.tree()));
 }
 
+/// Solving `idx == r + 2` subtracts 2 from the index, which the comparison never
+/// did: at an i32 index's minimum it runs in i64 rather than wrap onto a step, and
+/// a full-range i64 index, with nothing wider to run in, is not solved.
+#[test_case(DType::Int32, Some(i64::from(i32::MIN) - 2) ; "a full-range i32 index subtracts in i64")]
+#[test_case(DType::Int64, None ; "a full-range i64 index is not solved")]
+fn solving_for_the_range_never_wraps_the_index(dtype: DType, solved_at_min: Option<i64>) {
+    let range = reduce_range(END, 0);
+    let (ConstValue::Int(min), ConstValue::Int(max)) = (ConstValue::min(dtype.base()), ConstValue::max(dtype.base()))
+    else {
+        unreachable!("a signed index")
+    };
+    let compared = range.cast(dtype.clone()).try_add(&UOp::const_(dtype.clone(), ConstValue::Int(2))).expect("r + 2");
+    let solved = solve_for_range(&UOp::variable("idx".to_string(), min, max, dtype), &compared, &range);
+    let got = solved.as_ref().map(|solved| fold_at(solved, &Bindings::at("idx", min)));
+    assert_eq!(got, solved_at_min.map(|at_min| Some(ConstValue::Int(at_min))), "{:?}", solved.map(|s| s.tree()));
+}
+
+/// The EQ and NE lifts read `i32(r) + 2 == idx` as `i32(r) == idx - 2` only where
+/// the bounds keep `idx - 2` in i32; a full-range index keeps the comparison, which
+/// the collapse then solves in i64.
+#[test_case(i32::MIN, i32::MAX, false ; "a full-range index keeps the comparison")]
+#[test_case(0, 100, true ; "an index that cannot wrap is lifted")]
+fn the_eq_and_ne_lifts_never_wrap_the_index(lo: i32, hi: i32, lifted: bool) {
+    let range = reduce_range(END, 0);
+    let arange = range.cast(DType::Int32).try_add(&UOp::native_const(2i32)).expect("r + 2");
+    let idx = UOp::variable("idx".to_string(), lo.into(), hi.into(), DType::Int32);
+    let eq = try_lift_arithmetic_from_eq(&arange.try_cmpeq(&idx).expect("cmpeq"));
+    assert_eq!(eq.is_some(), lifted, "{}", eq.map_or("None".to_string(), |lifted| lifted.tree()));
+    let ne = arange.try_cmpne(&idx).expect("cmpne");
+    let matcher = build_reduce_load_collapse_matcher();
+    if lifted {
+        rewritten(matcher, &ne, &mut ());
+    } else {
+        super::helpers::assert_no_match(matcher, &ne, &mut ());
+    }
+}
+
 /// The whole collapse on both gate forms: a full-range index may keep its reduce,
 /// but wherever the body folds, `2^32 + 3` and `i64::MIN` read nothing and the
 /// index naming step 3 reads step 3. An index that fits must still collapse.

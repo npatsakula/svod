@@ -1313,24 +1313,50 @@ fn reaches(node: &Arc<UOp>, range: &Arc<UOp>) -> bool {
 /// node provably takes. A cast that merged two values would let several steps
 /// of the reduction satisfy the equality, and keeping one would drop the rest.
 pub(crate) fn cast_is_injective(value: &Arc<UOp>, dtype: &DType) -> bool {
-    let int = |value: &ConstValue| match *value {
+    let (Some((lo, hi)), Some(format)) = (int_limits(dtype), int_limits(&value.dtype())) else { return false };
+    let fits = |(min, max): (i128, i128)| lo <= min && max <= hi;
+    fits(format) || sound_int_bounds(value).is_some_and(fits)
+}
+
+fn int_value(value: &ConstValue) -> Option<i128> {
+    match *value {
         ConstValue::Int(v) => Some(i128::from(v)),
         ConstValue::UInt(v) => Some(i128::from(v)),
         _ => None,
-    };
-    // `ConstValue::{min, max}` give `Index` the i64 range it lowers into, where
-    // `DType::{min_value, max_value}` say `0..=0`, which any bounds would fit.
-    let limits = |dtype: &DType| -> Option<(i128, i128)> {
-        dtype.is_int().then_some(())?;
-        Some((int(&ConstValue::min(dtype.base()))?, int(&ConstValue::max(dtype.base()))?))
-    };
-    let (Some((lo, hi)), Some(format)) = (limits(dtype), limits(&value.dtype())) else { return false };
-    let fits = |(min, max): (i128, i128)| lo <= min && max <= hi;
-    fits(format)
-        || SoundVminVmaxProperty::get(value)
-            .as_ref()
-            .and_then(|(min, max)| Some((int(min)?, int(max)?)))
-            .is_some_and(fits)
+    }
+}
+
+/// The values an int dtype holds. `ConstValue::{min, max}` give `Index` the i64
+/// range it lowers into, where `DType::{min_value, max_value}` say `0..=0`, which
+/// any bounds would fit.
+fn int_limits(dtype: &DType) -> Option<(i128, i128)> {
+    dtype.is_int().then_some(())?;
+    Some((int_value(&ConstValue::min(dtype.base()))?, int_value(&ConstValue::max(dtype.base()))?))
+}
+
+fn sound_int_bounds(node: &Arc<UOp>) -> Option<(i128, i128)> {
+    SoundVminVmaxProperty::get(node).as_ref().and_then(|(min, max)| Some((int_value(min)?, int_value(max)?)))
+}
+
+/// The dtype `idx + by` (`idx - by` when `negate`) computes in without wrapping:
+/// `idx`'s own where the operands' bounds keep the result inside it, else i64
+/// where they keep it there. `idx == arange(2, 7)` does no arithmetic on `idx`, so
+/// the `idx - 2` read off it must not wrap an i32 index near its minimum past the
+/// bounds check [`gated_collapse_core`] puts on it.
+fn wrap_free_dtype(idx: &Arc<UOp>, by: &Arc<UOp>, negate: bool) -> Option<DType> {
+    let bounds = |node: &Arc<UOp>| sound_int_bounds(node).or_else(|| int_limits(&node.dtype()));
+    let ((lo, hi), (by_lo, by_hi)) = (bounds(idx)?, bounds(by)?);
+    let (lo, hi) = if negate { (lo - by_hi, hi - by_lo) } else { (lo + by_lo, hi + by_hi) };
+    let holds = |dtype: &DType| int_limits(dtype).is_some_and(|(min, max)| min <= lo && hi <= max);
+    [idx.dtype(), DType::Int64].into_iter().find(holds)
+}
+
+/// `idx + by`, or `idx - by` when `negate`, in [`wrap_free_dtype`].
+fn shift(idx: &Arc<UOp>, by: &Arc<UOp>, negate: bool) -> Option<Arc<UOp>> {
+    let dtype = wrap_free_dtype(idx, by, negate)?;
+    let widen = |node: &Arc<UOp>| if node.dtype() == dtype { node.clone() } else { node.cast(dtype.clone()) };
+    let (idx, by) = (widen(idx), widen(by));
+    if negate { idx.try_sub(&by) } else { idx.try_add(&by) }.ok()
 }
 
 /// `other == cast(src)` read as `other' == src`, with `other'` the inverse cast of
@@ -1358,9 +1384,9 @@ pub(crate) fn solve_for_range(idx: &Arc<UOp>, cmp: &Arc<UOp>, range: &Arc<UOp>) 
         }
         let step = match cmp.op() {
             Op::Cast(ops::Cast { src, .. }) => (peel_cast(&cmp, src, &idx)?, src.clone()),
-            Op::Binary(BinaryOp::Add, x, y) if !reaches(y, range) => (idx.try_sub(y).ok()?, x.clone()),
-            Op::Binary(BinaryOp::Add, x, y) if !reaches(x, range) => (idx.try_sub(x).ok()?, y.clone()),
-            Op::Binary(BinaryOp::Sub, x, y) if !reaches(y, range) => (idx.try_add(y).ok()?, x.clone()),
+            Op::Binary(BinaryOp::Add, x, y) if !reaches(y, range) => (shift(&idx, y, true)?, x.clone()),
+            Op::Binary(BinaryOp::Add, x, y) if !reaches(x, range) => (shift(&idx, x, true)?, y.clone()),
+            Op::Binary(BinaryOp::Sub, x, y) if !reaches(y, range) => (shift(&idx, y, false)?, x.clone()),
             _ => return None,
         };
         (idx, cmp) = step;
@@ -1683,12 +1709,19 @@ pub(crate) fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     };
 
     match inner_lhs.op() {
-        Op::Binary(BinaryOp::Add, x, y) if no_range(y) => x.try_cmpeq(&effective_rhs.try_sub(y).ok()?).ok(),
-        Op::Binary(BinaryOp::Add, x, y) if no_range(x) => y.try_cmpeq(&effective_rhs.try_sub(x).ok()?).ok(),
-        Op::Binary(BinaryOp::Sub, x, y) if no_range(y) => x.try_cmpeq(&effective_rhs.try_add(y).ok()?).ok(),
-        Op::Binary(BinaryOp::Sub, x, y) if no_range(x) => y.try_cmpeq(&x.try_sub(&effective_rhs).ok()?).ok(),
+        Op::Binary(BinaryOp::Add, x, y) if no_range(y) => x.try_cmpeq(&lifted(&effective_rhs, y, true)?).ok(),
+        Op::Binary(BinaryOp::Add, x, y) if no_range(x) => y.try_cmpeq(&lifted(&effective_rhs, x, true)?).ok(),
+        Op::Binary(BinaryOp::Sub, x, y) if no_range(y) => x.try_cmpeq(&lifted(&effective_rhs, y, false)?).ok(),
+        Op::Binary(BinaryOp::Sub, x, y) if no_range(x) => y.try_cmpeq(&lifted(x, &effective_rhs, true)?).ok(),
         _ => None,
     }
+}
+
+/// `c - y` (`c + y` unless `negate`), the side an EQ or NE lift moves `y` onto,
+/// only where it cannot wrap in `c`'s dtype. Elsewhere the comparison stays as it
+/// is, and the gated collapse solves it in i64 ([`solve_for_range`]).
+fn lifted(c: &Arc<UOp>, y: &Arc<UOp>, negate: bool) -> Option<Arc<UOp>> {
+    (wrap_free_dtype(c, y, negate)? == c.dtype()).then(|| if negate { c.try_sub(y) } else { c.try_add(y) }.ok())?
 }
 
 /// Arithmetic lifting for Ge comparisons.
@@ -1798,17 +1831,13 @@ pub fn build_reduce_load_collapse_matcher() -> &'static TypedPatternMatcher<()> 
 fn ne_lifting_patterns() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // NE lifting: (x + y) != c → x != (c - y) when no_range(y, c)
-        Ne(Add(x, y), c) if no_range(y) && no_range(c) => {
-            let new_c = c.try_sub(y).ok()?;
-            x.try_cmpne(&new_c).ok()
-        },
+        Ne(Add(x, y), c) if no_range(y) && no_range(c) => x.try_cmpne(&lifted(c, y, true)?).ok(),
 
         // .or_casted() NE: Cast(x + y) != c → x != (c.cast(inner_dtype) - y)
         Ne(cast @ Cast { src: inner, .. }, c) if no_range(c) => {
             let Op::Binary(BinaryOp::Add, x, y) = inner.op() else { return None };
             if !no_range(y) { return None; }
-            let new_c = peel_cast(cast, inner, c)?.try_sub(y).ok()?;
-            x.try_cmpne(&new_c).ok()
+            x.try_cmpne(&lifted(&peel_cast(cast, inner, c)?, y, true)?).ok()
         },
     }
 }
