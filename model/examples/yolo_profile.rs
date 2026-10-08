@@ -142,6 +142,11 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     warmup: usize,
 
+    /// End-to-end forwards (execute, then read the predictions back) timed after
+    /// the profile passes: what a caller waits for, with no timestamp in it.
+    #[arg(long, default_value_t = 0)]
+    e2e: usize,
+
     /// Square input side in pixels.
     #[arg(long, default_value_t = 640)]
     size: usize,
@@ -380,6 +385,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let profile = profile.expect("iters is non-zero");
+    if args.e2e > 0 {
+        let mut e2e = Vec::with_capacity(args.e2e);
+        for _ in 0..args.e2e {
+            let t = Instant::now();
+            jit.execute_bound(args.batch as i64)?;
+            jit.predictions_to_vec::<f32>()?;
+            e2e.push(t.elapsed());
+        }
+        e2e.sort();
+        let (n, ms) = (e2e.len(), |d: Duration| d.as_secs_f64() * 1e3);
+        println!(
+            "e2e: min {:.3} / p10 {:.3} / median {:.3} / p90 {:.3} ms over {n}",
+            ms(e2e[0]),
+            ms(e2e[n / 10]),
+            ms(e2e[n / 2]),
+            ms(e2e[n * 9 / 10])
+        );
+    }
     let stage = profile.stage("forward").ok_or("profile produced no forward stage")?;
     if stage.kernels.is_empty() {
         return Err("profiler returned zero kernels — refusing to print empty tables".into());

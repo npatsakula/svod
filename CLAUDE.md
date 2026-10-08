@@ -111,8 +111,12 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
   left, but it was measured and lost: on gfx1201, YOLO26 f16 BEAM=4 tuned with an untimed run
   ahead of each timed one replayed +1.1% at m and −4.8% at x against the old timing, cold −0.1%
   and −3.4% (one cold tune per arm, every arm's plans replayed under one stamp). What must stay out
-  of the span is a stamp's own `acquire_mem`: it timed a full cache flush with every kernel and read
-  every profiled AMD replay 3.6-5.4% slow.
+  of the span is a stamp's own `acquire_mem`: it timed a cache flush with every kernel. Its removal
+  does not shift a profile by that flush (~0.3 µs a dispatch) but by a per-run factor on every long
+  kernel, of either sign: the same plans read YOLO26 m 4-8% *slower* under the old stamps, x ±3%
+  and l 4-10% *faster*. So an AMD profile compares only under one stamp, and `yolo_profile --e2e`
+  (no stamp in it) arbitrates: across the two stamps l/b1 read 5% slower than the reviewed tip,
+  end to end it is 4-6% faster.
 
 ## Task evaluation
 
