@@ -3552,6 +3552,7 @@ dependencies = [
  "svod-runtime",
  "svod-tensor",
  "svod-tk",
+ "svod-tk3",
  "tempfile",
  "test-case",
  "tiktoken-rs",

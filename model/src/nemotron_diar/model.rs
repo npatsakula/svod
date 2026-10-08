@@ -23,6 +23,7 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, Layer, LayerNorm, Linear, Module, get_tensor, prefixed};
+use svod_tk3::ops::{self, Act, Attn, KeyMask};
 
 use crate::audio::MelSpectrogram;
 use crate::init::{Bias, conv1d, layer_norm, linear};
@@ -39,13 +40,14 @@ const SEQ_ALIGN: usize = 64;
 /// The checkpoint's repository.
 pub const HUB_REPO: &str = "nvidia/Nemotron-3-Diarization";
 
-/// `x·wᵀ + b` through the hand GEMM where it applies ([`crate::linear`]).
-fn project(layer: &Linear, x: &Tensor) -> Result<Tensor> {
-    let y = crate::linear::linear(x, &layer.weight)?;
-    Ok(match &layer.bias {
-        Some(bias) => y.try_add(bias)?,
-        None => y,
-    })
+/// `act(x·wᵀ + b) + residual`, the bias, activation and residual add in the
+/// GEMM's epilogue where the tile kernel runs.
+fn project(layer: &Linear, x: &Tensor, act: Act, residual: Option<&Tensor>) -> Result<Tensor> {
+    Ok(ops::linear(x, &layer.weight, ops::Linear { bias: layer.bias.as_ref(), act, residual, gated: false })?)
+}
+
+fn norm(layer: &LayerNorm, x: &Tensor) -> Result<Tensor> {
+    Ok(ops::layer_norm(x, &layer.weight, layer.bias.as_ref(), layer.eps)?)
 }
 
 /// Self-attention with RoPE. The checkpoint's bias-free `q_proj`, `k_proj` and
@@ -69,11 +71,11 @@ impl Attention {
         }
     }
 
-    /// `x`: `[B, S, D]`; `rope`: `(cos, sin)` as `[1, S, 1, Dh / 2]`;
-    /// `key_lens`: `[B]` attended keys per row.
-    fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor), key_lens: &Tensor) -> Result<Tensor> {
+    /// `residual + o_proj(attention(x))`. `x`: `[B, S, D]`; `rope`: `(cos,
+    /// sin)` as `[1, S, 1, Dh / 2]`; `key_lens`: `[B]` attended keys per row.
+    fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor), key_lens: &Tensor, residual: &Tensor) -> Result<Tensor> {
         let (b, s, d) = (x.dim(0)?, x.dim(1)?, x.dim_const(2)?);
-        let qkv = crate::linear::linear(x, &self.qkv_weight)?;
+        let qkv = ops::linear(x, &self.qkv_weight, ops::Linear::default())?;
         let heads = |part: usize| {
             qkv.narrow(-1, part * d, d)?.try_reshape([
                 b.clone(),
@@ -88,8 +90,9 @@ impl Attention {
         let q = heads(0)?.apply_rotary_emb(cos, sin, false)?.contiguous();
         let k = heads(1)?.apply_rotary_emb(cos, sin, false)?.contiguous();
         let v = heads(2)?;
-        let out = crate::attention::attend(&q, &k, &v, false, Some(key_lens))?;
-        project(&self.o_proj, &out.try_reshape([b, s, SInt::Const(d)])?)
+        let opts = Attn { keys: KeyMask::Lens(key_lens), ..Attn::default() };
+        let out = ops::attention(&q, &k, &v, opts)?;
+        project(&self.o_proj, &out.try_reshape([b, s, SInt::Const(d)])?, Act::None, Some(residual))
     }
 }
 
@@ -138,17 +141,12 @@ impl EncoderLayer {
 
     /// Pre-LN: `x + attn(ln1(x))`, then `+ mlp(ln2(·))` with exact GELU.
     fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor), key_lens: &Tensor) -> Result<Tensor> {
-        // Norm outputs materialized: fused into the next GEMM's operand loads
-        // they keep it off tensor cores.
-        let normed = self.layer_norm1.forward(x)?.contiguous();
-        let attn = scoped("self_attn", || self.self_attn.forward(&normed, rope, key_lens))?;
-        let x = x.try_add(&attn)?;
-        let hidden = scoped("mlp", || -> Result<Tensor> {
-            // Materialized, so the activation stays out of the next GEMM's operand loads.
-            let h = project(&self.mlp.fc1, &self.layer_norm2.forward(&x)?.contiguous())?.gelu_exact()?.contiguous();
-            project(&self.mlp.fc2, &h)
-        })?;
-        Ok(x.try_add(&hidden)?)
+        let normed = norm(&self.layer_norm1, x)?;
+        let x = scoped("self_attn", || self.self_attn.forward(&normed, rope, key_lens, x))?;
+        scoped("mlp", || {
+            let h = project(&self.mlp.fc1, &norm(&self.layer_norm2, &x)?, Act::Gelu, None)?;
+            project(&self.mlp.fc2, &h, Act::None, Some(&x))
+        })
     }
 }
 
@@ -272,7 +270,7 @@ impl NemotronDiar {
             .try_reshape([b, SInt::Const(mel_frames / factor), SInt::Const(factor * self.config.num_mel_bins)])?
             .cast(self.config.dtype.clone())
             .contiguous();
-        Ok(scoped("embedder", || project(&self.projection, &stacked))?.cast(DType::Float32))
+        Ok(scoped("embedder", || project(&self.projection, &stacked, Act::None, None))?.cast(DType::Float32))
     }
 
     /// One step: encoder input embeddings `[B, S, hidden]` (f32), each row
@@ -287,13 +285,12 @@ impl NemotronDiar {
     pub fn classify(&self, embeds: &Tensor, seq_lens: &Tensor, key_lens: &Tensor) -> Result<Tensor> {
         let config = &self.config;
         let seq = embeds.dim_const(1)?;
-        // The encoder sees the step padded to a length the kernels tile: the
-        // flash-attention tile where that kernel runs, else `SEQ_ALIGN` (an
-        // odd length such as the 541-frame streaming step halves the
-        // scheduler's throughput). `key_lens` hides the padding, which is cut
-        // again before the head.
-        let align = crate::attention::flash_attention_tile(&embeds.device(), &config.dtype).unwrap_or(SEQ_ALIGN);
-        let padded = seq.next_multiple_of(align);
+        // The encoder sees the step padded to a length the kernels like:
+        // `SEQ_ALIGN` for the scheduler (an odd length such as the 541-frame
+        // streaming step halves its throughput), and the tile kernels'
+        // preference on top. `key_lens` hides the padding, which is cut again
+        // before the head.
+        let padded = ops::preferred_len(&embeds.device(), &config.dtype, seq.next_multiple_of(SEQ_ALIGN));
         let embeds_padded = match padded - seq {
             0 => embeds.clone(),
             pad => embeds.try_pad(&[(0, 0), (0, pad as isize), (0, 0)])?,
@@ -302,22 +299,21 @@ impl NemotronDiar {
         let table = |t: &Tensor| t.narrow(0, 0_usize, padded)?.try_unsqueeze(0);
         let rope = (table(&self.rope.0)?, table(&self.rope.1)?);
 
-        let mut x =
-            scoped("input_norm", || self.input_norm.forward(&embeds_padded.cast(config.dtype.clone())))?.contiguous();
+        let mut x = scoped("input_norm", || norm(&self.input_norm, &embeds_padded.cast(config.dtype.clone())))?;
         for (index, layer) in self.layers.iter().enumerate() {
             x = scoped_index("layers", index, || layer.forward(&x, &rope, key_lens))?;
         }
-        let x = scoped("final_norm", || self.final_norm.forward(&x.narrow(1, 0_usize, seq)?))?.contiguous();
+        let x = scoped("final_norm", || norm(&self.final_norm, &x.narrow(1, 0_usize, seq)?))?;
 
         let valid = Tensor::sequence_mask(seq_lens, seq)?.cast(config.dtype.clone()).try_unsqueeze(-1)?;
-        let hidden = scoped("proj", || project(&self.proj, &x))?.try_mul(&valid)?;
+        let hidden = scoped("proj", || project(&self.proj, &x, Act::None, None))?.try_mul(&valid)?;
         let head = config.head_hidden_size;
         let upsampled = scoped("upsampler", || self.upsampler.forward(&hidden.try_permute(&[0, 2, 1])?))?
             .try_permute(&[0, 2, 1])?
             .try_reshape([embeds.dim(0)?, SInt::Const(seq * config.subsampling_factor), SInt::Const(head)])?;
         let logits = scoped("classifier", || -> Result<Tensor> {
-            let h = project(&self.dense, &upsampled.relu()?.contiguous())?;
-            project(&self.out_proj, &h.relu()?.contiguous())
+            let h = project(&self.dense, &upsampled.relu()?.contiguous(), Act::None, None)?;
+            project(&self.out_proj, &h.relu()?.contiguous(), Act::None, None)
         })?;
         Ok(logits.cast(DType::Float32).sigmoid()?)
     }

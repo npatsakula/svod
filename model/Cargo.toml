@@ -19,6 +19,7 @@ svod-macros = { path = "../macros", version = "=0.2.0" }
 svod-runtime = { path = "../runtime", version = "=0.2.0" }
 svod-tensor = { path = "../tensor", version = "=0.2.0" }
 svod-tk = { path = "../tk", version = "=0.2.0" }
+svod-tk3 = { path = "../tk3", version = "=0.2.0" }
 ndarray.workspace = true
 prost = "0.14.3"
 nom = "7.1"
