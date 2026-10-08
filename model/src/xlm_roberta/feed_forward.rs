@@ -3,6 +3,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
+use svod_tk3::ops::{self, Act};
 
 use crate::init::{fan_in_uniform, zeros};
 
@@ -36,8 +37,9 @@ impl FeedForwardWeights {
 
     /// Forward. `x`: `(B, L, D)` → `(B, L, D)`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = x.linear().weight(&self.intermediate_weight).bias(&self.intermediate_bias).call()?;
-        let y = y.gelu_exact()?;
-        Ok(y.linear().weight(&self.output_weight).bias(&self.output_bias).call()?)
+        let opts = ops::Linear { bias: Some(&self.intermediate_bias), act: Act::Gelu, ..ops::Linear::default() };
+        let y = ops::linear(x, &self.intermediate_weight, opts)?;
+        let opts = ops::Linear { bias: Some(&self.output_bias), ..ops::Linear::default() };
+        Ok(ops::linear(&y, &self.output_weight, opts)?)
     }
 }

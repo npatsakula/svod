@@ -11,6 +11,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
+use svod_tk3::ops;
 
 use crate::init::{fan_in_uniform, zeros};
 
@@ -61,14 +62,17 @@ impl XlmRobertaAttention {
     /// `false` = padding.
     pub fn forward(&self, x: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let project = |w: &Tensor, b: &Tensor| -> Result<Tensor> {
-            Ok(x.linear().weight(w).bias(b).call()?.split_heads(self.num_heads)?)
+            Ok(ops::linear(x, w, ops::Linear { bias: Some(b), ..ops::Linear::default() })?
+                .split_heads(self.num_heads)?)
         };
         let q = project(&self.query_weight, &self.query_bias)?;
         let k = project(&self.key_weight, &self.key_bias)?;
         let v = project(&self.value_weight, &self.value_bias)?;
 
+        // SDPA, not the op layer: it takes key lengths, not a bool padding mask.
         let attn = q.scaled_dot_product_attention().key(&k).value(&v).maybe_key_padding_mask(padding_mask).call()?;
 
-        Ok(attn.merge_heads()?.linear().weight(&self.out_weight).bias(&self.out_bias).call()?)
+        let opts = ops::Linear { bias: Some(&self.out_bias), ..ops::Linear::default() };
+        Ok(ops::linear(&attn.merge_heads()?, &self.out_weight, opts)?)
     }
 }
