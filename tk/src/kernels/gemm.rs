@@ -807,10 +807,11 @@ pub const NT_32X32: GemmCfg = GemmCfg { block_m: 32, block_n: 32, acc_m: 1, k_st
 /// still). Kept for a device with more bandwidth per FLOP, which flips the sign.
 pub const NT_SPLIT_K: GemmCfg = GemmCfg { split_k: 2, l2_swizzle: false, ..NT_128X64 };
 
-/// The CUDA sm_80+ tiles, widest first. The two fine ones are never the static
-/// choice ([`GemmPolicy::cfg`] keeps its order among the tiles narrower than the
-/// widest): they are there for [`GemmPolicy::tuned`] to measure on a shape whose
-/// grid starves the device, which the convolutions at 20² and 40² do.
+/// The CUDA sm_80+ tiles, widest first. [`GemmPolicy::cfg`] keeps the two fine
+/// ones behind [`NT_64X64`], so its static choice is never [`NT_64X64_W8`] and is
+/// [`NT_32X32`] only where `M` or `N` is not a multiple of 64: they are there for
+/// [`GemmPolicy::tuned`] to measure on a shape whose grid starves the device,
+/// which the convolutions at 20² and 40² do.
 pub const CUDA_TILES: [GemmCfg; 4] = [NT_128X64, NT_64X64, NT_64X64_W8, NT_32X32];
 
 /// The RDNA (wave32 WMMA) tiles, measured on gfx1151: the CUDA tiles without the
@@ -1022,7 +1023,9 @@ pub fn select_cfg(m: usize, k: usize, n: usize) -> Option<GemmCfg> {
 ///   [`GEMM_NT_SUPPORTED_ARCHS`] with its LLVM backend, **or** no tile of its
 ///   table covers the shape ([`GemmPolicy::cfg`]): `M` and `N` must be multiples
 ///   of 64, `K` a multiple of the 32-wide strip and at least 64 (two strips, one
-///   per pipeline stage). The caller pads to 128 or substitutes `Tensor::linear`.
+///   per pipeline stage). On CUDA, [`NT_32X32`] also takes an `M` or `N` that is
+///   a multiple of 32, with a `K` that is a multiple of its 64-deep strip and at
+///   least 128. The caller pads to 128 or substitutes `Tensor::linear`.
 ///
 /// The tile is the one measured fastest on this device for the shape
 /// ([`GemmPolicy::tuned`]): the first request of a shape times every candidate

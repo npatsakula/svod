@@ -285,10 +285,10 @@ impl ArchCaps {
 
     /// Whether a GLOBAL→LOCAL tile fill can be issued as asynchronous copies
     /// retired as one group (`cp.async` on CUDA). A plan whose body is built
-    /// *entirely* out of those copies — the tap-unrolled and image-staged
-    /// convolutions — exists only where this holds; every other fill stages
-    /// through registers and runs anywhere. A plan offered without it reaches
-    /// [`crate::Group::cp_async_fill`] and panics rather than lowering.
+    /// *entirely* out of those copies — the image-staged convolution — exists
+    /// only where this holds; every other fill stages through registers and runs
+    /// anywhere. A plan offered without it reaches [`crate::Group::cp_async_fill`]
+    /// and panics rather than lowering.
     ///
     /// False on AMD, and on RDNA3/RDNA4 that is the ISA and not a gap in this
     /// tree: VMEM→LDS direct loads (`global_load … lds`, `buffer_load … lds`)
