@@ -176,26 +176,43 @@ pub fn flash_attention(spec: FaSpec) -> Program {
             let scale = k.fill::<F32>(Shape::new(bq, bkv), Const::Float(scale_log2e));
             let mut s = k.binary(s, scale, BinaryOp::Mul);
             if causal || key_lens {
-                let col = k.coord(Shape::new(bq, bkv), Axis::Col);
-                let kv_off = k.splat::<I32>(Shape::new(bq, bkv), step * bkv);
-                let col = k.binary(col, kv_off, BinaryOp::Add);
-                let mut keep = None;
+                // Only a block crossing the diagonal or the key boundary pays
+                // for the mask; the others take the plain path.
+                let block_end = step.clone() * bkv + bkv;
+                let mut partial = Sc::from(0);
                 if causal {
-                    let row = k.coord(Shape::new(bq, bkv), Axis::Row);
-                    let q_off = k.splat::<I32>(Shape::new(bq, bkv), q_off.clone());
-                    let row = k.binary(row, q_off, BinaryOp::Add);
-                    keep = Some(k.compare(col, row, BinaryOp::Le));
+                    partial = partial.or(q_off.clone().lt(block_end.clone()));
                 }
                 if key_lens {
-                    let len = k.splat::<I32>(Shape::new(bq, bkv), len.clone());
-                    let valid = k.compare(col, len, BinaryOp::Lt);
-                    keep = Some(match keep {
-                        Some(keep) => k.binary(keep, valid, BinaryOp::And),
-                        None => valid,
-                    });
+                    partial = partial.or(len.clone().lt(block_end));
                 }
-                let masked = k.fill::<F32>(Shape::new(bq, bkv), Const::Float(f64::NEG_INFINITY));
-                s = k.where_(keep.expect("a mask"), s, masked);
+                let plain = s;
+                [s] = k.select_if(
+                    partial,
+                    |k| {
+                        let col = k.coord(Shape::new(bq, bkv), Axis::Col);
+                        let kv_off = k.splat::<I32>(Shape::new(bq, bkv), step.clone() * bkv);
+                        let col = k.binary(col, kv_off, BinaryOp::Add);
+                        let mut keep = None;
+                        if causal {
+                            let row = k.coord(Shape::new(bq, bkv), Axis::Row);
+                            let q_off = k.splat::<I32>(Shape::new(bq, bkv), q_off.clone());
+                            let row = k.binary(row, q_off, BinaryOp::Add);
+                            keep = Some(k.compare(col, row, BinaryOp::Le));
+                        }
+                        if key_lens {
+                            let len = k.splat::<I32>(Shape::new(bq, bkv), len.clone());
+                            let valid = k.compare(col, len, BinaryOp::Lt);
+                            keep = Some(match keep {
+                                Some(keep) => k.binary(keep, valid, BinaryOp::And),
+                                None => valid,
+                            });
+                        }
+                        let masked = k.fill::<F32>(Shape::new(bq, bkv), Const::Float(f64::NEG_INFINITY));
+                        [k.where_(keep.expect("a mask"), plain, masked)]
+                    },
+                    |_| [plain],
+                );
             }
             let block_max = k.reduce(s, Axis::Row, ReduceOp::Max);
             let m_new = k.binary(m, block_max, BinaryOp::Max);

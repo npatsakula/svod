@@ -125,6 +125,11 @@ fn gemm_throughput_probe() {
     plans.push(("tk1 gemm_nt".to_string(), tk1.prepare().unwrap()));
 
     // Round-robin so clock drift hits every candidate alike; keep the best.
+    // The 3060 idles at a low clock: spin the first plan for half a second.
+    let warm = std::time::Instant::now();
+    while warm.elapsed().as_millis() < 500 {
+        plans[0].1.execute().unwrap();
+    }
     let mut best = vec![f64::INFINITY; plans.len()];
     for _ in 0..4 {
         for (i, (_, plan)) in plans.iter().enumerate() {
