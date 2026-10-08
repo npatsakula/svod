@@ -77,7 +77,7 @@ fn norm(
     let spec = |cfg| NormSpec { norm: kind, rows, d, batch: batch.clone(), eps, residual: residual.is_some(), cfg };
     let shape = [batch.capacity(), rows, d];
     let cfg = tuned(op, &target, x.dtype(), &shape, (&batch, kind, residual.is_some()), &cfgs, |cfg| {
-        (typed!(x.dtype(), kernel, &spec(cfg)), cfg.lowering(target.clone()))
+        vec![(typed!(x.dtype(), kernel, &spec(cfg)), cfg.lowering(target.clone()))]
     });
     let spec = spec(cfg);
     let out = output(&ext.dims, &var, x.dtype());

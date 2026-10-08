@@ -87,7 +87,7 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
     let shape = [batch.capacity(), t, heads, kv_heads, d];
     let salt = (&batch, q_norm.is_some(), k_norm.is_some(), rope_spec);
     let cfg = tuned(OP, &target, qkv.dtype(), &shape, salt, &cfgs, |cfg| {
-        (typed!(qkv.dtype(), kernel, &spec(cfg)), cfg.lowering(target.clone()))
+        vec![(typed!(qkv.dtype(), kernel, &spec(cfg)), cfg.lowering(target.clone()))]
     });
     let q = output(&[b, t, heads, d], &var, qkv.dtype());
     let k = output(&[b, t, kv_heads, d], &var, qkv.dtype());

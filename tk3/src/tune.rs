@@ -72,9 +72,13 @@ impl TuneKey {
     }
 }
 
+/// A candidate's programs, launched in order (a kernel and the merge of
+/// its partial results, say).
+pub type Candidate = Vec<(Program, Lowering)>;
+
 /// The fingerprint of built candidates: their tile programs and lowerings.
-pub fn fingerprint(programs: &[(Program, Lowering)]) -> u64 {
-    digest(&format!("{programs:?}"))
+pub fn fingerprint(candidates: &[Candidate]) -> u64 {
+    digest(&format!("{candidates:?}"))
 }
 
 /// A memo of this process's choices, backed by one file per device under `root`.
@@ -160,30 +164,39 @@ impl TuneStore {
 
     /// [`Self::select`] over the programs `build(i)` makes for candidate `i`,
     /// built only on a memo miss and timed by [`measure`] on a store miss.
-    pub fn choose(&self, key: &TuneKey, count: usize, build: impl Fn(usize) -> (Program, Lowering)) -> Option<usize> {
+    pub fn choose(&self, key: &TuneKey, count: usize, build: impl Fn(usize) -> Candidate) -> Option<usize> {
         let programs = OnceLock::new();
         let built = || programs.get_or_init(|| (0..count).map(&build).collect::<Vec<_>>());
         self.select(key, count, || fingerprint(built()), || measure(built().iter().cloned()))
     }
 
     /// The candidate [`Self::choose`] finds among `candidates`, else the first.
-    pub fn pick<C: Copy>(&self, key: &TuneKey, candidates: &[C], build: impl Fn(C) -> (Program, Lowering)) -> C {
+    pub fn pick<C: Copy>(&self, key: &TuneKey, candidates: &[C], build: impl Fn(C) -> Candidate) -> C {
         let chosen = self.choose(key, candidates.len(), |i| build(candidates[i]));
         candidates[chosen.unwrap_or(0)]
     }
 }
 
-/// Each program's best device time in ns on scratch buffers at capacity
-/// (every runtime variable bound to its maximum); `None` where it fails.
-pub fn measure(programs: impl IntoIterator<Item = (Program, Lowering)>) -> Vec<Option<u64>> {
-    let plans: Vec<Option<ExecutionPlan>> = programs.into_iter().map(|(p, l)| scratch_plan(p, &l)).collect();
-    if let Some(first) = plans.iter().flatten().next() {
+/// Each candidate's best device time in ns, its programs' summed, on scratch
+/// buffers at capacity (every runtime variable bound to its maximum); `None`
+/// where one fails.
+pub fn measure(candidates: impl IntoIterator<Item = Candidate>) -> Vec<Option<u64>> {
+    let plans: Vec<Option<Vec<ExecutionPlan>>> = candidates
+        .into_iter()
+        .map(|programs| programs.into_iter().map(|(p, l)| scratch_plan(p, &l)).collect())
+        .collect();
+    if let Some(first) = plans.iter().flatten().flatten().next() {
         spin(first, WARMUP);
     }
     let time = |i: usize| {
-        let plan = plans[i].as_ref()?;
-        spin(plan, SUSTAIN);
-        (0..RUNS).map(|_| run(plan)).min().flatten()
+        let plans = plans[i].as_ref()?;
+        plans
+            .iter()
+            .map(|plan| {
+                spin(plan, SUSTAIN);
+                (0..RUNS).map(|_| run(plan)).min().flatten()
+            })
+            .sum::<Option<Duration>>()
     };
     round_robin_min(plans.len(), ROUNDS, time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
 }

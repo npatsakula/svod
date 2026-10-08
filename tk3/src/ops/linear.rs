@@ -67,7 +67,7 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     let spec = |cfg| GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };
     let shape = [batch.capacity(), m, n, k];
     let cfg = tuned(OP, &target, x.dtype(), &shape, (&batch, epilogue), &cfgs, |cfg| {
-        (typed!(x.dtype(), gemm, &spec(cfg)), cfg.lowering(target.clone()))
+        vec![(typed!(x.dtype(), gemm, &spec(cfg)), cfg.lowering(target.clone()))]
     });
     let y = output(&[lead, &[n]].concat(), &var, x.dtype());
     let ins: Vec<&Tensor> = [Some(x), Some(w), opts.bias, opts.residual, Some(&y)].into_iter().flatten().collect();
