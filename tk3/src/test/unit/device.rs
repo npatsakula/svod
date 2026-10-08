@@ -75,3 +75,62 @@ fn gemm_matches_the_interpreter(
     }
     eprintln!("max abs diff {worst:.3e}");
 }
+
+/// Throughput probe against tk1's `gemm_nt` on the same device and shapes;
+/// prints TFLOP/s and never asserts (run with `--ignored --nocapture`).
+#[test]
+#[ignore = "perf probe: needs a CUDA device"]
+fn gemm_throughput_probe() {
+    let Some(target) = cuda_target() else {
+        eprintln!("skipped: no CUDA device");
+        return;
+    };
+    let (m, n, k) = (4096usize, 4096usize, 4096usize);
+    let mut seed = 3;
+    let a: Vec<f32> = (0..m * k).map(|_| lcg(&mut seed)).collect();
+    let b: Vec<f32> = (0..n * k).map(|_| lcg(&mut seed)).collect();
+    let a_t = Tensor::from_slice(&a).cast(DType::BFloat16);
+    let b_t = Tensor::from_slice(&b).cast(DType::BFloat16);
+    a_t.realize().unwrap();
+    b_t.realize().unwrap();
+    let flops = 2.0 * m as f64 * n as f64 * k as f64;
+    let time = |plan: &svod_runtime::ExecutionPlan, label: &str| {
+        plan.execute_profiled().unwrap();
+        let reps = 10;
+        let mut best = f64::INFINITY;
+        for _ in 0..reps {
+            for k in plan.execute_profiled().unwrap() {
+                if let (Some(s), Some(e)) = (k.gpu_start_ns, k.gpu_end_ns) {
+                    best = best.min((e - s) as f64 * 1e-9);
+                }
+            }
+        }
+        eprintln!("{label}: {:.2} ms, {:.1} TFLOP/s", best * 1e3, flops / best / 1e12);
+    };
+    // Static shared memory is capped at 48 KB on this path.
+    for (bm, bn, bk, stages, wr, wc) in [
+        (128, 128, 32, 3, 2, 4),
+        (128, 128, 16, 4, 2, 4),
+        (128, 256, 32, 2, 2, 4),
+        (64, 128, 64, 2, 2, 2),
+        (128, 128, 32, 2, 4, 2),
+    ] {
+        let mut prog = super::programs::gemm_nt(m, n, k, bm, bn, bk, stages);
+        prog.warps = wr * wc;
+        let lowering = Lowering {
+            target: target.clone(),
+            schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync },
+            grid: WarpGrid { rows: wr, cols: wc },
+            swizzle: true,
+        };
+        let c_t = Tensor::empty(&[m * n], DType::BFloat16);
+        let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
+        let plan = out.prepare().unwrap();
+        time(&plan, &format!("tk3 {bm}x{bn}x{bk} s{stages} {wr}x{wc}"));
+    }
+    let a2 = a_t.try_reshape([m, k]).unwrap();
+    let b2 = b_t.try_reshape([n, k]).unwrap();
+    let tk1 = svod_tk::gemm_nt(&a2, &b2).unwrap().expect("tk1 serves this shape");
+    let plan = tk1.prepare().unwrap();
+    time(&plan, "tk1 gemm_nt");
+}
