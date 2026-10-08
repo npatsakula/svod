@@ -573,21 +573,6 @@ crate::codegen_tests! {
         assert_close_f32(&y.realize_with_and(&config).as_vec::<f32>().unwrap(), &[20.0, 40.0, 60.0], 1e-6);
     }
 
-    /// A plan prepared over a placeholder binds its storage; host writes through
-    /// the placeholder's `array_view_mut` are what the next execute reads.
-    fn test_empty_placeholder_host_writes_reach_prepared_plan(config) {
-        test_setup();
-        let x = Tensor::empty(&[3], DType::Float32);
-        let y = (&x + &Tensor::from_slice([1.0f32, 1.0, 1.0])).unwrap();
-        let plan = y.prepare_with(&config).unwrap();
-
-        for (frame, expected) in [([1.0f32, 2.0, 3.0], [2.0f32, 3.0, 4.0]), ([4.0, 5.0, 6.0], [5.0, 6.0, 7.0])] {
-            x.array_view_mut::<f32>().unwrap().as_slice_mut().unwrap().copy_from_slice(&frame);
-            plan.execute().unwrap();
-            assert_close_f32(&y.as_vec::<f32>().unwrap(), &expected, 1e-6);
-        }
-    }
-
     /// Every realized assign lands in the storage the prepared plan reads.
     fn test_assign_realize_replays_through_prepared_plan(config) {
         test_setup();

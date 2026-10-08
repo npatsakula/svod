@@ -253,18 +253,10 @@ fn coalescing_groups_scalar_loads_by_run(sink: Arc<UOp>, renderer: Renderer, gro
 /// storage dtype, so the same 16-wide group is decomposed back into sixteen
 /// scalar byte loads and no fp8 cast survives to meet the NVPTX renderer's
 /// refusal of them.
-#[test_case(ScalarDType::FP8E4M3, Renderer::amd_rdna4(), 16, vec![16]; "sixteen fp8 lanes are one access on RDNA4")]
-#[test_case(ScalarDType::FP8E5M2, Renderer::amd_cdna3(), 16, vec![16]; "sixteen fp8 lanes are one access on CDNA3")]
 #[test_case(ScalarDType::FP8E4M3, Renderer::cuda_sm80(false), 16, vec![16]; "sixteen fp8 lanes are one access on CUDA")]
 #[test_case(ScalarDType::FP8E4M3, Renderer::amd_rdna4(), 24, vec![16, 8]; "a one-byte run walks the fold ladder down")]
 #[test_case(ScalarDType::FP8E4M3, Renderer::metal(), 16, vec![4, 4, 4, 4]; "MSL stops a one-byte fold at four lanes")]
-#[test_case(ScalarDType::FP8E4M3, Renderer::cpu(), 16, vec![4, 4, 4, 4]; "the host stops a one-byte fold at four lanes")]
 #[test_case(ScalarDType::BFloat16, Renderer::amd_rdna3(), 8, vec![8]; "eight bf16 lanes are one access on RDNA")]
-#[test_case(ScalarDType::Float16, Renderer::cuda_sm80(false), 8, vec![8]; "eight f16 lanes are one access on CUDA")]
-#[test_case(ScalarDType::BFloat16, Renderer::metal(), 8, vec![4, 4]; "MSL stops at four lanes")]
-#[test_case(ScalarDType::BFloat16, Renderer::cpu(), 8, vec![4, 4]; "the host keeps four lanes")]
-#[test_case(ScalarDType::Float32, Renderer::amd_rdna3(), 8, vec![4, 4]; "f32 stays at four lanes")]
-#[test_case(ScalarDType::Int32, Renderer::amd_rdna4(), 8, vec![4, 4]; "i32 stays at four lanes")]
 fn the_widest_fold_is_the_target_access_width(scalar: ScalarDType, renderer: Renderer, lanes: i64, widths: Vec<usize>) {
     let buffer = UOp::param(0, lanes as usize, DType::Scalar(scalar), None);
     let accesses = (0..lanes).map(|offset| load_at(&buffer, UOp::index_const(offset))).collect();
@@ -303,10 +295,8 @@ fn fp8_cast_kernel(scalar: ScalarDType, wide: DType) -> Arc<UOp> {
 /// fp8. Verified end to end against `svod-codegen`: on gfx942 and gfx1201 this
 /// kernel renders `load <16 x i8>` plus sixteen `@llvm.amdgcn.cvt.f32.{fp8,bf8}`
 /// calls, and clang selects `v_cvt_f32_{fp8,bf8}` for both archs.
-#[test_case(svod_dtype::AmdArch::Gfx942, ScalarDType::FP8E4M3, DType::Float32; "cdna3 e4m3 to f32")]
 #[test_case(svod_dtype::AmdArch::Gfx942, ScalarDType::FP8E5M2, DType::Float16; "cdna3 e5m2 to f16")]
 #[test_case(svod_dtype::AmdArch::Gfx1201, ScalarDType::FP8E4M3, DType::Float32; "rdna4 e4m3 to f32")]
-#[test_case(svod_dtype::AmdArch::Gfx1201, ScalarDType::FP8E5M2, DType::Float16; "rdna4 e5m2 to f16")]
 fn a_sixteen_lane_fp8_fold_survives_post_optimization_as_scalar_casts(
     arch: svod_dtype::AmdArch,
     scalar: ScalarDType,

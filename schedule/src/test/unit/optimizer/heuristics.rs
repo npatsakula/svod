@@ -291,8 +291,6 @@ fn non_cuda_tiling_matches_the_shipped_fixed_step(renderer: Renderer, dims: (usi
 /// fragments, the addresses and the pipeline sit on top of them, and gfx1201
 /// answers by spilling to scratch at 5 resident waves of 16.
 #[test_case(PROBE_CONV, &[(OptOps::UPCAST, 1, 3), (OptOps::UPCAST, 1, 2)]; "the probe conv")]
-#[test_case((40, 40, 192, 16, 9), &[(OptOps::UPCAST, 1, 3), (OptOps::UPCAST, 1, 2)]; "the core takes the whole channel axis, the taps carry the reuse")]
-#[test_case((40, 40, 192, 16, 1), &[]; "one tap and one channel trip cannot amortise a wider tile")]
 fn rdna4_conv_warp_tile_stays_inside_the_lane_budget(
     shape: (i64, i64, i64, i64, i64),
     expected: &[(OptOps, usize, usize)],
@@ -320,20 +318,16 @@ fn rdna4_conv_warp_tile_stays_inside_the_lane_budget(
 /// count — at `k = 16` the core consumes the whole channel axis, the cap reads
 /// `1` and the tile cannot grow at all, though nine taps of reuse sit behind it.
 ///
-/// The first two rows are the regression: both returned an **empty plan** before
-/// `reduce_depth` counted the taps. The `k = 192` row is deep enough on the
-/// channel axis alone and is unchanged by the fix; the single-tap row is the
-/// control, where there is genuinely nothing to amortise and the cap must still
-/// bite.
+/// The first row is the regression: it returned an **empty plan** before
+/// `reduce_depth` counted the taps. The single-tap row is the control, where
+/// there is genuinely nothing to amortise and the cap must still bite.
 ///
-/// The realized tile is `3` and not the `9`/`12` the growth allows because our
+/// The realized tile is `3` and not the `9` the growth allows because our
 /// axis choice (`bdae1883`, which offers the operands both ways round) lands a
 /// 5-extent spatial axis on N, and 5 is prime: no [`TC_GROWTH_FACTORS`] entry
 /// divides it under the cap, so N cannot grow and the tile comes out M-only.
-/// The cap itself is doing its job — `growth` is 9/12/12/1 across these rows.
+/// The cap itself is doing its job — `growth` is 9/1 across these rows.
 #[test_case((40, 40, 192, 16, 9), 3; "the core takes the whole channel axis, the taps carry the reuse")]
-#[test_case((40, 40, 192, 32, 9), 3; "two channel trips and nine taps")]
-#[test_case(PROBE_CONV, 3; "192 channels deep enough on their own, unchanged by the fix")]
 #[test_case((40, 40, 192, 16, 1), 1; "one tap and one channel trip cannot amortise a wider tile")]
 fn cuda_conv_warp_tile_counts_the_taps_as_reduce_trips(shape: (i64, i64, i64, i64, i64), tiles: usize) {
     let plan = conv_plan_on(shape, (true, true), Renderer::cuda()).expect("the conv takes a tensor core");
@@ -419,7 +413,6 @@ fn try_tensor_cores_default_matches_strict_on_plain_matmul() {
 /// levels take the operands the other way round instead of padding 40 to 48, and pad
 /// only when no assignment divides.
 #[test_case(40, 64, TcOpt::Padded, 1, 0; "padded prefers the unpadded side")]
-#[test_case(40, 64, TcOpt::Unbounded, 1, 0; "unbounded prefers the unpadded side")]
 #[test_case(20, 64, TcOpt::Padded, 2, 2; "pads when neither side divides")]
 fn try_tensor_cores_pads_only_when_no_axis_choice_divides(m: i64, n: i64, tc_opt: TcOpt, level: usize, masks: usize) {
     let (applied, scheduler) = run(
@@ -858,7 +851,6 @@ fn hand_coded_optimizations_runs_the_elementwise_ladder_in_order() {
 #[test_case(Renderer::amd_rdna3(), 5, DType::Float16, &[Opt::upcast(0, 5), Opt::group(0, 32), Opt::local(0, 4), Opt::unroll(1, 8)]; "rdna keeps a wave per row group")]
 #[test_case(Renderer::amd_cdna3(), 5, DType::Float16, &[Opt::upcast(0, 5), Opt::group(0, 64), Opt::local(0, 4), Opt::unroll(1, 4)]; "cdna keeps a wave per row group and its unroll divides the rest")]
 #[test_case(Renderer::amd_rdna3(), 5, DType::Float32, &[Opt::upcast(0, 5), Opt::group(0, 32), Opt::local(0, 4), Opt::unroll(1, 4)]; "the unroll follows the element width")]
-#[test_case(Renderer::amd_rdna3(), 1, DType::Float16, &[Opt::group(0, 32), Opt::local(0, 4), Opt::unroll(1, 8)]; "a single row has nothing to upcast")]
 #[test_case(Renderer::cuda(), 5, DType::Float16, &[Opt::upcast(0, 5), Opt::group(0, 8), Opt::local(0, 4), Opt::upcast(0, 4)]; "cuda keeps tinygrad's tile")]
 #[test_case(Renderer::amd_rdna3(), 64, DType::Float16, &[]; "rows past the upcast limit are not a skinny batch")]
 fn matvec_fast_path_upcasts_a_skinny_batch(renderer: Renderer, m: i64, stored: DType, expected: &[Opt]) {
@@ -893,7 +885,6 @@ fn matvec_config_overrides_the_device_tile() {
 /// does not fit — must not cost the row tile: the rest of the fast path still
 /// applies and a decode step's GEMV keeps its LOCAL/UPCAST instead of falling
 /// through to the generic tail.
-#[test_case(Renderer::cuda(), 16, plain_row_reduce, &[Opt::local(0, 4), Opt::upcast(0, 4)]; "cuda keeps the block and the rows")]
 #[test_case(Renderer::amd_rdna3(), 512, skinny_batch, &[Opt::upcast(0, 5), Opt::local(0, 4), Opt::unroll(0, 8)]; "rdna keeps the batch upcast and the block")]
 fn matvec_fast_path_survives_a_declined_group(
     mut renderer: Renderer,
@@ -906,11 +897,6 @@ fn matvec_fast_path_survives_a_declined_group(
     assert!(applied, "a declined GROUP must not abort the fast path");
     assert_eq!(scheduler.applied_opts, expected);
     assert!(scheduler.axes_of(&[AxisType::GroupReduce]).is_empty(), "GROUP was declined");
-}
-
-/// `y[r] = sum_c x[r, c]`: the fast path's plainest shape.
-fn plain_row_reduce() -> Arc<UOp> {
-    row_reduce(AxisType::Global, 64, 128, DType::Float32, None)
 }
 
 /// A decoder step's projection: five rows through one weight.

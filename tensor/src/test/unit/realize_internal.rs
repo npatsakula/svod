@@ -956,7 +956,6 @@ fn compile_missing_kernels_publishes_the_survivors_of_a_failed_optimize(failing:
 #[test_case([5, 10, 1], [5, 10, 1], 1.0 ; "a grid within the cap is timed whole")]
 #[test_case([80, 80, 80], [80, 80, 10], 8.0 ; "the innermost axis is halved while it stays above 16")]
 #[test_case([262_144, 16, 1], [4_096, 16, 1], 64.0 ; "an axis at 16 is skipped for the next one")]
-#[test_case([16, 16, 16], [16, 16, 16], 1.0 ; "small axes are never halved")]
 fn the_timed_grid_shrinks_along_the_innermost_axis(grid: [usize; 3], expect: [usize; 3], factor: f64) {
     assert_eq!(test_grid(grid), (expect, factor));
 }

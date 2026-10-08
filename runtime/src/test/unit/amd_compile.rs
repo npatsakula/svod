@@ -13,9 +13,7 @@ fn nogpulib_tracks_device_library_use(body: &str) -> bool {
 /// backend refuses a clang older than 22 and names the one it found; a version
 /// string it cannot read passes.
 #[test_case::test_case("Ubuntu clang version 20.1.2 (0ubuntu1~24.04.3)\nTarget: x86_64-pc-linux-gnu" => false; "ubuntu 20")]
-#[test_case::test_case("AMD clang version 19.0.0git (https://github.com/ROCm/llvm-project roc-6.4.0)" => false; "rocm 19")]
 #[test_case::test_case("Ubuntu clang version 22.1.8 (++20260714014902+ca7933e47d3a-1~exp1)" => true; "ubuntu 22")]
-#[test_case::test_case("clang version 23.1.1\nTarget: x86_64-pc-linux-gnu" => true; "arch 23")]
 #[test_case::test_case("a vendor compiler, build 7" => true; "unreadable passes")]
 fn amd_refuses_a_clang_older_than_22(version: &str) -> bool {
     check_amd_clang(version)

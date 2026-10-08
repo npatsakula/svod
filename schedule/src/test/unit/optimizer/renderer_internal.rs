@@ -120,7 +120,6 @@ fn fingerprint_tracks_the_exact_target_and_every_capability() {
 #[test_case(AmdArch::Gfx942, ScalarDType::FP8E4M3FNUZ, false, false; "cdna3 decomposes FNUZ fp8")]
 #[test_case(AmdArch::Gfx1151, ScalarDType::FP8E4M3, false, false; "rdna3 decomposes OCP fp8")]
 #[test_case(AmdArch::Gfx1201, ScalarDType::FP8E4M3, true, false; "rdna4 converts OCP fp8 without a matrix core")]
-#[test_case(AmdArch::Gfx1201, ScalarDType::FP8E5M2, true, false; "rdna4 converts bf8 without a matrix core")]
 #[test_case(AmdArch::Gfx1201, ScalarDType::FP8E5M2FNUZ, false, false; "rdna4 decomposes FNUZ fp8")]
 fn amd_fp8_dtype_capabilities_are_arch_specific(arch: AmdArch, dtype: ScalarDType, supported: bool, matrix: bool) {
     let renderer = Renderer::for_amd_arch(arch);

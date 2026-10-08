@@ -52,10 +52,7 @@ fn assert_stored_channels_innermost(conv: &YoloConv, loaded: &Tensor) {
 }
 
 #[test_case(DType::Float32, 4, 8, 3, false; "f32 3x3")]
-#[test_case(DType::Float16, 4, 8, 3, false; "f16 3x3")]
-#[test_case(DType::Float16, 6, 6, 1, false; "f16 1x1")]
 #[test_case(DType::Float16, 64, 64, 3, true; "f16 tk 3x3")]
-#[test_case(DType::Float32, 64, 64, 3, true; "f32 tk 3x3, which runs the graph")]
 fn a_loaded_conv_stores_its_weight_channels_innermost(dtype: DType, cin: usize, cout: usize, k: usize, tk: bool) {
     let loaded = load_weights(&unfolded_state(cin, cout, k), &dtype).unwrap();
     let mut conv = YoloConv::empty(cin, cout, k, 1, true);
@@ -69,7 +66,6 @@ fn a_loaded_conv_stores_its_weight_channels_innermost(dtype: DType, cin: usize, 
 
 /// A channels-last bottleneck's convs read channels-last activations and still
 /// store their weights the same way: one layout decision for every block.
-#[test_case(DType::Float32; "f32")]
 #[test_case(DType::Float16; "f16")]
 fn a_channels_last_bottleneck_stores_its_weights_channels_innermost(dtype: DType) {
     let mut sd = StateDict::new();

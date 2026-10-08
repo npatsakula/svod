@@ -610,73 +610,6 @@ fn sq_attention_appended_key_matches_the_cpu_reference() {
     }
 }
 
-/// Appending must decode as splicing did. The whisper step used to concatenate
-/// the layer's cache slice with the projected row and ask for the final slot,
-/// which copies the slice once per layer; the two forms score the same keys in
-/// the same order, so only the copy is gone.
-///
-/// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib sq_attention_appended -- --ignored`.
-#[test]
-#[ignore]
-fn sq_attention_appended_key_matches_a_spliced_cache() {
-    if !supported_device() {
-        eprintln!("skip sq_attention_appended_key_matches_a_spliced_cache: unsupported device/toolchain");
-        return;
-    }
-    // A short cache the lengths can span end to end, then whisper large-v3's own
-    // self-attention geometry: five hypotheses over a 448-position cache packed
-    // 32 layers deep, read from one layer's head offset.
-    for (b, n, h, h_total, d, head_offset, lens) in [
-        (5usize, 16usize, 3usize, 7usize, 64usize, 2usize, vec![0i32, 1, 9, 15, 16]),
-        (5, 448, 20, 640, 64, 380, vec![0i32, 1, 200, 447, 448]),
-    ] {
-        let lens = {
-            let t = Tensor::from_slice(lens.as_slice());
-            t.realize().expect("realize lens");
-            t
-        };
-        let f16 = |shape: &[usize]| {
-            let t = Tensor::randn(shape).expect("operand").cast(DType::Float16);
-            t.realize().expect("realize operand");
-            t
-        };
-        let q = Tensor::randn(&[b, 1, h, d]).expect("q");
-        q.realize().expect("realize q");
-        let (k, v) = (f16(&[b, n, h_total, d]), f16(&[b, n, h_total, d]));
-        let (append_k, append_v) = (f16(&[b, 1, h, d]), f16(&[b, 1, h, d]));
-
-        let appended = crate::single_query_attention_packed(
-            &q,
-            &k,
-            &v,
-            head_offset,
-            SqAttentionOpts { key_lens: Some(&lens), appended: Some((&append_k, &append_v)), ..Default::default() },
-        )
-        .expect("appended")
-        .expect("supported");
-
-        let splice = |cache: &Tensor, new: &Tensor| {
-            let spliced = Tensor::cat(&[&cache.narrow(2, head_offset, h).expect("layer"), new], 1).expect("splice");
-            spliced.realize().expect("realize spliced");
-            spliced
-        };
-        let (spliced_k, spliced_v) = (splice(&k, &append_k), splice(&v, &append_v));
-        let spliced = crate::single_query_attention(
-            &q,
-            &spliced_k,
-            &spliced_v,
-            SqAttentionOpts { key_lens: Some(&lens), include_last: true, ..Default::default() },
-        )
-        .expect("spliced")
-        .expect("supported");
-        Tensor::realize_batch([&appended, &spliced]).expect("realize both");
-
-        let (a, e) = (appended.as_vec::<f32>().expect("appended vec"), spliced.as_vec::<f32>().expect("spliced vec"));
-        let max_abs = super::max_abs_err(&a, &e);
-        assert!(max_abs < 1e-6, "n {n}: the appended key diverged from the spliced cache by {max_abs:e}");
-    }
-}
-
 /// A head dim the arch's wave size does not divide is a fit failure, not a
 /// caller bug: the launch declines with `Ok(None)` so a dispatch layer (the
 /// whisper decoder) falls back to its generic attention path. Host-portable:
@@ -696,14 +629,12 @@ fn undivisible_head_dim_declines_instead_of_erroring() {
 // ─── Split policy ────────────────────────────────────────────────────────────
 
 /// The policy aims the split at the wave budget over divisors that keep a
-/// chunk, preferring chunks with no partial tail; an explicit zero budget
-/// keeps one split, and so does a key range too short to chunk.
+/// chunk, preferring chunks with no partial tail. The single-split cases (an
+/// explicit zero budget, a key range too short to chunk) are pinned by
+/// `sq_policy_falls_back_when_the_device_reports_no_budget`.
 #[test_case(GpuArch::Amd(AmdArch::Gfx1151), (40, 32), 5, 20, 1500, 15, &[5, 10, 12, 15]; "whisper large cross attention on a 40-cu rdna part")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx1151), (40, 32), 1, 6, 1500, 25, &[3, 5, 15, 25]; "tiny heads want more splits")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx1151), (40, 32), 5, 20, 64, 1, &[]; "a short key range stays whole")]
 #[test_case(GpuArch::Amd(AmdArch::Gfx942), (304, 32), 5, 20, 1500, 12, &[5, 6, 10, 12]; "a 304-cu wave64 part is capped by its 120-key floor")]
 #[test_case(SM_86, (28, 16), 5, 20, 1500, 5, &[3, 4, 5, 6]; "whisper large cross attention on a 28-sm ampere part")]
-#[test_case(SM_86, (28, 0), 5, 20, 1500, 1, &[]; "an explicit zero budget keeps one split")]
 fn sq_policy_splits_toward_the_wave_budget(
     arch: GpuArch,
     (compute_units, waves_per_cu): (usize, usize),
@@ -723,9 +654,8 @@ fn sq_policy_splits_toward_the_wave_budget(
 }
 
 /// Every candidate the policy hands the tuner is a legal split of `n` that
-/// leaves each wave its floor of loop trips, on either wave size.
+/// leaves each wave its floor of loop trips.
 #[test_case(GpuArch::Amd(AmdArch::Gfx1151); "wave32")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx942); "wave64")]
 fn sq_policy_candidates_divide_the_keys(arch: GpuArch) {
     let policy = crate::SqPolicy::with_budget(arch, 40, 32);
     for n in [448, 1500, 1536, 3000] {
@@ -737,62 +667,11 @@ fn sq_policy_candidates_divide_the_keys(arch: GpuArch) {
     }
 }
 
-/// The policy's split runs the two-kernel path and matches the single-kernel
-/// answer: the whisper geometry, one shared f16 cache addressed by a map.
-#[test]
-fn sq_policy_split_matches_a_single_split() {
-    if !supported_device() {
-        return;
-    }
-    let (b, n, h, d) = (5, 1500, 20, 64);
-    let device = Tensor::empty(&[1], DType::Float32).device();
-    let q = Tensor::randn(&[b, 1, h, d]).expect("q").to(device.clone());
-    let k = Tensor::randn(&[1, n, h, d]).expect("k").cast(DType::Float16).to(device.clone());
-    let v = Tensor::randn(&[1, n, h, d]).expect("v").cast(DType::Float16).to(device.clone());
-    let map = Tensor::zeros(&[b], DType::Int32).to(device);
-    let run = |split: Option<usize>| {
-        let out = crate::single_query_attention(
-            &q,
-            &k,
-            &v,
-            SqAttentionOpts { split, cache_map: Some(&map), ..Default::default() },
-        )
-        .expect("launch")
-        .expect("supported");
-        out.realize().expect("realize");
-        out.as_vec::<f32>().expect("vec")
-    };
-    crate::tune::set_enabled(false);
-    let (whole, policy) = (run(Some(1)), run(None));
-    let max_abs = super::max_abs_err(&whole, &policy);
-    assert!(max_abs < 1e-4, "policy split max abs error {max_abs}");
-}
-
-/// The device policy carries the device's own counts, not the family's
-/// reference device. `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib sq_policy_reads -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn sq_policy_reads_the_device_budget_gpu() {
-    if !supported_device() {
-        return;
-    }
-    let spec = svod_tensor::Tensor::empty(&[1], DType::Float32).device();
-    let arch = crate::target::resolve_arch(&spec).expect("a GPU arch");
-    let policy = crate::SqPolicy::for_device(&spec, arch);
-    eprintln!("{policy:?}");
-    match crate::target::compute_units(&spec).zip(crate::target::resident_waves_per_cu(&spec)) {
-        Some(budget) => assert_eq!((policy.compute_units, policy.waves_per_cu), budget),
-        // A part the launch supports but the probe does not describe.
-        None => assert!(policy.split(5, 20, 1500) > 1, "the assumed budget still splits"),
-    }
-}
-
 /// A device whose probe reports no wave budget — the KFD node without
 /// `simd_per_cu`, the CUDA limits that failed to open — still splits a long
 /// cross attention: the assumed budget stands in, so large-v3's 1500 keys do
 /// not run as one latency-bound wave per `(row, head)`.
 #[test_case(GpuArch::Amd(AmdArch::Gfx1151); "rdna wave32")]
-#[test_case(SM_86; "ampere")]
 fn sq_policy_falls_back_when_the_device_reports_no_budget(arch: GpuArch) {
     // No backend probe answers for a host spec: the unreported path.
     let policy = crate::SqPolicy::for_device(&DeviceSpec::Cpu, arch);

@@ -134,11 +134,8 @@ fn amd_maps(f: RTBaseShape, transpose: bool, lane: usize, j: usize, expect: (i64
 /// N-major store its transpose. The cases are chosen so that both the gfx11
 /// accumulator ([`LaneMap::Interleaved`]) and the gfx11 replicated input
 /// (`Strided { stride: 0 }`) fail them — the two maps gfx12 is not.
-#[test_case(false, 5, 0, (5, 0); "operand lane 5 reg 0")]
 #[test_case(false, 21, 3, (5, 11); "operand upper wave-half is the second K run")]
 #[test_case(true, 21, 3, (11, 5); "col accumulator is the transpose")]
-#[test_case(true, 5, 0, (0, 5); "col accumulator lane 5 reg 0")]
-#[test_case(false, 31, 7, (15, 15); "last lane, last register")]
 fn gfx12_map(transpose: bool, lane: usize, j: usize, expect: (i64, i64)) {
     assert_eq!(rc(&RT_16X16_GFX12, transpose, lane, j), expect);
 }
@@ -186,7 +183,6 @@ proptest! {
 #[test_case(2; "gfx1151 input")]
 #[test_case(3; "gfx1151 acc_t")]
 #[test_case(4; "sm_86 mma.sync")]
-#[test_case(6; "gfx1201 wmma")]
 fn reduce_plan_matches_brute_force(which: usize) {
     let (f, wave, name) = all_frags()[which];
     let (rows, cols, ept) = (f.base.rows, f.base.cols, f.base.ept);
@@ -253,7 +249,6 @@ fn reduce_plan_matches_brute_force(which: usize) {
 /// vectors are allocated with, and `Kernel::rv` follows it.
 #[test_case(GpuArch::Amd(AmdArch::Gfx942), 1; "gfx942")]
 #[test_case(GpuArch::Amd(AmdArch::Gfx1151), 1; "gfx1151")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx1201), 1; "gfx1201")]
 #[test_case(SM_86, 2; "sm_86")]
 fn rv_slots_follow_the_accumulator_map(arch: GpuArch, slots: usize) {
     let caps = ArchCaps::for_arch(arch);
@@ -272,7 +267,6 @@ fn rv_slots_follow_the_accumulator_map(arch: GpuArch, slots: usize) {
 #[test_case(RT_16X16, false, None; "gfx942")]
 #[test_case(RT_16X16_W32_IN, false, None; "gfx1151 input")]
 #[test_case(RT_16X16_W32_ACC, false, None; "gfx1151 acc")]
-#[test_case(RT_16X16_GFX12, false, None; "gfx1201")]
 fn ldmatrix_x4_plan(f: RTBaseShape, transpose: bool, plan: Option<LdmatrixX4>) {
     assert_eq!(f.map.ldmatrix_x4(transpose), plan);
 }

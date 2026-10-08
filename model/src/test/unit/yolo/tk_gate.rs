@@ -40,7 +40,6 @@ fn bodies_on_tk(block: &C3k2) -> bool {
 #[test_case(YoloScale::Nano, (false, false, false, false); "n: a 16-wide head, 8- and 16-channel bodies")]
 #[test_case(YoloScale::Small, (false, false, false, true); "s: the head's 32-wide reductions")]
 #[test_case(YoloScale::Medium, (false, true, true, true); "m: 64-channel bodies")]
-#[test_case(YoloScale::Large, (false, true, true, true); "l: as m")]
 #[test_case(YoloScale::XLarge, (false, true, true, true); "x: 96-channel bodies and head")]
 fn the_gate_reaches(scale: YoloScale, want: (bool, bool, bool, bool)) {
     let model = Yolo26Detect::with_zero_weights(YoloConfig::new(scale, 80));

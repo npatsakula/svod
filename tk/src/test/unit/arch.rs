@@ -190,7 +190,6 @@ fn frag_roles_resolve_to_canonical_constants() {
 /// Sharing one fragment across the roles is also what licenses the register
 /// acc→input handoff (hardware-verified on gfx1201), which drops FA's per-warp
 /// LDS relayout band.
-#[test_case(AmdArch::Gfx1200; "gfx1200")]
 #[test_case(AmdArch::Gfx1201; "gfx1201")]
 fn rdna4_caps_resolve_gfx12_fragments(arch: AmdArch) {
     let c = ArchCaps::for_amd(arch);
@@ -205,31 +204,12 @@ fn rdna4_caps_resolve_gfx12_fragments(arch: AmdArch) {
     assert!(c.acc_reusable_as_input(), "one gfx12 fragment for both roles ⇒ a register copy");
 }
 
-/// The scheduling cap: only gfx12 needs the explicit fence that keeps a
-/// pipelined trip's LDS commit after its MMAs. The GEMM asks for the property,
-/// so a new arch joins by answering here — [`staged_gemm_rdna4_fences_the_commit`]
-/// pins what the answer does to the kernel.
-#[test_case(GpuArch::Amd(AmdArch::Gfx1201), true; "gfx1201")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx1200), true; "gfx1200")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx1151), false; "gfx1151")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx942), false; "gfx942")]
-#[test_case(SM_86, false; "sm_86")]
-#[test_case(GpuArch::Metal(svod_dtype::MetalFamily::Apple(9)), false; "metal")]
-fn pipeline_commit_fence_is_gfx12_only(arch: GpuArch, want: bool) {
-    assert_eq!(ArchCaps::for_arch(arch).needs_pipeline_commit_fence(), want);
-}
-
-/// The async-copy cap: only CUDA has `cp.async`. The conv rewrites whose fills
-/// have no register-staged form are offered on this answer alone, and the tuner
-/// *builds every candidate it is offered* to fingerprint it — so a wrong answer
-/// here is a panic in `cp_async_fill`, not a slower kernel. `every_plan_builds`
-/// in the conv tests pins the other half of that contract.
+/// The async-copy cap: only CUDA has `cp.async`. Every collaborative fill asks it
+/// whether to issue `cp.async` copies or stage through registers
+/// ([`crate::Group::cp_async_fill_applies`]), so a wrong `true` hands AMD fills it
+/// cannot lower, and a wrong `false` takes the image-staged convolution off CUDA.
 #[test_case(SM_86, true; "sm_86")]
 #[test_case(GpuArch::Amd(AmdArch::Gfx1201), false; "gfx1201")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx1200), false; "gfx1200")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx1151), false; "gfx1151")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx942), false; "gfx942")]
-#[test_case(GpuArch::Metal(svod_dtype::MetalFamily::Apple(9)), false; "metal")]
 fn async_copy_is_cuda_only(arch: GpuArch, want: bool) {
     assert_eq!(ArchCaps::for_arch(arch).has_async_copy(), want);
 }

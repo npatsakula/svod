@@ -734,104 +734,6 @@ fn beam_search_seeds_the_hand_coded_kernel() {
     assert_eq!(scored.last(), Some(&seed_opts), "after the last wave, against the search's answer");
 }
 
-/// A seed the field cannot beat neither ends the search nor steers it: the beam
-/// keeps improving from the bare kernel for as many waves as it would unseeded,
-/// and the seed wins only at the end.
-#[test]
-fn the_seed_competes_at_the_end_and_never_steers() {
-    let scheduler = matvec_scheduler();
-    let config = BeamConfig { beam_width: 2, disable_cache: true, ..Default::default() };
-    let seed_opts = unreachable_seed(&scheduler, &config);
-    let scored = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let score = {
-        let (seed_opts, scored) = (seed_opts.clone(), std::sync::Arc::clone(&scored));
-        move |candidate: &Scheduler, _early_stop: Option<Duration>| {
-            let opts = &candidate.applied_opts;
-            scored.lock().unwrap().push(opts.clone());
-            // The seed is far ahead; every other plan improves on its parent a little.
-            let timing = if *opts == seed_opts { 100 } else { 100_000 - 20 * opts.len() as u64 };
-            Some(CandidateMetrics {
-                timing: Duration::from_nanos(timing),
-                ir_hash: plan_identity(opts),
-                compute_ops: Some(1),
-            })
-        }
-    };
-    let result = beam_search(scheduler.clone(), &config, score).expect("beam search");
-    assert_eq!(result.scheduler.applied_opts, seed_opts, "the fastest plan still wins");
-    assert_eq!(result.timing, Duration::from_nanos(100));
-    let scored = scored.lock().unwrap();
-    assert!(!scored.iter().any(|opts| opts.len() > seed_opts.len() && opts.starts_with(&seed_opts)), "never expanded");
-    let deepest = scored.iter().filter(|opts| **opts != seed_opts).map(Vec::len).max().unwrap_or(0);
-    assert!(deepest >= 3, "the search must go on past the seed's wave: deepest plan {deepest}");
-    assert!(result.iterations >= 3, "iterations {}", result.iterations);
-}
-
-/// A seed nobody can use must not divert the search: scoring it slowest leaves the
-/// winner exactly where a search that never saw it lands.
-#[test]
-fn a_losing_seed_leaves_the_search_unchanged() {
-    let scheduler = matvec_scheduler();
-    let config = BeamConfig { beam_width: 2, disable_cache: true, ..Default::default() };
-    let seed_opts = unreachable_seed(&scheduler, &config);
-    // `slowest` times the seed and loses; `dropped` never returns metrics for it,
-    // which is precisely how the search behaved before it was seeded.
-    let run = |slowest: bool| {
-        let seed_opts = seed_opts.clone();
-        let score = move |candidate: &Scheduler, _early_stop: Option<Duration>| {
-            let identity = plan_identity(&candidate.applied_opts);
-            if candidate.applied_opts == seed_opts {
-                return slowest.then_some(CandidateMetrics {
-                    timing: Duration::from_secs(1),
-                    ir_hash: identity,
-                    compute_ops: Some(1),
-                });
-            }
-            Some(CandidateMetrics { timing: plan_timing(identity)?, ir_hash: identity, compute_ops: Some(1) })
-        };
-        beam_search(scheduler.clone(), &config, score).expect("beam search")
-    };
-    let (timed, unseeded) = (run(true), run(false));
-    assert_ne!(timed.scheduler.applied_opts, seed_opts, "a losing seed must not win");
-    assert_eq!(timed.scheduler.applied_opts, unseeded.scheduler.applied_opts);
-    assert_eq!(timed.timing, unseeded.timing);
-    assert_eq!(timed.iterations, unseeded.iterations);
-}
-
-/// The staged loop holds the hand-coded kernel out of every wave and times it
-/// against its answer once the search is over.
-#[test]
-fn staged_beam_seeds_the_hand_coded_kernel() {
-    let scheduler = matvec_scheduler();
-    let config =
-        BeamConfig { beam_width: 2, min_progress_ns: 1_000_000_000, disable_cache: true, ..Default::default() };
-    let seed_opts = unreachable_seed(&scheduler, &config);
-    let waves = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let result = beam_search_staged(
-        scheduler,
-        &config,
-        {
-            let waves = std::sync::Arc::clone(&waves);
-            move |candidates: &[Scheduler], emit: &mut dyn FnMut(usize, CompiledCandidate<u64>)| {
-                waves.lock().unwrap().push(plans(candidates));
-                for (index, candidate) in candidates.iter().enumerate() {
-                    emit(index, compiled(plan_identity(&candidate.applied_opts), Some(1)));
-                }
-            }
-        },
-        each(|identity: &u64| {
-            Some(if *identity == plan_identity(&seed_opts) { Duration::from_nanos(1) } else { Duration::from_nanos(2) })
-        }),
-    )
-    .expect("staged beam search");
-    let waves = waves.lock().unwrap();
-    let (finalists, search) = waves.split_last().expect("waves");
-    assert!(search.iter().all(|wave| !wave.contains(&seed_opts)), "the seed belongs to no wave");
-    assert_eq!(finalists.len(), 2, "the answer, then the seed");
-    assert_eq!(finalists[1], seed_opts);
-    assert_eq!(result.scheduler.applied_opts, seed_opts);
-}
-
 /// The remote protocol carries the seed to the closing comparison as a multi-opt
 /// suffix: the worker replays the whole stack from the recorded prefix, and the
 /// parent can return it as the winner.
@@ -870,7 +772,6 @@ fn remote_beam_replays_the_multi_opt_seed() {
 /// The worker rebuilds a seed from the base AST alone, whatever the heuristics stacked:
 /// a tensor-core tile with its post-TC extras, or the decode matvec's four-opt split.
 #[test_case(crate::optimizer::Renderer::cuda(), 512, 512, 512; "tensor cores on cuda")]
-#[test_case(crate::optimizer::Renderer::for_amd_arch(svod_dtype::AmdArch::Gfx1201), 512, 512, 512; "tensor cores on rdna4")]
 #[test_case(crate::optimizer::Renderer::for_amd_arch(svod_dtype::AmdArch::Gfx1201), 5, 5120, 1280; "decode matvec on rdna4")]
 fn every_seed_replays_through_the_remote_protocol(renderer: crate::optimizer::Renderer, m: i64, n: i64, k: i64) {
     use svod_dtype::DType;

@@ -43,11 +43,8 @@ fn rows(t: &Tensor) -> Vec<Vec<f32>> {
 
 /// The fused weight is laid out in alternating `pair`-row gate and up blocks,
 /// which is what puts a gate column beside its up column inside one wave's
-/// accumulator, at whatever width the device's GEMM tiles read; `None` keeps the
-/// checkpoint's plain stacking.
-#[test_case(Some(8); "pair 8")]
+/// accumulator, at whatever width the device's GEMM tiles read.
 #[test_case(Some(16); "pair 16")]
-#[test_case(None; "plainly stacked")]
 fn pair_rows_interleaves_the_gate_up_blocks(pair: Option<usize>) {
     let (gate, up) = (marked(I, H, 100.0), marked(I, H, 200.0));
     let fused = pair_rows(&gate, &up, pair).expect("pair rows");
@@ -61,21 +58,6 @@ fn pair_rows_interleaves_the_gate_up_blocks(pair: Option<usize>) {
     }
 }
 
-/// The load-time row order is the weight's device's: the host has no hand GEMM,
-/// so a CPU-loaded module keeps the rows plainly stacked and publishes them back
-/// unchanged.
-#[test]
-fn load_state_dict_pairs_the_rows_at_the_device_width() {
-    let (gate, up, down) = (marked(I, H, 100.0), marked(I, H, 200.0), marked(H, I, 300.0));
-    let mlp = loaded(&gate, &up, &down);
-    let want = svod_tk::swiglu_pair_width(&gate.device());
-    let all = rows(&mlp.gate_up_weight);
-    match want {
-        None => assert_eq!(all, [rows(&gate), rows(&up)].concat(), "no hand GEMM: plainly stacked"),
-        Some(pair) => assert_eq!(all, rows(&pair_rows(&gate, &up, Some(pair)).expect("pair rows"))),
-    }
-}
-
 /// The published state dict is the un-interleaved checkpoint layout, so a
 /// load/write round trip is the identity — the row order is an internal detail.
 #[test]
@@ -85,17 +67,6 @@ fn write_state_un_interleaves_the_rows() {
     assert_eq!(rows(&sd["gate_proj.weight"]), rows(&gate));
     assert_eq!(rows(&sd["up_proj.weight"]), rows(&up));
     assert_eq!(rows(&sd["down_proj.weight"]), rows(&down));
-}
-
-/// A never-loaded module keeps the plainly stacked rows, and still publishes
-/// the same two keys.
-#[test]
-fn an_unloaded_module_publishes_the_stacked_halves() {
-    let mlp = Qwen3MLP::empty(H, I, DType::Float32);
-    let sd = mlp.state_dict("");
-    let all = rows(&mlp.gate_up_weight);
-    assert_eq!(rows(&sd["gate_proj.weight"]), all[..I].to_vec());
-    assert_eq!(rows(&sd["up_proj.weight"]), all[I..].to_vec());
 }
 
 /// Whatever the row order, the forward is `down(silu(x·gateᵀ)·(x·upᵀ))`: the

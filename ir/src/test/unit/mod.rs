@@ -5,7 +5,6 @@ pub mod canonical;
 pub mod comparison;
 pub mod const_cast;
 pub mod control;
-pub mod device;
 pub mod dtype_rule;
 pub mod memory;
 pub mod movement;

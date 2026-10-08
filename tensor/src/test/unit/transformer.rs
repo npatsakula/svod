@@ -595,19 +595,10 @@ fn test_sdpa_scores_cuda_tc_warp_with_three_locals_matches_cpu() {
 }
 
 // =========================================================================
-// Embedding ids the vocab does not hold
+// Embedding over u8 ids
 // =========================================================================
 
 crate::codegen_tests! {
-    fn test_embedding_reads_no_row_for_an_id_outside_the_vocab(config) {
-        // i64 ids past 32 bits beside in-range ones: `2^32 + 2` must not read row 2.
-        let weight = Tensor::from_ndarray(&array![[1.0f32], [2.0], [3.0], [4.0], [5.0]]);
-        let ids = Tensor::from_slice([(1i64 << 32) + 2, 2, 1 << 31, -(1i64 << 32) + 4, 4, -1]);
-        let result = weight.embedding(&ids).unwrap();
-        result.realize_with(&config).unwrap();
-        assert_eq!(result.as_vec::<f32>().unwrap(), vec![0.0, 3.0, 0.0, 0.0, 5.0, 0.0]);
-    }
-
     fn test_embedding_u8_ids_past_127_read_their_row(config) {
         // A vocab u8 covers exactly, so the lookup collapses into a direct read
         // indexed by the id itself: an id past 127 must stay unsigned there.

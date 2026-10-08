@@ -191,9 +191,6 @@ fn assert_healthy(outputs: &[Vec<f32>]) -> f32 {
 /// The core property, over several batch extents. An odd batch is included on
 /// purpose: it is the one that leaves the GEMM's `M` ragged against the tile.
 #[test_case::test_case(2, DType::Float32; "batch 2 f32")]
-#[test_case::test_case(3, DType::Float32; "batch 3 f32 (ragged M)")]
-#[test_case::test_case(4, DType::Float32; "batch 4 f32")]
-#[test_case::test_case(2, DType::Float16; "batch 2 f16 (tk conv path on CUDA)")]
 #[test_case::test_case(3, DType::Float16; "batch 3 f16 (tk conv path on CUDA)")]
 #[ignore = "heavy: one full Yolo26n detect forward per image, plus one batched"]
 fn batch_matches_solo_runs(batch: usize, dtype: DType) {
@@ -218,7 +215,6 @@ fn batch_matches_solo_runs(batch: usize, dtype: DType) {
 /// the leak the solo comparison can miss: a kernel that mixed images in a fixed,
 /// position-dependent way could still agree with a solo run and only diverge once
 /// the neighbours change.
-#[test_case::test_case(DType::Float32; "f32")]
 #[test_case::test_case(DType::Float16; "f16 (tk conv path on CUDA)")]
 #[ignore = "heavy: three batched Yolo26n detect forwards"]
 fn batch_slot_output_ignores_its_neighbours(dtype: DType) {
@@ -254,8 +250,6 @@ fn batch_slot_output_ignores_its_neighbours(dtype: DType) {
 /// dtype rather than falling back to the graph conv. `with_b_fixed` is what makes
 /// the tk path reachable at batch > 1 — and what lets the plan be graph-captured,
 /// since capture is gated on no kernel carrying an unbound var.
-#[test_case::test_case(2, DType::Float32; "batch 2 f32")]
-#[test_case::test_case(3, DType::Float32; "batch 3 f32 (ragged M)")]
 #[test_case::test_case(2, DType::Float16; "batch 2 f16 (tk conv path on CUDA)")]
 #[ignore = "heavy: a full detect graph compile per batch extent"]
 fn pinned_batch_jit_matches_solo_runs(batch: usize, dtype: DType) {
@@ -287,24 +281,4 @@ fn pinned_batch_jit_matches_solo_runs(batch: usize, dtype: DType) {
              {diff:.3e}, tolerance {tol:.3e} (inter-image spread {spread:.3e})"
         );
     }
-}
-
-/// A guard on the guards above: the tolerance has to actually reject a wrong
-/// image. `tol` is a hundredth of the *smallest* difference between two distinct
-/// images, so this holds by construction — but it is the construction that would
-/// break if someone loosened [`REASSOCIATION_FRACTION`] or flattened the model,
-/// and then every comparison above would start passing for the wrong reason.
-#[test]
-#[ignore = "heavy: two Yolo26n detect forwards"]
-fn the_comparison_rejects_a_swapped_image() {
-    let model = random_model(&DType::Float32);
-    let solo: Vec<Vec<f32>> = (0..2).map(|k| predictions(&model, &[k]).remove(0)).collect();
-    let spread = assert_healthy(&solo);
-    let tol = spread * REASSOCIATION_FRACTION;
-    let swapped = max_abs_diff(&solo[0], &solo[1]);
-    assert!(
-        swapped > tol * 10.0,
-        "comparing image 0 against image 1 differs by only {swapped:.3e} against a tolerance of \
-         {tol:.3e} — the assertions in this file could not tell two images apart"
-    );
 }

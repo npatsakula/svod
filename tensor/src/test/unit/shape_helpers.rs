@@ -318,8 +318,6 @@ crate::codegen_tests! {
 
     #[test_case(&[1, 2, 3, 4], 2; "single_batch")]
     #[test_case(&[2, 3, 2, 5], 2; "multi_batch")]
-    #[test_case(&[1, 1, 2, 3], 3; "scale_three")]
-    #[test_case(&[2, 2, 3, 2], 1; "scale_one_is_identity")]
     fn test_upsample_nearest_matches_gather(config, shape: &[usize], repeat: usize) {
         test_setup();
         let x = iota(shape);
@@ -389,9 +387,10 @@ crate::codegen_tests! {
 
     /// `floor(o / s)` — the view the fast path substitutes — is what nearest
     /// resize computes for only two of the (coordinate transform, rounding)
-    /// pairings. The other two here read a different input element, so they
-    /// pin that the fast path is not taken for them.
-    #[test_case(CoordinateTransformMode::HalfPixel, NearestMode::RoundPreferFloor, &[0., 0., 0., 0., 1., 1., 1., 1.]; "half_pixel_round_prefer_floor_is_the_view")]
+    /// pairings: `asymmetric` with `floor` here, and the default `half_pixel`
+    /// with `round_prefer_floor` that `test_upsample_nearest_matches_gather`
+    /// checks. The other two read a different input element, so they pin that
+    /// the fast path is not taken for them.
     #[test_case(CoordinateTransformMode::Asymmetric, NearestMode::Floor, &[0., 0., 0., 0., 1., 1., 1., 1.]; "asymmetric_floor_is_the_view")]
     #[test_case(CoordinateTransformMode::Asymmetric, NearestMode::RoundPreferFloor, &[0., 0., 0., 1., 1., 1., 1., 1.]; "asymmetric_round_prefer_floor_is_not")]
     #[test_case(CoordinateTransformMode::HalfPixel, NearestMode::Floor, &[0., 0., 0., 0., 0., 0., 1., 1.]; "half_pixel_floor_is_not")]

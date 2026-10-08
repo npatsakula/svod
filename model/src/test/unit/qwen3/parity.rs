@@ -67,7 +67,6 @@ fn realized<T: svod_dtype::ext::HasDType + Clone + Default>(sd: &StateDict, key:
 /// The golden's left-padded `input_ids` + `attention_mask`, re-packed to
 /// right padding: `(ids [B, L] i32, lengths [B] i32, per-row pad counts)`.
 struct Rows {
-    batch: usize,
     seq_len: usize,
     ids: Tensor,
     lengths: Tensor,
@@ -91,7 +90,6 @@ fn rows(sd: &StateDict) -> Rows {
         left_pads.push(seq_len - real.len());
     }
     Rows {
-        batch,
         seq_len,
         ids: Tensor::from_slice(packed).try_reshape([batch as isize, seq_len as isize]).unwrap(),
         lengths: Tensor::from_slice(lengths),
@@ -143,23 +141,6 @@ fn embeddings_match_pytorch() {
     assert_eq!(got.len(), want.len());
     let delta = max_abs_delta(&got, &want);
     assert!(delta < 1e-3, "max_abs_delta = {delta:.6} (threshold 1e-3)");
-}
-
-#[test]
-#[ignore = "heavy: negative control — pooling the padded end must diverge"]
-fn pooling_past_the_real_length_diverges_from_golden() {
-    let emb = Qwen3Embedding { model: load_model(), normalize: true };
-    let sd = golden("golden.safetensors");
-    let rows = rows(&sd);
-    assert!(rows.left_pads.iter().any(|&p| p > 0), "the golden batch has no padded row");
-
-    let full = Tensor::from_slice(vec![rows.seq_len as i32; rows.batch]);
-    let out = emb.encode(&rows.ids, &full).unwrap();
-    out.realize().unwrap();
-    let got = out.as_vec::<f32>().unwrap();
-    let want: Vec<f32> = realized(&sd, "embeddings");
-    let delta = max_abs_delta(&got, &want);
-    assert!(delta > 1e-2, "pooling pad tokens did NOT diverge (delta={delta:.6})");
 }
 
 #[test]

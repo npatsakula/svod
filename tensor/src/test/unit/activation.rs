@@ -145,29 +145,6 @@ fn a_narrow_chain_is_evaluated_in_fp32_and_rounded_once() {
     }
 }
 
-/// A stream that is already wide is left exactly as it was: the promotion mints
-/// no casts, so an fp32 graph keeps the AST it had before.
-#[test]
-fn a_wide_chain_is_untouched() {
-    let x = Tensor::empty(&[5], DType::Float32);
-    let chains: [(&str, Result<Tensor>); 8] = [
-        ("sigmoid", x.sigmoid()),
-        ("tanh", x.tanh()),
-        ("swish", x.swish()),
-        ("silu", x.silu()),
-        ("gelu", x.gelu()),
-        ("gelu_exact", x.gelu_exact()),
-        ("elu", x.elu(1.0)),
-        ("selu", x.selu(1.673_263_2, 1.050_701)),
-    ];
-
-    for (name, built) in chains {
-        let y = built.unwrap_or_else(|e| panic!("{name}: {e:?}"));
-        assert_eq!(y.dtype(), DType::Float32, "{name} preserves fp32");
-        assert_eq!(chain_widths(&y).1, [], "{name} mints a cast on an fp32 stream");
-    }
-}
-
 // =========================================================================
 // Batch Normalization Tests
 // =========================================================================

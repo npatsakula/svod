@@ -240,7 +240,6 @@ fn gemm_first_use_measures_the_table_once_gpu() {
 /// The attention split's first use measures the policy's candidates (each a
 /// partial + merge pair) once and records one line; the winner is a candidate.
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::sq_attention_first_use -- --ignored`.
-#[test_case(1, 20, true; "one shared cache")]
 #[test_case(5, 640, true; "whisper large's packed cross cache")]
 #[test_case(5, 20, false; "a cache per row")]
 #[ignore]

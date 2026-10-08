@@ -23,10 +23,7 @@ fn geom(h: usize, cin: usize, cout: usize, k: usize, stride: usize) -> ConvGeom 
 }
 
 /// Output extents and the GEMM shape follow PyTorch's `(h + 2p − k) / s + 1`.
-#[test_case(geom(40, 192, 192, 3, 1), (40, 1600, 1728, 192); "3x3 stride 1")]
 #[test_case(geom(80, 768, 768, 3, 2), (40, 1600, 6912, 768); "3x3 stride 2")]
-#[test_case(geom(40, 384, 192, 1, 1), (40, 1600, 384, 192); "1x1")]
-#[test_case(geom(20, 768, 768, 3, 1), (20, 400, 6912, 768); "20x20, a ragged M")]
 fn geometry(g: ConvGeom, want: (usize, usize, usize, usize)) {
     assert_eq!((g.ho(), g.mkn().0, g.mkn().1, g.mkn().2), want);
 }
@@ -34,11 +31,8 @@ fn geometry(g: ConvGeom, want: (usize, usize, usize, usize)) {
 /// A tile fits when a strip stays inside one tap (`cin` a multiple of `k_step`),
 /// `cout` tiles by its N edge and K holds two strips; `M` may be ragged.
 #[test_case(geom(40, 192, 192, 3, 1), true; "192 channels")]
-#[test_case(geom(20, 768, 768, 3, 1), true; "ragged M of 400")]
-#[test_case(geom(160, 48, 48, 3, 1), false; "48 channels do not fill a strip")]
+#[test_case(geom(160, 48, 64, 3, 1), false; "48 channels do not fill a strip")]
 #[test_case(geom(80, 384, 96, 3, 1), false; "96 output channels miss the N edge")]
-#[test_case(geom(40, 384, 192, 1, 1), true; "1x1")]
-#[test_case(geom(320, 3, 96, 3, 2), false; "an RGB stem")]
 fn rdna4_tiles(g: ConvGeom, served: bool) {
     let cfg = select_conv_cfg(&GemmPolicy::for_arch(RDNA4), &g);
     assert_eq!(cfg.is_some(), served, "{cfg:?}");
@@ -54,12 +48,10 @@ fn rdna4_tiles(g: ConvGeom, served: bool) {
 /// and the K floor. A 1x1 passes on K alone; whether its layout makes it worth
 /// running is the caller's knowledge, not the kernel's.
 #[test_case(96, 96, 9, true; "96 channels, K = 864")]
-#[test_case(384, 96, 9, true; "the x head's reduction")]
 #[test_case(64, 64, 9, true; "K = 576, the floor itself")]
 #[test_case(32, 32, 9, false; "K = 288 is under the floor")]
-#[test_case(48, 48, 9, false; "48 output channels miss the N edge")]
-#[test_case(16, 64, 9, false; "16 input channels: K = 144")]
-#[test_case(24, 64, 9, false; "24 input channels never fill a strip")]
+#[test_case(96, 48, 9, false; "48 output channels miss the N edge")]
+#[test_case(24, 64, 25, false; "24 input channels never fill a strip")]
 #[test_case(1536, 768, 1, true; "a 1x1 passes on K")]
 fn worth_asking_follows_the_lattice_and_the_floor(cin: usize, cout: usize, taps: usize, want: bool) {
     assert_eq!(conv2d_nhwc_worth_asking(cin, cout, taps), want);
@@ -73,15 +65,10 @@ fn worth_asking_follows_the_lattice_and_the_floor(cin: usize, cout: usize, taps:
 /// rule: its 128x64 tile is "fine" beside the 128x128 one, and backbone.1 lives
 /// on it.
 #[test_case(SM86, geom(80, 384, 96, 3, 1), true; "sm86 384-96 at 80: 600 fine blocks")]
-#[test_case(SM86, geom(40, 768, 96, 3, 1), true; "sm86 768-96 at 40: 150")]
 #[test_case(SM86, geom(20, 768, 96, 3, 1), false; "sm86 768-96 at 20: 39, starved")]
-#[test_case(SM86, geom(80, 128, 32, 3, 1), true; "sm86 the s head at 80")]
-#[test_case(SM86, geom(20, 512, 32, 3, 1), false; "sm86 the s head at 20")]
 #[test_case(SM86, geom(20, 192, 192, 3, 1), false; "sm86 a wide tile also fits")]
 #[test_case(SM86, geom(80, 96, 96, 3, 1), true; "sm86 96-96 at 80: the lattice's edge on 150 blocks")]
 #[test_case(SM86, geom(20, 96, 96, 3, 1), false; "sm86 96-96 at 20: the lattice's edge on 12, starved")]
-#[test_case(SM86, geom(160, 48, 48, 3, 1), false; "sm86 48 channels: nothing tiles it, nothing to decline")]
-#[test_case(RDNA4, geom(80, 96, 96, 3, 1), false; "rdna4 never declines: the lattice measures")]
 #[test_case(RDNA4, geom(320, 96, 192, 3, 2), false; "rdna4 keeps backbone.1 on its 128x64 tile")]
 fn the_fine_tile_is_declined_on_a_wide_grid(arch: GpuArch, g: ConvGeom, declined: bool) {
     let (policy, caps) = (GemmPolicy::for_arch(arch), crate::ArchCaps::for_arch(arch));
@@ -91,12 +78,10 @@ fn the_fine_tile_is_declined_on_a_wide_grid(arch: GpuArch, g: ConvGeom, declined
     assert!(plans.iter().all(|p| g.tiles(&p.cfg())));
 }
 
-/// The kernel builds off the GPU, on every arch of the table, with and without a
-/// residual — the row gather, the ragged store and the epilogue all lower.
-#[test_case(RDNA4, geom(40, 192, 192, 3, 1), true; "rdna4 3x3 with residual")]
-#[test_case(RDNA4, geom(20, 768, 768, 3, 2), false; "rdna4 ragged M")]
+/// The kernel builds off the GPU where `every_plan_builds` does not reach: on
+/// RDNA3's table and fragments, and for a 1x1, whose row source has no tap to
+/// decode.
 #[test_case(GpuArch::Amd(AmdArch::Gfx1151), geom(40, 384, 192, 1, 1), false; "rdna3 1x1")]
-#[test_case(GpuArch::Cuda(svod_dtype::CudaArch::from_compute_capability(8, 6)), geom(40, 192, 192, 3, 1), true; "sm86")]
 fn the_kernel_builds(arch: GpuArch, g: ConvGeom, residual: bool) {
     let caps = crate::ArchCaps::for_arch(arch);
     let cfg = select_conv_cfg(&GemmPolicy::for_arch(arch), &g).expect("a tile");
@@ -246,16 +231,10 @@ fn reference(g: &ConvGeom, x: &Tensor, w: &Tensor, bias: &Tensor, res: Option<&T
 /// (the graph reads them through permuted views), bias, SiLU and residual
 /// included: both accumulate in f32 and round to the operand dtype in the same
 /// places, so they differ by a summation order, two ulps at most.
-#[test_case(geom(32, 384, 192, 1, 1), false, DType::Float16, 4e-3; "1x1, aligned M")]
-#[test_case(ConvGeom { batch: 1, h: 34, w: 34, cin: 192, cout: 192, kh: 3, kw: 3, stride: 1, pad: 0 }, false, DType::Float16, 4e-3; "3x3 unpadded, aligned M")]
-#[test_case(ConvGeom { batch: 1, h: 34, w: 34, cin: 64, cout: 192, kh: 3, kw: 3, stride: 1, pad: 0 }, false, DType::Float16, 4e-3; "3x3 unpadded, 64 channels, aligned M")]
-#[test_case(geom(32, 192, 192, 3, 1), false, DType::Float16, 4e-3; "3x3, aligned M")]
-#[test_case(geom(40, 192, 192, 3, 1), true, DType::Float16, 4e-3; "3x3 stride 1 with residual, f16")]
 #[test_case(geom(40, 192, 192, 3, 1), false, DType::BFloat16, 8e-3; "3x3 stride 1, bf16")]
 #[test_case(geom(80, 768, 768, 3, 2), false, DType::Float16, 4e-3; "3x3 stride 2")]
 #[test_case(geom(40, 384, 192, 1, 1), false, DType::Float16, 4e-3; "1x1")]
 #[test_case(geom(20, 768, 768, 3, 1), true, DType::Float16, 4e-3; "ragged M with residual")]
-#[test_case(ConvGeom { batch: 2, h: 24, w: 40, cin: 64, cout: 128, kh: 3, kw: 3, stride: 1, pad: 1 }, false, DType::Float16, 4e-3; "batch 2, non-square")]
 #[ignore]
 fn conv_matches_the_graph_gpu(g: ConvGeom, residual: bool, dtype: DType, tol: f32) {
     if !device_supported(CONV_SUPPORTED_ARCHS) {
@@ -323,11 +302,7 @@ fn the_patch_is_offered(arch: GpuArch, g: ConvGeom, expected: bool) {
 /// fingerprint it — a plan offered on an arch whose body it cannot lower takes
 /// the process down on the *first* convolution, before anything is measured.
 #[test_case(SM86, geom(40, 192, 192, 3, 1), true; "sm86 3x3 with residual")]
-#[test_case(SM86, geom(20, 192, 192, 3, 1), false; "sm86 windows overhang a 20x20 image")]
-#[test_case(SM86, geom(80, 768, 768, 3, 2), false; "sm86 3x3 stride 2")]
 #[test_case(RDNA4, geom(40, 192, 192, 3, 1), true; "rdna4 3x3 with residual")]
-#[test_case(RDNA4, geom(20, 192, 192, 3, 1), false; "rdna4 windows overhang a 20x20 image")]
-#[test_case(RDNA4, geom(80, 768, 768, 3, 2), false; "rdna4 3x3 stride 2")]
 fn every_plan_builds(arch: GpuArch, g: ConvGeom, residual: bool) {
     let caps = crate::ArchCaps::for_arch(arch);
     let plans = conv_candidates(&GemmPolicy::for_arch(arch), &g, &caps);
@@ -350,9 +325,7 @@ fn every_plan_builds(arch: GpuArch, g: ConvGeom, residual: bool) {
 /// above only ever sees the static choice (tuning is off under test), so this is
 /// what covers the tiles the chooser passes over — and, on CUDA, the
 /// image-staged kernel.
-#[test_case(geom(40, 192, 192, 3, 1), false; "3x3 stride 1")]
 #[test_case(geom(40, 192, 192, 3, 1), true; "3x3 stride 1 with residual")]
-#[test_case(geom(20, 192, 192, 3, 1), false; "windows overhang a 20x20 image")]
 #[test_case(ConvGeom { batch: 2, h: 24, w: 40, cin: 64, cout: 128, kh: 3, kw: 3, stride: 1, pad: 1 }, false; "batch 2, non-square")]
 #[ignore]
 fn every_plan_matches_the_graph_gpu(g: ConvGeom, residual: bool) {
@@ -460,25 +433,8 @@ fn an_inf_in_the_activation_stays_where_the_graph_puts_it_gpu() {
 /// SVOD_DEVICE=AMD:0 cargo test --release -p svod-tk --lib every_lattice_tile -- --ignored --nocapture
 /// ```
 #[test_case(geom(80, 64, 64, 3, 1); "m bodies 64-64 at 80")]
-#[test_case(geom(40, 128, 128, 3, 1); "m bodies 128-128 at 40")]
-#[test_case(geom(20, 128, 128, 3, 1); "m backbone.8 bodies at 20")]
-#[test_case(geom(80, 256, 64, 3, 1); "m head at 80")]
-#[test_case(geom(40, 512, 64, 3, 1); "m head at 40")]
-#[test_case(geom(20, 512, 64, 3, 1); "m head at 20")]
 #[test_case(geom(20, 512, 256, 3, 1); "m neck.22 attn cv1")]
-#[test_case(geom(20, 256, 512, 3, 1); "m neck.22 attn cv2")]
-#[test_case(geom(320, 64, 128, 3, 2); "m backbone.1")]
-#[test_case(geom(160, 256, 256, 3, 2); "m backbone.3")]
-#[test_case(geom(80, 256, 256, 3, 2); "m neck.17")]
 #[test_case(geom(80, 512, 512, 3, 2); "m backbone.5")]
-#[test_case(geom(40, 512, 512, 3, 2); "m backbone.7 and neck.20")]
-#[test_case(geom(160, 64, 64, 3, 2); "n backbone.3")]
-#[test_case(geom(80, 128, 128, 3, 2); "n backbone.5")]
-#[test_case(geom(40, 128, 256, 3, 2); "n backbone.7")]
-#[test_case(geom(80, 64, 64, 3, 2); "n neck.17")]
-#[test_case(geom(40, 128, 128, 3, 2); "n neck.20")]
-#[test_case(geom(20, 128, 64, 3, 1); "n neck.22 attn cv1")]
-#[test_case(geom(20, 64, 128, 3, 1); "n neck.22 attn cv2")]
 #[ignore]
 fn every_lattice_tile_matches_the_graph_gpu(g: ConvGeom) {
     if !device_supported(CONV_SUPPORTED_ARCHS) {

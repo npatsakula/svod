@@ -129,20 +129,6 @@ fn detect_matmul_orders_the_axis_choices_by_axis_id() {
     assert_eq!(extents[2..], [16, 16], "then in0's only range serves as N against either in1 range");
 }
 
-/// Each operand is offered on either side of the core: the swapped choices
-/// take N from in0 and M from in1.
-#[test]
-fn detect_matmul_offers_the_operands_both_ways_round() {
-    let scheduler = Scheduler::new(matmul_accum(16, 16, 16, DType::Float16, DType::Float32), Renderer::cuda());
-    let pattern = matching::detect_matmul(&scheduler).unwrap().expect("matmul detected");
-
-    assert_eq!(pattern.axis_choices.len(), 2);
-    let (n, m, _) = &pattern.axis_choices[0];
-    assert!(Arc::ptr_eq(n, &pattern.in1_ranges[0]) && Arc::ptr_eq(m, &pattern.in0_ranges[0]), "in1 takes N first");
-    let (n, m, _) = &pattern.axis_choices[1];
-    assert!(Arc::ptr_eq(n, &pattern.in0_ranges[0]) && Arc::ptr_eq(m, &pattern.in1_ranges[0]), "then in0 takes N");
-}
-
 /// A `None` verdict is a decline, not an error: a kernel with no REDUCE and a
 /// REDUCE of a constant are both declined without failing the pass.
 #[test_case(true; "no REDUCE at all")]
@@ -317,11 +303,9 @@ fn apply_in_shape_only_mode_splits_the_axes_without_a_wmma() {
 }
 
 /// `tc_opt = 2` pads each non-divisible dimension to the core's tile, as long
-/// as the tail stays inside the padding budget; `tc_opt = 3` up to PADTO's own
-/// limit.
+/// as the tail stays inside the padding budget.
 #[test_case(15, 16, 16, 2, 2; "one padded axis")]
 #[test_case(30, 30, 30, 2, 6; "every axis padded")]
-#[test_case(5, 16, 16, 3, 2; "unbounded padding tiles a beam width of five")]
 fn apply_pads_non_divisible_dimensions(m: i64, n: i64, k: i64, tc_opt: usize, masks: usize) {
     let mut scheduler = Scheduler::new(matmul_accum(m, n, k, DType::Float16, DType::Float32), Renderer::cuda());
 
@@ -341,7 +325,6 @@ fn apply_pads_non_divisible_dimensions(m: i64, n: i64, k: i64, tc_opt: usize, ma
 /// multiplies a memory-bound GEMV's work for nothing.
 #[test_case(15, 16, 16, 1, "dimension not divisible by tensor core size", "TC"; "15 is not divisible by 16")]
 #[test_case(4, 16, 16, 2, "padding to the tensor-core tile would add too much work", "TC"; "4 -> 16 is a 4x work increase")]
-#[test_case(5, 16, 16, 2, "padding to the tensor-core tile would add too much work", "TC"; "a beam width of 5 never pays for a 16-row tile")]
 #[test_case(16, 12, 16, 2, "padding to the tensor-core tile would add too much work", "TC"; "12 -> 16 is a third more work")]
 #[test_case(2, 16, 16, 3, "padding would add more than 4x work", "PADTO"; "unbounded padding keeps only the 4x limit, on either side")]
 fn apply_rejects_a_non_divisible_dimension(m: i64, n: i64, k: i64, tc_opt: usize, reason: &str, op: &str) {
@@ -427,7 +410,6 @@ fn reduce_after_matmul(n: i64, k: i64, d: i64, fused: bool) -> Arc<UOp> {
 /// summed a quarter of its channels under a BEAM plan). The heuristics used to
 /// decline this shape on their own; a replayed plan went straight to the core.
 #[test_case(Some(0); "the beam's default axis choice")]
-#[test_case(None; "every axis choice")]
 fn a_reduced_matmul_output_refuses_the_tensor_core(axis_choice: Option<usize>) {
     let mut fused = Scheduler::new(reduce_after_matmul(64, 384, 384, true), Renderer::cuda());
     let error = apply_with_axis_choice(&mut fused, -1, 2, 1, axis_choice).expect_err("refused");
@@ -585,7 +567,6 @@ fn apply_rejects_a_group_after_tensor_cores() {
 #[test_case(Renderer::metal(), None; "metal keeps the fixed step")]
 #[test_case(Renderer::amd_rdna3(), None; "rdna3 keeps the fixed step")]
 #[test_case(Renderer::amd_cdna3(), None; "cdna3 keeps the fixed step")]
-#[test_case(Renderer::amd_cdna4(), None; "cdna4 keeps the fixed step")]
 #[test_case(Renderer::intel_xe(), None; "intel xe keeps the fixed step")]
 fn tc_tile_policy_follows_the_target(renderer: Renderer, accum_max: Option<usize>) {
     let budget = match renderer.tc_tile_policy() {

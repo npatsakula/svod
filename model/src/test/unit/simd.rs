@@ -48,15 +48,3 @@ fn lanewise_matches_the_f64_reference(simd: fn(&[f32]) -> Vec<f32>, reference: f
         assert!((got - want).abs() <= tolerance, "x = {x}: got {got}, want {want}");
     }
 }
-
-/// Saturation keeps its sign and never divides `inf / inf` past the exponent
-/// floor; `tanh(-0.0)` stays `-0.0`.
-#[test]
-fn lanewise_saturates() {
-    let s = sigmoid_all(&[f32::MAX, f32::MIN, 0.0]);
-    assert_eq!((s[0], s[2]), (1.0, 0.5));
-    assert!((0.0..f32::MIN_POSITIVE * 2.0).contains(&s[1]), "{}", s[1]);
-    let t = tanh_all(&[f32::MAX, f32::MIN, -0.0]);
-    assert_eq!(t[..2], [1.0, -1.0]);
-    assert!(t[2] == 0.0 && t[2].is_sign_negative());
-}

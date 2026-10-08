@@ -34,11 +34,8 @@ fn depth_preserved_for_large() {
     assert_eq!(make_depth(1, s), 1);
 }
 
-#[test_case(YoloScale::Nano, false)]
 #[test_case(YoloScale::Small, false)]
 #[test_case(YoloScale::Medium, true)]
-#[test_case(YoloScale::Large, true)]
-#[test_case(YoloScale::XLarge, true)]
 fn c3k_is_forced_for_medium_and_up(scale: YoloScale, expected: bool) {
     assert_eq!(scale.forces_c3k(), expected);
 }

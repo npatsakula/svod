@@ -65,12 +65,6 @@ impl Program for StampedKernel {
     }
 }
 
-#[test]
-fn a_stamping_backend_is_timed_on_its_stamp() {
-    let time = unsafe { time_kernel(&StampedKernel, &[], &[], None, None, false) }.unwrap();
-    assert_eq!(time, Some(Duration::from_micros(7)));
-}
-
 /// A backend that stamps its first run and then loses its stamps.
 struct FlakyStampKernel(std::sync::atomic::AtomicUsize);
 

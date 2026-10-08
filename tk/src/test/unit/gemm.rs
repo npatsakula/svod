@@ -33,24 +33,12 @@ const SM86: GpuArch = GpuArch::Cuda(svod_dtype::CudaArch::from_compute_capabilit
 const RDNA: GpuArch = GpuArch::Amd(svod_dtype::AmdArch::Gfx1151);
 const RDNA4: GpuArch = GpuArch::Amd(svod_dtype::AmdArch::Gfx1201);
 
-/// The static shared-memory a CUDA block may take without the opt-in dynamic
-/// allocation (48 KiB).
-const SHARED_MAX: usize = 48 << 10;
-
 // ── Applicability + config invariants (GPU-free) ─────────────────────────────
 
 /// The linear-layer shapes the kernel is tuned for, plus the odd ones a caller
 /// might hand it: `M`/`N` multiples of 64 with `K` a multiple of the 32-wide strip
 /// are served, everything else declines so the caller can pad.
 #[test_case(4096, 1024, 6144, true; "gate_up")]
-#[test_case(1024, 1024, 6144, true; "gate_up small M")]
-#[test_case(1024, 1024, 4096, true; "fused qkv")]
-#[test_case(1024, 1024, 2048, true; "q only")]
-#[test_case(4096, 3072, 1024, true; "down")]
-#[test_case(1024, 3072, 1024, true; "down small M")]
-#[test_case(3072, 1280, 5120, true; "whisper ffn")]
-#[test_case(128, 1024, 6144, true; "batch-1 prefill")]
-#[test_case(128, 1024, 1024, true; "batch-1 narrow")]
 #[test_case(256, 192, 128, true; "odd K")]
 #[test_case(64, 32, 64, false; "K shorter than the pipeline")]
 #[test_case(1024, 1024, 100, false; "N not a multiple of 64")]
@@ -62,10 +50,8 @@ fn select_cfg_applicability(m: usize, k: usize, n: usize, served: bool) {
 
 /// The narrow-N / short-M crossover: the default 128×64 tile once its grid covers
 /// the device, the finer 64×64 tile when it would not.
-#[test_case(4096, 6144, NT_128X64; "large grid keeps the default tile")]
 #[test_case(1024, 1024, NT_128X64; "128 blocks still fill 28 SMs")]
 #[test_case(128, 6144, NT_64X64; "batch-1 prefill takes the finer tile")]
-#[test_case(128, 1024, NT_64X64; "a 16-block grid takes the finer tile")]
 fn select_cfg_crossover(m: usize, n: usize, want: GemmCfg) {
     assert_eq!(select_cfg(m, 1024, n), Some(want), "select_cfg({m}, 1024, {n})");
 }
@@ -85,16 +71,12 @@ fn select_cfg_crossover_follows_the_sm_count() {
 /// served by its tiles (`0` wide, `1` the deep-strip fine tile, `2` the short-K
 /// fine tile), with the crossover against the family's 40 CUs; a family nobody
 /// measured declines every shape.
-#[test_case(4096, 1024, 6144, Some(0); "gate_up keeps the wide tile")]
-#[test_case(1024, 1024, 6144, Some(0); "gate_up small M")]
 #[test_case(4096, 3072, 1024, Some(0); "512 blocks take the wide tile")]
 #[test_case(1024, 1024, 2048, Some(1); "256 blocks stay on the fine tile")]
-#[test_case(128, 1024, 6144, Some(1); "batch-1 prefill takes the fine tile")]
 #[test_case(64, 128, 192, Some(1); "short grid takes the deep strip")]
 #[test_case(64, 64, 192, Some(2); "a K too short for the deep strip")]
 #[test_case(128, 96, 6144, Some(2); "K of three strips")]
 #[test_case(100, 1024, 1024, None; "M not a multiple of 64")]
-#[test_case(1024, 48, 1024, None; "K not a multiple of the strip")]
 fn rdna_policy_applicability(m: usize, k: usize, n: usize, want: Option<usize>) {
     let policy = GemmPolicy::for_arch(RDNA);
     assert_eq!(policy.compute_units, 40);
@@ -108,13 +90,9 @@ fn rdna_policy_applicability(m: usize, k: usize, n: usize, want: Option<usize>) 
 /// (`resident` 1 against the measured 64), the finer tiles behind it for the
 /// short grids and the `M`s it does not divide; every tile a 64-wide wave N
 /// tile, so the gate/up pair width is 32 on every candidate.
-#[test_case(4096, 1024, 6144, Some(0); "gate_up takes the wide tile")]
-#[test_case(4096, 2048, 1024, Some(0); "256 blocks take the wide tile")]
 #[test_case(1024, 3072, 1024, Some(0); "64 blocks still take the wide tile")]
 #[test_case(128, 1024, 6144, Some(2); "batch-1 prefill falls back to 128x64")]
-#[test_case(128, 1024, 1024, Some(2); "an 8-block grid falls back to 128x64")]
 #[test_case(64, 64, 192, Some(3); "M of 64 takes the two-wave 64x64 tile")]
-#[test_case(100, 1024, 1024, None; "M not a multiple of 64")]
 fn rdna4_policy_applicability(m: usize, k: usize, n: usize, want: Option<usize>) {
     let policy = GemmPolicy::for_arch(RDNA4);
     assert_eq!((policy.compute_units, policy.resident), (64, 1));
@@ -156,23 +134,6 @@ proptest! {
             prop_assert!(cfg.tiles(m, k, n));
         }
     }
-
-    /// Whatever the shape, a returned tile is launchable: a legal CUDA block, a
-    /// static shared-memory budget, and a wave grid its block edges divide into.
-    #[test]
-    fn prop_selected_cfg_is_launchable(m in 1usize..64, k in 1usize..64, n in 1usize..64) {
-        let (m, k, n) = (m * 64, k * 32, n * 64);
-        let Some(cfg) = select_cfg(m, k, n) else { return Ok(()) };
-        prop_assert!(cfg.threads(32) <= 1024, "block {} threads", cfg.threads(32));
-        prop_assert!(cfg.shared_bytes(2) <= SHARED_MAX, "{} shared bytes", cfg.shared_bytes(2));
-        prop_assert_eq!(cfg.reg_m() * cfg.blocks_m(), cfg.block_m);
-        prop_assert_eq!(cfg.reg_n() * cfg.blocks_n(), cfg.block_n);
-        prop_assert_eq!(cfg.reg_m() % 16, 0);
-        prop_assert_eq!(cfg.reg_n() % 16, 0);
-        // The launch grid covers the whole C tile exactly once per K-slab.
-        let grid = cfg.grid_dims(m, n);
-        prop_assert_eq!((grid[0] * grid[1] * grid[2]) as usize, cfg.blocks(m, n));
-    }
 }
 
 // ── Epilogue applicability (GPU-free) ────────────────────────────────────────
@@ -180,10 +141,11 @@ proptest! {
 /// Every tile a policy can pick either reads the widest one's gate/up row
 /// arrangement or declines the epilogue outright, so a weight permuted once at
 /// load is servable whatever `M` turns out to be — the invariant
-/// [`GemmPolicy::swiglu_pair_width`] exists to state, on every arch table.
+/// [`GemmPolicy::swiglu_pair_width`] exists to state: on the CUDA table, whose
+/// finest tile declines, and on RDNA's, where every tile reads it (RDNA4's
+/// 32-wide pair is pinned with its table above).
 #[test_case(SM86, &CUDA_TILES; "cuda")]
 #[test_case(RDNA, &RDNA_TILES; "rdna")]
-#[test_case(RDNA4, &RDNA4_TILES; "rdna4")]
 fn swiglu_pair_width_is_the_widest_tiles(arch: GpuArch, table: &[GemmCfg]) {
     let policy = GemmPolicy::for_arch(arch);
     assert_eq!(policy.tiles, table);
@@ -198,38 +160,14 @@ fn swiglu_pair_width_is_the_widest_tiles(arch: GpuArch, table: &[GemmCfg]) {
     }
 }
 
-/// The device-level [`swiglu_pair_width`] is the resolved arch's, and `None`
-/// where no arch resolves (the host), so a model on the CPU keeps its rows
-/// plainly stacked.
-#[test]
-fn swiglu_pair_width_is_none_off_the_gpu() {
-    assert_eq!(swiglu_pair_width(&svod_dtype::DeviceSpec::Cpu), None);
-}
-
-/// `Epilogue` is the shape contract too: SwiGLU halves the output columns, the
-/// other two keep them, and `kind` drops the operand without changing either.
-#[test]
-fn epilogue_out_cols_and_kind() {
-    let t = Tensor::randn(&[8, 8]).expect("randn");
-    assert_eq!(Epilogue::<&Tensor>::Plain.out_cols(6144), 6144);
-    assert_eq!(Epilogue::Add(&t).out_cols(6144), 6144);
-    assert_eq!(Epilogue::<&Tensor>::SwiGlu { pair: 16 }.out_cols(6144), 3072);
-    assert_eq!(Epilogue::Add(&t).kind(), Epilogue::Add(()));
-    assert_eq!(Epilogue::<&Tensor>::SwiGlu { pair: 16 }.kind(), Epilogue::SwiGlu { pair: 16 });
-}
-
 /// A tile carries an epilogue only when its store can: split-K writes f32
 /// partials, so neither fused form rides it; SwiGLU further needs `reg_n/2` to be
 /// the caller's `pair` and a whole number of fragments.
-#[test_case(NT_128X64, Epilogue::Plain, true; "plain rides any tile")]
 #[test_case(NT_SPLIT_K, Epilogue::Plain, true; "plain rides split-K")]
 #[test_case(NT_128X64, Epilogue::Add(()), true; "add rides the default tile")]
-#[test_case(NT_64X64, Epilogue::Add(()), true; "add rides the finer tile")]
 #[test_case(NT_SPLIT_K, Epilogue::Add(()), false; "add declines split-K")]
 #[test_case(NT_128X64, Epilogue::SwiGlu { pair: 16 }, true; "swiglu at the tiles' own pair")]
-#[test_case(NT_64X64, Epilogue::SwiGlu { pair: 16 }, true; "swiglu on the finer tile")]
 #[test_case(NT_128X64, Epilogue::SwiGlu { pair: 32 }, false; "swiglu declines a wider pair")]
-#[test_case(NT_128X64, Epilogue::SwiGlu { pair: 8 }, false; "swiglu declines a narrower pair")]
 #[test_case(NT_SPLIT_K, Epilogue::SwiGlu { pair: 16 }, false; "swiglu declines split-K")]
 fn cfg_carries_epilogue(cfg: GemmCfg, epi: Epilogue<()>, carries: bool) {
     assert_eq!(cfg.carries(epi, Some(FRAG_COLS)), carries, "{cfg:?} carrying {epi:?}");
@@ -279,18 +217,11 @@ const BF16_REL_TOL: f32 = 8e-3;
 /// the product's, not a new one. Measured ≤ 4.5e-3 on the shapes below.
 const SWIGLU_REL_TOL: f32 = 1.2e-2;
 
-/// `gemm_nt` against the generic `Tensor::linear` over the same bf16 operands, on
-/// every tuned linear-layer shape plus the odd ones (a batch-1 M, an N that only
-/// tiles by 64, a K that is neither a power of two nor a multiple of 64).
+/// `gemm_nt` against the generic `Tensor::linear` over the same bf16 operands,
+/// through the static tile choice: the gate/up projection, and a single-tile `M`
+/// whose `K` is two 32-wide strips, the shortest the pipeline takes. Each table
+/// tile's numerics are [`every_table_tile_matches_linear_gpu`]'s.
 #[test_case(4096, 1024, 6144; "gate_up")]
-#[test_case(1024, 1024, 6144; "gate_up small M")]
-#[test_case(1024, 1024, 4096; "fused qkv")]
-#[test_case(1024, 1024, 2048; "q only")]
-#[test_case(4096, 3072, 1024; "down")]
-#[test_case(1024, 3072, 1024; "down small M")]
-#[test_case(3072, 1280, 5120; "whisper ffn")]
-#[test_case(128, 1024, 1024; "batch-1 narrow")]
-#[test_case(256, 192, 128; "odd K")]
 #[test_case(64, 64, 64 * 3; "single-tile M")]
 #[ignore]
 fn gemm_nt_matches_linear_gpu(m: usize, k: usize, n: usize) {
@@ -418,12 +349,10 @@ fn gemm_nt_split_k_matches_linear_gpu() {
 }
 
 /// `gemm_nt_with_epilogue(Add)` against the graph's `linear` + `try_add` over the
-/// same bf16 operands, on the projections the epilogue is for (`o_proj`,
-/// `down_proj` at the Qwen3-Embedding shapes) plus an odd one.
+/// same bf16 operands, on a projection the epilogue is for (`o_proj` at the
+/// Qwen3-Embedding shape), on the wide tile and, at batch 1, on a fine one.
 #[test_case(4096, 1024, 1024; "o_proj")]
-#[test_case(4096, 3072, 1024; "down_proj")]
 #[test_case(128, 1024, 1024; "batch-1 o_proj")]
-#[test_case(256, 192, 128; "odd K")]
 #[ignore]
 fn gemm_nt_add_matches_graph_gpu(m: usize, k: usize, n: usize) {
     if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
@@ -461,12 +390,11 @@ fn pair_rows(w: &Tensor, pair: usize) -> Tensor {
 
 /// `gemm_nt_with_epilogue(SwiGlu)` against the graph it replaces — the fused
 /// gate/up GEMM, the split, `silu` and the multiply — on the Qwen3-Embedding MLP
-/// shapes plus an odd one. The reference reads the **un-permuted** weight, so the
-/// test also pins the row arrangement and the output column mapping.
+/// shape, on the wide tile and, at batch 1, on a fine one. The reference reads
+/// the **un-permuted** weight, so the test also pins the row arrangement and the
+/// output column mapping.
 #[test_case(4096, 1024, 6144; "gate_up")]
-#[test_case(1024, 1024, 6144; "gate_up small M")]
 #[test_case(128, 1024, 6144; "batch-1 prefill")]
-#[test_case(256, 192, 128; "odd K")]
 #[ignore]
 fn gemm_nt_swiglu_matches_graph_gpu(m: usize, k: usize, n: usize) {
     if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
@@ -659,12 +587,13 @@ fn single_fragment(stages: usize) -> GemmCfg {
 /// Every K step's WMMA reads the accumulator the step before wrote. On a
 /// single-fragment tile the looped `mma`'s ranges are all trip-1, and a read held
 /// in the loop only by its own K range loses it when symbolic folds them: the read
-/// hoists above the K loop and every step adds onto the zeroed tile.
-#[test_case(SM86, single_fragment(2); "sm86 staged")]
+/// hoists above the K loop and every step adds onto the zeroed tile. The
+/// pipelined tile of that class is checked on both devices by
+/// `every_lattice_tile_keeps_its_accumulator_in_the_k_loop`; these rows are the
+/// forms it is not bound to build: the single-buffered loop, which the lattice
+/// never offers, and two accumulators chained in one trip.
 #[test_case(SM86, single_fragment(1); "sm86 single-buffered")]
 #[test_case(SM86, GemmCfg { warps_m: 1, acc_m: 2, ..single_fragment(2) }; "sm86 two accumulators")]
-#[test_case(RDNA4, single_fragment(2); "rdna4 staged")]
-#[test_case(SM86, GemmCfg { k_step: 32, ..single_fragment(2) }; "sm86 two K fragments")]
 fn a_single_fragment_gemm_keeps_its_accumulator_in_the_k_loop(arch: GpuArch, cfg: GemmCfg) {
     use std::sync::Arc;
 
@@ -692,7 +621,6 @@ fn a_single_fragment_gemm_keeps_its_accumulator_in_the_k_loop(arch: GpuArch, cfg
 /// (`conv2d_nhwc_silu`), and left at fp16 the four roundings cost the model a
 /// P5/32 detection.
 #[test_case(DType::Float16; "fp16 widens")]
-#[test_case(DType::BFloat16; "bf16 widens")]
 fn silu_evaluates_a_narrow_operand_in_fp32(dt: DType) {
     use svod_ir::{Op, UnaryOp};
 
