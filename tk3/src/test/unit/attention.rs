@@ -167,3 +167,60 @@ fn kernel_matches_the_program(spec: FaSpec, lens: &[i64]) {
     );
     assert!(worst < 2e-2, "max abs diff {worst}");
 }
+
+/// Throughput against tk1's flash attention on the same device: causal and
+/// plain, head dim 64 and 128 (run with `--ignored --nocapture --release`).
+#[test]
+#[ignore = "perf probe: needs a CUDA device"]
+fn attention_throughput_probe() {
+    let device = default_device();
+    let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
+        return;
+    };
+    let (batch, heads, t) = (4usize, 8usize, 2048usize);
+    for (d, causal, bq, bkv) in [(64, false, 64, 64), (64, true, 64, 64), (128, false, 64, 32), (128, true, 64, 32)] {
+        let spec = FaSpec { batch, t, tk: t, heads, d, bq, bkv, stages: 2, causal, key_lens: false, scale: 1.0 / (d as f32).sqrt() };
+        let c = case(spec, &[]);
+        let to_bf16 = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+        let (q, k, v) = (to_bf16(&c.q), to_bf16(&c.k), to_bf16(&c.v));
+        for x in [&q, &k, &v] {
+            x.realize().unwrap();
+        }
+        let flops = 4.0 * batch as f64 * heads as f64 * t as f64 * t as f64 * d as f64 / if causal { 2.0 } else { 1.0 };
+        let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
+        for warps_rows in [4u32] {
+            let lowering = Lowering {
+                target: target.clone(),
+                schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false },
+                grid: WarpGrid { rows: warps_rows, cols: 1 },
+                swizzle: true,
+            };
+            let o = Tensor::empty(&[batch * t * heads * d], DType::BFloat16);
+            let out = graph_launch(flash_attention(spec), &lowering, &[&q, &k, &v, &o]).unwrap();
+            let mut plan = out.prepare().unwrap();
+            plan.execute_with_vars(&[("b", batch as i64)]).unwrap();
+            plans.push((format!("tk3 d{d} causal={causal} bq{bq} bkv{bkv}"), plan));
+        }
+        let shape = [batch, t, heads, d];
+        let (q4, k4, v4) = (q.try_reshape(shape).unwrap(), k.try_reshape(shape).unwrap(), v.try_reshape(shape).unwrap());
+        let opts = svod_tk::FaOpts { causal, ..Default::default() };
+        if let Ok(Some(tk1)) = svod_tk::flash_attention_with(&q4, &k4, &v4, opts) {
+            plans.push((format!("tk1 d{d} causal={causal}"), tk1.prepare().unwrap()));
+        }
+        let mut best = vec![f64::INFINITY; plans.len()];
+        for _ in 0..4 {
+            for (i, (_, plan)) in plans.iter().enumerate() {
+                for _ in 0..5 {
+                    for kp in plan.execute_profiled().unwrap() {
+                        if let (Some(s), Some(e)) = (kp.gpu_start_ns, kp.gpu_end_ns) {
+                            best[i] = best[i].min((e - s) as f64 * 1e-9);
+                        }
+                    }
+                }
+            }
+        }
+        for ((label, _), secs) in plans.iter().zip(&best) {
+            eprintln!("{label}: {:.3} ms, {:.1} TFLOP/s", secs * 1e3, flops / secs / 1e12);
+        }
+    }
+}
