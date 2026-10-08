@@ -5,7 +5,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
-use super::{Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, live, typed};
+use super::{Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, typed};
 use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
 use crate::launch;
 
@@ -64,11 +64,9 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     let epilogue =
         Epilogue { bias: opts.bias.is_some(), act: opts.act, gated: opts.gated, residual: opts.residual.is_some() };
     let spec = GemmSpec { m, n, k, batch: batch_of(&var, 1), epilogue, cfg };
-    let y = Tensor::empty(&[lead, &[n]].concat(), x.dtype());
+    let y = output(&[lead, &[n]].concat(), &var, x.dtype());
     let ins: Vec<&Tensor> = [Some(x), Some(w), opts.bias, opts.residual, Some(&y)].into_iter().flatten().collect();
-    let y = launch::graph_launch(typed!(x.dtype(), gemm, &spec), &cfg.lowering(target), &ins)
-        .context(LaunchSnafu { op: OP })?;
-    live(OP, y, &var)
+    launch::graph_launch(typed!(x.dtype(), gemm, &spec), &cfg.lowering(target), &ins).context(LaunchSnafu { op: OP })
 }
 
 /// The generic graph of the same op; the input is materialized, since a lazy

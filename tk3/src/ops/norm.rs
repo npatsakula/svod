@@ -5,7 +5,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
-use super::{GraphSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, live, typed};
+use super::{GraphSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, typed};
 use crate::kernels::rows::{Norm, NormSpec, norm as kernel};
 use crate::launch;
 
@@ -74,18 +74,15 @@ fn norm(
     let (lead, d) = (&ext.dims[..ext.dims.len() - 1], ext.dims[ext.dims.len() - 1]);
     let rows = lead[usize::from(var.is_some())..].iter().product();
     let spec = NormSpec { norm: kind, rows, d, batch: batch_of(&var, 1), eps, residual: residual.is_some(), cfg };
-    let out = Tensor::empty(&ext.dims, x.dtype());
-    let sum = residual.map(|_| Tensor::empty(&ext.dims, x.dtype()));
+    let out = output(&ext.dims, &var, x.dtype());
+    let sum = residual.map(|_| output(&ext.dims, &var, x.dtype()));
     let ins: Vec<&Tensor> = [Some(x), residual, Some(w), b, Some(&out), sum.as_ref()].into_iter().flatten().collect();
     let at = ins.len() - 1 - usize::from(sum.is_some());
     let mut outs =
         launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &cfg.lowering(target.expect("planned")), &ins)
             .context(LaunchSnafu { op })?;
-    let sum = match sum {
-        Some(_) => Some(live(op, outs.pop().expect("the sum"), &var)?),
-        None => None,
-    };
-    Ok((sum, live(op, outs.swap_remove(at), &var)?))
+    let sum = sum.map(|_| outs.pop().expect("the sum"));
+    Ok((sum, outs.swap_remove(at)))
 }
 
 pub(crate) fn graph(

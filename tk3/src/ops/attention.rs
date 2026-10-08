@@ -7,7 +7,7 @@ use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
-use super::{DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, live, typed};
+use super::{DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, typed};
 use crate::kernels::attention::{AttnSpec, attention as fa};
 use crate::launch;
 
@@ -76,12 +76,11 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         scale: opts.scale.unwrap_or(1.0 / (d as f32).sqrt()),
         cfg,
     };
-    let o = Tensor::empty(&q_ext.dims, q.dtype());
+    let o = output(&q_ext.dims, &var, q.dtype());
     let lens = lens.map(|l| if l.dtype() == DType::Int32 { l.clone() } else { l.cast(DType::Int32) });
     let ins: Vec<&Tensor> = [Some(q), Some(k), Some(v), Some(&o), lens.as_ref()].into_iter().flatten().collect();
-    let o = launch::graph_launch(typed!(q.dtype(), fa, &spec), &cfg.lowering(target.expect("planned")), &ins)
-        .context(LaunchSnafu { op: OP })?;
-    live(OP, o, &var)
+    launch::graph_launch(typed!(q.dtype(), fa, &spec), &cfg.lowering(target.expect("planned")), &ins)
+        .context(LaunchSnafu { op: OP })
 }
 
 fn dims4(dims: &[usize]) -> [usize; 4] {
