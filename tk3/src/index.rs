@@ -33,7 +33,7 @@ pub fn shr(a: &Arc<UOp>, bits: u32) -> Arc<UOp> {
 
 /// The memory access form the renderer takes: a scalar INDEX, or for `w > 1`
 /// the coalesced `SHRINK(buffer, offset, w)` of one `w`-wide access.
-fn access(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize) -> Arc<UOp> {
+pub fn access(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize) -> Arc<UOp> {
     if w == 1 {
         return UOp::index().buffer(buf.clone()).indices(vec![off.clone()]).call().expect("INDEX");
     }
@@ -44,22 +44,39 @@ pub fn index(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize) -> Arc<UOp> {
     access(buf, off, w)
 }
 
-/// A `w`-wide load at `off`, `tag`ged so two loads of one address around a
-/// store stay two loads.
-pub fn load(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize, tag: u64) -> Arc<UOp> {
-    UOp::load().index(access(buf, off, w)).call().rtag(Some(smallvec![tag as usize]))
+/// A load through an access node, `tag`ged so two loads of one address
+/// around a store stay two loads.
+pub fn load_at(access: &Arc<UOp>, tag: u64) -> Arc<UOp> {
+    UOp::load().index(access.clone()).call().rtag(Some(smallvec![tag as usize]))
 }
 
-/// A `w`-wide load that yields zeros where `gate` is false.
-pub fn load_gated(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize, gate: &Arc<UOp>, tag: u64) -> Arc<UOp> {
+/// A load through a gated access node (`off.valid(gate)`) that yields zeros
+/// where `gate` is false.
+pub fn load_gated_at(access: &Arc<UOp>, w: usize, gate: &Arc<UOp>, tag: u64) -> Arc<UOp> {
+    let buf = match access.op() {
+        Op::Shrink(ops::Shrink { src, .. }) => src.clone(),
+        Op::Index(ops::Index { buffer, .. }) => buffer.clone(),
+        _ => unreachable!("an access node"),
+    };
     let elem = match buf.dtype() {
         DType::Ptr { base, .. } => *base,
         other => other,
     };
     let scalar = elem.scalar().expect("a scalar element");
     let zero = scalar.vec(w).zero_const();
-    let index = access(buf, &off.valid(gate.clone()), w);
-    UOp::load().index(index).alt(zero).gate(gate.clone()).call().rtag(Some(smallvec![tag as usize]))
+    UOp::load().index(access.clone()).alt(zero).gate(gate.clone()).call().rtag(Some(smallvec![tag as usize]))
+}
+
+pub fn store_at(access: &Arc<UOp>, vals: Vec<Arc<UOp>>) -> Arc<UOp> {
+    let w = vals.len();
+    let value =
+        if w == 1 { vals.into_iter().next().expect("one value") } else { UOp::stack(vals.into_iter().collect()) };
+    access.store(value)
+}
+
+/// A `w`-wide load at `off`.
+pub fn load(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize, tag: u64) -> Arc<UOp> {
+    load_at(&access(buf, off, w), tag)
 }
 
 trait ZeroConst {

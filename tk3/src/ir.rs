@@ -250,6 +250,9 @@ pub struct Loop {
     pub extent: ScalarId,
     pub carried: Vec<Carried>,
     pub body: Block,
+    /// Copies of the body per emitted iteration (1 = rolled); the schedule
+    /// template sets it so ring-slot arithmetic folds to constants.
+    pub unroll: u32,
 }
 
 /// One side of a [`Pipeline`]: a body parameterized by the step it handles

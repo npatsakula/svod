@@ -22,7 +22,7 @@ fn expansion_preserves_the_result(prefetch: Prefetch, stages: usize) {
     let a: Vec<f64> = (0..m * k).map(|i| round_to(ScalarDType::BFloat16, ((i * 13) % 17) as f64 / 8.0 - 1.0)).collect();
     let b: Vec<f64> = (0..n * k).map(|i| round_to(ScalarDType::BFloat16, ((i * 7) % 19) as f64 / 8.0 - 1.0)).collect();
     let want = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[("b", 1)]).unwrap();
-    expand(&mut prog, Schedule::Uniform { prefetch });
+    expand(&mut prog, Schedule::Uniform { prefetch, unroll: true });
     let got = run(&prog, vec![a, b, vec![0.0; m * n]], &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
@@ -46,7 +46,7 @@ fn expansion_preserves_the_result(prefetch: Prefetch, stages: usize) {
 #[test]
 fn register_staging_splits_the_copies_around_the_compute() {
     let mut prog = super::programs::gemm_nt(32, 32, 64, 32, 32, 32, 2);
-    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged });
+    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: true });
     let Stmt::Loop(l) = &prog.body.0[1] else { panic!("the pipeline became a loop") };
     let blocks: Vec<&Block> = l
         .body

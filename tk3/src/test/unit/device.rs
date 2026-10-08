@@ -47,7 +47,7 @@ fn gemm_matches_the_interpreter(
     prog.warps = wr * wc;
     let lowering = Lowering {
         target,
-        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync },
+        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: true },
         grid: WarpGrid { rows: wr, cols: wc },
         swizzle: true,
     };
@@ -108,25 +108,27 @@ fn gemm_throughput_probe() {
         eprintln!("{label}: {:.2} ms, {:.1} TFLOP/s", best * 1e3, flops / best / 1e12);
     };
     // Static shared memory is capped at 48 KB on this path.
-    for (bm, bn, bk, stages, wr, wc) in [
-        (128, 128, 32, 3, 2, 4),
-        (128, 128, 16, 4, 2, 4),
-        (128, 256, 32, 2, 2, 4),
-        (64, 128, 64, 2, 2, 2),
-        (128, 128, 32, 2, 4, 2),
+    for (bm, bn, bk, stages, wr, wc, group_m, unroll) in [
+        (128, 64, 32, 2, 2, 2, 8, true),
+        (128, 64, 32, 2, 2, 2, 8, false),
+        (128, 64, 32, 2, 2, 2, 0, true),
+        (128, 128, 32, 3, 2, 4, 8, true),
+        (128, 128, 32, 3, 2, 4, 8, false),
+        (64, 128, 64, 2, 2, 2, 8, true),
+        (128, 128, 32, 2, 4, 2, 8, false),
     ] {
-        let mut prog = super::programs::gemm_nt(m, n, k, bm, bn, bk, stages);
+        let mut prog = super::programs::gemm_nt_ordered(m, n, k, bm, bn, bk, stages, group_m);
         prog.warps = wr * wc;
         let lowering = Lowering {
             target: target.clone(),
-            schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync },
+            schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll },
             grid: WarpGrid { rows: wr, cols: wc },
             swizzle: true,
         };
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
         let plan = out.prepare().unwrap();
-        time(&plan, &format!("tk3 {bm}x{bn}x{bk} s{stages} {wr}x{wc}"));
+        time(&plan, &format!("tk3 {bm}x{bn}x{bk} s{stages} {wr}x{wc} group_m={group_m} unroll={unroll}"));
     }
     let a2 = a_t.try_reshape([m, k]).unwrap();
     let b2 = b_t.try_reshape([n, k]).unwrap();
