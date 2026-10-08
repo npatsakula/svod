@@ -52,7 +52,7 @@ The motivation and design are covered in
 | Speech recognition | Whisper, GigaAM v3 (CTC, RN-T) |
 | Voice activity | FireRedVAD, Silero VAD |
 | Speech enhancement | GTCRN |
-| Speaker analysis | DiariZen, WeSpeaker |
+| Speaker analysis | Nemotron-3-Diarization, DiariZen, WeSpeaker |
 | Text embeddings and reranking | BGE-M3, Qwen3-Embedding, ModernBERT |
 | Vision | YOLO26, ResNet |
 | Anything else | [ONNX importer](onnx/) ([op coverage](onnx/PARITY.md)) |

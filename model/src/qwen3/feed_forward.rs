@@ -19,7 +19,7 @@ use svod_tensor::nn::{Module, StateDict, get_tensor, prefixed};
 use crate::init::fan_in_uniform;
 
 use super::error::Result;
-use super::linear::{Projected, linear, linear_add};
+use crate::linear::{Projected, linear, linear_add};
 
 #[derive(Clone)]
 pub struct Qwen3MLP {
@@ -48,14 +48,14 @@ impl Qwen3MLP {
     /// The MLP over `x`, with `residual` folded into the `down_proj` GEMM's
     /// epilogue when that kernel takes it (see [`linear_add`]).
     pub(crate) fn forward_into(&self, x: &Tensor, residual: Option<&Tensor>) -> Result<Projected> {
-        linear_add(&self.activation(x)?, &self.down_weight, residual)
+        Ok(linear_add(&self.activation(x)?, &self.down_weight, residual)?)
     }
 
     /// `silu(gate(x)) * up(x)` — one GEMM whose epilogue writes it, or the fused
     /// GEMM plus the split / silu / multiply graph where that epilogue declines.
     fn activation(&self, x: &Tensor) -> Result<Tensor> {
         if let Some(pair) = self.pair
-            && let Some(act) = super::linear::linear_swiglu(x, &self.gate_up_weight, pair)?
+            && let Some(act) = crate::linear::linear_swiglu(x, &self.gate_up_weight, pair)?
         {
             return Ok(act);
         }

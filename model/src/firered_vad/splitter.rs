@@ -99,7 +99,9 @@ impl FireRedVadSplitter {
         Self::from_model(FireRedVad::from_safetensors(path).context(LoadSnafu)?, bounds)
     }
 
-    fn from_model(
+    /// Bake a splitter around an already-loaded model (cheap to clone: weights
+    /// are shared), e.g. one VAD load serving several encoders' bounds.
+    pub fn from_model(
         model: FireRedVad,
         bounds: &EncoderBounds,
     ) -> Result<VadSplitter<FireRedVadProbs>, FireRedVadSplitterError> {

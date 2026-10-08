@@ -18,6 +18,7 @@ CTC / RN-T decoders, VAD chunking और long-form ऑडियो पाइप�
 | वॉइस एक्टिविटी | Silero VAD 16k | `silero_vad` | `vpermilp/silero-vad` |
 | स्पीच एन्हांसमेंट | GTCRN | `gtcrn` | `vpermilp/gtcrn` |
 | स्पीकर डायराइज़ेशन | DiariZen (WavLM + Conformer) | `diarizen` | `BUT-FIT/diarizen-wavlm-large-s80-md-v2` |
+| स्पीकर डायराइज़ेशन | Nemotron-3-Diarization (ऑफ़लाइन, स्ट्रीमिंग; अधिकतम 8 स्पीकर) | `nemotron_diar` | `nvidia/Nemotron-3-Diarization` |
 | स्पीकर एम्बेडिंग | WeSpeaker ResNet34 | `wespeaker` | `pyannote/wespeaker-voxceleb-resnet34-LM` |
 | टेक्स्ट एम्बेडिंग | BGE-M3 (dense, sparse, ColBERT), BGE-reranker-v2-m3 | `bgem3` | `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3` |
 | टेक्स्ट एम्बेडिंग | Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B | `qwen3` | `Qwen/Qwen3-Embedding-0.6B` |
@@ -34,10 +35,10 @@ CTC / RN-T decoders, VAD chunking और long-form ऑडियो पाइप�
 
 ```toml
 [dependencies]
-svod-model  = "0.1"
-svod-arch   = "0.1"   # Asr, splitters, decoders
-svod-tensor = "0.1"
-svod-dtype  = "0.1"
+svod-model  = "0.2"
+svod-arch   = "0.2"   # Asr, splitters, decoders
+svod-tensor = "0.2"
+svod-dtype  = "0.2"
 ```
 
 बिल्ड के लिए मशीन पर LLVM और Clang चाहिए (देखें
@@ -69,6 +70,7 @@ cargo run -p svod-model --release --example whisper_infer  -- audio.wav [--size 
 cargo run -p svod-model --release --example vad_stream     -- audio.wav                # streaming VAD events
 cargo run -p svod-model --release --example vad_bench      -- audio.wav                # Silero vs FireRedVAD
 cargo run -p svod-model --release --example gtcrn_enhance  -- --in noisy.wav --out clean.wav --hub
+cargo run -p svod-model --release --example nemotron_diarize -- audio.wav [--stream low|very-low|ultra-low]
 cargo run -p svod-model --release --example qwen3_embed    -- --texts texts.txt --batch 8 --max-len 512
 cargo run -p svod-model --release --example resnet_classify -- --hub --image dog.bin --side 224
 cargo run -p svod-model --release --example yolo_detect    -- --hub --scale small --image photo.bin --side 640
@@ -215,6 +217,43 @@ for chunk in waveform.chunks(CHUNK) {               // pad the last one to CHUNK
     jit.output()?.copyout(bytemuck::cast_slice_mut(&mut out))?;
 }
 ```
+
+---
+
+## स्पीकर डायराइज़ेशन
+
+`nemotron_diar` Nemotron-3-Diarization चलाता है: हर 10 ms फ़्रेम के लिए अधिकतम 8
+स्पीकरों की गतिविधि, जिन्हें पहली बार आने के क्रम में क्रमांकित किया जाता है।
+रिकॉर्डिंग और लाइव स्ट्रीम एक ही लूप से गुज़रते हैं — ऑडियो को चंक में काटा जाता है,
+और हर चंक पिछले फ़्रेमों के स्पीकर कैश के साथ एनकोड होता है — फ़र्क़ सिर्फ़ चंक के
+आकार का है (ऑफ़लाइन, या मॉडल कार्ड की 1.04 / 0.64 / 0.32 s लेटेंसी):
+
+```rust
+use svod_arch::diarization::{Binarization, write_rttm};
+use svod_dtype::DType;
+use svod_model::nemotron_diar::{Diarizer, NemotronDiar, StreamingMode};
+
+// पूरी रिकॉर्डिंग।
+let mut diarizer = Diarizer::offline(NemotronDiar::from_hub(DType::BFloat16, 1)?)?;
+let result = diarizer.diarize(&waveform, 16000)?;        // probs: [frames, 8], 10 ms की पंक्तियाँ
+write_rttm(std::io::stdout(), "meeting", &result.segments(&Binarization::default()))?;
+
+// लाइव स्ट्रीम, 1.04 s लेटेंसी।
+let model = NemotronDiar::from_hub(DType::BFloat16, 1)?;
+let mut diarizer = Diarizer::streaming(model, StreamingMode::LowLatency)?;
+let mut session = diarizer.session();
+for block in microphone {
+    session.push(&block)?;
+    diarizer.run(&mut [&mut session])?;
+    let probs = session.take_probs();                    // पिछली कॉल के बाद निकली पंक्तियाँ
+}
+session.finish();
+diarizer.run(&mut [&mut session])?;
+```
+
+`run` कितने भी सेशन लेता है और उनके तैयार चंक को बैच में जोड़ता है, अधिकतम
+`from_hub` को दिए गए `max_batch` तक। `svod_arch::diarization` में मॉडल से स्वतंत्र
+हिस्से हैं: स्पीकर कैश, प्रायिकताओं को सेगमेंट में बदलने वाली थ्रेशोल्ड, और RTTM आउटपुट।
 
 ---
 

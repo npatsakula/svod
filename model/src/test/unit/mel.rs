@@ -8,7 +8,7 @@ use svod_tensor::Tensor;
 use svod_tensor::nn::{MelNorm, MelScale as FbScale};
 use test_case::test_case;
 
-use crate::audio::{MelConfig, MelScale, MelSpectrogram};
+use crate::audio::{FrameCursor, MelConfig, MelLog, MelScale, MelSpectrogram, PadMode};
 use crate::whisper::{N_FRAMES, N_SAMPLES, WhisperMel};
 
 fn gigaam_config() -> MelConfig {
@@ -20,6 +20,10 @@ fn gigaam_config() -> MelConfig {
         n_mels: 64,
         center: true,
         mel_scale: MelScale::Htk,
+        periodic: true,
+        pad_mode: crate::audio::PadMode::Reflect,
+        preemphasis: None,
+        log: crate::audio::MelSpectrogram::LOG,
     }
 }
 
@@ -32,6 +36,10 @@ fn whisper_config() -> MelConfig {
         n_mels: 80,
         center: true,
         mel_scale: MelScale::Slaney,
+        periodic: true,
+        pad_mode: crate::audio::PadMode::Reflect,
+        preemphasis: None,
+        log: crate::audio::MelSpectrogram::LOG,
     }
 }
 
@@ -275,4 +283,181 @@ fn graph_mel_matches_naive_dft_on_real_clip() {
     };
     assert_gigaam_parity(&[&clip, &clip[16000 / 2..16000 + 321]], "ru_clip_0");
     assert_whisper_parity(&[&clip], "ru_clip_0");
+}
+
+// =========================================================================
+// NeMo front-end and incremental framing
+// =========================================================================
+
+/// NeMo's `AudioToMelSpectrogramPreprocessor` as Nemotron-3-Diarization sets
+/// it (`n_fft` 512 over a 400-sample symmetric Hann, zero `center` padding,
+/// whole-signal pre-emphasis 0.97, 128 Slaney mels, `ln(x + 2^-24)`).
+fn nemo_config() -> MelConfig {
+    MelConfig {
+        sample_rate: 16000,
+        n_fft: 512,
+        hop_length: 160,
+        win_length: 400,
+        n_mels: 128,
+        center: true,
+        mel_scale: MelScale::Slaney,
+        periodic: false,
+        pad_mode: PadMode::Zero,
+        preemphasis: Some(0.97),
+        log: MelLog::LnAdd { guard: 2f64.powi(-24) },
+    }
+}
+
+/// Naive NeMo log-mel `[n_mels, L / hop + 1]`: pre-emphasis (first sample
+/// kept), zero padding, the symmetric window centered in `n_fft`, a DFT per
+/// frame, the Slaney filterbank, `ln(x + 2^-24)`.
+fn ref_nemo_log_mel(x: &[f32]) -> Vec<f64> {
+    let config = nemo_config();
+    let (n_fft, hop, win_length, n_mels) = (config.n_fft, config.hop_length, config.win_length, config.n_mels);
+    let n_bins = n_fft / 2 + 1;
+    let fb: Vec<f64> = Tensor::mel_filterbank(
+        16000,
+        n_fft,
+        n_mels,
+        0.0,
+        8000.0,
+        FbScale::Slaney,
+        Some(MelNorm::Slaney),
+        DType::Float32,
+    )
+    .unwrap()
+    .to_vec::<f32>()
+    .unwrap()
+    .into_iter()
+    .map(f64::from)
+    .collect();
+    let left = (n_fft - win_length) / 2;
+    let win: Vec<f64> = (0..n_fft)
+        .map(|n| match n.checked_sub(left) {
+            Some(k) if k < win_length => 0.5 - 0.5 * (TAU * k as f64 / (win_length - 1) as f64).cos(),
+            _ => 0.0,
+        })
+        .collect();
+    let emphasized: Vec<f64> =
+        (0..x.len()).map(|n| f64::from(x[n]) - if n > 0 { 0.97 * f64::from(x[n - 1]) } else { 0.0 }).collect();
+    let mut sig = vec![0.0; n_fft / 2];
+    sig.extend(emphasized);
+    sig.extend(std::iter::repeat_n(0.0, n_fft / 2));
+    let frames = (sig.len() - n_fft) / hop + 1;
+    let mut out = vec![0.0; n_mels * frames];
+    for t in 0..frames {
+        let frame = &sig[t * hop..t * hop + n_fft];
+        let power: Vec<f64> = (0..n_bins)
+            .map(|k| {
+                let (re, im) = (0..n_fft).fold((0.0, 0.0), |(re, im), n| {
+                    let angle = TAU * ((k * n) % n_fft) as f64 / n_fft as f64;
+                    let v = frame[n] * win[n];
+                    (re + v * angle.cos(), im - v * angle.sin())
+                });
+                re * re + im * im
+            })
+            .collect();
+        for m in 0..n_mels {
+            let energy: f64 = (0..n_bins).map(|k| fb[m * n_bins + k] * power[k]).sum();
+            out[m * frames + t] = (energy + 2f64.powi(-24)).ln();
+        }
+    }
+    out
+}
+
+/// Host framing and the graph's own `center` padding both reproduce the naive
+/// NeMo front-end, pre-emphasis and zero padding included.
+#[test]
+fn nemo_front_end_matches_naive_reference() {
+    let mel = MelSpectrogram::new(&nemo_config());
+    let signal = synthetic(16000 / 2 + 37, 9);
+    let frames = mel.num_frames(signal.len());
+    assert_eq!(frames, signal.len() / 160 + 1);
+    let want = ref_nemo_log_mel(&signal);
+
+    let mut framed = vec![0.0f32; mel.framed_len(signal.len())];
+    mel.frame_into(&signal, &mut framed);
+    let host = mel
+        .forward_tensor(&Tensor::from_slice(framed).try_unsqueeze(0).unwrap(), &Tensor::from_slice(vec![frames as i32]))
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap();
+    let graph = mel
+        .forward_power_tensor(&Tensor::from_slice(signal.clone()))
+        .unwrap()
+        .mel_log(nemo_config().log)
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap();
+    for (label, got) in [("host framing", host), ("graph padding", graph)] {
+        let worst = max_abs_diff(&got, &want);
+        eprintln!("nemo {label} vs naive log-mel max abs diff: {worst:.3e}");
+        assert!(worst <= 2e-3, "{label}: max abs diff {worst}");
+    }
+}
+
+fn cursor_config(pad_mode: PadMode, preemphasis: Option<f32>, center: bool) -> MelConfig {
+    MelConfig { pad_mode, preemphasis, center, n_fft: 64, win_length: 48, hop_length: 16, ..nemo_config() }
+}
+
+#[test]
+#[should_panic(expected = "precedes the discarded prefix")]
+fn staging_a_discarded_frame_panics() {
+    let mel = MelSpectrogram::new(&cursor_config(PadMode::Zero, None, true));
+    let mut cursor = mel.cursor();
+    cursor.push(&synthetic(400, 3));
+    cursor.discard(8);
+    let mut out = vec![0.0f32; mel.frames_len(1)];
+    cursor.stage(7, &mut out);
+}
+
+proptest::proptest! {
+    /// A signal pushed in arbitrary pieces stages, for every frame run that
+    /// has arrived, exactly the samples whole-signal framing stages — across
+    /// discards of consumed frames.
+    #[test]
+    fn cursor_matches_whole_signal_framing(
+        len in 70usize..600,
+        cuts in proptest::collection::vec(1usize..90, 1..12),
+        run in 1usize..6,
+        zero_pad: bool,
+        preemphasis: bool,
+        center: bool,
+    ) {
+        let config = cursor_config(
+            if zero_pad { PadMode::Zero } else { PadMode::Reflect },
+            preemphasis.then_some(0.97),
+            center,
+        );
+        let mel = MelSpectrogram::new(&config);
+        let signal = synthetic(len, len as u32);
+        let mut whole = vec![0.0f32; mel.framed_len(len)];
+        mel.frame_into(&signal, &mut whole);
+
+        let mut cursor = mel.cursor();
+        let (mut fed, mut next) = (0, 0);
+        let check = |cursor: &mut FrameCursor, next: &mut usize| -> Result<(), proptest::test_runner::TestCaseError> {
+            while *next + run <= cursor.available() {
+                let mut out = vec![f32::NAN; mel.frames_len(run)];
+                cursor.stage(*next, &mut out);
+                let from = *next * 16;
+                proptest::prop_assert_eq!(&out[..], &whole[from..from + out.len()]);
+                *next += 1;
+                cursor.discard(*next);
+            }
+            Ok(())
+        };
+        for cut in cuts.iter().cycle() {
+            if fed == len {
+                break;
+            }
+            let to = (fed + cut).min(len);
+            cursor.push(&signal[fed..to]);
+            fed = to;
+            check(&mut cursor, &mut next)?;
+        }
+        cursor.finish();
+        proptest::prop_assert_eq!(cursor.available(), mel.num_frames(len));
+        check(&mut cursor, &mut next)?;
+    }
 }

@@ -18,6 +18,7 @@ CTC / RN-T decoders, VAD chunking and the long-form audio pipeline.
 | Voice activity | Silero VAD 16k | `silero_vad` | `vpermilp/silero-vad` |
 | Speech enhancement | GTCRN | `gtcrn` | `vpermilp/gtcrn` |
 | Speaker diarization | DiariZen (WavLM + Conformer) | `diarizen` | `BUT-FIT/diarizen-wavlm-large-s80-md-v2` |
+| Speaker diarization | Nemotron-3-Diarization (offline, streaming; up to 8 speakers) | `nemotron_diar` | `nvidia/Nemotron-3-Diarization` |
 | Speaker embedding | WeSpeaker ResNet34 | `wespeaker` | `pyannote/wespeaker-voxceleb-resnet34-LM` |
 | Text embeddings | BGE-M3 (dense, sparse, ColBERT), BGE-reranker-v2-m3 | `bgem3` | `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3` |
 | Text embeddings | Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B | `qwen3` | `Qwen/Qwen3-Embedding-0.6B` |
@@ -34,10 +35,10 @@ lists the upstream repositories and the parity tests behind each row.
 
 ```toml
 [dependencies]
-svod-model  = "0.1"
-svod-arch   = "0.1"   # Asr, splitters, decoders
-svod-tensor = "0.1"
-svod-dtype  = "0.1"
+svod-model  = "0.2"
+svod-arch   = "0.2"   # Asr, splitters, decoders
+svod-tensor = "0.2"
+svod-dtype  = "0.2"
 ```
 
 The build needs LLVM and Clang on the machine (see the
@@ -69,6 +70,7 @@ cargo run -p svod-model --release --example whisper_infer  -- audio.wav [--size 
 cargo run -p svod-model --release --example vad_stream     -- audio.wav                # streaming VAD events
 cargo run -p svod-model --release --example vad_bench      -- audio.wav                # Silero vs FireRedVAD
 cargo run -p svod-model --release --example gtcrn_enhance  -- --in noisy.wav --out clean.wav --hub
+cargo run -p svod-model --release --example nemotron_diarize -- audio.wav [--stream low|very-low|ultra-low]
 cargo run -p svod-model --release --example qwen3_embed    -- --texts texts.txt --batch 8 --max-len 512
 cargo run -p svod-model --release --example resnet_classify -- --hub --image dog.bin --side 224
 cargo run -p svod-model --release --example yolo_detect    -- --hub --scale small --image photo.bin --side 640
@@ -215,6 +217,44 @@ for chunk in waveform.chunks(CHUNK) {               // pad the last one to CHUNK
     jit.output()?.copyout(bytemuck::cast_slice_mut(&mut out))?;
 }
 ```
+
+---
+
+## Speaker diarization
+
+`nemotron_diar` runs Nemotron-3-Diarization: per 10 ms frame, the activity of
+up to 8 speakers, numbered by first appearance. Recordings and live streams run
+the same loop — the audio is cut into chunks, each encoded together with a
+speaker cache of earlier frames — and differ only in chunk sizes (offline, or
+the model card's 1.04 / 0.64 / 0.32 s latencies):
+
+```rust
+use svod_arch::diarization::{Binarization, write_rttm};
+use svod_dtype::DType;
+use svod_model::nemotron_diar::{Diarizer, NemotronDiar, StreamingMode};
+
+// Whole recording.
+let mut diarizer = Diarizer::offline(NemotronDiar::from_hub(DType::BFloat16, 1)?)?;
+let result = diarizer.diarize(&waveform, 16000)?;        // probs: [frames, 8], 10 ms rows
+write_rttm(std::io::stdout(), "meeting", &result.segments(&Binarization::default()))?;
+
+// Live stream, 1.04 s latency.
+let model = NemotronDiar::from_hub(DType::BFloat16, 1)?;
+let mut diarizer = Diarizer::streaming(model, StreamingMode::LowLatency)?;
+let mut session = diarizer.session();
+for block in microphone {
+    session.push(&block)?;
+    diarizer.run(&mut [&mut session])?;
+    let probs = session.take_probs();                    // rows emitted since the last call
+}
+session.finish();
+diarizer.run(&mut [&mut session])?;
+```
+
+`run` takes any number of sessions and batches their ready chunks, up to the
+`max_batch` passed to `from_hub`. `svod_arch::diarization` holds the
+model-agnostic parts: the speaker cache, the thresholds turning probabilities
+into segments, and RTTM output.
 
 ---
 

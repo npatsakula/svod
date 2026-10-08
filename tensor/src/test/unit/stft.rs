@@ -836,6 +836,7 @@ fn ref_mel_spectrogram(
     match log {
         None => mel,
         Some(MelLog::Ln { min, max }) => mel.iter().map(|v| v.clamp(min, max).ln()).collect(),
+        Some(MelLog::LnAdd { guard }) => mel.iter().map(|v| (v + guard).ln()).collect(),
         Some(MelLog::Whisper) => {
             let logged: Vec<f64> = mel.iter().map(|v| v.max(1e-10).log10()).collect();
             let floor = logged.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - 8.0;
@@ -848,6 +849,7 @@ fn ref_mel_spectrogram(
 #[test_case(MelScale::Htk, None, 1.0, None; "torchaudio magnitude")]
 #[test_case(MelScale::Htk, None, 2.0, Some(MelLog::Ln { min: 1e-9, max: 1e9 }); "gigaam log")]
 #[test_case(MelScale::Slaney, Some(MelNorm::Slaney), 2.0, Some(MelLog::Whisper); "whisper log")]
+#[test_case(MelScale::Slaney, Some(MelNorm::Slaney), 2.0, Some(MelLog::LnAdd { guard: 2f64.powi(-24) }); "nemo log")]
 #[test_case(MelScale::Slaney, Some(MelNorm::Slaney), 3.0, None; "fractional power")]
 fn mel_spectrogram_matches_naive_host_pipeline(
     scale: MelScale,

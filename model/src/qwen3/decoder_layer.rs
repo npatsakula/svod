@@ -24,7 +24,7 @@ use svod_tensor::nn::{Layer, Module, RmsNorm};
 use super::attention::Qwen3Attention;
 use super::error::{Result, TkSnafu};
 use super::feed_forward::Qwen3MLP;
-use super::linear::Projected;
+use crate::linear::Projected;
 
 /// The residual stream between sublayers: logically `stream + pending`, held
 /// unsummed until a norm consumes both in one pass.

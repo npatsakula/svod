@@ -24,8 +24,8 @@ use svod_codegen::program_pipeline::{self, ProgramTarget};
 use svod_device::Buffer;
 use svod_device::device::{Device, Program, ProgramSpec};
 use svod_dtype::{DType, DeviceSpec, GpuArch};
-use svod_ir::UOp;
 use svod_ir::ops;
+use svod_ir::{SInt, UOp};
 use svod_tensor::Tensor;
 
 use crate::target::ArchSet;
@@ -187,6 +187,10 @@ pub enum Error {
     /// An operand has a symbolic (non-constant) dimension; the kernel needs static dims.
     #[snafu(display("{kernel}: operand {operand}: dim {axis} is not statically known"))]
     OperandSymbolicDim { kernel: &'static str, operand: &'static str, axis: usize },
+    /// A direct launch was given a variable grid extent; only a graph launch
+    /// binds variables.
+    #[snafu(display("{name}: launch grid extent {axis} is not a constant; only a graph launch binds a variable"))]
+    SymbolicGridExtent { name: String, axis: usize },
 }
 
 /// Resolve a tensor operand's shape to concrete `usize` dims, or an
@@ -231,6 +235,80 @@ pub fn concrete_dims_at_least(
     (0..shape.len())
         .map(|i| pinned_dim(&shape[i]).context(OperandSymbolicDimSnafu { kernel, operand, axis: i }))
         .collect()
+}
+
+/// A leading (batch) dim bound to a runtime variable — the JIT `batch_var`.
+#[derive(Clone, Debug)]
+pub struct VarBatch {
+    /// The dim as the operand's shape spells it, to shrink an output back to.
+    pub dim: SInt,
+    /// The unbound variable, a launch-grid extent.
+    pub var: Arc<UOp>,
+}
+
+/// [`concrete_dims`] with the leading (batch) dim allowed to be a runtime
+/// variable. The dims come back at the batch's capacity (its `vmax`, which the
+/// scheduler allocates the buffer for), plus the [`VarBatch`] when it is
+/// symbolic. Any other symbolic dim, or a batch that is an expression rather
+/// than a bare variable, is an [`Error::OperandSymbolicDim`].
+pub fn batched_dims(
+    t: &Tensor,
+    kernel: &'static str,
+    operand: &'static str,
+    rank: usize,
+) -> Result<(Vec<usize>, Option<VarBatch>)> {
+    batched_dims_of(t, kernel, operand, rank, true)
+}
+
+/// [`batched_dims`] for an operand of any rank of at least `min_rank`.
+pub fn batched_dims_at_least(
+    t: &Tensor,
+    kernel: &'static str,
+    operand: &'static str,
+    min_rank: usize,
+) -> Result<(Vec<usize>, Option<VarBatch>)> {
+    batched_dims_of(t, kernel, operand, min_rank, false)
+}
+
+/// Whether `t`'s shape is one a hand kernel can bind: every dim static, except
+/// a leading dim that may be a bound runtime variable ([`batched_dims`]) — the
+/// gate a caller checks before handing an operand to a kernel.
+pub fn static_past_batch(t: &Tensor) -> bool {
+    batched_dims_of(t, "", "", 1, false).is_ok()
+}
+
+fn batched_dims_of(
+    t: &Tensor,
+    kernel: &'static str,
+    operand: &'static str,
+    rank: usize,
+    exact: bool,
+) -> Result<(Vec<usize>, Option<VarBatch>)> {
+    let shape = t.shape().ok().context(OperandIndeterminateShapeSnafu { kernel, operand })?;
+    let ranked = if exact { shape.len() == rank } else { shape.len() >= rank };
+    snafu::ensure!(ranked, OperandRankSnafu { kernel, operand, expected: rank, got: shape.len() });
+    let batch = match &shape[0] {
+        SInt::Symbolic(dim) => {
+            let var = match dim.op() {
+                svod_ir::Op::Bind(ops::Bind { var, .. }) => var,
+                _ => dim,
+            };
+            let bounded = match var.op() {
+                svod_ir::Op::Param(ops::Param { arg, .. }) => arg.vmin_vmax.is_some(),
+                svod_ir::Op::DefineVar(..) => true,
+                _ => false,
+            };
+            snafu::ensure!(bounded, OperandSymbolicDimSnafu { kernel, operand, axis: 0usize });
+            Some(VarBatch { dim: shape[0].clone(), var: var.clone() })
+        }
+        _ => None,
+    };
+    let dims = std::iter::once(shape[0].vmax())
+        .chain(shape[1..].iter().map(SInt::as_const))
+        .enumerate()
+        .map(|(axis, dim)| dim.context(OperandSymbolicDimSnafu { kernel, operand, axis }))
+        .collect::<Result<_>>()?;
+    Ok((dims, batch))
 }
 
 /// Compile `sink` for `device` and dispatch it against `buffers`, populating the
@@ -471,7 +549,7 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
 /// ```
 pub fn run_kernel<F>(
     name: impl Into<String>,
-    grid: [i64; 3],
+    grid: impl Into<crate::Grid>,
     block: i64,
     outs: &mut [&mut Tensor],
     ins: &[&Tensor],
@@ -522,7 +600,7 @@ where
 /// ```
 pub fn graph_launch<F>(
     name: impl Into<String>,
-    grid: [i64; 3],
+    grid: impl Into<crate::Grid>,
     block: i64,
     out: Tensor,
     ins: &[&Tensor],
@@ -561,7 +639,7 @@ where
 /// `grid`/`block`, as in [`graph_launch`].
 pub fn graph_launch_multi<F>(
     name: impl Into<String>,
-    grid: [i64; 3],
+    grid: impl Into<crate::Grid>,
     block: i64,
     outs: Vec<Tensor>,
     ins: &[&Tensor],
@@ -663,7 +741,7 @@ pub fn launch_custom<T>(
 /// ```
 pub fn compile_kernel<F>(
     name: impl Into<String>,
-    grid: [i64; 3],
+    grid: impl Into<crate::Grid>,
     block: i64,
     outs: &mut [&mut Tensor],
     ins: &[&Tensor],
@@ -672,6 +750,10 @@ pub fn compile_kernel<F>(
 where
     F: FnOnce(&crate::Kernel) -> Arc<UOp>,
 {
+    let (name, grid): (String, crate::Grid) = (name.into(), grid.into());
+    if let Some(axis) = grid.0.iter().position(|extent| !matches!(extent.op(), svod_ir::Op::Const(..))) {
+        return SymbolicGridExtentSnafu { name, axis }.fail();
+    }
     // Inputs must hold concrete DATA: realize (compute) any lazy graph first.
     // Outputs are allocated fresh by `realize_buffer` below.
     for t in ins.iter() {

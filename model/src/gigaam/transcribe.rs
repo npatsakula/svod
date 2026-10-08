@@ -234,6 +234,10 @@ impl GigaAmTranscriber {
             n_mels: model.config.n_mels,
             center: model.config.mel_center,
             mel_scale: crate::audio::MelScale::Htk,
+            periodic: true,
+            pad_mode: crate::audio::PadMode::Reflect,
+            preemphasis: None,
+            log: crate::audio::MelSpectrogram::LOG,
         });
 
         let subsampling_factor = model.config.subsampling_factor;
@@ -340,6 +344,12 @@ impl GigaAmTranscriber {
         };
 
         Ok(Self { model, mel, mel_jit, framed, head_decoder, encoder_jit, max_batch, max_t_mel })
+    }
+
+    /// Windows one compiled dispatch decodes. Every dispatch runs at this batch
+    /// shape, so a caller pooling windows fills batches of exactly this size.
+    pub fn max_batch(&self) -> usize {
+        self.max_batch
     }
 }
 

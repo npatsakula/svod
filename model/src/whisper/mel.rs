@@ -26,6 +26,10 @@ impl WhisperMel {
             n_mels,
             center: true,
             mel_scale: MelScale::Slaney,
+            periodic: true,
+            pad_mode: crate::audio::PadMode::Reflect,
+            preemphasis: None,
+            log: crate::audio::MelSpectrogram::LOG,
         });
         Self { inner }
     }

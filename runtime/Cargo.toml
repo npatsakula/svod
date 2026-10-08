@@ -10,11 +10,11 @@ description = "Kernel execution runtime for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.0" }
-svod-device = { path = "../device", version = "=0.1.0" }
-svod-ir = { path = "../ir", version = "=0.1.0" }
-svod-codegen = { path = "../codegen", version = "=0.1.0" }
-svod-schedule = { path = "../schedule", version = "=0.1.0" }
+svod-dtype = { path = "../dtype", version = "=0.2.0" }
+svod-device = { path = "../device", version = "=0.2.0" }
+svod-ir = { path = "../ir", version = "=0.2.0" }
+svod-codegen = { path = "../codegen", version = "=0.2.0" }
+svod-schedule = { path = "../schedule", version = "=0.2.0" }
 snafu = "0.9"
 parking_lot = "0.12"
 libc = "0.2"

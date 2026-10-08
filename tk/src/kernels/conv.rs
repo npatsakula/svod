@@ -456,7 +456,7 @@ pub fn build_conv(ker: &Kernel, geom: ConvGeom, cfg: GemmCfg, dt: DType, epi: Ep
     let (outs, ins) = ker.bind_abi(&[GlSpec::new(&[1, 1, m, n], dt)], &ins);
     let epi = Epilogue::BiasAct { bias: ins[2].clone(), residual: ins.get(3).cloned(), act };
     let rows = row_source(geom, cfg);
-    gemm_core_with(ker, (m, k, n), cfg, outs[0].clone(), ins[0].clone(), ins[1].clone(), epi, Some(&*rows));
+    gemm_core_with(ker, (m, k, n), cfg, outs[0].clone(), ins[0].clone(), ins[1].clone(), epi, Some(&*rows), false);
 }
 
 /// **Graph-native** channels-last convolution: `x[batch, h, w, cin]` and

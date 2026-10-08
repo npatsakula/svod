@@ -9,24 +9,25 @@ description = "ThunderKittens-style tile DSL for authoring hand-tuned GPU kernel
 autobenches = false # explicit [[bench]] entries below; `benches/common.rs` is a shared module, not a bench
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.0" }
-svod-ir = { path = "../ir", version = "=0.1.0" }
-svod-tensor = { path = "../tensor", version = "=0.1.0" }
+svod-dtype = { path = "../dtype", version = "=0.2.0" }
+svod-ir = { path = "../ir", version = "=0.2.0" }
+svod-tensor = { path = "../tensor", version = "=0.2.0" }
 smallvec = { workspace = true }
 snafu = "0.9"
-svod-codegen = { path = "../codegen", version = "=0.1.0" }
-svod-device = { path = "../device", version = "=0.1.0" }
-svod-runtime = { path = "../runtime", version = "=0.1.0" }
-svod-schedule = { path = "../schedule", version = "=0.1.0" }
+svod-codegen = { path = "../codegen", version = "=0.2.0" }
+svod-device = { path = "../device", version = "=0.2.0" }
+svod-runtime = { path = "../runtime", version = "=0.2.0" }
+svod-schedule = { path = "../schedule", version = "=0.2.0" }
 tracing = "0.1.44"
 
 [dev-dependencies]
-svod-schedule = { path = "../schedule", version = "=0.1.0", features = ["testing"] }
+svod-schedule = { path = "../schedule", version = "=0.2.0", features = ["testing"] }
 proptest = "1.9"
 test-case = "3.3.1"
 criterion = "0.8"
 ndarray.workspace = true # native CPU baseline for the knn bench
 tracing-subscriber = "0.3.23"
+svod-macros = { path = "../macros", version = "=0.2.0" }
 
 # GPU device-time benches (criterion), one binary per kernel sharing `benches/common.rs`.
 # Self-skip when no AMD GPU; run one with e.g. `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench knn`.

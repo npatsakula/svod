@@ -19,6 +19,7 @@ sidebar_label: Запуск моделей
 | Детекция речевой активности | Silero VAD 16k | `silero_vad` | `vpermilp/silero-vad` |
 | Улучшение речи | GTCRN | `gtcrn` | `vpermilp/gtcrn` |
 | Диаризация дикторов | DiariZen (WavLM + Conformer) | `diarizen` | `BUT-FIT/diarizen-wavlm-large-s80-md-v2` |
+| Диаризация дикторов | Nemotron-3-Diarization (офлайн, потоковый режим; до 8 дикторов) | `nemotron_diar` | `nvidia/Nemotron-3-Diarization` |
 | Эмбеддинги дикторов | WeSpeaker ResNet34 | `wespeaker` | `pyannote/wespeaker-voxceleb-resnet34-LM` |
 | Текстовые эмбеддинги | BGE-M3 (dense, sparse, ColBERT), BGE-reranker-v2-m3 | `bgem3` | `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3` |
 | Текстовые эмбеддинги | Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B | `qwen3` | `Qwen/Qwen3-Embedding-0.6B` |
@@ -35,10 +36,10 @@ sidebar_label: Запуск моделей
 
 ```toml
 [dependencies]
-svod-model  = "0.1"
-svod-arch   = "0.1"   # Asr, splitters, decoders
-svod-tensor = "0.1"
-svod-dtype  = "0.1"
+svod-model  = "0.2"
+svod-arch   = "0.2"   # Asr, splitters, decoders
+svod-tensor = "0.2"
+svod-dtype  = "0.2"
 ```
 
 Для сборки на машине нужны LLVM и Clang (см.
@@ -71,6 +72,7 @@ cargo run -p svod-model --release --example whisper_infer  -- audio.wav [--size 
 cargo run -p svod-model --release --example vad_stream     -- audio.wav                # streaming VAD events
 cargo run -p svod-model --release --example vad_bench      -- audio.wav                # Silero vs FireRedVAD
 cargo run -p svod-model --release --example gtcrn_enhance  -- --in noisy.wav --out clean.wav --hub
+cargo run -p svod-model --release --example nemotron_diarize -- audio.wav [--stream low|very-low|ultra-low]
 cargo run -p svod-model --release --example qwen3_embed    -- --texts texts.txt --batch 8 --max-len 512
 cargo run -p svod-model --release --example resnet_classify -- --hub --image dog.bin --side 224
 cargo run -p svod-model --release --example yolo_detect    -- --hub --scale small --image photo.bin --side 640
@@ -223,6 +225,44 @@ for chunk in waveform.chunks(CHUNK) {               // pad the last one to CHUNK
     jit.output()?.copyout(bytemuck::cast_slice_mut(&mut out))?;
 }
 ```
+
+---
+
+## Диаризация дикторов
+
+`nemotron_diar` запускает Nemotron-3-Diarization: для каждого кадра 10 мс —
+активность до 8 дикторов, пронумерованных по первому появлению. Записи и живые
+потоки проходят один и тот же цикл — звук режется на чанки, каждый кодируется
+вместе с кэшем дикторов из прошлых кадров — и отличаются только размером
+чанков (офлайн или задержки 1,04 / 0,64 / 0,32 с из карточки модели):
+
+```rust
+use svod_arch::diarization::{Binarization, write_rttm};
+use svod_dtype::DType;
+use svod_model::nemotron_diar::{Diarizer, NemotronDiar, StreamingMode};
+
+// Запись целиком.
+let mut diarizer = Diarizer::offline(NemotronDiar::from_hub(DType::BFloat16, 1)?)?;
+let result = diarizer.diarize(&waveform, 16000)?;        // probs: [frames, 8], строки по 10 мс
+write_rttm(std::io::stdout(), "meeting", &result.segments(&Binarization::default()))?;
+
+// Живой поток, задержка 1,04 с.
+let model = NemotronDiar::from_hub(DType::BFloat16, 1)?;
+let mut diarizer = Diarizer::streaming(model, StreamingMode::LowLatency)?;
+let mut session = diarizer.session();
+for block in microphone {
+    session.push(&block)?;
+    diarizer.run(&mut [&mut session])?;
+    let probs = session.take_probs();                    // строки, выданные с прошлого вызова
+}
+session.finish();
+diarizer.run(&mut [&mut session])?;
+```
+
+`run` принимает любое число сессий и объединяет их готовые чанки в батч
+размером до `max_batch`, переданного в `from_hub`. В `svod_arch::diarization`
+лежат части, не зависящие от модели: кэш дикторов, пороги, превращающие
+вероятности в сегменты, и вывод RTTM.
 
 ---
 

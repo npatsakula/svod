@@ -10,10 +10,10 @@ description = "Intermediate representation for the Svod ML compiler"
 readme = "README.md"
 
 [dependencies]
-svod-dtype = { path = "../dtype", version = "=0.1.0", features = [
+svod-dtype = { path = "../dtype", version = "=0.2.0", features = [
   "serde",
 ] }
-svod-macros = { path = "../macros", version = "=0.1.0" }
+svod-macros = { path = "../macros", version = "=0.2.0" }
 smallvec = { workspace = true, features = ["serde"] }
 snafu = "0.9"
 proptest = { version = "1.9.0", optional = true }
@@ -32,7 +32,7 @@ bincode = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 half = "2.7.1"
-svod-dtype = { path = "../dtype", version = "=0.1.0", features = ["proptest"] }
+svod-dtype = { path = "../dtype", version = "=0.2.0", features = ["proptest"] }
 proptest = "1.9.0"
 test-case = "3.3.1"
 

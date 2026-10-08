@@ -10,8 +10,8 @@ sidebar_label: 张量 API
 
 ```toml
 [dependencies]
-svod-tensor = "0.1"
-svod-dtype  = "0.1"   # DType
+svod-tensor = "0.2"
+svod-dtype  = "0.2"   # DType
 ndarray     = "0.17"            # array!, views
 ```
 

@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use smallvec::smallvec;
-use snafu::ensure;
+use snafu::{ResultExt, ensure};
 use svod_dtype::DType;
 use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
@@ -892,7 +892,10 @@ impl Default for FaOpts<'_> {
 /// **Graph-native** flash-attention forward — runs the hand kernel, or reports
 /// that it doesn't apply. **No silent fallback:** the caller owns that policy.
 ///
-/// Q is `[B,N,H,D]`, K/V are `[B,N,H_KV,D]`. The outcome is three-way, splitting
+/// Q is `[B,N,H,D]`, K/V are `[B,N,H_KV,D]`. `B` may be a bound runtime variable
+/// (a JIT `batch_var`) shared by all three: it becomes the launch grid's z extent,
+/// the buffers and the tile policy take its maximum, and the output is shrunk back
+/// to it. The other dims must be static. The outcome is three-way, splitting
 /// "this device/length can't use the kernel" (`None`, a fallback trigger) from
 /// "this request is malformed" (`Err`, a caller bug):
 ///
@@ -907,7 +910,7 @@ impl Default for FaOpts<'_> {
 ///   The per-warp tile is the one measured fastest on this device for the shape
 ///   ([`FaPolicy::tuned`]; `SVOD_TK_TUNE=0` keeps the policy's static choice).
 /// - `Err` — *malformed request* on a supported device: a FIXED property is wrong —
-///   `q`/`k` not a statically-shaped rank-4 tensor, operand dtype ∉ {bf16, f16},
+///   `q`/`k` not a rank-4 tensor static past a variable batch (shared with `k`/`v`), operand dtype ∉ {bf16, f16},
 ///   `D % 16 != 0`, or `H % H_KV != 0` (GQA). These are
 ///   caller bugs, raised loudly instead of silently routed to the slow path. (A
 ///   genuine kernel build/dispatch failure also returns `Err`.)
@@ -940,9 +943,11 @@ pub fn flash_attention_tuned(
     opts: FaOpts,
     policy: impl Fn(&svod_dtype::DeviceSpec, svod_dtype::GpuArch) -> FaPolicy + Copy,
 ) -> crate::LaunchResult<Option<Tensor>> {
-    let qd = crate::launch::concrete_dims(q, "flash-attention", "q", 4)?;
-    let kd = crate::launch::concrete_dims(k, "flash-attention", "k", 4)?;
-    let vd = crate::launch::concrete_dims(v, "flash-attention", "v", 4)?;
+    // A symbolic batch (the JIT `batch_var`) stays a launch-grid extent: every
+    // tile, buffer and policy decision below uses its capacity `b`.
+    let (qd, batch) = crate::launch::batched_dims(q, "flash-attention", "q", 4)?;
+    let (kd, k_batch) = crate::launch::batched_dims(k, "flash-attention", "k", 4)?;
+    let (vd, v_batch) = crate::launch::batched_dims(v, "flash-attention", "v", 4)?;
     let (b, n, h, d) = (qd[0], qd[1], qd[2], qd[3]);
     let h_kv = kd[2];
     let dtype = q.uop().dtype();
@@ -957,10 +962,12 @@ pub fn flash_attention_tuned(
     // predicate: a KV length differing from q's is cross-attention (or incremental
     // decode), a legitimate attention shape this kernel simply does not implement, so
     // it declines and the caller falls back instead of surfacing an error.
-    let kv_shape = [("k", &kd), ("v", &vd)]
+    let same_batch =
+        |other: &Option<crate::launch::VarBatch>| other.as_ref().map(|b| &b.dim) == batch.as_ref().map(|b| &b.dim);
+    let kv_shape = [("k", &kd, &k_batch), ("v", &vd, &v_batch)]
         .into_iter()
-        .find(|(_, dims)| [dims[0], dims[2], dims[3]] != [b, h_kv, d])
-        .map(|(operand, dims)| (operand, dims.clone(), vec![b, dims[1], h_kv, d]));
+        .find(|(_, dims, kv_batch)| [dims[0], dims[2], dims[3]] != [b, h_kv, d] || !same_batch(kv_batch))
+        .map(|(operand, dims, _)| (operand, dims.clone(), vec![b, dims[1], h_kv, d]));
     let kv_seq_match = kd[1] == n && vd[1] == n;
     let (tiling_device, build_device) = (q.device(), q.device());
     let tiling_dtype = dtype.clone();
@@ -1031,7 +1038,8 @@ pub fn flash_attention_tuned(
             let cfg = cfg_cell
                 .get_or_init(|| chosen(&policy(&build_device, arch), &build_device, arch, &dtype))
                 .expect("checked by the tiling predicate");
-            let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
+            let grid_z = batch.as_ref().map_or_else(|| iconst(b as i64), |batch| batch.var.clone());
+            let grid = crate::Grid([iconst(h as i64), iconst((n / cfg.q_blk / NUM_WARPS) as i64), grid_z]);
             let out = Tensor::empty(&[b, n, h, d], dtype.clone());
             let build_dtype = dtype.clone();
             // ABI/global order is o, q, k, v, (lens), (seg_start) — `out` is global[0],
@@ -1052,8 +1060,7 @@ pub fn flash_attention_tuned(
             // built outside the caller's origin scope.
             let key_lens_clamped = opts.key_lens.map(|lens| {
                 let _shared = svod_ir::origin::OriginScope::suspend();
-                let ones = Tensor::full(&[b], ConstValue::Int(1), DType::Int32);
-                lens.maximum(&ones).expect("clamp key_lens >= 1")
+                lens.maximum(1).expect("clamp key_lens >= 1")
             });
             let mut ins: Vec<&Tensor> = vec![q, k, v];
             if let Some(lens) = &key_lens_clamped {
@@ -1063,10 +1070,17 @@ pub fn flash_attention_tuned(
                 ins.push(seg_start);
             }
             let block = (NUM_WARPS * caps.wave_size) as i64;
-            crate::graph_launch("flash_attention", grid, block, out, &ins, caps, move |ker| {
+            let out = crate::graph_launch("flash_attention", grid, block, out, &ins, caps, move |ker| {
                 build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, build_dtype.clone(), mask);
                 ker.finish(1)
-            })
+            })?;
+            // The output is allocated at capacity; consumers see the live batch.
+            match &batch {
+                Some(batch) => out
+                    .try_shrink([Some((svod_ir::SInt::Const(0), batch.dim.clone())), None, None, None])
+                    .context(crate::launch::CustomKernelSnafu { name: "flash_attention" }),
+                None => Ok(out),
+            }
         },
     )
 }

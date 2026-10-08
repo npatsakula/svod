@@ -21,6 +21,7 @@
 //! free of the Tensor/device stack. The model owns audio → mel → device tensor
 //! internally.
 
+use std::ops::Range;
 use std::time::Instant;
 
 use snafu::{ResultExt, Snafu};
@@ -80,6 +81,14 @@ pub struct Transcription {
     pub text: String,
     pub chunks: Vec<ChunkResult>,
     pub profile: Option<RunProfile>,
+}
+
+impl Transcription {
+    /// Stitch per-chunk results: texts joined by single spaces, empties dropped.
+    pub fn from_chunks(chunks: Vec<ChunkResult>, profile: Option<RunProfile>) -> Self {
+        let text = chunks.iter().map(|c| c.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
+        Self { text, chunks, profile }
+    }
 }
 
 /// Per-call run switches, orthogonal to a [`Transcriber`]'s construction config
@@ -466,7 +475,7 @@ pub trait Transcriber {
                 // The core owns text up to the advance; anything the window
                 // decoded past it belongs to the window that starts there.
                 let core_end = seek.saturating_add(step).min(region.end);
-                let geom = ChunkGeom::new(
+                let geom = ChunkWindow::new(
                     &AudioChunk::with_decode(seek, core_end, seek, decode_end),
                     waveform.len(),
                     sample_rate,
@@ -476,8 +485,7 @@ pub trait Transcriber {
             }
         }
 
-        let text = results.iter().map(|c| c.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
-        Ok(Transcription { text, chunks: results, profile: prof })
+        Ok(Transcription::from_chunks(results, prof))
     }
 
     /// Decode every chunk once, at the splitter's own boundaries. The path for a
@@ -489,13 +497,12 @@ pub trait Transcriber {
         opts: RunOptions,
     ) -> Result<Transcription, Self::Error> {
         let sample_rate = self.sample_rate() as f32;
-        let metas: Vec<ChunkGeom> =
-            chunks.iter().map(|chunk| ChunkGeom::new(chunk, waveform.len(), sample_rate)).collect();
-        let windows: Vec<&[f32]> = metas.iter().map(|m| &waveform[m.decode_start..m.decode_end]).collect();
+        let metas: Vec<ChunkWindow> =
+            chunks.iter().map(|chunk| ChunkWindow::new(chunk, waveform.len(), sample_rate)).collect();
+        let windows: Vec<&[f32]> = metas.iter().map(|m| &waveform[m.decode_range()]).collect();
         let (transcripts, prof) = self.transcribe_windows(&windows, opts)?;
         let results: Vec<ChunkResult> = transcripts.into_iter().zip(&metas).map(|(t, m)| m.finish(t, opts)).collect();
-        let text = results.iter().map(|c| c.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
-        Ok(Transcription { text, chunks: results, profile: prof })
+        Ok(Transcription::from_chunks(results, prof))
     }
 
     /// [`transcribe_chunks`](Self::transcribe_chunks) with default
@@ -538,8 +545,12 @@ fn coalesce_regions(chunks: &[AudioChunk], waveform_len: usize) -> Vec<Region> {
     regions
 }
 
-/// Decode geometry for one chunk, derived from its [`AudioChunk`].
-struct ChunkGeom {
+/// Decode geometry for one chunk: which slice of the waveform to decode, and
+/// how to crop that decode back to the chunk's core. Public so a caller that
+/// pools windows from several waveforms into one
+/// [`Transcriber::transcribe_windows`] batch can finish each chunk itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkWindow {
     decode_start: usize,
     decode_end: usize,
     start_sec: f32,
@@ -547,8 +558,8 @@ struct ChunkGeom {
     core_offset_sec: f32,
 }
 
-impl ChunkGeom {
-    fn new(chunk: &AudioChunk, waveform_len: usize, sample_rate: f32) -> Self {
+impl ChunkWindow {
+    pub fn new(chunk: &AudioChunk, waveform_len: usize, sample_rate: f32) -> Self {
         let decode_end = chunk.decode_end_sample.min(waveform_len);
         Self {
             decode_start: chunk.decode_start_sample.min(decode_end),
@@ -559,12 +570,17 @@ impl ChunkGeom {
         }
     }
 
+    /// Sample range of the waveform to feed the transcriber.
+    pub fn decode_range(&self) -> Range<usize> {
+        self.decode_start..self.decode_end
+    }
+
     fn core_duration(&self) -> f32 {
         self.end_sec - self.start_sec
     }
 
     /// Crop this window's transcript to the core and emit the chunk's result.
-    fn finish(&self, transcript: Transcript, opts: RunOptions) -> ChunkResult {
+    pub fn finish(&self, transcript: Transcript, opts: RunOptions) -> ChunkResult {
         let core_duration = self.core_duration();
         let words = crop_words_to_core(transcript.words, self.core_offset_sec, core_duration);
         let segments = crop_segments_to_core(transcript.segments, self.core_offset_sec, core_duration);

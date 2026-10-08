@@ -983,7 +983,7 @@ fn fa_policy_tile(
 /// the GQA `h_kv` groups broadcast to `h`, `causal`, the `[B,1,1,N]` key mask
 /// (`kv_pos >= key_lens[b]`) and the `[B,1,N,N]` segment mask
 /// (`kv_pos < seg_start[b, q_pos]`) applied exactly as the kernel does.
-fn fa_reference(
+pub(super) fn fa_reference(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,

@@ -211,6 +211,8 @@ pub enum MelNorm {
 pub enum MelLog {
     /// `ln(clamp(x, min, max))` — GigaAM's `torch.log(x.clamp(1e-9, 1e9))`.
     Ln { min: f64, max: f64 },
+    /// `ln(x + guard)` — NeMo's `log_zero_guard_type="add"` (`guard = 2^-24`).
+    LnAdd { guard: f64 },
     /// Whisper's `log_mel_spectrogram` tail: `log10(max(x, 1e-10))`, floored
     /// at 8 below the maximum of each `[n_mels, T]` signal, then `(x + 4) / 4`.
     Whisper,
@@ -351,6 +353,7 @@ impl Tensor {
         origin_call!("mel_log");
         match log {
             MelLog::Ln { min, max } => self.clamp().min(min).max(max).call()?.try_log(),
+            MelLog::LnAdd { guard } => self.try_add(guard)?.try_log(),
             MelLog::Whisper => {
                 let ndim = self.ndim()?;
                 ensure!(ndim >= 2, NdimMinimumSnafu { op: "mel_log", min: 2_usize, actual: ndim });
