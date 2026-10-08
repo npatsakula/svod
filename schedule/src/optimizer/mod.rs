@@ -1009,6 +1009,11 @@ fn optimize_kernel_with_config_impl(
     if renderer.supported_ops().is_none() {
         return Err(OptError::MissingRendererCapabilities);
     }
+    // A PROGRAM is past optimization (`UOp::linear_program`): no pre/post pass
+    // may reorder or rewrite an author-ordered list.
+    if matches!(ast.op(), svod_ir::Op::Program(..)) {
+        return Ok(ast);
+    }
     // Author-supplied `opts_to_apply` (tinygrad parity) is read from the kernel
     // SINK marker BEFORE pre-optimization. When set, it overrides the strategy:
     // apply exactly those opts (an empty list applies none), never heuristics.

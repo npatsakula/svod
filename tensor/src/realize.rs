@@ -1264,7 +1264,9 @@ impl KernelSite {
         // Author-supplied `opts_to_apply` short-circuits before beam: such
         // kernels must go through the heuristic entry so `apply_explicit_opts`
         // honors the exact opt list (empty = none).
+        // A PROGRAM body is already linear; the optimizer passes it through.
         let has_explicit_opts = config.optimizer.opts_to_apply.is_some()
+            || matches!(self.ast.op(), Op::Program(..))
             || matches!(self.ast.op(), Op::Sink(ops::Sink { info: Some(ki), .. }) if ki.opts_to_apply.is_some());
         if !has_explicit_opts && matches!(config.optimizer.strategy, svod_schedule::OptStrategy::Beam { .. }) {
             beam_search_optimize(self.ast.clone(), &self.renderer, &self.device, &self.buffers, config)

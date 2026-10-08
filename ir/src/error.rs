@@ -248,4 +248,14 @@ pub enum Error {
     /// A MULTI or MSELECT form survived the supported pre-rangeify rewrites.
     #[snafu(display("unsupported multi-device form {operation}: {reason}"))]
     MultiUnsupported { operation: &'static str, reason: &'static str },
+
+    /// A pre-linearized op list uses an op it only lists later.
+    #[snafu(display("linear program: op {op} (id={id}) uses {source_op} (id={source_id}) before the list emits it"))]
+    LinearForwardReference { op: String, id: u64, source_op: String, source_id: u64 },
+
+    /// A pre-linearized op list repeats a node that is not a void statement.
+    #[snafu(display(
+        "linear program: {op} (id={id}) is listed twice; only void CUSTOM, STORE and BARRIER statements repeat (tag a value to emit it twice)"
+    ))]
+    LinearRepeat { op: String, id: u64 },
 }

@@ -102,6 +102,11 @@ cached_property! {
             // beats a hash table and the inline buffer avoids a heap allocation
             // per node.
             let mut result = crate::uop::core::RangeIds::new();
+            // A PROGRAM is a closed kernel and its LINEAR list closes RANGEs by
+            // position, not by an END edge, so no range leaks out of either.
+            if matches!(uop.op, Op::Linear(..) | Op::Program(..)) {
+                return result;
+            }
 
             // Step 1: Merge from all sources' cached in_scope_ranges
             uop.op.map_child(|src| result.extend_from_slice(InScopeRangesProperty::get(src)));

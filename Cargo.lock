@@ -3683,6 +3683,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "svod-tk3"
+version = "0.2.0"
+dependencies = [
+ "proptest",
+ "smallvec",
+ "snafu",
+ "svod-dtype",
+ "svod-ir",
+ "svod-schedule",
+ "test-case",
+]
+
+[[package]]
 name = "symlink"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

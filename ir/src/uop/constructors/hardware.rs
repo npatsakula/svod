@@ -184,6 +184,124 @@ impl UOp {
         Self::new(Op::Program(ops::Program { sink, info: info.into(), linear, source, binary }), DType::Void)
     }
 
+    /// A PROGRAM already at its LINEAR stage: codegen renders `ops` in exactly
+    /// this order, and neither the optimizer nor the linearizer ever sees it.
+    ///
+    /// A source the list does not name is emitted just before its first user
+    /// (sources first), so constants and index math need not be listed. Using
+    /// an op the list names only later is [`Error::LinearForwardReference`];
+    /// repeating anything but a void `Custom`/`Store`/`Barrier` statement is
+    /// [`Error::LinearRepeat`] — `rtag` a value to emit it twice. Hash-consing
+    /// makes identical statements one node, which renders at every position.
+    ///
+    /// The SINK is derived, `SINK[info]` over the listed ops nothing else in
+    /// the list consumes, so every PARAM, SPECIAL, LOAD and STORE reaches the
+    /// `ProgramInfo` ABI and launch dims. PARAMs keep their authored slots (a
+    /// scalar variable needs one past the buffers, and binds by name); weak
+    /// PARAM shapes, as `custom_kernel` placeholders carry, are committed, which
+    /// rebuilds the listed ops that read them. Index a placeholder's `base()`.
+    ///
+    /// [`Error::LinearForwardReference`]: crate::Error::LinearForwardReference
+    /// [`Error::LinearRepeat`]: crate::Error::LinearRepeat
+    pub fn linear_program(
+        info: crate::KernelInfo,
+        ops: impl IntoIterator<Item = Arc<Self>>,
+        target: svod_dtype::DeviceSpec,
+    ) -> Result<Arc<Self>> {
+        use std::collections::HashSet;
+
+        let ops = Self::commit_param_shapes(ops.into_iter().collect());
+        let listed: HashSet<u64> = ops.iter().map(|op| op.id).collect();
+        let mut emitted = HashSet::new();
+        let mut list: Vec<Arc<Self>> = Vec::with_capacity(ops.len());
+        for op in &ops {
+            if emitted.contains(&op.id) {
+                let statement = matches!(op.op(), Op::Custom(..) | Op::Store(..) | Op::Barrier(..));
+                ensure!(
+                    statement && op.dtype() == DType::Void,
+                    crate::error::LinearRepeatSnafu { op: op.op().as_ref(), id: op.id }
+                );
+                list.push(op.clone());
+                continue;
+            }
+            // Post-order walk of the unlisted sources `op` reaches.
+            let mut stack = vec![(op.clone(), false)];
+            while let Some((node, expanded)) = stack.pop() {
+                if expanded {
+                    emitted.insert(node.id);
+                    list.push(node);
+                    continue;
+                }
+                if emitted.contains(&node.id) {
+                    continue;
+                }
+                stack.push((node.clone(), true));
+                for source in node.op().sources().into_iter().rev() {
+                    if emitted.contains(&source.id) {
+                        continue;
+                    }
+                    ensure!(
+                        !listed.contains(&source.id),
+                        crate::error::LinearForwardReferenceSnafu {
+                            op: node.op().as_ref(),
+                            id: node.id,
+                            source_op: source.op().as_ref(),
+                            source_id: source.id,
+                        }
+                    );
+                    stack.push((source, false));
+                }
+            }
+        }
+
+        let consumed: HashSet<u64> = list.iter().flat_map(|node| node.op().sources()).map(|source| source.id).collect();
+        let mut seen = HashSet::new();
+        let roots = list.iter().filter(|node| !consumed.contains(&node.id) && seen.insert(node.id)).cloned().collect();
+        let sink = Self::sink_with_info(roots, info);
+        list.push(sink.clone());
+        let program_info = crate::ProgramInfo::from_sink(&sink, target);
+        Ok(Self::program(sink, program_info, Some(Self::linear(list.into())), None, None))
+    }
+
+    /// PARAM shapes are metadata a program never renders, but `custom_kernel`
+    /// placeholders carry them as weak constants, which no program admits; the
+    /// optimizer's index-dtype lowering would commit them, so commit them here.
+    fn commit_param_shapes(ops: Vec<Arc<Self>>) -> Vec<Arc<Self>> {
+        use std::collections::HashMap;
+
+        use crate::UOpKey;
+
+        let root = Self::sink(ops.clone());
+        let commit_const = |node: &Arc<Self>| match node.op() {
+            Op::Const(value) if node.dtype() == DType::WeakInt => {
+                let dtype = match value.0.try_int() {
+                    Some(v) if i32::try_from(v).is_err() => DType::Int64,
+                    _ => DType::Int32,
+                };
+                Some((UOpKey(node.clone()), Self::const_(dtype, value.0)))
+            }
+            _ => None,
+        };
+        let params: HashMap<UOpKey, Arc<Self>> = root
+            .toposort()
+            .into_iter()
+            .filter_map(|node| {
+                let Op::Param(ops::Param { shape, arg }) = node.op() else { return None };
+                let consts: HashMap<_, _> = shape.toposort().iter().filter_map(commit_const).collect();
+                let shape = shape.substitute(&consts);
+                let committed = Self::new(Op::Param(ops::Param { shape, arg: arg.clone() }), node.dtype());
+                (!Arc::ptr_eq(&committed, &node)).then(|| (UOpKey(node.clone()), committed.rtag(node.tag().clone())))
+            })
+            .collect();
+        if params.is_empty() {
+            return ops;
+        }
+        match root.substitute(&params).op() {
+            Op::Sink(ops::Sink { sources, .. }) => sources.to_vec(),
+            _ => unreachable!("substitution keeps the SINK root"),
+        }
+    }
+
     /// LINEAR stage payload.
     pub fn linear(ops: SmallVec<[Arc<Self>; 8]>) -> Arc<Self> {
         Self::new(Op::Linear(ops::Linear { ops }), DType::Void)
