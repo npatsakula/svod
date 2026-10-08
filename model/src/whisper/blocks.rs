@@ -5,8 +5,25 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Linear;
+use svod_tk3::ops::{self, Act};
 
 use super::error::Result;
+
+/// `act(x·wᵀ + b)` through the tile op layer, whose kernel keeps the
+/// accumulator, bias and activation in f32 until one final rounding. A scaled
+/// or fp8 weight takes [`linear_forward`].
+pub(crate) fn project(layer: &Linear, x: &Tensor, act: Act) -> Result<Tensor> {
+    if layer.weight_scale.is_none() && layer.weight.dtype() == x.dtype() {
+        let opts = ops::Linear { bias: layer.bias.as_ref(), act, ..ops::Linear::default() };
+        return Ok(ops::linear(x, &layer.weight, opts)?);
+    }
+    let y = linear_forward(layer, x)?;
+    Ok(match act {
+        Act::None => y,
+        Act::Gelu => y.gelu_exact()?,
+        Act::Silu => y.silu()?,
+    })
+}
 
 /// Whisper's linear forward. OpenAI keeps the matmul accumulator *and* the bias
 /// addition in FP32 when activation and weight are both half precision, so the

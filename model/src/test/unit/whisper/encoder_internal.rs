@@ -1,9 +1,9 @@
-//! Whisper encoder internals: the encoder sequence-padding policy and the
-//! per-block flash-attention dispatch count it produces.
+//! Whisper encoder internals: the unpadded 1500-frame sequence and its one
+//! flash-attention dispatch per block.
 
 use crate::whisper::config::ModelDimensions;
-use crate::whisper::encoder::{AudioEncoder, encoder_padded_sequence_len};
-use svod_dtype::{DType, DeviceSpec};
+use crate::whisper::encoder::AudioEncoder;
+use svod_dtype::DType;
 use svod_tensor::Tensor;
 
 fn encoder_dims(layers: usize) -> ModelDimensions {
@@ -23,9 +23,7 @@ fn encoder_dims(layers: usize) -> ModelDimensions {
 }
 
 #[test]
-fn unsupported_device_keeps_original_encoder_sequence() {
-    assert_eq!(encoder_padded_sequence_len(&DeviceSpec::Cpu, &DType::Float16, 1500), None);
-
+fn encoder_keeps_the_sequence_length() {
     let encoder = AudioEncoder::empty(&encoder_dims(1));
     let mel = Tensor::zeros(&[1, 4, 3000], DType::Float32);
     let out = encoder.forward(&mel).unwrap();
@@ -33,13 +31,13 @@ fn unsupported_device_keeps_original_encoder_sequence() {
 }
 
 #[test]
-#[ignore = "GPU: inspect full padded Whisper encoder execution plan"]
-fn padded_encoder_plan_has_one_flash_attention_per_block() {
+#[ignore = "GPU: inspect full Whisper encoder execution plan"]
+fn encoder_plan_has_one_flash_attention_per_block() {
     // The encoder gates on its activations' device, which follows the weights
     // onto the process default device.
     let device = svod_dtype::default_device::default_device();
-    if !svod_tk::flash_attention_supported(&device) {
-        eprintln!("skipping: flash-attention is not supported on {device:?}");
+    if !svod_tk3::ops::supported(&device) {
+        eprintln!("skipping: no tile kernels on {device:?}");
         return;
     }
     let encoder = AudioEncoder::empty(&encoder_dims(32));
@@ -60,24 +58,4 @@ fn padded_encoder_plan_has_one_flash_attention_per_block() {
     };
     let flash_attention = plan.kernels().filter(|kernel| is_flash_attention(&kernel.entry_point)).count();
     assert_eq!(flash_attention, 32, "expected one handwritten flash-attention dispatch per encoder block");
-}
-
-/// fp32 activations must not pad, on any device. The padding buys nothing on its
-/// own — it exists so flash attention can tile the sequence — and that kernel's
-/// mma operands are 16-bit, so reaching it from fp32 means a silent downcast. That
-/// downcast moved the encoder from 1.0e-3 to 1.8 against the PyTorch golden, so
-/// the dtype gate is what keeps an fp32 model on SDPA.
-#[test]
-fn fp32_activations_are_never_padded_for_flash_attention() {
-    for device in [DeviceSpec::Cpu, DeviceSpec::Cuda { device_id: 0 }] {
-        assert_eq!(
-            encoder_padded_sequence_len(&device, &DType::Float32, 1500),
-            None,
-            "fp32 must not pad on {device:?}"
-        );
-    }
-    // The 16-bit dtypes stay eligible; whether they pad is then the device's call.
-    for dtype in [DType::Float16, DType::BFloat16] {
-        assert_eq!(encoder_padded_sequence_len(&DeviceSpec::Cpu, &dtype, 1500), None, "CPU has no FA kernel");
-    }
 }

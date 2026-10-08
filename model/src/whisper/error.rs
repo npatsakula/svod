@@ -9,6 +9,11 @@ pub enum Error {
         source: Box<svod_tensor::error::Error>,
     },
     #[snafu(display("{source}"), context(false))]
+    Ops {
+        #[snafu(source(from(svod_tk3::ops::Error, Box::new)))]
+        source: Box<svod_tk3::ops::Error>,
+    },
+    #[snafu(display("{source}"), context(false))]
     Jit {
         #[snafu(source(from(crate::jit::JitError, Box::new)))]
         source: Box<crate::jit::JitError>,
