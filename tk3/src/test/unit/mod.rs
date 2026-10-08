@@ -5,6 +5,8 @@ mod device;
 mod interp;
 mod layout;
 mod layouts;
+mod ops;
+mod ops_plan;
 mod parts;
 mod rows;
 mod schedule;
