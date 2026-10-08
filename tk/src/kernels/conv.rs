@@ -153,7 +153,9 @@ pub enum ConvPlan {
     /// strip)` pair ([`build_conv`]).
     Gathered(GemmCfg),
     /// The image-staged form: one patch per channel strip, every tap read out of
-    /// it ([`build_conv_patch`]).
+    /// it ([`build_conv_patch`]). The gathered form serves every shape this one
+    /// does; this one is there for the reads it saves ([`patch_candidate`]), and
+    /// [`tuned_conv_plan`] picks it where it times faster.
     Patch(PatchCfg),
 }
 
