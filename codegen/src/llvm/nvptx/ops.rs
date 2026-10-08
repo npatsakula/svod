@@ -29,7 +29,10 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Special(ops::Special { name, .. }) => render_special(uop, name, ctx, kernel),
         Op::Barrier(..) => render_barrier(kernel),
         Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
-            render_define_local(uop, ctx, kernel)
+            match ctx.dynamic_local(arg.slot) {
+                Some(offset) => render_dynamic_local(uop, offset, ctx, kernel),
+                None => render_define_local(uop, ctx, kernel),
+            }
         }
         // REG buffers keep the CPU emitter's plain `alloca`: NVPTX allocas
         // live in the generic address space (its datalayout carries no
@@ -58,6 +61,57 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         // ── Everything else: shared CPU path (ALU, INDEX, LOAD, STORE, …) ─
         _ => cpu::render_uop(uop, ctx, kernel),
     }
+}
+
+// ── LOCAL buffers above the static `.shared` cap ─────────────────────────
+
+/// The `extern` zero-length shared array every LOCAL buffer is carved from
+/// when the kernel's total exceeds [`svod_dtype::CudaArch::MAX_STATIC_SHARED_BYTES`].
+const DYNAMIC_SHARED_ARRAY: &str = "@svod_dynamic_shared";
+
+/// Lay the kernel's LOCAL buffers out at 16-byte aligned offsets. Totals up
+/// to the static cap keep one `addrspace(3)` global per buffer; above it the
+/// buffers become slices of one dynamic shared array, and the module exports
+/// the byte count as the `.const` [`DYNAMIC_SHARED_BYTES_SYMBOL`], which the
+/// loader reads to opt the function in and size every launch. The size thus
+/// travels inside the kernel image, through every cache and worker.
+///
+/// [`DYNAMIC_SHARED_BYTES_SYMBOL`]: svod_device::cuda::DYNAMIC_SHARED_BYTES_SYMBOL
+pub(crate) fn plan_shared_memory(nodes: &[Arc<UOp>], ctx: &mut RenderContext) {
+    let mut offsets = std::collections::HashMap::new();
+    let mut total = 0usize;
+    for node in nodes {
+        let Op::Buffer(ops::Buffer { arg, .. }) = node.op() else { continue };
+        if arg.addrspace != Some(svod_ir::AddrSpace::Local) || offsets.contains_key(&arg.slot) {
+            continue;
+        }
+        offsets.insert(arg.slot, total);
+        total = (total + node.buffer_size().unwrap_or(1) * arg.dtype.bytes()).next_multiple_of(16);
+    }
+    if total <= svod_dtype::CudaArch::MAX_STATIC_SHARED_BYTES {
+        return;
+    }
+    ctx.push_module_prefix(format!("{DYNAMIC_SHARED_ARRAY} = external addrspace(3) global [0 x i8], align 16"));
+    ctx.push_module_prefix(format!(
+        "@{} = addrspace(4) constant i32 {total}, align 4",
+        svod_device::cuda::DYNAMIC_SHARED_BYTES_SYMBOL
+    ));
+    ctx.set_dynamic_locals(offsets);
+}
+
+/// A LOCAL buffer as a generic pointer `offset` bytes into the dynamic array.
+fn render_dynamic_local(
+    uop: &Arc<UOp>,
+    offset: usize,
+    ctx: &mut RenderContext,
+    kernel: &mut Vec<String>,
+) -> Option<()> {
+    let dst = ctx.name(uop);
+    kernel.push(format!(
+        "  {dst}.shared = getelementptr inbounds i8, ptr addrspace(3) {DYNAMIC_SHARED_ARRAY}, i64 {offset}"
+    ));
+    kernel.push(format!("  {dst} = addrspacecast ptr addrspace(3) {dst}.shared to ptr"));
+    Some(())
 }
 
 fn undecomposed(ctx: &mut RenderContext, what: &str) -> Option<()> {

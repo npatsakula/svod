@@ -15,8 +15,8 @@ use object::{LittleEndian, Object, ObjectSymbol, SymbolKind};
 
 use super::device::{CudaDevice, CudaEvent};
 use super::sys::{
-    CU_LAUNCH_PARAM_BUFFER_POINTER, CU_LAUNCH_PARAM_BUFFER_SIZE, CU_LAUNCH_PARAM_END, CUfunction, CUmodule, CUresult,
-    CUstream, func_attribute, jit_option,
+    Api, CU_LAUNCH_PARAM_BUFFER_POINTER, CU_LAUNCH_PARAM_BUFFER_SIZE, CU_LAUNCH_PARAM_END, CUfunction, CUmodule,
+    CUresult, CUstream, func_attribute, jit_option,
 };
 use crate::device::{AbiParamDescriptor, CompiledSpec, Program};
 use crate::hcq::ClikeKernargLayout;
@@ -41,11 +41,12 @@ impl Drop for CudaModule {
     }
 }
 
-/// Grid (blocks) and block (threads) of one launch.
+/// Grid (blocks), block (threads) and dynamic shared bytes of one launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Launch {
     pub grid: [u32; 3],
     pub block: [u32; 3],
+    pub dynamic_shared_bytes: u32,
 }
 
 pub struct CudaProgram {
@@ -57,6 +58,9 @@ pub struct CudaProgram {
     max_threads_per_block: u32,
     num_regs: u32,
     shared_bytes: u32,
+    /// Dynamic shared memory every launch passes; the module exports it (see
+    /// [`super::DYNAMIC_SHARED_BYTES_SYMBOL`]) and the function is opted in.
+    dynamic_shared_bytes: u32,
     local_bytes: u32,
     /// Block size of the latest launch, the occupancy query's input.
     last_block: AtomicU32,
@@ -70,6 +74,7 @@ impl std::fmt::Debug for CudaProgram {
             .field("var_count", &self.layout.vars)
             .field("num_regs", &self.num_regs)
             .field("shared_bytes", &self.shared_bytes)
+            .field("dynamic_shared_bytes", &self.dynamic_shared_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -176,10 +181,33 @@ impl CudaProgram {
             unsafe { (api.func_get_attribute)(&mut value, id, function) }.check("cuFuncGetAttribute")?;
             Ok(u32::try_from(value).unwrap_or(0))
         };
+        let shared_bytes = attribute(func_attribute::SHARED_SIZE_BYTES)?;
+        let dynamic_shared_bytes = exported_dynamic_shared_bytes(api, raw, name)?;
+        if dynamic_shared_bytes > 0 {
+            let limit = dev.limits().shared_per_block_optin;
+            if u64::from(shared_bytes) + u64::from(dynamic_shared_bytes) > u64::from(limit) {
+                return Err(Error::CudaSharedMemoryExceeded {
+                    kernel: name.into(),
+                    static_bytes: shared_bytes,
+                    dynamic_bytes: dynamic_shared_bytes,
+                    limit,
+                });
+            }
+            // SAFETY: a live function; the value is within the opt-in limit.
+            unsafe {
+                (api.func_set_attribute)(
+                    function,
+                    func_attribute::MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    dynamic_shared_bytes as c_int,
+                )
+            }
+            .check("cuFuncSetAttribute")?;
+        }
         Ok(Self {
             max_threads_per_block: attribute(func_attribute::MAX_THREADS_PER_BLOCK)?,
             num_regs: attribute(func_attribute::NUM_REGS)?,
-            shared_bytes: attribute(func_attribute::SHARED_SIZE_BYTES)?,
+            shared_bytes,
+            dynamic_shared_bytes,
             local_bytes: attribute(func_attribute::LOCAL_SIZE_BYTES)?,
             dev,
             module,
@@ -230,7 +258,7 @@ impl CudaProgram {
                 ),
             });
         }
-        Ok(Launch { grid, block })
+        Ok(Launch { grid, block, dynamic_shared_bytes: self.dynamic_shared_bytes })
     }
 
     /// Pack `buffers`/`vals` into a fresh kernarg blob.
@@ -269,7 +297,19 @@ impl CudaProgram {
         // SAFETY: `extra` follows the sentinel protocol and points into live
         // locals; the caller guarantees the buffer addresses.
         let result = unsafe {
-            (api.launch_kernel)(self.function, gx, gy, gz, bx, by, bz, 0, stream, null_mut(), extra.as_mut_ptr())
+            (api.launch_kernel)(
+                self.function,
+                gx,
+                gy,
+                gz,
+                bx,
+                by,
+                bz,
+                launch.dynamic_shared_bytes,
+                stream,
+                null_mut(),
+                extra.as_mut_ptr(),
+            )
         };
         self.dev.check(result, "cuLaunchKernel")?;
         self.last_block.store(bx * by * bz, Ordering::Relaxed);
@@ -283,11 +323,40 @@ impl CudaProgram {
         let mut blocks: c_int = 0;
         // SAFETY: out-pointer to a live integer; the function is live.
         unsafe {
-            (api.occupancy_max_active_blocks_per_multiprocessor)(&mut blocks, self.function, block_threads as c_int, 0)
+            (api.occupancy_max_active_blocks_per_multiprocessor)(
+                &mut blocks,
+                self.function,
+                block_threads as c_int,
+                self.dynamic_shared_bytes as usize,
+            )
         }
         .check("cuOccupancyMaxActiveBlocksPerMultiprocessor")?;
         Ok(u32::try_from(blocks).unwrap_or(0))
     }
+}
+
+/// The `u32` a module exports under [`super::DYNAMIC_SHARED_BYTES_SYMBOL`],
+/// or 0 when its shared memory is all static.
+fn exported_dynamic_shared_bytes(api: &Api, module: CUmodule, kernel: &str) -> Result<u32> {
+    let symbol = CString::new(super::DYNAMIC_SHARED_BYTES_SYMBOL).expect("symbol has no NUL");
+    let (mut address, mut size) = (0, 0usize);
+    // SAFETY: out-pointers to live locals; a live module and a NUL-terminated name.
+    let result = unsafe { (api.module_get_global)(&mut address, &mut size, module, symbol.as_ptr()) };
+    if result == CUresult::NOT_FOUND {
+        return Ok(0);
+    }
+    result.check("cuModuleGetGlobal")?;
+    let mut bytes = [0u8; 4];
+    if size != bytes.len() {
+        return Err(Error::CudaJit {
+            kernel: kernel.into(),
+            cause: format!("{symbol:?} is {size} bytes, not a u32"),
+            log: String::new(),
+        });
+    }
+    // SAFETY: copies the 4-byte global into a 4-byte local.
+    unsafe { (api.memcpy_dtoh)(bytes.as_mut_ptr().cast(), address, bytes.len()) }.check("cuMemcpyDtoH")?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 /// The kernarg layout of `abi`, once the descriptors pass the shared checks.
@@ -476,7 +545,7 @@ impl Program for CudaProgram {
         Some(KernelResources {
             vgprs: Some(self.num_regs),
             sgprs: None,
-            lds_bytes: self.shared_bytes,
+            lds_bytes: self.shared_bytes + self.dynamic_shared_bytes,
             scratch_bytes: Some(self.local_bytes),
             wave_size: limits.warp_size,
             occupancy,

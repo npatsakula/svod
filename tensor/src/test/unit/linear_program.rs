@@ -294,3 +294,48 @@ fn graph_kernel_binds_a_variable_grid() {
         assert!(actual[live..].iter().zip(&data[live..]).all(|(y, x)| *y != x + 1.0), "rows={n} ran past the batch");
     }
 }
+
+/// 64 KB of shared memory, above the static 48 KB `ptxas` accepts: thread
+/// `t` of 256 stores `x[t]` at the top of the buffer, and after the barrier
+/// reads its mirror's slot, so `y = reverse(x)` holds only when the whole
+/// buffer is addressable at launch. CUDA only.
+#[test]
+fn graph_kernel_uses_64k_dynamic_shared_memory() {
+    const THREADS: i64 = 256;
+    const SMEM: usize = 16 << 10;
+    let spec = svod_dtype::default_device::default_device();
+    if !matches!(spec, DeviceSpec::Cuda { .. }) {
+        return;
+    }
+    let data: Vec<f32> = (0..THREADS).map(|i| i as f32 * 0.25 - 9.0).collect();
+    let x = Tensor::from_slice(&data);
+    let program = |y: &Arc<UOp>, x: &Arc<UOp>| {
+        let t = UOp::special_dtype(i32c(THREADS), "lidx0".into(), DType::Int32);
+        let smem = UOp::buffer(0, SMEM, DType::Float32, svod_dtype::AddrSpace::Local, None);
+        let top = i32c(SMEM as i64 - 1);
+        let at = |i: Arc<UOp>| UOp::index().buffer(smem.clone()).indices(vec![i]).call().unwrap();
+        let load = UOp::load().index(UOp::index().buffer(x.clone()).indices(vec![t.clone()]).call().unwrap()).call();
+        let fill = at(top.try_sub(&t).unwrap()).store(load);
+        let barrier = fill.barrier(smallvec![]);
+        let mirror = at(top.try_sub(&i32c(THREADS - 1)).unwrap().try_add(&t).unwrap());
+        let read = UOp::load().index(mirror.clone()).call();
+        let store = UOp::index().buffer(y.clone()).indices(vec![t.clone()]).call().unwrap().store(read);
+        let info = KernelInfo { name: Some("linear_dynamic_smem".into()), ..Default::default() };
+        UOp::linear_program(info, [t, smem.clone(), fill, barrier, mirror, store], spec.clone()).unwrap()
+    };
+    let y =
+        Tensor::graph_kernel("linear_dynamic_smem", Tensor::empty(&[THREADS as usize], DType::Float32), &[&x], |ph| {
+            program(&ph[0], &ph[1])
+        })
+        .unwrap();
+    let plan = y.prepare_with(&config_for(&spec)).unwrap();
+    let kernel = plan.kernels().find(|k| k.entry_point == "linear_dynamic_smem").expect("compiled as is");
+    assert!(kernel.code.contains("@svod_dynamic_shared = external addrspace(3)"), "{}", kernel.code);
+    plan.execute().unwrap();
+    let mut actual = vec![0f32; THREADS as usize];
+    // SAFETY: `actual` is initialized f32s viewed as bytes.
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(actual.as_mut_ptr().cast::<u8>(), actual.len() * size_of::<f32>()) };
+    plan.output_buffer().unwrap().copyout(bytes).unwrap();
+    assert_eq!(actual, data.iter().rev().copied().collect::<Vec<_>>());
+}

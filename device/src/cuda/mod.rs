@@ -42,6 +42,10 @@ macro_rules! dl_api {
     };
 }
 
+/// The `.const` `u32` a kernel module exports when its shared memory is
+/// dynamic: the bytes to opt the function into and pass at every launch.
+pub const DYNAMIC_SHARED_BYTES_SYMBOL: &str = "svod_dynamic_shared_bytes";
+
 pub mod allocator;
 pub mod cupti;
 pub mod device;

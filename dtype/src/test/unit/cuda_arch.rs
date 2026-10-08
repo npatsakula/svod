@@ -72,3 +72,19 @@ proptest! {
         prop_assert!(lo.has_fp8() <= hi.has_fp8());
     }
 }
+
+#[test_case(6, 1, 48; "pascal portable")]
+#[test_case(7, 0, 96; "volta")]
+#[test_case(7, 5, 64; "turing")]
+#[test_case(8, 0, 163; "a100")]
+#[test_case(8, 6, 99; "ga10x")]
+#[test_case(8, 9, 99; "ada")]
+#[test_case(9, 0, 227; "hopper")]
+#[test_case(10, 0, 227; "blackwell datacenter")]
+#[test_case(12, 0, 99; "blackwell consumer")]
+#[test_case(13, 0, 48; "unknown generation stays portable")]
+fn shared_optin_follows_the_programming_guide(major: u8, minor: u8, kib: usize) {
+    let arch = CudaArch::from_compute_capability(major, minor);
+    assert_eq!(arch.max_shared_per_block_optin(), kib << 10);
+    assert!(arch.max_shared_per_block_optin() >= CudaArch::MAX_STATIC_SHARED_BYTES);
+}

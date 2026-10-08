@@ -110,10 +110,13 @@ fn scalar_argument_is_packed_as_i32() {
 fn launch_dims_are_blocks_and_threads() {
     let Some(dev) = cuda_device_or_skip() else { return };
     let program = load(&dev, "vadd", &vadd_abi());
-    assert_eq!(program.launch_dims(None, None).unwrap(), Launch { grid: [1, 1, 1], block: [1, 1, 1] });
+    assert_eq!(
+        program.launch_dims(None, None).unwrap(),
+        Launch { grid: [1, 1, 1], block: [1, 1, 1], dynamic_shared_bytes: 0 }
+    );
     assert_eq!(
         program.launch_dims(Some([7, 3, 2]), Some([32, 4, 1])).unwrap(),
-        Launch { grid: [7, 3, 2], block: [32, 4, 1] }
+        Launch { grid: [7, 3, 2], block: [32, 4, 1], dynamic_shared_bytes: 0 }
     );
     let error = program.launch_dims(Some([1, 1, 1]), Some([2048, 1, 1])).expect_err("block too large");
     let message = format!("{error}");
@@ -343,4 +346,102 @@ fn load_dispatches_on_the_image_format() {
     assert!(format!("{error}").contains("no entry"), "{error}");
     let error = CudaProgram::load_ptx(Arc::clone(&*dev), &image, "vadd", &vadd_abi()).expect_err("NUL bytes");
     assert!(format!("{error}").contains("NUL"), "{error}");
+}
+
+/// A kernel module whose shared memory is one `extern` array of `bytes`,
+/// exported the way the NVPTX renderer does above the static 48 KB cap.
+/// Thread `t` round-trips `input[t]` through the slot `4 * (t + 1)` bytes
+/// below the array's end, which only exists when the launch passes `bytes`.
+fn dynamic_shared_ptx(bytes: u32) -> String {
+    format!(
+        r#"
+.version 7.0
+.target sm_75
+.address_size 64
+
+.extern .shared .align 16 .b8 svod_dynamic_shared[];
+.visible .const .align 4 .u32 {symbol} = {bytes};
+
+.visible .entry dyn_smem(
+	.param .u64 dyn_smem_param_0,
+	.param .u64 dyn_smem_param_1
+)
+{{
+	.reg .f32 	%f<2>;
+	.reg .b32 	%r<4>;
+	.reg .b64 	%rd<6>;
+
+	ld.param.u64 	%rd1, [dyn_smem_param_0];
+	ld.param.u64 	%rd2, [dyn_smem_param_1];
+	cvta.to.global.u64 	%rd1, %rd1;
+	cvta.to.global.u64 	%rd2, %rd2;
+	mov.u32 	%r1, %tid.x;
+	mul.wide.u32 	%rd3, %r1, 4;
+	add.s64 	%rd4, %rd2, %rd3;
+	ld.global.f32 	%f1, [%rd4];
+	mov.u32 	%r2, svod_dynamic_shared;
+	add.s32 	%r2, %r2, {top};
+	shl.b32 	%r3, %r1, 2;
+	sub.s32 	%r2, %r2, %r3;
+	st.shared.f32 	[%r2], %f1;
+	bar.sync 	0;
+	ld.shared.f32 	%f1, [%r2];
+	add.s64 	%rd5, %rd1, %rd3;
+	st.global.f32 	[%rd5], %f1;
+	ret;
+}}
+"#,
+        symbol = crate::cuda::DYNAMIC_SHARED_BYTES_SYMBOL,
+        top = bytes - 4,
+    )
+}
+
+/// 64 KB of dynamic shared memory: the function is opted in at load and both
+/// a direct launch and a graph replay pass the size.
+#[test]
+fn dynamic_shared_memory_above_48k_launches() {
+    let Some(alloc) = cuda_alloc_or_skip() else { return };
+    const BYTES: u32 = 64 << 10;
+    if alloc.dev.limits().shared_per_block_optin < BYTES {
+        eprintln!("skipping: device opt-in shared limit is below 64 KB");
+        return;
+    }
+    let ptx = dynamic_shared_ptx(BYTES);
+    let program = CudaProgram::load_ptx(Arc::clone(&alloc.dev), ptx.as_bytes(), "dyn_smem", &[storage(0), storage(1)])
+        .expect("load");
+    assert_eq!(program.launch_dims(None, Some([256, 1, 1])).unwrap().dynamic_shared_bytes, BYTES);
+    assert!(program.resource_usage().unwrap().lds_bytes >= BYTES);
+    let input: Vec<f32> = (0..256).map(|i| i as f32 * 0.5 - 7.0).collect();
+    let (out, in_buf) = (upload(&alloc, &[0.0; 256]), upload(&alloc, &input));
+    unsafe { program.execute(&[device_ptr(&out), device_ptr(&in_buf)], &[], None, Some([256, 1, 1]), true) }
+        .expect("dispatch");
+    assert_eq!(download(&alloc, &out, 256), input);
+
+    let out = upload(&alloc, &[0.0; 256]);
+    let kernel = crate::device::GraphKernel {
+        program: &program as &dyn Program,
+        buffers: vec![device_ptr(&out), device_ptr(&in_buf)],
+        vals: vec![],
+        global_size: None,
+        local_size: Some([256, 1, 1]),
+        deps: vec![],
+    };
+    let graph = crate::cuda::CudaGraph::capture(Arc::clone(&alloc.dev), &[kernel]).unwrap().expect("graphable");
+    graph.replay(&[], &[]).unwrap();
+    assert_eq!(download(&alloc, &out, 256), input);
+}
+
+/// A module asking for more than the device's opt-in limit fails at load.
+#[test]
+fn dynamic_shared_memory_above_optin_limit_is_rejected() {
+    let Some(dev) = cuda_device_or_skip() else { return };
+    let limit = dev.limits().shared_per_block_optin;
+    assert!(limit >= dev.limits().shared_per_block, "{:?}", dev.limits());
+    let ptx = dynamic_shared_ptx(limit + 16);
+    let error = CudaProgram::load_ptx(Arc::clone(&dev), ptx.as_bytes(), "dyn_smem", &[storage(0), storage(1)])
+        .expect_err("over the opt-in limit");
+    assert!(
+        matches!(error, crate::Error::CudaSharedMemoryExceeded { dynamic_bytes, limit: l, .. } if dynamic_bytes == limit + 16 && l == limit),
+        "{error:?}"
+    );
 }

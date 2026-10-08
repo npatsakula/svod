@@ -219,6 +219,62 @@ fn nvptx_shared_memory_traffic_selects_shared_instructions() {
     }
 }
 
+/// LOCAL buffers stay static `.shared` globals up to the 48 KB ptxas cap;
+/// above it they are carved from one `extern` dynamic array at 16-byte
+/// aligned offsets, and the module exports the total for the loader.
+#[test_case::test_case(&[(DType::Float32, 8192), (DType::Float32, 4096)], None; "exactly 48 KB stays static")]
+#[test_case::test_case(&[(DType::Float32, 12289), (DType::Float16, 8192)], Some(&[0, 49168][..]); "unaligned first buffer pads to 16")]
+#[test_case::test_case(&[(DType::Float16, 3), (DType::Float32, 16384), (DType::Int8, 1)], Some(&[0, 16, 65552][..]); "three buffers")]
+fn nvptx_locals_above_static_cap_share_one_dynamic_array(buffers: &[(DType, usize)], offsets: Option<&[usize]>) {
+    let lane = UOp::special(UOp::native_const(32i32), "lidx0".to_string());
+    let stores = buffers
+        .iter()
+        .enumerate()
+        .map(|(slot, (dtype, size))| {
+            let local = UOp::buffer(slot, *size, dtype.clone(), AddrSpace::Local, None);
+            let at = UOp::index().buffer(local).indices(vec![UOp::native_const(0i32)]).call().unwrap();
+            let value = UOp::load().index(indexed(buffers.len() + slot, dtype.clone(), lane.clone())).call();
+            at.store(value)
+        })
+        .collect();
+    let result = render_nvptx_linearized(&UOp::sink(stores), SM86, "nvptx_dynamic_shared");
+    let symbol = svod_device::cuda::DYNAMIC_SHARED_BYTES_SYMBOL;
+    let Some(offsets) = offsets else {
+        assert!(!result.code.contains("@svod_dynamic_shared") && !result.code.contains(symbol), "{}", result.code);
+        assert!(result.code.contains("@local0 = internal unnamed_addr addrspace(3) global"), "{}", result.code);
+        assert_ptx_compiles(&result.code, SM86);
+        return;
+    };
+    let (dtype, size) = buffers.last().unwrap();
+    let total = (offsets.last().unwrap() + dtype.bytes() * size).next_multiple_of(16);
+    assert!(
+        result.code.contains("@svod_dynamic_shared = external addrspace(3) global [0 x i8], align 16"),
+        "{}",
+        result.code
+    );
+    assert!(
+        result.code.contains(&format!("@{symbol} = addrspace(4) constant i32 {total}, align 4")),
+        "{}",
+        result.code
+    );
+    assert!(!result.code.contains("@local"), "no static LOCAL global may remain:\n{}", result.code);
+    for (slot, offset) in offsets.iter().enumerate() {
+        let needle = format!(
+            "%local{slot}.shared = getelementptr inbounds i8, ptr addrspace(3) @svod_dynamic_shared, i64 {offset}"
+        );
+        assert!(result.code.contains(&needle), "missing {needle}:\n{}", result.code);
+    }
+    if let Some(ptx) = assert_ptx_compiles(&result.code, SM86) {
+        for needle in [
+            ".extern .shared .align 16 .b8 svod_dynamic_shared[];".to_string(),
+            format!(".visible .const .align 4 .u32 {symbol} = {total};"),
+            "st.shared".to_string(),
+        ] {
+            assert!(ptx.contains(&needle), "missing {needle}:\n{ptx}");
+        }
+    }
+}
+
 /// `@llvm.exp2` selects on f16/f32; `Log2` rides `lg2.approx.f32` (widening
 /// f16 around it); f64 has neither, so the decomposition set expands both
 /// polynomially. Division keeps `contract` only, so PTX gets `div.rn`.
