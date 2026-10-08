@@ -479,3 +479,87 @@ fn attention_throughput_probe() {
         }
     }
 }
+
+/// A Whisper large-v3 decoder step on the device: self attention over a
+/// layer-packed cache with the step's key appended, and cross attention
+/// over a shared 1500-key cache, tk3 (tuned splits, then unsplit) against
+/// tk1's single-query kernel (its split policy, then unsplit). Prints
+/// microseconds per step and never asserts (run with `--ignored --nocapture`).
+#[test]
+#[ignore = "perf probe: needs a CUDA device"]
+fn decode_throughput_probe() {
+    use crate::ops::{self as tk, Attn, Cache, KeyMask};
+    if !matches!(default_device(), DeviceSpec::Cuda { .. }) {
+        return;
+    }
+    crate::tune::set_enabled(true);
+    let (b, heads, d, layers, layer) = (5usize, 20usize, 64usize, 32usize, 10usize);
+    let f16 = |shape: &[usize], seed: u64| {
+        let mut s = seed;
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|_| lcg(&mut s) as f32).collect();
+        let t = Tensor::from_slice(&data).try_reshape(shape.iter().map(|&x| x as isize).collect::<Vec<_>>()).unwrap();
+        let t = t.cast(DType::Float16).contiguous();
+        t.realize().unwrap();
+        t
+    };
+    let ints = |v: Vec<i32>| {
+        let t = Tensor::from_slice(&v);
+        t.realize().unwrap();
+        t
+    };
+    let q = f16(&[b, 1, heads, d], 1);
+    let self_k = f16(&[b, 448, layers * heads, d], 2);
+    let self_v = f16(&[b, 448, layers * heads, d], 3);
+    let (k_app, v_app) = (f16(&[b, 1, heads, d], 4), f16(&[b, 1, heads, d], 5));
+    let lens = ints(vec![200; b]);
+    let cross_k = f16(&[1, 1500, layers * heads, d], 6);
+    let cross_v = f16(&[1, 1500, layers * heads, d], 7);
+    let map = ints(vec![0; b]);
+    let q32 = q.cast(DType::Float32).contiguous();
+    q32.realize().unwrap();
+
+    let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
+    for (name, splits) in [("tuned", None), ("unsplit", Some(1))] {
+        let cache =
+            Cache { head_start: layer * heads, kv_heads: heads, row_map: None, appended: Some((&k_app, &v_app)) };
+        let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, ..Attn::default() };
+        let o = tk::attention(&q, &self_k, &self_v, opts).unwrap();
+        plans.push((format!("tk3 self {name}"), o.prepare().unwrap()));
+        let cache = Cache { head_start: layer * heads, kv_heads: heads, row_map: Some(&map), appended: None };
+        let o = tk::attention(&q, &cross_k, &cross_v, Attn { cache: Some(cache), splits, ..Attn::default() }).unwrap();
+        plans.push((format!("tk3 cross {name}"), o.prepare().unwrap()));
+    }
+    for (name, split) in [("policy", None), ("unsplit", Some(1))] {
+        let opts =
+            svod_tk::SqAttentionOpts { key_lens: Some(&lens), appended: Some((&k_app, &v_app)), ..Default::default() };
+        if let Ok(Some(o)) = svod_tk::single_query_attention_packed(&q32, &self_k, &self_v, layer * heads, opts) {
+            plans.push((format!("tk1 self {name}"), o.prepare().unwrap()));
+        }
+        let opts = svod_tk::SqAttentionOpts { split, cache_map: Some(&map), ..Default::default() };
+        if let Ok(Some(o)) = svod_tk::single_query_attention_packed(&q32, &cross_k, &cross_v, layer * heads, opts) {
+            plans.push((format!("tk1 cross {name}"), o.prepare().unwrap()));
+        }
+    }
+    let warm = std::time::Instant::now();
+    while warm.elapsed().as_millis() < 500 {
+        plans[0].1.execute().unwrap();
+    }
+    let mut best = vec![f64::INFINITY; plans.len()];
+    for _ in 0..4 {
+        for (i, (_, plan)) in plans.iter().enumerate() {
+            for _ in 0..5 {
+                let run: f64 = plan
+                    .execute_profiled()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|kp| Some((kp.gpu_end_ns? - kp.gpu_start_ns?) as f64 * 1e-3))
+                    .sum();
+                best[i] = best[i].min(run);
+            }
+        }
+    }
+    for ((label, _), us) in plans.iter().zip(&best) {
+        eprintln!("{label}: {us:.1} us");
+    }
+}
