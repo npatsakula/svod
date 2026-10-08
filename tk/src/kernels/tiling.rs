@@ -2,8 +2,8 @@
 //!
 //! A tile table is a conclusion — the shape someone measured fastest on the
 //! hardware they had. This module holds the reasoning instead, so a device
-//! nobody measured, a shape outside the table, or a second kernel with its own
-//! economics does not need a table of its own.
+//! nobody measured or a shape outside the table does not need a table of its
+//! own.
 //!
 //! Three limits decide which tiles a device can run at all, and every one of
 //! them is something the backend reports ([`crate::target::workgroup_limits`]):
@@ -18,15 +18,15 @@
 //! * **operand traffic**, `(block_m + block_n) / (block_m · block_n)`. A square
 //!   tile moves the least memory per MAC, which is why the widest tile wins
 //!   whenever its grid still covers the device.
-//! * **trip overhead**, `1 / (block_n · k_step)` for a kernel that pays per K
-//!   trip. This is the term a tile table cannot express, because it is not a
-//!   property of the device at all — it is a property of the kernel reading it.
-//!   The NT GEMM does not pay it: a strip row is a base pointer and a stride.
-//!   The implicit-GEMM convolution does: it rebuilds every strip row's source
-//!   index on every trip, decoding an output pixel and a tap before it can
-//!   gather the row. Halving the trips halves that work per MAC, which is why
-//!   the convolution wants a strip twice as deep as the GEMM's on the same
-//!   hardware.
+//! * **trip overhead**, `1 / (block_n · k_step)`. This is the term a tile table
+//!   cannot express, because it is not a property of the device at all — it is
+//!   a property of the kernel reading it. The implicit-GEMM convolution, the
+//!   one kernel tiled from here, rebuilds every strip row's source index on
+//!   every trip, decoding an output pixel and a tap before it can gather the
+//!   row. Halving the trips halves that work per MAC, which is why the
+//!   convolution wants a strip twice as deep as the GEMM's on the same hardware
+//!   (the NT GEMM, whose strip row is a base pointer and a stride, keeps its
+//!   measured tables).
 //!
 //! The ranking is not asked to pick the winner. It is asked to put the winner
 //! in a handful of candidates that [`crate::tune`] then measures on the real
@@ -63,18 +63,6 @@ impl Trial for CompiledLaunch {
     fn resources(&self) -> Option<KernelResources> {
         CompiledLaunch::resources(self)
     }
-}
-
-/// What one K trip costs a kernel beyond the MACs of the trip itself.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum TripCost {
-    /// A strip row is a base pointer and a stride, so the trip count barely
-    /// shows: the plain NT GEMM.
-    Free,
-    /// Every strip row's source index is rebuilt on the trip — the
-    /// implicit-GEMM convolution decodes an output pixel and a tap out of
-    /// `(pid_m, r, tile)` before it can gather the row.
-    PerStripRow,
 }
 
 /// What a device allows one workgroup, and how many it wants in flight.
@@ -118,7 +106,8 @@ const REGISTERS_PER_LANE_MAX: usize = 255;
 const REGISTERS_PER_LANE_FLOOR: usize = 128;
 
 /// What one strip-row index decode costs against one operand element of
-/// traffic, for a kernel that pays per trip.
+/// traffic: the convolution decodes an output pixel and a tap out of
+/// `(pid_m, r, tile)` before it can gather the row.
 ///
 /// This is the one number here that measurement fixes rather than the device
 /// reports: a decode is a handful of integer divisions and a bounds test, and
@@ -358,13 +347,10 @@ impl TileBudget {
     /// the tile either clears or does not ([`Self::fits`]), and pricing it on a
     /// slope above that floor only produced ties that resolved toward the
     /// smallest tile.
-    fn cost(&self, cfg: &GemmCfg, trip: TripCost, (m, n): (usize, usize)) -> (bool, f64) {
+    fn cost(&self, cfg: &GemmCfg, (m, n): (usize, usize)) -> (bool, f64) {
         let (block_m, block_n) = (cfg.block_m as f64, cfg.block_n as f64);
         let traffic = (block_m + block_n) / (block_m * block_n);
-        let decode = match trip {
-            TripCost::Free => 0.0,
-            TripCost::PerStripRow => 1.0 / (block_n * cfg.k_step as f64),
-        };
+        let decode = 1.0 / (block_n * cfg.k_step as f64);
         (cfg.blocks(m, n) < self.blocks_wanted, traffic + DECODE_WEIGHT * decode)
     }
 
@@ -378,7 +364,6 @@ impl TileBudget {
         &self,
         base: &GemmCfg,
         in_bytes: usize,
-        trip: TripCost,
         (m, n): (usize, usize),
         limit: usize,
         accept: impl Fn(&GemmCfg) -> bool,
@@ -411,7 +396,7 @@ impl TileBudget {
             }
         }
         found.sort_by(|a, b| {
-            let (ca, cb) = (self.cost(a, trip, (m, n)), self.cost(b, trip, (m, n)));
+            let (ca, cb) = (self.cost(a, (m, n)), self.cost(b, (m, n)));
             ca.0.cmp(&cb.0).then(ca.1.total_cmp(&cb.1)).then_with(|| self.accumulators(a).cmp(&self.accumulators(b)))
         });
         // One entry per tile a launch can tell apart: the wave grids that split

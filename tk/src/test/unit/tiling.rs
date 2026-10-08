@@ -12,7 +12,7 @@ use svod_ir::UOp;
 
 use crate::kernels::conv::{ConvGeom, build_conv, stored_tile};
 use crate::kernels::gemm::{Epilogue, GemmCfg, NT_128X64};
-use crate::kernels::tiling::{TileBudget, Trial, TripCost, pack};
+use crate::kernels::tiling::{TileBudget, Trial, pack};
 use crate::target::WorkgroupLimits;
 
 const SM86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
@@ -56,8 +56,7 @@ fn rx_9070_xt() -> TileBudget {
 /// one-step neighbours, under the kernel's own tiling rule.
 fn reachable(budget: &TileBudget, g: &ConvGeom) -> Vec<GemmCfg> {
     let (m, _, n) = g.mkn();
-    let mut tiles: Vec<GemmCfg> =
-        budget.ranked(&NT_128X64, 2, TripCost::PerStripRow, (m, n), usize::MAX, |cfg| g.tiles(cfg)).to_vec();
+    let mut tiles: Vec<GemmCfg> = budget.ranked(&NT_128X64, 2, (m, n), usize::MAX, |cfg| g.tiles(cfg)).to_vec();
     let mut next = 0;
     while next < tiles.len() {
         for cfg in budget.neighbours(&tiles[next], 2, |cfg| g.tiles(cfg)) {
@@ -82,7 +81,7 @@ fn every_candidate_fits_the_device() {
     let budget = rtx_3060();
     let bytes = DType::Float16.bytes();
     for &(m, k, n) in &[(1600usize, 9 * 768usize, 768usize), (6400, 9 * 384, 384), (4096, 1024, 6144)] {
-        let tiles = budget.ranked(&NT_128X64, bytes, TripCost::PerStripRow, (m, n), 16, |cfg| cfg.tiles(m, k, n));
+        let tiles = budget.ranked(&NT_128X64, bytes, (m, n), 16, |cfg| cfg.tiles(m, k, n));
         assert!(!tiles.is_empty(), "{m}x{k}x{n} has no candidate");
         for cfg in tiles {
             assert!(budget.fits(&cfg, bytes), "{cfg:?} does not fit the device it was generated for");
@@ -104,7 +103,7 @@ fn no_step_leaves_the_lattice() {
     let budget = rtx_3060();
     let bytes = DType::Float16.bytes();
     let (m, k, n) = (4096usize, 1024usize, 6144usize);
-    let seeds = budget.ranked(&NT_128X64, bytes, TripCost::Free, (m, n), 8, |cfg| cfg.tiles(m, k, n));
+    let seeds = budget.ranked(&NT_128X64, bytes, (m, n), 8, |cfg| cfg.tiles(m, k, n));
     assert!(!seeds.is_empty(), "the GEMM must have somewhere to start");
     let mut frontier: Vec<GemmCfg> = seeds.into_iter().collect();
     for _ in 0..3 {
@@ -202,7 +201,7 @@ impl Trial for Scripted {
 fn m_bodies() -> (TileBudget, ConvGeom, Vec<GemmCfg>) {
     let (budget, g) = (rx_9070_xt(), yolo_conv(64, 64, 80, 1));
     let (m, _, n) = g.mkn();
-    let seeds = budget.ranked(&NT_128X64, 2, TripCost::PerStripRow, (m, n), 4, |cfg| g.tiles(cfg)).to_vec();
+    let seeds = budget.ranked(&NT_128X64, 2, (m, n), 4, |cfg| g.tiles(cfg)).to_vec();
     (budget, g, seeds)
 }
 

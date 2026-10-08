@@ -24,7 +24,7 @@ use super::gemm::{
     BOrder, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmCfg, GemmPolicy, RowSource, b_index, b_operand, b_strip,
     gemm_core_with, narrow, silu,
 };
-use super::tiling::{self, TileBudget, TripCost};
+use super::tiling::{self, TileBudget};
 use crate::group::{iadd, idiv, imod, imul};
 use crate::index::{Idx, cidx, load_off};
 use crate::tiles::TileLayout;
@@ -209,7 +209,7 @@ pub(crate) fn conv_tile_seeds(
     let plain = |cfg: &GemmCfg| GemmCfg { l2_swizzle: false, ..*cfg };
     let base = plain(policy.tiles.first().unwrap_or(&super::gemm::NT_128X64));
     let mut seeds: Vec<GemmCfg> =
-        budget.ranked(&base, dtype.bytes(), TripCost::PerStripRow, (m, n), CONV_SEEDS, |cfg| geom.tiles(cfg)).to_vec();
+        budget.ranked(&base, dtype.bytes(), (m, n), CONV_SEEDS, |cfg| geom.tiles(cfg)).to_vec();
     for cfg in policy.tiles.iter().map(plain).filter(|cfg| geom.tiles(cfg)) {
         if !seeds.contains(&cfg) {
             seeds.push(cfg);
