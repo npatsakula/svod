@@ -363,3 +363,22 @@ fn f16_ops_match_the_graph() {
     let want = tk::norm::graph(crate::kernels::rows::Norm::Rms, &x, None, &w, None, 1e-6).unwrap().1;
     assert_close("f16 rms norm", &y, &want, 2e-2);
 }
+
+/// The residual is a realized buffer that a graph kernel (a norm the op
+/// layer leaves on the graph) also reads; the GEMM consumes that kernel's
+/// output.
+#[test]
+fn residual_shared_with_a_graph_norm() {
+    if !device() {
+        return;
+    }
+    let (m, d) = (1536, 384);
+    let x = rand(&[1, m, d], 20, 1.0, DType::Float16);
+    let g = rand(&[d], 21, 1.0, DType::Float16);
+    let w = rand(&[d, d], 22, 0.2, DType::Float16);
+    let ln = tk::layer_norm(&x, &g, None, 1e-5).unwrap();
+    let opts = Linear { residual: Some(&x), ..Linear::default() };
+    let y = tk::linear(&ln, &w, opts).unwrap();
+    assert_kernel(&y, "gemm");
+    assert_close("residual over graph norm", &y, &linear_reference(&ln, &w, opts), 3e-2);
+}

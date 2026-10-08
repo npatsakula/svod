@@ -228,6 +228,41 @@ fn test_custom_kernel_hand_ranged_loop_cpu() {
     });
 }
 
+/// A realized shaped input (a reshaped buffer) read by a graph kernel and by
+/// the custom kernel: the graph kernel's indexed load of the shared node must
+/// not replace the call's whole-buffer argument.
+#[test]
+fn test_custom_kernel_input_shared_with_a_graph_kernel() {
+    test_setup();
+    svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || {
+        let n = 8usize;
+        let config = PrepareConfig::for_cpu_backend(CpuBackend::Clang);
+        let src = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).try_reshape([2, 4]).unwrap();
+        src.realize_with(&config).unwrap();
+        assert!(matches!(src.uop().op(), Op::Reshape(..)));
+        let doubled = (&src * 2.0f32).unwrap();
+        let dst = Tensor::empty(&[2, 4], DType::Float32);
+
+        let mut outputs = dst
+            .custom_kernel(&[&doubled, &src], move |ph| {
+                let i = UOp::range_const(n as i64, 0);
+                let load = |buf: &Arc<UOp>| {
+                    UOp::load().index(UOp::index().buffer(buf.base()).indices(vec![i.clone()]).call().unwrap()).call()
+                };
+                let val = load(&ph[1]).try_add(&load(&ph[2])).unwrap();
+                let out_idx = UOp::index().buffer(ph[0].base()).indices(vec![i.clone()]).call().unwrap();
+                let store = out_idx.store(val).end(smallvec![i]);
+                UOp::sink_with_info(vec![store], KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() })
+            })
+            .expect("custom kernel should build");
+
+        let out = outputs.remove(0);
+        out.realize_with(&config).unwrap();
+        let expected: Vec<f32> = (0..n).map(|x| 3.0 * x as f32).collect();
+        assert_close_f32(&out.as_vec::<f32>().unwrap(), &expected, 1e-6);
+    });
+}
+
 /// Hardware-gated: `SVOD_DEVICE=AMD:0 cargo test -p svod-tensor custom_kernel::test_custom_kernel_hand_ranged_loop_amd -- --ignored --nocapture`.
 #[test]
 #[ignore]
