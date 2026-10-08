@@ -77,12 +77,14 @@ pub fn gemm_candidates(target: &Target, batches: usize, m: usize, n: usize, k: u
 
 /// One warp per 16 query rows. `d = 128` leads with half-width key blocks:
 /// 64-wide ones measured 18.2 TFLOP/s against 22.2 on sm_86, since 64 KB
-/// per block leaves one block per SM.
+/// per block leaves one block per SM. `d = 48` keeps the shapes whose K/V
+/// fills divide among the block's threads (96-byte rows, 16-byte chunks).
 pub fn attention_candidates(target: &Target, d: usize) -> Vec<FaCfg> {
     let fa = |bq, bkv, stages| FaCfg { bq, bkv, stages };
     let list = match d {
-        64 => [fa(64, 64, 2), fa(64, 64, 3), fa(128, 64, 2), fa(64, 32, 2), fa(128, 32, 2), fa(64, 32, 3)],
-        128 => [fa(64, 32, 2), fa(64, 32, 3), fa(128, 32, 2), fa(64, 64, 2), fa(128, 64, 2), fa(128, 32, 3)],
+        48 => vec![fa(64, 64, 2), fa(64, 64, 3)],
+        64 => vec![fa(64, 64, 2), fa(64, 64, 3), fa(128, 64, 2), fa(64, 32, 2), fa(128, 32, 2), fa(64, 32, 3)],
+        128 => vec![fa(64, 32, 2), fa(64, 32, 3), fa(128, 32, 2), fa(64, 64, 2), fa(128, 64, 2), fa(128, 32, 3)],
         _ => return vec![],
     };
     list.into_iter().filter(|c| c.smem_bytes(d) <= target.smem_bytes).collect()

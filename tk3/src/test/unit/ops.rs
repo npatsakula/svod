@@ -219,20 +219,54 @@ struct AttnCase {
     d: usize,
     causal: bool,
     lens: Option<Vec<i32>>,
+    window: Option<(usize, usize)>,
+    /// A bool key mask hiding every fifth key, and packed segments of 30 rows.
+    key_mask: bool,
+    segments: bool,
 }
 
-fn attn_inputs(c: &AttnCase, cap: usize) -> (Tensor, Tensor, Tensor, Option<Tensor>) {
+struct AttnInputs {
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    lens: Option<Tensor>,
+    key_mask: Option<Tensor>,
+    seg_start: Option<Tensor>,
+}
+
+impl AttnInputs {
+    fn opts(&self, c: &AttnCase) -> Attn<'_> {
+        let keys = match (&self.lens, &self.key_mask) {
+            (Some(lens), _) => KeyMask::Lens(lens),
+            (None, Some(mask)) => KeyMask::Bool(mask),
+            (None, None) => KeyMask::None,
+        };
+        Attn { causal: c.causal, keys, window: c.window, seg_start: self.seg_start.as_ref(), scale: None }
+    }
+}
+
+fn attn_inputs(c: &AttnCase, cap: usize) -> AttnInputs {
+    let realized = |t: Tensor| {
+        t.realize().unwrap();
+        t
+    };
     let q = rand(&[cap, c.t, c.h, c.d], 20, 1.0, DType::BFloat16);
     let k = rand(&[cap, c.tk, c.h_kv, c.d], 21, 1.0, DType::BFloat16);
     let v = rand(&[cap, c.tk, c.h_kv, c.d], 22, 1.0, DType::BFloat16);
     let lens = c.lens.as_ref().map(|l| {
         let mut l = l.clone();
         l.resize(cap, c.tk as i32);
-        let t = Tensor::from_slice(&l);
-        t.realize().unwrap();
-        t
+        realized(Tensor::from_slice(&l))
     });
-    (q, k, v, lens)
+    let key_mask = c.key_mask.then(|| {
+        let mask: Vec<bool> = (0..cap * c.tk).map(|x| (x / c.tk + x % c.tk) % 5 != 2).collect();
+        realized(Tensor::from_slice(&mask).try_reshape([cap, c.tk]).unwrap())
+    });
+    let seg_start = c.segments.then(|| {
+        let seg: Vec<i32> = (0..cap * c.t).map(|x| (x % c.t - x % c.t % 30) as i32).collect();
+        realized(Tensor::from_slice(&seg).try_reshape([cap, c.t]).unwrap())
+    });
+    AttnInputs { q, k, v, lens, key_mask, seg_start }
 }
 
 /// `b` batches of `[t, tk]` query/key rows, `[h, h_kv]` heads of width `d`.
@@ -244,7 +278,8 @@ fn case(
     causal: bool,
     lens: Option<&[i32]>,
 ) -> AttnCase {
-    AttnCase { b, t, tk, h, h_kv, d, causal, lens: lens.map(<[i32]>::to_vec) }
+    let lens = lens.map(<[i32]>::to_vec);
+    AttnCase { b, t, tk, h, h_kv, d, causal, lens, window: None, key_mask: false, segments: false }
 }
 
 #[test_case(case(2, [100, 100], [4, 4], 64, false, Some(&[100, 61])); "t100 key lens")]
@@ -252,16 +287,21 @@ fn case(
 #[test_case(case(2, [128, 128], [8, 2], 64, true, Some(&[128, 77])); "gqa 8 over 2")]
 #[test_case(case(2, [100, 100], [4, 2], 128, true, Some(&[90, 100])); "d128 gqa causal lens")]
 #[test_case(case(2, [37, 150], [4, 4], 64, false, None); "cross attention")]
+#[test_case(AttnCase { window: Some((64, 64)), ..case(2, [300, 300], [4, 4], 64, false, None) }; "window 64 each side")]
+#[test_case(AttnCase { key_mask: true, ..case(2, [100, 100], [4, 4], 64, false, None) }; "bool key mask")]
+#[test_case(AttnCase { key_mask: true, window: Some((10, 0)), ..case(2, [130, 130], [4, 2], 128, true, None) }; "d128 causal window bool mask")]
+#[test_case(AttnCase { segments: true, ..case(2, [200, 200], [4, 2], 64, true, None) }; "causal packed segments")]
+#[test_case(AttnCase { segments: true, key_mask: true, ..case(1, [96, 96], [4, 4], 48, true, None) }; "d48 causal segments bool mask")]
+#[test_case(case(2, [150, 150], [4, 4], 48, false, Some(&[150, 100])); "d48 key lens")]
 fn attention_matches_the_graph(c: AttnCase) {
     if !device() {
         return;
     }
-    let (q, k, v, lens) = attn_inputs(&c, c.b);
-    let keys = lens.as_ref().map_or(KeyMask::None, KeyMask::Lens);
-    let opts = Attn { causal: c.causal, keys, scale: None };
-    let o = tk::attention(&q, &k, &v, opts).unwrap();
+    let inputs = attn_inputs(&c, c.b);
+    let opts = inputs.opts(&c);
+    let o = tk::attention(&inputs.q, &inputs.k, &inputs.v, opts).unwrap();
     assert_kernel(&o, "flash_attention");
-    assert_close("attention", &o, &tk::attention::graph(&q, &k, &v, opts, lens.as_ref()).unwrap(), 2e-2);
+    assert_close("attention", &o, &tk::attention::graph(&inputs.q, &inputs.k, &inputs.v, opts).unwrap(), 2e-2);
 }
 
 #[test]
@@ -271,16 +311,16 @@ fn attention_under_a_batch_variable() {
     }
     let (cap, live) = (3, 2);
     let c = case(cap, [96, 96], [4, 2], 64, false, Some(&[96, 40, 5]));
-    let (q, k, v, lens) = attn_inputs(&c, cap);
+    let AttnInputs { q, k, v, lens, .. } = attn_inputs(&c, cap);
     let lens = lens.unwrap();
     let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
     let [qb, kb, vb, lb] = <[Tensor; 4]>::try_from(bound(&[&q, &k, &v, &lens], &var)).unwrap();
-    let o = tk::attention(&qb, &kb, &vb, Attn { causal: false, keys: KeyMask::Lens(&lb), scale: Some(0.2) }).unwrap();
+    let opts = |lens| Attn { keys: KeyMask::Lens(lens), scale: Some(0.2), ..Attn::default() };
+    let o = tk::attention(&qb, &kb, &vb, opts(&lb)).unwrap();
     assert_eq!(o.shape().unwrap()[0], var.as_sint());
     assert_kernel(&o, "flash_attention");
     let [qs, ks, vs, ls] = <[Tensor; 4]>::try_from(first(&[&q, &k, &v, &lens], live)).unwrap();
-    let opts = Attn { causal: false, keys: KeyMask::Lens(&ls), scale: Some(0.2) };
-    assert_close("batched attention", &o, &tk::attention::graph(&qs, &ks, &vs, opts, Some(&ls)).unwrap(), 2e-2);
+    assert_close("batched attention", &o, &tk::attention::graph(&qs, &ks, &vs, opts(&ls)).unwrap(), 2e-2);
 }
 
 // ---- norms ---------------------------------------------------------------------
@@ -354,7 +394,7 @@ fn f16_ops_match_the_graph() {
     let opts = Attn { causal: true, ..Attn::default() };
     let o = tk::attention(&q, &k, &v, opts).unwrap();
     assert_kernel(&o, "flash_attention");
-    assert_close("f16 attention", &o, &tk::attention::graph(&q, &k, &v, opts, None).unwrap(), 2e-2);
+    assert_close("f16 attention", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
 
     let w = rand(&[256], 52, 1.0, DType::Float16);
     let x = rand(&[37, 256], 53, 2.0, DType::Float16);
