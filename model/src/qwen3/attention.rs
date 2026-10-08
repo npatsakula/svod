@@ -96,13 +96,15 @@ impl Qwen3Attention {
     /// `x`: `(B, L, D)` → `(B, L, D)`. `rope`: sequence-major `(cos, sin)`,
     /// `[1, L, 1, Dh/2]` by position or `[B, L, 1, Dh/2]` by token.
     pub fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor)) -> Result<Tensor> {
-        self.forward_packed(x, rope, None)
+        self.forward_packed(x, None, rope, None)
     }
 
-    /// [`Self::forward`] over packed rows' `seg_start` (see [`causal_attention`]).
+    /// [`Self::forward`] over packed rows' `seg_start` (see [`causal_attention`]),
+    /// `residual` added in the `o_proj` GEMM's epilogue.
     pub(crate) fn forward_packed(
         &self,
         x: &Tensor,
+        residual: Option<&Tensor>,
         rope: &(Tensor, Tensor),
         seg_start: Option<&Tensor>,
     ) -> Result<Tensor> {
@@ -114,7 +116,7 @@ impl Qwen3Attention {
             l,
             SInt::Const(self.num_heads * self.head_dim),
         ])?;
-        Ok(ops::linear(&attn, &self.o_proj_weight, ops::Linear::default())?)
+        Ok(ops::linear(&attn, &self.o_proj_weight, ops::Linear { residual, ..Default::default() })?)
     }
 
     /// The fused GEMM output `[B, L, (H + 2·Hkv)·Dh]` → the three sequence-major

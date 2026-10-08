@@ -4,12 +4,8 @@
 //! y = h + mlp(post_attention_layernorm(h))
 //! ```
 //!
-//! Each residual add feeds exactly one norm, so the addend travels beside the
-//! stream until [`svod_tk3::ops::add_rms_norm`] writes the sum and its norm
-//! in one pass. The GEMM epilogue cannot take it: with the norm on the graph
-//! path (a width without a norm kernel, a weight off the stream's dtype) a
-//! launch whose residual operand the norm also reads fails kernel-graph
-//! verification.
+//! Each residual add rides the epilogue of the GEMM that produces its addend
+//! (`o_proj`, `down_proj`).
 
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Module, RmsNorm};
@@ -19,12 +15,8 @@ use super::attention::Qwen3Attention;
 use super::error::Result;
 use super::feed_forward::Qwen3MLP;
 
-/// `(x + delta, rms_norm(x + delta))`.
-pub(crate) fn add_norm(norm: &RmsNorm, delta: Option<&Tensor>, x: &Tensor) -> Result<(Tensor, Tensor)> {
-    Ok(match delta {
-        Some(delta) => ops::add_rms_norm(delta, x, &norm.weight, norm.eps)?,
-        None => (x.clone(), ops::rms_norm(x, &norm.weight, norm.eps)?),
-    })
+pub(crate) fn rms_norm(norm: &RmsNorm, x: &Tensor) -> Result<Tensor> {
+    Ok(ops::rms_norm(x, &norm.weight, norm.eps)?)
 }
 
 #[derive(Clone, Module)]
@@ -55,23 +47,20 @@ impl Qwen3DecoderLayer {
     }
 
     pub fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor)) -> Result<Tensor> {
-        let (h, mlp) = self.forward_unsummed(x, None, rope, None)?;
-        Ok(h.try_add(&mlp)?)
+        self.forward_packed(x, rope, None)
     }
 
-    /// The layer over the stream `x + delta`, returning the stream and the mlp
-    /// output still to be added to it. `seg_start` is the packed rows' segment
-    /// table (see [`super::Packing`]).
-    pub(crate) fn forward_unsummed(
+    /// [`Self::forward`] over packed rows' segment table `seg_start` (see
+    /// [`super::Packing`]).
+    pub(crate) fn forward_packed(
         &self,
         x: &Tensor,
-        delta: Option<&Tensor>,
         rope: &(Tensor, Tensor),
         seg_start: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
-        let (x, x_norm) = add_norm(&self.input_layernorm, delta, x)?;
-        let attn = self.attention.forward_packed(&x_norm, rope, seg_start)?;
-        let (h, h_norm) = add_norm(&self.post_attention_layernorm, Some(&attn), &x)?;
-        Ok((h, self.mlp.forward(&h_norm)?))
+    ) -> Result<Tensor> {
+        let x_norm = rms_norm(&self.input_layernorm, x)?;
+        let h = self.attention.forward_packed(&x_norm, Some(x), rope, seg_start)?;
+        let h_norm = rms_norm(&self.post_attention_layernorm, &h)?;
+        self.mlp.forward_into(&h_norm, Some(&h))
     }
 }
