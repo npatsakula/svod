@@ -12,7 +12,9 @@ use super::{
     DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed,
 };
 use crate::kernels;
-use crate::kernels::attention::{AttnMask, AttnSpec, CombineSpec, FaCfg, attention as fa, combine, key_mask_stride};
+use crate::kernels::attention::{
+    AttnMask, AttnSpec, Bias, CombineSpec, FaCfg, attention as fa, combine, key_mask_stride,
+};
 use crate::kernels::rows::NormCfg;
 use crate::launch;
 
@@ -64,11 +66,15 @@ pub struct Attn<'a> {
     pub splits: Option<usize>,
     /// Defaults to `1/√D`.
     pub scale: Option<f32>,
+    /// `[B, H, T, Tk]` or `[1, H, T, Tk]` added to the scaled scores before
+    /// the masks: `softmax(q·kᵀ·scale + bias)`. With an appended row `Tk`
+    /// counts it, its column last. Off the stream dtype keeps the graph.
+    pub bias: Option<&'a Tensor>,
 }
 
 const OP: &str = "attention";
 
-/// `softmax(q·kᵀ·scale)·v` over `q [B, T, H, D]` and `k`/`v [B, Tk, H_kv, D]`,
+/// `softmax(q·kᵀ·scale + bias)·v` over `q [B, T, H, D]` and `k`/`v [B, Tk, H_kv, D]`,
 /// query head `h` reading KV head `h / (H / H_kv)`; returns `[B, T, H, D]`.
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tensor> {
     let shape = |t: &Tensor| shape_of(t).context(GraphSnafu { op: OP });
@@ -128,11 +134,24 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         let got = shape(seg)?;
         ensure!(got == qs[..2], shape_err("seg start", &got, fmt_shape(&qs[..2])));
     }
+    let appended = opts.cache.is_some_and(|c| c.appended.is_some());
+    let keys = ks[1].as_const().map_or(ks[1].clone(), |n| SInt::Const(n + usize::from(appended)));
+    let bias_rows = match opts.bias {
+        Some(bias) => {
+            let got = shape(bias)?;
+            let want = [qs[0].clone(), qs[2].clone(), qs[1].clone(), keys.clone()];
+            let fits = got.len() == 4 && (got[0] == want[0] || got[0] == SInt::Const(1)) && got[1..] == want[1..];
+            ensure!(fits, shape_err("bias", &got, format!("[{} | 1, {}, {}, {keys}]", qs[0], qs[2], qs[1])));
+            Some(if got[0] == SInt::Const(1) { Bias::Shared } else { Bias::PerBatch })
+        }
+        None => None,
+    };
 
     let (q_ext, var) = extent(&qs).unzip();
     let k_ext = extent(&ks).map(|(e, _)| e);
     let target = super::target(&q.device());
-    let plan = shape::attention(target.as_ref(), &[q.dtype(), k.dtype(), v.dtype()], q_ext.as_ref(), k_ext.as_ref());
+    let dtypes: Vec<DType> = [q, k, v].into_iter().chain(opts.bias).map(Tensor::dtype).collect();
+    let plan = shape::attention(target.as_ref(), &dtypes, q_ext.as_ref(), k_ext.as_ref());
     let Plan::Kernel(cfgs) = plan else { return graph(q, k, v, opts).context(GraphSnafu { op: OP }) };
     let (q_ext, k_ext, var) = (q_ext.expect("planned"), k_ext.expect("planned"), var.flatten());
     let target = target.expect("planned");
@@ -200,12 +219,28 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         if pad == 0 { m } else { m.try_pad(&[(0, 0), (0, pad as isize)]).expect("padding the last dim") }
     });
     let segs = opts.seg_start.map(i32);
+    // Rows padded to the kernel's aligned stride, like the key mask's.
+    let bias = opts.bias.map(|b| {
+        let keys = tk + usize::from(appended);
+        let pad = key_mask_stride(keys) - keys;
+        if pad == 0 {
+            b.clone()
+        } else {
+            b.try_pad(&[(0, 0), (0, 0), (0, 0), (0, pad as isize)]).expect("padding the last dim")
+        }
+    });
     let row_map = opts.cache.and_then(|c| c.row_map).map(i32);
     let (k_app, v_app) = opts.cache.and_then(|c| c.appended).unzip();
-    let mask = AttnMask { key_lens: lens.is_some(), key_mask: bools.is_some(), seg_start: segs.is_some(), ..edges };
+    let mask = AttnMask {
+        key_lens: lens.is_some(),
+        key_mask: bools.is_some(),
+        seg_start: segs.is_some(),
+        bias: bias_rows,
+        ..edges
+    };
     let spec = spec(cfg, mask, cache);
     let lowering = cfg.lowering(target.clone());
-    let extras = [lens.as_ref(), bools.as_ref(), segs.as_ref(), row_map.as_ref(), k_app, v_app];
+    let extras = [lens.as_ref(), bools.as_ref(), segs.as_ref(), row_map.as_ref(), k_app, v_app, bias.as_ref()];
     if cfg.splits == 1 {
         let o = output(&q_ext.dims, &var, q.dtype());
         let ins: Vec<&Tensor> = [Some(q), Some(k), Some(v), Some(&o)].into_iter().chain(extras).flatten().collect();
@@ -235,7 +270,7 @@ fn dims4(dims: &[usize]) -> [usize; 4] {
     dims.try_into().expect("rank 4")
 }
 
-/// SDPA over head-major `[B, H, T, D]`, with the same masks; a cache is
+/// SDPA over head-major `[B, H, T, D]`, with the same masks and bias; a cache is
 /// narrowed to its heads, gathered by the row map and extended by the
 /// appended row.
 pub(crate) fn graph(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> svod_tensor::error::Result<Tensor> {
@@ -278,6 +313,16 @@ pub(crate) fn graph(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> svod_tens
         }
         None => None,
     };
+    // One attention mask: the segment mask folds into the bias as its floor.
+    let attn_mask = match (hidden, opts.bias) {
+        (hidden, None) => hidden,
+        (None, Some(bias)) => Some(bias.clone()),
+        (Some(hidden), Some(bias)) => {
+            let bias = bias.cast(DType::Float32);
+            let floor = Tensor::const_(f32::MIN, DType::Float32);
+            Some(bias.where_(&hidden.logical_not()?, &floor)?)
+        }
+    };
     head_major(q)?
         .scaled_dot_product_attention()
         .key(&head_major(&k)?)
@@ -286,7 +331,7 @@ pub(crate) fn graph(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> svod_tens
         .maybe_window(opts.window)
         .enable_gqa(q.dim_const(2)? != k.dim_const(2)?)
         .maybe_key_padding_mask(valid.as_ref())
-        .maybe_attn_mask(hidden.as_ref())
+        .maybe_attn_mask(attn_mask.as_ref())
         .maybe_scale(opts.scale.map(f64::from))
         .call()?
         .try_permute(&[0, 2, 1, 3])

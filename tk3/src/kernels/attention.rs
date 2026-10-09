@@ -2,7 +2,7 @@
 //! shared ring, the online-softmax state `(m, l, o)` carried.
 
 use super::rows::NormCfg;
-use super::{Batch, batch_offset, bound};
+use super::{Batch, batch_offset, bound, load_f32};
 use crate::atoms::Target;
 use crate::build::*;
 use crate::ir::*;
@@ -63,6 +63,20 @@ pub struct AttnMask {
     /// A `[batch, t]` i32 parameter, non-decreasing along `t`: keys before
     /// `seg_start[i]` are hidden from query `i` (packed rows' segment starts).
     pub seg_start: bool,
+    /// An additive score bias in the stream type, `scores·scale + bias`
+    /// before the masks hide anything; the [`Bias`] rows say whose.
+    pub bias: Option<Bias>,
+}
+
+/// The rows of the `bias` parameter, `[rows, heads, t, key_mask_stride(keys)]`
+/// with `keys` the scored keys: `tk`, plus one with a row appended (its
+/// column last).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Bias {
+    /// One row every batch shares.
+    Shared,
+    /// A row per batch.
+    PerBatch,
 }
 
 /// Keys and values read from a cache of `[rows, tk, heads_total, d]`, the
@@ -79,7 +93,8 @@ pub struct Cache {
     pub appended: bool,
 }
 
-/// The row stride of the `key_mask` parameter: 8-element runs stay aligned.
+/// The row stride of the `key_mask` and `bias` parameters: 8-element runs
+/// stay aligned.
 pub fn key_mask_stride(tk: usize) -> usize {
     tk.next_multiple_of(8)
 }
@@ -113,6 +128,7 @@ impl AttnSpec {
             (cache.row_map, "row_map"),
             (cache.appended, "k_app"),
             (cache.appended, "v_app"),
+            (self.mask.bias.is_some(), "bias"),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -161,16 +177,16 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     [m_new, l, o]
 }
 
-/// `o = softmax(q·kᵀ·scale)·v`. Parameters in order: `q`, `k`, `v`, then `o`
+/// `o = softmax(q·kᵀ·scale + bias)·v`. Parameters in order: `q`, `k`, `v`, then `o`
 /// (one split) or the f32 partials `o_part [splits, batch, t, heads, d]`,
 /// `m_part` and `l_part [splits, batch, t, heads]`, then
 /// [`AttnSpec::extra_params`]. Key blocks no query of the tile sees are
 /// skipped through the first block and the trip count, the rest shared
 /// evenly by the splits; only blocks a mask edge crosses pay for the mask,
-/// except under a key mask, which every block reads.
+/// except under a key mask or a bias, which every block reads.
 pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, scale, cfg } = *spec;
-    let AttnMask { causal, window, key_lens, key_mask, seg_start } = mask;
+    let AttnMask { causal, window, key_lens, key_mask, seg_start, bias } = mask;
     let FaCfg { bq, bkv, stages, splits } = cfg;
     let cap = batch.capacity();
     let (kv_rows, heads_total, head_start) =
@@ -195,6 +211,12 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         let k_app = k.param::<T>("k_app", ParamKind::In, cap * kv_heads * d);
         let v_app = k.param::<T>("v_app", ParamKind::In, cap * kv_heads * d);
         (k_app, v_app)
+    });
+    let keys = tk + usize::from(appended.is_some());
+    let bias_stride = key_mask_stride(keys);
+    let bias = bias.map(|rows| {
+        let n = if rows == Bias::Shared { 1 } else { cap };
+        (k.param::<T>("bias", ParamKind::In, n * heads * t * bias_stride), rows)
     });
     let (gz, bb) = batch.axis(&mut k);
     k.grid([Sc::from(t.div_ceil(bq) * splits), Sc::from(heads), gz]);
@@ -236,6 +258,13 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let mask_view = masks.map(|m| {
         let view = k.view(m, b.clone() * mask_stride, [mask_stride, 1], Shape::new(1, bkv), [None, bound(tk, bkv)]);
         k.at(view, 0, 0)
+    });
+    // Past `keys` (the appended column's tile always overhangs it) reads nothing.
+    let bias_view = bias.map(|(p, rows)| {
+        let batch = if rows == Bias::Shared { Sc::from(0) } else { batch_offset(&bb, heads * t * bias_stride) };
+        let cols = if appended.is_some() { Some(Sc::from(keys)) } else { bound(keys, bkv) };
+        let bounds = [bound(t, bq), cols];
+        k.view(p, batch + hh.clone() * (t * bias_stride), [bias_stride, 1], Shape::new(bq, bkv), bounds)
     });
     // The tile's segment starts, loaded once; the mask is monotonic, so the
     // first and last rows bound the tile's.
@@ -285,6 +314,15 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         let q_off = k.splat::<I32>(shape, q_off.clone());
         (col, k.binary(row, q_off, BinaryOp::Add))
     };
+    // The bias tile of the key block at `col`, in the scores' log2 units.
+    let biased = |k: &mut Kernel, s: Regs<F32>, col: Sc| -> Regs<F32> {
+        let Some(view) = bias_view else { return s };
+        let tile = k.at(view, q_off.clone(), col);
+        let b = load_f32(k, tile);
+        let log2e = k.fill::<F32>(shape, Const::Float(std::f64::consts::LOG2_E));
+        let b = k.binary(b, log2e, BinaryOp::Mul);
+        k.binary(s, b, BinaryOp::Add)
+    };
     let hide = |k: &mut Kernel, keep: Regs<Bool>, plain: Regs<F32>| {
         let hidden = k.fill::<F32>(shape, Const::Float(f64::NEG_INFINITY));
         k.where_(keep, plain, hidden)
@@ -333,6 +371,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     };
     let edges = causal || keys_masked || window.is_some() || seg.is_some();
     let mask = |k: &mut Kernel, s: Regs<F32>, block_start: Sc| -> Regs<F32> {
+        let s = biased(k, s, block_start.clone());
         if key_mask {
             return masked(k, s, block_start);
         }
@@ -396,6 +435,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             let (k_g, v_g) = (app(&mut k, k_app), app(&mut k, v_app));
             let last = split.clone().eq(splits - 1);
             let one = |k: &mut Kernel, s: Regs<F32>, _: Sc| {
+                let s = biased(k, s, Sc::from(tk));
                 let col = k.coord(shape, Axis::Col);
                 let zero = k.zeros::<I32>(shape);
                 let first_col = k.compare(col, zero, BinaryOp::Eq);

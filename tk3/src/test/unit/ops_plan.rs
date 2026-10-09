@@ -165,6 +165,20 @@ fn f16_takes_the_kernels() {
 fn attention_plans(d: usize, want: Result<FaCfg, Fallback>) {
     let (q, kv) = (ext(&[2, 100, 8, d]), ext(&[2, 37, 2, d]));
     assert_eq!(first(shape::attention(Some(&sm86()), &[BF16; 3], Some(&q), Some(&kv))), want);
+    assert_eq!(first(shape::attention(Some(&sm86()), &[BF16; 4], Some(&q), Some(&kv))), want, "with a bias");
+}
+
+/// A bias takes the kernel in the stream type only.
+#[test_case(BF16, true; "bf16")]
+#[test_case(DType::Float16, false; "f16 under bf16")]
+#[test_case(DType::Float32, false; "f32")]
+fn biased_attention_plans(bias: DType, kernel: bool) {
+    let (q, kv) = (ext(&[2, 100, 8, 64]), ext(&[2, 100, 8, 64]));
+    let plan = shape::attention(Some(&sm86()), &[BF16, BF16, BF16, bias], Some(&q), Some(&kv));
+    assert_eq!(matches!(plan, Plan::Kernel(_)), kernel, "{plan:?}");
+    if !kernel {
+        assert_eq!(plan, Plan::Graph(Fallback::Dtype));
+    }
 }
 
 /// Both query-block widths and key-block widths, two- and three-deep rings,
@@ -340,6 +354,20 @@ fn semantic_mismatches_are_errors() {
     let with_lens = Attn { keys: KeyMask::Lens(&lens), ..Attn::default() };
     let opts = Attn { cache: Some(Cache { row_map: Some(&map), appended: Some((&app, &wide)), ..plain }), ..with_lens };
     assert!(matches!(err(tk::attention(&q, &cache, &cache, opts)), Error::Shape { operand: "appended v", .. }));
+    let bias = t(&[2, 6, 10, 13], BF16);
+    let opts = Attn { cache: Some(Cache { row_map: Some(&map), appended: Some((&app, &app)), ..plain }), ..with_lens };
+    assert!(tk::attention(&q, &cache, &cache, Attn { bias: Some(&bias), ..opts }).is_ok(), "the appended column");
+    for dims in [[2, 6, 10, 12], [3, 6, 10, 13], [2, 2, 10, 13], [2, 6, 12, 13]] {
+        let bias = t(&dims, BF16);
+        let opts = Attn { bias: Some(&bias), ..opts };
+        let got = tk::attention(&q, &cache, &cache, opts);
+        assert!(matches!(err(got), Error::Shape { operand: "bias", .. }), "{dims:?}");
+    }
+    let bias = t(&[1, 6, 10, 12], BF16);
+    assert!(tk::attention(&q, &kv2, &kv2, Attn { bias: Some(&bias), ..Attn::default() }).is_ok(), "shared");
+    // Off the stream dtype is the graph's to handle, not an error.
+    let bias = t(&[2, 6, 10, 12], DType::Float32);
+    assert!(tk::attention(&q, &kv2, &kv2, Attn { bias: Some(&bias), ..Attn::default() }).is_ok(), "f32 bias");
 
     let qkv = t(&[2, 10, 8 * 64], BF16);
     let split = Qkv { heads: 4, kv_heads: 2, head_dim: 64, q_norm: None, k_norm: None, eps: 1e-6, rope: None };
