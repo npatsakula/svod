@@ -54,7 +54,8 @@ pub struct AttnMask {
     /// Keys within `[i − left, i + right]` of query `i`.
     pub window: Option<(usize, usize)>,
     /// A `[batch]` i32 parameter of valid key counts: keys at and past the
-    /// count are hidden.
+    /// count are hidden. A count of 0 sees key 0 unless a row is appended,
+    /// so a lane always has a key and a finite output.
     pub key_lens: bool,
     /// A `[batch, tk rounded up to 8]` i32 parameter, nonzero where the key
     /// is visible.
@@ -207,6 +208,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     // Keys past the length are masked; keys past `tk` too when blocks overhang it.
     let keys_masked = key_lens || !tk.is_multiple_of(bkv);
     let len = match lens {
+        Some(lens) if appended.is_some() => k.load_scalar(lens, b.clone()).min(tk),
         Some(lens) => k.load_scalar(lens, b.clone()).max(1).min(tk),
         None => Sc::from(tk),
     };

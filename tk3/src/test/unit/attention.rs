@@ -74,7 +74,9 @@ fn reference(c: &Case) -> Vec<f64> {
     let (stride, kv_stride, group) = (s.heads * s.d, cache.heads_total * s.d, s.heads / s.kv_heads);
     let mut out = vec![0.0; s.batch.capacity() * s.t * stride];
     for b in 0..s.batch.capacity() {
-        let len = if m.key_lens { c.lens[b].max(1) as usize } else { s.tk };
+        // An empty lane sees key 0 unless a row is appended, as the kernel does.
+        let floor = usize::from(!cache.appended);
+        let len = if m.key_lens { (c.lens[b] as usize).max(floor) } else { s.tk };
         let row = if cache.row_map { c.row_map[b] as usize } else { b };
         let keys = s.tk + usize::from(cache.appended);
         for h in 0..s.heads {
@@ -244,6 +246,8 @@ fn cached(
 #[test_case(cached(1, 200, [4, 4, 64], true, true, 4), &[200, 70]; "four splits")]
 #[test_case(cached(5, 96, [2, 2, 128], false, true, 2), &[64, 96]; "d 128, two splits, five queries")]
 #[test_case(cached(1, 64, [2, 2, 64], false, false, 4), &[64, 40]; "more splits than blocks for a row")]
+#[test_case(cached(1, 7, [6, 6, 64], false, true, 1), &[0, 7]; "appended row only, one split")]
+#[test_case(cached(1, 7, [6, 6, 64], false, true, 2), &[0, 3]; "appended row only, two splits")]
 fn cached_program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     program_matches_a_direct_softmax(spec, lens);
 }
@@ -274,6 +278,8 @@ fn only_the_live_batch_runs() {
 #[test_case(cached(1, 100, [4, 2, 64], true, true, 1), &[100, 37]; "cache: row map, appended, gqa")]
 #[test_case(cached(1, 200, [4, 4, 64], true, true, 4), &[200, 70]; "cache: four splits")]
 #[test_case(cached(5, 96, [2, 2, 128], false, true, 2), &[64, 96]; "cache: d 128, two splits")]
+#[test_case(cached(1, 7, [6, 6, 64], false, true, 1), &[0, 7]; "cache: appended row only")]
+#[test_case(cached(1, 7, [6, 6, 64], false, true, 2), &[0, 3]; "cache: appended row only, two splits")]
 #[test_case(with(FaCfg { splits: 3, ..FaCfg::new(16, 64, 2) }, cached(1, 1500, [4, 4, 64], true, false, 1)), &[1500, 1200]; "cache: bq 16, three splits of 1500 keys")]
 fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
     let device = default_device();

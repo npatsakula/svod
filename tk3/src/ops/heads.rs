@@ -2,13 +2,12 @@
 //! RMS-normalized over the head and rotated.
 
 use snafu::{ResultExt, ensure};
+use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
-use super::{
-    DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed,
-};
+use super::{GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed};
 use crate::kernels::heads::{HeadsSpec, Rope, heads as kernel};
 use crate::launch;
 
@@ -45,7 +44,6 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
         if let Some(w) = w {
             let got = shape(w)?;
             ensure!(got == [SInt::Const(d)], shape_err(operand, &got, format!("[{d}]")));
-            ensure!(w.dtype() == qkv.dtype(), DtypeSnafu { op: OP, operand, got: w.dtype(), want: qkv.dtype() });
         }
     }
     if let Some((cos, sin)) = rope {
@@ -58,14 +56,14 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
         );
         let sin_shape = shape(sin)?;
         ensure!(sin_shape == got, shape_err("sin", &sin_shape, fmt_shape(&got)));
-        for (operand, t) in [("cos", cos), ("sin", sin)] {
-            ensure!(t.dtype() == qkv.dtype(), DtypeSnafu { op: OP, operand, got: t.dtype(), want: qkv.dtype() });
-        }
     }
 
     let (ext, var) = extent(&xs).unzip();
     let target = super::target(&qkv.device());
-    let plan = shape::heads(target.as_ref(), &[qkv.dtype()], ext.as_ref(), d);
+    // A weight or table off the stream dtype keeps the graph, as the norms do.
+    let (cos, sin) = rope.unzip();
+    let dtypes: Vec<DType> = [Some(qkv), q_norm, k_norm, cos, sin].into_iter().flatten().map(Tensor::dtype).collect();
+    let plan = shape::heads(target.as_ref(), &dtypes, ext.as_ref(), d);
     let Plan::Kernel(cfgs) = plan else { return graph(qkv, opts).context(GraphSnafu { op: OP }) };
     let (ext, var, target) = (ext.expect("planned"), var.flatten(), target.expect("planned"));
     let (b, t) = (ext.dims[0], ext.dims[1]);
@@ -92,7 +90,6 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
     let q = output(&[b, t, heads, d], &var, qkv.dtype());
     let k = output(&[b, t, kv_heads, d], &var, qkv.dtype());
     let v = output(&[b, t, kv_heads, d], &var, qkv.dtype());
-    let (cos, sin) = rope.unzip();
     let ins: Vec<&Tensor> =
         [Some(qkv), q_norm, k_norm, cos, sin, Some(&q), Some(&k), Some(&v)].into_iter().flatten().collect();
     let mut outs = launch::graph_launch_all(typed!(qkv.dtype(), kernel, &spec(cfg)), &cfg.lowering(target), &ins)
