@@ -45,14 +45,17 @@ pub struct NormSpec {
     pub eps: f64,
     /// Normalize `x + residual`, which is also written out.
     pub residual: bool,
+    /// LayerNorm adds a `[d]` bias.
+    pub bias: bool,
     pub cfg: NormCfg,
 }
 
-/// Parameters in order: `x`, `residual` if fused, `w [d]`, `b [d]`
-/// (LayerNorm), `out`, and `sum` (`x + residual` rounded to the element
-/// type, which is what gets normalized) if fused. `d` is a power of two.
+/// Parameters in order: `x`, `residual` if fused, `w [d]`, `b [d]` (a
+/// LayerNorm with a bias), `out`, and `sum` (`x + residual` rounded to the
+/// element type, which is what gets normalized) if fused. `d` is a power
+/// of two.
 pub fn norm<T: Elem>(spec: &NormSpec) -> Program {
-    let NormSpec { norm, rows, d, ref batch, eps, residual, cfg: NormCfg { br } } = *spec;
+    let NormSpec { norm, rows, d, ref batch, eps, residual, bias, cfg: NormCfg { br } } = *spec;
     let elems = batch.capacity() * rows * d;
     let mut k = Kernel::new(match norm {
         Norm::Layer => "layer_norm",
@@ -61,7 +64,7 @@ pub fn norm<T: Elem>(spec: &NormSpec) -> Program {
     let x = k.param::<T>("x", ParamKind::In, elems);
     let r = residual.then(|| k.param::<T>("residual", ParamKind::In, elems));
     let w = k.param::<T>("w", ParamKind::In, d);
-    let b = (norm == Norm::Layer).then(|| k.param::<T>("b", ParamKind::In, d));
+    let b = (norm == Norm::Layer && bias).then(|| k.param::<T>("b", ParamKind::In, d));
     let out = k.param::<T>("out", ParamKind::Out, elems);
     let sum = residual.then(|| k.param::<T>("sum", ParamKind::Out, elems));
     let (gz, bb) = batch.axis(&mut k);

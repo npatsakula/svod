@@ -31,8 +31,9 @@ fn gemm_nt_epilogue(
     gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg })
 }
 
-fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: bool) -> Program {
-    norm::<BF16>(&NormSpec { norm: norm_, rows, d, batch: Batch::Static(1), eps, residual, cfg: NormCfg { br } })
+fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: bool, bias: bool) -> Program {
+    let spec = NormSpec { norm: norm_, rows, d, batch: Batch::Static(1), eps, residual, bias, cfg: NormCfg { br } };
+    norm::<BF16>(&spec)
 }
 
 fn cuda_target() -> Option<Target> {
@@ -187,7 +188,7 @@ fn epilogues_match_on_device(m: usize, n: usize, k: usize, tile: [usize; 3], sta
 
 // ---- row kernels -------------------------------------------------------------
 
-fn norm_inputs(norm: Norm, rows: usize, d: usize, residual: bool, seed: u64) -> Vec<Vec<f64>> {
+fn norm_inputs(norm: Norm, rows: usize, d: usize, residual: bool, bias: bool, seed: u64) -> Vec<Vec<f64>> {
     let mut seed = seed;
     // An offset per element keeps the mean away from zero, so centering matters.
     let mut params = vec![bf16s(rows * d, &mut seed, |x| 2.0 * x + 1.5)];
@@ -195,7 +196,7 @@ fn norm_inputs(norm: Norm, rows: usize, d: usize, residual: bool, seed: u64) -> 
         params.push(bf16s(rows * d, &mut seed, |x| x));
     }
     params.push(bf16s(d, &mut seed, |x| 1.0 + 0.5 * x));
-    if norm == Norm::Layer {
+    if norm == Norm::Layer && bias {
         params.push(bf16s(d, &mut seed, |x| 0.5 * x));
     }
     params.push(vec![0.0; rows * d]);
@@ -207,12 +208,20 @@ fn norm_inputs(norm: Norm, rows: usize, d: usize, residual: bool, seed: u64) -> 
 
 /// `(out, sum)` in f64 from the bf16 inputs; the sum is rounded to bf16
 /// before it is normalized, as the kernel stores and reads it.
-fn norm_reference(norm: Norm, rows: usize, d: usize, eps: f64, residual: bool, p: &[Vec<f64>]) -> (Vec<f64>, Vec<f64>) {
+fn norm_reference(
+    norm: Norm,
+    rows: usize,
+    d: usize,
+    eps: f64,
+    residual: bool,
+    bias: bool,
+    p: &[Vec<f64>],
+) -> (Vec<f64>, Vec<f64>) {
     let at = |i| &p[i];
     let x = at(0);
     let r = residual.then(|| at(1));
     let w = at(1 + usize::from(residual));
-    let b = (norm == Norm::Layer).then(|| at(2 + usize::from(residual)));
+    let b = (norm == Norm::Layer && bias).then(|| at(2 + usize::from(residual)));
     let sum: Vec<f64> =
         (0..rows * d).map(|e| round_to(ScalarDType::BFloat16, x[e] + r.map_or(0.0, |r| r[e]))).collect();
     let mut out = vec![0.0; rows * d];
@@ -230,8 +239,8 @@ fn norm_reference(norm: Norm, rows: usize, d: usize, eps: f64, residual: bool, p
 }
 
 /// Indices of `out` and `sum` among the parameters.
-fn norm_outputs(norm: Norm, residual: bool) -> (usize, usize) {
-    let out = 2 + usize::from(residual) + usize::from(norm == Norm::Layer);
+fn norm_outputs(norm: Norm, residual: bool, bias: bool) -> (usize, usize) {
+    let out = 2 + usize::from(residual) + usize::from(norm == Norm::Layer && bias);
     (out, out + 1)
 }
 
@@ -244,14 +253,15 @@ proptest! {
         rows in 1usize..20,
         layer in any::<bool>(),
         residual in any::<bool>(),
+        bias in any::<bool>(),
         seed in any::<u64>(),
     ) {
         let (norm, d, eps) = (if layer { Norm::Layer } else { Norm::Rms }, 256, 1e-5);
-        let prog = norm_rows(norm, rows, d, 4, eps, residual);
-        let params = norm_inputs(norm, rows, d, residual, seed);
-        let (want, want_sum) = norm_reference(norm, rows, d, eps, residual, &params);
+        let prog = norm_rows(norm, rows, d, 4, eps, residual, bias);
+        let params = norm_inputs(norm, rows, d, residual, bias, seed);
+        let (want, want_sum) = norm_reference(norm, rows, d, eps, residual, bias, &params);
         let out = run(&prog, params, &[]).unwrap();
-        let (o, s) = norm_outputs(norm, residual);
+        let (o, s) = norm_outputs(norm, residual, bias);
         assert_close("out", &out[o], &want, 1e-2);
         if residual {
             assert_close("sum", &out[s], &want_sum, 0.0);
@@ -261,24 +271,25 @@ proptest! {
 
 /// LayerNorm and RMSNorm on the device match the interpreter and the f64
 /// reference, with and without the fused residual, on a partial last block.
-#[test_case(Norm::Layer, 512, false, 4; "layer 512")]
-#[test_case(Norm::Layer, 1024, true, 4; "layer 1024 residual")]
-#[test_case(Norm::Rms, 512, true, 4; "rms 512 residual")]
-#[test_case(Norm::Rms, 1024, false, 4; "rms 1024")]
-#[test_case(Norm::Layer, 512, true, 8; "layer 512 residual, 8 rows a block")]
-#[test_case(Norm::Rms, 2048, false, 16; "rms 2048, 16 rows a block")]
-fn norms_match_on_device(norm: Norm, d: usize, residual: bool, br: usize) {
+#[test_case(Norm::Layer, 512, false, true, 4; "layer 512")]
+#[test_case(Norm::Layer, 512, false, false, 4; "layer 512 without a bias")]
+#[test_case(Norm::Layer, 1024, true, true, 4; "layer 1024 residual")]
+#[test_case(Norm::Rms, 512, true, false, 4; "rms 512 residual")]
+#[test_case(Norm::Rms, 1024, false, false, 4; "rms 1024")]
+#[test_case(Norm::Layer, 512, true, true, 8; "layer 512 residual, 8 rows a block")]
+#[test_case(Norm::Rms, 2048, false, false, 16; "rms 2048, 16 rows a block")]
+fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: usize) {
     let Some(target) = cuda_target() else {
         eprintln!("skipped: no CUDA device");
         return;
     };
     let (rows, eps) = (37, 1e-5);
-    let prog = norm_rows(norm, rows, d, br, eps, residual);
-    let params = norm_inputs(norm, rows, d, residual, 5);
-    let (want, want_sum) = norm_reference(norm, rows, d, eps, residual, &params);
+    let prog = norm_rows(norm, rows, d, br, eps, residual, bias);
+    let params = norm_inputs(norm, rows, d, residual, bias, 5);
+    let (want, want_sum) = norm_reference(norm, rows, d, eps, residual, bias, &params);
     let interp = run(&prog, params.clone(), &[]).unwrap();
     let got = on_device(prog, &row_lowering(target), &params);
-    let (o, s) = norm_outputs(norm, residual);
+    let (o, s) = norm_outputs(norm, residual, bias);
     let d_interp = assert_close("out vs interpreter", &got[o], &interp[o], 1e-2);
     let d_ref = assert_close("out vs reference", &got[o], &want, 1e-2);
     if residual {
@@ -322,7 +333,8 @@ fn norm_bandwidth_probe() {
     let (rows, d, eps) = (8192, 1024, 1e-5);
     let gbs = |bytes: f64, secs: f64| bytes / secs / 1e9;
     for (norm, residual) in [(Norm::Rms, false), (Norm::Layer, false), (Norm::Rms, true), (Norm::Layer, true)] {
-        let params = norm_inputs(norm, rows, d, residual, 9);
+        let bias = norm == Norm::Layer;
+        let params = norm_inputs(norm, rows, d, residual, bias, 9);
         let tensors = upload(&params);
         for t in &tensors {
             t.realize().unwrap();
@@ -333,8 +345,8 @@ fn norm_bandwidth_probe() {
         let baseline = gpu_seconds(&(&tensors[0] + &tensors[0]).unwrap().prepare().unwrap());
         eprintln!("graph x + x: {:.1} us, {:.0} GB/s", baseline * 1e6, gbs((4 * rows * d) as f64, baseline));
         for br in [4, 8, 16] {
-            let prog = norm_rows(norm, rows, d, br, eps, residual);
-            let (o, _) = norm_outputs(norm, residual);
+            let prog = norm_rows(norm, rows, d, br, eps, residual, bias);
+            let (o, _) = norm_outputs(norm, residual, bias);
             let plan = graph_launch_all(prog, &row_lowering(target.clone()), &refs).unwrap()[o].prepare().unwrap();
             let secs = gpu_seconds(&plan);
             eprintln!("{norm:?} residual={residual} br={br}: {:.1} us, {:.0} GB/s", secs * 1e6, gbs(bytes, secs));

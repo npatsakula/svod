@@ -72,7 +72,11 @@ pub fn graph_launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor])
     let ins: Vec<&Tensor> = tensors.iter().enumerate().filter(|(i, _)| *i != out_at).map(|(_, t)| *t).collect();
     let device = default_device();
     let mut failure = None;
-    let info = CallInfo { name: Some(name.clone()), ..CallInfo::default() };
+    // The kernel is charged to the call site, never to whichever site first
+    // lowered the memoized body.
+    let origin = svod_ir::origin::current();
+    let info =
+        CallInfo { name: Some(name.clone()), origin, origins: origin.into_iter().collect(), ..CallInfo::default() };
     let result = tensors[out_at].custom_kernel_with(&ins, info, |ph| {
         let key = lowered_key(&prog, lowering, &device, &ph);
         if let Some(program) = LOWERED.lock().expect("lowered memo").get(&key) {
@@ -85,8 +89,9 @@ pub fn graph_launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor])
         }
         match lower::lower(prog, lowering, params, device) {
             Ok(lowered) => {
-                LOWERED.lock().expect("lowered memo").insert(key, lowered.program.clone());
-                lowered.program
+                let program = lowered.program.without_origins();
+                LOWERED.lock().expect("lowered memo").insert(key, program.clone());
+                program
             }
             Err(err) => {
                 failure = Some(err);

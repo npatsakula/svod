@@ -435,11 +435,12 @@ fn heads_under_a_batch_variable() {
 
 // ---- norms ---------------------------------------------------------------------
 
-#[test_case(true, false, 1024; "layer 1024")]
-#[test_case(true, true, 256; "add layer 256")]
-#[test_case(false, false, 2048; "rms 2048")]
-#[test_case(false, true, 1024; "add rms 1024")]
-fn norms_match_the_graph(layer: bool, residual: bool, d: usize) {
+#[test_case(true, false, true, 1024; "layer 1024")]
+#[test_case(true, false, false, 512; "layer 512 without a bias")]
+#[test_case(true, true, true, 256; "add layer 256")]
+#[test_case(false, false, false, 2048; "rms 2048")]
+#[test_case(false, true, false, 1024; "add rms 1024")]
+fn norms_match_the_graph(layer: bool, residual: bool, bias: bool, d: usize) {
     if !device() {
         return;
     }
@@ -447,15 +448,16 @@ fn norms_match_the_graph(layer: bool, residual: bool, d: usize) {
     let r = rand(&[37, d], 31, 1.0, DType::BFloat16);
     let w = rand(&[d], 32, 1.0, DType::BFloat16);
     let b = rand(&[d], 33, 0.5, DType::BFloat16);
+    let b = bias.then_some(&b);
     let (sum, y) = match (layer, residual) {
-        (true, false) => (None, tk::layer_norm(&x, &w, Some(&b), 1e-5).unwrap()),
-        (true, true) => tk::add_layer_norm(&x, &r, &w, Some(&b), 1e-5).map(|(s, y)| (Some(s), y)).unwrap(),
+        (true, false) => (None, tk::layer_norm(&x, &w, b, 1e-5).unwrap()),
+        (true, true) => tk::add_layer_norm(&x, &r, &w, b, 1e-5).map(|(s, y)| (Some(s), y)).unwrap(),
         (false, false) => (None, tk::rms_norm(&x, &w, 1e-6).unwrap()),
         (false, true) => tk::add_rms_norm(&x, &r, &w, 1e-6).map(|(s, y)| (Some(s), y)).unwrap(),
     };
     let kind = if layer { crate::kernels::rows::Norm::Layer } else { crate::kernels::rows::Norm::Rms };
     let eps = if layer { 1e-5 } else { 1e-6 };
-    let (want_sum, want) = tk::norm::graph(kind, &x, residual.then_some(&r), &w, layer.then_some(&b), eps).unwrap();
+    let (want_sum, want) = tk::norm::graph(kind, &x, residual.then_some(&r), &w, b, eps).unwrap();
     assert_kernel(&y, if layer { "layer_norm" } else { "rms_norm" });
     assert_close("norm", &y, &want, 2e-2);
     if let (Some(sum), Some(want_sum)) = (sum, want_sum) {
