@@ -170,6 +170,24 @@ fn an_unscaled_epilogue_keeps_its_tune_key() {
     assert_ne!(gemm::<BF16T>(&spec(plain)), gemm::<BF16T>(&spec(half)));
 }
 
+/// A plain global view prints as it did before row maps existed, so a
+/// GEMM's program fingerprint, and with it the tune store, is unchanged; a
+/// gathered view prints its map.
+#[test]
+fn an_unmapped_view_keeps_its_tune_key() {
+    use crate::ir::{ParamId, Place, RowMap, ScalarId};
+    let (param, offset, stride, bounds) =
+        (ParamId(0), ScalarId(1), [ScalarId(2), ScalarId(3)], [None, Some(ScalarId(4))]);
+    let plain = Place::Global { param, offset, stride, bounds, rows: None };
+    let old = "Global { param: ParamId(0), offset: ScalarId(1), stride: [ScalarId(2), ScalarId(3)], bounds: [None, Some(ScalarId(4))] }";
+    assert_eq!(format!("{plain:?}"), old);
+    let rows = Some(RowMap { offset: ScalarId(5), valid: None });
+    let gathered = Place::Global { param, offset, stride, bounds, rows };
+    assert!(format!("{gathered:?}").ends_with("rows: RowMap { offset: ScalarId(5), valid: None } }"));
+    let smem = Place::Smem { alloc: crate::ir::SmemId(1), offset };
+    assert_eq!(format!("{smem:?} {:?}", Place::Reg), "Smem { alloc: SmemId(1), offset: ScalarId(1) } Reg");
+}
+
 /// The graph fallback (f32 here) applies the scale between the activation and
 /// the residual: `scale·act(x·wᵀ + b) + r`.
 #[test_case(Act::None, false; "plain")]
