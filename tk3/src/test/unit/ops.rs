@@ -1,21 +1,21 @@
 //! Every op against its own graph fallback on a CUDA device, on awkward
 //! shapes; skipped unless `SVOD_DEVICE` names one.
 
-use svod_dtype::{DType, DeviceSpec, default_device::default_device};
+use svod_dtype::{DType, default_device::default_device};
 use svod_ir::{Op, SInt, ops};
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
 use crate::ops::{self as tk, Act, Attn, Cache, Conv, KeyMask, Linear, Qkv};
 
-/// A CUDA device to run on, with tuning off so a test does not measure
+/// A device with tk3 tables to run on, with tuning off so a test does not measure
 /// every shape it touches (the untuned pick runs).
 fn device() -> bool {
     crate::tune::set_enabled(false);
     let device = default_device();
-    let ok = matches!(device, DeviceSpec::Cuda { .. }) && tk::supported(&device);
+    let ok = tk::supported(&device);
     if !ok {
-        eprintln!("skipped: no CUDA device");
+        eprintln!("skipped: no device with tk3 tables");
     }
     ok
 }

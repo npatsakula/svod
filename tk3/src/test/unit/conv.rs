@@ -555,9 +555,12 @@ fn plan_ns(plan: &svod_runtime::ExecutionPlan) -> u64 {
 /// rounding) over the layout the model holds; run under `BEAM=4` for the
 /// graph arm the model gets. Prints µs and TFLOP/s and never asserts.
 #[test]
-#[ignore = "perf probe: needs a CUDA device"]
+#[ignore = "perf probe: needs a GPU"]
 fn conv_throughput_probe() {
-    let Some(target) = cuda_target() else { return };
+    let Some(target) = super::device_target() else {
+        eprintln!("skipped: no GPU with tk3 tables");
+        return;
+    };
     let dtype = DType::Float16;
     for (cin, cout, side, stride, chain) in PROBE {
         let g = geom([side, side], cin, cout, 3, stride, 1, 1);

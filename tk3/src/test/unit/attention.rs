@@ -477,10 +477,10 @@ fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, 
 /// on the 3060 before its removal, in TFLOP/s: d64 23.0, d64 causal 20.7,
 /// d128 22.3, d128 causal 16.5.
 #[test]
-#[ignore = "perf probe: needs a CUDA device"]
+#[ignore = "perf probe: needs a GPU"]
 fn attention_throughput_probe() {
-    let device = default_device();
-    let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
+    let Some(target) = super::device_target() else {
+        eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
     let (batch, heads, t) = (4usize, 8usize, 2048usize);
@@ -503,8 +503,14 @@ fn attention_throughput_probe() {
             mask: AttnMask { causal, bias, ..AttnMask::default() },
             cache: None,
             scale: 1.0 / (d as f32).sqrt(),
-            cfg: FaCfg::new(bq, bkv, 2),
+            // The blocks measured on sm_86; elsewhere the op layer's first pick.
+            cfg: if target.cp_async {
+                FaCfg::new(bq, bkv, 2)
+            } else {
+                crate::ops::config::attention_candidates(&target, d, t)[0]
+            },
         };
+        let (bq, bkv) = (spec.cfg.bq, spec.cfg.bkv);
         let c = case(spec.clone(), &[]);
         let to_bf16 =
             |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
@@ -556,10 +562,11 @@ fn attention_throughput_probe() {
 /// tk1's single-query kernel under its split policy, last measured here on
 /// the 3060 before its removal: self 89.1 µs, cross 78.8 µs (636 µs unsplit).
 #[test]
-#[ignore = "perf probe: needs a CUDA device"]
+#[ignore = "perf probe: needs a GPU"]
 fn decode_throughput_probe() {
     use crate::ops::{self as tk, Attn, Cache, KeyMask};
-    if !matches!(default_device(), DeviceSpec::Cuda { .. }) {
+    if super::device_target().is_none() {
+        eprintln!("skipped: no GPU with tk3 tables");
         return;
     }
     crate::tune::set_enabled(true);

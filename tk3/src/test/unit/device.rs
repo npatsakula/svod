@@ -102,10 +102,10 @@ fn check_gemm(target: &Target, m: usize, n: usize, k: usize, cfg: GemmCfg) {
 /// never asserts (run with `--ignored --nocapture`). tk1's `gemm_nt`, last
 /// measured here on the 3060 before its removal: 25.8 TFLOP/s.
 #[test]
-#[ignore = "perf probe: needs a CUDA device"]
+#[ignore = "perf probe: needs a GPU"]
 fn gemm_throughput_probe() {
-    let Some(target) = cuda_target() else {
-        eprintln!("skipped: no CUDA device");
+    let Some(target) = super::device_target() else {
+        eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
     let (m, n, k) = (4096usize, 4096usize, 4096usize);
@@ -119,15 +119,29 @@ fn gemm_throughput_probe() {
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     // Static shared memory is capped at 48 KB on this path.
     let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
-    for (bm, bn, bk, stages, wr, wc, group_m, unroll) in [
-        (128, 64, 32, 2, 2, 2, 8, true),
-        (128, 64, 32, 2, 2, 2, 8, false),
-        (128, 64, 32, 3, 2, 2, 8, false),
-        (128, 128, 32, 3, 2, 4, 8, true),
-        (128, 128, 32, 3, 2, 4, 8, false),
-        (128, 128, 32, 2, 2, 4, 8, false),
-    ] {
-        let cfg = GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll };
+    // The configs measured on sm_86; elsewhere the op layer's candidates.
+    let cfgs: Vec<GemmCfg> = if target.cp_async {
+        [
+            (128, 64, 32, 2, 2, 2, 8, true),
+            (128, 64, 32, 2, 2, 2, 8, false),
+            (128, 64, 32, 3, 2, 2, 8, false),
+            (128, 128, 32, 3, 2, 4, 8, true),
+            (128, 128, 32, 3, 2, 4, 8, false),
+            (128, 128, 32, 2, 2, 4, 8, false),
+        ]
+        .map(|(bm, bn, bk, stages, wr, wc, group_m, unroll)| GemmCfg {
+            tile: [bm, bn, bk],
+            stages,
+            warps: [wr, wc],
+            group_m,
+            unroll,
+        })
+        .to_vec()
+    } else {
+        crate::ops::config::gemm_candidates(&target, 1, m, n, k, false)
+    };
+    for cfg in cfgs {
+        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll } = cfg;
         let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(target.clone()));
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
@@ -167,12 +181,12 @@ fn gemm_throughput_probe() {
 /// and 4096³, marking the old fixed ladder's pick for the small shapes;
 /// prints the first fit (the untuned pick) and the winner per shape.
 #[test]
-#[ignore = "perf probe: needs a CUDA device"]
+#[ignore = "perf probe: needs a GPU"]
 fn gemm_candidates_probe() {
     use crate::kernels::Act;
     use crate::ops::config::gemm_candidates;
-    let Some(target) = cuda_target() else {
-        eprintln!("skipped: no CUDA device");
+    let Some(target) = super::device_target() else {
+        eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
     let ladder = GemmCfg { tile: [128, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true };
