@@ -32,10 +32,11 @@ use crate::state::{self, StateDict, scoped, scoped_index};
 use super::config::NemotronDiarConfig;
 use super::error::Result;
 
-/// Sequence multiple the encoder pads a step to where flash attention does
-/// not set one. Measured on CPU: the 541-frame streaming step runs 2x faster
-/// padded to 576 than as is, and the 684-frame offline step fastest at 704.
-const SEQ_ALIGN: usize = 64;
+/// Sequence multiple the encoder pads a step to; the config checks the RoPE
+/// table against the padded step. Measured on CPU: the 541-frame streaming
+/// step runs 2x faster padded to 576 than as is, and the 684-frame offline
+/// step fastest at 704.
+pub(super) const SEQ_ALIGN: usize = 64;
 
 /// The checkpoint's repository.
 pub const HUB_REPO: &str = "nvidia/Nemotron-3-Diarization";

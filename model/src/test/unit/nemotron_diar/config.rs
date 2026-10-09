@@ -50,11 +50,11 @@ fn invalid_profiles_are_rejected(profile: Profile) {
     assert!(config().validate_profile(&profile).is_err());
 }
 
-/// The encoder pads a step to a tileable length, so the RoPE table must cover
-/// the padded step, not just the capacity: the published offline step is 684
-/// frames, padded to 768.
-#[test_case(768, true; "covers the padded step")]
-#[test_case(767, false; "one position short")]
+/// The encoder pads a step to `SEQ_ALIGN`, so the RoPE table must cover the
+/// padded step, not just the capacity: the published offline step is 684
+/// frames, padded to 704.
+#[test_case(704, true; "covers the padded step")]
+#[test_case(703, false; "one position short")]
 fn profiles_are_checked_at_the_padded_length(max_positions: usize, accepted: bool) {
     let json = CONFIG_JSON
         .replace("\"max_position_embeddings\": 5000", &format!("\"max_position_embeddings\": {max_positions}"));
