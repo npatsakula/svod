@@ -96,11 +96,11 @@ impl YoloConfig {
         self
     }
 
-    /// Cast an input image into the compute dtype. A no-op when they already
-    /// match (`UOp::cast` returns the same node), so the f32 default adds
-    /// nothing to the graph.
-    pub fn cast_input(&self, images: &Tensor) -> Tensor {
-        images.cast(self.compute_dtype.clone())
+    /// An NCHW image batch as the model runs it: the compute dtype, and the
+    /// `[B, H, W, C]` view every layer takes. The cast is a no-op when the
+    /// dtypes already match (`UOp::cast` returns the same node).
+    pub fn cast_input(&self, images: &Tensor) -> crate::yolo::Result<Tensor> {
+        Ok(images.cast(self.compute_dtype.clone()).try_permute(&[0, 2, 3, 1])?)
     }
 }
 

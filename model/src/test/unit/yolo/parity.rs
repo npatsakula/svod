@@ -15,7 +15,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use super::tk_gate::{tk_convs, tk_device};
+use super::kernels::{tk_calls, tk_device};
 use crate::state::StateDict;
 use crate::state::load_safetensors;
 use crate::yolo::{Yolo26Detect, YoloConfig, YoloScale};
@@ -107,7 +107,7 @@ fn deltas(got: &[f32], want: &[f32], channels: usize, anchors: usize, floor: f32
 }
 
 /// The f32 model against the golden over every anchor, and the f16 one over the
-/// anchors a detection reads, with the tk convolution checked to have run where
+/// anchors a detection reads, with the tile convolution checked to have run where
 /// the device has it.
 #[test_case(DType::Float32, f32::NEG_INFINITY, SCORE_TOL; "f32, every anchor")]
 #[test_case(DType::Float16, CONFIDENT, F16_SCORE_TOL; "f16, confident anchors")]
@@ -127,7 +127,7 @@ fn detect_output_matches_pytorch(dtype: DType, floor: f32, score_tol: f32) {
 
     let out = model.forward(&images).expect("forward");
     if dtype != DType::Float32 && tk_device(&images.device()) {
-        assert!(tk_convs(&out) > 0, "the tk convolution runs on this device");
+        assert!(tk_calls(&out, "conv") > 0, "the tile convolution runs on this device");
     }
     let got = out.cast(DType::Float32).to_vec::<f32>().unwrap();
     let want = load_golden_vec::<f32>(&golden, "output");

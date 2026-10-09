@@ -25,7 +25,7 @@ fn io(conv: &YoloConv) -> (Option<DType>, Option<DType>) {
 #[test]
 fn with_io_dtype_casts_the_edges_it_is_given() {
     let conv = model().backbone.conv0;
-    let x = Tensor::zeros(&[1, 3, 64, 64], NARROW);
+    let x = Tensor::zeros(&[1, 64, 64, 3], NARROW);
 
     assert_eq!(conv.forward(&x).expect("unpinned").dtype(), NARROW, "unpinned, the stream keeps its width");
 
@@ -100,11 +100,7 @@ fn an_unknown_stage_is_refused_and_changes_nothing() {
     assert_eq!(io(&m.neck.c3k2_22.cv2), (None, None));
 }
 
-/// Every name the flag accepts has to run end to end. The casts sit on the
-/// NCHW module edges on purpose — inside a chain that keeps `[B, H, W, C]` the
-/// producer and consumer agree on layout only because they read the same
-/// stream dtype — so a pin landing anywhere else would mismatch the layout
-/// here rather than in a profiling run.
+/// Every name the flag accepts has to run end to end.
 #[test_case("backbone.10.attn" ; "C2PSA attention")]
 #[test_case("neck.17" ; "a PAN downsample")]
 #[test_case("neck.22" ; "the P5 C3k2")]
@@ -123,7 +119,7 @@ fn a_pinned_stage_hands_the_stream_back_narrow(stage: &str) {
     let mut m = model();
     assert!(m.force_stage_dtype(stage, WIDE));
 
-    let (l4, l6, l10) = m.backbone.forward(&Tensor::zeros(&[1, 3, 64, 64], NARROW)).expect("backbone forward");
+    let (l4, l6, l10) = m.backbone.forward(&Tensor::zeros(&[1, 64, 64, 3], NARROW)).expect("backbone forward");
     for (name, feat) in [("l4", &l4), ("l6", &l6), ("l10", &l10)] {
         assert_eq!(feat.dtype(), NARROW, "{name} leaves the backbone at the compute dtype");
     }

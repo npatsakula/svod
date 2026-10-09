@@ -6,10 +6,10 @@
 //! predictions *shape* follows the bound batch — neither looks at a value, so a
 //! kernel that mixed two images would pass both.
 //!
-//! The property is load-bearing for the batched tk convolution: `ConvGeom::mkn`
-//! folds the batch into the implicit GEMM's `M = batch·OH·OW`, and a strip row
-//! decodes back to an image with `b = m / (ho·wo)`. Get that decode wrong and
-//! images blend, which no shape assertion can see.
+//! The property is load-bearing for the batched tile convolution: a static batch
+//! folds into the implicit GEMM's `M = batch·OH·OW` and a row decodes back to an
+//! image with `b = m / (ho·wo)`, while a bound one walks grid z. Get either wrong
+//! and images blend, which no shape assertion can see.
 //!
 //! ```text
 //! cargo test --release -p svod-model --lib yolo::batch -- --ignored
@@ -145,8 +145,8 @@ fn input(batch: &[usize]) -> Tensor {
 fn predictions(model: &Yolo26Detect, batch: &[usize]) -> Vec<Vec<f32>> {
     let images = input(batch);
     let out = model.forward(&images).expect("forward");
-    if model.config.compute_dtype != DType::Float32 && super::tk_gate::tk_device(&images.device()) {
-        assert!(super::tk_gate::tk_convs(&out) > 0, "the tk convolution runs on this device");
+    if model.config.compute_dtype != DType::Float32 && super::kernels::tk_device(&images.device()) {
+        assert!(super::kernels::tk_calls(&out, "conv") > 0, "the tile convolution runs on this device");
     }
     let dims = out.dims().expect("concrete prediction dims");
     assert_eq!(dims[0], batch.len(), "predictions lost the batch axis: {dims:?}");
@@ -244,15 +244,13 @@ fn batch_slot_output_ignores_its_neighbours(dtype: DType) {
     );
 }
 
-/// The same property through the JIT with the batch variable pinned, which is how
-/// a batched model is actually served: `svod_tk::conv2d_nhwc` needs a statically
-/// known dim 0, so a free `batch_var` fails `prepare` outright at a tensor-core
-/// dtype rather than falling back to the graph conv. `with_b_fixed` is what makes
-/// the tk path reachable at batch > 1 — and what lets the plan be graph-captured,
-/// since capture is gated on no kernel carrying an unbound var.
-#[test_case::test_case(2, DType::Float16; "batch 2 f16 (tk conv path on CUDA)")]
+/// The same property through the JIT, with the batch variable pinned (a static
+/// batch the kernels fold into their rows, and a plan that can be graph-captured)
+/// or left free over `1..=batch` (the kernels walk the bound batch on grid z).
+#[test_case::test_case(2, DType::Float16, true; "pinned batch 2 f16 (tk conv path on CUDA)")]
+#[test_case::test_case(3, DType::Float16, false; "free batch 3 f16 (tk conv path on CUDA)")]
 #[ignore = "heavy: a full detect graph compile per batch extent"]
-fn pinned_batch_jit_matches_solo_runs(batch: usize, dtype: DType) {
+fn batch_jit_matches_solo_runs(batch: usize, dtype: DType, pinned: bool) {
     let slots: Vec<usize> = (0..batch).collect();
     // One model for both sides: two builds would differ only if the weights were
     // not a pure function of the key, and that difference would read as a leak.
@@ -261,24 +259,30 @@ fn pinned_batch_jit_matches_solo_runs(batch: usize, dtype: DType) {
     let spread = assert_healthy(&solo);
     let tol = spread * REASSOCIATION_FRACTION;
 
-    let mut jit = Yolo26DetectJit::new(model).with_b_fixed(batch);
-    jit.prepare(InputSpec::f32(&[batch, 3, SIDE, SIDE])).expect("pinned-batch prepare");
+    let mut model = model;
+    model.config.max_batch_size = batch;
+    let jit = Yolo26DetectJit::new(model);
+    let mut jit = if pinned { jit.with_b_fixed(batch) } else { jit };
+    jit.prepare(InputSpec::f32(&[batch, 3, SIDE, SIDE])).expect("batched prepare");
     let batched: Vec<f32> = slots.iter().flat_map(|&k| image(SIDE, k)).collect();
     jit.images_mut().expect("images slot").copyin(bytemuck::cast_slice(&batched)).expect("copy the batch in");
-    jit.execute_bound(batch as i64).expect("execute the pinned batch");
+    // A free variable also runs below its capacity: the leading images alone.
+    let lives = if pinned { vec![batch] } else { vec![batch, batch - 1] };
+    for live in lives {
+        jit.execute_bound(live as i64).expect("execute the batch");
+        let shape = jit.predictions_shape().expect("predictions shape");
+        assert_eq!(shape[0], live, "predictions lost the batch axis: {shape:?}");
+        let flat = jit.predictions_to_vec::<f32>().expect("read predictions back");
+        let per = shape[1] * shape[2];
+        assert_eq!(flat.len(), live * per);
 
-    let shape = jit.predictions_shape().expect("predictions shape");
-    assert_eq!(shape[0], batch, "predictions lost the batch axis: {shape:?}");
-    let flat = jit.predictions_to_vec::<f32>().expect("read predictions back");
-    let per = shape[1] * shape[2];
-    assert_eq!(flat.len(), batch * per);
-
-    for (i, (b, s)) in flat.chunks_exact(per).zip(&solo).enumerate() {
-        let diff = max_abs_diff(b, s);
-        assert!(
-            diff <= tol,
-            "JIT image {i} of a pinned batch of {batch} ({dtype:?}) differs from its solo run by \
-             {diff:.3e}, tolerance {tol:.3e} (inter-image spread {spread:.3e})"
-        );
+        for (i, (b, s)) in flat.chunks_exact(per).zip(&solo).enumerate() {
+            let diff = max_abs_diff(b, s);
+            assert!(
+                diff <= tol,
+                "JIT image {i} of a batch of {live} (pinned: {pinned}, {dtype:?}) differs from its solo run by \
+                 {diff:.3e}, tolerance {tol:.3e} (inter-image spread {spread:.3e})"
+            );
+        }
     }
 }

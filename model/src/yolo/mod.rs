@@ -49,7 +49,8 @@ mod semseg;
 
 pub use backbone::{YoloBackbone, YoloBackboneCls, YoloBackboneP6, scaled_channels};
 pub use blocks::{
-    Attention, C2PSA, C2f, C3k, C3k2, C3k2Inner, PSABlock, Sppf, YoloBottleneck, YoloConv, conv2d_bias, deconv2d_2x,
+    Attention, C2PSA, C2f, C3k, C3k2, C3k2Inner, PSABlock, Sppf, YOLO_BN_EPS, YoloBottleneck, YoloConv, conv2d_bias,
+    deconv2d_2x,
 };
 pub use classify::{ClassifyHead, Yolo26Classify};
 pub use config::{YoloConfig, YoloScale, make_depth, make_divisible, scale_channels};

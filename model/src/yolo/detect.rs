@@ -5,7 +5,6 @@
 //! detection scales) and differ in backbone/neck depth.
 
 use svod_dtype::DType;
-use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
 
@@ -17,7 +16,7 @@ use super::blocks::csp::C3k2Inner;
 use super::config::{P2_STRIDES, P6_STRIDES, YoloConfig};
 use super::error::Result;
 
-use super::head::{BoxBranch, ClsBranch, dist2bbox, make_anchors};
+use super::head::{BoxBranch, ClsBranch, anchor_rows, dist2bbox, make_anchors};
 use super::loader;
 
 // ---------------------------------------------------------------------------
@@ -57,33 +56,19 @@ impl Detect {
         }
     }
 
-    /// Run box + cls heads on each feature map, decode boxes via dist2bbox,
-    /// sigmoid scores, and cat into `[B, 4+nc, A]`. The branches run at the
+    /// Run box + cls heads on each `[B, H, W, C]` feature map, decode boxes
+    /// via dist2bbox, sigmoid scores, and cat into `[B, 4+nc, A]`. The branches run at the
     /// features' dtype and emit [`super::head::HEAD_DTYPE`], so the decode is
     /// full-width whatever the backbone computed in.
     pub fn forward(&self, feats: &[Tensor]) -> Result<Tensor> {
-        let shape = feats[0].shape()?;
-        let b = shape[0].clone();
-
         let mut boxes_list: Vec<Tensor> = Vec::with_capacity(feats.len());
         let mut scores_list: Vec<Tensor> = Vec::with_capacity(feats.len());
         let mut feat_sizes: Vec<(usize, usize)> = Vec::with_capacity(feats.len());
 
         for (i, feat) in feats.iter().enumerate() {
-            let h = feat.dim_const(2)?;
-            let w = feat.dim_const(3)?;
-            let hw = h * w;
-            feat_sizes.push((h, w));
-
-            // Each branch ends in its own kernel: fused into the `cat` below, a
-            // final conv would be recomputed over every scale's anchors.
-            let box_out = scoped_index("one2one_cv2", i, || self.cv2[i].forward(feat))?.contiguous();
-            let box_out = box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)])?;
-            boxes_list.push(box_out);
-
-            let cls_out = scoped_index("one2one_cv3", i, || self.cv3[i].forward(feat))?.contiguous();
-            let cls_out = cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)])?;
-            scores_list.push(cls_out);
+            feat_sizes.push((feat.dim_const(1)?, feat.dim_const(2)?));
+            boxes_list.push(anchor_rows(&scoped_index("one2one_cv2", i, || self.cv2[i].forward(feat))?)?);
+            scores_list.push(anchor_rows(&scoped_index("one2one_cv3", i, || self.cv3[i].forward(feat))?)?);
         }
 
         let boxes_refs: Vec<&Tensor> = boxes_list.iter().collect();
@@ -158,7 +143,7 @@ impl Yolo26Detect {
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
-        let images = &self.config.cast_input(images);
+        let images = &self.config.cast_input(images)?;
         let (l4, l6, l10) = crate::state::scoped("backbone", || self.backbone.forward(images))?;
         let (p3, p4, p5) = crate::state::scoped("neck", || self.neck.forward(&l4, &l6, &l10))?;
         crate::state::scoped("head", || self.head.forward(&[p3, p4, p5]))
@@ -171,9 +156,7 @@ impl Yolo26Detect {
     ///
     /// This locates where a narrow dtype costs accuracy. Every layer takes its
     /// width from the stream it is handed, so an island is just a cast at each
-    /// end of the stage; the ends chosen here are the NCHW module edges, which
-    /// is the only place a cast cannot break the layout agreement described on
-    /// [`YoloConv::with_io_dtype`].
+    /// end of the stage ([`YoloConv::with_io_dtype`]).
     pub fn force_stage_dtype(&mut self, stage: &str, dtype: DType) -> bool {
         let out = self.config.compute_dtype.clone();
         let (b, n) = (&mut self.backbone, &mut self.neck);
@@ -284,7 +267,7 @@ impl Yolo26DetectP2 {
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
-        let images = &self.config.cast_input(images);
+        let images = &self.config.cast_input(images)?;
         let (l2, l4, l6, l10) = self.backbone.forward_with_p2(images)?;
         let (p2, p3, p4, p5) = self.neck.forward(&l2, &l4, &l6, &l10)?;
         self.head.forward(&[p2, p3, p4, p5])
@@ -348,7 +331,7 @@ impl Yolo26DetectP6 {
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
-        let images = &self.config.cast_input(images);
+        let images = &self.config.cast_input(images)?;
         let (l4, l6, l8, l12) = self.backbone.forward(images)?;
         let (p3, p4, p5, p6) = self.neck.forward(&l4, &l6, &l8, &l12)?;
         self.head.forward(&[p3, p4, p5, p6])

@@ -1,10 +1,7 @@
 //! Where a YOLO conv's weight is stored, checked through the production load
 //! path: `load_weights`, then the block's own `load_state_dict`.
 
-use std::sync::Arc;
-
 use svod_dtype::DType;
-use svod_ir::{Op, UOp, ops};
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Module, StateDict};
 use test_case::test_case;
@@ -15,10 +12,6 @@ use crate::yolo::{YoloBottleneck, YoloConv};
 
 fn values(t: &Tensor) -> Vec<f32> {
     t.contiguous().cast(DType::Float32).to_vec::<f32>().unwrap()
-}
-
-fn dims(uop: &Arc<UOp>) -> Vec<usize> {
-    uop.shape().unwrap().unwrap().iter().map(|d| d.as_const().unwrap()).collect()
 }
 
 /// The loader keeps every tensor in the checkpoint's layout, folded, cast and
@@ -36,45 +29,41 @@ fn the_loader_keeps_the_checkpoint_layout(dtype: DType) {
     assert_eq!(values(&loaded["conv.weight"]), values(&folded["conv.weight"].cast(dtype)));
 }
 
-/// A block stores its weight `[cout, kh, kw, cin]` behind the `[cout, cin, kh,
-/// kw]` view the graph reads, at every dtype and kernel size, and a tk block
-/// binds that same buffer rather than a copy of it.
-fn assert_stored_channels_innermost(conv: &YoloConv, loaded: &Tensor) {
-    let view = conv.conv.weight.uop();
-    let Op::Permute(ops::Permute { src, axes }) = view.op() else { panic!("a view over the stored weight") };
-    assert_eq!(axes.as_slice(), [0, 3, 1, 2]);
-    assert!(src.has_buffer_identity(), "the stored weight is a buffer");
-    let [cout, cin, kh, kw] = loaded.dims().unwrap()[..] else { panic!("a 4-D weight") };
-    assert_eq!(dims(src), [cout, kh, kw, cin]);
-    assert_eq!(conv.conv.weight.dims().unwrap(), [cout, cin, kh, kw]);
-    assert_eq!(conv.weight_taps.as_ref().map(|taps| Arc::ptr_eq(&taps.uop(), src)), conv.tk.then_some(true));
-    assert_eq!(values(&conv.conv.weight), values(loaded));
+/// A block stores its weight `[cout, kh, kw, cin]`, realized, the layout a
+/// channels-last convolution reduces over, and hands the checkpoint's `[cout,
+/// cin, kh, kw]` back in its state dict.
+fn assert_stored_channels_innermost(conv: &YoloConv, loaded: &StateDict, prefix: &str) {
+    let checkpoint = &loaded[&format!("{prefix}conv.weight")];
+    let [cout, cin, kh, kw] = checkpoint.dims().unwrap()[..] else { panic!("a 4-D weight") };
+    assert!(conv.weight.uop().has_buffer_identity(), "the stored weight is a buffer");
+    assert!(conv.bias.uop().has_buffer_identity(), "the folded bias is a buffer");
+    assert_eq!(conv.weight.dims().unwrap(), [cout, kh, kw, cin]);
+    let written = conv.state_dict("");
+    assert_eq!(written["conv.weight"].dims().unwrap(), [cout, cin, kh, kw]);
+    assert_eq!(values(&written["conv.weight"]), values(checkpoint));
+    assert_eq!(values(&conv.bias), values(&loaded[&format!("{prefix}conv.bias")]));
 }
 
-#[test_case(DType::Float32, 4, 8, 3, false; "f32 3x3")]
-#[test_case(DType::Float16, 64, 64, 3, true; "f16 tk 3x3")]
-fn a_loaded_conv_stores_its_weight_channels_innermost(dtype: DType, cin: usize, cout: usize, k: usize, tk: bool) {
+#[test_case(DType::Float32, 4, 8, 3; "f32 3x3")]
+#[test_case(DType::Float16, 64, 64, 3; "f16 3x3")]
+#[test_case(DType::Float16, 32, 48, 1; "f16 1x1")]
+fn a_loaded_conv_stores_its_weight_channels_innermost(dtype: DType, cin: usize, cout: usize, k: usize) {
     let loaded = load_weights(&unfolded_state(cin, cout, k), &dtype).unwrap();
     let mut conv = YoloConv::empty(cin, cout, k, 1, true);
-    if tk {
-        conv = conv.tk();
-        assert!(conv.tk, "the shape is one the kernel serves");
-    }
     conv.load_state_dict(&loaded, "").unwrap();
-    assert_stored_channels_innermost(&conv, &loaded["conv.weight"]);
+    assert_stored_channels_innermost(&conv, &loaded, "");
 }
 
-/// A channels-last bottleneck's convs read channels-last activations and still
-/// store their weights the same way: one layout decision for every block.
-#[test_case(DType::Float16; "f16")]
-fn a_channels_last_bottleneck_stores_its_weights_channels_innermost(dtype: DType) {
+/// Every block of a bottleneck stores its weight the same way.
+#[test]
+fn a_bottleneck_stores_its_weights_channels_innermost() {
     let mut sd = StateDict::new();
     for (prefix, (cin, cout)) in [("cv1.", (16, 8)), ("cv2.", (8, 16))] {
         sd.extend(unfolded_state(cin, cout, 3).into_iter().map(|(key, t)| (format!("{prefix}{key}"), t)));
     }
-    let loaded = load_weights(&sd, &dtype).unwrap();
-    let mut block = YoloBottleneck::empty(16, 16, true).channels_last();
+    let loaded = load_weights(&sd, &DType::Float16).unwrap();
+    let mut block = YoloBottleneck::empty(16, 16, true);
     block.load_state_dict(&loaded, "").unwrap();
-    assert_stored_channels_innermost(&block.cv1, &loaded["cv1.conv.weight"]);
-    assert_stored_channels_innermost(&block.cv2, &loaded["cv2.conv.weight"]);
+    assert_stored_channels_innermost(&block.cv1, &loaded, "cv1.");
+    assert_stored_channels_innermost(&block.cv2, &loaded, "cv2.");
 }

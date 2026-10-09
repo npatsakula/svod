@@ -5,12 +5,12 @@
 //! then runs Conv→ConvTranspose2d→Conv→Conv2d to produce `[B, 1, H/4, W/4]`.
 
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Conv2d, ConvTranspose2d, CoordinateTransformMode, Layer, Module, ResizeMode};
+use svod_tensor::nn::{Conv2d, ConvTranspose2d, CoordinateTransformMode, Module, ResizeMode};
 
 use crate::state::StateDict;
 
 use super::backbone::YoloBackbone;
-use super::blocks::conv::{YoloConv, conv2d_bias, deconv2d_2x};
+use super::blocks::conv::{YoloConv, conv2d_bias, deconv, deconv2d_2x, pointwise, to_nchw, to_nhwc};
 use super::config::YoloConfig;
 use super::error::Result;
 
@@ -20,11 +20,13 @@ use super::neck::YoloNeck;
 /// Bilinear 2× upsample with align_corners=True, as torch's
 /// `interpolate(..., mode="bilinear", align_corners=True)`.
 fn resize_bilinear_2x(x: &Tensor) -> Result<Tensor> {
-    Ok(x.upsample_with()
+    let up = to_nchw(x)?
+        .upsample_with()
         .scale(&[2, 2])
         .mode(ResizeMode::Linear)
         .coordinate_transformation_mode(CoordinateTransformMode::AlignCorners)
-        .call()?)
+        .call()?;
+    to_nhwc(&up)
 }
 
 /// Depth fusion decoder head.
@@ -86,9 +88,9 @@ impl DepthHead {
         }
 
         let out = self.head_conv0.forward(&out)?;
-        let out = self.head_deconv.forward(&out)?;
+        let out = deconv(&self.head_deconv, &out)?;
         let out = self.head_conv1.forward(&out)?;
-        let out = self.head_conv2.forward(&out)?;
+        let out = to_nchw(&pointwise(&self.head_conv2, &out)?)?;
 
         // Log-affine calibration of exp(clamp(out, -4, 5)):
         // `depth ** cal_a * exp(cal_b)`, the identity when uncalibrated.
@@ -154,7 +156,7 @@ impl Yolo26Depth {
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
-        let images = &self.config.cast_input(images);
+        let images = &self.config.cast_input(images)?;
         let (l4, l6, l10) = self.backbone.forward(images)?;
         let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
         self.head.forward(&[p3, p4, p5])

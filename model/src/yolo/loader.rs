@@ -4,6 +4,7 @@ use std::path::Path;
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::BatchNorm2d;
 
 use crate::state::{self, StateDict};
 
@@ -40,33 +41,49 @@ pub fn cast_weights(sd: &StateDict, dtype: &DType) -> StateDict {
         .collect()
 }
 
-/// Fold every `YoloConv`'s batch norm into its convolution: `conv.weight`
-/// scales by `gamma / sqrt(var + eps)` per output channel and a `conv.bias` of
-/// `beta - mean * scale` appears beside it, which [`YoloConv`] takes as the
-/// sign that the norm is already applied. The conv kernel then reads two
-/// buffers instead of six and its epilogue is a bias and the activation, as
-/// Ultralytics' `fuse()` leaves it. Folded in f32, before any narrowing.
+/// Fold every `YoloConv`'s batch norm into its convolution ([`fold_norm`]):
+/// `conv.weight` scales per output channel and a `conv.bias` appears beside
+/// it, which [`YoloConv`] takes as the sign that the norm is already applied.
+/// The conv kernel then reads two buffers instead of six and its epilogue is a
+/// bias and the activation, as Ultralytics' `fuse()` leaves it. A conv that
+/// already carries a bias is left alone.
 ///
 /// [`YoloConv`]: super::blocks::conv::YoloConv
 pub fn fold_batchnorm(sd: &StateDict) -> Result<StateDict> {
     let mut out = sd.clone();
     for (key, weight) in sd {
         let Some(prefix) = key.strip_suffix("conv.weight") else { continue };
-        let bn = |name: &str| sd.get(&format!("{prefix}bn.{name}")).map(|t| t.cast(DType::Float32));
-        let (Some(gamma), Some(beta), Some(mean), Some(var)) =
+        let bn = |name: &str| sd.get(&format!("{prefix}bn.{name}")).cloned();
+        let (Some(weight_bn), Some(bias_bn), Some(mean), Some(var)) =
             (bn("weight"), bn("bias"), bn("running_mean"), bn("running_var"))
         else {
             continue;
         };
-        let scale = var.try_add(Tensor::const_(YOLO_BN_EPS, DType::Float32))?.try_rsqrt()?.try_mul(&gamma)?;
-        let bias = beta.try_sub(&mean.try_mul(&scale)?)?;
-        let cout = weight.dim_const(0)?;
-        let scale = scale.try_reshape(vec![cout as isize, 1, 1, 1])?;
-        let folded = weight.cast(DType::Float32).try_mul(&scale)?.cast(weight.dtype());
+        if sd.contains_key(&format!("{prefix}conv.bias")) {
+            continue;
+        }
+        let norm = BatchNorm2d::new(weight_bn, bias_bn, mean, var, YOLO_BN_EPS);
+        let (folded, bias) = fold_norm(weight, &norm)?;
         out.insert(key.clone(), folded);
-        out.insert(format!("{prefix}conv.bias"), bias.cast(weight.dtype()));
+        out.insert(format!("{prefix}conv.bias"), bias);
     }
     Ok(out)
+}
+
+/// A conv weight `[cout, ...]` and the norm that follows it as one biased
+/// conv: the weight scales by `gamma / sqrt(var + eps)` per output channel and
+/// the bias is `beta - mean * scale`. Folded in f32 and cast back to the
+/// weight's dtype.
+pub fn fold_norm(weight: &Tensor, norm: &BatchNorm2d) -> svod_tensor::error::Result<(Tensor, Tensor)> {
+    let f32 = |t: &Tensor| t.cast(DType::Float32);
+    let scale = f32(&norm.running_var)
+        .try_add(Tensor::const_(norm.eps, DType::Float32))?
+        .try_rsqrt()?
+        .try_mul(f32(&norm.weight))?;
+    let bias = f32(&norm.bias).try_sub(&f32(&norm.running_mean).try_mul(&scale)?)?;
+    let cout = weight.dim_const(0)?;
+    let folded = f32(weight).try_mul(&scale.try_reshape(vec![cout as isize, 1, 1, 1])?)?.cast(weight.dtype());
+    Ok((folded, bias.cast(weight.dtype())))
 }
 
 /// [`cast_weights`], materialised — the checkpoint path.
@@ -79,8 +96,8 @@ pub fn fold_batchnorm(sd: &StateDict) -> Result<StateDict> {
 /// Narrowing to f16 is bit-exact for an Ultralytics checkpoint: the trainer
 /// saves fp16 and the converters widen it on the way in, so the f32 on disk
 /// carries no more information than the f16 it came from.
-/// Every tensor keeps the checkpoint's layout here: a [`YoloConv`] decides its
-/// weight's own storage when it loads it.
+/// Every tensor keeps the checkpoint's layout here: a [`YoloConv`] stores its
+/// weight channels-last when it loads it.
 ///
 /// [`YoloConv`]: super::blocks::conv::YoloConv
 pub fn load_weights(sd: &StateDict, dtype: &DType) -> Result<StateDict> {

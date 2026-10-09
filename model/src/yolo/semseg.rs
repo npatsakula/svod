@@ -4,12 +4,12 @@
 //! Conv→Conv2d classifier on P3. Forward returns `[B, nc, H/8, W/8]` logits.
 
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Conv2d, Layer, Module, ResizeMode};
+use svod_tensor::nn::{Conv2d, Module};
 
 use crate::state::StateDict;
 
 use super::backbone::YoloBackbone;
-use super::blocks::conv::{YoloConv, conv2d_bias};
+use super::blocks::conv::{YoloConv, conv2d_bias, pointwise, to_nchw, upsample_nearest};
 use super::blocks::csp::C3k2;
 use super::config::{YoloConfig, make_depth};
 use super::error::Result;
@@ -35,7 +35,7 @@ impl SemSegClassifier {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = &super::head::in_head_dtype(x);
         let x = self.conv0.forward(x)?;
-        Ok(self.conv2.forward(&x)?)
+        pointwise(&self.conv2, &x)
     }
 }
 
@@ -97,19 +97,19 @@ impl Yolo26SemSeg {
 
     /// Run the full network. Returns `[B, nc, H/8, W/8]` per-pixel logits.
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
-        let images = &self.config.cast_input(images);
+        let images = &self.config.cast_input(images)?;
         let (l4, l6, l10) = self.backbone.forward(images)?;
 
         // Partial FPN top-down (layers 11–16)
-        let up = l10.upsample(&[2, 2], ResizeMode::Nearest)?;
-        let cat = Tensor::cat(&[&up, &l6], 1)?;
+        let up = upsample_nearest(&l10, 2)?;
+        let cat = Tensor::cat(&[&up, &l6], -1)?;
         let l13 = self.c3k2_13.forward(&cat)?;
 
-        let up = l13.upsample(&[2, 2], ResizeMode::Nearest)?;
-        let cat = Tensor::cat(&[&up, &l4], 1)?;
+        let up = upsample_nearest(&l13, 2)?;
+        let cat = Tensor::cat(&[&up, &l4], -1)?;
         let l16 = self.c3k2_16.forward(&cat)?;
 
         // Classifier on P3
-        self.classifier.forward(&l16)
+        to_nchw(&self.classifier.forward(&l16)?)
     }
 }

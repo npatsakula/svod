@@ -3,9 +3,9 @@
 
 use svod_ir::SInt;
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Conv2d, Layer, Module};
+use svod_tensor::nn::{Conv2d, Module};
 
-use super::blocks::conv::{YoloConv, conv2d_bias};
+use super::blocks::conv::{YoloConv, conv2d_bias, pointwise};
 use super::error::Result;
 use crate::state::scoped;
 
@@ -27,6 +27,15 @@ pub(crate) const HEAD_DTYPE: svod_dtype::DType = svod_dtype::DType::Float32;
 /// A no-op when the features are f32 already: `UOp::cast` returns the same node.
 pub(crate) fn in_head_dtype(feat: &Tensor) -> Tensor {
     feat.cast(HEAD_DTYPE)
+}
+
+/// A branch's `[B, H, W, C]` output as the `[B, C, H·W]` rows the heads
+/// concatenate over every scale's anchors. Realized first: fused into that
+/// `cat`, a branch's last conv would be recomputed over every scale.
+pub(crate) fn anchor_rows(t: &Tensor) -> Result<Tensor> {
+    let [b, h, w, c]: [SInt; 4] = t.shape()?.to_vec().try_into().expect("a [B, H, W, C] map");
+    let hw = h.as_const().expect("a static height") * w.as_const().expect("a static width");
+    Ok(t.contiguous().try_permute(&[0, 3, 1, 2])?.try_reshape([b, c, SInt::from(hw)])?)
 }
 
 /// [`in_head_dtype`] across a head's feature pyramid.
@@ -97,11 +106,7 @@ pub struct BoxBranch {
 impl BoxBranch {
     pub fn empty(in_ch: usize, hidden: usize, reg_max: usize) -> Self {
         Self {
-            // The one branch conv the tk kernel can serve: `conv1` holds an f32
-            // accumulator the kernel has no way to keep, and the logits conv is
-            // a 1x1. Its input is a neck feature at most 512 channels wide, so
-            // the permute into `[B, H, W, C]` is small beside the win.
-            conv0: YoloConv::empty(in_ch, hidden, 3, 1, true).tk(),
+            conv0: YoloConv::empty(in_ch, hidden, 3, 1, true),
             conv1: YoloConv::empty(hidden, hidden, 3, 1, true).with_acc_dtype(HEAD_DTYPE),
             conv2: conv2d_bias(hidden, 4 * reg_max, 1, 1).with_acc_dtype(HEAD_DTYPE),
         }
@@ -110,7 +115,7 @@ impl BoxBranch {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = scoped("0", || self.conv0.forward(x))?;
         let x = scoped("1", || self.conv1.forward(&x))?;
-        Ok(scoped("2", || self.conv2.forward(&x))?)
+        scoped("2", || pointwise(&self.conv2, &x))
     }
 }
 
@@ -148,7 +153,7 @@ impl ClsBranch {
         let x = scoped("0.1", || self.conv0.forward(&x))?;
         let x = scoped("1.0", || self.dw1.forward(&x))?;
         let x = scoped("1.1", || self.conv1.forward(&x))?;
-        Ok(scoped("2", || self.conv2.forward(&x))?)
+        scoped("2", || pointwise(&self.conv2, &x))
     }
 }
 

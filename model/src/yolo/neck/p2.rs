@@ -5,10 +5,10 @@
 //! maps at strides 4, 8, 16, 32.
 
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Module, ResizeMode};
+use svod_tensor::nn::Module;
 
 use crate::state::scoped;
-use crate::yolo::blocks::conv::YoloConv;
+use crate::yolo::blocks::conv::{YoloConv, upsample_nearest};
 use crate::yolo::blocks::csp::C3k2;
 use crate::yolo::config::{YoloScale, make_depth, scale_channels};
 use crate::yolo::error::Result;
@@ -76,29 +76,29 @@ impl YoloNeckP2 {
         l10: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         // FPN top-down: l10 → up → cat(l6) → c3k2_13 → up → cat(l4) → c3k2_16 → up → cat(l2) → c3k2_19
-        let up = l10.upsample(&[2, 2], ResizeMode::Nearest)?;
-        let cat = Tensor::cat(&[&up, l6], 1)?;
+        let up = upsample_nearest(l10, 2)?;
+        let cat = Tensor::cat(&[&up, l6], -1)?;
         let l13 = scoped("13", || self.c3k2_13.forward(&cat))?;
 
-        let up = l13.upsample(&[2, 2], ResizeMode::Nearest)?;
-        let cat = Tensor::cat(&[&up, l4], 1)?;
+        let up = upsample_nearest(&l13, 2)?;
+        let cat = Tensor::cat(&[&up, l4], -1)?;
         let l16 = scoped("16", || self.c3k2_16.forward(&cat))?;
 
-        let up = l16.upsample(&[2, 2], ResizeMode::Nearest)?;
-        let cat = Tensor::cat(&[&up, l2], 1)?;
+        let up = upsample_nearest(&l16, 2)?;
+        let cat = Tensor::cat(&[&up, l2], -1)?;
         let l19 = scoped("19", || self.c3k2_19.forward(&cat))?;
 
         // PAN bottom-up: l19 → conv20 → cat(l16) → c3k2_22 → conv23 → cat(l13) → c3k2_25 → conv26 → cat(l10) → c3k2_28
         let l20 = scoped("20", || self.conv20.forward(&l19))?;
-        let cat = Tensor::cat(&[&l20, &l16], 1)?;
+        let cat = Tensor::cat(&[&l20, &l16], -1)?;
         let l22 = scoped("22", || self.c3k2_22.forward(&cat))?;
 
         let l23 = scoped("23", || self.conv23.forward(&l22))?;
-        let cat = Tensor::cat(&[&l23, &l13], 1)?;
+        let cat = Tensor::cat(&[&l23, &l13], -1)?;
         let l25 = scoped("25", || self.c3k2_25.forward(&cat))?;
 
         let l26 = scoped("26", || self.conv26.forward(&l25))?;
-        let cat = Tensor::cat(&[&l26, l10], 1)?;
+        let cat = Tensor::cat(&[&l26, l10], -1)?;
         let l28 = scoped("28", || self.c3k2_28.forward(&cat))?;
 
         Ok((l19, l22, l25, l28))

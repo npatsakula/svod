@@ -4,17 +4,17 @@
 //! feature maps `(P3, P4, P5)` at strides 8, 16, 32.
 
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Module, ResizeMode};
+use svod_tensor::nn::Module;
 
 use crate::state::scoped;
 use crate::yolo::backbone::scaled_channels;
-use crate::yolo::blocks::conv::YoloConv;
+use crate::yolo::blocks::conv::{YoloConv, upsample_nearest};
 use crate::yolo::blocks::csp::C3k2;
 use crate::yolo::config::{YoloScale, make_depth};
 use crate::yolo::error::Result;
 
-/// Full FPN+PAN neck (layers 11–22). Shared by detect, segment, obb, pose,
-/// and depth models.
+/// Full FPN+PAN neck (layers 11–22) over `[B, H, W, C]` maps. Shared by
+/// detect, segment, obb, pose, and depth models.
 #[derive(Clone, Module)]
 pub struct YoloNeck {
     #[module(key = "13")]
@@ -41,11 +41,11 @@ impl YoloNeck {
             // Layer 16: C3k2 [256, True] — input is cat(upsample(c3), c3) = c3+c3
             c3k2_16: C3k2::empty(c3 + c3, c2, d(2), true, 0.5, true, false),
             // Layer 17: Conv [256, 3, 2]
-            conv17: YoloConv::empty(c2, c2, 3, 2, true).tk(),
+            conv17: YoloConv::empty(c2, c2, 3, 2, true),
             // Layer 19: C3k2 [512, True] — input is cat(conv17_out, c3k2_13_out)
             c3k2_19: C3k2::empty(c2 + c3, c3, d(2), true, 0.5, true, false),
             // Layer 20: Conv [512, 3, 2]
-            conv20: YoloConv::empty(c3, c3, 3, 2, true).tk(),
+            conv20: YoloConv::empty(c3, c3, 3, 2, true),
             // Layer 22: C3k2 [1024, True, 0.5, True] — attn=True
             c3k2_22: C3k2::empty(c3 + c4, c4, d(1), true, 0.5, true, true),
         }
@@ -54,25 +54,21 @@ impl YoloNeck {
     /// Run the full FPN+PAN. Returns `(P3, P4, P5)` detection features.
     pub fn forward(&self, l4: &Tensor, l6: &Tensor, l10: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         // FPN top-down
-        let up = l10.upsample(&[2, 2], ResizeMode::Nearest)?;
-        let cat = Tensor::cat(&[&up, l6], 1)?;
+        let up = upsample_nearest(l10, 2)?;
+        let cat = Tensor::cat(&[&up, l6], -1)?;
         let l13 = scoped("13", || self.c3k2_13.forward(&cat))?;
 
-        let up = l13.upsample(&[2, 2], ResizeMode::Nearest)?;
-        let cat = Tensor::cat(&[&up, l4], 1)?;
+        let up = upsample_nearest(&l13, 2)?;
+        let cat = Tensor::cat(&[&up, l4], -1)?;
         let l16 = scoped("16", || self.c3k2_16.forward(&cat))?;
 
-        // PAN bottom-up. The downsampling convs feed only a `cat`. They used to
-        // be realized first, so that fusing into it could not run each over the
-        // whole concatenated channel range — but a tk convolution's output is
-        // already its own kernel's, and copying the NCHW view of it back out
-        // costs a copy for nothing.
+        // PAN bottom-up.
         let l17 = scoped("17", || self.conv17.forward(&l16))?;
-        let cat = Tensor::cat(&[&l17, &l13], 1)?;
+        let cat = Tensor::cat(&[&l17, &l13], -1)?;
         let l19 = scoped("19", || self.c3k2_19.forward(&cat))?;
 
         let l20 = scoped("20", || self.conv20.forward(&l19))?;
-        let cat = Tensor::cat(&[&l20, l10], 1)?;
+        let cat = Tensor::cat(&[&l20, l10], -1)?;
         let l22 = scoped("22", || self.c3k2_22.forward(&cat))?;
 
         Ok((l16, l19, l22))

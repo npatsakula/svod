@@ -25,10 +25,7 @@ pub fn scaled_channels(scale: YoloScale) -> [usize; 5] {
 /// Full YOLO v26 backbone (layers 0–10): Conv→Conv→C3k2→Conv→C3k2→Conv→
 /// C3k2→Conv→C3k2→SPPF→C2PSA.
 ///
-/// The stride-2 downsamples run the tk convolution ([`YoloConv::tk`]); layer 0
-/// does not, its three input channels being too few to fill a K strip.
-///
-/// Forward returns the three skip-connection outputs: `(l4, l6, l10)`.
+/// Takes and returns `[B, H, W, C]` maps. Forward returns the three skip-connection outputs: `(l4, l6, l10)`.
 #[derive(Clone, Module)]
 pub struct YoloBackbone {
     #[module(key = "0")]
@@ -61,13 +58,13 @@ impl YoloBackbone {
         let [c0, c1, c2, c3, c4] = scaled_channels(scale);
         Self {
             conv0: YoloConv::empty(3, c0, 3, 2, true),
-            conv1: YoloConv::empty(c0, c1, 3, 2, true).tk(),
+            conv1: YoloConv::empty(c0, c1, 3, 2, true),
             c3k2_2: C3k2::empty(c1, c2, d(2), true, 0.25, scale.forces_c3k(), false),
-            conv3: YoloConv::empty(c2, c2, 3, 2, true).tk(),
+            conv3: YoloConv::empty(c2, c2, 3, 2, true),
             c3k2_4: C3k2::empty(c2, c3, d(2), true, 0.25, scale.forces_c3k(), false),
-            conv5: YoloConv::empty(c3, c3, 3, 2, true).tk(),
+            conv5: YoloConv::empty(c3, c3, 3, 2, true),
             c3k2_6: C3k2::empty(c3, c3, d(2), true, 0.5, true, false),
-            conv7: YoloConv::empty(c3, c4, 3, 2, true).tk(),
+            conv7: YoloConv::empty(c3, c4, 3, 2, true),
             c3k2_8: C3k2::empty(c4, c4, d(2), true, 0.5, true, false),
             sppf9: Sppf::empty(c4, c4, 5, 3, true),
             c2psa10: C2PSA::empty(c4, c4, d(2), 0.5),
@@ -130,13 +127,13 @@ impl YoloBackboneCls {
         let [c0, c1, c2, c3, c4] = scaled_channels(scale);
         Self {
             conv0: YoloConv::empty(3, c0, 3, 2, true),
-            conv1: YoloConv::empty(c0, c1, 3, 2, true).tk(),
+            conv1: YoloConv::empty(c0, c1, 3, 2, true),
             c3k2_2: C3k2::empty(c1, c2, d(2), true, 0.25, scale.forces_c3k(), false),
-            conv3: YoloConv::empty(c2, c2, 3, 2, true).tk(),
+            conv3: YoloConv::empty(c2, c2, 3, 2, true),
             c3k2_4: C3k2::empty(c2, c3, d(2), true, 0.25, scale.forces_c3k(), false),
-            conv5: YoloConv::empty(c3, c3, 3, 2, true).tk(),
+            conv5: YoloConv::empty(c3, c3, 3, 2, true),
             c3k2_6: C3k2::empty(c3, c3, d(2), true, 0.5, true, false),
-            conv7: YoloConv::empty(c3, c4, 3, 2, true).tk(),
+            conv7: YoloConv::empty(c3, c4, 3, 2, true),
             c3k2_8: C3k2::empty(c4, c4, d(2), true, 0.5, true, false),
             c2psa9: C2PSA::empty(c4, c4, d(2), 0.5),
         }

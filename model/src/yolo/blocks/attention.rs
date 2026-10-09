@@ -1,6 +1,7 @@
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
+use svod_tk3::ops::{self, Attn};
 
 use super::conv::YoloConv;
 use crate::state::{scoped, scoped_index};
@@ -42,35 +43,47 @@ impl Attention {
         }
     }
 
+    /// `x` is `[B, H, W, C]`; so is the output.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with(x, None)
+    }
+
+    /// `x + attention(x)`, the add in the output projection's epilogue.
+    pub fn forward_residual(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_with(x, Some(x))
+    }
+
+    fn forward_with(&self, x: &Tensor, residual: Option<&Tensor>) -> Result<Tensor> {
         let b = x.dim(0)?;
         let (nh, kd, hd) = (self.num_heads, self.key_dim, self.head_dim);
-        let h = x.dim_const(2)?;
-        let w = x.dim_const(3)?;
-        let hw = h * w;
+        let (h, w) = (x.dim_const(1)?, x.dim_const(2)?);
 
-        // QKV 1×1 conv, then flatten spatial and separate heads:
-        // [B, C, H, W] → [B, nh*(2kd+hd), H, W] → [B, nh, 2kd+hd, H*W]
+        // QKV 1×1 conv, its channels split into heads of `q | k | v`:
+        // [B, H, W, nh·(2kd+hd)] → [B, H·W, nh, 2kd+hd].
         let qkv = scoped("qkv", || self.qkv.forward(x))?;
-        let qkv = qkv.try_reshape([b.clone(), SInt::from(nh), SInt::from(kd * 2 + hd), SInt::from(hw)])?;
-
-        // q [B,nh,kd,N], k [B,nh,kd,N], v [B,nh,hd,N]
-        let parts = qkv.split(&[kd, kd, hd], 2)?;
+        let qkv = qkv.try_reshape([b.clone(), SInt::from(h * w), SInt::from(nh), SInt::from(kd * 2 + hd)])?;
+        let parts = qkv.split(&[kd, kd, hd], -1)?;
         let (q, k, v) = (&parts[0], &parts[1], &parts[2]);
 
-        // attn = softmax(q^T @ k) : [B, nh, N, N]
-        let attn = q.try_mul(self.scale)?.try_transpose(-2, -1)?.matmul(k)?.softmax(-1)?;
+        // The keys are narrower than the values: zeros past `kd` leave every
+        // score as it is, so all three share one head width.
+        let d = kd.max(hd);
+        let widen = |t: &Tensor, from: usize| -> Result<Tensor> {
+            Ok(if from == d { t.clone() } else { t.try_pad(&[(0, 0), (0, 0), (0, 0), (0, (d - from) as isize)])? })
+        };
+        let attn = Attn { scale: Some(self.scale), ..Default::default() };
+        let out = ops::attention(&widen(q, kd)?, &widen(k, kd)?, &widen(v, hd)?, attn)?;
+        let out = if d == hd { out } else { out.narrow(-1, 0usize, hd)? };
 
-        // out = v @ attn^T : [B, nh, hd, N], reshaped back to [B, C, H, W]
-        let spatial = |t: &Tensor| t.try_reshape([b.clone(), SInt::from(nh * hd), SInt::from(h), SInt::from(w)]);
-        let out = spatial(&v.matmul(&attn.try_transpose(-2, -1)?)?)?;
+        // Positional encoding: a depthwise conv over the values as a map.
+        let spatial = |t: &Tensor| t.try_reshape([b.clone(), SInt::from(h), SInt::from(w), SInt::from(nh * hd)]);
+        let pe = scoped("pe", || self.pe.forward(&spatial(v)?))?;
 
-        // Positional encoding: depthwise conv on v reshaped to spatial.
-        let v = spatial(v)?;
-        let pe = scoped("pe", || self.pe.forward(&v))?;
-
-        let out = out.try_add(&pe)?;
-        scoped("proj", || self.proj.forward(&out))
+        let out = spatial(&out)?.try_add(&pe)?;
+        scoped("proj", || match residual {
+            Some(r) => self.proj.forward_residual(&out, r),
+            None => self.proj.forward(&out),
+        })
     }
 }
 
@@ -95,11 +108,12 @@ impl PSABlock {
         }
     }
 
+    /// `x` is `[B, H, W, C]`; both residuals ride the epilogues of the convs
+    /// that end their branch.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = x.try_add(&scoped("attn", || self.attn.forward(x))?)?;
+        let x = scoped("attn", || self.attn.forward_residual(x))?;
         let h = scoped("ffn.0", || self.ffn0.forward(&x))?;
-        let ffn_out = scoped("ffn.1", || self.ffn1.forward(&h))?;
-        Ok(x.try_add(&ffn_out)?)
+        scoped("ffn.1", || self.ffn1.forward_residual(&h, &x))
     }
 }
 
@@ -130,10 +144,10 @@ impl C2PSA {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let y = scoped("cv1", || self.cv1.forward(x))?;
-        let a = y.narrow(1, 0usize, self.c_hidden)?;
-        let b = y.narrow(1, self.c_hidden, self.c_hidden)?;
+        let a = y.narrow(-1, 0usize, self.c_hidden)?;
+        let b = y.narrow(-1, self.c_hidden, self.c_hidden)?;
         let b = self.m.iter().enumerate().try_fold(b, |acc, (i, blk)| scoped_index("m", i, || blk.forward(&acc)))?;
-        let cat = Tensor::cat(&[&a, &b], 1)?;
+        let cat = Tensor::cat(&[&a, &b], -1)?;
         scoped("cv2", || self.cv2.forward(&cat))
     }
 }
