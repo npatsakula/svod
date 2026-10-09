@@ -1,5 +1,5 @@
+use crate::qwen3::SEQUENCE_TILE as TILE;
 use svod_dtype::DType;
-use svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE as TILE;
 
 use crate::qwen3::{Qwen3Config, Qwen3Embedder, Qwen3Embedding};
 

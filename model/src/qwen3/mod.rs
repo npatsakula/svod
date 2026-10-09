@@ -20,7 +20,6 @@ mod feed_forward;
 mod jit;
 mod model;
 mod reranker;
-pub(crate) mod tk;
 
 pub use attention::Qwen3Attention;
 pub use config::{Qwen3Config, qwen3_embedding_0_6b};
@@ -30,6 +29,8 @@ pub use embedder::Qwen3Embedding;
 pub use error::{Error, Result};
 pub use feed_forward::Qwen3MLP;
 pub use jit::{Qwen3EmbeddingJit, Qwen3RerankerJit};
+#[cfg(test)]
+pub(crate) use model::SEQUENCE_TILE;
 pub use model::{Packing, Qwen3Model};
 pub use reranker::Qwen3Reranker;
 

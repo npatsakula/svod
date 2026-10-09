@@ -226,9 +226,8 @@ fn qwen3_0_6b_structural() -> Qwen3Config {
     }
 }
 
-/// A config the hand kernels apply to on a supported device: a 128-wide hidden
-/// state and head dim (both a multiple of the 32-lane wave, halving to 64), and
-/// head counts a wave grid divides.
+/// A config the tk3 kernels apply to on a supported device: a 128-wide hidden
+/// state and head dim, and grouped query heads.
 fn fusable_cfg() -> Qwen3Config {
     Qwen3Config {
         hidden_size: 128,
@@ -276,16 +275,31 @@ fn residual_stream_matches_the_eager_layer_chain() {
     assert!(err < tol, "residual stream diverges from the eager chain: relative error {err} (tol {tol})");
 }
 
-/// `forward` rounds a sequence up to the flash-attention tile and narrows the
+/// `forward` rounds a sequence up to the attention tile and narrows the
 /// rope cache to that padded length, so the cache must cover it for every
 /// admissible length — including a context that is not a whole number of tiles.
+#[test_case(64; "below one tile")]
+#[test_case(100; "not a tile multiple")]
+#[test_case(128; "exactly one tile")]
 #[test_case(200; "between tiles")]
 fn rope_cache_covers_the_padded_context(max_positions: usize) {
     let model = Qwen3Model::empty(Qwen3Config { max_position_embeddings: max_positions, ..tiny_cfg() });
-    let padded = max_positions.next_multiple_of(svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE);
+    let padded = max_positions.next_multiple_of(crate::qwen3::SEQUENCE_TILE);
     let (cos, sin) = model.rope_prefix(padded).expect("the cache must reach the padded context");
     assert_eq!(cos.dim_const(1).unwrap(), padded);
     assert_eq!(sin.dim_const(1).unwrap(), padded);
+}
+
+/// Rounding the cache up to the tile appends rows; the positions the model
+/// already had must not move.
+#[test]
+fn rope_cache_rounding_leaves_positions_put() {
+    let rows = |max_positions: usize| {
+        let model = Qwen3Model::empty(Qwen3Config { max_position_embeddings: max_positions, ..tiny_cfg() });
+        let (cos, sin) = model.rope_prefix(100).expect("100 positions");
+        (realized(&cos.contiguous()), realized(&sin.contiguous()))
+    };
+    assert_eq!(rows(100), rows(128), "the rounded cache must agree with an exact one on their shared rows");
 }
 
 /// `lengths` names each row's real token count and the pooled token is the one
@@ -306,6 +320,21 @@ fn out_of_range_lengths_saturate_into_the_row() {
     assert_eq!(at(9), last, "a length past the row pools its last token");
 }
 
+/// The reranker pools through the same `last_token`, so a degenerate length
+/// scores a real token rather than a row of zeros (a flat 0.5 after sigmoid).
+#[test]
+fn reranker_scores_a_real_token_at_a_zero_length() {
+    use crate::qwen3::Qwen3Reranker;
+
+    let mut reranker = Qwen3Reranker::empty(tiny_cfg());
+    reranker.yes_loc = 5;
+    let ids = Tensor::from_slice([3i32, 1, 4, 1, 5, 9, 2, 6]).try_reshape([1isize, 8]).unwrap();
+    let at = |len: i32| realized(&reranker.forward(&ids, &Tensor::from_slice([len])).unwrap());
+
+    assert_eq!(at(0), at(1), "a zero length scores the row's first token");
+    assert!(at(0)[0] != 0.5, "a row of zeros would score exactly sigmoid(0)");
+}
+
 /// A sequence past the config's context is a caller bug named as one, not a
 /// narrow that ran off the end of the rope cache.
 #[test]
@@ -316,4 +345,21 @@ fn a_sequence_past_the_context_is_rejected() {
     assert!(matches!(err, crate::qwen3::Error::ContextLength { seq_len: 5, max_position_embeddings: 4 }), "got {err}");
     // The whole context still runs, tile or no tile.
     model.forward(&Tensor::from_slice([0i32; 4]).try_reshape([1isize, 4]).unwrap()).expect("four tokens fit");
+}
+
+/// Norm weights kept at a different precision from the stream are the graph
+/// path's business: the heads op rejects the mismatch, so the prologue must
+/// take the graph and `forward` must still produce a hidden state.
+#[test]
+fn a_norm_weight_off_the_stream_dtype_falls_back_to_the_graph() {
+    let mut model = Qwen3Model::empty(Qwen3Config { dtype: crate::default_compute_dtype(), ..fusable_cfg() });
+    for layer in &mut model.layers {
+        layer.input_layernorm.weight = layer.input_layernorm.weight.cast(DType::Float32);
+        layer.post_attention_layernorm.weight = layer.post_attention_layernorm.weight.cast(DType::Float32);
+        layer.attention.q_norm.weight = layer.attention.q_norm.weight.cast(DType::Float32);
+    }
+    let ids = Tensor::from_slice((0..128i32).collect::<Vec<_>>()).try_reshape([1isize, 128]).unwrap();
+    let out =
+        realized(&model.forward(&ids).expect("the graph path takes what the kernels will not").cast(DType::Float32));
+    assert!(out.iter().all(|x| x.is_finite()));
 }

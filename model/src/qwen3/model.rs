@@ -7,7 +7,7 @@
 //!
 //! **Padding convention: right.** Attention is causal, so a real token never
 //! sees the padding after it and no mask is needed anywhere in the stack; the
-//! hand flash-attention kernel runs unmasked. Rows are then read back at
+//! attention runs with no key mask. Rows are then read back at
 //! [`last_token`]. RoPE only enters through position differences, so this is
 //! the reference's left-padded result to rounding.
 //!
@@ -49,12 +49,17 @@ pub struct Qwen3Model {
     inv_freq: Tensor,
 }
 
-/// Positions the rope cache holds: the context rounded up to the attention
-/// tile, because [`Qwen3Model::forward`] pads a sequence to that tile and
-/// narrows the cache to the padded length. The rows past the context are only
-/// ever read by that padding, which is causal-invisible.
+/// The length multiple 16-bit sequences run at on a tk3 device, and the
+/// embedder's plan bucket: whole query tiles of every attention config, so
+/// no tile is cut by the sequence end.
+pub(crate) const SEQUENCE_TILE: usize = 128;
+
+/// Positions the rope cache holds: the context rounded up to
+/// [`SEQUENCE_TILE`], because [`Qwen3Model::forward`] pads a sequence to that
+/// tile and narrows the cache to the padded length. The rows past the context
+/// are only ever read by that padding, which is causal-invisible.
 fn rope_positions(config: &Qwen3Config) -> usize {
-    config.max_position_embeddings.max(1).next_multiple_of(svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE)
+    config.max_position_embeddings.max(1).next_multiple_of(SEQUENCE_TILE)
 }
 
 /// Sequence-major `(cos, sin)` for `positions` positions, realized.
@@ -135,13 +140,13 @@ impl Qwen3Model {
         Ok((angles.cos()?.cast(dtype.clone()), angles.sin()?.cast(dtype)))
     }
 
-    /// Sequence length the stack runs at: on a device with the hand kernel,
-    /// 16-bit activations pad up to its tile so every layer takes the fast
-    /// path; padded rows are causal-invisible and sliced off again.
+    /// Sequence length the stack runs at: on a device with tk3 kernels,
+    /// 16-bit activations pad up to [`SEQUENCE_TILE`]; padded rows are
+    /// causal-invisible and sliced off again.
     fn padded_len(&self, seq_len: usize) -> usize {
         let sixteen_bit = matches!(self.config.dtype.base(), ScalarDType::BFloat16 | ScalarDType::Float16);
-        if sixteen_bit && svod_tk::flash_attention_supported(&self.embeddings.weight.device()) {
-            seq_len.next_multiple_of(svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE)
+        if sixteen_bit && svod_tk3::ops::supported(&self.embeddings.weight.device()) {
+            seq_len.next_multiple_of(SEQUENCE_TILE)
         } else {
             seq_len
         }
@@ -167,7 +172,7 @@ impl Qwen3Model {
 
     /// Packed `input_ids` `(B, L)` → last-hidden-state `(B, L, D)`: every
     /// token is rotated by its own position and sees only its own sequence.
-    /// `L` is the caller's — the packer sizes rows to the attention tile.
+    /// `L` is the caller's — the packer sizes rows to [`SEQUENCE_TILE`].
     pub fn forward_packed(&self, input_ids: &Tensor, packing: &Packing) -> Result<Tensor> {
         let rope = self.rope_at(packing.positions)?;
         self.stack(input_ids, &rope, Some(packing.seg_start))
