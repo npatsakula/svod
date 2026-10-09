@@ -9,7 +9,8 @@ use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
 use crate::kernels::rows::NormCfg;
 
-/// Targets with measured tables: `mma.sync` + `cp.async` + `ldmatrix` (sm_80+).
+/// Targets with tables: `mma.sync` + `cp.async` + `ldmatrix` (sm_80+, measured
+/// on sm_86; Hopper and Blackwell run the same path, no wgmma or TMA).
 pub fn has_tables(target: &Target) -> bool {
     matches!(target.arch, GpuArch::Cuda(c) if c.major >= 8)
 }
