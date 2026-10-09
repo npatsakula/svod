@@ -44,7 +44,11 @@ pub const HUB_REPO: &str = "nvidia/Nemotron-3-Diarization";
 /// `act(x·wᵀ + b) + residual`, the bias, activation and residual add in the
 /// GEMM's epilogue where the tile kernel runs.
 fn project(layer: &Linear, x: &Tensor, act: Act, residual: Option<&Tensor>) -> Result<Tensor> {
-    Ok(ops::linear(x, &layer.weight, ops::Linear { bias: layer.bias.as_ref(), act, residual, gated: false })?)
+    Ok(ops::linear(
+        x,
+        &layer.weight,
+        ops::Linear { bias: layer.bias.as_ref(), act, residual, ..ops::Linear::default() },
+    )?)
 }
 
 fn norm(layer: &LayerNorm, x: &Tensor) -> Result<Tensor> {

@@ -7,12 +7,14 @@ use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
 use crate::atoms::{Target, sm86};
+use crate::build::BF16 as BF16T;
+use crate::kernels::Batch;
 use crate::kernels::attention::FaCfg;
-use crate::kernels::gemm::GemmCfg;
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::NormCfg;
 use crate::ops::config;
 use crate::ops::shape::{self, Extent, Fallback, Plan, extent};
-use crate::ops::{self as tk, Attn, Cache, Error, KeyMask, Linear, Qkv};
+use crate::ops::{self as tk, Act, Attn, Cache, Error, KeyMask, Linear, Qkv};
 
 const BF16: DType = DType::BFloat16;
 
@@ -153,6 +155,44 @@ fn a_variable_reduced_dim_falls_back() {
 fn f16_takes_the_kernels() {
     let f16 = [DType::Float16, DType::Float16];
     assert!(matches!(shape::linear(Some(&sm86()), &f16, Some(&ext(&[64, 64])), 64, false), Plan::Kernel(_)));
+}
+
+/// The tune store keys a GEMM by its epilogue's text: without a scale it
+/// reads as it did before the field, so stored choices still apply; a scale
+/// is its own key and its own program.
+#[test]
+fn an_unscaled_epilogue_keeps_its_tune_key() {
+    let plain = Epilogue { bias: true, residual: true, ..Epilogue::default() };
+    assert_eq!(format!("{plain:?}"), "Epilogue { bias: true, act: None, gated: false, residual: true }");
+    let half = Epilogue { scale: Some(Scale::new(0.5)), ..plain };
+    assert_eq!(format!("{half:?}"), "Epilogue { bias: true, act: None, gated: false, residual: true, scale: 0.5 }");
+    let spec = |epilogue| GemmSpec { m: 64, n: 64, k: 64, batch: Batch::Static(1), epilogue, cfg: BIG };
+    assert_ne!(gemm::<BF16T>(&spec(plain)), gemm::<BF16T>(&spec(half)));
+}
+
+/// The graph fallback (f32 here) applies the scale between the activation and
+/// the residual: `scale·act(x·wᵀ + b) + r`.
+#[test_case(Act::None, false; "plain")]
+#[test_case(Act::Silu, false; "silu")]
+#[test_case(Act::Gelu, true; "geglu")]
+fn the_graph_scales_before_the_residual(act: Act, gated: bool) {
+    let f = |shape: &[usize], seed: usize| {
+        let len = shape.iter().product::<usize>();
+        let data: Vec<f32> = (0..len).map(|i| ((i * 7 + seed * 13) % 17) as f32 / 8.0 - 1.0).collect();
+        Tensor::from_slice(data).try_reshape(shape.iter().map(|&d| d as isize).collect::<Vec<_>>()).unwrap()
+    };
+    let (m, n, k) = (5, 6, 4);
+    let rows = if gated { 2 * n } else { n };
+    let (x, w, b, r) = (f(&[m, k], 1), f(&[rows, k], 2), f(&[rows], 3), f(&[m, n], 4));
+    let opts = Linear { bias: Some(&b), act, gated, residual: Some(&r), scale: Some(-0.75) };
+    let got = tk::linear(&x, &w, opts).unwrap().to_vec::<f32>().unwrap();
+    let unscaled = Linear { residual: None, scale: None, ..opts };
+    let y = tk::linear(&x, &w, unscaled).unwrap().to_vec::<f32>().unwrap();
+    let r = r.to_vec::<f32>().unwrap();
+    for (i, g) in got.iter().enumerate() {
+        let want = -0.75 * y[i] + r[i];
+        assert!((g - want).abs() <= 1e-5 * want.abs().max(1.0), "[{i}] = {g}, want {want}");
+    }
 }
 
 // ---- attention ---------------------------------------------------------------------

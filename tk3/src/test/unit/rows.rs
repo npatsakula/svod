@@ -11,7 +11,7 @@ use crate::atoms::{Target, sm86};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::*;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch_all;
@@ -113,18 +113,21 @@ fn gemm_reference(m: usize, n: usize, k: usize, epi: Epilogue, p: &[Vec<f64>]) -
                 Act::Silu => silu(x),
             };
             let y = if epi.gated { y * half(i, j, 1) } else { y };
+            let y = y * epi.scale.map_or(1.0, |s| f64::from(s.get()));
             round_to(ScalarDType::BFloat16, y + residual.map_or(0.0, |r| r[e]))
         })
         .collect()
 }
 
-const EPILOGUES: [Epilogue; 6] = [
-    Epilogue { bias: true, residual: false, act: Act::None, gated: false },
-    Epilogue { bias: false, residual: true, act: Act::None, gated: false },
-    Epilogue { bias: true, residual: false, act: Act::Gelu, gated: false },
-    Epilogue { bias: true, residual: true, act: Act::Silu, gated: false },
-    Epilogue { bias: true, residual: false, act: Act::Silu, gated: true },
-    Epilogue { bias: false, residual: true, act: Act::Gelu, gated: true },
+const EPILOGUES: [Epilogue; 8] = [
+    Epilogue { bias: true, residual: false, act: Act::None, gated: false, scale: None },
+    Epilogue { bias: false, residual: true, act: Act::None, gated: false, scale: None },
+    Epilogue { bias: true, residual: false, act: Act::Gelu, gated: false, scale: None },
+    Epilogue { bias: true, residual: true, act: Act::Silu, gated: false, scale: None },
+    Epilogue { bias: true, residual: false, act: Act::Silu, gated: true, scale: None },
+    Epilogue { bias: false, residual: true, act: Act::Gelu, gated: true, scale: None },
+    Epilogue { bias: true, residual: true, act: Act::None, gated: false, scale: Some(Scale::new(0.5)) },
+    Epilogue { bias: true, residual: false, act: Act::Silu, gated: true, scale: Some(Scale::new(-1.5)) },
 ];
 
 /// The interpreter applies every epilogue as the f64 reference does.
@@ -134,6 +137,8 @@ const EPILOGUES: [Epilogue; 6] = [
 #[test_case(3; "bias silu residual")]
 #[test_case(4; "bias swiglu")]
 #[test_case(5; "geglu residual")]
+#[test_case(6; "bias half-scaled residual")]
+#[test_case(7; "bias swiglu negative scale")]
 fn epilogue_interpreter_matches_the_reference(which: usize) {
     let (m, n, k, epi) = (64, 64, 64, EPILOGUES[which]);
     let prog = gemm_nt_epilogue(m, n, k, [32, 32, 16], 2, [2, 2], epi);

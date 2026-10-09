@@ -131,11 +131,21 @@ fn linear_reference(x: &Tensor, w: &Tensor, opts: Linear) -> Tensor {
     tk::linear::graph(&f32(x), &f32(w), opts).unwrap()
 }
 
-#[test_case(&[37], 96, 64, Act::Gelu, true, true; "m37 n96 bias gelu residual")]
-#[test_case(&[3, 50], 64, 96, Act::None, false, true; "two lead dims, residual")]
-#[test_case(&[300], 200, 48, Act::Silu, true, false; "bk 16, silu")]
-#[test_case(&[2048], 512, 512, Act::None, false, false; "large plain")]
-fn linear_matches_the_graph(lead: &[usize], n: usize, k: usize, act: Act, bias: bool, residual: bool) {
+#[test_case(&[37], 96, 64, Act::Gelu, true, true, None; "m37 n96 bias gelu residual")]
+#[test_case(&[3, 50], 64, 96, Act::None, false, true, None; "two lead dims, residual")]
+#[test_case(&[300], 200, 48, Act::Silu, true, false, None; "bk 16, silu")]
+#[test_case(&[2048], 512, 512, Act::None, false, false, None; "large plain")]
+#[test_case(&[3, 50], 64, 96, Act::None, true, true, Some(0.5); "half-step residual")]
+#[test_case(&[37], 96, 64, Act::Silu, false, false, Some(-2.0); "scaled silu")]
+fn linear_matches_the_graph(
+    lead: &[usize],
+    n: usize,
+    k: usize,
+    act: Act,
+    bias: bool,
+    residual: bool,
+    scale: Option<f32>,
+) {
     if !device() {
         return;
     }
@@ -143,7 +153,7 @@ fn linear_matches_the_graph(lead: &[usize], n: usize, k: usize, act: Act, bias: 
     let w = rand(&[n, k], 2, 0.5, DType::BFloat16);
     let b = rand(&[n], 3, 1.0, DType::BFloat16);
     let r = rand(&[lead, &[n]].concat(), 4, 2.0, DType::BFloat16);
-    let opts = Linear { bias: bias.then_some(&b), act, gated: false, residual: residual.then_some(&r) };
+    let opts = Linear { bias: bias.then_some(&b), act, gated: false, residual: residual.then_some(&r), scale };
     let y = tk::linear(&x, &w, opts).unwrap();
     assert_kernel(&y, "gemm");
     assert_close("linear", &y, &linear_reference(&x, &w, opts), 2e-2);
@@ -159,7 +169,7 @@ fn gated_linear_matches_the_graph(act: Act, bias: bool) {
     let x = rand(&[m, k], 5, 1.0, DType::BFloat16);
     let w = rand(&[2 * n, k], 6, 0.3, DType::BFloat16);
     let b = rand(&[2 * n], 7, 1.0, DType::BFloat16);
-    let opts = Linear { bias: bias.then_some(&b), act, gated: true, residual: None };
+    let opts = Linear { bias: bias.then_some(&b), act, gated: true, ..Linear::default() };
     let y = tk::linear(&x, &w, opts).unwrap();
     assert_eq!(y.shape().unwrap().to_vec(), [SInt::Const(m), SInt::Const(n)]);
     assert_kernel(&y, "gemm");
@@ -195,7 +205,7 @@ fn linear_under_a_batch_variable() {
     let b = rand(&[2 * n], 13, 1.0, DType::BFloat16);
     let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
     let [xb, rb] = <[Tensor; 2]>::try_from(bound(&[&x, &r], &var)).unwrap();
-    let opts = Linear { bias: Some(&b), act: Act::Silu, gated: true, residual: Some(&rb) };
+    let opts = Linear { bias: Some(&b), act: Act::Silu, gated: true, residual: Some(&rb), scale: Some(0.5) };
     let y = tk::linear(&xb, &w, opts).unwrap();
     assert_eq!(y.shape().unwrap()[0], var.as_sint());
     assert_kernel(&y, "gemm");

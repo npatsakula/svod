@@ -24,8 +24,12 @@ pub fn supported(device: &DeviceSpec) -> bool;
 |---|---|---|
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual }`; gated `w` `[2N, K]` है |
 | `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
+| `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`; gated `w` `[2N, K]` है |
+| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale }` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` `x` जैसा `residual` लेते हैं और `(x + residual, norm)` लौटाते हैं |
+
+`Linear::scale` residual जोड़ने से पहले activated मान को गुणा करता है: `scale·act(x·wᵀ + bias) + residual`, इसलिए Conformer का half-step `x + 0.5·ffn(x)` एक ही GEMM है।
 
 `Attn::keys` `KeyMask::None`, `KeyMask::Lens(&lens)` (`[B]` वैध key गिनतियाँ) या
 `KeyMask::Bool(&mask)` (`[B, Tk]`, जहाँ attend हो वहाँ true) है। `Attn::cache`

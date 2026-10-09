@@ -1,4 +1,5 @@
-//! `act(x·wᵀ + bias) + residual`, or `act(gate)·up + residual` off a gated weight.
+//! `scale·act(x·wᵀ + bias) + residual`, or `scale·act(gate)·up + residual`
+//! off a gated weight.
 
 use snafu::{ResultExt, ensure};
 use svod_ir::SInt;
@@ -6,7 +7,7 @@ use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
 use super::{Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed};
-use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmSpec, Scale, gemm};
 use crate::launch;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -19,6 +20,9 @@ pub struct Linear<'a> {
     pub gated: bool,
     /// `[lead..., N]`, added last.
     pub residual: Option<&'a Tensor>,
+    /// Multiplies the activated (gated) value before the residual add:
+    /// `x + 0.5·ffn(x)` is `residual: Some(x), scale: Some(0.5)`.
+    pub scale: Option<f32>,
 }
 
 const OP: &str = "linear";
@@ -61,8 +65,13 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     let n = n.as_const().expect("planned");
     // A bound batch walks grid z; each batch is a GEMM over the rows behind it.
     let m = lead[usize::from(var.is_some())..].iter().product();
-    let epilogue =
-        Epilogue { bias: opts.bias.is_some(), act: opts.act, gated: opts.gated, residual: opts.residual.is_some() };
+    let epilogue = Epilogue {
+        bias: opts.bias.is_some(),
+        act: opts.act,
+        gated: opts.gated,
+        residual: opts.residual.is_some(),
+        scale: opts.scale.map(Scale::new),
+    };
     let batch = batch_of(&var, 1);
     let spec = |cfg| GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };
     let shape = [batch.capacity(), m, n, k];
@@ -85,6 +94,10 @@ pub(crate) fn graph(x: &Tensor, w: &Tensor, opts: Linear) -> svod_tensor::error:
         activate(&halves[0], opts.act)?.try_mul(&halves[1])?
     } else {
         activate(&y, opts.act)?
+    };
+    let y = match opts.scale {
+        Some(scale) => y.try_mul(scale)?,
+        None => y,
     };
     match opts.residual {
         Some(r) => y.try_add(r),

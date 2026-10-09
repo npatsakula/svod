@@ -1,7 +1,10 @@
-//! `c = act(a·bᵀ + bias) + residual` (or `act(gate)·up` for a gated weight)
-//! as a K-streaming block pipeline with the epilogue on the f32 accumulator.
+//! `c = scale·act(a·bᵀ + bias) + residual` (or `scale·act(gate)·up` for a
+//! gated weight) as a K-streaming block pipeline with the epilogue on the f32
+//! accumulator.
 
-use super::{Act, Batch, batch_offset, bound, load_f32};
+use std::fmt;
+
+use super::{Act, Batch, batch_offset, bound, konst, load_f32};
 use crate::atoms::Target;
 use crate::build::*;
 use crate::ir::*;
@@ -10,7 +13,7 @@ use crate::lower::Lowering;
 use crate::schedule::{Prefetch, Schedule};
 
 /// What runs on the accumulator before the single rounding at the store.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Epilogue {
     /// A `[n]` (`[2n]` gated) bias parameter.
     pub bias: bool,
@@ -20,6 +23,42 @@ pub struct Epilogue {
     pub gated: bool,
     /// A `[m, n]` residual parameter added last.
     pub residual: bool,
+    /// Multiplies the activated (gated) value, before the residual add.
+    pub scale: Option<Scale>,
+}
+
+/// The tune store keys by this text: an epilogue without a scale prints as
+/// it did before the field existed, so its stored choices still apply.
+impl fmt::Debug for Epilogue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("Epilogue");
+        s.field("bias", &self.bias).field("act", &self.act).field("gated", &self.gated);
+        s.field("residual", &self.residual);
+        if let Some(scale) = self.scale {
+            s.field("scale", &scale);
+        }
+        s.finish()
+    }
+}
+
+/// An f32 output scale, compared and hashed by its bits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Scale(u32);
+
+impl Scale {
+    pub const fn new(value: f32) -> Self {
+        Self(value.to_bits())
+    }
+
+    pub fn get(self) -> f32 {
+        f32::from_bits(self.0)
+    }
+}
+
+impl fmt::Debug for Scale {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,6 +153,10 @@ pub fn gemm<T: Elem>(spec: &GemmSpec) -> Program {
     let mut out = epi.act.apply(&mut k, first);
     if let Some(up) = up {
         out = k.binary(out, up, BinaryOp::Mul);
+    }
+    if let Some(scale) = epi.scale {
+        let s = konst(&mut k, out, f64::from(scale.get()));
+        out = k.binary(out, s, BinaryOp::Mul);
     }
     let tile = |k: &mut Kernel, p: ParamRef<T>| {
         let v = k.view(p, batch_offset(&bb, m * n), [n, 1], Shape::new(bm, bn), [m_bound.clone(), n_bound.clone()]);
