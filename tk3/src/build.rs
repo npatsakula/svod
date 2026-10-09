@@ -239,7 +239,8 @@ impl Kernel {
 
     /// A `shape` window at `offset` elements into `param`, rows `stride.0`
     /// apart and columns `stride.1` apart; `bounds` are its valid row/column
-    /// counts (reads past them yield zero, writes are dropped).
+    /// counts: writes past them are dropped, register loads read zero, and a
+    /// fill into shared memory clamps (see [`Place::Global`]).
     pub fn view<T: Elem>(
         &mut self,
         param: ParamRef<T>,
@@ -251,19 +252,49 @@ impl Kernel {
         let offset = self.intern(offset);
         let stride = stride.map(|s| self.intern(s));
         let bounds = bounds.map(|b| b.map(|s| self.intern(s)));
-        Tile::new(self.value(T::DTYPE, shape, Place::Global { param: param.0, offset, stride, bounds }))
+        Tile::new(self.value(T::DTYPE, shape, Place::Global { param: param.0, offset, stride, bounds, rows: None }))
+    }
+
+    /// A `shape` window of contiguous columns whose row `r` starts at
+    /// `offset + rows[Row := r]` (see [`Self::row`]) and reads zero wherever
+    /// `valid[Row := r]` is zero, on every path; `col_bound` is a plain column
+    /// bound.
+    pub fn gather<T: Elem>(
+        &mut self,
+        param: ParamRef<T>,
+        offset: impl Into<Sc>,
+        rows: Sc,
+        valid: Option<Sc>,
+        shape: Shape,
+        col_bound: Option<Sc>,
+    ) -> Gmem<T> {
+        let offset = self.intern(offset);
+        let rows = RowMap { offset: self.intern(rows), valid: valid.map(|v| self.intern(v)) };
+        let stride = [self.intern(0), self.intern(1)];
+        let bounds = [None, col_bound.map(|b| self.intern(b))];
+        Tile::new(self.value(
+            T::DTYPE,
+            shape,
+            Place::Global { param: param.0, offset, stride, bounds, rows: Some(rows) },
+        ))
+    }
+
+    /// The row coordinate a [`Self::gather`] map is evaluated at.
+    pub fn row(&mut self) -> Sc {
+        self.scalar(Scalar::Row)
     }
 
     /// The same window moved by `rows`/`cols` elements, keeping its bounds
-    /// relative to the new origin.
+    /// relative to the new origin. A gathered view moves along its columns only.
     pub fn at<T: Elem>(&mut self, view: Gmem<T>, rows: impl Into<Sc>, cols: impl Into<Sc>) -> Gmem<T> {
         let (rows, cols) = (rows.into(), cols.into());
         let Value { dtype, shape, place } = self.prog.value(view.0).clone();
-        let Place::Global { param, offset, stride, bounds } = place else { unreachable!("global tier") };
+        let Place::Global { param, offset, stride, bounds, rows: map } = place else { unreachable!("global tier") };
+        assert!(map.is_none() || rows == Sc::Const(0), "a gathered view moves along its columns only");
         let moved = Sc::Id(offset) + rows.clone() * Sc::Id(stride[0]) + cols.clone() * Sc::Id(stride[1]);
         let offset = self.intern(moved);
         let bounds = [(bounds[0], rows), (bounds[1], cols)].map(|(b, by)| b.map(|b| self.intern(Sc::Id(b) - by)));
-        Tile::new(self.value(dtype, shape, Place::Global { param, offset, stride, bounds }))
+        Tile::new(self.value(dtype, shape, Place::Global { param, offset, stride, bounds, rows: map }))
     }
 
     pub fn smem_view<T: Elem>(&mut self, alloc: SmemId, offset: impl Into<Sc>, shape: Shape) -> Shared<T> {

@@ -97,6 +97,41 @@ fn cp_async_ca_selects_the_sized_form(bytes: usize) {
     }
 }
 
+/// Lanes past the first half copy zero source bytes: the predicated form
+/// takes the size as its third operand and lands in PTX as `src_size`.
+#[test]
+fn cp_async_16_zfill_passes_the_source_size() {
+    let l = lane();
+    let tile = UOp::buffer(0, 256, DType::BFloat16, AddrSpace::Local, None);
+    let chunk = imul(&l, 8);
+    let live = l.try_cmplt(&UOp::native_const(16i32)).unwrap();
+    let bytes = UOp::try_where(live, UOp::native_const(16i32), UOp::native_const(0i32)).unwrap();
+    let copy =
+        cp_async_16_zfill(&shared_at(&tile, chunk.clone()), &global_at(0, DType::BFloat16, chunk.clone()), &bytes);
+    let barrier = cp_async_wait_all(smallvec![cp_async_commit(smallvec![copy])]).barrier(smallvec![]);
+    let value = UOp::load().index(shared_at(&tile.after(smallvec![barrier]), chunk.clone())).call();
+    let kernel = UOp::sink(vec![global_at(1, DType::BFloat16, chunk).store(value)]);
+    let rendered = render_nvptx_linearized(&kernel, SM86, "nvptx_cp_async_zfill");
+    let call = "call void @llvm.nvvm.cp.async.cg.shared.global.16.s(ptr addrspace(3) %";
+    assert!(rendered.code.contains(call) && rendered.code.contains(", i32 %"), "missing {call}:\n{}", rendered.code);
+    if let Some(ptx) = assert_ptx_compiles(&rendered.code, SM86) {
+        assert!(
+            ptx.contains("cp.async.cg.shared.global [%r") || ptx.contains("cp.async.cg.shared.global [%rd"),
+            "{ptx}"
+        );
+        assert!(ptx.contains("], 16, %r"), "the source size is a register operand:\n{ptx}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "src_size must be i32")]
+fn cp_async_zfill_takes_an_i32_size() {
+    let l = lane();
+    let tile = UOp::buffer(0, 256, DType::BFloat16, AddrSpace::Local, None);
+    let bytes = UOp::native_const(16i64);
+    cp_async_16_zfill(&shared_at(&tile, l.clone()), &global_at(0, DType::BFloat16, l), &bytes);
+}
+
 #[test]
 #[should_panic(expected = "no 8-byte form")]
 fn cp_async_cg_is_16_bytes_only() {

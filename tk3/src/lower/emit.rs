@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 use svod_codegen::llvm::nvptx::ops::shfl_bfly;
-use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_commit, cp_async_wait, ldmatrix};
+use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill, cp_async_commit, cp_async_wait, ldmatrix};
 use svod_dtype::{AddrSpace, DType, DeviceSpec, GpuArch, ScalarDType};
 use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp};
 
@@ -52,6 +52,10 @@ struct Emit<'a> {
     /// The level every hoisted value sits at.
     levels: HashMap<u64, usize>,
     scalars: HashMap<ScalarId, (usize, Arc<UOp>)>,
+    /// Scalars over [`Scalar::Row`], memoized per row value they were taken at.
+    row_scalars: HashMap<(ScalarId, u64), (usize, Arc<UOp>)>,
+    /// Whether each scalar reads [`Scalar::Row`].
+    row_dep: Vec<bool>,
     inductions: HashMap<ScalarId, (usize, Arc<UOp>)>,
     /// Register buffer of every register value (carried values share one).
     regs: HashMap<ValId, Arc<UOp>>,
@@ -100,6 +104,10 @@ impl<'a> Emit<'a> {
                 alias.insert(c.init, c.phi);
             }
         }
+        let mut row_dep = vec![None; prog.scalars.len()];
+        for id in 0..prog.scalars.len() {
+            reads_row(prog, ScalarId(id as u32), &mut row_dep);
+        }
         Self {
             prog,
             lay,
@@ -110,6 +118,8 @@ impl<'a> Emit<'a> {
             headers: vec![0],
             levels: HashMap::new(),
             scalars: HashMap::new(),
+            row_scalars: HashMap::new(),
+            row_dep: row_dep.into_iter().map(|d| d.expect("every scalar visited")).collect(),
             inductions: HashMap::new(),
             regs: HashMap::new(),
             alias,
@@ -214,10 +224,27 @@ impl<'a> Emit<'a> {
     // ---- scalars ----------------------------------------------------------
 
     fn scalar(&mut self, id: ScalarId) -> (usize, Arc<UOp>) {
-        if let Some(found) = self.scalars.get(&id) {
+        self.scalar_at(id, None)
+    }
+
+    /// `id` with [`Scalar::Row`] bound to `row`. A row-dependent value is
+    /// memoized per row value, so every chunk of a fill gets its own and
+    /// whatever only depends on the row and the block is listed once, in the
+    /// prologue.
+    fn scalar_at(&mut self, id: ScalarId, row: Option<&Arc<UOp>>) -> (usize, Arc<UOp>) {
+        let row = row.filter(|_| self.row_dep[id.index()]);
+        let found = match row {
+            Some(r) => self.row_scalars.get(&(id, r.id)),
+            None => self.scalars.get(&id),
+        };
+        if let Some(found) = found {
             return found.clone();
         }
         let (level, u) = match self.prog.scalar(id) {
+            Scalar::Row => {
+                let row = row.expect("a row map is evaluated at a row").clone();
+                return (self.level_of(&row), row);
+            }
             // Constants have no position: an unlisted node lands before its first user.
             Scalar::Const(v) => {
                 let u = c32(*v);
@@ -232,7 +259,7 @@ impl<'a> Emit<'a> {
             Scalar::Special(Special::Warp) => (0, self.warp.clone()),
             Scalar::Induction => return self.inductions[&id].clone(),
             Scalar::Bin(op, a, b) => {
-                let ((la, a), (lb, b)) = (self.scalar(*a), self.scalar(*b));
+                let ((la, a), (lb, b)) = (self.scalar_at(*a, row), self.scalar_at(*b, row));
                 let u = match op {
                     BinOp::Add => a.try_add(&b),
                     BinOp::Sub => a.try_sub(&b),
@@ -250,7 +277,7 @@ impl<'a> Emit<'a> {
                 (la.max(lb), u.expect("i32 scalar"))
             }
             Scalar::Load { param, index } => {
-                let (level, index) = self.scalar(*index);
+                let (level, index) = self.scalar_at(*index, row);
                 let buf = self.params[param.index()].clone();
                 let idx = self.access(&buf, &index, 1);
                 let tag = self.next_tag();
@@ -259,7 +286,10 @@ impl<'a> Emit<'a> {
             }
         };
         let u = self.hoist(u);
-        self.scalars.insert(id, (level, u.clone()));
+        match row {
+            Some(r) => self.row_scalars.insert((id, r.id), (level, u.clone())),
+            None => self.scalars.insert(id, (level, u.clone())),
+        };
         (level, u)
     }
 
@@ -361,6 +391,20 @@ impl<'a> Emit<'a> {
     /// an epilogue after the loop may still use them.
     fn address(&mut self, view: &View, row: &Arc<UOp>, col: &Arc<UOp>) -> (Arc<UOp>, Option<Arc<UOp>>) {
         match &view.place {
+            Place::Global { offset, stride, bounds, rows: Some(map), .. } => {
+                let ((_, offset), (_, s1)) = (self.scalar(*offset), self.scalar(stride[1]));
+                let (_, start) = self.scalar_at(map.offset, Some(row));
+                // The view's offset moves per step; the row's start and the
+                // column are listed where their inputs are.
+                let off = add(&offset, &add(&start, &mul(col, &s1)));
+                let valid = map.valid.map(|v| {
+                    let (_, v) = self.scalar_at(v, Some(row));
+                    v.try_cmpne(&c32(0)).expect("row gate")
+                });
+                let in_cols = bounds[1].map(|b| col.try_cmplt(&self.sc(b)).expect("bound compare"));
+                let gate = valid.into_iter().chain(in_cols).reduce(|a, b| a.try_and_op(&b).expect("and"));
+                (self.hoist(off), gate.map(|g| self.hoist(g)))
+            }
             Place::Global { offset, stride, bounds, .. } => {
                 let ((l0, offset), (l1, s0), (l2, s1)) =
                     (self.scalar(*offset), self.scalar(stride[0]), self.scalar(stride[1]));
@@ -559,6 +603,7 @@ impl<'a> Emit<'a> {
         self.levels.insert(value.id, level);
         self.inductions.insert(iv, (level, value));
         self.scalars.retain(|_, (l, _)| *l < level);
+        self.row_scalars.retain(|_, (l, _)| *l < level);
     }
 
     /// One iteration's body; a carried value moves into its `phi` right where
@@ -650,7 +695,8 @@ impl<'a> Emit<'a> {
             cols % chunk == 0 && chunks % threads == 0,
             UnsupportedSnafu { what: format!("a {}×{} fill by {threads} threads", d.shape.rows, cols) }
         );
-        let Place::Global { stride, bounds, .. } = &s.place else { unreachable!() };
+        let Place::Global { stride, bounds, rows, .. } = &s.place else { unreachable!() };
+        let gathered = rows.is_some();
         snafu::ensure!(
             matches!(self.prog.scalar(stride[1]), Scalar::Const(1)),
             UnsupportedSnafu { what: "a fill from a column-strided view" }
@@ -671,13 +717,30 @@ impl<'a> Emit<'a> {
                 }
                 None => row.clone(),
             };
-            let (src_off, _) = self.address(&s, &src_row, &col);
+            let (src_off, gate) = self.address(&s, &src_row, &col);
+            // A plain view's fill clamps (above); a gathered row outside its
+            // map lands as zeros, from element 0 of the operand.
+            let gate = gate.filter(|_| gathered);
+            let src_off = match &gate {
+                Some(g) => self.hoist(UOp::try_where(g.clone(), src_off, c32(0)).expect("safe offset")),
+                None => src_off,
+            };
             let (dst_off, _) = self.address(&d, &row, &col);
             if cuda && mode == CopyMode::Async && self.low.target.cp_async {
                 let (dst, src) = (self.access(&d.buf, &dst_off, 1), self.access(&s.buf, &src_off, 1));
-                self.push(cp_async_16(&dst, &src));
+                match gate {
+                    Some(g) => {
+                        let bytes = self.hoist(UOp::try_where(g, c32(16), c32(0)).expect("source size"));
+                        self.push(cp_async_16_zfill(&dst, &src, &bytes))
+                    }
+                    None => self.push(cp_async_16(&dst, &src)),
+                };
             } else {
                 let v = self.mem_load(&s.buf, &src_off, chunk as u32, None);
+                let v = match gate {
+                    Some(g) => zeroed(&g, v),
+                    None => v,
+                };
                 let vals = (0..chunk as usize).map(|e| elem(&v, e, chunk as usize)).collect();
                 self.mem_store(&d.buf, &dst_off, vals);
             }
@@ -752,13 +815,23 @@ impl<'a> Emit<'a> {
         Ok(())
     }
 
+    /// Global → registers: past a plain bound the load is gated; a gathered
+    /// row outside its map reads element 0 and one select zeroes the run.
     fn load_regs(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let l = self.layout(dst).clone();
         let s = self.view(src);
+        let gathered = matches!(s.place, Place::Global { rows: Some(_), .. });
         for (j, w) in Self::runs(&l, self.low.target.wave, 16 / s.dtype.bytes() as u32) {
             let (row, col) = self.coord(&l, j);
             let (off, gate) = self.address(&s, &row, &col);
-            let v = self.mem_load(&s.buf, &off, w, gate.as_ref());
+            let v = match gate {
+                Some(g) if gathered => {
+                    let safe = self.hoist(UOp::try_where(g.clone(), off, c32(0)).expect("safe offset"));
+                    let v = self.mem_load(&s.buf, &safe, w, None);
+                    zeroed(&g, v)
+                }
+                gate => self.mem_load(&s.buf, &off, w, gate.as_ref()),
+            };
             let vals = (0..w as usize).map(|e| elem(&v, e, w as usize)).collect();
             self.reg_store(dst, j, vals);
         }
@@ -1060,4 +1133,26 @@ impl<'a> Emit<'a> {
             }
         }
     }
+}
+
+/// `v` where `gate` holds, else zeros: one select over the whole run (a
+/// multiply would turn an Inf read in its place into NaN).
+fn zeroed(gate: &Arc<UOp>, v: Arc<UOp>) -> Arc<UOp> {
+    let zero = v.vconst_like(0);
+    UOp::try_where(gate.clone(), v, zero).expect("zero fill")
+}
+
+/// Whether scalar `id` reads [`Scalar::Row`], memoized in `memo`.
+fn reads_row(prog: &Program, id: ScalarId, memo: &mut Vec<Option<bool>>) -> bool {
+    if let Some(known) = memo[id.index()] {
+        return known;
+    }
+    let dep = match prog.scalar(id) {
+        Scalar::Row => true,
+        Scalar::Bin(_, a, b) => reads_row(prog, *a, memo) | reads_row(prog, *b, memo),
+        Scalar::Load { index, .. } => reads_row(prog, *index, memo),
+        Scalar::Const(_) | Scalar::Var(_) | Scalar::Special(_) | Scalar::Induction => false,
+    };
+    memo[id.index()] = Some(dep);
+    dep
 }

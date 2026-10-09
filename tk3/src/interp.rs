@@ -105,14 +105,20 @@ pub fn run(prog: &Program, params: Vec<Vec<f64>>, vars: &[(&str, i64)]) -> Resul
 
 impl Frame<'_> {
     fn scalar(&self, id: ScalarId) -> Option<i64> {
+        self.scalar_at(id, None)
+    }
+
+    /// `id` with [`Scalar::Row`] bound to `row`.
+    fn scalar_at(&self, id: ScalarId, row: Option<i64>) -> Option<i64> {
         Some(match self.prog.scalar(id) {
+            Scalar::Row => row?,
             Scalar::Const(v) => *v,
             Scalar::Var(name) => *self.vars.get(name)?,
             Scalar::Special(Special::Block(axis)) => self.block[*axis as usize],
             Scalar::Special(Special::Warp) => self.warp,
             Scalar::Induction => *self.induction.get(&id)?,
             Scalar::Bin(op, a, b) => {
-                let (a, b) = (self.scalar(*a)?, self.scalar(*b)?);
+                let (a, b) = (self.scalar_at(*a, row)?, self.scalar_at(*b, row)?);
                 match op {
                     BinOp::Add => a + b,
                     BinOp::Sub => a - b,
@@ -129,7 +135,7 @@ impl Frame<'_> {
                 }
             }
             Scalar::Load { param, index } => {
-                let index = self.scalar(*index)?;
+                let index = self.scalar_at(*index, row)?;
                 self.globals[param.index()].get(index as usize).copied().unwrap_or(0.0) as i64
             }
         })
@@ -216,11 +222,15 @@ impl Frame<'_> {
         match place {
             Place::Reg => Some(r * cols + c),
             Place::Smem { offset, .. } => Some(self.must(*offset) as usize + r * cols + c),
-            Place::Global { offset, stride, bounds, .. } => {
+            Place::Global { offset, stride, bounds, rows, .. } => {
                 let inside = |b: Option<ScalarId>, i: usize| b.is_none_or(|b| (i as i64) < self.must(b));
-                (inside(bounds[0], r) && inside(bounds[1], c)).then(|| {
-                    (self.must(*offset) + r as i64 * self.must(stride[0]) + c as i64 * self.must(stride[1])) as usize
-                })
+                let at = |id: ScalarId| self.scalar_at(id, Some(r as i64)).expect("a defined row map");
+                let (row_ok, row_off) = match rows {
+                    Some(map) => (map.valid.is_none_or(|v| at(v) != 0), at(map.offset)),
+                    None => (inside(bounds[0], r), r as i64 * self.must(stride[0])),
+                };
+                (row_ok && inside(bounds[1], c))
+                    .then(|| (self.must(*offset) + row_off + c as i64 * self.must(stride[1])) as usize)
             }
         }
     }

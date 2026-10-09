@@ -83,14 +83,30 @@ pub enum Place {
         offset: ScalarId,
     },
     /// `param[offset + r·stride.0 + c·stride.1]`, in elements; `bounds` are
-    /// the valid row/col counts of the window (`None` = fully in bounds), so
-    /// loads past them are gated and stores past them dropped.
+    /// the valid row/col counts of the window (`None` = fully in bounds).
+    /// Stores past them are dropped and register loads past them read zero,
+    /// but a fill into shared memory re-reads the last valid row past the
+    /// row bound and ignores the column bound: what it stages there is only
+    /// ever consumed into rows or columns the store drops.
+    ///
+    /// With `rows`, row `r` starts at `offset + rows.offset[Row := r]`
+    /// instead (`stride.0` is unused) and a row outside `rows.valid` reads
+    /// zero on every path, fills included: a gather whose padding is data.
     Global {
         param: ParamId,
         offset: ScalarId,
         stride: [ScalarId; 2],
         bounds: [Option<ScalarId>; 2],
+        rows: Option<RowMap>,
     },
+}
+
+/// A per-row offset and validity, expressions over [`Scalar::Row`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RowMap {
+    pub offset: ScalarId,
+    /// Nonzero where the row is in bounds; `None`: every row is.
+    pub valid: Option<ScalarId>,
 }
 
 /// Scalar expressions live in an arena and are shared by index.
@@ -108,6 +124,8 @@ pub enum Scalar {
         param: ParamId,
         index: ScalarId,
     },
+    /// The row coordinate inside the view whose [`RowMap`] reads it.
+    Row,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
