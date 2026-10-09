@@ -248,9 +248,10 @@ fn every_family_assembles_for_hopper() {
 /// barriers, relayouts): the bookkeeping the target's template adds keeps
 /// the numerics.
 #[test_case(hopper(); "sm_90")]
-#[test_case(rdna(AmdArch::Gfx1201, 64); "gfx1201")]
-#[test_case(rdna(AmdArch::Gfx1151, 40); "gfx1151")]
-#[test_case(rdna(AmdArch::Gfx1100, 96); "gfx1100")]
+#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
+#[test_case(amd(AmdArch::Gfx1100, 96); "gfx1100")]
+#[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
 fn lowering_keeps_the_interpreted_result(target: Target) {
     for (name, prog, lowering) in families(&target) {
         let params = inputs(&name, &prog);
@@ -265,18 +266,19 @@ fn lowering_keeps_the_interpreted_result(target: Target) {
     }
 }
 
-/// A Radeon with `cus` compute units and 64 KB of LDS per workgroup.
-pub(super) fn rdna(arch: AmdArch, cus: u32) -> Target {
+/// An AMD GPU with `cus` compute units and 64 KB of LDS per workgroup.
+pub(super) fn amd(arch: AmdArch, cus: u32) -> Target {
     Target { sms: Some(cus), ..Target::for_arch(GpuArch::Amd(arch)) }
 }
 
-/// RDNA WMMA with register-staged fills: every family lowers for the
-/// target and, where clang has the AMDGPU backend, compiles to a code
-/// object holding the kernel's descriptor.
-#[test_case(rdna(AmdArch::Gfx1201, 64); "gfx1201")]
-#[test_case(rdna(AmdArch::Gfx1151, 40); "gfx1151")]
-#[test_case(rdna(AmdArch::Gfx1100, 96); "gfx1100")]
-fn every_family_compiles_for_rdna(target: Target) {
+/// RDNA WMMA and CDNA MFMA with register-staged fills: every family lowers
+/// for the target and, where clang has the AMDGPU backend, compiles to a
+/// code object holding the kernel's descriptor.
+#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
+#[test_case(amd(AmdArch::Gfx1100, 96); "gfx1100")]
+#[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
+fn every_family_compiles_for_amd(target: Target) {
     assert!(config::has_tables(&target));
     let GpuArch::Amd(arch) = target.arch else { unreachable!() };
     for (name, prog, lowering) in families(&target) {
@@ -393,13 +395,14 @@ fn register_staged_families_match_on_cuda() {
     check_on_device(&Target { cp_async: false, ldmatrix: false, ..target });
 }
 
-/// Every candidate the op layer may plan on RDNA lowers (the tune store
+/// Every candidate the op layer may plan on AMD lowers (the tune store
 /// would otherwise time a failure): the GEMM lists of a large, a small-M and
 /// a ragged shape, the attention lists of every head size and both query
 /// regimes, and the convolution lists of every YOLO class.
-#[test_case(rdna(AmdArch::Gfx1201, 64); "gfx1201")]
-#[test_case(rdna(AmdArch::Gfx1151, 40); "gfx1151")]
-fn every_rdna_candidate_lowers(target: Target) {
+#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
+#[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
+fn every_amd_candidate_lowers(target: Target) {
     let mut gemms = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
         for gated in [false, true] {
