@@ -127,7 +127,7 @@ jobs:
           wait_for_crate svod-tensor "$VERSION"
           wait_for_crate svod-arch "$VERSION"
 
-          # L7: svod-tk, svod-tk3, svod-onnx (no inter-dep); svod-tk3 must precede svod-model
+          # L7: svod-tk, svod-tk3, svod-onnx (no inter-dep); svod-tk and svod-tk3 must precede svod-model
           publish_crate svod-tk &
           publish_crate svod-tk3 &
           publish_crate svod-onnx &
@@ -136,7 +136,7 @@ jobs:
           wait_for_crate svod-tk3 "$VERSION"
           wait_for_crate svod-onnx "$VERSION"
 
-          # L8: svod-model (depends on svod-tk3)
+          # L8: svod-model (depends on svod-tk and svod-tk3)
           publish_crate svod-model
           wait_for_crate svod-model "$VERSION"
           echo "All crates published successfully!"
