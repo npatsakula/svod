@@ -198,7 +198,7 @@ pub fn measure(candidates: impl IntoIterator<Item = Candidate>) -> Vec<Option<u6
             })
             .sum::<Option<Duration>>()
     };
-    round_robin_min(plans.len(), ROUNDS, time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
+    round_robin_min(plans.len(), ROUNDS, None, time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
 }
 
 fn scratch_plan(prog: Program, lowering: &Lowering) -> Option<ExecutionPlan> {

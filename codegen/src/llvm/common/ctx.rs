@@ -49,6 +49,7 @@ impl RenderContext {
             loop_hint: None,
             unhinted: HashSet::new(),
             loops: 0,
+            dynamic_locals: HashMap::new(),
         }
     }
 
@@ -79,7 +80,6 @@ impl RenderContext {
                 .chain((1..=self.loops).map(|n| format!("!{n} = distinct !{{!{n}, !0}}")))
                 .collect(),
             _ => Vec::new(),
-            dynamic_locals: HashMap::new(),
         }
     }
 

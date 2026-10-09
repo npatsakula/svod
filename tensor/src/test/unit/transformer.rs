@@ -629,6 +629,9 @@ crate::codegen_tests! {
         let result = weight.embedding(&ids).unwrap();
         result.realize_with(&config).unwrap();
         assert_eq!(result.as_vec::<f32>().unwrap(), vec![5.0, 255.0, 44.0, 0.0]);
+    }
+}
+
 /// The one-hot sum over the vocabulary collapses to an indexed load, whatever
 /// integer type the indices have: no kernel keeps a reduce.
 #[test_case(DType::Int32 ; "int32 indices")]
