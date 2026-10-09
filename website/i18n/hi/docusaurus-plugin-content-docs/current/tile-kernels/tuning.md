@@ -73,10 +73,10 @@ SVOD_DEVICE=CUDA:0 cargo test -p svod-tk3 --lib --release -- --ignored --nocaptu
 
 | Probe | क्या छापता है |
 |---|---|
-| `gemm_throughput_probe` | 4096³ पर tk1 के मुक़ाबले tk3 GEMM configs, TFLOP/s |
+| `gemm_throughput_probe` | 4096³ पर tk3 GEMM configs, TFLOP/s |
 | `gemm_candidates_probe` | Nemotron के projection shapes और 4096³ पर हर GEMM candidate, untuned चुनाव और विजेता |
-| `attention_throughput_probe` | tk1 के मुक़ाबले flash attention (B 4, H 8, T 2048; d 64/128, causal और non-causal) |
-| `decode_throughput_probe` | tk1 के मुक़ाबले Whisper large-v3 decoder step का self और cross attention |
+| `attention_throughput_probe` | Flash attention (B 4, H 8, T 2048; d 64/128, causal और non-causal) |
+| `decode_throughput_probe` | Whisper large-v3 decoder step का self और cross attention |
 | `first_execution_probe` | Graph GEMM के मुक़ाबले tk3 GEMM को बनाने, lower करने और prepare करने की host लागत |
 
 आख़िरी probe ने वे host लागतें मापीं जिन्होंने `launch.rs` को आकार दिया। एक GEMM body को lower करने

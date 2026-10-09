@@ -58,7 +58,5 @@ data है, जिसे lowering और op layer चुनते हैं:
 | AMD CDNA: ping-pong template, MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ; remote MI300X hardware पर मापा जाना है |
 | AMD RDNA, Apple | सिर्फ़ atoms; न tables, न emit किए गए कर्नेल |
 | Warp roles, role barriers, raw asm statements | IR में रिकॉर्ड होते हैं, lowering उन्हें ठुकराती है |
-| मॉडलों में decode attention | Cache-mode कर्नेल मौजूद है; कोई मॉडल अभी उसे इस्तेमाल नहीं करता |
-| Convolution (implicit GEMM) | शुरू नहीं हुआ |
+| Convolution (implicit GEMM) | tk3 में शुरू नहीं हुआ; YOLO का convolution tk1 पर चलता है |
 | fp8/int8 weights, GEMV + argmax, persistent grid, attention backward | शुरू नहीं हुआ |
-| tk1 को रिटायर करना | ऊपर के उन आइटमों पर निर्भर जिनकी मॉडलों को अब भी tk1 से ज़रूरत है |

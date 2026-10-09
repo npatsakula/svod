@@ -75,10 +75,10 @@ SVOD_DEVICE=CUDA:0 cargo test -p svod-tk3 --lib --release -- --ignored --nocaptu
 
 | Проба | Печатает |
 |---|---|
-| `gemm_throughput_probe` | Конфигурации GEMM tk3 против tk1 на 4096³, TFLOP/s |
+| `gemm_throughput_probe` | Конфигурации GEMM tk3 на 4096³, TFLOP/s |
 | `gemm_candidates_probe` | Каждого кандидата GEMM на формах проекций Nemotron и 4096³, выбор без тюнинга и победителя |
-| `attention_throughput_probe` | Flash attention (B 4, H 8, T 2048; d 64/128, causal и без) против tk1 |
-| `decode_throughput_probe` | Self и cross attention одного шага декодера Whisper large-v3 против tk1 |
+| `attention_throughput_probe` | Flash attention (B 4, H 8, T 2048; d 64/128, causal и без) |
+| `decode_throughput_probe` | Self и cross attention одного шага декодера Whisper large-v3 |
 | `first_execution_probe` | Стоимость на хосте сборки, понижения и подготовки GEMM tk3 против GEMM графа |
 
 Последняя проба замерила стоимость на хосте, которая сформировала `launch.rs`. Понижение тела

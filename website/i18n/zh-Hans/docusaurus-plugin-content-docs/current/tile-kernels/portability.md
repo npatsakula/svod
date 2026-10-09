@@ -51,7 +51,5 @@ sidebar_label: 可移植性
 | AMD CDNA：ping-pong 模板、MFMA 32×32、`buffer_load … lds` | 未开始；将在远程 MI300X 硬件上测量 |
 | AMD RDNA、Apple | 仅有原子；没有配置表，没有发射的内核 |
 | Warp 角色、角色屏障、原始 asm 语句 | 可在 IR 中记录，但被降级拒绝 |
-| 模型中的解码注意力 | 缓存模式内核已存在；尚无模型使用 |
-| 卷积（隐式 GEMM） | 未开始 |
+| 卷积（隐式 GEMM） | tk3 中未开始；YOLO 的卷积运行在 tk1 上 |
 | fp8/int8 权重、GEMV + argmax、持久化网格、注意力反向 | 未开始 |
-| 淘汰 tk1 | 等待上述模型仍需从 tk1 获得的项目完成 |

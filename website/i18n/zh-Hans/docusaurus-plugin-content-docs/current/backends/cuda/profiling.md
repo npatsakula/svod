@@ -111,7 +111,13 @@ SVOD_PMC: 2 of 5 requested counters are not collected on this backend
 限制的内核和受发射限制的内核区分开。
 
 ```bash
-SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo bench -p svod-tk --bench matmul -- --profile-time 5
+SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
+```
+
+tk3 的吞吐量探针只为手写内核计时。它们读取事件时间戳，而不是计数器：
+
+```bash
+SVOD_DEVICE=CUDA:0 cargo test -p svod-tk3 --release --lib gemm_throughput_probe -- --ignored --nocapture
 ```
 
 ### 权限

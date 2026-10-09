@@ -111,8 +111,8 @@ The attention throughput probe (B 4, H 8, T 2048, bf16) measured in TFLOP/s agai
 | d 128 | 22.3 | 22.3 |
 | d 128 causal | 20.9 | 16.5 |
 
-The decode probe times one Whisper large-v3 decoder step's attention in µs. The kernels run on
-the model's shapes, but the Whisper model does not call them yet:
+The decode probe times one Whisper large-v3 decoder step's attention in µs. The Whisper decoder
+step calls these kernels:
 
 | Case | tk3 | tk1 |
 |---|---|---|

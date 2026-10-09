@@ -74,10 +74,10 @@ SVOD_DEVICE=CUDA:0 cargo test -p svod-tk3 --lib --release -- --ignored --nocaptu
 
 | Probe | Prints |
 |---|---|
-| `gemm_throughput_probe` | tk3 GEMM configs against tk1 at 4096³, TFLOP/s |
+| `gemm_throughput_probe` | tk3 GEMM configs at 4096³, TFLOP/s |
 | `gemm_candidates_probe` | Every GEMM candidate on Nemotron's projection shapes and 4096³, the untuned pick and the winner |
-| `attention_throughput_probe` | Flash attention (B 4, H 8, T 2048; d 64/128, causal and not) against tk1 |
-| `decode_throughput_probe` | A Whisper large-v3 decoder step's self and cross attention against tk1 |
+| `attention_throughput_probe` | Flash attention (B 4, H 8, T 2048; d 64/128, causal and not) |
+| `decode_throughput_probe` | A Whisper large-v3 decoder step's self and cross attention |
 | `first_execution_probe` | Host cost of building, lowering and preparing a tk3 GEMM against a graph GEMM |
 
 The last probe measured the host costs that shaped `launch.rs`. Lowering a GEMM body costs
