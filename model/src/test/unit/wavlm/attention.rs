@@ -1,8 +1,10 @@
 use svod_dtype::DType;
 use svod_tensor::nn::{Layer, Linear, Module};
 use svod_tensor::{Tensor, s};
+use test_case::test_case;
 
 use crate::init::fan_in_uniform;
+use crate::state::cast_all;
 use crate::wavlm::{
     GatedRelPosAttention, WavLmConfig, compute_bucket_indices, compute_position_bias, wavlm_large_s80_md,
 };
@@ -186,6 +188,33 @@ fn attention_matches_reference_formula() {
     for (a, b) in got.iter().zip(&want) {
         assert!((a - b).abs() < 1e-5, "attention mismatch: {a} vs {b}");
     }
+}
+
+/// The 16-bit forward (tk3's flash attention with the gated bias on a GPU,
+/// the graph elsewhere) against the f32 formula: pruned heads of width 64,
+/// two batches, a length off every tile.
+#[test_case(DType::Float16; "f16")]
+#[test_case(DType::BFloat16; "bf16")]
+fn half_attention_matches_reference_formula(dtype: DType) {
+    let mut cfg = wavlm_large_s80_md();
+    cfg.encoder_embed_dim = 256;
+    cfg.encoder_head_dim = 64;
+    cfg.encoder_total_num_heads = vec![4; cfg.encoder_num_layers];
+    cfg.encoder_remaining_heads = (0..cfg.encoder_num_layers).map(|_| vec![0, 2, 3]).collect();
+    let attn = GatedRelPosAttention::empty(&cfg, 0);
+    let (l, embed) = (37usize, cfg.encoder_embed_dim);
+    let x = ramp(&[2, l, embed]);
+    let rel_embed = fan_in_uniform(&[cfg.encoder_num_buckets, attn.total_num_heads], 4, DType::Float32);
+    let pb = compute_position_bias(&rel_embed, l, l, cfg.encoder_num_buckets, cfg.encoder_max_distance).unwrap();
+    let want = reference_attention(&attn, &x, &pb, cfg.encoder_head_dim).to_vec::<f32>().unwrap();
+
+    let mut half = attn.clone();
+    half.load_state_dict(&cast_all(&attn.state_dict(""), dtype.clone()), "").unwrap();
+    let got = half.forward(&x.cast(dtype.clone()), &pb.cast(dtype)).unwrap();
+    let got = got.cast(DType::Float32).to_vec::<f32>().unwrap();
+    assert_eq!(got.len(), want.len());
+    let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs() / b.abs().max(1.0)).fold(0.0f32, f32::max);
+    assert!(worst < 3e-2, "max relative error {worst}");
 }
 
 /// A deterministic non-constant input: `sin` over the flattened index.

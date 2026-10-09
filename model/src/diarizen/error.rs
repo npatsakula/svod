@@ -10,6 +10,11 @@ pub enum Error {
         #[snafu(source(from(svod_tensor::error::Error, Box::new)))]
         source: Box<svod_tensor::error::Error>,
     },
+    #[snafu(display("{source}"), context(false))]
+    Ops {
+        #[snafu(source(from(svod_tk3::ops::Error, Box::new)))]
+        source: Box<svod_tk3::ops::Error>,
+    },
     #[snafu(display("HF Hub op failed"), context(false))]
     Hub { source: hf_hub::HFError },
     #[snafu(display("pickle loader failed"))]
@@ -36,6 +41,7 @@ impl From<crate::wavlm::Error> for Error {
         use crate::wavlm::Error as W;
         match e {
             W::Tensor { source } => Error::Tensor { source },
+            W::Ops { source } => Error::Ops { source },
             W::Pickle { source } => Error::Pickle { source },
             W::Hub { source } => Error::Hub { source },
         }

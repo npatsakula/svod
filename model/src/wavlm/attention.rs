@@ -23,8 +23,10 @@
 //!   gates and head-selects independently.
 
 use svod_dtype::DType;
+use svod_ir::SInt;
 use svod_tensor::nn::{Layer, Linear, Module};
 use svod_tensor::{Tensor, s};
+use svod_tk3::ops::{self, Attn};
 
 use crate::init::{Bias, linear, ones};
 
@@ -182,15 +184,18 @@ impl GatedRelPosAttention {
         let gate = gate_a.try_mul(&gate_b.try_mul(&self.gru_rel_pos_const)?.try_sub(1.0)?)?.try_add(2.0)?;
         let bias = gate.try_mul(position_bias)?.getitem(s![.., self.remaining_heads.clone(), .., ..])?;
 
-        // Q / K / V (lines 455-458) and the attention itself (461-472): the
-        // gated bias is the additive float `attn_mask`.
-        let nk = self.num_kept();
-        let q = self.q.forward(x)?.split_heads(nk)?;
-        let k = self.k.forward(x)?.split_heads(nk)?;
-        let v = self.v.forward(x)?.split_heads(nk)?;
-        let attended = q.scaled_dot_product_attention().key(&k).value(&v).attn_mask(&bias).call()?;
+        // Q / K / V (lines 455-458) and the attention itself (461-472), the
+        // gated bias added to the scaled scores, over sequence-major heads.
+        let (nk, head_dim) = (self.num_kept(), x.dim_const(2)? / self.total_num_heads);
+        let (b, l) = (shape[0].clone(), shape[2].clone()); // `x`'s batch and length
+        let heads = |lin: &Linear| -> Result<Tensor> {
+            let dims = [b.clone(), l.clone(), SInt::Const(nk), SInt::Const(head_dim)];
+            Ok(lin.forward(x)?.try_reshape(dims)?)
+        };
+        let (q, k, v) = (heads(&self.q)?, heads(&self.k)?, heads(&self.v)?);
+        let attended = ops::attention(&q, &k, &v, Attn { bias: Some(&bias), ..Attn::default() })?;
 
         // Py:478-480  merge the heads back and project out.
-        Ok(self.out.forward(&attended.merge_heads()?)?)
+        Ok(self.out.forward(&attended.try_reshape([b, l, SInt::Const(nk * head_dim)])?)?)
     }
 }
