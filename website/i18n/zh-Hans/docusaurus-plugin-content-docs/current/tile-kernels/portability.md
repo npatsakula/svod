@@ -20,14 +20,18 @@ sidebar_label: 可移植性
 
 `Target::for_device(&spec)` 从实际设备解析目标。`Target::for_arch(arch)` 仅根据架构构造目标，主机测试使用的就是它。`atoms::sm86()` 是带 28 个 SM 的 RTX 3060 目标。
 
-| 目标 | 原子与布局 | 配置表 | 已降级并运行 |
-|---|---|---|---|
-| CUDA sm_80+（在 sm_86 上测量） | `mma.sync` m16n8k16, `ldmatrix`, `cp.async` | 有 | 是 |
-| AMD CDNA (gfx942) | MFMA 16×16×16 | 无 | 否 |
-| AMD RDNA3 / RDNA4 | WMMA 16×16×16 | 无 | 否 |
-| Apple | simdgroup 8×8×8 | 无 | 否 |
+| 目标 | 原子 | 填充 | 配置表 | 状态 |
+|---|---|---|---|---|
+| CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`，2–3 级 | 有 | 在 RTX 3060 上测量 |
+| CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`，共享内存最多 227 KB | sm_80 配置表 | 已编译：每个族都能用 `ptxas -arch=sm_90` 和 `sm_90a` 汇编；未运行 |
+| AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16，每 lane 8 个值 | 寄存器中转，2 级 | 有，未测量 | 已编译为 code object；未运行 |
+| AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16，输入复制 | 寄存器中转，2 级 | 有，未测量 | 已编译为 code object；未运行 |
+| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16，wave64 | 寄存器中转，2 级 | 有，未测量 | 已为 gfx942 编译；未运行 |
+| Apple | simdgroup 8×8×8 | 无 | 无 | 仅有原子 |
 
-`ops::supported(device)` 只在存在配置表的地方为 true，因此在其他所有设备上，每个算子都构建其计算图回退（`Fallback::Target`）。AMD 和 Apple 的原子已存在，主机测试也检查了它们的布局能铺满指令形状，但还没有任何内核在这些目标上被降级或运行。
+`ops::supported(device)` 仅在有配置表的地方为真；在其他设备上，每个 op 构建自己的图回退（`Fallback::Target`）。主机测试把每个原子的操作数布局与厂商 ISA 文档中的 lane 公式逐一核对；对每个有配置表的目标，它们降级每个内核族，在降级前后用解释器运行，并在安装了 `ptxas` 或 clang 时编译。"已编译"不等于"在设备上正确"：只有当 `targets::families_match_the_interpreter_on_the_device` 在该硬件上通过时，目标才算已测量。
+
+没有 `cp.async` 时（RDNA 没有 global → LDS 拷贝），流水线把每一步加载到寄存器，计算上一步，再把寄存器写入共享内存，使用两个槽位。同一路径也在 CUDA 的设备测试中运行（`register_staged_families_match_on_cuda`）。
 
 ## 策略 {#strategy}
 
@@ -46,10 +50,16 @@ sidebar_label: 可移植性
 
 | 项目 | 状态 |
 |---|---|
-| Hopper (sm_90a)：wgmma、TMA、mbarrier、warp 专用化模板 | 未开始；将在远程 H100 硬件上测量 |
+| Hopper (sm_90a)：wgmma、TMA、mbarrier、warp 专用化模板 | 未开始；Hopper 走 `mma.sync` 路径（基础设施第 5–8 项） |
 | Blackwell (sm_100a)：tcgen05、张量内存 | 未开始；没有 B200 可用 |
-| AMD CDNA：ping-pong 模板、MFMA 32×32、`buffer_load … lds` | 未开始；将在远程 MI300X 硬件上测量 |
-| AMD RDNA、Apple | 仅有原子；没有配置表，没有发射的内核 |
+| AMD CDNA：ping-pong 模板、MFMA 32×32、`buffer_load … lds` | 未开始 |
+| AMD 测量 | 尚无 AMD 内核运行过；配置表只是供 tune store 挑选的初始猜测 |
+| AMD 注意力寄存器 | 分数 tile 经共享内存进入 P·V，V 操作数逐元素收集；RDNA 上 d = 128 会溢出寄存器 |
+| Apple | 仅有原子；没有配置表，没有发射的内核 |
 | Warp 角色、角色屏障、原始 asm 语句 | 可在 IR 中记录，但被降级拒绝 |
+<<<<<<< HEAD
 | 卷积（隐式 GEMM） | 仅 CUDA sm_80+（`ops::conv2d`）；YOLO26 以 channels-last 运行在其上，在 tk3 拥有 RDNA 配置表之前 AMD 上该算子走图 |
+=======
+| 卷积（隐式 GEMM） | 在 sm_86 上测量，已为 AMD 编译；YOLO 模型尚未接入 |
+>>>>>>> b4e4d30b ([*] docs: the tile-kernel target matrix after Hopper, RDNA and CDNA)
 | fp8/int8 权重、GEMV + argmax、持久化网格、注意力反向 | 未开始 |
