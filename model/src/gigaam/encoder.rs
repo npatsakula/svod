@@ -32,8 +32,9 @@ fn build_rope_cache(config: &GigaAmConfig) -> svod_tensor::error::Result<(Tensor
 
 type Result<T> = super::Result<T>;
 
-/// `act(x·wᵀ + bias) + residual`, through the tile op layer unless the weight
-/// carries a dynamic-quantization scale. The scale's presence is a property of the
+/// `scale·act(x·wᵀ + bias) + residual` as `opts` spells it (the bias is
+/// `bias`), through the tile op layer unless the weight carries a
+/// dynamic-quantization `weight_scale`. Its presence is a property of the
 /// *weight dtype*, not of the state dict, so the pair is loaded together by
 /// the owner's `Module` impl rather than derived.
 fn linear(
@@ -41,19 +42,22 @@ fn linear(
     weight: &Tensor,
     bias: &Tensor,
     weight_scale: Option<&Tensor>,
-    act: Act,
-    residual: Option<&Tensor>,
+    opts: ops::Linear,
 ) -> Result<Tensor> {
     let Some(scale) = weight_scale else {
-        return Ok(ops::linear(x, weight, ops::Linear { bias: Some(bias), act, residual, ..ops::Linear::default() })?);
+        return Ok(ops::linear(x, weight, ops::Linear { bias: Some(bias), ..opts })?);
     };
     let y = x.dynamic_quantized_linear().weight(weight).weight_scale(scale).bias(bias).call()?;
-    let y = match act {
+    let y = match opts.act {
         Act::None => y,
         Act::Silu => y.silu()?,
         Act::Gelu => y.gelu_exact()?,
     };
-    Ok(match residual {
+    let y = match opts.scale {
+        Some(s) => y.try_mul(s)?,
+        None => y,
+    };
+    Ok(match opts.residual {
         Some(r) => r.try_add(&y)?,
         None => y,
     })
@@ -73,9 +77,8 @@ fn bias_of(linear: &Linear) -> &Tensor {
 // FeedForward
 // ---------------------------------------------------------------------------
 
-/// Conformer FFN: LayerNorm -> Linear(d->4d) -> SiLU -> Linear(4d->d).
-///
-/// Does NOT apply residual or 0.5 scaling — caller handles that.
+/// Conformer FFN half-step: `x + 0.5·Linear(4d->d)(SiLU(Linear(d->4d)(LayerNorm(x))))`,
+/// the scale and residual in the second GEMM's epilogue.
 #[derive(Clone, Module)]
 pub struct FeedForward {
     pub norm: LayerNorm,
@@ -101,8 +104,10 @@ impl FeedForward {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let y = scoped("norm", || self.norm.forward(x))?;
-        let y = linear(&y, &self.linear1.weight, bias_of(&self.linear1), self.linear1_scale.as_ref(), Act::Silu, None)?;
-        linear(&y, &self.linear2.weight, bias_of(&self.linear2), self.linear2_scale.as_ref(), Act::None, None)
+        let up = ops::Linear { act: Act::Silu, ..ops::Linear::default() };
+        let y = linear(&y, &self.linear1.weight, bias_of(&self.linear1), self.linear1_scale.as_ref(), up)?;
+        let down = ops::Linear { residual: Some(x), scale: Some(0.5), ..ops::Linear::default() };
+        linear(&y, &self.linear2.weight, bias_of(&self.linear2), self.linear2_scale.as_ref(), down)
     }
 }
 
@@ -172,7 +177,7 @@ impl MultiHeadSelfAttention {
         let d_k = d_model / self.n_heads;
         let h = self.n_heads;
 
-        let y = scoped("norm", || self.norm.forward(x))?;
+        let y = scoped("norm", || self.norm.forward(x))?.contiguous();
 
         // RoPE expects [T, B, H, d_k] (PyTorch ordering). Rotate once, then
         // materialise back as [B, T, d_model] so the Q/K projections share
@@ -191,9 +196,9 @@ impl MultiHeadSelfAttention {
             .try_transpose(0, 1)?
             .contiguous();
 
-        let q = linear(&qk_input, &self.q_proj, &self.q_bias, self.q_weight_scale.as_ref(), Act::None, None)?;
-        let k = linear(&qk_input, &self.k_proj, &self.k_bias, self.k_weight_scale.as_ref(), Act::None, None)?;
-        let v = linear(&y, &self.v_proj, &self.v_bias, self.v_weight_scale.as_ref(), Act::None, None)?;
+        let q = linear(&qk_input, &self.q_proj, &self.q_bias, self.q_weight_scale.as_ref(), ops::Linear::default())?;
+        let k = linear(&qk_input, &self.k_proj, &self.k_bias, self.k_weight_scale.as_ref(), ops::Linear::default())?;
+        let v = linear(&y, &self.v_proj, &self.v_bias, self.v_weight_scale.as_ref(), ops::Linear::default())?;
 
         // Head-split into the attention's sequence-major `[B, T, H, d_k]`, not
         // `Tensor::split_heads`, which lands head-major `[B, H, T, d_k]`.
@@ -207,7 +212,8 @@ impl MultiHeadSelfAttention {
         // Head-merge is a plain reshape here: the attention output is already
         // seq-major, so there is no transpose to undo.
         let out = attn.try_reshape([b, t, SInt::Const(d_model)])?;
-        linear(&out, &self.out_proj, &self.out_bias, self.out_weight_scale.as_ref(), Act::None, Some(x))
+        let opts = ops::Linear { residual: Some(x), ..ops::Linear::default() };
+        linear(&out, &self.out_proj, &self.out_bias, self.out_weight_scale.as_ref(), opts)
     }
 }
 
@@ -543,8 +549,7 @@ impl ConformerLayer {
         pad_valid: Option<&Tensor>,
     ) -> Result<Tensor> {
         // FFN1 half-step
-        let ffn1 = scoped("ffn1", || self.ffn1.forward(x))?;
-        let x = x.try_add(&ffn1.try_mul(0.5)?)?;
+        let x = scoped("ffn1", || self.ffn1.forward(x))?;
 
         // MHSA, the residual added in the out projection's epilogue
         let x = scoped("mhsa", || self.mhsa.forward(&x, cos, sin, key_lens))?;
@@ -555,11 +560,10 @@ impl ConformerLayer {
 
         // FFN2 half-step. Materialized in the activation dtype: otherwise the
         // final norm's f32 cast fuses into the FFN2 GEMM, which then stores f32.
-        let ffn2 = scoped("ffn2", || self.ffn2.forward(&x))?;
-        let x = x.try_add(&ffn2.try_mul(0.5)?)?.contiguous();
+        let x = scoped("ffn2", || self.ffn2.forward(&x))?.contiguous();
 
         // Final layer norm
-        Ok(scoped("final_norm", || self.final_norm.forward(&x))?)
+        Ok(scoped("final_norm", || self.final_norm.forward(&x))?.contiguous())
     }
 }
 
