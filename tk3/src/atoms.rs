@@ -7,6 +7,7 @@ use svod_ir::{AxisId, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 use svod_schedule::optimizer::{Renderer, TensorCore};
 
 use crate::layout::{self as frag, Dim, Layout};
+use crate::schedule::Prefetch;
 
 /// One matrix-core instruction: `C[m, n] += A[m, k] · B[k, n]`, with the
 /// register/lane layout of every operand over one wave.
@@ -77,7 +78,18 @@ impl Target {
                 limits = reg::resolve_cuda_limits(*device_id).ok();
                 GpuArch::Cuda(reg::resolve_cuda_arch(*device_id).ok()?)
             }
-            DeviceSpec::Amd { device_id } => GpuArch::Amd(reg::resolve_amd_arch_from_topology(*device_id).ok()?),
+            DeviceSpec::Amd { device_id } => {
+                let arch = reg::resolve_amd_arch_from_topology(*device_id).ok()?;
+                let node = svod_device::amd::topology::enumerate().into_iter().nth(*device_id);
+                let mut target = Self::for_arch(GpuArch::Amd(arch));
+                if let Some(node) = node {
+                    if node.lds_size_in_kb > 0 {
+                        target.smem_bytes = node.lds_size_in_kb as usize * 1024;
+                    }
+                    target.sms = (node.simd_per_cu > 0).then(|| node.simd_count / node.simd_per_cu);
+                }
+                return Some(target);
+            }
             DeviceSpec::Metal { device_id } => GpuArch::Metal(reg::resolve_metal_family(*device_id).ok()?),
             DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => return None,
         };
@@ -87,6 +99,21 @@ impl Target {
             target.sms = Some(limits.sm_count);
         }
         Some(target)
+    }
+
+    /// How a pipeline fills shared memory: `cp.async` where the target has
+    /// it, else through registers (RDNA3/RDNA4 have no global→LDS copy).
+    pub fn prefetch(&self) -> Prefetch {
+        if self.cp_async { Prefetch::CpAsync } else { Prefetch::RegisterStaged }
+    }
+
+    /// Pipeline stages the target's prefetch can use: register staging
+    /// runs one step ahead over two slots.
+    pub fn stages(&self, stages: usize) -> usize {
+        match self.prefetch() {
+            Prefetch::CpAsync => stages,
+            Prefetch::RegisterStaged => 2,
+        }
     }
 
     /// The matrix core for `dtype_in → dtype_out`, if the target has one.

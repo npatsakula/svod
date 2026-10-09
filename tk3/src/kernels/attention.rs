@@ -8,7 +8,7 @@ use crate::build::*;
 use crate::ir::*;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
-use crate::schedule::{Prefetch, Schedule};
+use crate::schedule::Schedule;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FaCfg {
@@ -31,9 +31,10 @@ impl FaCfg {
     }
 
     pub fn lowering(&self, target: Target) -> Lowering {
+        let prefetch = target.prefetch();
         Lowering {
             target,
-            schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false },
+            schedule: Schedule::Uniform { prefetch, unroll: false },
             grid: WarpGrid { rows: self.warps(), cols: 1 },
             swizzle: true,
         }

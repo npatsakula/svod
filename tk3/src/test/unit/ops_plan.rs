@@ -1,7 +1,7 @@
 //! The op layer's decisions on the host: which plan each shape, dtype and
 //! target gets, and which requests are errors rather than fallbacks.
 
-use svod_dtype::{AmdArch, DType, DeviceSpec, GpuArch};
+use svod_dtype::{AmdArch, DType, DeviceSpec, GpuArch, MetalFamily};
 use svod_ir::SInt;
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
@@ -36,6 +36,11 @@ fn first<C: Clone>(plan: Plan<C>) -> Result<C, Fallback> {
 
 fn rdna3() -> Target {
     Target::for_arch(GpuArch::Amd(AmdArch::Gfx1100))
+}
+
+/// A target with a matrix core and no tables.
+fn apple() -> Target {
+    Target::for_arch(GpuArch::Metal(MetalFamily::Apple(9)))
 }
 
 // ---- linear ------------------------------------------------------------------------
@@ -127,7 +132,7 @@ fn gated_linear_drops_a_stage_under_a_static_cap() {
 }
 
 #[test_case(None, &[BF16, BF16], true, Fallback::Target; "no target")]
-#[test_case(Some(rdna3()), &[BF16, BF16], true, Fallback::Target; "no tables for the arch")]
+#[test_case(Some(apple()), &[BF16, BF16], true, Fallback::Target; "no tables for the arch")]
 #[test_case(Some(sm86()), &[DType::Float32, DType::Float32], true, Fallback::Dtype; "f32 keeps the graph")]
 #[test_case(Some(sm86()), &[BF16, DType::Float32], true, Fallback::Dtype; "mixed operand types")]
 #[test_case(Some(sm86()), &[DType::Int32, DType::Int32], true, Fallback::Dtype; "integers")]
@@ -513,7 +518,33 @@ fn a_bound_conv_batch_plans_per_image() {
     let x = Extent { dims: vec![8, 80, 80, 384], var: true };
     let plan = shape::conv2d(Some(&sm86()), &[F16; 3], F16, None, Some(&x), &g, 1);
     assert_eq!(plan, Plan::Kernel(config::conv_candidates(&sm86(), 8, 1600, &g)));
-    let plan = shape::conv2d(Some(&rdna3()), &[F16; 3], F16, None, Some(&x), &g, 1);
+    let plan = shape::conv2d(Some(&apple()), &[F16; 3], F16, None, Some(&x), &g, 1);
     assert_eq!(plan, Plan::Graph(Fallback::Target));
     assert_eq!(shape::conv2d(Some(&sm86()), &[F16; 3], F16, None, None, &g, 1), Plan::Graph(Fallback::Symbolic));
+}
+
+/// RDNA plans kernels from its own tables: two-slot register-staged rings
+/// only, 16×16 WMMA-tileable warp grids, attention within 64 KB of LDS with
+/// its score relayout.
+#[test]
+fn rdna_plans_register_staged_kernels() {
+    let target = rdna3();
+    let Plan::Kernel(gemms) = shape::linear(Some(&target), &[BF16, BF16], Some(&ext(&[4096, 4096])), 4096, false)
+    else {
+        panic!("a GEMM kernel")
+    };
+    assert_eq!(gemms[0], gemm_cfg([128, 128, 32], 2, [2, 4], false));
+    assert!(gemms.iter().all(|c| c.stages == 2 && config::cfg_fits(&target, c)));
+    let Plan::Kernel(small) = shape::linear(Some(&target), &[BF16, BF16], Some(&ext(&[704, 512])), 512, false) else {
+        panic!("a GEMM kernel")
+    };
+    assert_eq!(small[0].tile, [64, 64, 32], "a small grid leads with the smallest tile");
+    for (d, t) in [(64, 1500), (128, 1500), (64, 1)] {
+        let q = ext(&[1, t, 8, d]);
+        let Plan::Kernel(fa) = shape::attention(Some(&target), &[BF16; 3], Some(&q), Some(&q)) else {
+            panic!("an attention kernel")
+        };
+        assert!(fa.iter().all(|c| c.stages == 2 && c.smem_bytes(d) + c.bq * c.bkv * 4 <= 64 << 10), "{fa:?}");
+    }
+    assert!(matches!(shape::norm(Some(&target), &[BF16; 2], Some(&ext(&[37, 1024]))), Plan::Kernel(_)));
 }

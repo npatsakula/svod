@@ -234,6 +234,30 @@ pub fn natural(shape: Shape, warps: u32, lanes: u32) -> Option<TileLayout> {
     Some(TileLayout { frag, reps, warps: warps_layout })
 }
 
+/// The layout of a register-staged fill: each lane holds a 16-byte run of
+/// a row (the `cp.async` chunk), lanes then warps walk the runs row-major,
+/// and registers repeat the pattern down the rows and across the columns.
+/// Dims only need a power-of-two part as wide as the lanes and warps use,
+/// so 48- and 96-wide tiles repeat by three; warps past the rows replicate.
+pub fn chunked(shape: Shape, elem_bytes: usize, warps: u32, lanes: u32) -> Option<TileLayout> {
+    let pow2 = |n: u32| 1u32 << n.trailing_zeros();
+    let (rows, cols) = (shape.rows as u32, shape.cols as u32);
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+    let v = (16 / elem_bytes as u32).min(pow2(cols));
+    let lane_cols = pow2(cols / v).min(lanes);
+    let lane_rows = (lanes / lane_cols).min(pow2(rows));
+    let warp_rows = pow2(rows / lane_rows).min(warps);
+    let frag = Layout::identity(Reg, v, Col)
+        .product(&Layout::identity(Lane, lane_cols, Col))
+        .product(&Layout::identity(Lane, lane_rows, Row))
+        .product(&Layout::zeros(Lane, lanes / (lane_cols * lane_rows)));
+    let warps_layout = Layout::identity(Warp, warp_rows, Row).product(&Layout::zeros(Warp, warps / warp_rows));
+    let reps = [rows / (lane_rows * warp_rows), cols / (v * lane_cols)];
+    Some(TileLayout { frag, reps, warps: warps_layout })
+}
+
 struct Infer<'a> {
     prog: &'a mut Program,
     target: &'a Target,
@@ -357,6 +381,15 @@ impl Infer<'_> {
                 Stmt::If { then, otherwise, .. } => {
                     self.pass(then)?;
                     self.pass(otherwise)?;
+                }
+                Stmt::Copy { dst, src, mode: CopyMode::Staged } if self.lay[dst.index()].is_none() => {
+                    let (d, s) = (self.prog.value(*dst), self.prog.value(*src));
+                    if d.place == Place::Reg && s.tier() == Tier::Global {
+                        let (warps, lanes) = (self.prog.warps, self.target.wave);
+                        if let Some(l) = chunked(d.shape, d.dtype.bytes(), warps, lanes) {
+                            self.set(*dst, l);
+                        }
+                    }
                 }
                 Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
             }

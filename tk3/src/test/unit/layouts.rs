@@ -6,7 +6,7 @@ use crate::atoms::sm86;
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{self as frag, Dim};
-use crate::layouts::{Relayout, TileLayout, WarpGrid, infer, mma_layouts, natural};
+use crate::layouts::{Relayout, TileLayout, WarpGrid, chunked, infer, mma_layouts, natural};
 
 fn coords(l: &TileLayout, warps: u32, lanes: u32) -> Vec<(u32, u32)> {
     (0..warps)
@@ -105,4 +105,34 @@ fn shapes_that_do_not_tile_the_grid_are_rejected() {
     assert!(mma_layouts(atom, WarpGrid { rows: 2, cols: 4 }, 64, 128, 24).is_err(), "k = 24");
     let [a, b, c] = mma_layouts(atom, WarpGrid { rows: 1, cols: 1 }, 16, 48, 32).unwrap();
     assert_eq!((a.reps, b.reps, c.reps), ([1, 2], [2, 6], [1, 6]), "48 columns are six n-halves");
+}
+
+/// A register-staged fill's layout holds every element of its tile, each
+/// lane's registers in 16-byte row runs, and replicates only warps (or
+/// lanes) the tile has no rows for.
+#[test_case(128, 32, 2, 4, 32; "128x32 bf16 on four waves")]
+#[test_case(96, 32, 2, 4, 32; "96 rows repeat by three")]
+#[test_case(64, 48, 2, 2, 32; "48 columns repeat by three")]
+#[test_case(16, 64, 2, 1, 32; "one wave")]
+#[test_case(64, 64, 2, 4, 64; "wave64")]
+#[test_case(8, 16, 2, 4, 32; "fewer chunks than threads")]
+#[test_case(32, 32, 4, 2, 32; "f32")]
+fn chunked_layouts_cover_their_tile_in_16_byte_runs(rows: usize, cols: usize, bytes: usize, warps: u32, lanes: u32) {
+    let l = chunked(Shape::new(rows, cols), bytes, warps, lanes).unwrap();
+    assert_eq!(l.shape(), Shape::new(rows, cols));
+    let held: HashSet<(u32, u32)> = coords(&l, warps, lanes).into_iter().collect();
+    assert_eq!(held.len(), rows * cols, "every element held");
+    let v = (16 / bytes).min(cols) as u32;
+    for w in 0..warps {
+        for lane in 0..lanes {
+            for j in (0..l.regs()).step_by(v as usize) {
+                let (r, c) = l.coord(w, lane, j);
+                assert_eq!(c % v, 0, "a run starts on a 16-byte boundary");
+                assert!(
+                    (1..v).all(|e| l.coord(w, lane, j + e) == (r, c + e)),
+                    "a run is one row's consecutive columns"
+                );
+            }
+        }
+    }
 }

@@ -19,7 +19,7 @@ use crate::kernels::gemm::{Epilogue, GemmCfg};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch;
 use crate::lower::lower;
-use crate::ops::config::{conv_candidates, conv_cfg_fits};
+use crate::ops::config::{cfg_fits, conv_candidates};
 
 pub(super) fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, p: usize, d: usize) -> ConvGeom {
     ConvGeom { h: hw[0], w: hw[1], cin, cout, kernel: [k, k], stride: [s, s], pad: [p, p], dilation: [d, d] }
@@ -292,7 +292,9 @@ fn conv_candidates_lower() {
         let cands = conv_candidates(&target, 1, ho * wo, &g);
         assert!(!cands.is_empty() || g.cin == 48, "{g:?}");
         for ConvCfg { gemm: c, split } in cands {
-            assert!(conv_cfg_fits(&c) && g.cin.is_multiple_of(c.tile[2]) && c.smem_bytes(false) <= target.smem_bytes);
+            assert!(
+                cfg_fits(&target, &c) && g.cin.is_multiple_of(c.tile[2]) && c.smem_bytes(false) <= target.smem_bytes
+            );
             assert!((g.k() / c.tile[2]).is_multiple_of(split));
         }
     }

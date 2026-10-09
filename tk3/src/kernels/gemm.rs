@@ -10,7 +10,7 @@ use crate::build::*;
 use crate::ir::*;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
-use crate::schedule::{Prefetch, Schedule};
+use crate::schedule::Schedule;
 
 /// What runs on the accumulator before the single rounding at the store.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -86,9 +86,10 @@ pub struct GemmCfg {
 
 impl GemmCfg {
     pub fn lowering(&self, target: Target) -> Lowering {
+        let prefetch = target.prefetch();
         Lowering {
             target,
-            schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: self.unroll },
+            schedule: Schedule::Uniform { prefetch, unroll: self.unroll },
             grid: WarpGrid { rows: self.warps[0], cols: self.warps[1] },
             swizzle: true,
         }
