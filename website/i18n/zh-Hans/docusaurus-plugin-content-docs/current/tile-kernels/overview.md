@@ -6,7 +6,7 @@ sidebar_label: 概览
 
 Svod 的优化器通过搜索循环变换，为模型的大部分计算找到快速的调度。但有些内核无法用这种方式找到。Flash attention 是一个递推：每个键块都要更新运行中的最大值与和，并重新缩放累加器，因此不存在一个可以直接分块的归约。张量核心 GPU 上的快速 GEMM 依赖多级 `cp.async` 环形缓冲、`ldmatrix` 片段加载以及带 swizzle 的共享内存布局，这些都不是循环搜索中的步骤。这类内核需要手写，而 `svod-tk3`（“tk3”）就是编写它们的 crate。
 
-tk3 是较早的 `svod-tk` crate（tk1）的后继者。Transformer 模型的手写内核运行在本文介绍的算子层上；YOLO 的卷积（隐式 GEMM）运行在 `svod-tk` 上。
+tk3 是较早的 `svod-tk` crate（tk1）的后继者。Transformer 模型的手写内核运行在本文介绍的算子层上，YOLO26 也是如此，其卷积为隐式 GEMM（`ops::conv2d`）。
 
 ## tk3 是什么 {#what-tk3-is}
 

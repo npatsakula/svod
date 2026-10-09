@@ -51,5 +51,5 @@ sidebar_label: 可移植性
 | AMD CDNA：ping-pong 模板、MFMA 32×32、`buffer_load … lds` | 未开始；将在远程 MI300X 硬件上测量 |
 | AMD RDNA、Apple | 仅有原子；没有配置表，没有发射的内核 |
 | Warp 角色、角色屏障、原始 asm 语句 | 可在 IR 中记录，但被降级拒绝 |
-| 卷积（隐式 GEMM） | 仅 CUDA sm_80+（`ops::conv2d`）；在有配置表之前 AMD 仍走图或 tk1，YOLO 模型尚未接入 |
+| 卷积（隐式 GEMM） | 仅 CUDA sm_80+（`ops::conv2d`）；YOLO26 以 channels-last 运行在其上，在 tk3 拥有 RDNA 配置表之前 AMD 上该算子走图 |
 | fp8/int8 权重、GEMV + argmax、持久化网格、注意力反向 | 未开始 |

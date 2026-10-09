@@ -12,7 +12,7 @@ reduction to tile. A fast GEMM on a tensor-core GPU depends on a multi-stage `cp
 Kernels like these are written by hand, and `svod-tk3` ("tk3") is the crate for writing them.
 
 tk3 succeeds the older `svod-tk` crate (tk1). The transformer models run their hand kernels on the
-op layer described here; the YOLO convolution (an implicit GEMM) runs on `svod-tk`.
+op layer described here, and so does YOLO26, whose convolutions are implicit GEMMs (`ops::conv2d`).
 
 ## What tk3 is
 
