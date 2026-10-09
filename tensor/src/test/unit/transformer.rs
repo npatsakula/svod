@@ -85,6 +85,18 @@ crate::codegen_tests! {
         assert_eq!(view[[1, 0, 1]], 7.0);
     }
 
+    fn test_embedding_i64_indices(config) {
+        // An int64 index meets the int32 arange widened to int64.
+        let weight = Tensor::from_ndarray(&array![[0.0f32, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]);
+        let indices = Tensor::from_ndarray(&array![[3i64, 0], [1, 3]]);
+        let result = weight.embedding(&indices).unwrap();
+        result.realize_with(&config).unwrap();
+        let view = result.array_view::<f32>().unwrap();
+        assert_eq!(view.shape(), &[2, 2, 2]);
+        let rows: Vec<f32> = view.iter().copied().collect();
+        assert_eq!(rows, [6.0, 7.0, 0.0, 1.0, 2.0, 3.0, 6.0, 7.0]);
+    }
+
     // =========================================================================
     // Scaled Dot-Product Attention tests
     // =========================================================================
@@ -617,5 +629,18 @@ crate::codegen_tests! {
         let result = weight.embedding(&ids).unwrap();
         result.realize_with(&config).unwrap();
         assert_eq!(result.as_vec::<f32>().unwrap(), vec![5.0, 255.0, 44.0, 0.0]);
+/// The one-hot sum over the vocabulary collapses to an indexed load, whatever
+/// integer type the indices have: no kernel keeps a reduce.
+#[test_case(DType::Int32 ; "int32 indices")]
+#[test_case(DType::Int64 ; "int64 indices")]
+fn embedding_lowers_to_a_gather(index: DType) {
+    let weight = Tensor::randn(&[1000, 8]).unwrap().contiguous();
+    weight.realize().unwrap();
+    let indices = Tensor::from_slice([5i64, 999, 0]).cast(index).contiguous();
+    indices.realize().unwrap();
+    let plan = weight.embedding(&indices).unwrap().prepare().unwrap();
+    for kernel in plan.prepared_kernels() {
+        let reduces = kernel.ast.toposort().iter().any(|u| matches!(u.op(), svod_ir::Op::Reduce(..)));
+        assert!(!reduces, "a reduce over the vocabulary survived:\n{}", kernel.ast.tree());
     }
 }

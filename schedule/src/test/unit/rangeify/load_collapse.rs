@@ -501,5 +501,26 @@ fn a_u64_bound_past_i64_never_wraps_through_the_lt_collapse(arange: U64Arange) {
             let pinned = folded.substitute(&[(UOpKey(loaded.clone()), constant(cut))].into_iter().collect());
             assert_eq!(count(&pinned), Some(arange.count_below(cut)), "load = {cut}:\n{}", folded.tree());
         }
+/// An embedding compares an int64 index with the int32 arange widened to it:
+/// `sum(where(idx == Cast(Cast(r, i32), i64), expr, 0))`. Casts that hold the
+/// whole range are peeled; a chain through a type that wraps it is not the
+/// range compared any more and keeps the reduce.
+#[test_case(&[DType::Int64], 1000, true ; "a single cast")]
+#[test_case(&[DType::Int32, DType::Int64], 1000, true ; "int32 widened to int64")]
+#[test_case(&[DType::Int16, DType::Int32, DType::Int64], 1000, true ; "a longer widening chain")]
+#[test_case(&[DType::Int8, DType::Int64], 1000, false ; "an int8 intermediate wraps the range")]
+#[test_case(&[DType::Int8, DType::Int64], 100, true ; "an int8 intermediate holds a short range")]
+fn an_eq_gate_through_a_cast_chain(chain: &[DType], end: i64, collapses: bool) {
+    let range = reduce_range(end, 0);
+    let side = chain.iter().fold(range.clone(), |side, dtype| side.cast(dtype.clone()));
+    let idx = UOp::var("idx", DType::Int64, 7, 7);
+    let value = UOp::const_(DType::Float32, ConstValue::Float(1.5));
+    let body = UOp::try_where(idx.try_cmpeq(&side).expect("cmpeq"), value, zero()).expect("gate");
+    match reduce_load_collapse(&body, &[range]) {
+        Some(folded) => {
+            assert!(collapses, "the chain must keep the reduce, got {}", folded.tree());
+            assert_const_float(&folded, 1.5);
+        }
+        None => assert!(!collapses, "the chain holds the range and must collapse"),
     }
 }
