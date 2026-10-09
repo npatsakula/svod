@@ -127,48 +127,47 @@ fn cached_step_key_lengths_admit_only_prefix_and_appended_key() {
 }
 
 #[test]
-#[ignore = "GPU: custom single-query self/cross attention vs generic SDPA on a supported AMD device"]
+#[ignore = "GPU: the op layer's cached self/cross attention vs generic SDPA on a tk3 device"]
 fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
-    // The kernel's own arch set, not a hand-kept list: a part it supports must
-    // run here the day it is added.
     let device = Tensor::empty(&[1], DType::Float32).device();
-    let archs = svod_tk::kernels::sq_attention::SQ_ATTENTION_SUPPORTED_ARCHS;
-    if let Err(why) = svod_tk::target::check_target(&device, archs) {
-        eprintln!("skip: {device:?} does not run single-query attention ({why})");
+    if !svod_tk3::ops::supported(&device) {
+        eprintln!("skip: {device:?} has no tk3 kernels");
         return;
     }
 
     let mut dims = tiny_dims();
     // Production cross-attention length: split=4 creates 375-key chunks, which
-    // also exercises the partial kernel's ragged subgroup tile.
+    // also exercises a ragged last key block. The kernels take 16-bit caches
+    // only, so the step runs in f16.
     dims.n_audio_ctx = 1500;
     dims.n_text_ctx = 7;
+    dims.dtype = DType::Float16;
     let model = Whisper::empty(dims.clone());
     let (batch, d_head) = (2, dims.n_text_state / dims.n_text_head);
     let layer_heads = dims.n_text_layer * dims.n_text_head;
     let token = Tensor::from_slice([1i32, 2]).try_reshape([batch, 1]).unwrap();
-    let self_k = Tensor::randn(&[batch, dims.n_text_ctx, layer_heads, d_head]).unwrap();
-    let self_v = Tensor::randn(&[batch, dims.n_text_ctx, layer_heads, d_head]).unwrap();
-    let cross_k = Tensor::randn(&[batch, dims.n_audio_ctx, layer_heads, d_head]).unwrap();
-    let cross_v = Tensor::randn(&[batch, dims.n_audio_ctx, layer_heads, d_head]).unwrap();
+    let cache =
+        |rows: usize, len: usize| Tensor::randn(&[rows, len, layer_heads, d_head]).unwrap().cast(DType::Float16);
+    let (self_k, self_v) = (cache(batch, dims.n_text_ctx), cache(batch, dims.n_text_ctx));
+    let (cross_k, cross_v) = (cache(batch, dims.n_audio_ctx), cache(batch, dims.n_audio_ctx));
     // Identity gives each row its own cross cache; `[0, 0]` is one beam attempt
-    // whose lanes share the owner's. The tile kernel resolves the row with an
-    // index load and the generic path with a gather, so both maps must agree.
-    // The self-attention kernel reads the prefix each row filled and scores the
-    // row this step projected separately, so the lengths span a row that has
-    // decoded nothing and one whose prefix fills the cache.
+    // whose lanes share the owner's. The kernel resolves the row with an index
+    // load and the generic path with a gather, so both maps must agree. The
+    // self attention reads the prefix each row filled and scores the row this
+    // step projected separately, so the lengths span a row that has decoded
+    // nothing and one whose prefix fills the cache.
+    let modes = [
+        StepAttentionMode::Generic,
+        StepAttentionMode::OpSelf,
+        StepAttentionMode::OpCross { split: 1 },
+        StepAttentionMode::OpCross { split: 4 },
+        StepAttentionMode::OpBoth { split: 1 },
+        StepAttentionMode::OpBoth { split: 4 },
+    ];
     for (map, lens) in [(vec![0i32, 1], [2i32, 5]), (vec![0i32, 0], [2i32, 5]), (vec![0i32, 1], [0i32, 7])] {
         let key_lens = Tensor::from_slice(lens);
         let cross_map = Tensor::from_slice(map.clone());
-        let outputs = [
-            StepAttentionMode::Generic,
-            StepAttentionMode::CustomSelf,
-            StepAttentionMode::CustomCross { split: 1 },
-            StepAttentionMode::CustomCross { split: 4 },
-            StepAttentionMode::CustomBoth { split: 1 },
-            StepAttentionMode::CustomBoth { split: 4 },
-        ]
-        .map(|mode| {
+        let outputs = modes.map(|mode| {
             model
                 .decoder
                 .forward_step_with_attention_mode(
@@ -179,21 +178,15 @@ fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
         });
         Tensor::realize_batch(outputs.iter()).unwrap();
         let reference = outputs[0].as_vec::<f32>().unwrap();
-        for (mode, output) in [
-            StepAttentionMode::CustomSelf,
-            StepAttentionMode::CustomCross { split: 1 },
-            StepAttentionMode::CustomCross { split: 4 },
-            StepAttentionMode::CustomBoth { split: 1 },
-            StepAttentionMode::CustomBoth { split: 4 },
-        ]
-        .into_iter()
-        .zip(&outputs[1..])
-        {
+        let scale = reference.iter().fold(0f32, |m, x| m.max(x.abs()));
+        for (mode, output) in modes.into_iter().zip(&outputs).skip(1) {
             let got = output.as_vec::<f32>().unwrap();
             let max_abs = got.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            // Both paths round the attention output to f16 before the out
+            // projection: a few f16 ulps of the logits' range.
             assert!(
-                max_abs < 3e-4,
-                "{mode:?} logits differ from generic SDPA by {max_abs:e} under map {map:?} and lengths {lens:?}"
+                max_abs < 4e-3 * scale,
+                "{mode:?} logits differ from generic SDPA by {max_abs:e} (range {scale:e}) under map {map:?} and lengths {lens:?}"
             );
         }
     }
