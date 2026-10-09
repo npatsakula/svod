@@ -23,14 +23,14 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | Op | Shapes | Options |
 |---|---|---|
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual }`; gated `w` is `[2N, K]` |
-| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale }` |
+| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` take `residual` like `x` and return `(x + residual, norm)` |
 
 `Attn::keys` is `KeyMask::None`, `KeyMask::Lens(&lens)` (`[B]` valid key counts) or
 `KeyMask::Bool(&mask)` (`[B, Tk]`, true where attended). `Attn::cache` takes
 `Cache { head_start, kv_heads, row_map, appended }`, and `appended` requires `KeyMask::Lens`.
-`Attn::scale` defaults to `1/√D`. `Qkv::rope` is `(cos, sin)` of `[1, T, 1, D/2]` (by position)
+`Attn::scale` defaults to `1/√D`. `Attn::bias` (`[B, H, T, Tk]` or `[1, H, T, Tk]`, the stream dtype) is added to the scaled scores before the masks, as in WavLM's relative position bias. `Qkv::rope` is `(cos, sin)` of `[1, T, 1, D/2]` (by position)
 or `[B, T, 1, D/2]` (by token). The masks are described with the
 [attention kernel](./kernel-library#flash-attention).
 

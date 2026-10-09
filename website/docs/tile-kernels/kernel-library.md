@@ -68,6 +68,7 @@ The online-softmax state `(m, l, o)` is carried in f32 using `exp2`.
 | `AttnMask::key_lens` | `[batch]` i32 valid key counts; blocks past the length are skipped |
 | `AttnMask::key_mask` | `[batch, tk]` i32 visible keys (row stride rounded up to 8), read in every block |
 | `AttnMask::seg_start` | `[batch, t]` i32 segment starts of packed rows, non-decreasing along `t` |
+| `AttnMask::bias` | `[batch or 1, heads, t, tk]` additive bias in the stream type (row stride rounded up to 8), read in every block and added to the scaled scores before the masks |
 
 Masks are tile-class work. Only key blocks that a causal, window, length or segment edge
 crosses compute the predicate (`select_if` on the block start); blocks fully inside run

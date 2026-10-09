@@ -24,14 +24,14 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | Операция | Формы | Опции |
 |---|---|---|
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual }`; gated `w` имеет форму `[2N, K]` |
-| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale }` |
+| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` принимают `residual` той же формы, что `x`, и возвращают `(x + residual, norm)` |
 
 `Attn::keys` — это `KeyMask::None`, `KeyMask::Lens(&lens)` (`[B]` — число валидных ключей) или
 `KeyMask::Bool(&mask)` (`[B, Tk]`, true там, где ключ учитывается). `Attn::cache` принимает
 `Cache { head_start, kv_heads, row_map, appended }`, причём `appended` требует `KeyMask::Lens`.
-`Attn::scale` по умолчанию равен `1/√D`. `Qkv::rope` — это `(cos, sin)` формы `[1, T, 1, D/2]`
+`Attn::scale` по умолчанию равен `1/√D`. `Attn::bias` (`[B, H, T, Tk]` или `[1, H, T, Tk]` в типе потока) прибавляется к масштабированным оценкам до масок, как относительное позиционное смещение WavLM. `Qkv::rope` — это `(cos, sin)` формы `[1, T, 1, D/2]`
 (по позиции) или `[B, T, 1, D/2]` (по токену). Маски описаны вместе с
 [ядром внимания](./kernel-library#flash-attention).
 
