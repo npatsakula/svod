@@ -228,6 +228,30 @@ fn test_custom_kernel_hand_ranged_loop_cpu() {
     });
 }
 
+/// A custom kernel's output is a realized buffer, so a graph op that asks for
+/// it contiguous reads it in place: the plan holds the custom kernel and the
+/// graph kernel, with no copy between them.
+#[test]
+fn a_contiguous_custom_kernel_output_is_not_copied() {
+    test_setup();
+    svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || {
+        let n = 8usize;
+        let src = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let dst = Tensor::empty(&[n], DType::Float32);
+        let mut outputs = dst.custom_kernel(&[&src], hand_ranged_add1_body(n)).expect("custom kernel should build");
+        let out = outputs.remove(0).contiguous().try_reshape([2, 4]).unwrap().contiguous();
+        let doubled = (&out * 2.0f32).unwrap();
+        let plan = doubled.prepare_with(&PrepareConfig::for_cpu_backend(CpuBackend::Clang)).unwrap();
+        assert_eq!(plan.kernels().count(), 2, "the custom kernel and the graph kernel, no copy");
+        plan.execute().unwrap();
+        let mut bytes = vec![0u8; n * 4];
+        plan.output_buffer().unwrap().copyout_prefix(&mut bytes).unwrap();
+        let got: Vec<f32> = bytes.chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let expected: Vec<f32> = (0..n).map(|x| 2.0 * (x as f32 + 1.0)).collect();
+        assert_close_f32(&got, &expected, 1e-6);
+    });
+}
+
 /// A realized shaped input (a reshaped buffer) read by a graph kernel and by
 /// the custom kernel: the graph kernel's indexed load of the shared node must
 /// not replace the call's whole-buffer argument.
