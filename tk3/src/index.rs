@@ -52,9 +52,13 @@ pub fn load_at(access: &Arc<UOp>, tag: u64) -> Arc<UOp> {
 
 /// A load through `access` where `gate` holds, zeros elsewhere (the form
 /// the late gater produces: a clean address, the gate on the load).
-pub fn load_gated_at(access: &Arc<UOp>, gate: &Arc<UOp>, tag: u64) -> Arc<UOp> {
-    let zero = UOp::load().index(access.clone()).call().vconst_like(0);
-    UOp::load().index(access.clone()).alt(zero).gate(gate.clone()).call().rtag(Some(smallvec![tag as usize]))
+pub fn load_gated_at(access: &Arc<UOp>, gate: &Arc<UOp>, zero: &Arc<UOp>, tag: u64) -> Arc<UOp> {
+    UOp::load().index(access.clone()).alt(zero.clone()).gate(gate.clone()).call().rtag(Some(smallvec![tag as usize]))
+}
+
+/// The zero a gated load of `access` yields where its gate is off.
+pub fn load_zero(access: &Arc<UOp>) -> Arc<UOp> {
+    UOp::load().index(access.clone()).call().vconst_like(0)
 }
 
 pub fn store_at(access: &Arc<UOp>, vals: Vec<Arc<UOp>>) -> Arc<UOp> {

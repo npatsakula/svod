@@ -309,7 +309,10 @@ impl<'a> Emit<'a> {
         let tag = self.next_tag();
         let idx = self.access(buf, off, w);
         let u = match gate {
-            Some(gate) => load_gated_at(&idx, gate, tag),
+            Some(gate) => {
+                let zero = self.hoist_zero(load_zero(&idx));
+                load_gated_at(&idx, gate, &zero, tag)
+            }
             None => load_at(&idx, tag),
         };
         self.push(u)
@@ -738,7 +741,7 @@ impl<'a> Emit<'a> {
             } else {
                 let v = self.mem_load(&s.buf, &src_off, chunk as u32, None);
                 let v = match gate {
-                    Some(g) => zeroed(&g, v),
+                    Some(g) => self.zeroed(&g, v),
                     None => v,
                 };
                 let vals = (0..chunk as usize).map(|e| elem(&v, e, chunk as usize)).collect();
@@ -828,7 +831,7 @@ impl<'a> Emit<'a> {
                 Some(g) if gathered => {
                     let safe = self.hoist(UOp::try_where(g.clone(), off, c32(0)).expect("safe offset"));
                     let v = self.mem_load(&s.buf, &safe, w, None);
-                    zeroed(&g, v)
+                    self.zeroed(&g, v)
                 }
                 gate => self.mem_load(&s.buf, &off, w, gate.as_ref()),
             };
@@ -1115,6 +1118,20 @@ impl<'a> Emit<'a> {
         Ok(())
     }
 
+    /// `v` where `gate` holds, else zeros: one select over the whole run (a
+    /// multiply would turn an Inf read in its place into NaN).
+    fn zeroed(&mut self, gate: &Arc<UOp>, v: Arc<UOp>) -> Arc<UOp> {
+        let zero = self.hoist_zero(v.vconst_like(0));
+        UOp::try_where(gate.clone(), v, zero).expect("zero fill")
+    }
+
+    /// A zero is one hash-consed node per type: a vector of them (rendered as
+    /// an instruction chain) is listed in the prologue rather than at its
+    /// first use, which another branch would not reach; a scalar is a literal.
+    fn hoist_zero(&mut self, zero: Arc<UOp>) -> Arc<UOp> {
+        if matches!(zero.op(), Op::Const(..) | Op::VConst(..)) { zero } else { self.hoist(zero) }
+    }
+
     fn shuffle_xor(&mut self, value: &Arc<UOp>, mask: u32) -> Arc<UOp> {
         match self.low.target.arch {
             GpuArch::Cuda(_) => shfl_bfly(value, &c32(mask as i64)),
@@ -1122,7 +1139,8 @@ impl<'a> Emit<'a> {
             GpuArch::Amd(_) => {
                 let is_f32 = value.dtype() == DType::Float32;
                 let data = if is_f32 { value.bitcast(DType::Int32) } else { value.clone() };
-                let addr = mul(&xor(&self.lane, &c32(mask as i64)), &c32(4));
+                // Pure and lane-only: listed in the prologue, so every branch reaches it.
+                let addr = self.hoist(mul(&xor(&self.lane, &c32(mask as i64)), &c32(4)));
                 let sh = UOp::custom(
                     smallvec![addr, data],
                     "declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)\ncall i32 @llvm.amdgcn.ds.bpermute(i32 {0}, i32 {1})"
@@ -1133,13 +1151,6 @@ impl<'a> Emit<'a> {
             }
         }
     }
-}
-
-/// `v` where `gate` holds, else zeros: one select over the whole run (a
-/// multiply would turn an Inf read in its place into NaN).
-fn zeroed(gate: &Arc<UOp>, v: Arc<UOp>) -> Arc<UOp> {
-    let zero = v.vconst_like(0);
-    UOp::try_where(gate.clone(), v, zero).expect("zero fill")
 }
 
 /// Whether scalar `id` reads [`Scalar::Row`], memoized in `memo`.
