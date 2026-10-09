@@ -6,7 +6,7 @@ use svod_ir::{Op, SInt, ops};
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
-use crate::ops::{self as tk, Act, Attn, Cache, KeyMask, Linear, Qkv};
+use crate::ops::{self as tk, Act, Attn, Cache, Conv, KeyMask, Linear, Qkv};
 
 /// A CUDA device to run on, with tuning off so a test does not measure
 /// every shape it touches (the untuned pick runs).
@@ -585,4 +585,105 @@ fn residual_shared_with_a_graph_norm() {
     let y = tk::linear(&ln, &w, opts).unwrap();
     assert_kernel(&y, "gemm");
     assert_close("residual over graph norm", &y, &linear_reference(&ln, &w, opts), 3e-2);
+}
+
+// ---- conv2d --------------------------------------------------------------------
+
+/// The graph fallback computed from f32 copies of the operands.
+fn conv_reference(x: &Tensor, w: &Tensor, opts: Conv) -> Tensor {
+    let f32 = |t: &Tensor| t.cast(DType::Float32);
+    let (bias, residual) = (opts.bias.map(f32), opts.residual.map(f32));
+    let out = opts.out_dtype.unwrap_or(x.dtype());
+    let opts = Conv { bias: bias.as_ref(), residual: residual.as_ref(), out_dtype: Some(out), ..opts };
+    tk::conv::graph(&f32(x), &f32(w), opts).unwrap()
+}
+
+fn conv_opts<'a>(k: usize, s: usize, bias: &'a Tensor, residual: Option<&'a Tensor>) -> Conv<'a> {
+    Conv { stride: [s, s], pad: [k / 2, k / 2], bias: Some(bias), act: Act::Silu, residual, ..Conv::default() }
+}
+
+/// The kernel, the 1×1 route through `linear` and the fallbacks all match
+/// the graph's convolution; `kernel` names the graph kernel that must run.
+#[test_case([2, 13, 11, 64], 96, 3, 1, 1, true, Some("conv"); "3x3 residual, two images")]
+#[test_case([1, 32, 32, 32], 48, 3, 2, 1, false, Some("conv"); "stride 2 on 48 wide")]
+#[test_case([1, 9, 9, 64], 64, 1, 1, 1, true, Some("gemm"); "pointwise is a linear")]
+#[test_case([1, 16, 16, 64], 64, 3, 1, 64, false, None; "depthwise keeps the graph")]
+#[test_case([1, 16, 16, 8], 32, 3, 1, 1, false, None; "eight channels keep the graph")]
+fn conv2d_matches_the_graph(
+    x: [usize; 4],
+    cout: usize,
+    k: usize,
+    s: usize,
+    groups: usize,
+    residual: bool,
+    kernel: Option<&str>,
+) {
+    if !device() {
+        return;
+    }
+    let dtype = DType::Float16;
+    let xt = rand(&x, 21, 1.0, dtype.clone());
+    let w = rand(&[cout, k, k, x[3] / groups], 22, 1.0 / ((k * k * x[3] / groups) as f32).sqrt(), dtype.clone());
+    let b = rand(&[cout], 23, 1.0, dtype.clone());
+    let out = (x[1] + 2 * (k / 2) - k) / s + 1;
+    let r = rand(&[x[0], out, (x[2] + 2 * (k / 2) - k) / s + 1, cout], 24, 2.0, dtype);
+    let opts = Conv { groups, ..conv_opts(k, s, &b, residual.then_some(&r)) };
+    let y = tk::conv2d(&xt, &w, opts.clone()).unwrap();
+    if let Some(name) = kernel {
+        assert_kernel(&y, name);
+    }
+    assert_close("conv2d", &y, &conv_reference(&xt, &w, opts), 4e-3);
+}
+
+/// An f32 output keeps the accumulator unrounded, with an f32 residual.
+#[test]
+fn conv2d_with_an_f32_output() {
+    if !device() {
+        return;
+    }
+    let x = rand(&[1, 20, 20, 96], 25, 1.0, DType::Float16);
+    let w = rand(&[64, 3, 3, 96], 26, 0.1, DType::Float16);
+    let b = rand(&[64], 27, 1.0, DType::Float16);
+    let r = rand(&[1, 20, 20, 64], 28, 1.0, DType::Float32);
+    let opts = Conv { out_dtype: Some(DType::Float32), ..conv_opts(3, 1, &b, Some(&r)) };
+    let y = tk::conv2d(&x, &w, opts.clone()).unwrap();
+    assert_eq!(y.dtype(), DType::Float32);
+    assert_kernel(&y, "conv");
+    assert_close("f32 conv2d", &y, &conv_reference(&x, &w, opts), 1e-4);
+}
+
+/// A bound batch below capacity: the live images only, the output's dim 0
+/// the variable, the same plan rebound to one image.
+#[test]
+fn conv2d_under_a_batch_variable() {
+    if !device() {
+        return;
+    }
+    let (cap, live) = (4, 3);
+    let x = rand(&[cap, 32, 32, 32], 29, 1.0, DType::Float16);
+    let r = rand(&[cap, 16, 16, 64], 30, 1.0, DType::Float16);
+    let w = rand(&[64, 3, 3, 32], 31, 0.2, DType::Float16);
+    let b = rand(&[64], 32, 1.0, DType::Float16);
+    let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
+    let [xb, rb] = <[Tensor; 2]>::try_from(bound(&[&x, &r], &var)).unwrap();
+    let y = tk::conv2d(&xb, &w, conv_opts(3, 2, &b, Some(&rb))).unwrap();
+    assert_eq!(y.shape().unwrap()[0], var.as_sint());
+    assert_kernel(&y, "conv");
+    let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], live)).unwrap();
+    assert_close("batched conv2d", &y, &conv_reference(&xs, &w, conv_opts(3, 2, &b, Some(&rs))), 4e-3);
+    let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], 1)).unwrap();
+    let want = values(&conv_reference(&xs, &w, conv_opts(3, 2, &b, Some(&rs))));
+    assert_close_values("rebound conv2d", &rebound(&y, 1, 16 * 16 * 64), &want, 4e-3);
+}
+
+/// Shapes the graph op would reject are errors, not fallbacks.
+#[test]
+fn conv2d_rejects_mismatched_operands() {
+    let x = Tensor::empty(&[1, 8, 8, 32], DType::Float16);
+    let w = Tensor::empty(&[16, 3, 3, 24], DType::Float16);
+    assert!(matches!(tk::conv2d(&x, &w, Conv::default()), Err(tk::Error::Shape { operand: "w", .. })));
+    let w = Tensor::empty(&[16, 3, 3, 32], DType::Float16);
+    let b = Tensor::empty(&[8], DType::Float16);
+    let opts = Conv { bias: Some(&b), ..Conv::default() };
+    assert!(matches!(tk::conv2d(&x, &w, opts), Err(tk::Error::Shape { operand: "bias", .. })));
 }

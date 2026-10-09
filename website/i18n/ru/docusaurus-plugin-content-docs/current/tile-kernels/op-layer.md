@@ -11,6 +11,7 @@ sidebar_label: Слой операций
 
 ```rust
 pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor>;
+pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor>;
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tensor>;
 pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)>;
 pub fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Tensor>;
@@ -25,6 +26,7 @@ pub fn supported(device: &DeviceSpec) -> bool;
 |---|---|---|
 | `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`; gated `w` имеет форму `[2N, K]` |
+| `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`; свёртка 1×1 — это `linear` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` принимают `residual` той же формы, что `x`, и возвращают `(x + residual, norm)` |
 
@@ -48,8 +50,8 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | `Target` | Тензор не на устройстве по умолчанию, или у устройства нет таблиц tk3 (сегодня — всё, кроме CUDA sm_80+) |
 | `Dtype` | Какой-либо операнд в f32, или операнды не имеют общего 16-битного типа с матричным ядром |
 | `Symbolic` | Символьна размерность, отличная от связанной ведущей (для `linear` — также символьное `N`) |
-| `Shape` | `linear`: `N` не кратно 8 или нет строк. `attention`: `D ∉ {48, 64, 128}` или пустая размерность. `heads`: `D` не степень двойки в 16..=256. Нормализации: `D` не степень двойки в 256..=2048 |
-| `Config` | Ни одна тайловая конфигурация не подходит. Для `linear` — `K` не кратно 16 |
+| `Shape` | `linear`: `N` не кратно 8 или нет строк. `attention`: `D ∉ {48, 64, 128}` или пустая размерность. `heads`: `D` не степень двойки в 16..=256. Нормализации: `D` не степень двойки в 256..=2048. `conv2d`: `groups > 1`, `Cin` не кратно 16, `Cout` не кратно 8 или пустой выход |
+| `Config` | Ни одна тайловая конфигурация не подходит. Для `linear` — `K` не кратно 16. Для `conv2d` — также классы, на которых ядро по измерениям проигрывает (мелкие свёртки с шагом 1 на полной сетке) |
 
 Реальные случаи из `test/unit/ops_plan.rs` на цели sm_86:
 

@@ -10,6 +10,7 @@ use svod_tensor::Tensor;
 use super::config;
 use crate::atoms::Target;
 use crate::kernels::attention::FaCfg;
+use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
 use crate::kernels::rows::NormCfg;
 
@@ -130,6 +131,41 @@ pub fn linear(target: Option<&Target>, dtypes: &[DType], x: Option<&Extent>, n: 
             return Err(Fallback::Shape);
         }
         candidates(config::gemm_candidates(target, batches, rows, n, k, gated), Fallback::Config)
+    })
+}
+
+/// `x [b, h, w, cin]` ⊛ `geom`'s weight; `dtypes` are those of `x`, `w` and
+/// the bias, `out` the output type and `residual` the residual's. A static
+/// batch folds into the GEMM rows, a bound one walks grid z.
+pub fn conv2d(
+    target: Option<&Target>,
+    dtypes: &[DType],
+    out: DType,
+    residual: Option<DType>,
+    x: Option<&Extent>,
+    geom: &ConvGeom,
+    groups: usize,
+) -> Plan<ConvCfg> {
+    plan(|| {
+        let (target, x) = (gate(target, dtypes)?, x.ok_or(Fallback::Symbolic)?);
+        let wide = out == DType::Float32;
+        if !(out == dtypes[0] || wide) || residual.is_some_and(|r| r != out) {
+            return Err(Fallback::Dtype);
+        }
+        let [ho, wo] = geom.out_hw();
+        let pixels = ho * wo;
+        // Columns are stored in vector runs: a run never straddles `cout`.
+        if groups != 1 || !geom.cout.is_multiple_of(8) || pixels == 0 || x.dims[0] == 0 {
+            return Err(Fallback::Shape);
+        }
+        if !geom.cin.is_multiple_of(16) {
+            return Err(Fallback::Shape);
+        }
+        let (batches, m) = if x.var { (x.dims[0], pixels) } else { (1, x.dims[0] * pixels) };
+        let mut list = config::conv_candidates(target, batches, m, geom);
+        // Grid z is the batch's when it is bound.
+        list.retain(|c| c.split == 1 || !x.var);
+        candidates(list, Fallback::Config)
     })
 }
 

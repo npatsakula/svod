@@ -14,6 +14,7 @@ sidebar_label: Библиотека ядер
 | Ядро | Спецификация → программа | Имя ядра | Операция |
 |---|---|---|---|
 | GEMM + эпилог | `GemmSpec` → `gemm::gemm` | `gemm` | `ops::linear` |
+| Свёртка (implicit GEMM) | `ConvSpec` → `conv::conv` (+ `gemm::split_merge` при разбиении K) | `conv`, `split_merge` | `ops::conv2d` |
 | Flash attention, прямой проход | `AttnSpec` → `attention::attention` | `flash_attention` | `ops::attention` |
 | Слияние разбиений | `CombineSpec` → `attention::combine` | `combine_splits` | `ops::attention` со `splits` |
 | Пролог внимания | `HeadsSpec` → `heads::heads` | `heads` | `ops::heads` |

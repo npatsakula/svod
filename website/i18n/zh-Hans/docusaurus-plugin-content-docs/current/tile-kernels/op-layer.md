@@ -8,6 +8,7 @@ sidebar_label: 算子层
 
 ```rust
 pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor>;
+pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor>;
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tensor>;
 pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)>;
 pub fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Tensor>;
@@ -26,6 +27,7 @@ pub fn supported(device: &DeviceSpec) -> bool;
 
 `Attn::keys` 可以是 `KeyMask::None`、`KeyMask::Lens(&lens)`（`[B]` 有效键数）或 `KeyMask::Bool(&mask)`（`[B, Tk]`，被关注处为 true）。`Attn::cache` 接收 `Cache { head_start, kv_heads, row_map, appended }`，而 `appended` 要求 `KeyMask::Lens`。`Attn::scale` 默认为 `1/√D`。`Attn::bias`（`[B, H, T, Tk]` 或 `[1, H, T, Tk]`，与数据流同一 dtype）在掩码之前加到缩放后的分数上，例如 WavLM 的相对位置偏置。`Qkv::rope` 是 `[1, T, 1, D/2]`（按位置）或 `[B, T, 1, D/2]`（按 token）的 `(cos, sin)`。掩码的说明见[注意力内核](./kernel-library#flash-attention)。
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`；门控的 `w` 为 `[2N, K]` |
+| `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`；1×1 卷积即 `linear` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` 接收与 `x` 同形的 `residual`，返回 `(x + residual, norm)` |
 
@@ -42,8 +44,8 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | `Target` | 张量不在默认设备上，或设备没有 tk3 配置表（目前：除 CUDA sm_80+ 之外的一切） |
 | `Dtype` | 任一操作数为 f32，或操作数没有共享同一种带矩阵核心的 16 位类型 |
 | `Symbolic` | 除绑定的首维之外还有符号维度（对 `linear` 而言，符号化的 `N` 也算） |
-| `Shape` | `linear`：`N` 不是 8 的倍数或没有行。`attention`：`D ∉ {48, 64, 128}` 或存在空维度。`heads`：`D` 不是 16..=256 范围内的 2 的幂。归一化：`D` 不是 256..=2048 范围内的 2 的幂 |
-| `Config` | 没有合适的 tile 配置。对 `linear` 而言，`K` 不是 16 的倍数 |
+| `Shape` | `linear`：`N` 不是 8 的倍数或没有行。`attention`：`D ∉ {48, 64, 128}` 或存在空维度。`heads`：`D` 不是 16..=256 范围内的 2 的幂。归一化：`D` 不是 256..=2048 范围内的 2 的幂。`conv2d`：`groups > 1`、`Cin` 不是 16 的倍数、`Cout` 不是 8 的倍数或输出为空 |
+| `Config` | 没有合适的 tile 配置。对 `linear` 而言，`K` 不是 16 的倍数。对 `conv2d` 而言，还包括实测内核落后的类别（占满网格的浅层步长 1 卷积） |
 
 `test/unit/ops_plan.rs` 中的真实用例，基于 sm_86 目标：
 

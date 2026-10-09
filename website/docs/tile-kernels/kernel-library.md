@@ -14,6 +14,7 @@ the config.
 | Kernel | Spec → program | Kernel name | Op |
 |---|---|---|---|
 | GEMM + epilogue | `GemmSpec` → `gemm::gemm` | `gemm` | `ops::linear` |
+| Implicit-GEMM convolution | `ConvSpec` → `conv::conv` (+ `gemm::split_merge` when split) | `conv`, `split_merge` | `ops::conv2d` |
 | Flash attention forward | `AttnSpec` → `attention::attention` | `flash_attention` | `ops::attention` |
 | Split merge | `CombineSpec` → `attention::combine` | `combine_splits` | `ops::attention` with `splits` |
 | Attention prologue | `HeadsSpec` → `heads::heads` | `heads` | `ops::heads` |

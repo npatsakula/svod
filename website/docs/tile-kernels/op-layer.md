@@ -10,6 +10,7 @@ itself. A model never checks whether a kernel applies and never pads to a tile.
 
 ```rust
 pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor>;
+pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor>;
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tensor>;
 pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)>;
 pub fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Tensor>;
@@ -24,6 +25,7 @@ pub fn supported(device: &DeviceSpec) -> bool;
 |---|---|---|
 | `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`; gated `w` is `[2N, K]` |
+| `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`; a 1×1 is `linear` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` take `residual` like `x` and return `(x + residual, norm)` |
 
@@ -47,8 +49,8 @@ untuned pick first. `Plan::Graph(Fallback)` says why the graph runs.
 | `Target` | The tensor is not on the default device, or the device has no tk3 tables (today: anything but CUDA sm_80+) |
 | `Dtype` | Any operand is f32, or the operands do not all share one 16-bit type with a matrix core |
 | `Symbolic` | A dim other than a bound leading one is symbolic (for `linear`, also a symbolic `N`) |
-| `Shape` | `linear`: `N` not a multiple of 8 or no rows. `attention`: `D ∉ {48, 64, 128}` or an empty dim. `heads`: `D` not a power of two in 16..=256. Norms: `D` not a power of two in 256..=2048 |
-| `Config` | No tile config fits. For `linear`, `K` is not a multiple of 16 |
+| `Shape` | `linear`: `N` not a multiple of 8 or no rows. `conv2d`: `groups > 1`, `Cin` not a multiple of 16, `Cout` not a multiple of 8, or an empty output. `attention`: `D ∉ {48, 64, 128}` or an empty dim. `heads`: `D` not a power of two in 16..=256. Norms: `D` not a power of two in 256..=2048 |
+| `Config` | No tile config fits. For `linear`, `K` is not a multiple of 16. For `conv2d`, also the classes the kernel was measured to lose (shallow stride-1 convolutions on a full grid) |
 
 Real cases from `test/unit/ops_plan.rs`, on the sm_86 target:
 
