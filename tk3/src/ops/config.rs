@@ -5,6 +5,7 @@ use svod_dtype::GpuArch;
 
 use crate::atoms::Target;
 use crate::kernels::attention::FaCfg;
+use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
 use crate::kernels::rows::NormCfg;
 
@@ -108,32 +109,67 @@ pub fn conv_cfg_fits(cfg: &GemmCfg) -> bool {
         && (bn * bk / 8).is_multiple_of(threads)
 }
 
-/// Convolution configs for `batches` grid batches of `m` output pixels,
-/// `n = cout`, `k = kh·kw·cin`. A family is eligible when `bk` (halved down
+/// Stride-1 convolutions shallower than this (`kh·kw·cin`) lose on a grid
+/// that fills the device: on sm_86, 192→192 3×3 at 40² runs 61 µs against
+/// tk1's image-staged form at 54, and 96→96 at 80² 62 µs against the graph's
+/// 59 at BEAM=4. Their starved grids win split (192→192 at 20²: 21 µs
+/// against tk1's 22.5).
+const SHALLOW_STRIDE_ONE_K: usize = 2048;
+
+/// [`conv_tiles`] where the kernel was measured to win: none for a shallow
+/// stride-1 convolution whose lead tile fills [`CONV_BLOCKS_PER_SM`] blocks
+/// per SM (the graph runs), every one elsewhere.
+pub fn conv_candidates(target: &Target, batches: usize, m: usize, g: &ConvGeom) -> Vec<ConvCfg> {
+    let tiles = conv_tiles(target, batches, m, g);
+    let sms = target.sms.unwrap_or(DEFAULT_SMS) as usize;
+    let filled = tiles.first().is_some_and(|c| {
+        let [bm, bn, _] = c.gemm.tile;
+        batches * m.div_ceil(bm) * g.cout.div_ceil(bn) >= CONV_BLOCKS_PER_SM * sms
+    });
+    if g.stride == [1, 1] && g.k() < SHALLOW_STRIDE_ONE_K && filled { vec![] } else { tiles }
+}
+
+/// Every convolution config that lowers, for `batches` grid batches of `m`
+/// output pixels of `g` (`n = cout`, `k = kh·kw·cin`). A family is eligible when `bk` (halved down
 /// to 16 until it divides `cin`, so a step stays in one tap) lowers and its
-/// tiles pad `m × n` by at most 1/16. The lead is the largest eligible
-/// family whose grid gives every SM [`CONV_BLOCKS_PER_SM`] blocks, else the
-/// eligible one with the most blocks; its pipeline variants follow, then
-/// every other eligible family.
-pub fn conv_candidates(target: &Target, batches: usize, m: usize, n: usize, k: usize, cin: usize) -> Vec<GemmCfg> {
+/// tiles pad `m × n` by at most 1/8. The lead is the largest eligible
+/// family whose grid gives every SM [`CONV_BLOCKS_PER_SM`] blocks, preferring
+/// at most 1/16 padding, else the eligible one with the most blocks; its pipeline variants follow, then
+/// every other eligible family. On a starved grid (fewer than twice
+/// [`CONV_BLOCKS_PER_SM`] blocks per SM, a single static batch) the lead
+/// and the family with the most blocks also come split over the reduction,
+/// in counts dividing the steps that keep at most 16 blocks per SM, as do the
+/// families with the most blocks at 1/16 and at 1/8 padding.
+pub fn conv_tiles(target: &Target, batches: usize, m: usize, g: &ConvGeom) -> Vec<ConvCfg> {
+    let (n, k, cin) = (g.cout, g.k(), g.cin);
     if m == 0 || n == 0 || k == 0 {
         return vec![];
     }
     let sms = target.sms.unwrap_or(DEFAULT_SMS) as usize;
+    // The share of the tiles' area past `m × n`.
+    let padding = |c: &GemmCfg| {
+        let [bm, bn, _] = c.tile;
+        let area = m.div_ceil(bm) * bm * n.div_ceil(bn) * bn;
+        (area - m * n) as f64 / area as f64
+    };
     let fit = |mut c: GemmCfg| {
         while !cin.is_multiple_of(c.tile[2]) && c.tile[2] > 16 {
             c.tile[2] /= 2;
         }
-        let [bm, bn, bk] = c.tile;
-        let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
-        let padded = 16 * (gm * bm * gn * bn - m * n) <= gm * bm * gn * bn;
-        (padded && cin.is_multiple_of(bk) && conv_cfg_fits(&c) && c.smem_bytes(false) <= target.smem_bytes).then_some(c)
+        (padding(&c) <= 1.0 / 8.0
+            && cin.is_multiple_of(c.tile[2])
+            && conv_cfg_fits(&c)
+            && c.smem_bytes(false) <= target.smem_bytes)
+            .then_some(c)
     };
     let eligible: Vec<GemmCfg> = CONV_FAMILIES.into_iter().filter_map(fit).collect();
     let blocks = |c: &GemmCfg| batches * m.div_ceil(c.tile[0]) * n.div_ceil(c.tile[1]);
+    let fills = |c: &&GemmCfg| blocks(c) >= CONV_BLOCKS_PER_SM * sms;
     let Some(&base) = eligible
         .iter()
-        .find(|c| blocks(c) >= CONV_BLOCKS_PER_SM * sms)
+        .filter(|c| padding(c) <= 1.0 / 16.0)
+        .find(fills)
+        .or_else(|| eligible.iter().find(fills))
         .or_else(|| eligible.iter().max_by_key(|c| blocks(c)))
     else {
         return vec![];
@@ -144,9 +180,25 @@ pub fn conv_candidates(target: &Target, batches: usize, m: usize, n: usize, k: u
         GemmCfg { unroll: !base.unroll, ..base },
     ];
     let mut out = vec![base];
-    for c in variants.into_iter().filter_map(fit).chain(eligible) {
+    for c in variants.into_iter().filter_map(fit).chain(eligible.iter().copied()) {
         if !out.contains(&c) {
             out.push(c);
+        }
+    }
+    let mut out: Vec<ConvCfg> = out.into_iter().map(|gemm| ConvCfg { gemm, split: 1 }).collect();
+    let widest = |tight: bool| {
+        let pick = eligible.iter().filter(|c| !tight || padding(c) <= 1.0 / 16.0).max_by_key(|c| blocks(c));
+        pick.copied().unwrap_or(base)
+    };
+    if batches == 1 && blocks(&base) < 2 * CONV_BLOCKS_PER_SM * sms {
+        for gemm in [base, widest(true), widest(false)] {
+            let trips = k / gemm.tile[2];
+            for split in [2, 3, 4, 6, 9] {
+                let c = ConvCfg { gemm, split };
+                if trips.is_multiple_of(split) && blocks(&gemm) * split <= 16 * sms && !out.contains(&c) {
+                    out.push(c);
+                }
+            }
         }
     }
     out
