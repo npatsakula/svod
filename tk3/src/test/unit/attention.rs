@@ -414,8 +414,10 @@ fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, 
     assert!(worst < 2e-2, "max abs diff {worst}");
 }
 
-/// Throughput against tk1's flash attention on the same device: causal and
-/// plain, head dim 64 and 128 (run with `--ignored --nocapture --release`).
+/// Flash attention throughput at B 4, H 8, T 2048 bf16: causal and plain,
+/// head dim 64 and 128 (run with `--ignored --nocapture --release`). tk1's
+/// `flash_attention_with`, last measured here on the 3060 before its removal,
+/// in TFLOP/s: d64 23.0, d64 causal 20.7, d128 22.3, d128 causal 16.5.
 #[test]
 #[ignore = "perf probe: needs a CUDA device"]
 fn attention_throughput_probe() {
@@ -454,13 +456,6 @@ fn attention_throughput_probe() {
             plan.execute_with_vars(&[("b", batch as i64)]).unwrap();
             plans.push((format!("tk3 d{d} causal={causal} bq{bq} bkv{bkv}"), plan));
         }
-        let shape = [batch, t, heads, d];
-        let (q4, k4, v4) =
-            (q.try_reshape(shape).unwrap(), k.try_reshape(shape).unwrap(), v.try_reshape(shape).unwrap());
-        let opts = svod_tk::FaOpts { causal, ..Default::default() };
-        if let Ok(Some(tk1)) = svod_tk::flash_attention_with(&q4, &k4, &v4, opts) {
-            plans.push((format!("tk1 d{d} causal={causal}"), tk1.prepare().unwrap()));
-        }
         // The 3060 idles at a low clock: spin the first plan for half a second.
         let warm = std::time::Instant::now();
         while warm.elapsed().as_millis() < 500 {
@@ -488,9 +483,10 @@ fn attention_throughput_probe() {
 
 /// A Whisper large-v3 decoder step on the device: self attention over a
 /// layer-packed cache with the step's key appended, and cross attention
-/// over a shared 1500-key cache, tk3 (tuned splits, then unsplit) against
-/// tk1's single-query kernel (its split policy, then unsplit). Prints
+/// over a shared 1500-key cache, tuned splits then unsplit. Prints
 /// microseconds per step and never asserts (run with `--ignored --nocapture`).
+/// tk1's single-query kernel under its split policy, last measured here on
+/// the 3060 before its removal: self 89.1 µs, cross 78.8 µs (636 µs unsplit).
 #[test]
 #[ignore = "perf probe: needs a CUDA device"]
 fn decode_throughput_probe() {
@@ -522,8 +518,6 @@ fn decode_throughput_probe() {
     let cross_k = f16(&[1, 1500, layers * heads, d], 6);
     let cross_v = f16(&[1, 1500, layers * heads, d], 7);
     let map = ints(vec![0; b]);
-    let q32 = q.cast(DType::Float32).contiguous();
-    q32.realize().unwrap();
 
     let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
     for (name, splits) in [("tuned", None), ("unsplit", Some(1))] {
@@ -535,17 +529,6 @@ fn decode_throughput_probe() {
         let cache = Cache { head_start: layer * heads, kv_heads: heads, row_map: Some(&map), appended: None };
         let o = tk::attention(&q, &cross_k, &cross_v, Attn { cache: Some(cache), splits, ..Attn::default() }).unwrap();
         plans.push((format!("tk3 cross {name}"), o.prepare().unwrap()));
-    }
-    for (name, split) in [("policy", None), ("unsplit", Some(1))] {
-        let opts =
-            svod_tk::SqAttentionOpts { key_lens: Some(&lens), appended: Some((&k_app, &v_app)), ..Default::default() };
-        if let Ok(Some(o)) = svod_tk::single_query_attention_packed(&q32, &self_k, &self_v, layer * heads, opts) {
-            plans.push((format!("tk1 self {name}"), o.prepare().unwrap()));
-        }
-        let opts = svod_tk::SqAttentionOpts { split, cache_map: Some(&map), ..Default::default() };
-        if let Ok(Some(o)) = svod_tk::single_query_attention_packed(&q32, &cross_k, &cross_v, layer * heads, opts) {
-            plans.push((format!("tk1 cross {name}"), o.prepare().unwrap()));
-        }
     }
     let warm = std::time::Instant::now();
     while warm.elapsed().as_millis() < 500 {

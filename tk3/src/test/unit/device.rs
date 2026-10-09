@@ -98,8 +98,9 @@ fn check_gemm(target: &Target, m: usize, n: usize, k: usize, cfg: GemmCfg) {
     eprintln!("{cfg:?}: max abs diff {worst:.3e}");
 }
 
-/// Throughput probe against tk1's `gemm_nt` on the same device and shapes;
-/// prints TFLOP/s and never asserts (run with `--ignored --nocapture`).
+/// Throughput probe of tk3 GEMM configs at 4096³ bf16; prints TFLOP/s and
+/// never asserts (run with `--ignored --nocapture`). tk1's `gemm_nt`, last
+/// measured here on the 3060 before its removal: 25.8 TFLOP/s.
 #[test]
 #[ignore = "perf probe: needs a CUDA device"]
 fn gemm_throughput_probe() {
@@ -135,10 +136,6 @@ fn gemm_throughput_probe() {
             out.prepare().unwrap(),
         ));
     }
-    let a2 = a_t.try_reshape([m, k]).unwrap();
-    let b2 = b_t.try_reshape([n, k]).unwrap();
-    let tk1 = svod_tk::gemm_nt(&a2, &b2).unwrap().expect("tk1 serves this shape");
-    plans.push(("tk1 gemm_nt".to_string(), tk1.prepare().unwrap()));
 
     // Round-robin so clock drift hits every candidate alike; keep the best.
     // The 3060 idles at a low clock: spin the first plan for half a second.
