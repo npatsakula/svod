@@ -115,6 +115,20 @@ fn valloc_maps_and_resolves_then_vfree() {
     assert_eq!(m.resolve(vm.va_addr), None);
 }
 
+/// A zero-byte request maps one page, as KFD's does, in both physical layouts:
+/// the VA alignment is read off the rounded size, which must not be zero.
+#[test]
+fn a_zero_byte_valloc_maps_one_page() {
+    let mut m = mm();
+    for contiguous in [false, true] {
+        let vm = m.valloc(0, 0x1000, false, contiguous).expect("valloc");
+        assert_eq!(vm.size, 0x1000);
+        assert!(m.resolve(vm.va_addr).is_some());
+        m.vfree(&vm);
+        assert_eq!(m.resolve(vm.va_addr), None);
+    }
+}
+
 #[test]
 fn valloc_contiguous_is_one_segment() {
     let mut m = mm();

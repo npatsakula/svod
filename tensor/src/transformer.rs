@@ -38,7 +38,7 @@ impl Tensor {
 
         // one-hot mask: [*idx_shape, vocab] bool — True where the vocab row
         // matches the index value.
-        let vocab_arange = Tensor::arange(0, Some(vocab_size as i64), None)?.cast(indices.uop().dtype());
+        let vocab_arange = Tensor::index_arange(vocab_size, &indices.uop().dtype())?;
         let mask = indices.try_unsqueeze(-1)?.try_eq(&vocab_arange)?;
 
         // Reshape weight to [1... (per idx dim), vocab, embed] so its trailing

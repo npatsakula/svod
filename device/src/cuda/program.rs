@@ -424,6 +424,8 @@ impl Program for CudaProgram {
         if wait { self.dev.synchronize_lane(lane) } else { Ok(()) }
     }
 
+    /// The run is warm: two events on the stream bracket the launch, and
+    /// nothing flushes the caches the stream's earlier work left.
     unsafe fn execute_timed(
         &self,
         buffers: &[*mut u8],

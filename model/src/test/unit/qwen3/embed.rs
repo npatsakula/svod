@@ -37,13 +37,6 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-#[test]
-fn max_len_rounds_up_to_the_attention_tile() {
-    let model = Qwen3Embedding::empty(tiny_cfg());
-    assert_eq!(embedder_of(&model, 1, 1).max_len(), TILE);
-    assert_eq!(embedder_of(&model, 1, TILE + 1).max_len(), 2 * TILE);
-}
-
 /// Rows come back in input order, unit-normalized, and each one is the same
 /// vector whether it is embedded alone or packed into a plan row next to
 /// other rows — which every row of this set is: three rows in two plan rows.

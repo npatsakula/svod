@@ -1,0 +1,12 @@
+[project]
+name = "scripts"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "safetensors>=0.8.0",
+    "torch>=2.13.0",
+    "transformers>=5.14.1",
+    "ultralytics==8.4.153",
+]

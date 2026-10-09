@@ -5,9 +5,11 @@
 //! kernel cannot be regression-tested by its IR text. The *graph*, however, is fully
 //! deterministic: every [`UOp`] carries a recursive structural `content_hash`
 //! (op-variant + dtype + op-data + child hashes, excluding the global id — the very
-//! hash hash-consing dedups by, [`svod_ir`] `xxh64` seed 0). This module exposes it
-//! as a stable [`KernelFingerprint`] — the right oracle for proving a
-//! behavior-preserving refactor and for golden-testing a kernel builder.
+//! hash hash-consing dedups by, [`svod_ir`] `xxh64` seed 0). The hash also mixes in
+//! a node's origin, a process-local scope id, so the graph is fingerprinted with its
+//! origins cleared. This module exposes it as a stable [`KernelFingerprint`] — the
+//! right oracle for proving a behavior-preserving refactor, for golden-testing a
+//! kernel builder, and for keying a tune line another process reads.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,9 +20,9 @@ use svod_ir::UOp;
 /// [`Self::digest`] ⇒ structurally identical graphs (same ops, dtypes, edges, tags).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelFingerprint {
-    /// High 64 bits: the SINK's recursive `content_hash` (the whole graph's
-    /// structure). Low 64 bits: an order-independent fold of every node's `tag` —
-    /// the one datum `content_hash` omits. Stable across builds/machines.
+    /// High 64 bits: the origin-free SINK's recursive `content_hash` (the whole
+    /// graph's structure). Low 64 bits: an order-independent fold of every node's
+    /// `tag` — the one datum `content_hash` omits. Stable across builds/machines.
     pub digest: u128,
     /// Per-op-variant node count (keyed by the op's discriminant), for informative
     /// golden-mismatch diffs.
@@ -30,9 +32,10 @@ pub struct KernelFingerprint {
 }
 
 /// Fingerprint the UOp graph rooted at `sink` (typically a [`crate::Kernel::finish`]
-/// SINK). Pure and deterministic: invariant to the global id counter and to the
-/// non-deterministic render stage.
+/// SINK). Pure and deterministic: invariant to the global id counter, to the origin
+/// scopes the graph was built under, and to the non-deterministic render stage.
 pub fn kernel_fingerprint(sink: &Arc<UOp>) -> KernelFingerprint {
+    let sink = sink.without_origins();
     let nodes = sink.toposort();
     let mut tag_fold: u64 = 0;
     let mut op_counts: BTreeMap<String, u32> = BTreeMap::new();

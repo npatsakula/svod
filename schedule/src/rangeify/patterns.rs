@@ -18,7 +18,7 @@ use smallvec::SmallVec;
 use svod_device::DeviceSpec;
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::uop::cached_property::CachedProperty;
-use svod_ir::uop::properties::SoundVminVmaxProperty;
+use svod_ir::uop::properties::{RangesProperty, SoundVminVmaxProperty};
 use svod_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey, UnaryOp};
 
 use crate::TypedPatternMatcher;
@@ -1297,6 +1297,102 @@ fn gated_collapse_core(idx: &Arc<UOp>, range: &Arc<UOp>, end: &Arc<UOp>, expr: &
     UOp::try_where(in_bounds, substituted, zero_like).ok()
 }
 
+/// Whether `node` depends on `range` — the question the reduce-collapse family
+/// actually asks, where `no_range` asks the stricter "depends on no range at all".
+///
+/// `RangesProperty` is the cached backward slice of RANGEs and excludes the node
+/// itself, so a bare range is tested separately. Reading the cache beats a
+/// memoized walk here: this runs per candidate inside the rewrite fixed point,
+/// and a slice holds a handful of ranges.
+fn reaches(node: &Arc<UOp>, range: &Arc<UOp>) -> bool {
+    Arc::ptr_eq(node, range) || RangesProperty::get(node).iter().any(|r| Arc::ptr_eq(r, range))
+}
+
+/// Whether casting `value` to `dtype` keeps its values distinct — either the
+/// destination covers the source format outright, or it covers the values this
+/// node provably takes. A cast that merged two values would let several steps
+/// of the reduction satisfy the equality, and keeping one would drop the rest.
+pub(crate) fn cast_is_injective(value: &Arc<UOp>, dtype: &DType) -> bool {
+    let (Some((lo, hi)), Some(format)) = (int_limits(dtype), int_limits(&value.dtype())) else { return false };
+    let fits = |(min, max): (i128, i128)| lo <= min && max <= hi;
+    fits(format) || sound_int_bounds(value).is_some_and(fits)
+}
+
+fn int_value(value: &ConstValue) -> Option<i128> {
+    match *value {
+        ConstValue::Int(v) => Some(i128::from(v)),
+        ConstValue::UInt(v) => Some(i128::from(v)),
+        _ => None,
+    }
+}
+
+/// The values an int dtype holds. `ConstValue::{min, max}` give `Index` the i64
+/// range it lowers into, where `DType::{min_value, max_value}` say `0..=0`, which
+/// any bounds would fit.
+fn int_limits(dtype: &DType) -> Option<(i128, i128)> {
+    dtype.is_int().then_some(())?;
+    Some((int_value(&ConstValue::min(dtype.base()))?, int_value(&ConstValue::max(dtype.base()))?))
+}
+
+fn sound_int_bounds(node: &Arc<UOp>) -> Option<(i128, i128)> {
+    SoundVminVmaxProperty::get(node).as_ref().and_then(|(min, max)| Some((int_value(min)?, int_value(max)?)))
+}
+
+/// The dtype `idx + by` (`idx - by` when `negate`) computes in without wrapping:
+/// `idx`'s own where the operands' bounds keep the result inside it, else i64
+/// where they keep it there. `idx == arange(2, 7)` does no arithmetic on `idx`, so
+/// the `idx - 2` read off it must not wrap an i32 index near its minimum past the
+/// bounds check [`gated_collapse_core`] puts on it.
+fn wrap_free_dtype(idx: &Arc<UOp>, by: &Arc<UOp>, negate: bool) -> Option<DType> {
+    let bounds = |node: &Arc<UOp>| sound_int_bounds(node).or_else(|| int_limits(&node.dtype()));
+    let ((lo, hi), (by_lo, by_hi)) = (bounds(idx)?, bounds(by)?);
+    let (lo, hi) = if negate { (lo - by_hi, hi - by_lo) } else { (lo + by_lo, hi + by_hi) };
+    let holds = |dtype: &DType| int_limits(dtype).is_some_and(|(min, max)| min <= lo && hi <= max);
+    [idx.dtype(), DType::Int64].into_iter().find(holds)
+}
+
+/// `idx + by`, or `idx - by` when `negate`, in [`wrap_free_dtype`].
+fn shift(idx: &Arc<UOp>, by: &Arc<UOp>, negate: bool) -> Option<Arc<UOp>> {
+    let dtype = wrap_free_dtype(idx, by, negate)?;
+    let widen = |node: &Arc<UOp>| if node.dtype() == dtype { node.clone() } else { node.cast(dtype.clone()) };
+    let (idx, by) = (widen(idx), widen(by));
+    if negate { idx.try_sub(&by) } else { idx.try_add(&by) }.ok()
+}
+
+/// `other == cast(src)` read as `other' == src`, with `other'` the inverse cast of
+/// `other` (and `<` read the same way). Sound only when both casts keep their
+/// values: `cast` over `src`, so one step still matches one value, and the inverse
+/// over `other`, so nothing outside `src`'s dtype folds onto a value inside it
+/// (`2^32 + 3` onto 3 when `cast` widens i32 to i64). A cast that keeps every value
+/// keeps their order too.
+fn peel_cast(cast: &Arc<UOp>, src: &Arc<UOp>, other: &Arc<UOp>) -> Option<Arc<UOp>> {
+    (cast_is_injective(src, &cast.dtype()) && cast_is_injective(other, &src.dtype())).then(|| other.cast(src.dtype()))
+}
+
+/// Rewrite `idx == cmp` into the equivalent `idx' == range`, peeling casts and
+/// range-invariant arithmetic off `cmp` and applying the inverse to `idx`.
+///
+/// The compared side is hardly ever the bare range: `gather` builds its arange
+/// from a reduce that collapses to `(r + 1) + (-1)` under the index-dtype casts,
+/// which is `r` and does not match as `r`.
+pub(crate) fn solve_for_range(idx: &Arc<UOp>, cmp: &Arc<UOp>, range: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let (mut idx, mut cmp) = (idx.clone(), cmp.clone());
+    // Every step replaces `cmp` with one of its sources, so its depth bounds the walk.
+    loop {
+        if Arc::ptr_eq(&cmp, range) {
+            return Some(idx);
+        }
+        let step = match cmp.op() {
+            Op::Cast(ops::Cast { src, .. }) => (peel_cast(&cmp, src, &idx)?, src.clone()),
+            Op::Binary(BinaryOp::Add, x, y) if !reaches(y, range) => (shift(&idx, y, true)?, x.clone()),
+            Op::Binary(BinaryOp::Add, x, y) if !reaches(x, range) => (shift(&idx, x, true)?, y.clone()),
+            Op::Binary(BinaryOp::Sub, x, y) if !reaches(y, range) => (shift(&idx, y, false)?, x.clone()),
+            _ => return None,
+        };
+        (idx, cmp) = step;
+    }
+}
+
 /// Reduction collapse patterns:
 /// 1. Sum of `where(r < cut, 0, val)` → `clamp(end-cut, 0, end) * val`
 /// 2. Sum of `where(r < cut, val, 0)` → `clamp(cut, 0, end) * val`
@@ -1392,30 +1488,33 @@ fn try_reduce_collapse(
     // Both collapse to: where(in_bounds, expr[r:=idx.valid(v)], 0)
     // NE: idx != r with zero in true_val, expression in false_val
     // EQ: idx == r with expression in true_val, zero in false_val
-    // Also handles .or_casted(): unwraps CAST around the range operand.
+    //
+    // Which side carries the range decides the orientation. `no_range` cannot
+    // decide it: it asks whether a node reaches *any* range, and a gather's
+    // index reaches the output ranges by construction — it is a different index
+    // per output element — so neither side is range-free, both tests fail and
+    // the arm gives up on the very shape it was written for. `solve_for_range`
+    // then moves whatever wraps the range over onto the index.
     //
     // A shape that is not NE/EQ over this range must FALL THROUGH to Pattern 4:
     // an `And` condition is exactly what the two-sided rule below is written for.
-    if let Some((idx, cmp_range, expr)) = match cond.op() {
-        // NE: where(idx != range_side, 0, expr).
-        Op::Binary(BinaryOp::Ne, idx, ne_range) if is_const_zero(true_val) && no_range(idx) => {
-            Some((idx, ne_range, false_val))
-        }
-        // EQ: where(idx == range_side, expr, 0) — Svod-specific
-        Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => {
-            if no_range(lhs) {
-                Some((lhs, rhs, true_val))
-            } else if no_range(rhs) {
-                Some((rhs, lhs, true_val))
-            } else {
-                None
-            }
-        }
+    if let Some((lhs, rhs, expr)) = match cond.op() {
+        Op::Binary(BinaryOp::Ne, lhs, rhs) if is_const_zero(true_val) => Some((lhs, rhs, false_val)),
+        Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => Some((lhs, rhs, true_val)),
         _ => None,
     } {
-        let actual_range = if let Op::Cast(ops::Cast { src, .. }) = cmp_range.op() { src } else { cmp_range };
-        if Arc::ptr_eq(actual_range, range) {
-            return gated_collapse_core(idx, range, end, expr);
+        // Exactly one side may carry the range; with it on both there is no
+        // single step to pick out, and with it on neither there is nothing to
+        // pick it out of.
+        let oriented = match (reaches(lhs, range), reaches(rhs, range)) {
+            (false, true) => Some((lhs, rhs)),
+            (true, false) => Some((rhs, lhs)),
+            _ => None,
+        };
+        if let Some((idx, cmp)) = oriented
+            && let Some(idx) = solve_for_range(idx, cmp, range)
+        {
+            return gated_collapse_core(&idx, range, end, expr);
         }
     }
 
@@ -1520,10 +1619,11 @@ fn try_param_factor(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<
 /// - (x + y) < c → x < (c - y) when y, c are range-free
 /// - (x * y) < c → x < ceil(c/y) when y > 0, y, c range-free
 ///
-/// Also handles `.or_casted()` variants where lhs is wrapped in a CAST:
+/// Also handles `.or_casted()` variants, where lhs is wrapped in a CAST and
+/// [`peel_cast`] reads `c` in the inner dtype:
 /// - Cast(x + y) < c → x < (c.cast(inner_dtype) - y)
 /// - Cast(x * y) < c → x < ceil(c.cast(inner_dtype)/y)
-fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
+pub(crate) fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Binary(BinaryOp::Lt, lhs, rhs) = cond.op() else {
         return None;
     };
@@ -1534,13 +1634,9 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     // Unwrap optional CAST to get the inner expression (or_casted pattern).
-    // When CAST is present, we need to cast the rhs constant to the inner dtype.
-    let (inner_lhs, effective_rhs) = if let Op::Cast(ops::Cast { src, .. }) = lhs.op() {
-        let inner_dtype = src.dtype();
-        let casted_rhs = rhs.cast(inner_dtype);
-        (src.as_ref(), casted_rhs)
-    } else {
-        (lhs.as_ref(), rhs.clone())
+    let (inner_lhs, effective_rhs) = match lhs.op() {
+        Op::Cast(ops::Cast { src, .. }) => (src.as_ref(), peel_cast(lhs, src, rhs)?),
+        _ => (lhs.as_ref(), rhs.clone()),
     };
 
     // Pattern: (x + y) < c → x < (c - y). ADD is commutative, so try both
@@ -1592,7 +1688,7 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// - (x + y) == c → x == (c - y) or y == (c - x)
 /// - (x - y) == c → x == (c + y) or y == (x - c)
 /// - Cast(x ± y) == c → same with c cast to inner dtype
-fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
+pub(crate) fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Binary(BinaryOp::Eq, raw_lhs, raw_rhs) = cond.op() else { return None };
 
     // Normalize: range-containing side on lhs, range-free on rhs.
@@ -1606,20 +1702,26 @@ fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     };
 
-    // Unwrap optional CAST, adjusting rhs to inner dtype
-    let (inner_lhs, effective_rhs) = if let Op::Cast(ops::Cast { src, .. }) = lhs.op() {
-        (src.as_ref(), rhs.cast(src.dtype()))
-    } else {
-        (lhs.as_ref(), rhs.clone())
+    // Unwrap optional CAST, reading rhs in the inner dtype
+    let (inner_lhs, effective_rhs) = match lhs.op() {
+        Op::Cast(ops::Cast { src, .. }) => (src.as_ref(), peel_cast(lhs, src, rhs)?),
+        _ => (lhs.as_ref(), rhs.clone()),
     };
 
     match inner_lhs.op() {
-        Op::Binary(BinaryOp::Add, x, y) if no_range(y) => x.try_cmpeq(&effective_rhs.try_sub(y).ok()?).ok(),
-        Op::Binary(BinaryOp::Add, x, y) if no_range(x) => y.try_cmpeq(&effective_rhs.try_sub(x).ok()?).ok(),
-        Op::Binary(BinaryOp::Sub, x, y) if no_range(y) => x.try_cmpeq(&effective_rhs.try_add(y).ok()?).ok(),
-        Op::Binary(BinaryOp::Sub, x, y) if no_range(x) => y.try_cmpeq(&x.try_sub(&effective_rhs).ok()?).ok(),
+        Op::Binary(BinaryOp::Add, x, y) if no_range(y) => x.try_cmpeq(&lifted(&effective_rhs, y, true)?).ok(),
+        Op::Binary(BinaryOp::Add, x, y) if no_range(x) => y.try_cmpeq(&lifted(&effective_rhs, x, true)?).ok(),
+        Op::Binary(BinaryOp::Sub, x, y) if no_range(y) => x.try_cmpeq(&lifted(&effective_rhs, y, false)?).ok(),
+        Op::Binary(BinaryOp::Sub, x, y) if no_range(x) => y.try_cmpeq(&lifted(x, &effective_rhs, true)?).ok(),
         _ => None,
     }
+}
+
+/// `c - y` (`c + y` unless `negate`), the side an EQ or NE lift moves `y` onto,
+/// only where it cannot wrap in `c`'s dtype. Elsewhere the comparison stays as it
+/// is, and the gated collapse solves it in i64 ([`solve_for_range`]).
+fn lifted(c: &Arc<UOp>, y: &Arc<UOp>, negate: bool) -> Option<Arc<UOp>> {
+    (wrap_free_dtype(c, y, negate)? == c.dtype()).then(|| if negate { c.try_sub(y) } else { c.try_add(y) }.ok())?
 }
 
 /// Arithmetic lifting for Ge comparisons.
@@ -1729,18 +1831,13 @@ pub fn build_reduce_load_collapse_matcher() -> &'static TypedPatternMatcher<()> 
 fn ne_lifting_patterns() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // NE lifting: (x + y) != c → x != (c - y) when no_range(y, c)
-        Ne(Add(x, y), c) if no_range(y) && no_range(c) => {
-            let new_c = c.try_sub(y).ok()?;
-            x.try_cmpne(&new_c).ok()
-        },
+        Ne(Add(x, y), c) if no_range(y) && no_range(c) => x.try_cmpne(&lifted(c, y, true)?).ok(),
 
         // .or_casted() NE: Cast(x + y) != c → x != (c.cast(inner_dtype) - y)
-        Ne(Cast { src: inner, .. }, c) if no_range(c) => {
+        Ne(cast @ Cast { src: inner, .. }, c) if no_range(c) => {
             let Op::Binary(BinaryOp::Add, x, y) = inner.op() else { return None };
             if !no_range(y) { return None; }
-            let casted_c = c.cast(inner.dtype());
-            let new_c = casted_c.try_sub(y).ok()?;
-            x.try_cmpne(&new_c).ok()
+            x.try_cmpne(&lifted(&peel_cast(cast, inner, c)?, y, true)?).ok()
         },
     }
 }

@@ -809,14 +809,62 @@ impl Program for AmdProgram {
             owner.synchronize()?;
         } else {
             crate::device::PlanContext::finish_replay(&owner)?;
-            // Fire-and-forget with a throwaway owner (BEAM timing): nothing
-            // durable records this submission, so park its finalizer in the
-            // core's unattributed list for scoped host waits.
+            // Fire-and-forget with a throwaway owner: nothing durable records
+            // this submission, so park its finalizer in the core's unattributed
+            // list for scoped host waits.
             if let Some(token) = owner.completion_token() {
                 self.dev.core().record_unattributed(token);
             }
         }
         Ok(())
+    }
+
+    /// The dispatch's own span on the GPU's 100 MHz clock, from the two
+    /// `release_mem_timestamp` probes `profile=true` brackets it with.
+    ///
+    /// Without this a tuner times AMD on the host clock, which charges the
+    /// kernel for the whole submit path: the PM4 stream rebuilt per call, the
+    /// ring memcpy and doorbell, and — unboundedly — a scratch regrow in
+    /// `ensure_has_local_memory` or a kernarg-arena wrap that drains the
+    /// device. The first of those is driven by the candidate's own
+    /// `private_segment_fixed_size`, so it lands on spilling candidates
+    /// specifically and no amount of repetition averages it out.
+    ///
+    /// The run is cold: like every dispatch here it goes behind the coherence
+    /// barrier, which writes back and invalidates the whole cache hierarchy, L2
+    /// included. The probes touch no cache, so the span is the kernel's alone.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Program::execute`].
+    unsafe fn execute_timed(
+        &self,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    ) -> Result<Option<std::time::Duration>> {
+        let alloc = crate::amd::AmdAllocator::new(self.device_id)?;
+        let owner = crate::amd::connector::OwnerCtx::new(Arc::clone(self.dev.core()), alloc);
+        // `profile=true` obliges us to hold the handle until after the drain:
+        // the probes write into scratch it owns. SAFETY: forwarded contract.
+        let stamps = unsafe {
+            crate::device::PlanContext::dispatch(
+                &owner,
+                self,
+                buffers,
+                vals,
+                global_size,
+                local_size,
+                /*profile=*/ true,
+            )?
+        };
+        // Poisons the device and propagates on a faulting candidate, exactly as
+        // the untimed path does, so a tuner drops it instead of hanging.
+        owner.synchronize()?;
+        Ok(stamps
+            .and_then(|stamps| stamps.timestamps_ns())
+            .map(|(start, end)| std::time::Duration::from_nanos(end - start)))
     }
 
     fn name(&self) -> &str {

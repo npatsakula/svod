@@ -81,6 +81,10 @@ pub const WARP_THREADS: usize = 64;
 const _: () = assert!(WARP_THREADS == ArchCaps::GFX942.wave_size);
 
 // ── Use the built-in kernels (Tensor in → Tensor out) ───────────────────────
+pub use kernels::conv::{
+    CONV_K_FLOOR, CONV_SUPPORTED_ARCHS, ConvGeom, ConvPlan, PatchCfg, conv2d_nhwc, conv2d_nhwc_worth_asking,
+    select_conv_cfg,
+};
 pub use kernels::fa::{
     FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaMask, FaOpts, flash_attention, flash_attention_supported,
     flash_attention_tuned, flash_attention_with,
@@ -95,7 +99,7 @@ pub use target::ArchSet;
 
 // ── Author your own kernel (the tile DSL) ───────────────────────────────────
 pub use arch::ArchCaps;
-pub use group::{ArgDir, Group, LoadInto, MoveIdx, StoreInto, SwapDir};
+pub use group::{ArgDir, Group, LoadInto, MoveIdx, RowStore, StoreInto, SwapDir};
 pub use index::IntoIdxs;
 pub use kernel::{Grid, Kernel};
 pub use launch::{graph_launch, graph_launch_multi, launch_custom, static_past_batch}; // wrap a hand kernel as a lazy Tensor graph node / kernel entry

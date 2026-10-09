@@ -497,6 +497,34 @@ fn pm4_dispatch_timestamp_probe() {
     output.raw.free_amd_device_in_place();
 }
 
+/// `Program::execute_timed` on AMD returns the probes' GPU-clock span, not the
+/// caller's wall clock — the AMD twin of CUDA's `timed_execution_reports_gpu_duration`.
+/// The span must be shorter than the wall time around it, because the wall time
+/// also holds the submit path and the drain that the stamps exist to exclude.
+///
+/// Run: `SVOD_DEVICE=AMD:0 cargo test -p svod-device --lib execute_timed_reports -- --ignored --test-threads=1`
+#[test]
+#[ignore = "manual hardware probe; needs a real AMD GPU + clang"]
+fn execute_timed_reports_the_gpu_span() {
+    let Some(alloc) = amd_alloc_or_skip() else { return };
+    ensure_hw_signal_pool(&alloc);
+    let Some(bytes) = clang_amdgcn(STORE_ZERO_IR, alloc.dev.arch.mcpu()) else { return };
+    let program = AmdProgram::load(alloc.dev.clone(), &alloc, &bytes, "store_zero", &global_f32_buffer_abi())
+        .expect("load program");
+    let output = ProbeBuffer::new(&alloc);
+
+    let wall = std::time::Instant::now();
+    let gpu = unsafe { program.execute_timed(&[output.gpu as *mut u8], &[], Some([64, 1, 1]), Some([64, 1, 1])) }
+        .expect("timed dispatch")
+        .expect("a profiled AMD dispatch stamps its own span");
+    let wall = wall.elapsed();
+
+    assert!(gpu.as_nanos() > 0, "the 100 MHz clock must advance across a dispatch");
+    assert!(gpu < wall, "gpu {gpu:?} must exclude the submit path the wall clock {wall:?} holds");
+
+    output.raw.free_amd_device_in_place();
+}
+
 /// Forced-AQL timeline stress: 2000 asynchronous, 128 synchronous and 128
 /// profiled dispatches through one plan context. Multi-XCC hardware uses AQL by
 /// default; single-XCC hardware must set `SVOD_AMD_AQL=1`.

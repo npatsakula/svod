@@ -56,9 +56,19 @@ fn const_extent(rng: &Arc<UOp>) -> Option<usize> {
     }
 }
 
-/// Product of the constant extents of every axis of `axis_type`.
-fn extent_product(scheduler: &Scheduler, axis_type: AxisType) -> usize {
-    scheduler.ranges_of(&[axis_type]).iter().filter_map(const_extent).product::<usize>().max(1)
+/// Product of the constant extents of every axis of one of `axis_types`.
+fn extent_product(scheduler: &Scheduler, axis_types: &[AxisType]) -> usize {
+    scheduler.ranges_of(axis_types).iter().filter_map(const_extent).product::<usize>().max(1)
+}
+
+/// Trips the accumulator is reused over: every reduce axis the kernel still
+/// carries, which is what the core left of its own K times the reduces it did
+/// not take. A convolution's taps stay as loops around the WMMA and the
+/// accumulator is set up and written back once for all of them, so counting the
+/// core's K axis alone understates the depth ninefold on a 3x3 — and then caps
+/// the warp tile far below what the register budget allows.
+fn reduce_depth(scheduler: &Scheduler) -> usize {
+    extent_product(scheduler, &[AxisType::Reduce, AxisType::GroupReduce])
 }
 
 /// LOCAL size for a global axis none of the standard sizes divides, with the
@@ -1444,12 +1454,8 @@ fn apply_tc_tiling(scheduler: &mut Scheduler, axes: &[Arc<UOp>; 3]) {
                 &tc,
                 accum_max,
                 scheduler.renderer().upcast_max,
-                extent_product(scheduler, AxisType::Global),
-                [
-                    const_extent(&rngs[1]).unwrap_or(1),
-                    const_extent(&rngs[0]).unwrap_or(1),
-                    const_extent(&axes[2]).unwrap_or(1),
-                ],
+                extent_product(scheduler, &[AxisType::Global]),
+                [const_extent(&rngs[1]).unwrap_or(1), const_extent(&rngs[0]).unwrap_or(1), reduce_depth(scheduler)],
             );
             for (dim, sz) in [(1usize, m_grow), (0, n_grow)] {
                 if sz > 1 {
@@ -1500,36 +1506,25 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         _ => return false,
     };
 
-    // The WMMA needs clean M/N *output* ranges: a tensor core tiles the matmul's
-    // own M/N/K, splitting M/N into Warp/Local/Upcast. If the matmul output is
-    // consumed by a downstream reduce (e.g. `min_over_K(x@cᵀ)`), that output axis
-    // is itself a Reduce axis — tiling it makes the downstream reduce span the
-    // tensor-core Warp/Local axes and share the matmul's reduce loops, so one
-    // physical loop ends up closed by two ENDs (invalid LLVM phi). Decline TC in
-    // that case and let the generic reduce path handle the fused kernel.
-    let output_is_reduce = pattern
-        .in0_ranges
-        .iter()
-        .chain(pattern.in1_ranges.iter())
-        .any(|r| matches!(r.op(), Op::Range(ops::Range { axis_type: AxisType::Reduce, .. })));
-    if output_is_reduce {
-        tracing::debug!(
-            "try_tensor_cores: matmul output axis is a reduce axis (fused reduce-after-matmul); skipping TC"
-        );
-        return false;
-    }
-
     let axis_choice_count = pattern.axis_choices.len();
 
     let mut rejections = Vec::new();
 
-    for axis_choice in 0..axis_choice_count {
+    // Padded rows stream the same weights and multiply the MACs, so an axis
+    // assignment the tiles divide beats one that pads: a conv whose 40-wide
+    // spatial axis misses the 16-side takes the 8-side instead of padding to
+    // 48. Every choice is tried unpadded before the configured level may pad.
+    let configured = config.tc_opt.as_usize();
+    let levels =
+        (configured >= TcOpt::Padded.as_usize()).then_some(TcOpt::Relaxed.as_usize()).into_iter().chain([configured]);
+
+    for (tc_opt, axis_choice) in levels.flat_map(|level| (0..axis_choice_count).map(move |choice| (level, choice))) {
         // Clone the scheduler for trial - if this axis choice fails, no partial mutations.
         let mut trial = scheduler.clone();
         let tc_result = tc::apply_with_axis_choice(
             &mut trial,
             config.tc_select.as_i32(),
-            config.tc_opt.as_usize(),
+            tc_opt,
             config.tc_enabled.as_usize(),
             Some(axis_choice),
         );
@@ -1538,19 +1533,14 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
             Ok(axes) => axes,
             Err(err) => {
                 let err_msg = err.to_string();
-                tracing::debug!(axis_choice, reason = %err_msg, "try_tensor_cores: axis choice rejected");
-                rejections.push((axis_choice, err_msg));
+                tracing::debug!(tc_opt, axis_choice, reason = %err_msg, "try_tensor_cores: axis choice rejected");
+                rejections.push((tc_opt, axis_choice, err_msg));
                 continue;
             }
         };
 
-        // Record the TC opt with explicit axis choice.
-        let opt = Opt::tc(
-            Some(axis_choice),
-            config.tc_select.as_i32(),
-            config.tc_opt.as_usize(),
-            config.tc_enabled.as_usize(),
-        );
+        // Record the TC opt with the axis choice and the level that applied it.
+        let opt = Opt::tc(Some(axis_choice), config.tc_select.as_i32(), tc_opt, config.tc_enabled.as_usize());
         trial.applied_opts.push(opt);
 
         apply_tc_tiling(&mut trial, &axes);

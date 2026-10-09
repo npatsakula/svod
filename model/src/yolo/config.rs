@@ -1,3 +1,6 @@
+use svod_dtype::DType;
+use svod_tensor::Tensor;
+
 /// YOLO model scale variants. Each maps to Ultralytics'
 /// `[depth_multiple, width_multiple, max_channels]` scaling table.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -32,6 +35,13 @@ impl YoloScale {
     pub fn max_channels(self) -> usize {
         self.scaling().2
     }
+
+    /// Ultralytics' `parse_model` rewrites every `C3k2`'s `c3k` argument to
+    /// `true` for the M/L/X scales, so the shallow blocks the YAML marks
+    /// `False` still nest a `C3k` there instead of a plain bottleneck.
+    pub fn forces_c3k(self) -> bool {
+        matches!(self, YoloScale::Medium | YoloScale::Large | YoloScale::XLarge)
+    }
 }
 
 /// `ceil(value / divisor) * divisor` — Ultralytics `make_divisible`.
@@ -57,16 +67,40 @@ pub struct YoloConfig {
     pub nc: usize,
     pub reg_max: usize,
     pub max_batch_size: usize,
+    /// Dtype the backbone and neck compute in; see [`Self::with_compute_dtype`].
+    /// The heads always decode in f32 regardless (`head::in_head_dtype`).
+    pub compute_dtype: DType,
 }
 
 impl YoloConfig {
     pub fn new(scale: YoloScale, nc: usize) -> Self {
-        Self { scale, nc, reg_max: 1, max_batch_size: 1 }
+        Self { scale, nc, reg_max: 1, max_batch_size: 1, compute_dtype: DType::Float32 }
     }
 
     pub fn with_max_batch_size(mut self, max_batch_size: usize) -> Self {
         self.max_batch_size = max_batch_size;
         self
+    }
+
+    /// Run the backbone and neck at `compute_dtype`, accumulating reductions in
+    /// f32 (`Tensor::sum_acc_dtype` promotes f16/bf16 sums on its own, so a conv
+    /// is `CAST_f16(REDUCE_f32(Add, CAST_f32(MUL(f16, f16))))` — the shape the
+    /// tensor-core matcher wants).
+    ///
+    /// Weights must move with the activations: `least_upper_dtype(f16, f32)` is
+    /// f32, so a checkpoint left at f32 would promote the very first conv back
+    /// and silently revert the whole graph — no error, no speedup. The loaders
+    /// therefore cast the state dict to match (`loader::cast_weights`).
+    pub fn with_compute_dtype(mut self, compute_dtype: DType) -> Self {
+        self.compute_dtype = compute_dtype;
+        self
+    }
+
+    /// Cast an input image into the compute dtype. A no-op when they already
+    /// match (`UOp::cast` returns the same node), so the f32 default adds
+    /// nothing to the graph.
+    pub fn cast_input(&self, images: &Tensor) -> Tensor {
+        images.cast(self.compute_dtype.clone())
     }
 }
 

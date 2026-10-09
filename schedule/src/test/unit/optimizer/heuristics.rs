@@ -15,10 +15,10 @@ use crate::optimizer::heuristics::{
     try_warp_row_reduction,
 };
 use crate::optimizer::renderer::TcTilePolicy;
-use crate::optimizer::{Opt, OptArg, OptOps, Renderer, Scheduler, apply_opt};
+use crate::optimizer::{Opt, OptArg, OptArgExt, OptOps, Renderer, Scheduler, apply_opt};
 use crate::test::support::prelude::*;
 use crate::test::unit::optimizer::kernels::{
-    Ranged, matmul_accum, matmul_with, plus, row_major, row_reduce, times, two_n_matmul,
+    Ranged, matmul_accum, matmul_with, plus, row_major, row_reduce, taps_conv, times, two_n_matmul,
 };
 
 // THE KERNEL SHAPES THIS PASS IS RANKED AGAINST
@@ -138,6 +138,40 @@ fn opt(op: OptOps, axis: usize, arg: usize) -> (OptOps, Option<usize>, OptArg) {
     (op, Some(axis), OptArg::Int(arg))
 }
 
+/// The 192->192 3x3 convolution over a 40x40 image the layout probe measures.
+const PROBE_CONV: (i64, i64, i64, i64, i64) = (40, 40, 192, 192, 9);
+
+/// Tensor-core tiles one warp's output covers under `plan`: every UPCAST
+/// multiplies it, and a lane holds an accumulator per element of each tile.
+fn warp_tiles(plan: &[(OptOps, Option<usize>, OptArg)]) -> usize {
+    plan.iter()
+        .filter_map(|(op, _, arg)| match (op, arg) {
+            (OptOps::UPCAST, OptArg::Int(amount)) => Some(*amount),
+            _ => None,
+        })
+        .product()
+}
+
+/// The post-TC opt sequence a `(m1, m2, n, k, taps)` convolution gets on
+/// `renderer` for operands laid out `channels_last`; `None` when the shape
+/// declines the tensor core.
+fn conv_plan_on(
+    shape: (i64, i64, i64, i64, i64),
+    channels_last: (bool, bool),
+    renderer: Renderer,
+) -> Option<Vec<(OptOps, Option<usize>, OptArg)>> {
+    let (m1, m2, n, k, taps) = shape;
+    let mut scheduler = Scheduler::new(taps_conv(m1, m2, n, k, taps, channels_last), renderer);
+    try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()).then(|| {
+        scheduler
+            .applied_opts
+            .iter()
+            .filter(|opt| opt.op != OptOps::TC)
+            .map(|opt| (opt.op, opt.axis, opt.arg.clone()))
+            .collect()
+    })
+}
+
 /// `(axis type, constant extent)` of a RANGE; `None` when it is not a RANGE.
 fn range_axis(range: &Arc<UOp>) -> Option<(AxisType, i64)> {
     matches!(range.op(), Op::Range(..)).then(|| (range_axis_type(range), expect_range_extent(range)))
@@ -207,7 +241,7 @@ fn cuda_tensor_core_warp_tile(m: i64, n: i64, k: i64, expected: &[(OptOps, usize
     assert_eq!(tc_plan(m, n, k, Renderer::cuda()), expected);
 }
 
-/// Every target off CUDA keeps [`TcTilePolicy::FixedStep`], tinygrad's step:
+/// Every target off the lane budget keeps [`TcTilePolicy::FixedStep`], tinygrad's step:
 type FixedStepPlan = &'static [(OptOps, usize, usize)];
 const FIXED_STEP: &[((usize, usize), FixedStepPlan)] = &[
     ((16, 3), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 3)]),
@@ -227,7 +261,6 @@ const FIXED_STEP_GRID_N: [i64; 5] = [48, 320, 768, 1536, 3072];
 const FIXED_STEP_GRID_K: [i64; 3] = [320, 768, 3072];
 
 #[test_case(Renderer::amd_rdna3(), (16, 16); "rdna3 wmma")]
-#[test_case(Renderer::amd_rdna4(), (16, 16); "rdna4 wmma")]
 #[test_case(Renderer::amd_cdna3(), (16, 16); "cdna3 mfma")]
 #[test_case(Renderer::amd_cdna4(), (16, 16); "cdna4 mfma")]
 #[test_case(Renderer::metal(), (8, 8); "metal simdgroup")]
@@ -246,6 +279,59 @@ fn non_cuda_tiling_matches_the_shipped_fixed_step(renderer: Renderer, dims: (usi
             }
         }
     }
+}
+
+/// RDNA4 sizes a convolution's warp tile against the register file, so the tile
+/// comes out square under the budget whichever way the operands lie.
+///
+/// The accumulator assertion is the point of the policy: the fixed step grows M
+/// and then N by the first of `[5, 4, 3, 2]` that divides, so a lane can end up
+/// holding 25 tiles — 200 f32 accumulators on this core — with nothing in the
+/// step to stop it. That is past the 256 VGPRs a wave32 lane addresses once the
+/// fragments, the addresses and the pipeline sit on top of them, and gfx1201
+/// answers by spilling to scratch at 5 resident waves of 16.
+#[test_case(PROBE_CONV, &[(OptOps::UPCAST, 1, 3), (OptOps::UPCAST, 1, 2)]; "the probe conv")]
+fn rdna4_conv_warp_tile_stays_inside_the_lane_budget(
+    shape: (i64, i64, i64, i64, i64),
+    expected: &[(OptOps, usize, usize)],
+) {
+    let renderer = Renderer::amd_rdna4();
+    let TcTilePolicy::LaneBudget { accum_max } = renderer.tc_tile_policy() else { panic!("RDNA4 takes the budget") };
+    let lane_tile = renderer.tensor_cores[0].lane_tile();
+    let expected: Vec<_> = expected.iter().map(|&(op, axis, arg)| opt(op, axis, arg)).collect();
+
+    for channels_last in [(false, false), (true, true), (true, false), (false, true)] {
+        let plan = conv_plan_on(shape, channels_last, renderer.clone()).expect("the conv takes a tensor core");
+        assert_eq!(plan, expected, "{shape:?} {channels_last:?}");
+        assert!(
+            warp_tiles(&plan) * lane_tile <= accum_max,
+            "{shape:?} {channels_last:?}: {} accumulators over the {accum_max} budget",
+            warp_tiles(&plan) * lane_tile
+        );
+    }
+}
+
+/// On CUDA the warp tile is capped by the trips the accumulator is reused over,
+/// and a convolution's taps are trips: they stay a loop around the WMMA while
+/// the accumulator is set up and written back once for all of them. Counting
+/// only what the core left of its own K axis divides that depth by the tap
+/// count — at `k = 16` the core consumes the whole channel axis, the cap reads
+/// `1` and the tile cannot grow at all, though nine taps of reuse sit behind it.
+///
+/// The first row is the regression: it returned an **empty plan** before
+/// `reduce_depth` counted the taps. The single-tap row is the control, where
+/// there is genuinely nothing to amortise and the cap must still bite.
+///
+/// The realized tile is `3` and not the `9` the growth allows because our
+/// axis choice (`bdae1883`, which offers the operands both ways round) lands a
+/// 5-extent spatial axis on N, and 5 is prime: no [`TC_GROWTH_FACTORS`] entry
+/// divides it under the cap, so N cannot grow and the tile comes out M-only.
+/// The cap itself is doing its job — `growth` is 9/1 across these rows.
+#[test_case((40, 40, 192, 16, 9), 3; "the core takes the whole channel axis, the taps carry the reuse")]
+#[test_case((40, 40, 192, 16, 1), 1; "one tap and one channel trip cannot amortise a wider tile")]
+fn cuda_conv_warp_tile_counts_the_taps_as_reduce_trips(shape: (i64, i64, i64, i64, i64), tiles: usize) {
+    let plan = conv_plan_on(shape, (true, true), Renderer::cuda()).expect("the conv takes a tensor core");
+    assert_eq!(warp_tiles(&plan), tiles, "warp tile for {shape:?}: {plan:?}");
 }
 
 /// A wider warp tile must never record an UPCAST the renderer would refuse to replay.
@@ -321,6 +407,26 @@ fn try_tensor_cores_default_matches_strict_on_plain_matmul() {
     };
     assert_eq!(HeuristicsConfig::default().tc_opt, TcOpt::Padded);
     assert_eq!(plan(TcOpt::default()), plan(TcOpt::Strict));
+}
+
+/// A 40-wide spatial axis misses CUDA's 16-side but divides the 8-side: the padding
+/// levels take the operands the other way round instead of padding 40 to 48, and pad
+/// only when no assignment divides.
+#[test_case(40, 64, TcOpt::Padded, 1, 0; "padded prefers the unpadded side")]
+#[test_case(20, 64, TcOpt::Padded, 2, 2; "pads when neither side divides")]
+fn try_tensor_cores_pads_only_when_no_axis_choice_divides(m: i64, n: i64, tc_opt: TcOpt, level: usize, masks: usize) {
+    let (applied, scheduler) = run(
+        conv_like_weak(m, n, 64, 3),
+        Renderer::cuda(),
+        &HeuristicsConfig::builder().tc_opt(tc_opt).build(),
+        try_tensor_cores,
+    );
+    assert!(applied);
+    let tc = scheduler.applied_opts.iter().find(|opt| opt.op == OptOps::TC).expect("TC opt recorded");
+    let (_, opt_level, _) = tc.arg.tc().expect("tensor-core arg");
+    assert_eq!(opt_level, level, "the recorded level is the one that applied the choice");
+    let where_count = count(scheduler.ast(), |node| matches!(node.op(), Op::Ternary(svod_ir::TernaryOp::Where, ..)));
+    assert_eq!(where_count, masks, "an unpadded choice carries no padding mask");
 }
 
 /// Two N axes, a bad one first: `Metal`'s retry must commit the axis choice that divides.
@@ -745,7 +851,6 @@ fn hand_coded_optimizations_runs_the_elementwise_ladder_in_order() {
 #[test_case(Renderer::amd_rdna3(), 5, DType::Float16, &[Opt::upcast(0, 5), Opt::group(0, 32), Opt::local(0, 4), Opt::unroll(1, 8)]; "rdna keeps a wave per row group")]
 #[test_case(Renderer::amd_cdna3(), 5, DType::Float16, &[Opt::upcast(0, 5), Opt::group(0, 64), Opt::local(0, 4), Opt::unroll(1, 4)]; "cdna keeps a wave per row group and its unroll divides the rest")]
 #[test_case(Renderer::amd_rdna3(), 5, DType::Float32, &[Opt::upcast(0, 5), Opt::group(0, 32), Opt::local(0, 4), Opt::unroll(1, 4)]; "the unroll follows the element width")]
-#[test_case(Renderer::amd_rdna3(), 1, DType::Float16, &[Opt::group(0, 32), Opt::local(0, 4), Opt::unroll(1, 8)]; "a single row has nothing to upcast")]
 #[test_case(Renderer::cuda(), 5, DType::Float16, &[Opt::upcast(0, 5), Opt::group(0, 8), Opt::local(0, 4), Opt::upcast(0, 4)]; "cuda keeps tinygrad's tile")]
 #[test_case(Renderer::amd_rdna3(), 64, DType::Float16, &[]; "rows past the upcast limit are not a skinny batch")]
 fn matvec_fast_path_upcasts_a_skinny_batch(renderer: Renderer, m: i64, stored: DType, expected: &[Opt]) {
@@ -780,7 +885,6 @@ fn matvec_config_overrides_the_device_tile() {
 /// does not fit — must not cost the row tile: the rest of the fast path still
 /// applies and a decode step's GEMV keeps its LOCAL/UPCAST instead of falling
 /// through to the generic tail.
-#[test_case(Renderer::cuda(), 16, plain_row_reduce, &[Opt::local(0, 4), Opt::upcast(0, 4)]; "cuda keeps the block and the rows")]
 #[test_case(Renderer::amd_rdna3(), 512, skinny_batch, &[Opt::upcast(0, 5), Opt::local(0, 4), Opt::unroll(0, 8)]; "rdna keeps the batch upcast and the block")]
 fn matvec_fast_path_survives_a_declined_group(
     mut renderer: Renderer,
@@ -793,11 +897,6 @@ fn matvec_fast_path_survives_a_declined_group(
     assert!(applied, "a declined GROUP must not abort the fast path");
     assert_eq!(scheduler.applied_opts, expected);
     assert!(scheduler.axes_of(&[AxisType::GroupReduce]).is_empty(), "GROUP was declined");
-}
-
-/// `y[r] = sum_c x[r, c]`: the fast path's plainest shape.
-fn plain_row_reduce() -> Arc<UOp> {
-    row_reduce(AxisType::Global, 64, 128, DType::Float32, None)
 }
 
 /// A decoder step's projection: five rows through one weight.

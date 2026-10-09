@@ -19,8 +19,39 @@ use crate::error::JitResultExt;
 /// - [`crate::Error::JitCompilation`] when `clang` is missing, the AMDGPU
 ///   target is not enabled in the host LLVM, or compilation fails.
 pub fn compile_ir_to_amd_object(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8>> {
-    let toolchain = ClangToolchain::discover(None)?;
-    compile_ir_to_amd_object_with(&toolchain, ir, arch)
+    compile_ir_to_amd_object_with(&amd_toolchain(None)?, ir, arch)
+}
+
+/// The oldest clang whose AMDGPU code is verified. 20.1.2 compiles some kernels
+/// that spill to wrong values or NaN, with the loop hint in place too.
+pub(crate) const MIN_AMD_CLANG_MAJOR: u32 = 22;
+
+/// The clang on `PATH`, refused for AMDGPU code when older than
+/// [`MIN_AMD_CLANG_MAJOR`].
+pub(crate) fn amd_toolchain(cache: Option<&crate::object_cache::ObjectCache>) -> crate::Result<ClangToolchain> {
+    let toolchain = ClangToolchain::discover(cache)?;
+    check_amd_clang(toolchain.version())?;
+    Ok(toolchain)
+}
+
+/// Refuse a clang older than [`MIN_AMD_CLANG_MAJOR`], given its `--version`
+/// output; one whose version it cannot read passes.
+pub(crate) fn check_amd_clang(version: &str) -> crate::Result<()> {
+    let major = version
+        .split("clang version ")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse::<u32>().ok());
+    match major {
+        Some(major) if major < MIN_AMD_CLANG_MAJOR => Err(crate::Error::JitCompilation {
+            reason: format!(
+                "{} is too old for AMD GPUs: clang 20 compiles some AMDGPU kernels that spill to wrong \
+                 values, and svod's AMD code is verified with clang {MIN_AMD_CLANG_MAJOR} or newer",
+                version.lines().next().unwrap_or(version).trim()
+            ),
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Clang driver flags for one kernel.

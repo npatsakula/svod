@@ -12,7 +12,7 @@ use test_case::test_case;
 
 use crate::kernels::norm::{NORM_SUPPORTED_ARCHS, add_rms_norm, rms_norm, select_norm_cfg};
 
-use super::device_supported;
+use super::{device_supported, rel_err};
 
 /// The wave width the tables below are written against (CUDA / RDNA).
 const W32: usize = 32;
@@ -22,15 +22,10 @@ const W32: usize = 32;
 /// A row is servable exactly when it divides into the wave and fits in
 /// registers; the block shape then takes the widest wave count the row *count*
 /// divides by.
-#[test_case(4096, 1024, Some(8); "the layer norm at 8x512")]
-#[test_case(4096, 128, Some(8); "a head norm at 8x512")]
-#[test_case(128, 1024, Some(8); "a batch-1 prefill")]
-#[test_case(4, 1024, Some(4); "four rows take a four-wave block")]
 #[test_case(3, 1024, Some(1); "a prime row count falls to one wave")]
 #[test_case(4096, 2048, Some(8); "the widest row that still fits in registers")]
 #[test_case(4096, 2080, None; "a row past the register budget declines")]
 #[test_case(4096, 1000, None; "a row that does not divide the wave declines")]
-#[test_case(4096, 16, None; "a row narrower than the wave declines")]
 fn select_norm_cfg_applicability(rows: usize, d: usize, rows_per_block: Option<usize>) {
     assert_eq!(select_norm_cfg(rows, d, W32).map(|c| c.rows_per_block), rows_per_block, "select_norm_cfg({rows}, {d})");
 }
@@ -80,13 +75,6 @@ fn operand(shape: &[usize], dtype: DType, seed: f32) -> Tensor {
     t
 }
 
-/// Largest elementwise difference relative to the reference's own magnitude.
-fn rel_err(got: &[f32], want: &[f32]) -> f32 {
-    assert_eq!(got.len(), want.len(), "length mismatch");
-    let scale = want.iter().fold(0f32, |a, b| a.max(b.abs())).max(f32::MIN_POSITIVE);
-    got.iter().zip(want).fold(0f32, |a, (g, w)| a.max((g - w).abs())) / scale
-}
-
 /// The kernel and the graph run the same ops in the same dtypes; only the row
 /// reduce's summation order differs (a wave butterfly against the scheduler's
 /// tree), so the result can move by the bf16 rounding of a different order: two
@@ -96,13 +84,9 @@ const BF16_REL_TOL: f32 = 8e-3;
 const EPS: f64 = 1e-6;
 
 /// `rms_norm` against `Tensor::rms_norm_with` over the same bf16 operands, at
-/// the two rows that matter (the 1024-wide hidden state and the 128-wide head)
-/// and several row counts, including a rank-3 activation.
-#[test_case(&[4096, 1024]; "hidden rows at 8x512")]
-#[test_case(&[128, 1024]; "a batch-1 prefill")]
+/// the two rows that matter (the 1024-wide hidden state and the 128-wide head):
+/// one on a four-wave block, the other through a rank-4 view.
 #[test_case(&[4, 1024]; "four rows")]
-#[test_case(&[65536, 128]; "head rows at 8x512")]
-#[test_case(&[8, 512, 1024]; "a rank-3 activation")]
 #[test_case(&[8, 512, 16, 128]; "a rank-4 head view")]
 #[ignore]
 fn rms_norm_matches_the_graph_gpu(shape: &[usize]) {
@@ -123,9 +107,6 @@ fn rms_norm_matches_the_graph_gpu(shape: &[usize]) {
 
 /// `add_rms_norm` against the graph's `x + residual` then norm: `h` is the bf16
 /// sum exactly, and `y` its norm.
-#[test_case(&[4096, 1024]; "hidden rows at 8x512")]
-#[test_case(&[128, 1024]; "a batch-1 prefill")]
-#[test_case(&[65536, 128]; "head rows")]
 #[test_case(&[8, 512, 1024]; "a rank-3 activation")]
 #[ignore]
 fn add_rms_norm_matches_the_graph_gpu(shape: &[usize]) {

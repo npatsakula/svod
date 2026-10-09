@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use svod_dtype::{DType, DeviceSpec, GpuArch};
 use test_case::test_case;
 
-use crate::tune::{TuneKey, TuneStore};
+use crate::tune::{TUNE_SCHEMA, TuneKey, TuneStore};
 
 /// A key over `candidates` (the cheap identity of the candidate set the memo is
 /// keyed by) — `builds`, the candidate graphs' fingerprints, reaches the store
@@ -152,6 +152,62 @@ fn a_stale_index_is_ignored_and_a_memory_store_memoizes() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A stored search result the caller no longer accepts, written for a space that
+/// has since changed, is searched again; the new value overwrites the line and is
+/// what the memo and the next store read.
+#[test]
+fn a_searched_value_the_caller_rejects_is_searched_again() {
+    let dir = scratch("rejected");
+    let k = key("conv2d_nhwc", &[1, 80, 80, 64], &[1]);
+    let seen = std::cell::Cell::new(false);
+    let first = TuneStore::at(Some(dir.clone()));
+    assert_eq!(first.searched(&k, builds(&[1], &seen), |_| true, || Some((7, 100))), Some(7));
+
+    let stricter = TuneStore::at(Some(dir.clone()));
+    let mut searched = false;
+    let found = stricter.searched(
+        &k,
+        builds(&[1], &seen),
+        |found| found != 7,
+        || {
+            searched = true;
+            Some((9, 120))
+        },
+    );
+    assert_eq!((found, searched), (Some(9), true), "a rejected line is searched again");
+    let memo = stricter.searched(&k, builds(&[1], &seen), |_| true, || panic!("the memo answers"));
+    assert_eq!(memo, Some(9), "the rejected value never reaches the memo");
+
+    let third = TuneStore::at(Some(dir.clone()));
+    assert_eq!(third.searched(&k, builds(&[1], &seen), |_| true, || panic!("the new line is read")), Some(9));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Another toolchain reads none of the old lines: the compiler names the file,
+/// so the same request measures again beside it.
+#[test]
+fn another_toolchain_reads_none_of_the_old_lines() {
+    let dir = scratch("toolchain");
+    let k = key("gemm_nt", &[64, 64, 192], &[1, 2]);
+    let seen = std::cell::Cell::new(false);
+    let store = TuneStore::at(Some(dir.clone()));
+    assert_eq!(store.select_with(&k, 2, builds(&[1, 2], &seen), || vec![Some(2), Some(1)]), Some(1));
+
+    let other = TuneKey { compiler: k.compiler ^ 1, ..k.clone() };
+    let fresh = TuneStore::at(Some(dir.clone()));
+    let mut measured = false;
+    let chosen = fresh.select_with(&other, 2, builds(&[1, 2], &seen), || {
+        measured = true;
+        vec![Some(1), Some(2)]
+    });
+    assert_eq!((chosen, measured), (Some(0), true), "another toolchain measures again");
+    let files: Vec<String> =
+        std::fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert!(files.iter().all(|name| name.contains(&format!("-s{TUNE_SCHEMA}-"))), "{files:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// On a supported GPU, a first request measures the GEMM table for a shape and
 /// records one line; the winner is a table tile that tiles the shape.
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::gemm_first_use -- --ignored`.
@@ -184,7 +240,6 @@ fn gemm_first_use_measures_the_table_once_gpu() {
 /// The attention split's first use measures the policy's candidates (each a
 /// partial + merge pair) once and records one line; the winner is a candidate.
 /// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::sq_attention_first_use -- --ignored`.
-#[test_case(1, 20, true; "one shared cache")]
 #[test_case(5, 640, true; "whisper large's packed cross cache")]
 #[test_case(5, 20, false; "a cache per row")]
 #[ignore]

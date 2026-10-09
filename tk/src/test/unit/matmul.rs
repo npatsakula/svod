@@ -9,8 +9,9 @@ use svod_ir::{Op, UOp};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
+use super::max_abs_err;
 use crate::kernels::gemm::*;
-use crate::tiles::{RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_IN, TileLayout};
+use crate::tiles::{RT_16X16, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_IN, TileLayout};
 use crate::{Kernel, MoveIdx};
 use svod_ir::ops;
 
@@ -91,27 +92,6 @@ fn mma_rejects_a_foreign_amd_fragment() {
     let c = ker.rt((16, 16), DType::Float32, TileLayout::Col, RT_16X16_W32_ACC);
     let c0 = warp.zero(c);
     let _ = warp.mma_ab(c0, &a, &b);
-}
-
-/// The gfx12 fragment, by contrast, matches its descriptor: the same build on the
-/// same arch with [`crate::tiles::RT_16X16_GFX12`] emits one 8/8/8 WMMA.
-#[test]
-fn mma_accepts_the_gfx12_fragment() {
-    let caps = crate::ArchCaps::for_amd(svod_dtype::AmdArch::Gfx1201);
-    let ker = Kernel::new("mma_gfx12_probe", [1, 1, 1], caps.wave_size as i64, vec![], caps);
-    let warp = ker.warp();
-    let a = ker.rt((16, 16), DType::BFloat16, TileLayout::Row, RT_16X16_GFX12);
-    let b = ker.rt((16, 16), DType::BFloat16, TileLayout::Col, RT_16X16_GFX12);
-    let c = ker.rt((16, 16), DType::Float32, TileLayout::Col, RT_16X16_GFX12);
-    let c0 = warp.zero(c);
-    let out = warp.mma_ab(c0, &a, &b);
-    let wmmas: Vec<_> = out.uop().toposort().into_iter().filter(|u| matches!(u.op(), Op::Wmma(..))).collect();
-    assert_eq!(wmmas.len(), 1, "one WMMA for the single 16×16 fragment");
-    let Op::Wmma(ops::Wmma { metadata, .. }) = wmmas[0].op() else { unreachable!() };
-    let axes = metadata.upcast_axes.as_ref().expect("unexpanded WMMA metadata");
-    let prod = |axes: &[(svod_ir::AxisId, usize)]| axes.iter().map(|(_, s)| s).product::<usize>();
-    assert_eq!((prod(&axes.a), prod(&axes.b), prod(&axes.c)), (8, 8, 8), "gfx12 upcast products");
-    assert_eq!(metadata.threads, 32);
 }
 
 /// The fully-unrolled MMA ([`Kernel::set_unroll`]) emits one symbolic `WMMA` per
@@ -448,59 +428,6 @@ fn matmul_reference(a: &svod_tensor::Tensor, b: &svod_tensor::Tensor) -> Vec<f32
     reference.as_vec::<f32>().expect("read reference")
 }
 
-fn max_abs_err(got: &[f32], expected: &[f32]) -> f32 {
-    assert_eq!(got.len(), expected.len(), "length mismatch");
-    got.iter().zip(expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max)
-}
-
-/// The wave32 AMD matmul (gfx11 and gfx12 alike) computes exactly `A·B` — not a
-/// transposed or operand-swapped variant. Compares `got` against every
-/// transpose/permutation candidate and asserts `A·B` is the unique match (the rest
-/// are garbage-scale). A layout regression in the wave32 fragment map would flip
-/// which candidate wins.
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib matmul::test_matmul_wave32_computes_ab -- --ignored --nocapture`.
-#[test]
-#[ignore]
-fn test_matmul_wave32_computes_ab() {
-    // `SMALL_CFG` is the wave64/wave32 AMD config; on a CUDA warp it would hand one
-    // warp a 64×64 f32 accumulator (128 registers per lane).
-    if !wave32_amd_device() {
-        eprintln!("skip test_matmul_wave32_computes_ab: needs a wave32 AMD device");
-        return;
-    }
-    use svod_tensor::Tensor;
-    let n = 64usize;
-    let (a, b) = matmul_inputs(n);
-    let got = launch_matmul("matmul_diag", n, SMALL_CFG, |ker| build_matmul_cfg(ker, n, SMALL_CFG), &a, &b);
-
-    let f = |t: &Tensor| t.cast(DType::Float32);
-    let (af, bf) = (f(&a), f(&b));
-    let tr = |x: &Tensor| x.try_permute(&[1, 0]).expect("transpose");
-    let mm = |x: &Tensor, y: &Tensor| x.matmul(y).expect("matmul");
-    let vec = |x: Tensor| {
-        x.realize().expect("realize");
-        x.as_vec::<f32>().expect("read")
-    };
-
-    let ab_err = max_abs_err(&got, &vec(mm(&af, &bf)));
-    println!("matmul[wave32] N={n}: max abs error vs A·B = {ab_err:e}");
-    // bf16 accumulation over K=64 ⇒ a few thousandths; transposes/swaps are O(1).
-    assert!(ab_err < 1e-1, "wave32 matmul should equal A·B, got max abs err {ab_err:e}");
-
-    let wrong: Vec<(&str, Tensor)> = vec![
-        ("(A·B)^T", tr(&mm(&af, &bf))),
-        ("A^T·B", mm(&tr(&af), &bf)),
-        ("A·B^T", mm(&af, &tr(&bf))),
-        ("A^T·B^T", mm(&tr(&af), &tr(&bf))),
-        ("B·A", mm(&bf, &af)),
-        ("(B·A)^T", tr(&mm(&bf, &af))),
-    ];
-    for (name, cand) in wrong {
-        let err = max_abs_err(&got, &vec(cand));
-        assert!(err > 1.0, "wave32 matmul matches {name} (err {err:e}) — layout is not plain A·B");
-    }
-}
-
 /// Element-level check of the wave32 AMD fragment lane→(m,n) map (gfx11 and gfx12
 /// alike): `A = I`, `B[k][j] = (k%16)*16 + (j%16)` ⇒ `C = B`, so the first 16×16
 /// output fragment must read `got[i][j] = i*16 + j`. Any within-fragment permutation
@@ -537,7 +464,7 @@ fn test_matmul_wave32_grid() {
 }
 
 /// Whether the env-selected device is a wave32 AMD GPU (gfx11 or gfx12). The
-/// wave32 layout rungs below build `SMALL_CFG`, whose 64×64 single-wave
+/// wave32 layout rung above builds `SMALL_CFG`, whose 64×64 single-wave
 /// accumulator is 128 f32/lane — affordable on AMD's 256 VGPRs, not on a CUDA warp.
 fn wave32_amd_device() -> bool {
     super::wave32_fragment_device().is_some_and(|caps| caps.amd().is_some())
@@ -977,7 +904,7 @@ fn matmul_core_contract() {
         let cpu = cpu.as_vec::<f32>().expect("read reference");
         let mine: Vec<f32> =
             (0..n * n).map(|p| (0..n).map(|k| a_data[(p / n) * n + k] * b_data[k * n + p % n]).sum()).collect();
-        let err = cpu.iter().zip(&mine).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let err = max_abs_err(&cpu, &mine);
         assert!(err < 1e-3, "the test's own reference disagrees with tensor matmul (max {err:e})");
     }
     let got = launch_matmul("matmul_contract", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);

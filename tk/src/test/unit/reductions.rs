@@ -190,7 +190,7 @@ fn test_softmax_gpu() {
     let expected = reference.as_vec::<f32>().expect("read reference");
 
     assert_eq!(got.len(), expected.len(), "length mismatch");
-    let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+    let max_abs = super::max_abs_err(&got, &expected);
     println!("softmax N={n} block={block}: max abs error = {max_abs:e}");
     assert!(max_abs < 1e-4, "max abs error {max_abs} exceeds f32 softmax tolerance 1e-4");
 }
@@ -227,7 +227,7 @@ fn test_softmax_unroll_gpu() {
         reference.realize().expect("realize reference");
         let expected = reference.as_vec::<f32>().expect("read reference");
 
-        let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+        let max_abs = super::max_abs_err(&got, &expected);
         println!("softmax_u N={n} block={block}: max abs error = {max_abs:e}");
         assert!(max_abs < 1e-4, "softmax_u N={n} block={block}: max abs error {max_abs} exceeds 1e-4");
     }

@@ -95,6 +95,20 @@ pub enum TcTilePolicy {
     },
 }
 
+/// Output elements an RDNA4 lane may hold as tensor-core accumulators.
+///
+/// gfx12 allocates VGPRs out of a 1536-register SIMD file in granules of 24,
+/// wave32, so a wave costing `v` registers leaves `1536 / (ceil(v / 24) * 24)`
+/// of the SIMD's 16 waves resident. The accumulators are f32 and live across
+/// the whole K loop, so they set the floor under `v`; the A/B fragments, the
+/// operand addresses and the pipeline sit on top of them, and a lane addresses
+/// no more than 256 VGPRs before the rest spills to scratch.
+///
+/// The value is the near edge of the plateau a sweep found (96 to 120; at 128
+/// kernels spill again), so a kernel whose fragments and addressing cost more
+/// than a convolution's still has somewhere to put them.
+const RDNA4_LANE_ACCUM_MAX: usize = 96;
+
 /// Backend renderer capabilities.
 ///
 /// Describes what features and optimizations a particular backend supports.
@@ -223,18 +237,22 @@ impl Renderer {
     /// How the hand heuristic sizes the per-warp output tile once a tensor core
     /// has landed.
     ///
-    /// [`TcTilePolicy::LaneBudget`] is the measured policy and only the CUDA
-    /// families opt in: 128 accumulators per lane — half of the 255 registers
-    /// an NVIDIA lane addresses — is the optimum on GA106 (RTX 3060, f16 in /
-    /// f32 out `mma.sync`), where it runs GigaAM's 768->3072 projection at
-    /// 20.8 TFLOPS against 15.9 for the fixed step. Every other target keeps
-    /// [`TcTilePolicy::FixedStep`] until its register file can be measured on
-    /// hardware.
+    /// [`TcTilePolicy::LaneBudget`] is the measured policy, and a target opts in
+    /// once its register file has been measured on hardware:
+    ///
+    /// * **CUDA** — 128 accumulators per lane, half of the 255 registers an
+    ///   NVIDIA lane addresses.
+    /// * **RDNA4** — [`RDNA4_LANE_ACCUM_MAX`].
+    ///
+    /// Everything else keeps [`TcTilePolicy::FixedStep`], which grows the tile
+    /// by the first of `[5, 4, 3, 2]` that divides each side and so is bounded
+    /// by the extents rather than by the registers they cost.
     pub fn tc_tile_policy(&self) -> TcTilePolicy {
         match self.device {
             RendererDevice::CudaSm75 | RendererDevice::CudaSm80 | RendererDevice::CudaSm89 => {
                 TcTilePolicy::LaneBudget { accum_max: 128 }
             }
+            RendererDevice::AmdRdna4 => TcTilePolicy::LaneBudget { accum_max: RDNA4_LANE_ACCUM_MAX },
             _ => TcTilePolicy::FixedStep,
         }
     }
@@ -331,8 +349,30 @@ impl Renderer {
     /// Create a CUDA GPU renderer configuration (SM80/Ampere by default).
     ///
     /// For specific architectures, use `cuda_sm75()`, `cuda_sm80()`, or `cuda_sm89()`.
+    /// The tf32 shapes follow [`Self::tf32_enabled`].
     pub fn cuda() -> Self {
-        Self::cuda_sm80(false) // Default to SM80 (A100) without TF32
+        Self::cuda_sm80(Self::tf32_enabled())
+    }
+
+    /// Whether the CUDA profiles carry the f32-in (tf32) tensor-core shapes.
+    ///
+    /// tf32 truncates both operands of an f32 matrix product to a 10-bit
+    /// mantissa while keeping f32 accumulation — fp16-class operand precision
+    /// at HMMA speed. Withheld by default (matching cuBLAS's `CUBLAS_TF32`
+    /// default and tinygrad's f32 cores); `SVOD_TF32` (or `TF32`) set to any
+    /// non-empty value other than `0`/`false` opts in. Read once per profile
+    /// construction, and the extra core moves [`Self::cache_fingerprint`], so
+    /// beam plans tuned without it are never replayed with it.
+    fn tf32_enabled() -> bool {
+        Self::tf32_enabled_in(|key| std::env::var(key).ok())
+    }
+
+    /// [`Self::tf32_enabled`], reading the variables through `var`.
+    fn tf32_enabled_in(var: impl Fn(&str) -> Option<String>) -> bool {
+        ["SVOD_TF32", "TF32"].into_iter().find_map(var).is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
     }
 
     /// Create a CUDA GPU renderer for SM75 (Turing - RTX 20xx, T4).
@@ -586,10 +626,11 @@ impl Renderer {
     /// lower), and anything older runs without tensor cores. The sm_89 fp8
     /// profile is withheld from every capability until the NVPTX renderer
     /// lowers the `cvt.*.e4m3x2` conversions; its fp8 storage dtype would fail
-    /// at render time today.
+    /// at render time today. The tf32 f32-in shapes join every sm_80+ profile
+    /// when [`Self::tf32_enabled`] opts in.
     pub fn for_cuda_arch(arch: CudaArch) -> Self {
         let sm = arch.sm();
-        let mut renderer = if arch.has_bf16_mma() { Self::cuda_sm80(false) } else { Self::cuda_sm75() };
+        let mut renderer = if arch.has_bf16_mma() { Self::cuda_sm80(Self::tf32_enabled()) } else { Self::cuda_sm75() };
         if sm < 75 {
             renderer.tensor_cores.clear();
         }

@@ -45,28 +45,11 @@ use ScalarDType::{BFloat16, Bool, FP8E4M3, FP8E5M2, Float16, Float32, Int8, Int3
 #[test_case::test_case(Gfx1201, FP8E4M3, Float32, 16 => None; "rdna4 has no native fp8 wmma")]
 #[test_case::test_case(Gfx1151, FP8E4M3, Float32, 16 => None)]
 #[test_case::test_case(Gfx1151, FP8E4M3, Float32, 32 => None; "rdna must not inherit the cdna fp8 mfma")]
-// `iu8` selects on both RDNA families; the overloaded RDNA4 name carries the
-// packed wire widths (`<8 x i32>` accumulator, `<2 x i32>` inputs).
-#[test_case::test_case(Gfx1100, Int8, Int32, 16 => Some("llvm.amdgcn.wmma.i32.16x16x16.iu8".into()))]
-#[test_case::test_case(Gfx1201, Int8, Int32, 16 => Some("llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v2i32".into()))]
+// The accumulator is pinned to the operand and RDNA's WMMA is K=16 only; the
+// `iu8` names both RDNA families select are pinned with their packed operands by
+// `amd_wmma_operand_packing`'s int8 rows.
 #[test_case::test_case(Gfx1201, Int8, Float32, 16 => None; "the int8 wmma only accumulates in i32")]
 #[test_case::test_case(Gfx1201, Int8, Int32, 32 => None; "rdna wmma is k16 only")]
-#[test_case::test_case(Gfx942, Int8, Int32, 16 => None; "cdna has no iu8 mfma here")]
-#[test_case::test_case(Gfx1100, BFloat16, Float16, 16 => None; "the accumulator is pinned to the operand")]
 fn intrinsic_selection(arch: AmdArch, in_dt: ScalarDType, acc_dt: ScalarDType, k: usize) -> Option<String> {
     resolve_intrinsic(arch, Some(in_dt), Some(acc_dt), (16, 16, k))
-}
-
-/// Int8 operands ride the wire four-to-an-i32, so the packed width follows the
-/// family's elements-per-thread: RDNA3's 16 lanes give `<4 x i32>`, RDNA4's 8
-/// give `<2 x i32>`. Without the packing flag the natural vector type stands.
-#[test_case::test_case(16 => ("<4 x i32>".to_string(), "<16 x i8>".to_string()); "rdna3")]
-#[test_case::test_case(8 => ("<2 x i32>".to_string(), "<8 x i8>".to_string()); "rdna4")]
-fn rdna_int8_uses_packed_i32_wire_type(count: usize) -> (String, String) {
-    let dtype = DType::Int8.vec(count).unwrap();
-    let (packed, reinterpreted) = wmma_wire_type_with_scaled_fp8(&dtype, false, false, true);
-    assert!(reinterpreted, "packing needs a bitcast");
-    let (natural, reinterpreted) = wmma_wire_type_with_scaled_fp8(&dtype, false, false, false);
-    assert!(!reinterpreted, "the natural type needs none");
-    (packed, natural)
 }

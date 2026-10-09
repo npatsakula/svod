@@ -9,7 +9,8 @@ use svod_tensor::jit::{InputSpec, JitError};
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
-use super::gemm::{BF16_REL_TOL, SWIGLU_REL_TOL, operand, pair_rows, rel_err, to_f32_vec};
+use super::gemm::{BF16_REL_TOL, SWIGLU_REL_TOL, operand, pair_rows, to_f32_vec};
+use super::rel_err;
 use crate::kernels::gemm::{Epilogue, GEMM_NT_SUPPORTED_ARCHS, gemm_nt, gemm_nt_with_epilogue, swiglu_pair_width};
 
 const MAX_B: usize = 3;
@@ -207,7 +208,7 @@ fn gemm_batch_var_outcomes_gpu() {
         return;
     }
     let w = operand(N, K, DType::BFloat16, 0.17);
-    assert!(gemm_nt(&symbolic(96, K, 0.31), &w).expect("builds").is_none(), "96 rows per batch do not tile");
+    assert!(gemm_nt(&symbolic(80, K, 0.31), &w).expect("builds").is_none(), "80 rows per batch do not tile");
 
     let x = symbolic(L, K, 0.31);
     let res = batched(L, N, 0.53);

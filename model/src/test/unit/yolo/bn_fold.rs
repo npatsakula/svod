@@ -1,0 +1,119 @@
+use svod_dtype::DType;
+use svod_tensor::Tensor;
+use svod_tensor::nn::{Module, StateDict};
+use test_case::test_case;
+
+use crate::yolo::YoloConv;
+use crate::yolo::loader::fold_batchnorm;
+
+fn ramp(n: usize, scale: f32, offset: f32) -> Vec<f32> {
+    (0..n).map(|i| ((i * 7919 % 97) as f32 / 97.0 - 0.5) * scale + offset).collect()
+}
+
+pub(super) fn unfolded_state(cin: usize, cout: usize, k: usize) -> StateDict {
+    let mut sd = StateDict::new();
+    let t = |data: Vec<f32>, shape: &[isize]| Tensor::from_slice(data).try_reshape(shape.to_vec()).unwrap();
+    sd.insert(
+        "conv.weight".into(),
+        t(ramp(cout * cin * k * k, 0.2, 0.0), &[cout as isize, cin as isize, k as isize, k as isize]),
+    );
+    sd.insert("bn.weight".into(), t(ramp(cout, 0.5, 1.0), &[cout as isize]));
+    sd.insert("bn.bias".into(), t(ramp(cout, 0.3, 0.0), &[cout as isize]));
+    sd.insert("bn.running_mean".into(), t(ramp(cout, 0.4, 0.0), &[cout as isize]));
+    sd.insert("bn.running_var".into(), t(ramp(cout, 0.5, 1.0), &[cout as isize]));
+    sd
+}
+
+/// Folding is value-preserving: the biased conv alone reproduces conv + norm.
+#[test_case(4, 8, 3, true; "3x3 with activation")]
+fn a_folded_conv_matches_conv_then_norm(cin: usize, cout: usize, k: usize, act: bool) {
+    let sd = unfolded_state(cin, cout, k);
+    let mut plain = YoloConv::empty(cin, cout, k, 1, act);
+    plain.load_state_dict(&sd, "").unwrap();
+    let mut folded = YoloConv::empty(cin, cout, k, 1, act);
+    folded.load_state_dict(&fold_batchnorm(&sd).unwrap(), "").unwrap();
+    assert!(folded.conv.bias.is_some(), "the fold leaves a bias on the conv");
+    assert!(plain.conv.bias.is_none());
+
+    let x = Tensor::from_slice(ramp(cin * 25, 2.0, 0.1)).try_reshape([1, cin as isize, 5, 5]).unwrap();
+    let want = plain.forward(&x).unwrap().to_vec::<f32>().unwrap();
+    let got = folded.forward(&x).unwrap().to_vec::<f32>().unwrap();
+    let max = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(max < 1e-5, "folded conv drifts by {max}");
+}
+
+/// Only a `conv.weight` with a full `bn.*` beside it folds; anything else, such
+/// as the head's biased final convs or the norm keys themselves, passes through.
+#[test]
+fn the_fold_leaves_other_keys_alone() {
+    let mut sd = unfolded_state(2, 2, 1);
+    sd.insert("head.2.weight".into(), Tensor::zeros(&[2, 2, 1, 1], DType::Float32));
+    sd.insert("head.2.bias".into(), Tensor::zeros(&[2], DType::Float32));
+    sd.insert("lone.conv.weight".into(), Tensor::zeros(&[2, 2, 1, 1], DType::Float32));
+    let folded = fold_batchnorm(&sd).unwrap();
+    assert_eq!(folded.len(), sd.len() + 1, "exactly one bias appears");
+    assert!(folded.contains_key("conv.bias"));
+    assert!(!folded.contains_key("lone.conv.bias"), "no norm, nothing to fold");
+    for key in ["bn.weight", "bn.running_var", "head.2.weight", "lone.conv.weight"] {
+        assert!(std::sync::Arc::ptr_eq(&sd[key].uop(), &folded[key].uop()), "{key} is handed straight through");
+    }
+}
+
+/// The tk convolution is asked for where the kernel says it is worth asking on
+/// the channel counts — a lattice tile serves them and K clears the floor
+/// ([`svod_tk::conv2d_nhwc_worth_asking`]) — and the block is one the model
+/// routes there: dense, and not a 1x1. A block that fails keeps the graph path
+/// rather than paying for a layout change that buys nothing.
+#[test_case(192, 192, 3, true; "192 channels, 3x3")]
+#[test_case(768, 768, 1, false; "a 1x1 stays on the graph")]
+fn the_tk_flag_follows_what_the_kernel_can_tile(cin: usize, cout: usize, k: usize, eligible: bool) {
+    let conv = YoloConv::empty(cin, cout, k, 1, true);
+    assert_eq!(conv.tk_eligible(), eligible);
+    assert_eq!(conv.tk().tk, eligible, "the flag is set only where the kernel can serve");
+}
+
+/// The rounding boundary of a narrow block: downstream of the convolution's
+/// reduce there is exactly **one** cast, the narrowing at the store. The fp32
+/// accumulator reaches the norm and the activation unrounded.
+///
+/// Rounding it at the conv and letting `silu` widen again reads (1 widening,
+/// 2 narrowings) instead — a round trip no rewrite may remove, because removing
+/// it changes the result, and it measured +3.2% of the YOLO26x forward.
+///
+/// Counting only downstream of the reduce keeps the test blind to however the
+/// caller happened to build its f16 operands.
+#[test_case(true; "activated")]
+fn a_narrow_block_rounds_once_after_the_reduce(act: bool) {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use svod_ir::{Op, UOp, ops};
+
+    let sd: StateDict = fold_batchnorm(&unfolded_state(4, 8, 3))
+        .unwrap()
+        .into_iter()
+        .map(|(k, t)| (k, t.cast(DType::Float16)))
+        .collect();
+    let mut conv = YoloConv::empty(4, 8, 3, 1, act);
+    conv.load_state_dict(&sd, "").unwrap();
+
+    let x = Tensor::from_slice(ramp(4 * 25, 2.0, 0.1)).try_reshape([1, 4, 5, 5]).unwrap().cast(DType::Float16);
+    let y = conv.forward(&x).unwrap();
+    assert_eq!(y.dtype(), DType::Float16, "the block leaves at the stream's width");
+
+    let mut seen: HashSet<*const UOp> = HashSet::new();
+    let (mut wide, mut narrow) = (0, 0);
+    for node in y.uop().toposort() {
+        let fed = node.op().sources().iter().any(|s| seen.contains(&Arc::as_ptr(s)));
+        if !fed && !matches!(node.op(), Op::ReduceAxis(..) | Op::Reduce(..)) {
+            continue;
+        }
+        seen.insert(Arc::as_ptr(&node));
+        let Op::Cast(ops::Cast { src, dtype }) = node.op() else { continue };
+        match (src.dtype() == DType::Float16, *dtype == DType::Float16) {
+            (true, false) => wide += 1,
+            (false, true) => narrow += 1,
+            _ => {}
+        }
+    }
+    assert_eq!((wide, narrow), (0, 1), "casts downstream of the reduce for act={act}");
+}

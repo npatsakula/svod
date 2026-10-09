@@ -313,13 +313,17 @@ impl<'k> Group<'k> {
         let a_at = if a_t { [Idx::from(&inner), Idx::from(&height)] } else { [Idx::from(&height), Idx::from(&inner)] };
         let b_at = if b_t { [Idx::from(&width), Idx::from(&inner)] } else { [Idx::from(&inner), Idx::from(&width)] };
         let c_at = [Idx::from(&height), Idx::from(&width)];
-        // The accumulator read must depend on the reduce range `inner`, or it is
-        // loop-invariant w.r.t. the K loop and gets hoisted *out* of it — every
-        // K-iteration would then re-read the pre-loop C and the WMMA's
-        // accumulation chain breaks. Mirrors svod's `reduce_to_acc`
-        // (`acc.after([..reduce_range]).index(..)`): the `After([inner])` keeps
-        // the read inside the K loop so it observes the prior iteration's store.
-        let c_acc = c.uop().after(smallvec![inner.clone()]);
+        // The accumulator read must sit inside every loop the accumulator is
+        // carried around, or it hoists out and each step re-reads the tile as it
+        // stood before that loop: `inner`, so a K step sees the previous one's
+        // store (svod's `reduce_to_acc`: `acc.after([..reduce_range])`), and every
+        // enclosing tracked loop (`Group::anchor`). `inner` alone is not enough:
+        // on a single-fragment tile every range here is trip-1, symbolic folds
+        // them and drops the `AFTER` on the constant, and the read leaves the
+        // outer K loop.
+        let mut carried = self.ker.tracked_ranges();
+        carried.push(inner.clone());
+        let c_acc = c.uop().after(carried);
         let c_store = plan.emit(a, b, &c, [&a_at, &b_at, &c_at], &c_acc).end(smallvec![height, width, inner]);
         self.finalize_reg(c, c_store)
     }

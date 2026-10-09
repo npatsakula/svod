@@ -387,6 +387,8 @@ fn identity_and_zero_patterns_unchecked() -> &'static TypedPatternMatcher {
 /// - ALU(y, WHERE(cond, x, Invalid)) → WHERE(cond, ALU(y, x), Invalid)
 /// - ALU(Invalid, y) / ALU(y, Invalid) → Invalid (non-comparison binary ops,
 ///   either operand position, as tinygrad's order-insensitive match)
+/// - REDUCE(op, WHERE(cond, x, Invalid)) → WHERE(cond, REDUCE(op, x), Invalid),
+///   for a `cond` no reduce range can move
 ///
 /// MUST be first in `symbolic_simple()` — before `x*0→0` which would eat
 /// `MUL(0, WHERE(cond, x, Invalid))` → `0`, losing validity tracking.
@@ -481,6 +483,21 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
             let marker = UOp::invalid_marker();
             UOp::try_where(cond.clone(), inner, marker).ok()
         },
+
+        // A gate no reduce range can move is the same for every contribution, so
+        // the whole reduction is valid or invalid together and the gate lifts out
+        // (tinygrad's `lift_reduce_gate`, for a gate it lifts whole). Left in
+        // place it stays wedged between the REDUCE and its MUL, where
+        // `tc::matmul_operands` — which sees through casts and nothing else —
+        // stops recognising a matmul. `num_axes > 0` also reduces leading shaped
+        // axes, which carry no RANGE to test `cond` against, so those are left
+        // alone.
+        Reduce { src: Where(cond, x, invalid), ranges, reduce_op, num_axes }
+            if UOp::is_invalid_marker(invalid) && *num_axes == 0 && !moved_by_ranges(cond, ranges)
+            => {
+                let reduced = x.reduce_with_num_axes(ranges.clone(), *reduce_op, *num_axes);
+                UOp::try_where(cond.clone(), reduced, UOp::invalid_marker()).ok()
+            },
 
         // Push binary ALU through WHERE-with-Invalid (left operand)
         // ALU(WHERE(cond, x, Invalid), y) → WHERE(cond, ALU(x, y), Invalid)
@@ -2309,6 +2326,13 @@ fn reduce_mul_chain_sym(
     let reduced = inside_prod.reduce_with_num_axes(ranges.clone(), reduce_op, num_axes);
     let outside_prod = outside.into_iter().reduce(|a, b| a.try_mul(&b).expect("mul failed")).unwrap();
     reduced.try_mul(&outside_prod).ok()
+}
+
+/// Whether `uop` reads any of `ranges`, i.e. whether a reduction over them can
+/// change its value.
+fn moved_by_ranges(uop: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> bool {
+    let range_ids: std::collections::HashSet<u64> = ranges.iter().map(|r| r.id).collect();
+    uop.any_in_subtree(|node| range_ids.contains(&node.id))
 }
 
 /// REMOVE_FROM_SINK_LIKE = {Ops.NOOP, Ops.STACK, Ops.SINK}

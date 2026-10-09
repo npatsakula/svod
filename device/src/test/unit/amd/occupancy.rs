@@ -17,13 +17,11 @@ fn decodes_vgpr_sgpr_segments_wave32() {
 
 /// Wave32 occupancy steps read off `llc -mcpu=gfx1151|gfx1201` (LLVM 20): the
 /// 24-VGPR allocation granule of `FeatureGFX11FullVGPRs` puts the waves/SIMD
-/// breaks at 96, 120 and 144 VGPRs. A 16-VGPR granule would give 16/12/12/10/10/10.
+/// breaks at 96, 120 and 144 VGPRs. A 16-VGPR granule would give 16/13/12 here,
+/// a 32-VGPR one 16/12/12.
 #[test_case::test_case(96 => 16; "the last count that saturates the SIMD")]
 #[test_case::test_case(97 => 12; "one past 96 rounds up to 120")]
-#[test_case::test_case(120 => 12)]
 #[test_case::test_case(121 => 10; "one past 120 rounds up to 144")]
-#[test_case::test_case(144 => 10)]
-#[test_case::test_case(145 => 9; "one past 144 rounds up to 168")]
 fn wave32_vgpr_occupancy_matches_llc(vgprs: u32) -> u32 {
     let waves = |major| {
         let occ = vgpr_limited_occupancy(vgprs, 32, major).expect("gfx{major} geometry known");

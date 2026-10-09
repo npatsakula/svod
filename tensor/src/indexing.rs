@@ -73,16 +73,26 @@ impl Tensor {
         let dim_size = self_shape[dim].as_const().ok_or_else(|| crate::error::ErrorKind::SymbolicShapeUnsupported {
             operation: "gather along a symbolic dim".to_string(),
         })?;
-        let arange_dtype = DType::Int64;
-        let arange = Tensor::arange_with_dtype()
-            .start(UOp::const_(arange_dtype.clone(), ConstValue::Int(0)))
-            .stop(UOp::const_(arange_dtype.clone(), ConstValue::Int(dim_size as i64)))
-            .dtype(arange_dtype)
-            .call()?
-            .cast(index.uop().dtype());
+        let arange = Tensor::index_arange(dim_size, &index.uop().dtype())?;
         let mask = index.try_unsqueeze(-1)?.try_eq(&arange)?;
 
         x.where_(&mask, Self::new(x.uop().const_like(0)))?.sum_with().axes(-1).dtype(self.uop().dtype()).call()
+    }
+
+    /// The positions `0..n` an index of `dtype` is compared against. Built in Int64
+    /// and cast to `dtype` only when every position fits it: the comparison then
+    /// happens in the index's own dtype, where the gated-load collapse can read the
+    /// index without narrowing it. A position `dtype` cannot hold stays Int64 and
+    /// the comparison widens the index instead of wrapping positions onto it.
+    pub(crate) fn index_arange(n: usize, dtype: &DType) -> Result<Tensor> {
+        let int64 = DType::Int64;
+        let arange = Tensor::arange_with_dtype()
+            .start(UOp::const_(int64.clone(), ConstValue::Int(0)))
+            .stop(UOp::const_(int64.clone(), ConstValue::Int(n as i64)))
+            .dtype(int64)
+            .call()?;
+        let fits = dtype.is_int() && n.saturating_sub(1) as f64 <= dtype.max_value();
+        Ok(if fits { arange.cast(dtype.clone()) } else { arange })
     }
 
     /// Select elements along `dim` using a 1D index tensor.
@@ -119,7 +129,7 @@ impl Tensor {
         let ndim = self.ndim()?;
         let norm_dim = Self::normalize_axis(dim, ndim)?;
         let offset = ndim - norm_dim - 1;
-        let arange = Tensor::arange(0, Some(num_classes as i64), None)?;
+        let arange = Tensor::index_arange(num_classes, &self.uop().dtype())?;
         let mut ar_shape = vec![1isize; 1 + offset];
         ar_shape[0] = num_classes as isize;
         self.try_eq(&arange.try_reshape(&ar_shape)?)

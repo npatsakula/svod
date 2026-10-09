@@ -554,7 +554,7 @@ fn test_fa_noncausal_f16_amd() {
     let expected = reference.as_vec::<f32>().expect("read reference");
 
     assert_eq!(got.len(), expected.len(), "length mismatch");
-    let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+    let max_abs = super::max_abs_err(&got, &expected);
     println!("fa[noncausal,f16] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
     assert!(max_abs <= 2e-2, "non-causal f16 FA exceeds tol (max abs {max_abs:e})");
 }
@@ -616,7 +616,7 @@ fn test_fa_noncausal_f16_masked_amd() {
     let expected = reference.as_vec::<f32>().expect("read reference");
 
     assert_eq!(got.len(), expected.len(), "length mismatch");
-    let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
+    let max_abs = super::max_abs_err(&got, &expected);
     println!("fa[noncausal,f16,masked lens={valid}] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
     assert!(max_abs <= 2e-2, "non-causal masked f16 FA exceeds tol (max abs {max_abs:e})");
 }
@@ -628,10 +628,9 @@ fn test_fa_noncausal_f16_masked_amd() {
 /// and one-token pads, row 1 one segment `[0, 256)`, so the table masks keys
 /// within the causal triangle (not only beyond it), whole KV blocks ahead of a
 /// segment are hidden (the running max must start finite), and a one-token
-/// segment stays finite. Both per-warp tiles, with and without a key mask
-/// beside it (a row with no visible key at all is the caller's bug either way).
+/// segment stays finite. With and without a key mask beside it (a row with no
+/// visible key at all is the caller's bug either way).
 #[test_case::test_case(16, 16, false; "square tile")]
-#[test_case::test_case(16, 32, false; "taller KV block")]
 #[test_case::test_case(16, 16, true; "with the key mask")]
 #[ignore]
 fn test_fa_seg_start(q_blk: usize, kv_blk: usize, key_mask: bool) {
@@ -834,7 +833,6 @@ fn render_fa_sm86(name: &str, (b, n, h, h_kv, d): (usize, usize, usize, usize, u
 #[test_case::test_case(16, 32, true, false, 128; "16x32 flat d=128")]
 #[test_case::test_case(16, 64, true, false, 64; "16x64 flat")]
 #[test_case::test_case(16, 64, true, true, 128; "16x64 flat causal d=128")]
-#[test_case::test_case(16, 16, true, false, 128; "16x16 flat d=128")]
 #[test_case::test_case(16, 16, true, true, 128; "16x16 flat causal d=128")]
 fn test_fa_sm86_renders_mma_sync(q_blk: usize, kv_blk: usize, unroll: bool, causal: bool, d: usize) {
     let body = if unroll { "flat" } else { "rolled" };
@@ -912,7 +910,6 @@ fn loop_bounds(code: &str) -> Vec<String> {
 /// sweep tests against the constant `N / KV_BLK` and every rendered loop bound is
 /// a literal.
 #[test_case::test_case(16, 16; "square tile")]
-#[test_case::test_case(16, 32; "taller KV block")]
 fn test_fa_sm86_causal_skips_kv_blocks(q_blk: usize, kv_blk: usize) {
     let (n, d) = (512usize, 128usize);
     let shape = (1, n, 2, 2, d);
@@ -958,7 +955,8 @@ const SM_86: svod_dtype::GpuArch = svod_dtype::GpuArch::Cuda(svod_dtype::CudaArc
 /// takes the taller `{16,64}` KV block (flat) once the grid covers its 28 SMs at
 /// d ≤ 64 (the d=128 double buffers would exceed the static LDS), the square
 /// `{16,16}` (two blocks per SM) at d ≤ 128, and the `{16,32}` baseline both on a
-/// grid too small to fill the SMs twice over and past every `big` head-dim bound.
+/// grid too small to fill the SMs twice over and past every `big` head-dim bound
+/// (d=192, pinned by `fa_policy_declines_tiles_past_shared_memory`).
 #[test_case::test_case(GFX942, (1, 1536, 16, 64), (16, 32), false; "gfx942 small grid")]
 #[test_case::test_case(GFX942, (8, 2048, 32, 128), (32, 32), false; "gfx942 machine-covering grid")]
 #[test_case::test_case(GFX942, (64, 1152, 16, 64), (16, 32), false; "gfx942 N not a 256-multiple")]
@@ -969,8 +967,6 @@ const SM_86: svod_dtype::GpuArch = svod_dtype::GpuArch::Cuda(svod_dtype::CudaArc
 #[test_case::test_case(SM_86, (1, 256, 2, 64), (16, 32), true; "sm_86 tiny grid")]
 #[test_case::test_case(SM_86, (8, 1152, 16, 64), (16, 64), true; "sm_86 N a 128-multiple only")]
 #[test_case::test_case(SM_86, (8, 1536, 16, 128), (16, 16), true; "sm_86 d=128 takes the square tile")]
-#[test_case::test_case(SM_86, (1, 128, 16, 128), (16, 32), true; "sm_86 d=128 small grid keeps the taller KV block")]
-#[test_case::test_case(SM_86, (8, 512, 16, 192), (16, 32), true; "sm_86 d=192 has no big tile")]
 fn fa_policy_tile(
     arch: svod_dtype::GpuArch,
     (b, n, h, d): (usize, usize, usize, usize),

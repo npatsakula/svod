@@ -42,13 +42,17 @@ pub struct Conv2d {
     pub padding: ((isize, isize), (isize, isize)),
     pub dilation: (usize, usize),
     pub groups: usize,
+    /// Accumulate and emit the sum in this dtype instead of the operands' own;
+    /// see [`Self::with_acc_dtype`].
+    #[module(skip)]
+    pub acc_dtype: Option<DType>,
 }
 
 impl Conv2d {
     /// Create a Conv2d from existing tensors, with unit stride and dilation,
     /// no padding and one group.
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
-        Self { weight, bias, stride: (1, 1), padding: ((0, 0), (0, 0)), dilation: (1, 1), groups: 1 }
+        Self { weight, bias, stride: (1, 1), padding: ((0, 0), (0, 0)), dilation: (1, 1), groups: 1, acc_dtype: None }
     }
 
     #[track_caller]
@@ -85,6 +89,14 @@ impl Conv2d {
         self.groups = groups;
         self
     }
+
+    /// Accumulate in `dtype` and hand the sum on at that width, so a half-width
+    /// convolution can still emit full-width values (a box regression's pixel
+    /// distances, say) without rounding them through its operand dtype.
+    pub fn with_acc_dtype(mut self, dtype: DType) -> Self {
+        self.acc_dtype = Some(dtype);
+        self
+    }
 }
 
 impl Layer for Conv2d {
@@ -96,6 +108,7 @@ impl Layer for Conv2d {
             .stride(&[self.stride.0, self.stride.1])
             .dilation(&[self.dilation.0, self.dilation.1])
             .padding(&[self.padding.0, self.padding.1])
+            .maybe_acc_dtype(self.acc_dtype.clone())
             .call()
     }
 }

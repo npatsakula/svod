@@ -73,6 +73,7 @@ impl DepthHead {
     }
 
     pub fn forward(&self, feats: &[Tensor]) -> Result<Tensor> {
+        let feats = &super::head::in_head_dtypes(feats);
         let nl = feats.len();
         let projected: Vec<Tensor> = (0..nl).map(|i| self.proj[i].forward(&feats[i])).collect::<Result<_>>()?;
 
@@ -120,12 +121,15 @@ impl Yolo26Depth {
     pub fn with_zero_weights(config: YoloConfig) -> Self {
         let scale = config.scale;
         let [_, _, c2, c3, c4] = super::backbone::scaled_channels(scale);
-        Self {
+        let mut model = Self {
             config: config.clone(),
             backbone: YoloBackbone::empty(scale),
             neck: YoloNeck::empty(scale),
             head: DepthHead::empty(&[c2, c3, c4], 256),
-        }
+        };
+        loader::cast_placeholders(&mut model, &config.compute_dtype)
+            .expect("a freshly built model round-trips its own state dict");
+        model
     }
 
     pub fn from_hub(model_id: &str, config: YoloConfig) -> Result<Self> {
@@ -143,12 +147,14 @@ impl Yolo26Depth {
     }
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
+        let sd = loader::load_weights(sd, &config.compute_dtype)?;
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "")?;
+        model.load_state_dict(&sd, "")?;
         Ok(model)
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let images = &self.config.cast_input(images);
         let (l4, l6, l10) = self.backbone.forward(images)?;
         let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
         self.head.forward(&[p3, p4, p5])

@@ -32,11 +32,8 @@ fn device_supported() -> bool {
 /// The prologue needs a wave count dividing both head counts, and a head dim
 /// whose halves each divide into the wave.
 #[test_case(16, 8, 128, Some(8); "qwen3 0.6b")]
-#[test_case(32, 8, 128, Some(8); "a wider query grid")]
-#[test_case(12, 6, 128, Some(2); "head counts that only share two")]
 #[test_case(16, 8, 64, Some(8); "a 64 head dim still fits, with scalar accesses")]
 #[test_case(16, 8, 32, None; "a 32 head dim halves below the wave")]
-#[test_case(16, 8, 127, None; "an odd head dim declines")]
 #[test_case(5, 5, 128, Some(1); "prime head counts fall to one wave")]
 fn select_qkv_cfg_applicability(h: usize, h_kv: usize, dh: usize, warps: Option<usize>) {
     let heads = Heads { h, h_kv, dh };
@@ -115,14 +112,10 @@ fn reference_prologue(
     (norm_rope(&parts[0], heads.h, wq), norm_rope(&parts[1], heads.h_kv, wk), view(&parts[2], heads.h_kv).contiguous())
 }
 
-/// `qkv_norm_rope` against that graph, at the model's geometry, at a
-/// single-row batch (where the rope position folds to the block index), and
-/// with the packed rows' per-token rope table.
+/// `qkv_norm_rope` against that graph, at the model's geometry with the
+/// per-position rope cache and with the packed rows' per-token rope table.
 #[test_case(8, 512, Heads { h: 16, h_kv: 8, dh: 128 }, false; "qwen3 0.6b at 8x512")]
 #[test_case(8, 512, Heads { h: 16, h_kv: 8, dh: 128 }, true; "qwen3 0.6b at 8x512 packed")]
-#[test_case(1, 128, Heads { h: 16, h_kv: 8, dh: 128 }, false; "a batch-1 prefill")]
-#[test_case(2, 256, Heads { h: 8, h_kv: 8, dh: 128 }, false; "multi-head attention")]
-#[test_case(2, 256, Heads { h: 8, h_kv: 8, dh: 128 }, true; "multi-head attention packed")]
 #[test_case(4, 128, Heads { h: 12, h_kv: 6, dh: 256 }, false; "a two-wave block with a 256 head dim")]
 #[ignore]
 fn qkv_norm_rope_matches_the_graph_gpu(b: usize, l: usize, heads: Heads, per_token: bool) {

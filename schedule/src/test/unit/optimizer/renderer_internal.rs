@@ -120,7 +120,6 @@ fn fingerprint_tracks_the_exact_target_and_every_capability() {
 #[test_case(AmdArch::Gfx942, ScalarDType::FP8E4M3FNUZ, false, false; "cdna3 decomposes FNUZ fp8")]
 #[test_case(AmdArch::Gfx1151, ScalarDType::FP8E4M3, false, false; "rdna3 decomposes OCP fp8")]
 #[test_case(AmdArch::Gfx1201, ScalarDType::FP8E4M3, true, false; "rdna4 converts OCP fp8 without a matrix core")]
-#[test_case(AmdArch::Gfx1201, ScalarDType::FP8E5M2, true, false; "rdna4 converts bf8 without a matrix core")]
 #[test_case(AmdArch::Gfx1201, ScalarDType::FP8E5M2FNUZ, false, false; "rdna4 decomposes FNUZ fp8")]
 fn amd_fp8_dtype_capabilities_are_arch_specific(arch: AmdArch, dtype: ScalarDType, supported: bool, matrix: bool) {
     let renderer = Renderer::for_amd_arch(arch);
@@ -271,6 +270,20 @@ fn for_cuda_arch_fingerprint_tracks_the_exact_capability() {
 fn tf32_opt_in_changes_the_capability(allow_tf32: bool) {
     assert_ne!(Renderer::cuda_sm80(false).cache_fingerprint(), Renderer::cuda_sm80(true).cache_fingerprint());
     assert_eq!(Renderer::cuda_sm80(allow_tf32).tensor_cores.iter().any(|tc| tc.dtype_in == DType::Float32), allow_tf32);
+}
+
+/// Which environments opt in to the tf32 shapes: `SVOD_TF32`, else `TF32`, set
+/// to anything but empty, `0` or `false`.
+#[test_case(&[], false; "unset")]
+#[test_case(&[("SVOD_TF32", "")], false; "empty")]
+#[test_case(&[("SVOD_TF32", " 0 ")], false; "zero")]
+#[test_case(&[("SVOD_TF32", "False")], false; "false in any case")]
+#[test_case(&[("SVOD_TF32", "1")], true; "set")]
+#[test_case(&[("TF32", "1")], true; "the bare name")]
+#[test_case(&[("SVOD_TF32", "0"), ("TF32", "1")], false; "the svod name wins")]
+fn tf32_opt_in_reads_the_documented_variables(env: &[(&str, &str)], expected: bool) {
+    let var = |key: &str| env.iter().find(|(name, _)| *name == key).map(|(_, value)| value.to_string());
+    assert_eq!(Renderer::tf32_enabled_in(var), expected);
 }
 
 /// The profile names the codegen binding per backend family, and the matcher

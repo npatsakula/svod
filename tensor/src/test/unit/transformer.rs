@@ -593,3 +593,29 @@ fn test_sdpa_scores_cuda_tc_warp_with_three_locals_matches_cpu() {
     let actual = case.run(crate::config::cuda_test_device().expect("a CUDA device is open"), &config, &forced, build);
     assert_all_close(&actual, &expected, 1e-2);
 }
+
+// =========================================================================
+// Embedding over u8 ids
+// =========================================================================
+
+crate::codegen_tests! {
+    fn test_embedding_u8_ids_past_127_read_their_row(config) {
+        // A vocab u8 covers exactly, so the lookup collapses into a direct read
+        // indexed by the id itself: an id past 127 must stay unsigned there.
+        let weight = Tensor::from_ndarray(&Array2::from_shape_fn((256, 1), |(row, _)| row as f32));
+        let ids = Tensor::from_slice([200u8, 5, 255, 128]);
+        let result = weight.embedding(&ids).unwrap();
+        result.realize_with(&config).unwrap();
+        assert_eq!(result.as_vec::<f32>().unwrap(), vec![200.0, 5.0, 255.0, 128.0]);
+    }
+
+    fn test_embedding_u8_ids_never_wrap_onto_a_row(config) {
+        // A vocab past u8's range: comparing a u8 id against positions cast to u8
+        // would match id 5 at row 5 and again at row 261.
+        let weight = Tensor::from_ndarray(&Array2::from_shape_fn((300, 1), |(row, _)| row as f32));
+        let ids = Tensor::from_slice([5u8, 255, 44, 0]);
+        let result = weight.embedding(&ids).unwrap();
+        result.realize_with(&config).unwrap();
+        assert_eq!(result.as_vec::<f32>().unwrap(), vec![5.0, 255.0, 44.0, 0.0]);
+    }
+}

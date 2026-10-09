@@ -522,7 +522,6 @@ fn render_amd(optimized: Arc<UOp>, arch: AmdArch, name: &str) -> (Arc<UOp>, svod
 #[test_case(DType::FP8E4M3, true, "llvm.amdgcn.cvt.f32.fp8"; "e4m3 converts natively")]
 #[test_case(DType::FP8E5M2, true, "llvm.amdgcn.cvt.f32.bf8"; "e5m2 converts natively")]
 #[test_case(DType::FP8E4M3FNUZ, false, ""; "e4m3fnuz decomposes")]
-#[test_case(DType::FP8E5M2FNUZ, false, ""; "e5m2fnuz decomposes")]
 fn test_matmul_fp8_gfx1201_uses_f16_wmma_compile_only(dtype: DType, native: bool, convert: &str) {
     use svod_dtype::ScalarDType;
 

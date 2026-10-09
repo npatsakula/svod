@@ -96,6 +96,18 @@ pub(crate) fn matmul_with(m: i64, n: i64, k: i64, stored: DType, map: impl Fn(Ar
     kernel.sink(product.reduce(vec![kernel.range(2)].into(), ReduceOp::Add), &[0, 1])
 }
 
+/// A convolution's shape: `C[m1, m2, n] = sum_k A[m1, m2, k] * B[k, n]`, two M
+/// axes sharing every weight, over f16 operands and an f32 accumulator.
+pub(crate) fn two_m_matmul(m1: i64, m2: i64, n: i64, k: i64) -> Arc<UOp> {
+    let kernel =
+        Ranged::new(&[(m1, AxisType::Global), (m2, AxisType::Global), (n, AxisType::Global), (k, AxisType::Reduce)]);
+    let row = plus(times(&kernel.range(0), m2), kernel.range(1));
+    let a = kernel.index(&DType::Float16, m1 * m2 * k, plus(times(&row, k), kernel.range(3)));
+    let b = kernel.index(&DType::Float16, k * n, plus(times(&kernel.range(3), n), kernel.range(2)));
+    let product = a.try_mul(&b).expect("mul").cast(DType::Float32);
+    kernel.sink(product.reduce(vec![kernel.range(3)].into(), ReduceOp::Add), &[0, 1, 2])
+}
+
 /// Two N axes, so a divisibility retry has somewhere to land: `n_bad` is axis 3.
 pub(crate) fn two_n_matmul(n_bad: i64, n_good: i64) -> Arc<UOp> {
     let kernel = Ranged::new(&[
@@ -108,4 +120,31 @@ pub(crate) fn two_n_matmul(n_bad: i64, n_good: i64) -> Arc<UOp> {
     let b = kernel.index(&DType::Float32, 4096, plus(plus(kernel.range(2), kernel.range(3)), kernel.range(1)));
     let product = a.try_mul(&b).expect("mul");
     kernel.sink(product.reduce(vec![kernel.range(2)].into(), ReduceOp::Add), &[0, 1, 3])
+}
+
+/// A convolution's shape with the taps kept: `C[m1, m2, n] = sum_{k, t} A[..] *
+/// B[..]`, two M axes sharing one weight over a reduce that spans the channels
+/// `k` and the `taps`. Each operand is laid out channels-last — the reduce is
+/// its contiguous axis, as an NHWC tensor or a `[n, t, k]` weight gives — or
+/// channels-first, where the reduce strides over the taps or the whole image.
+pub(crate) fn taps_conv(m1: i64, m2: i64, n: i64, k: i64, taps: i64, channels_last: (bool, bool)) -> Arc<UOp> {
+    let kernel = Ranged::new(&[
+        (m1, AxisType::Global),
+        (m2, AxisType::Global),
+        (n, AxisType::Global),
+        (taps, AxisType::Reduce),
+        (k, AxisType::Reduce),
+    ]);
+    let (m1_ax, m2_ax, n_ax, t_ax, k_ax) =
+        (kernel.range(0), kernel.range(1), kernel.range(2), kernel.range(3), kernel.range(4));
+    let row = plus(times(&m1_ax, m2 + taps), plus(m2_ax, t_ax.clone()));
+    let activation =
+        if channels_last.0 { plus(times(&row, k), k_ax.clone()) } else { plus(times(&k_ax, m1 * (m2 + taps)), row) };
+    let a = kernel.index(&DType::Float16, m1 * (m2 + taps) * k, activation);
+    let taps_major = plus(times(&t_ax, k), k_ax.clone());
+    let channels_major = plus(times(&k_ax, taps), t_ax.clone());
+    let weight = plus(times(&n_ax, k * taps), if channels_last.1 { taps_major } else { channels_major });
+    let b = kernel.index(&DType::Float16, n * k * taps, weight);
+    let product = a.try_mul(&b).expect("mul").cast(DType::Float32);
+    kernel.sink(product.reduce(vec![t_ax, k_ax].into(), ReduceOp::Add), &[0, 1, 2])
 }

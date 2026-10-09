@@ -267,7 +267,7 @@ impl SqPolicy {
                     warm_clock(CLOCK_WARMUP, || pair_time(first));
                 }
                 let time = |i: usize| pair_time(launches[i].as_ref()?);
-                round_robin_min(candidates.len(), crate::tune::ROUNDS, time)
+                round_robin_min(candidates.len(), crate::tune::ROUNDS, None, time)
                     .into_iter()
                     .map(|t| t.map(|t| t.as_nanos() as u64))
                     .collect()

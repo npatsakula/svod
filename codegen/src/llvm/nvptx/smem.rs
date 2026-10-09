@@ -44,11 +44,7 @@ pub enum CpAsyncCache {
 /// [`cp_async_wait_all`] retires it, and other threads see it after a barrier.
 /// A `Void` statement: sequence its consumers with `.after([..])`.
 pub fn cp_async(dst_shared: &Arc<UOp>, src_global: &Arc<UOp>, bytes: usize, cache: CpAsyncCache) -> Arc<UOp> {
-    let cache = match (cache, bytes) {
-        (CpAsyncCache::Cg, 16) => "cg",
-        (CpAsyncCache::Ca, 4 | 8 | 16) => "ca",
-        (cache, bytes) => panic!("cp.async.{cache:?} has no {bytes}-byte form (cg: 16; ca: 4/8/16)"),
-    };
+    let cache = cache_suffix(cache, bytes);
     UOp::custom(
         smallvec![specific_ptr(dst_shared, AddrSpace::Local), specific_ptr(src_global, AddrSpace::Global)],
         format!(
@@ -59,9 +55,58 @@ pub fn cp_async(dst_shared: &Arc<UOp>, src_global: &Arc<UOp>, bytes: usize, cach
     )
 }
 
+/// The `.cg`/`.ca` suffix for a copy of `bytes`, panicking on a width the cache
+/// policy has no form for.
+fn cache_suffix(cache: CpAsyncCache, bytes: usize) -> &'static str {
+    match (cache, bytes) {
+        (CpAsyncCache::Cg, 16) => "cg",
+        (CpAsyncCache::Ca, 4 | 8 | 16) => "ca",
+        (cache, bytes) => panic!("cp.async.{cache:?} has no {bytes}-byte form (cg: 16; ca: 4/8/16)"),
+    }
+}
+
 /// The tile-load form: one 16-byte `.cg` copy per thread.
 pub fn cp_async_16(dst_shared: &Arc<UOp>, src_global: &Arc<UOp>) -> Arc<UOp> {
     cp_async(dst_shared, src_global, 16, CpAsyncCache::Cg)
+}
+
+/// `cp.async.{cg,ca}.shared.global [dst], [src], bytes, src_size`: the
+/// zero-filling form of [`cp_async`]. Only the first `src_size` bytes are read
+/// from global memory; the copy engine fills the rest of the `bytes`-wide
+/// destination with zeros, without a read and without the value ever reaching a
+/// register. `src_bytes` is a runtime `i32`, so a **predicated** copy is
+/// `src_size = 0`: the whole chunk lands as zeros and global memory is not
+/// touched at all.
+///
+/// # Panics
+/// Panics unless `src_bytes` is an `i32` value (the intrinsic's operand type).
+pub fn cp_async_zfill(
+    dst_shared: &Arc<UOp>,
+    src_global: &Arc<UOp>,
+    bytes: usize,
+    src_bytes: &Arc<UOp>,
+    cache: CpAsyncCache,
+) -> Arc<UOp> {
+    assert_eq!(src_bytes.dtype(), DType::Int32, "cp.async src_size must be i32");
+    let cache = cache_suffix(cache, bytes);
+    UOp::custom(
+        smallvec![
+            specific_ptr(dst_shared, AddrSpace::Local),
+            specific_ptr(src_global, AddrSpace::Global),
+            src_bytes.clone()
+        ],
+        format!(
+            "declare void @llvm.nvvm.cp.async.{cache}.shared.global.{bytes}.s(ptr addrspace(3), ptr addrspace(1), i32)\n\
+             call void @llvm.nvvm.cp.async.{cache}.shared.global.{bytes}.s(ptr addrspace(3) {{0}}, ptr addrspace(1) {{1}}, i32 {{2}})"
+        ),
+        DType::Void,
+    )
+}
+
+/// The tile-load form of [`cp_async_zfill`]: one predicated 16-byte `.cg` copy
+/// per thread.
+pub fn cp_async_16_zfill(dst_shared: &Arc<UOp>, src_global: &Arc<UOp>, src_bytes: &Arc<UOp>) -> Arc<UOp> {
+    cp_async_zfill(dst_shared, src_global, 16, src_bytes, CpAsyncCache::Cg)
 }
 
 fn void_call(intrinsic: &str, args: &str, params: &str, deps: SmallVec<[Arc<UOp>; 4]>) -> Arc<UOp> {

@@ -1128,16 +1128,16 @@ pub fn optimize_kernel_with_strategy(
 ///
 /// ```ignore
 /// use svod_schedule::optimizer::{optimize_kernel_beam, BeamConfig, Renderer};
-/// use svod_runtime::{BenchmarkConfig, benchmark_kernel};
+/// use svod_runtime::time_kernel;
 ///
 /// let config = BeamConfig::from_env();
 /// let renderer = Renderer::cpu();
 ///
-/// let compile_and_time = |scheduler: &Scheduler| -> Option<Duration> {
+/// let compile_and_time = |scheduler: &Scheduler, _early_stop: Option<Duration>| -> Option<CandidateMetrics> {
 ///     let ast = scheduler.get_optimized_ast(None);
 ///     let kernel = compile_kernel(&ast)?;
-///     let result = benchmark_kernel(&kernel, &buffers, &vars, &bench_config).ok()?;
-///     Some(result.min)
+///     let timing = unsafe { time_kernel(&kernel, &buffers, &vars, None, None, false) }.ok()??;
+///     Some(CandidateMetrics { timing, ir_hash: ..., compute_ops: None })
 /// };
 ///
 /// let result = optimize_kernel_beam(ast, &renderer, &config, 0, compile_and_time)?;

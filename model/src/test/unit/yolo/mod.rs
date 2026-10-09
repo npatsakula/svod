@@ -1,4 +1,7 @@
+mod batch;
+mod bn_fold;
 mod classify;
+mod compute_dtype;
 mod config;
 mod depth;
 mod detect_p2;
@@ -11,3 +14,6 @@ mod parity;
 mod pose;
 mod segment;
 mod semseg;
+mod stage_dtype;
+mod tk_gate;
+mod weight_layout;

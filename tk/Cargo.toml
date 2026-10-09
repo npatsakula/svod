@@ -18,6 +18,7 @@ svod-codegen = { path = "../codegen", version = "=0.2.0" }
 svod-device = { path = "../device", version = "=0.2.0" }
 svod-runtime = { path = "../runtime", version = "=0.2.0" }
 svod-schedule = { path = "../schedule", version = "=0.2.0" }
+tracing = "0.1.44"
 
 [dev-dependencies]
 svod-schedule = { path = "../schedule", version = "=0.2.0", features = ["testing"] }
@@ -25,10 +26,15 @@ proptest = "1.9"
 test-case = "3.3.1"
 criterion = "0.8"
 ndarray.workspace = true # native CPU baseline for the knn bench
+tracing-subscriber = "0.3.23"
 svod-macros = { path = "../macros", version = "=0.2.0" }
 
 # GPU device-time benches (criterion), one binary per kernel sharing `benches/common.rs`.
 # Self-skip when no AMD GPU; run one with e.g. `SVOD_DEVICE=AMD:0 cargo bench -p svod-tk --bench knn`.
+[[bench]]
+name = "conv"
+harness = false
+
 [[bench]]
 name = "fa"
 harness = false

@@ -20,7 +20,7 @@ use svod_ir::ops;
 
 type Result<T> = std::result::Result<T, BeamWorker>;
 
-pub const BEAM_WORKER_PROTOCOL_VERSION: u32 = 1;
+pub const BEAM_WORKER_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInit {

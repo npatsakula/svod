@@ -313,6 +313,8 @@ impl Program for MetalProgram {
         }
     }
 
+    /// The run is warm: the command buffer's own GPU timestamps bracket it, and
+    /// nothing flushes the caches the queue's earlier work left.
     unsafe fn execute_timed(
         &self,
         buffers: &[*mut u8],

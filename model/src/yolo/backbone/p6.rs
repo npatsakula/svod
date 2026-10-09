@@ -6,6 +6,7 @@
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
 
+use crate::state::scoped;
 use crate::yolo::blocks::attention::C2PSA;
 use crate::yolo::blocks::conv::YoloConv;
 use crate::yolo::blocks::csp::C3k2;
@@ -61,9 +62,9 @@ impl YoloBackboneP6 {
         Self {
             conv0: YoloConv::empty(3, c0, 3, 2, true),
             conv1: YoloConv::empty(c0, c1, 3, 2, true),
-            c3k2_2: C3k2::empty(c1, c2, d(2), true, 0.25, false, false),
+            c3k2_2: C3k2::empty(c1, c2, d(2), true, 0.25, scale.forces_c3k(), false),
             conv3: YoloConv::empty(c2, c2, 3, 2, true),
-            c3k2_4: C3k2::empty(c2, c3, d(2), true, 0.25, false, false),
+            c3k2_4: C3k2::empty(c2, c3, d(2), true, 0.25, scale.forces_c3k(), false),
             conv5: YoloConv::empty(c3, c3, 3, 2, true),
             c3k2_6: C3k2::empty(c3, c3, d(2), true, 0.5, true, false),
             conv7: YoloConv::empty(c3, c5, 3, 2, true),
@@ -77,19 +78,19 @@ impl YoloBackboneP6 {
 
     /// Run backbone layers 0–12, returning `(l4, l6, l8, l12)`.
     pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-        let x = self.conv0.forward(x)?;
-        let x = self.conv1.forward(&x)?;
-        let x = self.c3k2_2.forward(&x)?;
-        let x = self.conv3.forward(&x)?;
-        let l4 = self.c3k2_4.forward(&x)?;
-        let x = self.conv5.forward(&l4)?;
-        let l6 = self.c3k2_6.forward(&x)?;
-        let x = self.conv7.forward(&l6)?;
-        let l8 = self.c3k2_8.forward(&x)?;
-        let x = self.conv9.forward(&l8)?;
-        let x = self.c3k2_10.forward(&x)?;
-        let x = self.sppf11.forward(&x)?;
-        let l12 = self.c2psa12.forward(&x)?;
+        let x = scoped("0", || self.conv0.forward(x))?;
+        let x = scoped("1", || self.conv1.forward(&x))?;
+        let x = scoped("2", || self.c3k2_2.forward(&x))?;
+        let x = scoped("3", || self.conv3.forward(&x))?;
+        let l4 = scoped("4", || self.c3k2_4.forward(&x))?;
+        let x = scoped("5", || self.conv5.forward(&l4))?;
+        let l6 = scoped("6", || self.c3k2_6.forward(&x))?;
+        let x = scoped("7", || self.conv7.forward(&l6))?;
+        let l8 = scoped("8", || self.c3k2_8.forward(&x))?;
+        let x = scoped("9", || self.conv9.forward(&l8))?;
+        let x = scoped("10", || self.c3k2_10.forward(&x))?;
+        let x = scoped("11", || self.sppf11.forward(&x))?;
+        let l12 = scoped("12", || self.c2psa12.forward(&x))?;
         Ok((l4, l6, l8, l12))
     }
 }

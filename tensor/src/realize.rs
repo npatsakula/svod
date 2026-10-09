@@ -1902,7 +1902,27 @@ fn beam_search_optimize(
     let wire_graph = svod_ir::OptimizerWireGraph::from_root(&ast).context(UOpSnafu)?;
     // Prepare scheduler (applies symbolic simplification and loop→global).
     // BEAM and heuristic are mutually exclusive.
-    let scheduler = prepare_scheduler(ast, renderer).context(OptimizeSnafu)?;
+    let scheduler = prepare_scheduler(ast.clone(), renderer).context(OptimizeSnafu)?;
+    let ast_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        scheduler.ast().hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    };
+    // Debug: `BEAM_ONLY=<hash prefix>` searches that kernel alone; the rest take
+    // the heuristics so a single kernel's search can be repeated in seconds.
+    if let Ok(only) = std::env::var("BEAM_ONLY")
+        && !ast_hash.starts_with(&only)
+    {
+        let mut heuristic = optimizer_config.clone();
+        heuristic.strategy = svod_schedule::OptStrategy::Heuristic;
+        return svod_schedule::optimize_kernel_with_naming(ast, renderer, &heuristic, KernelNaming::Deferred)
+            .context(OptimizeSnafu)
+            .map_err(Into::into);
+    }
+    if beam_debug > 0 {
+        eprintln!("[beam] kernel ast={ast_hash}");
+    }
 
     // Ensure all buffers are allocated for timing
     for buf in buffers {
@@ -1911,7 +1931,6 @@ fn beam_search_optimize(
 
     // Clone buffers for the closure (Buffer is Clone + Send + Sync)
     let buffers: Vec<Buffer> = buffers.to_vec();
-    let bench_config = svod_runtime::BenchmarkConfig { timing_runs: beam_config.num_runs, ..Default::default() };
 
     // Clone device components for the closure
     let dev_compiler = device.compiler.clone();
@@ -1927,6 +1946,12 @@ fn beam_search_optimize(
         vals: Vec<i64>,
         global_size: [usize; 3],
         local_size: Option<[usize; 3]>,
+    }
+    /// A batch member on the device, with the grid it is timed at.
+    struct Loaded {
+        program: Box<dyn svod_device::device::Program>,
+        grid: [usize; 3],
+        factor: f64,
     }
     let worker_init = crate::beam_worker::WorkerInit {
         protocol_version: crate::beam_worker::BEAM_WORKER_PROTOCOL_VERSION,
@@ -2009,71 +2034,74 @@ fn beam_search_optimize(
     };
 
     let dev_runtime = device.runtime.clone();
-    // The first candidate lifts the clock for the search; the rest run under
-    // its load.
-    let cold = std::cell::Cell::new(true);
-    let benchmark = |candidate: &CompiledBeamProgram, early_stop: Option<Duration>| -> Option<Duration> {
+    let lifts_clock = renderer.device.idles_its_clock();
+    let evict_host_cache = renderer.device.benchmark_evicts_via_host_stream();
+    // A batch is loaded whole, the clock lifted on its first member, and the
+    // members timed in rounds, each keeping its minimum — the search's
+    // `TimingBatch` says why one at a time ranked the clock, not the kernels.
+    let benchmark = |batch: &[CompiledBeamProgram], early_stop: Option<Duration>| -> Vec<Option<Duration>> {
         use std::panic::{AssertUnwindSafe, catch_unwind};
-        match catch_unwind(AssertUnwindSafe(|| {
-            let program = match (dev_runtime)(&candidate.compiled) {
-                Ok(program) => program,
-                Err(e) => {
+        let buffer_ptrs: Vec<*mut u8> = buffers.iter().map(|buffer| unsafe { buffer.as_raw_ptr() }).collect();
+        let loaded: Vec<Option<Loaded>> = batch
+            .iter()
+            .map(|candidate| match (dev_runtime)(&candidate.compiled) {
+                Ok(program) => {
+                    let (grid, factor) = test_grid(candidate.global_size);
+                    Some(Loaded { program, grid, factor })
+                }
+                Err(error) => {
                     if log_surpass {
-                        eprintln!("[BEAM drop] runtime_err: {e:?} opts={:?}", candidate.opts);
+                        eprintln!("[BEAM drop] runtime_err: {error:?} opts={:?}", candidate.opts);
                     }
-                    return None;
+                    None
                 }
-            };
-
-            let buffer_ptrs: Vec<*mut u8> = buffers.iter().map(|buffer| unsafe { buffer.as_raw_ptr() }).collect();
-
-            let vals = &candidate.vals;
-
-            const MAX_TEST_GLOBAL_SIZE: usize = 65536;
-            let mut test_global_size = candidate.global_size;
-            let original_size: usize = test_global_size.iter().product();
-            while test_global_size.iter().product::<usize>() > MAX_TEST_GLOBAL_SIZE {
-                let mut halved = false;
-                for axis in (0..test_global_size.len()).rev() {
-                    if test_global_size[axis] > 16 {
-                        test_global_size[axis] /= 2;
-                        halved = true;
-                        break;
-                    }
-                }
-                if !halved {
-                    break;
-                }
-            }
-            let shrunk_size: usize = test_global_size.iter().product();
-            let factor = if shrunk_size > 0 { original_size as f64 / shrunk_size as f64 } else { 1.0 };
-
-            let mut config = bench_config.clone();
-            config.warmup_budget = cold.replace(false).then_some(svod_runtime::benchmark::CLOCK_WARMUP);
-            config.early_stop = early_stop
-                .map(|timing| Duration::from_nanos((timing.as_nanos() as f64 / factor).min(u64::MAX as f64) as u64));
-            config.clear_l2 = renderer.device.has_hardware_cache_invalidate();
-            let result = unsafe {
-                svod_runtime::benchmark_kernel(
+            })
+            .collect();
+        // One timed run of member `i`, scaled back up from its test grid.
+        let run = |i: usize| -> Option<Duration> {
+            let Loaded { program, grid, factor } = loaded[i].as_ref()?;
+            let candidate = &batch[i];
+            let timed = catch_unwind(AssertUnwindSafe(|| unsafe {
+                svod_runtime::time_kernel(
                     program.as_ref(),
                     &buffer_ptrs,
-                    vals,
-                    Some(test_global_size),
+                    &candidate.vals,
+                    Some(*grid),
                     candidate.local_size,
-                    &config,
+                    evict_host_cache,
                 )
-                .ok()?
-            };
-            Some(Duration::from_nanos((result.min.as_nanos() as f64 * factor).min(u64::MAX as f64) as u64))
-        })) {
-            Ok(timing) => timing,
-            Err(_) => {
-                if log_surpass {
-                    eprintln!("[BEAM drop] panic_in_benchmark opts={:?}", candidate.opts);
+            }));
+            match timed {
+                Ok(Ok(Some(t))) => {
+                    Some(Duration::from_nanos((t.as_nanos() as f64 * factor).min(u64::MAX as f64) as u64))
                 }
-                None
+                // A lost stamp drops the candidate: its other rounds ran on the
+                // device clock, and a wall time beside them would be a second one.
+                Ok(Ok(None) | Err(_)) => None,
+                Err(_) => {
+                    if log_surpass {
+                        eprintln!("[BEAM drop] panic_in_benchmark opts={:?}", candidate.opts);
+                    }
+                    None
+                }
+            }
+        };
+        if lifts_clock && let Some(first) = (0..batch.len()).find(|&i| loaded[i].is_some()) {
+            svod_runtime::benchmark::warm_clock(svod_runtime::benchmark::CLOCK_WARMUP, || run(first));
+        }
+        let timings = svod_runtime::benchmark::round_robin_min(batch.len(), beam_config.num_runs, early_stop, run);
+        if beam_debug > 1 {
+            for ((candidate, timing), loaded) in batch.iter().zip(&timings).zip(&loaded) {
+                let Some(Loaded { program, grid, factor }) = loaded else { continue };
+                eprintln!(
+                    "[beam] timed {timing:?} grid={:?} test_grid={grid:?} factor={factor} res={:?} opts={:?}",
+                    candidate.global_size,
+                    program.resource_usage(),
+                    candidate.opts
+                );
             }
         }
+        timings
     };
 
     let behavior_fingerprint = post_optimizer_behavior_fingerprint(&post_optimizer_config);
@@ -2086,18 +2114,6 @@ fn beam_search_optimize(
         benchmark,
     );
     let result = result.context(OptimizeSnafu)?;
-    if beam_debug > 0 {
-        eprintln!(
-            "[beam] final timing={:?} iterations={} generated={} compiled={} unique_binary={} benchmarked={} opts={:?}",
-            result.timing,
-            result.iterations,
-            result.generated,
-            result.compiled,
-            result.unique_binary,
-            result.benchmarked,
-            result.scheduler.applied_opts
-        );
-    }
 
     // Debug: log beam search results
     tracing::debug!(
@@ -2120,9 +2136,43 @@ fn beam_search_optimize(
     // Apply post-optimization to final result with renderer so pm_add_gpudims runs
     // (Thread → core_id, Global → SPECIAL).
     let raw_ast = result.scheduler.get_optimized_ast_with_naming(KernelNaming::Deferred);
+    if beam_debug > 0 {
+        let name = match raw_ast.op() {
+            Op::Sink(ops::Sink { info: Some(ki), .. }) => ki.name.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        eprintln!(
+            "[beam] final kernel={name} timing={:?} iterations={} generated={} compiled={} unique_binary={} \
+             benchmarked={} opts={:?}",
+            result.timing,
+            result.iterations,
+            result.generated,
+            result.compiled,
+            result.unique_binary,
+            result.benchmarked,
+            result.scheduler.applied_opts
+        );
+    }
     apply_post_optimization_with_config(raw_ast, renderer, &post_optimizer_config)
         .context(OptimizeSnafu)
         .map_err(Into::into)
+}
+
+/// Tinygrad's `get_test_global_size`: a grid past 65536 workgroups is halved
+/// along its innermost axis still above 16 until it fits, and the time is
+/// scaled back up by the same factor.
+fn test_grid(global_size: [usize; 3]) -> ([usize; 3], f64) {
+    const MAX_TEST_GLOBAL_SIZE: usize = 65536;
+    let mut test = global_size;
+    while test.iter().product::<usize>() > MAX_TEST_GLOBAL_SIZE {
+        match (0..3).rev().find(|&axis| test[axis] > 16) {
+            Some(axis) => test[axis] /= 2,
+            None => break,
+        }
+    }
+    let shrunk: usize = test.iter().product();
+    let factor = if shrunk > 0 { global_size.iter().product::<usize>() as f64 / shrunk as f64 } else { 1.0 };
+    (test, factor)
 }
 
 #[cfg(test)]

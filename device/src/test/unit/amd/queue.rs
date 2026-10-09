@@ -627,14 +627,6 @@ fn hcq_pm4_command_goldens_concatenate_in_submission_order() {
                 0,
                 0,
                 0,
-                0xc006_5800,
-                0,
-                0xffff_ffff,
-                0xffff_ffff,
-                0,
-                0,
-                0,
-                0xc3f1,
             ],
         ),
         (
@@ -649,6 +641,43 @@ fn hcq_pm4_command_goldens_concatenate_in_submission_order() {
     let mixed = compute_of(goldens.iter().map(|(command, _)| command.clone()));
     let concatenated = goldens.iter().flat_map(|(_, dwords)| dwords.iter().copied()).collect::<Vec<_>>();
     assert_eq!(lower_hcq_pm4(&mixed, pm4_state()).unwrap(), concatenated);
+}
+
+/// Every `ACQUIRE_MEM` packet of a lowered PM4 stream.
+fn acquires(dwords: &[u32]) -> Vec<&[u32]> {
+    let mut packets = Vec::new();
+    let mut at = 0;
+    while at < dwords.len() {
+        let header = dwords[at];
+        assert_eq!(header >> 30, 3, "a compute stream is type-3 packets: {header:#x} at {at}");
+        let len = ((header >> 16) & 0x3fff) as usize + 2;
+        if (header >> 8) & 0xff == crate::amd::sys::pm4::PACKET3_ACQUIRE_MEM {
+            packets.push(&dwords[at..at + len]);
+        }
+        at += len;
+    }
+    packets
+}
+
+/// A stamp writes the clock and touches no cache: an acquire after the start
+/// stamp would be timed with the kernel. A stamped dispatch carries only the
+/// acquire every dispatch carries.
+#[test_case::test_case(9 ; "gfx9")]
+#[test_case::test_case(11 ; "gfx11")]
+#[test_case::test_case(12 ; "gfx12")]
+fn a_stamp_touches_no_cache(target_major: u32) {
+    let compute = Command::Compute(ComputeDispatch {
+        amd_pm4: Some(AmdPm4Dispatch { target_major, ..amd_pm4([1, 2, 3], 0x7_0000_0000, [2, 1, 1]) }),
+        ..dispatch(0x7_0000_0100, 0x8_0000_0000)
+    });
+    let state = Pm4LoweringState { target_major, ..pm4_state() };
+    let bare = lower_hcq_pm4(&compute_of([compute.clone()]), state).unwrap();
+    let stamped = lower_hcq_pm4(
+        &compute_of([Command::Timestamp { dst: 0x9_0000_0020 }, compute, Command::Timestamp { dst: 0x9_0000_0028 }]),
+        state,
+    )
+    .unwrap();
+    assert_eq!(acquires(&stamped), acquires(&bare));
 }
 
 #[test]

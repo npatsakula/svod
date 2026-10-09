@@ -10,48 +10,6 @@ use svod_device::device::Program;
 
 use crate::Result;
 
-/// Configuration for kernel benchmarking.
-#[derive(Debug, Clone)]
-pub struct BenchmarkConfig {
-    /// Number of warmup runs (not timed).
-    pub warmup_runs: usize,
-    /// Number of timing runs.
-    pub timing_runs: usize,
-    /// Whether to return minimum time (true) or mean (false).
-    pub take_minimum: bool,
-    /// If set, abort the timing loop the moment any single run exceeds this
-    /// threshold. Used by beam search to skip candidates clearly slower than
-    /// the current best (typically `early_stop = beam[0].timing * 3`).
-    pub early_stop: Option<Duration>,
-    /// Invalidate L2 between runs by streaming through a scratch buffer.
-    /// Stabilises rankings — without this, second/third runs hit hot caches
-    /// and bias beam toward smaller-tile candidates.
-    pub clear_l2: bool,
-    /// Run the kernel back to back for this long before the first timed run
-    /// ([`warm_clock`]): a GPU idles at a fraction of its boost clock and takes
-    /// about a second of load to lift it, so a kernel timed cold measures the
-    /// clock, not the kernel. `None` skips the warm-up (a device already under
-    /// load, or the CPU).
-    pub warmup_budget: Option<Duration>,
-}
-
-impl Default for BenchmarkConfig {
-    fn default() -> Self {
-        // 3 timing runs, take the minimum — variance from rayon dispatch
-        // and OS scheduling is much larger than per-run overhead, so the
-        // min of 3 is a tighter estimate of the kernel's true cost than
-        // any longer-running statistic.
-        Self {
-            warmup_runs: 0,
-            timing_runs: 3,
-            take_minimum: true,
-            early_stop: None,
-            clear_l2: false,
-            warmup_budget: None,
-        }
-    }
-}
-
 /// The load a GPU needs before a timing means anything: the RTX 3060 idles at
 /// 210 MHz against a 2130 MHz boost and lifts within about a second; the same
 /// kernel times 3x apart cold.
@@ -69,8 +27,10 @@ const WARM_FLOOR: Duration = Duration::from_millis(50);
 /// The time is checked one window of runs against the previous: once a window's
 /// minimum no longer beats the last by 5%, the clock is up. A device already
 /// under load plateaus in its first windows and pays only `WARM_FLOOR`, so a
-/// tuner touching many shapes does not spend the budget on each. See
-/// [`BenchmarkConfig::warmup_budget`].
+/// tuner touching many shapes does not spend the budget on each. A GPU idles at
+/// a fraction of its boost clock and takes about a second of load to lift it,
+/// so a kernel timed cold measures the clock, not the kernel; the CPU needs no
+/// lift.
 pub fn warm_clock(budget: Duration, mut dispatch: impl FnMut() -> Option<Duration>) {
     let start = Instant::now();
     let (mut previous, mut current, mut runs) = (Duration::MAX, Duration::MAX, 0usize);
@@ -91,115 +51,58 @@ pub fn warm_clock(budget: Duration, mut dispatch: impl FnMut() -> Option<Duratio
 /// Each candidate's minimum over `rounds` rounds of timing every candidate in
 /// turn, so none is judged at a clock the others were not (timing them one after
 /// another lets the first lift the clock for the rest). `time(i)` is one timed
-/// run of candidate `i`; `None` excludes it for good.
+/// run of candidate `i`; `None` excludes it for good. A candidate whose minimum
+/// is already past `early_stop` is not run again — it cannot win, and a search
+/// sets the bound at a multiple of its incumbent to spend the rounds on the
+/// ones that can — but the minimum it reached stands.
 pub fn round_robin_min(
     count: usize,
     rounds: usize,
+    early_stop: Option<Duration>,
     mut time: impl FnMut(usize) -> Option<Duration>,
 ) -> Vec<Option<Duration>> {
     let mut best: Vec<Option<Duration>> = vec![None; count];
-    let mut dead = vec![false; count];
+    let mut live = vec![true; count];
     for _ in 0..rounds {
         for i in 0..count {
-            if dead[i] {
+            if !live[i] {
                 continue;
             }
             match time(i) {
-                Some(t) => best[i] = Some(best[i].map_or(t, |b| b.min(t))),
-                None => (dead[i], best[i]) = (true, None),
+                Some(t) => {
+                    let t = best[i].map_or(t, |b| b.min(t));
+                    best[i] = Some(t);
+                    live[i] = early_stop.is_none_or(|bound| t <= bound);
+                }
+                None => (live[i], best[i]) = (false, None),
             }
         }
     }
     best
 }
 
-/// Result of kernel benchmarking.
-#[derive(Debug, Clone)]
-pub struct BenchmarkResult {
-    /// Minimum execution time.
-    pub min: Duration,
-    /// Mean execution time.
-    pub mean: Duration,
-    /// All timing measurements.
-    pub runs: Vec<Duration>,
-}
-
-impl BenchmarkResult {
-    /// Get the timing value based on config preference.
-    pub fn timing(&self, take_minimum: bool) -> Duration {
-        if take_minimum { self.min } else { self.mean }
-    }
-}
-
-/// Benchmark a compiled kernel's execution time.
-///
-/// Runs warmup iterations (discarded), then timing iterations.
-/// Returns min/mean/all timings.
+/// One synchronous timed run of `kernel` on its backend's clock: the device's
+/// own stamp where it keeps one, else the wall clock around the dispatch
+/// ([`Program::execute_timed`]). `None` is a sample the backend lost, which a
+/// caller drops rather than time the kernel on a second clock. `evict_host_cache`
+/// streams a scratch buffer through the host caches first; that reaches only a
+/// kernel the CPU runs.
 ///
 /// # Safety
 ///
-/// All buffer pointers must be valid for the duration of benchmarking.
-/// The kernel will be executed multiple times.
-///
-/// # Example
-///
-/// ```ignore
-/// let config = BenchmarkConfig::default();
-/// let result = unsafe { benchmark_kernel(&kernel, &buffers, &vals, None, None, &config)? };
-/// println!("Min time: {:?}", result.min);
-/// ```
-pub unsafe fn benchmark_kernel(
+/// All buffer pointers must be valid for the duration of the run.
+pub unsafe fn time_kernel(
     kernel: &dyn Program,
     buffers: &[*mut u8],
     vals: &[i64],
     global_size: Option<[usize; 3]>,
     local_size: Option<[usize; 3]>,
-    config: &BenchmarkConfig,
-) -> Result<BenchmarkResult> {
-    // Warm-up (discarded): the clock budget, then the counted runs.
-    if let Some(budget) = config.warmup_budget {
-        warm_clock(budget, || {
-            let start = Instant::now();
-            unsafe { kernel.execute(buffers, vals, global_size, local_size, true) }.ok().map(|_| start.elapsed())
-        });
+    evict_host_cache: bool,
+) -> Result<Option<Duration>> {
+    if evict_host_cache {
+        invalidate_l2();
     }
-    for _ in 0..config.warmup_runs {
-        // wait=true: benchmark needs each dispatch to complete before the next
-        // (async submit would measure queue time, not kernel time).
-        unsafe {
-            kernel.execute(buffers, vals, global_size, local_size, /*wait=*/ true)?
-        };
-    }
-
-    // Timing runs
-    let mut runs = Vec::with_capacity(config.timing_runs);
-    for i in 0..config.timing_runs {
-        if config.clear_l2 && i > 0 {
-            invalidate_l2();
-        }
-        // GPU-stamped duration when the backend has one (Metal command-buffer
-        // times); otherwise the wall clock around the synchronous dispatch.
-        let start = Instant::now();
-        let gpu = unsafe { kernel.execute_timed(buffers, vals, global_size, local_size)? };
-        runs.push(gpu.unwrap_or_else(|| start.elapsed()));
-
-        // Min-of-runs early stop: abort only when the best run so far still
-        // exceeds the threshold. A single jitter outlier in an otherwise
-        // competitive candidate must not disqualify it — `take_minimum=true`
-        // already discards tail noise from the final result.
-        if let Some(threshold) = config.early_stop
-            && runs.iter().copied().min().expect("runs non-empty after push") > threshold
-        {
-            break;
-        }
-    }
-
-    // Calculate statistics
-    let min = runs.iter().copied().min().unwrap_or(Duration::ZERO);
-    let total: Duration = runs.iter().sum();
-    let mean = total / runs.len().max(1) as u32;
-
-    Ok(BenchmarkResult { min, mean, runs })
+    Ok(unsafe { kernel.execute_timed(buffers, vals, global_size, local_size)? })
 }
 
 /// Force rayon's global thread pool to materialise.
@@ -211,7 +114,8 @@ pub fn warmup_thread_pool() {
     rayon::join(|| (), || ());
 }
 
-/// Stream through a 16 MiB scratch buffer to evict L2 between timing runs.
+/// Stream through a 16 MiB scratch buffer to evict the *host* L2 before a
+/// timing run. This is a CPU-kernel tool: a GPU keeps its device caches.
 ///
 /// Apple M1 P-core L2 is 12 MiB, A14/M2 L2 caches are similar; 16 MiB is
 /// large enough to fully evict L2 on common Apple Silicon and x86 desktop

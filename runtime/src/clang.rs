@@ -25,6 +25,7 @@ use crate::{Error, Result};
 pub(crate) struct ClangToolchain {
     executable: PathBuf,
     executable_digest: [u8; 32],
+    version: String,
     identity: String,
 }
 
@@ -41,13 +42,18 @@ impl ClangToolchain {
         };
         let version = String::from_utf8(version)
             .map_err(|error| Error::JitCompilation { reason: format!("clang --version was not UTF-8: {error}") })?;
-        let identity =
-            format!("path={};sha256={};version={}", executable.display(), hex(&executable_digest), version.trim());
-        Ok(Self { executable, executable_digest, identity })
+        let version = version.trim().to_string();
+        let identity = format!("path={};sha256={};version={version}", executable.display(), hex(&executable_digest));
+        Ok(Self { executable, executable_digest, version, identity })
     }
 
     pub(crate) fn identity(&self) -> &str {
         &self.identity
+    }
+
+    /// `clang --version`'s output, trimmed.
+    pub(crate) fn version(&self) -> &str {
+        &self.version
     }
 
     /// Resolve `flags` into the concrete target description clang will use —
@@ -442,6 +448,12 @@ mod dlopen_impl {
             Ok(Self { _lib: lib, fn_ptr, name: name.to_string(), var_names, cif, _tmp_dir: tmp_dir })
         }
 
+        /// Execute the kernel with buffer pointers and variable values.
+        ///
+        /// # Safety
+        ///
+        /// Caller must ensure buffer pointers are valid/aligned and `vals` length
+        /// matches `var_names`.
         pub unsafe fn execute_with_vals(&self, buffers: &[*mut u8], vals: &[i64]) -> Result<()> {
             unsafe { self.cif.dispatch(self.fn_ptr, buffers, vals, None)? };
             Ok(())

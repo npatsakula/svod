@@ -410,9 +410,10 @@ impl<P: PhysMem> MemoryManager<P> {
 
     /// Allocate `size` bytes of VA + backing VRAM and map them. `contiguous`
     /// forces one physical segment; otherwise physical memory is grabbed in
-    /// descending `palloc_ranges` chunks. Returns `None` on OOM.
+    /// descending `palloc_ranges` chunks. A zero-byte request maps one page, as
+    /// KFD's does. Returns `None` on OOM.
     pub fn valloc(&mut self, size: u64, align: u64, uncached: bool, contiguous: bool) -> Option<VirtMapping> {
-        let size = round_up(size, 0x1000);
+        let size = round_up(size.max(1), 0x1000);
         let va_align = (1u64 << (bit_length(size) - 1)).max(align.max(1));
         let va = self.va_alloc.alloc(size, va_align)?;
 

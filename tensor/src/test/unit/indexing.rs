@@ -383,3 +383,162 @@ fn test_shrink_empty_is_identity() {
     let sliced = t.try_shrink(&[] as &[(isize, isize)]).unwrap();
     assert_eq!(get_shape(&sliced), vec![1]);
 }
+
+// =========================================================================
+// An index outside its arange's dtype names no position
+// =========================================================================
+
+/// The dtype an index tensor is built in. `u64` keeps the two's-complement bit
+/// pattern of the same values, so `-1` is `u64::MAX`.
+#[derive(Clone, Copy, Debug)]
+enum IndexDtype {
+    I32,
+    I64,
+    U64,
+}
+
+impl IndexDtype {
+    fn dtype(self) -> DType {
+        match self {
+            Self::I32 => DType::Int32,
+            Self::I64 => DType::Int64,
+            Self::U64 => DType::UInt64,
+        }
+    }
+
+    /// In-range and negative indices beside ones a 32-bit cast would fold onto a
+    /// position: `2^32 + 3` onto 3, `-2^32` and `i64::MIN` onto 0.
+    fn values(self) -> Vec<i128> {
+        let wide =
+            [(1i128 << 32) + 3, 1, -1, -(1 << 32), 3, (1 << 32) + 5, i64::MIN.into(), i64::MAX.into(), 4, 1 << 31];
+        match self {
+            Self::I64 => wide.to_vec(),
+            Self::U64 => wide.iter().map(|&v| i128::from(v as i64 as u64)).collect(),
+            Self::I32 => vec![i32::MAX.into(), 1, -1, i32::MIN.into(), 3, 5, 4, 2, 0, 6],
+        }
+    }
+
+    fn tensor(self, values: &[i128]) -> Tensor {
+        match self {
+            Self::I32 => Tensor::from_slice(values.iter().map(|&v| v as i32).collect::<Vec<_>>()),
+            Self::I64 => Tensor::from_slice(values.iter().map(|&v| v as i64).collect::<Vec<_>>()),
+            Self::U64 => Tensor::from_slice(values.iter().map(|&v| v as u64).collect::<Vec<_>>()),
+        }
+    }
+}
+
+crate::codegen_tests! {
+    /// `sum_j x[j] * (idx == start + j)` keeps the one step an index names, and an
+    /// index outside the arange names none: the collapse that turns this masked sum
+    /// into a gather must not read the index through a narrowing cast.
+    #[test_case(IndexDtype::I64, 0; "i64 index")]
+    #[test_case(IndexDtype::U64, 0; "u64 index")]
+    #[test_case(IndexDtype::I32, 0; "i32 index")]
+    #[test_case(IndexDtype::I64, 2; "i64 index, offset arange")]
+    #[test_case(IndexDtype::U64, 2; "u64 index, offset arange")]
+    #[test_case(IndexDtype::I32, 2; "i32 index, offset arange")]
+    fn test_a_wide_index_never_aliases_onto_the_arange(config, index: IndexDtype, start: i64) {
+        let x = [10.0f32, 20.0, 30.0, 40.0, 50.0];
+        let values = index.values();
+        let positions = Tensor::arange(start, Some(start + x.len() as i64), None).unwrap().cast(index.dtype());
+        let mask = index.tensor(&values).try_unsqueeze(-1).unwrap().try_eq(&positions).unwrap();
+        let out = Tensor::from_slice(x).try_unsqueeze(0).unwrap().where_(&mask, 0.0f32).unwrap().sum(-1isize).unwrap();
+        out.realize_with(&config).unwrap();
+        let expected: Vec<f32> = values
+            .iter()
+            .map(|&v| (0..x.len()).filter(|&j| v == i128::from(start) + j as i128).fold(0.0, |sum, j| sum + x[j]))
+            .collect();
+        assert_eq!(out.as_vec::<f32>().unwrap(), expected, "indices {values:?}");
+    }
+}
+
+/// The lookups whose arange the gated-load collapse can turn into a direct read.
+#[derive(Clone, Copy, Debug)]
+enum Lookup {
+    Gather,
+    Embedding,
+    /// `x.where_(idx == arange(n).cast(dtype), 0).sum(-1)` written by hand.
+    WidenedMask,
+}
+
+impl Lookup {
+    fn build(self, vocab: usize, ids: &Tensor) -> Tensor {
+        match self {
+            Self::Gather => Tensor::empty(&[vocab], DType::Float32).gather(0, ids).unwrap(),
+            Self::Embedding => Tensor::empty(&[vocab, 8], DType::Float32).embedding(ids).unwrap(),
+            Self::WidenedMask => {
+                let positions = Tensor::arange(0, Some(vocab as i64), None).unwrap().cast(ids.uop().dtype());
+                let mask = ids.try_unsqueeze(-1).unwrap().try_eq(&positions).unwrap();
+                Tensor::empty(&[1, vocab], DType::Float32).where_(&mask, 0.0f32).unwrap().sum(-1isize).unwrap()
+            }
+        }
+    }
+}
+
+/// Reduces left in the kernels `t` schedules into, once each kernel's gated-load
+/// collapse has run.
+fn reduces_left(t: &Tensor) -> usize {
+    let sink = svod_ir::UOp::sink(vec![t.uop().contiguous()]);
+    let rangeified = svod_schedule::rangeify_with_map(sink).expect("rangeify");
+    let (kernels, _) = svod_schedule::try_get_kernel_graph(rangeified.sink).expect("kernel graph");
+    crate::schedule::create_pre_schedule(kernels)
+        .expect("pre-schedule")
+        .items
+        .iter()
+        .map(|item| {
+            let ast = svod_schedule::optimizer::apply_pre_optimization(item.ast.clone()).expect("pre-optimization");
+            ast.toposort().iter().filter(|node| matches!(node.op(), svod_ir::Op::Reduce(..))).count()
+        })
+        .sum()
+}
+
+/// A lookup collapses into a direct read whenever its arange compares in a dtype
+/// the index provably fits. A hand-built mask that widens an Int32 arange to an
+/// i64 index keeps its reduce: reading the index at 32 bits would fold `2^32 + k`
+/// onto position `k`.
+#[test_case::test_case(Lookup::Gather, DType::Int32, 0; "gather, i32")]
+#[test_case::test_case(Lookup::Gather, DType::Int64, 0; "gather, i64")]
+#[test_case::test_case(Lookup::Embedding, DType::Int32, 0; "embedding, i32")]
+#[test_case::test_case(Lookup::Embedding, DType::Int64, 0; "embedding, i64")]
+#[test_case::test_case(Lookup::Embedding, DType::UInt8, 0; "embedding, u8 against a wider vocab")]
+#[test_case::test_case(Lookup::WidenedMask, DType::Int32, 0; "a mask against i32")]
+#[test_case::test_case(Lookup::WidenedMask, DType::Int64, 1; "a mask widened to i64")]
+fn a_lookup_collapses_only_where_the_index_fits(lookup: Lookup, dtype: DType, reduces: usize) {
+    let lookup_tensor = lookup.build(300, &Tensor::empty(&[4], dtype));
+    assert_eq!(reduces_left(&lookup_tensor), reduces);
+}
+
+/// Indices around the arange, past 32 bits on either side, and at the extremes.
+fn wide_index() -> impl proptest::strategy::Strategy<Value = i64> {
+    use proptest::prelude::*;
+    prop_oneof![
+        -3i64..8,
+        (any::<i32>().prop_filter("past 32 bits", |high| *high != 0), 0i64..8)
+            .prop_map(|(high, low)| (i64::from(high) << 32) | low),
+        Just(i64::MIN),
+        Just(i64::MAX),
+        any::<i64>(),
+    ]
+}
+
+crate::codegen_tests! {
+    #[proptest_config(proptest::test_runner::Config::with_cases(24))]
+    fn test_lookups_match_a_reference(config, ids in proptest::collection::vec(wide_index(), 1..8)) {
+        let x = [10.0f32, 20.0, 30.0, 40.0, 50.0];
+        let expected: Vec<f32> =
+            ids.iter().map(|&id| usize::try_from(id).ok().and_then(|at| x.get(at)).copied().unwrap_or(0.0)).collect();
+        let index = Tensor::from_slice(&ids);
+        let table = Tensor::from_slice(x);
+        let positions = Tensor::arange(0, Some(x.len() as i64), None).unwrap().cast(DType::Int64);
+        let mask = index.try_unsqueeze(-1).unwrap().try_eq(&positions).unwrap();
+        let lookups = [
+            table.gather(0, &index).unwrap(),
+            table.try_unsqueeze(-1).unwrap().embedding(&index).unwrap().try_reshape([-1isize]).unwrap(),
+            table.try_unsqueeze(0).unwrap().where_(&mask, 0.0f32).unwrap().sum(-1isize).unwrap(),
+        ];
+        for (name, lookup) in ["gather", "embedding", "mask"].into_iter().zip(lookups) {
+            lookup.realize_with(&config).unwrap();
+            proptest::prop_assert_eq!(lookup.as_vec::<f32>().unwrap(), expected.clone(), "{} of {:?}", name, ids);
+        }
+    }
+}
