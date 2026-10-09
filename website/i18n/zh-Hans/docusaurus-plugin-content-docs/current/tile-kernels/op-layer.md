@@ -45,7 +45,7 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | `Dtype` | 任一操作数为 f32，或操作数没有共享同一种带矩阵核心的 16 位类型 |
 | `Symbolic` | 除绑定的首维之外还有符号维度（对 `linear` 而言，符号化的 `N` 也算） |
 | `Shape` | `linear`：`N` 不是 8 的倍数或没有行。`attention`：`D ∉ {48, 64, 128}` 或存在空维度。`heads`：`D` 不是 16..=256 范围内的 2 的幂。归一化：`D` 不是 256..=2048 范围内的 2 的幂。`conv2d`：`groups > 1`、`Cin` 不是 16 的倍数、`Cout` 不是 8 的倍数或输出为空 |
-| `Config` | 没有合适的 tile 配置。对 `linear` 而言，`K` 不是 16 的倍数。对 `conv2d` 而言，还包括实测内核落后的类别（占满网格的浅层步长 1 卷积） |
+| `Config` | 没有合适的 tile 配置。对 `linear` 而言，`K` 不是 16 的倍数 |
 
 `test/unit/ops_plan.rs` 中的真实用例，基于 sm_86 目标：
 

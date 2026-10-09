@@ -50,7 +50,7 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | `Dtype` | कोई operand f32 है, या सारे operands matrix core वाला एक ही 16-bit type साझा नहीं करते |
 | `Symbolic` | Bound leading dim के अलावा कोई dim symbolic है (`linear` के लिए symbolic `N` भी) |
 | `Shape` | `linear`: `N` 8 का गुणज नहीं या कोई row नहीं। `attention`: `D ∉ {48, 64, 128}` या कोई ख़ाली dim। `heads`: `D` 16..=256 में दो की घात नहीं। Norms: `D` 256..=2048 में दो की घात नहीं। `conv2d`: `groups > 1`, `Cin` 16 का गुणज नहीं, `Cout` 8 का गुणज नहीं, या ख़ाली output |
-| `Config` | कोई tile config फ़िट नहीं होता। `linear` के लिए, `K` 16 का गुणज नहीं। `conv2d` के लिए वे classes भी जिन पर kernel मापकर हारता है (पूरे grid पर उथले stride-1 convolutions) |
+| `Config` | कोई tile config फ़िट नहीं होता। `linear` के लिए, `K` 16 का गुणज नहीं |
 
 sm_86 target पर `test/unit/ops_plan.rs` के असली cases:
 

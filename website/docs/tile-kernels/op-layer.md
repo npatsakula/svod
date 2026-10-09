@@ -50,7 +50,7 @@ untuned pick first. `Plan::Graph(Fallback)` says why the graph runs.
 | `Dtype` | Any operand is f32, or the operands do not all share one 16-bit type with a matrix core |
 | `Symbolic` | A dim other than a bound leading one is symbolic (for `linear`, also a symbolic `N`) |
 | `Shape` | `linear`: `N` not a multiple of 8 or no rows. `conv2d`: `groups > 1`, `Cin` not a multiple of 16, `Cout` not a multiple of 8, or an empty output. `attention`: `D ∉ {48, 64, 128}` or an empty dim. `heads`: `D` not a power of two in 16..=256. Norms: `D` not a power of two in 256..=2048 |
-| `Config` | No tile config fits. For `linear`, `K` is not a multiple of 16. For `conv2d`, also the classes the kernel was measured to lose (shallow stride-1 convolutions on a full grid) |
+| `Config` | No tile config fits. For `linear`, `K` is not a multiple of 16 |
 
 Real cases from `test/unit/ops_plan.rs`, on the sm_86 target:
 
