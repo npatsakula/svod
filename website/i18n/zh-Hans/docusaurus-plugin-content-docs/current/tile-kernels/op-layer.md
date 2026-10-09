@@ -20,14 +20,12 @@ pub fn supported(device: &DeviceSpec) -> bool;
 
 | 算子 | 形状 | 选项 |
 |---|---|---|
-| `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual }`；门控的 `w` 为 `[2N, K]` |
 | `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` 接收与 `x` 同形的 `residual`，返回 `(x + residual, norm)` |
 
 `Attn::keys` 可以是 `KeyMask::None`、`KeyMask::Lens(&lens)`（`[B]` 有效键数）或 `KeyMask::Bool(&mask)`（`[B, Tk]`，被关注处为 true）。`Attn::cache` 接收 `Cache { head_start, kv_heads, row_map, appended }`，而 `appended` 要求 `KeyMask::Lens`。`Attn::scale` 默认为 `1/√D`。`Attn::bias`（`[B, H, T, Tk]` 或 `[1, H, T, Tk]`，与数据流同一 dtype）在掩码之前加到缩放后的分数上，例如 WavLM 的相对位置偏置。`Qkv::rope` 是 `[1, T, 1, D/2]`（按位置）或 `[B, T, 1, D/2]`（按 token）的 `(cos, sin)`。掩码的说明见[注意力内核](./kernel-library#flash-attention)。
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`；门控的 `w` 为 `[2N, K]` |
-| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale }` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` 接收与 `x` 同形的 `residual`，返回 `(x + residual, norm)` |
 
