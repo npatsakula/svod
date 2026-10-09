@@ -7,6 +7,7 @@ use std::sync::Arc;
 use proptest::prelude::*;
 use svod_dtype::{DType, DeviceSpec, ScalarDType};
 use svod_ir::{BinaryOp as UBinary, Op, UOp, ops};
+use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::atoms::sm86;
@@ -16,6 +17,7 @@ use crate::ir::Program;
 use crate::kernels::conv::{ConvGeom, ConvSpec, conv};
 use crate::kernels::gemm::{Epilogue, GemmCfg};
 use crate::kernels::{Act, Batch};
+use crate::launch::graph_launch;
 use crate::lower::lower;
 use crate::ops::config::{conv_candidates, conv_cfg_fits};
 
@@ -287,4 +289,178 @@ fn conv_lead_tiles(cin: usize, cout: usize, hw: usize, s: usize, tile: Option<[u
 #[test_case(40; "a multiple of 8 only")]
 fn too_few_channels_have_no_candidates(cin: usize) {
     assert!(conv_candidates(&sm86(), 1, 6400, 64, 9 * cin, cin).is_empty());
+}
+
+// ---- on the device -----------------------------------------------------------------
+
+fn cuda_target() -> Option<crate::atoms::Target> {
+    let spec = svod_dtype::default_device::default_device();
+    let target = matches!(spec, DeviceSpec::Cuda { .. }).then(|| crate::atoms::Target::for_device(&spec)).flatten();
+    if target.is_none() {
+        eprintln!("skipped: no CUDA device");
+    }
+    target
+}
+
+fn upload(v: &[f64], dtype: DType) -> Tensor {
+    let t = Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(dtype).contiguous();
+    t.realize().unwrap();
+    t
+}
+
+/// The convolution as the graph computes it in f32 from the same f16
+/// values: NCHW views, one cast at the end.
+fn graph_reference(g: &ConvGeom, images: usize, epi: Epilogue, p: &[Vec<f64>]) -> Vec<f32> {
+    let [ho, wo] = g.out_hw();
+    let f32_of = |v: &[f64], shape: Vec<isize>| upload(v, DType::Float32).try_reshape(shape).unwrap();
+    let x = f32_of(&p[0], vec![images as isize, g.h as isize, g.w as isize, g.cin as isize]);
+    let w = f32_of(&p[1], vec![g.cout as isize, g.kernel[0] as isize, g.kernel[1] as isize, g.cin as isize]);
+    let bias = epi.bias.then(|| f32_of(&p[2], vec![g.cout as isize]));
+    let padding = [(g.pad[0] as isize, g.pad[0] as isize), (g.pad[1] as isize, g.pad[1] as isize)];
+    let y = x
+        .try_permute(&[0, 3, 1, 2])
+        .unwrap()
+        .conv2d()
+        .weight(&w.try_permute(&[0, 3, 1, 2]).unwrap())
+        .maybe_bias(bias.as_ref())
+        .stride(&g.stride)
+        .dilation(&g.dilation)
+        .padding(&padding)
+        .call()
+        .unwrap();
+    let y = match epi.act {
+        Act::Silu => y.silu().unwrap(),
+        _ => y,
+    };
+    let mut y = y.try_permute(&[0, 2, 3, 1]).unwrap();
+    if epi.residual {
+        let shape = vec![images as isize, ho as isize, wo as isize, g.cout as isize];
+        y = y.try_add(f32_of(&p[2 + usize::from(epi.bias)], shape)).unwrap();
+    }
+    let out = if epi.out_f32 { DType::Float32 } else { DType::Float16 };
+    y.cast(out).cast(DType::Float32).contiguous().to_vec::<f32>().unwrap()
+}
+
+/// The kernel's output for `params` on the device, as f32.
+fn on_device(spec: &ConvSpec, target: &crate::atoms::Target, params: &[Vec<f64>]) -> Vec<f32> {
+    let out = if spec.epilogue.out_f32 { DType::Float32 } else { DType::Float16 };
+    let n = params.len();
+    let tensors: Vec<Tensor> = params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let output_typed = i == n - 1 || (spec.epilogue.residual && i == n - 2);
+            upload(p, if output_typed { out.clone() } else { DType::Float16 })
+        })
+        .collect();
+    let refs: Vec<&Tensor> = tensors.iter().collect();
+    let y = graph_launch(conv::<F16>(spec), &spec.cfg.lowering(target.clone()), &refs).unwrap();
+    y.cast(DType::Float32).to_vec::<f32>().unwrap()
+}
+
+fn assert_close_f32(what: &str, got: &[f32], want: &[f32], tol: f32) -> f32 {
+    assert_eq!(got.len(), want.len(), "{what}: element count");
+    let mut worst = 0.0f32;
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        let diff = (g - w).abs();
+        worst = worst.max(diff);
+        assert!(diff <= tol * w.abs().max(1.0), "{what}[{i}] = {g}, graph {w}");
+    }
+    worst
+}
+
+const RESIDUAL_SILU_BIAS: Epilogue = Epilogue { residual: true, ..SILU_BIAS };
+
+/// Every candidate of every YOLO26x dense 3×3 class matches the graph's
+/// convolution on the device (the tuner times on scratch buffers; this
+/// sweep is what verifies what it may pick).
+#[test]
+fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
+    let Some(target) = cuda_target() else { return };
+    for class in YOLO {
+        let g = yolo_geom(class);
+        let [ho, wo] = g.out_hw();
+        let params = inputs(&g, 1, RESIDUAL_SILU_BIAS, 13);
+        let want = graph_reference(&g, 1, RESIDUAL_SILU_BIAS, &params);
+        for c in conv_candidates(&target, 1, ho * wo, g.cout, g.k(), g.cin) {
+            let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue: RESIDUAL_SILU_BIAS, cfg: c };
+            let got = on_device(&spec, &target, &params);
+            let worst = assert_close_f32(&format!("{g:?} {c:?}"), &got, &want, 2e-3);
+            eprintln!("{}->{} {}x{} s{} {c:?}: max abs diff {worst:.2e}", g.cin, g.cout, g.h, g.w, g.stride[0]);
+        }
+    }
+}
+
+/// Folded batches, odd sizes, dilation and every epilogue on the device
+/// against the graph and the f64 reference.
+#[test_case(geom([7, 9], 32, 40, 3, 1, 1, 1), 3, RESIDUAL_SILU_BIAS, [64, 64, 32]; "ragged m and n, three images")]
+#[test_case(geom([11, 6], 64, 96, 5, 2, 2, 1), 2, SILU_BIAS, [64, 96, 32]; "5x5 stride 2 on 96 wide")]
+#[test_case(geom([10, 10], 16, 48, 3, 1, 2, 2), 1, SILU_BIAS, [64, 64, 16]; "dilated, 16 channels")]
+#[test_case(geom([9, 9], 32, 64, 3, 1, 1, 1), 2, Epilogue { out_f32: true, residual: true, ..Epilogue::DEFAULT }, [64, 64, 32]; "f32 out and residual")]
+fn conv_matches_on_the_device(g: ConvGeom, images: usize, epi: Epilogue, tile: [usize; 3]) {
+    let Some(target) = cuda_target() else { return };
+    let warps = if tile[1] == 48 { [2, 1] } else { [2, 2] };
+    let spec = ConvSpec { batch: Batch::Static(images), geom: g, epilogue: epi, cfg: cfg(tile, warps, 3) };
+    let params = inputs(&g, images, epi, 21);
+    let got = on_device(&spec, &target, &params);
+    let want = reference(&g, images, epi, &params);
+    let want: Vec<f32> = want.iter().map(|&w| w as f32).collect();
+    assert_close_f32("y vs f64", &got, &want, tolerance(epi) as f32);
+    assert_close_f32("y vs graph", &got, &graph_reference(&g, images, epi, &params), tolerance(epi) as f32);
+}
+
+/// An Inf in the first input element gives exactly the graph's set of
+/// non-finite outputs: the padded taps of its windows read zero, never a
+/// value multiplied by zero.
+#[test]
+fn an_inf_gives_the_graphs_non_finite_set_on_the_device() {
+    let Some(target) = cuda_target() else { return };
+    let g = geom([20, 20], 64, 64, 3, 1, 1, 1);
+    let epi = SILU_BIAS;
+    let mut params = inputs(&g, 1, epi, 8);
+    params[0][0] = f64::INFINITY;
+    let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue: epi, cfg: cfg([64, 64, 32], [2, 2], 3) };
+    let got = on_device(&spec, &target, &params);
+    let want = graph_reference(&g, 1, epi, &params);
+    let bad = |v: &[f32]| v.iter().enumerate().filter(|(_, x)| !x.is_finite()).map(|(i, _)| i).collect::<Vec<_>>();
+    assert_eq!(bad(&got), bad(&want));
+    assert_eq!(bad(&got).len(), 4 * g.cout, "the four windows over the corner pixel");
+}
+
+/// A bound batch walks grid z: buffers at capacity, the plan executed at a
+/// smaller live batch computes exactly those images.
+#[test]
+fn a_bound_batch_runs_the_live_images_on_the_device() {
+    let Some(target) = cuda_target() else { return };
+    let g = geom([12, 10], 32, 64, 3, 2, 1, 1);
+    let [ho, wo] = g.out_hw();
+    let (cap, live) = (3usize, 2usize);
+    let spec = ConvSpec {
+        batch: Batch::Var { name: "b".into(), min: 1, max: cap as i64 },
+        geom: g,
+        epilogue: RESIDUAL_SILU_BIAS,
+        cfg: cfg([64, 64, 32], [2, 2], 3),
+    };
+    let params = inputs(&g, cap, RESIDUAL_SILU_BIAS, 4);
+    let tensors: Vec<Tensor> = params.iter().map(|p| upload(p, DType::Float16)).collect();
+    let refs: Vec<&Tensor> = tensors.iter().collect();
+    let y = graph_launch(conv::<F16>(&spec), &spec.cfg.lowering(target), &refs).unwrap();
+    let mut plan = y.prepare().unwrap();
+    plan.execute_with_vars(&[("b", live as i64)]).unwrap();
+    let mut bytes = vec![0u8; live * ho * wo * g.cout * 2];
+    plan.output_buffer().unwrap().copyout_prefix(&mut bytes).unwrap();
+    let got: Vec<f32> = bytes.chunks(2).map(|b| half_to_f32(u16::from_le_bytes([b[0], b[1]]))).collect();
+    let want = reference(&g, cap, RESIDUAL_SILU_BIAS, &params);
+    let want: Vec<f32> = want[..got.len()].iter().map(|&w| w as f32).collect();
+    assert_close_f32("live images", &got, &want, 2e-3);
+}
+
+fn half_to_f32(h: u16) -> f32 {
+    let (sign, exp, frac) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+    let v = match exp {
+        0 => frac * 2f32.powi(-24),
+        31 => f32::INFINITY,
+        e => (1.0 + frac / 1024.0) * 2f32.powi(e - 15),
+    };
+    if sign == 1 { -v } else { v }
 }
