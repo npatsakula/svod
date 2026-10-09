@@ -153,9 +153,10 @@ Lanes are not ordered against each other, so `CudaDevice` keeps three
 tables (module docs of `device/src/cuda/device.rs`):
 
 - **producers** — storage base -> the newest completion token per lane that
-  read or wrote it (a host overwrite is a WAR hazard against in-flight
-  readers too). The execution plan publishes its or its graph's token on every
-  storage it touches after each execute; the allocator publishes a
+  read or wrote it, and whether it wrote (a host overwrite is a WAR hazard
+  against in-flight readers too). The execution plan publishes its or its
+  graph's token on every storage it touches after each execute, marked as a
+  write where the plan writes it; the allocator publishes a
   copy-lane token after each transfer or memset. `wait_storage(base)` drains
   the lanes below, then waits those tokens, then drops them from the table. A
   storage the table does not know — including one whose newest token belongs
@@ -168,8 +169,16 @@ tables (module docs of `device/src/cuda/device.rs`):
 - **copy tail** — the newest copy-lane event; each launch waits it on the
   GPU before running, so asynchronous copies precede every later kernel.
 
-`SVOD_CUDA_SCOPED_SYNC=0` disables all of it: every wait drains the context
-and every copy synchronizes the copy stream.
+Before each execute, a plan orders its lane (or its graph's) after the other
+lanes' conflicting tokens with `cuStreamWaitEvent`
+(`CudaDevice::order_lane_after`): the writers of every storage it reads, and
+every token of a storage it writes. Plans that only read a storage, such as
+shared weights, stay concurrent. Tokens outlive their lanes, so a one-shot
+`realize` whose plan is already dropped still orders the next one.
+
+`SVOD_CUDA_SCOPED_SYNC=0` disables all of it: every wait drains the context,
+every copy synchronizes the copy stream, and every plan execute drains the
+context first.
 
 The executor's cross-plan ordering is a host signal (`CpuTimelineSignal`) on
 every backend, CUDA included; there is no `TimelineSignal` implementation of

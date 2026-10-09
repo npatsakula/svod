@@ -12,10 +12,11 @@
 //! keeps three tables:
 //!
 //! - `producers`: storage base → the newest completion token per lane that
-//!   read or wrote it (a host overwrite is a WAR hazard against in-flight
-//!   readers too). Published by the executor after every plan execute and by
-//!   the allocator after every copy-lane operation. A storage absent from the
-//!   table has unknown producers and falls back to a context drain.
+//!   read or wrote it, and whether it wrote (a host overwrite is a WAR
+//!   hazard against in-flight readers too). Published by the executor after
+//!   every plan execute and by the allocator after every copy-lane
+//!   operation. A storage absent from the table has unknown producers and
+//!   falls back to a context drain.
 //! - `lanes`: every live lane and how many submissions it holds that no
 //!   token has been published for yet; such lanes are waited by every
 //!   scoped wait. A token counts as published only once its owner recorded
@@ -24,6 +25,11 @@
 //! - `copy_tail`: the newest copy-lane event; every launch on any lane waits
 //!   it on the GPU, so an asynchronous copy or memset is ordered before all
 //!   later kernels without a host wait.
+//!
+//! A plan submitting onto its lane is ordered on the GPU after the other
+//! lanes' tokens it conflicts with ([`CudaDevice::order_lane_after`]): the
+//! writers of what it reads, every token of what it writes. Readers sharing
+//! a storage (weights) stay concurrent.
 //!
 //! `SVOD_CUDA_SCOPED_SYNC=0` disables all of it: every wait drains the
 //! context and every copy synchronizes the copy stream, as before.
@@ -65,7 +71,15 @@ const PRUNE_PRODUCERS_ABOVE: usize = 8;
 
 /// In-flight tokens of one storage: at most one per lane, since a lane is
 /// in order and its newest token implies the older ones.
-type Producers = smallvec::SmallVec<[CudaCompletionToken; 2]>;
+type Producers = smallvec::SmallVec<[Producer; 2]>;
+
+/// A lane's newest token on a storage, and whether any submission it covers
+/// wrote the storage.
+#[derive(Clone)]
+struct Producer {
+    token: CudaCompletionToken,
+    writes: bool,
+}
 
 /// Whether the driver loads, initializes, and reports at least one device.
 /// Memoized; never panics; `false` on any failure.
@@ -540,11 +554,11 @@ impl CudaDevice {
         self.producers.lock().remove(&base);
     }
 
-    /// Record `token` as an in-flight producer/reader of the storage at
-    /// `base`, replacing this lane's previous token. A token of another
-    /// backend cannot be ordered by event, so the storage's producers become
-    /// unknown (every later access drains).
-    pub(crate) fn record_producer(&self, base: u64, token: &Arc<dyn CompletionToken>) {
+    /// Record `token` as an in-flight reader of the storage at `base`, and
+    /// its writer when `writes`, replacing this lane's previous token. A
+    /// token of another backend cannot be ordered by event, so the storage's
+    /// producers become unknown (every later access drains).
+    pub(crate) fn record_producer(&self, base: u64, token: &Arc<dyn CompletionToken>, writes: bool) {
         if !Self::scoped_sync_enabled() {
             return;
         }
@@ -553,18 +567,20 @@ impl CudaDevice {
             self.producers.lock().remove(&base);
             return;
         };
-        self.record_cuda_producer(base, token);
+        self.record_cuda_producer(base, token, writes);
     }
 
-    fn record_cuda_producer(&self, base: u64, token: &CudaCompletionToken) {
+    /// The newer token of a lane implies its older ones, so it inherits
+    /// their write until it retires.
+    fn record_cuda_producer(&self, base: u64, token: &CudaCompletionToken, writes: bool) {
         let mut producers = self.producers.lock();
         let tokens = producers.entry(base).or_default();
-        match tokens.iter_mut().find(|earlier| earlier.lane() == token.lane()) {
-            Some(slot) => *slot = token.clone(),
-            None => tokens.push(token.clone()),
+        match tokens.iter_mut().find(|earlier| earlier.token.lane() == token.lane()) {
+            Some(slot) => *slot = Producer { token: token.clone(), writes: writes || slot.writes },
+            None => tokens.push(Producer { token: token.clone(), writes }),
         }
         if tokens.len() > PRUNE_PRODUCERS_ABOVE {
-            tokens.retain(|token| !token.retired());
+            tokens.retain(|producer| !producer.token.retired());
         }
     }
 
@@ -596,11 +612,11 @@ impl CudaDevice {
                 self.synchronize_lane(&lane)?;
             }
         }
-        for token in &tokens {
-            token.event().wait(0).inspect_err(|error| self.poison(&error.to_string()))?;
+        for producer in &tokens {
+            producer.token.event().wait(0).inspect_err(|error| self.poison(&error.to_string()))?;
         }
         if let Some(current) = self.producers.lock().get_mut(&base) {
-            current.retain(|token| !tokens.iter().any(|waited| Arc::ptr_eq(waited.event(), token.event())));
+            current.retain(|kept| !tokens.iter().any(|waited| Arc::ptr_eq(waited.token.event(), kept.token.event())));
         }
         Ok(())
     }
@@ -613,7 +629,7 @@ impl CudaDevice {
         if !Self::scoped_sync_enabled() {
             return self.synchronize();
         }
-        let api = self.enter()?;
+        self.enter()?;
         let mut events: Vec<Arc<CudaEvent>> = Vec::new();
         {
             let producers = self.producers.lock();
@@ -622,11 +638,52 @@ impl CudaDevice {
                     drop(producers);
                     return self.synchronize();
                 };
-                events.extend(tokens.iter().map(|token| Arc::clone(token.event())));
+                events.extend(tokens.iter().map(|producer| Arc::clone(producer.token.event())));
             }
         }
+        self.wait_on_gpu(&self.copy, events)
+    }
+
+    /// Order `lane` after every other lane's in-flight access that conflicts
+    /// with `accesses` (`(storage base, writes)`), on the GPU: the writers of
+    /// a storage it reads (RAW), every reader and writer of one it writes
+    /// (WAR, WAW). Lanes with unpublished submissions contribute a tail
+    /// event; unknown storages drain the context, as does the kill switch.
+    /// Copy-lane work needs nothing here: [`Self::order_launch`] covers it.
+    pub(crate) fn order_lane_after(self: &Arc<Self>, lane: &Lane, accesses: &[(u64, bool)]) -> Result<()> {
+        if !Self::scoped_sync_enabled() {
+            return self.synchronize();
+        }
+        self.enter()?;
+        let mut events: Vec<Arc<CudaEvent>> = Vec::new();
+        {
+            let producers = self.producers.lock();
+            for &(base, writes) in accesses {
+                let Some(tokens) = producers.get(&base) else {
+                    drop(producers);
+                    return self.synchronize();
+                };
+                let conflicting = tokens.iter().filter(|producer| {
+                    let lane_id = producer.token.lane();
+                    lane_id != lane.id && lane_id != self.copy.id && (writes || producer.writes)
+                });
+                for producer in conflicting {
+                    let event = producer.token.event();
+                    if !events.iter().any(|seen| Arc::ptr_eq(seen, event)) {
+                        events.push(Arc::clone(event));
+                    }
+                }
+            }
+        }
+        self.wait_on_gpu(lane, events)
+    }
+
+    /// Make `waiter` wait `events` and the current tail of every other lane
+    /// with unpublished submissions, on the GPU.
+    fn wait_on_gpu(self: &Arc<Self>, waiter: &Lane, mut events: Vec<Arc<CudaEvent>>) -> Result<()> {
+        let api = self.enter()?;
         for lane in self.live_lanes() {
-            if lane.has_unpublished() {
+            if lane.id != waiter.id && lane.has_unpublished() {
                 let tail = CudaEvent::new(Arc::clone(self), false)?;
                 tail.record(lane.raw)?;
                 events.push(Arc::new(tail));
@@ -634,7 +691,7 @@ impl CudaDevice {
         }
         for event in events.iter().filter(|event| !event.observed_complete()) {
             // SAFETY: live stream and event of this context.
-            self.check(unsafe { (api.stream_wait_event)(self.copy.raw, event.raw, 0) }, "cuStreamWaitEvent")?;
+            self.check(unsafe { (api.stream_wait_event)(waiter.raw, event.raw, 0) }, "cuStreamWaitEvent")?;
         }
         Ok(())
     }
@@ -651,7 +708,7 @@ impl CudaDevice {
         let event = Arc::new(event);
         let token = CudaCompletionToken::new(Arc::clone(&event), self.copy.id);
         for base in bases {
-            self.record_cuda_producer(*base, &token);
+            self.record_cuda_producer(*base, &token, true);
         }
         *self.copy_tail.lock() = Some(event);
         self.copy_seq.fetch_add(1, Ordering::AcqRel);
@@ -741,6 +798,15 @@ impl CudaStream {
         let event = CudaEvent::new(Arc::clone(&self.dev), timing)?;
         event.record(self.lane.raw)?;
         Ok(Arc::new(event))
+    }
+
+    /// Order this stream after the conflicting in-flight work of other lanes
+    /// ([`CudaDevice::order_lane_after`]); buffers of another device or not
+    /// yet allocated have nothing in flight here.
+    pub fn order_after(&self, accesses: &[(&crate::Buffer, bool)]) -> Result<()> {
+        let bases: smallvec::SmallVec<[(u64, bool); 16]> =
+            accesses.iter().filter_map(|(buffer, writes)| Some((buffer.cuda_base(&self.dev)?, *writes))).collect();
+        self.dev.order_lane_after(&self.lane, &bases)
     }
 
     /// A completion token for everything submitted so far. The submissions

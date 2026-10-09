@@ -802,15 +802,24 @@ impl Buffer {
         self.data.allocator.synchronize()
     }
 
-    /// Record `token` as an in-flight producer/reader of this buffer's
-    /// storage for scoped host synchronization (the AMD and CUDA
-    /// `wait_storage`). No-op on other backends and on storage that was
-    /// never allocated (nothing can be in flight against it).
-    pub fn record_completion(&self, token: &Arc<dyn crate::sync::CompletionToken>) {
+    /// Record `token` as an in-flight reader of this buffer's storage, and
+    /// its writer when `writes`, for scoped synchronization (the AMD and
+    /// CUDA `wait_storage`, the CUDA cross-lane ordering). No-op on other
+    /// backends and on storage that was never allocated (nothing can be in
+    /// flight against it).
+    pub fn record_completion(&self, token: &Arc<dyn crate::sync::CompletionToken>, writes: bool) {
         match self.data.raw.get() {
             Some(RawBuffer::AmdDevice { gpu_addr, device, .. }) => device.core().record_producer(*gpu_addr, token),
-            Some(RawBuffer::Cuda { device_ptr, device, .. }) => device.record_producer(*device_ptr, token),
+            Some(RawBuffer::Cuda { device_ptr, device, .. }) => device.record_producer(*device_ptr, token, writes),
             _ => {}
+        }
+    }
+
+    /// The CUDA storage base of this buffer when it is allocated on `device`.
+    pub(crate) fn cuda_base(&self, device: &Arc<crate::cuda::CudaDevice>) -> Option<u64> {
+        match self.data.raw.get() {
+            Some(RawBuffer::Cuda { device_ptr, device: owner, .. }) if Arc::ptr_eq(owner, device) => Some(*device_ptr),
+            _ => None,
         }
     }
 

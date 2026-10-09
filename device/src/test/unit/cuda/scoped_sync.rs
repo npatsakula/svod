@@ -12,8 +12,8 @@ use super::graph::Chain;
 use super::{Hardware, cuda_alloc_or_skip, device_ptr, download, load, slow_abi, upload, vadd_abi};
 use crate::Buffer;
 use crate::allocator::{Allocator, BufferSpec, RawBuffer};
-use crate::cuda::{CudaAllocator, CudaDevice, CudaPlanCtx, CudaProgram};
-use crate::device::{PlanContext, Program};
+use crate::cuda::{CudaAllocator, CudaDevice, CudaGraph, CudaPlanCtx, CudaProgram};
+use crate::device::{GraphKernel, PlanContext, Program};
 use crate::sync::CompletionToken;
 
 const N: usize = 256;
@@ -79,7 +79,7 @@ impl Slow {
 fn publish(dev: &CudaDevice, ctx: &CudaPlanCtx, storages: &[&RawBuffer]) -> Arc<dyn CompletionToken> {
     let token = ctx.completion_token().expect("CUDA contexts hand out tokens");
     for storage in storages {
-        dev.record_producer(base(storage), &token);
+        dev.record_producer(base(storage), &token, true);
     }
     token.published();
     token
@@ -198,7 +198,7 @@ fn graph_replay_then_host_read() {
     chain.alloc._copyin(&chain.out, 0, &vec![0u8; chain.alloc_len() * 4]).unwrap();
     graph.replay(&[], &[]).unwrap();
     let token = graph.completion_token().expect("replays record completion");
-    chain.alloc.dev.record_producer(base(&chain.out), &token);
+    chain.alloc.dev.record_producer(base(&chain.out), &token, true);
     assert_eq!(chain.alloc.dev.producer_count(base(&chain.out)), Some(2), "the copy-in's token and the replay's");
     assert_eq!(download(&chain.alloc, &chain.out, chain.alloc_len()), chain.expected());
     assert!(token.retired());
@@ -232,8 +232,8 @@ fn managed_host_views_wait_the_producer() {
     }
     .unwrap();
     let token = ctx.completion_token().unwrap();
-    out.record_completion(&token);
-    source.record_completion(&token);
+    out.record_completion(&token, true);
+    source.record_completion(&token, false);
     assert_eq!(slow.dev().producer_count(unsafe { out.as_raw_ptr() } as u64), Some(1));
     assert_eq!(out.as_slice::<f32>().unwrap(), &doubled(&input)[..]);
     assert!(token.retired());
@@ -264,7 +264,7 @@ fn recycled_allocations_wait_the_previous_owner() {
     }
     .unwrap();
     let token = ctx.completion_token().unwrap();
-    first.record_completion(&token);
+    first.record_completion(&token, true);
     drop(first);
     let second = Buffer::new_with_zero_init(alloc, DType::Float32, vec![N], spec, true);
     second.ensure_allocated().unwrap();
@@ -358,7 +358,7 @@ fn unrecorded_token_keeps_the_lane_covered() {
     slow.dispatch(&ctx, &out, &input, LONG_MS);
     let token = ctx.completion_token().expect("CUDA contexts hand out tokens");
     assert_eq!(download(&slow.alloc, &out, N), doubled(&values(3.0)), "read raced the unpublished launch");
-    slow.dev().record_producer(base(&out), &token);
+    slow.dev().record_producer(base(&out), &token, true);
     token.published();
     let later = upload(&slow.alloc, &vec![0.0; N]);
     slow.dispatch(&ctx, &later, &input, LONG_MS);
@@ -374,7 +374,7 @@ fn unrecorded_graph_token_keeps_the_lane_covered() {
     graph.replay(&[], &[]).unwrap();
     let token = graph.completion_token().expect("replays record completion");
     assert_eq!(download(&chain.alloc, &chain.out, chain.alloc_len()), chain.expected());
-    chain.alloc.dev.record_producer(base(&chain.out), &token);
+    chain.alloc.dev.record_producer(base(&chain.out), &token, true);
     token.published();
     chain.alloc._copyin(&chain.out, 0, &vec![0u8; chain.alloc_len() * 4]).unwrap();
     graph.replay_profiled(&[], &[]).unwrap();
@@ -396,4 +396,121 @@ fn small_copyin_is_published_as_the_producer() {
     publish(slow.dev(), &ctx, &[&out, &input]);
     assert_eq!(download(&slow.alloc, &out, N), doubled(&values(7.0)));
     slow.alloc._free(input, &spec);
+}
+
+/// A device-local `Buffer` holding `values`, as a plan binds it.
+fn plan_buffer(slow: &Slow, values: &[f32]) -> Buffer {
+    let alloc: Arc<dyn Allocator> = Arc::new((*slow.alloc).clone());
+    let spec = BufferSpec { cpu_access: false, ..BufferSpec::default() };
+    let mut buffer = Buffer::new(alloc, DType::Float32, vec![values.len()], spec);
+    buffer.copyin(super::f32_bytes(values)).unwrap();
+    buffer
+}
+
+fn read(buffer: &Buffer) -> Vec<f32> {
+    let mut bytes = vec![0u8; buffer.size()];
+    buffer.copyout(&mut bytes).unwrap();
+    bytes.as_chunks::<4>().0.iter().map(|chunk| f32::from_le_bytes(*chunk)).collect()
+}
+
+/// `slow_double(out, input, ms)` on `ctx` after ordering it as a plan
+/// would, then the executor's token publication with the same accesses.
+fn plan_dispatch(slow: &Slow, ctx: &CudaPlanCtx, out: &Buffer, input: &Buffer, ms: i64) -> Arc<dyn CompletionToken> {
+    ctx.order_after(&[(input, false), (out, true)]).unwrap();
+    unsafe {
+        ctx.dispatch(
+            &slow.program,
+            &[out.as_raw_ptr(), input.as_raw_ptr()],
+            &[ms],
+            Some([1, 1, 1]),
+            Some([N, 1, 1]),
+            false,
+        )
+    }
+    .unwrap();
+    let token = ctx.completion_token().unwrap();
+    input.record_completion(&token, false);
+    out.record_completion(&token, true);
+    token.published();
+    token
+}
+
+/// A plan reading what a plan on another lane wrote is ordered after the
+/// writer on the GPU, even once the writer's plan (and lane) is gone: the
+/// one-shot `realize` chain `cat → narrow → read` read zeros without it.
+#[test]
+fn a_plan_is_ordered_after_the_writer_of_its_input() {
+    let Some(slow) = Slow::new() else { return };
+    let input = values(4.0);
+    let (source, mid, out) = (plan_buffer(&slow, &input), plan_buffer(&slow, &[0.0; N]), plan_buffer(&slow, &[0.0; N]));
+    let writer = slow.ctx();
+    plan_dispatch(&slow, &writer, &mid, &source, LONG_MS);
+    drop(writer);
+    let started = Instant::now();
+    plan_dispatch(&slow, &slow.ctx(), &out, &mid, 0);
+    assert!(started.elapsed() < NOT_WAITED, "the ordering waited on the host");
+    assert_eq!(read(&out), doubled(&doubled(&input)));
+}
+
+/// Plans that only read a storage (shared weights) are not ordered after
+/// each other.
+#[test]
+fn readers_of_a_shared_storage_stay_concurrent() {
+    let Some(slow) = Slow::new() else { return };
+    let input = values(6.0);
+    let (shared, out_a, out_b) =
+        (plan_buffer(&slow, &input), plan_buffer(&slow, &[0.0; N]), plan_buffer(&slow, &[0.0; N]));
+    let (ctx_a, ctx_b) = (slow.ctx(), slow.ctx());
+    plan_dispatch(&slow, &ctx_a, &out_a, &shared, LONG_MS);
+    plan_dispatch(&slow, &ctx_b, &out_b, &shared, 0);
+    let started = Instant::now();
+    assert_eq!(read(&out_b), doubled(&input));
+    let elapsed = started.elapsed();
+    assert!(elapsed < NOT_WAITED, "the second reader was ordered after the first ({elapsed:?})");
+    assert_eq!(read(&out_a), doubled(&input));
+}
+
+/// A plan overwriting a storage another lane is still about to read waits
+/// that reader (WAR), and one overwriting another lane's output waits its
+/// writer (WAW).
+#[test]
+fn a_plan_writing_a_storage_waits_its_readers_and_writers() {
+    let Some(slow) = Slow::new() else { return };
+    let old = values(8.0);
+    let (input, out, other) =
+        (plan_buffer(&slow, &old), plan_buffer(&slow, &[0.0; N]), plan_buffer(&slow, &values(1.0)));
+    plan_dispatch(&slow, &slow.ctx(), &out, &input, LONG_MS);
+    plan_dispatch(&slow, &slow.ctx(), &input, &other, 0);
+    assert_eq!(read(&out), doubled(&old), "the overwrite raced the slow reader");
+    assert_eq!(read(&input), doubled(&values(1.0)));
+
+    plan_dispatch(&slow, &slow.ctx(), &out, &input, LONG_MS);
+    plan_dispatch(&slow, &slow.ctx(), &out, &other, 0);
+    assert_eq!(read(&out), doubled(&values(1.0)), "the slow writer landed after the later one");
+}
+
+/// A graph replay is ordered after the writer of its input like a plan
+/// context's dispatches.
+#[test]
+fn a_graph_replay_is_ordered_after_the_writer_of_its_input() {
+    let Some(slow) = Slow::new() else { return };
+    let input = values(2.0);
+    let (source, mid, out) = (plan_buffer(&slow, &input), plan_buffer(&slow, &[0.0; N]), plan_buffer(&slow, &[0.0; N]));
+    let kernel = GraphKernel {
+        program: &slow.program as &dyn Program,
+        buffers: unsafe { vec![out.as_raw_ptr(), mid.as_raw_ptr()] },
+        vals: vec![0],
+        global_size: Some([1, 1, 1]),
+        local_size: Some([N, 1, 1]),
+        deps: vec![],
+    };
+    let graph = CudaGraph::capture(Arc::clone(slow.dev()), &[kernel]).unwrap().expect("CUDA kernels are graphable");
+    plan_dispatch(&slow, &slow.ctx(), &mid, &source, LONG_MS);
+    graph.order_after(&[(&mid, false), (&out, true)]).unwrap();
+    graph.replay(&[], &[]).unwrap();
+    let token = graph.completion_token().unwrap();
+    mid.record_completion(&token, false);
+    out.record_completion(&token, true);
+    token.published();
+    assert_eq!(read(&out), doubled(&doubled(&input)));
 }
