@@ -1,6 +1,7 @@
 mod atoms;
 mod attention;
 mod build;
+mod conv;
 mod device;
 mod gather;
 mod heads;

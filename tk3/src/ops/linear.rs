@@ -71,6 +71,7 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
         gated: opts.gated,
         residual: opts.residual.is_some(),
         scale: opts.scale.map(Scale::new),
+        out_f32: false,
     };
     let batch = batch_of(&var, 1);
     let spec = |cfg| GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };
