@@ -179,11 +179,26 @@ impl TuneStore {
 
 /// Each candidate's best device time in ns, its programs' summed, on scratch
 /// buffers at capacity (every runtime variable bound to its maximum); `None`
-/// where one fails.
+/// where one fails. The programs compile in parallel; the device runs them
+/// one at a time.
 pub fn measure(candidates: impl IntoIterator<Item = Candidate>) -> Vec<Option<u64>> {
-    let plans: Vec<Option<Vec<ExecutionPlan>>> = candidates
-        .into_iter()
+    use rayon::prelude::*;
+    let candidates: Vec<Candidate> = candidates.into_iter().collect();
+    let compiled: Vec<Option<Vec<Scratch>>> = candidates
+        .into_par_iter()
         .map(|programs| programs.into_iter().map(|(p, l)| scratch_plan(p, &l)).collect())
+        .collect();
+    let plans: Vec<Option<Vec<ExecutionPlan>>> = compiled
+        .into_iter()
+        .map(|plans| {
+            plans?
+                .into_iter()
+                .map(|(mut plan, vars)| {
+                    let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+                    plan.execute_with_vars(&vars).ok().map(|_| plan)
+                })
+                .collect()
+        })
         .collect();
     if let Some(first) = plans.iter().flatten().flatten().next() {
         spin(first, WARMUP);
@@ -201,14 +216,14 @@ pub fn measure(candidates: impl IntoIterator<Item = Candidate>) -> Vec<Option<u6
     round_robin_min(plans.len(), ROUNDS, None, time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
 }
 
-fn scratch_plan(prog: Program, lowering: &Lowering) -> Option<ExecutionPlan> {
+/// A compiled plan over scratch buffers and the variable bindings it runs at.
+type Scratch = (ExecutionPlan, Vec<(String, i64)>);
+
+fn scratch_plan(prog: Program, lowering: &Lowering) -> Option<Scratch> {
     let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
     let buffers: Vec<Tensor> = prog.params.iter().map(|p| Tensor::empty(&[p.elems], p.dtype.into())).collect();
     let out = launch::graph_launch(prog, lowering, &buffers.iter().collect::<Vec<_>>()).ok()?;
-    let mut plan = out.prepare().ok()?;
-    let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-    plan.execute_with_vars(&vars).ok()?;
-    Some(plan)
+    Some((out.prepare().ok()?, vars))
 }
 
 fn spin(plan: &ExecutionPlan, budget: Duration) {
