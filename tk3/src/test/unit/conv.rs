@@ -5,12 +5,12 @@
 use std::sync::Arc;
 
 use proptest::prelude::*;
-use svod_dtype::{DType, DeviceSpec, ScalarDType};
+use svod_dtype::{AmdArch, DType, DeviceSpec, GpuArch, ScalarDType};
 use svod_ir::{BinaryOp as UBinary, Op, UOp, ops};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use crate::atoms::sm86;
+use crate::atoms::{Target, sm86};
 use crate::build::F16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
@@ -281,10 +281,12 @@ pub(super) fn yolo_geom((cin, cout, k, hw, s): (usize, usize, usize, [usize; 2],
     geom(hw, cin, cout, k, s, k / 2, 1)
 }
 
-/// Every YOLO26x 3×3 class has candidates on sm_86, at most eight unsplit
-/// and each a distinct output tile and warp grid, and every one lowers: its
-/// tiles split into whole chunks per thread, `bk` divides `cin` (a step
-/// stays in one tap), the ring fits, and a split divides the steps.
+/// Every YOLO26x 3×3 class but the 48-channel one (whose steps would be one
+/// depth: the graph's on the cp.async path) has candidates on sm_86, at most
+/// eight unsplit and each a distinct output tile and warp grid, and every
+/// one lowers: its tiles split into whole chunks per thread, `bk` divides
+/// `cin` (a step stays in one tap), the ring fits, and a split divides the
+/// steps.
 #[test]
 fn conv_candidates_lower() {
     let target = sm86();
@@ -292,6 +294,10 @@ fn conv_candidates_lower() {
         let g = yolo_geom(class);
         let [ho, wo] = g.out_hw();
         let cands = Planner::new(target.clone()).conv_candidates(1, ho * wo, &g);
+        if g.cin == 48 {
+            assert!(cands.is_empty(), "{g:?}");
+            continue;
+        }
         assert!(!cands.is_empty(), "{g:?}");
         let unsplit: Vec<&ConvCfg> = cands.iter().filter(|c| c.split == 1).collect();
         assert!(unsplit.len() <= 8, "{g:?}: {}", unsplit.len());
@@ -313,7 +319,8 @@ fn conv_candidates_lower() {
 /// tiles, not 64-row ones padded by a ninth.
 #[test_case(96, 96, 80, 1, [64, 96]; "96 channels get a 96-wide tile")]
 #[test_case(192, 192, 40, 1, [64, 64]; "192 at 40x40 fills the SMs with 64x64")]
-#[test_case(384, 384, 160, 2, [128, 128]; "a large grid takes the largest tile")]
+#[test_case(384, 384, 160, 2, [64, 96]; "the stride-2 body's measured tile")]
+#[test_case(384, 384, 160, 2, [128, 128]; "a large grid keeps the largest tile")]
 #[test_case(768, 768, 40, 2, [32, 96]; "400 rows pad 64-row tiles by a ninth")]
 #[test_case(96, 48, 80, 1, [64, 48]; "48 channels take a 48-wide tile")]
 fn conv_shortlists_hold_the_measured_tiles(cin: usize, cout: usize, hw: usize, s: usize, tile: [usize; 2]) {
@@ -330,14 +337,18 @@ fn conv_shortlists_hold_the_measured_tiles(cin: usize, cout: usize, hw: usize, s
 }
 
 /// A 48-channel body's B tile is 48 wide and 16 deep (`bk` divides `cin`):
-/// 96 chunks, which split evenly over one warp only, so the class is served
-/// by one-warp blocks, which is better than no kernel.
+/// 96 chunks, which split evenly over one warp only. The register-staged
+/// path serves the class with one-warp blocks; the cp.async path, where a
+/// one-depth step runs behind the graph's conv (sm_86 at 160²: 84 µs against
+/// 57), leaves it to the graph.
 #[test]
-fn the_48_channel_bodies_take_one_warp_blocks() {
+fn the_48_channel_bodies_take_one_warp_blocks_or_the_graph() {
     let g = geom([160, 160], 48, 48, 3, 1, 1, 1);
-    let cands = Planner::new(sm86()).conv_candidates(1, 160 * 160, &g);
+    let rdna3 = Target::for_arch(GpuArch::Amd(AmdArch::Gfx1100));
+    let cands = Planner::new(rdna3).conv_candidates(1, 160 * 160, &g);
     assert!(!cands.is_empty());
     assert!(cands.iter().all(|c| c.gemm.tile[1..] == [48, 16] && c.gemm.warps == [1, 1]), "{cands:?}");
+    assert!(Planner::new(sm86()).conv_candidates(1, 160 * 160, &g).is_empty());
 }
 
 /// A starved grid (400 output pixels of 192 channels) has split candidates.

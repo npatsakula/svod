@@ -52,16 +52,17 @@ const BIG: GemmCfg = GemmCfg { tile: [128, 128, 32], stages: 3, warps: [4, 4], g
 /// tile and ring over eight warps. It stays in the shortlist.
 const BIG_MEASURED: GemmCfg = GemmCfg { tile: [128, 128, 32], stages: 3, warps: [2, 4], group_m: 8, unroll: false };
 
-/// The untuned pick per shape on sm_86: a grid that fills the device takes
-/// the 128×128 tile, 32 deep; fewer blocks per SM take deeper steps and, as
-/// rows run out, shorter tiles; a reduction dim off 32 takes 16-deep steps.
+/// The untuned pick per shape on sm_86: a grid that fills the device, or
+/// half of one, takes the 128×128 tile, 32 deep; as rows run out the tiles
+/// shrink to 32 rows over four warps; a reduction dim off 32 takes 16-deep
+/// steps.
 #[test_case(&[4096, 4096], 4096, false, Ok(BIG); "large grid, deepest ring")]
 #[test_case(&[4096, 4096], 4096, true, Ok(BIG); "gated keeps the ring in 99 KB")]
 #[test_case(&[8, 256, 512], 2048, false, Ok(BIG); "a static batch counts toward the grid")]
-#[test_case(&[2048, 512], 1024, false, Ok(gemm_cfg([128, 128, 64], 3, [4, 4], false)); "half the big grid, deeper steps")]
-#[test_case(&[8, 37, 512], 512, false, Ok(gemm_cfg([64, 128, 64], 3, [4, 4], false)); "medium grid")]
-#[test_case(&[37, 64], 96, false, Ok(gemm_cfg([32, 64, 64], 3, [2, 4], false)); "few rows")]
-#[test_case(&[37, 48], 96, false, Ok(gemm_cfg([64, 64, 16], 3, [2, 2], false)); "k a multiple of 16 only")]
+#[test_case(&[2048, 512], 1024, false, Ok(BIG); "half the big grid")]
+#[test_case(&[8, 37, 512], 512, false, Ok(gemm_cfg([32, 64, 32], 3, [2, 2], false)); "medium grid")]
+#[test_case(&[37, 64], 96, false, Ok(gemm_cfg([32, 48, 64], 3, [2, 2], false)); "few rows")]
+#[test_case(&[37, 48], 96, false, Ok(gemm_cfg([32, 64, 16], 3, [1, 2], false)); "k a multiple of 16 only")]
 #[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
 #[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
 #[test_case(&[0, 64], 96, false, Err(Fallback::Shape); "no rows")]
@@ -79,7 +80,8 @@ fn gemm_list(x: &Extent, n: usize, gated: bool) -> Vec<GemmCfg> {
 /// The 4096³ shortlist on sm_86: eight distinct tiles and warp grids, the
 /// cheapest by the traffic model first, each with its one cheapest pipeline
 /// (three stages, rolled: the deepest ring 100 KB holds, and `cp.async` slots
-/// gain nothing from unrolling in the model), the measured peak among them.
+/// gain nothing from unrolling in the model), the measured peak among them,
+/// and the 64-row tiles the sweeps measured ahead on narrower problems.
 #[test]
 fn large_gemm_candidates() {
     let want = [
@@ -88,9 +90,9 @@ fn large_gemm_candidates() {
         gemm_cfg([256, 128, 32], 3, [4, 4], false),
         BIG_MEASURED,
         gemm_cfg([128, 128, 32], 3, [4, 2], false),
-        gemm_cfg([128, 256, 32], 3, [2, 4], false),
-        gemm_cfg([256, 128, 32], 3, [4, 2], false),
-        gemm_cfg([128, 256, 32], 3, [4, 2], false),
+        gemm_cfg([64, 128, 32], 3, [2, 4], false),
+        gemm_cfg([128, 64, 32], 3, [4, 2], false),
+        gemm_cfg([64, 64, 32], 3, [2, 2], false),
     ];
     assert_eq!(gemm_list(&ext(&[4096, 4096]), 4096, false), want);
 }
@@ -557,8 +559,9 @@ fn conv_geom(hw: usize, cin: usize, cout: usize, k: usize, s: usize) -> crate::k
     }
 }
 
-/// The untuned pick's output width: a body of 96 or 48 channels takes a tile
-/// of its width, not a power of two padded by a third.
+/// The untuned pick's output width: a body of 96 channels takes a tile of
+/// its width, not a power of two padded by a third; a 48-channel body, whose
+/// steps would be one depth, takes the graph on the cp.async path.
 fn conv_plan(x: &[usize], g: crate::kernels::conv::ConvGeom, groups: usize) -> Result<usize, Fallback> {
     let plan = shape::conv2d(Some(&Planner::new(sm86())), &[F16; 3], F16, None, Some(&ext(x)), &g, groups);
     first(plan).map(|c| c.gemm.tile[1])
@@ -567,12 +570,12 @@ fn conv_plan(x: &[usize], g: crate::kernels::conv::ConvGeom, groups: usize) -> R
 const F16: DType = DType::Float16;
 
 #[test_case(&[1, 80, 80, 384], conv_geom(80, 384, 96, 3, 1), 1, Ok(96); "head conv, 96 wide")]
-#[test_case(&[1, 20, 20, 192], conv_geom(20, 192, 192, 3, 1), 1, Ok(64); "a starved shallow body")]
+#[test_case(&[1, 20, 20, 192], conv_geom(20, 192, 192, 3, 1), 1, Ok(96); "a starved shallow body")]
 #[test_case(&[8, 80, 80, 384], conv_geom(80, 384, 384, 3, 2), 1, Ok(128); "a static batch folds into the rows")]
-#[test_case(&[1, 40, 40, 192], conv_geom(40, 192, 192, 3, 1), 1, Ok(96); "a shallow body filling the device")]
+#[test_case(&[1, 40, 40, 192], conv_geom(40, 192, 192, 3, 1), 1, Ok(64); "a shallow body filling the device")]
 #[test_case(&[1, 80, 80, 96], conv_geom(80, 96, 96, 3, 1), 1, Ok(96); "96 wide, shallow")]
 #[test_case(&[1, 640, 640, 3], conv_geom(640, 3, 96, 3, 2), 1, Err(Fallback::Shape); "rgb stem")]
-#[test_case(&[1, 160, 160, 48], conv_geom(160, 48, 48, 3, 1), 1, Ok(48); "48 wide on one warp")]
+#[test_case(&[1, 160, 160, 48], conv_geom(160, 48, 48, 3, 1), 1, Err(Fallback::Config); "48 wide takes the graph")]
 #[test_case(&[1, 20, 20, 64], conv_geom(20, 64, 60, 3, 1), 1, Err(Fallback::Shape); "cout off 8")]
 #[test_case(&[1, 20, 20, 64], conv_geom(20, 64, 64, 3, 1), 64, Err(Fallback::Shape); "depthwise")]
 #[test_case(&[0, 20, 20, 64], conv_geom(20, 64, 64, 3, 1), 1, Err(Fallback::Shape); "no images")]
