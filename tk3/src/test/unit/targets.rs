@@ -487,6 +487,23 @@ fn shared_tiles_lie_along_their_fragments(target: Target, values: Axis) {
     assert!(lowered_tile(prog, &lowering).smem.iter().all(|a| a.along == Axis::Col));
 }
 
+/// Where the target loads 16×16 blocks transposed (RDNA4), the staged
+/// registers of a column-major tile hold column runs straight from global
+/// memory and store them as 16-byte vectors; elsewhere the staged registers
+/// are walked down the rows.
+#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201 loads values transposed")]
+#[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942 walks the rows")]
+fn column_major_tiles_fill_by_transposing_loads(target: Target, transposing: bool) {
+    assert_eq!(target.tr_load, transposing);
+    let families = families(&target);
+    let (name, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("attention d128")).unwrap().clone();
+    let ir = render(prog, &lowering);
+    let calls = ir.matches("call <8 x bfloat> @llvm.amdgcn.global.load.tr.b128.v8bf16(ptr addrspace(1) %").count();
+    assert_eq!(calls > 0, transposing, "{name}: {calls} transposing loads");
+    let (_, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("gemm #0")).unwrap().clone();
+    assert!(!render(prog, &lowering).contains("global.load.tr"), "a row-major fill stays a chunk copy");
+}
+
 /// `Sync::Fence` statements in `block`, recursively.
 fn fences(block: &crate::ir::Block) -> usize {
     use crate::ir::{Stmt, Sync};

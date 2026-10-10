@@ -183,7 +183,11 @@ fn amd_loops_indexing_registers_stay_unhinted() {
 // These exercise the AMDLLVMRenderer codegen path; `assert_amd_ir_compiles`
 // hands the result to clang-amdgcn where a host toolchain is available.
 
-fn render_amd_linearized(root: &std::sync::Arc<svod_ir::UOp>, arch: AmdArch, name: &str) -> crate::RenderedKernel {
+pub(crate) fn render_amd_linearized(
+    root: &std::sync::Arc<svod_ir::UOp>,
+    arch: AmdArch,
+    name: &str,
+) -> crate::RenderedKernel {
     let code_renderer = LlvmTextRenderer::amd(arch);
     let optimizer_renderer = svod_schedule::OptimizerRenderer::for_amd_arch(arch).with_rewrite_capabilities(
         svod_ir::RendererOps::all(),
@@ -567,7 +571,7 @@ fn assert_llvm_ir_assembles(ir: &str) {
 /// As above, but through `clang --target=amdgcn-amd-amdhsa`, which also runs
 /// instruction selection. Returns without asserting when the host clang has no
 /// AMDGPU target.
-fn assert_amd_ir_compiles(ir: &str, arch: &str) {
+pub(crate) fn assert_amd_ir_compiles(ir: &str, arch: &str) {
     use std::io::Write;
     use std::process::{Command, Stdio};
 

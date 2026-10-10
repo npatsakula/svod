@@ -71,6 +71,9 @@ pub struct Target {
     pub cp_async: bool,
     /// Warp-collective 8×8 b16 fragment loads from shared memory.
     pub ldmatrix: bool,
+    /// Transposing 16-byte loads of 16×16 b16 blocks from global memory, a
+    /// column run per lane (`global_load_tr_b128`): RDNA4.
+    pub tr_load: bool,
     /// Shared memory a block may use without special launch attributes.
     pub smem_bytes: usize,
     /// Streaming multiprocessors (compute units), when the device reports them.
@@ -95,6 +98,7 @@ impl Target {
             GpuArch::Metal(_) => (false, false, 32 << 10),
         };
         let commit_fence = matches!(arch, GpuArch::Amd(a) if a.is_rdna4());
+        let tr_load = matches!(arch, GpuArch::Amd(a) if a.is_rdna4() && wave == 32);
         let occupancy = match arch {
             // Four schedulers over 64K registers; 48 warps on sm_86, sm_89 and
             // sm_120, 64 elsewhere.
@@ -108,7 +112,18 @@ impl Target {
             GpuArch::Amd(_) => Occupancy { simds: 2, file: 1536, waves: 16, registers: 256 },
             GpuArch::Metal(_) => Occupancy { simds: 4, file: 1024, waves: 8, registers: 128 },
         };
-        Self { arch, wave, mma: mma_atoms(arch), cp_async, ldmatrix, smem_bytes, sms: None, commit_fence, occupancy }
+        Self {
+            arch,
+            wave,
+            mma: mma_atoms(arch),
+            cp_async,
+            ldmatrix,
+            tr_load,
+            smem_bytes,
+            sms: None,
+            commit_fence,
+            occupancy,
+        }
     }
 
     /// The target behind a device, when the backend reports its architecture.

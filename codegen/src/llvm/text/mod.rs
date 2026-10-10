@@ -600,4 +600,4 @@ pub fn render(uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
 
 #[cfg(test)]
 #[path = "../../test/unit/llvm_text.rs"]
-mod tests;
+pub(crate) mod tests;

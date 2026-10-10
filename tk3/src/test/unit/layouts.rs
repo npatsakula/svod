@@ -6,13 +6,35 @@ use crate::atoms::sm86;
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{self as frag, Dim};
-use crate::layouts::{Issue, Laid, Relayout, TileLayout, WarpGrid, chunked, infer, natural};
+use crate::layouts::{Issue, Laid, Relayout, TileLayout, WarpGrid, chunked, infer, natural, transposing};
 
 fn coords(l: &TileLayout, warps: u32, lanes: u32) -> Vec<(u32, u32)> {
     (0..warps)
         .flat_map(|w| (0..lanes).flat_map(move |l_| (0..l.regs()).map(move |j| (w, l_, j))))
         .map(|(w, l_, j)| l.coord(w, l_, j))
         .collect()
+}
+
+/// The layout transposing loads leave a tile in holds every element in
+/// 16-byte column runs, divides the 16×16 blocks among the warps where there
+/// are enough, and exists only for wave32 tiles 16 divides.
+#[test_case(16, 128, 4, 16; "16 keys of 128")]
+#[test_case(32, 64, 4, 16; "32 keys of 64")]
+#[test_case(64, 64, 8, 16; "64 keys over 8 warps")]
+#[test_case(16, 48, 4, 24; "three blocks over 4 warps replicate")]
+fn transposing_layouts_hold_16_byte_column_runs(rows: usize, cols: usize, warps: u32, regs: u32) {
+    let l = transposing(Shape::new(rows, cols), warps, 32).unwrap();
+    assert_eq!((l.shape(), l.regs()), (Shape::new(rows, cols), regs));
+    let held: HashSet<(u32, u32)> = coords(&l, warps, 32).into_iter().collect();
+    assert_eq!(held.len(), rows * cols, "every element held");
+    assert!(
+        l.runs(32, 8, Axis::Row).iter().all(|&(_, w)| w == 8),
+        "column runs of eight: {:?}",
+        l.runs(32, 8, Axis::Row)
+    );
+    assert!(l.runs(32, 8, Axis::Col).iter().all(|&(_, w)| w == 1), "no row runs");
+    assert!(transposing(Shape::new(rows, cols), warps, 64).is_none(), "wave32 only");
+    assert!(transposing(Shape::new(8, cols), warps, 32).is_none(), "blocks of 16");
 }
 
 /// The GEMM's accumulator takes the matrix core's C layout tiled over the

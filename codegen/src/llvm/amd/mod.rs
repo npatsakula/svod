@@ -5,6 +5,7 @@
 //! falls through to the CPU emitter unchanged.
 
 pub mod ops;
+pub mod tr;
 pub mod wmma;
 
 pub use ops::render_uop;
