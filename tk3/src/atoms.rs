@@ -45,6 +45,22 @@ impl MmaAtom {
     }
 }
 
+/// What an SM (compute unit) runs at once, per lane: its SIMDs, the
+/// register file each gives its waves, and how many waves each schedules.
+/// [`Target::for_arch`] fills in the architecture's facts; [`Target::for_device`]
+/// replaces what the device reports (SIMDs and waves on AMD, the register
+/// file and waves on CUDA).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Occupancy {
+    pub simds: u32,
+    /// 32-bit registers per lane in a SIMD's file, shared by its waves.
+    pub file: u32,
+    /// Waves a SIMD schedules at most.
+    pub waves: u32,
+    /// Registers one lane may hold; past it a kernel spills.
+    pub registers: u32,
+}
+
 /// What a target offers the lowering.
 #[derive(Clone, Debug)]
 pub struct Target {
@@ -59,6 +75,7 @@ pub struct Target {
     pub smem_bytes: usize,
     /// Streaming multiprocessors (compute units), when the device reports them.
     pub sms: Option<u32>,
+    pub occupancy: Occupancy,
     /// The machine scheduler hoists a pipeline trip's shared-memory commit above
     /// its products unless fenced (`Sync::Fence` → `sched_barrier`), leaving
     /// the block waiting on global memory with no product in flight: RDNA4.
@@ -78,7 +95,20 @@ impl Target {
             GpuArch::Metal(_) => (false, false, 32 << 10),
         };
         let commit_fence = matches!(arch, GpuArch::Amd(a) if a.is_rdna4());
-        Self { arch, wave, mma: mma_atoms(arch), cp_async, ldmatrix, smem_bytes, sms: None, commit_fence }
+        let occupancy = match arch {
+            // Four schedulers over 64K registers; 48 warps on sm_86, sm_89 and
+            // sm_120, 64 elsewhere.
+            GpuArch::Cuda(c) => {
+                let waves = if (c.major == 8 && c.minor >= 6) || c.major == 12 { 12 } else { 16 };
+                Occupancy { simds: 4, file: 512, waves, registers: 255 }
+            }
+            // CDNA: four SIMD16s, 512 architectural registers (and as many accumulators) per lane.
+            GpuArch::Amd(a) if a.is_cdna() => Occupancy { simds: 4, file: 512, waves: 8, registers: 512 },
+            // RDNA: two SIMD32s with 192 KB of registers each.
+            GpuArch::Amd(_) => Occupancy { simds: 2, file: 1536, waves: 16, registers: 256 },
+            GpuArch::Metal(_) => Occupancy { simds: 4, file: 1024, waves: 8, registers: 128 },
+        };
+        Self { arch, wave, mma: mma_atoms(arch), cp_async, ldmatrix, smem_bytes, sms: None, commit_fence, occupancy }
     }
 
     /// The target behind a device, when the backend reports its architecture.
@@ -99,7 +129,13 @@ impl Target {
                     if node.lds_size_in_kb > 0 {
                         target.smem_bytes = node.lds_size_in_kb as usize * 1024;
                     }
-                    target.sms = (node.simd_per_cu > 0).then(|| node.simd_count / node.simd_per_cu);
+                    if let Some(sms) = node.simd_count.checked_div(node.simd_per_cu).filter(|&sms| sms > 0) {
+                        target.sms = Some(sms);
+                        target.occupancy.simds = node.simd_per_cu;
+                    }
+                    if node.max_waves_per_simd > 0 {
+                        target.occupancy.waves = node.max_waves_per_simd;
+                    }
                 }
                 return Some(target);
             }
@@ -110,6 +146,13 @@ impl Target {
         if let Some(limits) = limits {
             target.smem_bytes = limits.shared_per_block_optin as usize;
             target.sms = Some(limits.sm_count);
+            let lanes = target.occupancy.simds * limits.warp_size.max(1);
+            if limits.registers_per_sm > 0 {
+                target.occupancy.file = limits.registers_per_sm / lanes;
+            }
+            if limits.max_threads_per_sm > 0 {
+                target.occupancy.waves = limits.max_threads_per_sm / lanes;
+            }
         }
         Some(target)
     }

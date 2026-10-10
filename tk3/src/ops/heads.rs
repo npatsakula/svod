@@ -59,13 +59,14 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
     }
 
     let (ext, var) = extent(&xs).unzip();
-    let target = super::target(&qkv.device());
+    let planner = super::planner(&qkv.device());
     // A weight or table off the stream dtype keeps the graph, as the norms do.
     let (cos, sin) = rope.unzip();
     let dtypes: Vec<DType> = [Some(qkv), q_norm, k_norm, cos, sin].into_iter().flatten().map(Tensor::dtype).collect();
-    let plan = shape::heads(target.as_ref(), &dtypes, ext.as_ref(), d);
+    let plan = shape::heads(planner.as_deref(), &dtypes, ext.as_ref(), d);
     let Plan::Kernel(cfgs) = plan else { return graph(qkv, opts).context(GraphSnafu { op: OP }) };
-    let (ext, var, target) = (ext.expect("planned"), var.flatten(), target.expect("planned"));
+    let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
+    let target = planner.target.clone();
     let (b, t) = (ext.dims[0], ext.dims[1]);
     let batch = batch_of(&var, b);
     let per_batch = rope.is_some_and(|(cos, _)| cos.shape().is_ok_and(|s| s[0] != SInt::Const(1)));

@@ -57,7 +57,8 @@ inference reads the operand layouts from the atom that consumes the values.
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_*` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8 | `simdgroup_8x8` |
 
-Only the CUDA row has kernel tables and runs on hardware today (see [Portability](./portability)).
+The CUDA and AMD rows plan kernels and run on hardware today (sm_86 and gfx1201 measured; see
+[Portability](./portability)).
 
 ## Layout inference
 

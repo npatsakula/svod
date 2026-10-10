@@ -1,20 +1,29 @@
 //! Tile config candidates per target and shape, most promising first: the
-//! first is what runs untuned, the tune store measures the rest.
+//! first is what runs untuned, the tune store measures the rest. GEMM-shaped
+//! kernels draw theirs from a lattice over the construct's knobs, kept to
+//! what the lowering runs and ranked by a traffic model; a [`Planner`] holds
+//! the rankings of one device. The other kernels' lists are small functions
+//! of the target.
+
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use svod_dtype::GpuArch;
 
 use crate::atoms::Target;
+use crate::ir::{Orient, Shape};
 use crate::kernels::attention::FaCfg;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
 use crate::kernels::rows::NormCfg;
+use crate::layouts::{WarpGrid, chunked};
 
-/// Targets with tables: `mma.sync` + `cp.async` + `ldmatrix` (sm_80+, measured
+/// Targets with kernels: `mma.sync` + `cp.async` + `ldmatrix` (sm_80+, measured
 /// on sm_86; Hopper and Blackwell run the same path, no wgmma or TMA), and
-/// AMD matrix cores with register-staged fills: RDNA3/RDNA3.5/RDNA4 WMMA and
-/// CDNA3/4 MFMA 16×16×16 on wave64 (conservative tiles, compiled but not yet
-/// measured).
-pub fn has_tables(target: &Target) -> bool {
+/// AMD matrix cores with register-staged fills: RDNA3/RDNA3.5/RDNA4 WMMA
+/// (measured on gfx1201) and CDNA3/4 MFMA 16×16×16 on wave64 (compiled, not
+/// yet measured).
+pub fn has_kernels(target: &Target) -> bool {
     match target.arch {
         GpuArch::Cuda(c) => c.major >= 8,
         GpuArch::Amd(a) => a.has_matrix_cores(),
@@ -22,202 +31,74 @@ pub fn has_tables(target: &Target) -> bool {
     }
 }
 
-/// Whether the warp grid of `cfg` tiles its output with `target`'s matrix
-/// core atoms and its ring depth is one the target's prefetch runs.
-fn tiles(target: &Target, cfg: &GemmCfg) -> bool {
-    let Some(atom) = target.mma.first() else { return false };
-    let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
-    bm.is_multiple_of(atom.m as usize * wr)
-        && bn.is_multiple_of(atom.n as usize * wc)
-        && bk.is_multiple_of(atom.k as usize)
-        && target.stages(cfg.stages) == cfg.stages
-}
+impl GemmCfg {
+    /// Whether the warp grid tiles the output with `target`'s matrix core
+    /// atoms and the ring depth is one the target's prefetch runs.
+    fn tiles(&self, target: &Target) -> bool {
+        let Some(atom) = target.mma.first() else { return false };
+        let ([bm, bn, bk], [wr, wc]) = (self.tile, self.warps.map(|w| w as usize));
+        bm.is_multiple_of(atom.m as usize * wr)
+            && bn.is_multiple_of(atom.n as usize * wc)
+            && bk.is_multiple_of(atom.k as usize)
+            && target.stages(self.stages) == self.stages
+    }
 
-/// Whether `cfg` lowers on `target`: [`tiles`], and both operand tiles
-/// split into whole 16-byte chunks per thread.
-pub fn cfg_fits(target: &Target, cfg: &GemmCfg) -> bool {
-    let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
-    let threads = target.wave as usize * wr * wc;
-    tiles(target, cfg) && (bm * bk / 8).is_multiple_of(threads) && (bn * bk / 8).is_multiple_of(threads)
+    /// Whether the config lowers on `target`: it [`tiles`](Self::tiles), and
+    /// both operand tiles split into whole 16-byte chunks per thread.
+    pub fn fits(&self, target: &Target) -> bool {
+        let ([bm, bn, bk], [wr, wc]) = (self.tile, self.warps.map(|w| w as usize));
+        let threads = target.wave as usize * wr * wc;
+        self.tiles(target) && (bm * bk / 8).is_multiple_of(threads) && (bn * bk / 8).is_multiple_of(threads)
+    }
+
+    /// The registers a lane holds for a GEMM over a weight of `halves`
+    /// halves (two when gated): the f32 accumulators, the 16-bit operand
+    /// fragments and, where the fill goes through registers, its staged
+    /// chunks, from the layouts the lowering assigns. `None` when the tile
+    /// does not lay out. Addressing and the epilogue's temporaries are not
+    /// counted.
+    pub fn registers(&self, target: &Target, halves: usize) -> Option<u32> {
+        let atom = target.mma.first()?;
+        let ([bm, bn, bk], [wr, wc]) = (self.tile, self.warps);
+        let issue = atom.issue(Orient::Direct, WarpGrid { rows: wr, cols: wc }, bm, bn, bk).ok()?;
+        let halves = halves as u32;
+        let acc = issue.c.regs() * halves;
+        let operands = (issue.a.regs() + issue.b.regs() * halves).div_ceil(2);
+        let fill = if target.cp_async {
+            0
+        } else {
+            let fill =
+                |rows: usize| chunked(Shape::new(rows, bk), 2, wr * wc, target.wave).map(|l| l.regs());
+            (fill(bm)? + fill(bn * halves as usize)?).div_ceil(2)
+        };
+        Some(acc + operands + fill)
+    }
 }
 
 const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], unroll: bool) -> GemmCfg {
     GemmCfg { tile, stages, warps, group_m: 8, unroll }
 }
 
-/// Output tile families, largest first, each with its measured best
-/// pipeline on sm_86 (4096³ peaks at the first; 64×64 wins M = 704).
-const GEMM_FAMILIES: [GemmCfg; 4] = [
-    gemm_cfg([128, 128, 32], 3, [2, 4], false),
-    gemm_cfg([128, 64, 32], 2, [2, 2], true),
-    gemm_cfg([64, 128, 32], 2, [2, 2], false),
-    gemm_cfg([64, 64, 32], 3, [2, 2], true),
-];
+/// The knobs a GEMM-shaped kernel is enumerated over: output tile edges
+/// (48 and 96 columns for the convolution bodies a power of two would pad
+/// by a third), reduction depths and warp grids.
+const ROWS: [usize; 4] = [32, 64, 128, 256];
+const COLS: [usize; 5] = [48, 64, 96, 128, 256];
+const DEPTHS: [usize; 3] = [16, 32, 64];
+const GRIDS: [[u32; 2]; 9] = [[1, 1], [1, 2], [2, 1], [2, 2], [1, 4], [4, 1], [2, 4], [4, 2], [4, 4]];
 
-/// AMD output tiles (RDNA and CDNA), largest first, on the register-staged two-slot ring:
-/// a wave's sub-tile stays at most 64×32 (eight 16×16 accumulators) so the
-/// accumulators, both operand fragments and the staged fill fit in the
-/// wave32 register file (CDNA has twice that). Unmeasured: the tune store picks among them.
-const GEMM_FAMILIES_AMD: [GemmCfg; 4] = [
-    gemm_cfg([128, 128, 32], 2, [2, 4], false),
-    gemm_cfg([128, 64, 32], 2, [2, 2], true),
-    gemm_cfg([64, 128, 32], 2, [2, 2], true),
-    gemm_cfg([64, 64, 32], 2, [2, 2], true),
-];
-
-fn gemm_families(target: &Target) -> &'static [GemmCfg] {
-    match target.arch {
-        GpuArch::Amd(_) => &GEMM_FAMILIES_AMD,
-        _ => &GEMM_FAMILIES,
-    }
-}
-
-/// Blocks per SM a family's grid needs before its larger tile pays off:
-/// at M = 704 the 128-row tiles lose to 64×64 with 7 blocks per SM.
-const BLOCKS_PER_SM: usize = 8;
-/// The SM count assumed when the device reports none.
-const DEFAULT_SMS: u32 = 32;
-
-/// At most eight GEMM configs for `batches` GEMMs of `m` rows, `n` columns
-/// and reduction dim `k`. The lead family is the largest whose grid fills
-/// every SM `BLOCKS_PER_SM` times with at most 1/16 of its output tiles'
-/// area past `m × n` (else 64×64); it comes with its pipeline variants, the
-/// other families follow with their own pipelines.
-pub fn gemm_candidates(target: &Target, batches: usize, m: usize, n: usize, k: usize, gated: bool) -> Vec<GemmCfg> {
-    let sms = target.sms.unwrap_or(DEFAULT_SMS) as usize;
-    let fills = |c: &GemmCfg| {
-        let [bm, bn, _] = c.tile;
-        let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
-        let padded = 16 * (gm * bm * gn * bn - m * n) <= gm * bm * gn * bn;
-        padded && batches * gm * gn >= BLOCKS_PER_SM * sms
-    };
-    let families = gemm_families(target);
-    let lead = families.iter().position(fills).unwrap_or(families.len() - 1);
-    let base = families[lead];
-    let [bm, bn, _] = base.tile;
-    let warps = match base.warps {
-        [2, 4] => [4, 2],
-        [2, 2] if bm > bn => [4, 2],
-        [2, 2] if bm < bn => [2, 4],
-        w => w,
-    };
-    let variants = [
-        base,
-        GemmCfg { stages: if base.stages == 2 { 3 } else { 2 }, ..base },
-        GemmCfg { tile: [bm, bn, 64], stages: 2, ..base },
-        GemmCfg { unroll: !base.unroll, ..base },
-        GemmCfg { warps, ..base },
-    ];
-    let others = families.iter().enumerate().filter(|(i, _)| *i != lead).map(|(_, c)| *c);
-    let mut out: Vec<GemmCfg> = vec![];
-    for mut c in variants.into_iter().chain(others) {
-        // A reduction dim off `bk` halves it, down to one 16-deep mma step.
-        while !k.is_multiple_of(c.tile[2]) && c.tile[2] > 16 {
-            c.tile[2] /= 2;
-        }
-        c.stages = target.stages(c.stages);
-        let fits = k > 0 && k.is_multiple_of(c.tile[2]) && tiles(target, &c);
-        if fits && c.smem_bytes(gated) <= target.smem_bytes && !out.contains(&c) {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Implicit-GEMM convolution tiles, largest first: the GEMM families, then
-/// output widths for 96- and 48-channel convolutions (a power-of-two tile
-/// would pad them by a third or re-read A per narrow block). A 48-wide B
-/// tile splits into whole chunks per thread only at `bk = 64` on four warps
-/// or `bk = 32` on two.
-const CONV_FAMILIES: [GemmCfg; 9] = [
-    gemm_cfg([128, 128, 32], 3, [2, 4], false),
-    gemm_cfg([128, 96, 32], 2, [2, 2], true),
-    gemm_cfg([128, 64, 32], 2, [2, 2], true),
-    gemm_cfg([64, 128, 32], 2, [2, 2], false),
-    gemm_cfg([64, 96, 32], 3, [2, 2], true),
-    gemm_cfg([128, 48, 64], 2, [4, 1], true),
-    gemm_cfg([64, 64, 32], 3, [2, 2], true),
-    gemm_cfg([32, 96, 32], 3, [2, 2], true),
-    gemm_cfg([64, 48, 32], 3, [2, 1], true),
-];
-
-/// Blocks per SM a convolution's lead tile must reach: its grids are a few
-/// hundred blocks, where the GEMM's eight would leave only the smallest tile.
-const CONV_BLOCKS_PER_SM: usize = 2;
-
-/// Convolution configs for `batches` grid batches of `m` output pixels of
-/// `g` (`n = cout`, `k = kh·kw·cin`); on sm_86 the best of them beats the
-/// graph's conv at BEAM=4 on every YOLO26x 3×3 class it serves. Open: the
-/// gathered A operand re-reads each input pixel per tap, so on stride-1
-/// bodies tk1's image-staged (Patch) form is still ahead, 192→192 at 40²
-/// 54.3 µs against 61.2 (graph 86.6); the Patch form is pending. A family is eligible when `bk` (halved down
-/// to 16 until it divides `cin`, so a step stays in one tap) lowers and its
-/// tiles pad `m × n` by at most 1/8. The lead is the largest eligible
-/// family whose grid gives every SM [`CONV_BLOCKS_PER_SM`] blocks, preferring
-/// at most 1/16 padding, else the eligible one with the most blocks; its pipeline variants follow, then
-/// every other eligible family. On a starved grid (fewer than twice
-/// [`CONV_BLOCKS_PER_SM`] blocks per SM, a single static batch) the lead
-/// and the family with the most blocks also come split over the reduction,
-/// in counts dividing the steps that keep at most 16 blocks per SM, as do the
-/// families with the most blocks at 1/16 and at 1/8 padding.
-pub fn conv_candidates(target: &Target, batches: usize, m: usize, g: &ConvGeom) -> Vec<ConvCfg> {
-    let (n, k, cin) = (g.cout, g.k(), g.cin);
-    if m == 0 || n == 0 || k == 0 {
-        return vec![];
-    }
-    let sms = target.sms.unwrap_or(DEFAULT_SMS) as usize;
-    // The share of the tiles' area past `m × n`.
-    let padding = |c: &GemmCfg| {
-        let [bm, bn, _] = c.tile;
-        let area = m.div_ceil(bm) * bm * n.div_ceil(bn) * bn;
-        (area - m * n) as f64 / area as f64
-    };
-    let fit = |mut c: GemmCfg| {
-        while !cin.is_multiple_of(c.tile[2]) && c.tile[2] > 16 {
-            c.tile[2] /= 2;
-        }
-        c.stages = target.stages(c.stages);
-        (padding(&c) <= 1.0 / 8.0
-            && cin.is_multiple_of(c.tile[2])
-            && cfg_fits(target, &c)
-            && c.smem_bytes(false) <= target.smem_bytes)
-            .then_some(c)
-    };
-    let eligible: Vec<GemmCfg> = CONV_FAMILIES.into_iter().filter_map(fit).collect();
-    let blocks = |c: &GemmCfg| batches * m.div_ceil(c.tile[0]) * n.div_ceil(c.tile[1]);
-    let fills = |c: &&GemmCfg| blocks(c) >= CONV_BLOCKS_PER_SM * sms;
-    let Some(&base) = eligible
-        .iter()
-        .filter(|c| padding(c) <= 1.0 / 16.0)
-        .find(fills)
-        .or_else(|| eligible.iter().find(fills))
-        .or_else(|| eligible.iter().max_by_key(|c| blocks(c)))
-    else {
-        return vec![];
-    };
-    let variants = [
-        GemmCfg { stages: if base.stages == 2 { 3 } else { 2 }, ..base },
-        GemmCfg { tile: [base.tile[0], base.tile[1], 64], stages: 2, ..base },
-        GemmCfg { unroll: !base.unroll, ..base },
-    ];
-    let mut out = vec![base];
-    for c in variants.into_iter().filter_map(fit).chain(eligible.iter().copied()) {
-        if !out.contains(&c) {
-            out.push(c);
-        }
-    }
-    let mut out: Vec<ConvCfg> = out.into_iter().map(|gemm| ConvCfg { gemm, split: 1 }).collect();
-    let widest = |tight: bool| {
-        let pick = eligible.iter().filter(|c| !tight || padding(c) <= 1.0 / 16.0).max_by_key(|c| blocks(c));
-        pick.copied().unwrap_or(base)
-    };
-    if batches == 1 && blocks(&base) < 2 * CONV_BLOCKS_PER_SM * sms {
-        for gemm in [base, widest(true), widest(false)] {
-            let trips = k / gemm.tile[2];
-            for split in [2, 3, 4, 6, 9] {
-                let c = ConvCfg { gemm, split };
-                if trips.is_multiple_of(split) && blocks(&gemm) * split <= 16 * sms && !out.contains(&c) {
-                    out.push(c);
+/// Every config the construct spans on `target`: the tiles and warp grids,
+/// the ring depths its prefetch runs, rolled and unrolled.
+fn lattice(target: &Target) -> Vec<GemmCfg> {
+    let stages: &[usize] = if target.cp_async { &[3, 2] } else { &[2] };
+    let mut out = vec![];
+    for bm in ROWS {
+        for bn in COLS {
+            for bk in DEPTHS {
+                for warps in GRIDS {
+                    for &stages in stages {
+                        out.extend([false, true].map(|unroll| gemm_cfg([bm, bn, bk], stages, warps, unroll)));
+                    }
                 }
             }
         }
@@ -225,56 +106,333 @@ pub fn conv_candidates(target: &Target, batches: usize, m: usize, g: &ConvGeom) 
     out
 }
 
-/// One warp per 16 query rows. `d = 128` leads with half-width key blocks:
-/// 64-wide ones measured 18.2 TFLOP/s against 22.2 on sm_86, since 64 KB
-/// per block leaves one block per SM. `d = 48` keeps the shapes whose K/V
-/// fills divide among the block's threads (96-byte rows, 16-byte chunks).
-/// A decoder step (`t ≤ 16`) is bandwidth-bound: one-warp blocks, which
-/// leave room for several per SM.
-pub fn attention_candidates(target: &Target, d: usize, t: usize) -> Vec<FaCfg> {
-    if let GpuArch::Amd(_) = target.arch {
-        return amd_attention_candidates(target, d, t);
-    }
-    let fa = FaCfg::new;
-    let list = match (d, t <= 16) {
-        (48 | 64 | 128, true) => vec![fa(16, 64, 2), fa(16, 64, 3), fa(16, 32, 2)],
-        (48, false) => vec![fa(64, 64, 2), fa(64, 64, 3)],
-        (64, false) => vec![fa(64, 64, 2), fa(64, 64, 3), fa(128, 64, 2), fa(64, 32, 2), fa(128, 32, 2), fa(64, 32, 3)],
-        (128, false) => {
-            vec![fa(64, 32, 2), fa(64, 32, 3), fa(128, 32, 2), fa(64, 64, 2), fa(128, 64, 2), fa(128, 32, 3)]
-        }
-        _ => return vec![],
-    };
-    let mut out: Vec<FaCfg> = vec![];
-    for c in list {
-        // A ring the target's prefetch cannot run deep folds into a shallower one.
-        let c = FaCfg { stages: target.stages(c.stages), ..c };
-        if c.smem_bytes(d) <= target.smem_bytes && !out.contains(&c) {
-            out.push(c);
-        }
-    }
-    out
+/// The SM count assumed when the device reports none.
+const DEFAULT_SMS: u32 = 32;
+/// Waves per SM past which more hide no more of the latency between a
+/// block's trips: the stall a trip leaves is weighed against the waves
+/// around it.
+const HIDING_WAVES: f64 = 16.0;
+/// A rolled register-staged ring recomputes its slot offsets every trip
+/// where an unrolled one has immediates.
+const ROLLED: f64 = 1.1;
+/// What a trip costs besides its traffic (the barrier, the ring's bubble),
+/// as bytes of shared-memory traffic: about 256 SM cycles.
+const TRIP: usize = 32 << 10;
+/// What one matrix-core step (a 16×16×16 product) costs, in the same bytes:
+/// its eight SM cycles at the 128 B/cycle of shared memory. It charges a
+/// padded tile for the work it wastes.
+const STEP: usize = 1024;
+
+/// A GEMM-shaped problem: `batches` products of `m × k` by `k × n·halves`
+/// (two halves: a gated weight, whose block stages a `2·bn`-wide B tile
+/// and holds two accumulators).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Problem {
+    pub batches: usize,
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub halves: usize,
 }
 
-/// AMD attention on the two-slot register-staged ring. The score tile
-/// reaches the P·V product through shared memory (the WMMA accumulator is
-/// not the operand layout), so that `bq × bkv` f32 scratch counts against
-/// the 64 KB of LDS too; the K/V fill must split into whole 16-byte chunks
-/// per thread. Unmeasured: the tune store picks among them.
-fn amd_attention_candidates(target: &Target, d: usize, t: usize) -> Vec<FaCfg> {
-    let fa = FaCfg::new;
-    let list = match (d, t <= 16) {
-        (48 | 64 | 128, true) => vec![fa(16, 32, 2), fa(16, 16, 2), fa(16, 64, 2)],
-        (48, false) => vec![fa(64, 32, 2), fa(64, 64, 2)],
-        (64, false) => vec![fa(64, 32, 2), fa(128, 32, 2), fa(64, 16, 2), fa(64, 64, 2)],
-        (128, false) => vec![fa(64, 16, 2), fa(128, 16, 2), fa(64, 32, 2), fa(128, 32, 2)],
-        _ => return vec![],
-    };
-    let fits = |c: &FaCfg| {
-        let threads = c.warps() as usize * target.wave as usize;
-        c.smem_bytes(d) + c.bq * c.bkv * 4 <= target.smem_bytes && (c.bkv * d / 8).is_multiple_of(threads)
-    };
-    list.into_iter().filter(fits).collect()
+impl Problem {
+    fn blocks(&self, cfg: &GemmCfg) -> usize {
+        self.batches * self.m.div_ceil(cfg.tile[0]) * self.n.div_ceil(cfg.tile[1])
+    }
+
+    /// The share of the tiles' area past `m × n`.
+    fn padding(&self, cfg: &GemmCfg) -> f64 {
+        let [bm, bn, _] = cfg.tile;
+        let area = self.m.div_ceil(bm) * bm * self.n.div_ceil(bn) * bn;
+        (area - self.m * self.n) as f64 / area as f64
+    }
+
+    /// What `cfg` costs here on `target`, for ranking, and a lane's
+    /// registers; `None` when it does not run. The cost is the bytes a
+    /// block's trip moves through shared memory (every wave's operand
+    /// fragments in, the fill out, [`TRIP`] for the trip itself and [`STEP`]
+    /// per matrix-core step) over the trips of every round of blocks the
+    /// device runs, stretched by how few waves an SM holds, and how few
+    /// steps its ring keeps in flight, to hide one trip's latency behind
+    /// another's. The matrix-core work is the same per output whatever the
+    /// tile, so the traffic is what tells tiles apart, and the SM count, the
+    /// shared memory and the register file decide how many blocks a round
+    /// holds.
+    fn admit(&self, target: &Target, cfg: &GemmCfg) -> Option<(f64, u32)> {
+        let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
+        let gated = self.halves == 2;
+        // A trip's products cover its own fragment loads only when a step is at
+        // least two matrix-core depths (measured: one-depth steps run a third
+        // slower at best), unless the reduction dim allows nothing deeper.
+        let depth = 2 * target.mma.first()?.k as usize;
+        let deep = bk >= depth || !self.k.is_multiple_of(depth);
+        if !(deep && self.k.is_multiple_of(bk) && cfg.fits(target) && cfg.smem_bytes(gated) <= target.smem_bytes) {
+            return None;
+        }
+        let regs = cfg.registers(target, self.halves).filter(|&r| r <= target.occupancy.registers)?;
+        let occupancy = target.occupancy;
+        let waves = wr * wc;
+        let per_simd = occupancy.waves.min(occupancy.file / regs) as usize;
+        let resident = (target.smem_bytes / cfg.smem_bytes(gated)).min(occupancy.simds as usize * per_simd / waves);
+        if resident == 0 {
+            return None;
+        }
+        let sms = target.sms.unwrap_or(DEFAULT_SMS) as usize;
+        let blocks = self.blocks(cfg);
+        let actual = resident.min(blocks.div_ceil(sms));
+        let rounds = blocks.div_ceil(sms * actual);
+        let steps = bm * bn * self.halves * bk / 4096;
+        let traffic =
+            (waves * (bm / wr + bn * self.halves / wc) + bm + bn * self.halves) * bk * 2 + TRIP + steps * STEP;
+        let trips = self.k / bk;
+        let hiding = 1.0 + HIDING_WAVES / (actual * waves * (cfg.stages - 1)) as f64;
+        let rolled = if cfg.unroll || target.cp_async { 1.0 } else { ROLLED };
+        Some(((rounds * actual * trips * traffic) as f64 * hiding * rolled, regs))
+    }
+
+    /// The lattice's configs that run this problem on `target`, cheapest
+    /// first, then by fewer registers, one pipeline (depth, ring depth,
+    /// unrolling) per output tile and warp grid, so the list spans tiles
+    /// rather than one tile's pipelines.
+    pub fn ranked(&self, target: &Target) -> Vec<GemmCfg> {
+        let mut ranked: Vec<(f64, u32, GemmCfg)> = lattice(target)
+            .into_iter()
+            .filter_map(|c| self.admit(target, &c).map(|(cost, regs)| (cost, regs, c)))
+            .collect();
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut seen = HashSet::new();
+        ranked.into_iter().map(|(_, _, c)| c).filter(|c| seen.insert(([c.tile[0], c.tile[1]], c.warps))).collect()
+    }
+}
+
+/// The configs the tune store measures per shape.
+const SHORTLIST: usize = 8;
+/// Blocks per SM a convolution's grid should reach before its reduction is
+/// left whole: its grids are a few hundred blocks.
+const CONV_BLOCKS_PER_SM: usize = 2;
+
+/// What the op layer plans with on one device: its target, and the
+/// problems ranked for it so far. An op plans its shape again at every
+/// call, and laying out the lattice's feasible configs takes a millisecond,
+/// so a ranking is kept for the planner's life (one per device).
+#[derive(Debug)]
+pub struct Planner {
+    pub target: Target,
+    ranked: papaya::HashMap<Problem, Arc<[GemmCfg]>>,
+    attention: papaya::HashMap<Attention, Arc<[FaCfg]>>,
+}
+
+/// The ranking kept under `key`, made by `rank` the first time it is asked for.
+fn cached<K: std::hash::Hash + Eq + Clone, V>(
+    map: &papaya::HashMap<K, Arc<[V]>>,
+    key: K,
+    rank: impl FnOnce() -> Vec<V>,
+) -> Arc<[V]> {
+    map.pin().get_or_insert_with(key, || rank().into()).clone()
+}
+
+impl Planner {
+    pub fn new(target: Target) -> Self {
+        Self { target, ranked: papaya::HashMap::new(), attention: papaya::HashMap::new() }
+    }
+
+    /// At most [`SHORTLIST`] attention configs for `tiles` rows of `t`
+    /// queries over `tk` keys at head size `d`, the cheapest first.
+    pub fn attention_candidates(&self, tiles: usize, t: usize, tk: usize, d: usize, causal: bool) -> Vec<FaCfg> {
+        if tiles * t * tk * d == 0 {
+            return vec![];
+        }
+        let p = Attention { tiles, t, tk, d, causal };
+        let ranked = cached(&self.attention, p, || p.ranked(&self.target));
+        ranked.iter().take(SHORTLIST).copied().collect()
+    }
+
+    fn ranked(&self, p: Problem) -> Arc<[GemmCfg]> {
+        cached(&self.ranked, p, || p.ranked(&self.target))
+    }
+
+    /// At most [`SHORTLIST`] GEMM configs for `batches` GEMMs of `m` rows,
+    /// `n` columns and reduction dim `k`, the cheapest of the lattice first.
+    pub fn gemm_candidates(&self, batches: usize, m: usize, n: usize, k: usize, gated: bool) -> Vec<GemmCfg> {
+        if batches * m * n * k == 0 {
+            return vec![];
+        }
+        let p = Problem { batches, m, n, k, halves: if gated { 2 } else { 1 } };
+        self.ranked(p).iter().take(SHORTLIST).copied().collect()
+    }
+
+    /// Convolution configs for `batches` grid batches of `m` output pixels
+    /// of `g` (`n = cout`, `k = kh·kw·cin`): the cheapest lattice configs
+    /// whose step stays within one tap (`bk` divides `cin`) and whose tiles
+    /// pad `m × n` by at most 1/8. On a starved grid (fewer than twice
+    /// [`CONV_BLOCKS_PER_SM`] blocks per SM, a single static batch) the lead
+    /// and the eligible configs with the most blocks at 1/16 and at 1/8
+    /// padding also come split over the reduction, in counts dividing the
+    /// steps that keep at most 16 blocks per SM. Open: the gathered A
+    /// operand re-reads each input pixel per tap, so on stride-1 bodies
+    /// tk1's image-staged (Patch) form is still ahead, 192→192 at 40² 54.3 µs
+    /// against 61.2 on sm_86 (graph 86.6); the Patch form is pending.
+    pub fn conv_candidates(&self, batches: usize, m: usize, g: &ConvGeom) -> Vec<ConvCfg> {
+        let (n, k, cin) = (g.cout, g.k(), g.cin);
+        if batches * m * n * k == 0 {
+            return vec![];
+        }
+        let p = Problem { batches, m, n, k, halves: 1 };
+        let eligible: Vec<GemmCfg> = self
+            .ranked(p)
+            .iter()
+            .filter(|c| cin.is_multiple_of(c.tile[2]) && p.padding(c) <= 1.0 / 8.0)
+            .copied()
+            .collect();
+        let Some(&base) = eligible.first() else { return vec![] };
+        let mut out: Vec<ConvCfg> = eligible.iter().take(SHORTLIST).map(|&gemm| ConvCfg { gemm, split: 1 }).collect();
+        let sms = self.target.sms.unwrap_or(DEFAULT_SMS) as usize;
+        let blocks = |c: &GemmCfg| p.blocks(c);
+        let widest = |tight: bool| {
+            let pick = eligible.iter().filter(|c| !tight || p.padding(c) <= 1.0 / 16.0).max_by_key(|c| blocks(c));
+            pick.copied().unwrap_or(base)
+        };
+        if batches == 1 && blocks(&base) < 2 * CONV_BLOCKS_PER_SM * sms {
+            for gemm in [base, widest(true), widest(false)] {
+                let trips = k / gemm.tile[2];
+                for split in [2, 3, 4, 6, 9] {
+                    let c = ConvCfg { gemm, split };
+                    if trips.is_multiple_of(split) && blocks(&gemm) * split <= 16 * sms && !out.contains(&c) {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+impl FaCfg {
+    /// Whether the config lowers on `target` for head size `d`: one warp per
+    /// 16 query rows, both products tile the atoms, and the K and V fills
+    /// split into whole 16-byte chunks per thread.
+    pub fn fits(&self, target: &Target, d: usize) -> bool {
+        let Some(atom) = target.mma.first() else { return false };
+        let (bq, bkv) = (self.bq, self.bkv);
+        let threads = self.warps() as usize * target.wave as usize;
+        bq.is_multiple_of(16)
+            && bq > 0
+            && [bkv, d].iter().all(|&x| x.is_multiple_of(atom.n as usize) && x.is_multiple_of(atom.k as usize))
+            && (bkv * d / 8).is_multiple_of(threads)
+            && target.stages(self.stages) == self.stages
+    }
+
+    /// The registers a lane holds for head size `d`, from the layouts the
+    /// lowering assigns: the query fragments and the f32 output, live across
+    /// the key loop; the key fragments, the f32 scores, the probabilities and
+    /// the value fragments, all live together while a block's scores are
+    /// turned into probabilities and multiplied in; and the staged K and V
+    /// chunks where the fill goes through registers (the value tile is
+    /// stored column-major where it is staged, so its fragments gather as
+    /// 16-byte runs like the keys').
+    pub fn registers(&self, target: &Target, d: usize) -> Option<u32> {
+        let atom = target.mma.first()?;
+        let grid = WarpGrid { rows: self.warps(), cols: 1 };
+        let qk = atom.issue(Orient::Direct, grid, self.bq, self.bkv, d).ok()?;
+        let pv = atom.issue(Orient::Direct, grid, self.bq, d, self.bkv).ok()?;
+        let half = |regs: u32| regs.div_ceil(2);
+        let fill = if target.cp_async {
+            0
+        } else {
+            let tile = chunked(Shape::new(self.bkv, d), 2, self.warps(), target.wave)?;
+            2 * half(tile.regs())
+        };
+        let (q, o) = (half(qk.a.regs()), pv.c.regs());
+        let (k, s, p, v) = (half(qk.b.regs()), qk.c.regs(), half(pv.a.regs()), half(pv.b.regs()));
+        Some(q + o + k + s + p + v + fill)
+    }
+}
+
+/// What a score element costs beyond its products, in bytes of shared-memory
+/// traffic: the softmax's scale, mask, max, exp2 and sum on the vector units.
+const SCORE: usize = 32;
+/// What a key block on a causal query block's diagonal costs in trips.
+const DIAGONAL: usize = 3;
+
+/// An attention problem: `tiles` independent query rows of `t` queries over
+/// `tk` keys at head size `d` (`tiles` = batch × heads), `causal` when a
+/// query sees the keys up to its own position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Attention {
+    pub tiles: usize,
+    pub t: usize,
+    pub tk: usize,
+    pub d: usize,
+    pub causal: bool,
+}
+
+impl Attention {
+    fn blocks(&self, cfg: &FaCfg) -> usize {
+        self.tiles * self.t.div_ceil(cfg.bq)
+    }
+
+    /// What `cfg` costs here on `target`, for ranking, and a lane's
+    /// registers; `None` when it does not run. A key block's trip moves
+    /// every warp's K and V fragments in and the fill out, pays [`TRIP`],
+    /// [`STEP`] per matrix-core step of both products and [`SCORE`] per
+    /// score, over the key blocks of every round of query blocks the device
+    /// runs, stretched by how few waves an SM holds and how few steps its
+    /// ring keeps in flight. A warp past the problem's query rows hides
+    /// nothing: it stalls on the loads its neighbours stall on and adds the
+    /// work of its padded rows, so a decoder step takes the one-warp tile. A
+    /// causal query block scores half the keys plus its diagonal, a key block
+    /// per `bkv` of its own rows, each costing [`DIAGONAL`] trips: the mask,
+    /// and the rows above the diagonal every warp still runs.
+    fn admit(&self, target: &Target, cfg: &FaCfg) -> Option<(f64, u32)> {
+        let (bq, bkv, d) = (cfg.bq, cfg.bkv, self.d);
+        let smem = cfg.smem_bytes(d) + cfg.scratch_bytes(target);
+        if !(cfg.fits(target, d) && smem <= target.smem_bytes) {
+            return None;
+        }
+        let regs = cfg.registers(target, d).filter(|&r| r <= target.occupancy.registers)?;
+        let occupancy = target.occupancy;
+        let waves = cfg.warps() as usize;
+        let per_simd = occupancy.waves.min(occupancy.file / regs) as usize;
+        let resident = (target.smem_bytes / smem).min(occupancy.simds as usize * per_simd / waves);
+        if resident == 0 {
+            return None;
+        }
+        let sms = target.sms.unwrap_or(DEFAULT_SMS) as usize;
+        let blocks = self.blocks(cfg);
+        let actual = resident.min(blocks.div_ceil(sms));
+        let rounds = blocks.div_ceil(sms * actual);
+        let steps = 2 * bq * bkv * d / 4096;
+        let traffic = (2 * waves + 2) * bkv * d * 2 + TRIP + steps * STEP + bq * bkv * SCORE;
+        let diagonal = DIAGONAL * bq.div_ceil(bkv);
+        let trips = if self.causal { self.tk.div_ceil(2 * bkv) + diagonal } else { self.tk.div_ceil(bkv) };
+        let useful = waves.min(self.t.div_ceil(16));
+        let hiding = 1.0 + HIDING_WAVES / (actual * useful * (cfg.stages - 1)) as f64;
+        let rolled = if cfg.unroll || target.cp_async { 1.0 } else { ROLLED };
+        Some(((rounds * actual * trips * traffic) as f64 * hiding * rolled, regs))
+    }
+
+    /// The lattice's configs that run this problem on `target`, cheapest
+    /// first, then by fewer registers, one pipeline per query and key block
+    /// size.
+    pub fn ranked(&self, target: &Target) -> Vec<FaCfg> {
+        let stages: &[usize] = if target.cp_async { &[3, 2] } else { &[2] };
+        let mut ranked: Vec<(f64, u32, FaCfg)> = vec![];
+        for bq in [16, 32, 64, 128] {
+            for bkv in [16, 32, 64, 128] {
+                for &stages in stages {
+                    for unroll in [false, true] {
+                        let cfg = FaCfg { unroll, ..FaCfg::new(bq, bkv, stages) };
+                        if let Some((cost, regs)) = self.admit(target, &cfg) {
+                            ranked.push((cost, regs, cfg));
+                        }
+                    }
+                }
+            }
+        }
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut seen = HashSet::new();
+        ranked.into_iter().map(|(_, _, c)| c).filter(|c| seen.insert((c.bq, c.bkv))).collect()
+    }
 }
 
 /// Key splits worth measuring for `tiles` independent query tiles over

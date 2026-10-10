@@ -19,7 +19,7 @@ use crate::kernels::gemm::{Epilogue, GemmCfg};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch;
 use crate::lower::lower;
-use crate::ops::config::{cfg_fits, conv_candidates};
+use crate::ops::config::Planner;
 
 pub(super) fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, p: usize, d: usize) -> ConvGeom {
     ConvGeom { h: hw[0], w: hw[1], cin, cout, kernel: [k, k], stride: [s, s], pad: [p, p], dilation: [d, d] }
@@ -281,61 +281,77 @@ pub(super) fn yolo_geom((cin, cout, k, hw, s): (usize, usize, usize, [usize; 2],
     geom(hw, cin, cout, k, s, k / 2, 1)
 }
 
-/// Every candidate of every YOLO class lowers on sm_86: its tiles split
-/// into whole chunks per thread, `bk` divides `cin`, the ring fits.
+/// Every YOLO26x 3×3 class has candidates on sm_86, at most eight unsplit
+/// and each a distinct output tile and warp grid, and every one lowers: its
+/// tiles split into whole chunks per thread, `bk` divides `cin` (a step
+/// stays in one tap), the ring fits, and a split divides the steps.
 #[test]
 fn conv_candidates_lower() {
     let target = sm86();
     for class in YOLO {
         let g = yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        let cands = conv_candidates(&target, 1, ho * wo, &g);
-        assert!(!cands.is_empty() || g.cin == 48, "{g:?}");
+        let cands = Planner::new(target.clone()).conv_candidates(1, ho * wo, &g);
+        assert!(!cands.is_empty(), "{g:?}");
+        let unsplit: Vec<&ConvCfg> = cands.iter().filter(|c| c.split == 1).collect();
+        assert!(unsplit.len() <= 8, "{g:?}: {}", unsplit.len());
+        for (i, c) in unsplit.iter().enumerate() {
+            let same = |o: &&ConvCfg| o.gemm.tile[..2] == c.gemm.tile[..2] && o.gemm.warps == c.gemm.warps;
+            assert!(!unsplit[..i].iter().any(same), "one pipeline per tile and grid: {c:?}");
+        }
         for ConvCfg { gemm: c, split } in cands {
-            assert!(
-                cfg_fits(&target, &c) && g.cin.is_multiple_of(c.tile[2]) && c.smem_bytes(false) <= target.smem_bytes
-            );
+            assert!(c.fits(&target) && g.cin.is_multiple_of(c.tile[2]) && c.smem_bytes(false) <= target.smem_bytes);
             assert!((g.k() / c.tile[2]).is_multiple_of(split));
         }
     }
 }
 
-#[test_case(96, 96, 80, 1, Some([64, 96, 32]); "96 channels get a 96-wide tile")]
-#[test_case(192, 192, 40, 1, Some([64, 64, 32]); "192 at 40x40 fills the SMs with 64x64")]
-#[test_case(384, 384, 160, 2, Some([128, 128, 32]); "a large grid takes the largest tile")]
-#[test_case(768, 768, 40, 2, Some([32, 96, 32]); "400 rows pad 64-row tiles by a ninth")]
-#[test_case(96, 48, 80, 1, Some([64, 48, 32]); "48 channels take a 48-wide tile")]
-#[test_case(48, 48, 160, 1, None; "48 channels in no 48-wide fill")]
-fn conv_lead_tiles(cin: usize, cout: usize, hw: usize, s: usize, tile: Option<[usize; 3]>) {
+/// The output tiles measured best on sm_86 are in their class's shortlist
+/// (with the step depth the model prefers), and every candidate pads the
+/// output by at most an eighth: a 96- or 48-wide body takes a 96- or 48-wide
+/// tile, not a power of two padded by a third, and 400 rows take 32-row
+/// tiles, not 64-row ones padded by a ninth.
+#[test_case(96, 96, 80, 1, [64, 96]; "96 channels get a 96-wide tile")]
+#[test_case(192, 192, 40, 1, [64, 64]; "192 at 40x40 fills the SMs with 64x64")]
+#[test_case(384, 384, 160, 2, [128, 128]; "a large grid takes the largest tile")]
+#[test_case(768, 768, 40, 2, [32, 96]; "400 rows pad 64-row tiles by a ninth")]
+#[test_case(96, 48, 80, 1, [64, 48]; "48 channels take a 48-wide tile")]
+fn conv_shortlists_hold_the_measured_tiles(cin: usize, cout: usize, hw: usize, s: usize, tile: [usize; 2]) {
     let g = geom([hw, hw], cin, cout, 3, s, 1, 1);
     let [ho, wo] = g.out_hw();
-    let lead = conv_candidates(&sm86(), 1, ho * wo, &g).first().map(|c| c.gemm.tile);
-    assert_eq!(lead, tile);
+    let (m, n) = (ho * wo, cout);
+    let cands = Planner::new(sm86()).conv_candidates(1, m, &g);
+    assert!(cands.iter().any(|c| c.gemm.tile[..2] == tile), "{tile:?} not in {cands:?}");
+    for c in &cands {
+        let [bm, bn, _] = c.gemm.tile;
+        let area = m.div_ceil(bm) * bm * n.div_ceil(bn) * bn;
+        assert!(8 * (area - m * n) <= area, "{c:?} pads {m}×{n}");
+    }
 }
 
-/// Every YOLO26x 3×3 class but the 48-channel bodies has candidates; a
-/// starved grid has split ones.
+/// A 48-channel body's B tile is 48 wide and 16 deep (`bk` divides `cin`):
+/// 96 chunks, which split evenly over one warp only, so the class is served
+/// by one-warp blocks, which is better than no kernel.
 #[test]
-fn only_the_48_channel_bodies_have_no_candidates() {
-    let none: Vec<(usize, usize)> = YOLO
-        .into_iter()
-        .map(yolo_geom)
-        .filter(|g| {
-            let [ho, wo] = g.out_hw();
-            conv_candidates(&sm86(), 1, ho * wo, g).is_empty()
-        })
-        .map(|g| (g.cin, g.cout))
-        .collect();
-    assert_eq!(none, [(48, 48)]);
+fn the_48_channel_bodies_take_one_warp_blocks() {
+    let g = geom([160, 160], 48, 48, 3, 1, 1, 1);
+    let cands = Planner::new(sm86()).conv_candidates(1, 160 * 160, &g);
+    assert!(!cands.is_empty());
+    assert!(cands.iter().all(|c| c.gemm.tile[1..] == [48, 16] && c.gemm.warps == [1, 1]), "{cands:?}");
+}
+
+/// A starved grid (400 output pixels of 192 channels) has split candidates.
+#[test]
+fn a_starved_grid_splits_the_reduction() {
     let starved = geom([20, 20], 192, 192, 3, 1, 1, 1);
-    assert!(conv_candidates(&sm86(), 1, 400, &starved).iter().any(|c| c.split > 1));
+    assert!(Planner::new(sm86()).conv_candidates(1, 400, &starved).iter().any(|c| c.split > 1));
 }
 
 #[test_case(3; "rgb stem")]
 #[test_case(8; "eight channels")]
 #[test_case(40; "a multiple of 8 only")]
 fn too_few_channels_have_no_candidates(cin: usize) {
-    assert!(conv_candidates(&sm86(), 1, 6400, &geom([80, 80], cin, 64, 3, 1, 1, 1)).is_empty());
+    assert!(Planner::new(sm86()).conv_candidates(1, 6400, &geom([80, 80], cin, 64, 3, 1, 1, 1)).is_empty());
 }
 
 // ---- on the device -----------------------------------------------------------------
@@ -441,7 +457,7 @@ fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
         let [ho, wo] = g.out_hw();
         let params = inputs(&g, 1, RESIDUAL_SILU_BIAS, 13);
         let want = graph_reference(&g, 1, RESIDUAL_SILU_BIAS, &params);
-        for c in conv_candidates(&target, 1, ho * wo, &g) {
+        for c in Planner::new(target.clone()).conv_candidates(1, ho * wo, &g) {
             let (epilogue, split) = (RESIDUAL_SILU_BIAS, c.split);
             let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue, cfg: c.gemm, split };
             let got = on_device(&spec, &target, &params);
@@ -568,7 +584,7 @@ fn conv_throughput_probe() {
         let flops = 2.0 * (ho * wo * cout * g.k()) as f64;
         let tflops = |ns: f64| flops / ns / 1e3;
         let label = format!("{cin}->{cout} s{stride} @{side}");
-        let cands = conv_candidates(&target, 1, ho * wo, &g);
+        let cands = Planner::new(target.clone()).conv_candidates(1, ho * wo, &g);
         let build = |c: ConvCfg| {
             let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue: SILU_BIAS, cfg: c.gemm, split: c.split };
             spec.programs::<F16>(&target)

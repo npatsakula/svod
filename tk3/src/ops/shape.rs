@@ -7,8 +7,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::{ConstValue, Op, SInt, UOp, ops};
 use svod_tensor::Tensor;
 
-use super::config;
-use crate::atoms::Target;
+use super::config::{self, Planner};
 use crate::kernels::attention::FaCfg;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
@@ -90,15 +89,15 @@ pub fn shape_of(t: &Tensor) -> svod_tensor::error::Result<Vec<SInt>> {
     Ok(t.shape()?.to_vec())
 }
 
-/// The target when it has kernel tables and every operand shares a 16-bit
+/// The planner when its target has kernels and every operand shares a 16-bit
 /// type it has a matrix core for (f32 keeps the graph by policy).
-fn gate<'a>(target: Option<&'a Target>, dtypes: &[DType]) -> Result<&'a Target, Fallback> {
-    let target = target.filter(|t| config::has_tables(t)).ok_or(Fallback::Target)?;
+fn gate<'a>(planner: Option<&'a Planner>, dtypes: &[DType]) -> Result<&'a Planner, Fallback> {
+    let planner = planner.filter(|p| config::has_kernels(&p.target)).ok_or(Fallback::Target)?;
     let first = dtypes[0].scalar().ok_or(Fallback::Dtype)?;
     let typed = matches!(first, ScalarDType::BFloat16 | ScalarDType::Float16)
-        && target.mma(first, ScalarDType::Float32).is_some()
+        && planner.target.mma(first, ScalarDType::Float32).is_some()
         && dtypes.iter().all(|d| d.scalar() == Some(first));
-    typed.then_some(target).ok_or(Fallback::Dtype)
+    typed.then_some(planner).ok_or(Fallback::Dtype)
 }
 
 /// The last dim, which a bound batch variable must not be.
@@ -119,9 +118,9 @@ fn candidates<C>(list: Vec<C>, none: Fallback) -> Result<Vec<C>, Fallback> {
 }
 
 /// `x [lead..., k] · w [n·halves, k]ᵀ`; `dtypes` are those of every operand.
-pub fn linear(target: Option<&Target>, dtypes: &[DType], x: Option<&Extent>, n: usize, gated: bool) -> Plan<GemmCfg> {
+pub fn linear(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>, n: usize, gated: bool) -> Plan<GemmCfg> {
     plan(|| {
-        let (target, x) = (gate(target, dtypes)?, x.ok_or(Fallback::Symbolic)?);
+        let (planner, x) = (gate(planner, dtypes)?, x.ok_or(Fallback::Symbolic)?);
         let k = reduced(x)?;
         // A bound batch walks grid z; each batch is a GEMM over the rows behind it.
         let lead = &x.dims[..x.dims.len() - 1];
@@ -130,7 +129,7 @@ pub fn linear(target: Option<&Target>, dtypes: &[DType], x: Option<&Extent>, n: 
         if !n.is_multiple_of(8) || rows * batches == 0 {
             return Err(Fallback::Shape);
         }
-        candidates(config::gemm_candidates(target, batches, rows, n, k, gated), Fallback::Config)
+        candidates(planner.gemm_candidates(batches, rows, n, k, gated), Fallback::Config)
     })
 }
 
@@ -138,7 +137,7 @@ pub fn linear(target: Option<&Target>, dtypes: &[DType], x: Option<&Extent>, n: 
 /// the bias, `out` the output type and `residual` the residual's. A static
 /// batch folds into the GEMM rows, a bound one walks grid z.
 pub fn conv2d(
-    target: Option<&Target>,
+    planner: Option<&Planner>,
     dtypes: &[DType],
     out: DType,
     residual: Option<DType>,
@@ -147,7 +146,7 @@ pub fn conv2d(
     groups: usize,
 ) -> Plan<ConvCfg> {
     plan(|| {
-        let (target, x) = (gate(target, dtypes)?, x.ok_or(Fallback::Symbolic)?);
+        let (planner, x) = (gate(planner, dtypes)?, x.ok_or(Fallback::Symbolic)?);
         let wide = out == DType::Float32;
         if !(out == dtypes[0] || wide) || residual.is_some_and(|r| r != out) {
             return Err(Fallback::Dtype);
@@ -162,44 +161,51 @@ pub fn conv2d(
             return Err(Fallback::Shape);
         }
         let (batches, m) = if x.var { (x.dims[0], pixels) } else { (1, x.dims[0] * pixels) };
-        let mut list = config::conv_candidates(target, batches, m, geom);
+        let mut list = planner.conv_candidates(batches, m, geom);
         // Grid z is the batch's when it is bound.
         list.retain(|c| c.split == 1 || !x.var);
         candidates(list, Fallback::Config)
     })
 }
 
-/// `q [b, t, h, d]` against `k`/`v [b, tk, h_kv, d]`.
-pub fn attention(target: Option<&Target>, dtypes: &[DType], q: Option<&Extent>, k: Option<&Extent>) -> Plan<FaCfg> {
+/// `q [b, t, h, d]` against `k`/`v [b, tk, h_kv, d]`, `causal` under that mask.
+pub fn attention(
+    planner: Option<&Planner>,
+    dtypes: &[DType],
+    q: Option<&Extent>,
+    k: Option<&Extent>,
+    causal: bool,
+) -> Plan<FaCfg> {
     plan(|| {
-        let target = gate(target, dtypes)?;
+        let planner = gate(planner, dtypes)?;
         let (q, k) = (q.ok_or(Fallback::Symbolic)?, k.ok_or(Fallback::Symbolic)?);
         if q.dims.contains(&0) || k.dims.contains(&0) {
             return Err(Fallback::Shape);
         }
-        candidates(config::attention_candidates(target, q.dims[3], q.dims[1]), Fallback::Shape)
+        let [b, t, heads, d] = [q.dims[0], q.dims[1], q.dims[2], q.dims[3]];
+        candidates(planner.attention_candidates(b * heads, t, k.dims[1], d, causal), Fallback::Shape)
     })
 }
 
 /// `qkv [b, t, slots·d]` into heads of width `d`.
-pub fn heads(target: Option<&Target>, dtypes: &[DType], x: Option<&Extent>, d: usize) -> Plan<NormCfg> {
+pub fn heads(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>, d: usize) -> Plan<NormCfg> {
     plan(|| {
-        let (target, x) = (gate(target, dtypes)?, x.ok_or(Fallback::Symbolic)?);
+        let (planner, x) = (gate(planner, dtypes)?, x.ok_or(Fallback::Symbolic)?);
         if x.dims.len() != 3 || x.dims.contains(&0) {
             return Err(Fallback::Shape);
         }
-        candidates(config::heads_candidates(target, d), Fallback::Shape)
+        candidates(config::heads_candidates(&planner.target, d), Fallback::Shape)
     })
 }
 
 /// A norm over the last dim of `x`.
-pub fn norm(target: Option<&Target>, dtypes: &[DType], x: Option<&Extent>) -> Plan<NormCfg> {
+pub fn norm(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>) -> Plan<NormCfg> {
     plan(|| {
-        let (target, x) = (gate(target, dtypes)?, x.ok_or(Fallback::Symbolic)?);
+        let (planner, x) = (gate(planner, dtypes)?, x.ok_or(Fallback::Symbolic)?);
         let d = reduced(x)?;
         if x.dims.contains(&0) {
             return Err(Fallback::Shape);
         }
-        candidates(config::norm_candidates(target, d), Fallback::Shape)
+        candidates(config::norm_candidates(&planner.target, d), Fallback::Shape)
     })
 }

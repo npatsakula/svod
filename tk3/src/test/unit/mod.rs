@@ -25,7 +25,7 @@ use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 /// The default device's target when tk3 has tables for it, of any vendor.
 fn device_target() -> Option<Target> {
     let target = Target::for_device(&svod_dtype::default_device::default_device());
-    target.filter(crate::ops::config::has_tables)
+    target.filter(crate::ops::config::has_kernels)
 }
 
 /// A plain bf16 `c = a·bᵀ` program on a 2×4 warp grid.

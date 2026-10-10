@@ -11,7 +11,7 @@ use crate::atoms::sm86;
 use crate::build::BF16;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use crate::ops::config::gemm_candidates;
+use crate::ops::config::Planner;
 use crate::tune::{self, TuneKey, TuneStore, fingerprint};
 
 fn key(shape: &[usize], candidates: &[usize]) -> TuneKey {
@@ -130,7 +130,7 @@ fn a_gemm_tunes_on_the_device() {
         return;
     };
     let (m, n, k) = (704, 512, 512);
-    let cfgs = gemm_candidates(&target, 1, m, n, k, false);
+    let cfgs = Planner::new(target.clone()).gemm_candidates(1, m, n, k, false);
     let batch = Batch::Var { name: "b".into(), min: 1, max: 1 };
     let build = |cfg: GemmCfg| {
         let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue: Epilogue::default(), cfg };

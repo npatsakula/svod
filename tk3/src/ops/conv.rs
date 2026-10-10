@@ -102,12 +102,14 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
     }
 
     let (ext, var) = extent(&xs).unzip();
-    let target = super::target(&x.device());
+    let planner = super::planner(&x.device());
     let dtypes: Vec<DType> = [Some(x), Some(w), opts.bias].into_iter().flatten().map(Tensor::dtype).collect();
     let residual_dtype = opts.residual.map(Tensor::dtype);
-    let plan = shape::conv2d(target.as_ref(), &dtypes, out_dtype.clone(), residual_dtype, ext.as_ref(), &geom, groups);
+    let plan =
+        shape::conv2d(planner.as_deref(), &dtypes, out_dtype.clone(), residual_dtype, ext.as_ref(), &geom, groups);
     let Plan::Kernel(cfgs) = plan else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
-    let (ext, var, target) = (ext.expect("planned"), var.flatten(), target.expect("planned"));
+    let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
+    let target = planner.target.clone();
     let images = ext.dims[0];
     let batch = match var {
         Some(_) => batch_of(&var, images),

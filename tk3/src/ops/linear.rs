@@ -52,15 +52,16 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     }
 
     let (ext, var) = extent(&xs).unzip();
-    let target = super::target(&x.device());
+    let planner = super::planner(&x.device());
     let dtypes: Vec<_> =
         [Some(x), Some(w), opts.bias, opts.residual].into_iter().flatten().map(Tensor::dtype).collect();
     let plan = match n.as_const() {
-        Some(n) => shape::linear(target.as_ref(), &dtypes, ext.as_ref(), n, opts.gated),
+        Some(n) => shape::linear(planner.as_deref(), &dtypes, ext.as_ref(), n, opts.gated),
         None => Plan::Graph(shape::Fallback::Symbolic),
     };
     let Plan::Kernel(cfgs) = plan else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
-    let (ext, var, target) = (ext.expect("planned"), var.flatten(), target.expect("planned"));
+    let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
+    let target = planner.target.clone();
     let (lead, k) = (&ext.dims[..ext.dims.len() - 1], ext.dims[ext.dims.len() - 1]);
     let n = n.as_const().expect("planned");
     // A bound batch walks grid z; each batch is a GEMM over the rows behind it.
