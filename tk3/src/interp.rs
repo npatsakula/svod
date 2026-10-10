@@ -218,10 +218,14 @@ impl Frame<'_> {
     }
 
     /// Element coordinates → flat index of a view, or `None` out of bounds.
-    fn address(&self, place: &Place, r: usize, c: usize, cols: usize) -> Option<usize> {
+    fn address(&self, place: &Place, r: usize, c: usize, shape: Shape) -> Option<usize> {
+        let Shape { rows, cols } = shape;
         match place {
             Place::Reg => Some(r * cols + c),
-            Place::Smem { offset, .. } => Some(self.must(*offset) as usize + r * cols + c),
+            Place::Smem { alloc, offset } => Some(
+                self.must(*offset) as usize
+                    + if self.prog.smem[alloc.index()].along == Axis::Row { c * rows + r } else { r * cols + c },
+            ),
             Place::Global { offset, stride, bounds, rows, .. } => {
                 let inside = |b: Option<ScalarId>, i: usize| b.is_none_or(|b| (i as i64) < self.must(b));
                 let at = |id: ScalarId| self.scalar_at(id, Some(r as i64)).expect("a defined row map");
@@ -249,7 +253,7 @@ impl Frame<'_> {
                 let mut out = vec![0.0; rows * cols];
                 for r in 0..rows {
                     for c in 0..cols {
-                        if let Some(i) = self.address(&v.place, r, c, cols) {
+                        if let Some(i) = self.address(&v.place, r, c, v.shape) {
                             out[r * cols + c] = store.get(i).copied().unwrap_or(0.0);
                         }
                     }
@@ -271,7 +275,7 @@ impl Frame<'_> {
                 let mut writes = Vec::with_capacity(rows * cols);
                 for r in 0..rows {
                     for c in 0..cols {
-                        if let Some(i) = self.address(&v.place, r, c, cols) {
+                        if let Some(i) = self.address(&v.place, r, c, v.shape) {
                             writes.push((i, rounded[r * cols + c]));
                         }
                     }

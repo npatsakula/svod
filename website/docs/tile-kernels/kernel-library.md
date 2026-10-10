@@ -101,7 +101,10 @@ an SM holds. Two facts the model learned from the ISA on gfx1201: the compiled l
 query, key, score, probability and value fragments live together, so the register count is
 their sum and 16-key blocks are what fits at `d = 128`; and a warp past the problem's queries
 hides no latency, so a decoder step leads with one-warp blocks. A causal mask charges each query
-block its diagonal.
+block its diagonal. The value tile is stored column-major where its fill goes through registers
+(see [Layouts and Lowering](./layouts-and-lowering#layouts-and-lowering)), so its fragments gather
+as 16-byte loads like the keys'; measured on gfx1201 that is 5–28% per shape over the row-major
+tile's one load per key.
 
 Each tile config is crossed with split counts. `Attn::splits = Some(n)` fixes `n`, capped at the
 key block count. With `None`, `config::split_candidates` proposes 1, 2, the counts around two

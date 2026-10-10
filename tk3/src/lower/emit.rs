@@ -470,9 +470,14 @@ impl<'a> Emit<'a> {
                 (self.hoist(off), gate.map(|g| self.hoist(g)))
             }
             Place::Smem { offset, .. } => {
-                let (row, col) = c.full();
+                let (mut row, mut col) = c.full();
+                let mut cols = view.shape.cols as i64;
+                // A column-major tile is the row-major tile of its transpose.
+                if self.along(view).0 == Axis::Row {
+                    (row, col) = (col, row);
+                    cols = view.shape.rows as i64;
+                }
                 let offset = self.sc(*offset);
-                let cols = view.shape.cols as i64;
                 let chunk = 16 / view.dtype.bytes() as i64;
                 let cpr = cols / chunk;
                 // The XOR must stay within the row: a power-of-two chunk count.
@@ -544,27 +549,28 @@ impl<'a> Emit<'a> {
         Coord { row: self.hoist(row), col: self.hoist(col), dr: dr + (rr * fr_n) as i64, dc: dc + (rc * fc_n) as i64 }
     }
 
-    /// Register runs `(start, width)` whose elements are consecutive columns
-    /// of one row in every lane, aligned to their width.
-    fn runs(l: &TileLayout, lanes: u32, max_width: u32) -> Vec<(u32, u32)> {
-        let mut out = vec![];
-        let mut j = 0;
-        while j < l.regs() {
-            let mut w = max_width.min(l.regs() - j);
-            while w > 1 {
-                let ok = (0..lanes).all(|lane| {
-                    let (r0, c0) = l.coord(0, lane, j);
-                    c0 % w == 0 && (1..w).all(|e| l.coord(0, lane, j + e) == (r0, c0 + e))
-                });
-                if ok {
-                    break;
-                }
-                w /= 2;
+    /// The axis a view stores consecutive elements along, and whether a run
+    /// along it may be one vector access: a global view is contiguous along
+    /// the axis of its unit stride (neither: every element on its own), a
+    /// shared tile along its allocation's axis.
+    fn along(&self, view: &View) -> (Axis, bool) {
+        match &view.place {
+            Place::Global { stride, .. } => {
+                let unit = |s: ScalarId| matches!(self.prog.scalar(s), Scalar::Const(1));
+                if unit(stride[1]) { (Axis::Col, true) } else { (Axis::Row, unit(stride[0])) }
             }
-            out.push((j, w));
-            j += w;
+            // The relayout scratch is no allocation of the program: row-major.
+            Place::Smem { alloc, .. } => (self.prog.smem.get(alloc.index()).map_or(Axis::Col, |a| a.along), true),
+            Place::Reg => unreachable!(),
         }
-        out
+    }
+
+    /// The register runs of `l` a view is accessed by: 16-byte vectors along
+    /// the view's axis where it is contiguous, else single elements.
+    fn runs(&self, l: &TileLayout, view: &View) -> Vec<(u32, u32)> {
+        let (along, contiguous) = self.along(view);
+        let width = if contiguous { 16 / view.dtype.bytes() as u32 } else { 1 };
+        l.runs(self.low.target.wave, width, along)
     }
 
     // ---- statements -------------------------------------------------------
@@ -760,6 +766,7 @@ impl<'a> Emit<'a> {
             cols % chunk == 0 && chunks % threads == 0,
             UnsupportedSnafu { what: format!("a {}×{} fill by {threads} threads", d.shape.rows, cols) }
         );
+        snafu::ensure!(self.along(&d).0 == Axis::Col, UnsupportedSnafu { what: "a chunk fill of a column-major tile" });
         let Place::Global { stride, bounds, rows, .. } = &s.place else { unreachable!() };
         let gathered = rows.is_some();
         snafu::ensure!(
@@ -820,22 +827,21 @@ impl<'a> Emit<'a> {
         let l = self.layout(dst).clone();
         let s = self.view(src);
         let [sub_r, sub_c] = l.sub_shape();
-        if self.low.target.ldmatrix && s.dtype.bytes() == 2 && sub_r % 16 == 0 && sub_c % 16 == 0 {
+        // `ldmatrix` reads 16-byte memory rows: a row-major tile only.
+        let rows = self.along(&s).0 == Axis::Col;
+        if self.low.target.ldmatrix && rows && s.dtype.bytes() == 2 && sub_r % 16 == 0 && sub_c % 16 == 0 {
             for trans in [false, true] {
                 let produced = TileLayout {
                     frag: frag::ldmatrix_x4(trans),
                     reps: [sub_r / 16, sub_c / 16],
                     warps: l.warps.clone(),
                 };
-                let perm = match produced.relayout(&l, self.prog.warps, self.low.target.wave) {
-                    Relayout::Identity => (0..l.regs()).collect::<Vec<_>>(),
-                    Relayout::RegPermute(p) => p,
-                    _ => continue,
-                };
-                return self.ldmatrix_gather(dst, &s, &l, trans, &perm);
+                if let Some(perm) = l.as_permutation_of(&produced, self.prog.warps, self.low.target.wave) {
+                    return self.ldmatrix_gather(dst, &s, &l, trans, &perm);
+                }
             }
         }
-        for (j, w) in Self::runs(&l, self.low.target.wave, 16 / s.dtype.bytes() as u32) {
+        for (j, w) in self.runs(&l, &s) {
             let c = self.coord(&l, j);
             let (off, _) = self.address(&s, &c);
             let v = self.mem_load(&s.buf, &off, w, None);
@@ -886,7 +892,7 @@ impl<'a> Emit<'a> {
         let l = self.layout(dst).clone();
         let s = self.view(src);
         let gathered = matches!(s.place, Place::Global { rows: Some(_), .. });
-        for (j, w) in Self::runs(&l, self.low.target.wave, 16 / s.dtype.bytes() as u32) {
+        for (j, w) in self.runs(&l, &s) {
             let c = self.coord(&l, j);
             let (off, gate) = self.address(&s, &c);
             let v = match gate {
@@ -906,7 +912,7 @@ impl<'a> Emit<'a> {
     fn store_regs(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let l = self.layout(src).clone();
         let d = self.view(dst);
-        for (j, w) in Self::runs(&l, self.low.target.wave, 16 / d.dtype.bytes() as u32) {
+        for (j, w) in self.runs(&l, &d) {
             let c = self.coord(&l, j);
             let (off, gate) = self.address(&d, &c);
             let vals = self.reg_loads(src, j, w);
@@ -973,7 +979,7 @@ impl<'a> Emit<'a> {
 
     fn store_view(&mut self, d: &View, src: ValId) -> Result<()> {
         let l = self.layout(src).clone();
-        for (j, w) in Self::runs(&l, self.low.target.wave, 16 / d.dtype.bytes() as u32) {
+        for (j, w) in self.runs(&l, d) {
             let c = self.coord(&l, j);
             let (off, _) = self.address(d, &c);
             let vals = self.reg_loads(src, j, w);
@@ -984,7 +990,7 @@ impl<'a> Emit<'a> {
 
     fn gather_view(&mut self, dst: ValId, s: &View) -> Result<()> {
         let l = self.layout(dst).clone();
-        for (j, w) in Self::runs(&l, self.low.target.wave, 16 / s.dtype.bytes() as u32) {
+        for (j, w) in self.runs(&l, s) {
             let c = self.coord(&l, j);
             let (off, _) = self.address(s, &c);
             let v = self.mem_load(&s.buf, &off, w, None);

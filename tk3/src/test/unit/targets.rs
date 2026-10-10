@@ -18,7 +18,7 @@ use test_case::test_case;
 use crate::atoms::Target;
 use crate::build::{BF16, F16};
 use crate::interp::{self, round_to};
-use crate::ir::{ParamKind, Program};
+use crate::ir::{Axis, ParamKind, Program};
 use crate::kernels::Act;
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Cache, CombineSpec, attention, combine};
@@ -466,6 +466,27 @@ fn every_amd_candidate_lowers(target: Target) {
         }
     }
 }
+
+/// A shared tile lies along the axis its readers' fragments run along: the
+/// value tile of a register-staged attention kernel is stored column-major,
+/// since the product's B fragments hold runs of keys, and gathers as 16-byte
+/// loads; the key tile, whose fragments hold runs of head elements, and a
+/// GEMM's operand tiles stay row-major. A `cp.async` target fills its tiles
+/// in chunks, which cannot scatter, so there every tile stays row-major and
+/// `ldmatrix.trans` does the transposing.
+#[test_case(amd(AmdArch::Gfx1201, 64), Axis::Row; "gfx1201 stores values column-major")]
+#[test_case(amd(AmdArch::Gfx942, 304), Axis::Row; "gfx942 stores values column-major")]
+#[test_case(crate::atoms::sm86(), Axis::Col; "sm_86 keeps every tile row-major")]
+fn shared_tiles_lie_along_their_fragments(target: Target, values: Axis) {
+    let families = families(&target);
+    let (_, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("attention d128")).unwrap().clone();
+    let tile = lowered_tile(prog, &lowering);
+    let along = |name: &str| tile.smem.iter().find(|a| a.name == name).map(|a| a.along).unwrap();
+    assert_eq!((along("k_s"), along("v_s")), (Axis::Col, values));
+    let (_, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("gemm #0")).unwrap().clone();
+    assert!(lowered_tile(prog, &lowering).smem.iter().all(|a| a.along == Axis::Col));
+}
+
 /// `Sync::Fence` statements in `block`, recursively.
 fn fences(block: &crate::ir::Block) -> usize {
     use crate::ir::{Stmt, Sync};

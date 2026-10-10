@@ -111,19 +111,38 @@ fn shapes_that_do_not_tile_the_grid_are_rejected() {
 /// A register-staged fill's layout holds every element of its tile, each
 /// lane's registers in 16-byte row runs, and replicates only warps (or
 /// lanes) the tile has no rows for.
-#[test_case(128, 32, 2, 4, 32; "128x32 bf16 on four waves")]
-#[test_case(96, 32, 2, 4, 32; "96 rows repeat by three")]
-#[test_case(64, 48, 2, 2, 32; "48 columns repeat by three")]
-#[test_case(16, 64, 2, 1, 32; "one wave")]
-#[test_case(64, 64, 2, 4, 64; "wave64")]
-#[test_case(8, 16, 2, 4, 32; "fewer chunks than threads")]
-#[test_case(32, 32, 4, 2, 32; "f32")]
-fn chunked_layouts_cover_their_tile_in_16_byte_runs(rows: usize, cols: usize, bytes: usize, warps: u32, lanes: u32) {
-    let l = chunked(Shape::new(rows, cols), bytes, warps, lanes).unwrap();
+#[test_case(128, 32, 2, 4, 32, Axis::Col; "128x32 bf16 on four waves")]
+#[test_case(96, 32, 2, 4, 32, Axis::Col; "96 rows repeat by three")]
+#[test_case(64, 48, 2, 2, 32, Axis::Col; "48 columns repeat by three")]
+#[test_case(16, 64, 2, 1, 32, Axis::Col; "one wave")]
+#[test_case(64, 64, 2, 4, 64, Axis::Col; "wave64")]
+#[test_case(8, 16, 2, 4, 32, Axis::Col; "fewer chunks than threads")]
+#[test_case(32, 32, 4, 2, 32, Axis::Col; "f32")]
+#[test_case(16, 128, 2, 4, 32, Axis::Row; "16 keys walked down the rows")]
+#[test_case(64, 64, 2, 2, 32, Axis::Row; "64 keys walked down the rows")]
+#[test_case(96, 32, 2, 4, 32, Axis::Row; "96 rows walked down the rows")]
+fn chunked_layouts_cover_their_tile_in_16_byte_runs(
+    rows: usize,
+    cols: usize,
+    bytes: usize,
+    warps: u32,
+    lanes: u32,
+    walk: Axis,
+) {
+    let l = chunked(Shape::new(rows, cols), bytes, warps, lanes, walk).unwrap();
     assert_eq!(l.shape(), Shape::new(rows, cols));
     let held: HashSet<(u32, u32)> = coords(&l, warps, lanes).into_iter().collect();
     assert_eq!(held.len(), rows * cols, "every element held");
     let v = (16 / bytes).min(cols) as u32;
+    if walk == Axis::Row {
+        let (r0, c0) = l.coord(0, 0, 0);
+        let (r1, c1) = l.coord(0, 1, 0);
+        assert_eq!((r1, c1), (r0 + 1, c0), "the next lane holds the next row");
+    }
+    let threads = (warps * lanes) as usize;
+    if (rows * cols / v as usize).is_multiple_of(threads) {
+        assert_eq!(l.regs() as usize * threads, rows * cols, "a tile the threads divide is held once, not replicated");
+    }
     for w in 0..warps {
         for lane in 0..lanes {
             for j in (0..l.regs()).step_by(v as usize) {

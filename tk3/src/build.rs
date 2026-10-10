@@ -185,7 +185,7 @@ impl Kernel {
     }
 
     pub fn smem<T: Elem>(&mut self, name: impl Into<String>, elems: usize) -> SmemId {
-        self.prog.smem.push(SmemAlloc { name: name.into(), dtype: T::DTYPE, elems });
+        self.prog.smem.push(SmemAlloc { name: name.into(), dtype: T::DTYPE, elems, along: Axis::Col });
         SmemId(self.prog.smem.len() as u32 - 1)
     }
 
