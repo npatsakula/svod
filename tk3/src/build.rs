@@ -476,13 +476,13 @@ impl Kernel {
         init: [Regs<T>; N],
         body: impl FnOnce(&mut Self, Sc, [Regs<T>; N]) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
-        let extent = self.intern(extent);
+        let (start, extent) = (self.intern(0), self.intern(extent));
         let iv = self.push_scalar(Scalar::Induction);
         let phi = self.carried(init.map(ValId::from));
         let mut next = [ValId(0); N];
         let block = self.with_block(|k| next = body(k, Sc::Id(iv), phi.map(Tile::new)).map(ValId::from));
         let carried = (0..N).map(|i| Carried { init: init[i].0, phi: phi[i], next: next[i] }).collect();
-        self.push(Stmt::Loop(Loop { iv, extent, carried, body: block, unroll: 1 }));
+        self.push(Stmt::Loop(Loop { iv, start, extent, carried, body: block, unroll: 1 }));
         phi.map(Tile::new)
     }
 

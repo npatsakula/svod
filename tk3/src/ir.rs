@@ -296,9 +296,12 @@ pub struct Carried {
     pub next: ValId,
 }
 
+/// `iv` runs over `start..start + extent`; several loops may share an `iv`
+/// (and the scalars defined from it) over consecutive ranges.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Loop {
     pub iv: ScalarId,
+    pub start: ScalarId,
     pub extent: ScalarId,
     pub carried: Vec<Carried>,
     pub body: Block,
@@ -352,6 +355,10 @@ pub enum Sync {
     /// Block until at most `pending` of this thread's committed groups are in
     /// flight.
     WaitAsync { pending: u32 },
+    /// No instruction moves across this point: a pipeline trip's commit stays
+    /// after its products, where a machine scheduler would otherwise hoist
+    /// it above them. Nothing to a target that keeps program order.
+    Fence,
 }
 
 #[derive(Clone, Debug, PartialEq)]

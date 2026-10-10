@@ -446,6 +446,39 @@ fn every_amd_candidate_lowers(target: Target) {
         }
     }
 }
+/// `Sync::Fence` statements in `block`, recursively.
+fn fences(block: &crate::ir::Block) -> usize {
+    use crate::ir::{Stmt, Sync};
+    block
+        .0
+        .iter()
+        .map(|s| match s {
+            Stmt::Sync(Sync::Fence) => 1,
+            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
+            Stmt::Loop(l) => fences(&l.body),
+            Stmt::Pipeline(p) => fences(&p.produce.body) + fences(&p.consume.body),
+            Stmt::Role { body, .. } => fences(body),
+            Stmt::If { then, otherwise, .. } => fences(then) + fences(otherwise),
+        })
+        .sum()
+}
+
+/// The register-staged template fences every trip between its products and
+/// its commit on every target that runs it; the fence is an instruction only
+/// where the scheduler would otherwise hoist the commit (RDNA4), and the
+/// interpreter never sees it, so `lowering_keeps_the_interpreted_result`
+/// covers its placement.
+#[test_case(AmdArch::Gfx1201, true; "gfx1201 fences")]
+#[test_case(AmdArch::Gfx942, false; "gfx942 keeps order")]
+#[test_case(AmdArch::Gfx1100, false; "gfx1100 keeps order")]
+fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
+    let target = amd(arch, 64);
+    assert_eq!(target.commit_fence, emitted);
+    let (name, prog, lowering) = families(&target).into_iter().find(|(n, ..)| n.starts_with("gemm #0")).unwrap();
+    let tile = lowered_tile(prog, &lowering);
+    assert_eq!(fences(&tile.body), 1, "{name}: one fence per pipeline");
+}
+
 /// `Relayout` statements of tiles in `block`, recursively; vectors are not
 /// counted.
 fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {

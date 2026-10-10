@@ -163,9 +163,9 @@ impl Frame<'_> {
                 self.write(*dst, &data);
             }
             Stmt::Loop(l) => {
-                let extent = self.must(l.extent);
+                let (start, extent) = (self.must(l.start), self.must(l.extent));
                 self.enter(&l.carried);
-                for i in 0..extent {
+                for i in start..start + extent {
                     self.induction.insert(l.iv, i);
                     self.block_run(&l.body)?;
                     self.advance(&l.carried);
