@@ -103,9 +103,13 @@ The emitter lists every statement's instructions in program order inside a pre-l
 program, so Svod's linearizer toposort never runs on a tk3 kernel. Global accesses past a view's
 bounds are gated: loads read zero and stores are dropped. Shared rows are XOR-swizzled in
 16-byte chunks when the chunk count per row is a power of two. Shared to register loads of
-16-bit tiles use `ldmatrix.x4` where the layout allows. The CUDA backend places shared memory
-above the 48 KB static limit in one dynamic array. Config candidates are filtered against the
-target's opt-in limit (`Target::smem_bytes`).
+16-bit tiles use `ldmatrix.x4` where the layout allows. An
+address into a plain global view is the view's offset plus the lane's part of the coordinate, one
+value listed once in the prologue, plus the register's constant last, so the compiler keeps a
+running pointer per view and an immediate per register instead of rebuilding every address on
+every trip; a gathered row and a swizzled shared row take the full coordinate. The CUDA backend
+places shared memory above the 48 KB static limit in one dynamic array. Config candidates are
+filtered against the target's opt-in limit (`Target::smem_bytes`).
 
 :::note[Invariants kept by the emitter, not the author]
 Pure values are listed at the loop level their inputs require. Register accesses are scalar.

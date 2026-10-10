@@ -79,6 +79,27 @@ struct View {
     dtype: ScalarDType,
 }
 
+/// A register's coordinate in its tile: the part the lane and warp decide,
+/// and the constant the register adds to each dimension.
+struct Coord {
+    row: Arc<UOp>,
+    col: Arc<UOp>,
+    dr: i64,
+    dc: i64,
+}
+
+impl Coord {
+    fn plain(row: Arc<UOp>, col: Arc<UOp>) -> Self {
+        Self { row, col, dr: 0, dc: 0 }
+    }
+
+    /// The coordinate with its constant added.
+    fn full(&self) -> (Arc<UOp>, Arc<UOp>) {
+        let shift = |v: &Arc<UOp>, d: i64| if d == 0 { v.clone() } else { add(v, &c32(d)) };
+        (shift(&self.row, self.dr), shift(&self.col, self.dc))
+    }
+}
+
 impl<'a> Emit<'a> {
     fn new(prog: &'a Program, lay: &'a [Option<TileLayout>], low: &'a Lowering, params: Vec<Arc<UOp>>) -> Self {
         let threads = prog.warps * low.target.wave;
@@ -405,20 +426,24 @@ impl<'a> Emit<'a> {
         View { buf, place: val.place, shape: val.shape, dtype: val.dtype }
     }
 
-    /// Element offset of `(row, col)` in a memory view, with the swizzle a
-    /// shared view takes, and its bounds gate if any. Both are listed at the
-    /// nesting level of their inputs, so a loop body computes them once and
-    /// an epilogue after the loop may still use them.
-    fn address(&mut self, view: &View, row: &Arc<UOp>, col: &Arc<UOp>) -> (Arc<UOp>, Option<Arc<UOp>>) {
+    /// Element offset of a register's coordinate in a memory view, with the
+    /// swizzle a shared view takes, and its bounds gate if any. The lane's
+    /// part of the offset is one value listed where its inputs are (the
+    /// prologue, for a tile). In a plain global view the view's offset is
+    /// added to it and the register's constant last, so a compiler keeps the
+    /// first two as a running pointer and the constant as an immediate; a
+    /// gathered row and a swizzled shared row need the full coordinate.
+    fn address(&mut self, view: &View, c: &Coord) -> (Arc<UOp>, Option<Arc<UOp>>) {
         match &view.place {
             Place::Global { offset, stride, bounds, rows: Some(map), .. } => {
+                let (row, col) = c.full();
                 let ((_, offset), (_, s1)) = (self.scalar(*offset), self.scalar(stride[1]));
-                let (_, start) = self.scalar_at(map.offset, Some(row));
+                let (_, start) = self.scalar_at(map.offset, Some(&row));
                 // The view's offset moves per step; the row's start and the
                 // column are listed where their inputs are.
-                let off = add(&offset, &add(&start, &mul(col, &s1)));
+                let off = add(&offset, &add(&start, &mul(&col, &s1)));
                 let valid = map.valid.map(|v| {
-                    let (_, v) = self.scalar_at(v, Some(row));
+                    let (_, v) = self.scalar_at(v, Some(&row));
                     v.try_cmpne(&c32(0)).expect("row gate")
                 });
                 let in_cols = bounds[1].map(|b| col.try_cmplt(&self.sc(b)).expect("bound compare"));
@@ -426,22 +451,26 @@ impl<'a> Emit<'a> {
                 (self.hoist(off), gate.map(|g| self.hoist(g)))
             }
             Place::Global { offset, stride, bounds, .. } => {
-                let ((l0, offset), (l1, s0), (l2, s1)) =
+                let ((_, offset), (_, s0), (_, s1)) =
                     (self.scalar(*offset), self.scalar(stride[0]), self.scalar(stride[1]));
-                let mut level = l0.max(l1).max(l2);
-                let off = add(&add(&offset, &mul(row, &s0)), &mul(col, &s1));
+                let lane = self.hoist(add(&mul(&c.row, &s0), &mul(&c.col, &s1)));
+                let mut off = add(&offset, &lane);
+                let delta =
+                    [(c.dr, &s0), (c.dc, &s1)].into_iter().filter(|(d, _)| *d != 0).map(|(d, s)| mul(&c32(d), s));
+                if let Some(delta) = delta.reduce(|a, b| add(&a, &b)) {
+                    off = add(&off, &delta);
+                }
+                let (row, col) = c.full();
                 let gate = bounds
                     .iter()
                     .zip([row, col])
-                    .filter_map(|(b, i)| b.map(|b| (self.scalar(b), i)))
-                    .map(|((l, bound), i)| {
-                        level = level.max(l);
-                        i.try_cmplt(&bound).expect("bound compare")
-                    })
+                    .filter_map(|(b, i)| b.map(|b| (self.sc(b), i)))
+                    .map(|(bound, i)| i.try_cmplt(&bound).expect("bound compare"))
                     .reduce(|a, b| a.try_and_op(&b).expect("and"));
                 (self.hoist(off), gate.map(|g| self.hoist(g)))
             }
             Place::Smem { offset, .. } => {
+                let (row, col) = c.full();
                 let offset = self.sc(*offset);
                 let cols = view.shape.cols as i64;
                 let chunk = 16 / view.dtype.bytes() as i64;
@@ -449,58 +478,70 @@ impl<'a> Emit<'a> {
                 // The XOR must stay within the row: a power-of-two chunk count.
                 let col = if self.low.swizzle && cols % chunk == 0 && cpr >= 2 && (cpr as u64).is_power_of_two() {
                     let bits = chunk.trailing_zeros();
-                    let (c, within) = (shr(col, bits), and(col, &c32(chunk - 1)));
+                    let (c, within) = (shr(&col, bits), and(&col, &c32(chunk - 1)));
                     let sw = if cpr >= 8 {
-                        and(row, &c32(7))
+                        and(&row, &c32(7))
                     } else {
-                        and(&shr(row, (8 / cpr).trailing_zeros()), &c32(cpr - 1))
+                        and(&shr(&row, (8 / cpr).trailing_zeros()), &c32(cpr - 1))
                     };
                     add(&mul(&xor(&c, &sw), &c32(chunk)), &within)
                 } else {
-                    col.clone()
+                    col
                 };
-                let off = add(&add(&offset, &mul(row, &c32(cols))), &col);
-                (self.hoist(off), None)
+                let lane = self.hoist(add(&mul(&row, &c32(cols)), &col));
+                (self.hoist(add(&offset, &lane)), None)
             }
             Place::Reg => unreachable!(),
         }
     }
 
-    /// Integer coordinate `(row, col)` register `j` of this thread holds;
-    /// induction-free, so listed in the prologue.
-    fn coord(&mut self, l: &TileLayout, j: u32) -> (Arc<UOp>, Arc<UOp>) {
+    /// The coordinate register `j` of this thread holds in layout `l`:
+    /// its lane- and warp-dependent part, induction-free and listed in the
+    /// prologue, and the constant the register adds to it.
+    fn coord(&mut self, l: &TileLayout, j: u32) -> Coord {
         let regs = l.frag_regs();
         let rep = j / regs;
         let (rr, rc) = (rep / l.reps[1], rep % l.reps[1]);
         let (fr, fc) = l.frag.apply(&[(Reg, j % regs)]);
         let [fr_n, fc_n] = l.frag_shape();
         let [sr, sc] = l.sub_shape();
-        let bit_terms = |src: &Arc<UOp>, layout: &Layout, dim, init: (u32, u32)| {
-            let (mut r, mut c) = (c32(init.0 as i64), c32(init.1 as i64));
+        // What the bits of `src` move in each dimension, and the bits they reach.
+        let bit_terms = |src: &Arc<UOp>, layout: &Layout, dim| {
+            let (mut r, mut c): (Option<Arc<UOp>>, Option<Arc<UOp>>) = (None, None);
+            let (mut mr, mut mc) = (0, 0);
+            let mix = |acc: &mut Option<Arc<UOp>>, bit: &Arc<UOp>, v: u32| {
+                if v != 0 {
+                    let term = mul(bit, &c32(v as i64));
+                    *acc = Some(acc.as_ref().map_or(term.clone(), |a| xor(a, &term)));
+                }
+            };
             for b in 0..layout.in_bits(dim) {
-                let (vr, vc) = {
-                    let out = layout.basis(dim, b);
-                    let get = |d| out.iter().find(|o| o.0 == d).map_or(0, |o| o.1);
-                    (get(Row), get(Col))
-                };
+                let out = layout.basis(dim, b);
+                let get = |d| out.iter().find(|o| o.0 == d).map_or(0, |o| o.1);
+                let (vr, vc) = (get(Row), get(Col));
                 if vr == 0 && vc == 0 {
                     continue;
                 }
                 let bit = and(&shr(src, b), &c32(1));
-                if vr != 0 {
-                    r = xor(&r, &mul(&bit, &c32(vr as i64)));
-                }
-                if vc != 0 {
-                    c = xor(&c, &mul(&bit, &c32(vc as i64)));
-                }
+                mix(&mut r, &bit, vr);
+                mix(&mut c, &bit, vc);
+                (mr, mc) = (mr | vr, mc | vc);
             }
-            (r, c)
+            (r.unwrap_or_else(|| c32(0)), c.unwrap_or_else(|| c32(0)), mr, mc)
         };
-        let (fr, fc) = bit_terms(&self.lane, &l.frag, Lane, (fr, fc));
-        let (wr, wc) = bit_terms(&self.warp, &l.warps, Warp, (0, 0));
-        let row = add(&add(&mul(&wr, &c32(sr as i64)), &c32((rr * fr_n) as i64)), &fr);
-        let col = add(&add(&mul(&wc, &c32(sc as i64)), &c32((rc * fc_n) as i64)), &fc);
-        (self.hoist(row), self.hoist(col))
+        let (lr, lc, mr, mc) = bit_terms(&self.lane, &l.frag, Lane);
+        let (wr, wc, ..) = bit_terms(&self.warp, &l.warps, Warp);
+        // The register's own bits add to the lane's when they share none (the
+        // XOR is then a sum), and the constant stays apart; else it is mixed in.
+        let (fr, fc) = (fr as i64, fc as i64);
+        let ((lr, dr), (lc, dc)) = if fr & mr as i64 == 0 && fc & mc as i64 == 0 {
+            ((lr, fr), (lc, fc))
+        } else {
+            ((xor(&lr, &c32(fr)), 0), (xor(&lc, &c32(fc)), 0))
+        };
+        let row = add(&mul(&wr, &c32(sr as i64)), &lr);
+        let col = add(&mul(&wc, &c32(sc as i64)), &lc);
+        Coord { row: self.hoist(row), col: self.hoist(col), dr: dr + (rr * fr_n) as i64, dc: dc + (rc * fc_n) as i64 }
     }
 
     /// Register runs `(start, width)` whose elements are consecutive columns
@@ -741,7 +782,7 @@ impl<'a> Emit<'a> {
                 }
                 None => row.clone(),
             };
-            let (src_off, gate) = self.address(&s, &src_row, &col);
+            let (src_off, gate) = self.address(&s, &Coord::plain(src_row, col.clone()));
             // A plain view's fill clamps (above); a gathered row outside its
             // map lands as zeros, from element 0 of the operand.
             let gate = gate.filter(|_| gathered);
@@ -749,7 +790,7 @@ impl<'a> Emit<'a> {
                 Some(g) => self.hoist(UOp::try_where(g.clone(), src_off, c32(0)).expect("safe offset")),
                 None => src_off,
             };
-            let (dst_off, _) = self.address(&d, &row, &col);
+            let (dst_off, _) = self.address(&d, &Coord::plain(row, col));
             if cuda && mode == CopyMode::Async && self.low.target.cp_async {
                 let (dst, src) = (self.access(&d.buf, &dst_off, 1), self.access(&s.buf, &src_off, 1));
                 match gate {
@@ -795,8 +836,8 @@ impl<'a> Emit<'a> {
             }
         }
         for (j, w) in Self::runs(&l, self.low.target.wave, 16 / s.dtype.bytes() as u32) {
-            let (row, col) = self.coord(&l, j);
-            let (off, _) = self.address(&s, &row, &col);
+            let c = self.coord(&l, j);
+            let (off, _) = self.address(&s, &c);
             let v = self.mem_load(&s.buf, &off, w, None);
             let vals = (0..w as usize).map(|e| elem(&v, e, w as usize)).collect();
             self.reg_store(dst, j, vals);
@@ -812,13 +853,13 @@ impl<'a> Emit<'a> {
         let lane_hi = self.hoist(mul(&shr(&self.lane, 4), &c32(8)));
         // Where this warp's sub-tile starts.
         let (wr, wc) =
-            self.coord(&TileLayout { frag: Layout::zeros(Lane, 1), reps: [1, 1], warps: l.warps.clone() }, 0);
+            self.coord(&TileLayout { frag: Layout::zeros(Lane, 1), reps: [1, 1], warps: l.warps.clone() }, 0).full();
         let (wr, wc) = (self.hoist(mul(&wr, &c32(sub_r as i64))), self.hoist(mul(&wc, &c32(sub_c as i64))));
         for br in 0..blocks_r {
             for bc in 0..blocks_c {
                 let row = self.hoist(add(&add(&wr, &c32((br * 16) as i64)), &lane16));
                 let col = self.hoist(add(&add(&wc, &c32((bc * 16) as i64)), &lane_hi));
-                let (off, _) = self.address(s, &row, &col);
+                let (off, _) = self.address(s, &Coord::plain(row, col));
                 let idx = self.access(&s.buf, &off, 1);
                 let words = ldmatrix(&idx, 4, trans, pair.clone());
                 let block = br * blocks_c + bc;
@@ -846,8 +887,8 @@ impl<'a> Emit<'a> {
         let s = self.view(src);
         let gathered = matches!(s.place, Place::Global { rows: Some(_), .. });
         for (j, w) in Self::runs(&l, self.low.target.wave, 16 / s.dtype.bytes() as u32) {
-            let (row, col) = self.coord(&l, j);
-            let (off, gate) = self.address(&s, &row, &col);
+            let c = self.coord(&l, j);
+            let (off, gate) = self.address(&s, &c);
             let v = match gate {
                 Some(g) if gathered => {
                     let safe = self.hoist(UOp::try_where(g.clone(), off, c32(0)).expect("safe offset"));
@@ -866,8 +907,8 @@ impl<'a> Emit<'a> {
         let l = self.layout(src).clone();
         let d = self.view(dst);
         for (j, w) in Self::runs(&l, self.low.target.wave, 16 / d.dtype.bytes() as u32) {
-            let (row, col) = self.coord(&l, j);
-            let (off, gate) = self.address(&d, &row, &col);
+            let c = self.coord(&l, j);
+            let (off, gate) = self.address(&d, &c);
             let vals = self.reg_loads(src, j, w);
             match gate {
                 Some(gate) => {
@@ -933,8 +974,8 @@ impl<'a> Emit<'a> {
     fn store_view(&mut self, d: &View, src: ValId) -> Result<()> {
         let l = self.layout(src).clone();
         for (j, w) in Self::runs(&l, self.low.target.wave, 16 / d.dtype.bytes() as u32) {
-            let (row, col) = self.coord(&l, j);
-            let (off, _) = self.address(d, &row, &col);
+            let c = self.coord(&l, j);
+            let (off, _) = self.address(d, &c);
             let vals = self.reg_loads(src, j, w);
             self.mem_store(&d.buf, &off, vals);
         }
@@ -944,8 +985,8 @@ impl<'a> Emit<'a> {
     fn gather_view(&mut self, dst: ValId, s: &View) -> Result<()> {
         let l = self.layout(dst).clone();
         for (j, w) in Self::runs(&l, self.low.target.wave, 16 / s.dtype.bytes() as u32) {
-            let (row, col) = self.coord(&l, j);
-            let (off, _) = self.address(s, &row, &col);
+            let c = self.coord(&l, j);
+            let (off, _) = self.address(s, &c);
             let v = self.mem_load(&s.buf, &off, w, None);
             let vals = (0..w as usize).map(|e| elem(&v, e, w as usize)).collect();
             self.reg_store(dst, j, vals);
@@ -977,8 +1018,9 @@ impl<'a> Emit<'a> {
             TileOp::Coord(axis) => {
                 let l = self.layout(dst).clone();
                 for j in 0..regs {
-                    let (row, col) = self.coord(&l, j);
-                    self.reg_store(dst, j, vec![if axis == Axis::Row { row } else { col }]);
+                    let (row, col) = self.coord(&l, j).full();
+                    let v = self.hoist(if axis == Axis::Row { row } else { col });
+                    self.reg_store(dst, j, vec![v]);
                 }
             }
             TileOp::Unary { src, f } => {
