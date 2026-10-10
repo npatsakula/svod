@@ -10,7 +10,7 @@ use svod_ir::UOp;
 
 use crate::atoms::Target;
 use crate::ir::*;
-use crate::layouts::{self, TileLayout, WarpGrid};
+use crate::layouts::{self, Laid, TileLayout, WarpGrid};
 use crate::schedule::{self, Schedule};
 
 mod emit;
@@ -50,8 +50,9 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     schedule::expand(&mut prog, lowering.schedule);
     materialize_operands(&mut prog);
     sync::insert_barriers(&mut prog);
-    let layouts = layouts::infer(&mut prog, &lowering.target, lowering.grid).context(LayoutSnafu)?;
-    let program = emit::emit(&prog, &layouts, lowering, params, device)?;
+    let laid = layouts::infer(prog, &lowering.target, lowering.grid).context(LayoutSnafu)?;
+    let program = emit::emit(&laid, lowering, params, device)?;
+    let Laid { prog, layouts } = laid;
     Ok(Lowered { program, tile: prog, layouts })
 }
 

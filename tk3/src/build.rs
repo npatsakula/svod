@@ -384,12 +384,26 @@ impl Kernel {
         b: Tile<PB, T>,
         b_t: bool,
     ) -> Regs<F32> {
+        self.mma_oriented(acc, a, a_t, b, b_t, None)
+    }
+
+    /// [`Self::mma`] pinned to issue `orient` way round; `None` leaves the
+    /// choice to the layout inference.
+    pub fn mma_oriented<T: Elem, PA: TierMark, PB: TierMark>(
+        &mut self,
+        acc: Regs<F32>,
+        a: Tile<PA, T>,
+        a_t: bool,
+        b: Tile<PB, T>,
+        b_t: bool,
+        orient: Option<Orient>,
+    ) -> Regs<F32> {
         let (sacc, sa, sb) = (self.shape(acc), self.shape(a), self.shape(b));
         let (m, ka) = if a_t { (sa.cols, sa.rows) } else { (sa.rows, sa.cols) };
         let (kb, n) = if b_t { (sb.cols, sb.rows) } else { (sb.rows, sb.cols) };
         assert_eq!(ka, kb, "mma reduction dims");
         assert_eq!(sacc, Shape::new(m, n), "mma accumulator shape");
-        self.let_(sacc, TileOp::Mma { acc: acc.0, a: a.0, b: b.0, a_t, b_t })
+        self.let_(sacc, TileOp::Mma { acc: acc.0, a: a.0, b: b.0, a_t, b_t, orient })
     }
 
     pub fn reduce<T: Elem>(&mut self, src: Regs<T>, axis: Axis, f: ReduceOp) -> Regs<T> {

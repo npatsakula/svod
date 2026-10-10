@@ -446,3 +446,45 @@ fn every_amd_candidate_lowers(target: Target) {
         }
     }
 }
+/// `Relayout` statements of tiles in `block`, recursively; vectors are not
+/// counted.
+fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
+    use crate::ir::{Stmt, TileOp};
+    block
+        .0
+        .iter()
+        .map(|s| match s {
+            Stmt::Let { op: TileOp::Relayout { src }, .. } => {
+                let shape = prog.value(*src).shape;
+                usize::from(shape.rows > 1 && shape.cols > 1)
+            }
+            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
+            Stmt::Loop(l) => tile_relayouts(prog, &l.body),
+            Stmt::Pipeline(p) => tile_relayouts(prog, &p.produce.body) + tile_relayouts(prog, &p.consume.body),
+            Stmt::Role { body, .. } => tile_relayouts(prog, body),
+            Stmt::If { then, otherwise, .. } => tile_relayouts(prog, then) + tile_relayouts(prog, otherwise),
+        })
+        .sum()
+}
+
+/// Where the accumulator is its operand's transpose (gfx12, CDNA) the inference
+/// issues attention's products the way round that hands the scores to P·V as
+/// they stand, so no attention kernel re-holds a score tile (the decoder step's
+/// cache kernel still moves its softmax state, a 16-element vector, between the
+/// cached keys and the appended one); where neither way is free (RDNA3) the
+/// tile relayout remains, as it did before the choice existed.
+#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
+#[test_case(amd(AmdArch::Gfx942, 304), true; "gfx942")]
+#[test_case(amd(AmdArch::Gfx1100, 96), false; "gfx1100")]
+fn attention_orientation_spares_the_relayout(target: Target, free: bool) {
+    let kernels: Vec<_> = families(&target).into_iter().filter(|(name, ..)| name.starts_with("attention d")).collect();
+    assert!(!kernels.is_empty());
+    for (name, prog, lowering) in kernels {
+        let tile = lowered_tile(prog, &lowering);
+        let n = tile_relayouts(&tile, &tile.body);
+        assert_eq!(n == 0, free, "{name}: {n} tile relayouts");
+    }
+    // What the planner charges for the scratch agrees with the lowering.
+    let atom = target.mma.first().unwrap();
+    assert_eq!(atom.accumulator_feeds(target.wave), free);
+}

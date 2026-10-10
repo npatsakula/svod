@@ -237,13 +237,16 @@ pub enum TileOp {
         to: ScalarDType,
     },
     /// `acc + A·B`, with `A` read transposed when `a_t` (an `[k, m]` tile) and
-    /// `B` read transposed when `b_t` (an `[n, k]` tile).
+    /// `B` read transposed when `b_t` (an `[n, k]` tile). `orient` is which
+    /// way round the core issues it: `None` until the layout inference
+    /// chooses, `Some` once laid or where the author pinned it.
     Mma {
         acc: ValId,
         a: ValId,
         b: ValId,
         a_t: bool,
         b_t: bool,
+        orient: Option<Orient>,
     },
     /// Reduce along `axis`: `Row` folds every row to one column (`[rows, 1]`),
     /// `Col` folds every column to one row (`[1, cols]`).
@@ -419,6 +422,17 @@ pub struct Var {
     pub name: String,
     pub min: i64,
     pub max: i64,
+}
+
+/// Which way round a product is issued. `C = A·B` and its transpose
+/// `Cᵀ = Bᵀ·Aᵀ` are the same instruction with the operand slots exchanged,
+/// and a transposed layout is a relabelling of `Row` and `Col`, so the
+/// choice costs nothing and only decides which of the core's layouts each
+/// value is held in. The layout inference chooses; an author may pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Orient {
+    Direct,
+    Swapped,
 }
 
 #[derive(Clone, Debug, PartialEq)]
