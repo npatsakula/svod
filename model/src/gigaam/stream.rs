@@ -250,6 +250,18 @@ impl GigaAmStreamer {
         self.rounds
     }
 
+    /// The sizes of every device buffer the streamer's plans own, in bytes:
+    /// the caches, the step's intermediates and the decoder's state. Their
+    /// sum is the streamer's device footprint besides the model's weights.
+    pub fn device_buffers(&self) -> Result<Vec<usize>> {
+        let mut sizes: Vec<usize> = self.jit.buffers()?.iter().map(|b| b.size()).collect();
+        sizes.extend(self.mel_jit.buffers()?.iter().map(|b| b.size()));
+        if let StreamHead::Rnnt { backend, .. } = &self.head {
+            sizes.extend(backend.device_buffers()?);
+        }
+        Ok(sizes)
+    }
+
     /// Seconds per encoder frame.
     pub fn frame_shift(&self) -> f32 {
         (self.model.config.hop_length * self.model.config.subsampling_factor) as f32 / self.sample_rate() as f32
