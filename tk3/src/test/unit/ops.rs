@@ -312,7 +312,7 @@ fn case(
     }
 }
 
-const CHUNKS: Option<Chunk> = Some(Chunk { size: 8, left: Some(16) });
+const CHUNKS: Option<Chunk> = Some(Chunk { size: 8, left: Some(16), right: 0 });
 
 #[test_case(case(2, [100, 100], [4, 4], 64, false, Some(&[100, 61])); "t100 key lens")]
 #[test_case(case(1, [200, 200], [2, 2], 64, true, None); "causal t200")]
@@ -331,8 +331,8 @@ const CHUNKS: Option<Chunk> = Some(Chunk { size: 8, left: Some(16) });
 #[test_case(AttnCase { bias: Some(2), ..case(2, [37, 150], [4, 4], 64, false, None) }; "biased cross attention")]
 #[test_case(AttnCase { bias: Some(1), segments: true, ..case(2, [200, 200], [4, 2], 64, true, None) }; "bias over packed segments")]
 #[test_case(AttnCase { chunk: CHUNKS, ..case(2, [300, 300], [4, 4], 48, false, Some(&[300, 171])) }; "d48 chunks of 8, sixteen behind, lens")]
-#[test_case(AttnCase { chunk: Some(Chunk { size: 24, left: None }), ..case(2, [200, 200], [4, 2], 64, false, None) }; "chunks of 24, every earlier one")]
-#[test_case(AttnCase { chunk: Some(Chunk { size: 16, left: Some(1) }), key_mask: true, ..case(1, [100, 100], [4, 4], 128, false, None) }; "d128 chunks with a bool mask")]
+#[test_case(AttnCase { chunk: Some(Chunk { size: 24, left: None, right: 1 }), ..case(2, [200, 200], [4, 2], 64, false, None) }; "chunks of 24, every earlier one and one ahead")]
+#[test_case(AttnCase { chunk: Some(Chunk { size: 16, left: Some(1), right: 0 }), key_mask: true, ..case(1, [100, 100], [4, 4], 128, false, None) }; "d128 chunks with a bool mask")]
 fn attention_matches_the_graph(c: AttnCase) {
     if !device() {
         return;

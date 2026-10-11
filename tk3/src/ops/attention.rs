@@ -58,7 +58,7 @@ pub struct Attn<'a> {
     /// Query `i` sees keys `[i − left, i + right]` only.
     pub window: Option<(usize, usize)>,
     /// Block attention over one sequence: query `i` sees the keys of chunk
-    /// `i / size` and of the `left` chunks before it.
+    /// `i / size`, of the `left` chunks before it and the `right` after.
     pub chunk: Option<Chunk>,
     /// `[B, T]` integer segment starts of packed rows, non-decreasing along
     /// `T`: query `i` does not see keys before `seg_start[b, i]`.
@@ -352,14 +352,14 @@ pub(crate) fn graph(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> svod_tens
         }
         None => None,
     };
-    // Keys of a later chunk, or of one past the reach behind, are masked out.
-    if let Some(Chunk { size, left }) = opts.chunk {
+    // Keys of a chunk past the reach ahead or behind are masked out.
+    if let Some(Chunk { size, left, right }) = opts.chunk {
         let t = q.dim_const(1)?;
         let chunk_of = |n: usize, shape: [isize; 4]| -> svod_tensor::error::Result<Tensor> {
             Tensor::arange(0, Some(n as i64), None)?.try_cdiv(size as i32)?.try_reshape(shape)
         };
         let (cq, ck) = (chunk_of(t, [1, 1, t as isize, 1])?, chunk_of(tk, [1, 1, 1, tk as isize])?);
-        let mut out = ck.try_gt(&cq)?;
+        let mut out = ck.try_gt(&cq.try_add(right as i32)?)?;
         if let Some(left) = left {
             out = out.try_bitor(&ck.try_add(left as i32)?.try_lt(&cq)?)?;
         }
