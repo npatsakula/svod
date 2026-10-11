@@ -27,17 +27,18 @@ use crate::gigaam::transcribe::{ctc_frames_to_words, pack_lengths_buffer};
 use crate::gigaam::{Error as ModelError, StreamingConfig};
 use crate::jit::{InputSpec, JitError};
 
-// One streaming step over every lane: the chunk's mel frames and the lanes'
-// cursors in, the caches recycled in place, and the emitted frames out as CTC
-// argmax labels `[S, chunk]` or the RN-T joint's projection
-// `[S, chunk, joint_hidden]`.
+// One streaming step over every lane: the chunk's mel frames, the lanes'
+// cursors and the key and value rings in, the small caches recycled in
+// place, and out the emitted frames as CTC argmax labels `[S, chunk]` or the
+// RN-T joint's projection `[S, chunk, joint_hidden]` plus the rows the host
+// copies into the rings.
 jit_wrapper! {
     GigaAmStreamJit(GigaAm) {
-        inputs { mel: Tensor, valid: Tensor, emitted: Tensor, pending_len: Tensor, flush: Tensor }
-        state { subs0: Tensor, subs1: Tensor, conv: Tensor, keys: Tensor, values: Tensor, pending: Tensor }
-        outputs { frames }
+        inputs { mel: Tensor, valid: Tensor, emitted: Tensor, pending_len: Tensor, flush: Tensor, keys: Tensor, values: Tensor }
+        state { subs0: Tensor, subs1: Tensor, conv: Tensor, pending: Tensor }
+        outputs { frames, new_keys, new_values }
 
-        build(mel, valid, emitted, pending_len, flush, subs0, subs1, conv, keys, values, pending) {
+        build(mel, valid, emitted, pending_len, flush, keys, values, subs0, subs1, conv, pending) {
             let cursors = StreamCursors { valid, emitted, pending: pending_len, flush };
             let caches = StreamCaches { subsampling: [subs0, subs1], conv, keys, values, pending };
             let out: crate::gigaam::error::Result<_> = (|| {
@@ -48,7 +49,7 @@ jit_wrapper! {
                     Head::Rnnt { head, .. } => head.joint.project_encoder(&frames)?,
                 };
                 let [subs0, subs1] = step.subsampling;
-                Ok((frames, subs0, subs1, step.conv, step.keys, step.values, step.pending))
+                Ok((frames, step.keys, step.values, subs0, subs1, step.conv, step.pending))
             })();
             out
         }
@@ -154,6 +155,11 @@ pub struct GigaAmStreamer {
     /// Mel frames per chunk.
     chunk_mel: usize,
     rounds: u64,
+    /// The rings: chunk-sized slots per lane, and the bytes of one.
+    slots: usize,
+    slot_bytes: usize,
+    /// Bytes of one lane's row in each small cache, zeroed when a lane opens.
+    lane_bytes: [usize; 3],
 }
 
 impl GigaAmStreamer {
@@ -187,6 +193,7 @@ impl GigaAmStreamer {
         )?;
 
         let dtype = model.encoder.input_dtype();
+        let bytes = dtype.bytes();
         let (d, h, layers, left) = (cfg.d_model, cfg.n_heads, cfg.n_layers, cfg.subs_kernel_size - 1);
         let cap = streaming.cache_frames(cfg.max_encoder_frames);
         let cache = |shape: &[usize]| InputSpec::new(shape, dtype.clone()).device_local();
@@ -197,14 +204,16 @@ impl GigaAmStreamer {
             InputSpec::i32(&[lanes]),
             InputSpec::i32(&[lanes]),
             InputSpec::i32(&[lanes]),
+            cache(&[lanes, cap, layers * h, d / h]),
+            cache(&[lanes, cap, layers * h, d / h]),
             cache(&[lanes, cfg.n_mels, left]),
             cache(&[lanes, d, left]),
             cache(&[lanes, layers, d, cfg.conv_kernel - 1]),
-            cache(&[lanes, cap, layers * h, d / h]),
-            cache(&[lanes, cap, layers * h, d / h]),
             cache(&[lanes, chunk, d]),
             &device_local,
         )?;
+        let (slots, slot_bytes) = (cap / chunk, chunk * layers * d * bytes);
+        let lane_bytes = [cfg.n_mels * left * bytes, d * left * bytes, layers * d * (cfg.conv_kernel - 1) * bytes];
 
         let head = match &model.head {
             Head::Ctc(_) => {
@@ -229,6 +238,9 @@ impl GigaAmStreamer {
             generation: 0,
             chunk_mel,
             rounds: 0,
+            slots,
+            slot_bytes,
+            lane_bytes,
         })
     }
 
@@ -273,9 +285,15 @@ impl GigaAmStreamer {
         self.streaming.step_frames() as f32 * self.frame_shift()
     }
 
-    /// Open a stream on a free lane; `None` when every lane is taken.
-    pub fn open(&mut self) -> Option<StreamId> {
-        let lane = self.lanes.iter().position(Option::is_none)?;
+    /// Open a stream on a free lane; `None` when every lane is taken. The
+    /// lane's convolution caches start as zeros, a stream's silence before
+    /// its first frame; its ring slots are hidden until written.
+    pub fn open(&mut self) -> Result<Option<StreamId>> {
+        let Some(lane) = self.lanes.iter().position(Option::is_none) else { return Ok(None) };
+        let zeros = vec![0u8; self.lane_bytes.iter().copied().max().unwrap_or(0)];
+        self.jit.subs0_mut()?.copyin_at(lane * self.lane_bytes[0], &zeros[..self.lane_bytes[0]])?;
+        self.jit.subs1_mut()?.copyin_at(lane * self.lane_bytes[1], &zeros[..self.lane_bytes[1]])?;
+        self.jit.conv_mut()?.copyin_at(lane * self.lane_bytes[2], &zeros[..self.lane_bytes[2]])?;
         self.generation = self.generation.wrapping_add(1);
         let id = StreamId { lane: lane as u32, generation: self.generation };
         let blank = match &self.head {
@@ -294,7 +312,7 @@ impl GigaAmStreamer {
             fresh: true,
             emissions: Vec::new(),
         });
-        Some(id)
+        Ok(Some(id))
     }
 
     fn lane_mut(&mut self, id: StreamId) -> Result<&mut Lane> {
@@ -468,6 +486,18 @@ impl GigaAmStreamer {
             }
         }
 
+        // The emitted rows take their lane's next ring slot, the one written
+        // `cap` frames ago, as device copies queued after the step.
+        for (i, feed) in feeds.iter().enumerate() {
+            let Some(lane) = &self.lanes[i] else { continue };
+            if feed.out == 0 {
+                continue;
+            }
+            let slot = (lane.emitted / chunk) % self.slots;
+            let (dst, src, len) = ((i * self.slots + slot) * self.slot_bytes, i * self.slot_bytes, self.slot_bytes);
+            self.jit.copy_output_to_keys(1, dst, src, len)?;
+            self.jit.copy_output_to_values(2, dst, src, len)?;
+        }
         for (i, feed) in feeds.iter().enumerate() {
             let Some(lane) = &mut self.lanes[i] else { continue };
             if feed.valid == 0 && !feed.flush {
