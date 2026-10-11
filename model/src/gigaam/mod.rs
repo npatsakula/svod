@@ -20,7 +20,7 @@
 
 mod config;
 mod ctc;
-mod encoder;
+pub(crate) mod encoder;
 mod error;
 mod jit;
 mod model;
@@ -29,7 +29,7 @@ pub(crate) mod rnnt;
 pub(crate) mod transcribe;
 
 pub(crate) use config::subsampled_len;
-pub use config::{ConvNormType, GigaAmConfig, SubsamplingMode, TransducerConfig};
+pub use config::{ConvNormType, GigaAmConfig, StreamingConfig, SubsamplingMode, TransducerConfig};
 pub use error::{Error, Result};
 pub use jit::GigaAmEncoderJit;
 pub use model::{GigaAm, Head, RnntRuntime};

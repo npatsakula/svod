@@ -1,5 +1,6 @@
 mod encoder;
 mod rnnt;
+mod stream;
 
 /// Pins the threading contract a serving pipeline relies on: each built
 /// transcriber and VAD splitter moves to a per-device worker thread.

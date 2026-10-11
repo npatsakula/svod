@@ -63,6 +63,49 @@ pub struct GigaAmConfig {
     /// in `RNNTGreedyDecoding` (or the head config has predictor/joint
     /// blocks). `None` for CTC checkpoints.
     pub transducer: Option<TransducerConfig>,
+    /// The cache-aware streaming variant of the encoder, from the top-level
+    /// `streaming` block a streaming fine-tune's `config.json` carries.
+    /// `None` is the offline encoder.
+    pub streaming: Option<StreamingConfig>,
+}
+
+/// The streaming encoder: the same parameters, with causal subsampling and
+/// convolutions and block attention over chunks of `chunk_size` encoder
+/// frames (40 ms each). A query sees its own chunk and the
+/// `left_context_chunks` before it; `right_context_chunks == 1` lets it see
+/// the next chunk too, at a chunk of extra latency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamingConfig {
+    pub chunk_size: usize,
+    /// `None` is every earlier chunk: the cache then spans `max_encoder_frames`.
+    pub left_context_chunks: Option<usize>,
+    /// 0 or 1.
+    pub right_context_chunks: usize,
+}
+
+impl StreamingConfig {
+    /// The keys and values a lane keeps per layer.
+    pub fn cache_frames(&self, max_encoder_frames: usize) -> usize {
+        self.left_context_chunks.map_or(max_encoder_frames, |left| left * self.chunk_size)
+    }
+
+    /// Encoder frames a step runs its layers over: the chunk, plus the
+    /// look-ahead chunk when there is one.
+    pub fn step_frames(&self) -> usize {
+        self.chunk_size * (1 + self.right_context_chunks)
+    }
+
+    fn validate(self) -> Result<Self> {
+        if self.chunk_size == 0 || self.right_context_chunks > 1 {
+            return Err(Error::Streaming {
+                message: format!(
+                    "chunk_size {} must be positive and right_context_chunks {} 0 or 1",
+                    self.chunk_size, self.right_context_chunks
+                ),
+            });
+        }
+        Ok(self)
+    }
 }
 
 /// RNN-T-specific config extracted from the JSON `head.decoder` /
@@ -90,12 +133,19 @@ impl GigaAmConfig {
             message: "config.json missing required path /cfg/model/cfg".into(),
         })?;
         let raw: RawModelCfg = serde_json::from_value(leaf.clone()).context(ConfigSnafu)?;
-        Self::from_raw(raw)
+        let streaming = match root.get("streaming") {
+            Some(block) => serde_json::from_value::<RawStreaming>(block.clone()).context(ConfigSnafu)?.into_config()?,
+            None => None,
+        };
+        Self::from_raw(raw, streaming)
     }
 
-    fn from_raw(raw: RawModelCfg) -> Result<Self> {
+    fn from_raw(raw: RawModelCfg, streaming: Option<StreamingConfig>) -> Result<Self> {
         validate_preprocessor(&raw.preprocessor)?;
         validate_encoder(&raw.encoder)?;
+        if streaming.is_some() && !matches!(raw.encoder.subsampling, SubsamplingMode::Conv1d) {
+            return Err(Error::Streaming { message: "streaming needs conv1d subsampling".into() });
+        }
 
         // `max_mel_frames` is the pre-subsampling sequence-length bound. Configs that
         // only specify `pos_emb_max_len` (the post-subsampling encoder bound) need it
@@ -153,6 +203,7 @@ impl GigaAmConfig {
             max_encoder_frames,
             decoder,
             transducer,
+            streaming,
         })
     }
 }
@@ -170,6 +221,36 @@ struct RawModelCfg {
     head: RawHead,
     #[serde(default)]
     decoding: Option<serde_json::Value>,
+}
+
+/// The top-level `streaming` block: the fine-tune's settings, `enabled`
+/// false or a missing block being the offline model. `left_context_chunks`
+/// of -1 is unbounded.
+#[derive(Deserialize)]
+struct RawStreaming {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_chunk_size")]
+    chunk_size: usize,
+    #[serde(default = "default_left_context")]
+    left_context_chunks: i64,
+    #[serde(default)]
+    right_context_chunks: usize,
+}
+
+impl RawStreaming {
+    fn into_config(self) -> Result<Option<StreamingConfig>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let left_context_chunks = usize::try_from(self.left_context_chunks).ok();
+        let config = StreamingConfig {
+            chunk_size: self.chunk_size,
+            left_context_chunks,
+            right_context_chunks: self.right_context_chunks,
+        };
+        config.validate().map(Some)
+    }
 }
 
 #[derive(Deserialize)]
@@ -240,6 +321,12 @@ struct RawHeadJoint {
 
 fn default_true() -> bool {
     true
+}
+fn default_chunk_size() -> usize {
+    8
+}
+fn default_left_context() -> i64 {
+    -1
 }
 fn default_subs_kernel_size() -> usize {
     3
