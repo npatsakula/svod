@@ -66,8 +66,10 @@ pub struct AttnMask {
     pub causal: bool,
     /// Keys within `[i − left, i + right]` of query `i`.
     pub window: Option<(usize, usize)>,
+    /// Query `i` sees the keys of its own chunk and the chunks before it.
+    pub chunk: Option<Chunk>,
     /// A `[batch]` i32 parameter of valid key counts: keys at and past the
-    /// count are hidden. A count of 0 sees key 0 unless a row is appended,
+    /// count are hidden. A count of 0 sees key 0 unless rows are appended,
     /// so a lane always has a key and a finite output.
     pub key_lens: bool,
     /// A `[batch, tk rounded up to 8]` i32 parameter, nonzero where the key
@@ -81,9 +83,19 @@ pub struct AttnMask {
     pub bias: Option<Bias>,
 }
 
+/// Block attention: position `p` lies in chunk `p / size`, and a query sees
+/// the keys of its own chunk and of the `left` chunks before it (every
+/// earlier chunk without a bound), none after. Positions are the query and
+/// key indices, so the queries' and keys' sequences must be the same one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Chunk {
+    pub size: usize,
+    pub left: Option<usize>,
+}
+
 /// The rows of the `bias` parameter, `[rows, heads, t, key_mask_stride(keys)]`
-/// with `keys` the scored keys: `tk`, plus one with a row appended (its
-/// column last).
+/// with `keys` the scored keys: `tk`, plus the appended rows (their columns
+/// last).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Bias {
     /// One row every batch shares.
@@ -101,9 +113,13 @@ pub struct Cache {
     pub head_start: usize,
     /// A `[batch]` i32 parameter: the cache row each batch reads.
     pub row_map: bool,
-    /// `[batch, kv_heads, d]` key and value parameters, one row per batch
-    /// scored after the cached keys (the token a decoder step projected).
-    pub appended: bool,
+    /// Rows of `[batch, appended, kv_heads, d]` key and value parameters
+    /// scored after the cached keys (the tokens a step projected), at most a
+    /// key block of them; 0 appends nothing.
+    pub appended: usize,
+    /// A `[batch]` i32 parameter of visible appended rows: the rest are
+    /// hidden. Without it every appended row is seen.
+    pub app_lens: bool,
 }
 
 /// The row stride of the `key_mask` and `bias` parameters: 8-element runs
@@ -132,15 +148,22 @@ impl AttnSpec {
     /// Parameters after the outputs, in order.
     pub fn extra_params(&self) -> Vec<&'static str> {
         let AttnMask { key_lens, key_mask, seg_start, .. } = self.mask;
-        let cache =
-            self.cache.unwrap_or(Cache { rows: 0, heads_total: 0, head_start: 0, row_map: false, appended: false });
+        let cache = self.cache.unwrap_or(Cache {
+            rows: 0,
+            heads_total: 0,
+            head_start: 0,
+            row_map: false,
+            appended: 0,
+            app_lens: false,
+        });
         [
             (key_lens, "key_lens"),
             (key_mask, "key_mask"),
             (seg_start, "seg_start"),
             (cache.row_map, "row_map"),
-            (cache.appended, "k_app"),
-            (cache.appended, "v_app"),
+            (cache.appended > 0, "k_app"),
+            (cache.appended > 0, "v_app"),
+            (cache.app_lens, "app_lens"),
             (self.mask.bias.is_some(), "bias"),
         ]
         .into_iter()
@@ -199,11 +222,13 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
 /// except under a key mask or a bias, which every block reads.
 pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, scale, cfg } = *spec;
-    let AttnMask { causal, window, key_lens, key_mask, seg_start, bias } = mask;
+    let AttnMask { causal, window, chunk, key_lens, key_mask, seg_start, bias } = mask;
     let FaCfg { bq, bkv, stages, splits, .. } = cfg;
     let cap = batch.capacity();
     let (kv_rows, heads_total, head_start) =
         cache.map_or((cap, kv_heads, 0), |c| (c.rows, c.heads_total, c.head_start));
+    let appended = cache.map_or(0, |c| c.appended);
+    assert!(appended <= bkv, "{appended} appended rows overflow a key block of {bkv}");
     let mut k = Kernel::new("flash_attention");
     let q = k.param::<T>("q", ParamKind::In, cap * t * heads * d);
     let kk = k.param::<T>("k", ParamKind::In, kv_rows * tk * heads_total * d);
@@ -220,12 +245,13 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let masks = key_mask.then(|| k.param::<I32>("key_mask", ParamKind::In, cap * mask_stride));
     let segs = seg_start.then(|| k.param::<I32>("seg_start", ParamKind::In, cap * t));
     let row_map = cache.is_some_and(|c| c.row_map).then(|| k.param::<I32>("row_map", ParamKind::In, cap));
-    let appended = cache.is_some_and(|c| c.appended).then(|| {
-        let k_app = k.param::<T>("k_app", ParamKind::In, cap * kv_heads * d);
-        let v_app = k.param::<T>("v_app", ParamKind::In, cap * kv_heads * d);
+    let app = (appended > 0).then(|| {
+        let k_app = k.param::<T>("k_app", ParamKind::In, cap * appended * kv_heads * d);
+        let v_app = k.param::<T>("v_app", ParamKind::In, cap * appended * kv_heads * d);
         (k_app, v_app)
     });
-    let keys = tk + usize::from(appended.is_some());
+    let app_lens = cache.is_some_and(|c| c.app_lens).then(|| k.param::<I32>("app_lens", ParamKind::In, cap));
+    let keys = tk + appended;
     let bias_stride = key_mask_stride(keys);
     let bias = bias.map(|rows| {
         let n = if rows == Bias::Shared { 1 } else { cap };
@@ -243,7 +269,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     // Keys past the length are masked; keys past `tk` too when blocks overhang it.
     let keys_masked = key_lens || !tk.is_multiple_of(bkv);
     let len = match lens {
-        Some(lens) if appended.is_some() => k.load_scalar(lens, b.clone()).min(tk),
+        Some(lens) if appended > 0 => k.load_scalar(lens, b.clone()).min(tk),
         Some(lens) => k.load_scalar(lens, b.clone()).max(1).min(tk),
         None => Sc::from(tk),
     };
@@ -272,10 +298,10 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         let view = k.view(m, b.clone() * mask_stride, [mask_stride, 1], Shape::new(1, bkv), [None, bound(tk, bkv)]);
         k.at(view, 0, 0)
     });
-    // Past `keys` (the appended column's tile always overhangs it) reads nothing.
+    // Past `keys` (the appended columns' tile always overhangs them) reads nothing.
     let bias_view = bias.map(|(p, rows)| {
         let batch = if rows == Bias::Shared { Sc::from(0) } else { batch_offset(&bb, heads * t * bias_stride) };
-        let cols = if appended.is_some() { Some(Sc::from(keys)) } else { bound(keys, bkv) };
+        let cols = if appended > 0 { Some(Sc::from(keys)) } else { bound(keys, bkv) };
         let bounds = [bound(t, bq), cols];
         k.view(p, batch + hh.clone() * (t * bias_stride), [bias_stride, 1], Shape::new(bq, bkv), bounds)
     });
@@ -288,11 +314,17 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         (k.load(tile), k.load_scalar(s, b.clone() * t + q_off.clone()), k.load_scalar(s, b.clone() * t + last))
     });
 
+    // The tile's first and last query chunks; the first sees the most
+    // keys ahead, the last the fewest behind.
+    let chunks = chunk.map(|c| (q_off.clone() / c.size, (q_off.clone() + (bq - 1)) / c.size));
     // Key blocks `first..end` hold every key some query of the tile sees;
     // this split takes an even share of them.
     let mut first = Sc::from(0);
     if let Some((left, _)) = window {
         first = first.max((q_off.clone().max(left) - left) / bkv);
+    }
+    if let (Some(Chunk { size, left: Some(left) }), Some((cq0, _))) = (chunk, &chunks) {
+        first = first.max((cq0.clone().max(left) - left) * size / bkv);
     }
     if let Some((_, seg_first, _)) = &seg {
         first = first.max(seg_first.clone() / bkv);
@@ -303,6 +335,9 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     }
     if let Some((_, right)) = window {
         end = end.min((q_off.clone() + bq + right + bkv - 1) / bkv);
+    }
+    if let (Some(Chunk { size, .. }), Some((_, cq1))) = (chunk, &chunks) {
+        end = end.min(((cq1.clone() + 1) * size + (bkv - 1)) / bkv);
     }
     if key_lens {
         end = end.min((len.clone() + bkv - 1) / bkv);
@@ -368,6 +403,19 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             let cond = k.compare(col, reach, BinaryOp::Le);
             and(k, cond);
         }
+        if let Some(Chunk { size, left }) = chunk {
+            let size = k.splat::<I32>(shape, size);
+            let cq = k.binary(row, size, BinaryOp::Div);
+            let ck = k.binary(col, size, BinaryOp::Div);
+            let cond = k.compare(ck, cq, BinaryOp::Le);
+            and(k, cond);
+            if let Some(left) = left {
+                let left = k.splat::<I32>(shape, left);
+                let reach = k.binary(ck, left, BinaryOp::Add);
+                let cond = k.compare(cq, reach, BinaryOp::Le);
+                and(k, cond);
+            }
+        }
         if let Some(view) = mask_view {
             let tile = k.at(view, 0, block_start.clone());
             let visible = k.load(tile);
@@ -382,7 +430,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         }
         hide(k, keep.expect("a mask"), plain)
     };
-    let edges = causal || keys_masked || window.is_some() || seg.is_some();
+    let edges = causal || keys_masked || window.is_some() || chunk.is_some() || seg.is_some();
     let mask = |k: &mut Kernel, s: Regs<F32>, block_start: Sc| -> Regs<F32> {
         let s = biased(k, s, block_start.clone());
         if key_mask {
@@ -404,6 +452,14 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             let left_edge = (block_start.clone() + left).lt(q_off.clone() + bq - 1);
             let right_edge = (q_off.clone() + right + 1).lt(block_end.clone());
             partial = partial.or(left_edge).or(right_edge);
+        }
+        if let (Some(Chunk { size, left }), Some((cq0, cq1))) = (chunk, &chunks) {
+            // Every row sees a block within the last row's reach behind and
+            // the first row's chunk ahead.
+            partial = partial.or(((cq0.clone() + 1) * size).lt(block_end.clone()));
+            if let Some(left) = left {
+                partial = partial.or(block_start.clone().lt((cq1.clone().max(left) - left) * size));
+            }
         }
         if let Some((_, _, seg_last)) = &seg {
             partial = partial.or(block_start.clone().lt(seg_last.clone()));
@@ -431,33 +487,38 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             step(k, &st, k_t, v_t, (s_first.clone() + step_) * bkv, carried)
         },
     );
-    // The appended row, a block holding one key that every split scores
-    // and all but the last hide: a hidden block leaves `(m, l, o)` as they
-    // were, and a branch would cost more than the step.
-    let [m, l, acc] = match appended {
+    // The appended rows, a block of keys that every split scores and all
+    // but the last hide: a hidden block leaves `(m, l, o)` as they were, and
+    // a branch would cost more than the step.
+    let [m, l, acc] = match app {
         Some((k_app, v_app)) => {
             let app = |k: &mut Kernel, p: ParamRef<T>| {
                 k.view(
                     p,
-                    batch_offset(&bb, kv_heads * d) + kv_head.clone() * d,
+                    batch_offset(&bb, appended * kv_heads * d) + kv_head.clone() * d,
                     [kv_heads * d, 1],
                     Shape::new(bkv, d),
-                    [Some(Sc::from(1)), None],
+                    [Some(Sc::from(appended)), None],
                 )
             };
             let (k_g, v_g) = (app(&mut k, k_app), app(&mut k, v_app));
+            let visible = match app_lens {
+                Some(p) => k.load_scalar(p, b.clone()).min(appended),
+                None => Sc::from(appended),
+            };
             let last = split.clone().eq(splits - 1);
-            let one = |k: &mut Kernel, s: Regs<F32>, _: Sc| {
+            let rows = |k: &mut Kernel, s: Regs<F32>, _: Sc| {
                 let s = biased(k, s, Sc::from(tk));
                 let col = k.coord(shape, Axis::Col);
+                let visible = k.splat::<I32>(shape, visible.clone());
+                let seen = k.compare(col, visible, BinaryOp::Lt);
                 let zero = k.zeros::<I32>(shape);
-                let first_col = k.compare(col, zero, BinaryOp::Eq);
                 let owner = k.splat::<I32>(shape, last.clone());
                 let owned = k.compare(owner, zero, BinaryOp::Ne);
-                let keep = k.binary(first_col, owned, BinaryOp::And);
+                let keep = k.binary(seen, owned, BinaryOp::And);
                 hide(k, keep, s)
             };
-            let st = Step { q_r, scale_log2e, shape, mask: &one };
+            let st = Step { q_r, scale_log2e, shape, mask: &rows };
             step(&mut k, &st, k_g, v_g, Sc::from(0), [m, l, acc])
         }
         None => [m, l, acc],

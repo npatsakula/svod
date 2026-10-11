@@ -12,6 +12,7 @@ use super::{
     DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed,
 };
 use crate::kernels;
+pub use crate::kernels::attention::Chunk;
 use crate::kernels::attention::{
     AttnMask, AttnSpec, Bias, CombineSpec, FaCfg, attention as fa, combine, key_mask_stride,
 };
@@ -38,10 +39,13 @@ pub struct Cache<'a> {
     pub kv_heads: usize,
     /// `[B]` integer cache row per batch lane; `None` reads row `b`.
     pub row_map: Option<&'a Tensor>,
-    /// `[B, 1, kv_heads, D]` key and value scored after the cached prefix:
-    /// the token the step projected, not yet written to the cache. Needs
-    /// [`KeyMask::Lens`] naming the prefix.
+    /// `[B, n, kv_heads, D]` keys and values scored after the cached prefix:
+    /// the tokens the step projected, not yet written to the cache. Needs
+    /// [`KeyMask::Lens`] naming the prefix; `n` is at most a key block.
     pub appended: Option<(&'a Tensor, &'a Tensor)>,
+    /// `[B]` integer counts of visible appended rows, the rest hidden;
+    /// `None` sees them all.
+    pub app_lens: Option<&'a Tensor>,
 }
 
 /// The masks apply together; a query with no visible key yields NaN, as a
@@ -53,6 +57,9 @@ pub struct Attn<'a> {
     pub keys: KeyMask<'a>,
     /// Query `i` sees keys `[i − left, i + right]` only.
     pub window: Option<(usize, usize)>,
+    /// Block attention over one sequence: query `i` sees the keys of chunk
+    /// `i / size` and of the `left` chunks before it.
+    pub chunk: Option<Chunk>,
     /// `[B, T]` integer segment starts of packed rows, non-decreasing along
     /// `T`: query `i` does not see keys before `seg_start[b, i]`.
     pub seg_start: Option<&'a Tensor>,
@@ -67,8 +74,8 @@ pub struct Attn<'a> {
     /// Defaults to `1/√D`.
     pub scale: Option<f32>,
     /// `[B, H, T, Tk]` or `[1, H, T, Tk]` added to the scaled scores before
-    /// the masks: `softmax(q·kᵀ·scale + bias)`. With an appended row `Tk`
-    /// counts it, its column last. Off the stream dtype keeps the graph.
+    /// the masks: `softmax(q·kᵀ·scale + bias)`. With appended rows `Tk`
+    /// counts them, their columns last. Off the stream dtype keeps the graph.
     pub bias: Option<&'a Tensor>,
 }
 
@@ -105,16 +112,19 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
             ensure!(got == [qs[0].clone()], shape_err("row map", &got, format!("[{}]", qs[0])));
         }
         if let Some((ka, va)) = cache.appended {
-            let want = vec![qs[0].clone(), SInt::Const(1), kv_heads.clone(), qs[3].clone()];
+            let rows = shape(ka)?.get(1).and_then(SInt::as_const).filter(|&n| n > 0);
+            let want = vec![qs[0].clone(), SInt::Const(rows.unwrap_or(1)), kv_heads.clone(), qs[3].clone()];
             for (operand, t) in [("appended k", ka), ("appended v", va)] {
                 let got = shape(t)?;
-                ensure!(got == want, shape_err(operand, &got, fmt_shape(&want)));
+                ensure!(rows.is_some() && got == want, shape_err(operand, &got, fmt_shape(&want)));
                 ensure!(t.dtype() == q.dtype(), DtypeSnafu { op: OP, operand, got: t.dtype(), want: q.dtype() });
             }
-            ensure!(
-                matches!(opts.keys, KeyMask::Lens(_)),
-                shape_err("key lens", &[], "[B] with an appended row".into())
-            );
+            ensure!(matches!(opts.keys, KeyMask::Lens(_)), shape_err("key lens", &[], "[B] with appended rows".into()));
+        }
+        if let Some(lens) = cache.app_lens {
+            let got = shape(lens)?;
+            let fits = cache.appended.is_some() && got == [qs[0].clone()];
+            ensure!(fits, shape_err("appended lens", &got, format!("[{}] with appended rows", qs[0])));
         }
     }
     let (lens, bools) = match opts.keys {
@@ -134,8 +144,8 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         let got = shape(seg)?;
         ensure!(got == qs[..2], shape_err("seg start", &got, fmt_shape(&qs[..2])));
     }
-    let appended = opts.cache.is_some_and(|c| c.appended.is_some());
-    let keys = ks[1].as_const().map_or(ks[1].clone(), |n| SInt::Const(n + usize::from(appended)));
+    let appended = opts.cache.and_then(|c| c.appended).map_or(0, |(ka, _)| ka.dim_const(1).expect("checked"));
+    let keys = ks[1].as_const().map_or(ks[1].clone(), |n| SInt::Const(n + appended));
     let bias_rows = match opts.bias {
         Some(bias) => {
             let got = shape(bias)?;
@@ -151,8 +161,15 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let k_ext = extent(&ks).map(|(e, _)| e);
     let planner = super::planner(&q.device());
     let dtypes: Vec<DType> = [q, k, v].into_iter().chain(opts.bias).map(Tensor::dtype).collect();
-    let plan = shape::attention(planner.as_deref(), &dtypes, q_ext.as_ref(), k_ext.as_ref(), opts.causal);
+    // A chunk mask skips about as many key blocks as a causal one.
+    let causal = opts.causal || opts.chunk.is_some();
+    let plan = shape::attention(planner.as_deref(), &dtypes, q_ext.as_ref(), k_ext.as_ref(), causal);
     let Plan::Kernel(cfgs) = plan else { return graph(q, k, v, opts).context(GraphSnafu { op: OP }) };
+    // The appended rows ride one key block.
+    let cfgs: Vec<FaCfg> = cfgs.into_iter().filter(|c| c.bkv >= appended).collect();
+    if cfgs.is_empty() {
+        return graph(q, k, v, opts).context(GraphSnafu { op: OP });
+    }
     let (q_ext, k_ext, var) = (q_ext.expect("planned"), k_ext.expect("planned"), var.flatten());
     let target = planner.expect("planned").target.clone();
     let ([b, t, heads, d], [kv_rows, tk, heads_total, _]) = (dims4(&q_ext.dims), dims4(&k_ext.dims));
@@ -163,9 +180,10 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         heads_total,
         head_start: c.head_start,
         row_map: c.row_map.is_some(),
-        appended: c.appended.is_some(),
+        appended,
+        app_lens: c.app_lens.is_some(),
     });
-    let edges = AttnMask { causal: opts.causal, window: opts.window, ..AttnMask::default() };
+    let edges = AttnMask { causal: opts.causal, window: opts.window, chunk: opts.chunk, ..AttnMask::default() };
     let spec = |cfg, mask, cache| AttnSpec {
         batch: batch.clone(),
         t,
@@ -200,7 +218,8 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         let plain = cache.map(|c| kernels::attention::Cache {
             rows: c.rows.max(batch.capacity()),
             row_map: false,
-            appended: false,
+            appended: 0,
+            app_lens: false,
             ..c
         });
         let mut programs = vec![(typed!(q.dtype(), fa, &spec(cfg, edges, plain)), cfg.lowering(target.clone()))];
@@ -221,7 +240,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let segs = opts.seg_start.map(i32);
     // Rows padded to the kernel's aligned stride, like the key mask's.
     let bias = opts.bias.map(|b| {
-        let keys = tk + usize::from(appended);
+        let keys = tk + appended;
         let pad = key_mask_stride(keys) - keys;
         if pad == 0 {
             b.clone()
@@ -231,6 +250,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     });
     let row_map = opts.cache.and_then(|c| c.row_map).map(i32);
     let (k_app, v_app) = opts.cache.and_then(|c| c.appended).unzip();
+    let app_lens = opts.cache.and_then(|c| c.app_lens).map(i32);
     let mask = AttnMask {
         key_lens: lens.is_some(),
         key_mask: bools.is_some(),
@@ -240,7 +260,16 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     };
     let spec = spec(cfg, mask, cache);
     let lowering = cfg.lowering(target.clone());
-    let extras = [lens.as_ref(), bools.as_ref(), segs.as_ref(), row_map.as_ref(), k_app, v_app, bias.as_ref()];
+    let extras = [
+        lens.as_ref(),
+        bools.as_ref(),
+        segs.as_ref(),
+        row_map.as_ref(),
+        k_app,
+        v_app,
+        app_lens.as_ref(),
+        bias.as_ref(),
+    ];
     if cfg.splits == 1 {
         let o = output(&q_ext.dims, &var, q.dtype());
         let ins: Vec<&Tensor> = [Some(q), Some(k), Some(v), Some(&o)].into_iter().chain(extras).flatten().collect();
@@ -287,6 +316,7 @@ pub(crate) fn graph(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> svod_tens
         }
     };
     let (k_app, v_app) = opts.cache.and_then(|c| c.appended).unzip();
+    let cached_keys = k.dim_const(1)?;
     let (k, v) = (cached(k, k_app)?, cached(v, v_app)?);
     let tk = k.dim_const(1)?;
     // Key validity and segment masks are properties of the lengths, shared
@@ -296,8 +326,17 @@ pub(crate) fn graph(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> svod_tens
         KeyMask::Lens(lens) => {
             let prefix = Tensor::sequence_mask(lens, tk)?;
             Some(match k_app {
-                // The appended key, at the end, is always seen.
-                Some(_) => prefix.try_bitor(&Tensor::arange(tk as i64, None, None)?.try_eq(tk as i64 - 1)?)?,
+                // The appended keys, after the cache, are seen: all, or the counted ones.
+                Some(_) => {
+                    let offset = Tensor::arange(0, Some(tk as i64), None)?.try_sub(cached_keys as i32)?;
+                    let seen = match opts.cache.and_then(|c| c.app_lens) {
+                        Some(n) => offset
+                            .try_ge(0i32)?
+                            .try_bitand(&offset.try_lt(&n.cast(DType::Int32).try_unsqueeze(-1)?)?)?,
+                        None => offset.try_ge(0i32)?,
+                    };
+                    prefix.try_bitor(&seen)?
+                }
                 None => prefix,
             })
         }
@@ -305,7 +344,7 @@ pub(crate) fn graph(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> svod_tens
         KeyMask::None => None,
     };
     // Keys before the query's own segment are masked out (`true`).
-    let hidden = match opts.seg_start {
+    let mut hidden = match opts.seg_start {
         Some(start) => {
             let (b, t) = (start.dim(0)?, start.dim_const(1)?);
             let keys = Tensor::arange(0, Some(tk as i64), None)?.try_reshape([1isize, 1, 1, tk as isize])?;
@@ -313,6 +352,22 @@ pub(crate) fn graph(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> svod_tens
         }
         None => None,
     };
+    // Keys of a later chunk, or of one past the reach behind, are masked out.
+    if let Some(Chunk { size, left }) = opts.chunk {
+        let t = q.dim_const(1)?;
+        let chunk_of = |n: usize, shape: [isize; 4]| -> svod_tensor::error::Result<Tensor> {
+            Tensor::arange(0, Some(n as i64), None)?.try_cdiv(size as i32)?.try_reshape(shape)
+        };
+        let (cq, ck) = (chunk_of(t, [1, 1, t as isize, 1])?, chunk_of(tk, [1, 1, 1, tk as isize])?);
+        let mut out = ck.try_gt(&cq)?;
+        if let Some(left) = left {
+            out = out.try_bitor(&ck.try_add(left as i32)?.try_lt(&cq)?)?;
+        }
+        hidden = Some(match hidden {
+            Some(h) => h.try_bitor(&out)?,
+            None => out,
+        });
+    }
     // One attention mask: the segment mask folds into the bias as its floor.
     let attn_mask = match (hidden, opts.bias) {
         (hidden, None) => hidden,

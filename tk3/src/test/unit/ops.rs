@@ -6,7 +6,7 @@ use svod_ir::{Op, SInt, ops};
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
-use crate::ops::{self as tk, Act, Attn, Cache, Conv, KeyMask, Linear, Qkv};
+use crate::ops::{self as tk, Act, Attn, Cache, Chunk, Conv, KeyMask, Linear, Qkv};
 
 /// A device with tk3 tables to run on, with tuning off so a test does not measure
 /// every shape it touches (the untuned pick runs).
@@ -230,6 +230,7 @@ struct AttnCase {
     causal: bool,
     lens: Option<Vec<i32>>,
     window: Option<(usize, usize)>,
+    chunk: Option<Chunk>,
     /// A bool key mask hiding every fifth key, and packed segments of 30 rows.
     key_mask: bool,
     segments: bool,
@@ -255,7 +256,7 @@ impl AttnInputs {
             (None, None) => KeyMask::None,
         };
         let (seg_start, bias) = (self.seg_start.as_ref(), self.bias.as_ref());
-        Attn { causal: c.causal, keys, window: c.window, seg_start, bias, ..Attn::default() }
+        Attn { causal: c.causal, keys, window: c.window, chunk: c.chunk, seg_start, bias, ..Attn::default() }
     }
 }
 
@@ -294,8 +295,24 @@ fn case(
     lens: Option<&[i32]>,
 ) -> AttnCase {
     let lens = lens.map(<[i32]>::to_vec);
-    AttnCase { b, t, tk, h, h_kv, d, causal, lens, window: None, key_mask: false, segments: false, bias: None }
+    AttnCase {
+        b,
+        t,
+        tk,
+        h,
+        h_kv,
+        d,
+        causal,
+        lens,
+        window: None,
+        chunk: None,
+        key_mask: false,
+        segments: false,
+        bias: None,
+    }
 }
+
+const CHUNKS: Option<Chunk> = Some(Chunk { size: 8, left: Some(16) });
 
 #[test_case(case(2, [100, 100], [4, 4], 64, false, Some(&[100, 61])); "t100 key lens")]
 #[test_case(case(1, [200, 200], [2, 2], 64, true, None); "causal t200")]
@@ -313,6 +330,9 @@ fn case(
 #[test_case(AttnCase { bias: Some(2), ..case(2, [99, 99], [4, 4], 64, false, Some(&[99, 50])) }; "bias with key lens")]
 #[test_case(AttnCase { bias: Some(2), ..case(2, [37, 150], [4, 4], 64, false, None) }; "biased cross attention")]
 #[test_case(AttnCase { bias: Some(1), segments: true, ..case(2, [200, 200], [4, 2], 64, true, None) }; "bias over packed segments")]
+#[test_case(AttnCase { chunk: CHUNKS, ..case(2, [300, 300], [4, 4], 48, false, Some(&[300, 171])) }; "d48 chunks of 8, sixteen behind, lens")]
+#[test_case(AttnCase { chunk: Some(Chunk { size: 24, left: None }), ..case(2, [200, 200], [4, 2], 64, false, None) }; "chunks of 24, every earlier one")]
+#[test_case(AttnCase { chunk: Some(Chunk { size: 16, left: Some(1) }), key_mask: true, ..case(1, [100, 100], [4, 4], 128, false, None) }; "d128 chunks with a bool mask")]
 fn attention_matches_the_graph(c: AttnCase) {
     if !device() {
         return;
@@ -368,12 +388,22 @@ fn biased_attention_under_a_batch_variable(per_batch: bool) {
 
 /// A decoder step: `t` queries per lane against a cache of three layers'
 /// heads shared by two windows, each lane reading its window's row, the
-/// step's own key appended; with and without key splits.
-#[test_case(1, 64, 20, 1500, Some(4), false; "one query, 1500 keys, four splits")]
-#[test_case(1, 128, 8, 300, None, false; "d 128 unsplit")]
-#[test_case(3, 64, 4, 200, Some(2), false; "three queries, two splits")]
-#[test_case(3, 64, 4, 200, Some(2), true; "biased, three queries, two splits")]
-fn cached_attention_matches_the_graph(t: usize, d: usize, h: usize, tk: usize, splits: Option<usize>, biased: bool) {
+/// step's own `appended` keys after it (all seen, or `counted` per lane);
+/// with and without key splits.
+#[test_case([1, 64, 20, 1500], Some(4), 1, false, false; "one query, 1500 keys, four splits")]
+#[test_case([1, 128, 8, 300], None, 1, false, false; "d 128 unsplit")]
+#[test_case([3, 64, 4, 200], Some(2), 1, false, false; "three queries, two splits")]
+#[test_case([3, 64, 4, 200], Some(2), 1, false, true; "biased, three queries, two splits")]
+#[test_case([8, 48, 16, 128], None, 8, false, false; "a streaming chunk: eight queries, eight appended, d 48")]
+#[test_case([16, 48, 16, 128], Some(2), 16, true, false; "sixteen counted appended, two splits")]
+#[test_case([8, 64, 4, 128], None, 8, true, true; "biased, counted appended")]
+fn cached_attention_matches_the_graph(
+    [t, d, h, tk]: [usize; 4],
+    splits: Option<usize>,
+    appended: usize,
+    counted: bool,
+    biased: bool,
+) {
     if !device() {
         return;
     }
@@ -381,18 +411,21 @@ fn cached_attention_matches_the_graph(t: usize, d: usize, h: usize, tk: usize, s
     let q = rand(&[b, t, h, d], 40, 1.0, DType::BFloat16);
     let k = rand(&[rows, tk, layers * h, d], 41, 1.0, DType::BFloat16);
     let v = rand(&[rows, tk, layers * h, d], 42, 1.0, DType::BFloat16);
-    let k_app = rand(&[b, 1, h, d], 43, 1.0, DType::BFloat16);
-    let v_app = rand(&[b, 1, h, d], 44, 1.0, DType::BFloat16);
+    let k_app = rand(&[b, appended, h, d], 43, 1.0, DType::BFloat16);
+    let v_app = rand(&[b, appended, h, d], 44, 1.0, DType::BFloat16);
     let realized = |v: Vec<i32>| {
         let t = Tensor::from_slice(&v);
         t.realize().unwrap();
         t
     };
-    let lens = realized(vec![tk as i32, 1, 37, tk as i32 - 1, 100]);
+    let lens = realized(vec![tk as i32, 1, 37, tk as i32 - 1, 0]);
     let row_map = realized(vec![0, 1, 1, 0, 1]);
-    let cache = Cache { head_start: h, kv_heads: h, row_map: Some(&row_map), appended: Some((&k_app, &v_app)) };
-    // The appended key's column last.
-    let bias = rand(&[b, h, t, tk + 1], 45, 2.0, DType::BFloat16);
+    let seen = realized((0..b).map(|lane| (appended as i32 - lane as i32 % 3).max(1)).collect());
+    let app_lens = counted.then_some(&seen);
+    let cache =
+        Cache { head_start: h, kv_heads: h, row_map: Some(&row_map), appended: Some((&k_app, &v_app)), app_lens };
+    // The appended keys' columns last.
+    let bias = rand(&[b, h, t, tk + appended], 45, 2.0, DType::BFloat16);
     let bias = biased.then_some(&bias);
     let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, bias, ..Attn::default() };
     let o = tk::attention(&q, &k, &v, opts).unwrap();

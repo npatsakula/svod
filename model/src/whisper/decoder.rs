@@ -436,6 +436,7 @@ impl TextDecoder {
                             kv_heads: n_head,
                             row_map: None,
                             appended: Some((&new_k, &new_v)),
+                            app_lens: None,
                         };
                         let opts = Attn { keys: KeyMask::Lens(self_key_lens), cache: Some(cache), ..Attn::default() };
                         let out = ops::attention(&q.cast(self.cache_dtype.clone()), self_k_cache, self_v_cache, opts)?;
@@ -470,6 +471,7 @@ impl TextDecoder {
                             kv_heads: n_head,
                             row_map: Some(cross_cache_map),
                             appended: None,
+                            app_lens: None,
                         };
                         let opts = Attn { cache: Some(cache), splits: attention.cross_splits, ..Attn::default() };
                         let out = ops::attention(&q.cast(self.cache_dtype.clone()), cross_k, cross_v, opts)?;

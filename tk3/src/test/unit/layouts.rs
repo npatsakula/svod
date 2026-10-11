@@ -111,6 +111,8 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
 #[test_case(64, 64, 4, 32; "square")]
 #[test_case(16, 256, 4, 32; "wide")]
 #[test_case(256, 8, 8, 64; "narrow, wave64")]
+#[test_case(4, 48, 4, 32; "48 wide: 16 spread three times")]
+#[test_case(8, 96, 4, 64; "96 wide, wave64")]
 fn natural_layouts_hold_every_element_once(rows: usize, cols: usize, warps: u32, lanes: u32) {
     let l = natural(Shape::new(rows, cols), warps, lanes).unwrap();
     assert_eq!(l.shape(), Shape::new(rows, cols));

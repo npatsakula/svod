@@ -11,7 +11,7 @@ use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::attention::{
-    AttnMask, AttnSpec, Bias, Cache, CombineSpec, FaCfg, attention, combine, key_mask_stride,
+    AttnMask, AttnSpec, Bias, Cache, Chunk, CombineSpec, FaCfg, attention, combine, key_mask_stride,
 };
 use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch;
@@ -42,17 +42,24 @@ struct Case {
     seg_start: Vec<i64>,
     /// `[batch]`: batch `b` reads cache row `rows - 1 - b`.
     row_map: Vec<i64>,
-    /// `[batch, kv_heads, d]` appended keys and values.
+    /// `[batch, appended, kv_heads, d]` appended keys and values.
     k_app: Vec<f64>,
     v_app: Vec<f64>,
+    /// `[batch]`: batch `b` sees `appended - b % 3` of them, at least one.
+    app_lens: Vec<i64>,
     /// `[rows, heads, t, key_mask_stride(keys)]` in `2·[-1, 1)`, the padding
     /// columns past `keys` a large value nothing may read; empty unbiased.
     bias: Vec<f64>,
 }
 
-/// The scored keys: the cached ones and the appended row.
+/// The rows appended per batch.
+fn appended(spec: &AttnSpec) -> usize {
+    spec.cache.map_or(0, |c| c.appended)
+}
+
+/// The scored keys: the cached ones and the appended rows.
 fn keys(spec: &AttnSpec) -> usize {
-    spec.tk + usize::from(spec.cache.is_some_and(|c| c.appended))
+    spec.tk + appended(spec)
 }
 
 fn case(spec: AttnSpec, lens: &[i64]) -> Case {
@@ -71,7 +78,9 @@ fn case(spec: AttnSpec, lens: &[i64]) -> Case {
     let key_mask = (0..batch * stride).map(|x| i64::from((x / stride + x % stride) % 5 != 2)).collect();
     let seg_start = (0..batch * spec.t).map(|x| (x % spec.t - x % spec.t % SEGMENT) as i64).collect();
     let row_map = (0..batch).map(|b| (rows - 1 - b) as i64).collect();
-    let (k_app, v_app) = (n(batch * spec.kv_heads * spec.d, &mut seed), n(batch * spec.kv_heads * spec.d, &mut seed));
+    let app = batch * appended(&spec) * spec.kv_heads * spec.d;
+    let (k_app, v_app) = (n(app, &mut seed), n(app, &mut seed));
+    let app_lens = (0..batch).map(|b| (appended(&spec) as i64 - b as i64 % 3).max(1)).collect();
     let bias_rows = match spec.mask.bias {
         Some(Bias::Shared) => 1,
         Some(Bias::PerBatch) => batch,
@@ -83,21 +92,28 @@ fn case(spec: AttnSpec, lens: &[i64]) -> Case {
         .enumerate()
         .map(|(i, x)| if i % stride < keys { 2.0 * x } else { 1e3 })
         .collect();
-    Case { spec, q, k, v, lens: lens.to_vec(), key_mask, seg_start, row_map, k_app, v_app, bias }
+    Case { spec, q, k, v, lens: lens.to_vec(), key_mask, seg_start, row_map, k_app, v_app, app_lens, bias }
 }
 
 /// Direct attention in f64 with the same masks and cache reads.
 fn reference(c: &Case) -> Vec<f64> {
     let s = &c.spec;
     let m = s.mask;
-    let cache =
-        s.cache.unwrap_or(Cache { rows: 0, heads_total: s.kv_heads, head_start: 0, row_map: false, appended: false });
+    let cache = s.cache.unwrap_or(Cache {
+        rows: 0,
+        heads_total: s.kv_heads,
+        head_start: 0,
+        row_map: false,
+        appended: 0,
+        app_lens: false,
+    });
     let (stride, kv_stride, group) = (s.heads * s.d, cache.heads_total * s.d, s.heads / s.kv_heads);
     let mut out = vec![0.0; s.batch.capacity() * s.t * stride];
     for b in 0..s.batch.capacity() {
-        // An empty lane sees key 0 unless a row is appended, as the kernel does.
-        let floor = usize::from(!cache.appended);
+        // An empty lane sees key 0 unless rows are appended, as the kernel does.
+        let floor = usize::from(cache.appended == 0);
         let len = if m.key_lens { (c.lens[b] as usize).max(floor) } else { s.tk };
+        let seen = if cache.app_lens { c.app_lens[b] as usize } else { cache.appended };
         let row = if cache.row_map { c.row_map[b] as usize } else { b };
         let keys = keys(s);
         let bias_stride = key_mask_stride(keys);
@@ -108,18 +124,26 @@ fn reference(c: &Case) -> Vec<f64> {
                 if j < s.tk {
                     cached[(row * s.tk + j) * kv_stride + kv_head * s.d + dd]
                 } else {
-                    appended[(b * s.kv_heads + h / group) * s.d + dd]
+                    appended[((b * cache.appended + j - s.tk) * s.kv_heads + h / group) * s.d + dd]
                 }
             };
             for i in 0..s.t {
                 let qi = &c.q[(b * s.t + i) * stride + h * s.d..][..s.d];
+                let chunked = |j: usize| {
+                    m.chunk.is_some_and(|Chunk { size, left }| {
+                        j / size > i / size || left.is_some_and(|l| j / size + l < i / size)
+                    })
+                };
                 let hidden = |j: usize| {
-                    j < s.tk
-                        && (j >= len
-                            || (m.causal && j > i)
-                            || m.window.is_some_and(|(l, r)| j + l < i || j > i + r)
-                            || (m.key_mask && c.key_mask[b * key_mask_stride(s.tk) + j] == 0)
-                            || (m.seg_start && (j as i64) < c.seg_start[b * s.t + i]))
+                    if j >= s.tk {
+                        return j - s.tk >= seen;
+                    }
+                    j >= len
+                        || (m.causal && j > i)
+                        || m.window.is_some_and(|(l, r)| j + l < i || j > i + r)
+                        || chunked(j)
+                        || (m.key_mask && c.key_mask[b * key_mask_stride(s.tk) + j] == 0)
+                        || (m.seg_start && (j as i64) < c.seg_start[b * s.t + i])
                 };
                 let scores: Vec<f64> = (0..keys)
                     .map(|j| {
@@ -161,6 +185,7 @@ fn extra_params(c: &Case) -> Vec<Vec<f64>> {
             "row_map" => ints(&c.row_map),
             "k_app" => c.k_app.clone(),
             "v_app" => c.v_app.clone(),
+            "app_lens" => ints(&c.app_lens),
             "bias" => c.bias.clone(),
             other => unreachable!("{other}"),
         })
@@ -219,13 +244,31 @@ fn masked(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, mask: AttnMask) 
     }
 }
 
-const NONE: AttnMask =
-    AttnMask { causal: false, window: None, key_lens: false, key_mask: false, seg_start: false, bias: None };
+const NONE: AttnMask = AttnMask {
+    causal: false,
+    window: None,
+    chunk: None,
+    key_lens: false,
+    key_mask: false,
+    seg_start: false,
+    bias: None,
+};
 const WINDOW: AttnMask = AttnMask { window: Some((20, 5)), key_lens: true, ..NONE };
 const KEY_MASK: AttnMask = AttnMask { key_mask: true, ..NONE };
 const SEGMENTS: AttnMask = AttnMask { causal: true, seg_start: true, ..NONE };
-const EVERY: AttnMask =
-    AttnMask { causal: true, window: Some((50, 0)), key_lens: true, key_mask: true, seg_start: true, bias: None };
+/// Chunks of 16 with two behind: the block edges fall inside 32- and 64-wide key blocks.
+const CHUNKED: AttnMask = AttnMask { chunk: Some(Chunk { size: 16, left: Some(2) }), key_lens: true, ..NONE };
+/// Chunks of 24 with every earlier one: the edges off the key block grid.
+const CHUNKED_ALL: AttnMask = AttnMask { chunk: Some(Chunk { size: 24, left: None }), ..NONE };
+const EVERY: AttnMask = AttnMask {
+    causal: true,
+    window: Some((50, 0)),
+    chunk: Some(Chunk { size: 32, left: Some(3) }),
+    key_lens: true,
+    key_mask: true,
+    seg_start: true,
+    bias: None,
+};
 const SHARED: AttnMask = AttnMask { bias: Some(Bias::Shared), ..NONE };
 const PER_BATCH: AttnMask = AttnMask { bias: Some(Bias::PerBatch), ..NONE };
 const CAUSAL_BIAS: AttnMask = AttnMask { causal: true, ..PER_BATCH };
@@ -249,6 +292,8 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(masked(128, 128, 64, 64, 32, WINDOW), &[128, 90]; "window with lengths")]
 #[test_case(masked(128, 128, 64, 64, 64, KEY_MASK), &[128, 128]; "key mask")]
 #[test_case(masked(128, 128, 64, 64, 32, SEGMENTS), &[128, 128]; "causal segments")]
+#[test_case(masked(128, 128, 64, 64, 32, CHUNKED), &[128, 90]; "chunks with lengths")]
+#[test_case(masked(100, 100, 64, 64, 64, CHUNKED_ALL), &[100, 100]; "chunks, every earlier one, ragged")]
 #[test_case(masked(128, 128, 64, 64, 32, EVERY), &[128, 100]; "every mask")]
 #[test_case(masked(96, 96, 48, 64, 64, SEGMENTS), &[96, 96]; "d 48")]
 #[test_case(masked(128, 128, 64, 64, 64, PER_BATCH), &[128, 128]; "bias per batch")]
@@ -269,34 +314,46 @@ fn program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     assert!(worst < 2e-2, "max abs diff {worst}");
 }
 
-/// A decoder step: one query row against a cache of several layers' heads,
-/// rows mapped, the step's own key appended after the prefix.
+/// A decoder step: `t` query rows against a cache of several layers' heads,
+/// rows mapped, the step's own `appended` keys after the prefix.
 fn cached(
     t: usize,
     tk: usize,
     [heads, kv_heads, d]: [usize; 3],
     row_map: bool,
-    appended: bool,
+    appended: usize,
     splits: usize,
 ) -> AttnSpec {
     let mut spec = masked(t, tk, d, 64, 32, AttnMask { key_lens: true, ..AttnMask::default() });
     spec.heads = heads;
     spec.kv_heads = kv_heads;
-    spec.cache = Some(Cache { rows: 3, heads_total: 3 * kv_heads, head_start: kv_heads, row_map, appended });
+    let cache = Cache { rows: 3, heads_total: 3 * kv_heads, head_start: kv_heads, row_map, appended, app_lens: false };
+    spec.cache = Some(cache);
     spec.cfg.splits = splits;
     spec
 }
 
-#[test_case(cached(1, 100, [4, 4, 64], false, false, 1), &[100, 37]; "cache slice")]
-#[test_case(cached(1, 100, [4, 2, 64], true, true, 1), &[100, 37]; "row map, appended, gqa")]
-#[test_case(cached(1, 200, [4, 4, 64], true, true, 4), &[200, 70]; "four splits")]
-#[test_case(cached(5, 96, [2, 2, 128], false, true, 2), &[64, 96]; "d 128, two splits, five queries")]
-#[test_case(cached(1, 64, [2, 2, 64], false, false, 4), &[64, 40]; "more splits than blocks for a row")]
-#[test_case(cached(1, 7, [6, 6, 64], false, true, 1), &[0, 7]; "appended row only, one split")]
-#[test_case(cached(1, 7, [6, 6, 64], false, true, 2), &[0, 3]; "appended row only, two splits")]
-#[test_case(biased(cached(1, 100, [4, 2, 64], true, true, 1)), &[100, 37]; "biased: row map, appended, gqa")]
-#[test_case(biased(cached(5, 96, [2, 2, 128], false, true, 2)), &[64, 96]; "biased: d 128, two splits")]
-#[test_case(biased(cached(1, 200, [4, 4, 64], false, false, 4)), &[200, 70]; "biased: four splits")]
+/// `spec` with the visible appended rows counted per batch.
+fn counted(mut spec: AttnSpec) -> AttnSpec {
+    spec.cache = spec.cache.map(|c| Cache { app_lens: true, ..c });
+    spec
+}
+
+#[test_case(cached(1, 100, [4, 4, 64], false, 0, 1), &[100, 37]; "cache slice")]
+#[test_case(cached(1, 100, [4, 2, 64], true, 1, 1), &[100, 37]; "row map, appended, gqa")]
+#[test_case(cached(1, 200, [4, 4, 64], true, 1, 4), &[200, 70]; "four splits")]
+#[test_case(cached(5, 96, [2, 2, 128], false, 1, 2), &[64, 96]; "d 128, two splits, five queries")]
+#[test_case(cached(1, 64, [2, 2, 64], false, 0, 4), &[64, 40]; "more splits than blocks for a row")]
+#[test_case(cached(1, 7, [6, 6, 64], false, 1, 1), &[0, 7]; "appended row only, one split")]
+#[test_case(cached(1, 7, [6, 6, 64], false, 1, 2), &[0, 3]; "appended row only, two splits")]
+#[test_case(cached(8, 128, [4, 4, 48], false, 8, 1), &[128, 40]; "eight queries, eight appended, d 48")]
+#[test_case(cached(16, 128, [2, 2, 64], true, 16, 2), &[128, 0]; "sixteen appended, a block of them, two splits")]
+#[test_case(counted(cached(8, 128, [4, 4, 48], false, 8, 1)), &[128, 40]; "counted appended rows")]
+#[test_case(counted(cached(16, 96, [2, 2, 64], false, 16, 3)), &[0, 96]; "counted appended rows only, three splits")]
+#[test_case(biased(cached(1, 100, [4, 2, 64], true, 1, 1)), &[100, 37]; "biased: row map, appended, gqa")]
+#[test_case(biased(cached(5, 96, [2, 2, 128], false, 1, 2)), &[64, 96]; "biased: d 128, two splits")]
+#[test_case(biased(cached(1, 200, [4, 4, 64], false, 0, 4)), &[200, 70]; "biased: four splits")]
+#[test_case(biased(counted(cached(8, 64, [2, 2, 64], false, 8, 2))), &[64, 20]; "biased: counted appended rows")]
 fn cached_program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     program_matches_a_direct_softmax(spec, lens);
 }
@@ -322,22 +379,26 @@ fn only_the_live_batch_runs() {
 #[test_case(masked(128, 128, 64, 64, 32, WINDOW), &[128, 90]; "window with lengths")]
 #[test_case(masked(100, 100, 64, 64, 64, KEY_MASK), &[100, 100]; "key mask, ragged")]
 #[test_case(masked(128, 128, 64, 64, 32, SEGMENTS), &[128, 128]; "causal segments")]
+#[test_case(masked(128, 128, 64, 64, 32, CHUNKED), &[128, 90]; "chunks with lengths")]
+#[test_case(masked(100, 100, 64, 64, 64, CHUNKED_ALL), &[100, 100]; "chunks, every earlier one, ragged")]
 #[test_case(masked(128, 128, 128, 64, 32, EVERY), &[128, 100]; "every mask, d 128")]
 #[test_case(with(FaCfg::new(64, 64, 3), masked(200, 200, 48, 0, 0, SEGMENTS)), &[200, 200]; "d 48, three stages")]
-#[test_case(cached(1, 100, [4, 2, 64], true, true, 1), &[100, 37]; "cache: row map, appended, gqa")]
-#[test_case(cached(1, 200, [4, 4, 64], true, true, 4), &[200, 70]; "cache: four splits")]
-#[test_case(cached(5, 96, [2, 2, 128], false, true, 2), &[64, 96]; "cache: d 128, two splits")]
-#[test_case(cached(1, 7, [6, 6, 64], false, true, 1), &[0, 7]; "cache: appended row only")]
-#[test_case(cached(1, 7, [6, 6, 64], false, true, 2), &[0, 3]; "cache: appended row only, two splits")]
-#[test_case(with(FaCfg { splits: 3, ..FaCfg::new(16, 64, 2) }, cached(1, 1500, [4, 4, 64], true, false, 1)), &[1500, 1200]; "cache: bq 16, three splits of 1500 keys")]
+#[test_case(cached(1, 100, [4, 2, 64], true, 1, 1), &[100, 37]; "cache: row map, appended, gqa")]
+#[test_case(cached(1, 200, [4, 4, 64], true, 1, 4), &[200, 70]; "cache: four splits")]
+#[test_case(cached(5, 96, [2, 2, 128], false, 1, 2), &[64, 96]; "cache: d 128, two splits")]
+#[test_case(cached(1, 7, [6, 6, 64], false, 1, 1), &[0, 7]; "cache: appended row only")]
+#[test_case(cached(1, 7, [6, 6, 64], false, 1, 2), &[0, 3]; "cache: appended row only, two splits")]
+#[test_case(cached(8, 128, [4, 4, 48], false, 8, 1), &[128, 40]; "cache: eight appended, d 48")]
+#[test_case(counted(cached(16, 128, [2, 2, 64], true, 16, 2)), &[128, 0]; "cache: sixteen counted appended, two splits")]
+#[test_case(with(FaCfg { splits: 3, ..FaCfg::new(16, 64, 2) }, cached(1, 1500, [4, 4, 64], true, 0, 1)), &[1500, 1200]; "cache: bq 16, three splits of 1500 keys")]
 #[test_case(masked(128, 128, 64, 64, 64, PER_BATCH), &[128, 128]; "bias per batch")]
 #[test_case(masked(100, 130, 64, 64, 64, SHARED), &[130, 130]; "shared bias, ragged")]
 #[test_case(masked(256, 256, 64, 64, 64, CAUSAL_BIAS), &[256, 256]; "causal bias")]
 #[test_case(masked(99, 99, 64, 64, 64, LENS_BIAS), &[99, 41]; "bias with key lengths, odd keys")]
 #[test_case(with(FaCfg::new(128, 32, 2), masked(200, 130, 128, 0, 0, LENS_BIAS)), &[130, 99]; "d 128 bias with lengths, bq 128")]
 #[test_case(masked(128, 128, 128, 64, 32, EVERY_BIAS), &[128, 100]; "every mask and a bias, d 128")]
-#[test_case(biased(cached(1, 100, [4, 2, 64], true, true, 1)), &[100, 37]; "cache biased: row map, appended, gqa")]
-#[test_case(biased(cached(5, 96, [2, 2, 128], false, true, 2)), &[64, 96]; "cache biased: d 128, two splits")]
+#[test_case(biased(cached(1, 100, [4, 2, 64], true, 1, 1)), &[100, 37]; "cache biased: row map, appended, gqa")]
+#[test_case(biased(counted(cached(5, 96, [2, 2, 128], false, 8, 2))), &[64, 96]; "cache biased: d 128, eight counted appended, two splits")]
 fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
     let device = default_device();
     let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
@@ -670,12 +731,18 @@ fn decode_throughput_probe() {
 
     let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
     for (name, splits) in [("tuned", None), ("unsplit", Some(1))] {
-        let cache =
-            Cache { head_start: layer * heads, kv_heads: heads, row_map: None, appended: Some((&k_app, &v_app)) };
+        let cache = Cache {
+            head_start: layer * heads,
+            kv_heads: heads,
+            row_map: None,
+            appended: Some((&k_app, &v_app)),
+            app_lens: None,
+        };
         let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, ..Attn::default() };
         let o = tk::attention(&q, &self_k, &self_v, opts).unwrap();
         plans.push((format!("tk3 self {name}"), o.prepare().unwrap()));
-        let cache = Cache { head_start: layer * heads, kv_heads: heads, row_map: Some(&map), appended: None };
+        let cache =
+            Cache { head_start: layer * heads, kv_heads: heads, row_map: Some(&map), appended: None, app_lens: None };
         let o = tk::attention(&q, &cross_k, &cross_v, Attn { cache: Some(cache), splits, ..Attn::default() }).unwrap();
         plans.push((format!("tk3 cross {name}"), o.prepare().unwrap()));
     }
