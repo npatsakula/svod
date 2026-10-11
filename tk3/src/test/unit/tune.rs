@@ -12,7 +12,7 @@ use crate::build::BF16;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::ops::config::Planner;
-use crate::tune::{self, TuneKey, TuneStore, fingerprint};
+use crate::tune::{self, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 fn key(shape: &[usize], candidates: &[usize]) -> TuneKey {
     TuneKey::new("gemm", &sm86(), ScalarDType::BFloat16, shape, &candidates)
@@ -106,6 +106,28 @@ fn keys_are_stable(shape: &[usize], candidates: &[usize], same: bool) {
     assert_eq!(base.line(3) == other.line(3), same);
     assert!(base.line(3).starts_with("gemm|sm_86-28sm|BFloat16|1x704x512x512|"), "{}", base.line(3));
     assert_ne!(base.line(3), base.line(4), "the program fingerprint is part of the line");
+}
+
+/// Two candidates of one shape run on the same scratch buffers, parameter by
+/// parameter; a program's two parameters of one size never alias.
+#[test]
+fn candidates_share_scratch_buffers_without_aliasing_a_program() {
+    let spec = |tile| GemmSpec {
+        m: 256,
+        n: 256,
+        k: 256,
+        batch: Batch::Static(1),
+        epilogue: Epilogue::default(),
+        cfg: GemmCfg { tile, stages: 2, warps: [2, 2], group_m: 8, unroll: true },
+    };
+    let (first, second) = (gemm::<BF16>(&spec([64, 64, 32])), gemm::<BF16>(&spec([128, 64, 32])));
+    let pool = ScratchPool::default();
+    let (a, b) = (pool.buffers(&first.params), pool.buffers(&second.params));
+    let same = |x: &svod_tensor::Tensor, y: &svod_tensor::Tensor| std::sync::Arc::ptr_eq(&x.uop(), &y.uop());
+    assert_eq!(a.len(), 3, "a, b and c");
+    assert!(a.iter().zip(&b).all(|(x, y)| same(x, y)), "the second candidate reuses the first's buffers");
+    assert!(!same(&a[0], &a[1]), "a and b are both [256·256] bf16 yet distinct");
+    assert!(!same(&a[0], &a[2]) && !same(&a[1], &a[2]));
 }
 
 /// `SVOD_TK3_TUNE=0`'s override: off and back on.
