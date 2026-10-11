@@ -26,6 +26,7 @@ mod jit;
 mod model;
 pub(crate) mod remap;
 pub(crate) mod rnnt;
+pub mod stream;
 pub(crate) mod transcribe;
 
 pub(crate) use config::subsampled_len;

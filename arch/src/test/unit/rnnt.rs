@@ -939,3 +939,20 @@ proptest! {
         }
     }
 }
+
+/// Resuming decodes from the lanes' present state: no reset, the same tapes.
+#[test]
+fn resume_batch_blocks_skips_the_reset() {
+    let decoder = decoder_with(abc_vocab(), 10);
+    let blank = decoder.blank_id();
+    let scripts = vec![vec![0, blank, 1, 1, blank, 2], vec![blank, 2, blank, blank, 0, blank]];
+    let valid = vec![6, 5];
+    let mut fresh = MockBatchBlockStep::new(scripts.clone(), valid.clone(), blank, 10, 4, 2);
+    let want = decoder.decode_batch_blocks(&valid, &mut fresh).unwrap();
+    assert_eq!(fresh.resets, 1);
+    let mut resumed = MockBatchBlockStep::new(scripts, valid.clone(), blank, 10, 4, 2);
+    let got = decoder.resume_batch_blocks(&valid, &mut resumed).unwrap();
+    assert_eq!(resumed.resets, 0);
+    assert_eq!(got, want);
+    assert!(!got[0].1.is_empty());
+}

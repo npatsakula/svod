@@ -589,14 +589,39 @@ impl RnntDecoder {
         let b = valid_frames.len();
         let lanes = step.batch();
         assert!(b <= lanes, "decode_batch_blocks: {b} items exceed the backend's {lanes} lanes");
+        if self.vocabulary.is_empty() || valid_frames.iter().all(|&v| v == 0) {
+            return Ok(vec![(String::new(), Vec::new()); b]);
+        }
+        step.reset().map_err(|e| BackendSnafu { frame: 0usize }.into_error(e))?;
+        self.run_blocks(valid_frames, step)
+    }
+
+    /// [`Self::decode_batch_blocks`] from the lanes' present state instead of
+    /// a reset: a chunk of a stream continues where its last chunk stopped,
+    /// the backend having set every lane's frame cursor to the chunk's start.
+    /// Emission frames are relative to the chunk.
+    pub fn resume_batch_blocks<S: BatchBlockStep>(
+        &self,
+        valid_frames: &[usize],
+        step: &mut S,
+    ) -> Result<Vec<LaneDecode>, RnntDecodeError<S::Error>> {
+        let b = valid_frames.len();
+        assert!(b <= step.batch(), "resume_batch_blocks: {b} items exceed the backend's {} lanes", step.batch());
+        if self.vocabulary.is_empty() || valid_frames.iter().all(|&v| v == 0) {
+            return Ok(vec![(String::new(), Vec::new()); b]);
+        }
+        self.run_blocks(valid_frames, step)
+    }
+
+    fn run_blocks<S: BatchBlockStep>(
+        &self,
+        valid_frames: &[usize],
+        step: &mut S,
+    ) -> Result<Vec<LaneDecode>, RnntDecodeError<S::Error>> {
+        let b = valid_frames.len();
         let k = step.block_steps();
         let mut texts = vec![String::new(); b];
         let mut emissions = vec![Vec::new(); b];
-        if self.vocabulary.is_empty() || valid_frames.iter().all(|&v| v == 0) {
-            return Ok(texts.into_iter().zip(emissions).collect());
-        }
-
-        step.reset().map_err(|e| BackendSnafu { frame: 0usize }.into_error(e))?;
         loop {
             let tapes = step.run_block().map_err(|e| BackendSnafu { frame: 0usize }.into_error(e))?;
             for i in 0..b {

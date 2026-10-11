@@ -29,7 +29,7 @@ fn config() -> GigaAmConfig {
 }
 
 /// A model's parameters keyed the way `GigaAm::from_state_dict` loads them.
-fn state_dict(model: &GigaAm) -> StateDict {
+pub(super) fn state_dict(model: &GigaAm) -> StateDict {
     let mut sd = model.encoder.subsampling.state_dict("subsampling");
     for (index, layer) in model.encoder.layers.iter().enumerate() {
         sd.extend(layer.state_dict(&format!("layers.{index}")));

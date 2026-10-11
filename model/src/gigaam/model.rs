@@ -24,7 +24,7 @@ use crate::gigaam::encoder::Encoder;
 use crate::gigaam::error::Error;
 
 use crate::gigaam::rnnt::RnntHead;
-use crate::gigaam::{GigaAmConfig, Result, remap};
+use crate::gigaam::{GigaAmConfig, Result, StreamingConfig, remap};
 use crate::sentencepiece;
 
 fn prepare_scaled_weights(sd: &mut StateDict, dtype: &DType) -> Result<()> {
@@ -152,6 +152,14 @@ impl Head {
 }
 
 impl GigaAm {
+    /// Run the encoder as the streaming variant `streaming` describes (no
+    /// parameters change). A checkpoint fine-tuned for it loads that way by
+    /// itself; the offline weights stream too, at reduced accuracy.
+    pub fn enable_streaming(&mut self, streaming: StreamingConfig) {
+        self.config.streaming = Some(streaming);
+        self.encoder.streaming = Some(streaming);
+    }
+
     /// Recommended soft chunk-target duration (seconds) for this model, or `None`
     /// for greedy fill-to-max. RN-T benefits from the target-split (autoregressive
     /// skip-deletion); CTC (non-autoregressive) does not, so it returns `None`.
