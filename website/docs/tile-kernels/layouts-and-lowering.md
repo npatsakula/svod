@@ -12,9 +12,9 @@ are swizzled. Each kernel config builds its own (`GemmCfg::lowering`, `FaCfg::lo
 
 | Step | Module | Effect |
 |---|---|---|
-| 1. Schedule expansion | `schedule::expand` | Every `Pipeline` becomes loops, branches and explicit `Sync` statements |
-| 2. Operand materialization | `lower` | A shared or global `mma` operand gets an explicit load into a fresh register tile |
-| 3. Barriers | `lower::sync` | Barriers are inserted around author-level shared memory traffic |
+| 1. Operand materialization | `lower` | A shared or global `mma` operand gets an explicit load into a fresh register tile |
+| 2. Barriers | `lower::sync` | Shared-memory effects are fenced: barriers, and a commit and wait before an async copy's tile is used. A `Pipeline` is still one statement, whose template fences its own ring, so the pass fences only where the ring meets the code around it |
+| 3. Schedule expansion | `schedule::expand` | Every `Pipeline` becomes loops, branches and explicit `Sync` statements |
 | 4. Layout inference | `layouts::infer` | Every register tile gets a layout; conflicts get a `Relayout` |
 | 5. Shared orientation | `lower::orient_shared` | A shared allocation is stored along the axis its readers' fragments run along, so a gather is 16-byte loads; only register-staged fills can scatter, so `cp.async` tiles stay row-major. The staged registers of a column-major tile hold column runs straight from a transposing load where the target has one (RDNA4), else are walked down the rows |
 | 6. Emission | `lower/emit.rs` | Statements are emitted in program order into `UOp::linear_program` |

@@ -8,9 +8,9 @@ sidebar_label: 布局与降级
 
 | 步骤 | 模块 | 作用 |
 |---|---|---|
-| 1. 调度展开 | `schedule::expand` | 每个 `Pipeline` 变为循环、分支和显式的 `Sync` 语句 |
-| 2. 操作数物化 | `lower` | 位于共享内存或全局内存的 `mma` 操作数获得一次显式加载，载入新的寄存器 tile |
-| 3. 屏障 | `lower::sync` | 在作者层面的共享内存访问周围插入屏障 |
+| 1. 操作数物化 | `lower` | 位于共享内存或全局内存的 `mma` 操作数获得一次显式加载，载入新的寄存器 tile |
+| 2. 屏障 | `lower::sync` | 对共享内存效果进行同步：插入屏障，并在使用异步拷贝的 tile 之前插入一次提交和等待。此时 `Pipeline` 仍是一条语句，其模板自行同步自己的环形缓冲，因此该 pass 只在环形缓冲与周围代码相接之处同步 |
+| 3. 调度展开 | `schedule::expand` | 每个 `Pipeline` 变为循环、分支和显式的 `Sync` 语句 |
 | 4. 布局推断 | `layouts::infer` | 每个寄存器 tile 获得一个布局；冲突处插入 `Relayout` |
 | 5. 发射 | `lower/emit.rs` | 语句按程序顺序发射到 `UOp::linear_program` 中 |
 

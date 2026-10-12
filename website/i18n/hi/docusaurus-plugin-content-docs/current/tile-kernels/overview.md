@@ -22,7 +22,7 @@ tk3 पुराने `svod-tk` crate (tk1) का उत्तराधिक�
 | Layouts | `layout`, `layouts` | हर fragment और swizzle के लिए F2 linear layouts (bit matrices), जिन्हें inference तय करता है। Kernel code कभी किसी lane का नाम नहीं लेता। |
 | Atoms | `atoms` | हर target के matrix-core instructions जो अपने operand layouts साथ लाते हैं (CUDA पर `mma.sync`)। |
 | Schedule templates | `schedule` | एक `Pipeline` statement को loops, `cp.async` groups और barriers में फैलाते हैं। लेखक सिर्फ़ produce और consume bodies लिखता है। |
-| Lowering | `lower` | Schedule को फैलाता है, effects से barriers डालता है, layouts infer करता है और एक pre-linearized instruction list (`Op::Linear`) emit करता है, ताकि क्रम कोई toposort तय न करे। |
+| Lowering | `lower` | Effects से barriers डालता है, schedule को फैलाता है, layouts infer करता है और एक pre-linearized instruction list (`Op::Linear`) emit करता है, ताकि क्रम कोई toposort तय न करे। |
 | Kernels | `kernels` | Epilogues वाला GEMM, flash attention, attention prologue, LayerNorm/RMSNorm। हर एक में spec struct जाता है और `Program` निकलता है। |
 | Launch | `launch` | किसी program को lazy ग्राफ़ में custom kernel की तरह चलाता है, lowered bodies को memoize करते हुए। |
 | Op layer | `ops` | `linear`, `attention`, `heads`, `layer_norm`, `rms_norm`, … ये हमेशा एक `Tensor` लौटाते हैं: kernel फ़िट हो तो kernel, वरना ग्राफ़। |
@@ -36,7 +36,7 @@ model code ──► svod_tk3::ops          always a Tensor; picks a kernel and 
               kernels::*               spec ─► tile Program (builder, program order)
                    │
                    ▼
-              lower::lower             schedule template ─► operand loads ─► barriers
+              lower::lower             operand loads ─► barriers ─► schedule template
                    │                   ─► layout inference ─► emission
                    ▼
               Op::Linear program  ──►  custom kernel in the lazy graph ─► LLVM ─► device

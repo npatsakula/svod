@@ -1,6 +1,6 @@
-//! From a tile program to a pre-linearized Svod program: expand the schedule
-//! template, give every register tile a layout, then emit the instruction
-//! list in program order.
+//! From a tile program to a pre-linearized Svod program: fence the author's
+//! shared-memory effects, expand the schedule template, give every register
+//! tile a layout, then emit the instruction list in program order.
 
 use std::sync::Arc;
 
@@ -47,9 +47,9 @@ pub struct Lowered {
 /// `params` are the flat buffer UOps in `prog.params` order (placeholders on
 /// the graph path, `UOp::param`s on the direct one).
 pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Lowered> {
-    schedule::expand(&mut prog, lowering.schedule);
     materialize_operands(&mut prog);
     sync::insert_barriers(&mut prog);
+    schedule::expand(&mut prog, lowering.schedule);
     let mut laid = layouts::infer(prog, &lowering.target, lowering.grid).context(LayoutSnafu)?;
     orient_shared(&mut laid, &lowering.target);
     let program = emit::emit(&laid, lowering, params, device)?;
