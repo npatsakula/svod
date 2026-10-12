@@ -134,7 +134,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let (lens, bools) = match opts.keys {
         KeyMask::Lens(lens) => {
             let got = shape(lens)?;
-            ensure!(got.len() == 1, shape_err("key lens", &got, format!("[{}]", qs[0])));
+            ensure!(got == [qs[0].clone()], shape_err("key lens", &got, format!("[{}]", qs[0])));
             (Some(lens), None)
         }
         KeyMask::Bool(mask) => {

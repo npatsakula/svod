@@ -108,9 +108,7 @@ fn reference(c: &Case) -> Vec<f64> {
     let (stride, kv_stride, group) = (s.heads * s.d, cache.heads_total * s.d, s.heads / s.kv_heads);
     let mut out = vec![0.0; s.batch.capacity() * s.t * stride];
     for b in 0..s.batch.capacity() {
-        // An empty lane sees key 0 unless rows are appended, as the kernel does.
-        let floor = usize::from(cache.appended == 0);
-        let len = if m.key_lens { (c.lens[b] as usize).max(floor) } else { s.tk };
+        let len = if m.key_lens { c.lens[b] as usize } else { s.tk };
         let seen = if cache.app_lens { c.app_lens[b] as usize } else { cache.appended };
         let row = if cache.row_map { c.row_map[b] as usize } else { b };
         let keys = keys(s);
@@ -158,6 +156,10 @@ fn reference(c: &Case) -> Vec<f64> {
                     })
                     .collect();
                 let mx = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                // A query no key reaches attends to nothing: zeros, as the graph writes.
+                if mx == f64::NEG_INFINITY {
+                    continue;
+                }
                 let w: Vec<f64> = scores.iter().map(|x| (x - mx).exp()).collect();
                 let l: f64 = w.iter().sum();
                 for dd in 0..s.d {
@@ -301,6 +303,8 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(masked(99, 99, 64, 64, 64, LENS_BIAS), &[99, 41]; "bias with key lengths, odd keys")]
 #[test_case(masked(128, 128, 128, 64, 32, LENS_BIAS), &[128, 70]; "d 128 bias with key lengths")]
 #[test_case(masked(128, 128, 64, 64, 32, EVERY_BIAS), &[128, 100]; "every mask and a bias")]
+#[test_case(spec(128, 128, 64, 64, 64, false, true), &[100, 0]; "a lane with no keys")]
+#[test_case(spec(128, 128, 64, 64, 32, true, true), &[0, 50]; "causal, a lane with no keys")]
 fn program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     let c = case(spec.clone(), lens);
     let got = run(&flash_attention(&spec), params(&c), &[("b", 2)]).unwrap();
@@ -353,8 +357,30 @@ fn counted(mut spec: AttnSpec) -> AttnSpec {
 #[test_case(biased(cached(5, 96, [2, 2, 128], false, 1, 2)), &[64, 96]; "biased: d 128, two splits")]
 #[test_case(biased(cached(1, 200, [4, 4, 64], false, 0, 4)), &[200, 70]; "biased: four splits")]
 #[test_case(biased(counted(cached(8, 64, [2, 2, 64], false, 8, 2))), &[64, 20]; "biased: counted appended rows")]
+#[test_case(cached(1, 100, [4, 4, 64], false, 0, 1), &[100, 0]; "a cached lane with no keys")]
+#[test_case(cached(1, 200, [4, 4, 64], false, 0, 4), &[0, 70]; "a cached lane with no keys, four splits")]
 fn cached_program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     program_matches_a_direct_softmax(spec, lens);
+}
+
+/// A batch whose key mask hides every key attends to nothing: its rows come
+/// out as zeros, as the graph writes them, not as the NaN of an empty
+/// softmax, whole or merged from key splits.
+#[test_case(1; "whole")]
+#[test_case(3; "three splits")]
+fn a_fully_masked_batch_is_zeros(splits: usize) {
+    let spec = masked(128, 128, 64, 64, 32, KEY_MASK);
+    let spec = AttnSpec { cfg: FaCfg { splits, ..spec.cfg }, ..spec };
+    let mut c = case(spec.clone(), &[128, 128]);
+    let stride = key_mask_stride(spec.tk);
+    c.key_mask[stride..].fill(0);
+    let got = run(&flash_attention(&spec), params(&c), &[("b", 2)]).unwrap();
+    let got = output(&c, got, 2);
+    let half = spec.t * spec.heads * spec.d;
+    assert!(got[..half].iter().any(|x| *x != 0.0), "the visible batch attends");
+    assert!(got[half..].iter().all(|x| *x == 0.0), "the hidden batch is zeros");
+    let want = reference(&c);
+    assert!(got.iter().zip(&want).all(|(g, w)| (g - w).abs() < 2e-2));
 }
 
 /// The live batch bound: rows of a batch past it are never written.

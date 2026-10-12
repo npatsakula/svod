@@ -780,11 +780,12 @@ impl<'a> Emit<'a> {
             let c = add(&self.tid, &c32(t * threads));
             let (row, cc) = (c.try_cdiv(&c32(cpr)).expect("row"), c.try_cmod(&c32(cpr)).expect("chunk"));
             let (row, col) = (self.hoist(row), self.hoist(mul(&cc, &c32(chunk))));
-            // Rows past a bound re-read the last valid one; the consumer masks.
+            // Rows past a bound re-read the last valid one (the first, under an
+            // empty bound); the consumer masks.
             let src_row = match bounds[0] {
                 Some(b) => {
                     let bound = self.sc(b);
-                    let last = bound.try_sub(&c32(1)).expect("bound");
+                    let last = bound.try_sub(&c32(1)).expect("bound").try_max(&c32(0)).expect("floor");
                     let over = row.try_cmplt(&last).expect("cmp");
                     self.hoist(UOp::try_where(over, row.clone(), last).expect("clamp"))
                 }
