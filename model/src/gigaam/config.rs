@@ -77,7 +77,8 @@ pub struct GigaAmConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamingConfig {
     pub chunk_size: usize,
-    /// `None` is every earlier chunk: the cache then spans `max_encoder_frames`.
+    /// `None` is every earlier chunk; a stream's cache then spans
+    /// `max_encoder_frames`, past which the oldest fall away.
     pub left_context_chunks: Option<usize>,
     /// 0 or 1.
     pub right_context_chunks: usize,
@@ -96,14 +97,21 @@ impl StreamingConfig {
         self.chunk_size * (1 + self.right_context_chunks)
     }
 
-    fn validate(self) -> Result<Self> {
-        if self.chunk_size == 0 || self.right_context_chunks > 1 {
+    /// The settings an encoder can run: a chunk of at least one frame, at
+    /// least a chunk behind, at most a chunk ahead, and conv1d subsampling,
+    /// the only kind with a causal form.
+    pub(crate) fn validate(self, subsampling: &SubsamplingMode) -> Result<Self> {
+        let sound = self.chunk_size > 0 && self.left_context_chunks != Some(0) && self.right_context_chunks <= 1;
+        if !sound {
             return Err(Error::Streaming {
                 message: format!(
-                    "chunk_size {} must be positive and right_context_chunks {} 0 or 1",
-                    self.chunk_size, self.right_context_chunks
+                    "chunk_size {} must be positive, left_context_chunks {:?} at least one and right_context_chunks {} 0 or 1",
+                    self.chunk_size, self.left_context_chunks, self.right_context_chunks
                 ),
             });
+        }
+        if !matches!(subsampling, SubsamplingMode::Conv1d) {
+            return Err(Error::Streaming { message: "streaming needs conv1d subsampling".into() });
         }
         Ok(self)
     }
@@ -144,9 +152,7 @@ impl GigaAmConfig {
     fn from_raw(raw: RawModelCfg, streaming: Option<StreamingConfig>) -> Result<Self> {
         validate_preprocessor(&raw.preprocessor)?;
         validate_encoder(&raw.encoder)?;
-        if streaming.is_some() && !matches!(raw.encoder.subsampling, SubsamplingMode::Conv1d) {
-            return Err(Error::Streaming { message: "streaming needs conv1d subsampling".into() });
-        }
+        let streaming = streaming.map(|s| s.validate(&raw.encoder.subsampling)).transpose()?;
 
         // `max_mel_frames` is the pre-subsampling sequence-length bound. Configs that
         // only specify `pos_emb_max_len` (the post-subsampling encoder bound) need it
@@ -245,12 +251,11 @@ impl RawStreaming {
             return Ok(None);
         }
         let left_context_chunks = usize::try_from(self.left_context_chunks).ok();
-        let config = StreamingConfig {
+        Ok(Some(StreamingConfig {
             chunk_size: self.chunk_size,
             left_context_chunks,
             right_context_chunks: self.right_context_chunks,
-        };
-        config.validate().map(Some)
+        }))
     }
 }
 
@@ -401,12 +406,15 @@ fn validate_encoder(encoder: &RawEncoder) -> Result<()> {
 /// The single definition behind `StridingSubsampling::output_length`,
 /// `GigaAmConfig` validation and the transcriber's chunk bookkeeping.
 ///
-/// Saturating: a degenerate `mel_frames < kernel_size - 2 * pad` (only
-/// reachable for an empty / sub-frame window) must clamp to 0, not wrap.
+/// No frames give none; a degenerate `mel_frames < kernel_size - 2 * pad`
+/// (a sub-frame window) clamps to one, not wraps.
 pub(crate) fn subsampled_len(kernel_size: usize, mel_frames: usize) -> usize {
     let pad = (kernel_size - 1) / 2;
     let mut len = mel_frames;
     for _ in 0..2 {
+        if len == 0 {
+            return 0;
+        }
         len = len.saturating_add(2 * pad).saturating_sub(kernel_size) / 2 + 1;
     }
     len

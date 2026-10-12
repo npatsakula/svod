@@ -16,6 +16,7 @@ use std::path::Path;
 
 use svod_dtype::DType;
 
+use crate::audio::{MelConfig, MelScale, MelSpectrogram, PadMode};
 use crate::state::{self, StateDict};
 use svod_tensor::nn::Module;
 
@@ -155,9 +156,29 @@ impl GigaAm {
     /// Run the encoder as the streaming variant `streaming` describes (no
     /// parameters change). A checkpoint fine-tuned for it loads that way by
     /// itself; the offline weights stream too, at reduced accuracy.
-    pub fn enable_streaming(&mut self, streaming: StreamingConfig) {
+    pub fn enable_streaming(&mut self, streaming: StreamingConfig) -> Result<()> {
+        let streaming = streaming.validate(&self.config.subsampling_mode)?;
         self.config.streaming = Some(streaming);
         self.encoder.streaming = Some(streaming);
+        Ok(())
+    }
+
+    /// The log-mel front end this model's checkpoint was trained on.
+    pub fn mel_spectrogram(&self) -> MelSpectrogram {
+        let cfg = &self.config;
+        MelSpectrogram::new(&MelConfig {
+            sample_rate: cfg.sample_rate,
+            n_fft: cfg.n_fft,
+            hop_length: cfg.hop_length,
+            win_length: cfg.win_length,
+            n_mels: cfg.n_mels,
+            center: cfg.mel_center,
+            mel_scale: MelScale::Htk,
+            periodic: true,
+            pad_mode: PadMode::Reflect,
+            preemphasis: None,
+            log: MelSpectrogram::LOG,
+        })
     }
 
     /// Recommended soft chunk-target duration (seconds) for this model, or `None`

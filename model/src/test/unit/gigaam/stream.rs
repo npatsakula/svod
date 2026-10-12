@@ -55,9 +55,9 @@ fn ints(values: &[i32]) -> Tensor {
     t
 }
 
-/// Encoder frames of a causal subsampling over `mel_frames` mel frames, none of none.
+/// Encoder frames of a subsampling over `mel_frames` mel frames.
 fn frames_of(mel_frames: usize) -> usize {
-    mel_frames.div_ceil(2).div_ceil(2)
+    crate::gigaam::subsampled_len(5, mel_frames)
 }
 
 /// The whole-sequence forward's frames `[lane][frame][d]`.
@@ -285,7 +285,6 @@ use svod_arch::ctc::{CtcDecoder, GreedyDecoder};
 use svod_arch::rnnt::{RnntDecoder, RnntOpts, TokenEmission};
 use test_case::test_case;
 
-use crate::audio::{MelConfig, MelSpectrogram};
 use crate::gigaam::rnnt::RnntBlockBackend;
 use crate::gigaam::stream::GigaAmStreamer;
 use crate::gigaam::{Head, TransducerConfig};
@@ -314,23 +313,6 @@ fn head_config(rnnt: bool, streaming: StreamingConfig) -> GigaAmConfig {
     cfg
 }
 
-fn mel_of(model: &GigaAm) -> MelSpectrogram {
-    let cfg = &model.config;
-    MelSpectrogram::new(&MelConfig {
-        sample_rate: cfg.sample_rate,
-        n_fft: cfg.n_fft,
-        hop_length: cfg.hop_length,
-        win_length: cfg.win_length,
-        n_mels: cfg.n_mels,
-        center: cfg.mel_center,
-        mel_scale: crate::audio::MelScale::Htk,
-        periodic: true,
-        pad_mode: crate::audio::PadMode::Reflect,
-        preemphasis: None,
-        log: MelSpectrogram::LOG,
-    })
-}
-
 fn waveform(seed: u32, samples: usize) -> Vec<f32> {
     let mut state = seed.wrapping_mul(2654435761).wrapping_add(12345);
     (0..samples)
@@ -344,7 +326,7 @@ fn waveform(seed: u32, samples: usize) -> Vec<f32> {
 /// The whole-sequence pipeline over one waveform: mel, the streaming
 /// encoder's forward, and the head's greedy decode.
 fn offline_emissions(model: &GigaAm, wave: &[f32]) -> Vec<TokenEmission> {
-    let mel = mel_of(model);
+    let mel = model.mel_spectrogram();
     let frames = mel.num_frames(wave.len());
     let mut framed = vec![0.0; mel.frames_len(frames)];
     mel.frame_into(wave, &mut framed);
@@ -400,7 +382,7 @@ fn streams_decode_like_the_whole_sequence(rnnt: bool, right_context_chunks: usiz
     let waves = [waveform(1, 16000 * 2 + 777), waveform(2, 16000 + 1234)];
     let (model, want_a) = emitting_model(&cfg, &waves[0]);
     let want_b = offline_emissions(&model, &waves[1]);
-    let mut streamer = GigaAmStreamer::new(model, 2).expect("streamer");
+    let mut streamer = GigaAmStreamer::new(model.clone(), 2).expect("streamer");
     assert_eq!(streamer.free_lanes(), 2);
 
     let a = streamer.open().unwrap().unwrap();
@@ -449,8 +431,42 @@ fn streams_decode_like_the_whole_sequence(rnnt: bool, right_context_chunks: usiz
     let c = streamer.open().unwrap().unwrap();
     streamer.push(c, &waves[1]).unwrap();
     streamer.finish(c).unwrap();
-    let again: Vec<TokenEmission> = streamer.step().unwrap().into_iter().flat_map(|e| e.emissions).collect();
+    let events = streamer.step().unwrap();
+    let again: Vec<TokenEmission> = events.iter().flat_map(|e| e.emissions.iter().cloned()).collect();
     assert_eq!(again, want_b, "a reused lane");
+    assert!(events.last().is_some_and(|e| e.transcript.is_some()), "closed with its transcript");
+
+    // Audio ending exactly on a chunk boundary leaves nothing to feed after
+    // `finish`, and the stream still closes.
+    let mel = model.mel_spectrogram();
+    let exact = &waves[0][..mel.frames_len(5 * MEL_CHUNK)];
+    let want = offline_emissions(&model, exact);
+    let d = streamer.open().unwrap().unwrap();
+    streamer.push(d, exact).unwrap();
+    let before: Vec<TokenEmission> = streamer.step().unwrap().into_iter().flat_map(|e| e.emissions).collect();
+    streamer.finish(d).unwrap();
+    let closing = streamer.step().unwrap();
+    let after: Vec<TokenEmission> = closing.iter().flat_map(|e| e.emissions.iter().cloned()).collect();
+    assert_eq!([before, after].concat(), want, "a stream cut at a chunk boundary");
+    assert!(closing.iter().any(|e| e.id == d && e.transcript.is_some()), "closed after finish");
+    assert_eq!(streamer.free_lanes(), 2);
+}
+
+/// The settings the public API takes are the ones a checkpoint may carry.
+#[test]
+fn streaming_settings_are_validated() {
+    let mut model = GigaAm::with_random_weights(super::super::batch::test_config());
+    let good = StreamingConfig { chunk_size: CHUNK, left_context_chunks: Some(2), right_context_chunks: 1 };
+    assert!(model.enable_streaming(good).is_ok());
+    for bad in [
+        StreamingConfig { chunk_size: 0, ..good },
+        StreamingConfig { left_context_chunks: Some(0), ..good },
+        StreamingConfig { right_context_chunks: 2, ..good },
+    ] {
+        assert!(model.enable_streaming(bad).is_err(), "{bad:?}");
+    }
+    assert_eq!(model.config.streaming, Some(good), "a rejected setting changes nothing");
+    assert!(GigaAmStreamer::new(GigaAm::with_random_weights(super::super::batch::test_config()), 1).is_err());
 }
 
 /// On a GPU the chunk step runs the tile kernels at the model's head size:
