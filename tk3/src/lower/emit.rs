@@ -726,11 +726,10 @@ impl<'a> Emit<'a> {
                 self.last.clone().barrier(smallvec![]).rtag(Some(smallvec![tag as usize]))
             }
             Sync::Barrier { role: Some(_) } => return UnsupportedSnafu { what: "role barriers" }.fail(),
-            Sync::CommitAsync if cuda => cp_async_commit(smallvec![]),
-            Sync::WaitAsync { pending } if cuda => cp_async_wait(pending, smallvec![]),
-            Sync::CommitAsync | Sync::WaitAsync { .. } => {
-                return UnsupportedSnafu { what: "async copies off CUDA" }.fail();
-            }
+            Sync::CommitAsync if cuda && self.low.target.cp_async => cp_async_commit(smallvec![]),
+            Sync::WaitAsync { pending } if cuda && self.low.target.cp_async => cp_async_wait(pending, smallvec![]),
+            // Without `cp.async` the copies were synchronous: nothing to wait for.
+            Sync::CommitAsync | Sync::WaitAsync { .. } => return Ok(()),
             Sync::Fence if self.low.target.commit_fence => UOp::custom(
                 smallvec![self.last.clone()],
                 "declare void @llvm.amdgcn.sched.barrier(i32)\ncall void @llvm.amdgcn.sched.barrier(i32 0)".to_string(),
