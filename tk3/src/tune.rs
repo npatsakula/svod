@@ -20,6 +20,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use svod_dtype::ScalarDType;
+use svod_dtype::default_device::{default_device, with_default_device};
 use svod_runtime::ExecutionPlan;
 use svod_runtime::benchmark::round_robin_min;
 use svod_tensor::Tensor;
@@ -179,16 +180,14 @@ impl TuneStore {
 
 /// Each candidate's best device time in ns, its programs' summed, on scratch
 /// buffers at capacity (every runtime variable bound to its maximum); `None`
-/// where one fails. The programs compile in parallel; the device runs them
-/// one at a time.
+/// where one fails. The programs compile in parallel, on workers carrying
+/// the caller's default device and origin scope; the device runs them one
+/// at a time.
 pub fn measure(candidates: impl IntoIterator<Item = Candidate>) -> Vec<Option<u64>> {
-    use rayon::prelude::*;
     let candidates: Vec<Candidate> = candidates.into_iter().collect();
     let pool = ScratchPool::default();
-    let compiled: Vec<Option<Vec<Scratch>>> = candidates
-        .into_par_iter()
-        .map(|programs| programs.into_iter().map(|(p, l)| scratch_plan(p, &l, &pool)).collect())
-        .collect();
+    let compiled: Vec<Option<Vec<Scratch>>> =
+        in_parallel(candidates, |programs| programs.into_iter().map(|(p, l)| scratch_plan(p, &l, &pool)).collect());
     let plans: Vec<Option<Vec<ExecutionPlan>>> = compiled
         .into_iter()
         .map(|plans| {
@@ -210,7 +209,7 @@ pub fn measure(candidates: impl IntoIterator<Item = Candidate>) -> Vec<Option<u6
             .iter()
             .map(|plan| {
                 spin(plan, SUSTAIN);
-                (0..RUNS).map(|_| run(plan)).min().flatten()
+                best((0..RUNS).map(|_| run(plan)))
             })
             .sum::<Option<Duration>>()
     };
@@ -260,6 +259,29 @@ fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPool) -> Optio
 fn spin(plan: &ExecutionPlan, budget: Duration) {
     let start = std::time::Instant::now();
     while start.elapsed() < budget && plan.execute().is_ok() {}
+}
+
+/// `f` over `items` on the rayon pool, each worker running under the
+/// caller's default device and origin scope (both per thread), so what it
+/// builds is what the caller would have built.
+pub(crate) fn in_parallel<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    use rayon::prelude::*;
+    let (device, origin, capture) = (default_device(), svod_ir::origin::current(), svod_ir::origin::enabled());
+    items
+        .into_par_iter()
+        .map(|item| {
+            with_default_device(device.clone(), || {
+                let _capture = svod_ir::origin::capture_for_thread(capture);
+                let _scope = svod_ir::origin::install(origin);
+                f(item)
+            })
+        })
+        .collect()
+}
+
+/// The fastest of the runs that were timed; `None` only when none was.
+pub(crate) fn best(runs: impl Iterator<Item = Option<Duration>>) -> Option<Duration> {
+    runs.flatten().min()
 }
 
 /// One run's longest kernel; `None` when the device stamps no times.
