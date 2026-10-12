@@ -570,13 +570,17 @@ impl CudaDevice {
         self.record_cuda_producer(base, token, writes);
     }
 
-    /// The newer token of a lane implies its older ones, so it inherits
-    /// their write until it retires.
+    /// The newer token of a lane implies its older ones, so it inherits an
+    /// older write still in flight; a retired write is over, and read-only
+    /// work after it no longer holds other lanes.
     fn record_cuda_producer(&self, base: u64, token: &CudaCompletionToken, writes: bool) {
         let mut producers = self.producers.lock();
         let tokens = producers.entry(base).or_default();
         match tokens.iter_mut().find(|earlier| earlier.token.lane() == token.lane()) {
-            Some(slot) => *slot = Producer { token: token.clone(), writes: writes || slot.writes },
+            Some(slot) => {
+                let inherited = slot.writes && !slot.token.retired();
+                *slot = Producer { token: token.clone(), writes: writes || inherited };
+            }
             None => tokens.push(Producer { token: token.clone(), writes }),
         }
         if tokens.len() > PRUNE_PRODUCERS_ABOVE {
@@ -587,6 +591,11 @@ impl CudaDevice {
     #[cfg(test)]
     pub(crate) fn producer_count(&self, base: u64) -> Option<usize> {
         self.producers.lock().get(&base).map(|tokens| tokens.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn producer_writes(&self, base: u64, lane: u64) -> Option<bool> {
+        self.producers.lock().get(&base)?.iter().find(|p| p.token.lane() == lane).map(|p| p.writes)
     }
 
     fn live_lanes(&self) -> Vec<Arc<Lane>> {

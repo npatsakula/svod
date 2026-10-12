@@ -514,3 +514,24 @@ fn a_graph_replay_is_ordered_after_the_writer_of_its_input() {
     token.published();
     assert_eq!(read(&out), doubled(&doubled(&input)));
 }
+
+/// A lane's newer token inherits its older write only while that write is in
+/// flight: read-only work after a retired write holds no other lane.
+#[test]
+fn a_retired_write_is_not_inherited() {
+    let Some(slow) = Slow::new() else { return };
+    let (input, out) = (upload(&slow.alloc, &values(1.0)), upload(&slow.alloc, &vec![0.0; N]));
+    let ctx = slow.ctx();
+    slow.dispatch(&ctx, &out, &input, 0);
+    let written = ctx.completion_token().expect("a token");
+    slow.dev().record_producer(base(&out), &written, true);
+    written.published();
+    written.wait(u64::MAX).unwrap();
+    assert!(written.retired());
+    slow.dispatch(&ctx, &input, &out, 0);
+    let read = ctx.completion_token().expect("a token");
+    slow.dev().record_producer(base(&out), &read, false);
+    read.published();
+    let lane = (read.as_ref() as &dyn std::any::Any).downcast_ref::<crate::cuda::CudaCompletionToken>().unwrap().lane();
+    assert_eq!(slow.dev().producer_writes(base(&out), lane), Some(false), "the retired write is not inherited");
+}
