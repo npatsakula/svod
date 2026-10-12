@@ -348,6 +348,11 @@ impl Kernel {
         self.let_(shape, TileOp::Binary { a: a.0, b: b.0, f })
     }
 
+    /// `a · factor` (see [`BinaryOp::Scale`]).
+    pub fn scale<T: Elem>(&mut self, a: Regs<T>, factor: Regs<T>) -> Regs<T> {
+        self.binary(a, factor, BinaryOp::Scale)
+    }
+
     pub fn compare<T: Elem>(&mut self, a: Regs<T>, b: Regs<T>, f: BinaryOp) -> Regs<Bool> {
         assert!(matches!(f, BinaryOp::Lt | BinaryOp::Le | BinaryOp::Eq | BinaryOp::Ne), "a comparison");
         let shape = self.broadcast_shape(a.0, b.0);
@@ -370,7 +375,14 @@ impl Kernel {
 
     pub fn cast<T: Elem, U: Elem>(&mut self, src: Regs<T>) -> Regs<U> {
         let shape = self.shape(src);
-        self.let_(shape, TileOp::Cast { src: src.0, to: U::DTYPE })
+        self.let_(shape, TileOp::Cast { src: src.0, to: U::DTYPE, round: Round::Nearest })
+    }
+
+    /// [`Self::cast`] rounding toward zero: f32 to bf16 only.
+    pub fn cast_toward_zero<U: Elem>(&mut self, src: Regs<F32>) -> Regs<U> {
+        assert_eq!(U::DTYPE, ScalarDType::BFloat16, "a truncating cast is f32 to bf16");
+        let shape = self.shape(src);
+        self.let_(shape, TileOp::Cast { src: src.0, to: U::DTYPE, round: Round::Zero })
     }
 
     /// `acc + A·B` where `A` is `[m, k]` (or `[k, m]` when `a_t`) and `B` is

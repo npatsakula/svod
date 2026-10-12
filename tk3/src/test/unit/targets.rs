@@ -504,6 +504,18 @@ fn column_major_tiles_fill_by_transposing_loads(target: Target, transposing: boo
     assert!(!render(prog, &lowering).contains("global.load.tr"), "a row-major fill stays a chunk copy");
 }
 
+/// On AMD the softmax's `exp2` is the hardware `v_exp_f32` alone, with no
+/// denormal range reduction around it; other targets keep `llvm.exp2`.
+#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
+#[test_case(crate::atoms::sm86(), false; "sm_86")]
+fn attention_exponentials_are_the_hardware_ones_on_amd(target: Target, raw: bool) {
+    let (name, prog, lowering) =
+        families(&target).into_iter().find(|(n, ..)| n.starts_with("attention d128")).expect("an attention family");
+    let ir = render(prog, &lowering);
+    assert_eq!(ir.contains("@llvm.amdgcn.exp2.f32("), raw, "{name}");
+    assert_eq!(ir.contains("@llvm.exp2.f32("), !raw, "{name}");
+}
+
 /// `Sync::Fence` statements in `block`, recursively.
 fn fences(block: &crate::ir::Block) -> usize {
     use crate::ir::{Stmt, Sync};

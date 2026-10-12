@@ -109,3 +109,47 @@ proptest! {
         }
     }
 }
+
+/// A cast toward zero keeps an f32's upper 16 bits; the default cast rounds
+/// to nearest, ties to even.
+#[test_case(1.0 + 3.0 / 512.0, 1.0 + 1.0 / 128.0, 1.0; "a quarter ulp above a half rounds up, truncates down")]
+#[test_case(-(1.0 + 3.0 / 512.0), -(1.0 + 1.0 / 128.0), -1.0; "toward zero from below too")]
+#[test_case(0.5, 0.5, 0.5; "representable values stay")]
+#[test_case(0.0, 0.0, 0.0; "zero")]
+fn a_truncating_cast_keeps_the_upper_half(x: f64, nearest: f64, toward_zero: f64) {
+    let mut k = Kernel::new("casts");
+    let src = k.param::<F32>("x", ParamKind::In, 1);
+    let near = k.param::<BF16>("nearest", ParamKind::Out, 1);
+    let zero = k.param::<BF16>("toward_zero", ParamKind::Out, 1);
+    let v = k.view(src, 0, [1, 1], Shape::new(1, 1), [None, None]);
+    let v = k.load(v);
+    let (a, b) = (k.cast::<F32, BF16>(v), k.cast_toward_zero::<BF16>(v));
+    let oa = k.view(near, 0, [1, 1], Shape::new(1, 1), [None, None]);
+    let ob = k.view(zero, 0, [1, 1], Shape::new(1, 1), [None, None]);
+    k.store(oa, a);
+    k.store(ob, b);
+    let out = run(&k.finish(), vec![vec![x], vec![0.0], vec![0.0]], &[]).unwrap();
+    assert_eq!((out[1][0], out[2][0]), (nearest, toward_zero));
+}
+
+/// `scale` is a product whatever its factors: ones (which the lowering may
+/// skip) and others alike.
+#[test]
+fn scale_is_a_product() {
+    let (rows, cols) = (4usize, 8usize);
+    let mut k = Kernel::new("scale");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let f = k.param::<F32>("f", ParamKind::In, rows);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let fv = k.view(f, 0, [1, 1], Shape::new(rows, 1), [None, None]);
+    let (xr, fr) = (k.load(xv), k.load(fv));
+    let out = k.scale(xr, fr);
+    let yv = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    k.store(yv, out);
+    let xs: Vec<f64> = (0..rows * cols).map(|i| i as f64 - 7.5).collect();
+    let fs = vec![1.0, 0.5, 1.0, -2.0];
+    let got = run(&k.finish(), vec![xs.clone(), fs.clone(), vec![0.0; rows * cols]], &[]).unwrap();
+    let want: Vec<f64> = xs.iter().enumerate().map(|(i, x)| x * fs[i / cols]).collect();
+    assert_eq!(got[2], want);
+}

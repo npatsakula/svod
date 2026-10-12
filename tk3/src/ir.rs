@@ -196,6 +196,11 @@ pub enum BinaryOp {
     Add,
     Sub,
     Mul,
+    /// `a · b`, exactly as [`BinaryOp::Mul`]; the lowering skips the
+    /// multiplies of a thread whose factors in `b` are all exactly 1, so an
+    /// update that rarely applies (rescaling an accumulator) costs a compare
+    /// where it does not.
+    Scale,
     Div,
     Max,
     Min,
@@ -235,6 +240,7 @@ pub enum TileOp {
     Cast {
         src: ValId,
         to: ScalarDType,
+        round: Round,
     },
     /// `acc + A·B`, with `A` read transposed when `a_t` (an `[k, m]` tile) and
     /// `B` read transposed when `b_t` (an `[n, k]` tile). `orient` is which
@@ -434,6 +440,16 @@ pub struct Var {
     pub name: String,
     pub min: i64,
     pub max: i64,
+}
+
+/// How a cast to a narrower float rounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Round {
+    /// To the nearest value, ties to even.
+    Nearest,
+    /// Toward zero: f32 → bf16 keeps the upper half of the bits, one
+    /// instruction per pair where the target has no bf16 convert.
+    Zero,
 }
 
 /// Which way round a product is issued. `C = A·B` and its transpose
