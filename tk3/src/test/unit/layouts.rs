@@ -180,3 +180,46 @@ fn chunked_layouts_cover_their_tile_in_16_byte_runs(
         }
     }
 }
+
+/// Elementwise ops whose operands are held otherwise than their result: two
+/// a product holds as its A and B fragments, and a sum whose result a later
+/// product takes as its B while one of its operands is another's A. The operands are re-held, so each op
+/// reads them in its result's layout.
+#[test]
+fn elementwise_operands_reach_the_op_in_its_layout() {
+    let mut k = Kernel::new("mixed");
+    k.warps(1);
+    let x = k.param::<BF16>("x", ParamKind::In, 256);
+    let y = k.param::<BF16>("y", ParamKind::In, 256);
+    let view = |k: &mut Kernel, p| k.view(p, 0, [16, 1], Shape::new(16, 16), [None, None]);
+    let (xg, yg) = (view(&mut k, x), view(&mut k, y));
+    let (xr, yr) = (k.load(xg), k.load(yg));
+    let acc = k.zeros::<F32>(Shape::new(16, 16));
+    let prod = k.mma(acc, xr, false, yr, false);
+    let sum = k.binary(xr, yr, BinaryOp::Add);
+    let sum = k.cast::<BF16, F32>(sum);
+    let both = k.binary(prod, sum, BinaryOp::Mul);
+    // Laid only by what follows: the sum as a B operand, `u` as an A one.
+    let z = k.param::<BF16>("z", ParamKind::In, 512);
+    let (ug, wg) = (view(&mut k, z), k.view(z, 256, [16, 1], Shape::new(16, 16), [None, None]));
+    let (u, w) = (k.load(ug), k.load(wg));
+    let uw = k.binary(u, w, BinaryOp::Add);
+    let acc = k.zeros::<F32>(Shape::new(16, 16));
+    let first = k.mma(acc, u, false, yr, false);
+    let again = k.mma(first, xr, false, uw, false);
+    let both = k.binary(both, again, BinaryOp::Add);
+    let out = k.param::<F32>("o", ParamKind::Out, 256);
+    let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
+    k.store(o, both);
+    let Laid { prog, layouts } = infer(k.finish(), &sm86(), WarpGrid { rows: 1, cols: 1 }).unwrap();
+    let lay = |v: &ValId| layouts[v.index()].clone().unwrap();
+    let mut checked = 0;
+    for (_, s) in prog.walk() {
+        if let Stmt::Let { dst, op: TileOp::Binary { a, b, .. } } = s {
+            assert_eq!((lay(a), lay(b)), (lay(dst), lay(dst)), "{s:?}");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 4);
+    assert!(prog.walk().any(|(_, s)| matches!(s, Stmt::Let { op: TileOp::Relayout { .. }, .. })), "one re-held");
+}
