@@ -281,6 +281,10 @@ fn biased(spec: AttnSpec) -> AttnSpec {
     AttnSpec { mask: AttnMask { bias: Some(Bias::PerBatch), ..spec.mask }, ..spec }
 }
 
+/// The RDNA prefill forms: truncated probabilities, the rescale skipped and
+/// the maximum in raw units, on a 64×32 tile.
+const RAW_MAX: FaCfg = FaCfg { truncate_p: true, skip_rescale: true, raw_max: true, ..FaCfg::new(64, 32, 2) };
+
 /// A scale of the caller's choosing, in place of `1/√d`.
 fn scaled(mut spec: AttnSpec, scale: f32) -> AttnSpec {
     spec.scale = scale;
@@ -312,7 +316,10 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(spec(128, 128, 64, 64, 64, false, true), &[100, 0]; "a lane with no keys")]
 #[test_case(spec(128, 128, 64, 64, 32, true, true), &[0, 50]; "causal, a lane with no keys")]
 #[test_case(scaled(spec(128, 128, 64, 64, 32, true, true), 0.3), &[128, 50]; "a larger scale")]
-#[test_case(scaled(spec(128, 128, 64, 64, 32, true, true), -0.1), &[128, 50]; "a negative scale runs the maximum in the exponent's units")]
+#[test_case(with(RAW_MAX, spec(128, 128, 64, 64, 32, true, true)), &[128, 50]; "the maximum in raw units")]
+#[test_case(with(RAW_MAX, scaled(spec(128, 128, 64, 64, 32, true, true), 0.3)), &[128, 50]; "the maximum in raw units, a larger scale")]
+#[test_case(with(RAW_MAX, scaled(spec(128, 128, 64, 64, 32, true, true), -0.1)), &[128, 50]; "a negative scale keeps the maximum in the exponent's units")]
+#[test_case(with(RAW_MAX, masked(128, 128, 64, 64, 32, EVERY_BIAS)), &[128, 100]; "a bias keeps the maximum in the exponent's units")]
 fn program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     let c = case(spec.clone(), lens);
     let got = run(&flash_attention(&spec), params(&c), &[("b", 2)]).unwrap();
@@ -368,6 +375,8 @@ fn counted(mut spec: AttnSpec) -> AttnSpec {
 #[test_case(cached(1, 100, [4, 4, 64], false, 0, 1), &[100, 0]; "a cached lane with no keys")]
 #[test_case(cached(1, 200, [4, 4, 64], false, 0, 4), &[0, 70]; "a cached lane with no keys, four splits")]
 #[test_case(scaled(cached(1, 200, [4, 4, 64], true, 1, 4), -0.1), &[200, 70]; "four splits merge a negative scale's partial maxima")]
+#[test_case(with(RAW_MAX, cached(1, 200, [4, 4, 64], true, 1, 4)), &[200, 70]; "four splits merge raw partial maxima in the exponent's units")]
+#[test_case(with(RAW_MAX, biased(cached(5, 96, [2, 2, 128], false, 1, 2))), &[64, 96]; "biased, two splits: the maximum stays in the exponent's units")]
 fn cached_program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     program_matches_a_direct_softmax(spec, lens);
 }
@@ -408,7 +417,7 @@ fn only_the_live_batch_runs() {
 #[test_case(spec(256, 256, 64, 64, 64, true, false), &[256, 256]; "causal")]
 #[test_case(spec(128, 256, 64, 64, 64, false, true), &[200, 33]; "key lengths")]
 #[test_case(spec(128, 128, 128, 64, 32, true, true), &[128, 64]; "d 128, causal with lengths")]
-#[test_case(with(FaCfg { truncate_p: true, skip_rescale: true, ..FaCfg::new(64, 32, 2) }, spec(128, 128, 128, 0, 0, true, true)), &[128, 64]; "d 128, truncated probabilities, skipped rescale")]
+#[test_case(with(RAW_MAX, spec(128, 128, 128, 0, 0, true, true)), &[128, 64]; "d 128, the RDNA prefill forms")]
 #[test_case(with(FaCfg::new(128, 64, 3), spec(256, 192, 64, 0, 0, true, true)), &[192, 70]; "bq 128, three stages")]
 #[test_case(with(FaCfg::new(128, 32, 2), spec(200, 130, 128, 0, 0, false, true)), &[130, 99]; "d 128, bq 128, ragged")]
 #[test_case(masked(128, 128, 64, 64, 32, WINDOW), &[128, 90]; "window with lengths")]

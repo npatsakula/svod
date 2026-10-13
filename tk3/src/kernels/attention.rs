@@ -29,11 +29,17 @@ pub struct FaCfg {
     /// branch by every wave whose rows all kept their maximum, which under the
     /// lazy rescale is most of them. Else a plain multiply.
     pub skip_rescale: bool,
+    /// The running maximum is kept in the raw scores' units (a positive scale
+    /// commutes with the maximum, so without a bias the raw scores are
+    /// reduced and the maximum alone is scaled, a multiply per row rather
+    /// than per score), at the price of a multiply on the step's dependent
+    /// chain. Else the scores are scaled first.
+    pub raw_max: bool,
 }
 
 impl FaCfg {
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
-        Self { bq, bkv, stages, splits: 1, unroll: false, truncate_p: false, skip_rescale: false }
+        Self { bq, bkv, stages, splits: 1, unroll: false, truncate_p: false, skip_rescale: false, raw_max: false }
     }
 
     /// One warp per 16 query rows: row reductions stay within a warp.
@@ -197,11 +203,11 @@ struct Step<'a, T> {
 }
 
 impl<T> Step<'_, T> {
-    /// Whether the running maximum is kept in the raw scores' units: a
-    /// positive scale commutes with the maximum, and without a bias nothing
-    /// joins the scores before it.
+    /// Whether the running maximum is kept in the raw scores' units: the
+    /// planned form, where a positive scale commutes with the maximum and no
+    /// bias joins the scores before it.
     fn raw_max(&self) -> bool {
-        self.bias.is_none() && self.scale_log2e > 0.0
+        self.cfg.raw_max && self.bias.is_none() && self.scale_log2e > 0.0
     }
 }
 
@@ -224,9 +230,10 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let rows = k.shape(m);
     // With the maximum in raw units the raw scores are masked and reduced,
     // and the scale reaches only the two row values the exponent and the
-    // correction take (a multiply per row rather than per score): the
-    // exponent's `s·scale − m·scale` is one fma per score. A bias joins the
-    // scaled scores before the mask, so with one the scores are scaled first.
+    // correction take: the exponent's `s·scale − m·scale` is one fma per
+    // score. Else the scores are scaled first (which also leaves them
+    // canonical for the compiler, sparing the quieting of a matrix core's
+    // results before `maxnum`), and a bias joins them before the mask.
     let (s, block_max) = if st.raw_max() {
         let s = (st.mask)(k, s, block_start);
         let block_max = k.reduce(s, Axis::Row, ReduceOp::Max);

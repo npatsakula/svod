@@ -333,23 +333,24 @@ fn attention_candidates(d: usize, smem: usize, measured: (usize, usize)) {
 }
 
 /// The softmax forms follow the target: probabilities are truncated where a
-/// bf16 rounding is several instructions, and the rescale is skipped where
-/// the matrix cores share the vector ALUs (RDNA) or, beside them, where a
-/// full tile's lane holds 64 output registers (sm_86: `d = 128` prefill;
-/// `d = 64` and a decoder step's row multiply).
-#[test_case(sm86(), 128, 512, (false, true); "sm_86 d 128 prefill")]
-#[test_case(sm86(), 64, 512, (false, false); "sm_86 d 64 prefill")]
-#[test_case(sm86(), 128, 1, (false, false); "sm_86 d 128 decode")]
-#[test_case(amd(AmdArch::Gfx1201, 64), 128, 512, (true, true); "gfx1201 d 128 prefill")]
-#[test_case(amd(AmdArch::Gfx1201, 64), 64, 1, (true, true); "gfx1201 d 64 decode")]
-#[test_case(amd(AmdArch::Gfx942, 304), 128, 512, (true, false); "gfx942 d 128: 32 output registers a lane")]
-#[test_case(amd(AmdArch::Gfx950, 256), 64, 512, (false, false); "gfx950 rounds a pair at once")]
-fn attention_forms_follow_the_target(target: Target, d: usize, t: usize, (truncate_p, skip_rescale): (bool, bool)) {
-    assert_eq!(target.bf16_cvt, !truncate_p);
+/// bf16 rounding is several instructions; the rescale is skipped where the
+/// matrix cores share the vector ALUs (RDNA) or, beside them, where a full
+/// tile's lane holds 64 output registers (sm_86: `d = 128` prefill; `d = 64`
+/// and a decoder step's row multiply); the maximum runs in raw units on RDNA
+/// tiles full of queries, a decoder step's one wave scaling first.
+#[test_case(sm86(), 128, 512, (false, true, false); "sm_86 d 128 prefill")]
+#[test_case(sm86(), 64, 512, (false, false, false); "sm_86 d 64 prefill")]
+#[test_case(sm86(), 128, 1, (false, false, false); "sm_86 d 128 decode")]
+#[test_case(amd(AmdArch::Gfx1201, 64), 128, 512, (true, true, true); "gfx1201 d 128 prefill")]
+#[test_case(amd(AmdArch::Gfx1201, 64), 64, 1, (true, true, false); "gfx1201 d 64 decode")]
+#[test_case(amd(AmdArch::Gfx942, 304), 128, 512, (true, false, false); "gfx942 d 128: 32 output registers a lane")]
+#[test_case(amd(AmdArch::Gfx950, 256), 64, 512, (false, false, false); "gfx950 rounds a pair at once")]
+fn attention_forms_follow_the_target(target: Target, d: usize, t: usize, forms: (bool, bool, bool)) {
+    assert_eq!(target.bf16_cvt, !forms.0);
     let list = Planner::new(target).attention_candidates(8, t, 1500, d, false);
     assert!(!list.is_empty());
     for c in &list {
-        assert_eq!((c.truncate_p, c.skip_rescale), (truncate_p, skip_rescale), "{c:?}");
+        assert_eq!((c.truncate_p, c.skip_rescale, c.raw_max), forms, "{c:?}");
     }
 }
 
