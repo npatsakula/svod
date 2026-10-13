@@ -74,6 +74,9 @@ pub struct Target {
     /// Transposing 16-byte loads of 16×16 b16 blocks from global memory, a
     /// column run per lane (`global_load_tr_b128`): RDNA4.
     pub tr_load: bool,
+    /// A bf16 pair's dot product accumulated in f32 (`v_dot2_f32_bf16`):
+    /// RDNA3 on, and gfx950.
+    pub dot2_bf16: bool,
     /// Shared memory a block may use without special launch attributes.
     pub smem_bytes: usize,
     /// Streaming multiprocessors (compute units), when the device reports them.
@@ -113,6 +116,7 @@ impl Target {
         };
         let mma_on_valu = matches!(arch, GpuArch::Amd(a) if !a.is_cdna());
         let tr_load = matches!(arch, GpuArch::Amd(a) if a.is_rdna4() && wave == 32);
+        let dot2_bf16 = matches!(arch, GpuArch::Amd(a) if !a.is_cdna() || a == AmdArch::Gfx950);
         let occupancy = match arch {
             // Four schedulers over 64K registers; 48 warps on sm_86, sm_89 and
             // sm_120, 64 elsewhere.
@@ -133,6 +137,7 @@ impl Target {
             cp_async,
             ldmatrix,
             tr_load,
+            dot2_bf16,
             smem_bytes,
             sms: None,
             commit_fence,

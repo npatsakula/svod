@@ -1206,8 +1206,13 @@ impl<'a> Emit<'a> {
         Ok(())
     }
 
+    /// The fold runs in the destination's type: a 16-bit source is widened
+    /// element by element, except a bf16 sum on a target with `v_dot2_f32_bf16`,
+    /// which adds a lane's pairs as held with one instruction each.
     fn reduce(&mut self, dst: ValId, src: ValId, axis: Axis, f: ReduceOp) -> Result<()> {
         let (ls, ld) = (self.layout(src).clone(), self.layout(dst).clone());
+        let (from, to) = (self.value(src).dtype, self.value(dst).dtype);
+        let dot2 = from != to && from == ScalarDType::BFloat16 && f == ReduceOp::Sum && self.low.target.dot2_bf16;
         let (fold_masks, across) = match axis {
             Axis::Row => (ls.row_fold_masks(), ls.warps.out_size(Col)),
             Axis::Col => (ls.col_fold_masks(), ls.warps.out_size(Row)),
@@ -1229,9 +1234,21 @@ impl<'a> Emit<'a> {
             let want = key(&ld, 0, jd);
             let members: Vec<u32> = (0..ls.regs()).filter(|&j| key(&ls, 0, j) == want).collect();
             debug_assert!(!members.is_empty());
-            let mut acc = self.reg_load(src, members[0]);
-            for &j in &members[1..] {
+            let (mut acc, rest) = if dot2 {
+                let mut acc = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+                let (pairs, rest) = members.as_chunks::<2>();
+                for &[a, b] in pairs {
+                    let (x, y) = (self.reg_load(src, a), self.reg_load(src, b));
+                    acc = self.dot2_bf16(UOp::stack(smallvec![x, y]), acc);
+                }
+                (acc, rest.to_vec())
+            } else {
+                let x = self.reg_load(src, members[0]);
+                (if from != to { x.cast(DType::Scalar(to)) } else { x }, members[1..].to_vec())
+            };
+            for &j in &rest {
                 let x = self.reg_load(src, j);
+                let x = if from != to { x.cast(DType::Scalar(to)) } else { x };
                 acc = combine(&acc, &x);
             }
             for &mask in &fold_masks {
@@ -1300,6 +1317,13 @@ impl<'a> Emit<'a> {
             ),
             _ => x.try_exp2().expect("exp2"),
         }
+    }
+
+    /// `acc + pair·(1, 1)` for a bf16 `pair`, accumulated in f32.
+    fn dot2_bf16(&mut self, pair: Arc<UOp>, acc: Arc<UOp>) -> Arc<UOp> {
+        let call = "declare float @llvm.amdgcn.fdot2.f32.bf16(<2 x bfloat>, <2 x bfloat>, float, i1)\n\
+                    call float @llvm.amdgcn.fdot2.f32.bf16(<2 x bfloat> {0}, <2 x bfloat> <bfloat 0xR3F80, bfloat 0xR3F80>, float {1}, i1 false)";
+        self.push(UOp::custom(smallvec![pair, acc], call.to_string(), DType::Float32))
     }
 
     fn shuffle_xor(&mut self, value: &Arc<UOp>, mask: u32) -> Arc<UOp> {
