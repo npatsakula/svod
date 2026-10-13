@@ -386,6 +386,28 @@ impl FaCfg {
     }
 }
 
+/// Output registers per lane from which skipping the rescale pays for its
+/// branch where the matrix cores run beside the vector units: measured on
+/// sm_86, +4% at `d = 128` (64 registers), neutral at `d = 64`.
+const SKIP_RESCALE_REGS: u32 = 64;
+
+impl FaCfg {
+    /// The softmax forms that pay on `target` for `t` queries at head size
+    /// `d`. Probabilities are truncated where rounding them to nearest takes
+    /// several instructions. The rescale is skipped where the vector work it
+    /// saves is matrix time (RDNA), or where it saves [`SKIP_RESCALE_REGS`]
+    /// multiplies per lane of a tile full of queries: a decoder step's one
+    /// row keeps the multiply, the branch splitting its short loop's product
+    /// chain cost it 5–7% on sm_86.
+    pub fn forms(self, target: &Target, d: usize, t: usize) -> Self {
+        let grid = WarpGrid { rows: self.warps(), cols: 1 };
+        let out = target.mma.first().and_then(|a| a.issue(Orient::Direct, grid, self.bq, d, self.bkv).ok());
+        let out = out.map_or(0, |issue| issue.c.regs());
+        let skip_rescale = target.mma_on_valu || (t >= self.bq && out >= SKIP_RESCALE_REGS);
+        Self { truncate_p: !target.bf16_cvt, skip_rescale, ..self }
+    }
+}
+
 /// What a score element costs beyond its products, in bytes of shared-memory
 /// traffic: the softmax's scale, mask, max, exp2 and sum on the vector units.
 const SCORE: usize = 32;
@@ -451,7 +473,7 @@ impl Attention {
 
     /// The lattice's configs that run this problem on `target`, cheapest
     /// first, then by fewer registers, one pipeline per query and key block
-    /// size.
+    /// size, in the softmax [`forms`](FaCfg::forms) that pay there.
     pub fn ranked(&self, target: &Target) -> Vec<FaCfg> {
         let stages: &[usize] = if target.cp_async { &[3, 2] } else { &[2] };
         let mut ranked: Vec<(f64, u32, FaCfg)> = vec![];
@@ -459,7 +481,7 @@ impl Attention {
             for bkv in [16, 32, 64, 128] {
                 for &stages in stages {
                     for unroll in [false, true] {
-                        let cfg = FaCfg { unroll, ..FaCfg::new(bq, bkv, stages) };
+                        let cfg = FaCfg { unroll, ..FaCfg::new(bq, bkv, stages) }.forms(target, self.d, self.t);
                         if let Some((cost, regs)) = self.admit(target, &cfg) {
                             ranked.push((cost, regs, cfg));
                         }

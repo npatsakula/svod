@@ -20,11 +20,20 @@ pub struct FaCfg {
     pub splits: usize,
     /// The ring loop unrolled over its slots.
     pub unroll: bool,
+    /// Probabilities held in bf16 are truncated rather than rounded, and the
+    /// row sum adds what is held, so the normalization stays unbiased: a pair
+    /// per instruction where rounding to nearest takes several. An f16 stream
+    /// rounds either way.
+    pub truncate_p: bool,
+    /// The output's rescale is a [`BinaryOp::Scale`]: skipped under a lane
+    /// branch by every wave whose rows all kept their maximum, which under the
+    /// lazy rescale is most of them. Else a plain multiply.
+    pub skip_rescale: bool,
 }
 
 impl FaCfg {
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
-        Self { bq, bkv, stages, splits: 1, unroll: false }
+        Self { bq, bkv, stages, splits: 1, unroll: false, truncate_p: false, skip_rescale: false }
     }
 
     /// One warp per 16 query rows: row reductions stay within a warp.
@@ -180,6 +189,7 @@ struct Step<'a, T> {
     scale_log2e: f64,
     shape: Shape,
     mask: Mask<'a>,
+    cfg: FaCfg,
 }
 
 /// How far (in log2 units) a row's running maximum may fall behind its
@@ -203,7 +213,7 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let block_max = k.reduce(s, Axis::Row, ReduceOp::Max);
     // A row adopts its new maximum only when it grows by more than
     // `RESCALE_ABOVE` (log2 units), else keeps the old one: its correction is
-    // then exactly 1 and the accumulator's rescale is skipped, while its
+    // then exactly 1 (and the accumulator's rescale may be skipped), while its
     // probabilities stay below 2^RESCALE_ABOVE. `o` and `l` share the stale
     // maximum, so their quotient is the same.
     let m_max = k.binary(m, block_max, BinaryOp::Max);
@@ -215,10 +225,7 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let corr = k.unary(corr, UnaryOp::Exp2);
     let p = k.binary(s, m_new, BinaryOp::Sub);
     let p = k.unary(p, UnaryOp::Exp2);
-    // Probabilities in [0, 1] held in bf16 are truncated, a pair per
-    // instruction where rounding to nearest takes several, and the row sum
-    // adds what is held, so the normalization stays unbiased.
-    let (p16, held) = if T::DTYPE == svod_dtype::ScalarDType::BFloat16 {
+    let (p16, held) = if st.cfg.truncate_p && T::DTYPE == svod_dtype::ScalarDType::BFloat16 {
         let p16 = k.cast_toward_zero::<T>(p);
         (p16, k.cast::<T, F32>(p16))
     } else {
@@ -227,7 +234,7 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let block_sum = k.reduce(held, Axis::Row, ReduceOp::Sum);
     let l = k.binary(l, corr, BinaryOp::Mul);
     let l = k.binary(l, block_sum, BinaryOp::Add);
-    let o = k.scale(o, corr);
+    let o = if st.cfg.skip_rescale { k.scale(o, corr) } else { k.binary(o, corr, BinaryOp::Mul) };
     let o = k.mma(o, p16, false, v_t, false);
     [m_new, l, o]
 }
@@ -489,7 +496,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         let [out] = k.select_if(partial, |k| [masked(k, s, block_start.clone())], |_| [s]);
         out
     };
-    let st = Step { q_r, scale_log2e, shape, mask: &mask };
+    let st = Step { q_r, scale_log2e, shape, mask: &mask, cfg };
     let [m, l, acc] = k.pipeline(
         blocks,
         stages,
@@ -540,7 +547,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
                 let keep = k.binary(seen, owned, BinaryOp::And);
                 hide(k, keep, s)
             };
-            let st = Step { q_r, scale_log2e, shape, mask: &rows };
+            let st = Step { q_r, scale_log2e, shape, mask: &rows, cfg };
             step(&mut k, &st, k_g, v_g, Sc::from(0), [m, l, acc])
         }
         None => [m, l, acc],

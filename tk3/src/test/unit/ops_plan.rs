@@ -15,6 +15,7 @@ use crate::kernels::rows::NormCfg;
 use crate::ops::config::{self, Planner};
 use crate::ops::shape::{self, Extent, Fallback, Plan, extent};
 use crate::ops::{self as tk, Act, Attn, Cache, Error, KeyMask, Linear, Qkv};
+use crate::test::unit::targets::amd;
 
 const BF16: DType = DType::BFloat16;
 
@@ -328,6 +329,27 @@ fn attention_candidates(d: usize, smem: usize, measured: (usize, usize)) {
     for (i, c) in list.iter().enumerate() {
         assert!(!list[..i].iter().any(|o| (o.bq, o.bkv) == (c.bq, c.bkv)), "one pipeline per tile: {list:?}");
         assert_eq!(c.scratch_bytes(&target), 0);
+    }
+}
+
+/// The softmax forms follow the target: probabilities are truncated where a
+/// bf16 rounding is several instructions, and the rescale is skipped where
+/// the matrix cores share the vector ALUs (RDNA) or, beside them, where a
+/// full tile's lane holds 64 output registers (sm_86: `d = 128` prefill;
+/// `d = 64` and a decoder step's row multiply).
+#[test_case(sm86(), 128, 512, (false, true); "sm_86 d 128 prefill")]
+#[test_case(sm86(), 64, 512, (false, false); "sm_86 d 64 prefill")]
+#[test_case(sm86(), 128, 1, (false, false); "sm_86 d 128 decode")]
+#[test_case(amd(AmdArch::Gfx1201, 64), 128, 512, (true, true); "gfx1201 d 128 prefill")]
+#[test_case(amd(AmdArch::Gfx1201, 64), 64, 1, (true, true); "gfx1201 d 64 decode")]
+#[test_case(amd(AmdArch::Gfx942, 304), 128, 512, (true, false); "gfx942 d 128: 32 output registers a lane")]
+#[test_case(amd(AmdArch::Gfx950, 256), 64, 512, (false, false); "gfx950 rounds a pair at once")]
+fn attention_forms_follow_the_target(target: Target, d: usize, t: usize, (truncate_p, skip_rescale): (bool, bool)) {
+    assert_eq!(target.bf16_cvt, !truncate_p);
+    let list = Planner::new(target).attention_candidates(8, t, 1500, d, false);
+    assert!(!list.is_empty());
+    for c in &list {
+        assert_eq!((c.truncate_p, c.skip_rescale), (truncate_p, skip_rescale), "{c:?}");
     }
 }
 

@@ -83,6 +83,14 @@ pub struct Target {
     /// its products unless fenced (`Sync::Fence` → `sched_barrier`), leaving
     /// the block waiting on global memory with no product in flight: RDNA4.
     pub commit_fence: bool,
+    /// An f32 pair rounds to bf16 in one instruction (`cvt.rn.bf16x2.f32`,
+    /// `v_cvt_pk_bf16_f32`): sm_80+ and gfx950; elsewhere the rounding is
+    /// about seven vector instructions per element.
+    pub bf16_cvt: bool,
+    /// The matrix products issue on the vector ALUs (RDNA's WMMA), so vector
+    /// work saved is matrix time gained; CUDA's tensor cores and CDNA's matrix
+    /// cores run beside the vector units.
+    pub mma_on_valu: bool,
 }
 
 impl Target {
@@ -98,6 +106,12 @@ impl Target {
             GpuArch::Metal(_) => (false, false, 32 << 10),
         };
         let commit_fence = matches!(arch, GpuArch::Amd(a) if a.is_rdna4());
+        let bf16_cvt = match arch {
+            GpuArch::Cuda(c) => c.major >= 8,
+            GpuArch::Amd(a) => a == AmdArch::Gfx950,
+            GpuArch::Metal(_) => false,
+        };
+        let mma_on_valu = matches!(arch, GpuArch::Amd(a) if !a.is_cdna());
         let tr_load = matches!(arch, GpuArch::Amd(a) if a.is_rdna4() && wave == 32);
         let occupancy = match arch {
             // Four schedulers over 64K registers; 48 warps on sm_86, sm_89 and
@@ -122,6 +136,8 @@ impl Target {
             smem_bytes,
             sms: None,
             commit_fence,
+            bf16_cvt,
+            mma_on_valu,
             occupancy,
         }
     }
