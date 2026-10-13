@@ -534,16 +534,15 @@ fn attention_softmax_takes_the_planned_forms(target: Target, family: &str, (trun
     assert_eq!((casts > 0, scales > 0), (truncated, skipped), "{name}: {casts} casts toward zero, {scales} scales");
 }
 
-/// The row sum of the probabilities follows the P·V product where the
-/// rescale is a branch or the probabilities are truncated (both consumers
-/// then read one pack), and precedes the rescale otherwise: on sm_86 the
-/// `d = 128` prefill sums after, `d = 64` and a decoder step before; gfx1201
-/// always after.
-#[test_case(crate::atoms::sm86(), "attention d128 causal #0", true; "sm_86 d 128 after")]
+/// The row sum of the probabilities follows the P·V product where they are
+/// truncated (both consumers then read one pack), and precedes the rescale
+/// otherwise: on sm_86 always before; on gfx1201 after for a bf16 stream,
+/// before for the f16 decode family, which rounds.
+#[test_case(crate::atoms::sm86(), "attention d128 causal #0", false; "sm_86 d 128 before")]
 #[test_case(crate::atoms::sm86(), "attention d64 causal #0", false; "sm_86 d 64 before")]
 #[test_case(crate::atoms::sm86(), "attention d64 cache", false; "sm_86 decode before")]
 #[test_case(amd(AmdArch::Gfx1201, 64), "attention d64 causal #0", true; "gfx1201 d 64 after")]
-#[test_case(amd(AmdArch::Gfx1201, 64), "attention d64 cache", true; "gfx1201 decode after")]
+#[test_case(amd(AmdArch::Gfx1201, 64), "attention d64 cache", false; "gfx1201 f16 decode before")]
 fn attention_sums_the_probabilities_where_the_forms_say(target: Target, family: &str, after: bool) {
     use crate::ir::{ReduceOp, TileOp};
     let (name, prog, _) =

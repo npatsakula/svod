@@ -124,10 +124,10 @@ tiles full of queries, the running maximum stays in the raw scores' units (a pos
 with the maximum; a bias keeps the scaled form), so only the two row values the exponent and the
 correction take are scaled, a multiply per row rather than per score, at the price of a multiply on
 the step's dependent chain, which a decoder step's one wave feels (3%) and a full tile does not. The
-row sum of the probabilities follows the product where the rescale is a branch or the probabilities
-are truncated, so both consumers read them packed once (sm_86 d = 128: +7%; the truncated sum is the
-bf16 pair dot product where the target has it), and precedes the rescale otherwise (sm_86 d = 64
-causal: +5% that way round). Under a causal mask (or chunks seeing every earlier one) the last
+row sum of truncated probabilities follows the product, so both consumers read them packed once (it
+is the bf16 pair dot product where the target has it); rounded ones are summed before the rescale,
+which with the planned forms on sm_86 is 3% at d = 128 over the other order (24.7 against 24.0
+TFLOP/s, 22.4 before this work) and neutral at d = 64 and on a decoder step. Under a causal mask (or chunks seeing every earlier one) the last
 query blocks, which score the most keys, run first, so a round's tail is its shortest blocks. On
 gfx1201 the lazy rescale, the truncation, the skip and the raw `exp2` below took the d = 128 kernel
 from 90 to 116 TFLOP/s on random data and Qwen3's causal attention from 63 to 77; the raw maximum,
