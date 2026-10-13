@@ -12,7 +12,7 @@ use svod_dtype::GpuArch;
 
 use crate::atoms::Target;
 use crate::ir::{Axis, Orient, Shape};
-use crate::kernels::attention::FaCfg;
+use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
 use crate::kernels::rows::NormCfg;
@@ -127,6 +127,11 @@ struct Costs {
     wave_trip: usize,
     step: usize,
     hiding: f64,
+    /// Output registers per lane from which skipping attention's rescale
+    /// under a branch pays beside separate matrix cores (sm_86: 64, +4% at
+    /// `d = 128`, neutral at `d = 64`; CDNA takes the same fit, unmeasured);
+    /// 0 where the vector work is matrix time, so it always pays.
+    skip_rescale_regs: u32,
 }
 
 impl Costs {
@@ -137,10 +142,11 @@ impl Costs {
     /// path's are the gfx1201 fit: about 256 SM cycles per trip and eight
     /// per step at 128 B/cycle.
     fn of(target: &Target) -> Self {
+        let skip_rescale_regs = if target.mma_on_valu { 0 } else { 64 };
         if target.cp_async {
-            Self { trip: 0, wave_trip: 128, step: 2048, hiding: 16.0 }
+            Self { trip: 0, wave_trip: 128, step: 2048, hiding: 16.0, skip_rescale_regs }
         } else {
-            Self { trip: TRIP, wave_trip: 0, step: STEP, hiding: HIDING_WAVES }
+            Self { trip: TRIP, wave_trip: 0, step: STEP, hiding: HIDING_WAVES, skip_rescale_regs }
         }
     }
 }
@@ -346,14 +352,16 @@ impl Planner {
 }
 
 impl FaCfg {
-    /// Whether the config lowers on `target` for head size `d`: one warp per
-    /// 16 query rows, both products tile the atoms, and the K and V fills
-    /// split into whole 16-byte chunks per thread.
+    /// Whether the config lowers on `target` for head size `d`: the atom's M
+    /// is the kernel's [`WARP_ROWS`] (one warp per that many query rows),
+    /// both products tile the atoms, and the K and V fills split into whole
+    /// 16-byte chunks per thread.
     pub fn fits(&self, target: &Target, d: usize) -> bool {
         let Some(atom) = target.mma.first() else { return false };
         let (bq, bkv) = (self.bq, self.bkv);
         let threads = self.warps() as usize * target.wave as usize;
-        bq.is_multiple_of(16)
+        atom.m as usize == WARP_ROWS
+            && bq.is_multiple_of(WARP_ROWS)
             && bq > 0
             && [bkv, d].iter().all(|&x| x.is_multiple_of(atom.n as usize) && x.is_multiple_of(atom.k as usize))
             && (bkv * d / 8).is_multiple_of(threads)
@@ -386,28 +394,24 @@ impl FaCfg {
     }
 }
 
-/// Output registers per lane from which skipping the rescale pays for its
-/// branch where the matrix cores run beside the vector units: measured on
-/// sm_86, +4% at `d = 128` (64 registers), neutral at `d = 64`.
-const SKIP_RESCALE_REGS: u32 = 64;
-
 impl FaCfg {
     /// The softmax forms that pay on `target` for `t` queries at head size
     /// `d`. Probabilities are truncated where rounding them to nearest takes
     /// several instructions. The rescale is skipped where the vector work it
-    /// saves is matrix time (RDNA), or where it saves [`SKIP_RESCALE_REGS`]
-    /// multiplies per lane of a tile full of queries: a decoder step's one
-    /// row keeps the multiply, the branch splitting its short loop's product
-    /// chain cost it 5–7% on sm_86. The maximum runs in raw units where the
-    /// vector work is matrix time and the tile is full of queries (gfx1201:
-    /// +3% at `d = 64`, +1% at `d = 128`); the multiply it puts on the
-    /// step's dependent chain cost a decoder step's one wave 3%.
+    /// saves is matrix time (RDNA), or where it saves the family's fitted
+    /// [`Costs::skip_rescale_regs`] multiplies per lane of a tile full of
+    /// queries: a decoder step's one row keeps the multiply, the branch
+    /// splitting its short loop's product chain cost it 5–7% on sm_86. The
+    /// maximum runs in raw units where the vector work is matrix time and the
+    /// tile is full of queries (gfx1201: +3% at `d = 64`, +1% at `d = 128`);
+    /// the multiply it puts on the step's dependent chain cost a decoder
+    /// step's one wave 3%.
     pub fn forms(self, target: &Target, d: usize, t: usize) -> Self {
         let grid = WarpGrid { rows: self.warps(), cols: 1 };
         let out = target.mma.first().and_then(|a| a.issue(Orient::Direct, grid, self.bq, d, self.bkv).ok());
         let out = out.map_or(0, |issue| issue.c.regs());
         let full = t >= self.bq;
-        let skip_rescale = target.mma_on_valu || (full && out >= SKIP_RESCALE_REGS);
+        let skip_rescale = target.mma_on_valu || (full && out >= Costs::of(target).skip_rescale_regs);
         Self { truncate_p: !target.bf16_cvt, skip_rescale, raw_max: target.mma_on_valu && full, ..self }
     }
 }
@@ -469,7 +473,7 @@ impl Attention {
         let traffic = (2 * waves + 2) * bkv * d * 2 + TRIP + steps * STEP + bq * bkv * SCORE;
         let diagonal = DIAGONAL * bq.div_ceil(bkv);
         let trips = if self.causal { self.tk.div_ceil(2 * bkv) + diagonal } else { self.tk.div_ceil(bkv) };
-        let useful = waves.min(self.t.div_ceil(16));
+        let useful = waves.min(self.t.div_ceil(WARP_ROWS));
         let hiding = 1.0 + HIDING_WAVES / (actual * useful * (cfg.stages - 1)) as f64;
         let rolled = if cfg.unroll || target.cp_async { 1.0 } else { ROLLED };
         Some(((rounds * actual * trips * traffic) as f64 * hiding * rolled, regs))
