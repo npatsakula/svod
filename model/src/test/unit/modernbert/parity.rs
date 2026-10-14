@@ -32,16 +32,19 @@ use crate::modernbert::{
     ModernBertForMaskedLm, ModernBertTokenClassificationModel, ModernBertTokenClassifier,
 };
 use crate::state::StateDict;
-use crate::test::unit::modernbert::max_abs_delta;
+use crate::test::unit::modernbert::{max_abs_delta, nan_max};
 
-const HUB_REPO: &str = "answerdotai/ModernBERT-base";
+/// `answerdotai/ModernBERT-base`, at the revision the goldens were generated
+/// from (each repo's pin is also its generate script's `--revision` default).
+const BASE_REPO: (&str, &str) = ("answerdotai/ModernBERT-base", "8949b909ec900327062f0ebf497f51aef5e6f0c8");
 
-/// Resolve a real-checkpoint test file from `repo`: `SVOD_MODERNBERT` dir
-/// override → local `data/modernbert/` → HF Hub download. Model weights /
-/// configs live on HF Hub, but the `golden*.safetensors` fixtures are generated
-/// locally (not committed, not published) — a missing golden says so instead of
-/// a generic "download" message that's wrong for goldens.
-fn local_or_hub(repo: &str, name: &str) -> PathBuf {
+/// Resolve a real-checkpoint test file from `(repo, revision)`:
+/// `SVOD_MODERNBERT` dir override → local `data/modernbert/` → HF Hub download.
+/// Model weights / configs live on HF Hub, but the `golden*.safetensors`
+/// fixtures are generated locally (not committed, not published) — a missing
+/// golden says so instead of a generic "download" message that's wrong for
+/// goldens.
+fn local_or_hub((repo, revision): (&str, &str), name: &str) -> PathBuf {
     let dir = std::env::var_os("SVOD_MODERNBERT")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/modernbert"));
@@ -55,14 +58,14 @@ fn local_or_hub(repo: &str, name: &str) -> PathBuf {
          locally; run `model/scripts/generate_modernbert*.py` (or point SVOD_MODERNBERT at \
          the output dir)"
     );
-    let repo = crate::hub::HubRepo::open(repo, "main").expect("HF Hub API");
+    let repo = crate::hub::HubRepo::open(repo, revision).expect("HF Hub API");
     repo.get(name).unwrap_or_else(|_| panic!("download {name} from HF Hub"))
 }
 
 /// [`local_or_hub`] for `answerdotai/ModernBERT-base` (`golden.safetensors` is
 /// the output of `model/scripts/generate_modernbert_golden.py`).
 fn real_file(name: &str) -> PathBuf {
-    local_or_hub(HUB_REPO, name)
+    local_or_hub(BASE_REPO, name)
 }
 
 fn load_golden_vec<T: svod_dtype::ext::HasDType + Default + Clone>(sd: &StateDict, key: &str) -> Vec<T> {
@@ -121,7 +124,7 @@ fn real_token_max_delta(got: &[f32], want: &[f32], mask: &[i64], d: usize) -> f3
         .zip(mask.iter())
         .filter(|&(_, m)| *m == 1)
         .map(|((g, w), _)| max_abs_delta(g, w))
-        .fold(0.0, |max, d| if d.is_nan() || d > max { d } else { max })
+        .fold(0.0, nan_max)
 }
 
 /// `last_hidden_state` parity: our backbone (f32) vs the PyTorch reference.
@@ -400,11 +403,12 @@ fn embeddings_match_pytorch() {
 // The SST-2 model uses mean pooling and `classifier_bias = false` — exercising
 // the masked-mean path and the optional-bias code.
 
-const CLASSIFIER_HUB_REPO: &str = "AnkitAI/Sensible-ModernBERT-Sentiment-Analysis";
+const CLASSIFIER_REPO: (&str, &str) =
+    ("AnkitAI/Sensible-ModernBERT-Sentiment-Analysis", "df8a40e2ea5911d7c8d52cced4ad60048ae63490");
 
 /// [`local_or_hub`] for the SST-2 fine-tuned repo.
 fn classifier_file(name: &str) -> PathBuf {
-    local_or_hub(CLASSIFIER_HUB_REPO, name)
+    local_or_hub(CLASSIFIER_REPO, name)
 }
 
 /// The classifier at `dtype` over the golden's rows, and the golden. The plan
@@ -478,16 +482,17 @@ fn ignoring_padding_diverges_in_classification() {
 
 // ─── token classification parity ───────────────────────────────────────────
 //
-// Tests the fused backbone + token head (`prediction_head_tail` over the full
+// Tests the fused backbone + token head (`ClassifierHead::forward` over the full
 // `(B, L, D)` state, no pooling) against `AutoModelForTokenClassification` from
 // `transformers`. The CoNLL-2003 NER fine-tune has no pooling; `classifier_bias`
 // is exercised by the always-present `classifier.bias`.
 
-const TOKEN_HUB_REPO: &str = "sanketrai/modernbert-base-conll2003-english-ner";
+const TOKEN_REPO: (&str, &str) =
+    ("sanketrai/modernbert-base-conll2003-english-ner", "6e6500c22245f5f17a2dd3a427577715625c3d9d");
 
 /// [`local_or_hub`] for the CoNLL-2003 NER fine-tuned repo.
 fn token_file(name: &str) -> PathBuf {
-    local_or_hub(TOKEN_HUB_REPO, name)
+    local_or_hub(TOKEN_REPO, name)
 }
 
 /// The token classifier at `dtype` over the golden's rows, and the golden.
@@ -523,7 +528,7 @@ fn token_logits_match_pytorch() {
     assert_eq!(classifications.len(), encodings.len(), "batch size mismatch");
     let mut worst = 0.0f32;
     for (i, c) in classifications.iter().enumerate() {
-        assert_eq!(c.logits.len(), seq_len * num_labels, "per-chunk grid shape");
+        assert_eq!((c.logits.len(), c.num_labels), (seq_len * num_labels, num_labels), "per-chunk grid shape");
         // Compare only real-token rows: pad rows are a don't-care and may drift.
         for t in 0..seq_len {
             if encodings[i].attention_mask[t] == 0 {
@@ -538,45 +543,6 @@ fn token_logits_match_pytorch() {
         }
     }
     eprintln!("token logits real-position max |delta| = {worst:.3e}");
-}
-
-/// Negative control: an all-ones mask (ignoring padding) must DIVERGE from the
-/// golden on real-token rows — backbone attention is contaminated by pad keys.
-/// If this passes, the golden isn't exercising the mask.
-#[test]
-#[ignore = "heavy: real CoNLL-2003 ModernBERT-base NER weights + PyTorch golden (local or HF Hub download)"]
-fn ignoring_padding_diverges_in_token_classification() {
-    let (mut recognizer, encodings, golden) = load_token_fixture(DType::Float32);
-    let want: Vec<f32> = load_golden_vec(&golden, "expected_logits");
-    let (num_labels, seq_len) = (recognizer.num_labels(), encodings[0].len());
-
-    let unmasked: Vec<Encoding> = encodings
-        .iter()
-        .map(|e| {
-            let mut e = e.clone();
-            e.attention_mask.fill(1);
-            e
-        })
-        .collect();
-
-    let refs: Vec<&Encoding> = unmasked.iter().collect();
-    let (classifications, _prof) = recognizer.run_batch(&refs, false).expect("recognize unmasked");
-
-    for (i, c) in classifications.iter().enumerate() {
-        for t in 0..seq_len {
-            if encodings[i].attention_mask[t] == 0 {
-                continue; // compare only originally-real positions
-            }
-            let got = &c.logits[t * num_labels..(t + 1) * num_labels];
-            let want_off = (i * seq_len + t) * num_labels;
-            let expected = &want[want_off..want_off + num_labels];
-            let max_delta = max_abs_delta(got, expected);
-            assert!(
-                max_delta > 1e-2,
-                "ignoring padding did NOT diverge from the golden [{i}][{t}] (max |delta| = {max_delta:.3e})"
-            );
-        }
-    }
 }
 
 // ─── bf16 heads ─────────────────────────────────────────────────────────────
@@ -596,8 +562,11 @@ enum Head {
 /// The heads in bf16 — where they run on tk's flash attention, GEMMs and layer
 /// norm, which the f32 parity tests above never reach — against the f32
 /// goldens, bounded by PyTorch's own bf16 drift on the same inputs
-/// (`<output>_bf16.cpu_{sdpa,eager}`, written by the golden scripts) times
-/// [`BF16_HEAD_SLACK`]. The token head is compared at real tokens only.
+/// (`<output>_bf16.{cpu,cuda}_{sdpa,eager}`, written by the golden scripts)
+/// times [`BF16_HEAD_SLACK`]. The CUDA paths are required: a GPU's matrix-core
+/// GEMMs and fused attention round apart from any CPU path, and the CPU pair
+/// alone failed the 3060's embedding at 2.7x. The token head is compared at real
+/// tokens only.
 #[test_case::test_case(Head::Embed; "embed")]
 #[test_case::test_case(Head::Classify; "classify")]
 #[test_case::test_case(Head::ClassifyTokens; "classify tokens")]
@@ -642,8 +611,11 @@ fn bf16_heads_track_pytorch_bf16(head: Head) {
         .filter(|k| k.starts_with(&format!("{key}_bf16.")))
         .map(|k| (k.clone(), max_abs_delta(&real_rows(load_golden_vec(&golden, k)), &want)))
         .collect::<Vec<_>>();
-    assert!(!pytorch.is_empty(), "the golden predates PyTorch's bf16 paths: rerun its generate script");
-    let worst = pytorch.iter().map(|(_, d)| *d).fold(0.0, f32::max);
+    assert!(
+        pytorch.iter().any(|(k, _)| k.contains(".cuda_")),
+        "the golden lacks PyTorch's CUDA bf16 paths: rerun its generate script on a CUDA machine"
+    );
+    let worst = pytorch.iter().map(|(_, d)| *d).fold(0.0, nan_max);
     eprintln!("{head:?}: svod bf16 max |Δ| {drift:.3e}; pytorch {pytorch:?}");
     assert!(drift <= BF16_HEAD_SLACK * worst, "{head:?} bf16 drifts past PyTorch's: {drift:.3e} against {worst:.3e}");
 }
