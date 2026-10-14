@@ -715,9 +715,6 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
     /// these with the source chunks' positions afterwards. Shared by the
     /// single-text and batch paths.
     fn run_chunks_flat(&mut self, chunks: &[&TextChunk], profile: bool) -> Result<ModelOutputs<M>, M::Error> {
-        if chunks.is_empty() {
-            return Ok((Vec::new(), None));
-        }
         let max_batch = self.model.capacity().0.max(1);
         let mut order: Vec<usize> = (0..chunks.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(chunks[i].encoding.len()));
@@ -775,10 +772,6 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
     /// moved out of the flat stream by each text's chunk count — plus a shared
     /// batch-level profile.
     fn run_batch_inner(&mut self, texts: &[&str], opts: RunOptions) -> Result<BatchRun<M>, PipelineError<T, C, M>> {
-        if texts.is_empty() {
-            return Ok((Vec::new(), Vec::new(), None));
-        }
-
         let t = Instant::now();
         let encodings = self.tokenizer.encode_batch(texts).context(TokenizeSnafu)?;
         let tok_wall = t.elapsed();
@@ -1200,15 +1193,10 @@ where
         }
         let id = argmax(row);
         // Argmax probability = softmax(row)[id], computed in place (max-subtracted
-        // for stability) rather than allocating the full probability vector. An
-        // empty row scores 0.0; an all-zero row yields the uniform 1/nl.
-        let score = if row.is_empty() {
-            0.0
-        } else {
-            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let sum: f32 = row.iter().map(|x| (x - max).exp()).sum();
-            (row[id] - max).exp() / sum
-        };
+        // for stability) rather than allocating the full probability vector.
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = row.iter().map(|x| (x - max).exp()).sum();
+        let score = (row[id] - max).exp() / sum;
         let label_id = id as u32;
         let (start, end) = chunk.token_offsets.get(t).copied().unwrap_or((0, 0));
         out.push(TokenLabel { label_id, label: id2label(label_id), start, end, token_index: content_idx, score });
@@ -1388,15 +1376,10 @@ fn close_span(open: &mut Option<(String, u32, usize, usize, usize, f32)>, out: &
     }
 }
 
-/// Index of the maximum element, or `0` for an empty slice. NaN-safe: NaN is
-/// treated as equal to everything (never wins a strict greater-than), so a NaN
-/// row yields `0` rather than panicking — unlike `partial_cmp(b).unwrap()`.
+/// Index of the maximum element, or `0` for an empty or all-NaN slice. NaN
+/// entries are skipped, so a NaN neither wins nor hides a larger value after it.
 pub fn argmax(row: &[f32]) -> usize {
-    row.iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+    row.iter().enumerate().filter(|(_, x)| !x.is_nan()).max_by(|(_, a), (_, b)| a.total_cmp(b)).map_or(0, |(i, _)| i)
 }
 
 /// Softmax probabilities (max-subtracted for numerical stability), summing to

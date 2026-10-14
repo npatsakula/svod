@@ -1,3 +1,5 @@
+use svod_dtype::DType;
+
 use crate::modernbert::ModernBertConfig;
 
 fn test_cfg() -> ModernBertConfig {
@@ -109,10 +111,11 @@ fn parse_id2label_dense_with_gaps() {
     assert_eq!(c.num_labels, 5, "num_labels follows dense id2label length");
 }
 
-/// An absent `id2label` yields an empty vec and the base `num_labels` default.
+/// `apply_checkpoint` takes every field from the checkpoint's config but the
+/// two the caller chose, `dtype` and `max_batch_size`.
 #[test]
-fn parse_absent_id2label_is_empty() {
-    let c = ModernBertConfig::from_json_str("{}").expect("parse");
-    assert!(c.id2label.is_empty());
-    assert_eq!(c.num_labels, 2, "base default");
+fn apply_checkpoint_keeps_the_caller_fields() {
+    let mut caller = ModernBertConfig { dtype: DType::Float16, max_batch_size: 8, ..ModernBertConfig::default() };
+    caller.apply_checkpoint(&test_cfg());
+    assert_eq!((caller.dtype, caller.max_batch_size, caller.hidden_size), (DType::Float16, 8, 768));
 }

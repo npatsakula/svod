@@ -45,7 +45,6 @@ fn layer_zero_has_no_attn_norm() {
 
 /// `forward` produces a `(B, L, D)` tensor of the expected shape.
 #[test]
-#[ignore = "heavy: 2-layer ModernBERT eager forward+realize through the CPU backend"]
 fn forward_output_shape() {
     let cfg = tiny_cfg();
     let m = ModernBert::empty(cfg);
