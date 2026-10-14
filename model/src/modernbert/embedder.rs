@@ -27,9 +27,11 @@ use crate::modernbert::head_jit::{HeadError, HeadPlans};
 /// Masked mean-pool + L2-normalize → finished `(B, D)` f32 embeddings (the
 /// sentence-transformers recipe for ModernBERT). `hidden`: `(B, L, D)`;
 /// `attention_mask`: `(B, L)`, non-zero = real token. An all-pad row pools to
-/// the zero vector and stays zero.
+/// the zero vector and stays zero. The mean runs in f32, as the reference
+/// pools: a bf16 mean rounds the pooled vector itself, an error no averaging
+/// over tokens washes out.
 pub(crate) fn pool_embed(hidden: &Tensor, attention_mask: &Tensor) -> ModelResult<Tensor> {
-    Ok(hidden.masked_mean(attention_mask, 1)?.cast(DType::Float32).lp_normalize(-1, 2)?)
+    Ok(hidden.cast(DType::Float32).masked_mean(attention_mask, 1)?.lp_normalize(-1, 2)?)
 }
 
 /// Finished-embeddings model over a [`ModernBert`] backbone. Construction is

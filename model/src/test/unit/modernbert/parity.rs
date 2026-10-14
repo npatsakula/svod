@@ -547,9 +547,9 @@ fn token_logits_match_pytorch() {
 
 // ─── bf16 heads ─────────────────────────────────────────────────────────────
 
-/// How far past PyTorch's worse bf16 path a bf16 head's drift may land. Its two
-/// paths differ by rounding alone, yet their classifier logits sit 3.3x apart,
-/// so two draws are a thin yardstick for a third.
+/// How far past PyTorch's worst bf16 path a bf16 head's drift may land. Its four
+/// paths differ by rounding alone, yet their classifier logits sit 4.6x apart,
+/// so four draws are still a thin yardstick for a fifth.
 const BF16_HEAD_SLACK: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug)]
@@ -564,9 +564,9 @@ enum Head {
 /// goldens, bounded by PyTorch's own bf16 drift on the same inputs
 /// (`<output>_bf16.{cpu,cuda}_{sdpa,eager}`, written by the golden scripts)
 /// times [`BF16_HEAD_SLACK`]. The CUDA paths are required: a GPU's matrix-core
-/// GEMMs and fused attention round apart from any CPU path, and the CPU pair
-/// alone failed the 3060's embedding at 2.7x. The token head is compared at real
-/// tokens only.
+/// GEMMs and fused attention round apart from any CPU path, so the CPU pair
+/// alone measures another rounding than the one under test. The token head is
+/// compared at real tokens only.
 #[test_case::test_case(Head::Embed; "embed")]
 #[test_case::test_case(Head::Classify; "classify")]
 #[test_case::test_case(Head::ClassifyTokens; "classify tokens")]
