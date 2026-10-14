@@ -6,13 +6,14 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Host-side speech decoding for Svod: CTC and RNN-T decoders, VAD-driven chunking, a long-form ASR pipeline, and diarization post-processing"
+description = "Host-side pipelines for Svod: CTC and RNN-T decoders, VAD-driven chunking, a long-form ASR pipeline, diarization post-processing, and encoder text pipelines (tokenize, chunk, batch, aggregate)"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"], optional = true }
 snafu = "0.9"
 svod-ir = { path = "../ir", version = "=0.2.0" }
 svod-runtime = { path = "../runtime", version = "=0.2.0" }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
 
 [dev-dependencies]
 proptest = "1.9"
@@ -20,5 +21,9 @@ serde_json = "1.0"
 test-case = "3.3.1"
 
 [features]
-default = ["serde"]
+default = ["serde", "hf-tokenizers"]
 serde = ["dep:serde"]
+# The HuggingFace `tokenizers` adapter (`HfTokenizer` / `Encoding::from_hf`).
+# The `Tokenizer` trait + `Encoding` struct stay always-available, so a downstream
+# user wiring their own tokenizer can opt out and skip the `onig` build.
+hf-tokenizers = ["dep:tokenizers"]

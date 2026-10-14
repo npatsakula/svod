@@ -1,6 +1,6 @@
 //! Tests for transformer building blocks: embedding, attention, rotary embeddings, rms_norm.
 
-use crate::Tensor;
+use crate::{SInt, Tensor, Variable};
 use ndarray::{Array2, array};
 use svod_dtype::DType;
 use test_case::test_case;
@@ -646,4 +646,44 @@ fn embedding_lowers_to_a_gather(index: DType) {
         let reduces = kernel.ast.toposort().iter().any(|u| matches!(u.op(), svod_ir::Op::Reduce(..)));
         assert!(!reduces, "a reduce over the vocabulary survived:\n{}", kernel.ast.tree());
     }
+}
+
+// ─── symbolic-batch embedding (regression for the dropped-JIT-batching bug) ────
+//
+// `Tensor::embedding` (src/transformer.rs) used to demand a *concrete* leading
+// dim on `indices`: its flatten (`try_reshape([-1])`) and output-shape rebuild
+// (`idx_shape[i].as_const()`) needed a concrete total element count. A symbolic
+// (rebindable) batch dim — what a JIT plan's `batch_var b: (1, max_batch)`
+// shrinks every batched input to — used to bail with
+// `SymbolicShapeUnsupported { operation: "reshape with -1 inference" }`, which
+// blocked the entire ModernBERT backbone JIT path. `embedding` now carries the
+// symbolic leading dim through to the gather; this guards that it stays fixed.
+
+#[test]
+fn embedding_supports_symbolic_batch_dim() {
+    // Weight table [vocab=4, embed_dim=2] (concrete — only the *index* side matters).
+    let weight = Tensor::from_ndarray(&array![[0.0f32, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]);
+
+    // Concrete index tensor [max_b=2, seq=3], then shrink the leading dim to a
+    // bound (symbolic) variable — the exact shape a JIT plan's
+    // `batch_var b: (1, 2)` hands the model.
+    let indices = Tensor::from_ndarray(&array![[0i32, 1, 2], [3, 2, 1]]);
+    let bound = Variable::new("b", 1, 2).bind(2).unwrap();
+    let indices = indices.try_shrink([Some((SInt::Const(0), bound.as_sint())), None]).unwrap();
+    // indices is now (Symbolic(b), 3) — the batch dim is rebindable.
+
+    let t = weight.embedding(&indices).expect("embedding must carry a symbolic batch dim through");
+    t.realize_with(&crate::PrepareConfig::from_env()).expect("realize symbolic-batch embedding");
+    // The realized shape is still symbolic (BIND on dim 0), so array_view
+    // returns the flat buffer — read it flat and index manually.
+    let view = t.array_view::<f32>().expect("readout");
+    assert_eq!(view.shape(), &[12]);
+    // A [2,3] index into a [4,2] weight yields [2,3,2]; row-major flat = b*6+s*2+e.
+    // Row 0 picks weight rows [0,1,2] = [0,1],[2,3],[4,5].
+    assert_eq!(view[0], 0.0); // [0,0,0]
+    assert_eq!(view[3], 3.0); // [0,1,1]
+    assert_eq!(view[4], 4.0); // [0,2,0]
+    // Row 1 picks weight rows [3,2,1] = [6,7],[4,5],[2,3].
+    assert_eq!(view[7], 7.0); // [1,0,1]
+    assert_eq!(view[10], 2.0); // [1,2,0]
 }

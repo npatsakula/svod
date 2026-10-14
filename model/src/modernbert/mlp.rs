@@ -1,9 +1,14 @@
-//! ModernBERT gated feed-forward (SwiGLU-style): `Linear(D, 2I)` → split
+//! ModernBERT gated feed-forward (GeGLU): `Linear(D, 2I)` → split
 //! `[input | gate]` → `GELU(input) * gate` → `Linear(I, D)`. No biases.
 //!
-//! Mirrors `FlexBertGLU`. `Wi` output dim is `2*intermediate` (input and gate
-//! branches concatenated along the last axis); `Wo` takes the gated `I`-dim
-//! result back to `D`.
+//! Mirrors `ModernBertMLP` (released `hidden_activation = "gelu"`); `Wi` output
+//! dim is `2*intermediate` (input and gate branches concatenated along the last
+//! axis); `Wo` takes the gated `I`-dim result back to `D`.
+//!
+//! Scope: the port hardcodes no biases, matching the published
+//! `attention_bias = false` / `mlp_bias = false` checkpoints. A custom
+//! fine-tune setting either flag would have its bias weights silently dropped
+//! (see [`ModernBertAttention`](super::ModernBertAttention) / [`ModernBertGlu::empty`]).
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
