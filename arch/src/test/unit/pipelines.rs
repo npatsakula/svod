@@ -156,7 +156,7 @@ fn transcribe_chunks_omits_words_when_not_wanted() {
         out: vec![Transcript { text: String::new(), words: vec![word("hi", 1.0, 2.0)], ..Default::default() }],
     };
     // default options → words: false, so cropped words are not surfaced.
-    let out = asr.transcribe_chunks_default(&waveform, &chunks).unwrap();
+    let out = asr.transcribe_chunks(&waveform, &chunks, ().into()).unwrap();
     assert_eq!(out.text, "hi");
     assert_eq!(out.chunks[0].words, None);
 }
@@ -218,7 +218,7 @@ fn asr_composes_split_and_transcribe() {
         ],
     };
     let mut asr = Asr::new(splitter, transcriber);
-    let out = asr.transcribe_default(&[0.0_f32; 25]).unwrap();
+    let out = asr.transcribe(&[0.0_f32; 25], ()).unwrap();
     assert_eq!(out.text, "one two three");
 }
 
@@ -275,7 +275,7 @@ fn asr_profiles_per_call_without_rebuild() {
     let stages: Vec<&str> = profile.stages.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(stages, vec!["vad", "decode"], "VAD stage leads the merged profile");
 
-    assert!(asr.transcribe_default(&[0.0_f32; 4]).unwrap().profile.is_none());
+    assert!(asr.transcribe(&[0.0_f32; 4], ()).unwrap().profile.is_none());
 }
 
 #[test]

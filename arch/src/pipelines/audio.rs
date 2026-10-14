@@ -109,6 +109,12 @@ pub struct RunOptions {
     pub profile: bool,
 }
 
+impl From<()> for RunOptions {
+    fn from(_: ()) -> Self {
+        Self::default()
+    }
+}
+
 /// Advance a model's decode window by what it actually decoded, not by a fixed
 /// stride.
 ///
@@ -504,16 +510,6 @@ pub trait Transcriber {
         let results: Vec<ChunkResult> = transcripts.into_iter().zip(&metas).map(|(t, m)| m.finish(t, opts)).collect();
         Ok(Transcription::from_chunks(results, prof))
     }
-
-    /// [`transcribe_chunks`](Self::transcribe_chunks) with default
-    /// [`RunOptions`] (no words, segments, or profile).
-    fn transcribe_chunks_default(
-        &mut self,
-        waveform: &[f32],
-        chunks: &[AudioChunk],
-    ) -> Result<Transcription, Self::Error> {
-        self.transcribe_chunks(waveform, chunks, RunOptions::default())
-    }
 }
 
 /// One stretch of audio a read head walks, and the window length to walk it with.
@@ -642,8 +638,9 @@ impl<S: Splitter, T: Transcriber> Asr<S, T> {
     pub fn transcribe(
         &mut self,
         waveform: &[f32],
-        opts: RunOptions,
+        opts: impl Into<RunOptions>,
     ) -> Result<Transcription, AsrError<S::Error, T::Error>> {
+        let opts = opts.into();
         let t = Instant::now();
         let chunks = self.splitter.split(waveform).context(SplitSnafu)?;
         let split_wall = t.elapsed();
@@ -658,12 +655,6 @@ impl<S: Splitter, T: Transcriber> Asr<S, T> {
             transcription.profile = Some(p);
         }
         Ok(transcription)
-    }
-
-    /// [`transcribe`](Self::transcribe) with default [`RunOptions`] (no words,
-    /// segments, or profile) — the common case, without spelling out the struct.
-    pub fn transcribe_default(&mut self, waveform: &[f32]) -> Result<Transcription, AsrError<S::Error, T::Error>> {
-        self.transcribe(waveform, RunOptions::default())
     }
 
     pub fn splitter_mut(&mut self) -> &mut S {

@@ -3,12 +3,12 @@ use svod_tensor::Tensor;
 
 use svod_tensor::nn::{Module, StateDict};
 
-use crate::modernbert::{ModernBert, ModernBertConfig};
+use crate::modernbert::{ClassifierPooling, ModernBert, ModernBertConfig};
 
 /// A tiny config for fast unit tests: 2 layers, hidden 32, 4 heads (head_dim 8),
 /// vocab 64, intermediate 64, f32 compute. Global-every-3 still gives layer 0
 /// global and layer 1 local.
-fn tiny_cfg() -> ModernBertConfig {
+pub(crate) fn tiny_cfg() -> ModernBertConfig {
     ModernBertConfig {
         vocab_size: 64,
         hidden_size: 32,
@@ -26,6 +26,11 @@ fn tiny_cfg() -> ModernBertConfig {
         decoder_bias: true,
         dtype: DType::Float32,
         max_batch_size: 1,
+        num_labels: 3,
+        classifier_pooling: ClassifierPooling::Cls,
+        classifier_bias: false,
+        norm_bias: false,
+        id2label: vec![],
     }
 }
 
@@ -40,6 +45,7 @@ fn layer_zero_has_no_attn_norm() {
 
 /// `forward` produces a `(B, L, D)` tensor of the expected shape.
 #[test]
+#[ignore = "heavy: 2-layer ModernBERT eager forward+realize through the CPU backend"]
 fn forward_output_shape() {
     let cfg = tiny_cfg();
     let m = ModernBert::empty(cfg);

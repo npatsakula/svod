@@ -28,7 +28,7 @@ plans.
 | GTCRN (offline / streaming) | Speech enhancement | `gtcrn` | [Xiaobin-Rong/gtcrn](https://github.com/Xiaobin-Rong/gtcrn) | [`vpermilp/gtcrn`](https://huggingface.co/vpermilp/gtcrn) |
 | DiariZen segmentation (WavLM + Conformer) | Speaker diarization | `diarizen` | [BUT-FIT/DiariZen](https://github.com/BUTSpeechFIT/DiariZen) | [`BUT-FIT/diarizen-wavlm-large-s80-md-v2`](https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2) |
 | Nemotron-3-Diarization (offline + streaming Sortformer, 8 speakers) | Speaker diarization | `nemotron_diar` | [NVIDIA NeMo](https://github.com/NVIDIA-NeMo/Speech) | [`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization) |
-| ModernBERT (base / large) | Text embeddings, fill-mask (MLM) | `modernbert` | [Answer.AI ModernBERT](https://github.com/AnswerDotAI/ModernBERT) | [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) |
+| ModernBERT (base / large) | Text embeddings, sequence classification, token classification, fill-mask (MLM, model layer only) | `modernbert` | [Answer.AI ModernBERT](https://github.com/AnswerDotAI/ModernBERT) | [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) |
 | BGE-M3 (dense / sparse / ColBERT) | Text embeddings, retrieval | `bgem3` | [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (XLM-RoBERTa-large) | [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) |
 | BGE-reranker-v2-m3 | Cross-encoder reranking | `bgem3` | [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) | [`BAAI/bge-reranker-v2-m3`](https://huggingface.co/BAAI/bge-reranker-v2-m3) |
 | Qwen3-Embedding-0.6B | Text embeddings, retrieval | `qwen3` | [Qwen team](https://huggingface.co/Qwen) (Qwen3 LLM) | [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) |
@@ -54,4 +54,9 @@ cargo run -p svod-model --release --example whisper_infer -- audio.wav --languag
 cargo run -p svod-model --release --example gtcrn_enhance -- --hub --in noisy.wav --out enhanced.wav
 cargo run -p svod-model --release --example nemotron_diarize -- audio.wav [--stream low|very-low|ultra-low]  # RTTM to stdout
 cargo run -p svod-model --release --example qwen3_embed -- --texts texts.txt
+cargo run -p svod-model --release --example modernbert_embed_infer -- "hello world"            # embeddings (--window/--stride for long docs)
+cargo run -p svod-model --release --example modernbert_embed_batch_infer -- "one" "two"        # batched embeddings (multi-text throughput)
+cargo run -p svod-model --release --example modernbert_classify_infer -- "This movie was great!" # sentence classification
+cargo run -p svod-model --release --example modernbert_token_infer -- "Barack Obama was born in Hawaii" # token classification / NER
+cargo run -p svod-model --release --example modernbert_token_chunks_infer -- < long_doc.txt # long-doc NER via the chunk seam (group_spans_document)
 ```

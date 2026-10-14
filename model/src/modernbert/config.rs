@@ -11,12 +11,21 @@
 //! `local_attention`-wide sliding window split evenly. Global layers use
 //! `global_rope_theta`; local layers use `local_rope_theta`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
 use svod_dtype::DType;
 
 use super::error::{Error, Result};
+
+/// Pooling strategy for the classification head. HF ModernBERT defaults to
+/// `"cls"` (take the first token); `"mean"` does a masked mean over the sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassifierPooling {
+    Cls,
+    Mean,
+}
 
 /// Clean, resolved ModernBERT backbone config.
 #[derive(Clone, Debug)]
@@ -48,6 +57,22 @@ pub struct ModernBertConfig {
     pub dtype: DType,
     /// Upper bound on the symbolic batch variable in the JIT wrapper.
     pub max_batch_size: usize,
+    // ── classification-only fields (ignored by the backbone / embedder) ──
+    /// Number of output classes for sequence classification.
+    pub num_labels: usize,
+    /// `"cls"` (take token 0) or `"mean"` (masked mean) — HF's
+    /// `classifier_pooling`.
+    pub classifier_pooling: ClassifierPooling,
+    /// Whether `head.dense` has a bias term (HF's `classifier_bias`).
+    pub classifier_bias: bool,
+    /// Whether LayerNorm biases are present (HF's `norm_bias`).
+    pub norm_bias: bool,
+    /// Dense label-name table for classification heads (sequence + token):
+    /// `id2label[id]` is the name of label `id`. Built from HF `config.json`'s
+    /// sparse `id2label` map — sized to `max(id)+1`, gaps filled with
+    /// `"LABEL_{id}"`. Empty for checkpoints without a label map (e.g. the
+    /// base embedder).
+    pub id2label: Vec<String>,
 }
 
 impl ModernBertConfig {
@@ -70,27 +95,6 @@ impl ModernBertConfig {
     /// Rotary base for the given layer.
     pub fn rope_theta(&self, layer_id: usize) -> f64 {
         if self.is_global_layer(layer_id) { self.global_rope_theta } else { self.local_rope_theta }
-    }
-
-    /// Splice in the structural fields parsed from the published `config.json`,
-    /// preserving the caller-chosen `dtype` / `max_batch_size`. Shared by the
-    /// backbone (`ModernBert`) and MLM (`ModernBertForMaskedLm`) Hub loaders so
-    /// both stay in sync without copy-pasting the field list.
-    pub fn merge_structural_from(&mut self, parsed: &Self) {
-        self.vocab_size = parsed.vocab_size;
-        self.hidden_size = parsed.hidden_size;
-        self.num_hidden_layers = parsed.num_hidden_layers;
-        self.num_attention_heads = parsed.num_attention_heads;
-        self.intermediate_size = parsed.intermediate_size;
-        self.max_position_embeddings = parsed.max_position_embeddings;
-        self.layer_norm_eps = parsed.layer_norm_eps;
-        self.global_rope_theta = parsed.global_rope_theta;
-        self.local_rope_theta = parsed.local_rope_theta;
-        self.local_attention = parsed.local_attention;
-        self.global_attn_every_n_layers = parsed.global_attn_every_n_layers;
-        self.pad_token_id = parsed.pad_token_id;
-        self.tie_word_embeddings = parsed.tie_word_embeddings;
-        self.decoder_bias = parsed.decoder_bias;
     }
 }
 
@@ -117,6 +121,11 @@ impl Default for ModernBertConfig {
             decoder_bias: false,
             dtype: crate::default_compute_dtype(),
             max_batch_size: 1,
+            num_labels: 2,
+            classifier_pooling: ClassifierPooling::Cls,
+            classifier_bias: false,
+            norm_bias: false,
+            id2label: vec![],
         }
     }
 }
@@ -143,6 +152,8 @@ impl ModernBertConfig {
 
     fn from_raw(raw: RawModernBertConfig) -> Self {
         let d = ModernBertConfig::default();
+        let id2label = dense_id2label(&raw.id2label);
+        let rope = raw.rope_parameters.unwrap_or_default();
         ModernBertConfig {
             vocab_size: raw.vocab_size.unwrap_or(d.vocab_size),
             hidden_size: raw.hidden_size.unwrap_or(d.hidden_size),
@@ -151,17 +162,60 @@ impl ModernBertConfig {
             intermediate_size: raw.intermediate_size.unwrap_or(d.intermediate_size),
             max_position_embeddings: raw.max_position_embeddings.unwrap_or(d.max_position_embeddings),
             layer_norm_eps: raw.layer_norm_eps.or(raw.norm_eps).unwrap_or(d.layer_norm_eps),
-            global_rope_theta: raw.global_rope_theta.unwrap_or(d.global_rope_theta),
-            local_rope_theta: raw.local_rope_theta.unwrap_or(d.local_rope_theta),
+            global_rope_theta: raw.global_rope_theta.or(rope.full_attention.rope_theta).unwrap_or(d.global_rope_theta),
+            local_rope_theta: raw.local_rope_theta.or(rope.sliding_attention.rope_theta).unwrap_or(d.local_rope_theta),
             local_attention: raw.local_attention.unwrap_or(d.local_attention),
             global_attn_every_n_layers: raw.global_attn_every_n_layers.unwrap_or(d.global_attn_every_n_layers),
             pad_token_id: raw.pad_token_id.unwrap_or(d.pad_token_id),
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(d.tie_word_embeddings),
             decoder_bias: raw.decoder_bias.unwrap_or(d.decoder_bias),
+            // Compute dtype is caller-chosen, not from config.json.
             dtype: d.dtype,
             max_batch_size: d.max_batch_size,
+            num_labels: raw.num_labels.unwrap_or(if id2label.is_empty() { d.num_labels } else { id2label.len() }),
+            classifier_pooling: match raw.classifier_pooling.as_deref() {
+                Some("mean") => ClassifierPooling::Mean,
+                _ => ClassifierPooling::Cls,
+            },
+            classifier_bias: raw.classifier_bias.unwrap_or(d.classifier_bias),
+            norm_bias: raw.norm_bias.unwrap_or(d.norm_bias),
+            id2label,
         }
     }
+
+    /// Splice every field from a checkpoint-parsed `parsed` config into `self`,
+    /// preserving the two caller-chosen fields (`dtype`, `max_batch_size`) that
+    /// are absent from the on-disk `config.json`. All hub loaders route through
+    /// here so the field list lives in one place — a new structural field flows
+    /// through every loader without touching them.
+    pub fn apply_checkpoint(&mut self, parsed: &ModernBertConfig) {
+        let dtype = self.dtype.clone();
+        let max_batch_size = self.max_batch_size;
+        *self = ModernBertConfig { dtype, max_batch_size, ..parsed.clone() };
+    }
+}
+
+/// Build a dense `Vec<String>` from a sparse HF `id2label` map (`config.json`):
+/// size to `max(id)+1`, fill gaps (and empty values) with `"LABEL_{id}"`. An
+/// absent or empty map yields `vec![]`.
+fn dense_id2label(raw: &Option<HashMap<String, String>>) -> Vec<String> {
+    let Some(map) = raw else { return Vec::new() };
+    let max_id = map.keys().filter_map(|k| k.parse::<usize>().ok()).max();
+    let Some(max_id) = max_id else { return Vec::new() };
+    let mut out = vec![String::new(); max_id + 1];
+    for (k, v) in map {
+        if let Ok(id) = k.parse::<usize>()
+            && id < out.len()
+        {
+            out[id] = v.clone();
+        }
+    }
+    for (i, slot) in out.iter_mut().enumerate() {
+        if slot.is_empty() {
+            *slot = format!("LABEL_{i}");
+        }
+    }
+    out
 }
 
 /// Serde mirror of the published `config.json`. Every field is optional so a
@@ -179,9 +233,32 @@ struct RawModernBertConfig {
     norm_eps: Option<f64>,
     global_rope_theta: Option<f64>,
     local_rope_theta: Option<f64>,
+    /// transformers ≥ 5 writes the two rotary bases here, per layer type,
+    /// instead of `global_rope_theta` / `local_rope_theta`.
+    rope_parameters: Option<RawRopeParameters>,
     local_attention: Option<usize>,
     global_attn_every_n_layers: Option<usize>,
     pad_token_id: Option<usize>,
     tie_word_embeddings: Option<bool>,
     decoder_bias: Option<bool>,
+    // ── classification-only fields ──
+    num_labels: Option<usize>,
+    /// HF derives `num_labels` from `len(id2label)` when not explicitly set.
+    id2label: Option<HashMap<String, String>>,
+    classifier_pooling: Option<String>,
+    classifier_bias: Option<bool>,
+    norm_bias: Option<bool>,
+}
+
+#[derive(Default, Deserialize)]
+struct RawRopeParameters {
+    #[serde(default)]
+    full_attention: RawRope,
+    #[serde(default)]
+    sliding_attention: RawRope,
+}
+
+#[derive(Default, Deserialize)]
+struct RawRope {
+    rope_theta: Option<f64>,
 }
