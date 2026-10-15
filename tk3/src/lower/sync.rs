@@ -198,17 +198,19 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block,
             // The warps part on a clean slate (the block's open effects are
             // fenced first, for every warp), fence their own effects among
             // their own lanes, and what any of them wrote or read is the
-            // block's open effect afterwards.
+            // block's open effect afterwards, a copy still in flight its
+            // pending one.
             Stmt::Warps { body } => {
                 let open = if state.pending.is_empty() { Need::Fence } else { Need::Land };
                 if state.any() {
                     state.meet(open, scope, &mut out);
                 }
-                let (body, _) = walk(prog, body, State::default(), Scope::Warp);
+                let (body, end) = walk(prog, body, State::default(), Scope::Warp);
                 let mut touched = HashSet::new();
                 written(prog, &body, &mut touched);
                 read(prog, &body, &mut touched);
                 state.dirty.extend(touched);
+                state.pending.extend(end.pending);
                 Stmt::Warps { body }
             }
             other => other,

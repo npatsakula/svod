@@ -77,6 +77,30 @@ fn warps_fence_their_own_effects_and_the_block_fences_theirs() {
     assert_eq!(scopes, [Scope::Warp, Scope::Block]);
 }
 
+/// A warp's asynchronous copy still in flight when the warps end is landed,
+/// not only fenced, before the block reads its tile.
+#[test]
+fn a_warps_async_copy_is_landed_before_the_block_reads_it() {
+    let mut k = Kernel::new("warps_async");
+    k.warps(4);
+    let src = k.param::<BF16>("x", ParamKind::In, 4 * 256);
+    let scratch = k.smem::<BF16>("scratch", 4 * 256);
+    k.each_warp(|k| {
+        let w = k.warp();
+        let g = k.view(src, w.clone() * 256, [16, 1], Shape::new(16, 16), [None, None]);
+        let region = k.smem_view::<BF16>(scratch, w * 256, Shape::new(16, 16));
+        k.stage(region, g, CopyMode::Async);
+    });
+    let first = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
+    let merged = k.load(first);
+    let out = k.param::<BF16>("o", ParamKind::Out, 256);
+    let o = out_view(&mut k, out, 0);
+    k.store(o, merged);
+    let mut prog = k.finish();
+    insert_barriers(&mut prog);
+    assert_eq!(top(&prog), ["other", "commit", "wait", "barrier", "load", "out"]);
+}
+
 /// A loop may run no trip, so what was written before it is still unfenced
 /// after it even when its body ends on a barrier.
 #[test]
