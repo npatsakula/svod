@@ -129,7 +129,8 @@ fn lattice(target: &Target) -> Vec<GemmCfg> {
 /// How a problem runs under one config: `blocks` blocks of `waves` waves,
 /// each holding `smem` bytes of shared memory and `regs` registers a lane
 /// by the layout count, and running `trips` trips of `work` ns of SM time
-/// through a ring `stages` deep.
+/// plus a trip's fixed overhead `trip` (its barrier and ring bubble, which
+/// the other blocks an SM holds work through) through a ring `stages` deep.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Run {
     pub blocks: usize,
@@ -138,6 +139,7 @@ pub(crate) struct Run {
     pub waves: usize,
     pub trips: usize,
     pub work: f64,
+    pub trip: f64,
     pub stages: usize,
 }
 
@@ -192,26 +194,71 @@ impl Problem {
         let fragments = waves * (bm / wr + bn * halves / wc) * bk * 2;
         let fill = (bm + bn * halves) * bk * 2;
         let steps = bm * bn * halves * bk / 4096;
-        let work = fragments as f64 * costs.smem_byte
-            + fill as f64 * costs.global_byte
-            + steps as f64 * costs.step
-            + costs.trip(!cfg.unroll && !target.cp_async);
         let (blocks, trips, stages) = (self.blocks(cfg), self.k / bk, cfg.stages);
-        Some((planner.pipelined(Run { blocks, smem, regs, waves, trips, work, stages }), regs))
+        let unique = (self.batches * (self.m + self.n * halves) * self.k * 2) as f64;
+        let fill_byte = planner.fill_byte(unique, (blocks * trips * fill) as f64);
+        let work = fragments as f64 * costs.smem_byte + fill as f64 * fill_byte + steps as f64 * costs.step;
+        let trip = costs.trip(!cfg.unroll && !target.cp_async);
+        Some((planner.pipelined(Run { blocks, smem, regs, waves, trips, work, trip, stages }), regs))
     }
 
     /// The lattice's configs that run this problem on the planner's target,
-    /// cheapest first, then by fewer registers, every pipeline (depth, ring
-    /// depth, unrolling) of every tile: the shortlist keeps a tile's first
-    /// clean one ([`shortlist`]).
+    /// every pipeline (depth, ring depth, unrolling) of every tile, cheapest
+    /// first (then by fewer registers) and [`spread`] over the block tiles
+    /// the cost band holds: the shortlist keeps a tile's first clean one
+    /// ([`shortlist`]).
     pub fn ranked(&self, planner: &Planner) -> Vec<GemmCfg> {
         let mut ranked: Vec<(f64, u32, GemmCfg)> = lattice(&planner.device.target)
             .into_iter()
             .filter_map(|c| self.admit(planner, &c).map(|(cost, regs)| (cost, regs, c)))
             .collect();
         ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        ranked.into_iter().map(|(_, _, c)| c).collect()
+        spread(ranked.into_iter().map(|(cost, _, c)| (cost, c)).collect(), |c| [c.tile[0], c.tile[1]])
     }
+}
+
+/// How far past the cheapest config's cost the model cannot tell configs
+/// apart: on sm_86 the measured best of Nemotron's projections and of 4096³
+/// sat 12–31% behind the model's first.
+const BAND: f64 = 1.35;
+
+/// `ranked` (cheapest first, with its costs) led by the band's classes in
+/// turn: each class's cheapest tile (classes in the order of their
+/// cheapest), then each one's next, and so on, a tile's pipelines (ring
+/// depth, unrolling) after it; then the rest as ranked. The model orders
+/// the tiles of a class (a block tile's warp grids and depths) better than
+/// it orders classes, so a shortlist from the front times every class the
+/// band holds rather than one class's variants.
+pub(crate) fn spread<C: Tiled, K: Eq + Hash>(ranked: Vec<(f64, C)>, class: impl Fn(&C) -> K) -> Vec<C> {
+    let Some(&(best, _)) = ranked.first() else { return vec![] };
+    let mut classes: Vec<(K, Vec<C>)> = vec![];
+    let mut tiles = HashSet::new();
+    for &(_, c) in ranked.iter().take_while(|(cost, _)| *cost <= BAND * best) {
+        if !tiles.insert(c.tile()) {
+            continue;
+        }
+        let key = class(&c);
+        match classes.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, list)) => list.push(c),
+            None => classes.push((key, vec![c])),
+        }
+    }
+    let depth = classes.iter().map(|(_, list)| list.len()).max().unwrap_or(0);
+    let mut out: Vec<C> = Vec::with_capacity(ranked.len());
+    let mut placed = HashSet::new();
+    for round in 0..depth {
+        for (_, list) in &classes {
+            let Some(&lead) = list.get(round) else { continue };
+            // The tile's pipelines follow it, in ranked order.
+            for &(_, c) in &ranked {
+                if c.tile() == lead.tile() && placed.insert(c) {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out.extend(ranked.into_iter().map(|(_, c)| c).filter(|c| placed.insert(*c)));
+    out
 }
 
 /// The configs the tune store measures per shape.
@@ -328,26 +375,44 @@ impl Planner {
         self.device.target.sms.expect("a planned target reports its SM count") as usize
     }
 
-    /// The SM time of `run`. Its blocks run in rounds of as many as an SM
-    /// holds at once, and no more than fill the SMs: by its shared memory and
-    /// by its register file under the layout estimate, at least one (the
-    /// compiled kernel, not the estimate, decides whether a block runs). A
-    /// trip of a round is bound by the SM's issue work, by one wave's own
-    /// issue (a block of fewer waves than SIMDs leaves the rest idle) or by
-    /// the memory latency its ring cannot hide (it prefetches `stages - 1`
-    /// trips ahead), whichever is longest.
+    /// The SM time of `run`. The busiest SM issues the work of
+    /// `⌈blocks / sms⌉` blocks, each taken up as another ends (measured on
+    /// sm_86: a 64×64 GEMM's time steps with that count, not with whole
+    /// rounds of resident blocks), a trip's fixed overhead shared with the
+    /// blocks it holds at once: by its shared memory and by its register file
+    /// under the layout estimate, at least one (the compiled kernel, not the
+    /// estimate, decides whether a block runs). A round of those blocks is at
+    /// least one wave's own issue (a block of fewer waves than SIMDs leaves
+    /// the rest idle) and the memory latency its ring cannot hide (it
+    /// prefetches `stages - 1` trips ahead).
     pub(crate) fn pipelined(&self, run: Run) -> f64 {
-        let Run { blocks, smem, regs, waves, trips, work, stages } = run;
+        let Run { blocks, smem, regs, waves, trips, work, trip, stages } = run;
         let Device { target, costs } = &self.device;
         let (o, sms) = (target.occupancy, self.sms());
         let per_simd = o.waves.min(o.file / regs.max(1)) as usize;
         let resident = (target.smem_bytes / smem).min(o.simds as usize * per_simd / waves).max(1);
-        let actual = resident.min(blocks.div_ceil(sms));
-        let rounds = blocks.div_ceil(sms * actual);
-        let issue = actual as f64 * work;
-        let wave = o.simds as f64 * work / waves as f64;
+        let per_sm = blocks.div_ceil(sms);
+        let rounds = per_sm.div_ceil(resident);
+        let issue = per_sm as f64 * (work + trip / resident.min(per_sm) as f64);
+        let wave = o.simds as f64 * (work + trip) / waves as f64;
         let wait = costs.latency / stages.saturating_sub(1).max(1) as f64;
-        (rounds * trips) as f64 * issue.max(wave).max(wait)
+        trips as f64 * issue.max(rounds as f64 * wave.max(wait))
+    }
+
+    /// What a byte of a fill costs when `fill` bytes stream `unique`
+    /// distinct ones. Where the distinct bytes fit three quarters of the
+    /// cache in front of DRAM (the rest left to other traffic) each comes
+    /// from DRAM once and its re-reads from the cache; past half again as
+    /// much every byte comes from DRAM; between, the two blend.
+    pub(crate) fn fill_byte(&self, unique: f64, fill: f64) -> f64 {
+        let c = &self.device.costs;
+        let held = 0.75 * c.l2_bytes;
+        if held <= 0.0 || fill <= 0.0 {
+            return c.global_byte;
+        }
+        let fits = ((1.5 * held - unique) / (0.5 * held)).clamp(0.0, 1.0);
+        let hit = fits * (1.0 - unique / fill).max(0.0);
+        hit * c.l2_byte + (1.0 - hit) * c.global_byte
     }
 
     /// Every attention config for `tiles` rows of `t` queries over `tk`
@@ -526,13 +591,13 @@ impl Attention {
         let work = fragments as f64 * costs.smem_byte
             + fill as f64 * costs.global_byte
             + steps as f64 * costs.step
-            + (kw * bq * bkv) as f64 * costs.score
-            + costs.trip(!cfg.unroll && !target.cp_async);
+            + (kw * bq * bkv) as f64 * costs.score;
+        let trip = costs.trip(!cfg.unroll && !target.cp_async);
         let diagonal = DIAGONAL * bq.div_ceil(bkv);
         let trips = if self.causal { self.tk.div_ceil(2 * bkv) + diagonal } else { self.tk.div_ceil(bkv) };
         let trips = trips.div_ceil(kw);
         let (blocks, stages) = (self.blocks(cfg), cfg.stages);
-        Some((planner.pipelined(Run { blocks, smem, regs, waves, trips, work, stages }), regs))
+        Some((planner.pipelined(Run { blocks, smem, regs, waves, trips, work, trip, stages }), regs))
     }
 
     /// The lattice's configs that run this problem on the planner's target,

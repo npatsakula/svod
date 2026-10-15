@@ -121,7 +121,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
 }
 
 /// Every probe pair lowers and renders for the target, and is keyed by
-/// the field it measures.
+/// the field it measures; so do the cache probes, smallest footprint first.
 #[test_case(sm86(); "sm86")]
 #[test_case(gfx1151(); "gfx1151")]
 #[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
@@ -129,7 +129,9 @@ fn every_probe_renders(target: Target) {
     let probes = probes(&target);
     let ops: Vec<String> = Costs::default().fields().map(|(f, _)| format!("probe:{f}")).into();
     assert_eq!(probes.iter().map(|p| p.op).collect::<Vec<_>>(), ops);
-    for p in &probes {
+    let cached = crate::probe::cache_probes(&target).unwrap();
+    assert!(cached.windows(2).all(|w| w[0].0 < w[1].0), "footprints grow");
+    for p in probes.iter().chain(cached.iter().map(|(_, p)| p)) {
         for (prog, lowering) in p.candidates.iter().flatten() {
             let decides = ["probe:lane_move", "probe:smem_trip"].contains(&p.op);
             assert!(decides || lowering.device.costs == Costs::default(), "{}: only a relayout's kind is costed", p.op);

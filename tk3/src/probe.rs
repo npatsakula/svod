@@ -78,6 +78,7 @@ pub fn costs(target: &Target) -> Result<Costs> {
         assert_eq!(probe.op.strip_prefix("probe:"), Some(name), "probes in field order");
         *value = measured(target, compiler, probe)?;
     }
+    (costs.l2_byte, costs.l2_bytes) = cache(target, compiler, costs.global_byte)?;
     // A plan prices a trip's fragment reads by `smem_byte`, so a trip is
     // what its pipeline adds besides reading its tile from the ring.
     let fragment = (trip_tile(target).elems() * 4) as f64 * costs.smem_byte;
@@ -118,6 +119,41 @@ fn timed(built: &mut [Built], per: f64) -> Result<u64, String> {
         }
         _ => Err("a program failed to build or lost its stamps".into()),
     }
+}
+
+/// The footprints the cache probes read [`STREAM`] bytes from, smallest
+/// first: from the size of a small cache to past every device's L2.
+const FOOTPRINTS: [(&str, usize); 8] = [
+    ("probe:cached_1m", 1 << 20),
+    ("probe:cached_2m", 2 << 20),
+    ("probe:cached_4m", 4 << 20),
+    ("probe:cached_8m", 8 << 20),
+    ("probe:cached_16m", 16 << 20),
+    ("probe:cached_32m", 32 << 20),
+    ("probe:cached_64m", 64 << 20),
+    ("probe:cached_128m", 128 << 20),
+];
+
+/// The cache in front of DRAM: a streamed byte's cost from the smallest
+/// footprint, which stays in it, and its bytes, the largest footprint still
+/// read nearer that rate than `global_byte`'s (on a log scale), so a second,
+/// slower cache level counts as DRAM. No cache faster than DRAM: its bytes
+/// price fills as DRAM does.
+fn cache(target: &Target, compiler: u64, global_byte: f64) -> Result<(f64, f64)> {
+    let mut rates = Vec::with_capacity(FOOTPRINTS.len());
+    for (footprint, probe) in cache_probes(target)? {
+        rates.push((footprint, measured(target, compiler, probe)?));
+    }
+    let near = rates[0].1;
+    let mid = (near * global_byte).sqrt();
+    let held = rates.iter().take_while(|(_, r)| *r <= mid).last().map_or(0, |&(f, _)| f);
+    Ok((near, held as f64))
+}
+
+/// The cache probes of `target` with their footprints, smallest first.
+pub(crate) fn cache_probes(target: &Target) -> Result<Vec<(usize, Probe)>> {
+    let p = Probes::new(target)?;
+    Ok(FOOTPRINTS.iter().map(|&(op, footprint)| (footprint, p.cached(op, footprint))).collect())
 }
 
 /// Every probe of `target`, in [`Costs::fields`] order.
@@ -245,6 +281,39 @@ impl<'a> Probes<'a> {
             let sum = if on {
                 sum_loads(&mut k, iters, zero, |k, i| {
                     k.view(src, (i * blocks + block) * tile.elems(), [tile.cols, 1], tile, [None, None])
+                })
+            } else {
+                zero
+            };
+            output(&mut k, blocks, sum);
+            k.finish()
+        })
+    }
+
+    /// Four times [`STREAM`] bytes of i32 tiles read by a single wave of
+    /// blocks, every block resident from first to last, so the tiles they
+    /// read an iteration together run on in one sweep, wrapped into the
+    /// first `footprint` bytes: a tile comes round again after a footprint of
+    /// traffic, so a byte comes from wherever a footprint that size stays.
+    /// The block count is not a power of two, so the wrap never folds the
+    /// sweep onto a block's own tile. Faster than DRAM, so it reads more than
+    /// [`Self::global_byte`] to stand as clear of its baseline.
+    fn cached(&self, op: &'static str, footprint: usize) -> Probe {
+        let tile = Shape::new(32, 128);
+        let o = self.target.occupancy;
+        let blocks = (self.sms * o.simds * o.waves / WARPS) as usize;
+        let iters = 4 * STREAM / (tile.elems() * 4) / blocks;
+        let region = footprint / (tile.elems() * 4);
+        let units = (blocks * iters * tile.elems() * 4) as f64;
+        self.make(op, ScalarDType::Int32, units, true, self.lowering(ROWS, false), |on| {
+            let mut k = kernel(op, blocks, WARPS);
+            let src = k.param::<I32>("src", ParamKind::In, footprint / 4);
+            let block = k.block(0);
+            let zero = k.fill::<I32>(tile, Const::Int(0));
+            let sum = if on {
+                sum_loads(&mut k, iters, zero, |k, i| {
+                    let at = (i * blocks + block) % region * tile.elems();
+                    k.view(src, at, [tile.cols, 1], tile, [None, None])
                 })
             } else {
                 zero

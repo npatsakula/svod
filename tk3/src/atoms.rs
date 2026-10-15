@@ -151,13 +151,33 @@ pub struct Costs {
     pub smem_trip: f64,
     /// Global memory latency one trip waits unhidden, ns.
     pub latency: f64,
+    /// One byte streamed into a block from the cache in front of DRAM (L2),
+    /// as `global_byte` from a footprint that stays in it.
+    pub l2_byte: f64,
+    /// That cache's bytes: operands that fit in it come from DRAM once and
+    /// are re-read from it. 0 where unmeasured: every fill byte is then
+    /// priced at `global_byte`.
+    pub l2_bytes: f64,
 }
 
 impl Costs {
-    /// Every field by name, in declaration order.
+    /// Every field a pair of programs measures, by name, in declaration
+    /// order: all but the cache's, which a series of footprints measures.
     pub fn fields(&mut self) -> [(&'static str, &mut f64); 10] {
-        let Costs { smem_byte, global_byte, scatter, step, score, trip, trip_rolled, lane_move, smem_trip, latency } =
-            self;
+        let Costs {
+            smem_byte,
+            global_byte,
+            scatter,
+            step,
+            score,
+            trip,
+            trip_rolled,
+            lane_move,
+            smem_trip,
+            latency,
+            l2_byte: _,
+            l2_bytes: _,
+        } = self;
         [
             ("smem_byte", smem_byte),
             ("global_byte", global_byte),
