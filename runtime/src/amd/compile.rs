@@ -37,12 +37,7 @@ pub(crate) fn amd_toolchain(cache: Option<&crate::object_cache::ObjectCache>) ->
 /// Refuse a clang older than [`MIN_AMD_CLANG_MAJOR`], given its `--version`
 /// output; one whose version it cannot read passes.
 pub(crate) fn check_amd_clang(version: &str) -> crate::Result<()> {
-    let major = version
-        .split("clang version ")
-        .nth(1)
-        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-        .and_then(|digits| digits.parse::<u32>().ok());
-    match major {
+    match crate::clang::clang_major_version(version) {
         Some(major) if major < MIN_AMD_CLANG_MAJOR => Err(crate::Error::JitCompilation {
             reason: format!(
                 "{} is too old for AMD GPUs: clang 20 compiles some AMDGPU kernels that spill to wrong \

@@ -143,7 +143,7 @@ impl ModernBertForMaskedLm {
         let repo = crate::hub::HubRepo::open(model_id, revision)?;
         let cfg_path = repo.get("config.json")?;
         let parsed = ModernBertConfig::from_json(&cfg_path)?;
-        config.merge_structural_from(&parsed);
+        config.apply_checkpoint(&parsed);
 
         let weights_path = repo.get("model.safetensors")?;
         Self::from_safetensors(&weights_path, config.clone())
@@ -160,7 +160,7 @@ impl ModernBertForMaskedLm {
     pub fn from_state_dict(sd: &StateDict, config: ModernBertConfig) -> Result<Self> {
         let dtype = config.dtype.clone();
         let mut model = Self::empty(config);
-        model.load_state_dict(&state::cast_all(sd, dtype), "")?;
+        model.load_state_dict(&state::cast_all(sd, dtype)?, "")?;
         Ok(model)
     }
 }

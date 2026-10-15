@@ -11,6 +11,7 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Linear, Module};
 
+use crate::attention::Keys;
 use crate::init::{Bias, linear};
 use crate::state::scoped;
 
@@ -114,7 +115,7 @@ impl MultiHeadAttention {
         };
         let (q_fa, k_fa, v_fa) = (split(q)?, split(k)?, split(v)?);
 
-        let out = crate::attention::attend(&q_fa, &k_fa, &v_fa, causal, key_lens)?;
+        let out = crate::attention::attend(&q_fa, &k_fa, &v_fa, causal, key_lens.map_or(Keys::All, Keys::Lens))?;
         Ok(out.try_reshape([b, s, d.into()])?)
     }
 }

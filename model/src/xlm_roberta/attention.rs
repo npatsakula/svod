@@ -1,17 +1,21 @@
 //! XLM-RoBERTa self-attention with separate biased Q/K/V/O projections.
 //!
 //! Standard BERT-style multi-head attention: separate `Linear(D, D, bias)` for
-//! Q, K, V; reshape to `(B, H, L, hd)`; scaled dot-product attention (global,
-//! no window); output `Linear(D, D, bias)`. No RoPE, no relative positions.
+//! Q, K, V; reshape to seq-major `(B, L, H, hd)`; global attention through
+//! the shared `attend` — tk's flash attention on 16-bit activations whose
+//! length tiles, SDPA otherwise; output `Linear(D, D, bias)`. No RoPE, no
+//! relative positions.
 //!
 //! State-dict keys match the published `BAAI/bge-m3` `pytorch_model.bin`:
 //! `attention.self.{query,key,value}.{weight,bias}`,
 //! `attention.output.dense.{weight,bias}`.
 
 use svod_dtype::DType;
+use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
 
+use crate::attention::{Keys, attend};
 use crate::init::{fan_in_uniform, zeros};
 
 use super::error::Result;
@@ -60,15 +64,17 @@ impl XlmRobertaAttention {
     /// `padding_mask`: optional bool `(B, L)` where `true` = real token,
     /// `false` = padding.
     pub fn forward(&self, x: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
-        let project = |w: &Tensor, b: &Tensor| -> Result<Tensor> {
-            Ok(x.linear().weight(w).bias(b).call()?.split_heads(self.num_heads)?)
+        let (b, l) = (x.dim(0)?, x.dim(1)?);
+        let heads = [b.clone(), l.clone(), SInt::Const(self.num_heads), SInt::Const(self.head_dim)];
+        let project = |w: &Tensor, bias: &Tensor| -> Result<Tensor> {
+            Ok(x.linear().weight(w).bias(bias).call()?.try_reshape(heads.clone())?)
         };
         let q = project(&self.query_weight, &self.query_bias)?;
         let k = project(&self.key_weight, &self.key_bias)?;
         let v = project(&self.value_weight, &self.value_bias)?;
 
-        let attn = q.scaled_dot_product_attention().key(&k).value(&v).maybe_key_padding_mask(padding_mask).call()?;
-
-        Ok(attn.merge_heads()?.linear().weight(&self.out_weight).bias(&self.out_bias).call()?)
+        let keys = padding_mask.map_or(Keys::All, Keys::Mask);
+        let attn = attend(&q, &k, &v, false, keys)?.try_reshape([b, l, SInt::Const(self.hidden_size)])?;
+        Ok(attn.linear().weight(&self.out_weight).bias(&self.out_bias).call()?)
     }
 }

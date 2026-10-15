@@ -6,6 +6,7 @@
 
 use crate::bgem3::{BgeM3, BgeRerankerV2M3, EncodeOpts};
 use crate::state::{self, StateDict};
+use crate::test::unit::{load_golden_vec, max_abs_delta};
 use crate::xlm_roberta::XlmRobertaConfig;
 use std::path::PathBuf;
 use svod_dtype::DType;
@@ -56,17 +57,6 @@ fn load_fixture() -> (BgeM3, StateDict) {
         None
     };
     (BgeM3 { model: backbone, sparse_head: sparse, colbert_head: colbert, normalize_dense: true }, golden)
-}
-
-fn load_golden_vec<T: Clone + Default + svod_dtype::ext::HasDType>(sd: &StateDict, key: &str) -> Vec<T> {
-    let t = sd.get(key).unwrap_or_else(|| panic!("missing golden key: {key}")).clone();
-    t.realize().unwrap();
-    t.as_vec::<T>().unwrap()
-}
-
-fn max_abs_delta(got: &[f32], want: &[f32]) -> f32 {
-    assert_eq!(got.len(), want.len());
-    got.iter().zip(want.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
 }
 
 fn prep_inputs(golden: &StateDict) -> (Tensor, Tensor) {

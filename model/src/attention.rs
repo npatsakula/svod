@@ -2,7 +2,7 @@
 //!
 //! Heads are seq-major, `[B, T, H, D]` — the layout the hand flash-attention
 //! kernel consumes. That kernel runs when it applies; [SDPA] runs otherwise,
-//! with the same `key_lens` key-only padding mask, so the result is correct on
+//! with the same key-only padding mask ([`Keys`]), so the result is correct on
 //! any device.
 //!
 //! The kernel's mma operands are 16-bit, so it only runs on activations that
@@ -17,18 +17,33 @@ use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 use svod_tensor::error::Result;
 
+/// The keys each query row may attend.
+#[derive(Clone, Copy)]
+pub(crate) enum Keys<'a> {
+    /// Every key.
+    All,
+    /// A `[B]` `i32` length per row: the keys at and past it are masked.
+    Lens(&'a Tensor),
+    /// A `[B, T]` validity mask, non-zero = a real key.
+    Mask(&'a Tensor),
+}
+
 /// Attention over `[B, T, H, D]` queries, keys and values, returning
-/// `[B, T, H, D]`. `key_lens`, a realized `[B]` `i32` tensor, masks the keys at
-/// and past each row's length.
-pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, key_lens: Option<&Tensor>) -> Result<Tensor> {
+/// `[B, T, H, D]`, attending the keys `keys` admits.
+pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, keys: Keys<'_>) -> Result<Tensor> {
     let sixteen_bit = matches!(q.dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16);
     if sixteen_bit && q.dim_const(-1)?.is_multiple_of(16) {
-        let opts = svod_tk::FaOpts { causal, key_lens, ..Default::default() };
+        let (key_lens, key_mask) = match keys {
+            Keys::All => (None, None),
+            Keys::Lens(lens) => (Some(lens), None),
+            Keys::Mask(mask) => (None, Some(mask)),
+        };
+        let opts = svod_tk::FaOpts { causal, key_lens, key_mask, ..Default::default() };
         if let Some(out) = svod_tk::flash_attention_with(q, k, v, opts).map_err(tk_launch_error)? {
             return Ok(out);
         }
     }
-    sdpa(q, k, v, causal, key_lens)
+    sdpa(q, k, v, causal, keys)
 }
 
 /// The sequence multiple the flash-attention kernel tiles, when it can run
@@ -40,16 +55,18 @@ pub(crate) fn flash_attention_tile(device: &svod_dtype::DeviceSpec, dtype: &svod
 }
 
 /// [`attend`]'s fallback: SDPA wants head-major `[B, H, T, D]`.
-fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, key_lens: Option<&Tensor>) -> Result<Tensor> {
+fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, keys: Keys<'_>) -> Result<Tensor> {
     let head_major = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]);
-    // `[B, T]` key validity is a property of `key_lens`, shared by every layer:
-    // built outside the layer's origin scope so the layers share one mask.
-    let valid = match key_lens {
-        Some(lens) => {
+    let valid = match keys {
+        Keys::All => None,
+        // `[B, T]` key validity is a property of the lengths, shared by every
+        // layer: built outside the layer's origin scope so the layers share
+        // one mask.
+        Keys::Lens(lens) => {
             let _shared = OriginScope::suspend();
             Some(Tensor::sequence_mask(lens, k.dim_const(1)?)?)
         }
-        None => None,
+        Keys::Mask(mask) => Some(mask.clone()),
     };
     head_major(q)?
         .scaled_dot_product_attention()

@@ -24,6 +24,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, Layer, LayerNorm, Linear, Module, get_tensor, prefixed};
 
+use crate::attention::Keys;
 use crate::audio::MelSpectrogram;
 use crate::init::{Bias, conv1d, layer_norm, linear};
 use crate::state::{self, StateDict, scoped, scoped_index};
@@ -88,7 +89,7 @@ impl Attention {
         let q = heads(0)?.apply_rotary_emb(cos, sin, false)?.contiguous();
         let k = heads(1)?.apply_rotary_emb(cos, sin, false)?.contiguous();
         let v = heads(2)?;
-        let out = crate::attention::attend(&q, &k, &v, false, Some(key_lens))?;
+        let out = crate::attention::attend(&q, &k, &v, false, Keys::Lens(key_lens))?;
         project(&self.o_proj, &out.try_reshape([b, s, SInt::Const(d)])?)
     }
 }

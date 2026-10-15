@@ -4,6 +4,7 @@ device/src/test/
 dtype/src/test/
 ir/src/test/
 model/src/test/
+model/scripts/
 onnx/src/test/
 runtime/src/test/
 schedule/src/test/

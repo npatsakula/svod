@@ -9,7 +9,7 @@ use svod_tensor::jit::{InputSpec, JitError};
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
-use crate::kernels::fa::{FA_SUPPORTED_ARCHS, FaOpts, flash_attention_with};
+use crate::kernels::fa::{FA_SUPPORTED_ARCHS, FaOpts, flash_attention_packed, flash_attention_with};
 
 const MAX_B: usize = 3;
 const N: usize = 256;
@@ -18,14 +18,44 @@ const D: usize = 64;
 /// Valid keys per batch row: a full row, a partial last KV block, a single key.
 const LENS: [i32; MAX_B] = [N as i32, 77, 1];
 
+/// How the keys are masked: not at all, by per-row lengths, or by a `[B, N]`
+/// validity table.
+#[derive(Clone, Copy, Debug)]
+enum Mask {
+    None,
+    Lens,
+    Keys,
+}
+
+/// The `[MAX_B, N]` key validity: every key, every third one hidden, a single
+/// key.
+fn key_table() -> Vec<i32> {
+    (0..MAX_B * N)
+        .map(|i| match i / N {
+            0 => 1,
+            1 => i32::from(i % N % 3 != 1),
+            _ => i32::from(i % N == 5),
+        })
+        .collect()
+}
+
 struct Attention {
     causal: bool,
 }
 
 impl Attention {
-    fn forward(&self, q: &Tensor, k: &Tensor, v: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor, JitError> {
-        let opts = FaOpts { causal: self.causal, key_lens, seg_start: None };
+    fn forward(&self, q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) -> Result<Tensor, JitError> {
+        let opts = FaOpts { causal: self.causal, ..opts };
         let out = flash_attention_with(q, k, v, opts)
+            .map_err(|e| JitError::Build { source: Box::new(e) })?
+            .expect("the FA kernel applies on a supported device");
+        Ok(out.cast(DType::Float32))
+    }
+
+    /// Over one packed `[B, N, 3H, D]` operand, the key table masking it.
+    fn forward_packed(&self, qkv: &Tensor, keys: &Tensor) -> Result<Tensor, JitError> {
+        let opts = FaOpts { causal: self.causal, key_mask: Some(keys), ..Default::default() };
+        let out = flash_attention_packed(qkv, (H, H), opts)
             .map_err(|e| JitError::Build { source: Box::new(e) })?
             .expect("the FA kernel applies on a supported device");
         Ok(out.cast(DType::Float32))
@@ -38,7 +68,7 @@ jit_wrapper! {
         batch_var b: (1, MAX_B),
         outputs { o }
 
-        build(q, k, v) { model.forward(q, k, v, None) }
+        build(q, k, v) { model.forward(q, k, v, FaOpts::default()) }
     }
 }
 
@@ -48,7 +78,17 @@ jit_wrapper! {
         batch_var b: (1, MAX_B),
         outputs { o }
 
-        build(q, k, v, lens) { model.forward(q, k, v, Some(lens)) }
+        build(q, k, v, lens) { model.forward(q, k, v, FaOpts { key_lens: Some(lens), ..Default::default() }) }
+    }
+}
+
+jit_wrapper! {
+    KeyTableAttentionJit(Attention) {
+        inputs { q: Tensor, k: Tensor, v: Tensor, keys: Tensor }
+        batch_var b: (1, MAX_B),
+        outputs { o }
+
+        build(q, k, v, keys) { model.forward(q, k, v, FaOpts { key_mask: Some(keys), ..Default::default() }) }
     }
 }
 
@@ -83,6 +123,18 @@ macro_rules! batch_plan {
 }
 batch_plan!(AttentionJit);
 batch_plan!(MaskedAttentionJit);
+jit_wrapper! {
+    PackedAttentionJit(Attention) {
+        inputs { qkv: Tensor, keys: Tensor }
+        batch_var b: (1, MAX_B),
+        outputs { o }
+
+        build(qkv, keys) { model.forward_packed(qkv, keys) }
+    }
+}
+
+batch_plan!(KeyTableAttentionJit);
+batch_plan!(PackedAttentionJit);
 
 fn copy_into(t: &Tensor, dst: &mut svod_device::Buffer) {
     t.realize().expect("realize");
@@ -104,35 +156,83 @@ fn operand(seed: f32) -> Tensor {
 ///
 /// One plan prepared at the batch capacity and executed at every bound batch
 /// matches both the kernel built for that concrete batch and SDPA, with exactly
-/// one flash-attention dispatch whose grid takes the batch variable.
-#[test_case(false, false; "bidirectional")]
-#[test_case(true, false; "causal")]
-#[test_case(false, true; "bidirectional key mask")]
-#[test_case(true, true; "causal key mask")]
+/// one flash-attention dispatch whose grid takes the batch variable. A `[B, N]`
+/// key table takes the queries' batch variable as the operands do.
+#[test_case(false, Mask::None; "bidirectional")]
+#[test_case(true, Mask::None; "causal")]
+#[test_case(false, Mask::Lens; "bidirectional key mask")]
+#[test_case(true, Mask::Lens; "causal key mask")]
+#[test_case(false, Mask::Keys; "bidirectional key table")]
+#[test_case(true, Mask::Keys; "causal key table")]
 #[ignore]
-fn fa_batch_var_matches_concrete_batch(causal: bool, masked: bool) {
+fn fa_batch_var_matches_concrete_batch(causal: bool, mask: Mask) {
     if !super::device_supported(FA_SUPPORTED_ARCHS) {
         eprintln!("skip fa_batch_var_matches_concrete_batch: unsupported device/toolchain");
         return;
     }
     let (q, k, v) = (operand(0.0), operand(1.0), operand(2.0));
+    let keys = key_table();
     let spec = InputSpec::new(&[MAX_B, N, H, D], DType::Float16);
-    let mut plan: Box<dyn BatchPlan> = if masked {
-        let mut jit = MaskedAttentionJit::new(Attention { causal });
-        jit.prepare(spec.clone(), spec.clone(), spec, InputSpec::i32(&[MAX_B])).expect("prepare");
-        copy_into(&q, jit.q_mut().expect("q"));
-        copy_into(&k, jit.k_mut().expect("k"));
-        copy_into(&v, jit.v_mut().expect("v"));
-        copy_into(&Tensor::from_slice(LENS.as_slice()), jit.lens_mut().expect("lens"));
-        Box::new(jit)
-    } else {
-        let mut jit = AttentionJit::new(Attention { causal });
-        jit.prepare(spec.clone(), spec.clone(), spec).expect("prepare");
-        copy_into(&q, jit.q_mut().expect("q"));
-        copy_into(&k, jit.k_mut().expect("k"));
-        copy_into(&v, jit.v_mut().expect("v"));
-        Box::new(jit)
+    let mut plan: Box<dyn BatchPlan> = match mask {
+        Mask::None => {
+            let mut jit = AttentionJit::new(Attention { causal });
+            jit.prepare(spec.clone(), spec.clone(), spec).expect("prepare");
+            copy_into(&q, jit.q_mut().expect("q"));
+            copy_into(&k, jit.k_mut().expect("k"));
+            copy_into(&v, jit.v_mut().expect("v"));
+            Box::new(jit)
+        }
+        Mask::Lens => {
+            let mut jit = MaskedAttentionJit::new(Attention { causal });
+            jit.prepare(spec.clone(), spec.clone(), spec, InputSpec::i32(&[MAX_B])).expect("prepare");
+            copy_into(&q, jit.q_mut().expect("q"));
+            copy_into(&k, jit.k_mut().expect("k"));
+            copy_into(&v, jit.v_mut().expect("v"));
+            copy_into(&Tensor::from_slice(LENS.as_slice()), jit.lens_mut().expect("lens"));
+            Box::new(jit)
+        }
+        Mask::Keys => {
+            let mut jit = KeyTableAttentionJit::new(Attention { causal });
+            jit.prepare(spec.clone(), spec.clone(), spec, InputSpec::i32(&[MAX_B, N])).expect("prepare");
+            copy_into(&q, jit.q_mut().expect("q"));
+            copy_into(&k, jit.k_mut().expect("k"));
+            copy_into(&v, jit.v_mut().expect("v"));
+            let table = Tensor::from_slice(keys.as_slice()).try_reshape([MAX_B, N]).expect("reshape");
+            copy_into(&table, jit.keys_mut().expect("keys"));
+            Box::new(jit)
+        }
     };
+    check_every_batch(plan.as_mut(), (&q, &k, &v), causal, mask);
+}
+
+/// `SVOD_DEVICE=CUDA:0 cargo test --release -p svod-tk --lib fa_batch_var -- --ignored --nocapture`.
+///
+/// The packed `[B, N, 3H, D]` operand takes the batch variable as the split
+/// ones do: one plan, the key table masking it, matches the split kernel built
+/// for each concrete batch and SDPA.
+#[test_case(false; "bidirectional")]
+#[test_case(true; "causal")]
+#[ignore]
+fn fa_batch_var_packed_matches_concrete_batch(causal: bool) {
+    if !super::device_supported(FA_SUPPORTED_ARCHS) {
+        eprintln!("skip fa_batch_var_packed_matches_concrete_batch: unsupported device/toolchain");
+        return;
+    }
+    let (q, k, v) = (operand(0.0), operand(1.0), operand(2.0));
+    let qkv = Tensor::cat(&[&q, &k, &v], 2).expect("pack the heads");
+    let mut jit = PackedAttentionJit::new(Attention { causal });
+    jit.prepare(InputSpec::new(&[MAX_B, N, 3 * H, D], DType::Float16), InputSpec::i32(&[MAX_B, N])).expect("prepare");
+    copy_into(&qkv, jit.qkv_mut().expect("qkv"));
+    let table = Tensor::from_slice(key_table().as_slice()).try_reshape([MAX_B, N]).expect("reshape");
+    copy_into(&table, jit.keys_mut().expect("keys"));
+    check_every_batch(&mut jit, (&q, &k, &v), causal, Mask::Keys);
+}
+
+/// Execute `plan` at every bound batch, down and back to one, against the split
+/// kernel built for that concrete batch and SDPA; the plan holds exactly one
+/// flash-attention dispatch, whose grid takes the batch variable.
+fn check_every_batch(plan: &mut dyn BatchPlan, (q, k, v): (&Tensor, &Tensor, &Tensor), causal: bool, mask: Mask) {
+    let keys = key_table();
     let dispatches = plan.fa_dispatches();
     assert_eq!(dispatches.len(), 1, "one flash-attention dispatch, got {dispatches:?}");
     assert!(dispatches[0].1.iter().any(|n| n == "b"), "the FA grid takes `b`: {dispatches:?}");
@@ -141,12 +241,20 @@ fn fa_batch_var_matches_concrete_batch(causal: bool, masked: bool) {
         let got = plan.run(b);
 
         let live = |t: &Tensor| t.try_shrink([Some((0, b as isize)), None, None, None]).expect("shrink").contiguous();
-        let (qb, kb, vb) = (live(&q), live(&k), live(&v));
+        let (qb, kb, vb) = (live(q), live(k), live(v));
         let lens = Tensor::from_slice(&LENS[..b]);
-        let opts = FaOpts { causal, key_lens: masked.then_some(&lens), seg_start: None };
+        let table = Tensor::from_slice(&keys[..b * N]).try_reshape([b, N]).expect("reshape");
+        let (by_lens, by_keys) = (matches!(mask, Mask::Lens), matches!(mask, Mask::Keys));
+        let opts = FaOpts {
+            causal,
+            key_lens: by_lens.then_some(&lens),
+            key_mask: by_keys.then_some(&table),
+            ..Default::default()
+        };
         let concrete = flash_attention_with(&qb, &kb, &vb, opts).expect("fa").expect("applies").cast(DType::Float32);
         concrete.realize().expect("realize concrete");
-        let reference = super::fa::fa_reference(&qb, &kb, &vb, causal, masked.then_some(&LENS[..b]), None);
+        let (lens, keys) = (by_lens.then_some(&LENS[..b]), by_keys.then_some(&keys[..b * N]));
+        let reference = super::fa::fa_reference(&qb, &kb, &vb, causal, lens, None, (keys, None));
         reference.realize().expect("realize reference");
 
         let same = svod_tensor::testing::allclose_f32(&got, &concrete.as_vec::<f32>().expect("read"), 1e-3, 1e-3);

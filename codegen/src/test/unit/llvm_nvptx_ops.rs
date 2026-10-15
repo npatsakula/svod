@@ -311,12 +311,12 @@ fn nvptx_rejects_fp8_casts() {
     assert!(err.to_string().contains("fp8 cast"), "{err}");
 }
 
-/// Conversions the CPU emitter renders generically all select on NVPTX; bf16
-/// narrowing takes the integer-domain rounding from the decomposition set and
-/// bools store as bytes.
+/// Conversions the CPU emitter renders generically all select on NVPTX: bf16
+/// narrowing is a plain `fptrunc`, which sm_80+ assembles to the native
+/// round-to-nearest-even `cvt`, and bools store as bytes.
 #[test_case::test_case(DType::Float32, DType::Float16, &["fptrunc float", "to half"]; "f32 to f16")]
 #[test_case::test_case(DType::Float16, DType::Float32, &["fpext half"]; "f16 to f32")]
-#[test_case::test_case(DType::Float32, DType::BFloat16, &["bitcast i16", "to bfloat"]; "f32 to bf16 rounds in integers")]
+#[test_case::test_case(DType::Float32, DType::BFloat16, &["fptrunc float", "to bfloat"]; "f32 to bf16")]
 #[test_case::test_case(DType::BFloat16, DType::Float32, &["fpext bfloat"]; "bf16 to f32")]
 #[test_case::test_case(DType::Int32, DType::Float32, &["sitofp i32"]; "i32 to f32")]
 #[test_case::test_case(DType::Float32, DType::Int64, &["fptosi float", "to i64"]; "f32 to i64")]
@@ -328,10 +328,10 @@ fn nvptx_casts_select(from: DType, to: DType, present: &[&str]) {
     for needle in present {
         assert!(rendered.code.contains(needle), "missing {needle}:\n{}", rendered.code);
     }
-    if to == DType::BFloat16 {
-        assert!(!rendered.code.contains("fptrunc float"), "{}", rendered.code);
+    let ptx = assert_ptx_compiles(&rendered.code, SM86);
+    if let Some(ptx) = ptx.filter(|_| to == DType::BFloat16) {
+        assert!(ptx.contains("cvt.rn.bf16.f32"), "{ptx}");
     }
-    assert_ptx_compiles(&rendered.code, SM86);
 }
 
 #[test]

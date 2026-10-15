@@ -42,9 +42,9 @@
 use svod_dtype::{AmdArch, CudaArch, GpuArch};
 
 use crate::tiles::{
-    RT_8X8_SIMD, RT_8X8_SIMD_T, RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T,
-    RT_16X16_W32_IN, RTBaseShape, ST_8X8, ST_16X16, ST_16X16_MMA, ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32,
-    STBaseShape,
+    RT_8X8_SIMD, RT_8X8_SIMD_T, RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_MMA_HALVES, RT_16X16_W32_ACC,
+    RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape, ST_8X8, ST_16X16, ST_16X16_MMA, ST_16X16_SWIZZLED,
+    ST_16X16_SWIZZLED_W32, ST_16X32_MMA, ST_16X64_MMA, STBaseShape,
 };
 
 /// Logical role of a 16×16 matrix-core fragment, independent of arch packing.
@@ -168,9 +168,10 @@ impl ArchCaps {
     /// [`RT_16X16`]; gfx11 (RDNA3 WMMA) splits into the even/odd-interleaved
     /// accumulator, the replicated input, and the transposed accumulator, while
     /// gfx12 (RDNA4) shares one strided 8/lane [`RT_16X16_GFX12`] across all four; CUDA
-    /// sm_80+ resolves every role to the two-half [`RT_16X16_MMA`] (an accumulator
-    /// IS the A-operand register order, and the transposed store is the `Col`
-    /// reading of the same map); Apple7+ Metal resolves to the 8×8
+    /// sm_80+ resolves every role to the two-half [`RT_16X16_MMA`] map (an
+    /// accumulator IS the A-operand register order, and the transposed store is the
+    /// `Col` reading of the same map), the A position read by the core in n-halves
+    /// ([`RT_16X16_MMA_HALVES`]); Apple7+ Metal resolves to the 8×8
     /// [`RT_8X8_SIMD`], flipped to [`RT_8X8_SIMD_T`] for the A operand. `None` where tk has
     /// no fragment table (pre-Ampere CUDA, pre-Apple7 Metal) — see the module
     /// docs.
@@ -179,7 +180,10 @@ impl ArchCaps {
             return None;
         }
         Some(match self.arch {
-            GpuArch::Cuda(_) => RT_16X16_MMA,
+            GpuArch::Cuda(_) => match role {
+                FragRole::Operand => RT_16X16_MMA_HALVES,
+                FragRole::OperandB | FragRole::Accumulator | FragRole::AccumulatorT => RT_16X16_MMA,
+            },
             // Apple's core computes `D = A·B` straight off the fragment map, with no
             // per-operand calibration table to absorb tk's `Col` convention. tk's
             // accumulators are `Col`, so the product is emitted transposed
@@ -218,6 +222,19 @@ impl ArchCaps {
     /// bank conflicts (the matmul A/B strips). `None` where [`Self::frag`] is.
     pub fn shared_swizzled(&self) -> Option<STBaseShape> {
         self.shared_strip(true)
+    }
+
+    /// The strip for `cols`-wide rows of a `bytes`-wide element that are only ever
+    /// read by whole rows (every [`crate::ST::subtile`] of it spans its full width):
+    /// on CUDA, where a row of 64 or 128 bytes is one base tile ([`ST_16X32_MMA`],
+    /// [`ST_16X64_MMA`]), so the `cp.async` fill writes each row contiguously; the
+    /// swizzled strip ([`Self::shared_swizzled`]) everywhere else.
+    pub fn shared_rows(&self, cols: usize, bytes: usize) -> Option<STBaseShape> {
+        match (self.arch, cols * bytes) {
+            (GpuArch::Cuda(_), 64) if bytes == 2 && self.has_matrix_core_layouts() => Some(ST_16X32_MMA),
+            (GpuArch::Cuda(_), 128) if bytes == 2 && self.has_matrix_core_layouts() => Some(ST_16X64_MMA),
+            _ => self.shared_swizzled(),
+        }
     }
 
     fn shared_strip(&self, swizzled: bool) -> Option<STBaseShape> {

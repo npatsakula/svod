@@ -434,6 +434,163 @@ fn a_wide_index_never_aliases_through_the_collapse(offset: i32) {
     }
 }
 
+/// An index loaded from a buffer, whose bounds `reduce_collapse` cannot know.
+fn loaded_index(dtype: DType) -> Arc<UOp> {
+    UOp::load().index(crate::test::support::build::index(UOp::new_buffer(DeviceSpec::Cpu, 16, dtype), 0)).call()
+}
+
+/// `expr` with each pinned node replaced by its constant.
+fn pinned(expr: &Arc<UOp>, pins: &[(&Arc<UOp>, Arc<UOp>)]) -> Arc<UOp> {
+    expr.substitute(&pins.iter().map(|(node, value)| (UOpKey(Arc::clone(node)), value.clone())).collect())
+}
+
+/// Whether an integer add or multiply anywhere in the constant `expr`, the arms of
+/// every select included, leaves its dtype: poison under `add nsw` and undefined
+/// in C, whichever way the select falls.
+fn wraps(expr: &Arc<UOp>) -> bool {
+    let int = |value: ConstValue| match value {
+        ConstValue::Int(v) => Some(i128::from(v)),
+        ConstValue::UInt(v) => Some(i128::from(v)),
+        _ => None,
+    };
+    let exact = |node: &Arc<UOp>| int(fold_at(node, &Bindings::none())?);
+    expr.toposort().iter().any(|node| {
+        let Op::Binary(op @ (BinaryOp::Add | BinaryOp::Mul), a, b) = node.op() else { return false };
+        let limits = (int(ConstValue::min(node.dtype().base())), int(ConstValue::max(node.dtype().base())));
+        let (Some(a), Some(b), (Some(min), Some(max))) = (exact(a), exact(b), limits) else { return false };
+        let value = if *op == BinaryOp::Add { a.checked_add(b) } else { a.checked_mul(b) };
+        value.is_none_or(|value| value < min || max < value)
+    })
+}
+
+/// Compared sides whose offset no dtype can move onto a full-range 64-bit index.
+#[derive(Clone, Copy, Debug)]
+enum Span {
+    /// `END * R + r`: the first stage `split_reduceop` leaves of a lookup.
+    Split,
+    /// `r + start`: an arange from `start`.
+    From(i128),
+}
+
+impl Span {
+    fn compared(self, range: &Arc<UOp>, outer: &Arc<UOp>, dtype: &DType) -> Arc<UOp> {
+        match self {
+            Span::Split => {
+                outer.try_mul(&UOp::index_const(END)).expect("R * END").try_add(range).expect("+ r").cast(dtype.clone())
+            }
+            Span::From(start) => range
+                .cast(dtype.clone())
+                .try_add(&UOp::const_(dtype.clone(), index_value(dtype, start)))
+                .expect("+ start"),
+        }
+    }
+
+    /// The value the compared side takes at `r = 0`, with `R = 2`.
+    fn first(self) -> i128 {
+        if let Span::From(start) = self { start } else { 2 * i128::from(END) }
+    }
+}
+
+/// `value` held by a 64-bit index of `dtype`.
+fn index_value(dtype: &DType, value: i128) -> ConstValue {
+    if *dtype == DType::UInt64 { ConstValue::UInt(value as u64) } else { ConstValue::Int(value as i64) }
+}
+
+/// Whether a 64-bit index of `dtype` holds `value`.
+fn held_by(dtype: &DType, value: i128) -> bool {
+    if *dtype == DType::UInt64 { u64::try_from(value).is_ok() } else { i64::try_from(value).is_ok() }
+}
+
+/// `solve_for_range` cannot move these offsets onto a full-range 64-bit index, so
+/// the collapse gates the raw index on the span the compared side takes. An index
+/// in the span reads its step; its neighbours, `2^32` past it and the extremes
+/// read nothing; and no lane wraps on the way, inside the span or out of it. A
+/// span from `i64::MIN` would add `-i64::MIN`, and a u64 span across `i64::MAX`
+/// has no signed dtype to subtract in, so those two need not collapse.
+#[test_case(Span::Split, DType::Int64, BinaryOp::Eq, true ; "a split lookup")]
+#[test_case(Span::Split, DType::Int64, BinaryOp::Ne, true ; "a split lookup in the ne form")]
+#[test_case(Span::Split, DType::UInt64, BinaryOp::Eq, true ; "a split lookup against a u64 index")]
+#[test_case(Span::From(5), DType::Int64, BinaryOp::Eq, true ; "an arange from 5")]
+#[test_case(Span::From(i64::MIN.into()), DType::Int64, BinaryOp::Eq, false ; "an arange from i64::MIN")]
+#[test_case(Span::From((1 << 63) - 5), DType::UInt64, BinaryOp::Eq, false ; "a u64 arange across i64::MAX")]
+fn a_full_range_64_bit_index_reads_only_its_step(span: Span, dtype: DType, form: BinaryOp, collapses: bool) {
+    let (range, outer) = (reduce_range(END, 0), UOp::range_const(4, 1));
+    let (idx, compared, step) =
+        (loaded_index(dtype.clone()), span.compared(&range, &outer, &dtype), range.cast(DType::Float32));
+    let body = match form {
+        BinaryOp::Eq => UOp::try_where(idx.try_cmpeq(&compared).expect("cmpeq"), step, zero()),
+        _ => UOp::try_where(idx.try_cmpne(&compared).expect("cmpne"), zero(), step),
+    }
+    .expect("gate");
+    let Some(folded) = reduce_load_collapse(&body, std::slice::from_ref(&range)) else {
+        assert!(!collapses, "a full-range index must collapse:\n{}", body.tree());
+        return;
+    };
+    let first = span.first();
+    let probes =
+        [first, first + 3, first + 9, first - 1, first + 10, (1 << 32) + first, i64::MIN.into(), i64::MAX.into()];
+    for held in probes.into_iter().chain([1 << 63, u64::MAX.into()]).filter(|held| held_by(&dtype, *held)) {
+        let pinned = pinned(
+            &folded,
+            &[(&idx, UOp::const_(dtype.clone(), index_value(&dtype, held))), (&outer, UOp::index_const(2))],
+        );
+        assert!(!wraps(&pinned), "idx = {held} wraps:\n{}", folded.tree());
+        let want = if (first..first + i128::from(END)).contains(&held) { (held - first) as f64 } else { 0.0 };
+        assert_eq!(fold_at(&pinned, &Bindings::none()).and_then(|v| v.try_float()), Some(want), "idx = {held}");
+    }
+}
+
+/// A range that may be empty has no last step: read off `r := end - 1`, the span
+/// of `i32(r) + w` at `end = 0` wraps below `i32::MIN` onto everything. Wherever
+/// the body folds, an empty range reads nothing and wraps nowhere.
+#[test]
+fn a_range_that_may_be_empty_reads_nothing() {
+    let end = UOp::define_var("end".to_string(), 0, END);
+    let range = UOp::range_axis(end.clone(), svod_ir::AxisId::Renumbered(0), svod_ir::AxisType::Reduce);
+    let offset = UOp::variable("w".to_string(), i32::MIN.into(), 0, DType::Int32);
+    let compared = range.cast(DType::Int32).try_add(&offset).expect("r + w").cast(DType::Int64);
+    let idx = index_var(i64::MIN, i64::MAX);
+    let body =
+        UOp::try_where(idx.try_cmpeq(&compared).expect("cmpeq"), range.cast(DType::Float32), zero()).expect("gate");
+    let Some(folded) = reduce_load_collapse(&body, std::slice::from_ref(&range)) else { return };
+    for at in [0, i32::MIN.into(), i64::MIN] {
+        let pins = [(&idx, UOp::native_const(at)), (&offset, UOp::native_const(i32::MIN)), (&end, UOp::index_const(0))];
+        let pinned = pinned(&folded, &pins);
+        assert!(!wraps(&pinned), "idx = {at} wraps:\n{}", folded.tree());
+        assert_eq!(fold_at(&pinned, &Bindings::none()).and_then(|v| v.try_float()), Some(0.0), "idx = {at}");
+    }
+}
+
+/// A cast that wraps the range folds two steps onto one index: over 300 steps,
+/// `i64(u8(r))` takes 5 at steps 5 and 261. That is no span, so wherever the body
+/// folds, index 5 still reads both.
+#[test]
+fn a_cast_that_wraps_the_range_keeps_every_step() {
+    let range = reduce_range(300, 0);
+    let compared = range.cast(DType::UInt8).cast(DType::Int64);
+    let idx = loaded_index(DType::Int64);
+    let body =
+        UOp::try_where(idx.try_cmpeq(&compared).expect("cmpeq"), range.cast(DType::Float32), zero()).expect("gate");
+    let Some(folded) = reduce_load_collapse(&body, std::slice::from_ref(&range)) else { return };
+    let pinned = pinned(&folded, &[(&idx, UOp::native_const(5i64))]);
+    assert_eq!(fold_at(&pinned, &Bindings::none()).and_then(|v| v.try_float()), Some(266.0), "{}", folded.tree());
+}
+
+/// Solving `idx == r + i32::MIN` adds `-i32::MIN`, which wraps onto itself in i32
+/// even where the bounds keep `idx - i32::MIN` there; the shift runs in i64.
+#[test]
+fn solving_never_negates_an_offset_onto_itself() {
+    let range = reduce_range(END, 0);
+    let compared = range.cast(DType::Int32).try_add(&UOp::native_const(i32::MIN)).expect("r + i32::MIN");
+    let idx = UOp::variable("idx".to_string(), i32::MIN.into(), -1, DType::Int32);
+    let solved = solve_for_range(&idx, &compared, &range).expect("the shift fits i64");
+    for at in [i32::MIN, -1] {
+        let pinned = pinned(&solved, &[(&idx, UOp::native_const(at))]);
+        assert!(!wraps(&pinned), "idx = {at} wraps:\n{}", solved.tree());
+        assert_eq!(fold_at(&pinned, &Bindings::none()), Some(ConstValue::Int(i64::from(at) - i64::from(i32::MIN))));
+    }
+}
+
 /// `Index` is as wide as the i64 it lowers into, so neither direction of a cast
 /// that touches it can pass on its placeholder `0..=0` bounds.
 #[test]

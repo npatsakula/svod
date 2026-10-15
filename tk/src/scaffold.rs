@@ -148,6 +148,16 @@ impl Kernel {
     pub fn shared_sw_stages(&self, dims: (usize, usize), dt: DType, layout: TileLayout, stages: usize) -> ST {
         self.st_stages(dims, dt, layout, self.shared_strip(true), stages)
     }
+    /// A `stages`-deep shared strip read only by whole rows, on the arch's
+    /// full-row strip where it has one ([`crate::ArchCaps::shared_rows`]) — the
+    /// GEMM operand strips, whose waves take row bands of them.
+    ///
+    /// # Panics
+    /// Panics when the arch has no fragment layouts (see [`Kernel::frag`]).
+    pub fn shared_rows_stages(&self, dims: (usize, usize), dt: DType, layout: TileLayout, stages: usize) -> ST {
+        let strip = self.caps.shared_rows(dims.1, dt.bytes()).unwrap_or_else(|| self.no_layout("shared strip"));
+        self.st_stages(dims, dt, layout, strip, stages)
+    }
     fn shared_strip(&self, swizzled: bool) -> STBaseShape {
         let strip = if swizzled { self.caps.shared_swizzled() } else { self.caps.shared_default() };
         strip.unwrap_or_else(|| self.no_layout("shared strip"))

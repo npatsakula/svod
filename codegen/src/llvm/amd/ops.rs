@@ -98,6 +98,36 @@ fn render_float_unary(
     Some(())
 }
 
+/// `exp2` of an f32 as the bare `v_exp_f32`, a typed `Op::Custom` for tile
+/// kernels to build with. `@llvm.exp2.f32` (what [`render_float_unary`] emits)
+/// wraps the instruction in a fix-up that keeps a result below `2^-126`
+/// denormal — a compare, two selects and an `ldexp`, about 5 VALU a value on
+/// gfx1201 — which an online softmax pays per score for weights that small
+/// ones cannot move. Here such a result flushes to zero.
+pub fn exp2_flush(x: &Arc<UOp>) -> Arc<UOp> {
+    assert_eq!(x.dtype(), DType::Float32, "exp2_flush takes one f32");
+    UOp::custom(
+        smallvec::smallvec![x.clone()],
+        "declare float @llvm.amdgcn.exp2.f32(float)\ncall float @llvm.amdgcn.exp2.f32(float {0})".to_string(),
+        DType::Float32,
+    )
+}
+
+/// `max(a, b)` of two f32 as IEEE `maximumNumber` (`@llvm.maxnum.f32`), a typed
+/// `Op::Custom` for tile kernels to build with: gfx12 selects one
+/// `v_max_num_f32`, where the renderers decompose `Max` into a compare and a
+/// select to keep tinygrad's NaN propagation. A NaN operand yields the other
+/// one. Before gfx12 the IEEE-mode `v_max_f32` needs its operands quieted, so
+/// the select is no worse there.
+pub fn max_num(a: &Arc<UOp>, b: &Arc<UOp>) -> Arc<UOp> {
+    assert!(a.dtype() == DType::Float32 && b.dtype() == DType::Float32, "max_num takes two f32");
+    UOp::custom(
+        smallvec::smallvec![a.clone(), b.clone()],
+        "declare float @llvm.maxnum.f32(float, float)\ncall float @llvm.maxnum.f32(float {0}, float {1})".to_string(),
+        DType::Float32,
+    )
+}
+
 // ── SPECIAL: workgroup / workitem / direct-global axis ────────────────────
 
 fn render_special(uop: &Arc<UOp>, name: &str, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {

@@ -1,7 +1,7 @@
 use svod_dtype::DType;
 
 use crate::jit::InputSpec;
-use crate::modernbert::{ModernBert, ModernBertConfig, ModernBertJit};
+use crate::modernbert::{ClassifierPooling, ModernBert, ModernBertConfig, ModernBertJit};
 
 /// Tiny config (2 layers, hidden 32) so the CPU JIT graph compiles in seconds.
 fn tiny_cfg() -> ModernBertConfig {
@@ -22,6 +22,11 @@ fn tiny_cfg() -> ModernBertConfig {
         decoder_bias: true,
         dtype: DType::Float32,
         max_batch_size: 4,
+        num_labels: 3,
+        classifier_pooling: ClassifierPooling::Cls,
+        classifier_bias: false,
+        norm_bias: false,
+        id2label: vec![],
     }
 }
 

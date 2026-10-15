@@ -1,25 +1,7 @@
-use svod_dtype::DType;
 use svod_tensor::nn::Module;
 
 use crate::bgem3::{BgeM3, BgeRerankerV2M3, EncodeOpts};
-use crate::test::unit::xlm_roberta::model::{expected_keys, sorted_keys};
-use crate::xlm_roberta::XlmRobertaConfig;
-
-fn tiny_cfg() -> XlmRobertaConfig {
-    XlmRobertaConfig {
-        vocab_size: 100,
-        hidden_size: 32,
-        num_hidden_layers: 2,
-        num_attention_heads: 4,
-        intermediate_size: 64,
-        max_position_embeddings: 20,
-        type_vocab_size: 1,
-        layer_norm_eps: 1e-5,
-        pad_token_id: 1,
-        dtype: DType::Float32,
-        max_batch_size: 1,
-    }
-}
+use crate::test::unit::xlm_roberta::model::{expected_keys, sorted_keys, tiny_cfg};
 
 #[test]
 fn bgem3_encode_dense_shape() {
