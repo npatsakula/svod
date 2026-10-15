@@ -162,13 +162,9 @@ fn gemm_throughput_probe() {
     for _ in 0..4 {
         for (i, (_, plan)) in plans.iter().enumerate() {
             for _ in 0..5 {
-                let run = plan
-                    .execute_profiled()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|kp| Some((kp.gpu_end_ns? - kp.gpu_start_ns?) as f64 * 1e-9))
-                    .fold(0.0, f64::max);
-                best[i] = best[i].min(run);
+                if let Some(run) = super::kernel_secs(plan) {
+                    best[i] = best[i].min(run.into_iter().fold(0.0, f64::max));
+                }
             }
         }
     }

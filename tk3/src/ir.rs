@@ -449,7 +449,8 @@ pub enum Round {
     /// To the nearest value, ties to even.
     Nearest,
     /// Toward zero: f32 → bf16 keeps the upper half of the bits, one
-    /// instruction per pair where the target has no bf16 convert.
+    /// instruction per pair where the target has no bf16 convert. A NaN whose
+    /// payload lies in the lower half becomes an infinity of its sign.
     Zero,
 }
 

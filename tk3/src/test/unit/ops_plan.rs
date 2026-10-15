@@ -681,15 +681,17 @@ fn rdna_plans_register_staged_kernels() {
             panic!("an attention kernel")
         };
         let within = |c: &FaCfg| c.smem_bytes(d) + c.scratch_bytes(&target) <= 64 << 10;
-        assert!(fa.iter().all(|c| c.stages == 2 && c.unroll && within(c)), "{fa:?}");
+        assert!(fa.iter().all(|c| c.stages == 2 && within(c)), "{fa:?}");
         assert!(fa.iter().all(|c| c.scratch_bytes(&target) == c.bq * c.bkv * 4), "RDNA3 re-holds its scores");
     }
-    // RDNA3's replicated operand fragments and the per-key value gather put
-    // every `d = 128` config past the register file: the graph, until the
-    // value tile is stored transposed.
+    // `d = 128` fits RDNA3's register file only rolled, one trip's fragments
+    // and fill at a time.
     let q = ext(&[1, 1500, 8, 128]);
-    let plan = shape::attention(Some(&Planner::new(target.clone())), &[BF16; 3], Some(&q), Some(&q), false);
-    assert_eq!(plan, Plan::Graph(Fallback::Shape));
+    let Plan::Kernel(fa) = shape::attention(Some(&Planner::new(target.clone())), &[BF16; 3], Some(&q), Some(&q), false)
+    else {
+        panic!("a d128 attention kernel")
+    };
+    assert!(fa.iter().all(|c| !c.unroll), "{fa:?}");
     assert!(matches!(
         shape::norm(Some(&Planner::new(target.clone())), &[BF16; 2], Some(&ext(&[37, 1024]))),
         Plan::Kernel(_)

@@ -23,6 +23,14 @@ use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 
+/// Every kernel's device time in seconds for one profiled run of `plan`, or
+/// `None` when any kernel lost its stamps: a probe that dropped it would read
+/// the run as faster than it was.
+fn kernel_secs(plan: &svod_runtime::ExecutionPlan) -> Option<Vec<f64>> {
+    let profile = plan.execute_profiled().unwrap();
+    profile.iter().map(|k| Some(k.gpu_end_ns?.checked_sub(k.gpu_start_ns?)? as f64 * 1e-9)).collect()
+}
+
 /// The default device's target when tk3 has tables for it, of any vendor.
 fn device_target() -> Option<Target> {
     let target = Target::for_device(&svod_dtype::default_device::default_device());

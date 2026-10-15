@@ -14,6 +14,7 @@ use svod_dtype::{AddrSpace, DType, DeviceSpec, GpuArch, ScalarDType};
 use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp};
 
 use super::{Lowering, ProgramSnafu, Result, UnsupportedSnafu};
+use crate::atoms::LaneMove;
 use crate::index::*;
 use crate::ir::*;
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
@@ -988,6 +989,38 @@ impl<'a> Emit<'a> {
                 }
                 Ok(())
             }
+            Relayout::Exchange(picks) => {
+                // A (mask, register) move is made once and shared by every
+                // destination register that selects it.
+                let mut moved: HashMap<(u32, u32), Arc<UOp>> = HashMap::new();
+                for (jd, picks) in picks.into_iter().enumerate() {
+                    let mut out: Option<Arc<UOp>> = None;
+                    for p in picks.into_iter().rev() {
+                        let v = match moved.get(&(p.mask, p.reg)) {
+                            Some(v) => v.clone(),
+                            None => {
+                                let x = self.reg_load(src, p.reg);
+                                let v = if p.mask == 0 { x } else { self.shuffle_xor(&x, p.mask) };
+                                moved.insert((p.mask, p.reg), v.clone());
+                                v
+                            }
+                        };
+                        out = Some(match out {
+                            None => v,
+                            Some(rest) => {
+                                let mine = and(
+                                    &c32(p.lanes as u32 as i32 as i64).try_shr_op(&self.lane).expect("lane bit"),
+                                    &c32(1),
+                                );
+                                let mine = self.hoist(mine.try_cmpne(&c32(0)).expect("lane predicate"));
+                                UOp::try_where(mine, v, rest).expect("exchange select")
+                            }
+                        });
+                    }
+                    self.reg_store(dst, jd as u32, vec![out.expect("a move per register")]);
+                }
+                Ok(())
+            }
             Relayout::LaneShuffle(_) | Relayout::ViaSmem => self.relayout_via_smem(dst, src),
         }
     }
@@ -1305,17 +1338,19 @@ impl<'a> Emit<'a> {
         if matches!(zero.op(), Op::Const(..) | Op::VConst(..)) { zero } else { self.hoist(zero) }
     }
 
-    /// `2^x`. On AMD an f32 one is the hardware `v_exp_f32` alone, without the
+    /// `2^x`. Where the target has [`crate::atoms::Target::hardware_exp2`], an f32
+    /// one is the hardware instruction alone (`v_exp_f32`), without the
     /// range reduction LLVM wraps `llvm.exp2` in to keep results below 2^-126
     /// denormal: those flush to zero, which no kernel tells apart.
     fn exp2(&mut self, x: &Arc<UOp>) -> Arc<UOp> {
-        match self.low.target.arch {
-            GpuArch::Amd(_) if x.dtype() == DType::Float32 => UOp::custom(
+        if self.low.target.hardware_exp2 && x.dtype() == DType::Float32 {
+            UOp::custom(
                 smallvec![x.clone()],
                 "declare float @llvm.amdgcn.exp2.f32(float)\ncall float @llvm.amdgcn.exp2.f32(float {0})".to_string(),
                 DType::Float32,
-            ),
-            _ => x.try_exp2().expect("exp2"),
+            )
+        } else {
+            x.try_exp2().expect("exp2")
         }
     }
 
@@ -1327,24 +1362,67 @@ impl<'a> Emit<'a> {
     }
 
     fn shuffle_xor(&mut self, value: &Arc<UOp>, mask: u32) -> Arc<UOp> {
-        match self.low.target.arch {
-            GpuArch::Cuda(_) => shfl_bfly(value, &c32(mask as i64)),
-            GpuArch::Metal(_) => svod_codegen::c::metal::simd_shuffle_xor(value, &c32(mask as i64)),
-            GpuArch::Amd(_) => {
-                let is_f32 = value.dtype() == DType::Float32;
-                let data = if is_f32 { value.bitcast(DType::Int32) } else { value.clone() };
+        match self.low.target.lane_move {
+            LaneMove::Shuffle => shfl_bfly(value, &c32(mask as i64)),
+            LaneMove::SimdShuffle => svod_codegen::c::metal::simd_shuffle_xor(value, &c32(mask as i64)),
+            LaneMove::Dpp if mask < 32 => {
+                let (mut word, back) = as_word(value);
+                if mask & 15 != 0 {
+                    // `row_xmask:mask`, every row and bank written.
+                    word = UOp::custom(
+                        smallvec![word],
+                        format!(
+                            "declare i32 @llvm.amdgcn.update.dpp.i32(i32, i32, i32, i32, i32, i1)\n\
+                             call i32 @llvm.amdgcn.update.dpp.i32(i32 0, i32 {{0}}, i32 {}, i32 15, i32 15, i1 false)",
+                            0x160 | (mask & 15)
+                        ),
+                        DType::Int32,
+                    );
+                }
+                if mask & 16 != 0 {
+                    // Each lane takes the same lane of the other row of 16.
+                    word = UOp::custom(
+                        smallvec![word],
+                        "declare i32 @llvm.amdgcn.permlanex16.i32(i32, i32, i32, i32, i1, i1)\n\
+                         call i32 @llvm.amdgcn.permlanex16.i32(i32 {0}, i32 {0}, i32 1985229328, i32 -19088744, i1 false, i1 false)"
+                            .to_string(),
+                        DType::Int32,
+                    );
+                }
+                back(word)
+            }
+            LaneMove::Permute | LaneMove::Dpp => {
+                let (word, back) = as_word(value);
                 // Pure and lane-only: listed in the prologue, so every branch reaches it.
                 let addr = self.hoist(mul(&xor(&self.lane, &c32(mask as i64)), &c32(4)));
-                let sh = UOp::custom(
-                    smallvec![addr, data],
+                back(UOp::custom(
+                    smallvec![addr, word],
                     "declare i32 @llvm.amdgcn.ds.bpermute(i32, i32)\ncall i32 @llvm.amdgcn.ds.bpermute(i32 {0}, i32 {1})"
                         .to_string(),
                     DType::Int32,
-                );
-                if is_f32 { sh.bitcast(DType::Float32) } else { sh }
+                ))
             }
         }
     }
+}
+
+/// `value` as the 32-bit word a lane move carries, and the way back: a
+/// 16-bit value travels zero-extended.
+fn as_word(value: &Arc<UOp>) -> (Arc<UOp>, impl Fn(Arc<UOp>) -> Arc<UOp>) {
+    let dtype = value.dtype();
+    let wide = dtype.scalar().is_none_or(|s| s.bytes() == 4);
+    let int = dtype == DType::Int32;
+    let word = match () {
+        () if int => value.clone(),
+        () if wide => value.bitcast(DType::Int32),
+        () => value.bitcast(DType::Scalar(ScalarDType::UInt16)).cast(DType::Int32),
+    };
+    let back = move |w: Arc<UOp>| match () {
+        () if int => w,
+        () if wide => w.bitcast(dtype.clone()),
+        () => w.cast(DType::Scalar(ScalarDType::UInt16)).bitcast(dtype.clone()),
+    };
+    (word, back)
 }
 
 /// Whether scalar `id` reads [`Scalar::Row`], memoized in `memo`.

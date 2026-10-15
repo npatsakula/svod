@@ -390,6 +390,14 @@ impl FaCfg {
         };
         let (q, o) = (half(qk.a.regs()), pv.c.regs());
         let (k, s, p, v) = (half(qk.b.regs()), qk.c.regs(), half(pv.a.regs()), half(pv.b.regs()));
+        if !atom.accumulator_feeds(target.wave) {
+            // Fitted on gfx1151 (clang 23, `-mcumode`) against the allocated
+            // registers: the softmax holds about four score-sized tiles; a
+            // rolled trip streams the value fragments behind the products,
+            // an unrolled pair of trips also holds them and both trips' fills.
+            let (stream, fill) = if self.unroll { (k + v, 2 * fill) } else { (k, fill) };
+            return Some(q + o + 4 * s + stream + fill + ADDRESSING);
+        }
         Some(q + o + k + s + p + v + fill)
     }
 }
@@ -415,6 +423,9 @@ impl FaCfg {
         Self { truncate_p: !target.bf16_cvt, skip_rescale, raw_max: target.mma_on_valu && full, ..self }
     }
 }
+
+/// Registers of addressing and loop state beside an attention kernel's tiles.
+const ADDRESSING: u32 = 8;
 
 /// What a score element costs beyond its products, in bytes of shared-memory
 /// traffic: the softmax's scale, mask, max, exp2 and sum on the vector units.

@@ -344,6 +344,30 @@ fn attention_matches_the_graph(c: AttnCase) {
     assert_close("attention", &o, &tk::attention::graph(&inputs.q, &inputs.k, &inputs.v, opts).unwrap(), 2e-2);
 }
 
+/// Scores that climb across key blocks (a bias ramp along the keys) make the
+/// kernel adopt new row maxima mid-sequence, so the accumulator's skippable
+/// rescale runs on the device while it holds earlier blocks' work: slowly
+/// after a stale maximum, steeply on every block.
+#[test_case(0.1, false; "a slow climb")]
+#[test_case(1.0, false; "a steep climb")]
+#[test_case(0.1, true; "a slow causal climb")]
+fn climbing_scores_match_the_graph(per_key: f32, causal: bool) {
+    if !device() {
+        return;
+    }
+    let c = AttnCase { bias: Some(2), ..case(2, [200, 200], [4, 4], 64, causal, None) };
+    let mut inputs = attn_inputs(&c, c.b);
+    let ramp: Vec<f32> = (0..c.b * c.h * c.t * c.tk).map(|i| per_key * (i % c.tk) as f32).collect();
+    let ramp = Tensor::from_slice(&ramp).try_reshape([c.b, c.h, c.t, c.tk]).unwrap().cast(DType::BFloat16);
+    ramp.realize().unwrap();
+    inputs.bias = Some(ramp);
+    let opts = inputs.opts(&c);
+    let o = tk::attention(&inputs.q, &inputs.k, &inputs.v, opts).unwrap();
+    assert_kernel(&o, "flash_attention");
+    let want = tk::attention::graph(&inputs.q, &inputs.k, &inputs.v, opts).unwrap();
+    assert_close("climbing attention", &o, &want, 2e-2);
+}
+
 #[test]
 fn attention_under_a_batch_variable() {
     if !device() {
