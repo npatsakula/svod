@@ -7,7 +7,7 @@
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DType, DeviceSpec};
 use svod_tensor::Tensor;
-use svod_tk3::atoms::Target;
+use svod_tk3::atoms::{Device, Target};
 use svod_tk3::build::BF16;
 use svod_tk3::kernels::Batch;
 use svod_tk3::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
@@ -40,6 +40,7 @@ fn tk1_vs_tk3_gemm_side_by_side() {
         return;
     }
     let target = Target::for_device(&device).expect("a tk3 target");
+    let device = Device { costs: svod_tk3::probe::costs(&target).expect("device costs"), target };
     let plain = Epilogue::default();
     let residual = Epilogue { residual: true, ..plain };
     let swiglu = Epilogue { act: Act::Silu, gated: true, ..plain };
@@ -99,7 +100,7 @@ fn tk1_vs_tk3_gemm_side_by_side() {
                 params.push(r);
             }
             params.push(&out);
-            let y = graph_launch(gemm::<BF16>(&spec), &c.lowering(target.clone()), &params).unwrap();
+            let y = graph_launch(gemm::<BF16>(&spec), &c.lowering(&device), &params).unwrap();
             plans.push((format!("tk3 {label} {:?} {:?} unroll={}", c.tile, c.warps, c.unroll), y.prepare().unwrap()));
         };
         pinned("tabled", tabled);
