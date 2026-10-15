@@ -1,6 +1,7 @@
 //! Shared machinery for the encoder heads (ModernBERT's embedder / classifier /
-//! token classifier): one head error, the hub options their loaders take, and
-//! `HeadPlans`, the per-shape plan cache every head runs its chunks through.
+//! token classifier, XLM-R's token classifier): one head error, the hub
+//! options their loaders take, and `HeadPlans`, the per-shape plan cache
+//! every head runs its chunks through.
 //!
 //! The heads are mechanically identical up to (a) the JIT wrapper type, (b)
 //! the output-decode stride, and (c) the profile stage label, so the capacity

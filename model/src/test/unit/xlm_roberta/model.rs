@@ -3,7 +3,8 @@ use svod_tensor::nn::{Module, StateDict};
 
 use crate::xlm_roberta::{XlmRobertaConfig, XlmRobertaModel};
 
-fn tiny_cfg() -> XlmRobertaConfig {
+/// A 2-layer, 32-wide backbone with 20 position rows.
+pub fn tiny_cfg() -> XlmRobertaConfig {
     XlmRobertaConfig {
         vocab_size: 100,
         hidden_size: 32,
@@ -14,6 +15,8 @@ fn tiny_cfg() -> XlmRobertaConfig {
         type_vocab_size: 1,
         layer_norm_eps: 1e-5,
         pad_token_id: 1,
+        num_labels: 2,
+        id2label: Vec::new(),
         dtype: DType::Float32,
         max_batch_size: 1,
     }

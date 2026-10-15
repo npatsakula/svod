@@ -15,7 +15,7 @@ plans.
 | `blocks` | Shared `conv2d`, `batchnorm2d`, `BasicBlock`, `Bottleneck`, `ResidualStage` reused by every ResNet-shaped backbone. timm/torchvision key convention. |
 | `wavlm` | WavLM speech-representation backbone (Conv1d feature extractor + gated rel-pos Transformer, per-layer pruning) consumed by `diarizen`. |
 | `encoder_head` | The text encoder heads' static per-shape plans (`HeadPlans`), input packing, `HeadError` and the `HubOptions` their hub loaders take. |
-| `xlm_roberta` | XLM-RoBERTa text encoder backbone (absolute position embeddings, post-norm Transformer) consumed by `bgem3`. |
+| `xlm_roberta` | XLM-RoBERTa text encoder backbone (absolute position embeddings, post-norm Transformer) consumed by `bgem3`, plus a token-classification head. |
 | `qwen3` | Qwen3 decoder-only LLM backbone (causal attention, GQA, per-head Q/K RMSNorm, RoPE, SwiGLU) consumed by embedding models. |
 | `sentencepiece` | Minimal SentencePiece `.model` protobuf loader (vocab piece extraction). |
 
@@ -32,6 +32,7 @@ plans.
 | ModernBERT (base / large) | Text embeddings, sequence classification, token classification, fill-mask (MLM, model layer only) | `modernbert` | [Answer.AI ModernBERT](https://github.com/AnswerDotAI/ModernBERT) | [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) |
 | BGE-M3 (dense / sparse / ColBERT) | Text embeddings, retrieval | `bgem3` | [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (XLM-RoBERTa-large) | [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) |
 | BGE-reranker-v2-m3 | Cross-encoder reranking | `bgem3` | [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) | [`BAAI/bge-reranker-v2-m3`](https://huggingface.co/BAAI/bge-reranker-v2-m3) |
+| SaT (Segment any Text) | Sentence segmentation (token classification) | `xlm_roberta` | [segment-any-text/wtpsplit](https://github.com/segment-any-text/wtpsplit) (XLM-RoBERTa-base) | [`segment-any-text/sat-3l-sm`](https://huggingface.co/segment-any-text/sat-3l-sm) |
 | Qwen3-Embedding-0.6B | Text embeddings, retrieval | `qwen3` | [Qwen team](https://huggingface.co/Qwen) (Qwen3 LLM) | [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) |
 | Qwen3-Reranker-0.6B | Cross-encoder reranking | `qwen3` | [Qwen team](https://huggingface.co/Qwen) (Qwen3 LLM) | [`Qwen/Qwen3-Reranker-0.6B`](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B) |
 | ResNet (18 / 34 / 50 / 101 / 152) | Vision | `resnet` | [He et al. 2015](https://arxiv.org/abs/1512.03385) | [`timm/resnet*.a1_in1k`](https://huggingface.co/timm) |
