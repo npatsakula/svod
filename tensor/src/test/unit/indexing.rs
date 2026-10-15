@@ -492,24 +492,55 @@ fn reduces_left(t: &Tensor) -> usize {
         .sum()
 }
 
-/// A lookup collapses into a direct read whenever its arange compares in a dtype
-/// the index provably fits. A hand-built mask that widens an Int32 arange to an
-/// i64 index keeps its reduce: reading the index at 32 bits would fold `2^32 + k`
-/// onto position `k`.
-#[test_case::test_case(Lookup::Gather, DType::Int32, 0; "gather, i32")]
-#[test_case::test_case(Lookup::Gather, DType::Int64, 0; "gather, i64")]
-#[test_case::test_case(Lookup::Embedding, DType::Int32, 0; "embedding, i32")]
-#[test_case::test_case(Lookup::Embedding, DType::Int64, 0; "embedding, i64")]
-#[test_case::test_case(Lookup::Embedding, DType::UInt8, 0; "embedding, u8 against a wider vocab")]
-#[test_case::test_case(Lookup::WidenedMask, DType::Int32, 0; "a mask against i32")]
-#[test_case::test_case(Lookup::WidenedMask, DType::Int64, 1; "a mask widened to i64")]
-fn a_lookup_collapses_only_where_the_index_fits(lookup: Lookup, dtype: DType, reduces: usize) {
-    let lookup_tensor = lookup.build(300, &Tensor::empty(&[4], dtype));
-    assert_eq!(reduces_left(&lookup_tensor), reduces);
+/// A lookup collapses into a direct read whatever its index dtype. A hand-built
+/// mask that widens an Int32 arange to an i64 index cannot read the index at 32
+/// bits, which would fold `2^32 + k` onto position `k`, so it gates the raw index
+/// on the span the arange takes instead.
+#[test_case::test_case(Lookup::Gather, DType::Int32; "gather, i32")]
+#[test_case::test_case(Lookup::Gather, DType::Int64; "gather, i64")]
+#[test_case::test_case(Lookup::Embedding, DType::Int32; "embedding, i32")]
+#[test_case::test_case(Lookup::Embedding, DType::Int64; "embedding, i64")]
+#[test_case::test_case(Lookup::Embedding, DType::UInt8; "embedding, u8 against a wider vocab")]
+#[test_case::test_case(Lookup::WidenedMask, DType::Int32; "a mask against i32")]
+#[test_case::test_case(Lookup::WidenedMask, DType::Int64; "a mask widened to i64")]
+fn a_lookup_collapses_whatever_the_index_dtype(lookup: Lookup, dtype: DType) {
+    assert_eq!(reduces_left(&lookup.build(300, &Tensor::empty(&[4], dtype))), 0);
+}
+
+/// `table[ids]` summed in two stages `chunks` rows apart, the shape `split_reduceop`
+/// gives a large lookup, built here so that no split heuristic decides it.
+fn split_lookup(table: &Tensor, ids: &Tensor, chunks: isize) -> Tensor {
+    let arange = Tensor::index_arange(table.dim_const(0).unwrap(), &ids.uop().dtype()).unwrap();
+    let mask = ids.try_unsqueeze(-1).unwrap().try_eq(&arange).unwrap();
+    let picked = table.try_unsqueeze(0).unwrap().where_(&mask, 0.0f32).unwrap();
+    let staged = picked.try_reshape([ids.dim_const(0).unwrap() as isize, chunks, -1]).unwrap();
+    staged.sum(-1isize).unwrap().contiguous().sum(-1isize).unwrap()
+}
+
+crate::codegen_tests! {
+    /// The first stage of a split lookup reads its row directly, behind a gate on
+    /// the raw index: every id in the table reads its row, and ids past either
+    /// end, `2^32` past a row and the i64 extremes read nothing.
+    #[test_case(IndexDtype::I64; "i64 ids")]
+    #[test_case(IndexDtype::U64; "u64 ids")]
+    fn test_a_split_lookup_reads_only_its_row(config, index: IndexDtype) {
+        let table: Vec<f32> = (1..=4096).map(|row| row as f32).collect();
+        let wide = [i64::MIN, i64::MAX, -1, 0, 511, 512, 4095, 4096, (1 << 32) + 3, 1000];
+        let ids: Vec<i128> = match index {
+            IndexDtype::U64 => wide.iter().map(|&id| i128::from(id as u64)).collect(),
+            _ => wide.iter().map(|&id| i128::from(id)).collect(),
+        };
+        let looked_up = split_lookup(&Tensor::from_slice(&table), &index.tensor(&ids), 8);
+        assert_eq!(reduces_left(&looked_up), 1, "only the second stage sums");
+        looked_up.realize_with(&config).unwrap();
+        let expected: Vec<f32> =
+            ids.iter().map(|&id| usize::try_from(id).ok().and_then(|row| table.get(row)).copied().unwrap_or(0.0)).collect();
+        assert_eq!(looked_up.as_vec::<f32>().unwrap(), expected, "ids {ids:?}");
+    }
 }
 
 /// A vocabulary big enough for `split_reduceop` to split the lookup in two still
-/// collapses into a direct read: split, a 64-bit index could not.
+/// collapses into one direct read: split, it would leave a sum over the chunks.
 #[test]
 fn a_lookup_too_wide_for_one_reduce_still_collapses() {
     assert_eq!(reduces_left(&Lookup::Embedding.build(65_536, &Tensor::empty(&[4], DType::Int64))), 0);
