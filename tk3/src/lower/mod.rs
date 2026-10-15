@@ -107,37 +107,44 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
     // wave's lanes store consecutive elements.
     // A copy inside a `Warps` statement is one warp's own, its chunks spread
     // over that warp's lanes alone.
-    let mut own = std::collections::HashSet::new();
-    for (_, stmt) in prog.walk() {
-        if let Stmt::Warps { body } = stmt {
-            for (_, inner) in body.walk_from(1) {
-                if let Stmt::Copy { dst, .. } = inner {
-                    own.insert(*dst);
-                }
-            }
+    for (stmt, scope) in scoped(&prog.body, Scope::Block) {
+        let Stmt::Copy { dst, src, mode: CopyMode::Staged } = stmt else { continue };
+        if !(alloc(prog, *dst).is_some_and(|a| transposed.contains(&a)) && prog.value(*src).tier() == Tier::Reg) {
+            continue;
+        }
+        let tmp = prog.value(*src);
+        let bytes = tmp.dtype.bytes();
+        let warps = if scope == Scope::Warp { 1 } else { prog.warps };
+        let l = layouts::transposing(tmp.shape, warps, lanes)
+            .filter(|_| target.tr_load && bytes == 2)
+            .or_else(|| layouts::chunked(tmp.shape, bytes, warps, lanes, Axis::Row));
+        if let Some(l) = l {
+            layouts[src.index()] = Some(l);
         }
     }
-    let walked: Vec<(ValId, TileLayout)> = prog
-        .walk()
-        .filter_map(|(_, stmt)| match stmt {
-            Stmt::Copy { dst, src, mode: CopyMode::Staged }
-                if alloc(prog, *dst).is_some_and(|a| transposed.contains(&a))
-                    && prog.value(*src).tier() == Tier::Reg =>
-            {
-                let tmp = prog.value(*src);
-                let bytes = tmp.dtype.bytes();
-                let warps = if own.contains(dst) { 1 } else { prog.warps };
-                layouts::transposing(tmp.shape, warps, lanes)
-                    .filter(|_| target.tr_load && bytes == 2)
-                    .or_else(|| layouts::chunked(tmp.shape, bytes, warps, lanes, Axis::Row))
-                    .map(|l| (*src, l))
+}
+
+/// Every statement of `block`, recursively, with the scope it runs in.
+fn scoped(block: &Block, scope: Scope) -> Vec<(&Stmt, Scope)> {
+    let mut out = vec![];
+    for stmt in &block.0 {
+        out.push((stmt, scope));
+        match stmt {
+            Stmt::Loop(l) => out.extend(scoped(&l.body, scope)),
+            Stmt::Pipeline(p) => {
+                out.extend(scoped(&p.produce.body, scope));
+                out.extend(scoped(&p.consume.body, scope));
             }
-            _ => None,
-        })
-        .collect();
-    for (tmp, l) in walked {
-        layouts[tmp.index()] = Some(l);
+            Stmt::Role { body, .. } => out.extend(scoped(body, scope)),
+            Stmt::Warps { body } => out.extend(scoped(body, Scope::Warp)),
+            Stmt::If { then, otherwise, .. } => {
+                out.extend(scoped(then, scope));
+                out.extend(scoped(otherwise, scope));
+            }
+            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+        }
     }
+    out
 }
 
 /// An `Mma` reads registers: a shared or global operand becomes an explicit

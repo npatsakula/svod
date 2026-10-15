@@ -497,13 +497,6 @@ impl Program {
 }
 
 impl Block {
-    /// Every statement of the block, recursively, with its depth from `depth`.
-    pub fn walk_from(&self, depth: usize) -> impl Iterator<Item = (usize, &Stmt)> {
-        let mut out = vec![];
-        self.walk(depth, &mut out);
-        out.into_iter()
-    }
-
     fn walk<'a>(&'a self, depth: usize, out: &mut Vec<(usize, &'a Stmt)>) {
         for stmt in &self.0 {
             out.push((depth, stmt));
