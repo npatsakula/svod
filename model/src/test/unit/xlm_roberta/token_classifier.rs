@@ -14,10 +14,11 @@
 use std::path::PathBuf;
 
 use svod_arch::pipelines::text::{ClassifyTokens, EncoderHead, Encoding};
-use svod_dtype::DType;
+use svod_dtype::default_device::set_default_device;
+use svod_dtype::{DType, DeviceSpec};
 use svod_tensor::nn::Module;
 
-use crate::encoder_head::HeadError;
+use crate::encoder_head::{HeadError, HeadOptions};
 use crate::state::StateDict;
 use crate::test::unit::encoder_head::{assert_tracks_pytorch_bf16, golden_encodings, local_or_hub, real_rows};
 use crate::test::unit::xlm_roberta::model::{expected_keys, sorted_keys, tiny_cfg};
@@ -58,11 +59,15 @@ fn sat_file(name: &str) -> PathBuf {
 fn load_sat_fixture(golden: &str, dtype: DType) -> (XlmRobertaTokenClassifier, Vec<Encoding>, StateDict) {
     let golden = crate::state::load_safetensors(&sat_file(golden)).expect("golden");
     let encodings = golden_encodings(&golden);
-    let mut cfg = XlmRobertaConfig::from_json(&sat_file("config.json")).expect("parse config.json");
-    cfg.dtype = dtype;
-    let sd = crate::state::load_safetensors(&sat_file("model.safetensors")).expect("load weights");
-    let model = XlmRobertaTokenClassificationModel::from_state_dict(&sd, cfg).expect("build model");
-    let classifier = XlmRobertaTokenClassifier::new(model, encodings.len(), encodings[0].len()).expect("classifier");
+    let opts = HeadOptions {
+        max_batch: encodings.len(),
+        max_seq: Some(encodings[0].len()),
+        dtype: Some(dtype),
+        ..HeadOptions::default()
+    };
+    let classifier =
+        XlmRobertaTokenClassifier::from_files(&sat_file("config.json"), &sat_file("model.safetensors"), &opts)
+            .expect("classifier");
     (classifier, encodings, golden)
 }
 
@@ -94,7 +99,8 @@ fn sat_logits_match_pytorch(golden: &str) {
 
 /// The classifier in bf16 — where its attention runs on tk's flash attention
 /// wherever tk has it, which the f32 tests never reach — bounded by PyTorch's
-/// own bf16 drift.
+/// own bf16 drift. It runs on a thread that defaults to the CPU: the plans
+/// still compile for the device the classifier was built on.
 #[test_case::test_case("golden_sat.safetensors"; "short")]
 #[test_case::test_case("golden_sat_512.safetensors"; "full position table")]
 #[ignore = "heavy: real sat-3l-sm weights (HF Hub) + PyTorch golden, on a bf16 device"]
@@ -106,7 +112,14 @@ fn sat_bf16_tracks_pytorch_bf16(golden: &str) {
     }
     let (mut classifier, encodings, golden) = load_sat_fixture(golden, dtype);
     let mask = load_golden_vec::<i64>(&golden, "attention_mask");
-    let (got, flash) = classify(&mut classifier, &encodings);
+    let run = std::thread::scope(|s| {
+        s.spawn(|| {
+            set_default_device(DeviceSpec::Cpu);
+            classify(&mut classifier, &encodings)
+        })
+        .join()
+    });
+    let (got, flash) = run.expect("classify on a CPU-default thread");
     let device = svod_dtype::default_device::default_device();
     let tk = svod_tk::ops::supported(&device);
     eprintln!("sat on {device:?}: flash attention {flash}");

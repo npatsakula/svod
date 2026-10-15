@@ -32,7 +32,7 @@ pub use error::{Error, Result};
 pub use feed_forward::FeedForwardWeights;
 pub use jit::{XlmRobertaJit, XlmRobertaTokenClassifierJit};
 pub use model::XlmRobertaModel;
-pub use pipeline::{XlmRobertaTokenClassifierLoad, from_hub_token_classification};
+pub use pipeline::from_hub_token_classification;
 pub use position_ids::position_ids_from_input_ids;
 #[cfg(test)]
 pub(crate) use token_classifier::XlmRobertaTokenClassificationModel;

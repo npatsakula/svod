@@ -1,14 +1,19 @@
 //! The batching every encoder head shares ([`crate::encoder_head`]): plan
-//! shapes and input packing, plus the fixtures and comparisons the heads'
-//! parity tests share.
+//! shapes, input packing, the build options and the device a head runs on,
+//! plus the fixtures and comparisons the heads' parity tests share.
 
 use std::path::{Path, PathBuf};
 
-use svod_arch::pipelines::text::Encoding;
+use svod_arch::pipelines::text::{EncoderHead, Encoding};
+use svod_dtype::default_device::{default_device, set_default_device, with_default_device};
+use svod_dtype::{DType, DeviceSpec};
 
-use crate::encoder_head::{pack_ids, pack_mask, plan_shape};
+use crate::encoder_head::{HeadOptions, pack_ids, pack_mask, plan_shape};
+use crate::modernbert::{ModernBertClassifier, ModernBertEmbedder, ModernBertTokenClassifier};
 use crate::state::StateDict;
+use crate::test::unit::xlm_roberta::model::tiny_cfg;
 use crate::test::unit::{load_golden_vec, max_abs_delta, nan_max};
+use crate::xlm_roberta::{XlmRobertaTokenClassificationModel, XlmRobertaTokenClassifier};
 
 /// A chunk of `real_ids` (mask 1) followed by `n_pad` pad positions (id 0,
 /// mask 0).
@@ -149,4 +154,51 @@ fn pack_inputs_pad_stride_and_truncate_correctly() {
 #[test_case::test_case(2, 0, 8 => (2, 128); "empty chunks still take a tile")]
 fn plan_shape_rounds_rows_and_length(b: usize, longest: usize, max_batch: usize) -> (usize, usize) {
     plan_shape(b, longest, max_batch)
+}
+
+// ── options, threads and devices ────────────────────────────────────────────
+
+/// Options left unset resolve on the building thread: its default device, and
+/// that device's compute dtype. A set field wins.
+#[test_case::test_case(None, None => (DeviceSpec::Cpu, DType::BFloat16); "the building thread's device")]
+#[test_case::test_case(Some(DType::Float32), None => (DeviceSpec::Cpu, DType::Float32); "a set dtype")]
+#[test_case::test_case(None, Some(DeviceSpec::Amd { device_id: 3 }) => (DeviceSpec::Amd { device_id: 3 }, DType::BFloat16); "a set device")]
+fn head_options_resolve_on_the_building_thread(
+    dtype: Option<DType>,
+    device: Option<DeviceSpec>,
+) -> (DeviceSpec, DType) {
+    let opts = HeadOptions { dtype, device, ..HeadOptions::default() };
+    with_default_device(DeviceSpec::Cpu, || opts.build(|dtype| (default_device(), dtype)))
+}
+
+/// Pins the threading contract a serving pipeline relies on: each head moves
+/// to the worker thread that runs it.
+#[test]
+fn heads_are_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<ModernBertEmbedder>();
+    assert_send::<ModernBertClassifier>();
+    assert_send::<ModernBertTokenClassifier>();
+    assert_send::<XlmRobertaTokenClassifier>();
+}
+
+/// A head built for the CPU compiles its first plan there even when the thread
+/// that runs it defaults to a device that does not exist, whose allocations
+/// would panic.
+#[test]
+fn a_head_compiles_for_the_device_it_was_built_on() {
+    let mut classifier = with_default_device(DeviceSpec::Cpu, || {
+        XlmRobertaTokenClassifier::new(XlmRobertaTokenClassificationModel::empty(tiny_cfg()), 1, 8)
+    })
+    .expect("classifier");
+    let chunk = encoding(&[0, 10, 20, 2], 0);
+    let run = std::thread::scope(|s| {
+        s.spawn(|| {
+            set_default_device(DeviceSpec::Amd { device_id: 99 });
+            classifier.run(&chunk, false)
+        })
+        .join()
+    });
+    let logits = run.expect("the run stays on the CPU").expect("classify").0.logits;
+    assert_eq!(logits.len(), chunk.len() * tiny_cfg().num_labels);
 }

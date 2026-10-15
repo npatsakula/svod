@@ -27,9 +27,10 @@ use svod_arch::pipelines::text::{Classify, ClassifyTokens, EncoderHead, Encoding
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
+use crate::encoder_head::HeadOptions;
 use crate::modernbert::{
-    ModernBert, ModernBertClassificationModel, ModernBertClassifier, ModernBertConfig, ModernBertEmbedder,
-    ModernBertForMaskedLm, ModernBertTokenClassificationModel, ModernBertTokenClassifier,
+    ModernBert, ModernBertClassifier, ModernBertConfig, ModernBertEmbedder, ModernBertForMaskedLm,
+    ModernBertTokenClassifier,
 };
 use crate::state::StateDict;
 use crate::test::unit::encoder_head::{assert_tracks_pytorch_bf16, golden_encodings};
@@ -328,11 +329,10 @@ fn bf16_drift_tracks_pytorch_bf16(length: usize) {
 /// The embedder at `dtype` over the golden's one row, and the golden.
 fn load_embed_fixture(dtype: DType) -> (ModernBertEmbedder, Encoding, StateDict) {
     let golden = crate::state::load_safetensors(&real_file("golden.safetensors")).expect("golden");
-    let mut cfg = ModernBertConfig::from_json(&real_file("config.json")).expect("parse config.json");
-    cfg.dtype = dtype;
-    let model = ModernBert::from_safetensors(&real_file("model.safetensors"), cfg).expect("load weights");
     let enc = golden_encodings(&golden).pop().expect("one row");
-    let embedder = ModernBertEmbedder::new(model, 1, enc.len()).expect("embedder");
+    let opts = HeadOptions { max_seq: Some(enc.len()), dtype: Some(dtype), ..HeadOptions::default() };
+    let embedder = ModernBertEmbedder::from_files(&real_file("config.json"), &real_file("model.safetensors"), &opts)
+        .expect("embedder");
     (embedder, enc, golden)
 }
 
@@ -370,16 +370,25 @@ fn classifier_file(name: &str) -> PathBuf {
     local_or_hub(CLASSIFIER_REPO, name)
 }
 
+/// A head sized to the golden's padded rows, computing in `dtype`.
+fn fixture_options(encodings: &[Encoding], dtype: DType) -> HeadOptions {
+    HeadOptions {
+        max_batch: encodings.len(),
+        max_seq: Some(encodings[0].len()),
+        dtype: Some(dtype),
+        ..HeadOptions::default()
+    }
+}
+
 /// The classifier at `dtype` over the golden's rows, and the golden. The plan
 /// matches the golden's padding (batch and length from its `input_ids`).
 fn load_classifier_fixture(dtype: DType) -> (ModernBertClassifier, Vec<Encoding>, StateDict) {
     let golden = crate::state::load_safetensors(&classifier_file("golden_classifier.safetensors")).expect("golden");
     let encodings = golden_encodings(&golden);
-    let mut cfg = ModernBertConfig::from_json(&classifier_file("config.json")).expect("parse config.json");
-    cfg.dtype = dtype;
-    let sd = crate::state::load_safetensors(&classifier_file("model.safetensors")).expect("load weights");
-    let model = ModernBertClassificationModel::from_state_dict(&sd, &cfg).expect("build model");
-    let classifier = ModernBertClassifier::new(model, encodings.len(), encodings[0].len()).expect("build classifier");
+    let opts = fixture_options(&encodings, dtype);
+    let classifier =
+        ModernBertClassifier::from_files(&classifier_file("config.json"), &classifier_file("model.safetensors"), &opts)
+            .expect("build classifier");
     (classifier, encodings, golden)
 }
 
@@ -460,12 +469,10 @@ fn token_file(name: &str) -> PathBuf {
 fn load_token_fixture(dtype: DType) -> (ModernBertTokenClassifier, Vec<Encoding>, StateDict) {
     let golden = crate::state::load_safetensors(&token_file("golden_token.safetensors")).expect("golden");
     let encodings = golden_encodings(&golden);
-    let mut cfg = ModernBertConfig::from_json(&token_file("config.json")).expect("parse config.json");
-    cfg.dtype = dtype;
-    let sd = crate::state::load_safetensors(&token_file("model.safetensors")).expect("load weights");
-    let model = ModernBertTokenClassificationModel::from_state_dict(&sd, &cfg).expect("build model");
+    let opts = fixture_options(&encodings, dtype);
     let classifier =
-        ModernBertTokenClassifier::new(model, encodings.len(), encodings[0].len()).expect("build token classifier");
+        ModernBertTokenClassifier::from_files(&token_file("config.json"), &token_file("model.safetensors"), &opts)
+            .expect("build token classifier");
     (classifier, encodings, golden)
 }
 

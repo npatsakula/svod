@@ -40,10 +40,7 @@ pub use head::{MlmHead, ModernBertForMaskedLm};
 pub use jit::{ModernBertJit, ModernBertMlmJit};
 pub use mlp::ModernBertGlu;
 pub use model::ModernBert;
-pub use pipeline::{
-    ModernBertClassifierLoad, ModernBertTokenClassifierLoad, from_hub, from_hub_classifier,
-    from_hub_token_classification,
-};
+pub use pipeline::{from_hub, from_hub_classifier, from_hub_token_classification};
 #[cfg(test)]
 pub(crate) use token_classifier::ModernBertTokenClassificationModel;
 pub use token_classifier::ModernBertTokenClassifier;

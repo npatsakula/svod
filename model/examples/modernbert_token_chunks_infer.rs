@@ -31,7 +31,7 @@ use svod_arch::pipelines::text::{
     group_spans_document, labels_for_tokens,
 };
 use svod_dtype::DType;
-use svod_model::encoder_head::HubOptions;
+use svod_model::encoder_head::{HeadOptions, HubOptions};
 use svod_model::modernbert;
 
 #[derive(Parser, Debug)]
@@ -108,28 +108,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let scheme = parse_scheme(&args.scheme)?;
-    let dtype = match args.dtype {
-        None => svod_model::default_compute_dtype(),
-        Some(Dtype::F32) => DType::Float32,
-        Some(Dtype::F16) => DType::Float16,
-        Some(Dtype::Bf16) => DType::BFloat16,
-    };
+    let dtype = args.dtype.map(|dtype| match dtype {
+        Dtype::F32 => DType::Float32,
+        Dtype::F16 => DType::Float16,
+        Dtype::Bf16 => DType::BFloat16,
+    });
     let opts = HubOptions {
         revision: args.revision.clone(),
-        max_batch: args.max_batch,
-        max_seq: args.max_seq,
-        dtype,
-        tokenizer_repo: None,
+        head: HeadOptions { max_batch: args.max_batch, max_seq: args.max_seq, dtype, device: None },
+        ..Default::default()
     };
 
     let t_total = Instant::now();
     println!("Loading ModernBERT token classifier from {} ({})...", args.repo, args.revision);
-    let load = modernbert::from_hub_token_classification(&args.repo, &opts)?;
-    let (_, max_seq) = load.classifier.capacity();
-    let num_labels = load.classifier.num_labels();
+    let (tokenizer, classifier) = modernbert::from_hub_token_classification(&args.repo, &opts)?;
+    let (_, max_seq) = classifier.capacity();
+    let num_labels = classifier.num_labels();
     println!("Loaded: max_seq={max_seq}, max_batch={}, num_labels={num_labels}", args.max_batch);
 
-    let id2label = load.id2label;
+    let id2label = classifier.id2label().to_vec();
     let label_of = |id: u32| id2label.get(id as usize).map_or("", |s| s.as_str());
 
     // Resolve window/stride: default to max_seq with 50% overlap so the sliding
@@ -146,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The pipeline owns the tokenizer + chunker + classifier; the chunk seam
     // (classify_tokens_chunks) bypasses the first two, so we drive them
     // explicitly here to tokenize + window once, then feed the chunks back in.
-    let mut pipeline = EncoderPipeline::new(load.tokenizer, chunker, load.classifier);
+    let mut pipeline = EncoderPipeline::new(tokenizer, chunker, classifier);
 
     println!("\nTagging {} chars via the chunk seam (scheme = {})...", text.len(), args.scheme);
     let t = Instant::now();
