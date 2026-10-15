@@ -219,13 +219,18 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         }
         other => other.clone(),
     };
+    // A cache with fewer rows than lanes is read through a map (zeros, in
+    // the scratch): lanes sharing a row is what makes a cross cache cheap,
+    // and the tuner should see it. Otherwise a row per lane, no map.
+    let rows = cache.map(|c| c.rows.min(measured.capacity()));
+    let mapped = cache.is_some_and(|c| c.row_map) && rows.is_some_and(|r| r < measured.capacity());
     let shape = [measured.capacity(), t, tk, heads, kv_heads, d];
-    let salt = (&measured, edges, cache.map(|c| c.heads_total), opts.splits);
+    let salt = (&measured, edges, cache.map(|c| c.heads_total), rows, mapped, opts.splits);
     let mut tuner = Tuner::new(&planner.device, q.dtype(), &shape, salt, |cfg: FaCfg| {
-        // Scratch caches hold a row per batch lane: no map to read, no garbage rows.
+        // Scratch caches hold no appended rows and no garbage: a zero map.
         let plain = cache.map(|c| kernels::attention::Cache {
-            rows: measured.capacity(),
-            row_map: false,
+            rows: rows.expect("a cache"),
+            row_map: mapped,
             appended: 0,
             app_lens: false,
             ..c
@@ -239,6 +244,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         programs
     });
     let cfg = tune(&mut tuner, &ranked, expand);
+    tracing::debug!(?shape, ?cfg, "attention tuned");
     let i32 = |t: &Tensor| if t.dtype() == DType::Int32 { t.clone() } else { t.cast(DType::Int32) };
     let lens = lens.map(i32);
     // Rows padded to the kernel's aligned stride.
