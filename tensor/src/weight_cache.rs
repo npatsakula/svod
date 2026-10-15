@@ -76,7 +76,12 @@ pub(crate) fn shared_weight_buffer(key: WeightKey, bytes: &[u8]) -> Arc<Buffer> 
             let allocator = svod_device::registry::registry().get(&key.device).unwrap_or_else(|e| {
                 panic!("Failed to get allocator for {:?}: {e}", key.device);
             });
-            let mut buffer = Buffer::new(allocator, key.dtype.clone(), key.shape.clone(), Default::default());
+            // `nolru`: a checkpoint weight lives as long as its model and its
+            // size rarely matches another allocation, so pooling it on free
+            // would only hold device memory (all of a model's f32 weights once
+            // they are cast to a narrower dtype) until an allocation fails.
+            let spec = svod_device::BufferSpec { nolru: true, ..Default::default() };
+            let mut buffer = Buffer::new(allocator, key.dtype.clone(), key.shape.clone(), spec);
             buffer.copyin(bytes).expect("weight upload");
             buffer.mark_immutable();
             let arc = Arc::new(buffer);
