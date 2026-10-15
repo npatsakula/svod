@@ -38,6 +38,45 @@ fn out_view(k: &mut Kernel, out: ParamRef<BF16>, at: usize) -> Gmem<BF16> {
     k.view(out, at, [16, 1], Shape::new(16, 16), [None, None])
 }
 
+/// Inside a [`Stmt::Warps`] a warp's own store and load of its region are
+/// fenced among its lanes alone; what the warps left is fenced for the block
+/// before the block reads it.
+#[test]
+fn warps_fence_their_own_effects_and_the_block_fences_theirs() {
+    let mut k = Kernel::new("warps");
+    k.warps(4);
+    let scratch = k.smem::<BF16>("scratch", 4 * 256);
+    let out = k.param::<BF16>("o", ParamKind::Out, 2 * 256);
+    k.each_warp(|k| {
+        let w = k.warp();
+        let region = k.smem_view::<BF16>(scratch, w * 256, Shape::new(16, 16));
+        let z = k.zeros::<BF16>(Shape::new(16, 16));
+        k.store(region, z);
+        let back = k.load(region);
+        let o = out_view(k, out, 0);
+        k.store(o, back);
+    });
+    let first = k.smem_view::<BF16>(scratch, 0, Shape::new(16, 16));
+    let merged = k.load(first);
+    let o = out_view(&mut k, out, 256);
+    k.store(o, merged);
+    let mut prog = k.finish();
+    insert_barriers(&mut prog);
+    assert_eq!(
+        top(&prog),
+        ["other", "barrier", "load", "out"],
+        "the block fences the warps' effects: {:?}",
+        top(&prog)
+    );
+    let Stmt::Warps { body } = &prog.body.0[0] else { panic!("the warps statement first") };
+    assert_eq!(kinds(&prog, body), ["other", "store", "barrier", "load", "out"]);
+    let scopes: Vec<Scope> = prog
+        .walk()
+        .filter_map(|(_, s)| if let Stmt::Sync(Sync::Barrier { scope }) = s { Some(*scope) } else { None })
+        .collect();
+    assert_eq!(scopes, [Scope::Warp, Scope::Block]);
+}
+
 /// A loop may run no trip, so what was written before it is still unfenced
 /// after it even when its body ends on a barrier.
 #[test]
@@ -55,7 +94,7 @@ fn a_store_before_a_loop_is_fenced_past_it() {
     k.store(o, y);
     let mut prog = k.finish();
     let Some(Stmt::Loop(l)) = prog.body.0.iter_mut().find(|s| matches!(s, Stmt::Loop(_))) else { panic!("a loop") };
-    l.body.0.push(Stmt::Sync(Sync::Barrier { role: None }));
+    l.body.0.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
     insert_barriers(&mut prog);
     let k = top(&prog);
     let at = k.iter().position(|k| *k == "loop").unwrap();
@@ -129,12 +168,12 @@ fn a_pending_async_copy_survives_a_barrier(between: Between) {
     let mut prog = k.finish();
     let after_copy = top(&prog).iter().position(|s| *s == "async").unwrap() + 1;
     match between {
-        Between::Barrier => prog.body.0.insert(after_copy, Stmt::Sync(Sync::Barrier { role: None })),
+        Between::Barrier => prog.body.0.insert(after_copy, Stmt::Sync(Sync::Barrier { scope: Scope::Block })),
         Between::Loop => {
             let Some(Stmt::Loop(l)) = prog.body.0.iter_mut().find(|s| matches!(s, Stmt::Loop(_))) else {
                 panic!("a loop")
             };
-            l.body.0.push(Stmt::Sync(Sync::Barrier { role: None }));
+            l.body.0.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
         }
         Between::Fence => {}
     }

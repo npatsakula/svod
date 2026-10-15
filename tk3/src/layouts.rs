@@ -35,6 +35,11 @@ pub struct WarpGrid {
 }
 
 impl WarpGrid {
+    /// The warps a tile is spread over.
+    pub fn count(self) -> u32 {
+        self.rows * self.cols
+    }
+
     /// Warp index → warp sub-tile coordinate: the low bits walk columns.
     pub fn layout(self) -> Layout {
         let lc = self.cols.trailing_zeros();
@@ -495,6 +500,9 @@ struct Infer<'a> {
     conflicts: HashMap<(usize, ValId), TileLayout>,
     /// Position of the statement being visited, for conflict keys.
     pos: usize,
+    /// Whose lanes a staged copy's chunks are spread over: the block's, or
+    /// one warp's inside a [`Stmt::Warps`].
+    scope: Scope,
 }
 
 /// A program whose register values all have a layout and whose products are
@@ -578,7 +586,7 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid) -> Resul
             .map(|((_, v), want)| match &it.lay[v.index()] {
                 Some(have) => {
                     let elems = trial.value(*v).shape.elems() as f64;
-                    have.relayout(want, trial.warps, target.wave, costs).cost_per_element(costs) * elems
+                    have.relayout(want, grid.count(), target.wave, costs).cost_per_element(costs) * elems
                 }
                 None => 0.0,
             })
@@ -639,7 +647,7 @@ fn set_orient(block: &mut Block, choice: &HashMap<ValId, Orient>) {
                 set_orient(&mut p.produce.body, choice);
                 set_orient(&mut p.consume.body, choice);
             }
-            Stmt::Role { body, .. } => set_orient(body, choice),
+            Stmt::Role { body, .. } | Stmt::Warps { body } => set_orient(body, choice),
             Stmt::If { then, otherwise, .. } => {
                 set_orient(then, choice);
                 set_orient(otherwise, choice);
@@ -654,14 +662,14 @@ impl<'a> Infer<'a> {
         for (v, l) in &prog.pins {
             lay[v.index()] = Some(l.clone());
         }
-        Infer { prog, target, grid, lay, changed: true, conflicts: HashMap::new(), pos: 0 }
+        Infer { prog, target, grid, lay, changed: true, conflicts: HashMap::new(), pos: 0, scope: Scope::Block }
     }
 
     /// Run the propagation to its fixed point, seeding what nothing constrains.
     fn solve(&mut self) -> Result<()> {
         let prog = self.prog;
         let n = self.lay.len();
-        let (warps, lanes) = (prog.warps, self.target.wave);
+        let (warps, lanes) = (self.grid.count(), self.target.wave);
         for _ in 0..4 * n + 4 {
             if !self.changed {
                 // At a fixed point, a value nothing constrains takes the natural
@@ -760,6 +768,11 @@ impl<'a> Infer<'a> {
                     self.pass(&p.consume.body)?;
                 }
                 Stmt::Role { body, .. } => self.pass(body)?,
+                Stmt::Warps { body } => {
+                    let outer = std::mem::replace(&mut self.scope, Scope::Warp);
+                    self.pass(body)?;
+                    self.scope = outer;
+                }
                 Stmt::If { then, otherwise, .. } => {
                     self.pass(then)?;
                     self.pass(otherwise)?;
@@ -767,8 +780,8 @@ impl<'a> Infer<'a> {
                 Stmt::Copy { dst, src, mode: CopyMode::Staged } if self.lay[dst.index()].is_none() => {
                     let (d, s) = (self.prog.value(*dst), self.prog.value(*src));
                     if d.place == Place::Reg && s.tier() == Tier::Global {
-                        let (warps, lanes) = (self.prog.warps, self.target.wave);
-                        if let Some(l) = chunked(d.shape, d.dtype.bytes(), warps, lanes, Axis::Col) {
+                        let warps = if self.scope == Scope::Warp { 1 } else { self.prog.warps };
+                        if let Some(l) = chunked(d.shape, d.dtype.bytes(), warps, self.target.wave, Axis::Col) {
                             self.set(*dst, l);
                         }
                     }
@@ -922,7 +935,7 @@ impl Rewrite<'_> {
                     p.produce.body = self.insert(std::mem::take(&mut p.produce.body));
                     p.consume.body = self.insert(std::mem::take(&mut p.consume.body));
                 }
-                Stmt::Role { body, .. } => *body = self.insert(std::mem::take(body)),
+                Stmt::Role { body, .. } | Stmt::Warps { body } => *body = self.insert(std::mem::take(body)),
                 Stmt::If { then, otherwise, .. } => {
                     *then = self.insert(std::mem::take(then));
                     *otherwise = self.insert(std::mem::take(otherwise));

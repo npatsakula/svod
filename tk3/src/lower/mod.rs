@@ -105,6 +105,18 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
     // The staged registers of a column-major tile hold column runs where the
     // target loads them transposed, else are walked down its rows so a
     // wave's lanes store consecutive elements.
+    // A copy inside a `Warps` statement is one warp's own, its chunks spread
+    // over that warp's lanes alone.
+    let mut own = std::collections::HashSet::new();
+    for (_, stmt) in prog.walk() {
+        if let Stmt::Warps { body } = stmt {
+            for (_, inner) in body.walk_from(1) {
+                if let Stmt::Copy { dst, .. } = inner {
+                    own.insert(*dst);
+                }
+            }
+        }
+    }
     let walked: Vec<(ValId, TileLayout)> = prog
         .walk()
         .filter_map(|(_, stmt)| match stmt {
@@ -114,9 +126,10 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
             {
                 let tmp = prog.value(*src);
                 let bytes = tmp.dtype.bytes();
-                layouts::transposing(tmp.shape, prog.warps, lanes)
+                let warps = if own.contains(dst) { 1 } else { prog.warps };
+                layouts::transposing(tmp.shape, warps, lanes)
                     .filter(|_| target.tr_load && bytes == 2)
-                    .or_else(|| layouts::chunked(tmp.shape, bytes, prog.warps, lanes, Axis::Row))
+                    .or_else(|| layouts::chunked(tmp.shape, bytes, warps, lanes, Axis::Row))
                     .map(|l| (*src, l))
             }
             _ => None,
@@ -155,7 +168,7 @@ fn materialize_block(prog: &mut Program, block: Block) -> Block {
                 p.produce.body = materialize_block(prog, std::mem::take(&mut p.produce.body));
                 p.consume.body = materialize_block(prog, std::mem::take(&mut p.consume.body));
             }
-            Stmt::Role { body, .. } => *body = materialize_block(prog, std::mem::take(body)),
+            Stmt::Role { body, .. } | Stmt::Warps { body } => *body = materialize_block(prog, std::mem::take(body)),
             Stmt::If { then, otherwise, .. } => {
                 *then = materialize_block(prog, std::mem::take(then));
                 *otherwise = materialize_block(prog, std::mem::take(otherwise));

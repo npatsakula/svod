@@ -157,6 +157,19 @@ d = 64 105 → 108 (causal 87 → 92), the decoder step unchanged. What remains 
 the loop's WMMAs alone would run at is spread thin: the vector work is 15%, the loads, stores,
 barriers and addressing the rest.
 
+A decoder step's block is one row warp of queries (`bq = 16`) walking every key block in turn, a
+single wave waiting on each block's load. `FaCfg::key_warps` lets that block's warps share its keys
+instead: each walks its own range of key blocks through its own ring slots with its own softmax
+state, inside a `Warps` statement (every warp on its own, warp-scoped copies and barriers), and the
+states merge through shared memory at the end, as the split merge does. The planner offers 1, 2 and
+4 key warps for `t ≤ 16`; the tuner picks. On gfx1201 the Whisper large-v3 cross-attention step
+(1500 keys, one cache row shared by five lanes) went from 25.3 to 15.7 µs tuned (four splits) and to
+18.2 unsplit (two key warps), tk1's single-query kernel being 16.1; the self-attention step is
+unchanged. Four key warps at `bkv = 16` lose again: their 32 KB of rings plus the merge scratch
+leave one block per CU. The tuner also measures a cache the way the model reads it: fewer cache
+rows than lanes are read through a zero row map, so lanes share a row, where it used to time a row
+per lane, 38 MB from DRAM for a shape that is 7.7 MB in L2.
+
 Each tile config is crossed with split counts. `Attn::splits = Some(n)` fixes `n`: only the
 configs with at least `n` key blocks are ranked, at `n` (capped at the most key blocks any config
 has), so a named count is never dropped by a large key block. With `None`, `Planner::splits`

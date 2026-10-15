@@ -11,7 +11,7 @@ use svod_codegen::llvm::amd::tr::global_load_tr_b128;
 use svod_codegen::llvm::nvptx::ops::shfl_bfly;
 use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill, cp_async_commit, cp_async_wait, ldmatrix};
 use svod_dtype::{AddrSpace, DType, DeviceSpec, GpuArch, ScalarDType};
-use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp};
+use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp, ops};
 
 use super::{Lowering, ProgramSnafu, Result, UnsupportedSnafu};
 use crate::atoms::LaneMove;
@@ -66,6 +66,9 @@ struct Emit<'a> {
     lane: Arc<UOp>,
     warp: Arc<UOp>,
     tid: Arc<UOp>,
+    /// Whose threads the statement being emitted belongs to: the block's, or
+    /// one warp's own inside a [`Stmt::Warps`].
+    scope: Scope,
     range_id: usize,
     reg_slot: usize,
     local_slot: usize,
@@ -149,6 +152,7 @@ impl<'a> Emit<'a> {
             lane,
             warp,
             tid,
+            scope: Scope::Block,
             range_id: 0,
             reg_slot: 0,
             local_slot: 0,
@@ -606,6 +610,12 @@ impl<'a> Emit<'a> {
             Stmt::Loop(l) => self.loop_(l),
             Stmt::Pipeline(_) => UnsupportedSnafu { what: "an unexpanded pipeline" }.fail(),
             Stmt::Role { .. } => UnsupportedSnafu { what: "warp roles" }.fail(),
+            Stmt::Warps { body } => {
+                let outer = std::mem::replace(&mut self.scope, Scope::Warp);
+                let out = self.block(body);
+                self.scope = outer;
+                out
+            }
             Stmt::If { pred, then, otherwise } => {
                 let pred = self.sc(*pred);
                 let cond = pred.try_cmpne(&c32(0)).expect("predicate");
@@ -722,11 +732,19 @@ impl<'a> Emit<'a> {
     fn sync(&mut self, sync: Sync) -> Result<()> {
         let cuda = matches!(self.low.device.target.arch, GpuArch::Cuda(_));
         let u = match sync {
-            Sync::Barrier { role: None } => {
+            Sync::Barrier { scope: Scope::Block } => {
                 let tag = self.next_tag();
                 self.last.clone().barrier(smallvec![]).rtag(Some(smallvec![tag as usize]))
             }
-            Sync::Barrier { role: Some(_) } => return UnsupportedSnafu { what: "role barriers" }.fail(),
+            // A warp's own barrier: CUDA's lanes schedule independently and
+            // its shared accesses need `bar.warp.sync`; an AMD wave issues
+            // its LDS accesses in order and waits on their counters.
+            Sync::Barrier { scope: Scope::Warp } if cuda => UOp::custom(
+                smallvec![self.last.clone()],
+                "declare void @llvm.nvvm.bar.warp.sync(i32)\ncall void @llvm.nvvm.bar.warp.sync(i32 -1)".to_string(),
+                DType::Void,
+            ),
+            Sync::Barrier { scope: Scope::Warp } => return Ok(()),
             Sync::CommitAsync if cuda && self.low.device.target.cp_async => cp_async_commit(smallvec![]),
             Sync::WaitAsync { pending } if cuda && self.low.device.target.cp_async => {
                 cp_async_wait(pending, smallvec![])
@@ -757,12 +775,28 @@ impl<'a> Emit<'a> {
         }
     }
 
-    /// Global → shared, every thread moving 16-byte chunks.
+    /// The warps whose threads a copy of the statement being emitted is
+    /// spread over: the block's, or one inside a [`Stmt::Warps`].
+    fn warps(&self) -> u32 {
+        match self.scope {
+            Scope::Block => self.prog.warps,
+            Scope::Warp => 1,
+        }
+    }
+
+    /// The warps a register tile is spread over: the lowering's grid, which
+    /// key warps sharing a block's tiles are not part of.
+    fn grid_warps(&self) -> u32 {
+        self.low.grid.count()
+    }
+
+    /// Global → shared, every thread of the scope moving 16-byte chunks.
     fn fill(&mut self, dst: ValId, src: ValId, mode: CopyMode) -> Result<()> {
         let (d, s) = (self.view(dst), self.view(src));
         let chunk = 16 / d.dtype.bytes() as i64;
         let cols = d.shape.cols as i64;
-        let threads = (self.prog.warps * self.low.device.target.wave) as i64;
+        let threads = (self.warps() * self.low.device.target.wave) as i64;
+        let tid = if self.scope == Scope::Warp { self.lane.clone() } else { self.tid.clone() };
         let chunks = d.shape.rows as i64 * cols / chunk;
         let cuda = matches!(self.low.device.target.arch, GpuArch::Cuda(_));
         snafu::ensure!(
@@ -779,7 +813,7 @@ impl<'a> Emit<'a> {
         let bounds = *bounds;
         let cpr = cols / chunk;
         for t in 0..chunks / threads {
-            let c = add(&self.tid, &c32(t * threads));
+            let c = add(&tid, &c32(t * threads));
             let (row, cc) = (c.try_cdiv(&c32(cpr)).expect("row"), c.try_cmod(&c32(cpr)).expect("chunk"));
             let (row, col) = (self.hoist(row), self.hoist(mul(&cc, &c32(chunk))));
             // Rows past a bound re-read the last valid one (the first, under an
@@ -840,7 +874,7 @@ impl<'a> Emit<'a> {
                     reps: [sub_r / 16, sub_c / 16],
                     warps: l.warps.clone(),
                 };
-                if let Some(perm) = l.as_permutation_of(&produced, self.prog.warps, self.low.device.target.wave) {
+                if let Some(perm) = l.as_permutation_of(&produced, self.grid_warps(), self.low.device.target.wave) {
                     return self.ldmatrix_gather(dst, &s, &l, trans, &perm);
                 }
             }
@@ -926,7 +960,7 @@ impl<'a> Emit<'a> {
         }
         let produced =
             TileLayout { frag: frag::global_tr_b128(), reps: [sub_r / 16, sub_c / 16], warps: l.warps.clone() };
-        l.as_permutation_of(&produced, self.prog.warps, self.low.device.target.wave)
+        l.as_permutation_of(&produced, self.grid_warps(), self.low.device.target.wave)
     }
 
     /// Global → registers by transposing loads, one per 16×16 block, its
@@ -977,7 +1011,7 @@ impl<'a> Emit<'a> {
 
     fn relayout(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let (ls, ld) = (self.layout(src).clone(), self.layout(dst).clone());
-        match ls.relayout(&ld, self.prog.warps, self.low.device.target.wave, &self.low.device.costs) {
+        match ls.relayout(&ld, self.grid_warps(), self.low.device.target.wave, &self.low.device.costs) {
             Relayout::Identity => {
                 let buf = self.reg_buf(src);
                 let root = self.root(dst);
@@ -1033,24 +1067,38 @@ impl<'a> Emit<'a> {
         bit.try_cmpne(&c(0)).expect("lane predicate")
     }
 
+    /// A tile re-held through a scratch of shared memory; inside a
+    /// [`Stmt::Warps`] every warp takes its own region of it.
     fn relayout_via_smem(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let Value { dtype, shape, .. } = self.value(src).clone();
         let elems = shape.elems();
+        let regions = if self.scope == Scope::Warp { self.prog.warps as usize } else { 1 };
         let scratch = match self.scratch.get(&dtype) {
-            Some((buf, size)) if *size >= elems => buf.clone(),
+            Some((buf, size)) if *size >= elems * regions => buf.clone(),
             _ => {
-                let buf = UOp::buffer(self.local_slot, elems, DType::Scalar(dtype), AddrSpace::Local, None);
+                let buf = UOp::buffer(self.local_slot, elems * regions, DType::Scalar(dtype), AddrSpace::Local, None);
                 self.local_slot += 1;
                 let buf = self.hoist(buf);
-                self.scratch.insert(dtype, (buf.clone(), elems));
+                self.scratch.insert(dtype, (buf.clone(), elems * regions));
                 buf
             }
         };
-        let view =
-            View { buf: scratch, place: Place::Smem { alloc: SmemId(u32::MAX), offset: self.zero() }, shape, dtype };
-        self.sync(Sync::Barrier { role: None })?;
+        // A warp's region: the scratch pointer advanced by its index, so the
+        // view itself keeps a zero offset.
+        let buf = if regions > 1 {
+            let at = self.hoist(mul(&self.warp, &c32(elems as i64)));
+            self.hoist(UOp::new(
+                Op::Shrink(ops::Shrink { src: scratch, offsets: at, sizes: c32(elems as i64) }),
+                self.scratch[&dtype].0.dtype(),
+            ))
+        } else {
+            scratch
+        };
+        let offset = self.zero();
+        let view = View { buf, place: Place::Smem { alloc: SmemId(u32::MAX), offset }, shape, dtype };
+        self.sync(Sync::Barrier { scope: self.scope })?;
         self.store_view(&view, src)?;
-        self.sync(Sync::Barrier { role: None })?;
+        self.sync(Sync::Barrier { scope: self.scope })?;
         self.gather_view(dst, &view)
     }
 

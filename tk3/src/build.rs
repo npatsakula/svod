@@ -547,6 +547,14 @@ impl Kernel {
         self.push(Stmt::Role { role, body });
     }
 
+    /// Every warp runs `body` on its own ([`Stmt::Warps`]): [`warp`](Self::warp)
+    /// is its index there, and what it leaves in shared memory is visible to
+    /// the block afterwards.
+    pub fn each_warp(&mut self, body: impl FnOnce(&mut Self)) {
+        let body = self.with_block(body);
+        self.push(Stmt::Warps { body });
+    }
+
     pub fn if_(&mut self, pred: impl Into<Sc>, then: impl FnOnce(&mut Self), otherwise: impl FnOnce(&mut Self)) {
         let pred = self.intern(pred);
         let then = self.with_block(then);
@@ -592,7 +600,7 @@ impl Kernel {
 
     /// A barrier across the block's warps.
     pub fn barrier(&mut self) {
-        self.push(Stmt::Sync(Sync::Barrier { role: None }));
+        self.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
     }
 
     pub fn finish(mut self) -> Program {

@@ -25,12 +25,15 @@ pub enum Schedule {
 /// synchronization according to `schedule`.
 pub fn expand(prog: &mut Program, schedule: Schedule) {
     let body = std::mem::take(&mut prog.body);
-    prog.body = Expander { prog, schedule }.block(body);
+    prog.body = Expander { prog, schedule, scope: Scope::Block }.block(body);
 }
 
 struct Expander<'p> {
     prog: &'p mut Program,
     schedule: Schedule,
+    /// Whose barriers a pipeline's template emits: the block's, or one
+    /// warp's own inside a [`Stmt::Warps`].
+    scope: Scope,
 }
 
 impl Expander<'_> {
@@ -65,11 +68,21 @@ impl Expander<'_> {
                 vec![Stmt::Loop(l)]
             }
             Stmt::Role { role, body } => vec![Stmt::Role { role, body: self.block(body) }],
+            Stmt::Warps { body } => {
+                let outer = std::mem::replace(&mut self.scope, Scope::Warp);
+                let body = self.block(body);
+                self.scope = outer;
+                vec![Stmt::Warps { body }]
+            }
             Stmt::If { pred, then, otherwise } => {
                 vec![Stmt::If { pred, then: self.block(then), otherwise: self.block(otherwise) }]
             }
             other => vec![other],
         }
+    }
+
+    fn barrier(&self) -> Stmt {
+        Stmt::Sync(Sync::Barrier { scope: self.scope })
     }
 
     fn pipeline(&mut self, p: Pipeline) -> Vec<Stmt> {
@@ -120,8 +133,7 @@ impl Expander<'_> {
         self.define(consume.slot, Scalar::Bin(BinOp::Rem, consume.step, nstages));
         let consuming = self.bin(BinOp::Le, ahead, iv);
         let producing = self.bin(BinOp::Lt, iv, extent);
-        let mut consume_body =
-            vec![Stmt::Sync(Sync::WaitAsync { pending: stages as u32 - 2 }), Stmt::Sync(Sync::Barrier { role: None })];
+        let mut consume_body = vec![Stmt::Sync(Sync::WaitAsync { pending: stages as u32 - 2 }), self.barrier()];
         consume_body.extend(consume.body.0);
         let body = vec![
             Self::if_(consuming, consume_body),
@@ -141,13 +153,9 @@ impl Expander<'_> {
         }
         let start = zero;
         let mut body = produce.body.0;
-        body.extend([
-            Stmt::Sync(Sync::CommitAsync),
-            Stmt::Sync(Sync::WaitAsync { pending: 0 }),
-            Stmt::Sync(Sync::Barrier { role: None }),
-        ]);
+        body.extend([Stmt::Sync(Sync::CommitAsync), Stmt::Sync(Sync::WaitAsync { pending: 0 }), self.barrier()]);
         body.extend(consume.body.0);
-        body.push(Stmt::Sync(Sync::Barrier { role: None }));
+        body.push(self.barrier());
         vec![Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll: 1 })]
     }
 
@@ -192,7 +200,7 @@ impl Expander<'_> {
                 other => issue.push(other),
             }
         }
-        let barrier = Stmt::Sync(Sync::Barrier { role: None });
+        let barrier = self.barrier();
         let head: Vec<Stmt> = issue.iter().chain(&commit).cloned().chain([barrier.clone()]).collect();
         let fenced = [Stmt::Sync(Sync::Fence)].into_iter().chain(commit).chain([barrier]);
         let body: Vec<Stmt> = issue.into_iter().chain(consume.body.0.iter().cloned()).chain(fenced).collect();

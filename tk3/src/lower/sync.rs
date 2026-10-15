@@ -47,17 +47,22 @@ impl State {
         }
     }
 
-    /// Emit what `need` asks for into `out`. A barrier orders threads but
-    /// lands no copy, so only the wait clears `pending`.
-    fn meet(&mut self, need: Need, out: &mut Vec<Stmt>) {
+    /// Emit what `need` asks for into `out`, the barrier over `scope`. A
+    /// barrier orders threads but lands no copy, so only the wait clears
+    /// `pending`.
+    fn meet(&mut self, need: Need, scope: Scope, out: &mut Vec<Stmt>) {
         if need == Need::Land {
             out.extend([Stmt::Sync(Sync::CommitAsync), Stmt::Sync(Sync::WaitAsync { pending: 0 })]);
             self.pending.clear();
         }
         if need >= Need::Fence {
-            out.push(Stmt::Sync(Sync::Barrier { role: None }));
+            out.push(Stmt::Sync(Sync::Barrier { scope }));
             self.fenced();
         }
+    }
+
+    fn any(&self) -> bool {
+        !(self.dirty.is_empty() && self.read.is_empty() && self.pending.is_empty())
     }
 
     fn fenced(&mut self) {
@@ -68,7 +73,7 @@ impl State {
 
 pub fn insert_barriers(prog: &mut Program) {
     let body = std::mem::take(&mut prog.body);
-    let (body, _) = walk(prog, body, State::default());
+    let (body, _) = walk(prog, body, State::default(), Scope::Block);
     prog.body = body;
 }
 
@@ -89,22 +94,42 @@ fn written(prog: &Program, block: &Block, into: &mut HashSet<SmemId>) {
                 written(prog, then, into);
                 written(prog, otherwise, into);
             }
-            Stmt::Role { body, .. } => written(prog, body, into),
+            Stmt::Role { body, .. } | Stmt::Warps { body } => written(prog, body, into),
             Stmt::Pipeline(p) => written(prog, &p.produce.body, into),
             Stmt::Let { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
         }
     }
 }
 
-/// Rewrite `block` under the incoming `state`; returns it with the state at
-/// its end.
-fn walk(prog: &Program, block: Block, mut state: State) -> (Block, State) {
+/// The shared allocations `block` copies out of.
+fn read(prog: &Program, block: &Block, into: &mut HashSet<SmemId>) {
+    for stmt in &block.0 {
+        match stmt {
+            Stmt::Copy { src, .. } => into.extend(alloc(prog, *src)),
+            Stmt::Loop(l) => read(prog, &l.body, into),
+            Stmt::If { then, otherwise, .. } => {
+                read(prog, then, into);
+                read(prog, otherwise, into);
+            }
+            Stmt::Role { body, .. } | Stmt::Warps { body } => read(prog, body, into),
+            Stmt::Pipeline(p) => {
+                read(prog, &p.produce.body, into);
+                read(prog, &p.consume.body, into);
+            }
+            Stmt::Let { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+        }
+    }
+}
+
+/// Rewrite `block` under the incoming `state`, its barriers over `scope`;
+/// returns it with the state at its end.
+fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block, State) {
     let mut out = Vec::with_capacity(block.0.len());
     for stmt in block.0 {
         let stmt = match stmt {
             Stmt::Copy { dst, src, mode } => {
                 let (wr, rd) = (alloc(prog, dst), alloc(prog, src));
-                state.meet(state.need(rd, false).max(state.need(wr, true)), &mut out);
+                state.meet(state.need(rd, false).max(state.need(wr, true)), scope, &mut out);
                 if let Some(a) = wr {
                     match mode {
                         CopyMode::Async => state.pending.insert(a),
@@ -128,9 +153,9 @@ fn walk(prog: &Program, block: Block, mut state: State) -> (Block, State) {
                 // The body's end state flows back to its start, and the state
                 // before the loop flows past it: it may run no trip.
                 let before = state.clone();
-                let (_, back) = walk(prog, l.body.clone(), state.clone());
+                let (_, back) = walk(prog, l.body.clone(), state.clone(), scope);
                 state.merge(&back);
-                let (body, end) = walk(prog, std::mem::take(&mut l.body), state);
+                let (body, end) = walk(prog, std::mem::take(&mut l.body), state, scope);
                 l.body = body;
                 state = end;
                 state.merge(&before);
@@ -144,13 +169,13 @@ fn walk(prog: &Program, block: Block, mut state: State) -> (Block, State) {
                 written(prog, &p.produce.body, &mut ring);
                 let need = ring.iter().map(|&a| state.need(Some(a), true)).max().unwrap_or(Need::Nothing);
                 let landing = if state.pending.is_empty() { Need::Nothing } else { Need::Land };
-                state.meet(need.max(landing), &mut out);
+                state.meet(need.max(landing), scope, &mut out);
                 // Landed copies are fenced by the template's barrier before
                 // the first consume, as is every later consume's start, but
                 // an async copy a consume issues is still pending at the next.
-                let (_, back) = walk(prog, p.consume.body.clone(), State::default());
+                let (_, back) = walk(prog, p.consume.body.clone(), State::default(), scope);
                 let start = State { pending: back.pending, ..State::default() };
-                let (body, mut end) = walk(prog, std::mem::take(&mut p.consume.body), start);
+                let (body, mut end) = walk(prog, std::mem::take(&mut p.consume.body), start, scope);
                 p.consume.body = body;
                 // No barrier follows the last consume: its effects and its
                 // ring reads stay open. With no step, the state passes through.
@@ -159,16 +184,32 @@ fn walk(prog: &Program, block: Block, mut state: State) -> (Block, State) {
                 Stmt::Pipeline(p)
             }
             Stmt::If { pred, then, otherwise } => {
-                let (then, s1) = walk(prog, then, state.clone());
-                let (otherwise, s2) = walk(prog, otherwise, state);
+                let (then, s1) = walk(prog, then, state.clone(), scope);
+                let (otherwise, s2) = walk(prog, otherwise, state, scope);
                 state = s1;
                 state.merge(&s2);
                 Stmt::If { pred, then, otherwise }
             }
             Stmt::Role { role, body } => {
-                let (body, end) = walk(prog, body, state);
+                let (body, end) = walk(prog, body, state, scope);
                 state = end;
                 Stmt::Role { role, body }
+            }
+            // The warps part on a clean slate (the block's open effects are
+            // fenced first, for every warp), fence their own effects among
+            // their own lanes, and what any of them wrote or read is the
+            // block's open effect afterwards.
+            Stmt::Warps { body } => {
+                let open = if state.pending.is_empty() { Need::Fence } else { Need::Land };
+                if state.any() {
+                    state.meet(open, scope, &mut out);
+                }
+                let (body, _) = walk(prog, body, State::default(), Scope::Warp);
+                let mut touched = HashSet::new();
+                written(prog, &body, &mut touched);
+                read(prog, &body, &mut touched);
+                state.dirty.extend(touched);
+                Stmt::Warps { body }
             }
             other => other,
         };

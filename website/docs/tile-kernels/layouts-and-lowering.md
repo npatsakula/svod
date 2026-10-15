@@ -127,7 +127,12 @@ value listed once in the prologue, plus the register's constant last, so the com
 running pointer per view and an immediate per register instead of rebuilding every address on
 every trip; a gathered row and a swizzled shared row take the full coordinate. A `Scale`
 (a product, exactly) puts its multiplies under a branch on whether any factor the thread holds
-differs from 1, which a wave whose factors are all ones jumps over. A cast toward zero to bf16
+differs from 1, which a wave whose factors are all ones jumps over. A `Warps` statement runs its body
+on every warp alone: `Special::Warp` is the warp's index, its copies move whole tiles with its own
+lanes, its barriers (from the barrier pass and the pipeline templates) gather only itself, `bar.warp.sync`
+on CUDA and nothing on AMD, whose wave issues its LDS accesses in order, and what the warps left in
+shared memory is fenced for the block at the statement's end. Tile layouts span the lowering's warp
+grid, which the warps of such a statement are not part of. A cast toward zero to bf16
 keeps the upper half of the f32's bits. A reduction of a bf16 tile into f32 folds in f32: where the
 target has `v_dot2_f32_bf16` (RDNA3 on, gfx950) a lane's pairs are added as held, one instruction
 each; elsewhere each element is widened first. On AMD an f32 `Exp2` is the hardware `v_exp_f32`

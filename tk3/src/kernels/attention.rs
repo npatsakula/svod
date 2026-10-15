@@ -21,6 +21,13 @@ pub struct FaCfg {
     /// The ring loop unrolled over its slots.
     pub unroll: bool,
     pub forms: Forms,
+    /// Warps sharing a block of one row-warp of queries (`bq` = [`WARP_ROWS`])
+    /// by its keys: each walks its own range of key blocks through its own
+    /// ring slots with its own softmax state, and the states merge through
+    /// shared memory at the end. A one-row decoder step's block is otherwise
+    /// a single wave waiting on every key block's load in turn; this many
+    /// loads are in flight instead. `1` leaves the keys to one warp.
+    pub key_warps: usize,
 }
 
 /// The softmax forms: all off as planned; the tuner flips each where it
@@ -62,21 +69,30 @@ impl FaCfg {
             splits: 1,
             unroll: false,
             forms: Forms { truncate_p: false, sum_after: false, skip_rescale: false, raw_max: false },
+            key_warps: 1,
         }
     }
 
-    /// One warp per [`WARP_ROWS`] query rows.
-    pub fn warps(&self) -> u32 {
+    /// One warp per [`WARP_ROWS`] query rows: the warps a tile is spread over.
+    pub fn row_warps(&self) -> u32 {
         (self.bq / WARP_ROWS) as u32
     }
 
-    pub fn lowering(&self, device: &Device) -> Lowering {
-        Lowering::uniform(device, self.unroll, WarpGrid { rows: self.warps(), cols: 1 })
+    /// The block's warps: the row warps, each split [`key_warps`](Self::key_warps) ways.
+    pub fn warps(&self) -> u32 {
+        self.row_warps() * self.key_warps as u32
     }
 
-    /// Static shared memory of the K and V rings, in bytes of a 16-bit type.
+    pub fn lowering(&self, device: &Device) -> Lowering {
+        Lowering::uniform(device, self.unroll, WarpGrid { rows: self.row_warps(), cols: 1 })
+    }
+
+    /// Static shared memory in bytes: the K and V rings of a 16-bit type, one
+    /// per key warp, and the f32 states the key warps merge through.
     pub fn smem_bytes(&self, d: usize) -> usize {
-        2 * self.stages * self.bkv * d * 2
+        let rings = self.key_warps * 2 * self.stages * self.bkv * d * 2;
+        let merge = if self.key_warps > 1 { self.key_warps * WARP_ROWS * (d + 2) * 4 } else { 0 };
+        rings + merge
     }
 
     /// The shared scratch the f32 score tile crosses to become the P·V
@@ -352,9 +368,12 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     });
     let (gz, bb) = batch.axis(&mut k);
     k.grid([Sc::from(t.div_ceil(bq) * splits), Sc::from(heads), gz]);
+    let kw = cfg.key_warps;
+    assert!(kw == 1 || bq == WARP_ROWS, "{kw} key warps share a block of one row warp, not {bq} rows");
     k.warps(cfg.warps());
-    let k_s = k.smem::<T>("k_s", stages * bkv * d);
-    let v_s = k.smem::<T>("v_s", stages * bkv * d);
+    let k_s = k.smem::<T>("k_s", kw * stages * bkv * d);
+    let v_s = k.smem::<T>("v_s", kw * stages * bkv * d);
+    let merge = (kw > 1).then(|| k.smem::<F32>("merge", kw * WARP_ROWS * (d + 2)));
 
     let (order, split, hh) = (k.block(0) / splits, k.block(0) % splits, k.block(1));
     // Where later queries see more keys (a causal mask, chunks with every
@@ -569,61 +588,132 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     };
     let bias_tile = bias_view.is_some().then_some(&biased as Mask);
     let st = Step { q_r, scale_log2e, shape, bias: bias_tile, mask: &mask, cfg };
-    let [m, l, acc] = k.pipeline(
-        blocks,
-        stages,
-        [m0, l0, o0],
-        |k, step, slot| {
-            let kv_off = (s_first.clone() + step) * bkv;
-            let k_g = k.at(k_view, kv_off.clone(), 0);
-            let v_g = k.at(v_view, kv_off, 0);
-            let k_t = k.smem_slot::<T>(k_s, slot.clone(), Shape::new(bkv, d));
-            let v_t = k.smem_slot::<T>(v_s, slot, Shape::new(bkv, d));
-            k.stage(k_t, k_g, CopyMode::Async);
-            k.stage(v_t, v_g, CopyMode::Async);
-        },
-        |k, step_, slot, carried| {
-            let k_t = k.smem_slot::<T>(k_s, slot.clone(), Shape::new(bkv, d));
-            let v_t = k.smem_slot::<T>(v_s, slot, Shape::new(bkv, d));
-            step(k, &st, k_t, v_t, (s_first.clone() + step_) * bkv, carried)
-        },
-    );
-    // The appended rows, a block of keys that every split scores and all
-    // but the last hide: a hidden block leaves `(m, l, o)` as they were, and
-    // a branch would cost more than the step.
-    let [m, l, acc] = match app {
-        Some((k_app, v_app)) => {
-            let app = |k: &mut Kernel, p: ParamRef<T>| {
-                k.view(
-                    p,
-                    batch_offset(&bb, appended * kv_heads * d) + kv_head.clone() * d,
-                    [kv_heads * d, 1],
-                    Shape::new(bkv, d),
-                    [Some(Sc::from(appended)), None],
-                )
+    let app_views = app.map(|(k_app, v_app)| {
+        let app = |k: &mut Kernel, p: ParamRef<T>| {
+            k.view(
+                p,
+                batch_offset(&bb, appended * kv_heads * d) + kv_head.clone() * d,
+                [kv_heads * d, 1],
+                Shape::new(bkv, d),
+                [Some(Sc::from(appended)), None],
+            )
+        };
+        let (k_g, v_g) = (app(&mut k, k_app), app(&mut k, v_app));
+        let visible = match app_lens {
+            Some(p) => k.load_scalar(p, b.clone()).min(appended),
+            None => Sc::from(appended),
+        };
+        (k_g, v_g, visible)
+    });
+    // One warp's share of the split's key blocks (`warp` is `None` for the
+    // whole share), folded into `(m, l, o)`, the maximum in the exponent's
+    // units at the end.
+    let run = |k: &mut Kernel, warp: Option<Sc>| -> [Regs<F32>; 3] {
+        let (w_first, w_blocks, slot0, owner) = match &warp {
+            Some(w) => (
+                s_first.clone() + blocks.clone() * w.clone() / kw,
+                blocks.clone() * (w.clone() + 1) / kw - blocks.clone() * w.clone() / kw,
+                w.clone() * stages,
+                split.clone().eq(splits - 1).and(w.clone().eq(kw - 1)),
+            ),
+            None => (s_first.clone(), blocks.clone(), Sc::from(0), split.clone().eq(splits - 1)),
+        };
+        let [m, l, acc] = k.pipeline(
+            w_blocks,
+            stages,
+            [m0, l0, o0],
+            |k, step, slot| {
+                let kv_off = (w_first.clone() + step) * bkv;
+                let k_g = k.at(k_view, kv_off.clone(), 0);
+                let v_g = k.at(v_view, kv_off, 0);
+                let k_t = k.smem_slot::<T>(k_s, slot0.clone() + slot.clone(), Shape::new(bkv, d));
+                let v_t = k.smem_slot::<T>(v_s, slot0.clone() + slot, Shape::new(bkv, d));
+                k.stage(k_t, k_g, CopyMode::Async);
+                k.stage(v_t, v_g, CopyMode::Async);
+            },
+            |k, step_, slot, carried| {
+                let k_t = k.smem_slot::<T>(k_s, slot0.clone() + slot.clone(), Shape::new(bkv, d));
+                let v_t = k.smem_slot::<T>(v_s, slot0.clone() + slot, Shape::new(bkv, d));
+                step(k, &st, k_t, v_t, (w_first.clone() + step_) * bkv, carried)
+            },
+        );
+        // The appended rows, a block of keys that every split and key warp
+        // scores and all but the last hide: a hidden block leaves `(m, l, o)`
+        // as they were, and a branch would cost more than the step.
+        let [m, l, acc] = match &app_views {
+            Some((k_g, v_g, visible)) => {
+                let app_bias = |k: &mut Kernel, s: Regs<F32>, _: Sc| biased(k, s, Sc::from(tk));
+                let rows = |k: &mut Kernel, s: Regs<F32>, _: Sc| {
+                    let col = k.coord(shape, Axis::Col);
+                    let visible = k.splat::<I32>(shape, visible.clone());
+                    let seen = k.compare(col, visible, BinaryOp::Lt);
+                    let zero = k.zeros::<I32>(shape);
+                    let owner = k.splat::<I32>(shape, owner.clone());
+                    let owned = k.compare(owner, zero, BinaryOp::Ne);
+                    let keep = k.binary(seen, owned, BinaryOp::And);
+                    hide(k, keep, s)
+                };
+                let bias_tile = bias_view.is_some().then_some(&app_bias as Mask);
+                let st = Step { q_r, scale_log2e, shape, bias: bias_tile, mask: &rows, cfg };
+                step(k, &st, *k_g, *v_g, Sc::from(0), [m, l, acc])
+            }
+            None => [m, l, acc],
+        };
+        let m = if st.raw_max() {
+            let row_scale = k.fill::<F32>(Shape::new(bq, 1), Const::Float(scale_log2e));
+            k.binary(m, row_scale, BinaryOp::Mul)
+        } else {
+            m
+        };
+        [m, l, acc]
+    };
+    let [m, l, acc] = match merge {
+        None => run(&mut k, None),
+        // Every warp leaves its state in its region of the merge scratch; the
+        // block then folds the regions as the split merge does.
+        Some(merge) => {
+            let region = WARP_ROWS * (d + 2);
+            let views = |k: &mut Kernel, at: Sc| {
+                let o = k.smem_view::<F32>(merge, at.clone() * region, Shape::new(WARP_ROWS, d));
+                let m = k.smem_view::<F32>(merge, at.clone() * region + WARP_ROWS * d, Shape::new(WARP_ROWS, 1));
+                let l = k.smem_view::<F32>(merge, at * region + WARP_ROWS * (d + 1), Shape::new(WARP_ROWS, 1));
+                (o, m, l)
             };
-            let (k_g, v_g) = (app(&mut k, k_app), app(&mut k, v_app));
-            let visible = match app_lens {
-                Some(p) => k.load_scalar(p, b.clone()).min(appended),
-                None => Sc::from(appended),
-            };
-            let last = split.clone().eq(splits - 1);
-            let app_bias = |k: &mut Kernel, s: Regs<F32>, _: Sc| biased(k, s, Sc::from(tk));
-            let rows = |k: &mut Kernel, s: Regs<F32>, _: Sc| {
-                let col = k.coord(shape, Axis::Col);
-                let visible = k.splat::<I32>(shape, visible.clone());
-                let seen = k.compare(col, visible, BinaryOp::Lt);
-                let zero = k.zeros::<I32>(shape);
-                let owner = k.splat::<I32>(shape, last.clone());
-                let owned = k.compare(owner, zero, BinaryOp::Ne);
-                let keep = k.binary(seen, owned, BinaryOp::And);
-                hide(k, keep, s)
-            };
-            let bias_tile = bias_view.is_some().then_some(&app_bias as Mask);
-            let st = Step { q_r, scale_log2e, shape, bias: bias_tile, mask: &rows, cfg };
-            step(&mut k, &st, k_g, v_g, Sc::from(0), [m, l, acc])
+            k.each_warp(|k| {
+                let w = k.warp();
+                let [m, l, acc] = run(k, Some(w.clone()));
+                let (o_v, m_v, l_v) = views(k, w);
+                k.store(o_v, acc);
+                k.store(m_v, m);
+                k.store(l_v, l);
+            });
+            let parts: Vec<_> = (0..kw)
+                .map(|w| {
+                    let (o_v, m_v, l_v) = views(&mut k, Sc::from(w));
+                    (k.load(o_v), k.load(m_v), k.load(l_v))
+                })
+                .collect();
+            let mut m = parts[0].1;
+            for (_, mw, _) in &parts[1..] {
+                m = k.binary(m, *mw, BinaryOp::Max);
+            }
+            let (mut l, mut acc) = (None, None);
+            for (ow, mw, lw) in &parts {
+                let w = k.binary(*mw, m, BinaryOp::Sub);
+                let w = k.unary(w, UnaryOp::Exp2);
+                let lw = k.binary(*lw, w, BinaryOp::Mul);
+                let ow = k.binary(*ow, w, BinaryOp::Mul);
+                l = Some(match l {
+                    Some(l) => k.binary(l, lw, BinaryOp::Add),
+                    None => lw,
+                });
+                acc = Some(match acc {
+                    Some(acc) => k.binary(acc, ow, BinaryOp::Add),
+                    None => ow,
+                });
+            }
+            [m, l.expect("a key warp"), acc.expect("a key warp")]
         }
-        None => [m, l, acc],
     };
     match (o, parts) {
         (Some(o), _) => {
@@ -643,13 +733,6 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             );
             let o_view = k.at(o_view, q_off.clone(), 0);
             k.store(o_view, acc);
-            // The partial maximum is merged in the exponent's units.
-            let m = if st.raw_max() {
-                let row_scale = k.fill::<F32>(Shape::new(bq, 1), Const::Float(scale_log2e));
-                k.binary(m, row_scale, BinaryOp::Mul)
-            } else {
-                m
-            };
             for (p, val) in [(m_part, m), (l_part, l)] {
                 let view = k.view(
                     p,

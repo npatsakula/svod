@@ -329,13 +329,22 @@ pub struct Raw {
     pub writes: Vec<ValId>,
 }
 
+/// Whose threads a barrier gathers and a copy's chunks are spread over: the
+/// block's, or (inside [`Stmt::Warps`]) one warp's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Scope {
+    Block,
+    Warp,
+}
+
 /// Synchronization the schedule templates and the sync pass emit; authors
 /// never write these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Sync {
-    /// Every thread of the block (or of `role`'s warps) arrives before any
-    /// continues; shared-memory writes before it are visible after it.
-    Barrier { role: Option<RoleId> },
+    /// Every thread of the `scope` arrives before any continues;
+    /// shared-memory writes before it are visible after it. A warp's own
+    /// barrier orders its lanes' shared accesses and nothing else.
+    Barrier { scope: Scope },
     /// Close the group of this thread's async copies issued since the last
     /// commit.
     CommitAsync,
@@ -364,6 +373,13 @@ pub enum Stmt {
     /// Run only by the warps of `role`.
     Role {
         role: RoleId,
+        body: Block,
+    },
+    /// Every warp of the block runs `body` on its own: `Special::Warp` is
+    /// its index, its copies move whole tiles with its lanes alone, and its
+    /// barriers gather only itself. What the warps leave in shared memory is
+    /// fenced for the block at the statement's end.
+    Warps {
         body: Block,
     },
     If {
@@ -481,6 +497,13 @@ impl Program {
 }
 
 impl Block {
+    /// Every statement of the block, recursively, with its depth from `depth`.
+    pub fn walk_from(&self, depth: usize) -> impl Iterator<Item = (usize, &Stmt)> {
+        let mut out = vec![];
+        self.walk(depth, &mut out);
+        out.into_iter()
+    }
+
     fn walk<'a>(&'a self, depth: usize, out: &mut Vec<(usize, &'a Stmt)>) {
         for stmt in &self.0 {
             out.push((depth, stmt));
@@ -490,7 +513,7 @@ impl Block {
                     p.produce.body.walk(depth + 1, out);
                     p.consume.body.walk(depth + 1, out);
                 }
-                Stmt::Role { body, .. } => body.walk(depth + 1, out),
+                Stmt::Role { body, .. } | Stmt::Warps { body } => body.walk(depth + 1, out),
                 Stmt::If { then, otherwise, .. } => {
                     then.walk(depth + 1, out);
                     otherwise.walk(depth + 1, out);

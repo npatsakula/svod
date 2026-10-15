@@ -223,6 +223,9 @@ impl Tiled for ConvCfg {
 }
 
 /// The blocks, the splits and the softmax forms: a forms pair is two tiles.
+/// A tile is its query and key block sizes and its key warps: a different
+/// number of key warps is a different kernel structure, not a pipeline of
+/// the same one.
 impl Tiled for FaCfg {
     fn tile(&self) -> Self {
         FaCfg { stages: 0, unroll: false, ..*self }
@@ -423,10 +426,12 @@ impl FaCfg {
     pub fn fits(&self, target: &Target, d: usize) -> bool {
         let Some(atom) = target.mma.first() else { return false };
         let (bq, bkv) = (self.bq, self.bkv);
-        let threads = self.warps() as usize * target.wave as usize;
+        // Key warps fill their own tiles alone.
+        let threads = self.row_warps() as usize * target.wave as usize;
         atom.m as usize == WARP_ROWS
             && bq.is_multiple_of(WARP_ROWS)
             && bq > 0
+            && (self.key_warps == 1 || bq == WARP_ROWS)
             && [bkv, d].iter().all(|&x| x.is_multiple_of(atom.n as usize) && x.is_multiple_of(atom.k as usize))
             && (bkv * d / 8).is_multiple_of(threads)
             && target.stages(self.stages) == self.stages
@@ -444,14 +449,14 @@ impl FaCfg {
     /// what the tuner reads.
     pub fn registers(&self, target: &Target, d: usize) -> Option<u32> {
         let atom = target.mma.first()?;
-        let grid = WarpGrid { rows: self.warps(), cols: 1 };
+        let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
         let qk = atom.issue(Orient::Direct, grid, self.bq, self.bkv, d).ok()?;
         let pv = atom.issue(Orient::Direct, grid, self.bq, d, self.bkv).ok()?;
         let half = |regs: u32| regs.div_ceil(2);
         let fill = if target.cp_async {
             0
         } else {
-            let tile = chunked(Shape::new(self.bkv, d), 2, self.warps(), target.wave, Axis::Col)?;
+            let tile = chunked(Shape::new(self.bkv, d), 2, self.row_warps(), target.wave, Axis::Col)?;
             2 * half(tile.regs())
         };
         let (q, o) = (half(qk.a.regs()), pv.c.regs());
@@ -486,9 +491,11 @@ impl Attention {
     /// both products' fragment reads, fills and steps, the softmax of every
     /// score and its overhead. A causal query block scores half the keys plus
     /// its diagonal, a key block per `bkv` of its rows, each [`DIAGONAL`] trips.
+    /// Key warps each take a share of the trips, every trip of theirs the
+    /// block's whole work at once.
     pub(crate) fn admit(&self, planner: &Planner, cfg: &FaCfg) -> Option<(f64, u32)> {
         let Device { target, costs } = &planner.device;
-        let (bq, bkv, d) = (cfg.bq, cfg.bkv, self.d);
+        let (bq, bkv, d, kw) = (cfg.bq, cfg.bkv, self.d, cfg.key_warps);
         let smem = cfg.smem_bytes(d) + cfg.scratch_bytes(target);
         if !(cfg.fits(target, d) && smem <= target.smem_bytes) {
             return None;
@@ -496,15 +503,16 @@ impl Attention {
         let regs = cfg.registers(target, d)?;
         let waves = cfg.warps() as usize;
         let fragments = 2 * waves * bkv * d * 2;
-        let fill = 2 * bkv * d * 2;
-        let steps = 2 * bq * bkv * d / 4096;
+        let fill = kw * 2 * bkv * d * 2;
+        let steps = kw * 2 * bq * bkv * d / 4096;
         let work = fragments as f64 * costs.smem_byte
             + fill as f64 * costs.global_byte
             + steps as f64 * costs.step
-            + (bq * bkv) as f64 * costs.score
+            + (kw * bq * bkv) as f64 * costs.score
             + costs.trip(!cfg.unroll && !target.cp_async);
         let diagonal = DIAGONAL * bq.div_ceil(bkv);
         let trips = if self.causal { self.tk.div_ceil(2 * bkv) + diagonal } else { self.tk.div_ceil(bkv) };
+        let trips = trips.div_ceil(kw);
         let (blocks, stages) = (self.blocks(cfg), cfg.stages);
         Some((planner.pipelined(Run { blocks, smem, regs, waves, trips, work, stages }), regs))
     }
@@ -517,12 +525,16 @@ impl Attention {
         let stages: &[usize] = if planner.device.target.cp_async { &[3, 2] } else { &[2] };
         let mut ranked: Vec<(f64, u32, FaCfg)> = vec![];
         for bq in [16, 32, 64, 128] {
+            // A row warp of queries may share its block with key warps.
+            let key_warps: &[usize] = if bq == WARP_ROWS && self.t <= WARP_ROWS { &[1, 2, 4] } else { &[1] };
             for bkv in [16, 32, 64, 128] {
                 for &stages in stages {
                     for unroll in [false, true] {
-                        let cfg = FaCfg { unroll, ..FaCfg::new(bq, bkv, stages) };
-                        if let Some((cost, regs)) = self.admit(planner, &cfg) {
-                            ranked.push((cost, regs, cfg));
+                        for &key_warps in key_warps {
+                            let cfg = FaCfg { unroll, key_warps, ..FaCfg::new(bq, bkv, stages) };
+                            if let Some((cost, regs)) = self.admit(planner, &cfg) {
+                                ranked.push((cost, regs, cfg));
+                            }
                         }
                     }
                 }
