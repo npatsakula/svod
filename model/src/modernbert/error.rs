@@ -27,5 +27,5 @@ pub enum Error {
     #[snafu(display("loading tokenizer failed: {source}"))]
     Tokenizer { source: svod_arch::pipelines::text::HfTokenizerError },
     #[snafu(display("building encoder head failed: {source}"))]
-    Head { source: super::head_jit::HeadError },
+    Head { source: crate::encoder_head::HeadError },
 }

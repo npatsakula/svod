@@ -18,6 +18,7 @@ use serde::Deserialize;
 use svod_dtype::DType;
 
 use super::error::{Error, Result};
+use crate::encoder_head::dense_id2label;
 
 /// Pooling strategy for the classification head. HF ModernBERT defaults to
 /// `"cls"` (take the first token); `"mean"` does a masked mean over the sequence.
@@ -193,29 +194,6 @@ impl ModernBertConfig {
         let max_batch_size = self.max_batch_size;
         *self = ModernBertConfig { dtype, max_batch_size, ..parsed.clone() };
     }
-}
-
-/// Build a dense `Vec<String>` from a sparse HF `id2label` map (`config.json`):
-/// size to `max(id)+1`, fill gaps (and empty values) with `"LABEL_{id}"`. An
-/// absent or empty map yields `vec![]`.
-fn dense_id2label(raw: &Option<HashMap<String, String>>) -> Vec<String> {
-    let Some(map) = raw else { return Vec::new() };
-    let max_id = map.keys().filter_map(|k| k.parse::<usize>().ok()).max();
-    let Some(max_id) = max_id else { return Vec::new() };
-    let mut out = vec![String::new(); max_id + 1];
-    for (k, v) in map {
-        if let Ok(id) = k.parse::<usize>()
-            && id < out.len()
-        {
-            out[id] = v.clone();
-        }
-    }
-    for (i, slot) in out.iter_mut().enumerate() {
-        if slot.is_empty() {
-            *slot = format!("LABEL_{i}");
-        }
-    }
-    out
 }
 
 /// Serde mirror of the published `config.json`. Every field is optional so a

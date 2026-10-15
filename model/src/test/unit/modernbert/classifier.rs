@@ -13,8 +13,9 @@ use crate::modernbert::{
     ClassifierHead, ModernBertClassificationModel, ModernBertClassifier, ModernBertConfig,
     ModernBertTokenClassificationModel, ModernBertTokenClassifier,
 };
+use crate::test::unit::encoder_head::encoding;
+use crate::test::unit::max_abs_delta;
 use crate::test::unit::modernbert::model::tiny_cfg;
-use crate::test::unit::modernbert::{encoding, max_abs_delta};
 
 const MAX_BATCH: usize = 4;
 /// Two attention tiles, so a batch can run at either plan length.

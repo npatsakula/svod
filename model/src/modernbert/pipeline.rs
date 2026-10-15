@@ -7,7 +7,6 @@
 
 use snafu::ResultExt;
 use svod_arch::pipelines::text::HfTokenizer;
-use svod_dtype::DType;
 
 use super::classifier::{ModernBertClassificationModel, ModernBertClassifier};
 use super::config::ModernBertConfig;
@@ -15,43 +14,20 @@ use super::embedder::ModernBertEmbedder;
 use super::error::{HeadSnafu, Result, TokenizerSnafu};
 use super::model::ModernBert;
 use super::token_classifier::{ModernBertTokenClassificationModel, ModernBertTokenClassifier};
+use crate::encoder_head::HubOptions;
 use crate::state::StateDict;
 
-/// How a hub loader builds its head.
-#[derive(Clone, Debug)]
-pub struct HubOptions {
-    /// Hub revision: a branch, tag or commit.
-    pub revision: String,
-    /// Most chunks one execute runs.
-    pub max_batch: usize,
-    /// Longest chunk the head accepts, in tokens (specials included) — size the
-    /// pipeline's chunker to it. `None` takes the checkpoint's
-    /// `max_position_embeddings`. A batch runs at its own longest chunk, so
-    /// this bounds a chunk; it does not size every run.
-    pub max_seq: Option<usize>,
-    /// Compute dtype.
-    pub dtype: DType,
-}
-
-impl Default for HubOptions {
-    /// `main`, one chunk per execute, the checkpoint's full length, and the
-    /// default device's compute dtype.
-    fn default() -> Self {
-        Self { revision: "main".into(), max_batch: 1, max_seq: None, dtype: crate::default_compute_dtype() }
-    }
-}
-
-/// Fetch `config.json` + `model.safetensors` + `tokenizer.json` from
-/// `opts.revision`. The config takes the caller's `dtype` and every structural
-/// field (including `id2label`) from the downloaded `config.json` via
-/// [`ModernBertConfig::apply_checkpoint`]. Returns the resolved config, the
+/// Fetch `config.json` + `model.safetensors` from `opts.revision`, and
+/// `tokenizer.json` (see [`HubOptions::tokenizer_repo`]). The config takes the
+/// caller's `dtype` and every structural field (including `id2label`) from the
+/// downloaded `config.json` via [`ModernBertConfig::apply_checkpoint`]. Returns the resolved config, the
 /// loaded state dict, the tokenizer, and the head's `max_seq`.
 fn fetch_hub(model_id: &str, opts: &HubOptions) -> Result<(ModernBertConfig, StateDict, HfTokenizer, usize)> {
     let mut config = ModernBertConfig { dtype: opts.dtype.clone(), ..Default::default() };
     let repo = crate::hub::HubRepo::open(model_id, &opts.revision)?;
     config.apply_checkpoint(&ModernBertConfig::from_json(&repo.get("config.json")?)?);
     let sd = crate::state::load_safetensors(&repo.get("model.safetensors")?)?;
-    let tokenizer = HfTokenizer::from_path(&repo.get("tokenizer.json")?).context(TokenizerSnafu)?;
+    let tokenizer = HfTokenizer::from_path(&opts.tokenizer_json(&repo)?).context(TokenizerSnafu)?;
     let max_seq = opts.max_seq.unwrap_or(config.max_position_embeddings);
     Ok((config, sd, tokenizer, max_seq))
 }

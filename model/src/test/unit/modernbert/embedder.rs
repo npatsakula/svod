@@ -1,16 +1,15 @@
-//! Host-only tests of the batching every ModernBERT head shares
-//! ([`HeadPlans`](crate::modernbert::head_jit::HeadPlans)), through
+//! Host-only tests of the batching every encoder head shares
+//! ([`HeadPlans`](crate::encoder_head::HeadPlans)), through
 //! [`ModernBertEmbedder`] over a tiny random-weight backbone: capacity
-//! validation, the guards a batch meets before any plan compiles, plan shapes
-//! and input packing. None compiles a plan — the numerics are the parity
-//! tests', the batched execution the classifier's.
+//! validation and the guards a batch meets before any plan compiles. None
+//! compiles a plan — the numerics are the parity tests', the batched execution
+//! the classifier's.
 
 use svod_arch::pipelines::text::{EncoderHead, Encoding};
 
-use crate::modernbert::head_jit::plan_shape;
-use crate::modernbert::packing::{pack_ids, pack_mask};
-use crate::modernbert::{HeadError, ModernBert, ModernBertEmbedder};
-use crate::test::unit::modernbert::encoding;
+use crate::encoder_head::HeadError;
+use crate::modernbert::{ModernBert, ModernBertEmbedder};
+use crate::test::unit::encoder_head::encoding;
 use crate::test::unit::modernbert::model::tiny_cfg;
 
 const MAX_BATCH: usize = 4;
@@ -57,41 +56,7 @@ fn empty_batch_is_noop() {
     assert!(prof.is_some(), "profiled empty batch yields a (default) profile");
 }
 
-// ── input packing ───────────────────────────────────────────────────────────
-
-/// Packing honors the per-row `len` stride, zero-fills pad positions and
-/// unused rows, and truncates over-length inputs. The mask mirrors the ids'
-/// real-token counts; only an unused row attends its first position, so a live
-/// empty chunk stays fully masked and pools to the zero vector.
-#[test]
-fn pack_inputs_pad_stride_and_truncate_correctly() {
-    let (rows, len) = (4, 4);
-    // Stale contents from a previous batch must not survive the pack.
-    let mut ids_v = vec![-1i64; rows * len];
-    let mut mask_v = vec![-1i64; rows * len];
-
-    // e1: 2 real tokens + 1 trailing pad (mask 0). Then a chunk with no token.
-    // e2: 5 real tokens — one over len, so the last must be truncated. Row 3
-    // left unused.
-    let (e1, empty, e2) = (encoding(&[1, 2], 1), encoding(&[], 0), encoding(&[10, 20, 30, 40, 50], 0));
-    let batch = [&e1, &empty, &e2];
-    pack_ids(&mut ids_v, &batch, len);
-    pack_mask(&mut mask_v, &batch, len);
-
-    assert_eq!(ids_v, vec![1, 2, 0, 0, 0, 0, 0, 0, 10, 20, 30, 40, 0, 0, 0, 0]);
-    assert_eq!(mask_v, vec![1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0]);
-}
-
-// ── plan shapes and capacity ─────────────────────────────────────────────────
-
-/// A batch runs at the smallest prepared shape that holds it: rows round up to
-/// a power of two capped at `max_batch`, the length to the flash-attention tile.
-#[test_case::test_case(3, 128, 8 => (4, 128); "rows round up, a full tile stays")]
-#[test_case::test_case(5, 129, 6 => (6, 256); "rows cap at max_batch, length spills a tile")]
-#[test_case::test_case(2, 0, 8 => (2, 128); "empty chunks still take a tile")]
-fn plan_shape_rounds_rows_and_length(b: usize, longest: usize, max_batch: usize) -> (usize, usize) {
-    plan_shape(b, longest, max_batch)
-}
+// ── capacity ─────────────────────────────────────────────────────────────────
 
 /// `max_seq` past the checkpoint's positions, or a zero capacity, is refused at
 /// construction rather than at the first oversized batch.

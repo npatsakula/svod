@@ -13,6 +13,8 @@
 
 use svod_macros::jit_wrapper;
 
+use crate::encoder_head::head_jit;
+
 use super::embedder::pool_embed;
 use super::model::ModernBert;
 
@@ -28,3 +30,5 @@ jit_wrapper! {
         }
     }
 }
+
+head_jit!(ModernBertEmbedderJit, ModernBert, embeddings_to_vec);

@@ -20,7 +20,7 @@
 //! without GPU bf16 transcendentals. bf16 numerical parity is implied by the
 //! framework's f32-accumulator guarantees in layernorm/matmul/attention.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use svod_arch::pipelines::text::{Classify, ClassifyTokens, EncoderHead, Encoding};
 
@@ -32,46 +32,23 @@ use crate::modernbert::{
     ModernBertForMaskedLm, ModernBertTokenClassificationModel, ModernBertTokenClassifier,
 };
 use crate::state::StateDict;
-use crate::test::unit::modernbert::{max_abs_delta, nan_max};
+use crate::test::unit::encoder_head::{assert_tracks_pytorch_bf16, golden_encodings};
+use crate::test::unit::{load_golden_vec, max_abs_delta, nan_max};
 
 /// `answerdotai/ModernBERT-base`, at the revision the goldens were generated
 /// from (each repo's pin is also its generate script's `--revision` default).
 const BASE_REPO: (&str, &str) = ("answerdotai/ModernBERT-base", "8949b909ec900327062f0ebf497f51aef5e6f0c8");
 
-/// Resolve a real-checkpoint test file from `(repo, revision)`:
-/// `SVOD_MODERNBERT` dir override → local `data/modernbert/` → HF Hub download.
-/// Model weights / configs live on HF Hub, but the `golden*.safetensors`
-/// fixtures are generated locally (not committed, not published) — a missing
-/// golden says so instead of a generic "download" message that's wrong for
-/// goldens.
-fn local_or_hub((repo, revision): (&str, &str), name: &str) -> PathBuf {
-    let dir = std::env::var_os("SVOD_MODERNBERT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/modernbert"));
-    let local = dir.join(name);
-    if local.exists() {
-        return local;
-    }
-    assert!(
-        !name.starts_with("golden"),
-        "{name} not found in data/modernbert/ and not on HF Hub — goldens are generated \
-         locally; run `model/scripts/generate_modernbert*.py` (or point SVOD_MODERNBERT at \
-         the output dir)"
-    );
-    let repo = crate::hub::HubRepo::open(repo, revision).expect("HF Hub API");
-    repo.get(name).unwrap_or_else(|_| panic!("download {name} from HF Hub"))
+/// [`encoder_head::local_or_hub`](crate::test::unit::encoder_head::local_or_hub)
+/// over `SVOD_MODERNBERT` / `data/modernbert/`.
+fn local_or_hub(repo: (&str, &str), name: &str) -> PathBuf {
+    crate::test::unit::encoder_head::local_or_hub("SVOD_MODERNBERT", "modernbert", repo, name)
 }
 
 /// [`local_or_hub`] for `answerdotai/ModernBERT-base` (`golden.safetensors` is
 /// the output of `model/scripts/generate_modernbert_golden.py`).
 fn real_file(name: &str) -> PathBuf {
     local_or_hub(BASE_REPO, name)
-}
-
-fn load_golden_vec<T: svod_dtype::ext::HasDType + Default + Clone>(sd: &StateDict, key: &str) -> Vec<T> {
-    let t = sd.get(key).unwrap_or_else(|| panic!("golden key {key}")).clone();
-    t.realize().expect("realize golden");
-    t.as_vec::<T>().expect("golden readout")
 }
 
 /// Load the model + golden fixture once, returning (model, ids, mask, want).
@@ -359,24 +336,6 @@ fn load_embed_fixture(dtype: DType) -> (ModernBertEmbedder, Encoding, StateDict)
     (embedder, enc, golden)
 }
 
-/// The golden's `input_ids` / `attention_mask` — `(B, L)`, or `(L,)` for one
-/// row — as one encoding per row.
-fn golden_encodings(golden: &StateDict) -> Vec<Encoding> {
-    let (ids, mask): (Vec<i64>, Vec<i64>) =
-        (load_golden_vec(golden, "input_ids"), load_golden_vec(golden, "attention_mask"));
-    let seq_len = golden["input_ids"].dim_const(-1).expect("concrete seq_len");
-    ids.chunks_exact(seq_len)
-        .zip(mask.chunks_exact(seq_len))
-        .map(|(ids, mask)| Encoding {
-            input_ids: ids.iter().map(|&x| x as u32).collect(),
-            attention_mask: mask.iter().map(|&x| x as u32).collect(),
-            token_type_ids: vec![0; seq_len],
-            offsets: vec![(0, 0); seq_len],
-            special_tokens_mask: vec![0; seq_len],
-        })
-        .collect()
-}
-
 /// Embedding-pipeline parity: Svod's fused backbone+masked-mean-pool+L2-norm JIT
 /// (`ModernBertEmbedder`) vs the PyTorch reference (`expected_embedding` from the
 /// golden, produced by `transformers` + the same pooling recipe). Validates the
@@ -547,11 +506,6 @@ fn token_logits_match_pytorch() {
 
 // ─── bf16 heads ─────────────────────────────────────────────────────────────
 
-/// How far past PyTorch's worst bf16 path a bf16 head's drift may land. Its four
-/// paths differ by rounding alone, yet their classifier logits sit 4.6x apart,
-/// so four draws are still a thin yardstick for a fifth.
-const BF16_HEAD_SLACK: f32 = 2.0;
-
 #[derive(Clone, Copy, Debug)]
 enum Head {
     Embed,
@@ -561,12 +515,8 @@ enum Head {
 
 /// The heads in bf16 — where they run on tk's flash attention, GEMMs and layer
 /// norm, which the f32 parity tests above never reach — against the f32
-/// goldens, bounded by PyTorch's own bf16 drift on the same inputs
-/// (`<output>_bf16.{cpu,cuda}_{sdpa,eager}`, written by the golden scripts)
-/// times [`BF16_HEAD_SLACK`]. The CUDA paths are required: a GPU's matrix-core
-/// GEMMs and fused attention round apart from any CPU path, so the CPU pair
-/// alone measures another rounding than the one under test. The token head is
-/// compared at real tokens only.
+/// goldens, bounded by PyTorch's own bf16 drift ([`assert_tracks_pytorch_bf16`]).
+/// The token head is compared at real tokens only.
 #[test_case::test_case(Head::Embed; "embed")]
 #[test_case::test_case(Head::Classify; "classify")]
 #[test_case::test_case(Head::ClassifyTokens; "classify tokens")]
@@ -597,25 +547,6 @@ fn bf16_heads_track_pytorch_bf16(head: Head) {
             (got.collect(), golden, "expected_logits", Some((mask, classifier.num_labels())))
         }
     };
-    // The token head's pad positions are a don't-care: keep the real rows.
-    let real_rows = |grid: Vec<f32>| match &real {
-        Some((mask, width)) => {
-            grid.chunks_exact(*width).zip(mask).filter(|&(_, &m)| m == 1).flat_map(|(row, _)| row.to_vec()).collect()
-        }
-        None => grid,
-    };
-    let want = real_rows(load_golden_vec(&golden, key));
-    let drift = max_abs_delta(&real_rows(got), &want);
-    let pytorch = golden
-        .keys()
-        .filter(|k| k.starts_with(&format!("{key}_bf16.")))
-        .map(|k| (k.clone(), max_abs_delta(&real_rows(load_golden_vec(&golden, k)), &want)))
-        .collect::<Vec<_>>();
-    assert!(
-        pytorch.iter().any(|(k, _)| k.contains(".cuda_")),
-        "the golden lacks PyTorch's CUDA bf16 paths: rerun its generate script on a CUDA machine"
-    );
-    let worst = pytorch.iter().map(|(_, d)| *d).fold(0.0, nan_max);
-    eprintln!("{head:?}: svod bf16 max |Δ| {drift:.3e}; pytorch {pytorch:?}");
-    assert!(drift <= BF16_HEAD_SLACK * worst, "{head:?} bf16 drifts past PyTorch's: {drift:.3e} against {worst:.3e}");
+    let real = real.as_ref().map(|(mask, width)| (mask.as_slice(), *width));
+    assert_tracks_pytorch_bf16(&format!("{head:?}"), got, &golden, key, real);
 }

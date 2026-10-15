@@ -12,17 +12,17 @@
 //! [`from_hub`](crate::modernbert::from_hub).
 //!
 //! Each batch runs on a static plan sized to it (see
-//! [`HeadPlans`](crate::modernbert::head_jit::HeadPlans)), and the live rows are
+//! [`HeadPlans`](crate::encoder_head::HeadPlans)), and the live rows are
 //! sliced out of the plan's `[rows, D]` output.
 
 use svod_arch::pipelines::text::{Embed, Embedding, EncoderHead, Encoding, RunProfile};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
+use crate::encoder_head::{HeadError, HeadPlans};
 use crate::modernbert::ModernBert;
 use crate::modernbert::embedder_jit::ModernBertEmbedderJit;
 use crate::modernbert::error::Result as ModelResult;
-use crate::modernbert::head_jit::{HeadError, HeadPlans};
 
 /// Masked mean-pool + L2-normalize → finished `(B, D)` f32 embeddings (the
 /// sentence-transformers recipe for ModernBERT). `hidden`: `(B, L, D)`;
@@ -49,8 +49,10 @@ impl ModernBertEmbedder {
     /// `max_position_embeddings`. The model's config must already reflect the
     /// checkpoint (e.g. via [`ModernBert::from_hub`]).
     pub fn new(model: ModernBert, max_batch: usize, max_seq: usize) -> Result<Self, HeadError> {
-        let (hidden_size, max_positions) = (model.config.hidden_size, model.config.max_position_embeddings);
-        Ok(Self { plans: HeadPlans::new(model, max_batch, max_seq, max_positions, "embed")?, hidden_size })
+        let config = &model.config;
+        let (hidden_size, max_positions, pad_id) =
+            (config.hidden_size, config.max_position_embeddings, config.pad_token_id);
+        Ok(Self { plans: HeadPlans::new(model, max_batch, max_seq, max_positions, pad_id, "embed")?, hidden_size })
     }
 }
 

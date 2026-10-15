@@ -14,6 +14,7 @@ plans.
 | `state` | Safetensors loading (single-file and sharded), dtype casting, and the origin scopes that name a module's weights. The `StateDict` / `Module` contract itself lives in `svod_tensor::nn`. |
 | `blocks` | Shared `conv2d`, `batchnorm2d`, `BasicBlock`, `Bottleneck`, `ResidualStage` reused by every ResNet-shaped backbone. timm/torchvision key convention. |
 | `wavlm` | WavLM speech-representation backbone (Conv1d feature extractor + gated rel-pos Transformer, per-layer pruning) consumed by `diarizen`. |
+| `encoder_head` | The text encoder heads' static per-shape plans (`HeadPlans`), input packing, `HeadError` and the `HubOptions` their hub loaders take. |
 | `xlm_roberta` | XLM-RoBERTa text encoder backbone (absolute position embeddings, post-norm Transformer) consumed by `bgem3`. |
 | `qwen3` | Qwen3 decoder-only LLM backbone (causal attention, GQA, per-head Q/K RMSNorm, RoPE, SwiGLU) consumed by embedding models. |
 | `sentencepiece` | Minimal SentencePiece `.model` protobuf loader (vocab piece extraction). |

@@ -16,11 +16,9 @@ mod encoder;
 mod encoder_layer;
 mod error;
 mod head;
-pub(crate) mod head_jit;
 mod jit;
 mod mlp;
 mod model;
-pub(crate) mod packing;
 mod pipeline;
 mod token_classifier;
 mod token_classifier_jit;
@@ -39,12 +37,11 @@ pub use encoder::Encoder;
 pub use encoder_layer::EncoderLayer;
 pub use error::{Error, Result};
 pub use head::{MlmHead, ModernBertForMaskedLm};
-pub use head_jit::HeadError;
 pub use jit::{ModernBertJit, ModernBertMlmJit};
 pub use mlp::ModernBertGlu;
 pub use model::ModernBert;
 pub use pipeline::{
-    HubOptions, ModernBertClassifierLoad, ModernBertTokenClassifierLoad, from_hub, from_hub_classifier,
+    ModernBertClassifierLoad, ModernBertTokenClassifierLoad, from_hub, from_hub_classifier,
     from_hub_token_classification,
 };
 #[cfg(test)]
