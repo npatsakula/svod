@@ -302,7 +302,7 @@ fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: u
     let params = norm_inputs(norm, rows, d, residual, bias, 5);
     let (want, want_sum) = norm_reference(norm, rows, d, eps, residual, bias, &params);
     let interp = run(&prog, params.clone(), &[]).unwrap();
-    let got = on_device(prog, &row_lowering(target), &params);
+    let got = on_device(prog, &row_lowering(target, br), &params);
     let (o, s) = norm_outputs(norm, residual, bias);
     let d_interp = assert_close("out vs interpreter", &got[o], &interp[o], 1e-2);
     let d_ref = assert_close("out vs reference", &got[o], &want, 1e-2);
@@ -312,8 +312,21 @@ fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: u
     eprintln!("{norm:?} d={d} residual={residual}: max abs diff {d_interp:.3e} (interpreter), {d_ref:.3e} (f64)");
 }
 
-fn row_lowering(target: Target) -> Lowering {
-    NormCfg { br: 4 }.lowering(&declared(target))
+/// A block's warps split its rows, one each: what a lane runs (its
+/// reductions' shuffles here) is the same whatever the rows per block.
+#[test]
+fn a_lane_norms_one_row_whatever_the_block() {
+    let shuffles = |br: usize| {
+        let prog = norm_rows(Norm::Rms, 8192, 1024, br, 1e-5, false, false);
+        super::targets::render(prog, &row_lowering(sm86(), br)).matches("shfl").count()
+    };
+    let four = shuffles(4);
+    assert!(four > 0);
+    assert_eq!([shuffles(8), shuffles(16)], [four, four]);
+}
+
+fn row_lowering(target: Target, br: usize) -> Lowering {
+    NormCfg { br }.lowering(&declared(target))
 }
 
 /// Fastest GPU time of `plan`'s kernels after a warm-up long enough for the
@@ -361,7 +374,7 @@ fn norm_bandwidth_probe() {
         for br in [4, 8, 16] {
             let prog = norm_rows(norm, rows, d, br, eps, residual, bias);
             let (o, _) = norm_outputs(norm, residual, bias);
-            let plan = graph_launch_all(prog, &row_lowering(target.clone()), &refs).unwrap()[o].prepare().unwrap();
+            let plan = graph_launch_all(prog, &row_lowering(target.clone(), br), &refs).unwrap()[o].prepare().unwrap();
             let secs = gpu_seconds(&plan);
             eprintln!("{norm:?} residual={residual} br={br}: {:.1} us, {:.0} GB/s", secs * 1e6, gbs(bytes, secs));
         }

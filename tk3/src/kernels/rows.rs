@@ -23,9 +23,10 @@ pub struct NormCfg {
 }
 
 impl NormCfg {
-    /// No matrix core: the warp grid only has to cover the warps.
+    /// No matrix core: the warp grid only has to cover the warps, one per
+    /// row, which tile layouts span.
     pub fn lowering(&self, device: &Device) -> Lowering {
-        Lowering::uniform(device, false, WarpGrid { rows: 1, cols: 1 })
+        Lowering::uniform(device, false, WarpGrid { rows: self.br as u32, cols: 1 })
     }
 }
 
