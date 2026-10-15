@@ -777,10 +777,9 @@ fn through_views(
 /// of `where(idx == arange, x, 0)`, `where(idx != arange, 0, x)` or
 /// `x * (idx == arange)`, where `idx` is constant along the reduced axes and
 /// `arange` varies along all of them without reading a buffer, through casts
-/// that keep every value of `idx`. Split, the first stage has to solve
-/// `idx == k * chunk + r` instead, which a 64-bit `idx` cannot do without
-/// risking a wrap, so it reads the whole table for every index; a narrower
-/// `idx` folds, but still pays for a second kernel and its intermediate.
+/// that keep every value of `idx`. Split, the first stage still folds, gated on
+/// `idx` landing in its chunk, but the lookup pays for a second kernel and an
+/// intermediate of one value per chunk.
 fn is_one_hot_select(reduce: &Arc<UOp>, input_shape: &[SInt]) -> bool {
     use svod_ir::{BinaryOp, ReduceOp, TernaryOp};
 
