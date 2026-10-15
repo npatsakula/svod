@@ -42,8 +42,10 @@ pub fn supported(device: &DeviceSpec) -> bool;
 ## Ядро или граф {#kernel-or-graph}
 
 Решение — чистая функция в `ops::shape`, `fn(target, dtypes, extents, …) -> Plan<Cfg>`, поэтому
-оно тестируется на хосте без GPU. `Plan::Kernel(candidates)` перечисляет конфигурации, первой —
-выбор без тюнинга. `Plan::Graph(Fallback)` говорит, почему работает граф.
+оно тестируется на хосте без GPU. `Plan::Kernel(configs)` ранжирует конфигурации, первой —
+выбор без тюнинга; [тюнер](./tuning) замеряет первые, которые компилируются без вытеснения
+регистров (или, если вытесняют все, первые, которые компилируются: вытеснение никогда не
+отправляет операцию в граф). `Plan::Graph(Fallback)` говорит, почему работает граф.
 
 | `Fallback` | Когда |
 |---|---|
@@ -61,7 +63,8 @@ pub fn supported(device: &DeviceSpec) -> bool;
 #[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
 #[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
 fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallback>) {
-    assert_eq!(first(shape::linear(Some(&sm86()), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
+    let planner = Planner::new(Device { target: sm86(), costs: costs() });
+    assert_eq!(first(shape::linear(Some(&planner), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
 }
 ```
 

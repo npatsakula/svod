@@ -8,7 +8,7 @@ sidebar_label: कर्नेल लाइब्रेरी
 element type (`BF16` या `F16`) पर generic है। हर spec में एक `batch: Batch` होता है:
 `Batch::Static(n)` `n` batches launch करता है, और `Batch::Var { name, min, max }` नाम से bind हुए
 runtime variable की live गिनती launch करता है, buffers `max` के आकार के होते हैं। हर config type में
-एक `lowering(target)` है। मॉडल इन कर्नेलों तक [op layer](./op-layer) के ज़रिए पहुँचते हैं, जो config
+एक `lowering(&device)` है (एक `atoms::Device`: target और उसकी costs)। मॉडल इन कर्नेलों तक [op layer](./op-layer) के ज़रिए पहुँचते हैं, जो config
 चुनती है।
 
 | कर्नेल | Spec → program | कर्नेल का नाम | Op |
@@ -35,22 +35,31 @@ runtime variable की live गिनती launch करता है, buffers
 `GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll }`। `m` से आगे की rows और
 `n` से आगे के columns bounded views हैं, इसलिए `m` और `n` मुक्त हैं। `k` का `bk` का गुणज होना ज़रूरी है।
 
-Op layer candidates चार tile families से लेती है, हर एक अपनी sm_86 पर मापी गई सबसे अच्छी pipeline
-के साथ:
+Op layer कोई tile table नहीं रखती। `config::Planner::gemm_ranked` construct के knobs गिनता है (32–256
+rows और 48–256 columns के output tiles, `bk` 16–64, नौ warp grids, वे ring depths जो target का prefetch
+चलाता है, rolled और unrolled), वही रखता है जिसे lowering चला सके (atoms warp grid को tile करते हैं, fills
+हर thread पर पूरे 16-byte chunks में बँटते हैं, ring shared memory में समाती है) और बाक़ी को device की मापी
+गई `Costs` से SM time के nanoseconds में rank करता है। एक block का trip `work` करता है: हर wave के operand
+fragments shared memory से पढ़े जाते हैं, fill stream होकर आता है, matrix-core steps और trip की fixed cost।
+जितने blocks एक SM एक साथ रखता है उनका एक round SM के issue work से, एक wave के अपने issue से (जिस block
+में SM के SIMDs से कम waves हैं वह बाक़ी को idle छोड़ता है) या उस memory latency से bound होता है जिसे एक
+pipeline stage आगे छिपा नहीं सकता, जो भी सबसे लंबा हो:
+`cost = rounds × trips × max(resident × work, simds × work / waves, latency / (stages − 1))`
+(`Planner::pipelined`)। बीच वाले bound के बिना gfx1151 की ranking one-warp 256×256 tiles से शुरू होती थी जो
+1–3 TFLOP/s पर चलते थे। Layout की register count सिर्फ़ अनुमान लगाती है कि कितने blocks resident हैं; यह
+कुछ भी admit नहीं करती, क्योंकि जहाँ fragments replicate होते हैं (gfx11 WMMA) वहाँ यह ज़्यादा गिनती है।
+Ranking किसी tile की हर pipeline रखती है; [tune store](./tuning) उन पहले आठ output tiles और warp grids में
+से चुनता है जिनके compiled kernels spill नहीं करते, हर एक अपनी पहली clean pipeline पर (सब spill करें तो:
+पहले आठ जो compile हों)। Pipelines सिर्फ़ model से rank होती हैं, इसलिए spill करने वाली unrolled ring अपने
+rolled जुड़वाँ के लिए जगह छोड़ती है: gfx1151 पर d = 128 के unrolled 64×16 और 128×16 attention tiles spill
+करते हैं और rolled वाले clean compile होते हैं। Model के लिए gated weight एक `2·bn`-चौड़ा B tile और दो
+accumulators है, इसलिए उसकी बढ़त आधी चौड़ाई पर आती है। किसी device का `Planner` उसका target, उसकी मापी गई
+costs और वे problems रखता है जिन्हें उसने rank किया है (op हर call पर अपना shape plan करता है; lattice को
+rank करने में एक millisecond लगता है), process में हर device के लिए एक planner।
 
-| Family | Stages | Warp grid | Unroll | मापी गई टिप्पणी |
-|---|---|---|---|---|
-| 128×128×32 | 3 | 2×4 | नहीं | 4096³ का शिखर यहीं: 25.4 TFLOP/s |
-| 128×64×32 | 2 | 2×2 | हाँ | |
-| 64×128×32 | 2 | 2×2 | नहीं | |
-| 64×64×32 | 3 | 2×2 | हाँ | M = 704 (Nemotron): 128-row tiles 64×64 से हारते हैं |
-
-`config::gemm_candidates` सबसे पहले वह सबसे बड़ी family रखता है जिसका grid हर SM को 8 blocks देता है
-और output area का अधिकतम 1/16 pad करता है (वरना 64×64)। फिर वह उस family के variants जोड़ता है
-(दूसरी stage count, `bk = 64`, उल्टा `unroll`, transposed warp grid), फिर बाक़ी families। जब `k`
-`bk` का गुणज नहीं होता तो `bk` आधा होते-होते 16 तक जाता है, और जिन configs की ring target की shared
-memory से बड़ी है वे हटा दिए जाते हैं। अधिकतम आठ candidates बचते हैं, और [tune store](./tuning)
-उनमें से चुनता है।
+Model में कोई fitted constants नहीं हैं: हर cost device की अपनी है, एक probe से मापी गई। जहाँ ranking और
+कोई माप असहमत हों, माप जीतता है: shape को `qwen3_gemm_candidates_probe` में जोड़ें और देखें कि ranking
+कौन सी cost चूकती है।
 
 ## Flash attention {#flash-attention}
 
@@ -88,35 +97,51 @@ Masks tile-class का काम हैं। सिर्फ़ वे key blo
 **Key splits** (`FaCfg::splits > 1`) कुछ लंबी rows को, जैसे decoder step को, ज़्यादा blocks देते हैं।
 हर split f32 partials `o_part`, `m_part` और `l_part` लिखता है, और `combine` उन्हें मिलाता है।
 
-`FaCfg { bq, bkv, stages, splits }` हर 16 query rows पर एक warp इस्तेमाल करता है। Head dim के हिसाब से
-candidates, पहला untuned चुनाव है:
-
-| `d` | Candidates `(bq, bkv, stages)` | मापी गई टिप्पणी (sm_86) |
-|---|---|---|
-| 48, 64, 128 with `t ≤ 16` | (16, 64, 2), (16, 64, 3), (16, 32, 2) | Decoder step bandwidth-bound है: one-warp blocks हर SM पर कई blocks की जगह छोड़ते हैं |
-| 48 | (64, 64, 2), (64, 64, 3) | ऐसे shapes जिनके K/V fills block के threads में बँट जाते हैं (96-byte rows) |
-| 64 | (64, 64, 2), (64, 64, 3), (128, 64, 2), (64, 32, 2), (128, 32, 2), (64, 32, 3) | |
-| 128 | (64, 32, 2), (64, 32, 3), (128, 32, 2), (64, 64, 2), (128, 64, 2), (128, 32, 3) | `bkv = 64` ने 18.2 TFLOP/s मापा, `bkv = 32` के 22.2 के मुक़ाबले: प्रति block 64 KB से हर SM पर एक ही block बचता है |
+`FaCfg { bq, bkv, stages, splits, unroll, .. }` हर 16 query rows पर एक warp इस्तेमाल करता है। Candidates
+GEMM वाले ही lattice और cost model से आते हैं (`Planner::attention_ranked`): 16–128 rows के query blocks,
+16–128 keys के key blocks, वे ring depths जो target चलाता है, rolled और unrolled, उतने तक सीमित जो lower हो
+(fills हर thread पर chunks में बँटते हैं, ring shared memory में समाती है) और इस हिसाब से rank होते हैं कि
+एक key block की cost क्या है (हर warp के K और V fragments पढ़े जाते हैं, दोनों tiles stream होकर आते हैं,
+matrix-core steps, हर score पर softmax का vector काम और trip की fixed cost), query blocks के हर round के
+key blocks पर, हर round GEMM की तरह bound। Register अनुमान query, key, score, probability और value
+fragments हैं, जो compiled loop में साथ-साथ live रहते हैं; कोई config spill करता है या नहीं, यह compiled
+kernel बताता है। Problem की queries से आगे का warp अपनी padded rows का काम जोड़ता है, इसलिए जहाँ tiles device
+को भर देते हैं वहाँ decoder step one-warp blocks से शुरू होता है; जहाँ वे SIMDs को idle छोड़ते हैं वहाँ padded
+warp उनमें से एक पर चलता है। Causal mask हर query block से उसका diagonal वसूलता है। जहाँ value tile का fill
+registers से होकर जाता है वहाँ वह column-major रखा जाता है (देखें
+[Layouts and Lowering](./layouts-and-lowering#layouts-and-lowering)), इसलिए उसके fragments keys की तरह
+16-byte loads के रूप में इकट्ठा होते हैं; gfx1201 पर मापा गया तो यह row-major tile के हर key पर एक load के
+मुक़ाबले प्रति shape 5–28% है। RDNA4 पर fill ख़ुद एक transposing load (`global_load_tr_b128`) है, इसलिए
+उसके registers column runs रखते हैं और वे भी 16-byte vectors के रूप में store होते हैं।
 
 Softmax step जितना कम vector काम कर सके करता है, जो वहाँ सबसे ज़्यादा मायने रखता है जहाँ matrix cores
 SIMD के ALUs साझा करते हैं (RDNA)। कोई row नया running maximum तभी लेती है जब वह log2 इकाइयों में 8 से
 ज़्यादा बढ़े (FlashAttention-4 का lazy rescale): वरना correction ठीक 1 रहता है और probabilities 2⁸ से नीचे
-रहती हैं। Forms target के हिसाब से तय होते हैं, जिन्हें planner (`FaCfg::forms`) `Target::bf16_cvt` और
-`Target::mma_on_valu` से चुनता है। `truncate_p` के साथ bf16 में रखी probabilities round नहीं, truncate होती
+रहती हैं। Planner हर config सादे forms में देता है; बाक़ी चार (`FaCfg::forms`: `truncate_p`, `skip_rescale`, `raw_max`,
+`sum_after`) tuner knobs हैं, जो tiles के साथ बारी-बारी tune होते हैं (`ops::attention::tune`, `descend` के ज़रिए), क्योंकि
+कोई tile केवल कुछ forms के साथ ही clean compile हो सकता है: ranking के पहले clean compile होने वाले config पर
+एक forms pass, फिर उसके रखे forms के साथ ranking पर tile और split का चुनाव, फिर उस winner पर दोबारा एक
+forms pass (store-backed, इसलिए कुछ न बदले तो सस्ता)। Forms pass एक coordinate descent है: हर form एक बार,
+इसी क्रम में, एक two-candidate tune जिसमें अब तक के forms का मुक़ाबला उसी से होता है
+जिसमें वह form पलटा गया हो, और पलटाव तभी रखा जाता है जब वह तेज़ मापे (spill करने वाला पलटाव admit नहीं
+होता)। कौन सा form registers बचाता है, यह कहीं नियम नहीं है: माप तय करता है। Tuning बंद होने पर हर attention
+सादे forms चलाता है। `truncate_p` के साथ bf16 में रखी probabilities round नहीं, truncate होती
 हैं — जहाँ rounding कई instructions लेती है वहाँ एक instruction में एक जोड़ी — और row sum उन्हें वैसे ही जोड़ता है
 जैसे वे रखी हैं, ताकि normalization unbiased रहे; जो targets एक जोड़ी को एक instruction में round करते हैं
 (sm_80+, gfx950) वे f32 मान round और sum करते हैं, क्योंकि रखे मानों का अतिरिक्त conversion sm_86 पर
 3–5% महँगा था। `skip_rescale` के साथ output accumulator का rescale एक `Scale` है, जिसे हर वह wave छोड़ देती है
-जिसकी सभी rows ने अपना maximum रखा; यह वहाँ हर जगह चालू है जहाँ matrix products vector ALUs पर issue होते हैं,
-और अलग matrix cores के बगल में केवल वहाँ जहाँ भरे tile की lane 64 output registers रखती है (sm_86: d = 128 पर
-+4%, d = 64 पर neutral और decoder step पर 5–7% धीमा, जिसकी एक row सादा multiply रखती है)। `raw_max` के साथ,
-queries से भरे RDNA tiles पर, running maximum raw scores की इकाइयों में रहता है (positive scale maximum के साथ
-commute करता है; bias scaled form रखता है), तो केवल वे दो row मान scale होते हैं जो exponent और correction
-लेते हैं — हर score की जगह हर row पर एक multiply — step की dependent chain पर एक multiply की कीमत पर, जिसे
-decoder step की अकेली wave महसूस करती है (3%) और भरा tile नहीं। Probabilities का row sum product के बाद आता
-है जहाँ rescale एक branch है या probabilities truncated हैं, ताकि दोनों consumers उन्हें एक बार packed पढ़ें
-(sm_86 d = 128: +7%; truncated sum वह bf16 pair dot product है जहाँ target के पास वह है), और वरना rescale से
-पहले (sm_86 d = 64 causal: इस क्रम में +5%)। Causal mask (या हर पहले वाले को देखने वाले chunks) के नीचे
+जिसकी सभी rows ने अपना maximum रखा; इसका फ़ायदा वहाँ हर जगह मिला जहाँ matrix products vector ALUs पर issue
+होते हैं, और अलग matrix cores के बगल में केवल वहाँ जहाँ भरे tile की lane 64 output registers रखती है (sm_86:
+d = 128 पर +4%, d = 64 पर neutral और decoder step पर 5–7% धीमा, जिसकी एक row सादा multiply रखती है)।
+`raw_max` के साथ (queries से भरे RDNA tiles पर फ़ायदेमंद), running maximum raw scores की इकाइयों में रहता है
+(positive scale maximum के साथ commute करता है; bias scaled form रखता है), तो केवल वे दो row मान scale होते
+हैं जो exponent और correction लेते हैं — हर score की जगह हर row पर एक multiply — step की dependent chain पर
+एक multiply की कीमत पर, जिसे decoder step की अकेली wave महसूस करती है (3%) और भरा tile नहीं। `sum_after` के
+साथ row sum rescale से पहले आने की जगह product के बाद आता है; truncated probabilities दोनों तरह वैसे ही जोड़ी
+जाती हैं जैसे रखी हैं (bf16 pair dot product, जहाँ target के पास वह है), rounded वाली f32 में। Product के बाद
+दोनों consumers truncated मान एक बार packed पढ़ते हैं (gfx1201); उससे पहले, sm_86 पर rounding के साथ, यह क्रम
+d = 128 पर 3% तेज़ था (24.7 बनाम 24.0 TFLOP/s, इस काम से पहले 22.4) और d = 64 पर तथा decoder step पर
+neutral। Causal mask (या हर पहले वाले को देखने वाले chunks) के नीचे
 आख़िरी query blocks, जो सबसे ज़्यादा keys score करते हैं, पहले चलते हैं, ताकि round की पूँछ उसके सबसे छोटे
 blocks हों। gfx1201 पर lazy rescale, truncation, skip और नीचे के raw `exp2` ने d = 128 kernel को random data
 पर 90 से 116 TFLOP/s और Qwen3 के causal attention को 63 से 77 तक ले गए; raw maximum, pair dot product और
@@ -124,8 +149,10 @@ block order उन्हें 120 और 79 तक, d = 128 causal 96 → 100 �
 decoder step अपरिवर्तित। Loop के अकेले WMMAs जिस 162 TFLOP/s पर चलते, उसके मुक़ाबले जो बचा है वह पतला फैला है:
 vector काम 15%, बाक़ी loads, stores, barriers और addressing।
 
-हर tile config को split counts से गुणा किया जाता है। `Attn::splits = Some(n)` `n` तय करता है, key
-block count पर सीमित। `None` के साथ, `config::split_candidates` 1, 2, हर SM पर दो blocks के आसपास की
+हर tile config को split counts से गुणा किया जाता है। `Attn::splits = Some(n)` `n` तय करता है: सिर्फ़
+वे configs rank होते हैं जिनमें कम से कम `n` key blocks हों, `n` पर (उस सबसे बड़ी key block count पर
+सीमित जो किसी config में हो), इसलिए बताई गई गिनती किसी बड़े key block की वजह से कभी नहीं छूटती। `None` के
+साथ, `Planner::splits` 1, 2, हर SM पर दो blocks के आसपास की
 गिनतियाँ, और हर key block के लिए एक split सुझाता है। यह सिर्फ़ उन्हीं गिनतियों को रखता है जो key
 block count और उस SM लक्ष्य के दोगुने में से छोटे तक हों। Unsplit
 config पहले आता है, और split candidate अपने merge के साथ मिलाकर मापा जाता है।
@@ -146,6 +173,10 @@ decoder step इन्हीं कर्नेलों को बुलात�
 |---|---|---|
 | Self attention, 200 cached keys + appended एक | 21.5 | 89.1 |
 | Cross attention, 1500 shared keys | 66.3 | 78.8 (636 unsplit) |
+
+खुला मुद्दा: decode `row_map` अब भी tuned shape से बाहर है (tuner हर lane पर एक row वाले scratch caches पर
+मापता है, जहाँ map कचरा rows पढ़ता), इसलिए tuned cross attention अपने map के साथ सबसे तेज़ न भी हो: gfx1151
+पर (2026-10-14) वह 60 µs unsplit के मुक़ाबले 90 µs पर tune हुआ।
 
 ## Attention prologue {#attention-prologue}
 

@@ -41,8 +41,10 @@ or `[B, T, 1, D/2]` (by token). The masks are described with the
 ## Kernel or graph
 
 The decision is a pure function in `ops::shape`, `fn(target, dtypes, extents, …) -> Plan<Cfg>`,
-so it is tested on the host without a GPU. `Plan::Kernel(candidates)` lists the configs with the
-untuned pick first. `Plan::Graph(Fallback)` says why the graph runs.
+so it is tested on the host without a GPU. `Plan::Kernel(configs)` ranks the configs with the
+untuned pick first; the [tuner](./tuning) measures the first that compile without spilling (or,
+when every one spills, the first that compile: spills never send an op to the graph).
+`Plan::Graph(Fallback)` says why the graph runs.
 
 | `Fallback` | When |
 |---|---|
@@ -60,7 +62,8 @@ Real cases from `test/unit/ops_plan.rs`, on the sm_86 target:
 #[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
 #[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
 fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallback>) {
-    assert_eq!(first(shape::linear(Some(&sm86()), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
+    let planner = Planner::new(Device { target: sm86(), costs: costs() });
+    assert_eq!(first(shape::linear(Some(&planner), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
 }
 ```
 

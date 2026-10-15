@@ -6,8 +6,8 @@ sidebar_label: Layouts and Lowering
 
 `lower::lower(program, &lowering, params, device)` turns a tile program into a Svod program
 whose instruction list is already in order. A `Lowering` holds everything the author did not
-decide: the `Target`, the `Schedule`, the `WarpGrid` over the block tile, and whether shared rows
-are swizzled. Each kernel config builds its own (`GemmCfg::lowering`, `FaCfg::lowering`,
+decide: the `Device` (the target and its costs), the `Schedule`, the `WarpGrid` over the block
+tile, and whether shared rows are swizzled. Each kernel config builds its own (`GemmCfg::lowering`, `FaCfg::lowering`,
 `NormCfg::lowering`).
 
 | Step | Module | Effect |
@@ -65,7 +65,7 @@ The CUDA and AMD rows plan kernels and run on hardware today (sm_86 and gfx1201 
 
 1. **Atoms seed.** An `mma` gives its operands and result the atom's layouts tiled over the
    `WarpGrid` (`MmaAtom::issue`), issued whichever way round (`ir::Orient`) leaves the program
-   the least relayout traffic: `Cᵀ = Bᵀ·Aᵀ` is the same instruction with its slots exchanged,
+   the least relayout cost under the lowering's `Costs`: `Cᵀ = Bᵀ·Aᵀ` is the same instruction with its slots exchanged,
    so on a square atom an accumulator can be held as the next product's operand at no cost.
    An author may pin the orientation (`Kernel::mma_oriented`).
 2. **Elementwise ops unify.** Operands and the result of `binary`, `cast`, `where_` and the
@@ -78,8 +78,18 @@ The CUDA and AMD rows plan kernels and run on hardware today (sm_86 and gfx1201 
    does not default it apart from that tile.
 5. **Conflicts become relayouts.** A value two consumers want differently gets a
    `TileOp::Relayout` inserted. `TileLayout::relayout` classifies it as `Identity`,
-   `RegPermute` (within each lane), `LaneShuffle` or `ViaSmem`. The emitter currently lowers
-   both `LaneShuffle` and `ViaSmem` through shared memory.
+   `RegPermute` (within each lane), `Exchange` (each register taken by lane-xor moves from
+   fixed partners, the same in every warp) or `ViaSmem`. An `Exchange` is kept
+   only while its work costs less than a round trip through shared memory
+   (`Relayout::work × Costs::lane_move < Costs::smem_trip`, the work being its distinct
+   non-zero-mask moves plus a select per extra pick, a select counting as a move, per register); otherwise the tile takes
+   the round trip. The emitter lowers an `Exchange` with the target's lane moves
+   (`atoms::LaneMove`: DPP and `permlanex16` on RDNA, `ds_bpermute` on CDNA's wave64) and
+   `ViaSmem` through shared memory. `Relayout::cost_per_element` prices each
+   class from the `Costs` (a `RegPermute` is free, since the compiler renames the registers;
+   the exchange's work at `lane_move`; `smem_trip`), and the orientation search also charges
+   every element of a global load whose lanes scatter `Costs::scatter`, so an RDNA3 attention
+   with a bias keeps its products direct and reads the bias along its rows.
 
 ## Schedule templates
 

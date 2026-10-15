@@ -22,6 +22,14 @@ sidebar_label: Portability
 builds one from an architecture alone, which is what host tests use. `atoms::sm86()` is the
 RTX 3060 target with 28 SMs.
 
+A target declares what the chip can do, never what it costs. What its primitives cost
+(`atoms::Costs`: a shared-memory byte, a streamed byte, a scattered element, a matrix-core
+step, a score's softmax work, a trip, a lane move, a shared round trip, a register copy, the
+global latency) is measured on the device at first use (`probe::costs`) and kept in the tune
+store; host tests declare it. There are no per-family cost tables. The costs reach the
+lowering as `Lowering::costs` (orientation, exchange or round trip) and the op layer as
+`Planner::device` (the candidate rankings).
+
 | Target | Atoms | Fills | Tables | State |
 |---|---|---|---|---|
 | CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, 2–3 stages | yes | Measured on an RTX 3060 |
@@ -53,7 +61,7 @@ is data the lowering and the op layer choose:
 | Matrix-core atoms and their layouts | `atoms`, `layout/atoms.rs` |
 | Copy mechanisms (`cp.async`, `ldmatrix`, register staging) | `Target` flags, the emitter |
 | Schedule templates | `schedule::Schedule` |
-| Config candidate tables | `ops::config` |
+| Config candidate rankings | `ops::config`, from the measured `Costs` |
 
 A forked kernel program for one vendor is allowed only as a bounded exception.
 
@@ -64,8 +72,7 @@ A forked kernel program for one vendor is allowed only as a bounded exception.
 | Hopper (sm_90a): wgmma, TMA, mbarrier, warp-specialized template | Not started; Hopper runs the `mma.sync` path (substrate items 5–8) |
 | Blackwell (sm_100a): tcgen05, tensor memory | Not started; no B200 access |
 | AMD CDNA: ping-pong template, MFMA 32×32, `buffer_load … lds` | Not started |
-| AMD measurements | gfx1201 (RX 9070 XT) measured: GEMM, convolution and attention ahead of tk1 on Qwen3 and YOLO; CDNA compiled, not run |
-| RDNA3 attention at d = 128 | The score tile still crosses shared memory there (the accumulator feeds neither operand) and the configs overrun the register file, so the graph runs it |
+| AMD measurements | gfx1201 (RX 9070 XT) measured: GEMM, convolution and attention ahead of tk1 on Qwen3 and YOLO; gfx1151 (Strix Halo) measured: attention at d = 64 and 128; CDNA compiled, not run |
 | Apple | Atoms only; no tables, no emitted kernels |
 | Convolution (implicit GEMM) | Measured on sm_86, where YOLO26 runs on it channels-last (`ops::conv2d`); compiled only for AMD |
 | Warp roles, role barriers, raw asm statements | Recorded in the IR, rejected by the lowering |

@@ -4,7 +4,9 @@ sidebar_label: 调优
 
 # 调优
 
-每个算子在 `ops::config` 中为每种形状提供一个候选列表（表格见[内核库](./kernel-library)）。第一个候选是未调优时运行的配置。调优存储在设备第一次遇到某个形状时测量整个列表，并保留胜者。
+每个算子在 `ops::config` 中为每种形状提供一个排序后的配置列表（表格见[内核库](./kernel-library)），依据设备测得的代价排序（见[设备代价](#device-costs)）。排序是一个模型，寄存器计数也是，因此二者都不决定配置的准入。决定准入的是一条规则：调优器按排序顺序、以每批八个并行编译排序后的配置，直到得到前八个编译后内核不溢出的 tile（内核报告了溢出的 scratch 字节即为溢出；什么都不报告的后端视为准入）。排序列出一个 tile 的每条流水线（环形缓冲深度、展开），tile 以其第一条干净的流水线被准入，因此会溢出的展开环形缓冲让位于其不展开的孪生配置。只有在仍有干净配置时，溢出才会排除一个配置：当每个能编译的配置都溢出时，仍对其中前八个计时，因为由时间来评判，而溢出的内核仍胜过计算图。只有一个配置的列表走同一路径，没有算子会因为溢出而退回计算图。准入的配置连同其变体（注意力的键拆分、饥饿卷积的归约拆分）就是调优存储在设备第一次遇到某个形状时测量的候选，它保留胜者。注意力轮流调优其 softmax 形式和 tile：先在排序中第一个干净配置上调优形式，再在这些形式下调优 tile，然后在胜者上再调优一次形式（见[内核库](./kernel-library)）。准入列表只在本进程内记住；另一个进程会重新编译它，编译器的目标文件缓存使这很便宜。当什么都无法编译时（没有可供编译的设备），直接使用前八个而不做测试。
+
+关闭调优时（`SVOD_TK3_TUNE=0`），准入仍会编译，并运行第一个准入的配置；只关闭候选计时。设备的代价探针仍会测量，每个设备一次（在 gfx1151 上约 4 s），因为排序需要它们。
 
 更好的固定默认值并不够用。Nemotron 的 GEMM（M = 704，N 512–2048）在旧的固定 tile 梯度下只有约 14 TFLOP/s：28 个 SM 上只有 48 个块。使用调优存储后，它们在 RTX 3060 上的平均时间从 76.5 µs 降到约 60 µs。
 
@@ -14,12 +16,17 @@ sidebar_label: 调优
 
 | 步骤 | 设置 |
 |---|---|
-| 预热 | 500 ms 的连续运行（RTX 3060 空闲时运行在 210 MHz） |
+| 预热 | 连续运行直到时钟稳定（RTX 3060 空闲时运行在 210 MHz） |
 | 轮次 | 对所有候选进行 4 轮轮询 |
 | 每轮 | 10 ms 的维持运行，然后 5 次剖析运行，保留每个候选的最小值 |
-| 一次运行的时间 | 最长内核的 GPU 时间戳 |
+| 一次运行的时间 | 其各内核 GPU 时间戳之和 |
 
 一个候选是一组程序：对拆分注意力而言是一个内核加上合并其部分结果的内核，其时间是各程序时间之和。构建或运行失败的候选被跳过。如果什么都没测到，就使用第一个候选，并且不存储任何内容。
+
+有两道防护保证计时可信：
+
+- **一把设备锁。** 进程中的每次计时，无论是调优器的还是代价探针的，在 `tune::time` 期间都持有同一把锁：共享设备的两次测量会互相干扰计时。两个线程调优同一个键时只测量一次；第二个线程等待第一个的结果。
+- **时间戳防护。** gfx1151 偶尔会把一个长内核的时间戳记为约一微秒（在一个 90 ms 内核的约六十次运行中见过一次）。`tune::best` 在保留最快值之前，丢弃低于该候选运行中位数一半的运行，调优器和探针都是如此。
 
 ## 存储 {#the-store}
 
@@ -27,29 +34,33 @@ sidebar_label: 调优
 |---|---|
 | 目录 | `$SVOD_TK3_TUNE_DIR`，否则 `$XDG_CACHE_HOME/svod/tk3_tune`，否则 `~/.cache/svod/tk3_tune` |
 | 文件 | 每个设备和 crate 版本一个，例如 `sm_86_28sm-v0.2.0.txt` |
-| 行 | `op\|device\|dtype\|shape\|candidates\|programs index ns` |
-| 键 | `tune::TuneKey { op, device, dtype, shape, candidates }`，其中 `device` 是架构和 SM 数量（`sm_86-28sm`） |
+| 行 | `op\|device\|dtype\|shape\|candidates\|compiler\|programs index ns` |
+| 键 | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`，其中 `device` 是架构和 SM 数量（`sm_86-28sm`），`compiler` 是设备编译器的摘要（`tune::compiler`） |
 
-来自真实存储的一行：attention，bf16，形状 `[batch, t, tk, heads, kv_heads, d]`，候选 2 以 61.4 µs 胜出。
+来自真实存储的一行：attention，f16，形状 `[batch, t, tk, heads, kv_heads, d]`，候选 1 以 23.2 µs 胜出。
 
 ```text
-attention|sm_86-28sm|BFloat16|1x704x704x8x8x64|3733e8921b15aa79|77aee9d5c98fa463 2 61440
+attention|gfx1151-40sm|Float16|5x1x448x20x20x64|f0896a3761c96a19|465b6912a7cb2da1|9c2caed511ea3c95 1 23240
 ```
 
-`programs` 字段是已构建候选程序及其降级的指纹，因此内核一旦改动就会重新测量。写入时会重新读取、合并并原子地替换文件。无法读取或写入的存储视为未命中，从不报错。进程内的记忆缓存无需构建任何东西即可回答重复调用。
+`programs` 字段是候选程序及其降级的指纹，`compiler` 是工具链的指纹，因此内核或编译器一旦改动就会重新测量。程序会被构建（代价很低）以计算指纹；只有存储未命中时才编译它们，因此热存储在准入之外不编译任何东西。写入时会重新读取、合并并原子地替换文件。无法读取或写入的存储视为未命中，从不报错。进程内的记忆缓存无需构建任何东西即可回答重复调用。
+
+## 设备代价 {#device-costs}
+
+排序所用的代价（`atoms::Costs`：一个共享字节、一个流式字节、一步矩阵核运算、一个分数的 softmax、一次流水线行程、lane 移动、全局延迟……）由 `probe::costs` 在进程第一次为该设备做规划时在设备上测量：每个字段是一对程序，其中探针做其基线所做的一切，再加上已知数量的该原语。这些值以 `probe:<field>` 行写入同一个存储文件（索引为 0，`ns` 位置存放飞秒数），因此之后的进程会读回它们。规划器每个设备只创建一次；第二个调用者等待探针完成。没有 SM 数量的设备无法缩放探针，也就没有规划器。主机测试则直接声明代价：`test::unit::costs()` 和 `gfx1151_costs()`，后者取自一个 gfx1151 存储。
 
 ## 关闭调优 {#switching-it-off}
 
 | 方式 | 作用 |
 |---|---|
-| `SVOD_TK3_TUNE=0` | 关闭测量；运行第一个候选 |
+| `SVOD_TK3_TUNE=0` | 关闭候选计时；运行第一个准入的候选（代价探针仍会测量） |
 | `svod_tk3::tune::set_enabled(false)` | 对当前进程效果相同，优先于环境变量（测试中使用） |
 
 `tune::TuneStore::at(root)` 在另一个根目录构建存储，传入 `None` 时仅存在于内存中。`tune::measure(candidates)` 以同样方式为任意 `tune::Candidate`（`Vec<(Program, Lowering)>`）列表计时。
 
-## 探针 {#probes}
+## 探针测试 {#probe-tests}
 
-探针是带 `#[ignore]` 的测试，只打印耗时，从不断言。在空闲的 GPU 上逐个运行：
+探针测试是带 `#[ignore]` 的测试，只打印耗时，从不断言。它们用设备探测到的代价排序，并为调优器准入的短名单计时（即算子层自身的准入），同时标出调优器的选择。在空闲的 GPU 上逐个运行：
 
 ```bash
 SVOD_DEVICE=CUDA:0 cargo test -p svod-tk3 --lib --release -- --ignored --nocapture --test-threads=1 gemm_candidates_probe
@@ -57,9 +68,9 @@ SVOD_DEVICE=CUDA:0 cargo test -p svod-tk3 --lib --release -- --ignored --nocaptu
 
 | 探针 | 输出 |
 |---|---|
-| `gemm_throughput_probe` | tk3 GEMM 各配置在 4096³ 上的 TFLOP/s |
-| `gemm_candidates_probe` | Nemotron 投影形状和 4096³ 上的每个 GEMM 候选、未调优时的选择以及胜者 |
-| `attention_throughput_probe` | Flash attention（B 4、H 8、T 2048；d 64/128，因果与非因果） |
+| `gemm_throughput_probe` | 准入的 GEMM 配置在 4096³ 上的 TFLOP/s，以及调优器的选择 |
+| `gemm_candidates_probe` | Nemotron 投影形状和 4096³ 上每个准入的 GEMM 候选、未调优时的选择、最快者以及调优器的选择 |
+| `attention_throughput_probe` | Flash attention（B 4、H 8、T 2048；d 64/128，因果与非因果）：每个准入的配置，以及调优器的选择及其 softmax 形式 |
 | `decode_throughput_probe` | 一个 Whisper large-v3 解码器步骤的自注意力和交叉注意力 |
 | `first_execution_probe` | 构建、降级和准备一个 tk3 GEMM 的主机开销，与图 GEMM 对比 |
 
