@@ -65,6 +65,90 @@ fn flattened_expand() -> Arc<UOp> {
     expanded(&[50, 1], &[50, 1_000]).try_reshape(&smallvec::smallvec![SInt::Const(50_000)]).expect("reshape")
 }
 
+fn broadcast(src: Arc<UOp>, base: &[usize], to: &[usize]) -> Arc<UOp> {
+    let dtype = src.dtype();
+    let src = src.try_reshape(&base.iter().map(|&s| SInt::Const(s)).collect()).expect("reshape");
+    let new_shape = stack(to.iter().map(|&d| UOp::index_const(d as i64)));
+    UOp::new(Op::Expand(ops::Expand { src, new_shape }), dtype)
+}
+
+/// `[rows, indices, width]` of a lookup small enough to build its arange by hand.
+const LOOKUP: [usize; 3] = [64, 4, 8];
+
+fn int_expanded(base: &[usize]) -> Arc<UOp> {
+    broadcast(buffer_of(base.iter().product(), svod_dtype::ScalarDType::Int32), base, &LOOKUP)
+}
+
+/// `0..n` along `axis` of [`LOOKUP`], in `dtype`: varies along that axis and
+/// reads no buffer, as `Tensor::arange` does.
+fn arange_along(axis: usize, dtype: DType) -> Arc<UOp> {
+    let mut base = [1; 3];
+    base[axis] = LOOKUP[axis];
+    broadcast(stack((0..LOOKUP[axis]).map(|i| UOp::index_const(i as i64))).cast(dtype), &base, &LOOKUP)
+}
+
+/// `Tensor::embedding`'s lookup, `where(idx == arange, table, 0)` summed over
+/// the rows, and the variations of it that reduce simplification cannot fold.
+#[derive(Clone, Copy)]
+enum Lookup {
+    Where,
+    Mul,
+    Ne,
+    Lt,
+    OneElsewhere,
+    Max,
+    CastBeforeTheSum,
+    AgainstAnotherAxis,
+    IndexVariesToo,
+    ArangeReadsABuffer,
+    ArangeWidenedPastTheIndex,
+}
+
+impl Lookup {
+    fn reduce(self) -> Arc<UOp> {
+        let [rows, indices, width] = LOOKUP;
+        let index = int_expanded(&[1, indices, 1]);
+        let arange = arange_along(0, DType::Int32);
+        let table = expanded(&[rows, 1, width], &LOOKUP);
+        let fill = |value: f32| broadcast(UOp::native_const(value), &[1, 1, 1], &LOOKUP);
+        let eq = |lhs: &Arc<UOp>, rhs: &Arc<UOp>| lhs.try_cmpeq(rhs).expect("eq");
+        let select = |condition| UOp::try_where(condition, table.clone(), fill(0.0)).expect("where");
+        let source = match self {
+            Self::Where | Self::Max => select(eq(&index, &arange)),
+            Self::Mul => table.try_mul(&eq(&index, &arange).cast(DType::Float32)).expect("mul"),
+            Self::Ne => UOp::try_where(index.try_cmpne(&arange).expect("ne"), fill(0.0), table).expect("where"),
+            Self::Lt => select(index.try_cmplt(&arange).expect("lt")),
+            Self::OneElsewhere => UOp::try_where(eq(&index, &arange), table, fill(1.0)).expect("where"),
+            Self::CastBeforeTheSum => select(eq(&index, &arange)).cast(DType::Float64),
+            Self::AgainstAnotherAxis => select(eq(&index, &arange_along(2, DType::Int32))),
+            Self::IndexVariesToo => select(eq(&int_expanded(&[rows, indices, 1]), &arange)),
+            Self::ArangeReadsABuffer => select(eq(&index, &int_expanded(&[rows, 1, 1]))),
+            Self::ArangeWidenedPastTheIndex => select(eq(&index, &arange_along(0, DType::Int16).cast(DType::Int32))),
+        };
+        let reduce_op = if matches!(self, Self::Max) { ReduceOp::Max } else { ReduceOp::Add };
+        source.try_reduce_axis(reduce_op, vec![0]).expect("reduce axis")
+    }
+}
+
+/// A lookup reduce simplification folds into one indexed load stays one
+/// reduce: split, a 64-bit index could not fold, and the first stage would read
+/// the whole table for every index. Every other reduce still splits.
+#[test_case(Lookup::Where, true ; "where(idx == arange, x, 0)")]
+#[test_case(Lookup::Mul, true ; "x * (idx == arange)")]
+#[test_case(Lookup::Ne, true ; "where(idx != arange, 0, x)")]
+#[test_case(Lookup::Lt, false ; "where(idx < arange, x, 0) selects a prefix")]
+#[test_case(Lookup::OneElsewhere, false ; "where(idx == arange, x, 1) is not a select")]
+#[test_case(Lookup::Max, false ; "a max does not fold")]
+#[test_case(Lookup::CastBeforeTheSum, false ; "a cast before the sum keeps it from folding")]
+#[test_case(Lookup::AgainstAnotherAxis, false ; "the arange runs along another axis")]
+#[test_case(Lookup::IndexVariesToo, false ; "the index varies along the reduced axis")]
+#[test_case(Lookup::ArangeReadsABuffer, false ; "the compared side reads a buffer")]
+#[test_case(Lookup::ArangeWidenedPastTheIndex, false ; "the arange is widened past the index")]
+fn a_lookup_that_folds_into_a_load_is_not_split(lookup: Lookup, whole: bool) {
+    let config = SplitReduceOpConfig { split_threshold: 8, ..Default::default() };
+    assert_eq!(split_reduceop(&lookup.reduce(), &config).is_none(), whole);
+}
+
 #[test_case(ReduceOp::Add ; "add")]
 #[test_case(ReduceOp::Mul ; "mul")]
 #[test_case(ReduceOp::Max ; "max")]

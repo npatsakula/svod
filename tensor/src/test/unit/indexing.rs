@@ -508,6 +508,13 @@ fn a_lookup_collapses_only_where_the_index_fits(lookup: Lookup, dtype: DType, re
     assert_eq!(reduces_left(&lookup_tensor), reduces);
 }
 
+/// A vocabulary big enough for `split_reduceop` to split the lookup in two still
+/// collapses into a direct read: split, a 64-bit index could not.
+#[test]
+fn a_lookup_too_wide_for_one_reduce_still_collapses() {
+    assert_eq!(reduces_left(&Lookup::Embedding.build(65_536, &Tensor::empty(&[4], DType::Int64))), 0);
+}
+
 /// Indices around the arange, past 32 bits on either side, and at the extremes.
 fn wide_index() -> impl proptest::strategy::Strategy<Value = i64> {
     use proptest::prelude::*;
