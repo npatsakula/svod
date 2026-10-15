@@ -1,6 +1,7 @@
 //! [`XlmRobertaTokenClassifier`]: the published key layout and the capacity its
-//! position table allows (host-only), and parity against PyTorch on
-//! `segment-any-text/sat-3l-sm` (heavy).
+//! position table allows (host-only), and parity on
+//! `segment-any-text/sat-3l-sm` (heavy) against PyTorch and, for a long text's
+//! stitched windows, against wtpsplit.
 //!
 //! # Goldens are not committed
 //!
@@ -13,7 +14,10 @@
 
 use std::path::PathBuf;
 
-use svod_arch::pipelines::text::{ClassifyTokens, EncoderHead, Encoding};
+use svod_arch::pipelines::text::{
+    ClassifyTokens, EncoderHead, EncoderPipeline, Encoding, HfTokenizer, SlidingWindowChunker, Tokenizer,
+    WindowWeighting, sigmoid, token_scores_document,
+};
 use svod_dtype::default_device::set_default_device;
 use svod_dtype::{DType, DeviceSpec};
 use svod_tensor::nn::Module;
@@ -49,6 +53,10 @@ fn capacity_is_bounded_by_the_position_table(max_seq: usize) -> Result<(usize, u
 /// `segment-any-text/sat-3l-sm`, at the revision the goldens were generated
 /// from (the generate script's `--revision` default).
 const SAT_REPO: (&str, &str) = ("segment-any-text/sat-3l-sm", "137da054051ad9f1eac42025f758db4ac9f22535");
+
+/// The tokenizer SaT uses (it ships none), at the revision the goldens were
+/// generated with.
+const TOKENIZER_REPO: (&str, &str) = ("FacebookAI/xlm-roberta-base", "e73636d4f797dec63c3081bb6ed5c7b0bb3f2089");
 
 fn sat_file(name: &str) -> PathBuf {
     local_or_hub("SVOD_XLM_ROBERTA", "xlm_roberta", SAT_REPO, name)
@@ -125,4 +133,43 @@ fn sat_bf16_tracks_pytorch_bf16(golden: &str) {
     eprintln!("sat on {device:?}: flash attention {flash}");
     assert_eq!(flash, tk, "flash attention ran: {flash}, tk has it on {device:?}: {tk}");
     assert_tracks_pytorch_bf16("sat", got, &golden, "expected_logits", Some((&mask, classifier.num_labels())));
+}
+
+/// One long text through the pipeline — sliding windows with the last pulled
+/// back, the classifier, [`token_scores_document`] — against wtpsplit's
+/// `extract`, which stitches SaT's windows (`golden_sat_windows`): the windows'
+/// geometry, the logit averaging and its weighting. A token sits in up to eight
+/// windows, and some tokens share a byte span. f32 on both sides.
+#[test_case::test_case(WindowWeighting::Uniform, "expected_logits_uniform"; "uniform")]
+#[test_case::test_case(WindowWeighting::Hat, "expected_logits_hat"; "hat")]
+#[ignore = "heavy: real sat-3l-sm weights (HF Hub) + wtpsplit golden"]
+fn sat_window_scores_match_wtpsplit(weighting: WindowWeighting, key: &str) {
+    let golden = crate::state::load_safetensors(&sat_file("golden_sat_windows.safetensors")).expect("golden");
+    let text = String::from_utf8(load_golden_vec::<u8>(&golden, "text")).expect("UTF-8 text");
+    let stride = load_golden_vec::<i64>(&golden, "stride")[0] as usize;
+
+    let tokenizer_json = local_or_hub("SVOD_XLM_ROBERTA", "xlm_roberta", TOKENIZER_REPO, "tokenizer.json");
+    let mut tokenizer = HfTokenizer::from_path(tokenizer_json).expect("tokenizer");
+    let enc = tokenizer.encode(&text).expect("encode");
+    let content = enc.input_ids.iter().zip(&enc.special_tokens_mask).filter(|&(_, &special)| special == 0);
+    let ids: Vec<i64> = content.map(|(&id, _)| id.into()).collect();
+    assert_eq!(ids, load_golden_vec::<i64>(&golden, "input_ids"), "the text tokenizes as wtpsplit's does");
+
+    let opts = HeadOptions { max_batch: 8, dtype: Some(DType::Float32), ..HeadOptions::default() };
+    let classifier =
+        XlmRobertaTokenClassifier::from_files(&sat_file("config.json"), &sat_file("model.safetensors"), &opts)
+            .expect("classifier");
+    let chunker = SlidingWindowChunker::new(classifier.capacity().1, stride).with_full_last_window();
+    let mut pipeline = EncoderPipeline::new(tokenizer, chunker, classifier);
+    let chunks = pipeline.classify_tokens(&text, ()).expect("classify tokens").chunks;
+    let scores = token_scores_document(&chunks, weighting);
+
+    let spans: Vec<(usize, usize)> = scores.iter().map(|t| (t.start, t.end)).collect();
+    assert!(spans.windows(2).any(|pair| pair[0] == pair[1]), "no two tokens share a byte span");
+    let got: Vec<f32> = scores.iter().map(|t| t.probs[0]).collect();
+    let want: Vec<f32> = load_golden_vec::<f32>(&golden, key).into_iter().map(sigmoid).collect();
+    assert_eq!(got.len(), want.len(), "scored tokens");
+    let delta = max_abs_delta(&got, &want);
+    eprintln!("{} windows of {} tokens: max |Δ| {delta:.3e}", chunks.len(), ids.len());
+    assert!(delta < 1e-4, "stitched scores drifted from wtpsplit's: max |Δ| = {delta}");
 }
