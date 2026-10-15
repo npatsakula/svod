@@ -252,13 +252,15 @@ impl Tokenizer for HfTokenizer {
 
 // ─── Chunker (chunk source) ─────────────────────────────────────────────────
 
-/// One chunked slice of an [`Encoding`], plus the byte offset where it begins
-/// in the source text. `byte_offset` lets a future token-classification
-/// pipeline re-base per-token byte spans back to the original text.
+/// One chunked slice of an [`Encoding`], plus where it begins in the source:
+/// the byte offset and the token index of its first content token.
 #[derive(Clone, Debug)]
 pub struct TextChunk {
     pub encoding: Encoding,
     pub byte_offset: usize,
+    /// The index of the chunk's first content token among the source
+    /// encoding's content tokens (those between its boundary specials).
+    pub first_token: usize,
 }
 
 /// Turns an [`Encoding`] into ordered [`TextChunk`]s; [`EncoderPipeline`] is
@@ -331,7 +333,7 @@ impl Chunker for TruncatingChunker {
             offsets: enc.offsets[..take].to_vec(),
             special_tokens_mask: enc.special_tokens_mask[..take].to_vec(),
         };
-        Ok(vec![TextChunk { encoding, byte_offset: 0 }])
+        Ok(vec![TextChunk { encoding, byte_offset: 0, first_token: 0 }])
     }
 }
 
@@ -384,12 +386,15 @@ fn build_window(enc: &Encoding, lead: usize, trail: usize, content_start: usize,
 /// never skips content despite specials consuming part of the budget.
 ///
 /// The last window may be shorter than `window` when content doesn't divide
-/// evenly — the embedder pads it. Each [`TextChunk`] carries the byte offset of
-/// its first content token as `byte_offset`.
+/// evenly — the embedder pads it — unless
+/// [`with_full_last_window`](Self::with_full_last_window) pulls it back. Each
+/// [`TextChunk`] carries the byte offset and the content-token index of its
+/// first content token.
 #[derive(Debug)]
 pub struct SlidingWindowChunker {
     window: usize,
     stride: usize,
+    full_last_window: bool,
 }
 
 /// Construction / chunk error for [`SlidingWindowChunker`]. The two
@@ -414,7 +419,17 @@ impl SlidingWindowChunker {
     pub fn try_new(window: usize, stride: usize) -> Result<Self, SlidingWindowChunkerError> {
         ensure!(window >= 1, WindowTooSmallSnafu);
         ensure!((1..=window).contains(&stride), StrideOutOfRangeSnafu);
-        Ok(Self { window, stride })
+        Ok(Self { window, stride, full_last_window: false })
+    }
+
+    /// Pull the last window back so it ends at the text's end holding a full
+    /// window of content, as wtpsplit windows SaT's input: the closing tokens
+    /// keep a full window of context on their left. That window overlaps the
+    /// one before it by more than the stride does, so leave this off where each
+    /// window's result counts once, as in pooled embeddings.
+    pub fn with_full_last_window(mut self) -> Self {
+        self.full_last_window = true;
+        self
     }
 
     /// `window` = total sequence length per chunk (incl. specials);
@@ -458,9 +473,13 @@ impl Chunker for SlidingWindowChunker {
         let mut chunks = Vec::new();
         let mut start = 0;
         loop {
+            if self.full_last_window && start + content_window > content_len {
+                start = content_len.saturating_sub(content_window);
+            }
             let end = (start + content_window).min(content_len);
             let byte_offset = enc.offsets.get(lead + start).map_or(0, |o| o.0);
-            chunks.push(TextChunk { encoding: build_window(enc, lead, trail, start, end), byte_offset });
+            let encoding = build_window(enc, lead, trail, start, end);
+            chunks.push(TextChunk { encoding, byte_offset, first_token: start });
             if end >= content_len {
                 break;
             }
@@ -536,11 +555,18 @@ pub struct TokenClassification {
 /// `token_offsets` are **source-absolute** byte spans (the HF tokenizer returns
 /// source-referential offsets, preserved through chunking), so `&text[start..end]`
 /// slices a token directly — no rebase by `byte_offset` is needed. `byte_offset`
-/// is kept for chunk ordering and cross-chunk grouping (the byte offset of the
-/// chunk's first content token), consistent with the sibling result types.
+/// is kept for chunk ordering (the byte offset of the chunk's first content
+/// token), consistent with the sibling result types.
+///
+/// `first_token` places the chunk's tokens in the document: overlapping windows
+/// agree on a token's index where its byte span is ambiguous, since distinct
+/// tokens can share one (XLM-R's lone `▁` and the emoji after it, the byte
+/// tokens of one CJK character under a byte-level BPE).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChunkTokenClassification {
     pub byte_offset: usize,
+    /// [`TextChunk::first_token`] of the chunk.
+    pub first_token: usize,
     pub logits: Vec<f32>,
     pub num_labels: usize,
     pub token_offsets: Vec<(usize, usize)>,
@@ -902,6 +928,7 @@ fn attach_token(outputs: Vec<TokenClassification>, chunks: &[TextChunk]) -> Vec<
         .zip(outputs)
         .map(|(c, o)| ChunkTokenClassification {
             byte_offset: c.byte_offset,
+            first_token: c.first_token,
             token_offsets: c.encoding.offsets.clone(),
             special_tokens_mask: c.encoding.special_tokens_mask.clone(),
             logits: o.logits,
@@ -1051,7 +1078,7 @@ impl<T: Tokenizer, C: Chunker, M: ClassifyTokens> EncoderPipeline<T, C, M> {
     /// Tokenize → chunk → classify_tokens → assemble profile. With
     /// [`RunOptions::profile`] set, the profile leads with the tokenize and chunk
     /// stages, then the encoder's. Decode spans with [`labels_for_tokens`] /
-    /// [`group_spans`].
+    /// [`group_spans`], or sigmoid scores with [`token_scores_document`].
     pub fn classify_tokens(
         &mut self,
         text: &str,
@@ -1137,15 +1164,16 @@ pub enum Scheme {
 /// name (borrowing from the caller's label table), its source-absolute byte
 /// span, and its confidence `score` (the softmax probability of the argmax
 /// label). Produced by [`labels_for_tokens`]; consumed by [`group_spans`].
-/// Special tokens are already filtered out, so `token_index` runs contiguously
-/// over the chunk's content tokens.
+/// Special tokens are already filtered out.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TokenLabel<'a> {
     pub label_id: u32,
     pub label: &'a str,
     pub start: usize,
     pub end: usize,
-    /// Index within the content-token vec (contiguous from 0).
+    /// The token's index among its source text's content tokens (the chunk's
+    /// [`first_token`](ChunkTokenClassification::first_token) plus its place in
+    /// the chunk): every window holding the token gives it the same index.
     pub token_index: usize,
     /// Softmax probability of the argmax label — the per-token confidence.
     pub score: f32,
@@ -1153,12 +1181,12 @@ pub struct TokenLabel<'a> {
 
 /// One decoded span: a contiguous run of same-type tokens (NER under a prefix
 /// scheme) or a single token (POS / `Scheme::Flat`). `start`/`end` are
-/// source-absolute byte offsets; `token_range` indexes the content-token vec;
-/// `score` is the **minimum** member-token confidence (the conservative
-/// aggregate for thresholding — a span survives a `score >= t` filter only when
-/// every constituent token does). Owned (the `label` is detached from the
-/// caller's label table via [`TokenLabel`]'s `&str` → `String` promotion inside
-/// [`group_spans`]).
+/// source-absolute byte offsets; `token_range` spans the member tokens'
+/// [`TokenLabel::token_index`]es; `score` is the **minimum** member-token
+/// confidence (the conservative aggregate for thresholding — a span survives a
+/// `score >= t` filter only when every constituent token does). Owned (the
+/// `label` is detached from the caller's label table via [`TokenLabel`]'s
+/// `&str` → `String` promotion inside [`group_spans`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entity {
     pub label: String,
@@ -1179,14 +1207,16 @@ pub struct Entity {
 /// skipped. The `score` is the softmax probability of the argmax label (max of
 /// [`softmax`] over the row), computed in f32. This is the per-token view (POS /
 /// chunking / [`Scheme::Flat`]); follow with [`group_spans`] to reconstruct
-/// entity spans under a prefix scheme.
+/// entity spans under a prefix scheme. A head that scores each label on its
+/// own — one label, or several that may hold at once — decodes with
+/// [`token_scores_document`] instead: the softmax of one logit is always 1.
 pub fn labels_for_tokens<'a, F>(chunk: &ChunkTokenClassification, id2label: F) -> Vec<TokenLabel<'a>>
 where
     F: Fn(u32) -> &'a str,
 {
     let nl = chunk.num_labels.max(1);
+    let (lead, _) = boundary_specials(&chunk.special_tokens_mask);
     let mut out = Vec::new();
-    let mut content_idx = 0;
     for (t, (row, special)) in chunk.logits.chunks_exact(nl).zip(&chunk.special_tokens_mask).enumerate() {
         if *special != 0 {
             continue;
@@ -1199,8 +1229,9 @@ where
         let score = (row[id] - max).exp() / sum;
         let label_id = id as u32;
         let (start, end) = chunk.token_offsets.get(t).copied().unwrap_or((0, 0));
-        out.push(TokenLabel { label_id, label: id2label(label_id), start, end, token_index: content_idx, score });
-        content_idx += 1;
+        // The leading specials are skipped above, so `t >= lead`.
+        let token_index = chunk.first_token + t - lead;
+        out.push(TokenLabel { label_id, label: id2label(label_id), start, end, token_index, score });
     }
     out
 }
@@ -1211,92 +1242,64 @@ where
 /// opener), extending on matching `I`, and closing on `O` / a type change / an
 /// explicit `L`/`E` closer. `Scheme::Flat` emits one entity per token. Broken
 /// transitions never panic: a stray `I-` opens a fresh span (HF's lenient
-/// `group_entities` convention).
+/// `group_entities` convention). A span's `token_range` ends past its last
+/// member.
 pub fn group_spans(tokens: &[TokenLabel<'_>], scheme: Scheme) -> Vec<Entity> {
+    let single = |t: &TokenLabel<'_>, label: String| Entity {
+        label,
+        label_id: t.label_id,
+        start: t.start,
+        end: t.end,
+        token_range: t.token_index..t.token_index + 1,
+        score: t.score,
+    };
     if matches!(scheme, Scheme::Flat) {
-        return tokens
-            .iter()
-            .map(|t| Entity {
-                label: t.label.to_string(),
-                label_id: t.label_id,
-                start: t.start,
-                end: t.end,
-                token_range: t.token_index..t.token_index + 1,
-                score: t.score,
-            })
-            .collect();
+        return tokens.iter().map(|t| single(t, t.label.to_string())).collect();
     }
 
-    let mut entities: Vec<Entity> = Vec::new();
-    // Open span: (type, label_id, start_byte, end_byte, start_token_index, min_score)
-    let mut open: Option<(String, u32, usize, usize, usize, f32)> = None;
-
+    let mut entities = Vec::new();
+    let mut open: Option<Entity> = None;
     for t in tokens {
         let (prefix, typ) = parse_tag(t.label, scheme);
         let typ = typ.unwrap_or_else(|| t.label.to_string());
+        let continues = open.as_ref().is_some_and(|e| e.label == typ);
         match prefix {
-            Prefix::O => {
-                close_span(&mut open, &mut entities, t.token_index);
+            Prefix::O => entities.extend(open.take()),
+            Prefix::B => {
+                entities.extend(open.take());
+                open = Some(single(t, typ));
             }
-            Prefix::B | Prefix::U | Prefix::S => {
-                close_span(&mut open, &mut entities, t.token_index);
-                if matches!(prefix, Prefix::U | Prefix::S) {
-                    entities.push(Entity {
-                        label: typ,
-                        label_id: t.label_id,
-                        start: t.start,
-                        end: t.end,
-                        token_range: t.token_index..t.token_index + 1,
-                        score: t.score,
-                    });
-                } else {
-                    open = Some((typ, t.label_id, t.start, t.end, t.token_index, t.score));
-                }
+            Prefix::U | Prefix::S => {
+                entities.extend(open.take());
+                entities.push(single(t, typ));
             }
+            Prefix::I if continues => extend_span(open.as_mut().expect("a continued span is open"), t),
+            // Stray I- (no matching open span): lenient — open a fresh span.
             Prefix::I => {
-                if let Some((ot, _, _, oe, _, ms)) = open.as_mut()
-                    && *ot == typ
-                {
-                    *oe = t.end;
-                    *ms = (*ms).min(t.score);
-                    continue;
-                }
-                // Stray I- (no matching open span): lenient — open a fresh span.
-                close_span(&mut open, &mut entities, t.token_index);
-                open = Some((typ, t.label_id, t.start, t.end, t.token_index, t.score));
+                entities.extend(open.take());
+                open = Some(single(t, typ));
             }
+            Prefix::L | Prefix::E if continues => {
+                let mut span = open.take().expect("a continued span is open");
+                extend_span(&mut span, t);
+                entities.push(span);
+            }
+            // Stray L-/E-: emit a single-token span.
             Prefix::L | Prefix::E => {
-                let matches_open = open.as_ref().is_some_and(|(ot, _, _, _, _, _)| *ot == typ);
-                if matches_open {
-                    let (_, lid, start, _, start_token, min_so_far) = open.take().unwrap();
-                    entities.push(Entity {
-                        label: typ,
-                        label_id: lid,
-                        start,
-                        end: t.end,
-                        token_range: start_token..t.token_index + 1,
-                        score: min_so_far.min(t.score),
-                    });
-                    continue;
-                }
-                // Stray L-/E-: emit a single-token span.
-                close_span(&mut open, &mut entities, t.token_index);
-                entities.push(Entity {
-                    label: typ,
-                    label_id: t.label_id,
-                    start: t.start,
-                    end: t.end,
-                    token_range: t.token_index..t.token_index + 1,
-                    score: t.score,
-                });
+                entities.extend(open.take());
+                entities.push(single(t, typ));
             }
         }
     }
-    // Flush any span open at end-of-sequence. Its end-token index is the count
-    // of content tokens (range exclusive end).
-    close_span(&mut open, &mut entities, tokens.len());
-
+    entities.extend(open);
     entities
+}
+
+/// Add `t` to the end of an open span.
+fn extend_span(span: &mut Entity, t: &TokenLabel<'_>) {
+    span.end = t.end;
+    span.token_range.end = t.token_index + 1;
+    span.score = span.score.min(t.score);
 }
 
 /// Document-level span grouping for multi-chunk (e.g. sliding-window) token
@@ -1305,9 +1308,10 @@ pub fn group_spans(tokens: &[TokenLabel<'_>], scheme: Scheme) -> Vec<Entity> {
 /// Overlapping windows predict the same source tokens more than once, and an
 /// entity straddling a window boundary is split across chunks. This collapses
 /// the overlap: every per-chunk [`TokenLabel`] is flattened into one stream,
-/// deduplicated by byte span (the highest-confidence prediction wins a
-/// disagreement), re-indexed contiguously, and re-grouped under `scheme` — so
-/// the split halves of a boundary entity merge into one [`Entity`].
+/// deduplicated by [`token_index`](TokenLabel::token_index) (the
+/// highest-confidence prediction wins a disagreement), and re-grouped under
+/// `scheme` — so the split halves of a boundary entity merge into one
+/// [`Entity`].
 ///
 /// `per_chunk` is one `Vec<TokenLabel>` per chunk (each produced by
 /// [`labels_for_tokens`]); the returned [`Entity`] spans carry source-absolute
@@ -1316,23 +1320,136 @@ pub fn group_spans(tokens: &[TokenLabel<'_>], scheme: Scheme) -> Vec<Entity> {
 /// `SlidingWindowChunker` with `stride == window`) this is equivalent to
 /// concatenating the chunks; it matters only when windows overlap.
 pub fn group_spans_document<'a>(per_chunk: &[Vec<TokenLabel<'a>>], scheme: Scheme) -> Vec<Entity> {
-    // Flatten, then sort by (start, end, score desc) so dedup_by keeps the
-    // highest-confidence prediction for each byte span.
+    // Sort by (token, score desc) so dedup keeps the highest-confidence
+    // prediction for each token.
     let mut all: Vec<TokenLabel<'a>> = per_chunk.iter().flatten().copied().collect();
     all.sort_by(|a, b| {
-        a.start
-            .cmp(&b.start)
-            .then(a.end.cmp(&b.end))
-            .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+        a.token_index.cmp(&b.token_index).then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
     });
-    all.dedup_by(|a, b| a.start == b.start && a.end == b.end);
+    all.dedup_by_key(|t| t.token_index);
+    group_spans(&all, scheme)
+}
 
-    // Re-index contiguously: group_spans reads token_index for token_range.
-    for (i, t) in all.iter_mut().enumerate() {
-        t.token_index = i;
+// ─── Sigmoid scores (independent labels) ────────────────────────────────────
+
+/// How [`token_scores_document`] weighs the logits a token gets from each
+/// window holding it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowWeighting {
+    /// Every window counts the same (wtpsplit's default).
+    Uniform,
+    /// A triangle peaking mid-window (wtpsplit's `hat`): `1 - |x|`, with `x`
+    /// spaced evenly over `±(1 - 1/n)` across a window's `n` content tokens. A
+    /// token near a window's edge, with context on one side only, counts less.
+    Hat,
+}
+
+impl WindowWeighting {
+    /// The weight of the `k`-th of a window's `n` content tokens.
+    fn weight(self, k: usize, n: usize) -> f32 {
+        match self {
+            Self::Hat if n > 1 => {
+                let half = 1.0 - 1.0 / n as f32;
+                1.0 - (2.0 * half * k as f32 / (n - 1) as f32 - half).abs()
+            }
+            _ => 1.0,
+        }
+    }
+}
+
+/// One content token's sigmoid scores, merged across the windows holding it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TokenScore<'a> {
+    /// The token's index among its source text's content tokens.
+    pub token_index: usize,
+    /// Source-absolute byte span.
+    pub start: usize,
+    pub end: usize,
+    /// One probability per label.
+    pub probs: &'a [f32],
+}
+
+/// Per-token sigmoid scores over a text, one row per content token any window
+/// held, in token order. Produced by [`token_scores_document`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TokenScores {
+    num_labels: usize,
+    tokens: Vec<(usize, (usize, usize))>,
+    probs: Vec<f32>,
+}
+
+impl TokenScores {
+    /// Probabilities per token.
+    pub fn num_labels(&self) -> usize {
+        self.num_labels
     }
 
-    group_spans(&all, scheme)
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = TokenScore<'_>> {
+        self.tokens
+            .iter()
+            .zip(self.probs.chunks_exact(self.num_labels.max(1)))
+            .map(|(&(token_index, (start, end)), probs)| TokenScore { token_index, start, end, probs })
+    }
+}
+
+/// Score every label of every content token with a sigmoid, for heads whose
+/// labels hold independently: one label (SaT's sentence boundaries), or
+/// several that may hold at once. Special tokens are skipped.
+///
+/// Where windows overlap, a token's logits are averaged over the windows
+/// holding it — weighted by `weighting` — before the sigmoid, as wtpsplit
+/// stitches SaT's windows (the mean of the sigmoids is a different number).
+/// Windows meet on [`TokenScore::token_index`], not byte spans. Over one chunk,
+/// or windows that do not overlap, every weighting gives each token the
+/// sigmoid of its own logits. `chunks` hold one text's windows, all with the
+/// same `num_labels`.
+pub fn token_scores_document(chunks: &[ChunkTokenClassification], weighting: WindowWeighting) -> TokenScores {
+    let Some(num_labels) = chunks.first().map(|c| c.num_labels).filter(|&nl| nl > 0) else {
+        return TokenScores::default();
+    };
+    let content = |c: &ChunkTokenClassification| {
+        let (lead, trail) = boundary_specials(&c.special_tokens_mask);
+        (lead, c.special_tokens_mask.len().saturating_sub(lead + trail))
+    };
+    let lo = chunks.iter().map(|c| c.first_token).min().unwrap_or(0);
+    let hi = chunks.iter().map(|c| c.first_token + content(c).1).max().unwrap_or(0);
+
+    // Per source token: Σ w·logit per label, Σ w, and the byte span.
+    let mut sums = vec![0.0f32; (hi - lo) * num_labels];
+    let mut weights = vec![0.0f32; hi - lo];
+    let mut spans = vec![(0, 0); hi - lo];
+    for chunk in chunks {
+        assert_eq!(chunk.num_labels, num_labels, "every window of a text scores the same labels");
+        let (lead, n) = content(chunk);
+        let rows = chunk.logits.chunks_exact(num_labels).zip(&chunk.special_tokens_mask).zip(&chunk.token_offsets);
+        for (t, ((row, &special), &span)) in rows.enumerate() {
+            if special != 0 {
+                continue;
+            }
+            let k = t - lead;
+            let (w, i) = (weighting.weight(k, n), chunk.first_token + k - lo);
+            for (sum, &logit) in sums[i * num_labels..][..num_labels].iter_mut().zip(row) {
+                *sum += w * logit;
+            }
+            weights[i] += w;
+            spans[i] = span;
+        }
+    }
+
+    let mut scores = TokenScores { num_labels, ..TokenScores::default() };
+    for (i, &w) in weights.iter().enumerate().filter(|&(_, &w)| w > 0.0) {
+        scores.tokens.push((lo + i, spans[i]));
+        scores.probs.extend(sums[i * num_labels..][..num_labels].iter().map(|&sum| sigmoid(sum / w)));
+    }
+    scores
 }
 
 /// Tag prefix decoded by [`parse_tag`].
@@ -1369,13 +1486,6 @@ fn parse_tag(label: &str, scheme: Scheme) -> (Prefix, Option<String>) {
     (prefix, t)
 }
 
-/// Flush an open span (if any) into `out` spanning `[start_token .. end_token)`.
-fn close_span(open: &mut Option<(String, u32, usize, usize, usize, f32)>, out: &mut Vec<Entity>, end_token: usize) {
-    if let Some((typ, lid, start, end, start_token, score)) = open.take() {
-        out.push(Entity { label: typ, label_id: lid, start, end, token_range: start_token..end_token, score });
-    }
-}
-
 /// Index of the maximum element, or `0` for an empty or all-NaN slice. NaN
 /// entries are skipped, so a NaN neither wins nor hides a larger value after it.
 pub fn argmax(row: &[f32]) -> usize {
@@ -1390,4 +1500,10 @@ pub fn softmax(logits: &[f32]) -> Vec<f32> {
     let exp: Vec<f32> = logits.iter().map(|x| (x - max).exp()).collect();
     let sum: f32 = exp.iter().sum();
     exp.iter().map(|x| x / sum).collect()
+}
+
+/// The logistic sigmoid, `1 / (1 + e^-x)`: a label's probability from its own
+/// logit, for heads whose labels hold independently.
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
 }

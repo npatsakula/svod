@@ -9,8 +9,9 @@ use crate::pipelines::text::HfTokenizer;
 use crate::pipelines::text::{
     ChunkTokenClassification, Chunker, Classification, Classify, ClassifyTokens, Embed, Embedding, EncoderHead,
     EncoderPipeline, EncoderPipelineError, Encoding, RunOptions, RunProfile, Scheme, SlidingWindowChunker,
-    SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, Tokenizer, TruncatingChunker,
-    TruncatingChunkerError, argmax, group_spans, group_spans_document, labels_for_tokens, softmax,
+    SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, TokenScores, Tokenizer, TruncatingChunker,
+    TruncatingChunkerError, WindowWeighting, argmax, group_spans, group_spans_document, labels_for_tokens, sigmoid,
+    softmax, token_scores_document,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -312,6 +313,9 @@ fn sliding_windows_long_input_with_overlap_and_correct_offsets() {
     assert_eq!(out[2].byte_offset, 4);
     assert_eq!(out[2].encoding.input_ids, vec![2, 14, 15, 16, 3]);
     assert_field_lengths(&out[2].encoding, 5);
+
+    // Each window's first content token, counted over the text's content.
+    assert_eq!(out.iter().map(|c| c.first_token).collect::<Vec<_>>(), [0, 2, 4]);
 }
 
 #[test]
@@ -325,6 +329,20 @@ fn sliding_last_window_clamped_when_content_uneven() {
     assert_eq!(out[1].encoding.input_ids, vec![2, 30, 40, 3]);
     assert_eq!(out[2].encoding.input_ids, vec![2, 50, 3]);
     assert_eq!(out[2].byte_offset, 4);
+}
+
+/// Pulled back, the last window ends at the text's end holding a full window
+/// of content, and its first token and byte offset move with it. A text
+/// shorter than one window stays one window. Each row is `(first_token,
+/// byte_offset, content tokens)` per window.
+#[test_case(6, 5, 2 => vec![(0, 0, 3), (2, 2, 3), (3, 3, 3)]; "the last window steps back")]
+#[test_case(5, 4, 4 => vec![(0, 0, 2), (2, 2, 2), (3, 3, 2)]; "adjacent windows overlap at the end")]
+#[test_case(2, 5, 2 => vec![(0, 0, 2)]; "shorter than a window")]
+fn sliding_full_last_window_ends_full(content: u32, window: usize, stride: usize) -> Vec<(usize, usize, usize)> {
+    let ids: Vec<u32> = (10..10 + content).collect();
+    let mut chunker = SlidingWindowChunker::new(window, stride).with_full_last_window();
+    let chunks = chunker.chunk(&enc_with_specials(&ids)).unwrap();
+    chunks.iter().map(|c| (c.first_token, c.byte_offset, c.encoding.len() - 2)).collect()
 }
 
 #[test]
@@ -698,6 +716,7 @@ fn classify_tokens_sliding_pipeline_produces_per_window_classifications() {
     assert_eq!(out.chunks[2].byte_offset, 4);
     assert_eq!(out.chunks[2].logits, vec![50.0, 60.0]);
     assert_eq!(out.chunks[2].token_offsets, vec![(4, 5), (5, 6)]);
+    assert_eq!(out.chunks.iter().map(|c| c.first_token).collect::<Vec<_>>(), [0, 2, 4]);
     assert_eq!(stage_names(out.profile), ["tokenize", "chunk", "classify_tokens"]);
 }
 
@@ -728,7 +747,7 @@ fn shared_chunks() -> Vec<TextChunk> {
 
 /// Build one [`TextChunk`] directly from ids (offsets count up, no specials).
 fn text_chunk(ids: &[u32], byte_offset: usize) -> TextChunk {
-    TextChunk { encoding: enc(ids), byte_offset }
+    TextChunk { encoding: enc(ids), byte_offset, first_token: 0 }
 }
 
 /// A pipeline driven only through its chunk seam; its tokenizer and chunker
@@ -803,7 +822,7 @@ fn classify_chunks_batch_preserves_grouping() {
 fn classify_tokens_chunks_threads_per_token_geometry() {
     // Per-token byte offsets and the special-token mask come from the chunk,
     // the logit grid and num_labels from the head.
-    let chunks = vec![TextChunk { encoding: enc_with_specials(&[4, 5]), byte_offset: 0 }];
+    let chunks = vec![TextChunk { encoding: enc_with_specials(&[4, 5]), byte_offset: 0, first_token: 0 }];
     let mut p = seam(StubRecognize { num_labels: 2, max_batch: 1 });
     let out = p.classify_tokens_chunks(&chunks, ()).unwrap();
     assert_eq!(out.chunks.len(), 1);
@@ -906,6 +925,7 @@ fn token_chunk(spec: &[(u32, (usize, usize), bool)], num_labels: usize) -> Chunk
     }
     ChunkTokenClassification {
         byte_offset: 0,
+        first_token: 0,
         logits,
         num_labels,
         token_offsets: offsets,
@@ -944,6 +964,16 @@ fn labels_for_tokens_argmaxes_skips_specials_and_pairs_offsets() {
         TokenLabel { label_id, label: ner_id2label(label_id), start, end, token_index, score }
     };
     assert_eq!(labels, [expect(1, 0, 3, 0), expect(2, 3, 7, 1), expect(0, 7, 8, 2), expect(1, 8, 12, 3)]);
+}
+
+/// Token indices count the text's content tokens from the chunk's first; an
+/// interior special keeps its place, though it decodes to nothing.
+#[test]
+fn labels_for_tokens_index_from_the_chunk_start() {
+    let spec = [(0, (0, 0), true), (1, (5, 6), false), (0, (6, 6), true), (2, (7, 8), false), (0, (8, 8), true)];
+    let chunk = ChunkTokenClassification { first_token: 5, ..token_chunk(&spec, 5) };
+    let indices: Vec<usize> = labels_for_tokens(&chunk, ner_id2label).iter().map(|t| t.token_index).collect();
+    assert_eq!(indices, [5, 7]);
 }
 
 #[test]
@@ -1062,6 +1092,15 @@ fn group_spans_bilou_mismatched_closer_flushes_then_single() {
     assert_eq!(spans[1].score, 0.5);
 }
 
+/// A span's range follows its members' token indices — a chunk from the middle
+/// of a text keeps the text's numbering.
+#[test]
+fn group_spans_ranges_follow_token_indices() {
+    let spans = group_spans(&[tl("B-PER", 10, 13, 7, 1.0), tl("I-PER", 13, 16, 8, 1.0)], Scheme::Bio);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].token_range, 7..9);
+}
+
 #[test_case("NOUN", Scheme::Bio; "bare label")]
 #[test_case("L-PER", Scheme::Bio; "L outside BILOU")]
 #[test_case("U-PER", Scheme::Iobes; "U outside BILOU")]
@@ -1078,17 +1117,16 @@ fn group_spans_unrecognized_tag_opens_a_span_per_token(label: &str, scheme: Sche
 
 #[test]
 fn group_spans_document_merges_overlap_and_boundary_split() {
-    // Windows A and B overlap on two tokens (bytes 3..10). Flattened, B's copy
-    // of the overlap follows A's last token, so only sorting pairs the
-    // duplicates up. On 7..10 they disagree: B's confident I-PER must beat A's
-    // O, or the entity splits. B's trailing O closes the span at its re-indexed
-    // position.
+    // Windows A and B overlap on two tokens (1 and 2). Flattened, B's copy of
+    // the overlap follows A's last token, so only sorting pairs the duplicates
+    // up. On token 2 they disagree: B's confident I-PER must beat A's O, or the
+    // entity splits. B's trailing O closes the span.
     let window_a = vec![tl("B-PER", 0, 3, 0, 0.9), tl("I-PER", 3, 7, 1, 0.8), tl("O", 7, 10, 2, 0.4)];
     let window_b = vec![
-        tl("I-PER", 3, 7, 0, 0.6),
-        tl("I-PER", 7, 10, 1, 0.85),
-        tl("I-PER", 10, 14, 2, 0.75),
-        tl("O", 14, 15, 3, 1.0),
+        tl("I-PER", 3, 7, 1, 0.6),
+        tl("I-PER", 7, 10, 2, 0.85),
+        tl("I-PER", 10, 14, 3, 0.75),
+        tl("O", 14, 15, 4, 1.0),
     ];
     let spans = group_spans_document(&[window_a, window_b], Scheme::Bio);
     assert_eq!(spans.len(), 1);
@@ -1103,7 +1141,7 @@ fn group_spans_document_non_overlapping_equivalent_to_concat() {
     // Adjacent (non-overlapping) chunks: document grouping == concatenation,
     // with token ranges counted across the whole document.
     let chunk0 = vec![tl("B-PER", 0, 3, 0, 1.0), tl("I-PER", 3, 6, 1, 1.0)];
-    let chunk1 = vec![tl("O", 6, 7, 0, 1.0), tl("B-LOC", 7, 10, 1, 1.0)];
+    let chunk1 = vec![tl("O", 6, 7, 2, 1.0), tl("B-LOC", 7, 10, 3, 1.0)];
     let spans = group_spans_document(&[chunk0, chunk1], Scheme::Bio);
     assert_eq!(spans.len(), 2);
     assert_eq!(spans[0].label, "PER");
@@ -1112,6 +1150,102 @@ fn group_spans_document_non_overlapping_equivalent_to_concat() {
     assert_eq!(spans[1].label, "LOC");
     assert_eq!((spans[1].start, spans[1].end), (7, 10));
     assert_eq!(spans[1].token_range, 3..4);
+}
+
+/// Distinct tokens sharing a byte span (a lone `▁` and the emoji after it)
+/// both survive the merge: windows meet on token indices.
+#[test]
+fn group_spans_document_keeps_tokens_that_share_a_span() {
+    let window_a = vec![tl("B-PER", 0, 4, 0, 0.9), tl("I-PER", 0, 4, 1, 0.8)];
+    let window_b = vec![tl("I-PER", 0, 4, 1, 0.7), tl("O", 5, 6, 2, 1.0)];
+    let spans = group_spans_document(&[window_a, window_b], Scheme::Bio);
+    let got: Vec<_> = spans.iter().map(|e| (e.token_range.clone(), e.score)).collect();
+    assert_eq!(got, [(0..2, 0.8)]);
+}
+
+// ─── token_scores_document (sigmoid scores) ─────────────────────────────────
+
+/// A window of `rows` content-token logits from token `first_token` on,
+/// between a leading and a trailing special that score high (and must be
+/// skipped). Token `i` spans bytes `(i, i + 1)`.
+fn scored_chunk(first_token: usize, rows: &[&[f32]]) -> ChunkTokenClassification {
+    let num_labels = rows[0].len();
+    let special_row = vec![9.0; num_labels];
+    let logits = [&special_row[..]].into_iter().chain(rows.iter().copied()).chain([&special_row[..]]).flatten();
+    let content = (first_token..first_token + rows.len()).map(|i| (i, i + 1));
+    let mut special_tokens_mask = vec![0; rows.len() + 2];
+    (special_tokens_mask[0], special_tokens_mask[rows.len() + 1]) = (1, 1);
+    ChunkTokenClassification {
+        byte_offset: first_token,
+        first_token,
+        logits: logits.copied().collect(),
+        num_labels,
+        token_offsets: [(0, 0)].into_iter().chain(content).chain([(0, 0)]).collect(),
+        special_tokens_mask,
+    }
+}
+
+/// `(token_index, span, probs)` per scored token.
+fn score_rows(scores: &TokenScores) -> Vec<(usize, (usize, usize), Vec<f32>)> {
+    scores.iter().map(|t| (t.token_index, (t.start, t.end), t.probs.to_vec())).collect()
+}
+
+#[test]
+fn token_scores_take_a_sigmoid_per_content_token() {
+    let scores = token_scores_document(&[scored_chunk(0, &[&[2.0], &[-1.0]])], WindowWeighting::Uniform);
+    assert_eq!(scores.num_labels(), 1);
+    assert_eq!(score_rows(&scores), [(0, (0, 1), vec![sigmoid(2.0)]), (1, (1, 2), vec![sigmoid(-1.0)])]);
+}
+
+/// Labels score independently: two labels may both be likely.
+#[test]
+fn token_scores_score_each_label_on_its_own() {
+    let scores = token_scores_document(&[scored_chunk(0, &[&[1.0, 1.0]])], WindowWeighting::Uniform);
+    assert_eq!(score_rows(&scores), [(0, (0, 1), vec![sigmoid(1.0); 2])]);
+}
+
+/// Overlapping windows average a token's logits, then take the sigmoid: token
+/// 1 gets sigmoid((2 - 4) / 2), not the mean of sigmoid(2) and sigmoid(-4).
+/// A token one window holds keeps its own logit.
+#[test]
+fn token_scores_average_logits_across_windows() {
+    let windows = [scored_chunk(0, &[&[0.5], &[2.0]]), scored_chunk(1, &[&[-4.0], &[1.5]])];
+    let scores = token_scores_document(&windows, WindowWeighting::Uniform);
+    let want = [(0, (0, 1), vec![sigmoid(0.5)]), (1, (1, 2), vec![sigmoid(-1.0)]), (2, (2, 3), vec![sigmoid(1.5)])];
+    assert_eq!(score_rows(&scores), want);
+}
+
+/// Under `Hat`, token 1 sits mid-window in the first window (weight 1) and at
+/// the edge of the second (weight 1/3 of three): the mean leans to the first
+/// window's logit, (2·1 - 2·⅓) / (1 + ⅓) = 1.
+#[test_case(WindowWeighting::Uniform => 0.0; "uniform")]
+#[test_case(WindowWeighting::Hat => 1.0; "hat")]
+fn token_scores_weigh_window_edges(weighting: WindowWeighting) -> f32 {
+    let windows = [scored_chunk(0, &[&[0.0], &[2.0], &[0.0]]), scored_chunk(1, &[&[-2.0], &[0.0], &[0.0]])];
+    let p = token_scores_document(&windows, weighting).iter().nth(1).expect("token 1").probs[0];
+    // Back to the averaged logit, rounded past the f32 noise of the weights.
+    ((p / (1.0 - p)).ln() * 1e4).round() / 1e4
+}
+
+/// Distinct tokens sharing a byte span stay distinct rows.
+#[test]
+fn token_scores_keep_tokens_that_share_a_span() {
+    let (mut a, mut b) = (scored_chunk(0, &[&[1.0], &[2.0]]), scored_chunk(1, &[&[2.0], &[3.0]]));
+    (a.token_offsets[1], a.token_offsets[2], b.token_offsets[1]) = ((0, 4), (0, 4), (0, 4));
+    let rows = score_rows(&token_scores_document(&[a, b], WindowWeighting::Uniform));
+    let want = [(0, (0, 4), vec![sigmoid(1.0)]), (1, (0, 4), vec![sigmoid(2.0)]), (2, (2, 3), vec![sigmoid(3.0)])];
+    assert_eq!(rows, want);
+}
+
+#[test]
+fn token_scores_of_no_windows_are_empty() {
+    assert!(token_scores_document(&[], WindowWeighting::Hat).is_empty());
+}
+
+#[test]
+#[should_panic(expected = "every window of a text scores the same labels")]
+fn token_scores_refuse_windows_with_different_labels() {
+    token_scores_document(&[scored_chunk(0, &[&[1.0]]), scored_chunk(1, &[&[1.0, 2.0]])], WindowWeighting::Uniform);
 }
 
 proptest! {
