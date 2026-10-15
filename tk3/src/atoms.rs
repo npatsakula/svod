@@ -57,6 +57,8 @@ pub struct Occupancy {
     pub file: u32,
     /// Waves a SIMD schedules at most.
     pub waves: u32,
+    /// Registers one lane may hold; past it a kernel spills.
+    pub registers: u32,
 }
 
 /// What a target offers the lowering.
@@ -204,13 +206,13 @@ impl Target {
             // sm_120, 64 elsewhere.
             GpuArch::Cuda(c) => {
                 let waves = if (c.major == 8 && c.minor >= 6) || c.major == 12 { 12 } else { 16 };
-                Occupancy { simds: 4, file: 512, waves }
+                Occupancy { simds: 4, file: 512, waves, registers: 255 }
             }
             // CDNA: four SIMD16s, 512 architectural registers (and as many accumulators) per lane.
-            GpuArch::Amd(a) if a.is_cdna() => Occupancy { simds: 4, file: 512, waves: 8 },
+            GpuArch::Amd(a) if a.is_cdna() => Occupancy { simds: 4, file: 512, waves: 8, registers: 512 },
             // RDNA: two SIMD32s with 192 KB of registers each.
-            GpuArch::Amd(_) => Occupancy { simds: 2, file: 1536, waves: 16 },
-            GpuArch::Metal(_) => Occupancy { simds: 4, file: 1024, waves: 8 },
+            GpuArch::Amd(_) => Occupancy { simds: 2, file: 1536, waves: 16, registers: 256 },
+            GpuArch::Metal(_) => Occupancy { simds: 4, file: 1024, waves: 8, registers: 128 },
         };
         Self {
             arch,

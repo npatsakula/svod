@@ -81,6 +81,18 @@ impl GemmCfg {
         };
         Some(acc + operands + fill)
     }
+
+    /// The registers a lane holds at once however the lowering streams its
+    /// fragments: the f32 accumulators and one matrix-core depth of operand
+    /// fragments, a floor of [`Self::registers`]. Past the lane's limit the
+    /// kernel cannot compile without spilling.
+    pub fn live_registers(&self, target: &Target, halves: usize) -> Option<u32> {
+        let atom = target.mma.first()?;
+        let ([bm, bn, _], [wr, wc]) = (self.tile, self.warps);
+        let issue = atom.issue(Orient::Direct, WarpGrid { rows: wr, cols: wc }, bm, bn, atom.k as usize).ok()?;
+        let halves = halves as u32;
+        Some(issue.c.regs() * halves + (issue.a.regs() + issue.b.regs() * halves).div_ceil(2))
+    }
 }
 
 pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], unroll: bool) -> GemmCfg {
@@ -154,9 +166,12 @@ impl Problem {
     }
 
     /// What `cfg` costs on the planner's device ([`Planner::pipelined`] ns of
-    /// SM time) and a lane's registers by the layout count, which admits
-    /// nothing ([`shortlist`]); `None` when it does not lower. A trip pays its
-    /// fragment reads, fill, matrix-core steps (padding included) and overhead.
+    /// SM time) and a lane's registers by the layout count, which over-counts
+    /// what the lowering streams (the compiled kernel judges, [`shortlist`]);
+    /// `None` when it does not lower, or when its [live
+    /// registers](GemmCfg::live_registers) alone pass the lane's limit. A trip
+    /// pays its fragment reads, fill, matrix-core steps (padding included)
+    /// and overhead.
     pub(crate) fn admit(&self, planner: &Planner, cfg: &GemmCfg) -> Option<(f64, u32)> {
         let Device { target, costs } = &planner.device;
         let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
@@ -170,6 +185,9 @@ impl Problem {
             return None;
         }
         let regs = cfg.registers(target, self.halves)?;
+        if cfg.live_registers(target, self.halves)? > target.occupancy.registers {
+            return None;
+        }
         let (halves, waves) = (self.halves, wr * wc);
         let fragments = waves * (bm / wr + bn * halves / wc) * bk * 2;
         let fill = (bm + bn * halves) * bk * 2;
