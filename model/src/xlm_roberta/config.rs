@@ -6,12 +6,14 @@
 //! adds a caller-chosen compute [`DType`] (defaults to [`crate::default_compute_dtype`];
 //! f32 for CPU parity tests).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
 use svod_dtype::DType;
 
 use super::error::{Error, Result};
+use crate::encoder_head::dense_id2label;
 
 /// Clean, resolved XLM-RoBERTa config.
 #[derive(Clone, Debug)]
@@ -27,6 +29,11 @@ pub struct XlmRobertaConfig {
     /// XLM-RoBERTa padding index (= `pad_token_id`). Position IDs are offset
     /// by this value: real tokens start at `padding_idx + 1`.
     pub pad_token_id: usize,
+    /// Labels of a classification head: `len(id2label)` unless `config.json`
+    /// sets it.
+    pub num_labels: usize,
+    /// Label names, dense by id (`config.json`'s `id2label`).
+    pub id2label: Vec<String>,
     /// Caller-chosen compute dtype (bf16 by default; f32 for CPU parity).
     pub dtype: DType,
     /// Upper bound on the symbolic batch variable in the JIT wrapper.
@@ -36,6 +43,13 @@ pub struct XlmRobertaConfig {
 impl XlmRobertaConfig {
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
+    }
+
+    /// The longest sequence the position table holds: positions start at
+    /// `pad_token_id + 1`, so a table of `max_position_embeddings` rows numbers
+    /// `max_position_embeddings - pad_token_id - 1` tokens (514 rows: 512).
+    pub fn max_sequence_length(&self) -> usize {
+        self.max_position_embeddings.saturating_sub(self.pad_token_id + 1)
     }
 
     /// Splice in the structural fields parsed from the published `config.json`,
@@ -51,11 +65,14 @@ impl XlmRobertaConfig {
         self.type_vocab_size = parsed.type_vocab_size;
         self.layer_norm_eps = parsed.layer_norm_eps;
         self.pad_token_id = parsed.pad_token_id;
+        self.num_labels = parsed.num_labels;
+        self.id2label = parsed.id2label.clone();
     }
 
     /// Parse a HuggingFace `config.json`. Unrecognized fields are ignored; any
     /// of the structural fields below that is absent falls back to the
-    /// XLM-RoBERTa-large defaults.
+    /// XLM-RoBERTa-large defaults. A SaT checkpoint's limited lookahead (a
+    /// banded attention mask) is refused: the backbone attends globally.
     pub fn from_json(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path)
             .map_err(|e| Error::Config { message: format!("reading config.json: {e}") })?;
@@ -65,11 +82,20 @@ impl XlmRobertaConfig {
     pub fn from_json_str(data: &str) -> Result<Self> {
         let raw: RawXlmRobertaConfig =
             serde_json::from_str(data).map_err(|e| Error::Config { message: format!("JSON parse error: {e}") })?;
+        let banded = match (raw.lookahead, raw.lookahead_split_layers) {
+            (Some(tokens), _) => Some(format!("a lookahead of {tokens} tokens")),
+            (None, Some(layer)) => Some(format!("causal attention from layer {layer}")),
+            (None, None) => None,
+        };
+        if let Some(banded) = banded {
+            return Err(Error::Config { message: format!("{banded} is not supported: the backbone attends globally") });
+        }
         Ok(Self::from_raw(raw))
     }
 
     fn from_raw(raw: RawXlmRobertaConfig) -> Self {
         let base = xlm_roberta_large();
+        let id2label = dense_id2label(&raw.id2label);
         XlmRobertaConfig {
             vocab_size: raw.vocab_size.unwrap_or(base.vocab_size),
             hidden_size: raw.hidden_size.unwrap_or(base.hidden_size),
@@ -80,6 +106,8 @@ impl XlmRobertaConfig {
             type_vocab_size: raw.type_vocab_size.unwrap_or(base.type_vocab_size),
             layer_norm_eps: raw.layer_norm_eps.or(raw.norm_eps).unwrap_or(base.layer_norm_eps),
             pad_token_id: raw.pad_token_id.unwrap_or(base.pad_token_id),
+            num_labels: raw.num_labels.unwrap_or(if id2label.is_empty() { base.num_labels } else { id2label.len() }),
+            id2label,
             dtype: base.dtype,
             max_batch_size: base.max_batch_size,
         }
@@ -99,6 +127,8 @@ pub fn xlm_roberta_large() -> XlmRobertaConfig {
         type_vocab_size: 1,
         layer_norm_eps: 1e-5,
         pad_token_id: 1,
+        num_labels: 2,
+        id2label: Vec::new(),
         dtype: crate::default_compute_dtype(),
         max_batch_size: 1,
     }
@@ -119,4 +149,11 @@ struct RawXlmRobertaConfig {
     layer_norm_eps: Option<f64>,
     norm_eps: Option<f64>,
     pad_token_id: Option<usize>,
+    num_labels: Option<usize>,
+    /// HF derives `num_labels` from `len(id2label)` when not explicitly set.
+    id2label: Option<HashMap<String, String>>,
+    /// SaT (`xlm-token`): the tokens past the query a layer may attend, and
+    /// the layer from which attention turns causal.
+    lookahead: Option<usize>,
+    lookahead_split_layers: Option<usize>,
 }
