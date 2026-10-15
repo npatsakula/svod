@@ -9,29 +9,43 @@ use svod_tensor::jit::{InputSpec, JitError};
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
-use super::gemm::{BF16_REL_TOL, SWIGLU_REL_TOL, operand, pair_rows, to_f32_vec};
+use super::gemm::{BF16_REL_TOL, SWIGLU_REL_TOL, graph_rope, operand, pair_rows, rope_tables, to_f32_vec};
 use super::rel_err;
-use crate::kernels::gemm::{Epilogue, GEMM_NT_SUPPORTED_ARCHS, gemm_nt, gemm_nt_with_epilogue, swiglu_pair_width};
+use crate::kernels::gemm::{
+    Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmPolicy, gemm_nt, gemm_nt_with_epilogue, swiglu_pair_width,
+};
 
 const MAX_B: usize = 3;
 const L: usize = 128;
 const K: usize = 192;
 const N: usize = 256;
+/// The RoPE epilogue's head width and rotated heads: half of `N` rotates, the
+/// columns after it are stored as they are. Each batch's `L` rows are one
+/// sequence.
+const HEAD_DIM: usize = 64;
+const ROTATED: usize = 2;
 
 #[derive(Clone, Copy, Debug)]
 enum Epi {
     Plain,
     Add,
     SwiGlu,
+    Rope,
 }
 
-/// One projection; the weight is static, `pair` the SwiGLU row arrangement.
+/// One projection; the weight is static, `pair` the SwiGLU row arrangement,
+/// `rope` the `[L, HEAD_DIM/2]` rotary tables.
 struct Proj {
     w: Tensor,
     pair: usize,
+    rope: (Tensor, Tensor),
 }
 
 impl Proj {
+    fn rope(&self) -> Epilogue<&Tensor> {
+        Epilogue::Rope { cos: &self.rope.0, sin: &self.rope.1, seq: L, head_dim: HEAD_DIM, heads: ROTATED }
+    }
+
     fn forward(&self, x: &Tensor, epi: Epilogue<&Tensor>) -> Result<Tensor, JitError> {
         let y = gemm_nt_with_epilogue(x, &self.w, epi)
             .map_err(|e| JitError::Build { source: Box::new(e) })?
@@ -67,6 +81,15 @@ jit_wrapper! {
     }
 }
 
+jit_wrapper! {
+    RopeJit(Proj) {
+        inputs { x: Tensor }
+        batch_var b: (1, MAX_B),
+        outputs { y }
+        build(x) { model.forward(x, model.rope()) }
+    }
+}
+
 /// The surface the test drives on every wrapper.
 trait BatchPlan {
     /// The plan's GEMM dispatches as `(entry point, var names)`, matched by base
@@ -99,6 +122,7 @@ macro_rules! batch_plan {
 batch_plan!(PlainJit);
 batch_plan!(AddJit);
 batch_plan!(SwiGluJit);
+batch_plan!(RopeJit);
 
 fn copy_into(t: &Tensor, dst: &mut svod_device::Buffer) {
     t.realize().expect("realize");
@@ -122,10 +146,13 @@ fn live(t: &Tensor, b: usize) -> Tensor {
 ///
 /// One plan prepared at the batch capacity and executed at every bound batch
 /// matches the GEMM built for that concrete batch and the graph it replaces,
-/// with exactly one GEMM dispatch whose grid takes the batch variable.
+/// with exactly one GEMM dispatch whose grid takes the batch variable. RoPE's
+/// positions restart at every batch, read off the store's offset, and only a
+/// tile that stages its store carries it.
 #[test_case(Epi::Plain; "plain")]
 #[test_case(Epi::Add; "residual add")]
 #[test_case(Epi::SwiGlu; "swiglu")]
+#[test_case(Epi::Rope; "rope")]
 #[ignore]
 fn gemm_batch_var_matches_concrete_batch(epi: Epi) {
     if !super::device_supported(GEMM_NT_SUPPORTED_ARCHS) {
@@ -137,8 +164,18 @@ fn gemm_batch_var_matches_concrete_batch(epi: Epi) {
     let pair = swiglu_pair_width(&x.device()).expect("a common pair width");
     let cols = if matches!(epi, Epi::SwiGlu) { N / 2 } else { N };
     let res = batched(L, cols, 0.53);
-    let proj = Proj { w: if matches!(epi, Epi::SwiGlu) { pair_rows(&w, pair) } else { w.clone() }, pair };
+    let w_rows = if matches!(epi, Epi::SwiGlu) { pair_rows(&w, pair) } else { w.clone() };
+    let proj = Proj { w: w_rows, pair, rope: rope_tables(L, HEAD_DIM) };
     let kernel_w = proj.w.clone();
+    let arch = crate::target::resolve_supported_arch(&x.device(), GEMM_NT_SUPPORTED_ARCHS).expect("supported");
+    let caps = crate::ArchCaps::for_arch(arch);
+    if matches!(epi, Epi::Rope)
+        && !GemmPolicy::for_arch(arch).tiles.iter().any(|c| c.carries(proj.rope().kind(), &caps))
+    {
+        eprintln!("skip gemm_batch_var_matches_concrete_batch[rope]: no {arch:?} tile stages its store");
+        return;
+    }
+    let rope = proj.rope.clone();
 
     let spec = |cols| InputSpec::new(&[MAX_B, L, cols], DType::BFloat16);
     let mut plan: Box<dyn BatchPlan> = match epi {
@@ -161,6 +198,12 @@ fn gemm_batch_var_matches_concrete_batch(epi: Epi) {
             copy_into(&x, jit.x_mut().expect("x"));
             Box::new(jit)
         }
+        Epi::Rope => {
+            let mut jit = RopeJit::new(proj);
+            jit.prepare(spec(K)).expect("prepare");
+            copy_into(&x, jit.x_mut().expect("x"));
+            Box::new(jit)
+        }
     };
     let dispatches = plan.gemm_dispatches();
     assert_eq!(dispatches.len(), 1, "one GEMM dispatch, got {dispatches:?}");
@@ -173,6 +216,7 @@ fn gemm_batch_var_matches_concrete_batch(epi: Epi) {
             Epi::Plain => Epilogue::Plain,
             Epi::Add => Epilogue::Add(&resb),
             Epi::SwiGlu => Epilogue::SwiGlu { pair },
+            Epi::Rope => Epilogue::Rope { cos: &rope.0, sin: &rope.1, seq: L, head_dim: HEAD_DIM, heads: ROTATED },
         };
         let concrete = gemm_nt_with_epilogue(&xb, &kernel_w, kernel_epi).expect("build").expect("applies");
         let linear = xb.linear().weight(&w).call().expect("reference linear");
@@ -182,6 +226,10 @@ fn gemm_batch_var_matches_concrete_batch(epi: Epi) {
             Epi::SwiGlu => {
                 let halves = linear.split(&[N / 2, N / 2], -1).expect("split");
                 (halves[0].silu().expect("silu").try_mul(&halves[1]).expect("gate·up"), SWIGLU_REL_TOL)
+            }
+            Epi::Rope => {
+                let flat = linear.try_reshape([(b * L) as isize, N as isize]).expect("flatten the batches");
+                (graph_rope(&flat, (&rope.0, &rope.1), b, HEAD_DIM, ROTATED), BF16_REL_TOL)
             }
         };
         let concrete_err = rel_err(&got, &to_f32_vec(&concrete));

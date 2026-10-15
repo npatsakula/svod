@@ -15,6 +15,8 @@
 
 use std::sync::Arc;
 
+use svod_codegen::llvm::amd::ops::{exp2_flush, max_num};
+use svod_dtype::{AmdArch, DType};
 use svod_ir::{ConstValue, UOp};
 
 use crate::Group;
@@ -157,8 +159,24 @@ impl<'k> Group<'k> {
     }
 
     // ── unary ─────────────────────────────────────────────────────────────────
-    /// `exp2(a)` element-wise.
+    /// `exp2(a)` element-wise. On AMD an f32 tile takes the bare `v_exp_f32`
+    /// ([`exp2_flush`]): a result below `2^-126` flushes to zero instead of
+    /// paying the denormal fix-up per element.
     pub fn exp2<T: RegTile<'k>>(&self, a: T) -> T {
-        self.map(a, |x, _| x.try_exp2().expect("tk exp2"))
+        let flush = self.kernel().caps.amd().is_some();
+        self.map(
+            a,
+            move |x, _| {
+                if flush && x.dtype() == DType::Float32 { exp2_flush(x) } else { x.try_exp2().expect("tk exp2") }
+            },
+        )
+    }
+
+    /// `max(x, y)` of two scalars, for a reduction's combiner: on gfx12 an f32
+    /// takes the native `v_max_num_f32` ([`max_num`], a NaN operand yields the
+    /// other), elsewhere the renderer's compare and select.
+    pub fn max_num(&self, x: &Arc<UOp>, y: &Arc<UOp>) -> Arc<UOp> {
+        let native = self.kernel().caps.amd().is_some_and(AmdArch::is_rdna4);
+        if native && x.dtype() == DType::Float32 { max_num(x, y) } else { maximum(x, y) }
     }
 }

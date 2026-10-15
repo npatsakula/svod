@@ -1,26 +1,71 @@
 //! Pure graph-shape tests for the register-tile math ops (`TileMathMixin`).
 
-use svod_dtype::DType;
-use svod_ir::{BinaryOp, Op, UnaryOp};
+use svod_dtype::{AmdArch, CudaArch, DType, GpuArch};
+use svod_ir::{BinaryOp, Op, UnaryOp, ops};
+use test_case::test_case;
 
-use crate::Kernel;
 use crate::tiles::{RT_16X16, TileLayout, VecLayout};
+use crate::{ArchCaps, Kernel};
+
+const GFX942: GpuArch = GpuArch::Amd(AmdArch::Gfx942);
+const GFX1201: GpuArch = GpuArch::Amd(AmdArch::Gfx1201);
+const SM_86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
 
 fn probe() -> Kernel {
     Kernel::new("math_probe", [1, 1, 1], 64, vec![], crate::ArchCaps::GFX942)
 }
 
-/// `exp2` maps an `Exp2` unary over the tile and stores it back.
-#[test]
-fn test_exp2_emits_unary_exp2() {
-    let ker = probe();
+fn probe_on(arch: GpuArch) -> Kernel {
+    let caps = ArchCaps::for_arch(arch);
+    Kernel::new("math_probe", [1, 1, 1], caps.wave_size as i64, vec![], caps)
+}
+
+/// The LLVM call a typed `Custom` renders, when the graph holds one.
+fn custom_call(uop: &svod_ir::UOp) -> Option<&str> {
+    match uop.op() {
+        Op::Custom(ops::Custom { code, .. }) => code.lines().find(|l| l.starts_with("call ")),
+        _ => None,
+    }
+}
+
+/// `exp2` maps an `Exp2` unary over the tile, except an f32 tile on AMD, which
+/// takes the bare `v_exp_f32` (no denormal fix-up) as a typed `Custom`.
+#[test_case(GFX942, DType::Float32, Some("call float @llvm.amdgcn.exp2.f32(float {0})"); "gfx942 f32 flushes")]
+#[test_case(GFX1201, DType::Float32, Some("call float @llvm.amdgcn.exp2.f32(float {0})"); "gfx1201 f32 flushes")]
+#[test_case(GFX1201, DType::BFloat16, None; "gfx1201 bf16 keeps exp2")]
+#[test_case(SM_86, DType::Float32, None; "sm_86 f32 keeps exp2")]
+fn test_exp2_lowering(arch: GpuArch, dtype: DType, custom: Option<&str>) {
+    let ker = probe_on(arch);
     let warp = ker.warp();
-    let a = warp.zero(ker.rt((16, 16), DType::Float32, TileLayout::Row, RT_16X16));
-    let out = warp.exp2(a);
-    assert!(
-        out.uop().toposort().iter().any(|u| matches!(u.op(), Op::Unary(UnaryOp::Exp2, _))),
-        "exp2 emits a Unary(Exp2)"
+    let a = warp.zero(ker.rt((16, 16), dtype, TileLayout::Row, RT_16X16));
+    let topo = warp.exp2(a).uop().toposort();
+    let calls: Vec<&str> = topo.iter().filter_map(|u| custom_call(u)).collect();
+    let unary = topo.iter().any(|u| matches!(u.op(), Op::Unary(UnaryOp::Exp2, _)));
+    match custom {
+        Some(call) => assert!(calls == [call] && !unary, "{arch:?}: want only {call}, got {calls:?}, Exp2 {unary}"),
+        None => assert!(calls.is_empty() && unary, "{arch:?}: want Unary(Exp2), got {calls:?}"),
+    }
+}
+
+/// `max_num` is the native `maxnum` on gfx12 f32 only; elsewhere the `Max` the
+/// renderers decompose into a compare and a select.
+#[test_case(GFX1201, DType::Float32, true; "gfx1201 f32 native")]
+#[test_case(GFX1201, DType::Int32, false; "gfx1201 i32 max")]
+#[test_case(GFX942, DType::Float32, false; "gfx942 f32 max")]
+#[test_case(SM_86, DType::Float32, false; "sm_86 f32 max")]
+fn test_max_num_lowering(arch: GpuArch, dtype: DType, native: bool) {
+    let ker = probe_on(arch);
+    let (x, y) = (
+        svod_ir::UOp::const_(dtype.clone(), svod_ir::ConstValue::Int(1)),
+        svod_ir::UOp::const_(dtype, svod_ir::ConstValue::Int(2)),
     );
+    let out = ker.warp().max_num(&x, &y);
+    if native {
+        assert_eq!(custom_call(&out), Some("call float @llvm.maxnum.f32(float {0}, float {1})"));
+        assert!(out.op().sources().iter().map(|s| s.id).eq([x.id, y.id]), "maxnum reads x then y");
+    } else {
+        assert!(matches!(out.op(), Op::Binary(BinaryOp::Max, _, _)), "{arch:?}: want Max, got {:?}", out.op());
+    }
 }
 
 /// `mul_scalar` folds the scalar into a `Mul` against a constant.

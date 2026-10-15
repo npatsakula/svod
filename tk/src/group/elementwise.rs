@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use svod_dtype::DType;
+use svod_ir::decompositions::cast_finite_float_to_bf16;
 use svod_ir::{ConstValue, UOp};
 
 use super::Group;
@@ -79,15 +81,34 @@ impl<'k> Group<'k> {
     /// # Panics
     /// Panics if `dst` and `src` have different shapes.
     pub fn copy<T: RegTile<'k>>(&self, dst: T, src: &T) -> T {
+        self.copy_cast(dst, src, |x, dtype| x.cast(dtype))
+    }
+
+    /// [`Self::copy`] of a `src` that is never NaN, or whose NaNs the caller
+    /// carries on another path. On AMD, which has no bf16 convert instruction, an
+    /// f32 → bf16 copy then narrows in two integer ops a value
+    /// ([`cast_finite_float_to_bf16`]) instead of the NaN-guarded expansion of
+    /// `fptrunc` (five and a half on gfx12); elsewhere it is [`Self::copy`].
+    pub fn narrow_finite<T: RegTile<'k>>(&self, dst: T, src: &T) -> T {
+        let integer = self.kernel().caps.amd().is_some();
+        self.copy_cast(dst, src, move |x, dtype| {
+            if integer && x.dtype() == DType::Float32 && dtype == DType::BFloat16 {
+                cast_finite_float_to_bf16(&x)
+            } else {
+                x.cast(dtype)
+            }
+        })
+    }
+
+    /// Copy `src` into `dst`, narrowing each element with `cast` on a dtype mismatch.
+    fn copy_cast<T: RegTile<'k>>(&self, dst: T, src: &T, cast: impl Fn(Arc<UOp>, DType) -> Arc<UOp>) -> T {
         // Per-lane register op: wave-safe (each wave copies its own RT).
         assert_eq!(dst.shape(), src.shape(), "copy: shape mismatch");
         let (sbuf, sshape, selem) = (self.anchor(src.uop()), src.shape().to_vec(), src.elem().clone());
         let (dbuf, dshape, delem) = (dst.uop().clone(), dst.shape().to_vec(), dst.elem().clone());
         let ended = self.elementwise(&dshape.clone(), move |idxs| {
-            let mut load = load_at(&sbuf, &sshape, idxs);
-            if selem != delem {
-                load = load.cast(delem.clone());
-            }
+            let load = load_at(&sbuf, &sshape, idxs);
+            let load = if selem != delem { cast(load, delem.clone()) } else { load };
             flat_index(&dbuf, &dshape, idxs).store(load)
         });
         self.finalize_tile(dst, ended)

@@ -46,6 +46,31 @@ fn role_tiles_panic_without_fragment_layouts() {
     let _ = ker.acc((16, 16), TileLayout::Col);
 }
 
+/// `ST::view` reads a shared buffer as another tile from its first element —
+/// the GEMM's output band over its A strips: the same buffer, the new shape, no
+/// parity offset.
+#[test]
+fn st_view_reads_the_buffer_as_another_tile() {
+    let caps = ArchCaps::for_arch(GpuArch::Cuda(CudaArch::from_compute_capability(8, 6)));
+    let ker = Kernel::new("view", [1, 1, 1], 128, vec![], caps);
+    let strips = ker.shared_rows_stages((64, 32), DType::BFloat16, TileLayout::Row, 2);
+    let base = caps.shared_rows(64, 2).expect("a 128-byte row strip");
+    let band = strips.with_base_offset(UOp::index_const(2048)).view((64, 64), TileLayout::Row, base);
+    assert!(std::sync::Arc::ptr_eq(band.uop(), strips.uop()));
+    assert_eq!((band.rows, band.cols, band.shape()), (64, 64, &[4, 1, 16, 64][..]));
+    assert!(band.base_offset().is_none(), "a view starts at the buffer's first element");
+}
+
+/// A view past the end of its buffer is refused.
+#[test]
+#[should_panic(expected = "overruns its 4096-element buffer")]
+fn st_view_refuses_to_overrun_the_buffer() {
+    let caps = ArchCaps::for_arch(GpuArch::Cuda(CudaArch::from_compute_capability(8, 6)));
+    let ker = Kernel::new("view", [1, 1, 1], 128, vec![], caps);
+    let strips = ker.shared_rows_stages((64, 32), DType::BFloat16, TileLayout::Row, 2);
+    let _ = strips.view((128, 64), TileLayout::Row, caps.shared_rows(64, 2).expect("a 128-byte row strip"));
+}
+
 /// `bind_abi` binds outputs first, then inputs, preserving order and shapes — so the
 /// ABI slot order is fixed by the call structure, not by statement order.
 #[test]

@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Layer, LayerNorm, Module};
+use svod_tensor::nn::{LayerNorm, Module};
 
 use crate::state::{self, StateDict};
 
@@ -17,6 +17,7 @@ use super::config::ModernBertConfig;
 use super::embeddings::Embeddings;
 use super::encoder::Encoder;
 use super::error::Result;
+use super::norm::layer_norm;
 
 #[derive(Clone, Module)]
 pub struct ModernBert {
@@ -45,7 +46,7 @@ impl ModernBert {
     pub fn forward(&self, input_ids: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let x = self.embeddings.forward(input_ids)?;
         let x = self.encoder.forward(&x, padding_mask)?;
-        Ok(self.final_norm.forward(&x)?)
+        layer_norm(&x, &self.final_norm)
     }
 
     /// Download `config.json` + `model.safetensors` from a HuggingFace Hub
@@ -81,7 +82,7 @@ impl ModernBert {
     pub fn from_state_dict(sd: &StateDict, config: ModernBertConfig) -> Result<Self> {
         let dtype = config.dtype.clone();
         let mut model = Self::empty(config);
-        model.load_state_dict(&state::cast_all(sd, dtype), "")?;
+        model.load_state_dict(&state::cast_all(sd, dtype)?, "")?;
         Ok(model)
     }
 }

@@ -9,6 +9,7 @@ use svod_tensor::nn::{Embedding, Layer, LayerNorm, Module};
 use crate::init::embedding;
 
 use super::error::Result;
+use super::norm::layer_norm;
 
 #[derive(Clone, Module)]
 pub struct Embeddings {
@@ -24,6 +25,6 @@ impl Embeddings {
 
     /// Forward. `input_ids`: `(B, L)` int64 → `(B, L, D)`.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        Ok(self.norm.forward(&self.tok_embeddings.forward(input_ids)?)?)
+        layer_norm(&self.tok_embeddings.forward(input_ids)?, &self.norm)
     }
 }

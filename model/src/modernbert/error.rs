@@ -15,6 +15,11 @@ pub enum Error {
         #[snafu(source(from(crate::state::Error, Box::new)))]
         source: Box<crate::state::Error>,
     },
+    #[snafu(display("hand kernel: {source}"))]
+    Tk {
+        #[snafu(source(from(svod_tk::LaunchError, Box::new)))]
+        source: Box<svod_tk::LaunchError>,
+    },
     #[snafu(display("HF Hub op failed"), context(false))]
     Hub { source: hf_hub::HFError },
     #[snafu(display("reading config.json failed: {message}"))]

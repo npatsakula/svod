@@ -3,10 +3,12 @@
 //! Tests all arithmetic operations including basic ops, type promotion, and error handling.
 
 use std::f32::consts::PI;
+use std::sync::Arc;
 
 use svod_dtype::DType;
+use test_case::test_case;
 
-use crate::{BinaryOp, ConstValue, Op, UOp, error::Error, uop::eval::eval_binary_op}; // ConstValue kept for Void, Float16, i8, u8
+use crate::{BinaryOp, ConstValue, Op, TernaryOp, UOp, error::Error, ops, uop::eval::eval_binary_op}; // ConstValue kept for Void, Float16, i8, u8
 
 // =========================================================================
 // Basic Arithmetic Operations
@@ -91,6 +93,132 @@ fn test_signed_floor_divmod_semantics() {
             assert!(floor_mod == 0 || (floor_mod < 0) == (b < 0));
             assert_eq!(cdiv, a / b);
             assert_eq!(cmod, a % b);
+        }
+    }
+}
+
+/// The integer bf16 narrowing replaces exactly the f32 → bf16 cast: no cast to
+/// bf16 survives and the payload arrives by bitcast, while the other float
+/// casts (f32 → f16, bf16 → f32) stay for the backend to select.
+#[test]
+fn bf16_integer_casts_rewrite_only_f32_to_bf16() {
+    let patterns = crate::decompositions::bf16_integer_cast_patterns();
+    let casts_to = |root: &std::sync::Arc<UOp>, dt: &DType| {
+        root.toposort().iter().filter(|u| matches!(u.op(), Op::Cast(_)) && u.dtype() == *dt).count()
+    };
+    let narrow = crate::decompositions::decompose_with(&UOp::native_const(0.25f32).cast(DType::BFloat16), &patterns);
+    assert_eq!(narrow.dtype(), DType::BFloat16);
+    assert!(matches!(narrow.op(), Op::BitCast(_)), "{narrow:?}");
+    assert_eq!(casts_to(&narrow, &DType::BFloat16), 0);
+    for (from, to) in [(DType::Float32, DType::Float16), (DType::BFloat16, DType::Float32)] {
+        let root = UOp::native_const(0.25f32).cast(from).cast(to.clone());
+        let kept = crate::decompositions::decompose_with(&root, &patterns);
+        assert_eq!(casts_to(&kept, &to), 1, "{to:?} cast must stay");
+    }
+}
+
+/// The bits of an integer expression over f32 constants, the ops the bf16
+/// narrowings build: every lane is its dtype's width, wrapping as the hardware does.
+fn eval_bits(u: &Arc<UOp>) -> u64 {
+    let width = |u: &Arc<UOp>| if u.dtype().is_bool() { 1 } else { u.dtype().base().bitsize() };
+    let wrap = |v: u64| if width(u) == 64 { v } else { v & ((1 << width(u)) - 1) };
+    match u.op() {
+        Op::Const(c) => match c.0 {
+            ConstValue::Float(v) if u.dtype() == DType::Float32 => u64::from((v as f32).to_bits()),
+            ConstValue::Int(v) => wrap(v as u64),
+            ConstValue::UInt(v) => wrap(v),
+            ref other => panic!("constant {other:?} of {:?}", u.dtype()),
+        },
+        Op::BitCast(ops::BitCast { src, .. }) => {
+            assert_eq!(width(src), width(u), "a bitcast keeps the width");
+            eval_bits(src)
+        }
+        Op::Cast(ops::Cast { src, .. }) => {
+            assert!(src.dtype().is_int() && u.dtype().is_int() && width(u) <= width(src), "{u:?}");
+            wrap(eval_bits(src))
+        }
+        Op::Binary(op, a, b) => {
+            let (a, b) = (eval_bits(a), eval_bits(b));
+            wrap(match op {
+                BinaryOp::Add => a.wrapping_add(b),
+                BinaryOp::Mul => a.wrapping_mul(b),
+                BinaryOp::Shr => a >> b,
+                BinaryOp::And => a & b,
+                BinaryOp::Or => a | b,
+                BinaryOp::Ne => u64::from(a != b),
+                other => panic!("{other:?} in a bf16 narrowing"),
+            })
+        }
+        Op::Ternary(TernaryOp::Where, cond, a, b) => eval_bits(if eval_bits(cond) != 0 { a } else { b }),
+        other => panic!("{other:?} in a bf16 narrowing"),
+    }
+}
+
+/// `x` narrowed by the guarded integer rewrite and by the finite one, as bits.
+fn narrowed(x: f32) -> (u16, u16) {
+    let x = UOp::native_const(x);
+    let patterns = crate::decompositions::bf16_integer_cast_patterns();
+    let guarded = crate::decompositions::decompose_with(&x.cast(DType::BFloat16), &patterns);
+    let finite = crate::decompositions::cast_finite_float_to_bf16(&x);
+    (eval_bits(&guarded) as u16, eval_bits(&finite) as u16)
+}
+
+/// The finite narrowing is the round-half-to-even bias alone: no compare, no
+/// select, the payload by bitcast, as many lanes out as in.
+#[test]
+fn finite_bf16_narrowing_selects_nothing() {
+    for lanes in [1, 4] {
+        let x = UOp::vconst(vec![ConstValue::Float(0.25); lanes], DType::Float32);
+        let narrow = crate::decompositions::cast_finite_float_to_bf16(&x);
+        assert_eq!(narrow.dtype(), DType::BFloat16.vec(lanes).unwrap());
+        assert!(matches!(narrow.op(), Op::BitCast(_)), "{narrow:?}");
+        let nodes = narrow.toposort();
+        let guard =
+            nodes.iter().find(|u| matches!(u.op(), Op::Ternary(..) | Op::Binary(BinaryOp::Ne | BinaryOp::Eq, ..)));
+        assert!(guard.is_none(), "{guard:?}");
+    }
+}
+
+/// Both integer narrowings round half to even exactly as `half` does on the
+/// values where rounding bites: ties to either parity, the carry into the
+/// exponent, overflow to infinity, subnormals, zeros and infinities.
+#[test_case(1.0 + f32::EPSILON * 128.0; "tie to even rounds down")]
+#[test_case(f32::from_bits(0x3f81_8000); "tie to odd rounds up")]
+#[test_case(f32::from_bits(0x3f80_8001); "above the tie rounds up")]
+#[test_case(f32::from_bits(0x3f80_7fff); "below the tie rounds down")]
+#[test_case(f32::from_bits(0x3fff_ffff); "the carry reaches the exponent")]
+#[test_case(f32::MAX; "max finite overflows to infinity")]
+#[test_case(-f32::MAX; "min finite overflows to negative infinity")]
+#[test_case(f32::from_bits(0x7f7f_7fff); "the largest value that stays finite")]
+#[test_case(f32::MIN_POSITIVE; "smallest normal")]
+#[test_case(f32::from_bits(1); "smallest subnormal")]
+#[test_case(f32::from_bits(0x0000_8000); "subnormal tie")]
+#[test_case(f32::from_bits(0x807f_ffff); "negative subnormal rounds into the normals")]
+#[test_case(0.0; "zero")]
+#[test_case(-0.0; "negative zero")]
+#[test_case(f32::INFINITY; "infinity")]
+#[test_case(f32::NEG_INFINITY; "negative infinity")]
+#[test_case(0.1; "a softmax weight")]
+fn bf16_integer_narrowings_round_half_to_even(x: f32) {
+    let expected = half::bf16::from_f32(x).to_bits();
+    assert_eq!(narrowed(x), (expected, expected), "{x:e} = {:#010x}", x.to_bits());
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4096))]
+
+    /// Over every bit pattern: the guarded narrowing is `half`'s (a NaN stays a
+    /// NaN), and the finite one agrees with it on everything but a NaN.
+    #[test]
+    fn bf16_integer_narrowings_match_half(bits in proptest::prelude::any::<u32>()) {
+        let x = f32::from_bits(bits);
+        let expected = half::bf16::from_f32(x);
+        let (guarded, finite) = narrowed(x);
+        if x.is_nan() {
+            proptest::prop_assert!(half::bf16::from_bits(guarded).is_nan(), "{bits:#010x} -> {guarded:#06x}");
+        } else {
+            proptest::prop_assert_eq!(guarded, expected.to_bits(), "{:#010x}", bits);
+            proptest::prop_assert_eq!(finite, expected.to_bits(), "{:#010x}", bits);
         }
     }
 }
