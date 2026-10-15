@@ -42,17 +42,18 @@ fn device_planner() -> Option<Arc<Planner>> {
 
 /// What the tuner makes of `ranked` on the device, as the op layer tunes:
 /// the candidates `expand` makes of the admitted shortlist (compiled, the
-/// spilling ones dropped while clean ones remain) and its pick among them.
+/// spilling ones dropped while clean ones remain) and its pick among them,
+/// none where the planner offers no kernel (the op layer takes the graph).
 pub(crate) fn tuned_on_device<C: crate::ops::config::Tiled + PartialEq + std::fmt::Debug>(
     planner: &Planner,
     (op, dtype, shape): (&'static str, svod_dtype::DType, &[usize]),
     ranked: &[C],
     expand: impl Fn(&[C]) -> Vec<C>,
     build: impl Fn(C) -> crate::tune::Candidate,
-) -> (Vec<C>, C) {
+) -> (Vec<C>, Option<C>) {
     let mut tuner = crate::ops::Tuner::new(&planner.device, dtype, shape, "a device test", build);
     let candidates = expand(&tuner.admitted(op, ranked));
-    let pick = tuner.fastest(op, &candidates);
+    let pick = (!candidates.is_empty()).then(|| tuner.fastest(op, &candidates));
     (candidates, pick)
 }
 

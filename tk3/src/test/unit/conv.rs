@@ -571,8 +571,8 @@ const PROBE: [(usize, usize, usize, usize, bool); 12] = [
 
 /// The convolution candidates the tuner times on the device for one image
 /// of `g` (the admitted shortlist of the device's ranking, with the splits
-/// the op layer adds) and its pick among them.
-fn device_candidates(planner: &Planner, g: &ConvGeom, epilogue: Epilogue) -> (Vec<ConvCfg>, ConvCfg) {
+/// the op layer adds) and its pick among them, if any.
+fn device_candidates(planner: &Planner, g: &ConvGeom, epilogue: Epilogue) -> (Vec<ConvCfg>, Option<ConvCfg>) {
     let [ho, wo] = g.out_hw();
 
     let build = |c: ConvCfg| {
@@ -621,7 +621,7 @@ fn conv_throughput_probe() {
             let ConvCfg { gemm: c, split } = cand;
             let t =
                 t.map_or("failed".into(), |t| format!("{:8.1} us {:5.1} TFLOP/s", t as f64 / 1e3, tflops(t as f64)));
-            let picked = if *cand == pick { " (tuner's pick)" } else { "" };
+            let picked = if Some(*cand) == pick { " (tuner's pick)" } else { "" };
             eprintln!(
                 "  {label} tk3 {:?} s{} {:?} unroll={} split {split}: {t}{picked}",
                 c.tile, c.stages, c.warps, c.unroll

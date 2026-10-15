@@ -129,9 +129,9 @@ fn gemm_programs(tile: [usize; 3]) -> tune::Candidate {
 }
 
 /// A choice keys by the candidates' programs, each built once: a store
-/// miss compiles each candidate once (the device then times them), and a
-/// store hit in another process builds the programs to fingerprint them
-/// and compiles nothing.
+/// miss compiles each candidate once (and times them where the host's
+/// device runs sm_86 programs), and a store hit in another process builds
+/// the programs to fingerprint them and compiles nothing.
 #[test]
 fn a_store_hit_compiles_nothing() {
     let dir = scratch("hit");
@@ -146,13 +146,14 @@ fn a_store_hit_compiles_nothing() {
     let mut bench = Bench::default();
     let missed = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
     assert_eq!((builds.get(), bench.built.len()), (2, 2), "a miss builds and compiles each once");
-    // What the device would have measured, stored as a timing would.
+    // Without a device that timed them, what it would have measured, stored
+    // as a timing would; with one, its choice is already stored.
     let stored = TuneStore::at(Some(dir.clone())).select(&k, 2, || programs, || vec![Some(9), Some(4)]);
-    assert_eq!((missed, stored), (None, Some(1)), "nothing timed on the host");
+    assert_eq!(stored, missed.or(Some(1)), "the device's choice, else the stored timing's");
     builds.set(0);
     let mut bench = Bench::default();
     let hit = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
-    assert_eq!((hit, builds.get(), bench.built.len()), (Some(1), 2, 0));
+    assert_eq!((hit, builds.get(), bench.built.len()), (stored, 2, 0));
     let _ = std::fs::remove_dir_all(dir);
 }
 
