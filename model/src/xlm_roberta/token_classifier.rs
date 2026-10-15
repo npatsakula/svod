@@ -9,18 +9,21 @@
 //! with the backbone into one plan per batch shape (see
 //! [`HeadPlans`](crate::encoder_head::HeadPlans)).
 
+use std::path::Path;
+
+use snafu::ResultExt;
 use svod_arch::pipelines::text::{ClassifyTokens, EncoderHead, Encoding, RunProfile, TokenClassification};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, Linear, Module};
 
 use super::config::XlmRobertaConfig;
-use super::error::Result;
+use super::error::{HeadSnafu, Result};
 use super::jit::XlmRobertaTokenClassifierJit;
 use super::model::XlmRobertaModel;
-use crate::encoder_head::{HeadError, HeadPlans};
+use crate::encoder_head::{HeadError, HeadOptions, HeadPlans};
 use crate::init::{Bias, linear};
-use crate::state::{StateDict, cast_all};
+use crate::state::{StateDict, cast_all, load_safetensors};
 
 /// Backbone + token-classification head — the model type wrapped by the JIT.
 /// Loads the published layout: the backbone under `roberta.`, the head under
@@ -60,15 +63,29 @@ impl XlmRobertaTokenClassificationModel {
 }
 
 /// Finished token-classifier model. Construction is cheap; each batch shape
-/// compiles on first use. Implements [`EncoderHead`] (with [`ClassifyTokens`]
+/// compiles on first use, for the device the classifier was built on.
+/// Implements [`EncoderHead`] (with [`ClassifyTokens`]
 /// fixing the output kinds) for drop-in use with
 /// [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline).
 pub struct XlmRobertaTokenClassifier {
     plans: HeadPlans<XlmRobertaTokenClassifierJit>,
     num_labels: usize,
+    id2label: Vec<String>,
 }
 
 impl XlmRobertaTokenClassifier {
+    /// Build from a checkpoint's `config.json` and `model.safetensors`.
+    /// `opts.max_seq` defaults to [`XlmRobertaConfig::max_sequence_length`]
+    /// (512 for a 514-row position table).
+    pub fn from_files(config_json: &Path, weights: &Path, opts: &HeadOptions) -> Result<Self> {
+        opts.build(|dtype| {
+            let config = XlmRobertaConfig { dtype, ..XlmRobertaConfig::from_json(config_json)? };
+            let max_seq = opts.max_seq.unwrap_or(config.max_sequence_length());
+            let model = XlmRobertaTokenClassificationModel::from_state_dict(&load_safetensors(weights)?, config)?;
+            Self::new(model, opts.max_batch, max_seq).context(HeadSnafu)
+        })
+    }
+
     /// Classify the tokens of batches of up to `max_batch` chunks of up to
     /// `max_seq` tokens (specials included). `max_seq` may not exceed
     /// [`XlmRobertaConfig::max_sequence_length`]; padding takes the
@@ -80,9 +97,16 @@ impl XlmRobertaTokenClassifier {
     ) -> std::result::Result<Self, HeadError> {
         let num_labels = model.num_labels();
         let config = &model.backbone.config;
-        let (max_positions, pad_id) = (config.max_sequence_length(), config.pad_token_id);
+        let (max_positions, pad_id, id2label) =
+            (config.max_sequence_length(), config.pad_token_id, config.id2label.clone());
         let plans = HeadPlans::new(model, max_batch, max_seq, max_positions, pad_id, "classify_tokens")?;
-        Ok(Self { plans, num_labels })
+        Ok(Self { plans, num_labels, id2label })
+    }
+
+    /// Label names by id, from `config.json`'s `id2label` (empty when it has
+    /// none).
+    pub fn id2label(&self) -> &[String] {
+        &self.id2label
     }
 }
 

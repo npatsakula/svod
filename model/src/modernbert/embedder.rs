@@ -15,14 +15,18 @@
 //! [`HeadPlans`](crate::encoder_head::HeadPlans)), and the live rows are
 //! sliced out of the plan's `[rows, D]` output.
 
+use std::path::Path;
+
+use snafu::ResultExt;
 use svod_arch::pipelines::text::{Embed, Embedding, EncoderHead, Encoding, RunProfile};
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::encoder_head::{HeadError, HeadPlans};
+use crate::encoder_head::{HeadError, HeadOptions, HeadPlans};
 use crate::modernbert::ModernBert;
 use crate::modernbert::embedder_jit::ModernBertEmbedderJit;
-use crate::modernbert::error::Result as ModelResult;
+use crate::modernbert::error::{HeadSnafu, Result as ModelResult};
+use crate::modernbert::pipeline::load_checkpoint;
 
 /// Masked mean-pool + L2-normalize → finished `(B, D)` f32 embeddings (the
 /// sentence-transformers recipe for ModernBERT). `hidden`: `(B, L, D)`;
@@ -35,19 +39,31 @@ pub(crate) fn pool_embed(hidden: &Tensor, attention_mask: &Tensor) -> ModelResul
 }
 
 /// Finished-embeddings model over a [`ModernBert`] backbone. Construction is
-/// cheap; each batch shape compiles on first use.
+/// cheap; each batch shape compiles on first use, for the device the embedder
+/// was built on.
 pub struct ModernBertEmbedder {
     plans: HeadPlans<ModernBertEmbedderJit>,
     hidden_size: usize,
 }
 
 impl ModernBertEmbedder {
+    /// Build from a checkpoint's `config.json` and `model.safetensors`.
+    /// `opts.max_seq` defaults to the checkpoint's `max_position_embeddings`.
+    pub fn from_files(config_json: &Path, weights: &Path, opts: &HeadOptions) -> ModelResult<Self> {
+        opts.build(|dtype| {
+            let (config, sd, max_seq) = load_checkpoint(config_json, weights, dtype, opts.max_seq)?;
+            Self::new(ModernBert::from_state_dict(&sd, config)?, opts.max_batch, max_seq).context(HeadSnafu)
+        })
+    }
+
     /// Embed batches of up to `max_batch` chunks of up to `max_seq` tokens
     /// (specials included). `max_batch`/`max_seq` are caller-chosen and
     /// typically flow in from the pipeline (the chunker's `max_seq` at
     /// assembly); `max_seq` may not exceed the checkpoint's
     /// `max_position_embeddings`. The model's config must already reflect the
-    /// checkpoint (e.g. via [`ModernBert::from_hub`]).
+    /// checkpoint (e.g. via [`ModernBert::from_hub`]). Plans compile for the
+    /// calling thread's default device, which should be the one the model's
+    /// weights loaded onto.
     pub fn new(model: ModernBert, max_batch: usize, max_seq: usize) -> Result<Self, HeadError> {
         let config = &model.config;
         let (hidden_size, max_positions, pad_id) =

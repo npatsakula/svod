@@ -1,7 +1,7 @@
 //! Shared machinery for the encoder heads (ModernBERT's embedder / classifier /
-//! token classifier, XLM-R's token classifier): one head error, the hub
-//! options their loaders take, and `HeadPlans`, the per-shape plan cache
-//! every head runs its chunks through.
+//! token classifier, XLM-R's token classifier): one head error, the options
+//! their loaders take, and `HeadPlans`, the per-shape plan cache every head
+//! runs its chunks through.
 //!
 //! The heads are mechanically identical up to (a) the JIT wrapper type, (b)
 //! the output-decode stride, and (c) the profile stage label, so the capacity
@@ -20,6 +20,10 @@
 //!
 //! Each plan holds its own activation buffers, so memory grows with the number
 //! of shapes a workload touches.
+//!
+//! A head records the device it was built for and compiles every later plan
+//! there, whichever thread runs it: the default device is thread-local, and a
+//! serving pipeline builds a head on one thread and runs it on another.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -28,7 +32,8 @@ use std::time::Instant;
 use hf_hub::HFError;
 use snafu::{ResultExt, Snafu, ensure};
 use svod_arch::pipelines::text::{Encoding, RunProfile};
-use svod_dtype::DType;
+use svod_dtype::default_device::{default_device, with_default_device};
+use svod_dtype::{DType, DeviceSpec};
 use svod_runtime::{KernelProfile, StageProfile};
 use svod_tensor::PrepareConfig;
 use svod_tensor::jit::rt::ArrayViewMutD;
@@ -54,11 +59,9 @@ pub enum HeadError {
     BeyondPositions { stage: &'static str, max_seq: usize, max_positions: usize },
 }
 
-/// How a hub loader builds its head.
+/// How a head is built: its capacity, compute dtype and device.
 #[derive(Clone, Debug)]
-pub struct HubOptions {
-    /// Hub revision: a branch, tag or commit.
-    pub revision: String,
+pub struct HeadOptions {
     /// Most chunks one execute runs.
     pub max_batch: usize,
     /// Longest chunk the head accepts, in tokens (specials included) — size the
@@ -66,25 +69,48 @@ pub struct HubOptions {
     /// has. A batch runs at its own longest chunk, so this bounds a chunk; it
     /// does not size every run.
     pub max_seq: Option<usize>,
-    /// Compute dtype.
-    pub dtype: DType,
+    /// Compute dtype. `None` takes [`compute_dtype_for`](crate::compute_dtype_for)
+    /// the head's device.
+    pub dtype: Option<DType>,
+    /// The device the weights load onto and every plan compiles for. `None`
+    /// takes the building thread's default device.
+    pub device: Option<DeviceSpec>,
+}
+
+impl Default for HeadOptions {
+    /// One chunk per execute, the checkpoint's full length, and the building
+    /// thread's device and its compute dtype.
+    fn default() -> Self {
+        Self { max_batch: 1, max_seq: None, dtype: None, device: None }
+    }
+}
+
+impl HeadOptions {
+    /// Run a head's `build` on the resolved device, handing it the resolved
+    /// dtype: the weights load onto that device, and [`HeadPlans`] records it.
+    pub(crate) fn build<T>(&self, build: impl FnOnce(DType) -> T) -> T {
+        let device = self.device.clone().unwrap_or_else(default_device);
+        let dtype = self.dtype.clone().unwrap_or_else(|| crate::compute_dtype_for(&device));
+        with_default_device(device, || build(dtype))
+    }
+}
+
+/// How a hub loader fetches a checkpoint and builds its head.
+#[derive(Clone, Debug)]
+pub struct HubOptions {
+    /// Hub revision: a branch, tag or commit.
+    pub revision: String,
     /// The repository and revision holding `tokenizer.json`, for checkpoints
     /// that ship none (SaT reuses `FacebookAI/xlm-roberta-base`'s). `None`
     /// reads the model's repository at [`Self::revision`].
     pub tokenizer_repo: Option<(String, String)>,
+    pub head: HeadOptions,
 }
 
 impl Default for HubOptions {
-    /// `main`, one chunk per execute, the checkpoint's full length, the default
-    /// device's compute dtype, and the model's own tokenizer.
+    /// `main`, the model's own tokenizer, and [`HeadOptions::default`].
     fn default() -> Self {
-        Self {
-            revision: "main".into(),
-            max_batch: 1,
-            max_seq: None,
-            dtype: crate::default_compute_dtype(),
-            tokenizer_repo: None,
-        }
+        Self { revision: "main".into(), tokenizer_repo: None, head: HeadOptions::default() }
     }
 }
 
@@ -193,20 +219,22 @@ pub(crate) struct HeadRun {
 }
 
 /// A head's static plans, one per `(rows, length)` shape, each compiled on
-/// first use (see the module doc for how a batch picks its shape).
+/// first use for the device the head was built on (see the module doc).
 pub(crate) struct HeadPlans<J: HeadJit> {
     model: J::Model,
     max_batch: usize,
     max_seq: usize,
     pad_id: i64,
+    device: DeviceSpec,
     stage: &'static str,
     plans: BTreeMap<(usize, usize), J>,
 }
 
 impl<J: HeadJit> HeadPlans<J> {
     /// Plans for batches of up to `max_batch` chunks of up to `max_seq` tokens,
-    /// padded with `pad_id`. `max_seq` may not exceed `max_positions`, the
-    /// longest chunk the checkpoint has positions for.
+    /// padded with `pad_id`, on the building thread's default device. `max_seq`
+    /// may not exceed `max_positions`, the longest chunk the checkpoint has
+    /// positions for.
     pub(crate) fn new(
         model: J::Model,
         max_batch: usize,
@@ -218,7 +246,7 @@ impl<J: HeadJit> HeadPlans<J> {
         ensure!(max_batch > 0 && max_seq > 0, EmptyCapacitySnafu { stage, max_batch, max_seq });
         ensure!(max_seq <= max_positions, BeyondPositionsSnafu { stage, max_seq, max_positions });
         let pad_id = i64::try_from(pad_id).expect("a pad id fits the i64 inputs");
-        Ok(Self { model, max_batch, max_seq, pad_id, stage, plans: BTreeMap::new() })
+        Ok(Self { model, max_batch, max_seq, pad_id, device: default_device(), stage, plans: BTreeMap::new() })
     }
 
     pub(crate) fn capacity(&self) -> (usize, usize) {
@@ -228,6 +256,10 @@ impl<J: HeadJit> HeadPlans<J> {
     /// Run `batch` through the plan for its shape, compiling it first if this
     /// is the shape's first batch. Returns the live rows of the output.
     pub(crate) fn run(&mut self, batch: &[&Encoding], profile: bool) -> Result<HeadRun, HeadError> {
+        with_default_device(self.device.clone(), || self.run_on_device(batch, profile))
+    }
+
+    fn run_on_device(&mut self, batch: &[&Encoding], profile: bool) -> Result<HeadRun, HeadError> {
         let (b, stage) = (batch.len(), self.stage);
         if b == 0 {
             return Ok(HeadRun { output: Vec::new(), len: 0, profile: profile.then(RunProfile::default) });

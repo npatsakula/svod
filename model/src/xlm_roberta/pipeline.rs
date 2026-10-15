@@ -8,33 +8,21 @@
 use snafu::ResultExt;
 use svod_arch::pipelines::text::HfTokenizer;
 
-use super::config::XlmRobertaConfig;
-use super::error::{HeadSnafu, Result, TokenizerSnafu};
-use super::token_classifier::{XlmRobertaTokenClassificationModel, XlmRobertaTokenClassifier};
+use super::error::{Result, TokenizerSnafu};
+use super::token_classifier::XlmRobertaTokenClassifier;
 use crate::encoder_head::HubOptions;
 use crate::hub::HubRepo;
 
-/// Loaded token-classifier pair: the tokenizer, the head, and the dense
-/// label-name table from `config.json` (`id2label`).
-pub struct XlmRobertaTokenClassifierLoad {
-    pub tokenizer: HfTokenizer,
-    pub classifier: XlmRobertaTokenClassifier,
-    pub id2label: Vec<String>,
-}
-
-/// Download a token-classification checkpoint and assemble an
-/// [`XlmRobertaTokenClassifierLoad`]. `opts.max_seq` defaults to
-/// [`XlmRobertaConfig::max_sequence_length`] (512 for a 514-row position
-/// table).
-pub fn from_hub_token_classification(model_id: &str, opts: &HubOptions) -> Result<XlmRobertaTokenClassifierLoad> {
+/// Download a token-classification checkpoint and build it with
+/// [`XlmRobertaTokenClassifier::from_files`] under `opts.head`, beside its
+/// tokenizer.
+pub fn from_hub_token_classification(
+    model_id: &str,
+    opts: &HubOptions,
+) -> Result<(HfTokenizer, XlmRobertaTokenClassifier)> {
     let repo = HubRepo::open(model_id, &opts.revision)?;
-    let mut config = XlmRobertaConfig { dtype: opts.dtype.clone(), ..super::xlm_roberta_large() };
-    config.merge_structural_from(&XlmRobertaConfig::from_json(&repo.get("config.json")?)?);
-    let sd = crate::state::load_safetensors(&repo.get("model.safetensors")?)?;
+    let classifier =
+        XlmRobertaTokenClassifier::from_files(&repo.get("config.json")?, &repo.get("model.safetensors")?, &opts.head)?;
     let tokenizer = HfTokenizer::from_path(&opts.tokenizer_json(&repo)?).context(TokenizerSnafu)?;
-    let max_seq = opts.max_seq.unwrap_or(config.max_sequence_length());
-    let id2label = config.id2label.clone();
-    let model = XlmRobertaTokenClassificationModel::from_state_dict(&sd, config)?;
-    let classifier = XlmRobertaTokenClassifier::new(model, opts.max_batch, max_seq).context(HeadSnafu)?;
-    Ok(XlmRobertaTokenClassifierLoad { tokenizer, classifier, id2label })
+    Ok((tokenizer, classifier))
 }
