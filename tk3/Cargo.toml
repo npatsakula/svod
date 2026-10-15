@@ -19,6 +19,7 @@ svod-device = { path = "../device", version = "=0.2.0" }
 svod-runtime = { path = "../runtime", version = "=0.2.0" }
 papaya = "0.2.3"
 rayon = "1.12.0"
+tracing = "0.1"
 
 [dev-dependencies]
 libm = "0.2.16"

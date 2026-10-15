@@ -13,11 +13,13 @@ pub(crate) mod linear;
 pub(crate) mod norm;
 pub mod shape;
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use snafu::Snafu;
 use svod_dtype::default_device::default_device;
-use svod_dtype::{DType, DeviceSpec};
+use svod_dtype::{DType, DeviceSpec, ScalarDType};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
@@ -26,10 +28,10 @@ pub use self::conv::{Conv, conv2d};
 pub use self::heads::{Qkv, heads};
 pub use self::linear::{Linear, linear};
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
-use crate::atoms::Target;
+use crate::atoms::{Device, Target};
 pub use crate::kernels::Act;
 use crate::kernels::Batch;
-use crate::tune::{self, TuneKey, TuneStore};
+use crate::tune::{self, Bench, TuneKey, TuneStore};
 use config::Planner;
 use shape::BatchVar;
 
@@ -54,43 +56,107 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Whether a tk3 target with kernels exists for `device`.
+/// Whether `device` has a planner: a tk3 target with kernels whose costs
+/// measure (probed on the first ask).
 pub fn supported(device: &DeviceSpec) -> bool {
-    planner(device).is_some_and(|p| config::has_kernels(&p.target))
+    planner(device).is_some()
 }
 
 /// The planner of a device kernels can be launched on (graph kernels lower
-/// for the default device): its target and the candidate lists ranked for
-/// it, kept for the process, one per device.
-fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
-    static PLANNERS: OnceLock<papaya::HashMap<DeviceSpec, Option<Arc<Planner>>>> = OnceLock::new();
+/// for the default device): its target, its measured costs and the
+/// candidate lists ranked for it, kept for the process, one per device. A
+/// device describes itself once: its probes run under the lock, and a
+/// second caller waits for them.
+pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
+    static PLANNERS: LazyLock<Mutex<HashMap<DeviceSpec, Option<Arc<Planner>>>>> = LazyLock::new(Mutex::default);
     if *device != default_device() {
         return None;
     }
-    let planners = PLANNERS.get_or_init(papaya::HashMap::new).pin();
+    let mut planners = PLANNERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     planners
-        .get_or_insert_with(device.clone(), || Target::for_device(device).map(|t| Arc::new(Planner::new(t))))
+        .entry(device.clone())
+        .or_insert_with(|| {
+            let target = Target::for_device(device).filter(config::has_kernels)?;
+            // A device whose primitives cannot be measured has no planner.
+            let costs = crate::probe::costs(&target)
+                .inspect_err(|e| tracing::warn!("{}: no tk3 planner: {e}", target.arch.target_name()))
+                .ok()?;
+            Some(Arc::new(Planner::new(Device { target, costs })))
+        })
         .clone()
 }
 
-/// The candidate to launch: the global store's measured winner for `shape`
-/// when tuning is on, else the first. `salt` is what else the programs `build`
-/// makes vary with.
-fn tuned<C: Copy + std::fmt::Debug>(
-    op: &'static str,
-    target: &Target,
-    dtype: DType,
-    shape: &[usize],
-    salt: impl std::fmt::Debug,
-    candidates: &[C],
-    build: impl Fn(C) -> tune::Candidate,
-) -> C {
-    if candidates.len() == 1 || !tune::enabled() {
-        return candidates[0];
+/// One shape's tuning on the default device: what keys its store entries
+/// and the programs a config builds, compiled once on one [`Bench`] for
+/// every pass that asks (admission, the choice, later knobs). Each pass is
+/// a list under an op name: [`Self::admitted`] keeps the first
+/// [`SHORTLIST`](config::SHORTLIST) of a ranked list whose compiled kernels
+/// do not spill (all spilling: the first that compile; nothing compiling,
+/// no device: the first, untested), and [`Self::fastest`] times a list on a
+/// store miss. With tuning off (`SVOD_TK3_TUNE=0`) no candidate is timed
+/// and the first admitted one is taken; admission still compiles, and the
+/// device's cost probes still measure once ([`planner`]).
+pub(crate) struct Tuner<'a, C, B> {
+    target: &'a Target,
+    compiler: u64,
+    dtype: ScalarDType,
+    shape: &'a [usize],
+    salt: String,
+    build: B,
+    bench: Bench<C>,
+}
+
+impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> {
+    /// `salt` is what else the programs `build` makes vary with.
+    pub(crate) fn new(device: &'a Device, dtype: DType, shape: &'a [usize], salt: impl Debug, build: B) -> Self {
+        let (compiler, dtype) = (tune::compiler(&default_device()), dtype.scalar().expect("a kernel dtype"));
+        Self {
+            target: &device.target,
+            compiler,
+            dtype,
+            shape,
+            salt: format!("{salt:?}"),
+            build,
+            bench: Bench::default(),
+        }
     }
-    let scalar = dtype.scalar().expect("a kernel dtype");
-    let key = TuneKey::new(op, target, scalar, shape, &format!("{salt:?} {candidates:?}"));
-    TuneStore::global().pick(&key, candidates, build)
+
+    fn key(&self, op: &'static str, list: &[C]) -> TuneKey {
+        let candidates = format!("{} {list:?}", self.salt);
+        TuneKey::new(op, self.target, self.compiler, self.dtype, self.shape, &candidates)
+    }
+
+    /// The configs of `ranked` (best guess first) the tuner chooses among
+    /// ([`config::shortlist`]), compiled in ranked batches and memoized for
+    /// the process.
+    pub(crate) fn admitted(&mut self, op: &'static str, ranked: &[C]) -> Vec<C> {
+        let key = self.key(op, ranked);
+        let (bench, build) = (&mut self.bench, &self.build);
+        let found = TuneStore::global().admitted(&key, || config::shortlist(ranked, |batch| bench.admit(batch, build)));
+        match found {
+            Some(at) => at.iter().map(|&i| ranked[i]).collect(),
+            None => config::distinct(ranked).take(config::SHORTLIST).collect(),
+        }
+    }
+
+    /// The fastest of `candidates` by the global store under `op`, timed on
+    /// a miss; the first when tuning is off, alone or nothing ran.
+    pub(crate) fn fastest(&mut self, op: &'static str, candidates: &[C]) -> C {
+        if !tune::enabled() || candidates.len() == 1 {
+            return candidates[0];
+        }
+        let key = self.key(op, candidates);
+        let chosen = TuneStore::global().choose(&key, candidates, &self.build, &mut self.bench);
+        candidates[chosen.unwrap_or(0)]
+    }
+
+    /// The candidate to launch: `expand` makes the admitted configs of
+    /// `ranked` the candidates (adding variants, such as key splits, the
+    /// plain one first), and the fastest is taken.
+    pub(crate) fn tuned(&mut self, op: &'static str, ranked: &[C], expand: impl Fn(&[C]) -> Vec<C>) -> C {
+        let candidates = expand(&self.admitted(op, ranked));
+        self.fastest(op, &candidates)
+    }
 }
 
 fn fmt_shape(shape: &[SInt]) -> String {

@@ -10,6 +10,7 @@ use svod_ir::{BinaryOp as UBinary, Op, TernaryOp, UOp, ops};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
+use super::declared;
 use crate::atoms::{Target, sm86};
 use crate::build::*;
 use crate::interp::{round_to, run};
@@ -172,7 +173,7 @@ fn gathered_gemm_matches_the_reference_in_the_interpreter() {
 
 fn lowering(target: Target, prefetch: Prefetch, warps: [u32; 2]) -> Lowering {
     Lowering {
-        target,
+        device: declared(target),
         schedule: Schedule::Uniform { prefetch, unroll: true },
         grid: WarpGrid { rows: warps[0], cols: warps[1] },
         swizzle: true,

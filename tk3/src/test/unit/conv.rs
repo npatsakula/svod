@@ -10,6 +10,7 @@ use svod_ir::{BinaryOp as UBinary, Op, UOp, ops};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
+use super::{conv_first_eight, declared, planner};
 use crate::atoms::{Target, sm86};
 use crate::build::F16;
 use crate::interp::{round_to, run};
@@ -156,7 +157,7 @@ fn split_conv_matches_the_direct_convolution(split: usize, epi: Epilogue) {
     let params = inputs(&g, images, epi, 6);
     let want = reference(&g, images, epi, &params);
     let [ho, wo] = g.out_hw();
-    let progs = spec.programs::<F16>(&sm86());
+    let progs = spec.programs::<F16>(&declared(sm86()));
     let partial = vec![0.0; split * images * ho * wo * g.cout];
     let parts = run(&progs[0].0, vec![params[0].clone(), params[1].clone(), partial], &[]).unwrap();
     let mut merge_in = vec![parts[2].clone()];
@@ -221,7 +222,7 @@ proptest! {
 fn emitted(prog: Program, c: GemmCfg) -> Vec<Arc<UOp>> {
     let params =
         prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
-    let lowered = lower(prog, &c.lowering(sm86()), params, DeviceSpec::Cuda { device_id: 0 }).unwrap();
+    let lowered = lower(prog, &c.lowering(&declared(sm86())), params, DeviceSpec::Cuda { device_id: 0 }).unwrap();
     let Op::Program(ops::Program { linear: Some(linear), .. }) = lowered.program.op() else { panic!("a program") };
     let Op::Linear(ops::Linear { ops }) = linear.op() else { panic!("a linear list") };
     ops.to_vec()
@@ -293,7 +294,7 @@ fn conv_candidates_lower() {
     for class in YOLO {
         let g = yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        let cands = Planner::new(target.clone()).conv_candidates(1, ho * wo, &g);
+        let cands = conv_first_eight(&planner(target.clone()), 1, ho * wo, &g);
         if g.cin == 48 {
             assert!(cands.is_empty(), "{g:?}");
             continue;
@@ -312,23 +313,20 @@ fn conv_candidates_lower() {
     }
 }
 
-/// The output tiles measured best on sm_86 are in their class's shortlist
-/// (with the step depth the model prefers), and every candidate pads the
-/// output by at most an eighth: a 96- or 48-wide body takes a 96- or 48-wide
-/// tile, not a power of two padded by a third, and 400 rows take 32-row
-/// tiles, not 64-row ones padded by a ninth.
-#[test_case(96, 96, 80, 1, [64, 96]; "96 channels get a 96-wide tile")]
-#[test_case(192, 192, 40, 1, [64, 64]; "192 at 40x40 fills the SMs with 64x64")]
-#[test_case(384, 384, 160, 2, [64, 96]; "the stride-2 body's measured tile")]
-#[test_case(384, 384, 160, 2, [128, 128]; "a large grid keeps the largest tile")]
-#[test_case(768, 768, 40, 2, [32, 96]; "400 rows pad 64-row tiles by a ninth")]
-#[test_case(96, 48, 80, 1, [64, 48]; "48 channels take a 48-wide tile")]
-fn conv_shortlists_hold_the_measured_tiles(cin: usize, cout: usize, hw: usize, s: usize, tile: [usize; 2]) {
+/// Every candidate pads the output by at most an eighth: a 96- or 48-wide
+/// body takes a 96- or 48-wide tile, not a power of two padded by a third,
+/// and 400 rows take 32-row tiles, not 64-row ones padded by a ninth.
+#[test_case(96, 96, 80, 1; "96 channels")]
+#[test_case(192, 192, 40, 1; "192 at 40x40")]
+#[test_case(384, 384, 160, 2; "the stride-2 body")]
+#[test_case(768, 768, 40, 2; "400 rows")]
+#[test_case(96, 48, 80, 1; "48 channels")]
+fn conv_candidates_pad_by_an_eighth_at_most(cin: usize, cout: usize, hw: usize, s: usize) {
     let g = geom([hw, hw], cin, cout, 3, s, 1, 1);
     let [ho, wo] = g.out_hw();
     let (m, n) = (ho * wo, cout);
-    let cands = Planner::new(sm86()).conv_candidates(1, m, &g);
-    assert!(cands.iter().any(|c| c.gemm.tile[..2] == tile), "{tile:?} not in {cands:?}");
+    let cands = conv_first_eight(&planner(sm86()), 1, m, &g);
+    assert!(!cands.is_empty(), "{g:?}");
     for c in &cands {
         let [bm, bn, _] = c.gemm.tile;
         let area = m.div_ceil(bm) * bm * n.div_ceil(bn) * bn;
@@ -339,30 +337,30 @@ fn conv_shortlists_hold_the_measured_tiles(cin: usize, cout: usize, hw: usize, s
 /// A 48-channel body's B tile is 48 wide and 16 deep (`bk` divides `cin`):
 /// 96 chunks, which split evenly over one warp only. The register-staged
 /// path serves the class with one-warp blocks; the cp.async path, where a
-/// one-depth step runs behind the graph's conv (sm_86 at 160²: 84 µs against
-/// 57), leaves it to the graph.
+/// one-depth step runs behind the graph's conv, leaves it to the graph.
 #[test]
 fn the_48_channel_bodies_take_one_warp_blocks_or_the_graph() {
     let g = geom([160, 160], 48, 48, 3, 1, 1, 1);
-    let rdna3 = Target::for_arch(GpuArch::Amd(AmdArch::Gfx1100));
-    let cands = Planner::new(rdna3).conv_candidates(1, 160 * 160, &g);
+    let rdna3 = Target { sms: Some(48), ..Target::for_arch(GpuArch::Amd(AmdArch::Gfx1100)) };
+    let cands = conv_first_eight(&planner(rdna3), 1, 160 * 160, &g);
     assert!(!cands.is_empty());
     assert!(cands.iter().all(|c| c.gemm.tile[1..] == [48, 16] && c.gemm.warps == [1, 1]), "{cands:?}");
-    assert!(Planner::new(sm86()).conv_candidates(1, 160 * 160, &g).is_empty());
+    assert!(conv_first_eight(&planner(sm86()), 1, 160 * 160, &g).is_empty());
 }
 
 /// A starved grid (400 output pixels of 192 channels) has split candidates.
 #[test]
 fn a_starved_grid_splits_the_reduction() {
     let starved = geom([20, 20], 192, 192, 3, 1, 1, 1);
-    assert!(Planner::new(sm86()).conv_candidates(1, 400, &starved).iter().any(|c| c.split > 1));
+    assert!(conv_first_eight(&planner(sm86()), 1, 400, &starved).iter().any(|c| c.split > 1));
 }
 
 #[test_case(3; "rgb stem")]
 #[test_case(8; "eight channels")]
 #[test_case(40; "a multiple of 8 only")]
 fn too_few_channels_have_no_candidates(cin: usize) {
-    assert!(Planner::new(sm86()).conv_candidates(1, 6400, &geom([80, 80], cin, 64, 3, 1, 1, 1)).is_empty());
+    let g = geom([80, 80], cin, 64, 3, 1, 1, 1);
+    assert!(conv_first_eight(&planner(sm86()), 1, 6400, &g).is_empty());
 }
 
 // ---- on the device -----------------------------------------------------------------
@@ -428,7 +426,7 @@ fn on_device(spec: &ConvSpec, target: &crate::atoms::Target, params: &[Vec<f64>]
         })
         .collect();
     let refs: Vec<&Tensor> = tensors.iter().collect();
-    let mut programs = spec.programs::<F16>(target).into_iter();
+    let mut programs = spec.programs::<F16>(&declared(target.clone())).into_iter();
     let (prog, lowering) = programs.next().unwrap();
     let y = match programs.next() {
         None => graph_launch(prog, &lowering, &refs).unwrap(),
@@ -463,12 +461,12 @@ const RESIDUAL_SILU_BIAS: Epilogue = Epilogue { residual: true, ..SILU_BIAS };
 #[test]
 fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
     let Some(target) = cuda_target() else { return };
+    let planner = super::device_planner().expect("a planner for the device");
     for class in YOLO {
         let g = yolo_geom(class);
-        let [ho, wo] = g.out_hw();
         let params = inputs(&g, 1, RESIDUAL_SILU_BIAS, 13);
         let want = graph_reference(&g, 1, RESIDUAL_SILU_BIAS, &params);
-        for c in Planner::new(target.clone()).conv_candidates(1, ho * wo, &g) {
+        for c in device_candidates(&planner, &g, RESIDUAL_SILU_BIAS).0 {
             let (epilogue, split) = (RESIDUAL_SILU_BIAS, c.split);
             let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue, cfg: c.gemm, split };
             let got = on_device(&spec, &target, &params);
@@ -533,7 +531,7 @@ fn a_bound_batch_runs_the_live_images_on_the_device() {
     let params = inputs(&g, cap, RESIDUAL_SILU_BIAS, 4);
     let tensors: Vec<Tensor> = params.iter().map(|p| upload(p, DType::Float16)).collect();
     let refs: Vec<&Tensor> = tensors.iter().collect();
-    let y = graph_launch(conv::<F16>(&spec), &spec.cfg.lowering(target), &refs).unwrap();
+    let y = graph_launch(conv::<F16>(&spec), &spec.cfg.lowering(&declared(target)), &refs).unwrap();
     let mut plan = y.prepare().unwrap();
     plan.execute_with_vars(&[("b", live as i64)]).unwrap();
     let mut bytes = vec![0u8; live * ho * wo * g.cout * 2];
@@ -571,23 +569,41 @@ const PROBE: [(usize, usize, usize, usize, bool); 12] = [
     (48, 48, 160, 1, true),
 ];
 
+/// The convolution candidates the tuner times on the device for one image
+/// of `g` (the admitted shortlist of the device's ranking, with the splits
+/// the op layer adds) and its pick among them.
+fn device_candidates(planner: &Planner, g: &ConvGeom, epilogue: Epilogue) -> (Vec<ConvCfg>, ConvCfg) {
+    let [ho, wo] = g.out_hw();
+
+    let build = |c: ConvCfg| {
+        let spec = ConvSpec { batch: Batch::Static(1), geom: *g, epilogue, cfg: c.gemm, split: c.split };
+        spec.programs::<F16>(&planner.device)
+    };
+    let shape = [g.cin, g.cout, g.h, g.w, g.stride[0]];
+    let ranked = planner.conv_ranked(1, ho * wo, g);
+    let expand = |admitted: &[ConvCfg]| planner.conv_splits(1, ho * wo, g, admitted);
+    super::tuned_on_device(planner, ("conv2d", DType::Float16, &shape), &ranked, expand, build)
+}
+
 /// Device time of one run of `plan` in ns, every kernel's summed; `None`
 /// when a kernel lost its stamps.
 fn plan_ns(plan: &svod_runtime::ExecutionPlan) -> Option<f64> {
-    super::kernel_secs(plan).map(|t| t.into_iter().sum::<f64>() * 1e9)
+    crate::tune::run(plan).map(|d| d.as_secs_f64() * 1e9)
 }
 
-/// Throughput of every conv candidate per class, timed as the tune store
-/// times them, against the graph's f16 conv (bias and SiLU at f32, one
-/// rounding) over the layout the model holds; run under `BEAM=4` for the
-/// graph arm the model gets. Prints µs and TFLOP/s and never asserts.
+/// Throughput of every conv candidate the tuner admits per class (the
+/// device's probed costs ranking), timed as the tune store times them, and
+/// the tuner's pick, against the graph's f16 conv (bias and SiLU at f32,
+/// one rounding) over the layout the model holds; run under `BEAM=4` for
+/// the graph arm the model gets. Prints µs and TFLOP/s and never asserts.
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn conv_throughput_probe() {
-    let Some(target) = super::device_target() else {
+    let Some(planner) = super::device_planner() else {
         eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
+
     let dtype = DType::Float16;
     for (cin, cout, side, stride, chain) in PROBE {
         let g = geom([side, side], cin, cout, 3, stride, 1, 1);
@@ -595,16 +611,21 @@ fn conv_throughput_probe() {
         let flops = 2.0 * (ho * wo * cout * g.k()) as f64;
         let tflops = |ns: f64| flops / ns / 1e3;
         let label = format!("{cin}->{cout} s{stride} @{side}");
-        let cands = Planner::new(target.clone()).conv_candidates(1, ho * wo, &g);
+        let (cands, pick) = device_candidates(&planner, &g, SILU_BIAS);
         let build = |c: ConvCfg| {
             let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue: SILU_BIAS, cfg: c.gemm, split: c.split };
-            spec.programs::<F16>(&target)
+            spec.programs::<F16>(&planner.device)
         };
         let times = crate::tune::measure(cands.iter().map(|&c| build(c)));
-        for (ConvCfg { gemm: c, split }, t) in cands.iter().zip(&times) {
+        for (cand, t) in cands.iter().zip(&times) {
+            let ConvCfg { gemm: c, split } = cand;
             let t =
                 t.map_or("failed".into(), |t| format!("{:8.1} us {:5.1} TFLOP/s", t as f64 / 1e3, tflops(t as f64)));
-            eprintln!("  {label} tk3 {:?} s{} {:?} unroll={} split {split}: {t}", c.tile, c.stages, c.warps, c.unroll);
+            let picked = if *cand == pick { " (tuner's pick)" } else { "" };
+            eprintln!(
+                "  {label} tk3 {:?} s{} {:?} unroll={} split {split}: {t}{picked}",
+                c.tile, c.stages, c.warps, c.unroll
+            );
         }
 
         let mut seed = 1;

@@ -2,12 +2,11 @@
 //! LayerNorm and RMSNorm, optionally after a residual add.
 
 use super::{Batch, affine, batch_offset, bound, load_f32};
-use crate::atoms::Target;
+use crate::atoms::Device;
 use crate::build::*;
 use crate::ir::*;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
-use crate::schedule::Schedule;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Norm {
@@ -25,14 +24,8 @@ pub struct NormCfg {
 
 impl NormCfg {
     /// No matrix core: the warp grid only has to cover the warps.
-    pub fn lowering(&self, target: Target) -> Lowering {
-        let prefetch = target.prefetch();
-        Lowering {
-            target,
-            schedule: Schedule::Uniform { prefetch, unroll: false },
-            grid: WarpGrid { rows: 1, cols: 1 },
-            swizzle: true,
-        }
+    pub fn lowering(&self, device: &Device) -> Lowering {
+        Lowering::uniform(device, false, WarpGrid { rows: 1, cols: 1 })
     }
 }
 

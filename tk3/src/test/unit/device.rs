@@ -5,7 +5,8 @@ use svod_dtype::{DType, DeviceSpec, ScalarDType, default_device::default_device}
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use crate::atoms::Target;
+use super::declared;
+use crate::atoms::{Device, Target};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
@@ -21,6 +22,16 @@ fn cuda_target() -> Option<Target> {
 
 fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
     gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg })
+}
+
+/// The GEMM configs the tuner times on the device for `spec`'s shape (its
+/// admitted shortlist of the device's ranking) and its pick among them.
+fn device_gemms(planner: &Planner, spec: &GemmSpec) -> (Vec<GemmCfg>, GemmCfg) {
+    let GemmSpec { m, n, k, epilogue, .. } = *spec;
+    let ranked = planner.gemm_ranked(1, m, n, k, epilogue.gated);
+    let build = |cfg: GemmCfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+    let shape = [spec.batch.capacity(), m, n, k];
+    super::tuned_on_device(planner, ("gemm", DType::BFloat16, &shape), &ranked, <[_]>::to_vec, build)
 }
 
 fn lcg(seed: &mut u64) -> f32 {
@@ -50,31 +61,34 @@ fn gemm_matches_the_interpreter(
         return;
     };
     let cfg = GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m: 0, unroll: true };
-    check_gemm(&target, m, n, k, cfg);
+    check_gemm(&declared(target), m, n, k, cfg);
 }
 
-/// Every config the op layer may pick or tune to, on a grid with partial
-/// row and column tiles.
+/// Every config the op layer may pick or tune to (the device's admitted
+/// shortlists), on a grid with partial row and column tiles.
 #[test]
 fn every_gemm_candidate_matches_the_interpreter() {
-    let Some(target) = cuda_target() else {
+    if cuda_target().is_none() {
         eprintln!("skipped: no CUDA device");
         return;
-    };
-    let mut cfgs = Planner::new(target.clone()).gemm_candidates(1, 4096, 4096, 4096, false);
-    for cfg in Planner::new(target.clone()).gemm_candidates(1, 704, 512, 512, false) {
-        if !cfgs.contains(&cfg) {
-            cfgs.push(cfg);
-        }
+    }
+    let planner = super::device_planner().expect("a planner for the device");
+    let mut cfgs = vec![];
+    for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512)] {
+        let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: BIG };
+        cfgs.extend(device_gemms(&planner, &spec).0.into_iter().filter(|c| !cfgs.contains(c)).collect::<Vec<_>>());
     }
     for cfg in cfgs {
-        check_gemm(&target, 200, 136, 128, cfg);
+        check_gemm(&planner.device, 200, 136, 128, cfg);
     }
 }
 
-fn check_gemm(target: &Target, m: usize, n: usize, k: usize, cfg: GemmCfg) {
+/// A config standing in where a spec's own is replaced.
+const BIG: GemmCfg = GemmCfg { tile: [128, 128, 32], stages: 2, warps: [2, 4], group_m: 8, unroll: true };
+
+fn check_gemm(device: &Device, m: usize, n: usize, k: usize, cfg: GemmCfg) {
     let prog = plain_gemm(m, n, k, cfg);
-    let lowering = cfg.lowering(target.clone());
+    let lowering = cfg.lowering(device);
     let mut seed = 11;
     let a: Vec<f32> = (0..m * k).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect();
     let b: Vec<f32> = (0..n * k).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect();
@@ -99,16 +113,19 @@ fn check_gemm(target: &Target, m: usize, n: usize, k: usize, cfg: GemmCfg) {
     eprintln!("{cfg:?}: max abs diff {worst:.3e}");
 }
 
-/// Throughput probe of tk3 GEMM configs at 4096³ bf16; prints TFLOP/s and
-/// never asserts (run with `--ignored --nocapture`). tk1's `gemm_nt`, last
-/// measured here on the 3060 before its removal: 25.8 TFLOP/s.
+/// Throughput probe of tk3 GEMM configs at 4096³ bf16: the configs the
+/// tuner admits on the device (the sm_86 measured set on `cp.async`
+/// targets) and the tuner's pick; prints TFLOP/s and never asserts (run
+/// with `--ignored --nocapture`). tk1's `gemm_nt`, last measured here on
+/// the 3060 before its removal: 25.8 TFLOP/s.
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn gemm_throughput_probe() {
-    let Some(target) = super::device_target() else {
+    let Some(planner) = super::device_planner() else {
         eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
+    let target = &planner.device.target;
     let (m, n, k) = (4096usize, 4096usize, 4096usize);
     let mut seed = 3;
     let a: Vec<f32> = (0..m * k).map(|_| lcg(&mut seed)).collect();
@@ -120,7 +137,9 @@ fn gemm_throughput_probe() {
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     // Static shared memory is capped at 48 KB on this path.
     let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
-    // The configs measured on sm_86; elsewhere the op layer's candidates.
+    // The configs measured on sm_86; elsewhere the tuner's admitted ones.
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: BIG };
+    let (admitted, pick) = device_gemms(&planner, &spec);
     let cfgs: Vec<GemmCfg> = if target.cp_async {
         [
             (128, 64, 32, 2, 2, 2, 8, true),
@@ -139,15 +158,16 @@ fn gemm_throughput_probe() {
         })
         .to_vec()
     } else {
-        Planner::new(target.clone()).gemm_candidates(1, m, n, k, false)
+        admitted
     };
     for cfg in cfgs {
         let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll } = cfg;
-        let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(target.clone()));
+        let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(&planner.device));
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
+        let picked = if cfg == pick { " (tuner's pick)" } else { "" };
         plans.push((
-            format!("tk3 {bm}x{bn}x{bk} s{stages} {wr}x{wc} group_m={group_m} unroll={unroll}"),
+            format!("tk3 {bm}x{bn}x{bk} s{stages} {wr}x{wc} group_m={group_m} unroll={unroll}{picked}"),
             out.prepare().unwrap(),
         ));
     }
@@ -162,8 +182,8 @@ fn gemm_throughput_probe() {
     for _ in 0..4 {
         for (i, (_, plan)) in plans.iter().enumerate() {
             for _ in 0..5 {
-                if let Some(run) = super::kernel_secs(plan) {
-                    best[i] = best[i].min(run.into_iter().fold(0.0, f64::max));
+                if let Some(run) = crate::tune::run(plan) {
+                    best[i] = best[i].min(run.as_secs_f64());
                 }
             }
         }
@@ -173,15 +193,16 @@ fn gemm_throughput_probe() {
     }
 }
 
-/// Every GEMM candidate of `ops::config` timed as the tune store times them,
-/// on Nemotron's projections (704 rows under a batch variable of capacity 1)
-/// and 4096³, marking the old fixed ladder's pick for the small shapes;
-/// prints the first fit (the untuned pick) and the winner per shape.
+/// Every GEMM candidate the tuner admits on the device timed as the tune
+/// store times them, on Nemotron's projections (704 rows under a batch
+/// variable of capacity 1) and 4096³, marking the old fixed ladder's pick
+/// for the small shapes; prints the first admitted (the untuned pick), the
+/// fastest and the tuner's pick per shape.
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn gemm_candidates_probe() {
     use crate::kernels::Act;
-    let Some(target) = super::device_target() else {
+    let Some(planner) = super::device_planner() else {
         eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
@@ -195,18 +216,19 @@ fn gemm_candidates_probe() {
         (4096, 4096, 4096, plain, false),
     ] {
         let batch = if var { Batch::Var { name: "b".into(), min: 1, max: 1 } } else { Batch::Static(1) };
-        let cfgs = Planner::new(target.clone()).gemm_candidates(1, m, n, k, false);
+        let (cfgs, pick) = device_gemms(&planner, &GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg: BIG });
         let build = |cfg| {
             let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };
-            vec![(gemm::<BF16>(&spec), cfg.lowering(target.clone()))]
+            vec![(gemm::<BF16>(&spec), cfg.lowering(&planner.device))]
         };
         let ns = crate::tune::measure(cfgs.iter().map(|&c| build(c)));
         let tflops = |ns: u64| 2.0 * (m * n * k) as f64 / ns as f64 / 1e3;
         eprintln!("== {m}x{n}x{k} {epilogue:?}");
         for (i, (c, t)) in cfgs.iter().zip(&ns).enumerate() {
-            let label = match (i, var && *c == ladder) {
-                (0, _) => " first fit",
-                (_, true) => " old ladder pick",
+            let label = match (i, var && *c == ladder, *c == pick) {
+                (_, _, true) => " tuner's pick",
+                (0, ..) => " first admitted",
+                (_, true, _) => " old ladder pick",
                 _ => "",
             };
             let t = t.map_or("failed".into(), |t| format!("{:6.1} us {:5.1} TFLOP/s", t as f64 / 1e3, tflops(t)));
@@ -214,7 +236,7 @@ fn gemm_candidates_probe() {
         }
         let (t, i) = ns.iter().enumerate().filter_map(|(i, t)| Some((t.as_ref().copied()?, i))).min().unwrap();
         eprintln!(
-            "  tuned: {:?} s{} {:?} unroll={} at {:.1} TFLOP/s",
+            "  fastest: {:?} s{} {:?} unroll={} at {:.1} TFLOP/s",
             cfgs[i].tile,
             cfgs[i].stages,
             cfgs[i].warps,
@@ -235,6 +257,7 @@ fn first_execution_probe() {
         eprintln!("skipped: no CUDA device");
         return;
     };
+    let device = declared(target);
     let (m, n, k) = (704usize, 1536usize, 512usize);
     let mut seed = 5;
     let a: Vec<f32> = (0..m * k).map(|_| lcg(&mut seed)).collect();
@@ -247,7 +270,7 @@ fn first_execution_probe() {
     for (bm, bn, stages) in [(128, 128, 3), (64, 64, 2)] {
         let cfg = GemmCfg { tile: [bm, bn, 32], stages, warps: [2, 2], group_m: 8, unroll: false };
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
-        let out = graph_launch(plain_gemm(m, n, k, cfg), &cfg.lowering(target.clone()), &[&a_t, &b_t, &c_t]).unwrap();
+        let out = graph_launch(plain_gemm(m, n, k, cfg), &cfg.lowering(&device), &[&a_t, &b_t, &c_t]).unwrap();
         plans.push((format!("tk3 {bm}x{bn} s{stages}"), out.prepare().unwrap()));
     }
     let a2 = a_t.try_reshape([m, k]).unwrap();
@@ -260,7 +283,7 @@ fn first_execution_probe() {
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let t = std::time::Instant::now();
         let prog = plain_gemm(m, n, k, cfg);
-        let lowering = cfg.lowering(target.clone());
+        let lowering = cfg.lowering(&device);
         let built = t.elapsed();
         let text = format!("{prog:?}{lowering:?}");
         let formatted = t.elapsed();
@@ -307,10 +330,11 @@ fn first_execution_probe() {
 #[ignore = "perf probe: needs a GPU"]
 fn qwen3_gemm_candidates_probe() {
     use crate::kernels::Act;
-    let Some(target) = super::device_target() else {
+    let Some(planner) = super::device_planner() else {
         eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
+    let target = &planner.device.target;
     let plain = Epilogue::default();
     let shapes = [
         ("qkv", 4096, 4096, 1024, plain, 270.4),
@@ -319,7 +343,8 @@ fn qwen3_gemm_candidates_probe() {
         ("down+residual", 4096, 1024, 3072, Epilogue { residual: true, ..plain }, 196.6),
     ];
     for (name, m, n, k, epilogue, tk1_us) in shapes {
-        let shortlist = Planner::new(target.clone()).gemm_candidates(1, m, n, k, epilogue.gated);
+        let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: BIG };
+        let shortlist = device_gemms(&planner, &spec).0;
         let mut lattice = vec![];
         for bm in [64, 128, 256] {
             for bn in [64, 128, 256] {
@@ -327,10 +352,7 @@ fn qwen3_gemm_candidates_probe() {
                     for warps in [[2, 2], [2, 4], [4, 2], [4, 4]] {
                         for unroll in [false, true] {
                             let cfg = GemmCfg { tile: [bm, bn, bk], stages: 2, warps, group_m: 8, unroll };
-                            let halves = if epilogue.gated { 2 } else { 1 };
-                            let fits = cfg.fits(&target)
-                                && cfg.smem_bytes(epilogue.gated) <= target.smem_bytes
-                                && cfg.registers(&target, halves).is_some_and(|r| r <= target.occupancy.registers);
+                            let fits = cfg.fits(target) && cfg.smem_bytes(epilogue.gated) <= target.smem_bytes;
                             if fits && !shortlist.contains(&cfg) {
                                 lattice.push(cfg);
                             }
@@ -343,7 +365,7 @@ fn qwen3_gemm_candidates_probe() {
         let tflops = |ns: u64| 2.0 * (m * n_eff * k) as f64 / ns as f64 / 1e3;
         let build = |cfg: GemmCfg| {
             let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg };
-            vec![(gemm::<BF16>(&spec), cfg.lowering(target.clone()))]
+            vec![(gemm::<BF16>(&spec), cfg.lowering(&planner.device))]
         };
         let show = |set: &str, cfgs: &[GemmCfg], ns: &[Option<u64>]| -> Option<(u64, GemmCfg)> {
             let mut best: Option<(u64, GemmCfg)> = None;

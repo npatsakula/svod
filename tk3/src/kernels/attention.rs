@@ -3,13 +3,13 @@
 
 use super::rows::NormCfg;
 use super::{Batch, batch_offset, bound, load_f32};
-use crate::atoms::Target;
+use crate::atoms::{Device, Target};
 use crate::build::*;
 use crate::ir::*;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
-use crate::schedule::Schedule;
 
+/// A flash-attention config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FaCfg {
     pub bq: usize,
@@ -20,11 +20,22 @@ pub struct FaCfg {
     pub splits: usize,
     /// The ring loop unrolled over its slots.
     pub unroll: bool,
+    pub forms: Forms,
+}
+
+/// The softmax forms: all off as planned; the tuner flips each where it
+/// measures faster on the device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Forms {
     /// Probabilities held in bf16 are truncated rather than rounded, and the
     /// row sum adds what is held, so the normalization stays unbiased: a pair
     /// per instruction where rounding to nearest takes several. An f16 stream
     /// rounds either way.
     pub truncate_p: bool,
+    /// The row sum follows the product rather than preceding the rescale,
+    /// so both read the held probabilities once; before it, the f32 sum
+    /// overlaps the product's operand conversion.
+    pub sum_after: bool,
     /// The output's rescale is a [`BinaryOp::Scale`]: skipped under a lane
     /// branch by every wave whose rows all kept their maximum, which under the
     /// lazy rescale is most of them. Else a plain multiply.
@@ -44,7 +55,14 @@ pub const WARP_ROWS: usize = 16;
 
 impl FaCfg {
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
-        Self { bq, bkv, stages, splits: 1, unroll: false, truncate_p: false, skip_rescale: false, raw_max: false }
+        Self {
+            bq,
+            bkv,
+            stages,
+            splits: 1,
+            unroll: false,
+            forms: Forms { truncate_p: false, sum_after: false, skip_rescale: false, raw_max: false },
+        }
     }
 
     /// One warp per [`WARP_ROWS`] query rows.
@@ -52,14 +70,8 @@ impl FaCfg {
         (self.bq / WARP_ROWS) as u32
     }
 
-    pub fn lowering(&self, target: Target) -> Lowering {
-        let prefetch = target.prefetch();
-        Lowering {
-            target,
-            schedule: Schedule::Uniform { prefetch, unroll: self.unroll },
-            grid: WarpGrid { rows: self.warps(), cols: 1 },
-            swizzle: true,
-        }
+    pub fn lowering(&self, device: &Device) -> Lowering {
+        Lowering::uniform(device, self.unroll, WarpGrid { rows: self.warps(), cols: 1 })
     }
 
     /// Static shared memory of the K and V rings, in bytes of a 16-bit type.
@@ -212,7 +224,7 @@ impl<T> Step<'_, T> {
     /// planned form, where a positive scale commutes with the maximum and no
     /// bias joins the scores before it.
     fn raw_max(&self) -> bool {
-        self.cfg.raw_max && self.bias.is_none() && self.scale_log2e > 0.0
+        self.cfg.forms.raw_max && self.bias.is_none() && self.scale_log2e > 0.0
     }
 }
 
@@ -276,21 +288,19 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let m_exp = scaled(k, m_new);
     let p = k.binary(s, m_exp, BinaryOp::Sub);
     let p = k.unary(p, UnaryOp::Exp2);
-    let truncate = st.cfg.truncate_p && T::DTYPE == svod_dtype::ScalarDType::BFloat16;
+    let truncate = st.cfg.forms.truncate_p && T::DTYPE == svod_dtype::ScalarDType::BFloat16;
     let p16 = if truncate { k.cast_toward_zero::<T>(p) } else { k.cast::<F32, T>(p) };
     // Truncated probabilities are summed as held, so the normalization stays
-    // unbiased, and the sum follows the product so that both consumers read
-    // them packed once (gfx1201); rounded ones are summed in f32 before the
-    // rescale (sm_86 with the planned forms: 3% at d = 128 over the other
-    // order, d = 64 and a decoder step unchanged).
+    // unbiased; rounded ones are summed in f32. Where the sum goes is
+    // `sum_after`'s.
     let summed = |k: &mut Kernel| {
         let block_sum =
             if truncate { k.reduce_f32(p16, Axis::Row, ReduceOp::Sum) } else { k.reduce(p, Axis::Row, ReduceOp::Sum) };
         let l = k.binary(l, corr, BinaryOp::Mul);
         k.binary(l, block_sum, BinaryOp::Add)
     };
-    let early = (!truncate).then(|| summed(k));
-    let o = if st.cfg.skip_rescale { k.scale(o, corr) } else { k.binary(o, corr, BinaryOp::Mul) };
+    let early = (!st.cfg.forms.sum_after).then(|| summed(k));
+    let o = if st.cfg.forms.skip_rescale { k.scale(o, corr) } else { k.binary(o, corr, BinaryOp::Mul) };
     let o = k.mma(o, p16, false, v_t, false);
     let l = early.unwrap_or_else(|| summed(k));
     [m_new, l, o]

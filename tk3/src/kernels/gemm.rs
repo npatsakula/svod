@@ -5,12 +5,11 @@
 use std::fmt;
 
 use super::{Act, Batch, batch_offset, bound, konst, load_f32};
-use crate::atoms::Target;
+use crate::atoms::Device;
 use crate::build::*;
 use crate::ir::*;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
-use crate::schedule::Schedule;
 
 /// What runs on the accumulator before the single rounding at the store.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -85,14 +84,8 @@ pub struct GemmCfg {
 }
 
 impl GemmCfg {
-    pub fn lowering(&self, target: Target) -> Lowering {
-        let prefetch = target.prefetch();
-        Lowering {
-            target,
-            schedule: Schedule::Uniform { prefetch, unroll: self.unroll },
-            grid: WarpGrid { rows: self.warps[0], cols: self.warps[1] },
-            swizzle: true,
-        }
+    pub fn lowering(&self, device: &Device) -> Lowering {
+        Lowering::uniform(device, self.unroll, WarpGrid { rows: self.warps[0], cols: self.warps[1] })
     }
 
     /// Static shared memory of the operand ring, in bytes of a 16-bit type.
@@ -272,9 +265,9 @@ pub struct MergeSpec {
 }
 
 impl MergeSpec {
-    pub fn lowering(&self, target: Target) -> Lowering {
+    pub fn lowering(&self, device: &Device) -> Lowering {
         GemmCfg { tile: [self.tile[0], self.tile[1], 16], stages: 1, warps: [4, 1], group_m: 0, unroll: false }
-            .lowering(target)
+            .lowering(device)
     }
 }
 

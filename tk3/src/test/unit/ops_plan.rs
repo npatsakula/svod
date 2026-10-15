@@ -1,21 +1,24 @@
 //! The op layer's decisions on the host: which plan each shape, dtype and
 //! target gets, and which requests are errors rather than fallbacks.
 
+use std::sync::Arc;
+
 use svod_dtype::{AmdArch, DType, DeviceSpec, GpuArch, MetalFamily};
 use svod_ir::SInt;
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
-use crate::atoms::{Target, sm86};
+use super::{costs, first_eight, planner};
+use crate::atoms::{Costs, Device, Target, sm86};
 use crate::build::BF16 as BF16T;
 use crate::kernels::Batch;
-use crate::kernels::attention::FaCfg;
+use crate::kernels::attention::{FaCfg, Forms};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::NormCfg;
-use crate::ops::config::{self, Planner};
+use crate::ops::attention::{descend, split_ranked};
+use crate::ops::config::{self, Planner, Run, gemm_cfg};
 use crate::ops::shape::{self, Extent, Fallback, Plan, extent};
 use crate::ops::{self as tk, Act, Attn, Cache, Error, KeyMask, Linear, Qkv};
-use crate::test::unit::targets::amd;
 
 const BF16: DType = DType::BFloat16;
 
@@ -23,8 +26,12 @@ fn ext(dims: &[usize]) -> Extent {
     Extent { dims: dims.to_vec(), var: false }
 }
 
-fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { tile, stages, warps, group_m: 8, unroll }
+/// The candidates of a plan that takes the kernel.
+fn kernel_plan<C>(plan: Plan<C>) -> Arc<[C]> {
+    match plan {
+        Plan::Kernel(list) => list,
+        Plan::Graph(why) => panic!("graph: {why:?}"),
+    }
 }
 
 /// The untuned pick of a plan: its first candidate.
@@ -36,72 +43,69 @@ fn first<C: Clone>(plan: Plan<C>) -> Result<C, Fallback> {
 }
 
 fn rdna3() -> Target {
-    Target::for_arch(GpuArch::Amd(AmdArch::Gfx1100))
+    Target { sms: Some(48), ..Target::for_arch(GpuArch::Amd(AmdArch::Gfx1100)) }
 }
 
 /// A target with a matrix core and no tables.
 fn apple() -> Target {
-    Target::for_arch(GpuArch::Metal(MetalFamily::Apple(9)))
+    Target { sms: Some(10), ..Target::for_arch(GpuArch::Metal(MetalFamily::Apple(9))) }
 }
 
 // ---- linear ------------------------------------------------------------------------
 
-/// The model's lead for a big GEMM on sm_86: the 128×128 tile over 16 warps,
-/// three 32-deep slots (100 KB holds them twice over).
-const BIG: GemmCfg = GemmCfg { tile: [128, 128, 32], stages: 3, warps: [4, 4], group_m: 8, unroll: false };
-/// The config measured fastest at 4096³ on the 3060 (25.4 TFLOP/s): the same
-/// tile and ring over eight warps. It stays in the shortlist.
+/// The config measured fastest at 4096³ on the 3060 (25.4 TFLOP/s): the
+/// 128×128 tile and three 32-deep slots over eight warps.
 const BIG_MEASURED: GemmCfg = GemmCfg { tile: [128, 128, 32], stages: 3, warps: [2, 4], group_m: 8, unroll: false };
 
-/// The untuned pick per shape on sm_86: a grid that fills the device, or
-/// half of one, takes the 128×128 tile, 32 deep; as rows run out the tiles
-/// shrink to 32 rows over four warps; a reduction dim off 32 takes 16-deep
-/// steps.
-#[test_case(&[4096, 4096], 4096, false, Ok(BIG); "large grid, deepest ring")]
-#[test_case(&[4096, 4096], 4096, true, Ok(BIG); "gated keeps the ring in 99 KB")]
-#[test_case(&[8, 256, 512], 2048, false, Ok(BIG); "a static batch counts toward the grid")]
-#[test_case(&[2048, 512], 1024, false, Ok(BIG); "half the big grid")]
-#[test_case(&[8, 37, 512], 512, false, Ok(gemm_cfg([32, 64, 32], 3, [2, 2], false)); "medium grid")]
-#[test_case(&[37, 64], 96, false, Ok(gemm_cfg([32, 48, 64], 3, [2, 2], false)); "few rows")]
-#[test_case(&[37, 48], 96, false, Ok(gemm_cfg([32, 64, 16], 3, [1, 2], false)); "k a multiple of 16 only")]
-#[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
-#[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
-#[test_case(&[0, 64], 96, false, Err(Fallback::Shape); "no rows")]
-fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallback>) {
-    assert_eq!(first(shape::linear(Some(&Planner::new(sm86())), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
-}
-
-fn gemm_list(x: &Extent, n: usize, gated: bool) -> Vec<GemmCfg> {
-    match shape::linear(Some(&Planner::new(sm86())), &[BF16, BF16], Some(x), n, gated) {
-        Plan::Kernel(list) => list,
-        Plan::Graph(why) => panic!("graph: {why:?}"),
+/// A list the planner offers for `k` on `target`: not empty, each config
+/// once, lowering there with its ring in shared memory and dividing `k`;
+/// its untested shortlist one pipeline per output tile and warp grid.
+fn assert_valid(list: &[GemmCfg], target: &Target, k: usize, gated: bool) {
+    assert!(!list.is_empty(), "{list:?}");
+    for (i, c) in list.iter().enumerate() {
+        assert!(c.fits(target) && k.is_multiple_of(c.tile[2]), "{c:?}");
+        assert!(c.smem_bytes(gated) <= target.smem_bytes, "{c:?}");
+        assert!(!list[..i].contains(c), "{c:?} twice");
+    }
+    let short = first_eight(list);
+    for (i, c) in short.iter().enumerate() {
+        assert!(!short[..i].iter().any(|o| o.tile[..2] == c.tile[..2] && o.warps == c.warps), "{short:?}");
     }
 }
 
-/// The 4096³ shortlist on sm_86: eight distinct tiles and warp grids, the
-/// cheapest by the traffic model first, each with its one cheapest pipeline
-/// (three stages, rolled: the deepest ring 100 KB holds, and `cp.async` slots
-/// gain nothing from unrolling in the model), the measured peak among them,
-/// and the 64-row tiles the sweeps measured ahead on narrower problems.
+/// Every shape the kernel takes on sm_86 plans a valid list (a reduction dim
+/// off 32 takes 16-deep steps); the rest keep the graph for their reason.
+#[test_case(&[4096, 4096], 4096, false, Ok(()); "large grid")]
+#[test_case(&[4096, 4096], 4096, true, Ok(()); "gated")]
+#[test_case(&[8, 256, 512], 2048, false, Ok(()); "a static batch counts toward the grid")]
+#[test_case(&[2048, 512], 1024, false, Ok(()); "half the big grid")]
+#[test_case(&[8, 37, 512], 512, false, Ok(()); "medium grid")]
+#[test_case(&[37, 64], 96, false, Ok(()); "few rows")]
+#[test_case(&[37, 48], 96, false, Ok(()); "k a multiple of 16 only")]
+#[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
+#[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
+#[test_case(&[0, 64], 96, false, Err(Fallback::Shape); "no rows")]
+fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<(), Fallback>) {
+    let plan = shape::linear(Some(&planner(sm86())), &[BF16, BF16], Some(&ext(x)), n, gated);
+    match plan {
+        Plan::Kernel(list) => assert_valid(&list, &sm86(), *x.last().unwrap(), gated),
+        Plan::Graph(why) => assert_eq!(Err(why), want),
+    }
+}
+
+fn gemm_list(x: &Extent, n: usize, gated: bool) -> Arc<[GemmCfg]> {
+    kernel_plan(shape::linear(Some(&planner(sm86())), &[BF16, BF16], Some(x), n, gated))
+}
+
+/// The 4096³ ranking on sm_86 is valid.
 #[test]
 fn large_gemm_candidates() {
-    let want = [
-        BIG,
-        gemm_cfg([128, 256, 32], 3, [4, 4], false),
-        gemm_cfg([256, 128, 32], 3, [4, 4], false),
-        BIG_MEASURED,
-        gemm_cfg([128, 128, 32], 3, [4, 2], false),
-        gemm_cfg([64, 128, 32], 3, [2, 4], false),
-        gemm_cfg([128, 64, 32], 3, [4, 2], false),
-        gemm_cfg([64, 64, 32], 3, [2, 2], false),
-    ];
-    assert_eq!(gemm_list(&ext(&[4096, 4096]), 4096, false), want);
+    assert_valid(&gemm_list(&ext(&[4096, 4096]), 4096, false), &sm86(), 4096, false);
 }
 
 /// Nemotron's projections (704 rows under a batch variable of capacity 1)
-/// measured fastest on 64×64 tiles on the 3060, where 128-row tiles pad 64
-/// rows and leave the 28 SMs with too few blocks: the shortlist keeps a
-/// 64-row tile for the tune store to find, and spans eight tiles and grids.
+/// rank more than eight configs, so the shortlist spans eight tiles and
+/// grids.
 #[test_case(512, 512, false; "qkv-sized out")]
 #[test_case(1536, 512, false; "fused qkv")]
 #[test_case(2048, 512, false; "ffn up")]
@@ -110,39 +114,195 @@ fn large_gemm_candidates() {
 fn small_m_gemm_candidates(n: usize, k: usize, gated: bool) {
     let x = Extent { dims: vec![1, 704, k], var: true };
     let list = gemm_list(&x, n, gated);
-    assert_eq!(list.len(), 8);
-    assert!(list.iter().any(|c| c.tile[0] == 64), "{list:?}");
-    for (i, c) in list.iter().enumerate() {
-        assert!(!list[..i].iter().any(|o| o.tile[..2] == c.tile[..2] && o.warps == c.warps), "{list:?}");
-    }
+    assert!(list.len() >= 8, "{list:?}");
+    assert_valid(&list, &sm86(), k, gated);
+}
+
+fn gfx1201() -> Target {
+    Target { sms: Some(64), ..Target::for_arch(GpuArch::Amd(AmdArch::Gfx1201)) }
 }
 
 /// A gated weight stages a B tile twice the config's width and holds two
-/// accumulators: on gfx1201 the 128×128 tile over eight warps costs 216 of a
-/// lane's 256 registers gated where its half-width form costs 128, and its
-/// 64-deep form does not fit at all. The model knows it as a `2·bn`-wide
-/// problem, so Qwen3's gate/up shortlist leads with 128×128 over 16 warps
-/// and holds the half-width tiles (measured 329 / 329 / 338 µs against
-/// 358 for the next and 431 for tk1); only the plain shortlist reaches a
-/// 256-wide tile.
+/// accumulators: by the layout count the 128×128 tile over eight warps
+/// holds 216 registers a lane gated where its half-width form holds 128, and
+/// its 64-deep form more than gfx1201's 256, whose two-slot ring of a
+/// 384-wide fill is past the 64 KB of LDS besides. The ranking keeps steps
+/// at least two matrix-core depths deep.
 #[test]
 fn a_gated_gemm_is_a_double_width_problem() {
-    let target = Target { sms: Some(64), ..Target::for_arch(GpuArch::Amd(AmdArch::Gfx1201)) };
+    let target = gfx1201();
     let eight = gemm_cfg([128, 128, 32], 2, [2, 4], true);
     let half = gemm_cfg([128, 64, 32], 2, [2, 4], true);
     let deep = gemm_cfg([128, 128, 64], 2, [2, 4], true);
     assert_eq!((eight.registers(&target, 2), half.registers(&target, 2)), (Some(216), Some(128)));
     assert!(deep.registers(&target, 2).is_some_and(|r| r > 256), "{:?}", deep.registers(&target, 2));
-    let planner = Planner::new(target.clone());
-    let gated = planner.gemm_candidates(1, 4096, 3072, 1024, true);
-    assert_eq!(gated[0], gemm_cfg([128, 128, 32], 2, [4, 4], true), "{gated:?}");
-    assert!(gated.contains(&half) && gated.contains(&gemm_cfg([128, 64, 32], 2, [4, 2], true)), "{gated:?}");
-    assert!(!gated.contains(&deep) && gated.iter().all(|c| c.tile[2] >= 32), "{gated:?}");
-    let plain = planner.gemm_candidates(1, 4096, 3072, 1024, false);
-    assert!(gated.iter().all(|c| c.tile[1] <= 128) && plain.iter().any(|c| c.tile[1] == 256), "{plain:?}");
+    let gated = planner(target.clone()).gemm_ranked(1, 4096, 3072, 1024, true);
+    assert_valid(&gated, &target, 1024, true);
+    assert!(gated.iter().all(|c| c.tile[2] >= 32), "{gated:?}");
+    let p = config::Problem { batches: 1, m: 4096, n: 3072, k: 1024, halves: 2 };
+    assert!(deep.smem_bytes(true) > target.smem_bytes && p.admit(&planner(target), &deep).is_none());
 }
 
-/// Every list is short, duplicate-free, within shared memory and divides `k`.
+/// The layout count over-counts gfx11's replicated WMMA fragments: at
+/// `d = 128` it puts 64×16 and 128×16 past the 256 registers a lane holds,
+/// yet both compile without spilling, rolled. So no count admits: both are
+/// ranked, and the compiled kernel decides.
+#[test]
+fn no_register_count_admits() {
+    let target = rdna3();
+    let ranked = planner(target.clone()).attention_ranked(8, 1500, 1500, 128, false);
+    for (bq, bkv) in [(64, 16), (128, 16)] {
+        let over = FaCfg::new(bq, bkv, 2).registers(&target, 128).is_some_and(|r| r > 256);
+        assert!(over, "{bq}×{bkv} counts past the cap");
+        assert!(ranked.iter().any(|c| (c.bq, c.bkv) == (bq, bkv)), "{bq}×{bkv} not in {ranked:?}");
+    }
+}
+
+/// The SM time of `rounds` rounds of `actual` resident blocks of `waves`
+/// waves, each `trips` trips of `work`, on sm_86 under `costs`: blocks
+/// filling the SMs `rounds` times over, each holding `1/actual` of an SM's
+/// shared memory (at most twelve resident: sm_86's 48 waves over four).
+fn pipelined(costs: Costs, [rounds, trips, actual, waves, stages]: [usize; 5], work: f64) -> f64 {
+    let planner = Planner::new(Device { target: sm86(), costs });
+    let (blocks, smem) = (rounds * actual * planner.sms(), sm86().smem_bytes / actual);
+    planner.pipelined(Run { blocks, smem, regs: 0, waves, trips, work, stages })
+}
+
+/// Without latency a round is its issue work: linear in the work, the
+/// resident blocks, the trips and the rounds, whatever the ring.
+#[test]
+fn without_latency_a_round_is_its_work() {
+    let flat = Costs { latency: 0.0, ..costs() };
+    let cost = |rounds, trips, actual, work, stages| pipelined(flat, [rounds, trips, actual, 4, stages], work);
+    assert_eq!(cost(1, 1, 1, 100.0, 2), 100.0);
+    assert_eq!(cost(1, 1, 1, 300.0, 2), 3.0 * cost(1, 1, 1, 100.0, 2));
+    assert_eq!(cost(2, 3, 4, 100.0, 3), 24.0 * cost(1, 1, 1, 100.0, 3));
+    assert_eq!(cost(1, 1, 1, 100.0, 2), cost(1, 1, 1, 100.0, 3));
+}
+
+proptest::proptest! {
+    /// A block of fewer waves than the SM's SIMDs leaves SIMDs idle: with
+    /// no latency, a one-warp block never beats a block of as many warps as
+    /// SIMDs doing the same work, and is that many times slower alone.
+    #[test]
+    fn a_one_warp_block_never_beats_a_full_one(
+        rounds in 1usize..8,
+        trips in 1usize..64,
+        actual in 1usize..12,
+        work in 1.0f64..1e4,
+    ) {
+        let flat = Costs { latency: 0.0, ..costs() };
+        let simds = sm86().occupancy.simds as usize;
+        let one = pipelined(flat, [rounds, trips, actual, 1, 2], work);
+        let full = pipelined(flat, [rounds, trips, actual, simds, 2], work);
+        proptest::prop_assert!(one >= full, "{one} < {full}");
+        let alone = pipelined(flat, [rounds, trips, 1, 1, 2], work);
+        proptest::prop_assert_eq!(alone, simds as f64 * pipelined(flat, [rounds, trips, 1, simds, 2], work));
+    }
+}
+
+/// Under a latency no work covers, a round costs the latency its ring
+/// leaves, so a register file holding twice the resident blocks halves the
+/// rounds and the cost; a deeper ring hides more of it.
+#[test]
+fn under_latency_resident_blocks_halve_the_cost() {
+    let slow = Costs { latency: 1e9, ..costs() };
+    let p = config::Problem { batches: 112, m: 128, n: 128, k: 4096, halves: 1 };
+    let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
+    let full = sm86();
+    let starved = Target { occupancy: crate::atoms::Occupancy { waves: 2, ..full.occupancy }, ..sm86() };
+    let cost = |target: Target| p.admit(&Planner::new(Device { target, costs: slow }), &cfg).expect("admitted").0;
+    assert_eq!(2.0 * cost(full), cost(starved));
+    assert!(pipelined(slow, [1, 1, 1, 4, 3], 1.0) < pipelined(slow, [1, 1, 1, 4, 2], 1.0));
+}
+
+/// A ring of one stage or none prefetches nothing: the round waits the
+/// whole latency, never a division by zero.
+#[test_case(0; "no ring")]
+#[test_case(1; "one stage")]
+fn a_ring_without_prefetch_waits_the_latency(stages: usize) {
+    let c = costs();
+    assert_eq!(pipelined(c, [1, 1, 1, 4, stages], 0.0), c.latency);
+    assert_eq!(pipelined(c, [1, 1, 1, 4, stages], 0.0), pipelined(c, [1, 1, 1, 4, 2], 0.0));
+}
+
+/// A ranked config of the shortlist tests: its position, and the tile it
+/// is a pipeline of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Pipe {
+    at: usize,
+    tile: usize,
+}
+
+impl config::Tiled for Pipe {
+    fn tile(&self) -> Self {
+        Pipe { at: 0, ..*self }
+    }
+}
+
+/// The tuner's shortlist is the first eight ranked configs whose compiled
+/// kernels do not spill, one per tile (its first clean pipeline), in ranked
+/// order, compiled in batches of eight until eight tiles pass: a batch past
+/// that is never compiled. Where every config that compiles spills, the
+/// first eight of those are timed anyway; where nothing compiles there is
+/// nothing to judge. `twins` are `(config, the config whose tile it shares)`.
+#[test_case(&[], &[], &[], 20, Some(&[0, 1, 2, 3, 4, 5, 6, 7]), 1; "nothing spills: the first batch")]
+#[test_case(&[1, 4, 9], &[], &[], 20, Some(&[0, 2, 3, 5, 6, 7, 8, 10]), 2; "spills skipped, order kept")]
+#[test_case(&[0, 1, 2], &[], &[], 5, Some(&[3, 4]), 1; "a short ranking keeps what passes")]
+#[test_case(&[0, 2, 3], &[1], &[], 5, Some(&[4]), 1; "a failure is never timed")]
+#[test_case(&[0, 1], &[], &[], 2, Some(&[0, 1]), 1; "every config spills: they are timed anyway")]
+#[test_case(&[0], &[], &[], 1, Some(&[0]), 1; "a single spilling config is timed alike")]
+#[test_case(&[], &[], &[], 1, Some(&[0]), 1; "a single clean config")]
+#[test_case(&(0..20).collect::<Vec<_>>(), &[], &[], 20, Some(&[0, 1, 2, 3, 4, 5, 6, 7]), 3; "all twenty spill")]
+#[test_case(&[0, 1], &[2], &[], 3, Some(&[0, 1]), 1; "spilled and failed: the spilled")]
+#[test_case(&[], &[0, 1, 2], &[], 3, None, 1; "nothing compiles")]
+#[test_case(&[], &[], &[], 0, None, 0; "nothing ranked")]
+#[test_case(&[0], &[], &[(1, 0)], 3, Some(&[1, 2]), 1; "a spilling unrolled ring yields to its clean rolled twin")]
+#[test_case(&[], &[], &[(1, 0)], 3, Some(&[0, 2]), 1; "two clean pipelines of one tile: the first")]
+#[test_case(&[], &[], &[(1, 0), (3, 2)], 16, Some(&[0, 2, 4, 5, 6, 7, 8, 9]), 2; "eight tiles, not eight configs")]
+#[test_case(&[0, 1], &[], &[(1, 0)], 2, Some(&[0, 1]), 1; "both pipelines spill: both are timed")]
+fn the_shortlist_is_the_first_eight_tiles_that_do_not_spill(
+    spilled: &[usize],
+    failed: &[usize],
+    twins: &[(usize, usize)],
+    ranked: usize,
+    want: Option<&[usize]>,
+    batches: usize,
+) {
+    use crate::tune::Compiled;
+    let tile = |at: usize| twins.iter().find(|(c, _)| *c == at).map_or(at, |(_, t)| *t);
+    let ranked: Vec<Pipe> = (0..ranked).map(|at| Pipe { at, tile: tile(at) }).collect();
+    let mut asked = vec![];
+    let got = config::shortlist(&ranked, |batch| {
+        asked.push(batch.to_vec());
+        let verdict = |p: &Pipe| match (spilled.contains(&p.at), failed.contains(&p.at)) {
+            (_, true) => Compiled::Failed,
+            (true, _) => Compiled::Spilled,
+            _ => Compiled::Clean,
+        };
+        batch.iter().map(verdict).collect()
+    });
+    assert_eq!(got.as_deref(), want);
+    assert_eq!(asked.len(), batches, "{asked:?}");
+    assert!(asked.iter().flatten().eq(ranked.iter().take(8 * batches)), "ranked batches of eight: {asked:?}");
+}
+
+/// At zero costs every config ties: the ranking is degenerate (fewest
+/// registers first) but finite, and still lists what lowers.
+#[test]
+fn a_ranking_at_zero_costs_is_finite() {
+    let planner = Planner::new(Device { target: sm86(), costs: Costs::default() });
+    let p = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
+    let ranked = p.ranked(&planner);
+    assert!(!ranked.is_empty());
+    assert!(ranked.iter().all(|c| p.admit(&planner, c).is_some_and(|(cost, _)| cost == 0.0)));
+    let a = config::Attention { tiles: 8, t: 100, tk: 100, d: 64, causal: true };
+    let ranked = a.ranked(&planner);
+    assert!(!ranked.is_empty());
+    assert!(ranked.iter().all(|c| a.admit(&planner, c).is_some_and(|(cost, _)| cost == 0.0)));
+}
+
+/// Every list is non-empty, duplicate-free, within shared memory and divides `k`.
 #[test_case(&[4096, 4096], 4096, false; "large")]
 #[test_case(&[4096, 4096], 4096, true; "large gated")]
 #[test_case(&[704, 2048], 512, false; "small m")]
@@ -152,12 +312,8 @@ fn gemm_candidates_are_valid(x: &[usize], n: usize, gated: bool) {
     let k = *x.last().unwrap();
     for smem in [sm86().smem_bytes, 48 << 10] {
         let target = Target { smem_bytes: smem, ..sm86() };
-        let Plan::Kernel(list) =
-            shape::linear(Some(&Planner::new(target.clone())), &[BF16; 2], Some(&ext(x)), n, gated)
-        else {
-            panic!("no kernel")
-        };
-        assert!((1..=8).contains(&list.len()), "{list:?}");
+        let list = kernel_plan(shape::linear(Some(&planner(target)), &[BF16; 2], Some(&ext(x)), n, gated));
+        assert!(!list.is_empty(), "{list:?}");
         for (i, c) in list.iter().enumerate() {
             assert!(k.is_multiple_of(c.tile[2]) && c.smem_bytes(gated) <= smem, "{c:?}");
             assert!(!list[..i].contains(c), "duplicate {c:?}");
@@ -166,16 +322,14 @@ fn gemm_candidates_are_valid(x: &[usize], n: usize, gated: bool) {
 }
 
 /// A target capped at static shared memory drops a stage for the gated GEMM:
-/// its three-slot ring of a 384-wide fill is 72 KB.
+/// the three-slot ring of the 128×128 tile's 384-wide fill is 72 KB.
 #[test]
 fn gated_linear_drops_a_stage_under_a_static_cap() {
-    let mut target = sm86();
-    target.smem_bytes = 48 << 10;
-    let want = Ok(GemmCfg { stages: 2, ..BIG });
-    assert_eq!(
-        first(shape::linear(Some(&Planner::new(target.clone())), &[BF16, BF16], Some(&ext(&[4096, 4096])), 4096, true)),
-        want
-    );
+    let target = Target { smem_bytes: 48 << 10, ..sm86() };
+    let planner = planner(target.clone());
+    let list = kernel_plan(shape::linear(Some(&planner), &[BF16, BF16], Some(&ext(&[4096, 4096])), 4096, true));
+    assert_valid(&list, &target, 4096, true);
+    assert!(!list.iter().any(|c| c.tile == [128, 128, 32] && c.stages == 3), "{list:?}");
 }
 
 #[test_case(None, &[BF16, BF16], true, Fallback::Target; "no target")]
@@ -188,7 +342,7 @@ fn every_op_falls_back_alike(target: Option<Target>, dtypes: &[DType], static_di
     let x = static_dims.then(|| ext(&[2, 128, 1024]));
     let kv = static_dims.then(|| ext(&[2, 128, 16, 64]));
     let q = static_dims.then(|| ext(&[2, 128, 16, 64]));
-    let planner = target.map(Planner::new);
+    let planner = target.map(planner);
     let target = planner.as_ref();
     assert_eq!(shape::linear(target, dtypes, x.as_ref(), 1024, false), Plan::Graph(why));
     assert_eq!(shape::attention(target, dtypes, q.as_ref(), kv.as_ref(), false), Plan::Graph(why));
@@ -199,21 +353,15 @@ fn every_op_falls_back_alike(target: Option<Target>, dtypes: &[DType], static_di
 #[test]
 fn a_variable_reduced_dim_falls_back() {
     let x = Extent { dims: vec![64], var: true };
-    assert_eq!(
-        shape::linear(Some(&Planner::new(sm86())), &[BF16; 2], Some(&x), 64, false),
-        Plan::Graph(Fallback::Symbolic)
-    );
+    assert_eq!(shape::linear(Some(&planner(sm86())), &[BF16; 2], Some(&x), 64, false), Plan::Graph(Fallback::Symbolic));
     let x = Extent { dims: vec![1024], var: true };
-    assert_eq!(shape::norm(Some(&Planner::new(sm86())), &[BF16; 2], Some(&x)), Plan::Graph(Fallback::Symbolic));
+    assert_eq!(shape::norm(Some(&planner(sm86())), &[BF16; 2], Some(&x)), Plan::Graph(Fallback::Symbolic));
 }
 
 #[test]
 fn f16_takes_the_kernels() {
     let f16 = [DType::Float16, DType::Float16];
-    assert!(matches!(
-        shape::linear(Some(&Planner::new(sm86())), &f16, Some(&ext(&[64, 64])), 64, false),
-        Plan::Kernel(_)
-    ));
+    assert!(matches!(shape::linear(Some(&planner(sm86())), &f16, Some(&ext(&[64, 64])), 64, false), Plan::Kernel(_)));
 }
 
 /// The tune store keys a GEMM by its epilogue's text: without a scale it
@@ -225,26 +373,8 @@ fn an_unscaled_epilogue_keeps_its_tune_key() {
     assert_eq!(format!("{plain:?}"), "Epilogue { bias: true, act: None, gated: false, residual: true }");
     let half = Epilogue { scale: Some(Scale::new(0.5)), ..plain };
     assert_eq!(format!("{half:?}"), "Epilogue { bias: true, act: None, gated: false, residual: true, scale: 0.5 }");
-    let spec = |epilogue| GemmSpec { m: 64, n: 64, k: 64, batch: Batch::Static(1), epilogue, cfg: BIG };
+    let spec = |epilogue| GemmSpec { m: 64, n: 64, k: 64, batch: Batch::Static(1), epilogue, cfg: BIG_MEASURED };
     assert_ne!(gemm::<BF16T>(&spec(plain)), gemm::<BF16T>(&spec(half)));
-}
-
-/// A plain global view prints as it did before row maps existed, so a
-/// GEMM's program fingerprint, and with it the tune store, is unchanged; a
-/// gathered view prints its map.
-#[test]
-fn an_unmapped_view_keeps_its_tune_key() {
-    use crate::ir::{ParamId, Place, RowMap, ScalarId};
-    let (param, offset, stride, bounds) =
-        (ParamId(0), ScalarId(1), [ScalarId(2), ScalarId(3)], [None, Some(ScalarId(4))]);
-    let plain = Place::Global { param, offset, stride, bounds, rows: None };
-    let old = "Global { param: ParamId(0), offset: ScalarId(1), stride: [ScalarId(2), ScalarId(3)], bounds: [None, Some(ScalarId(4))] }";
-    assert_eq!(format!("{plain:?}"), old);
-    let rows = Some(RowMap { offset: ScalarId(5), valid: None });
-    let gathered = Place::Global { param, offset, stride, bounds, rows };
-    assert!(format!("{gathered:?}").ends_with("rows: RowMap { offset: ScalarId(5), valid: None } }"));
-    let smem = Place::Smem { alloc: crate::ir::SmemId(1), offset };
-    assert_eq!(format!("{smem:?} {:?}", Place::Reg), "Smem { alloc: SmemId(1), offset: ScalarId(1) } Reg");
 }
 
 /// The graph fallback (f32 here) applies the scale between the activation and
@@ -274,24 +404,29 @@ fn the_graph_scales_before_the_residual(act: Act, gated: bool) {
 
 // ---- attention ---------------------------------------------------------------------
 
-/// The untuned pick per head size on sm_86 (a prefill of 100 queries over
-/// 37 keys): 16-key blocks at `d = 128`, where a key block's fragments and
-/// scores are what the register file is spent on, and the query block the
-/// device's SMs fill; `d = 48` keeps the shapes whose K/V fills divide among
-/// the block's threads (96-byte rows); `d = 32` fits 64-key blocks. A head
-/// size past the register file keeps the graph.
-#[test_case(64, Ok((64, 16)); "d 64")]
-#[test_case(128, Ok((128, 16)); "d 128")]
-#[test_case(48, Ok((64, 64)); "d 48")]
-#[test_case(32, Ok((128, 64)); "d 32")]
-#[test_case(256, Err(Fallback::Shape); "d 256")]
-fn attention_plans(d: usize, want: Result<(usize, usize), Fallback>) {
+/// Every head size whose K/V fills divide among a block's threads plans
+/// valid attention configs on sm_86 (a prefill of 100 queries over 37 keys),
+/// with and without a bias. One whose layout count is past the register
+/// file plans too: the compiled kernels decide, and the graph runs where
+/// every one spills.
+#[test_case(64, Ok(()); "d 64")]
+#[test_case(128, Ok(()); "d 128")]
+#[test_case(48, Ok(()); "d 48")]
+#[test_case(32, Ok(()); "d 32")]
+#[test_case(256, Ok(()); "d 256")]
+#[test_case(40, Err(Fallback::Shape); "d 40 off the atoms")]
+fn attention_plans(d: usize, want: Result<(), Fallback>) {
+    let target = sm86();
     let (q, kv) = (ext(&[2, 100, 8, d]), ext(&[2, 37, 2, d]));
-    let lead = |dtypes: &[DType]| {
-        first(shape::attention(Some(&Planner::new(sm86())), dtypes, Some(&q), Some(&kv), false)).map(|c| (c.bq, c.bkv))
-    };
-    assert_eq!(lead(&[BF16; 3]), want);
-    assert_eq!(lead(&[BF16; 4]), want, "with a bias");
+    for dtypes in [&[BF16; 3][..], &[BF16; 4]] {
+        match shape::attention(Some(&planner(target.clone())), dtypes, Some(&q), Some(&kv), false) {
+            Plan::Kernel(list) => {
+                assert!(want.is_ok() && !list.is_empty(), "{list:?}");
+                assert!(list.iter().all(|c| c.fits(&target, d) && c.smem_bytes(d) <= target.smem_bytes), "{list:?}");
+            }
+            Plan::Graph(why) => assert_eq!(Err(why), want),
+        }
+    }
 }
 
 /// A bias takes the kernel in the stream type only.
@@ -300,96 +435,195 @@ fn attention_plans(d: usize, want: Result<(usize, usize), Fallback>) {
 #[test_case(DType::Float32, false; "f32")]
 fn biased_attention_plans(bias: DType, kernel: bool) {
     let (q, kv) = (ext(&[2, 100, 8, 64]), ext(&[2, 100, 8, 64]));
-    let plan = shape::attention(Some(&Planner::new(sm86())), &[BF16, BF16, BF16, bias], Some(&q), Some(&kv), false);
+    let plan = shape::attention(Some(&planner(sm86())), &[BF16, BF16, BF16, bias], Some(&q), Some(&kv), false);
     assert_eq!(matches!(plan, Plan::Kernel(_)), kernel, "{plan:?}");
     if !kernel {
         assert_eq!(plan, Plan::Graph(Fallback::Dtype));
     }
 }
 
-/// The shortlist spans distinct query and key block sizes within shared
-/// memory, one pipeline per tile, and keeps the configs measured fastest on
-/// the 3060: `(64, 64)` at `d = 64` and `(64, 32)` at `d = 128` (64 KB per
-/// block left one block per SM there). The score tile needs no scratch
-/// there: the `mma.sync` accumulator is its A operand.
-#[test_case(64, 99 << 10, (64, 64); "d 64")]
-#[test_case(128, 99 << 10, (64, 32); "d 128")]
-#[test_case(128, 48 << 10, (64, 32); "d 128 under a static cap")]
-fn attention_candidates(d: usize, smem: usize, measured: (usize, usize)) {
+fn attention_list(d: usize, smem: usize) -> (Target, Arc<[FaCfg]>) {
     let target = Target { smem_bytes: smem, ..sm86() };
     let (q, kv) = (ext(&[2, 100, 8, d]), ext(&[2, 37, 2, d]));
-    let Plan::Kernel(list) =
-        shape::attention(Some(&Planner::new(target.clone())), &[BF16; 3], Some(&q), Some(&kv), false)
-    else {
-        panic!()
-    };
-    assert!((4..=8).contains(&list.len()), "{list:?}");
+    let list = kernel_plan(shape::attention(Some(&planner(target.clone())), &[BF16; 3], Some(&q), Some(&kv), false));
+    (target, list)
+}
+
+/// The ranking spans query and key block sizes within shared memory, each
+/// config once, its untested shortlist one pipeline per tile. The score
+/// tile needs no scratch there: the `mma.sync` accumulator is its A operand.
+#[test_case(64, 99 << 10; "d 64")]
+#[test_case(128, 99 << 10; "d 128")]
+#[test_case(128, 48 << 10; "d 128 under a static cap")]
+fn attention_candidates(d: usize, smem: usize) {
+    let (target, list) = attention_list(d, smem);
+    assert!(list.len() >= 4, "{list:?}");
     assert!(list.iter().all(|c| c.smem_bytes(d) <= smem && c.fits(&target, d)), "{list:?}");
-    assert!(list.iter().any(|c| (c.bq, c.bkv) == measured), "{measured:?} not in {list:?}");
     for (i, c) in list.iter().enumerate() {
-        assert!(!list[..i].iter().any(|o| (o.bq, o.bkv) == (c.bq, c.bkv)), "one pipeline per tile: {list:?}");
+        assert!(!list[..i].contains(c), "{c:?} twice");
         assert_eq!(c.scratch_bytes(&target), 0);
     }
-}
-
-/// The softmax forms follow the target: probabilities are truncated where a
-/// bf16 rounding is several instructions; the rescale is skipped where the
-/// matrix cores share the vector ALUs (RDNA) or, beside them, where a full
-/// tile's lane holds 64 output registers (sm_86: `d = 128` prefill; `d = 64`
-/// and a decoder step's row multiply); the maximum runs in raw units on RDNA
-/// tiles full of queries, a decoder step's one wave scaling first.
-#[test_case(sm86(), 128, 512, (false, true, false); "sm_86 d 128 prefill")]
-#[test_case(sm86(), 64, 512, (false, false, false); "sm_86 d 64 prefill")]
-#[test_case(sm86(), 128, 1, (false, false, false); "sm_86 d 128 decode")]
-#[test_case(amd(AmdArch::Gfx1201, 64), 128, 512, (true, true, true); "gfx1201 d 128 prefill")]
-#[test_case(amd(AmdArch::Gfx1201, 64), 64, 1, (true, true, false); "gfx1201 d 64 decode")]
-#[test_case(amd(AmdArch::Gfx942, 304), 128, 512, (true, false, false); "gfx942 d 128: 32 output registers a lane")]
-#[test_case(amd(AmdArch::Gfx950, 256), 64, 512, (false, false, false); "gfx950 rounds a pair at once")]
-fn attention_forms_follow_the_target(target: Target, d: usize, t: usize, forms: (bool, bool, bool)) {
-    assert_eq!(target.bf16_cvt, !forms.0);
-    let list = Planner::new(target).attention_candidates(8, t, 1500, d, false);
-    assert!(!list.is_empty());
-    for c in &list {
-        assert_eq!((c.truncate_p, c.skip_rescale, c.raw_max), forms, "{c:?}");
+    let short = first_eight(&list);
+    assert!(short.len() >= 4, "{short:?}");
+    for (i, c) in short.iter().enumerate() {
+        assert!(!short[..i].iter().any(|o| (o.bq, o.bkv) == (c.bq, c.bkv)), "one pipeline per tile: {short:?}");
     }
 }
 
-/// A warp past the queries hides nothing and adds work: a decoder step's
-/// lead has one warp per 16 queries, no more.
-#[test_case(1, 64; "one query, d 64")]
-#[test_case(16, 128; "sixteen queries, d 128")]
-#[test_case(17, 64; "seventeen queries, two warps")]
-#[test_case(100, 64; "a prefill fills a block")]
-fn decode_attention_leads_with_the_queries_warps(t: usize, d: usize) {
-    let (q, kv) = (ext(&[4, t, 8, d]), ext(&[4, 1500, 8, d]));
-    let Plan::Kernel(list) = shape::attention(Some(&Planner::new(sm86())), &[BF16; 3], Some(&q), Some(&kv), false)
-    else {
-        panic!()
-    };
-    let lead = list[0];
-    assert!(lead.bq <= t.div_ceil(16) * 16, "{lead:?} for {t} queries");
-    if t <= 16 {
+/// A warp past the queries adds the work of its padded rows. Where the
+/// tiles fill the device, a decoder step's lead has one warp per 16
+/// queries, no more; where they leave SIMDs idle, a padded warp runs on one
+/// of them, so the lead has at most as many warps as an SM has SIMDs.
+#[test_case(4, 1, 64; "one query, d 64, 32 tiles")]
+#[test_case(4, 16, 128; "sixteen queries, d 128, 32 tiles")]
+#[test_case(4, 17, 64; "seventeen queries, 32 tiles")]
+#[test_case(4, 100, 64; "a prefill fills a block")]
+#[test_case(64, 1, 64; "one query, d 64, 512 tiles")]
+#[test_case(64, 16, 128; "sixteen queries, d 128, 512 tiles")]
+fn decode_attention_leads_with_the_queries_warps(batch: usize, t: usize, d: usize) {
+    let (q, kv) = (ext(&[batch, t, 8, d]), ext(&[batch, 1500, 8, d]));
+    let list = kernel_plan(shape::attention(Some(&planner(sm86())), &[BF16; 3], Some(&q), Some(&kv), false));
+    let (lead, queries) = (list[0], t.div_ceil(16) * 16);
+    let filled = batch * 8 >= 16 * sm86().sms.unwrap() as usize;
+    let most = if filled { queries } else { queries.max(16 * sm86().occupancy.simds as usize) };
+    assert!(lead.bq <= most, "{lead:?} for {t} queries");
+    if filled && t <= 16 {
         assert_eq!(lead.bq, 16, "{list:?}");
     }
 }
 
 /// One and two always; around two blocks per SM otherwise, never past the
-/// key blocks, and none without an SM count.
+/// key blocks.
 #[test_case(20, 24, &[1, 2, 3, 6]; "twenty tiles on 28 SMs")]
 #[test_case(20, 2, &[1, 2]; "two key blocks")]
 #[test_case(224, 24, &[1, 2]; "enough tiles already")]
 #[test_case(1, 24, &[1, 2, 24]; "one tile: the blocks cap")]
 fn split_candidates(tiles: usize, blocks: usize, want: &[usize]) {
-    assert_eq!(config::split_candidates(&sm86(), tiles, blocks), want);
-    let unknown = Target { sms: None, ..sm86() };
-    assert_eq!(config::split_candidates(&unknown, tiles, blocks), [1]);
+    assert_eq!(planner(sm86()).splits(tiles, blocks), want);
+}
+
+fn gfx1151() -> Target {
+    Target { sms: Some(40), ..Target::for_arch(GpuArch::Amd(AmdArch::Gfx1151)) }
+}
+
+/// Under gfx1151's probed costs the probe shapes' rankings (B 4, H 8, T
+/// 2048) hold the tiles measured fastest on that chip in their first eight:
+/// `(64, 16)` at `d = 64`, and `(64, 16)` or `(128, 16)` at `d = 128`
+/// (26 TFLOP/s, 2026-10-13).
+#[test_case(64, false, &[(64, 16)]; "d 64")]
+#[test_case(64, true, &[(64, 16)]; "d 64 causal")]
+#[test_case(128, false, &[(64, 16), (128, 16)]; "d 128")]
+#[test_case(128, true, &[(64, 16), (128, 16)]; "d 128 causal")]
+fn gfx1151_attention_shortlists_hold_the_measured_tiles(d: usize, causal: bool, measured: &[(usize, usize)]) {
+    let planner = Planner::new(Device { target: gfx1151(), costs: super::gfx1151_costs() });
+    let list = first_eight(&planner.attention_ranked(32, 2048, 2048, d, causal));
+    let tiles: Vec<(usize, usize)> = list.iter().map(|c| (c.bq, c.bkv)).collect();
+    assert!(measured.iter().any(|m| tiles.contains(m)), "{measured:?} not in {tiles:?}");
+}
+
+/// Under gfx1151's probed costs no block of fewer warps than the CU's two
+/// SIMDs leads the 4096³ ranking (one-warp 256×256 tiles led it, measured
+/// at 1–3 TFLOP/s, before a round was bound by one wave's issue).
+#[test]
+fn gfx1151_gemm_ranking_leads_with_full_blocks() {
+    let planner = Planner::new(Device { target: gfx1151(), costs: super::gfx1151_costs() });
+    let list = first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, false));
+    let simds = planner.device.target.occupancy.simds;
+    assert!(list.iter().all(|c| c.warps[0] * c.warps[1] >= simds), "{list:?}");
+}
+
+/// A named split count is honoured: the configs with that many key blocks
+/// stay, at that count; past the most any config has, it is capped there;
+/// without one every config stays unsplit.
+#[test_case(Some(2), 128, &[(16, 64, 2), (16, 32, 2)]; "two splits drop the one-block config")]
+#[test_case(Some(4), 128, &[(16, 32, 4)]; "four splits keep the four-block config")]
+#[test_case(Some(9), 128, &[(16, 32, 4)]; "past every config: capped at the most")]
+#[test_case(Some(2), 16, &[(16, 128, 1), (16, 64, 1), (16, 32, 1)]; "one key block: unsplit")]
+#[test_case(None, 128, &[(16, 128, 1), (16, 64, 1), (16, 32, 1)]; "none named: unsplit")]
+fn a_named_split_count_is_honoured(splits: Option<usize>, tk: usize, want: &[(usize, usize, usize)]) {
+    let ranked = [FaCfg::new(16, 128, 2), FaCfg::new(16, 64, 2), FaCfg::new(16, 32, 2)];
+    let got: Vec<_> = split_ranked(&ranked, splits, tk).iter().map(|c| (c.bq, c.bkv, c.splits)).collect();
+    assert_eq!(got, want);
+}
+
+/// The decoder step that lost its named splits on gfx1151 (sixteen queries
+/// at `d = 48` over 128 cached keys, two splits): its whole ranking keeps
+/// the two splits, whichever config leads.
+#[test]
+fn a_decoder_steps_ranking_keeps_its_named_splits() {
+    let planner = Planner::new(Device { target: gfx1151(), costs: super::gfx1151_costs() });
+    let ranked = planner.attention_ranked(5 * 16, 16, 128, 48, false);
+    let split = split_ranked(&ranked, Some(2), 128);
+    assert!(!split.is_empty() && split.iter().all(|c| c.splits == 2 && 128usize.div_ceil(c.bkv) >= 2), "{split:?}");
+}
+
+/// The softmax forms and the tiles are tuned in turn: a forms pass on the
+/// ranking's first clean config, the tiles over the ranking under the
+/// forms it kept, and a forms pass on their winner. A pass visits each form
+/// once, in order, and keeps a flip only where it measured faster (a tie
+/// keeps the forms so far), the store choosing as the tuner's does.
+#[test]
+fn the_forms_and_tiles_are_tuned_in_turn() {
+    use crate::tune::{TuneKey, TuneStore};
+    #[derive(Debug, PartialEq)]
+    enum Asked {
+        FirstClean,
+        Pair(FaCfg, FaCfg),
+        Tiles(Vec<FaCfg>),
+    }
+    let store = TuneStore::at(None);
+    let ranked = [FaCfg::new(128, 32, 2), FaCfg::new(64, 16, 2)];
+    // Truncation and the late sum measure faster, the raw maximum ties, and
+    // under truncation the second tile wins.
+    let ns = |c: &FaCfg| {
+        let f = c.forms;
+        100 - 10 * u64::from(f.truncate_p) - 5 * u64::from(f.sum_after) + u64::from(f.skip_rescale)
+            - 20 * u64::from(f.truncate_p && c.bq == 64)
+    };
+    let asked = std::cell::RefCell::new(vec![]);
+    let fastest = |list: &[FaCfg]| {
+        let key = TuneKey::new("attention", &sm86(), 0, svod_dtype::ScalarDType::BFloat16, &[], &format!("{list:?}"));
+        let chosen = store.select(&key, list.len(), || 0, || list.iter().map(|c| Some(ns(c))).collect());
+        list[chosen.unwrap_or(0)]
+    };
+    let tuned = descend(
+        &ranked,
+        |r| {
+            asked.borrow_mut().push(Asked::FirstClean);
+            r[0]
+        },
+        |r| {
+            asked.borrow_mut().push(Asked::Tiles(r.to_vec()));
+            fastest(r)
+        },
+        |[current, flipped]| {
+            asked.borrow_mut().push(Asked::Pair(current, flipped));
+            fastest(&[current, flipped])
+        },
+    );
+    let asked = asked.into_inner();
+    assert_eq!(asked.len(), 10, "{asked:?}");
+    assert_eq!(asked[0], Asked::FirstClean);
+    let pairs = |at: std::ops::Range<usize>, tile: (usize, usize)| {
+        for (k, a) in asked[at].iter().enumerate() {
+            let Asked::Pair(current, flipped) = a else { panic!("a forms pair, not {a:?}") };
+            assert_eq!((current.bq, current.bkv), tile);
+            assert_eq!(flipped.forms, crate::ops::attention::FORMS[k](current.forms), "form {k} flipped");
+        }
+    };
+    pairs(1..5, (128, 32));
+    let forms = Forms { truncate_p: true, sum_after: true, ..Forms::default() };
+    let formed = ranked.map(|c| FaCfg { forms, ..c }).to_vec();
+    assert_eq!(asked[5], Asked::Tiles(formed), "the tiles under the first pass's forms");
+    pairs(6..10, (64, 16));
+    assert_eq!(tuned, FaCfg { forms, ..FaCfg::new(64, 16, 2) });
 }
 
 #[test]
 fn attention_with_symbolic_keys_falls_back() {
     let q = ext(&[2, 100, 8, 64]);
     assert_eq!(
-        shape::attention(Some(&Planner::new(sm86())), &[BF16; 3], Some(&q), None, false),
+        shape::attention(Some(&planner(sm86())), &[BF16; 3], Some(&q), None, false),
         Plan::Graph(Fallback::Symbolic)
     );
 }
@@ -402,14 +636,14 @@ fn attention_with_symbolic_keys_falls_back() {
 #[test_case(512, Err(Fallback::Shape); "d 512")]
 fn heads_plan(d: usize, want: Result<NormCfg, Fallback>) {
     let x = ext(&[2, 100, 12 * d]);
-    assert_eq!(first(shape::heads(Some(&Planner::new(sm86())), &[BF16], Some(&x), d)), want);
+    assert_eq!(first(shape::heads(Some(&planner(sm86())), &[BF16], Some(&x), d)), want);
 }
 
 #[test]
 fn heads_keep_the_graph_for_a_weight_off_the_stream_dtype() {
     let x = ext(&[2, 100, 12 * 64]);
     assert_eq!(
-        shape::heads(Some(&Planner::new(sm86())), &[BF16, DType::Float16], Some(&x), 64),
+        shape::heads(Some(&planner(sm86())), &[BF16, DType::Float16], Some(&x), 64),
         Plan::Graph(Fallback::Dtype)
     );
 }
@@ -417,8 +651,8 @@ fn heads_keep_the_graph_for_a_weight_off_the_stream_dtype() {
 #[test]
 fn heads_need_three_dims() {
     let x = ext(&[200, 12 * 64]);
-    assert_eq!(shape::heads(Some(&Planner::new(sm86())), &[BF16], Some(&x), 64), Plan::Graph(Fallback::Shape));
-    assert_eq!(shape::heads(Some(&Planner::new(sm86())), &[BF16], None, 64), Plan::Graph(Fallback::Symbolic));
+    assert_eq!(shape::heads(Some(&planner(sm86())), &[BF16], Some(&x), 64), Plan::Graph(Fallback::Shape));
+    assert_eq!(shape::heads(Some(&planner(sm86())), &[BF16], None, 64), Plan::Graph(Fallback::Symbolic));
 }
 
 // ---- norms -------------------------------------------------------------------------
@@ -430,7 +664,7 @@ fn heads_need_three_dims() {
 #[test_case(4096, Err(Fallback::Shape); "wider than the measured range")]
 fn norm_plans(d: usize, want: Result<Vec<usize>, Fallback>) {
     let want = want.map_or_else(Plan::Graph, |rows| Plan::Kernel(rows.into_iter().map(|br| NormCfg { br }).collect()));
-    assert_eq!(shape::norm(Some(&Planner::new(sm86())), &[BF16; 2], Some(&ext(&[37, d]))), want);
+    assert_eq!(shape::norm(Some(&planner(sm86())), &[BF16; 2], Some(&ext(&[37, d]))), want);
 }
 
 // ---- extents -------------------------------------------------------------------------
@@ -599,20 +833,20 @@ fn conv_geom(hw: usize, cin: usize, cout: usize, k: usize, s: usize) -> crate::k
     }
 }
 
-/// The untuned pick's output width: a body of 96 channels takes a tile of
-/// its width, not a power of two padded by a third; a 48-channel body, whose
-/// steps would be one depth, takes the graph on the cp.async path.
+/// The untuned pick's output width: never padding the channels by more than
+/// an eighth (a body of 96 channels takes no 128-wide tile); a 48-channel
+/// body, whose steps would be one depth, takes the graph on the cp.async path.
 fn conv_plan(x: &[usize], g: crate::kernels::conv::ConvGeom, groups: usize) -> Result<usize, Fallback> {
-    let plan = shape::conv2d(Some(&Planner::new(sm86())), &[F16; 3], F16, None, Some(&ext(x)), &g, groups);
+    let plan = shape::conv2d(Some(&planner(sm86())), &[F16; 3], F16, None, Some(&ext(x)), &g, groups);
     first(plan).map(|c| c.gemm.tile[1])
 }
 
 const F16: DType = DType::Float16;
 
 #[test_case(&[1, 80, 80, 384], conv_geom(80, 384, 96, 3, 1), 1, Ok(96); "head conv, 96 wide")]
-#[test_case(&[1, 20, 20, 192], conv_geom(20, 192, 192, 3, 1), 1, Ok(96); "a starved shallow body")]
-#[test_case(&[8, 80, 80, 384], conv_geom(80, 384, 384, 3, 2), 1, Ok(128); "a static batch folds into the rows")]
-#[test_case(&[1, 40, 40, 192], conv_geom(40, 192, 192, 3, 1), 1, Ok(64); "a shallow body filling the device")]
+#[test_case(&[1, 20, 20, 192], conv_geom(20, 192, 192, 3, 1), 1, Ok(192); "a starved shallow body")]
+#[test_case(&[8, 80, 80, 384], conv_geom(80, 384, 384, 3, 2), 1, Ok(384); "a static batch folds into the rows")]
+#[test_case(&[1, 40, 40, 192], conv_geom(40, 192, 192, 3, 1), 1, Ok(192); "a shallow body filling the device")]
 #[test_case(&[1, 80, 80, 96], conv_geom(80, 96, 96, 3, 1), 1, Ok(96); "96 wide, shallow")]
 #[test_case(&[1, 640, 640, 3], conv_geom(640, 3, 96, 3, 2), 1, Err(Fallback::Shape); "rgb stem")]
 #[test_case(&[1, 160, 160, 48], conv_geom(160, 48, 48, 3, 1), 1, Err(Fallback::Config); "48 wide takes the graph")]
@@ -621,7 +855,12 @@ const F16: DType = DType::Float16;
 #[test_case(&[0, 20, 20, 64], conv_geom(20, 64, 64, 3, 1), 1, Err(Fallback::Shape); "no images")]
 #[test_case(&[1, 1, 1, 64], conv_geom(1, 64, 64, 5, 1).with_pad(0), 1, Err(Fallback::Shape); "empty output")]
 fn conv_plans(x: &[usize], g: crate::kernels::conv::ConvGeom, groups: usize, want: Result<usize, Fallback>) {
-    assert_eq!(conv_plan(x, g, groups), want);
+    match (conv_plan(x, g, groups), want) {
+        (Ok(bn), Ok(cout)) => {
+            assert!(8 * (cout.div_ceil(bn) * bn - cout) <= cout.div_ceil(bn) * bn, "{bn} pads {cout}")
+        }
+        (got, want) => assert_eq!(got, want),
+    }
 }
 
 #[test_case(&[F16, F16, F16], DType::Float32, Some(DType::Float32), true; "f32 out with an f32 residual")]
@@ -631,7 +870,7 @@ fn conv_plans(x: &[usize], g: crate::kernels::conv::ConvGeom, groups: usize, wan
 #[test_case(&[F16, BF16, F16], F16, None, false; "mixed operands")]
 fn conv_dtype_plans(dtypes: &[DType], out: DType, residual: Option<DType>, kernel: bool) {
     let g = conv_geom(80, 384, 96, 3, 1);
-    let plan = shape::conv2d(Some(&Planner::new(sm86())), dtypes, out, residual, Some(&ext(&[1, 80, 80, 384])), &g, 1);
+    let plan = shape::conv2d(Some(&planner(sm86())), dtypes, out, residual, Some(&ext(&[1, 80, 80, 384])), &g, 1);
     assert_eq!(matches!(plan, Plan::Kernel(_)), kernel, "{plan:?}");
     if !kernel {
         assert_eq!(plan, Plan::Graph(Fallback::Dtype));
@@ -644,12 +883,12 @@ fn conv_dtype_plans(dtypes: &[DType], out: DType, residual: Option<DType>, kerne
 fn a_bound_conv_batch_plans_per_image() {
     let g = conv_geom(80, 384, 384, 3, 2);
     let x = Extent { dims: vec![8, 80, 80, 384], var: true };
-    let plan = shape::conv2d(Some(&Planner::new(sm86())), &[F16; 3], F16, None, Some(&x), &g, 1);
-    assert_eq!(plan, Plan::Kernel(Planner::new(sm86()).conv_candidates(8, 1600, &g)));
-    let plan = shape::conv2d(Some(&Planner::new(apple())), &[F16; 3], F16, None, Some(&x), &g, 1);
+    let plan = shape::conv2d(Some(&planner(sm86())), &[F16; 3], F16, None, Some(&x), &g, 1);
+    assert_eq!(plan, Plan::Kernel(planner(sm86()).conv_ranked(8, 1600, &g)));
+    let plan = shape::conv2d(Some(&planner(apple())), &[F16; 3], F16, None, Some(&x), &g, 1);
     assert_eq!(plan, Plan::Graph(Fallback::Target));
     assert_eq!(
-        shape::conv2d(Some(&Planner::new(sm86())), &[F16; 3], F16, None, None, &g, 1),
+        shape::conv2d(Some(&planner(sm86())), &[F16; 3], F16, None, None, &g, 1),
         Plan::Graph(Fallback::Symbolic)
     );
 }
@@ -660,40 +899,19 @@ fn a_bound_conv_batch_plans_per_image() {
 #[test]
 fn rdna_plans_register_staged_kernels() {
     let target = rdna3();
-    let Plan::Kernel(gemms) =
-        shape::linear(Some(&Planner::new(target.clone())), &[BF16, BF16], Some(&ext(&[4096, 4096])), 4096, false)
-    else {
-        panic!("a GEMM kernel")
-    };
-    assert_eq!(gemms[0], gemm_cfg([128, 256, 32], 2, [4, 4], true));
-    assert!(gemms.iter().all(|c| c.stages == 2 && c.unroll && c.fits(&target)));
-    let Plan::Kernel(small) =
-        shape::linear(Some(&Planner::new(target.clone())), &[BF16, BF16], Some(&ext(&[704, 512])), 512, false)
-    else {
-        panic!("a GEMM kernel")
-    };
-    assert!(small.iter().any(|c| c.tile[..2] == [64, 64]), "a small grid offers the 64×64 tile: {small:?}");
+    let gemms =
+        kernel_plan(shape::linear(Some(&planner(target.clone())), &[BF16; 2], Some(&ext(&[4096, 4096])), 4096, false));
+    assert_valid(&gemms, &target, 4096, false);
+    assert!(first_eight(&gemms).iter().all(|c| c.stages == 2 && c.unroll && c.fits(&target)), "{gemms:?}");
     for (d, t) in [(64, 1500), (64, 1)] {
         let q = ext(&[1, t, 8, d]);
-        let Plan::Kernel(fa) =
-            shape::attention(Some(&Planner::new(target.clone())), &[BF16; 3], Some(&q), Some(&q), false)
-        else {
-            panic!("an attention kernel")
-        };
+        let fa = kernel_plan(shape::attention(Some(&planner(target.clone())), &[BF16; 3], Some(&q), Some(&q), false));
         let within = |c: &FaCfg| c.smem_bytes(d) + c.scratch_bytes(&target) <= 64 << 10;
         assert!(fa.iter().all(|c| c.stages == 2 && within(c)), "{fa:?}");
         assert!(fa.iter().all(|c| c.scratch_bytes(&target) == c.bq * c.bkv * 4), "RDNA3 re-holds its scores");
     }
-    // `d = 128` fits RDNA3's register file only rolled, one trip's fragments
-    // and fill at a time.
-    let q = ext(&[1, 1500, 8, 128]);
-    let Plan::Kernel(fa) = shape::attention(Some(&Planner::new(target.clone())), &[BF16; 3], Some(&q), Some(&q), false)
-    else {
-        panic!("a d128 attention kernel")
-    };
-    assert!(fa.iter().all(|c| !c.unroll), "{fa:?}");
     assert!(matches!(
-        shape::norm(Some(&Planner::new(target.clone())), &[BF16; 2], Some(&ext(&[37, 1024]))),
+        shape::norm(Some(&planner(target.clone())), &[BF16; 2], Some(&ext(&[37, 1024]))),
         Plan::Kernel(_)
     ));
 }

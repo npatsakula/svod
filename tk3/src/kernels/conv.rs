@@ -4,7 +4,7 @@
 
 use super::Batch;
 use super::gemm::{Epilogue, GemmCfg, GemmSpec, MergeSpec, mainloop_gemm, split_merge};
-use crate::atoms::Target;
+use crate::atoms::Device;
 use crate::build::*;
 use crate::ir::*;
 use crate::lower::Lowering;
@@ -87,11 +87,11 @@ impl ConvSpec {
 
     /// The programs to launch in order with their lowerings: the convolution,
     /// or its partials and their merge.
-    pub fn programs<T: Elem>(&self, target: &Target) -> Vec<(Program, Lowering)> {
-        let mut out = vec![(conv::<T>(self), self.cfg.lowering(target.clone()))];
+    pub fn programs<T: Elem>(&self, device: &Device) -> Vec<(Program, Lowering)> {
+        let mut out = vec![(conv::<T>(self), self.cfg.lowering(device))];
         if self.split > 1 {
             let merge = self.merge();
-            out.push((split_merge::<T>(&merge), merge.lowering(target.clone())));
+            out.push((split_merge::<T>(&merge), merge.lowering(device)));
         }
         out
     }

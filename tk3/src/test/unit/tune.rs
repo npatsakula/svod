@@ -1,21 +1,31 @@
-//! The tune store: memo, on-disk round trip, key stability, the rule that
-//! nothing unmeasured is stored, and on a CUDA device a real GEMM tuning.
+//! The tune store: memo, on-disk round trip of choices and values, key
+//! stability, the rule that nothing unmeasured is stored, a key measured
+//! once under concurrent asks, a store hit compiling nothing, a run's
+//! stamps and the lost-stamp guard, what counts as a spill, the admission
+//! memo, and on a CUDA device a real GEMM tuning.
 
 use std::cell::Cell;
 use std::path::PathBuf;
 
 use svod_dtype::ScalarDType;
+use svod_runtime::KernelResources;
 use test_case::test_case;
 
-use crate::atoms::sm86;
+use crate::atoms::{Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use crate::ops::config::Planner;
-use crate::tune::{self, ScratchPool, TuneKey, TuneStore, fingerprint};
+use crate::tune::{self, Bench, ScratchPool, TuneKey, TuneStore, fingerprint};
 
+/// A host key: no device, so no compiler digest.
 fn key(shape: &[usize], candidates: &[usize]) -> TuneKey {
-    TuneKey::new("gemm", &sm86(), ScalarDType::BFloat16, shape, &candidates)
+    TuneKey::new("gemm", &sm86(), 0, ScalarDType::BFloat16, shape, &candidates)
+}
+
+/// The store file of [`key`]'s device under `dir`.
+fn store_file(dir: &std::path::Path) -> String {
+    let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
+    std::fs::read_to_string(path).expect("the store file")
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -42,8 +52,7 @@ fn a_winner_round_trips_through_the_store() {
     let ran = Cell::new(false);
     let chosen = TuneStore::at(Some(dir.clone())).select(&k, 3, || 7, timed(&[Some(300), Some(100), None], &ran));
     assert_eq!((chosen, ran.get()), (Some(1), true));
-    let text = std::fs::read_to_string(dir.join("sm_86_28sm-v0.2.0.txt")).expect("the store file");
-    assert_eq!(text, format!("{} 1 100\n", k.line(7)));
+    assert_eq!(store_file(&dir), format!("{} 1 100\n", k.line(7)));
 
     let again = TuneStore::at(Some(dir.clone()));
     let ran = Cell::new(false);
@@ -81,7 +90,69 @@ fn nothing_measured_is_never_stored() {
     let k = key(&[64, 64, 64], &[0, 1]);
     assert_eq!(store.select(&k, 2, || 1, || vec![None, None]), None);
     assert!(store.entries(&k).is_empty());
-    assert_eq!(store.pick(&k, &[10, 20], |_| unreachable!("memoized")), 10, "the first candidate");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Two threads asking for one key at once measure it once: the second
+/// waits for the first's value.
+#[test]
+fn a_key_in_flight_is_measured_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let store = TuneStore::at(None);
+    let k = key(&[2, 2, 2], &[0, 1]);
+    let (measured, start) = (AtomicUsize::new(0), std::sync::Barrier::new(2));
+    let ask = || {
+        start.wait();
+        store.select(
+            &k,
+            2,
+            || 1,
+            || {
+                measured.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                vec![Some(2), Some(1)]
+            },
+        )
+    };
+    let chosen = std::thread::scope(|s| {
+        let other = s.spawn(ask);
+        [ask(), other.join().expect("the other asker")]
+    });
+    assert_eq!((chosen, measured.load(Ordering::SeqCst)), ([Some(1), Some(1)], 1));
+}
+
+/// A plain bf16 GEMM's programs at `tile` on sm_86.
+fn gemm_programs(tile: [usize; 3]) -> tune::Candidate {
+    let cfg = GemmCfg { tile, stages: 2, warps: [2, 2], group_m: 8, unroll: true };
+    let spec = GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
+    vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target: sm86(), costs: super::costs() }))]
+}
+
+/// A choice keys by the candidates' programs, each built once: a store
+/// miss compiles each candidate once (the device then times them), and a
+/// store hit in another process builds the programs to fingerprint them
+/// and compiles nothing.
+#[test]
+fn a_store_hit_compiles_nothing() {
+    let dir = scratch("hit");
+    let k = key(&[128, 128, 128], &[0, 1]);
+    let tiles = [[64, 64, 32], [128, 64, 32]];
+    let builds = Cell::new(0);
+    let build = |i: usize| {
+        builds.set(builds.get() + 1);
+        gemm_programs(tiles[i])
+    };
+    let programs = fingerprint(&[gemm_programs(tiles[0]), gemm_programs(tiles[1])]);
+    let mut bench = Bench::default();
+    let missed = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
+    assert_eq!((builds.get(), bench.built.len()), (2, 2), "a miss builds and compiles each once");
+    // What the device would have measured, stored as a timing would.
+    let stored = TuneStore::at(Some(dir.clone())).select(&k, 2, || programs, || vec![Some(9), Some(4)]);
+    assert_eq!((missed, stored), (None, Some(1)), "nothing timed on the host");
+    builds.set(0);
+    let mut bench = Bench::default();
+    let hit = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
+    assert_eq!((hit, builds.get(), bench.built.len()), (Some(1), 2, 0));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -95,6 +166,67 @@ fn a_stale_index_is_a_miss() {
     assert_eq!(TuneStore::at(Some(dir.clone())).select(&k, 2, || 1, timed(&[Some(1), None], &ran)), Some(0));
     assert!(ran.get());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A value is stored as index 0 with the number in the value slot; a second
+/// store on the directory reads it back without measuring.
+#[test]
+fn a_value_round_trips_through_the_store() {
+    let dir = scratch("value");
+    let k = key(&[], &[9]);
+    assert_eq!(TuneStore::at(Some(dir.clone())).value(&k, || 7, || Some(1234)), Some(1234));
+    assert_eq!(store_file(&dir), format!("{} 0 1234\n", k.line(7)));
+    let measured = || panic!("measured twice");
+    assert_eq!(TuneStore::at(Some(dir.clone())).value(&k, || 7, measured), Some(1234));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A warm memo answers a value without fingerprinting or measuring; an
+/// unmeasured value is memoized as missing and never stored.
+#[test_case(Some(5); "measured")]
+#[test_case(None; "unmeasured")]
+fn the_memo_answers_a_value(measured: Option<u64>) {
+    let dir = scratch(&format!("value-memo-{measured:?}"));
+    let store = TuneStore::at(Some(dir.clone()));
+    let k = key(&[1], &[0]);
+    assert_eq!(store.value(&k, || 1, || measured), measured);
+    assert_eq!(store.entries(&k).len(), usize::from(measured.is_some()));
+    assert_eq!(store.value(&k, || unreachable!("fingerprinted"), || unreachable!("measured")), measured);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Choices and values of one device share its file; writing one keeps the other.
+#[test]
+fn choices_and_values_share_a_file() {
+    let dir = scratch("shared");
+    let (choice, value) = (key(&[64, 64, 64], &[0, 1]), TuneKey { op: "probe:step", ..key(&[], &[2]) });
+    TuneStore::at(Some(dir.clone())).select(&choice, 2, || 1, || vec![Some(9), Some(4)]);
+    TuneStore::at(Some(dir.clone())).value(&value, || 2, || Some(42));
+    let again = TuneStore::at(Some(dir.clone()));
+    assert_eq!(again.entries(&choice).len(), 2);
+    assert_eq!(again.select(&choice, 2, || 1, || panic!("measured twice")), Some(1));
+    assert_eq!(again.value(&value, || 2, || panic!("measured twice")), Some(42));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Another compiler (toolchain, flags) is another line, so it re-measures.
+#[test]
+fn the_compiler_is_part_of_the_line() {
+    let base = key(&[8, 8, 8], &[0, 1]);
+    let other = TuneKey { compiler: base.compiler ^ 1, ..base.clone() };
+    assert_ne!(base.line(3), other.line(3));
+    assert!(base.line(3).contains(&format!("|{:016x}|", base.compiler)), "{}", base.line(3));
+}
+
+/// A run's time sums its kernels (a candidate is a kernel and its merge);
+/// a kernel without both stamps voids the run rather than shortening it.
+#[test_case(&[(Some(10), Some(15)), (Some(20), Some(23))] => Some(8); "kernels summed")]
+#[test_case(&[(Some(10), Some(15)), (Some(20), None)] => None; "a lost end")]
+#[test_case(&[(None, Some(15)), (Some(20), Some(23))] => None; "a lost start")]
+#[test_case(&[(Some(15), Some(10))] => None; "an end before its start")]
+#[test_case(&[] => None; "no kernels")]
+fn a_run_needs_every_stamp(stamps: &[(Option<u64>, Option<u64>)]) -> Option<u64> {
+    tune::stamped(stamps.iter().copied()).map(|d| d.as_nanos() as u64)
 }
 
 #[test_case(&[1, 704, 512, 512], &[0, 1], true; "the same inputs")]
@@ -130,14 +262,48 @@ fn candidates_share_scratch_buffers_without_aliasing_a_program() {
     assert!(!same(&a[0], &a[2]) && !same(&a[1], &a[2]));
 }
 
+/// A kernel spilled when it reports scratch bytes; a backend reporting no
+/// resources, or no scratch, admits.
+#[test_case(&[] => false; "nothing reported")]
+#[test_case(&[None] => false; "no scratch field")]
+#[test_case(&[Some(0), None] => false; "no scratch used")]
+#[test_case(&[Some(0), Some(16)] => true; "the merge fits, the kernel spills")]
+fn a_kernel_with_scratch_spilled(scratch: &[Option<u32>]) -> bool {
+    let resources: Vec<KernelResources> = scratch
+        .iter()
+        .map(|&scratch_bytes| KernelResources {
+            vgprs: Some(128),
+            sgprs: None,
+            lds_bytes: 0,
+            scratch_bytes,
+            wave_size: 32,
+            occupancy: None,
+        })
+        .collect();
+    tune::spilled(&resources)
+}
+
 /// `SVOD_TK3_TUNE=0`'s override: off and back on.
 #[test]
 fn tuning_can_be_turned_off() {
+    let before = tune::enabled();
     tune::set_enabled(false);
     assert!(!tune::enabled());
     tune::set_enabled(true);
     assert!(tune::enabled());
-    tune::set_enabled(false);
+    tune::set_enabled(before);
+}
+
+/// A ranked list's admission is memoized for the process: a second ask
+/// compiles nothing, and nothing compiled to judge is remembered as such.
+#[test_case(Some(vec![0, 2]); "admitted")]
+#[test_case(None; "nothing built")]
+fn admission_is_memoized(found: Option<Vec<usize>>) {
+    let store = TuneStore::at(None);
+    let k = key(&[1, 2, 3], &[0, 1, 2]);
+    let want = found.clone().map(Into::into);
+    assert_eq!(store.admitted(&k, || found), want);
+    assert_eq!(store.admitted(&k, || unreachable!("compiled twice")), want);
 }
 
 /// Tunes a Nemotron GEMM on the device into a scratch directory; a second
@@ -145,23 +311,23 @@ fn tuning_can_be_turned_off() {
 #[test]
 fn a_gemm_tunes_on_the_device() {
     let spec = svod_dtype::default_device::default_device();
-    let Some(target) =
-        matches!(spec, svod_dtype::DeviceSpec::Cuda { .. }).then(|| crate::atoms::Target::for_device(&spec)).flatten()
-    else {
+    let Some(planner) = super::device_planner().filter(|_| matches!(spec, svod_dtype::DeviceSpec::Cuda { .. })) else {
         eprintln!("skipped: no CUDA device");
         return;
     };
+    let device = &planner.device;
     let (m, n, k) = (704, 512, 512);
-    let cfgs = Planner::new(target.clone()).gemm_candidates(1, m, n, k, false);
+    let cfgs = super::first_eight(&planner.gemm_ranked(1, m, n, k, false));
     let batch = Batch::Var { name: "b".into(), min: 1, max: 1 };
     let build = |cfg: GemmCfg| {
         let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue: Epilogue::default(), cfg };
-        vec![(gemm::<BF16>(&spec), cfg.lowering(target.clone()))]
+        vec![(gemm::<BF16>(&spec), cfg.lowering(device))]
     };
-    let key = TuneKey::new("gemm", &target, ScalarDType::BFloat16, &[1, m, n, k], &cfgs);
+    let key = TuneKey::new("gemm", &device.target, tune::compiler(&spec), ScalarDType::BFloat16, &[1, m, n, k], &cfgs);
     let dir = scratch("device");
     let start = std::time::Instant::now();
-    let chosen = TuneStore::at(Some(dir.clone())).pick(&key, &cfgs, build);
+    let chosen = TuneStore::at(Some(dir.clone())).choose(&key, &cfgs, build, &mut Bench::default());
+    let chosen = cfgs[chosen.expect("measured")];
     eprintln!("tuned {} candidates in {:.1} s: {chosen:?}", cfgs.len(), start.elapsed().as_secs_f64());
     let programs = || fingerprint(&cfgs.iter().map(|&c| build(c)).collect::<Vec<_>>());
     let hit = TuneStore::at(Some(dir.clone())).select(&key, cfgs.len(), programs, || panic!("measured twice"));
@@ -170,10 +336,14 @@ fn a_gemm_tunes_on_the_device() {
 }
 
 /// A candidate's time is its fastest timed run: a run the device did not
-/// stamp is skipped, not taken as the candidate failing.
+/// stamp is skipped, not taken as the candidate failing, and one under half
+/// the median of its runs (a stamp the device lost the middle of) is dropped.
 #[test_case(&[Some(5), None, Some(3)] => Some(3); "a lost sample")]
 #[test_case(&[None, Some(7)] => Some(7); "the first lost")]
 #[test_case(&[None, None] => None; "none timed")]
+#[test_case(&[Some(90_000), Some(1), Some(91_000), Some(90_500), Some(92_000)] => Some(90_000); "a bogus stamp")]
+#[test_case(&[Some(100), Some(60), Some(110)] => Some(60); "a fast run within half the median")]
+#[test_case(&[Some(100), Some(49), Some(110)] => Some(100); "past half the median")]
 fn a_candidate_keeps_its_timed_runs(runs: &[Option<u64>]) -> Option<u64> {
     let runs = runs.iter().map(|r| r.map(std::time::Duration::from_nanos));
     tune::best(runs).map(|d| d.as_nanos() as u64)

@@ -1,28 +1,29 @@
-//! Measured config choice per shape. An op's candidate list is a search space:
-//! the first time a device meets a shape, every candidate is built on scratch
-//! buffers at capacity and timed (the clock lifted first, then round-robin
-//! rounds keeping each candidate's minimum), and the winner is kept in the
-//! process memo and on disk. This runs where the op is called, at graph
-//! build, never inside a running plan.
+//! Measured config choice per shape, made at graph build: an op's ranked
+//! configs are admitted ([`Bench`]) and, on a store miss, timed; the winner
+//! is kept in the process memo and on disk.
 //!
-//! The store is one line per entry (`key index ns`) in `$SVOD_TK3_TUNE_DIR`
+//! The store is one line per entry (`key index value`) in `$SVOD_TK3_TUNE_DIR`
 //! (else `$XDG_CACHE_HOME/svod/tk3_tune`, else `$HOME/.cache/svod/tk3_tune`),
-//! one file per device and crate version. A line's key carries a fingerprint
-//! of the candidate programs, so a kernel change re-measures. An unreadable
-//! or unwritable store is a miss, never an error; `SVOD_TK3_TUNE=0` or
-//! [`set_enabled`] turns measuring off and the list's first entry is used.
+//! one file per device and crate version. A line's key carries a digest of the
+//! device's compiler ([`compiler`]) and a fingerprint of the candidate
+//! programs, so a toolchain or kernel change re-measures. A choice's value is
+//! its device ns; a measured value ([`TuneStore::value`]) has index 0. An
+//! unreadable or unwritable store is a miss, never an error.
+//! `SVOD_TK3_TUNE=0` or [`set_enabled`] turns candidate timing off: the first
+//! admitted candidate is used, while a device's probes still measure.
 
+use std::borrow::BorrowMut;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
-use svod_dtype::ScalarDType;
 use svod_dtype::default_device::{default_device, with_default_device};
-use svod_runtime::ExecutionPlan;
-use svod_runtime::benchmark::round_robin_min;
+use svod_dtype::{DeviceSpec, ScalarDType};
+use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
+use svod_runtime::{ExecutionPlan, KernelResources};
 use svod_tensor::Tensor;
 
 use crate::atoms::Target;
@@ -34,10 +35,9 @@ use crate::lower::Lowering;
 const ROUNDS: usize = 4;
 /// Profiled runs per candidate per round.
 const RUNS: usize = 5;
-/// Back-to-back runs lift a cold clock (an RTX 3060 idles at 210 MHz) ...
-const WARMUP: Duration = Duration::from_millis(500);
-/// ... and keep it up ahead of each candidate's profiled runs, whose host
-/// overhead would otherwise let a short kernel's clock sag.
+/// Back-to-back runs keep the lifted clock up ahead of each candidate's
+/// profiled runs, whose host overhead would otherwise let a short kernel's
+/// clock sag.
 const SUSTAIN: Duration = Duration::from_millis(10);
 
 fn digest(value: &impl Hash) -> u64 {
@@ -57,42 +57,74 @@ pub struct TuneKey {
     pub dtype: ScalarDType,
     pub shape: Vec<usize>,
     pub candidates: u64,
+    /// The device's [`compiler`] digest.
+    pub compiler: u64,
 }
 
 impl TuneKey {
-    pub fn new(op: &'static str, target: &Target, dtype: ScalarDType, shape: &[usize], candidates: &impl Hash) -> Self {
+    pub fn new(
+        op: &'static str,
+        target: &Target,
+        compiler: u64,
+        dtype: ScalarDType,
+        shape: &[usize],
+        candidates: &impl Hash,
+    ) -> Self {
         let device = format!("{}-{}sm", target.arch.target_name(), target.sms.unwrap_or(0));
-        Self { op, device, dtype, shape: shape.to_vec(), candidates: digest(candidates) }
+        Self { op, device, dtype, shape: shape.to_vec(), candidates: digest(candidates), compiler }
     }
 
     /// The store line for the candidate programs fingerprinted as `programs`.
     pub fn line(&self, programs: u64) -> String {
         let shape: Vec<String> = self.shape.iter().map(usize::to_string).collect();
-        let (op, device, dtype) = (self.op, &self.device, self.dtype);
-        format!("{op}|{device}|{dtype:?}|{}|{:016x}|{programs:016x}", shape.join("x"), self.candidates)
+        let (op, device, dtype, compiler) = (self.op, &self.device, self.dtype, self.compiler);
+        let candidates = self.candidates;
+        format!("{op}|{device}|{dtype:?}|{}|{candidates:016x}|{compiler:016x}|{programs:016x}", shape.join("x"))
     }
+}
+
+/// A digest of `spec`'s compiler identity (backend, toolchain, flags) for
+/// [`TuneKey::compiler`], once per device; 0 where no device opens.
+pub fn compiler(spec: &DeviceSpec) -> u64 {
+    static DIGESTS: LazyLock<Once<DeviceSpec, u64>> = LazyLock::new(Mutex::default);
+    once(&DIGESTS, spec, || {
+        let device = svod_runtime::DEVICE_FACTORIES.device(spec, svod_device::registry::registry());
+        device.map_or(0, |device| digest(&device.compiler.cache_key()))
+    })
 }
 
 /// A candidate's programs, launched in order (a kernel and the merge of
 /// its partial results, say).
 pub type Candidate = Vec<(Program, Lowering)>;
 
-/// The fingerprint of built candidates: their tile programs and lowerings.
+/// The fingerprint of candidates' programs: their tile programs and lowerings.
 pub fn fingerprint(candidates: &[Candidate]) -> u64 {
-    digest(&format!("{candidates:?}"))
+    digest(&candidates.iter().map(|c| digest(&format!("{c:?}"))).collect::<Vec<_>>())
+}
+
+/// Values per key, each made once: a caller asking for a key in flight
+/// waits for its value rather than making another.
+type Once<K, V> = Mutex<HashMap<K, Arc<OnceLock<V>>>>;
+
+fn once<K: Clone + Eq + Hash, V: Clone>(map: &Once<K, V>, key: &K, init: impl FnOnce() -> V) -> V {
+    let cell = map.lock().expect("tune memo").entry(key.clone()).or_default().clone();
+    cell.get_or_init(init).clone()
 }
 
 /// A memo of this process's choices, backed by one file per device under `root`.
 #[derive(Debug)]
 pub struct TuneStore {
     root: Option<PathBuf>,
-    memo: Mutex<HashMap<TuneKey, Option<usize>>>,
+    /// `(index, value)` per key, of a choice or a value alike.
+    memo: Once<TuneKey, Option<(usize, u64)>>,
+    /// The admitted indices per ranked list ([`Self::admitted`]).
+    admitted: Once<TuneKey, Option<Arc<[usize]>>>,
 }
 
 impl TuneStore {
     /// The store rooted at `root` (`None`: memory only).
     pub fn at(root: Option<PathBuf>) -> Self {
-        Self { root, memo: Mutex::default() }
+        Self { root, memo: Mutex::default(), admitted: Mutex::default() }
     }
 
     /// The process-wide store per the environment (see the module docs).
@@ -112,7 +144,7 @@ impl TuneStore {
         self.root.as_ref().map(|root| root.join(format!("{name}-v{}.txt", env!("CARGO_PKG_VERSION"))))
     }
 
-    /// Every `line -> (index, ns)` of the key's device file; empty when unreadable.
+    /// Every `line -> (index, value)` of the key's device file; empty when unreadable.
     pub fn entries(&self, key: &TuneKey) -> HashMap<String, (usize, u64)> {
         let Some(text) = self.path(key).and_then(|p| std::fs::read_to_string(p).ok()) else { return HashMap::new() };
         text.lines()
@@ -126,11 +158,11 @@ impl TuneStore {
 
     /// Re-read, merge and replace the file atomically, so concurrent writers
     /// lose at most each other's newest line, never the file.
-    fn put(&self, key: &TuneKey, line: String, index: usize, ns: u64) {
+    fn put(&self, key: &TuneKey, line: String, index: usize, value: u64) {
         let Some(path) = self.path(key) else { return };
         let mut entries = self.entries(key);
-        entries.insert(line, (index, ns));
-        let mut lines: Vec<String> = entries.iter().map(|(line, (i, ns))| format!("{line} {i} {ns}")).collect();
+        entries.insert(line, (index, value));
+        let mut lines: Vec<String> = entries.iter().map(|(line, (i, v))| format!("{line} {i} {v}")).collect();
         lines.sort();
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         if std::fs::write(&tmp, lines.join("\n") + "\n").is_ok() && std::fs::rename(&tmp, &path).is_err() {
@@ -149,59 +181,193 @@ impl TuneStore {
         programs: impl FnOnce() -> u64,
         measure: impl FnOnce() -> Vec<Option<u64>>,
     ) -> Option<usize> {
-        if let Some(chosen) = self.memo.lock().expect("tune memo").get(key) {
-            return *chosen;
+        self.remember(key, |i| i < count, || (programs(), ()), |()| fastest(measure())).map(|(i, _)| i)
+    }
+
+    /// A measured number (a probe's cost, say) by the same path as
+    /// [`Self::select`]: the memo, the store, else `measure`, stored when `Some`.
+    pub fn value(
+        &self,
+        key: &TuneKey,
+        programs: impl FnOnce() -> u64,
+        measure: impl FnOnce() -> Option<u64>,
+    ) -> Option<u64> {
+        self.remember(key, |i| i == 0, || (programs(), ()), |()| measure().map(|v| (0, v))).map(|(_, v)| v)
+    }
+
+    /// The memo, then the stored entry whose index is `valid` under the
+    /// fingerprint `programs` makes, else `measure`'s `(index, value)` of
+    /// what `programs` built, stored when there is one and memoized either way.
+    fn remember<T>(
+        &self,
+        key: &TuneKey,
+        valid: impl Fn(usize) -> bool,
+        programs: impl FnOnce() -> (u64, T),
+        measure: impl FnOnce(T) -> Option<(usize, u64)>,
+    ) -> Option<(usize, u64)> {
+        once(&self.memo, key, || {
+            let (programs, built) = programs();
+            let line = key.line(programs);
+            self.entries(key).remove(&line).filter(|(i, _)| valid(*i)).or_else(|| {
+                let (i, v) = measure(built)?;
+                self.put(key, line, i, v);
+                Some((i, v))
+            })
+        })
+    }
+
+    /// [`Self::select`] among `candidates`, keyed by the fingerprint of the
+    /// programs `build` makes (each built once); only a store miss compiles
+    /// them (those `bench` has not) and [`time`]s them.
+    pub fn choose<C: Copy + PartialEq>(
+        &self,
+        key: &TuneKey,
+        candidates: &[C],
+        build: impl Fn(C) -> Candidate,
+        bench: &mut Bench<C>,
+    ) -> Option<usize> {
+        let programs = || {
+            let built: Vec<Candidate> = candidates.iter().map(|&c| build(c)).collect();
+            (fingerprint(&built), built)
+        };
+        let timed = |built| fastest(bench.time(candidates, built));
+        self.remember(key, |i| i < candidates.len(), programs, timed).map(|(i, _)| i)
+    }
+
+    /// The indices `admit` finds for the ranked list `key` names (`None`:
+    /// nothing compiled to judge), memoized for the process only: what
+    /// compiles without spilling is the compiler's (already in the key), and
+    /// recompiling in another process hits the object cache.
+    pub fn admitted(&self, key: &TuneKey, admit: impl FnOnce() -> Option<Vec<usize>>) -> Option<Arc<[usize]>> {
+        once(&self.admitted, key, || admit().map(Into::into))
+    }
+}
+
+/// The fastest of candidates' device times as `(index, ns)`.
+fn fastest(ns: Vec<Option<u64>>) -> Option<(usize, u64)> {
+    ns.into_iter().enumerate().filter_map(|(i, ns)| Some((ns?, i))).min().map(|(ns, i)| (i, ns))
+}
+
+/// A candidate compiled on scratch buffers: its plans (`None` when one
+/// failed to build) and its kernels' compiled resources where the backend
+/// reports them.
+pub struct Built {
+    plans: Option<Vec<Scratch>>,
+    resources: Vec<KernelResources>,
+}
+
+/// What compiling a candidate showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compiled {
+    Failed,
+    /// A kernel [`spilled`]: timed only where every candidate does.
+    Spilled,
+    Clean,
+}
+
+impl Built {
+    pub fn verdict(&self) -> Compiled {
+        match &self.plans {
+            None => Compiled::Failed,
+            Some(_) if spilled(&self.resources) => Compiled::Spilled,
+            Some(_) => Compiled::Clean,
         }
-        let line = key.line(programs());
-        let stored = self.entries(key).remove(&line).map(|(i, _)| i).filter(|i| *i < count);
-        let chosen = stored.or_else(|| {
-            let (ns, i) = measure().into_iter().enumerate().filter_map(|(i, ns)| Some((ns?, i))).min()?;
-            self.put(key, line, i, ns);
-            Some(i)
-        });
-        self.memo.lock().expect("tune memo").insert(key.clone(), chosen);
-        chosen
+    }
+}
+
+/// Whether a kernel of `resources` spilled to scratch; a backend reporting
+/// nothing has not.
+pub fn spilled(resources: &[KernelResources]) -> bool {
+    resources.iter().any(|r| r.scratch_bytes.is_some_and(|b| b > 0))
+}
+
+/// Candidates compiled once on one scratch pool and kept: admitted in ranked
+/// batches, then timed by the passes that ask for them, none compiled twice.
+pub struct Bench<C> {
+    pool: ScratchPool,
+    pub(crate) built: Vec<(C, Built)>,
+}
+
+impl<C> Default for Bench<C> {
+    fn default() -> Self {
+        Self { pool: ScratchPool::default(), built: vec![] }
+    }
+}
+
+impl<C: Copy + PartialEq> Bench<C> {
+    fn find(&self, c: C) -> Option<usize> {
+        self.built.iter().position(|(b, _)| *b == c)
     }
 
-    /// [`Self::select`] over the programs `build(i)` makes for candidate `i`,
-    /// built only on a memo miss and timed by [`measure`] on a store miss.
-    pub fn choose(&self, key: &TuneKey, count: usize, build: impl Fn(usize) -> Candidate) -> Option<usize> {
-        let programs = OnceLock::new();
-        let built = || programs.get_or_init(|| (0..count).map(&build).collect::<Vec<_>>());
-        self.select(key, count, || fingerprint(built()), || measure(built().iter().cloned()))
+    /// Compiles, in parallel, those of `candidates` not compiled before,
+    /// from the programs `programs` makes of a candidate's position.
+    fn compile(&mut self, candidates: &[C], mut programs: impl FnMut(usize) -> Candidate) {
+        let missing: Vec<usize> = (0..candidates.len()).filter(|&i| self.find(candidates[i]).is_none()).collect();
+        let built = compile(missing.iter().map(|&i| programs(i)).collect(), &self.pool);
+        self.built.extend(missing.into_iter().map(|i| candidates[i]).zip(built));
     }
 
-    /// The candidate [`Self::choose`] finds among `candidates`, else the first.
-    pub fn pick<C: Copy>(&self, key: &TuneKey, candidates: &[C], build: impl Fn(C) -> Candidate) -> C {
-        let chosen = self.choose(key, candidates.len(), |i| build(candidates[i]));
-        candidates[chosen.unwrap_or(0)]
+    /// What compiling each of `batch` (the programs `build` makes) showed.
+    pub fn admit(&mut self, batch: &[C], build: impl Fn(C) -> Candidate) -> Vec<Compiled> {
+        self.compile(batch, |i| build(batch[i]));
+        batch.iter().map(|&c| self.built[self.find(c).expect("compiled")].1.verdict()).collect()
+    }
+
+    /// Each of `candidates`' best device time ([`time`]); those not compiled
+    /// yet compile from `programs`, theirs in order.
+    pub fn time(&mut self, candidates: &[C], programs: Vec<Candidate>) -> Vec<Option<u64>> {
+        let mut programs: Vec<Option<Candidate>> = programs.into_iter().map(Some).collect();
+        self.compile(candidates, |i| programs[i].take().expect("a candidate's programs"));
+        let (timed, mut built): (Vec<C>, Vec<&mut Built>) =
+            self.built.iter_mut().filter(|(c, _)| candidates.contains(c)).map(|(c, b)| (*c, b)).unzip();
+        let ns = time(&mut built);
+        candidates.iter().map(|c| ns[timed.iter().position(|t| t == c).expect("compiled")]).collect()
     }
 }
 
 /// Each candidate's best device time in ns, its programs' summed, on scratch
-/// buffers at capacity (every runtime variable bound to its maximum); `None`
-/// where one fails. The programs compile in parallel, on workers carrying
-/// the caller's default device and origin scope; the device runs them one
-/// at a time.
+/// buffers at capacity: [`compile`], then [`time`].
 pub fn measure(candidates: impl IntoIterator<Item = Candidate>) -> Vec<Option<u64>> {
-    let candidates: Vec<Candidate> = candidates.into_iter().collect();
-    let pool = ScratchPool::default();
-    let compiled: Vec<Option<Vec<Scratch>>> =
-        in_parallel(candidates, |programs| programs.into_iter().map(|(p, l)| scratch_plan(p, &l, &pool)).collect());
-    let plans: Vec<Option<Vec<ExecutionPlan>>> = compiled
-        .into_iter()
-        .map(|plans| {
-            plans?
-                .into_iter()
-                .map(|(mut plan, vars)| {
+    time(&mut compile(candidates.into_iter().collect(), &ScratchPool::default()))
+}
+
+/// Builds each candidate's plans on `pool`'s scratch buffers at capacity
+/// (every runtime variable bound to its maximum) and reads its kernels'
+/// [`resources`]. The programs compile in parallel, on workers carrying the
+/// caller's default device and origin scope.
+pub(crate) fn compile(candidates: Vec<Candidate>, pool: &ScratchPool) -> Vec<Built> {
+    in_parallel(candidates, |programs| {
+        let plans: Option<Vec<Scratch>> = programs.into_iter().map(|(p, l)| scratch_plan(p, &l, pool)).collect();
+        let resources = plans.iter().flatten().flat_map(|(plan, _)| resources(plan)).collect();
+        Built { plans, resources }
+    })
+}
+
+/// Held across every [`time`] in the process, the probes' and the tuner's
+/// alike: two measurements sharing the device would time each other.
+static DEVICE: Mutex<()> = Mutex::new(());
+
+/// Each built candidate's best device time in ns, its programs' summed;
+/// `None` where one failed to build or run. The device runs them one at a
+/// time, after the clock is lifted, under the process's one timing lock.
+pub(crate) fn time<B: BorrowMut<Built>>(built: &mut [B]) -> Vec<Option<u64>> {
+    let _device = DEVICE.lock().unwrap_or_else(PoisonError::into_inner);
+    let plans: Vec<Option<Vec<&ExecutionPlan>>> = built
+        .iter_mut()
+        .map(|b| {
+            b.borrow_mut()
+                .plans
+                .as_mut()?
+                .iter_mut()
+                .map(|(plan, vars)| {
                     let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-                    plan.execute_with_vars(&vars).ok().map(|_| plan)
+                    plan.execute_with_vars(&vars).ok().map(|_| &*plan)
                 })
                 .collect()
         })
         .collect();
     if let Some(first) = plans.iter().flatten().flatten().next() {
-        spin(first, WARMUP);
+        warm_clock(CLOCK_WARMUP, || run(first));
     }
     let time = |i: usize| {
         let plans = plans[i].as_ref()?;
@@ -249,7 +415,7 @@ impl ScratchPool {
     }
 }
 
-fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPool) -> Option<Scratch> {
+pub(crate) fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPool) -> Option<Scratch> {
     let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
     let buffers = pool.buffers(&prog.params);
     let out = launch::graph_launch(prog, lowering, &buffers.iter().collect::<Vec<_>>()).ok()?;
@@ -279,15 +445,33 @@ pub(crate) fn in_parallel<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + 
         .collect()
 }
 
-/// The fastest of the runs that were timed; `None` only when none was.
+/// The fastest of a candidate's timed runs, dropping any under half their
+/// median (a lost stamp); `None` only when no run was timed.
 pub(crate) fn best(runs: impl Iterator<Item = Option<Duration>>) -> Option<Duration> {
-    runs.flatten().min()
+    let mut runs: Vec<Duration> = runs.flatten().collect();
+    runs.sort_unstable();
+    let median = *runs.get(runs.len() / 2)?;
+    runs.into_iter().find(|&run| 2 * run >= median)
 }
 
-/// One run's longest kernel; `None` when the device stamps no times.
-fn run(plan: &ExecutionPlan) -> Option<Duration> {
-    let profile = plan.execute_profiled().ok()?;
-    profile.iter().filter_map(|k| k.gpu_end_ns?.checked_sub(k.gpu_start_ns?)).max().map(Duration::from_nanos)
+/// One run's device time, its kernels' summed: a candidate is a kernel plus
+/// its merge, which the longest alone would hide. `None` when the run fails
+/// or the device did not stamp every kernel (see [`stamped`]).
+pub(crate) fn run(plan: &ExecutionPlan) -> Option<Duration> {
+    stamped(plan.execute_profiled().ok()?.iter().map(|k| (k.gpu_start_ns, k.gpu_end_ns)))
+}
+
+/// The sum of the `(start, end)` stamps of a run's kernels; `None` when there
+/// are none or any lost one, since a run without it would read as faster.
+pub(crate) fn stamped(stamps: impl IntoIterator<Item = (Option<u64>, Option<u64>)>) -> Option<Duration> {
+    let ns: Vec<u64> = stamps.into_iter().map(|(start, end)| end?.checked_sub(start?)).collect::<Option<_>>()?;
+    (!ns.is_empty()).then(|| Duration::from_nanos(ns.iter().sum()))
+}
+
+/// The compiled resources (registers, LDS, scratch) of the plan's kernels
+/// whose backend reports them, in schedule order.
+pub fn resources(plan: &ExecutionPlan) -> Vec<KernelResources> {
+    plan.kernels().filter_map(|k| k.program.resource_usage()).collect()
 }
 
 /// `0`: follow the environment; `1`: off; `2`: on.

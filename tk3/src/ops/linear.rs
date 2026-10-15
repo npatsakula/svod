@@ -6,7 +6,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
-use super::{Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed};
+use super::{Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output, typed};
 use crate::kernels::gemm::{Epilogue, GemmSpec, Scale, gemm};
 use crate::launch;
 
@@ -61,7 +61,6 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     };
     let Plan::Kernel(cfgs) = plan else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
-    let target = planner.target.clone();
     let (lead, k) = (&ext.dims[..ext.dims.len() - 1], ext.dims[ext.dims.len() - 1]);
     let n = n.as_const().expect("planned");
     // A bound batch walks grid z; each batch is a GEMM over the rows behind it.
@@ -77,12 +76,13 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     let batch = batch_of(&var, 1);
     let spec = |cfg| GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };
     let shape = [batch.capacity(), m, n, k];
-    let cfg = tuned(OP, &target, x.dtype(), &shape, (&batch, epilogue), &cfgs, |cfg| {
-        vec![(typed!(x.dtype(), gemm, &spec(cfg)), cfg.lowering(target.clone()))]
-    });
+    let cfg = Tuner::new(&planner.device, x.dtype(), &shape, (&batch, epilogue), |cfg| {
+        vec![(typed!(x.dtype(), gemm, &spec(cfg)), cfg.lowering(&planner.device))]
+    })
+    .tuned(OP, &cfgs, <[_]>::to_vec);
     let y = output(&[lead, &[n]].concat(), &var, x.dtype());
     let ins: Vec<&Tensor> = [Some(x), Some(w), opts.bias, opts.residual, Some(&y)].into_iter().flatten().collect();
-    launch::graph_launch(typed!(x.dtype(), gemm, &spec(cfg)), &cfg.lowering(target), &ins)
+    launch::graph_launch(typed!(x.dtype(), gemm, &spec(cfg)), &cfg.lowering(&planner.device), &ins)
         .context(LaunchSnafu { op: OP })
 }
 
