@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use snafu::{ResultExt, Snafu};
 use svod_ir::origin::{OriginId, OriginSet};
 use svod_ir::{CallInfo, Op, SInt, UOp, UOpKey};
@@ -616,8 +616,9 @@ struct SplitCandidate {
     output_size: usize,
 }
 
-fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bool> {
-    let ranges: Vec<Arc<UOp>> = input_shape
+/// One RANGE per axis of `shape`, numbered by position; a unit axis reads at 0.
+fn axis_ranges(shape: &[SInt]) -> Vec<Arc<UOp>> {
+    shape
         .iter()
         .enumerate()
         .map(|(axis_id, dim)| match dim {
@@ -627,9 +628,11 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
             }
             _ => UOp::index_const(0),
         })
-        .collect();
+        .collect()
+}
 
-    let indexed = match UOp::index().buffer(Arc::clone(source)).indices(ranges).call() {
+fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bool> {
+    let indexed = match UOp::index().buffer(Arc::clone(source)).indices(axis_ranges(input_shape)).call() {
         Ok(idx) => idx,
         Err(_) => return vec![false; input_shape.len()],
     };
@@ -748,6 +751,77 @@ fn apply_split_transformation(
     second_reduce.try_reshape(final_shape).ok()
 }
 
+/// Follows `node` down through movement ops, and through the casts whose source
+/// `pass` accepts, to the first other op, carrying `indices` (what each axis of
+/// `node` is read at) onto that op's axes. `None` past a cast `pass` refuses.
+fn through_views(
+    mut node: &Arc<UOp>,
+    mut indices: Vec<Arc<UOp>>,
+    pass: impl Fn(&Arc<UOp>) -> bool,
+) -> Option<(&Arc<UOp>, Vec<Arc<UOp>>)> {
+    loop {
+        match node.op() {
+            Op::Cast(ops::Cast { src, .. }) => node = pass(src).then_some(src)?,
+            op if op.is_movement() => {
+                let src = op.children()[0];
+                indices = super::indexing::apply_movement_op(op, src.shape().ok()??, &indices);
+                node = src;
+            }
+            _ => return Some((node, indices)),
+        }
+    }
+}
+
+/// Whether `reduce` is the one-hot lookup `Tensor::embedding` and `gather`
+/// build, in a form reduce simplification folds into one indexed load: a sum
+/// of `where(idx == arange, x, 0)`, `where(idx != arange, 0, x)` or
+/// `x * (idx == arange)`, where `idx` is constant along the reduced axes and
+/// `arange` varies along all of them without reading a buffer, through casts
+/// that keep every value of `idx`. Split, the first stage has to solve
+/// `idx == k * chunk + r` instead, which a 64-bit `idx` cannot do without
+/// risking a wrap, so it reads the whole table for every index; a narrower
+/// `idx` folds, but still pays for a second kernel and its intermediate.
+fn is_one_hot_select(reduce: &Arc<UOp>, input_shape: &[SInt]) -> bool {
+    use svod_ir::{BinaryOp, ReduceOp, TernaryOp};
+
+    let Op::Reduce(ops::Reduce { src, reduce_op: ReduceOp::Add, num_axes, .. }) = reduce.op() else {
+        return false;
+    };
+    // A cast between the reduce and the select keeps it from folding.
+    let Some((select, at)) = through_views(src, axis_ranges(input_shape), |_| false) else {
+        return false;
+    };
+    let is_zero = |uop: &Arc<UOp>| matches!(uop.base().op(), Op::Const(value) if value.0.is_zero());
+    let (gates, compare): (SmallVec<[&Arc<UOp>; 2]>, _) = match select.op() {
+        Op::Ternary(TernaryOp::Where, gate, _, otherwise) if is_zero(otherwise) => (smallvec![gate], BinaryOp::Eq),
+        Op::Ternary(TernaryOp::Where, gate, picked, _) if is_zero(picked) => (smallvec![gate], BinaryOp::Ne),
+        Op::Binary(BinaryOp::Mul, lhs, rhs) => (smallvec![lhs, rhs], BinaryOp::Eq),
+        _ => return false,
+    };
+
+    let reduced: HashSet<usize> =
+        (0..*num_axes).filter(|&axis| input_shape[axis].as_const().is_some_and(|n| n > 1)).collect();
+    // The reduced axes `side` varies along, and the op it reads them from.
+    let along_reduced = |side: &Arc<UOp>, at: &[Arc<UOp>], pass: &dyn Fn(&Arc<UOp>) -> bool| {
+        let (base, at) = through_views(side, at.to_vec(), pass)?;
+        let axes: HashSet<usize> =
+            at.iter().flat_map(collect_range_ids).filter(|axis| reduced.contains(axis)).collect();
+        Some((base.clone(), axes))
+    };
+    let selects = |idx: &Arc<UOp>, arange: &Arc<UOp>, at: &[Arc<UOp>]| {
+        let keeps_idx = |src: &Arc<UOp>| svod_dtype::DType::can_safe_cast(idx.dtype(), src.dtype());
+        along_reduced(idx, at, &|_| true).is_some_and(|(_, axes)| axes.is_empty())
+            && along_reduced(arange, at, &keeps_idx)
+                .is_some_and(|(base, axes)| axes == reduced && !base.any_in_subtree(|node| node.has_buffer_identity()))
+    };
+    gates.into_iter().any(|gate| {
+        through_views(gate, at.clone(), |_| true).is_some_and(|(cmp, at)| match cmp.op() {
+            Op::Binary(op, lhs, rhs) if *op == compare => selects(lhs, rhs, &at) || selects(rhs, lhs, &at),
+            _ => false,
+        })
+    })
+}
+
 /// Split a large tensor-form REDUCE into two stages.
 pub fn split_reduceop(reduce: &Arc<UOp>, config: &SplitReduceOpConfig) -> Option<Arc<UOp>> {
     if !config.enabled {
@@ -776,7 +850,7 @@ pub fn split_reduceop(reduce: &Arc<UOp>, config: &SplitReduceOpConfig) -> Option
     }
 
     let ratio = input_size / output_size;
-    if ratio < config.split_threshold {
+    if ratio < config.split_threshold || is_one_hot_select(reduce, input_shape) {
         return None;
     }
 
