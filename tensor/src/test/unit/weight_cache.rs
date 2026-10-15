@@ -42,3 +42,16 @@ fn shared_weight_refuses_host_writes() {
     buffer.copyout(&mut out).unwrap();
     assert_eq!(out, [2u8; 16], "reads stay legal and correct");
 }
+
+/// The registry drops a weight's storage as soon as the weight's BUFFER uop
+/// dies, not whenever papaya's collector next retires a batch of removed
+/// entries: a thread that stops dropping tensors keeps its last 31 for good,
+/// and a model cast to f16 would keep that many f32 checkpoint weights.
+#[test]
+fn dropping_a_weight_tensor_releases_its_storage() {
+    let bytes = [3u8; 16];
+    let tensor = crate::Tensor::from_shared_weight(key("w_drop"), &bytes).unwrap();
+    let storage = std::sync::Arc::downgrade(&shared_weight_buffer(key("w_drop"), &bytes));
+    drop(tensor);
+    assert!(storage.upgrade().is_none(), "the storage must die with its last tensor");
+}

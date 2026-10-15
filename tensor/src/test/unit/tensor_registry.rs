@@ -106,6 +106,37 @@ fn buffer_entry_expires_when_uop_drops() {
     assert!(get_buffer(id).is_none(), "entry must expire with its UOp");
 }
 
+/// Re-registering a live id (an in-place assign re-inserts its own storage)
+/// must never hide the buffer from a concurrent lookup: only removal may
+/// empty a slot that a reader can still hold.
+#[test]
+fn re_registering_a_live_id_never_hides_its_buffer() {
+    let uop = UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    let allocator = svod_device::registry::cpu().expect("cpu allocator");
+    let buffer = Arc::new(svod_device::Buffer::new(allocator, DType::Float32, vec![4], Default::default()));
+    register_buffer_by_uop_id(uop.id, buffer.clone());
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut misses = 0;
+                    while !done.load(Ordering::Relaxed) {
+                        misses += usize::from(get_buffer_arc(uop.id).is_none());
+                    }
+                    misses
+                })
+            })
+            .collect();
+        for _ in 0..100_000 {
+            register_buffer_by_uop_id(uop.id, buffer.clone());
+        }
+        done.store(true, Ordering::Relaxed);
+        let misses: usize = readers.into_iter().map(|reader| reader.join().unwrap()).sum();
+        assert_eq!(misses, 0, "lookups of a live id found no buffer");
+    });
+}
+
 /// The realize-final broadcast is device-scoped: a device-less (pure)
 /// receiver sharing the realized graph must NOT be folded onto the realized
 /// device buffer — an `amd` variant realizing a shared constant must never
