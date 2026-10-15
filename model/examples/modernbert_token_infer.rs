@@ -23,6 +23,7 @@ use svod_arch::pipelines::text::{
     ClassifyTokens, EncoderHead, EncoderPipeline, RunOptions, Scheme, TruncatingChunker, group_spans, labels_for_tokens,
 };
 use svod_dtype::DType;
+use svod_model::encoder_head::HubOptions;
 use svod_model::modernbert;
 
 #[derive(Parser, Debug)]
@@ -97,11 +98,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Dtype::F16) => DType::Float16,
         Some(Dtype::Bf16) => DType::BFloat16,
     };
-    let opts = modernbert::HubOptions {
+    let opts = HubOptions {
         revision: args.revision.clone(),
         max_batch: args.max_batch,
         max_seq: args.max_seq,
         dtype,
+        tokenizer_repo: None,
     };
 
     let t_total = Instant::now();

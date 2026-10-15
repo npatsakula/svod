@@ -11,6 +11,8 @@
 
 use svod_macros::jit_wrapper;
 
+use crate::encoder_head::head_jit;
+
 use super::token_classifier::ModernBertTokenClassificationModel;
 
 jit_wrapper! {
@@ -25,3 +27,5 @@ jit_wrapper! {
         }
     }
 }
+
+head_jit!(ModernBertTokenClassifierJit, ModernBertTokenClassificationModel, logits_to_vec);

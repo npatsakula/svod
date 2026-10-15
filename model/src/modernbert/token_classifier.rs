@@ -17,10 +17,10 @@ use svod_arch::pipelines::text::{ClassifyTokens, EncoderHead, Encoding, RunProfi
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
 
+use crate::encoder_head::{HeadError, HeadPlans};
 use crate::modernbert::classifier::ClassifierHead;
 use crate::modernbert::config::ModernBertConfig;
 use crate::modernbert::error::Result;
-use crate::modernbert::head_jit::{HeadError, HeadPlans};
 use crate::modernbert::model::ModernBert;
 use crate::modernbert::token_classifier_jit::ModernBertTokenClassifierJit;
 use crate::state::{self, StateDict};
@@ -81,8 +81,10 @@ impl ModernBertTokenClassifier {
         max_seq: usize,
     ) -> std::result::Result<Self, HeadError> {
         let num_labels = model.head.num_labels();
-        let max_positions = model.backbone.config.max_position_embeddings;
-        Ok(Self { plans: HeadPlans::new(model, max_batch, max_seq, max_positions, "classify_tokens")?, num_labels })
+        let config = &model.backbone.config;
+        let (max_positions, pad_id) = (config.max_position_embeddings, config.pad_token_id);
+        let plans = HeadPlans::new(model, max_batch, max_seq, max_positions, pad_id, "classify_tokens")?;
+        Ok(Self { plans, num_labels })
     }
 }
 

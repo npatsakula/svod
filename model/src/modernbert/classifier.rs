@@ -17,11 +17,11 @@ use svod_tensor::Tensor;
 use svod_tensor::nn::{LayerNorm, Linear, Module};
 use svod_tk::ops::{self, Act};
 
+use crate::encoder_head::{HeadError, HeadPlans};
 use crate::init::{Bias, linear};
 use crate::modernbert::classifier_jit::ModernBertClassifierJit;
 use crate::modernbert::config::{ClassifierPooling, ModernBertConfig};
 use crate::modernbert::error::Result;
-use crate::modernbert::head_jit::{HeadError, HeadPlans};
 use crate::modernbert::model::ModernBert;
 use crate::state::{self, StateDict};
 
@@ -141,8 +141,9 @@ impl ModernBertClassifier {
         max_seq: usize,
     ) -> std::result::Result<Self, HeadError> {
         let num_classes = model.head.num_labels();
-        let max_positions = model.backbone.config.max_position_embeddings;
-        Ok(Self { plans: HeadPlans::new(model, max_batch, max_seq, max_positions, "classify")?, num_classes })
+        let config = &model.backbone.config;
+        let (max_positions, pad_id) = (config.max_position_embeddings, config.pad_token_id);
+        Ok(Self { plans: HeadPlans::new(model, max_batch, max_seq, max_positions, pad_id, "classify")?, num_classes })
     }
 }
 

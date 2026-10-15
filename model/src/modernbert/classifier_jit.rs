@@ -11,6 +11,8 @@
 
 use svod_macros::jit_wrapper;
 
+use crate::encoder_head::head_jit;
+
 use super::classifier::ModernBertClassificationModel;
 
 jit_wrapper! {
@@ -25,3 +27,5 @@ jit_wrapper! {
         }
     }
 }
+
+head_jit!(ModernBertClassifierJit, ModernBertClassificationModel, logits_to_vec);
