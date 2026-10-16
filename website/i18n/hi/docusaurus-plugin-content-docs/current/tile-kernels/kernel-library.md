@@ -46,7 +46,9 @@ fragments shared memory से पढ़े जाते हैं, fill stream 
 estimate से); उन blocks का एक round कम से कम एक wave का अपना issue है (जिस block में SM के SIMDs से कम waves
 हैं वह बाक़ी को idle छोड़ता है) और वह memory latency जिसे एक pipeline stage आगे छिपा नहीं सकता:
 `cost = trips × max(per_sm × (work + trip / resident), rounds × max(simds × (work + trip) / waves, latency / (stages − 1)))`
-जहाँ `rounds = ⌈per_sm / resident⌉` (`Planner::pipelined`)। Fill का byte इस हिसाब से priced है कि वह कहाँ से
+जहाँ `rounds = ⌈per_sm / resident⌉` (`Planner::pipelined`); जो SIMD `step_lone / step` से कम waves रखता है
+(उतनी waves matrix-core chain की latency छिपाती हैं), वह उनका issue `work` उतने गुना धीमा चलाता है, fill इस बीच
+stream होती रहती है। Fill का byte इस हिसाब से priced है कि वह कहाँ से
 आता है: distinct bytes cache के तीन-चौथाई में समाएँ तो L2 दर, उससे डेढ़ गुना से ज़्यादा हों तो DRAM दर, बीच में
 दोनों का मिश्रण (`Planner::fill_byte`)। Wave वाले bound के बिना gfx1151 की ranking one-warp 256×256 tiles से
 शुरू होती थी जो

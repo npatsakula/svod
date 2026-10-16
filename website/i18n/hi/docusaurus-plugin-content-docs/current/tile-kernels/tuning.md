@@ -92,7 +92,8 @@ warm run के सारे fingerprints मिलकर 45 ms); सिर्�
 
 ## Device costs {#device-costs}
 
-Ranking की costs (`atoms::Costs`: एक shared byte, एक streamed byte, एक matrix-core step, एक score का
+Ranking की costs (`atoms::Costs`: एक shared byte, एक streamed byte, भरे SM पर और अपने SIMD पर अकेली wave का
+एक matrix-core step, एक score का
 softmax, एक pipeline trip, lane moves, global latency, ...) device पर `probe::costs` से मापी जाती हैं, पहली
 बार जब कोई process उसके लिए plan करता है: हर field programs की एक जोड़ी है, एक probe जो वह सब करता है जो
 उसका baseline करता है, साथ में primitive की एक ज्ञात मात्रा। Values उसी store फ़ाइल में `probe:<field>` lines

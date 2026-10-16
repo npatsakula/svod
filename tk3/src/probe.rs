@@ -258,6 +258,7 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
         p.global_byte(),
         p.scatter(),
         p.step(),
+        p.step_lone(),
         p.score(),
         p.trips("probe:trip", true),
         p.trips("probe:trip_rolled", false),
@@ -451,11 +452,38 @@ impl<'a> Probes<'a> {
     /// 16×16×16 matrix-core steps on register operands into four
     /// independent accumulators per warp.
     fn step(&self) -> Probe {
-        let (op, [bm, bn, bk], iters) = ("probe:step", [64, 64, 16], 1024);
-        let units = (self.blocks * iters * bm * bn * bk / 4096) as f64;
         let lowering = self.lowering(WarpGrid { rows: 2, cols: 2 }, false);
-        self.make(op, ScalarDType::BFloat16, units, true, lowering, |on| {
-            let mut k = kernel(op, self.blocks, WARPS);
+        self.steps("probe:step", [64, 64, 16], self.blocks, WARPS, lowering, true)
+    }
+
+    /// The step of a wave alone on its SIMD, a block per SM of a wave per
+    /// SIMD ([`Self::chain`]), each wave over the 32×32 accumulators a wave
+    /// of [`Self::step`] holds: the chain's latency per step, where `step`
+    /// is the core's throughput; their ratio is the waves a SIMD hides it
+    /// with. A unit is one wave's step.
+    fn step_lone(&self) -> Probe {
+        let warps = self.warps;
+        let tile = [32 * warps as usize, 32, 16];
+        self.steps("probe:step_lone", tile, self.sms as usize, warps, self.chain(Costs::default()), false)
+    }
+
+    /// `blocks` of `warps` each accumulating a `bm × bn` product over `bk`
+    /// every iteration, where the baseline holds the zero accumulator; a
+    /// unit is a 16×16×16 step of the SM (`per_sm`) or of one wave.
+    fn steps(
+        &self,
+        op: &'static str,
+        [bm, bn, bk]: [usize; 3],
+        blocks: usize,
+        warps: u32,
+        lowering: Lowering,
+        per_sm: bool,
+    ) -> Probe {
+        let iters = 1024;
+        let steps = iters * bm * bn * bk / 4096;
+        let units = if per_sm { blocks * steps } else { steps / warps as usize } as f64;
+        self.make(op, ScalarDType::BFloat16, units, per_sm, lowering, |on| {
+            let mut k = kernel(op, blocks, warps);
             let a = input::<BF16>(&mut k, Shape::new(bm, bk));
             let b = input::<BF16>(&mut k, Shape::new(bn, bk));
             let zero = k.zeros::<F32>(Shape::new(bm, bn));
@@ -464,7 +492,7 @@ impl<'a> Probes<'a> {
             } else {
                 [zero]
             };
-            output(&mut k, self.blocks, acc);
+            output(&mut k, blocks, acc);
             k.finish()
         })
     }

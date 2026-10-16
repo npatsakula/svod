@@ -47,7 +47,9 @@ with the blocks it holds at once (`resident`, by shared memory and the register 
 of those blocks is at least one wave's own issue (a block of fewer waves than the SM has SIMDs
 leaves the rest idle) and the memory latency one pipeline stage ahead cannot hide:
 `cost = trips × max(per_sm × (work + trip / resident), rounds × max(simds × (work + trip) / waves, latency / (stages − 1)))`
-with `rounds = ⌈per_sm / resident⌉` (`Planner::pipelined`). A fill's byte is priced by where it
+with `rounds = ⌈per_sm / resident⌉` (`Planner::pipelined`); a SIMD holding fewer waves than
+`step_lone / step`, the waves that hide a matrix-core chain's latency, runs their issue `work` that
+many times slower, the fill streaming on meanwhile. A fill's byte is priced by where it
 comes from: the L2 rate where the distinct bytes fit three quarters of the cache, the DRAM rate
 past half again as much, a blend between (`Planner::fill_byte`). Without the wave bound,
 gfx1151's ranking led with one-warp 256×256

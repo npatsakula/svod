@@ -142,7 +142,11 @@ pub(crate) struct Run {
     pub regs: u32,
     pub waves: usize,
     pub trips: usize,
+    /// A trip's issue work: the waves' fragment reads, steps and vector work.
     pub work: f64,
+    /// A trip's fill, priced by where its bytes come from: streamed through
+    /// the ring while the waves issue.
+    pub fill: f64,
     pub trip: f64,
     pub stages: usize,
 }
@@ -200,10 +204,10 @@ impl Problem {
         let steps = bm * bn * halves * bk / 4096;
         let (blocks, trips, stages) = (self.blocks(cfg), self.k / bk, cfg.stages);
         let unique = (self.batches * (self.m + self.n * halves) * self.k * 2) as f64;
-        let fill_byte = planner.fill_byte(unique, (blocks * trips * fill) as f64);
-        let work = fragments as f64 * costs.smem_byte + fill as f64 * fill_byte + steps as f64 * costs.step;
+        let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64);
+        let work = fragments as f64 * costs.smem_byte + steps as f64 * costs.step;
         let trip = costs.trip(!cfg.unroll && !target.cp_async);
-        Some((planner.pipelined(Run { blocks, smem, regs, waves, trips, work, trip, stages }), regs))
+        Some((planner.pipelined(Run { blocks, smem, regs, waves, trips, work, fill, trip, stages }), regs))
     }
 
     /// The lattice's configs that run this problem on the planner's target,
@@ -476,17 +480,25 @@ impl Planner {
     /// estimate, decides whether a block runs). A round of those blocks is at
     /// least one wave's own issue (a block of fewer waves than SIMDs leaves
     /// the rest idle) and the memory latency its ring cannot hide (it
-    /// prefetches `stages - 1` trips ahead).
+    /// prefetches `stages - 1` trips ahead). A SIMD holding fewer waves than
+    /// hide a matrix-core chain's latency (`step_lone / step` of them) runs
+    /// their issue work that many times slower, the blocks the SM holds at
+    /// once sharing its SIMDs, a block alone its own waves; the fill streams
+    /// on meanwhile.
     pub(crate) fn pipelined(&self, run: Run) -> f64 {
-        let Run { blocks, smem, regs, waves, trips, work, trip, stages } = run;
+        let Run { blocks, smem, regs, waves, trips, work, fill, trip, stages } = run;
         let Device { target, costs } = &self.device;
         let (o, sms) = (target.occupancy, self.sms());
         let per_simd = o.waves.min(o.file / regs.max(1)) as usize;
         let resident = (target.smem_bytes / smem).min(o.simds as usize * per_simd / waves).max(1);
         let per_sm = blocks.div_ceil(sms);
         let rounds = per_sm.div_ceil(resident);
-        let issue = per_sm as f64 * (work + trip / resident.min(per_sm) as f64);
-        let wave = o.simds as f64 * (work + trip) / waves as f64;
+        let hide =
+            if costs.step > 0.0 && costs.step_lone > 0.0 { (costs.step_lone / costs.step).max(1.0) } else { 1.0 };
+        let lone = |waves: usize| (hide / (waves as f64 / o.simds as f64).max(1.0)).max(1.0);
+        let at_once = resident.min(per_sm);
+        let issue = per_sm as f64 * (work * lone(at_once * waves) + fill + trip / at_once as f64);
+        let wave = o.simds as f64 * (work * lone(waves) + fill + trip) / waves as f64;
         let wait = costs.latency / stages.saturating_sub(1).max(1) as f64;
         trips as f64 * issue.max(rounds as f64 * wave.max(wait))
     }
@@ -663,11 +675,12 @@ impl Attention {
     }
 
     /// What `cfg` costs here, as [`Problem::admit`]: a key block's trip pays
-    /// both products' fragment reads, fills and steps, the softmax of every
-    /// score and its overhead. A causal query block scores half the keys plus
-    /// its diagonal, a key block per `bkv` of its rows, each [`DIAGONAL`] trips.
-    /// Key warps each take a share of the trips, every trip of theirs the
-    /// block's whole work at once.
+    /// both products' fragment reads, fills (priced by where their bytes
+    /// come from, every tile's keys and values the distinct ones) and steps,
+    /// the softmax of every score and its overhead. A causal query block
+    /// scores half the keys plus its diagonal, a key block per `bkv` of its
+    /// rows, each [`DIAGONAL`] trips. Key warps each take a share of the
+    /// trips, every trip of theirs the block's whole work at once.
     pub(crate) fn admit(&self, planner: &Planner, cfg: &FaCfg) -> Option<(f64, u32)> {
         let Device { target, costs } = &planner.device;
         let (bq, bkv, d, kw) = (cfg.bq, cfg.bkv, self.d, cfg.key_warps);
@@ -680,16 +693,16 @@ impl Attention {
         let fragments = 2 * waves * bkv * d * 2;
         let fill = kw * 2 * bkv * d * 2;
         let steps = kw * 2 * bq * bkv * d / 4096;
-        let work = fragments as f64 * costs.smem_byte
-            + fill as f64 * costs.global_byte
-            + steps as f64 * costs.step
-            + (kw * bq * bkv) as f64 * costs.score;
-        let trip = costs.trip(!cfg.unroll && !target.cp_async);
         let diagonal = DIAGONAL * bq.div_ceil(bkv);
         let trips = if self.causal { self.tk.div_ceil(2 * bkv) + diagonal } else { self.tk.div_ceil(bkv) };
         let trips = trips.div_ceil(kw);
         let (blocks, stages) = (self.blocks(cfg), cfg.stages);
-        Some((planner.pipelined(Run { blocks, smem, regs, waves, trips, work, trip, stages }), regs))
+        let unique = (self.tiles * self.tk * d * 2 * 2) as f64;
+        let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64);
+        let work =
+            fragments as f64 * costs.smem_byte + steps as f64 * costs.step + (kw * bq * bkv) as f64 * costs.score;
+        let trip = costs.trip(!cfg.unroll && !target.cp_async);
+        Some((planner.pipelined(Run { blocks, smem, regs, waves, trips, work, fill, trip, stages }), regs))
     }
 
     /// The lattice's configs that run this problem on the planner's target,
