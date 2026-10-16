@@ -120,6 +120,26 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
     }
 }
 
+/// A cache probe's sweep reaches every tile of every footprint: its block
+/// count is odd, so coprime with the power-of-two regions, on every target's
+/// occupancy (gfx1201's 64 CUs would otherwise make 512 blocks, each
+/// re-reading its own tile).
+#[test_case(sm86(), 28; "sm86")]
+#[test_case(gfx1151(), 20; "gfx1151")]
+#[test_case(amd(AmdArch::Gfx1201, 64), 64; "gfx1201")]
+#[test_case(amd(AmdArch::Gfx942, 304), 304; "gfx942")]
+fn a_cache_probe_sweeps_every_tile(target: Target, sms: u32) {
+    let blocks = crate::probe::cached_blocks(sms, &target);
+    assert_eq!(blocks % 2, 1, "{blocks} blocks");
+    for (footprint, _) in crate::probe::cache_probes(&target).unwrap() {
+        let region = footprint / (32 * 128 * 4);
+        assert!(
+            region.is_power_of_two() && !(blocks as usize).is_multiple_of(region),
+            "{blocks} blocks over {region} tiles"
+        );
+    }
+}
+
 /// Every probe pair lowers and renders for the target, and is keyed by
 /// the field it measures; so do the cache probes, smallest footprint first.
 #[test_case(sm86(); "sm86")]
