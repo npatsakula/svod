@@ -566,9 +566,16 @@ impl ScratchPool {
                 pool.entry(key)
                     .or_insert_with(|| {
                         // Written here: an unrealized buffer is allocated by
-                        // every plan that reads it, one per candidate.
+                        // every plan that reads it, one per candidate. The
+                        // fill is prepared as a candidate is, in passing: it
+                        // moves no kernel-name counter, so a model's kernel
+                        // of its shape, prepared after a tune, keeps the name
+                        // and the object it has in a process that tuned
+                        // nothing.
                         let t = Tensor::zeros(&[p.elems], p.dtype.into()).contiguous();
-                        t.realize().expect("a scratch buffer");
+                        let mut config = PrepareConfig::from_env();
+                        config.ephemeral = true;
+                        t.realize_with(&config).expect("a scratch buffer");
                         t
                     })
                     .clone()

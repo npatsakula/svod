@@ -160,7 +160,12 @@ fn gemm_throughput_probe() {
         })
         .to_vec()
     } else {
-        admitted
+        // The pick may be a pipeline twin of an admitted tile.
+        let mut cfgs = admitted;
+        if !cfgs.contains(&pick) {
+            cfgs.push(pick);
+        }
+        cfgs
     };
     for cfg in cfgs {
         let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll } = cfg;
