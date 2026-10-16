@@ -303,6 +303,11 @@ pub(crate) fn spread<C: Tiled, K: Eq + Hash>(ranked: Vec<(f64, C)>, class: impl 
 /// about 20 ms once the device's clock is up and the ranking cannot be
 /// trusted to put the best within a few (see the module docs).
 pub(crate) const SHORTLIST: usize = 64;
+/// Search bound: the leading tiles of a timing whose other pipelines are
+/// timed after it: a tile enters the shortlist as its first clean pipeline,
+/// and on gfx1201 the 4096³ GEMM's measured best entered as a pipeline 8 %
+/// behind its best and lost the shortlist to another tile.
+pub(crate) const TWIN_TILES: usize = 3;
 /// Model: blocks per SM a convolution's grid should reach before its
 /// reduction is left whole: its grids are a few hundred blocks.
 const CONV_BLOCKS_PER_SM: usize = 2;
