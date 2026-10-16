@@ -129,7 +129,8 @@ every trip; a gathered row and a swizzled shared row take the full coordinate. A
 (a product, exactly) puts its multiplies under a branch on whether any factor the thread holds
 differs from 1, which a wave whose factors are all ones jumps over. A `Warps` statement runs its body
 on every warp alone: `Special::Warp` is the warp's index, its copies move whole tiles with its own
-lanes, its barriers (from the barrier pass and the pipeline templates) gather only itself, `bar.warp.sync`
+lanes (a copy carries the scope it was recorded in, and the halves register staging splits it into keep
+it), its barriers (from the barrier pass and the pipeline templates) gather only itself, `bar.warp.sync`
 on CUDA and nothing on AMD, whose wave issues its LDS accesses in order, and what the warps left in
 shared memory is fenced for the block at the statement's end. Tile layouts span the lowering's warp
 grid, which the warps of such a statement are not part of. A cast toward zero to bf16

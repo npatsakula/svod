@@ -127,7 +127,8 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block,
     let mut out = Vec::with_capacity(block.0.len());
     for stmt in block.0 {
         let stmt = match stmt {
-            Stmt::Copy { dst, src, mode } => {
+            Stmt::Copy { dst, src, mode, scope: own } => {
+                assert_eq!(own, scope, "a copy's scope is its enclosing statement's");
                 let (wr, rd) = (alloc(prog, dst), alloc(prog, src));
                 state.meet(state.need(rd, false).max(state.need(wr, true)), scope, &mut out);
                 if let Some(a) = wr {
@@ -137,7 +138,7 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block,
                     };
                 }
                 state.read.extend(rd);
-                Stmt::Copy { dst, src, mode }
+                Stmt::Copy { dst, src, mode, scope: own }
             }
             Stmt::Sync(sync) => {
                 match sync {

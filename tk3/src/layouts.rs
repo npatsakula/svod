@@ -500,9 +500,6 @@ struct Infer<'a> {
     conflicts: HashMap<(usize, ValId), TileLayout>,
     /// Position of the statement being visited, for conflict keys.
     pos: usize,
-    /// Whose lanes a staged copy's chunks are spread over: the block's, or
-    /// one warp's inside a [`Stmt::Warps`].
-    scope: Scope,
 }
 
 /// A program whose register values all have a layout and whose products are
@@ -662,7 +659,7 @@ impl<'a> Infer<'a> {
         for (v, l) in &prog.pins {
             lay[v.index()] = Some(l.clone());
         }
-        Infer { prog, target, grid, lay, changed: true, conflicts: HashMap::new(), pos: 0, scope: Scope::Block }
+        Infer { prog, target, grid, lay, changed: true, conflicts: HashMap::new(), pos: 0 }
     }
 
     /// Run the propagation to its fixed point, seeding what nothing constrains.
@@ -767,19 +764,15 @@ impl<'a> Infer<'a> {
                     self.pass(&p.produce.body)?;
                     self.pass(&p.consume.body)?;
                 }
-                Stmt::Warps { body } => {
-                    let outer = std::mem::replace(&mut self.scope, Scope::Warp);
-                    self.pass(body)?;
-                    self.scope = outer;
-                }
+                Stmt::Warps { body } => self.pass(body)?,
                 Stmt::If { then, otherwise, .. } => {
                     self.pass(then)?;
                     self.pass(otherwise)?;
                 }
-                Stmt::Copy { dst, src, mode: CopyMode::Staged } if self.lay[dst.index()].is_none() => {
+                Stmt::Copy { dst, src, mode: CopyMode::Staged, scope } if self.lay[dst.index()].is_none() => {
                     let (d, s) = (self.prog.value(*dst), self.prog.value(*src));
                     if d.place == Place::Reg && s.tier() == Tier::Global {
-                        let warps = if self.scope == Scope::Warp { 1 } else { self.prog.warps };
+                        let warps = if *scope == Scope::Warp { 1 } else { self.prog.warps };
                         if let Some(l) = chunked(d.shape, d.dtype.bytes(), warps, self.target.wave, Axis::Col) {
                             self.set(*dst, l);
                         }

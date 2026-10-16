@@ -189,12 +189,12 @@ impl Expander<'_> {
         let (mut issue, mut commit) = (vec![], vec![]);
         for stmt in produce.body.0 {
             match stmt {
-                Stmt::Copy { dst, src, .. } if self.prog.value(src).tier() == Tier::Global => {
+                Stmt::Copy { dst, src, scope, .. } if self.prog.value(src).tier() == Tier::Global => {
                     let Value { dtype, shape, .. } = self.prog.value(src).clone();
                     self.prog.values.push(Value { dtype, shape, place: Place::Reg });
                     let tmp = ValId(self.prog.values.len() as u32 - 1);
-                    issue.push(Stmt::Copy { dst: tmp, src, mode: CopyMode::Staged });
-                    commit.push(Stmt::Copy { dst, src: tmp, mode: CopyMode::Staged });
+                    issue.push(Stmt::Copy { dst: tmp, src, mode: CopyMode::Staged, scope });
+                    commit.push(Stmt::Copy { dst, src: tmp, mode: CopyMode::Staged, scope });
                 }
                 other => issue.push(other),
             }

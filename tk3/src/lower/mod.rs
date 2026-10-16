@@ -89,7 +89,7 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
     let mut wants: Vec<Option<Axis>> = vec![None; prog.smem.len()];
     let mut staged = vec![true; prog.smem.len()];
     for (_, stmt) in prog.walk() {
-        let Stmt::Copy { dst, src, mode } = stmt else { continue };
+        let Stmt::Copy { dst, src, mode, .. } = stmt else { continue };
         if let (Some(a), Tier::Global) = (alloc(prog, *dst), prog.value(*src).tier()) {
             staged[a] &= *mode == CopyMode::Staged;
         }
@@ -114,17 +114,16 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
     }
     // The staged registers of a column-major tile hold column runs where the
     // target loads them transposed, else are walked down its rows so a
-    // wave's lanes store consecutive elements.
-    // A copy inside a `Warps` statement is one warp's own, its chunks spread
-    // over that warp's lanes alone.
-    for (stmt, scope) in scoped(&prog.body, Scope::Block) {
-        let Stmt::Copy { dst, src, mode: CopyMode::Staged } = stmt else { continue };
+    // wave's lanes store consecutive elements; a warp's own copy spreads
+    // its chunks over that warp's lanes alone.
+    for (_, stmt) in prog.walk() {
+        let Stmt::Copy { dst, src, mode: CopyMode::Staged, scope } = stmt else { continue };
         if !(alloc(prog, *dst).is_some_and(|a| transposed.contains(&a)) && prog.value(*src).tier() == Tier::Reg) {
             continue;
         }
         let tmp = prog.value(*src);
         let bytes = tmp.dtype.bytes();
-        let warps = if scope == Scope::Warp { 1 } else { prog.warps };
+        let warps = if *scope == Scope::Warp { 1 } else { prog.warps };
         let l = layouts::transposing(tmp.shape, warps, lanes)
             .filter(|_| target.tr_load && bytes == 2)
             .or_else(|| layouts::chunked(tmp.shape, bytes, warps, lanes, Axis::Row));
@@ -134,37 +133,15 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
     }
 }
 
-/// Every statement of `block`, recursively, with the scope it runs in.
-fn scoped(block: &Block, scope: Scope) -> Vec<(&Stmt, Scope)> {
-    let mut out = vec![];
-    for stmt in &block.0 {
-        out.push((stmt, scope));
-        match stmt {
-            Stmt::Loop(l) => out.extend(scoped(&l.body, scope)),
-            Stmt::Pipeline(p) => {
-                out.extend(scoped(&p.produce.body, scope));
-                out.extend(scoped(&p.consume.body, scope));
-            }
-            Stmt::Warps { body } => out.extend(scoped(body, Scope::Warp)),
-            Stmt::If { then, otherwise, .. } => {
-                out.extend(scoped(then, scope));
-                out.extend(scoped(otherwise, scope));
-            }
-            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
-        }
-    }
-    out
-}
-
 /// An `Mma` reads registers: a shared or global operand becomes an explicit
 /// load into a fresh register tile just before it, so the inference gives
 /// that tile the operand layout and the emitter sees one copy op.
 fn materialize_operands(prog: &mut Program) {
     let body = std::mem::take(&mut prog.body);
-    prog.body = materialize_block(prog, body);
+    prog.body = materialize_block(prog, body, Scope::Block);
 }
 
-fn materialize_block(prog: &mut Program, block: Block) -> Block {
+fn materialize_block(prog: &mut Program, block: Block, scope: Scope) -> Block {
     let mut out = Vec::with_capacity(block.0.len());
     for mut stmt in block.0 {
         match &mut stmt {
@@ -174,20 +151,20 @@ fn materialize_block(prog: &mut Program, block: Block) -> Block {
                         let Value { dtype, shape, .. } = prog.value(*operand).clone();
                         prog.values.push(Value { dtype, shape, place: Place::Reg });
                         let tmp = ValId(prog.values.len() as u32 - 1);
-                        out.push(Stmt::Copy { dst: tmp, src: *operand, mode: CopyMode::Sync });
+                        out.push(Stmt::Copy { dst: tmp, src: *operand, mode: CopyMode::Sync, scope });
                         *operand = tmp;
                     }
                 }
             }
-            Stmt::Loop(l) => l.body = materialize_block(prog, std::mem::take(&mut l.body)),
+            Stmt::Loop(l) => l.body = materialize_block(prog, std::mem::take(&mut l.body), scope),
             Stmt::Pipeline(p) => {
-                p.produce.body = materialize_block(prog, std::mem::take(&mut p.produce.body));
-                p.consume.body = materialize_block(prog, std::mem::take(&mut p.consume.body));
+                p.produce.body = materialize_block(prog, std::mem::take(&mut p.produce.body), scope);
+                p.consume.body = materialize_block(prog, std::mem::take(&mut p.consume.body), scope);
             }
-            Stmt::Warps { body } => *body = materialize_block(prog, std::mem::take(body)),
+            Stmt::Warps { body } => *body = materialize_block(prog, std::mem::take(body), Scope::Warp),
             Stmt::If { then, otherwise, .. } => {
-                *then = materialize_block(prog, std::mem::take(then));
-                *otherwise = materialize_block(prog, std::mem::take(otherwise));
+                *then = materialize_block(prog, std::mem::take(then), scope);
+                *otherwise = materialize_block(prog, std::mem::take(otherwise), scope);
             }
             Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
         }

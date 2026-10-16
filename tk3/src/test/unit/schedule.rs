@@ -43,6 +43,61 @@ fn expansion_preserves_the_result(prefetch: Prefetch, stages: usize) {
     }
 }
 
+/// A copy carries the scope it was recorded in, and the halves register
+/// staging splits it into keep it: inside a `Warps` statement every copy is
+/// one warp's own, outside it the block's.
+#[test]
+fn staged_halves_keep_their_copys_scope() {
+    use crate::build::BF16;
+    use crate::kernels::Batch;
+    use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
+    let cfg = FaCfg { key_warps: 4, ..FaCfg::new(16, 16, 2) };
+    let mask = AttnMask::default();
+    let spec = AttnSpec {
+        batch: Batch::Static(1),
+        t: 1,
+        tk: 64,
+        heads: 1,
+        kv_heads: 1,
+        d: 64,
+        mask,
+        cache: None,
+        scale: 0.125,
+        cfg,
+    };
+    let mut prog = attention::<BF16>(&spec);
+    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: false });
+    fn copies(block: &Block, inside: bool, out: &mut Vec<(bool, Scope, CopyMode)>) {
+        for s in &block.0 {
+            match s {
+                Stmt::Copy { mode, scope, .. } => out.push((inside, *scope, *mode)),
+                Stmt::Loop(l) => copies(&l.body, inside, out),
+                Stmt::Warps { body } => copies(body, true, out),
+                Stmt::If { then, otherwise, .. } => {
+                    copies(then, inside, out);
+                    copies(otherwise, inside, out);
+                }
+                Stmt::Pipeline(p) => {
+                    copies(&p.produce.body, inside, out);
+                    copies(&p.consume.body, inside, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut seen = vec![];
+    copies(&prog.body, false, &mut seen);
+    assert!(
+        seen.iter().any(|(inside, _, mode)| *inside && *mode == CopyMode::Staged),
+        "staged halves inside the warps"
+    );
+    assert!(seen.iter().any(|(inside, ..)| !inside), "copies outside the warps");
+    for (inside, scope, mode) in seen {
+        let want = if inside { Scope::Warp } else { Scope::Block };
+        assert_eq!(scope, want, "a {mode:?} copy {}", if inside { "inside the warps" } else { "of the block" });
+    }
+}
+
 /// Register staging splits every global→shared copy into a load before the
 /// consumer and a store after it, and peels the ring into three loops over
 /// one induction variable: the first trip loads and commits step 0, a
@@ -56,7 +111,8 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops() {
         prog.body.0.iter().filter_map(|s| if let Stmt::Loop(l) = s { Some(l) } else { None }).collect();
     let [head, steady, drain] = loops[..] else { panic!("three loops, got {}", loops.len()) };
     let kind = |s: &Stmt| match s {
-        Stmt::Copy { dst, src, mode: CopyMode::Staged } => match (prog.value(*src).tier(), prog.value(*dst).tier()) {
+        Stmt::Copy { dst, src, mode: CopyMode::Staged, .. } => match (prog.value(*src).tier(), prog.value(*dst).tier())
+        {
             (Tier::Global, Tier::Reg) => "issue",
             (Tier::Reg, Tier::Smem) => "commit",
             tiers => panic!("{tiers:?}"),
