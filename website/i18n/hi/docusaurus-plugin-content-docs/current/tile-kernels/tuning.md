@@ -41,7 +41,9 @@ device पर एक बार (gfx1151 पर लगभग 4 s), क्यो�
 
 Op वहीं मापता है जहाँ उसे बुलाया जाता है, ग्राफ़ बनते समय, कभी किसी चलते हुए plan के अंदर नहीं। हर
 candidate एक program के रूप में बनता है, capacity पर scratch buffers पर launch होता है, हर runtime
-variable उसकी अधिकतम value से bound होता है, और समय मापा जाता है:
+variable उसकी अधिकतम value से bound होता है (float operand में `[-1, 1)` से लिए गए मान होते हैं और
+integer operand में शून्य: शून्य कोई bit नहीं बदलते, और जो card असली data पर clock घटाता है, जैसे RX 9070 XT
+4096³ GEMM पर 15 %, वह वैसे ही मापा जाता है जैसे वह चलेगा), और समय मापा जाता है:
 
 | क़दम | सेटिंग |
 |---|---|
@@ -73,7 +75,7 @@ Sustain device time में इसलिए नापा जाता है �
 | क्या | मान |
 |---|---|
 | Directory | `$SVOD_TK3_TUNE_DIR`, वरना `$XDG_CACHE_HOME/svod/tk3_tune`, वरना `~/.cache/svod/tk3_tune` |
-| फ़ाइल | हर device और crate version के लिए एक, जैसे `sm_86_28sm-v0.2.0.txt`, पहली line में उसका line format (`format 1`, `tune::FORMAT`); दूसरे format की फ़ाइल पूरी छोड़ दी जाती है |
+| फ़ाइल | हर device और crate version के लिए एक, जैसे `sm_86_28sm-v0.2.0.txt`, पहली line में उसका line format (`format 2`, `tune::FORMAT`); दूसरे format की फ़ाइल पूरी छोड़ दी जाती है |
 | Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: `choice` में विजेता का `index ns`, `value` में एक मापा हुआ अंक, `admitted` में admission के रखे हुए ranked indices, `first` में पहले clean config का index |
 | Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, जहाँ `device` arch और SM count है (`sm_86-28sm`) और `compiler` device के compiler का digest है (`tune::compiler`) |
 

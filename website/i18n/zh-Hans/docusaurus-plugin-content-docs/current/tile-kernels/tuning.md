@@ -12,7 +12,7 @@ sidebar_label: 调优
 
 ## 何时进行测量 {#when-measurement-happens}
 
-算子在被调用的地方、即构建计算图时进行测量，从不在运行中的计划内部测量。每个候选被构建为程序，在按容量分配的临时缓冲区上启动（所有运行时变量都绑定到最大值），并计时：
+算子在被调用的地方、即构建计算图时进行测量，从不在运行中的计划内部测量。每个候选被构建为程序，在按容量分配的临时缓冲区上启动（所有运行时变量都绑定到最大值；浮点操作数填充从 `[-1, 1)` 中抽取的值，整数操作数填充零：零不翻转任何位，而在真实数据下降频的显卡，如 RX 9070 XT 在 4096³ GEMM 上慢 15 %，按其实际运行状态计时），并计时：
 
 | 步骤 | 设置 |
 |---|---|
@@ -35,7 +35,7 @@ sidebar_label: 调优
 | 项目 | 值 |
 |---|---|
 | 目录 | `$SVOD_TK3_TUNE_DIR`，否则 `$XDG_CACHE_HOME/svod/tk3_tune`，否则 `~/.cache/svod/tk3_tune` |
-| 文件 | 每个设备和 crate 版本一个，例如 `sm_86_28sm-v0.2.0.txt`，以行格式作为首行（`format 1`，`tune::FORMAT`）；其他格式的文件整个丢弃 |
+| 文件 | 每个设备和 crate 版本一个，例如 `sm_86_28sm-v0.2.0.txt`，以行格式作为首行（`format 2`，`tune::FORMAT`）；其他格式的文件整个丢弃 |
 | 行 | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`：`choice` 存放胜者的 `index ns`，`value` 存放一个测得的数，`admitted` 存放准入保留的排序索引，`first` 存放第一个干净配置的索引 |
 | 键 | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`，其中 `device` 是架构和 SM 数量（`sm_86-28sm`），`compiler` 是设备编译器的摘要（`tune::compiler`） |
 

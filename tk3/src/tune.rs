@@ -22,7 +22,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use svod_dtype::default_device::{default_device, with_default_device};
-use svod_dtype::{DeviceSpec, ScalarDType};
+use svod_dtype::{DType, DeviceSpec, ScalarDType};
 use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
 use svod_runtime::{ExecutionPlan, KernelResources};
 use svod_tensor::{PrepareConfig, Tensor};
@@ -34,7 +34,7 @@ use crate::lower::Lowering;
 
 /// The store's line format, bumped when a line's meaning changes (a file
 /// without a format line is of the first).
-pub(crate) const FORMAT: u32 = 1;
+pub(crate) const FORMAT: u32 = 2;
 /// Search bound: timed rounds over every candidate after the warm-up, and
 /// the rounds the two leaders then run again.
 const ROUNDS: usize = 4;
@@ -572,7 +572,7 @@ impl ScratchPool {
                         // of its shape, prepared after a tune, keeps the name
                         // and the object it has in a process that tuned
                         // nothing.
-                        let t = Tensor::zeros(&[p.elems], p.dtype.into()).contiguous();
+                        let t = scratch(p);
                         let mut config = PrepareConfig::from_env();
                         config.ephemeral = true;
                         t.realize_with(&config).expect("a scratch buffer");
@@ -581,6 +581,21 @@ impl ScratchPool {
                     .clone()
             })
             .collect()
+    }
+}
+
+/// A scratch buffer's unrealized fill: a float parameter holds values in
+/// `[-1, 1)`, drawn on the device, so a card that clocks down under real
+/// data (the RX 9070 XT runs the 4096³ GEMM 15 % slower on random operands
+/// than on zeros, which toggle no bit) is timed as it will run; an integer
+/// parameter holds zeros, since a probe reads it as the slot to read next.
+fn scratch(p: &Param) -> Tensor {
+    if p.dtype.is_float() {
+        let unit = Tensor::rand_with(&[p.elems], DType::Float32, default_device()).expect("a scratch fill");
+        let spread = unit.try_mul(2.0f32).and_then(|t| t.try_sub(1.0f32)).expect("a scratch fill");
+        spread.cast(p.dtype.into()).contiguous()
+    } else {
+        Tensor::zeros(&[p.elems], p.dtype.into()).contiguous()
     }
 }
 

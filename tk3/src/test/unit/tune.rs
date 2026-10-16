@@ -547,3 +547,22 @@ fn a_scratch_fill_moves_no_kernel_name_counter() {
     assert_eq!(pool.buffers(&[param]).len(), 1);
     assert_eq!(names(&ones().prepare().expect("a plan")), expected, "the fill moved the counter");
 }
+
+/// A float scratch buffer holds values spread over `[-1, 1)`, an integer one
+/// zeros: the first toggles bits as real data does, the second is read as
+/// the slot a probe reads next.
+#[test]
+fn a_float_scratch_buffer_is_random_and_an_integer_one_is_zero() {
+    use crate::ir::{Param, ParamKind};
+    let pool = ScratchPool::default();
+    let param = |dtype| Param { name: "x".into(), dtype, kind: ParamKind::In, elems: 4096 };
+    let [floats, ints] =
+        pool.buffers(&[param(ScalarDType::Float32), param(ScalarDType::Int32)]).try_into().expect("two");
+    let floats: Vec<f32> = floats.to_vec().expect("values");
+    let ints: Vec<i32> = ints.to_vec().expect("values");
+    assert!(floats.iter().all(|x| (-1.0..1.0).contains(x)), "values in [-1, 1)");
+    let (negative, positive) =
+        (floats.iter().filter(|&&x| x < -0.5).count(), floats.iter().filter(|&&x| x > 0.5).count());
+    assert!(negative > 512 && positive > 512, "spread over the range: {negative} below -0.5, {positive} above 0.5");
+    assert!(ints.iter().all(|&x| x == 0), "an integer parameter is zero");
+}
