@@ -21,7 +21,7 @@ no op falls to the graph because of spills. The admitted configs, with their var
 for attention, reduction splits for a starved convolution), are the candidates the tune store
 measures the first time a device meets a shape, and it keeps the winner; the winner's tile's
 other pipelines are then compiled and timed against it, spilling or not (among a tile's pipelines
-the time alone judges, and an unrolled ring that spills a little is often the fastest), and the
+the time alone judges, and an unrolled ring that spills a little may be the fastest), and the
 fastest is the choice. Attention
 tunes its softmax forms and its tiles in turn: the forms on the ranking's first clean config, the
 tiles under those forms, then the forms again on the winner (see the
