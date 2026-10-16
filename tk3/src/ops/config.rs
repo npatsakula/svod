@@ -1,15 +1,19 @@
-//! Tile config candidates per target and shape, most promising first: the
-//! first is what runs untuned, the tune store measures a shortlist. GEMM-shaped
-//! kernels draw theirs from a lattice over the construct's knobs, kept to
-//! what the lowering runs and ranked in nanoseconds of SM time from the
-//! device's measured [`Costs`]: a round of resident blocks is bound by the
-//! SM's issue work, by one wave's own issue or by the memory latency one
-//! pipeline stage ahead cannot hide ([`Planner::pipelined`]). Registers admit
-//! nothing here: the layout count over-counts, so the tuner's shortlist is
-//! the first ranked configs whose compiled kernels do not spill
-//! ([`shortlist`]); without a device the first candidates are untested
-//! guesses. A [`Planner`] holds the rankings of one device. The other
-//! kernels' lists are small functions of the target.
+//! Tile config candidates per target and shape, most promising first. The
+//! device picks: the tune store times the first [`SHORTLIST`] tiles that
+//! compile clean, most of the lattice, and the ranking orders what is
+//! compiled and timed first and stands in for a measurement where there is
+//! no device (the first config runs untuned). GEMM-shaped kernels draw
+//! theirs from a lattice over the construct's knobs, kept to what the
+//! lowering runs and ranked in nanoseconds of SM time from the device's
+//! measured [`Costs`]: a round of resident blocks is bound by the SM's issue
+//! work, by one wave's own issue or by the memory latency one pipeline stage
+//! ahead cannot hide ([`Planner::pipelined`]). The model orders block tiles
+//! well enough to lead with them ([`spread`]) and warp grids poorly (on
+//! sm_86 the measured best sat as deep as the 92nd of 109 tiles), which is
+//! why the shortlist runs that deep. Registers admit nothing here: the
+//! layout count over-counts, so the compiled kernel judges ([`shortlist`]).
+//! A [`Planner`] holds the rankings of one device. The other kernels' lists
+//! are small functions of the target.
 
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -261,8 +265,11 @@ pub(crate) fn spread<C: Tiled, K: Eq + Hash>(ranked: Vec<(f64, C)>, class: impl 
     out
 }
 
-/// The configs the tune store measures per shape.
-pub(crate) const SHORTLIST: usize = 8;
+/// The tiles the tune store measures per shape, compiled in parallel
+/// batches of as many: most of the lattice, since timing a tile costs
+/// about 20 ms once the device's clock is up and the ranking cannot be
+/// trusted to put the best within a few (see the module docs).
+pub(crate) const SHORTLIST: usize = 64;
 /// Blocks per SM a convolution's grid should reach before its reduction is
 /// left whole: its grids are a few hundred blocks.
 const CONV_BLOCKS_PER_SM: usize = 2;
@@ -270,20 +277,37 @@ const CONV_BLOCKS_PER_SM: usize = 2;
 /// A config's tile: all of it but its pipeline (ring depth, unrolling),
 /// which the ranking orders by a cost model alone and the compiler may
 /// refuse, so the shortlist holds one config per tile, its first clean
-/// pipeline ([`shortlist`]).
+/// pipeline ([`shortlist`]); the tile that wins has its other pipelines,
+/// its [`twins`](Self::twins), timed after.
 pub(crate) trait Tiled: Copy + Eq + Hash {
     fn tile(&self) -> Self;
+
+    /// The configs of `ranked` sharing this tile, each under this config's
+    /// variant (a split count the tuner added): every pipeline of the tile.
+    fn twins(&self, ranked: &[Self]) -> Vec<Self>;
 }
 
 impl Tiled for GemmCfg {
     fn tile(&self) -> Self {
         GemmCfg { tile: [self.tile[0], self.tile[1], 0], stages: 0, unroll: false, ..*self }
     }
+
+    fn twins(&self, ranked: &[Self]) -> Vec<Self> {
+        ranked.iter().filter(|c| c.tile() == self.tile()).copied().collect()
+    }
 }
 
 impl Tiled for ConvCfg {
     fn tile(&self) -> Self {
         ConvCfg { gemm: self.gemm.tile(), ..*self }
+    }
+
+    fn twins(&self, ranked: &[Self]) -> Vec<Self> {
+        self.gemm
+            .twins(&ranked.iter().map(|c| c.gemm).collect::<Vec<_>>())
+            .into_iter()
+            .map(|gemm| ConvCfg { gemm, ..*self })
+            .collect()
     }
 }
 
@@ -295,11 +319,24 @@ impl Tiled for FaCfg {
     fn tile(&self) -> Self {
         FaCfg { stages: 0, unroll: false, ..*self }
     }
+
+    fn twins(&self, ranked: &[Self]) -> Vec<Self> {
+        let block = |c: &FaCfg| (c.bq, c.bkv, c.key_warps);
+        ranked
+            .iter()
+            .filter(|c| block(c) == block(self))
+            .map(|c| FaCfg { stages: c.stages, unroll: c.unroll, ..*self })
+            .collect()
+    }
 }
 
 impl Tiled for NormCfg {
     fn tile(&self) -> Self {
         *self
+    }
+
+    fn twins(&self, _: &[Self]) -> Vec<Self> {
+        vec![*self]
     }
 }
 
@@ -307,6 +344,12 @@ impl Tiled for NormCfg {
 pub(crate) fn distinct<C: Tiled>(ranked: &[C]) -> impl Iterator<Item = C> + '_ {
     let mut seen = HashSet::new();
     ranked.iter().copied().filter(move |c| seen.insert(c.tile()))
+}
+
+/// `list` with each config once, in order.
+pub(crate) fn distinct_configs<C: Tiled>(list: &[C]) -> Vec<C> {
+    let mut seen = HashSet::new();
+    list.iter().copied().filter(|c| seen.insert(*c)).collect()
 }
 
 /// The indices of the first [`SHORTLIST`] configs of `ranked` whose
@@ -317,18 +360,36 @@ pub(crate) fn distinct<C: Tiled>(ranked: &[C]) -> impl Iterator<Item = C> + '_ {
 /// `compile` is asked about batches of [`SHORTLIST`] in that order (the
 /// tuner compiles a batch in parallel) until enough tiles are clean or the
 /// list ends. `None` when nothing compiled: no device to judge on.
-pub(crate) fn shortlist<C: Tiled>(ranked: &[C], mut compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<Vec<usize>> {
-    let (mut clean, mut spilled, mut tiles) = (vec![], vec![], HashSet::new());
+pub(crate) fn shortlist<C: Tiled>(ranked: &[C], compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<Vec<usize>> {
+    let mut tiles = HashSet::new();
+    judged(ranked, SHORTLIST, compile, |c| tiles.insert(c.tile()))
+}
+
+/// The indices of every config of `list` whose compiled kernel does not
+/// spill, judged as [`shortlist`] judges (every one spilling: all of them;
+/// nothing compiling: `None`) but with none set aside for sharing a tile:
+/// a tile's [twins](Tiled::twins) are judged so.
+pub(crate) fn clean<C: Tiled>(list: &[C], compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<Vec<usize>> {
+    judged(list, list.len(), compile, |_| true)
+}
+
+fn judged<C: Tiled>(
+    ranked: &[C],
+    limit: usize,
+    mut compile: impl FnMut(&[C]) -> Vec<Compiled>,
+    mut keep: impl FnMut(&C) -> bool,
+) -> Option<Vec<usize>> {
+    let (mut clean, mut spilled) = (vec![], vec![]);
     for (n, batch) in ranked.chunks(SHORTLIST).enumerate() {
         for (i, compiled) in compile(batch).into_iter().enumerate() {
             let at = n * SHORTLIST + i;
             match compiled {
-                Compiled::Clean if tiles.insert(batch[i].tile()) => clean.push(at),
+                Compiled::Clean if keep(&batch[i]) => clean.push(at),
                 Compiled::Clean | Compiled::Failed => {}
                 Compiled::Spilled => spilled.push(at),
             }
         }
-        if clean.len() >= SHORTLIST {
+        if clean.len() >= limit {
             break;
         }
     }
@@ -339,7 +400,7 @@ pub(crate) fn shortlist<C: Tiled>(ranked: &[C], mut compile: impl FnMut(&[C]) ->
     } else {
         return None;
     };
-    out.truncate(SHORTLIST);
+    out.truncate(limit);
     Some(out)
 }
 

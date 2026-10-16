@@ -8,15 +8,17 @@ use svod_ir::SInt;
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
+use super::conv::geom;
 use super::{costs, first_eight, planner};
 use crate::atoms::{Costs, Device, Target, sm86};
 use crate::build::BF16 as BF16T;
 use crate::kernels::Batch;
 use crate::kernels::attention::{FaCfg, Forms};
+use crate::kernels::conv::ConvCfg;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::NormCfg;
 use crate::ops::attention::{descend, split_ranked};
-use crate::ops::config::{self, Planner, Run, gemm_cfg};
+use crate::ops::config::{self, Planner, Run, SHORTLIST, Tiled, gemm_cfg};
 use crate::ops::shape::{self, Extent, Fallback, Plan, extent};
 use crate::ops::{self as tk, Act, Attn, Cache, Error, KeyMask, Linear, Qkv};
 
@@ -339,38 +341,55 @@ impl config::Tiled for Pipe {
     fn tile(&self) -> Self {
         Pipe { at: 0, ..*self }
     }
+
+    fn twins(&self, ranked: &[Self]) -> Vec<Self> {
+        ranked.iter().filter(|p| p.tile == self.tile).copied().collect()
+    }
 }
 
-/// The tuner's shortlist is the first eight ranked configs whose compiled
-/// kernels do not spill, one per tile (its first clean pipeline), in ranked
-/// order, compiled in batches of eight until eight tiles pass: a batch past
-/// that is never compiled. Where every config that compiles spills, the
-/// first eight of those are timed anyway; where nothing compiles there is
-/// nothing to judge. `twins` are `(config, the config whose tile it shares)`.
-#[test_case(&[], &[], &[], 20, Some(&[0, 1, 2, 3, 4, 5, 6, 7]), 1; "nothing spills: the first batch")]
-#[test_case(&[1, 4, 9], &[], &[], 20, Some(&[0, 2, 3, 5, 6, 7, 8, 10]), 2; "spills skipped, order kept")]
-#[test_case(&[0, 1, 2], &[], &[], 5, Some(&[3, 4]), 1; "a short ranking keeps what passes")]
-#[test_case(&[0, 2, 3], &[1], &[], 5, Some(&[4]), 1; "a failure is never timed")]
-#[test_case(&[0, 1], &[], &[], 2, Some(&[0, 1]), 1; "every config spills: they are timed anyway")]
-#[test_case(&[0], &[], &[], 1, Some(&[0]), 1; "a single spilling config is timed alike")]
-#[test_case(&[], &[], &[], 1, Some(&[0]), 1; "a single clean config")]
-#[test_case(&(0..20).collect::<Vec<_>>(), &[], &[], 20, Some(&[0, 1, 2, 3, 4, 5, 6, 7]), 3; "all twenty spill")]
-#[test_case(&[0, 1], &[2], &[], 3, Some(&[0, 1]), 1; "spilled and failed: the spilled")]
-#[test_case(&[], &[0, 1, 2], &[], 3, None, 1; "nothing compiles")]
-#[test_case(&[], &[], &[], 0, None, 0; "nothing ranked")]
-#[test_case(&[0], &[], &[(1, 0)], 3, Some(&[1, 2]), 1; "a spilling unrolled ring yields to its clean rolled twin")]
-#[test_case(&[], &[], &[(1, 0)], 3, Some(&[0, 2]), 1; "two clean pipelines of one tile: the first")]
-#[test_case(&[], &[], &[(1, 0), (3, 2)], 16, Some(&[0, 2, 4, 5, 6, 7, 8, 9]), 2; "eight tiles, not eight configs")]
-#[test_case(&[0, 1], &[], &[(1, 0)], 2, Some(&[0, 1]), 1; "both pipelines spill: both are timed")]
-fn the_shortlist_is_the_first_eight_tiles_that_do_not_spill(
+/// The tuner's shortlist is the first [`SHORTLIST`] ranked configs whose
+/// compiled kernels do not spill, one per tile (its first clean pipeline),
+/// in ranked order, compiled in batches of as many until that many tiles
+/// pass: a batch past that is never compiled. Where every config that
+/// compiles spills, the first [`SHORTLIST`] of those are timed anyway;
+/// where nothing compiles there is nothing to judge. `twins` are `(config,
+/// the config whose tile it shares)`; `ranked` is in shortlists.
+#[test_case(&[], &[], &[], 1.5, Some(&(0..SHORTLIST).collect::<Vec<_>>()), 1; "nothing spills: the first batch")]
+#[test_case(&[1, 4, 9], &[], &[], 1.5, Some(&(0..SHORTLIST + 3).filter(|i| ![1, 4, 9].contains(i)).collect::<Vec<_>>()), 2; "spills skipped, order kept")]
+#[test_case(&[0, 1, 2], &[], &[], 0.0, Some(&[3, 4]), 1; "a short ranking keeps what passes")]
+#[test_case(&[0, 2, 3], &[1], &[], 0.0, Some(&[4]), 1; "a failure is never timed")]
+#[test_case(&[0, 1], &[], &[], 0.0, Some(&[0, 1]), 1; "every config spills: they are timed anyway")]
+#[test_case(&[0], &[], &[], 0.0, Some(&[0]), 1; "a single spilling config is timed alike")]
+#[test_case(&[], &[], &[], 0.0, Some(&[0]), 1; "a single clean config")]
+#[test_case(&(0..2 * SHORTLIST).collect::<Vec<_>>(), &[], &[], 2.0, Some(&(0..SHORTLIST).collect::<Vec<_>>()), 2; "every config spills")]
+#[test_case(&[0, 1], &[2], &[], 0.0, Some(&[0, 1]), 1; "spilled and failed: the spilled")]
+#[test_case(&[], &[0, 1, 2], &[], 0.0, None, 1; "nothing compiles")]
+#[test_case(&[], &[], &[], 0.0, None, 0; "nothing ranked")]
+#[test_case(&[0], &[], &[(1, 0)], 0.0, Some(&[1, 2]), 1; "a spilling unrolled ring yields to its clean rolled twin")]
+#[test_case(&[], &[], &[(1, 0)], 0.0, Some(&[0, 2]), 1; "two clean pipelines of one tile: the first")]
+#[test_case(&[], &[], &[(1, 0), (3, 2)], 1.5, Some(&[0, 2].into_iter().chain(4..SHORTLIST + 2).collect::<Vec<_>>()), 2; "tiles, not configs")]
+#[test_case(&[0, 1], &[], &[(1, 0)], 0.0, Some(&[0, 1]), 1; "both pipelines spill: both are timed")]
+fn the_shortlist_is_the_first_tiles_that_do_not_spill(
     spilled: &[usize],
     failed: &[usize],
     twins: &[(usize, usize)],
-    ranked: usize,
+    ranked: f64,
     want: Option<&[usize]>,
     batches: usize,
 ) {
     use crate::tune::Compiled;
+    // Short rankings are as long as what they name.
+    let ranked = if ranked == 0.0 {
+        spilled
+            .iter()
+            .chain(failed)
+            .chain(twins.iter().map(|(c, _)| c))
+            .max()
+            .map_or(0, |m| m + 1)
+            .max(want.map_or(0, |w| w.iter().max().map_or(0, |m| m + 1)))
+    } else {
+        (ranked * SHORTLIST as f64) as usize
+    };
     let tile = |at: usize| twins.iter().find(|(c, _)| *c == at).map_or(at, |(_, t)| *t);
     let ranked: Vec<Pipe> = (0..ranked).map(|at| Pipe { at, tile: tile(at) }).collect();
     let mut asked = vec![];
@@ -385,7 +404,75 @@ fn the_shortlist_is_the_first_eight_tiles_that_do_not_spill(
     });
     assert_eq!(got.as_deref(), want);
     assert_eq!(asked.len(), batches, "{asked:?}");
-    assert!(asked.iter().flatten().eq(ranked.iter().take(8 * batches)), "ranked batches of eight: {asked:?}");
+    assert!(asked.iter().flatten().eq(ranked.iter().take(SHORTLIST * batches)), "ranked batches: {asked:?}");
+}
+
+/// A tile's twins are judged whole: every clean one, in order, none set
+/// aside for sharing the tile; every one spilling, all of them; nothing
+/// compiling, nothing.
+#[test_case(&[], &[], 4, Some(&[0, 1, 2, 3]); "all clean")]
+#[test_case(&[1], &[3], 4, Some(&[0, 2]); "a spill and a failure dropped")]
+#[test_case(&[0, 1, 2], &[], 3, Some(&[0, 1, 2]); "every one spills")]
+#[test_case(&[0], &[1], 2, Some(&[0]); "the spilled when nothing is clean")]
+#[test_case(&[], &[0, 1], 2, None; "nothing compiles")]
+fn twins_are_judged_whole(spilled: &[usize], failed: &[usize], count: usize, want: Option<&[usize]>) {
+    use crate::tune::Compiled;
+    let twins: Vec<Pipe> = (0..count).map(|at| Pipe { at, tile: 0 }).collect();
+    let got = config::clean(&twins, |batch| {
+        assert_eq!(batch.len(), count, "one batch");
+        let verdict = |p: &Pipe| match (spilled.contains(&p.at), failed.contains(&p.at)) {
+            (_, true) => Compiled::Failed,
+            (true, _) => Compiled::Spilled,
+            _ => Compiled::Clean,
+        };
+        batch.iter().map(verdict).collect()
+    });
+    assert_eq!(got.as_deref(), want);
+}
+
+/// A GEMM config's twins are the ranking's configs of its block tile and
+/// warp grid: every reduction depth, ring depth and unrolling, itself
+/// among them, in ranked order.
+#[test]
+fn a_gemm_tiles_twins_are_its_pipelines() {
+    let planner = planner(sm86());
+    let ranked = planner.gemm_ranked(1, 704, 1536, 512, false);
+    let winner = ranked.iter().find(|c| c.tile[..2] == [64, 64] && c.warps == [2, 2]).copied().unwrap();
+    let twins = winner.twins(&ranked);
+    assert!(twins.contains(&winner));
+    assert!(twins.len() >= 4, "{twins:?}");
+    assert!(twins.iter().all(|c| c.tile[..2] == [64, 64] && c.warps == [2, 2]), "{twins:?}");
+    assert!(twins.iter().any(|c| c.tile[2] != winner.tile[2]) && twins.iter().any(|c| c.stages != winner.stages));
+    let order: Vec<usize> = twins.iter().map(|t| ranked.iter().position(|c| c == t).unwrap()).collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    assert_eq!(config::distinct_configs(&twins), twins);
+}
+
+/// A split convolution's twins keep its split; a split attention's keep its
+/// splits and its tuned softmax forms, the ranking's being plain; a norm
+/// config is its own only twin.
+#[test]
+fn variants_keep_their_variant_across_twins() {
+    let planner = planner(sm86());
+    let ranked: Vec<ConvCfg> = planner.conv_ranked(1, 6400, &geom([80, 80], 64, 64, 3, 1, 1, 1)).to_vec();
+    let winner = ConvCfg { split: 3, ..ranked[0] };
+    let twins = winner.twins(&ranked);
+    assert!(twins.len() >= 2 && twins.iter().all(|c| c.split == 3 && c.gemm.tile() == winner.gemm.tile()), "{twins:?}");
+    let ranked = planner.attention_ranked(8, 2048, 2048, 64, false);
+    let forms = Forms { raw_max: true, ..Forms::default() };
+    let winner = FaCfg { splits: 4, forms, ..ranked[0] };
+    let twins = winner.twins(&ranked);
+    assert!(twins.len() >= 2, "{twins:?}");
+    assert!(
+        twins
+            .iter()
+            .all(|c| (c.bq, c.bkv, c.key_warps, c.splits, c.forms)
+                == (winner.bq, winner.bkv, winner.key_warps, 4, forms)),
+        "{twins:?}"
+    );
+    assert!(twins.iter().any(|c| (c.stages, c.unroll) != (winner.stages, winner.unroll)));
+    let norm = NormCfg { br: 8 };
+    assert_eq!(norm.twins(&[NormCfg { br: 4 }, norm, NormCfg { br: 16 }]), vec![norm]);
 }
 
 /// At zero costs every config ties: the ranking is degenerate (fewest

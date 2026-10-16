@@ -49,7 +49,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// first `Out`/`InOut` parameter's tensor is returned as the lazy result.
 pub fn graph_launch(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Tensor> {
     let out_at = first_output(&prog);
-    Ok(graph_launch_all(prog, lowering, tensors)?.swap_remove(out_at))
+    Ok(launch_all(prog, lowering, tensors, true)?.swap_remove(out_at))
+}
+
+/// [`graph_launch`] with the body lowered for this launch alone, kept in no
+/// memo: a tuner's candidate on scratch buffers, whose placeholders never
+/// key an op's call.
+pub(crate) fn graph_launch_once(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Tensor> {
+    let out_at = first_output(&prog);
+    Ok(launch_all(prog, lowering, tensors, false)?.swap_remove(out_at))
 }
 
 fn first_output(prog: &Program) -> usize {
@@ -62,6 +70,10 @@ fn first_output(prog: &Program) -> usize {
 /// [`graph_launch`] returning every parameter's tensor as it is after the
 /// kernel, in `prog.params` order, so programs with several outputs can be read.
 pub fn graph_launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
+    launch_all(prog, lowering, tensors, true)
+}
+
+fn launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor], memo: bool) -> Result<Vec<Tensor>> {
     let name = prog.name.clone();
     snafu::ensure!(
         tensors.len() == prog.params.len(),
@@ -79,7 +91,7 @@ pub fn graph_launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor])
         CallInfo { name: Some(name.clone()), origin, origins: origin.into_iter().collect(), ..CallInfo::default() };
     let result = tensors[out_at].custom_kernel_with(&ins, info, |ph| {
         let key = lowered_key(&prog, lowering, &device, &ph);
-        if let Some(program) = LOWERED.lock().expect("lowered memo").get(&key) {
+        if let Some(program) = LOWERED.lock().expect("lowered memo").get(&key).filter(|_| memo) {
             return program.clone();
         }
         let mut params: Vec<Arc<UOp>> = Vec::with_capacity(ph.len());
@@ -90,7 +102,9 @@ pub fn graph_launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor])
         match lower::lower(prog, lowering, params, device) {
             Ok(lowered) => {
                 let program = lowered.program.without_origins();
-                LOWERED.lock().expect("lowered memo").insert(key, program.clone());
+                if memo {
+                    LOWERED.lock().expect("lowered memo").insert(key, program.clone());
+                }
                 program
             }
             Err(err) => {
