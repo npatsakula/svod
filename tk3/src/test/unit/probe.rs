@@ -142,10 +142,14 @@ fn an_unmeasured_field_leaves_its_default() {
 }
 
 /// The ladder's reading: the cache's byte is the smallest footprint's, never
-/// dearer than DRAM's, and its bytes the largest footprint nearer that rate
-/// than DRAM's on a log scale; a footprint slower than DRAM holds nothing.
-#[test_case(&[(1 << 20, 10.0), (2 << 20, 11.0), (4 << 20, 60.0), (8 << 20, 95.0)], 100.0, (10.0, 2.0 * (1 << 20) as f64); "a knee at two")]
-#[test_case(&[(1 << 20, 10.0), (2 << 20, 12.0), (4 << 20, 30.0), (8 << 20, 31.0), (16 << 20, 90.0)], 100.0, (10.0, 8.0 * (1 << 20) as f64); "a second level nearer the cache counts as cache")]
+/// dearer than DRAM's, and its bytes the most any footprint shows it
+/// answering, the share of the footprint's reads at the cache's rate rather
+/// than DRAM's times the footprint; a footprint slower than DRAM holds
+/// nothing.
+#[test_case(&[(1 << 20, 10.0), (2 << 20, 10.0), (4 << 20, 60.0), (8 << 20, 95.0)], 100.0, (10.0, 2.0 * (1 << 20) as f64); "a knee at two")]
+#[test_case(&[(1 << 20, 10.0), (2 << 20, 11.0), (4 << 20, 40.0), (8 << 20, 95.0)], 100.0, (10.0, 4.0 * (1 << 20) as f64 * (60.0 / 90.0)); "a rung two thirds answered shows that share")]
+#[test_case(&[(1 << 20, 10.0), (2 << 20, 10.0), (4 << 20, 55.0), (8 << 20, 77.5), (16 << 20, 88.75)], 100.0, (10.0, 2.0 * (1 << 20) as f64); "every rung past the cache shows the same bytes")]
+#[test_case(&[(1 << 20, 10.0), (2 << 20, 10.0), (4 << 20, 30.0), (8 << 20, 31.0), (16 << 20, 90.0)], 100.0, (10.0, 8.0 * (1 << 20) as f64 * (69.0 / 90.0)); "a second level counts for the share it answers")]
 #[test_case(&[(1 << 20, 120.0), (2 << 20, 130.0)], 100.0, (100.0, 0.0); "slower than DRAM holds nothing")]
 fn the_ladder_reads_the_cache(rates: &[(usize, f64)], global_byte: f64, want: (f64, f64)) {
     assert_eq!(crate::probe::held(rates, global_byte), want);
@@ -156,8 +160,8 @@ fn the_ladder_reads_the_cache(rates: &[(usize, f64)], global_byte: f64, want: (f
 /// small cache measures a few rungs and one whose cache holds every
 /// footprint measures them all; a rung that cannot be measured (a rate of
 /// 0 here) fails the ladder. A list of rates repeats its last.
-#[test_case(&[10.0, 11.0, 60.0, 95.0, 100.0], 100.0, 4, Some((10.0, 2.0 * (1 << 20) as f64)); "a small cache stops the ladder at four")]
-#[test_case(&[10.0, 12.0, 30.0, 31.0, 90.0, 95.0], 100.0, 6, Some((10.0, 8.0 * (1 << 20) as f64)); "a second level is climbed through")]
+#[test_case(&[10.0, 11.0, 60.0, 95.0, 100.0], 100.0, 4, Some((10.0, 2.0 * (1 << 20) as f64 * (89.0 / 90.0))); "a small cache stops the ladder at four")]
+#[test_case(&[10.0, 12.0, 30.0, 31.0, 90.0, 95.0], 100.0, 6, Some((10.0, 8.0 * (1 << 20) as f64 * (69.0 / 90.0))); "a second level is climbed through")]
 #[test_case(&[120.0, 130.0], 100.0, 2, Some((100.0, 0.0)); "slower than DRAM stops at two")]
 #[test_case(&[10.0], 100.0, 9, Some((10.0, (STREAM / 2) as f64)); "a cache holding half the stream climbs every rung")]
 #[test_case(&[10.0, 11.0, 0.0], 100.0, 3, None; "a rung that fails")]
