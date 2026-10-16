@@ -115,7 +115,7 @@ fn gelu(k: &mut Kernel, x: Regs<F32>) -> Regs<F32> {
 }
 
 /// A 16-bit tile loaded and widened to f32.
-fn load_f32<T: Elem>(k: &mut Kernel, view: Gmem<T>) -> Regs<F32> {
+fn load_f32<T: Elem, P: TierMark>(k: &mut Kernel, view: Tile<P, T>) -> Regs<F32> {
     let v = k.load(view);
     k.cast::<T, F32>(v)
 }

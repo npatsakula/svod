@@ -91,7 +91,7 @@ Online-softmax state `(m, l, o)` f32 में `exp2` के साथ carry ह
 | `AttnMask::key_lens` | `[batch]` i32 वैध key गिनतियाँ; लंबाई से आगे के blocks छोड़े जाते हैं |
 | `AttnMask::key_mask` | `[batch, tk]` i32 दिखने वाली keys (row stride 8 तक ऊपर round), हर block में पढ़ी जाती है |
 | `AttnMask::seg_start` | packed rows के `[batch, t]` i32 segment starts, `t` के साथ non-decreasing |
-| `AttnMask::bias` | stream type में `[batch या 1, heads, t, tk]` additive bias (row stride 8 तक rounded), हर block में पढ़ा जाता है और masks से पहले scaled scores में जोड़ा जाता है |
+| `AttnMask::bias` | stream type में `[batch या 1, heads, t, tk]` additive bias (row stride 8 तक rounded), K और V के बगल में अपने ring slot से stream होता है (admission में इसके bytes उन्हीं की तरह गिने जाते हैं) और masks से पहले scaled scores में जोड़ा जाता है; appended rows का block अपना bias tile सीधे पढ़ता है |
 
 Masks tile-class का काम हैं। सिर्फ़ वे key blocks predicate गिनते हैं जिन्हें causal, window, length
 या segment का कोई किनारा काटता है (block start पर `select_if`); पूरी तरह अंदर वाले blocks बिना mask
@@ -130,8 +130,8 @@ registers से होकर जाता है वहाँ वह column-maj
 Softmax step जितना कम vector काम कर सके करता है, जो वहाँ सबसे ज़्यादा मायने रखता है जहाँ matrix cores
 SIMD के ALUs साझा करते हैं (RDNA)। कोई row नया running maximum तभी लेती है जब वह log2 इकाइयों में 8 से
 ज़्यादा बढ़े (FlashAttention-4 का lazy rescale): वरना correction ठीक 1 रहता है और probabilities 2⁸ से नीचे
-रहती हैं। Planner हर config सादे forms में देता है; बाक़ी चार (`FaCfg::forms`: `truncate_p`, `skip_rescale`, `raw_max`,
-`sum_after`) tuner knobs हैं, जो tiles के साथ बारी-बारी tune होते हैं (`ops::attention::tune`, `descend` के ज़रिए), क्योंकि
+रहती हैं। Planner हर config सादे forms में देता है; बाक़ी पाँच (`FaCfg::forms`: `truncate_p`, `skip_rescale`, `raw_max`,
+`sum_after`, `bias_direct`) tuner knobs हैं, जो tiles के साथ बारी-बारी tune होते हैं (`ops::attention::tune`, `descend` के ज़रिए), क्योंकि
 कोई tile केवल कुछ forms के साथ ही clean compile हो सकता है: ranking के पहले clean compile होने वाले config पर
 एक forms pass, फिर उसके रखे forms के साथ ranking पर tile और split का चुनाव, फिर उस winner पर दोबारा एक
 forms pass (store-backed, इसलिए कुछ न बदले तो सस्ता)। Forms pass एक coordinate descent है: हर form एक बार,
@@ -154,7 +154,11 @@ d = 128 पर +4%, d = 64 पर neutral और decoder step पर 5–7% ध�
 जाती हैं जैसे रखी हैं (bf16 pair dot product, जहाँ target के पास वह है), rounded वाली f32 में। Product के बाद
 दोनों consumers truncated मान एक बार packed पढ़ते हैं (gfx1201); उससे पहले, sm_86 पर rounding के साथ, यह क्रम
 d = 128 पर 3% तेज़ था (24.7 बनाम 24.0 TFLOP/s, इस काम से पहले 22.4) और d = 64 पर तथा decoder step पर
-neutral। Causal mask (या हर पहले वाले को देखने वाले chunks) के नीचे
+neutral। `bias_direct` के साथ (जो सिर्फ़ bias के तहत flip होता है) हर key block का bias tile K और V के बगल
+वाले अपने ring slot से stream होने की जगह, जो planned form है, scores के layout में सीधे global memory से पढ़ा
+जाता है: gfx1151 पर, जिसका accumulator हर lane में एक column रखता है और ring के tile को दो-दो byte में gather
+करता है, causal mask के बिना direct reads तेज़ निकले (d = 64, B 4, H 8, T 2048 पर 3.0 बनाम 3.6 ms) और उसके
+साथ ring तेज़ (1.88 बनाम 2.12 ms)। Causal mask (या हर पहले वाले को देखने वाले chunks) के नीचे
 आख़िरी query blocks, जो सबसे ज़्यादा keys score करते हैं, पहले चलते हैं, ताकि round की पूँछ उसके सबसे छोटे
 blocks हों। gfx1201 पर lazy rescale, truncation, skip और नीचे के raw `exp2` ने d = 128 kernel को random data
 पर 90 से 116 TFLOP/s और Qwen3 के causal attention को 63 से 77 तक ले गए; raw maximum, pair dot product और

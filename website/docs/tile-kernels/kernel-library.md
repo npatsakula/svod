@@ -95,7 +95,7 @@ The online-softmax state `(m, l, o)` is carried in f32 using `exp2`.
 | `AttnMask::key_lens` | `[batch]` i32 valid key counts; blocks past the length are skipped |
 | `AttnMask::key_mask` | `[batch, tk]` i32 visible keys (row stride rounded up to 8), read in every block |
 | `AttnMask::seg_start` | `[batch, t]` i32 segment starts of packed rows, non-decreasing along `t` |
-| `AttnMask::bias` | `[batch or 1, heads, t, tk]` additive bias in the stream type (row stride rounded up to 8), read in every block and added to the scaled scores before the masks |
+| `AttnMask::bias` | `[batch or 1, heads, t, tk]` additive bias in the stream type (row stride rounded up to 8), streamed through a ring slot of its own beside K and V (its bytes counted in admission like theirs) and added to the scaled scores before the masks; the appended rows' block reads its bias tile directly |
 
 Masks are tile-class work. Only key blocks that a causal, window, length or segment edge
 crosses compute the predicate (`select_if` on the block start); blocks fully inside run
@@ -136,7 +136,7 @@ The softmax step does as little vector work as it can, which matters most where 
 cores share the SIMD's ALUs (RDNA). A row adopts a new running maximum only when it grows by
 more than 8 in log2 units (FlashAttention-4's lazy rescale): otherwise the correction is exactly
 1, while the probabilities stay below 2⁸. The planner offers every config in the plain forms; the
-other four (`FaCfg::forms`: `truncate_p`, `skip_rescale`, `raw_max`, `sum_after`) are tuner knobs, tuned in
+other five (`FaCfg::forms`: `truncate_p`, `skip_rescale`, `raw_max`, `sum_after`, `bias_direct`) are tuner knobs, tuned in
 turn with the tiles (`ops::attention::tune`, through `descend`), since a tile may compile clean only under some
 forms: a forms
 pass on the ranking's first config that compiles clean, then the tile and split choice over the
@@ -162,7 +162,12 @@ the step's dependent chain, which a decoder step's one wave feels (3%) and a ful
 probabilities are summed as held either way (the bf16 pair dot product where the target has it),
 rounded ones in f32. After the product both consumers read truncated values packed once (gfx1201);
 before it, on sm_86 with rounding, the order was 3% faster at d = 128 (24.7 against 24.0 TFLOP/s,
-22.4 before this work) and neutral at d = 64 and on a decoder step. Under a causal mask (or chunks seeing every earlier one) the last
+22.4 before this work) and neutral at d = 64 and on a decoder step. With `bias_direct` (flipped only under a bias),
+each key block's bias tile is read straight from global memory in the scores' layout rather than
+streamed through its ring slot beside K and V, the planned form: on gfx1151, whose accumulator holds a
+column per lane and gathers the ring's tile two bytes at a time, the direct reads measured faster
+without a causal mask (3.0 against 3.6 ms at d = 64, B 4, H 8, T 2048) and the ring faster with one
+(1.88 against 2.12 ms). Under a causal mask (or chunks seeing every earlier one) the last
 query blocks, which score the most keys, run first, so a round's tail is its shortest blocks. On
 gfx1201 the lazy rescale, the truncation, the skip and the raw `exp2` below took the d = 128 kernel
 from 90 to 116 TFLOP/s on random data and Qwen3's causal attention from 63 to 77; the raw maximum,

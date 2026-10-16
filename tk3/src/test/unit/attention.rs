@@ -286,7 +286,7 @@ fn biased(spec: AttnSpec) -> AttnSpec {
 /// The RDNA prefill forms: truncated probabilities, the rescale skipped and
 /// the maximum in raw units, on a 64×32 tile.
 const RAW_MAX: FaCfg = FaCfg {
-    forms: Forms { truncate_p: true, skip_rescale: true, raw_max: true, sum_after: false },
+    forms: Forms { truncate_p: true, skip_rescale: true, raw_max: true, sum_after: false, bias_direct: false },
     ..FaCfg::new(64, 32, 2)
 };
 
@@ -632,13 +632,13 @@ fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg>, Vec<FaCf
     use crate::ops::attention::tune;
     let AttnSpec { t, tk, heads, d, mask, .. } = *spec;
     let tiles = spec.batch.capacity() * heads;
-    let ranked = planner.attention_ranked(tiles, t, tk, d, mask.causal);
+    let ranked = planner.attention_ranked(tiles, t, tk, d, mask.causal, mask.bias.is_some());
     let build = |cfg: FaCfg| vec![(flash_attention(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
     let shape = [spec.batch.capacity(), t, tk, heads, d];
     let mut tuner = crate::ops::Tuner::new(&planner.device, DType::BFloat16, &shape, mask, build);
     let plain = tuner.admitted("attention", &ranked);
     let formed = std::cell::RefCell::new(vec![]);
-    let pick = tune(&mut tuner, &ranked, |admitted| {
+    let pick = tune(&mut tuner, &ranked, mask.bias.is_some(), |admitted| {
         *formed.borrow_mut() = admitted.to_vec();
         admitted.to_vec()
     });
@@ -668,6 +668,7 @@ fn label(c: &FaCfg) -> String {
         (f.skip_rescale, "skip_rescale"),
         (f.raw_max, "raw_max"),
         (f.sum_after, "sum_after"),
+        (f.bias_direct, "bias_direct"),
     ];
     let on: Vec<&str> = forms.iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect();
     format!("bq{} bkv{} s{} unroll={} forms [{}]", c.bq, c.bkv, c.stages, c.unroll, on.join(" "))
@@ -744,7 +745,7 @@ fn key_warp_resources_probe() {
             eprintln!("{}: does not compile", label(&cfg));
             continue;
         };
-        eprintln!("{} ({} B static smem): {:?}", label(&cfg), cfg.smem_bytes(64), crate::tune::resources(&plan));
+        eprintln!("{} ({} B static smem): {:?}", label(&cfg), cfg.smem_bytes(64, false), crate::tune::resources(&plan));
     }
 }
 
@@ -797,7 +798,10 @@ fn attention_candidates_probe() {
             for bkv in [16, 32, 64, 128] {
                 for unroll in [false, true] {
                     let cfg = FaCfg { unroll, ..FaCfg::new(bq, bkv, 2) };
-                    if cfg.fits(target, d) && cfg.smem_bytes(d) <= target.smem_bytes && !cfgs.contains(&cfg) {
+                    if cfg.fits(target, d, false)
+                        && cfg.smem_bytes(d, false) <= target.smem_bytes
+                        && !cfgs.contains(&cfg)
+                    {
                         cfgs.push(cfg);
                     }
                 }
