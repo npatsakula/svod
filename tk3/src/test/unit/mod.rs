@@ -30,6 +30,7 @@ use crate::ops::config::Planner;
 
 /// The default device's target when tk3 has tables for it, of any vendor.
 fn device_target() -> Option<Target> {
+    traced();
     let target = Target::for_device(&svod_dtype::default_device::default_device());
     target.filter(crate::ops::config::has_kernels)
 }
@@ -37,7 +38,19 @@ fn device_target() -> Option<Target> {
 /// The default device's planner as the op layer holds it: its costs probed
 /// on the device (read from the tune store after the first run).
 fn device_planner() -> Option<Arc<Planner>> {
+    traced();
     crate::ops::planner(&svod_dtype::default_device::default_device())
+}
+
+/// The crate's tracing under `RUST_LOG` on stderr, for the probes: the
+/// tuner's picks and round times at `svod_tk3=debug`.
+fn traced() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .without_time()
+        .try_init();
 }
 
 /// What the tuner makes of `ranked` on the device, as the op layer tunes:

@@ -490,10 +490,12 @@ pub(crate) fn rounds(count: usize, mut time: impl FnMut(usize) -> Option<Duratio
     let Some(lead) = best.iter().flatten().min().copied() else { return best };
     let bound = lead.mul_f64(CONTENDER);
     let contenders: Vec<usize> = (0..count).filter(|&i| best[i].is_some_and(|t| t <= bound)).collect();
+    tracing::debug!(first = ?best, ?contenders, "tuner's first round");
     let more = round_robin_min(contenders.len(), ROUNDS - 1, Some(bound), |j| time(contenders[j]));
     for (&i, more) in contenders.iter().zip(more) {
         best[i] = more.and_then(|m| best[i].map(|b| b.min(m)));
     }
+    tracing::debug!(?best, "tuner's rounds");
     best
 }
 

@@ -57,4 +57,6 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
 ## Task evaluation
 
 - `cargo fmt`, `cargo clippy` and `cargo test` should pass before I can perform review.
+- Run the tk3 suite in release (`cargo test -p svod-tk3 --release --lib`): its planner, admission and
+  interpreter paths are Rust-heavy and take ~14 min in debug against ~45 s in release (gfx1201, 2026-10-16).
 - Don't hack/simplify tests, ensure they are comprehensive and cover all edge cases.
