@@ -29,8 +29,9 @@ tiles under those forms, then the forms again on the winner (see the
 a warm store compiles nothing but the winner. When nothing compiles (no device to compile on) the
 first 64 tiles are used untested.
 
-With tuning off (`SVOD_TK3_TUNE=0`) nothing is timed or stored: the ranked list's first config
-that compiles clean runs, found compiling in ranked batches of eight. The device's cost probes
+With tuning off (`SVOD_TK3_TUNE=0`) nothing is timed: the ranked list's first config that
+compiles clean runs, found compiling in ranked batches of eight and kept in the store as a
+`first` line (attention's forms pass starts from the same config). The device's cost probes
 still measure, once per device (about 4 s on gfx1151), since the ranking needs them.
 
 A better fixed default was not enough. Nemotron's GEMMs (M = 704, N 512–2048) ran at about
@@ -74,7 +75,7 @@ Two guards keep a time honest:
 |---|---|
 | Directory | `$SVOD_TK3_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk3_tune`, else `~/.cache/svod/tk3_tune` |
 | File | One per device and crate version, e.g. `sm_86_28sm-v0.2.0.txt`, headed by its line format (`format 1`, `tune::FORMAT`); a file of another format is dropped whole |
-| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: a `choice` holds the winner's `index ns`, a `value` a measured number, an `admitted` the ranked indices admission kept |
+| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: a `choice` holds the winner's `index ns`, a `value` a measured number, an `admitted` the ranked indices admission kept, a `first` the first clean config's index |
 | Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, where `device` is arch and SM count (`sm_86-28sm`) and `compiler` digests the device's compiler (`tune::compiler`) |
 
 Two lines from a real store: attention, bf16, shape `[batch, t, tk, heads, kv_heads, d]`,

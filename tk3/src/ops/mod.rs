@@ -143,11 +143,15 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
 
     /// The first config of `ranked` whose compiled kernel does not spill
     /// ([`config::first_clean`]; nothing compiling: the first; nothing
-    /// ranked: `None`), compiled in ranked batches: what runs with tuning
-    /// off, and where a pass that starts from one config starts.
-    pub(crate) fn first_clean(&mut self, ranked: &[C]) -> Option<C> {
+    /// ranked: `None`), compiled in ranked batches on a store miss and kept
+    /// in the store under the batch's programs: what runs with tuning off,
+    /// and where a pass that starts from one config starts.
+    pub(crate) fn first_clean(&mut self, op: &'static str, ranked: &[C]) -> Option<C> {
+        let key = self.key(op, ranked);
         let (bench, build) = (&mut self.bench, &self.build);
-        let at = config::first_clean(ranked, |batch| bench.admit(batch, build));
+        let programs = || Self::programs(build, &ranked[..ranked.len().min(config::FIRST)]);
+        let find = || config::first_clean(ranked, |batch| bench.admit(batch, build));
+        let at = TuneStore::global().first(&key, programs, find);
         ranked.get(at.unwrap_or(0)).copied()
     }
 
@@ -157,7 +161,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     /// off, the [`Self::first_clean`] alone.
     pub(crate) fn admitted(&mut self, op: &'static str, ranked: &[C]) -> Vec<C> {
         if !tune::enabled() {
-            return self.first_clean(ranked).into_iter().collect();
+            return self.first_clean(op, ranked).into_iter().collect();
         }
         let key = self.key(op, ranked);
         let (bench, build) = (&mut self.bench, &self.build);

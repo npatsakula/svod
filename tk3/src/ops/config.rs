@@ -394,7 +394,7 @@ pub(crate) fn compiled<C: Tiled>(list: &[C], mut compile: impl FnMut(&[C]) -> Ve
 /// Search bound: configs compiled at once in search of the first clean one: the first
 /// ranked config nearly always is, and a search is what runs with tuning
 /// off, where no test should pay for a lattice.
-const FIRST: usize = 8;
+pub(crate) const FIRST: usize = 8;
 
 /// The index of the first config of `ranked` whose compiled kernel does
 /// not spill, judged as [`shortlist`] judges (every one spilling: the first

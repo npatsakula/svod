@@ -349,6 +349,26 @@ fn an_admission_round_trips_through_the_store() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A first clean config round-trips through the store as a `first` line
+/// beside the list's admission, each remembered once: a second store on
+/// the directory searches nothing, and a search that found nothing is not
+/// stored.
+#[test]
+fn a_first_clean_config_round_trips_through_the_store() {
+    let dir = scratch("first");
+    let k = key(&[1, 2, 3], &[0, 1, 2]);
+    let store = TuneStore::at(Some(dir.clone()));
+    assert_eq!(store.first(&key(&[9], &[0]), || 7, || None), None);
+    assert!(store.entries(&k).is_empty());
+    assert_eq!(store.first(&k, || 7, || Some(2)), Some(2));
+    assert_eq!(store.admitted(&k, || 7, || Some(vec![2, 0, 5])).as_deref(), Some(&[2, 0, 5][..]));
+    let lines = format!("format {FORMAT}\n{} 2 0 5\n{} 2\n", k.line(Kind::Admitted, 7), k.line(Kind::First, 7));
+    assert_eq!(store_file(&dir), lines);
+    let again = TuneStore::at(Some(dir.clone()));
+    assert_eq!(again.first(&k, || 7, || unreachable!("searched twice")), Some(2));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A file of another line format is dropped whole and the next write starts
 /// it over in this one; a file of this format, or without a format line
 /// (the first format's), reads as it did and stays as it is until a write.
@@ -485,6 +505,8 @@ fn a_scratch_plan_publishes_nothing() {
     let (first, second) = (scratch(), scratch());
     assert!(!kernels(&first.0).is_empty());
     assert!(kernels(&first.0).iter().zip(kernels(&second.0)).all(|(a, b)| !std::ptr::eq(*a, b)));
+    let names = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(|k| k.entry_point.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&first.0), names(&second.0), "a candidate's kernels are named by their shape alone");
     let launched = || {
         let buffers = pool.buffers(&gemm::<BF16>(&spec).params);
         let tensors: Vec<&svod_tensor::Tensor> = buffers.iter().collect();
