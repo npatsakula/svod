@@ -393,6 +393,19 @@ fn costs_need_the_sm_count() {
     assert!(matches!(probe::probes(&target), Err(probe::Error::NoSms { .. })));
 }
 
+/// A probe settles on two timings that agree and keeps the lesser; timings
+/// apart (one slowed by a kernel sharing the device) take a third, and the
+/// least of them stands.
+#[test_case(&[100, 105, 90] => (Some(100), 2); "two agree")]
+#[test_case(&[100, 130, 120] => (Some(100), 3); "none agree, the least")]
+#[test_case(&[130, 100, 103] => (Some(100), 3); "a slow first")]
+#[test_case(&[] => (None, 0); "nothing timed")]
+fn a_probe_keeps_the_least_of_agreeing_timings(timings: &[u64]) -> (Option<u64>, usize) {
+    let taken = std::cell::Cell::new(0);
+    let least = probe::least(timings.iter().copied().inspect(|_| taken.set(taken.get() + 1)));
+    (least, taken.get())
+}
+
 /// On the attached GPU every cost measures (none is left at zero), finite
 /// and non-negative, and ordered as the hardware is: a shared byte cheaper
 /// than a global one, a cached one no dearer than DRAM's, a lone trip's wait

@@ -38,8 +38,12 @@ const LATENCY_TRIPS: usize = 16 << 10;
 /// a launch.
 const TRIPS: usize = 4096;
 /// Measurement: timings of a pair, compiled once, before a probe gives up: one with a
-/// weak signal ([`strong`]) or a lost stamp is timed again.
+/// weak signal ([`strong`]) or a lost stamp is timed again, and so is one
+/// that disagrees with the last ([`least`]).
 const TRIES: usize = 3;
+/// Measurement: how close two timings of a probe must be for it to settle
+/// on the lesser.
+const AGREE: f64 = 0.1;
 /// Measurement: warps of a throughput probe's block.
 const WARPS: u32 = 4;
 /// Measurement: a throughput probe's warp grid: [`WARPS`] rows of warps.
@@ -134,7 +138,7 @@ fn measured(target: &Target, compiler: u64, probe: Probe) -> Result<f64> {
         || programs,
         || {
             let mut built = tune::compile(candidates, &ScratchPool::default());
-            (0..TRIES).find_map(|_| match timed(&mut built, scale / units) {
+            least((0..TRIES).filter_map(|_| match timed(&mut built, scale / units) {
                 Ok((fs, base_ns, probe_ns)) => {
                     tracing::debug!(op, base_ns, probe_ns, fs, "probe pair timed");
                     Some(fs)
@@ -143,10 +147,25 @@ fn measured(target: &Target, compiler: u64, probe: Probe) -> Result<f64> {
                     last = e;
                     None
                 }
-            })
+            }))
         },
     );
     Ok(fs.context(UnmeasuredSnafu { probe: op, last })? as f64 * 1e-6)
+}
+
+/// The least of `timings`, taken until two agree within [`AGREE`]: a kernel
+/// sharing the device with another's runs slow, never fast, so of two
+/// timings apart the lesser is nearer the primitive and a third decides.
+pub(crate) fn least(timings: impl Iterator<Item = u64>) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    for t in timings {
+        let settled = best.is_some_and(|b| b.abs_diff(t) as f64 <= AGREE * b.max(t) as f64);
+        best = Some(best.map_or(t, |b| b.min(t)));
+        if settled {
+            break;
+        }
+    }
+    best
 }
 
 /// One timing of a compiled pair: its difference times `per`, in
