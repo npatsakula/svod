@@ -1284,6 +1284,16 @@ impl KernelSite {
         }
     }
 
+    /// The kernel's name for a `config`: the next of its shape name in the
+    /// process ([`finalize_kernel_name`]), or for an ephemeral prepare the
+    /// bare shape name, so a candidate compiled in passing (in parallel, in
+    /// a tuner) moves no counter and the kernels prepared after it keep
+    /// the names, and the compiled objects, they have in a process that
+    /// compiled no candidate.
+    fn named(optimized: &Arc<UOp>, config: &PrepareConfig) -> Arc<UOp> {
+        if config.ephemeral { optimized.clone() } else { finalize_kernel_name(optimized) }
+    }
+
     /// Render and compile a named optimized kernel, then publish it under
     /// `key`; an `ephemeral` prepare reads the compiled-program cache but
     /// publishes in neither.
@@ -1335,7 +1345,7 @@ impl KernelSite {
     fn build(&self, config: &PrepareConfig) -> Result<Arc<CachedKernel>> {
         let _detached = svod_ir::origin::OriginScope::suspend();
         let optimized = self.optimize(config)?;
-        self.compile(finalize_kernel_name(&optimized), config.ephemeral)
+        self.compile(Self::named(&optimized, config), config.ephemeral)
     }
 
     fn cached(&self) -> Option<Arc<CachedKernel>> {
@@ -1387,7 +1397,7 @@ fn compile_missing_kernels(
         .into_iter()
         .zip(optimized)
         .filter_map(|(job, optimized)| match optimized {
-            Ok(ast) => Some((job, finalize_kernel_name(&ast))),
+            Ok(ast) => Some((job, KernelSite::named(&ast, config))),
             Err(err) => {
                 failed.get_or_insert(err);
                 None

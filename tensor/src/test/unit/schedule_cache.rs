@@ -622,6 +622,29 @@ fn test_cache_disabled_matches_enabled_var_names_and_kernel_count() {
     );
 }
 
+/// An ephemeral prepare names its kernels by their bare shape names and
+/// moves no process-wide name counter: two ephemeral plans of one
+/// computation carry the same names, and the plain plan prepared after
+/// them, the first of its shape name in the process, carries them too, so
+/// the kernels a process prepares after a candidate keep the names (and
+/// the compiled objects) they have in a process that compiled none. The
+/// shape is one no other test prepares, since the counter is the process's.
+#[test]
+fn an_ephemeral_prepare_names_kernels_bare() {
+    svod_schedule::testing::setup_test_tracing();
+    let fresh = || {
+        let (a, b): (Vec<f32>, Vec<f32>) = (0..7919).map(|i| (i as f32, 2.0 * i as f32)).unzip();
+        (&Tensor::from_slice(a) + &Tensor::from_slice(b)).unwrap()
+    };
+    let ephemeral = PrepareConfig { ephemeral: true, ..cfg() };
+    let names = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(|k| k.entry_point.clone()).collect::<Vec<_>>();
+    let (once, twice) = (fresh().prepare_with(&ephemeral).unwrap(), fresh().prepare_with(&ephemeral).unwrap());
+    assert!(!names(&once).is_empty());
+    assert_eq!(names(&once), names(&twice), "ephemeral names are the shape's alone");
+    let plain = fresh().prepare_with(&cfg()).unwrap();
+    assert_eq!(names(&plain), names(&once), "the ephemeral prepares moved no counter");
+}
+
 /// An ephemeral prepare records nothing: its schedule is not in the cache
 /// afterwards and its kernel is compiled again by a plain prepare of the
 /// same computation, which a second plain prepare then shares; the
