@@ -668,6 +668,31 @@ fn final_sink_verification_cannot_be_bypassed_by_a_staged_linear() {
     assert!(format!("{err}").contains("SINK must be void"), "unexpected error: {err:?}");
 }
 
+/// A kernel's text does not depend on the UOps the process minted before
+/// it: its if-labels are numbered by the kernel's own counter, not by the
+/// process-wide UOp id, so the same kernel built after a thousand other
+/// UOps renders the same text and finds its compiled object again.
+#[test]
+fn a_kernels_text_does_not_depend_on_the_uops_minted_before_it() {
+    let gated = || {
+        let out_index = UOp::index()
+            .buffer(UOp::param(0, 16, DType::Float32, None))
+            .indices(vec![UOp::index_const(0)])
+            .call()
+            .expect("index");
+        let store = out_index.store_gated(UOp::native_const(1.0f32), UOp::native_const(true));
+        let program = program_from_sink(committed_sink(vec![store]), DeviceSpec::Cpu).expect("final target graph");
+        let linearized = do_linearize(&program).expect("linearize");
+        let Op::Program(ops::Program { linear: Some(linear), .. }) = linearized.op() else { panic!("LINEAR") };
+        crate::llvm::text::render(linear, Some("gated")).expect("render").code
+    };
+    let first = gated();
+    let minted: Vec<Arc<UOp>> = (0..1000).map(UOp::native_const).collect();
+    let second = gated();
+    assert!(first.contains("if_then_"), "{first}");
+    assert_eq!(first, second, "{}", minted.len());
+}
+
 /// A gated STORE becomes IF / STORE / ENDIF during the cleanup rewrite, and the
 /// linearized list is verified *after* that rewrite — otherwise `spec_program`'s
 /// IF rule (which rejects a body-carrying IF) would never be reached.

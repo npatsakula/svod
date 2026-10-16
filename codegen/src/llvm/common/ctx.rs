@@ -200,6 +200,17 @@ impl RenderContext {
         self.names.contains_key(&id)
     }
 
+    /// A label stem for a block-structured op, numbered by this kernel's
+    /// counter like a value and kept under the op's id for its closing
+    /// half: a program's text then reads the same whatever UOps the process
+    /// minted before it, so its compiled object is found again.
+    pub fn label(&mut self, uop: &Arc<UOp>) -> String {
+        let stem = format!("{}", self.counter);
+        self.counter += 1;
+        self.names.insert(uop.id, stem.clone());
+        stem
+    }
+
     /// Alias one ID to another's name.
     pub fn alias(&mut self, id: u64, name: String) {
         self.names.insert(id, name);
