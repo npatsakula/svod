@@ -48,10 +48,13 @@ pub fn heads<T: Elem>(spec: &HeadsSpec) -> Program {
     let kk = k.param::<T>("k", ParamKind::Out, cap * t * kv_heads * d);
     let v = k.param::<T>("v", ParamKind::Out, cap * t * kv_heads * d);
     let (gz, bb) = batch.axis(&mut k);
-    k.grid([Sc::from(t.div_ceil(br)), Sc::from(slots), gz]);
+    // The head slots of a row group are the fastest-moving blocks, so the
+    // blocks a dispatcher deals in turn read one row group's contiguous
+    // bytes rather than a chunk of every row a row apart.
+    k.grid([Sc::from(slots), Sc::from(t.div_ceil(br)), gz]);
     k.warps(br as u32);
-    let row0 = k.block(0) * br;
-    let slot = k.block(1);
+    let slot = k.block(0);
+    let row0 = k.block(1) * br;
     let shape = Shape::new(br, half);
     let tiles = |k: &mut Kernel, p: ParamRef<T>, width: usize, col: Sc| {
         let view = k.view(p, batch_offset(&bb, t * width) + col, [width, 1], shape, [bound(t, br), None]);
