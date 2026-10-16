@@ -6,11 +6,12 @@
 //! theirs from a lattice over the construct's knobs, kept to what the
 //! lowering runs and ranked in nanoseconds of SM time from the device's
 //! measured [`Costs`]: a round of resident blocks is bound by the SM's issue
-//! work, by one wave's own issue or by the memory latency one pipeline stage
-//! ahead cannot hide ([`Planner::pipelined`]). The model orders block tiles
-//! well enough to lead with them ([`spread`]) and warp grids poorly (on
-//! sm_86 the measured best sat as deep as the 92nd of 109 tiles), which is
-//! why the shortlist runs that deep. Registers admit nothing here: the
+//! work or by one wave's own issue, plus the memory latency one pipeline
+//! stage ahead cannot hide ([`Planner::pipelined`]). The model orders block
+//! tiles well enough to lead with them ([`spread`]) and warp grids less well
+//! (on sm_86 the measured best sat as deep as the 92nd of 109 tiles before
+//! a trip's pipes overlapped across a SIMD's waves), which is why the
+//! shortlist runs that deep. Registers admit nothing here: the
 //! layout count over-counts, so the compiled kernel judges ([`shortlist`]).
 //! A [`Planner`] holds the rankings of one device. The other kernels' lists
 //! are small functions of the target.
@@ -132,20 +133,25 @@ fn lattice(target: &Target) -> Vec<GemmCfg> {
 
 /// How a problem runs under one config: `blocks` blocks of `waves` waves,
 /// each holding `smem` bytes of shared memory and `regs` registers a lane
-/// by the layout count, and running `trips` trips of `work` ns of SM time
-/// plus a trip's fixed overhead `trip` (its barrier and ring bubble, which
-/// the other blocks an SM holds work through) through a ring `stages` deep.
+/// by the layout count, and running `trips` trips through a ring `stages`
+/// deep. A trip's issue goes down three pipes, in ns of SM time each, plus
+/// a fixed overhead `trip` (its barrier and ring bubble, which the other
+/// blocks an SM holds work through).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Run {
     pub blocks: usize,
     pub smem: usize,
     pub regs: u32,
     pub waves: usize,
+    /// The independent matrix-core accumulators a wave holds between
+    /// dependent steps: they hide a chain's latency as other waves do.
+    pub atoms: usize,
     pub trips: usize,
-    /// A trip's issue work: the waves' fragment reads, steps and vector work.
+    /// A trip's operand fragments read from shared memory.
+    pub reads: f64,
+    /// A trip's matrix-core steps and vector work.
     pub work: f64,
-    /// A trip's fill, priced by where its bytes come from: streamed through
-    /// the ring while the waves issue.
+    /// A trip's fill, priced by where its bytes come from.
     pub fill: f64,
     pub trip: f64,
     pub stages: usize,
@@ -181,7 +187,9 @@ impl Problem {
     /// `None` when it does not lower, or when its [live
     /// registers](GemmCfg::live_registers) alone pass the lane's limit. A trip
     /// pays its fragment reads, fill, matrix-core steps (padding included)
-    /// and overhead.
+    /// and overhead. The fill's bytes are the whole operands' distinct ones,
+    /// and the blocks in flight at once (one an SM at least) share a group's
+    /// A rows and their B columns whatever the cache holds of the whole.
     pub(crate) fn admit(&self, planner: &Planner, cfg: &GemmCfg) -> Option<(f64, u32)> {
         let Device { target, costs } = &planner.device;
         let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
@@ -199,15 +207,23 @@ impl Problem {
             return None;
         }
         let (halves, waves) = (self.halves, wr * wc);
+        let atom = target.mma.first()?;
+        let atoms = (bm / wr / atom.m as usize) * (bn * halves / wc / atom.n as usize);
         let fragments = waves * (bm / wr + bn * halves / wc) * bk * 2;
         let fill = (bm + bn * halves) * bk * 2;
         let steps = bm * bn * halves * bk / 4096;
         let (blocks, trips, stages) = (self.blocks(cfg), self.k / bk, cfg.stages);
         let unique = (self.batches * (self.m + self.n * halves) * self.k * 2) as f64;
-        let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64);
-        let work = fragments as f64 * costs.smem_byte + steps as f64 * costs.step;
+        let flight = planner.sms().min(blocks).max(1);
+        let group = cfg.group_m.max(1).min(flight);
+        let distinct = group * bm + flight.div_ceil(group) * bn * halves;
+        let shared = 1.0 - distinct as f64 / (flight * (bm + bn * halves)) as f64;
+        let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
+        let reads = fragments as f64 * costs.smem_byte;
+        let work = steps as f64 * costs.step;
         let trip = costs.trip(!cfg.unroll && !target.cp_async);
-        Some((planner.pipelined(Run { blocks, smem, regs, waves, trips, work, fill, trip, stages }), regs))
+        let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
+        Some((planner.pipelined(run), regs))
     }
 
     /// The lattice's configs that run this problem on the planner's target,
@@ -237,6 +253,11 @@ const CACHE_SHARE: f64 = 0.75;
 /// from DRAM: an LRU cache streamed past its size by half holds nothing
 /// that is read again.
 const CACHE_SPILL: f64 = 1.5;
+/// Model: the waves per SIMD past which a trip's pipes overlap no further
+/// (measured on gfx1201 and sm_86: sixteen waves per SIMD run a tile no
+/// better than four, and the ranking that counted them did put sixteen-warp
+/// blocks first on sm_86 where eight-warp ones run 7% faster).
+const OVERLAP_WAVES: f64 = 4.0;
 
 /// `ranked` (cheapest first, with its costs) led by the band's classes in
 /// turn: each class's cheapest tile (classes in the order of their
@@ -483,16 +504,21 @@ impl Planner {
     /// rounds of resident blocks), a trip's fixed overhead shared with the
     /// blocks it holds at once: by its shared memory and by its register file
     /// under the layout estimate, at least one (the compiled kernel, not the
-    /// estimate, decides whether a block runs). A round of those blocks is at
-    /// least one wave's own issue (a block of fewer waves than SIMDs leaves
-    /// the rest idle) and the memory latency its ring cannot hide (it
-    /// prefetches `stages - 1` trips ahead). A SIMD holding fewer waves than
-    /// hide a matrix-core chain's latency (`step_lone / step` of them) runs
-    /// their issue work that many times slower, the blocks the SM holds at
-    /// once sharing its SIMDs, a block alone its own waves; the fill streams
-    /// on meanwhile.
+    /// estimate, decides whether a block runs). A trip's pipes (the fragment
+    /// reads, the matrix-core steps, the fill) overlap across the waves a
+    /// SIMD holds: the longest is paid whole, the rest in a share of one over
+    /// the waves per SIMD up to [`OVERLAP_WAVES`], the blocks the SM holds at
+    /// once pooling theirs (measured on gfx1201 and sm_86: a block at one
+    /// wave per SIMD pays about their sum, at four or more the longest). A SIMD holding fewer
+    /// waves than hide a matrix-core chain's latency (`step_lone / step` of
+    /// them, a wave's independent accumulators counting as waves) runs the
+    /// steps that many times slower. A round of blocks is at least one wave's
+    /// own issue (a block of fewer waves than SIMDs leaves the rest idle),
+    /// and every round of every trip pays the memory latency the ring cannot
+    /// hide (it prefetches `stages - 1` trips ahead) on top of its issue:
+    /// measured on both, the latency adds rather than hides under the issue.
     pub(crate) fn pipelined(&self, run: Run) -> f64 {
-        let Run { blocks, smem, regs, waves, trips, work, fill, trip, stages } = run;
+        let Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages } = run;
         let Device { target, costs } = &self.device;
         let (o, sms) = (target.occupancy, self.sms());
         let per_simd = o.waves.min(o.file / regs.max(1)) as usize;
@@ -501,27 +527,35 @@ impl Planner {
         let rounds = per_sm.div_ceil(resident);
         let hide =
             if costs.step > 0.0 && costs.step_lone > 0.0 { (costs.step_lone / costs.step).max(1.0) } else { 1.0 };
-        let lone = |waves: usize| (hide / (waves as f64 / o.simds as f64).max(1.0)).max(1.0);
+        let per_simd = |waves: usize| (waves as f64 / o.simds as f64).max(1.0);
+        let lone = |waves: usize| (hide / (per_simd(waves) * atoms.max(1) as f64)).max(1.0);
+        let body = |waves: usize| {
+            let pipes = [reads, work * lone(waves), fill];
+            let longest = pipes.into_iter().fold(0.0, f64::max);
+            longest + (pipes.iter().sum::<f64>() - longest) / per_simd(waves).min(OVERLAP_WAVES)
+        };
         let at_once = resident.min(per_sm);
-        let issue = per_sm as f64 * (work * lone(at_once * waves) + fill + trip / at_once as f64);
-        let wave = o.simds as f64 * (work * lone(waves) + fill + trip) / waves as f64;
+        let issue = per_sm as f64 * (body(at_once * waves) + trip / at_once as f64);
+        let wave = o.simds as f64 * (body(waves) + trip) / waves as f64;
         let wait = costs.latency / stages.saturating_sub(1).max(1) as f64;
-        trips as f64 * issue.max(rounds as f64 * wave.max(wait))
+        trips as f64 * (issue.max(rounds as f64 * wave) + rounds as f64 * wait)
     }
 
     /// What a byte of a fill costs when `fill` bytes stream `unique`
-    /// distinct ones. Where the distinct bytes fit the [`CACHE_SHARE`] of
-    /// the cache in front of DRAM each comes from DRAM once and its re-reads
-    /// from the cache; past [`CACHE_SPILL`] times that every byte comes from
-    /// DRAM; between, the two blend.
-    pub(crate) fn fill_byte(&self, unique: f64, fill: f64) -> f64 {
+    /// distinct ones, of which the blocks in flight at once re-read a
+    /// `shared` part from one another's lines. Where the distinct bytes fit
+    /// the [`CACHE_SHARE`] of the cache in front of DRAM each comes from
+    /// DRAM once and its re-reads from the cache; past [`CACHE_SPILL`] times
+    /// that every byte comes from DRAM but the shared part, which a cache
+    /// too small for the whole still holds; between, the two blend.
+    pub(crate) fn fill_byte(&self, unique: f64, fill: f64, shared: f64) -> f64 {
         let c = &self.device.costs;
         let held = CACHE_SHARE * c.l2_bytes;
         if held <= 0.0 || fill <= 0.0 {
             return c.global_byte;
         }
         let fits = ((CACHE_SPILL * held - unique) / ((CACHE_SPILL - 1.0) * held)).clamp(0.0, 1.0);
-        let hit = fits * (1.0 - unique / fill).max(0.0);
+        let hit = (fits * (1.0 - unique / fill).max(0.0)).max(shared.clamp(0.0, 1.0));
         hit * c.l2_byte + (1.0 - hit) * c.global_byte
     }
 
@@ -687,7 +721,10 @@ impl Attention {
     /// the softmax of every score and its overhead. A causal query block
     /// scores half the keys plus its diagonal, a key block per `bkv` of its
     /// rows, each [`DIAGONAL`] trips. Key warps each take a share of the
-    /// trips, every trip of theirs the block's whole work at once.
+    /// trips, every trip of theirs the block's whole work at once. The query
+    /// blocks in flight at once share their tiles' keys and values whatever
+    /// the cache holds of the whole; a wave's independent accumulators are
+    /// the narrower product's.
     pub(crate) fn admit(&self, planner: &Planner, cfg: &FaCfg) -> Option<(f64, u32)> {
         let Device { target, costs } = &planner.device;
         let (bq, bkv, d, kw) = (cfg.bq, cfg.bkv, self.d, cfg.key_warps);
@@ -697,6 +734,7 @@ impl Attention {
         }
         let regs = cfg.registers(target, d)?;
         let waves = cfg.warps() as usize;
+        let atoms = bkv.min(d) / target.mma.first()?.n as usize;
         let fragments = 2 * waves * bkv * d * 2;
         let fill = kw * 2 * bkv * d * 2;
         let steps = kw * 2 * bq * bkv * d / 4096;
@@ -705,11 +743,14 @@ impl Attention {
         let trips = trips.div_ceil(kw);
         let (blocks, stages) = (self.blocks(cfg), cfg.stages);
         let unique = (self.tiles * self.tk * d * 2 * 2) as f64;
-        let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64);
-        let work =
-            fragments as f64 * costs.smem_byte + steps as f64 * costs.step + (kw * bq * bkv) as f64 * costs.score;
+        let flight = planner.sms().min(blocks).max(1);
+        let shared = 1.0 - flight.div_ceil(self.t.div_ceil(bq)) as f64 / flight as f64;
+        let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
+        let reads = fragments as f64 * costs.smem_byte;
+        let work = steps as f64 * costs.step + (kw * bq * bkv) as f64 * costs.score;
         let trip = costs.trip(!cfg.unroll && !target.cp_async);
-        Some((planner.pipelined(Run { blocks, smem, regs, waves, trips, work, fill, trip, stages }), regs))
+        let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
+        Some((planner.pipelined(run), regs))
     }
 
     /// The lattice's configs that run this problem on the planner's target,
