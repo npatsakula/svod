@@ -75,6 +75,6 @@ data है, जिसे lowering और op layer चुनते हैं:
 | AMD CDNA: ping-pong template, MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ |
 | AMD पर माप | gfx1201 (RX 9070 XT) पर मापा गया: Qwen3 और YOLO पर GEMM, convolution और attention tk1 से आगे; gfx1151 (Strix Halo) पर मापा गया: d = 64 और 128 पर attention; CDNA compile हुआ, चलाया नहीं गया |
 | Apple | सिर्फ़ atoms; न tables, न emit किए गए कर्नेल |
-| Warp roles, role barriers, raw asm statements | IR में रिकॉर्ड होते हैं, lowering उन्हें ठुकराती है |
+| Raw asm statements | IR में रिकॉर्ड होते हैं, lowering उन्हें ठुकराती है |
 | Convolution (implicit GEMM) | sm_86 पर मापा गया, जहाँ YOLO26 इस पर channels-last चलता है (`ops::conv2d`); AMD के लिए सिर्फ़ compile हुआ |
 | fp8/int8 weights, GEMV + argmax, persistent grid, attention backward | शुरू नहीं हुआ |

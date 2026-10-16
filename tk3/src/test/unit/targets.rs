@@ -170,11 +170,56 @@ fn inputs(name: &str, prog: &Program) -> Vec<Vec<f64>> {
     params.collect()
 }
 
-/// The tile program after `lowering` for interpretation.
-fn lowered_tile(prog: Program, lowering: &Lowering) -> Program {
+/// `prog` lowered for its lowering's target, parameters declared flat.
+fn lowered(prog: Program, lowering: &Lowering) -> crate::lower::Result<crate::lower::Lowered> {
     let params =
         prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
-    lower(prog, lowering, params, device(&lowering.device.target)).unwrap().tile
+    lower(prog, lowering, params, device(&lowering.device.target))
+}
+
+/// The tile program after `lowering` for interpretation.
+fn lowered_tile(prog: Program, lowering: &Lowering) -> Program {
+    lowered(prog, lowering).unwrap().tile
+}
+
+/// A lowering takes a program whose warps its grid takes all, or one whose
+/// warps run on their own ([`Stmt::Warps`]) in whole grids; any other
+/// pairing is refused before a layout is inferred.
+#[test_case(4, [1, 1], false => matches Err(crate::lower::Error::Grid { warps: 4, grid: 1 }); "a norm's four warps on a lone grid")]
+#[test_case(4, [2, 1], false => matches Err(crate::lower::Error::Grid { warps: 4, grid: 2 }); "a norm's four warps on half a grid")]
+#[test_case(4, [4, 1], false => matches Ok(_); "a norm's four warps on their grid")]
+#[test_case(4, [1, 1], true => matches Ok(_); "four key warps on a lone grid")]
+#[test_case(4, [3, 1], true => matches Err(crate::lower::Error::Grid { warps: 4, grid: 3 }); "four key warps on a grid of three")]
+fn a_grid_takes_every_warp_or_whole_grids_run_alone(
+    warps: u32,
+    grid: [u32; 2],
+    key_warps: bool,
+) -> crate::lower::Result<()> {
+    let device = super::declared(crate::atoms::sm86());
+    let lowering = Lowering::uniform(&device, false, crate::layouts::WarpGrid { rows: grid[0], cols: grid[1] });
+    let batch = Batch::Static(1);
+    let prog = if key_warps {
+        let cfg = crate::kernels::attention::FaCfg {
+            key_warps: warps as usize,
+            ..crate::kernels::attention::FaCfg::new(16, 16, 2)
+        };
+        let mask = AttnMask::default();
+        attention::<F16>(&AttnSpec {
+            batch,
+            t: 1,
+            tk: 64,
+            heads: 1,
+            kv_heads: 1,
+            d: 64,
+            mask,
+            cache: None,
+            scale: 0.125,
+            cfg,
+        })
+    } else {
+        combine::<F16>(&CombineSpec { batch, t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: warps as usize } })
+    };
+    lowered(prog, &lowering).map(drop)
 }
 
 /// LLVM text of `prog` for its lowering's target.
@@ -584,7 +629,7 @@ fn tile_ops_in_order(block: &crate::ir::Block) -> Vec<crate::ir::TileOp> {
                 out.extend(tile_ops_in_order(&p.produce.body));
                 out.extend(tile_ops_in_order(&p.consume.body));
             }
-            Stmt::Role { body, .. } | Stmt::Warps { body } => out.extend(tile_ops_in_order(body)),
+            Stmt::Warps { body } => out.extend(tile_ops_in_order(body)),
             Stmt::If { then, otherwise, .. } => {
                 out.extend(tile_ops_in_order(then));
                 out.extend(tile_ops_in_order(otherwise));
@@ -605,7 +650,7 @@ fn tile_ops(block: &crate::ir::Block, f: &dyn Fn(&crate::ir::TileOp) -> bool) ->
             Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
             Stmt::Loop(l) => tile_ops(&l.body, f),
             Stmt::Pipeline(p) => tile_ops(&p.produce.body, f) + tile_ops(&p.consume.body, f),
-            Stmt::Role { body, .. } | Stmt::Warps { body } => tile_ops(body, f),
+            Stmt::Warps { body } => tile_ops(body, f),
             Stmt::If { then, otherwise, .. } => tile_ops(then, f) + tile_ops(otherwise, f),
         })
         .sum()
@@ -623,6 +668,7 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
     assert_eq!(target.dot2_bf16, dot2);
     let (rows, cols) = (4usize, 128usize);
     let mut k = Kernel::new("held_sum");
+    k.warps(1);
     let x = k.param::<F32>("x", ParamKind::In, rows * cols);
     let y = k.param::<F32>("y", ParamKind::Out, rows);
     let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
@@ -667,7 +713,7 @@ fn fences(block: &crate::ir::Block) -> usize {
             Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
             Stmt::Loop(l) => fences(&l.body),
             Stmt::Pipeline(p) => fences(&p.produce.body) + fences(&p.consume.body),
-            Stmt::Role { body, .. } | Stmt::Warps { body } => fences(body),
+            Stmt::Warps { body } => fences(body),
             Stmt::If { then, otherwise, .. } => fences(then) + fences(otherwise),
         })
         .sum()
@@ -704,7 +750,7 @@ fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
             Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
             Stmt::Loop(l) => tile_relayouts(prog, &l.body),
             Stmt::Pipeline(p) => tile_relayouts(prog, &p.produce.body) + tile_relayouts(prog, &p.consume.body),
-            Stmt::Role { body, .. } | Stmt::Warps { body } => tile_relayouts(prog, body),
+            Stmt::Warps { body } => tile_relayouts(prog, body),
             Stmt::If { then, otherwise, .. } => tile_relayouts(prog, then) + tile_relayouts(prog, otherwise),
         })
         .sum()

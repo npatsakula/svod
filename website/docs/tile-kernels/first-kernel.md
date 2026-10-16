@@ -176,5 +176,5 @@ output and falls back to the graph when the kernel does not apply.
 | Movement | `stage` (global → shared, `CopyMode::Async` or `Sync`), `load`, `store` |
 | Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (branches producing tiles) |
 
-`role_block`, `raw` and `transpose` can be recorded but are not lowered yet: the lowering
-returns `Error::Unsupported` for them.
+`raw` and `transpose` can be recorded but are not lowered yet: the lowering returns
+`Error::Unsupported` for them.

@@ -67,7 +67,6 @@ impl Expander<'_> {
                 l.body = self.block(l.body);
                 vec![Stmt::Loop(l)]
             }
-            Stmt::Role { role, body } => vec![Stmt::Role { role, body: self.block(body) }],
             Stmt::Warps { body } => {
                 let outer = std::mem::replace(&mut self.scope, Scope::Warp);
                 let body = self.block(body);

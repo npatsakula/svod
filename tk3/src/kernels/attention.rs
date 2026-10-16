@@ -244,8 +244,8 @@ impl<T> Step<'_, T> {
     }
 }
 
-/// How far (in log2 units) a row's running maximum may fall behind its
-/// scores before the row rescales (FlashAttention-4's lazy rescale): the
+/// Numeric: how far (in log2 units) a row's running maximum may fall behind
+/// its scores before the row rescales (FlashAttention-4's lazy rescale): the
 /// probabilities of a block stay below 2^8. The stream type bounds the
 /// choice rather than fixing it: f16 holds up to 2^15, bf16 up to 2^127, and
 /// the f32 output accumulates `p·v` over every key, so the margin left is

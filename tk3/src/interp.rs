@@ -183,13 +183,6 @@ impl Frame<'_> {
                     self.advance(&p.carried);
                 }
             }
-            Stmt::Role { role, body } => {
-                let warps = self.prog.roles[role.index()].warps.clone();
-                let saved = self.warp;
-                self.warp = i64::from(warps.start);
-                self.block_run(body)?;
-                self.warp = saved;
-            }
             // The warps run one after another: what one leaves in shared
             // memory the next sees, as the real ones do after the block fence.
             Stmt::Warps { body } => {

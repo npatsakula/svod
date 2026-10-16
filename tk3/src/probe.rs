@@ -29,19 +29,20 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Bytes the streaming probes read once per run: larger than any device
-/// cache (MI300X's Infinity Cache is 256 MB), so every run streams from DRAM.
+/// Measurement: bytes the streaming probes read once per run: larger than
+/// any device cache (MI300X's Infinity Cache is 256 MB), so every run streams from DRAM.
 pub(crate) const STREAM: usize = 512 << 20;
-/// Trips of a lone wave at most: a few ms of waiting.
+/// Measurement: trips of a lone wave at most: a few ms of waiting.
 const LATENCY_TRIPS: usize = 16 << 10;
-/// Trips of the trip probes: enough that their fixed costs dwarf a launch.
+/// Measurement: trips of the trip probes: enough that their fixed costs dwarf
+/// a launch.
 const TRIPS: usize = 4096;
-/// Timings of a pair, compiled once, before a probe gives up: one with a
+/// Measurement: timings of a pair, compiled once, before a probe gives up: one with a
 /// weak signal ([`strong`]) or a lost stamp is timed again.
 const TRIES: usize = 3;
-/// Warps of a throughput probe's block.
+/// Measurement: warps of a throughput probe's block.
 const WARPS: u32 = 4;
-/// A throughput probe's warp grid: [`WARPS`] rows of warps.
+/// Measurement: a throughput probe's warp grid: [`WARPS`] rows of warps.
 const ROWS: WarpGrid = WarpGrid { rows: WARPS, cols: 1 };
 
 /// One measurement: `candidates` are `[baseline, probe]`, the probe doing
@@ -163,8 +164,8 @@ fn timed(built: &mut [Built], per: f64) -> Result<(u64, u64, u64), String> {
     }
 }
 
-/// The footprints the cache probes read [`STREAM`] bytes from, smallest
-/// first: from the size of a small cache to past every device's L2.
+/// Measurement: the footprints the cache probes read [`STREAM`] bytes from,
+/// smallest first: from the size of a small cache to past every device's L2.
 const FOOTPRINTS: [(&str, usize); 8] = [
     ("probe:cached_1m", 1 << 20),
     ("probe:cached_2m", 2 << 20),
@@ -216,7 +217,7 @@ pub(crate) fn region_tiles(footprint: usize) -> usize {
     (2..=most).rev().find(|&n| (2..).take_while(|d| d * d <= n).all(|d| n % d != 0)).expect("a footprint of tiles")
 }
 
-/// The tile a cache probe's blocks read: 16 KB of i32.
+/// Measurement: the tile a cache probe's blocks read: 16 KB of i32.
 const CACHE_TILE: Shape = Shape::new(32, 128);
 
 /// The cache probes of `target` with their footprints, smallest first.

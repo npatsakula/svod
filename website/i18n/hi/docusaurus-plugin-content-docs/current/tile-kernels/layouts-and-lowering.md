@@ -129,5 +129,6 @@ scalar होते हैं। Shared और global accesses `SHRINK` vector a
 :::
 
 जो रिकॉर्ड तो होता है पर अभी lower नहीं होता, उसके लिए `lower::Error::Unsupported` लौटाया जाता है:
-warp roles, role barriers, `raw` statements, register transposes, और non-CUDA target पर async copies।
+`raw` statements और register transposes। `cp.async` के बिना target पर async copy एक synchronous copy
+होती है, और उसके commit और wait कुछ emit नहीं करते।
 `TK3_DUMP_LIST=1` emit की गई list छापता है (देखें [टेस्टिंग और डिबगिंग](./testing-and-debugging))।

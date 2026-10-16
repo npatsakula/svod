@@ -4,7 +4,6 @@
 //! Scalars are ordinary expressions with operators, interned when consumed.
 
 use std::marker::PhantomData;
-use std::ops::Range;
 use std::rc::Rc;
 
 use svod_dtype::ScalarDType;
@@ -142,7 +141,6 @@ impl Kernel {
                 vars: vec![],
                 grid: [ScalarId(0); 3],
                 warps: 4,
-                roles: vec![],
                 smem: vec![],
                 scalars: vec![],
                 values: vec![],
@@ -178,11 +176,6 @@ impl Kernel {
 
     pub fn warps(&mut self, warps: u32) {
         self.prog.warps = warps;
-    }
-
-    pub fn role(&mut self, name: impl Into<String>, warps: Range<u32>, regs: Option<u32>) -> RoleId {
-        self.prog.roles.push(Role { name: name.into(), warps, regs });
-        RoleId(self.prog.roles.len() as u32 - 1)
     }
 
     pub fn smem<T: Elem>(&mut self, name: impl Into<String>, elems: usize) -> SmemId {
@@ -540,11 +533,6 @@ impl Kernel {
         let carried = (0..N).map(|i| Carried { init: init[i].0, phi: phi[i], next: next[i] }).collect();
         self.push(Stmt::Pipeline(Pipeline { extent, stages, carried, produce, consume }));
         phi.map(Tile::new)
-    }
-
-    pub fn role_block(&mut self, role: RoleId, body: impl FnOnce(&mut Self)) {
-        let body = self.with_block(body);
-        self.push(Stmt::Role { role, body });
     }
 
     /// Every warp runs `body` on its own ([`Stmt::Warps`]): [`warp`](Self::warp)

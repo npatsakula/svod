@@ -177,5 +177,5 @@ c.realize()?;
 | Movement | `stage` (global → shared, `CopyMode::Async` या `Sync`), `load`, `store` |
 | Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches) |
 
-`role_block`, `raw` और `transpose` रिकॉर्ड किए जा सकते हैं पर अभी lower नहीं होते: lowering उनके
+`raw` और `transpose` रिकॉर्ड किए जा सकते हैं पर अभी lower नहीं होते: lowering उनके
 लिए `Error::Unsupported` लौटाती है।

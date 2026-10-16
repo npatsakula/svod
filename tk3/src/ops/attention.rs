@@ -81,7 +81,7 @@ pub struct Attn<'a> {
 
 const OP: &str = "attention";
 
-/// The lanes a shape is measured at, at most.
+/// Measurement: the lanes a shape is measured at, at most.
 const TUNE_BATCH: usize = 64;
 
 /// `softmax(q·kᵀ·scale + bias)·v` over `q [B, T, H, D]` and `k`/`v [B, Tk, H_kv, D]`,
@@ -323,7 +323,7 @@ pub(crate) fn split_ranked(cfgs: &[FaCfg], splits: Option<usize>, tk: usize) -> 
     cfgs.iter().filter(|c| blocks(c) >= splits).map(|&c| FaCfg { splits, ..c }).collect()
 }
 
-/// The softmax forms, each flipped in turn by [`forms`].
+/// Search bound: the softmax forms, each flipped in turn by [`forms`].
 pub(crate) const FORMS: [fn(Forms) -> Forms; 4] = [
     |f| Forms { truncate_p: !f.truncate_p, ..f },
     |f| Forms { skip_rescale: !f.skip_rescale, ..f },

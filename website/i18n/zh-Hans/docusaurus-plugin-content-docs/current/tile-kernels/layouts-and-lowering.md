@@ -75,4 +75,4 @@ pub fn mma_sync_c() -> Layout {
 纯值被列在其输入所需的循环层级。寄存器访问是标量访问。共享与全局访问是 `SHRINK` 向量访问。门控存储位于 `If` 内部。携带值在定义它们的块末尾移入其 `phi`。这些规则在 `lower/emit.rs` 中强制执行，内核作者从不需要处理它们。
 :::
 
-对已记录但尚未降级的内容返回 `lower::Error::Unsupported`：warp 角色、角色屏障、`raw` 语句、寄存器转置，以及非 CUDA 目标上的异步拷贝。`TK3_DUMP_LIST=1` 会打印发射出的列表（参见[测试与调试](./testing-and-debugging)）。
+对已记录但尚未降级的内容返回 `lower::Error::Unsupported`：`raw` 语句和寄存器转置。没有 `cp.async` 的目标上，异步拷贝就是同步拷贝，其 commit 与 wait 不发射任何指令。`TK3_DUMP_LIST=1` 会打印发射出的列表（参见[测试与调试](./testing-and-debugging)）。

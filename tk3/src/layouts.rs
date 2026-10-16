@@ -537,7 +537,7 @@ pub fn infer(mut prog: Program, device: &Device, grid: WarpGrid) -> Result<Laid>
     Ok(Laid { prog, layouts })
 }
 
-/// Up to this many free products every orientation is tried; past it each is
+/// Search bound: up to this many free products every orientation is tried; past it each is
 /// flipped on its own and a flip that lowers the cost is kept.
 const EXHAUSTIVE_UP_TO: usize = 6;
 
@@ -647,7 +647,7 @@ fn set_orient(block: &mut Block, choice: &HashMap<ValId, Orient>) {
                 set_orient(&mut p.produce.body, choice);
                 set_orient(&mut p.consume.body, choice);
             }
-            Stmt::Role { body, .. } | Stmt::Warps { body } => set_orient(body, choice),
+            Stmt::Warps { body } => set_orient(body, choice),
             Stmt::If { then, otherwise, .. } => {
                 set_orient(then, choice);
                 set_orient(otherwise, choice);
@@ -767,7 +767,6 @@ impl<'a> Infer<'a> {
                     self.pass(&p.produce.body)?;
                     self.pass(&p.consume.body)?;
                 }
-                Stmt::Role { body, .. } => self.pass(body)?,
                 Stmt::Warps { body } => {
                     let outer = std::mem::replace(&mut self.scope, Scope::Warp);
                     self.pass(body)?;
@@ -935,7 +934,7 @@ impl Rewrite<'_> {
                     p.produce.body = self.insert(std::mem::take(&mut p.produce.body));
                     p.consume.body = self.insert(std::mem::take(&mut p.consume.body));
                 }
-                Stmt::Role { body, .. } | Stmt::Warps { body } => *body = self.insert(std::mem::take(body)),
+                Stmt::Warps { body } => *body = self.insert(std::mem::take(body)),
                 Stmt::If { then, otherwise, .. } => {
                     *then = self.insert(std::mem::take(then));
                     *otherwise = self.insert(std::mem::take(otherwise));
