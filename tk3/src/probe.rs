@@ -134,54 +134,42 @@ const FOOTPRINTS: [(&str, usize); 8] = [
     ("probe:cached_128m", 128 << 20),
 ];
 
-/// The most a cache in front of DRAM runs ahead of it, per byte: a probe
-/// reading faster than this measured a nearer level (a block re-reading its
-/// own tile from L0, at a hundred times DRAM), not the cache every SM shares
-/// (sm_86: 5.6×; gfx1201's L2, 256 bytes a clock on each of its channels
-/// against GDDR6: 18×).
-const CACHE_OVER_DRAM: f64 = 32.0;
-
 /// The cache in front of DRAM: a streamed byte's cost from the smallest
 /// footprint, which stays in it, and its bytes, the largest footprint still
 /// read nearer that rate than `global_byte`'s (on a log scale), so a second,
 /// slower cache level counts as DRAM. No cache faster than DRAM: its bytes
-/// price fills as DRAM does.
+/// price fills as DRAM does. A cache that cannot be measured prices them so
+/// too, with a warning: the planner keeps its device either way.
 fn cache(target: &Target, compiler: u64, global_byte: f64) -> Result<(f64, f64)> {
     let mut rates = Vec::with_capacity(FOOTPRINTS.len());
     for (footprint, probe) in cache_probes(target)? {
-        rates.push((footprint, measured(target, compiler, probe)?));
+        match measured(target, compiler, probe) {
+            Ok(rate) => rates.push((footprint, rate)),
+            Err(e) => {
+                tracing::warn!("{}: {e}; fills priced as DRAM", target.arch.target_name());
+                return Ok((global_byte, 0.0));
+            }
+        }
     }
     let near = rates[0].1;
-    // A rate no shared cache reaches came from a nearer level: the planner
-    // keeps its device and prices every fill byte as DRAM, which it did
-    // before the cache was measured at all.
-    if near * CACHE_OVER_DRAM < global_byte {
-        tracing::warn!(
-            "{}: {near:.0} fs a byte against {global_byte:.0} from DRAM is a nearer level than the cache; fills priced as DRAM",
-            target.arch.target_name()
-        );
-        return Ok((global_byte, 0.0));
-    }
     let mid = (near * global_byte).sqrt();
     let held = rates.iter().take_while(|(_, r)| *r <= mid).last().map_or(0, |&(f, _)| f);
     Ok((near, held as f64))
 }
 
-/// Tiles between the starting points of two blocks one SM runs: odd, so an
-/// SM's blocks land on distinct tiles of any power-of-two region of at least
-/// its block count.
-const SCATTER: usize = 37;
-
-/// The blocks of a cache probe: every SIMD's wave slots filled with blocks of
-/// [`WARPS`], less one where that count is even, so the count is odd and
-/// coprime with every power-of-two region (64 CUs of two SIMD32s with 16
-/// waves would make 512, and a sweep of 512 blocks over a region of 64 tiles
-/// hands every block its own tile for good).
-pub(crate) fn cached_blocks(sms: u32, target: &Target) -> u32 {
-    let o = target.occupancy;
-    let blocks = sms * o.simds * o.waves / WARPS;
-    blocks - (1 - blocks % 2)
+/// The tiles a cache probe's region of `footprint` bytes holds: the largest
+/// prime count of [`CACHE_TILE`]s that fits, so blocks any stride apart read
+/// distinct tiles whatever order a dispatcher deals them to its SMs (a
+/// power-of-two count against 64 CUs dealt in turn put every block of a CU
+/// on one tile, read from its own L0), and a sweep of any block count the
+/// prime does not divide reaches every tile.
+pub(crate) fn region_tiles(footprint: usize) -> usize {
+    let most = footprint / (CACHE_TILE.elems() * 4);
+    (2..=most).rev().find(|&n| (2..).take_while(|d| d * d <= n).all(|d| n % d != 0)).expect("a footprint of tiles")
 }
+
+/// The tile a cache probe's blocks read: 16 KB of i32.
+const CACHE_TILE: Shape = Shape::new(32, 128);
 
 /// The cache probes of `target` with their footprints, smallest first.
 pub(crate) fn cache_probes(target: &Target) -> Result<Vec<(usize, Probe)>> {
@@ -323,35 +311,29 @@ impl<'a> Probes<'a> {
         })
     }
 
-    /// Four times [`STREAM`] bytes of i32 tiles read by a single wave of
+    /// Four times [`STREAM`] bytes of [`CACHE_TILE`]s read by a single wave of
     /// blocks, every block resident from first to last, so the tiles they
-    /// read an iteration together run on in one sweep, wrapped into the
-    /// first `footprint` bytes: a tile comes round again after a footprint of
-    /// traffic, so a byte comes from wherever a footprint that size stays.
-    /// The block count is odd ([`cached_blocks`]), so the sweep over a
-    /// power-of-two region reaches every tile and never folds onto a block's
-    /// own. Blocks are dealt to SMs in turn, so the blocks one SM runs are a
-    /// multiple of the SM count apart, which a power-of-two region would map
-    /// to one tile (64 CUs, a 64-tile region: every block of a CU reads the
-    /// same tile, from its own L0); each block therefore starts [`SCATTER`]
-    /// tiles further on per SM round. Faster than DRAM, so it reads more
-    /// than [`Self::global_byte`] to stand as clear of its baseline.
+    /// read an iteration together run on in one sweep, wrapped into a region
+    /// of a prime number of tiles within `footprint` ([`region_tiles`]): a
+    /// tile comes round again after a region of traffic, so a byte comes
+    /// from wherever a region that size stays, and no two blocks read one
+    /// tile together. Faster than DRAM, so it reads more than
+    /// [`Self::global_byte`] to stand as clear of its baseline.
     fn cached(&self, op: &'static str, footprint: usize) -> Probe {
-        let tile = Shape::new(32, 128);
-        let blocks = cached_blocks(self.sms, self.target) as usize;
+        let tile = CACHE_TILE;
+        let o = self.target.occupancy;
+        let blocks = (self.sms * o.simds * o.waves / WARPS) as usize;
         let iters = 4 * STREAM / (tile.elems() * 4) / blocks;
-        let region = footprint / (tile.elems() * 4);
-        let sms = self.sms as usize;
+        let region = region_tiles(footprint);
         let units = (blocks * iters * tile.elems() * 4) as f64;
         self.make(op, ScalarDType::Int32, units, true, self.lowering(ROWS, false), |on| {
             let mut k = kernel(op, blocks, WARPS);
-            let src = k.param::<I32>("src", ParamKind::In, footprint / 4);
+            let src = k.param::<I32>("src", ParamKind::In, region * tile.elems());
             let block = k.block(0);
             let zero = k.fill::<I32>(tile, Const::Int(0));
             let sum = if on {
                 sum_loads(&mut k, iters, zero, |k, i| {
-                    let start = block.clone() + block.clone() / sms * SCATTER;
-                    let at = (i * blocks + start) % region * tile.elems();
+                    let at = (i * blocks + block.clone()) % region * tile.elems();
                     k.view(src, at, [tile.cols, 1], tile, [None, None])
                 })
             } else {

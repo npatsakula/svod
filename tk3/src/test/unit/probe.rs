@@ -120,23 +120,31 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
     }
 }
 
-/// A cache probe's sweep reaches every tile of every footprint: its block
-/// count is odd, so coprime with the power-of-two regions, on every target's
-/// occupancy (gfx1201's 64 CUs would otherwise make 512 blocks, each
-/// re-reading its own tile).
+/// A cache probe's region holds a prime number of tiles that nearly fills
+/// its footprint, so on every target's occupancy the sweep of its blocks
+/// reaches every tile and the blocks an SM runs together, dealt any stride
+/// apart (gfx1201's 64 CUs dealt in turn would put the 512 blocks of a
+/// 64-tile region eight to a tile), read distinct ones.
 #[test_case(sm86(), 28; "sm86")]
 #[test_case(gfx1151(), 20; "gfx1151")]
 #[test_case(amd(AmdArch::Gfx1201, 64), 64; "gfx1201")]
 #[test_case(amd(AmdArch::Gfx942, 304), 304; "gfx942")]
 fn a_cache_probe_sweeps_every_tile(target: Target, sms: u32) {
-    let blocks = crate::probe::cached_blocks(sms, &target);
-    assert_eq!(blocks % 2, 1, "{blocks} blocks");
+    let o = target.occupancy;
+    let blocks = (sms * o.simds * o.waves / 4) as usize;
+    let gcd = |mut a: usize, mut b: usize| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
     for (footprint, _) in crate::probe::cache_probes(&target).unwrap() {
-        let region = footprint / (32 * 128 * 4);
-        assert!(
-            region.is_power_of_two() && !(blocks as usize).is_multiple_of(region),
-            "{blocks} blocks over {region} tiles"
-        );
+        let region = crate::probe::region_tiles(footprint);
+        let tiles = footprint / (32 * 128 * 4);
+        assert!(region <= tiles && region * 4 > tiles * 3, "{region} of {tiles} tiles");
+        assert!((2..region).all(|d| !region.is_multiple_of(d)), "{region} tiles: prime");
+        assert_eq!(gcd(blocks, region), 1, "{blocks} blocks over {region} tiles");
+        assert!((1..=16).all(|r| !(sms as usize * r).is_multiple_of(region)), "an SM's blocks share no tile");
     }
 }
 
