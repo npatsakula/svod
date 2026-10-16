@@ -94,9 +94,9 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
 /// kernels do not spill (all spilling: the first that compile; nothing
 /// compiling, no device: the first, untested), [`Self::fastest`] times a
 /// list on a store miss, and [`Self::pipelined`] times the winning tile's
-/// other pipelines. With tuning off (`SVOD_TK3_TUNE=0`) no candidate is
-/// timed and the first admitted one is taken; admission still compiles,
-/// and the device's cost probes still measure once ([`planner`]).
+/// other pipelines. With tuning off (`SVOD_TK3_TUNE=0`) nothing is timed or
+/// stored: the ranked list's [`Self::first_clean`] config runs, and the
+/// device's cost probes still measure once ([`planner`]).
 pub(crate) struct Tuner<'a, C, B> {
     target: &'a Target,
     compiler: u64,
@@ -133,10 +133,24 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         TuneKey::new(op, self.target, self.compiler, self.dtype, self.shape, &candidates)
     }
 
+    /// The first config of `ranked` whose compiled kernel does not spill
+    /// ([`config::first_clean`]; nothing compiling: the first; nothing
+    /// ranked: `None`), compiled in ranked batches: what runs with tuning
+    /// off, and where a pass that starts from one config starts.
+    pub(crate) fn first_clean(&mut self, ranked: &[C]) -> Option<C> {
+        let (bench, build) = (&mut self.bench, &self.build);
+        let at = config::first_clean(ranked, |batch| bench.admit(batch, build));
+        ranked.get(at.unwrap_or(0)).copied()
+    }
+
     /// The configs of `ranked` (best guess first) the tuner chooses among
     /// ([`config::shortlist`]), compiled in ranked batches on a store miss
-    /// and kept in the store under the shortlist's programs.
+    /// and kept in the store under the shortlist's programs; with tuning
+    /// off, the [`Self::first_clean`] alone.
     pub(crate) fn admitted(&mut self, op: &'static str, ranked: &[C]) -> Vec<C> {
+        if !tune::enabled() {
+            return self.first_clean(ranked).into_iter().collect();
+        }
         let key = self.key(op, ranked);
         let (bench, build) = (&mut self.bench, &self.build);
         let programs = || Self::programs(build, &ranked[..ranked.len().min(config::SHORTLIST)]);

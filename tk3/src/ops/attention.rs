@@ -359,7 +359,7 @@ pub(crate) fn descend(
 
 /// The config `tuner` launches from `ranked`, `expand` making a tile pass's
 /// candidates as in [`Tuner::tuned`]: the softmax forms and tiles tuned in
-/// turn by [`descend`], or with tuning off the first admitted, plain.
+/// turn by [`descend`], or with tuning off the first clean, plain.
 pub(crate) fn tune<B: Fn(FaCfg) -> crate::tune::Candidate>(
     tuner: &mut Tuner<'_, FaCfg, B>,
     ranked: &[FaCfg],
@@ -371,7 +371,7 @@ pub(crate) fn tune<B: Fn(FaCfg) -> crate::tune::Candidate>(
     let tuner = std::cell::RefCell::new(tuner);
     descend(
         ranked,
-        |r| tuner.borrow_mut().admitted(OP, r)[0],
+        |r| tuner.borrow_mut().first_clean(r).expect("a ranked attention config"),
         |r| tuner.borrow_mut().tuned(OP, r, &expand),
         |pair| {
             let mut tuner = tuner.borrow_mut();

@@ -2,13 +2,14 @@
 //! configs are admitted ([`Bench`]) and, on a store miss, timed; the winner
 //! is kept in the process memo and on disk.
 //!
-//! The store is one line per [`Entry`] (`kind|key numbers`) in
-//! `$SVOD_TK3_TUNE_DIR` (else `$XDG_CACHE_HOME/svod/tk3_tune`, else
-//! `$HOME/.cache/svod/tk3_tune`), one file per device and crate version. A
-//! line's key carries a digest of the device's compiler ([`compiler`]) and a
-//! fingerprint of the candidate programs, so a toolchain or kernel change
-//! re-measures. An unreadable or unwritable store is a miss, never an error;
-//! a line the store cannot read is dropped at its next write.
+//! The store is one line per [`Entry`] (`kind|key numbers`) under a
+//! `format N` line ([`FORMAT`]) in `$SVOD_TK3_TUNE_DIR` (else
+//! `$XDG_CACHE_HOME/svod/tk3_tune`, else `$HOME/.cache/svod/tk3_tune`), one
+//! file per device and crate version. A line's key carries a digest of the
+//! device's compiler ([`compiler`]) and a fingerprint of the candidate
+//! programs, so a toolchain or kernel change re-measures. An unreadable or
+//! unwritable store is a miss, never an error; a line the store cannot read
+//! is dropped at its next write, and a file of another format whole.
 //! `SVOD_TK3_TUNE=0` or [`set_enabled`] turns candidate timing off: the first
 //! admitted candidate is used, while a device's probes still measure.
 
@@ -31,6 +32,9 @@ use crate::ir::{Param, Program};
 use crate::launch;
 use crate::lower::Lowering;
 
+/// The store's line format, bumped when a line's meaning changes (a file
+/// without a format line is of the first).
+pub(crate) const FORMAT: u32 = 1;
 /// Timed rounds over every candidate after the warm-up.
 const ROUNDS: usize = 4;
 /// Rounds past the first go to the candidates within this factor of the
@@ -198,9 +202,14 @@ impl TuneStore {
         self.root.as_ref().map(|root| root.join(format!("{name}-v{}.txt", env!("CARGO_PKG_VERSION"))))
     }
 
-    /// Every readable `line -> entry` of the key's device file; empty when unreadable.
+    /// Every readable `line -> entry` of the key's device file; empty when
+    /// unreadable or of another format.
     pub fn entries(&self, key: &TuneKey) -> HashMap<String, Entry> {
         let Some(text) = self.path(key).and_then(|p| std::fs::read_to_string(p).ok()) else { return HashMap::new() };
+        let format = text.lines().next().and_then(|l| l.strip_prefix("format ")).map(|n| n.parse::<u32>().ok());
+        if format.is_some_and(|n| n != Some(FORMAT)) {
+            return HashMap::new();
+        }
         text.lines()
             .filter_map(|line| {
                 let mut fields = line.split_whitespace();
@@ -220,7 +229,8 @@ impl TuneStore {
         let mut lines: Vec<String> = entries.iter().map(|(line, entry)| format!("{line} {}", entry.render())).collect();
         lines.sort();
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, lines.join("\n") + "\n").is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let text = format!("format {FORMAT}\n{}\n", lines.join("\n"));
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
     }
