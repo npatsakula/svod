@@ -32,12 +32,19 @@ pub fn shr(a: &Arc<UOp>, bits: u32) -> Arc<UOp> {
 }
 
 /// The memory access form the renderer takes: a scalar INDEX, or for `w > 1`
-/// the coalesced `SHRINK(buffer, offset, w)` of one `w`-wide access.
+/// the coalesced `SHRINK(buffer, offset, w)` of one `w`-wide access. A `buf`
+/// that is itself a crop of a buffer (a warp's region, or a buffer read
+/// under another type) is cropped from that buffer at the summed offset,
+/// under its own type: a program allows a crop of a buffer alone.
 pub fn access(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize) -> Arc<UOp> {
     if w == 1 {
         return UOp::index().buffer(buf.clone()).indices(vec![off.clone()]).call().expect("INDEX");
     }
-    UOp::new(Op::Shrink(ops::Shrink { src: buf.clone(), offsets: off.clone(), sizes: c32(w as i64) }), buf.dtype())
+    let (src, offsets) = match buf.op() {
+        Op::Shrink(ops::Shrink { src, offsets, .. }) => (src.clone(), add(offsets, off)),
+        _ => (buf.clone(), off.clone()),
+    };
+    UOp::new(Op::Shrink(ops::Shrink { src, offsets, sizes: c32(w as i64) }), buf.dtype())
 }
 
 pub fn index(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize) -> Arc<UOp> {

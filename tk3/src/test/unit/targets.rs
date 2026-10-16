@@ -537,9 +537,14 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
 fn shared_tiles_lie_along_their_fragments(target: Target, values: Axis) {
     let families = families(&target);
     let (_, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("attention d128")).unwrap().clone();
-    let tile = lowered_tile(prog, &lowering);
-    let along = |name: &str| tile.smem.iter().find(|a| a.name == name).map(|a| a.along).unwrap();
-    assert_eq!((along("k_s"), along("v_s")), (Axis::Col, values));
+    let rings = |tile: Program| {
+        let along = |name: &str| tile.smem.iter().find(|a| a.name == name).map(|a| a.along).unwrap();
+        (along("k_s"), along("v_s"))
+    };
+    assert_eq!(rings(lowered_tile(prog, &lowering)), (Axis::Col, values));
+    // The key warps' f32 merge views over the rings cast no vote.
+    let (_, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("attention d64 cache key warps")).unwrap();
+    assert_eq!(rings(lowered_tile(prog.clone(), lowering)), (Axis::Col, values));
     let (_, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("gemm #0")).unwrap().clone();
     assert!(lowered_tile(prog, &lowering).smem.iter().all(|a| a.along == Axis::Col));
 }

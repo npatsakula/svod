@@ -154,7 +154,7 @@ c.realize()?;
 |---|---|
 | 声明 | `param`、`var`（按名称绑定的启动变量）、`grid`、`warps`、`smem` |
 | 标量 | `block(axis)`、`warp()`、`load_scalar(param, index)`、`Sc` 运算符以及 `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
-| 视图 | `view`、`at`、`smem_view`、`smem_slot` |
+| 视图 | `view`、`at`、`smem_view`、`smem_view_as`、`smem_slot` |
 | Tile 操作 | `fill`、`zeros`、`splat`、`coord`、`unary`、`binary`（行向量或列向量会广播）、`compare`、`cast`、`where_`、`reduce`、`mma` |
 | 数据移动 | `stage`（全局 → 共享，`CopyMode::Async` 或 `Sync`）、`load`、`store` |
 | 控制 | `loop_`（携带寄存器 tile）、`pipeline`、`if_`、`select_if`（产生 tile 的分支） |

@@ -624,7 +624,8 @@ impl FaCfg {
         atom.m as usize == WARP_ROWS
             && bq.is_multiple_of(WARP_ROWS)
             && bq > 0
-            && (self.key_warps == 1 || bq == WARP_ROWS)
+            // A key warp's merged output reuses its 16-bit key ring as f32.
+            && (self.key_warps == 1 || bq == WARP_ROWS && self.stages * bkv >= 2 * WARP_ROWS)
             && [bkv, d].iter().all(|&x| x.is_multiple_of(atom.n as usize) && x.is_multiple_of(atom.k as usize))
             && (bkv * d / 8).is_multiple_of(threads)
             && target.stages(self.stages) == self.stages

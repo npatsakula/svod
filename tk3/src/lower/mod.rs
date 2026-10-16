@@ -94,6 +94,11 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
             staged[a] &= *mode == CopyMode::Staged;
         }
         let (Some(a), Tier::Reg) = (alloc(prog, *src), prog.value(*dst).tier()) else { continue };
+        // A view under another type is scratch over a dead region: it takes
+        // the allocation's axis as it finds it.
+        if prog.value(*dst).dtype != prog.smem[a].dtype {
+            continue;
+        }
         let l = layouts[dst.index()].as_ref().expect("a laid register tile");
         let width = 16 / prog.value(*dst).dtype.bytes() as u32;
         let widest = |along| l.runs(lanes, width, along).iter().map(|&(_, w)| w).max().unwrap_or(1);

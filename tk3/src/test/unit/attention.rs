@@ -723,6 +723,31 @@ fn attention_throughput_probe() {
     }
 }
 
+/// What the backend allocates for a decoder step's key-warp configs on the
+/// device: registers, shared memory (the rings alone: the merged states
+/// reuse them) and any spill, printed (run with `--ignored --nocapture`);
+/// never asserts.
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn key_warp_resources_probe() {
+    let Some(planner) = super::device_planner() else {
+        eprintln!("skipped: no GPU with tk3 tables");
+        return;
+    };
+    let pool = crate::tune::ScratchPool::default();
+    for (key_warps, bkv) in [(1, 16), (2, 16), (4, 16), (1, 32), (2, 32), (4, 32)] {
+        let cfg = FaCfg { key_warps, ..FaCfg::new(16, bkv, 2) };
+        let spec = probe_spec(5, 20, 1, 1500, 64, AttnMask::default());
+        let spec = AttnSpec { cfg, ..spec };
+        let lowering = cfg.lowering(&planner.device);
+        let Some((plan, _)) = crate::tune::scratch_plan(flash_attention(&spec), &lowering, &pool) else {
+            eprintln!("{}: does not compile", label(&cfg));
+            continue;
+        };
+        eprintln!("{} ({} B static smem): {:?}", label(&cfg), cfg.smem_bytes(64), crate::tune::resources(&plan));
+    }
+}
+
 /// The tuner's d = 128 attention kernel on gfx1151 compiles without
 /// spilling: admission drops what spills while a clean config remains.
 #[test]
