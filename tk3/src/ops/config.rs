@@ -306,8 +306,11 @@ pub(crate) const SHORTLIST: usize = 64;
 /// Search bound: the leading tiles of a timing whose other pipelines are
 /// timed after it: a tile enters the shortlist as its first clean pipeline,
 /// and on gfx1201 the 4096³ GEMM's measured best entered as a pipeline 8 %
-/// behind its best and lost the shortlist to another tile.
-pub(crate) const TWIN_TILES: usize = 3;
+/// behind its best, third in the timed order, and lost the shortlist to
+/// another tile. Over three cards' exhaustive sweeps four is the knee: the
+/// best tile sits within the first four on 11 of 17 shapes and a deeper
+/// stage reaches no more until eight, at twice the compiles.
+pub(crate) const TWIN_TILES: usize = 4;
 /// Model: blocks per SM a convolution's grid should reach before its
 /// reduction is left whole: its grids are a few hundred blocks.
 const CONV_BLOCKS_PER_SM: usize = 2;

@@ -20,7 +20,7 @@ judges and a spilling kernel still beats the graph. A list of one config takes t
 no op falls to the graph because of spills. The admitted configs, with their variants (key splits
 for attention, reduction splits for a starved convolution), are the candidates the tune store
 measures the first time a device meets a shape, and it keeps their timed order; the other
-pipelines of the three leading tiles (`config::TWIN_TILES`) are then compiled and timed against
+pipelines of the four leading tiles (`config::TWIN_TILES`) are then compiled and timed against
 the winner, spilling or not (among a tile's pipelines the time alone judges, an unrolled ring
 that spills a little may be the fastest, and a tile's place in the shortlist is its first
 pipeline's), and the fastest is the choice. Attention
