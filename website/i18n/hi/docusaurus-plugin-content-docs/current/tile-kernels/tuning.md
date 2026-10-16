@@ -20,7 +20,9 @@ configs बचे हों: जब हर compile होने वाला con
 जाती है, और कोई op spills की वजह से ग्राफ़ पर नहीं गिरता। Admit हुए configs, अपने variants के साथ (attention
 के लिए key splits, भूखी convolution के लिए reduction splits), वे candidates हैं जिन्हें tune store तब मापता है
 जब कोई device पहली बार किसी shape से मिलता है, और वह विजेता को रखता है; फिर विजेता के tile की बाक़ी
-pipelines compile होकर उसके मुक़ाबले मापी जाती हैं, और सबसे तेज़ चुनाव बनती है। Attention अपने softmax forms
+pipelines compile होकर उसके मुक़ाबले मापी जाती हैं, spill करें या न करें (एक tile की pipelines के बीच
+अकेले समय ही फ़ैसला करता है, और थोड़ा spill करती unrolled ring अक्सर सबसे तेज़ होती है), और सबसे तेज़
+चुनाव बनती है। Attention अपने softmax forms
 और अपने tiles बारी-बारी tune करता है: ranking के पहले clean config पर forms, उन forms के साथ tiles, फिर
 winner पर दोबारा forms (देखें [कर्नेल लाइब्रेरी](./kernel-library))। Admit हुई list store में चुनाव के साथ रखी
 जाती है, इसलिए warm store विजेता के सिवा कुछ compile नहीं करता। जब कुछ भी compile नहीं होता (compile करने को
