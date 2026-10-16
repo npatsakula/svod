@@ -430,18 +430,28 @@ fn workers_see_the_callers_device() {
 
 /// The timed rounds: every candidate runs once, then only those within
 /// [`CONTENDER`](tune::CONTENDER) of the first round's best run the rest
-/// ([`ROUNDS`] in all); a candidate that fails (a run of 0 here, its list
-/// run out) is excluded for good, whichever round it fails in; nothing
-/// running leaves every candidate `None`. A candidate's list repeats its
-/// last run.
-#[test_case(&[&[100], &[150], &[110], &[500]], &[4, 1, 4, 1], &[Some(100), Some(150), Some(110), Some(500)]; "losers run once")]
-#[test_case(&[&[100, 90, 95, 92], &[118, 121]], &[4, 2], &[Some(90), Some(118)]; "past the bound a contender stops, its minimum standing")]
-#[test_case(&[&[100], &[]], &[4, 1], &[Some(100), None]; "a failure in the first round")]
-#[test_case(&[&[100], &[105, 104, 0]], &[4, 3], &[Some(100), None]; "a failure in a later round")]
-#[test_case(&[&[], &[]], &[1, 1], &[None, None]; "nothing runs")]
-#[test_case(&[], &[], &[]; "no candidates")]
-fn contenders_run_the_later_rounds(runs: &[&[u64]], want_calls: &[usize], want: &[Option<u64>]) {
+/// ([`ROUNDS`] in all), or every candidate when there are fewer than
+/// [`CUT_FROM`](tune::CUT_FROM) (`losers` more at 1000 fill a field out);
+/// then, where more than two contenders ran them, the two leaders run
+/// [`ROUNDS`] more.
+/// A candidate that fails (a run of 0 here, its list run out) is excluded
+/// for good, whichever round it fails in; nothing running leaves every
+/// candidate `None`. A candidate's list repeats its last run.
+#[test_case(&[&[100], &[150], &[110], &[500]], 12, &[4, 1, 4, 1], &[Some(100), Some(150), Some(110), Some(500)]; "in a field losers run once and two contenders are the leaders")]
+#[test_case(&[&[100], &[115], &[110], &[500]], 12, &[8, 4, 8, 1], &[Some(100), Some(115), Some(110), Some(500)]; "in a field the leaders of three contenders run again")]
+#[test_case(&[&[100], &[150], &[110], &[500]], 0, &[8, 4, 8, 4], &[Some(100), Some(150), Some(110), Some(500)]; "a short list runs every round")]
+#[test_case(&[&[100, 90, 95, 92], &[118, 121]], 14, &[4, 2], &[Some(90), Some(118)]; "past the bound a contender stops, its minimum standing")]
+#[test_case(&[&[100; 4], &[101; 4], &[150]], 0, &[8, 8, 4], &[Some(100), Some(101), Some(150)]; "the two leaders run again")]
+#[test_case(&[&[100, 100, 100, 100, 95], &[101, 101, 101, 101, 94], &[150]], 0, &[8, 8, 4], &[Some(95), Some(94), Some(150)]; "the leaders' rounds decide")]
+#[test_case(&[&[100, 100, 100, 100, 95], &[101, 101, 101, 101, 94]], 0, &[4, 4], &[Some(100), Some(101)]; "a pair has run together already")]
+#[test_case(&[&[100], &[]], 0, &[4, 1], &[Some(100), None]; "a failure in the first round")]
+#[test_case(&[&[100], &[105, 104, 0]], 0, &[4, 3], &[Some(100), None]; "a failure in a later round")]
+#[test_case(&[&[100, 100, 100, 100, 0], &[101], &[150]], 0, &[5, 8, 4], &[None, Some(101), Some(150)]; "a failure in the leaders' rounds")]
+#[test_case(&[&[], &[]], 0, &[1, 1], &[None, None]; "nothing runs")]
+#[test_case(&[], 0, &[], &[]; "no candidates")]
+fn contenders_run_the_later_rounds(runs: &[&[u64]], losers: usize, want_calls: &[usize], want: &[Option<u64>]) {
     use std::cell::RefCell;
+    let runs: Vec<&[u64]> = runs.iter().copied().chain(std::iter::repeat_n(&[1000][..], losers)).collect();
     let calls = RefCell::new(vec![0usize; runs.len()]);
     let got = tune::rounds(runs.len(), |i| {
         let mut calls = calls.borrow_mut();
@@ -449,8 +459,12 @@ fn contenders_run_the_later_rounds(runs: &[&[u64]], want_calls: &[usize], want: 
         calls[i] += 1;
         run.filter(|&t| t > 0).map(Duration::from_nanos)
     });
-    assert_eq!(got.iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect::<Vec<_>>(), want);
-    assert_eq!(*calls.borrow(), want_calls);
+    let got: Vec<Option<u64>> = got.iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect();
+    assert_eq!(got[..want.len()], *want);
+    assert!(got[want.len()..].iter().all(|t| *t == Some(1000)), "{got:?}");
+    let calls = calls.borrow();
+    assert_eq!(calls[..want_calls.len()], *want_calls);
+    assert!(calls[want_calls.len()..].iter().all(|&c| c == 1), "{calls:?}");
 }
 
 /// A candidate's plan is prepared for its measurement alone: two scratch

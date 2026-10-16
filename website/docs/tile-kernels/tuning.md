@@ -44,7 +44,7 @@ variable bound to its maximum, and timed:
 | Step | Setting |
 |---|---|
 | Warm-up | Back-to-back runs until the clock plateaus (an RTX 3060 idles at 210 MHz) |
-| Rounds | One round of every candidate, then 3 more of the contenders: those within 1.2× of the first round's best |
+| Rounds | One round of every candidate, then 3 more of the contenders: those within 1.2× of the first round's best (every candidate, under 16 of them); then 4 more of the two leaders, where more than two contenders ran |
 | Per round | 5 ms of device time in back-to-back sustain runs (sized by the candidate's last run), then 5 profiled runs, keeping each candidate's minimum |
 | Time of a run | The sum of its kernels' GPU timestamps |
 

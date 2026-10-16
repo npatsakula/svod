@@ -165,8 +165,10 @@ fn timed(built: &mut [Built], per: f64) -> Result<(u64, u64, u64), String> {
 }
 
 /// Measurement: the footprints the cache probes read [`STREAM`] bytes from,
-/// smallest first: from the size of a small cache to past every device's L2.
-const FOOTPRINTS: [(&str, usize); 8] = [
+/// smallest first: from the size of a small cache to half the stream, past
+/// every device's cache (MI300X's Infinity Cache is 256 MB), so a probe
+/// still reads each byte of a footprint twice.
+const FOOTPRINTS: [(&str, usize); 9] = [
     ("probe:cached_1m", 1 << 20),
     ("probe:cached_2m", 2 << 20),
     ("probe:cached_4m", 4 << 20),
@@ -175,22 +177,45 @@ const FOOTPRINTS: [(&str, usize); 8] = [
     ("probe:cached_32m", 32 << 20),
     ("probe:cached_64m", 64 << 20),
     ("probe:cached_128m", 128 << 20),
+    ("probe:cached_256m", 256 << 20),
 ];
 
-/// The cache in front of DRAM, as [`held`] reads the ladder of footprints;
-/// `None`, with a warning, when a footprint cannot be measured.
+/// The cache in front of DRAM, as [`climbed`] reads the ladder of
+/// footprints; `None`, with a warning, when a footprint cannot be measured.
 fn cache(target: &Target, compiler: u64, global_byte: f64) -> Result<Option<(f64, f64)>> {
-    let mut rates = Vec::with_capacity(FOOTPRINTS.len());
-    for (footprint, probe) in cache_probes(target)? {
-        match measured(target, compiler, probe) {
-            Ok(rate) => rates.push((footprint, rate)),
-            Err(e) => {
-                tracing::warn!("{}: {e}; the cache is unmeasured", target.arch.target_name());
-                return Ok(None);
-            }
+    let ladder = climbed(cache_probes(target)?, global_byte, |probe| measured(target, compiler, probe));
+    Ok(ladder.map_err(|e| tracing::warn!("{}: {e}; the cache is unmeasured", target.arch.target_name())).ok())
+}
+
+/// The ladder of `probes` (smallest footprint first) measured until it has
+/// [`settled`] past the cache, read by [`held`]: a small cache's ladder
+/// stops after a few footprints, and no run streams a large one for
+/// nothing.
+pub(crate) fn climbed(
+    probes: Vec<(usize, Probe)>,
+    global_byte: f64,
+    mut measure: impl FnMut(Probe) -> Result<f64>,
+) -> Result<(f64, f64)> {
+    let mut rates = Vec::with_capacity(probes.len());
+    for (footprint, probe) in probes {
+        if settled(&rates, global_byte) {
+            break;
         }
+        rates.push((footprint, measure(probe)?));
     }
-    Ok(Some(held(&rates, global_byte)))
+    Ok(held(&rates, global_byte))
+}
+
+/// Whether the ladder's last two footprints both read nearer DRAM's rate
+/// than the cache's: one footprint past the knee could be noise or a
+/// second cache level; two are past the cache ([`held`] counts neither).
+pub(crate) fn settled(rates: &[(usize, f64)], global_byte: f64) -> bool {
+    rates.len() >= 2 && rates[rates.len() - 2..].iter().all(|(_, r)| *r > mid(rates, global_byte))
+}
+
+/// The rate between the cache's and DRAM's on a log scale.
+fn mid(rates: &[(usize, f64)], global_byte: f64) -> f64 {
+    (rates[0].1.min(global_byte) * global_byte).sqrt()
 }
 
 /// What a ladder of `(footprint, ns a byte)` says of the cache in front of
@@ -200,10 +225,9 @@ fn cache(target: &Target, compiler: u64, global_byte: f64) -> Result<Option<(f64
 /// as DRAM. No cache faster than DRAM: a byte costs DRAM's at most, and no
 /// footprint is held.
 pub(crate) fn held(rates: &[(usize, f64)], global_byte: f64) -> (f64, f64) {
-    let near = rates[0].1.min(global_byte);
-    let mid = (near * global_byte).sqrt();
+    let mid = mid(rates, global_byte);
     let held = rates.iter().take_while(|(_, r)| *r <= mid).last().map_or(0, |&(f, _)| f);
-    (near, held as f64)
+    (rates[0].1.min(global_byte), held as f64)
 }
 
 /// The tiles a cache probe's region of `footprint` bytes holds: the largest
