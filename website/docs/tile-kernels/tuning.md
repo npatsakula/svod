@@ -100,7 +100,10 @@ by `probe::costs` the first time a process plans for it: each field is a pair of
 probe doing all its baseline does plus a known amount of the primitive. The values go in the
 same store file as `probe:<field>` lines (index 0, femtoseconds in the `ns` slot), so later
 processes read them back. The planner is made once per device; a second caller waits for the
-probes. A device without an SM count cannot scale a probe and has no planner. Host tests
+probes. A probe that fails leaves its field at zero, is warned about, and is named in
+`Planner::unmeasured`, which the device gate holds empty: the planner ranks with what it has rather
+than leaving the device to the graph. Only a device without an SM count, which no probe can scale
+to, has no planner. Host tests
 declare costs instead: `test::unit::costs()` and `gfx1151_costs()`, the latter pasted from a
 gfx1151 store.
 

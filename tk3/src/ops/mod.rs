@@ -77,11 +77,12 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
         .entry(device.clone())
         .or_insert_with(|| {
             let target = Target::for_device(device).filter(config::has_kernels)?;
-            // A device whose primitives cannot be measured has no planner.
-            let costs = crate::probe::costs(&target)
+            // A device no probe can scale to (no SM count) has no planner; a
+            // probe that fails leaves its field at zero and the planner ranks on.
+            let measured = crate::probe::costs(&target)
                 .inspect_err(|e| tracing::warn!("{}: no tk3 planner: {e}", target.arch.target_name()))
                 .ok()?;
-            Some(Arc::new(Planner::new(Device { target, costs })))
+            Some(Arc::new(Planner::measured(target, measured)))
         })
         .clone()
 }

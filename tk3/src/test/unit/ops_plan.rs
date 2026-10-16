@@ -511,6 +511,21 @@ fn variants_keep_their_variant_across_twins() {
     assert_eq!(norm.twins(&[NormCfg { br: 4 }, norm, NormCfg { br: 16 }]), vec![norm]);
 }
 
+/// A planner whose device left a field unmeasured (zero) ranks on: the
+/// rankings stay non-empty with finite, positive costs, and the planner
+/// names the field.
+#[test]
+fn a_planner_over_a_zero_field_still_ranks() {
+    let measured = crate::probe::Measured { costs: Costs { step: 0.0, ..costs() }, unmeasured: vec!["step"] };
+    let planner = Planner::measured(sm86(), measured);
+    assert_eq!(planner.unmeasured, ["step"]);
+    let p = config::Problem { batches: 1, m: 704, n: 1536, k: 512, halves: 1 };
+    let ranked = p.ranked(&planner);
+    assert!(!ranked.is_empty());
+    assert!(ranked.iter().all(|c| p.admit(&planner, c).is_some_and(|(cost, _)| cost.is_finite() && cost > 0.0)));
+    assert!(!planner.attention_ranked(8, 512, 512, 128, true).is_empty());
+}
+
 /// At zero costs every config ties: the ranking is degenerate (fewest
 /// registers first) but finite, and still lists what lowers.
 #[test]
