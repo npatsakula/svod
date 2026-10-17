@@ -15,6 +15,7 @@
 
 pub mod ops;
 pub mod smem;
+pub mod wgmma;
 pub mod wmma;
 
 pub use ops::{ShflMode, globaltimer, render_uop, shfl, shfl_bfly, shfl_down, shfl_idx, shfl_up};
@@ -37,12 +38,23 @@ pub fn ptx_isa(arch: svod_dtype::CudaArch) -> u32 {
     }
 }
 
+/// The `-march` of `arch`: Hopper takes its architecture-specific feature
+/// set (`sm_90a`), which the warpgroup products of [`wgmma`] need and which
+/// runs on sm_90 alone, where every kernel is JIT-compiled for the device
+/// at hand anyway.
+pub fn march(arch: svod_dtype::CudaArch) -> String {
+    match (arch.major, arch.minor) {
+        (9, 0) => "sm_90a".to_string(),
+        _ => arch.to_string(),
+    }
+}
+
 /// Clang flags compiling rendered IR on stdin to PTX text on stdout for
 /// `arch`. `-Wno-override-module` silences the note about the module's own
 /// `target triple` (the renderer sets it to match).
 pub fn clang_flags(arch: svod_dtype::CudaArch) -> Vec<String> {
     let mut flags: Vec<String> = ["-x", "ir", "-S", "-O3", "--target=nvptx64-nvidia-cuda"].map(str::to_string).into();
-    flags.push(format!("-march={arch}"));
+    flags.push(format!("-march={}", march(arch)));
     flags.push(format!("--cuda-feature=+ptx{}", ptx_isa(arch)));
     flags.extend(["-Wno-override-module", "-", "-o", "-"].map(str::to_string));
     flags
