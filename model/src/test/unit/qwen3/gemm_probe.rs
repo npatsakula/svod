@@ -10,7 +10,7 @@ use svod_tensor::Tensor;
 use svod_tk3::atoms::{Device, Target};
 use svod_tk3::build::BF16;
 use svod_tk3::kernels::Batch;
-use svod_tk3::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk3::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
 use svod_tk3::launch::graph_launch;
 use svod_tk3::ops::{self, Act, Linear};
 
@@ -28,7 +28,7 @@ fn flat(n: usize, seed: &mut u64) -> Tensor {
 }
 
 const fn cfg(tile: [usize; 3], warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { tile, stages: 2, warps, group_m: 8, unroll }
+    GemmCfg { tile, stages: 2, warps, group_m: 8, unroll, core: Core::Warp }
 }
 
 #[test]
