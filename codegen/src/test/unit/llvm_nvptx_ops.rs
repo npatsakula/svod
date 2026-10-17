@@ -192,7 +192,7 @@ fn nvptx_define_local_emits_addrspace3_module_global() {
     let local = UOp::buffer(42, 16, DType::Float32, AddrSpace::Local, None);
     let result = render_nvptx_linearized(&UOp::sink(vec![local]), SM86, "nvptx_shared");
     for needle in [
-        "@local42 = internal unnamed_addr addrspace(3) global [16 x float] undef, align 16",
+        &format!("@local42 = internal unnamed_addr addrspace(3) global [16 x float] undef, align {SHARED_ALIGN}"),
         "addrspacecast ptr addrspace(3) @local42 to ptr",
     ] {
         assert!(result.code.contains(needle), "missing {needle}:\n{}", result.code);
@@ -215,6 +215,65 @@ fn nvptx_shared_memory_traffic_selects_shared_instructions() {
     if let Some(ptx) = assert_ptx_compiles(&result.code, SM86) {
         for needle in ["st.shared", "ld.shared", "bar.sync"] {
             assert!(ptx.contains(needle), "missing {needle}:\n{ptx}");
+        }
+    }
+}
+
+/// LOCAL buffers stay static `.shared` globals up to the 48 KB ptxas cap;
+/// above it they are carved from one `extern` dynamic array at
+/// [`SHARED_ALIGN`]-aligned offsets, and the module exports the total for the
+/// loader.
+#[test_case::test_case(&[(DType::Float32, 8192), (DType::Float32, 4096)], None; "exactly 48 KB stays static")]
+#[test_case::test_case(&[(DType::Float32, 12289), (DType::Float16, 8192)], Some(&[0, 50176][..]); "unaligned first buffer pads to the alignment")]
+#[test_case::test_case(&[(DType::Float16, 3), (DType::Float32, 16384), (DType::Int8, 1)], Some(&[0, 1024, 66560][..]); "three buffers")]
+fn nvptx_locals_above_static_cap_share_one_dynamic_array(buffers: &[(DType, usize)], offsets: Option<&[usize]>) {
+    let lane = UOp::special(UOp::native_const(32i32), "lidx0".to_string());
+    let stores = buffers
+        .iter()
+        .enumerate()
+        .map(|(slot, (dtype, size))| {
+            let local = UOp::buffer(slot, *size, dtype.clone(), AddrSpace::Local, None);
+            let at = UOp::index().buffer(local).indices(vec![UOp::native_const(0i32)]).call().unwrap();
+            let value = UOp::load().index(indexed(buffers.len() + slot, dtype.clone(), lane.clone())).call();
+            at.store(value)
+        })
+        .collect();
+    let result = render_nvptx_linearized(&UOp::sink(stores), SM86, "nvptx_dynamic_shared");
+    let symbol = svod_device::cuda::DYNAMIC_SHARED_BYTES_SYMBOL;
+    let Some(offsets) = offsets else {
+        assert!(!result.code.contains("@svod_dynamic_shared") && !result.code.contains(symbol), "{}", result.code);
+        assert!(result.code.contains("@local0 = internal unnamed_addr addrspace(3) global"), "{}", result.code);
+        assert_ptx_compiles(&result.code, SM86);
+        return;
+    };
+    let (dtype, size) = buffers.last().unwrap();
+    let total = (offsets.last().unwrap() + dtype.bytes() * size).next_multiple_of(SHARED_ALIGN);
+    assert!(
+        result
+            .code
+            .contains(&format!("@svod_dynamic_shared = external addrspace(3) global [0 x i8], align {SHARED_ALIGN}")),
+        "{}",
+        result.code
+    );
+    assert!(
+        result.code.contains(&format!("@{symbol} = addrspace(4) constant i32 {total}, align 4")),
+        "{}",
+        result.code
+    );
+    assert!(!result.code.contains("@local"), "no static LOCAL global may remain:\n{}", result.code);
+    for (slot, offset) in offsets.iter().enumerate() {
+        let needle = format!(
+            "%local{slot}.shared = getelementptr inbounds i8, ptr addrspace(3) @svod_dynamic_shared, i64 {offset}"
+        );
+        assert!(result.code.contains(&needle), "missing {needle}:\n{}", result.code);
+    }
+    if let Some(ptx) = assert_ptx_compiles(&result.code, SM86) {
+        for needle in [
+            format!(".extern .shared .align {SHARED_ALIGN} .b8 svod_dynamic_shared[];"),
+            format!(".visible .const .align 4 .u32 {symbol} = {total};"),
+            "st.shared".to_string(),
+        ] {
+            assert!(ptx.contains(&needle), "missing {needle}:\n{ptx}");
         }
     }
 }
@@ -536,7 +595,7 @@ fn clang_flags_pin_the_ptx_isa_per_arch(arch: CudaArch, feature: &str) {
     assert_eq!(&flags[..2], ["-x", "ir"]);
     assert!(flags.contains(&"-S".to_string()));
     assert!(flags.contains(&"--target=nvptx64-nvidia-cuda".to_string()));
-    assert!(flags.contains(&format!("-march={arch}")));
+    assert!(flags.contains(&format!("-march={}", crate::llvm::nvptx::march(arch))));
     assert!(flags.contains(&format!("--cuda-feature={feature}")));
     assert_eq!(&flags[flags.len() - 3..], ["-", "-o", "-"]);
 }

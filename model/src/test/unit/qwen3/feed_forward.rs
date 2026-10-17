@@ -1,15 +1,12 @@
 //! Tests for the Qwen3 SwiGLU feed-forward ([`crate::qwen3::Qwen3MLP`]): the
-//! load-time gate/up row interleave the fused GEMM epilogue reads, its inverse
-//! on the published state dict, and the forward's agreement with the eager
-//! `silu(gate)·up` whichever layout the weight is in.
+//! load-time gate-over-up stacking the gated GEMM reads, the published state
+//! dict, and the forward's agreement with the eager `silu(gate)·up`.
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Module, StateDict};
 
 use crate::qwen3::Qwen3MLP;
-use crate::qwen3::pair_rows;
-use test_case::test_case;
 
 const H: usize = 16;
 const I: usize = 32;
@@ -41,27 +38,18 @@ fn rows(t: &Tensor) -> Vec<Vec<f32>> {
     t.as_vec::<f32>().expect("read").chunks(cols).map(<[f32]>::to_vec).collect()
 }
 
-/// The fused weight is laid out in alternating `pair`-row gate and up blocks,
-/// which is what puts a gate column beside its up column inside one wave's
-/// accumulator, at whatever width the device's GEMM tiles read.
-#[test_case(Some(16); "pair 16")]
-fn pair_rows_interleaves_the_gate_up_blocks(pair: Option<usize>) {
-    let (gate, up) = (marked(I, H, 100.0), marked(I, H, 200.0));
-    let fused = pair_rows(&gate, &up, pair).expect("pair rows");
-    assert_eq!(fused.dims().expect("dims"), [2 * I, H]);
-    let (got, g, u) = (rows(&fused), rows(&gate), rows(&up));
-    let pair = pair.unwrap_or(I);
-    for (r, row) in got.iter().enumerate() {
-        let (block, within) = (r / pair, r % pair);
-        let want = if block % 2 == 0 { &g[(block / 2) * pair + within] } else { &u[(block / 2) * pair + within] };
-        assert_eq!(row, want, "row {r} of the fused weight");
-    }
+/// The fused weight is gate over up, the op layer's gated order.
+#[test]
+fn load_state_dict_stacks_gate_over_up() {
+    let (gate, up, down) = (marked(I, H, 100.0), marked(I, H, 200.0), marked(H, I, 300.0));
+    let mlp = loaded(&gate, &up, &down);
+    assert_eq!(rows(&mlp.gate_up_weight), [rows(&gate), rows(&up)].concat());
 }
 
-/// The published state dict is the un-interleaved checkpoint layout, so a
-/// load/write round trip is the identity — the row order is an internal detail.
+/// The published state dict is the checkpoint's two-key layout, so a
+/// load/write round trip is the identity.
 #[test]
-fn write_state_un_interleaves_the_rows() {
+fn write_state_splits_the_stacked_rows() {
     let (gate, up, down) = (marked(I, H, 100.0), marked(I, H, 200.0), marked(H, I, 300.0));
     let sd = loaded(&gate, &up, &down).state_dict("");
     assert_eq!(rows(&sd["gate_proj.weight"]), rows(&gate));
@@ -69,9 +57,19 @@ fn write_state_un_interleaves_the_rows() {
     assert_eq!(rows(&sd["down_proj.weight"]), rows(&down));
 }
 
-/// Whatever the row order, the forward is `down(silu(x·gateᵀ)·(x·upᵀ))`: the
-/// interleave is undone by the epilogue's column mapping on a device that runs
-/// it, and by the split here on one that does not.
+/// A never-loaded module keeps the plainly stacked rows, and still publishes
+/// the same two keys.
+#[test]
+fn an_unloaded_module_publishes_the_stacked_halves() {
+    let mlp = Qwen3MLP::empty(H, I, DType::Float32);
+    let sd = mlp.state_dict("");
+    let all = rows(&mlp.gate_up_weight);
+    assert_eq!(rows(&sd["gate_proj.weight"]), all[..I].to_vec());
+    assert_eq!(rows(&sd["up_proj.weight"]), all[I..].to_vec());
+}
+
+/// The forward is `down(silu(x·gateᵀ)·(x·upᵀ))`, from the gated epilogue on a
+/// device that runs it and from the graph on one that does not.
 #[test]
 fn forward_matches_the_eager_swiglu() {
     let (gate, up, down) = (marked(I, H, 0.01), marked(I, H, 0.02), marked(H, I, 0.03));

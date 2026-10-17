@@ -419,3 +419,33 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    /// Collapsing a label sequence run by run, the last label carried, emits
+    /// what the whole sequence's timestamped decode does.
+    #[test]
+    fn collapse_carries_the_label_across_runs(
+        labels in prop::collection::vec(0usize..4, 1..40),
+        cuts in prop::collection::vec(0usize..40, 0..4),
+    ) {
+        let decoder = GreedyDecoder::new(abc_vocab());
+        let total = decoder.total_vocab();
+        let logits = concat(&labels.iter().map(|&l| frame_for(l, total)).collect::<Vec<_>>());
+        let (text, frames) = decoder.decode_with_timestamps(&logits, labels.len(), labels.len());
+        let mut cuts: Vec<usize> = cuts.into_iter().map(|c| c.min(labels.len())).collect();
+        cuts.push(labels.len());
+        cuts.sort_unstable();
+        let (mut prev, mut start, mut got) = (decoder.blank_id(), 0, Vec::new());
+        for cut in cuts {
+            let run = &labels[start..cut];
+            got.extend(decoder.collapse(run, &mut prev).into_iter().map(|(token, at)| (token, start + at)));
+            start = cut;
+        }
+        let want: Vec<(usize, usize)> = text
+            .chars()
+            .zip(&frames)
+            .map(|(c, &f)| (abc_vocab().iter().position(|v| v == &c.to_string()).unwrap(), f))
+            .collect();
+        prop_assert_eq!(got, want);
+    }
+}

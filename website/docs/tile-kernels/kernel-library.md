@@ -1,232 +1,245 @@
 ---
-sidebar_label: The Kernel Library
+sidebar_label: Kernel Library
 ---
 
-# The Kernel Library
+# Kernel Library
 
-The USE face: every kernel `svod-tk` ships, callable with plain tensors and no knowledge of
-tiles. Each returns a lazy `Tensor` (an `Op::Call` node) that composes into a model graph and
-realizes through the normal `prepare()` path, and each follows the three-way contract from
-[Authoring into the IR](./lowering):
+Every kernel in `svod_tk3::kernels` is a function `fn k<T: Elem>(spec: &Spec) -> Program`,
+generic over the 16-bit element type (`BF16` or `F16`). Each spec has a `batch: Batch`:
+`Batch::Static(n)` launches `n` batches, and `Batch::Var { name, min, max }` launches the live
+count of a runtime variable bound by name, with buffers sized for `max`. Each config type has a
+`lowering(&device)` (an `atoms::Device`: the target and its costs). Models reach these kernels through the [op layer](./op-layer), which picks
+the config.
 
-| Result | Meaning |
-|---|---|
-| `Ok(Some(out))` | the kernel ran |
-| `Ok(None)` | it does not apply: the device is outside the kernel's `ArchSet`, its LLVM backend is missing, or the shape does not tile — fall back deliberately |
-| `Err(LaunchError)` | the request is malformed (dtype, rank, a symbolic dim, a divisibility rule) — a caller bug |
-
-Operands are bf16 or f16 unless noted; accumulation is f32.
-
----
-
-## Targets
-
-Each kernel declares its own `ArchSet` (`tk/src/target.rs`): an explicit AMD list plus an
-open-ended CUDA capability floor and an Apple GPU-family floor.
-
-| Kernel | gfx942 (CDNA3) | gfx1151 (RDNA3.5) | gfx1200 / gfx1201 (RDNA4) | CUDA sm_80+ | Metal Apple7+ |
-|---|---|---|---|---|---|
-| `flash_attention` / `_with` / `_tuned` | yes | yes | yes | yes | yes |
-| `matmul` (square) | yes | yes | yes | yes | yes |
-| `gemm_nt` / `_with` / `_with_epilogue` | — | yes | yes | yes | — |
-| `rms_norm` / `add_rms_norm` | — | yes | yes | yes | — |
-| `single_query_attention` / `_packed` | yes | yes | yes | yes | — |
-| `knn` | yes | yes | yes | — | — |
-| `kmeans_assign` | yes | yes | yes | — | — |
-
-The constants are `FA_SUPPORTED_ARCHS`, `MATMUL_SUPPORTED_ARCHS`, `GEMM_NT_SUPPORTED_ARCHS`,
-`NORM_SUPPORTED_ARCHS`, `SQ_ATTENTION_SUPPORTED_ARCHS`, `KNN_SUPPORTED_ARCHS` and
-`KMEANS_SUPPORTED_ARCHS` in `tk/src/kernels/`. A family joins a kernel by validation and by
-measuring its own tile table — `gemm_nt` and the norms are wave32-only because nobody has
-measured a wave64 table for them, not because the body cannot run there.
-`flash_attention_supported(&device)` answers the arch gate alone, for callers that pad or
-bucket a sequence length ahead of the launch.
-
----
-
-## Flash attention
-
-```rust
-pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> LaunchResult<Option<Tensor>>
-pub fn flash_attention_with(q, k, v, opts: FaOpts) -> LaunchResult<Option<Tensor>>
-pub fn flash_attention_tuned(q, k, v, opts, policy: impl Fn(&DeviceSpec, GpuArch) -> FaPolicy + Copy) -> ..
-
-pub struct FaOpts<'a> {
-    pub causal: bool,                      // default true
-    pub key_lens: Option<&'a Tensor>,      // [B] i32 valid-key counts: keys >= key_lens[b] are masked
-    pub seg_start: Option<&'a Tensor>,     // [B, N] i32: query q of batch b sees no key before seg_start[b, q]
-}
-```
-
-`q` is `[B, N, H, D]`, `k`/`v` are `[B, N, H_kv, D]` (GQA: `H % H_kv == 0`), the output is
-`[B, N, H, D]` in the operand dtype. Sequence-major, not head-major — the model reshapes a
-projection straight into it without a transpose.
-
-- `Ok(None)`: off the arch set; `N` not a multiple of `q_blk · 8` (the per-warp Q tile times
-  the eight waves of a workgroup; `FLASH_ATTENTION_SEQUENCE_MULTIPLE` is the baseline's
-  `128`); a KV length that differs from `N` (cross-attention is not implemented); a head dim
-  whose double-buffered K/V tiles exceed the device's shared memory.
-- `Err`: dtype outside `{bf16, f16}` or differing between `q` and `k`/`v`; `D % 16 != 0`;
-  `H % H_kv != 0`; a `k`/`v` shape other than `[B, N, H_kv, D]`.
-
-`key_lens` masks keys only — padded query rows are still computed and the caller discards
-them. A `key_lens[b] == 0` is clamped to `1` so the row stays finite. `seg_start` packs
-several sequences into one row: each entry must lie in `0..=q` and leave at least one visible
-key. [Flash Attention](./flash-attention) is the worked example; the per-warp tile is
-measured on first use ([Autotuning](./tuning)).
-
----
+| Kernel | Spec → program | Kernel name | Op |
+|---|---|---|---|
+| GEMM + epilogue | `GemmSpec` → `gemm::gemm` | `gemm` | `ops::linear` |
+| Implicit-GEMM convolution | `ConvSpec` → `conv::conv` (+ `gemm::split_merge` when split) | `conv`, `split_merge` | `ops::conv2d` |
+| Flash attention forward | `AttnSpec` → `attention::attention` | `flash_attention` | `ops::attention` |
+| Split merge | `CombineSpec` → `attention::combine` | `combine_splits` | `ops::attention` with `splits` |
+| Attention prologue | `HeadsSpec` → `heads::heads` | `heads` | `ops::heads` |
+| LayerNorm / RMSNorm | `NormSpec` → `rows::norm` | `layer_norm` / `rms_norm` | `ops::{layer_norm, rms_norm, add_*}` |
 
 ## GEMM
 
-```rust
-pub fn matmul(a: &Tensor, b: &Tensor) -> LaunchResult<Option<Tensor>>              // [n, n] · [n, n] → f32
-pub fn gemm_nt(x: &Tensor, w: &Tensor) -> LaunchResult<Option<Tensor>>             // [lead..., K] · [N, K]ᵀ → [lead..., N]
-pub fn gemm_nt_with(x, w, cfg: impl Fn(usize, usize, usize) -> Option<GemmCfg> + Copy) -> ..
-pub fn gemm_nt_with_epilogue(x, w, epilogue: Epilogue<&Tensor>) -> LaunchResult<Option<Tensor>>
+`c = act(a·bᵀ + bias) + residual`, with `a [batch·m, k]` and `b [n, k]`. Everything after the
+matrix product runs on the f32 accumulator, and the result is rounded once at the store.
 
-pub enum Epilogue<T> {
-    Plain,               // y = x·wᵀ
-    Add(T),              // y = x·wᵀ + residual, residual [lead..., N] in the operand dtype
-    SwiGlu { pair: usize }, // y = silu(gate)·up off a fused [2I, K] gate/up weight; y is [lead..., N/2]
-}
-pub fn swiglu_pair_width(spec: &DeviceSpec) -> Option<usize>
-```
+| `Epilogue` field | Effect |
+|---|---|
+| `bias` | `[n]` row added to the accumulator (`[2n]` when gated) |
+| `act` | `Act::None`, `Act::Gelu` (erf approximation, error at most 1.5e-7), `Act::Silu` |
+| `gated` | `b` is `[2n, k]`, gate rows over up rows; output `act(gate)·up` (SwiGLU, GeGLU) |
+| `residual` | `[batch·m, n]` added last |
 
-`matmul` is the square reference kernel: any float dtype in (cast to bf16), f32 out, every
-arch. It is the performance canary for the DSL, not a production GEMM.
+`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll }`. Rows past `m`
+and columns past `n` are bounded views, so `m` and `n` are free. `k` must be a multiple of `bk`.
 
-`gemm_nt` is the production linear layer. `x` is `[lead..., K]` of any rank ≥ 2 (a
-`[B, L, K]` activation binds without a reshape or copy), `w` is `[N, K]` as a weight is
-stored, and `y` is `[lead..., N]` in the operand dtype — the f32 accumulators are narrowed in
-registers, so there is no f32 round trip through memory. `M = ∏lead` and `N` must be
-multiples of 64 and `K` a multiple of the 32-wide strip with at least two strips; otherwise
-`Ok(None)` and the caller pads to 128 or uses `Tensor::linear`.
+The op layer does not keep a tile table. `config::Planner::gemm_ranked` enumerates the construct's
+knobs (output tiles of 32–256 rows and 48–256 columns, `bk` 16–64, nine warp grids, the ring
+depths the target's prefetch runs, rolled and unrolled), keeps what the lowering can run (the
+atoms tile the warp grid, the fills split into whole 16-byte chunks per thread, the ring fits
+shared memory) and ranks the rest in nanoseconds of SM time from the device's measured `Costs`.
+A block's trip issues down three pipes: every wave's operand fragments read from shared memory,
+the matrix-core steps and the fill streamed in, plus the trip's fixed cost. The pipes overlap
+across the waves a SIMD holds: the longest is paid whole, the rest in a share of one over the
+waves per SIMD up to four (`OVERLAP_WAVES`: sixteen waves per SIMD run a tile no better than four
+on gfx1201 and sm_86). A SIMD holding fewer waves than `step_lone / step`, the waves that hide a
+matrix-core chain's latency, runs the steps that many times slower, a wave's independent
+accumulators counting as waves. The busiest SM issues the work of `per_sm = ⌈blocks / sms⌉`
+blocks, each taken up as another ends, the trip's fixed cost shared with the blocks it holds at
+once (`resident`, by shared memory and the register estimate); a round of those blocks is at least
+one wave's own issue (a block of fewer waves than the SM has SIMDs leaves the rest idle), and every
+round pays the memory latency one pipeline stage ahead cannot hide on top of its issue:
+`cost = trips × (max(per_sm × (body + trip / resident), rounds × simds × (body + trip) / waves) + rounds × latency / (stages − 1))`
+with `rounds = ⌈per_sm / resident⌉` and `body` the overlapped pipes (`Planner::pipelined`). A
+fill's byte is priced by where it comes from: the L2 rate where the distinct bytes fit three
+quarters of the cache, the DRAM rate past half again as much, a blend between, and never dearer
+than the share the blocks in flight at once re-read from one another's lines, a group's A rows and
+their B columns (`Planner::fill_byte`). Without the wave bound,
+gfx1151's ranking led with one-warp 256×256
+tiles that ran at 1–3 TFLOP/s. The layout's register count only estimates how many blocks are resident;
+it admits nothing, since it over-counts where fragments are replicated (gfx11 WMMA). The ranking
+keeps every pipeline of a tile; the [tune store](./tuning) picks among the first 64 output
+tiles and warp grids whose compiled kernels do not spill, each at its first clean pipeline (all
+spilling: the first 64 that compile), then among the winning tile's other pipelines. The compiler
+admits and the clock picks because the model orders block tiles well and warp grids poorly (on
+sm_86 the measured best sat as deep as the 92nd of 109 tiles); the pipelines it ranks alone until
+the winner is known, so an
+unrolled ring that spills yields to its rolled twin: on gfx1151 the unrolled 64×16 and 128×16
+attention tiles at d = 128 spill and the rolled ones compile clean. A
+gated weight
+is a `2·bn`-wide B tile and two accumulators to the model, so its lead comes at half width. The
+`Planner` of a device holds its target, its measured costs and the problems it has ranked (an op
+plans its shape at every call; ranking the lattice takes a millisecond), one planner per device
+for the process.
 
-The epilogues are why the kernel exists: they fold the pass the graph would pay after the
-GEMM into its store. `Add` reads the residual at the store's own offset and adds in the
-output dtype, exactly as the graph's `try_add` rounds. `SwiGlu` needs the fused weight's rows
-arranged in alternating gate/up blocks of `pair` rows — `swiglu_pair_width(&device)` is
-`reg_n / 2` of the device's tile table, or `None` when the tiles disagree (the caller keeps a
-separate SwiGLU pass). The model loads the weight in that order once, because `M` picks the
-tile at launch time and every candidate tile must read the same arrangement.
+The model has no fitted constants: every cost is the device's own, measured by a probe. Where the
+ranking and a measurement disagree, the measurement wins: add the shape to
+`qwen3_gemm_candidates_probe` and check which cost the ranking misses.
 
-The tile comes from `GemmPolicy` (`tk/src/kernels/gemm.rs`): a per-family table —
-`CUDA_TILES`, `RDNA_TILES`, `RDNA4_TILES` — measured on first use per shape and epilogue
-([Autotuning](./tuning)), or the static `GemmPolicy::cfg` choice when tuning is off.
-`gemm_nt_with` takes the chooser from the caller (the benches sweep it this way).
+## Flash attention
 
----
+`o = softmax(q·kᵀ·scale)·v` over sequence-major `q [batch, t, heads, d]` and
+`k`, `v [batch, tk, kv_heads, d]`. Q stays in registers and K/V stream through a shared ring.
+The online-softmax state `(m, l, o)` is carried in f32 using `exp2`.
 
-## RMS norm
+| Feature | How |
+|---|---|
+| GQA | Query head `h` reads KV head `h / (heads / kv_heads)` |
+| Cross attention | `tk ≠ t` is a property of the views |
+| Any `t`, `tk` | Bounds instead of padding: the query tile and the last key block are bounded views, and keys past `tk` are masked |
+| Head dims | 48, 64, 128 |
+| `AttnMask::causal` | Key blocks past the diagonal are skipped through the trip count |
+| `AttnMask::window` | `(left, right)` around each query; blocks outside are skipped |
+| `AttnMask::key_lens` | `[batch]` i32 valid key counts; blocks past the length are skipped |
+| `AttnMask::key_mask` | `[batch, tk]` i32 visible keys (row stride rounded up to 8), read in every block |
+| `AttnMask::seg_start` | `[batch, t]` i32 segment starts of packed rows, non-decreasing along `t` |
+| `AttnMask::bias` | `[batch or 1, heads, t, tk]` additive bias in the stream type (row stride rounded up to 8), streamed through a ring slot of its own beside K and V (its bytes counted in admission like theirs) and added to the scaled scores before the masks; the appended rows' block reads its bias tile directly |
 
-```rust
-pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> LaunchResult<Option<Tensor>>
-pub fn add_rms_norm(x, residual: &Tensor, weight, eps) -> LaunchResult<Option<(Tensor, Tensor)>>   // (h, y)
-pub fn select_norm_cfg(rows: usize, d: usize, lanes: usize) -> Option<NormCfg>
-```
+Masks are tile-class work. Only key blocks that a causal, window, length or segment edge
+crosses compute the predicate (`select_if` on the block start); blocks fully inside run
+unmasked. A bool key mask is applied in every block. A query that sees no key yields NaN, as a
+softmax over an empty row does.
 
-`x` is `[rows..., D]`, `weight` `[D]`, both in one 16-bit dtype. One wave per row, the row
-held in registers, the sum of squares completed by a butterfly shuffle — no LDS, no barrier,
-no `RANGE`. Numerics mirror the graph op for op:
-`y = dtype((f32(x) · rsqrt(Σx²/D + eps)) · f32(w))`, one rounding at the end; only the
-summation order differs. `Ok(None)` when `D` is not a multiple of the wave or exceeds 64
-elements per lane (`2048` at wave32).
+**Cache mode** (`AttnSpec::cache = Some(Cache { .. })`) reads K and V from a cache
+`[rows, tk, heads_total, d]` that holds several layers' heads:
 
-`add_rms_norm` returns `(h, y)` with `h = x + residual` rounded as the graph's add rounds it
-and `y = rms_norm(h)`, so a pre-norm decoder layer writes and reads its residual stream once.
-When the preceding projection took the residual through `Epilogue::Add`, the two-pass
-`rms_norm` is enough; `model/src/qwen3/decoder_layer.rs` chooses between them per layer.
+| `Cache` field | Effect |
+|---|---|
+| `head_start` | First of this attention's `kv_heads` heads in the cache row |
+| `row_map` | A `[batch]` i32 parameter: the cache row each batch lane reads |
+| `appended` | `[batch, kv_heads, d]` key and value scored after the cached prefix (the token a decoder step just projected) |
 
----
+**Key splits** (`FaCfg::splits > 1`) give a few long rows, such as a decoder step, more blocks.
+Each split writes f32 partials `o_part`, `m_part` and `l_part`, and `combine` merges them.
 
-## Single-query attention
+`FaCfg { bq, bkv, stages, splits, unroll, .. }` uses one warp per 16 query rows. Candidates come
+from the same lattice and cost model as the GEMM's (`Planner::attention_ranked`): query
+blocks of 16–128 rows, key blocks of 16–128 keys, the ring depths the target runs, rolled and
+unrolled, kept to what lowers (the fills split into chunks per thread, the ring fits shared
+memory) and ranked by what a key block costs (every warp's K and V fragments read, both tiles
+streamed in, the matrix-core steps, the softmax's vector work per score and the trip's fixed
+cost), over the key blocks of every round of query blocks, each round bound as the GEMM's. The
+register estimate is the query, key, score, probability and value fragments, live together in the
+compiled loop; whether a config spills is the compiled kernel's to say. A warp past the problem's
+queries adds the work of its padded rows, so where the tiles fill the device a decoder step leads
+with one-warp blocks; where they leave SIMDs idle a padded warp runs on one of them. A causal
+mask charges each query
+block its diagonal. The value tile is stored column-major where its fill goes through registers
+(see [Layouts and Lowering](./layouts-and-lowering#layouts-and-lowering)), so its fragments gather
+as 16-byte loads like the keys'; measured on gfx1201 that is 5–28% per shape over the row-major
+tile's one load per key. On RDNA4 the fill itself is a transposing load (`global_load_tr_b128`),
+so its registers hold column runs and store as 16-byte vectors too.
 
-```rust
-pub fn single_query_attention(q, k, v, opts: SqAttentionOpts<'_>) -> LaunchResult<Option<Tensor>>
-pub fn single_query_attention_packed(q, k, v, head_offset: usize, opts) -> LaunchResult<Option<Tensor>>
+The softmax step does as little vector work as it can, which matters most where the matrix
+cores share the SIMD's ALUs (RDNA). A row adopts a new running maximum only when it grows by
+more than 8 in log2 units (FlashAttention-4's lazy rescale): otherwise the correction is exactly
+1, while the probabilities stay below 2⁸. The planner offers every config in the plain forms; the
+other five (`FaCfg::forms`: `truncate_p`, `skip_rescale`, `raw_max`, `sum_after`, `bias_direct`) are tuner knobs, tuned in
+turn with the tiles (`ops::attention::tune`, through `descend`), since a tile may compile clean only under some
+forms: a forms
+pass on the ranking's first config that compiles clean, then the tile and split choice over the
+ranking under the forms it kept, then a forms pass again on that winner (store-backed, so cheap
+when nothing changes). A forms pass is a coordinate descent: each form once, in that order, a
+two-candidate tune of the forms so far against the same with that form
+flipped, the flip kept only where it measures faster (a spilling flip is not admitted). Which
+form saves registers is not a rule anywhere: the measurement decides. With tuning off every
+attention runs the plain forms. With `truncate_p`,
+probabilities held in bf16 are truncated rather than rounded, a pair per instruction where the
+rounding is several, and the row sum adds the values as held, so the normalization stays unbiased;
+targets that round a pair in one instruction (sm_80+, gfx950) round and sum the f32 values, the
+extra conversion of the held values having cost 3–5% on sm_86. With `skip_rescale`, the output
+accumulator's rescale is a `Scale`, skipped by every wave whose rows all kept their maximum; it
+paid wherever the matrix products issue on the vector ALUs, and beside separate matrix cores only
+where a full tile's lane holds 64 output registers (sm_86: +4% at d = 128, neutral at d = 64 and
+5–7% slower on a decoder step, whose one row keeps the plain multiply). With `raw_max` (paid on RDNA
+tiles full of queries), the running maximum stays in the raw scores' units (a positive scale commutes
+with the maximum; a bias keeps the scaled form), so only the two row values the exponent and the
+correction take are scaled, a multiply per row rather than per score, at the price of a multiply on
+the step's dependent chain, which a decoder step's one wave feels (3%) and a full tile does not. With
+`sum_after`, the row sum follows the product rather than preceding the rescale; truncated
+probabilities are summed as held either way (the bf16 pair dot product where the target has it),
+rounded ones in f32. After the product both consumers read truncated values packed once (gfx1201);
+before it, on sm_86 with rounding, the order was 3% faster at d = 128 (24.7 against 24.0 TFLOP/s,
+22.4 before this work) and neutral at d = 64 and on a decoder step. With `bias_direct` (flipped only under a bias),
+each key block's bias tile is read straight from global memory in the scores' layout rather than
+streamed through its ring slot beside K and V, the planned form: on gfx1151, whose accumulator holds a
+column per lane and gathers the ring's tile two bytes at a time, the direct reads measured faster
+without a causal mask (3.0 against 3.6 ms at d = 64, B 4, H 8, T 2048) and the ring faster with one
+(1.88 against 2.12 ms). Under a causal mask (or chunks seeing every earlier one) the last
+query blocks, which score the most keys, run first, so a round's tail is its shortest blocks. On
+gfx1201 the lazy rescale, the truncation, the skip and the raw `exp2` below took the d = 128 kernel
+from 90 to 116 TFLOP/s on random data and Qwen3's causal attention from 63 to 77; the raw maximum,
+the pair dot product and the block order took them on to 120 and 79, d = 128 causal 96 → 100 and
+d = 64 105 → 108 (causal 87 → 92), the decoder step unchanged. What remains against the 162 TFLOP/s
+the loop's WMMAs alone would run at is spread thin: the vector work is 15%, the loads, stores,
+barriers and addressing the rest.
 
-pub struct SqAttentionOpts<'a> {
-    pub key_lens: Option<&'a Tensor>,                 // [B] i32, entries in 0..=N
-    pub include_last: bool,                           // also score key N-1 (Whisper's self-cache slot)
-    pub appended: Option<(&'a Tensor, &'a Tensor)>,   // the step's own [B, 1, H, D] K/V, scored after the prefix
-    pub split: Option<usize>,                         // K/V chunks; None = the device's SqPolicy, tuned on first use
-    pub cache_map: Option<&'a Tensor>,                // [B] i32: which K/V row each query row reads
-}
-```
+A decoder step's block is one row warp of queries (`bq = 16`) walking every key block in turn, a
+single wave waiting on each block's load. `FaCfg::key_warps` lets that block's warps share its keys
+instead: each walks its own range of key blocks through its own ring slots with its own softmax
+state, inside a `Warps` statement (every warp on its own, warp-scoped copies and barriers), and the
+states merge through shared memory at the end, as the split merge does. The planner offers 1, 2 and
+4 key warps for `t ≤ 16`; the tuner picks. On gfx1201 the Whisper large-v3 cross-attention step
+(1500 keys, one cache row shared by five lanes) went from 25.3 to 15.7 µs tuned (four splits) and to
+18.2 unsplit (two key warps), tk1's single-query kernel being 16.1; the self-attention step is
+unchanged. The states merge through the warps' own ring slots, dead once their pipelines end
+(f32 views of the 16-bit rings: a warp's output over its key slots, its maximum and sum over its
+value slots, `Kernel::smem_view_as`), so four key warps at `bkv = 16` take the rings' 32 KB alone
+and two blocks fit a CU: the unsplit cross-attention step went from 19.6 to 15.8 µs, the four-split
+one's time, and the tuner picks it unsplit. The tuner also measures a cache the way the model reads it: fewer cache
+rows than lanes are read through a zero row map, so lanes share a row, where it used to time a row
+per lane, 38 MB from DRAM for a shape that is 7.7 MB in L2.
 
-The decode-step kernel: `q` is `[B, 1, H, D]` in f32, `k`/`v` are `[B, N, H_total, D]` in
-f32, f16 or bf16 (or `[1, N, H_total, D]` to serve every row from one cache), the output
-`[B, 1, H, D]` in f32.
-One wave owns one `(batch, head)`; `Q` stays in registers while K/V stream over `N`; dot
-products are XOR-shuffle all-reduces and the softmax is a one-pass online update. There is no
-LDS and no matrix core, which is why its `ArchSet` is the widest AMD list plus CUDA.
+Each tile config is crossed with split counts. `Attn::splits = Some(n)` fixes `n`: only the
+configs with at least `n` key blocks are ranked, at `n` (capped at the most key blocks any config
+has), so a named count is never dropped by a large key block. With `None`, `Planner::splits`
+proposes 1, 2, the counts around two
+blocks per SM, and one split per key block. It keeps only counts up to the smaller of the key
+block count and twice that SM target. The unsplit
+config comes first, and a split candidate is timed together with its merge.
 
-`_packed` selects heads `head_offset..head_offset + H` of a packed cache without slicing it.
-Long unmasked attention splits K/V into contiguous chunks, each a wave, and merges their
-softmax states in a second pass; `SqPolicy` sizes the split from the device's resident-wave
-budget and measures the nearest divisors on first use.
+The attention throughput probe (B 4, H 8, T 2048, bf16) measured in TFLOP/s against tk1:
 
----
+| Case | tk3 | tk1 |
+|---|---|---|
+| d 64 | 24.1 | 23.0 |
+| d 64 causal | 22.6 | 20.7 |
+| d 128 | 22.3 | 22.3 |
+| d 128 causal | 20.9 | 16.5 |
 
-## k-NN and k-means
+The decode probe times one Whisper large-v3 decoder step's attention in µs. The Whisper decoder
+step calls these kernels:
 
-```rust
-pub fn knn(x: &Tensor, c: &Tensor, k: usize) -> LaunchResult<Option<(Tensor, Tensor)>>           // (dists [N, k] f32, idxs [N, k] i32)
-pub fn kmeans_assign(x: &Tensor, c: &Tensor) -> LaunchResult<Option<(Tensor, Tensor)>>         // (cluster_ids [N] i32, best_dist [N] f32)
-pub fn kmeans_update(x, cluster_ids, old_centroids) -> LaunchResult<(Tensor, Tensor)>           // (new_centroids [K, D], shift [K])
-```
+| Case | tk3 | tk1 |
+|---|---|---|
+| Self attention, 200 cached keys + the appended one | 21.5 | 89.1 |
+| Cross attention, 1500 shared keys | 66.3 | 78.8 (636 unsplit) |
 
-Both stream the corpus (centroids) through the matrix core and keep a running top-K
-(argmin) from the x²-free score `‖c‖² − 2⟨x, c⟩`, so the `[N, M]` distance matrix is never
-formed; the host side casts to bf16, pads `D` (and `N`) to the WMMA edge, and re-adds `‖x‖²`
-for exact f32 distances. `knn` takes `k` in `1..=16`. `kmeans_update` is a pure graph op —
-`scatter_reduce` per cluster, empty-cluster fixup, per-cluster shift — because the
-sort/scatter pattern does not tile; the caller owns the Lloyd loop. AMD-only.
+Open: the decode `row_map` is still excluded from the tuned shape (the tuner measures on scratch
+caches of one row per lane, where a map would read garbage rows), so a tuned cross attention may
+not be the fastest with its map: on gfx1151 (2026-10-14) it tuned to 90 µs against 60 µs unsplit.
 
----
+## Attention prologue
 
-## Using a kernel in a model
+`heads` splits a fused projection `qkv [batch, t, (heads + 2·kv_heads)·d]` into sequence-major
+`q [batch, t, heads, d]` and `k`, `v [batch, t, kv_heads, d]`. Optionally it RMS-normalizes `q`
+and `k` over the head with `[d]` weights, then applies rotary embedding to them. The rotation
+pairs the head's two halves, using `(cos, sin)` tables of `[t, d/2]`, shared or per batch
+(`Rope { per_batch }`). A block handles `br` rows of one head slot. `d` must be a power of two
+in 16..=256, and candidates are `br ∈ {4, 8, 16}`.
 
-The policy — which kernel, which fallback — belongs to the model, never to the kernel. The
-Qwen3 decoder in `model/src/qwen3/` is the reference integration:
+## Norms
 
-```rust
-// model/src/qwen3/linear.rs
-pub(crate) fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
-    if fusable(x, w)
-        && let Some(y) = svod_tk::gemm_nt(x, w).context(TkSnafu)?
-    {
-        return Ok(y);
-    }
-    Ok(x.contiguous().linear().weight(w).call()?)
-}
-```
+`rows::norm` uses one warp per row and a fused reduce-then-map in f32:
 
-```rust
-// model/src/qwen3/attention.rs
-if matches!(q.dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16)
-    && let Some(out) =
-        svod_tk::flash_attention_with(q, k, v, svod_tk::FaOpts { causal: true, key_lens: None, seg_start })
-            .context(TkSnafu)?
-{
-    return Ok(out);
-}
-// else: permute to head-major and run scaled_dot_product_attention
-```
+| `Norm` | Formula |
+|---|---|
+| `Layer` | `(x − mean)·rsqrt(var + eps)·w + b` |
+| `Rms` | `x·rsqrt(mean(x²) + eps)·w` |
 
-Three habits to copy:
-
-- **Gate on `fusable` first.** `Err` means a malformed request, and a 16-bit check on the
-  caller's side keeps a legitimate f32 path from being reported as a bug.
-- **Bridge the error.** `LaunchError` is boxed into the model's error enum
-  (`#[snafu(source(from(svod_tk::LaunchError, Box::new)))]`), so a failed build is a model
-  error with the kernel's context attached.
-- **Shape for the kernel upstream.** `embed.rs` buckets padded sequence lengths to
-  `FLASH_ATTENTION_SEQUENCE_MULTIPLE`, and `feed_forward.rs` interleaves the gate/up weight
-  by `swiglu_pair_width` at load time, so the kernels apply instead of declining.
-
-A fusion that knows a model's memory layout lives beside the model: `model/src/qwen3/tk/mod.rs`
-is a QKV-norm-RoPE prologue written on the norm kernel's row vocabulary, gated by
-`NORM_SUPPORTED_ARCHS`, launched through `graph_launch_multi` with three outputs. The same
-`launch_custom` policy applies — it is a tk kernel in every respect except where it lives.
+With `residual: true` it normalizes `x + residual` rounded to the element type and also writes
+that sum, which is the pre-norm residual stream of a transformer layer. `d` must be a power of
+two in 256..=2048, and candidates are `br ∈ {4, 8, 16}` rows per block. Measured at 92% of
+memory bandwidth on sm_86.

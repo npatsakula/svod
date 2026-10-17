@@ -6,7 +6,6 @@
 //! Weights load from the Hugging Face Hub, and each model runs through JIT plans that
 //! compile once and replay. See <https://svod.vpermilp.online/docs/models>.
 
-pub(crate) mod attention;
 pub mod audio;
 pub mod bgem3;
 pub mod blocks;
@@ -17,7 +16,6 @@ pub mod gtcrn;
 pub(crate) mod hub;
 pub(crate) mod init;
 pub mod jit;
-pub(crate) mod linear;
 pub mod modernbert;
 pub mod nemotron_diar;
 pub mod qwen3;

@@ -41,9 +41,8 @@ impl ClassifyHead {
         let x = &super::head::in_head_dtype(x);
         let b = x.shape()?[0].clone();
         let x = self.conv.forward(x)?;
-        // GAP: mean over H,W (axes 2,3)
-        let x = x.mean_with().axes(vec![2isize, 3]).keepdim(true).call()?;
-        // Flatten: [B, 1280, 1, 1] → [B, 1280]
+        // GAP: mean over H, W of [B, H, W, 1280]
+        let x = x.mean_with().axes(vec![1isize, 2]).keepdim(true).call()?;
         let x = x.try_reshape([b, SInt::from(HIDDEN)])?;
         // Linear → softmax
         Ok(self.linear.forward(&x)?.softmax(-1)?)
@@ -100,7 +99,7 @@ impl Yolo26Classify {
 
     /// Run the full network. Returns `[B, nc]` softmax probabilities.
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
-        let images = &self.config.cast_input(images);
+        let images = &self.config.cast_input(images)?;
         let feat = self.backbone.forward(images)?;
         self.head.forward(&feat)
     }

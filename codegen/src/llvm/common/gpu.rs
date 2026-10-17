@@ -7,10 +7,11 @@
 
 use std::sync::Arc;
 
-use svod_dtype::DType;
+use svod_dtype::{AddrSpace, DType};
 use svod_ir::{Op, ops, prelude::*};
 
 use super::{RenderContext, ldt};
+use smallvec::smallvec;
 
 /// Parse a SPECIAL axis name: `'g'/'l'/'i'` prefix + 0/1/2 axis suffix.
 ///
@@ -63,7 +64,12 @@ pub fn local_bounds(nodes: &[Arc<UOp>]) -> Option<[u64; 3]> {
 /// use everywhere else (a bare `ptr addrspace(3)` operand is a type error
 /// there). Both backends recover the fast `ds_*` / `ld.shared` forms through
 /// LLVM's address-space inference at `-O3`.
-pub fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
+pub fn render_define_local(
+    uop: &Arc<UOp>,
+    ctx: &mut RenderContext,
+    kernel: &mut Vec<String>,
+    align: usize,
+) -> Option<()> {
     let dst = ctx.name(uop); // e.g. "%local42"
     let (id, base_dtype) = match uop.op() {
         Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
@@ -75,7 +81,7 @@ pub fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut
     let base_ty = ldt(&base_dtype);
     let global_name = format!("@local{id}");
     ctx.push_module_prefix(format!(
-        "{global_name} = internal unnamed_addr addrspace(3) global [{size} x {base_ty}] undef, align 16"
+        "{global_name} = internal unnamed_addr addrspace(3) global [{size} x {base_ty}] undef, align {align}"
     ));
     kernel.push(format!("  {dst} = addrspacecast ptr addrspace(3) {global_name} to ptr"));
     Some(())
@@ -99,3 +105,18 @@ pub fn wmma_operand_dtype(uop: &Arc<UOp>) -> DType {
 #[cfg(test)]
 #[path = "../../test/unit/llvm_common_gpu.rs"]
 mod tests;
+
+/// `ptr` → `ptr addrspace(N)` for a pointer UOp whose provenance is `space`:
+/// Svod pointers stay generic through a kernel body, and NVPTX and AMDGPU
+/// both number global as 1 and shared as 3, so an intrinsic that wants a
+/// specific space gets a cast LLVM folds back onto the buffer at `-O3`.
+pub fn specific_ptr(ptr: &Arc<UOp>, space: AddrSpace) -> Arc<UOp> {
+    assert_eq!(ptr.addrspace(), Some(space), "pointer must resolve to a {space:?} buffer");
+    let num = match space {
+        AddrSpace::Global => 1,
+        AddrSpace::Local => 3,
+        AddrSpace::Reg => unreachable!("register scratch has no address-space form"),
+    };
+    let dtype = DType::Void.ptr(None, space).expect("void is not a pointer");
+    UOp::custom(smallvec![ptr.clone()], format!("addrspacecast ptr {{0}} to ptr addrspace({num})"), dtype)
+}

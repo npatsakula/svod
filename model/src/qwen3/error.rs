@@ -17,10 +17,10 @@ pub enum Error {
         source: Box<crate::jit::JitError>,
     },
 
-    #[snafu(display("hand kernel: {source}"))]
-    Tk {
-        #[snafu(source(from(svod_tk::LaunchError, Box::new)))]
-        source: Box<svod_tk::LaunchError>,
+    #[snafu(display("{source}"), context(false))]
+    Ops {
+        #[snafu(source(from(svod_tk3::ops::Error, Box::new)))]
+        source: Box<svod_tk3::ops::Error>,
     },
 
     #[snafu(display("state-dict op failed"), context(false))]

@@ -225,8 +225,10 @@ impl UOp {
         Self::placeholder(&capacity, anchor.dtype(), slot, addrspace, None)
     }
 
-    /// The realized node a chain of reshapes views, if the base is one.
-    fn realized_base(x: &Arc<Self>) -> Option<Arc<Self>> {
+    /// The realized node a chain of reshapes views, if the base is one: its
+    /// bytes already sit in a buffer, so a reader binds the node instead of
+    /// materialising it again.
+    pub fn realized_base(x: &Arc<Self>) -> Option<Arc<Self>> {
         match x.op() {
             Op::After(..) => Some(x.clone()),
             Op::Reshape(ops::Reshape { src, .. }) => Self::realized_base(src),

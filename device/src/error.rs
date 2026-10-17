@@ -152,6 +152,14 @@ pub enum Error {
     #[snafu(display("CUDA JIT of kernel {kernel:?} failed: {cause}\n{log}"))]
     CudaJit { kernel: String, cause: String, log: String },
 
+    /// A kernel's static plus dynamic shared memory exceeds what one block
+    /// may opt into on this device.
+    #[snafu(display(
+        "CUDA kernel {kernel:?} needs {static_bytes} static + {dynamic_bytes} dynamic bytes of shared memory, \
+         above the device's {limit}-byte per-block opt-in limit"
+    ))]
+    CudaSharedMemoryExceeded { kernel: String, static_bytes: u32, dynamic_bytes: u32, limit: u32 },
+
     /// CUDA allocation failure (VRAM exhaustion, unsupported memory kind).
     #[snafu(display("CUDA allocation of {size} bytes failed: {reason}"))]
     CudaAllocFailed { size: usize, reason: String },

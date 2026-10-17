@@ -7,7 +7,8 @@
 //! ```
 
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Layer, LayerNorm, Module};
+use svod_tensor::nn::{LayerNorm, Module};
+use svod_tk3::ops;
 
 use super::attention::XlmRobertaAttention;
 use super::config::XlmRobertaConfig;
@@ -39,12 +40,11 @@ impl EncoderLayer {
         }
     }
 
-    /// Forward. `x`: `(B, L, D)` → `(B, L, D)`. Post-norm.
+    /// Forward. `x`: `(B, L, D)` → `(B, L, D)`. Post-norm, each residual added
+    /// in the epilogue of the GEMM before its norm.
     pub fn forward(&self, x: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
-        let attn_delta = self.attention.forward(x, padding_mask)?;
-        let x = self.attention_norm.forward(&x.try_add(&attn_delta)?)?;
-
-        let ffn_delta = self.feed_forward.forward(&x)?;
-        Ok(self.ffn_norm.forward(&x.try_add(&ffn_delta)?)?)
+        let norm = |x: &Tensor, ln: &LayerNorm| ops::layer_norm(x, &ln.weight, ln.bias.as_ref(), ln.eps);
+        let x = norm(&self.attention.forward(x, x, padding_mask)?, &self.attention_norm)?;
+        Ok(norm(&self.feed_forward.forward(&x, &x)?, &self.ffn_norm)?)
     }
 }

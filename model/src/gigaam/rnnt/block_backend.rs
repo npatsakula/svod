@@ -25,6 +25,8 @@ pub struct RnntBlockBackend<const W: usize = DECODE_WINDOW> {
     max_t: usize,
     enc_hidden: usize,
     blank_id: usize,
+    pred_layers: usize,
+    pred_hidden: usize,
 
     // Host-side tape staging (read once per block).
     tokens: Vec<i32>,
@@ -89,6 +91,8 @@ impl<const W: usize> RnntBlockBackend<W> {
             max_t,
             enc_hidden,
             blank_id,
+            pred_layers: layers,
+            pred_hidden: p,
             tokens: vec![0; lanes * BLOCK_STEPS],
             emit: vec![0; lanes * BLOCK_STEPS],
             frames_tape: vec![0; lanes * BLOCK_STEPS],
@@ -119,6 +123,46 @@ impl<const W: usize> RnntBlockBackend<W> {
         let bytes = proj_out.size();
         self.jit.enc_mut()?.copy_region_from(0, proj_out, 0, bytes)?;
 
+        self.set_valid(valid)
+    }
+
+    /// The sizes of every device buffer the backend's plans own, in bytes.
+    pub fn device_buffers(&self) -> crate::jit::Result<Vec<usize>> {
+        let mut sizes: Vec<usize> = self.jit.buffers()?.iter().map(|b| b.size()).collect();
+        sizes.extend(self.proj.buffers()?.iter().map(|b| b.size()));
+        Ok(sizes)
+    }
+
+    /// The lanes' encoder rows already projected for the joint, on the
+    /// device: `[lanes, max_t, joint_hidden]` f32.
+    pub fn bind_projected(&mut self, projected: &svod_device::Buffer) -> crate::jit::Result<()> {
+        self.jit.enc_mut()?.copy_region_from(0, projected, 0, projected.size())?;
+        Ok(())
+    }
+
+    /// Start a chunk of a stream on every lane: the frame cursors and
+    /// same-frame symbol counts return to zero over `valid[i]` frames, the
+    /// lanes `fresh` names start a new stream (predictor state zeroed, the
+    /// blank as the last label) and the others continue theirs.
+    pub fn begin_chunk(&mut self, valid: &[usize], fresh: &[bool]) -> crate::jit::Result<()> {
+        let lanes = self.lanes;
+        self.jit.time_mut()?.copyin(bytemuck::cast_slice(&vec![0i64; lanes]))?;
+        self.jit.symbols_mut()?.copyin(bytemuck::cast_slice(&vec![0i32; lanes]))?;
+        self.set_valid(valid)?;
+        let blank = [self.blank_id as i64];
+        let state = vec![0u8; self.pred_hidden * 4];
+        for lane in fresh.iter().enumerate().filter(|(_, fresh)| **fresh).map(|(lane, _)| lane) {
+            self.jit.prev_mut()?.copyin_at(lane * 8, bytemuck::cast_slice(&blank))?;
+            for layer in 0..self.pred_layers {
+                let offset = (layer * lanes + lane) * state.len();
+                self.jit.h_mut()?.copyin_at(offset, &state)?;
+                self.jit.c_mut()?.copyin_at(offset, &state)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn set_valid(&mut self, valid: &[usize]) -> crate::jit::Result<()> {
         let mut view = self.jit.valid_view_mut::<i32>()?;
         let slice = view.as_slice_mut().expect("contiguous valid");
         slice.fill(0);

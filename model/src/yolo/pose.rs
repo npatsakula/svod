@@ -8,16 +8,16 @@
 
 use svod_ir::SInt;
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Conv2d, Layer, Module};
+use svod_tensor::nn::{Conv2d, Module};
 
 use crate::state::StateDict;
 
 use super::backbone::YoloBackbone;
-use super::blocks::conv::{YoloConv, conv2d_bias};
+use super::blocks::conv::{YoloConv, conv2d_bias, pointwise};
 use super::config::DETECT_STRIDES;
 use super::error::Result;
 
-use super::head::{BoxBranch, ClsBranch, dist2bbox, make_anchors};
+use super::head::{BoxBranch, ClsBranch, anchor_rows, dist2bbox, make_anchors};
 use super::loader;
 use super::neck::YoloNeck;
 
@@ -82,29 +82,17 @@ impl Pose26 {
 
     pub fn forward(&self, feats: &[Tensor]) -> Result<Tensor> {
         let feats = &super::head::in_head_dtypes(feats);
-        let shape = feats[0].shape()?;
-        let b = shape[0].clone();
-
         let mut boxes_list: Vec<Tensor> = Vec::with_capacity(feats.len());
         let mut scores_list: Vec<Tensor> = Vec::with_capacity(feats.len());
         let mut kpts_list: Vec<Tensor> = Vec::with_capacity(feats.len());
         let mut feat_sizes: Vec<(usize, usize)> = Vec::with_capacity(feats.len());
 
         for (i, feat) in feats.iter().enumerate() {
-            let h = feat.dim_const(2)?;
-            let w = feat.dim_const(3)?;
-            feat_sizes.push((h, w));
-            let hw = h * w;
-
-            let box_out = self.cv2[i].forward(feat)?;
-            boxes_list.push(box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)])?);
-
-            let cls_out = self.cv3[i].forward(feat)?;
-            scores_list.push(cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)])?);
-
+            feat_sizes.push((feat.dim_const(1)?, feat.dim_const(2)?));
+            boxes_list.push(anchor_rows(&self.cv2[i].forward(feat)?)?);
+            scores_list.push(anchor_rows(&self.cv3[i].forward(feat)?)?);
             let features = self.cv4[i].forward(feat)?;
-            let kpts = self.cv4_kpts[i].forward(&features)?;
-            kpts_list.push(kpts.try_reshape([b.clone(), SInt::from(self.nk), SInt::from(hw)])?);
+            kpts_list.push(anchor_rows(&pointwise(&self.cv4_kpts[i], &features)?)?);
         }
 
         let boxes_refs: Vec<&Tensor> = boxes_list.iter().collect();
@@ -222,7 +210,7 @@ impl Yolo26Pose {
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
-        let images = &self.config.cast_input(images);
+        let images = &self.config.cast_input(images)?;
         let (l4, l6, l10) = self.backbone.forward(images)?;
         let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
         self.head.forward(&[p3, p4, p5])

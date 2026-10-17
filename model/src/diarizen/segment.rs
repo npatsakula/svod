@@ -144,8 +144,7 @@ impl DiariZenSegmenter {
             // `(real, frames, k)` — a prefix of the max-batch-sized buffer.
             self.jit.execute_bound(real as i64)?;
 
-            let out = self.jit.logits_view::<f32>()?;
-            acc.extend_from_slice(out.as_slice().expect("contiguous segmentation output"));
+            acc.extend(self.jit.logits_to_vec::<f32>()?);
         }
 
         let logits = Tensor::from_slice(&acc).try_reshape([num_chunks, self.frames, self.k])?;

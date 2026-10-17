@@ -621,3 +621,51 @@ fn test_cache_disabled_matches_enabled_var_names_and_kernel_count() {
         "output count must match across cache-warm and cache-cold paths"
     );
 }
+
+/// An ephemeral prepare names its kernels by their bare shape names and
+/// moves no process-wide name counter: two ephemeral plans of one
+/// computation carry the same names, and the plain plan prepared after
+/// them, the first of its shape name in the process, carries them too, so
+/// the kernels a process prepares after a candidate keep the names (and
+/// the compiled objects) they have in a process that compiled none. The
+/// shape is one no other test prepares, since the counter is the process's.
+#[test]
+fn an_ephemeral_prepare_names_kernels_bare() {
+    svod_schedule::testing::setup_test_tracing();
+    let fresh = || {
+        let (a, b): (Vec<f32>, Vec<f32>) = (0..7919).map(|i| (i as f32, 2.0 * i as f32)).unzip();
+        (&Tensor::from_slice(a) + &Tensor::from_slice(b)).unwrap()
+    };
+    let ephemeral = PrepareConfig { ephemeral: true, ..cfg() };
+    let names = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(|k| k.entry_point.clone()).collect::<Vec<_>>();
+    let (once, twice) = (fresh().prepare_with(&ephemeral).unwrap(), fresh().prepare_with(&ephemeral).unwrap());
+    assert!(!names(&once).is_empty());
+    assert_eq!(names(&once), names(&twice), "ephemeral names are the shape's alone");
+    let plain = fresh().prepare_with(&cfg()).unwrap();
+    assert_eq!(names(&plain), names(&once), "the ephemeral prepares moved no counter");
+}
+
+/// An ephemeral prepare records nothing: its schedule is not in the cache
+/// afterwards and its kernel is compiled again by a plain prepare of the
+/// same computation, which a second plain prepare then shares; the
+/// ephemeral plan runs all the same.
+#[test]
+fn an_ephemeral_prepare_records_nothing() {
+    svod_schedule::testing::setup_test_tracing();
+    let fresh =
+        || (&Tensor::from_slice([1.0f32, 2.0, 3.0, 5.0]) * &Tensor::from_slice([7.0f32, 11.0, 13.0, 17.0])).unwrap();
+    let plain = cfg();
+    let ephemeral = PrepareConfig { ephemeral: true, ..cfg() };
+    let kernels = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(std::ptr::from_ref).collect::<Vec<_>>();
+    let key = crate::schedule_cache::cache_key_for(&fresh(), &ephemeral).unwrap();
+    let t = fresh();
+    let once = t.prepare_with(&ephemeral).unwrap();
+    once.execute().unwrap();
+    assert_eq!(t.to_vec::<f32>().unwrap(), [7.0, 22.0, 39.0, 85.0]);
+    assert!(!crate::schedule_cache::schedule_cache().pin().contains_key(&key));
+    let (first, second) = (fresh().prepare_with(&plain).unwrap(), fresh().prepare_with(&plain).unwrap());
+    assert!(!kernels(&once).is_empty());
+    assert!(kernels(&once).iter().zip(kernels(&first)).all(|(a, b)| !std::ptr::eq(*a, b)), "published");
+    assert!(kernels(&first).iter().zip(kernels(&second)).all(|(a, b)| std::ptr::eq(*a, b)), "not cached");
+    assert!(crate::schedule_cache::schedule_cache().pin().contains_key(&key));
+}

@@ -14,20 +14,8 @@ use smallvec::{SmallVec, smallvec};
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::prelude::*;
 
+use crate::llvm::common::gpu::specific_ptr;
 use crate::llvm::common::ldt;
-
-/// `ptr` → `ptr addrspace(N)` for a pointer UOp whose provenance is `space`
-/// (NVPTX numbers global as 1 and shared as 3).
-fn specific_ptr(ptr: &Arc<UOp>, space: AddrSpace) -> Arc<UOp> {
-    assert_eq!(ptr.addrspace(), Some(space), "pointer must resolve to a {space:?} buffer");
-    let num = match space {
-        AddrSpace::Global => 1,
-        AddrSpace::Local => 3,
-        AddrSpace::Reg => unreachable!("register scratch has no cp.async/ldmatrix form"),
-    };
-    let dtype = DType::Void.ptr(None, space).expect("void is not a pointer");
-    UOp::custom(smallvec![ptr.clone()], format!("addrspacecast ptr {{0}} to ptr addrspace({num})"), dtype)
-}
 
 /// Cache policy of a `cp.async` copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

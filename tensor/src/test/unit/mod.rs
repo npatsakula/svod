@@ -37,6 +37,7 @@ pub mod variable;
 mod attention_helpers;
 mod jit;
 mod layers;
+mod linear_program;
 mod module;
 mod nn_affine;
 mod reduce_symbolic;

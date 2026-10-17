@@ -118,10 +118,18 @@ where
     }
 }
 
+/// The kernel cached under `(program_hash, compiler_key)`, if any.
+pub fn cached_kernel(program_hash: u64, compiler_key: &str) -> Option<Arc<CachedKernel>> {
+    let map = kernels();
+    let guard = map.guard();
+    map.get(&(program_hash, compiler_key.to_string()), &guard).cloned()
+}
+
 // No `clear_all` / `gc_unused_kernels`: the cache is intentionally
 // process-static and deduped by `(program_hash, compiler_key)`. Identical programs share an
 // `Arc<CachedKernel>` so cross-test interference is moot; a public bulk
 // drop would burst `AmdProgram::Drop` (and equivalents) through the cache
 // while in-flight dispatches still resolve through it — exactly the
 // unmap-while-busy hazard the per-connector cleanup paths already create.
-// Programs amortise across the process and the OS reclaims at exit.
+// Programs amortise across the process and the OS reclaims at exit. What
+// must not amortise is never published: see `PrepareConfig::ephemeral`.

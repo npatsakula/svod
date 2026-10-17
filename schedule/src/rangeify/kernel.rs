@@ -576,9 +576,9 @@ fn split_all_stores(root: &Arc<UOp>) -> Arc<UOp> {
             if matches!(computation.op(), Op::Store(..) | Op::End(..))
             => split_store(ctx, node),
     };
-    // Skip the SINK subtree of an already-formed kernel AST.
-    matcher.add(&[OpKey::Sink], |node, _ctx| {
-        if matches!(node.op(), Op::Sink(ops::Sink { info: Some(_), .. })) {
+    // Skip the subtree of an already-formed kernel AST or PROGRAM.
+    matcher.add(&[OpKey::Sink, OpKey::Program], |node, _ctx| {
+        if matches!(node.op(), Op::Sink(ops::Sink { info: Some(_), .. }) | Op::Program(..)) {
             RewriteResult::Gate(node.clone())
         } else {
             RewriteResult::NoMatch

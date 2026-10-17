@@ -104,23 +104,13 @@ See [Pattern system](https://svod.vpermilp.online/docs/architecture/optimization
 
 - **Tensor cores** are chosen per architecture: NVIDIA sm_75/80/89, AMD RDNA3,
   RDNA4 and CDNA3/4, plus Apple Metal. fp8 is available on sm_89 and CDNA3.
-- **Tile kernels (`tk`)**: a ThunderKittens-style tile DSL in Rust for GEMM,
-  flash attention, RMSNorm and k-means. A single kernel source lowers to AMD
-  MFMA/WMMA (gfx942, gfx11, gfx12), CUDA `mma.sync` (sm_80+) and Apple
-  `simdgroup_matrix` (Apple7+). Tile shapes are
-  autotuned on first use and cached. See
+- **Tile kernels (`tk3`)**: hand-written GEMM, flash attention, attention
+  prologue and norm kernels in a structured tile IR with linear layouts,
+  pipelined through `cp.async` and `mma.sync` on CUDA sm_80+, interpreted on
+  the host for tests, and tuned per shape on first use with an on-disk store.
+  Models call them through an op layer that always returns a tensor and keeps
+  the graph where no kernel applies. See
   [Tile kernels](https://svod.vpermilp.online/docs/tile-kernels/overview).
-
-  ```rust
-  fn micro_matmul(ker: &Kernel) -> Arc<UOp> {
-      let w = ker.warp();
-      let a = ker.rt((64, 64), DType::BFloat16, Row, RT_16X16);
-      let b = ker.rt((64, 64), DType::BFloat16, Col, RT_16X16);
-      let c = ker.rt((64, 64), DType::Float32, Col, RT_16X16);
-      let out = w.mma_ab(w.zero(c), &a, &b); // one matrix-core instruction per fragment
-      ker.finish(1)
-  }
-  ```
 - **Kernel search**: hand-written heuristics, or BEAM search over the
   optimization space with a persistent on-disk cache. See
   [Kernel search](https://svod.vpermilp.online/docs/architecture/optimizations/kernel-search).

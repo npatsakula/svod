@@ -480,15 +480,15 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         }
 
         Op::If(ops::If { condition, .. }) => {
-            let cond = ctx.get(condition);
-            let if_id = uop.id;
+            let cond = ctx.get(condition).to_string();
+            let if_id = ctx.label(uop);
             kernel.push(format!("  br i1 {cond}, label %if_then_{if_id}, label %if_end_{if_id}"));
             kernel.push(format!("if_then_{if_id}:"));
             Some(())
         }
 
         Op::EndIf(ops::EndIf { if_op }) => {
-            let if_id = if_op.id;
+            let if_id = ctx.get(if_op);
             kernel.push(format!("  br label %if_end_{if_id}"));
             kernel.push(format!("if_end_{if_id}:"));
             Some(())

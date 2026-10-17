@@ -228,6 +228,65 @@ fn test_custom_kernel_hand_ranged_loop_cpu() {
     });
 }
 
+/// A custom kernel's output is a realized buffer, so a graph op that asks for
+/// it contiguous reads it in place: the plan holds the custom kernel and the
+/// graph kernel, with no copy between them.
+#[test]
+fn a_contiguous_custom_kernel_output_is_not_copied() {
+    test_setup();
+    svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || {
+        let n = 8usize;
+        let src = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let dst = Tensor::empty(&[n], DType::Float32);
+        let mut outputs = dst.custom_kernel(&[&src], hand_ranged_add1_body(n)).expect("custom kernel should build");
+        let out = outputs.remove(0).contiguous().try_reshape([2, 4]).unwrap().contiguous();
+        let doubled = (&out * 2.0f32).unwrap();
+        let plan = doubled.prepare_with(&PrepareConfig::for_cpu_backend(CpuBackend::Clang)).unwrap();
+        assert_eq!(plan.kernels().count(), 2, "the custom kernel and the graph kernel, no copy");
+        plan.execute().unwrap();
+        let mut bytes = vec![0u8; n * 4];
+        plan.output_buffer().unwrap().copyout_prefix(&mut bytes).unwrap();
+        let got: Vec<f32> = bytes.chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let expected: Vec<f32> = (0..n).map(|x| 2.0 * (x as f32 + 1.0)).collect();
+        assert_close_f32(&got, &expected, 1e-6);
+    });
+}
+
+/// A realized shaped input (a reshaped buffer) read by a graph kernel and by
+/// the custom kernel: the graph kernel's indexed load of the shared node must
+/// not replace the call's whole-buffer argument.
+#[test]
+fn test_custom_kernel_input_shared_with_a_graph_kernel() {
+    test_setup();
+    svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || {
+        let n = 8usize;
+        let config = PrepareConfig::for_cpu_backend(CpuBackend::Clang);
+        let src = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).try_reshape([2, 4]).unwrap();
+        src.realize_with(&config).unwrap();
+        assert!(matches!(src.uop().op(), Op::Reshape(..)));
+        let doubled = (&src * 2.0f32).unwrap();
+        let dst = Tensor::empty(&[2, 4], DType::Float32);
+
+        let mut outputs = dst
+            .custom_kernel(&[&doubled, &src], move |ph| {
+                let i = UOp::range_const(n as i64, 0);
+                let load = |buf: &Arc<UOp>| {
+                    UOp::load().index(UOp::index().buffer(buf.base()).indices(vec![i.clone()]).call().unwrap()).call()
+                };
+                let val = load(&ph[1]).try_add(&load(&ph[2])).unwrap();
+                let out_idx = UOp::index().buffer(ph[0].base()).indices(vec![i.clone()]).call().unwrap();
+                let store = out_idx.store(val).end(smallvec![i]);
+                UOp::sink_with_info(vec![store], KernelInfo { opts_to_apply: Some(vec![]), ..Default::default() })
+            })
+            .expect("custom kernel should build");
+
+        let out = outputs.remove(0);
+        out.realize_with(&config).unwrap();
+        let expected: Vec<f32> = (0..n).map(|x| 3.0 * x as f32).collect();
+        assert_close_f32(&out.as_vec::<f32>().unwrap(), &expected, 1e-6);
+    });
+}
+
 /// Hardware-gated: `SVOD_DEVICE=AMD:0 cargo test -p svod-tensor custom_kernel::test_custom_kernel_hand_ranged_loop_amd -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -281,4 +340,42 @@ fn test_tensor_custom_op_amd_end_to_end() {
 
     let result = out.as_vec::<f32>().unwrap();
     assert_close_f32(&result, &[7.0], 1e-6);
+}
+
+/// `empty_dynamic_spec` binds storage of the requested class up front, sized
+/// to every symbolic dim's maximum; a custom kernel writes it and the host
+/// reads it back through `copyout`.
+#[test]
+fn a_spec_bound_empty_is_a_custom_kernel_output() {
+    test_setup();
+    svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || {
+        let n = 8usize;
+        let spec = svod_device::BufferSpec { cpu_access: false, ..Default::default() };
+        let dst = Tensor::empty_dynamic_spec(&[SInt::Const(n)], DType::Float32, spec).unwrap();
+        let bound = dst.buffer().expect("storage bound at construction");
+        assert_eq!(bound.size(), n * 4);
+        assert!(!bound.is_allocated(), "allocated when a plan first runs over it");
+
+        let src = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let out = dst.custom_kernel(&[&src], hand_ranged_add1_body(n)).unwrap().remove(0);
+        out.realize_with(&PrepareConfig::for_cpu_backend(CpuBackend::Clang)).unwrap();
+        let expected: Vec<f32> = (0..n).map(|x| x as f32 + 1.0).collect();
+        assert_close_f32(&out.as_vec::<f32>().unwrap(), &expected, 1e-6);
+        assert_eq!(out.buffer().unwrap().id(), bound.id(), "the kernel wrote the bound storage");
+    });
+}
+
+#[test]
+fn a_spec_bound_empty_is_sized_to_its_variable_max() {
+    let batch = crate::Variable::new("batch", 1, 8);
+    let shape = [batch.as_sint(), SInt::Const(4)];
+    let t = Tensor::empty_dynamic_spec(&shape, DType::Float32, Default::default()).unwrap();
+    assert_eq!(t.buffer().unwrap().size(), 8 * 4 * 4);
+    assert_eq!(t.shape().unwrap()[..], shape[..]);
+}
+
+#[test]
+fn a_spec_bound_empty_of_no_elements_binds_nothing() {
+    let t = Tensor::empty_dynamic_spec(&[SInt::Const(0), SInt::Const(3)], DType::Float32, Default::default()).unwrap();
+    assert!(t.buffer().is_none());
 }

@@ -16,6 +16,7 @@ use svod_ir::{WmmaMetadata, prelude::*};
 
 use crate::llvm::common::gpu::wmma_operand_dtype;
 use crate::llvm::common::{RenderContext, ldt};
+use crate::llvm::nvptx::wgmma;
 
 /// How a fragment is handed to the intrinsic: `<2 x half>` pairs, or 32-bit
 /// words of the given LLVM element type (`i32` for bf16/tf32/fp8/int8 bit
@@ -58,6 +59,9 @@ pub fn render_wmma_nvptx(
     ctx: &mut RenderContext,
     kernel: &mut Vec<String>,
 ) -> Option<()> {
+    if metadata.threads == wgmma::THREADS {
+        return wgmma::render(uop, a, b, c, metadata, ctx, kernel);
+    }
     let dst = ctx.name(uop);
     let a_name = ctx.get(a).to_string();
     let b_name = ctx.get(b).to_string();
@@ -119,7 +123,7 @@ pub fn render_wmma_nvptx(
 /// return their SSA names. `HalfPair` shuffles out `<2 x half>` slices; `Word`
 /// reinterprets the vector as `i32` words (or reads `float`/`i32` lanes
 /// directly when the natural type already is the wire type).
-fn split_fragment(
+pub(crate) fn split_fragment(
     kernel: &mut Vec<String>,
     dst: &str,
     operand: &str,
@@ -167,7 +171,15 @@ fn split_fragment(
 
 /// Reassemble the intrinsic's aggregate result into the WMMA's natural
 /// `<N x T>` vector under `dst`.
-fn join_fragment(kernel: &mut Vec<String>, dst: &str, call: &str, ret_ty: &str, out: &DType, wire: Wire, count: usize) {
+pub(crate) fn join_fragment(
+    kernel: &mut Vec<String>,
+    dst: &str,
+    call: &str,
+    ret_ty: &str,
+    out: &DType,
+    wire: Wire,
+    count: usize,
+) {
     let natural = ldt(out);
     let parts: Vec<String> = (0..count)
         .map(|i| {

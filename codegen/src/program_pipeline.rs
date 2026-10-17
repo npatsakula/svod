@@ -264,6 +264,9 @@ pub fn program_from_sink_with_renderer(sink: Arc<UOp>, renderer: &dyn Renderer) 
 }
 
 fn program_from_sink_impl(sink: Arc<UOp>, device: DeviceSpec, renderer: Option<&dyn Renderer>) -> Result<Arc<UOp>> {
+    if matches!(sink.op(), Op::Program(..)) {
+        return adopt_program(sink, &device, renderer);
+    }
     let sink = if matches!(sink.op(), Op::Sink(..)) { sink } else { UOp::sink(vec![sink]) };
     // Hand-authored kernels carry their stable name in structured SINK info.
     // Optimizer metadata may also be present with an auto-generated shape name;
@@ -300,6 +303,29 @@ fn program_from_sink_impl(sink: Arc<UOp>, device: DeviceSpec, renderer: Option<&
     validate_program_info(&sink, &info, renderer.map(Renderer::device))?;
     svod_ir::dump_canonical_stage("program", &program);
     Ok(program)
+}
+
+/// An author-built PROGRAM (`UOp::linear_program`) crosses the boundary as
+/// is: no CFG, PARAM numbering or instruction selection rewrites it, so only
+/// the checks run. Instruction selection would have to rewrite the LINEAR
+/// list, which an ISA renderer cannot be handed unselected.
+fn adopt_program(program: Arc<UOp>, device: &DeviceSpec, renderer: Option<&dyn Renderer>) -> Result<Arc<UOp>> {
+    validate_program_shape(&program)?;
+    let (sink, info, linear, _, _) = unpack_program(&program)?;
+    if linear.is_some() && renderer.is_some_and(|renderer| renderer.isel_matcher().is_some()) {
+        return Err(invalid_program_state("a pre-linearized PROGRAM cannot pass instruction selection"));
+    }
+    verify_final_sink(&sink)?;
+    verify_program_linear(linear.as_ref())?;
+    validate_program_info(&sink, &info, Some(device))?;
+    Ok(program)
+}
+
+fn verify_program_linear(linear: Option<&Arc<UOp>>) -> Result<()> {
+    match linear.map(|linear| linear.op()) {
+        Some(Op::Linear(ops::Linear { ops })) => verify_linear_list(ops),
+        _ => Ok(()),
+    }
 }
 
 /// PROGRAM -> LINEAR stage.
@@ -496,11 +522,12 @@ pub fn get_program(
     let mut program = match input.op() {
         Op::Program(..) => {
             validate_program_shape(input)?;
-            let (sink, info, _, _, _) = unpack_program(input)?;
+            let (sink, info, linear, _, _) = unpack_program(input)?;
             // The only `spec_program` check on an externally supplied PROGRAM:
             // one that already carries a LINEAR stage skips `do_linearize`, so
-            // its SINK would otherwise never be verified here.
+            // neither its SINK nor its list would otherwise be verified here.
             verify_final_sink(&sink)?;
+            verify_program_linear(linear.as_ref())?;
             validate_program_info(&sink, &info, Some(renderer.device()))?;
             input.clone()
         }
