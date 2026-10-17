@@ -27,9 +27,9 @@ sidebar_label: 可移植性
 |---|---|---|---|---|
 | CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`，2–3 级 | 有 | 在 RTX 3060 上测量 |
 | CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix`；基于共享描述符的 `wgmma` m64nNk16（GEMM） | `cp.async`，共享内存最多 227 KB | 有 | 在 H100 PCIe 上测得：GEMM 4096³ bf16 在 warpgroup 核心上 433 TFLOP/s（`mma.sync` 234；cuBLASLt 524） |
-| AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16，每 lane 8 个值 | 寄存器中转，1–2 级 | 有，未测量 | 已编译为 code object；未运行 |
-| AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16，输入复制 | 寄存器中转，1–2 级 | 有，未测量 | 已编译为 code object；未运行 |
-| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16，wave64 | 寄存器中转，1–2 级 | 有，未测量 | 已为 gfx942 编译；未运行 |
+| AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16，每 lane 8 个值 | 寄存器中转，1–2 级 | 有 | 在 RX 9070 XT (gfx1201) 上测得：GEMM 4096³ bf16 148 TFLOP/s（rocBLAS 80），attention d64 117 |
+| AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16，输入复制 | 寄存器中转，1–2 级 | 有 | 在 Strix Halo (gfx1151) 上测得：GEMM 4096³ bf16 28 TFLOP/s（rocBLAS 32.5），attention d64 28；gfx1100–1102 已编译，未运行 |
+| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16，wave64 | 寄存器中转，1–2 级 | 有 | 在 MI300X (gfx942) 上测得：GEMM 4096³ bf16 在单槽位环上 511 TFLOP/s（hipBLASLt 615），attention d64 257、d128 292；gfx950 已编译，未运行 |
 | Apple | simdgroup 8×8×8 | 无 | 无 | 仅有原子 |
 
 `ops::supported(device)` 仅在有配置表的地方为真；在其他设备上，每个 op 构建自己的图回退（`Fallback::Target`）。主机测试把每个原子的操作数布局与厂商 ISA 文档中的 lane 公式逐一核对；对每个有配置表的目标，它们降级每个内核族，在降级前后用解释器运行，并在安装了 `ptxas` 或 clang 时编译。"已编译"不等于"在设备上正确"：只有当 `targets::families_match_the_interpreter_on_the_device` 在该硬件上通过时，目标才算已测量。
