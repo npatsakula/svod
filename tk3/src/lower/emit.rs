@@ -68,6 +68,8 @@ struct Emit<'a> {
     lane: Arc<UOp>,
     warp: Arc<UOp>,
     tid: Arc<UOp>,
+    /// The block's index along each grid axis, once taken ([`Self::block_index`]).
+    blocks: [Option<Arc<UOp>>; 3],
     /// Whose threads the statement being emitted belongs to: the block's, or
     /// one warp's own inside a [`Stmt::Warps`].
     scope: Scope,
@@ -158,6 +160,7 @@ impl<'a> Emit<'a> {
             lane,
             warp,
             tid,
+            blocks: [None, None, None],
             scope: Scope::Block,
             range_id: 0,
             reg_slot: 0,
@@ -280,10 +283,7 @@ impl<'a> Emit<'a> {
                 return (0, u);
             }
             Scalar::Var(name) => (0, self.vars[name].clone()),
-            Scalar::Special(Special::Block(axis)) => {
-                let end = self.scalar(self.prog.grid[*axis as usize]).1;
-                (0, UOp::special_dtype(end, format!("gidx{axis}"), DType::Int32))
-            }
+            Scalar::Special(Special::Block(axis)) => (0, self.block_index(*axis as usize)),
             Scalar::Special(Special::Warp) => (0, self.warp.clone()),
             Scalar::Induction => return self.inductions[&id].clone(),
             Scalar::Bin(op, a, b) => {
@@ -323,6 +323,42 @@ impl<'a> Emit<'a> {
 
     fn sc(&mut self, id: ScalarId) -> Arc<UOp> {
         self.scalar(id).1
+    }
+
+    /// The block's index along grid `axis`: the hardware's, or on a target
+    /// of several dies the index of the block that the hardware's linear
+    /// position lands on under [`die_order`], so the blocks a kernel places
+    /// next to each other (sharing a panel, a head's keys) share a die's L2.
+    /// Every axis is derived at once and kept, listed in the prologue.
+    fn block_index(&mut self, axis: usize) -> Arc<UOp> {
+        if let Some(b) = &self.blocks[axis] {
+            return b.clone();
+        }
+        let ends: Vec<Arc<UOp>> = (0..3).map(|a| self.scalar(self.prog.grid[a]).1).collect();
+        let hw: Vec<Arc<UOp>> =
+            (0..3).map(|a| UOp::special_dtype(ends[a].clone(), format!("gidx{a}"), DType::Int32)).collect();
+        let dies = self.low.device.target.xcds as i64;
+        let blocks = if dies > 1 {
+            let linear = add(&hw[0], &mul(&ends[0], &add(&hw[1], &mul(&ends[1], &hw[2]))));
+            let total = mul(&ends[0], &mul(&ends[1], &ends[2]));
+            let (base, tall) = (total.try_cdiv(&c32(dies)).expect("base"), total.try_cmod(&c32(dies)).expect("tall"));
+            let (die, local) = (linear.try_cmod(&c32(dies)).expect("die"), linear.try_cdiv(&c32(dies)).expect("local"));
+            // `min(die, tall)`: the dies before `tall` hold a block more.
+            let extra = add(&die, &tall).try_sub(&die.try_max(&tall).expect("max")).expect("min");
+            let ordered = self.hoist(add(&add(&mul(&die, &base), &extra), &local));
+            let per_plane = mul(&ends[0], &ends[1]);
+            [
+                ordered.try_cmod(&ends[0]).expect("x"),
+                ordered.try_cdiv(&ends[0]).expect("row").try_cmod(&ends[1]).expect("y"),
+                ordered.try_cdiv(&per_plane).expect("z"),
+            ]
+        } else {
+            [hw[0].clone(), hw[1].clone(), hw[2].clone()]
+        };
+        for (a, b) in blocks.into_iter().enumerate() {
+            self.blocks[a] = Some(self.hoist(b));
+        }
+        self.blocks[axis].clone().expect("just taken")
     }
 
     /// The value of a scalar that is arithmetic over constants.
@@ -1488,6 +1524,16 @@ impl<'a> Emit<'a> {
             }
         }
     }
+}
+
+/// The block that hardware position `linear` of `total` runs on a target of
+/// `dies` dies, each taking every `dies`th block of a dispatch: the dies'
+/// shares laid end to end (the first `total % dies` dies hold a block more),
+/// so a die runs a contiguous range of the kernel's block order.
+pub fn die_order(linear: u64, total: u64, dies: u64) -> u64 {
+    let (base, tall) = (total / dies, total % dies);
+    let (die, local) = (linear % dies, linear / dies);
+    die * base + die.min(tall) + local
 }
 
 /// DPP's `row_xmask` control: OR the lane xor-mask within a row of 16.

@@ -81,6 +81,10 @@ pub struct Target {
     pub smem_bytes: usize,
     /// Streaming multiprocessors (compute units), when the device reports them.
     pub sms: Option<u32>,
+    /// Dies a dispatch deals its blocks to round-robin, each with its own L2
+    /// (CDNA3's XCDs): the lowering renumbers blocks so consecutive ones share
+    /// a die ([`crate::lower::emit::die_order`]). 1 where a device is one die.
+    pub xcds: u32,
     pub occupancy: Occupancy,
     /// The machine scheduler hoists a pipeline trip's shared-memory commit above
     /// its products unless fenced (`Sync::Fence` → `sched_barrier`), leaving
@@ -250,6 +254,7 @@ impl Target {
             dot2_bf16,
             smem_bytes,
             sms: None,
+            xcds: 1,
             commit_fence,
             bf16_cvt,
             mma_on_valu,
@@ -284,6 +289,7 @@ impl Target {
                     if node.max_waves_per_simd > 0 {
                         target.occupancy.waves = node.max_waves_per_simd;
                     }
+                    target.xcds = node.num_xcc.max(1);
                 }
                 return Some(target);
             }
