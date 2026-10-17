@@ -175,22 +175,23 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     }
 
     /// `candidates` in the order they ran by the global store under `op`,
-    /// fastest first, timed on a miss; as given when tuning is off, alone or
-    /// nothing ran.
-    pub(crate) fn ordered(&mut self, op: &'static str, candidates: &[C]) -> Vec<C> {
+    /// fastest first, each with its device ns, timed on a miss; as given
+    /// and untimed when tuning is off, alone or nothing ran.
+    pub(crate) fn ordered(&mut self, op: &'static str, candidates: &[C]) -> Vec<(C, Option<u64>)> {
+        let untimed = || candidates.iter().map(|&c| (c, None)).collect();
         if !tune::enabled() || candidates.len() == 1 {
-            return candidates.to_vec();
+            return untimed();
         }
         let key = self.key(op, candidates);
         match TuneStore::global().choose(&key, candidates, &self.build, &mut self.bench) {
-            Some(order) => order.iter().map(|&i| candidates[i]).collect(),
-            None => candidates.to_vec(),
+            Some(timed) => timed.iter().map(|&(i, ns)| (candidates[i], Some(ns))).collect(),
+            None => untimed(),
         }
     }
 
     /// The fastest of `candidates` ([`Self::ordered`]).
     pub(crate) fn fastest(&mut self, op: &'static str, candidates: &[C]) -> C {
-        self.ordered(op, candidates)[0]
+        self.ordered(op, candidates)[0].0
     }
 
     /// The candidate to launch: `expand` makes the admitted configs of
@@ -203,17 +204,24 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         self.pipelined(op, &ordered, ranked)
     }
 
-    /// The fastest pipeline of the leading [`config::TWIN_TILES`] tiles of
-    /// `ordered` (fastest first): their [twins](config::Tiled::twins) in
-    /// `ranked` compiled and timed together, every one that compiles,
+    /// The fastest pipeline of the leading tiles of `ordered` (fastest
+    /// first, with their times): the tiles within the contender band of the
+    /// leader, at most [`config::TWIN_TILES`], their [twins](config::Tiled::twins)
+    /// in `ranked` compiled and timed together, every one that compiles,
     /// spilling or not ([`config::compiled`]), the winner among them (the
     /// shortlist held one pipeline per tile, the model's first clean one,
     /// and a tile's place in it is that pipeline's). The leader itself with
     /// tuning off, alone, or where no other twin compiles to be judged.
-    pub(crate) fn pipelined(&mut self, op: &'static str, ordered: &[C], ranked: &[C]) -> C {
-        let winner = ordered[0];
-        let leaders: Vec<C> = config::distinct(ordered).take(config::TWIN_TILES).collect();
+    pub(crate) fn pipelined(&mut self, op: &'static str, ordered: &[(C, Option<u64>)], ranked: &[C]) -> C {
+        let (winner, lead) = ordered[0];
+        let near: Vec<C> = ordered
+            .iter()
+            .filter(|(_, ns)| lead.zip(*ns).is_none_or(|(lead, ns)| ns as f64 <= lead as f64 * tune::CONTENDER))
+            .map(|&(c, _)| c)
+            .collect();
+        let leaders: Vec<C> = config::distinct(&near).take(config::TWIN_TILES).collect();
         let twins: Vec<C> = config::distinct_configs(&leaders.iter().flat_map(|l| l.twins(ranked)).collect::<Vec<_>>());
+        tracing::debug!(?leaders, twins = twins.len(), "tuner's twins");
         if !tune::enabled() || twins.len() < 2 {
             return winner;
         }
