@@ -23,7 +23,7 @@ fn expansion_preserves_the_result(prefetch: Prefetch, stages: usize) {
     let a: Vec<f64> = (0..m * k).map(|i| round_to(ScalarDType::BFloat16, ((i * 13) % 17) as f64 / 8.0 - 1.0)).collect();
     let b: Vec<f64> = (0..n * k).map(|i| round_to(ScalarDType::BFloat16, ((i * 7) % 19) as f64 / 8.0 - 1.0)).collect();
     let want = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[("b", 1)]).unwrap();
-    expand(&mut prog, Schedule::Uniform { prefetch, unroll: true });
+    expand(&mut prog, Schedule::Uniform { prefetch, unroll: true, async_products: false });
     let got = run(&prog, vec![a, b, vec![0.0; m * n]], &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
@@ -50,6 +50,46 @@ fn expansion_preserves_the_result(prefetch: Prefetch, stages: usize) {
     }
 }
 
+/// The ring that leaves a trip's products in flight keeps the result too,
+/// and its bookkeeping is as documented: production lags a trip (a slot is
+/// refilled two trips after it was consumed), `stages - 3` copy groups stay
+/// pending at a consume, every consume ends waiting for all but its
+/// youngest chain and the loop ends waiting for every chain.
+#[test_case(3; "three stages")]
+#[test_case(4; "four stages")]
+fn products_in_flight_preserve_the_result(stages: usize) {
+    let (m, n, k) = (64usize, 32usize, 160usize);
+    let mut prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
+    let a: Vec<f64> = (0..m * k).map(|i| round_to(ScalarDType::BFloat16, ((i * 13) % 17) as f64 / 8.0 - 1.0)).collect();
+    let b: Vec<f64> = (0..n * k).map(|i| round_to(ScalarDType::BFloat16, ((i * 7) % 19) as f64 / 8.0 - 1.0)).collect();
+    let want = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[("b", 1)]).unwrap();
+    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: true, async_products: true });
+    let got = run(&prog, vec![a, b, vec![0.0; m * n]], &[("b", 1)]).unwrap();
+    assert_eq!(got[2], want[2]);
+    let syncs: Vec<Sync> =
+        prog.walk().filter_map(|(_, s)| if let Stmt::Sync(s) = s { Some(*s) } else { None }).collect();
+    let copies = syncs.iter().filter(|s| matches!(s, Sync::WaitAsync { .. })).count();
+    assert_eq!(copies, 1);
+    assert!(syncs.contains(&Sync::WaitAsync { pending: stages as u32 - 3 }), "{syncs:?}");
+    let waits: Vec<u32> = syncs
+        .iter()
+        .filter_map(|s| if let Sync::WaitProducts { pending } = s { Some(*pending) } else { None })
+        .collect();
+    assert_eq!(waits, [1, 0], "one in the loop, one after it");
+    let at = prog.body.0.iter().position(|s| matches!(s, Stmt::Loop(_))).expect("the ring's loop");
+    let Stmt::Loop(l) = &prog.body.0[at] else { unreachable!() };
+    assert!(matches!(prog.body.0[at + 1], Stmt::Sync(Sync::WaitProducts { pending: 0 })), "waited right after");
+    let Stmt::If { then, .. } = &l.body.0[0] else { panic!("the consume first") };
+    assert!(
+        matches!(then.0.last(), Some(Stmt::Sync(Sync::WaitProducts { pending: 1 }))),
+        "the consume ends in its wait"
+    );
+    // The produce stage's step is `iv - 1`: a lag of one trip.
+    let Stmt::If { pred, .. } = &l.body.0[1] else { panic!("the produce second") };
+    let Scalar::Bin(BinOp::And, started, _) = prog.scalar(*pred) else { panic!("started and before the end") };
+    assert!(matches!(prog.scalar(*started), Scalar::Bin(BinOp::Le, _, iv) if *iv == l.iv));
+}
+
 /// A copy carries the scope it was recorded in, and the halves register
 /// staging splits it into keep it: inside a `Warps` statement every copy is
 /// one warp's own, outside it the block's.
@@ -73,7 +113,7 @@ fn staged_halves_keep_their_copys_scope() {
         cfg,
     };
     let mut prog = attention::<BF16>(&spec);
-    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: false });
+    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: false, async_products: false });
     fn copies(block: &Block, inside: bool, out: &mut Vec<(bool, Scope, CopyMode)>) {
         for s in &block.0 {
             match s {
@@ -113,7 +153,7 @@ fn staged_halves_keep_their_copys_scope() {
 #[test]
 fn register_staging_peels_the_ring_into_three_branch_free_loops() {
     let mut prog = super::gemm_nt(32, 32, 64, 32, 32, 32, 2);
-    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: true });
+    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: true, async_products: false });
     let loops: Vec<&Loop> =
         prog.body.0.iter().filter_map(|s| if let Stmt::Loop(l) = s { Some(l) } else { None }).collect();
     let [head, steady, drain] = loops[..] else { panic!("three loops, got {}", loops.len()) };

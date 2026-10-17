@@ -13,6 +13,7 @@ sidebar_label: पोर्टेबिलिटी
 | `arch` | `GpuArch::{Cuda, Amd, Metal}` |
 | `wave` | हर warp या wave में lanes |
 | `mma` | अपने operand layouts के साथ matrix-core atoms |
+| `group_mma` | shared-memory descriptors पर warpgroup matrix atoms (CUDA sm_90) |
 | `cp_async` | Asynchronous global → shared copies (CUDA sm_80+) |
 | `ldmatrix` | Warp-collective 8×8 b16 fragment loads (CUDA sm_75+) |
 | `smem_bytes` | हर block की shared memory (device बताए तो opt-in सीमा) |
@@ -33,7 +34,7 @@ score का softmax काम, एक trip, एक lane move, एक shared rou
 | Target | Atoms | Fills | Tables | स्थिति |
 |---|---|---|---|---|
 | CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, 2–3 stages | हाँ | RTX 3060 पर मापा गया |
-| CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, 227 KB तक shared | sm_80 tables | Compile हुआ: हर family `ptxas -arch=sm_90` और `sm_90a` से assemble होती है; चलाया नहीं गया |
+| CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix`; shared descriptors पर `wgmma` m64nNk16 (GEMM) | `cp.async`, 227 KB तक shared | हाँ | H100 PCIe पर मापा गया: GEMM 4096³ bf16 warpgroup core पर 433 TFLOP/s (`mma.sync` पर 234; cuBLASLt 524) |
 | AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, हर lane में 8 values | register-staged, 1–2 stages | हाँ, मापी नहीं गईं | Code objects में compile हुआ; चलाया नहीं गया |
 | AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 1–2 stages | हाँ, मापी नहीं गईं | Code objects में compile हुआ; चलाया नहीं गया |
 | AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages | हाँ, मापी नहीं गईं | gfx942 के लिए compile हुआ; चलाया नहीं गया |
@@ -70,7 +71,7 @@ data है, जिसे lowering और op layer चुनते हैं:
 
 | आइटम | स्थिति |
 |---|---|
-| Hopper (sm_90a): wgmma, TMA, mbarrier, warp-specialized template | शुरू नहीं हुआ; Hopper `mma.sync` path पर चलता है (substrate items 5–8) |
+| Hopper (sm_90a): TMA, mbarrier, warp-specialized template; attention के लिए `wgmma` और trips के बीच उसका overlap | शुरू नहीं हुआ; GEMM `wgmma` पर चलता है जहाँ हर product की chain अपने statement के भीतर पूरी होने का इंतज़ार करती है, attention `mma.sync` पर |
 | Blackwell (sm_100a): tcgen05, tensor memory | शुरू नहीं हुआ; B200 तक पहुँच नहीं |
 | AMD CDNA: ping-pong template, MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ |
 | AMD पर माप | gfx1201 (RX 9070 XT) पर मापा गया: Qwen3 और YOLO पर GEMM, convolution और attention tk1 से आगे; gfx1151 (Strix Halo) पर मापा गया: d = 64 और 128 पर attention; CDNA compile हुआ, चलाया नहीं गया |

@@ -11,7 +11,7 @@ use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::launch::graph_launch;
 use crate::ops::config::Planner;
 
@@ -62,7 +62,7 @@ fn gemm_matches_the_interpreter(
         eprintln!("skipped: no CUDA device");
         return;
     };
-    let cfg = GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m: 0, unroll: true };
+    let cfg = GemmCfg { core: Core::Warp, tile: [bm, bn, bk], stages, warps: [wr, wc], group_m: 0, unroll: true };
     check_gemm(&declared(target), m, n, k, cfg);
 }
 
@@ -85,10 +85,52 @@ fn every_gemm_candidate_matches_the_interpreter() {
     }
 }
 
-/// A config standing in where a spec's own is replaced.
-const BIG: GemmCfg = GemmCfg { tile: [128, 128, 32], stages: 2, warps: [2, 4], group_m: 8, unroll: true };
+/// A warpgroup GEMM against the warp-core one of the same block tile on the
+/// same operands, over partial tiles and a `k` of several trips: both agree
+/// with the interpreter as every config must, and with each other bit for
+/// bit (the two cores accumulate a `k16` step alike; measured so on an H100
+/// over every shape here).
+#[test_case([128, 128, 64], [8, 1], [2, 4], 3; "128x128x64 two groups")]
+#[test_case([128, 256, 64], [8, 1], [2, 4], 2; "128x256x64 two groups")]
+#[test_case([64, 128, 32], [4, 1], [2, 2], 3; "64x128x32 one group")]
+#[test_case([64, 64, 16], [4, 1], [2, 2], 3; "64x64x16 one group")]
+#[test_case([128, 96, 64], [8, 1], [4, 1], 2; "128x96x64 three n32")]
+#[test_case([256, 128, 64], [16, 1], [4, 4], 2; "256x128x64 four groups")]
+#[test_case([128, 256, 64], [8, 2], [4, 4], 2; "128x256x64 two by two")]
+fn warpgroup_gemm_matches_the_warp_core(tile: [usize; 3], group: [u32; 2], warp: [u32; 2], stages: usize) {
+    let Some(target) = cuda_target().filter(|t| !t.group_mma.is_empty()) else {
+        eprintln!("skipped: no CUDA device with a warpgroup core");
+        return;
+    };
+    let device = declared(target);
+    // Rows stay 16-byte aligned for the chunk fills: `n` a multiple of eight.
+    let (m, n, k) = (tile[0] * 2 - 5, tile[1] + 8, tile[2] * 5);
+    let cfgs = [(Core::Group, group), (Core::Warp, warp)].map(|(core, warps)| GemmCfg {
+        tile,
+        stages,
+        warps,
+        group_m: 8,
+        unroll: false,
+        core,
+    });
+    let outs: Vec<Vec<f32>> = cfgs.iter().map(|cfg| check_gemm(&device, m, n, k, *cfg)).collect();
+    let (same, worst) = outs[0].iter().zip(&outs[1]).fold((0usize, 0.0f32), |(same, worst), (g, w)| {
+        (same + usize::from(g.to_bits() == w.to_bits()), worst.max((g - w).abs() / w.abs().max(1.0)))
+    });
+    eprintln!(
+        "{tile:?} {group:?} vs {warp:?}: {same} of {} bit-equal, worst relative difference {worst:.3e}",
+        outs[0].len()
+    );
+    assert_eq!(same, outs[0].len(), "{tile:?}: the warpgroup and warp cores differ");
+}
 
-fn check_gemm(device: &Device, m: usize, n: usize, k: usize, cfg: GemmCfg) {
+/// A config standing in where a spec's own is replaced.
+const BIG: GemmCfg =
+    GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 2, warps: [2, 4], group_m: 8, unroll: true };
+
+/// The device's result, checked against the interpreter's within the
+/// rounding a bf16 store and f32 accumulation allow.
+fn check_gemm(device: &Device, m: usize, n: usize, k: usize, cfg: GemmCfg) -> Vec<f32> {
     let prog = plain_gemm(m, n, k, cfg);
     let lowering = cfg.lowering(device);
     let mut seed = 11;
@@ -113,6 +155,7 @@ fn check_gemm(device: &Device, m: usize, n: usize, k: usize, cfg: GemmCfg) {
         assert!(diff <= 1.6e-2 * w.abs().max(1.0), "{cfg:?}: c[{}, {}] = {g}, interpreter {w}", i / n, i % n);
     }
     eprintln!("{cfg:?}: max abs diff {worst:.3e}");
+    got
 }
 
 /// Throughput probe of tk3 GEMM configs at 4096³ bf16: the configs the
@@ -152,6 +195,7 @@ fn gemm_throughput_probe() {
             (128, 128, 32, 2, 2, 4, 8, false),
         ]
         .map(|(bm, bn, bk, stages, wr, wc, group_m, unroll)| GemmCfg {
+            core: Core::Warp,
             tile: [bm, bn, bk],
             stages,
             warps: [wr, wc],
@@ -162,18 +206,36 @@ fn gemm_throughput_probe() {
     } else {
         admitted
     };
+    if !target.group_mma.is_empty() {
+        cfgs.extend(
+            [
+                ([128, 128, 64], [8, 1], 3),
+                ([128, 256, 64], [8, 1], 2),
+                ([128, 256, 64], [8, 2], 2),
+                ([256, 128, 64], [16, 1], 2),
+            ]
+            .map(|(tile, warps, stages)| GemmCfg {
+                tile,
+                stages,
+                warps,
+                group_m: 8,
+                unroll: false,
+                core: Core::Group,
+            }),
+        );
+    }
     // The pick may be a pipeline twin of an admitted tile, or outside the fixed set.
     if !cfgs.contains(&pick) {
         cfgs.push(pick);
     }
     for cfg in cfgs {
-        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll } = cfg;
+        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll, core } = cfg;
         let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(&planner.device));
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
         let picked = if cfg == pick { " (tuner's pick)" } else { "" };
         plans.push((
-            format!("tk3 {bm}x{bn}x{bk} s{stages} {wr}x{wc} group_m={group_m} unroll={unroll}{picked}"),
+            format!("tk3 {bm}x{bn}x{bk} s{stages} {wr}x{wc} group_m={group_m} unroll={unroll} {core:?}{picked}"),
             out.prepare().unwrap(),
         ));
     }
@@ -212,7 +274,7 @@ fn gemm_candidates_probe() {
         eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
-    let ladder = GemmCfg { tile: [128, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true };
+    let ladder = GemmCfg { core: Core::Warp, tile: [128, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true };
     let plain = Epilogue::default();
     for (m, n, k, epilogue, var) in [
         (704, 1536, 512, plain, true),
@@ -274,7 +336,7 @@ fn first_execution_probe() {
     b_t.realize().unwrap();
     let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
     for (bm, bn, stages) in [(128, 128, 3), (64, 64, 2)] {
-        let cfg = GemmCfg { tile: [bm, bn, 32], stages, warps: [2, 2], group_m: 8, unroll: false };
+        let cfg = GemmCfg { core: Core::Warp, tile: [bm, bn, 32], stages, warps: [2, 2], group_m: 8, unroll: false };
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(plain_gemm(m, n, k, cfg), &cfg.lowering(&device), &[&a_t, &b_t, &c_t]).unwrap();
         plans.push((format!("tk3 {bm}x{bn} s{stages}"), out.prepare().unwrap()));
@@ -284,7 +346,7 @@ fn first_execution_probe() {
     let graph = a2.matmul(&b2.try_transpose(0, 1).unwrap()).unwrap();
     plans.push(("graph matmul".to_string(), graph.prepare().unwrap()));
     // Host-side cost: building, lowering and scheduling the pre-linearized body.
-    let cfg = GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: false };
+    let cfg = GemmCfg { core: Core::Warp, tile: [64, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: false };
     for i in 0..3 {
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let t = std::time::Instant::now();
@@ -357,7 +419,8 @@ fn qwen3_gemm_candidates_probe() {
                 for bk in [16, 32, 64] {
                     for warps in [[2, 2], [2, 4], [4, 2], [4, 4]] {
                         for unroll in [false, true] {
-                            let cfg = GemmCfg { tile: [bm, bn, bk], stages: 2, warps, group_m: 8, unroll };
+                            let cfg =
+                                GemmCfg { core: Core::Warp, tile: [bm, bn, bk], stages: 2, warps, group_m: 8, unroll };
                             let fits = cfg.fits(target) && cfg.smem_bytes(epilogue.gated) <= target.smem_bytes;
                             if fits && !shortlist.contains(&cfg) {
                                 lattice.push(cfg);

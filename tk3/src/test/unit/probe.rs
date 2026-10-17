@@ -10,7 +10,7 @@ use svod_dtype::{AmdArch, DType, DeviceSpec, GpuArch};
 use svod_ir::UOp;
 use test_case::test_case;
 
-use super::targets::{amd, render};
+use super::targets::{amd, hopper, render};
 use crate::atoms::{Costs, Target, sm86};
 use crate::ir::*;
 use crate::layouts::Relayout;
@@ -100,7 +100,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
         probe.value(l.carried[0].phi).shape.elems()
     };
     match field {
-        "step" => (blocks * extent * mma(probe) / 4096) as f64,
+        "step" | "step_group" => (blocks * extent * mma(probe) / 4096) as f64,
         "smem_byte" | "global_byte" => {
             let tier = if field == "smem_byte" { Tier::Smem } else { Tier::Global };
             (blocks * extent * loads_from(probe, tier).iter().map(|l| l.1).sum::<usize>()) as f64
@@ -126,18 +126,20 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
 }
 
 /// A probe that fails leaves its field at zero and names itself; every
-/// other field is what its probe measured.
+/// other field is what its probe measured, and a primitive the target
+/// lacks (sm_86 has no warpgroup core) costs zero without being unmeasured.
 #[test]
 fn an_unmeasured_field_leaves_its_default() {
     let target = sm86();
     let measured = crate::probe::assemble(&target, probes(&target), |p| match p.op {
         "probe:step" => Err(crate::probe::Error::Unmeasured { probe: p.op, last: "no stamps".into() }),
+        "probe:step_group" => unreachable!("an absent primitive is not measured"),
         _ => Ok(1.5),
     });
     assert_eq!(measured.unmeasured, ["step"]);
     let mut costs = measured.costs;
     for (name, value) in costs.fields() {
-        assert_eq!(*value, if name == "step" { 0.0 } else { 1.5 }, "{name}");
+        assert_eq!(*value, if ["step", "step_group"].contains(&name) { 0.0 } else { 1.5 }, "{name}");
     }
 }
 
@@ -209,6 +211,7 @@ fn a_cache_probe_sweeps_every_tile(target: Target, sms: u32) {
 /// Every probe pair lowers and renders for the target, and is keyed by
 /// the field it measures; so do the cache probes, smallest footprint first.
 #[test_case(sm86(); "sm86")]
+#[test_case(hopper(); "sm90")]
 #[test_case(gfx1151(); "gfx1151")]
 #[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
 fn every_probe_renders(target: Target) {
@@ -231,11 +234,16 @@ fn every_probe_renders(target: Target) {
 /// times the primitive per trip (the extra trips over the baseline's, for a
 /// pipeline; every trip, for the rolled ring).
 #[test_case(sm86(); "sm86")]
+#[test_case(hopper(); "sm90")]
 #[test_case(gfx1151(); "gfx1151")]
 fn units_count_the_primitive(target: Target) {
     let probes = probes(&target);
     for p in &probes {
         let field = p.op.strip_prefix("probe:").expect("a probe op");
+        if p.candidates.is_empty() {
+            assert!(field == "step_group" && target.group_mma.is_empty(), "{}: an absent primitive", p.op);
+            continue;
+        }
         let (_, probe) = pair(p);
         assert_eq!(p.units, counted(&target, &probes, field), "{}", p.op);
         if ["scatter", "step_lone", "lane_move", "smem_trip"].contains(&field) {
@@ -306,6 +314,7 @@ fn in_loop(ir: &str) -> &str {
 /// nowhere. A shared tile is read through the ring's pointer, `%local0`.
 #[test_case(sm86(), "step", "@llvm.nvvm.mma."; "sm86 mma.sync")]
 #[test_case(gfx1151(), "step", "@llvm.amdgcn.wmma."; "gfx1151 wmma")]
+#[test_case(hopper(), "step_group", "wgmma.mma_async.sync.aligned.m64n256k16"; "sm90 wgmma")]
 #[test_case(sm86(), "step_lone", "@llvm.nvvm.mma."; "sm86 lone mma.sync")]
 #[test_case(gfx1151(), "step_lone", "@llvm.amdgcn.wmma."; "gfx1151 lone wmma")]
 #[test_case(sm86(), "smem_byte", "ptr %local0"; "sm86 shared load")]

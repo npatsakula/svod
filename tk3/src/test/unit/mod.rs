@@ -25,7 +25,7 @@ use crate::build::BF16;
 use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::ops::config::Planner;
 
 /// The default device's target when tk3 has tables for it, of any vendor.
@@ -93,6 +93,7 @@ pub(crate) fn costs() -> Costs {
         global_byte: 0.02,
         scatter: 8.0,
         step: 5.0,
+        step_group: 0.0,
         // A guess: three waves a SIMD hide the chain.
         step_lone: 15.0,
         score: 0.5,
@@ -116,6 +117,7 @@ pub(crate) fn gfx1151_costs() -> Costs {
         global_byte: 0.1877,
         scatter: 3.05,
         step: 6.25,
+        step_group: 0.0,
         // Unmeasured there: equal to `step`, so a lone wave hides nothing.
         step_lone: 6.25,
         score: 0.0773,
@@ -143,7 +145,7 @@ fn gemm_nt(m: usize, n: usize, k: usize, bm: usize, bn: usize, bk: usize, stages
 }
 
 fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, batch: Batch) -> Program {
-    let cfg = GemmCfg { tile, stages, warps: [2, 4], group_m: 0, unroll: true };
+    let cfg = GemmCfg { core: Core::Warp, tile, stages, warps: [2, 4], group_m: 0, unroll: true };
     gemm::<BF16>(&GemmSpec { m, n, k, batch, epilogue: Epilogue::default(), cfg })
 }
 

@@ -173,8 +173,9 @@ fn gathered_gemm_matches_the_reference_in_the_interpreter() {
 
 fn lowering(target: Target, prefetch: Prefetch, warps: [u32; 2]) -> Lowering {
     Lowering {
+        group: false,
         device: declared(target),
-        schedule: Schedule::Uniform { prefetch, unroll: true },
+        schedule: Schedule::Uniform { prefetch, unroll: true, async_products: false },
         grid: WarpGrid { rows: warps[0], cols: warps[1] },
         swizzle: true,
     }

@@ -17,8 +17,13 @@ pub enum Prefetch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Schedule {
     /// Every warp loads and computes; `unroll` copies the loop body once per
-    /// ring slot so slot addressing folds to constants.
-    Uniform { prefetch: Prefetch, unroll: bool },
+    /// ring slot so slot addressing folds to constants. With
+    /// `async_products` a consume's warpgroup products are left in flight
+    /// over the next trip's fill (`cp.async` rings of three slots or more):
+    /// the ring refills the slot consumed two trips ago, and the template
+    /// waits for all but the youngest chain after every consume and for
+    /// every chain after the loop ([`Sync::WaitProducts`]).
+    Uniform { prefetch: Prefetch, unroll: bool, async_products: bool },
 }
 
 /// Replace every [`Stmt::Pipeline`] of `prog` by loops, branches and explicit
@@ -88,8 +93,11 @@ impl Expander<'_> {
         let Pipeline { extent, stages, carried, produce, consume } = p;
         let produce = Stage { body: self.block(produce.body), ..produce };
         let consume = Stage { body: self.block(consume.body), ..consume };
-        let Schedule::Uniform { prefetch, unroll } = self.schedule;
+        let Schedule::Uniform { prefetch, unroll, async_products } = self.schedule;
         let mut out = match prefetch {
+            Prefetch::CpAsync if stages >= 3 && async_products => {
+                self.cp_async_products(extent, stages, carried, produce, consume)
+            }
             Prefetch::CpAsync if stages >= 2 => self.cp_async(extent, stages, carried, produce, consume),
             Prefetch::CpAsync => self.single_stage(extent, carried, produce, consume),
             Prefetch::RegisterStaged => self.register_staged(extent, stages, carried, produce, consume),
@@ -140,6 +148,50 @@ impl Expander<'_> {
             Stmt::Sync(Sync::CommitAsync),
         ];
         vec![Stmt::Loop(Loop { iv, start, extent: total, carried, body: Block(body), unroll: stages as u32 })]
+    }
+
+    /// [`Self::cp_async`] with the consume's products left in flight: step
+    /// `i - 1` is issued at iteration `i` into the slot consumed two
+    /// iterations ago (the slot of the chain still running was consumed
+    /// one ago), so `stages - 3` groups stay pending at a consume. Every
+    /// thread waits for all but its youngest chain at the end of each
+    /// consume, and the barrier before the next consume then holds every
+    /// warpgroup's chain over a slot complete before that slot is refilled.
+    fn cp_async_products(
+        &mut self,
+        extent: ScalarId,
+        stages: usize,
+        carried: Vec<Carried>,
+        produce: Stage,
+        consume: Stage,
+    ) -> Vec<Stmt> {
+        assert!(stages >= 3, "a chain in flight takes a slot of its own");
+        let iv = self.scalar(Scalar::Induction);
+        let one = self.c(1);
+        let ahead = self.c(stages as i64 - 1);
+        let total = self.bin(BinOp::Add, extent, ahead);
+        let nstages = self.c(stages as i64);
+        let start = self.c(0);
+        self.define(produce.step, Scalar::Bin(BinOp::Sub, iv, one));
+        self.define(produce.slot, Scalar::Bin(BinOp::Rem, produce.step, nstages));
+        self.define(consume.step, Scalar::Bin(BinOp::Sub, iv, ahead));
+        self.define(consume.slot, Scalar::Bin(BinOp::Rem, consume.step, nstages));
+        let consuming = self.bin(BinOp::Le, ahead, iv);
+        let started = self.bin(BinOp::Le, one, iv);
+        let before_end = self.bin(BinOp::Lt, produce.step, extent);
+        let producing = self.bin(BinOp::And, started, before_end);
+        let mut consume_body = vec![Stmt::Sync(Sync::WaitAsync { pending: stages as u32 - 3 }), self.barrier()];
+        consume_body.extend(consume.body.0);
+        consume_body.push(Stmt::Sync(Sync::WaitProducts { pending: 1 }));
+        let body = vec![
+            Self::if_(consuming, consume_body),
+            Self::if_(producing, produce.body.0),
+            Stmt::Sync(Sync::CommitAsync),
+        ];
+        vec![
+            Stmt::Loop(Loop { iv, start, extent: total, carried, body: Block(body), unroll: stages as u32 }),
+            Stmt::Sync(Sync::WaitProducts { pending: 0 }),
+        ]
     }
 
     /// One slot: copy, wait, consume, and fence before the slot is refilled.

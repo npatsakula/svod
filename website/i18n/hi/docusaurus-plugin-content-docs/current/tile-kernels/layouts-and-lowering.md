@@ -52,9 +52,20 @@ layouts उस atom से पढ़ता है जो values को consume �
 | Target | Atom (bf16/f16 → f32) | Fragment layouts |
 |---|---|---|
 | CUDA | `mma.sync` m16n8k16 | `mma_sync_a`, `mma_sync_b`, `mma_sync_c` |
+| CUDA sm_90 | `wgmma` m64nNk16, चार warps एक साथ | `wgmma_a`, `wgmma_c`; `B` descriptor के ज़रिए, कभी registers में नहीं |
 | AMD CDNA | MFMA 16×16×16 | `mfma_16x16x16` |
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_*` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8 | `simdgroup_8x8` |
+
+`atoms::GroupMmaAtom` एक warpgroup instruction है: चार लगातार warps मिलकर 64 × n का product जारी
+करते हैं, operands shared memory से descriptors के ज़रिए पढ़े जाते हैं (`B` हमेशा, `A` तब तक जब तक वह
+register tile न हो), और accumulator पूरे group पर फैला रहता है, हर warp अपनी 16 rows `mma.sync` के C
+layout में रखता है। जिस GEMM config का `core` `Group` है, उसके products इसी पर lower होते हैं
+(`Lowering::group`): grid की rows warpgroups हैं, shared operands load होने के बजाय अपनी जगह रहते हैं,
+और emitter हर product को ring की swizzled rows पर एक `wgmma` chain के रूप में लिखता है (descriptor का
+swizzle mode lowering का अपना XOR है, इसलिए ring के slots 1024-byte boundaries से शुरू होते हैं)।
+Blackwell का `tcgen05.mma` इसी class का है, बस accumulator tensor memory में और जारी करने वाला एक
+thread (`AccResidence`, `IssueScope`)।
 
 आज सिर्फ़ CUDA वाली row के पास kernel tables हैं और वही hardware पर चलती है (देखें [पोर्टेबिलिटी](./portability))।
 

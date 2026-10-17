@@ -10,8 +10,9 @@ use smallvec::smallvec;
 use svod_codegen::llvm::amd::tr::global_load_tr_b128;
 use svod_codegen::llvm::nvptx::ops::shfl_bfly;
 use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill, cp_async_commit, cp_async_wait, ldmatrix};
+use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, GpuArch, ScalarDType};
-use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp, ops};
+use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp, WmmaMetadata, ops};
 
 use super::{Lowering, ProgramSnafu, Result, UnsupportedSnafu};
 use crate::atoms::LaneMove;
@@ -20,7 +21,7 @@ use crate::ir::*;
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
 use crate::layout::{self as frag, Layout};
 use crate::layouts::{Laid, Relayout, TileLayout};
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 
 pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Arc<UOp>> {
     let (prog, lay) = (&laid.prog, laid.layouts.as_slice());
@@ -73,6 +74,9 @@ struct Emit<'a> {
     /// Whose threads the statement being emitted belongs to: the block's, or
     /// one warp's own inside a [`Stmt::Warps`].
     scope: Scope,
+    /// The block being emitted holds a [`Sync::WaitProducts`]: its warpgroup
+    /// products issue without waiting, that statement is their wait.
+    async_products: bool,
     range_id: usize,
     reg_slot: usize,
     local_slot: usize,
@@ -162,6 +166,7 @@ impl<'a> Emit<'a> {
             tid,
             blocks: [None, None, None],
             scope: Scope::Block,
+            async_products: false,
             range_id: 0,
             reg_slot: 0,
             local_slot: 0,
@@ -673,9 +678,12 @@ impl<'a> Emit<'a> {
 
     fn block(&mut self, block: &Block) -> Result<()> {
         self.pending.push(vec![]);
+        let waited = block.0.iter().any(|s| matches!(s, Stmt::Sync(Sync::WaitProducts { .. })));
+        let outer = std::mem::replace(&mut self.async_products, waited);
         for stmt in &block.0 {
             self.stmt(stmt)?;
         }
+        self.async_products = outer;
         // A carried tile moves a fragment at a time, as the products read
         // it, so the backend carries vectors and never unpacks them.
         for c in self.pending.pop().expect("the block just opened") {
@@ -853,6 +861,8 @@ impl<'a> Emit<'a> {
                 DType::Void,
             ),
             Sync::Fence => return Ok(()),
+            Sync::WaitProducts { pending } if cuda && self.low.group => wgmma::wait(pending),
+            Sync::WaitProducts { .. } => return Ok(()),
         };
         self.push(u);
         Ok(())
@@ -1307,6 +1317,7 @@ impl<'a> Emit<'a> {
                     self.reg_store(dst, j, vec![UOp::try_where(p, x, y).expect("where")]);
                 }
             }
+            TileOp::Mma { .. } if self.low.group => self.group_mma(dst, op)?,
             TileOp::Mma { .. } => self.mma(dst, op)?,
             TileOp::Reduce { src, axis, f } => self.reduce(dst, src, axis, f)?,
             TileOp::Transpose { .. } => return UnsupportedSnafu { what: "register transposes" }.fail(),
@@ -1377,6 +1388,94 @@ impl<'a> Emit<'a> {
                 }
                 self.reg_store_vec(dst, cblock * rc, rc, c);
             }
+        }
+        Ok(())
+    }
+
+    /// A product on the warpgroup atom: per instruction column block, one
+    /// `Wmma` over the whole K chain, its shared operands as the descriptors
+    /// of this warp's group rows (and the block's columns of `B`) at every
+    /// `k16` step, `A` as its register fragments when it is a register tile.
+    /// The descriptor's swizzle is the lowering's own (the hardware applies
+    /// it to the absolute address, so the ring's slots start on 1024-byte
+    /// boundaries), and a step moves the start 32 bytes along the row. The
+    /// chain is fenced and committed inside the one statement
+    /// (`codegen::llvm::nvptx::wgmma`) and waited for there too, unless the
+    /// block holds the [`Sync::WaitProducts`] a schedule template placed to
+    /// wait later, with the next trip's fill under way.
+    fn group_mma(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
+        let TileOp::Mma { acc, a, b, a_t, b_t, .. } = *op else { unreachable!("a product") };
+        let (va, vb, vd) = (self.value(a).clone(), self.value(b).clone(), self.value(dst).clone());
+        let atom = self.low.device.target.group_mma(va.dtype, vd.dtype).expect("inference found the core").clone();
+        snafu::ensure!(
+            !a_t && b_t && vb.tier() == Tier::Smem && self.low.swizzle,
+            UnsupportedSnafu { what: "a warpgroup product over other than swizzled K-major shared rows" }
+        );
+        let grid = self.low.grid;
+        let k = va.shape.cols;
+        let issue = atom.issue(grid, vd.shape.rows, vd.shape.cols, k).expect("inference laid this product");
+        let n_atom = atom.n_for(vd.shape.cols as u32 / grid.cols).expect("inference laid this product") as usize;
+        let (rn, rc, rk) = (issue.c.reps[1] as usize, issue.c.frag_regs() as usize, k / wgmma::K);
+        let bytes = va.dtype.bytes();
+        let swizzle = wgmma::Swizzle::for_row_bytes(k * bytes)
+            .context(UnsupportedSnafu { what: format!("a warpgroup product over {}-byte shared rows", k * bytes) })?;
+        let stride = (8 * k * bytes) as u32;
+        // This warp's group and the group's place in the grid, columns first.
+        let group = self.hoist(shr(&self.warp, 2));
+        let cols = c32(grid.cols as i64);
+        let group_row = self.hoist(group.try_cdiv(&cols).expect("group row"));
+        let group_col = self.hoist(group.try_cmod(&cols).expect("group column"));
+        let describe = |this: &mut Self, v: ValId, row0: Arc<UOp>| -> Result<Vec<Arc<UOp>>> {
+            let view = this.view(v);
+            snafu::ensure!(
+                this.along(&view).0 == Axis::Col,
+                UnsupportedSnafu { what: "a column-major shared operand" }
+            );
+            let Place::Smem { offset, .. } = view.place else { unreachable!("a shared operand") };
+            let (_, offset) = this.scalar(offset);
+            let offset = match &view.region {
+                Some(region) => add(&offset, region),
+                None => offset,
+            };
+            let base = this.hoist(add(&offset, &mul(&row0, &c32(view.shape.cols as i64))));
+            Ok((0..rk)
+                .map(|kk| {
+                    let at = add(&base, &c32((kk * wgmma::K) as i64));
+                    let ptr = this.access(&view.buf, &at, 1);
+                    let address = this.hoist(wgmma::shared_address(&ptr));
+                    this.hoist(wgmma::descriptor(&address, stride, swizzle))
+                })
+                .collect())
+        };
+        // One descriptor is the operand itself, not a one-wide vector.
+        let gather =
+            |ops: Vec<Arc<UOp>>| if ops.len() == 1 { ops[0].clone() } else { UOp::stack(ops.into_iter().collect()) };
+        let from_registers = va.tier() == Tier::Reg;
+        let a_op = if from_registers {
+            let regs = issue.a.frag_regs() as usize;
+            UOp::stack((0..rk).flat_map(|kk| self.reg_loads(a, (kk * regs) as u32, regs as u32)).collect())
+        } else {
+            let rows = self.hoist(mul(&group_row, &c32(wgmma::M as i64)));
+            gather(describe(self, a, rows)?)
+        };
+        let meta = WmmaMetadata {
+            name: wgmma::name(from_registers, !self.async_products),
+            dims: (n_atom, wgmma::M, k),
+            dtype_in: DType::Scalar(va.dtype),
+            dtype_out: DType::Scalar(vd.dtype),
+            device: atom.device,
+            threads: wgmma::THREADS,
+            upcast_axes: None,
+            reduce_axes: vec![],
+        };
+        for j in 0..rn {
+            let rows = add(&mul(&group_col, &c32((n_atom * rn) as i64)), &c32((j * n_atom) as i64));
+            let rows = self.hoist(rows);
+            let b_op = gather(describe(self, b, rows)?);
+            let c = UOp::stack(self.reg_loads(acc, (j * rc) as u32, rc as u32).into_iter().collect());
+            let d = UOp::wmma(a_op.clone(), b_op, c, meta.clone());
+            let vals = (0..rc).map(|p| elem(&d, p, rc)).collect();
+            self.reg_store(dst, (j * rc) as u32, vals);
         }
         Ok(())
     }

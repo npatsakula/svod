@@ -13,6 +13,7 @@ sidebar_label: 可移植性
 | `arch` | `GpuArch::{Cuda, Amd, Metal}` |
 | `wave` | 每个 warp 或 wave 的 lane 数 |
 | `mma` | 带操作数布局的矩阵核心原子 |
+| `group_mma` | 基于共享内存描述符的 warpgroup 矩阵原子（CUDA sm_90） |
 | `cp_async` | 异步的全局 → 共享拷贝（CUDA sm_80+） |
 | `ldmatrix` | warp 协作的 8×8 b16 片段加载（CUDA sm_75+） |
 | `smem_bytes` | 每个块的共享内存（设备报告时为 opt-in 上限） |
@@ -25,7 +26,7 @@ sidebar_label: 可移植性
 | 目标 | 原子 | 填充 | 配置表 | 状态 |
 |---|---|---|---|---|
 | CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`，2–3 级 | 有 | 在 RTX 3060 上测量 |
-| CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`，共享内存最多 227 KB | sm_80 配置表 | 已编译：每个族都能用 `ptxas -arch=sm_90` 和 `sm_90a` 汇编；未运行 |
+| CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix`；基于共享描述符的 `wgmma` m64nNk16（GEMM） | `cp.async`，共享内存最多 227 KB | 有 | 在 H100 PCIe 上测得：GEMM 4096³ bf16 在 warpgroup 核心上 433 TFLOP/s（`mma.sync` 234；cuBLASLt 524） |
 | AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16，每 lane 8 个值 | 寄存器中转，1–2 级 | 有，未测量 | 已编译为 code object；未运行 |
 | AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16，输入复制 | 寄存器中转，1–2 级 | 有，未测量 | 已编译为 code object；未运行 |
 | AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16，wave64 | 寄存器中转，1–2 级 | 有，未测量 | 已为 gfx942 编译；未运行 |
@@ -52,7 +53,7 @@ sidebar_label: 可移植性
 
 | 项目 | 状态 |
 |---|---|
-| Hopper (sm_90a)：wgmma、TMA、mbarrier、warp 专用化模板 | 未开始；Hopper 走 `mma.sync` 路径（基础设施第 5–8 项） |
+| Hopper (sm_90a)：TMA、mbarrier、warp 专用化模板；attention 用 `wgmma` 及其跨行程重叠 | 未开始；GEMM 走 `wgmma`，每个乘积的链在其语句内等待完成，attention 走 `mma.sync` |
 | Blackwell (sm_100a)：tcgen05、张量内存 | 未开始；没有 B200 可用 |
 | AMD CDNA：ping-pong 模板、MFMA 32×32、`buffer_load … lds` | 未开始 |
 | AMD 测量 | gfx1201 (RX 9070 XT) 已测量：GEMM、卷积和注意力在 Qwen3 和 YOLO 上领先 tk1；gfx1151 (Strix Halo) 已测量：d = 64 和 128 的注意力；CDNA 已编译，未运行 |

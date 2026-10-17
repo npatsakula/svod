@@ -39,9 +39,12 @@ pub fn mma_sync_c() -> Layout {
 | 目标 | 原子 (bf16/f16 → f32) | 片段布局 |
 |---|---|---|
 | CUDA | `mma.sync` m16n8k16 | `mma_sync_a`, `mma_sync_b`, `mma_sync_c` |
+| CUDA sm_90 | `wgmma` m64nNk16，四个 warp 一起 | `wgmma_a`、`wgmma_c`；`B` 经描述符读取，从不驻留寄存器 |
 | AMD CDNA | MFMA 16×16×16 | `mfma_16x16x16` |
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_*` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8 | `simdgroup_8x8` |
+
+`atoms::GroupMmaAtom` 是一条 warpgroup 指令：四个相邻的 warp 一起发出一个 64 × n 的乘积，操作数通过描述符从共享内存读取（`B` 总是如此，`A` 除非是寄存器 tile），累加器分布在整个 group 上，每个 warp 以 `mma.sync` 的 C 布局持有自己的 16 行。`core` 为 `Group` 的 GEMM 配置把乘积降低到它上面（`Lowering::group`）：网格的行是 warpgroup，共享操作数留在原地而不被加载，发射器把每个乘积写成一条跨 ring 的 swizzle 行的 `wgmma` 链（描述符的 swizzle 模式就是降低器自己的 XOR，因此 ring 的槽位从 1024 字节边界开始）。Blackwell 的 `tcgen05.mma` 是同一类，只是累加器位于 tensor memory、由单个线程发出（`AccResidence`、`IssueScope`）。
 
 目前 CUDA 和 AMD 两行都会规划内核并在硬件上运行（已测量 sm_86 和 gfx1201；参见[可移植性](./portability)）。
 

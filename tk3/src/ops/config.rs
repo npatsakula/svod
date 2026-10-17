@@ -26,9 +26,9 @@ use crate::atoms::{Device, Target};
 use crate::ir::{Axis, Orient, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
-use crate::kernels::gemm::GemmCfg;
+use crate::kernels::gemm::{Core, GemmCfg};
 use crate::kernels::rows::NormCfg;
-use crate::layouts::{WarpGrid, chunked};
+use crate::layouts::{Issue, WarpGrid, chunked};
 use crate::tune::Compiled;
 
 /// Targets with kernels: `mma.sync` + `cp.async` + `ldmatrix` (sm_80+, measured
@@ -45,15 +45,25 @@ pub fn has_kernels(target: &Target) -> bool {
 }
 
 impl GemmCfg {
+    /// The operand layouts of the tile's product on `target`, over the
+    /// config's core and warp grid, as the lowering lays them.
+    fn issue(&self, target: &Target, bk: usize) -> Option<Issue> {
+        let ([bm, bn, _], [wr, wc]) = (self.tile, self.warps);
+        let grid = WarpGrid { rows: wr, cols: wc };
+        match self.core {
+            Core::Warp => target.mma.first()?.issue(Orient::Direct, grid, bm, bn, bk).ok(),
+            Core::Group => target.group_mma.first()?.issue(grid, bm, bn, bk).ok(),
+        }
+    }
+
     /// Whether the warp grid tiles the output with `target`'s matrix core
-    /// atoms and the ring depth is one the target's prefetch runs.
+    /// atoms and the ring depth is one the target's prefetch runs. A
+    /// warpgroup config's rows of shared operands must be one swizzle span
+    /// (32, 64 or 128 bytes), the descriptor's own.
     fn tiles(&self, target: &Target) -> bool {
-        let Some(atom) = target.mma.first() else { return false };
-        let ([bm, bn, bk], [wr, wc]) = (self.tile, self.warps.map(|w| w as usize));
-        bm.is_multiple_of(atom.m as usize * wr)
-            && bn.is_multiple_of(atom.n as usize * wc)
-            && bk.is_multiple_of(atom.k as usize)
-            && target.stages(self.stages) == self.stages
+        let bk = self.tile[2];
+        let row = self.core == Core::Warp || matches!(bk * 2, 32 | 64 | 128);
+        row && self.issue(target, bk).is_some() && target.stages(self.stages) == self.stages
     }
 
     /// Whether the config lowers on `target`: it [`tiles`](Self::tiles), and
@@ -71,12 +81,11 @@ impl GemmCfg {
     /// does not lay out. Addressing and the epilogue's temporaries are not
     /// counted.
     pub fn registers(&self, target: &Target, halves: usize) -> Option<u32> {
-        let atom = target.mma.first()?;
         let ([bm, bn, bk], [wr, wc]) = (self.tile, self.warps);
-        let issue = atom.issue(Orient::Direct, WarpGrid { rows: wr, cols: wc }, bm, bn, bk).ok()?;
+        let issue = self.issue(target, bk)?;
         let halves = halves as u32;
         let acc = issue.c.regs() * halves;
-        let operands = (issue.a.regs() + issue.b.regs() * halves).div_ceil(2);
+        let operands = self.operand_registers(&issue, halves);
         let fill = if target.cp_async {
             0
         } else {
@@ -89,21 +98,31 @@ impl GemmCfg {
 
     /// The registers a lane holds at once however the lowering streams its
     /// fragments: the f32 accumulators, and one matrix-core depth of operand
-    /// fragments, a floor of [`Self::registers`]. Past what the lane holds
-    /// ([`crate::atoms::Occupancy::holds`]: the accumulators in a file of
-    /// their own where the target has one) the kernel cannot compile without
+    /// fragments, a floor of [`Self::registers`]; on the warpgroup core the
+    /// operands stay in shared memory and their descriptors are counted
+    /// instead. Past what the lane holds ([`crate::atoms::Occupancy::holds`]:
+    /// the accumulators in a file of their own where the target has one) or
+    /// past the block's share of the file the kernel cannot compile without
     /// spilling.
     pub fn live_registers(&self, target: &Target, halves: usize) -> Option<(u32, u32)> {
-        let atom = target.mma.first()?;
-        let ([bm, bn, _], [wr, wc]) = (self.tile, self.warps);
-        let issue = atom.issue(Orient::Direct, WarpGrid { rows: wr, cols: wc }, bm, bn, atom.k as usize).ok()?;
+        let issue = self.issue(target, 16)?;
         let halves = halves as u32;
-        Some((issue.c.regs() * halves, (issue.a.regs() + issue.b.regs() * halves).div_ceil(2)))
+        Some((issue.c.regs() * halves, self.operand_registers(&issue, halves)))
+    }
+
+    /// The 32-bit registers a lane holds of the operand fragments; on the
+    /// warpgroup core, whose operands stay in shared memory, the two 64-bit
+    /// descriptors of every `k16` step of a chain instead.
+    fn operand_registers(&self, issue: &Issue, halves: u32) -> u32 {
+        match self.core {
+            Core::Warp => (issue.a.regs() + issue.b.regs() * halves).div_ceil(2),
+            Core::Group => 4 * issue.a.reps[1] * halves,
+        }
     }
 }
 
 pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { tile, stages, warps, group_m: 8, unroll }
+    GemmCfg { core: Core::Warp, tile, stages, warps, group_m: 8, unroll }
 }
 
 /// Search bound: the knobs a GEMM-shaped kernel is enumerated over: output tile edges
@@ -113,20 +132,37 @@ const ROWS: [usize; 4] = [32, 64, 128, 256];
 const COLS: [usize; 5] = [48, 64, 96, 128, 256];
 const DEPTHS: [usize; 3] = [16, 32, 64];
 const GRIDS: [[u32; 2]; 9] = [[1, 1], [1, 2], [2, 1], [2, 2], [1, 4], [4, 1], [2, 4], [4, 2], [4, 4]];
+/// Warp grids of whole warpgroups down the rows, one to four of them.
+const GROUP_GRIDS: [[u32; 2]; 6] = [[4, 1], [4, 2], [8, 1], [8, 2], [16, 1], [4, 4]];
+
+/// A core with the warp grids and ring depths the lattice spans it over.
+type Cores = [(Core, &'static [[u32; 2]], &'static [usize])];
 
 /// Every config the construct spans on `target`: the tiles and warp grids,
-/// the ring depths its prefetch runs, rolled and unrolled.
+/// the ring depths its prefetch runs, rolled and unrolled; on a target with
+/// warpgroup instructions, the tiles of whole warpgroups on them as well.
 fn lattice(target: &Target) -> Vec<GemmCfg> {
-    let stages: &[usize] = if target.cp_async { &[3, 2, 1] } else { &[2, 1] };
+    let cores: &Cores = match (target.cp_async, target.group_mma.is_empty()) {
+        (false, _) => &[(Core::Warp, &GRIDS, &[2, 1])],
+        (true, true) => &[(Core::Warp, &GRIDS, &[3, 2, 1])],
+        // A warpgroup ring keeps a chain in flight in a slot of its own.
+        (true, false) => &[(Core::Warp, &GRIDS, &[3, 2, 1]), (Core::Group, &GROUP_GRIDS, &[4, 3])],
+    };
     let mut out = vec![];
     for bm in ROWS {
         for bn in COLS {
             for bk in DEPTHS {
-                for warps in GRIDS {
-                    for &stages in stages {
-                        // One slot has no slot arithmetic to fold: rolled only.
-                        let unrolls: &[bool] = if stages == 1 { &[false] } else { &[false, true] };
-                        out.extend(unrolls.iter().map(|&unroll| gemm_cfg([bm, bn, bk], stages, warps, unroll)));
+                for &(core, grids, stages) in cores {
+                    for &warps in grids {
+                        for &stages in stages {
+                            // One slot has no slot arithmetic to fold: rolled only.
+                            let unrolls: &[bool] = if stages == 1 { &[false] } else { &[false, true] };
+                            out.extend(
+                                unrolls
+                                    .iter()
+                                    .map(|&unroll| GemmCfg { core, ..gemm_cfg([bm, bn, bk], stages, warps, unroll) }),
+                            );
+                        }
                     }
                 }
             }
@@ -207,14 +243,26 @@ impl Problem {
             return None;
         }
         let regs = cfg.registers(target, self.halves)?;
+        let (halves, waves) = (self.halves, wr * wc);
         let (acc, live) = cfg.live_registers(target, self.halves)?;
-        if !target.occupancy.holds(acc, live) {
+        if !target.occupancy.holds(acc, live) || acc + live > target.lane_budget(waves as u32) {
             return None;
         }
-        let (halves, waves) = (self.halves, wr * wc);
         let atom = target.mma.first()?;
-        let atoms = (bm / wr / atom.m as usize) * (bn * halves / wc / atom.n as usize);
-        let fragments = waves * (bm / wr + bn * halves / wc) * bk * 2;
+        // A warpgroup product reads no fragments and holds one accumulator
+        // chain per instruction column block; its step is the group's.
+        let (atoms, fragments, step) = match cfg.core {
+            Core::Warp => (
+                (bm / wr / atom.m as usize) * (bn * halves / wc / atom.n as usize),
+                waves * (bm / wr + bn * halves / wc) * bk * 2,
+                costs.step,
+            ),
+            Core::Group => {
+                let group = target.group_mma.first()?;
+                let n = group.n_for((bn / wc) as u32)? as usize;
+                (bn * halves / wc / n, 0, costs.step_group)
+            }
+        };
         let fill = (bm + bn * halves) * bk * 2;
         let steps = bm * bn * halves * bk / 4096;
         let (blocks, trips, stages) = (self.blocks(cfg), self.k / bk, cfg.stages);
@@ -225,7 +273,7 @@ impl Problem {
         let shared = 1.0 - distinct as f64 / (flight * (bm + bn * halves)) as f64;
         let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
         let reads = fragments as f64 * costs.smem_byte;
-        let work = steps as f64 * costs.step;
+        let work = steps as f64 * step;
         let trip = costs.trip(stages, !cfg.unroll && !target.cp_async);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
         Some((planner.pipelined(run), regs))

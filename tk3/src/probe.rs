@@ -115,6 +115,10 @@ pub(crate) fn assemble(target: &Target, probes: Vec<Probe>, mut measure: impl Fn
     let mut unmeasured = vec![];
     for ((name, value), probe) in fields.into_iter().zip(probes) {
         assert_eq!(probe.op.strip_prefix("probe:"), Some(name), "probes in field order");
+        // A primitive the target lacks costs nothing and is not unmeasured.
+        if probe.candidates.is_empty() {
+            continue;
+        }
         match measure(probe) {
             Ok(v) => *value = v,
             Err(e) => {
@@ -283,6 +287,7 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
         p.global_byte(),
         p.scatter(),
         p.step(),
+        p.step_group(),
         p.step_lone(),
         p.score(),
         p.trips("probe:trip", true, 2),
@@ -480,6 +485,36 @@ impl<'a> Probes<'a> {
     fn step(&self) -> Probe {
         let lowering = self.lowering(WarpGrid { rows: 2, cols: 2 }, false);
         self.steps("probe:step", [64, 64, 16], self.blocks, WARPS, lowering, true)
+    }
+
+    /// The step issued as a warpgroup product ([`crate::atoms::GroupMmaAtom`]):
+    /// a group's 64×256 accumulator over a 64-deep shared operand pair, four
+    /// `k16` instructions a statement, the operands written to shared memory
+    /// once; no candidates where the target has no such core.
+    fn step_group(&self) -> Probe {
+        let (op, [bm, bn, bk]) = ("probe:step_group", [64usize, 256, 64]);
+        let iters = 1024;
+        let units = (self.blocks * iters * bm * bn * bk / 4096) as f64;
+        let mut lowering = self.lowering(ROWS, false);
+        lowering.group = true;
+        let mut probe = self.make(op, ScalarDType::BFloat16, units, true, lowering, |on| {
+            let mut k = kernel(op, self.blocks, WARPS);
+            let (sa, sb) = (Shape::new(bm, bk), Shape::new(bn, bk));
+            let (a, b) = (input::<BF16>(&mut k, sa), input::<BF16>(&mut k, sb));
+            let (a_s, b_s) = (k.smem::<BF16>("a_s", sa.elems()), k.smem::<BF16>("b_s", sb.elems()));
+            let (a_t, b_t) = (k.smem_view::<BF16>(a_s, 0, sa), k.smem_view::<BF16>(b_s, 0, sb));
+            k.store(a_t, a);
+            k.store(b_t, b);
+            let zero = k.zeros::<F32>(Shape::new(bm, bn));
+            let [acc] =
+                if on { k.loop_(iters, [zero], |k, _, [acc]| [k.mma(acc, a_t, false, b_t, true)]) } else { [zero] };
+            output(&mut k, self.blocks, acc);
+            k.finish()
+        });
+        if self.target.group_mma.is_empty() {
+            probe.candidates.clear();
+        }
+        probe
     }
 
     /// The step of a wave alone on its SIMD, a block per SM of a wave per

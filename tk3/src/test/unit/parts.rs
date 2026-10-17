@@ -39,8 +39,9 @@ fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, warps: u32, tol
     params.push(vec![0.0; out_elems]);
     let want = run(&prog, params, &[]).unwrap();
     let lowering = Lowering {
+        group: false,
         device: declared(target),
-        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false },
+        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false, async_products: false },
         grid: WarpGrid { rows: warps, cols: 1 },
         swizzle: true,
     };
@@ -165,8 +166,9 @@ fn pv_identity_probe() {
     // Exact in bf16: row id in the high byte, column in the low bits.
     let vd: Vec<f32> = (0..bkv * d).map(|i| ((i / d) * 2 + (i % d) / 32) as f32).collect();
     let lowering = Lowering {
+        group: false,
         device: declared(target),
-        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false },
+        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false, async_products: false },
         grid: WarpGrid { rows: 4, cols: 1 },
         swizzle: true,
     };
@@ -204,8 +206,9 @@ fn mma_peak_probe() {
     k.store(c_view, acc);
     let prog = k.finish();
     let lowering = Lowering {
+        group: false,
         device: declared(target),
-        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false },
+        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false, async_products: false },
         grid: WarpGrid { rows: 2, cols: 2 },
         swizzle: true,
     };

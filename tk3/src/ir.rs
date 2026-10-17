@@ -354,6 +354,11 @@ pub enum Sync {
     /// after its products, where a machine scheduler would otherwise hoist
     /// it above them. Nothing to a target that keeps program order.
     Fence,
+    /// Block until at most `pending` of this thread's warpgroup product
+    /// chains are in flight (`wgmma.wait_group`): the products of the block
+    /// holding this statement issue asynchronously and this is their wait.
+    /// Nothing to a target without such chains.
+    WaitProducts { pending: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq)]

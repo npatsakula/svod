@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use snafu::{OptionExt, Snafu, ensure};
 
-use crate::atoms::{Costs, Device, MmaAtom, Target};
+use crate::atoms::{Costs, Device, GroupMmaAtom, MmaAtom, Target};
 use crate::ir::*;
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
 use crate::layout::{self as frag, Layout};
@@ -23,6 +23,8 @@ pub enum Error {
     CarriedLayoutChanges { value: ValId },
     #[snafu(display("value {value:?} ({rows}×{cols}) has no layout and no natural one"))]
     Undetermined { value: ValId, rows: usize, cols: usize },
+    #[snafu(display("a warpgroup product takes {what}"))]
+    GroupOperand { what: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -45,6 +47,21 @@ impl WarpGrid {
         let lc = self.cols.trailing_zeros();
         let lr = self.rows.trailing_zeros();
         let bases: Vec<[u32; 2]> = (0..lc).map(|i| [0, 1 << i]).chain((0..lr).map(|i| [1 << i, 0])).collect();
+        Layout::from_bases([(Row, self.rows), (Col, self.cols)], &[(Warp, &bases)])
+    }
+
+    /// The grid as warpgroups of four consecutive warps down the rows: the
+    /// two low warp bits walk a group's rows, the bits above walk the
+    /// groups, columns first. `rows` is a multiple of four.
+    pub fn group_layout(self) -> Layout {
+        assert!(self.rows.is_multiple_of(GroupMmaAtom::WARPS), "a {}×{} grid of warpgroups", self.rows, self.cols);
+        let lc = self.cols.trailing_zeros();
+        let lr = (self.rows / GroupMmaAtom::WARPS).trailing_zeros();
+        let bases: Vec<[u32; 2]> = [[1, 0], [2, 0]]
+            .into_iter()
+            .chain((0..lc).map(|i| [0, 1 << i]))
+            .chain((0..lr).map(|i| [GroupMmaAtom::WARPS << i, 0]))
+            .collect();
         Layout::from_bases([(Row, self.rows), (Col, self.cols)], &[(Warp, &bases)])
     }
 }
@@ -402,6 +419,38 @@ impl MmaAtom {
     }
 }
 
+impl GroupMmaAtom {
+    /// The `[m, n] += [m, k] · [k, n]` product over `grid` as warpgroups
+    /// ([`WarpGrid::group_layout`]): each group holds 64 rows of the
+    /// accumulator and `n / cols` columns as [`Self::n_for`] instructions
+    /// repeated along the columns; a register `A` holds a group's rows as
+    /// [`frag::wgmma_a`] repeated along `k`. The `b` layout is the shape's
+    /// placeholder: `B` is read through a descriptor and never held.
+    pub fn issue(&self, grid: WarpGrid, m: usize, n: usize, k: usize) -> Result<Issue> {
+        let (wr, wc) = (grid.rows, grid.cols);
+        let groups = wr / Self::WARPS;
+        let n_atom = (n as u32).checked_div(wc).and_then(|cols| self.n_for(cols));
+        ensure!(
+            wr.is_multiple_of(Self::WARPS) && m == (Self::M * groups) as usize && n_atom.is_some(),
+            NotTileableSnafu { rows: m, cols: n, wr, wc, m: Self::M, n: self.n_max }
+        );
+        ensure!(k.is_multiple_of(Self::K as usize), ReductionNotTileableSnafu { k, atom_k: Self::K });
+        let n_atom = n_atom.expect("checked");
+        let (rn, rk) = (n as u32 / wc / n_atom, k as u32 / Self::K);
+        let warps = grid.group_layout();
+        Ok(Issue {
+            a: TileLayout { frag: self.a(), reps: [1, rk], warps: warps.sublayout(&[Warp], &[Row]) },
+            b: TileLayout {
+                frag: frag::mma_sync_b(),
+                reps: [rk, n as u32 / wc / 8],
+                warps: warps.sublayout(&[Warp], &[Col]),
+            },
+            c: TileLayout { frag: self.c(n_atom), reps: [1, rn], warps },
+            swapped: false,
+        })
+    }
+}
+
 /// A layout for a tile nothing constrains: each lane holds a short row
 /// vector, lanes walk the columns then the rows, warps split the rows. The
 /// vector is as wide as a wave can spread over one row, up to 8 elements,
@@ -494,6 +543,8 @@ struct Infer<'a> {
     prog: &'a Program,
     target: &'a Target,
     grid: WarpGrid,
+    /// Products issue on the warpgroup atom.
+    group: bool,
     lay: Vec<Option<TileLayout>>,
     changed: bool,
     /// Operands whose current layout differs from the one a consumer needs.
@@ -521,9 +572,9 @@ pub struct Laid {
 /// product wants, which on a target whose accumulator is its operand's
 /// transpose is free (what tk1's `acc_reusable_as_input` flag used to say).
 /// Products the author oriented stay as pinned.
-pub fn infer(mut prog: Program, device: &Device, grid: WarpGrid) -> Result<Laid> {
-    orient_products(&mut prog, device, grid)?;
-    let mut it = Infer::new(&prog, &device.target, grid);
+pub fn infer(mut prog: Program, device: &Device, grid: WarpGrid, group: bool) -> Result<Laid> {
+    orient_products(&mut prog, device, grid, group)?;
+    let mut it = Infer::new(&prog, &device.target, grid, group);
     it.solve()?;
     let (mut layouts, conflicts) = (it.lay, it.conflicts);
     if !conflicts.is_empty() {
@@ -560,14 +611,15 @@ fn scatters(prog: &Program, lay: &TileLayout, from: &Value, lanes: u32) -> bool 
 
 /// Write an orientation into every product of `prog`: the pinned ones stay,
 /// the rest take the assignment of least relayout and scatter cost.
-fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid) -> Result<()> {
+fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, group: bool) -> Result<()> {
     let Device { target, costs } = device;
-    // A product listed twice (a peeled loop trip) is one decision.
+    // A product listed twice (a peeled loop trip) is one decision; a
+    // warpgroup product is never square, so it issues one way.
     let mut free: Vec<ValId> = vec![];
     for (_, s) in prog.walk() {
         if let Stmt::Let { dst, op: TileOp::Mma { a, orient: None, .. } } = s {
             let (va, vd) = (prog.value(*a), prog.value(*dst));
-            if target.mma(va.dtype, vd.dtype).is_some_and(MmaAtom::swappable) && !free.contains(dst) {
+            if !group && target.mma(va.dtype, vd.dtype).is_some_and(MmaAtom::swappable) && !free.contains(dst) {
                 free.push(*dst);
             }
         }
@@ -575,7 +627,7 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid) -> Resul
     let cost_of = |choice: &HashMap<ValId, Orient>| -> Result<f64> {
         let mut trial = prog.clone();
         set_orient(&mut trial.body, choice);
-        let mut it = Infer::new(&trial, target, grid);
+        let mut it = Infer::new(&trial, target, grid, group);
         it.solve()?;
         let relayouts: f64 = it
             .conflicts
@@ -654,12 +706,12 @@ fn set_orient(block: &mut Block, choice: &HashMap<ValId, Orient>) {
 }
 
 impl<'a> Infer<'a> {
-    fn new(prog: &'a Program, target: &'a Target, grid: WarpGrid) -> Self {
+    fn new(prog: &'a Program, target: &'a Target, grid: WarpGrid, group: bool) -> Self {
         let mut lay = vec![None; prog.values.len()];
         for (v, l) in &prog.pins {
             lay[v.index()] = Some(l.clone());
         }
-        Infer { prog, target, grid, lay, changed: true, conflicts: HashMap::new(), pos: 0 }
+        Infer { prog, target, grid, group, lay, changed: true, conflicts: HashMap::new(), pos: 0 }
     }
 
     /// Run the propagation to its fixed point, seeding what nothing constrains.
@@ -845,6 +897,25 @@ impl<'a> Infer<'a> {
                     self.demand(dst, l.transposed());
                 } else if let Some(l) = self.lay[dst.index()].clone() {
                     self.set(src, l.transposed());
+                }
+            }
+            TileOp::Mma { acc, a, b, a_t, b_t, orient: _ } if self.group => {
+                let (va, vc) = (self.prog.value(a).clone(), self.prog.value(dst).clone());
+                let atom = self
+                    .target
+                    .group_mma(va.dtype, vc.dtype)
+                    .context(NoMatrixCoreSnafu { arch: self.target.arch, dtype_in: va.dtype, dtype_out: vc.dtype })?
+                    .clone();
+                ensure!(
+                    self.prog.value(b).tier() == Tier::Smem && b_t && !a_t,
+                    GroupOperandSnafu { what: "a K-major shared B operand and an untransposed A" }
+                );
+                let k = va.shape.cols;
+                let Issue { a: la, c: lc, .. } = atom.issue(self.grid, vc.shape.rows, vc.shape.cols, k)?;
+                self.demand(acc, lc.clone());
+                self.demand(dst, lc);
+                if self.prog.value(a).place == Place::Reg {
+                    self.demand(a, la);
                 }
             }
             TileOp::Mma { acc, a, b, a_t, b_t, orient } => {
