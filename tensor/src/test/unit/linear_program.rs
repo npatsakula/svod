@@ -143,7 +143,11 @@ fn assert_authored_order(source: &str, gpu: bool) {
     assert_eq!(nops.len(), 2, "a repeated statement renders at each position:\n{source}");
     assert!(stores[0] < nops[0] && nops[0] < stores[1] && stores[1] < nops[1], "{source}");
     if gpu {
-        let barriers = positions(source, "call void @llvm.nvvm.barrier0()");
+        // The block barrier as each GPU backend renders it.
+        let barriers: Vec<usize> = ["call void @llvm.nvvm.barrier0()", "call void @llvm.amdgcn.s.barrier()"]
+            .iter()
+            .flat_map(|needle| positions(source, needle))
+            .collect();
         assert_eq!(barriers.len(), 1, "{source}");
         assert!(nops[0] < barriers[0] && barriers[0] < stores[1], "{source}");
     }
