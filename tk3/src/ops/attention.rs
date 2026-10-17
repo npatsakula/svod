@@ -8,7 +8,8 @@ use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
 use super::{
-    DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output, typed,
+    DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
+    output, typed,
 };
 use crate::kernels;
 use crate::kernels::Batch;
@@ -295,15 +296,18 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         bias.as_ref(),
     ];
     if cfg.splits == 1 {
-        let o = output(&q_ext.dims, &var, q.dtype());
+        let o = output(&q_ext.dims, &var, q.dtype()).context(GraphSnafu { op: OP })?;
         let ins: Vec<&Tensor> = [Some(q), Some(k), Some(v), Some(&o)].into_iter().chain(extras).flatten().collect();
         return launch::graph_launch(typed!(q.dtype(), fa, &spec), &lowering, &ins).context(LaunchSnafu { op: OP });
     }
-    let part = |dims: &[usize]| Tensor::empty(dims, DType::Float32);
+    let part = |dims: &[usize]| {
+        let dims: Vec<SInt> = dims.iter().map(|&d| SInt::Const(d)).collect();
+        kernel_buffer(&dims, DType::Float32).context(GraphSnafu { op: OP })
+    };
     let (o_part, m_part, l_part) = (
-        part(&[cfg.splits, batch.capacity(), t, heads, d]),
-        part(&[cfg.splits, batch.capacity(), t, heads]),
-        part(&[cfg.splits, batch.capacity(), t, heads]),
+        part(&[cfg.splits, batch.capacity(), t, heads, d])?,
+        part(&[cfg.splits, batch.capacity(), t, heads])?,
+        part(&[cfg.splits, batch.capacity(), t, heads])?,
     );
     let ins: Vec<&Tensor> = [Some(q), Some(k), Some(v), Some(&o_part), Some(&m_part), Some(&l_part)]
         .into_iter()
@@ -313,7 +317,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let parts =
         launch::graph_launch_all(typed!(q.dtype(), fa, &spec), &lowering, &ins).context(LaunchSnafu { op: OP })?;
     let merge = merge(cfg.splits);
-    let o = output(&q_ext.dims, &var, q.dtype());
+    let o = output(&q_ext.dims, &var, q.dtype()).context(GraphSnafu { op: OP })?;
     let ins = [&parts[3], &parts[4], &parts[5], &o];
     launch::graph_launch(typed!(q.dtype(), combine, &merge), &merge.cfg.lowering(&planner.device), &ins)
         .context(LaunchSnafu { op: OP })

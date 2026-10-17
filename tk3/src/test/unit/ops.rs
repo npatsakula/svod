@@ -191,6 +191,23 @@ fn linear_takes_lazy_views() {
     assert_close("linear of views", &y, &tk::linear::graph(&x, &w, Linear::default()).unwrap(), 2e-2);
 }
 
+/// A kernel's output lives where the scheduler keeps graph intermediates:
+/// device-local on a backend that tells it apart (no host mapping, so a GPU
+/// write never faults in managed pages), read back through `copyout`.
+#[test]
+fn kernel_outputs_are_device_local() {
+    if !device() {
+        return;
+    }
+    let local = svod_device::registry::registry().get(&default_device()).unwrap().supports_device_local();
+    let (x, w) = (rand(&[96, 64], 10, 1.0, DType::BFloat16), rand(&[64, 64], 11, 0.5, DType::BFloat16));
+    let y = tk::linear(&x, &w, Linear::default()).unwrap();
+    assert_kernel(&y, "gemm");
+    y.realize().unwrap();
+    assert_eq!(y.buffer().unwrap().as_host_bytes().is_err(), local, "host-mapped: {}", !local);
+    assert_close("linear read through copyout", &y, &tk::linear::graph(&x, &w, Linear::default()).unwrap(), 2e-2);
+}
+
 /// A batch bound below its capacity: one GEMM over the live batches only,
 /// the output shrunk to the live dim.
 #[test]

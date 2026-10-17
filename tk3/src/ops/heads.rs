@@ -88,9 +88,9 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
         vec![(typed!(qkv.dtype(), kernel, &spec(cfg)), cfg.lowering(&planner.device))]
     })
     .tuned(OP, &cfgs, <[_]>::to_vec);
-    let q = output(&[b, t, heads, d], &var, qkv.dtype());
-    let k = output(&[b, t, kv_heads, d], &var, qkv.dtype());
-    let v = output(&[b, t, kv_heads, d], &var, qkv.dtype());
+    let q = output(&[b, t, heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;
+    let k = output(&[b, t, kv_heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;
+    let v = output(&[b, t, kv_heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;
     let ins: Vec<&Tensor> =
         [Some(qkv), q_norm, k_norm, cos, sin, Some(&q), Some(&k), Some(&v)].into_iter().flatten().collect();
     let mut outs =
