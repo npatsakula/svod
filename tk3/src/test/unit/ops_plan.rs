@@ -213,6 +213,29 @@ fn an_sm_issues_its_share_of_blocks() {
     assert_eq!(planner.pipelined(run(9 * sms + 1)), 1000.0);
 }
 
+/// A ring's trips are charged at the probe of its depth: a one-slot ring
+/// halves a tile's shared memory, so more of its blocks share a trip's
+/// overhead, and it wins only while its measured trip (the commit's barrier
+/// pair) costs little more than the two-slot trip; charged a dear one it
+/// ranks behind the two-slot pipeline of the same tile, on every prefetch
+/// (the cp.async target's one slot is its single-stage expansion).
+#[test_case(sm86(), 32; "sm86 three slots against one")]
+#[test_case(rdna3(), 32; "rdna3 two slots against one")]
+fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize) {
+    let problem = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
+    // A small tile: its residency is bound by shared memory, not registers.
+    let two = GemmCfg { tile: [64, 64, bk], stages: target.stages(3), warps: [2, 2], group_m: 8, unroll: false };
+    let one = GemmCfg { stages: 1, ..two };
+    let cost = |trip_one: f64, cfg: &GemmCfg| {
+        let planner = Planner::new(Device { target: target.clone(), costs: Costs { trip_one, ..costs() } });
+        problem.admit(&planner, cfg).expect("admitted").0
+    };
+    let c = costs();
+    assert!(cost(c.trip_rolled, &one) < cost(c.trip_rolled, &two), "a cheap one-slot trip wins on residency");
+    assert!(cost(10.0 * c.trip_rolled, &one) > cost(10.0 * c.trip_rolled, &two), "a dear one loses");
+    assert_eq!(cost(c.trip_rolled, &two), cost(10.0 * c.trip_rolled, &two), "the two-slot ring never pays it");
+}
+
 /// A trip's fixed overhead is shared by the blocks an SM holds at once,
 /// its work is not.
 #[test_case(1; "one block an SM")]

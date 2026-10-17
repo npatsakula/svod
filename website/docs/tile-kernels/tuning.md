@@ -101,7 +101,7 @@ anything.
 ## Device costs
 
 The ranking's costs (`atoms::Costs`: a shared byte, a streamed byte, a matrix-core step under a
-full SM and alone on its SIMD, a score's softmax, a pipeline trip, lane moves, global latency, ...) are measured on the device
+full SM and alone on its SIMD, a score's softmax, a pipeline trip over two ring slots (unrolled and rolled) and over one, lane moves, global latency, ...) are measured on the device
 by `probe::costs` the first time a process plans for it: each field is a pair of programs, a
 probe doing all its baseline does plus a known amount of the primitive. The values go in the
 same store file as `probe:<field>` lines (index 0, femtoseconds in the `ns` slot), so later

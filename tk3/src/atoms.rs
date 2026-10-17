@@ -161,6 +161,12 @@ pub struct Costs {
     pub trip: f64,
     /// The same for a rolled ring (slot offsets recomputed per trip).
     pub trip_rolled: f64,
+    /// The same over a ring of one slot: its commit waits behind a
+    /// block-wide barrier for every warp to leave the slot and is followed
+    /// by another, both exposed every trip (a two-slot commit sits behind a
+    /// fence); on a target with asynchronous copies, its single-stage
+    /// expansion's wait and barriers.
+    pub trip_one: f64,
     /// One unit of an exchange's [`crate::layouts::Relayout::work`] (a lane
     /// move, or a select): averaged over the moves a half-wave exchange
     /// issues, on RDNA a `permlanex16` across the rows of 16 and a DPP
@@ -182,7 +188,7 @@ pub struct Costs {
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
     /// order: all but the cache's, which a series of footprints measures.
-    pub fn fields(&mut self) -> [(&'static str, &mut f64); 11] {
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 12] {
         let Costs {
             smem_byte,
             global_byte,
@@ -192,6 +198,7 @@ impl Costs {
             score,
             trip,
             trip_rolled,
+            trip_one,
             lane_move,
             smem_trip,
             latency,
@@ -207,6 +214,7 @@ impl Costs {
             ("score", score),
             ("trip", trip),
             ("trip_rolled", trip_rolled),
+            ("trip_one", trip_one),
             ("lane_move", lane_move),
             ("smem_trip", smem_trip),
             ("latency", latency),
@@ -438,10 +446,15 @@ pub struct Device {
 }
 
 impl Costs {
-    /// One pipeline trip's fixed overhead: a `rolled` register-staged ring
-    /// recomputes its slot offsets every trip.
-    pub fn trip(&self, rolled: bool) -> f64 {
-        if rolled { self.trip_rolled } else { self.trip }
+    /// One pipeline trip's fixed overhead over a ring `stages` deep: a ring
+    /// of one slot pays its barrier pair, a `rolled` register-staged ring of
+    /// two recomputes its slot offsets every trip.
+    pub fn trip(&self, stages: usize, rolled: bool) -> f64 {
+        match stages {
+            ..=1 => self.trip_one,
+            _ if rolled => self.trip_rolled,
+            _ => self.trip,
+        }
     }
 }
 

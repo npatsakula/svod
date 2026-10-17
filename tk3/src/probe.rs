@@ -101,6 +101,7 @@ pub fn costs(target: &Target) -> Result<Measured> {
     let fragment = (trip_tile(target).elems() * 4) as f64 * costs.smem_byte;
     costs.trip = (costs.trip - fragment).max(0.0);
     costs.trip_rolled = (costs.trip_rolled - fragment).max(0.0);
+    costs.trip_one = (costs.trip_one - fragment).max(0.0);
     Ok(measured)
 }
 
@@ -284,8 +285,9 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
         p.step(),
         p.step_lone(),
         p.score(),
-        p.trips("probe:trip", true),
-        p.trips("probe:trip_rolled", false),
+        p.trips("probe:trip", true, 2),
+        p.trips("probe:trip_rolled", false, 2),
+        p.trips("probe:trip_one", false, 1),
         p.lane_move(),
         p.smem_trip(),
         p.latency(),
@@ -551,8 +553,9 @@ impl<'a> Probes<'a> {
 
     /// [`TRIPS`] trips of a pipeline over the least fill a block copies, a
     /// 16-byte chunk per thread (eight to a 32-wide i32 row), from a region
-    /// every block shares so it stays in cache, lowered `unroll`ed (a trip's
-    /// fixed cost) or rolled (slot offsets recomputed per trip). The baseline
+    /// every block shares so it stays in cache, through a ring `stages` deep
+    /// as the target runs it, lowered `unroll`ed (a trip's fixed cost) or
+    /// rolled (slot offsets recomputed per trip). The baseline
     /// loads the same chunks into registers in a plain loop of as many trips,
     /// held as the fill holds them (a 16-byte load a lane, pinned: summed in
     /// the tile's natural layout a lane loads four separate words, which on
@@ -560,13 +563,13 @@ impl<'a> Probes<'a> {
     /// so the difference is a whole trip: the ring's store, fences and load,
     /// and the loads the compiler does not hoist. [`costs`] takes the load
     /// out.
-    fn trips(&self, op: &'static str, unroll: bool) -> Probe {
+    fn trips(&self, op: &'static str, unroll: bool, stages: usize) -> Probe {
         let (tile, region) = (trip_tile(self.target), 16);
-        let stages = self.target.stages(2);
+        let stages = self.target.stages(stages);
         let units = (self.blocks * TRIPS) as f64;
         let chunks = chunked(tile, 4, WARPS, self.target.wave, Axis::Col).expect("a chunk layout");
         self.make(op, ScalarDType::Int32, units, true, self.lowering(ROWS, unroll), |on| {
-            // Both trip probes run these programs, named alike.
+            // Every trip probe runs these programs, named alike.
             let mut k = kernel("probe:trip", self.blocks, WARPS);
             let src = k.param::<I32>("src", ParamKind::In, region * tile.elems());
             let zero = k.fill::<I32>(tile, Const::Int(0));
