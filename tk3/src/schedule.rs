@@ -158,13 +158,15 @@ impl Expander<'_> {
         vec![Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll: 1 })]
     }
 
-    /// Two slots, one step ahead: a trip loads step `i` into registers,
-    /// consumes step `i - 1` from the other slot, writes the registers to
-    /// this step's slot and fences. The first trip only loads and the last
-    /// only consumes, so each is peeled into a one-trip loop and the steady
-    /// loop has no branches: a trip is one basic block, which a machine
-    /// scheduler may reorder freely, and the [`Sync::Fence`] between the
-    /// products and the commit is what keeps the two slots' order.
+    /// One step ahead over two slots or one: a trip loads step `i` into
+    /// registers, consumes step `i - 1` from its slot, writes the registers
+    /// to step `i`'s slot. With two slots a fence keeps the commit after the
+    /// products; with one the commit waits behind a barrier for every warp
+    /// to finish the slot, then barriers again, so the slot holds a step at
+    /// a time and a tile twice as deep fits the same shared memory. The first
+    /// trip only loads and the last only consumes, so each is peeled into a
+    /// one-trip loop and the steady loop has no branches: a trip is one
+    /// basic block, which a machine scheduler may reorder freely.
     fn register_staged(
         &mut self,
         extent: ScalarId,
@@ -173,7 +175,7 @@ impl Expander<'_> {
         produce: Stage,
         consume: Stage,
     ) -> Vec<Stmt> {
-        assert_eq!(stages, 2, "register staging runs one step ahead over two slots");
+        assert!(matches!(stages, 1 | 2), "register staging runs one step ahead over one or two slots");
         let iv = self.scalar(Scalar::Induction);
         let one = self.c(1);
         let two = self.c(2);
@@ -181,10 +183,11 @@ impl Expander<'_> {
         // An empty pipeline runs no trip at all (a range never counts down).
         let nonempty = self.bin(BinOp::Lt, zero, extent);
         let steady = self.bin(BinOp::Sub, extent, nonempty);
+        let slot = |step| if stages == 1 { Scalar::Const(0) } else { Scalar::Bin(BinOp::Rem, step, two) };
         self.define(produce.step, Scalar::Bin(BinOp::Add, iv, zero));
-        self.define(produce.slot, Scalar::Bin(BinOp::Rem, produce.step, two));
+        self.define(produce.slot, slot(produce.step));
         self.define(consume.step, Scalar::Bin(BinOp::Sub, iv, one));
-        self.define(consume.slot, Scalar::Bin(BinOp::Rem, consume.step, two));
+        self.define(consume.slot, slot(consume.step));
         // Split every global→shared copy into its load and its store halves.
         let (mut issue, mut commit) = (vec![], vec![]);
         for stmt in produce.body.0 {
@@ -201,7 +204,8 @@ impl Expander<'_> {
         }
         let barrier = self.barrier();
         let head: Vec<Stmt> = issue.iter().chain(&commit).cloned().chain([barrier.clone()]).collect();
-        let fenced = [Stmt::Sync(Sync::Fence)].into_iter().chain(commit).chain([barrier]);
+        let before = if stages == 1 { barrier.clone() } else { Stmt::Sync(Sync::Fence) };
+        let fenced = [before].into_iter().chain(commit).chain([barrier]);
         let body: Vec<Stmt> = issue.into_iter().chain(consume.body.0.iter().cloned()).chain(fenced).collect();
         // The drain's carried registers hold what the steady loop left.
         let drained: Vec<Carried> = carried.iter().map(|c| Carried { init: c.phi, ..*c }).collect();
@@ -210,7 +214,7 @@ impl Expander<'_> {
         };
         vec![
             trips(zero, nonempty, vec![], head, 1),
-            trips(one, steady, carried, body, 2),
+            trips(one, steady, carried, body, stages as u32),
             trips(extent, nonempty, drained, consume.body.0, 1),
         ]
     }

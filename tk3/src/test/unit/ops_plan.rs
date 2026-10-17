@@ -1414,16 +1414,17 @@ fn a_bound_conv_batch_plans_per_image() {
     );
 }
 
-/// RDNA plans kernels from the lattice under its own facts: two-slot
-/// register-staged rings only, unrolled over the slots, 16×16 WMMA-tileable
-/// warp grids, attention within 64 KB of LDS with its score relayout.
+/// RDNA plans kernels from the lattice under its own facts: register-staged
+/// rings of one slot (rolled: there is nothing to fold) or two (unrolled
+/// over the slots), 16×16 WMMA-tileable warp grids, attention within 64 KB
+/// of LDS with its score relayout.
 #[test]
 fn rdna_plans_register_staged_kernels() {
     let target = rdna3();
     let gemms =
         kernel_plan(shape::linear(Some(&planner(target.clone())), &[BF16; 2], Some(&ext(&[4096, 4096])), 4096, false));
     assert_valid(&gemms, &target, 4096, false);
-    assert!(first_eight(&gemms).iter().all(|c| c.stages == 2 && c.unroll && c.fits(&target)), "{gemms:?}");
+    assert!(first_eight(&gemms).iter().all(|c| c.unroll == (c.stages == 2) && c.fits(&target)), "{gemms:?}");
     for (d, t) in [(64, 1500), (64, 1)] {
         let q = ext(&[1, t, 8, d]);
         let fa =

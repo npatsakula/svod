@@ -34,9 +34,9 @@ score का softmax काम, एक trip, एक lane move, एक shared rou
 |---|---|---|---|---|
 | CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, 2–3 stages | हाँ | RTX 3060 पर मापा गया |
 | CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, 227 KB तक shared | sm_80 tables | Compile हुआ: हर family `ptxas -arch=sm_90` और `sm_90a` से assemble होती है; चलाया नहीं गया |
-| AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, हर lane में 8 values | register-staged, 2 stages | हाँ, मापी नहीं गईं | Code objects में compile हुआ; चलाया नहीं गया |
-| AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 2 stages | हाँ, मापी नहीं गईं | Code objects में compile हुआ; चलाया नहीं गया |
-| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 2 stages | हाँ, मापी नहीं गईं | gfx942 के लिए compile हुआ; चलाया नहीं गया |
+| AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, हर lane में 8 values | register-staged, 1–2 stages | हाँ, मापी नहीं गईं | Code objects में compile हुआ; चलाया नहीं गया |
+| AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 1–2 stages | हाँ, मापी नहीं गईं | Code objects में compile हुआ; चलाया नहीं गया |
+| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages | हाँ, मापी नहीं गईं | gfx942 के लिए compile हुआ; चलाया नहीं गया |
 | Apple | simdgroup 8×8×8 | कोई नहीं | नहीं | सिर्फ़ atoms |
 
 `ops::supported(device)` वहीं true है जहाँ config tables हैं; किसी और device पर हर op अपना

@@ -332,11 +332,11 @@ impl Target {
     }
 
     /// Pipeline stages the target's prefetch can use: register staging
-    /// runs one step ahead over two slots.
+    /// runs one step ahead over one or two slots.
     pub fn stages(&self, stages: usize) -> usize {
         match self.prefetch() {
             Prefetch::CpAsync => stages,
-            Prefetch::RegisterStaged => 2,
+            Prefetch::RegisterStaged => stages.clamp(1, 2),
         }
     }
 

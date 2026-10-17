@@ -95,6 +95,7 @@ layouts उस atom से पढ़ता है जो values को consume �
 |---|---|
 | `CpAsync`, `stages ≥ 2` | `extent + stages − 1` iterations का एक loop। हर iteration तब तक रुकता है जब तक अधिकतम `stages − 2` copy groups बाक़ी न रहें, फिर barrier करके step `i − (stages − 1)` consume करता है। फिर step `i` की `cp.async` copies को एक iteration पहले ख़ाली हुए slot में भेजता है और उन्हें एक group के रूप में commit करता है (अंत के बाद एक ख़ाली group गिनती को एकसमान रखता है)। |
 | `CpAsync`, `stages = 1` | Copy, commit, सबका wait, barrier, consume, barrier। |
+| `RegisterStaged` (1 stage) | एक ही slot पर वही तीन loops: step `i` के लिए global → register loads, step `i − 1` consume, barrier (हर warp slot से निपट चुका), register → shared stores, फिर barrier; उसी shared memory में दोगुना गहरा tile समाता है। |
 | `RegisterStaged` (2 stages) | Step `i` के लिए global → register loads, step `i − 1` consume, register → shared stores, barrier। |
 
 `unroll` loop body को हर ring slot के लिए एक बार copy करता है ताकि slot arithmetic constants में fold
