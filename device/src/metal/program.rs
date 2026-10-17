@@ -342,6 +342,7 @@ impl Program for MetalProgram {
     fn resource_usage(&self) -> Option<KernelResources> {
         Some(KernelResources {
             vgprs: None,
+            agprs: None,
             sgprs: None,
             lds_bytes: self.static_threadgroup_memory as u32,
             scratch_bytes: None,

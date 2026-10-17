@@ -85,10 +85,12 @@ fn assert_valid(list: &[GemmCfg], target: &Target, k: usize, gated: bool) {
 #[test_case(sm86(), true; "sm_86 gated")]
 #[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1201, 64), false; "gfx1201")]
 fn the_ranking_drops_what_a_lane_cannot_hold(target: Target, gated: bool) {
-    let limit = target.occupancy.registers;
     let ranked = planner(target.clone()).gemm_ranked(1, 704, 1536, 512, gated);
     let halves = if gated { 2 } else { 1 };
-    assert!(ranked.iter().all(|c| c.live_registers(&target, halves).unwrap() <= limit));
+    assert!(ranked.iter().all(|c| {
+        let (acc, live) = c.live_registers(&target, halves).unwrap();
+        target.occupancy.holds(acc, live)
+    }));
     let has = |tile: [usize; 3], warps: [u32; 2]| ranked.iter().any(|c| c.tile == tile && c.warps == warps);
     assert_eq!((has([256, 96, 32], [2, 1]), has([64, 64, 32], [2, 2])), (false, true));
 }
@@ -480,6 +482,30 @@ fn under_latency_resident_blocks_halve_the_cost() {
     let (starved, full) = (cost(starved), cost(full));
     assert!((starved / full - 2.0).abs() < 1e-3, "{starved} starved, {full} full");
     assert!(pipelined(slow, [1, 1, 1, 4, 3], 1.0) < pipelined(slow, [1, 1, 1, 4, 2], 1.0));
+}
+
+/// CDNA keeps the f32 accumulators in a file of their own: a 256×256 tile
+/// over four waves holds on gfx942 (256 accumulators a lane, its whole AGPR
+/// file) and not on gfx1201, where accumulators and operands share the 256
+/// vector registers of a lane.
+#[test_case(AmdArch::Gfx942, true; "gfx942 accumulator file")]
+#[test_case(AmdArch::Gfx1201, false; "gfx1201 one file")]
+fn four_waves_of_256x256_hold_only_with_an_accumulator_file(arch: AmdArch, holds: bool) {
+    let target = crate::test::unit::targets::amd(arch, 64);
+    let (acc, live) = gemm_cfg([256, 256, 32], 2, [2, 2], false).live_registers(&target, 1).unwrap();
+    assert!(acc >= 256 && live > 0, "{acc} accumulators, {live} operands");
+    assert_eq!(target.occupancy.holds(acc, live), holds);
+}
+
+/// What a lane holds: with an accumulator file the two counts are judged
+/// apart, without one together.
+#[test_case(0, 200, 56 => true; "one file, fits")]
+#[test_case(0, 200, 57 => false; "one file, one over")]
+#[test_case(256, 256, 256 => true; "two files, both full")]
+#[test_case(256, 257, 0 => false; "two files, accumulators over")]
+#[test_case(256, 0, 257 => false; "two files, vector over")]
+fn a_lane_holds_what_its_files_take(acc_file: u32, acc: u32, rest: u32) -> bool {
+    crate::atoms::Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file }.holds(acc, rest)
 }
 
 /// A ring of one stage or none prefetches nothing: the round waits the

@@ -544,6 +544,7 @@ impl Program for CudaProgram {
             .map(|blocks| ((blocks * block) as f32 / limits.max_threads_per_sm as f32).min(1.0));
         Some(KernelResources {
             vgprs: Some(self.num_regs),
+            agprs: None,
             sgprs: None,
             lds_bytes: self.shared_bytes + self.dynamic_shared_bytes,
             scratch_bytes: Some(self.local_bytes),

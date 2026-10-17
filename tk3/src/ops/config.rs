@@ -88,15 +88,17 @@ impl GemmCfg {
     }
 
     /// The registers a lane holds at once however the lowering streams its
-    /// fragments: the f32 accumulators and one matrix-core depth of operand
-    /// fragments, a floor of [`Self::registers`]. Past the lane's limit the
-    /// kernel cannot compile without spilling.
-    pub fn live_registers(&self, target: &Target, halves: usize) -> Option<u32> {
+    /// fragments: the f32 accumulators, and one matrix-core depth of operand
+    /// fragments, a floor of [`Self::registers`]. Past what the lane holds
+    /// ([`crate::atoms::Occupancy::holds`]: the accumulators in a file of
+    /// their own where the target has one) the kernel cannot compile without
+    /// spilling.
+    pub fn live_registers(&self, target: &Target, halves: usize) -> Option<(u32, u32)> {
         let atom = target.mma.first()?;
         let ([bm, bn, _], [wr, wc]) = (self.tile, self.warps);
         let issue = atom.issue(Orient::Direct, WarpGrid { rows: wr, cols: wc }, bm, bn, atom.k as usize).ok()?;
         let halves = halves as u32;
-        Some(issue.c.regs() * halves + (issue.a.regs() + issue.b.regs() * halves).div_ceil(2))
+        Some((issue.c.regs() * halves, (issue.a.regs() + issue.b.regs() * halves).div_ceil(2)))
     }
 }
 
@@ -203,7 +205,8 @@ impl Problem {
             return None;
         }
         let regs = cfg.registers(target, self.halves)?;
-        if cfg.live_registers(target, self.halves)? > target.occupancy.registers {
+        let (acc, live) = cfg.live_registers(target, self.halves)?;
+        if !target.occupancy.holds(acc, live) {
             return None;
         }
         let (halves, waves) = (self.halves, wr * wc);

@@ -313,6 +313,7 @@ fn a_kernel_with_scratch_spilled(scratch: &[Option<u32>]) -> bool {
         .iter()
         .map(|&scratch_bytes| KernelResources {
             vgprs: Some(128),
+            agprs: None,
             sgprs: None,
             lds_bytes: 0,
             scratch_bytes,
