@@ -142,7 +142,7 @@ fn gemm_throughput_probe() {
     // The configs measured on sm_86; elsewhere the tuner's admitted ones.
     let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: BIG };
     let (admitted, pick) = device_gemms(&planner, &spec);
-    let cfgs: Vec<GemmCfg> = if target.cp_async {
+    let mut cfgs: Vec<GemmCfg> = if target.cp_async {
         [
             (128, 64, 32, 2, 2, 2, 8, true),
             (128, 64, 32, 2, 2, 2, 8, false),
@@ -160,13 +160,12 @@ fn gemm_throughput_probe() {
         })
         .to_vec()
     } else {
-        // The pick may be a pipeline twin of an admitted tile.
-        let mut cfgs = admitted;
-        if !cfgs.contains(&pick) {
-            cfgs.push(pick);
-        }
-        cfgs
+        admitted
     };
+    // The pick may be a pipeline twin of an admitted tile, or outside the fixed set.
+    if !cfgs.contains(&pick) {
+        cfgs.push(pick);
+    }
     for cfg in cfgs {
         let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll } = cfg;
         let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(&planner.device));
