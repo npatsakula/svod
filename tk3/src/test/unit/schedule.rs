@@ -197,7 +197,7 @@ fn one_slot_staging_commits_between_two_barriers() {
         .filter_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some([p.produce.slot, p.consume.slot]) } else { None })
         .flatten()
         .collect();
-    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: true });
+    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: true, async_products: false });
     assert!(!slots.is_empty() && slots.iter().all(|&s| *prog.scalar(s) == Scalar::Const(0)), "one slot");
     let loops: Vec<&Loop> =
         prog.body.0.iter().filter_map(|s| if let Stmt::Loop(l) = s { Some(l) } else { None }).collect();

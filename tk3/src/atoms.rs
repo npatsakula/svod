@@ -256,7 +256,7 @@ pub struct Costs {
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
     /// order: all but the cache's, which a series of footprints measures.
-    pub fn fields(&mut self) -> [(&'static str, &mut f64); 12] {
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 13] {
         let Costs {
             smem_byte,
             global_byte,
