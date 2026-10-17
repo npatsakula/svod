@@ -341,3 +341,41 @@ fn test_tensor_custom_op_amd_end_to_end() {
     let result = out.as_vec::<f32>().unwrap();
     assert_close_f32(&result, &[7.0], 1e-6);
 }
+
+/// `empty_dynamic_spec` binds storage of the requested class up front, sized
+/// to every symbolic dim's maximum; a custom kernel writes it and the host
+/// reads it back through `copyout`.
+#[test]
+fn a_spec_bound_empty_is_a_custom_kernel_output() {
+    test_setup();
+    svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || {
+        let n = 8usize;
+        let spec = svod_device::BufferSpec { cpu_access: false, ..Default::default() };
+        let dst = Tensor::empty_dynamic_spec(&[SInt::Const(n)], DType::Float32, spec).unwrap();
+        let bound = dst.buffer().expect("storage bound at construction");
+        assert_eq!(bound.size(), n * 4);
+        assert!(!bound.is_allocated(), "allocated when a plan first runs over it");
+
+        let src = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let out = dst.custom_kernel(&[&src], hand_ranged_add1_body(n)).unwrap().remove(0);
+        out.realize_with(&PrepareConfig::for_cpu_backend(CpuBackend::Clang)).unwrap();
+        let expected: Vec<f32> = (0..n).map(|x| x as f32 + 1.0).collect();
+        assert_close_f32(&out.as_vec::<f32>().unwrap(), &expected, 1e-6);
+        assert_eq!(out.buffer().unwrap().id(), bound.id(), "the kernel wrote the bound storage");
+    });
+}
+
+#[test]
+fn a_spec_bound_empty_is_sized_to_its_variable_max() {
+    let batch = crate::Variable::new("batch", 1, 8);
+    let shape = [batch.as_sint(), SInt::Const(4)];
+    let t = Tensor::empty_dynamic_spec(&shape, DType::Float32, Default::default()).unwrap();
+    assert_eq!(t.buffer().unwrap().size(), 8 * 4 * 4);
+    assert_eq!(t.shape().unwrap()[..], shape[..]);
+}
+
+#[test]
+fn a_spec_bound_empty_of_no_elements_binds_nothing() {
+    let t = Tensor::empty_dynamic_spec(&[SInt::Const(0), SInt::Const(3)], DType::Float32, Default::default()).unwrap();
+    assert!(t.buffer().is_none());
+}
