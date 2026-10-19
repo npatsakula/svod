@@ -2,6 +2,7 @@ mod atoms;
 mod attention;
 mod build;
 mod conv;
+mod cost_model;
 mod device;
 mod emit;
 mod gather;

@@ -22,7 +22,7 @@ fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
 
 /// The GEMM configs the tuner times on the device for `spec`'s shape (its
 /// admitted shortlist of the device's ranking) and its pick among them.
-fn device_gemms(planner: &Planner, spec: &GemmSpec) -> (Vec<GemmCfg>, GemmCfg) {
+pub(super) fn device_gemms(planner: &Planner, spec: &GemmSpec) -> (Vec<GemmCfg>, GemmCfg) {
     let GemmSpec { m, n, k, epilogue, .. } = *spec;
     let ranked = planner.gemm_ranked(1, m, n, k, epilogue.gated);
     let build = |cfg: GemmCfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
@@ -144,7 +144,7 @@ fn two_crews_match_the_interpreter_and_the_uniform_kernel(tile: [usize; 3]) {
 }
 
 /// A config standing in where a spec's own is replaced.
-const BIG: GemmCfg =
+pub(super) const BIG: GemmCfg =
     GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 2, warps: [2, 4], group_m: 8, unroll: true, crews: 1 };
 
 /// The device's result, checked against the interpreter's within the

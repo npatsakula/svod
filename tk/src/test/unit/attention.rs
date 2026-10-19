@@ -749,7 +749,7 @@ fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, 
 /// in the plain forms (its shortlist of the device's ranking), the
 /// candidates of its last tile pass, and its pick, tuned as the op layer
 /// tunes ([`tune`]).
-fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg>, Vec<FaCfg>, FaCfg) {
+pub(super) fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg>, Vec<FaCfg>, FaCfg) {
     use crate::ops::attention::tune;
     let AttnSpec { t, tk, heads, d, mask, .. } = *spec;
     let tiles = spec.batch.capacity() * heads;
@@ -768,7 +768,7 @@ fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg>, Vec<FaCf
 }
 
 /// The probe's shape: `batch` lanes of `heads` heads over `t` queries and keys.
-fn probe_spec(batch: usize, heads: usize, t: usize, tk: usize, d: usize, mask: AttnMask) -> AttnSpec {
+pub(super) fn probe_spec(batch: usize, heads: usize, t: usize, tk: usize, d: usize, mask: AttnMask) -> AttnSpec {
     AttnSpec {
         batch: Batch::Static(batch),
         t,
