@@ -13,14 +13,10 @@
 mod attention;
 mod config;
 mod decoder_layer;
-#[cfg(test)]
-pub(crate) use decoder_layer::fusable as norm_fusable;
 mod embed;
 mod embedder;
 mod error;
 mod feed_forward;
-#[cfg(test)]
-pub(crate) use feed_forward::pair_rows;
 mod jit;
 mod model;
 mod reranker;
