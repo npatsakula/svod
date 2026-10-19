@@ -253,7 +253,7 @@ pub(super) fn render(prog: Program, lowering: &Lowering) -> String {
     renderer.render(&linear, Some(&name)).unwrap_or_else(|e| panic!("{name}: {e}")).code
 }
 
-fn run(mut command: Command, input: &[u8], what: &str) -> Result<Vec<u8>, String> {
+pub(super) fn run(mut command: Command, input: &[u8], what: &str) -> Result<Vec<u8>, String> {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

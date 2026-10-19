@@ -10,7 +10,7 @@ use svod_dtype::{AmdArch, DType, DeviceSpec, GpuArch};
 use svod_ir::UOp;
 use test_case::test_case;
 
-use super::targets::{amd, hopper, render};
+use super::targets::{amd, hopper, render, run};
 use crate::atoms::{Costs, Target, sm86};
 use crate::ir::*;
 use crate::layouts::Relayout;
@@ -499,7 +499,11 @@ fn probe_signals_are_strong() {
                 let mut built = crate::tune::compile(p.candidates.clone(), &crate::tune::ScratchPool::default());
                 let pairs = probe::resolve_pairs(&mut built);
                 let resolved = probe::resolved(&pairs);
-                assert!(resolved.is_some_and(|r| r.clear()), "{}: {pairs:?} resolve to {resolved:?}", p.op);
+                assert!(
+                    resolved.is_some_and(|r| r.measurable() && r.clear()),
+                    "{}: {pairs:?} resolve to {resolved:?}",
+                    p.op
+                );
             }
         }
     }
@@ -543,6 +547,43 @@ fn trip_baselines_load_as_the_fill_loads(target: Target, l2_only: bool) {
         let (_, lowering) = &p.candidates[0][0];
         let code = render(base.clone(), lowering);
         assert_eq!(code.contains("ld.global.cg.v4.u32"), l2_only, "{field}: the baseline's load policy");
+    }
+}
+
+#[test_case(&[(100, 160), (102, 161), (101, 159)], true; "a baseline that moves the bytes")]
+#[test_case(&[(80, 160), (81, 161), (79, 159)], true; "half the probe")]
+#[test_case(&[(29, 2400), (30, 2410), (29, 2395)], false; "a baseline whose loads left the loop")]
+fn a_baseline_under_half_its_probe_is_not_measurable(pairs: &[(u64, u64)], measurable: bool) {
+    assert_eq!(probe::resolved(pairs).map(|r| r.measurable()), Some(measurable));
+}
+
+/// Every trip pair, as clang -O3 compiles it for RDNA, keeps a global load
+/// inside its loop: no ring depth folds a trip's chunk or slot index to a
+/// constant the loop's loads could be hoisted on. With the slot
+/// `order % stages` and the chunk `step % 16`, the one-slot baseline's
+/// sixteen loads all left the loop on gfx1201 and gfx1151.
+#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
+fn trip_pairs_load_inside_their_loops(target: Target) {
+    if !svod_runtime::amd::has_amdgpu_target() {
+        eprintln!("skipped: clang has no AMDGPU target");
+        return;
+    }
+    let GpuArch::Amd(arch) = target.arch else { unreachable!() };
+    let probes = probes(&target);
+    for field in ["trip", "trip_rolled", "trip_one"] {
+        let p = find(&probes, field);
+        let (_, lowering) = &p.candidates[0][0];
+        let (base, probe) = pair(p);
+        for (side, prog) in [("baseline", base), ("probe", probe)] {
+            let mut clang = std::process::Command::new("clang");
+            clang.args(["-x", "ir", "-O3", "-S", "--target=amdgcn-amd-amdhsa", "-nogpulib", "-", "-o", "-"]);
+            clang.arg(format!("-mcpu={}", arch.mcpu()));
+            let ir = render(prog.clone(), lowering);
+            let isa = String::from_utf8(run(clang, ir.as_bytes(), "clang").unwrap()).unwrap();
+            let (_, looped) = isa.split_once("\n.LBB0_").unwrap_or_else(|| panic!("{field} {side}: no loop"));
+            assert!(looped.contains("global_load"), "{field} {side}: every global load left the loop");
+        }
     }
 }
 

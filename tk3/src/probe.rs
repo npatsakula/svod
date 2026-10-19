@@ -88,9 +88,20 @@ pub(crate) struct Resolved {
     /// The run-to-run spread of the baselines plus that of the probes, each
     /// with its extremes trimmed.
     pub(crate) spread: f64,
+    /// The median baseline and probe timings.
+    pub(crate) baseline: f64,
+    pub(crate) probe: f64,
 }
 
 impl Resolved {
+    /// Whether the baseline did the work the probe rides on: a baseline
+    /// under half its probe's time moved less than the bytes (its loads
+    /// left the loop, or a constant index let the compiler fold them), and
+    /// the difference would price them as the primitive.
+    pub(crate) fn measurable(&self) -> bool {
+        2.0 * self.baseline >= self.probe
+    }
+
     pub(crate) fn clear(&self) -> bool {
         self.difference > self.spread
     }
@@ -117,10 +128,14 @@ pub(crate) fn resolved(pairs: &[(u64, u64)]) -> Option<Resolved> {
         kept.last().zip(kept.first()).map_or(0.0, |(hi, lo)| (hi - lo) as f64)
     };
     let spread = spread(|p| p.0) + spread(|p| p.1);
-    let mut diffs: Vec<f64> = pairs.iter().map(|&(base, probe)| probe as f64 - base as f64).collect();
-    diffs.sort_by(f64::total_cmp);
-    let difference = *diffs.get(diffs.len() / 2)?;
-    Some(Resolved { difference, spread })
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied()
+    };
+    let difference = median(pairs.iter().map(|&(base, probe)| probe as f64 - base as f64).collect())?;
+    let baseline = median(pairs.iter().map(|p| p.0 as f64).collect())?;
+    let probe = median(pairs.iter().map(|p| p.1 as f64).collect())?;
+    Some(Resolved { difference, spread, baseline, probe })
 }
 
 /// [`RESOLVE_TRIES`] timings of a compiled pair; those that lost a stamp or
@@ -213,6 +228,13 @@ fn measured(target: &Target, compiler: u64, probe: Probe) -> Result<f64> {
                 last = format!("no difference resolved from {pairs:?}");
                 let r = resolved(&pairs)?;
                 tracing::debug!(op, ?pairs, ?r, "probe pair resolved");
+                if !r.measurable() {
+                    last = format!(
+                        "a baseline of {} ns under half the probe's {} ns: it does not move the probe's bytes",
+                        r.baseline, r.probe
+                    );
+                    return None;
+                }
                 return Some((r.value() * scale / units * 1e6).round() as u64);
             }
             least((0..TRIES).filter_map(|_| match timed(&mut built, scale / units) {
@@ -681,11 +703,18 @@ impl<'a> Probes<'a> {
     /// - it keeps as many loads in flight as the ring holds slots, issuing a
     ///   group of `stages` trips' loads before summing any, so neither side
     ///   waits out a load the other hides;
-    /// - it reads a fragment back from a ring as deep as the probe's.
+    /// - it reads a fragment back from a ring as deep as the probe's;
+    /// - both sides take every trip's chunk, and the baseline its fragment's
+    ///   slot, from runtime data (`order`, zeros at run): with the chunk
+    ///   `step % region` and the slot `order % stages`, a one-slot baseline
+    ///   folded its slot to 0 and LLVM hoisted all sixteen of the region's
+    ///   loads out of the loop on gfx1201 and gfx1151, timing 1 % of its
+    ///   probe.
     ///
     /// The difference is then the trip itself: the ring's store, waits and
-    /// barriers, its slot arithmetic, and the loads the compiler does not
-    /// hoist. Next to the bytes it is small (a few percent of the pair), so
+    /// barriers, and its slot arithmetic. A baseline under half its probe's
+    /// time did not move the bytes, and the pair is not recorded
+    /// ([`Resolved::measurable`]). Next to the bytes it is small (a few percent of the pair), so
     /// it is [`Signal::Resolved`]: the median of several timings, held
     /// against their spread, which bounds it where it cannot be told from
     /// zero.
@@ -699,24 +728,28 @@ impl<'a> Probes<'a> {
             // Every trip probe runs these programs, named alike.
             let mut k = kernel("probe:trip", self.blocks, WARPS);
             let src = k.param::<I32>("src", ParamKind::In, sms * region * tile.elems());
+            // Zeros at run (the scratch pool's integers), unknown to the
+            // compiler: every trip's chunk and fragment slot is a runtime
+            // value, so no ring depth folds an index to a constant and no
+            // period of the region lets a loop's loads leave it.
+            let order = k.param::<I32>("order", ParamKind::In, TRIPS);
             let first = k.block(0) % sms * region;
             let zero = k.fill::<I32>(tile, Const::Int(0));
             let chunk = |k: &mut Kernel, step: Sc| {
-                k.view(src, (first.clone() + step % region) * tile.elems(), [32, 1], tile, [None, None])
+                let at = (step.clone() + k.load_scalar(order, step)) % region;
+                k.view(src, (first.clone() + at) * tile.elems(), [32, 1], tile, [None, None])
             };
             let sum = if on {
                 ring_sum(&mut k, TRIPS, stages, zero, chunk)
             } else {
                 // The ring's slots, written once and fenced before the loop; a
-                // trip reads the one a parameter names (zeros at run), as the
-                // ring's consume reads its tile, and no read is invariant for
-                // the compiler to hoist.
+                // trip reads the slot `order` names, as the ring's consume
+                // reads its tile.
                 let ring = k.smem::<I32>("ring", stages * tile.elems());
                 for slot in 0..stages {
                     let s = k.smem_slot::<I32>(ring, slot, tile);
                     k.store(s, zero);
                 }
-                let order = k.param::<I32>("order", ParamKind::In, TRIPS);
                 k.barrier();
                 k.pin(zero, chunks.clone());
                 // As many loads in flight as the ring holds slots: each
@@ -733,7 +766,7 @@ impl<'a> Probes<'a> {
                         })
                         .collect();
                     for (t, y) in trips.into_iter().zip(loaded) {
-                        let slot = k.load_scalar(order, t) % stages;
+                        let slot = k.load_scalar(order, t);
                         let s = k.smem_slot::<I32>(ring, slot, tile);
                         let fragment = k.load(s);
                         sum = k.binary(sum, y, BinaryOp::Add);
