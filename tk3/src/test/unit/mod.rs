@@ -67,8 +67,8 @@ pub(crate) fn tuned_on_device<C: crate::ops::config::Tiled + PartialEq + std::fm
     let mut tuner = crate::ops::Tuner::new(&planner.device, dtype, shape, "a device test", build);
     let candidates = expand(&tuner.admitted(op, ranked));
     let pick = (!candidates.is_empty()).then(|| {
-        let winner = tuner.fastest(op, &candidates);
-        tuner.pipelined(op, winner, ranked)
+        let ordered = tuner.ordered(op, &candidates);
+        tuner.pipelined(op, &ordered, ranked)
     });
     (candidates, pick)
 }

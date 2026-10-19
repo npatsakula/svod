@@ -34,7 +34,7 @@ use crate::lower::Lowering;
 
 /// The store's line format, bumped when a line's meaning changes (a file
 /// without a format line is of the first).
-pub(crate) const FORMAT: u32 = 2;
+pub(crate) const FORMAT: u32 = 3;
 /// Search bound: timed rounds over every candidate after the warm-up, and
 /// the rounds the two leaders then run again.
 const ROUNDS: usize = 4;
@@ -130,8 +130,8 @@ fn once<K: Clone + Eq + Hash, V: Clone>(map: &Once<K, V>, key: &K, init: impl Fn
 /// What a store line records, under its kind, key and fingerprint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
-    /// The fastest candidate's index and its device ns.
-    Choice { index: usize, ns: u64 },
+    /// The candidates that ran, fastest first, and the fastest's device ns.
+    Choice { order: Arc<[usize]>, ns: u64 },
     /// A measured number: a probe's cost.
     Value(u64),
     /// The ranked indices admission kept, or the one its search for a
@@ -164,7 +164,9 @@ impl Entry {
     /// The entry's numbers as its line holds them after the key.
     fn render(&self) -> String {
         match self {
-            Entry::Choice { index, ns } => format!("{index} {ns}"),
+            Entry::Choice { order, ns } => {
+                format!("{ns} {}", order.iter().map(usize::to_string).collect::<Vec<_>>().join(" "))
+            }
             Entry::Value(v) => v.to_string(),
             Entry::Admitted(at) => at.iter().map(usize::to_string).collect::<Vec<_>>().join(" "),
         }
@@ -173,7 +175,9 @@ impl Entry {
     /// The entry a line of `kind` with `numbers` after its key records.
     fn parse(kind: &str, numbers: &[u64]) -> Option<Self> {
         match (kind, numbers) {
-            ("choice", &[index, ns]) => Some(Entry::Choice { index: index as usize, ns }),
+            ("choice", &[ns, ref order @ ..]) if !order.is_empty() => {
+                Some(Entry::Choice { order: order.iter().map(|&i| i as usize).collect(), ns })
+            }
             ("value", &[v]) => Some(Entry::Value(v)),
             ("admitted", at) if !at.is_empty() => Some(Entry::Admitted(at.iter().map(|&i| i as usize).collect())),
             ("first", &[at]) => Some(Entry::Admitted([at as usize].into())),
@@ -248,7 +252,7 @@ impl TuneStore {
 
     /// The winner among `count` candidates: the memo, then the store under
     /// the line `programs` fingerprints, else `measure` times every candidate
-    /// (device ns, `None` where one cannot run) and the fastest is stored.
+    /// (device ns, `None` where one cannot run) and their order is stored.
     /// `None` when nothing measured; that is memoized but never stored.
     pub fn select(
         &self,
@@ -257,10 +261,10 @@ impl TuneStore {
         programs: impl FnOnce() -> u64,
         measure: impl FnOnce() -> Vec<Option<u64>>,
     ) -> Option<usize> {
-        let within = |entry: &Entry| matches!(entry, Entry::Choice { index, .. } if *index < count);
-        let timed = |()| fastest(measure()).map(|(index, ns)| Entry::Choice { index, ns });
+        let within = |entry: &Entry| matches!(entry, Entry::Choice { order, .. } if order.iter().all(|&i| i < count));
+        let timed = |()| ordered(measure()).map(|(order, ns)| Entry::Choice { order, ns });
         match self.remember(Kind::Choice, key, within, || (programs(), ()), timed)? {
-            Entry::Choice { index, .. } => Some(index),
+            Entry::Choice { order, .. } => Some(order[0]),
             _ => None,
         }
     }
@@ -301,24 +305,26 @@ impl TuneStore {
         })
     }
 
-    /// [`Self::select`] among `candidates`, keyed by the fingerprint of the
-    /// programs `build` makes (each built once); only a store miss compiles
-    /// them (those `bench` has not) and [`time`]s them.
+    /// The indices of `candidates` that ran, fastest first, as
+    /// [`Self::select`] finds them, keyed by the fingerprint of the programs
+    /// `build` makes (each built once); only a store miss compiles them
+    /// (those `bench` has not) and [`time`]s them.
     pub fn choose<C: Copy + PartialEq>(
         &self,
         key: &TuneKey,
         candidates: &[C],
         build: impl Fn(C) -> Candidate,
         bench: &mut Bench<C>,
-    ) -> Option<usize> {
+    ) -> Option<Arc<[usize]>> {
         let programs = || {
             let built: Vec<Candidate> = candidates.iter().map(|&c| build(c)).collect();
             (fingerprint(&built), built)
         };
-        let within = |entry: &Entry| matches!(entry, Entry::Choice { index, .. } if *index < candidates.len());
-        let timed = |built| fastest(bench.time(candidates, built)).map(|(index, ns)| Entry::Choice { index, ns });
+        let within =
+            |entry: &Entry| matches!(entry, Entry::Choice { order, .. } if order.iter().all(|&i| i < candidates.len()));
+        let timed = |built| ordered(bench.time(candidates, built)).map(|(order, ns)| Entry::Choice { order, ns });
         match self.remember(Kind::Choice, key, within, programs, timed)? {
-            Entry::Choice { index, .. } => Some(index),
+            Entry::Choice { order, .. } => Some(order),
             _ => None,
         }
     }
@@ -361,8 +367,13 @@ impl TuneStore {
 }
 
 /// The fastest of candidates' device times as `(index, ns)`.
-fn fastest(ns: Vec<Option<u64>>) -> Option<(usize, u64)> {
-    ns.into_iter().enumerate().filter_map(|(i, ns)| Some((ns?, i))).min().map(|(ns, i)| (i, ns))
+/// The candidates that ran, fastest first, with the fastest's ns; `None`
+/// when none did.
+fn ordered(ns: Vec<Option<u64>>) -> Option<(Arc<[usize]>, u64)> {
+    let mut ran: Vec<(u64, usize)> = ns.into_iter().enumerate().filter_map(|(i, ns)| Some((ns?, i))).collect();
+    ran.sort_unstable();
+    let &(ns, _) = ran.first()?;
+    Some((ran.into_iter().map(|(_, i)| i).collect(), ns))
 }
 
 /// A candidate compiled on scratch buffers: its plans (`None` when one

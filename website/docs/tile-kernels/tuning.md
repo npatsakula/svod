@@ -19,10 +19,11 @@ when every config that compiles spills, the first 64 of those are timed anyway, 
 judges and a spilling kernel still beats the graph. A list of one config takes the same path, and
 no op falls to the graph because of spills. The admitted configs, with their variants (key splits
 for attention, reduction splits for a starved convolution), are the candidates the tune store
-measures the first time a device meets a shape, and it keeps the winner; the winner's tile's
-other pipelines are then compiled and timed against it, spilling or not (among a tile's pipelines
-the time alone judges, and an unrolled ring that spills a little may be the fastest), and the
-fastest is the choice. Attention
+measures the first time a device meets a shape, and it keeps their timed order; the other
+pipelines of the three leading tiles (`config::TWIN_TILES`) are then compiled and timed against
+the winner, spilling or not (among a tile's pipelines the time alone judges, an unrolled ring
+that spills a little may be the fastest, and a tile's place in the shortlist is its first
+pipeline's), and the fastest is the choice. Attention
 tunes its softmax forms and its tiles in turn: the forms on the ranking's first clean config, the
 tiles under those forms, then the forms again on the winner (see the
 [Kernel Library](./kernel-library)). The admitted list is kept in the store beside the choice, so
@@ -77,7 +78,7 @@ Two guards keep a time honest:
 |---|---|
 | Directory | `$SVOD_TK3_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk3_tune`, else `~/.cache/svod/tk3_tune` |
 | File | One per device and crate version, e.g. `sm_86_28sm-v0.2.0.txt`, headed by its line format (`format 2`, `tune::FORMAT`); a file of another format is dropped whole |
-| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: a `choice` holds the winner's `index ns`, a `value` a measured number, an `admitted` the ranked indices admission kept, a `first` the first clean config's index |
+| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: a `choice` holds the fastest's `ns` and the candidates that ran, fastest first, a `value` a measured number, an `admitted` the ranked indices admission kept, a `first` the first clean config's index |
 | Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, where `device` is arch and SM count (`sm_86-28sm`) and `compiler` digests the device's compiler (`tune::compiler`) |
 
 Two lines from a real store: attention, bf16, shape `[batch, t, tk, heads, kv_heads, d]`,
@@ -85,7 +86,7 @@ candidate 0 won at 62.3 µs; the 4096³ GEMM's admission, the ranked indices of 
 (shortened).
 
 ```text
-choice|attention|sm_86-28sm|BFloat16|1x704x704x8x8x64|23f7784292d1b0a0|9154cc72f03d25cd|1640bd140bf8e08b 0 62304
+choice|attention|sm_86-28sm|BFloat16|1x704x704x8x8x64|23f7784292d1b0a0|9154cc72f03d25cd|1640bd140bf8e08b 62304 0 3 1
 admitted|gemm|sm_86-28sm|BFloat16|1x4096x4096x4096|47ed81ff601380fe|9154cc72f03d25cd|1f0f4f6116dbeee7 4 10 18 22 30 …
 ```
 
