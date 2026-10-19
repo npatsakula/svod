@@ -99,7 +99,13 @@ Emitter हर statement के instructions को program order में ए�
 करता है, इसलिए Svod के linearizer का toposort किसी tk3 कर्नेल पर कभी नहीं चलता। View के bounds से
 आगे के global accesses gated होते हैं: loads शून्य पढ़ते हैं और stores छोड़ दिए जाते हैं। जब हर row
 में chunks की गिनती दो की घात हो, तो shared rows 16-byte chunks में XOR-swizzle होती हैं। 16-bit
-tiles के shared से register loads, जहाँ layout अनुमति दे, `ldmatrix.x4` इस्तेमाल करते हैं। CUDA
+tiles के shared से register loads, जहाँ layout अनुमति दे, `ldmatrix.x4` इस्तेमाल करते हैं। `Scale` (ठीक-ठीक एक product) अपने multiplies को इस branch के नीचे रखता है कि thread के रखे किसी factor
+का मान 1 से अलग है या नहीं, और जिस wave के सभी factors एक हैं वह उसे छोड़ देती है। bf16 की ओर zero-ward cast
+f32 के bits का ऊपरी आधा रखता है। bf16 tile का f32 में reduction f32 में fold होता है: जहाँ target के पास
+`v_dot2_f32_bf16` है (RDNA3 से आगे, gfx950) वहाँ lane की जोड़ियाँ जैसी रखी हैं वैसी जुड़ती हैं, हर जोड़ी एक
+instruction; वरना हर element पहले widen होता है। AMD पर f32 `Exp2` hardware का `v_exp_f32` है
+(`llvm.amdgcn.exp2`), उस range reduction के बिना जो `llvm.exp2` 2⁻¹²⁶ से नीचे के results को denormal रखने के
+लिए जोड़ता है; वे शून्य हो जाते हैं। CUDA
 backend 48 KB की static सीमा से ऊपर की shared memory को एक dynamic array में रखता है। Config
 candidates target की opt-in सीमा (`Target::smem_bytes`) के ख़िलाफ़ छाने जाते हैं।
 

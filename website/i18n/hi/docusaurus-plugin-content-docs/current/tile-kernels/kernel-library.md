@@ -98,6 +98,32 @@ candidates, पहला untuned चुनाव है:
 | 64 | (64, 64, 2), (64, 64, 3), (128, 64, 2), (64, 32, 2), (128, 32, 2), (64, 32, 3) | |
 | 128 | (64, 32, 2), (64, 32, 3), (128, 32, 2), (64, 64, 2), (128, 64, 2), (128, 32, 3) | `bkv = 64` ने 18.2 TFLOP/s मापा, `bkv = 32` के 22.2 के मुक़ाबले: प्रति block 64 KB से हर SM पर एक ही block बचता है |
 
+Softmax step जितना कम vector काम कर सके करता है, जो वहाँ सबसे ज़्यादा मायने रखता है जहाँ matrix cores
+SIMD के ALUs साझा करते हैं (RDNA)। कोई row नया running maximum तभी लेती है जब वह log2 इकाइयों में 8 से
+ज़्यादा बढ़े (FlashAttention-4 का lazy rescale): वरना correction ठीक 1 रहता है और probabilities 2⁸ से नीचे
+रहती हैं। Forms target के हिसाब से तय होते हैं, जिन्हें planner (`FaCfg::forms`) `Target::bf16_cvt` और
+`Target::mma_on_valu` से चुनता है। `truncate_p` के साथ bf16 में रखी probabilities round नहीं, truncate होती
+हैं — जहाँ rounding कई instructions लेती है वहाँ एक instruction में एक जोड़ी — और row sum उन्हें वैसे ही जोड़ता है
+जैसे वे रखी हैं, ताकि normalization unbiased रहे; जो targets एक जोड़ी को एक instruction में round करते हैं
+(sm_80+, gfx950) वे f32 मान round और sum करते हैं, क्योंकि रखे मानों का अतिरिक्त conversion sm_86 पर
+3–5% महँगा था। `skip_rescale` के साथ output accumulator का rescale एक `Scale` है, जिसे हर वह wave छोड़ देती है
+जिसकी सभी rows ने अपना maximum रखा; यह वहाँ हर जगह चालू है जहाँ matrix products vector ALUs पर issue होते हैं,
+और अलग matrix cores के बगल में केवल वहाँ जहाँ भरे tile की lane 64 output registers रखती है (sm_86: d = 128 पर
++4%, d = 64 पर neutral और decoder step पर 5–7% धीमा, जिसकी एक row सादा multiply रखती है)। `raw_max` के साथ,
+queries से भरे RDNA tiles पर, running maximum raw scores की इकाइयों में रहता है (positive scale maximum के साथ
+commute करता है; bias scaled form रखता है), तो केवल वे दो row मान scale होते हैं जो exponent और correction
+लेते हैं — हर score की जगह हर row पर एक multiply — step की dependent chain पर एक multiply की कीमत पर, जिसे
+decoder step की अकेली wave महसूस करती है (3%) और भरा tile नहीं। Probabilities का row sum product के बाद आता
+है जहाँ rescale एक branch है या probabilities truncated हैं, ताकि दोनों consumers उन्हें एक बार packed पढ़ें
+(sm_86 d = 128: +7%; truncated sum वह bf16 pair dot product है जहाँ target के पास वह है), और वरना rescale से
+पहले (sm_86 d = 64 causal: इस क्रम में +5%)। Causal mask (या हर पहले वाले को देखने वाले chunks) के नीचे
+आख़िरी query blocks, जो सबसे ज़्यादा keys score करते हैं, पहले चलते हैं, ताकि round की पूँछ उसके सबसे छोटे
+blocks हों। gfx1201 पर lazy rescale, truncation, skip और नीचे के raw `exp2` ने d = 128 kernel को random data
+पर 90 से 116 TFLOP/s और Qwen3 के causal attention को 63 से 77 तक ले गए; raw maximum, pair dot product और
+block order उन्हें 120 और 79 तक, d = 128 causal 96 → 100 और d = 64 105 → 108 (causal 87 → 92) तक ले गए,
+decoder step अपरिवर्तित। Loop के अकेले WMMAs जिस 162 TFLOP/s पर चलते, उसके मुक़ाबले जो बचा है वह पतला फैला है:
+vector काम 15%, बाक़ी loads, stores, barriers और addressing।
+
 हर tile config को split counts से गुणा किया जाता है। `Attn::splits = Some(n)` `n` तय करता है, key
 block count पर सीमित। `None` के साथ, `config::split_candidates` 1, 2, हर SM पर दो blocks के आसपास की
 गिनतियाँ, और हर key block के लिए एक split सुझाता है। यह सिर्फ़ उन्हीं गिनतियों को रखता है जो key

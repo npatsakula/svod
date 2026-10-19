@@ -110,7 +110,7 @@ so its registers hold column runs and store as 16-byte vectors too.
 The softmax step does as little vector work as it can, which matters most where the matrix
 cores share the SIMD's ALUs (RDNA). A row adopts a new running maximum only when it grows by
 more than 8 in log2 units (FlashAttention-4's lazy rescale): otherwise the correction is exactly
-1, while the probabilities stay below 2⁸. Two forms follow the target, chosen by the planner
+1, while the probabilities stay below 2⁸. The forms follow the target, chosen by the planner
 (`FaCfg::forms`) from `Target::bf16_cvt` and `Target::mma_on_valu`. With `truncate_p`,
 probabilities held in bf16 are truncated rather than rounded, a pair per instruction where the
 rounding is several, and the row sum adds the values as held, so the normalization stays unbiased;
@@ -124,8 +124,10 @@ tiles full of queries, the running maximum stays in the raw scores' units (a pos
 with the maximum; a bias keeps the scaled form), so only the two row values the exponent and the
 correction take are scaled, a multiply per row rather than per score, at the price of a multiply on
 the step's dependent chain, which a decoder step's one wave feels (3%) and a full tile does not. The
-held sum is taken after the product so both read the probabilities packed once, by the bf16 pair dot
-product where the target has it. Under a causal mask (or chunks seeing every earlier one) the last
+row sum of the probabilities follows the product where the rescale is a branch or the probabilities
+are truncated, so both consumers read them packed once (sm_86 d = 128: +7%; the truncated sum is the
+bf16 pair dot product where the target has it), and precedes the rescale otherwise (sm_86 d = 64
+causal: +5% that way round). Under a causal mask (or chunks seeing every earlier one) the last
 query blocks, which score the most keys, run first, so a round's tail is its shortest blocks. On
 gfx1201 the lazy rescale, the truncation, the skip and the raw `exp2` below took the d = 128 kernel
 from 90 to 116 TFLOP/s on random data and Qwen3's causal attention from 63 to 77; the raw maximum,
