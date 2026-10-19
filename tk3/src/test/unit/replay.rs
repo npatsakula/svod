@@ -5,6 +5,7 @@
 //! admission, choice and pipeline stages to the config they name.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use svod_dtype::{DType, ScalarDType};
 use test_case::test_case;
@@ -12,7 +13,7 @@ use test_case::test_case;
 use crate::atoms::sm86;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec};
-use crate::ops::config::{Tiled, representatives};
+use crate::ops::config::{Planner, Tiled, representatives};
 use crate::ops::{DEVICE_TEST, tuned};
 use crate::tune::{self, Entry, FORMAT, Found, Kind, TuneKey, TuneStore};
 
@@ -137,13 +138,11 @@ fn a_gemm_tuning_reads_the_key_the_op_layer_writes(probe: bool) {
     assert_eq!(lookups[0].key, want.candidates(Kind::Admitted));
 }
 
-/// A replayed tuning follows the stored stages: the admitted indices name
-/// configs of the ranking's representatives, the choice orders those
-/// candidates, and with the leader alone within the contender band (its
-/// twins' stage unstored) the leader is the pick.
-#[test]
-fn a_replayed_gemm_follows_the_admission_and_the_choice() {
-    let dir = scratch("chain");
+/// A store under `dir` holding a 512³ GEMM's admission, of the ranking's
+/// third and second representatives, and their choice, the second at 900 ns
+/// and the third at 2000 (outside the contender band); the planner and its
+/// ranking's representatives.
+fn admitted_and_chosen(dir: &Path) -> (Planner, Arc<[GemmCfg]>, Vec<GemmCfg>) {
     let planner = super::planner(sm86());
     let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
     let reps = representatives(&ranked);
@@ -153,17 +152,30 @@ fn a_replayed_gemm_follows_the_admission_and_the_choice() {
     };
     let (admitted, candidates) = (at(&reps), at(&[reps[2], reps[1]]));
     write(
-        &dir,
+        dir,
         &admitted,
         &[
             format!("{} 2 1", admitted.line(Kind::Admitted, 1)),
             format!("{} 1 900 0 2000", candidates.line(Kind::Choice, 1)),
         ],
     );
-    let spec =
-        GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: ranked[0] };
+    (planner, ranked, reps)
+}
+
+fn spec(cfg: GemmCfg) -> GemmSpec {
+    GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg }
+}
+
+/// A replayed tuning follows the stored stages: the admitted indices name
+/// configs of the ranking's representatives, the choice orders those
+/// candidates, and with the leader alone within the contender band (its
+/// twins' stage unstored) the leader is the pick.
+#[test]
+fn a_replayed_gemm_follows_the_admission_and_the_choice() {
+    let dir = scratch("chain");
+    let (planner, ranked, reps) = admitted_and_chosen(&dir);
     let store = TuneStore::replay(dir.clone());
-    let pick = tuned::linear(&store, &planner, DType::BFloat16, &ranked, spec).cfg;
+    let pick = tuned::linear(&store, &planner, DType::BFloat16, &ranked, spec(ranked[0])).cfg;
     assert_eq!(pick, reps[1], "the choice's fastest, the second admitted");
     let lookups = store.lookups();
     let found: Vec<(Kind, Found)> = lookups.iter().map(|l| (l.kind, l.found)).collect();
@@ -172,5 +184,38 @@ fn a_replayed_gemm_follows_the_admission_and_the_choice() {
     let twins = reps[1].twins(&ranked).len();
     assert_eq!(lookups.len(), if twins >= 2 { 3 } else { 2 }, "{lookups:?}");
     assert!(tune::enabled());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The planner log names the configs each stage decided on as their Debug
+/// text, where the store's lines hold only indices: the admitted list, the
+/// choice with each candidate's ns, and the pick. The log is read from a
+/// child process of this test alone: a subscriber scoped to one thread of
+/// the parallel suite can miss events whose interest another thread cached.
+#[test]
+fn the_planner_log_names_the_admitted_and_chosen_configs() {
+    const CHILD: &str = "SVOD_TK3_TEST_PLAN_LOG_DIR";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        super::traced();
+        let (planner, ranked, _) = admitted_and_chosen(Path::new(&dir));
+        tuned::linear(&TuneStore::replay(dir.into()), &planner, DType::BFloat16, &ranked, spec(ranked[0]));
+        return;
+    }
+    let dir = scratch("log");
+    let (_, _, reps) = admitted_and_chosen(&dir);
+    let test = std::thread::current().name().expect("a named test thread").to_string();
+    let child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &dir)
+        .env("RUST_LOG", format!("{}=debug", crate::ops::PLAN))
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("the child runs");
+    assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stderr));
+    let log = String::from_utf8_lossy(&child.stderr).into_owned();
+    let line = |message: &str| log.lines().find(|l| l.contains(message)).unwrap_or_else(|| panic!("{message}: {log}"));
+    assert!(line(" admitted ").contains(&format!("configs=[{:?}, {:?}]", reps[2], reps[1])), "{log}");
+    assert!(line(" choice ").contains(&format!("timed=[({:?}, 900), ({:?}, 2000)]", reps[1], reps[2])), "{log}");
+    assert!(line(" tuned ").contains(&format!("pick={:?}", reps[1])), "{log}");
     let _ = std::fs::remove_dir_all(dir);
 }

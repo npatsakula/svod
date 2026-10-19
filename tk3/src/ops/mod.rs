@@ -201,8 +201,10 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         let (store, bench, build) = (self.store, &mut self.bench, &self.build);
         let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::FIRST)]);
         let find = || config::first_clean(ranked, |batch| bench.admit(batch, build));
-        let at = self.store.first(&key, programs, find);
-        ranked.get(at.unwrap_or(0)).copied()
+        let at = store.first(&key, programs, find);
+        let cfg = ranked.get(at.unwrap_or(0)).copied();
+        tracing::debug!(target: PLAN, op, shape = ?self.shape, ?cfg, stored = at.is_some(), "first");
+        cfg
     }
 
     /// The configs of `ranked` (best guess first) the tuner chooses among
@@ -217,11 +219,13 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         let (store, bench, build) = (self.store, &mut self.bench, &self.build);
         let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::SHORTLIST)]);
         let admit = || config::shortlist(ranked, |batch| bench.admit(batch, build));
-        let found = self.store.admitted(&key, programs, admit);
-        match found {
+        let found = store.admitted(&key, programs, admit);
+        let configs: Vec<C> = match &found {
             Some(at) => at.iter().map(|&i| ranked[i]).collect(),
             None => config::distinct(ranked).take(config::SHORTLIST).collect(),
-        }
+        };
+        tracing::debug!(target: PLAN, op, shape = ?self.shape, ?configs, stored = found.is_some(), "admitted");
+        configs
     }
 
     /// `candidates` in the order they ran by the global store under `op`,
@@ -233,10 +237,10 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
             return untimed();
         }
         let key = self.key(op, candidates);
-        match self.store.choose(&key, candidates, &self.build, &mut self.bench) {
-            Some(timed) => timed.iter().map(|&(i, ns)| (candidates[i], Some(ns))).collect(),
-            None => untimed(),
-        }
+        let Some(timed) = self.store.choose(&key, candidates, &self.build, &mut self.bench) else { return untimed() };
+        let timed: Vec<(C, u64)> = timed.iter().map(|&(i, ns)| (candidates[i], ns)).collect();
+        tracing::debug!(target: PLAN, op, shape = ?self.shape, ?timed, "choice");
+        timed.into_iter().map(|(c, ns)| (c, Some(ns))).collect()
     }
 
     /// The fastest of `candidates` ([`Self::ordered`]).
@@ -281,11 +285,10 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         let key = self.keyed(op, " compiled", &twins);
         let (store, bench, build) = (self.store, &mut self.bench, &self.build);
         let admit = || config::compiled(&twins, |batch| bench.admit(batch, build));
-        let judged = self.store.admitted(&key, || Self::programs(store, build, &twins), admit);
-        match judged {
-            Some(at) if at.len() > 1 => self.fastest(op, &at.iter().map(|&i| twins[i]).collect::<Vec<_>>()),
-            _ => winner,
-        }
+        let judged = store.admitted(&key, || Self::programs(store, build, &twins), admit);
+        let compiled: Vec<C> = judged.iter().flat_map(|at| at.iter().map(|&i| twins[i])).collect();
+        tracing::debug!(target: PLAN, op, shape = ?self.shape, ?compiled, "twins admitted");
+        if compiled.len() > 1 { self.fastest(op, &compiled) } else { winner }
     }
 }
 
