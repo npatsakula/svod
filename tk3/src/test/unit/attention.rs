@@ -806,40 +806,41 @@ fn label(c: &FaCfg) -> String {
 #[ignore = "perf probe: needs a GPU"]
 fn attention_throughput_probe() {
     let Some(planner) = super::device_planner() else { return };
-    crate::tune::set_enabled(true);
-    let (batch, heads, t) = (4usize, 8usize, 2048usize);
-    for (d, causal, bias) in [
-        (64, false, false),
-        (64, false, true),
-        (64, true, false),
-        (64, true, true),
-        (128, false, false),
-        (128, true, false),
-    ] {
-        let mask = AttnMask { causal, bias: bias.then_some(Bias::PerBatch), ..AttnMask::default() };
-        let spec = probe_spec(batch, heads, t, t, d, mask);
-        let (plain, admitted, pick) = device_attention(&planner, &spec);
-        let mut timed = admitted.clone();
-        if !timed.contains(&pick) {
-            timed.push(pick);
+    crate::tune::scoped(true, || {
+        let (batch, heads, t) = (4usize, 8usize, 2048usize);
+        for (d, causal, bias) in [
+            (64, false, false),
+            (64, false, true),
+            (64, true, false),
+            (64, true, true),
+            (128, false, false),
+            (128, true, false),
+        ] {
+            let mask = AttnMask { causal, bias: bias.then_some(Bias::PerBatch), ..AttnMask::default() };
+            let spec = probe_spec(batch, heads, t, t, d, mask);
+            let (plain, admitted, pick) = device_attention(&planner, &spec);
+            let mut timed = admitted.clone();
+            if !timed.contains(&pick) {
+                timed.push(pick);
+            }
+            let build =
+                |cfg: FaCfg| vec![(flash_attention(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+            let ns = crate::tune::measure(timed.iter().map(|&c| build(c)));
+            let flops = 4.0 * (batch * heads * t * t * d) as f64 / if causal { 2.0 } else { 1.0 };
+            eprintln!(
+                "== attention d{d} causal={causal} bias={bias}: {} admitted plain, {} under the first forms",
+                plain.len(),
+                admitted.len()
+            );
+            for (c, ns) in timed.iter().zip(ns) {
+                let what = if *c == pick { " (tuner's pick)" } else { "" };
+                let time = ns.map_or("failed".into(), |ns| {
+                    format!("{:8.1} us {:5.1} TFLOP/s", ns as f64 / 1e3, flops / ns as f64 / 1e3)
+                });
+                eprintln!("  {}: {time}{what}", label(c));
+            }
         }
-        let build =
-            |cfg: FaCfg| vec![(flash_attention(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
-        let ns = crate::tune::measure(timed.iter().map(|&c| build(c)));
-        let flops = 4.0 * (batch * heads * t * t * d) as f64 / if causal { 2.0 } else { 1.0 };
-        eprintln!(
-            "== attention d{d} causal={causal} bias={bias}: {} admitted plain, {} under the first forms",
-            plain.len(),
-            admitted.len()
-        );
-        for (c, ns) in timed.iter().zip(ns) {
-            let what = if *c == pick { " (tuner's pick)" } else { "" };
-            let time = ns.map_or("failed".into(), |ns| {
-                format!("{:8.1} us {:5.1} TFLOP/s", ns as f64 / 1e3, flops / ns as f64 / 1e3)
-            });
-            eprintln!("  {}: {time}{what}", label(c));
-        }
-    }
+    });
 }
 
 /// What the backend allocates for a decoder step's key-warp configs on the
@@ -959,63 +960,71 @@ fn decode_throughput_probe() {
     if super::device_target().is_none() {
         return;
     }
-    crate::tune::set_enabled(true);
-    let (b, heads, d, layers, layer) = (5usize, 20usize, 64usize, 32usize, 10usize);
-    let f16 = |shape: &[usize], seed: u64| {
-        let mut s = seed;
-        let n: usize = shape.iter().product();
-        let data: Vec<f32> = (0..n).map(|_| lcg(&mut s) as f32).collect();
-        let t = Tensor::from_slice(&data).try_reshape(shape.iter().map(|&x| x as isize).collect::<Vec<_>>()).unwrap();
-        let t = t.cast(DType::Float16).contiguous();
-        t.realize().unwrap();
-        t
-    };
-    let ints = |v: Vec<i32>| {
-        let t = Tensor::from_slice(&v);
-        t.realize().unwrap();
-        t
-    };
-    let q = f16(&[b, 1, heads, d], 1);
-    let self_k = f16(&[b, 448, layers * heads, d], 2);
-    let self_v = f16(&[b, 448, layers * heads, d], 3);
-    let (k_app, v_app) = (f16(&[b, 1, heads, d], 4), f16(&[b, 1, heads, d], 5));
-    let lens = ints(vec![200; b]);
-    let cross_k = f16(&[1, 1500, layers * heads, d], 6);
-    let cross_v = f16(&[1, 1500, layers * heads, d], 7);
-    let map = ints(vec![0; b]);
-
-    let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
-    for (name, splits) in [("tuned", None), ("unsplit", Some(1))] {
-        let cache = Cache {
-            head_start: layer * heads,
-            kv_heads: heads,
-            row_map: None,
-            appended: Some((&k_app, &v_app)),
-            app_lens: None,
+    crate::tune::scoped(true, || {
+        let (b, heads, d, layers, layer) = (5usize, 20usize, 64usize, 32usize, 10usize);
+        let f16 = |shape: &[usize], seed: u64| {
+            let mut s = seed;
+            let n: usize = shape.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| lcg(&mut s) as f32).collect();
+            let t =
+                Tensor::from_slice(&data).try_reshape(shape.iter().map(|&x| x as isize).collect::<Vec<_>>()).unwrap();
+            let t = t.cast(DType::Float16).contiguous();
+            t.realize().unwrap();
+            t
         };
-        let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, ..Attn::default() };
-        let o = tk::attention(&q, &self_k, &self_v, opts).unwrap();
-        plans.push((format!("tk3 self {name}"), o.prepare().unwrap()));
-        let cache =
-            Cache { head_start: layer * heads, kv_heads: heads, row_map: Some(&map), appended: None, app_lens: None };
-        let o = tk::attention(&q, &cross_k, &cross_v, Attn { cache: Some(cache), splits, ..Attn::default() }).unwrap();
-        plans.push((format!("tk3 cross {name}"), o.prepare().unwrap()));
-    }
-    let warm = std::time::Instant::now();
-    while warm.elapsed().as_millis() < 500 {
-        plans[0].1.execute().unwrap();
-    }
-    let mut best = vec![f64::INFINITY; plans.len()];
-    for _ in 0..4 {
-        for (i, (_, plan)) in plans.iter().enumerate() {
-            for _ in 0..5 {
-                if let Some(run) = crate::tune::run(plan) {
-                    best[i] = best[i].min(run.as_secs_f64() * 1e6);
+        let ints = |v: Vec<i32>| {
+            let t = Tensor::from_slice(&v);
+            t.realize().unwrap();
+            t
+        };
+        let q = f16(&[b, 1, heads, d], 1);
+        let self_k = f16(&[b, 448, layers * heads, d], 2);
+        let self_v = f16(&[b, 448, layers * heads, d], 3);
+        let (k_app, v_app) = (f16(&[b, 1, heads, d], 4), f16(&[b, 1, heads, d], 5));
+        let lens = ints(vec![200; b]);
+        let cross_k = f16(&[1, 1500, layers * heads, d], 6);
+        let cross_v = f16(&[1, 1500, layers * heads, d], 7);
+        let map = ints(vec![0; b]);
+
+        let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
+        for (name, splits) in [("tuned", None), ("unsplit", Some(1))] {
+            let cache = Cache {
+                head_start: layer * heads,
+                kv_heads: heads,
+                row_map: None,
+                appended: Some((&k_app, &v_app)),
+                app_lens: None,
+            };
+            let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, ..Attn::default() };
+            let o = tk::attention(&q, &self_k, &self_v, opts).unwrap();
+            plans.push((format!("tk3 self {name}"), o.prepare().unwrap()));
+            let cache = Cache {
+                head_start: layer * heads,
+                kv_heads: heads,
+                row_map: Some(&map),
+                appended: None,
+                app_lens: None,
+            };
+            let o =
+                tk::attention(&q, &cross_k, &cross_v, Attn { cache: Some(cache), splits, ..Attn::default() }).unwrap();
+            plans.push((format!("tk3 cross {name}"), o.prepare().unwrap()));
+        }
+        let warm = std::time::Instant::now();
+        while warm.elapsed().as_millis() < 500 {
+            plans[0].1.execute().unwrap();
+        }
+        let mut best = vec![f64::INFINITY; plans.len()];
+        for _ in 0..4 {
+            for (i, (_, plan)) in plans.iter().enumerate() {
+                for _ in 0..5 {
+                    if let Some(run) = crate::tune::run(plan) {
+                        best[i] = best[i].min(run.as_secs_f64() * 1e6);
+                    }
                 }
             }
         }
-    }
-    for ((label, _), us) in plans.iter().zip(&best) {
-        eprintln!("{label}: {us:.1} us");
-    }
+        for ((label, _), us) in plans.iter().zip(&best) {
+            eprintln!("{label}: {us:.1} us");
+        }
+    });
 }

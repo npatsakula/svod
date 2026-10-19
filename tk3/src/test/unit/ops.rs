@@ -8,11 +8,12 @@ use test_case::test_case;
 
 use crate::ops::{self as tk, Act, Attn, Cache, Chunk, Conv, KeyMask, Linear, Qkv};
 
-/// A device with tk3 tables to run on, with tuning off so a test does not measure
-/// every shape it touches (the untuned pick runs).
-fn device() -> bool {
-    crate::tune::set_enabled(false);
-    super::device_planner().is_some()
+/// `test` on a device with tk3 tables, with tuning off on its thread so it
+/// does not measure every shape it touches (the untuned pick runs).
+fn untuned(test: impl FnOnce()) {
+    if super::device_planner().is_some() {
+        crate::tune::scoped(false, test);
+    }
 }
 
 /// A realized `shape` tensor of `dtype` with values in `scale·[-1, 1)`.
@@ -141,49 +142,46 @@ fn linear_matches_the_graph(
     residual: bool,
     scale: Option<f32>,
 ) {
-    if !device() {
-        return;
-    }
-    let x = rand(&[lead, &[k]].concat(), 1, 1.0, DType::BFloat16);
-    let w = rand(&[n, k], 2, 0.5, DType::BFloat16);
-    let b = rand(&[n], 3, 1.0, DType::BFloat16);
-    let r = rand(&[lead, &[n]].concat(), 4, 2.0, DType::BFloat16);
-    let opts = Linear { bias: bias.then_some(&b), act, gated: false, residual: residual.then_some(&r), scale };
-    let y = tk::linear(&x, &w, opts).unwrap();
-    assert_kernel(&y, "gemm");
-    assert_close("linear", &y, &linear_reference(&x, &w, opts), 2e-2);
+    untuned(|| {
+        let x = rand(&[lead, &[k]].concat(), 1, 1.0, DType::BFloat16);
+        let w = rand(&[n, k], 2, 0.5, DType::BFloat16);
+        let b = rand(&[n], 3, 1.0, DType::BFloat16);
+        let r = rand(&[lead, &[n]].concat(), 4, 2.0, DType::BFloat16);
+        let opts = Linear { bias: bias.then_some(&b), act, gated: false, residual: residual.then_some(&r), scale };
+        let y = tk::linear(&x, &w, opts).unwrap();
+        assert_kernel(&y, "gemm");
+        assert_close("linear", &y, &linear_reference(&x, &w, opts), 2e-2);
+    });
 }
 
 #[test_case(Act::Silu, true; "swiglu with bias")]
 #[test_case(Act::Gelu, false; "geglu")]
 fn gated_linear_matches_the_graph(act: Act, bias: bool) {
-    if !device() {
-        return;
-    }
-    let (m, n, k) = (77, 96, 128);
-    let x = rand(&[m, k], 5, 1.0, DType::BFloat16);
-    let w = rand(&[2 * n, k], 6, 0.3, DType::BFloat16);
-    let b = rand(&[2 * n], 7, 1.0, DType::BFloat16);
-    let opts = Linear { bias: bias.then_some(&b), act, gated: true, ..Linear::default() };
-    let y = tk::linear(&x, &w, opts).unwrap();
-    assert_eq!(y.shape().unwrap().to_vec(), [SInt::Const(m), SInt::Const(n)]);
-    assert_kernel(&y, "gemm");
-    assert_close("gated linear", &y, &linear_reference(&x, &w, opts), 2e-2);
+    untuned(|| {
+        let (m, n, k) = (77, 96, 128);
+        let x = rand(&[m, k], 5, 1.0, DType::BFloat16);
+        let w = rand(&[2 * n, k], 6, 0.3, DType::BFloat16);
+        let b = rand(&[2 * n], 7, 1.0, DType::BFloat16);
+        let opts = Linear { bias: bias.then_some(&b), act, gated: true, ..Linear::default() };
+        let y = tk::linear(&x, &w, opts).unwrap();
+        assert_eq!(y.shape().unwrap().to_vec(), [SInt::Const(m), SInt::Const(n)]);
+        assert_kernel(&y, "gemm");
+        assert_close("gated linear", &y, &linear_reference(&x, &w, opts), 2e-2);
+    });
 }
 
 /// Operands that are lazy views (a transpose, a reshape) are materialized
 /// for the kernel.
 #[test]
 fn linear_takes_lazy_views() {
-    if !device() {
-        return;
-    }
-    let xt = rand(&[64, 40], 8, 1.0, DType::BFloat16);
-    let x = xt.try_transpose(0, 1).unwrap().try_reshape([4, 10, 64]).unwrap();
-    let w = rand(&[2, 32, 64], 9, 0.5, DType::BFloat16).try_reshape([64, 64]).unwrap();
-    let y = tk::linear(&x, &w, Linear::default()).unwrap();
-    assert_kernel(&y, "gemm");
-    assert_close("linear of views", &y, &tk::linear::graph(&x, &w, Linear::default()).unwrap(), 2e-2);
+    untuned(|| {
+        let xt = rand(&[64, 40], 8, 1.0, DType::BFloat16);
+        let x = xt.try_transpose(0, 1).unwrap().try_reshape([4, 10, 64]).unwrap();
+        let w = rand(&[2, 32, 64], 9, 0.5, DType::BFloat16).try_reshape([64, 64]).unwrap();
+        let y = tk::linear(&x, &w, Linear::default()).unwrap();
+        assert_kernel(&y, "gemm");
+        assert_close("linear of views", &y, &tk::linear::graph(&x, &w, Linear::default()).unwrap(), 2e-2);
+    });
 }
 
 /// A kernel's output lives where the scheduler keeps graph intermediates:
@@ -191,43 +189,41 @@ fn linear_takes_lazy_views() {
 /// write never faults in managed pages), read back through `copyout`.
 #[test]
 fn kernel_outputs_are_device_local() {
-    if !device() {
-        return;
-    }
-    let local = svod_device::registry::registry().get(&default_device()).unwrap().supports_device_local();
-    let (x, w) = (rand(&[96, 64], 10, 1.0, DType::BFloat16), rand(&[64, 64], 11, 0.5, DType::BFloat16));
-    let y = tk::linear(&x, &w, Linear::default()).unwrap();
-    assert_kernel(&y, "gemm");
-    y.realize().unwrap();
-    assert_eq!(y.buffer().unwrap().as_host_bytes().is_err(), local, "host-mapped: {}", !local);
-    assert_close("linear read through copyout", &y, &tk::linear::graph(&x, &w, Linear::default()).unwrap(), 2e-2);
+    untuned(|| {
+        let local = svod_device::registry::registry().get(&default_device()).unwrap().supports_device_local();
+        let (x, w) = (rand(&[96, 64], 10, 1.0, DType::BFloat16), rand(&[64, 64], 11, 0.5, DType::BFloat16));
+        let y = tk::linear(&x, &w, Linear::default()).unwrap();
+        assert_kernel(&y, "gemm");
+        y.realize().unwrap();
+        assert_eq!(y.buffer().unwrap().as_host_bytes().is_err(), local, "host-mapped: {}", !local);
+        assert_close("linear read through copyout", &y, &tk::linear::graph(&x, &w, Linear::default()).unwrap(), 2e-2);
+    });
 }
 
 /// A batch bound below its capacity: one GEMM over the live batches only,
 /// the output shrunk to the live dim.
 #[test]
 fn linear_under_a_batch_variable() {
-    if !device() {
-        return;
-    }
-    let (cap, live, rows, n, k) = (4, 3, 37, 64, 64);
-    let x = rand(&[cap, rows, k], 10, 1.0, DType::BFloat16);
-    let r = rand(&[cap, rows, n], 11, 1.0, DType::BFloat16);
-    let w = rand(&[2 * n, k], 12, 0.5, DType::BFloat16);
-    let b = rand(&[2 * n], 13, 1.0, DType::BFloat16);
-    let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
-    let [xb, rb] = <[Tensor; 2]>::try_from(bound(&[&x, &r], &var)).unwrap();
-    let opts = Linear { bias: Some(&b), act: Act::Silu, gated: true, residual: Some(&rb), scale: Some(0.5) };
-    let y = tk::linear(&xb, &w, opts).unwrap();
-    assert_eq!(y.shape().unwrap()[0], var.as_sint());
-    assert_kernel(&y, "gemm");
-    let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], live)).unwrap();
-    let want = linear_reference(&xs, &w, Linear { residual: Some(&rs), ..opts });
-    assert_close("batched linear", &y, &want, 2e-2);
-    // The same plan serves a smaller batch.
-    let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], 1)).unwrap();
-    let want = values(&linear_reference(&xs, &w, Linear { residual: Some(&rs), ..opts }));
-    assert_close_values("rebound linear", &rebound(&y, 1, rows * n), &want, 2e-2);
+    untuned(|| {
+        let (cap, live, rows, n, k) = (4, 3, 37, 64, 64);
+        let x = rand(&[cap, rows, k], 10, 1.0, DType::BFloat16);
+        let r = rand(&[cap, rows, n], 11, 1.0, DType::BFloat16);
+        let w = rand(&[2 * n, k], 12, 0.5, DType::BFloat16);
+        let b = rand(&[2 * n], 13, 1.0, DType::BFloat16);
+        let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
+        let [xb, rb] = <[Tensor; 2]>::try_from(bound(&[&x, &r], &var)).unwrap();
+        let opts = Linear { bias: Some(&b), act: Act::Silu, gated: true, residual: Some(&rb), scale: Some(0.5) };
+        let y = tk::linear(&xb, &w, opts).unwrap();
+        assert_eq!(y.shape().unwrap()[0], var.as_sint());
+        assert_kernel(&y, "gemm");
+        let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], live)).unwrap();
+        let want = linear_reference(&xs, &w, Linear { residual: Some(&rs), ..opts });
+        assert_close("batched linear", &y, &want, 2e-2);
+        // The same plan serves a smaller batch.
+        let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], 1)).unwrap();
+        let want = values(&linear_reference(&xs, &w, Linear { residual: Some(&rs), ..opts }));
+        assert_close_values("rebound linear", &rebound(&y, 1, rows * n), &want, 2e-2);
+    });
 }
 
 // ---- attention ----------------------------------------------------------------
@@ -346,14 +342,13 @@ const CHUNKS: Option<Chunk> = Some(Chunk { size: 8, left: Some(16), right: 0 });
 #[test_case(AttnCase { chunk: Some(Chunk { size: 24, left: None, right: 1 }), ..case(2, [200, 200], [4, 2], 64, false, None) }; "chunks of 24, every earlier one and one ahead")]
 #[test_case(AttnCase { chunk: Some(Chunk { size: 16, left: Some(1), right: 0 }), key_mask: true, ..case(1, [100, 100], [4, 4], 128, false, None) }; "d128 chunks with a bool mask")]
 fn attention_matches_the_graph(c: AttnCase) {
-    if !device() {
-        return;
-    }
-    let inputs = attn_inputs(&c, c.b);
-    let opts = inputs.opts(&c);
-    let o = tk::attention(&inputs.q, &inputs.k, &inputs.v, opts).unwrap();
-    assert_kernel(&o, "flash_attention");
-    assert_close("attention", &o, &tk::attention::graph(&inputs.q, &inputs.k, &inputs.v, opts).unwrap(), 2e-2);
+    untuned(|| {
+        let inputs = attn_inputs(&c, c.b);
+        let opts = inputs.opts(&c);
+        let o = tk::attention(&inputs.q, &inputs.k, &inputs.v, opts).unwrap();
+        assert_kernel(&o, "flash_attention");
+        assert_close("attention", &o, &tk::attention::graph(&inputs.q, &inputs.k, &inputs.v, opts).unwrap(), 2e-2);
+    });
 }
 
 /// Scores that climb across key blocks (a bias ramp along the keys) make the
@@ -364,62 +359,60 @@ fn attention_matches_the_graph(c: AttnCase) {
 #[test_case(1.0, false; "a steep climb")]
 #[test_case(0.1, true; "a slow causal climb")]
 fn climbing_scores_match_the_graph(per_key: f32, causal: bool) {
-    if !device() {
-        return;
-    }
-    let c = AttnCase { bias: Some(2), ..case(2, [200, 200], [4, 4], 64, causal, None) };
-    let mut inputs = attn_inputs(&c, c.b);
-    let ramp: Vec<f32> = (0..c.b * c.h * c.t * c.tk).map(|i| per_key * (i % c.tk) as f32).collect();
-    let ramp = Tensor::from_slice(&ramp).try_reshape([c.b, c.h, c.t, c.tk]).unwrap().cast(DType::BFloat16);
-    ramp.realize().unwrap();
-    inputs.bias = Some(ramp);
-    let opts = inputs.opts(&c);
-    let o = tk::attention(&inputs.q, &inputs.k, &inputs.v, opts).unwrap();
-    assert_kernel(&o, "flash_attention");
-    let want = tk::attention::graph(&inputs.q, &inputs.k, &inputs.v, opts).unwrap();
-    assert_close("climbing attention", &o, &want, 2e-2);
+    untuned(|| {
+        let c = AttnCase { bias: Some(2), ..case(2, [200, 200], [4, 4], 64, causal, None) };
+        let mut inputs = attn_inputs(&c, c.b);
+        let ramp: Vec<f32> = (0..c.b * c.h * c.t * c.tk).map(|i| per_key * (i % c.tk) as f32).collect();
+        let ramp = Tensor::from_slice(&ramp).try_reshape([c.b, c.h, c.t, c.tk]).unwrap().cast(DType::BFloat16);
+        ramp.realize().unwrap();
+        inputs.bias = Some(ramp);
+        let opts = inputs.opts(&c);
+        let o = tk::attention(&inputs.q, &inputs.k, &inputs.v, opts).unwrap();
+        assert_kernel(&o, "flash_attention");
+        let want = tk::attention::graph(&inputs.q, &inputs.k, &inputs.v, opts).unwrap();
+        assert_close("climbing attention", &o, &want, 2e-2);
+    });
 }
 
 #[test]
 fn attention_under_a_batch_variable() {
-    if !device() {
-        return;
-    }
-    let (cap, live) = (3, 2);
-    let c = case(cap, [96, 96], [4, 2], 64, false, Some(&[96, 40, 5]));
-    let AttnInputs { q, k, v, lens, .. } = attn_inputs(&c, cap);
-    let lens = lens.unwrap();
-    let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
-    let [qb, kb, vb, lb] = <[Tensor; 4]>::try_from(bound(&[&q, &k, &v, &lens], &var)).unwrap();
-    let opts = |lens| Attn { keys: KeyMask::Lens(lens), scale: Some(0.2), ..Attn::default() };
-    let o = tk::attention(&qb, &kb, &vb, opts(&lb)).unwrap();
-    assert_eq!(o.shape().unwrap()[0], var.as_sint());
-    assert_kernel(&o, "flash_attention");
-    let [qs, ks, vs, ls] = <[Tensor; 4]>::try_from(first(&[&q, &k, &v, &lens], live)).unwrap();
-    assert_close("batched attention", &o, &tk::attention::graph(&qs, &ks, &vs, opts(&ls)).unwrap(), 2e-2);
+    untuned(|| {
+        let (cap, live) = (3, 2);
+        let c = case(cap, [96, 96], [4, 2], 64, false, Some(&[96, 40, 5]));
+        let AttnInputs { q, k, v, lens, .. } = attn_inputs(&c, cap);
+        let lens = lens.unwrap();
+        let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
+        let [qb, kb, vb, lb] = <[Tensor; 4]>::try_from(bound(&[&q, &k, &v, &lens], &var)).unwrap();
+        let opts = |lens| Attn { keys: KeyMask::Lens(lens), scale: Some(0.2), ..Attn::default() };
+        let o = tk::attention(&qb, &kb, &vb, opts(&lb)).unwrap();
+        assert_eq!(o.shape().unwrap()[0], var.as_sint());
+        assert_kernel(&o, "flash_attention");
+        let [qs, ks, vs, ls] = <[Tensor; 4]>::try_from(first(&[&q, &k, &v, &lens], live)).unwrap();
+        assert_close("batched attention", &o, &tk::attention::graph(&qs, &ks, &vs, opts(&ls)).unwrap(), 2e-2);
+    });
 }
 
 /// A per-batch and a shared bias under a batch bound below its capacity.
 #[test_case(true; "per batch")]
 #[test_case(false; "shared")]
 fn biased_attention_under_a_batch_variable(per_batch: bool) {
-    if !device() {
-        return;
-    }
-    let (cap, live) = (3, 2);
-    let c = AttnCase { bias: Some(if per_batch { cap } else { 1 }), ..case(cap, [99, 99], [4, 4], 64, false, None) };
-    let AttnInputs { q, k, v, bias, .. } = attn_inputs(&c, cap);
-    let bias = bias.unwrap();
-    let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
-    let [qb, kb, vb] = <[Tensor; 3]>::try_from(bound(&[&q, &k, &v], &var)).unwrap();
-    let bb = if per_batch { bound(&[&bias], &var).swap_remove(0) } else { bias.clone() };
-    let o = tk::attention(&qb, &kb, &vb, Attn { bias: Some(&bb), ..Attn::default() }).unwrap();
-    assert_eq!(o.shape().unwrap()[0], var.as_sint());
-    assert_kernel(&o, "flash_attention");
-    let [qs, ks, vs] = <[Tensor; 3]>::try_from(first(&[&q, &k, &v], live)).unwrap();
-    let bs = if per_batch { first(&[&bias], live).swap_remove(0) } else { bias };
-    let want = tk::attention::graph(&qs, &ks, &vs, Attn { bias: Some(&bs), ..Attn::default() }).unwrap();
-    assert_close("batched biased attention", &o, &want, 2e-2);
+    untuned(|| {
+        let (cap, live) = (3, 2);
+        let c =
+            AttnCase { bias: Some(if per_batch { cap } else { 1 }), ..case(cap, [99, 99], [4, 4], 64, false, None) };
+        let AttnInputs { q, k, v, bias, .. } = attn_inputs(&c, cap);
+        let bias = bias.unwrap();
+        let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
+        let [qb, kb, vb] = <[Tensor; 3]>::try_from(bound(&[&q, &k, &v], &var)).unwrap();
+        let bb = if per_batch { bound(&[&bias], &var).swap_remove(0) } else { bias.clone() };
+        let o = tk::attention(&qb, &kb, &vb, Attn { bias: Some(&bb), ..Attn::default() }).unwrap();
+        assert_eq!(o.shape().unwrap()[0], var.as_sint());
+        assert_kernel(&o, "flash_attention");
+        let [qs, ks, vs] = <[Tensor; 3]>::try_from(first(&[&q, &k, &v], live)).unwrap();
+        let bs = if per_batch { first(&[&bias], live).swap_remove(0) } else { bias };
+        let want = tk::attention::graph(&qs, &ks, &vs, Attn { bias: Some(&bs), ..Attn::default() }).unwrap();
+        assert_close("batched biased attention", &o, &want, 2e-2);
+    });
 }
 
 /// A decoder step: `t` queries per lane against a cache of three layers'
@@ -440,36 +433,35 @@ fn cached_attention_matches_the_graph(
     counted: bool,
     biased: bool,
 ) {
-    if !device() {
-        return;
-    }
-    let (b, rows, layers) = (5, 2, 3);
-    let q = rand(&[b, t, h, d], 40, 1.0, DType::BFloat16);
-    let k = rand(&[rows, tk, layers * h, d], 41, 1.0, DType::BFloat16);
-    let v = rand(&[rows, tk, layers * h, d], 42, 1.0, DType::BFloat16);
-    let k_app = rand(&[b, appended, h, d], 43, 1.0, DType::BFloat16);
-    let v_app = rand(&[b, appended, h, d], 44, 1.0, DType::BFloat16);
-    let realized = |v: Vec<i32>| {
-        let t = Tensor::from_slice(&v);
-        t.realize().unwrap();
-        t
-    };
-    let lens = realized(vec![tk as i32, 1, 37, tk as i32 - 1, 0]);
-    let row_map = realized(vec![0, 1, 1, 0, 1]);
-    let seen = realized((0..b).map(|lane| (appended as i32 - lane as i32 % 3).max(1)).collect());
-    let app_lens = counted.then_some(&seen);
-    let cache =
-        Cache { head_start: h, kv_heads: h, row_map: Some(&row_map), appended: Some((&k_app, &v_app)), app_lens };
-    // The appended keys' columns last.
-    let bias = rand(&[b, h, t, tk + appended], 45, 2.0, DType::BFloat16);
-    let bias = biased.then_some(&bias);
-    let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, bias, ..Attn::default() };
-    let o = tk::attention(&q, &k, &v, opts).unwrap();
-    assert_kernel(&o, "flash_attention");
-    if splits.is_some() {
-        assert_kernel(&o, "combine_splits");
-    }
-    assert_close("cached attention", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
+    untuned(|| {
+        let (b, rows, layers) = (5, 2, 3);
+        let q = rand(&[b, t, h, d], 40, 1.0, DType::BFloat16);
+        let k = rand(&[rows, tk, layers * h, d], 41, 1.0, DType::BFloat16);
+        let v = rand(&[rows, tk, layers * h, d], 42, 1.0, DType::BFloat16);
+        let k_app = rand(&[b, appended, h, d], 43, 1.0, DType::BFloat16);
+        let v_app = rand(&[b, appended, h, d], 44, 1.0, DType::BFloat16);
+        let realized = |v: Vec<i32>| {
+            let t = Tensor::from_slice(&v);
+            t.realize().unwrap();
+            t
+        };
+        let lens = realized(vec![tk as i32, 1, 37, tk as i32 - 1, 0]);
+        let row_map = realized(vec![0, 1, 1, 0, 1]);
+        let seen = realized((0..b).map(|lane| (appended as i32 - lane as i32 % 3).max(1)).collect());
+        let app_lens = counted.then_some(&seen);
+        let cache =
+            Cache { head_start: h, kv_heads: h, row_map: Some(&row_map), appended: Some((&k_app, &v_app)), app_lens };
+        // The appended keys' columns last.
+        let bias = rand(&[b, h, t, tk + appended], 45, 2.0, DType::BFloat16);
+        let bias = biased.then_some(&bias);
+        let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, bias, ..Attn::default() };
+        let o = tk::attention(&q, &k, &v, opts).unwrap();
+        assert_kernel(&o, "flash_attention");
+        if splits.is_some() {
+            assert_kernel(&o, "combine_splits");
+        }
+        assert_close("cached attention", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
+    });
 }
 
 // ---- heads ---------------------------------------------------------------------
@@ -493,60 +485,58 @@ fn rope_tables(rows: usize, t: usize, d: usize, dtype: DType) -> (Tensor, Tensor
 #[test_case(1, 50, [4, 1, 64], true, false, false; "normed only")]
 #[test_case(2, 16, [2, 2, 32], false, false, false; "a split")]
 fn heads_match_the_graph(b: usize, t: usize, [h, h_kv, d]: [usize; 3], normed: bool, rotated: bool, by_token: bool) {
-    if !device() {
-        return;
-    }
-    let qkv = rand(&[b, t, (h + 2 * h_kv) * d], 30, 2.0, DType::BFloat16);
-    let q_w = rand(&[d], 31, 0.5, DType::BFloat16);
-    let k_w = rand(&[d], 32, 0.5, DType::BFloat16);
-    let tables = rotated.then(|| rope_tables(if by_token { b } else { 1 }, t, d, DType::BFloat16));
-    let opts = Qkv {
-        heads: h,
-        kv_heads: h_kv,
-        head_dim: d,
-        q_norm: normed.then_some(&q_w),
-        k_norm: normed.then_some(&k_w),
-        eps: 1e-6,
-        rope: tables.as_ref().map(|(c, s)| (c, s)),
-    };
-    let (q, k, v) = tk::heads(&qkv, opts).unwrap();
-    assert_kernel(&q, "heads");
-    let (wq, wk, wv) = tk::heads::graph(&qkv, opts).unwrap();
-    assert_close("q", &q, &wq, 2e-2);
-    assert_close("k", &k, &wk, 2e-2);
-    assert_close("v", &v, &wv, 0.0);
+    untuned(|| {
+        let qkv = rand(&[b, t, (h + 2 * h_kv) * d], 30, 2.0, DType::BFloat16);
+        let q_w = rand(&[d], 31, 0.5, DType::BFloat16);
+        let k_w = rand(&[d], 32, 0.5, DType::BFloat16);
+        let tables = rotated.then(|| rope_tables(if by_token { b } else { 1 }, t, d, DType::BFloat16));
+        let opts = Qkv {
+            heads: h,
+            kv_heads: h_kv,
+            head_dim: d,
+            q_norm: normed.then_some(&q_w),
+            k_norm: normed.then_some(&k_w),
+            eps: 1e-6,
+            rope: tables.as_ref().map(|(c, s)| (c, s)),
+        };
+        let (q, k, v) = tk::heads(&qkv, opts).unwrap();
+        assert_kernel(&q, "heads");
+        let (wq, wk, wv) = tk::heads::graph(&qkv, opts).unwrap();
+        assert_close("q", &q, &wq, 2e-2);
+        assert_close("k", &k, &wk, 2e-2);
+        assert_close("v", &v, &wv, 0.0);
+    });
 }
 
 #[test]
 fn heads_under_a_batch_variable() {
-    if !device() {
-        return;
-    }
-    let (cap, live, t, [h, h_kv, d]) = (3, 2, 12, [4, 2, 64]);
-    let qkv = rand(&[cap, t, (h + 2 * h_kv) * d], 33, 2.0, DType::BFloat16);
-    let w = rand(&[d], 34, 0.5, DType::BFloat16);
-    let (cos, sin) = rope_tables(1, t, d, DType::BFloat16);
-    let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
-    let [qkv_b] = <[Tensor; 1]>::try_from(bound(&[&qkv], &var)).unwrap();
-    let opts = Qkv {
-        heads: h,
-        kv_heads: h_kv,
-        head_dim: d,
-        q_norm: Some(&w),
-        k_norm: Some(&w),
-        eps: 1e-6,
-        rope: Some((&cos, &sin)),
-    };
-    let (q, k, v) = tk::heads(&qkv_b, opts).unwrap();
-    for out in [&q, &k, &v] {
-        assert_eq!(out.shape().unwrap()[0], var.as_sint());
-    }
-    assert_kernel(&q, "heads");
-    let [qkv_s] = <[Tensor; 1]>::try_from(first(&[&qkv], live)).unwrap();
-    let (wq, wk, wv) = tk::heads::graph(&qkv_s, opts).unwrap();
-    assert_close("batched q", &q, &wq, 2e-2);
-    assert_close("batched k", &k, &wk, 2e-2);
-    assert_close("batched v", &v, &wv, 0.0);
+    untuned(|| {
+        let (cap, live, t, [h, h_kv, d]) = (3, 2, 12, [4, 2, 64]);
+        let qkv = rand(&[cap, t, (h + 2 * h_kv) * d], 33, 2.0, DType::BFloat16);
+        let w = rand(&[d], 34, 0.5, DType::BFloat16);
+        let (cos, sin) = rope_tables(1, t, d, DType::BFloat16);
+        let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
+        let [qkv_b] = <[Tensor; 1]>::try_from(bound(&[&qkv], &var)).unwrap();
+        let opts = Qkv {
+            heads: h,
+            kv_heads: h_kv,
+            head_dim: d,
+            q_norm: Some(&w),
+            k_norm: Some(&w),
+            eps: 1e-6,
+            rope: Some((&cos, &sin)),
+        };
+        let (q, k, v) = tk::heads(&qkv_b, opts).unwrap();
+        for out in [&q, &k, &v] {
+            assert_eq!(out.shape().unwrap()[0], var.as_sint());
+        }
+        assert_kernel(&q, "heads");
+        let [qkv_s] = <[Tensor; 1]>::try_from(first(&[&qkv], live)).unwrap();
+        let (wq, wk, wv) = tk::heads::graph(&qkv_s, opts).unwrap();
+        assert_close("batched q", &q, &wq, 2e-2);
+        assert_close("batched k", &k, &wk, 2e-2);
+        assert_close("batched v", &v, &wv, 0.0);
+    });
 }
 
 // ---- norms ---------------------------------------------------------------------
@@ -557,50 +547,48 @@ fn heads_under_a_batch_variable() {
 #[test_case(false, false, false, 2048; "rms 2048")]
 #[test_case(false, true, false, 1024; "add rms 1024")]
 fn norms_match_the_graph(layer: bool, residual: bool, bias: bool, d: usize) {
-    if !device() {
-        return;
-    }
-    let x = rand(&[37, d], 30, 2.0, DType::BFloat16);
-    let r = rand(&[37, d], 31, 1.0, DType::BFloat16);
-    let w = rand(&[d], 32, 1.0, DType::BFloat16);
-    let b = rand(&[d], 33, 0.5, DType::BFloat16);
-    let b = bias.then_some(&b);
-    let (sum, y) = match (layer, residual) {
-        (true, false) => (None, tk::layer_norm(&x, &w, b, 1e-5).unwrap()),
-        (true, true) => tk::add_layer_norm(&x, &r, &w, b, 1e-5).map(|(s, y)| (Some(s), y)).unwrap(),
-        (false, false) => (None, tk::rms_norm(&x, &w, 1e-6).unwrap()),
-        (false, true) => tk::add_rms_norm(&x, &r, &w, 1e-6).map(|(s, y)| (Some(s), y)).unwrap(),
-    };
-    let kind = if layer { crate::kernels::rows::Norm::Layer } else { crate::kernels::rows::Norm::Rms };
-    let eps = if layer { 1e-5 } else { 1e-6 };
-    let (want_sum, want) = tk::norm::graph(kind, &x, residual.then_some(&r), &w, b, eps).unwrap();
-    assert_kernel(&y, if layer { "layer_norm" } else { "rms_norm" });
-    assert_close("norm", &y, &want, 2e-2);
-    if let (Some(sum), Some(want_sum)) = (sum, want_sum) {
-        assert_close("sum", &sum, &want_sum, 0.0);
-    }
+    untuned(|| {
+        let x = rand(&[37, d], 30, 2.0, DType::BFloat16);
+        let r = rand(&[37, d], 31, 1.0, DType::BFloat16);
+        let w = rand(&[d], 32, 1.0, DType::BFloat16);
+        let b = rand(&[d], 33, 0.5, DType::BFloat16);
+        let b = bias.then_some(&b);
+        let (sum, y) = match (layer, residual) {
+            (true, false) => (None, tk::layer_norm(&x, &w, b, 1e-5).unwrap()),
+            (true, true) => tk::add_layer_norm(&x, &r, &w, b, 1e-5).map(|(s, y)| (Some(s), y)).unwrap(),
+            (false, false) => (None, tk::rms_norm(&x, &w, 1e-6).unwrap()),
+            (false, true) => tk::add_rms_norm(&x, &r, &w, 1e-6).map(|(s, y)| (Some(s), y)).unwrap(),
+        };
+        let kind = if layer { crate::kernels::rows::Norm::Layer } else { crate::kernels::rows::Norm::Rms };
+        let eps = if layer { 1e-5 } else { 1e-6 };
+        let (want_sum, want) = tk::norm::graph(kind, &x, residual.then_some(&r), &w, b, eps).unwrap();
+        assert_kernel(&y, if layer { "layer_norm" } else { "rms_norm" });
+        assert_close("norm", &y, &want, 2e-2);
+        if let (Some(sum), Some(want_sum)) = (sum, want_sum) {
+            assert_close("sum", &sum, &want_sum, 0.0);
+        }
+    });
 }
 
 #[test]
 fn norm_under_a_batch_variable() {
-    if !device() {
-        return;
-    }
-    let (cap, live, d) = (4, 3, 512);
-    let x = rand(&[cap, 37, d], 40, 2.0, DType::BFloat16);
-    let r = rand(&[cap, 37, d], 41, 1.0, DType::BFloat16);
-    let w = rand(&[d], 42, 1.0, DType::BFloat16);
-    let b = rand(&[d], 43, 0.5, DType::BFloat16);
-    let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
-    let [xb, rb] = <[Tensor; 2]>::try_from(bound(&[&x, &r], &var)).unwrap();
-    let (sum, y) = tk::add_layer_norm(&xb, &rb, &w, Some(&b), 1e-5).unwrap();
-    assert_eq!(y.shape().unwrap()[0], var.as_sint());
-    assert_kernel(&y, "layer_norm");
-    let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], live)).unwrap();
-    let (want_sum, want) =
-        tk::norm::graph(crate::kernels::rows::Norm::Layer, &xs, Some(&rs), &w, Some(&b), 1e-5).unwrap();
-    assert_close("batched norm", &y, &want, 2e-2);
-    assert_close("batched sum", &sum, &want_sum.unwrap(), 0.0);
+    untuned(|| {
+        let (cap, live, d) = (4, 3, 512);
+        let x = rand(&[cap, 37, d], 40, 2.0, DType::BFloat16);
+        let r = rand(&[cap, 37, d], 41, 1.0, DType::BFloat16);
+        let w = rand(&[d], 42, 1.0, DType::BFloat16);
+        let b = rand(&[d], 43, 0.5, DType::BFloat16);
+        let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
+        let [xb, rb] = <[Tensor; 2]>::try_from(bound(&[&x, &r], &var)).unwrap();
+        let (sum, y) = tk::add_layer_norm(&xb, &rb, &w, Some(&b), 1e-5).unwrap();
+        assert_eq!(y.shape().unwrap()[0], var.as_sint());
+        assert_kernel(&y, "layer_norm");
+        let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], live)).unwrap();
+        let (want_sum, want) =
+            tk::norm::graph(crate::kernels::rows::Norm::Layer, &xs, Some(&rs), &w, Some(&b), 1e-5).unwrap();
+        assert_close("batched norm", &y, &want, 2e-2);
+        assert_close("batched sum", &sum, &want_sum.unwrap(), 0.0);
+    });
 }
 
 // ---- f16 -------------------------------------------------------------------------
@@ -608,33 +596,32 @@ fn norm_under_a_batch_variable() {
 /// The same kernels over f16 operands.
 #[test]
 fn f16_ops_match_the_graph() {
-    if !device() {
-        return;
-    }
-    let x = rand(&[45, 64], 50, 1.0, DType::Float16);
-    let w = rand(&[64, 64], 51, 0.5, DType::Float16);
-    let y = tk::linear(&x, &w, Linear::default()).unwrap();
-    assert_kernel(&y, "gemm");
-    assert_close("f16 linear", &y, &tk::linear::graph(&x, &w, Linear::default()).unwrap(), 2e-2);
+    untuned(|| {
+        let x = rand(&[45, 64], 50, 1.0, DType::Float16);
+        let w = rand(&[64, 64], 51, 0.5, DType::Float16);
+        let y = tk::linear(&x, &w, Linear::default()).unwrap();
+        assert_kernel(&y, "gemm");
+        assert_close("f16 linear", &y, &tk::linear::graph(&x, &w, Linear::default()).unwrap(), 2e-2);
 
-    let c = case(1, [70, 70], [2, 2], 64, true, None);
-    let [q, k, v] = [20, 21, 22].map(|s| rand(&[1, c.t, c.h, c.d], s, 1.0, DType::Float16));
-    let opts = Attn { causal: true, ..Attn::default() };
-    let o = tk::attention(&q, &k, &v, opts).unwrap();
-    assert_kernel(&o, "flash_attention");
-    assert_close("f16 attention", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
-    let bias = rand(&[1, c.h, c.t, c.t], 23, 2.0, DType::Float16);
-    let opts = Attn { bias: Some(&bias), ..opts };
-    let o = tk::attention(&q, &k, &v, opts).unwrap();
-    assert_kernel(&o, "flash_attention");
-    assert_close("f16 biased attention", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
+        let c = case(1, [70, 70], [2, 2], 64, true, None);
+        let [q, k, v] = [20, 21, 22].map(|s| rand(&[1, c.t, c.h, c.d], s, 1.0, DType::Float16));
+        let opts = Attn { causal: true, ..Attn::default() };
+        let o = tk::attention(&q, &k, &v, opts).unwrap();
+        assert_kernel(&o, "flash_attention");
+        assert_close("f16 attention", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
+        let bias = rand(&[1, c.h, c.t, c.t], 23, 2.0, DType::Float16);
+        let opts = Attn { bias: Some(&bias), ..opts };
+        let o = tk::attention(&q, &k, &v, opts).unwrap();
+        assert_kernel(&o, "flash_attention");
+        assert_close("f16 biased attention", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
 
-    let w = rand(&[256], 52, 1.0, DType::Float16);
-    let x = rand(&[37, 256], 53, 2.0, DType::Float16);
-    let y = tk::rms_norm(&x, &w, 1e-6).unwrap();
-    assert_kernel(&y, "rms_norm");
-    let want = tk::norm::graph(crate::kernels::rows::Norm::Rms, &x, None, &w, None, 1e-6).unwrap().1;
-    assert_close("f16 rms norm", &y, &want, 2e-2);
+        let w = rand(&[256], 52, 1.0, DType::Float16);
+        let x = rand(&[37, 256], 53, 2.0, DType::Float16);
+        let y = tk::rms_norm(&x, &w, 1e-6).unwrap();
+        assert_kernel(&y, "rms_norm");
+        let want = tk::norm::graph(crate::kernels::rows::Norm::Rms, &x, None, &w, None, 1e-6).unwrap().1;
+        assert_close("f16 rms norm", &y, &want, 2e-2);
+    });
 }
 
 /// The residual is a realized buffer that a graph kernel (a norm the op
@@ -642,18 +629,17 @@ fn f16_ops_match_the_graph() {
 /// output.
 #[test]
 fn residual_shared_with_a_graph_norm() {
-    if !device() {
-        return;
-    }
-    let (m, d) = (1536, 384);
-    let x = rand(&[1, m, d], 20, 1.0, DType::Float16);
-    let g = rand(&[d], 21, 1.0, DType::Float16);
-    let w = rand(&[d, d], 22, 0.2, DType::Float16);
-    let ln = tk::layer_norm(&x, &g, None, 1e-5).unwrap();
-    let opts = Linear { residual: Some(&x), ..Linear::default() };
-    let y = tk::linear(&ln, &w, opts).unwrap();
-    assert_kernel(&y, "gemm");
-    assert_close("residual over graph norm", &y, &linear_reference(&ln, &w, opts), 3e-2);
+    untuned(|| {
+        let (m, d) = (1536, 384);
+        let x = rand(&[1, m, d], 20, 1.0, DType::Float16);
+        let g = rand(&[d], 21, 1.0, DType::Float16);
+        let w = rand(&[d, d], 22, 0.2, DType::Float16);
+        let ln = tk::layer_norm(&x, &g, None, 1e-5).unwrap();
+        let opts = Linear { residual: Some(&x), ..Linear::default() };
+        let y = tk::linear(&ln, &w, opts).unwrap();
+        assert_kernel(&y, "gemm");
+        assert_close("residual over graph norm", &y, &linear_reference(&ln, &w, opts), 3e-2);
+    });
 }
 
 // ---- conv2d --------------------------------------------------------------------
@@ -687,62 +673,59 @@ fn conv2d_matches_the_graph(
     residual: bool,
     kernel: Option<&str>,
 ) {
-    if !device() {
-        return;
-    }
-    let dtype = DType::Float16;
-    let xt = rand(&x, 21, 1.0, dtype.clone());
-    let w = rand(&[cout, k, k, x[3] / groups], 22, 1.0 / ((k * k * x[3] / groups) as f32).sqrt(), dtype.clone());
-    let b = rand(&[cout], 23, 1.0, dtype.clone());
-    let out = (x[1] + 2 * (k / 2) - k) / s + 1;
-    let r = rand(&[x[0], out, (x[2] + 2 * (k / 2) - k) / s + 1, cout], 24, 2.0, dtype);
-    let opts = Conv { groups, ..conv_opts(k, s, &b, residual.then_some(&r)) };
-    let y = tk::conv2d(&xt, &w, opts.clone()).unwrap();
-    if let Some(name) = kernel {
-        assert_kernel(&y, name);
-    }
-    assert_close("conv2d", &y, &conv_reference(&xt, &w, opts), 4e-3);
+    untuned(|| {
+        let dtype = DType::Float16;
+        let xt = rand(&x, 21, 1.0, dtype.clone());
+        let w = rand(&[cout, k, k, x[3] / groups], 22, 1.0 / ((k * k * x[3] / groups) as f32).sqrt(), dtype.clone());
+        let b = rand(&[cout], 23, 1.0, dtype.clone());
+        let out = (x[1] + 2 * (k / 2) - k) / s + 1;
+        let r = rand(&[x[0], out, (x[2] + 2 * (k / 2) - k) / s + 1, cout], 24, 2.0, dtype);
+        let opts = Conv { groups, ..conv_opts(k, s, &b, residual.then_some(&r)) };
+        let y = tk::conv2d(&xt, &w, opts.clone()).unwrap();
+        if let Some(name) = kernel {
+            assert_kernel(&y, name);
+        }
+        assert_close("conv2d", &y, &conv_reference(&xt, &w, opts), 4e-3);
+    });
 }
 
 /// An f32 output keeps the accumulator unrounded, with an f32 residual.
 #[test]
 fn conv2d_with_an_f32_output() {
-    if !device() {
-        return;
-    }
-    let x = rand(&[1, 20, 20, 96], 25, 1.0, DType::Float16);
-    let w = rand(&[64, 3, 3, 96], 26, 0.1, DType::Float16);
-    let b = rand(&[64], 27, 1.0, DType::Float16);
-    let r = rand(&[1, 20, 20, 64], 28, 1.0, DType::Float32);
-    let opts = Conv { out_dtype: Some(DType::Float32), ..conv_opts(3, 1, &b, Some(&r)) };
-    let y = tk::conv2d(&x, &w, opts.clone()).unwrap();
-    assert_eq!(y.dtype(), DType::Float32);
-    assert_kernel(&y, "conv");
-    assert_close("f32 conv2d", &y, &conv_reference(&x, &w, opts), 1e-4);
+    untuned(|| {
+        let x = rand(&[1, 20, 20, 96], 25, 1.0, DType::Float16);
+        let w = rand(&[64, 3, 3, 96], 26, 0.1, DType::Float16);
+        let b = rand(&[64], 27, 1.0, DType::Float16);
+        let r = rand(&[1, 20, 20, 64], 28, 1.0, DType::Float32);
+        let opts = Conv { out_dtype: Some(DType::Float32), ..conv_opts(3, 1, &b, Some(&r)) };
+        let y = tk::conv2d(&x, &w, opts.clone()).unwrap();
+        assert_eq!(y.dtype(), DType::Float32);
+        assert_kernel(&y, "conv");
+        assert_close("f32 conv2d", &y, &conv_reference(&x, &w, opts), 1e-4);
+    });
 }
 
 /// A bound batch below capacity: the live images only, the output's dim 0
 /// the variable, the same plan rebound to one image.
 #[test]
 fn conv2d_under_a_batch_variable() {
-    if !device() {
-        return;
-    }
-    let (cap, live) = (4, 3);
-    let x = rand(&[cap, 32, 32, 32], 29, 1.0, DType::Float16);
-    let r = rand(&[cap, 16, 16, 64], 30, 1.0, DType::Float16);
-    let w = rand(&[64, 3, 3, 32], 31, 0.2, DType::Float16);
-    let b = rand(&[64], 32, 1.0, DType::Float16);
-    let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
-    let [xb, rb] = <[Tensor; 2]>::try_from(bound(&[&x, &r], &var)).unwrap();
-    let y = tk::conv2d(&xb, &w, conv_opts(3, 2, &b, Some(&rb))).unwrap();
-    assert_eq!(y.shape().unwrap()[0], var.as_sint());
-    assert_kernel(&y, "conv");
-    let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], live)).unwrap();
-    assert_close("batched conv2d", &y, &conv_reference(&xs, &w, conv_opts(3, 2, &b, Some(&rs))), 4e-3);
-    let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], 1)).unwrap();
-    let want = values(&conv_reference(&xs, &w, conv_opts(3, 2, &b, Some(&rs))));
-    assert_close_values("rebound conv2d", &rebound(&y, 1, 16 * 16 * 64), &want, 4e-3);
+    untuned(|| {
+        let (cap, live) = (4, 3);
+        let x = rand(&[cap, 32, 32, 32], 29, 1.0, DType::Float16);
+        let r = rand(&[cap, 16, 16, 64], 30, 1.0, DType::Float16);
+        let w = rand(&[64, 3, 3, 32], 31, 0.2, DType::Float16);
+        let b = rand(&[64], 32, 1.0, DType::Float16);
+        let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
+        let [xb, rb] = <[Tensor; 2]>::try_from(bound(&[&x, &r], &var)).unwrap();
+        let y = tk::conv2d(&xb, &w, conv_opts(3, 2, &b, Some(&rb))).unwrap();
+        assert_eq!(y.shape().unwrap()[0], var.as_sint());
+        assert_kernel(&y, "conv");
+        let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], live)).unwrap();
+        assert_close("batched conv2d", &y, &conv_reference(&xs, &w, conv_opts(3, 2, &b, Some(&rs))), 4e-3);
+        let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], 1)).unwrap();
+        let want = values(&conv_reference(&xs, &w, conv_opts(3, 2, &b, Some(&rs))));
+        assert_close_values("rebound conv2d", &rebound(&y, 1, 16 * 16 * 64), &want, 4e-3);
+    });
 }
 
 /// Shapes the graph op would reject are errors, not fallbacks.
@@ -775,22 +758,21 @@ fn attention_rejects_key_lengths_off_the_batch(lens: &[usize]) {
 #[test_case(true; "a zero key length")]
 #[test_case(false; "every key masked")]
 fn attention_to_no_key_is_zeros(lens: bool) {
-    if !device() {
-        return;
-    }
-    let (b, t, tk, h, d) = (2, 64, 96, 4, 64);
-    let q = rand(&[b, t, h, d], 30, 1.0, DType::BFloat16);
-    let k = rand(&[b, tk, h, d], 31, 1.0, DType::BFloat16);
-    let v = rand(&[b, tk, h, d], 32, 1.0, DType::BFloat16);
-    let len = Tensor::from_slice([tk as i32, 0]);
-    let visible: Vec<bool> = (0..b * tk).map(|x| x < tk).collect();
-    let mask = Tensor::from_slice(&visible).try_reshape([b, tk]).unwrap();
-    let keys = if lens { KeyMask::Lens(&len) } else { KeyMask::Bool(&mask) };
-    let opts = Attn { keys, ..Attn::default() };
-    let o = tk::attention(&q, &k, &v, opts).unwrap();
-    assert_kernel(&o, "flash_attention");
-    let got = values(&o);
-    assert!(got.iter().all(|x| x.is_finite()), "no NaN");
-    assert!(got[got.len() / 2..].iter().all(|x| *x == 0.0), "the unreached batch is zeros");
-    assert_close("attention to no key", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
+    untuned(|| {
+        let (b, t, tk, h, d) = (2, 64, 96, 4, 64);
+        let q = rand(&[b, t, h, d], 30, 1.0, DType::BFloat16);
+        let k = rand(&[b, tk, h, d], 31, 1.0, DType::BFloat16);
+        let v = rand(&[b, tk, h, d], 32, 1.0, DType::BFloat16);
+        let len = Tensor::from_slice([tk as i32, 0]);
+        let visible: Vec<bool> = (0..b * tk).map(|x| x < tk).collect();
+        let mask = Tensor::from_slice(&visible).try_reshape([b, tk]).unwrap();
+        let keys = if lens { KeyMask::Lens(&len) } else { KeyMask::Bool(&mask) };
+        let opts = Attn { keys, ..Attn::default() };
+        let o = tk::attention(&q, &k, &v, opts).unwrap();
+        assert_kernel(&o, "flash_attention");
+        let got = values(&o);
+        assert!(got.iter().all(|x| x.is_finite()), "no NaN");
+        assert!(got[got.len() / 2..].iter().all(|x| *x == 0.0), "the unreached batch is zeros");
+        assert_close("attention to no key", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
+    });
 }

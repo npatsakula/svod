@@ -324,15 +324,23 @@ fn a_kernel_with_scratch_spilled(scratch: &[Option<u32>]) -> bool {
     tune::spilled(&resources)
 }
 
-/// `SVOD_TK3_TUNE=0`'s override: off and back on.
-#[test]
-fn tuning_can_be_turned_off() {
-    let before = tune::enabled();
-    tune::set_enabled(false);
-    assert!(!tune::enabled());
-    tune::set_enabled(true);
-    assert!(tune::enabled());
-    tune::set_enabled(before);
+/// A scoped setting holds on its thread and on the workers `in_parallel`
+/// runs there, nests, and gives the outer one back on return and on unwind;
+/// another thread follows the environment.
+#[test_case(false; "off")]
+#[test_case(true; "on")]
+fn a_scoped_setting_holds_on_its_thread_alone(on: bool) {
+    let outer = tune::enabled();
+    tune::scoped(on, || {
+        assert_eq!(tune::enabled(), on);
+        assert!(tune::in_parallel((0..64).collect(), |_: i32| tune::enabled()).into_iter().all(|e| e == on));
+        assert_eq!(std::thread::spawn(tune::enabled).join().unwrap(), outer);
+        tune::scoped(!on, || assert_eq!(tune::enabled(), !on));
+        assert_eq!(tune::enabled(), on);
+        assert!(std::panic::catch_unwind(|| tune::scoped(!on, || panic!("unwinds"))).is_err());
+        assert_eq!(tune::enabled(), on);
+    });
+    assert_eq!(tune::enabled(), outer);
 }
 
 /// A ranked list's admission is memoized for the process: a second ask

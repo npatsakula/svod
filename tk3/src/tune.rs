@@ -10,14 +10,15 @@
 //! programs, so a toolchain or kernel change re-measures. An unreadable or
 //! unwritable store is a miss, never an error; a line the store cannot read
 //! is dropped at its next write, and a file of another format whole.
-//! `SVOD_TK3_TUNE=0` or [`set_enabled`] turns candidate timing off: the first
-//! admitted candidate is used, while a device's probes still measure.
+//! `SVOD_TK3_TUNE=0`, or [`scoped`] on a thread, turns candidate timing off:
+//! the first admitted candidate is used, while a device's probes still
+//! measure.
 
 use std::borrow::BorrowMut;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -635,17 +636,19 @@ fn sustain(plan: &ExecutionPlan, budget: Duration, per_run: Duration) {
 }
 
 /// `f` over `items` on the rayon pool, each worker running under the
-/// caller's default device and origin scope (both per thread), so what it
-/// builds is what the caller would have built.
+/// caller's default device, origin scope and [`scoped`] tuning (all per
+/// thread), so what it builds is what the caller would have built.
 pub(crate) fn in_parallel<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
     use rayon::prelude::*;
     let (device, origin, capture) = (default_device(), svod_ir::origin::current(), svod_ir::origin::enabled());
+    let tuning = SCOPED.get();
     items
         .into_par_iter()
         .map(|item| {
             with_default_device(device.clone(), || {
                 let _capture = svod_ir::origin::capture_for_thread(capture);
                 let _scope = svod_ir::origin::install(origin);
+                let _tuning = Restore(SCOPED.replace(tuning));
                 f(item)
             })
         })
@@ -681,19 +684,29 @@ pub fn resources(plan: &ExecutionPlan) -> Vec<KernelResources> {
     plan.kernels().filter_map(|k| k.program.resource_usage()).collect()
 }
 
-/// `0`: follow the environment; `1`: off; `2`: on.
-static OVERRIDE: AtomicU8 = AtomicU8::new(0);
-
-/// [`set_enabled`]'s last setting, else `SVOD_TK3_TUNE` is not `0`.
-pub fn enabled() -> bool {
-    match OVERRIDE.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => std::env::var("SVOD_TK3_TUNE").map_or(true, |v| v != "0"),
-    }
+thread_local! {
+    /// The innermost [`scoped`] setting on this thread.
+    static SCOPED: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// Force measuring on or off for this process, over the environment.
-pub fn set_enabled(on: bool) {
-    OVERRIDE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+/// The innermost [`scoped`] setting on this thread, else `SVOD_TK3_TUNE`
+/// is not `0`.
+pub fn enabled() -> bool {
+    SCOPED.get().unwrap_or_else(|| std::env::var("SVOD_TK3_TUNE").map_or(true, |v| v != "0"))
+}
+
+/// `f` with measuring on or off on this thread, over the environment; the
+/// outer setting comes back when `f` returns or unwinds.
+pub fn scoped<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let _restore = Restore(SCOPED.replace(Some(on)));
+    f()
+}
+
+/// Puts a captured [`SCOPED`] setting back on drop.
+struct Restore(Option<bool>);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        SCOPED.set(self.0);
+    }
 }
