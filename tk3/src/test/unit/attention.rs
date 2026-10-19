@@ -507,7 +507,7 @@ fn attention_throughput_probe() {
             cfg: if target.cp_async {
                 FaCfg::new(bq, bkv, 2)
             } else {
-                crate::ops::config::attention_candidates(&target, d, t)[0]
+                crate::ops::config::Planner::new(target.clone()).attention_candidates(batch * heads, t, t, d, causal)[0]
             },
         };
         let (bq, bkv) = (spec.cfg.bq, spec.cfg.bkv);
@@ -551,6 +551,80 @@ fn attention_throughput_probe() {
         }
         for ((label, _), secs) in plans.iter().zip(&best) {
             eprintln!("{label}: {:.3} ms, {:.1} TFLOP/s", secs * 1e3, flops / secs / 1e12);
+        }
+    }
+}
+
+/// Every attention config the construct spans against the planner's
+/// shortlist, timed on the device for the probe shapes and Qwen3's: prints
+/// each config's time, the shortlist's members marked (run with `--ignored
+/// --nocapture`); never asserts.
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn attention_candidates_probe() {
+    use crate::ops::config::Planner;
+    let Some(target) = super::device_target() else {
+        eprintln!("skipped: no GPU with tk3 tables");
+        return;
+    };
+    let planner = Planner::new(target.clone());
+    for (batch, heads, t, d, causal) in [
+        (8usize, 16usize, 512usize, 128usize, false),
+        (4, 8, 2048, 64, false),
+        (4, 8, 2048, 64, true),
+        (4, 8, 2048, 128, false),
+        (4, 8, 2048, 128, true),
+        (5, 20, 1, 64, false),
+    ] {
+        let tk = if t == 1 { 1500 } else { t };
+        let shortlist = planner.attention_candidates(batch * heads, t, tk, d, causal);
+        let mut cfgs: Vec<FaCfg> = shortlist.clone();
+        for bq in [16, 32, 64, 128] {
+            for bkv in [16, 32, 64, 128] {
+                for unroll in [false, true] {
+                    let cfg = FaCfg { unroll, ..FaCfg::new(bq, bkv, 2) };
+                    let fits = cfg.fits(&target, d)
+                        && cfg.smem_bytes(d) <= target.smem_bytes
+                        && cfg.registers(&target, d).is_some_and(|r| r <= target.occupancy.registers);
+                    if fits && !cfgs.contains(&cfg) {
+                        cfgs.push(cfg);
+                    }
+                }
+            }
+        }
+        let spec = |cfg| AttnSpec {
+            batch: Batch::Static(batch),
+            t,
+            tk,
+            heads,
+            kv_heads: heads,
+            d,
+            mask: AttnMask { causal, ..AttnMask::default() },
+            cache: None,
+            scale: 1.0 / (d as f32).sqrt(),
+            cfg,
+        };
+        let flops = 4.0 * (batch * heads * t * tk * d) as f64 / if causal { 2.0 } else { 1.0 };
+        let ns =
+            crate::tune::measure(cfgs.iter().map(|&c| vec![(flash_attention(&spec(c)), c.lowering(target.clone()))]));
+        eprintln!(
+            "== attention b{batch} h{heads} t{t} tk{tk} d{d} causal={causal} ({} shortlist, {} lattice)",
+            shortlist.len(),
+            cfgs.len()
+        );
+        for (c, ns) in cfgs.iter().zip(ns) {
+            let set = if shortlist.contains(c) { "short" } else { "lattice" };
+            match ns {
+                Some(ns) => eprintln!(
+                    "  {set:7} bq{} bkv{} unroll={}: {:8.1} us {:6.1} TFLOP/s",
+                    c.bq,
+                    c.bkv,
+                    c.unroll,
+                    ns as f64 / 1e3,
+                    flops / ns as f64 / 1e3
+                ),
+                None => eprintln!("  {set:7} bq{} bkv{} unroll={}: failed", c.bq, c.bkv, c.unroll),
+            }
         }
     }
 }

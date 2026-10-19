@@ -12,6 +12,7 @@ use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::launch::graph_launch;
+use crate::ops::config::Planner;
 
 fn cuda_target() -> Option<Target> {
     let spec = default_device();
@@ -60,8 +61,8 @@ fn every_gemm_candidate_matches_the_interpreter() {
         eprintln!("skipped: no CUDA device");
         return;
     };
-    let mut cfgs = crate::ops::config::gemm_candidates(&target, 1, 4096, 4096, 4096, false);
-    for cfg in crate::ops::config::gemm_candidates(&target, 1, 704, 512, 512, false) {
+    let mut cfgs = Planner::new(target.clone()).gemm_candidates(1, 4096, 4096, 4096, false);
+    for cfg in Planner::new(target.clone()).gemm_candidates(1, 704, 512, 512, false) {
         if !cfgs.contains(&cfg) {
             cfgs.push(cfg);
         }
@@ -138,7 +139,7 @@ fn gemm_throughput_probe() {
         })
         .to_vec()
     } else {
-        crate::ops::config::gemm_candidates(&target, 1, m, n, k, false)
+        Planner::new(target.clone()).gemm_candidates(1, m, n, k, false)
     };
     for cfg in cfgs {
         let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll } = cfg;
@@ -184,7 +185,6 @@ fn gemm_throughput_probe() {
 #[ignore = "perf probe: needs a GPU"]
 fn gemm_candidates_probe() {
     use crate::kernels::Act;
-    use crate::ops::config::gemm_candidates;
     let Some(target) = super::device_target() else {
         eprintln!("skipped: no GPU with tk3 tables");
         return;
@@ -199,7 +199,7 @@ fn gemm_candidates_probe() {
         (4096, 4096, 4096, plain, false),
     ] {
         let batch = if var { Batch::Var { name: "b".into(), min: 1, max: 1 } } else { Batch::Static(1) };
-        let cfgs = gemm_candidates(&target, 1, m, n, k, false);
+        let cfgs = Planner::new(target.clone()).gemm_candidates(1, m, n, k, false);
         let build = |cfg| {
             let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };
             vec![(gemm::<BF16>(&spec), cfg.lowering(target.clone()))]
@@ -300,3 +300,92 @@ fn first_execution_probe() {
         eprintln!("{label}: {}", times.iter().map(|t| format!("{t:.2} ms")).collect::<Vec<_>>().join(", "));
     }
 }
+
+/// Qwen3-Embedding-0.6B's four projections at batch 8 × 512 (M 4096), bf16:
+/// the planner's shortlist, then the rest of a lattice of configs that pass
+/// the target's feasibility predicates, timed as the tune store times them;
+/// prints each and the best of either set. tk1's in-model means on gfx1201
+/// (`origin/main`, 2026-10-09) sit beside each shape, so a lattice win says
+/// the shortlist is the gap and a tie says it is not.
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn qwen3_gemm_candidates_probe() {
+    use crate::kernels::Act;
+    let Some(target) = super::device_target() else {
+        eprintln!("skipped: no GPU with tk3 tables");
+        return;
+    };
+    let plain = Epilogue::default();
+    let shapes = [
+        ("qkv", 4096, 4096, 1024, plain, 270.4),
+        ("o_proj+residual", 4096, 1024, 2048, Epilogue { residual: true, ..plain }, 152.4),
+        ("gate_up swiglu", 4096, 3072, 1024, Epilogue { act: Act::Silu, gated: true, ..plain }, 436.4),
+        ("down+residual", 4096, 1024, 3072, Epilogue { residual: true, ..plain }, 196.6),
+    ];
+    for (name, m, n, k, epilogue, tk1_us) in shapes {
+        let shortlist = Planner::new(target.clone()).gemm_candidates(1, m, n, k, epilogue.gated);
+        let mut lattice = vec![];
+        for bm in [64, 128, 256] {
+            for bn in [64, 128, 256] {
+                for bk in [16, 32, 64] {
+                    for warps in [[2, 2], [2, 4], [4, 2], [4, 4]] {
+                        for unroll in [false, true] {
+                            let cfg = GemmCfg { tile: [bm, bn, bk], stages: 2, warps, group_m: 8, unroll };
+                            let halves = if epilogue.gated { 2 } else { 1 };
+                            let fits = cfg.fits(&target)
+                                && cfg.smem_bytes(epilogue.gated) <= target.smem_bytes
+                                && cfg.registers(&target, halves).is_some_and(|r| r <= target.occupancy.registers);
+                            if fits && !shortlist.contains(&cfg) {
+                                lattice.push(cfg);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let n_eff = if epilogue.gated { 2 * n } else { n };
+        let tflops = |ns: u64| 2.0 * (m * n_eff * k) as f64 / ns as f64 / 1e3;
+        let build = |cfg: GemmCfg| {
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg };
+            vec![(gemm::<BF16>(&spec), cfg.lowering(target.clone()))]
+        };
+        let show = |set: &str, cfgs: &[GemmCfg], ns: &[Option<u64>]| -> Option<(u64, GemmCfg)> {
+            let mut best: Option<(u64, GemmCfg)> = None;
+            for (c, t) in cfgs.iter().zip(ns) {
+                let t = match t {
+                    Some(t) => {
+                        if best.is_none_or(|(b, _)| *t < b) {
+                            best = Some((*t, *c));
+                        }
+                        format!("{:6.1} us {:5.1} TFLOP/s", *t as f64 / 1e3, tflops(*t))
+                    }
+                    None => "failed".to_string(),
+                };
+                eprintln!("  {set:7} {:?} s{} {:?} unroll={}: {t}", c.tile, c.stages, c.warps, c.unroll);
+            }
+            best
+        };
+        eprintln!(
+            "== {name}: {m}x{n}x{k} gated={} ({} shortlist, {} lattice); tk1 in-model {tk1_us} us",
+            epilogue.gated,
+            shortlist.len(),
+            lattice.len()
+        );
+        let s_best = show("short", &shortlist, &crate::tune::measure(shortlist.iter().map(|&c| build(c))));
+        let l_best = show("lattice", &lattice, &crate::tune::measure(lattice.iter().map(|&c| build(c))));
+        let fmt = |b: Option<(u64, GemmCfg)>| {
+            b.map_or("none".to_string(), |(t, c)| {
+                format!(
+                    "{:.1} us {:.1} TFLOP/s {:?} {:?} unroll={}",
+                    t as f64 / 1e3,
+                    tflops(t),
+                    c.tile,
+                    c.warps,
+                    c.unroll
+                )
+            })
+        };
+        eprintln!("{name}: shortlist best {} | lattice best {} | tk1 {tk1_us} us", fmt(s_best), fmt(l_best));
+    }
+}
+

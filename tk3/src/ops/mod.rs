@@ -13,8 +13,7 @@ pub(crate) mod linear;
 pub(crate) mod norm;
 pub mod shape;
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use snafu::Snafu;
 use svod_dtype::default_device::default_device;
@@ -31,6 +30,7 @@ use crate::atoms::Target;
 pub use crate::kernels::Act;
 use crate::kernels::Batch;
 use crate::tune::{self, TuneKey, TuneStore};
+use config::Planner;
 use shape::BatchVar;
 
 #[derive(Debug, Snafu)]
@@ -54,20 +54,23 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Whether a tk3 target with kernel tables exists for `device`.
+/// Whether a tk3 target with kernels exists for `device`.
 pub fn supported(device: &DeviceSpec) -> bool {
-    target(device).is_some_and(|t| config::has_tables(&t))
+    planner(device).is_some_and(|p| config::has_kernels(&p.target))
 }
 
-/// The target of a device kernels can be launched on (graph kernels lower for
-/// the default device), resolved once per device.
-fn target(device: &DeviceSpec) -> Option<Target> {
-    static TARGETS: OnceLock<Mutex<HashMap<DeviceSpec, Option<Target>>>> = OnceLock::new();
+/// The planner of a device kernels can be launched on (graph kernels lower
+/// for the default device): its target and the candidate lists ranked for
+/// it, kept for the process, one per device.
+fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
+    static PLANNERS: OnceLock<papaya::HashMap<DeviceSpec, Option<Arc<Planner>>>> = OnceLock::new();
     if *device != default_device() {
         return None;
     }
-    let mut cache = TARGETS.get_or_init(Mutex::default).lock().expect("target cache");
-    cache.entry(device.clone()).or_insert_with(|| Target::for_device(device)).clone()
+    let planners = PLANNERS.get_or_init(papaya::HashMap::new).pin();
+    planners
+        .get_or_insert_with(device.clone(), || Target::for_device(device).map(|t| Arc::new(Planner::new(t))))
+        .clone()
 }
 
 /// The candidate to launch: the global store's measured winner for `shape`

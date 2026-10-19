@@ -18,11 +18,13 @@ pub struct FaCfg {
     /// Key splits: each is a block along grid x writing a partial result
     /// that [`combine`] merges; `1` writes the output directly.
     pub splits: usize,
+    /// The ring loop unrolled over its slots.
+    pub unroll: bool,
 }
 
 impl FaCfg {
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
-        Self { bq, bkv, stages, splits: 1 }
+        Self { bq, bkv, stages, splits: 1, unroll: false }
     }
 
     /// One warp per 16 query rows: row reductions stay within a warp.
@@ -34,7 +36,7 @@ impl FaCfg {
         let prefetch = target.prefetch();
         Lowering {
             target,
-            schedule: Schedule::Uniform { prefetch, unroll: false },
+            schedule: Schedule::Uniform { prefetch, unroll: self.unroll },
             grid: WarpGrid { rows: self.warps(), cols: 1 },
             swizzle: true,
         }
@@ -43,6 +45,16 @@ impl FaCfg {
     /// Static shared memory of the K and V rings, in bytes of a 16-bit type.
     pub fn smem_bytes(&self, d: usize) -> usize {
         2 * self.stages * self.bkv * d * 2
+    }
+
+    /// The shared scratch the f32 score tile crosses to become the P·V
+    /// operand where the core's accumulator cannot feed a product as it
+    /// stands (RDNA3); nothing where it can.
+    pub fn scratch_bytes(&self, target: &Target) -> usize {
+        match target.mma.first() {
+            Some(atom) if !atom.accumulator_feeds(target.wave) => self.bq * self.bkv * 4,
+            _ => 0,
+        }
     }
 }
 
@@ -188,7 +200,7 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
 pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, scale, cfg } = *spec;
     let AttnMask { causal, window, key_lens, key_mask, seg_start, bias } = mask;
-    let FaCfg { bq, bkv, stages, splits } = cfg;
+    let FaCfg { bq, bkv, stages, splits, .. } = cfg;
     let cap = batch.capacity();
     let (kv_rows, heads_total, head_start) =
         cache.map_or((cap, kv_heads, 0), |c| (c.rows, c.heads_total, c.head_start));

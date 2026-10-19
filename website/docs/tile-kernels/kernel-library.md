@@ -35,22 +35,24 @@ matrix product runs on the f32 accumulator, and the result is rounded once at th
 `GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll }`. Rows past `m`
 and columns past `n` are bounded views, so `m` and `n` are free. `k` must be a multiple of `bk`.
 
-The op layer draws candidates from four tile families, each with its best pipeline as measured
-on sm_86:
+The op layer does not keep a tile table. `config::Planner::gemm_candidates` enumerates the construct's
+knobs (output tiles of 32–256 rows and 48–256 columns, `bk` 16–64, nine warp grids, the ring
+depths the target's prefetch runs, rolled and unrolled), keeps what the lowering can run (the
+atoms tile the warp grid, the fills split into whole 16-byte chunks per thread, the ring fits
+shared memory, a lane's registers fit the file) and ranks the rest by a traffic model: the bytes
+a block's trip moves through shared memory, plus a fixed cost per trip and per matrix-core step,
+over the trips of every round of blocks the device runs, stretched by how few waves an SM holds
+and how few steps its ring keeps in flight. One pipeline per output tile and warp grid is kept,
+at most eight candidates remain, and the [tune store](./tuning) picks among them. A gated weight
+is a `2·bn`-wide B tile and two accumulators to the model, so its lead comes at half width. The
+`Planner` of a device holds its target and the problems it has ranked (an op plans its shape at
+every call; ranking the lattice takes a millisecond), one planner per device for the process.
 
-| Family | Stages | Warp grid | Unroll | Measured note |
-|---|---|---|---|---|
-| 128×128×32 | 3 | 2×4 | no | 4096³ peaks here: 25.4 TFLOP/s |
-| 128×64×32 | 2 | 2×2 | yes | |
-| 64×128×32 | 2 | 2×2 | no | |
-| 64×64×32 | 3 | 2×2 | yes | M = 704 (Nemotron): 128-row tiles lose to 64×64 |
-
-`config::gemm_candidates` leads with the largest family whose grid gives every SM 8 blocks and
-pads at most 1/16 of the output area (else 64×64). It adds that family's variants (the other
-stage count, `bk = 64`, flipped `unroll`, transposed warp grid), then the other families. `bk`
-halves down to 16 when `k` is not a multiple of it, and configs whose ring exceeds the target's
-shared memory are dropped. At most eight candidates remain, and the [tune store](./tuning)
-picks among them.
+The model was fitted on gfx1201 against a measured lattice of 94 configs on Qwen3's four
+projections (the measured best is within the shortlist's top five on each) and checked against
+the sm_86 facts the earlier tables recorded (4096³ peaks at 128×128 with 3 stages on a 2×4 warp
+grid; that config stays in the shortlist). Where the model and a measurement disagree, the
+measurement wins: add the shape to `qwen3_gemm_candidates_probe` and refit the constants.
 
 ## Flash attention
 
@@ -88,15 +90,18 @@ softmax over an empty row does.
 **Key splits** (`FaCfg::splits > 1`) give a few long rows, such as a decoder step, more blocks.
 Each split writes f32 partials `o_part`, `m_part` and `l_part`, and `combine` merges them.
 
-`FaCfg { bq, bkv, stages, splits }` uses one warp per 16 query rows. Candidates by head dim,
-first is the untuned pick:
-
-| `d` | Candidates `(bq, bkv, stages)` | Measured note (sm_86) |
-|---|---|---|
-| 48, 64, 128 with `t ≤ 16` | (16, 64, 2), (16, 64, 3), (16, 32, 2) | A decoder step is bandwidth-bound: one-warp blocks leave room for several per SM |
-| 48 | (64, 64, 2), (64, 64, 3) | Shapes whose K/V fills divide among the block's threads (96-byte rows) |
-| 64 | (64, 64, 2), (64, 64, 3), (128, 64, 2), (64, 32, 2), (128, 32, 2), (64, 32, 3) | |
-| 128 | (64, 32, 2), (64, 32, 3), (128, 32, 2), (64, 64, 2), (128, 64, 2), (128, 32, 3) | `bkv = 64` measured 18.2 TFLOP/s against 22.2 for `bkv = 32`: 64 KB per block leaves one block per SM |
+`FaCfg { bq, bkv, stages, splits, unroll }` uses one warp per 16 query rows. Candidates come
+from the same lattice and traffic model as the GEMM's (`Planner::attention_candidates`): query
+blocks of 16–128 rows, key blocks of 16–128 keys, the ring depths the target runs, rolled and
+unrolled, kept to what lowers (the fills split into chunks per thread, the ring fits shared
+memory, a lane's registers fit) and ranked by the bytes a key block moves (every warp's K and V
+fragments in, the fill out), the matrix-core steps, the softmax's vector work per score and the
+trip's fixed cost, over the key blocks of every round of query blocks, stretched by how few waves
+an SM holds. Two facts the model learned from the ISA on gfx1201: the compiled loop keeps the
+query, key, score, probability and value fragments live together, so the register count is
+their sum and 16-key blocks are what fits at `d = 128`; and a warp past the problem's queries
+hides no latency, so a decoder step leads with one-warp blocks. A causal mask charges each query
+block its diagonal.
 
 Each tile config is crossed with split counts. `Attn::splits = Some(n)` fixes `n`, capped at the
 key block count. With `None`, `config::split_candidates` proposes 1, 2, the counts around two

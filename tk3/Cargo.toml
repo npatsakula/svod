@@ -17,6 +17,7 @@ svod-codegen = { path = "../codegen", version = "=0.2.0" }
 svod-tensor = { path = "../tensor", version = "=0.2.0" }
 svod-device = { path = "../device", version = "=0.2.0" }
 svod-runtime = { path = "../runtime", version = "=0.2.0" }
+papaya = "0.2.3"
 
 [dev-dependencies]
 libm = "0.2.16"

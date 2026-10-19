@@ -28,7 +28,7 @@ use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::launch::graph_launch_all;
 use crate::lower::{Lowering, lower};
-use crate::ops::config;
+use crate::ops::config::{self, Planner};
 
 use super::conv::geom;
 
@@ -43,11 +43,11 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
     // Shapes stay small for the interpreter; the tiles are those planned
     // for a large GEMM, so the biggest register tiles are lowered too.
     let gemm_spec = |m, n, k, epilogue: Epilogue| {
-        let cfg = config::gemm_candidates(target, 1, 4096, 4096, k, epilogue.gated)[0];
+        let cfg = Planner::new(target.clone()).gemm_candidates(1, 4096, 4096, k, epilogue.gated)[0];
         GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg }
     };
     let plain = gemm_spec(130, 192, 128, Epilogue::DEFAULT);
-    for (i, cfg) in config::gemm_candidates(target, 1, 4096, 4096, 4096, false).into_iter().enumerate() {
+    for (i, cfg) in Planner::new(target.clone()).gemm_candidates(1, 4096, 4096, 4096, false).into_iter().enumerate() {
         let spec = GemmSpec { cfg, ..plain.clone() };
         push(&format!("gemm #{i} {:?}x{}", cfg.tile, cfg.stages), gemm::<BF16>(&spec), cfg.lowering(target.clone()));
     }
@@ -55,32 +55,36 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
     push("gemm swiglu", gemm::<F16>(&swiglu), swiglu.cfg.lowering(target.clone()));
     let half_step = Epilogue { residual: true, act: Act::Gelu, scale: Some(Scale::new(0.5)), ..Epilogue::DEFAULT };
     let half_step = GemmSpec {
-        cfg: config::gemm_candidates(target, 1, 300, 512, 256, false)[0],
+        cfg: Planner::new(target.clone()).gemm_candidates(1, 300, 512, 256, false)[0],
         ..gemm_spec(100, 96, 256, half_step)
     };
     push("gemm gelu scale residual", gemm::<BF16>(&half_step), half_step.cfg.lowering(target.clone()));
 
-    let fa = |t, tk, d, mask, cache: Option<Cache>, batch| {
-        let cfg = config::attention_candidates(target, d, t)[0];
+    // The planner's lead for the shape; a head size it plans no kernel for
+    // (RDNA3 at `d = 128`: replicated fragments and the per-key value gather
+    // overrun the register file) has no family.
+    let fa = |t, tk, d, mask: AttnMask, cache: Option<Cache>, batch| {
+        let cfg = *Planner::new(target.clone()).attention_candidates(8, t, tk, d, mask.causal).first()?;
         let splits = if cache.is_some() { 2 } else { 1 };
         let cfg = crate::kernels::attention::FaCfg { splits, ..cfg };
-        AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache, scale: 0.125, cfg }
+        Some(AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache, scale: 0.125, cfg })
     };
     let causal = AttnMask { causal: true, ..AttnMask::default() };
     for d in [64, 128] {
-        let spec = fa(100, 100, d, causal, None, Batch::Static(2));
-        for (i, cfg) in config::attention_candidates(target, d, 100).into_iter().enumerate() {
+        let Some(spec) = fa(100, 100, d, causal, None, Batch::Static(2)) else { continue };
+        for (i, cfg) in Planner::new(target.clone()).attention_candidates(8, 100, 100, d, true).into_iter().enumerate()
+        {
             let spec = AttnSpec { cfg, ..spec.clone() };
             let name = format!("attention d{d} causal #{i} {}x{}x{}", cfg.bq, cfg.bkv, cfg.stages);
             push(&name, attention::<BF16>(&spec), cfg.lowering(target.clone()));
         }
     }
     let masked = AttnMask { key_lens: true, key_mask: true, ..AttnMask::default() };
-    let spec = fa(37, 75, 64, masked, None, Batch::Var { name: "b".into(), min: 1, max: 2 });
+    let spec = fa(37, 75, 64, masked, None, Batch::Var { name: "b".into(), min: 1, max: 2 }).expect("d 64 plans");
     push("attention d64 key masks", attention::<F16>(&spec), spec.cfg.lowering(target.clone()));
     let cache = Cache { rows: 6, heads_total: 6, head_start: 2, row_map: true, appended: true };
     let lens = AttnMask { key_lens: true, ..AttnMask::default() };
-    let spec = fa(1, 150, 64, lens, Some(cache), Batch::Var { name: "b".into(), min: 1, max: 3 });
+    let spec = fa(1, 150, 64, lens, Some(cache), Batch::Var { name: "b".into(), min: 1, max: 3 }).expect("d 64 plans");
     push("attention d64 cache", attention::<F16>(&spec), spec.cfg.lowering(target.clone()));
     let merge = CombineSpec { batch: spec.batch.clone(), t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: 4 } };
     push("attention combine", combine::<F16>(&merge), merge.cfg.lowering(target.clone()));
@@ -116,7 +120,7 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
         ("conv 3x3 stride 2 split", geom([16, 16], 128, 64, 3, 2, 1, 1), 1),
     ] {
         let [ho, wo] = g.out_hw();
-        let cfgs = config::conv_candidates(target, 1, images * ho * wo, &g);
+        let cfgs = Planner::new(target.clone()).conv_candidates(1, images * ho * wo, &g);
         let c = cfgs.iter().find(|c| (c.split > 1) == name.ends_with("split")).unwrap_or(&cfgs[0]);
         let spec = ConvSpec { batch: Batch::Static(images), geom: g, epilogue: silu_bias, cfg: c.gemm, split: c.split };
         for (i, (prog, lowering)) in spec.programs::<F16>(target).into_iter().enumerate() {
@@ -214,7 +218,7 @@ pub(super) fn hopper() -> Target {
 #[test]
 fn every_family_assembles_for_hopper() {
     let target = hopper();
-    assert!(config::has_tables(&target));
+    assert!(config::has_kernels(&target));
     assert_eq!(target.smem_bytes, 227 << 10);
     let Some(ptxas) = ptxas() else {
         for (_, prog, lowering) in families(&target) {
@@ -279,7 +283,7 @@ pub(super) fn amd(arch: AmdArch, cus: u32) -> Target {
 #[test_case(amd(AmdArch::Gfx1100, 96); "gfx1100")]
 #[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
 fn every_family_compiles_for_amd(target: Target) {
-    assert!(config::has_tables(&target));
+    assert!(config::has_kernels(&target));
     let GpuArch::Amd(arch) = target.arch else { unreachable!() };
     for (name, prog, lowering) in families(&target) {
         let kernel = prog.name.clone();
@@ -375,11 +379,27 @@ fn check_on_device(target: &Target) {
 #[test]
 fn families_match_the_interpreter_on_the_device() {
     let device = default_device();
-    let Some(target) = Target::for_device(&device).filter(config::has_tables) else {
+    let Some(target) = Target::for_device(&device).filter(config::has_kernels) else {
         eprintln!("skipped: no device with tk3 tables");
         return;
     };
     check_on_device(&target);
+}
+
+/// The device's occupancy facts come from the device where it reports them
+/// (SIMDs per CU and waves per SIMD on AMD, the register file and waves per
+/// SM on CUDA), and agree with the architecture's defaults the host tests
+/// plan with: a lattice ranked on the host is the one the device runs.
+#[test]
+fn the_device_reports_the_architectures_occupancy() {
+    let device = default_device();
+    let Some(target) = Target::for_device(&device).filter(config::has_kernels) else {
+        eprintln!("skipped: no device with tk3 tables");
+        return;
+    };
+    let arch = Target::for_arch(target.arch);
+    assert_eq!(target.occupancy, arch.occupancy, "{:?}", target.arch);
+    assert!(target.sms.is_some_and(|n| n > 0));
 }
 
 /// The RDNA data path on an NVIDIA GPU: register-staged fills into the
@@ -406,7 +426,7 @@ fn every_amd_candidate_lowers(target: Target) {
     let mut gemms = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
         for gated in [false, true] {
-            for cfg in config::gemm_candidates(&target, 1, m, n, k, gated) {
+            for cfg in Planner::new(target.clone()).gemm_candidates(1, m, n, k, gated) {
                 let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
                 gemms.push(GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue, cfg });
             }
@@ -415,9 +435,9 @@ fn every_amd_candidate_lowers(target: Target) {
     for spec in gemms {
         linear(gemm::<BF16>(&spec), &spec.cfg.lowering(target.clone()));
     }
-    for d in [48, 64, 128] {
+    for d in [32, 48, 64, 128] {
         for t in [1, 16, 100] {
-            for cfg in config::attention_candidates(&target, d, t) {
+            for cfg in Planner::new(target.clone()).attention_candidates(2, t, 100, d, t > 1) {
                 let spec = AttnSpec {
                     batch: Batch::Static(1),
                     t,
@@ -437,7 +457,7 @@ fn every_amd_candidate_lowers(target: Target) {
     for class in super::conv::YOLO {
         let g = super::conv::yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        for c in config::conv_candidates(&target, 1, ho * wo, &g) {
+        for c in Planner::new(target.clone()).conv_candidates(1, ho * wo, &g) {
             let spec =
                 ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, cfg: c.gemm, split: c.split };
             for (prog, lowering) in spec.programs::<F16>(&target) {

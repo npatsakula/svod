@@ -149,12 +149,12 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
 
     let (q_ext, var) = extent(&qs).unzip();
     let k_ext = extent(&ks).map(|(e, _)| e);
-    let target = super::target(&q.device());
+    let planner = super::planner(&q.device());
     let dtypes: Vec<DType> = [q, k, v].into_iter().chain(opts.bias).map(Tensor::dtype).collect();
-    let plan = shape::attention(target.as_ref(), &dtypes, q_ext.as_ref(), k_ext.as_ref());
+    let plan = shape::attention(planner.as_deref(), &dtypes, q_ext.as_ref(), k_ext.as_ref(), opts.causal);
     let Plan::Kernel(cfgs) = plan else { return graph(q, k, v, opts).context(GraphSnafu { op: OP }) };
     let (q_ext, k_ext, var) = (q_ext.expect("planned"), k_ext.expect("planned"), var.flatten());
-    let target = target.expect("planned");
+    let target = planner.expect("planned").target.clone();
     let ([b, t, heads, d], [kv_rows, tk, heads_total, _]) = (dims4(&q_ext.dims), dims4(&k_ext.dims));
     let batch = batch_of(&var, b);
     let kv_heads = opts.cache.map_or(heads_total, |c| c.kv_heads);

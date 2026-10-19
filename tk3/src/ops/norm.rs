@@ -65,12 +65,13 @@ fn norm(
     }
 
     let (ext, var) = extent(&xs).unzip();
-    let target = super::target(&x.device());
+    let planner = super::planner(&x.device());
     let dtypes: Vec<_> = [Some(x), residual, Some(w), b].into_iter().flatten().map(Tensor::dtype).collect();
-    let Plan::Kernel(cfgs) = shape::norm(target.as_ref(), &dtypes, ext.as_ref()) else {
+    let Plan::Kernel(cfgs) = shape::norm(planner.as_deref(), &dtypes, ext.as_ref()) else {
         return graph(kind, x, residual, w, b, eps).context(GraphSnafu { op });
     };
-    let (ext, var, target) = (ext.expect("planned"), var.flatten(), target.expect("planned"));
+    let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
+    let target = planner.target.clone();
     let (lead, d) = (&ext.dims[..ext.dims.len() - 1], ext.dims[ext.dims.len() - 1]);
     let rows = lead[usize::from(var.is_some())..].iter().product();
     let batch = batch_of(&var, 1);
