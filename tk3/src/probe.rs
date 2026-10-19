@@ -15,7 +15,7 @@ use crate::atoms::{Costs, Device, Target};
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{Dim, Layout};
-use crate::layouts::{TileLayout, WarpGrid, natural};
+use crate::layouts::{TileLayout, WarpGrid, chunked, natural};
 use crate::lower::Lowering;
 use crate::tune::{self, Built, Candidate, ScratchPool, TuneKey, TuneStore};
 
@@ -554,13 +554,17 @@ impl<'a> Probes<'a> {
     /// every block shares so it stays in cache, lowered `unroll`ed (a trip's
     /// fixed cost) or rolled (slot offsets recomputed per trip). The baseline
     /// loads the same chunks into registers in a plain loop of as many trips,
-    /// which the compiler reduces to little more than the loop (the region's
-    /// chunks repeat), so the difference is a whole trip: the cached fill, the
-    /// ring's store, fences and load. [`costs`] takes the load out.
+    /// held as the fill holds them (a 16-byte load a lane, pinned: summed in
+    /// the tile's natural layout a lane loads four separate words, which on
+    /// gfx942 cost more than the ring itself and left the pair no signal),
+    /// so the difference is a whole trip: the ring's store, fences and load,
+    /// and the loads the compiler does not hoist. [`costs`] takes the load
+    /// out.
     fn trips(&self, op: &'static str, unroll: bool) -> Probe {
         let (tile, region) = (trip_tile(self.target), 16);
         let stages = self.target.stages(2);
         let units = (self.blocks * TRIPS) as f64;
+        let chunks = chunked(tile, 4, WARPS, self.target.wave, Axis::Col).expect("a chunk layout");
         self.make(op, ScalarDType::Int32, units, true, self.lowering(ROWS, unroll), |on| {
             // Both trip probes run these programs, named alike.
             let mut k = kernel("probe:trip", self.blocks, WARPS);
@@ -568,8 +572,18 @@ impl<'a> Probes<'a> {
             let zero = k.fill::<I32>(tile, Const::Int(0));
             let chunk =
                 |k: &mut Kernel, step: Sc| k.view(src, step % region * tile.elems(), [32, 1], tile, [None, None]);
-            let sum =
-                if on { ring_sum(&mut k, TRIPS, stages, zero, chunk) } else { sum_loads(&mut k, TRIPS, zero, chunk) };
+            let sum = if on {
+                ring_sum(&mut k, TRIPS, stages, zero, chunk)
+            } else {
+                k.pin(zero, chunks.clone());
+                let [sum] = k.loop_(TRIPS, [zero], |k, i, [sum]| {
+                    let v = chunk(k, i);
+                    let y = k.load(v);
+                    k.pin(y, chunks.clone());
+                    [k.binary(sum, y, BinaryOp::Add)]
+                });
+                sum
+            };
             output(&mut k, self.blocks, sum);
             k.finish()
         })
