@@ -109,21 +109,31 @@ fn the_ranking_drops_what_a_lane_cannot_hold(target: Target, gated: bool) {
     assert_eq!((has([256, 96, 32], [2, 1]), has([64, 64, 32], [2, 2])), (false, true));
 }
 
+/// Under sm_86's shared memory and under a static 48 KB cap alike.
 #[test_case(&[4096, 4096], 4096, false, Ok(()); "large grid")]
 #[test_case(&[4096, 4096], 4096, true, Ok(()); "gated")]
 #[test_case(&[8, 256, 512], 2048, false, Ok(()); "a static batch counts toward the grid")]
 #[test_case(&[2048, 512], 1024, false, Ok(()); "half the big grid")]
+#[test_case(&[704, 2048], 512, false, Ok(()); "small m")]
 #[test_case(&[8, 37, 512], 512, false, Ok(()); "medium grid")]
 #[test_case(&[37, 64], 96, false, Ok(()); "few rows")]
 #[test_case(&[37, 48], 96, false, Ok(()); "k a multiple of 16 only")]
+#[test_case(&[300, 48], 200, false, Ok(()); "bk 16")]
+#[test_case(&[1000, 96], 64, true, Ok(()); "bk 32 only, gated")]
 #[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
 #[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
 #[test_case(&[0, 64], 96, false, Err(Fallback::Shape); "no rows")]
 fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<(), Fallback>) {
-    let plan = shape::linear(Some(&planner(sm86())), &[BF16, BF16], Some(&ext(x)), n, gated);
-    match plan {
-        Plan::Kernel(list) => assert_valid(&list, &sm86(), *x.last().unwrap(), gated),
-        Plan::Graph(why) => assert_eq!(Err(why), want),
+    for smem in [sm86().smem_bytes, 48 << 10] {
+        let target = Target { smem_bytes: smem, ..sm86() };
+        let plan = shape::linear(Some(&planner(target.clone())), &[BF16, BF16], Some(&ext(x)), n, gated);
+        match plan {
+            Plan::Kernel(list) => {
+                assert_eq!(want, Ok(()), "{smem} bytes: {list:?}");
+                assert_valid(&list, &target, *x.last().unwrap(), gated);
+            }
+            Plan::Graph(why) => assert_eq!(Err(why), want, "{smem} bytes"),
+        }
     }
 }
 
@@ -883,25 +893,6 @@ fn a_ranking_at_zero_costs_is_finite() {
     let ranked = a.ranked(&planner);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| a.admit(&planner, c).is_ok_and(|(cost, _)| cost == 0.0)));
-}
-
-/// Every list is non-empty, duplicate-free, within shared memory and divides `k`.
-#[test_case(&[4096, 4096], 4096, false; "large")]
-#[test_case(&[4096, 4096], 4096, true; "large gated")]
-#[test_case(&[704, 2048], 512, false; "small m")]
-#[test_case(&[300, 48], 200, false; "bk 16")]
-#[test_case(&[1000, 96], 64, true; "bk 32 only, gated")]
-fn gemm_candidates_are_valid(x: &[usize], n: usize, gated: bool) {
-    let k = *x.last().unwrap();
-    for smem in [sm86().smem_bytes, 48 << 10] {
-        let target = Target { smem_bytes: smem, ..sm86() };
-        let list = kernel_plan(shape::linear(Some(&planner(target)), &[BF16; 2], Some(&ext(x)), n, gated));
-        assert!(!list.is_empty(), "{list:?}");
-        for (i, c) in list.iter().enumerate() {
-            assert!(k.is_multiple_of(c.tile[2]) && c.smem_bytes(gated) <= smem, "{c:?}");
-            assert!(!list[..i].contains(c), "duplicate {c:?}");
-        }
-    }
 }
 
 /// A target capped at static shared memory drops a stage for the gated GEMM:
