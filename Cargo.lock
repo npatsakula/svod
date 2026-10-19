@@ -3698,7 +3698,6 @@ dependencies = [
  "svod-runtime",
  "svod-schedule",
  "svod-tensor",
- "svod-tk",
  "test-case",
 ]
 
