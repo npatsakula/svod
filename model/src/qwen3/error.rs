@@ -23,12 +23,6 @@ pub enum Error {
         source: Box<svod_tk3::ops::Error>,
     },
 
-    #[snafu(display("hand kernel: {source}"))]
-    Tk {
-        #[snafu(source(from(svod_tk::LaunchError, Box::new)))]
-        source: Box<svod_tk::LaunchError>,
-    },
-
     #[snafu(display("state-dict op failed"), context(false))]
     State {
         #[snafu(source(from(crate::state::Error, Box::new)))]

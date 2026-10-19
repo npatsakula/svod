@@ -4,21 +4,17 @@
 //! The checkpoint's `q_proj`/`k_proj`/`v_proj` read the same input, so they are
 //! stacked into one `[(H + 2·Hkv)·Dh, D]` weight at load and split after a
 //! single GEMM; the state dict keeps the published three-key layout. Heads are
-//! kept sequence-major, `[B, L, H, Dh]`: the layout the hand flash-attention
-//! kernel consumes and returns, so the head split and merge are plain
-//! reshapes. The SDPA fallback permutes to head-major and back.
+//! kept sequence-major, `[B, L, H, Dh]`: the layout the op layer's heads and
+//! attention ops produce and consume, so the head merge is a plain reshape.
 
-use snafu::ResultExt;
-use svod_dtype::ScalarDType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, Module, RmsNorm, StateDict, get_tensor, prefixed};
-use svod_tk3::ops;
+use svod_tk3::ops::{self, Attn, Qkv};
 
 use crate::init::fan_in_uniform;
 
-use super::error::{Result, TkSnafu};
-use super::tk;
+use super::error::Result;
 
 #[derive(Clone)]
 pub struct Qwen3Attention {
@@ -30,40 +26,6 @@ pub struct Qwen3Attention {
     pub o_proj_weight: Tensor,
     pub q_norm: RmsNorm,
     pub k_norm: RmsNorm,
-}
-
-/// Causal grouped-query attention over sequence-major `[B, L, H, Dh]`: the
-/// hand kernel when it applies (16-bit operands on a supported device at a
-/// tiling shape), else SDPA. Padding is on the right, behind the causal edge,
-/// so the only mask is the `[B, L]` segment start of packed rows (see
-/// [`super::Packing`]), which hides the sequences packed before a token's own.
-pub(crate) fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, seg_start: Option<&Tensor>) -> Result<Tensor> {
-    if matches!(q.dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16)
-        && let Some(out) =
-            svod_tk::flash_attention_with(q, k, v, svod_tk::FaOpts { causal: true, key_lens: None, seg_start })
-                .context(TkSnafu)?
-    {
-        return Ok(out);
-    }
-    let head_major = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]);
-    // Keys before the query's own segment are masked out (`true`).
-    let segment_mask = match seg_start {
-        Some(start) => {
-            let (b, l) = (start.dim(0)?, start.dim_const(1)?);
-            let keys = Tensor::arange(0, Some(l as i64), None)?.try_reshape([1isize, 1, 1, l as isize])?;
-            Some(keys.try_lt(&start.try_reshape([b, SInt::Const(1), SInt::Const(l), SInt::Const(1)])?)?)
-        }
-        None => None,
-    };
-    let out = head_major(q)?
-        .scaled_dot_product_attention()
-        .key(&head_major(k)?)
-        .value(&head_major(v)?)
-        .is_causal(true)
-        .enable_gqa(true)
-        .maybe_attn_mask(segment_mask.as_ref())
-        .call()?;
-    Ok(head_major(&out)?)
 }
 
 impl Qwen3Attention {
@@ -99,8 +61,11 @@ impl Qwen3Attention {
         self.forward_packed(x, None, rope, None)
     }
 
-    /// [`Self::forward`] over packed rows' `seg_start` (see [`causal_attention`]),
-    /// `residual` added in the `o_proj` GEMM's epilogue.
+    /// [`Self::forward`] over packed rows: `seg_start` `[B, L]` is the row
+    /// index each token's sequence starts at (see [`super::Packing`]), hiding
+    /// the sequences packed before it. Padding is on the right, behind the
+    /// causal edge, so it needs no mask. `residual` is added in the `o_proj`
+    /// GEMM's epilogue.
     pub(crate) fn forward_packed(
         &self,
         x: &Tensor,
@@ -110,45 +75,40 @@ impl Qwen3Attention {
     ) -> Result<Tensor> {
         let (b, l) = (x.dim(0)?, x.dim(1)?);
         let qkv = ops::linear(x, &self.qkv_weight, ops::Linear::default())?;
-        let (q, k, v) = self.prologue(&qkv, rope, (&b, &l))?;
-        let attn = causal_attention(&q, &k, &v, seg_start)?.try_reshape([
-            b,
-            l,
-            SInt::Const(self.num_heads * self.head_dim),
-        ])?;
+        let (q, k, v) = self.prologue(&qkv, rope)?;
+        let attn = ops::attention(&q, &k, &v, Attn { causal: true, seg_start, ..Attn::default() })?;
+        let attn = attn.try_reshape([b, l, SInt::Const(self.num_heads * self.head_dim)])?;
         Ok(ops::linear(&attn, &self.o_proj_weight, ops::Linear { residual, ..Default::default() })?)
     }
 
     /// The fused GEMM output `[B, L, (H + 2·Hkv)·Dh]` → the three sequence-major
-    /// head tensors attention consumes. The hand kernel reads the row once and
-    /// writes `q`/`k` (normed over `Dh`, then rotated) and `v` (copied); off its
-    /// geometry or arch it declines and the split / head view / norm / rope graph
-    /// runs instead, recomputing the strided views five times over.
-    fn prologue(
-        &self,
-        qkv: &Tensor,
-        rope: &(Tensor, Tensor),
-        (b, l): (&SInt, &SInt),
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let (cos, sin) = rope;
-        let geom = tk::Heads { h: self.num_heads, h_kv: self.num_kv_heads, dh: self.head_dim };
-        // Every operand the kernel treats as structural, not just the activation:
-        // a weight or a rope table off its dtype or shape is an `Err`, and this
-        // split / norm / rope graph is the fallback it would have skipped.
-        if self.q_norm.eps == self.k_norm.eps
-            && tk::fusable(qkv, &self.q_norm.weight, &self.k_norm.weight, cos, sin, geom)
-            && let Some(out) =
-                tk::qkv_norm_rope(qkv, &self.q_norm.weight, &self.k_norm.weight, cos, sin, self.q_norm.eps, geom)
-                    .context(TkSnafu)?
-        {
-            return Ok(out);
+    /// head tensors attention consumes: `q`/`k` normed over `Dh`, then rotated.
+    ///
+    /// `ops::heads` shares one `eps` and rejects norm weights or rope tables
+    /// off `qkv`'s dtype (which the graph accepts), so those take the split /
+    /// norm / rope graph here.
+    fn prologue(&self, qkv: &Tensor, (cos, sin): &(Tensor, Tensor)) -> Result<(Tensor, Tensor, Tensor)> {
+        let (q_norm, k_norm) = (&self.q_norm, &self.k_norm);
+        let one_dtype = [&q_norm.weight, &k_norm.weight, cos, sin].iter().all(|t| t.dtype() == qkv.dtype());
+        if one_dtype && q_norm.eps == k_norm.eps {
+            let split = Qkv {
+                heads: self.num_heads,
+                kv_heads: self.num_kv_heads,
+                head_dim: self.head_dim,
+                q_norm: Some(&q_norm.weight),
+                k_norm: Some(&k_norm.weight),
+                eps: q_norm.eps,
+                rope: Some((cos, sin)),
+            };
+            return Ok(ops::heads(qkv, split)?);
         }
+        let (b, l) = (qkv.dim(0)?, qkv.dim(1)?);
         let parts = qkv.split(&self.qkv_rows(), -1)?;
         let heads = |p: &Tensor, h: usize| -> Result<Tensor> {
             Ok(p.try_reshape([b.clone(), l.clone(), SInt::Const(h), SInt::Const(self.head_dim)])?)
         };
-        let q = self.q_norm.forward(&heads(&parts[0], self.num_heads)?)?.apply_rotary_emb(cos, sin, false)?;
-        let k = self.k_norm.forward(&heads(&parts[1], self.num_kv_heads)?)?.apply_rotary_emb(cos, sin, false)?;
+        let q = q_norm.forward(&heads(&parts[0], self.num_heads)?)?.apply_rotary_emb(cos, sin, false)?;
+        let k = k_norm.forward(&heads(&parts[1], self.num_kv_heads)?)?.apply_rotary_emb(cos, sin, false)?;
         Ok((q, k, heads(&parts[2], self.num_kv_heads)?))
     }
 }

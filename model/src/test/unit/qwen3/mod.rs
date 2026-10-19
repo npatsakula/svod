@@ -2,8 +2,6 @@ mod attention;
 mod config;
 mod embed;
 mod feed_forward;
-mod gates;
 mod model;
 mod parity;
 mod reranker;
-mod tk;

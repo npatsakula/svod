@@ -1,5 +1,5 @@
 //! JIT wrappers for the Qwen3 heads. Prepared at a concrete `[B, L]`: the
-//! hand attention kernel takes no symbolic dimension, so batch and length are
+//! tk3 kernels take no symbolic length, so batch and length are
 //! plan shape and [`super::Qwen3Embedder`] keeps one plan per length bucket.
 
 use svod_macros::jit_wrapper;
