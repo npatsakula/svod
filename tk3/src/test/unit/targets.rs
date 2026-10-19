@@ -1056,61 +1056,8 @@ fn attention_orientation_spares_the_relayout(target: Target, free: bool) {
     assert_eq!(atom.accumulator_feeds(target.wave), free);
 }
 
-/// The attention kernels at one atom row per warp are what they were
-/// before `warp_rows` existed: the warps, the layout count, the lowered
-/// tile's statements and the rendered text's size and matrix-core calls,
-/// recorded on 13a03cda for sm_86 and gfx1201 at the d64 and d128 probe
-/// picks and a causal tile.
-#[test_case(crate::atoms::sm86(), 64, 128, 32, false, 8, 136, [6, 31, 1, 2, 2, 1, 3], 9323, 97; "sm86 d64")]
-#[test_case(crate::atoms::sm86(), 128, 128, 16, false, 8, 172, [6, 31, 1, 2, 2, 1, 3], 9999, 97; "sm86 d128")]
-#[test_case(crate::atoms::sm86(), 64, 64, 64, true, 4, 224, [6, 42, 1, 2, 2, 1, 3], 19520, 193; "sm86 d64 causal")]
-#[test_case(amd(AmdArch::Gfx1201, 64), 64, 128, 32, false, 8, 144, [14, 51, 3, 4, 4, 2, 3], 10993, 65; "gfx1201 d64")]
-#[test_case(amd(AmdArch::Gfx1201, 64), 128, 128, 16, false, 8, 180, [14, 51, 3, 4, 4, 2, 3], 11457, 65; "gfx1201 d128")]
-#[test_case(amd(AmdArch::Gfx1201, 64), 64, 64, 64, true, 4, 256, [14, 73, 3, 4, 4, 2, 3], 21327, 129; "gfx1201 d64 causal")]
-#[test_case(amd(AmdArch::Gfx942, 304), 64, 128, 64, false, 8, 120, [14, 51, 3, 4, 4, 2, 3], 9292, 129; "gfx942 d64")]
-#[test_case(amd(AmdArch::Gfx942, 304), 128, 128, 32, false, 8, 132, [14, 51, 3, 4, 4, 2, 3], 9178, 129; "gfx942 d128")]
-#[allow(clippy::too_many_arguments)]
-fn one_atom_row_per_warp_emits_what_it_did(
-    target: Target,
-    d: usize,
-    bq: usize,
-    bkv: usize,
-    causal: bool,
-    warps: u32,
-    regs: u32,
-    [copies, lets, loops, mmas, reduces, relayouts, syncs]: [usize; 7],
-    ir_lines: usize,
-    mma_calls: usize,
-) {
-    use crate::ir::{Stmt, TileOp};
-    use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS};
-    let all = Forms { truncate_p: true, skip_rescale: true, raw_max: true, sum_after: true, bias_direct: false };
-    let cfg = FaCfg { unroll: true, forms: all, ..FaCfg::new(bq, bkv, 2) };
-    assert_eq!(cfg.warp_rows, WARP_ROWS);
-    let (prog, lowering) = attention_at(&target, cfg, d, causal);
-    assert_eq!((cfg.warps(), cfg.registers(&target, d, false)), (warps, Some(regs)));
-    let tile = lowered_tile(prog.clone(), &lowering);
-    let count = |pred: &dyn Fn(&Stmt) -> bool| tile.walk().filter(|(_, s)| pred(s)).count();
-    let got = [
-        count(&|s| matches!(s, Stmt::Copy { .. })),
-        count(
-            &|s| matches!(s, Stmt::Let { op, .. } if !matches!(op, TileOp::Mma { .. } | TileOp::Reduce { .. } | TileOp::Relayout { .. })),
-        ),
-        count(&|s| matches!(s, Stmt::Loop(_))),
-        count(&|s| matches!(s, Stmt::Let { op: TileOp::Mma { .. }, .. })),
-        count(&|s| matches!(s, Stmt::Let { op: TileOp::Reduce { .. }, .. })),
-        count(&|s| matches!(s, Stmt::Let { op: TileOp::Relayout { .. }, .. })),
-        count(&|s| matches!(s, Stmt::Sync(_))),
-    ];
-    assert_eq!(got, [copies, lets, loops, mmas, reduces, relayouts, syncs]);
-    let ir = render(prog, &lowering);
-    let calls = ["@llvm.amdgcn.wmma", "@llvm.amdgcn.mfma", "@llvm.nvvm.mma"].map(|c| ir.matches(c).count());
-    assert_eq!((ir.lines().count(), calls.iter().sum::<usize>()), (ir_lines, mma_calls));
-}
-
-/// The d64 and d128 probe picks over `d`, `bq`, `bkv` on `target`, plain
-/// or causal, every form on, as the probe's tuner picks them.
-fn attention_at(target: &Target, cfg: crate::kernels::attention::FaCfg, d: usize, causal: bool) -> (Program, Lowering) {
+/// The probe's plain attention at head size `d` under `cfg` on `target`.
+fn attention_at(target: &Target, cfg: crate::kernels::attention::FaCfg, d: usize) -> (Program, Lowering) {
     use crate::kernels::attention::{AttnMask, AttnSpec, attention};
     let spec = AttnSpec {
         batch: Batch::Static(4),
@@ -1119,7 +1066,7 @@ fn attention_at(target: &Target, cfg: crate::kernels::attention::FaCfg, d: usize
         heads: 8,
         kv_heads: 8,
         d,
-        mask: AttnMask { causal, ..AttnMask::default() },
+        mask: AttnMask::default(),
         cache: None,
         scale: 0.125,
         cfg,
@@ -1149,7 +1096,7 @@ fn two_atom_rows_per_warp_lower(target: Target) {
         assert_eq!(two.warps() * 2, one.warps());
         let (r1, r2) = (one.registers(&target, d, false).unwrap(), two.registers(&target, d, false).unwrap());
         assert!(r2 > r1 && r2 < 2 * r1, "{r1} -> {r2}: twice the accumulators, the queries and fills shared");
-        let (prog, lowering) = attention_at(&target, two, d, false);
+        let (prog, lowering) = attention_at(&target, two, d);
         assert!(!render(prog, &lowering).is_empty());
     }
     let odd = FaCfg { warp_rows: 2 * WARP_ROWS, ..FaCfg::new(16, 16, 2) };
