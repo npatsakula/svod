@@ -97,7 +97,7 @@ fn input() -> (Tensor, Vec<f32>) {
     (x, data.iter().map(|v| v + 1.0).collect())
 }
 
-/// The `tk` direct path: optimizer, PROGRAM boundary, render, compile, run.
+/// The direct path: optimizer, PROGRAM boundary, render, compile, run.
 fn compile_and_run(device: &Device, program: Arc<UOp>, buffers: &[svod_device::Buffer]) -> String {
     let renderer = crate::realize::get_optimizer_renderer(device);
     let optimized = svod_schedule::optimize_kernel_with_config(program.clone(), &renderer, &Default::default())

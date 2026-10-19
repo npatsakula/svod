@@ -11,7 +11,8 @@ use test_case::test_case;
 use crate::layout::Dim::{self, Col, Lane, Reg, Row, Warp};
 use crate::layout::*;
 
-/// tk1 `LaneMap`, the integer half of `rc` copied from `tk/src/layout.rs`.
+/// tk1 `LaneMap`, the integer half of `rc` copied from tk1's
+/// `tk/src/layout.rs` before the crate's removal.
 #[derive(Clone, Copy, Debug)]
 enum LaneMap {
     Strided { stride: i64 },

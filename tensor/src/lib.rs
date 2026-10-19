@@ -682,8 +682,9 @@ impl Tensor {
 
     /// Build a hand-written kernel as a **graph node** — the generic
     /// `custom_kernel` → `Op::Call` wrapper for any author-supplied SINK builder
-    /// (the svod-tk tile DSL is one client; a raw UOp builder is another). Unlike a
-    /// direct launch it returns a *lazy* output [`Tensor`] the scheduler realizes
+    /// (a raw UOp builder or a `UOp::linear_program`; svod-tk3 calls
+    /// [`Tensor::custom_kernel_with`] directly). Unlike a direct launch it
+    /// returns a *lazy* output [`Tensor`] the scheduler realizes
     /// (and the JIT graph captures) like any other op, so a hand kernel composes
     /// into a model and benchmarks through the normal `prepare()` path.
     ///

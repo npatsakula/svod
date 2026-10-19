@@ -652,7 +652,7 @@ fn analyze_callable_dependencies(callables: &[Arc<UOp>], root: &Arc<UOp>) -> Res
     // `toposort_call_aware(false)` stops at CALL boundaries: only inter-kernel
     // AFTER surfaces (the scheduling DAG between callables) are walked, never the
     // intra-kernel AFTERs *inside* a CALL body. A hand-lowered kernel body (a
-    // marked SINK, e.g. svod-tk's tile DSL or rangeify's own `reduce_to_acc`)
+    // marked SINK, e.g. a hand-ranged custom kernel or rangeify's own `reduce_to_acc`)
     // legitimately contains `After([END(STORE)])` / `After([RANGE])` REG/LDS
     // accumulator edges; those are the linearizer's concern, not callable
     // dependencies, and must not be validated by this grammar.

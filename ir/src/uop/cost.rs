@@ -22,7 +22,7 @@ use crate::uop::UOp;
 ///
 /// Only arithmetic that produces *values* counts. Address arithmetic — the
 /// operands of an INDEX, and the bounds of a RANGE or SPECIAL — is skipped: a
-/// scheduler-built AST barely has any, but a hand-lowered kernel body (a `tk`
+/// scheduler-built AST barely has any, but a hand-lowered kernel body (a tk3
 /// tile kernel) is mostly index math, and counting it reported a matmul at
 /// tens of times the hardware's peak.
 ///

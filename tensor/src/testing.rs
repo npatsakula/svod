@@ -1,8 +1,7 @@
 //! Numeric comparison helpers shared by custom-kernel correctness checks — the
 //! one-shot [`custom_kernel_check!`](crate::custom_kernel_check) macro and any
-//! property-based harness (e.g. `svod-tk`'s proptest kernel checks). Kept in the
-//! library (not behind `cfg(test)`) so the `#[macro_export]` macro and downstream
-//! test crates can both reach it.
+//! property-based harness. Kept in the library (not behind `cfg(test)`) so the
+//! `#[macro_export]` macro and downstream test crates can both reach it.
 
 /// Outcome of an [`allclose_f32`] comparison.
 pub struct AllcloseReport {

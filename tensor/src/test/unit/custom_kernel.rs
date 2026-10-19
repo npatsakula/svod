@@ -187,7 +187,7 @@ fn test_tensor_custom_op_numerical_llvm_backend() {
 /// Build a hand-ranged `out[i] = in[i] + 1` kernel body (manual RANGE +
 /// STORE-with-ranges). Used to prove the schedule passes a custom_kernel body
 /// through lowering WITHOUT re-rangeifying author-created loops — the core
-/// precondition for the svod-tk tile DSL.
+/// precondition for any hand-ranged kernel body.
 fn hand_ranged_add1_body(n: usize) -> impl FnOnce(Vec<Arc<UOp>>) -> Arc<UOp> {
     move |ph| {
         let out_buf = ph[0].clone();
