@@ -24,6 +24,7 @@ use std::sync::{Arc, LazyLock};
 
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DeviceSpec, ScalarDType};
+use test_case::test_case;
 
 use crate::atoms::{Costs, Device, Target};
 use crate::build::BF16;
@@ -245,6 +246,22 @@ fn decode(dtype: ScalarDType, bytes: &[u8]) -> Vec<f64> {
 /// The bf16 of `bits`.
 fn bf16(bits: u16) -> f64 {
     half::bf16::from_bits(bits).to_f64()
+}
+
+/// [`decode`] reads a 16-bit output as IEEE does: a NaN (all-ones exponent,
+/// a payload) stays NaN rather than reading as the infinity a check would
+/// take for an overflow, and infinities, subnormals and the largest finite
+/// value are exact.
+#[test_case(ScalarDType::Float16, 0x7e01, None; "f16 NaN")]
+#[test_case(ScalarDType::Float16, 0xfc00, Some(f64::NEG_INFINITY); "f16 negative infinity")]
+#[test_case(ScalarDType::Float16, 0x0001, Some(2f64.powi(-24)); "f16 least subnormal")]
+#[test_case(ScalarDType::Float16, 0x7bff, Some(65504.0); "f16 largest finite")]
+#[test_case(ScalarDType::BFloat16, 0xffc1, None; "bf16 NaN")]
+#[test_case(ScalarDType::BFloat16, 0x7f80, Some(f64::INFINITY); "bf16 infinity")]
+#[test_case(ScalarDType::BFloat16, 0xbf80, Some(-1.0); "bf16 minus one")]
+fn a_16_bit_output_decodes_as_ieee(dtype: ScalarDType, bits: u16, want: Option<f64>) {
+    let got = decode(dtype, &bits.to_le_bytes())[0];
+    assert!(want.map_or(got.is_nan(), |w| got == w), "{bits:#06x}: {got}");
 }
 
 /// `|got - want| ≤ tol·max(|want|, 1)` everywhere: an error relative to the
