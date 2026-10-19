@@ -260,3 +260,24 @@ fn tile_prologue_compiles_to_ptx() {
     }
     assert!(!ptx.contains("cvta.to.shared"), "the shared casts must fold onto the tile global:\n{ptx}");
 }
+
+/// Each lane loads one 16-byte chunk through `ld.global.cg` and stores its
+/// words back: four outputs of one aggregate, cached at L2 only.
+#[test]
+fn ld_global_cg_16_loads_four_words_at_l2() {
+    let chunk = imul(&lane(), 4);
+    let words = ld_global_cg_16(&global_at(0, DType::Int32, chunk.clone()));
+    let stores = (0..4)
+        .map(|i| {
+            global_at(1, DType::Int32, chunk.try_add(&UOp::native_const(i as i32)).unwrap()).store(words[i].clone())
+        })
+        .collect();
+    let rendered = render_nvptx_linearized(&UOp::sink(stores), SM86, "nvptx_ld_global_cg");
+    let call = "call { i32, i32, i32, i32 } asm sideeffect \"ld.global.cg.v4.u32 {$0, $1, $2, $3}, [$4];\", \"=r,=r,=r,=r,l\"(ptr addrspace(1) %";
+    assert_eq!(rendered.code.matches(call).count(), 1, "one load:\n{}", rendered.code);
+    let extracted = rendered.code.lines().filter(|l| l.contains("= extractvalue { i32, i32, i32, i32 } %")).count();
+    assert_eq!(extracted, 4, "{}", rendered.code);
+    if let Some(ptx) = assert_ptx_compiles(&rendered.code, SM86) {
+        assert!(ptx.contains("ld.global.cg.v4.u32"), "{ptx}");
+    }
+}

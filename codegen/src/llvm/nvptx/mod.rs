@@ -59,4 +59,6 @@ pub fn clang_flags(arch: svod_dtype::CudaArch) -> Vec<String> {
     flags.extend(["-Wno-override-module", "-", "-o", "-"].map(str::to_string));
     flags
 }
-pub use smem::{CpAsyncCache, cp_async, cp_async_16, cp_async_commit, cp_async_wait, cp_async_wait_all, ldmatrix};
+pub use smem::{
+    CpAsyncCache, cp_async, cp_async_16, cp_async_commit, cp_async_wait, cp_async_wait_all, ld_global_cg_16, ldmatrix,
+};
