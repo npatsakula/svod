@@ -463,7 +463,6 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     // Keys past the length are masked; keys past `tk` too when blocks overhang it.
     let keys_masked = key_lens || !tk.is_multiple_of(bkv);
     let len = match lens {
-        Some(lens) if appended > 0 => k.load_scalar(lens, b.clone()).min(tk),
         Some(lens) => k.load_scalar(lens, b.clone()).min(tk),
         None => Sc::from(tk),
     };
