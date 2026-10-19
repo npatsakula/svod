@@ -534,6 +534,52 @@ fn attention_softmax_takes_the_planned_forms(target: Target, family: &str, (trun
     assert_eq!((casts > 0, scales > 0), (truncated, skipped), "{name}: {casts} casts toward zero, {scales} scales");
 }
 
+/// The row sum of the probabilities follows the P·V product where the
+/// rescale is a branch or the probabilities are truncated (both consumers
+/// then read one pack), and precedes the rescale otherwise: on sm_86 the
+/// `d = 128` prefill sums after, `d = 64` and a decoder step before; gfx1201
+/// always after.
+#[test_case(crate::atoms::sm86(), "attention d128 causal #0", true; "sm_86 d 128 after")]
+#[test_case(crate::atoms::sm86(), "attention d64 causal #0", false; "sm_86 d 64 before")]
+#[test_case(crate::atoms::sm86(), "attention d64 cache", false; "sm_86 decode before")]
+#[test_case(amd(AmdArch::Gfx1201, 64), "attention d64 causal #0", true; "gfx1201 d 64 after")]
+#[test_case(amd(AmdArch::Gfx1201, 64), "attention d64 cache", true; "gfx1201 decode after")]
+fn attention_sums_the_probabilities_where_the_forms_say(target: Target, family: &str, after: bool) {
+    use crate::ir::{ReduceOp, TileOp};
+    let (name, prog, _) =
+        families(&target).into_iter().find(|(n, ..)| n.starts_with(family)).expect("an attention family");
+    let ops = tile_ops_in_order(&prog.body);
+    let products: Vec<usize> =
+        ops.iter().enumerate().filter(|(_, op)| matches!(op, TileOp::Mma { .. })).map(|(i, _)| i).collect();
+    let sum = ops.iter().position(|op| matches!(op, TileOp::Reduce { f: ReduceOp::Sum, .. })).expect("a row sum");
+    // The first step's products: `q·kᵀ`, then `p·v`.
+    assert!(products.len() >= 2, "{name}");
+    assert_eq!(sum > products[1], after, "{name}: sum at {sum}, products at {products:?}");
+}
+
+/// The tile ops of `block` in program order, recursively.
+fn tile_ops_in_order(block: &crate::ir::Block) -> Vec<crate::ir::TileOp> {
+    use crate::ir::Stmt;
+    let mut out = vec![];
+    for s in &block.0 {
+        match s {
+            Stmt::Let { op, .. } => out.push(op.clone()),
+            Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+            Stmt::Loop(l) => out.extend(tile_ops_in_order(&l.body)),
+            Stmt::Pipeline(p) => {
+                out.extend(tile_ops_in_order(&p.produce.body));
+                out.extend(tile_ops_in_order(&p.consume.body));
+            }
+            Stmt::Role { body, .. } => out.extend(tile_ops_in_order(body)),
+            Stmt::If { then, otherwise, .. } => {
+                out.extend(tile_ops_in_order(then));
+                out.extend(tile_ops_in_order(otherwise));
+            }
+        }
+    }
+    out
+}
+
 /// The tile ops of `block` (recursively) that `f` picks.
 fn tile_ops(block: &crate::ir::Block, f: &dyn Fn(&crate::ir::TileOp) -> bool) -> usize {
     use crate::ir::Stmt;

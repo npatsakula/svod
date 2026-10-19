@@ -37,14 +37,19 @@ pub struct FaCfg {
     pub raw_max: bool,
 }
 
+/// Query rows per warp: the M of every matrix core's atom, so a row's scores
+/// and its reductions stay within the warp. The planner refuses a core
+/// whose atom differs ([`FaCfg::fits`](Self::fits)).
+pub const WARP_ROWS: usize = 16;
+
 impl FaCfg {
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
         Self { bq, bkv, stages, splits: 1, unroll: false, truncate_p: false, skip_rescale: false, raw_max: false }
     }
 
-    /// One warp per 16 query rows: row reductions stay within a warp.
+    /// One warp per [`WARP_ROWS`] query rows.
     pub fn warps(&self) -> u32 {
-        (self.bq / 16) as u32
+        (self.bq / WARP_ROWS) as u32
     }
 
     pub fn lowering(&self, target: Target) -> Lowering {
@@ -213,7 +218,10 @@ impl<T> Step<'_, T> {
 
 /// How far (in log2 units) a row's running maximum may fall behind its
 /// scores before the row rescales (FlashAttention-4's lazy rescale): the
-/// probabilities of a block stay below 2^8, well inside bf16 and f32.
+/// probabilities of a block stay below 2^8. The stream type bounds the
+/// choice rather than fixing it: f16 holds up to 2^15, bf16 up to 2^127, and
+/// the f32 output accumulates `p·v` over every key, so the margin left is
+/// what keeps that sum finite for any value magnitude.
 const RESCALE_ABOVE: f64 = 8.0;
 
 fn step<T: Elem, PK: TierMark, PV: TierMark>(
@@ -270,16 +278,22 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let p = k.unary(p, UnaryOp::Exp2);
     let truncate = st.cfg.truncate_p && T::DTYPE == svod_dtype::ScalarDType::BFloat16;
     let p16 = if truncate { k.cast_toward_zero::<T>(p) } else { k.cast::<F32, T>(p) };
+    // Truncated probabilities are summed as held, so the normalization stays
+    // unbiased; rounded ones in f32. The sum follows the product where the
+    // rescale is a branch, so both consumers of the probabilities sit on one
+    // side of it and read them packed once (sm_86 d = 128: +7%); with a plain
+    // rescale it comes first (sm_86 d = 64 causal: +5% over the other order).
+    let summed = |k: &mut Kernel| {
+        let block_sum =
+            if truncate { k.reduce_f32(p16, Axis::Row, ReduceOp::Sum) } else { k.reduce(p, Axis::Row, ReduceOp::Sum) };
+        let l = k.binary(l, corr, BinaryOp::Mul);
+        k.binary(l, block_sum, BinaryOp::Add)
+    };
+    let after = truncate || st.cfg.skip_rescale;
+    let early = (!after).then(|| summed(k));
     let o = if st.cfg.skip_rescale { k.scale(o, corr) } else { k.binary(o, corr, BinaryOp::Mul) };
     let o = k.mma(o, p16, false, v_t, false);
-    // Truncated probabilities are summed as held, so the normalization stays
-    // unbiased; rounded ones in f32. The sum follows the product so that both
-    // read the probabilities packed once, on the same side of the rescale's
-    // branch.
-    let block_sum =
-        if truncate { k.reduce_f32(p16, Axis::Row, ReduceOp::Sum) } else { k.reduce(p, Axis::Row, ReduceOp::Sum) };
-    let l = k.binary(l, corr, BinaryOp::Mul);
-    let l = k.binary(l, block_sum, BinaryOp::Add);
+    let l = early.unwrap_or_else(|| summed(k));
     [m_new, l, o]
 }
 
