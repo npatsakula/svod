@@ -1,12 +1,11 @@
 //! The attention prologue: the program against a direct f64 reference on the
 //! host, and the lowered kernel against the program on the GPU.
 
-use svod_dtype::{DType, DeviceSpec, ScalarDType, default_device::default_device};
+use svod_dtype::{DType, ScalarDType};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::declared;
-use crate::atoms::Target;
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::kernels::Batch;
@@ -150,11 +149,7 @@ fn only_the_live_batch_runs() {
 #[test_case(spec(var(), 40, [8, 2, 128], [true, true], Some(true)); "d 128, tables per batch, batch var")]
 #[test_case(spec(STATIC, 16, [2, 2, 64], [false, false], None); "a split")]
 fn kernel_matches_the_program(s: HeadsSpec) {
-    let device = default_device();
-    let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
-        eprintln!("skipped: no CUDA device");
-        return;
-    };
+    let Some(target) = super::cuda_target() else { return };
     let cap = s.batch.capacity();
     let p = inputs(&s, 11);
     let want = run(&heads::<BF16>(&s), p.clone(), &[("b", cap as i64)]).unwrap();

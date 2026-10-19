@@ -419,11 +419,11 @@ fn a_file_of_another_format_is_dropped(written: Option<u32>, kept: bool) {
 /// store on that directory answers from disk without measuring.
 #[test]
 fn a_gemm_tunes_on_the_device() {
-    let spec = svod_dtype::default_device::default_device();
-    let Some(planner) = super::device_planner().filter(|_| matches!(spec, svod_dtype::DeviceSpec::Cuda { .. })) else {
-        eprintln!("skipped: no CUDA device");
+    if super::cuda_target().is_none() {
         return;
-    };
+    }
+    let planner = super::device_planner().expect("a planner for the device");
+    let spec = svod_dtype::default_device::default_device();
     let device = &planner.device;
     let (m, n, k) = (704, 512, 512);
     let cfgs = super::first_eight(&planner.gemm_ranked(1, m, n, k, false));
@@ -514,10 +514,7 @@ fn contenders_run_the_later_rounds(runs: &[&[u64]], losers: usize, want_calls: &
 /// the other, while the same program launched as an op is compiled once.
 #[test]
 fn a_scratch_plan_publishes_nothing() {
-    let Some(planner) = super::device_planner() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(planner) = super::device_planner() else { return };
     let device = &planner.device;
     let cfg = super::first_eight(&planner.gemm_ranked(1, 704, 512, 512, false))[0];
     let spec = GemmSpec { m: 704, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };

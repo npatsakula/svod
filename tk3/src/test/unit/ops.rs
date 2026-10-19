@@ -1,5 +1,5 @@
-//! Every op against its own graph fallback on a CUDA device, on awkward
-//! shapes; skipped unless `SVOD_DEVICE` names one.
+//! Every op against its own graph fallback on the device, on awkward
+//! shapes; gated as every device test is ([`super::device_target`]).
 
 use svod_dtype::{DType, default_device::default_device};
 use svod_ir::{Op, SInt, ops};
@@ -12,12 +12,7 @@ use crate::ops::{self as tk, Act, Attn, Cache, Chunk, Conv, KeyMask, Linear, Qkv
 /// every shape it touches (the untuned pick runs).
 fn device() -> bool {
     crate::tune::set_enabled(false);
-    let device = default_device();
-    let ok = tk::supported(&device);
-    if !ok {
-        eprintln!("skipped: no device with tk3 tables");
-    }
-    ok
+    super::device_planner().is_some()
 }
 
 /// A realized `shape` tensor of `dtype` with values in `scale·[-1, 1)`.

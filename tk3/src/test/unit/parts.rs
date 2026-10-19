@@ -2,12 +2,11 @@
 //! interpreter: a global-resident A operand, the transposed `ldmatrix` B
 //! operand, row reductions and vector broadcasts.
 
-use svod_dtype::{DType, DeviceSpec, ScalarDType, default_device::default_device};
+use svod_dtype::{DType, ScalarDType};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::declared;
-use crate::atoms::Target;
 use crate::build::*;
 use crate::interp::{round_to, run};
 use crate::ir::*;
@@ -15,11 +14,6 @@ use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 use crate::schedule::{Prefetch, Schedule};
-
-fn target() -> Option<Target> {
-    let device = default_device();
-    matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten()
-}
 
 fn data(n: usize, seed: &mut u64) -> Vec<f64> {
     (0..n)
@@ -31,10 +25,7 @@ fn data(n: usize, seed: &mut u64) -> Vec<f64> {
 }
 
 fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, warps: u32, tol: f64) {
-    let Some(target) = target() else {
-        eprintln!("skipped: no CUDA device");
-        return;
-    };
+    let Some(target) = super::cuda_target() else { return };
     let mut params = inputs.clone();
     params.push(vec![0.0; out_elems]);
     let want = run(&prog, params, &[]).unwrap();
@@ -144,7 +135,7 @@ fn row_reductions_and_broadcast() {
 #[test]
 #[ignore = "diagnostic"]
 fn pv_identity_probe() {
-    let Some(target) = target() else { return };
+    let Some(target) = super::cuda_target() else { return };
     let (bq, bkv, d) = (64usize, 64usize, 64usize);
     let mut k = Kernel::new("pv_id");
     let p = k.param::<BF16>("p", ParamKind::In, bq * bkv);
@@ -187,7 +178,7 @@ fn pv_identity_probe() {
 #[test]
 #[ignore = "perf probe: needs a CUDA device"]
 fn mma_peak_probe() {
-    let Some(target) = target() else { return };
+    let Some(target) = super::cuda_target() else { return };
     let (bm, bn, bk, iters, blocks) = (64usize, 64usize, 16usize, 4096i64, 28 * 16usize);
     let mut k = Kernel::new("mma_peak");
     let a = k.param::<BF16>("a", ParamKind::In, bm * bk);

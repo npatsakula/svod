@@ -18,7 +18,10 @@ mod sync;
 mod targets;
 mod tune;
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+use svod_dtype::DeviceSpec;
+use svod_dtype::default_device::default_device;
 
 use crate::atoms::{Costs, Device, Target};
 use crate::build::BF16;
@@ -26,20 +29,77 @@ use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
-use crate::ops::config::Planner;
+use crate::ops::config::{Planner, has_kernels};
 
-/// The default device's target when tk3 has tables for it, of any vendor.
+/// The default device's target when tk3 has kernels for it, of any vendor:
+/// the gate of every device test. It skips (`None`) only where there is
+/// nothing to run on: `SVOD_DEVICE=CPU`, a GPU tk3 has no kernels for, or no
+/// `SVOD_DEVICE` and no GPU tk3 supports attached. A supported GPU the suite
+/// is not pointed at, or an `SVOD_DEVICE` that does not open, fails the
+/// test, since a suite whose device tests all skip passes and proves nothing.
 fn device_target() -> Option<Target> {
     traced();
-    let target = Target::for_device(&svod_dtype::default_device::default_device());
-    target.filter(crate::ops::config::has_kernels)
+    let device = default_device();
+    let Some(target) = Target::for_device(&device) else {
+        assert_eq!(device, DeviceSpec::Cpu, "the default device does not open");
+        if std::env::var_os("SVOD_DEVICE").is_some() {
+            eprintln!("skipped: SVOD_DEVICE selects the CPU");
+            return None;
+        }
+        if let Some((select, target)) = attached() {
+            panic!(
+                "tk3 has kernels for the attached {} but SVOD_DEVICE is unset: run with SVOD_DEVICE={select} \
+                 (SVOD_DEVICE=CPU runs the host tests alone)",
+                target.arch.target_name()
+            );
+        }
+        eprintln!("skipped: no GPU tk3 has kernels for");
+        return None;
+    };
+    if !has_kernels(&target) {
+        eprintln!("skipped: tk3 has no kernels for {}", target.arch.target_name());
+        return None;
+    }
+    Some(target)
 }
 
-/// The default device's planner as the op layer holds it: its costs probed
-/// on the device (read from the tune store after the first run).
+/// The first GPU tk3 has kernels for on this machine and the `SVOD_DEVICE`
+/// that selects it, found without selecting it: AMD ones from the KFD
+/// topology in sysfs, a CUDA one once the driver counts devices (`cuInit`
+/// creates no context; reading the architecture opens device 0's).
+fn attached() -> Option<(String, Target)> {
+    static ATTACHED: LazyLock<Option<(String, Target)>> = LazyLock::new(|| {
+        let amd = (0..svod_device::amd::topology::enumerate().len()).map(|device_id| DeviceSpec::Amd { device_id });
+        let cuda = svod_device::cuda::has_devices().then_some(DeviceSpec::Cuda { device_id: 0 });
+        amd.chain(cuda).find_map(|spec| {
+            let target = Target::for_device(&spec).filter(has_kernels)?;
+            let select = match spec {
+                DeviceSpec::Amd { device_id: 0 } => "AMD".to_string(),
+                DeviceSpec::Amd { device_id } => format!("AMD:{device_id}"),
+                _ => "CUDA".to_string(),
+            };
+            Some((select, target))
+        })
+    });
+    ATTACHED.clone()
+}
+
+/// The default device's planner as the op layer holds it, behind
+/// [`device_target`]'s gate: its costs probed on the device (read from the
+/// tune store after the first run).
 fn device_planner() -> Option<Arc<Planner>> {
-    traced();
-    crate::ops::planner(&svod_dtype::default_device::default_device())
+    device_target()?;
+    Some(crate::ops::planner(&default_device()).expect("the device's cost probes measure"))
+}
+
+/// [`device_target`] when the device is a CUDA one.
+fn cuda_target() -> Option<Target> {
+    let target = device_target()?;
+    let cuda = matches!(target.arch, svod_dtype::GpuArch::Cuda(_));
+    if !cuda {
+        eprintln!("skipped: not a CUDA device");
+    }
+    cuda.then_some(target)
 }
 
 /// The crate's tracing under `RUST_LOG` on stderr, for the probes: the

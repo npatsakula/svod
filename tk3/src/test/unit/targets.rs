@@ -10,7 +10,6 @@ use std::sync::Arc;
 use proptest::prelude::*;
 use svod_codegen::Renderer;
 use svod_codegen::llvm::LlvmTextRenderer;
-use svod_dtype::default_device::default_device;
 use svod_dtype::{AmdArch, CudaArch, DType, DeviceSpec, GpuArch, ScalarDType};
 use svod_ir::{Op, UOp, ops};
 use svod_tensor::Tensor;
@@ -688,11 +687,7 @@ fn check_on_device(target: &Target) {
 /// new GPU; skips without one.
 #[test]
 fn families_match_the_interpreter_on_the_device() {
-    let device = default_device();
-    let Some(target) = Target::for_device(&device).filter(config::has_kernels) else {
-        eprintln!("skipped: no device with tk3 tables");
-        return;
-    };
+    let Some(target) = super::device_target() else { return };
     check_on_device(&target);
 }
 
@@ -702,11 +697,7 @@ fn families_match_the_interpreter_on_the_device() {
 /// plan with: a lattice ranked on the host is the one the device runs.
 #[test]
 fn the_device_reports_the_architectures_occupancy() {
-    let device = default_device();
-    let Some(target) = Target::for_device(&device).filter(config::has_kernels) else {
-        eprintln!("skipped: no device with tk3 tables");
-        return;
-    };
+    let Some(target) = super::device_target() else { return };
     let arch = Target::for_arch(target.arch);
     assert_eq!(target.occupancy, arch.occupancy, "{:?}", target.arch);
     assert!(target.sms.is_some_and(|n| n > 0));
@@ -717,11 +708,7 @@ fn the_device_reports_the_architectures_occupancy() {
 /// two-slot rings, measured against the interpreter.
 #[test]
 fn register_staged_families_match_on_cuda() {
-    let device = default_device();
-    let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
-        eprintln!("skipped: no CUDA device");
-        return;
-    };
+    let Some(target) = super::cuda_target() else { return };
     check_on_device(&Target { cp_async: false, ldmatrix: false, ..target });
 }
 

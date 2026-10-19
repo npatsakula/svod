@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use svod_dtype::{DType, DeviceSpec, ScalarDType, default_device::default_device};
+use svod_dtype::{DType, DeviceSpec, ScalarDType};
 use svod_ir::{BinaryOp as UBinary, Op, TernaryOp, UOp, ops};
 use svod_tensor::Tensor;
 use test_case::test_case;
@@ -262,11 +262,7 @@ fn a_staged_gathered_run_is_one_select() {
 #[test_case(Prefetch::CpAsync; "cp.async")]
 #[test_case(Prefetch::RegisterStaged; "register staged")]
 fn gathered_gemm_matches_the_interpreter_on_the_gpu(prefetch: Prefetch) {
-    let device = default_device();
-    let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
-        eprintln!("skipped: no CUDA device");
-        return;
-    };
+    let Some(target) = super::cuda_target() else { return };
     let (m, n, kk) = (128usize, 64usize, 256usize);
     let (tile, stages, warps) = PIN;
     let mut seed = 9;

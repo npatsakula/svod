@@ -2,12 +2,12 @@
 //! interpreter computes. Skips unless `SVOD_DEVICE` names a CUDA device (the
 //! two-crew test: a device that interleaves crews).
 
-use svod_dtype::{DType, DeviceSpec, ScalarDType, default_device::default_device};
+use svod_dtype::{DType, ScalarDType, default_device::default_device};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::declared;
-use crate::atoms::{Device, Target};
+use crate::atoms::Device;
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
@@ -15,11 +15,6 @@ use crate::kernels::Batch;
 use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::launch::graph_launch;
 use crate::ops::config::Planner;
-
-fn cuda_target() -> Option<Target> {
-    let spec = default_device();
-    matches!(spec, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&spec)).flatten()
-}
 
 fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
     gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg })
@@ -59,10 +54,7 @@ fn gemm_matches_the_interpreter(
     wr: u32,
     wc: u32,
 ) {
-    let Some(target) = cuda_target() else {
-        eprintln!("skipped: no CUDA device");
-        return;
-    };
+    let Some(target) = super::cuda_target() else { return };
     let cfg =
         GemmCfg { core: Core::Warp, tile: [bm, bn, bk], stages, warps: [wr, wc], group_m: 0, unroll: true, crews: 1 };
     check_gemm(&declared(target), m, n, k, cfg);
@@ -72,8 +64,7 @@ fn gemm_matches_the_interpreter(
 /// shortlists), on a grid with partial row and column tiles.
 #[test]
 fn every_gemm_candidate_matches_the_interpreter() {
-    if cuda_target().is_none() {
-        eprintln!("skipped: no CUDA device");
+    if super::cuda_target().is_none() {
         return;
     }
     let planner = super::device_planner().expect("a planner for the device");
@@ -100,8 +91,8 @@ fn every_gemm_candidate_matches_the_interpreter() {
 #[test_case([256, 128, 64], [16, 1], [4, 4], 2; "256x128x64 four groups")]
 #[test_case([128, 256, 64], [8, 2], [4, 4], 2; "128x256x64 two by two")]
 fn warpgroup_gemm_matches_the_warp_core(tile: [usize; 3], group: [u32; 2], warp: [u32; 2], stages: usize) {
-    let Some(target) = cuda_target().filter(|t| !t.group_mma.is_empty()) else {
-        eprintln!("skipped: no CUDA device with a warpgroup core");
+    let Some(target) = super::cuda_target().filter(|t| !t.group_mma.is_empty()) else {
+        eprintln!("skipped: no warpgroup core");
         return;
     };
     let device = declared(target);
@@ -198,10 +189,7 @@ fn check_gemm(device: &Device, m: usize, n: usize, k: usize, cfg: GemmCfg) -> Ve
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn gemm_throughput_probe() {
-    let Some(planner) = super::device_planner() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(planner) = super::device_planner() else { return };
     let target = &planner.device.target;
     let (m, n, k) = (4096usize, 4096usize, 4096usize);
     let mut seed = 3;
@@ -304,10 +292,7 @@ fn gemm_throughput_probe() {
 #[ignore = "perf probe: needs a GPU"]
 fn gemm_candidates_probe() {
     use crate::kernels::Act;
-    let Some(planner) = super::device_planner() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(planner) = super::device_planner() else { return };
     let ladder =
         GemmCfg { core: Core::Warp, tile: [128, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true, crews: 1 };
     let plain = Epilogue::default();
@@ -356,10 +341,7 @@ fn gemm_candidates_probe() {
 #[test]
 #[ignore = "perf probe: needs a CUDA device"]
 fn first_execution_probe() {
-    let Some(target) = cuda_target() else {
-        eprintln!("skipped: no CUDA device");
-        return;
-    };
+    let Some(target) = super::cuda_target() else { return };
     let device = declared(target);
     let (m, n, k) = (704usize, 1536usize, 512usize);
     let mut seed = 5;
@@ -442,10 +424,7 @@ fn first_execution_probe() {
 #[ignore = "perf probe: needs a GPU"]
 fn qwen3_gemm_candidates_probe() {
     use crate::kernels::Act;
-    let Some(planner) = super::device_planner() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(planner) = super::device_planner() else { return };
     let target = &planner.device.target;
     let plain = Epilogue::default();
     let shapes = [
@@ -537,11 +516,11 @@ fn transposing_loads_land_as_their_layout() {
     use crate::layout::{global_tr_b128, global_tr_rows};
     use svod_codegen::llvm::amd::tr::global_load_tr_b128;
     use svod_ir::{CallInfo, KernelInfo, UOp};
-    let device = default_device();
-    if !Target::for_device(&device).is_some_and(|t| t.tr_load) {
-        eprintln!("skipped: no device with transposing loads");
+    if !super::device_target().is_some_and(|t| t.tr_load) {
+        eprintln!("skipped: no transposing loads");
         return;
     }
+    let device = default_device();
     let input = Tensor::from_slice((0..256).map(|i| i as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
     let out = Tensor::from_slice(vec![0f32; 256]).cast(DType::BFloat16);
     let name = "tr_probe".to_string();

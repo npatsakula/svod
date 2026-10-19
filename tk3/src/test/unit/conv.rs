@@ -365,15 +365,6 @@ fn too_few_channels_have_no_candidates(cin: usize) {
 
 // ---- on the device -----------------------------------------------------------------
 
-fn cuda_target() -> Option<crate::atoms::Target> {
-    let spec = svod_dtype::default_device::default_device();
-    let target = matches!(spec, DeviceSpec::Cuda { .. }).then(|| crate::atoms::Target::for_device(&spec)).flatten();
-    if target.is_none() {
-        eprintln!("skipped: no CUDA device");
-    }
-    target
-}
-
 fn upload(v: &[f64], dtype: DType) -> Tensor {
     let t = Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(dtype).contiguous();
     t.realize().unwrap();
@@ -460,7 +451,7 @@ const RESIDUAL_SILU_BIAS: Epilogue = Epilogue { residual: true, ..SILU_BIAS };
 /// sweep is what verifies what it may pick).
 #[test]
 fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
-    let Some(target) = cuda_target() else { return };
+    let Some(target) = super::cuda_target() else { return };
     let planner = super::device_planner().expect("a planner for the device");
     for class in YOLO {
         let g = yolo_geom(class);
@@ -483,7 +474,7 @@ fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
 #[test_case(geom([10, 10], 16, 48, 3, 1, 2, 2), 1, SILU_BIAS, [64, 64, 16]; "dilated, 16 channels")]
 #[test_case(geom([9, 9], 32, 64, 3, 1, 1, 1), 2, Epilogue { out_f32: true, residual: true, ..Epilogue::DEFAULT }, [64, 64, 32]; "f32 out and residual")]
 fn conv_matches_on_the_device(g: ConvGeom, images: usize, epi: Epilogue, tile: [usize; 3]) {
-    let Some(target) = cuda_target() else { return };
+    let Some(target) = super::cuda_target() else { return };
     let warps = if tile[1] == 48 { [2, 1] } else { [2, 2] };
     let spec = ConvSpec { batch: Batch::Static(images), geom: g, epilogue: epi, cfg: cfg(tile, warps, 3), split: 1 };
     let params = inputs(&g, images, epi, 21);
@@ -499,7 +490,7 @@ fn conv_matches_on_the_device(g: ConvGeom, images: usize, epi: Epilogue, tile: [
 /// value multiplied by zero.
 #[test]
 fn an_inf_gives_the_graphs_non_finite_set_on_the_device() {
-    let Some(target) = cuda_target() else { return };
+    let Some(target) = super::cuda_target() else { return };
     let g = geom([20, 20], 64, 64, 3, 1, 1, 1);
     let epi = SILU_BIAS;
     let mut params = inputs(&g, 1, epi, 8);
@@ -517,7 +508,7 @@ fn an_inf_gives_the_graphs_non_finite_set_on_the_device() {
 /// smaller live batch computes exactly those images.
 #[test]
 fn a_bound_batch_runs_the_live_images_on_the_device() {
-    let Some(target) = cuda_target() else { return };
+    let Some(target) = super::cuda_target() else { return };
     let g = geom([12, 10], 32, 64, 3, 2, 1, 1);
     let [ho, wo] = g.out_hw();
     let (cap, live) = (3usize, 2usize);
@@ -599,10 +590,7 @@ fn plan_ns(plan: &svod_runtime::ExecutionPlan) -> Option<f64> {
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn conv_throughput_probe() {
-    let Some(planner) = super::device_planner() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(planner) = super::device_planner() else { return };
 
     let dtype = DType::Float16;
     for (cin, cout, side, stride, chain) in PROBE {

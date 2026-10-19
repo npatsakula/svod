@@ -441,10 +441,7 @@ fn a_probe_keeps_the_least_of_agreeing_timings(timings: &[u64]) -> (Option<u64>,
 /// retries absorb a pair timed alongside another test's kernels.
 #[test]
 fn device_costs_are_physical() {
-    let Some(target) = super::device_target() else {
-        eprintln!("skipped: no device with kernels");
-        return;
-    };
+    let Some(target) = super::device_target() else { return };
     let probe::Measured { costs: c, unmeasured } = probe::costs(&target).unwrap();
     eprintln!("{} ({:?} SMs): {c:#?}", target.arch.target_name(), target.sms);
     assert!(unmeasured.is_empty(), "unmeasured: {unmeasured:?}");
@@ -489,10 +486,7 @@ fn device_costs_are_physical() {
 #[test]
 #[ignore = "perf probe: times every pair alone, run with --ignored under the GPU lock"]
 fn probe_signals_are_strong() {
-    let Some(target) = super::device_target() else {
-        eprintln!("skipped: no device with kernels");
-        return;
-    };
+    let Some(target) = super::device_target() else { return };
     for p in probes(&target).iter().filter(|p| !p.candidates.is_empty()) {
         let [Some(base), Some(with)] = crate::tune::measure(p.candidates.clone())[..] else {
             panic!("{}: not timed", p.op)

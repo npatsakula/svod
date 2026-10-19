@@ -1,6 +1,5 @@
 //! GEMM epilogues and row kernels: interpreter against f64 references on the
-//! host, and the lowered programs against both on a CUDA device (skipped
-//! unless `SVOD_DEVICE` names one).
+//! host, and the lowered programs against both on the device.
 
 use proptest::prelude::*;
 use svod_dtype::{DType, ScalarDType};
@@ -35,12 +34,6 @@ fn gemm_nt_epilogue(
 fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: bool, bias: bool) -> Program {
     let spec = NormSpec { norm: norm_, rows, d, batch: Batch::Static(1), eps, residual, bias, cfg: NormCfg { br } };
     norm::<BF16>(&spec)
-}
-
-/// Row kernels have no pipeline and no matrix core: every vendor with
-/// tables runs them.
-fn gpu_target() -> Option<Target> {
-    super::device_target()
 }
 
 fn lcg(seed: &mut u64) -> f64 {
@@ -182,10 +175,7 @@ fn bias_vector_takes_the_accumulators_column_layout() {
 #[test_case(64, 64, 64, [64, 64, 32], 2, 2, 2; "small")]
 #[test_case(256, 256, 256, [128, 64, 32], 2, 2, 2; "256 cubed")]
 fn epilogues_match_on_device(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, wr: u32, wc: u32) {
-    let Some(target) = gpu_target() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(target) = super::device_target() else { return };
     for epi in EPILOGUES {
         let prog = gemm_nt_epilogue(m, n, k, tile, stages, [wr, wc], epi);
         let params = gemm_inputs(m, n, k, epi);
@@ -293,10 +283,7 @@ proptest! {
 #[test_case(Norm::Layer, 512, true, true, 8; "layer 512 residual, 8 rows a block")]
 #[test_case(Norm::Rms, 2048, false, false, 16; "rms 2048, 16 rows a block")]
 fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: usize) {
-    let Some(target) = gpu_target() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(target) = super::device_target() else { return };
     let (rows, eps) = (37, 1e-5);
     let prog = norm_rows(norm, rows, d, br, eps, residual, bias);
     let params = norm_inputs(norm, rows, d, residual, bias, 5);
@@ -353,10 +340,7 @@ fn gpu_seconds(plan: &svod_runtime::ExecutionPlan) -> f64 {
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn norm_bandwidth_probe() {
-    let Some(target) = gpu_target() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(target) = super::device_target() else { return };
     let (rows, d, eps) = (8192, 1024, 1e-5);
     let gbs = |bytes: f64, secs: f64| bytes / secs / 1e9;
     for (norm, residual) in [(Norm::Rms, false), (Norm::Layer, false), (Norm::Rms, true), (Norm::Layer, true)] {

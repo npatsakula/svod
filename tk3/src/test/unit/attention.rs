@@ -1,7 +1,7 @@
 //! Flash attention: the program against a direct softmax reference on the
 //! host, and the lowered kernel against the program on the GPU.
 
-use svod_dtype::{DType, DeviceSpec, ScalarDType, default_device::default_device};
+use svod_dtype::{DType, ScalarDType};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
@@ -476,10 +476,7 @@ fn only_the_live_batch_runs() {
 #[test_case(false, true, 64, 128, 64; "bias")]
 #[test_case(true, true, 64, 64, 32; "causal bias")]
 fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq: usize, bkv: usize) {
-    let Some(planner) = super::device_planner() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(planner) = super::device_planner() else { return };
     let device = &planner.device;
     let mask = AttnMask { causal, key_lens: true, bias: bias.then_some(Bias::PerBatch), ..NONE };
     let one = masked(100, 150, d, bq, bkv, mask);
@@ -556,16 +553,8 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
 #[test_case(biased(cached(1, 100, [4, 2, 64], true, 1, 1)), &[100, 37]; "cache biased: row map, appended, gqa")]
 #[test_case(biased(counted(cached(5, 96, [2, 2, 128], false, 8, 2))), &[64, 96]; "cache biased: d 128, eight counted appended, two splits")]
 fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
-    let Some(target) = cuda_target() else {
-        eprintln!("skipped: no CUDA device");
-        return;
-    };
+    let Some(target) = super::cuda_target() else { return };
     on_device(&spec, lens, target);
-}
-
-fn cuda_target() -> Option<Target> {
-    let device = default_device();
-    matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten()
 }
 
 /// `spec`'s kernel on the device against the program in the interpreter
@@ -696,7 +685,7 @@ fn grouped(spec: AttnSpec) -> AttnSpec {
 #[test_case(cached(5, 96, [2, 2, 128], false, 0, 2), &[64, 96]; "cache: d 128, two splits")]
 #[test_case(biased(cached(1, 200, [4, 4, 64], false, 0, 4)), &[200, 70]; "cache biased: four splits")]
 fn warpgroup_kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
-    let Some(target) = cuda_target().filter(|t| !t.group_mma.is_empty()) else {
+    let Some(target) = super::cuda_target().filter(|t| !t.group_mma.is_empty()) else {
         eprintln!("skipped: no warpgroup matrix core");
         return;
     };
@@ -716,11 +705,7 @@ fn warpgroup_kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
 #[test_case(1, 4, 64, 3, 1; "three splits, one batch")]
 #[test_case(7, 3, 64, 2, 2; "twenty-one rows, partial block")]
 fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, batch: usize) {
-    let device = default_device();
-    let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
-        eprintln!("skipped: no CUDA device");
-        return;
-    };
+    let Some(target) = super::cuda_target() else { return };
     let spec = CombineSpec { batch: Batch::Static(batch), t, heads, d, splits, cfg: NormCfg { br: 4 } };
     let rows = splits * batch * t * heads;
     let mut seed = 9;
@@ -817,10 +802,7 @@ fn label(c: &FaCfg) -> String {
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn attention_throughput_probe() {
-    let Some(planner) = super::device_planner() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(planner) = super::device_planner() else { return };
     crate::tune::set_enabled(true);
     let (batch, heads, t) = (4usize, 8usize, 2048usize);
     for (d, causal, bias) in [
@@ -864,10 +846,7 @@ fn attention_throughput_probe() {
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn key_warp_resources_probe() {
-    let Some(planner) = super::device_planner() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(planner) = super::device_planner() else { return };
     let pool = crate::tune::ScratchPool::default();
     for (key_warps, bkv) in [(1, 16), (2, 16), (4, 16), (1, 32), (2, 32), (4, 32)] {
         let cfg = FaCfg { key_warps, ..FaCfg::new(16, bkv, 2) };
@@ -910,10 +889,7 @@ fn the_tuned_d128_attention_does_not_spill_on_gfx1151() {
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn attention_candidates_probe() {
-    let Some(planner) = super::device_planner() else {
-        eprintln!("skipped: no GPU with tk3 tables");
-        return;
-    };
+    let Some(planner) = super::device_planner() else { return };
     let target = &planner.device.target;
     for (batch, heads, t, d, causal) in [
         (8usize, 16usize, 512usize, 128usize, false),
@@ -978,7 +954,6 @@ fn attention_candidates_probe() {
 fn decode_throughput_probe() {
     use crate::ops::{self as tk, Attn, Cache, KeyMask};
     if super::device_target().is_none() {
-        eprintln!("skipped: no GPU with tk3 tables");
         return;
     }
     crate::tune::set_enabled(true);
