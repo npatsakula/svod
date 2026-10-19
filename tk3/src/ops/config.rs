@@ -335,10 +335,14 @@ impl Tiled for ConvCfg {
         ConvCfg { gemm: self.gemm.tile(), ..*self }
     }
 
+    /// A split's twins keep its depth as well as its split: a partial
+    /// kernel's split must divide its trips, and a tile's depths divide
+    /// differently (3456 taps are 108 trips at a depth of 32, 54 at 64).
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
         self.gemm
             .twins(&ranked.iter().map(|c| c.gemm).collect::<Vec<_>>())
             .into_iter()
+            .filter(|gemm| self.split == 1 || gemm.tile[2] == self.gemm.tile[2])
             .map(|gemm| ConvCfg { gemm, ..*self })
             .collect()
     }

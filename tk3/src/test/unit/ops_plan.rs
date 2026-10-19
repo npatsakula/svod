@@ -657,6 +657,7 @@ fn variants_keep_their_variant_across_twins() {
     let winner = ConvCfg { split: 3, ..ranked[0] };
     let twins = winner.twins(&ranked);
     assert!(twins.len() >= 2 && twins.iter().all(|c| c.split == 3 && c.gemm.tile() == winner.gemm.tile()), "{twins:?}");
+    assert!(twins.iter().all(|c| c.gemm.tile[2] == winner.gemm.tile[2]), "a split keeps its depth: {twins:?}");
     let ranked = planner.attention_ranked(8, 2048, 2048, 64, false);
     let forms = Forms { raw_max: true, ..Forms::default() };
     let winner = FaCfg { splits: 4, forms, ..ranked[0] };
@@ -672,6 +673,36 @@ fn variants_keep_their_variant_across_twins() {
     assert!(twins.iter().any(|c| (c.stages, c.unroll) != (winner.stages, winner.unroll)));
     let norm = NormCfg { br: 8 };
     assert_eq!(norm.twins(&[NormCfg { br: 4 }, norm, NormCfg { br: 16 }]), vec![norm]);
+}
+
+/// A split convolution's twins each run whole trips under its split: a
+/// tile's depths divide the taps differently, and a twin the kernel cannot
+/// build panics the tuner instead of timing (gfx1151's 384→96 probe
+/// geometry, split 4 at a depth of 32 handed a depth-64 twin of 54 trips).
+#[test_case(sm86(); "sm86")]
+#[test_case(gfx1151(); "gfx1151")]
+fn a_split_convolutions_twins_divide_its_trips(target: Target) {
+    let planner = planner(target);
+    let geometries = [([80, 80], 384, 96), ([40, 40], 768, 96), ([80, 80], 64, 64), ([20, 20], 192, 192)];
+    let mut checked = 0;
+    for (hw, cin, cout) in geometries {
+        let g = geom(hw, cin, cout, 3, 1, 1, 1);
+        let ranked: Vec<ConvCfg> = planner.conv_ranked(1, hw[0] * hw[1], &g).to_vec();
+        for &cfg in &ranked {
+            for split in [2, 3, 4, 6, 9] {
+                if !(g.k() / cfg.gemm.tile[2]).is_multiple_of(split) {
+                    continue;
+                }
+                let winner = ConvCfg { split, ..cfg };
+                for twin in winner.twins(&ranked) {
+                    let trips = g.k() / twin.gemm.tile[2];
+                    assert!(trips.is_multiple_of(split), "{g:?} {winner:?} -> {twin:?}: {trips} trips");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 100, "{checked} twins checked");
 }
 
 /// A planner whose device left a field unmeasured (zero) ranks on: the
