@@ -183,7 +183,8 @@ fn no_register_count_admits() {
 fn pipelined(costs: Costs, [rounds, trips, actual, waves, stages]: [usize; 5], work: f64) -> f64 {
     let planner = Planner::new(Device { target: sm86(), costs });
     let (blocks, smem) = (rounds * actual * planner.sms(), sm86().smem_bytes / actual);
-    planner.pipelined(Run { blocks, smem, regs: 0, waves, trips, work, fill: 0.0, trip: 0.0, stages })
+    let run = Run { blocks, smem, regs: 0, waves, atoms: 1, trips, reads: 0.0, work, fill: 0.0, trip: 0.0, stages };
+    planner.pipelined(run)
 }
 
 /// The busiest SM issues `⌈blocks / sms⌉` blocks' work, not whole rounds of
@@ -198,7 +199,9 @@ fn an_sm_issues_its_share_of_blocks() {
         smem: sm86().smem_bytes / 4,
         regs: 0,
         waves: 4,
+        atoms: 1,
         trips: 1,
+        reads: 0.0,
         work: 100.0,
         fill: 0.0,
         trip: 0.0,
@@ -217,17 +220,29 @@ fn a_trip_overhead_is_shared_by_resident_blocks(resident: usize) {
     let planner = Planner::new(Device { target: sm86(), costs: flat });
     let blocks = resident * planner.sms();
     let smem = sm86().smem_bytes / resident;
-    let run = |work, trip| Run { blocks, smem, regs: 0, waves: 4, trips: 1, work, fill: 0.0, trip, stages: 2 };
+    let run = |work, trip| Run {
+        blocks,
+        smem,
+        regs: 0,
+        waves: 4,
+        atoms: 1,
+        trips: 1,
+        reads: 0.0,
+        work,
+        fill: 0.0,
+        trip,
+        stages: 2,
+    };
     let base = planner.pipelined(run(100.0, 0.0));
     assert_eq!(planner.pipelined(run(100.0, 40.0)) - base, 40.0);
 }
 
 /// A SIMD holding fewer waves than hide a matrix-core chain (`step_lone /
-/// step` of them) runs their issue work that many times slower, the fill
-/// streaming on meanwhile: a block of one wave per SIMD alone on its SM pays
-/// the whole ratio on its work and nothing on its fill, four blocks of them
-/// at once pay nothing, and a device whose lone step costs its throughput
-/// step (or has none measured) hides nothing to pay for.
+/// step` of them) runs their steps that many times slower, the fill and the
+/// reads never: a block of one wave per SIMD alone on its SM pays the whole
+/// ratio on its steps and nothing on its fill, four blocks of them at once
+/// pay nothing, and a device whose lone step costs its throughput step (or
+/// has none measured) hides nothing to pay for.
 #[test]
 fn a_lone_wave_pays_its_chain() {
     let flat = |step_lone| Costs { latency: 0.0, step: 5.0, step_lone, ..costs() };
@@ -235,7 +250,9 @@ fn a_lone_wave_pays_its_chain() {
     let cost = |step_lone, resident, work, fill| {
         let planner = Planner::new(Device { target: sm86(), costs: flat(step_lone) });
         let (blocks, smem) = (resident * planner.sms(), sm86().smem_bytes / resident);
-        planner.pipelined(Run { blocks, smem, regs: 0, waves, trips: 1, work, fill, trip: 0.0, stages: 2 })
+        let run =
+            Run { blocks, smem, regs: 0, waves, atoms: 1, trips: 1, reads: 0.0, work, fill, trip: 0.0, stages: 2 };
+        planner.pipelined(run)
     };
     assert_eq!(cost(15.0, 1, 100.0, 0.0), 300.0);
     assert_eq!(cost(15.0, 1, 100.0, 50.0), 350.0);
@@ -244,11 +261,75 @@ fn a_lone_wave_pays_its_chain() {
     assert_eq!(cost(0.0, 1, 100.0, 0.0), 100.0);
 }
 
+/// A wave's independent accumulators hide a matrix-core chain as other
+/// waves do: alone on its SIMD with one accumulator a wave pays the whole
+/// ratio on its steps, with as many as the ratio nothing; its reads never
+/// pay it.
+#[test]
+fn independent_accumulators_hide_the_chain() {
+    let flat = Costs { latency: 0.0, step: 5.0, step_lone: 15.0, ..costs() };
+    let planner = Planner::new(Device { target: sm86(), costs: flat });
+    let (waves, smem) = (sm86().occupancy.simds as usize, sm86().smem_bytes);
+    let cost = |atoms, work, reads| {
+        let blocks = planner.sms();
+        let run = Run { blocks, smem, regs: 0, waves, atoms, trips: 1, reads, work, fill: 0.0, trip: 0.0, stages: 2 };
+        planner.pipelined(run)
+    };
+    assert_eq!(cost(1, 100.0, 0.0), 300.0);
+    assert_eq!(cost(3, 100.0, 0.0), 100.0);
+    assert_eq!(cost(1, 0.0, 100.0), 100.0);
+}
+
+/// A trip's pipes overlap across the waves a SIMD holds: a block of one
+/// wave per SIMD pays its reads, steps and fill in full, one of four per
+/// SIMD the longest and a quarter of the rest, one of eight no less (four
+/// waves overlap all there is), and the blocks an SM holds at once pool
+/// their waves, so four one-per-SIMD blocks pay as the four-per-SIMD block
+/// does, four times over.
+#[test]
+fn pipes_overlap_across_the_waves_a_simd_holds() {
+    let flat = Costs { latency: 0.0, step_lone: costs().step, ..costs() };
+    let planner = Planner::new(Device { target: sm86(), costs: flat });
+    let simds = sm86().occupancy.simds as usize;
+    let cost = |resident: usize, waves: usize| {
+        let (blocks, smem) = (resident * planner.sms(), sm86().smem_bytes / resident);
+        let run = Run {
+            blocks,
+            smem,
+            regs: 0,
+            waves,
+            atoms: 1,
+            trips: 1,
+            reads: 40.0,
+            work: 100.0,
+            fill: 60.0,
+            trip: 0.0,
+            stages: 2,
+        };
+        planner.pipelined(run)
+    };
+    assert_eq!(cost(1, simds), 200.0);
+    assert_eq!(cost(1, 4 * simds), 125.0);
+    assert_eq!(cost(1, 8 * simds), 125.0);
+    assert_eq!(cost(4, simds), 4.0 * 125.0);
+}
+
+/// Every round of every trip pays the latency its ring leaves on top of
+/// its issue; a deeper ring leaves less.
+#[test]
+fn a_round_pays_the_latency_its_ring_leaves() {
+    let c = Costs { step_lone: costs().step, ..costs() };
+    assert_eq!(pipelined(c, [1, 1, 1, 4, 2], 100.0), 100.0 + c.latency);
+    assert_eq!(pipelined(c, [1, 1, 1, 4, 3], 100.0), 100.0 + c.latency / 2.0);
+    assert_eq!(pipelined(c, [2, 3, 1, 4, 2], 100.0), 3.0 * 2.0 * (100.0 + c.latency));
+}
+
 /// The 64×64 tile that ran 54 µs on four warps and 78 on one (measured on
-/// sm_86 at 4096³; here a grid of one block per SM, so one block's waves
-/// share each SIMD): the one-warp grid pays the chain its four warps hide,
-/// and the ranking has the four above it by more than it had without a
-/// lone step.
+/// sm_86 at 4096³; here a grid of one block per SM): the one-warp grid
+/// leaves three schedulers idle and exposes every pipe, so the ranking has
+/// the four above it; a warp of that tile holds more independent
+/// accumulators than hide the chain, so a lone step dearer than the step
+/// changes nothing.
 #[test]
 fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
     let cfg = |warps| GemmCfg { tile: [64, 64, 32], stages: 3, warps, group_m: 8, unroll: false };
@@ -259,13 +340,14 @@ fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
         cost(cfg([1, 1])) / cost(cfg([2, 2]))
     };
     let (flat, lone) = (ratio(costs().step), ratio(costs().step_lone));
-    assert!(lone > flat && lone > 1.0, "one warp over four: {lone} with a lone step, {flat} without");
+    assert!(flat > 1.0 && lone == flat, "one warp over four: {lone} with a lone step, {flat} without");
 }
 
 /// An attention fill's byte is priced as a GEMM's: the keys and values of
 /// every tile are the distinct bytes, and where they fit the cache the query
 /// blocks of a tile re-read them from it, so a cached cost is below the
-/// DRAM one; a cache too small for them prices every byte as DRAM.
+/// DRAM one; a cache too small for them still serves the query blocks in
+/// flight at once, which share a tile's keys, so the cost sits between.
 #[test]
 fn an_attention_fill_is_priced_by_where_it_comes_from() {
     let a = config::Attention { tiles: 32, t: 2048, tk: 2048, d: 64, causal: false };
@@ -277,7 +359,7 @@ fn an_attention_fill_is_priced_by_where_it_comes_from() {
     };
     let (dram, cached, small) = (cost(0.0), cost(4.0 * unique), cost(unique / 4.0));
     assert!(cached < dram, "{cached} cached, {dram} from DRAM");
-    assert_eq!(small, dram);
+    assert!(cached <= small && small < dram, "{small} under a small cache");
 }
 
 /// A fill's byte is DRAM's where no cache was measured or the distinct
@@ -291,15 +373,35 @@ fn a_fill_is_priced_by_where_its_bytes_come_from() {
         Planner::new(Device { target: sm86(), costs: c })
     };
     let (none, cached) = (with(0.0), with(4.0 * mb));
-    assert_eq!(none.fill_byte(mb, 100.0 * mb), 0.08);
+    assert_eq!(none.fill_byte(mb, 100.0 * mb, 0.0), 0.08);
     // 1 MB read 100 times over: one byte in a hundred from DRAM.
-    assert!((cached.fill_byte(mb, 100.0 * mb) - (0.01 * 0.99 + 0.08 * 0.01)).abs() < 1e-12);
+    assert!((cached.fill_byte(mb, 100.0 * mb, 0.0) - (0.01 * 0.99 + 0.08 * 0.01)).abs() < 1e-12);
     // Past 1.5 × 3 MB every byte comes from DRAM.
-    assert_eq!(cached.fill_byte(5.0 * mb, 100.0 * mb), 0.08);
-    let edge: Vec<f64> = [2.0, 3.0, 3.5, 4.0, 4.5].iter().map(|&u| cached.fill_byte(u * mb, 100.0 * mb)).collect();
+    assert_eq!(cached.fill_byte(5.0 * mb, 100.0 * mb, 0.0), 0.08);
+    let edge: Vec<f64> = [2.0, 3.0, 3.5, 4.0, 4.5].iter().map(|&u| cached.fill_byte(u * mb, 100.0 * mb, 0.0)).collect();
     assert!(edge.windows(2).all(|w| w[0] <= w[1]), "{edge:?}");
     // A fill that reads each byte once pays DRAM whatever the cache.
-    assert_eq!(cached.fill_byte(mb, mb), 0.08);
+    assert_eq!(cached.fill_byte(mb, mb, 0.0), 0.08);
+}
+
+/// Where the whole operands overflow the cache, the blocks in flight at
+/// once still re-read one another's lines: that share is priced from the
+/// cache, a fill shared by nothing stays at DRAM, and the share never
+/// lowers a fill the cache already serves. A 4096³ GEMM on sm_86 (its
+/// operands twenty times its L2) is so priced nearer the cache than DRAM.
+#[test]
+fn blocks_in_flight_share_their_lines_past_the_cache() {
+    let mb = (1 << 20) as f64;
+    let c = Costs { global_byte: 0.08, l2_byte: 0.01, l2_bytes: 4.0 * mb, ..costs() };
+    let planner = Planner::new(Device { target: sm86(), costs: c });
+    assert_eq!(planner.fill_byte(100.0 * mb, 1e4 * mb, 0.0), 0.08);
+    assert!((planner.fill_byte(100.0 * mb, 1e4 * mb, 0.75) - (0.75 * 0.01 + 0.25 * 0.08)).abs() < 1e-12);
+    assert_eq!(planner.fill_byte(mb, 100.0 * mb, 0.5), planner.fill_byte(mb, 100.0 * mb, 0.0));
+    let p = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
+    let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
+    let dram = Planner::new(Device { target: sm86(), costs: Costs { l2_bytes: 0.0, ..c } });
+    let (cached, at_dram) = (p.admit(&planner, &cfg).unwrap().0, p.admit(&dram, &cfg).unwrap().0);
+    assert!(cached < 0.75 * at_dram, "{cached} cached, {at_dram} from DRAM");
 }
 
 /// The ranking's front spreads over the band's block tiles: a block tile's
@@ -375,7 +477,8 @@ fn under_latency_resident_blocks_halve_the_cost() {
     let full = sm86();
     let starved = Target { occupancy: crate::atoms::Occupancy { waves: 2, ..full.occupancy }, ..sm86() };
     let cost = |target: Target| p.admit(&Planner::new(Device { target, costs: slow }), &cfg).expect("admitted").0;
-    assert_eq!(2.0 * cost(full), cost(starved));
+    let (starved, full) = (cost(starved), cost(full));
+    assert!((starved / full - 2.0).abs() < 1e-3, "{starved} starved, {full} full");
     assert!(pipelined(slow, [1, 1, 1, 4, 3], 1.0) < pipelined(slow, [1, 1, 1, 4, 2], 1.0));
 }
 

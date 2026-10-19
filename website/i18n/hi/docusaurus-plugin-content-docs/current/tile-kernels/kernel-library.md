@@ -39,18 +39,22 @@ Op layer कोई tile table नहीं रखती। `config::Planner::gem
 rows और 48–256 columns के output tiles, `bk` 16–64, नौ warp grids, वे ring depths जो target का prefetch
 चलाता है, rolled और unrolled), वही रखता है जिसे lowering चला सके (atoms warp grid को tile करते हैं, fills
 हर thread पर पूरे 16-byte chunks में बँटते हैं, ring shared memory में समाती है) और बाक़ी को device की मापी
-गई `Costs` से SM time के nanoseconds में rank करता है। एक block का trip `work` करता है: हर wave के operand
-fragments shared memory से पढ़े जाते हैं, fill stream होकर आता है, matrix-core steps और trip की fixed cost।
-सबसे व्यस्त SM `per_sm = ⌈blocks / sms⌉` blocks का काम issue करता है, एक के ख़त्म होते ही अगला उठाते हुए,
-और trip की fixed cost उन blocks में बँटती है जो वह एक साथ रखता है (`resident`, shared memory और register
-estimate से); उन blocks का एक round कम से कम एक wave का अपना issue है (जिस block में SM के SIMDs से कम waves
-हैं वह बाक़ी को idle छोड़ता है) और वह memory latency जिसे एक pipeline stage आगे छिपा नहीं सकता:
-`cost = trips × max(per_sm × (work + trip / resident), rounds × max(simds × (work + trip) / waves, latency / (stages − 1)))`
-जहाँ `rounds = ⌈per_sm / resident⌉` (`Planner::pipelined`); जो SIMD `step_lone / step` से कम waves रखता है
-(उतनी waves matrix-core chain की latency छिपाती हैं), वह उनका issue `work` उतने गुना धीमा चलाता है, fill इस बीच
-stream होती रहती है। Fill का byte इस हिसाब से priced है कि वह कहाँ से
-आता है: distinct bytes cache के तीन-चौथाई में समाएँ तो L2 दर, उससे डेढ़ गुना से ज़्यादा हों तो DRAM दर, बीच में
-दोनों का मिश्रण (`Planner::fill_byte`)। Wave वाले bound के बिना gfx1151 की ranking one-warp 256×256 tiles से
+गई `Costs` से SM time के nanoseconds में rank करता है। एक block का trip तीन pipes से issue होता है: हर wave के
+operand fragments जो shared memory से पढ़े जाते हैं, matrix-core steps और stream होकर आती fill, साथ में trip
+की fixed cost। ये pipes उन waves के बीच overlap होती हैं जो एक SIMD रखता है: सबसे लंबी पूरी चुकाई जाती है,
+बाक़ी हर SIMD की waves पर एक का हिस्सा, ज़्यादा से ज़्यादा चार तक (`OVERLAP_WAVES`: gfx1201 और sm_86 पर हर
+SIMD की सोलह waves एक tile को चार से बेहतर नहीं चलातीं)। जो SIMD `step_lone / step` से कम waves रखता है
+(उतनी waves matrix-core chain की latency छिपाती हैं), वह steps उतने गुना धीमा चलाता है, और एक wave के
+independent accumulators waves की तरह गिने जाते हैं। सबसे व्यस्त SM `per_sm = ⌈blocks / sms⌉` blocks का
+काम issue करता है, एक के ख़त्म होते ही अगला उठाते हुए, और trip की fixed cost उन blocks में बँटती है जो वह एक
+साथ रखता है (`resident`, shared memory और register estimate से); उन blocks का एक round कम से कम एक wave का
+अपना issue है (जिस block में SM के SIMDs से कम waves हैं वह बाक़ी को idle छोड़ता है), और हर round अपने issue के
+ऊपर वह memory latency चुकाता है जिसे एक pipeline stage आगे छिपा नहीं सकता:
+`cost = trips × (max(per_sm × (body + trip / resident), rounds × simds × (body + trip) / waves) + rounds × latency / (stages − 1))`
+जहाँ `rounds = ⌈per_sm / resident⌉` और `body` overlap की हुई pipes हैं (`Planner::pipelined`)। Fill का byte
+इस हिसाब से priced है कि वह कहाँ से आता है: distinct bytes cache के तीन-चौथाई में समाएँ तो L2 दर, उससे डेढ़
+गुना से ज़्यादा हों तो DRAM दर, बीच में दोनों का मिश्रण, और कभी उस हिस्से से महँगा नहीं जिसे एक साथ चल रहे
+blocks एक-दूसरे की lines से दोबारा पढ़ते हैं — अपने group की A rows और अपनी B columns (`Planner::fill_byte`)। Wave वाले bound के बिना gfx1151 की ranking one-warp 256×256 tiles से
 शुरू होती थी जो
 1–3 TFLOP/s पर चलते थे। Layout की register count सिर्फ़ अनुमान लगाती है कि कितने blocks resident हैं; यह
 कुछ भी admit नहीं करती, क्योंकि जहाँ fragments replicate होते हैं (gfx11 WMMA) वहाँ यह ज़्यादा गिनती है।
