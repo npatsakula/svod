@@ -96,6 +96,25 @@ impl Tensor {
         Self::with_entry(entry)
     }
 
+    /// [`Tensor::empty_dynamic`] whose storage is of class `spec` on the
+    /// default device, bound now and allocated when a plan first runs over
+    /// it. With `cpu_access: false` it is device-local: the host reads it
+    /// through `copyout` (`as_vec`), never a mapping (`array_view`).
+    #[track_caller]
+    pub fn empty_dynamic_spec(shape: &[SInt], dtype: DType, spec: svod_device::BufferSpec) -> Result<Self> {
+        let numel: usize = shape.iter().map(crate::sint_vmax).product();
+        if numel == 0 {
+            return Ok(Self::empty_dynamic(shape, dtype));
+        }
+        let device = svod_dtype::default_device::default_device();
+        let allocator = registry::registry().get(&device).context(DeviceSnafu)?;
+        let buffer_uop = UOp::new_buffer(device, numel, dtype.clone());
+        let buffer_uop_id = buffer_uop.id;
+        let uop = buffer_uop.try_reshape(&Shape::from_iter(shape.iter().cloned())).context(UOpSnafu)?;
+        let buffer = Arc::new(Buffer::new(allocator, dtype, vec![numel], spec));
+        Ok(Self::with_entry(tensor_registry::register_tensor_with_buffer(uop, buffer, buffer_uop_id)))
+    }
+
     /// Weight-loading constructor: weights with the same checkpoint
     /// provenance share ONE immutable device storage across model instances
     /// (see [`crate::weight_cache`]). The tensor still gets its own BUFFER
