@@ -427,16 +427,16 @@ impl Tiled for ConvCfg {
 }
 
 /// The blocks, the splits and the softmax forms: a forms pair is two tiles.
-/// A tile is its query and key block sizes and its key warps: a different
-/// number of key warps is a different kernel structure, not a pipeline of
-/// the same one.
+/// A tile is its query and key block sizes, its key warps and its rows per
+/// warp: a different number of either is a different kernel structure, not
+/// a pipeline of the same one.
 impl Tiled for FaCfg {
     fn tile(&self) -> Self {
         FaCfg { stages: 0, unroll: false, ..*self }
     }
 
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
-        let block = |c: &FaCfg| (c.bq, c.bkv, c.key_warps);
+        let block = |c: &FaCfg| (c.bq, c.bkv, c.key_warps, c.warp_rows);
         ranked
             .iter()
             .filter(|c| block(c) == block(self))
@@ -737,16 +737,19 @@ impl Planner {
 
 impl FaCfg {
     /// Whether the config lowers on `target` for head size `d`: the atom's M
-    /// is the kernel's [`WARP_ROWS`] (one warp per that many query rows),
-    /// both products tile the atoms, and the K and V fills (and the bias
-    /// tile's under a bias) split into whole 16-byte chunks per thread.
+    /// is the kernel's [`WARP_ROWS`], a warp owns whole atom rows of queries
+    /// and the block whole warps, both products tile the atoms, and the K
+    /// and V fills (and the bias tile's under a bias) split into whole
+    /// 16-byte chunks per thread.
     pub fn fits(&self, target: &Target, d: usize, bias: bool) -> bool {
         let Some(atom) = target.mma.first() else { return false };
-        let (bq, bkv) = (self.bq, self.bkv);
+        let (bq, bkv, rows) = (self.bq, self.bkv, self.warp_rows);
         // Key warps fill their own tiles alone.
         let threads = self.row_warps() as usize * target.wave as usize;
         atom.m as usize == WARP_ROWS
-            && bq.is_multiple_of(WARP_ROWS)
+            && rows.is_multiple_of(WARP_ROWS)
+            && rows > 0
+            && bq.is_multiple_of(rows)
             && bq > 0
             // A key warp's merged output reuses its 16-bit key ring as f32.
             && (self.key_warps == 1 || bq == WARP_ROWS && self.stages * bkv >= 2 * WARP_ROWS)
@@ -782,6 +785,14 @@ impl FaCfg {
         let (q, o) = (half(qk.a.regs()), pv.c.regs());
         let (k, s, p, v) = (half(qk.b.regs()), qk.c.regs(), half(pv.a.regs()), half(pv.b.regs()));
         Some(q + o + k + s + p + v + fill)
+    }
+
+    /// Of [`Self::registers`], the f32 output accumulator a lane carries
+    /// across the key loop: what a matrix core with a file of its own
+    /// (CDNA's AGPRs) may hold beside the rest.
+    pub fn accumulators(&self, target: &Target, d: usize) -> Option<u32> {
+        let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
+        Some(target.mma.first()?.issue(Orient::Direct, grid, self.bq, d, self.bkv).ok()?.c.regs())
     }
 }
 
@@ -820,7 +831,9 @@ impl Attention {
     /// trips, every trip of theirs the block's whole work at once. The query
     /// blocks in flight at once share their tiles' keys and values whatever
     /// the cache holds of the whole; a wave's independent accumulators are
-    /// the narrower product's.
+    /// the narrower product's, over every atom row the warp owns. A warp
+    /// owning more rows reads each fragment for all of them: the fragment
+    /// reads are per wave, so they divide by the rows per warp.
     pub(crate) fn admit(&self, planner: &Planner, cfg: &FaCfg) -> Option<(f64, u32)> {
         let Device { target, costs } = &planner.device;
         let (bq, bkv, d, kw) = (cfg.bq, cfg.bkv, self.d, cfg.key_warps);
@@ -829,8 +842,15 @@ impl Attention {
             return None;
         }
         let regs = cfg.registers(target, d, self.bias)?;
+        // Where the accumulators have a file of their own, the output's are
+        // priced against it and the rest against the vector registers.
+        let acc = cfg.accumulators(target, d)?;
+        if target.occupancy.acc_file > 0 && !target.occupancy.holds(acc, regs - acc) {
+            return None;
+        }
         let waves = cfg.warps() as usize;
-        let atoms = bkv.min(d) / target.mma.first()?.n as usize;
+        let atom = target.mma.first()?;
+        let atoms = (cfg.warp_rows / atom.m as usize) * (bkv.min(d) / atom.n as usize);
         let bias = usize::from(self.bias) * kw * bq * bkv * 2;
         let fragments = 2 * waves * bkv * d * 2 + bias;
         let fill = kw * 2 * bkv * d * 2 + bias;
@@ -852,8 +872,9 @@ impl Attention {
 
     /// The lattice's configs that run this problem on the planner's target,
     /// cheapest first, then by fewer registers, every pipeline of every query
-    /// and key block size, in the plain softmax forms (the tuner sets the
-    /// others); the shortlist keeps a tile's first clean one.
+    /// and key block size at one or two atom rows per warp, in the plain
+    /// softmax forms (the tuner sets the others); the shortlist keeps a
+    /// tile's first clean one.
     pub fn ranked(&self, planner: &Planner) -> Vec<FaCfg> {
         let stages: &[usize] = if planner.device.target.cp_async { &[3, 2] } else { &[2] };
         let mut ranked: Vec<(f64, u32, FaCfg)> = vec![];
@@ -863,10 +884,14 @@ impl Attention {
             for bkv in [16, 32, 64, 128] {
                 for &stages in stages {
                     for unroll in [false, true] {
-                        for &key_warps in key_warps {
-                            let cfg = FaCfg { unroll, key_warps, ..FaCfg::new(bq, bkv, stages) };
-                            if let Some((cost, regs)) = self.admit(planner, &cfg) {
-                                ranked.push((cost, regs, cfg));
+                        for warp_rows in [WARP_ROWS, 2 * WARP_ROWS] {
+                            // Key warps share a block of one row warp.
+                            let key_warps = if warp_rows == WARP_ROWS { key_warps } else { &[1][..] };
+                            for &key_warps in key_warps {
+                                let cfg = FaCfg { unroll, key_warps, warp_rows, ..FaCfg::new(bq, bkv, stages) };
+                                if let Some((cost, regs)) = self.admit(planner, &cfg) {
+                                    ranked.push((cost, regs, cfg));
+                                }
                             }
                         }
                     }

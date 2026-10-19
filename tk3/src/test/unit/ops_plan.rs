@@ -1029,8 +1029,9 @@ fn attention_list(d: usize, smem: usize) -> (Target, Arc<[FaCfg]>) {
     (target, list)
 }
 
-/// The ranking spans query and key block sizes within shared memory, each
-/// config once, its untested shortlist one pipeline per tile. The score
+/// The ranking spans query and key block sizes within shared memory at one
+/// or two atom rows per warp, each config once, its untested shortlist one
+/// pipeline per tile (a tile's rows per warp are part of it). The score
 /// tile needs no scratch there: the `mma.sync` accumulator is its A operand.
 #[test_case(64, 99 << 10; "d 64")]
 #[test_case(128, 99 << 10; "d 128")]
@@ -1046,8 +1047,10 @@ fn attention_candidates(d: usize, smem: usize) {
     let short = first_eight(&list);
     assert!(short.len() >= 4, "{short:?}");
     for (i, c) in short.iter().enumerate() {
-        assert!(!short[..i].iter().any(|o| (o.bq, o.bkv) == (c.bq, c.bkv)), "one pipeline per tile: {short:?}");
+        let tile = |c: &FaCfg| (c.bq, c.bkv, c.warp_rows);
+        assert!(!short[..i].iter().any(|o| tile(o) == tile(c)), "one pipeline per tile: {short:?}");
     }
+    assert!(list.iter().any(|c| c.warp_rows == 32) && list.iter().any(|c| c.warp_rows == 16), "{list:?}");
 }
 
 /// A warp past the queries adds the work of its padded rows. Where the

@@ -37,7 +37,7 @@ score का softmax काम, एक trip, एक lane move, एक shared rou
 | CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix`; shared descriptors पर `wgmma` m64nNk16 (GEMM) | `cp.async`, 227 KB तक shared | हाँ | H100 PCIe पर मापा गया: GEMM 4096³ bf16 warpgroup core पर 433 TFLOP/s (`mma.sync` पर 234; cuBLASLt 524) |
 | AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, हर lane में 8 values | register-staged, 1–2 stages | हाँ | RX 9070 XT (gfx1201) पर मापा गया: GEMM 4096³ bf16 148 TFLOP/s (rocBLAS 80), attention d64 117 |
 | AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 1–2 stages | हाँ | Strix Halo (gfx1151) पर मापा गया: GEMM 4096³ bf16 28 TFLOP/s (rocBLAS 32.5), attention d64 28; gfx1100–1102 compile हुए, चलाए नहीं गए |
-| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages, two crews | हाँ | MI300X (gfx942) पर मापा गया: GEMM 4096³ bf16 एक-slot ring पर दो crews के साथ 555 TFLOP/s (hipBLASLt 615), attention d64 257, d128 292; gfx950 compile हुआ, चलाया नहीं गया |
+| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages, two crews | हाँ | MI300X (gfx942) पर मापा गया: GEMM 4096³ bf16 एक-slot ring पर दो crews के साथ 555 TFLOP/s (hipBLASLt 615), attention d64 282, d128 343 (हर wave में 32 query rows); gfx950 compile हुआ, चलाया नहीं गया |
 | Apple | simdgroup 8×8×8 | कोई नहीं | नहीं | सिर्फ़ atoms |
 
 `ops::supported(device)` वहीं true है जहाँ config tables हैं; किसी और device पर हर op अपना

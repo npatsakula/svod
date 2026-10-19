@@ -10,7 +10,7 @@ use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 
 /// A flash-attention config.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FaCfg {
     pub bq: usize,
     pub bkv: usize,
@@ -28,6 +28,27 @@ pub struct FaCfg {
     /// a single wave waiting on every key block's load in turn; this many
     /// loads are in flight instead. `1` leaves the keys to one warp.
     pub key_warps: usize,
+    /// Query rows a warp owns: [`WARP_ROWS`] (one atom row) or twice that,
+    /// where every key and value fragment the warp reads from the ring
+    /// feeds two atom rows of products at the price of twice the score and
+    /// output accumulators per lane.
+    pub warp_rows: usize,
+}
+
+/// The tune store keys by this text: a config of one atom row per warp
+/// prints as it did before the field existed, so its stored choices still
+/// apply.
+impl std::fmt::Debug for FaCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("FaCfg");
+        s.field("bq", &self.bq).field("bkv", &self.bkv).field("stages", &self.stages);
+        s.field("splits", &self.splits).field("unroll", &self.unroll).field("forms", &self.forms);
+        s.field("key_warps", &self.key_warps);
+        if self.warp_rows != WARP_ROWS {
+            s.field("warp_rows", &self.warp_rows);
+        }
+        s.finish()
+    }
 }
 
 /// The softmax forms: all off as planned; the tuner flips each where it
@@ -61,9 +82,10 @@ pub struct Forms {
     pub bias_direct: bool,
 }
 
-/// Query rows per warp: the M of every matrix core's atom, so a row's scores
-/// and its reductions stay within the warp. The planner refuses a core
-/// whose atom differs ([`FaCfg::fits`](Self::fits)).
+/// The fewest query rows per warp: the M of every matrix core's atom, so a
+/// row's scores and its reductions stay within the warp. A warp may own a
+/// multiple ([`FaCfg::warp_rows`]); the planner refuses a core whose atom
+/// differs ([`FaCfg::fits`](FaCfg::fits)).
 pub const WARP_ROWS: usize = 16;
 
 impl FaCfg {
@@ -82,12 +104,14 @@ impl FaCfg {
                 bias_direct: false,
             },
             key_warps: 1,
+            warp_rows: WARP_ROWS,
         }
     }
 
-    /// One warp per [`WARP_ROWS`] query rows: the warps a tile is spread over.
+    /// One warp per [`warp_rows`](Self::warp_rows) query rows: the warps a
+    /// tile is spread over.
     pub fn row_warps(&self) -> u32 {
-        (self.bq / WARP_ROWS) as u32
+        (self.bq / self.warp_rows) as u32
     }
 
     /// The block's warps: the row warps, each split [`key_warps`](Self::key_warps) ways.

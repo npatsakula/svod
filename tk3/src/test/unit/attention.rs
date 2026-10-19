@@ -12,7 +12,7 @@ use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::attention::{
-    AttnMask, AttnSpec, Bias, Cache, Chunk, CombineSpec, FaCfg, Forms, attention, combine, key_mask_stride,
+    AttnMask, AttnSpec, Bias, Cache, Chunk, CombineSpec, FaCfg, Forms, WARP_ROWS, attention, combine, key_mask_stride,
 };
 use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch;
@@ -296,6 +296,11 @@ const fn key_warps(kw: usize, bkv: usize) -> FaCfg {
     FaCfg { key_warps: kw, ..FaCfg::new(16, bkv, 2) }
 }
 
+/// Two atom rows of queries per warp, `bq` by `bkv`, in the plain forms.
+const fn rows32(bq: usize, bkv: usize) -> FaCfg {
+    FaCfg { warp_rows: 2 * WARP_ROWS, ..FaCfg::new(bq, bkv, 2) }
+}
+
 /// A scale of the caller's choosing, in place of `1/√d`.
 fn scaled(mut spec: AttnSpec, scale: f32) -> AttnSpec {
     spec.scale = scale;
@@ -337,6 +342,11 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(with(key_warps(4, 16), spec(16, 16, 64, 16, 16, false, true)), &[16, 0]; "four key warps, a lane with no keys")]
 #[test_case(with(FaCfg { forms: RAW_MAX.forms, ..key_warps(4, 16) }, spec(16, 200, 128, 16, 16, false, true)), &[200, 130]; "four key warps, d 128, the RDNA prefill forms")]
 #[test_case(with(key_warps(4, 16), masked(16, 128, 64, 16, 16, PER_BATCH)), &[128, 128]; "four key warps, bias per batch")]
+#[test_case(with(rows32(64, 32), spec(100, 150, 64, 64, 32, false, true)), &[150, 77]; "two atom rows a warp, plain")]
+#[test_case(with(rows32(64, 32), spec(100, 150, 128, 64, 32, true, true)), &[150, 77]; "two atom rows a warp, causal, d 128")]
+#[test_case(with(rows32(128, 64), masked(100, 150, 64, 128, 64, AttnMask { key_lens: true, ..PER_BATCH })), &[150, 77]; "two atom rows a warp, bias")]
+#[test_case(with(rows32(64, 32), masked(100, 150, 64, 64, 32, AttnMask { causal: true, key_lens: true, ..PER_BATCH })), &[150, 77]; "two atom rows a warp, causal bias")]
+#[test_case(with(FaCfg { stages: 1, ..rows32(64, 32) }, spec(100, 150, 64, 64, 32, true, true)), &[150, 77]; "two atom rows a warp, one slot")]
 fn program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     matches_a_direct_softmax(&case(spec, lens));
 }
@@ -671,7 +681,8 @@ fn label(c: &FaCfg) -> String {
         (f.bias_direct, "bias_direct"),
     ];
     let on: Vec<&str> = forms.iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect();
-    format!("bq{} bkv{} s{} unroll={} forms [{}]", c.bq, c.bkv, c.stages, c.unroll, on.join(" "))
+    let rows = if c.warp_rows == WARP_ROWS { String::new() } else { format!(" rows={}", c.warp_rows) };
+    format!("bq{} bkv{} s{}{rows} unroll={} forms [{}]", c.bq, c.bkv, c.stages, c.unroll, on.join(" "))
 }
 
 /// Flash attention throughput at B 4, H 8, T 2048 bf16, causal and plain,

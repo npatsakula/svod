@@ -114,7 +114,9 @@ softmax over an empty row does.
 **Key splits** (`FaCfg::splits > 1`) give a few long rows, such as a decoder step, more blocks.
 Each split writes f32 partials `o_part`, `m_part` and `l_part`, and `combine` merges them.
 
-`FaCfg { bq, bkv, stages, splits, unroll, .. }` uses one warp per 16 query rows. Candidates come
+`FaCfg { bq, bkv, stages, splits, unroll, warp_rows, .. }` uses one warp per `warp_rows` query rows, 16 (one
+atom row) or 32 (a warp's every key and value fragment feeds two atom rows, for twice the
+accumulators per lane). Candidates come
 from the same lattice and cost model as the GEMM's (`Planner::attention_ranked`): query
 blocks of 16–128 rows, key blocks of 16–128 keys, the ring depths the target runs, rolled and
 unrolled, kept to what lowers (the fills split into chunks per thread, the ring fits shared
