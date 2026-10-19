@@ -31,14 +31,6 @@ pub(crate) fn attend(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, key_lens:
     sdpa(q, k, v, causal, key_lens)
 }
 
-/// The sequence multiple the flash-attention kernel tiles, when it can run
-/// `dtype` activations on `device` at all: a caller choosing padded lengths
-/// pads to it there, and only there.
-pub(crate) fn flash_attention_tile(device: &svod_dtype::DeviceSpec, dtype: &svod_dtype::DType) -> Option<usize> {
-    let sixteen_bit = matches!(dtype.base(), ScalarDType::Float16 | ScalarDType::BFloat16);
-    (sixteen_bit && svod_tk::flash_attention_supported(device)).then_some(svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE)
-}
-
 /// [`attend`]'s fallback: SDPA wants head-major `[B, H, T, D]`.
 fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, key_lens: Option<&Tensor>) -> Result<Tensor> {
     let head_major = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]);
