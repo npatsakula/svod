@@ -37,7 +37,7 @@ lowering as `Lowering::costs` (orientation, exchange or round trip) and the op l
 | CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix`; `wgmma` m64nNk16 over shared descriptors (GEMM) | `cp.async`, up to 227 KB shared | yes | Measured on an H100 PCIe: GEMM 4096³ bf16 433 TFLOP/s on the warpgroup core (234 on `mma.sync`; cuBLASLt 524) |
 | AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, 8 values per lane | register-staged, 1–2 stages | yes | Measured on an RX 9070 XT (gfx1201): GEMM 4096³ bf16 148 TFLOP/s (rocBLAS 80), attention d64 117 |
 | AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 1–2 stages | yes | Measured on a Strix Halo (gfx1151): GEMM 4096³ bf16 28 TFLOP/s (rocBLAS 32.5), attention d64 28; gfx1100–1102 compiled, not run |
-| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages | yes | Measured on an MI300X (gfx942): GEMM 4096³ bf16 511 TFLOP/s on a one-slot ring (hipBLASLt 615), attention d64 257, d128 292; gfx950 compiled, not run |
+| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages, two crews | yes | Measured on an MI300X (gfx942): GEMM 4096³ bf16 555 TFLOP/s with two crews over a one-slot ring (hipBLASLt 615), attention d64 257, d128 292; gfx950 compiled, not run |
 | Apple | simdgroup 8×8×8 | none | no | Atoms only |
 
 `ops::supported(device)` is true where config tables exist; on any other device each op builds
@@ -72,7 +72,7 @@ A forked kernel program for one vendor is allowed only as a bounded exception.
 |---|---|
 | Hopper (sm_90a): TMA, mbarrier, warp-specialized template; `wgmma` for attention and its overlap across trips | Not started; the GEMM runs on `wgmma` with each product's chain waited for inside its statement, attention on `mma.sync` |
 | Blackwell (sm_100a): tcgen05, tensor memory | Not started; no B200 access |
-| AMD CDNA: ping-pong template, MFMA 32×32, `buffer_load … lds` | Not started |
+| AMD CDNA: MFMA 32×32, `buffer_load … lds` | Not started |
 | AMD measurements | gfx1201 (RX 9070 XT) measured: GEMM, convolution and attention ahead of tk1 on Qwen3 and YOLO; gfx1151 (Strix Halo) measured: attention at d = 64 and 128; CDNA compiled, not run |
 | Apple | Atoms only; no tables, no emitted kernels |
 | Convolution (implicit GEMM) | Measured on sm_86, where YOLO26 runs on it channels-last (`ops::conv2d`); compiled only for AMD |

@@ -58,6 +58,11 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
     // One slot holds a tile twice as deep in the same shared memory.
     let one_slot = GemmSpec { cfg: config::gemm_cfg([64, 64, 64], 1, [2, 2], false), ..plain.clone() };
     push("gemm one slot", gemm::<BF16>(&one_slot), one_slot.cfg.lowering(&planner.device));
+    if target.crews >= 2 {
+        let cfg = GemmCfg { crews: 2, ..config::gemm_cfg([64, 64, 64], 1, [2, 4], false) };
+        let crews = GemmSpec { cfg, ..plain.clone() };
+        push("gemm two crews", gemm::<BF16>(&crews), cfg.lowering(&planner.device));
+    }
     let swiglu = gemm_spec(70, 64, 64, Epilogue { bias: true, act: Act::Silu, gated: true, ..Epilogue::DEFAULT });
     push("gemm swiglu", gemm::<F16>(&swiglu), swiglu.cfg.lowering(&planner.device));
     let half_step = Epilogue { residual: true, act: Act::Gelu, scale: Some(Scale::new(0.5)), ..Epilogue::DEFAULT };
@@ -328,7 +333,7 @@ pub(super) fn group_families(target: &Target) -> Vec<Launch> {
     tiles
         .into_iter()
         .map(|(tile, warps, stages)| {
-            let cfg = GemmCfg { tile, stages, warps, group_m: 8, unroll: false, core: Core::Group };
+            let cfg = GemmCfg { tile, stages, warps, group_m: 8, unroll: false, core: Core::Group, crews: 1 };
             assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
             let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
             let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };

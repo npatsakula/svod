@@ -90,6 +90,103 @@ fn products_in_flight_preserve_the_result(stages: usize) {
     assert!(matches!(prog.scalar(*started), Scalar::Bin(BinOp::Le, _, iv) if *iv == l.iv));
 }
 
+/// The two-crew expansion keeps the GEMM's result (the interpreter runs the
+/// crews as one, its barriers and priorities no-ops) and leaves no pipeline:
+/// a head trip, the second crew's extra barrier, the steady loop, the first
+/// crew's extra barrier; a trip holds two barriers per product.
+#[test_case(64, 4; "four slices")]
+#[test_case(32, 2; "two slices")]
+fn ping_pong_expansion_preserves_the_result(bk: usize, slices: usize) {
+    let (m, n, k) = (64usize, 64usize, 256usize);
+    let mut prog = super::gemm_nt_crews(m, n, k, [64, 64, bk]);
+    let a: Vec<f64> = (0..m * k).map(|i| round_to(ScalarDType::BFloat16, ((i * 13) % 17) as f64 / 8.0 - 1.0)).collect();
+    let b: Vec<f64> = (0..n * k).map(|i| round_to(ScalarDType::BFloat16, ((i * 7) % 19) as f64 / 8.0 - 1.0)).collect();
+    let want = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[("b", 1)]).unwrap();
+    // As the lowering: a product's shared operands become explicit reads first.
+    crate::lower::materialize_operands(&mut prog, false);
+    expand(&mut prog, Schedule::PingPong { crew: 4 });
+    let got = run(&prog, vec![a, b, vec![0.0; m * n]], &[("b", 1)]).unwrap();
+    assert_eq!(got[2], want[2]);
+    assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
+    assert_eq!(count(&prog, |s| matches!(s, Stmt::Loop(_))), 2, "a head trip and the steady loop");
+    let barriers = count(&prog, |s| matches!(s, Stmt::Sync(Sync::Barrier { .. })));
+    assert_eq!(barriers, 1 + 2 + 2 * slices, "the head's, the stagger pair, two per product");
+    assert_eq!(count(&prog, |s| matches!(s, Stmt::Sync(Sync::Prio { level: 3 }))), slices);
+}
+
+/// A two-crew trip is clusters: the fragment reads of a product (the last
+/// product's a cluster early), a barrier, the product at raised priority, a
+/// barrier; the next step's loads lead the load clusters, each operand's
+/// together (A's in the first, B's in the one before the last), and the
+/// commit, in issue order, sits alone in the last; the stagger barriers are
+/// one `if` before the loop for the second crew and one after it for the
+/// first.
+#[test]
+fn ping_pong_cuts_a_trip_into_clusters() {
+    let mut prog = super::gemm_nt_crews(64, 64, 256, [64, 64, 64]);
+    crate::lower::materialize_operands(&mut prog, false);
+    expand(&mut prog, Schedule::PingPong { crew: 4 });
+    let kind = |s: &Stmt| match s {
+        Stmt::Copy { dst, src, mode: CopyMode::Staged, .. } => match (&prog.value(*src).place, prog.value(*dst).tier())
+        {
+            (Place::Global { param, .. }, Tier::Reg) => ["issue a", "issue b"][param.index()],
+            (_, Tier::Smem) => "commit",
+            (place, tier) => panic!("{place:?} {tier:?}"),
+        },
+        Stmt::Copy { dst, src, mode: CopyMode::Sync, .. } => match (prog.value(*src).tier(), prog.value(*dst).tier()) {
+            (Tier::Smem, Tier::Reg) => "read",
+            tiers => panic!("{tiers:?}"),
+        },
+        Stmt::Let { op: TileOp::Mma { .. }, .. } => "mma",
+        Stmt::Let { .. } => "compute",
+        Stmt::Sync(Sync::Barrier { .. }) => "barrier",
+        Stmt::Sync(Sync::Prio { level: 3 }) => "prio",
+        Stmt::Sync(Sync::Prio { level: 0 }) => "unprio",
+        other => panic!("{other:?}"),
+    };
+    let at = prog.body.0.iter().position(|s| matches!(s, Stmt::Loop(_))).expect("the head trip");
+    let [Stmt::Loop(head), Stmt::If { then: wait, .. }, Stmt::Loop(steady), Stmt::If { then: realign, .. }] =
+        &prog.body.0[at..at + 4]
+    else {
+        panic!("{:?}", prog.body.0.len())
+    };
+    assert_eq!(
+        head.body.0.iter().map(kind).collect::<Vec<_>>(),
+        [["issue a", "issue b"].repeat(4), vec!["commit"; 8], vec!["barrier"]].concat()
+    );
+    assert_eq!((wait.0.len(), realign.0.len()), (1, 1), "one barrier each");
+    assert!(matches!(
+        (&wait.0[0], &realign.0[0]),
+        (Stmt::Sync(Sync::Barrier { .. }), Stmt::Sync(Sync::Barrier { .. }))
+    ));
+    let kinds: Vec<&str> = steady.body.0.iter().map(kind).collect();
+    let cluster = |issues: &[&'static str], reads: usize, commits: usize| -> Vec<&'static str> {
+        [
+            issues.to_vec(),
+            vec!["read"; reads],
+            vec!["commit"; commits],
+            vec!["barrier", "prio", "mma", "unprio", "barrier"],
+        ]
+        .concat()
+    };
+    let want = [cluster(&["issue a"; 4], 2, 0), cluster(&[], 2, 0), cluster(&["issue b"; 4], 4, 0), cluster(&[], 0, 8)]
+        .concat();
+    assert_eq!(kinds, want);
+    // Each commit stores the registers of the load issued in its place.
+    let staged = |want: Tier| -> Vec<ValId> {
+        let regs = steady.body.0.iter().filter_map(|s| match s {
+            Stmt::Copy { dst, src, mode: CopyMode::Staged, .. } if prog.value(*src).tier() == want => {
+                Some(if want == Tier::Global { *dst } else { *src })
+            }
+            _ => None,
+        });
+        regs.collect()
+    };
+    assert_eq!(staged(Tier::Global), staged(Tier::Reg));
+    assert_eq!(steady.unroll, 1);
+    assert_eq!(steady.carried.len(), 1);
+}
+
 /// A copy carries the scope it was recorded in, and the halves register
 /// staging splits it into keep it: inside a `Warps` statement every copy is
 /// one warp's own, outside it the block's.

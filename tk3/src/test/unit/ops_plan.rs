@@ -58,7 +58,7 @@ fn apple() -> Target {
 /// The config measured fastest at 4096³ on the 3060 (25.4 TFLOP/s): the
 /// 128×128 tile and three 32-deep slots over eight warps.
 const BIG_MEASURED: GemmCfg =
-    GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 3, warps: [2, 4], group_m: 8, unroll: false };
+    GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 3, warps: [2, 4], group_m: 8, unroll: false, crews: 1 };
 
 /// A list the planner offers for `k` on `target`: not empty, each config
 /// once, lowering there with its ring in shared memory and dividing `k`;
@@ -232,6 +232,7 @@ fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize) {
         warps: [2, 2],
         group_m: 8,
         unroll: false,
+        crews: 1,
     };
     let one = GemmCfg { stages: 1, ..two };
     let cost = |trip_one: f64, cfg: &GemmCfg| {
@@ -365,7 +366,8 @@ fn a_round_pays_the_latency_its_ring_leaves() {
 /// changes nothing.
 #[test]
 fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
-    let cfg = |warps| GemmCfg { core: Core::Warp, tile: [64, 64, 32], stages: 3, warps, group_m: 8, unroll: false };
+    let cfg =
+        |warps| GemmCfg { core: Core::Warp, tile: [64, 64, 32], stages: 3, warps, group_m: 8, unroll: false, crews: 1 };
     let p = config::Problem { batches: 1, m: 64 * 28, n: 64 * 28, k: 4096, halves: 1 };
     let ratio = |step_lone| {
         let planner = Planner::new(Device { target: sm86(), costs: Costs { step_lone, ..costs() } });
@@ -448,6 +450,7 @@ fn the_ranking_leads_with_a_tile_of_each_block() {
         warps,
         group_m: 8,
         unroll: false,
+        crews: 1,
     };
     let ranked = vec![
         (100.0, cfg([128, 128, 64], [2, 2], 3)),
@@ -520,6 +523,25 @@ fn under_latency_resident_blocks_halve_the_cost() {
     let (starved, full) = (cost(starved), cost(full));
     assert!((starved / full - 2.0).abs() < 1e-3, "{starved} starved, {full} full");
     assert!(pipelined(slow, [1, 1, 1, 4, 3], 1.0) < pipelined(slow, [1, 1, 1, 4, 2], 1.0));
+}
+
+/// A target of two crews ranks two-crew configs beside the uniform ones:
+/// one slot, the two warp rows, k-slices of a product each; a one-crew
+/// target ranks none.
+#[test_case(AmdArch::Gfx942, true; "gfx942 two crews")]
+#[test_case(AmdArch::Gfx1201, false; "gfx1201 one crew")]
+fn two_crews_are_ranked_only_where_the_target_interleaves_them(arch: AmdArch, some: bool) {
+    let target = crate::test::unit::targets::amd(arch, 64);
+    assert_eq!(target.crews >= 2, some);
+    let ranked = planner(target.clone()).gemm_ranked(1, 4096, 4096, 4096, false);
+    let crews: Vec<&GemmCfg> = ranked.iter().filter(|c| c.crews == 2).collect();
+    assert_eq!(!crews.is_empty(), some, "{ranked:?}");
+    assert!(crews.iter().all(|c| c.core == Core::Warp
+        && c.stages == 1
+        && c.warps[0] == 2
+        && !c.unroll
+        && c.tile[2] >= 32
+        && c.fits(&target)));
 }
 
 /// CDNA keeps the f32 accumulators in a file of their own: a 256×256 tile

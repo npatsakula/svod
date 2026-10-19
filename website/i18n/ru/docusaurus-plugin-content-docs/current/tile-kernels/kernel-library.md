@@ -32,7 +32,7 @@ sidebar_label: Библиотека ядер
 | `gated` | `b` имеет форму `[2n, k]`, строки gate над строками up; выход `act(gate)·up` (SwiGLU, GeGLU) |
 | `residual` | `[batch·m, n]`, прибавляется последним |
 
-`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll }`. Строки за `m`
+`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll, core, crews }`. Строки за `m`
 и столбцы за `n` — это view с границами, поэтому `m` и `n` произвольны. `k` обязано быть
 кратным `bk`.
 

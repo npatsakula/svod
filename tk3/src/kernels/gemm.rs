@@ -94,10 +94,16 @@ pub struct GemmCfg {
     pub group_m: usize,
     pub unroll: bool,
     pub core: Core,
+    /// Crews the warp rows form: 1, every warp loading and computing
+    /// together, or 2, the two rows of warps a cluster apart over one slot
+    /// ([`Schedule::PingPong`]), the operands held as k-slices of
+    /// [`KSLICE`] so a product's fragments are read a cluster ahead.
+    pub crews: u32,
 }
 
-/// The tune store keys by this text: a config on the warp-level core prints
-/// as it did before the field existed, so its stored choices still apply.
+/// The tune store keys by this text: a config on the warp-level core and
+/// one crew prints as it did before the fields existed, so its stored
+/// choices still apply.
 impl fmt::Debug for GemmCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("GemmCfg");
@@ -106,16 +112,27 @@ impl fmt::Debug for GemmCfg {
         if self.core != Core::Warp {
             s.field("core", &self.core);
         }
+        if self.crews != 1 {
+            s.field("crews", &self.crews);
+        }
         s.finish()
     }
 }
 
+/// The depth of an operand's k-slices under two crews: one matrix-core
+/// step, so a cluster's reads are one product's fragments.
+pub const KSLICE: usize = 16;
+
 impl GemmCfg {
     pub fn lowering(&self, device: &Device) -> Lowering {
         let grid = WarpGrid { rows: self.warps[0], cols: self.warps[1] };
+        if self.crews == 2 {
+            let schedule = Schedule::PingPong { crew: self.warps[1] };
+            return Lowering { schedule, ..Lowering::uniform(device, false, grid) };
+        }
         let group = self.core == Core::Group;
         let mut lowering = Lowering { group, ..Lowering::uniform(device, self.unroll, grid) };
-        let Schedule::Uniform { async_products, .. } = &mut lowering.schedule;
+        let Schedule::Uniform { async_products, .. } = &mut lowering.schedule else { unreachable!("uniform") };
         *async_products = group && self.stages >= 3;
         lowering
     }
@@ -217,10 +234,10 @@ fn build<T: Elem, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     let sa = Shape::new(bm, bk);
     let accs = if epi.gated {
         let halves = [b_view(&mut k, 0), b_view(&mut k, 1)];
-        mainloop(&mut k, sa, &a_tile, halves, trips / split, stages, bk, first_step).to_vec()
+        mainloop(&mut k, sa, &a_tile, halves, trips / split, stages, bk, first_step, cfg.crews).to_vec()
     } else {
         let whole = [b_view(&mut k, 0)];
-        mainloop(&mut k, sa, &a_tile, whole, trips / split, stages, bk, first_step).to_vec()
+        mainloop(&mut k, sa, &a_tile, whole, trips / split, stages, bk, first_step, cfg.crews).to_vec()
     };
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
     finish::<T, U>(&mut k, accs, epi, bias, residual, c, &bb, &tile);
@@ -305,6 +322,7 @@ impl MergeSpec {
             group_m: 0,
             unroll: false,
             core: Core::Warp,
+            crews: 1,
         }
         .lowering(device)
     }
@@ -364,8 +382,14 @@ fn mainloop<T: Elem, const N: usize>(
     stages: usize,
     bk: usize,
     first_step: Option<Sc>,
+    crews: u32,
 ) -> [Regs<F32>; N] {
     let sb = k.shape(bs[0]);
+    // Under two crews a slot holds each operand as k-slices one after
+    // another, so a slice is a plain view and a product's fragments are one
+    // cluster's reads.
+    let slices = if crews == 2 { bk / KSLICE } else { 1 };
+    let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
     let a_s = k.smem::<T>("a_s", stages * sa.elems());
     let b_s = [(); N].map(|()| k.smem::<T>("b_s", stages * sb.elems()));
     let init = [(); N].map(|()| k.zeros::<F32>(Shape::new(sa.rows, sb.rows)));
@@ -376,23 +400,31 @@ fn mainloop<T: Elem, const N: usize>(
         |k, step, slot| {
             let step = first_step.map_or(step.clone(), |s| s + step);
             let koff = step.clone() * bk;
-            let a_g = a(k, step, koff.clone());
-            let a_t = k.smem_slot::<T>(a_s, slot.clone(), sa);
-            k.stage(a_t, a_g, CopyMode::Async);
-            for (src, alloc) in bs.into_iter().zip(b_s) {
-                let g = k.at(src, 0, koff.clone());
-                let t = k.smem_slot::<T>(alloc, slot.clone(), sb);
-                k.stage(t, g, CopyMode::Async);
+            for s in 0..slices {
+                let kcol = koff.clone() + s * sa_s.cols;
+                let a_g = a(k, step.clone(), kcol.clone());
+                let a_g = k.narrow(a_g, sa_s);
+                let a_t = k.smem_view::<T>(a_s, slot.clone() * sa.elems() + s * sa_s.elems(), sa_s);
+                k.stage(a_t, a_g, CopyMode::Async);
+                for (src, alloc) in bs.into_iter().zip(b_s) {
+                    let g = k.at(src, 0, kcol.clone());
+                    let g = k.narrow(g, sb_s);
+                    let t = k.smem_view::<T>(alloc, slot.clone() * sb.elems() + s * sb_s.elems(), sb_s);
+                    k.stage(t, g, CopyMode::Async);
+                }
             }
         },
-        |k, _step, slot, accs| {
-            let a_t = k.smem_slot::<T>(a_s, slot.clone(), sa);
-            let mut i = 0;
-            accs.map(|acc| {
-                let b_t = k.smem_slot::<T>(b_s[i], slot.clone(), sb);
-                i += 1;
-                k.mma(acc, a_t, false, b_t, true)
-            })
+        |k, _step, slot, mut accs| {
+            for s in 0..slices {
+                let a_t = k.smem_view::<T>(a_s, slot.clone() * sa.elems() + s * sa_s.elems(), sa_s);
+                let mut i = 0;
+                accs = accs.map(|acc| {
+                    let b_t = k.smem_view::<T>(b_s[i], slot.clone() * sb.elems() + s * sb_s.elems(), sb_s);
+                    i += 1;
+                    k.mma(acc, a_t, false, b_t, true)
+                });
+            }
+            accs
         },
     )
 }

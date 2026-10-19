@@ -37,7 +37,7 @@ score का softmax काम, एक trip, एक lane move, एक shared rou
 | CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix`; shared descriptors पर `wgmma` m64nNk16 (GEMM) | `cp.async`, 227 KB तक shared | हाँ | H100 PCIe पर मापा गया: GEMM 4096³ bf16 warpgroup core पर 433 TFLOP/s (`mma.sync` पर 234; cuBLASLt 524) |
 | AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, हर lane में 8 values | register-staged, 1–2 stages | हाँ | RX 9070 XT (gfx1201) पर मापा गया: GEMM 4096³ bf16 148 TFLOP/s (rocBLAS 80), attention d64 117 |
 | AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 1–2 stages | हाँ | Strix Halo (gfx1151) पर मापा गया: GEMM 4096³ bf16 28 TFLOP/s (rocBLAS 32.5), attention d64 28; gfx1100–1102 compile हुए, चलाए नहीं गए |
-| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages | हाँ | MI300X (gfx942) पर मापा गया: GEMM 4096³ bf16 एक-slot ring पर 511 TFLOP/s (hipBLASLt 615), attention d64 257, d128 292; gfx950 compile हुआ, चलाया नहीं गया |
+| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages, two crews | हाँ | MI300X (gfx942) पर मापा गया: GEMM 4096³ bf16 एक-slot ring पर दो crews के साथ 555 TFLOP/s (hipBLASLt 615), attention d64 257, d128 292; gfx950 compile हुआ, चलाया नहीं गया |
 | Apple | simdgroup 8×8×8 | कोई नहीं | नहीं | सिर्फ़ atoms |
 
 `ops::supported(device)` वहीं true है जहाँ config tables हैं; किसी और device पर हर op अपना
@@ -73,7 +73,7 @@ data है, जिसे lowering और op layer चुनते हैं:
 |---|---|
 | Hopper (sm_90a): TMA, mbarrier, warp-specialized template; attention के लिए `wgmma` और trips के बीच उसका overlap | शुरू नहीं हुआ; GEMM `wgmma` पर चलता है जहाँ हर product की chain अपने statement के भीतर पूरी होने का इंतज़ार करती है, attention `mma.sync` पर |
 | Blackwell (sm_100a): tcgen05, tensor memory | शुरू नहीं हुआ; B200 तक पहुँच नहीं |
-| AMD CDNA: ping-pong template, MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ |
+| AMD CDNA: MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ |
 | AMD पर माप | gfx1201 (RX 9070 XT) पर मापा गया: Qwen3 और YOLO पर GEMM, convolution और attention tk1 से आगे; gfx1151 (Strix Halo) पर मापा गया: d = 64 और 128 पर attention; CDNA compile हुआ, चलाया नहीं गया |
 | Apple | सिर्फ़ atoms; न tables, न emit किए गए कर्नेल |
 | Raw asm statements | IR में रिकॉर्ड होते हैं, lowering उन्हें ठुकराती है |

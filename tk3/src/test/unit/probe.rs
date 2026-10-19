@@ -259,6 +259,7 @@ fn units_count_the_primitive(target: Target) {
             .iter()
             .map(|c| match c[0].1.schedule {
                 crate::schedule::Schedule::Uniform { unroll, .. } => unroll,
+                crate::schedule::Schedule::PingPong { .. } => panic!("a probe runs every warp alike"),
             })
             .collect()
     };

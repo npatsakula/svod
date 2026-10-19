@@ -63,7 +63,18 @@ impl GemmCfg {
     fn tiles(&self, target: &Target) -> bool {
         let bk = self.tile[2];
         let row = self.core == Core::Warp || matches!(bk * 2, 32 | 64 | 128);
-        row && self.issue(target, bk).is_some() && target.stages(self.stages) == self.stages
+        // Two crews: the two warp rows of the warp-level core, one slot, and
+        // k-slices of a product each with another to overlap, on a target
+        // that interleaves crews.
+        let crews = self.crews == 1
+            || (self.crews == 2
+                && self.core == Core::Warp
+                && target.crews >= 2
+                && self.stages == 1
+                && self.warps[0] == 2
+                && bk.is_multiple_of(crate::kernels::gemm::KSLICE)
+                && bk >= 2 * crate::kernels::gemm::KSLICE);
+        row && crews && self.issue(target, bk).is_some() && target.stages(self.stages) == self.stages
     }
 
     /// Whether the config lowers on `target`: it [`tiles`](Self::tiles), and
@@ -122,7 +133,7 @@ impl GemmCfg {
 }
 
 pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { core: Core::Warp, tile, stages, warps, group_m: 8, unroll }
+    GemmCfg { core: Core::Warp, tile, stages, warps, group_m: 8, unroll, crews: 1 }
 }
 
 /// Search bound: the knobs a GEMM-shaped kernel is enumerated over: output tile edges
@@ -162,6 +173,11 @@ fn lattice(target: &Target) -> Vec<GemmCfg> {
                                     .iter()
                                     .map(|&unroll| GemmCfg { core, ..gemm_cfg([bm, bn, bk], stages, warps, unroll) }),
                             );
+                            // Two crews: the warp-level core's two warp rows a
+                            // cluster apart over the one slot.
+                            if core == Core::Warp && target.crews >= 2 && stages == 1 && warps[0] == 2 {
+                                out.push(GemmCfg { crews: 2, ..gemm_cfg([bm, bn, bk], 1, warps, false) });
+                            }
                         }
                     }
                 }

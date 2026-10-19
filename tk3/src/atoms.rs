@@ -157,6 +157,12 @@ pub struct Target {
     pub smem_bytes: usize,
     /// Streaming multiprocessors (compute units), when the device reports them.
     pub sms: Option<u32>,
+    /// Crews a block's warps may split into, one stream of clusters offset by
+    /// a cluster so one crew's products overlap the other's loads: two where
+    /// the matrix core runs beside the vector units and a lane's file holds
+    /// two crews' accumulators (CDNA), one elsewhere
+    /// ([`crate::schedule::Schedule::PingPong`]).
+    pub crews: u32,
     /// Dies a dispatch deals its blocks to round-robin, each with its own L2
     /// (CDNA3's XCDs): the lowering renumbers blocks so consecutive ones share
     /// a die ([`crate::lower::emit::die_order`]). 1 where a device is one die.
@@ -348,6 +354,7 @@ impl Target {
             smem_bytes,
             sms: None,
             xcds: 1,
+            crews: if matches!(arch, GpuArch::Amd(a) if a.is_cdna()) { 2 } else { 1 },
             commit_fence,
             bf16_cvt,
             mma_on_valu,

@@ -143,7 +143,7 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block,
             Stmt::Sync(sync) => {
                 match sync {
                     Sync::Barrier { .. } => state.fenced(),
-                    Sync::Fence | Sync::WaitProducts { .. } => {}
+                    Sync::Fence | Sync::WaitProducts { .. } | Sync::Prio { .. } => {}
                     Sync::CommitAsync | Sync::WaitAsync { .. } => {
                         unreachable!("async groups are the templates' and this pass's own")
                     }

@@ -143,7 +143,7 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
 /// that tile the operand layout and the emitter sees one copy op. A
 /// warpgroup product (`group`) reads shared operands in place, through
 /// descriptors; only a global one is loaded.
-fn materialize_operands(prog: &mut Program, group: bool) {
+pub(crate) fn materialize_operands(prog: &mut Program, group: bool) {
     let body = std::mem::take(&mut prog.body);
     prog.body = materialize_block(prog, body, Scope::Block, group);
 }

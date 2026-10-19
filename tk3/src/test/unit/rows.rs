@@ -28,7 +28,7 @@ fn gemm_nt_epilogue(
     warps: [u32; 2],
     epi: Epilogue,
 ) -> Program {
-    let cfg = GemmCfg { core: Core::Warp, tile, stages, warps, group_m: 0, unroll: true };
+    let cfg = GemmCfg { core: Core::Warp, tile, stages, warps, group_m: 0, unroll: true, crews: 1 };
     gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg })
 }
 
@@ -191,7 +191,7 @@ fn epilogues_match_on_device(m: usize, n: usize, k: usize, tile: [usize; 3], sta
         let params = gemm_inputs(m, n, k, epi);
         let want = gemm_reference(m, n, k, epi, &params);
         let interp = run(&prog, params.clone(), &[]).unwrap();
-        let cfg = GemmCfg { core: Core::Warp, tile, stages, warps: [wr, wc], group_m: 0, unroll: true };
+        let cfg = GemmCfg { core: Core::Warp, tile, stages, warps: [wr, wc], group_m: 0, unroll: true, crews: 1 };
         let got = on_device(prog, &cfg.lowering(&declared(target.clone())), &params);
         let (got, interp) = (got.last().unwrap(), interp.last().unwrap());
         let d_interp = assert_close("c vs interpreter", got, interp, 1.6e-2);

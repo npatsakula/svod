@@ -863,6 +863,14 @@ impl<'a> Emit<'a> {
             Sync::Fence => return Ok(()),
             Sync::WaitProducts { pending } if cuda && self.low.group => wgmma::wait(pending),
             Sync::WaitProducts { .. } => return Ok(()),
+            // A side effect in list order, with no value to depend on: it may
+            // follow a barrier.
+            Sync::Prio { level } if matches!(self.low.device.target.arch, GpuArch::Amd(_)) => UOp::custom(
+                smallvec![],
+                format!("declare void @llvm.amdgcn.s.setprio(i16)\ncall void @llvm.amdgcn.s.setprio(i16 {level})"),
+                DType::Void,
+            ),
+            Sync::Prio { .. } => return Ok(()),
         };
         self.push(u);
         Ok(())

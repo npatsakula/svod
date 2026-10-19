@@ -24,6 +24,11 @@ pub enum Schedule {
     /// waits for all but the youngest chain after every consume and for
     /// every chain after the loop ([`Sync::WaitProducts`]).
     Uniform { prefetch: Prefetch, unroll: bool, async_products: bool },
+    /// Two crews of `crew` warps run one stream of clusters a cluster apart
+    /// over one register-staged slot: a crew's product, its fragments already
+    /// in registers, runs while the other crew loads, reads its next
+    /// fragments and commits the slot ([`Expander::ping_pong`]).
+    PingPong { crew: u32 },
 }
 
 /// Replace every [`Stmt::Pipeline`] of `prog` by loops, branches and explicit
@@ -93,7 +98,10 @@ impl Expander<'_> {
         let Pipeline { extent, stages, carried, produce, consume } = p;
         let produce = Stage { body: self.block(produce.body), ..produce };
         let consume = Stage { body: self.block(consume.body), ..consume };
-        let Schedule::Uniform { prefetch, unroll, async_products } = self.schedule;
+        let Schedule::Uniform { prefetch, unroll, async_products } = self.schedule else {
+            let Schedule::PingPong { crew } = self.schedule else { unreachable!() };
+            return self.ping_pong(extent, stages, carried, produce, consume, crew);
+        };
         let mut out = match prefetch {
             Prefetch::CpAsync if stages >= 3 && async_products => {
                 self.cp_async_products(extent, stages, carried, produce, consume)
@@ -210,6 +218,130 @@ impl Expander<'_> {
         vec![Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll: 1 })]
     }
 
+    /// Every global→shared copy of a produce body split into its load half
+    /// (into fresh staging registers) and its store half; what is not such a
+    /// copy stays with the loads.
+    fn staged_halves(&mut self, body: Block) -> (Vec<Stmt>, Vec<Stmt>) {
+        let (mut issue, mut commit) = (vec![], vec![]);
+        for stmt in body.0 {
+            match stmt {
+                Stmt::Copy { dst, src, scope, .. } if self.prog.value(src).tier() == Tier::Global => {
+                    let Value { dtype, shape, .. } = self.prog.value(src).clone();
+                    self.prog.values.push(Value { dtype, shape, place: Place::Reg });
+                    let tmp = ValId(self.prog.values.len() as u32 - 1);
+                    issue.push(Stmt::Copy { dst: tmp, src, mode: CopyMode::Staged, scope });
+                    commit.push(Stmt::Copy { dst, src: tmp, mode: CopyMode::Staged, scope });
+                }
+                other => issue.push(other),
+            }
+        }
+        (issue, commit)
+    }
+
+    /// One slot, two crews a cluster apart. The consume body is cut at its
+    /// products into clusters: the statements before a product (its fragment
+    /// reads) make a load cluster, the product an MFMA cluster, each closed
+    /// by a block barrier, so a barrier meets a crew's cluster `k` with the
+    /// other crew's `k - 1` and a crew's products, fed from registers, run
+    /// while the other crew loads. A trip issues the next step's global
+    /// loads at the head of the load clusters before the last, an operand's
+    /// all in one (its k-slices of a row meet the row's cache line at once;
+    /// spread over clusters, each slice fetches the line again) and the
+    /// operands spread apart, reads the last product's fragments a cluster
+    /// early, and commits the staged registers in issue order in the last
+    /// load cluster, when every warp has read its fragments of the step (the
+    /// crew behind is in a product). The head trip fills step 0; the
+    /// second crew then waits one barrier more and the first one more after
+    /// the loop, which puts the crews a cluster apart. A product runs at
+    /// raised issue priority. The last trip stages its own step again: its
+    /// commit lands the bytes already there.
+    fn ping_pong(
+        &mut self,
+        extent: ScalarId,
+        stages: usize,
+        carried: Vec<Carried>,
+        produce: Stage,
+        consume: Stage,
+        crew: u32,
+    ) -> Vec<Stmt> {
+        assert_eq!(stages, 1, "ping-pong runs over one slot");
+        let iv = self.scalar(Scalar::Induction);
+        let (zero, one, before) = (self.c(0), self.c(1), self.c(-1));
+        let nonempty = self.bin(BinOp::Lt, zero, extent);
+        let last = self.bin(BinOp::Sub, extent, one);
+        let next = self.bin(BinOp::Add, iv, one);
+        self.define(produce.step, Scalar::Bin(BinOp::Min, next, last));
+        self.define(produce.slot, Scalar::Const(0));
+        self.define(consume.step, Scalar::Bin(BinOp::Add, iv, zero));
+        self.define(consume.slot, Scalar::Const(0));
+        let (issue, commit) = self.staged_halves(produce.body);
+        let barrier = self.barrier();
+        let head: Vec<Stmt> = issue.iter().chain(&commit).cloned().chain([barrier.clone()]).collect();
+        // The clusters: the loads before each product, and the product.
+        let (mut loads, mut products): (Vec<Vec<Stmt>>, Vec<Stmt>) = (vec![vec![]], vec![]);
+        for stmt in consume.body.0 {
+            if matches!(stmt, Stmt::Let { op: TileOp::Mma { .. }, .. }) {
+                products.push(stmt);
+                loads.push(vec![]);
+            } else {
+                loads.last_mut().expect("a cluster").push(stmt);
+            }
+        }
+        let trailing = loads.pop().expect("a cluster");
+        let s = products.len();
+        assert!(s >= 2, "ping-pong overlaps the loads of one product with another");
+        let tail = std::mem::take(&mut loads[s - 1]);
+        loads[s - 2].extend(tail);
+        // Each issued load's operand, numbered in order of appearance.
+        let mut sources: Vec<ParamId> = vec![];
+        let groups: Vec<Option<usize>> = issue
+            .iter()
+            .map(|stmt| {
+                let Stmt::Copy { src, .. } = stmt else { return None };
+                let Place::Global { param, .. } = self.prog.value(*src).place else { return None };
+                Some(sources.iter().position(|&p| p == param).unwrap_or_else(|| {
+                    sources.push(param);
+                    sources.len() - 1
+                }))
+            })
+            .collect();
+        let spread = sources.len().saturating_sub(1).max(1);
+        let mut commit: Vec<(usize, Stmt)> = groups.iter().flatten().copied().zip(commit).collect();
+        commit.sort_by_key(|&(g, _)| g);
+        let mut front: Vec<Vec<Stmt>> = vec![vec![]; s];
+        for (stmt, g) in issue.into_iter().zip(groups) {
+            front[g.unwrap_or(0) * (s - 2) / spread].push(stmt);
+        }
+        for (cluster, front) in loads.iter_mut().zip(front) {
+            cluster.splice(0..0, front);
+        }
+        loads[s - 1].extend(commit.into_iter().map(|(_, stmt)| stmt));
+        let prio = |level| Stmt::Sync(Sync::Prio { level });
+        let mut body = vec![];
+        for (k, product) in products.into_iter().enumerate() {
+            body.append(&mut loads[k]);
+            body.push(barrier.clone());
+            body.extend([prio(3), product, prio(0)]);
+            if k == s - 1 {
+                body.extend(trailing.iter().cloned());
+            }
+            body.push(barrier.clone());
+        }
+        let warp = self.scalar(Scalar::Special(Special::Warp));
+        let crew = self.c(i64::from(crew));
+        let first = self.bin(BinOp::Lt, warp, crew);
+        let second = self.bin(BinOp::Eq, first, zero);
+        let trips = |start, extent, carried, body: Vec<Stmt>| {
+            Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll: 1 })
+        };
+        vec![
+            trips(before, nonempty, vec![], head),
+            Self::if_(second, vec![barrier.clone()]),
+            trips(zero, extent, carried, body),
+            Self::if_(first, vec![barrier]),
+        ]
+    }
+
     /// One step ahead over two slots or one: a trip loads step `i` into
     /// registers, consumes step `i - 1` from its slot, writes the registers
     /// to step `i`'s slot. With two slots a fence keeps the commit after the
@@ -240,20 +372,7 @@ impl Expander<'_> {
         self.define(produce.slot, slot(produce.step));
         self.define(consume.step, Scalar::Bin(BinOp::Sub, iv, one));
         self.define(consume.slot, slot(consume.step));
-        // Split every global→shared copy into its load and its store halves.
-        let (mut issue, mut commit) = (vec![], vec![]);
-        for stmt in produce.body.0 {
-            match stmt {
-                Stmt::Copy { dst, src, scope, .. } if self.prog.value(src).tier() == Tier::Global => {
-                    let Value { dtype, shape, .. } = self.prog.value(src).clone();
-                    self.prog.values.push(Value { dtype, shape, place: Place::Reg });
-                    let tmp = ValId(self.prog.values.len() as u32 - 1);
-                    issue.push(Stmt::Copy { dst: tmp, src, mode: CopyMode::Staged, scope });
-                    commit.push(Stmt::Copy { dst, src: tmp, mode: CopyMode::Staged, scope });
-                }
-                other => issue.push(other),
-            }
-        }
+        let (issue, commit) = self.staged_halves(produce.body);
         let barrier = self.barrier();
         let head: Vec<Stmt> = issue.iter().chain(&commit).cloned().chain([barrier.clone()]).collect();
         let before = if stages == 1 { barrier.clone() } else { Stmt::Sync(Sync::Fence) };

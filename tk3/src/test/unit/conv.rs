@@ -110,7 +110,7 @@ pub(super) fn tolerance(epi: Epilogue) -> f64 {
 }
 
 fn cfg(tile: [usize; 3], warps: [u32; 2], stages: usize) -> GemmCfg {
-    GemmCfg { core: Core::Warp, tile, stages, warps, group_m: 8, unroll: true }
+    GemmCfg { core: Core::Warp, tile, stages, warps, group_m: 8, unroll: true, crews: 1 }
 }
 
 fn check_interp(g: ConvGeom, batch: Batch, epi: Epilogue, c: GemmCfg) {

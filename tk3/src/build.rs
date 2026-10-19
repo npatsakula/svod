@@ -294,6 +294,13 @@ impl Kernel {
         Tile::new(self.value(dtype, shape, Place::Global { param, offset, stride, bounds, rows: map }))
     }
 
+    /// The first `shape` rows and columns of `view`.
+    pub fn narrow<T: Elem>(&mut self, view: Gmem<T>, shape: Shape) -> Gmem<T> {
+        let Value { dtype, shape: whole, place } = self.prog.value(view.0).clone();
+        assert!(shape.rows <= whole.rows && shape.cols <= whole.cols, "a window within the view");
+        Tile::new(self.value(dtype, shape, place))
+    }
+
     pub fn smem_view<T: Elem>(&mut self, alloc: SmemId, offset: impl Into<Sc>, shape: Shape) -> Shared<T> {
         assert_eq!(self.prog.smem[alloc.index()].dtype, T::DTYPE, "shared allocation dtype");
         self.smem_view_as(alloc, offset, shape)

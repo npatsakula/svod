@@ -32,7 +32,7 @@ runtime variable की live गिनती launch करता है, buffers
 | `gated` | `b` `[2n, k]` है, gate rows ऊपर, up rows नीचे; output `act(gate)·up` (SwiGLU, GeGLU) |
 | `residual` | `[batch·m, n]`, सबसे आख़िर में जोड़ा जाता है |
 
-`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll }`। `m` से आगे की rows और
+`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll, core, crews }`। `m` से आगे की rows और
 `n` से आगे के columns bounded views हैं, इसलिए `m` और `n` मुक्त हैं। `k` का `bk` का गुणज होना ज़रूरी है।
 
 Op layer कोई tile table नहीं रखती। `config::Planner::gemm_ranked` construct के knobs गिनता है (32–256

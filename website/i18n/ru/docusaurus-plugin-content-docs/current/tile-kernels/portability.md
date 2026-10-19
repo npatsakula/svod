@@ -38,7 +38,7 @@ sidebar_label: Переносимость
 | CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix`; `wgmma` m64nNk16 над дескрипторами shared (GEMM) | `cp.async`, до 227 КБ shared | да | Замерено на H100 PCIe: GEMM 4096³ bf16 433 TFLOP/s на ядре варпгруппы (234 на `mma.sync`; cuBLASLt 524) |
 | AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, 8 значений на лейн | через регистры, 1–2 стадии | да | Замерено на RX 9070 XT (gfx1201): GEMM 4096³ bf16 148 TFLOP/s (rocBLAS 80), attention d64 117 |
 | AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, реплицированные входы | через регистры, 1–2 стадии | да | Замерено на Strix Halo (gfx1151): GEMM 4096³ bf16 28 TFLOP/s (rocBLAS 32.5), attention d64 28; gfx1100–1102 скомпилированы, не запускались |
-| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | через регистры, 1–2 стадии | да | Замерено на MI300X (gfx942): GEMM 4096³ bf16 511 TFLOP/s на кольце из одного слота (hipBLASLt 615), attention d64 257, d128 292; gfx950 скомпилирован, не запускался |
+| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | через регистры, 1–2 стадии, две бригады | да | Замерено на MI300X (gfx942): GEMM 4096³ bf16 555 TFLOP/s двумя бригадами на кольце из одного слота (hipBLASLt 615), attention d64 257, d128 292; gfx950 скомпилирован, не запускался |
 | Apple | simdgroup 8×8×8 | нет | нет | Только атомы |
 
 `ops::supported(device)` истинно там, где есть таблицы конфигураций; на любом другом устройстве
@@ -74,7 +74,7 @@ sidebar_label: Переносимость
 |---|---|
 | Hopper (sm_90a): TMA, mbarrier, шаблон с warp specialization; `wgmma` для attention и его перекрытие между итерациями | Не начато; GEMM идёт на `wgmma`, где цепочка каждого произведения дожидается завершения внутри своего оператора, attention — на `mma.sync` |
 | Blackwell (sm_100a): tcgen05, тензорная память | Не начато; доступа к B200 нет |
-| AMD CDNA: шаблон ping-pong, MFMA 32×32, `buffer_load … lds` | Не начато |
+| AMD CDNA: MFMA 32×32, `buffer_load … lds` | Не начато |
 | Замеры на AMD | Замерен gfx1201 (RX 9070 XT): GEMM, свёртка и внимание опережают tk1 на Qwen3 и YOLO; замерен gfx1151 (Strix Halo): внимание при d = 64 и 128; CDNA скомпилирован, не запускался |
 | Apple | Только атомы; ни таблиц, ни выпущенных ядер |
 | Инструкции raw asm | Записываются в IR, отвергаются понижением |

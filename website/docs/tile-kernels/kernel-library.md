@@ -32,7 +32,7 @@ matrix product runs on the f32 accumulator, and the result is rounded once at th
 | `gated` | `b` is `[2n, k]`, gate rows over up rows; output `act(gate)·up` (SwiGLU, GeGLU) |
 | `residual` | `[batch·m, n]` added last |
 
-`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll }`. Rows past `m`
+`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll, core, crews }`. Rows past `m`
 and columns past `n` are bounded views, so `m` and `n` are free. `k` must be a multiple of `bk`.
 
 The op layer does not keep a tile table. `config::Planner::gemm_ranked` enumerates the construct's

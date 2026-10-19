@@ -359,6 +359,10 @@ pub enum Sync {
     /// holding this statement issue asynchronously and this is their wait.
     /// Nothing to a target without such chains.
     WaitProducts { pending: u32 },
+    /// The wave's issue priority from here on (`s_setprio`): raised over a
+    /// crew's products so the SIMD's other wave, loading, yields its issue
+    /// slots to them. Nothing where waves have no priority.
+    Prio { level: u8 },
 }
 
 #[derive(Clone, Debug, PartialEq)]

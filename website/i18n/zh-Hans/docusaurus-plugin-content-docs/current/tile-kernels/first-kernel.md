@@ -131,13 +131,14 @@ use svod_tensor::Tensor;
 use svod_tk3::atoms::{Device, Target};
 use svod_tk3::build::BF16;
 use svod_tk3::kernels::Batch;
-use svod_tk3::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk3::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
 use svod_tk3::launch::graph_launch;
 
 let (m, n, k) = (1000, 512, 256);
 let target = Target::for_device(&default_device()).expect("a GPU target");
 let device = Device { costs: svod_tk3::probe::costs(&target)?, target };
-let cfg = GemmCfg { tile: [64, 64, 32], stages: 3, warps: [2, 2], group_m: 8, unroll: true };
+let cfg =
+    GemmCfg { tile: [64, 64, 32], stages: 3, warps: [2, 2], group_m: 8, unroll: true, core: Core::Warp, crews: 1 };
 let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
 let a = Tensor::empty(&[m * k], DType::BFloat16);
 let b = Tensor::empty(&[n * k], DType::BFloat16);

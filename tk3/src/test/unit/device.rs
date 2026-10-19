@@ -1,5 +1,6 @@
 //! End to end on the attached GPU: the lowered program computes what the
-//! interpreter computes. Skips unless `SVOD_DEVICE` names a CUDA device.
+//! interpreter computes. Skips unless `SVOD_DEVICE` names a CUDA device (the
+//! two-crew test: a device that interleaves crews).
 
 use svod_dtype::{DType, DeviceSpec, ScalarDType, default_device::default_device};
 use svod_tensor::Tensor;
@@ -62,7 +63,8 @@ fn gemm_matches_the_interpreter(
         eprintln!("skipped: no CUDA device");
         return;
     };
-    let cfg = GemmCfg { core: Core::Warp, tile: [bm, bn, bk], stages, warps: [wr, wc], group_m: 0, unroll: true };
+    let cfg =
+        GemmCfg { core: Core::Warp, tile: [bm, bn, bk], stages, warps: [wr, wc], group_m: 0, unroll: true, crews: 1 };
     check_gemm(&declared(target), m, n, k, cfg);
 }
 
@@ -112,6 +114,7 @@ fn warpgroup_gemm_matches_the_warp_core(tile: [usize; 3], group: [u32; 2], warp:
         group_m: 8,
         unroll: false,
         core,
+        crews: 1,
     });
     let outs: Vec<Vec<f32>> = cfgs.iter().map(|cfg| check_gemm(&device, m, n, k, *cfg)).collect();
     let (same, worst) = outs[0].iter().zip(&outs[1]).fold((0usize, 0.0f32), |(same, worst), (g, w)| {
@@ -124,9 +127,38 @@ fn warpgroup_gemm_matches_the_warp_core(tile: [usize; 3], group: [u32; 2], warp:
     assert_eq!(same, outs[0].len(), "{tile:?}: the warpgroup and warp cores differ");
 }
 
+/// Two crews a cluster apart, on a target that interleaves them, compute
+/// what the interpreter computes over partial row and column tiles, and
+/// store bit for bit what the uniform kernel of the same tile stores (the
+/// k-slices reduce in the uniform kernel's order).
+#[test_case([256, 256, 64]; "256x256x64")]
+#[test_case([256, 256, 32]; "256x256x32")]
+#[test_case([256, 128, 64]; "256x128x64")]
+fn two_crews_match_the_interpreter_and_the_uniform_kernel(tile: [usize; 3]) {
+    let Some(planner) = super::device_planner().filter(|p| p.device.target.crews >= 2) else {
+        eprintln!("skipped: no device with two crews");
+        return;
+    };
+    let device = &planner.device;
+    let crews = GemmCfg { tile, stages: 1, warps: [2, 4], group_m: 8, unroll: false, core: Core::Warp, crews: 2 };
+    check_gemm(device, 200, 136, 128, crews);
+    check_gemm(device, 520, 300, 256, crews);
+    let (m, n, k) = (1024, 768, 512);
+    let mut seed = 5;
+    let a: Vec<f32> = (0..m * k).map(|_| lcg(&mut seed)).collect();
+    let b: Vec<f32> = (0..n * k).map(|_| lcg(&mut seed)).collect();
+    let (a_t, b_t) = (Tensor::from_slice(&a).cast(DType::BFloat16), Tensor::from_slice(&b).cast(DType::BFloat16));
+    let bits = |cfg: GemmCfg| -> Vec<u32> {
+        let c_t = Tensor::empty(&[m * n], DType::BFloat16);
+        let out = graph_launch(plain_gemm(m, n, k, cfg), &cfg.lowering(device), &[&a_t, &b_t, &c_t]).unwrap();
+        out.cast(DType::Float32).to_vec::<f32>().unwrap().iter().map(|x| x.to_bits()).collect()
+    };
+    assert!(bits(crews) == bits(GemmCfg { crews: 1, ..crews }), "{crews:?} differs from the uniform kernel");
+}
+
 /// A config standing in where a spec's own is replaced.
 const BIG: GemmCfg =
-    GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 2, warps: [2, 4], group_m: 8, unroll: true };
+    GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 2, warps: [2, 4], group_m: 8, unroll: true, crews: 1 };
 
 /// The device's result, checked against the interpreter's within the
 /// rounding a bf16 store and f32 accumulation allow.
@@ -201,6 +233,7 @@ fn gemm_throughput_probe() {
             warps: [wr, wc],
             group_m,
             unroll,
+            crews: 1,
         })
         .to_vec()
     } else {
@@ -221,6 +254,7 @@ fn gemm_throughput_probe() {
                 group_m: 8,
                 unroll: false,
                 core: Core::Group,
+                crews: 1,
             }),
         );
     }
@@ -229,13 +263,13 @@ fn gemm_throughput_probe() {
         cfgs.push(pick);
     }
     for cfg in cfgs {
-        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll, core } = cfg;
+        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll, core, crews } = cfg;
         let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(&planner.device));
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
         let picked = if cfg == pick { " (tuner's pick)" } else { "" };
         plans.push((
-            format!("tk3 {bm}x{bn}x{bk} s{stages} {wr}x{wc} group_m={group_m} unroll={unroll} {core:?}{picked}"),
+            format!("tk3 {bm}x{bn}x{bk} s{stages} {wr}x{wc} group_m={group_m} unroll={unroll} {core:?} crews={crews}{picked}"),
             out.prepare().unwrap(),
         ));
     }
@@ -274,7 +308,8 @@ fn gemm_candidates_probe() {
         eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
-    let ladder = GemmCfg { core: Core::Warp, tile: [128, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true };
+    let ladder =
+        GemmCfg { core: Core::Warp, tile: [128, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true, crews: 1 };
     let plain = Epilogue::default();
     for (m, n, k, epilogue, var) in [
         (704, 1536, 512, plain, true),
@@ -336,7 +371,15 @@ fn first_execution_probe() {
     b_t.realize().unwrap();
     let mut plans: Vec<(String, svod_runtime::ExecutionPlan)> = vec![];
     for (bm, bn, stages) in [(128, 128, 3), (64, 64, 2)] {
-        let cfg = GemmCfg { core: Core::Warp, tile: [bm, bn, 32], stages, warps: [2, 2], group_m: 8, unroll: false };
+        let cfg = GemmCfg {
+            core: Core::Warp,
+            tile: [bm, bn, 32],
+            stages,
+            warps: [2, 2],
+            group_m: 8,
+            unroll: false,
+            crews: 1,
+        };
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(plain_gemm(m, n, k, cfg), &cfg.lowering(&device), &[&a_t, &b_t, &c_t]).unwrap();
         plans.push((format!("tk3 {bm}x{bn} s{stages}"), out.prepare().unwrap()));
@@ -346,7 +389,8 @@ fn first_execution_probe() {
     let graph = a2.matmul(&b2.try_transpose(0, 1).unwrap()).unwrap();
     plans.push(("graph matmul".to_string(), graph.prepare().unwrap()));
     // Host-side cost: building, lowering and scheduling the pre-linearized body.
-    let cfg = GemmCfg { core: Core::Warp, tile: [64, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: false };
+    let cfg =
+        GemmCfg { core: Core::Warp, tile: [64, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: false, crews: 1 };
     for i in 0..3 {
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let t = std::time::Instant::now();
@@ -419,8 +463,15 @@ fn qwen3_gemm_candidates_probe() {
                 for bk in [16, 32, 64] {
                     for warps in [[2, 2], [2, 4], [4, 2], [4, 4]] {
                         for unroll in [false, true] {
-                            let cfg =
-                                GemmCfg { core: Core::Warp, tile: [bm, bn, bk], stages: 2, warps, group_m: 8, unroll };
+                            let cfg = GemmCfg {
+                                core: Core::Warp,
+                                tile: [bm, bn, bk],
+                                stages: 2,
+                                warps,
+                                group_m: 8,
+                                unroll,
+                                crews: 1,
+                            };
                             let fits = cfg.fits(target) && cfg.smem_bytes(epilogue.gated) <= target.smem_bytes;
                             if fits && !shortlist.contains(&cfg) {
                                 lattice.push(cfg);
