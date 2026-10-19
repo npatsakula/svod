@@ -887,6 +887,10 @@ impl<'a> Infer<'a> {
                 self.elementwise(dst, a, b);
                 self.unify(dst, pred);
             }
+            TileOp::MulAdd { a, b, c } => {
+                self.elementwise(dst, a, b);
+                self.unify(dst, c);
+            }
             TileOp::Reduce { src, axis, .. } => {
                 if let Some(want) = self.vector_of(src, axis) {
                     self.demand(dst, want);
@@ -984,6 +988,11 @@ impl Rewrite<'_> {
                         rewrite(self, pred);
                         rewrite(self, a);
                         rewrite(self, b);
+                    }
+                    TileOp::MulAdd { a, b, c } => {
+                        rewrite(self, a);
+                        rewrite(self, b);
+                        rewrite(self, c);
                     }
                     TileOp::Mma { acc, a, b, .. } => {
                         rewrite(self, acc);

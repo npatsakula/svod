@@ -76,7 +76,7 @@ thread (`AccResidence`, `IssueScope`)।
    `Costs` के तहत program पर सबसे कम relayout cost छोड़े: `Cᵀ = Bᵀ·Aᵀ` वही instruction है जिसके slots
    आपस में बदल दिए गए हों, इसलिए square atom पर accumulator बिना किसी cost के अगले product का operand
    बनकर रखा जा सकता है। Author orientation pin कर सकता है (`Kernel::mma_oriented`)।
-2. **Elementwise ops एक करते हैं।** `binary`, `cast`, `where_` के operands और नतीजा, और किसी loop
+2. **Elementwise ops एक करते हैं।** `binary`, `cast`, `where_`, `mul_add` के operands और नतीजा, और किसी loop
    की carried values, एक ही layout साझा करते हैं।
 3. **बिना बंधन वाले tiles natural layout लेते हैं।** Fixed point पर, जिस tile पर कोई बंधन नहीं, उसे
    `layouts::natural` मिलता है: हर lane अधिकतम 8 elements का एक छोटा row vector रखती है, lanes

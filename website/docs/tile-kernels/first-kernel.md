@@ -173,7 +173,7 @@ output and falls back to the graph when the kernel does not apply.
 | Declarations | `param`, `var` (a launch variable bound by name), `grid`, `warps`, `smem` |
 | Scalars | `block(axis)`, `warp()`, `load_scalar(param, index)`, `Sc` operators and `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | Views | `view`, `at`, `smem_view`, `smem_view_as`, `smem_slot` |
-| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (a row or column vector broadcasts), `compare`, `cast`, `where_`, `reduce`, `mma` |
+| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (a row or column vector broadcasts), `compare`, `cast`, `where_`, `mul_add` (one rounding), `reduce`, `mma` |
 | Movement | `stage` (global → shared, `CopyMode::Async` or `Sync`), `load`, `store` |
 | Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (branches producing tiles) |
 

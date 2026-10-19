@@ -79,7 +79,7 @@ The CUDA and AMD rows plan kernels and run on hardware today (sm_86 and gfx1201 
    the least relayout cost under the lowering's `Costs`: `Cᵀ = Bᵀ·Aᵀ` is the same instruction with its slots exchanged,
    so on a square atom an accumulator can be held as the next product's operand at no cost.
    An author may pin the orientation (`Kernel::mma_oriented`).
-2. **Elementwise ops unify.** Operands and the result of `binary`, `cast`, `where_` and the
+2. **Elementwise ops unify.** Operands and the result of `binary`, `cast`, `where_`, `mul_add` and the
    carried values of a loop share one layout.
 3. **Unconstrained tiles take a natural layout.** At a fixed point, a tile nothing constrains
    gets `layouts::natural`: each lane holds a short row vector of up to 8 elements, lanes walk

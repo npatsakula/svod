@@ -284,12 +284,14 @@ impl<T> Clone for Step<'_, T> {
 }
 impl<T> Copy for Step<'_, T> {}
 
-/// `s` plus a bias tile, in the scores' log2 units.
+/// `s` plus a bias tile, in the scores' log2 units: one fused multiply-add,
+/// so the result does not depend on which product the backend would fuse
+/// into a separate add (the scaled scores' or the bias's), which varies with
+/// the layout around it.
 fn biased<T: Elem, P: TierMark>(k: &mut Kernel, s: Regs<F32>, tile: Tile<P, T>) -> Regs<F32> {
     let b = load_f32(k, tile);
     let log2e = k.fill::<F32>(k.shape(s), Const::Float(std::f64::consts::LOG2_E));
-    let b = k.binary(b, log2e, BinaryOp::Mul);
-    k.binary(s, b, BinaryOp::Add)
+    k.mul_add(b, log2e, s)
 }
 
 impl<T> Step<'_, T> {

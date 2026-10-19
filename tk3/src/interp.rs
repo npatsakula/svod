@@ -396,6 +396,11 @@ impl Frame<'_> {
                 let (va, vb) = (self.broadcast(*a, out.shape), self.broadcast(*b, out.shape));
                 p.iter().zip(va.iter().zip(&vb)).map(|(&p, (&x, &y))| if p != 0.0 { x } else { y }).collect()
             }
+            TileOp::MulAdd { a, b, c } => {
+                let (va, vb, vc) =
+                    (self.broadcast(*a, out.shape), self.broadcast(*b, out.shape), self.broadcast(*c, out.shape));
+                va.iter().zip(&vb).zip(&vc).map(|((&x, &y), &z)| x.mul_add(y, z)).collect()
+            }
             TileOp::Transpose { src } => {
                 let v = self.read(*src);
                 (0..rows * cols).map(|i| v[(i % cols) * rows + i / cols]).collect()

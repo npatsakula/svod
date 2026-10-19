@@ -246,6 +246,14 @@ pub enum TileOp {
         a: ValId,
         b: ValId,
     },
+    /// `a·b + c` rounded once: one fused instruction whatever the layout
+    /// around it, where a separate multiply and add leave the backend free
+    /// to fuse either multiply feeding the add.
+    MulAdd {
+        a: ValId,
+        b: ValId,
+        c: ValId,
+    },
     /// Logical transpose of a register tile.
     Transpose {
         src: ValId,

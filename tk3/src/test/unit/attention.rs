@@ -465,6 +465,64 @@ fn only_the_live_batch_runs() {
     assert!(got[3][half..].iter().all(|x| *x == 0.0));
 }
 
+/// One row of queries a warp or two give the same bits on the device, under
+/// every mask form the probe covers, over partial query and key blocks:
+/// a 32-row warp runs the 16-row warp's arithmetic per element (the biased
+/// score is one fused multiply-add in both, so neither layout leaves the
+/// backend a different product to fuse), and both match the reference.
+#[test_case(false, false, 64, 64, 32; "plain")]
+#[test_case(true, false, 128, 64, 32; "causal, d 128")]
+#[test_case(false, true, 64, 128, 64; "bias")]
+#[test_case(true, true, 64, 64, 32; "causal bias")]
+fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq: usize, bkv: usize) {
+    let Some(planner) = super::device_planner() else {
+        eprintln!("skipped: no GPU with tk3 tables");
+        return;
+    };
+    let device = &planner.device;
+    let mask = AttnMask { causal, key_lens: true, bias: bias.then_some(Bias::PerBatch), ..NONE };
+    let one = masked(100, 150, d, bq, bkv, mask);
+    let two = AttnSpec { cfg: FaCfg { warp_rows: 2 * WARP_ROWS, ..one.cfg }, ..one.clone() };
+    if ![&one, &two].iter().all(|s| s.cfg.fits(&device.target, d, bias)) {
+        eprintln!("skipped: the tiles do not fit the target");
+        return;
+    }
+    let c = case(one.clone(), &[150, 77]);
+    let to_bf16 = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+    let (q, k, v) = (to_bf16(&c.q), to_bf16(&c.k), to_bf16(&c.v));
+    let elems = one.batch.capacity() * one.t * one.heads * d;
+    let extras: Vec<Tensor> = one
+        .extra_params()
+        .into_iter()
+        .zip(extra_params(&c))
+        .map(|(name, v)| match name {
+            "bias" => to_bf16(&v),
+            _ => Tensor::from_slice(v.iter().map(|&x| x as i32).collect::<Vec<_>>()),
+        })
+        .collect();
+    let bits = |spec: &AttnSpec| -> Vec<u16> {
+        let o = Tensor::empty(&[elems], DType::BFloat16);
+        let mut tensors = vec![&q, &k, &v, &o];
+        tensors.extend(&extras);
+        let outs = graph_launch_all(flash_attention(spec), &spec.cfg.lowering(device), &tensors).unwrap();
+        let mut plan = outs[3].prepare().unwrap();
+        plan.execute_with_vars(&[("b", 2)]).unwrap();
+        let mut bytes = vec![0u8; elems * 2];
+        outs[3].buffer().unwrap().copyout(&mut bytes).unwrap();
+        bytes.chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect()
+    };
+    let (got, want) = (bits(&two), bits(&one));
+    let same = got.iter().zip(&want).filter(|(a, b)| a == b).count();
+    assert_eq!(same, got.len(), "{} of {} outputs differ from the 16-row kernel's", got.len() - same, got.len());
+    let reference = reference(&c);
+    let worst = got
+        .iter()
+        .zip(&reference)
+        .map(|(g, w)| (f64::from(f32::from_bits(u32::from(*g) << 16)) - w).abs())
+        .fold(0.0, f64::max);
+    assert!(worst < 2e-2, "max abs diff {worst} against the reference");
+}
+
 #[test_case(spec(64, 64, 64, 64, 64, false, false), &[64, 64]; "one key block")]
 #[test_case(spec(128, 128, 64, 64, 64, false, false), &[128, 128]; "plain")]
 #[test_case(spec(256, 256, 64, 64, 64, true, false), &[256, 256]; "causal")]

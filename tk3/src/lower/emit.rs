@@ -1325,6 +1325,14 @@ impl<'a> Emit<'a> {
                     self.reg_store(dst, j, vec![UOp::try_where(p, x, y).expect("where")]);
                 }
             }
+            TileOp::MulAdd { a, b, c } => {
+                let (ja, jb, jc) = (self.operand_regs(dst, a), self.operand_regs(dst, b), self.operand_regs(dst, c));
+                for j in 0..regs {
+                    let (x, y) = (self.reg_load(a, ja[j as usize]), self.reg_load(b, jb[j as usize]));
+                    let z = self.reg_load(c, jc[j as usize]);
+                    self.reg_store(dst, j, vec![UOp::try_mulacc(x, y, z).expect("mul-add")]);
+                }
+            }
             TileOp::Mma { .. } if self.low.group => self.group_mma(dst, op)?,
             TileOp::Mma { .. } => self.mma(dst, op)?,
             TileOp::Reduce { src, axis, f } => self.reduce(dst, src, axis, f)?,

@@ -460,6 +460,13 @@ impl Kernel {
         self.let_(shape, TileOp::Where { pred: pred.0, a: a.0, b: b.0 })
     }
 
+    /// `a·b + c`, rounded once ([`TileOp::MulAdd`]).
+    pub fn mul_add<T: Elem>(&mut self, a: Regs<T>, b: Regs<T>, c: Regs<T>) -> Regs<T> {
+        let shape = self.broadcast_shape(a.0, b.0);
+        assert_eq!(self.shape(c), shape, "addend shape");
+        self.let_(shape, TileOp::MulAdd { a: a.0, b: b.0, c: c.0 })
+    }
+
     pub fn transpose<T: Elem>(&mut self, src: Regs<T>) -> Regs<T> {
         let shape = self.shape(src).transposed();
         self.let_(shape, TileOp::Transpose { src: src.0 })

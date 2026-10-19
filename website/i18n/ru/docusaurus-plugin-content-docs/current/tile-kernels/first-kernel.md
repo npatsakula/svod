@@ -177,7 +177,7 @@ c.realize()?;
 | Объявления | `param`, `var` (переменная запуска, связываемая по имени), `grid`, `warps`, `smem` |
 | Скаляры | `block(axis)`, `warp()`, `load_scalar(param, index)`, операторы `Sc` и `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | View | `view`, `at`, `smem_view`, `smem_view_as`, `smem_slot` |
-| Тайловые операции | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (вектор-строка или вектор-столбец транслируется), `compare`, `cast`, `where_`, `reduce`, `mma` |
+| Тайловые операции | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (вектор-строка или вектор-столбец транслируется), `compare`, `cast`, `where_`, `mul_add` (одно округление), `reduce`, `mma` |
 | Перемещение | `stage` (global → shared, `CopyMode::Async` или `Sync`), `load`, `store` |
 | Управление | `loop_` (переносимые регистровые тайлы), `pipeline`, `if_`, `select_if` (ветви, производящие тайлы) |
 

@@ -174,7 +174,7 @@ c.realize()?;
 | घोषणाएँ | `param`, `var` (launch variable जो नाम से bind होता है), `grid`, `warps`, `smem` |
 | Scalars | `block(axis)`, `warp()`, `load_scalar(param, index)`, `Sc` operators और `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | Views | `view`, `at`, `smem_view`, `smem_view_as`, `smem_slot` |
-| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `compare`, `cast`, `where_`, `reduce`, `mma` |
+| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `compare`, `cast`, `where_`, `mul_add` (एक ही rounding), `reduce`, `mma` |
 | Movement | `stage` (global → shared, `CopyMode::Async` या `Sync`), `load`, `store` |
 | Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches) |
 
