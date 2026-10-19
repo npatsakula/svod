@@ -116,6 +116,13 @@ fn rankings(planner: &Planner) -> (Vec<Ranking<GemmCfg>>, Vec<Ranking<FaCfg>>) {
     (gemms, attention)
 }
 
+/// The configs [`cost_model_probe`] times beside the tuner's pick: the
+/// whole ranking, or none under `COST_MODEL_PICKS` (an A/B of the picks
+/// across builds, whose rankings the replay prices).
+fn timing<C>(ranked: &[C]) -> &[C] {
+    if std::env::var_os("COST_MODEL_PICKS").is_some() { &[] } else { ranked }
+}
+
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn cost_model_probe() {
@@ -128,8 +135,9 @@ fn cost_model_probe() {
         let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: super::device::BIG };
         let pick = super::device::device_gemms(&planner, &spec).1;
         let build = |cfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
-        let (verdicts, ns) = timed(&ranked, &[pick], build);
-        report(label, &ranked, &predicted, &verdicts, &ns, &pick);
+        let ranked = timing(&ranked);
+        let (verdicts, ns) = timed(ranked, &[pick], build);
+        report(label, ranked, &predicted, &verdicts, &ns, &pick);
     }
     for ((label, batch, heads, t, d, causal), (_, ranked, predicted)) in
         ATTENTION_SHAPES.into_iter().filter(|s| wanted(s.0)).zip(attentions)
@@ -138,8 +146,9 @@ fn cost_model_probe() {
         let spec = super::attention::probe_spec(batch, heads, t, t, d, mask);
         let pick = super::attention::device_attention(&planner, &spec).2;
         let build = |cfg| vec![(attention::<BF16>(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
-        let (verdicts, ns) = timed(&ranked, &[pick], build);
-        report(label, &ranked, &predicted, &verdicts, &ns, &pick);
+        let ranked = timing(&ranked);
+        let (verdicts, ns) = timed(ranked, &[pick], build);
+        report(label, ranked, &predicted, &verdicts, &ns, &pick);
     }
 }
 
