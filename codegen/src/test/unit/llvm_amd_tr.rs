@@ -14,14 +14,19 @@ fn global_at(slot: usize, dtype: DType, index: Arc<UOp>) -> Arc<UOp> {
 
 /// Lane `L` addresses row `L % 16` at column `8·(L/16)` of a row-major 16×16
 /// tile and writes its eight transposed elements out in lane order.
-fn tr_kernel(elem: ScalarDType) -> Arc<UOp> {
+/// Where `gated`, lanes from 24 on read a run of zeros instead.
+fn tr_kernel(elem: ScalarDType, gated: bool) -> Arc<UOp> {
     let l = lane();
     let row = UOp::alu(BinaryOp::CMod, l.clone(), UOp::native_const(16i32));
     let half = UOp::alu(BinaryOp::CDiv, l.clone(), UOp::native_const(16i32));
     let at = UOp::alu(BinaryOp::Mul, row, UOp::native_const(16i32))
         .try_add(&UOp::alu(BinaryOp::Mul, half, UOp::native_const(8i32)))
         .unwrap();
-    let elems = global_load_tr_b128(&global_at(0, DType::Scalar(elem), at), elem);
+    let at = global_at(0, DType::Scalar(elem), at);
+    let elems = match gated {
+        true => global_load_tr_b128_or_zeros(&at, &l.try_cmplt(&UOp::native_const(24i32)).unwrap(), elem),
+        false => global_load_tr_b128(&at, elem),
+    };
     let stores = elems
         .iter()
         .enumerate()
@@ -38,12 +43,24 @@ fn tr_kernel(elem: ScalarDType) -> Arc<UOp> {
 #[test_case::test_case(ScalarDType::BFloat16, "<8 x bfloat>", "v8bf16"; "bf16")]
 #[test_case::test_case(ScalarDType::Float16, "<8 x half>", "v8f16"; "f16")]
 fn transposing_loads_take_a_global_pointer(elem: ScalarDType, ty: &str, overload: &str) {
-    let code = render_amd_linearized(&tr_kernel(elem), AmdArch::Gfx1201, "amd_tr").code;
+    let code = render_amd_linearized(&tr_kernel(elem, false), AmdArch::Gfx1201, "amd_tr").code;
     let intrinsic = format!("llvm.amdgcn.global.load.tr.b128.{overload}");
     assert_eq!(code.matches(&format!("declare {ty} @{intrinsic}(ptr addrspace(1))")).count(), 1, "{code}");
     assert!(code.contains(&format!("call {ty} @{intrinsic}(ptr addrspace(1) %")), "{code}");
     assert!(code.contains("addrspacecast ptr %"), "{code}");
     assert_eq!(code.matches(&format!("= extractelement {ty} %")).count(), 8, "{code}");
+    assert_amd_ir_compiles(&code, "gfx1201");
+}
+
+/// A gated load chooses its address between the operand's run and a
+/// module-level 16-byte run of zeros, defined once and aligned for the load.
+#[test]
+fn a_gated_transposing_load_reads_a_run_of_zeros_outside() {
+    let code = render_amd_linearized(&tr_kernel(ScalarDType::BFloat16, true), AmdArch::Gfx1201, "amd_tr_zeros").code;
+    let zeros = "@svod_tr_zeros = internal unnamed_addr addrspace(1) constant [4 x i32] zeroinitializer, align 16";
+    assert_eq!(code.matches(zeros).count(), 1, "{code}");
+    assert!(code.contains("ptr addrspace(1) @svod_tr_zeros\n"), "{code}");
+    assert!(code.contains("= select i1 %"), "{code}");
     assert_amd_ir_compiles(&code, "gfx1201");
 }
 
