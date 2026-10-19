@@ -251,9 +251,22 @@ struct Infer<'a> {
 pub fn infer(prog: &mut Program, target: &Target, grid: WarpGrid) -> Result<Vec<Option<TileLayout>>> {
     let n = prog.values.len();
     let mut it = Infer { prog, target, grid, lay: vec![None; n], changed: true, conflicts: HashMap::new(), pos: 0 };
-    for _ in 0..32 {
+    let (warps, lanes) = (it.prog.warps, it.target.wave);
+    for _ in 0..4 * n + 4 {
         if !it.changed {
-            break;
+            // At a fixed point, a value nothing constrains takes the natural
+            // layout and the passes go on, so what consumes it (a vector it
+            // broadcasts over, say) is demanded from it rather than defaulted
+            // apart from it. Tiles seed before vectors: a vector's layout is
+            // its tile's to decide.
+            let Some(v) = it.unconstrained() else { break };
+            let shape = it.prog.values[v.index()].shape;
+            let l = natural(shape, warps, lanes).context(UndeterminedSnafu {
+                value: v,
+                rows: shape.rows,
+                cols: shape.cols,
+            })?;
+            it.set(v, l);
         }
         it.changed = false;
         it.conflicts.clear();
@@ -268,21 +281,20 @@ pub fn infer(prog: &mut Program, target: &Target, grid: WarpGrid) -> Result<Vec<
         let body = it.insert(body);
         it.prog.body = body;
     }
-    let (warps, lanes) = (it.prog.warps, it.target.wave);
-    for (i, v) in it.prog.values.iter().enumerate() {
-        if v.place == Place::Reg && it.lay[i].is_none() {
-            let shape = v.shape;
-            it.lay[i] = Some(natural(shape, warps, lanes).context(UndeterminedSnafu {
-                value: ValId(i as u32),
-                rows: shape.rows,
-                cols: shape.cols,
-            })?);
-        }
-    }
     Ok(it.lay)
 }
 
 impl Infer<'_> {
+    /// The first register value without a layout, tiles before vectors.
+    fn unconstrained(&self) -> Option<ValId> {
+        let open = |vector: bool| {
+            self.prog.values.iter().enumerate().find(|(i, v)| {
+                v.place == Place::Reg && self.lay[*i].is_none() && (v.shape.rows == 1 || v.shape.cols == 1) == vector
+            })
+        };
+        open(false).or_else(|| open(true)).map(|(i, _)| ValId(i as u32))
+    }
+
     fn set(&mut self, v: ValId, l: TileLayout) {
         if self.lay[v.index()].as_ref() != Some(&l) {
             self.lay[v.index()] = Some(l);
