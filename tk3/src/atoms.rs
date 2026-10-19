@@ -172,14 +172,6 @@ pub struct Target {
     /// its products unless fenced (`Sync::Fence` → `sched_barrier`), leaving
     /// the block waiting on global memory with no product in flight: RDNA4.
     pub commit_fence: bool,
-    /// An f32 pair rounds to bf16 in one instruction (`cvt.rn.bf16x2.f32`,
-    /// `v_cvt_pk_bf16_f32`): sm_80+ and gfx950; elsewhere the rounding is
-    /// about seven vector instructions per element.
-    pub bf16_cvt: bool,
-    /// The matrix products issue on the vector ALUs (RDNA's WMMA), so vector
-    /// work saved is matrix time gained; CUDA's tensor cores and CDNA's matrix
-    /// cores run beside the vector units.
-    pub mma_on_valu: bool,
     /// How a lane reads the register of lane `lane ^ mask`.
     pub lane_move: LaneMove,
     /// An f32 `exp2` is the hardware instruction alone, without the range
@@ -312,12 +304,6 @@ impl Target {
             GpuArch::Metal(_) => (false, false, 32 << 10),
         };
         let commit_fence = matches!(arch, GpuArch::Amd(a) if a.is_rdna4());
-        let bf16_cvt = match arch {
-            GpuArch::Cuda(c) => c.major >= 8,
-            GpuArch::Amd(a) => a == AmdArch::Gfx950,
-            GpuArch::Metal(_) => false,
-        };
-        let mma_on_valu = matches!(arch, GpuArch::Amd(a) if !a.is_cdna());
         let lane_move = match arch {
             GpuArch::Cuda(_) => LaneMove::Shuffle,
             GpuArch::Metal(_) => LaneMove::SimdShuffle,
@@ -357,8 +343,6 @@ impl Target {
             xcds: 1,
             crews: if matches!(arch, GpuArch::Amd(a) if a.is_cdna()) { 2 } else { 1 },
             commit_fence,
-            bf16_cvt,
-            mma_on_valu,
             occupancy,
             lane_move,
             hardware_exp2,

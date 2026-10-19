@@ -638,16 +638,17 @@ fn gemm_candidate(target: crate::atoms::Target, costs: crate::atoms::Costs) -> t
     vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target, costs }))]
 }
 
-/// The fingerprint keys the emitted kernel: a target field (whether the
-/// matrix core issues on the vector unit, read by the ranking alone) or a
-/// cost (the memory latency) no instruction reads leaves it, a field the
-/// lowering reads (the dies the blocks are renumbered over) moves it.
+/// The fingerprint keys the emitted kernel: a target field (the waves a
+/// SIMD schedules, read by the ranking alone) or a cost (the memory
+/// latency) no instruction reads leaves it, a field the lowering reads (the
+/// dies the blocks are renumbered over) moves it.
 #[test]
 fn the_fingerprint_keys_what_is_emitted() {
     let fingerprint = |c| TuneStore::at(None).fingerprint(&[c]);
     let (target, costs) = (crate::atoms::Target::card("mi300x").expect("a listed card"), super::costs());
     let base = fingerprint(gemm_candidate(target.clone(), costs));
-    let planned = crate::atoms::Target { mma_on_valu: !target.mma_on_valu, ..target.clone() };
+    let occupancy = crate::atoms::Occupancy { waves: 2 * target.occupancy.waves, ..target.occupancy };
+    let planned = crate::atoms::Target { occupancy, ..target.clone() };
     assert_eq!(fingerprint(gemm_candidate(planned, costs)), base, "a field only the ranking reads");
     let latency = crate::atoms::Costs { latency: 2.0 * costs.latency, ..costs };
     assert_eq!(fingerprint(gemm_candidate(target.clone(), latency)), base, "a cost only the ranking reads");
