@@ -3,6 +3,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, LayerNorm, Linear, Module};
+use svod_tk3::ops::{self, Attn, Cache, KeyMask};
 
 use crate::init::{Bias, fan_in_uniform, layer_norm, linear};
 use crate::state::{scope_index, scoped, scoped_index};
@@ -11,18 +12,20 @@ use super::attention::MultiHeadAttention;
 use super::blocks::linear_forward;
 use super::config::ModelDimensions;
 use super::error::Result;
-use crate::attention::tk_launch_error;
 
+/// Which step attentions read the packed caches through the op layer's
+/// cached attention; the others splice and gather the caches into SDPA.
 #[derive(Clone, Copy)]
 struct StepAttentionConfig {
-    custom_self: bool,
-    custom_cross: bool,
+    op_self: bool,
+    op_cross: bool,
+    /// Key splits of the cross attention; `None` leaves them to the tune store.
     cross_splits: Option<usize>,
 }
 
 impl Default for StepAttentionConfig {
     fn default() -> Self {
-        Self { custom_self: true, custom_cross: true, cross_splits: None }
+        Self { op_self: true, op_cross: true, cross_splits: None }
     }
 }
 
@@ -30,23 +33,19 @@ impl Default for StepAttentionConfig {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum StepAttentionMode {
     Generic,
-    CustomSelf,
-    CustomCross { split: usize },
-    CustomBoth { split: usize },
+    OpSelf,
+    OpCross { split: usize },
+    OpBoth { split: usize },
 }
 
 #[cfg(test)]
 impl From<StepAttentionMode> for StepAttentionConfig {
     fn from(mode: StepAttentionMode) -> Self {
         match mode {
-            StepAttentionMode::Generic => Self { custom_self: false, custom_cross: false, cross_splits: None },
-            StepAttentionMode::CustomSelf => Self { custom_self: true, custom_cross: false, cross_splits: None },
-            StepAttentionMode::CustomCross { split } => {
-                Self { custom_self: false, custom_cross: true, cross_splits: Some(split) }
-            }
-            StepAttentionMode::CustomBoth { split } => {
-                Self { custom_self: true, custom_cross: true, cross_splits: Some(split) }
-            }
+            StepAttentionMode::Generic => Self { op_self: false, op_cross: false, cross_splits: None },
+            StepAttentionMode::OpSelf => Self { op_self: true, op_cross: false, cross_splits: None },
+            StepAttentionMode::OpCross { split } => Self { op_self: false, op_cross: true, cross_splits: Some(split) },
+            StepAttentionMode::OpBoth { split } => Self { op_self: true, op_cross: true, cross_splits: Some(split) },
         }
     }
 }
@@ -409,8 +408,6 @@ impl TextDecoder {
         }
         let batch = token.dim_const(0)?;
         let self_key_count = self_k_cache.dim_const(1)? + 1;
-        // The cross split is the device's unless the mode names one.
-        let cross_splits = attention.cross_splits;
         let act = |t: Tensor| t.cast(self.activation_dtype.clone());
         let heads = |t: Tensor| -> Result<Tensor> { Ok(t.try_reshape([batch, 1, n_head, d_head])?) };
 
@@ -425,48 +422,38 @@ impl TextDecoder {
             x = block.residual(
                 &x,
                 |h| {
-                    // Sequence-major `[B, 1, H, Dh]` projections feed the custom
-                    // kernel directly and are already in the cache layout.
+                    // Sequence-major `[B, 1, H, Dh]` projections, already in
+                    // the cache layout.
                     let q = heads(linear_forward(&block.attn.query, h)?)?;
                     let new_k = heads(linear_forward(&block.attn.key, h)?)?.cast(self.cache_dtype.clone());
                     let new_v = heads(linear_forward(&block.attn.value, h)?)?.cast(self.cache_dtype.clone());
-
-                    // The kernel scores this layer's packed cache prefix and the
-                    // row just projected, so nothing is spliced: the concatenation
-                    // the generic path needs copies the whole slice every layer.
-                    let direct = if attention.custom_self {
-                        svod_tk::single_query_attention_packed(
-                            &q.cast(DType::Float32),
-                            self_k_cache,
-                            self_v_cache,
-                            lh_start,
-                            svod_tk::SqAttentionOpts {
-                                key_lens: Some(self_key_lens),
-                                appended: Some((&new_k, &new_v)),
-                                ..Default::default()
-                            },
-                        )
-                        .map_err(tk_launch_error)?
+                    let out = if attention.op_self {
+                        // Scores this layer's packed cache prefix and the row
+                        // just projected, so nothing is spliced: the generic
+                        // concatenation copies the whole slice every layer.
+                        let cache = Cache {
+                            head_start: lh_start,
+                            kv_heads: n_head,
+                            row_map: None,
+                            appended: Some((&new_k, &new_v)),
+                        };
+                        let opts = Attn { keys: KeyMask::Lens(self_key_lens), cache: Some(cache), ..Attn::default() };
+                        let out = ops::attention(&q.cast(self.cache_dtype.clone()), self_k_cache, self_v_cache, opts)?;
+                        act(out.try_reshape([batch, 1, self.n_state])?)
                     } else {
-                        None
-                    };
-                    let out = match direct {
-                        Some(out) => act(out.try_reshape([batch, 1, self.n_state])?),
-                        None => {
-                            let full = |cache: &Tensor, new: &Tensor| -> Result<Tensor> {
-                                let layer = cache.narrow(2, lh_start, n_head)?;
-                                Ok(act(Tensor::cat(&[&layer, new], 1)?).try_permute(&[0, 2, 1, 3])?)
-                            };
-                            let valid = cached_step_mask(self_key_lens, self_key_count)?;
-                            q.try_permute(&[0, 2, 1, 3])?
-                                .scaled_dot_product_attention()
-                                .key(&full(self_k_cache, &new_k)?)
-                                .value(&full(self_v_cache, &new_v)?)
-                                .key_padding_mask(&valid)
-                                .is_causal(false)
-                                .call()?
-                                .merge_heads()?
-                        }
+                        let full = |cache: &Tensor, new: &Tensor| -> Result<Tensor> {
+                            let layer = cache.narrow(2, lh_start, n_head)?;
+                            Ok(act(Tensor::cat(&[&layer, new], 1)?).try_permute(&[0, 2, 1, 3])?)
+                        };
+                        let valid = cached_step_mask(self_key_lens, self_key_count)?;
+                        q.try_permute(&[0, 2, 1, 3])?
+                            .scaled_dot_product_attention()
+                            .key(&full(self_k_cache, &new_k)?)
+                            .value(&full(self_v_cache, &new_v)?)
+                            .key_padding_mask(&valid)
+                            .is_causal(false)
+                            .call()?
+                            .merge_heads()?
                     };
                     new_ks.push(new_k);
                     new_vs.push(new_v);
@@ -474,41 +461,31 @@ impl TextDecoder {
                 },
                 |h| {
                     let q = heads(linear_forward(&block.cross_attn.query, h)?)?;
-                    let direct = if attention.custom_cross {
-                        svod_tk::single_query_attention_packed(
-                            &q.cast(DType::Float32),
-                            cross_k,
-                            cross_v,
-                            lh_start,
-                            svod_tk::SqAttentionOpts {
-                                split: cross_splits,
-                                cache_map: Some(cross_cache_map),
-                                ..Default::default()
-                            },
-                        )
-                        .map_err(tk_launch_error)?
+                    // The cache holds one row per attempt, so a lane reads the
+                    // row its attempt owns: an index load in the op's kernel, a
+                    // gather on the generic path.
+                    let out = if attention.op_cross {
+                        let cache = Cache {
+                            head_start: lh_start,
+                            kv_heads: n_head,
+                            row_map: Some(cross_cache_map),
+                            appended: None,
+                        };
+                        let opts = Attn { cache: Some(cache), splits: attention.cross_splits, ..Attn::default() };
+                        let out = ops::attention(&q.cast(self.cache_dtype.clone()), cross_k, cross_v, opts)?;
+                        act(out.try_reshape([batch, 1, self.n_state])?)
                     } else {
-                        None
-                    };
-                    let out = match direct {
-                        Some(out) => act(out.try_reshape([batch, 1, self.n_state])?),
-                        None => {
-                            // The cache holds one row per attempt, so a lane reads the
-                            // row its attempt owns. The tile kernel does that with an
-                            // index load; here it costs a gather, which is why the fast
-                            // path exists.
-                            let owned = |cache: &Tensor| -> Result<Tensor> {
-                                let layer = cache.narrow(2, lh_start, n_head)?.index_select(0, cross_cache_map)?;
-                                Ok(act(layer).try_permute(&[0, 2, 1, 3])?)
-                            };
-                            q.try_permute(&[0, 2, 1, 3])?
-                                .scaled_dot_product_attention()
-                                .key(&owned(cross_k)?)
-                                .value(&owned(cross_v)?)
-                                .is_causal(false)
-                                .call()?
-                                .merge_heads()?
-                        }
+                        let owned = |cache: &Tensor| -> Result<Tensor> {
+                            let layer = cache.narrow(2, lh_start, n_head)?.index_select(0, cross_cache_map)?;
+                            Ok(act(layer).try_permute(&[0, 2, 1, 3])?)
+                        };
+                        q.try_permute(&[0, 2, 1, 3])?
+                            .scaled_dot_product_attention()
+                            .key(&owned(cross_k)?)
+                            .value(&owned(cross_v)?)
+                            .is_causal(false)
+                            .call()?
+                            .merge_heads()?
                     };
                     linear_forward(&block.cross_attn.out, &out)
                 },
