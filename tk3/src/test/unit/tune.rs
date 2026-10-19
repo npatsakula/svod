@@ -6,6 +6,7 @@
 
 use std::cell::Cell;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use svod_dtype::ScalarDType;
 use svod_runtime::KernelResources;
@@ -15,7 +16,7 @@ use crate::atoms::{Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use crate::tune::{self, Bench, ScratchPool, TuneKey, TuneStore, fingerprint};
+use crate::tune::{self, Bench, Kind, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.
 fn key(shape: &[usize], candidates: &[usize]) -> TuneKey {
@@ -52,7 +53,7 @@ fn a_winner_round_trips_through_the_store() {
     let ran = Cell::new(false);
     let chosen = TuneStore::at(Some(dir.clone())).select(&k, 3, || 7, timed(&[Some(300), Some(100), None], &ran));
     assert_eq!((chosen, ran.get()), (Some(1), true));
-    assert_eq!(store_file(&dir), format!("{} 1 100\n", k.line(7)));
+    assert_eq!(store_file(&dir), format!("{} 1 100\n", k.line(Kind::Choice, 7)));
 
     let again = TuneStore::at(Some(dir.clone()));
     let ran = Cell::new(false);
@@ -169,14 +170,14 @@ fn a_stale_index_is_a_miss() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A value is stored as index 0 with the number in the value slot; a second
-/// store on the directory reads it back without measuring.
+/// A value is stored as a `value` line holding the number; a second store
+/// on the directory reads it back without measuring.
 #[test]
 fn a_value_round_trips_through_the_store() {
     let dir = scratch("value");
     let k = key(&[], &[9]);
     assert_eq!(TuneStore::at(Some(dir.clone())).value(&k, || 7, || Some(1234)), Some(1234));
-    assert_eq!(store_file(&dir), format!("{} 0 1234\n", k.line(7)));
+    assert_eq!(store_file(&dir), format!("{} 1234\n", k.line(Kind::Value, 7)));
     let measured = || panic!("measured twice");
     assert_eq!(TuneStore::at(Some(dir.clone())).value(&k, || 7, measured), Some(1234));
     let _ = std::fs::remove_dir_all(dir);
@@ -215,8 +216,26 @@ fn choices_and_values_share_a_file() {
 fn the_compiler_is_part_of_the_line() {
     let base = key(&[8, 8, 8], &[0, 1]);
     let other = TuneKey { compiler: base.compiler ^ 1, ..base.clone() };
-    assert_ne!(base.line(3), other.line(3));
-    assert!(base.line(3).contains(&format!("|{:016x}|", base.compiler)), "{}", base.line(3));
+    assert_ne!(base.line(Kind::Choice, 3), other.line(Kind::Choice, 3));
+    let line = base.line(Kind::Choice, 3);
+    assert!(line.contains(&format!("|{:016x}|", base.compiler)), "{line}");
+}
+
+/// A line the store cannot read (an older format, a stray edit) is a miss
+/// and is dropped at the next write; a line of another kind under the same
+/// key is kept, each kind leading its own line.
+#[test]
+fn an_unreadable_line_is_dropped_at_the_next_write() {
+    let dir = scratch("unreadable");
+    let k = key(&[3, 3, 3], &[0, 1]);
+    let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
+    let kept = format!("{} 42", k.line(Kind::Value, 1));
+    std::fs::write(&path, format!("gemm|sm_86-28sm|BFloat16|3x3x3|0|0|0 1 100\n{kept}\nnonsense\n")).unwrap();
+    let store = TuneStore::at(Some(dir.clone()));
+    assert_eq!(store.entries(&k).len(), 1);
+    assert_eq!(store.select(&k, 2, || 1, || vec![Some(9), Some(4)]), Some(1));
+    assert_eq!(store_file(&dir), format!("{} 1 4\n{kept}\n", k.line(Kind::Choice, 1)));
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A run's time sums its kernels (a candidate is a kernel and its merge);
@@ -236,9 +255,11 @@ fn a_run_needs_every_stamp(stamps: &[(Option<u64>, Option<u64>)]) -> Option<u64>
 fn keys_are_stable(shape: &[usize], candidates: &[usize], same: bool) {
     let base = key(&[1, 704, 512, 512], &[0, 1]);
     let other = key(shape, candidates);
-    assert_eq!(base.line(3) == other.line(3), same);
-    assert!(base.line(3).starts_with("gemm|sm_86-28sm|BFloat16|1x704x512x512|"), "{}", base.line(3));
-    assert_ne!(base.line(3), base.line(4), "the program fingerprint is part of the line");
+    assert_eq!(base.line(Kind::Choice, 3) == other.line(Kind::Choice, 3), same);
+    let line = base.line(Kind::Choice, 3);
+    assert!(line.starts_with("choice|gemm|sm_86-28sm|BFloat16|1x704x512x512|"), "{line}");
+    assert_ne!(line, base.line(Kind::Choice, 4), "the program fingerprint is part of the line");
+    assert_ne!(line, base.line(Kind::Admitted, 3), "the kind is part of the line");
 }
 
 /// Two candidates of one shape run on the same scratch buffers, parameter by
@@ -303,8 +324,29 @@ fn admission_is_memoized(found: Option<Vec<usize>>) {
     let store = TuneStore::at(None);
     let k = key(&[1, 2, 3], &[0, 1, 2]);
     let want = found.clone().map(Into::into);
-    assert_eq!(store.admitted(&k, || found), want);
-    assert_eq!(store.admitted(&k, || unreachable!("compiled twice")), want);
+    assert_eq!(store.admitted(&k, || 7, || found), want);
+    assert_eq!(store.admitted(&k, || 7, || unreachable!("compiled twice")), want);
+}
+
+/// An admission round-trips through the store as an `admitted` line of its
+/// indices, so a second store on the directory judges nothing; under other
+/// programs (a lowering change) it judges again, and a judgement of nothing
+/// is never stored.
+#[test]
+fn an_admission_round_trips_through_the_store() {
+    let dir = scratch("admission");
+    let k = key(&[1, 2, 3], &[0, 1, 2]);
+    let store = TuneStore::at(Some(dir.clone()));
+    assert_eq!(store.admitted(&key(&[9], &[0]), || 7, || None), None);
+    assert!(store.entries(&k).is_empty());
+    assert_eq!(store.admitted(&k, || 7, || Some(vec![3, 0, 5])).as_deref(), Some(&[3, 0, 5][..]));
+    assert_eq!(store_file(&dir), format!("{} 3 0 5\n", k.line(Kind::Admitted, 7)));
+    let again = TuneStore::at(Some(dir.clone()));
+    assert_eq!(again.admitted(&k, || 7, || unreachable!("judged twice")).as_deref(), Some(&[3, 0, 5][..]));
+    let relowered = TuneStore::at(Some(dir.clone()));
+    assert_eq!(relowered.admitted(&k, || 8, || Some(vec![1])).as_deref(), Some(&[1][..]));
+    assert_eq!(store_file(&dir).lines().count(), 2);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Tunes a Nemotron GEMM on the device into a scratch directory; a second
@@ -360,4 +402,57 @@ fn workers_see_the_callers_device() {
     let pinned = DeviceSpec::Amd { device_id: 3 };
     let seen = with_default_device(pinned.clone(), || tune::in_parallel((0..64).collect(), |_: i32| default_device()));
     assert!(seen.iter().all(|d| *d == pinned), "{seen:?}");
+}
+
+/// The timed rounds: every candidate runs once, then only those within
+/// [`CONTENDER`](tune::CONTENDER) of the first round's best run the rest
+/// ([`ROUNDS`] in all); a candidate that fails (a run of 0 here, its list
+/// run out) is excluded for good, whichever round it fails in; nothing
+/// running leaves every candidate `None`. A candidate's list repeats its
+/// last run.
+#[test_case(&[&[100], &[150], &[110], &[500]], &[4, 1, 4, 1], &[Some(100), Some(150), Some(110), Some(500)]; "losers run once")]
+#[test_case(&[&[100, 90, 95, 92], &[118, 121]], &[4, 2], &[Some(90), Some(118)]; "past the bound a contender stops, its minimum standing")]
+#[test_case(&[&[100], &[]], &[4, 1], &[Some(100), None]; "a failure in the first round")]
+#[test_case(&[&[100], &[105, 104, 0]], &[4, 3], &[Some(100), None]; "a failure in a later round")]
+#[test_case(&[&[], &[]], &[1, 1], &[None, None]; "nothing runs")]
+#[test_case(&[], &[], &[]; "no candidates")]
+fn contenders_run_the_later_rounds(runs: &[&[u64]], want_calls: &[usize], want: &[Option<u64>]) {
+    use std::cell::RefCell;
+    let calls = RefCell::new(vec![0usize; runs.len()]);
+    let got = tune::rounds(runs.len(), |i| {
+        let mut calls = calls.borrow_mut();
+        let run = runs[i].get(calls[i]).or(runs[i].last()).copied();
+        calls[i] += 1;
+        run.filter(|&t| t > 0).map(Duration::from_nanos)
+    });
+    assert_eq!(got.iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect::<Vec<_>>(), want);
+    assert_eq!(*calls.borrow(), want_calls);
+}
+
+/// A candidate's plan is prepared for its measurement alone: two scratch
+/// plans of one program hold two compiled kernels, neither published for
+/// the other, while the same program launched as an op is compiled once.
+#[test]
+fn a_scratch_plan_publishes_nothing() {
+    let Some(planner) = super::device_planner() else {
+        eprintln!("skipped: no GPU with tk3 tables");
+        return;
+    };
+    let device = &planner.device;
+    let cfg = super::first_eight(&planner.gemm_ranked(1, 704, 512, 512, false))[0];
+    let spec = GemmSpec { m: 704, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
+    let pool = ScratchPool::default();
+    let scratch = || tune::scratch_plan(gemm::<BF16>(&spec), &cfg.lowering(device), &pool).expect("a plan");
+    let kernels = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(std::ptr::from_ref).collect::<Vec<_>>();
+    let (first, second) = (scratch(), scratch());
+    assert!(!kernels(&first.0).is_empty());
+    assert!(kernels(&first.0).iter().zip(kernels(&second.0)).all(|(a, b)| !std::ptr::eq(*a, b)));
+    let launched = || {
+        let buffers = pool.buffers(&gemm::<BF16>(&spec).params);
+        let tensors: Vec<&svod_tensor::Tensor> = buffers.iter().collect();
+        let out = crate::launch::graph_launch(gemm::<BF16>(&spec), &cfg.lowering(device), &tensors);
+        out.expect("a launch").prepare().expect("a plan")
+    };
+    let (first, second) = (launched(), launched());
+    assert!(kernels(&first).iter().zip(kernels(&second)).all(|(a, b)| std::ptr::eq(*a, b)));
 }

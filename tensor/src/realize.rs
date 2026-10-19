@@ -694,8 +694,10 @@ fn schedule_result_from_sink_with_cache(
             let kernel_graph = wrap_scan_loops_verified(kernel_graph)?;
             let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
             let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { pre_schedule: Arc::new(pre_schedule) });
-            let guard = cache.guard();
-            cache.insert(sched_key.clone(), Arc::clone(&new_entry), &guard);
+            if !config.ephemeral {
+                let guard = cache.guard();
+                cache.insert(sched_key.clone(), Arc::clone(&new_entry), &guard);
+            }
             Ok::<_, Error>(new_entry)
         },
     )?;
@@ -1282,8 +1284,10 @@ impl KernelSite {
         }
     }
 
-    /// Render and compile a named optimized kernel, then publish it under `key`.
-    fn compile(&self, optimized: Arc<UOp>) -> Result<Arc<CachedKernel>> {
+    /// Render and compile a named optimized kernel, then publish it under
+    /// `key`; an `ephemeral` prepare reads the compiled-program cache but
+    /// publishes in neither.
+    fn compile(&self, optimized: Arc<UOp>, ephemeral: bool) -> Result<Arc<CachedKernel>> {
         let program =
             svod_codegen::program_pipeline::program_from_sink_with_renderer(optimized, self.device.renderer.as_ref())
                 .context(RenderKernelSnafu)?;
@@ -1292,30 +1296,34 @@ impl KernelSite {
             program.toposort().iter().all(|node| node.origin().is_none()),
             "rendered programs inherit the stripped body, so the compiled-program cache stays shared"
         );
-        let result = svod_runtime::kernel_cache::get_or_compile_kernel(
-            crate::schedule_cache::content_hash(&program),
-            codegen,
-            || {
-                let (spec, compiled) = compile_with_program_pipeline_components(
-                    program.clone(),
-                    self.device.renderer.as_ref(),
-                    self.device.compiler.as_ref(),
-                )?;
-                let program = (self.device.runtime)(&compiled).context(CreateProgramSnafu)?;
-                Ok::<_, Error>(CachedKernel {
-                    program,
-                    device: codegen.to_string(),
-                    code: spec.src,
-                    entry_point: spec.name,
-                    var_names: spec.var_names,
-                    globals: spec.globals,
-                    outs: spec.outs,
-                    ins: spec.ins,
-                    global_size: spec.global_size,
-                    local_size: spec.local_size,
-                })
-            },
-        )?;
+        let hash = crate::schedule_cache::content_hash(&program);
+        let compile = || {
+            let (spec, compiled) = compile_with_program_pipeline_components(
+                program.clone(),
+                self.device.renderer.as_ref(),
+                self.device.compiler.as_ref(),
+            )?;
+            let program = (self.device.runtime)(&compiled).context(CreateProgramSnafu)?;
+            Ok::<_, Error>(CachedKernel {
+                program,
+                device: codegen.to_string(),
+                code: spec.src,
+                entry_point: spec.name,
+                var_names: spec.var_names,
+                globals: spec.globals,
+                outs: spec.outs,
+                ins: spec.ins,
+                global_size: spec.global_size,
+                local_size: spec.local_size,
+            })
+        };
+        if ephemeral {
+            return match svod_runtime::kernel_cache::cached_kernel(hash, codegen) {
+                Some(kernel) => Ok(kernel),
+                None => Ok(Arc::new(compile()?)),
+            };
+        }
+        let result = svod_runtime::kernel_cache::get_or_compile_kernel(hash, codegen, compile)?;
         opt_cache().insert(self.key.clone(), Arc::clone(&result));
         Ok(result)
     }
@@ -1327,7 +1335,7 @@ impl KernelSite {
     fn build(&self, config: &PrepareConfig) -> Result<Arc<CachedKernel>> {
         let _detached = svod_ir::origin::OriginScope::suspend();
         let optimized = self.optimize(config)?;
-        self.compile(finalize_kernel_name(&optimized))
+        self.compile(finalize_kernel_name(&optimized), config.ephemeral)
     }
 
     fn cached(&self) -> Option<Arc<CachedKernel>> {
@@ -1389,7 +1397,7 @@ fn compile_missing_kernels(
 
     let compiled = map_on_threads(threads, named, |((site, ticket), ast)| {
         let _detached = svod_ir::origin::OriginScope::suspend();
-        let compiled = site.compile(ast);
+        let compiled = site.compile(ast, config.ephemeral);
         drop(ticket);
         compiled.map(|kernel| (site.key.clone(), kernel))
     });

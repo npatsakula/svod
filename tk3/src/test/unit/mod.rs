@@ -26,7 +26,7 @@ use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use crate::ops::config::{Planner, SHORTLIST};
+use crate::ops::config::Planner;
 
 /// The default device's target when tk3 has tables for it, of any vendor.
 fn device_target() -> Option<Target> {
@@ -53,14 +53,18 @@ pub(crate) fn tuned_on_device<C: crate::ops::config::Tiled + PartialEq + std::fm
 ) -> (Vec<C>, Option<C>) {
     let mut tuner = crate::ops::Tuner::new(&planner.device, dtype, shape, "a device test", build);
     let candidates = expand(&tuner.admitted(op, ranked));
-    let pick = (!candidates.is_empty()).then(|| tuner.fastest(op, &candidates));
+    let pick = (!candidates.is_empty()).then(|| {
+        let winner = tuner.fastest(op, &candidates);
+        tuner.pipelined(op, winner, ranked)
+    });
     (candidates, pick)
 }
 
-/// The first [`SHORTLIST`] tiles of a ranking: a host test's stand-in for the
-/// tuner's admission, which compiles on a device.
+/// The front of a ranking: its first eight tiles, what a host test judges
+/// a ranking by (the tuner's shortlist, which compiles on a device, runs
+/// [`SHORTLIST`](crate::ops::config::SHORTLIST) deep).
 pub(crate) fn first_eight<C: crate::ops::config::Tiled>(ranked: &[C]) -> Vec<C> {
-    crate::ops::config::distinct(ranked).take(SHORTLIST).collect()
+    crate::ops::config::distinct(ranked).take(8).collect()
 }
 
 /// The convolution candidates of a ranking's [`first_eight`].

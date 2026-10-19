@@ -90,12 +90,13 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
 /// and the programs a config builds, compiled once on one [`Bench`] for
 /// every pass that asks (admission, the choice, later knobs). Each pass is
 /// a list under an op name: [`Self::admitted`] keeps the first
-/// [`SHORTLIST`](config::SHORTLIST) of a ranked list whose compiled kernels
-/// do not spill (all spilling: the first that compile; nothing compiling,
-/// no device: the first, untested), and [`Self::fastest`] times a list on a
-/// store miss. With tuning off (`SVOD_TK3_TUNE=0`) no candidate is timed
-/// and the first admitted one is taken; admission still compiles, and the
-/// device's cost probes still measure once ([`planner`]).
+/// [`SHORTLIST`](config::SHORTLIST) tiles of a ranked list whose compiled
+/// kernels do not spill (all spilling: the first that compile; nothing
+/// compiling, no device: the first, untested), [`Self::fastest`] times a
+/// list on a store miss, and [`Self::pipelined`] times the winning tile's
+/// other pipelines. With tuning off (`SVOD_TK3_TUNE=0`) no candidate is
+/// timed and the first admitted one is taken; admission still compiles,
+/// and the device's cost probes still measure once ([`planner`]).
 pub(crate) struct Tuner<'a, C, B> {
     target: &'a Target,
     compiler: u64,
@@ -121,18 +122,26 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         }
     }
 
+    /// The fingerprint of the programs `build` makes of `list`, what an
+    /// admission's store line carries: a lowering change re-judges.
+    fn programs(build: &B, list: &[C]) -> u64 {
+        tune::fingerprint(&list.iter().map(|&c| build(c)).collect::<Vec<_>>())
+    }
+
     fn key(&self, op: &'static str, list: &[C]) -> TuneKey {
         let candidates = format!("{} {list:?}", self.salt);
         TuneKey::new(op, self.target, self.compiler, self.dtype, self.shape, &candidates)
     }
 
     /// The configs of `ranked` (best guess first) the tuner chooses among
-    /// ([`config::shortlist`]), compiled in ranked batches and memoized for
-    /// the process.
+    /// ([`config::shortlist`]), compiled in ranked batches on a store miss
+    /// and kept in the store under the shortlist's programs.
     pub(crate) fn admitted(&mut self, op: &'static str, ranked: &[C]) -> Vec<C> {
         let key = self.key(op, ranked);
         let (bench, build) = (&mut self.bench, &self.build);
-        let found = TuneStore::global().admitted(&key, || config::shortlist(ranked, |batch| bench.admit(batch, build)));
+        let programs = || Self::programs(build, &ranked[..ranked.len().min(config::SHORTLIST)]);
+        let admit = || config::shortlist(ranked, |batch| bench.admit(batch, build));
+        let found = TuneStore::global().admitted(&key, programs, admit);
         match found {
             Some(at) => at.iter().map(|&i| ranked[i]).collect(),
             None => config::distinct(ranked).take(config::SHORTLIST).collect(),
@@ -152,10 +161,32 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
 
     /// The candidate to launch: `expand` makes the admitted configs of
     /// `ranked` the candidates (adding variants, such as key splits, the
-    /// plain one first), and the fastest is taken.
+    /// plain one first), the fastest is taken, and the fastest of its tile's
+    /// pipelines ([`Self::pipelined`]) is the choice.
     pub(crate) fn tuned(&mut self, op: &'static str, ranked: &[C], expand: impl Fn(&[C]) -> Vec<C>) -> C {
         let candidates = expand(&self.admitted(op, ranked));
-        self.fastest(op, &candidates)
+        let winner = self.fastest(op, &candidates);
+        self.pipelined(op, winner, ranked)
+    }
+
+    /// The fastest pipeline of `winner`'s tile: its [twins](config::Tiled::twins)
+    /// in `ranked` compiled and timed together, the winner among them (the
+    /// shortlist held one pipeline per tile, the model's first clean one).
+    /// The winner itself with tuning off, alone, or where no other twin
+    /// compiles to be judged.
+    pub(crate) fn pipelined(&mut self, op: &'static str, winner: C, ranked: &[C]) -> C {
+        let twins: Vec<C> = config::distinct_configs(&winner.twins(ranked));
+        if !tune::enabled() || twins.len() < 2 {
+            return winner;
+        }
+        let key = self.key(op, &twins);
+        let (bench, build) = (&mut self.bench, &self.build);
+        let admit = || config::clean(&twins, |batch| bench.admit(batch, build));
+        let judged = TuneStore::global().admitted(&key, || Self::programs(build, &twins), admit);
+        match judged {
+            Some(at) if at.len() > 1 => self.fastest(op, &at.iter().map(|&i| twins[i]).collect::<Vec<_>>()),
+            _ => winner,
+        }
     }
 }
 
