@@ -95,8 +95,10 @@ fn users(nodes: &[Arc<UOp>]) -> HashMap<u64, Vec<&Arc<UOp>>> {
 }
 
 /// On RDNA4 an element a transposing load brings from past its view's
-/// bounds reads zero, as every register load's does: each element received
-/// is selected at its own coordinate, a lane receiving other lanes' rows.
+/// bounds reads zero, as every register load's does: every read of a
+/// register it fills selects the element at its own coordinate (a lane
+/// receives other lanes' rows), except a store of it as it is that a branch
+/// on the view not holding its whole tile then stores again selected.
 /// Attention's bounded values and a GEMM's bounded residual load this way.
 #[test_case("attention d64 causal #0"; "keys past the length")]
 #[test_case("attention d64 cache"; "the appended keys")]
@@ -104,20 +106,79 @@ fn users(nodes: &[Arc<UOp>]) -> HashMap<u64, Vec<&Arc<UOp>>> {
 fn a_transposed_element_past_the_bounds_reads_zero(family: &str) {
     let launches = families(&amd(AmdArch::Gfx1201, 64));
     let (_, prog, lowering) = launches.into_iter().find(|(n, ..)| n.starts_with(family)).unwrap();
-    let nodes = linear(prog, &lowering).toposort();
+    let linear = linear(prog, &lowering);
+    let nodes = linear.toposort();
     let users = users(&nodes);
+    let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
     let custom =
         |u: &Arc<UOp>, what: &str| matches!(u.op(), Op::Custom(ops::Custom { code, .. }) if code.contains(what));
-    let loads: Vec<_> = nodes.iter().filter(|u| custom(u, "global.load.tr")).collect();
-    assert!(!loads.is_empty(), "{family}: no transposing load");
-    for load in loads {
-        for elem in users[&load.id].iter().filter(|u| custom(u, "extractelement")) {
-            let selected = users[&elem.id].iter().filter(|u| !matches!(u.op(), Op::Linear(..))).all(|u| {
-                matches!(u.op(), Op::Ternary(svod_ir::TernaryOp::Where, _, t, f) if t.id == elem.id && f.id != elem.id)
-            });
-            assert!(selected, "{family}: a transposed element is used unselected");
+    let filled =
+        |u: &Arc<UOp>| custom(u, "extractelement") && u.op().sources().iter().any(|s| custom(s, "global.load.tr"));
+    // The register accesses the loads fill, and the branches of the list.
+    let unchecked: Vec<u64> = list
+        .iter()
+        .filter_map(|u| match u.op() {
+            Op::Store(ops::Store { index, value, .. }) if filled(value) => Some(index.id),
+            _ => None,
+        })
+        .collect();
+    assert!(!unchecked.is_empty(), "{family}: no transposing load");
+    let at: HashMap<u64, usize> = list.iter().enumerate().map(|(i, u)| (u.id, i)).collect();
+    let branches: Vec<(Arc<UOp>, usize, usize)> = list
+        .iter()
+        .enumerate()
+        .filter_map(|(end, u)| match u.op() {
+            Op::EndIf(ops::EndIf { if_op }) => match if_op.op() {
+                Op::If(ops::If { condition, .. }) => Some((condition.clone(), at[&if_op.id], end)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    // Under a branch on a tile not lying inside its bounds whole.
+    let outside = |i: usize| {
+        branches
+            .iter()
+            .any(|(c, open, close)| *open < i && i < *close && matches!(c.op(), Op::Unary(svod_ir::UnaryOp::Not, _)))
+    };
+    let selects = |read: &Arc<UOp>| {
+        users[&read.id].iter().filter(|u| !matches!(u.op(), Op::Linear(..))).all(
+            |u| matches!(u.op(), Op::Ternary(svod_ir::TernaryOp::Where, _, t, f) if t.id == read.id && f.id != read.id),
+        )
+    };
+    // The register reads each store of the list writes, as they are or
+    // selected: (register, memory, selected, position).
+    // (register read, register, memory, selected, position) of every
+    // element a store of the list writes from a register a load fills.
+    let register = |u: &Arc<UOp>| match u.op() {
+        Op::Load(ops::Load { index, .. }) if unchecked.contains(&index.id) => Some((u.id, index.id, false)),
+        Op::Ternary(svod_ir::TernaryOp::Where, _, t, _) => match t.op() {
+            Op::Load(ops::Load { index, .. }) if unchecked.contains(&index.id) => Some((t.id, index.id, true)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut stored = vec![];
+    for (i, u) in list.iter().enumerate() {
+        let Op::Store(ops::Store { index, value, .. }) = u.op() else { continue };
+        let parts: Vec<Arc<UOp>> =
+            if register(value).is_some() { vec![value.clone()] } else { value.op().sources().into_iter().collect() };
+        stored.extend(parts.iter().filter_map(register).map(|(read, reg, sel)| (read, reg, index.id, sel, i)));
+    }
+    let mut as_is = std::collections::HashSet::new();
+    for &(read, reg, mem, sel, i) in &stored {
+        if !sel {
+            let again = stored.iter().any(|&(_, r, m, sel, j)| r == reg && m == mem && sel && j > i && outside(j));
+            assert!(again, "{family}: a transposed element is stored as it is and never again selected");
+            as_is.insert(read);
         }
     }
+    // Every other read of such a register selects.
+    let reads =
+        list.iter().filter(|u| matches!(u.op(), Op::Load(ops::Load { index, .. }) if unchecked.contains(&index.id)));
+    let others: Vec<_> = reads.filter(|u| !as_is.contains(&u.id)).collect();
+    assert!(!others.is_empty(), "{family}: no read of a transposed element is selected");
+    assert!(others.iter().all(|u| selects(u)), "{family}: a transposed element is read unselected");
 }
 
 /// A scalar read whose index may leave its parameter stays under the branch
