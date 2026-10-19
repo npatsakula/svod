@@ -40,11 +40,9 @@ fn loop_carries_registers_and_bounds_gate_the_tail() {
     let mut k = Kernel::new("prefix");
     let x = k.param::<F32>("x", ParamKind::In, rows * cols);
     let y = k.param::<F32>("y", ParamKind::Out, rows);
-    let bound = k.c(valid);
-    let view = k.view(x, 0, [cols, 1], Shape::new(rows, 1), [None, Some(bound)]);
+    let view = k.view(x, 0, [cols, 1], Shape::new(rows, 1), [None, Some(Sc::from(valid))]);
     let acc0 = k.zeros::<F32>(Shape::new(rows, 1));
-    let trips = k.c(cols as i64);
-    let [acc] = k.loop_(trips, [acc0], |k, i, [acc]| {
+    let [acc] = k.loop_(cols, [acc0], |k, i, [acc]| {
         let col = k.at(view, 0, i);
         let v = k.load(col);
         [k.binary(acc, v, BinaryOp::Add)]
@@ -71,9 +69,8 @@ fn online_softmax_normalizer_matches_the_direct_one() {
     let view = k.view(x, 0, [cols, 1], Shape::new(rows, blk), [None, None]);
     let m0 = k.fill::<F32>(Shape::new(rows, 1), Const::Float(f64::NEG_INFINITY));
     let l0 = k.zeros::<F32>(Shape::new(rows, 1));
-    let trips = k.c((cols / blk) as i64);
-    let [_m, l_acc] = k.loop_(trips, [m0, l0], |k, i, [m, l]| {
-        let off = k.mul(i, blk);
+    let [_m, l_acc] = k.loop_(cols / blk, [m0, l0], |k, i, [m, l]| {
+        let off = i * blk;
         let block = k.at(view, 0, off);
         let s = k.load(block);
         let bmax = k.reduce(s, Axis::Row, ReduceOp::Max);

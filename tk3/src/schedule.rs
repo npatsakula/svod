@@ -16,7 +16,9 @@ pub enum Prefetch {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Schedule {
-    Uniform { prefetch: Prefetch },
+    /// Every warp loads and computes; `unroll` copies the loop body once per
+    /// ring slot so slot addressing folds to constants.
+    Uniform { prefetch: Prefetch, unroll: bool },
 }
 
 /// Replace every [`Stmt::Pipeline`] of `prog` by loops, branches and explicit
@@ -74,15 +76,20 @@ impl Expander<'_> {
         let Pipeline { extent, stages, carried, produce, consume } = p;
         let produce = Stage { body: self.block(produce.body), ..produce };
         let consume = Stage { body: self.block(consume.body), ..consume };
-        match self.schedule {
-            Schedule::Uniform { prefetch: Prefetch::CpAsync } if stages >= 2 => {
-                self.cp_async(extent, stages, carried, produce, consume)
-            }
-            Schedule::Uniform { prefetch: Prefetch::CpAsync } => self.single_stage(extent, carried, produce, consume),
-            Schedule::Uniform { prefetch: Prefetch::RegisterStaged } => {
-                self.register_staged(extent, stages, carried, produce, consume)
+        let Schedule::Uniform { prefetch, unroll } = self.schedule;
+        let mut out = match prefetch {
+            Prefetch::CpAsync if stages >= 2 => self.cp_async(extent, stages, carried, produce, consume),
+            Prefetch::CpAsync => self.single_stage(extent, carried, produce, consume),
+            Prefetch::RegisterStaged => self.register_staged(extent, stages, carried, produce, consume),
+        };
+        if !unroll {
+            for stmt in &mut out {
+                if let Stmt::Loop(l) = stmt {
+                    l.unroll = 1;
+                }
             }
         }
+        out
     }
 
     fn if_(pred: ScalarId, then: Vec<Stmt>) -> Stmt {
@@ -120,7 +127,7 @@ impl Expander<'_> {
             Self::if_(producing, produce.body.0),
             Stmt::Sync(Sync::CommitAsync),
         ];
-        vec![Stmt::Loop(Loop { iv, extent: total, carried, body: Block(body) })]
+        vec![Stmt::Loop(Loop { iv, extent: total, carried, body: Block(body), unroll: stages as u32 })]
     }
 
     /// One slot: copy, wait, consume, and fence before the slot is refilled.
@@ -139,7 +146,7 @@ impl Expander<'_> {
         ]);
         body.extend(consume.body.0);
         body.push(Stmt::Sync(Sync::Barrier { role: None }));
-        vec![Stmt::Loop(Loop { iv, extent, carried, body: Block(body) })]
+        vec![Stmt::Loop(Loop { iv, extent, carried, body: Block(body), unroll: 1 })]
     }
 
     /// Two slots: every iteration loads step `i` into registers, consumes step
@@ -185,6 +192,6 @@ impl Expander<'_> {
             Self::if_(producing, commit),
             Stmt::Sync(Sync::Barrier { role: None }),
         ];
-        vec![Stmt::Loop(Loop { iv, extent: total, carried, body: Block(body) })]
+        vec![Stmt::Loop(Loop { iv, extent: total, carried, body: Block(body), unroll: 2 })]
     }
 }

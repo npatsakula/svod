@@ -1,9 +1,11 @@
 //! The recording builder: every call appends a statement to the open block
 //! and hands back a tier-typed handle. Tiles carry their tier and element type
 //! in the Rust type; shapes are checked when the statement is recorded.
+//! Scalars are ordinary expressions with operators, interned when consumed.
 
 use std::marker::PhantomData;
 use std::ops::Range;
+use std::rc::Rc;
 
 use svod_dtype::ScalarDType;
 
@@ -66,27 +68,62 @@ pub type Gmem<T> = Tile<Global, T>;
 pub type Shared<T> = Tile<Smem, T>;
 pub type Regs<T> = Tile<Reg, T>;
 
-/// A scalar expression handle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Sc(pub ScalarId);
-
-/// Scalar operands: handles, or integers recorded as constants.
-pub trait IntoSc {
-    fn into_sc(self, k: &mut Kernel) -> Sc;
+/// A scalar expression: built with ordinary operators, interned into the
+/// program's arena by the builder call that consumes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Sc {
+    Id(ScalarId),
+    Const(i64),
+    Bin(BinOp, Rc<Sc>, Rc<Sc>),
 }
-impl IntoSc for Sc {
-    fn into_sc(self, _: &mut Kernel) -> Sc {
-        self
+
+impl Sc {
+    fn bin(self, op: BinOp, rhs: impl Into<Sc>) -> Sc {
+        Sc::Bin(op, Rc::new(self), Rc::new(rhs.into()))
+    }
+    pub fn min(self, rhs: impl Into<Sc>) -> Sc {
+        self.bin(BinOp::Min, rhs)
+    }
+    pub fn max(self, rhs: impl Into<Sc>) -> Sc {
+        self.bin(BinOp::Max, rhs)
+    }
+    pub fn lt(self, rhs: impl Into<Sc>) -> Sc {
+        self.bin(BinOp::Lt, rhs)
+    }
+    pub fn le(self, rhs: impl Into<Sc>) -> Sc {
+        self.bin(BinOp::Le, rhs)
+    }
+    pub fn eq(self, rhs: impl Into<Sc>) -> Sc {
+        self.bin(BinOp::Eq, rhs)
+    }
+    pub fn and(self, rhs: impl Into<Sc>) -> Sc {
+        self.bin(BinOp::And, rhs)
+    }
+    pub fn or(self, rhs: impl Into<Sc>) -> Sc {
+        self.bin(BinOp::Or, rhs)
     }
 }
-macro_rules! into_sc {
-    ($($t:ty),*) => {$(impl IntoSc for $t {
-        fn into_sc(self, k: &mut Kernel) -> Sc {
-            k.c(self as i64)
+
+macro_rules! sc_from {
+    ($($t:ty),*) => {$(impl From<$t> for Sc {
+        fn from(v: $t) -> Sc {
+            Sc::Const(v as i64)
         }
     })*};
 }
-into_sc!(i64, i32, usize, u32);
+sc_from!(i64, i32, usize, u32);
+
+macro_rules! sc_ops {
+    ($($trait:ident $method:ident $op:ident),*) => {$(
+        impl<R: Into<Sc>> std::ops::$trait<R> for Sc {
+            type Output = Sc;
+            fn $method(self, rhs: R) -> Sc {
+                self.bin(BinOp::$op, rhs)
+            }
+        }
+    )*};
+}
+sc_ops!(Add add Add, Sub sub Sub, Mul mul Mul, Div div Div, Rem rem Rem);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParamRef<T>(pub ParamId, PhantomData<T>);
@@ -113,8 +150,8 @@ impl Kernel {
             },
             blocks: vec![Block::default()],
         };
-        let one = k.c(1);
-        k.prog.grid = [one.0; 3];
+        let one = k.push_scalar(Scalar::Const(1));
+        k.prog.grid = [one; 3];
         k
     }
 
@@ -135,7 +172,7 @@ impl Kernel {
     }
 
     pub fn grid(&mut self, dims: [Sc; 3]) {
-        self.prog.grid = dims.map(|s| s.0);
+        self.prog.grid = dims.map(|s| self.intern(s));
     }
 
     pub fn warps(&mut self, warps: u32) {
@@ -154,47 +191,39 @@ impl Kernel {
 
     // ---- scalars ---------------------------------------------------------
 
-    fn scalar(&mut self, s: Scalar) -> Sc {
+    fn push_scalar(&mut self, s: Scalar) -> ScalarId {
         self.prog.scalars.push(s);
-        Sc(ScalarId(self.prog.scalars.len() as u32 - 1))
+        ScalarId(self.prog.scalars.len() as u32 - 1)
     }
 
-    pub fn c(&mut self, v: i64) -> Sc {
-        self.scalar(Scalar::Const(v))
+    fn scalar(&mut self, s: Scalar) -> Sc {
+        Sc::Id(self.push_scalar(s))
     }
+
+    /// Intern an expression into the arena.
+    pub fn intern(&mut self, sc: impl Into<Sc>) -> ScalarId {
+        match sc.into() {
+            Sc::Id(id) => id,
+            Sc::Const(v) => self.push_scalar(Scalar::Const(v)),
+            Sc::Bin(op, a, b) => {
+                let (a, b) = (self.intern((*a).clone()), self.intern((*b).clone()));
+                self.push_scalar(Scalar::Bin(op, a, b))
+            }
+        }
+    }
+
     pub fn block(&mut self, axis: u8) -> Sc {
         self.scalar(Scalar::Special(Special::Block(axis)))
     }
+
     pub fn warp(&mut self) -> Sc {
         self.scalar(Scalar::Special(Special::Warp))
     }
-    pub fn bin(&mut self, op: BinOp, a: impl IntoSc, b: impl IntoSc) -> Sc {
-        let (a, b) = (a.into_sc(self), b.into_sc(self));
-        self.scalar(Scalar::Bin(op, a.0, b.0))
-    }
-    pub fn add(&mut self, a: impl IntoSc, b: impl IntoSc) -> Sc {
-        self.bin(BinOp::Add, a, b)
-    }
-    pub fn sub(&mut self, a: impl IntoSc, b: impl IntoSc) -> Sc {
-        self.bin(BinOp::Sub, a, b)
-    }
-    pub fn mul(&mut self, a: impl IntoSc, b: impl IntoSc) -> Sc {
-        self.bin(BinOp::Mul, a, b)
-    }
-    pub fn div(&mut self, a: impl IntoSc, b: impl IntoSc) -> Sc {
-        self.bin(BinOp::Div, a, b)
-    }
-    pub fn rem(&mut self, a: impl IntoSc, b: impl IntoSc) -> Sc {
-        self.bin(BinOp::Rem, a, b)
-    }
-    pub fn min(&mut self, a: impl IntoSc, b: impl IntoSc) -> Sc {
-        self.bin(BinOp::Min, a, b)
-    }
-    pub fn max(&mut self, a: impl IntoSc, b: impl IntoSc) -> Sc {
-        self.bin(BinOp::Max, a, b)
-    }
-    pub fn load_scalar<T: Elem>(&mut self, param: ParamRef<T>, index: Sc) -> Sc {
-        self.scalar(Scalar::Load { param: param.0, index: index.0 })
+
+    /// `param[index]` of an integer parameter.
+    pub fn load_scalar<T: Elem>(&mut self, param: ParamRef<T>, index: impl Into<Sc>) -> Sc {
+        let index = self.intern(index);
+        self.scalar(Scalar::Load { param: param.0, index })
     }
 
     // ---- views -----------------------------------------------------------
@@ -209,46 +238,43 @@ impl Kernel {
     }
 
     /// A `shape` window at `offset` elements into `param`, rows `stride.0`
-    /// apart and columns `stride.1` apart.
+    /// apart and columns `stride.1` apart; `bounds` are its valid row/column
+    /// counts (reads past them yield zero, writes are dropped).
     pub fn view<T: Elem>(
         &mut self,
         param: ParamRef<T>,
-        offset: impl IntoSc,
-        stride: [impl IntoSc; 2],
+        offset: impl Into<Sc>,
+        stride: [impl Into<Sc>; 2],
         shape: Shape,
         bounds: [Option<Sc>; 2],
     ) -> Gmem<T> {
-        let offset = offset.into_sc(self).0;
-        let stride = stride.map(|s| s.into_sc(self).0);
-        let place = Place::Global { param: param.0, offset, stride, bounds: bounds.map(|b| b.map(|s| s.0)) };
-        Tile::new(self.value(T::DTYPE, shape, place))
+        let offset = self.intern(offset);
+        let stride = stride.map(|s| self.intern(s));
+        let bounds = bounds.map(|b| b.map(|s| self.intern(s)));
+        Tile::new(self.value(T::DTYPE, shape, Place::Global { param: param.0, offset, stride, bounds }))
     }
 
     /// The same window moved by `rows`/`cols` elements, keeping its bounds
     /// relative to the new origin.
-    pub fn at<T: Elem>(&mut self, view: Gmem<T>, rows: impl IntoSc, cols: impl IntoSc) -> Gmem<T> {
-        let (rows, cols) = (rows.into_sc(self), cols.into_sc(self));
+    pub fn at<T: Elem>(&mut self, view: Gmem<T>, rows: impl Into<Sc>, cols: impl Into<Sc>) -> Gmem<T> {
+        let (rows, cols) = (rows.into(), cols.into());
         let Value { dtype, shape, place } = self.prog.value(view.0).clone();
         let Place::Global { param, offset, stride, bounds } = place else { unreachable!("global tier") };
-        let r = self.mul(rows, Sc(stride[0]));
-        let c = self.mul(cols, Sc(stride[1]));
-        let moved = self.add(Sc(offset), r);
-        let moved = self.add(moved, c);
-        let bounds = [(bounds[0], rows), (bounds[1], cols)].map(|(b, by)| b.map(|b| self.sub(Sc(b), by).0));
-        let place = Place::Global { param, offset: moved.0, stride, bounds };
-        Tile::new(self.value(dtype, shape, place))
+        let moved = Sc::Id(offset) + rows.clone() * Sc::Id(stride[0]) + cols.clone() * Sc::Id(stride[1]);
+        let offset = self.intern(moved);
+        let bounds = [(bounds[0], rows), (bounds[1], cols)].map(|(b, by)| b.map(|b| self.intern(Sc::Id(b) - by)));
+        Tile::new(self.value(dtype, shape, Place::Global { param, offset, stride, bounds }))
     }
 
-    pub fn smem_view<T: Elem>(&mut self, alloc: SmemId, offset: impl IntoSc, shape: Shape) -> Shared<T> {
+    pub fn smem_view<T: Elem>(&mut self, alloc: SmemId, offset: impl Into<Sc>, shape: Shape) -> Shared<T> {
         assert_eq!(self.prog.smem[alloc.index()].dtype, T::DTYPE, "shared allocation dtype");
-        let offset = offset.into_sc(self).0;
+        let offset = self.intern(offset);
         Tile::new(self.value(T::DTYPE, shape, Place::Smem { alloc, offset }))
     }
 
     /// Slot `slot` of a ring of `shape` tiles in `alloc`.
-    pub fn smem_slot<T: Elem>(&mut self, alloc: SmemId, slot: impl IntoSc, shape: Shape) -> Shared<T> {
-        let offset = self.mul(slot, shape.elems());
-        self.smem_view(alloc, offset, shape)
+    pub fn smem_slot<T: Elem>(&mut self, alloc: SmemId, slot: impl Into<Sc>, shape: Shape) -> Shared<T> {
+        self.smem_view(alloc, slot.into() * shape.elems(), shape)
     }
 
     // ---- tile ops --------------------------------------------------------
@@ -396,16 +422,17 @@ impl Kernel {
     /// tiles; returns the values after the last iteration.
     pub fn loop_<T: Elem, const N: usize>(
         &mut self,
-        extent: Sc,
+        extent: impl Into<Sc>,
         init: [Regs<T>; N],
         body: impl FnOnce(&mut Self, Sc, [Regs<T>; N]) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
-        let iv = self.scalar(Scalar::Induction);
+        let extent = self.intern(extent);
+        let iv = self.push_scalar(Scalar::Induction);
         let phi = self.carried(init.map(ValId::from));
         let mut next = [ValId(0); N];
-        let block = self.with_block(|k| next = body(k, iv, phi.map(Tile::new)).map(ValId::from));
+        let block = self.with_block(|k| next = body(k, Sc::Id(iv), phi.map(Tile::new)).map(ValId::from));
         let carried = (0..N).map(|i| Carried { init: init[i].0, phi: phi[i], next: next[i] }).collect();
-        self.push(Stmt::Loop(Loop { iv: iv.0, extent: extent.0, carried, body: block }));
+        self.push(Stmt::Loop(Loop { iv, extent, carried, body: block, unroll: 1 }));
         phi.map(Tile::new)
     }
 
@@ -414,22 +441,24 @@ impl Kernel {
     /// `consume(k, step, slot, carried)` computes from it.
     pub fn pipeline<T: Elem, const N: usize>(
         &mut self,
-        extent: Sc,
+        extent: impl Into<Sc>,
         stages: usize,
         init: [Regs<T>; N],
         produce: impl FnOnce(&mut Self, Sc, Sc),
         consume: impl FnOnce(&mut Self, Sc, Sc, [Regs<T>; N]) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
         assert!(stages >= 1, "at least one stage");
-        let [pstep, pslot, cstep, cslot] = [(); 4].map(|()| self.scalar(Scalar::Induction));
+        let extent = self.intern(extent);
+        let [pstep, pslot, cstep, cslot] = [(); 4].map(|()| self.push_scalar(Scalar::Induction));
         let phi = self.carried(init.map(ValId::from));
-        let body = self.with_block(|k| produce(k, pstep, pslot));
-        let produce = Stage { step: pstep.0, slot: pslot.0, body };
+        let body = self.with_block(|k| produce(k, Sc::Id(pstep), Sc::Id(pslot)));
+        let produce = Stage { step: pstep, slot: pslot, body };
         let mut next = [ValId(0); N];
-        let body = self.with_block(|k| next = consume(k, cstep, cslot, phi.map(Tile::new)).map(ValId::from));
-        let consume = Stage { step: cstep.0, slot: cslot.0, body };
+        let body =
+            self.with_block(|k| next = consume(k, Sc::Id(cstep), Sc::Id(cslot), phi.map(Tile::new)).map(ValId::from));
+        let consume = Stage { step: cstep, slot: cslot, body };
         let carried = (0..N).map(|i| Carried { init: init[i].0, phi: phi[i], next: next[i] }).collect();
-        self.push(Stmt::Pipeline(Pipeline { extent: extent.0, stages, carried, produce, consume }));
+        self.push(Stmt::Pipeline(Pipeline { extent, stages, carried, produce, consume }));
         phi.map(Tile::new)
     }
 
@@ -438,10 +467,11 @@ impl Kernel {
         self.push(Stmt::Role { role, body });
     }
 
-    pub fn if_(&mut self, pred: Sc, then: impl FnOnce(&mut Self), otherwise: impl FnOnce(&mut Self)) {
+    pub fn if_(&mut self, pred: impl Into<Sc>, then: impl FnOnce(&mut Self), otherwise: impl FnOnce(&mut Self)) {
+        let pred = self.intern(pred);
         let then = self.with_block(then);
         let otherwise = self.with_block(otherwise);
-        self.push(Stmt::If { pred: pred.0, then, otherwise });
+        self.push(Stmt::If { pred, then, otherwise });
     }
 
     pub fn raw(&mut self, raw: Raw) {

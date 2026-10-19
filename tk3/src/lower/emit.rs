@@ -125,31 +125,47 @@ impl<'a> Emit<'a> {
 
     fn push(&mut self, u: Arc<UOp>) -> Arc<UOp> {
         self.list.push(u.clone());
+        self.levels.insert(u.id, self.level());
         self.last = u.clone();
         u
     }
 
-    /// List a value at the header of nesting `level`, before everything that
-    /// level has emitted so far, after listing its pure sources there first
-    /// (so a source listed later can never trail its user). A value already
-    /// listed deeper moves up with its sources; one at or above `level` stays.
-    fn hoist(&mut self, level: usize, u: Arc<UOp>) -> Arc<UOp> {
-        if let Some(&listed) = self.levels.get(&u.id) {
-            if listed <= level {
-                return u;
-            }
-            let pos = self.list.iter().position(|x| Arc::ptr_eq(x, &u)).expect("listed");
-            self.list.remove(pos);
-            for h in &mut self.headers {
-                if *h > pos {
-                    *h -= 1;
+    /// The nesting level a value belongs to: the deepest level among the
+    /// listed values it reads (leaves and constants are level 0). Unlisted
+    /// pure sources are listed first, at their own level.
+    fn level_of(&mut self, u: &Arc<UOp>) -> usize {
+        if let Some(&l) = self.levels.get(&u.id) {
+            return l;
+        }
+        match u.op() {
+            Op::Const(..) | Op::Param(..) | Op::Buffer(..) | Op::DefineVar(..) | Op::VConst(..) => 0,
+            _ => {
+                let mut level = 0;
+                for src in u.op().sources() {
+                    level = level.max(self.level_of(&src));
                 }
+                level
             }
         }
+    }
+
+    /// List a pure value at the header of the level its inputs require, so
+    /// every region that can reach those inputs can reach it too. Listed
+    /// values stay where they are.
+    fn hoist(&mut self, u: Arc<UOp>) -> Arc<UOp> {
+        if self.levels.contains_key(&u.id) {
+            return u;
+        }
+        let mut level = 0;
         for src in u.op().sources() {
-            if matches!(src.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..)) {
-                self.hoist(level, src);
+            let pure = !matches!(
+                src.op(),
+                Op::Const(..) | Op::Param(..) | Op::Buffer(..) | Op::DefineVar(..) | Op::VConst(..)
+            ) && !self.levels.contains_key(&src.id);
+            if pure {
+                self.hoist(src.clone());
             }
+            level = level.max(self.level_of(&src));
         }
         let at = self.headers[level];
         self.list.insert(at, u.clone());
@@ -173,15 +189,15 @@ impl<'a> Emit<'a> {
         let n = self.params.len();
         for (i, v) in self.prog.vars.iter().enumerate() {
             let p = UOp::scalar_param(n + i, Some(v.name.clone()), DType::Int32, v.min, v.max);
-            let p = self.hoist(0, p);
+            let p = self.hoist(p);
             self.vars.insert(v.name.clone(), p);
         }
-        self.hoist(0, self.tid.clone());
-        self.hoist(0, self.lane.clone());
-        self.hoist(0, self.warp.clone());
+        self.hoist(self.tid.clone());
+        self.hoist(self.lane.clone());
+        self.hoist(self.warp.clone());
         for (i, alloc) in self.prog.smem.iter().enumerate() {
             let buf = UOp::buffer(i, alloc.elems, DType::Scalar(alloc.dtype), AddrSpace::Local, None);
-            let buf = self.hoist(0, buf);
+            let buf = self.hoist(buf);
             self.smem.push(buf);
         }
         self.local_slot = self.prog.smem.len();
@@ -228,18 +244,53 @@ impl<'a> Emit<'a> {
             }
             Scalar::Load { param, index } => {
                 let (level, index) = self.scalar(*index);
+                let buf = self.params[param.index()].clone();
+                let idx = self.access(&buf, &index, 1);
                 let tag = self.next_tag();
-                let u = load(&self.params[param.index()], &index, 1, tag).cast(DType::Int32);
-                (level, u)
+                let load = self.hoist(load_at(&idx, tag));
+                (level, load.cast(DType::Int32))
             }
         };
-        let u = self.hoist(level, u);
+        let u = self.hoist(u);
         self.scalars.insert(id, (level, u.clone()));
         (level, u)
     }
 
     fn sc(&mut self, id: ScalarId) -> Arc<UOp> {
         self.scalar(id).1
+    }
+
+    // ---- memory accesses ------------------------------------------------------
+
+    /// The access node of a `w`-wide element run at `off`, listed where its
+    /// offset is, so every copy of a loop body reaches it.
+    fn access(&mut self, buf: &Arc<UOp>, off: &Arc<UOp>, w: u32) -> Arc<UOp> {
+        self.hoist(access(buf, off, w as usize))
+    }
+
+    fn access_gated(&mut self, buf: &Arc<UOp>, off: &Arc<UOp>, w: u32, gate: &Arc<UOp>) -> Arc<UOp> {
+        let valid = self.hoist(off.valid(gate.clone()));
+        self.hoist(access(buf, &valid, w as usize))
+    }
+
+    fn mem_load(&mut self, buf: &Arc<UOp>, off: &Arc<UOp>, w: u32, gate: Option<&Arc<UOp>>) -> Arc<UOp> {
+        let tag = self.next_tag();
+        let u = match gate {
+            Some(gate) => {
+                let idx = self.access_gated(buf, off, w, gate);
+                load_gated_at(&idx, w as usize, gate, tag)
+            }
+            None => {
+                let idx = self.access(buf, off, w);
+                load_at(&idx, tag)
+            }
+        };
+        self.push(u)
+    }
+
+    fn mem_store(&mut self, buf: &Arc<UOp>, off: &Arc<UOp>, vals: Vec<Arc<UOp>>) {
+        let idx = self.access(buf, off, vals.len() as u32);
+        self.push(store_at(&idx, vals));
     }
 
     // ---- values -------------------------------------------------------------
@@ -272,7 +323,7 @@ impl<'a> Emit<'a> {
         let dtype = DType::Scalar(self.value(root).dtype);
         let buf = UOp::buffer(self.reg_slot, regs, dtype, AddrSpace::Reg, None);
         self.reg_slot += 1;
-        let buf = self.hoist(0, buf);
+        let buf = self.hoist(buf);
         self.regs.insert(root, buf.clone());
         buf
     }
@@ -280,8 +331,9 @@ impl<'a> Emit<'a> {
     /// Registers are scalar accesses (the coalescer never widens them).
     fn reg_load(&mut self, v: ValId, j: u32) -> Arc<UOp> {
         let buf = self.reg_buf(v);
+        let idx = self.access(&buf, &c32(j as i64), 1);
         let tag = self.next_tag();
-        self.push(load(&buf, &c32(j as i64), 1, tag))
+        self.push(load_at(&idx, tag))
     }
 
     fn reg_loads(&mut self, v: ValId, j: u32, w: u32) -> Vec<Arc<UOp>> {
@@ -291,7 +343,8 @@ impl<'a> Emit<'a> {
     fn reg_store(&mut self, v: ValId, j: u32, vals: Vec<Arc<UOp>>) {
         let buf = self.reg_buf(v);
         for (e, val) in vals.into_iter().enumerate() {
-            self.push(store(&buf, &c32(j as i64 + e as i64), vec![val]));
+            let idx = self.access(&buf, &c32(j as i64 + e as i64), 1);
+            self.push(store_at(&idx, vec![val]));
         }
     }
 
@@ -325,10 +378,10 @@ impl<'a> Emit<'a> {
                         i.try_cmplt(&bound).expect("bound compare")
                     })
                     .reduce(|a, b| a.try_and_op(&b).expect("and"));
-                (self.hoist(level, off), gate.map(|g| self.hoist(level, g)))
+                (self.hoist(off), gate.map(|g| self.hoist(g)))
             }
             Place::Smem { offset, .. } => {
-                let (level, offset) = self.scalar(*offset);
+                let offset = self.sc(*offset);
                 let cols = view.shape.cols as i64;
                 let chunk = 16 / view.dtype.bytes() as i64;
                 let cpr = cols / chunk;
@@ -345,7 +398,7 @@ impl<'a> Emit<'a> {
                     col.clone()
                 };
                 let off = add(&add(&offset, &mul(row, &c32(cols))), &col);
-                (self.hoist(level, off), None)
+                (self.hoist(off), None)
             }
             Place::Reg => unreachable!(),
         }
@@ -385,7 +438,7 @@ impl<'a> Emit<'a> {
         let (wr, wc) = bit_terms(&self.warp, &l.warps, Warp, (0, 0));
         let row = add(&add(&mul(&wr, &c32(sr as i64)), &c32((rr * fr_n) as i64)), &fr);
         let col = add(&add(&mul(&wc, &c32(sc as i64)), &c32((rc * fc_n) as i64)), &fc);
-        (self.hoist(0, row), self.hoist(0, col))
+        (self.hoist(row), self.hoist(col))
     }
 
     /// Register runs `(start, width)` whose elements are consecutive columns
@@ -424,19 +477,7 @@ impl<'a> Emit<'a> {
         match stmt {
             Stmt::Let { dst, op } => self.let_(*dst, op),
             Stmt::Copy { dst, src, mode } => self.copy(*dst, *src, *mode),
-            Stmt::Loop(l) => {
-                let end = self.sc(l.extent);
-                let range = UOp::range_axis_dtype(end, AxisId::Renumbered(self.range_id), AxisType::Loop, DType::Int32);
-                self.range_id += 1;
-                let range = self.push(range);
-                self.headers.push(self.list.len());
-                self.inductions.insert(l.iv, (self.level(), range.clone()));
-                self.block(&l.body)?;
-                self.headers.pop();
-                let end = self.last.clone().end(smallvec![range]);
-                self.push(end);
-                Ok(())
-            }
+            Stmt::Loop(l) => self.loop_(l),
             Stmt::Pipeline(_) => UnsupportedSnafu { what: "an unexpanded pipeline" }.fail(),
             Stmt::Role { .. } => UnsupportedSnafu { what: "warp roles" }.fail(),
             Stmt::If { pred, then, otherwise } => {
@@ -456,6 +497,77 @@ impl<'a> Emit<'a> {
             Stmt::Sync(sync) => self.sync(*sync),
             Stmt::Raw(_) => UnsupportedSnafu { what: "raw statements" }.fail(),
         }
+    }
+
+    /// A rolled loop, or `unroll` copies of the body per iteration followed by
+    /// a rolled remainder (skipped when a constant extent divides evenly).
+    fn loop_(&mut self, l: &Loop) -> Result<()> {
+        let extent = self.sc(l.extent);
+        let u = l.unroll.max(1) as i64;
+        let constant = match self.prog.scalar(l.extent) {
+            Scalar::Const(e) => Some(*e),
+            _ => None,
+        };
+        if u == 1 {
+            return self.loop_rolled(l, extent, |_, range| range);
+        }
+        let main = self.hoist(extent.try_cdiv(&c32(u)).expect("trips"));
+        let rem = self.hoist(extent.try_cmod(&c32(u)).expect("remainder"));
+        if constant.is_none_or(|e| e / u > 0) {
+            self.loop_unrolled(l, main.clone(), u)?;
+        }
+        if constant.is_none_or(|e| e % u != 0) {
+            let base = self.hoist(mul(&main, &c32(u)));
+            self.loop_rolled(l, rem, move |_, range| add(&base, &range))?;
+        }
+        Ok(())
+    }
+
+    fn open_range(&mut self, end: Arc<UOp>) -> Arc<UOp> {
+        let range = UOp::range_axis_dtype(end, AxisId::Renumbered(self.range_id), AxisType::Loop, DType::Int32);
+        self.range_id += 1;
+        let range = self.push(range);
+        self.headers.push(self.list.len());
+        // The induction variable belongs to the level it opens.
+        self.levels.insert(range.id, self.level());
+        range
+    }
+
+    fn close_range(&mut self, range: Arc<UOp>) {
+        self.headers.pop();
+        let end = self.last.clone().end(smallvec![range]);
+        self.push(end);
+    }
+
+    /// Bind the induction variable for one copy of a body: memoized scalars
+    /// of this level or deeper were computed for the previous binding.
+    fn bind(&mut self, iv: ScalarId, level: usize, value: Arc<UOp>) {
+        let value = self.hoist(value);
+        self.levels.insert(value.id, level);
+        self.inductions.insert(iv, (level, value));
+        self.scalars.retain(|_, (l, _)| *l < level);
+    }
+
+    fn loop_rolled(&mut self, l: &Loop, end: Arc<UOp>, iv: impl Fn(&mut Self, Arc<UOp>) -> Arc<UOp>) -> Result<()> {
+        let range = self.open_range(end);
+        let level = self.level();
+        let value = iv(self, range.clone());
+        self.bind(l.iv, level, value);
+        self.block(&l.body)?;
+        self.close_range(range);
+        Ok(())
+    }
+
+    fn loop_unrolled(&mut self, l: &Loop, trips: Arc<UOp>, u: i64) -> Result<()> {
+        let range = self.open_range(trips);
+        let level = self.level();
+        let base = mul(&range, &c32(u));
+        for copy in 0..u {
+            self.bind(l.iv, level, add(&base, &c32(copy)));
+            self.block(&l.body)?;
+        }
+        self.close_range(range);
+        Ok(())
     }
 
     fn sync(&mut self, sync: Sync) -> Result<()> {
@@ -511,27 +623,26 @@ impl<'a> Emit<'a> {
         for t in 0..chunks / threads {
             let c = add(&self.tid, &c32(t * threads));
             let (row, cc) = (c.try_cdiv(&c32(cpr)).expect("row"), c.try_cmod(&c32(cpr)).expect("chunk"));
-            let (row, col) = (self.hoist(0, row), self.hoist(0, mul(&cc, &c32(chunk))));
+            let (row, col) = (self.hoist(row), self.hoist(mul(&cc, &c32(chunk))));
             // Rows past a bound re-read the last valid one; the consumer masks.
             let src_row = match bounds[0] {
                 Some(b) => {
-                    let (level, bound) = self.scalar(b);
+                    let bound = self.sc(b);
                     let last = bound.try_sub(&c32(1)).expect("bound");
                     let over = row.try_cmplt(&last).expect("cmp");
-                    self.hoist(level, UOp::try_where(over, row.clone(), last).expect("clamp"))
+                    self.hoist(UOp::try_where(over, row.clone(), last).expect("clamp"))
                 }
                 None => row.clone(),
             };
             let (src_off, _) = self.address(&s, &src_row, &col);
             let (dst_off, _) = self.address(&d, &row, &col);
             if cuda && mode == CopyMode::Async && self.low.target.cp_async {
-                let copy = cp_async_16(&index(&d.buf, &dst_off, 1), &index(&s.buf, &src_off, 1));
-                self.push(copy);
+                let (dst, src) = (self.access(&d.buf, &dst_off, 1), self.access(&s.buf, &src_off, 1));
+                self.push(cp_async_16(&dst, &src));
             } else {
-                let tag = self.next_tag();
-                let v = self.push(load(&s.buf, &src_off, chunk as usize, tag));
+                let v = self.mem_load(&s.buf, &src_off, chunk as u32, None);
                 let vals = (0..chunk as usize).map(|e| elem(&v, e, chunk as usize)).collect();
-                self.push(store(&d.buf, &dst_off, vals));
+                self.mem_store(&d.buf, &dst_off, vals);
             }
         }
         Ok(())
@@ -562,8 +673,7 @@ impl<'a> Emit<'a> {
         for (j, w) in Self::runs(&l, self.low.target.wave, 16 / s.dtype.bytes() as u32) {
             let (row, col) = self.coord(&l, j);
             let (off, _) = self.address(&s, &row, &col);
-            let tag = self.next_tag();
-            let v = self.push(load(&s.buf, &off, w as usize, tag));
+            let v = self.mem_load(&s.buf, &off, w, None);
             let vals = (0..w as usize).map(|e| elem(&v, e, w as usize)).collect();
             self.reg_store(dst, j, vals);
         }
@@ -574,18 +684,19 @@ impl<'a> Emit<'a> {
         let [sub_r, sub_c] = l.sub_shape();
         let (blocks_r, blocks_c) = (sub_r / 16, sub_c / 16);
         let pair = DType::Scalar(s.dtype).vec(2).expect("a pair");
-        let lane16 = self.hoist(0, and(&self.lane, &c32(15)));
-        let lane_hi = self.hoist(0, mul(&shr(&self.lane, 4), &c32(8)));
+        let lane16 = self.hoist(and(&self.lane, &c32(15)));
+        let lane_hi = self.hoist(mul(&shr(&self.lane, 4), &c32(8)));
         // Where this warp's sub-tile starts.
         let (wr, wc) =
             self.coord(&TileLayout { frag: Layout::zeros(Lane, 1), reps: [1, 1], warps: l.warps.clone() }, 0);
-        let (wr, wc) = (self.hoist(0, mul(&wr, &c32(sub_r as i64))), self.hoist(0, mul(&wc, &c32(sub_c as i64))));
+        let (wr, wc) = (self.hoist(mul(&wr, &c32(sub_r as i64))), self.hoist(mul(&wc, &c32(sub_c as i64))));
         for br in 0..blocks_r {
             for bc in 0..blocks_c {
-                let row = self.hoist(0, add(&add(&wr, &c32((br * 16) as i64)), &lane16));
-                let col = self.hoist(0, add(&add(&wc, &c32((bc * 16) as i64)), &lane_hi));
+                let row = self.hoist(add(&add(&wr, &c32((br * 16) as i64)), &lane16));
+                let col = self.hoist(add(&add(&wc, &c32((bc * 16) as i64)), &lane_hi));
                 let (off, _) = self.address(s, &row, &col);
-                let words = ldmatrix(&index(&s.buf, &off, 1), 4, trans, pair.clone());
+                let idx = self.access(&s.buf, &off, 1);
+                let words = ldmatrix(&idx, 4, trans, pair.clone());
                 let block = br * blocks_c + bc;
                 for (jd, &js) in perm.iter().enumerate() {
                     let jd = jd as u32;
@@ -607,12 +718,7 @@ impl<'a> Emit<'a> {
         for (j, w) in Self::runs(&l, self.low.target.wave, 16 / s.dtype.bytes() as u32) {
             let (row, col) = self.coord(&l, j);
             let (off, gate) = self.address(&s, &row, &col);
-            let tag = self.next_tag();
-            let v = match gate {
-                Some(gate) => load_gated(&s.buf, &off, w as usize, &gate, tag),
-                None => load(&s.buf, &off, w as usize, tag),
-            };
-            let v = self.push(v);
+            let v = self.mem_load(&s.buf, &off, w, gate.as_ref());
             let vals = (0..w as usize).map(|e| elem(&v, e, w as usize)).collect();
             self.reg_store(dst, j, vals);
         }
@@ -630,12 +736,10 @@ impl<'a> Emit<'a> {
                 Some(gate) => {
                     let tag = self.next_tag();
                     let if_ = self.push(UOp::if_(gate, smallvec![]).rtag(Some(smallvec![tag as usize])));
-                    self.push(store(&d.buf, &off, vals));
+                    self.mem_store(&d.buf, &off, vals);
                     self.push(UOp::endif(if_));
                 }
-                None => {
-                    self.push(store(&d.buf, &off, vals));
-                }
+                None => self.mem_store(&d.buf, &off, vals),
             }
         }
         Ok(())
@@ -669,7 +773,7 @@ impl<'a> Emit<'a> {
             _ => {
                 let buf = UOp::buffer(self.local_slot, elems, DType::Scalar(dtype), AddrSpace::Local, None);
                 self.local_slot += 1;
-                let buf = self.hoist(0, buf);
+                let buf = self.hoist(buf);
                 self.scratch.insert(dtype, (buf.clone(), elems));
                 buf
             }
@@ -695,7 +799,7 @@ impl<'a> Emit<'a> {
             let (row, col) = self.coord(&l, j);
             let (off, _) = self.address(d, &row, &col);
             let vals = self.reg_loads(src, j, w);
-            self.push(store(&d.buf, &off, vals));
+            self.mem_store(&d.buf, &off, vals);
         }
         Ok(())
     }
@@ -705,8 +809,7 @@ impl<'a> Emit<'a> {
         for (j, w) in Self::runs(&l, self.low.target.wave, 16 / s.dtype.bytes() as u32) {
             let (row, col) = self.coord(&l, j);
             let (off, _) = self.address(s, &row, &col);
-            let tag = self.next_tag();
-            let v = self.push(load(&s.buf, &off, w as usize, tag));
+            let v = self.mem_load(&s.buf, &off, w, None);
             let vals = (0..w as usize).map(|e| elem(&v, e, w as usize)).collect();
             self.reg_store(dst, j, vals);
         }
