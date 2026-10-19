@@ -123,17 +123,6 @@ fn check_interp(g: ConvGeom, batch: Batch, epi: Epilogue, c: GemmCfg) {
 
 pub(super) const SILU_BIAS: Epilogue = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
 
-#[test_case(geom([5, 7], 16, 24, 3, 1, 1, 1), 2, SILU_BIAS, [32, 32, 16]; "3x3 same, ragged m and n")]
-#[test_case(geom([9, 8], 32, 48, 3, 2, 1, 1), 1, SILU_BIAS, [64, 48, 32]; "3x3 stride 2, 48-wide")]
-#[test_case(geom([2, 2], 16, 96, 5, 1, 2, 1), 3, SILU_BIAS, [32, 96, 16]; "smaller than the kernel")]
-#[test_case(geom([6, 6], 48, 16, 3, 1, 2, 2), 1, SILU_BIAS, [32, 32, 16]; "dilated")]
-#[test_case(geom([3, 9], 16, 8, 3, 3, 0, 1), 2, SILU_BIAS, [32, 32, 16]; "one output row")]
-#[test_case(geom([4, 4], 32, 32, 1, 1, 0, 1), 2, Epilogue { residual: true, ..SILU_BIAS }, [32, 32, 32]; "1x1 residual")]
-#[test_case(geom([5, 5], 16, 40, 3, 1, 1, 1), 1, Epilogue { out_f32: true, residual: true, ..Epilogue::DEFAULT }, [32, 32, 16]; "f32 out and residual")]
-fn conv_interpreter_matches_the_direct_convolution(g: ConvGeom, images: usize, epi: Epilogue, tile: [usize; 3]) {
-    check_interp(g, Batch::Static(images), epi, cfg(tile, [2, 2], 2));
-}
-
 /// A bound batch walks grid z instead of folding into the rows.
 #[test]
 fn a_bound_batch_walks_grid_z() {
@@ -190,23 +179,32 @@ fn epilogues() -> impl Strategy<Value = Epilogue> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(128))]
 
-    /// Any small geometry, epilogue and tile: the interpreter computes the
-    /// direct convolution.
+    /// Any small geometry (strided, dilated, padded or not, smaller than its
+    /// kernel), epilogue and tile, its depth dividing the channels: the
+    /// interpreter computes the direct convolution.
     #[test]
     fn conv_matches_the_direct_convolution_for_any_geometry(
         images in 1usize..=3,
         hw in [1usize..=12, 1usize..=12],
-        cin in prop_oneof![Just(16usize), Just(32), Just(48)],
+        tile in prop_oneof![
+            Just([32usize, 32, 16]),
+            Just([64, 96, 16]),
+            Just([32, 48, 16]),
+            Just([64, 48, 32]),
+            Just([32, 96, 16]),
+            Just([32, 32, 32]),
+        ],
+        depths in 1usize..=3,
         cout in (1usize..=12).prop_map(|c| 8 * c),
         k in prop_oneof![Just(1usize), Just(3), Just(5)],
-        s in 1usize..=2,
+        s in 1usize..=3,
+        d in 1usize..=2,
         padded in any::<bool>(),
         epi in epilogues(),
-        tile in prop_oneof![Just([32usize, 32, 16]), Just([64, 96, 16]), Just([32, 48, 16])],
     ) {
-        let g = geom(hw, cin, cout, k, s, if padded { k / 2 } else { 0 }, 1);
+        let g = geom(hw, depths * tile[2], cout, k, s, if padded { d * (k / 2) } else { 0 }, d);
         prop_assume!(g.out_hw().iter().all(|&d| d > 0));
         check_interp(g, Batch::Static(images), epi, cfg(tile, [2, 2], 2));
     }
