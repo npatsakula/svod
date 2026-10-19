@@ -883,11 +883,15 @@ fn every_op_falls_back_alike(target: Option<Target>, dtypes: &[DType], static_di
     let x = static_dims.then(|| ext(&[2, 128, 1024]));
     let kv = static_dims.then(|| ext(&[2, 128, 16, 64]));
     let q = static_dims.then(|| ext(&[2, 128, 16, 64]));
+    let image = static_dims.then(|| ext(&[2, 20, 20, 64]));
     let planner = target.map(planner);
     let target = planner.as_ref();
     assert_eq!(shape::linear(target, dtypes, x.as_ref(), 1024, false), Plan::Graph(why));
     assert_eq!(shape::attention(target, dtypes, q.as_ref(), kv.as_ref(), false, false), Plan::Graph(why));
     assert_eq!(shape::norm(target, dtypes, x.as_ref()), Plan::Graph(why));
+    assert_eq!(shape::heads(target, dtypes, x.as_ref(), 64), Plan::Graph(why));
+    let g = conv_geom(20, 64, 64, 3, 1);
+    assert_eq!(shape::conv2d(target, dtypes, dtypes[0].clone(), None, image.as_ref(), &g, 1), Plan::Graph(why));
 }
 
 /// A bound variable that is the reduced dim itself is no batch.
@@ -1201,7 +1205,6 @@ fn heads_keep_the_graph_for_a_weight_off_the_stream_dtype() {
 fn heads_need_three_dims() {
     let x = ext(&[200, 12 * 64]);
     assert_eq!(shape::heads(Some(&planner(sm86())), &[BF16], Some(&x), 64), Plan::Graph(Fallback::Shape));
-    assert_eq!(shape::heads(Some(&planner(sm86())), &[BF16], None, 64), Plan::Graph(Fallback::Symbolic));
 }
 
 // ---- norms -------------------------------------------------------------------------
@@ -1434,12 +1437,6 @@ fn a_bound_conv_batch_plans_per_image() {
     let x = Extent { dims: vec![8, 80, 80, 384], var: true };
     let plan = shape::conv2d(Some(&planner(sm86())), &[F16; 3], F16, None, Some(&x), &g, 1);
     assert_eq!(plan, Plan::Kernel(planner(sm86()).conv_ranked(8, 1600, &g)));
-    let plan = shape::conv2d(Some(&planner(apple())), &[F16; 3], F16, None, Some(&x), &g, 1);
-    assert_eq!(plan, Plan::Graph(Fallback::Target));
-    assert_eq!(
-        shape::conv2d(Some(&planner(sm86())), &[F16; 3], F16, None, None, &g, 1),
-        Plan::Graph(Fallback::Symbolic)
-    );
 }
 
 /// RDNA plans kernels from the lattice under its own facts: register-staged
