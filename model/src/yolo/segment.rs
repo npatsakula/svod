@@ -3,18 +3,17 @@
 //! Detection head + mask coefficient branch + Proto26 prototype generator.
 //! Forward returns `(predictions [B, 4+nc+nm, A], protos [B, nm, H/4, W/4])`.
 
-use svod_ir::SInt;
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Conv2d, ConvTranspose2d, Layer, Module, ResizeMode};
+use svod_tensor::nn::{Conv2d, ConvTranspose2d, Module};
 
 use crate::state::StateDict;
 
 use super::backbone::YoloBackbone;
-use super::blocks::conv::{YoloConv, conv2d_bias, deconv2d_2x};
+use super::blocks::conv::{YoloConv, conv2d_bias, deconv, deconv2d_2x, pointwise, to_nchw, upsample_nearest};
 use super::config::DETECT_STRIDES;
 use super::error::Result;
 
-use super::head::{BoxBranch, ClsBranch, dist2bbox, make_anchors};
+use super::head::{BoxBranch, ClsBranch, anchor_rows, dist2bbox, make_anchors};
 use super::loader;
 use super::neck::YoloNeck;
 
@@ -45,7 +44,7 @@ impl MaskBranch {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.conv0.forward(x)?;
         let x = self.conv1.forward(&x)?;
-        Ok(self.conv2.forward(&x)?)
+        pointwise(&self.conv2, &x)
     }
 }
 
@@ -87,13 +86,13 @@ impl Proto26 {
         for (i, f) in self.feat_refine.iter().enumerate() {
             // Level `i + 1` sits `i + 1` strides below P3.
             let scale = 1 << (i + 1);
-            let refined = f.forward(&feats[i + 1])?.upsample(&[scale, scale], ResizeMode::Nearest)?;
+            let refined = upsample_nearest(&f.forward(&feats[i + 1])?, scale)?;
             feat = feat.try_add(&refined)?;
         }
         let feat = self.feat_fuse.forward(&feat)?;
         // Proto parent: cv1 → ConvTranspose2d → cv2 → cv3
         let p = self.cv1.forward(&feat)?;
-        let p = self.upsample.forward(&p)?;
+        let p = deconv(&self.upsample, &p)?;
         let p = self.cv2.forward(&p)?;
         self.cv3.forward(&p)
     }
@@ -133,10 +132,7 @@ impl Segment26 {
 
     pub fn forward(&self, feats: &[Tensor]) -> Result<(Tensor, Tensor)> {
         let feats = &super::head::in_head_dtypes(feats);
-        let proto = self.proto.forward(feats)?;
-
-        let shape = feats[0].shape()?;
-        let b = shape[0].clone();
+        let proto = to_nchw(&self.proto.forward(feats)?)?;
 
         let mut boxes_list: Vec<Tensor> = Vec::with_capacity(feats.len());
         let mut scores_list: Vec<Tensor> = Vec::with_capacity(feats.len());
@@ -144,19 +140,10 @@ impl Segment26 {
         let mut feat_sizes: Vec<(usize, usize)> = Vec::with_capacity(feats.len());
 
         for (i, feat) in feats.iter().enumerate() {
-            let h = feat.dim_const(2)?;
-            let w = feat.dim_const(3)?;
-            feat_sizes.push((h, w));
-            let hw = h * w;
-
-            let box_out = self.cv2[i].forward(feat)?;
-            boxes_list.push(box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)])?);
-
-            let cls_out = self.cv3[i].forward(feat)?;
-            scores_list.push(cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)])?);
-
-            let mask_out = self.cv4[i].forward(feat)?;
-            mask_list.push(mask_out.try_reshape([b.clone(), SInt::from(self.nm), SInt::from(hw)])?);
+            feat_sizes.push((feat.dim_const(1)?, feat.dim_const(2)?));
+            boxes_list.push(anchor_rows(&self.cv2[i].forward(feat)?)?);
+            scores_list.push(anchor_rows(&self.cv3[i].forward(feat)?)?);
+            mask_list.push(anchor_rows(&self.cv4[i].forward(feat)?)?);
         }
 
         let boxes_refs: Vec<&Tensor> = boxes_list.iter().collect();
@@ -230,7 +217,7 @@ impl Yolo26Segment {
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<(Tensor, Tensor)> {
-        let images = &self.config.cast_input(images);
+        let images = &self.config.cast_input(images)?;
         let (l4, l6, l10) = self.backbone.forward(images)?;
         let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
         self.head.forward(&[p3, p4, p5])
