@@ -19,3 +19,25 @@ fn gemm_records_as_a_pipeline_with_a_carried_accumulator() {
     assert_eq!(prog.vars, vec![Var { name: "b".into(), min: 1, max: 8 }]);
     assert!(matches!(prog.scalar(prog.grid[2]), Scalar::Var(v) if v == "b"));
 }
+
+/// A scalar read is of an input and no store writes an input, so the
+/// lowering may list a read anywhere its index is known.
+#[test_case::test_case(ParamKind::Out; "a read of an output")]
+#[test_case::test_case(ParamKind::InOut; "a read of an output it also reads")]
+#[should_panic(expected = "a scalar load reads an input")]
+fn a_scalar_read_is_of_an_input(kind: ParamKind) {
+    let mut k = crate::build::Kernel::new("read");
+    let p = k.param::<crate::build::I32>("p", kind, 4);
+    k.load_scalar(p, 0);
+}
+
+#[test]
+#[should_panic(expected = "a store into an input")]
+fn no_store_writes_an_input() {
+    use crate::build::{I32, Kernel};
+    let mut k = Kernel::new("store");
+    let p = k.param::<I32>("p", ParamKind::In, 4);
+    let v = k.splat::<I32>(Shape::new(1, 4), 1);
+    let out = k.view(p, 0, [4, 1], Shape::new(1, 4), [None, None]);
+    k.store(out, v);
+}

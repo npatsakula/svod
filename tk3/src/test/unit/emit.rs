@@ -119,3 +119,48 @@ fn a_transposed_element_past_the_bounds_reads_zero(family: &str) {
         }
     }
 }
+
+/// A scalar read whose index may leave its parameter stays under the branch
+/// that keeps the index in range, and one met again past the branch is read
+/// again there, unguarded; a read the range analysis keeps inside the parameter is
+/// listed where its index is, ahead of the branch.
+#[test_case(8, true; "an index the branch keeps in range")]
+#[test_case(3, false; "an index always in range")]
+fn a_guarded_scalar_read_stays_under_its_guard(max: i64, guarded: bool) {
+    let tile = Shape::new(16, 32);
+    let mut k = Kernel::new("guarded");
+    k.warps(1);
+    let lens = k.param::<I32>("lens", ParamKind::In, 4);
+    let y = k.param::<F32>("y", ParamKind::Out, 2 * tile.elems());
+    let n = k.var("n", 0, max);
+    let len = k.load_scalar(lens, n.clone());
+    let at = |k: &mut Kernel, i: usize| k.view(y, i * tile.elems(), [tile.cols, 1], tile, [None, None]);
+    k.if_(
+        n.lt(4),
+        |k| {
+            let v = k.splat::<F32>(tile, len.clone());
+            let out = at(k, 0);
+            k.store(out, v);
+        },
+        |_| {},
+    );
+    let v = k.splat::<F32>(tile, len);
+    let out = at(&mut k, 1);
+    k.store(out, v);
+    let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
+    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: 1, cols: 1 });
+    let linear = linear(k.finish(), &lowering);
+    let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
+    let at = |f: &dyn Fn(&Arc<UOp>) -> bool| (0..list.len()).filter(|&i| f(&list[i])).collect::<Vec<_>>();
+    let opened = at(&|u| matches!(u.op(), Op::If { .. }));
+    let closed = at(&|u| matches!(u.op(), Op::EndIf { .. }));
+    let reads = at(&|u| matches!(u.op(), Op::Load { .. }) && u.dtype() == DType::Int32);
+    let under = |i: usize| opened.iter().zip(&closed).any(|(&o, &c)| o < i && i < c);
+    if guarded {
+        assert_eq!(reads.len(), 2, "a read under the branch and one past it");
+        assert_eq!(reads.iter().filter(|&&i| under(i)).count(), 1, "reads at {reads:?}, branch {opened:?}..{closed:?}");
+    } else {
+        assert_eq!(reads.len(), 1, "one read, shared");
+        assert!(reads[0] < opened[0], "read at {reads:?}, branch at {opened:?}");
+    }
+}

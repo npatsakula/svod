@@ -217,8 +217,10 @@ impl Kernel {
         self.scalar(Scalar::Special(Special::Warp))
     }
 
-    /// `param[index]` of an integer parameter.
+    /// `param[index]` of an integer input: no store of the kernel changes it,
+    /// so the lowering reads it once, wherever its index is known.
     pub fn load_scalar<T: Elem>(&mut self, param: ParamRef<T>, index: impl Into<Sc>) -> Sc {
+        assert_eq!(self.prog.params[param.0.index()].kind, ParamKind::In, "a scalar load reads an input");
         let index = self.intern(index);
         self.scalar(Scalar::Load { param: param.0, index })
     }
@@ -484,6 +486,9 @@ impl Kernel {
         let (d, s) = (self.prog.value(dst), self.prog.value(src));
         assert_eq!(d.shape, s.shape, "copy shapes");
         assert_eq!(d.dtype, s.dtype, "copy dtypes");
+        if let Place::Global { param, .. } = d.place {
+            assert_ne!(self.prog.params[param.index()].kind, ParamKind::In, "a store into an input");
+        }
         self.push(Stmt::Copy { dst, src, mode, scope: self.scope });
     }
 

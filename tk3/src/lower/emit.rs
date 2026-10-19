@@ -48,8 +48,11 @@ struct Emit<'a> {
     params: Vec<Arc<UOp>>,
     vars: HashMap<String, Arc<UOp>>,
     list: Vec<Arc<UOp>>,
-    /// Insertion point of values computed at each loop nesting level.
+    /// Insertion point of values computed at each nesting level: the
+    /// kernel's, then every open loop's body and branch of an `If`.
     headers: Vec<usize>,
+    /// The levels of the open branches, innermost last.
+    guards: Vec<usize>,
     /// The level every hoisted value sits at.
     levels: HashMap<u64, usize>,
     scalars: HashMap<ScalarId, (usize, Arc<UOp>)>,
@@ -151,6 +154,7 @@ impl<'a> Emit<'a> {
             vars: HashMap::new(),
             list: vec![],
             headers: vec![0],
+            guards: vec![],
             levels: HashMap::new(),
             scalars: HashMap::new(),
             row_scalars: HashMap::new(),
@@ -209,10 +213,15 @@ impl<'a> Emit<'a> {
     /// every region that can reach those inputs can reach it too. Listed
     /// values stay where they are.
     fn hoist(&mut self, u: Arc<UOp>) -> Arc<UOp> {
+        self.hoist_at(u, 0)
+    }
+
+    /// [`Self::hoist`] at level `floor` or deeper.
+    fn hoist_at(&mut self, u: Arc<UOp>, floor: usize) -> Arc<UOp> {
         if self.levels.contains_key(&u.id) {
             return u;
         }
-        let mut level = 0;
+        let mut level = floor;
         for src in u.op().sources() {
             let pure = !matches!(
                 src.op(),
@@ -312,12 +321,19 @@ impl<'a> Emit<'a> {
                 };
                 (la.max(lb), u.expect("i32 scalar"))
             }
+            // The parameter is an input, so no store moves under its read; a
+            // read whose index may leave the parameter stays under the
+            // branches it is met in, where the index is in range.
             Scalar::Load { param, index } => {
                 let (level, index) = self.scalar_at(*index, row);
                 let buf = self.params[param.index()].clone();
                 let idx = self.access(&buf, &index, 1);
                 let tag = self.next_tag();
-                let load = self.hoist(load_at(&idx, tag));
+                let elems = self.prog.params[param.index()].elems as i64;
+                let (lo, hi) = (index.vmin().try_int(), index.vmax().try_int());
+                let inside = lo.is_some_and(|lo| lo >= 0) && hi.is_some_and(|hi| hi < elems);
+                let level = if inside { level } else { level.max(self.guards.last().copied().unwrap_or(0)) };
+                let load = self.hoist_at(load_at(&idx, tag), level);
                 (level, load.cast(DType::Int32))
             }
         };
@@ -764,7 +780,14 @@ impl<'a> Emit<'a> {
                     }
                     let tag = self.next_tag();
                     let if_ = self.push(UOp::if_(cond, smallvec![]).rtag(Some(smallvec![tag as usize])));
+                    self.headers.push(self.list.len());
+                    self.guards.push(self.level());
                     self.block(branch)?;
+                    let level = self.guards.pop().expect("the branch just opened");
+                    self.headers.pop();
+                    // What was listed under the branch is out of reach past it.
+                    self.scalars.retain(|_, (l, _)| *l < level);
+                    self.row_scalars.retain(|_, (l, _)| *l < level);
                     self.push(UOp::endif(if_));
                 }
                 Ok(())
