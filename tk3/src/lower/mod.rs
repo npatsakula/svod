@@ -40,14 +40,19 @@ pub struct Lowering {
     pub grid: WarpGrid,
     /// XOR-swizzle 16-byte chunks of shared rows against the row index.
     pub swizzle: bool,
+    /// Products issue on the target's warpgroup atom
+    /// ([`crate::atoms::GroupMmaAtom`]): the grid's rows are warpgroups of
+    /// four warps, shared operands are read through descriptors (over the
+    /// swizzled rows, so `swizzle` holds) and never loaded into registers.
+    pub group: bool,
 }
 
 impl Lowering {
     /// `device`'s uniform pipeline over `grid`, its ring `unroll`ed or not,
     /// shared rows swizzled.
     pub fn uniform(device: &Device, unroll: bool, grid: WarpGrid) -> Self {
-        let schedule = Schedule::Uniform { prefetch: device.target.prefetch(), unroll };
-        Self { device: device.clone(), schedule, grid, swizzle: true }
+        let schedule = Schedule::Uniform { prefetch: device.target.prefetch(), unroll, async_products: false };
+        Self { device: device.clone(), schedule, grid, swizzle: true, group: false }
     }
 }
 
@@ -63,10 +68,10 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     let grid = lowering.grid.count();
     let lone = prog.walk().any(|(_, s)| matches!(s, Stmt::Warps { .. }));
     ensure!(prog.warps.is_multiple_of(grid) && (prog.warps == grid || lone), GridSnafu { warps: prog.warps, grid });
-    materialize_operands(&mut prog);
+    materialize_operands(&mut prog, lowering.group);
     sync::insert_barriers(&mut prog);
     schedule::expand(&mut prog, lowering.schedule);
-    let mut laid = layouts::infer(prog, &lowering.device, lowering.grid).context(LayoutSnafu)?;
+    let mut laid = layouts::infer(prog, &lowering.device, lowering.grid, lowering.group).context(LayoutSnafu)?;
     orient_shared(&mut laid, &lowering.device.target);
     let program = emit::emit(&laid, lowering, params, device)?;
     let Laid { prog, layouts } = laid;
@@ -135,19 +140,22 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
 
 /// An `Mma` reads registers: a shared or global operand becomes an explicit
 /// load into a fresh register tile just before it, so the inference gives
-/// that tile the operand layout and the emitter sees one copy op.
-fn materialize_operands(prog: &mut Program) {
+/// that tile the operand layout and the emitter sees one copy op. A
+/// warpgroup product (`group`) reads shared operands in place, through
+/// descriptors; only a global one is loaded.
+fn materialize_operands(prog: &mut Program, group: bool) {
     let body = std::mem::take(&mut prog.body);
-    prog.body = materialize_block(prog, body, Scope::Block);
+    prog.body = materialize_block(prog, body, Scope::Block, group);
 }
 
-fn materialize_block(prog: &mut Program, block: Block, scope: Scope) -> Block {
+fn materialize_block(prog: &mut Program, block: Block, scope: Scope, group: bool) -> Block {
     let mut out = Vec::with_capacity(block.0.len());
     for mut stmt in block.0 {
         match &mut stmt {
             Stmt::Let { op: TileOp::Mma { a, b, .. }, .. } => {
                 for operand in [a, b] {
-                    if prog.value(*operand).place != Place::Reg {
+                    let place = &prog.value(*operand).place;
+                    if *place != Place::Reg && !(group && matches!(place, Place::Smem { .. })) {
                         let Value { dtype, shape, .. } = prog.value(*operand).clone();
                         prog.values.push(Value { dtype, shape, place: Place::Reg });
                         let tmp = ValId(prog.values.len() as u32 - 1);
@@ -156,15 +164,15 @@ fn materialize_block(prog: &mut Program, block: Block, scope: Scope) -> Block {
                     }
                 }
             }
-            Stmt::Loop(l) => l.body = materialize_block(prog, std::mem::take(&mut l.body), scope),
+            Stmt::Loop(l) => l.body = materialize_block(prog, std::mem::take(&mut l.body), scope, group),
             Stmt::Pipeline(p) => {
-                p.produce.body = materialize_block(prog, std::mem::take(&mut p.produce.body), scope);
-                p.consume.body = materialize_block(prog, std::mem::take(&mut p.consume.body), scope);
+                p.produce.body = materialize_block(prog, std::mem::take(&mut p.produce.body), scope, group);
+                p.consume.body = materialize_block(prog, std::mem::take(&mut p.consume.body), scope, group);
             }
-            Stmt::Warps { body } => *body = materialize_block(prog, std::mem::take(body), Scope::Warp),
+            Stmt::Warps { body } => *body = materialize_block(prog, std::mem::take(body), Scope::Warp, group),
             Stmt::If { then, otherwise, .. } => {
-                *then = materialize_block(prog, std::mem::take(then), scope);
-                *otherwise = materialize_block(prog, std::mem::take(otherwise), scope);
+                *then = materialize_block(prog, std::mem::take(then), scope, group);
+                *otherwise = materialize_block(prog, std::mem::take(otherwise), scope, group);
             }
             Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
         }

@@ -54,9 +54,20 @@ inference reads the operand layouts from the atom that consumes the values.
 | Target | Atom (bf16/f16 → f32) | Fragment layouts |
 |---|---|---|
 | CUDA | `mma.sync` m16n8k16 | `mma_sync_a`, `mma_sync_b`, `mma_sync_c` |
+| CUDA sm_90 | `wgmma` m64nNk16, four warps at once | `wgmma_a`, `wgmma_c`; `B` through a descriptor, never held |
 | AMD CDNA | MFMA 16×16×16 | `mfma_16x16x16` |
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_*` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8 | `simdgroup_8x8` |
+
+An `atoms::GroupMmaAtom` is a warpgroup instruction: four consecutive warps issue a 64 × n
+product together over operands read from shared memory through descriptors (`B` always, `A`
+unless it is a register tile), the accumulator spread over the group with each warp holding
+16 rows in the `mma.sync` C layout. A GEMM config whose `core` is `Group` lowers its products
+on it (`Lowering::group`): the grid's rows are warpgroups, shared operands stay in place
+instead of being loaded, and the emitter writes each product as one `wgmma` chain over the
+ring's swizzled rows (the descriptor's swizzle mode is the lowering's own XOR, so the ring's
+slots start on 1024-byte boundaries). Blackwell's `tcgen05.mma` is the same class with its
+accumulator in tensor memory and one issuing thread (`AccResidence`, `IssueScope`).
 
 The CUDA and AMD rows plan kernels and run on hardware today (sm_86 and gfx1201 measured; see
 [Portability](./portability)).

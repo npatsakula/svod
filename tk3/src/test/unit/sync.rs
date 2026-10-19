@@ -7,7 +7,7 @@ use crate::build::*;
 use crate::ir::*;
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Cache, FaCfg, attention};
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::lower::sync::insert_barriers;
 
 /// The statements of `block` by kind.
@@ -392,7 +392,7 @@ fn a_consume_body_fences_its_own_tiles() {
 /// their templates fence: the pass leaves them as they are.
 #[test_case(gemm::<BF16>(&GemmSpec {
     m: 256, n: 256, k: 256, batch: Batch::Static(1), epilogue: Epilogue::default(),
-    cfg: GemmCfg { tile: [128, 128, 32], stages: 3, warps: [2, 2], group_m: 8, unroll: true },
+    cfg: GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 3, warps: [2, 2], group_m: 8, unroll: true },
 }); "gemm")]
 #[test_case(attention::<BF16>(&AttnSpec {
     batch: Batch::Var { name: "b".into(), min: 1, max: 2 },

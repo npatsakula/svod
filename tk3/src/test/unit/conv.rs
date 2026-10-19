@@ -16,7 +16,7 @@ use crate::build::F16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec, conv};
-use crate::kernels::gemm::{Epilogue, GemmCfg};
+use crate::kernels::gemm::{Core, Epilogue, GemmCfg};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch;
 use crate::lower::lower;
@@ -110,7 +110,7 @@ pub(super) fn tolerance(epi: Epilogue) -> f64 {
 }
 
 fn cfg(tile: [usize; 3], warps: [u32; 2], stages: usize) -> GemmCfg {
-    GemmCfg { tile, stages, warps, group_m: 8, unroll: true }
+    GemmCfg { core: Core::Warp, tile, stages, warps, group_m: 8, unroll: true }
 }
 
 fn check_interp(g: ConvGeom, batch: Batch, epi: Epilogue, c: GemmCfg) {

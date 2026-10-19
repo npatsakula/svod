@@ -10,6 +10,7 @@ use crate::build::*;
 use crate::ir::*;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
+use crate::schedule::Schedule;
 
 /// What runs on the accumulator before the single rounding at the store.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -71,7 +72,18 @@ impl fmt::Debug for Scale {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Which matrix instruction a config's products issue on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Core {
+    /// The warp-level atom ([`crate::atoms::MmaAtom`]): operands in registers.
+    #[default]
+    Warp,
+    /// The warpgroup atom ([`crate::atoms::GroupMmaAtom`]): `warps[0]` is
+    /// a multiple of four, and the ring's tiles are read through descriptors.
+    Group,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GemmCfg {
     /// `[bm, bn, bk]`.
     pub tile: [usize; 3],
@@ -81,11 +93,31 @@ pub struct GemmCfg {
     /// Tile rows walked together so resident blocks share B in L2 (0 = row-major).
     pub group_m: usize,
     pub unroll: bool,
+    pub core: Core,
+}
+
+/// The tune store keys by this text: a config on the warp-level core prints
+/// as it did before the field existed, so its stored choices still apply.
+impl fmt::Debug for GemmCfg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("GemmCfg");
+        s.field("tile", &self.tile).field("stages", &self.stages).field("warps", &self.warps);
+        s.field("group_m", &self.group_m).field("unroll", &self.unroll);
+        if self.core != Core::Warp {
+            s.field("core", &self.core);
+        }
+        s.finish()
+    }
 }
 
 impl GemmCfg {
     pub fn lowering(&self, device: &Device) -> Lowering {
-        Lowering::uniform(device, self.unroll, WarpGrid { rows: self.warps[0], cols: self.warps[1] })
+        let grid = WarpGrid { rows: self.warps[0], cols: self.warps[1] };
+        let group = self.core == Core::Group;
+        let mut lowering = Lowering { group, ..Lowering::uniform(device, self.unroll, grid) };
+        let Schedule::Uniform { async_products, .. } = &mut lowering.schedule;
+        *async_products = group && self.stages >= 3;
+        lowering
     }
 
     /// Static shared memory of the operand ring, in bytes of a 16-bit type.
@@ -266,8 +298,15 @@ pub struct MergeSpec {
 
 impl MergeSpec {
     pub fn lowering(&self, device: &Device) -> Lowering {
-        GemmCfg { tile: [self.tile[0], self.tile[1], 16], stages: 1, warps: [4, 1], group_m: 0, unroll: false }
-            .lowering(device)
+        GemmCfg {
+            tile: [self.tile[0], self.tile[1], 16],
+            stages: 1,
+            warps: [4, 1],
+            group_m: 0,
+            unroll: false,
+            core: Core::Warp,
+        }
+        .lowering(device)
     }
 }
 

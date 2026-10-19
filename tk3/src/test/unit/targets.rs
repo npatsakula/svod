@@ -24,12 +24,13 @@ use crate::kernels::Act;
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, Cache, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
-use crate::kernels::gemm::{Epilogue, GemmSpec, Scale, gemm};
+use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::launch::graph_launch_all;
 use crate::lower::{Lowering, lower};
 use crate::ops::config;
+use crate::schedule::{Prefetch, Schedule};
 
 use super::conv::geom;
 use super::{conv_first_eight, declared, first_eight, planner};
@@ -276,9 +277,9 @@ pub(super) fn hopper() -> Target {
     Target { sms: Some(132), ..Target::for_arch(GpuArch::Cuda(CudaArch { major: 9, minor: 0 })) }
 }
 
-/// The `mma.sync` + `cp.async` path on Hopper: every family lowers for
-/// sm_90, clang emits its PTX, and `ptxas` assembles it for `sm_90` and
-/// `sm_90a` (nothing in it needs the arch-specific features).
+/// Every family lowers for Hopper, clang emits its PTX for `sm_90a` (the
+/// warpgroup products need the arch-specific feature set, so every kernel
+/// targets it) and `ptxas` assembles it.
 #[test]
 fn every_family_assembles_for_hopper() {
     let target = hopper();
@@ -302,11 +303,90 @@ fn every_family_assembles_for_hopper() {
             }
             Err(e) => panic!("{name}: {e}"),
         };
-        for sm in ["sm_90", "sm_90a"] {
-            let mut command = Command::new(&ptxas);
-            command.args([&format!("-arch={sm}"), "-o", "/dev/null", "/dev/stdin"]);
-            run(command, &ptx, &format!("ptxas {sm} {name}")).unwrap_or_else(|e| panic!("{e}"));
-            eprintln!("{name}: assembled for {sm}");
+        let mut command = Command::new(&ptxas);
+        command.args(["-arch=sm_90a", "-o", "/dev/null", "/dev/stdin"]);
+        run(command, &ptx, &format!("ptxas sm_90a {name}")).unwrap_or_else(|e| panic!("{e}"));
+        eprintln!("{name}: assembled for sm_90a");
+    }
+}
+
+/// GEMM tiles on Hopper's warpgroup core: one to four warpgroups down the
+/// rows, one or two across, every swizzle span (16-, 32- and 64-deep rings
+/// are 32-, 64- and 128-byte rows), a 96-wide tile of three `n32` and a
+/// `k` of several trips. Shapes stay small for the interpreter.
+pub(super) fn group_families(target: &Target) -> Vec<Launch> {
+    let planner = planner(target.clone());
+    let tiles: [([usize; 3], [u32; 2], usize); 7] = [
+        ([128, 128, 64], [8, 1], 3),
+        ([128, 256, 64], [8, 1], 2),
+        ([64, 128, 32], [4, 1], 3),
+        ([64, 64, 16], [4, 1], 3),
+        ([128, 96, 64], [8, 1], 2),
+        ([256, 128, 64], [16, 1], 2),
+        ([128, 256, 64], [8, 2], 2),
+    ];
+    tiles
+        .into_iter()
+        .map(|(tile, warps, stages)| {
+            let cfg = GemmCfg { tile, stages, warps, group_m: 8, unroll: false, core: Core::Group };
+            assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
+            let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+            (format!("group gemm {:?} {:?}", cfg.tile, cfg.warps), gemm::<BF16>(&spec), cfg.lowering(&planner.device))
+        })
+        .collect()
+}
+
+/// Every warpgroup GEMM lowers for sm_90a and assembles: its main loop
+/// holds `wgmma.mma_async` products over descriptors and no warp-level
+/// product or fragment load, since both operands stay in shared memory.
+#[test]
+fn every_group_gemm_assembles_for_hopper() {
+    let target = hopper();
+    assert_eq!(target.group_mma.len(), 2);
+    let GpuArch::Cuda(arch) = target.arch else { unreachable!() };
+    let ptxas = ptxas();
+    for (name, prog, lowering) in group_families(&target) {
+        let ir = render(prog, &lowering);
+        assert!(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "{name}: no warpgroup product");
+        assert!(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "{name}: a warp-level product");
+        assert!(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async"), "{name}: unfenced chain");
+        // A ring of three slots or more leaves the chain in flight: the wait
+        // is the template's intrinsic, not the chain's own.
+        let in_flight =
+            lowering.schedule == Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false, async_products: true };
+        assert_eq!(ir.contains("@llvm.nvvm.wgmma.wait_group"), in_flight, "{name}: the template's wait");
+        assert_eq!(ir.contains("wgmma.wait_group.sync.aligned 0;"), !in_flight, "{name}: the chain's own wait");
+        let ptx = match svod_runtime::cuda::compile_ir_to_ptx(&ir, arch) {
+            Ok(ptx) => ptx,
+            Err(e) if e.to_string().contains("NVPTX target") => {
+                eprintln!("skipped: clang has no NVPTX target");
+                return;
+            }
+            Err(e) => panic!("{name}: {e}"),
+        };
+        let text = String::from_utf8_lossy(&ptx);
+        assert!(text.contains(".target sm_90a"), "{name}: not the arch-specific target");
+        let Some(ptxas) = &ptxas else { continue };
+        let mut command = Command::new(ptxas);
+        command.args(["-arch=sm_90a", "-o", "/dev/null", "/dev/stdin"]);
+        run(command, &ptx, &format!("ptxas sm_90a {name}")).unwrap_or_else(|e| panic!("{e}"));
+        eprintln!("{name}: assembled for sm_90a");
+    }
+}
+
+/// The lowered warpgroup GEMM keeps the interpreter's result: the shared
+/// operands it leaves in place are read as the register tiles were.
+#[test]
+fn group_lowering_keeps_the_interpreted_result() {
+    for (name, prog, lowering) in group_families(&hopper()) {
+        let params = inputs(&name, &prog);
+        let want = interp::run(&prog, params.clone(), &[]).unwrap();
+        let tile = lowered_tile(prog.clone(), &lowering);
+        assert!(tile.walk().all(|(_, s)| !matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16)), "{name}: an operand was loaded into registers");
+        let got = interp::run(&tile, params, &[]).unwrap();
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(g.iter().zip(w).all(|(a, b)| a == b), "{name}: parameter {i} differs after lowering");
         }
     }
 }
@@ -805,7 +885,12 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
     let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
     k.store(yv, sum);
     let lowering = Lowering {
-        schedule: crate::schedule::Schedule::Uniform { prefetch: target.prefetch(), unroll: false },
+        group: false,
+        schedule: crate::schedule::Schedule::Uniform {
+            prefetch: target.prefetch(),
+            unroll: false,
+            async_products: false,
+        },
         device: declared(target),
         grid: crate::layouts::WarpGrid { rows: 1, cols: 1 },
         swizzle: false,

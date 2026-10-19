@@ -13,6 +13,7 @@ sidebar_label: Portability
 | `arch` | `GpuArch::{Cuda, Amd, Metal}` |
 | `wave` | Lanes per warp or wave |
 | `mma` | Matrix-core atoms with their operand layouts |
+| `group_mma` | Warpgroup matrix atoms over shared-memory descriptors (CUDA sm_90) |
 | `cp_async` | Asynchronous global → shared copies (CUDA sm_80+) |
 | `ldmatrix` | Warp-collective 8×8 b16 fragment loads (CUDA sm_75+) |
 | `smem_bytes` | Shared memory per block (the opt-in limit when the device reports it) |
@@ -33,7 +34,7 @@ lowering as `Lowering::costs` (orientation, exchange or round trip) and the op l
 | Target | Atoms | Fills | Tables | State |
 |---|---|---|---|---|
 | CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, 2–3 stages | yes | Measured on an RTX 3060 |
-| CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, up to 227 KB shared | sm_80 tables | Compiled: every family assembles with `ptxas -arch=sm_90` and `sm_90a`; not run |
+| CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix`; `wgmma` m64nNk16 over shared descriptors (GEMM) | `cp.async`, up to 227 KB shared | yes | Measured on an H100 PCIe: GEMM 4096³ bf16 433 TFLOP/s on the warpgroup core (234 on `mma.sync`; cuBLASLt 524) |
 | AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, 8 values per lane | register-staged, 1–2 stages | yes, unmeasured | Compiled to code objects; not run |
 | AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 1–2 stages | yes, unmeasured | Compiled to code objects; not run |
 | AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages | yes, unmeasured | Compiled for gfx942; not run |
@@ -69,7 +70,7 @@ A forked kernel program for one vendor is allowed only as a bounded exception.
 
 | Item | State |
 |---|---|
-| Hopper (sm_90a): wgmma, TMA, mbarrier, warp-specialized template | Not started; Hopper runs the `mma.sync` path (substrate items 5–8) |
+| Hopper (sm_90a): TMA, mbarrier, warp-specialized template; `wgmma` for attention and its overlap across trips | Not started; the GEMM runs on `wgmma` with each product's chain waited for inside its statement, attention on `mma.sync` |
 | Blackwell (sm_100a): tcgen05, tensor memory | Not started; no B200 access |
 | AMD CDNA: ping-pong template, MFMA 32×32, `buffer_load … lds` | Not started |
 | AMD measurements | gfx1201 (RX 9070 XT) measured: GEMM, convolution and attention ahead of tk1 on Qwen3 and YOLO; gfx1151 (Strix Halo) measured: attention at d = 64 and 128; CDNA compiled, not run |

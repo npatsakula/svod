@@ -36,6 +36,19 @@ pub fn mma_sync_c() -> Layout {
     )
 }
 
+/// The accumulator of a warpgroup `wgmma.mma_async.m64nNk16` as one warp of the
+/// four holds it: its 16 rows of the 64, the columns in [`mma_sync_c`] blocks of
+/// eight by register quads: `row = g + 8·((j/2)%2), col = 2t + j%2 + 8·(j/4)`.
+pub fn wgmma_c(n: u32) -> Layout {
+    mma_sync_c().product(&Layout::identity(Reg, n / 8, Col))
+}
+
+/// The A operand of a warpgroup product held in registers, as one warp holds
+/// it: its 16 rows of the 64 as the [`mma_sync_a`] fragment.
+pub fn wgmma_a() -> Layout {
+    mma_sync_a()
+}
+
 /// The registers one `ldmatrix.sync.aligned.m8n8.x4[.trans].b16` fills: each lane gets
 /// a pair `(L/4, 2(L%4) + e)` of every 8×8 matrix (transposed under `.trans`), and
 /// register pair `p` is matrix `p` of the [`ldmatrix_x4_rows`] order (TL, BL, TR, BR)

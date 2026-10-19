@@ -15,7 +15,7 @@ use crate::build::BF16 as BF16T;
 use crate::kernels::Batch;
 use crate::kernels::attention::{FaCfg, Forms};
 use crate::kernels::conv::ConvCfg;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
+use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::NormCfg;
 use crate::ops::attention::{descend, split_ranked};
 use crate::ops::config::{self, Planner, Run, SHORTLIST, Tiled, gemm_cfg};
@@ -57,7 +57,8 @@ fn apple() -> Target {
 
 /// The config measured fastest at 4096³ on the 3060 (25.4 TFLOP/s): the
 /// 128×128 tile and three 32-deep slots over eight warps.
-const BIG_MEASURED: GemmCfg = GemmCfg { tile: [128, 128, 32], stages: 3, warps: [2, 4], group_m: 8, unroll: false };
+const BIG_MEASURED: GemmCfg =
+    GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 3, warps: [2, 4], group_m: 8, unroll: false };
 
 /// A list the planner offers for `k` on `target`: not empty, each config
 /// once, lowering there with its ring in shared memory and dividing `k`;
@@ -357,7 +358,7 @@ fn a_round_pays_the_latency_its_ring_leaves() {
 /// changes nothing.
 #[test]
 fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
-    let cfg = |warps| GemmCfg { tile: [64, 64, 32], stages: 3, warps, group_m: 8, unroll: false };
+    let cfg = |warps| GemmCfg { core: Core::Warp, tile: [64, 64, 32], stages: 3, warps, group_m: 8, unroll: false };
     let p = config::Problem { batches: 1, m: 64 * 28, n: 64 * 28, k: 4096, halves: 1 };
     let ratio = |step_lone| {
         let planner = Planner::new(Device { target: sm86(), costs: Costs { step_lone, ..costs() } });
@@ -433,7 +434,14 @@ fn blocks_in_flight_share_their_lines_past_the_cache() {
 /// second tile comes after every class's first, and every config is kept.
 #[test]
 fn the_ranking_leads_with_a_tile_of_each_block() {
-    let cfg = |tile: [usize; 3], warps: [u32; 2], stages| GemmCfg { tile, stages, warps, group_m: 8, unroll: false };
+    let cfg = |tile: [usize; 3], warps: [u32; 2], stages| GemmCfg {
+        core: Core::Warp,
+        tile,
+        stages,
+        warps,
+        group_m: 8,
+        unroll: false,
+    };
     let ranked = vec![
         (100.0, cfg([128, 128, 64], [2, 2], 3)),
         (100.0, cfg([128, 128, 64], [2, 2], 2)),

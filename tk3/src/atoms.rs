@@ -45,6 +45,68 @@ impl MmaAtom {
     }
 }
 
+/// A warpgroup matrix instruction: four consecutive warps issue
+/// `C[64, n] += A[64, 16] · B[k, n]` together (Hopper's `wgmma.mma_async`),
+/// `n` a power of two up to `n_max`. `B` is read from shared memory through
+/// a descriptor over the K-major rows a fill leaves, XOR-swizzled as the
+/// lowering swizzles them; `A` likewise, or from registers when it is a
+/// register tile. The accumulator is spread over the warpgroup, each warp
+/// holding its 16 rows in [`frag::wgmma_c`], so it feeds the next product's
+/// register `A` ([`frag::wgmma_a`]) as it stands.
+///
+/// Blackwell's `tcgen05.mma` is the same product over the same descriptors
+/// and slots in as a second implementation of this class; the two places it
+/// differs are named here: [`AccResidence`] (its accumulator lives in tensor
+/// memory and is read out explicitly) and [`IssueScope`] (one thread issues
+/// it for the warpgroup).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupMmaAtom {
+    pub n_max: u32,
+    pub dtype_in: ScalarDType,
+    pub dtype_out: ScalarDType,
+    pub residence: AccResidence,
+    pub scope: IssueScope,
+    pub device: RendererDevice,
+}
+
+/// Where a warpgroup product's accumulator lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccResidence {
+    /// Spread over the warpgroup's registers (Hopper).
+    Registers,
+    /// Tensor memory, read into registers on request (Blackwell).
+    TensorMemory,
+}
+
+/// Which threads issue a warpgroup product.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IssueScope {
+    /// Every thread of the warpgroup, aligned (Hopper).
+    Warpgroup,
+    /// One elected thread (Blackwell).
+    Thread,
+}
+
+impl GroupMmaAtom {
+    pub const M: u32 = 64;
+    pub const K: u32 = 16;
+    pub const WARPS: u32 = 4;
+
+    /// The widest instruction `n` that tiles `cols`: the largest power of
+    /// two up to `n_max` dividing it (a 96-wide tile issues three `n32`).
+    pub fn n_for(&self, cols: u32) -> Option<u32> {
+        (3..=self.n_max.trailing_zeros()).rev().map(|b| 1 << b).find(|n| cols.is_multiple_of(*n))
+    }
+
+    pub fn c(&self, n: u32) -> Layout {
+        frag::wgmma_c(n)
+    }
+
+    pub fn a(&self) -> Layout {
+        frag::wgmma_a()
+    }
+}
+
 /// What an SM (compute unit) runs at once, per lane: its SIMDs, the
 /// register file each gives its waves, and how many waves each schedules.
 /// [`Target::for_arch`] fills in the architecture's facts; [`Target::for_device`]
@@ -78,6 +140,9 @@ pub struct Target {
     pub arch: GpuArch,
     pub wave: u32,
     pub mma: Vec<MmaAtom>,
+    /// Warpgroup matrix instructions over shared descriptors, where the
+    /// target has them (Hopper).
+    pub group_mma: Vec<GroupMmaAtom>,
     /// Asynchronous global→shared copies (`cp.async`).
     pub cp_async: bool,
     /// Warp-collective 8×8 b16 fragment loads from shared memory.
@@ -152,6 +217,9 @@ pub struct Costs {
     /// One 16×16×16 matrix-core step of a wave, the SM full of waves: the
     /// core's throughput.
     pub step: f64,
+    /// The same step issued as part of a warpgroup product
+    /// ([`GroupMmaAtom`]), 0 where the target has none.
+    pub step_group: f64,
     /// The same step of a wave alone on its SIMD: a dependent chain's
     /// latency, which `step_lone / step` waves a SIMD hide.
     pub step_lone: f64,
@@ -194,6 +262,7 @@ impl Costs {
             global_byte,
             scatter,
             step,
+            step_group,
             step_lone,
             score,
             trip,
@@ -210,6 +279,7 @@ impl Costs {
             ("global_byte", global_byte),
             ("scatter", scatter),
             ("step", step),
+            ("step_group", step_group),
             ("step_lone", step_lone),
             ("score", score),
             ("trip", trip),
@@ -270,6 +340,7 @@ impl Target {
             arch,
             wave,
             mma: mma_atoms(arch),
+            group_mma: group_mma_atoms(arch),
             cp_async,
             ldmatrix,
             tr_load,
@@ -348,10 +419,42 @@ impl Target {
         }
     }
 
+    /// Registers one lane of a block of `waves` warps may hold: the lane's
+    /// limit, or less where the block's warps share a SIMD's file (sixteen
+    /// warps over four SIMDs of 512 registers a lane: 128 each).
+    pub fn lane_budget(&self, waves: u32) -> u32 {
+        let o = self.occupancy;
+        o.registers.min(o.file * o.simds / waves.max(1))
+    }
+
     /// The matrix core for `dtype_in → dtype_out`, if the target has one.
     pub fn mma(&self, dtype_in: ScalarDType, dtype_out: ScalarDType) -> Option<&MmaAtom> {
         self.mma.iter().find(|a| a.dtype_in == dtype_in && a.dtype_out == dtype_out)
     }
+
+    /// The warpgroup instruction for `dtype_in → dtype_out`, if the target has one.
+    pub fn group_mma(&self, dtype_in: ScalarDType, dtype_out: ScalarDType) -> Option<&GroupMmaAtom> {
+        self.group_mma.iter().find(|a| a.dtype_in == dtype_in && a.dtype_out == dtype_out)
+    }
+}
+
+/// Hopper's `wgmma.mma_async` over bf16 and f16 into f32; nothing elsewhere.
+fn group_mma_atoms(arch: GpuArch) -> Vec<GroupMmaAtom> {
+    let GpuArch::Cuda(c) = arch else { return vec![] };
+    if c.major != 9 {
+        return vec![];
+    }
+    let device = Renderer::for_cuda_arch(c).device;
+    [ScalarDType::BFloat16, ScalarDType::Float16]
+        .map(|dtype_in| GroupMmaAtom {
+            n_max: 256,
+            dtype_in,
+            dtype_out: ScalarDType::Float32,
+            residence: AccResidence::Registers,
+            scope: IssueScope::Warpgroup,
+            device,
+        })
+        .to_vec()
 }
 
 /// The scheduler's tensor-core descriptor as the IR metadata a hand-built

@@ -15,7 +15,7 @@ use test_case::test_case;
 use crate::atoms::{Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::tune::{self, Bench, FORMAT, Kind, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.
@@ -124,7 +124,7 @@ fn a_key_in_flight_is_measured_once() {
 
 /// A plain bf16 GEMM's programs at `tile` on sm_86.
 fn gemm_programs(tile: [usize; 3]) -> tune::Candidate {
-    let cfg = GemmCfg { tile, stages: 2, warps: [2, 2], group_m: 8, unroll: true };
+    let cfg = GemmCfg { core: Core::Warp, tile, stages: 2, warps: [2, 2], group_m: 8, unroll: true };
     let spec = GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
     vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target: sm86(), costs: super::costs() }))]
 }
@@ -290,7 +290,7 @@ fn candidates_share_scratch_buffers_without_aliasing_a_program() {
         k: 256,
         batch: Batch::Static(1),
         epilogue: Epilogue::default(),
-        cfg: GemmCfg { tile, stages: 2, warps: [2, 2], group_m: 8, unroll: true },
+        cfg: GemmCfg { core: Core::Warp, tile, stages: 2, warps: [2, 2], group_m: 8, unroll: true },
     };
     let (first, second) = (gemm::<BF16>(&spec([64, 64, 32])), gemm::<BF16>(&spec([128, 64, 32])));
     let pool = ScratchPool::default();

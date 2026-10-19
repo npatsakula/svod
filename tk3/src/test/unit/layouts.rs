@@ -46,7 +46,7 @@ fn transposing_layouts_hold_16_byte_column_runs(rows: usize, cols: usize, warps:
 fn gemm_accumulator_gets_the_core_layout_over_the_warp_grid() {
     let mut prog = super::gemm_nt(256, 256, 256, 128, 128, 32, 3);
     prog.warps = 8;
-    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), WarpGrid { rows: 2, cols: 4 }).unwrap();
+    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), WarpGrid { rows: 2, cols: 4 }, false).unwrap();
     let Stmt::Pipeline(p) = &prog.body.0[1] else { panic!("pipeline") };
     let acc = lay[p.carried[0].phi.index()].as_ref().unwrap();
     assert_eq!(acc.frag, frag::mma_sync_c());
@@ -91,7 +91,7 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     k.store(o_g, o);
     let mut prog = k.finish();
     prog.warps = 4;
-    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), WarpGrid { rows: 4, cols: 1 }).unwrap();
+    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), WarpGrid { rows: 4, cols: 1 }, false).unwrap();
     let relayouts: Vec<_> = prog
         .walk()
         .filter_map(|(_, s)| match s {
@@ -214,7 +214,7 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
     let out = k.param::<F32>("o", ParamKind::Out, 256);
     let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
     k.store(o, both);
-    let Laid { prog, layouts } = infer(k.finish(), &declared(sm86()), WarpGrid { rows: 1, cols: 1 }).unwrap();
+    let Laid { prog, layouts } = infer(k.finish(), &declared(sm86()), WarpGrid { rows: 1, cols: 1 }, false).unwrap();
     let lay = |v: &ValId| layouts[v.index()].clone().unwrap();
     let mut checked = 0;
     for (_, s) in prog.walk() {
@@ -268,7 +268,7 @@ fn attention_step(bias: bool) -> Program {
 fn gfx1151_attention(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLayout, TileLayout)>) {
     let target = Target::for_arch(GpuArch::Amd(AmdArch::Gfx1151));
     let Laid { prog, layouts: lay } =
-        infer(prog, &Device { target, costs: *costs }, WarpGrid { rows: 4, cols: 1 }).unwrap();
+        infer(prog, &Device { target, costs: *costs }, WarpGrid { rows: 4, cols: 1 }, false).unwrap();
     let orients = prog
         .walk()
         .filter_map(|(_, s)| match s {
@@ -389,4 +389,53 @@ fn relayout_costs_follow_the_declared_costs() {
     ];
     let priced = ways.each_ref().map(|w| w.cost_per_element(&costs));
     assert_eq!(priced, [0.0, 0.0, costs.lane_move, costs.smem_trip], "one move shared, one select");
+}
+
+/// A warpgroup accumulator as the PTX ISA tables it (`wgmma` D fragment,
+/// `.m64nNk16` f32): thread `t` of warp `w` holds register `j` at row
+/// `16w + t/4 + 8·((j/2)%2)`, column `2·(t%4) + j%2 + 8·(j/4)`.
+#[test_case(8; "n8")]
+#[test_case(64; "n64")]
+#[test_case(256; "n256")]
+fn warpgroup_accumulator_follows_the_ptx_table(n: u32) {
+    let atom = Target::for_arch(GpuArch::Cuda(svod_dtype::CudaArch { major: 9, minor: 0 })).group_mma[0].clone();
+    let issue = atom.issue(WarpGrid { rows: 4, cols: 1 }, 64, n as usize, 16).unwrap();
+    assert_eq!(issue.c.regs(), n / 2);
+    assert_eq!(issue.c.shape(), Shape::new(64, n as usize));
+    for w in 0..4 {
+        for t in 0..32 {
+            for j in 0..n / 2 {
+                let want = (16 * w + t / 4 + 8 * ((j / 2) % 2), 2 * (t % 4) + j % 2 + 8 * (j / 4));
+                assert_eq!(issue.c.coord(w, t, j), want, "warp {w} lane {t} register {j}");
+            }
+        }
+    }
+    // The register A operand of the next product is the accumulator's own
+    // layout, cast: a 16-wide slice of its rows per k16 step.
+    let a = issue.a.coord(1, 5, 3);
+    assert_eq!(a, issue.c.coord(1, 5, 3));
+}
+
+/// A grid of warpgroups: warps `4g..4g + 4` are one group down the rows, the
+/// groups walk the columns first; a group holds 64 rows and its share of the
+/// columns in the widest instruction that tiles them, repeated along them.
+#[test]
+fn warpgroups_are_consecutive_warps_down_the_rows() {
+    let atom = Target::for_arch(GpuArch::Cuda(svod_dtype::CudaArch { major: 9, minor: 0 })).group_mma[0].clone();
+    let grid = WarpGrid { rows: 8, cols: 2 };
+    let issue = atom.issue(grid, 128, 192, 64).unwrap();
+    assert_eq!((atom.n_for(96), atom.n_for(256), atom.n_for(40), atom.n_for(4)), (Some(32), Some(256), Some(8), None));
+    assert_eq!(issue.c.reps, [1, 3]);
+    assert_eq!(issue.c.regs(), 48);
+    assert_eq!(issue.a.reps, [1, 4]);
+    assert_eq!(issue.a.regs(), 32);
+    for warp in 0..16 {
+        let (group, in_group) = (warp / 4, warp % 4);
+        let (row, col) = issue.c.coord(warp, 0, 0);
+        assert_eq!((row, col), (64 * (group / 2) + 16 * in_group, 96 * (group % 2)), "warp {warp}");
+        assert_eq!(issue.a.coord(warp, 0, 0), (row, 0), "warp {warp}");
+    }
+    assert!(atom.issue(WarpGrid { rows: 2, cols: 1 }, 32, 64, 16).is_err(), "half a warpgroup");
+    assert!(atom.issue(WarpGrid { rows: 4, cols: 1 }, 128, 64, 16).is_err(), "two row blocks a group");
+    assert!(atom.issue(WarpGrid { rows: 4, cols: 1 }, 64, 64, 24).is_err(), "a k off the step");
 }
