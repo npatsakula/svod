@@ -457,9 +457,15 @@ fn device_costs_are_physical() {
     assert!(c.latency > c.step, "{c:?}");
     assert!(c.step_lone >= c.step, "{c:?}");
     assert!(c.smem_trip > 0.0, "{c:?}");
-    // A rolled ring and a one-slot ring do no less than an unrolled one,
-    // within what the trip pairs resolve: each pair's run-to-run spread, per
-    // unit, timed again here.
+    // A ring the planner prices apart from the unrolled two-slot one does no
+    // less than it, within what the trip pairs resolve: each pair's
+    // run-to-run spread, per unit, timed again here. A one-slot ring is priced
+    // on every target; a rolled one only where fills are register-staged
+    // (`Costs::trip`): on `cp.async` targets the planner never reads
+    // `trip_rolled`, and there the two rings differ by less than one
+    // process's measurement differs from the next (sm_86 over four fresh
+    // stores: trip 1.74–2.38 ns, rolled 1.86–2.48, each within 0.1 of its
+    // own re-timing), so their order is noise the ranking never sees.
     let probes = probes(&target);
     let spread = |field: &str| {
         let p = find(&probes, field);
@@ -469,7 +475,9 @@ fn device_costs_are_physical() {
     };
     let (trip, rolled, one) = (spread("trip"), spread("trip_rolled"), spread("trip_one"));
     eprintln!("spreads per unit: trip {trip:.3}, trip_rolled {rolled:.3}, trip_one {one:.3}");
-    assert!(c.trip_rolled >= 0.9 * c.trip - (trip + rolled), "{c:?}");
+    if !target.cp_async {
+        assert!(c.trip_rolled >= 0.9 * c.trip - (trip + rolled), "{c:?}");
+    }
     assert!(c.trip_one >= 0.9 * c.trip - (trip + one), "{c:?}");
 }
 
