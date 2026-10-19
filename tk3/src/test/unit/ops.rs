@@ -223,6 +223,8 @@ struct AttnCase {
     /// A bool key mask hiding every fifth key, and packed segments of 30 rows.
     key_mask: bool,
     segments: bool,
+    /// The rows of a `[rows, h, t, tk]` bias in `2·[-1, 1)`: 1 or `b`.
+    bias: Option<usize>,
 }
 
 struct AttnInputs {
@@ -232,6 +234,7 @@ struct AttnInputs {
     lens: Option<Tensor>,
     key_mask: Option<Tensor>,
     seg_start: Option<Tensor>,
+    bias: Option<Tensor>,
 }
 
 impl AttnInputs {
@@ -241,7 +244,8 @@ impl AttnInputs {
             (None, Some(mask)) => KeyMask::Bool(mask),
             (None, None) => KeyMask::None,
         };
-        Attn { causal: c.causal, keys, window: c.window, seg_start: self.seg_start.as_ref(), ..Attn::default() }
+        let (seg_start, bias) = (self.seg_start.as_ref(), self.bias.as_ref());
+        Attn { causal: c.causal, keys, window: c.window, seg_start, bias, ..Attn::default() }
     }
 }
 
@@ -266,7 +270,8 @@ fn attn_inputs(c: &AttnCase, cap: usize) -> AttnInputs {
         let seg: Vec<i32> = (0..cap * c.t).map(|x| (x % c.t - x % c.t % 30) as i32).collect();
         realized(Tensor::from_slice(&seg).try_reshape([cap, c.t]).unwrap())
     });
-    AttnInputs { q, k, v, lens, key_mask, seg_start }
+    let bias = c.bias.map(|rows| rand(&[rows.min(cap), c.h, c.t, c.tk], 23, 2.0, DType::BFloat16));
+    AttnInputs { q, k, v, lens, key_mask, seg_start, bias }
 }
 
 /// `b` batches of `[t, tk]` query/key rows, `[h, h_kv]` heads of width `d`.
@@ -279,7 +284,7 @@ fn case(
     lens: Option<&[i32]>,
 ) -> AttnCase {
     let lens = lens.map(<[i32]>::to_vec);
-    AttnCase { b, t, tk, h, h_kv, d, causal, lens, window: None, key_mask: false, segments: false }
+    AttnCase { b, t, tk, h, h_kv, d, causal, lens, window: None, key_mask: false, segments: false, bias: None }
 }
 
 #[test_case(case(2, [100, 100], [4, 4], 64, false, Some(&[100, 61])); "t100 key lens")]
@@ -293,6 +298,11 @@ fn case(
 #[test_case(AttnCase { segments: true, ..case(2, [200, 200], [4, 2], 64, true, None) }; "causal packed segments")]
 #[test_case(AttnCase { segments: true, key_mask: true, ..case(1, [96, 96], [4, 4], 48, true, None) }; "d48 causal segments bool mask")]
 #[test_case(case(2, [150, 150], [4, 4], 48, false, Some(&[150, 100])); "d48 key lens")]
+#[test_case(AttnCase { bias: Some(2), ..case(2, [100, 100], [4, 4], 64, false, None) }; "bias per batch")]
+#[test_case(AttnCase { bias: Some(1), ..case(2, [130, 130], [4, 2], 128, true, None) }; "d128 gqa causal shared bias")]
+#[test_case(AttnCase { bias: Some(2), ..case(2, [99, 99], [4, 4], 64, false, Some(&[99, 50])) }; "bias with key lens")]
+#[test_case(AttnCase { bias: Some(2), ..case(2, [37, 150], [4, 4], 64, false, None) }; "biased cross attention")]
+#[test_case(AttnCase { bias: Some(1), segments: true, ..case(2, [200, 200], [4, 2], 64, true, None) }; "bias over packed segments")]
 fn attention_matches_the_graph(c: AttnCase) {
     if !device() {
         return;
@@ -323,13 +333,37 @@ fn attention_under_a_batch_variable() {
     assert_close("batched attention", &o, &tk::attention::graph(&qs, &ks, &vs, opts(&ls)).unwrap(), 2e-2);
 }
 
+/// A per-batch and a shared bias under a batch bound below its capacity.
+#[test_case(true; "per batch")]
+#[test_case(false; "shared")]
+fn biased_attention_under_a_batch_variable(per_batch: bool) {
+    if !device() {
+        return;
+    }
+    let (cap, live) = (3, 2);
+    let c = AttnCase { bias: Some(if per_batch { cap } else { 1 }), ..case(cap, [99, 99], [4, 4], 64, false, None) };
+    let AttnInputs { q, k, v, bias, .. } = attn_inputs(&c, cap);
+    let bias = bias.unwrap();
+    let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
+    let [qb, kb, vb] = <[Tensor; 3]>::try_from(bound(&[&q, &k, &v], &var)).unwrap();
+    let bb = if per_batch { bound(&[&bias], &var).swap_remove(0) } else { bias.clone() };
+    let o = tk::attention(&qb, &kb, &vb, Attn { bias: Some(&bb), ..Attn::default() }).unwrap();
+    assert_eq!(o.shape().unwrap()[0], var.as_sint());
+    assert_kernel(&o, "flash_attention");
+    let [qs, ks, vs] = <[Tensor; 3]>::try_from(first(&[&q, &k, &v], live)).unwrap();
+    let bs = if per_batch { first(&[&bias], live).swap_remove(0) } else { bias };
+    let want = tk::attention::graph(&qs, &ks, &vs, Attn { bias: Some(&bs), ..Attn::default() }).unwrap();
+    assert_close("batched biased attention", &o, &want, 2e-2);
+}
+
 /// A decoder step: `t` queries per lane against a cache of three layers'
 /// heads shared by two windows, each lane reading its window's row, the
 /// step's own key appended; with and without key splits.
-#[test_case(1, 64, 20, 1500, Some(4); "one query, 1500 keys, four splits")]
-#[test_case(1, 128, 8, 300, None; "d 128 unsplit")]
-#[test_case(3, 64, 4, 200, Some(2); "three queries, two splits")]
-fn cached_attention_matches_the_graph(t: usize, d: usize, h: usize, tk: usize, splits: Option<usize>) {
+#[test_case(1, 64, 20, 1500, Some(4), false; "one query, 1500 keys, four splits")]
+#[test_case(1, 128, 8, 300, None, false; "d 128 unsplit")]
+#[test_case(3, 64, 4, 200, Some(2), false; "three queries, two splits")]
+#[test_case(3, 64, 4, 200, Some(2), true; "biased, three queries, two splits")]
+fn cached_attention_matches_the_graph(t: usize, d: usize, h: usize, tk: usize, splits: Option<usize>, biased: bool) {
     if !device() {
         return;
     }
@@ -347,7 +381,10 @@ fn cached_attention_matches_the_graph(t: usize, d: usize, h: usize, tk: usize, s
     let lens = realized(vec![tk as i32, 1, 37, tk as i32 - 1, 100]);
     let row_map = realized(vec![0, 1, 1, 0, 1]);
     let cache = Cache { head_start: h, kv_heads: h, row_map: Some(&row_map), appended: Some((&k_app, &v_app)) };
-    let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, ..Attn::default() };
+    // The appended key's column last.
+    let bias = rand(&[b, h, t, tk + 1], 45, 2.0, DType::BFloat16);
+    let bias = biased.then_some(&bias);
+    let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, bias, ..Attn::default() };
     let o = tk::attention(&q, &k, &v, opts).unwrap();
     assert_kernel(&o, "flash_attention");
     if splits.is_some() {
@@ -507,6 +544,11 @@ fn f16_ops_match_the_graph() {
     let o = tk::attention(&q, &k, &v, opts).unwrap();
     assert_kernel(&o, "flash_attention");
     assert_close("f16 attention", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
+    let bias = rand(&[1, c.h, c.t, c.t], 23, 2.0, DType::Float16);
+    let opts = Attn { bias: Some(&bias), ..opts };
+    let o = tk::attention(&q, &k, &v, opts).unwrap();
+    assert_kernel(&o, "flash_attention");
+    assert_close("f16 biased attention", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
 
     let w = rand(&[256], 52, 1.0, DType::Float16);
     let x = rand(&[37, 256], 53, 2.0, DType::Float16);

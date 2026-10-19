@@ -10,7 +10,9 @@ use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::kernels::Batch;
-use crate::kernels::attention::{AttnMask, AttnSpec, Cache, CombineSpec, FaCfg, attention, combine, key_mask_stride};
+use crate::kernels::attention::{
+    AttnMask, AttnSpec, Bias, Cache, CombineSpec, FaCfg, attention, combine, key_mask_stride,
+};
 use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch;
 use crate::launch::graph_launch_all;
@@ -43,6 +45,14 @@ struct Case {
     /// `[batch, kv_heads, d]` appended keys and values.
     k_app: Vec<f64>,
     v_app: Vec<f64>,
+    /// `[rows, heads, t, key_mask_stride(keys)]` in `2·[-1, 1)`, the padding
+    /// columns past `keys` a large value nothing may read; empty unbiased.
+    bias: Vec<f64>,
+}
+
+/// The scored keys: the cached ones and the appended row.
+fn keys(spec: &AttnSpec) -> usize {
+    spec.tk + usize::from(spec.cache.is_some_and(|c| c.appended))
 }
 
 fn case(spec: AttnSpec, lens: &[i64]) -> Case {
@@ -62,7 +72,18 @@ fn case(spec: AttnSpec, lens: &[i64]) -> Case {
     let seg_start = (0..batch * spec.t).map(|x| (x % spec.t - x % spec.t % SEGMENT) as i64).collect();
     let row_map = (0..batch).map(|b| (rows - 1 - b) as i64).collect();
     let (k_app, v_app) = (n(batch * spec.kv_heads * spec.d, &mut seed), n(batch * spec.kv_heads * spec.d, &mut seed));
-    Case { spec, q, k, v, lens: lens.to_vec(), key_mask, seg_start, row_map, k_app, v_app }
+    let bias_rows = match spec.mask.bias {
+        Some(Bias::Shared) => 1,
+        Some(Bias::PerBatch) => batch,
+        None => 0,
+    };
+    let (keys, stride) = (keys(&spec), key_mask_stride(keys(&spec)));
+    let bias = n(bias_rows * spec.heads * spec.t * stride, &mut seed)
+        .into_iter()
+        .enumerate()
+        .map(|(i, x)| if i % stride < keys { 2.0 * x } else { 1e3 })
+        .collect();
+    Case { spec, q, k, v, lens: lens.to_vec(), key_mask, seg_start, row_map, k_app, v_app, bias }
 }
 
 /// Direct attention in f64 with the same masks and cache reads.
@@ -78,7 +99,9 @@ fn reference(c: &Case) -> Vec<f64> {
         let floor = usize::from(!cache.appended);
         let len = if m.key_lens { (c.lens[b] as usize).max(floor) } else { s.tk };
         let row = if cache.row_map { c.row_map[b] as usize } else { b };
-        let keys = s.tk + usize::from(cache.appended);
+        let keys = keys(s);
+        let bias_stride = key_mask_stride(keys);
+        let bias_row = if m.bias == Some(Bias::PerBatch) { b } else { 0 };
         for h in 0..s.heads {
             let kv_head = cache.head_start + h / group;
             let key = |j: usize, dd: usize, cached: &[f64], appended: &[f64]| {
@@ -103,8 +126,13 @@ fn reference(c: &Case) -> Vec<f64> {
                         if hidden(j) {
                             return f64::NEG_INFINITY;
                         }
+                        let bias = match m.bias {
+                            Some(_) => c.bias[((bias_row * s.heads + h) * s.t + i) * bias_stride + j],
+                            None => 0.0,
+                        };
                         qi.iter().enumerate().map(|(dd, a)| a * key(j, dd, &c.k, &c.k_app)).sum::<f64>()
                             * s.scale as f64
+                            + bias
                     })
                     .collect();
                 let mx = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -133,6 +161,7 @@ fn extra_params(c: &Case) -> Vec<Vec<f64>> {
             "row_map" => ints(&c.row_map),
             "k_app" => c.k_app.clone(),
             "v_app" => c.v_app.clone(),
+            "bias" => c.bias.clone(),
             other => unreachable!("{other}"),
         })
         .collect()
@@ -190,12 +219,23 @@ fn masked(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, mask: AttnMask) 
     }
 }
 
-const WINDOW: AttnMask =
-    AttnMask { window: Some((20, 5)), key_lens: true, causal: false, key_mask: false, seg_start: false };
-const KEY_MASK: AttnMask = AttnMask { key_mask: true, causal: false, window: None, key_lens: false, seg_start: false };
-const SEGMENTS: AttnMask = AttnMask { causal: true, seg_start: true, window: None, key_lens: false, key_mask: false };
+const NONE: AttnMask =
+    AttnMask { causal: false, window: None, key_lens: false, key_mask: false, seg_start: false, bias: None };
+const WINDOW: AttnMask = AttnMask { window: Some((20, 5)), key_lens: true, ..NONE };
+const KEY_MASK: AttnMask = AttnMask { key_mask: true, ..NONE };
+const SEGMENTS: AttnMask = AttnMask { causal: true, seg_start: true, ..NONE };
 const EVERY: AttnMask =
-    AttnMask { causal: true, window: Some((50, 0)), key_lens: true, key_mask: true, seg_start: true };
+    AttnMask { causal: true, window: Some((50, 0)), key_lens: true, key_mask: true, seg_start: true, bias: None };
+const SHARED: AttnMask = AttnMask { bias: Some(Bias::Shared), ..NONE };
+const PER_BATCH: AttnMask = AttnMask { bias: Some(Bias::PerBatch), ..NONE };
+const CAUSAL_BIAS: AttnMask = AttnMask { causal: true, ..PER_BATCH };
+const LENS_BIAS: AttnMask = AttnMask { key_lens: true, ..PER_BATCH };
+const EVERY_BIAS: AttnMask = AttnMask { bias: Some(Bias::Shared), ..EVERY };
+
+/// `spec` with its cache's scores biased per batch.
+fn biased(spec: AttnSpec) -> AttnSpec {
+    AttnSpec { mask: AttnMask { bias: Some(Bias::PerBatch), ..spec.mask }, ..spec }
+}
 
 fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
     AttnSpec { cfg, ..spec }
@@ -211,6 +251,12 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(masked(128, 128, 64, 64, 32, SEGMENTS), &[128, 128]; "causal segments")]
 #[test_case(masked(128, 128, 64, 64, 32, EVERY), &[128, 100]; "every mask")]
 #[test_case(masked(96, 96, 48, 64, 64, SEGMENTS), &[96, 96]; "d 48")]
+#[test_case(masked(128, 128, 64, 64, 64, PER_BATCH), &[128, 128]; "bias per batch")]
+#[test_case(masked(100, 130, 64, 64, 64, SHARED), &[130, 130]; "shared bias, ragged")]
+#[test_case(masked(128, 128, 64, 64, 32, CAUSAL_BIAS), &[128, 128]; "causal bias")]
+#[test_case(masked(99, 99, 64, 64, 64, LENS_BIAS), &[99, 41]; "bias with key lengths, odd keys")]
+#[test_case(masked(128, 128, 128, 64, 32, LENS_BIAS), &[128, 70]; "d 128 bias with key lengths")]
+#[test_case(masked(128, 128, 64, 64, 32, EVERY_BIAS), &[128, 100]; "every mask and a bias")]
 fn program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     let c = case(spec.clone(), lens);
     let got = run(&flash_attention(&spec), params(&c), &[("b", 2)]).unwrap();
@@ -248,6 +294,9 @@ fn cached(
 #[test_case(cached(1, 64, [2, 2, 64], false, false, 4), &[64, 40]; "more splits than blocks for a row")]
 #[test_case(cached(1, 7, [6, 6, 64], false, true, 1), &[0, 7]; "appended row only, one split")]
 #[test_case(cached(1, 7, [6, 6, 64], false, true, 2), &[0, 3]; "appended row only, two splits")]
+#[test_case(biased(cached(1, 100, [4, 2, 64], true, true, 1)), &[100, 37]; "biased: row map, appended, gqa")]
+#[test_case(biased(cached(5, 96, [2, 2, 128], false, true, 2)), &[64, 96]; "biased: d 128, two splits")]
+#[test_case(biased(cached(1, 200, [4, 4, 64], false, false, 4)), &[200, 70]; "biased: four splits")]
 fn cached_program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     program_matches_a_direct_softmax(spec, lens);
 }
@@ -281,6 +330,14 @@ fn only_the_live_batch_runs() {
 #[test_case(cached(1, 7, [6, 6, 64], false, true, 1), &[0, 7]; "cache: appended row only")]
 #[test_case(cached(1, 7, [6, 6, 64], false, true, 2), &[0, 3]; "cache: appended row only, two splits")]
 #[test_case(with(FaCfg { splits: 3, ..FaCfg::new(16, 64, 2) }, cached(1, 1500, [4, 4, 64], true, false, 1)), &[1500, 1200]; "cache: bq 16, three splits of 1500 keys")]
+#[test_case(masked(128, 128, 64, 64, 64, PER_BATCH), &[128, 128]; "bias per batch")]
+#[test_case(masked(100, 130, 64, 64, 64, SHARED), &[130, 130]; "shared bias, ragged")]
+#[test_case(masked(256, 256, 64, 64, 64, CAUSAL_BIAS), &[256, 256]; "causal bias")]
+#[test_case(masked(99, 99, 64, 64, 64, LENS_BIAS), &[99, 41]; "bias with key lengths, odd keys")]
+#[test_case(with(FaCfg::new(128, 32, 2), masked(200, 130, 128, 0, 0, LENS_BIAS)), &[130, 99]; "d 128 bias with lengths, bq 128")]
+#[test_case(masked(128, 128, 128, 64, 32, EVERY_BIAS), &[128, 100]; "every mask and a bias, d 128")]
+#[test_case(biased(cached(1, 100, [4, 2, 64], true, true, 1)), &[100, 37]; "cache biased: row map, appended, gqa")]
+#[test_case(biased(cached(5, 96, [2, 2, 128], false, true, 2)), &[64, 96]; "cache biased: d 128, two splits")]
 fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
     let device = default_device();
     let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
@@ -310,7 +367,7 @@ fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
         .into_iter()
         .zip(extra_params(&c))
         .map(|(name, v)| match name {
-            "k_app" | "v_app" => to_bf16(&v),
+            "k_app" | "v_app" | "bias" => to_bf16(&v),
             _ => Tensor::from_slice(v.iter().map(|&x| x as i32).collect::<Vec<_>>()),
         })
         .collect();
@@ -415,9 +472,10 @@ fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, 
 }
 
 /// Flash attention throughput at B 4, H 8, T 2048 bf16: causal and plain,
-/// head dim 64 and 128 (run with `--ignored --nocapture --release`). tk1's
-/// `flash_attention_with`, last measured here on the 3060 before its removal,
-/// in TFLOP/s: d64 23.0, d64 causal 20.7, d128 22.3, d128 causal 16.5.
+/// head dim 64 and 128, and d 64 with a per-batch bias (run with `--ignored
+/// --nocapture --release`). tk1's `flash_attention_with`, last measured here
+/// on the 3060 before its removal, in TFLOP/s: d64 23.0, d64 causal 20.7,
+/// d128 22.3, d128 causal 16.5.
 #[test]
 #[ignore = "perf probe: needs a CUDA device"]
 fn attention_throughput_probe() {
@@ -426,7 +484,15 @@ fn attention_throughput_probe() {
         return;
     };
     let (batch, heads, t) = (4usize, 8usize, 2048usize);
-    for (d, causal, bq, bkv) in [(64, false, 64, 64), (64, true, 64, 64), (128, false, 64, 32), (128, true, 64, 32)] {
+    for (d, causal, bq, bkv, bias) in [
+        (64, false, 64, 64, false),
+        (64, false, 64, 64, true),
+        (64, true, 64, 64, false),
+        (64, true, 64, 64, true),
+        (128, false, 64, 32, false),
+        (128, true, 64, 32, false),
+    ] {
+        let bias = bias.then_some(Bias::PerBatch);
         let spec = AttnSpec {
             batch: Batch::Var { name: "b".into(), min: 1, max: batch as i64 },
             t,
@@ -434,7 +500,7 @@ fn attention_throughput_probe() {
             heads,
             kv_heads: heads,
             d,
-            mask: AttnMask { causal, ..AttnMask::default() },
+            mask: AttnMask { causal, bias, ..AttnMask::default() },
             cache: None,
             scale: 1.0 / (d as f32).sqrt(),
             cfg: FaCfg::new(bq, bkv, 2),
@@ -443,7 +509,8 @@ fn attention_throughput_probe() {
         let to_bf16 =
             |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
         let (q, k, v) = (to_bf16(&c.q), to_bf16(&c.k), to_bf16(&c.v));
-        for x in [&q, &k, &v] {
+        let biases = bias.map(|_| to_bf16(&c.bias));
+        for x in [&q, &k, &v].into_iter().chain(&biases) {
             x.realize().unwrap();
         }
         let flops = 4.0 * batch as f64 * heads as f64 * t as f64 * t as f64 * d as f64 / if causal { 2.0 } else { 1.0 };
@@ -451,10 +518,11 @@ fn attention_throughput_probe() {
         {
             let lowering = spec.cfg.lowering(target.clone());
             let o = Tensor::empty(&[batch * t * heads * d], DType::BFloat16);
-            let out = graph_launch(flash_attention(&spec), &lowering, &[&q, &k, &v, &o]).unwrap();
+            let ins: Vec<&Tensor> = [&q, &k, &v, &o].into_iter().chain(&biases).collect();
+            let out = graph_launch(flash_attention(&spec), &lowering, &ins).unwrap();
             let mut plan = out.prepare().unwrap();
             plan.execute_with_vars(&[("b", batch as i64)]).unwrap();
-            plans.push((format!("tk3 d{d} causal={causal} bq{bq} bkv{bkv}"), plan));
+            plans.push((format!("tk3 d{d} causal={causal} bias={} bq{bq} bkv{bkv}", bias.is_some()), plan));
         }
         // The 3060 idles at a low clock: spin the first plan for half a second.
         let warm = std::time::Instant::now();
