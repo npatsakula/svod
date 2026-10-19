@@ -156,28 +156,10 @@ pub(crate) fn conv_first_eight(planner: &Planner, batches: usize, m: usize, g: &
     planner.conv_splits(batches, m, g, &first_eight(&planner.conv_ranked(batches, m, g)))
 }
 
-/// Costs a test declares where it needs a ranking or an orientation: a
-/// guessed sm_86-class fixture.
+/// Costs a test declares where it needs a ranking or an orientation: the
+/// guessed sm_86-class fixture, the warpgroup step free.
 pub(crate) fn costs() -> Costs {
-    Costs {
-        smem_byte: 0.005,
-        global_byte: 0.02,
-        scatter: 8.0,
-        step: 5.0,
-        step_group: 0.0,
-        // A guess: three waves a SIMD hide the chain.
-        step_lone: 15.0,
-        score: 0.5,
-        trip: 150.0,
-        trip_rolled: 170.0,
-        // A guess: the barrier pair costs about what the two-slot trip does again.
-        trip_one: 300.0,
-        lane_move: 1.0,
-        smem_trip: 8.0,
-        latency: 600.0,
-        l2_byte: 0.0,
-        l2_bytes: 0.0,
-    }
+    Costs { step_group: 0.0, ..crate::probe::GUESSED }
 }
 
 /// gfx1151's costs (Strix Halo, 40 CUs) as `probe::costs` measured them on

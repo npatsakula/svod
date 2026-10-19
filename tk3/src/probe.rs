@@ -175,19 +175,81 @@ pub struct Measured {
 /// tune store. Only a target without an SM count, which no probe can scale
 /// to, is an error.
 pub fn costs(target: &Target) -> Result<Measured> {
-    let probes = probes(target)?;
     let compiler = tune::compiler(&default_device());
-    let mut measured = assemble(target, probes, |probe| self::measured(target, compiler, probe));
+    priced(target, |probe| self::measured(target, compiler, probe))
+}
+
+/// Every field of `target`'s costs, each probe's value by `measure`.
+fn priced(target: &Target, mut measure: impl FnMut(Probe) -> Result<f64>) -> Result<Measured> {
+    let mut measured = assemble(target, probes(target)?, &mut measure);
     let Measured { costs, unmeasured } = &mut measured;
     // The cache ladder is read against the DRAM rate; without one, or when a
     // footprint fails, the cache is unmeasured and fills are priced as DRAM.
-    let ladder = if unmeasured.contains(&"global_byte") { None } else { cache(target, compiler, costs.global_byte)? };
+    let ladder = if unmeasured.contains(&"global_byte") { None } else { cache(target, costs.global_byte, measure)? };
     (costs.l2_byte, costs.l2_bytes) = ladder.unwrap_or_else(|| {
         unmeasured.push("l2_bytes");
         (costs.global_byte, 0.0)
     });
     Ok(measured)
 }
+
+/// The costs `target`'s device measured into the tune store under `dir`,
+/// one copied from it: read, never written. A probe's line counts whatever
+/// compiler, store format or probe programs measured it (its value is ns
+/// per unit of the device); of several, the one of this build's programs.
+/// A probe no line settles is unmeasured. `None` where the store has no
+/// file for the target's device ([`tune::device`]: its arch and SM count),
+/// or the target no SM count.
+pub fn stored(dir: &std::path::Path, target: &Target) -> Option<Measured> {
+    let device = tune::device(target);
+    let file = TuneStore::at(Some(dir.to_path_buf())).file(&device)?;
+    let text = std::fs::read_to_string(&file).ok()?;
+    // `value|op|device|dtype|shape|candidates|compiler|programs femtoseconds`
+    let lines: Vec<(&str, &str, u64)> = text
+        .lines()
+        .filter_map(|line| {
+            let (key, fs) = line.split_once(' ')?;
+            let [kind, op, at, .., programs] = key.split('|').collect::<Vec<_>>()[..] else { return None };
+            (kind == "value" && at == device).then_some((op, programs, fs.trim().parse().ok()?))
+        })
+        .collect();
+    let value = |probe: Probe| {
+        let found: Vec<&(&str, &str, u64)> = lines.iter().filter(|l| l.0 == probe.op).collect();
+        let fs = match found[..] {
+            [only] => Some(only.2),
+            _ => {
+                let programs = format!("{:016x}", tune::fingerprint(&probe.candidates));
+                found.iter().find(|l| l.1 == programs).map(|l| l.2)
+            }
+        };
+        let last = format!("{} lines of it in {}, none of this build's programs", found.len(), file.display());
+        Ok(fs.context(UnmeasuredSnafu { probe: probe.op, last })? as f64 * 1e-6)
+    };
+    priced(target, value).ok()
+}
+
+/// Costs a device is planned with where nothing measured it: guesses at
+/// an sm_86-class part, the warpgroup step priced as the warp-level one. A
+/// ranking under them is a guess's.
+pub const GUESSED: Costs = Costs {
+    smem_byte: 0.005,
+    global_byte: 0.02,
+    scatter: 8.0,
+    step: 5.0,
+    step_group: 5.0,
+    // Three waves a SIMD hide the chain.
+    step_lone: 15.0,
+    score: 0.5,
+    trip: 150.0,
+    trip_rolled: 170.0,
+    // The barrier pair costs about what the two-slot trip does again.
+    trip_one: 300.0,
+    lane_move: 1.0,
+    smem_trip: 8.0,
+    latency: 600.0,
+    l2_byte: 0.0,
+    l2_bytes: 0.0,
+};
 
 /// `probes`, in [`Costs::fields`] order, each measured by `measure` into its
 /// field; a probe that fails leaves its field at zero, names itself in
@@ -304,8 +366,8 @@ const FOOTPRINTS: [(&str, usize); 9] = [
 
 /// The cache in front of DRAM, as [`climbed`] reads the ladder of
 /// footprints; `None`, with a warning, when a footprint cannot be measured.
-fn cache(target: &Target, compiler: u64, global_byte: f64) -> Result<Option<(f64, f64)>> {
-    let ladder = climbed(cache_probes(target)?, global_byte, |probe| measured(target, compiler, probe));
+fn cache(target: &Target, global_byte: f64, measure: impl FnMut(Probe) -> Result<f64>) -> Result<Option<(f64, f64)>> {
+    let ladder = climbed(cache_probes(target)?, global_byte, measure);
     Ok(ladder.map_err(|e| tracing::warn!("{}: {e}; the cache is unmeasured", target.arch.target_name())).ok())
 }
 

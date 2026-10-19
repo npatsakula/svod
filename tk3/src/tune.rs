@@ -87,8 +87,7 @@ impl TuneKey {
         shape: &[usize],
         candidates: &impl Hash,
     ) -> Self {
-        let device = format!("{}-{}sm", target.arch.target_name(), target.sms.unwrap_or(0));
-        Self { op, device, dtype, shape: shape.to_vec(), candidates: digest(candidates), compiler }
+        Self { op, device: device(target), dtype, shape: shape.to_vec(), candidates: digest(candidates), compiler }
     }
 
     /// The store line of a `kind` of entry for the candidate programs
@@ -99,6 +98,11 @@ impl TuneKey {
         let (kind, candidates) = (kind.name(), self.candidates);
         format!("{kind}|{op}|{device}|{dtype:?}|{}|{candidates:016x}|{compiler:016x}|{programs:016x}", shape.join("x"))
     }
+}
+
+/// A target's name in the store: arch and SM count ([`TuneKey::device`]).
+pub(crate) fn device(target: &Target) -> String {
+    format!("{}-{}sm", target.arch.target_name(), target.sms.unwrap_or(0))
 }
 
 /// A digest of `spec`'s compiler identity (backend, toolchain, flags) for
@@ -213,7 +217,12 @@ impl TuneStore {
     }
 
     fn path(&self, key: &TuneKey) -> Option<PathBuf> {
-        let name: String = key.device.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        self.file(&key.device)
+    }
+
+    /// The file of a [`device`]'s entries.
+    pub(crate) fn file(&self, device: &str) -> Option<PathBuf> {
+        let name: String = device.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
         self.root.as_ref().map(|root| root.join(format!("{name}-v{}.txt", env!("CARGO_PKG_VERSION"))))
     }
 

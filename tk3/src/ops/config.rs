@@ -563,6 +563,10 @@ fn judged<C: Tiled>(
 /// takes a millisecond, so a ranking is kept for the planner's life (one per
 /// device). The rankings are whole: the tuner admits the first
 /// [`SHORTLIST`] whose compiled kernels do not spill ([`shortlist`]).
+/// A planner needs no device: one over a card's offline target
+/// ([`Target::offline`]) and the costs its device stored
+/// ([`crate::probe::stored`]) ranks as the card's own would; only the op
+/// layer's ([`crate::ops::supported`]) launches.
 #[derive(Debug)]
 pub struct Planner {
     pub device: Device,
