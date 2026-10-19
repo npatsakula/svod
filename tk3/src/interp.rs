@@ -87,8 +87,8 @@ pub fn run(prog: &Program, params: Vec<Vec<f64>>, vars: &[(&str, i64)]) -> Resul
         block: [0; 3],
         warp: 0,
     };
-    for name in &prog.vars {
-        ensure!(frame.vars.contains_key(name), UnboundVarSnafu { name: name.clone() });
+    for var in &prog.vars {
+        ensure!(frame.vars.contains_key(&var.name), UnboundVarSnafu { name: var.name.clone() });
     }
     let grid = prog.grid.map(|g| frame.scalar(g).unwrap_or(1));
     for z in 0..grid[2] {

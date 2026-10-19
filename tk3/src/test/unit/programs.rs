@@ -10,7 +10,7 @@ pub fn gemm_nt(m: usize, n: usize, kk: usize, bm: usize, bn: usize, bk: usize, s
     let a = k.param::<BF16>("a", ParamKind::In, m * kk);
     let b = k.param::<BF16>("b", ParamKind::In, n * kk);
     let c = k.param::<BF16>("c", ParamKind::Out, m * n);
-    let batch = k.var("b");
+    let batch = k.var("b", 1, 8);
     let [gm, gn] = [k.c((m / bm) as i64), k.c((n / bn) as i64)];
     k.grid([gm, gn, batch]);
     k.warps(8);

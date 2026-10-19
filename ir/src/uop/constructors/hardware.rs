@@ -263,9 +263,18 @@ impl UOp {
         Ok(Self::program(sink, program_info, Some(Self::linear(list.into())), None, None))
     }
 
-    /// PARAM shapes are metadata a program never renders, but `custom_kernel`
-    /// placeholders carry them as weak constants, which no program admits; the
-    /// optimizer's index-dtype lowering would commit them, so commit them here.
+    fn commit_shape(
+        shape: &Arc<Self>,
+        commit_const: &impl Fn(&Arc<Self>) -> Option<(crate::UOpKey, Arc<Self>)>,
+    ) -> Arc<Self> {
+        let consts: std::collections::HashMap<_, _> = shape.toposort().iter().filter_map(commit_const).collect();
+        shape.substitute(&consts)
+    }
+
+    /// PARAM and BUFFER shapes are metadata a program never renders, but
+    /// `custom_kernel` placeholders and hand-built buffers carry them as weak
+    /// constants, which no program admits; the optimizer's index-dtype
+    /// lowering would commit them, so commit them here.
     fn commit_param_shapes(ops: Vec<Arc<Self>>) -> Vec<Arc<Self>> {
         use std::collections::HashMap;
 
@@ -286,10 +295,17 @@ impl UOp {
             .toposort()
             .into_iter()
             .filter_map(|node| {
-                let Op::Param(ops::Param { shape, arg }) = node.op() else { return None };
-                let consts: HashMap<_, _> = shape.toposort().iter().filter_map(commit_const).collect();
-                let shape = shape.substitute(&consts);
-                let committed = Self::new(Op::Param(ops::Param { shape, arg: arg.clone() }), node.dtype());
+                let committed = match node.op() {
+                    Op::Param(ops::Param { shape, arg }) => {
+                        let shape = Self::commit_shape(shape, &commit_const);
+                        Self::new(Op::Param(ops::Param { shape, arg: arg.clone() }), node.dtype())
+                    }
+                    Op::Buffer(ops::Buffer { shape, arg }) => {
+                        let shape = Self::commit_shape(shape, &commit_const);
+                        Self::new(Op::Buffer(ops::Buffer { shape, arg: arg.clone() }), node.dtype())
+                    }
+                    _ => return None,
+                };
                 (!Arc::ptr_eq(&committed, &node)).then(|| (UOpKey(node.clone()), committed.rtag(node.tag().clone())))
             })
             .collect();

@@ -125,10 +125,11 @@ impl Kernel {
         ParamRef(ParamId(self.prog.params.len() as u32 - 1), PhantomData)
     }
 
-    pub fn var(&mut self, name: impl Into<String>) -> Sc {
+    /// A symbolic variable in `min..=max` the launch binds by name.
+    pub fn var(&mut self, name: impl Into<String>, min: i64, max: i64) -> Sc {
         let name = name.into();
-        if !self.prog.vars.contains(&name) {
-            self.prog.vars.push(name.clone());
+        if !self.prog.vars.iter().any(|v| v.name == name) {
+            self.prog.vars.push(Var { name: name.clone(), min, max });
         }
         self.scalar(Scalar::Var(name))
     }

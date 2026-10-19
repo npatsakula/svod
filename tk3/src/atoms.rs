@@ -65,6 +65,19 @@ impl Target {
         Self { arch, wave, mma: mma_atoms(arch), cp_async, ldmatrix, smem_bytes }
     }
 
+    /// The target behind a device, when the backend reports its architecture.
+    pub fn for_device(spec: &svod_dtype::DeviceSpec) -> Option<Self> {
+        use svod_device::registry as reg;
+        use svod_dtype::DeviceSpec;
+        let arch = match spec {
+            DeviceSpec::Cuda { device_id } => GpuArch::Cuda(reg::resolve_cuda_arch(*device_id).ok()?),
+            DeviceSpec::Amd { device_id } => GpuArch::Amd(reg::resolve_amd_arch_from_topology(*device_id).ok()?),
+            DeviceSpec::Metal { device_id } => GpuArch::Metal(reg::resolve_metal_family(*device_id).ok()?),
+            DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => return None,
+        };
+        Some(Self::for_arch(arch))
+    }
+
     /// The matrix core for `dtype_in → dtype_out`, if the target has one.
     pub fn mma(&self, dtype_in: ScalarDType, dtype_out: ScalarDType) -> Option<&MmaAtom> {
         self.mma.iter().find(|a| a.dtype_in == dtype_in && a.dtype_out == dtype_out)

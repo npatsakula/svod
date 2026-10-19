@@ -14,6 +14,6 @@ fn gemm_records_as_a_pipeline_with_a_carried_accumulator() {
     assert_eq!((p.stages, p.produce.body.0.len(), p.consume.body.0.len()), (3, 2, 1));
     assert_eq!(p.carried.len(), 1);
     assert_eq!(prog.value(p.carried[0].phi).shape, Shape::new(bm, bn));
-    assert_eq!(prog.vars, vec!["b".to_string()]);
+    assert_eq!(prog.vars, vec![Var { name: "b".into(), min: 1, max: 8 }]);
     assert!(matches!(prog.scalar(prog.grid[2]), Scalar::Var(v) if v == "b"));
 }
