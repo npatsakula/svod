@@ -451,8 +451,8 @@ const RESIDUAL_SILU_BIAS: Epilogue = Epilogue { residual: true, ..SILU_BIAS };
 /// sweep is what verifies what it may pick).
 #[test]
 fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
-    let Some(target) = super::cuda_target() else { return };
-    let planner = super::device_planner().expect("a planner for the device");
+    let Some(planner) = super::device_planner() else { return };
+    let target = &planner.device.target;
     for class in YOLO {
         let g = yolo_geom(class);
         let params = inputs(&g, 1, RESIDUAL_SILU_BIAS, 13);
@@ -460,7 +460,7 @@ fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
         for c in device_candidates(&planner, &g, RESIDUAL_SILU_BIAS).0 {
             let (epilogue, split) = (RESIDUAL_SILU_BIAS, c.split);
             let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue, cfg: c.gemm, split };
-            let got = on_device(&spec, &target, &params);
+            let got = on_device(&spec, target, &params);
             let worst = assert_close_f32(&format!("{g:?} {c:?}"), &got, &want, 2e-3);
             eprintln!("{}->{} {}x{} s{} {c:?}: max abs diff {worst:.2e}", g.cin, g.cout, g.h, g.w, g.stride[0]);
         }
@@ -468,15 +468,22 @@ fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
 }
 
 /// Folded batches, odd sizes, dilation and every epilogue on the device
-/// against the graph and the f64 reference.
+/// against the graph and the f64 reference, over a three-slot ring where the
+/// device's fill runs one (register staging: two).
 #[test_case(geom([7, 9], 32, 40, 3, 1, 1, 1), 3, RESIDUAL_SILU_BIAS, [64, 64, 32]; "ragged m and n, three images")]
 #[test_case(geom([11, 6], 64, 96, 5, 2, 2, 1), 2, SILU_BIAS, [64, 96, 32]; "5x5 stride 2 on 96 wide")]
 #[test_case(geom([10, 10], 16, 48, 3, 1, 2, 2), 1, SILU_BIAS, [64, 64, 16]; "dilated, 16 channels")]
 #[test_case(geom([9, 9], 32, 64, 3, 1, 1, 1), 2, Epilogue { out_f32: true, residual: true, ..Epilogue::DEFAULT }, [64, 64, 32]; "f32 out and residual")]
 fn conv_matches_on_the_device(g: ConvGeom, images: usize, epi: Epilogue, tile: [usize; 3]) {
-    let Some(target) = super::cuda_target() else { return };
+    let Some(target) = super::device_target() else { return };
     let warps = if tile[1] == 48 { [2, 1] } else { [2, 2] };
-    let spec = ConvSpec { batch: Batch::Static(images), geom: g, epilogue: epi, cfg: cfg(tile, warps, 3), split: 1 };
+    let spec = ConvSpec {
+        batch: Batch::Static(images),
+        geom: g,
+        epilogue: epi,
+        cfg: cfg(tile, warps, target.stages(3)),
+        split: 1,
+    };
     let params = inputs(&g, images, epi, 21);
     let got = on_device(&spec, &target, &params);
     let want = reference(&g, images, epi, &params);
@@ -490,13 +497,18 @@ fn conv_matches_on_the_device(g: ConvGeom, images: usize, epi: Epilogue, tile: [
 /// value multiplied by zero.
 #[test]
 fn an_inf_gives_the_graphs_non_finite_set_on_the_device() {
-    let Some(target) = super::cuda_target() else { return };
+    let Some(target) = super::device_target() else { return };
     let g = geom([20, 20], 64, 64, 3, 1, 1, 1);
     let epi = SILU_BIAS;
     let mut params = inputs(&g, 1, epi, 8);
     params[0][0] = f64::INFINITY;
-    let spec =
-        ConvSpec { batch: Batch::Static(1), geom: g, epilogue: epi, cfg: cfg([64, 64, 32], [2, 2], 3), split: 1 };
+    let spec = ConvSpec {
+        batch: Batch::Static(1),
+        geom: g,
+        epilogue: epi,
+        cfg: cfg([64, 64, 32], [2, 2], target.stages(3)),
+        split: 1,
+    };
     let got = on_device(&spec, &target, &params);
     let want = graph_reference(&g, 1, epi, &params);
     let bad = |v: &[f32]| v.iter().enumerate().filter(|(_, x)| !x.is_finite()).map(|(i, _)| i).collect::<Vec<_>>();
@@ -508,7 +520,7 @@ fn an_inf_gives_the_graphs_non_finite_set_on_the_device() {
 /// smaller live batch computes exactly those images.
 #[test]
 fn a_bound_batch_runs_the_live_images_on_the_device() {
-    let Some(target) = super::cuda_target() else { return };
+    let Some(target) = super::device_target() else { return };
     let g = geom([12, 10], 32, 64, 3, 2, 1, 1);
     let [ho, wo] = g.out_hw();
     let (cap, live) = (3usize, 2usize);
@@ -516,7 +528,7 @@ fn a_bound_batch_runs_the_live_images_on_the_device() {
         batch: Batch::Var { name: "b".into(), min: 1, max: cap as i64 },
         geom: g,
         epilogue: RESIDUAL_SILU_BIAS,
-        cfg: cfg([64, 64, 32], [2, 2], 3),
+        cfg: cfg([64, 64, 32], [2, 2], target.stages(3)),
         split: 1,
     };
     let params = inputs(&g, cap, RESIDUAL_SILU_BIAS, 4);

@@ -2,7 +2,7 @@
 //! stability, the rule that nothing unmeasured is stored, a key measured
 //! once under concurrent asks, a store hit compiling nothing, a run's
 //! stamps and the lost-stamp guard, what counts as a spill, the admission
-//! memo, and on a CUDA device a real GEMM tuning.
+//! memo, and on the device a real GEMM tuning.
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -419,10 +419,7 @@ fn a_file_of_another_format_is_dropped(written: Option<u32>, kept: bool) {
 /// store on that directory answers from disk without measuring.
 #[test]
 fn a_gemm_tunes_on_the_device() {
-    if super::cuda_target().is_none() {
-        return;
-    }
-    let planner = super::device_planner().expect("a planner for the device");
+    let Some(planner) = super::device_planner() else { return };
     let spec = svod_dtype::default_device::default_device();
     let device = &planner.device;
     let (m, n, k) = (704, 512, 512);

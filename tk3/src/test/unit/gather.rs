@@ -262,7 +262,11 @@ fn a_staged_gathered_run_is_one_select() {
 #[test_case(Prefetch::CpAsync; "cp.async")]
 #[test_case(Prefetch::RegisterStaged; "register staged")]
 fn gathered_gemm_matches_the_interpreter_on_the_gpu(prefetch: Prefetch) {
-    let Some(target) = super::cuda_target() else { return };
+    let target = match prefetch {
+        Prefetch::CpAsync => super::cp_async_target(),
+        Prefetch::RegisterStaged => super::device_target(),
+    };
+    let Some(target) = target else { return };
     let (m, n, kk) = (128usize, 64usize, 256usize);
     let (tile, stages, warps) = PIN;
     let mut seed = 9;

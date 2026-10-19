@@ -705,10 +705,11 @@ fn the_device_reports_the_architectures_occupancy() {
 
 /// The RDNA data path on an NVIDIA GPU: register-staged fills into the
 /// chunk layout, vector shared-memory gathers instead of `ldmatrix`, and
-/// two-slot rings, measured against the interpreter.
+/// two-slot rings, measured against the interpreter (a device without
+/// `cp.async` runs them in the family test).
 #[test]
 fn register_staged_families_match_on_cuda() {
-    let Some(target) = super::cuda_target() else { return };
+    let Some(target) = super::cp_async_target() else { return };
     check_on_device(&Target { cp_async: false, ldmatrix: false, ..target });
 }
 

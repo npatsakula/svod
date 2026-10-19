@@ -521,6 +521,8 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
     assert!(worst < 2e-2, "max abs diff {worst} against the reference");
 }
 
+/// `spec`'s kernel on the device against the program, its ring as deep as
+/// the device's fill runs (register staging: two slots at most).
 #[test_case(spec(64, 64, 64, 64, 64, false, false), &[64, 64]; "one key block")]
 #[test_case(spec(128, 128, 64, 64, 64, false, false), &[128, 128]; "plain")]
 #[test_case(spec(256, 256, 64, 64, 64, true, false), &[256, 256]; "causal")]
@@ -553,7 +555,11 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
 #[test_case(biased(cached(1, 100, [4, 2, 64], true, 1, 1)), &[100, 37]; "cache biased: row map, appended, gqa")]
 #[test_case(biased(counted(cached(5, 96, [2, 2, 128], false, 8, 2))), &[64, 96]; "cache biased: d 128, eight counted appended, two splits")]
 fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
-    let Some(target) = super::cuda_target() else { return };
+    let Some(target) = super::device_target() else { return };
+    let spec = AttnSpec { cfg: FaCfg { stages: target.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
+    if !spec.cfg.fits(&target, spec.d, spec.mask.bias.is_some()) {
+        return eprintln!("skipped: {:?} does not fit {}", spec.cfg, target.arch.target_name());
+    }
     on_device(&spec, lens, target);
 }
 
@@ -685,10 +691,7 @@ fn grouped(spec: AttnSpec) -> AttnSpec {
 #[test_case(cached(5, 96, [2, 2, 128], false, 0, 2), &[64, 96]; "cache: d 128, two splits")]
 #[test_case(biased(cached(1, 200, [4, 4, 64], false, 0, 4)), &[200, 70]; "cache biased: four splits")]
 fn warpgroup_kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
-    let Some(target) = super::cuda_target().filter(|t| !t.group_mma.is_empty()) else {
-        eprintln!("skipped: no warpgroup matrix core");
-        return;
-    };
+    let Some(target) = super::group_target() else { return };
     let spec = grouped(spec);
     assert!(spec.cfg.fits(&target, spec.d, spec.mask.bias.is_some()), "{:?} does not fit", spec.cfg);
     let group = on_device(&spec, lens, target.clone());
@@ -705,7 +708,7 @@ fn warpgroup_kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
 #[test_case(1, 4, 64, 3, 1; "three splits, one batch")]
 #[test_case(7, 3, 64, 2, 2; "twenty-one rows, partial block")]
 fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, batch: usize) {
-    let Some(target) = super::cuda_target() else { return };
+    let Some(target) = super::device_target() else { return };
     let spec = CombineSpec { batch: Batch::Static(batch), t, heads, d, splits, cfg: NormCfg { br: 4 } };
     let rows = splits * batch * t * heads;
     let mut seed = 9;

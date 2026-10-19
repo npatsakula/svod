@@ -1,6 +1,6 @@
 //! End to end on the attached GPU: the lowered program computes what the
-//! interpreter computes. Skips unless `SVOD_DEVICE` names a CUDA device (the
-//! two-crew test: a device that interleaves crews).
+//! interpreter computes, on any vendor (the warpgroup test: a device with a
+//! warpgroup core; the two-crew test: one that interleaves crews).
 
 use svod_dtype::{DType, ScalarDType, default_device::default_device};
 use svod_tensor::Tensor;
@@ -37,8 +37,9 @@ fn lcg(seed: &mut u64) -> f32 {
     ((*seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
 }
 
-/// The pipelined GEMM over `cp.async` + `mma.sync` + `ldmatrix` matches the
-/// interpreter's bf16/f32 result on every tile of the grid.
+/// The pipelined GEMM matches the interpreter's bf16/f32 result on every
+/// tile of the grid, over the ring the device's fill can run (register
+/// staging: two slots at most).
 #[test_case(128, 128, 64, 128, 128, 32, 2, 2, 4; "one block, two stages")]
 #[test_case(256, 128, 256, 128, 64, 32, 3, 4, 2; "four blocks, three stages")]
 #[test_case(64, 64, 128, 64, 64, 64, 2, 2, 2; "64-wide k")]
@@ -54,7 +55,8 @@ fn gemm_matches_the_interpreter(
     wr: u32,
     wc: u32,
 ) {
-    let Some(target) = super::cuda_target() else { return };
+    let Some(target) = super::device_target() else { return };
+    let stages = target.stages(stages);
     let cfg =
         GemmCfg { core: Core::Warp, tile: [bm, bn, bk], stages, warps: [wr, wc], group_m: 0, unroll: true, crews: 1 };
     check_gemm(&declared(target), m, n, k, cfg);
@@ -64,10 +66,7 @@ fn gemm_matches_the_interpreter(
 /// shortlists), on a grid with partial row and column tiles.
 #[test]
 fn every_gemm_candidate_matches_the_interpreter() {
-    if super::cuda_target().is_none() {
-        return;
-    }
-    let planner = super::device_planner().expect("a planner for the device");
+    let Some(planner) = super::device_planner() else { return };
     let mut cfgs = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512)] {
         let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: BIG };
@@ -91,10 +90,7 @@ fn every_gemm_candidate_matches_the_interpreter() {
 #[test_case([256, 128, 64], [16, 1], [4, 4], 2; "256x128x64 four groups")]
 #[test_case([128, 256, 64], [8, 2], [4, 4], 2; "128x256x64 two by two")]
 fn warpgroup_gemm_matches_the_warp_core(tile: [usize; 3], group: [u32; 2], warp: [u32; 2], stages: usize) {
-    let Some(target) = super::cuda_target().filter(|t| !t.group_mma.is_empty()) else {
-        eprintln!("skipped: no warpgroup core");
-        return;
-    };
+    let Some(target) = super::group_target() else { return };
     let device = declared(target);
     // Rows stay 16-byte aligned for the chunk fills: `n` a multiple of eight.
     let (m, n, k) = (tile[0] * 2 - 5, tile[1] + 8, tile[2] * 5);
@@ -339,9 +335,9 @@ fn gemm_candidates_probe() {
 /// first executions of a fresh plan with dynamic and with static shared
 /// memory; prints milliseconds and never asserts.
 #[test]
-#[ignore = "perf probe: needs a CUDA device"]
+#[ignore = "perf probe: needs a cp.async device"]
 fn first_execution_probe() {
-    let Some(target) = super::cuda_target() else { return };
+    let Some(target) = super::cp_async_target() else { return };
     let device = declared(target);
     let (m, n, k) = (704usize, 1536usize, 512usize);
     let mut seed = 5;

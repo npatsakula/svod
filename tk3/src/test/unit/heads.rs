@@ -149,7 +149,7 @@ fn only_the_live_batch_runs() {
 #[test_case(spec(var(), 40, [8, 2, 128], [true, true], Some(true)); "d 128, tables per batch, batch var")]
 #[test_case(spec(STATIC, 16, [2, 2, 64], [false, false], None); "a split")]
 fn kernel_matches_the_program(s: HeadsSpec) {
-    let Some(target) = super::cuda_target() else { return };
+    let Some(target) = super::device_target() else { return };
     let cap = s.batch.capacity();
     let p = inputs(&s, 11);
     let want = run(&heads::<BF16>(&s), p.clone(), &[("b", cap as i64)]).unwrap();

@@ -92,14 +92,24 @@ fn device_planner() -> Option<Arc<Planner>> {
     Some(crate::ops::planner(&default_device()).expect("the device's cost probes measure"))
 }
 
-/// [`device_target`] when the device is a CUDA one.
-fn cuda_target() -> Option<Target> {
+/// [`device_target`] when the device fills shared memory with `cp.async`,
+/// for the tests that build those lowerings or rings deeper than two slots.
+fn cp_async_target() -> Option<Target> {
     let target = device_target()?;
-    let cuda = matches!(target.arch, svod_dtype::GpuArch::Cuda(_));
-    if !cuda {
-        eprintln!("skipped: not a CUDA device");
+    if !target.cp_async {
+        eprintln!("skipped: no cp.async");
     }
-    cuda.then_some(target)
+    target.cp_async.then_some(target)
+}
+
+/// [`device_target`] when the device has a warpgroup matrix core.
+fn group_target() -> Option<Target> {
+    let target = device_target()?;
+    let group = !target.group_mma.is_empty();
+    if !group {
+        eprintln!("skipped: no warpgroup matrix core");
+    }
+    group.then_some(target)
 }
 
 /// The crate's tracing under `RUST_LOG` on stderr, for the probes: the
