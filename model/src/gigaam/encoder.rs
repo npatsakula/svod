@@ -980,8 +980,9 @@ impl Encoder {
     /// One streaming step over `S` lanes: `mel` `[S, n_mels, 4·chunk]` is
     /// every lane's next chunk, `cursors.valid[s]` frames of it real (0 for a
     /// lane sitting this step out). Without look-ahead the chunk's frames come
-    /// out; with it the pending chunk's do, the new chunk becoming pending.
-    /// A lane's caches change only when it emits, so idle lanes are untouched.
+    /// out; with it the pending chunk's do once a new chunk or the flush is
+    /// in, the new chunk becoming pending. A lane's caches change only when it
+    /// emits, so idle lanes are untouched whatever their cursors say.
     ///
     /// The frames beyond `valid` are zeros from the mel front end, harmless
     /// to the causal convolutions and hidden from the attention, so a final
@@ -1008,15 +1009,17 @@ impl Encoder {
         let [subs0, subs1] = subs;
         let subsampling = [gate(&fresh, subs0, caches.subsampling[0])?, gate(&fresh, subs1, caches.subsampling[1])?];
 
-        // The frames the layers run over, and how many of their keys are real.
-        let (x, emits, visible) = if lookahead == 0 {
-            (x0.clone(), fresh.clone(), n_fresh.clone())
+        // The frames the layers run over, and how many of their keys are
+        // real: the pending chunk's (none without look-ahead) and, short of a
+        // flush, the fresh chunk's.
+        let flushed = cursors.flush.try_ne(0i32)?;
+        let visible = cursors.pending.try_add(&n_fresh.where_(&flushed.logical_not()?, 0i32)?)?;
+        // A pending chunk goes out once its look-ahead or the flush arrives.
+        let (x, emits) = if lookahead == 0 {
+            (x0.clone(), fresh.clone())
         } else {
-            let x = Tensor::cat(&[caches.pending, &x0], 1)?;
-            let emits = cursors.pending.try_gt(0i32)?;
-            let flushed = cursors.flush.try_ne(0i32)?;
-            let visible = cursors.pending.try_add(&n_fresh.where_(&flushed.logical_not()?, 0i32)?)?;
-            (x, emits, visible)
+            let due = fresh.try_bitor(&flushed)?;
+            (Tensor::cat(&[caches.pending, &x0], 1)?, cursors.pending.try_gt(0i32)?.try_bitand(&due)?)
         };
         // A lane with nothing to see keeps a finite output.
         let visible = visible.maximum(1i32)?;

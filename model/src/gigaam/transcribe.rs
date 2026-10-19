@@ -570,7 +570,7 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
 
 /// Pack per-chunk mel-frame counts into a JIT lengths input view `[max_batch]`,
 /// zero-padding unused entries.
-fn pack_lengths_buffer(mut view: ndarray::ArrayViewMutD<'_, i32>, chunk_lengths: &[usize]) {
+pub(crate) fn pack_lengths_buffer(mut view: ndarray::ArrayViewMutD<'_, i32>, chunk_lengths: &[usize]) {
     let slice = view.as_slice_mut().expect("contiguous lengths buffer");
     slice.fill(0);
     for (dst, &len) in slice.iter_mut().zip(chunk_lengths) {
