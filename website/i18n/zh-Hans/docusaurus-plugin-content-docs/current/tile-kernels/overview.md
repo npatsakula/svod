@@ -16,7 +16,7 @@ tk3 是较早的 `svod-tk` crate（tk1）的后继者。Transformer 模型的手
 | 布局 | `layout`, `layouts` | 用 F2 线性布局（比特矩阵）表示每种片段和 swizzle，由推断分配。内核代码从不指名某个 lane。 |
 | 原子 | `atoms` | 各目标的矩阵核心指令，自带操作数布局（CUDA 上为 `mma.sync`）。 |
 | 调度模板 | `schedule` | 把 `Pipeline` 语句展开为循环、`cp.async` 组和屏障。作者只需编写生产与消费两部分的主体。 |
-| 降级 | `lower` | 展开调度、根据效果插入屏障、推断布局，并输出预线性化的指令列表（`Op::Linear`），因此顺序不由任何拓扑排序决定。 |
+| 降级 | `lower` | 根据效果插入屏障、展开调度、推断布局，并输出预线性化的指令列表（`Op::Linear`），因此顺序不由任何拓扑排序决定。 |
 | 内核 | `kernels` | 带尾处理（epilogue）的 GEMM、flash attention、注意力前处理（prologue）、LayerNorm/RMSNorm。每个内核输入一个 spec 结构体，输出一个 `Program`。 |
 | 启动 | `launch` | 把程序作为惰性图中的自定义内核运行，降级后的主体会被记忆化缓存。 |
 | 算子层 | `ops` | `linear`、`attention`、`heads`、`layer_norm`、`rms_norm`……它们总是返回 `Tensor`：有合适的内核时使用内核，否则使用计算图。 |
@@ -30,7 +30,7 @@ model code ──► svod_tk3::ops          always a Tensor; picks a kernel and 
               kernels::*               spec ─► tile Program (builder, program order)
                    │
                    ▼
-              lower::lower             schedule template ─► operand loads ─► barriers
+              lower::lower             operand loads ─► barriers ─► schedule template
                    │                   ─► layout inference ─► emission
                    ▼
               Op::Linear program  ──►  custom kernel in the lazy graph ─► LLVM ─► device

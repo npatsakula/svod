@@ -12,9 +12,9 @@ sidebar_label: Layouts और Lowering
 
 | क़दम | मॉड्यूल | असर |
 |---|---|---|
-| 1. Schedule expansion | `schedule::expand` | हर `Pipeline` loops, branches और explicit `Sync` statements बन जाता है |
-| 2. Operand materialization | `lower` | Shared या global `mma` operand को एक नए register tile में explicit load मिलता है |
-| 3. Barriers | `lower::sync` | Author-level shared memory traffic के आसपास barriers डाले जाते हैं |
+| 1. Operand materialization | `lower` | Shared या global `mma` operand को एक नए register tile में explicit load मिलता है |
+| 2. Barriers | `lower::sync` | Shared memory effects fence किए जाते हैं: barriers, और async copy के tile के इस्तेमाल से पहले एक commit और wait। `Pipeline` अभी भी एक statement है, जिसका template अपनी ring ख़ुद fence करता है, इसलिए pass सिर्फ़ वहीं fence करता है जहाँ ring आसपास के code से मिलती है |
+| 3. Schedule expansion | `schedule::expand` | हर `Pipeline` loops, branches और explicit `Sync` statements बन जाता है |
 | 4. Layout inference | `layouts::infer` | हर register tile को एक layout मिलता है; टकराव पर `Relayout` |
 | 5. Emission | `lower/emit.rs` | Statements program order में `UOp::linear_program` में emit होते हैं |
 

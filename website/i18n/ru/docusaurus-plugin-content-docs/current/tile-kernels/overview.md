@@ -23,7 +23,7 @@ tk3 приходит на смену старому крейту `svod-tk` (tk1)
 | Раскладки | `layout`, `layouts` | Линейные раскладки над F2 (битовые матрицы) для каждого фрагмента и swizzle, назначаемые выводом. Код ядра никогда не называет лейн. |
 | Атомы | `atoms` | Инструкции матричных ядер каждой цели, несущие раскладки своих операндов (`mma.sync` на CUDA). |
 | Шаблоны расписания | `schedule` | Разворачивают инструкцию `Pipeline` в циклы, группы `cp.async` и барьеры. Автор пишет только тела produce и consume. |
-| Понижение | `lower` | Разворачивает расписание, вставляет барьеры по эффектам, выводит раскладки и выпускает заранее линеаризованный список инструкций (`Op::Linear`), так что порядок не решает никакая топологическая сортировка. |
+| Понижение | `lower` | Вставляет барьеры по эффектам, разворачивает расписание, выводит раскладки и выпускает заранее линеаризованный список инструкций (`Op::Linear`), так что порядок не решает никакая топологическая сортировка. |
 | Ядра | `kernels` | GEMM с эпилогами, flash attention, пролог внимания, LayerNorm/RMSNorm. На входе каждого — структура-спецификация, на выходе — `Program`. |
 | Запуск | `launch` | Запускает программу как пользовательское ядро в ленивом графе, мемоизируя пониженные тела. |
 | Слой операций | `ops` | `linear`, `attention`, `heads`, `layer_norm`, `rms_norm`, … Всегда возвращают `Tensor`: ядро, когда оно подходит, иначе граф. |
@@ -37,7 +37,7 @@ model code ──► svod_tk3::ops          always a Tensor; picks a kernel and 
               kernels::*               spec ─► tile Program (builder, program order)
                    │
                    ▼
-              lower::lower             schedule template ─► operand loads ─► barriers
+              lower::lower             operand loads ─► barriers ─► schedule template
                    │                   ─► layout inference ─► emission
                    ▼
               Op::Linear program  ──►  custom kernel in the lazy graph ─► LLVM ─► device

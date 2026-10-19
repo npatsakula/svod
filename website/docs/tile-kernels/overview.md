@@ -22,7 +22,7 @@ op layer described here, and so does YOLO26, whose convolutions are implicit GEM
 | Layouts | `layout`, `layouts` | F2 linear layouts (bit matrices) for every fragment and swizzle, assigned by inference. Kernel code never names a lane. |
 | Atoms | `atoms` | Per-target matrix-core instructions that carry their operand layouts (`mma.sync` on CUDA). |
 | Schedule templates | `schedule` | Expand a `Pipeline` statement into loops, `cp.async` groups and barriers. The author writes only the produce and consume bodies. |
-| Lowering | `lower` | Expands the schedule, inserts barriers from effects, infers layouts and emits a pre-linearized instruction list (`Op::Linear`), so no toposort decides the order. |
+| Lowering | `lower` | Inserts barriers from effects, expands the schedule, infers layouts and emits a pre-linearized instruction list (`Op::Linear`), so no toposort decides the order. |
 | Kernels | `kernels` | GEMM with epilogues, flash attention, the attention prologue, LayerNorm/RMSNorm. Each is a spec struct in and a `Program` out. |
 | Launch | `launch` | Runs a program as a custom kernel in the lazy graph, with lowered bodies memoized. |
 | Op layer | `ops` | `linear`, `attention`, `heads`, `layer_norm`, `rms_norm`, … These always return a `Tensor`, using a kernel when one fits and the graph otherwise. |
@@ -36,7 +36,7 @@ model code ──► svod_tk3::ops          always a Tensor; picks a kernel and 
               kernels::*               spec ─► tile Program (builder, program order)
                    │
                    ▼
-              lower::lower             schedule template ─► operand loads ─► barriers
+              lower::lower             operand loads ─► barriers ─► schedule template
                    │                   ─► layout inference ─► emission
                    ▼
               Op::Linear program  ──►  custom kernel in the lazy graph ─► LLVM ─► device
