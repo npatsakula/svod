@@ -281,6 +281,12 @@ fn biased(spec: AttnSpec) -> AttnSpec {
     AttnSpec { mask: AttnMask { bias: Some(Bias::PerBatch), ..spec.mask }, ..spec }
 }
 
+/// A scale of the caller's choosing, in place of `1/√d`.
+fn scaled(mut spec: AttnSpec, scale: f32) -> AttnSpec {
+    spec.scale = scale;
+    spec
+}
+
 fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
     AttnSpec { cfg, ..spec }
 }
@@ -305,6 +311,8 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(masked(128, 128, 64, 64, 32, EVERY_BIAS), &[128, 100]; "every mask and a bias")]
 #[test_case(spec(128, 128, 64, 64, 64, false, true), &[100, 0]; "a lane with no keys")]
 #[test_case(spec(128, 128, 64, 64, 32, true, true), &[0, 50]; "causal, a lane with no keys")]
+#[test_case(scaled(spec(128, 128, 64, 64, 32, true, true), 0.3), &[128, 50]; "a larger scale")]
+#[test_case(scaled(spec(128, 128, 64, 64, 32, true, true), -0.1), &[128, 50]; "a negative scale runs the maximum in the exponent's units")]
 fn program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     let c = case(spec.clone(), lens);
     let got = run(&flash_attention(&spec), params(&c), &[("b", 2)]).unwrap();
@@ -359,6 +367,7 @@ fn counted(mut spec: AttnSpec) -> AttnSpec {
 #[test_case(biased(counted(cached(8, 64, [2, 2, 64], false, 8, 2))), &[64, 20]; "biased: counted appended rows")]
 #[test_case(cached(1, 100, [4, 4, 64], false, 0, 1), &[100, 0]; "a cached lane with no keys")]
 #[test_case(cached(1, 200, [4, 4, 64], false, 0, 4), &[0, 70]; "a cached lane with no keys, four splits")]
+#[test_case(scaled(cached(1, 200, [4, 4, 64], true, 1, 4), -0.1), &[200, 70]; "four splits merge a negative scale's partial maxima")]
 fn cached_program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     program_matches_a_direct_softmax(spec, lens);
 }

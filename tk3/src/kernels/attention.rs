@@ -183,13 +183,26 @@ impl AttnSpec {
 type Mask<'a> = &'a dyn Fn(&mut Kernel, Regs<F32>, Sc) -> Regs<F32>;
 
 /// The online-softmax step over one key block: `q_r` against `k_t`, the
-/// scores masked by `mask(block_start)`, folded into `(m, l, o)` with `v_t`.
+/// scores (plus `bias(block_start)`, in the scaled log2 units) masked by
+/// `mask(block_start)`, folded into `(m, l, o)` with `v_t`. The running
+/// maximum `m` is in the raw scores' units when [`raw_max`](Self::raw_max)
+/// holds, else in the scaled log2 units of the exponent.
 struct Step<'a, T> {
     q_r: Regs<T>,
     scale_log2e: f64,
     shape: Shape,
+    bias: Option<Mask<'a>>,
     mask: Mask<'a>,
     cfg: FaCfg,
+}
+
+impl<T> Step<'_, T> {
+    /// Whether the running maximum is kept in the raw scores' units: a
+    /// positive scale commutes with the maximum, and without a bias nothing
+    /// joins the scores before it.
+    fn raw_max(&self) -> bool {
+        self.bias.is_none() && self.scale_log2e > 0.0
+    }
 }
 
 /// How far (in log2 units) a row's running maximum may fall behind its
@@ -208,9 +221,30 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let zero = k.zeros::<F32>(st.shape);
     let s = k.mma(zero, st.q_r, false, k_t, true);
     let scale = k.fill::<F32>(st.shape, Const::Float(st.scale_log2e));
-    let s = k.binary(s, scale, BinaryOp::Mul);
-    let s = (st.mask)(k, s, block_start);
-    let block_max = k.reduce(s, Axis::Row, ReduceOp::Max);
+    let rows = k.shape(m);
+    // With the maximum in raw units the raw scores are masked and reduced,
+    // and the scale reaches only the two row values the exponent and the
+    // correction take (a multiply per row rather than per score): the
+    // exponent's `s·scale − m·scale` is one fma per score. A bias joins the
+    // scaled scores before the mask, so with one the scores are scaled first.
+    let (s, block_max) = if st.raw_max() {
+        let s = (st.mask)(k, s, block_start);
+        let block_max = k.reduce(s, Axis::Row, ReduceOp::Max);
+        (k.binary(s, scale, BinaryOp::Mul), block_max)
+    } else {
+        let s = k.binary(s, scale, BinaryOp::Mul);
+        let s = st.bias.map_or(s, |bias| bias(k, s, block_start.clone()));
+        let s = (st.mask)(k, s, block_start);
+        (s, k.reduce(s, Axis::Row, ReduceOp::Max))
+    };
+    let unit = if st.raw_max() { st.scale_log2e } else { 1.0 };
+    let scaled = |k: &mut Kernel, x: Regs<F32>| {
+        if !st.raw_max() {
+            return x;
+        }
+        let row_scale = k.fill::<F32>(rows, Const::Float(st.scale_log2e));
+        k.binary(x, row_scale, BinaryOp::Mul)
+    };
     // A row adopts its new maximum only when it grows by more than
     // `RESCALE_ABOVE` (log2 units), else keeps the old one: its correction is
     // then exactly 1 (and the accumulator's rescale may be skipped), while its
@@ -218,12 +252,14 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     // maximum, so their quotient is the same.
     let m_max = k.binary(m, block_max, BinaryOp::Max);
     let growth = k.binary(m_max, m, BinaryOp::Sub);
-    let limit = k.fill::<F32>(k.shape(m), Const::Float(RESCALE_ABOVE));
+    let limit = k.fill::<F32>(rows, Const::Float(RESCALE_ABOVE / unit));
     let grows = k.compare(limit, growth, BinaryOp::Lt);
     let m_new = k.where_(grows, m_max, m);
     let corr = k.binary(m, m_new, BinaryOp::Sub);
+    let corr = scaled(k, corr);
     let corr = k.unary(corr, UnaryOp::Exp2);
-    let p = k.binary(s, m_new, BinaryOp::Sub);
+    let m_exp = scaled(k, m_new);
+    let p = k.binary(s, m_exp, BinaryOp::Sub);
     let p = k.unary(p, UnaryOp::Exp2);
     let (p16, held) = if st.cfg.truncate_p && T::DTYPE == svod_dtype::ScalarDType::BFloat16 {
         let p16 = k.cast_toward_zero::<T>(p);
@@ -461,7 +497,6 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     };
     let edges = causal || keys_masked || window.is_some() || chunk.is_some() || seg.is_some();
     let mask = |k: &mut Kernel, s: Regs<F32>, block_start: Sc| -> Regs<F32> {
-        let s = biased(k, s, block_start.clone());
         if key_mask {
             return masked(k, s, block_start);
         }
@@ -496,7 +531,8 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         let [out] = k.select_if(partial, |k| [masked(k, s, block_start.clone())], |_| [s]);
         out
     };
-    let st = Step { q_r, scale_log2e, shape, mask: &mask, cfg };
+    let bias_tile = bias_view.is_some().then_some(&biased as Mask);
+    let st = Step { q_r, scale_log2e, shape, bias: bias_tile, mask: &mask, cfg };
     let [m, l, acc] = k.pipeline(
         blocks,
         stages,
@@ -536,8 +572,8 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
                 None => Sc::from(appended),
             };
             let last = split.clone().eq(splits - 1);
+            let app_bias = |k: &mut Kernel, s: Regs<F32>, _: Sc| biased(k, s, Sc::from(tk));
             let rows = |k: &mut Kernel, s: Regs<F32>, _: Sc| {
-                let s = biased(k, s, Sc::from(tk));
                 let col = k.coord(shape, Axis::Col);
                 let visible = k.splat::<I32>(shape, visible.clone());
                 let seen = k.compare(col, visible, BinaryOp::Lt);
@@ -547,7 +583,8 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
                 let keep = k.binary(seen, owned, BinaryOp::And);
                 hide(k, keep, s)
             };
-            let st = Step { q_r, scale_log2e, shape, mask: &rows, cfg };
+            let bias_tile = bias_view.is_some().then_some(&app_bias as Mask);
+            let st = Step { q_r, scale_log2e, shape, bias: bias_tile, mask: &rows, cfg };
             step(&mut k, &st, k_g, v_g, Sc::from(0), [m, l, acc])
         }
         None => [m, l, acc],
@@ -570,6 +607,13 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             );
             let o_view = k.at(o_view, q_off.clone(), 0);
             k.store(o_view, acc);
+            // The partial maximum is merged in the exponent's units.
+            let m = if st.raw_max() {
+                let row_scale = k.fill::<F32>(Shape::new(bq, 1), Const::Float(scale_log2e));
+                k.binary(m, row_scale, BinaryOp::Mul)
+            } else {
+                m
+            };
             for (p, val) in [(m_part, m), (l_part, l)] {
                 let view = k.view(
                     p,
