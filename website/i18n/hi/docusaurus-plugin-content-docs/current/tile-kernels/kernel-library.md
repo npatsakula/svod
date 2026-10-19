@@ -41,16 +41,23 @@ rows और 48–256 columns के output tiles, `bk` 16–64, नौ warp grid
 हर thread पर पूरे 16-byte chunks में बँटते हैं, ring shared memory में समाती है) और बाक़ी को device की मापी
 गई `Costs` से SM time के nanoseconds में rank करता है। एक block का trip `work` करता है: हर wave के operand
 fragments shared memory से पढ़े जाते हैं, fill stream होकर आता है, matrix-core steps और trip की fixed cost।
-जितने blocks एक SM एक साथ रखता है उनका एक round SM के issue work से, एक wave के अपने issue से (जिस block
-में SM के SIMDs से कम waves हैं वह बाक़ी को idle छोड़ता है) या उस memory latency से bound होता है जिसे एक
-pipeline stage आगे छिपा नहीं सकता, जो भी सबसे लंबा हो:
-`cost = rounds × trips × max(resident × work, simds × work / waves, latency / (stages − 1))`
-(`Planner::pipelined`)। बीच वाले bound के बिना gfx1151 की ranking one-warp 256×256 tiles से शुरू होती थी जो
+सबसे व्यस्त SM `per_sm = ⌈blocks / sms⌉` blocks का काम issue करता है, एक के ख़त्म होते ही अगला उठाते हुए,
+और trip की fixed cost उन blocks में बँटती है जो वह एक साथ रखता है (`resident`, shared memory और register
+estimate से); उन blocks का एक round कम से कम एक wave का अपना issue है (जिस block में SM के SIMDs से कम waves
+हैं वह बाक़ी को idle छोड़ता है) और वह memory latency जिसे एक pipeline stage आगे छिपा नहीं सकता:
+`cost = trips × max(per_sm × (work + trip / resident), rounds × max(simds × (work + trip) / waves, latency / (stages − 1)))`
+जहाँ `rounds = ⌈per_sm / resident⌉` (`Planner::pipelined`)। Fill का byte इस हिसाब से priced है कि वह कहाँ से
+आता है: distinct bytes cache के तीन-चौथाई में समाएँ तो L2 दर, उससे डेढ़ गुना से ज़्यादा हों तो DRAM दर, बीच में
+दोनों का मिश्रण (`Planner::fill_byte`)। Wave वाले bound के बिना gfx1151 की ranking one-warp 256×256 tiles से
+शुरू होती थी जो
 1–3 TFLOP/s पर चलते थे। Layout की register count सिर्फ़ अनुमान लगाती है कि कितने blocks resident हैं; यह
 कुछ भी admit नहीं करती, क्योंकि जहाँ fragments replicate होते हैं (gfx11 WMMA) वहाँ यह ज़्यादा गिनती है।
-Ranking किसी tile की हर pipeline रखती है; [tune store](./tuning) उन पहले आठ output tiles और warp grids में
+Ranking किसी tile की हर pipeline रखती है; [tune store](./tuning) उन पहले 64 output tiles और warp grids में
 से चुनता है जिनके compiled kernels spill नहीं करते, हर एक अपनी पहली clean pipeline पर (सब spill करें तो:
-पहले आठ जो compile हों)। Pipelines सिर्फ़ model से rank होती हैं, इसलिए spill करने वाली unrolled ring अपने
+पहले 64 जो compile हों), फिर विजेता tile की बाक़ी pipelines में से। Admit compiler करता है और चुनाव घड़ी,
+क्योंकि model block tiles को अच्छा और warp grids को ख़राब क्रम देता है (sm_86 पर मापा गया सबसे तेज़ config
+109 tiles में 92वें स्थान पर था); pipelines को विजेता मिलने तक वह अकेला rank करता है, इसलिए spill करने वाली
+unrolled ring अपने
 rolled जुड़वाँ के लिए जगह छोड़ती है: gfx1151 पर d = 128 के unrolled 64×16 और 128×16 attention tiles spill
 करते हैं और rolled वाले clean compile होते हैं। Model के लिए gated weight एक `2·bn`-चौड़ा B tile और दो
 accumulators है, इसलिए उसकी बढ़त आधी चौड़ाई पर आती है। किसी device का `Planner` उसका target, उसकी मापी गई

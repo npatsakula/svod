@@ -407,6 +407,42 @@ fn the_shortlist_is_the_first_tiles_that_do_not_spill(
     assert!(asked.iter().flatten().eq(ranked.iter().take(SHORTLIST * batches)), "ranked batches: {asked:?}");
 }
 
+/// The first clean config is searched for in ranked batches of eight, the
+/// search stopping at the batch that holds one: a spill or a failure ahead
+/// of it is skipped, every config spilling yields the first that compiles,
+/// and nothing compiling finds nothing. `count` configs are ranked.
+#[test_case(&[], &[], 20, Some(0), 1; "the first is clean")]
+#[test_case(&[0, 1], &[2], 20, Some(3), 1; "spills and a failure skipped")]
+#[test_case(&(0..9).collect::<Vec<_>>(), &[], 20, Some(9), 2; "the second batch")]
+#[test_case(&[0, 1, 2], &[], 3, Some(0), 1; "every config spills: the first")]
+#[test_case(&[1], &[0, 2], 3, Some(1), 1; "the spilled over the failed")]
+#[test_case(&[], &[0, 1, 2], 3, None, 1; "nothing compiles")]
+#[test_case(&[], &[], 0, None, 0; "nothing ranked")]
+fn the_first_clean_config_is_searched_in_small_batches(
+    spilled: &[usize],
+    failed: &[usize],
+    count: usize,
+    want: Option<usize>,
+    batches: usize,
+) {
+    use crate::tune::Compiled;
+    let ranked: Vec<Pipe> = (0..count).map(|at| Pipe { at, tile: at }).collect();
+    let mut asked = vec![];
+    let got = config::first_clean(&ranked, |batch| {
+        asked.push(batch.to_vec());
+        let verdict = |p: &Pipe| match (spilled.contains(&p.at), failed.contains(&p.at)) {
+            (_, true) => Compiled::Failed,
+            (true, _) => Compiled::Spilled,
+            _ => Compiled::Clean,
+        };
+        batch.iter().map(verdict).collect()
+    });
+    assert_eq!(got, want);
+    assert_eq!(asked.len(), batches, "{asked:?}");
+    assert!(asked.iter().all(|b| b.len() <= 8), "small batches: {asked:?}");
+    assert!(asked.iter().flatten().eq(ranked.iter().take(8 * batches)), "ranked batches: {asked:?}");
+}
+
 /// A tile's twins are judged whole: every clean one, in order, none set
 /// aside for sharing the tile; every one spilling, all of them; nothing
 /// compiling, nothing.

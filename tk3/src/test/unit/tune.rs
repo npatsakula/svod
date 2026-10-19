@@ -16,7 +16,7 @@ use crate::atoms::{Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use crate::tune::{self, Bench, Kind, ScratchPool, TuneKey, TuneStore, fingerprint};
+use crate::tune::{self, Bench, FORMAT, Kind, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.
 fn key(shape: &[usize], candidates: &[usize]) -> TuneKey {
@@ -53,7 +53,7 @@ fn a_winner_round_trips_through_the_store() {
     let ran = Cell::new(false);
     let chosen = TuneStore::at(Some(dir.clone())).select(&k, 3, || 7, timed(&[Some(300), Some(100), None], &ran));
     assert_eq!((chosen, ran.get()), (Some(1), true));
-    assert_eq!(store_file(&dir), format!("{} 1 100\n", k.line(Kind::Choice, 7)));
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 1 100\n", k.line(Kind::Choice, 7)));
 
     let again = TuneStore::at(Some(dir.clone()));
     let ran = Cell::new(false);
@@ -177,7 +177,7 @@ fn a_value_round_trips_through_the_store() {
     let dir = scratch("value");
     let k = key(&[], &[9]);
     assert_eq!(TuneStore::at(Some(dir.clone())).value(&k, || 7, || Some(1234)), Some(1234));
-    assert_eq!(store_file(&dir), format!("{} 1234\n", k.line(Kind::Value, 7)));
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 1234\n", k.line(Kind::Value, 7)));
     let measured = || panic!("measured twice");
     assert_eq!(TuneStore::at(Some(dir.clone())).value(&k, || 7, measured), Some(1234));
     let _ = std::fs::remove_dir_all(dir);
@@ -234,7 +234,7 @@ fn an_unreadable_line_is_dropped_at_the_next_write() {
     let store = TuneStore::at(Some(dir.clone()));
     assert_eq!(store.entries(&k).len(), 1);
     assert_eq!(store.select(&k, 2, || 1, || vec![Some(9), Some(4)]), Some(1));
-    assert_eq!(store_file(&dir), format!("{} 1 4\n{kept}\n", k.line(Kind::Choice, 1)));
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 1 4\n{kept}\n", k.line(Kind::Choice, 1)));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -340,12 +340,36 @@ fn an_admission_round_trips_through_the_store() {
     assert_eq!(store.admitted(&key(&[9], &[0]), || 7, || None), None);
     assert!(store.entries(&k).is_empty());
     assert_eq!(store.admitted(&k, || 7, || Some(vec![3, 0, 5])).as_deref(), Some(&[3, 0, 5][..]));
-    assert_eq!(store_file(&dir), format!("{} 3 0 5\n", k.line(Kind::Admitted, 7)));
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 3 0 5\n", k.line(Kind::Admitted, 7)));
     let again = TuneStore::at(Some(dir.clone()));
     assert_eq!(again.admitted(&k, || 7, || unreachable!("judged twice")).as_deref(), Some(&[3, 0, 5][..]));
     let relowered = TuneStore::at(Some(dir.clone()));
     assert_eq!(relowered.admitted(&k, || 8, || Some(vec![1])).as_deref(), Some(&[1][..]));
-    assert_eq!(store_file(&dir).lines().count(), 2);
+    assert_eq!(store_file(&dir).lines().count(), 3);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A file of another line format is dropped whole and the next write starts
+/// it over in this one; a file of this format, or without a format line
+/// (the first format's), reads as it did and stays as it is until a write.
+#[test_case(Some(FORMAT + 1), false; "another format")]
+#[test_case(Some(FORMAT), true; "this format")]
+#[test_case(None, true; "no format line")]
+fn a_file_of_another_format_is_dropped(written: Option<u32>, kept: bool) {
+    let dir = scratch(&format!("format-{written:?}"));
+    let k = key(&[2, 2, 2], &[0, 1]);
+    let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
+    let line = format!("{} 1 100", k.line(Kind::Choice, 7));
+    let header = written.map_or(String::new(), |n| format!("format {n}\n"));
+    std::fs::write(&path, format!("{header}{line}\n")).unwrap();
+    let store = TuneStore::at(Some(dir.clone()));
+    assert_eq!(store.entries(&k).len(), usize::from(kept));
+    let measured = Cell::new(false);
+    assert_eq!(store.select(&k, 2, || 7, timed(&[Some(9), Some(4)], &measured)), Some(1));
+    assert_eq!(measured.get(), !kept);
+    let want =
+        if kept { format!("{header}{line}\n") } else { format!("format {FORMAT}\n{} 1 4\n", k.line(Kind::Choice, 7)) };
+    assert_eq!(store_file(&dir), want);
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -41,17 +41,24 @@ depths the target's prefetch runs, rolled and unrolled), keeps what the lowering
 atoms tile the warp grid, the fills split into whole 16-byte chunks per thread, the ring fits
 shared memory) and ranks the rest in nanoseconds of SM time from the device's measured `Costs`.
 A block's trip does `work`: every wave's operand fragments read from shared memory, the fill
-streamed in, the matrix-core steps and the trip's fixed cost. A round of the blocks an SM holds
-at once is bound by the SM's issue work, by one wave's own issue (a block of fewer waves than the
-SM has SIMDs leaves the rest idle) or by the memory latency one pipeline stage ahead cannot hide,
-whichever is longest:
-`cost = rounds × trips × max(resident × work, simds × work / waves, latency / (stages − 1))`
-(`Planner::pipelined`). Without the middle bound, gfx1151's ranking led with one-warp 256×256
+streamed in, the matrix-core steps and the trip's fixed cost. The busiest SM issues the work of
+`per_sm = ⌈blocks / sms⌉` blocks, each taken up as another ends, the trip's fixed cost shared
+with the blocks it holds at once (`resident`, by shared memory and the register estimate); a round
+of those blocks is at least one wave's own issue (a block of fewer waves than the SM has SIMDs
+leaves the rest idle) and the memory latency one pipeline stage ahead cannot hide:
+`cost = trips × max(per_sm × (work + trip / resident), rounds × max(simds × (work + trip) / waves, latency / (stages − 1)))`
+with `rounds = ⌈per_sm / resident⌉` (`Planner::pipelined`). A fill's byte is priced by where it
+comes from: the L2 rate where the distinct bytes fit three quarters of the cache, the DRAM rate
+past half again as much, a blend between (`Planner::fill_byte`). Without the wave bound,
+gfx1151's ranking led with one-warp 256×256
 tiles that ran at 1–3 TFLOP/s. The layout's register count only estimates how many blocks are resident;
 it admits nothing, since it over-counts where fragments are replicated (gfx11 WMMA). The ranking
-keeps every pipeline of a tile; the [tune store](./tuning) picks among the first eight output
+keeps every pipeline of a tile; the [tune store](./tuning) picks among the first 64 output
 tiles and warp grids whose compiled kernels do not spill, each at its first clean pipeline (all
-spilling: the first eight that compile). The pipelines are ranked by the model alone, so an
+spilling: the first 64 that compile), then among the winning tile's other pipelines. The compiler
+admits and the clock picks because the model orders block tiles well and warp grids poorly (on
+sm_86 the measured best sat as deep as the 92nd of 109 tiles); the pipelines it ranks alone until
+the winner is known, so an
 unrolled ring that spills yields to its rolled twin: on gfx1151 the unrolled 64×16 and 128×16
 attention tiles at d = 128 spill and the rolled ones compile clean. A
 gated weight

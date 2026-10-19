@@ -362,7 +362,7 @@ pub(crate) fn distinct_configs<C: Tiled>(list: &[C]) -> Vec<C> {
 /// list ends. `None` when nothing compiled: no device to judge on.
 pub(crate) fn shortlist<C: Tiled>(ranked: &[C], compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<Vec<usize>> {
     let mut tiles = HashSet::new();
-    judged(ranked, SHORTLIST, compile, |c| tiles.insert(c.tile()))
+    judged(ranked, SHORTLIST, SHORTLIST, compile, |c| tiles.insert(c.tile()))
 }
 
 /// The indices of every config of `list` whose compiled kernel does not
@@ -370,21 +370,35 @@ pub(crate) fn shortlist<C: Tiled>(ranked: &[C], compile: impl FnMut(&[C]) -> Vec
 /// nothing compiling: `None`) but with none set aside for sharing a tile:
 /// a tile's [twins](Tiled::twins) are judged so.
 pub(crate) fn clean<C: Tiled>(list: &[C], compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<Vec<usize>> {
-    judged(list, list.len(), compile, |_| true)
+    judged(list, list.len(), SHORTLIST, compile, |_| true)
+}
+
+/// Configs compiled at once in search of the first clean one: the first
+/// ranked config nearly always is, and a search is what runs with tuning
+/// off, where no test should pay for a lattice.
+const FIRST: usize = 8;
+
+/// The index of the first config of `ranked` whose compiled kernel does
+/// not spill, judged as [`shortlist`] judges (every one spilling: the first
+/// that compiles; nothing compiling: `None`), `compile` asked about batches
+/// of [`FIRST`] in ranked order until one passes.
+pub(crate) fn first_clean<C: Tiled>(ranked: &[C], compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<usize> {
+    judged(ranked, 1, FIRST, compile, |_| true).map(|at| at[0])
 }
 
 fn judged<C: Tiled>(
     ranked: &[C],
     limit: usize,
+    batch: usize,
     mut compile: impl FnMut(&[C]) -> Vec<Compiled>,
     mut keep: impl FnMut(&C) -> bool,
 ) -> Option<Vec<usize>> {
     let (mut clean, mut spilled) = (vec![], vec![]);
-    for (n, batch) in ranked.chunks(SHORTLIST).enumerate() {
-        for (i, compiled) in compile(batch).into_iter().enumerate() {
-            let at = n * SHORTLIST + i;
+    for (n, chunk) in ranked.chunks(batch).enumerate() {
+        for (i, compiled) in compile(chunk).into_iter().enumerate() {
+            let at = n * batch + i;
             match compiled {
-                Compiled::Clean if keep(&batch[i]) => clean.push(at),
+                Compiled::Clean if keep(&chunk[i]) => clean.push(at),
                 Compiled::Clean | Compiled::Failed => {}
                 Compiled::Spilled => spilled.push(at),
             }
