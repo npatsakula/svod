@@ -95,7 +95,9 @@ struct Emit<'a> {
 /// A register-side view of a tiled value for addressing shared/global memory.
 struct View {
     buf: Arc<UOp>,
-    place: Place,
+    /// Where the program holds the tile; `None` for the relayout scratch,
+    /// no allocation of the program: a row-major tile at its start.
+    place: Option<Place>,
     shape: Shape,
     dtype: ScalarDType,
     /// Added to a shared view's offset: a warp's region of the relayout
@@ -522,7 +524,7 @@ impl<'a> Emit<'a> {
             Place::Smem { alloc, .. } => self.smem_as(alloc.index(), val.dtype),
             Place::Reg => unreachable!("a memory view"),
         };
-        View { buf, place: val.place, shape: val.shape, dtype: val.dtype, region: None }
+        View { buf, place: Some(val.place), shape: val.shape, dtype: val.dtype, region: None }
     }
 
     /// Allocation `alloc`'s buffer read under `dtype`: its own where they
@@ -553,7 +555,7 @@ impl<'a> Emit<'a> {
     /// gathered row and a swizzled shared row need the full coordinate.
     fn address(&mut self, view: &View, c: &Coord) -> (Arc<UOp>, Option<Arc<UOp>>) {
         match &view.place {
-            Place::Global { offset, stride, rows: Some(map), .. } => {
+            Some(Place::Global { offset, stride, rows: Some(map), .. }) => {
                 let (row, col) = c.full();
                 let ((_, offset), (_, s1)) = (self.scalar(*offset), self.scalar(stride[1]));
                 let (_, start) = self.scalar_at(map.offset, Some(&row));
@@ -563,7 +565,7 @@ impl<'a> Emit<'a> {
                 let gate = self.inside(view, c);
                 (self.hoist(off), gate.map(|g| self.hoist(g)))
             }
-            Place::Global { offset, stride, .. } => {
+            Some(Place::Global { offset, stride, .. }) => {
                 let ((_, offset), (_, s0), (_, s1)) =
                     (self.scalar(*offset), self.scalar(stride[0]), self.scalar(stride[1]));
                 let lane = self.hoist(add(&mul(&c.row, &s0), &mul(&c.col, &s1)));
@@ -576,7 +578,7 @@ impl<'a> Emit<'a> {
                 let gate = self.inside(view, c);
                 (self.hoist(off), gate.map(|g| self.hoist(g)))
             }
-            Place::Smem { offset, .. } => {
+            Some(Place::Smem { .. }) | None => {
                 let (mut row, mut col) = c.full();
                 let mut cols = view.shape.cols as i64;
                 // A column-major tile is the row-major tile of its transpose.
@@ -584,7 +586,10 @@ impl<'a> Emit<'a> {
                     (row, col) = (col, row);
                     cols = view.shape.rows as i64;
                 }
-                let offset = self.sc(*offset);
+                let offset = match &view.place {
+                    Some(Place::Smem { offset, .. }) => self.sc(*offset),
+                    _ => c32(0),
+                };
                 // The relayout scratch is addressed through the warp's region.
                 let offset = match &view.region {
                     Some(region) => add(&offset, region),
@@ -624,14 +629,14 @@ impl<'a> Emit<'a> {
                 let lane = self.hoist(panel_off.map_or(lane.clone(), |at| add(&at, &lane)));
                 (self.hoist(add(&offset, &lane)), None)
             }
-            Place::Reg => unreachable!(),
+            Some(Place::Reg) => unreachable!(),
         }
     }
 
     /// Whether coordinate `c` of a global view lies within its bounds and,
     /// gathered, inside its row map; `None` where the view has neither.
     fn inside(&mut self, view: &View, c: &Coord) -> Option<Arc<UOp>> {
-        let Place::Global { bounds, rows, .. } = &view.place else { return None };
+        let Some(Place::Global { bounds, rows, .. }) = &view.place else { return None };
         let (row, col) = c.full();
         let in_rows = match rows {
             Some(map) => map.valid.map(|v| {
@@ -699,13 +704,13 @@ impl<'a> Emit<'a> {
     /// shared tile along its allocation's axis.
     fn along(&self, view: &View) -> (Axis, bool) {
         match &view.place {
-            Place::Global { stride, .. } => {
+            Some(Place::Global { stride, .. }) => {
                 let unit = |s: ScalarId| matches!(self.prog.scalar(s), Scalar::Const(1));
                 if unit(stride[1]) { (Axis::Col, true) } else { (Axis::Row, unit(stride[0])) }
             }
-            // The relayout scratch is no allocation of the program: row-major.
-            Place::Smem { alloc, .. } => (self.prog.smem.get(alloc.index()).map_or(Axis::Col, |a| a.along), true),
-            Place::Reg => unreachable!(),
+            Some(Place::Smem { alloc, .. }) => (self.prog.smem[alloc.index()].along, true),
+            None => (Axis::Col, true),
+            Some(Place::Reg) => unreachable!(),
         }
     }
 
@@ -977,7 +982,7 @@ impl<'a> Emit<'a> {
             UnsupportedSnafu { what: format!("a {}×{} fill by {threads} threads", d.shape.rows, cols) }
         );
         snafu::ensure!(self.along(&d).0 == Axis::Col, UnsupportedSnafu { what: "a chunk fill of a column-major tile" });
-        let Place::Global { stride, bounds, rows, .. } = &s.place else { unreachable!() };
+        let Some(Place::Global { stride, bounds, rows, .. }) = &s.place else { unreachable!() };
         let gathered = rows.is_some();
         snafu::ensure!(
             matches!(self.prog.scalar(stride[1]), Scalar::Const(1)),
@@ -1110,7 +1115,7 @@ impl<'a> Emit<'a> {
         if let Some(perm) = self.transposing(&l, &s) {
             return self.tr_load_regs(dst, &s, &l, &perm);
         }
-        let gathered = matches!(s.place, Place::Global { rows: Some(_), .. });
+        let gathered = matches!(s.place, Some(Place::Global { rows: Some(_), .. }));
         let cuda = matches!(self.low.device.target.arch, GpuArch::Cuda(_));
         let l2_only = mode == CopyMode::Staged && cuda && self.low.schedule.prefetch() == Prefetch::CpAsync;
         for (j, w) in self.runs(&l, &s) {
@@ -1169,7 +1174,7 @@ impl<'a> Emit<'a> {
     /// loads leave a row-major 16-bit `view` in, where the target has them.
     fn transposing(&self, l: &TileLayout, view: &View) -> Option<Vec<u32>> {
         let [sub_r, sub_c] = l.sub_shape();
-        let global = matches!(view.place, Place::Global { .. }) && self.along(view) == (Axis::Col, true);
+        let global = matches!(view.place, Some(Place::Global { .. })) && self.along(view) == (Axis::Col, true);
         if !self.low.device.target.tr_load || !global || view.dtype.bytes() != 2 || sub_r % 16 != 0 || sub_c % 16 != 0 {
             return None;
         }
@@ -1313,8 +1318,7 @@ impl<'a> Emit<'a> {
         // once the program's placeholders are bound, and the sum is listed
         // nowhere.
         let region = (regions > 1).then(|| self.hoist(mul(&self.warp, &c32(elems as i64))));
-        let place = Place::Smem { alloc: SmemId(u32::MAX), offset: self.zero() };
-        let view = View { buf: scratch, place, shape, dtype, region };
+        let view = View { buf: scratch, place: None, shape, dtype, region };
         snafu::ensure!(
             self.scope == Scope::Warp || self.divergent == 0,
             DivergentBarrierSnafu { what: "a relayout through shared memory" }
@@ -1323,13 +1327,6 @@ impl<'a> Emit<'a> {
         self.store_view(&view, src)?;
         self.sync(Sync::Barrier { scope: self.scope })?;
         self.gather_view(dst, &view)
-    }
-
-    fn zero(&mut self) -> ScalarId {
-        if let Some(id) = self.prog.scalars.iter().position(|s| *s == Scalar::Const(0)) {
-            return ScalarId(id as u32);
-        }
-        unreachable!("every program has a zero constant")
     }
 
     fn store_view(&mut self, d: &View, src: ValId) -> Result<()> {
@@ -1578,7 +1575,7 @@ impl<'a> Emit<'a> {
             // K-major one never reads it and declares one unit, as ever.
             let leading = if k_major { 16 } else { (rows * pc * e) as u32 };
             let stride = (8 * pc * e) as u32;
-            let Place::Smem { offset, .. } = view.place else { unreachable!("a shared operand") };
+            let Some(Place::Smem { offset, .. }) = view.place else { unreachable!("a shared operand") };
             let (_, offset) = this.scalar(offset);
             let offset = match &view.region {
                 Some(region) => add(&offset, region),

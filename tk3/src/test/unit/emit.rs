@@ -164,3 +164,32 @@ fn a_guarded_scalar_read_stays_under_its_guard(max: i64, guarded: bool) {
         assert!(reads[0] < opened[0], "read at {reads:?}, branch at {opened:?}");
     }
 }
+
+/// A tile re-held through the relayout scratch lowers in a program that
+/// interns no zero: the scratch is addressed from its start, not at an
+/// offset scalar of the program.
+#[test]
+fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
+    use crate::layouts::{Relayout, chunked};
+    let (tile, lanes) = (Shape::new(16, 32), 32);
+    let [from, to] = [Axis::Col, Axis::Row].map(|walk| chunked(tile, 4, 1, lanes, walk).expect("a chunked layout"));
+    let costs = super::lane_moves_dear();
+    assert_eq!(from.relayout(&to, 1, lanes, &costs), Relayout::ViaSmem);
+    let mut k = Kernel::new("relayout");
+    k.warps(1);
+    let x = k.param::<F32>("x", ParamKind::In, 2 * tile.elems());
+    let y = k.param::<F32>("y", ParamKind::Out, 2 * tile.elems());
+    let src = k.view(x, tile.elems(), [tile.cols, 1], tile, [None, None]);
+    let a = k.load(src);
+    k.pin(a, from);
+    let b = k.unary(a, UnaryOp::Neg);
+    k.pin(b, to);
+    let dst = k.view(y, tile.elems(), [tile.cols, 1], tile, [None, None]);
+    k.store(dst, b);
+    let prog = k.finish();
+    assert!(!prog.scalars.contains(&Scalar::Const(0)), "the program interns a zero");
+    let device = Device { target: crate::atoms::sm86(), costs };
+    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: 1, cols: 1 });
+    let nodes = linear(prog, &lowering).toposort();
+    assert!(nodes.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "no round trip through shared memory");
+}
