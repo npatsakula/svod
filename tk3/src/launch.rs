@@ -2,15 +2,32 @@
 //! capacity, the lowered PROGRAM as the call body, outputs in `prog.params`
 //! order after the inputs.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use snafu::{ResultExt, Snafu};
+use svod_dtype::DeviceSpec;
 use svod_dtype::default_device::default_device;
 use svod_ir::{CallInfo, UOp};
 use svod_tensor::Tensor;
 
 use crate::ir::{ParamKind, Program};
 use crate::lower::{self, Lowering};
+
+/// Lowered bodies by tile program, lowering, device and placeholders: a model
+/// calls an op once per layer, and lowering is milliseconds of instruction
+/// emission per call that hash-consing would only deduplicate afterwards.
+static LOWERED: LazyLock<Mutex<HashMap<u64, Arc<UOp>>>> = LazyLock::new(Mutex::default);
+
+fn lowered_key(prog: &Program, lowering: &Lowering, device: &DeviceSpec, placeholders: &[Arc<UOp>]) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    format!("{prog:?}{lowering:?}{device:?}").hash(&mut hasher);
+    for placeholder in placeholders {
+        format!("{:?}{:?}", placeholder.dtype(), placeholder.shape().ok().flatten()).hash(&mut hasher);
+    }
+    hasher.finish()
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -57,13 +74,20 @@ pub fn graph_launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor])
     let mut failure = None;
     let info = CallInfo { name: Some(name.clone()), ..CallInfo::default() };
     let result = tensors[out_at].custom_kernel_with(&ins, info, |ph| {
+        let key = lowered_key(&prog, lowering, &device, &ph);
+        if let Some(program) = LOWERED.lock().expect("lowered memo").get(&key) {
+            return program.clone();
+        }
         let mut params: Vec<Arc<UOp>> = Vec::with_capacity(ph.len());
         let mut rest = ph[1..].iter();
         for i in 0..ph.len() {
             params.push(if i == out_at { ph[0].base() } else { rest.next().expect("an input").base() });
         }
         match lower::lower(prog, lowering, params, device) {
-            Ok(lowered) => lowered.program,
+            Ok(lowered) => {
+                LOWERED.lock().expect("lowered memo").insert(key, lowered.program.clone());
+                lowered.program
+            }
             Err(err) => {
                 failure = Some(err);
                 UOp::noop()
