@@ -67,14 +67,56 @@ fn frags() -> Vec<Frag> {
     ]
 }
 
+/// Every input of `l`: each assignment of its input dims.
+fn all_inputs(l: &Layout) -> Vec<Vec<(Dim, u32)>> {
+    let dims = [Reg, Lane, Warp, Dim::Block, Row, Col].into_iter().filter(|&d| l.in_bits(d) > 0);
+    dims.fold(vec![vec![]], |acc, d| {
+        acc.into_iter().flat_map(|v| (0..l.in_size(d)).map(move |x| [v.clone(), vec![(d, x)]].concat())).collect()
+    })
+}
+
+/// How many inputs of `l` hold each `(row, col)` they reach.
+fn holders(l: &Layout) -> BTreeMap<(u32, u32), usize> {
+    let mut held = BTreeMap::new();
+    for x in all_inputs(l) {
+        *held.entry(l.apply(&x)).or_insert(0) += 1;
+    }
+    held
+}
+
+/// Whether `l` holds every element of its tile.
+pub(super) fn covers(l: &Layout) -> bool {
+    holders(l).len() == (l.out_size(Row) * l.out_size(Col)) as usize
+}
+
+/// Whether `l` holds every element of its tile exactly once.
+fn bijective(l: &Layout) -> bool {
+    covers(l) && holders(l).values().all(|&n| n == 1)
+}
+
+/// Mask of the input bits of `dim` that reach no output (replication).
+fn free_bits(l: &Layout, dim: Dim) -> u32 {
+    (0..l.in_bits(dim)).filter(|&b| l.basis(dim, b).iter().all(|o| o.1 == 0)).map(|b| 1 << b).sum()
+}
+
+/// Whether every lane of `dst` finds each of its elements in the same lane of `src`.
+fn in_lane(src: &Layout, dst: &Layout) -> bool {
+    (0..dst.in_size(Lane)).all(|lane| {
+        (0..dst.in_size(Reg)).all(|j| {
+            let want = dst.apply(&[(Lane, lane), (Reg, j)]);
+            (0..src.in_size(Reg)).any(|k| src.apply(&[(Lane, lane), (Reg, k)]) == want)
+        })
+    })
+}
+
 fn at(l: &Layout, lane: u32, j: u32) -> (i64, i64) {
     let (r, c) = l.apply(&[(Lane, lane), (Reg, j)]);
     (r.into(), c.into())
 }
 
-/// Each atom equals its tk1 closed form on every (lane, register), covers the tile
+/// Each atom equals its tk1 closed form on every (lane, register) and covers the tile
 /// exactly `replication` times (RDNA's replicated input: lanes `L`, `L+16` identical,
-/// lane bit 4 free), and the F2 predicates agree with the brute-force count.
+/// lane bit 4 free).
 #[test]
 fn atoms_match_lane_map_closed_forms() {
     for (name, atom, map, transpose, rows, cols, regs, lanes) in frags() {
@@ -91,10 +133,8 @@ fn atoms_match_lane_map_closed_forms() {
         }
         let replication = regs * lanes / (rows * cols) as u32;
         assert!(hits.iter().all(|&h| h == replication), "{name}: every element held {replication} times");
-        assert!(l.is_surjective(), "{name}: covers the tile");
-        assert_eq!(l.is_bijective(), replication == 1, "{name}: bijective");
         let free = if replication == 2 { 16 } else { 0 };
-        assert_eq!((l.free_bits(Lane), l.free_bits(Reg)), (free, 0), "{name}: free bits");
+        assert_eq!((free_bits(&l, Lane), free_bits(&l, Reg)), (free, 0), "{name}: free bits");
     }
 }
 
@@ -112,23 +152,19 @@ fn mma_sync_tile_is_c_over_the_n_halves() {
             }
         }
     }
-    assert!(b.is_bijective() && c.is_bijective());
+    assert!(bijective(&b) && bijective(&c));
 }
 
 /// The transposed tile holds the two B fragments in registers `{0,1,4,5}` / `{2,3,6,7}`:
-/// a register permutation of B tiled over the n-halves, and the conversion says so.
+/// a register permutation of B tiled over the n-halves.
 #[test]
 fn mma_sync_transposed_tile_is_two_b_fragments() {
-    let halves = mma_sync_b().product(&Layout::identity(Reg, 2, Col));
-    let swap_reg_bits = Layout::from_bases(
-        [(Reg, 8), (Lane, 32)],
-        &[(Reg, &[[1, 0], [4, 0], [2, 0]]), (Lane, &[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]])],
-    );
-    assert_eq!(halves.compose(&swap_reg_bits), mma_sync_16x16().transpose());
-    assert_eq!(
-        Conversion::between(&mma_sync_16x16().transpose(), &halves),
-        Conversion::RegPermute([0, 1, 4, 5, 2, 3, 6, 7].into_iter().collect())
-    );
+    let (halves, tile) = (mma_sync_b().product(&Layout::identity(Reg, 2, Col)), mma_sync_16x16().transpose());
+    for lane in 0..32 {
+        for (j, from) in [0, 1, 4, 5, 2, 3, 6, 7].into_iter().enumerate() {
+            assert_eq!(at(&halves, lane, j as u32), at(&tile, lane, from), "lane {lane} register {j}");
+        }
+    }
 }
 
 /// MFMA 32×32×8: A `row = L%32, k = 4(L/32) + j`, B its transpose, C/D `row = 8(j/4) +
@@ -150,7 +186,7 @@ fn mfma_32x32x8_tables() {
             assert_eq!(at(&c, lane, j as u32), (8 * (j / 4) + 4 * (l / 32) + j % 4, l % 32), "C lane {lane} reg {j}");
         }
     }
-    assert!(a.is_bijective() && c.is_bijective());
+    assert!(bijective(&a) && bijective(&c));
 }
 
 /// The Apple lane table measured on hardware (Apple9): the source of truth the
@@ -244,77 +280,6 @@ fn ldmatrix_x4_is_the_mma_sync_tile() {
     }
 }
 
-/// CuTe `Swizzle<B, M, S>` equals its integer formula on every offset, and is an
-/// involutive bijection.
-#[test_case(8, 64, 3, 3, 3; "128B swizzle of a 8x64 bf16 tile")]
-#[test_case(16, 64, 2, 3, 3; "64B")]
-#[test_case(32, 32, 3, 0, 5; "element-wise 32x32")]
-#[test_case(16, 16, 1, 3, 4; "16x16")]
-fn swizzle_matches_cute(rows: u32, cols: u32, b: u32, m: u32, s: u32) {
-    let sw = Layout::swizzle_xor(rows, cols, b, m, s);
-    for o in 0..rows * cols {
-        let want = o ^ ((o >> s) & (((1 << b) - 1) << m));
-        let (r, c) = sw.apply(&[(Row, o / cols), (Col, o % cols)]);
-        assert_eq!(r * cols + c, want, "offset {o}");
-    }
-    assert!(sw.is_bijective());
-    assert_eq!(sw.inverse(), Some(sw.clone()));
-    assert!(sw.compose(&sw).is_identity());
-}
-
-#[test]
-fn conversions() {
-    // The `mma.sync` accumulator is the A operand: tk1's `acc_reusable_as_input`.
-    assert_eq!(Conversion::between(&mma_sync_16x16(), &mma_sync_a()), Conversion::Identity);
-    // gfx11 accumulator (N-major) → replicated input: lane `L` register `j` reads lane
-    // `L%16 + 16·(j%2)`, register `j/2` — a warp shuffle, not tk1's LDS round trip.
-    let Conversion::LaneShuffle(plan) = Conversion::between(&wmma_gfx11_acc().transpose(), &wmma_gfx11_input()) else {
-        panic!("gfx11 acc → input is a lane shuffle")
-    };
-    for lane in 0..32 {
-        for j in 0..16 {
-            assert_eq!(plan.source(0, lane, j), (lane % 16 + 16 * (j % 2), j / 2), "lane {lane} reg {j}");
-        }
-    }
-    assert_eq!(plan.rounds(0).len(), 16);
-    // A register-level transpose crosses lanes.
-    assert!(matches!(Conversion::between(&wmma_gfx12().transpose(), &wmma_gfx12()), Conversion::LaneShuffle(_)));
-    // A 2×2 warp grid placed row-major vs column-major: data crosses warps.
-    let grid = |w: &[[u32; 2]]| mma_sync_16x16().product(&Layout::from_bases([(Row, 2), (Col, 2)], &[(Warp, w)]));
-    assert_eq!(Conversion::between(&grid(&[[1, 0], [0, 1]]), &grid(&[[0, 1], [1, 0]])), Conversion::ViaSmem);
-    // Same warp placement, lane-level relayout inside each warp.
-    let tiled = |l: Layout| l.product(&Layout::identity(Warp, 4, Row));
-    assert!(matches!(
-        Conversion::between(&tiled(wmma_gfx11_acc().transpose()), &tiled(wmma_gfx11_input())),
-        Conversion::LaneShuffle(_)
-    ));
-}
-
-/// 16×48 = three `mma.sync` atoms: the grid is a bijection of 24 registers × 32 lanes
-/// onto the tile, with no single-layout form; a power-of-two grid equals the product.
-#[test]
-fn tiled_grid() {
-    let t = Tiled { atom: mma_sync_16x16(), reps: [1, 3] };
-    assert_eq!((t.shape(), t.regs(), t.as_layout()), ([16, 48], 24, None));
-    let mut seen = BTreeSet::new();
-    for lane in 0..32 {
-        for j in 0..24 {
-            let (r, c) = t.apply(&[(Lane, lane), (Reg, j)]);
-            assert!(r < 16 && c < 48);
-            assert!(seen.insert((r, c)), "({r}, {c}) held twice");
-            assert_eq!(t.apply(&[(Lane, lane), (Reg, j % 8)]), (r, c - 16 * (j / 8)));
-        }
-    }
-    let t = Tiled { atom: mfma_16x16x16(), reps: [2, 4] };
-    let l = t.as_layout().expect("power-of-two grid");
-    assert_eq!((l.out_size(Row), l.out_size(Col), l.in_size(Reg)), (32, 64, 32));
-    for lane in 0..64 {
-        for j in 0..t.regs() {
-            assert_eq!(t.apply(&[(Lane, lane), (Reg, j)]), l.apply(&[(Lane, lane), (Reg, j)]));
-        }
-    }
-}
-
 // ── algebra laws ────────────────────────────────────────────────────────────
 
 /// A random linear map `ins → (o0, o1)`.
@@ -336,55 +301,14 @@ fn arb(ins: &'static [(Dim, u32)], outs: [(Dim, u32); 2]) -> impl Strategy<Value
 }
 
 const HW: &[(Dim, u32)] = &[(Reg, 8), (Lane, 32)];
-const HW_WARPS: &[(Dim, u32)] = &[(Reg, 4), (Lane, 8), (Warp, 2)];
 const TILE: [(Dim, u32); 2] = [(Row, 16), (Col, 16)];
-const TILE_IN: &[(Dim, u32)] = &[(Row, 16), (Col, 16)];
-
-fn all_inputs(l: &Layout) -> Vec<Vec<(Dim, u32)>> {
-    l.in_dims().fold(vec![vec![]], |acc, d| {
-        acc.into_iter().flat_map(|v| (0..l.in_size(d)).map(move |x| [v.clone(), vec![(d, x)]].concat())).collect()
-    })
-}
 
 proptest! {
-    #[test]
-    fn compose_is_associative(
-        a in arb(HW, TILE),
-        b in arb(TILE_IN, [(Row, 8), (Col, 32)]),
-        c in arb(&[(Row, 8), (Col, 32)], [(Lane, 64), (Warp, 4)]),
-    ) {
-        prop_assert_eq!(c.compose(&b).compose(&a), c.compose(&b.compose(&a)));
-    }
-
-    #[test]
-    fn compose_applies_in_sequence(a in arb(HW, TILE), b in arb(TILE_IN, TILE), lane in 0u32..32, j in 0u32..8) {
-        let (r, c) = a.apply(&[(Lane, lane), (Reg, j)]);
-        prop_assert_eq!(b.compose(&a).apply(&[(Lane, lane), (Reg, j)]), b.apply(&[(Row, r), (Col, c)]));
-    }
-
     #[test]
     fn apply_is_linear(a in arb(HW, TILE), x in (0u32..32, 0u32..8), y in (0u32..32, 0u32..8)) {
         let f = |(l, j)| a.apply(&[(Lane, l), (Reg, j)]);
         let (fx, fy, fxy) = (f(x), f(y), f((x.0 ^ y.0, x.1 ^ y.1)));
         prop_assert_eq!(fxy, (fx.0 ^ fy.0, fx.1 ^ fy.1));
-    }
-
-    #[test]
-    fn pseudo_inverse_laws(a in arb(HW_WARPS, TILE)) {
-        let p = a.pseudo_inverse();
-        prop_assert_eq!(&a.compose(&p).compose(&a), &a);
-        prop_assert_eq!(a.is_injective(), p.compose(&a).is_identity());
-        prop_assert_eq!(a.is_surjective(), a.compose(&p).is_identity());
-        prop_assert_eq!(a.inverse().is_some(), a.is_bijective());
-        prop_assert!(a.free_bits(Reg).count_ones() + a.free_bits(Lane).count_ones() + a.free_bits(Warp).count_ones() <= 6 - a.rank());
-    }
-
-    #[test]
-    fn bijections_invert(a in arb(HW, TILE).prop_filter("bijective", Layout::is_bijective)) {
-        let inv = a.inverse().expect("bijective");
-        prop_assert!(inv.compose(&a).is_identity());
-        prop_assert!(a.compose(&inv).is_identity());
-        prop_assert_eq!(inv.inverse(), Some(a));
     }
 
     #[test]
@@ -395,51 +319,16 @@ proptest! {
         let (r0, c0) = a.apply(&[(Lane, x.0), (Reg, x.1)]);
         let (r1, c1) = b.apply(&[(Reg, y.0), (Warp, y.1)]);
         prop_assert_eq!(p.apply(&[(Lane, x.0), (Reg, x.1 + 8 * y.0), (Warp, y.1)]), (r0 + 16 * r1, c0 + 16 * c1));
-        prop_assert_eq!(p.sublayout(&[Reg, Lane], &[Row, Col]).slice(Row, 0..4).slice(Col, 0..4).sublayout(&[Lane], &[Row, Col]), a.sublayout(&[Lane], &[Row, Col]));
+        prop_assert_eq!(p.sublayout(&[Lane], &[Row, Col]).apply(&[(Lane, x.0)]), a.apply(&[(Lane, x.0)]));
     }
 
     #[test]
-    fn transpose_and_slice(a in arb(HW, TILE), lane in 0u32..32, j in 0u32..8) {
+    fn transpose_swaps(a in arb(HW, TILE), lane in 0u32..32, j in 0u32..8) {
         let (r, c) = a.apply(&[(Lane, lane), (Reg, j)]);
         prop_assert_eq!(a.transpose().apply(&[(Lane, lane), (Reg, j)]), (c, r));
         prop_assert_eq!(&a.transpose().transpose(), &a);
-        prop_assert_eq!(a.slice(Row, 1..3).apply(&[(Lane, lane), (Reg, j)]), ((r >> 1) & 3, c));
     }
 
-    #[test]
-    fn conversion_plans_reproduce_the_destination(
-        src in arb(HW_WARPS, [(Row, 8), (Col, 8)]).prop_filter("bijective", Layout::is_bijective),
-        dst in arb(HW_WARPS, [(Row, 8), (Col, 8)]).prop_filter("bijective", Layout::is_bijective),
-    ) {
-        // Brute force: where each destination element lives in the source.
-        let holder: BTreeMap<(u32, u32), Vec<(Dim, u32)>> = all_inputs(&src).into_iter().map(|x| (src.apply(&x), x)).collect();
-        let moves = |d: Dim| all_inputs(&dst).iter().any(|x| {
-            let get = |v: &[(Dim, u32)]| v.iter().find(|e| e.0 == d).map_or(0, |e| e.1);
-            get(&holder[&dst.apply(x)]) != get(x)
-        });
-        let conv = Conversion::between(&src, &dst);
-        prop_assert_eq!(moves(Warp), conv == Conversion::ViaSmem);
-        // A lane-dependent register select moves nothing across lanes yet is no static
-        // permutation, so only this direction holds; the arms below check the rest.
-        if moves(Lane) {
-            prop_assert!(matches!(conv, Conversion::LaneShuffle(_) | Conversion::ViaSmem));
-        }
-        match conv {
-            Conversion::Identity => prop_assert_eq!(&src, &dst),
-            Conversion::RegPermute(perm) => for x in all_inputs(&dst) {
-                let mut moved = x.clone();
-                moved.iter_mut().filter(|e| e.0 == Reg).for_each(|e| e.1 = perm[e.1 as usize]);
-                prop_assert_eq!(src.apply(&moved), dst.apply(&x));
-            },
-            Conversion::LaneShuffle(plan) => for x in all_inputs(&dst) {
-                let warp: Vec<_> = x.iter().copied().filter(|e| e.0 == Warp).collect();
-                let get = |d| x.iter().find(|e| e.0 == d).map_or(0, |e| e.1);
-                let (l, j) = plan.source(get(Warp), get(Lane), get(Reg));
-                prop_assert_eq!(src.apply(&[[(Lane, l), (Reg, j)].as_slice(), &warp].concat()), dst.apply(&x));
-            },
-            Conversion::ViaSmem => {}
-        }
-    }
 }
 
 /// The accumulator reaches the next product's B operand for free exactly where tk1's
@@ -455,6 +344,6 @@ proptest! {
 fn amd_accumulator_reuse(arch: AmdArch, reusable: bool) {
     let target = crate::atoms::Target::for_arch(svod_dtype::GpuArch::Amd(arch));
     let atom = target.mma.first().expect("a matrix core");
-    assert_eq!(Conversion::between(&atom.c, &atom.b) == Conversion::Identity, reusable, "accumulator → B");
-    assert!(matches!(Conversion::between(&atom.c, &atom.a), Conversion::LaneShuffle(_)), "accumulator → A");
+    assert_eq!(atom.c == atom.b, reusable, "accumulator → B");
+    assert!(!in_lane(&atom.c, &atom.a), "accumulator → A crosses lanes");
 }

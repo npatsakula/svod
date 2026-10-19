@@ -77,7 +77,7 @@ fn atom_layouts_match_the_isa(arch: GpuArch, isa: Isa, wave: u32, mnk: (u32, u32
                     assert_eq!(at, isa(l, j)[i], "{dtype:?} operand {i}, lane {l}, register {j}");
                 }
             }
-            assert!(layout.is_surjective(), "{dtype:?} operand {i}: every element is held");
+            assert!(super::layout::covers(layout), "{dtype:?} operand {i}: every element is held");
         }
     }
     assert!(target.mma(ScalarDType::Float32, ScalarDType::Float32).is_none(), "no f32 core");
