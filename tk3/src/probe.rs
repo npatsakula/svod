@@ -79,6 +79,9 @@ pub(crate) enum Signal {
 /// Measurement: timings of a [`Signal::Resolved`] pair, compiled once: the
 /// spread of five bounds the noise a difference must clear.
 const RESOLVE_TRIES: usize = 5;
+/// Measurement: the fewest pairs a difference is resolved from, a spread
+/// left once their extremes are trimmed.
+const RESOLVE_PAIRS: usize = 3;
 
 /// A pair's difference and the noise it is told from, both in ns.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -114,14 +117,17 @@ impl Resolved {
 }
 
 /// `pairs` (`[baseline, probe]` timings of one compiled pair) resolved;
-/// `None` without a pair. A probe that runs faster than its baseline adds
+/// `None` under [`RESOLVE_PAIRS`], where no spread can be judged. A probe that runs faster than its baseline adds
 /// nothing the baseline's work did not cost (sm_120's `cp.async` ring moves
 /// its bytes a few percent cheaper than the same bytes loaded into
 /// registers), so its value is the spread, the bound on what it adds.
 pub(crate) fn resolved(pairs: &[(u64, u64)]) -> Option<Resolved> {
+    if pairs.len() < RESOLVE_PAIRS {
+        return None;
+    }
     let diffs: Vec<f64> = pairs.iter().map(|&(base, probe)| probe as f64 - base as f64).collect();
-    // The differences' range with its extremes trimmed once three pairs
-    // allow (a first run below the lifted clock is noise). A pair's two
+    // The differences' range with its extremes trimmed (a first run below
+    // the lifted clock is noise). A pair's two
     // programs run back to back, so a clock that drifts between pairs moves
     // both sides and leaves the difference: on gfx1151 the sides' own
     // ranges summed 5–40× the differences' (283 µs against 34 µs on a
@@ -129,8 +135,8 @@ pub(crate) fn resolved(pairs: &[(u64, u64)]) -> Option<Resolved> {
     let spread = {
         let mut d = diffs.clone();
         d.sort_by(f64::total_cmp);
-        let kept = if d.len() >= 3 { &d[1..d.len() - 1] } else { &d[..] };
-        kept.last().zip(kept.first()).map_or(0.0, |(hi, lo)| hi - lo)
+        let kept = &d[1..d.len() - 1];
+        kept[kept.len() - 1] - kept[0]
     };
     let median = |mut v: Vec<f64>| {
         v.sort_by(f64::total_cmp);
