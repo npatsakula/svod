@@ -75,6 +75,22 @@ fn assert_valid(list: &[GemmCfg], target: &Target, k: usize, gated: bool) {
 
 /// Every shape the kernel takes on sm_86 plans a valid list (a reduction dim
 /// off 32 takes 16-deep steps); the rest keep the graph for their reason.
+/// A config whose accumulators and one matrix-core depth of operands pass
+/// a lane's registers never compiles clean, so the ranking drops it: a
+/// 256×96 tile over two warps (384 accumulators a lane on sm_86), never a
+/// 64×64 one over four, gated or not.
+#[test_case(sm86(), false; "sm_86")]
+#[test_case(sm86(), true; "sm_86 gated")]
+#[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1201, 64), false; "gfx1201")]
+fn the_ranking_drops_what_a_lane_cannot_hold(target: Target, gated: bool) {
+    let limit = target.occupancy.registers;
+    let ranked = planner(target.clone()).gemm_ranked(1, 704, 1536, 512, gated);
+    let halves = if gated { 2 } else { 1 };
+    assert!(ranked.iter().all(|c| c.live_registers(&target, halves).unwrap() <= limit));
+    let has = |tile: [usize; 3], warps: [u32; 2]| ranked.iter().any(|c| c.tile == tile && c.warps == warps);
+    assert_eq!((has([256, 96, 32], [2, 1]), has([64, 64, 32], [2, 2])), (false, true));
+}
+
 #[test_case(&[4096, 4096], 4096, false, Ok(()); "large grid")]
 #[test_case(&[4096, 4096], 4096, true, Ok(()); "gated")]
 #[test_case(&[8, 256, 512], 2048, false, Ok(()); "a static batch counts toward the grid")]
