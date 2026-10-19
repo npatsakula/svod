@@ -198,3 +198,50 @@ fn scalar_division_truncates(n: i64, d: i64) -> Result<[f64; 2], String> {
     let out = run(&k.finish(), vec![vec![0.0; 2]], &[("n", n), ("d", d)]).map_err(|e| e.to_string())?;
     Ok([out[0][0], out[0][1]])
 }
+
+#[derive(Clone, Copy, Debug)]
+enum Access {
+    Read,
+    Write,
+    Scalar,
+    Shared,
+}
+
+/// An access past an allocation's capacity is an error naming it and the
+/// element, where the device would read or write wild: a 4×4 tile at
+/// element `at` of 16, a scalar at `at`, or a shared tile `at` elements in.
+/// Elements past a view's bounds are no access and stay legal.
+#[test_case(Access::Read, 0 => Ok(()); "a read within")]
+#[test_case(Access::Read, 4 => Err("element 16 of x is accessed, which holds 16".to_string()); "a read past")]
+#[test_case(Access::Write, 4 => Err("element 16 of y is accessed, which holds 16".to_string()); "a write past")]
+#[test_case(Access::Scalar, 15 => Ok(()); "a scalar at the last element")]
+#[test_case(Access::Scalar, 16 => Err("element 16 of x is accessed, which holds 16".to_string()); "a scalar past")]
+#[test_case(Access::Scalar, -1 => Err("element -1 of x is accessed, which holds 16".to_string()); "a scalar before")]
+#[test_case(Access::Shared, 4 => Err("element 16 of s is accessed, which holds 16".to_string()); "a shared tile past")]
+fn an_access_past_the_capacity_is_an_error(access: Access, at: i64) -> Result<(), String> {
+    let tile = Shape::new(4, 4);
+    let mut k = Kernel::new("oob");
+    let x = k.param::<F32>("x", ParamKind::In, 16);
+    let y = k.param::<F32>("y", ParamKind::Out, 16);
+    let rows = |of: Access| if std::mem::discriminant(&access) == std::mem::discriminant(&of) { at } else { 0 };
+    let (read_at, write_at) = (rows(Access::Read) * 4, rows(Access::Write) * 4);
+    let src = k.view(x, read_at, [tile.cols, 1], tile, [None, None]);
+    let mut v = k.load(src);
+    // Rows past a bound are no access, however far the view hangs over.
+    let over = k.view(x, 12, [tile.cols, 1], tile, [Some(Sc::from(1)), None]);
+    let over = k.load(over);
+    v = k.binary(v, over, BinaryOp::Max);
+    if let Access::Scalar = access {
+        let s = k.load_scalar(x, at);
+        v = k.splat::<F32>(tile, s);
+    }
+    if let Access::Shared = access {
+        let s = k.smem::<F32>("s", 16);
+        let shared = k.smem_view::<F32>(s, at * tile.cols as i64, tile);
+        k.store(shared, v);
+        v = k.load(shared);
+    }
+    let dst = k.view(y, write_at, [tile.cols, 1], tile, [None, None]);
+    k.store(dst, v);
+    run(&k.finish(), vec![vec![1.0; 16], vec![0.0; 16]], &[]).map(drop).map_err(|e| e.to_string())
+}

@@ -20,6 +20,15 @@ pub enum Error {
     Raw { code: String },
     #[snafu(display("scalar {a} {op:?} {b} is undefined"))]
     Division { op: BinOp, a: i64, b: i64 },
+    #[snafu(display("element {index} of {name} is accessed, which holds {len}"))]
+    OutOfBounds { name: String, index: i64, len: usize },
+}
+
+/// Where element `index` of `store`, named `name`, is held.
+fn slot(name: &str, store: &[f64], index: i64) -> Result<usize> {
+    let len = store.len();
+    ensure!((0..len as i64).contains(&index), OutOfBoundsSnafu { name, index, len });
+    Ok(index as usize)
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -138,8 +147,8 @@ impl Frame<'_> {
                 }
             }
             Scalar::Load { param, index } => {
-                let index = self.scalar_at(*index, row)?;
-                self.globals[param.index()].get(index as usize).copied().unwrap_or(0.0) as i64
+                let (store, index) = (&self.globals[param.index()], self.scalar_at(*index, row)?);
+                store[slot(&self.prog.params[param.index()].name, store, index)?] as i64
             }
         })
     }
@@ -219,14 +228,15 @@ impl Frame<'_> {
         }
     }
 
-    /// Element coordinates → flat index of a view, or `None` out of bounds.
-    fn address(&self, place: &Place, r: usize, c: usize, shape: Shape) -> Result<Option<usize>> {
+    /// Element coordinates → flat index of a view, or `None` past its bounds.
+    fn address(&self, place: &Place, r: usize, c: usize, shape: Shape) -> Result<Option<i64>> {
         let Shape { rows, cols } = shape;
         Ok(match place {
-            Place::Reg => Some(r * cols + c),
+            Place::Reg => Some((r * cols + c) as i64),
             Place::Smem { alloc, offset } => Some(
-                self.scalar(*offset)? as usize
-                    + if self.prog.smem[alloc.index()].along == Axis::Row { c * rows + r } else { r * cols + c },
+                self.scalar(*offset)?
+                    + (if self.prog.smem[alloc.index()].along == Axis::Row { c * rows + r } else { r * cols + c })
+                        as i64,
             ),
             Place::Global { offset, stride, bounds, rows, .. } => {
                 let inside = |b: Option<ScalarId>, i: usize| b.map_or(Ok(true), |b| Ok((i as i64) < self.scalar(b)?));
@@ -238,9 +248,18 @@ impl Frame<'_> {
                 if !(row_ok && inside(bounds[1], c)?) {
                     return Ok(None);
                 }
-                Some((self.scalar(*offset)? + row_off + c as i64 * self.scalar(stride[1])?) as usize)
+                Some(self.scalar(*offset)? + row_off + c as i64 * self.scalar(stride[1])?)
             }
         })
+    }
+
+    /// The name and elements of the allocation a memory view reads.
+    fn memory(&self, place: &Place) -> (&str, &[f64]) {
+        match place {
+            Place::Smem { alloc, .. } => (&self.prog.smem[alloc.index()].name, &self.smem[alloc.index()]),
+            Place::Global { param, .. } => (&self.prog.params[param.index()].name, &self.globals[param.index()]),
+            Place::Reg => unreachable!("a memory view"),
+        }
     }
 
     fn read(&self, id: ValId) -> Result<Vec<f64>> {
@@ -249,16 +268,12 @@ impl Frame<'_> {
         Ok(match &v.place {
             Place::Reg => self.regs[&id].clone(),
             Place::Smem { .. } | Place::Global { .. } => {
-                let store = match v.place {
-                    Place::Smem { alloc, .. } => &self.smem[alloc.index()],
-                    Place::Global { param, .. } => &self.globals[param.index()],
-                    Place::Reg => unreachable!(),
-                };
+                let (name, store) = self.memory(&v.place);
                 let mut out = vec![0.0; rows * cols];
                 for r in 0..rows {
                     for c in 0..cols {
                         if let Some(i) = self.address(&v.place, r, c, v.shape)? {
-                            out[r * cols + c] = store.get(i).copied().unwrap_or(0.0);
+                            out[r * cols + c] = store[slot(name, store, i)?];
                         }
                     }
                 }
@@ -277,10 +292,11 @@ impl Frame<'_> {
             }
             Place::Smem { .. } | Place::Global { .. } => {
                 let mut writes = Vec::with_capacity(rows * cols);
+                let (name, store) = self.memory(&v.place);
                 for r in 0..rows {
                     for c in 0..cols {
                         if let Some(i) = self.address(&v.place, r, c, v.shape)? {
-                            writes.push((i, rounded[r * cols + c]));
+                            writes.push((slot(name, store, i)?, rounded[r * cols + c]));
                         }
                     }
                 }
@@ -290,9 +306,7 @@ impl Frame<'_> {
                     Place::Reg => unreachable!(),
                 };
                 for (i, x) in writes {
-                    if let Some(slot) = store.get_mut(i) {
-                        *slot = x;
-                    }
+                    store[i] = x;
                 }
             }
         }
@@ -351,9 +365,11 @@ impl Frame<'_> {
                     })
                     .collect()
             }
-            TileOp::Cast { src, round: Round::Zero, .. } => {
-                self.read(*src)?.into_iter().map(|x| f32::from_bits((x as f32).to_bits() & 0xffff_0000) as f64).collect()
-            }
+            TileOp::Cast { src, round: Round::Zero, .. } => self
+                .read(*src)?
+                .into_iter()
+                .map(|x| f32::from_bits((x as f32).to_bits() & 0xffff_0000) as f64)
+                .collect(),
             TileOp::Cast { src, .. } | TileOp::Relayout { src } | TileOp::Move { src } => self.read(*src)?,
             TileOp::Mma { acc, a, b, a_t, b_t, .. } => {
                 let (va, vb) = (self.read(*a)?, self.read(*b)?);
