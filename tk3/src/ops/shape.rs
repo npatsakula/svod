@@ -15,8 +15,9 @@ use crate::kernels::rows::NormCfg;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Plan<C> {
-    /// The tile config candidates, the untuned pick first.
-    Kernel(Vec<C>),
+    /// The tile configs, ranked: the untuned pick first, the tuner's
+    /// shortlist the first that compile without spilling.
+    Kernel(Arc<[C]>),
     Graph(Fallback),
 }
 
@@ -92,10 +93,10 @@ pub fn shape_of(t: &Tensor) -> svod_tensor::error::Result<Vec<SInt>> {
 /// The planner when its target has kernels and every operand shares a 16-bit
 /// type it has a matrix core for (f32 keeps the graph by policy).
 fn gate<'a>(planner: Option<&'a Planner>, dtypes: &[DType]) -> Result<&'a Planner, Fallback> {
-    let planner = planner.filter(|p| config::has_kernels(&p.target)).ok_or(Fallback::Target)?;
+    let planner = planner.filter(|p| config::has_kernels(&p.device.target)).ok_or(Fallback::Target)?;
     let first = dtypes[0].scalar().ok_or(Fallback::Dtype)?;
     let typed = matches!(first, ScalarDType::BFloat16 | ScalarDType::Float16)
-        && planner.target.mma(first, ScalarDType::Float32).is_some()
+        && planner.device.target.mma(first, ScalarDType::Float32).is_some()
         && dtypes.iter().all(|d| d.scalar() == Some(first));
     typed.then_some(planner).ok_or(Fallback::Dtype)
 }
@@ -109,11 +110,11 @@ fn reduced(x: &Extent) -> Result<usize, Fallback> {
     }
 }
 
-fn plan<C>(f: impl FnOnce() -> Result<Vec<C>, Fallback>) -> Plan<C> {
+fn plan<C>(f: impl FnOnce() -> Result<Arc<[C]>, Fallback>) -> Plan<C> {
     f().map_or_else(Plan::Graph, Plan::Kernel)
 }
 
-fn candidates<C>(list: Vec<C>, none: Fallback) -> Result<Vec<C>, Fallback> {
+fn candidates<C>(list: Arc<[C]>, none: Fallback) -> Result<Arc<[C]>, Fallback> {
     if list.is_empty() { Err(none) } else { Ok(list) }
 }
 
@@ -129,7 +130,7 @@ pub fn linear(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>, n
         if !n.is_multiple_of(8) || rows * batches == 0 {
             return Err(Fallback::Shape);
         }
-        candidates(planner.gemm_candidates(batches, rows, n, k, gated), Fallback::Config)
+        candidates(planner.gemm_ranked(batches, rows, n, k, gated), Fallback::Config)
     })
 }
 
@@ -160,12 +161,16 @@ pub fn conv2d(
         if !geom.cin.is_multiple_of(16) {
             return Err(Fallback::Shape);
         }
-        let (batches, m) = if x.var { (x.dims[0], pixels) } else { (1, x.dims[0] * pixels) };
-        let mut list = planner.conv_candidates(batches, m, geom);
-        // Grid z is the batch's when it is bound.
-        list.retain(|c| c.split == 1 || !x.var);
-        candidates(list, Fallback::Config)
+        let (batches, m) = conv_grid(x, geom);
+        candidates(planner.conv_ranked(batches, m, geom), Fallback::Config)
     })
+}
+
+/// A convolution's grid batches and output pixels per batch: a static batch
+/// folds into the GEMM rows, a bound one walks grid z.
+pub fn conv_grid(x: &Extent, geom: &ConvGeom) -> (usize, usize) {
+    let [ho, wo] = geom.out_hw();
+    if x.var { (x.dims[0], ho * wo) } else { (1, x.dims[0] * ho * wo) }
 }
 
 /// `q [b, t, h, d]` against `k`/`v [b, tk, h_kv, d]`, `causal` under that mask.
@@ -183,29 +188,31 @@ pub fn attention(
             return Err(Fallback::Shape);
         }
         let [b, t, heads, d] = [q.dims[0], q.dims[1], q.dims[2], q.dims[3]];
-        candidates(planner.attention_candidates(b * heads, t, k.dims[1], d, causal), Fallback::Shape)
+        candidates(planner.attention_ranked(b * heads, t, k.dims[1], d, causal), Fallback::Shape)
     })
 }
 
 /// `qkv [b, t, slots·d]` into heads of width `d`.
 pub fn heads(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>, d: usize) -> Plan<NormCfg> {
     plan(|| {
-        let (planner, x) = (gate(planner, dtypes)?, x.ok_or(Fallback::Symbolic)?);
+        gate(planner, dtypes)?;
+        let x = x.ok_or(Fallback::Symbolic)?;
         if x.dims.len() != 3 || x.dims.contains(&0) {
             return Err(Fallback::Shape);
         }
-        candidates(config::heads_candidates(&planner.target, d), Fallback::Shape)
+        candidates(config::heads_candidates(d).into(), Fallback::Shape)
     })
 }
 
 /// A norm over the last dim of `x`.
 pub fn norm(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>) -> Plan<NormCfg> {
     plan(|| {
-        let (planner, x) = (gate(planner, dtypes)?, x.ok_or(Fallback::Symbolic)?);
+        gate(planner, dtypes)?;
+        let x = x.ok_or(Fallback::Symbolic)?;
         let d = reduced(x)?;
         if x.dims.contains(&0) {
             return Err(Fallback::Shape);
         }
-        candidates(config::norm_candidates(&planner.target, d), Fallback::Shape)
+        candidates(config::norm_candidates(d).into(), Fallback::Shape)
     })
 }

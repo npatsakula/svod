@@ -57,8 +57,6 @@ pub struct Occupancy {
     pub file: u32,
     /// Waves a SIMD schedules at most.
     pub waves: u32,
-    /// Registers one lane may hold; past it a kernel spills.
-    pub registers: u32,
 }
 
 /// What a target offers the lowering.
@@ -117,6 +115,62 @@ pub enum LaneMove {
     Dpp,
 }
 
+/// What a device's primitives cost, measured on it by [`crate::probe::costs`]
+/// or declared by a test. The throughput fields are ns of one SM's time per
+/// unit with the device full (device time × SMs / units), so a ranking sums
+/// them per block and per round; the relayout fields (`lane_move`,
+/// `smem_trip`, `scatter`) are what one wave waits per element
+/// on its dependent chain with one wave per SIMD, since a relayout sits
+/// between two products; `latency` is absolute.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Costs {
+    /// One byte of a wave's operand fragments read from shared memory.
+    pub smem_byte: f64,
+    /// One byte streamed from global memory into a block (its fill).
+    pub global_byte: f64,
+    /// One 16-bit element a wave reads from global memory scattered: a lane's
+    /// run under 16 bytes that the next lane does not continue (a line per lane).
+    /// Measured on lines in cache, so a bias read from DRAM costs more.
+    pub scatter: f64,
+    /// One 16×16×16 matrix-core step of a wave.
+    pub step: f64,
+    /// One score element's softmax vector work (scale, max, exp2, sum).
+    pub score: f64,
+    /// One pipeline trip's fixed overhead (barrier, ring bubble), unrolled.
+    pub trip: f64,
+    /// The same for a rolled ring (slot offsets recomputed per trip).
+    pub trip_rolled: f64,
+    /// One unit of an exchange's [`crate::layouts::Relayout::work`] (a lane
+    /// move, or a select): averaged over the moves a half-wave exchange
+    /// issues, on RDNA a `permlanex16` across the rows of 16 and a DPP
+    /// `row_xmask` within them.
+    pub lane_move: f64,
+    /// One element's round trip through shared memory (store, barrier, load).
+    pub smem_trip: f64,
+    /// Global memory latency one trip waits unhidden, ns.
+    pub latency: f64,
+}
+
+impl Costs {
+    /// Every field by name, in declaration order.
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 10] {
+        let Costs { smem_byte, global_byte, scatter, step, score, trip, trip_rolled, lane_move, smem_trip, latency } =
+            self;
+        [
+            ("smem_byte", smem_byte),
+            ("global_byte", global_byte),
+            ("scatter", scatter),
+            ("step", step),
+            ("score", score),
+            ("trip", trip),
+            ("trip_rolled", trip_rolled),
+            ("lane_move", lane_move),
+            ("smem_trip", smem_trip),
+            ("latency", latency),
+        ]
+    }
+}
+
 impl Target {
     pub fn for_arch(arch: GpuArch) -> Self {
         let wave = match arch {
@@ -150,13 +204,13 @@ impl Target {
             // sm_120, 64 elsewhere.
             GpuArch::Cuda(c) => {
                 let waves = if (c.major == 8 && c.minor >= 6) || c.major == 12 { 12 } else { 16 };
-                Occupancy { simds: 4, file: 512, waves, registers: 255 }
+                Occupancy { simds: 4, file: 512, waves }
             }
             // CDNA: four SIMD16s, 512 architectural registers (and as many accumulators) per lane.
-            GpuArch::Amd(a) if a.is_cdna() => Occupancy { simds: 4, file: 512, waves: 8, registers: 512 },
+            GpuArch::Amd(a) if a.is_cdna() => Occupancy { simds: 4, file: 512, waves: 8 },
             // RDNA: two SIMD32s with 192 KB of registers each.
-            GpuArch::Amd(_) => Occupancy { simds: 2, file: 1536, waves: 16, registers: 256 },
-            GpuArch::Metal(_) => Occupancy { simds: 4, file: 1024, waves: 8, registers: 128 },
+            GpuArch::Amd(_) => Occupancy { simds: 2, file: 1536, waves: 16 },
+            GpuArch::Metal(_) => Occupancy { simds: 4, file: 1024, waves: 8 },
         };
         Self {
             arch,
@@ -324,6 +378,22 @@ fn amd_accumulator(arch: AmdArch) -> Layout {
         frag::wmma_gfx12().transpose()
     } else {
         frag::wmma_gfx11_acc()
+    }
+}
+
+/// A device as the planner and the lowering see it: its declared facts and
+/// its measured costs.
+#[derive(Clone, Debug)]
+pub struct Device {
+    pub target: Target,
+    pub costs: Costs,
+}
+
+impl Costs {
+    /// One pipeline trip's fixed overhead: a `rolled` register-staged ring
+    /// recomputes its slot offsets every trip.
+    pub fn trip(&self, rolled: bool) -> f64 {
+        if rolled { self.trip_rolled } else { self.trip }
     }
 }
 

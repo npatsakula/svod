@@ -6,7 +6,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
-use super::{Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned};
+use super::{Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output};
 use crate::build::{BF16, F16};
 use crate::kernels::Batch;
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
@@ -109,7 +109,6 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
         shape::conv2d(planner.as_deref(), &dtypes, out_dtype.clone(), residual_dtype, ext.as_ref(), &geom, groups);
     let Plan::Kernel(cfgs) = plan else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
-    let target = planner.target.clone();
     let images = ext.dims[0];
     let batch = match var {
         Some(_) => batch_of(&var, images),
@@ -125,8 +124,8 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
     };
     let spec = |c: ConvCfg| ConvSpec { batch: batch.clone(), geom, epilogue, cfg: c.gemm, split: c.split };
     let programs = |spec: &ConvSpec| match x.dtype().scalar() {
-        Some(ScalarDType::BFloat16) => spec.programs::<BF16>(&target),
-        Some(ScalarDType::Float16) => spec.programs::<F16>(&target),
+        Some(ScalarDType::BFloat16) => spec.programs::<BF16>(&planner.device),
+        Some(ScalarDType::Float16) => spec.programs::<F16>(&planner.device),
         other => unreachable!("{other:?} has no kernel"),
     };
     let key = [
@@ -144,7 +143,15 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
         geom.dilation[0],
         geom.dilation[1],
     ];
-    let cfg = tuned(OP, &target, x.dtype(), &key, (&batch, epilogue), &cfgs, |c| programs(&spec(c)));
+    let (batches, m) = shape::conv_grid(&ext, &geom);
+    let expand = |admitted: &[ConvCfg]| {
+        let mut list = planner.conv_splits(batches, m, &geom, admitted);
+        // Grid z is the batch's when it is bound.
+        list.retain(|c| c.split == 1 || var.is_none());
+        list
+    };
+    let cfg = Tuner::new(&planner.device, x.dtype(), &key, (&batch, epilogue), |c| programs(&spec(c)))
+        .tuned(OP, &cfgs, expand);
     let mut programs = programs(&spec(cfg)).into_iter();
     let y = output(&[images, ho, wo, geom.cout], &var, out_dtype);
     let (prog, lowering) = programs.next().expect("the convolution");

@@ -4,11 +4,12 @@ use test_case::test_case;
 
 use svod_dtype::{AmdArch, GpuArch};
 
-use crate::atoms::{Target, sm86};
+use super::{costs, declared, lane_moves_dear};
+use crate::atoms::{Costs, Device, Target, sm86};
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{self as frag, Dim};
-use crate::layouts::{Issue, Laid, Relayout, TileLayout, WarpGrid, chunked, infer, natural, transposing};
+use crate::layouts::{Issue, Laid, Pick, Relayout, TileLayout, WarpGrid, chunked, infer, natural, transposing};
 
 fn coords(l: &TileLayout, warps: u32, lanes: u32) -> Vec<(u32, u32)> {
     (0..warps)
@@ -45,7 +46,7 @@ fn transposing_layouts_hold_16_byte_column_runs(rows: usize, cols: usize, warps:
 fn gemm_accumulator_gets_the_core_layout_over_the_warp_grid() {
     let mut prog = super::gemm_nt(256, 256, 256, 128, 128, 32, 3);
     prog.warps = 8;
-    let Laid { prog, layouts: lay } = infer(prog, &sm86(), WarpGrid { rows: 2, cols: 4 }).unwrap();
+    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), WarpGrid { rows: 2, cols: 4 }).unwrap();
     let Stmt::Pipeline(p) = &prog.body.0[1] else { panic!("pipeline") };
     let acc = lay[p.carried[0].phi.index()].as_ref().unwrap();
     assert_eq!(acc.frag, frag::mma_sync_c());
@@ -90,7 +91,7 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     k.store(o_g, o);
     let mut prog = k.finish();
     prog.warps = 4;
-    let Laid { prog, layouts: lay } = infer(prog, &sm86(), WarpGrid { rows: 4, cols: 1 }).unwrap();
+    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), WarpGrid { rows: 4, cols: 1 }).unwrap();
     let relayouts: Vec<_> = prog
         .walk()
         .filter_map(|(_, s)| match s {
@@ -103,7 +104,7 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     let (from, to) = (lay[src.index()].as_ref().unwrap(), lay[dst.index()].as_ref().unwrap());
     assert_eq!(from.frag, frag::mma_sync_c());
     assert_eq!(to.frag, frag::mma_sync_a());
-    assert_eq!(from.relayout(to, 4, 32), Relayout::Identity);
+    assert_eq!(from.relayout(to, 4, 32, &costs()), Relayout::Identity);
     assert_eq!(lay[q_r.0.index()].as_ref().unwrap().frag, frag::mma_sync_a());
     let m_l = lay[m.0.index()].as_ref().unwrap();
     assert_eq!((m_l.frag.in_size(Dim::Reg), m_l.shape()), (2, Shape::new(bq, 1)), "two rows per lane");
@@ -213,7 +214,7 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
     let out = k.param::<F32>("o", ParamKind::Out, 256);
     let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
     k.store(o, both);
-    let Laid { prog, layouts } = infer(k.finish(), &sm86(), WarpGrid { rows: 1, cols: 1 }).unwrap();
+    let Laid { prog, layouts } = infer(k.finish(), &declared(sm86()), WarpGrid { rows: 1, cols: 1 }).unwrap();
     let lay = |v: &ValId| layouts[v.index()].clone().unwrap();
     let mut checked = 0;
     for (_, s) in prog.walk() {
@@ -262,11 +263,12 @@ fn attention_step(bias: bool) -> Program {
     prog
 }
 
-/// The orientation `infer` gives each product of `prog` on gfx1151, and the
-/// relayouts it inserts.
-fn rdna3_attention(prog: Program) -> (Vec<Orient>, Vec<Relayout>) {
+/// The orientation `infer` gives each product of `prog` on gfx1151 (RDNA3.5)
+/// at `costs`, and the layouts each inserted relayout re-holds a tile between.
+fn gfx1151_attention(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLayout, TileLayout)>) {
     let target = Target::for_arch(GpuArch::Amd(AmdArch::Gfx1151));
-    let Laid { prog, layouts: lay } = infer(prog, &target, WarpGrid { rows: 4, cols: 1 }).unwrap();
+    let Laid { prog, layouts: lay } =
+        infer(prog, &Device { target, costs: *costs }, WarpGrid { rows: 4, cols: 1 }).unwrap();
     let orients = prog
         .walk()
         .filter_map(|(_, s)| match s {
@@ -278,8 +280,7 @@ fn rdna3_attention(prog: Program) -> (Vec<Orient>, Vec<Relayout>) {
         .walk()
         .filter_map(|(_, s)| match s {
             Stmt::Let { dst, op: TileOp::Relayout { src } } => {
-                let (from, to) = (lay[src.index()].as_ref()?, lay[dst.index()].as_ref()?);
-                Some(from.relayout(to, 4, 32))
+                Some((lay[src.index()].clone()?, lay[dst.index()].clone()?))
             }
             _ => None,
         })
@@ -289,21 +290,103 @@ fn rdna3_attention(prog: Program) -> (Vec<Orient>, Vec<Relayout>) {
 
 /// On gfx11 the score accumulator never feeds the next product as laid. With
 /// QKᵀ issued swapped each lane holds one query, so its row statistics stay in
-/// the lane, and P reaches PV by the two half-waves trading registers, with
-/// no shared-memory round trip.
+/// the lane, and where two lane moves cost less than a shared-memory round
+/// trip (the declared [`costs`]) P reaches PV by the two half-waves trading
+/// registers.
 #[test]
 fn rdna3_attention_trades_probabilities_between_half_waves() {
-    let (orients, relayouts) = rdna3_attention(attention_step(false));
+    let (orients, pairs) = gfx1151_attention(attention_step(false), &costs());
+    let relayouts: Vec<Relayout> = pairs.iter().map(|(from, to)| from.relayout(to, 4, 32, &costs())).collect();
     assert_eq!(orients[0], Orient::Swapped, "QKᵀ: {orients:?}");
     assert_eq!(relayouts.len(), 1, "only P changes role: {relayouts:?}");
     let Relayout::Exchange(picks) = &relayouts[0] else { panic!("an exchange: {:?}", relayouts[0]) };
     assert!(picks.iter().all(|p| p.len() <= 2 && p.iter().all(|p| p.mask < 32)), "{picks:?}");
 }
 
-/// A bias tile read into the swapped scores would scatter, a row per lane, so
-/// the products stay direct and the bias is read along its rows.
+/// A bias tile read into the swapped scores would scatter, a row per lane:
+/// where a scattered element costs what a round trip does (the declared
+/// [`costs`]) the products stay direct and the bias is read along its rows.
 #[test]
 fn rdna3_attention_reads_a_bias_along_its_rows() {
-    let (orients, _) = rdna3_attention(attention_step(true));
+    let (orients, _) = gfx1151_attention(attention_step(true), &costs());
     assert_eq!(orients, [Orient::Direct, Orient::Direct]);
+}
+
+/// Where a lane move costs more than a round trip through shared memory, P
+/// reaches PV through shared memory: no exchange is inserted.
+#[test]
+fn rdna3_attention_takes_the_round_trip_where_lane_moves_are_dear() {
+    let (_, pairs) = gfx1151_attention(attention_step(false), &lane_moves_dear());
+    assert!(!pairs.is_empty());
+    for (from, to) in &pairs {
+        assert_eq!(from.relayout(to, 4, 32, &lane_moves_dear()), Relayout::ViaSmem);
+    }
+}
+
+/// An exchange of work `k` per element becomes the round trip exactly when
+/// `k` lane moves cost at least the round trip.
+#[test]
+fn an_exchange_turns_into_the_round_trip_when_its_moves_cost_as_much() {
+    let (_, pairs) = gfx1151_attention(attention_step(false), &costs());
+    let (from, to) = &pairs[0];
+    let exchange = from.relayout(to, 4, 32, &costs());
+    assert!(matches!(exchange, Relayout::Exchange(_)), "an exchange: {exchange:?}");
+    let k = exchange.work();
+    let at = |lane_move: f64| from.relayout(to, 4, 32, &Costs { lane_move, ..costs() });
+    let even = costs().smem_trip / k;
+    assert_eq!(at(even), Relayout::ViaSmem, "{k} moves at the round trip's cost");
+    assert!(matches!(at(even * 0.99), Relayout::Exchange(_)), "{k} moves just under it");
+}
+
+fn pick() -> Pick {
+    Pick { mask: 16, reg: 0, lanes: u64::MAX }
+}
+
+/// Picks of `(mask, reg)`, per destination register.
+fn picks(regs: &[&[(u32, u32)]]) -> Relayout {
+    Relayout::Exchange(
+        regs.iter().map(|r| r.iter().map(|&(mask, reg)| Pick { mask, reg, lanes: u64::MAX }).collect()).collect(),
+    )
+}
+
+/// An exchange's work per element is what the emitter issues: each distinct
+/// `(mask, reg)` move of a non-zero mask once, a select per pick past a
+/// register's first, over its registers.
+#[test_case(&[&[(0, 0), (16, 1)], &[(0, 1), (16, 0)]], 2.0; "half swap: two moves, two selects")]
+#[test_case(&[&[(16, 0)], &[(16, 1)]], 1.0; "one pick of a mask: two moves")]
+#[test_case(&[&[(0, 0)], &[(16, 1)]], 0.5; "one pick, half the registers stay: one move")]
+#[test_case(&[&[(0, 0), (16, 1), (1, 0)], &[(0, 1), (16, 0), (1, 1)]], 4.0; "three picks: four moves, four selects")]
+#[test_case(&[&[(16, 0), (0, 0)], &[(16, 0), (0, 1)]], 1.5; "a move shared by two registers, two selects")]
+fn exchange_work_counts_moves_and_selects(regs: &[&[(u32, u32)]], work: f64) {
+    assert_eq!(picks(regs).work(), work);
+}
+
+/// The half-wave exchange a relayout infers moves every register once and
+/// selects once per register.
+#[test_case(4, 16; "across the rows of 16")]
+#[test_case(0, 1; "within them")]
+fn a_half_swap_moves_and_selects_once_per_register(lane: u32, mask: u32) {
+    let plain = natural(Shape::new(64, 64), 4, 32).unwrap();
+    let held = crate::probe::half_swapped(&plain, lane);
+    let exchange = plain.relayout(&held, 4, 32, &Costs { lane_move: 0.0, ..costs() });
+    let Relayout::Exchange(p) = &exchange else { panic!("an exchange: {exchange:?}") };
+    let masks: HashSet<u32> = p.iter().flatten().map(|p| p.mask).collect();
+    assert_eq!(masks, HashSet::from([0, mask]));
+    assert_eq!(exchange.work(), 2.0);
+}
+
+/// The per-element cost of each way to re-hold a tile is its work in the
+/// declared cost of its primitive, an in-lane permutation free like the
+/// identity, so their order follows the costs.
+#[test]
+fn relayout_costs_follow_the_declared_costs() {
+    let costs = costs();
+    let ways = [
+        Relayout::Identity,
+        Relayout::RegPermute(vec![1, 0]),
+        Relayout::Exchange(vec![vec![pick(), pick()], vec![pick()]]),
+        Relayout::ViaSmem,
+    ];
+    let priced = ways.each_ref().map(|w| w.cost_per_element(&costs));
+    assert_eq!(priced, [0.0, 0.0, costs.lane_move, costs.smem_trip], "one move shared, one select");
 }

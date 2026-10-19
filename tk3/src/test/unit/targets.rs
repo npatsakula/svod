@@ -21,16 +21,17 @@ use crate::interp::{self, round_to};
 use crate::ir::{Axis, ParamKind, Program};
 use crate::kernels::Act;
 use crate::kernels::Batch;
-use crate::kernels::attention::{AttnMask, AttnSpec, Cache, CombineSpec, attention, combine};
+use crate::kernels::attention::{AttnMask, AttnSpec, Cache, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
 use crate::kernels::gemm::{Epilogue, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::launch::graph_launch_all;
 use crate::lower::{Lowering, lower};
-use crate::ops::config::{self, Planner};
+use crate::ops::config;
 
 use super::conv::geom;
+use super::{conv_first_eight, declared, first_eight, planner};
 
 /// One launch of a family: its name, program and lowering.
 pub(super) type Launch = (String, Program, Lowering);
@@ -39,31 +40,30 @@ pub(super) type Launch = (String, Program, Lowering);
 pub(super) fn families(target: &Target) -> Vec<Launch> {
     let mut out: Vec<Launch> = vec![];
     let mut push = |name: &str, prog: Program, lowering: Lowering| out.push((name.to_string(), prog, lowering));
+    let planner = planner(target.clone());
 
     // Shapes stay small for the interpreter; the tiles are those planned
     // for a large GEMM, so the biggest register tiles are lowered too.
     let gemm_spec = |m, n, k, epilogue: Epilogue| {
-        let cfg = Planner::new(target.clone()).gemm_candidates(1, 4096, 4096, k, epilogue.gated)[0];
+        let cfg = planner.gemm_ranked(1, 4096, 4096, k, epilogue.gated)[0];
         GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg }
     };
     let plain = gemm_spec(130, 192, 128, Epilogue::DEFAULT);
-    for (i, cfg) in Planner::new(target.clone()).gemm_candidates(1, 4096, 4096, 4096, false).into_iter().enumerate() {
+    for (i, cfg) in first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).into_iter().enumerate() {
         let spec = GemmSpec { cfg, ..plain.clone() };
-        push(&format!("gemm #{i} {:?}x{}", cfg.tile, cfg.stages), gemm::<BF16>(&spec), cfg.lowering(target.clone()));
+        push(&format!("gemm #{i} {:?}x{}", cfg.tile, cfg.stages), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
     }
     let swiglu = gemm_spec(70, 64, 64, Epilogue { bias: true, act: Act::Silu, gated: true, ..Epilogue::DEFAULT });
-    push("gemm swiglu", gemm::<F16>(&swiglu), swiglu.cfg.lowering(target.clone()));
+    push("gemm swiglu", gemm::<F16>(&swiglu), swiglu.cfg.lowering(&planner.device));
     let half_step = Epilogue { residual: true, act: Act::Gelu, scale: Some(Scale::new(0.5)), ..Epilogue::DEFAULT };
-    let half_step = GemmSpec {
-        cfg: Planner::new(target.clone()).gemm_candidates(1, 300, 512, 256, false)[0],
-        ..gemm_spec(100, 96, 256, half_step)
-    };
-    push("gemm gelu scale residual", gemm::<BF16>(&half_step), half_step.cfg.lowering(target.clone()));
+    let half_step =
+        GemmSpec { cfg: planner.gemm_ranked(1, 300, 512, 256, false)[0], ..gemm_spec(100, 96, 256, half_step) };
+    push("gemm gelu scale residual", gemm::<BF16>(&half_step), half_step.cfg.lowering(&planner.device));
 
     // The planner's lead for the shape; a head size it plans no kernel for
     // has no family.
     let fa = |t, tk, d, mask: AttnMask, cache: Option<Cache>, batch| {
-        let cfg = *Planner::new(target.clone()).attention_candidates(8, t, tk, d, mask.causal).first()?;
+        let cfg = *planner.attention_ranked(8, t, tk, d, mask.causal).first()?;
         let splits = if cache.is_some() { 2 } else { 1 };
         let cfg = crate::kernels::attention::FaCfg { splits, ..cfg };
         Some(AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache, scale: 0.125, cfg })
@@ -71,33 +71,32 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
     let causal = AttnMask { causal: true, ..AttnMask::default() };
     for d in [64, 128] {
         let Some(spec) = fa(100, 100, d, causal, None, Batch::Static(2)) else { continue };
-        for (i, cfg) in Planner::new(target.clone()).attention_candidates(8, 100, 100, d, true).into_iter().enumerate()
-        {
+        for (i, cfg) in first_eight(&planner.attention_ranked(8, 100, 100, d, true)).into_iter().enumerate() {
             let spec = AttnSpec { cfg, ..spec.clone() };
             let name = format!("attention d{d} causal #{i} {}x{}x{}", cfg.bq, cfg.bkv, cfg.stages);
-            push(&name, attention::<BF16>(&spec), cfg.lowering(target.clone()));
+            push(&name, attention::<BF16>(&spec), cfg.lowering(&planner.device));
         }
     }
     let masked = AttnMask { key_lens: true, key_mask: true, ..AttnMask::default() };
     let spec = fa(37, 75, 64, masked, None, Batch::Var { name: "b".into(), min: 1, max: 2 }).expect("d 64 plans");
-    push("attention d64 key masks", attention::<F16>(&spec), spec.cfg.lowering(target.clone()));
+    push("attention d64 key masks", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
     let cache = Cache { rows: 6, heads_total: 6, row_map: true, appended: 1, app_lens: false };
     let lens = AttnMask { key_lens: true, ..AttnMask::default() };
     let spec = fa(1, 150, 64, lens, Some(cache), Batch::Var { name: "b".into(), min: 1, max: 3 }).expect("d 64 plans");
-    push("attention d64 cache", attention::<F16>(&spec), spec.cfg.lowering(target.clone()));
+    push("attention d64 cache", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
     let merge = CombineSpec { batch: spec.batch.clone(), t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: 4 } };
-    push("attention combine", combine::<F16>(&merge), merge.cfg.lowering(target.clone()));
+    push("attention combine", combine::<F16>(&merge), merge.cfg.lowering(&planner.device));
 
     for (name, kind, d, residual, bias) in
         [("layer norm", Norm::Layer, 1024, true, true), ("rms norm", Norm::Rms, 512, false, false)]
     {
-        let cfg = config::norm_candidates(target, d)[0];
+        let cfg = config::norm_candidates(d)[0];
         let spec = NormSpec { norm: kind, rows: 37, d, batch: Batch::Static(1), eps: 1e-5, residual, bias, cfg };
-        push(name, norm::<BF16>(&spec), cfg.lowering(target.clone()));
+        push(name, norm::<BF16>(&spec), cfg.lowering(&planner.device));
     }
 
     for d in [64, 128] {
-        let cfg = config::heads_candidates(target, d)[0];
+        let cfg = config::heads_candidates(d)[0];
         let spec = HeadsSpec {
             batch: Batch::Static(2),
             t: 20,
@@ -110,7 +109,7 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
             rope: Some(Rope { per_batch: false }),
             cfg,
         };
-        push(&format!("heads d{d}"), heads::<BF16>(&spec), cfg.lowering(target.clone()));
+        push(&format!("heads d{d}"), heads::<BF16>(&spec), cfg.lowering(&planner.device));
     }
 
     let silu_bias = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
@@ -119,10 +118,10 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
         ("conv 3x3 stride 2 split", geom([16, 16], 128, 64, 3, 2, 1, 1), 1),
     ] {
         let [ho, wo] = g.out_hw();
-        let cfgs = Planner::new(target.clone()).conv_candidates(1, images * ho * wo, &g);
+        let cfgs = conv_first_eight(&planner, 1, images * ho * wo, &g);
         let c = cfgs.iter().find(|c| (c.split > 1) == name.ends_with("split")).unwrap_or(&cfgs[0]);
         let spec = ConvSpec { batch: Batch::Static(images), geom: g, epilogue: silu_bias, cfg: c.gemm, split: c.split };
-        for (i, (prog, lowering)) in spec.programs::<F16>(target).into_iter().enumerate() {
+        for (i, (prog, lowering)) in spec.programs::<F16>(&planner.device).into_iter().enumerate() {
             push(&format!("{name} #{i}"), prog, lowering);
         }
     }
@@ -142,7 +141,8 @@ pub(super) fn linear(prog: Program, lowering: &Lowering) -> Arc<UOp> {
     let params =
         prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
     let name = prog.name.clone();
-    let lowered = lower(prog, lowering, params, device(&lowering.target)).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let lowered =
+        lower(prog, lowering, params, device(&lowering.device.target)).unwrap_or_else(|e| panic!("{name}: {e}"));
     let Op::Program(ops::Program { linear: Some(linear), .. }) = lowered.program.op() else { panic!("a program") };
     linear.clone()
 }
@@ -167,13 +167,13 @@ fn inputs(name: &str, prog: &Program) -> Vec<Vec<f64>> {
 fn lowered_tile(prog: Program, lowering: &Lowering) -> Program {
     let params =
         prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
-    lower(prog, lowering, params, device(&lowering.target)).unwrap().tile
+    lower(prog, lowering, params, device(&lowering.device.target)).unwrap().tile
 }
 
 /// LLVM text of `prog` for its lowering's target.
 pub(super) fn render(prog: Program, lowering: &Lowering) -> String {
     let name = prog.name.clone();
-    let renderer = match lowering.target.arch {
+    let renderer = match lowering.device.target.arch {
         GpuArch::Cuda(arch) => LlvmTextRenderer::nvptx(arch),
         GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
         GpuArch::Metal(_) => unreachable!("Metal renders C"),
@@ -422,21 +422,22 @@ fn register_staged_families_match_on_cuda() {
 #[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
 #[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
 fn every_amd_candidate_lowers(target: Target) {
+    let planner = planner(target.clone());
     let mut gemms = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
         for gated in [false, true] {
-            for cfg in Planner::new(target.clone()).gemm_candidates(1, m, n, k, gated) {
+            for cfg in first_eight(&planner.gemm_ranked(1, m, n, k, gated)) {
                 let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
                 gemms.push(GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue, cfg });
             }
         }
     }
     for spec in gemms {
-        linear(gemm::<BF16>(&spec), &spec.cfg.lowering(target.clone()));
+        linear(gemm::<BF16>(&spec), &spec.cfg.lowering(&planner.device));
     }
     for d in [32, 48, 64, 128] {
         for t in [1, 16, 100] {
-            for cfg in Planner::new(target.clone()).attention_candidates(2, t, 100, d, t > 1) {
+            for cfg in first_eight(&planner.attention_ranked(2, t, 100, d, t > 1)) {
                 let spec = AttnSpec {
                     batch: Batch::Static(1),
                     t,
@@ -449,17 +450,17 @@ fn every_amd_candidate_lowers(target: Target) {
                     scale: 0.125,
                     cfg,
                 };
-                linear(attention::<BF16>(&spec), &cfg.lowering(target.clone()));
+                linear(attention::<BF16>(&spec), &cfg.lowering(&planner.device));
             }
         }
     }
     for class in super::conv::YOLO {
         let g = super::conv::yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        for c in Planner::new(target.clone()).conv_candidates(1, ho * wo, &g) {
+        for c in conv_first_eight(&planner, 1, ho * wo, &g) {
             let spec =
                 ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, cfg: c.gemm, split: c.split };
-            for (prog, lowering) in spec.programs::<F16>(&target) {
+            for (prog, lowering) in spec.programs::<F16>(&planner.device) {
                 linear(prog, &lowering);
             }
         }
@@ -515,44 +516,52 @@ fn attention_exponentials_are_the_hardware_ones_on_amd(target: Target, raw: bool
     assert_eq!(ir.contains("@llvm.exp2.f32("), !raw, "{name}");
 }
 
-/// The attention program carries the softmax forms the planner chose for the
-/// target: a cast toward zero and a `Scale` on gfx1201 (an f16 stream rounds
-/// either way); on sm_86 neither at `d = 64` and the `Scale` alone at
-/// `d = 128`.
-#[test_case(crate::atoms::sm86(), "attention d64 causal #0", (false, false); "sm_86 d 64")]
-#[test_case(crate::atoms::sm86(), "attention d128 causal #0", (false, true); "sm_86 d 128")]
-#[test_case(amd(AmdArch::Gfx1201, 64), "attention d64 causal #0", (true, true); "gfx1201 d 64")]
-#[test_case(amd(AmdArch::Gfx1201, 64), "attention d128 causal #0", (true, true); "gfx1201 d 128")]
-#[test_case(amd(AmdArch::Gfx1201, 64), "attention d64 key masks", (false, true); "gfx1201 f16 rounds")]
-fn attention_softmax_takes_the_planned_forms(target: Target, family: &str, (truncated, skipped): (bool, bool)) {
-    use crate::ir::{BinaryOp, Round, TileOp};
-    let (name, prog, _) =
-        families(&target).into_iter().find(|(n, ..)| n.starts_with(family)).expect("an attention family");
+/// The attention program carries the softmax forms its config declares: a
+/// cast toward zero where bf16 probabilities are truncated (an f16 stream
+/// rounds either way), a `Scale` where the rescale is skipped, and the row
+/// sum after the P·V product exactly where `sum_after` puts it, whether the
+/// probabilities are truncated or not, before the rescale otherwise.
+#[test_case(crate::atoms::sm86(), false, (false, false, false), (false, false, false); "sm_86 plain")]
+#[test_case(crate::atoms::sm86(), false, (false, true, false), (false, true, false); "sm_86 rescale skipped")]
+#[test_case(crate::atoms::sm86(), false, (false, false, true), (false, false, true); "sm_86 rounded, sum after")]
+#[test_case(amd(AmdArch::Gfx1201, 64), false, (true, true, true), (true, true, true); "gfx1201 truncated, sum after")]
+#[test_case(amd(AmdArch::Gfx1201, 64), false, (true, true, false), (true, true, false); "gfx1201 truncated, sum before")]
+#[test_case(amd(AmdArch::Gfx1201, 64), true, (true, true, false), (false, true, false); "gfx1201 f16 rounds")]
+#[test_case(amd(AmdArch::Gfx1201, 64), true, (true, false, true), (false, false, true); "gfx1201 f16, sum after")]
+fn attention_softmax_takes_the_declared_forms(
+    target: Target,
+    f16: bool,
+    (truncate_p, skip_rescale, sum_after): (bool, bool, bool),
+    (truncated, skipped, after): (bool, bool, bool),
+) {
+    use crate::ir::{BinaryOp, ReduceOp, Round, TileOp};
+    let lead = planner(target.clone()).attention_ranked(8, 100, 100, 64, true)[0];
+    let forms = Forms { truncate_p, skip_rescale, sum_after, ..lead.forms };
+    let cfg = crate::kernels::attention::FaCfg { forms, ..lead };
+    let mask = AttnMask { causal: true, ..AttnMask::default() };
+    let spec = AttnSpec {
+        batch: Batch::Static(2),
+        t: 100,
+        tk: 100,
+        heads: 4,
+        kv_heads: 2,
+        d: 64,
+        mask,
+        cache: None,
+        scale: 0.125,
+        cfg,
+    };
+    let prog = if f16 { attention::<F16>(&spec) } else { attention::<BF16>(&spec) };
     let casts = tile_ops(&prog.body, &|op| matches!(op, TileOp::Cast { round: Round::Zero, .. }));
     let scales = tile_ops(&prog.body, &|op| matches!(op, TileOp::Binary { f: BinaryOp::Scale, .. }));
-    assert_eq!((casts > 0, scales > 0), (truncated, skipped), "{name}: {casts} casts toward zero, {scales} scales");
-}
-
-/// The row sum of the probabilities follows the P·V product where they are
-/// truncated (both consumers then read one pack), and precedes the rescale
-/// otherwise: on sm_86 always before; on gfx1201 after for a bf16 stream,
-/// before for the f16 decode family, which rounds.
-#[test_case(crate::atoms::sm86(), "attention d128 causal #0", false; "sm_86 d 128 before")]
-#[test_case(crate::atoms::sm86(), "attention d64 causal #0", false; "sm_86 d 64 before")]
-#[test_case(crate::atoms::sm86(), "attention d64 cache", false; "sm_86 decode before")]
-#[test_case(amd(AmdArch::Gfx1201, 64), "attention d64 causal #0", true; "gfx1201 d 64 after")]
-#[test_case(amd(AmdArch::Gfx1201, 64), "attention d64 cache", false; "gfx1201 f16 decode before")]
-fn attention_sums_the_probabilities_where_the_forms_say(target: Target, family: &str, after: bool) {
-    use crate::ir::{ReduceOp, TileOp};
-    let (name, prog, _) =
-        families(&target).into_iter().find(|(n, ..)| n.starts_with(family)).expect("an attention family");
+    assert_eq!((casts > 0, scales > 0), (truncated, skipped), "{casts} casts toward zero, {scales} scales");
     let ops = tile_ops_in_order(&prog.body);
     let products: Vec<usize> =
         ops.iter().enumerate().filter(|(_, op)| matches!(op, TileOp::Mma { .. })).map(|(i, _)| i).collect();
     let sum = ops.iter().position(|op| matches!(op, TileOp::Reduce { f: ReduceOp::Sum, .. })).expect("a row sum");
     // The first step's products: `q·kᵀ`, then `p·v`.
-    assert!(products.len() >= 2, "{name}");
-    assert_eq!(sum > products[1], after, "{name}: sum at {sum}, products at {products:?}");
+    assert!(products.len() >= 2);
+    assert_eq!(sum > products[1], after, "sum at {sum}, products at {products:?}");
 }
 
 /// The tile ops of `block` in program order, recursively.
@@ -617,7 +626,7 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
     k.store(yv, sum);
     let lowering = Lowering {
         schedule: crate::schedule::Schedule::Uniform { prefetch: target.prefetch(), unroll: false },
-        target,
+        device: declared(target),
         grid: crate::layouts::WarpGrid { rows: 1, cols: 1 },
         swizzle: false,
     };
@@ -694,12 +703,13 @@ fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
         .sum()
 }
 
-/// Where the accumulator is its operand's transpose (gfx12, CDNA) the inference
-/// issues attention's products the way round that hands the scores to P·V as
-/// they stand, so no attention kernel re-holds a score tile (the decoder step's
-/// cache kernel still moves its softmax state, a 16-element vector, between the
-/// cached keys and the appended one); where neither way is free (RDNA3) the
-/// tile relayout remains, a register exchange between the half-waves.
+/// Where the accumulator is its operand's transpose (gfx12, CDNA) the
+/// inference issues attention's products the way round that hands the scores
+/// to P·V as they stand, so no attention kernel re-holds a score tile (the
+/// decoder step's cache kernel still moves its softmax state, a 16-element
+/// vector, between the cached keys and the appended one); where neither way
+/// is free (RDNA3) the tile relayout remains, under the declared [`costs`] a
+/// register exchange between the half-waves.
 #[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
 #[test_case(amd(AmdArch::Gfx942, 304), true; "gfx942")]
 #[test_case(amd(AmdArch::Gfx1100, 96), false; "gfx1100")]

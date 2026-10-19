@@ -5,7 +5,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
-use super::{GraphSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed};
+use super::{GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output, typed};
 use crate::kernels::rows::{Norm, NormSpec, norm as kernel};
 use crate::launch;
 
@@ -71,22 +71,22 @@ fn norm(
         return graph(kind, x, residual, w, b, eps).context(GraphSnafu { op });
     };
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
-    let target = planner.target.clone();
     let (lead, d) = (&ext.dims[..ext.dims.len() - 1], ext.dims[ext.dims.len() - 1]);
     let rows = lead[usize::from(var.is_some())..].iter().product();
     let batch = batch_of(&var, 1);
     let (residual_, bias) = (residual.is_some(), b.is_some());
     let spec = |cfg| NormSpec { norm: kind, rows, d, batch: batch.clone(), eps, residual: residual_, bias, cfg };
     let shape = [batch.capacity(), rows, d];
-    let cfg = tuned(op, &target, x.dtype(), &shape, (&batch, kind, residual_, bias), &cfgs, |cfg| {
-        vec![(typed!(x.dtype(), kernel, &spec(cfg)), cfg.lowering(target.clone()))]
-    });
+    let cfg = Tuner::new(&planner.device, x.dtype(), &shape, (&batch, kind, residual_, bias), |cfg| {
+        vec![(typed!(x.dtype(), kernel, &spec(cfg)), cfg.lowering(&planner.device))]
+    })
+    .tuned(op, &cfgs, <[_]>::to_vec);
     let spec = spec(cfg);
     let out = output(&ext.dims, &var, x.dtype());
     let sum = residual.map(|_| output(&ext.dims, &var, x.dtype()));
     let ins: Vec<&Tensor> = [Some(x), residual, Some(w), b, Some(&out), sum.as_ref()].into_iter().flatten().collect();
     let at = ins.len() - 1 - usize::from(sum.is_some());
-    let mut outs = launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &cfg.lowering(target), &ins)
+    let mut outs = launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &cfg.lowering(&planner.device), &ins)
         .context(LaunchSnafu { op })?;
     let sum = sum.map(|_| outs.pop().expect("the sum"));
     Ok((sum, outs.swap_remove(at)))

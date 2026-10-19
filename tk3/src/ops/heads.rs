@@ -7,7 +7,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
-use super::{GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed};
+use super::{GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output, typed};
 use crate::kernels::heads::{HeadsSpec, Rope, heads as kernel};
 use crate::launch;
 
@@ -66,7 +66,6 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
     let plan = shape::heads(planner.as_deref(), &dtypes, ext.as_ref(), d);
     let Plan::Kernel(cfgs) = plan else { return graph(qkv, opts).context(GraphSnafu { op: OP }) };
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
-    let target = planner.target.clone();
     let (b, t) = (ext.dims[0], ext.dims[1]);
     let batch = batch_of(&var, b);
     let per_batch = rope.is_some_and(|(cos, _)| cos.shape().is_ok_and(|s| s[0] != SInt::Const(1)));
@@ -85,16 +84,18 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
     };
     let shape = [batch.capacity(), t, heads, kv_heads, d];
     let salt = (&batch, q_norm.is_some(), k_norm.is_some(), rope_spec);
-    let cfg = tuned(OP, &target, qkv.dtype(), &shape, salt, &cfgs, |cfg| {
-        vec![(typed!(qkv.dtype(), kernel, &spec(cfg)), cfg.lowering(target.clone()))]
-    });
+    let cfg = Tuner::new(&planner.device, qkv.dtype(), &shape, salt, |cfg| {
+        vec![(typed!(qkv.dtype(), kernel, &spec(cfg)), cfg.lowering(&planner.device))]
+    })
+    .tuned(OP, &cfgs, <[_]>::to_vec);
     let q = output(&[b, t, heads, d], &var, qkv.dtype());
     let k = output(&[b, t, kv_heads, d], &var, qkv.dtype());
     let v = output(&[b, t, kv_heads, d], &var, qkv.dtype());
     let ins: Vec<&Tensor> =
         [Some(qkv), q_norm, k_norm, cos, sin, Some(&q), Some(&k), Some(&v)].into_iter().flatten().collect();
-    let mut outs = launch::graph_launch_all(typed!(qkv.dtype(), kernel, &spec(cfg)), &cfg.lowering(target), &ins)
-        .context(LaunchSnafu { op: OP })?;
+    let mut outs =
+        launch::graph_launch_all(typed!(qkv.dtype(), kernel, &spec(cfg)), &cfg.lowering(&planner.device), &ins)
+            .context(LaunchSnafu { op: OP })?;
     let v = outs.pop().expect("v");
     let k = outs.pop().expect("k");
     let q = outs.pop().expect("q");

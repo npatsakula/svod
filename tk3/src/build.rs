@@ -147,6 +147,7 @@ impl Kernel {
                 scalars: vec![],
                 values: vec![],
                 body: Block::default(),
+                pins: vec![],
             },
             blocks: vec![Block::default()],
         };
@@ -449,6 +450,12 @@ impl Kernel {
         self.let_(shape, TileOp::Transpose { src: src.0 })
     }
 
+    /// Hold `v` under `layout` (see [`Program::pins`]).
+    pub fn pin<T: Elem>(&mut self, v: Regs<T>, layout: crate::layouts::TileLayout) {
+        assert_eq!(layout.shape(), self.shape(v), "a pin covers its tile");
+        self.prog.pins.push((v.0, layout));
+    }
+
     // ---- movement --------------------------------------------------------
 
     fn copy(&mut self, dst: ValId, src: ValId, mode: CopyMode) {
@@ -581,6 +588,11 @@ impl Kernel {
 
     pub fn raw(&mut self, raw: Raw) {
         self.push(Stmt::Raw(raw));
+    }
+
+    /// A barrier across the block's warps.
+    pub fn barrier(&mut self) {
+        self.push(Stmt::Sync(Sync::Barrier { role: None }));
     }
 
     pub fn finish(mut self) -> Program {

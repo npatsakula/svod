@@ -16,6 +16,7 @@ pub mod layout;
 pub mod layouts;
 pub mod lower;
 pub mod ops;
+pub mod probe;
 pub mod schedule;
 pub mod tune;
 

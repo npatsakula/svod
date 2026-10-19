@@ -6,16 +6,15 @@ use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
-use super::config;
 use super::shape::{self, Plan, extent, shape_of};
 use super::{
-    DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed,
+    DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output, typed,
 };
 use crate::kernels;
 use crate::kernels::Batch;
 pub use crate::kernels::attention::Chunk;
 use crate::kernels::attention::{
-    AttnMask, AttnSpec, Bias, CombineSpec, FaCfg, attention as fa, combine, key_mask_stride,
+    AttnMask, AttnSpec, Bias, CombineSpec, FaCfg, Forms, attention as fa, combine, key_mask_stride,
 };
 use crate::kernels::rows::NormCfg;
 use crate::launch;
@@ -170,12 +169,12 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let plan = shape::attention(planner.as_deref(), &dtypes, q_ext.as_ref(), k_ext.as_ref(), causal);
     let Plan::Kernel(cfgs) = plan else { return graph(q, k, v, opts).context(GraphSnafu { op: OP }) };
     // The appended rows ride one key block.
-    let cfgs: Vec<FaCfg> = cfgs.into_iter().filter(|c| c.bkv >= appended).collect();
+    let cfgs: Vec<FaCfg> = cfgs.iter().copied().filter(|c| c.bkv >= appended).collect();
     if cfgs.is_empty() {
         return graph(q, k, v, opts).context(GraphSnafu { op: OP });
     }
     let (q_ext, k_ext, var) = (q_ext.expect("planned"), k_ext.expect("planned"), var.flatten());
-    let target = planner.expect("planned").target.clone();
+    let planner = planner.expect("planned");
     let ([b, t, heads, d], [kv_rows, tk, heads_total, _]) = (dims4(&q_ext.dims), dims4(&k_ext.dims));
     let batch = batch_of(&var, b);
     let kv_heads = opts.cache.map_or(heads_total, |c| c.kv_heads);
@@ -199,19 +198,16 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         scale: opts.scale.unwrap_or(1.0 / (d as f32).sqrt()),
         cfg,
     };
-    // Every config with every split count worth measuring (a given one is
-    // capped at the key blocks), the unsplit pick first.
-    let cfgs: Vec<FaCfg> = cfgs
-        .into_iter()
-        .flat_map(|c| {
-            let blocks = tk.div_ceil(c.bkv);
-            let splits = match opts.splits {
-                Some(n) => vec![n.clamp(1, blocks)],
-                None => config::split_candidates(&target, batch.capacity() * heads * t.div_ceil(c.bq), blocks),
-            };
-            splits.into_iter().map(move |splits| FaCfg { splits, ..c })
-        })
-        .collect();
+    // The configs are admitted at a given split count, else unsplit; then
+    // each comes with every split count worth measuring, the unsplit first.
+    let ranked = split_ranked(&cfgs, opts.splits, tk);
+    let expand = |admitted: &[FaCfg]| -> Vec<FaCfg> {
+        let splits = |c: &FaCfg| match opts.splits {
+            Some(_) => vec![c.splits],
+            None => planner.splits(batch.capacity() * heads * t.div_ceil(c.bq), tk.div_ceil(c.bkv)),
+        };
+        admitted.iter().flat_map(|c| splits(c).into_iter().map(|splits| FaCfg { splits, ..*c })).collect()
+    };
     let merge = |splits| CombineSpec { batch: batch.clone(), t, heads, d, splits, cfg: NormCfg { br: 4 } };
     // Measured with the static masks only (scratch parameters would be
     // garbage) and at most `TUNE_BATCH` lanes: more fill the device alike,
@@ -225,7 +221,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     };
     let shape = [measured.capacity(), t, tk, heads, kv_heads, d];
     let salt = (&measured, edges, cache.map(|c| c.heads_total), opts.splits);
-    let cfg = tuned(OP, &target, q.dtype(), &shape, salt, &cfgs, |cfg| {
+    let mut tuner = Tuner::new(&planner.device, q.dtype(), &shape, salt, |cfg: FaCfg| {
         // Scratch caches hold a row per batch lane: no map to read, no garbage rows.
         let plain = cache.map(|c| kernels::attention::Cache {
             rows: measured.capacity(),
@@ -235,13 +231,14 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
             ..c
         });
         let spec = AttnSpec { batch: measured.clone(), ..spec(cfg, edges, plain) };
-        let mut programs = vec![(typed!(q.dtype(), fa, &spec), cfg.lowering(target.clone()))];
+        let mut programs = vec![(typed!(q.dtype(), fa, &spec), cfg.lowering(&planner.device))];
         if cfg.splits > 1 {
             let merge = merge(cfg.splits);
-            programs.push((typed!(q.dtype(), combine, &merge), merge.cfg.lowering(target.clone())));
+            programs.push((typed!(q.dtype(), combine, &merge), merge.cfg.lowering(&planner.device)));
         }
         programs
     });
+    let cfg = tune(&mut tuner, &ranked, expand);
     let i32 = |t: &Tensor| if t.dtype() == DType::Int32 { t.clone() } else { t.cast(DType::Int32) };
     let lens = lens.map(i32);
     // Rows padded to the kernel's aligned stride.
@@ -273,7 +270,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         ..edges
     };
     let spec = spec(cfg, mask, cache);
-    let lowering = cfg.lowering(target.clone());
+    let lowering = cfg.lowering(&planner.device);
     let extras = [
         lens.as_ref(),
         bools.as_ref(),
@@ -306,8 +303,76 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let merge = merge(cfg.splits);
     let o = output(&q_ext.dims, &var, q.dtype());
     let ins = [&parts[3], &parts[4], &parts[5], &o];
-    launch::graph_launch(typed!(q.dtype(), combine, &merge), &merge.cfg.lowering(target), &ins)
+    launch::graph_launch(typed!(q.dtype(), combine, &merge), &merge.cfg.lowering(&planner.device), &ins)
         .context(LaunchSnafu { op: OP })
+}
+
+/// `cfgs` (ranked) at the split count the caller names, else unsplit. A
+/// named count is honoured by the configs with that many key blocks of
+/// `tk`, the rest dropped; past the most any config has, it is capped there.
+pub(crate) fn split_ranked(cfgs: &[FaCfg], splits: Option<usize>, tk: usize) -> Vec<FaCfg> {
+    let blocks = |c: &FaCfg| tk.div_ceil(c.bkv);
+    let most = cfgs.iter().map(blocks).max().unwrap_or(1);
+    let splits = splits.map_or(1, |n| n.clamp(1, most));
+    cfgs.iter().filter(|c| blocks(c) >= splits).map(|&c| FaCfg { splits, ..c }).collect()
+}
+
+/// The softmax forms, each flipped in turn by [`forms`].
+pub(crate) const FORMS: [fn(Forms) -> Forms; 4] = [
+    |f| Forms { truncate_p: !f.truncate_p, ..f },
+    |f| Forms { skip_rescale: !f.skip_rescale, ..f },
+    |f| Forms { raw_max: !f.raw_max, ..f },
+    |f| Forms { sum_after: !f.sum_after, ..f },
+];
+
+/// Coordinate descent over the softmax forms from the tuned `winner`: each
+/// of [`FORMS`] once, `pick` choosing between the forms so far and the same
+/// with that one flipped (the tuner times the pair and keeps the flip only
+/// where it measures faster).
+pub(crate) fn forms(winner: FaCfg, mut pick: impl FnMut([FaCfg; 2]) -> FaCfg) -> FaCfg {
+    FORMS.iter().fold(winner, |c, flip| pick([c, FaCfg { forms: flip(c.forms), ..c }]))
+}
+
+/// The tuned attention config of `ranked`, its softmax forms and tiles
+/// tuned in turn, since a tile may fit only under some forms (bf16
+/// probabilities held truncated rather than in f32, say): the [`forms`]
+/// pass on `first_clean` of the ranking (its first config that compiles
+/// without spilling), the tile and split choice (`tiles`) over the ranking
+/// under those forms, and the forms pass again on that winner. `pick`
+/// chooses within a forms pair, as in [`forms`].
+pub(crate) fn descend(
+    ranked: &[FaCfg],
+    first_clean: impl FnOnce(&[FaCfg]) -> FaCfg,
+    tiles: impl FnOnce(&[FaCfg]) -> FaCfg,
+    mut pick: impl FnMut([FaCfg; 2]) -> FaCfg,
+) -> FaCfg {
+    let kept = forms(first_clean(ranked), &mut pick).forms;
+    let formed: Vec<FaCfg> = ranked.iter().map(|&c| FaCfg { forms: kept, ..c }).collect();
+    forms(tiles(&formed), pick)
+}
+
+/// The config `tuner` launches from `ranked`, `expand` making a tile pass's
+/// candidates as in [`Tuner::tuned`]: the softmax forms and tiles tuned in
+/// turn by [`descend`], or with tuning off the first admitted, plain.
+pub(crate) fn tune<B: Fn(FaCfg) -> crate::tune::Candidate>(
+    tuner: &mut Tuner<'_, FaCfg, B>,
+    ranked: &[FaCfg],
+    expand: impl Fn(&[FaCfg]) -> Vec<FaCfg>,
+) -> FaCfg {
+    if !crate::tune::enabled() {
+        return tuner.tuned(OP, ranked, expand);
+    }
+    let tuner = std::cell::RefCell::new(tuner);
+    descend(
+        ranked,
+        |r| tuner.borrow_mut().admitted(OP, r)[0],
+        |r| tuner.borrow_mut().tuned(OP, r, &expand),
+        |pair| {
+            let mut tuner = tuner.borrow_mut();
+            let admitted = tuner.admitted(OP, &pair);
+            tuner.fastest(OP, &admitted)
+        },
+    )
 }
 
 fn dims4(dims: &[usize]) -> [usize; 4] {

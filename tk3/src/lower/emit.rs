@@ -104,9 +104,9 @@ impl Coord {
 
 impl<'a> Emit<'a> {
     fn new(prog: &'a Program, lay: &'a [Option<TileLayout>], low: &'a Lowering, params: Vec<Arc<UOp>>) -> Self {
-        let threads = prog.warps * low.target.wave;
+        let threads = prog.warps * low.device.target.wave;
         let tid = UOp::special_dtype(c32(threads as i64), "lidx0".to_string(), DType::Int32);
-        let wave = c32(low.target.wave as i64);
+        let wave = c32(low.device.target.wave as i64);
         let lane = tid.try_cmod(&wave).expect("lane");
         let warp = tid.try_cdiv(&wave).expect("warp");
         let mut alias = HashMap::new();
@@ -572,7 +572,7 @@ impl<'a> Emit<'a> {
     fn runs(&self, l: &TileLayout, view: &View) -> Vec<(u32, u32)> {
         let (along, contiguous) = self.along(view);
         let width = if contiguous { 16 / view.dtype.bytes() as u32 } else { 1 };
-        l.runs(self.low.target.wave, width, along)
+        l.runs(self.low.device.target.wave, width, along)
     }
 
     // ---- statements -------------------------------------------------------
@@ -720,18 +720,20 @@ impl<'a> Emit<'a> {
     }
 
     fn sync(&mut self, sync: Sync) -> Result<()> {
-        let cuda = matches!(self.low.target.arch, GpuArch::Cuda(_));
+        let cuda = matches!(self.low.device.target.arch, GpuArch::Cuda(_));
         let u = match sync {
             Sync::Barrier { role: None } => {
                 let tag = self.next_tag();
                 self.last.clone().barrier(smallvec![]).rtag(Some(smallvec![tag as usize]))
             }
             Sync::Barrier { role: Some(_) } => return UnsupportedSnafu { what: "role barriers" }.fail(),
-            Sync::CommitAsync if cuda && self.low.target.cp_async => cp_async_commit(smallvec![]),
-            Sync::WaitAsync { pending } if cuda && self.low.target.cp_async => cp_async_wait(pending, smallvec![]),
+            Sync::CommitAsync if cuda && self.low.device.target.cp_async => cp_async_commit(smallvec![]),
+            Sync::WaitAsync { pending } if cuda && self.low.device.target.cp_async => {
+                cp_async_wait(pending, smallvec![])
+            }
             // Without `cp.async` the copies were synchronous: nothing to wait for.
             Sync::CommitAsync | Sync::WaitAsync { .. } => return Ok(()),
-            Sync::Fence if self.low.target.commit_fence => UOp::custom(
+            Sync::Fence if self.low.device.target.commit_fence => UOp::custom(
                 smallvec![self.last.clone()],
                 "declare void @llvm.amdgcn.sched.barrier(i32)\ncall void @llvm.amdgcn.sched.barrier(i32 0)".to_string(),
                 DType::Void,
@@ -760,9 +762,9 @@ impl<'a> Emit<'a> {
         let (d, s) = (self.view(dst), self.view(src));
         let chunk = 16 / d.dtype.bytes() as i64;
         let cols = d.shape.cols as i64;
-        let threads = (self.prog.warps * self.low.target.wave) as i64;
+        let threads = (self.prog.warps * self.low.device.target.wave) as i64;
         let chunks = d.shape.rows as i64 * cols / chunk;
-        let cuda = matches!(self.low.target.arch, GpuArch::Cuda(_));
+        let cuda = matches!(self.low.device.target.arch, GpuArch::Cuda(_));
         snafu::ensure!(
             cols % chunk == 0 && chunks % threads == 0,
             UnsupportedSnafu { what: format!("a {}×{} fill by {threads} threads", d.shape.rows, cols) }
@@ -800,7 +802,7 @@ impl<'a> Emit<'a> {
                 None => src_off,
             };
             let (dst_off, _) = self.address(&d, &Coord::plain(row, col));
-            if cuda && mode == CopyMode::Async && self.low.target.cp_async {
+            if cuda && mode == CopyMode::Async && self.low.device.target.cp_async {
                 let (dst, src) = (self.access(&d.buf, &dst_off, 1), self.access(&s.buf, &src_off, 1));
                 match gate {
                     Some(g) => {
@@ -831,14 +833,14 @@ impl<'a> Emit<'a> {
         let [sub_r, sub_c] = l.sub_shape();
         // `ldmatrix` reads 16-byte memory rows: a row-major tile only.
         let rows = self.along(&s).0 == Axis::Col;
-        if self.low.target.ldmatrix && rows && s.dtype.bytes() == 2 && sub_r % 16 == 0 && sub_c % 16 == 0 {
+        if self.low.device.target.ldmatrix && rows && s.dtype.bytes() == 2 && sub_r % 16 == 0 && sub_c % 16 == 0 {
             for trans in [false, true] {
                 let produced = TileLayout {
                     frag: frag::ldmatrix_x4(trans),
                     reps: [sub_r / 16, sub_c / 16],
                     warps: l.warps.clone(),
                 };
-                if let Some(perm) = l.as_permutation_of(&produced, self.prog.warps, self.low.target.wave) {
+                if let Some(perm) = l.as_permutation_of(&produced, self.prog.warps, self.low.device.target.wave) {
                     return self.ldmatrix_gather(dst, &s, &l, trans, &perm);
                 }
             }
@@ -919,12 +921,12 @@ impl<'a> Emit<'a> {
     fn transposing(&self, l: &TileLayout, view: &View) -> Option<Vec<u32>> {
         let [sub_r, sub_c] = l.sub_shape();
         let global = matches!(view.place, Place::Global { .. }) && self.along(view) == (Axis::Col, true);
-        if !self.low.target.tr_load || !global || view.dtype.bytes() != 2 || sub_r % 16 != 0 || sub_c % 16 != 0 {
+        if !self.low.device.target.tr_load || !global || view.dtype.bytes() != 2 || sub_r % 16 != 0 || sub_c % 16 != 0 {
             return None;
         }
         let produced =
             TileLayout { frag: frag::global_tr_b128(), reps: [sub_r / 16, sub_c / 16], warps: l.warps.clone() };
-        l.as_permutation_of(&produced, self.prog.warps, self.low.target.wave)
+        l.as_permutation_of(&produced, self.prog.warps, self.low.device.target.wave)
     }
 
     /// Global → registers by transposing loads, one per 16×16 block, its
@@ -975,7 +977,7 @@ impl<'a> Emit<'a> {
 
     fn relayout(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let (ls, ld) = (self.layout(src).clone(), self.layout(dst).clone());
-        match ls.relayout(&ld, self.prog.warps, self.low.target.wave) {
+        match ls.relayout(&ld, self.prog.warps, self.low.device.target.wave, &self.low.device.costs) {
             Relayout::Identity => {
                 let buf = self.reg_buf(src);
                 let root = self.root(dst);
@@ -996,23 +998,17 @@ impl<'a> Emit<'a> {
                 for (jd, picks) in picks.into_iter().enumerate() {
                     let mut out: Option<Arc<UOp>> = None;
                     for p in picks.into_iter().rev() {
-                        let v = match moved.get(&(p.mask, p.reg)) {
-                            Some(v) => v.clone(),
-                            None => {
+                        let v = moved
+                            .entry((p.mask, p.reg))
+                            .or_insert_with(|| {
                                 let x = self.reg_load(src, p.reg);
-                                let v = if p.mask == 0 { x } else { self.shuffle_xor(&x, p.mask) };
-                                moved.insert((p.mask, p.reg), v.clone());
-                                v
-                            }
-                        };
+                                if p.mask == 0 { x } else { self.shuffle_xor(&x, p.mask) }
+                            })
+                            .clone();
                         out = Some(match out {
                             None => v,
                             Some(rest) => {
-                                let mine = and(
-                                    &c32(p.lanes as u32 as i32 as i64).try_shr_op(&self.lane).expect("lane bit"),
-                                    &c32(1),
-                                );
-                                let mine = self.hoist(mine.try_cmpne(&c32(0)).expect("lane predicate"));
+                                let mine = self.hoist(self.lane_in(p.lanes));
                                 UOp::try_where(mine, v, rest).expect("exchange select")
                             }
                         });
@@ -1021,8 +1017,20 @@ impl<'a> Emit<'a> {
                 }
                 Ok(())
             }
-            Relayout::LaneShuffle(_) | Relayout::ViaSmem => self.relayout_via_smem(dst, src),
+            Relayout::ViaSmem => self.relayout_via_smem(dst, src),
         }
+    }
+
+    /// Whether this lane is one of `lanes`: a 32-bit word on a wave of 32,
+    /// a 64-bit one on a wave64.
+    fn lane_in(&self, lanes: u64) -> Arc<UOp> {
+        let (dtype, word, lane) = match self.low.device.target.wave {
+            ..=32 => (DType::Int32, lanes as u32 as i32 as i64, self.lane.clone()),
+            _ => (DType::Int64, lanes as i64, self.lane.cast(DType::Int64)),
+        };
+        let c = |v: i64| UOp::const_(dtype.clone(), ConstValue::Int(v));
+        let bit = and(&c(word).try_shr_op(&lane).expect("lane bit"), &c(1));
+        bit.try_cmpne(&c(0)).expect("lane predicate")
     }
 
     fn relayout_via_smem(&mut self, dst: ValId, src: ValId) -> Result<()> {
@@ -1189,7 +1197,7 @@ impl<'a> Emit<'a> {
             return (0..ld.regs()).collect();
         }
         let key = |r: u32, c: u32| if os.cols == 1 { (r, 0) } else { (0, c) };
-        let lanes = self.low.target.wave;
+        let lanes = self.low.device.target.wave;
         (0..ld.regs())
             .map(|j| {
                 let (r, c) = ld.coord(0, 0, j);
@@ -1209,7 +1217,7 @@ impl<'a> Emit<'a> {
         let TileOp::Mma { acc, a, b, a_t, b_t, orient } = *op else { unreachable!("a product") };
         let orient = orient.expect("a laid program orients every product");
         let (va, vd) = (self.value(a).clone(), self.value(dst).clone());
-        let atom = self.low.target.mma(va.dtype, vd.dtype).expect("inference found the core").clone();
+        let atom = self.low.device.target.mma(va.dtype, vd.dtype).expect("inference found the core").clone();
         let k = if a_t { va.shape.rows } else { va.shape.cols };
         // The product as laid, from the one function the inference used: the
         // slot each operand feeds and the registers each fragment holds.
@@ -1245,7 +1253,8 @@ impl<'a> Emit<'a> {
     fn reduce(&mut self, dst: ValId, src: ValId, axis: Axis, f: ReduceOp) -> Result<()> {
         let (ls, ld) = (self.layout(src).clone(), self.layout(dst).clone());
         let (from, to) = (self.value(src).dtype, self.value(dst).dtype);
-        let dot2 = from != to && from == ScalarDType::BFloat16 && f == ReduceOp::Sum && self.low.target.dot2_bf16;
+        let dot2 =
+            from != to && from == ScalarDType::BFloat16 && f == ReduceOp::Sum && self.low.device.target.dot2_bf16;
         let (fold_masks, across) = match axis {
             Axis::Row => (ls.row_fold_masks(), ls.warps.out_size(Col)),
             Axis::Col => (ls.col_fold_masks(), ls.warps.out_size(Row)),
@@ -1343,7 +1352,7 @@ impl<'a> Emit<'a> {
     /// range reduction LLVM wraps `llvm.exp2` in to keep results below 2^-126
     /// denormal: those flush to zero, which no kernel tells apart.
     fn exp2(&mut self, x: &Arc<UOp>) -> Arc<UOp> {
-        if self.low.target.hardware_exp2 && x.dtype() == DType::Float32 {
+        if self.low.device.target.hardware_exp2 && x.dtype() == DType::Float32 {
             UOp::custom(
                 smallvec![x.clone()],
                 "declare float @llvm.amdgcn.exp2.f32(float)\ncall float @llvm.amdgcn.exp2.f32(float {0})".to_string(),
@@ -1362,19 +1371,20 @@ impl<'a> Emit<'a> {
     }
 
     fn shuffle_xor(&mut self, value: &Arc<UOp>, mask: u32) -> Arc<UOp> {
-        match self.low.target.lane_move {
+        match self.low.device.target.lane_move {
             LaneMove::Shuffle => shfl_bfly(value, &c32(mask as i64)),
             LaneMove::SimdShuffle => svod_codegen::c::metal::simd_shuffle_xor(value, &c32(mask as i64)),
             LaneMove::Dpp if mask < 32 => {
                 let (mut word, back) = as_word(value);
                 if mask & 15 != 0 {
-                    // `row_xmask:mask`, every row and bank written.
+                    // `row_xmask:mask`, every row and bank written, so no lane keeps
+                    // the old value and it need not be set.
                     word = UOp::custom(
                         smallvec![word],
                         format!(
                             "declare i32 @llvm.amdgcn.update.dpp.i32(i32, i32, i32, i32, i32, i1)\n\
-                             call i32 @llvm.amdgcn.update.dpp.i32(i32 0, i32 {{0}}, i32 {}, i32 15, i32 15, i1 false)",
-                            0x160 | (mask & 15)
+                             call i32 @llvm.amdgcn.update.dpp.i32(i32 poison, i32 {{0}}, i32 {}, i32 15, i32 15, i1 false)",
+                            DPP_ROW_XMASK | (mask & 15)
                         ),
                         DType::Int32,
                     );
@@ -1383,9 +1393,11 @@ impl<'a> Emit<'a> {
                     // Each lane takes the same lane of the other row of 16.
                     word = UOp::custom(
                         smallvec![word],
-                        "declare i32 @llvm.amdgcn.permlanex16.i32(i32, i32, i32, i32, i1, i1)\n\
-                         call i32 @llvm.amdgcn.permlanex16.i32(i32 {0}, i32 {0}, i32 1985229328, i32 -19088744, i1 false, i1 false)"
-                            .to_string(),
+                        format!(
+                            "declare i32 @llvm.amdgcn.permlanex16.i32(i32, i32, i32, i32, i1, i1)\n\
+                             call i32 @llvm.amdgcn.permlanex16.i32(i32 {{0}}, i32 {{0}}, i32 {}, i32 {}, i1 false, i1 false)",
+                            0x76543210, 0xFEDCBA98_u32 as i32
+                        ),
                         DType::Int32,
                     );
                 }
@@ -1406,21 +1418,33 @@ impl<'a> Emit<'a> {
     }
 }
 
+/// DPP's `row_xmask` control: OR the lane xor-mask within a row of 16.
+const DPP_ROW_XMASK: u32 = 0x160;
+
 /// `value` as the 32-bit word a lane move carries, and the way back: a
-/// 16-bit value travels zero-extended.
+/// 16-bit value travels zero-extended. A lane move carries one 2- or 4-byte
+/// scalar, nothing else.
 fn as_word(value: &Arc<UOp>) -> (Arc<UOp>, impl Fn(Arc<UOp>) -> Arc<UOp>) {
     let dtype = value.dtype();
-    let wide = dtype.scalar().is_none_or(|s| s.bytes() == 4);
+    let bytes = dtype.scalar().map(|s| s.bytes());
+    assert!(matches!(bytes, Some(2 | 4)), "a lane move carries a 2- or 4-byte scalar, not {dtype:?}");
+    let wide = bytes == Some(4);
     let int = dtype == DType::Int32;
-    let word = match () {
-        () if int => value.clone(),
-        () if wide => value.bitcast(DType::Int32),
-        () => value.bitcast(DType::Scalar(ScalarDType::UInt16)).cast(DType::Int32),
+    let word = if int {
+        value.clone()
+    } else if wide {
+        value.bitcast(DType::Int32)
+    } else {
+        value.bitcast(DType::Scalar(ScalarDType::UInt16)).cast(DType::Int32)
     };
-    let back = move |w: Arc<UOp>| match () {
-        () if int => w,
-        () if wide => w.bitcast(dtype.clone()),
-        () => w.cast(DType::Scalar(ScalarDType::UInt16)).bitcast(dtype.clone()),
+    let back = move |w: Arc<UOp>| {
+        if int {
+            w
+        } else if wide {
+            w.bitcast(dtype.clone())
+        } else {
+            w.cast(DType::Scalar(ScalarDType::UInt16)).bitcast(dtype.clone())
+        }
     };
     (word, back)
 }

@@ -8,7 +8,7 @@ use snafu::{ResultExt, Snafu};
 use svod_dtype::DeviceSpec;
 use svod_ir::UOp;
 
-use crate::atoms::Target;
+use crate::atoms::{Device, Target};
 use crate::ir::*;
 use crate::layouts::{self, Laid, TileLayout, WarpGrid};
 use crate::schedule::{self, Schedule};
@@ -31,11 +31,22 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Everything the lowering decides that the author did not.
 #[derive(Clone, Debug)]
 pub struct Lowering {
-    pub target: Target,
+    /// The target and what its primitives cost: the costs decide each
+    /// product's orientation and how a tile is re-held.
+    pub device: Device,
     pub schedule: Schedule,
     pub grid: WarpGrid,
     /// XOR-swizzle 16-byte chunks of shared rows against the row index.
     pub swizzle: bool,
+}
+
+impl Lowering {
+    /// `device`'s uniform pipeline over `grid`, its ring `unroll`ed or not,
+    /// shared rows swizzled.
+    pub fn uniform(device: &Device, unroll: bool, grid: WarpGrid) -> Self {
+        let schedule = Schedule::Uniform { prefetch: device.target.prefetch(), unroll };
+        Self { device: device.clone(), schedule, grid, swizzle: true }
+    }
 }
 
 pub struct Lowered {
@@ -50,8 +61,8 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     materialize_operands(&mut prog);
     sync::insert_barriers(&mut prog);
     schedule::expand(&mut prog, lowering.schedule);
-    let mut laid = layouts::infer(prog, &lowering.target, lowering.grid).context(LayoutSnafu)?;
-    orient_shared(&mut laid, &lowering.target);
+    let mut laid = layouts::infer(prog, &lowering.device, lowering.grid).context(LayoutSnafu)?;
+    orient_shared(&mut laid, &lowering.device.target);
     let program = emit::emit(&laid, lowering, params, device)?;
     let Laid { prog, layouts } = laid;
     Ok(Lowered { program, tile: prog, layouts })

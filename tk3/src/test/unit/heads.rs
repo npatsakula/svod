@@ -5,6 +5,7 @@ use svod_dtype::{DType, DeviceSpec, ScalarDType, default_device::default_device}
 use svod_tensor::Tensor;
 use test_case::test_case;
 
+use super::declared;
 use crate::atoms::Target;
 use crate::build::BF16;
 use crate::interp::{round_to, run};
@@ -162,7 +163,7 @@ fn kernel_matches_the_program(s: HeadsSpec) {
         .map(|v| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16))
         .collect();
     let refs: Vec<&Tensor> = tensors.iter().collect();
-    let outs = graph_launch_all(heads::<BF16>(&s), &s.cfg.lowering(target), &refs).unwrap();
+    let outs = graph_launch_all(heads::<BF16>(&s), &s.cfg.lowering(&declared(target)), &refs).unwrap();
     let outputs = outs.len() - 3;
     for (i, name) in ["q", "k", "v"].into_iter().enumerate() {
         let out = &outs[outputs + i];

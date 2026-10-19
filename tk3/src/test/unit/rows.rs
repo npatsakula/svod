@@ -7,6 +7,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
+use super::declared;
 use crate::atoms::{Target, sm86};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
@@ -162,7 +163,7 @@ fn epilogue_interpreter_matches_the_reference(which: usize) {
 fn bias_vector_takes_the_accumulators_column_layout() {
     let epi = Epilogue { bias: true, ..Epilogue::default() };
     let prog = gemm_nt_epilogue(128, 128, 64, [128, 128, 32], 2, [2, 4], epi);
-    let Laid { prog, layouts: lay } = infer(prog, &sm86(), WarpGrid { rows: 2, cols: 4 }).unwrap();
+    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), WarpGrid { rows: 2, cols: 4 }).unwrap();
     let add = prog
         .walk()
         .find_map(|(_, s)| match s {
@@ -191,7 +192,7 @@ fn epilogues_match_on_device(m: usize, n: usize, k: usize, tile: [usize; 3], sta
         let want = gemm_reference(m, n, k, epi, &params);
         let interp = run(&prog, params.clone(), &[]).unwrap();
         let cfg = GemmCfg { tile, stages, warps: [wr, wc], group_m: 0, unroll: true };
-        let got = on_device(prog, &cfg.lowering(target.clone()), &params);
+        let got = on_device(prog, &cfg.lowering(&declared(target.clone())), &params);
         let (got, interp) = (got.last().unwrap(), interp.last().unwrap());
         let d_interp = assert_close("c vs interpreter", got, interp, 1.6e-2);
         let d_ref = assert_close("c vs reference", got, &want, 1.6e-2);
@@ -312,7 +313,7 @@ fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: u
 }
 
 fn row_lowering(target: Target) -> Lowering {
-    NormCfg { br: 4 }.lowering(target)
+    NormCfg { br: 4 }.lowering(&declared(target))
 }
 
 /// Fastest GPU time of `plan`'s kernels after a warm-up long enough for the

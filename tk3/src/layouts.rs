@@ -2,11 +2,11 @@
 //! need, free values adopt their consumer's, and a value two consumers want
 //! differently is re-held through an inserted [`TileOp::Relayout`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use snafu::{OptionExt, Snafu, ensure};
 
-use crate::atoms::{MmaAtom, Target};
+use crate::atoms::{Costs, Device, MmaAtom, Target};
 use crate::ir::*;
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
 use crate::layout::{self as frag, Layout};
@@ -118,10 +118,9 @@ impl TileLayout {
     /// The register permutation under which this layout is `produced` (what
     /// an instruction leaves a tile in), if it is one lane for lane.
     pub fn as_permutation_of(&self, produced: &Self, warps: u32, lanes: u32) -> Option<Vec<u32>> {
-        match produced.relayout(self, warps, lanes) {
-            Relayout::Identity => Some((0..self.regs()).collect()),
-            Relayout::RegPermute(perm) => Some(perm),
-            Relayout::Exchange(_) | Relayout::LaneShuffle(_) | Relayout::ViaSmem => None,
+        match produced.held(self, warps, lanes) {
+            Held::InLane(perm) => Some(perm),
+            Held::AcrossLanes { .. } | Held::AcrossWarps => None,
         }
     }
 
@@ -149,11 +148,29 @@ impl TileLayout {
         crate::layout::lanes_sharing_row(&self.frag.transpose())
     }
 
-    /// How `self` becomes `dst`, for `warps` warps of `lanes` lanes.
-    pub fn relayout(&self, dst: &Self, warps: u32, lanes: u32) -> Relayout {
+    /// How `self` becomes `dst`, for `warps` warps of `lanes` lanes: lanes
+    /// trade registers by lane moves while that is cheaper per element than
+    /// a round trip through shared memory.
+    pub fn relayout(&self, dst: &Self, warps: u32, lanes: u32, costs: &Costs) -> Relayout {
+        match self.held(dst, warps, lanes) {
+            Held::InLane(perm) if is_identity(&perm) => Relayout::Identity,
+            Held::InLane(perm) => Relayout::RegPermute(perm),
+            Held::AcrossLanes(holders) => match self.exchange(dst, &holders, warps, lanes).map(Relayout::Exchange) {
+                Some(exchange) if exchange.cost_per_element(costs) < Relayout::ViaSmem.cost_per_element(costs) => {
+                    exchange
+                }
+                _ => Relayout::ViaSmem,
+            },
+            Held::AcrossWarps => Relayout::ViaSmem,
+        }
+    }
+
+    /// Where every register of `dst` is held in `self`, preferring the same
+    /// lane, then the same warp.
+    fn held(&self, dst: &Self, warps: u32, lanes: u32) -> Held {
         assert_eq!(self.shape(), dst.shape(), "relayout between different tiles");
         if self == dst {
-            return Relayout::Identity;
+            return Held::InLane((0..dst.regs()).collect());
         }
         let Shape { rows, cols } = self.shape();
         let mut holders: Vec<Vec<(u32, u32, u32)>> = vec![vec![]; rows * cols];
@@ -168,7 +185,6 @@ impl TileLayout {
         let (mut cross_lane, mut cross_warp) = (false, false);
         let mut lane_perm: Option<Vec<u32>> = None;
         let mut uniform = true;
-        let mut sources = Vec::with_capacity((warps * lanes * dst.regs()) as usize);
         for w in 0..warps {
             for l in 0..lanes {
                 let mut perm = Vec::with_capacity(dst.regs() as usize);
@@ -184,31 +200,23 @@ impl TileLayout {
                     cross_lane |= pick.1 != l;
                     cross_warp |= pick.0 != w;
                     perm.push(pick.2);
-                    sources.push((pick.0, pick.1, pick.2));
                 }
                 uniform &= lane_perm.get_or_insert_with(|| perm.clone()) == &perm;
             }
         }
-        let perm = lane_perm.unwrap_or_default();
         if cross_warp {
-            Relayout::ViaSmem
+            Held::AcrossWarps
         } else if cross_lane || !uniform {
-            self.exchange(dst, &holders, warps, lanes).map_or(Relayout::LaneShuffle(sources), Relayout::Exchange)
-        } else if perm.iter().enumerate().all(|(j, &p)| j as u32 == p) {
-            Relayout::Identity
+            Held::AcrossLanes(holders)
         } else {
-            Relayout::RegPermute(perm)
+            Held::InLane(lane_perm.unwrap_or_default())
         }
     }
 
-    /// Every destination register as at most [`EXCHANGE_PICKS`] lane-xor moves
-    /// of one source register each, the same in every warp: lanes of a wave of
-    /// at most 32 trading registers with fixed partners (a wave64 keeps its
-    /// round trip, unmeasured). `holders` lists who holds each element.
+    /// Every destination register as lane-xor moves of one source register
+    /// each, the same in every warp: lanes trading registers with fixed
+    /// partners. `holders` lists who holds each element.
     fn exchange(&self, dst: &Self, holders: &[Vec<(u32, u32, u32)>], warps: u32, lanes: u32) -> Option<Vec<Vec<Pick>>> {
-        if lanes > 32 {
-            return None;
-        }
         let cols = self.shape().cols;
         // The (mask, source register) moves that bring lane `l` of warp `w` its element `j`.
         let moves = |w: u32, l: u32, j: u32| -> Vec<(u32, u32)> {
@@ -219,7 +227,7 @@ impl TileLayout {
             .map(|j| {
                 // Greedy cover: the move serving the most lanes still open, until none are.
                 let mut picks: Vec<Pick> = vec![];
-                let mut open: u64 = (1u64 << lanes) - 1;
+                let mut open: u64 = u64::MAX >> (64 - lanes);
                 while open != 0 {
                     let lanes_of = |mv: (u32, u32)| {
                         (0..lanes)
@@ -239,14 +247,21 @@ impl TileLayout {
                         (0..lanes).filter(|l| p.lanes >> l & 1 == 1).all(|l| moves(w, l, j).contains(&(p.mask, p.reg)))
                     })
                 });
-                (picks.len() <= EXCHANGE_PICKS && every_warp).then_some(picks)
+                every_warp.then_some(picks)
             })
             .collect()
     }
 }
 
-/// The most lane-xor moves an [`Relayout::Exchange`] selects among per register.
-const EXCHANGE_PICKS: usize = 2;
+/// Where a destination layout's registers are held in a source layout.
+enum Held {
+    /// In the same lane of every warp, destination register `j` at source
+    /// register `perm[j]`.
+    InLane(Vec<u32>),
+    /// In other lanes of the same warp: who holds each element.
+    AcrossLanes(Vec<Vec<(u32, u32, u32)>>),
+    AcrossWarps,
+}
 
 /// One lane-xor move of a [`Relayout::Exchange`]: the lanes in `lanes` take
 /// source register `reg` of lane `lane ^ mask`.
@@ -265,24 +280,48 @@ pub enum Relayout {
     RegPermute(Vec<u32>),
     /// Per destination register, the lane-xor moves that fill it, selected by lane.
     Exchange(Vec<Vec<Pick>>),
-    /// Per `(warp, lane, dst reg)` in row-major order: the `(warp, lane, reg)` it reads.
-    LaneShuffle(Vec<(u32, u32, u32)>),
+    /// A round trip through shared memory: across warps, or across lanes
+    /// where no exchange is cheaper.
     ViaSmem,
 }
 
 impl Relayout {
-    /// What moving one element this way is worth avoiding, for the inference
-    /// to weigh one assignment against another. The classes are ordered, not
-    /// calibrated, and a lane shuffle is priced as a round trip because that
-    /// is what the emitter lowers one into today.
-    pub fn cost_per_element(&self) -> u32 {
+    /// What moving one element this way costs, for the inference to weigh
+    /// one assignment against another: its [`Self::work`] in its primitive's
+    /// cost. A wave64 exchange's moves past 31 lanes run as `ds_bpermute` on
+    /// RDNA, yet are priced as lane moves: no cost is measured for them.
+    pub fn cost_per_element(&self, costs: &Costs) -> f64 {
+        let unit = match self {
+            Relayout::Exchange(_) => costs.lane_move,
+            Relayout::ViaSmem => costs.smem_trip,
+            _ => 0.0,
+        };
+        self.work() * unit
+    }
+
+    /// The primitives the emitter issues per element: none within a lane
+    /// (the compiler renames an in-lane permutation), one round trip through
+    /// shared memory across lanes or warps. An exchange moves each distinct
+    /// `(mask, reg)` of a non-zero mask once, shared by every destination
+    /// register that picks it, and selects among a register's picks, a
+    /// select counting as a move; its work is that over its registers.
+    pub fn work(&self) -> f64 {
         match self {
-            Relayout::Identity => 0,
-            Relayout::RegPermute(_) => 1,
-            Relayout::Exchange(_) => 2,
-            Relayout::LaneShuffle(_) | Relayout::ViaSmem => 16,
+            Relayout::Identity | Relayout::RegPermute(_) => 0.0,
+            Relayout::Exchange(picks) => {
+                let moves: HashSet<(u32, u32)> =
+                    picks.iter().flatten().filter(|p| p.mask != 0).map(|p| (p.mask, p.reg)).collect();
+                let selects: usize = picks.iter().map(|p| p.len().saturating_sub(1)).sum();
+                (moves.len() + selects) as f64 / picks.len().max(1) as f64
+            }
+            Relayout::ViaSmem => 1.0,
         }
     }
+}
+
+/// Whether register `j` stays register `j`.
+fn is_identity(perm: &[u32]) -> bool {
+    perm.iter().enumerate().all(|(j, &p)| j as u32 == p)
 }
 
 /// Keep the input bits that tell `axis` apart; the rest of the registers are
@@ -329,7 +368,7 @@ impl MmaAtom {
         let one = WarpGrid { rows: 1, cols: 1 };
         let feeds = |rows, cols, operand: fn(&Issue) -> &TileLayout| {
             self.issue(Orient::Direct, one, rows, cols, k)
-                .is_ok_and(|p| matches!(p.c.relayout(operand(&p), 1, lanes), Relayout::Identity))
+                .is_ok_and(|p| operand(&p).as_permutation_of(&p.c, 1, lanes).is_some_and(|perm| is_identity(&perm)))
         };
         feeds(m, k, |p| &p.a) || (self.swappable() && feeds(k, n, |p| &p.b))
     }
@@ -477,9 +516,9 @@ pub struct Laid {
 /// product wants, which on a target whose accumulator is its operand's
 /// transpose is free (what tk1's `acc_reusable_as_input` flag used to say).
 /// Products the author oriented stay as pinned.
-pub fn infer(mut prog: Program, target: &Target, grid: WarpGrid) -> Result<Laid> {
-    orient_products(&mut prog, target, grid)?;
-    let mut it = Infer::new(&prog, target, grid);
+pub fn infer(mut prog: Program, device: &Device, grid: WarpGrid) -> Result<Laid> {
+    orient_products(&mut prog, device, grid)?;
+    let mut it = Infer::new(&prog, &device.target, grid);
     it.solve()?;
     let (mut layouts, conflicts) = (it.lay, it.conflicts);
     if !conflicts.is_empty() {
@@ -494,8 +533,6 @@ pub fn infer(mut prog: Program, target: &Target, grid: WarpGrid) -> Result<Laid>
 /// flipped on its own and a flip that lowers the cost is kept.
 const EXHAUSTIVE_UP_TO: usize = 6;
 
-/// Write an orientation into every product of `prog`: the pinned ones stay,
-/// the rest take the assignment of least relayout cost.
 /// Whether lanes reading global view `from` into layout `lay` scatter: each
 /// lane's run along the view's unit-stride axis is under 16 bytes and the next
 /// lane does not continue it, so a wave's request touches a line per lane.
@@ -516,7 +553,10 @@ fn scatters(prog: &Program, lay: &TileLayout, from: &Value, lanes: u32) -> bool 
     run * bytes < 16 && !continued
 }
 
-fn orient_products(prog: &mut Program, target: &Target, grid: WarpGrid) -> Result<()> {
+/// Write an orientation into every product of `prog`: the pinned ones stay,
+/// the rest take the assignment of least relayout and scatter cost.
+fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid) -> Result<()> {
+    let Device { target, costs } = device;
     // A product listed twice (a peeled loop trip) is one decision.
     let mut free: Vec<ValId> = vec![];
     for (_, s) in prog.walk() {
@@ -527,35 +567,35 @@ fn orient_products(prog: &mut Program, target: &Target, grid: WarpGrid) -> Resul
             }
         }
     }
-    let cost_of = |choice: &HashMap<ValId, Orient>| -> Result<u32> {
+    let cost_of = |choice: &HashMap<ValId, Orient>| -> Result<f64> {
         let mut trial = prog.clone();
         set_orient(&mut trial.body, choice);
         let mut it = Infer::new(&trial, target, grid);
         it.solve()?;
-        let relayouts: u32 = it
+        let relayouts: f64 = it
             .conflicts
             .iter()
             .map(|((_, v), want)| match &it.lay[v.index()] {
                 Some(have) => {
-                    let shape = trial.value(*v).shape;
-                    have.relayout(want, trial.warps, target.wave).cost_per_element() * (shape.rows * shape.cols) as u32
+                    let elems = trial.value(*v).shape.elems() as f64;
+                    have.relayout(want, trial.warps, target.wave, costs).cost_per_element(costs) * elems
                 }
-                None => 0,
+                None => 0.0,
             })
             .sum();
         // A register tile loaded from global memory in a layout whose lanes
-        // scatter costs what a lane shuffle does: a memory line per lane.
-        let scattered: u32 = trial
+        // scatter costs a memory line per lane.
+        let scattered: f64 = trial
             .walk()
             .filter_map(|(_, s)| match s {
                 Stmt::Copy { dst, src, .. } if trial.value(*dst).tier() == Tier::Reg => {
                     let (lay, from) = (it.lay[dst.index()].as_ref()?, trial.value(*src));
-                    scatters(&trial, lay, from, target.wave).then(|| from.shape.elems() as u32)
+                    scatters(&trial, lay, from, target.wave).then(|| from.shape.elems() as f64)
                 }
                 _ => None,
             })
             .sum();
-        Ok(relayouts + Relayout::LaneShuffle(vec![]).cost_per_element() * scattered)
+        Ok(relayouts + costs.scatter * scattered)
     };
     let mut best: HashMap<ValId, Orient> = HashMap::new();
     let mut best_cost = cost_of(&best)?;
@@ -610,8 +650,11 @@ fn set_orient(block: &mut Block, choice: &HashMap<ValId, Orient>) {
 
 impl<'a> Infer<'a> {
     fn new(prog: &'a Program, target: &'a Target, grid: WarpGrid) -> Self {
-        let n = prog.values.len();
-        Infer { prog, target, grid, lay: vec![None; n], changed: true, conflicts: HashMap::new(), pos: 0 }
+        let mut lay = vec![None; prog.values.len()];
+        for (v, l) in &prog.pins {
+            lay[v.index()] = Some(l.clone());
+        }
+        Infer { prog, target, grid, lay, changed: true, conflicts: HashMap::new(), pos: 0 }
     }
 
     /// Run the propagation to its fixed point, seeding what nothing constrains.
