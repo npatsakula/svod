@@ -119,9 +119,20 @@ extra conversion of the held values having cost 3–5% on sm_86. With `skip_resc
 accumulator's rescale is a `Scale`, skipped by every wave whose rows all kept their maximum; it is
 on wherever the matrix products issue on the vector ALUs, and beside separate matrix cores only
 where a full tile's lane holds 64 output registers (sm_86: +4% at d = 128, neutral at d = 64 and
-5–7% slower on a decoder step, whose one row keeps the plain multiply). On gfx1201 the lazy
-rescale, the truncation, the skip and the raw `exp2` below took the d = 128 kernel from 90 to 119
-TFLOP/s on random data and Qwen3's causal attention from 63 to 77.
+5–7% slower on a decoder step, whose one row keeps the plain multiply). With `raw_max`, on RDNA
+tiles full of queries, the running maximum stays in the raw scores' units (a positive scale commutes
+with the maximum; a bias keeps the scaled form), so only the two row values the exponent and the
+correction take are scaled, a multiply per row rather than per score, at the price of a multiply on
+the step's dependent chain, which a decoder step's one wave feels (3%) and a full tile does not. The
+held sum is taken after the product so both read the probabilities packed once, by the bf16 pair dot
+product where the target has it. Under a causal mask (or chunks seeing every earlier one) the last
+query blocks, which score the most keys, run first, so a round's tail is its shortest blocks. On
+gfx1201 the lazy rescale, the truncation, the skip and the raw `exp2` below took the d = 128 kernel
+from 90 to 116 TFLOP/s on random data and Qwen3's causal attention from 63 to 77; the raw maximum,
+the pair dot product and the block order took them on to 120 and 79, d = 128 causal 96 → 100 and
+d = 64 105 → 108 (causal 87 → 92), the decoder step unchanged. What remains against the 162 TFLOP/s
+the loop's WMMAs alone would run at is spread thin: the vector work is 15%, the loads, stores,
+barriers and addressing the rest.
 
 Each tile config is crossed with split counts. `Attn::splits = Some(n)` fixes `n`, capped at the
 key block count. With `None`, `config::split_candidates` proposes 1, 2, the counts around two

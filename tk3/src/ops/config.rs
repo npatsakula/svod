@@ -398,13 +398,17 @@ impl FaCfg {
     /// saves is matrix time (RDNA), or where it saves [`SKIP_RESCALE_REGS`]
     /// multiplies per lane of a tile full of queries: a decoder step's one
     /// row keeps the multiply, the branch splitting its short loop's product
-    /// chain cost it 5–7% on sm_86.
+    /// chain cost it 5–7% on sm_86. The maximum runs in raw units where the
+    /// vector work is matrix time and the tile is full of queries (gfx1201:
+    /// +3% at `d = 64`, +1% at `d = 128`); the multiply it puts on the
+    /// step's dependent chain cost a decoder step's one wave 3%.
     pub fn forms(self, target: &Target, d: usize, t: usize) -> Self {
         let grid = WarpGrid { rows: self.warps(), cols: 1 };
         let out = target.mma.first().and_then(|a| a.issue(Orient::Direct, grid, self.bq, d, self.bkv).ok());
         let out = out.map_or(0, |issue| issue.c.regs());
-        let skip_rescale = target.mma_on_valu || (t >= self.bq && out >= SKIP_RESCALE_REGS);
-        Self { truncate_p: !target.bf16_cvt, skip_rescale, ..self }
+        let full = t >= self.bq;
+        let skip_rescale = target.mma_on_valu || (full && out >= SKIP_RESCALE_REGS);
+        Self { truncate_p: !target.bf16_cvt, skip_rescale, raw_max: target.mma_on_valu && full, ..self }
     }
 }
 
