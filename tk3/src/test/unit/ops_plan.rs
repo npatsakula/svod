@@ -478,7 +478,7 @@ fn semantic_mismatches_are_errors() {
     let opts = Attn { seg_start: Some(&seg), ..Attn::default() };
     assert!(matches!(err(tk::attention(&q, &kv2, &kv2, opts)), Error::Shape { operand: "seg start", .. }));
     let cache = t(&[3, 12, 6, 64], BF16);
-    let plain = Cache { head_start: 0, kv_heads: 2, row_map: None, appended: None };
+    let plain = Cache { head_start: 0, kv_heads: 2, row_map: None, appended: None, app_lens: None };
     let opts = Attn { cache: Some(plain), ..Attn::default() };
     assert!(
         matches!(err(tk::attention(&q, &cache, &cache, opts)), Error::Shape { operand: "k", .. }),
@@ -511,6 +511,23 @@ fn semantic_mismatches_are_errors() {
         let got = tk::attention(&q, &cache, &cache, opts);
         assert!(matches!(err(got), Error::Shape { operand: "bias", .. }), "{dims:?}");
     }
+    let rows = t(&[2, 8, 2, 64], BF16);
+    let eight = Cache { row_map: Some(&map), appended: Some((&rows, &rows)), ..plain };
+    let wide = t(&[2, 6, 10, 20], BF16);
+    let opts = Attn { cache: Some(eight), bias: Some(&wide), ..with_lens };
+    assert!(tk::attention(&q, &cache, &cache, opts).is_ok(), "eight appended columns");
+    let opts = Attn { cache: Some(Cache { app_lens: Some(&lens), ..eight }), ..with_lens };
+    assert!(tk::attention(&q, &cache, &cache, opts).is_ok(), "counted appended rows");
+    let opts = Attn { cache: Some(Cache { app_lens: Some(&map), row_map: Some(&map), ..plain }), ..with_lens };
+    assert!(
+        matches!(err(tk::attention(&q, &cache, &cache, opts)), Error::Shape { operand: "appended lens", .. }),
+        "a count needs appended rows"
+    );
+    let opts = Attn { cache: Some(Cache { app_lens: Some(&seg), ..eight }), ..with_lens };
+    assert!(matches!(err(tk::attention(&q, &cache, &cache, opts)), Error::Shape { operand: "appended lens", .. }));
+    let none = t(&[2, 0, 2, 64], BF16);
+    let opts = Attn { cache: Some(Cache { appended: Some((&none, &none)), ..eight }), ..with_lens };
+    assert!(matches!(err(tk::attention(&q, &cache, &cache, opts)), Error::Shape { operand: "appended k", .. }));
     let bias = t(&[1, 6, 10, 12], BF16);
     assert!(tk::attention(&q, &kv2, &kv2, Attn { bias: Some(&bias), ..Attn::default() }).is_ok(), "shared");
     // Off the stream dtype is the graph's to handle, not an error.
