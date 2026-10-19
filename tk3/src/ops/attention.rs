@@ -17,6 +17,7 @@ pub use crate::kernels::attention::Chunk;
 use crate::kernels::attention::{
     AttnMask, AttnSpec, Bias, CombineSpec, FaCfg, Forms, attention as fa, combine, key_mask_stride,
 };
+use crate::kernels::gemm::Core;
 use crate::kernels::rows::NormCfg;
 use crate::launch;
 
@@ -170,8 +171,10 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let biased = bias_rows.is_some();
     let plan = shape::attention(planner.as_deref(), &dtypes, q_ext.as_ref(), k_ext.as_ref(), causal, biased);
     let Plan::Kernel(cfgs) = plan else { return graph(q, k, v, opts).context(GraphSnafu { op: OP }) };
-    // The appended rows ride one key block.
-    let cfgs: Vec<FaCfg> = cfgs.iter().copied().filter(|c| c.bkv >= appended).collect();
+    // The appended rows ride one key block, read from global memory, which
+    // the warpgroup core's shared operands cannot.
+    let cfgs: Vec<FaCfg> =
+        cfgs.iter().copied().filter(|c| c.bkv >= appended && (appended == 0 || c.core == Core::Warp)).collect();
     if cfgs.is_empty() {
         return graph(q, k, v, opts).context(GraphSnafu { op: OP });
     }

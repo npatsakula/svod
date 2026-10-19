@@ -1,6 +1,9 @@
 //! Flash attention forward: Q resident in registers, K/V streamed through a
 //! shared ring, the online-softmax state `(m, l, o)` carried.
 
+use std::fmt;
+
+use super::gemm::Core;
 use super::rows::NormCfg;
 use super::{Batch, batch_offset, bound, load_f32};
 use crate::atoms::{Device, Target};
@@ -31,21 +34,30 @@ pub struct FaCfg {
     /// Query rows a warp owns: [`WARP_ROWS`] (one atom row) or twice that,
     /// where every key and value fragment the warp reads from the ring
     /// feeds two atom rows of products at the price of twice the score and
-    /// output accumulators per lane.
+    /// output accumulators per lane. The warp-level core's alone.
     pub warp_rows: usize,
+    /// The matrix instruction both products issue on. On the warpgroup core
+    /// each group of four row warps owns 64 query rows: the scores are a
+    /// chain over the shared key rows (K-major), the output's a chain of the
+    /// probabilities as they stand in registers over the shared value rows
+    /// (MN-major); a head wider than a 128-byte row is kept as column panels.
+    pub core: Core,
 }
 
-/// The tune store keys by this text: a config of one atom row per warp
-/// prints as it did before the field existed, so its stored choices still
-/// apply.
-impl std::fmt::Debug for FaCfg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+/// The tune store keys by this text: a config of one atom row per warp on
+/// the warp-level core prints as it did before the fields existed, so its
+/// stored choices still apply.
+impl fmt::Debug for FaCfg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("FaCfg");
         s.field("bq", &self.bq).field("bkv", &self.bkv).field("stages", &self.stages);
         s.field("splits", &self.splits).field("unroll", &self.unroll).field("forms", &self.forms);
         s.field("key_warps", &self.key_warps);
         if self.warp_rows != WARP_ROWS {
             s.field("warp_rows", &self.warp_rows);
+        }
+        if self.core != Core::Warp {
+            s.field("core", &self.core);
         }
         s.finish()
     }
@@ -105,6 +117,7 @@ impl FaCfg {
             },
             key_warps: 1,
             warp_rows: WARP_ROWS,
+            core: Core::Warp,
         }
     }
 
@@ -120,7 +133,8 @@ impl FaCfg {
     }
 
     pub fn lowering(&self, device: &Device) -> Lowering {
-        Lowering::uniform(device, self.unroll, WarpGrid { rows: self.row_warps(), cols: 1 })
+        let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
+        Lowering { group: self.core == Core::Group, ..Lowering::uniform(device, self.unroll, grid) }
     }
 
     /// Whether a bias rides the ring: under a bias, unless the forms read it

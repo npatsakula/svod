@@ -10,9 +10,10 @@
 //! with `fence.proxy.async` over what the generic proxy stored there.
 //!
 //! A shared operand reaches the core through a 64-bit matrix descriptor
-//! ([`descriptor`]) over its shared address, the K-major canonical layouts
-//! whose swizzle modes are those of the TMA (and of tk3's XOR swizzle of
-//! 16-byte chunks against the row).
+//! ([`descriptor`]) over its shared address, the canonical layouts whose
+//! swizzle modes are those of the TMA (and of tk3's XOR swizzle of 16-byte
+//! chunks against the row): K-major, or for B also MN-major (its rows run
+//! along N, the instruction transposing them).
 
 use std::sync::Arc;
 
@@ -32,20 +33,28 @@ pub const K: usize = 16;
 pub const N_MAX: usize = 256;
 /// Threads of a warpgroup.
 pub const THREADS: usize = 128;
+/// Bytes of the widest swizzle span: a row of a shared operand's canonical
+/// layout, or of one of its column panels.
+pub const SPAN: usize = 128;
 
 /// The `metadata.name` of a warpgroup product whose both operands are shared
 /// descriptors.
 pub const SS: &str = "wgmma.ss";
 /// The `metadata.name` of one whose A operand is held in registers.
 pub const RS: &str = "wgmma.rs";
+/// The suffix of a product whose B rows run along N (MN-major), read
+/// transposed.
+pub const B_MN: &str = ".bmn";
 /// The suffix of a chain left in flight: committed but not waited for, a
 /// later [`wait`] being the caller's.
 pub const ASYNC: &str = ".async";
 
-/// The `metadata.name` of a product: its A operand's form, and whether the
-/// statement waits for its chain.
-pub fn name(from_registers: bool, waits: bool) -> String {
-    format!("{}{}", if from_registers { RS } else { SS }, if waits { "" } else { ASYNC })
+/// The `metadata.name` of a product: its A operand's form, its B operand's
+/// major axis, and whether the statement waits for its chain.
+pub fn name(from_registers: bool, b_mn: bool, waits: bool) -> String {
+    let (a, b, wait) =
+        (if from_registers { RS } else { SS }, if b_mn { B_MN } else { "" }, if waits { "" } else { ASYNC });
+    format!("{a}{b}{wait}")
 }
 
 /// The swizzle a descriptor declares over its operand's shared rows: the
@@ -108,16 +117,18 @@ pub fn shared_address(ptr: &Arc<UOp>) -> Arc<UOp> {
     )
 }
 
-/// The matrix descriptor of a K-major shared operand at the 32-bit shared
+/// The matrix descriptor of a shared operand at the 32-bit shared
 /// `address`: its 16-byte units in bits 0–13, the leading byte offset in
-/// 16–29, the stride byte offset (between groups of eight rows) in 32–45
-/// and the swizzle mode in 62–63. The leading offset is unread for a
-/// swizzled K-major operand whose instruction depth lies within one swizzle
-/// span (a `k16` of 16-bit elements always does); it is declared as 16.
-pub fn descriptor(address: &Arc<UOp>, stride_bytes: u32, swizzle: Swizzle) -> Arc<UOp> {
+/// 16–29, the stride byte offset in 32–45 and the swizzle mode in 62–63.
+/// The stride is the step between groups of eight rows: along MN for a
+/// K-major operand, along K for an MN-major one. The leading offset is the
+/// step between the swizzle-wide column panels an MN-major operand's N
+/// spans; a K-major operand whose instruction depth lies within one swizzle
+/// span (a `k16` of 16-bit elements always does) never reads it.
+pub fn descriptor(address: &Arc<UOp>, leading_bytes: u32, stride_bytes: u32, swizzle: Swizzle) -> Arc<UOp> {
     let c64 = |v: i64| UOp::const_(DType::Int64, ConstValue::Int(v));
     let start = address.cast(DType::Int64).try_shr_op(&c64(4)).expect("shr").try_and_op(&c64(0x3fff)).expect("and");
-    let fixed = (1i64 << 16) | ((stride_bytes as i64 >> 4) << 32) | ((swizzle as i64) << 62);
+    let fixed = ((leading_bytes as i64 >> 4) << 16) | ((stride_bytes as i64 >> 4) << 32) | ((swizzle as i64) << 62);
     start.try_or_op(&c64(fixed)).expect("or")
 }
 
@@ -156,6 +167,10 @@ pub fn render(
     let (form, waits) = match metadata.name.strip_suffix(ASYNC) {
         Some(form) => (form, false),
         None => (metadata.name.as_str(), true),
+    };
+    let (form, b_mn) = match form.strip_suffix(B_MN) {
+        Some(form) => (form, true),
+        None => (form, false),
     };
     let from_registers = match form {
         SS => false,
@@ -222,9 +237,10 @@ pub fn render(
         };
         let b_text = format!("${operand}");
         operand += 1;
-        // scale-d = 1 (accumulate), scale-a = scale-b = 1, no transposes (a
-        // register A has no transpose flag: its last operand is B's).
-        let tail = if from_registers { "p,1,1,0" } else { "p,1,1,0,0" };
+        // scale-d = 1 (accumulate), scale-a = scale-b = 1, A untransposed
+        // (a register A has no such flag), B transposed when MN-major.
+        let tb = u8::from(b_mn);
+        let tail = if from_registers { format!("p,1,1,{tb}") } else { format!("p,1,1,0,{tb}") };
         text.push_str(&format!(
             "{{.reg .pred p; setp.ne.b32 p,1,0; wgmma.mma_async.sync.aligned.m{M}n{n}k{K}.f32.{ty}.{ty} {{{d_list}}},{a_text},{b_text},{tail};}}\\0A"
         ));

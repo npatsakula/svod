@@ -342,6 +342,63 @@ pub(super) fn group_families(target: &Target) -> Vec<Launch> {
         .collect()
 }
 
+/// Every warpgroup attention lowers for sm_90a and assembles: the scores
+/// are a register-A chain over K-major key rows, the output's a register-A
+/// chain over MN-major value rows (B transposed), and neither tile is ever
+/// loaded into registers; a head of 128 spans two column panels.
+#[test]
+fn every_group_attention_assembles_for_hopper() {
+    use crate::kernels::attention::FaCfg;
+    let target = hopper();
+    let GpuArch::Cuda(arch) = target.arch else { unreachable!() };
+    let device = declared(target.clone());
+    let ptxas = ptxas();
+    let plain = AttnMask::default();
+    let cases = [
+        (64, 64, 64, plain),
+        (128, 128, 64, AttnMask { causal: true, ..plain }),
+        (128, 64, 128, plain),
+        (64, 128, 128, AttnMask { bias: Some(Bias::PerBatch), key_lens: true, ..plain }),
+    ];
+    for (bq, bkv, d, mask) in cases {
+        let cfg = FaCfg { core: Core::Group, ..FaCfg::new(bq, bkv, 2) };
+        assert!(cfg.fits(&target, d, mask.bias.is_some()), "{cfg:?} fits the warpgroup core at d {d}");
+        let spec = AttnSpec {
+            batch: Batch::Static(2),
+            t: 300,
+            tk: 300,
+            heads: 2,
+            kv_heads: 2,
+            d,
+            mask,
+            cache: None,
+            scale: 0.125,
+            cfg,
+        };
+        let name = format!("group attention bq {bq} bkv {bkv} d {d}");
+        let ir = render(attention::<BF16>(&spec), &cfg.lowering(&device));
+        assert!(ir.contains(&format!("wgmma.mma_async.sync.aligned.m64n{bkv}k16")), "{name}: no scores chain");
+        assert!(ir.contains(&format!("wgmma.mma_async.sync.aligned.m64n{d}k16")), "{name}: no output chain");
+        assert!(ir.contains(",p,1,1,0;") && ir.contains(",p,1,1,1;"), "{name}: a K-major and an MN-major B");
+        assert!(!ir.contains("@llvm.nvvm.mma."), "{name}: a warp-level product");
+        // Only the bias tile is gathered from shared memory into registers.
+        assert!(mask.bias.is_some() || !ir.contains("ldmatrix"), "{name}: a key or value fragment load");
+        let ptx = match svod_runtime::cuda::compile_ir_to_ptx(&ir, arch) {
+            Ok(ptx) => ptx,
+            Err(e) if e.to_string().contains("NVPTX target") => {
+                eprintln!("skipped: clang has no NVPTX target");
+                return;
+            }
+            Err(e) => panic!("{name}: {e}"),
+        };
+        let Some(ptxas) = &ptxas else { continue };
+        let mut command = Command::new(ptxas);
+        command.args(["-arch=sm_90a", "-o", "/dev/null", "/dev/stdin"]);
+        run(command, &ptx, &format!("ptxas sm_90a {name}")).unwrap_or_else(|e| panic!("{e}"));
+        eprintln!("{name}: assembled for sm_90a");
+    }
+}
+
 /// Every warpgroup GEMM lowers for sm_90a and assembles: its main loop
 /// holds `wgmma.mma_async` products over descriptors and no warp-level
 /// product or fragment load, since both operands stay in shared memory.

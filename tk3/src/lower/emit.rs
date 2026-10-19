@@ -579,7 +579,22 @@ impl<'a> Emit<'a> {
                     Some(region) => add(&offset, region),
                     None => offset,
                 };
-                let chunk = 16 / view.dtype.bytes() as i64;
+                let bytes = view.dtype.bytes();
+                // A row past the widest swizzle span is kept as column panels.
+                let panel = (self.along(view).0 == Axis::Col)
+                    .then(|| self.panel_cols(view.shape.cols, bytes))
+                    .flatten()
+                    .map(|pc| pc as i64);
+                let (panel_off, cols) = match panel {
+                    Some(pc) => {
+                        let bits = pc.trailing_zeros();
+                        let at = mul(&shr(&col, bits), &c32(view.shape.rows as i64 * pc));
+                        col = and(&col, &c32(pc - 1));
+                        (Some(at), pc)
+                    }
+                    None => (None, cols),
+                };
+                let chunk = 16 / bytes as i64;
                 let cpr = cols / chunk;
                 // The XOR must stay within the row: a power-of-two chunk count.
                 let col = if self.low.swizzle && cols % chunk == 0 && cpr >= 2 && (cpr as u64).is_power_of_two() {
@@ -594,7 +609,8 @@ impl<'a> Emit<'a> {
                 } else {
                     col
                 };
-                let lane = self.hoist(add(&mul(&row, &c32(cols)), &col));
+                let lane = add(&mul(&row, &c32(cols)), &col);
+                let lane = self.hoist(panel_off.map_or(lane.clone(), |at| add(&at, &lane)));
                 (self.hoist(add(&offset, &lane)), None)
             }
             Place::Reg => unreachable!(),
@@ -664,6 +680,17 @@ impl<'a> Emit<'a> {
             Place::Smem { alloc, .. } => (self.prog.smem.get(alloc.index()).map_or(Axis::Col, |a| a.along), true),
             Place::Reg => unreachable!(),
         }
+    }
+
+    /// The width in elements of the column panels a shared row of `cols`
+    /// elements is stored as: under the warpgroup core a row longer than the
+    /// widest swizzle span (128 bytes) is kept as panels of that span, each
+    /// a row-major region of its own, so a descriptor's canonical layout
+    /// reaches every row; `None` keeps the row whole.
+    fn panel_cols(&self, cols: usize, bytes: usize) -> Option<usize> {
+        let row = cols * bytes;
+        (self.low.group && self.low.swizzle && row > wgmma::SPAN && row.is_multiple_of(wgmma::SPAN))
+            .then_some(wgmma::SPAN / bytes)
     }
 
     /// The register runs of `l` a view is accessed by: 16-byte vectors along
@@ -1412,54 +1439,74 @@ impl<'a> Emit<'a> {
     /// `Wmma` over the whole K chain, its shared operands as the descriptors
     /// of this warp's group rows (and the block's columns of `B`) at every
     /// `k16` step, `A` as its register fragments when it is a register tile.
-    /// The descriptor's swizzle is the lowering's own (the hardware applies
-    /// it to the absolute address, so the ring's slots start on 1024-byte
-    /// boundaries), and a step moves the start 32 bytes along the row. The
-    /// chain is fenced and committed inside the one statement
-    /// (`codegen::llvm::nvptx::wgmma`) and waited for there too, unless the
-    /// block holds the [`Sync::WaitProducts`] a schedule template placed to
-    /// wait later, with the next trip's fill under way.
+    /// `B` is K-major (`b_t`: its rows run along N) or MN-major (its rows run
+    /// along K, the instruction transposing them). The descriptor's swizzle
+    /// is the lowering's own (the hardware applies it to the absolute
+    /// address, so the ring's slots start on 1024-byte boundaries) over the
+    /// operand's rows, or over its column panels where a row is longer than
+    /// the widest span ([`Self::panel_cols`]). The chain is fenced and
+    /// committed inside the one statement (`codegen::llvm::nvptx::wgmma`) and
+    /// waited for there too, unless the block holds the
+    /// [`Sync::WaitProducts`] that waits for it later.
     fn group_mma(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
         let TileOp::Mma { acc, a, b, a_t, b_t, .. } = *op else { unreachable!("a product") };
         let (va, vb, vd) = (self.value(a).clone(), self.value(b).clone(), self.value(dst).clone());
         let atom = self.low.device.target.group_mma(va.dtype, vd.dtype).expect("inference found the core").clone();
         snafu::ensure!(
-            !a_t && b_t && vb.tier() == Tier::Smem && self.low.swizzle,
-            UnsupportedSnafu { what: "a warpgroup product over other than swizzled K-major shared rows" }
+            !a_t && vb.tier() == Tier::Smem && self.low.swizzle,
+            UnsupportedSnafu { what: "a warpgroup product over other than an untransposed A and swizzled shared B" }
         );
         let grid = self.low.grid;
         let k = va.shape.cols;
         let issue = atom.issue(grid, vd.shape.rows, vd.shape.cols, k).expect("inference laid this product");
         let n_atom = atom.n_for(vd.shape.cols as u32 / grid.cols).expect("inference laid this product") as usize;
         let (rn, rc, rk) = (issue.c.reps[1] as usize, issue.c.frag_regs() as usize, k / wgmma::K);
-        let bytes = va.dtype.bytes();
-        let swizzle = wgmma::Swizzle::for_row_bytes(k * bytes)
-            .context(UnsupportedSnafu { what: format!("a warpgroup product over {}-byte shared rows", k * bytes) })?;
-        let stride = (8 * k * bytes) as u32;
         // This warp's group and the group's place in the grid, columns first.
         let group = self.hoist(shr(&self.warp, 2));
         let cols = c32(grid.cols as i64);
         let group_row = self.hoist(group.try_cdiv(&cols).expect("group row"));
         let group_col = self.hoist(group.try_cmod(&cols).expect("group column"));
-        let describe = |this: &mut Self, v: ValId, row0: Arc<UOp>| -> Result<Vec<Arc<UOp>>> {
+        // The `k16` steps' descriptors of a shared operand from `at`: its
+        // first row when K-major (rows along M or N), else its first column
+        // (rows along K). Panel `p` of `pc` columns starts `p·rows·pc` in.
+        let describe = |this: &mut Self, v: ValId, at: Arc<UOp>, k_major: bool| -> Result<Vec<Arc<UOp>>> {
             let view = this.view(v);
             snafu::ensure!(
                 this.along(&view).0 == Axis::Col,
                 UnsupportedSnafu { what: "a column-major shared operand" }
             );
+            let (rows, e) = (view.shape.rows, view.dtype.bytes());
+            let pc = this.panel_cols(view.shape.cols, e).unwrap_or(view.shape.cols);
+            let swizzle = wgmma::Swizzle::for_row_bytes(pc * e)
+                .context(UnsupportedSnafu { what: format!("a warpgroup operand over {}-byte shared rows", pc * e) })?;
+            snafu::ensure!(
+                k_major || n_atom.is_multiple_of(pc),
+                UnsupportedSnafu { what: format!("an MN-major n{n_atom} block within a {pc}-wide panel") }
+            );
+            // The leading offset steps between an MN-major operand's panels; a
+            // K-major one never reads it and declares one unit, as ever.
+            let leading = if k_major { 16 } else { (rows * pc * e) as u32 };
+            let stride = (8 * pc * e) as u32;
             let Place::Smem { offset, .. } = view.place else { unreachable!("a shared operand") };
             let (_, offset) = this.scalar(offset);
             let offset = match &view.region {
                 Some(region) => add(&offset, region),
                 None => offset,
             };
-            let base = this.hoist(add(&offset, &mul(&row0, &c32(view.shape.cols as i64))));
+            let base = if k_major {
+                mul(&at, &c32(pc as i64))
+            } else {
+                mul(&shr(&at, pc.trailing_zeros()), &c32((rows * pc) as i64))
+            };
+            let base = this.hoist(add(&offset, &base));
             Ok((0..rk)
                 .map(|kk| {
-                    let at = add(&base, &c32((kk * wgmma::K) as i64));
+                    let kk = kk * wgmma::K;
+                    let step = if k_major { kk / pc * rows * pc + kk % pc } else { kk * pc };
+                    let at = add(&base, &c32(step as i64));
                     let ptr = this.access(&view.buf, &at, 1);
                     let address = this.hoist(wgmma::shared_address(&ptr));
-                    this.hoist(wgmma::descriptor(&address, stride, swizzle))
+                    this.hoist(wgmma::descriptor(&address, leading, stride, swizzle))
                 })
                 .collect())
         };
@@ -1472,10 +1519,10 @@ impl<'a> Emit<'a> {
             UOp::stack((0..rk).flat_map(|kk| self.reg_loads(a, (kk * regs) as u32, regs as u32)).collect())
         } else {
             let rows = self.hoist(mul(&group_row, &c32(wgmma::M as i64)));
-            gather(describe(self, a, rows)?)
+            gather(describe(self, a, rows, true)?)
         };
         let meta = WmmaMetadata {
-            name: wgmma::name(from_registers, !self.async_products),
+            name: wgmma::name(from_registers, !b_t, !self.async_products),
             dims: (n_atom, wgmma::M, k),
             dtype_in: DType::Scalar(va.dtype),
             dtype_out: DType::Scalar(vd.dtype),
@@ -1485,9 +1532,9 @@ impl<'a> Emit<'a> {
             reduce_axes: vec![],
         };
         for j in 0..rn {
-            let rows = add(&mul(&group_col, &c32((n_atom * rn) as i64)), &c32((j * n_atom) as i64));
-            let rows = self.hoist(rows);
-            let b_op = gather(describe(self, b, rows)?);
+            let at = add(&mul(&group_col, &c32((n_atom * rn) as i64)), &c32((j * n_atom) as i64));
+            let at = self.hoist(at);
+            let b_op = gather(describe(self, b, at, b_t)?);
             let c = UOp::stack(self.reg_loads(acc, (j * rc) as u32, rc as u32).into_iter().collect());
             let d = UOp::wmma(a_op.clone(), b_op, c, meta.clone());
             let vals = (0..rc).map(|p| elem(&d, p, rc)).collect();

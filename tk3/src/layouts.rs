@@ -903,7 +903,7 @@ impl<'a> Infer<'a> {
                     self.set(src, l.transposed());
                 }
             }
-            TileOp::Mma { acc, a, b, a_t, b_t, orient: _ } if self.group => {
+            TileOp::Mma { acc, a, b, a_t, .. } if self.group => {
                 let (va, vc) = (self.prog.value(a).clone(), self.prog.value(dst).clone());
                 let atom = self
                     .target
@@ -911,8 +911,8 @@ impl<'a> Infer<'a> {
                     .context(NoMatrixCoreSnafu { arch: self.target.arch, dtype_in: va.dtype, dtype_out: vc.dtype })?
                     .clone();
                 ensure!(
-                    self.prog.value(b).tier() == Tier::Smem && b_t && !a_t,
-                    GroupOperandSnafu { what: "a K-major shared B operand and an untransposed A" }
+                    self.prog.value(b).tier() == Tier::Smem && !a_t,
+                    GroupOperandSnafu { what: "a shared B operand and an untransposed A" }
                 );
                 let k = va.shape.cols;
                 let Issue { a: la, c: lc, .. } = atom.issue(self.grid, vc.shape.rows, vc.shape.cols, k)?;

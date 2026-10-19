@@ -1528,6 +1528,28 @@ fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usiz
     assert!(pick.twins(&ranked).iter().any(|c| c.warp_rows == 2 * WARP_ROWS), "{ranked:?}");
 }
 
+/// On a target with the warpgroup core the attention lattice spans both
+/// cores, the core part of a tile (a different kernel structure, never a
+/// twin): a warpgroup config keeps one atom row per warp, takes no two-row
+/// variant, and its twins are its own core's pipelines. A warp-level config
+/// of one atom row prints as it did before either field existed.
+#[test]
+fn the_warpgroup_core_is_a_tile_of_its_own() {
+    use crate::ops::config::representatives;
+    let ranked = planner(super::targets::hopper()).attention_ranked(32, 2048, 2048, 128, false, false);
+    let group: Vec<&FaCfg> = ranked.iter().filter(|c| c.core == Core::Group).collect();
+    assert!(!group.is_empty(), "no warpgroup config ranked");
+    assert!(group.iter().all(|c| c.warp_rows == WARP_ROWS), "{group:?}");
+    assert!(ranked.iter().any(|c| c.core == Core::Warp && c.warp_rows == 2 * WARP_ROWS), "no two-row variant");
+    for c in &group {
+        assert!(c.represents() && c.tile() != FaCfg { core: Core::Warp, ..**c }.tile());
+        assert!(c.twins(&ranked).iter().all(|t| t.core == Core::Group), "{c:?} twins a warp-level config");
+    }
+    assert_eq!(representatives(&ranked).len(), ranked.iter().filter(|c| c.warp_rows == WARP_ROWS).count());
+    let plain = format!("{:?}", FaCfg::new(64, 32, 2));
+    assert!(!plain.contains("core") && !plain.contains("warp_rows"), "{plain}");
+}
+
 fn gfx1151_planner() -> Planner {
     Planner::new(Device { target: super::targets::amd(AmdArch::Gfx1151, 40), costs: super::gfx1151_costs() })
 }

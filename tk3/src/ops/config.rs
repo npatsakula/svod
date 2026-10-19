@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use svod_dtype::GpuArch;
 
-use crate::atoms::{Device, Target};
+use crate::atoms::{Device, GroupMmaAtom, Target};
 use crate::ir::{Axis, Orient, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
@@ -449,7 +449,7 @@ impl Tiled for FaCfg {
     }
 
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
-        let block = |c: &FaCfg| (c.bq, c.bkv, c.key_warps);
+        let block = |c: &FaCfg| (c.bq, c.bkv, c.key_warps, c.core);
         ranked
             .iter()
             .filter(|c| block(c) == block(self))
@@ -758,13 +758,30 @@ impl FaCfg {
     /// is the kernel's [`WARP_ROWS`], a warp owns whole atom rows of queries
     /// and the block whole warps, both products tile the atoms, and the K
     /// and V fills (and the bias tile's under a bias) split into whole
-    /// 16-byte chunks per thread.
+    /// 16-byte chunks per thread. On the warpgroup core a group of four row
+    /// warps of one atom row each owns 64 query rows, both products' column
+    /// blocks tile the instruction, a value row spans whole column panels
+    /// (one swizzle span, or 128-byte panels) and no key warps split the
+    /// block.
     pub fn fits(&self, target: &Target, d: usize, bias: bool) -> bool {
         let Some(atom) = target.mma.first() else { return false };
         let (bq, bkv, rows) = (self.bq, self.bkv, self.warp_rows);
         // Key warps fill their own tiles alone.
         let threads = self.row_warps() as usize * target.wave as usize;
-        atom.m as usize == WARP_ROWS
+        let core = match self.core {
+            Core::Warp => true,
+            Core::Group => target.group_mma.first().is_some_and(|g| {
+                let groups = self.row_warps() / GroupMmaAtom::WARPS;
+                self.key_warps == 1
+                    && rows == WARP_ROWS
+                    && bq == GroupMmaAtom::M as usize * groups as usize
+                    && groups.is_power_of_two()
+                    && g.n_for(bkv as u32).is_some()
+                    && g.n_for(d as u32).is_some()
+                    && (matches!(d * 2, 32 | 64 | 128) || (d * 2).is_multiple_of(128))
+            }),
+        };
+        core && atom.m as usize == WARP_ROWS
             && rows.is_multiple_of(WARP_ROWS)
             && rows > 0
             && bq.is_multiple_of(rows)
@@ -787,11 +804,24 @@ impl FaCfg {
     /// 16-byte runs like the keys'), with the bias tile's under a bias.
     /// Addressing and what the compiler keeps beside the tiles are not
     /// counted: the compiled kernel's own count is what the tuner reads.
+    /// On the warpgroup core the key and value tiles stay in shared memory
+    /// and a chain's descriptors (two registers a `k16` step) stand in for
+    /// their fragments.
     pub fn registers(&self, target: &Target, d: usize, bias: bool) -> Option<u32> {
-        let atom = target.mma.first()?;
         let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
-        let qk = atom.issue(Orient::Direct, grid, self.bq, self.bkv, d).ok()?;
-        let pv = atom.issue(Orient::Direct, grid, self.bq, d, self.bkv).ok()?;
+        let (qk, pv) = match self.core {
+            Core::Warp => {
+                let atom = target.mma.first()?;
+                (
+                    atom.issue(Orient::Direct, grid, self.bq, self.bkv, d).ok()?,
+                    atom.issue(Orient::Direct, grid, self.bq, d, self.bkv).ok()?,
+                )
+            }
+            Core::Group => {
+                let atom = target.group_mma.first()?;
+                (atom.issue(grid, self.bq, self.bkv, d).ok()?, atom.issue(grid, self.bq, d, self.bkv).ok()?)
+            }
+        };
         let half = |regs: u32| regs.div_ceil(2);
         let fill = if target.cp_async {
             0
@@ -801,7 +831,10 @@ impl FaCfg {
             2 * chunks(Shape::new(self.bkv, d))? + bias
         };
         let (q, o) = (half(qk.a.regs()), pv.c.regs());
-        let (k, s, p, v) = (half(qk.b.regs()), qk.c.regs(), half(pv.a.regs()), half(pv.b.regs()));
+        let (k, s, p, v) = match self.core {
+            Core::Warp => (half(qk.b.regs()), qk.c.regs(), half(pv.a.regs()), half(pv.b.regs())),
+            Core::Group => (2 * qk.a.reps[1], qk.c.regs(), half(pv.a.regs()), 2 * pv.a.reps[1]),
+        };
         Some(q + o + k + s + p + v + fill)
     }
 
@@ -865,15 +898,27 @@ impl Attention {
         let regs = cfg.registers(target, d, self.bias)?;
         // Where the accumulators have a file of their own, the output's are
         // priced against it and the rest against the vector registers.
-        let acc = cfg.accumulators(target, d)?;
-        if target.occupancy.acc_file > 0 && !target.occupancy.holds(acc, regs - acc) {
-            return None;
+        if target.occupancy.acc_file > 0 {
+            let acc = cfg.accumulators(target, d)?;
+            if !target.occupancy.holds(acc, regs - acc) {
+                return None;
+            }
         }
         let waves = cfg.warps() as usize;
-        let atom = target.mma.first()?;
-        let atoms = (cfg.warp_rows / atom.m as usize) * (bkv.min(d) / atom.n as usize);
+        // A warpgroup product reads no key or value fragments, holds one
+        // chain per product, and is past `ptxas` beyond the block's share of
+        // the register file.
+        let (atoms, kv_reads, step) = match cfg.core {
+            Core::Warp => {
+                let atom = target.mma.first()?;
+                let atoms = (cfg.warp_rows / atom.m as usize) * (bkv.min(d) / atom.n as usize);
+                (atoms, 2 * waves * bkv * d * 2, costs.step)
+            }
+            Core::Group if regs <= target.lane_budget(waves as u32) => (1, 0, costs.step_group),
+            Core::Group => return None,
+        };
         let bias = usize::from(self.bias) * kw * bq * bkv * 2;
-        let fragments = 2 * waves * bkv * d * 2 + bias;
+        let fragments = kv_reads + bias;
         let fill = kw * 2 * bkv * d * 2 + bias;
         let steps = kw * 2 * bq * bkv * d / 4096;
         let diagonal = DIAGONAL * bq.div_ceil(bkv);
@@ -885,7 +930,7 @@ impl Attention {
         let shared = 1.0 - flight.div_ceil(self.t.div_ceil(bq)) as f64 / flight as f64;
         let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
         let reads = fragments as f64 * costs.smem_byte;
-        let work = steps as f64 * costs.step + (kw * bq * bkv) as f64 * costs.score;
+        let work = steps as f64 * step + (kw * bq * bkv) as f64 * costs.score;
         let trip = costs.trip(stages, !cfg.unroll && !target.cp_async);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
         Some((planner.pipelined(run), regs))
@@ -893,7 +938,8 @@ impl Attention {
 
     /// The lattice's configs that run this problem on the planner's target,
     /// cheapest first, then by fewer registers, every pipeline of every query
-    /// and key block size at one atom row per warp, in the plain softmax
+    /// and key block size at one atom row per warp, on the warp-level core
+    /// and, where the target has it, the warpgroup core, in the plain softmax
     /// forms (the tuner sets the others); the shortlist keeps a tile's first
     /// clean one. After them, the same configs at two atom rows per warp
     /// where that can pay ([`Self::two_rows_pay`]), in their twins' order: a
@@ -901,16 +947,22 @@ impl Attention {
     /// shortlist holds the one-row representatives and the twins stage times
     /// the variant beside them for the contender tiles.
     pub fn ranked(&self, planner: &Planner) -> Vec<FaCfg> {
-        let stages: &[usize] = if planner.device.target.cp_async { &[3, 2] } else { &[2] };
+        let target = &planner.device.target;
+        let stages: &[usize] = if target.cp_async { &[3, 2] } else { &[2] };
+        let cores: &[Core] = if target.group_mma.is_empty() { &[Core::Warp] } else { &[Core::Warp, Core::Group] };
         let mut ranked: Vec<(f64, u32, FaCfg)> = vec![];
-        for bq in [16, 32, 64, 128] {
+        for (core, bq) in cores.iter().flat_map(|&c| [16, 32, 64, 128, 256].map(|bq| (c, bq))) {
+            // The warp-level core's blocks stop at eight row warps.
+            if core == Core::Warp && bq > 128 {
+                continue;
+            }
             // A row warp of queries may share its block with key warps.
             let key_warps: &[usize] = if bq == WARP_ROWS && self.t <= WARP_ROWS { &[1, 2, 4] } else { &[1] };
             for bkv in [16, 32, 64, 128] {
                 for &stages in stages {
                     for unroll in [false, true] {
                         for &key_warps in key_warps {
-                            let cfg = FaCfg { unroll, key_warps, ..FaCfg::new(bq, bkv, stages) };
+                            let cfg = FaCfg { unroll, key_warps, core, ..FaCfg::new(bq, bkv, stages) };
                             if let Some((cost, regs)) = self.admit(planner, &cfg) {
                                 ranked.push((cost, regs, cfg));
                             }
@@ -930,7 +982,8 @@ impl Attention {
         [one, two].concat()
     }
 
-    /// Whether `wide`, `one` at two atom rows per warp, can pay: a block of
+    /// Whether `wide`, `one` at two atom rows per warp, can pay: the
+    /// warp-level core (a warpgroup's rows are the instruction's), a block of
     /// at least [`TWO_ROWS_FROM`] queries (fewer leave half the warps a
     /// block holds, too few to hide a chain), one key warp, admitted, and as
     /// many blocks resident as `one` keeps (the wider tiles' registers must
@@ -944,7 +997,8 @@ impl Attention {
             let per_simd = o.waves.min(o.file / regs.max(1)) as usize;
             Some((target.smem_bytes / smem.max(1)).min(o.simds as usize * per_simd / cfg.warps() as usize))
         };
-        one.bq >= TWO_ROWS_FROM
+        one.core == Core::Warp
+            && one.bq >= TWO_ROWS_FROM
             && one.key_warps == 1
             && self.admit(planner, wide).is_some()
             && resident(wide).zip(resident(one)).is_some_and(|(w, o)| w >= o)

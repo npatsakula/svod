@@ -14,6 +14,7 @@ use crate::kernels::Batch;
 use crate::kernels::attention::{
     AttnMask, AttnSpec, Bias, Cache, Chunk, CombineSpec, FaCfg, Forms, WARP_ROWS, attention, combine, key_mask_stride,
 };
+use crate::kernels::gemm::Core;
 use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch;
 use crate::launch::graph_launch_all;
@@ -555,11 +556,22 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
 #[test_case(biased(cached(1, 100, [4, 2, 64], true, 1, 1)), &[100, 37]; "cache biased: row map, appended, gqa")]
 #[test_case(biased(counted(cached(5, 96, [2, 2, 128], false, 8, 2))), &[64, 96]; "cache biased: d 128, eight counted appended, two splits")]
 fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
-    let device = default_device();
-    let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
+    let Some(target) = cuda_target() else {
         eprintln!("skipped: no CUDA device");
         return;
     };
+    on_device(&spec, lens, target);
+}
+
+fn cuda_target() -> Option<Target> {
+    let device = default_device();
+    matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten()
+}
+
+/// `spec`'s kernel on the device against the program in the interpreter
+/// (within 2e-2 of it), its bf16 output's bits returned.
+fn on_device(spec: &AttnSpec, lens: &[i64], target: Target) -> Vec<u16> {
+    let spec = spec.clone();
     let batch = spec.batch.capacity();
     let c = case(spec.clone(), lens);
     let raw = run(&flash_attention(&spec), params(&c), &[("b", batch as i64)]).unwrap();
@@ -621,8 +633,8 @@ fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
     plan.execute_with_vars(&[("b", batch as i64)]).unwrap();
     let mut bytes = vec![0u8; elems * 2];
     out.buffer().unwrap().copyout(&mut bytes).unwrap();
-    let got: Vec<f32> =
-        bytes.chunks(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect();
+    let bits: Vec<u16> = bytes.chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+    let got: Vec<f32> = bits.iter().map(|&b| f32::from_bits(u32::from(b) << 16)).collect();
     let reference = reference(&c);
     let mut worst = 0.0f64;
     let (mut over, mut worst_at) = (0usize, 0usize);
@@ -644,6 +656,57 @@ fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
         worst_at % spec.d
     );
     assert!(worst < 2e-2, "max abs diff {worst}");
+    bits
+}
+
+/// `spec` on the warpgroup core.
+fn grouped(spec: AttnSpec) -> AttnSpec {
+    AttnSpec { cfg: FaCfg { core: Core::Group, ..spec.cfg }, ..spec }
+}
+
+/// The warpgroup core's kernel (four row warps a group of 64 query rows,
+/// both products chains over shared descriptors) against the program on
+/// every mask form, ragged blocks and a cache without appended rows, and
+/// against the warp-level kernel's output bits.
+#[test_case(spec(64, 64, 64, 64, 64, false, false), &[64, 64]; "one key block")]
+#[test_case(spec(128, 192, 64, 64, 64, false, false), &[192, 192]; "three key blocks")]
+#[test_case(spec(256, 256, 64, 64, 64, true, false), &[256, 256]; "causal")]
+#[test_case(spec(128, 256, 64, 64, 64, false, true), &[200, 33]; "key lengths")]
+#[test_case(spec(128, 128, 128, 64, 32, true, true), &[128, 64]; "d 128, causal with lengths")]
+#[test_case(spec(256, 256, 128, 64, 128, false, false), &[256, 256]; "d 128, 128 keys a block")]
+#[test_case(with(FaCfg::new(128, 64, 3), spec(256, 192, 64, 0, 0, true, true)), &[192, 70]; "bq 128, three stages")]
+#[test_case(with(FaCfg::new(128, 128, 2), spec(256, 256, 64, 0, 0, false, false)), &[256, 256]; "bq 128, 128 keys a block")]
+#[test_case(with(FaCfg::new(128, 32, 2), spec(200, 130, 128, 0, 0, false, true)), &[130, 99]; "d 128, bq 128, ragged")]
+#[test_case(with(RAW_MAX, spec(128, 128, 128, 0, 0, true, true)), &[128, 64]; "d 128, the RDNA prefill forms")]
+#[test_case(masked(128, 128, 64, 64, 32, WINDOW), &[128, 90]; "window with lengths")]
+#[test_case(masked(100, 100, 64, 64, 64, KEY_MASK), &[100, 100]; "key mask, ragged")]
+#[test_case(masked(128, 128, 64, 64, 32, SEGMENTS), &[128, 128]; "causal segments")]
+#[test_case(masked(128, 128, 64, 64, 32, CHUNKED), &[128, 90]; "chunks with lengths")]
+#[test_case(masked(100, 100, 64, 64, 64, CHUNKED_ALL), &[100, 100]; "chunks, every earlier one and one ahead, ragged")]
+#[test_case(masked(128, 128, 128, 64, 32, EVERY), &[128, 100]; "every mask, d 128")]
+#[test_case(masked(128, 128, 64, 64, 64, PER_BATCH), &[128, 128]; "bias per batch")]
+#[test_case(masked(128, 128, 64, 64, 128, PER_BATCH), &[128, 128]; "bias per batch, 128 keys a block")]
+#[test_case(masked(100, 130, 64, 64, 64, SHARED), &[130, 130]; "shared bias, ragged")]
+#[test_case(masked(256, 256, 64, 64, 64, CAUSAL_BIAS), &[256, 256]; "causal bias")]
+#[test_case(masked(99, 99, 64, 64, 64, LENS_BIAS), &[99, 41]; "bias with key lengths, odd keys")]
+#[test_case(with(FaCfg::new(128, 32, 2), masked(200, 130, 128, 0, 0, LENS_BIAS)), &[130, 99]; "d 128 bias with lengths, bq 128")]
+#[test_case(masked(128, 128, 128, 64, 32, EVERY_BIAS), &[128, 100]; "every mask and a bias, d 128")]
+#[test_case(cached(1, 100, [4, 4, 64], false, 0, 1), &[100, 37]; "cache slice")]
+#[test_case(cached(1, 200, [4, 4, 64], true, 0, 4), &[200, 70]; "cache: row map, four splits")]
+#[test_case(cached(5, 96, [2, 2, 128], false, 0, 2), &[64, 96]; "cache: d 128, two splits")]
+#[test_case(biased(cached(1, 200, [4, 4, 64], false, 0, 4)), &[200, 70]; "cache biased: four splits")]
+fn warpgroup_kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
+    let Some(target) = cuda_target().filter(|t| !t.group_mma.is_empty()) else {
+        eprintln!("skipped: no warpgroup matrix core");
+        return;
+    };
+    let spec = grouped(spec);
+    assert!(spec.cfg.fits(&target, spec.d, spec.mask.bias.is_some()), "{:?} does not fit", spec.cfg);
+    let group = on_device(&spec, lens, target.clone());
+    let warp = on_device(&AttnSpec { cfg: FaCfg { core: Core::Warp, ..spec.cfg }, ..spec }, lens, target);
+    let equal = group.iter().zip(&warp).filter(|(g, w)| g == w).count();
+    let ulps = group.iter().zip(&warp).map(|(g, w)| (*g as i32 - *w as i32).unsigned_abs()).max().unwrap_or(0);
+    eprintln!("{equal} of {} bit-equal to the warp-level kernel, at most {ulps} bf16 ulps apart", group.len());
 }
 
 /// The split merge alone: random partials through the kernel against the
@@ -740,7 +803,8 @@ fn label(c: &FaCfg) -> String {
     ];
     let on: Vec<&str> = forms.iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect();
     let rows = if c.warp_rows == WARP_ROWS { String::new() } else { format!(" rows={}", c.warp_rows) };
-    format!("bq{} bkv{} s{}{rows} unroll={} forms [{}]", c.bq, c.bkv, c.stages, c.unroll, on.join(" "))
+    let core = if c.core == Core::Warp { "" } else { " group" };
+    format!("bq{} bkv{} s{}{rows} unroll={} forms [{}]{core}", c.bq, c.bkv, c.stages, c.unroll, on.join(" "))
 }
 
 /// Flash attention throughput at B 4, H 8, T 2048 bf16, causal and plain,
