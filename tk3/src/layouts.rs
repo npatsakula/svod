@@ -749,17 +749,7 @@ fn set_orient(block: &mut Block, choice: &HashMap<ValId, Orient>) {
             Stmt::Let { dst, op: TileOp::Mma { orient: orient @ None, .. } } => {
                 *orient = Some(choice.get(dst).copied().unwrap_or(Orient::Direct));
             }
-            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => {}
-            Stmt::Loop(l) => set_orient(&mut l.body, choice),
-            Stmt::Pipeline(p) => {
-                set_orient(&mut p.produce.body, choice);
-                set_orient(&mut p.consume.body, choice);
-            }
-            Stmt::Warps { body } => set_orient(body, choice),
-            Stmt::If { then, otherwise, .. } => {
-                set_orient(then, choice);
-                set_orient(otherwise, choice);
-            }
+            nested => nested.blocks_mut().for_each(|b| set_orient(b, choice)),
         }
     }
 }
@@ -870,20 +860,7 @@ impl<'a> Infer<'a> {
             self.pos += 1;
             match stmt {
                 Stmt::Let { dst, op } => self.let_(*dst, op)?,
-                Stmt::Loop(l) => {
-                    self.carried(&l.carried)?;
-                    self.pass(&l.body)?;
-                }
-                Stmt::Pipeline(p) => {
-                    self.carried(&p.carried)?;
-                    self.pass(&p.produce.body)?;
-                    self.pass(&p.consume.body)?;
-                }
-                Stmt::Warps { body } => self.pass(body)?,
-                Stmt::If { then, otherwise, .. } => {
-                    self.pass(then)?;
-                    self.pass(otherwise)?;
-                }
+                Stmt::Loop(Loop { carried, .. }) | Stmt::Pipeline(Pipeline { carried, .. }) => self.carried(carried)?,
                 Stmt::Copy { dst, src, mode: CopyMode::Staged, scope } if self.lay[dst.index()].is_none() => {
                     let (d, s) = (self.prog.value(*dst), self.prog.value(*src));
                     if d.place == Place::Reg && s.tier() == Tier::Global {
@@ -893,7 +870,10 @@ impl<'a> Infer<'a> {
                         }
                     }
                 }
-                Stmt::Copy { .. } | Stmt::Sync(_) => {}
+                _ => {}
+            }
+            for b in stmt.blocks() {
+                self.pass(b)?;
             }
         }
         Ok(())
@@ -1065,17 +1045,11 @@ impl Rewrite<'_> {
                     TileOp::Reduce { src, .. } => rewrite(self, src),
                     TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) => {}
                 },
-                Stmt::Loop(l) => l.body = self.insert(std::mem::take(&mut l.body)),
-                Stmt::Pipeline(p) => {
-                    p.produce.body = self.insert(std::mem::take(&mut p.produce.body));
-                    p.consume.body = self.insert(std::mem::take(&mut p.consume.body));
+                nested => {
+                    for b in nested.blocks_mut() {
+                        *b = self.insert(std::mem::take(b));
+                    }
                 }
-                Stmt::Warps { body } => *body = self.insert(std::mem::take(body)),
-                Stmt::If { then, otherwise, .. } => {
-                    *then = self.insert(std::mem::take(then));
-                    *otherwise = self.insert(std::mem::take(otherwise));
-                }
-                Stmt::Copy { .. } | Stmt::Sync(_) => {}
             }
             out.push(stmt);
         }

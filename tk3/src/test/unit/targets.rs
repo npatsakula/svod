@@ -915,41 +915,12 @@ fn attention_softmax_takes_the_declared_forms(
 /// The tile ops of `block` in program order, recursively.
 fn tile_ops_in_order(block: &crate::ir::Block) -> Vec<crate::ir::TileOp> {
     use crate::ir::Stmt;
-    let mut out = vec![];
-    for s in &block.0 {
-        match s {
-            Stmt::Let { op, .. } => out.push(op.clone()),
-            Stmt::Copy { .. } | Stmt::Sync(_) => {}
-            Stmt::Loop(l) => out.extend(tile_ops_in_order(&l.body)),
-            Stmt::Pipeline(p) => {
-                out.extend(tile_ops_in_order(&p.produce.body));
-                out.extend(tile_ops_in_order(&p.consume.body));
-            }
-            Stmt::Warps { body } => out.extend(tile_ops_in_order(body)),
-            Stmt::If { then, otherwise, .. } => {
-                out.extend(tile_ops_in_order(then));
-                out.extend(tile_ops_in_order(otherwise));
-            }
-        }
-    }
-    out
+    block.walk().filter_map(|(_, s)| if let Stmt::Let { op, .. } = s { Some(op.clone()) } else { None }).collect()
 }
 
 /// The tile ops of `block` (recursively) that `f` picks.
 fn tile_ops(block: &crate::ir::Block, f: &dyn Fn(&crate::ir::TileOp) -> bool) -> usize {
-    use crate::ir::Stmt;
-    block
-        .0
-        .iter()
-        .map(|s| match s {
-            Stmt::Let { op, .. } => usize::from(f(op)),
-            Stmt::Copy { .. } | Stmt::Sync(_) => 0,
-            Stmt::Loop(l) => tile_ops(&l.body, f),
-            Stmt::Pipeline(p) => tile_ops(&p.produce.body, f) + tile_ops(&p.consume.body, f),
-            Stmt::Warps { body } => tile_ops(body, f),
-            Stmt::If { then, otherwise, .. } => tile_ops(then, f) + tile_ops(otherwise, f),
-        })
-        .sum()
+    block.walk().filter(|(_, s)| matches!(s, crate::ir::Stmt::Let { op, .. } if f(op))).count()
 }
 
 /// A bf16 tile summed into f32 lowers to the pair dot product where the
@@ -989,18 +960,7 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
 /// `Sync::Fence` statements in `block`, recursively.
 fn fences(block: &crate::ir::Block) -> usize {
     use crate::ir::{Stmt, Sync};
-    block
-        .0
-        .iter()
-        .map(|s| match s {
-            Stmt::Sync(Sync::Fence) => 1,
-            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => 0,
-            Stmt::Loop(l) => fences(&l.body),
-            Stmt::Pipeline(p) => fences(&p.produce.body) + fences(&p.consume.body),
-            Stmt::Warps { body } => fences(body),
-            Stmt::If { then, otherwise, .. } => fences(then) + fences(otherwise),
-        })
-        .sum()
+    block.walk().filter(|(_, s)| matches!(s, Stmt::Sync(Sync::Fence))).count()
 }
 
 /// The two-slot register-staged template fences every trip between its
@@ -1028,21 +988,8 @@ fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
 /// counted.
 fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
     use crate::ir::{Stmt, TileOp};
-    block
-        .0
-        .iter()
-        .map(|s| match s {
-            Stmt::Let { op: TileOp::Relayout { src }, .. } => {
-                let shape = prog.value(*src).shape;
-                usize::from(shape.rows > 1 && shape.cols > 1)
-            }
-            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => 0,
-            Stmt::Loop(l) => tile_relayouts(prog, &l.body),
-            Stmt::Pipeline(p) => tile_relayouts(prog, &p.produce.body) + tile_relayouts(prog, &p.consume.body),
-            Stmt::Warps { body } => tile_relayouts(prog, body),
-            Stmt::If { then, otherwise, .. } => tile_relayouts(prog, then) + tile_relayouts(prog, otherwise),
-        })
-        .sum()
+    let tile = |src: &crate::ir::ValId| prog.value(*src).shape.rows > 1 && prog.value(*src).shape.cols > 1;
+    block.walk().filter(|(_, s)| matches!(s, Stmt::Let { op: TileOp::Relayout { src }, .. } if tile(src))).count()
 }
 
 /// The probe's plain attention at head size `d` under `cfg` on `target`.

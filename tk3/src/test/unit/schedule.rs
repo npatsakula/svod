@@ -215,20 +215,11 @@ fn staged_halves_keep_their_copys_scope() {
     expand(&mut prog, Schedule::Uniform { fill: Fill::Staged, unroll: false, async_products: false });
     fn copies(block: &Block, inside: bool, out: &mut Vec<(bool, Scope, CopyMode)>) {
         for s in &block.0 {
-            match s {
-                Stmt::Copy { mode, scope, .. } => out.push((inside, *scope, *mode)),
-                Stmt::Loop(l) => copies(&l.body, inside, out),
-                Stmt::Warps { body } => copies(body, true, out),
-                Stmt::If { then, otherwise, .. } => {
-                    copies(then, inside, out);
-                    copies(otherwise, inside, out);
-                }
-                Stmt::Pipeline(p) => {
-                    copies(&p.produce.body, inside, out);
-                    copies(&p.consume.body, inside, out);
-                }
-                _ => {}
+            if let Stmt::Copy { mode, scope, .. } = s {
+                out.push((inside, *scope, *mode));
             }
+            let inside = inside || matches!(s, Stmt::Warps { .. });
+            s.blocks().for_each(|b| copies(b, inside, out));
         }
     }
     let mut seen = vec![];

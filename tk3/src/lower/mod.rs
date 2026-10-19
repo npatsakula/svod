@@ -210,17 +210,12 @@ fn materialize_block(prog: &mut Program, block: Block, scope: Scope, core: Core)
                     }
                 }
             }
-            Stmt::Loop(l) => l.body = materialize_block(prog, std::mem::take(&mut l.body), scope, core),
-            Stmt::Pipeline(p) => {
-                p.produce.body = materialize_block(prog, std::mem::take(&mut p.produce.body), scope, core);
-                p.consume.body = materialize_block(prog, std::mem::take(&mut p.consume.body), scope, core);
+            nested => {
+                let scope = if matches!(nested, Stmt::Warps { .. }) { Scope::Warp } else { scope };
+                for b in nested.blocks_mut() {
+                    *b = materialize_block(prog, std::mem::take(b), scope, core);
+                }
             }
-            Stmt::Warps { body } => *body = materialize_block(prog, std::mem::take(body), Scope::Warp, core),
-            Stmt::If { then, otherwise, .. } => {
-                *then = materialize_block(prog, std::mem::take(then), scope, core);
-                *otherwise = materialize_block(prog, std::mem::take(otherwise), scope, core);
-            }
-            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => {}
         }
         out.push(stmt);
     }

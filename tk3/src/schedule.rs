@@ -75,20 +75,15 @@ impl Expander<'_> {
     fn stmt(&mut self, stmt: Stmt) -> Vec<Stmt> {
         match stmt {
             Stmt::Pipeline(p) => self.pipeline(p),
-            Stmt::Loop(mut l) => {
-                l.body = self.block(l.body);
-                vec![Stmt::Loop(l)]
-            }
-            Stmt::Warps { body } => {
-                let outer = std::mem::replace(&mut self.scope, Scope::Warp);
-                let body = self.block(body);
+            mut nested => {
+                let scope = if matches!(nested, Stmt::Warps { .. }) { Scope::Warp } else { self.scope };
+                let outer = std::mem::replace(&mut self.scope, scope);
+                for b in nested.blocks_mut() {
+                    *b = self.block(std::mem::take(b));
+                }
                 self.scope = outer;
-                vec![Stmt::Warps { body }]
+                vec![nested]
             }
-            Stmt::If { pred, then, otherwise } => {
-                vec![Stmt::If { pred, then: self.block(then), otherwise: self.block(otherwise) }]
-            }
-            other => vec![other],
         }
     }
 

@@ -91,41 +91,24 @@ fn alloc(prog: &Program, v: ValId) -> Option<SmemId> {
     }
 }
 
-/// The shared allocations `block` copies into.
+/// The shared allocations `block` copies into; of a pipeline, its produce
+/// bodies'.
 fn written(prog: &Program, block: &Block, into: &mut HashSet<SmemId>) {
     for stmt in &block.0 {
         match stmt {
             Stmt::Copy { dst, .. } => into.extend(alloc(prog, *dst)),
-            Stmt::Loop(l) => written(prog, &l.body, into),
-            Stmt::If { then, otherwise, .. } => {
-                written(prog, then, into);
-                written(prog, otherwise, into);
-            }
-            Stmt::Warps { body } => written(prog, body, into),
             Stmt::Pipeline(p) => written(prog, &p.produce.body, into),
-            Stmt::Let { .. } | Stmt::Sync(_) => {}
+            nested => nested.blocks().for_each(|b| written(prog, b, into)),
         }
     }
 }
 
 /// The shared allocations `block` copies out of.
 fn read(prog: &Program, block: &Block, into: &mut HashSet<SmemId>) {
-    for stmt in &block.0 {
-        match stmt {
-            Stmt::Copy { src, .. } => into.extend(alloc(prog, *src)),
-            Stmt::Loop(l) => read(prog, &l.body, into),
-            Stmt::If { then, otherwise, .. } => {
-                read(prog, then, into);
-                read(prog, otherwise, into);
-            }
-            Stmt::Warps { body } => read(prog, body, into),
-            Stmt::Pipeline(p) => {
-                read(prog, &p.produce.body, into);
-                read(prog, &p.consume.body, into);
-            }
-            Stmt::Let { .. } | Stmt::Sync(_) => {}
-        }
-    }
+    into.extend(block.walk().filter_map(|(_, s)| match s {
+        Stmt::Copy { src, .. } => alloc(prog, *src),
+        _ => None,
+    }));
 }
 
 /// Rewrite `block` under the incoming `state`, its barriers over `scope`,

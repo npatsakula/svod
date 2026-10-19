@@ -498,29 +498,50 @@ impl Program {
     }
     /// Every statement, outermost first, with its nesting depth.
     pub fn walk(&self) -> impl Iterator<Item = (usize, &Stmt)> {
-        let mut out = Vec::new();
-        self.body.walk(0, &mut out);
-        out.into_iter()
+        self.body.walk()
     }
 }
 
 impl Block {
-    fn walk<'a>(&'a self, depth: usize, out: &mut Vec<(usize, &'a Stmt)>) {
-        for stmt in &self.0 {
-            out.push((depth, stmt));
-            match stmt {
-                Stmt::Loop(l) => l.body.walk(depth + 1, out),
-                Stmt::Pipeline(p) => {
-                    p.produce.body.walk(depth + 1, out);
-                    p.consume.body.walk(depth + 1, out);
-                }
-                Stmt::Warps { body } => body.walk(depth + 1, out),
-                Stmt::If { then, otherwise, .. } => {
-                    then.walk(depth + 1, out);
-                    otherwise.walk(depth + 1, out);
-                }
-                Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => {}
+    /// Every statement, each before the ones it nests, with its depth below
+    /// this block.
+    pub fn walk(&self) -> impl Iterator<Item = (usize, &Stmt)> {
+        fn visit<'a>(block: &'a Block, depth: usize, out: &mut Vec<(usize, &'a Stmt)>) {
+            for stmt in &block.0 {
+                out.push((depth, stmt));
+                stmt.blocks().for_each(|b| visit(b, depth + 1, out));
             }
         }
+        let mut out = Vec::new();
+        visit(self, 0, &mut out);
+        out.into_iter()
+    }
+}
+
+impl Stmt {
+    /// The blocks the statement nests, in program order: a loop's or the
+    /// warps' body, a pipeline's produce then consume, a branch's then and
+    /// otherwise.
+    pub fn blocks(&self) -> impl Iterator<Item = &Block> {
+        let (first, second) = match self {
+            Stmt::Loop(l) => (Some(&l.body), None),
+            Stmt::Pipeline(p) => (Some(&p.produce.body), Some(&p.consume.body)),
+            Stmt::Warps { body } => (Some(body), None),
+            Stmt::If { then, otherwise, .. } => (Some(then), Some(otherwise)),
+            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => (None, None),
+        };
+        first.into_iter().chain(second)
+    }
+
+    /// [`Self::blocks`], mutably.
+    pub fn blocks_mut(&mut self) -> impl Iterator<Item = &mut Block> {
+        let (first, second) = match self {
+            Stmt::Loop(l) => (Some(&mut l.body), None),
+            Stmt::Pipeline(p) => (Some(&mut p.produce.body), Some(&mut p.consume.body)),
+            Stmt::Warps { body } => (Some(body), None),
+            Stmt::If { then, otherwise, .. } => (Some(then), Some(otherwise)),
+            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => (None, None),
+        };
+        first.into_iter().chain(second)
     }
 }
