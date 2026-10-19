@@ -23,11 +23,11 @@ use std::sync::Arc;
 
 use svod_dtype::GpuArch;
 
-use crate::atoms::{Device, Fill, GroupMmaAtom, Target};
-use crate::ir::{Axis, Orient, Shape};
+use crate::atoms::{Core, Device, Fill, GroupMmaAtom, Target};
+use crate::ir::{Axis, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
-use crate::kernels::gemm::{Core, GemmCfg};
+use crate::kernels::gemm::GemmCfg;
 use crate::kernels::rows::NormCfg;
 use crate::layouts::{Issue, WarpGrid, chunked};
 use crate::tune::Compiled;
@@ -50,11 +50,7 @@ impl GemmCfg {
     /// config's core and warp grid, as the lowering lays them.
     fn issue(&self, target: &Target, bk: usize) -> Option<Issue> {
         let ([bm, bn, _], [wr, wc]) = (self.tile, self.warps);
-        let grid = WarpGrid { rows: wr, cols: wc };
-        match self.core {
-            Core::Warp => target.mma.first()?.issue(Orient::Direct, grid, bm, bn, bk).ok(),
-            Core::Group => target.group_mma.first()?.issue(grid, bm, bn, bk).ok(),
-        }
+        target.issue(self.core, WarpGrid { rows: wr, cols: wc }, bm, bn, bk)
     }
 
     /// Whether the warp grid tiles the output with `target`'s matrix core
@@ -874,19 +870,10 @@ impl FaCfg {
     /// their fragments.
     pub fn registers(&self, target: &Target, d: usize, bias: bool) -> Option<u32> {
         let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
-        let (qk, pv) = match self.core {
-            Core::Warp => {
-                let atom = target.mma.first()?;
-                (
-                    atom.issue(Orient::Direct, grid, self.bq, self.bkv, d).ok()?,
-                    atom.issue(Orient::Direct, grid, self.bq, d, self.bkv).ok()?,
-                )
-            }
-            Core::Group => {
-                let atom = target.group_mma.first()?;
-                (atom.issue(grid, self.bq, self.bkv, d).ok()?, atom.issue(grid, self.bq, d, self.bkv).ok()?)
-            }
-        };
+        let (qk, pv) = (
+            target.issue(self.core, grid, self.bq, self.bkv, d)?,
+            target.issue(self.core, grid, self.bq, d, self.bkv)?,
+        );
         let half = |regs: u32| regs.div_ceil(2);
         let fill = if target.fill == Fill::CpAsync {
             0
@@ -908,7 +895,7 @@ impl FaCfg {
     /// (CDNA's AGPRs) may hold beside the rest.
     pub fn accumulators(&self, target: &Target, d: usize) -> Option<u32> {
         let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
-        Some(target.mma.first()?.issue(Orient::Direct, grid, self.bq, d, self.bkv).ok()?.c.regs())
+        Some(target.issue(Core::Warp, grid, self.bq, d, self.bkv)?.c.regs())
     }
 }
 

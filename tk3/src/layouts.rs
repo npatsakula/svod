@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use snafu::{OptionExt, Snafu, ensure};
 
-use crate::atoms::{Costs, Device, GroupMmaAtom, MmaAtom, Target};
+use crate::atoms::{Core, Costs, Device, GroupMmaAtom, MmaAtom, Target};
 use crate::ir::*;
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
 use crate::layout::{self as frag, Layout};
@@ -545,8 +545,8 @@ pub(crate) struct Infer<'a> {
     prog: &'a Program,
     target: &'a Target,
     grid: WarpGrid,
-    /// Products issue on the warpgroup atom.
-    group: bool,
+    /// The matrix instruction products issue on.
+    core: Core,
     lay: Vec<Option<TileLayout>>,
     changed: bool,
     /// Operands whose current layout differs from the one a consumer needs.
@@ -574,9 +574,9 @@ pub struct Laid {
 /// product wants, which on a target whose accumulator is its operand's
 /// transpose is free (what tk1's `acc_reusable_as_input` flag used to say).
 /// Products the author oriented stay as pinned.
-pub fn infer(mut prog: Program, device: &Device, grid: WarpGrid, group: bool) -> Result<Laid> {
-    orient_products(&mut prog, device, grid, group)?;
-    let mut it = Infer::new(&prog, &device.target, grid, group);
+pub fn infer(mut prog: Program, device: &Device, grid: WarpGrid, core: Core) -> Result<Laid> {
+    orient_products(&mut prog, device, grid, core)?;
+    let mut it = Infer::new(&prog, &device.target, grid, core);
     it.solve()?;
     let (mut layouts, conflicts) = (it.lay, it.conflicts);
     if !conflicts.is_empty() {
@@ -613,7 +613,7 @@ fn scatters(prog: &Program, lay: &TileLayout, from: &Value, lanes: u32) -> bool 
 
 /// Write an orientation into every product of `prog`: the pinned ones stay,
 /// the rest take the assignment of least relayout and scatter cost.
-fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, group: bool) -> Result<()> {
+fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Core) -> Result<()> {
     let Device { target, costs } = device;
     // A product listed twice (a peeled loop trip) is one decision; a
     // warpgroup product is never square, so it issues one way.
@@ -621,7 +621,10 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, group: b
     for (_, s) in prog.walk() {
         if let Stmt::Let { dst, op: TileOp::Mma { a, orient: None, .. } } = s {
             let (va, vd) = (prog.value(*a), prog.value(*dst));
-            if !group && target.mma(va.dtype, vd.dtype).is_some_and(MmaAtom::swappable) && !free.contains(dst) {
+            if core == Core::Warp
+                && target.mma(va.dtype, vd.dtype).is_some_and(MmaAtom::swappable)
+                && !free.contains(dst)
+            {
                 free.push(*dst);
             }
         }
@@ -629,7 +632,7 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, group: b
     let cost_of = |choice: &HashMap<ValId, Orient>| -> Result<f64> {
         let mut trial = prog.clone();
         set_orient(&mut trial.body, choice);
-        let mut it = Infer::new(&trial, target, grid, group);
+        let mut it = Infer::new(&trial, target, grid, core);
         it.solve()?;
         let relayouts: f64 = it
             .conflicts
@@ -708,12 +711,12 @@ fn set_orient(block: &mut Block, choice: &HashMap<ValId, Orient>) {
 }
 
 impl<'a> Infer<'a> {
-    pub(crate) fn new(prog: &'a Program, target: &'a Target, grid: WarpGrid, group: bool) -> Self {
+    pub(crate) fn new(prog: &'a Program, target: &'a Target, grid: WarpGrid, core: Core) -> Self {
         let mut lay = vec![None; prog.values.len()];
         for (v, l) in &prog.pins {
             lay[v.index()] = Some(l.clone());
         }
-        Infer { prog, target, grid, group, lay, changed: true, conflicts: HashMap::new(), pos: 0 }
+        Infer { prog, target, grid, core, lay, changed: true, conflicts: HashMap::new(), pos: 0 }
     }
 
     /// Run the propagation to its fixed point, seeding what nothing constrains.
@@ -909,7 +912,7 @@ impl<'a> Infer<'a> {
                 (Some(l), None) => self.set(dst, l.transposed()),
                 (None, None) => {}
             },
-            TileOp::Mma { acc, a, b, a_t, .. } if self.group => {
+            TileOp::Mma { acc, a, b, a_t, .. } if self.core == Core::Group => {
                 let (va, vc) = (self.prog.value(a).clone(), self.prog.value(dst).clone());
                 let atom = self
                     .target

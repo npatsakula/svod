@@ -5,7 +5,7 @@
 use std::fmt;
 
 use super::{Act, Batch, batch_offset, bound, konst, load_f32};
-use crate::atoms::Device;
+use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
 use crate::layouts::WarpGrid;
@@ -72,17 +72,6 @@ impl fmt::Debug for Scale {
     }
 }
 
-/// Which matrix instruction a config's products issue on.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Core {
-    /// The warp-level atom ([`crate::atoms::MmaAtom`]): operands in registers.
-    #[default]
-    Warp,
-    /// The warpgroup atom ([`crate::atoms::GroupMmaAtom`]): `warps[0]` is
-    /// a multiple of four, and the ring's tiles are read through descriptors.
-    Group,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GemmCfg {
     /// `[bm, bn, bk]`.
@@ -130,11 +119,9 @@ impl GemmCfg {
             let schedule = Schedule::PingPong { crew: self.warps[1] };
             return Lowering { schedule, ..Lowering::uniform(device, false, grid) };
         }
-        let group = self.core == Core::Group;
-        let mut lowering = Lowering { group, ..Lowering::uniform(device, self.unroll, grid) };
-        let Schedule::Uniform { async_products, .. } = &mut lowering.schedule else { unreachable!("uniform") };
-        *async_products = group && self.stages >= 3;
-        lowering
+        let async_products = self.core == Core::Group && self.stages >= 3;
+        let schedule = Schedule::Uniform { fill: device.target.fill, unroll: self.unroll, async_products };
+        Lowering { core: self.core, schedule, ..Lowering::uniform(device, self.unroll, grid) }
     }
 
     /// Static shared memory of the operand ring, in bytes of a 16-bit type.

@@ -3,10 +3,9 @@
 
 use std::fmt;
 
-use super::gemm::Core;
 use super::rows::NormCfg;
 use super::{Batch, batch_offset, bound, load_f32};
-use crate::atoms::{Device, Target};
+use crate::atoms::{Core, Device, Target};
 use crate::build::*;
 use crate::ir::*;
 use crate::layouts::WarpGrid;
@@ -134,7 +133,7 @@ impl FaCfg {
 
     pub fn lowering(&self, device: &Device) -> Lowering {
         let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
-        Lowering { group: self.core == Core::Group, ..Lowering::uniform(device, self.unroll, grid) }
+        Lowering { core: self.core, ..Lowering::uniform(device, self.unroll, grid) }
     }
 
     /// Whether a bias rides the ring: under a bias, unless the forms read it

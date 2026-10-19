@@ -7,7 +7,7 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::declared;
-use crate::atoms::Fill;
+use crate::atoms::{Core, Fill};
 use crate::build::*;
 use crate::interp::run;
 use crate::ir::*;
@@ -26,7 +26,7 @@ fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, warps: u32, tol
     params.push(vec![0.0; out_elems]);
     let want = run(&prog, params, &[]).unwrap();
     let lowering = Lowering {
-        group: false,
+        core: Core::Warp,
         device: declared(target),
         schedule: Schedule::Uniform { fill: Fill::CpAsync, unroll: false, async_products: false },
         grid: WarpGrid { rows: warps, cols: 1 },
@@ -150,7 +150,7 @@ fn mma_peak_probe() {
     k.store(c_view, acc);
     let prog = k.finish();
     let lowering = Lowering {
-        group: false,
+        core: Core::Warp,
         device: declared(target),
         schedule: Schedule::Uniform { fill: Fill::CpAsync, unroll: false, async_products: false },
         grid: WarpGrid { rows: 2, cols: 2 },

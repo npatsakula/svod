@@ -7,12 +7,12 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::declared;
-use crate::atoms::{Device, Fill};
+use crate::atoms::{Core, Device, Fill};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::launch::graph_launch;
 use crate::ops::config::Planner;
 

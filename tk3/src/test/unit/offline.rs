@@ -7,8 +7,7 @@ use std::path::PathBuf;
 use svod_dtype::DType;
 use test_case::test_case;
 
-use crate::atoms::{CARDS, Target};
-use crate::kernels::gemm::Core;
+use crate::atoms::{CARDS, Core, Target};
 use crate::ops::config::{self, Planner};
 use crate::ops::shape::{self, Extent, Plan};
 use crate::probe::{self, Measured};

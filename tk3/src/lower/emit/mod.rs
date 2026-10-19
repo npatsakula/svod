@@ -14,7 +14,7 @@ use svod_ir::uop::cached_property::CachedProperty;
 use svod_ir::uop::properties::SoundVminVmaxProperty;
 use svod_ir::{AxisId, AxisType, KernelInfo, Op, UOp};
 
-use crate::atoms::Fill;
+use crate::atoms::{Core, Fill};
 use crate::index::*;
 use crate::ir::*;
 use crate::layouts::{Laid, TileLayout};
@@ -671,7 +671,7 @@ impl<'a> Emit<'a> {
             Sync::CommitAsync | Sync::WaitAsync { .. } => return Ok(()),
             Sync::Fence if target.sync.commit_fence => amdgpu::sched_barrier(&self.last),
             Sync::Fence => return Ok(()),
-            Sync::WaitProducts { pending } if self.low.group => wgmma::wait(pending),
+            Sync::WaitProducts { pending } if self.low.core == Core::Group => wgmma::wait(pending),
             Sync::WaitProducts { .. } => return Ok(()),
             Sync::Prio { level } if target.sync.priority => amdgpu::setprio(level),
             Sync::Prio { .. } => return Ok(()),

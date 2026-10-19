@@ -11,8 +11,7 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::declared;
-use crate::atoms::Fill;
-use crate::atoms::{Target, sm86};
+use crate::atoms::{Core, Fill, Target, sm86};
 use crate::build::*;
 use crate::interp::run;
 use crate::ir::*;
@@ -171,7 +170,7 @@ fn gathered_gemm_matches_the_reference_in_the_interpreter() {
 
 fn lowering(target: Target, fill: Fill, warps: [u32; 2]) -> Lowering {
     Lowering {
-        group: false,
+        core: Core::Warp,
         device: declared(target),
         schedule: Schedule::Uniform { fill, unroll: true, async_products: false },
         grid: WarpGrid { rows: warps[0], cols: warps[1] },

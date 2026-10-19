@@ -8,11 +8,11 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::{assert_rel_close, conv_first_eight, declared, planner};
-use crate::atoms::{Target, sm86};
+use crate::atoms::{Core, Target, sm86};
 use crate::build::F16;
 use crate::interp::{round_to, run};
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec, conv};
-use crate::kernels::gemm::{Core, Epilogue, GemmCfg};
+use crate::kernels::gemm::{Epilogue, GemmCfg};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch;
 use crate::ops::config::Planner;

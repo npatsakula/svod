@@ -7,11 +7,11 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::{assert_rel_close, declared};
-use crate::atoms::{Target, sm86};
+use crate::atoms::{Core, Target, sm86};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::*;
-use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, Scale, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch_all;
@@ -139,7 +139,8 @@ fn epilogue_interpreter_matches_the_reference(which: usize) {
 fn bias_vector_takes_the_accumulators_column_layout() {
     let epi = Epilogue { bias: true, ..Epilogue::default() };
     let prog = gemm_nt_epilogue(128, 128, 64, [128, 128, 32], 2, [2, 4], epi);
-    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), WarpGrid { rows: 2, cols: 4 }, false).unwrap();
+    let Laid { prog, layouts: lay } =
+        infer(prog, &declared(sm86()), WarpGrid { rows: 2, cols: 4 }, Core::Warp).unwrap();
     let add = prog
         .walk()
         .find_map(|(_, s)| match s {

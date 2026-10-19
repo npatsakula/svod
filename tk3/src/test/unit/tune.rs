@@ -13,10 +13,10 @@ use svod_dtype::ScalarDType;
 use svod_runtime::KernelResources;
 use test_case::test_case;
 
-use crate::atoms::{Device, sm86};
+use crate::atoms::{Core, Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::tune::{self, Bench, Entry, FORMAT, Kind, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.

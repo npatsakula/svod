@@ -11,7 +11,7 @@ use snafu::{OptionExt, Snafu};
 use svod_dtype::default_device::default_device;
 use svod_dtype::{GpuArch, ScalarDType};
 
-use crate::atoms::{Costs, Device, Target};
+use crate::atoms::{Core, Costs, Device, Target};
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{Dim, Layout};
@@ -662,7 +662,7 @@ impl<'a> Probes<'a> {
         let iters = 1024;
         let units = (self.blocks * iters * bm * bn * bk / 4096) as f64;
         let mut lowering = self.lowering(ROWS, false);
-        lowering.group = true;
+        lowering.core = Core::Group;
         let mut probe = self.make(op, ScalarDType::BFloat16, units, true, lowering, |on| {
             let mut k = kernel(op, self.blocks, WARPS);
             let (sa, sb) = (Shape::new(bm, bk), Shape::new(bn, bk));

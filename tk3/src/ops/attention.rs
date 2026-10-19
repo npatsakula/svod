@@ -11,13 +11,13 @@ use super::{
     DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
     output, typed,
 };
+use crate::atoms::Core;
 use crate::kernels;
 use crate::kernels::Batch;
 pub use crate::kernels::attention::Chunk;
 use crate::kernels::attention::{
     AttnMask, AttnSpec, Bias, CombineSpec, FaCfg, Forms, attention as fa, combine, key_mask_stride,
 };
-use crate::kernels::gemm::Core;
 use crate::kernels::rows::NormCfg;
 use crate::launch;
 

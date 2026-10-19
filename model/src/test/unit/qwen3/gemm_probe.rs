@@ -7,10 +7,10 @@
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DType, DeviceSpec};
 use svod_tensor::Tensor;
-use svod_tk3::atoms::{Device, Target};
+use svod_tk3::atoms::{Core, Device, Target};
 use svod_tk3::build::BF16;
 use svod_tk3::kernels::Batch;
-use svod_tk3::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk3::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use svod_tk3::launch::graph_launch;
 use svod_tk3::ops::{self, Act, Linear};
 

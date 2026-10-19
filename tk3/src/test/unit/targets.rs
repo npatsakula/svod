@@ -15,8 +15,7 @@ use svod_ir::{Op, UOp, ops};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use crate::atoms::Fill;
-use crate::atoms::Target;
+use crate::atoms::{Core, Fill, Target};
 use crate::build::{BF16, F16};
 use crate::interp;
 use crate::ir::{Axis, ParamKind, Program};
@@ -24,7 +23,7 @@ use crate::kernels::Act;
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, Cache, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
-use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, Scale, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::launch::graph_launch_all;
@@ -472,7 +471,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         }
 
         let mut once = prog.clone();
-        crate::lower::materialize_operands(&mut once, lowering.group);
+        crate::lower::materialize_operands(&mut once, lowering.core);
         insert_barriers(&mut once).unwrap();
         let mut twice = once.clone();
         insert_barriers(&mut twice).unwrap();
@@ -975,7 +974,7 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
     let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
     k.store(yv, sum);
     let lowering = Lowering {
-        group: false,
+        core: Core::Warp,
         schedule: crate::schedule::Schedule::Uniform { fill: target.fill, unroll: false, async_products: false },
         device: declared(target),
         grid: crate::layouts::WarpGrid { rows: 1, cols: 1 },

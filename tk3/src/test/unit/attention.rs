@@ -6,7 +6,7 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::declared;
-use crate::atoms::Target;
+use crate::atoms::{Core, Target};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
@@ -14,7 +14,6 @@ use crate::kernels::Batch;
 use crate::kernels::attention::{
     AttnMask, AttnSpec, Bias, Cache, Chunk, CombineSpec, FaCfg, Forms, WARP_ROWS, attention, combine, key_mask_stride,
 };
-use crate::kernels::gemm::Core;
 use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch;
 use crate::launch::graph_launch_all;

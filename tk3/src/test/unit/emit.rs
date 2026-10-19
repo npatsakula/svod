@@ -9,7 +9,7 @@ use svod_ir::uop::eval::{eval_binary_op, eval_unary_op};
 use svod_ir::{ConstValue, Op, UOp, ops};
 use test_case::test_case;
 
-use crate::atoms::{Costs, Device};
+use crate::atoms::{Core, Costs, Device};
 use crate::build::*;
 use crate::ir::*;
 use crate::layouts::WarpGrid;
@@ -253,7 +253,6 @@ fn a_register_transpose_lowers(tile: Shape, warps: u32, pinned: bool) {
 fn the_segment_bounds_are_read_ahead_of_the_key_loop(group: bool) {
     use crate::kernels::Batch;
     use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
-    use crate::kernels::gemm::Core;
 
     let (target, cfg) = if group {
         (super::targets::hopper(), FaCfg { core: Core::Group, ..FaCfg::new(64, 64, 2) })

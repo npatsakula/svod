@@ -5,7 +5,7 @@ use test_case::test_case;
 use svod_dtype::{AmdArch, GpuArch};
 
 use super::{costs, declared, lane_moves_dear};
-use crate::atoms::{Costs, Device, Target, sm86};
+use crate::atoms::{Core, Costs, Device, Target, sm86};
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{self as frag, Dim};
@@ -50,15 +50,16 @@ fn inference_out_of_passes_is_an_error(passes: usize) -> crate::layouts::Result<
     let mut prog = super::gemm_nt(256, 256, 256, 128, 128, 32, 3);
     prog.warps = 8;
     let (target, grid) = (sm86(), WarpGrid { rows: 2, cols: 4 });
-    let Laid { prog, .. } = infer(prog, &declared(target.clone()), grid, false).unwrap();
-    crate::layouts::Infer::new(&prog, &target, grid, false).solve_within(passes)
+    let Laid { prog, .. } = infer(prog, &declared(target.clone()), grid, Core::Warp).unwrap();
+    crate::layouts::Infer::new(&prog, &target, grid, Core::Warp).solve_within(passes)
 }
 
 #[test]
 fn gemm_accumulator_gets_the_core_layout_over_the_warp_grid() {
     let mut prog = super::gemm_nt(256, 256, 256, 128, 128, 32, 3);
     prog.warps = 8;
-    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), WarpGrid { rows: 2, cols: 4 }, false).unwrap();
+    let Laid { prog, layouts: lay } =
+        infer(prog, &declared(sm86()), WarpGrid { rows: 2, cols: 4 }, Core::Warp).unwrap();
     let Stmt::Pipeline(p) = &prog.body.0[1] else { panic!("pipeline") };
     let acc = lay[p.carried[0].phi.index()].as_ref().unwrap();
     assert_eq!(acc.frag, frag::mma_sync_c());
@@ -103,7 +104,8 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     k.store(o_g, o);
     let mut prog = k.finish();
     prog.warps = 4;
-    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), WarpGrid { rows: 4, cols: 1 }, false).unwrap();
+    let Laid { prog, layouts: lay } =
+        infer(prog, &declared(sm86()), WarpGrid { rows: 4, cols: 1 }, Core::Warp).unwrap();
     let relayouts: Vec<_> = prog
         .walk()
         .filter_map(|(_, s)| match s {
@@ -226,7 +228,8 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
     let out = k.param::<F32>("o", ParamKind::Out, 256);
     let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
     k.store(o, both);
-    let Laid { prog, layouts } = infer(k.finish(), &declared(sm86()), WarpGrid { rows: 1, cols: 1 }, false).unwrap();
+    let Laid { prog, layouts } =
+        infer(k.finish(), &declared(sm86()), WarpGrid { rows: 1, cols: 1 }, Core::Warp).unwrap();
     let lay = |v: &ValId| layouts[v.index()].clone().unwrap();
     let mut checked = 0;
     for (_, s) in prog.walk() {
@@ -280,7 +283,7 @@ fn attention_step(bias: bool) -> Program {
 fn gfx1151_attention(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLayout, TileLayout)>) {
     let target = Target::for_arch(GpuArch::Amd(AmdArch::Gfx1151));
     let Laid { prog, layouts: lay } =
-        infer(prog, &Device { target, costs: *costs }, WarpGrid { rows: 4, cols: 1 }, false).unwrap();
+        infer(prog, &Device { target, costs: *costs }, WarpGrid { rows: 4, cols: 1 }, Core::Warp).unwrap();
     let orients = prog
         .walk()
         .filter_map(|(_, s)| match s {

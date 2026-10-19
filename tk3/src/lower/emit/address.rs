@@ -242,7 +242,7 @@ impl Emit<'_> {
     /// reaches every row; `None` keeps the row whole.
     pub(super) fn panel_cols(&self, cols: usize, bytes: usize) -> Option<usize> {
         let row = cols * bytes;
-        (self.low.group && self.low.swizzle && row > wgmma::SPAN && row.is_multiple_of(wgmma::SPAN))
+        (self.low.core == Core::Group && self.low.swizzle && row > wgmma::SPAN && row.is_multiple_of(wgmma::SPAN))
             .then_some(wgmma::SPAN / bytes)
     }
 

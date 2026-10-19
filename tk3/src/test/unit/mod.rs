@@ -26,13 +26,13 @@ use svod_dtype::default_device::default_device;
 use svod_dtype::{DeviceSpec, ScalarDType};
 use test_case::test_case;
 
-use crate::atoms::{Costs, Device, Fill, Target};
+use crate::atoms::{Core, Costs, Device, Fill, Target};
 use crate::build::BF16;
 use crate::interp::round_to;
 use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
-use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::ops::config::{Planner, has_kernels};
 
 /// The default device's target when tk3 has kernels for it, of any vendor:

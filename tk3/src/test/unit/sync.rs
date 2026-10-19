@@ -3,11 +3,12 @@
 
 use test_case::test_case;
 
+use crate::atoms::Core;
 use crate::build::*;
 use crate::ir::*;
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Cache, FaCfg, attention};
-use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::lower::sync::insert_barriers;
 
 /// The statements of `block` by kind.

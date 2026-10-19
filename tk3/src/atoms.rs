@@ -6,7 +6,20 @@ use svod_dtype::{AmdArch, CudaArch, DType, GpuArch, ScalarDType};
 use svod_ir::{AxisId, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 use svod_schedule::optimizer::{Renderer, TensorCore};
 
+use crate::ir::Orient;
 use crate::layout::{self as frag, Dim, Layout};
+use crate::layouts::{Issue, WarpGrid};
+
+/// Which matrix instruction a config's products issue on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Core {
+    /// The warp-level atom ([`MmaAtom`]): operands in registers.
+    #[default]
+    Warp,
+    /// The warpgroup atom ([`GroupMmaAtom`]): a grid's rows are warpgroups
+    /// of four warps, and shared operands are read through descriptors.
+    Group,
+}
 
 /// One matrix-core instruction: `C[m, n] += A[m, k] · B[k, n]`, with the
 /// register/lane layout of every operand over one wave.
@@ -462,6 +475,16 @@ impl Target {
     /// The matrix core for `dtype_in → dtype_out`, if the target has one.
     pub fn mma(&self, dtype_in: ScalarDType, dtype_out: ScalarDType) -> Option<&MmaAtom> {
         self.mma.iter().find(|a| a.dtype_in == dtype_in && a.dtype_out == dtype_out)
+    }
+
+    /// The `[m, n] += [m, k] · [k, n]` product over `grid` on `core`'s first
+    /// atom as the planner prices it, issued direct; `None` where the target
+    /// lacks the core or the product does not tile its atoms.
+    pub fn issue(&self, core: Core, grid: WarpGrid, m: usize, n: usize, k: usize) -> Option<Issue> {
+        match core {
+            Core::Warp => self.mma.first()?.issue(Orient::Direct, grid, m, n, k).ok(),
+            Core::Group => self.group_mma.first()?.issue(grid, m, n, k).ok(),
+        }
     }
 
     /// The warpgroup instruction for `dtype_in → dtype_out`, if the target has one.

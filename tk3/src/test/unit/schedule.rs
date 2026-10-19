@@ -1,7 +1,7 @@
 use svod_dtype::ScalarDType;
 use test_case::test_case;
 
-use crate::atoms::Fill;
+use crate::atoms::{Core, Fill};
 use crate::interp::{round_to, run};
 use crate::ir::*;
 use crate::schedule::{Schedule, expand};
@@ -105,7 +105,7 @@ fn ping_pong_expansion_preserves_the_result(bk: usize, slices: usize) {
     let mut prog = super::gemm_nt_crews(m, n, k, [64, 64, bk]);
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     // As the lowering: a product's shared operands become explicit reads first.
-    crate::lower::materialize_operands(&mut prog, false);
+    crate::lower::materialize_operands(&mut prog, Core::Warp);
     expand(&mut prog, Schedule::PingPong { crew: 4 });
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
@@ -126,7 +126,7 @@ fn ping_pong_expansion_preserves_the_result(bk: usize, slices: usize) {
 #[test]
 fn ping_pong_cuts_a_trip_into_clusters() {
     let mut prog = super::gemm_nt_crews(64, 64, 256, [64, 64, 64]);
-    crate::lower::materialize_operands(&mut prog, false);
+    crate::lower::materialize_operands(&mut prog, Core::Warp);
     expand(&mut prog, Schedule::PingPong { crew: 4 });
     let kind = |s: &Stmt| match s {
         Stmt::Copy { dst, src, mode: CopyMode::Staged, .. } => match (&prog.value(*src).place, prog.value(*dst).tier())

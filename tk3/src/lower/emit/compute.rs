@@ -111,7 +111,7 @@ impl Emit<'_> {
                     self.reg_store(dst, j, vec![UOp::try_mulacc(x, y, z).expect("mul-add")]);
                 }
             }
-            TileOp::Mma { .. } if self.low.group => self.group_mma(dst, op)?,
+            TileOp::Mma { .. } if self.low.core == Core::Group => self.group_mma(dst, op)?,
             TileOp::Mma { .. } => self.mma(dst, op)?,
             TileOp::Reduce { src, axis, f } => self.reduce(dst, src, axis, f)?,
             TileOp::Transpose { src } => self.transpose(dst, src)?,
