@@ -115,8 +115,39 @@ const HIDING_WAVES: f64 = 16.0;
 /// A rolled register-staged ring recomputes its slot offsets every trip
 /// where an unrolled one has immediates.
 const ROLLED: f64 = 1.1;
+/// What a trip costs besides its traffic, as bytes of shared-memory
+/// traffic: `trip` for the trip itself (the barrier, the ring's bubble) and
+/// `wave_trip` per wave and per 16-bit element of reduction depth (each
+/// wave's barrier arrival and fragment issue); `step` per matrix-core step
+/// (a 16×16×16 product), charging a padded tile for the work it wastes; and
+/// `hiding`, the waves per SM past which more hide no more of the latency
+/// between a block's trips.
+struct Costs {
+    trip: usize,
+    wave_trip: usize,
+    step: usize,
+    hiding: f64,
+}
+
+impl Costs {
+    /// The constants of `target`'s family. The `cp.async` path's are fitted
+    /// on sm_86 against full-lattice sweeps of YOLO's convolution bodies and
+    /// wide-M GEMMs (the measured best of every shortlist within 7% of the
+    /// lattice's best, 15% with a fixed trip cost); the register-staged
+    /// path's are the gfx1201 fit: about 256 SM cycles per trip and eight
+    /// per step at 128 B/cycle.
+    fn of(target: &Target) -> Self {
+        if target.cp_async {
+            Self { trip: 0, wave_trip: 128, step: 2048, hiding: 16.0 }
+        } else {
+            Self { trip: TRIP, wave_trip: 0, step: STEP, hiding: HIDING_WAVES }
+        }
+    }
+}
+
 /// What a trip costs besides its traffic (the barrier, the ring's bubble),
-/// as bytes of shared-memory traffic: about 256 SM cycles.
+/// as bytes of shared-memory traffic: about 256 SM cycles. Attention keeps
+/// these constants on every target.
 const TRIP: usize = 32 << 10;
 /// What one matrix-core step (a 16×16×16 product) costs, in the same bytes:
 /// its eight SM cycles at the 128 B/cycle of shared memory. It charges a
@@ -182,10 +213,13 @@ impl Problem {
         let actual = resident.min(blocks.div_ceil(sms));
         let rounds = blocks.div_ceil(sms * actual);
         let steps = bm * bn * self.halves * bk / 4096;
-        let traffic =
-            (waves * (bm / wr + bn * self.halves / wc) + bm + bn * self.halves) * bk * 2 + TRIP + steps * STEP;
+        let costs = Costs::of(target);
+        let traffic = (waves * (bm / wr + bn * self.halves / wc) + bm + bn * self.halves) * bk * 2
+            + costs.trip
+            + waves * bk * costs.wave_trip
+            + steps * costs.step;
         let trips = self.k / bk;
-        let hiding = 1.0 + HIDING_WAVES / (actual * waves * (cfg.stages - 1)) as f64;
+        let hiding = 1.0 + costs.hiding / (actual * waves * (cfg.stages - 1)) as f64;
         let rolled = if cfg.unroll || target.cp_async { 1.0 } else { ROLLED };
         Some(((rounds * actual * trips * traffic) as f64 * hiding * rolled, regs))
     }
@@ -278,10 +312,14 @@ impl Planner {
             return vec![];
         }
         let p = Problem { batches, m, n, k, halves: 1 };
+        // A one-depth step gathers a whole trip per product: on the cp.async
+        // path it runs behind the graph's conv (sm_86, 48→48 at 160²: 84 µs
+        // against 57), so the conv takes the graph there.
+        let depth = if self.target.cp_async { 2 * self.target.mma.first().map_or(16, |a| a.k as usize) } else { 0 };
         let eligible: Vec<GemmCfg> = self
             .ranked(p)
             .iter()
-            .filter(|c| cin.is_multiple_of(c.tile[2]) && p.padding(c) <= 1.0 / 8.0)
+            .filter(|c| cin.is_multiple_of(c.tile[2]) && c.tile[2] >= depth && p.padding(c) <= 1.0 / 8.0)
             .copied()
             .collect();
         let Some(&base) = eligible.first() else { return vec![] };
