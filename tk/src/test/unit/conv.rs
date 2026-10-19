@@ -472,7 +472,7 @@ fn device_candidates(planner: &Planner, g: &ConvGeom, epilogue: Epilogue) -> (Ve
     let shape = [g.cin, g.cout, g.h, g.w, g.stride[0]];
     let ranked = planner.conv_ranked(1, ho * wo, g);
     let expand = |admitted: &[ConvCfg]| planner.conv_splits(1, ho * wo, g, admitted);
-    super::tuned_on_device(planner, ("conv2d", DType::Float16, &shape), &ranked, expand, build)
+    super::tuned_on_device(planner, ("conv2d", DType::Float16, &shape, crate::ops::DEVICE_TEST), &ranked, expand, build)
 }
 
 /// Device time of one run of `plan` in ns, every kernel's summed; `None`

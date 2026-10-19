@@ -420,8 +420,13 @@ fn device_nearest(
     let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups, cfg };
     let build = |cfg: NearestCfg| vec![(nearest::<BF16>(&spec(cfg)), cfg.lowering(&planner.device))];
     let shape = [n, n, d];
-    let (admitted, pick) =
-        super::tuned_on_device(planner, ("nearest", DType::BFloat16, &shape), &ranked, <[_]>::to_vec, build);
+    let (admitted, pick) = super::tuned_on_device(
+        planner,
+        ("nearest", DType::BFloat16, &shape, (crate::ops::DEVICE_TEST, metric, floors, groups)),
+        &ranked,
+        <[_]>::to_vec,
+        build,
+    );
     (admitted, pick.expect("a nearest kernel the planner runs"))
 }
 

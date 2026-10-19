@@ -27,8 +27,13 @@ pub(super) fn device_gemms(planner: &Planner, spec: &GemmSpec) -> (Vec<GemmCfg>,
     let ranked = planner.gemm_ranked(1, m, n, k, epilogue.gated);
     let build = |cfg: GemmCfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
     let shape = [spec.batch.capacity(), m, n, k];
-    let (admitted, pick) =
-        super::tuned_on_device(planner, ("gemm", DType::BFloat16, &shape), &ranked, <[_]>::to_vec, build);
+    let (admitted, pick) = super::tuned_on_device(
+        planner,
+        ("gemm", DType::BFloat16, &shape, crate::ops::DEVICE_TEST),
+        &ranked,
+        <[_]>::to_vec,
+        build,
+    );
     (admitted, pick.expect("a GEMM the planner runs"))
 }
 

@@ -132,19 +132,20 @@ fn traced() {
         .try_init();
 }
 
-/// What the tuner makes of `ranked` on the device, as the op layer tunes:
+/// What the tuner makes of `ranked` on the device, as the op layer tunes
+/// (keyed by `salt`, what else the programs vary with):
 /// the candidates `expand` makes of the admitted shortlist (compiled, the
 /// spilling ones dropped while clean ones remain) and its pick among them,
 /// none where the planner offers no kernel (the op layer takes the graph).
 pub(crate) fn tuned_on_device<C: crate::ops::config::Tiled + PartialEq + std::fmt::Debug>(
     planner: &Planner,
-    (op, dtype, shape): (&'static str, svod_dtype::DType, &[usize]),
+    (op, dtype, shape, salt): (&'static str, svod_dtype::DType, &[usize], impl std::fmt::Debug),
     ranked: &[C],
     expand: impl Fn(&[C]) -> Vec<C>,
     build: impl Fn(C) -> crate::tune::Candidate,
 ) -> (Vec<C>, Option<C>) {
     let store = crate::tune::TuneStore::global();
-    let mut tuner = crate::ops::Tuner::new(store, &planner.device, dtype, shape, crate::ops::DEVICE_TEST, build);
+    let mut tuner = crate::ops::Tuner::new(store, &planner.device, dtype, shape, salt, build);
     let candidates = expand(&tuner.admitted(op, &crate::ops::config::representatives(ranked)));
     let pick = (!candidates.is_empty()).then(|| {
         let ordered = tuner.ordered(op, &candidates);
