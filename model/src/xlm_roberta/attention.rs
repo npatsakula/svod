@@ -57,10 +57,10 @@ impl XlmRobertaAttention {
         }
     }
 
-    /// Forward. `x`: `(B, L, D)`. Returns `(B, L, D)`.
-    /// `padding_mask`: optional bool `(B, L)` where `true` = real token,
-    /// `false` = padding.
-    pub fn forward(&self, x: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
+    /// Forward. `x`: `(B, L, D)`. Returns `residual + attn(x)`, `(B, L, D)`,
+    /// the add in the output projection's epilogue. `padding_mask`: optional
+    /// bool `(B, L)` where `true` = real token, `false` = padding.
+    pub fn forward(&self, x: &Tensor, residual: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let project = |w: &Tensor, b: &Tensor| -> Result<Tensor> {
             Ok(ops::linear(x, w, ops::Linear { bias: Some(b), ..ops::Linear::default() })?
                 .split_heads(self.num_heads)?)
@@ -72,7 +72,7 @@ impl XlmRobertaAttention {
         // SDPA, not the op layer: it takes key lengths, not a bool padding mask.
         let attn = q.scaled_dot_product_attention().key(&k).value(&v).maybe_key_padding_mask(padding_mask).call()?;
 
-        let opts = ops::Linear { bias: Some(&self.out_bias), ..ops::Linear::default() };
+        let opts = ops::Linear { bias: Some(&self.out_bias), residual: Some(residual), ..ops::Linear::default() };
         Ok(ops::linear(&attn.merge_heads()?, &self.out_weight, opts)?)
     }
 }
