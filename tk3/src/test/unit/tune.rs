@@ -168,3 +168,25 @@ fn a_gemm_tunes_on_the_device() {
     assert_eq!(hit.map(|i| cfgs[i]), Some(chosen));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A candidate's time is its fastest timed run: a run the device did not
+/// stamp is skipped, not taken as the candidate failing.
+#[test_case(&[Some(5), None, Some(3)] => Some(3); "a lost sample")]
+#[test_case(&[None, Some(7)] => Some(7); "the first lost")]
+#[test_case(&[None, None] => None; "none timed")]
+fn a_candidate_keeps_its_timed_runs(runs: &[Option<u64>]) -> Option<u64> {
+    let runs = runs.iter().map(|r| r.map(std::time::Duration::from_nanos));
+    tune::best(runs).map(|d| d.as_nanos() as u64)
+}
+
+/// Candidates compile on workers that see the caller's default device (a
+/// thread-local): a caller pinning one without `SVOD_DEVICE` builds them
+/// for it, not for the CPU.
+#[test]
+fn workers_see_the_callers_device() {
+    use svod_dtype::DeviceSpec;
+    use svod_dtype::default_device::{default_device, with_default_device};
+    let pinned = DeviceSpec::Amd { device_id: 3 };
+    let seen = with_default_device(pinned.clone(), || tune::in_parallel((0..64).collect(), |_: i32| default_device()));
+    assert!(seen.iter().all(|d| *d == pinned), "{seen:?}");
+}
