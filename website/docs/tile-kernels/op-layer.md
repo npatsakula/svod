@@ -23,49 +23,42 @@ pub fn supported(device: &DeviceSpec) -> bool;
 
 | Op | Shapes | Options |
 |---|---|---|
-| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
+| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, chunk, seg_start, cache, splits, scale, bias }` |
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`; gated `w` is `[2N, K]` |
 | `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`; a 1×1 is `linear` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` take `residual` like `x` and return `(x + residual, norm)` |
 
-`Linear::scale` multiplies the activated value before the residual add: `scale·act(x·wᵀ + bias) + residual`, so a Conformer half-step `x + 0.5·ffn(x)` is one GEMM.
+`Linear::scale` multiplies the activated value before the residual add:
+`scale·act(x·wᵀ + bias) + residual`, so a Conformer half-step `x + 0.5·ffn(x)` is one GEMM.
 
 `Attn::keys` is `KeyMask::None`, `KeyMask::Lens(&lens)` (`[B]` valid key counts) or
 `KeyMask::Bool(&mask)` (`[B, Tk]`, true where attended). `Attn::cache` takes
-`Cache { head_start, kv_heads, row_map, appended }`, and `appended` requires `KeyMask::Lens`.
-`Attn::scale` defaults to `1/√D`. `Attn::bias` (`[B, H, T, Tk]` or `[1, H, T, Tk]`, the stream dtype) is added to the scaled scores before the masks, as in WavLM's relative position bias. `Qkv::rope` is `(cos, sin)` of `[1, T, 1, D/2]` (by position)
-or `[B, T, 1, D/2]` (by token). The masks are described with the
-[attention kernel](./kernel-library#flash-attention).
+`Cache { head_start, kv_heads, row_map, appended, app_lens }`, and `appended` requires
+`KeyMask::Lens`. `Attn::chunk` is block attention (`Chunk { size, left, right }`).
+`Attn::scale` defaults to `1/√D`. `Attn::bias` (`[B, H, T, Tk]` or `[1, H, T, Tk]`, the stream
+dtype) is added to the scaled scores before the masks, as in WavLM's relative position bias.
+`Qkv::rope` is `(cos, sin)` of `[1, T, 1, D/2]` (by position) or `[B, T, 1, D/2]` (by token).
+The masks are described with the [attention kernel](./kernel-library#flash-attention).
 
 ## Kernel or graph
 
-The decision is a pure function in `ops::shape`, `fn(target, dtypes, extents, …) -> Plan<Cfg>`,
-so it is tested on the host without a GPU. `Plan::Kernel(configs)` ranks the configs with the
-untuned pick first; the [tuner](./tuning) measures the first that compile without spilling (or,
-when every one spills, the first that compile: spills never send an op to the graph).
-`Plan::Graph(Fallback)` says why the graph runs.
+The decision is a pure function in `ops::shape`, `fn(planner, dtypes, extents, …) -> Plan<Cfg>`,
+so it is tested on the host without a GPU (`test/unit/ops_plan.rs`). `Plan::Kernel(configs)`
+holds the ranked configs; the [tuner](./tuning) measures the first that compile without spilling
+(or, when every one spills, the first that compile: spills never send an op to the graph).
+`Plan::Graph(Fallback)` says why the graph runs, and the planner log names it
+(`RUST_LOG=svod_tk3::plan=debug`).
 
 | `Fallback` | When |
 |---|---|
-| `Target` | The tensor is not on the default device, or the device has no tk3 tables (today: anything but CUDA sm_80+) |
-| `Dtype` | Any operand is f32, or the operands do not all share one 16-bit type with a matrix core |
+| `Target` | The tensor is not on the default device, the device has no tk3 kernels (`config::has_kernels`: CUDA below sm_80, Metal, the CPU), or its target reports no SM count |
+| `Dtype` | Any operand is f32, or the operands do not all share one 16-bit type with a matrix core. `conv2d`: an output type other than the input's or f32, or a residual not in it |
 | `Symbolic` | A dim other than a bound leading one is symbolic (for `linear`, also a symbolic `N`) |
-| `Shape` | `linear`: `N` not a multiple of 8 or no rows. `conv2d`: `groups > 1`, `Cin` not a multiple of 16, `Cout` not a multiple of 8, or an empty output. `attention`: `D ∉ {48, 64, 128}` or an empty dim. `heads`: `D` not a power of two in 16..=256. Norms: `D` not a power of two in 256..=2048 |
+| `Shape` | `linear`: `N` not a multiple of 8 or no rows. `conv2d`: `groups > 1`, `Cin` not a multiple of 16, `Cout` not a multiple of 8, or an empty output. `attention`: no config fits `D` (on sm_86, 32, 48, 64, 128 and 256 plan and 40 does not) or an empty dim. `heads`: `D` not a power of two in 16..=256. Norms: `D` not a power of two in 256..=2048 |
 | `Config` | No tile config fits. For `linear`, `K` is not a multiple of 16 |
 
-Real cases from `test/unit/ops_plan.rs`, on the sm_86 target:
-
-```rust
-#[test_case(&[4096, 4096], 4096, false, Ok(BIG); "large grid, deepest ring")]
-#[test_case(&[8, 37, 512], 512, false, Ok(SMALL); "medium grid")]
-#[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
-#[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
-fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallback>) {
-    let planner = Planner::new(Device { target: sm86(), costs: costs() });
-    assert_eq!(first(shape::linear(Some(&planner), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
-}
-```
+`attention` also takes the graph when appended rows are wider than every config's key block.
 
 :::note[Why f32 keeps the graph]
 The kernels take 16-bit operands only. Casting an f32 model down would trade about three
@@ -77,7 +70,7 @@ decimal digits of precision for speed, so the op layer leaves that choice to the
 Dim 0 of an operand may be symbolic when it is bound to a runtime variable. That variable is
 either the JIT's `batch_var` or a `DefineVar`/bounded `Param` with min and max. The kernel then
 launches over the live count in grid z, and its buffers hold the maximum. Outputs are allocated
-at capacity with the symbolic dim kept in their shape (`Tensor::empty_dynamic`). The next kernel
+at capacity with the symbolic dim kept in their shape (`Tensor::empty_dynamic_spec`). The next kernel
 therefore binds the realized buffer itself, and no copy is made to shrink it. Any other symbolic
 dim is `Fallback::Symbolic`.
 
