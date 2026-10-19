@@ -1,9 +1,10 @@
 use svod_dtype::ScalarDType;
 use test_case::test_case;
 
+use crate::atoms::Fill;
 use crate::interp::{round_to, run};
 use crate::ir::*;
-use crate::schedule::{Prefetch, Schedule, expand};
+use crate::schedule::{Schedule, expand};
 
 fn count(prog: &Program, pred: impl Fn(&Stmt) -> bool) -> usize {
     prog.walk().filter(|(_, s)| pred(s)).count()
@@ -19,31 +20,31 @@ fn operands(m: usize, n: usize, k: usize) -> Vec<Vec<f64>> {
 /// Expanding the pipeline keeps the GEMM's result (the interpreter treats
 /// synchronization as no-ops, so this checks the step/slot bookkeeping and
 /// the prologue and drain, guarded or peeled) and leaves no pipeline behind.
-#[test_case(Prefetch::CpAsync, 1; "cp.async one stage")]
-#[test_case(Prefetch::CpAsync, 2; "cp.async two stages")]
-#[test_case(Prefetch::CpAsync, 4; "cp.async four stages")]
-#[test_case(Prefetch::RegisterStaged, 2; "register staged")]
-#[test_case(Prefetch::RegisterStaged, 1; "register staged, one slot")]
-fn expansion_preserves_the_result(prefetch: Prefetch, stages: usize) {
+#[test_case(Fill::CpAsync, 1; "cp.async one stage")]
+#[test_case(Fill::CpAsync, 2; "cp.async two stages")]
+#[test_case(Fill::CpAsync, 4; "cp.async four stages")]
+#[test_case(Fill::Staged, 2; "register staged")]
+#[test_case(Fill::Staged, 1; "register staged, one slot")]
+fn expansion_preserves_the_result(fill: Fill, stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
     let mut prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
-    expand(&mut prog, Schedule::Uniform { prefetch, unroll: true, async_products: false });
+    expand(&mut prog, Schedule::Uniform { fill, unroll: true, async_products: false });
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Pipeline(_))), 0);
-    let staged = prefetch == Prefetch::RegisterStaged;
+    let staged = fill == Fill::Staged;
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Loop(_))), if staged { 3 } else { 1 }, "peeled or one loop");
     let barriers = count(&prog, |s| matches!(s, Stmt::Sync(Sync::Barrier { .. })));
     let want = if staged && stages == 1 {
         3
-    } else if staged || (prefetch == Prefetch::CpAsync && stages == 1) {
+    } else if staged || (fill == Fill::CpAsync && stages == 1) {
         2
     } else {
         1
     };
     assert_eq!(barriers, want, "one per trip (two around a one-slot commit), plus the peeled prologue's");
-    if prefetch == Prefetch::CpAsync && stages >= 2 {
+    if fill == Fill::CpAsync && stages >= 2 {
         let waits: Vec<_> = prog
             .walk()
             .filter_map(|(_, s)| match s {
@@ -66,7 +67,7 @@ fn products_in_flight_preserve_the_result(stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
     let mut prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
     let want = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
-    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: true, async_products: true });
+    expand(&mut prog, Schedule::Uniform { fill: Fill::CpAsync, unroll: true, async_products: true });
     let got = run(&prog, operands(m, n, k), &[("b", 1)]).unwrap();
     assert_eq!(got[2], want[2]);
     let syncs: Vec<Sync> =
@@ -211,7 +212,7 @@ fn staged_halves_keep_their_copys_scope() {
         cfg,
     };
     let mut prog = attention::<BF16>(&spec);
-    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: false, async_products: false });
+    expand(&mut prog, Schedule::Uniform { fill: Fill::Staged, unroll: false, async_products: false });
     fn copies(block: &Block, inside: bool, out: &mut Vec<(bool, Scope, CopyMode)>) {
         for s in &block.0 {
             match s {
@@ -260,7 +261,7 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, t
         .filter_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some([p.produce.slot, p.consume.slot]) } else { None })
         .flatten()
         .collect();
-    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: true, async_products: false });
+    expand(&mut prog, Schedule::Uniform { fill: Fill::Staged, unroll: true, async_products: false });
     let constant = slots.iter().all(|&s| *prog.scalar(s) == Scalar::Const(0));
     assert!(!slots.is_empty() && constant == (stages == 1), "slot scalars constant: {constant}");
     let loops: Vec<&Loop> =

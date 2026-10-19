@@ -9,7 +9,7 @@ use svod_dtype::{AmdArch, GpuArch};
 use test_case::test_case;
 
 use super::targets::{amd, hopper, lowered, render, run};
-use crate::atoms::{Costs, Target, sm86};
+use crate::atoms::{Costs, Fill, Target, sm86};
 use crate::ir::*;
 use crate::layouts::Relayout;
 use crate::lower::Lowered;
@@ -268,7 +268,11 @@ fn units_count_the_primitive(target: Target) {
     let depth = |p: &Program| {
         p.walk().find_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some(p.stages) } else { None }).expect("a ring")
     };
-    assert_eq!((depth(pair(one).1), depth(pair(trip).1)), (1, target.stages(2)), "one slot against the target's two");
+    assert_eq!(
+        (depth(pair(one).1), depth(pair(trip).1)),
+        (1, target.fill.stages(2)),
+        "one slot against the target's two"
+    );
     let (_, latency) = pair(find(&probes, "latency"));
     assert_eq!((work(latency).0, latency.warps), (target.sms.unwrap() as usize, 1), "a lone wave per SM");
     let tile = loads_from(latency, Tier::Smem)[0].1;
@@ -461,7 +465,7 @@ fn device_costs_are_physical() {
     };
     let (trip, rolled, one) = (spread("trip"), spread("trip_rolled"), spread("trip_one"));
     eprintln!("spreads per unit: trip {trip:.3}, trip_rolled {rolled:.3}, trip_one {one:.3}");
-    if !target.cp_async {
+    if target.fill == Fill::Staged {
         assert!(c.trip_rolled >= 0.9 * c.trip - (trip + rolled), "{c:?}");
     }
     assert!(c.trip_one >= 0.9 * c.trip - (trip + one), "{c:?}");

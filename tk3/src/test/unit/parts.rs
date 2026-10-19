@@ -7,13 +7,14 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::declared;
+use crate::atoms::Fill;
 use crate::build::*;
 use crate::interp::run;
 use crate::ir::*;
 use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
-use crate::schedule::{Prefetch, Schedule};
+use crate::schedule::Schedule;
 
 fn data(n: usize, seed: &mut u64) -> Vec<f64> {
     super::rounded(ScalarDType::BFloat16, n, seed, |x| x)
@@ -27,7 +28,7 @@ fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, warps: u32, tol
     let lowering = Lowering {
         group: false,
         device: declared(target),
-        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false, async_products: false },
+        schedule: Schedule::Uniform { fill: Fill::CpAsync, unroll: false, async_products: false },
         grid: WarpGrid { rows: warps, cols: 1 },
         swizzle: true,
     };
@@ -151,7 +152,7 @@ fn mma_peak_probe() {
     let lowering = Lowering {
         group: false,
         device: declared(target),
-        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false, async_products: false },
+        schedule: Schedule::Uniform { fill: Fill::CpAsync, unroll: false, async_products: false },
         grid: WarpGrid { rows: 2, cols: 2 },
         swizzle: true,
     };

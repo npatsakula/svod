@@ -401,7 +401,7 @@ fn conv_matches_on_the_device(g: ConvGeom, images: usize, epi: Epilogue, tile: [
         batch: Batch::Static(images),
         geom: g,
         epilogue: epi,
-        cfg: cfg(tile, warps, target.stages(3)),
+        cfg: cfg(tile, warps, target.fill.stages(3)),
         split: 1,
     };
     let params = inputs(&g, images, epi, 21);
@@ -424,7 +424,7 @@ fn an_inf_gives_the_graphs_non_finite_set_on_the_device() {
         batch: Batch::Static(1),
         geom: g,
         epilogue: epi,
-        cfg: cfg([64, 64, 32], [2, 2], target.stages(3)),
+        cfg: cfg([64, 64, 32], [2, 2], target.fill.stages(3)),
         split: 1,
     };
     let got = on_device(&spec, &target, &params);
@@ -446,7 +446,7 @@ fn a_bound_batch_runs_the_live_images_on_the_device() {
         batch: Batch::Var { name: "b".into(), min: 1, max: cap as i64 },
         geom: g,
         epilogue: RESIDUAL_SILU_BIAS,
-        cfg: cfg([64, 64, 32], [2, 2], target.stages(3)),
+        cfg: cfg([64, 64, 32], [2, 2], target.fill.stages(3)),
         split: 1,
     };
     let params = inputs(&g, cap, RESIDUAL_SILU_BIAS, 4);

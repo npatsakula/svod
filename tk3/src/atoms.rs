@@ -7,7 +7,6 @@ use svod_ir::{AxisId, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 use svod_schedule::optimizer::{Renderer, TensorCore};
 
 use crate::layout::{self as frag, Dim, Layout};
-use crate::schedule::Prefetch;
 
 /// One matrix-core instruction: `C[m, n] += A[m, k] · B[k, n]`, with the
 /// register/lane layout of every operand over one wave.
@@ -143,8 +142,8 @@ pub struct Target {
     /// Warpgroup matrix instructions over shared descriptors, where the
     /// target has them (Hopper).
     pub group_mma: Vec<GroupMmaAtom>,
-    /// Asynchronous global→shared copies (`cp.async`).
-    pub cp_async: bool,
+    /// How global memory reaches a shared ring.
+    pub fill: Fill,
     /// Warp-collective 8×8 b16 fragment loads from shared memory.
     pub ldmatrix: bool,
     /// Transposing 16-byte loads of 16×16 b16 blocks from global memory, a
@@ -178,6 +177,30 @@ pub struct Target {
     /// reduction that keeps results below 2^-126 denormal (they flush to
     /// zero, which no kernel tells apart): AMD's `v_exp_f32`.
     pub hardware_exp2: bool,
+}
+
+/// How global memory reaches a shared ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fill {
+    /// Asynchronous 16-byte copies (`cp.async.cg`, sm_80+), landed by
+    /// commit and wait groups, `stages - 1` steps ahead.
+    CpAsync,
+    /// Global → registers before a step's compute and registers → shared
+    /// after it, one step ahead (RDNA and CDNA have no global → LDS copy):
+    /// the chunks take registers, and a rolled ring recomputes its slot
+    /// offsets every trip.
+    Staged,
+}
+
+impl Fill {
+    /// The ring depth this fill runs for `stages` asked: any, or one or two
+    /// slots through registers.
+    pub fn stages(self, stages: usize) -> usize {
+        match self {
+            Fill::CpAsync => stages,
+            Fill::Staged => stages.clamp(1, 2),
+        }
+    }
 }
 
 /// How a lane reads the register of lane `lane ^ mask`.
@@ -303,6 +326,7 @@ impl Target {
             GpuArch::Amd(a) => (false, false, if a == AmdArch::Gfx950 { 160 << 10 } else { 64 << 10 }),
             GpuArch::Metal(_) => (false, false, 32 << 10),
         };
+        let fill = if cp_async { Fill::CpAsync } else { Fill::Staged };
         let commit_fence = matches!(arch, GpuArch::Amd(a) if a.is_rdna4());
         let lane_move = match arch {
             GpuArch::Cuda(_) => LaneMove::Shuffle,
@@ -334,7 +358,7 @@ impl Target {
             wave,
             mma: mma_atoms(arch),
             group_mma: group_mma_atoms(arch),
-            cp_async,
+            fill,
             ldmatrix,
             tr_load,
             dot2_bf16,
@@ -406,21 +430,6 @@ impl Target {
             }
         }
         Some(target)
-    }
-
-    /// How a pipeline fills shared memory: `cp.async` where the target has
-    /// it, else through registers (RDNA3/RDNA4 have no global→LDS copy).
-    pub fn prefetch(&self) -> Prefetch {
-        if self.cp_async { Prefetch::CpAsync } else { Prefetch::RegisterStaged }
-    }
-
-    /// Pipeline stages the target's prefetch can use: register staging
-    /// runs one step ahead over one or two slots.
-    pub fn stages(&self, stages: usize) -> usize {
-        match self.prefetch() {
-            Prefetch::CpAsync => stages,
-            Prefetch::RegisterStaged => stages.clamp(1, 2),
-        }
     }
 
     /// Registers one lane of a block of `waves` warps may hold: the lane's

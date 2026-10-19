@@ -61,7 +61,7 @@ impl Lowering {
     /// `device`'s uniform pipeline over `grid`, its ring `unroll`ed or not,
     /// shared rows swizzled.
     pub fn uniform(device: &Device, unroll: bool, grid: WarpGrid) -> Self {
-        let schedule = Schedule::Uniform { prefetch: device.target.prefetch(), unroll, async_products: false };
+        let schedule = Schedule::Uniform { fill: device.target.fill, unroll, async_products: false };
         Self { device: device.clone(), schedule, grid, swizzle: true, group: false }
     }
 }

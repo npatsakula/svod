@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use svod_dtype::GpuArch;
 
-use crate::atoms::{Device, GroupMmaAtom, Target};
+use crate::atoms::{Device, Fill, GroupMmaAtom, Target};
 use crate::ir::{Axis, Orient, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
@@ -75,7 +75,7 @@ impl GemmCfg {
                 && self.warps[0] == 2
                 && bk.is_multiple_of(crate::kernels::gemm::KSLICE)
                 && bk >= 2 * crate::kernels::gemm::KSLICE);
-        row && crews && self.issue(target, bk).is_some() && target.stages(self.stages) == self.stages
+        row && crews && self.issue(target, bk).is_some() && target.fill.stages(self.stages) == self.stages
     }
 
     /// Whether the config lowers on `target`: it [`tiles`](Self::tiles), and
@@ -98,7 +98,7 @@ impl GemmCfg {
         let halves = halves as u32;
         let acc = issue.c.regs() * halves;
         let operands = self.operand_registers(&issue, halves);
-        let fill = if target.cp_async {
+        let fill = if target.fill == Fill::CpAsync {
             0
         } else {
             let fill =
@@ -154,11 +154,11 @@ type Cores = [(Core, &'static [[u32; 2]], &'static [usize])];
 /// the ring depths its prefetch runs, rolled and unrolled; on a target with
 /// warpgroup instructions, the tiles of whole warpgroups on them as well.
 pub fn gemm_lattice(target: &Target) -> Vec<GemmCfg> {
-    let cores: &Cores = match (target.cp_async, target.group_mma.is_empty()) {
-        (false, _) => &[(Core::Warp, &GRIDS, &[2, 1])],
-        (true, true) => &[(Core::Warp, &GRIDS, &[3, 2, 1])],
+    let cores: &Cores = match (target.fill, target.group_mma.is_empty()) {
+        (Fill::Staged, _) => &[(Core::Warp, &GRIDS, &[2, 1])],
+        (Fill::CpAsync, true) => &[(Core::Warp, &GRIDS, &[3, 2, 1])],
         // A warpgroup ring keeps a chain in flight in a slot of its own.
-        (true, false) => &[(Core::Warp, &GRIDS, &[3, 2, 1]), (Core::Group, &GROUP_GRIDS, &[4, 3])],
+        (Fill::CpAsync, false) => &[(Core::Warp, &GRIDS, &[3, 2, 1]), (Core::Group, &GROUP_GRIDS, &[4, 3])],
     };
     let mut out = vec![];
     for bm in ROWS {
@@ -338,7 +338,7 @@ impl Problem {
         let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
         let reads = fragments as f64 * costs.smem_byte;
         let work = steps as f64 * step;
-        let trip = costs.trip(stages, !cfg.unroll && !target.cp_async);
+        let trip = costs.trip(stages, !cfg.unroll && target.fill == Fill::Staged);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
         Ok((planner.pipelined(run), regs))
     }
@@ -767,7 +767,7 @@ impl Planner {
         }
         let p = Problem { batches, m, n, k, halves: 1 };
         let target = &self.device.target;
-        let depth = if target.cp_async { 2 * target.mma.first().map_or(16, |a| a.k as usize) } else { 0 };
+        let depth = if target.fill == Fill::CpAsync { 2 * target.mma.first().map_or(16, |a| a.k as usize) } else { 0 };
         let eligible = |c: &&GemmCfg| cin.is_multiple_of(c.tile[2]) && c.tile[2] >= depth && p.padding(c) <= 1.0 / 8.0;
         self.ranked(p).iter().filter(eligible).map(|&gemm| ConvCfg { gemm, split: 1 }).collect()
     }
@@ -856,7 +856,7 @@ impl FaCfg {
             && [bkv, d].iter().all(|&x| x.is_multiple_of(atom.n as usize) && x.is_multiple_of(atom.k as usize))
             && (bkv * d / 8).is_multiple_of(threads)
             && (!self.bias_ring(bias) || (bq * bkv / 8).is_multiple_of(threads))
-            && target.stages(self.stages) == self.stages
+            && target.fill.stages(self.stages) == self.stages
     }
 
     /// The registers a lane holds for head size `d`, from the layouts the
@@ -888,7 +888,7 @@ impl FaCfg {
             }
         };
         let half = |regs: u32| regs.div_ceil(2);
-        let fill = if target.cp_async {
+        let fill = if target.fill == Fill::CpAsync {
             0
         } else {
             let chunks = |shape| chunked(shape, 2, self.row_warps(), target.wave, Axis::Col).map(|t| half(t.regs()));
@@ -1002,7 +1002,7 @@ impl Attention {
         let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
         let reads = fragments as f64 * costs.smem_byte;
         let work = steps as f64 * step + (kw * bq * bkv) as f64 * costs.score;
-        let trip = costs.trip(stages, !cfg.unroll && !target.cp_async);
+        let trip = costs.trip(stages, !cfg.unroll && target.fill == Fill::Staged);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
         Ok((planner.pipelined(run), regs))
     }
@@ -1012,7 +1012,7 @@ impl Attention {
     /// on the warp-level core and, where the target has it, the warpgroup
     /// core, in the plain softmax forms.
     pub fn lattice(&self, target: &Target) -> Vec<FaCfg> {
-        let stages: &[usize] = if target.cp_async { &[3, 2] } else { &[2] };
+        let stages: &[usize] = if target.fill == Fill::CpAsync { &[3, 2] } else { &[2] };
         let cores: &[Core] = if target.group_mma.is_empty() { &[Core::Warp] } else { &[Core::Warp, Core::Group] };
         let mut out = vec![];
         for (core, bq) in cores.iter().flat_map(|&c| [16, 32, 64, 128, 256].map(|bq| (c, bq))) {

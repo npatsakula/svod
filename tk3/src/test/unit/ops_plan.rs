@@ -11,7 +11,7 @@ use test_case::test_case;
 use super::conv::geom;
 use super::tune::Select;
 use super::{costs, first_eight, planner};
-use crate::atoms::{Costs, Device, Target, sm86};
+use crate::atoms::{Costs, Device, Fill, Target, sm86};
 use crate::build::BF16 as BF16T;
 use crate::kernels::Batch;
 use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS};
@@ -238,7 +238,7 @@ fn an_sm_issues_its_share_of_blocks() {
 /// halves a tile's shared memory, so more of its blocks share a trip's
 /// overhead, and it wins only while its measured trip (the commit's barrier
 /// pair) costs little more than the two-slot trip; charged a dear one it
-/// ranks behind the two-slot pipeline of the same tile, on every prefetch
+/// ranks behind the two-slot pipeline of the same tile, on every fill
 /// (the cp.async target's one slot is its single-stage expansion).
 #[test_case(sm86(), 32; "sm86 three slots against one")]
 #[test_case(rdna3(), 32; "rdna3 two slots against one")]
@@ -248,7 +248,7 @@ fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize) {
     let two = GemmCfg {
         core: Core::Warp,
         tile: [64, 64, bk],
-        stages: target.stages(3),
+        stages: target.fill.stages(3),
         warps: [2, 2],
         group_m: 8,
         unroll: false,
@@ -821,7 +821,13 @@ fn a_bias_rides_its_own_ring_slot(target: Target) {
     assert!(small.fits(&target, 64, false));
     assert_eq!(small.fits(&target, 64, true), target.wave == 32, "{:?}", target.arch);
     let regs = |bias| cfg.registers(&target, 64, bias).expect("a lowered tile");
-    assert_eq!(regs(true) > regs(false), !target.cp_async, "{} with a bias, {} without", regs(true), regs(false));
+    assert_eq!(
+        regs(true) > regs(false),
+        target.fill == Fill::Staged,
+        "{} with a bias, {} without",
+        regs(true),
+        regs(false)
+    );
     let planner = planner(target.clone());
     let ranked = planner.attention_ranked(8, 512, 512, 64, false, true);
     assert!(!ranked.is_empty());

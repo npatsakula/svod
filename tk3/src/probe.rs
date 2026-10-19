@@ -792,7 +792,7 @@ impl<'a> Probes<'a> {
     /// zero.
     fn trips(&self, op: &'static str, unroll: bool, stages: usize) -> Probe {
         let (tile, region) = (trip_tile(self.target), 16);
-        let stages = self.target.stages(stages);
+        let stages = self.target.fill.stages(stages);
         let units = (self.blocks * TRIPS) as f64;
         let chunks = chunked(tile, 4, WARPS, self.target.wave, Axis::Col).expect("a chunk layout");
         let sms = self.sms as usize;
@@ -926,7 +926,7 @@ impl<'a> Probes<'a> {
         let tile = Shape::new(self.target.wave as usize, 4);
         let waves = self.sms as usize;
         let trips = LATENCY_TRIPS.min(STREAM / 4 / tile.elems() / waves);
-        let stages = self.target.stages(2);
+        let stages = self.target.fill.stages(2);
         let lowering = self.lowering(WarpGrid { rows: 1, cols: 1 }, false);
         self.make(op, ScalarDType::Int32, (trips - stages) as f64, false, lowering, |on| {
             let mut k = kernel(op, waves, 1);

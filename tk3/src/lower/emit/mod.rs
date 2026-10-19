@@ -14,6 +14,7 @@ use svod_ir::uop::cached_property::CachedProperty;
 use svod_ir::uop::properties::SoundVminVmaxProperty;
 use svod_ir::{AxisId, AxisType, KernelInfo, Op, UOp};
 
+use crate::atoms::Fill;
 use crate::index::*;
 use crate::ir::*;
 use crate::layouts::{Laid, TileLayout};
@@ -667,8 +668,8 @@ impl<'a> Emit<'a> {
             // its LDS accesses in order and waits on their counters.
             Sync::Barrier { scope: Scope::Warp } if cuda => nvptx::warp_barrier(&self.last),
             Sync::Barrier { scope: Scope::Warp } => return Ok(()),
-            Sync::CommitAsync if cuda && self.low.device.target.cp_async => cp_async_commit(smallvec![]),
-            Sync::WaitAsync { pending } if cuda && self.low.device.target.cp_async => {
+            Sync::CommitAsync if self.low.device.target.fill == Fill::CpAsync => cp_async_commit(smallvec![]),
+            Sync::WaitAsync { pending } if self.low.device.target.fill == Fill::CpAsync => {
                 cp_async_wait(pending, smallvec![])
             }
             // Without `cp.async` the copies were synchronous: nothing to wait for.

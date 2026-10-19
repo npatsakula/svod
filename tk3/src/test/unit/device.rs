@@ -7,7 +7,7 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::declared;
-use crate::atoms::Device;
+use crate::atoms::{Device, Fill};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
@@ -56,7 +56,7 @@ fn gemm_matches_the_interpreter(
     wc: u32,
 ) {
     let Some(target) = super::device_target() else { return };
-    let stages = target.stages(stages);
+    let stages = target.fill.stages(stages);
     let cfg =
         GemmCfg { core: Core::Warp, tile: [bm, bn, bk], stages, warps: [wr, wc], group_m: 0, unroll: true, crews: 1 };
     check_gemm(&declared(target), m, n, k, cfg);
@@ -201,7 +201,7 @@ fn gemm_throughput_probe() {
     // The configs measured on sm_86; elsewhere the tuner's admitted ones.
     let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: BIG };
     let (admitted, pick) = device_gemms(&planner, &spec);
-    let mut cfgs: Vec<GemmCfg> = if target.cp_async {
+    let mut cfgs: Vec<GemmCfg> = if target.fill == Fill::CpAsync {
         [
             (128, 64, 32, 2, 2, 2, 8, true),
             (128, 64, 32, 2, 2, 2, 8, false),

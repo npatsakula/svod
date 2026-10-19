@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill};
-use svod_dtype::{AddrSpace, DType, GpuArch};
+use svod_dtype::{AddrSpace, DType};
 use svod_ir::{ConstValue, Op, UOp};
 
+use crate::atoms::Fill;
 use crate::layout as frag;
 use crate::layouts::{Relayout, TileLayout};
 use crate::lower::{DivergentBarrierSnafu, Result, UnsupportedSnafu};
-use crate::schedule::Prefetch;
 
 use super::*;
 
@@ -46,7 +46,6 @@ impl Emit<'_> {
         };
         let threads = (warps * self.low.device.target.wave) as i64;
         let chunks = d.shape.rows as i64 * cols / chunk;
-        let cuda = matches!(self.low.device.target.arch, GpuArch::Cuda(_));
         snafu::ensure!(
             cols % chunk == 0 && chunks % threads == 0,
             UnsupportedSnafu { what: format!("a {}×{} fill by {threads} threads", d.shape.rows, cols) }
@@ -85,7 +84,7 @@ impl Emit<'_> {
                 None => src_off,
             };
             let (dst_off, _) = self.address(&d, &Coord::plain(row, col));
-            if cuda && mode == CopyMode::Async && self.low.device.target.cp_async {
+            if mode == CopyMode::Async && self.low.device.target.fill == Fill::CpAsync {
                 let (dst, src) = (self.access(&d.buf, &dst_off, 1), self.access(&s.buf, &src_off, 1));
                 match gate {
                     Some(g) => {
@@ -151,8 +150,7 @@ impl Emit<'_> {
             return self.tr_load_regs(dst, &s, &l, &perm);
         }
         let gathered = matches!(s.place, Some(Place::Global { rows: Some(_), .. }));
-        let cuda = matches!(self.low.device.target.arch, GpuArch::Cuda(_));
-        let l2_only = mode == CopyMode::Staged && cuda && self.low.schedule.prefetch() == Prefetch::CpAsync;
+        let l2_only = mode == CopyMode::Staged && self.low.schedule.fill() == Fill::CpAsync;
         for (j, w) in self.runs(&l, &s) {
             let c = self.coord(&l, j);
             let (off, gate) = self.address(&s, &c);

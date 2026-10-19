@@ -2,17 +2,8 @@
 //! template owns every barrier, wait and ring-slot computation; the author's
 //! `produce`/`consume` bodies are placed, never edited.
 
+use crate::atoms::Fill;
 use crate::ir::*;
-
-/// How a uniform (every warp does everything) schedule moves data in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Prefetch {
-    /// Asynchronous global→shared copies (`cp.async`), `stages - 1` steps ahead.
-    CpAsync,
-    /// Global→register loads issued before the compute of a step and written
-    /// to shared memory after it, one step ahead.
-    RegisterStaged,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Schedule {
@@ -23,7 +14,7 @@ pub enum Schedule {
     /// the ring refills the slot consumed two trips ago, and the template
     /// waits for all but the youngest chain after every consume and for
     /// every chain after the loop ([`Sync::WaitProducts`]).
-    Uniform { prefetch: Prefetch, unroll: bool, async_products: bool },
+    Uniform { fill: Fill, unroll: bool, async_products: bool },
     /// Two crews of `crew` warps run one stream of clusters a cluster apart
     /// over one register-staged slot: a crew's product, its fragments already
     /// in registers, runs while the other crew loads, reads its next
@@ -34,10 +25,10 @@ pub enum Schedule {
 impl Schedule {
     /// How the schedule's fills move data in; a ping-pong's slot is
     /// register-staged.
-    pub fn prefetch(&self) -> Prefetch {
+    pub fn fill(&self) -> Fill {
         match *self {
-            Schedule::Uniform { prefetch, .. } => prefetch,
-            Schedule::PingPong { .. } => Prefetch::RegisterStaged,
+            Schedule::Uniform { fill, .. } => fill,
+            Schedule::PingPong { .. } => Fill::Staged,
         }
     }
 }
@@ -109,17 +100,17 @@ impl Expander<'_> {
         let Pipeline { extent, stages, carried, produce, consume } = p;
         let produce = Stage { body: self.block(produce.body), ..produce };
         let consume = Stage { body: self.block(consume.body), ..consume };
-        let Schedule::Uniform { prefetch, unroll, async_products } = self.schedule else {
+        let Schedule::Uniform { fill, unroll, async_products } = self.schedule else {
             let Schedule::PingPong { crew } = self.schedule else { unreachable!() };
             return self.ping_pong(extent, stages, carried, produce, consume, crew);
         };
-        let mut out = match prefetch {
-            Prefetch::CpAsync if stages >= 3 && async_products => {
+        let mut out = match fill {
+            Fill::CpAsync if stages >= 3 && async_products => {
                 self.cp_async_products(extent, stages, carried, produce, consume)
             }
-            Prefetch::CpAsync if stages >= 2 => self.cp_async(extent, stages, carried, produce, consume),
-            Prefetch::CpAsync => self.single_stage(extent, carried, produce, consume),
-            Prefetch::RegisterStaged => self.register_staged(extent, stages, carried, produce, consume),
+            Fill::CpAsync if stages >= 2 => self.cp_async(extent, stages, carried, produce, consume),
+            Fill::CpAsync => self.single_stage(extent, carried, produce, consume),
+            Fill::Staged => self.register_staged(extent, stages, carried, produce, consume),
         };
         if !unroll {
             for stmt in &mut out {

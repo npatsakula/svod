@@ -26,7 +26,7 @@ use svod_dtype::default_device::default_device;
 use svod_dtype::{DeviceSpec, ScalarDType};
 use test_case::test_case;
 
-use crate::atoms::{Costs, Device, Target};
+use crate::atoms::{Costs, Device, Fill, Target};
 use crate::build::BF16;
 use crate::interp::round_to;
 use crate::ir::Program;
@@ -100,10 +100,10 @@ fn device_planner() -> Option<Arc<Planner>> {
 /// for the tests that build those lowerings or rings deeper than two slots.
 fn cp_async_target() -> Option<Target> {
     let target = device_target()?;
-    if !target.cp_async {
+    if target.fill == Fill::Staged {
         eprintln!("skipped: no cp.async");
     }
-    target.cp_async.then_some(target)
+    (target.fill == Fill::CpAsync).then_some(target)
 }
 
 /// [`device_target`] when the device has a warpgroup matrix core.

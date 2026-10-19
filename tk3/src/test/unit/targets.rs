@@ -15,6 +15,7 @@ use svod_ir::{Op, UOp, ops};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
+use crate::atoms::Fill;
 use crate::atoms::Target;
 use crate::build::{BF16, F16};
 use crate::interp;
@@ -30,7 +31,7 @@ use crate::launch::graph_launch_all;
 use crate::lower::sync::insert_barriers;
 use crate::lower::{Lowering, lower};
 use crate::ops::config;
-use crate::schedule::{Prefetch, Schedule};
+use crate::schedule::Schedule;
 
 use super::conv::geom;
 use super::{conv_first_eight, declared, first_eight, planner};
@@ -526,8 +527,8 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
             check(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "a warp-level product");
             check(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async"), "an unfenced chain");
-            let in_flight = lowering.schedule
-                == Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false, async_products: true };
+            let in_flight =
+                lowering.schedule == Schedule::Uniform { fill: Fill::CpAsync, unroll: false, async_products: true };
             check(ir.contains("@llvm.nvvm.wgmma.wait_group") == in_flight, "the template's wait");
             check(ir.contains("wgmma.wait_group.sync.aligned 0;") == !in_flight, "the chain's own wait");
         }
@@ -804,7 +805,7 @@ fn the_device_reports_the_architectures_occupancy() {
 #[test]
 fn register_staged_families_match_on_cuda() {
     let Some(target) = super::cp_async_target() else { return };
-    check_on_device(&Target { cp_async: false, ldmatrix: false, ..target });
+    check_on_device(&Target { fill: Fill::Staged, ldmatrix: false, ..target });
 }
 
 /// Every candidate the op layer may plan lowers (the tune store would
@@ -975,11 +976,7 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
     k.store(yv, sum);
     let lowering = Lowering {
         group: false,
-        schedule: crate::schedule::Schedule::Uniform {
-            prefetch: target.prefetch(),
-            unroll: false,
-            async_products: false,
-        },
+        schedule: crate::schedule::Schedule::Uniform { fill: target.fill, unroll: false, async_products: false },
         device: declared(target),
         grid: crate::layouts::WarpGrid { rows: 1, cols: 1 },
         swizzle: false,

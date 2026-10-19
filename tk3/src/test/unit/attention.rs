@@ -391,7 +391,7 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 fn attention_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     matches_a_direct_softmax(&case(spec.clone(), lens));
     let Some(target) = super::device_target() else { return };
-    let spec = AttnSpec { cfg: FaCfg { stages: target.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
+    let spec = AttnSpec { cfg: FaCfg { stages: target.fill.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
     let bias = spec.mask.bias.is_some();
     let smem = spec.cfg.smem_bytes(spec.d, bias) + spec.cfg.scratch_bytes(&target);
     if !spec.cfg.fits(&target, spec.d, bias) || smem > target.smem_bytes {
@@ -546,7 +546,7 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
 fn a_non_finite_unread_element_never_reaches_the_output(cfg: FaCfg) {
     let Some(target) = super::device_target() else { return };
     let spec = with(cfg, cached(1, 100, [4, 4, 64], true, 0, 1));
-    let spec = AttnSpec { cfg: FaCfg { stages: target.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
+    let spec = AttnSpec { cfg: FaCfg { stages: target.fill.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
     let mut c = case(spec, &[100, 37]);
     assert!(c.row_map.iter().all(|&r| r > 0), "no batch reads the cache's first row");
     c.v[0] = f64::INFINITY;
