@@ -25,6 +25,14 @@ pub struct Epilogue {
     pub residual: bool,
     /// Multiplies the activated (gated) value, before the residual add.
     pub scale: Option<Scale>,
+    /// The output (and residual) is f32: the accumulator is stored unrounded.
+    pub out_f32: bool,
+}
+
+impl Epilogue {
+    /// Nothing but the rounding, as a constant.
+    pub const DEFAULT: Self =
+        Self { bias: false, act: Act::None, gated: false, residual: false, scale: None, out_f32: false };
 }
 
 /// The tune store keys by this text: an epilogue without a scale prints as
@@ -36,6 +44,9 @@ impl fmt::Debug for Epilogue {
         s.field("residual", &self.residual);
         if let Some(scale) = self.scale {
             s.field("scale", &scale);
+        }
+        if self.out_f32 {
+            s.field("out_f32", &true);
         }
         s.finish()
     }
@@ -106,17 +117,49 @@ pub struct GemmSpec {
 /// `m` and weight rows past `n` are clamped reads whose results are never
 /// stored; `k` must be a multiple of `bk`.
 pub fn gemm<T: Elem>(spec: &GemmSpec) -> Program {
+    let GemmSpec { m, k: kk, cfg, .. } = *spec;
+    let [bm, _, bk] = cfg.tile;
+    mainloop_gemm::<T, _>("gemm", spec, m * kk, |k, a, bb, row0| {
+        let a_view = k.view(a, batch_offset(bb, m * kk), [kk, 1], Shape::new(bm, bk), [bound(m, bm), None]);
+        let a_view = k.at(a_view, row0, 0);
+        move |k: &mut Kernel, _step: Sc, koff: Sc| k.at(a_view, 0, koff)
+    })
+}
+
+/// The GEMM around an A operand of `a_elems` elements per batch whose
+/// K-step tiles `a` describes: given the kernel, the parameter, the batch
+/// index and the block's first row, it returns the source of the `[bm, bk]`
+/// tile at `(step, step·bk)`. The output dtype follows the epilogue.
+pub(crate) fn mainloop_gemm<T: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
+    name: &str,
+    spec: &GemmSpec,
+    a_elems: usize,
+    a: impl FnOnce(&mut Kernel, ParamRef<T>, &Option<Sc>, Sc) -> S,
+) -> Program {
+    if spec.epilogue.out_f32 {
+        build::<T, F32, S>(name, spec, a_elems, a)
+    } else {
+        build::<T, T, S>(name, spec, a_elems, a)
+    }
+}
+
+fn build<T: Elem, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
+    name: &str,
+    spec: &GemmSpec,
+    a_elems: usize,
+    a_source: impl FnOnce(&mut Kernel, ParamRef<T>, &Option<Sc>, Sc) -> S,
+) -> Program {
     let GemmSpec { m, n, k: kk, ref batch, epilogue: epi, cfg } = *spec;
     let [bm, bn, bk] = cfg.tile;
     assert!(kk.is_multiple_of(bk), "k is a multiple of bk");
     let halves = if epi.gated { 2 } else { 1 };
     let cap = batch.capacity();
-    let mut k = Kernel::new("gemm");
-    let a = k.param::<T>("a", ParamKind::In, cap * m * kk);
+    let mut k = Kernel::new(name);
+    let a = k.param::<T>("a", ParamKind::In, cap * a_elems);
     let b = k.param::<T>("b", ParamKind::In, halves * n * kk);
     let bias = epi.bias.then(|| k.param::<T>("bias", ParamKind::In, halves * n));
-    let residual = epi.residual.then(|| k.param::<T>("residual", ParamKind::In, cap * m * n));
-    let c = k.param::<T>("c", ParamKind::Out, cap * m * n);
+    let residual = epi.residual.then(|| k.param::<U>("residual", ParamKind::In, cap * m * n));
+    let c = k.param::<U>("c", ParamKind::Out, cap * m * n);
     let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
     let (gz, bb) = batch.axis(&mut k);
     k.grid([Sc::from(gm), Sc::from(gn), gz]);
@@ -125,8 +168,7 @@ pub fn gemm<T: Elem>(spec: &GemmSpec) -> Program {
     let (bx, by) = tile_order(&mut k, gm, gn, cfg.group_m);
     let (row0, col0) = (bx * bm, by * bn);
     let (m_bound, n_bound) = (bound(m, bm), bound(n, bn));
-    let a_view = k.view(a, batch_offset(&bb, m * kk), [kk, 1], Shape::new(bm, bk), [m_bound.clone(), None]);
-    let a_view = k.at(a_view, row0.clone(), 0);
+    let a_tile = a_source(&mut k, a, &bb, row0.clone());
     let b_view = |k: &mut Kernel, half: usize| {
         let v = k.view(b, half * n * kk, [kk, 1], Shape::new(bn, bk), [n_bound.clone(), None]);
         k.at(v, col0.clone(), 0)
@@ -134,10 +176,10 @@ pub fn gemm<T: Elem>(spec: &GemmSpec) -> Program {
     let (trips, stages) = (kk / bk, cfg.stages);
     let accs = if epi.gated {
         let halves = [b_view(&mut k, 0), b_view(&mut k, 1)];
-        mainloop(&mut k, a_view, halves, trips, stages, bk).to_vec()
+        mainloop(&mut k, Shape::new(bm, bk), &a_tile, halves, trips, stages, bk).to_vec()
     } else {
         let whole = [b_view(&mut k, 0)];
-        mainloop(&mut k, a_view, whole, trips, stages, bk).to_vec()
+        mainloop(&mut k, Shape::new(bm, bk), &a_tile, whole, trips, stages, bk).to_vec()
     };
     let mut accs = accs.into_iter().enumerate().map(|(half, acc)| match bias {
         Some(bias) => {
@@ -158,7 +200,7 @@ pub fn gemm<T: Elem>(spec: &GemmSpec) -> Program {
         let s = konst(&mut k, out, f64::from(scale.get()));
         out = k.binary(out, s, BinaryOp::Mul);
     }
-    let tile = |k: &mut Kernel, p: ParamRef<T>| {
+    let tile = |k: &mut Kernel, p: ParamRef<U>| {
         let v = k.view(p, batch_offset(&bb, m * n), [n, 1], Shape::new(bm, bn), [m_bound.clone(), n_bound.clone()]);
         k.at(v, row0.clone(), col0.clone())
     };
@@ -167,7 +209,7 @@ pub fn gemm<T: Elem>(spec: &GemmSpec) -> Program {
         let r = load_f32(&mut k, r);
         out = k.binary(out, r, BinaryOp::Add);
     }
-    let out = k.cast::<F32, T>(out);
+    let out = k.cast::<F32, U>(out);
     let c_view = tile(&mut k, c);
     k.store(c_view, out);
     k.finish()
@@ -185,17 +227,19 @@ fn tile_order(k: &mut Kernel, gm: usize, gn: usize, group_m: usize) -> (Sc, Sc) 
     (first_m + within.clone() % rows.clone(), within / rows)
 }
 
-/// The K-streaming pipeline: one A tile and `N` B tiles per step into a
-/// `stages`-deep shared ring, one f32 accumulator per B.
+/// The K-streaming pipeline: the `sa`-shaped A tile `a(step, step·bk)` and
+/// `N` B tiles per step into a `stages`-deep shared ring, one f32
+/// accumulator per B.
 fn mainloop<T: Elem, const N: usize>(
     k: &mut Kernel,
-    a: Gmem<T>,
+    sa: Shape,
+    a: &impl Fn(&mut Kernel, Sc, Sc) -> Gmem<T>,
     bs: [Gmem<T>; N],
     trips: usize,
     stages: usize,
     bk: usize,
 ) -> [Regs<F32>; N] {
-    let (sa, sb) = (k.shape(a), k.shape(bs[0]));
+    let sb = k.shape(bs[0]);
     let a_s = k.smem::<T>("a_s", stages * sa.elems());
     let b_s = [(); N].map(|()| k.smem::<T>("b_s", stages * sb.elems()));
     let init = [(); N].map(|()| k.zeros::<F32>(Shape::new(sa.rows, sb.rows)));
@@ -204,12 +248,13 @@ fn mainloop<T: Elem, const N: usize>(
         stages,
         init,
         |k, step, slot| {
-            let koff = step * bk;
-            for (src, alloc, shape) in
-                std::iter::once((a, a_s, sa)).chain(bs.into_iter().zip(b_s).map(|(b, s)| (b, s, sb)))
-            {
+            let koff = step.clone() * bk;
+            let a_g = a(k, step, koff.clone());
+            let a_t = k.smem_slot::<T>(a_s, slot.clone(), sa);
+            k.stage(a_t, a_g, CopyMode::Async);
+            for (src, alloc) in bs.into_iter().zip(b_s) {
                 let g = k.at(src, 0, koff.clone());
-                let t = k.smem_slot::<T>(alloc, slot.clone(), shape);
+                let t = k.smem_slot::<T>(alloc, slot.clone(), sb);
                 k.stage(t, g, CopyMode::Async);
             }
         },

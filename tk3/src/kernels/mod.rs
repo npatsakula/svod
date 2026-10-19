@@ -2,6 +2,7 @@
 //! [`Program`](crate::ir::Program) out, generic over the 16-bit element type.
 
 pub mod attention;
+pub mod conv;
 pub mod gemm;
 pub mod heads;
 pub mod rows;

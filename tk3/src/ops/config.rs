@@ -75,6 +75,83 @@ pub fn gemm_candidates(target: &Target, batches: usize, m: usize, n: usize, k: u
     out
 }
 
+/// Implicit-GEMM convolution tiles, largest first: the GEMM families, then
+/// output widths for 96- and 48-channel convolutions (a power-of-two tile
+/// would pad them by a third or re-read A per narrow block). A 48-wide B
+/// tile splits into whole chunks per thread only at `bk = 64` on four warps
+/// or `bk = 32` on two.
+const CONV_FAMILIES: [GemmCfg; 9] = [
+    gemm_cfg([128, 128, 32], 3, [2, 4], false),
+    gemm_cfg([128, 96, 32], 2, [2, 2], true),
+    gemm_cfg([128, 64, 32], 2, [2, 2], true),
+    gemm_cfg([64, 128, 32], 2, [2, 2], false),
+    gemm_cfg([64, 96, 32], 3, [2, 2], true),
+    gemm_cfg([128, 48, 64], 2, [4, 1], true),
+    gemm_cfg([64, 64, 32], 3, [2, 2], true),
+    gemm_cfg([32, 96, 32], 3, [2, 2], true),
+    gemm_cfg([64, 48, 32], 3, [2, 1], true),
+];
+
+/// Blocks per SM a convolution's lead tile must reach: its grids are a few
+/// hundred blocks, where the GEMM's eight would leave only the smallest tile.
+const CONV_BLOCKS_PER_SM: usize = 2;
+
+/// Whether `cfg` lowers: the warp grid tiles the output with 16×8 atoms and
+/// both operand tiles split into whole 16-byte chunks per thread.
+pub fn conv_cfg_fits(cfg: &GemmCfg) -> bool {
+    let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
+    let threads = 32 * wr * wc;
+    bm.is_multiple_of(16 * wr)
+        && bn.is_multiple_of(8 * wc)
+        && bk.is_multiple_of(16)
+        && (bm * bk / 8).is_multiple_of(threads)
+        && (bn * bk / 8).is_multiple_of(threads)
+}
+
+/// Convolution configs for `batches` grid batches of `m` output pixels,
+/// `n = cout`, `k = kh·kw·cin`. A family is eligible when `bk` (halved down
+/// to 16 until it divides `cin`, so a step stays in one tap) lowers and its
+/// tiles pad `m × n` by at most 1/16. The lead is the largest eligible
+/// family whose grid gives every SM [`CONV_BLOCKS_PER_SM`] blocks, else the
+/// eligible one with the most blocks; its pipeline variants follow, then
+/// every other eligible family.
+pub fn conv_candidates(target: &Target, batches: usize, m: usize, n: usize, k: usize, cin: usize) -> Vec<GemmCfg> {
+    if m == 0 || n == 0 || k == 0 {
+        return vec![];
+    }
+    let sms = target.sms.unwrap_or(DEFAULT_SMS) as usize;
+    let fit = |mut c: GemmCfg| {
+        while !cin.is_multiple_of(c.tile[2]) && c.tile[2] > 16 {
+            c.tile[2] /= 2;
+        }
+        let [bm, bn, bk] = c.tile;
+        let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
+        let padded = 16 * (gm * bm * gn * bn - m * n) <= gm * bm * gn * bn;
+        (padded && cin.is_multiple_of(bk) && conv_cfg_fits(&c) && c.smem_bytes(false) <= target.smem_bytes).then_some(c)
+    };
+    let eligible: Vec<GemmCfg> = CONV_FAMILIES.into_iter().filter_map(fit).collect();
+    let blocks = |c: &GemmCfg| batches * m.div_ceil(c.tile[0]) * n.div_ceil(c.tile[1]);
+    let Some(&base) = eligible
+        .iter()
+        .find(|c| blocks(c) >= CONV_BLOCKS_PER_SM * sms)
+        .or_else(|| eligible.iter().max_by_key(|c| blocks(c)))
+    else {
+        return vec![];
+    };
+    let variants = [
+        GemmCfg { stages: if base.stages == 2 { 3 } else { 2 }, ..base },
+        GemmCfg { tile: [base.tile[0], base.tile[1], 64], stages: 2, ..base },
+        GemmCfg { unroll: !base.unroll, ..base },
+    ];
+    let mut out = vec![base];
+    for c in variants.into_iter().filter_map(fit).chain(eligible) {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// One warp per 16 query rows. `d = 128` leads with half-width key blocks:
 /// 64-wide ones measured 18.2 TFLOP/s against 22.2 on sm_86, since 64 KB
 /// per block leaves one block per SM. `d = 48` keeps the shapes whose K/V
