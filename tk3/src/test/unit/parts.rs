@@ -130,49 +130,6 @@ fn row_reductions_and_broadcast() {
     check(k.finish(), vec![qd, kd], bq * (bkv + 2), (bq / 16) as u32, 1e-3);
 }
 
-/// Diagnostic: with P the identity, `o` is `v` itself; print where the first
-/// rows land.
-#[test]
-#[ignore = "diagnostic"]
-fn pv_identity_probe() {
-    let Some(target) = super::cp_async_target() else { return };
-    let (bq, bkv, d) = (64usize, 64usize, 64usize);
-    let mut k = Kernel::new("pv_id");
-    let p = k.param::<BF16>("p", ParamKind::In, bq * bkv);
-    let v = k.param::<BF16>("v", ParamKind::In, bkv * d);
-    let o_out = k.param::<F32>("o", ParamKind::Out, bq * d);
-    k.warps(4);
-    let v_s = k.smem::<BF16>("v_s", bkv * d);
-    let p_g = k.view(p, 0, [bkv, 1], Shape::new(bq, bkv), [None, None]);
-    let p_r = k.load(p_g);
-    let v_g = k.view(v, 0, [d, 1], Shape::new(bkv, d), [None, None]);
-    let v_t = k.smem_view::<BF16>(v_s, 0, Shape::new(bkv, d));
-    k.stage(v_t, v_g, CopyMode::Sync);
-    let zero = k.zeros::<F32>(Shape::new(bq, d));
-    let o = k.mma(zero, p_r, false, v_t, false);
-    let o_view = k.view(o_out, 0, [d, 1], Shape::new(bq, d), [None, None]);
-    k.store(o_view, o);
-    let prog = k.finish();
-    let pd: Vec<f32> = (0..bq * bkv).map(|i| if i / bkv == i % bkv { 1.0 } else { 0.0 }).collect();
-    // Exact in bf16: row id in the high byte, column in the low bits.
-    let vd: Vec<f32> = (0..bkv * d).map(|i| ((i / d) * 2 + (i % d) / 32) as f32).collect();
-    let lowering = Lowering {
-        group: false,
-        device: declared(target),
-        schedule: Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false, async_products: false },
-        grid: WarpGrid { rows: 4, cols: 1 },
-        swizzle: true,
-    };
-    let p_t = Tensor::from_slice(&pd).cast(DType::BFloat16);
-    let v_tt = Tensor::from_slice(&vd).cast(DType::BFloat16);
-    let out = Tensor::empty(&[bq * d], DType::Float32);
-    let got: Vec<f32> = graph_launch(prog, &lowering, &[&p_t, &v_tt, &out]).unwrap().to_vec::<f32>().unwrap();
-    let map: Vec<i32> = (0..bq).map(|r| (got[r * d] / 2.0) as i32).collect();
-    eprintln!("output row -> source row: {map:?}");
-    let col: Vec<i32> = (0..d).map(|c| (got[c] as i32) % 2).collect();
-    eprintln!("row 0 column halves: {col:?}");
-}
-
 /// The card's empirical tensor-core ceiling: register-resident `mma.sync`
 /// with f32 accumulation and no memory traffic.
 #[test]
