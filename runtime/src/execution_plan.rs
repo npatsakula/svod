@@ -463,10 +463,10 @@ pub struct ExecutionPlan {
     /// carries over to replicas.
     input_buffer_indices: HashSet<usize>,
 
-    /// One representative buffer index per distinct storage (arena views
-    /// share one storage) and whether the plan writes that storage: the
-    /// scoped-sync token recording and cross-context ordering.
-    storage_accesses: Vec<(usize, bool)>,
+    /// Indices of the buffers the plan writes. Indices, not storages: a
+    /// buffer rebound through [`Self::buffer_at_mut`] keeps its role, and
+    /// [`Self::storage_accesses`] resolves storages at every execute.
+    written_indices: Vec<usize>,
 
     /// Primary device for this plan.
     device: DeviceSpec,
@@ -1705,24 +1705,36 @@ impl ExecutionPlan {
     /// custom-function arguments (no outs list — conservatively all written,
     /// mirroring `hcq_operations`), and the plan's declared outputs.
     fn written_storage_ids(&self) -> HashSet<BufferId> {
-        let storage = |index: &usize| self.buffers.get(*index).map(Buffer::storage_id);
-        let mut written: HashSet<BufferId> = self.output_buffer_indices.iter().filter_map(storage).collect();
-        for op in &self.ops {
+        self.written_indices.iter().filter_map(|&index| self.buffers.get(index).map(Buffer::storage_id)).collect()
+    }
+
+    /// The indices [`Self::written_storage_ids`] resolves, from the ops.
+    fn written_indices(ops: &[PreparedOp], outputs: &[usize]) -> Vec<usize> {
+        let mut written: Vec<usize> = outputs.to_vec();
+        for op in ops {
             match op {
-                PreparedOp::CompiledProgram(kernel) => written.extend(
-                    kernel
-                        .output_indices
-                        .iter()
-                        .filter_map(|&position| kernel.buffer_indices.get(position))
-                        .filter_map(storage),
-                ),
-                PreparedOp::BufferCopy(copy) => written.extend(copy.buffer_indices.first().and_then(storage)),
-                PreparedOp::CustomFunction(custom) => {
-                    written.extend(custom.buffer_indices.iter().filter_map(storage));
-                }
+                PreparedOp::CompiledProgram(kernel) => written
+                    .extend(kernel.output_indices.iter().filter_map(|&position| kernel.buffer_indices.get(position))),
+                PreparedOp::BufferCopy(copy) => written.extend(copy.buffer_indices.first()),
+                PreparedOp::CustomFunction(custom) => written.extend(&custom.buffer_indices),
             }
         }
+        written.sort_unstable();
+        written.dedup();
         written
+    }
+
+    /// Every distinct storage the plan touches (arena views share one) and
+    /// whether it writes it, from the buffers bound now: the scoped-sync
+    /// token recording and cross-context ordering.
+    fn storage_accesses(&self) -> SmallVec<[(&Buffer, bool); 16]> {
+        let written = self.written_storage_ids();
+        let mut seen = HashSet::new();
+        self.buffers
+            .iter()
+            .filter(|buffer| seen.insert(buffer.storage_id()))
+            .map(|buffer| (buffer, written.contains(&buffer.storage_id())))
+            .collect()
     }
 
     /// Declare the buffer at `index` a host-written input: [`Self::replicate`]
@@ -1748,8 +1760,8 @@ impl ExecutionPlan {
     /// tokens (CPU) and on plans whose context was never minted.
     fn record_completion_token(&self, token: Option<std::sync::Arc<dyn svod_device::CompletionToken>>) {
         let Some(token) = token else { return };
-        for &(index, writes) in &self.storage_accesses {
-            self.buffers[index].record_completion(&token, writes);
+        for (buffer, writes) in self.storage_accesses() {
+            buffer.record_completion(&token, writes);
         }
         token.published();
     }
@@ -1760,8 +1772,7 @@ impl ExecutionPlan {
     /// when it replays, else the plan context of the first kernel on the
     /// plan's device.
     fn order_after_other_plans(&self, graph: Option<&dyn svod_device::Graph>) -> Result<()> {
-        let accesses: SmallVec<[(&Buffer, bool); 16]> =
-            self.storage_accesses.iter().map(|&(index, writes)| (&self.buffers[index], writes)).collect();
+        let accesses = self.storage_accesses();
         if let Some(graph) = graph {
             return graph.order_after(&accesses).context(ExecSnafu { context: "order graph after other plans" });
         }
@@ -2033,21 +2044,12 @@ impl ExecutionPlanBuilder {
             });
         }
 
-        // One representative buffer index per distinct storage; whether the
-        // plan writes it is filled in once the plan can name its writes.
-        let mut seen_storages = HashSet::new();
-        let storage_accesses: Vec<(usize, bool)> = self
-            .buffers
-            .iter()
-            .enumerate()
-            .filter(|(_, buffer)| seen_storages.insert(buffer.storage_id()))
-            .map(|(index, _)| (index, false))
-            .collect();
+        let written_indices = ExecutionPlan::written_indices(&self.ops, &self.output_buffer_indices);
 
         let op_order = compute_mixed_op_order_with_instance_dependencies(&self.ops, &self.op_instance_dependencies)?;
         let op_levels = compute_execution_levels_with_instance_dependencies(&self.ops, &self.op_instance_dependencies)?;
 
-        let mut plan = ExecutionPlan {
+        let plan = ExecutionPlan {
             ops: self.ops,
             op_instance_dependencies: self.op_instance_dependencies,
             op_order,
@@ -2056,7 +2058,7 @@ impl ExecutionPlanBuilder {
             ast_to_buffer: self.ast_to_buffer,
             output_buffer_indices: self.output_buffer_indices,
             input_buffer_indices: HashSet::new(),
-            storage_accesses,
+            written_indices,
             device: self.device,
             runtime_var_vals: HashMap::new(),
             graph: std::sync::OnceLock::new(),
@@ -2065,10 +2067,6 @@ impl ExecutionPlanBuilder {
             hcq_linked: std::sync::OnceLock::new(),
             hcq_poison: std::sync::OnceLock::new(),
         };
-        let written = plan.written_storage_ids();
-        for (index, writes) in &mut plan.storage_accesses {
-            *writes = written.contains(&plan.buffers[*index].storage_id());
-        }
         let linked = HcqLinkedPlan::capture(plan.hcq_operations()?)?;
         plan.hcq_linked.set(linked).map_err(|_| crate::error::Error::Execution {
             reason: "HCQ plan linked twice during preparation".into(),
