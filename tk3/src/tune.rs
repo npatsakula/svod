@@ -307,6 +307,7 @@ impl TuneStore {
             let (programs, built) = programs();
             let line = key.line(kind, programs);
             self.entries(key).remove(&line).filter(&valid).or_else(|| {
+                tracing::debug!(target: crate::ops::PLAN, line, "store miss");
                 let entry = measure(built)?;
                 self.put(key, line, &entry);
                 Some(entry)
@@ -445,9 +446,20 @@ impl<C: Copy + PartialEq> Bench<C> {
     }
 
     /// What compiling each of `batch` (the programs `build` makes) showed.
-    pub fn admit(&mut self, batch: &[C], build: impl Fn(C) -> Candidate) -> Vec<Compiled> {
+    pub fn admit(&mut self, batch: &[C], build: impl Fn(C) -> Candidate) -> Vec<Compiled>
+    where
+        C: std::fmt::Debug,
+    {
         self.compile(batch, |i| build(batch[i]));
-        batch.iter().map(|&c| self.built[self.find(c).expect("compiled")].1.verdict()).collect()
+        let verdict = |&cfg: &C| {
+            let built = &self.built[self.find(cfg).expect("compiled")].1;
+            let (verdict, resources) = (built.verdict(), &built.resources);
+            let registers: Vec<_> = resources.iter().map(|r| (r.vgprs, r.agprs)).collect();
+            let scratch: Vec<_> = resources.iter().map(|r| r.scratch_bytes).collect();
+            tracing::debug!(target: crate::ops::PLAN, ?cfg, ?verdict, ?registers, ?scratch, "compiled");
+            verdict
+        };
+        batch.iter().map(verdict).collect()
     }
 
     /// Each of `candidates`' best device time ([`time`]); those not compiled

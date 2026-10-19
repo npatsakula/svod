@@ -6,7 +6,7 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-use super::shape::{self, Plan, extent, shape_of};
+use super::shape::{self, extent, shape_of};
 use super::{GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output, typed};
 use crate::kernels::heads::{HeadsSpec, Rope, heads as kernel};
 use crate::launch;
@@ -64,7 +64,7 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
     let (cos, sin) = rope.unzip();
     let dtypes: Vec<DType> = [Some(qkv), q_norm, k_norm, cos, sin].into_iter().flatten().map(Tensor::dtype).collect();
     let plan = shape::heads(planner.as_deref(), &dtypes, ext.as_ref(), d);
-    let Plan::Kernel(cfgs) = plan else { return graph(qkv, opts).context(GraphSnafu { op: OP }) };
+    let Some(cfgs) = super::kernel(OP, plan) else { return graph(qkv, opts).context(GraphSnafu { op: OP }) };
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
     let (b, t) = (ext.dims[0], ext.dims[1]);
     let batch = batch_of(&var, b);

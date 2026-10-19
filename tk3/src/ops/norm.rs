@@ -4,7 +4,7 @@ use snafu::{ResultExt, ensure};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-use super::shape::{self, Plan, extent, shape_of};
+use super::shape::{self, extent, shape_of};
 use super::{GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output, typed};
 use crate::kernels::rows::{Norm, NormSpec, norm as kernel};
 use crate::launch;
@@ -67,7 +67,7 @@ fn norm(
     let (ext, var) = extent(&xs).unzip();
     let planner = super::planner(&x.device());
     let dtypes: Vec<_> = [Some(x), residual, Some(w), b].into_iter().flatten().map(Tensor::dtype).collect();
-    let Plan::Kernel(cfgs) = shape::norm(planner.as_deref(), &dtypes, ext.as_ref()) else {
+    let Some(cfgs) = super::kernel(op, shape::norm(planner.as_deref(), &dtypes, ext.as_ref())) else {
         return graph(kind, x, residual, w, b, eps).context(GraphSnafu { op });
     };
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));

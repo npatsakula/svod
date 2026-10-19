@@ -6,7 +6,7 @@ use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
-use super::shape::{self, Plan, extent, shape_of};
+use super::shape::{self, extent, shape_of};
 use super::{
     DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
     output, typed,
@@ -170,12 +170,13 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let causal = opts.causal || opts.chunk.is_some();
     let biased = bias_rows.is_some();
     let plan = shape::attention(planner.as_deref(), &dtypes, q_ext.as_ref(), k_ext.as_ref(), causal, biased);
-    let Plan::Kernel(cfgs) = plan else { return graph(q, k, v, opts).context(GraphSnafu { op: OP }) };
+    let Some(cfgs) = super::kernel(OP, plan) else { return graph(q, k, v, opts).context(GraphSnafu { op: OP }) };
     // The appended rows ride one key block, read from global memory, which
     // the warpgroup core's shared operands cannot.
     let cfgs: Vec<FaCfg> =
         cfgs.iter().copied().filter(|c| c.bkv >= appended && (appended == 0 || c.core == Core::Warp)).collect();
     if cfgs.is_empty() {
+        tracing::debug!(target: super::PLAN, op = OP, appended, "graph: no config holds the appended rows");
         return graph(q, k, v, opts).context(GraphSnafu { op: OP });
     }
     let (q_ext, k_ext, var) = (q_ext.expect("planned"), k_ext.expect("planned"), var.flatten());
@@ -254,7 +255,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         programs
     });
     let cfg = tune(&mut tuner, &ranked, biased, expand);
-    tracing::debug!(?shape, ?cfg, "attention tuned");
+    tracing::debug!(target: super::PLAN, op = OP, ?shape, pick = ?cfg, "attention tuned");
     let i32 = |t: &Tensor| if t.dtype() == DType::Int32 { t.clone() } else { t.cast(DType::Int32) };
     let lens = lens.map(i32);
     // Rows padded to the kernel's aligned stride.

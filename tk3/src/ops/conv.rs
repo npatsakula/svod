@@ -5,7 +5,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-use super::shape::{self, Plan, extent, shape_of};
+use super::shape::{self, extent, shape_of};
 use super::{
     Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
     output,
@@ -110,7 +110,7 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
     let residual_dtype = opts.residual.map(Tensor::dtype);
     let plan =
         shape::conv2d(planner.as_deref(), &dtypes, out_dtype.clone(), residual_dtype, ext.as_ref(), &geom, groups);
-    let Plan::Kernel(cfgs) = plan else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
+    let Some(cfgs) = super::kernel(OP, plan) else { return graph(x, w, opts).context(GraphSnafu { op: OP }) };
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
     let images = ext.dims[0];
     let batch = match var {

@@ -161,7 +161,7 @@ fn a_gated_gemm_is_a_double_width_problem() {
     assert_valid(&gated, &target, 1024, true);
     assert!(gated.iter().all(|c| c.tile[2] >= 32), "{gated:?}");
     let p = config::Problem { batches: 1, m: 4096, n: 3072, k: 1024, halves: 2 };
-    assert!(deep.smem_bytes(true) > target.smem_bytes && p.admit(&planner(target), &deep).is_none());
+    assert!(deep.smem_bytes(true) > target.smem_bytes && p.admit(&planner(target), &deep).is_err());
 }
 
 /// The layout count over-counts gfx11's replicated WMMA fragments: at
@@ -859,7 +859,7 @@ fn a_planner_over_a_zero_field_still_ranks() {
     let p = config::Problem { batches: 1, m: 704, n: 1536, k: 512, halves: 1 };
     let ranked = p.ranked(&planner);
     assert!(!ranked.is_empty());
-    assert!(ranked.iter().all(|c| p.admit(&planner, c).is_some_and(|(cost, _)| cost.is_finite() && cost > 0.0)));
+    assert!(ranked.iter().all(|c| p.admit(&planner, c).is_ok_and(|(cost, _)| cost.is_finite() && cost > 0.0)));
     assert!(!planner.attention_ranked(8, 512, 512, 128, true, false).is_empty());
 }
 
@@ -871,11 +871,11 @@ fn a_ranking_at_zero_costs_is_finite() {
     let p = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     let ranked = p.ranked(&planner);
     assert!(!ranked.is_empty());
-    assert!(ranked.iter().all(|c| p.admit(&planner, c).is_some_and(|(cost, _)| cost == 0.0)));
+    assert!(ranked.iter().all(|c| p.admit(&planner, c).is_ok_and(|(cost, _)| cost == 0.0)));
     let a = config::Attention { tiles: 8, t: 100, tk: 100, d: 64, causal: true, bias: false };
     let ranked = a.ranked(&planner);
     assert!(!ranked.is_empty());
-    assert!(ranked.iter().all(|c| a.admit(&planner, c).is_some_and(|(cost, _)| cost == 0.0)));
+    assert!(ranked.iter().all(|c| a.admit(&planner, c).is_ok_and(|(cost, _)| cost == 0.0)));
 }
 
 /// Every list is non-empty, duplicate-free, within shared memory and divides `k`.

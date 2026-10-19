@@ -17,6 +17,7 @@
 //! are small functions of the target.
 
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -152,7 +153,7 @@ type Cores = [(Core, &'static [[u32; 2]], &'static [usize])];
 /// Every config the construct spans on `target`: the tiles and warp grids,
 /// the ring depths its prefetch runs, rolled and unrolled; on a target with
 /// warpgroup instructions, the tiles of whole warpgroups on them as well.
-fn lattice(target: &Target) -> Vec<GemmCfg> {
+pub fn gemm_lattice(target: &Target) -> Vec<GemmCfg> {
     let cores: &Cores = match (target.cp_async, target.group_mma.is_empty()) {
         (false, _) => &[(Core::Warp, &GRIDS, &[2, 1])],
         (true, true) => &[(Core::Warp, &GRIDS, &[3, 2, 1])],
@@ -186,6 +187,41 @@ fn lattice(target: &Target) -> Vec<GemmCfg> {
     }
     out
 }
+
+/// Why a ranking leaves a config out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rejected {
+    /// It does not lower on the target: no matrix core, a warp grid that
+    /// does not tile the core's atoms, a fill that does not split into whole
+    /// 16-byte chunks per thread, a ring depth the prefetch does not run.
+    Lowers,
+    /// Its step is shallower than two matrix-core depths where the
+    /// reduction allows one.
+    Shallow,
+    /// Its step does not divide the reduction.
+    Divides,
+    /// Its shared memory passes the block's.
+    Smem { need: usize, have: usize },
+    /// Its tiles have no register layout.
+    Layout,
+    /// The registers a lane holds at once pass what it may.
+    Registers { need: u32, have: u32 },
+}
+
+/// A ranking: its configs with their costs ([`Planner::pipelined`] ns of SM
+/// time) and registers by the layout count, cheapest first (then fewer
+/// registers), logged under [`crate::ops::PLAN`] with how many `rejected` it left out.
+fn sorted<C: Debug>(problem: &impl Debug, mut ranked: Vec<(f64, u32, C)>, rejected: usize) -> Vec<(f64, u32, C)> {
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    tracing::debug!(target: crate::ops::PLAN, ?problem, ranked = ranked.len(), rejected, "ranking");
+    for (rank, (ns, regs, cfg)) in ranked.iter().take(LOGGED).enumerate() {
+        tracing::debug!(target: crate::ops::PLAN, rank, ns, regs, ?cfg, "ranked");
+    }
+    ranked
+}
+
+/// The configs of a ranking logged with their costs.
+const LOGGED: usize = 16;
 
 /// How a problem runs under one config: `blocks` blocks of `waves` waves,
 /// each holding `smem` bytes of shared memory and `regs` registers a lane
@@ -241,30 +277,40 @@ impl Problem {
     /// SM time) and a lane's registers by the layout count, which over-counts
     /// what the lowering streams (the compiled kernel judges, [`shortlist`]);
     /// `None` when it does not lower, or when its [live
-    /// registers](GemmCfg::live_registers) alone pass the lane's limit. A trip
+    /// registers](GemmCfg::live_registers) alone pass the lane's limit; why it
+    /// is left out otherwise. A trip
     /// pays its fragment reads, fill, matrix-core steps (padding included)
     /// and overhead. The fill's bytes are the whole operands' distinct ones,
     /// and the blocks in flight at once (one an SM at least) share a group's
     /// A rows and their B columns whatever the cache holds of the whole.
-    pub(crate) fn admit(&self, planner: &Planner, cfg: &GemmCfg) -> Option<(f64, u32)> {
+    pub fn admit(&self, planner: &Planner, cfg: &GemmCfg) -> Result<(f64, u32), Rejected> {
         let Device { target, costs } = &planner.device;
         let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
         let gated = self.halves == 2;
+        let atom = target.mma.first().ok_or(Rejected::Lowers)?;
         // A step is at least two matrix-core depths, unless the reduction dim
         // allows nothing deeper.
-        let depth = 2 * target.mma.first()?.k as usize;
-        let deep = bk >= depth || !self.k.is_multiple_of(depth);
+        let depth = 2 * atom.k as usize;
         let smem = cfg.smem_bytes(gated);
-        if !(deep && self.k.is_multiple_of(bk) && cfg.fits(target) && smem <= target.smem_bytes) {
-            return None;
+        if bk < depth && self.k.is_multiple_of(depth) {
+            return Err(Rejected::Shallow);
         }
-        let regs = cfg.registers(target, self.halves)?;
+        if !self.k.is_multiple_of(bk) {
+            return Err(Rejected::Divides);
+        }
+        if !cfg.fits(target) {
+            return Err(Rejected::Lowers);
+        }
+        if smem > target.smem_bytes {
+            return Err(Rejected::Smem { need: smem, have: target.smem_bytes });
+        }
+        let regs = cfg.registers(target, self.halves).ok_or(Rejected::Layout)?;
         let (halves, waves) = (self.halves, wr * wc);
-        let (acc, live) = cfg.live_registers(target, self.halves)?;
-        if !target.occupancy.holds(acc, live) || acc + live > target.lane_budget(waves as u32) {
-            return None;
+        let (acc, live) = cfg.live_registers(target, self.halves).ok_or(Rejected::Layout)?;
+        let budget = target.lane_budget(waves as u32);
+        if !target.occupancy.holds(acc, live) || acc + live > budget {
+            return Err(Rejected::Registers { need: acc + live, have: budget });
         }
-        let atom = target.mma.first()?;
         // A warpgroup product reads no fragments and holds one accumulator
         // chain per instruction column block; its step is the group's.
         let (atoms, fragments, step) = match cfg.core {
@@ -274,8 +320,8 @@ impl Problem {
                 costs.step,
             ),
             Core::Group => {
-                let group = target.group_mma.first()?;
-                let n = group.n_for((bn / wc) as u32)? as usize;
+                let group = target.group_mma.first().ok_or(Rejected::Lowers)?;
+                let n = group.n_for((bn / wc) as u32).ok_or(Rejected::Lowers)? as usize;
                 (bn * halves / wc / n, 0, costs.step_group)
             }
         };
@@ -292,7 +338,7 @@ impl Problem {
         let work = steps as f64 * step;
         let trip = costs.trip(stages, !cfg.unroll && !target.cp_async);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
-        Some((planner.pipelined(run), regs))
+        Ok((planner.pipelined(run), regs))
     }
 
     /// The lattice's configs that run this problem on the planner's target,
@@ -301,11 +347,13 @@ impl Problem {
     /// the cost band holds: the shortlist keeps a tile's first clean one
     /// ([`shortlist`]).
     pub fn ranked(&self, planner: &Planner) -> Vec<GemmCfg> {
-        let mut ranked: Vec<(f64, u32, GemmCfg)> = lattice(&planner.device.target)
+        let lattice = gemm_lattice(&planner.device.target);
+        let count = lattice.len();
+        let admitted: Vec<(f64, u32, GemmCfg)> = lattice
             .into_iter()
-            .filter_map(|c| self.admit(planner, &c).map(|(cost, regs)| (cost, regs, c)))
+            .filter_map(|c| self.admit(planner, &c).ok().map(|(cost, regs)| (cost, regs, c)))
             .collect();
-        ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let ranked = sorted(self, admitted, count);
         spread(ranked.into_iter().map(|(cost, _, c)| (cost, c)).collect(), |c| [c.tile[0], c.tile[1]])
     }
 }
@@ -892,20 +940,26 @@ impl Attention {
     /// the narrower product's, over every atom row the warp owns. A warp
     /// owning more rows reads each fragment for all of them: the fragment
     /// reads are per wave, so they divide by the rows per warp.
-    pub(crate) fn admit(&self, planner: &Planner, cfg: &FaCfg) -> Option<(f64, u32)> {
+    pub fn admit(&self, planner: &Planner, cfg: &FaCfg) -> Result<(f64, u32), Rejected> {
         let Device { target, costs } = &planner.device;
         let (bq, bkv, d, kw) = (cfg.bq, cfg.bkv, self.d, cfg.key_warps);
         let smem = cfg.smem_bytes(d, self.bias) + cfg.scratch_bytes(target);
-        if !(cfg.fits(target, d, self.bias) && smem <= target.smem_bytes) {
-            return None;
+        if !cfg.fits(target, d, self.bias) {
+            return Err(Rejected::Lowers);
         }
-        let regs = cfg.registers(target, d, self.bias)?;
+        if smem > target.smem_bytes {
+            return Err(Rejected::Smem { need: smem, have: target.smem_bytes });
+        }
+        let regs = cfg.registers(target, d, self.bias).ok_or(Rejected::Layout)?;
         // Where the accumulators have a file of their own, the output's are
         // priced against it and the rest against the vector registers.
         if target.occupancy.acc_file > 0 {
-            let acc = cfg.accumulators(target, d)?;
+            let acc = cfg.accumulators(target, d).ok_or(Rejected::Layout)?;
             if !target.occupancy.holds(acc, regs - acc) {
-                return None;
+                return Err(Rejected::Registers {
+                    need: regs,
+                    have: target.occupancy.acc_file + target.occupancy.registers,
+                });
             }
         }
         let waves = cfg.warps() as usize;
@@ -914,12 +968,12 @@ impl Attention {
         // the register file.
         let (atoms, kv_reads, step) = match cfg.core {
             Core::Warp => {
-                let atom = target.mma.first()?;
+                let atom = target.mma.first().ok_or(Rejected::Lowers)?;
                 let atoms = (cfg.warp_rows / atom.m as usize) * (bkv.min(d) / atom.n as usize);
                 (atoms, 2 * waves * bkv * d * 2, costs.step)
             }
             Core::Group if regs <= target.lane_budget(waves as u32) => (1, 0, costs.step_group),
-            Core::Group => return None,
+            Core::Group => return Err(Rejected::Registers { need: regs, have: target.lane_budget(waves as u32) }),
         };
         let bias = usize::from(self.bias) * kw * bq * bkv * 2;
         let fragments = kv_reads + bias;
@@ -937,24 +991,17 @@ impl Attention {
         let work = steps as f64 * step + (kw * bq * bkv) as f64 * costs.score;
         let trip = costs.trip(stages, !cfg.unroll && !target.cp_async);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
-        Some((planner.pipelined(run), regs))
+        Ok((planner.pipelined(run), regs))
     }
 
-    /// The lattice's configs that run this problem on the planner's target,
-    /// cheapest first, then by fewer registers, every pipeline of every query
-    /// and key block size at one atom row per warp, on the warp-level core
-    /// and, where the target has it, the warpgroup core, in the plain softmax
-    /// forms (the tuner sets the others); the shortlist keeps a tile's first
-    /// clean one. After them, the same configs at two atom rows per warp
-    /// where that can pay ([`Self::two_rows_pay`]), in their twins' order: a
-    /// variant of a tile (its rows per warp are not part of it), so the
-    /// shortlist holds the one-row representatives and the twins stage times
-    /// the variant beside them for the contender tiles.
-    pub fn ranked(&self, planner: &Planner) -> Vec<FaCfg> {
-        let target = &planner.device.target;
+    /// Every config the ranking spans for this problem on `target`: every
+    /// pipeline of every query and key block size at one atom row per warp,
+    /// on the warp-level core and, where the target has it, the warpgroup
+    /// core, in the plain softmax forms.
+    pub fn lattice(&self, target: &Target) -> Vec<FaCfg> {
         let stages: &[usize] = if target.cp_async { &[3, 2] } else { &[2] };
         let cores: &[Core] = if target.group_mma.is_empty() { &[Core::Warp] } else { &[Core::Warp, Core::Group] };
-        let mut ranked: Vec<(f64, u32, FaCfg)> = vec![];
+        let mut out = vec![];
         for (core, bq) in cores.iter().flat_map(|&c| [16, 32, 64, 128, 256].map(|bq| (c, bq))) {
             // The warp-level core's blocks stop at eight row warps.
             if core == Core::Warp && bq > 128 {
@@ -966,17 +1013,33 @@ impl Attention {
                 for &stages in stages {
                     for unroll in [false, true] {
                         for &key_warps in key_warps {
-                            let cfg = FaCfg { unroll, key_warps, core, ..FaCfg::new(bq, bkv, stages) };
-                            if let Some((cost, regs)) = self.admit(planner, &cfg) {
-                                ranked.push((cost, regs, cfg));
-                            }
+                            out.push(FaCfg { unroll, key_warps, core, ..FaCfg::new(bq, bkv, stages) });
                         }
                     }
                 }
             }
         }
-        ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let one: Vec<FaCfg> = ranked.into_iter().map(|(_, _, c)| c).collect();
+        out
+    }
+
+    /// The [`lattice`](Self::lattice)'s configs that run this problem on the planner's target,
+    /// cheapest first, then by fewer registers, every pipeline of every query
+    /// and key block size at one atom row per warp, on the warp-level core
+    /// and, where the target has it, the warpgroup core, in the plain softmax
+    /// forms (the tuner sets the others); the shortlist keeps a tile's first
+    /// clean one. After them, the same configs at two atom rows per warp
+    /// where that can pay ([`Self::two_rows_pay`]), in their twins' order: a
+    /// variant of a tile (its rows per warp are not part of it), so the
+    /// shortlist holds the one-row representatives and the twins stage times
+    /// the variant beside them for the contender tiles.
+    pub fn ranked(&self, planner: &Planner) -> Vec<FaCfg> {
+        let lattice = self.lattice(&planner.device.target);
+        let count = lattice.len();
+        let admitted: Vec<(f64, u32, FaCfg)> = lattice
+            .into_iter()
+            .filter_map(|c| self.admit(planner, &c).ok().map(|(cost, regs)| (cost, regs, c)))
+            .collect();
+        let one: Vec<FaCfg> = sorted(self, admitted, count).into_iter().map(|(_, _, c)| c).collect();
         let two = one
             .iter()
             .map(|&c| (c, FaCfg { warp_rows: 2 * WARP_ROWS, ..c }))
@@ -1004,7 +1067,7 @@ impl Attention {
         one.core == Core::Warp
             && one.bq >= TWO_ROWS_FROM
             && one.key_warps == 1
-            && self.admit(planner, wide).is_some()
+            && self.admit(planner, wide).is_ok()
             && resident(wide).zip(resident(one)).is_some_and(|(w, o)| w >= o)
     }
 }

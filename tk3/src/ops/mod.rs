@@ -34,7 +34,24 @@ pub use crate::kernels::Act;
 use crate::kernels::Batch;
 use crate::tune::{self, Bench, TuneKey, TuneStore};
 use config::Planner;
-use shape::BatchVar;
+use shape::{BatchVar, Plan};
+
+/// The tracing target of the planner's decisions, at debug: an op that
+/// takes the graph and why, a ranking's front with each config's predicted
+/// ns and how many it left out, on a store miss what compiling each config
+/// showed (its verdict, registers and spilled bytes), and the tuned pick.
+pub const PLAN: &str = "svod_tk3::plan";
+
+/// `plan`'s ranked configs, or `None` with why `op` takes the graph logged.
+fn kernel<C>(op: &'static str, plan: Plan<C>) -> Option<Arc<[C]>> {
+    match plan {
+        Plan::Kernel(cfgs) => Some(cfgs),
+        Plan::Graph(why) => {
+            tracing::debug!(target: PLAN, op, ?why, "graph");
+            None
+        }
+    }
+}
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -204,7 +221,9 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     pub(crate) fn tuned(&mut self, op: &'static str, ranked: &[C], expand: impl Fn(&[C]) -> Vec<C>) -> C {
         let candidates = expand(&self.admitted(op, &config::representatives(ranked)));
         let ordered = self.ordered(op, &candidates);
-        self.pipelined(op, &ordered, ranked)
+        let pick = self.pipelined(op, &ordered, ranked);
+        tracing::debug!(target: PLAN, op, shape = ?self.shape, ?pick, "tuned");
+        pick
     }
 
     /// The fastest pipeline of the leading tiles of `ordered` (fastest
