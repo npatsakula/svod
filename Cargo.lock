@@ -3690,6 +3690,7 @@ dependencies = [
  "libm",
  "papaya",
  "proptest",
+ "rayon",
  "smallvec",
  "snafu",
  "svod-codegen",
