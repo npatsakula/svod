@@ -50,8 +50,9 @@ pub struct Qwen3Model {
 }
 
 /// The length multiple 16-bit sequences run at on a tk3 device, and the
-/// embedder's plan bucket: whole query tiles of every attention config, so
-/// no tile is cut by the sequence end.
+/// embedder's plan bucket: the JIT bucket granularity, bounding how many
+/// sequence lengths compile a plan. It is not a kernel tile; tk3's kernels
+/// bound any length.
 pub(crate) const SEQUENCE_TILE: usize = 128;
 
 /// Positions the rope cache holds: the context rounded up to
