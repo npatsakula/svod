@@ -19,7 +19,7 @@ configs बचे हों: जब हर compile होने वाला con
 फ़ैसला समय करता है और spill करने वाला kernel भी ग्राफ़ को हरा देता है। एक config की list भी इसी रास्ते से
 जाती है, और कोई op spills की वजह से ग्राफ़ पर नहीं गिरता। Admit हुए configs, अपने variants के साथ (attention
 के लिए key splits, भूखी convolution के लिए reduction splits), वे candidates हैं जिन्हें tune store तब मापता है
-जब कोई device पहली बार किसी shape से मिलता है, और वह उनका समय-क्रम रखता है; फिर तीन अग्रणी tiles
+जब कोई device पहली बार किसी shape से मिलता है, और वह उनका समय-क्रम रखता है; फिर चार अग्रणी tiles
 (`config::TWIN_TILES`) की बाक़ी
 pipelines compile होकर उसके मुक़ाबले मापी जाती हैं, spill करें या न करें (एक tile की pipelines के बीच
 अकेले समय ही फ़ैसला करता है, और थोड़ा spill करती unrolled ring सबसे तेज़ हो सकती है), और सबसे तेज़
