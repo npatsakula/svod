@@ -552,13 +552,6 @@ fn trip_baselines_load_as_the_fill_loads(target: Target, l2_only: bool) {
     }
 }
 
-#[test_case(&[(100, 160), (102, 161), (101, 159)], true; "a baseline that moves the bytes")]
-#[test_case(&[(80, 160), (81, 161), (79, 159)], true; "half the probe")]
-#[test_case(&[(29, 2400), (30, 2410), (29, 2395)], false; "a baseline whose loads left the loop")]
-fn a_baseline_under_half_its_probe_is_not_measurable(pairs: &[(u64, u64)], measurable: bool) {
-    assert_eq!(probe::resolved(pairs).map(|r| r.measurable()), Some(measurable));
-}
-
 /// Every trip pair, as clang -O3 compiles it for RDNA, keeps a global load
 /// inside its loop: no ring depth folds a trip's chunk or slot index to a
 /// constant the loop's loads could be hoisted on. With the slot
@@ -589,15 +582,23 @@ fn trip_pairs_load_inside_their_loops(target: Target) {
     }
 }
 
-#[test_case(&[(100, 160), (102, 161), (101, 159)], Some((59.0, 0.0, 59.0)); "clear of the spread")]
-#[test_case(&[(100, 103), (110, 104), (104, 112), (100, 106), (103, 105)], Some((3.0, 4.0, 4.0)); "inside the spread, bounded by it")]
-#[test_case(&[(150, 160), (100, 140), (101, 141), (102, 139), (99, 140)], Some((40.0, 3.0, 40.0)); "a slow first run trimmed")]
-#[test_case(&[(200, 100), (201, 101), (202, 102)], Some((-100.0, 0.0, 0.0)); "faster than its baseline, bounded by the spread")]
+/// A pair's timings resolve to the median difference, the spread of the
+/// differences with their extremes trimmed and the value (the difference
+/// where it clears the spread, else the spread bounding it), and are
+/// measurable where the baseline takes at least half the probe's time: a
+/// baseline under half its probe moved less than the bytes (its loads left
+/// the loop on gfx1201 and gfx1151), and its difference would price them.
+#[test_case(&[(100, 160), (102, 161), (101, 159)], Some((59.0, 0.0, 59.0, true)); "clear of the spread, a baseline that moves the bytes")]
+#[test_case(&[(80, 160), (81, 161), (79, 159)], Some((80.0, 0.0, 80.0, true)); "a baseline half the probe")]
+#[test_case(&[(29, 2400), (30, 2410), (29, 2395)], Some((2371.0, 0.0, 2371.0, false)); "a baseline whose loads left the loop")]
+#[test_case(&[(100, 103), (110, 104), (104, 112), (100, 106), (103, 105)], Some((3.0, 4.0, 4.0, true)); "inside the spread, bounded by it")]
+#[test_case(&[(150, 160), (100, 140), (101, 141), (102, 139), (99, 140)], Some((40.0, 3.0, 40.0, true)); "a slow first run trimmed")]
+#[test_case(&[(200, 100), (201, 101), (202, 102)], Some((-100.0, 0.0, 0.0, true)); "faster than its baseline, bounded by the spread")]
 #[test_case(&[(100, 160)], None; "one pair has no spread")]
 #[test_case(&[(100, 160), (102, 161)], None; "two pairs leave none trimmed")]
-#[test_case(&[(3000, 3230), (3300, 3525), (3100, 3328), (3400, 3633), (3200, 3420)], Some((228.0, 5.0, 228.0)); "a clock drifting between pairs")]
+#[test_case(&[(3000, 3230), (3300, 3525), (3100, 3328), (3400, 3633), (3200, 3420)], Some((228.0, 5.0, 228.0, true)); "a clock drifting between pairs")]
 #[test_case(&[], None; "no pair")]
-fn a_resolved_difference_clears_its_spread(pairs: &[(u64, u64)], want: Option<(f64, f64, f64)>) {
-    let got = probe::resolved(pairs).map(|r| (r.difference, r.spread, r.value()));
+fn a_resolved_difference_clears_its_spread(pairs: &[(u64, u64)], want: Option<(f64, f64, f64, bool)>) {
+    let got = probe::resolved(pairs).map(|r| (r.difference, r.spread, r.value(), r.measurable()));
     assert_eq!(got, want);
 }
