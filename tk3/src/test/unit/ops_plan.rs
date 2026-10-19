@@ -224,6 +224,12 @@ fn heads_plan(d: usize, want: Result<NormCfg, Fallback>) {
 }
 
 #[test]
+fn heads_keep_the_graph_for_a_weight_off_the_stream_dtype() {
+    let x = ext(&[2, 100, 12 * 64]);
+    assert_eq!(shape::heads(Some(&sm86()), &[BF16, DType::Float16], Some(&x), 64), Plan::Graph(Fallback::Dtype));
+}
+
+#[test]
 fn heads_need_three_dims() {
     let x = ext(&[200, 12 * 64]);
     assert_eq!(shape::heads(Some(&sm86()), &[BF16], Some(&x), 64), Plan::Graph(Fallback::Shape));
@@ -344,9 +350,9 @@ fn semantic_mismatches_are_errors() {
     let w = t(&[32], BF16);
     let bad = Qkv { k_norm: Some(&w), ..split };
     assert!(matches!(err3(tk::heads(&qkv, bad)), Error::Shape { operand: "k norm", .. }));
+    // Off the stream dtype is the graph's to handle, not an error.
     let w16 = t(&[64], DType::Float16);
-    let bad = Qkv { q_norm: Some(&w16), ..split };
-    assert!(matches!(err3(tk::heads(&qkv, bad)), Error::Dtype { operand: "q norm", .. }));
+    assert!(tk::heads(&qkv, Qkv { q_norm: Some(&w16), ..split }).is_ok());
     let cos = t(&[1, 10, 1, 64], BF16);
     let bad = Qkv { rope: Some((&cos, &cos)), ..split };
     assert!(matches!(err3(tk::heads(&qkv, bad)), Error::Shape { operand: "cos", .. }));
