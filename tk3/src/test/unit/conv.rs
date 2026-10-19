@@ -611,7 +611,11 @@ fn conv_throughput_probe() {
         let flops = 2.0 * (ho * wo * cout * g.k()) as f64;
         let tflops = |ns: f64| flops / ns / 1e3;
         let label = format!("{cin}->{cout} s{stride} @{side}");
-        let (cands, pick) = device_candidates(&planner, &g, SILU_BIAS);
+        let (mut cands, pick) = device_candidates(&planner, &g, SILU_BIAS);
+        // The pick may be a pipeline twin of an admitted tile.
+        if let Some(pick) = pick.filter(|p| !cands.contains(p)) {
+            cands.push(pick);
+        }
         let build = |c: ConvCfg| {
             let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue: SILU_BIAS, cfg: c.gemm, split: c.split };
             spec.programs::<F16>(&planner.device)

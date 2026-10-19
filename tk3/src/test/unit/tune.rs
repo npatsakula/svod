@@ -516,3 +516,34 @@ fn a_scratch_plan_publishes_nothing() {
     let (first, second) = (launched(), launched());
     assert!(kernels(&first).iter().zip(kernels(&second)).all(|(a, b)| std::ptr::eq(*a, b)));
 }
+
+/// The pool's fill is prepared as a candidate is, in passing: a kernel of
+/// the fill's shape prepared after it, as a model's are after a tune, gets
+/// the bare shape name an ephemeral prepare keeps, not the counter's next
+/// (Nemotron's first warm run after a tune compiled its elementwise kernels
+/// again, under `n1` names).
+#[test]
+fn a_scratch_fill_moves_no_kernel_name_counter() {
+    use crate::ir::{Param, ParamKind};
+    use svod_dtype::DType;
+    use svod_tensor::{PrepareConfig, Tensor};
+    // A prime count: no other kernel of the process has the fill's shape.
+    let elems = 999_983;
+    let names = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(|k| k.entry_point.clone()).collect::<Vec<_>>();
+    let mut ephemeral = PrepareConfig::from_env();
+    ephemeral.ephemeral = true;
+    // A tensor prepares once; the ephemeral prepares publish nothing the
+    // later one could read.
+    let bare = |t: Tensor| names(&t.prepare_with(&ephemeral).expect("a plan"));
+    let (zeros, ones) = (
+        || Tensor::zeros(&[elems], DType::Float32).contiguous(),
+        || Tensor::ones(&[elems], DType::Float32).contiguous(),
+    );
+    let expected = bare(ones());
+    assert!(!expected.is_empty());
+    assert_eq!(bare(zeros()), expected, "the fill and the kernel after it share a shape name");
+    let pool = ScratchPool::default();
+    let param = Param { name: "x".into(), dtype: ScalarDType::Float32, kind: ParamKind::In, elems };
+    assert_eq!(pool.buffers(&[param]).len(), 1);
+    assert_eq!(names(&ones().prepare().expect("a plan")), expected, "the fill moved the counter");
+}
