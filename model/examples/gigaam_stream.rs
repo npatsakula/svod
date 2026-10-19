@@ -113,10 +113,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         pos = end;
-        let t0 = Instant::now();
+        let (t0, before) = (Instant::now(), streamer.rounds());
         let events = streamer.step()?;
         let took = t0.elapsed();
-        if !events.is_empty() {
+        if streamer.rounds() > before {
             t_step += took;
             steps += 1;
             slowest = slowest.max(took);
@@ -137,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  [{:6.2} - {:6.2}] {}", word.start, word.end, word.text);
     }
     println!(
-        "\n{} streams × {:.1} s in {:.2} s wall (RTF {:.4}); {steps} rounds with output, {:.1} ms mean, {:.1} ms slowest",
+        "\n{} streams × {:.1} s in {:.2} s wall (RTF {:.4}); {steps} pushes ran a step, {:.1} ms mean, {:.1} ms slowest",
         args.streams,
         seconds,
         wall.as_secs_f32(),

@@ -153,6 +153,7 @@ pub struct GigaAmStreamer {
     generation: u32,
     /// Mel frames per chunk.
     chunk_mel: usize,
+    rounds: u64,
 }
 
 impl GigaAmStreamer {
@@ -227,6 +228,7 @@ impl GigaAmStreamer {
             lanes: (0..lanes).map(|_| None).collect(),
             generation: 0,
             chunk_mel,
+            rounds: 0,
         })
     }
 
@@ -241,6 +243,11 @@ impl GigaAmStreamer {
 
     pub fn sample_rate(&self) -> usize {
         self.model.config.sample_rate
+    }
+
+    /// Batched steps run so far.
+    pub fn rounds(&self) -> u64 {
+        self.rounds
     }
 
     /// Seconds per encoder frame.
@@ -390,6 +397,7 @@ impl GigaAmStreamer {
     }
 
     fn run(&mut self, feeds: &[Feed], events: &mut Vec<StreamEvent>) -> Result<()> {
+        self.rounds += 1;
         let lanes = self.lanes.len();
         let framed_len = self.framed.len() / lanes;
         let look_ahead = self.streaming.right_context_chunks > 0;
