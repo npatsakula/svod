@@ -220,6 +220,11 @@ pub enum TileOp {
     Transpose {
         src: ValId,
     },
+    /// The same elements held under the layout its consumer needs; inserted
+    /// by the layout inference, never by an author.
+    Relayout {
+        src: ValId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

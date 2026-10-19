@@ -331,7 +331,7 @@ impl Frame<'_> {
                     })
                     .collect()
             }
-            TileOp::Cast { src, .. } => self.read(*src),
+            TileOp::Cast { src, .. } | TileOp::Relayout { src } => self.read(*src),
             TileOp::Mma { acc, a, b, a_t, b_t } => {
                 let (va, vb) = (self.read(*a), self.read(*b));
                 let (sa, sb) = (self.prog.value(*a).shape, self.prog.value(*b).shape);
