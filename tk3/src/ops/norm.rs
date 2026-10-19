@@ -82,8 +82,8 @@ fn norm(
     })
     .tuned(op, &cfgs, <[_]>::to_vec);
     let spec = spec(cfg);
-    let out = output(&ext.dims, &var, x.dtype());
-    let sum = residual.map(|_| output(&ext.dims, &var, x.dtype()));
+    let out = output(&ext.dims, &var, x.dtype()).context(GraphSnafu { op })?;
+    let sum = residual.map(|_| output(&ext.dims, &var, x.dtype())).transpose().context(GraphSnafu { op })?;
     let ins: Vec<&Tensor> = [Some(x), residual, Some(w), b, Some(&out), sum.as_ref()].into_iter().flatten().collect();
     let at = ins.len() - 1 - usize::from(sum.is_some());
     let mut outs = launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &cfg.lowering(&planner.device), &ins)

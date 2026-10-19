@@ -18,6 +18,7 @@ use std::fmt::Debug;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use snafu::Snafu;
+use svod_device::BufferSpec;
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DType, DeviceSpec, ScalarDType};
 use svod_ir::SInt;
@@ -251,12 +252,20 @@ fn batch_of(var: &Option<BatchVar>, static_batches: usize) -> Batch {
 
 /// A kernel output: allocated at capacity, shaped with the live batch in dim 0
 /// so a consumer kernel binds the realized buffer itself rather than a copy.
-fn output(dims: &[usize], var: &Option<BatchVar>, dtype: DType) -> Tensor {
+fn output(dims: &[usize], var: &Option<BatchVar>, dtype: DType) -> svod_tensor::error::Result<Tensor> {
     let mut shape: Vec<SInt> = dims.iter().map(|&d| SInt::Const(d)).collect();
     if let Some(var) = var {
         shape[0] = var.dim.clone();
     }
-    Tensor::empty_dynamic(&shape, dtype)
+    kernel_buffer(&shape, dtype)
+}
+
+/// Storage a kernel writes: device-local where the backend tells it apart
+/// from host-visible memory, as the scheduler places graph intermediates;
+/// the host reads it back through `copyout`.
+fn kernel_buffer(shape: &[SInt], dtype: DType) -> svod_tensor::error::Result<Tensor> {
+    let local = svod_device::registry::registry().get(&default_device()).is_ok_and(|a| a.supports_device_local());
+    Tensor::empty_dynamic_spec(shape, dtype, BufferSpec { cpu_access: !local, ..BufferSpec::default() })
 }
 
 /// `f::<T>(spec)` for the 16-bit element type `dtype`.

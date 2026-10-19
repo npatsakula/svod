@@ -6,7 +6,10 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
-use super::{Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output};
+use super::{
+    Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
+    output,
+};
 use crate::build::{BF16, F16};
 use crate::kernels::Batch;
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
@@ -153,14 +156,15 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
     let cfg = Tuner::new(&planner.device, x.dtype(), &key, (&batch, epilogue), |c| programs(&spec(c)))
         .tuned(OP, &cfgs, expand);
     let mut programs = programs(&spec(cfg)).into_iter();
-    let y = output(&[images, ho, wo, geom.cout], &var, out_dtype);
+    let y = output(&[images, ho, wo, geom.cout], &var, out_dtype).context(GraphSnafu { op: OP })?;
     let (prog, lowering) = programs.next().expect("the convolution");
     let ins = [Some(x), Some(w), opts.bias, opts.residual, Some(&y)];
     let Some((merge, merge_lowering)) = programs.next() else {
         let ins: Vec<&Tensor> = ins.into_iter().flatten().collect();
         return launch::graph_launch(prog, &lowering, &ins).context(LaunchSnafu { op: OP });
     };
-    let partial = Tensor::empty(&[cfg.split * images * ho * wo * geom.cout], DType::Float32);
+    let partial = kernel_buffer(&[SInt::Const(cfg.split * images * ho * wo * geom.cout)], DType::Float32)
+        .context(GraphSnafu { op: OP })?;
     let partial = launch::graph_launch(prog, &lowering, &[x, w, &partial]).context(LaunchSnafu { op: OP })?;
     let ins: Vec<&Tensor> = [Some(&partial), opts.bias, opts.residual, Some(&y)].into_iter().flatten().collect();
     launch::graph_launch(merge, &merge_lowering, &ins).context(LaunchSnafu { op: OP })

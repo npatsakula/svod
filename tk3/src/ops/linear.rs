@@ -80,7 +80,7 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
         vec![(typed!(x.dtype(), gemm, &spec(cfg)), cfg.lowering(&planner.device))]
     })
     .tuned(OP, &cfgs, <[_]>::to_vec);
-    let y = output(&[lead, &[n]].concat(), &var, x.dtype());
+    let y = output(&[lead, &[n]].concat(), &var, x.dtype()).context(GraphSnafu { op: OP })?;
     let ins: Vec<&Tensor> = [Some(x), Some(w), opts.bias, opts.residual, Some(&y)].into_iter().flatten().collect();
     launch::graph_launch(typed!(x.dtype(), gemm, &spec(cfg)), &cfg.lowering(&planner.device), &ins)
         .context(LaunchSnafu { op: OP })
