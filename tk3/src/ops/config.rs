@@ -572,12 +572,20 @@ impl Planner {
     }
 
     /// Every attention config for `tiles` rows of `t` queries over `tk`
-    /// keys at head size `d`, the cheapest first.
-    pub fn attention_ranked(&self, tiles: usize, t: usize, tk: usize, d: usize, causal: bool) -> Arc<[FaCfg]> {
+    /// keys at head size `d` ([`Attention`]), the cheapest first.
+    pub fn attention_ranked(
+        &self,
+        tiles: usize,
+        t: usize,
+        tk: usize,
+        d: usize,
+        causal: bool,
+        bias: bool,
+    ) -> Arc<[FaCfg]> {
         if tiles * t * tk * d == 0 {
             return Arc::new([]);
         }
-        let p = Attention { tiles, t, tk, d, causal };
+        let p = Attention { tiles, t, tk, d, causal, bias };
         cached(&self.attention, p, || p.ranked(self))
     }
 
@@ -660,9 +668,9 @@ impl Planner {
 impl FaCfg {
     /// Whether the config lowers on `target` for head size `d`: the atom's M
     /// is the kernel's [`WARP_ROWS`] (one warp per that many query rows),
-    /// both products tile the atoms, and the K and V fills split into whole
-    /// 16-byte chunks per thread.
-    pub fn fits(&self, target: &Target, d: usize) -> bool {
+    /// both products tile the atoms, and the K and V fills (and the bias
+    /// tile's under a bias) split into whole 16-byte chunks per thread.
+    pub fn fits(&self, target: &Target, d: usize, bias: bool) -> bool {
         let Some(atom) = target.mma.first() else { return false };
         let (bq, bkv) = (self.bq, self.bkv);
         // Key warps fill their own tiles alone.
@@ -674,6 +682,7 @@ impl FaCfg {
             && (self.key_warps == 1 || bq == WARP_ROWS && self.stages * bkv >= 2 * WARP_ROWS)
             && [bkv, d].iter().all(|&x| x.is_multiple_of(atom.n as usize) && x.is_multiple_of(atom.k as usize))
             && (bkv * d / 8).is_multiple_of(threads)
+            && (!self.bias_ring(bias) || (bq * bkv / 8).is_multiple_of(threads))
             && target.stages(self.stages) == self.stages
     }
 
@@ -684,10 +693,10 @@ impl FaCfg {
     /// turned into probabilities and multiplied in; and the staged K and V
     /// chunks where the fill goes through registers (the value tile is
     /// stored column-major where it is staged, so its fragments gather as
-    /// 16-byte runs like the keys'). Addressing and what the compiler keeps
-    /// beside the tiles are not counted: the compiled kernel's own count is
-    /// what the tuner reads.
-    pub fn registers(&self, target: &Target, d: usize) -> Option<u32> {
+    /// 16-byte runs like the keys'), with the bias tile's under a bias.
+    /// Addressing and what the compiler keeps beside the tiles are not
+    /// counted: the compiled kernel's own count is what the tuner reads.
+    pub fn registers(&self, target: &Target, d: usize, bias: bool) -> Option<u32> {
         let atom = target.mma.first()?;
         let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
         let qk = atom.issue(Orient::Direct, grid, self.bq, self.bkv, d).ok()?;
@@ -696,8 +705,9 @@ impl FaCfg {
         let fill = if target.cp_async {
             0
         } else {
-            let tile = chunked(Shape::new(self.bkv, d), 2, self.row_warps(), target.wave, Axis::Col)?;
-            2 * half(tile.regs())
+            let chunks = |shape| chunked(shape, 2, self.row_warps(), target.wave, Axis::Col).map(|t| half(t.regs()));
+            let bias = if self.bias_ring(bias) { chunks(Shape::new(self.bq, self.bkv))? } else { 0 };
+            2 * chunks(Shape::new(self.bkv, d))? + bias
         };
         let (q, o) = (half(qk.a.regs()), pv.c.regs());
         let (k, s, p, v) = (half(qk.b.regs()), qk.c.regs(), half(pv.a.regs()), half(pv.b.regs()));
@@ -712,7 +722,8 @@ const DIAGONAL: usize = 3;
 
 /// An attention problem: `tiles` independent query rows of `t` queries over
 /// `tk` keys at head size `d` (`tiles` = batch × heads), `causal` when a
-/// query sees the keys up to its own position.
+/// query sees the keys up to its own position, `bias` when an additive bias
+/// streams beside the keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Attention {
     pub tiles: usize,
@@ -720,6 +731,7 @@ pub struct Attention {
     pub tk: usize,
     pub d: usize,
     pub causal: bool,
+    pub bias: bool,
 }
 
 impl Attention {
@@ -729,8 +741,10 @@ impl Attention {
 
     /// What `cfg` costs here, as [`Problem::admit`]: a key block's trip pays
     /// both products' fragment reads, fills (priced by where their bytes
-    /// come from, every tile's keys and values the distinct ones) and steps,
-    /// the softmax of every score and its overhead. A causal query block
+    /// come from, every tile's keys and values the distinct ones; a bias
+    /// tile is filled and read once per trip like them, every one of its
+    /// bytes distinct) and steps, the softmax of every score and its
+    /// overhead. A causal query block
     /// scores half the keys plus its diagonal, a key block per `bkv` of its
     /// rows, each [`DIAGONAL`] trips. Key warps each take a share of the
     /// trips, every trip of theirs the block's whole work at once. The query
@@ -740,21 +754,22 @@ impl Attention {
     pub(crate) fn admit(&self, planner: &Planner, cfg: &FaCfg) -> Option<(f64, u32)> {
         let Device { target, costs } = &planner.device;
         let (bq, bkv, d, kw) = (cfg.bq, cfg.bkv, self.d, cfg.key_warps);
-        let smem = cfg.smem_bytes(d) + cfg.scratch_bytes(target);
-        if !(cfg.fits(target, d) && smem <= target.smem_bytes) {
+        let smem = cfg.smem_bytes(d, self.bias) + cfg.scratch_bytes(target);
+        if !(cfg.fits(target, d, self.bias) && smem <= target.smem_bytes) {
             return None;
         }
-        let regs = cfg.registers(target, d)?;
+        let regs = cfg.registers(target, d, self.bias)?;
         let waves = cfg.warps() as usize;
         let atoms = bkv.min(d) / target.mma.first()?.n as usize;
-        let fragments = 2 * waves * bkv * d * 2;
-        let fill = kw * 2 * bkv * d * 2;
+        let bias = usize::from(self.bias) * kw * bq * bkv * 2;
+        let fragments = 2 * waves * bkv * d * 2 + bias;
+        let fill = kw * 2 * bkv * d * 2 + bias;
         let steps = kw * 2 * bq * bkv * d / 4096;
         let diagonal = DIAGONAL * bq.div_ceil(bkv);
         let trips = if self.causal { self.tk.div_ceil(2 * bkv) + diagonal } else { self.tk.div_ceil(bkv) };
         let trips = trips.div_ceil(kw);
         let (blocks, stages) = (self.blocks(cfg), cfg.stages);
-        let unique = (self.tiles * self.tk * d * 2 * 2) as f64;
+        let unique = (self.tiles * self.tk * (d * 2 + usize::from(self.bias) * self.t) * 2) as f64;
         let flight = planner.sms().min(blocks).max(1);
         let shared = 1.0 - flight.div_ceil(self.t.div_ceil(bq)) as f64 / flight as f64;
         let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);

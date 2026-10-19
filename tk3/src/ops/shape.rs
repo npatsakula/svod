@@ -173,13 +173,15 @@ pub fn conv_grid(x: &Extent, geom: &ConvGeom) -> (usize, usize) {
     if x.var { (x.dims[0], ho * wo) } else { (1, x.dims[0] * ho * wo) }
 }
 
-/// `q [b, t, h, d]` against `k`/`v [b, tk, h_kv, d]`, `causal` under that mask.
+/// `q [b, t, h, d]` against `k`/`v [b, tk, h_kv, d]`, `causal` under that mask,
+/// `bias` with an additive bias.
 pub fn attention(
     planner: Option<&Planner>,
     dtypes: &[DType],
     q: Option<&Extent>,
     k: Option<&Extent>,
     causal: bool,
+    bias: bool,
 ) -> Plan<FaCfg> {
     plan(|| {
         let planner = gate(planner, dtypes)?;
@@ -188,7 +190,7 @@ pub fn attention(
             return Err(Fallback::Shape);
         }
         let [b, t, heads, d] = [q.dims[0], q.dims[1], q.dims[2], q.dims[3]];
-        candidates(planner.attention_ranked(b * heads, t, k.dims[1], d, causal), Fallback::Shape)
+        candidates(planner.attention_ranked(b * heads, t, k.dims[1], d, causal, bias), Fallback::Shape)
     })
 }
 

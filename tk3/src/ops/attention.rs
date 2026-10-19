@@ -166,7 +166,8 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let dtypes: Vec<DType> = [q, k, v].into_iter().chain(opts.bias).map(Tensor::dtype).collect();
     // A chunk mask skips about as many key blocks as a causal one.
     let causal = opts.causal || opts.chunk.is_some();
-    let plan = shape::attention(planner.as_deref(), &dtypes, q_ext.as_ref(), k_ext.as_ref(), causal);
+    let biased = bias_rows.is_some();
+    let plan = shape::attention(planner.as_deref(), &dtypes, q_ext.as_ref(), k_ext.as_ref(), causal, biased);
     let Plan::Kernel(cfgs) = plan else { return graph(q, k, v, opts).context(GraphSnafu { op: OP }) };
     // The appended rows ride one key block.
     let cfgs: Vec<FaCfg> = cfgs.iter().copied().filter(|c| c.bkv >= appended).collect();
@@ -209,9 +210,11 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         admitted.iter().flat_map(|c| splits(c).into_iter().map(|splits| FaCfg { splits, ..*c })).collect()
     };
     let merge = |splits| CombineSpec { batch: batch.clone(), t, heads, d, splits, cfg: NormCfg { br: 4 } };
-    // Measured with the static masks only (scratch parameters would be
-    // garbage) and at most `TUNE_BATCH` lanes: more fill the device alike,
-    // and a cache's scratch grows with every lane.
+    // Measured with the static masks and the bias only (scratch parameters
+    // would be garbage; a bias streams the same whatever it holds) and at
+    // most `TUNE_BATCH` lanes: more fill the device alike, and a cache's
+    // scratch grows with every lane.
+    let measured_mask = AttnMask { bias: bias_rows, ..edges };
     let measured = match &batch {
         Batch::Static(n) if *n > TUNE_BATCH => Batch::Static(TUNE_BATCH),
         Batch::Var { name, min, max } if *max > TUNE_BATCH as i64 => {
@@ -225,7 +228,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let rows = cache.map(|c| c.rows.min(measured.capacity()));
     let mapped = cache.is_some_and(|c| c.row_map) && rows.is_some_and(|r| r < measured.capacity());
     let shape = [measured.capacity(), t, tk, heads, kv_heads, d];
-    let salt = (&measured, edges, cache.map(|c| c.heads_total), rows, mapped, opts.splits);
+    let salt = (&measured, measured_mask, cache.map(|c| c.heads_total), rows, mapped, opts.splits);
     let mut tuner = Tuner::new(&planner.device, q.dtype(), &shape, salt, |cfg: FaCfg| {
         // Scratch caches hold no appended rows and no garbage: a zero map.
         let plain = cache.map(|c| kernels::attention::Cache {
@@ -235,7 +238,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
             app_lens: false,
             ..c
         });
-        let spec = AttnSpec { batch: measured.clone(), ..spec(cfg, edges, plain) };
+        let spec = AttnSpec { batch: measured.clone(), ..spec(cfg, measured_mask, plain) };
         let mut programs = timed_keys(tk, cache.is_some() || lens.is_some(), &cfg)
             .into_iter()
             .map(|tk| (typed!(q.dtype(), fa, &AttnSpec { tk, ..spec.clone() }), cfg.lowering(&planner.device)))
@@ -246,7 +249,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         }
         programs
     });
-    let cfg = tune(&mut tuner, &ranked, expand);
+    let cfg = tune(&mut tuner, &ranked, biased, expand);
     tracing::debug!(?shape, ?cfg, "attention tuned");
     let i32 = |t: &Tensor| if t.dtype() == DType::Int32 { t.clone() } else { t.cast(DType::Int32) };
     let lens = lens.map(i32);
@@ -337,20 +340,23 @@ pub(crate) fn timed_keys(tk: usize, below: bool, cfg: &FaCfg) -> Vec<usize> {
     if below && half < tk { vec![tk, half] } else { vec![tk] }
 }
 
-/// Search bound: the softmax forms, each flipped in turn by [`forms`].
-pub(crate) const FORMS: [fn(Forms) -> Forms; 4] = [
+/// Search bound: the softmax forms, each flipped in turn by [`forms`]; the
+/// last, the bias read directly, only under a bias.
+pub(crate) const FORMS: [fn(Forms) -> Forms; 5] = [
     |f| Forms { truncate_p: !f.truncate_p, ..f },
     |f| Forms { skip_rescale: !f.skip_rescale, ..f },
     |f| Forms { raw_max: !f.raw_max, ..f },
     |f| Forms { sum_after: !f.sum_after, ..f },
+    |f| Forms { bias_direct: !f.bias_direct, ..f },
 ];
 
 /// Coordinate descent over the softmax forms from the tuned `winner`: each
-/// of [`FORMS`] once, `pick` choosing between the forms so far and the same
-/// with that one flipped (the tuner times the pair and keeps the flip only
-/// where it measures faster).
-pub(crate) fn forms(winner: FaCfg, mut pick: impl FnMut([FaCfg; 2]) -> FaCfg) -> FaCfg {
-    FORMS.iter().fold(winner, |c, flip| pick([c, FaCfg { forms: flip(c.forms), ..c }]))
+/// of [`FORMS`] once (the bias form only with a `bias`), `pick` choosing
+/// between the forms so far and the same with that one flipped (the tuner
+/// times the pair and keeps the flip only where it measures faster).
+pub(crate) fn forms(winner: FaCfg, bias: bool, mut pick: impl FnMut([FaCfg; 2]) -> FaCfg) -> FaCfg {
+    let flips = FORMS.iter().take(if bias { FORMS.len() } else { FORMS.len() - 1 });
+    flips.fold(winner, |c, flip| pick([c, FaCfg { forms: flip(c.forms), ..c }]))
 }
 
 /// The tuned attention config of `ranked`, its softmax forms and tiles
@@ -362,21 +368,24 @@ pub(crate) fn forms(winner: FaCfg, mut pick: impl FnMut([FaCfg; 2]) -> FaCfg) ->
 /// chooses within a forms pair, as in [`forms`].
 pub(crate) fn descend(
     ranked: &[FaCfg],
+    bias: bool,
     first_clean: impl FnOnce(&[FaCfg]) -> FaCfg,
     tiles: impl FnOnce(&[FaCfg]) -> FaCfg,
     mut pick: impl FnMut([FaCfg; 2]) -> FaCfg,
 ) -> FaCfg {
-    let kept = forms(first_clean(ranked), &mut pick).forms;
+    let kept = forms(first_clean(ranked), bias, &mut pick).forms;
     let formed: Vec<FaCfg> = ranked.iter().map(|&c| FaCfg { forms: kept, ..c }).collect();
-    forms(tiles(&formed), pick)
+    forms(tiles(&formed), bias, pick)
 }
 
 /// The config `tuner` launches from `ranked`, `expand` making a tile pass's
-/// candidates as in [`Tuner::tuned`]: the softmax forms and tiles tuned in
-/// turn by [`descend`], or with tuning off the first clean, plain.
+/// candidates as in [`Tuner::tuned`]: the softmax forms (the bias form
+/// under a `bias`) and tiles tuned in turn by [`descend`], or with tuning
+/// off the first clean, plain.
 pub(crate) fn tune<B: Fn(FaCfg) -> crate::tune::Candidate>(
     tuner: &mut Tuner<'_, FaCfg, B>,
     ranked: &[FaCfg],
+    bias: bool,
     expand: impl Fn(&[FaCfg]) -> Vec<FaCfg>,
 ) -> FaCfg {
     if !crate::tune::enabled() {
@@ -385,6 +394,7 @@ pub(crate) fn tune<B: Fn(FaCfg) -> crate::tune::Candidate>(
     let tuner = std::cell::RefCell::new(tuner);
     descend(
         ranked,
+        bias,
         |r| tuner.borrow_mut().first_clean(OP, r).expect("a ranked attention config"),
         |r| tuner.borrow_mut().tuned(OP, r, &expand),
         |pair| {

@@ -852,9 +852,10 @@ impl<'a> Emit<'a> {
                 None => row.clone(),
             };
             let (src_off, gate) = self.address(&s, &Coord::plain(src_row, col.clone()));
-            // A plain view's fill clamps (above); a gathered row outside its
-            // map lands as zeros, from element 0 of the operand.
-            let gate = gate.filter(|_| gathered);
+            // A plain view's fill clamps its rows (above) and, under a column
+            // bound, lands a chunk starting past it as zeros, as a gathered
+            // row outside its map does, from element 0 of the operand.
+            let gate = gate.filter(|_| gathered || bounds[1].is_some());
             let src_off = match &gate {
                 Some(g) => self.hoist(UOp::try_where(g.clone(), src_off, c32(0)).expect("safe offset")),
                 None => src_off,

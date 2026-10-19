@@ -85,8 +85,9 @@ pub enum Place {
     /// the valid row/col counts of the window (`None` = fully in bounds).
     /// Stores past them are dropped and register loads past them read zero,
     /// but a fill into shared memory re-reads the last valid row past the
-    /// row bound and ignores the column bound: what it stages there is only
-    /// ever consumed into rows or columns the store drops.
+    /// row bound (what it stages there is only ever consumed into rows the
+    /// store drops) and zeroes its 16-byte chunks that start past the column
+    /// bound, so the rows' stride must cover the chunk the bound falls in.
     ///
     /// With `rows`, row `r` starts at `offset + rows.offset[Row := r]`
     /// instead (`stride.0` is unused) and a row outside `rows.valid` reads

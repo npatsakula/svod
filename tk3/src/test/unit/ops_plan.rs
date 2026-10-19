@@ -168,9 +168,9 @@ fn a_gated_gemm_is_a_double_width_problem() {
 #[test]
 fn no_register_count_admits() {
     let target = rdna3();
-    let ranked = planner(target.clone()).attention_ranked(8, 1500, 1500, 128, false);
+    let ranked = planner(target.clone()).attention_ranked(8, 1500, 1500, 128, false, false);
     for (bq, bkv) in [(64, 16), (128, 16)] {
-        let over = FaCfg::new(bq, bkv, 2).registers(&target, 128).is_some_and(|r| r > 256);
+        let over = FaCfg::new(bq, bkv, 2).registers(&target, 128, false).is_some_and(|r| r > 256);
         assert!(over, "{bq}×{bkv} counts past the cap");
         assert!(ranked.iter().any(|c| (c.bq, c.bkv) == (bq, bkv)), "{bq}×{bkv} not in {ranked:?}");
     }
@@ -350,7 +350,7 @@ fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
 /// flight at once, which share a tile's keys, so the cost sits between.
 #[test]
 fn an_attention_fill_is_priced_by_where_it_comes_from() {
-    let a = config::Attention { tiles: 32, t: 2048, tk: 2048, d: 64, causal: false };
+    let a = config::Attention { tiles: 32, t: 2048, tk: 2048, d: 64, causal: false, bias: false };
     let unique = (a.tiles * a.tk * a.d * 4) as f64;
     let cost = |l2_bytes| {
         let c = Costs { global_byte: 0.08, l2_byte: 0.01, l2_bytes, ..costs() };
@@ -669,7 +669,7 @@ fn variants_keep_their_variant_across_twins() {
     let twins = winner.twins(&ranked);
     assert!(twins.len() >= 2 && twins.iter().all(|c| c.split == 3 && c.gemm.tile() == winner.gemm.tile()), "{twins:?}");
     assert!(twins.iter().all(|c| c.gemm.tile[2] == winner.gemm.tile[2]), "a split keeps its depth: {twins:?}");
-    let ranked = planner.attention_ranked(8, 2048, 2048, 64, false);
+    let ranked = planner.attention_ranked(8, 2048, 2048, 64, false, false);
     let forms = Forms { raw_max: true, ..Forms::default() };
     let winner = FaCfg { splits: 4, forms, ..ranked[0] };
     let twins = winner.twins(&ranked);
@@ -716,6 +716,52 @@ fn a_split_convolutions_twins_divide_its_trips(target: Target) {
     assert!(checked > 100, "{checked} twins checked");
 }
 
+/// The bias form is offered only under a bias: a forms pass asks five
+/// pairs with one, the last flipping the direct read, and four without.
+#[test]
+fn the_bias_form_is_flipped_only_under_a_bias() {
+    let winner = FaCfg::new(64, 32, 2);
+    for (bias, flips) in [(false, 4), (true, 5)] {
+        let mut asked = vec![];
+        let kept = crate::ops::attention::forms(winner, bias, |[current, flipped]| {
+            asked.push(flipped.forms);
+            current
+        });
+        assert_eq!(kept, winner);
+        assert_eq!(asked.len(), flips, "{asked:?}");
+        assert_eq!(asked.iter().filter(|f| f.bias_direct).count(), usize::from(bias), "{asked:?}");
+    }
+}
+
+/// A bias rides a ring slot of its own: admission charges its tile's bytes
+/// beside K and V's, refuses a tile whose bias fill does not split into a
+/// 16-byte chunk per thread (16 queries by 16 keys on a wave of 64), counts
+/// its staged chunks where the fill goes through registers, and every
+/// config a biased ranking admits fits with the bias and costs more than
+/// it does without one, on every target.
+#[test_case(sm86(); "sm86")]
+#[test_case(gfx1151(); "gfx1151")]
+#[test_case(Target { sms: Some(64), ..Target::for_arch(GpuArch::Amd(AmdArch::Gfx1201)) }; "gfx1201")]
+#[test_case(Target { sms: Some(304), ..Target::for_arch(GpuArch::Amd(AmdArch::Gfx942)) }; "gfx942")]
+fn a_bias_rides_its_own_ring_slot(target: Target) {
+    let cfg = FaCfg::new(64, 32, 2);
+    assert_eq!(cfg.smem_bytes(64, true) - cfg.smem_bytes(64, false), 2 * 64 * 32 * 2);
+    let small = FaCfg::new(16, 16, 2);
+    assert!(small.fits(&target, 64, false));
+    assert_eq!(small.fits(&target, 64, true), target.wave == 32, "{:?}", target.arch);
+    let regs = |bias| cfg.registers(&target, 64, bias).expect("a lowered tile");
+    assert_eq!(regs(true) > regs(false), !target.cp_async, "{} with a bias, {} without", regs(true), regs(false));
+    let planner = planner(target.clone());
+    let ranked = planner.attention_ranked(8, 512, 512, 64, false, true);
+    assert!(!ranked.is_empty());
+    let within = |c: &FaCfg| c.smem_bytes(64, true) + c.scratch_bytes(&target) <= target.smem_bytes;
+    assert!(ranked.iter().all(|c| c.fits(&target, 64, true) && within(c)), "{ranked:?}");
+    let biased = config::Attention { tiles: 8, t: 512, tk: 512, d: 64, causal: false, bias: true };
+    let plain = config::Attention { bias: false, ..biased };
+    let cost = |a: &config::Attention, c: &FaCfg| a.admit(&planner, c).expect("admitted").0;
+    assert!(ranked.iter().all(|c| cost(&biased, c) > cost(&plain, c)), "{ranked:?}");
+}
+
 /// A planner whose device left a field unmeasured (zero) ranks on: the
 /// rankings stay non-empty with finite, positive costs, and the planner
 /// names the field.
@@ -728,7 +774,7 @@ fn a_planner_over_a_zero_field_still_ranks() {
     let ranked = p.ranked(&planner);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| p.admit(&planner, c).is_some_and(|(cost, _)| cost.is_finite() && cost > 0.0)));
-    assert!(!planner.attention_ranked(8, 512, 512, 128, true).is_empty());
+    assert!(!planner.attention_ranked(8, 512, 512, 128, true, false).is_empty());
 }
 
 /// At zero costs every config ties: the ranking is degenerate (fewest
@@ -740,7 +786,7 @@ fn a_ranking_at_zero_costs_is_finite() {
     let ranked = p.ranked(&planner);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| p.admit(&planner, c).is_some_and(|(cost, _)| cost == 0.0)));
-    let a = config::Attention { tiles: 8, t: 100, tk: 100, d: 64, causal: true };
+    let a = config::Attention { tiles: 8, t: 100, tk: 100, d: 64, causal: true, bias: false };
     let ranked = a.ranked(&planner);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| a.admit(&planner, c).is_some_and(|(cost, _)| cost == 0.0)));
@@ -789,7 +835,7 @@ fn every_op_falls_back_alike(target: Option<Target>, dtypes: &[DType], static_di
     let planner = target.map(planner);
     let target = planner.as_ref();
     assert_eq!(shape::linear(target, dtypes, x.as_ref(), 1024, false), Plan::Graph(why));
-    assert_eq!(shape::attention(target, dtypes, q.as_ref(), kv.as_ref(), false), Plan::Graph(why));
+    assert_eq!(shape::attention(target, dtypes, q.as_ref(), kv.as_ref(), false, false), Plan::Graph(why));
     assert_eq!(shape::norm(target, dtypes, x.as_ref()), Plan::Graph(why));
 }
 
@@ -863,10 +909,13 @@ fn attention_plans(d: usize, want: Result<(), Fallback>) {
     let target = sm86();
     let (q, kv) = (ext(&[2, 100, 8, d]), ext(&[2, 37, 2, d]));
     for dtypes in [&[BF16; 3][..], &[BF16; 4]] {
-        match shape::attention(Some(&planner(target.clone())), dtypes, Some(&q), Some(&kv), false) {
+        match shape::attention(Some(&planner(target.clone())), dtypes, Some(&q), Some(&kv), false, false) {
             Plan::Kernel(list) => {
                 assert!(want.is_ok() && !list.is_empty(), "{list:?}");
-                assert!(list.iter().all(|c| c.fits(&target, d) && c.smem_bytes(d) <= target.smem_bytes), "{list:?}");
+                assert!(
+                    list.iter().all(|c| c.fits(&target, d, false) && c.smem_bytes(d, false) <= target.smem_bytes),
+                    "{list:?}"
+                );
             }
             Plan::Graph(why) => assert_eq!(Err(why), want),
         }
@@ -879,7 +928,7 @@ fn attention_plans(d: usize, want: Result<(), Fallback>) {
 #[test_case(DType::Float32, false; "f32")]
 fn biased_attention_plans(bias: DType, kernel: bool) {
     let (q, kv) = (ext(&[2, 100, 8, 64]), ext(&[2, 100, 8, 64]));
-    let plan = shape::attention(Some(&planner(sm86())), &[BF16, BF16, BF16, bias], Some(&q), Some(&kv), false);
+    let plan = shape::attention(Some(&planner(sm86())), &[BF16, BF16, BF16, bias], Some(&q), Some(&kv), false, false);
     assert_eq!(matches!(plan, Plan::Kernel(_)), kernel, "{plan:?}");
     if !kernel {
         assert_eq!(plan, Plan::Graph(Fallback::Dtype));
@@ -889,7 +938,8 @@ fn biased_attention_plans(bias: DType, kernel: bool) {
 fn attention_list(d: usize, smem: usize) -> (Target, Arc<[FaCfg]>) {
     let target = Target { smem_bytes: smem, ..sm86() };
     let (q, kv) = (ext(&[2, 100, 8, d]), ext(&[2, 37, 2, d]));
-    let list = kernel_plan(shape::attention(Some(&planner(target.clone())), &[BF16; 3], Some(&q), Some(&kv), false));
+    let list =
+        kernel_plan(shape::attention(Some(&planner(target.clone())), &[BF16; 3], Some(&q), Some(&kv), false, false));
     (target, list)
 }
 
@@ -902,7 +952,7 @@ fn attention_list(d: usize, smem: usize) -> (Target, Arc<[FaCfg]>) {
 fn attention_candidates(d: usize, smem: usize) {
     let (target, list) = attention_list(d, smem);
     assert!(list.len() >= 4, "{list:?}");
-    assert!(list.iter().all(|c| c.smem_bytes(d) <= smem && c.fits(&target, d)), "{list:?}");
+    assert!(list.iter().all(|c| c.smem_bytes(d, false) <= smem && c.fits(&target, d, false)), "{list:?}");
     for (i, c) in list.iter().enumerate() {
         assert!(!list[..i].contains(c), "{c:?} twice");
         assert_eq!(c.scratch_bytes(&target), 0);
@@ -926,7 +976,7 @@ fn attention_candidates(d: usize, smem: usize) {
 #[test_case(64, 16, 128; "sixteen queries, d 128, 512 tiles")]
 fn decode_attention_leads_with_the_queries_warps(batch: usize, t: usize, d: usize) {
     let (q, kv) = (ext(&[batch, t, 8, d]), ext(&[batch, 1500, 8, d]));
-    let list = kernel_plan(shape::attention(Some(&planner(sm86())), &[BF16; 3], Some(&q), Some(&kv), false));
+    let list = kernel_plan(shape::attention(Some(&planner(sm86())), &[BF16; 3], Some(&q), Some(&kv), false, false));
     let (lead, queries) = (list[0], t.div_ceil(16) * 16);
     let filled = batch * 8 >= 16 * sm86().sms.unwrap() as usize;
     let most = if filled { queries } else { queries.max(16 * sm86().occupancy.simds as usize) };
@@ -960,7 +1010,7 @@ fn gfx1151() -> Target {
 #[test_case(128, true, &[(64, 16), (128, 16)]; "d 128 causal")]
 fn gfx1151_attention_shortlists_hold_the_measured_tiles(d: usize, causal: bool, measured: &[(usize, usize)]) {
     let planner = Planner::new(Device { target: gfx1151(), costs: super::gfx1151_costs() });
-    let list = first_eight(&planner.attention_ranked(32, 2048, 2048, d, causal));
+    let list = first_eight(&planner.attention_ranked(32, 2048, 2048, d, causal, false));
     let tiles: Vec<(usize, usize)> = list.iter().map(|c| (c.bq, c.bkv)).collect();
     assert!(measured.iter().any(|m| tiles.contains(m)), "{measured:?} not in {tiles:?}");
 }
@@ -996,7 +1046,7 @@ fn a_named_split_count_is_honoured(splits: Option<usize>, tk: usize, want: &[(us
 #[test]
 fn a_decoder_steps_ranking_keeps_its_named_splits() {
     let planner = Planner::new(Device { target: gfx1151(), costs: super::gfx1151_costs() });
-    let ranked = planner.attention_ranked(5 * 16, 16, 128, 48, false);
+    let ranked = planner.attention_ranked(5 * 16, 16, 128, 48, false, false);
     let split = split_ranked(&ranked, Some(2), 128);
     assert!(!split.is_empty() && split.iter().all(|c| c.splits == 2 && 128usize.div_ceil(c.bkv) >= 2), "{split:?}");
 }
@@ -1032,6 +1082,7 @@ fn the_forms_and_tiles_are_tuned_in_turn() {
     };
     let tuned = descend(
         &ranked,
+        false,
         |r| {
             asked.borrow_mut().push(Asked::FirstClean);
             r[0]
@@ -1067,7 +1118,7 @@ fn the_forms_and_tiles_are_tuned_in_turn() {
 fn attention_with_symbolic_keys_falls_back() {
     let q = ext(&[2, 100, 8, 64]);
     assert_eq!(
-        shape::attention(Some(&planner(sm86())), &[BF16; 3], Some(&q), None, false),
+        shape::attention(Some(&planner(sm86())), &[BF16; 3], Some(&q), None, false, false),
         Plan::Graph(Fallback::Symbolic)
     );
 }
@@ -1349,8 +1400,9 @@ fn rdna_plans_register_staged_kernels() {
     assert!(first_eight(&gemms).iter().all(|c| c.stages == 2 && c.unroll && c.fits(&target)), "{gemms:?}");
     for (d, t) in [(64, 1500), (64, 1)] {
         let q = ext(&[1, t, 8, d]);
-        let fa = kernel_plan(shape::attention(Some(&planner(target.clone())), &[BF16; 3], Some(&q), Some(&q), false));
-        let within = |c: &FaCfg| c.smem_bytes(d) + c.scratch_bytes(&target) <= 64 << 10;
+        let fa =
+            kernel_plan(shape::attention(Some(&planner(target.clone())), &[BF16; 3], Some(&q), Some(&q), false, false));
+        let within = |c: &FaCfg| c.smem_bytes(d, false) + c.scratch_bytes(&target) <= 64 << 10;
         assert!(fa.iter().all(|c| c.stages == 2 && within(c)), "{fa:?}");
         assert!(fa.iter().all(|c| c.scratch_bytes(&target) == c.bq * c.bkv * 4), "RDNA3 re-holds its scores");
     }

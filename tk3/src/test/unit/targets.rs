@@ -63,7 +63,7 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
     // The planner's lead for the shape; a head size it plans no kernel for
     // has no family.
     let fa = |t, tk, d, mask: AttnMask, cache: Option<Cache>, batch| {
-        let cfg = *planner.attention_ranked(8, t, tk, d, mask.causal).first()?;
+        let cfg = *planner.attention_ranked(8, t, tk, d, mask.causal, mask.bias.is_some()).first()?;
         let splits = if cache.is_some() { 2 } else { 1 };
         let cfg = crate::kernels::attention::FaCfg { splits, ..cfg };
         Some(AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache, scale: 0.125, cfg })
@@ -71,7 +71,7 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
     let causal = AttnMask { causal: true, ..AttnMask::default() };
     for d in [64, 128] {
         let Some(spec) = fa(100, 100, d, causal, None, Batch::Static(2)) else { continue };
-        for (i, cfg) in first_eight(&planner.attention_ranked(8, 100, 100, d, true)).into_iter().enumerate() {
+        for (i, cfg) in first_eight(&planner.attention_ranked(8, 100, 100, d, true, false)).into_iter().enumerate() {
             let spec = AttnSpec { cfg, ..spec.clone() };
             let name = format!("attention d{d} causal #{i} {}x{}x{}", cfg.bq, cfg.bkv, cfg.stages);
             push(&name, attention::<BF16>(&spec), cfg.lowering(&planner.device));
@@ -80,6 +80,11 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
     let masked = AttnMask { key_lens: true, key_mask: true, ..AttnMask::default() };
     let spec = fa(37, 75, 64, masked, None, Batch::Var { name: "b".into(), min: 1, max: 2 }).expect("d 64 plans");
     push("attention d64 key masks", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
+    // The bias streams through its own ring slot; its 75 keys end inside a
+    // key block, so the ring's fill meets the column bound.
+    let biased = AttnMask { key_lens: true, bias: Some(Bias::PerBatch), ..AttnMask::default() };
+    let spec = fa(37, 75, 64, biased, None, Batch::Static(2)).expect("d 64 plans with a bias");
+    push("attention d64 bias", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
     let cache = Cache { rows: 6, heads_total: 6, row_map: true, appended: 1, app_lens: false };
     let lens = AttnMask { key_lens: true, ..AttnMask::default() };
     let spec = fa(1, 150, 64, lens, Some(cache), Batch::Var { name: "b".into(), min: 1, max: 3 }).expect("d 64 plans");
@@ -525,7 +530,7 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
     }
     for d in [32, 48, 64, 128] {
         for t in [1, 16, 100] {
-            for cfg in first_eight(&planner.attention_ranked(2, t, 100, d, t > 1)) {
+            for cfg in first_eight(&planner.attention_ranked(2, t, 100, d, t > 1, false)) {
                 let spec = AttnSpec {
                     batch: Batch::Static(1),
                     t,
@@ -628,7 +633,7 @@ fn attention_softmax_takes_the_declared_forms(
     (truncated, skipped, after): (bool, bool, bool),
 ) {
     use crate::ir::{BinaryOp, ReduceOp, Round, TileOp};
-    let lead = planner(target.clone()).attention_ranked(8, 100, 100, 64, true)[0];
+    let lead = planner(target.clone()).attention_ranked(8, 100, 100, 64, true, false)[0];
     let forms = Forms { truncate_p, skip_rescale, sum_after, ..lead.forms };
     let cfg = crate::kernels::attention::FaCfg { forms, ..lead };
     let mask = AttnMask { causal: true, ..AttnMask::default() };

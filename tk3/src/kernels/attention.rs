@@ -53,6 +53,12 @@ pub struct Forms {
     /// than per score), at the price of a multiply on the step's dependent
     /// chain. Else the scores are scaled first.
     pub raw_max: bool,
+    /// A biased kernel reads each key block's bias tile straight from global
+    /// memory, in the scores' layout, rather than streaming it through a ring
+    /// slot beside K and V: the planned ring fills in 16-byte chunks and
+    /// gathers in the layout's runs, which a core whose accumulator holds a
+    /// column per lane (gfx11) reads two bytes at a time.
+    pub bias_direct: bool,
 }
 
 /// Query rows per warp: the M of every matrix core's atom, so a row's scores
@@ -68,7 +74,13 @@ impl FaCfg {
             stages,
             splits: 1,
             unroll: false,
-            forms: Forms { truncate_p: false, sum_after: false, skip_rescale: false, raw_max: false },
+            forms: Forms {
+                truncate_p: false,
+                sum_after: false,
+                skip_rescale: false,
+                raw_max: false,
+                bias_direct: false,
+            },
             key_warps: 1,
         }
     }
@@ -87,10 +99,18 @@ impl FaCfg {
         Lowering::uniform(device, self.unroll, WarpGrid { rows: self.row_warps(), cols: 1 })
     }
 
-    /// Static shared memory in bytes: the K and V rings of a 16-bit type, one
-    /// per key warp (the states key warps merge through reuse their rings).
-    pub fn smem_bytes(&self, d: usize) -> usize {
-        self.key_warps * 2 * self.stages * self.bkv * d * 2
+    /// Whether a bias rides the ring: under a bias, unless the forms read it
+    /// directly.
+    pub fn bias_ring(&self, bias: bool) -> bool {
+        bias && !self.forms.bias_direct
+    }
+
+    /// Static shared memory in bytes: the K and V rings of a 16-bit type (and
+    /// the bias ring, [`bias_ring`](Self::bias_ring)), one set per key warp
+    /// (the states key warps merge through reuse their rings).
+    pub fn smem_bytes(&self, d: usize, bias: bool) -> usize {
+        let slot = 2 * self.bkv * d + usize::from(self.bias_ring(bias)) * self.bq * self.bkv;
+        self.key_warps * self.stages * slot * 2
     }
 
     /// The shared scratch the f32 score tile crosses to become the P·V
@@ -233,6 +253,21 @@ struct Step<'a, T> {
     cfg: FaCfg,
 }
 
+impl<T> Clone for Step<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for Step<'_, T> {}
+
+/// `s` plus a bias tile, in the scores' log2 units.
+fn biased<T: Elem, P: TierMark>(k: &mut Kernel, s: Regs<F32>, tile: Tile<P, T>) -> Regs<F32> {
+    let b = load_f32(k, tile);
+    let log2e = k.fill::<F32>(k.shape(s), Const::Float(std::f64::consts::LOG2_E));
+    let b = k.binary(b, log2e, BinaryOp::Mul);
+    k.binary(s, b, BinaryOp::Add)
+}
+
 impl<T> Step<'_, T> {
     /// Whether the running maximum is kept in the raw scores' units: the
     /// planned form, where a positive scale commutes with the maximum and no
@@ -373,6 +408,9 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     k.warps(cfg.warps());
     let k_s = k.smem::<T>("k_s", kw * stages * bkv * d);
     let v_s = k.smem::<T>("v_s", kw * stages * bkv * d);
+    // The bias streams through a ring of its own beside K and V, unless the
+    // forms read its tiles directly.
+    let bias_s = cfg.bias_ring(bias.is_some()).then(|| k.smem::<T>("bias_s", kw * stages * bq * bkv));
 
     let (order, split, hh) = (k.block(0) / splits, k.block(0) % splits, k.block(1));
     // Where later queries see more keys (a causal mask, chunks with every
@@ -479,14 +517,12 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         let q_off = k.splat::<I32>(shape, q_off.clone());
         (col, k.binary(row, q_off, BinaryOp::Add))
     };
-    // The bias tile of the key block at `col`, in the scores' log2 units.
-    let biased = |k: &mut Kernel, s: Regs<F32>, col: Sc| -> Regs<F32> {
+    // The bias tile of the key block at `col` read from global memory: the
+    // appended block's, outside the ring.
+    let biased_at = |k: &mut Kernel, s: Regs<F32>, col: Sc| -> Regs<F32> {
         let Some(view) = bias_view else { return s };
         let tile = k.at(view, q_off.clone(), col);
-        let b = load_f32(k, tile);
-        let log2e = k.fill::<F32>(shape, Const::Float(std::f64::consts::LOG2_E));
-        let b = k.binary(b, log2e, BinaryOp::Mul);
-        k.binary(s, b, BinaryOp::Add)
+        biased(k, s, tile)
     };
     let hide = |k: &mut Kernel, keep: Regs<Bool>, plain: Regs<F32>| {
         let hidden = k.fill::<F32>(shape, Const::Float(f64::NEG_INFINITY));
@@ -585,7 +621,10 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         let [out] = k.select_if(partial, |k| [masked(k, s, block_start.clone())], |_| [s]);
         out
     };
-    let bias_tile = bias_view.is_some().then_some(&biased as Mask);
+    // The global reader serves the direct form and stands in for the ring's
+    // here, so the forms agree with the steps' (a bias keeps the scaled
+    // maximum).
+    let bias_tile = bias_view.is_some().then_some(&biased_at as Mask);
     let st = Step { q_r, scale_log2e, shape, bias: bias_tile, mask: &mask, cfg };
     let app_views = app.map(|(k_app, v_app)| {
         let app = |k: &mut Kernel, p: ParamRef<T>| {
@@ -622,17 +661,26 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             stages,
             [m0, l0, o0],
             |k, step, slot| {
-                let kv_off = (w_first.clone() + step) * bkv;
+                let (kv_off, slot) = ((w_first.clone() + step) * bkv, slot0.clone() + slot);
                 let k_g = k.at(k_view, kv_off.clone(), 0);
-                let v_g = k.at(v_view, kv_off, 0);
-                let k_t = k.smem_slot::<T>(k_s, slot0.clone() + slot.clone(), Shape::new(bkv, d));
-                let v_t = k.smem_slot::<T>(v_s, slot0.clone() + slot, Shape::new(bkv, d));
+                let v_g = k.at(v_view, kv_off.clone(), 0);
+                let k_t = k.smem_slot::<T>(k_s, slot.clone(), Shape::new(bkv, d));
+                let v_t = k.smem_slot::<T>(v_s, slot.clone(), Shape::new(bkv, d));
                 k.stage(k_t, k_g, CopyMode::Async);
                 k.stage(v_t, v_g, CopyMode::Async);
+                if let (Some(view), Some(ring)) = (bias_view, bias_s) {
+                    let b_g = k.at(view, q_off.clone(), kv_off);
+                    let b_t = k.smem_slot::<T>(ring, slot, shape);
+                    k.stage(b_t, b_g, CopyMode::Async);
+                }
             },
             |k, step_, slot, carried| {
-                let k_t = k.smem_slot::<T>(k_s, slot0.clone() + slot.clone(), Shape::new(bkv, d));
-                let v_t = k.smem_slot::<T>(v_s, slot0.clone() + slot, Shape::new(bkv, d));
+                let slot = slot0.clone() + slot;
+                let k_t = k.smem_slot::<T>(k_s, slot.clone(), Shape::new(bkv, d));
+                let v_t = k.smem_slot::<T>(v_s, slot.clone(), Shape::new(bkv, d));
+                let b_t = bias_s.map(|ring| k.smem_slot::<T>(ring, slot, shape));
+                let from_ring = |k: &mut Kernel, s, _| biased(k, s, b_t.expect("a bias ring"));
+                let st = if b_t.is_some() { Step { bias: Some(&from_ring as Mask), ..st } } else { st };
                 step(k, &st, k_t, v_t, (w_first.clone() + step_) * bkv, carried)
             },
         );
@@ -641,7 +689,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         // as they were, and a branch would cost more than the step.
         let [m, l, acc] = match &app_views {
             Some((k_g, v_g, visible)) => {
-                let app_bias = |k: &mut Kernel, s: Regs<F32>, _: Sc| biased(k, s, Sc::from(tk));
+                let app_bias = |k: &mut Kernel, s: Regs<F32>, _: Sc| biased_at(k, s, Sc::from(tk));
                 let rows = |k: &mut Kernel, s: Regs<F32>, _: Sc| {
                     let col = k.coord(shape, Axis::Col);
                     let visible = k.splat::<I32>(shape, visible.clone());
