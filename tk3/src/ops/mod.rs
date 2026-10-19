@@ -7,6 +7,7 @@
 
 pub(crate) mod attention;
 pub mod config;
+pub(crate) mod conv;
 pub(crate) mod heads;
 pub(crate) mod linear;
 pub(crate) mod norm;
@@ -22,6 +23,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 pub use self::attention::{Attn, Cache, KeyMask, attention};
+pub use self::conv::{Conv, conv2d};
 pub use self::heads::{Qkv, heads};
 pub use self::linear::{Linear, linear};
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};

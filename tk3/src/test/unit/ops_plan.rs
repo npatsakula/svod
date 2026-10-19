@@ -435,3 +435,67 @@ fn semantic_mismatches_are_errors() {
     let r = t(&[4, 32], BF16);
     assert!(matches!(tk::add_rms_norm(&x, &r, &w, 1e-5).map(|_| ()), Err(Error::Shape { operand: "residual", .. })));
 }
+
+// ---- conv2d ------------------------------------------------------------------------
+
+fn conv_geom(hw: usize, cin: usize, cout: usize, k: usize, s: usize) -> crate::kernels::conv::ConvGeom {
+    crate::kernels::conv::ConvGeom {
+        h: hw,
+        w: hw,
+        cin,
+        cout,
+        kernel: [k, k],
+        stride: [s, s],
+        pad: [k / 2, k / 2],
+        dilation: [1, 1],
+    }
+}
+
+fn conv_plan(x: &[usize], g: crate::kernels::conv::ConvGeom, groups: usize) -> Result<[usize; 3], Fallback> {
+    let plan = shape::conv2d(Some(&sm86()), &[F16; 3], F16, None, Some(&ext(x)), &g, groups);
+    first(plan).map(|c| c.gemm.tile)
+}
+
+const F16: DType = DType::Float16;
+
+#[test_case(&[1, 80, 80, 384], conv_geom(80, 384, 96, 3, 1), 1, Ok([64, 96, 32]); "head conv, 96 wide")]
+#[test_case(&[1, 20, 20, 192], conv_geom(20, 192, 192, 3, 1), 1, Ok([64, 48, 32]); "a starved shallow body")]
+#[test_case(&[8, 80, 80, 384], conv_geom(80, 384, 384, 3, 2), 1, Ok([128, 128, 32]); "a static batch folds into the rows")]
+#[test_case(&[1, 40, 40, 192], conv_geom(40, 192, 192, 3, 1), 1, Err(Fallback::Config); "a shallow body filling the device")]
+#[test_case(&[1, 80, 80, 96], conv_geom(80, 96, 96, 3, 1), 1, Err(Fallback::Config); "96 wide, shallow")]
+#[test_case(&[1, 640, 640, 3], conv_geom(640, 3, 96, 3, 2), 1, Err(Fallback::Shape); "rgb stem")]
+#[test_case(&[1, 160, 160, 48], conv_geom(160, 48, 48, 3, 1), 1, Err(Fallback::Config); "no 48-wide fill")]
+#[test_case(&[1, 20, 20, 64], conv_geom(20, 64, 60, 3, 1), 1, Err(Fallback::Shape); "cout off 8")]
+#[test_case(&[1, 20, 20, 64], conv_geom(20, 64, 64, 3, 1), 64, Err(Fallback::Shape); "depthwise")]
+#[test_case(&[0, 20, 20, 64], conv_geom(20, 64, 64, 3, 1), 1, Err(Fallback::Shape); "no images")]
+#[test_case(&[1, 1, 1, 64], conv_geom(1, 64, 64, 5, 1).with_pad(0), 1, Err(Fallback::Shape); "empty output")]
+fn conv_plans(x: &[usize], g: crate::kernels::conv::ConvGeom, groups: usize, want: Result<[usize; 3], Fallback>) {
+    assert_eq!(conv_plan(x, g, groups), want);
+}
+
+#[test_case(&[F16, F16, F16], DType::Float32, Some(DType::Float32), true; "f32 out with an f32 residual")]
+#[test_case(&[F16, F16, F16], DType::Float32, Some(F16), false; "residual off the output type")]
+#[test_case(&[F16, F16, F16], DType::BFloat16, None, false; "another half output")]
+#[test_case(&[DType::Float32; 3], DType::Float32, None, false; "f32 keeps the graph")]
+#[test_case(&[F16, BF16, F16], F16, None, false; "mixed operands")]
+fn conv_dtype_plans(dtypes: &[DType], out: DType, residual: Option<DType>, kernel: bool) {
+    let g = conv_geom(80, 384, 96, 3, 1);
+    let plan = shape::conv2d(Some(&sm86()), dtypes, out, residual, Some(&ext(&[1, 80, 80, 384])), &g, 1);
+    assert_eq!(matches!(plan, Plan::Kernel(_)), kernel, "{plan:?}");
+    if !kernel {
+        assert_eq!(plan, Plan::Graph(Fallback::Dtype));
+    }
+}
+
+/// A bound batch walks grid z: candidates for one image's rows, the batch
+/// counted toward the grid.
+#[test]
+fn a_bound_conv_batch_plans_per_image() {
+    let g = conv_geom(80, 384, 384, 3, 2);
+    let x = Extent { dims: vec![8, 80, 80, 384], var: true };
+    let plan = shape::conv2d(Some(&sm86()), &[F16; 3], F16, None, Some(&x), &g, 1);
+    assert_eq!(plan, Plan::Kernel(config::conv_candidates(&sm86(), 8, 1600, &g)));
+    let plan = shape::conv2d(Some(&rdna3()), &[F16; 3], F16, None, Some(&x), &g, 1);
+    assert_eq!(plan, Plan::Graph(Fallback::Target));
+    assert_eq!(shape::conv2d(Some(&sm86()), &[F16; 3], F16, None, None, &g, 1), Plan::Graph(Fallback::Symbolic));
+}

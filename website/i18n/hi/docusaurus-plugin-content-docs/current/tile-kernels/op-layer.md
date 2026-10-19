@@ -10,6 +10,7 @@ shapes किसी कर्नेल में फ़िट होते ह�
 
 ```rust
 pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor>;
+pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor>;
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tensor>;
 pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)>;
 pub fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Tensor>;
@@ -24,6 +25,7 @@ pub fn supported(device: &DeviceSpec) -> bool;
 |---|---|---|
 | `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`; gated `w` `[2N, K]` है |
+| `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`; 1×1 convolution `linear` है |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` `x` जैसा `residual` लेते हैं और `(x + residual, norm)` लौटाते हैं |
 
@@ -47,8 +49,8 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | `Target` | Tensor default device पर नहीं है, या device के पास tk3 tables नहीं हैं (आज: CUDA sm_80+ के अलावा सब) |
 | `Dtype` | कोई operand f32 है, या सारे operands matrix core वाला एक ही 16-bit type साझा नहीं करते |
 | `Symbolic` | Bound leading dim के अलावा कोई dim symbolic है (`linear` के लिए symbolic `N` भी) |
-| `Shape` | `linear`: `N` 8 का गुणज नहीं या कोई row नहीं। `attention`: `D ∉ {48, 64, 128}` या कोई ख़ाली dim। `heads`: `D` 16..=256 में दो की घात नहीं। Norms: `D` 256..=2048 में दो की घात नहीं |
-| `Config` | कोई tile config फ़िट नहीं होता। `linear` के लिए, `K` 16 का गुणज नहीं |
+| `Shape` | `linear`: `N` 8 का गुणज नहीं या कोई row नहीं। `attention`: `D ∉ {48, 64, 128}` या कोई ख़ाली dim। `heads`: `D` 16..=256 में दो की घात नहीं। Norms: `D` 256..=2048 में दो की घात नहीं। `conv2d`: `groups > 1`, `Cin` 16 का गुणज नहीं, `Cout` 8 का गुणज नहीं, या ख़ाली output |
+| `Config` | कोई tile config फ़िट नहीं होता। `linear` के लिए, `K` 16 का गुणज नहीं। `conv2d` के लिए वे classes भी जिन पर kernel मापकर हारता है (पूरे grid पर उथले stride-1 convolutions) |
 
 sm_86 target पर `test/unit/ops_plan.rs` के असली cases:
 

@@ -14,6 +14,7 @@ runtime variable की live गिनती launch करता है, buffers
 | कर्नेल | Spec → program | कर्नेल का नाम | Op |
 |---|---|---|---|
 | GEMM + epilogue | `GemmSpec` → `gemm::gemm` | `gemm` | `ops::linear` |
+| Implicit-GEMM convolution | `ConvSpec` → `conv::conv` (+ split होने पर `gemm::split_merge`) | `conv`, `split_merge` | `ops::conv2d` |
 | Flash attention forward | `AttnSpec` → `attention::attention` | `flash_attention` | `ops::attention` |
 | Split merge | `CombineSpec` → `attention::combine` | `combine_splits` | `splits` के साथ `ops::attention` |
 | Attention prologue | `HeadsSpec` → `heads::heads` | `heads` | `ops::heads` |

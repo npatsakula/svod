@@ -9,6 +9,7 @@ sidebar_label: 内核库
 | 内核 | Spec → 程序 | 内核名称 | 算子 |
 |---|---|---|---|
 | GEMM + 尾处理 | `GemmSpec` → `gemm::gemm` | `gemm` | `ops::linear` |
+| 隐式 GEMM 卷积 | `ConvSpec` → `conv::conv`（拆分 K 时另加 `gemm::split_merge`） | `conv`、`split_merge` | `ops::conv2d` |
 | Flash attention 前向 | `AttnSpec` → `attention::attention` | `flash_attention` | `ops::attention` |
 | 拆分合并 | `CombineSpec` → `attention::combine` | `combine_splits` | 带 `splits` 的 `ops::attention` |
 | 注意力前处理 | `HeadsSpec` → `heads::heads` | `heads` | `ops::heads` |
