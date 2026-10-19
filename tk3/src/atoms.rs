@@ -134,8 +134,12 @@ pub struct Costs {
     /// run under 16 bytes that the next lane does not continue (a line per lane).
     /// Measured on lines in cache, so a bias read from DRAM costs more.
     pub scatter: f64,
-    /// One 16×16×16 matrix-core step of a wave.
+    /// One 16×16×16 matrix-core step of a wave, the SM full of waves: the
+    /// core's throughput.
     pub step: f64,
+    /// The same step of a wave alone on its SIMD: a dependent chain's
+    /// latency, which `step_lone / step` waves a SIMD hide.
+    pub step_lone: f64,
     /// One score element's softmax vector work (scale, max, exp2, sum).
     pub score: f64,
     /// One pipeline trip's fixed overhead (barrier, ring bubble), unrolled.
@@ -163,12 +167,13 @@ pub struct Costs {
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
     /// order: all but the cache's, which a series of footprints measures.
-    pub fn fields(&mut self) -> [(&'static str, &mut f64); 10] {
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 11] {
         let Costs {
             smem_byte,
             global_byte,
             scatter,
             step,
+            step_lone,
             score,
             trip,
             trip_rolled,
@@ -183,6 +188,7 @@ impl Costs {
             ("global_byte", global_byte),
             ("scatter", scatter),
             ("step", step),
+            ("step_lone", step_lone),
             ("score", score),
             ("trip", trip),
             ("trip_rolled", trip_rolled),

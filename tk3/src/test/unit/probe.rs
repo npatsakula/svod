@@ -77,6 +77,18 @@ fn loads_from(prog: &Program, tier: Tier) -> Vec<(Shape, usize)> {
         .collect()
 }
 
+/// The `m × n × k` of the product `prog` accumulates.
+fn mma(prog: &Program) -> usize {
+    prog.walk()
+        .find_map(|(_, s)| match s {
+            Stmt::Let { dst, op: TileOp::Mma { a, .. } } => {
+                Some(prog.value(*dst).shape.elems() * prog.value(*a).shape.cols)
+            }
+            _ => None,
+        })
+        .expect("a product")
+}
+
 /// The product of every probe's loop: the units each divides by, counted
 /// from its programs.
 fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
@@ -88,15 +100,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
         probe.value(l.carried[0].phi).shape.elems()
     };
     match field {
-        "step" => {
-            let mma = probe.walk().find_map(|(_, s)| match s {
-                Stmt::Let { dst, op: TileOp::Mma { a, .. } } => {
-                    Some(probe.value(*dst).shape.elems() * probe.value(*a).shape.cols)
-                }
-                _ => None,
-            });
-            (blocks * extent * mma.expect("a product") / 4096) as f64
-        }
+        "step" => (blocks * extent * mma(probe) / 4096) as f64,
         "smem_byte" | "global_byte" => {
             let tier = if field == "smem_byte" { Tier::Smem } else { Tier::Global };
             (blocks * extent * loads_from(probe, tier).iter().map(|l| l.1).sum::<usize>()) as f64
@@ -104,6 +108,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
         "score" => (blocks * extent * carried()) as f64,
         // One wave's chain: every wave runs its own alongside the others.
         "scatter" => (extent * loads_from(probe, Tier::Global)[0].0.elems() / warps) as f64,
+        "step_lone" => (extent * mma(probe) / 4096 / warps) as f64,
         // The work of every relayout of a trip, as the inference prices it.
         "smem_trip" | "lane_move" => {
             let moved: f64 = relayouts(target, find(probes, field), 1).iter().map(Relayout::work).sum();
@@ -229,7 +234,7 @@ fn units_count_the_primitive(target: Target) {
         let field = p.op.strip_prefix("probe:").expect("a probe op");
         let (_, probe) = pair(p);
         assert_eq!(p.units, counted(&target, &probes, field), "{}", p.op);
-        if ["scatter", "lane_move", "smem_trip"].contains(&field) {
+        if ["scatter", "step_lone", "lane_move", "smem_trip"].contains(&field) {
             let (blocks, warps) = (work(probe).0, probe.warps);
             let simds = target.occupancy.simds;
             assert_eq!((blocks as u32, warps), (target.sms.unwrap(), simds), "{}: a wave per SIMD", p.op);
@@ -289,6 +294,8 @@ fn in_loop(ir: &str) -> &str {
 /// nowhere. A shared tile is read through the ring's pointer, `%local0`.
 #[test_case(sm86(), "step", "@llvm.nvvm.mma."; "sm86 mma.sync")]
 #[test_case(gfx1151(), "step", "@llvm.amdgcn.wmma."; "gfx1151 wmma")]
+#[test_case(sm86(), "step_lone", "@llvm.nvvm.mma."; "sm86 lone mma.sync")]
+#[test_case(gfx1151(), "step_lone", "@llvm.amdgcn.wmma."; "gfx1151 lone wmma")]
 #[test_case(sm86(), "smem_byte", "ptr %local0"; "sm86 shared load")]
 #[test_case(gfx1151(), "smem_byte", "ptr %local0"; "gfx1151 shared load")]
 #[test_case(sm86(), "lane_move", "@llvm.nvvm.shfl.sync.bfly"; "sm86 shuffle")]
@@ -404,6 +411,7 @@ fn device_costs_are_physical() {
     assert!(c.smem_byte > 0.0 && c.smem_byte < c.global_byte, "{c:?}");
     assert!(c.l2_byte > 0.0 && c.l2_byte <= c.global_byte, "{c:?}");
     assert!(c.latency > c.step, "{c:?}");
+    assert!(c.step_lone >= c.step, "{c:?}");
     assert!(c.trip_rolled >= 0.9 * c.trip, "{c:?}");
     assert!(c.smem_trip > 0.0, "{c:?}");
 }

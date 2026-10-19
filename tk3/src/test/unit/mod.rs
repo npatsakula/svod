@@ -93,6 +93,8 @@ pub(crate) fn costs() -> Costs {
         global_byte: 0.02,
         scatter: 8.0,
         step: 5.0,
+        // A guess: three waves a SIMD hide the chain.
+        step_lone: 15.0,
         score: 0.5,
         trip: 150.0,
         trip_rolled: 170.0,
@@ -112,6 +114,8 @@ pub(crate) fn gfx1151_costs() -> Costs {
         global_byte: 0.1877,
         scatter: 3.05,
         step: 6.25,
+        // Unmeasured there: equal to `step`, so a lone wave hides nothing.
+        step_lone: 6.25,
         score: 0.0773,
         trip: 11.67,
         trip_rolled: 13.85,
