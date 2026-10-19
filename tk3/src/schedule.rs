@@ -1,6 +1,7 @@
 //! Schedule templates: how a [`Pipeline`] statement runs on a target. The
-//! template owns every barrier, wait and ring-slot computation; the author's
-//! `produce`/`consume` bodies are placed, never edited.
+//! template owns every barrier, wait and ring-slot computation inside the
+//! ring (the sync pass fences only where the ring meets the code around it);
+//! the author's `produce`/`consume` bodies are placed, never edited.
 
 use crate::atoms::Fill;
 use crate::ir::*;
@@ -12,8 +13,9 @@ pub enum Schedule {
     /// `async_products` a consume's warpgroup products are left in flight
     /// over the next trip's fill (`cp.async` rings of three slots or more):
     /// the ring refills the slot consumed two trips ago, and the template
-    /// waits for all but the youngest chain after every consume and for
-    /// every chain after the loop ([`Sync::WaitProducts`]).
+    /// waits for all but the youngest chain after every consume that places
+    /// no wait of its own, and for every chain after the loop
+    /// ([`Sync::WaitProducts`]).
     Uniform { fill: Fill, unroll: bool, async_products: bool },
     /// Two crews of `crew` warps run one stream of clusters a cluster apart
     /// over one register-staged slot: a crew's product, its fragments already

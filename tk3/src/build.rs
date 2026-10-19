@@ -223,7 +223,6 @@ impl Kernel {
         Sc::Id(self.push_scalar(s))
     }
 
-    /// Intern an expression into the arena.
     pub fn intern(&mut self, sc: impl Into<Sc>) -> ScalarId {
         match sc.into() {
             Sc::Id(id) => id,
@@ -658,7 +657,8 @@ impl Kernel {
         merged.expect("both branches ran").map(Tile::new)
     }
 
-    /// A barrier across the block's warps.
+    /// A barrier across the block's warps, and a fence of its shared memory;
+    /// block-wide even inside [`Self::each_warp`].
     pub fn barrier(&mut self) {
         self.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
     }

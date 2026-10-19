@@ -15,8 +15,8 @@ use crate::kernels::rows::NormCfg;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Plan<C> {
-    /// The tile configs, ranked: the untuned pick first, the tuner's
-    /// shortlist the first that compile without spilling.
+    /// The tile configs, ranked by the model: untuned, the first that
+    /// compiles without spilling runs; tuned, the shortlist is drawn from the front.
     Kernel(Arc<[C]>),
     Graph(Fallback),
 }

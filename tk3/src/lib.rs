@@ -1,4 +1,5 @@
-//! Tiled Language v3. Design: `tk3_design.md` at the repository root.
+//! Tiled Language v3; the guide is the website's Tile Kernels pages
+//! (<https://svod.vpermilp.online/docs/tile-kernels/overview>).
 //!
 //! A kernel is a *structured* tile program (statements in program order, effects
 //! declared, sync derived), layouts are F2 linear maps carried as data, vendor

@@ -2,7 +2,7 @@
 //! map over GF(2) from the bits of named input dimensions to the bits of named output
 //! dimensions, stored as one basis vector per input bit. Output values are packed into
 //! a `u64`, the output dimensions in [`Dim`] order, each at the offset of the ones
-//! before it. Design: `tk3_design.md` §3.2.
+//! before it.
 
 mod atoms;
 
@@ -131,7 +131,7 @@ impl Layout {
 
     // ── construction ────────────────────────────────────────────────────────────
 
-    /// `in`'s bits onto the low bits of `out`, both of `size` elements.
+    /// `dim`'s bits onto the low bits of `out`, both of `size` elements.
     pub fn identity(dim: Dim, size: u32, out: Dim) -> Self {
         let b = log2(size);
         let outs: Outs = [(out, b)].into_iter().collect();

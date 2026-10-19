@@ -12,8 +12,8 @@
 //! unwritable store is a miss, never an error; a line the store cannot read
 //! is dropped at its next write, and a file of another format whole.
 //! `SVOD_TK3_TUNE=0`, or [`scoped`] on a thread, turns candidate timing off:
-//! the first admitted candidate is used, while a device's probes still
-//! measure.
+//! the first ranked config that compiles without spilling is used (that
+//! verdict is still stored), while a device's probes still measure.
 
 use std::borrow::BorrowMut;
 use std::cell::Cell;
@@ -35,13 +35,14 @@ use crate::ir::{Param, Program};
 use crate::launch;
 use crate::lower::Lowering;
 
-/// The store's line format, bumped when a line's meaning changes (a file
-/// without a format line is of the first); 5 fingerprints the emitted
-/// kernels, where 4 fingerprinted the programs and lowerings, targets and
-/// costs whole.
+/// The store's line format, bumped when a line's meaning changes; a file of
+/// another format, or without the line, is dropped whole. 5 fingerprints the
+/// emitted kernels, where 4 fingerprinted the programs and lowerings, targets
+/// and costs whole.
 pub(crate) const FORMAT: u32 = 5;
-/// Search bound: timed rounds over every candidate after the warm-up, and
-/// the rounds the two leaders then run again.
+/// Measurement: the rounds a contender is timed (the first over every
+/// candidate, the rest over the contenders), and the rounds the two leaders
+/// then run again ([`rounds`]).
 const ROUNDS: usize = 4;
 /// Search bound: candidates from which the first round cuts the field to
 /// its [`CONTENDER`]s; fewer run every round, a cut saving little and a

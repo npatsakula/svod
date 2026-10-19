@@ -74,8 +74,9 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Whether `device` has a planner: a tk3 target with kernels whose costs
-/// measure (probed on the first ask).
+/// Whether `device` has a planner: it is the default device, and its target
+/// has kernels and reports an SM count. Its cost probes run on the first ask;
+/// a probe that fails leaves its cost at zero rather than the device to the graph.
 pub fn supported(device: &DeviceSpec) -> bool {
     planner(device).is_some()
 }
@@ -111,11 +112,12 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
 /// a list under an op name: [`Self::admitted`] keeps the first
 /// [`SHORTLIST`](config::SHORTLIST) tiles of a ranked list whose compiled
 /// kernels do not spill (all spilling: the first that compile; nothing
-/// compiling, no device: the first, untested), [`Self::fastest`] times a
-/// list on a store miss, and [`Self::pipelined`] times the winning tile's
-/// other pipelines. With tuning off (`SVOD_TK3_TUNE=0`) nothing is timed or
-/// stored: the ranked list's [`Self::first_clean`] config runs, and the
-/// device's cost probes still measure once ([`planner`]).
+/// compiling, no device: the first [`SHORTLIST`](config::SHORTLIST) tiles,
+/// untested), [`Self::fastest`] times a list on a store miss, and
+/// [`Self::pipelined`] times the winning tile's other pipelines. With tuning
+/// off (`SVOD_TK3_TUNE=0`) nothing is timed: the ranked list's
+/// [`Self::first_clean`] config runs (its verdict kept as a `first` line), and
+/// the device's cost probes still measure once ([`planner`]).
 pub(crate) struct Tuner<'a, C, B> {
     target: &'a Target,
     compiler: u64,

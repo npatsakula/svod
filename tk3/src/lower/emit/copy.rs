@@ -133,7 +133,8 @@ impl Emit<'_> {
 
     /// Global → registers: past a plain bound the load is gated; a gathered
     /// row outside its map reads element 0 and one select zeroes the run.
-    /// Global → registers. The register half of a fill ([`CopyMode::Staged`])
+    /// Where the target loads transposed, [`Self::tr_load_regs`] takes over.
+    /// The register half of a fill ([`CopyMode::Staged`])
     /// reads as the kernel's fills read: where those are `cp.async.cg`
     /// copies, its 16-byte runs load at L2 only, bypassing L1 as the copies
     /// do; under register staging, as plain loads.

@@ -32,11 +32,10 @@ use crate::kernels::rows::NormCfg;
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked};
 use crate::tune::Compiled;
 
-/// Targets with kernels: `mma.sync` + `cp.async` + `ldmatrix` (sm_80+, measured
-/// on sm_86; Hopper and Blackwell run the same path, no wgmma or TMA), and
-/// AMD matrix cores with register-staged fills: RDNA3/RDNA3.5/RDNA4 WMMA
-/// (measured on gfx1201) and CDNA3/4 MFMA 16×16×16 on wave64 (compiled, not
-/// yet measured).
+/// Targets with kernels: CUDA sm_80+ on `mma.sync` + `cp.async` + `ldmatrix`,
+/// sm_90 adding the `wgmma` warpgroup core (no TMA or mbarrier), and AMD
+/// matrix cores with register-staged fills: RDNA3/3.5/4 WMMA and CDNA3/4
+/// MFMA 16×16×16 on wave64. Metal has atoms but no kernels.
 pub fn has_kernels(target: &Target) -> bool {
     match target.arch {
         GpuArch::Cuda(c) => c.major >= 8,
@@ -437,8 +436,8 @@ pub(crate) const SHORTLIST: usize = 64;
 /// cut it on some runs. Over three cards' exhaustive sweeps eight reaches
 /// every tile a deeper stage would.
 pub(crate) const TWIN_TILES: usize = 8;
-/// Model: blocks per SM a convolution's grid should reach before its
-/// reduction is left whole: its grids are a few hundred blocks.
+/// Search bound: half the blocks per SM a single-batch convolution's grid
+/// must reach before its reduction is left whole ([`Planner::conv_splits`]).
 const CONV_BLOCKS_PER_SM: usize = 2;
 /// Model: the share of a convolution tile's area that may pad past `m × n`;
 /// a split is sought among tiles within half of it as well.
@@ -542,7 +541,6 @@ pub(crate) fn distinct<C: Tiled>(ranked: &[C]) -> impl Iterator<Item = C> + '_ {
     ranked.iter().copied().filter(move |c| seen.insert(c.tile()))
 }
 
-/// `list` with each config once, in order.
 pub(crate) fn distinct_configs<C: Tiled>(list: &[C]) -> Vec<C> {
     let mut seen = HashSet::new();
     list.iter().copied().filter(|c| seen.insert(*c)).collect()
@@ -931,7 +929,7 @@ const FA_STAGES: [usize; 2] = [3, 2];
 /// Search bound: the warps a one-row-warp block's keys may split over.
 const KEY_WARPS: [usize; 3] = [1, 2, 4];
 
-/// Model: the fewest queries a block offers two atom rows per warp for.
+/// Search bound: the fewest queries a block offers two atom rows per warp for.
 const TWO_ROWS_FROM: usize = 64;
 
 /// Model: trips a key block on a causal query block's diagonal counts for: the

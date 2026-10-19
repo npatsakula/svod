@@ -953,7 +953,6 @@ impl<'a> Probes<'a> {
     }
 }
 
-/// A kernel named after the probe `op`.
 fn kernel(op: &str, blocks: usize, warps: u32) -> Kernel {
     let mut k = Kernel::new(op.replace(':', "_"));
     k.grid([Sc::from(blocks), Sc::from(1), Sc::from(1)]);
@@ -1023,7 +1022,8 @@ fn output<T: Elem>(k: &mut Kernel, blocks: usize, v: Regs<T>) {
 }
 
 /// `l` with its first register bit and lane bit `lane` exchanged: each lane
-/// keeps half its elements and takes the other half from lane `lane ^ 2^bit`.
+/// keeps half its elements and takes the other half from the lane whose
+/// index differs in bit `lane`.
 pub(crate) fn half_swapped(l: &TileLayout, lane: u32) -> TileLayout {
     let bases = |dim| -> Vec<[u32; 2]> {
         (0..l.frag.in_bits(dim))

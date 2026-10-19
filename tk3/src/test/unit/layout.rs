@@ -233,7 +233,7 @@ fn lanes_sharing_row_matches_brute_force() {
     assert_eq!(lanes_sharing_row(&mfma_32x32x8_c()).as_slice(), [1, 2, 4, 8, 16]);
 }
 
-/// `ldmatrix.x4` (`fa_cuda_references.md` §(c)) as a composition: the 8×8 per-matrix
+/// `ldmatrix.x4` as a composition: the 8×8 per-matrix
 /// pair layout tiled over the four matrices reproduces the `mma.sync` tile plain, its
 /// transpose under `.trans` (ThunderKittens `ldsm4t(tmp[0], tmp[2], tmp[1], tmp[3])`),
 /// and the matrices land where the addressing lanes `8m..8m+8` point.
@@ -333,7 +333,7 @@ proptest! {
 
 /// The accumulator reaches the next product's B operand for free exactly where tk1's
 /// `ArchCaps::acc_reusable_as_input` held — gfx12 and CDNA, hardware-verified there —
-/// so the F2 algebra subsumes that flag (`tk3_design.md` §3.2). Its A operand never
+/// so the F2 algebra subsumes that flag. Its A operand never
 /// does, and that is the handoff `kernels::attention` asks for: it accumulates the
 /// scores as `[bq, bkv]` and feeds them as A, where tk1 accumulates the transpose and
 /// feeds it as B.

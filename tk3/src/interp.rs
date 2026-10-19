@@ -31,7 +31,8 @@ fn slot(name: &str, store: &[f64], index: i64) -> Result<usize> {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Round `x` to `dtype`'s precision (round to nearest even).
+/// Round `x` to `dtype`'s precision: floats to nearest even, integers toward
+/// zero, bools to 0 or 1.
 pub fn round_to(dtype: ScalarDType, x: f64) -> f64 {
     match dtype {
         ScalarDType::Float32 => x as f32 as f64,

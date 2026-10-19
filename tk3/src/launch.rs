@@ -1,6 +1,7 @@
 //! Running a tile program as a lazy graph kernel: placeholders sized at
-//! capacity, the lowered PROGRAM as the call body, outputs in `prog.params`
-//! order after the inputs.
+//! capacity, the lowered PROGRAM as the call body. The first `Out`/`InOut`
+//! parameter is the call's output and every other parameter an input;
+//! results return in `prog.params` order.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

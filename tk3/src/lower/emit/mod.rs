@@ -193,8 +193,7 @@ impl<'a> Emit<'a> {
     }
 
     /// The nesting level a value belongs to: the deepest level among the
-    /// listed values it reads (leaves and constants are level 0). Unlisted
-    /// pure sources are listed first, at their own level.
+    /// listed values it reads (leaves and constants are level 0).
     fn level_of(&mut self, u: &Arc<UOp>) -> usize {
         if let Some(&l) = self.levels.get(&u.id) {
             return l;
@@ -608,8 +607,9 @@ impl<'a> Emit<'a> {
         self.row_scalars.retain(|_, (l, _)| *l < level);
     }
 
-    /// One iteration's body; a carried value moves into its `phi` right where
-    /// it is defined (see [`Self::advance`]).
+    /// One iteration's body; a carried value's move into its `phi` is
+    /// scheduled for the end of the block that defines its `next` (see
+    /// [`Self::advance`]).
     fn body(&mut self, l: &Loop) -> Result<()> {
         self.carried.push(l.carried.clone());
         self.block(&l.body)?;

@@ -1,9 +1,9 @@
-//! Vendor fragment layouts, each equal to the tk1 `LaneMap::rc` closed form it replaces
-//! (proved exhaustively in `test/unit/layout.rs`).
+//! Vendor fragment layouts.
 
 use super::Dim::{Col, Lane, Reg, Row};
 use super::Layout;
 
+/// Lane bits 0..4 walking the 16 rows.
 const LANE_ROWS16: [[u32; 2]; 4] = [[1, 0], [2, 0], [4, 0], [8, 0]];
 
 /// NVIDIA `mma.sync.m16n8k16` 16×16 register tile (tk `rt_base`, `LaneMap::MmaSync`),
@@ -143,7 +143,7 @@ pub fn wmma_gfx12() -> Layout {
     strided(8, 32)
 }
 
-/// Apple `simdgroup_matrix<T, 8, 8>` (`LaneMap::SimdgroupMatrix`, measured on Apple9):
+/// Apple `simdgroup_matrix<T, 8, 8>` (`LaneMap::SimdgroupMatrix`):
 /// `row = 4·((L/16)%2) + (L/2)%4, col = 4·((L/8)%2) + 2·(L%2) + j`. B operand and
 /// accumulator; the A operand is its transpose.
 pub fn simdgroup_8x8() -> Layout {

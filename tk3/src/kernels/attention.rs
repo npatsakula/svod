@@ -11,7 +11,6 @@ use crate::ir::*;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 
-/// A flash-attention config.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FaCfg {
     pub bq: usize,
@@ -176,11 +175,11 @@ pub struct AttnMask {
     pub causal: bool,
     /// Keys within `[i − left, i + right]` of query `i`.
     pub window: Option<(usize, usize)>,
-    /// Query `i` sees the keys of its own chunk and the chunks before it.
+    /// Block attention ([`Chunk`]): query `i` sees the keys of its own chunk,
+    /// of `left` chunks before it and of `right` after.
     pub chunk: Option<Chunk>,
     /// A `[batch]` i32 parameter of valid key counts: keys at and past the
-    /// count are hidden. A count of 0 sees key 0 unless rows are appended,
-    /// so a lane always has a key and a finite output.
+    /// count are hidden, and a lane left with no visible key yields zeros.
     pub key_lens: bool,
     /// A `[batch, tk rounded up to 8]` i32 parameter, nonzero where the key
     /// is visible.

@@ -30,7 +30,6 @@ pub struct Epilogue {
 }
 
 impl Epilogue {
-    /// Nothing but the rounding, as a constant.
     pub const DEFAULT: Self =
         Self { bias: false, act: Act::None, gated: false, residual: false, scale: None, out_f32: false };
 }

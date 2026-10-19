@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Tiled Language v3: a structured tile IR with F2 linear layouts, per-vendor schedule templates and an always-a-Tensor op layer"
+description = "Tiled Language v3: structured tile programs over F2 linear layouts, lowered per GPU target, with a measured planner and an always-a-Tensor op layer"
 
 [dependencies]
 svod-dtype = { path = "../dtype", version = "=0.2.0" }

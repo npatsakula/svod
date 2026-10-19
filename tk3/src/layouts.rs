@@ -39,7 +39,6 @@ pub struct WarpGrid {
 }
 
 impl WarpGrid {
-    /// The warps a tile is spread over.
     pub fn count(self) -> u32 {
         self.rows * self.cols
     }
@@ -312,8 +311,7 @@ pub enum Relayout {
 impl Relayout {
     /// What moving one element this way costs, for the inference to weigh
     /// one assignment against another: its [`Self::work`] in its primitive's
-    /// cost. A wave64 exchange's moves past 31 lanes run as `ds_bpermute` on
-    /// RDNA, yet are priced as lane moves: no cost is measured for them.
+    /// cost.
     pub fn cost_per_element(&self, costs: &Costs) -> f64 {
         let unit = match self {
             Relayout::Exchange(_) => costs.lane_move,
@@ -378,11 +376,6 @@ pub struct Issue {
 }
 
 impl MmaAtom {
-    /// The `[m, n] += [m, k] · [k, n]` product over `grid`, issued `orient`
-    /// way round. Swapped, our A feeds the slot expecting `atom.b` (as Aᵀ)
-    /// and our B the one expecting `atom.a`, so each is held in the other's
-    /// transpose and the accumulator in its own; the warp grid and repeat
-    /// counts are the direct form's either way, so no warp's work moves.
     /// Whether an accumulator feeds the next product without moving: the
     /// accumulator of an `m × k` product as its A operand directly, or that
     /// of a `k × n` product as the B operand of the swapped product (both
@@ -397,6 +390,11 @@ impl MmaAtom {
         feeds(m, k, |p| &p.a) || (self.swappable() && feeds(k, n, |p| &p.b))
     }
 
+    /// The `[m, n] += [m, k] · [k, n]` product over `grid`, issued `orient`
+    /// way round. Swapped, our A feeds the slot expecting `atom.b` (as Aᵀ)
+    /// and our B the one expecting `atom.a`, so each is held in the other's
+    /// transpose and the accumulator in its own; the warp grid and repeat
+    /// counts are the direct form's either way, so no warp's work moves.
     pub fn issue(&self, orient: Orient, grid: WarpGrid, m: usize, n: usize, k: usize) -> Result<Issue> {
         assert!(orient == Orient::Direct || self.swappable(), "a {}×{} atom cannot issue swapped", self.m, self.n);
         let (wr, wc) = (grid.rows, grid.cols);
@@ -626,7 +624,7 @@ pub struct Laid {
 /// is tried while the free products are few, one flip at a time beyond that —
 /// so an accumulator that feeds another product reaches it in the layout that
 /// product wants, which on a target whose accumulator is its operand's
-/// transpose is free (what tk1's `acc_reusable_as_input` flag used to say).
+/// transpose is free.
 /// Products the author oriented stay as pinned.
 pub fn infer(mut prog: Program, device: &Device, grid: WarpGrid, core: Core) -> Result<Laid> {
     orient_products(&mut prog, device, grid, core)?;
@@ -828,7 +826,6 @@ impl<'a> Infer<'a> {
         }
     }
 
-    /// `a` and `b` are held alike; a disagreement is resolved on `b`'s side.
     /// Hold `a` and `b` alike: an unlaid one takes the other's layout, and
     /// where both are laid differently `b` is re-held as `a` before the
     /// statement. An op unifies its result with each operand in that order,

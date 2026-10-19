@@ -58,19 +58,13 @@ impl MmaAtom {
 }
 
 /// A warpgroup matrix instruction: four consecutive warps issue
-/// `C[64, n] += A[64, 16] · B[k, n]` together (Hopper's `wgmma.mma_async`),
+/// `C[64, n] += A[64, 16] · B[16, n]` together (Hopper's `wgmma.mma_async`),
 /// `n` a power of two up to `n_max`. `B` is read from shared memory through
-/// a descriptor over the K-major rows a fill leaves, XOR-swizzled as the
-/// lowering swizzles them; `A` likewise, or from registers when it is a
+/// a descriptor over the rows a fill leaves, K-major or MN-major (the
+/// instruction transposing them), XOR-swizzled as the lowering swizzles them; `A` likewise, or from registers when it is a
 /// register tile. The accumulator is spread over the warpgroup, each warp
 /// holding its 16 rows in [`frag::wgmma_c`], so it feeds the next product's
 /// register `A` ([`frag::wgmma_a`]) as it stands.
-///
-/// Blackwell's `tcgen05.mma` is the same product over the same descriptors
-/// and slots in as a second implementation of this class; the two places it
-/// differs are named here: [`AccResidence`] (its accumulator lives in tensor
-/// memory and is read out explicitly) and [`IssueScope`] (one thread issues
-/// it for the warpgroup).
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupMmaAtom {
     pub n_max: u32,
@@ -81,7 +75,7 @@ pub struct GroupMmaAtom {
     pub device: RendererDevice,
 }
 
-/// Where a warpgroup product's accumulator lives.
+/// Where a warpgroup product's accumulator lives; only `Registers` is lowered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccResidence {
     /// Spread over the warpgroup's registers (Hopper).
@@ -90,7 +84,7 @@ pub enum AccResidence {
     TensorMemory,
 }
 
-/// Which threads issue a warpgroup product.
+/// Which threads issue a warpgroup product; only `Warpgroup` is lowered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IssueScope {
     /// Every thread of the warpgroup, aligned (Hopper).
@@ -100,8 +94,11 @@ pub enum IssueScope {
 }
 
 impl GroupMmaAtom {
+    /// The rows of one instruction's product.
     pub const M: u32 = 64;
+    /// The depth of one instruction over 16-bit inputs.
     pub const K: u32 = 16;
+    /// The warps of a warpgroup.
     pub const WARPS: u32 = 4;
 
     /// The widest instruction `n` that tiles `cols`: the largest power of
@@ -547,8 +544,8 @@ fn group_mma_atoms(device: RendererDevice) -> Vec<GroupMmaAtom> {
 }
 
 /// The scheduler's tensor-core descriptor as the IR metadata a hand-built
-/// `Wmma` carries (mirrors tk1 `wmma_from_tc`: `log2(elements_per_thread)`
-/// size-2 upcast axes per operand, no reduce axes).
+/// `Wmma` carries: `log2(elements_per_thread)` size-2 upcast axes per
+/// operand, no reduce axes.
 fn metadata(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
     let axes = |ept: usize| -> Vec<(AxisId, usize)> {
         (0..ept.trailing_zeros() as usize).map(|i| (AxisId::Renumbered(4 - i), 2)).collect()

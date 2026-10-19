@@ -76,7 +76,9 @@ impl Value {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Place {
     Reg,
-    /// `alloc[offset + r·cols + c]`, `offset` in elements.
+    /// `alloc[offset + r·cols + c]` in a row-major allocation,
+    /// `alloc[offset + c·rows + r]` in a column-major one ([`SmemAlloc::along`]),
+    /// before the swizzle the lowering applies; `offset` in elements.
     Smem {
         alloc: SmemId,
         offset: ScalarId,
@@ -339,8 +341,8 @@ pub enum Scope {
     Warp,
 }
 
-/// Synchronization the schedule templates and the sync pass emit; authors
-/// never write these.
+/// Synchronization the schedule templates and the sync pass emit; an author
+/// writes only a block barrier ([`crate::build::Kernel::barrier`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Sync {
     /// Every thread of the `scope` arrives before any continues;
@@ -387,7 +389,8 @@ pub enum Stmt {
     /// Every warp of the block runs `body` on its own: `Special::Warp` is
     /// its index, its copies move whole tiles with its lanes alone, and its
     /// barriers gather only itself. What the warps leave in shared memory is
-    /// fenced for the block at the statement's end.
+    /// the block's open effect afterwards: the sync pass fences it before the
+    /// block next touches it.
     Warps {
         body: Block,
     },
