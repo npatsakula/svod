@@ -56,6 +56,10 @@ struct Emit<'a> {
     /// Register buffer of every register value (carried values share one).
     regs: HashMap<ValId, Arc<UOp>>,
     alias: HashMap<ValId, ValId>,
+    /// The carried values of every open loop, innermost last.
+    carried: Vec<Vec<Carried>>,
+    /// Per open block: carried values defined in it, moved at its end.
+    pending: Vec<Vec<Carried>>,
     smem: Vec<Arc<UOp>>,
     scratch: HashMap<ScalarDType, (Arc<UOp>, usize)>,
     lane: Arc<UOp>,
@@ -90,9 +94,10 @@ impl<'a> Emit<'a> {
                 Stmt::Pipeline(p) => &p.carried,
                 _ => continue,
             };
+            // `init` starts in place; `next` is moved into `phi` at the end of
+            // every iteration (a body may read `phi` after computing `next`).
             for c in carried {
                 alias.insert(c.init, c.phi);
-                alias.insert(c.next, c.phi);
             }
         }
         Self {
@@ -108,6 +113,8 @@ impl<'a> Emit<'a> {
             inductions: HashMap::new(),
             regs: HashMap::new(),
             alias,
+            carried: vec![],
+            pending: vec![],
             smem: vec![],
             scratch: HashMap::new(),
             last: tid.clone(),
@@ -268,22 +275,12 @@ impl<'a> Emit<'a> {
         self.hoist(access(buf, off, w as usize))
     }
 
-    fn access_gated(&mut self, buf: &Arc<UOp>, off: &Arc<UOp>, w: u32, gate: &Arc<UOp>) -> Arc<UOp> {
-        let valid = self.hoist(off.valid(gate.clone()));
-        self.hoist(access(buf, &valid, w as usize))
-    }
-
     fn mem_load(&mut self, buf: &Arc<UOp>, off: &Arc<UOp>, w: u32, gate: Option<&Arc<UOp>>) -> Arc<UOp> {
         let tag = self.next_tag();
+        let idx = self.access(buf, off, w);
         let u = match gate {
-            Some(gate) => {
-                let idx = self.access_gated(buf, off, w, gate);
-                load_gated_at(&idx, w as usize, gate, tag)
-            }
-            None => {
-                let idx = self.access(buf, off, w);
-                load_at(&idx, tag)
-            }
+            Some(gate) => load_gated_at(&idx, gate, tag),
+            None => load_at(&idx, tag),
         };
         self.push(u)
     }
@@ -467,16 +464,31 @@ impl<'a> Emit<'a> {
     // ---- statements -------------------------------------------------------
 
     fn block(&mut self, block: &Block) -> Result<()> {
+        self.pending.push(vec![]);
         for stmt in &block.0 {
             self.stmt(stmt)?;
+        }
+        for c in self.pending.pop().expect("the block just opened") {
+            for j in 0..self.layout(c.phi).regs() {
+                let x = self.reg_load(c.next, j);
+                self.reg_store(c.phi, j, vec![x]);
+            }
         }
         Ok(())
     }
 
     fn stmt(&mut self, stmt: &Stmt) -> Result<()> {
         match stmt {
-            Stmt::Let { dst, op } => self.let_(*dst, op),
-            Stmt::Copy { dst, src, mode } => self.copy(*dst, *src, *mode),
+            Stmt::Let { dst, op } => {
+                self.let_(*dst, op)?;
+                self.advance(*dst);
+                Ok(())
+            }
+            Stmt::Copy { dst, src, mode } => {
+                self.copy(*dst, *src, *mode)?;
+                self.advance(*dst);
+                Ok(())
+            }
             Stmt::Loop(l) => self.loop_(l),
             Stmt::Pipeline(_) => UnsupportedSnafu { what: "an unexpanded pipeline" }.fail(),
             Stmt::Role { .. } => UnsupportedSnafu { what: "warp roles" }.fail(),
@@ -548,12 +560,36 @@ impl<'a> Emit<'a> {
         self.scalars.retain(|_, (l, _)| *l < level);
     }
 
+    /// One iteration's body; a carried value moves into its `phi` right where
+    /// it is defined (see [`Self::advance`]).
+    fn body(&mut self, l: &Loop) -> Result<()> {
+        self.carried.push(l.carried.clone());
+        self.block(&l.body)?;
+        self.carried.pop();
+        Ok(())
+    }
+
+    /// After the statement defining `v`: if `v` is the `next` of an open loop,
+    /// schedule its move into that loop's `phi` for the end of the block that
+    /// defines it (so the body may still read `phi`, and a guarded body moves
+    /// only on the iterations that run the guard).
+    fn advance(&mut self, v: ValId) {
+        let moves: Vec<Carried> = self
+            .carried
+            .iter()
+            .flatten()
+            .filter(|c| c.next == v && self.root(c.next) != self.root(c.phi))
+            .copied()
+            .collect();
+        self.pending.last_mut().expect("an open block").extend(moves);
+    }
+
     fn loop_rolled(&mut self, l: &Loop, end: Arc<UOp>, iv: impl Fn(&mut Self, Arc<UOp>) -> Arc<UOp>) -> Result<()> {
         let range = self.open_range(end);
         let level = self.level();
         let value = iv(self, range.clone());
         self.bind(l.iv, level, value);
-        self.block(&l.body)?;
+        self.body(l)?;
         self.close_range(range);
         Ok(())
     }
@@ -564,7 +600,7 @@ impl<'a> Emit<'a> {
         let base = mul(&range, &c32(u));
         for copy in 0..u {
             self.bind(l.iv, level, add(&base, &c32(copy)));
-            self.block(&l.body)?;
+            self.body(l)?;
         }
         self.close_range(range);
         Ok(())
@@ -704,7 +740,10 @@ impl<'a> Emit<'a> {
                         continue;
                     }
                     let e = js % 8;
-                    let v = elem(&words[(e / 2) as usize], (e % 2) as usize, 2);
+                    // Register pair `p` holds matrix `p` of the TL, BL, TR, BR address
+                    // order, with the middle two swapped under `.trans`.
+                    let word = if trans { [0, 2, 1, 3][(e / 2) as usize] } else { (e / 2) as usize };
+                    let v = elem(&words[word], (e % 2) as usize, 2);
                     self.reg_store(dst, jd, vec![v]);
                 }
             }
@@ -831,6 +870,12 @@ impl<'a> Emit<'a> {
                     self.reg_store(dst, j, vec![v.clone()]);
                 }
             }
+            TileOp::Splat(id) => {
+                let v = self.sc(id).cast(dtype);
+                for j in 0..regs {
+                    self.reg_store(dst, j, vec![v.clone()]);
+                }
+            }
             TileOp::Coord(axis) => {
                 let l = self.layout(dst).clone();
                 for j in 0..regs {
@@ -862,6 +907,7 @@ impl<'a> Emit<'a> {
                         BinaryOp::Add => x.try_add(&y),
                         BinaryOp::Sub => x.try_sub(&y),
                         BinaryOp::Mul => x.try_mul(&y),
+                        BinaryOp::Div if x.dtype().is_float() => x.try_div(&y),
                         BinaryOp::Div => x.try_cdiv(&y),
                         BinaryOp::Max => x.try_max(&y),
                         BinaryOp::Min => x.try_max(&y).map(|m| x.try_add(&y).unwrap().try_sub(&m).unwrap()),

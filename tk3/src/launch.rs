@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use snafu::{ResultExt, Snafu};
 use svod_dtype::default_device::default_device;
-use svod_ir::UOp;
+use svod_ir::{CallInfo, UOp};
 use svod_tensor::Tensor;
 
 use crate::ir::{ParamKind, Program};
@@ -31,21 +31,32 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Launch `prog` over `tensors`, one per declared parameter in order; the
 /// first `Out`/`InOut` parameter's tensor is returned as the lazy result.
 pub fn graph_launch(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Tensor> {
+    let out_at = first_output(&prog);
+    Ok(graph_launch_all(prog, lowering, tensors)?.swap_remove(out_at))
+}
+
+fn first_output(prog: &Program) -> usize {
+    prog.params
+        .iter()
+        .position(|p| matches!(p.kind, ParamKind::Out | ParamKind::InOut))
+        .expect("a program writes something")
+}
+
+/// [`graph_launch`] returning every parameter's tensor as it is after the
+/// kernel, in `prog.params` order, so programs with several outputs can be read.
+pub fn graph_launch_all(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Vec<Tensor>> {
     let name = prog.name.clone();
     snafu::ensure!(
         tensors.len() == prog.params.len(),
         AritySnafu { name: name.clone(), want: prog.params.len(), got: tensors.len() }
     );
-    let out_at = prog
-        .params
-        .iter()
-        .position(|p| matches!(p.kind, ParamKind::Out | ParamKind::InOut))
-        .expect("a program writes something");
+    let out_at = first_output(&prog);
     // `custom_kernel` hands placeholders in `[out, ins...]` order.
     let ins: Vec<&Tensor> = tensors.iter().enumerate().filter(|(i, _)| *i != out_at).map(|(_, t)| *t).collect();
     let device = default_device();
     let mut failure = None;
-    let result = Tensor::graph_kernel(&name, tensors[out_at].clone(), &ins, |ph| {
+    let info = CallInfo { name: Some(name.clone()), ..CallInfo::default() };
+    let result = tensors[out_at].custom_kernel_with(&ins, info, |ph| {
         let mut params: Vec<Arc<UOp>> = Vec::with_capacity(ph.len());
         let mut rest = ph[1..].iter();
         for i in 0..ph.len() {
@@ -62,5 +73,9 @@ pub fn graph_launch(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> 
     if let Some(source) = failure {
         return Err(Error::Lower { name, source: Box::new(source) });
     }
-    result.context(GraphSnafu { name })
+    // Back from `[out, ins...]` to parameter order.
+    let mut outs = result.context(GraphSnafu { name })?;
+    let out = outs.remove(0);
+    outs.insert(out_at, out);
+    Ok(outs)
 }

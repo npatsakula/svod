@@ -396,7 +396,7 @@ impl Infer<'_> {
 
     fn let_(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
         match *op {
-            TileOp::Fill(_) | TileOp::Coord(_) | TileOp::Relayout { .. } => {}
+            TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) | TileOp::Relayout { .. } => {}
             TileOp::Unary { src, .. } | TileOp::Cast { src, .. } => {
                 self.unify(src, dst);
                 self.unify(dst, src);
@@ -477,7 +477,7 @@ impl Infer<'_> {
                         rewrite(self, b);
                     }
                     TileOp::Reduce { src, .. } => rewrite(self, src),
-                    TileOp::Fill(_) | TileOp::Coord(_) => {}
+                    TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) => {}
                 },
                 Stmt::Loop(l) => l.body = self.insert(std::mem::take(&mut l.body)),
                 Stmt::Pipeline(p) => {

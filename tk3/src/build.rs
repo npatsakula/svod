@@ -297,6 +297,11 @@ impl Kernel {
         self.fill(shape, Const::Float(0.0))
     }
 
+    pub fn splat<T: Elem>(&mut self, shape: Shape, value: impl Into<Sc>) -> Regs<T> {
+        let value = self.intern(value);
+        self.let_(shape, TileOp::Splat(value))
+    }
+
     pub fn coord(&mut self, shape: Shape, axis: Axis) -> Regs<I32> {
         self.let_(shape, TileOp::Coord(axis))
     }

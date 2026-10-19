@@ -50,20 +50,10 @@ pub fn load_at(access: &Arc<UOp>, tag: u64) -> Arc<UOp> {
     UOp::load().index(access.clone()).call().rtag(Some(smallvec![tag as usize]))
 }
 
-/// A load through a gated access node (`off.valid(gate)`) that yields zeros
-/// where `gate` is false.
-pub fn load_gated_at(access: &Arc<UOp>, w: usize, gate: &Arc<UOp>, tag: u64) -> Arc<UOp> {
-    let buf = match access.op() {
-        Op::Shrink(ops::Shrink { src, .. }) => src.clone(),
-        Op::Index(ops::Index { buffer, .. }) => buffer.clone(),
-        _ => unreachable!("an access node"),
-    };
-    let elem = match buf.dtype() {
-        DType::Ptr { base, .. } => *base,
-        other => other,
-    };
-    let scalar = elem.scalar().expect("a scalar element");
-    let zero = scalar.vec(w).zero_const();
+/// A load through `access` where `gate` holds, zeros elsewhere (the form
+/// the late gater produces: a clean address, the gate on the load).
+pub fn load_gated_at(access: &Arc<UOp>, gate: &Arc<UOp>, tag: u64) -> Arc<UOp> {
+    let zero = UOp::load().index(access.clone()).call().vconst_like(0);
     UOp::load().index(access.clone()).alt(zero).gate(gate.clone()).call().rtag(Some(smallvec![tag as usize]))
 }
 
@@ -77,20 +67,6 @@ pub fn store_at(access: &Arc<UOp>, vals: Vec<Arc<UOp>>) -> Arc<UOp> {
 /// A `w`-wide load at `off`.
 pub fn load(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize, tag: u64) -> Arc<UOp> {
     load_at(&access(buf, off, w), tag)
-}
-
-trait ZeroConst {
-    fn zero_const(self) -> Arc<UOp>;
-}
-impl ZeroConst for DType {
-    fn zero_const(self) -> Arc<UOp> {
-        let scalar = self.scalar().expect("scalar");
-        let v = if scalar.is_float() { ConstValue::Float(0.0) } else { ConstValue::Int(0) };
-        match self.count() {
-            1 => UOp::const_(self, v),
-            n => UOp::vconst(vec![v; n], DType::Scalar(scalar)),
-        }
-    }
 }
 
 /// A `vals.len()`-wide store at `off`.

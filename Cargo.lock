@@ -3686,6 +3686,7 @@ dependencies = [
 name = "svod-tk3"
 version = "0.2.0"
 dependencies = [
+ "libm",
  "proptest",
  "smallvec",
  "snafu",
@@ -3693,8 +3694,10 @@ dependencies = [
  "svod-device",
  "svod-dtype",
  "svod-ir",
+ "svod-runtime",
  "svod-schedule",
  "svod-tensor",
+ "svod-tk",
  "test-case",
 ]
 

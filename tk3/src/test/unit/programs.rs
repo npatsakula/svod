@@ -78,3 +78,142 @@ pub fn gemm_nt_ordered(
     k.store(c_view, out);
     k.finish()
 }
+
+/// Shapes and options of a flash-attention forward program.
+#[derive(Clone, Copy, Debug)]
+pub struct FaSpec {
+    /// Maximum batch (the live batch is the bound variable `b`).
+    pub batch: usize,
+    pub t: usize,
+    pub tk: usize,
+    pub heads: usize,
+    pub d: usize,
+    pub bq: usize,
+    pub bkv: usize,
+    pub stages: usize,
+    pub causal: bool,
+    /// A `[batch]` i32 parameter of valid key counts follows `o`.
+    pub key_lens: bool,
+    pub scale: f32,
+}
+
+/// `o = softmax(q · kᵀ · scale) · v` over `[batch, t, heads, d]` tensors: Q
+/// resident in registers, K/V streamed through the pipeline, the online
+/// softmax state `(m, l, o)` carried; causal blocks past the diagonal are
+/// skipped through the dynamic extent, boundary blocks are masked.
+pub fn flash_attention(spec: FaSpec) -> Program {
+    let FaSpec { batch, t, tk, heads, d, bq, bkv, stages, causal, key_lens, scale } = spec;
+    let mut k = Kernel::new("flash_attention");
+    let q = k.param::<BF16>("q", ParamKind::In, batch * t * heads * d);
+    let kk = k.param::<BF16>("k", ParamKind::In, batch * tk * heads * d);
+    let v = k.param::<BF16>("v", ParamKind::In, batch * tk * heads * d);
+    let o = k.param::<BF16>("o", ParamKind::Out, batch * t * heads * d);
+    let lens = key_lens.then(|| k.param::<I32>("key_lens", ParamKind::In, batch));
+    let live = k.var("b", 1, batch as i64);
+    k.grid([Sc::from(t / bq), Sc::from(heads), live]);
+    k.warps((bq / 16) as u32);
+    let k_s = k.smem::<BF16>("k_s", stages * bkv * d);
+    let v_s = k.smem::<BF16>("v_s", stages * bkv * d);
+
+    let (qb, hh, bb) = (k.block(0), k.block(1), k.block(2));
+    let q_off = qb * bq;
+    let row_stride = heads * d;
+    let len = match lens {
+        Some(lens) => k.load_scalar(lens, bb.clone()).max(1),
+        None => Sc::from(tk),
+    };
+    let q_view = k.view(
+        q,
+        bb.clone() * (t * row_stride) + hh.clone() * d + q_off.clone() * row_stride,
+        [row_stride, 1],
+        Shape::new(bq, d),
+        [None, None],
+    );
+    let kv_base = bb.clone() * (tk * row_stride) + hh.clone() * d;
+    let k_view = k.view(kk, kv_base.clone(), [row_stride, 1], Shape::new(bkv, d), [Some(len.clone()), None]);
+    let v_view = k.view(v, kv_base, [row_stride, 1], Shape::new(bkv, d), [Some(len.clone()), None]);
+    let o_view = k.view(
+        o,
+        bb * (t * row_stride) + hh * d + q_off.clone() * row_stride,
+        [row_stride, 1],
+        Shape::new(bq, d),
+        [None, None],
+    );
+
+    // Key blocks this query block attends to: up to the diagonal when causal,
+    // up to the last valid key when lengths are given.
+    let mut blocks = Sc::from(tk / bkv);
+    if causal {
+        blocks = blocks.min((q_off.clone() + bq + bkv - 1) / bkv);
+    }
+    if key_lens {
+        blocks = blocks.min((len.clone() + bkv - 1) / bkv);
+    }
+
+    let q_r = k.load(q_view);
+    let m0 = k.fill::<F32>(Shape::new(bq, 1), Const::Float(-1e30));
+    let l0 = k.zeros::<F32>(Shape::new(bq, 1));
+    let o0 = k.zeros::<F32>(Shape::new(bq, d));
+    let scale_log2e = (scale * std::f32::consts::LOG2_E) as f64;
+    let [_m, l, acc] = k.pipeline(
+        blocks,
+        stages,
+        [m0, l0, o0],
+        |k, step, slot| {
+            let kv_off = step * bkv;
+            let k_g = k.at(k_view, kv_off.clone(), 0);
+            let v_g = k.at(v_view, kv_off, 0);
+            let k_t = k.smem_slot::<BF16>(k_s, slot.clone(), Shape::new(bkv, d));
+            let v_t = k.smem_slot::<BF16>(v_s, slot, Shape::new(bkv, d));
+            k.stage(k_t, k_g, CopyMode::Async);
+            k.stage(v_t, v_g, CopyMode::Async);
+        },
+        |k, step, slot, [m, l, o]| {
+            let k_t = k.smem_slot::<BF16>(k_s, slot.clone(), Shape::new(bkv, d));
+            let v_t = k.smem_slot::<BF16>(v_s, slot, Shape::new(bkv, d));
+            let zero = k.zeros::<F32>(Shape::new(bq, bkv));
+            let s = k.mma(zero, q_r, false, k_t, true);
+            let scale = k.fill::<F32>(Shape::new(bq, bkv), Const::Float(scale_log2e));
+            let mut s = k.binary(s, scale, BinaryOp::Mul);
+            if causal || key_lens {
+                let col = k.coord(Shape::new(bq, bkv), Axis::Col);
+                let kv_off = k.splat::<I32>(Shape::new(bq, bkv), step * bkv);
+                let col = k.binary(col, kv_off, BinaryOp::Add);
+                let mut keep = None;
+                if causal {
+                    let row = k.coord(Shape::new(bq, bkv), Axis::Row);
+                    let q_off = k.splat::<I32>(Shape::new(bq, bkv), q_off.clone());
+                    let row = k.binary(row, q_off, BinaryOp::Add);
+                    keep = Some(k.compare(col, row, BinaryOp::Le));
+                }
+                if key_lens {
+                    let len = k.splat::<I32>(Shape::new(bq, bkv), len.clone());
+                    let valid = k.compare(col, len, BinaryOp::Lt);
+                    keep = Some(match keep {
+                        Some(keep) => k.binary(keep, valid, BinaryOp::And),
+                        None => valid,
+                    });
+                }
+                let masked = k.fill::<F32>(Shape::new(bq, bkv), Const::Float(f64::NEG_INFINITY));
+                s = k.where_(keep.expect("a mask"), s, masked);
+            }
+            let block_max = k.reduce(s, Axis::Row, ReduceOp::Max);
+            let m_new = k.binary(m, block_max, BinaryOp::Max);
+            let corr = k.binary(m, m_new, BinaryOp::Sub);
+            let corr = k.unary(corr, UnaryOp::Exp2);
+            let p = k.binary(s, m_new, BinaryOp::Sub);
+            let p = k.unary(p, UnaryOp::Exp2);
+            let block_sum = k.reduce(p, Axis::Row, ReduceOp::Sum);
+            let l = k.binary(l, corr, BinaryOp::Mul);
+            let l = k.binary(l, block_sum, BinaryOp::Add);
+            let o = k.binary(o, corr, BinaryOp::Mul);
+            let p16 = k.cast::<F32, BF16>(p);
+            let o = k.mma(o, p16, false, v_t, false);
+            [m_new, l, o]
+        },
+    );
+    let out = k.binary(acc, l, BinaryOp::Div);
+    let out = k.cast::<F32, BF16>(out);
+    k.store(o_view, out);
+    k.finish()
+}

@@ -14,6 +14,7 @@ use crate::layouts::{self, TileLayout, WarpGrid};
 use crate::schedule::{self, Schedule};
 
 mod emit;
+pub mod sync;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -48,6 +49,7 @@ pub struct Lowered {
 pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Lowered> {
     schedule::expand(&mut prog, lowering.schedule);
     materialize_operands(&mut prog);
+    sync::insert_barriers(&mut prog);
     let layouts = layouts::infer(&mut prog, &lowering.target, lowering.grid).context(LayoutSnafu)?;
     let program = emit::emit(&prog, &layouts, lowering, params, device)?;
     Ok(Lowered { program, tile: prog, layouts })
