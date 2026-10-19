@@ -9,14 +9,16 @@ use std::sync::Arc;
 
 use svod_codegen::Renderer;
 use svod_codegen::llvm::LlvmTextRenderer;
-use svod_dtype::{CudaArch, DType, DeviceSpec, GpuArch, ScalarDType};
+use svod_dtype::default_device::default_device;
+use svod_dtype::{AmdArch, CudaArch, DType, DeviceSpec, GpuArch, ScalarDType};
 use svod_ir::{Op, UOp, ops};
+use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::atoms::Target;
 use crate::build::{BF16, F16};
 use crate::interp::{self, round_to};
-use crate::ir::Program;
+use crate::ir::{ParamKind, Program};
 use crate::kernels::Act;
 use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Cache, CombineSpec, attention, combine};
@@ -24,6 +26,7 @@ use crate::kernels::conv::ConvSpec;
 use crate::kernels::gemm::{Epilogue, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
+use crate::launch::graph_launch_all;
 use crate::lower::{Lowering, lower};
 use crate::ops::config;
 
@@ -141,6 +144,22 @@ pub(super) fn linear(prog: Program, lowering: &Lowering) -> Arc<UOp> {
     linear.clone()
 }
 
+/// Random parameters of `prog` rounded to their types; every i32 parameter
+/// (key counts, masks, segment starts, row maps) is 1.
+fn inputs(name: &str, prog: &Program) -> Vec<Vec<f64>> {
+    let mut seed = name.len() as u64;
+    let params = prog.params.iter().map(|p| match p.dtype {
+        ScalarDType::Int32 => vec![1.0; p.elems],
+        dtype => (0..p.elems)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                round_to(dtype, ((seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0)
+            })
+            .collect(),
+    });
+    params.collect()
+}
+
 /// The tile program after `lowering` for interpretation.
 fn lowered_tile(prog: Program, lowering: &Lowering) -> Program {
     let params =
@@ -229,22 +248,12 @@ fn every_family_assembles_for_hopper() {
 /// barriers, relayouts): the bookkeeping the target's template adds keeps
 /// the numerics.
 #[test_case(hopper(); "sm_90")]
+#[test_case(rdna(AmdArch::Gfx1201, 64); "gfx1201")]
+#[test_case(rdna(AmdArch::Gfx1151, 40); "gfx1151")]
+#[test_case(rdna(AmdArch::Gfx1100, 96); "gfx1100")]
 fn lowering_keeps_the_interpreted_result(target: Target) {
     for (name, prog, lowering) in families(&target) {
-        let mut seed = name.len() as u64;
-        let params: Vec<Vec<f64>> = prog
-            .params
-            .iter()
-            .map(|p| match p.dtype {
-                ScalarDType::Int32 => vec![1.0; p.elems],
-                dtype => (0..p.elems)
-                    .map(|_| {
-                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                        round_to(dtype, ((seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0)
-                    })
-                    .collect(),
-            })
-            .collect();
+        let params = inputs(&name, &prog);
         let vars: Vec<(&str, i64)> = prog.vars.iter().map(|v| (v.name.as_str(), v.max)).collect();
         let want = interp::run(&prog, params.clone(), &vars).unwrap();
         let tile = lowered_tile(prog.clone(), &lowering);
@@ -252,6 +261,185 @@ fn lowering_keeps_the_interpreted_result(target: Target) {
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
             let same = g.iter().zip(w).all(|(a, b)| a == b || (a.is_nan() && b.is_nan()));
             assert!(same, "{name}: parameter {i} differs after lowering");
+        }
+    }
+}
+
+/// A Radeon with `cus` compute units and 64 KB of LDS per workgroup.
+pub(super) fn rdna(arch: AmdArch, cus: u32) -> Target {
+    Target { sms: Some(cus), ..Target::for_arch(GpuArch::Amd(arch)) }
+}
+
+/// RDNA WMMA with register-staged fills: every family lowers for the
+/// target and, where clang has the AMDGPU backend, compiles to a code
+/// object holding the kernel's descriptor.
+#[test_case(rdna(AmdArch::Gfx1201, 64); "gfx1201")]
+#[test_case(rdna(AmdArch::Gfx1151, 40); "gfx1151")]
+#[test_case(rdna(AmdArch::Gfx1100, 96); "gfx1100")]
+fn every_family_compiles_for_rdna(target: Target) {
+    assert!(config::has_tables(&target));
+    let GpuArch::Amd(arch) = target.arch else { unreachable!() };
+    for (name, prog, lowering) in families(&target) {
+        let kernel = prog.name.clone();
+        let ir = render(prog, &lowering);
+        let object = match svod_runtime::amd::compile_ir_to_amd_object(&ir, arch) {
+            Ok(object) => object,
+            Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
+                eprintln!("skipped: {e}");
+                return;
+            }
+            Err(e) => panic!("{name}: {e}"),
+        };
+        assert_eq!(&object[..4], b"\x7fELF", "{name}: an ELF code object");
+        let descriptor = format!("{kernel}.kd");
+        assert!(object.windows(descriptor.len()).any(|w| w == descriptor.as_bytes()), "{name}: {descriptor}");
+        eprintln!("{name}: compiled for {}", arch.mcpu());
+    }
+}
+
+/// Every output parameter of `prog` after launching it under `lowering` on
+/// the default device, `None` for inputs.
+fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>]) -> Vec<Option<Vec<f64>>> {
+    let decl = prog.params.clone();
+    let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
+    let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+    let tensors: Vec<Tensor> = decl
+        .iter()
+        .zip(params)
+        .map(|(p, v)| match p.dtype {
+            ScalarDType::Int32 => Tensor::from_slice(v.iter().map(|&x| x as i32).collect::<Vec<_>>()),
+            dtype => Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::Scalar(dtype)),
+        })
+        .collect();
+    let refs: Vec<&Tensor> = tensors.iter().collect();
+    let outs = graph_launch_all(prog, lowering, &refs).unwrap();
+    decl.iter()
+        .zip(outs)
+        .map(|(p, t)| {
+            (p.kind != ParamKind::In).then(|| {
+                t.prepare().unwrap().execute_with_vars(&vars).unwrap();
+                let mut bytes = vec![0u8; p.elems * p.dtype.bytes()];
+                t.buffer().unwrap().copyout(&mut bytes).unwrap();
+                let half = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
+                match p.dtype {
+                    ScalarDType::Float32 => {
+                        bytes.chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()) as f64).collect()
+                    }
+                    ScalarDType::BFloat16 => {
+                        bytes.chunks(2).map(|b| f32::from_bits(u32::from(half(b)) << 16) as f64).collect()
+                    }
+                    ScalarDType::Float16 => bytes.chunks(2).map(|b| f16_bits(half(b))).collect(),
+                    other => unreachable!("{other:?} output"),
+                }
+            })
+        })
+        .collect()
+}
+
+fn f16_bits(h: u16) -> f64 {
+    let (sign, exp, frac) = (if h >> 15 == 1 { -1.0 } else { 1.0 }, (h >> 10) & 0x1f, f64::from(h & 0x3ff));
+    sign * match exp {
+        0 => frac * 2f64.powi(-24),
+        31 if frac == 0.0 => f64::INFINITY,
+        31 => f64::NAN,
+        e => (1.0 + frac / 1024.0) * 2f64.powi(i32::from(e) - 15),
+    }
+}
+
+/// Each family on the GPU against the interpreter: within two 16-bit ulps
+/// of the output scale (accumulation order differs), NaN where it is NaN.
+fn check_on_device(target: &Target) {
+    for (name, prog, lowering) in families(target) {
+        let params = inputs(&name, &prog);
+        let vars: Vec<(&str, i64)> = prog.vars.iter().map(|v| (v.name.as_str(), v.max)).collect();
+        let want = interp::run(&prog, params.clone(), &vars).unwrap();
+        let got = on_device(prog, &lowering, &params);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            let Some(g) = g else { continue };
+            let bad = g
+                .iter()
+                .zip(w)
+                .position(|(g, w)| !(g.is_nan() && w.is_nan() || (g - w).abs() <= 2e-2 * w.abs().max(1.0)));
+            let worst = g.iter().zip(w).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
+            eprintln!("{name}: output {i} max abs diff {worst:.3e}");
+            assert!(bad.is_none(), "{name}: output {i}[{}] = {} vs {}", bad.unwrap(), g[bad.unwrap()], w[bad.unwrap()]);
+        }
+    }
+}
+
+/// The device's own target (any vendor with tables): every family's first
+/// candidate computes what the interpreter computes. The remote gate for a
+/// new GPU; skips without one.
+#[test]
+fn families_match_the_interpreter_on_the_device() {
+    let device = default_device();
+    let Some(target) = Target::for_device(&device).filter(config::has_tables) else {
+        eprintln!("skipped: no device with tk3 tables");
+        return;
+    };
+    check_on_device(&target);
+}
+
+/// The RDNA data path on an NVIDIA GPU: register-staged fills into the
+/// chunk layout, vector shared-memory gathers instead of `ldmatrix`, and
+/// two-slot rings, measured against the interpreter.
+#[test]
+fn register_staged_families_match_on_cuda() {
+    let device = default_device();
+    let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
+        eprintln!("skipped: no CUDA device");
+        return;
+    };
+    check_on_device(&Target { cp_async: false, ldmatrix: false, ..target });
+}
+
+/// Every candidate the op layer may plan on RDNA lowers (the tune store
+/// would otherwise time a failure): the GEMM lists of a large, a small-M and
+/// a ragged shape, the attention lists of every head size and both query
+/// regimes, and the convolution lists of every YOLO class.
+#[test_case(rdna(AmdArch::Gfx1201, 64); "gfx1201")]
+#[test_case(rdna(AmdArch::Gfx1151, 40); "gfx1151")]
+fn every_rdna_candidate_lowers(target: Target) {
+    let mut gemms = vec![];
+    for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
+        for gated in [false, true] {
+            for cfg in config::gemm_candidates(&target, 1, m, n, k, gated) {
+                let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
+                gemms.push(GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue, cfg });
+            }
+        }
+    }
+    for spec in gemms {
+        linear(gemm::<BF16>(&spec), &spec.cfg.lowering(target.clone()));
+    }
+    for d in [48, 64, 128] {
+        for t in [1, 16, 100] {
+            for cfg in config::attention_candidates(&target, d, t) {
+                let spec = AttnSpec {
+                    batch: Batch::Static(1),
+                    t,
+                    tk: 100,
+                    heads: 2,
+                    kv_heads: 1,
+                    d,
+                    mask: AttnMask { causal: t > 1, ..AttnMask::default() },
+                    cache: None,
+                    scale: 0.125,
+                    cfg,
+                };
+                linear(attention::<BF16>(&spec), &cfg.lowering(target.clone()));
+            }
+        }
+    }
+    for class in super::conv::YOLO {
+        let g = super::conv::yolo_geom(class);
+        let [ho, wo] = g.out_hw();
+        for c in config::conv_candidates(&target, 1, ho * wo, &g) {
+            let spec =
+                ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, cfg: c.gemm, split: c.split };
+            for (prog, lowering) in spec.programs::<F16>(&target) {
+                linear(prog, &lowering);
+            }
         }
     }
 }

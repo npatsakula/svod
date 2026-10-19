@@ -10,9 +10,34 @@ use crate::kernels::gemm::GemmCfg;
 use crate::kernels::rows::NormCfg;
 
 /// Targets with tables: `mma.sync` + `cp.async` + `ldmatrix` (sm_80+, measured
-/// on sm_86; Hopper and Blackwell run the same path, no wgmma or TMA).
+/// on sm_86; Hopper and Blackwell run the same path, no wgmma or TMA), and
+/// RDNA3/RDNA3.5/RDNA4 WMMA with register-staged fills (conservative tiles,
+/// compiled but not yet measured).
 pub fn has_tables(target: &Target) -> bool {
-    matches!(target.arch, GpuArch::Cuda(c) if c.major >= 8)
+    match target.arch {
+        GpuArch::Cuda(c) => c.major >= 8,
+        GpuArch::Amd(a) => a.is_rdna3() || a.is_rdna3_5() || a.is_rdna4(),
+        GpuArch::Metal(_) => false,
+    }
+}
+
+/// Whether the warp grid of `cfg` tiles its output with `target`'s matrix
+/// core atoms and its ring depth is one the target's prefetch runs.
+fn tiles(target: &Target, cfg: &GemmCfg) -> bool {
+    let Some(atom) = target.mma.first() else { return false };
+    let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
+    bm.is_multiple_of(atom.m as usize * wr)
+        && bn.is_multiple_of(atom.n as usize * wc)
+        && bk.is_multiple_of(atom.k as usize)
+        && target.stages(cfg.stages) == cfg.stages
+}
+
+/// Whether `cfg` lowers on `target`: [`tiles`], and both operand tiles
+/// split into whole 16-byte chunks per thread.
+pub fn cfg_fits(target: &Target, cfg: &GemmCfg) -> bool {
+    let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
+    let threads = target.wave as usize * wr * wc;
+    tiles(target, cfg) && (bm * bk / 8).is_multiple_of(threads) && (bn * bk / 8).is_multiple_of(threads)
 }
 
 const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], unroll: bool) -> GemmCfg {
@@ -27,6 +52,24 @@ const GEMM_FAMILIES: [GemmCfg; 4] = [
     gemm_cfg([64, 128, 32], 2, [2, 2], false),
     gemm_cfg([64, 64, 32], 3, [2, 2], true),
 ];
+
+/// RDNA output tiles, largest first, on the register-staged two-slot ring:
+/// a wave's sub-tile stays at most 64×32 (eight 16×16 accumulators) so the
+/// accumulators, both operand fragments and the staged fill fit in the
+/// wave32 register file. Unmeasured: the tune store picks among them.
+const GEMM_FAMILIES_RDNA: [GemmCfg; 4] = [
+    gemm_cfg([128, 128, 32], 2, [2, 4], false),
+    gemm_cfg([128, 64, 32], 2, [2, 2], true),
+    gemm_cfg([64, 128, 32], 2, [2, 2], true),
+    gemm_cfg([64, 64, 32], 2, [2, 2], true),
+];
+
+fn gemm_families(target: &Target) -> &'static [GemmCfg] {
+    match target.arch {
+        GpuArch::Amd(_) => &GEMM_FAMILIES_RDNA,
+        _ => &GEMM_FAMILIES,
+    }
+}
 
 /// Blocks per SM a family's grid needs before its larger tile pays off:
 /// at M = 704 the 128-row tiles lose to 64×64 with 7 blocks per SM.
@@ -47,8 +90,9 @@ pub fn gemm_candidates(target: &Target, batches: usize, m: usize, n: usize, k: u
         let padded = 16 * (gm * bm * gn * bn - m * n) <= gm * bm * gn * bn;
         padded && batches * gm * gn >= BLOCKS_PER_SM * sms
     };
-    let lead = GEMM_FAMILIES.iter().position(fills).unwrap_or(GEMM_FAMILIES.len() - 1);
-    let base = GEMM_FAMILIES[lead];
+    let families = gemm_families(target);
+    let lead = families.iter().position(fills).unwrap_or(families.len() - 1);
+    let base = families[lead];
     let [bm, bn, _] = base.tile;
     let warps = match base.warps {
         [2, 4] => [4, 2],
@@ -63,14 +107,16 @@ pub fn gemm_candidates(target: &Target, batches: usize, m: usize, n: usize, k: u
         GemmCfg { unroll: !base.unroll, ..base },
         GemmCfg { warps, ..base },
     ];
-    let others = GEMM_FAMILIES.iter().enumerate().filter(|(i, _)| *i != lead).map(|(_, c)| *c);
+    let others = families.iter().enumerate().filter(|(i, _)| *i != lead).map(|(_, c)| *c);
     let mut out: Vec<GemmCfg> = vec![];
     for mut c in variants.into_iter().chain(others) {
         // A reduction dim off `bk` halves it, down to one 16-deep mma step.
         while !k.is_multiple_of(c.tile[2]) && c.tile[2] > 16 {
             c.tile[2] /= 2;
         }
-        if k > 0 && k.is_multiple_of(c.tile[2]) && c.smem_bytes(gated) <= target.smem_bytes && !out.contains(&c) {
+        c.stages = target.stages(c.stages);
+        let fits = k > 0 && k.is_multiple_of(c.tile[2]) && tiles(target, &c);
+        if fits && c.smem_bytes(gated) <= target.smem_bytes && !out.contains(&c) {
             out.push(c);
         }
     }
@@ -97,18 +143,6 @@ const CONV_FAMILIES: [GemmCfg; 9] = [
 /// Blocks per SM a convolution's lead tile must reach: its grids are a few
 /// hundred blocks, where the GEMM's eight would leave only the smallest tile.
 const CONV_BLOCKS_PER_SM: usize = 2;
-
-/// Whether `cfg` lowers: the warp grid tiles the output with 16×8 atoms and
-/// both operand tiles split into whole 16-byte chunks per thread.
-pub fn conv_cfg_fits(cfg: &GemmCfg) -> bool {
-    let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
-    let threads = 32 * wr * wc;
-    bm.is_multiple_of(16 * wr)
-        && bn.is_multiple_of(8 * wc)
-        && bk.is_multiple_of(16)
-        && (bm * bk / 8).is_multiple_of(threads)
-        && (bn * bk / 8).is_multiple_of(threads)
-}
 
 /// Convolution configs for `batches` grid batches of `m` output pixels of
 /// `g` (`n = cout`, `k = kh·kw·cin`); on sm_86 the best of them beats the
@@ -141,9 +175,10 @@ pub fn conv_candidates(target: &Target, batches: usize, m: usize, g: &ConvGeom) 
         while !cin.is_multiple_of(c.tile[2]) && c.tile[2] > 16 {
             c.tile[2] /= 2;
         }
+        c.stages = target.stages(c.stages);
         (padding(&c) <= 1.0 / 8.0
             && cin.is_multiple_of(c.tile[2])
-            && conv_cfg_fits(&c)
+            && cfg_fits(target, &c)
             && c.smem_bytes(false) <= target.smem_bytes)
             .then_some(c)
     };
@@ -196,6 +231,9 @@ pub fn conv_candidates(target: &Target, batches: usize, m: usize, g: &ConvGeom) 
 /// A decoder step (`t ≤ 16`) is bandwidth-bound: one-warp blocks, which
 /// leave room for several per SM.
 pub fn attention_candidates(target: &Target, d: usize, t: usize) -> Vec<FaCfg> {
+    if let GpuArch::Amd(_) = target.arch {
+        return rdna_attention_candidates(target, d, t);
+    }
     let fa = FaCfg::new;
     let list = match (d, t <= 16) {
         (48 | 64 | 128, true) => vec![fa(16, 64, 2), fa(16, 64, 3), fa(16, 32, 2)],
@@ -207,6 +245,27 @@ pub fn attention_candidates(target: &Target, d: usize, t: usize) -> Vec<FaCfg> {
         _ => return vec![],
     };
     list.into_iter().filter(|c| c.smem_bytes(d) <= target.smem_bytes).collect()
+}
+
+/// RDNA attention on the two-slot register-staged ring. The score tile
+/// reaches the P·V product through shared memory (the WMMA accumulator is
+/// not the operand layout), so that `bq × bkv` f32 scratch counts against
+/// the 64 KB of LDS too; the K/V fill must split into whole 16-byte chunks
+/// per thread. Unmeasured: the tune store picks among them.
+fn rdna_attention_candidates(target: &Target, d: usize, t: usize) -> Vec<FaCfg> {
+    let fa = FaCfg::new;
+    let list = match (d, t <= 16) {
+        (48 | 64 | 128, true) => vec![fa(16, 32, 2), fa(16, 16, 2), fa(16, 64, 2)],
+        (48, false) => vec![fa(64, 32, 2), fa(64, 64, 2)],
+        (64, false) => vec![fa(64, 32, 2), fa(128, 32, 2), fa(64, 16, 2), fa(64, 64, 2)],
+        (128, false) => vec![fa(64, 16, 2), fa(128, 16, 2), fa(64, 32, 2), fa(128, 32, 2)],
+        _ => return vec![],
+    };
+    let fits = |c: &FaCfg| {
+        let threads = c.warps() as usize * target.wave as usize;
+        c.smem_bytes(d) + c.bq * c.bkv * 4 <= target.smem_bytes && (c.bkv * d / 8).is_multiple_of(threads)
+    };
+    list.into_iter().filter(fits).collect()
 }
 
 /// Key splits worth measuring for `tiles` independent query tiles over
