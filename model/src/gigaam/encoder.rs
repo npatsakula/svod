@@ -736,8 +736,10 @@ pub struct StreamCaches<'a> {
     /// The last `k-1` gated frames before every layer's depthwise conv:
     /// `[S, L, d, k-1]`.
     pub conv: &'a Tensor,
-    /// Every layer's keys and values of the frames emitted so far, newest
-    /// first: `[S, cap, L·H, d_k]`.
+    /// Every layer's keys and values of the frames emitted so far,
+    /// `[S, cap, L·H, d_k]`: a ring of chunk-sized slots the caller fills
+    /// in order from each step's new rows, so a lane's first
+    /// `min(emitted, cap)` keys are the real ones. The step only reads it.
     pub keys: &'a Tensor,
     pub values: &'a Tensor,
     /// The look-ahead variant's subsampled chunk awaiting its look-ahead:
@@ -760,17 +762,19 @@ pub struct StreamCursors<'a> {
     pub flush: &'a Tensor,
 }
 
-/// A streaming step's results: the emitted frames and every cache's next
-/// value, in [`StreamCaches`]' order.
+/// A streaming step's results: the emitted frames, the next value of every
+/// cache the step carries, and the rows for the caller's key and value rings.
 pub struct StreamStep {
     /// `[S, chunk, d]`: the chunk's frames (the pending chunk's, with
     /// look-ahead); how many are real the caller knows from its cursors.
     pub out: Tensor,
     pub subsampling: [Tensor; 2],
     pub conv: Tensor,
+    pub pending: Tensor,
+    /// Every layer's keys and values of the emitted frames, `[S, chunk, L·H, d_k]`,
+    /// for the slot `emitted / chunk` of a lane that emitted.
     pub keys: Tensor,
     pub values: Tensor,
-    pub pending: Tensor,
 }
 
 impl Encoder {
@@ -1048,20 +1052,16 @@ impl Encoder {
             values.push(v.narrow(1, 0, chunk)?);
             convs.push(conv.try_unsqueeze(1)?);
         }
-        // The emitted chunk's keys lead the caches, the oldest falling off.
-        let shift = |new: &[Tensor], old: &Tensor| -> Result<Tensor> {
-            let new: Vec<&Tensor> = new.iter().collect();
-            let latest = Tensor::cat(&new, 2)?;
-            let kept = old.narrow(1, 0, cap - chunk)?;
-            gate(&emits, Tensor::cat(&[&latest, &kept], 1)?, old)
-        };
-        let keys = shift(&keys, caches.keys)?;
-        let values = shift(&values, caches.values)?;
+        // The rings are the caller's to write: a graph update of a cache
+        // would copy the whole of it aside first, a device copy of the
+        // chunk's rows into the lane's slot does not.
+        let rows = |new: &[Tensor]| -> Result<Tensor> { Ok(Tensor::cat(&new.iter().collect::<Vec<_>>(), 2)?) };
+        let (keys, values) = (rows(&keys)?, rows(&values)?);
         let convs: Vec<&Tensor> = convs.iter().collect();
         let conv = gate(&emits, Tensor::cat(&convs, 1)?, caches.conv)?;
         let pending = gate(&fresh, x0, caches.pending)?;
         let out = x.narrow(1, 0, chunk)?.try_reshape([s as isize, chunk as isize, d as isize])?;
-        Ok(StreamStep { out, subsampling, conv, keys, values, pending })
+        Ok(StreamStep { out, subsampling, conv, pending, keys, values })
     }
 
     pub fn subsampling_output_length(&self, mel_frames: usize) -> usize {

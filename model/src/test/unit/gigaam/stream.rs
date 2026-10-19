@@ -107,16 +107,42 @@ impl Caches {
 }
 
 /// One step: the emitted frames `[lane][frame][d]` (all `chunk` of them) and
-/// the caches realized for the next step.
+/// the caches realized for the next step, the emitted rows written into the
+/// lanes' ring slots as the streamer's device copies do.
 fn step(encoder: &Encoder, mel: &Tensor, cursors: [&[i32]; 4], caches: Caches) -> (Vec<Vec<Vec<f32>>>, Caches) {
+    let look_ahead = encoder.streaming.expect("streaming").right_context_chunks > 0;
+    let emits: Vec<bool> = (0..cursors[0].len())
+        .map(|i| {
+            let (valid, pending, flush) = (cursors[0][i] > 0, cursors[2][i] > 0, cursors[3][i] != 0);
+            if look_ahead { pending && (valid || flush) } else { valid }
+        })
+        .collect();
+    let emitted_before: Vec<i32> = cursors[1].to_vec();
     let [valid, emitted, pending, flush] = cursors.map(ints);
     let cursors = StreamCursors { valid: &valid, emitted: &emitted, pending: &pending, flush: &flush };
     let out = encoder.forward_stream(mel, cursors, caches.borrow()).expect("step");
+    let write = |ring: &Tensor, rows: &Tensor| -> Tensor {
+        let (s, cap, heads, dk) = (
+            ring.dim_const(0).unwrap(),
+            ring.dim_const(1).unwrap(),
+            ring.dim_const(2).unwrap(),
+            ring.dim_const(3).unwrap(),
+        );
+        let chunk = rows.dim_const(1).unwrap();
+        let slots = cap / chunk;
+        let (emits, emitted_before) = (&emits, &emitted_before);
+        let at: Vec<bool> = (0..s)
+            .flat_map(|i| (0..slots).map(move |slot| emits[i] && slot == (emitted_before[i] as usize / chunk) % slots))
+            .collect();
+        let at = Tensor::from_slice(at).try_reshape([s as isize, slots as isize, 1, 1, 1]).unwrap();
+        let ring = ring.try_reshape([s, slots, chunk, heads, dk]).unwrap();
+        rows.try_unsqueeze(1).unwrap().where_(&at, &ring).unwrap().try_reshape([s, cap, heads, dk]).unwrap()
+    };
     let next = Caches {
         subsampling: out.subsampling,
         conv: out.conv,
-        keys: out.keys,
-        values: out.values,
+        keys: write(&caches.keys, &out.keys),
+        values: write(&caches.values, &out.values),
         pending: out.pending,
     };
     let mut all = vec![&out.out, &next.conv, &next.keys, &next.values, &next.pending];
@@ -377,15 +403,16 @@ fn streams_decode_like_the_whole_sequence(rnnt: bool, right_context_chunks: usiz
     let mut streamer = GigaAmStreamer::new(model, 2).expect("streamer");
     assert_eq!(streamer.free_lanes(), 2);
 
-    let a = streamer.open().unwrap();
+    let a = streamer.open().unwrap().unwrap();
     let mut b = None;
     let mut got = [Vec::new(), Vec::new()];
     let mut finals = [None, None];
     let (mut pos, push) = ([0usize; 2], [1234usize, 2000]);
     for round in 0..40 {
         if round == 3 {
-            b = streamer.open();
+            b = streamer.open().unwrap();
             assert_eq!(streamer.free_lanes(), 0);
+            assert_eq!(streamer.open().unwrap(), None, "no third lane");
         }
         for (i, id) in [Some(a), b].into_iter().enumerate() {
             let Some(id) = id else { continue };
@@ -417,6 +444,13 @@ fn streams_decode_like_the_whole_sequence(rnnt: bool, right_context_chunks: usiz
     assert!(frames.windows(2).all(|w| w[0] <= w[1]), "frames in order");
     assert!(streamer.transcript(a).is_err(), "a closed stream is gone");
     assert_eq!(streamer.latency_seconds(), 0.04 * (CHUNK * (1 + right_context_chunks)) as f32);
+
+    // A reopened lane starts clean: the second signal again, pushed whole.
+    let c = streamer.open().unwrap().unwrap();
+    streamer.push(c, &waves[1]).unwrap();
+    streamer.finish(c).unwrap();
+    let again: Vec<TokenEmission> = streamer.step().unwrap().into_iter().flat_map(|e| e.emissions).collect();
+    assert_eq!(again, want_b, "a reused lane");
 }
 
 /// On a GPU the chunk step runs the tile kernels at the model's head size:

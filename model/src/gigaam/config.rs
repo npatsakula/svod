@@ -84,9 +84,10 @@ pub struct StreamingConfig {
 }
 
 impl StreamingConfig {
-    /// The keys and values a lane keeps per layer.
+    /// The keys and values a lane keeps per layer: whole chunks, since the
+    /// cache is a ring of chunk-sized slots.
     pub fn cache_frames(&self, max_encoder_frames: usize) -> usize {
-        self.left_context_chunks.map_or(max_encoder_frames, |left| left * self.chunk_size)
+        self.left_context_chunks.unwrap_or(max_encoder_frames.div_ceil(self.chunk_size)) * self.chunk_size
     }
 
     /// Encoder frames a step runs its layers over: the chunk, plus the

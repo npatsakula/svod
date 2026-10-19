@@ -106,7 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         buffers.iter().take(6).map(|b| b / 1048576).collect::<Vec<_>>(),
     );
 
-    let ids: Vec<StreamId> = (0..args.streams).map(|_| streamer.open().expect("a free lane")).collect();
+    let ids: Vec<StreamId> =
+        (0..args.streams).map(|_| streamer.open().map(|id| id.expect("a free lane"))).collect::<Result<_, _>>()?;
     let push = args.push_ms * sample_rate as usize / 1000;
     let (mut t_step, mut steps, mut slowest) = (Duration::ZERO, 0usize, Duration::ZERO);
     let mut finals = vec![None; args.streams];
