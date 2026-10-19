@@ -35,9 +35,9 @@ lowering as `Lowering::costs` (orientation, exchange or round trip) and the op l
 |---|---|---|---|---|
 | CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, 2–3 stages | yes | Measured on an RTX 3060 |
 | CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix`; `wgmma` m64nNk16 over shared descriptors (GEMM) | `cp.async`, up to 227 KB shared | yes | Measured on an H100 PCIe: GEMM 4096³ bf16 433 TFLOP/s on the warpgroup core (234 on `mma.sync`; cuBLASLt 524) |
-| AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, 8 values per lane | register-staged, 1–2 stages | yes, unmeasured | Compiled to code objects; not run |
-| AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 1–2 stages | yes, unmeasured | Compiled to code objects; not run |
-| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages | yes, unmeasured | Compiled for gfx942; not run |
+| AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, 8 values per lane | register-staged, 1–2 stages | yes | Measured on an RX 9070 XT (gfx1201): GEMM 4096³ bf16 148 TFLOP/s (rocBLAS 80), attention d64 117 |
+| AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 1–2 stages | yes | Measured on a Strix Halo (gfx1151): GEMM 4096³ bf16 28 TFLOP/s (rocBLAS 32.5), attention d64 28; gfx1100–1102 compiled, not run |
+| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages | yes | Measured on an MI300X (gfx942): GEMM 4096³ bf16 511 TFLOP/s on a one-slot ring (hipBLASLt 615), attention d64 257, d128 292; gfx950 compiled, not run |
 | Apple | simdgroup 8×8×8 | none | no | Atoms only |
 
 `ops::supported(device)` is true where config tables exist; on any other device each op builds
