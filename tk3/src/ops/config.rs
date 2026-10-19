@@ -381,7 +381,7 @@ pub(crate) fn shortlist<C: Tiled>(ranked: &[C], compile: impl FnMut(&[C]) -> Vec
 /// in order; `None` when nothing does. A tile's [twins](Tiled::twins) are
 /// judged so: the shortlist set its spilling pipelines aside for a clean
 /// one, but among a tile's pipelines the time alone decides, and an
-/// unrolled ring that spills a little is often the fastest.
+/// unrolled ring that spills a little may be the fastest.
 pub(crate) fn compiled<C: Tiled>(list: &[C], mut compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<Vec<usize>> {
     let mut out = vec![];
     for (n, chunk) in list.chunks(SHORTLIST).enumerate() {

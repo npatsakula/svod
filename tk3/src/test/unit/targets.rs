@@ -466,19 +466,24 @@ fn register_staged_families_match_on_cuda() {
     check_on_device(&Target { cp_async: false, ldmatrix: false, ..target });
 }
 
-/// Every candidate the op layer may plan on AMD lowers (the tune store
-/// would otherwise time a failure): the GEMM lists of a large, a small-M and
-/// a ragged shape, the attention lists of every head size and both query
-/// regimes, and the convolution lists of every YOLO class.
-#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
-#[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
-#[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
-fn every_amd_candidate_lowers(target: Target) {
+/// Every candidate the op layer may plan lowers (the tune store would
+/// otherwise time a failure): the GEMM lists of a large, a small-M and a
+/// ragged shape (the large one as deep as the shortlist compiles, on one
+/// target of each fill path), the attention lists of every head size and
+/// both query regimes, and the convolution lists of every YOLO class.
+#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40), false; "gfx1151")]
+#[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
+#[test_case(crate::atoms::sm86(), true; "sm86")]
+#[test_case(hopper(), false; "hopper")]
+fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
     let planner = planner(target.clone());
     let mut gemms = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
         for gated in [false, true] {
-            for cfg in first_eight(&planner.gemm_ranked(1, m, n, k, gated)) {
+            let ranked = planner.gemm_ranked(1, m, n, k, gated);
+            let deep = if m == 4096 && shortlist_deep { config::SHORTLIST } else { 8 };
+            for cfg in config::distinct(&ranked).take(deep) {
                 let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
                 gemms.push(GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue, cfg });
             }
