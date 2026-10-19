@@ -2,7 +2,7 @@
 //! names one; the lowering picks atoms from the [`Target`] and the inference
 //! propagates their layouts to the values around them.
 
-use svod_dtype::{AmdArch, CudaArch, DType, GpuArch, ScalarDType};
+use svod_dtype::{AmdArch, CudaArch, DType, GpuArch, MetalFamily, ScalarDType};
 use svod_ir::{AxisId, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 use svod_schedule::optimizer::{Renderer, TensorCore};
 
@@ -345,65 +345,10 @@ impl Costs {
 
 impl Target {
     pub fn for_arch(arch: GpuArch) -> Self {
-        let wave = match arch {
-            GpuArch::Amd(a) => a.wave_size(),
-            GpuArch::Cuda(c) => c.wave_size(),
-            GpuArch::Metal(_) => 32,
-        };
-        let (cp_async, ldmatrix, smem_bytes) = match arch {
-            GpuArch::Cuda(c) => (c.major >= 8, (c.major, c.minor) >= (7, 5), c.max_shared_per_block_optin()),
-            // A workgroup's LDS: 160 KB on gfx950, 64 KB on the others.
-            GpuArch::Amd(a) => (false, false, if a == AmdArch::Gfx950 { 160 << 10 } else { 64 << 10 }),
-            GpuArch::Metal(_) => (false, false, 32 << 10),
-        };
-        let fill = if cp_async { Fill::CpAsync } else { Fill::Staged };
-        let sync = SyncCaps {
-            warp_barrier: matches!(arch, GpuArch::Cuda(_)),
-            commit_fence: matches!(arch, GpuArch::Amd(a) if a.is_rdna4()),
-            priority: matches!(arch, GpuArch::Amd(_)),
-        };
-        let lane_move = match arch {
-            GpuArch::Cuda(_) => LaneMove::Shuffle,
-            GpuArch::Metal(_) => LaneMove::SimdShuffle,
-            GpuArch::Amd(a) if a.is_cdna() => LaneMove::Permute,
-            GpuArch::Amd(_) => LaneMove::Dpp,
-        };
-        let hardware_exp2 = matches!(arch, GpuArch::Amd(_));
-        let tr_load = matches!(arch, GpuArch::Amd(a) if a.is_rdna4() && wave == 32);
-        let dot2_bf16 = matches!(arch, GpuArch::Amd(a) if !a.is_cdna() || a == AmdArch::Gfx950);
-        let occupancy = match arch {
-            // Four schedulers over 64K registers; 48 warps on sm_86, sm_89 and
-            // sm_120, 64 elsewhere.
-            GpuArch::Cuda(c) => {
-                let waves = if (c.major == 8 && c.minor >= 6) || c.major == 12 { 12 } else { 16 };
-                Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0 }
-            }
-            // CDNA: four SIMD16s over a unified file of 512 registers a lane, a
-            // wave holding up to 256 vector and 256 accumulator (AGPR) ones.
-            GpuArch::Amd(a) if a.is_cdna() => {
-                Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file: 256 }
-            }
-            // RDNA: two SIMD32s with 192 KB of registers each.
-            GpuArch::Amd(_) => Occupancy { simds: 2, file: 1536, waves: 16, registers: 256, acc_file: 0 },
-            GpuArch::Metal(_) => Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0 },
-        };
-        Self {
-            arch,
-            wave,
-            mma: mma_atoms(arch),
-            group_mma: group_mma_atoms(arch),
-            fill,
-            ldmatrix,
-            tr_load,
-            dot2_bf16,
-            smem_bytes,
-            sms: None,
-            xcds: 1,
-            crews: if matches!(arch, GpuArch::Amd(a) if a.is_cdna()) { 2 } else { 1 },
-            sync,
-            occupancy,
-            lane_move,
-            hardware_exp2,
+        match arch {
+            GpuArch::Cuda(c) => cuda(c),
+            GpuArch::Amd(a) => amd(a),
+            GpuArch::Metal(f) => metal(f),
         }
     }
 
@@ -495,13 +440,100 @@ impl Target {
     }
 }
 
-/// Hopper's `wgmma.mma_async` over bf16 and f16 into f32; nothing elsewhere.
-fn group_mma_atoms(arch: GpuArch) -> Vec<GroupMmaAtom> {
-    let GpuArch::Cuda(c) = arch else { return vec![] };
-    if c.major != 9 {
-        return vec![];
+/// A CUDA part: `cp.async` fills from sm_80, `ldmatrix` from sm_75, the
+/// `mma.sync` m16n8k16 core and Hopper's warpgroup one; four schedulers over
+/// 64K registers, 48 warps on sm_86, sm_89 and sm_120, 64 elsewhere.
+fn cuda(c: CudaArch) -> Target {
+    let renderer = Renderer::for_cuda_arch(c);
+    let waves = if (c.major == 8 && c.minor >= 6) || c.major == 12 { 12 } else { 16 };
+    let mma = mma_atoms(&renderer, (8, 16, 16), [frag::mma_sync_a(), frag::mma_sync_b(), frag::mma_sync_c()]);
+    Target {
+        arch: GpuArch::Cuda(c),
+        wave: c.wave_size(),
+        mma,
+        group_mma: if c.major == 9 { group_mma_atoms(renderer.device) } else { vec![] },
+        fill: if c.major >= 8 { Fill::CpAsync } else { Fill::Staged },
+        ldmatrix: (c.major, c.minor) >= (7, 5),
+        tr_load: false,
+        dot2_bf16: false,
+        smem_bytes: c.max_shared_per_block_optin(),
+        sms: None,
+        crews: 1,
+        xcds: 1,
+        occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0 },
+        sync: SyncCaps { warp_barrier: true, commit_fence: false, priority: false },
+        lane_move: LaneMove::Shuffle,
+        hardware_exp2: false,
     }
-    let device = Renderer::for_cuda_arch(c).device;
+}
+
+/// An AMD part: register-staged fills into 64 KB of LDS a workgroup (160 KB
+/// on gfx950), the 16×16×16 core, settable issue priority and the hardware
+/// `exp2`. CDNA: MFMA on wave64, four SIMD16s over a unified file of 512
+/// registers a lane (up to 256 vector and 256 accumulator ones a wave),
+/// lane moves through the LDS crossbar, two crews. RDNA: WMMA on wave32,
+/// two SIMD32s with 192 KB of registers each, DPP lane moves, the bf16 pair
+/// dot product; RDNA4 adds transposing loads and needs its commit fenced.
+fn amd(a: AmdArch) -> Target {
+    let cdna = a.is_cdna();
+    let (operand, accumulator) = if cdna {
+        (frag::mfma_16x16x16(), frag::mfma_16x16x16().transpose())
+    } else if a.is_rdna4() {
+        (frag::wmma_gfx12(), frag::wmma_gfx12().transpose())
+    } else {
+        (frag::wmma_gfx11_input(), frag::wmma_gfx11_acc())
+    };
+    let layouts = [operand.clone(), operand.transpose(), accumulator];
+    let occupancy = if cdna {
+        Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file: 256 }
+    } else {
+        Occupancy { simds: 2, file: 1536, waves: 16, registers: 256, acc_file: 0 }
+    };
+    Target {
+        arch: GpuArch::Amd(a),
+        wave: a.wave_size(),
+        mma: mma_atoms(&Renderer::for_amd_arch(a), (16, 16, 16), layouts),
+        group_mma: vec![],
+        fill: Fill::Staged,
+        ldmatrix: false,
+        tr_load: a.is_rdna4(),
+        dot2_bf16: !cdna || a == AmdArch::Gfx950,
+        smem_bytes: if a == AmdArch::Gfx950 { 160 << 10 } else { 64 << 10 },
+        sms: None,
+        crews: if cdna { 2 } else { 1 },
+        xcds: 1,
+        occupancy,
+        sync: SyncCaps { warp_barrier: false, commit_fence: a.is_rdna4(), priority: true },
+        lane_move: if cdna { LaneMove::Permute } else { LaneMove::Dpp },
+        hardware_exp2: true,
+    }
+}
+
+/// An Apple part: `simdgroup_matrix` 8×8×8 products, no kernels yet.
+fn metal(f: MetalFamily) -> Target {
+    let s = frag::simdgroup_8x8();
+    Target {
+        arch: GpuArch::Metal(f),
+        wave: 32,
+        mma: mma_atoms(&Renderer::for_metal_family(f), (8, 8, 8), [s.transpose(), s.clone(), s]),
+        group_mma: vec![],
+        fill: Fill::Staged,
+        ldmatrix: false,
+        tr_load: false,
+        dot2_bf16: false,
+        smem_bytes: 32 << 10,
+        sms: None,
+        crews: 1,
+        xcds: 1,
+        occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0 },
+        sync: SyncCaps { warp_barrier: false, commit_fence: false, priority: false },
+        lane_move: LaneMove::SimdShuffle,
+        hardware_exp2: false,
+    }
+}
+
+/// Hopper's `wgmma.mma_async` over bf16 and f16 into f32.
+fn group_mma_atoms(device: RendererDevice) -> Vec<GroupMmaAtom> {
     [ScalarDType::BFloat16, ScalarDType::Float16]
         .map(|dtype_in| GroupMmaAtom {
             n_max: 256,
@@ -537,24 +569,10 @@ fn metadata(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
     }
 }
 
-fn mma_atoms(arch: GpuArch) -> Vec<MmaAtom> {
-    let renderer = match arch {
-        GpuArch::Amd(a) => Renderer::for_amd_arch(a),
-        GpuArch::Cuda(c) => Renderer::for_cuda_arch(c),
-        GpuArch::Metal(f) => Renderer::for_metal_family(f),
-    };
-    // (N, M, K) of the scheduler table, and the operand layouts of that shape.
-    let (dims, a, b, c): (_, Layout, Layout, Layout) = match arch {
-        GpuArch::Cuda(_) => ((8, 16, 16), frag::mma_sync_a(), frag::mma_sync_b(), frag::mma_sync_c()),
-        GpuArch::Amd(amd) => {
-            let a = amd_operand(amd);
-            ((16, 16, 16), a.clone(), a.transpose(), amd_accumulator(amd))
-        }
-        GpuArch::Metal(_) => {
-            let s = frag::simdgroup_8x8();
-            ((8, 8, 8), s.transpose(), s.clone(), s)
-        }
-    };
+/// The renderer's 16-bit-in, f32-out tensor cores of shape `dims` (the
+/// scheduler table's `(N, M, K)`), each with the operand layouts `[a, b, c]`
+/// of that shape.
+fn mma_atoms(renderer: &Renderer, dims: (usize, usize, usize), [a, b, c]: [Layout; 3]) -> Vec<MmaAtom> {
     renderer
         .tensor_cores
         .iter()
@@ -575,26 +593,6 @@ fn mma_atoms(arch: GpuArch) -> Vec<MmaAtom> {
 
 fn is_half(dtype: &DType) -> bool {
     matches!(dtype.scalar(), Some(ScalarDType::BFloat16 | ScalarDType::Float16))
-}
-
-fn amd_operand(arch: AmdArch) -> Layout {
-    if arch.is_cdna() {
-        frag::mfma_16x16x16()
-    } else if arch.is_rdna4() {
-        frag::wmma_gfx12()
-    } else {
-        frag::wmma_gfx11_input()
-    }
-}
-
-fn amd_accumulator(arch: AmdArch) -> Layout {
-    if arch.is_cdna() {
-        frag::mfma_16x16x16().transpose()
-    } else if arch.is_rdna4() {
-        frag::wmma_gfx12().transpose()
-    } else {
-        frag::wmma_gfx11_acc()
-    }
 }
 
 /// A device as the planner and the lowering see it: its declared facts and
