@@ -9,7 +9,7 @@ use std::sync::Arc;
 use smallvec::smallvec;
 use svod_codegen::llvm::nvptx::smem::{cp_async_commit, cp_async_wait};
 use svod_codegen::llvm::nvptx::wgmma;
-use svod_dtype::{AddrSpace, DType, DeviceSpec, GpuArch, ScalarDType};
+use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
 use svod_ir::uop::cached_property::CachedProperty;
 use svod_ir::uop::properties::SoundVminVmaxProperty;
 use svod_ir::{AxisId, AxisType, KernelInfo, Op, UOp};
@@ -657,28 +657,23 @@ impl<'a> Emit<'a> {
     }
 
     fn sync(&mut self, sync: Sync) -> Result<()> {
-        let cuda = matches!(self.low.device.target.arch, GpuArch::Cuda(_));
+        let target = &self.low.device.target;
         let u = match sync {
             Sync::Barrier { scope: Scope::Block } => {
                 let tag = self.next_tag();
                 self.last.clone().barrier(smallvec![]).rtag(Some(smallvec![tag as usize]))
             }
-            // A warp's own barrier: CUDA's lanes schedule independently and
-            // its shared accesses need `bar.warp.sync`; an AMD wave issues
-            // its LDS accesses in order and waits on their counters.
-            Sync::Barrier { scope: Scope::Warp } if cuda => nvptx::warp_barrier(&self.last),
+            Sync::Barrier { scope: Scope::Warp } if target.sync.warp_barrier => nvptx::warp_barrier(&self.last),
             Sync::Barrier { scope: Scope::Warp } => return Ok(()),
-            Sync::CommitAsync if self.low.device.target.fill == Fill::CpAsync => cp_async_commit(smallvec![]),
-            Sync::WaitAsync { pending } if self.low.device.target.fill == Fill::CpAsync => {
-                cp_async_wait(pending, smallvec![])
-            }
+            Sync::CommitAsync if target.fill == Fill::CpAsync => cp_async_commit(smallvec![]),
+            Sync::WaitAsync { pending } if target.fill == Fill::CpAsync => cp_async_wait(pending, smallvec![]),
             // Without `cp.async` the copies were synchronous: nothing to wait for.
             Sync::CommitAsync | Sync::WaitAsync { .. } => return Ok(()),
-            Sync::Fence if self.low.device.target.commit_fence => amdgpu::sched_barrier(&self.last),
+            Sync::Fence if target.sync.commit_fence => amdgpu::sched_barrier(&self.last),
             Sync::Fence => return Ok(()),
-            Sync::WaitProducts { pending } if cuda && self.low.group => wgmma::wait(pending),
+            Sync::WaitProducts { pending } if self.low.group => wgmma::wait(pending),
             Sync::WaitProducts { .. } => return Ok(()),
-            Sync::Prio { level } if matches!(self.low.device.target.arch, GpuArch::Amd(_)) => amdgpu::setprio(level),
+            Sync::Prio { level } if target.sync.priority => amdgpu::setprio(level),
             Sync::Prio { .. } => return Ok(()),
         };
         self.push(u);

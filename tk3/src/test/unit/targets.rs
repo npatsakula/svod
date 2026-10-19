@@ -1015,7 +1015,7 @@ fn fences(block: &crate::ir::Block) -> usize {
 #[test_case(AmdArch::Gfx1100, false; "gfx1100 keeps order")]
 fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
     let target = amd(arch, 64);
-    assert_eq!(target.commit_fence, emitted);
+    assert_eq!(target.sync.commit_fence, emitted);
     let device = declared(target);
     for (stages, want) in [(2, 1), (1, 0)] {
         let cfg = config::gemm_cfg([64, 64, 32], stages, [2, 2], stages == 2);

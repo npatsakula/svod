@@ -167,10 +167,8 @@ pub struct Target {
     /// a die ([`crate::lower::emit::die_order`]). 1 where a device is one die.
     pub xcds: u32,
     pub occupancy: Occupancy,
-    /// The machine scheduler hoists a pipeline trip's shared-memory commit above
-    /// its products unless fenced (`Sync::Fence` → `sched_barrier`), leaving
-    /// the block waiting on global memory with no product in flight: RDNA4.
-    pub commit_fence: bool,
+    /// What the semantic syncs a template places become.
+    pub sync: SyncCaps,
     /// How a lane reads the register of lane `lane ^ mask`.
     pub lane_move: LaneMove,
     /// An f32 `exp2` is the hardware instruction alone, without the range
@@ -201,6 +199,23 @@ impl Fill {
             Fill::Staged => stages.clamp(1, 2),
         }
     }
+}
+
+/// The semantic syncs ([`crate::ir::Sync`]) that are an instruction on a
+/// target; each is nothing elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncCaps {
+    /// A warp's own barrier is `bar.warp.sync`: CUDA's lanes schedule
+    /// independently, where an AMD wave issues its LDS accesses in order and
+    /// waits on their counters.
+    pub warp_barrier: bool,
+    /// The machine scheduler hoists a pipeline trip's shared-memory commit
+    /// above its products unless fenced (`Sync::Fence` → `sched_barrier`),
+    /// leaving the block waiting on global memory with no product in
+    /// flight: RDNA4.
+    pub commit_fence: bool,
+    /// A wave's issue priority is settable (`Sync::Prio` → `s_setprio`): AMD.
+    pub priority: bool,
 }
 
 /// How a lane reads the register of lane `lane ^ mask`.
@@ -327,7 +342,11 @@ impl Target {
             GpuArch::Metal(_) => (false, false, 32 << 10),
         };
         let fill = if cp_async { Fill::CpAsync } else { Fill::Staged };
-        let commit_fence = matches!(arch, GpuArch::Amd(a) if a.is_rdna4());
+        let sync = SyncCaps {
+            warp_barrier: matches!(arch, GpuArch::Cuda(_)),
+            commit_fence: matches!(arch, GpuArch::Amd(a) if a.is_rdna4()),
+            priority: matches!(arch, GpuArch::Amd(_)),
+        };
         let lane_move = match arch {
             GpuArch::Cuda(_) => LaneMove::Shuffle,
             GpuArch::Metal(_) => LaneMove::SimdShuffle,
@@ -366,7 +385,7 @@ impl Target {
             sms: None,
             xcds: 1,
             crews: if matches!(arch, GpuArch::Amd(a) if a.is_cdna()) { 2 } else { 1 },
-            commit_fence,
+            sync,
             occupancy,
             lane_move,
             hardware_exp2,
