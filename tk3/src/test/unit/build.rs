@@ -1,12 +1,14 @@
 use crate::ir::*;
 
 /// A block-level GEMM mainloop records as one pipeline whose consumer carries
-/// the accumulator, with every view addressed by scalar expressions.
+/// the accumulator, with every view addressed by scalar expressions and the
+/// bound batch on grid z.
 #[test]
 fn gemm_records_as_a_pipeline_with_a_carried_accumulator() {
     let (m, n, kk) = (256usize, 256usize, 1024usize);
     let (bm, bn, bk, stages) = (128usize, 128usize, 32usize, 3usize);
-    let prog = super::programs::gemm_nt(m, n, kk, bm, bn, bk, stages);
+    let batch = crate::kernels::Batch::Var { name: "b".into(), min: 1, max: 8 };
+    let prog = super::gemm_nt_batched(m, n, kk, [bm, bn, bk], stages, batch);
 
     let kinds: Vec<_> = prog.walk().map(|(d, s)| (d, std::mem::discriminant(s))).collect();
     assert_eq!(kinds.iter().filter(|(d, _)| *d == 0).count(), 4, "zeros, pipeline, cast, store at the top level");
