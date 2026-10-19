@@ -390,6 +390,10 @@ impl Graph for CudaGraph {
         Ok(())
     }
 
+    fn order_after(&self, accesses: &[(&crate::Buffer, bool)]) -> Result<()> {
+        self.stream.order_after(accesses)
+    }
+
     fn completion_token(&self) -> Option<Arc<dyn CompletionToken>> {
         Some(Arc::new(self.state.lock().last.clone()?))
     }

@@ -105,6 +105,10 @@ impl PlanContext for CudaPlanCtx {
         Ok(Some(Arc::new(CudaDispatchTimestamps { dev: Arc::clone(dev), start, end, counters })))
     }
 
+    fn order_after(&self, accesses: &[(&crate::Buffer, bool)]) -> Result<()> {
+        self.stream.order_after(accesses)
+    }
+
     fn completion_token(&self) -> Option<Arc<dyn CompletionToken>> {
         Some(Arc::new(self.stream.token().ok()?))
     }

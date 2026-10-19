@@ -152,6 +152,12 @@ pub trait Graph: Send + Sync {
         None
     }
 
+    /// Order the next replay after other contexts' in-flight work it
+    /// conflicts with; see [`PlanContext::order_after`].
+    fn order_after(&self, _accesses: &[(&crate::Buffer, bool)]) -> Result<()> {
+        Ok(())
+    }
+
     /// Replay a profiling-specific linked variant and return ready per-dispatch
     /// timestamps in capture order. Backends without graph timestamps return
     /// `None`, allowing the runtime to retain its per-call fallback.
@@ -194,6 +200,15 @@ pub trait PlanContext: Send + Sync {
         local_size: Option<[usize; 3]>,
         profile: bool,
     ) -> Result<Option<Arc<dyn crate::DispatchTimestamps>>>;
+
+    /// Order this context's next submissions after other contexts' in-flight
+    /// work they conflict with, given every storage the plan touches as
+    /// `(buffer, writes)`: the writers of what it reads, and every access to
+    /// what it writes. Backends whose contexts share one in-order queue need
+    /// nothing (the default).
+    fn order_after(&self, _accesses: &[(&crate::Buffer, bool)]) -> Result<()> {
+        Ok(())
+    }
 
     /// Completion token covering every submission this context has made so
     /// far. Backends without scoped sync return `None`.

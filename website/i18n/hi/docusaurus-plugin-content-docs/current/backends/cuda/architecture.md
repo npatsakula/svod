@@ -147,9 +147,10 @@ Lanes आपस में एक-दूसरे के विरुद्ध or
 (`device/src/cuda/device.rs` के module docs):
 
 - **producers** — storage base -> प्रति lane वह नवीनतम completion token जिसने उसे पढ़ा या
-  लिखा (एक host overwrite in-flight readers के विरुद्ध भी एक WAR hazard है)। Execution plan हर
-  execute के बाद अपना या अपने graph का token उन सभी storages पर publish करता है जिन्हें वह
-  छूता है; allocator हर transfer या memset के बाद एक copy-lane token publish करता है।
+  लिखा, और क्या उसने लिखा (एक host overwrite in-flight readers के विरुद्ध भी एक WAR hazard
+  है)। Execution plan हर execute के बाद अपना या अपने graph का token उन सभी storages पर publish
+  करता है जिन्हें वह छूता है, और जहाँ वह लिखता है वहाँ उसे write के रूप में चिह्नित करता है;
+  allocator हर transfer या memset के बाद एक copy-lane token publish करता है।
   `wait_storage(base)` नीचे बताई गई lanes को drain करता है, फिर उन tokens की प्रतीक्षा
   करता है, फिर उन्हें table से हटा देता है। जिस storage को table नहीं जानता — इसमें वह भी
   शामिल है जिसका नवीनतम token किसी दूसरे backend का हो — वह `cuCtxSynchronize` पर वापस
@@ -162,8 +163,15 @@ Lanes आपस में एक-दूसरे के विरुद्ध or
 - **copy tail** — नवीनतम copy-lane event; हर launch चलने से पहले उसकी प्रतीक्षा GPU पर
   करता है, ताकि asynchronous copies हर बाद के kernel से पहले आएँ।
 
-`SVOD_CUDA_SCOPED_SYNC=0` इस सबको disable कर देता है: तब हर wait context को drain करती है
-और हर copy copy stream को synchronize करती है।
+हर execute से पहले plan अपनी lane (या अपने graph की lane) को दूसरी lanes के टकराने वाले
+tokens के बाद `cuStreamWaitEvent` से order करता है (`CudaDevice::order_lane_after`): हर उस
+storage के writers के बाद जिसे वह पढ़ता है, और हर उस storage के सभी tokens के बाद जिसे वह
+लिखता है। जो plans किसी storage को सिर्फ़ पढ़ते हैं (जैसे shared weights), वे concurrent
+रहते हैं। Tokens अपनी lanes से अधिक जीते हैं, इसलिए एक one-shot `realize` जिसका plan drop हो
+चुका है, फिर भी अगले को order करता है।
+
+`SVOD_CUDA_SCOPED_SYNC=0` इस सबको disable कर देता है: तब हर wait context को drain करती है,
+हर copy copy stream को synchronize करती है, और हर plan execute पहले context को drain करता है।
 
 Executor की cross-plan ordering हर backend पर, CUDA सहित, एक host signal
 (`CpuTimelineSignal`) है; इसका अपना कोई `TimelineSignal` implementation नहीं है। Host
