@@ -59,6 +59,17 @@ pub struct Occupancy {
     pub waves: u32,
     /// Registers one lane may hold; past it a kernel spills.
     pub registers: u32,
+    /// Accumulator registers a lane holds beside `registers` where the
+    /// matrix core has a file of its own (CDNA's AGPRs); 0 where accumulators
+    /// take vector registers.
+    pub acc_file: u32,
+}
+
+impl Occupancy {
+    /// Whether a lane holds `acc` accumulators and `rest` other registers at once.
+    pub fn holds(&self, acc: u32, rest: u32) -> bool {
+        if self.acc_file > 0 { acc <= self.acc_file && rest <= self.registers } else { acc + rest <= self.registers }
+    }
 }
 
 /// What a target offers the lowering.
@@ -236,13 +247,16 @@ impl Target {
             // sm_120, 64 elsewhere.
             GpuArch::Cuda(c) => {
                 let waves = if (c.major == 8 && c.minor >= 6) || c.major == 12 { 12 } else { 16 };
-                Occupancy { simds: 4, file: 512, waves, registers: 255 }
+                Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0 }
             }
-            // CDNA: four SIMD16s, 512 architectural registers (and as many accumulators) per lane.
-            GpuArch::Amd(a) if a.is_cdna() => Occupancy { simds: 4, file: 512, waves: 8, registers: 512 },
+            // CDNA: four SIMD16s over a unified file of 512 registers a lane, a
+            // wave holding up to 256 vector and 256 accumulator (AGPR) ones.
+            GpuArch::Amd(a) if a.is_cdna() => {
+                Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file: 256 }
+            }
             // RDNA: two SIMD32s with 192 KB of registers each.
-            GpuArch::Amd(_) => Occupancy { simds: 2, file: 1536, waves: 16, registers: 256 },
-            GpuArch::Metal(_) => Occupancy { simds: 4, file: 1024, waves: 8, registers: 128 },
+            GpuArch::Amd(_) => Occupancy { simds: 2, file: 1536, waves: 16, registers: 256, acc_file: 0 },
+            GpuArch::Metal(_) => Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0 },
         };
         Self {
             arch,

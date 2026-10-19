@@ -886,12 +886,14 @@ impl Program for AmdProgram {
         Ok(Some(Box::new(owner)))
     }
 
-    /// Decode VGPR/SGPR/LDS/scratch + VGPR-limited occupancy from the kernel
-    /// descriptor. Uses the original (un-patched) `compute_pgm_rsrc1` and the
-    /// descriptor's exact segment sizes — pure static, no GPU access.
+    /// Decode VGPR/AGPR/SGPR/LDS/scratch + VGPR-limited occupancy from the
+    /// kernel descriptor. Uses the original (un-patched) `compute_pgm_rsrc1`,
+    /// `compute_pgm_rsrc3` and the descriptor's exact segment sizes — pure
+    /// static, no GPU access.
     fn resource_usage(&self) -> Option<crate::profile::KernelResources> {
         Some(crate::amd::occupancy::decode_resources(
             self.kd.compute_pgm_rsrc1,
+            self.kd.compute_pgm_rsrc3,
             self.kd.group_segment_fixed_size,
             self.kd.private_segment_fixed_size,
             if self.wave32 { 32 } else { 64 },
