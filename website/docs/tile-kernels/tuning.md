@@ -42,7 +42,9 @@ mean time fell from 76.5 to about 60 µs on the RTX 3060.
 
 The op measures where it is called, while the graph is built, never inside a running plan. Each
 candidate is built as a program, launched on scratch buffers at capacity with every runtime
-variable bound to its maximum, and timed:
+variable bound to its maximum (a float operand holds values drawn in `[-1, 1)` and an integer one
+zeros: zeros toggle no bit, and a card that clocks down under real data, as the RX 9070 XT does by
+15 % on the 4096³ GEMM, is timed as it will run), and timed:
 
 | Step | Setting |
 |---|---|
@@ -74,7 +76,7 @@ Two guards keep a time honest:
 | What | Value |
 |---|---|
 | Directory | `$SVOD_TK3_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk3_tune`, else `~/.cache/svod/tk3_tune` |
-| File | One per device and crate version, e.g. `sm_86_28sm-v0.2.0.txt`, headed by its line format (`format 1`, `tune::FORMAT`); a file of another format is dropped whole |
+| File | One per device and crate version, e.g. `sm_86_28sm-v0.2.0.txt`, headed by its line format (`format 2`, `tune::FORMAT`); a file of another format is dropped whole |
 | Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: a `choice` holds the winner's `index ns`, a `value` a measured number, an `admitted` the ranked indices admission kept, a `first` the first clean config's index |
 | Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, where `device` is arch and SM count (`sm_86-28sm`) and `compiler` digests the device's compiler (`tune::compiler`) |
 
