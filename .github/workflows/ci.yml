@@ -127,14 +127,16 @@ jobs:
           wait_for_crate svod-tensor "$VERSION"
           wait_for_crate svod-arch "$VERSION"
 
-          # L7: svod-tk + svod-onnx (no inter-dep); svod-tk must precede svod-model
+          # L7: svod-tk, svod-tk3, svod-onnx (no inter-dep); svod-tk3 must precede svod-model
           publish_crate svod-tk &
+          publish_crate svod-tk3 &
           publish_crate svod-onnx &
           wait
           wait_for_crate svod-tk "$VERSION"
+          wait_for_crate svod-tk3 "$VERSION"
           wait_for_crate svod-onnx "$VERSION"
 
-          # L8: svod-model (depends on svod-tk)
+          # L8: svod-model (depends on svod-tk3)
           publish_crate svod-model
           wait_for_crate svod-model "$VERSION"
           echo "All crates published successfully!"
@@ -160,7 +162,7 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
-          CRATES="svod-dtype svod-macros svod-arch svod-ir svod-device svod-schedule svod-codegen svod-runtime svod-tensor svod-tk svod-onnx svod-model"
+          CRATES="svod-dtype svod-macros svod-arch svod-ir svod-device svod-schedule svod-codegen svod-runtime svod-tensor svod-tk svod-tk3 svod-onnx svod-model"
           {
             echo "links<<EOF"
             echo "## Crates"
