@@ -810,7 +810,6 @@ impl<'a> Emit<'a> {
                 Ok(())
             }
             Stmt::Sync(sync) => self.sync(*sync),
-            Stmt::Raw(_) => UnsupportedSnafu { what: "raw statements" }.fail(),
         }
     }
 

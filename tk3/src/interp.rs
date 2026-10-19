@@ -16,8 +16,6 @@ pub enum Error {
     UnboundVar { name: String },
     #[snafu(display("parameter {name} has {got} elements, the program declares {want}"))]
     ParamSize { name: String, got: usize, want: usize },
-    #[snafu(display("raw statements cannot be interpreted: {code}"))]
-    Raw { code: String },
     #[snafu(display("scalar {a} {op:?} {b} is undefined"))]
     Division { op: BinOp, a: i64, b: i64 },
     #[snafu(display("element {index} of {name} is accessed, which holds {len}"))]
@@ -206,7 +204,6 @@ impl Frame<'_> {
                 self.block_run(branch)?;
             }
             Stmt::Sync(_) => {}
-            Stmt::Raw(raw) => return RawSnafu { code: raw.code.clone() }.fail(),
         }
         Ok(())
     }

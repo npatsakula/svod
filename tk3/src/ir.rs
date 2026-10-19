@@ -331,16 +331,6 @@ pub struct Pipeline {
     pub consume: Stage,
 }
 
-/// Vendor text with declared operands, results and effects.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Raw {
-    pub code: String,
-    pub operands: Vec<ValId>,
-    pub results: Vec<ValId>,
-    pub reads: Vec<ValId>,
-    pub writes: Vec<ValId>,
-}
-
 /// Whose threads a barrier gathers and a copy's chunks are spread over: the
 /// block's, or (inside [`Stmt::Warps`]) one warp's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -407,7 +397,6 @@ pub enum Stmt {
         otherwise: Block,
     },
     Sync(Sync),
-    Raw(Raw),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -530,7 +519,7 @@ impl Block {
                     then.walk(depth + 1, out);
                     otherwise.walk(depth + 1, out);
                 }
-                Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+                Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => {}
             }
         }
     }

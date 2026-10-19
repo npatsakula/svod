@@ -220,7 +220,7 @@ fn materialize_block(prog: &mut Program, block: Block, scope: Scope, group: bool
                 *then = materialize_block(prog, std::mem::take(then), scope, group);
                 *otherwise = materialize_block(prog, std::mem::take(otherwise), scope, group);
             }
-            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => {}
         }
         out.push(stmt);
     }

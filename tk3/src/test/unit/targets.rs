@@ -919,7 +919,7 @@ fn tile_ops_in_order(block: &crate::ir::Block) -> Vec<crate::ir::TileOp> {
     for s in &block.0 {
         match s {
             Stmt::Let { op, .. } => out.push(op.clone()),
-            Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+            Stmt::Copy { .. } | Stmt::Sync(_) => {}
             Stmt::Loop(l) => out.extend(tile_ops_in_order(&l.body)),
             Stmt::Pipeline(p) => {
                 out.extend(tile_ops_in_order(&p.produce.body));
@@ -943,7 +943,7 @@ fn tile_ops(block: &crate::ir::Block, f: &dyn Fn(&crate::ir::TileOp) -> bool) ->
         .iter()
         .map(|s| match s {
             Stmt::Let { op, .. } => usize::from(f(op)),
-            Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
+            Stmt::Copy { .. } | Stmt::Sync(_) => 0,
             Stmt::Loop(l) => tile_ops(&l.body, f),
             Stmt::Pipeline(p) => tile_ops(&p.produce.body, f) + tile_ops(&p.consume.body, f),
             Stmt::Warps { body } => tile_ops(body, f),
@@ -998,7 +998,7 @@ fn fences(block: &crate::ir::Block) -> usize {
         .iter()
         .map(|s| match s {
             Stmt::Sync(Sync::Fence) => 1,
-            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
+            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => 0,
             Stmt::Loop(l) => fences(&l.body),
             Stmt::Pipeline(p) => fences(&p.produce.body) + fences(&p.consume.body),
             Stmt::Warps { body } => fences(body),
@@ -1040,7 +1040,7 @@ fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
                 let shape = prog.value(*src).shape;
                 usize::from(shape.rows > 1 && shape.cols > 1)
             }
-            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
+            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => 0,
             Stmt::Loop(l) => tile_relayouts(prog, &l.body),
             Stmt::Pipeline(p) => tile_relayouts(prog, &p.produce.body) + tile_relayouts(prog, &p.consume.body),
             Stmt::Warps { body } => tile_relayouts(prog, body),

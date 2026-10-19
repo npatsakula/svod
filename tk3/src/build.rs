@@ -630,10 +630,6 @@ impl Kernel {
         merged.expect("both branches ran").map(Tile::new)
     }
 
-    pub fn raw(&mut self, raw: Raw) {
-        self.push(Stmt::Raw(raw));
-    }
-
     /// A barrier across the block's warps.
     pub fn barrier(&mut self) {
         self.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));

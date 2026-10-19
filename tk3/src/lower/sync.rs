@@ -103,7 +103,7 @@ fn written(prog: &Program, block: &Block, into: &mut HashSet<SmemId>) {
             }
             Stmt::Warps { body } => written(prog, body, into),
             Stmt::Pipeline(p) => written(prog, &p.produce.body, into),
-            Stmt::Let { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+            Stmt::Let { .. } | Stmt::Sync(_) => {}
         }
     }
 }
@@ -123,7 +123,7 @@ fn read(prog: &Program, block: &Block, into: &mut HashSet<SmemId>) {
                 read(prog, &p.produce.body, into);
                 read(prog, &p.consume.body, into);
             }
-            Stmt::Let { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+            Stmt::Let { .. } | Stmt::Sync(_) => {}
         }
     }
 }

@@ -692,7 +692,7 @@ fn set_orient(block: &mut Block, choice: &HashMap<ValId, Orient>) {
             Stmt::Let { dst, op: TileOp::Mma { orient: orient @ None, .. } } => {
                 *orient = Some(choice.get(dst).copied().unwrap_or(Orient::Direct));
             }
-            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) => {}
             Stmt::Loop(l) => set_orient(&mut l.body, choice),
             Stmt::Pipeline(p) => {
                 set_orient(&mut p.produce.body, choice);
@@ -836,7 +836,7 @@ impl<'a> Infer<'a> {
                         }
                     }
                 }
-                Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+                Stmt::Copy { .. } | Stmt::Sync(_) => {}
             }
         }
         Ok(())
@@ -1018,7 +1018,7 @@ impl Rewrite<'_> {
                     *then = self.insert(std::mem::take(then));
                     *otherwise = self.insert(std::mem::take(otherwise));
                 }
-                Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+                Stmt::Copy { .. } | Stmt::Sync(_) => {}
             }
             out.push(stmt);
         }
