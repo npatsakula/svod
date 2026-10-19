@@ -47,10 +47,6 @@ pub fn access(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize) -> Arc<UOp> {
     UOp::new(Op::Shrink(ops::Shrink { src, offsets, sizes: c32(w as i64) }), buf.dtype())
 }
 
-pub fn index(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize) -> Arc<UOp> {
-    access(buf, off, w)
-}
-
 /// A load through an access node, `tag`ged so two loads of one address
 /// around a store stay two loads.
 pub fn load_at(access: &Arc<UOp>, tag: u64) -> Arc<UOp> {
@@ -73,19 +69,6 @@ pub fn store_at(access: &Arc<UOp>, vals: Vec<Arc<UOp>>) -> Arc<UOp> {
     let value =
         if w == 1 { vals.into_iter().next().expect("one value") } else { UOp::stack(vals.into_iter().collect()) };
     access.store(value)
-}
-
-/// A `w`-wide load at `off`.
-pub fn load(buf: &Arc<UOp>, off: &Arc<UOp>, w: usize, tag: u64) -> Arc<UOp> {
-    load_at(&access(buf, off, w), tag)
-}
-
-/// A `vals.len()`-wide store at `off`.
-pub fn store(buf: &Arc<UOp>, off: &Arc<UOp>, vals: Vec<Arc<UOp>>) -> Arc<UOp> {
-    let w = vals.len();
-    let value =
-        if w == 1 { vals.into_iter().next().expect("one value") } else { UOp::stack(vals.into_iter().collect()) };
-    access(buf, off, w).store(value)
 }
 
 /// Element `j` of a `w`-wide vector value (an `i32` constant-position INDEX).
