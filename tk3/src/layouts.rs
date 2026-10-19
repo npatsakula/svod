@@ -641,6 +641,10 @@ pub fn infer(mut prog: Program, device: &Device, grid: WarpGrid, core: Core) -> 
     Ok(Laid { prog, layouts })
 }
 
+/// Search bound: the propagation passes a register value may take to reach
+/// the fixed point before the inference gives up.
+const PASSES_PER_VALUE: usize = 4;
+
 /// Search bound: up to this many free products every orientation is tried; past it each is
 /// flipped on its own and a flip that lowers the cost is kept.
 const EXHAUSTIVE_UP_TO: usize = 6;
@@ -765,7 +769,7 @@ impl<'a> Infer<'a> {
 
     /// Run the propagation to its fixed point, seeding what nothing constrains.
     fn solve(&mut self) -> Result<()> {
-        self.solve_within(4 * self.lay.len() + 4)
+        self.solve_within(PASSES_PER_VALUE * (self.lay.len() + 1))
     }
 
     /// [`Self::solve`] within `passes` passes after the first.

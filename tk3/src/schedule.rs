@@ -33,6 +33,10 @@ impl Schedule {
     }
 }
 
+/// The highest issue priority a wave takes (`s_setprio 3`), a crew's over
+/// its products.
+const RAISED: u8 = 3;
+
 /// Replace every [`Stmt::Pipeline`] of `prog` by loops, branches and explicit
 /// synchronization according to `schedule`.
 pub fn expand(prog: &mut Program, schedule: Schedule) {
@@ -325,7 +329,7 @@ impl Expander<'_> {
         for (k, product) in products.into_iter().enumerate() {
             body.append(&mut loads[k]);
             body.push(barrier.clone());
-            body.extend([prio(3), product, prio(0)]);
+            body.extend([prio(RAISED), product, prio(0)]);
             if k == s - 1 {
                 body.extend(trailing.iter().cloned());
             }

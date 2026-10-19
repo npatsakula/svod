@@ -60,6 +60,8 @@ const RUNS: usize = 5;
 /// profiled runs, keeping the lifted clock up where their host overhead would let a short
 /// kernel's clock sag.
 const SUSTAIN: Duration = Duration::from_millis(5);
+/// Measurement: the most launches a [`SUSTAIN`] queues, however short the kernel.
+const SUSTAIN_LAUNCHES: u128 = 1024;
 
 fn digest(value: &impl Hash) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
@@ -734,7 +736,7 @@ pub(crate) fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPoo
 /// host time would queue a thousand runs of a short kernel and every timed
 /// run after it would wait for the queue to drain.
 fn sustain(plan: &ExecutionPlan, budget: Duration, per_run: Duration) {
-    let launches = budget.as_nanos().div_ceil(per_run.as_nanos().max(1)).clamp(1, 1024);
+    let launches = budget.as_nanos().div_ceil(per_run.as_nanos().max(1)).clamp(1, SUSTAIN_LAUNCHES);
     for _ in 0..launches {
         if plan.execute().is_err() {
             break;

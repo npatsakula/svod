@@ -27,7 +27,7 @@ use crate::atoms::{Core, Device, Fill, GroupMmaAtom, Target};
 use crate::ir::{Axis, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
-use crate::kernels::gemm::GemmCfg;
+use crate::kernels::gemm::{GemmCfg, KSLICE};
 use crate::kernels::rows::NormCfg;
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked};
 use crate::tune::Compiled;
@@ -59,18 +59,19 @@ impl GemmCfg {
     /// (32, 64 or 128 bytes), the descriptor's own.
     fn tiles(&self, target: &Target) -> bool {
         let bk = self.tile[2];
-        let row = self.core == Core::Warp || Swizzle::spans(bk, 2);
+        let row = self.core == Core::Warp || Swizzle::spans(bk, ELEM);
         // Two crews: the two warp rows of the warp-level core, one slot, and
-        // k-slices of a product each with another to overlap, on a target
-        // that interleaves crews.
+        // k-slices of a product (one atom deep) each with another to
+        // overlap, on a target that interleaves crews.
         let crews = self.crews == 1
             || (self.crews == 2
                 && self.core == Core::Warp
                 && target.crews >= 2
+                && target.mma.first().is_some_and(|atom| atom.k as usize == KSLICE)
                 && self.stages == 1
                 && self.warps[0] == 2
-                && bk.is_multiple_of(crate::kernels::gemm::KSLICE)
-                && bk >= 2 * crate::kernels::gemm::KSLICE);
+                && bk.is_multiple_of(KSLICE)
+                && bk >= 2 * KSLICE);
         row && crews && self.issue(target, bk).is_some() && target.fill.stages(self.stages) == self.stages
     }
 
@@ -133,14 +134,17 @@ pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], u
     GemmCfg { core: Core::Warp, tile, stages, warps, group_m: 8, unroll, crews: 1 }
 }
 
-/// Search bound: the knobs a GEMM-shaped kernel is enumerated over: output tile edges
-/// (48 and 96 columns for the convolution bodies a power of two would pad
-/// by a third), reduction depths and warp grids.
+/// Search bound: the output tile's rows, the first of the knobs a GEMM-shaped
+/// kernel is enumerated over.
 const ROWS: [usize; 4] = [32, 64, 128, 256];
+/// Search bound: the output tile's columns (48 and 96 for the convolution
+/// bodies a power of two would pad by a third).
 const COLS: [usize; 5] = [48, 64, 96, 128, 256];
+/// Search bound: the reduction depths of a step.
 const DEPTHS: [usize; 3] = [16, 32, 64];
+/// Search bound: the warp grids over the output tile.
 const GRIDS: [[u32; 2]; 9] = [[1, 1], [1, 2], [2, 1], [2, 2], [1, 4], [4, 1], [2, 4], [4, 2], [4, 4]];
-/// Warp grids of whole warpgroups down the rows, one to four of them.
+/// Search bound: warp grids of whole warpgroups down the rows, one to four of them.
 const GROUP_GRIDS: [[u32; 2]; 6] = [[4, 1], [4, 2], [8, 1], [8, 2], [16, 1], [4, 4]];
 
 /// A core with the warp grids and ring depths the lattice spans it over.
@@ -218,7 +222,7 @@ fn sorted<C: Debug>(problem: &impl Debug, mut ranked: Vec<(f64, u32, C)>, spanne
     ranked
 }
 
-/// The configs of a ranking logged with their costs.
+/// Search bound: the configs of a ranking logged with their costs.
 const LOGGED: usize = 16;
 
 /// How a problem runs under one config: `blocks` blocks of `waves` waves,
@@ -314,7 +318,7 @@ impl Problem {
         let (atoms, fragments, step) = match cfg.core {
             Core::Warp => (
                 (bm / wr / atom.m as usize) * (bn * halves / wc / atom.n as usize),
-                waves * (bm / wr + bn * halves / wc) * bk * 2,
+                waves * (bm / wr + bn * halves / wc) * bk * ELEM,
                 costs.step,
             ),
             Core::Group => {
@@ -323,10 +327,10 @@ impl Problem {
                 (bn * halves / wc / n, 0, costs.step_group)
             }
         };
-        let fill = (bm + bn * halves) * bk * 2;
-        let steps = bm * bn * halves * bk / 4096;
+        let fill = (bm + bn * halves) * bk * ELEM;
+        let steps = bm * bn * halves * bk / STEP;
         let (blocks, trips, stages) = (self.blocks(cfg), self.k / bk, cfg.stages);
-        let unique = (self.batches * (self.m + self.n * halves) * self.k * 2) as f64;
+        let unique = (self.batches * (self.m + self.n * halves) * self.k * ELEM) as f64;
         let flight = planner.sms().min(blocks).max(1);
         let group = cfg.group_m.max(1).min(flight);
         let distinct = group * bm + flight.div_ceil(group) * bn * halves;
@@ -355,6 +359,12 @@ impl Problem {
         spread(ranked.into_iter().map(|(cost, _, c)| (cost, c)).collect(), |c| [c.tile[0], c.tile[1]])
     }
 }
+
+/// Model: the elements of one 16×16×16 matrix-core step, [`Costs::step`]'s
+/// unit.
+const STEP: usize = 16 * 16 * 16;
+/// The bytes of a kernel's 16-bit operand element.
+const ELEM: usize = 2;
 
 /// Model: how far past the cheapest config's cost the model cannot tell
 /// configs apart: on sm_86 the measured best of Nemotron's projections and of 4096³
@@ -430,6 +440,13 @@ pub(crate) const TWIN_TILES: usize = 8;
 /// Model: blocks per SM a convolution's grid should reach before its
 /// reduction is left whole: its grids are a few hundred blocks.
 const CONV_BLOCKS_PER_SM: usize = 2;
+/// Model: the share of a convolution tile's area that may pad past `m × n`;
+/// a split is sought among tiles within half of it as well.
+const CONV_PADDING: f64 = 1.0 / 8.0;
+/// Search bound: the counts a starved convolution's reduction splits into.
+const CONV_SPLITS: [usize; 5] = [2, 3, 4, 6, 9];
+/// Search bound: the most blocks per SM a split convolution grid reaches.
+const SPLIT_BLOCKS_PER_SM: usize = 16;
 
 /// A config's tile: all of it but its pipeline (ring depth, unrolling),
 /// which the ranking orders by a cost model alone and the compiler may
@@ -763,8 +780,12 @@ impl Planner {
         }
         let p = Problem { batches, m, n, k, halves: 1 };
         let target = &self.device.target;
-        let depth = if target.fill == Fill::CpAsync { 2 * target.mma.first().map_or(16, |a| a.k as usize) } else { 0 };
-        let eligible = |c: &&GemmCfg| cin.is_multiple_of(c.tile[2]) && c.tile[2] >= depth && p.padding(c) <= 1.0 / 8.0;
+        let depth = match (target.fill, target.mma.first()) {
+            (Fill::CpAsync, Some(atom)) => 2 * atom.k as usize,
+            _ => 0,
+        };
+        let eligible =
+            |c: &&GemmCfg| cin.is_multiple_of(c.tile[2]) && c.tile[2] >= depth && p.padding(c) <= CONV_PADDING;
         self.ranked(p).iter().filter(eligible).map(|&gemm| ConvCfg { gemm, split: 1 }).collect()
     }
 
@@ -781,15 +802,16 @@ impl Planner {
         let sms = self.sms();
         let blocks = |c: &GemmCfg| p.blocks(c);
         let widest = |tight: bool| {
-            let fits = |c: &&GemmCfg| !tight || p.padding(c) <= 1.0 / 16.0;
+            let fits = |c: &&GemmCfg| !tight || p.padding(c) <= CONV_PADDING / 2.0;
             admitted.iter().map(|c| &c.gemm).filter(fits).max_by_key(|c| blocks(c)).copied().unwrap_or(base)
         };
         if batches == 1 && blocks(&base) < 2 * CONV_BLOCKS_PER_SM * sms {
             for gemm in [base, widest(true), widest(false)] {
                 let trips = k / gemm.tile[2];
-                for split in [2, 3, 4, 6, 9] {
+                for split in CONV_SPLITS {
                     let c = ConvCfg { gemm, split };
-                    if trips.is_multiple_of(split) && blocks(&gemm) * split <= 16 * sms && !out.contains(&c) {
+                    let within = blocks(&gemm) * split <= SPLIT_BLOCKS_PER_SM * sms;
+                    if trips.is_multiple_of(split) && within && !out.contains(&c) {
                         out.push(c);
                     }
                 }
@@ -839,7 +861,7 @@ impl FaCfg {
                     && groups.is_power_of_two()
                     && g.n_for(bkv as u32).is_some()
                     && g.n_for(d as u32).is_some()
-                    && (Swizzle::spans(d, 2) || (d * 2).is_multiple_of(Swizzle::B128.span()))
+                    && (Swizzle::spans(d, ELEM) || (d * ELEM).is_multiple_of(Swizzle::B128.span()))
             }),
         };
         core && atom.m as usize == WARP_ROWS
@@ -898,6 +920,16 @@ impl FaCfg {
         Some(target.issue(Core::Warp, grid, self.bq, d, self.bkv)?.c.regs())
     }
 }
+
+/// Search bound: an attention block's queries.
+const QUERY_BLOCKS: [usize; 5] = [16, 32, 64, 128, 256];
+/// Search bound: an attention block's keys a trip.
+const KEY_BLOCKS: [usize; 4] = [16, 32, 64, 128];
+/// Search bound: an attention ring's depths, the deepest first; a
+/// register-staged fill runs the last alone.
+const FA_STAGES: [usize; 2] = [3, 2];
+/// Search bound: the warps a one-row-warp block's keys may split over.
+const KEY_WARPS: [usize; 3] = [1, 2, 4];
 
 /// Model: the fewest queries a block offers two atom rows per warp for.
 const TWO_ROWS_FROM: usize = 64;
@@ -970,20 +1002,20 @@ impl Attention {
             Core::Warp => {
                 let atom = target.mma.first().ok_or(Rejected::Lowers)?;
                 let atoms = (cfg.warp_rows / atom.m as usize) * (bkv.min(d) / atom.n as usize);
-                (atoms, 2 * waves * bkv * d * 2, costs.step)
+                (atoms, 2 * waves * bkv * d * ELEM, costs.step)
             }
             Core::Group if regs <= target.lane_budget(waves as u32) => (1, 0, costs.step_group),
             Core::Group => return Err(Rejected::Registers { need: regs, have: target.lane_budget(waves as u32) }),
         };
-        let bias = usize::from(self.bias) * kw * bq * bkv * 2;
+        let bias = usize::from(self.bias) * kw * bq * bkv * ELEM;
         let fragments = kv_reads + bias;
-        let fill = kw * 2 * bkv * d * 2 + bias;
-        let steps = kw * 2 * bq * bkv * d / 4096;
+        let fill = kw * 2 * bkv * d * ELEM + bias;
+        let steps = kw * 2 * bq * bkv * d / STEP;
         let diagonal = DIAGONAL * bq.div_ceil(bkv);
         let trips = if self.causal { self.tk.div_ceil(2 * bkv) + diagonal } else { self.tk.div_ceil(bkv) };
         let trips = trips.div_ceil(kw);
         let (blocks, stages) = (self.blocks(cfg), cfg.stages);
-        let unique = (self.tiles * self.tk * (d * 2 + usize::from(self.bias) * self.t) * 2) as f64;
+        let unique = (self.tiles * self.tk * (d * 2 + usize::from(self.bias) * self.t) * ELEM) as f64;
         let flight = planner.sms().min(blocks).max(1);
         let shared = 1.0 - flight.div_ceil(self.t.div_ceil(bq)) as f64 / flight as f64;
         let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
@@ -999,17 +1031,17 @@ impl Attention {
     /// on the warp-level core and, where the target has it, the warpgroup
     /// core, in the plain softmax forms.
     pub fn lattice(&self, target: &Target) -> Vec<FaCfg> {
-        let stages: &[usize] = if target.fill == Fill::CpAsync { &[3, 2] } else { &[2] };
+        let stages: &[usize] = if target.fill == Fill::CpAsync { &FA_STAGES } else { &FA_STAGES[1..] };
         let cores: &[Core] = if target.group_mma.is_empty() { &[Core::Warp] } else { &[Core::Warp, Core::Group] };
         let mut out = vec![];
-        for (core, bq) in cores.iter().flat_map(|&c| [16, 32, 64, 128, 256].map(|bq| (c, bq))) {
+        for (core, bq) in cores.iter().flat_map(|&c| QUERY_BLOCKS.map(|bq| (c, bq))) {
             // The warp-level core's blocks stop at eight row warps.
             if core == Core::Warp && bq > 128 {
                 continue;
             }
             // A row warp of queries may share its block with key warps.
-            let key_warps: &[usize] = if bq == WARP_ROWS && self.t <= WARP_ROWS { &[1, 2, 4] } else { &[1] };
-            for bkv in [16, 32, 64, 128] {
+            let key_warps: &[usize] = if bq == WARP_ROWS && self.t <= WARP_ROWS { &KEY_WARPS } else { &[1] };
+            for bkv in KEY_BLOCKS {
                 for &stages in stages {
                     for unroll in [false, true] {
                         for &key_warps in key_warps {
@@ -1077,7 +1109,7 @@ pub fn heads_candidates(d: usize) -> Vec<NormCfg> {
     if !(d.is_power_of_two() && (16..=256).contains(&d)) {
         return vec![];
     }
-    [4, 8, 16].map(|br| NormCfg { br }).to_vec()
+    ROW_WARPS.map(|br| NormCfg { br }).to_vec()
 }
 
 /// One warp per row of a power-of-two width a warp's vector loads span.
@@ -1085,5 +1117,8 @@ pub fn norm_candidates(d: usize) -> Vec<NormCfg> {
     if !(d.is_power_of_two() && (256..=2048).contains(&d)) {
         return vec![];
     }
-    [4, 8, 16].map(|br| NormCfg { br }).to_vec()
+    ROW_WARPS.map(|br| NormCfg { br }).to_vec()
 }
+
+/// Search bound: the rows (one warp each) of a row kernel's block.
+const ROW_WARPS: [usize; 3] = [4, 8, 16];

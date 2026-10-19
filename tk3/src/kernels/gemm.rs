@@ -108,8 +108,9 @@ impl fmt::Debug for GemmCfg {
     }
 }
 
-/// The depth of an operand's k-slices under two crews: one matrix-core
-/// step, so a cluster's reads are one product's fragments.
+/// The depth of an operand's k-slices under two crews: one matrix-core step,
+/// the k of every atom two crews run on (the planner admits none other), so
+/// a cluster's reads are one product's fragments.
 pub const KSLICE: usize = 16;
 
 impl GemmCfg {

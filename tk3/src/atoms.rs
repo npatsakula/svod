@@ -635,7 +635,9 @@ pub const CARDS: [(&str, GpuArch, u32, u32); 9] = [
     ("strix-halo", GpuArch::Amd(AmdArch::Gfx1151), 40, 1),
 ];
 
-/// The CUDA sm_86 target of the development machine's RTX 3060 (28 SMs).
+/// The CUDA sm_86 target of the development machine's RTX 3060 (28 SMs):
+/// the host tests' fixture.
+#[cfg(test)]
 pub fn sm86() -> Target {
     Target::card("rtx3060").expect("a listed card")
 }

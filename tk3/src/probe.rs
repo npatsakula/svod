@@ -234,7 +234,7 @@ pub fn stored(dir: &std::path::Path, target: &Target) -> Option<Measured> {
     priced(target, value).ok()
 }
 
-/// Costs a device is planned with where nothing measured it: guesses at
+/// Model: costs a device is planned with where nothing measured it: guesses at
 /// an sm_86-class part, the warpgroup step priced as the warp-level one. A
 /// ranking under them is a guess's.
 pub const GUESSED: Costs = Costs {

@@ -81,6 +81,9 @@ pub struct Attn<'a> {
 }
 
 const OP: &str = "attention";
+/// Search bound: the rows (one warp each) of a split's merge block, which
+/// the tuner times as part of every split candidate rather than on its own.
+const MERGE_ROWS: usize = 4;
 
 /// Measurement: the lanes a shape is measured at, at most.
 const TUNE_BATCH: usize = 64;
@@ -210,7 +213,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         };
         admitted.iter().flat_map(|c| splits(c).into_iter().map(|splits| FaCfg { splits, ..*c })).collect()
     };
-    let merge = |splits| CombineSpec { batch: batch.clone(), t, heads, d, splits, cfg: NormCfg { br: 4 } };
+    let merge = |splits| CombineSpec { batch: batch.clone(), t, heads, d, splits, cfg: NormCfg { br: MERGE_ROWS } };
     // Measured with the static masks and the bias only (scratch parameters
     // would be garbage; a bias streams the same whatever it holds) and at
     // most `TUNE_BATCH` lanes: more fill the device alike, and a cache's
