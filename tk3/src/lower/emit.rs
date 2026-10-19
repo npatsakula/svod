@@ -84,6 +84,9 @@ struct View {
     place: Place,
     shape: Shape,
     dtype: ScalarDType,
+    /// Added to a shared view's offset: a warp's region of the relayout
+    /// scratch inside a [`Stmt::Warps`].
+    region: Option<Arc<UOp>>,
 }
 
 /// A register's coordinate in its tile: the part the lane and warp decide,
@@ -432,7 +435,7 @@ impl<'a> Emit<'a> {
             Place::Smem { alloc, .. } => self.smem_as(alloc.index(), val.dtype),
             Place::Reg => unreachable!("a memory view"),
         };
-        View { buf, place: val.place, shape: val.shape, dtype: val.dtype }
+        View { buf, place: val.place, shape: val.shape, dtype: val.dtype, region: None }
     }
 
     /// Allocation `alloc`'s buffer read under `dtype`: its own where they
@@ -506,6 +509,11 @@ impl<'a> Emit<'a> {
                     cols = view.shape.rows as i64;
                 }
                 let offset = self.sc(*offset);
+                // The relayout scratch is addressed through the warp's region.
+                let offset = match &view.region {
+                    Some(region) => add(&offset, region),
+                    None => offset,
+                };
                 let chunk = 16 / view.dtype.bytes() as i64;
                 let cpr = cols / chunk;
                 // The XOR must stay within the row: a power-of-two chunk count.
@@ -1099,19 +1107,14 @@ impl<'a> Emit<'a> {
                 buf
             }
         };
-        // A warp's region: the scratch pointer advanced by its index, so the
-        // view itself keeps a zero offset.
-        let buf = if regions > 1 {
-            let at = self.hoist(mul(&self.warp, &c32(elems as i64)));
-            self.hoist(UOp::new(
-                Op::Shrink(ops::Shrink { src: scratch, offsets: at, sizes: c32(elems as i64) }),
-                self.scratch[&dtype].0.dtype(),
-            ))
-        } else {
-            scratch
-        };
-        let offset = self.zero();
-        let view = View { buf, place: Place::Smem { alloc: SmemId(u32::MAX), offset }, shape, dtype };
+        // A warp's region starts at its index's multiple of the tile: an
+        // offset of every access, never a crop of the scratch, since an
+        // access of a crop is folded into the buffer at the summed offset
+        // once the program's placeholders are bound, and the sum is listed
+        // nowhere.
+        let region = (regions > 1).then(|| self.hoist(mul(&self.warp, &c32(elems as i64))));
+        let place = Place::Smem { alloc: SmemId(u32::MAX), offset: self.zero() };
+        let view = View { buf: scratch, place, shape, dtype, region };
         self.sync(Sync::Barrier { scope: self.scope })?;
         self.store_view(&view, src)?;
         self.sync(Sync::Barrier { scope: self.scope })?;

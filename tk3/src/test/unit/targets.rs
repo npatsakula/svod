@@ -21,7 +21,7 @@ use crate::interp::{self, round_to};
 use crate::ir::{Axis, ParamKind, Program};
 use crate::kernels::Act;
 use crate::kernels::Batch;
-use crate::kernels::attention::{AttnMask, AttnSpec, Cache, CombineSpec, Forms, attention, combine};
+use crate::kernels::attention::{AttnMask, AttnSpec, Bias, Cache, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
 use crate::kernels::gemm::{Epilogue, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
@@ -91,6 +91,10 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
     };
     let spec = AttnSpec { cfg, ..spec };
     push("attention d64 cache key warps", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
+    // Key warps re-hold the biased score tile through their own regions of
+    // the relayout scratch where the core's accumulator cannot feed a product.
+    let spec = AttnSpec { mask: AttnMask { bias: Some(Bias::PerBatch), ..lens }, ..spec };
+    push("attention d64 cache key warps bias", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
     let merge = CombineSpec { batch: spec.batch.clone(), t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: 4 } };
     push("attention combine", combine::<F16>(&merge), merge.cfg.lowering(&planner.device));
 
@@ -351,6 +355,33 @@ fn every_family_compiles_for_amd(target: Target) {
         let descriptor = format!("{kernel}.kd");
         assert!(object.windows(descriptor.len()).any(|w| w == descriptor.as_bytes()), "{name}: {descriptor}");
         eprintln!("{name}: compiled for {}", arch.mcpu());
+    }
+}
+
+/// Every access a lowering lists reads an allocation or a view of its
+/// whole, never a crop at an offset: once a program's placeholders are
+/// bound, an access of a crop is folded into the buffer at the summed
+/// offset, and nothing lists the sum, so the LLVM renderer finds no name
+/// for it. Key warps re-holding a biased score tile through their regions
+/// of the relayout scratch hit this on gfx1151.
+#[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
+#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
+#[test_case(crate::atoms::sm86(); "sm86")]
+fn accesses_address_allocations_not_crops(target: Target) {
+    let zero = |u: &Arc<UOp>| matches!(u.op(), Op::Const(v) if v.0.try_int() == Some(0));
+    for (name, prog, lowering) in families(&target) {
+        let linear = linear(prog, &lowering);
+        let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("{name}: a linear list") };
+        for u in list.iter() {
+            let buf = match u.op() {
+                Op::Index(ops::Index { buffer, .. }) => buffer,
+                Op::Shrink(ops::Shrink { src, .. }) => src,
+                _ => continue,
+            };
+            if let Op::Shrink(ops::Shrink { offsets, .. }) = buf.op() {
+                assert!(zero(offsets), "{name}: {} {} reads a crop at an offset", u.id, u.op().as_ref());
+            }
+        }
     }
 }
 
@@ -772,12 +803,17 @@ fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
 /// decoder step's cache kernel still moves its softmax state, a 16-element
 /// vector, between the cached keys and the appended one); where neither way
 /// is free (RDNA3) the tile relayout remains, under the declared [`costs`] a
-/// register exchange between the half-waves.
+/// register exchange between the half-waves. The biased kernel is left out:
+/// its bias tiles come from global memory in a layout of their own, and on
+/// gfx942 the kernel re-holds three tiles however the products are issued.
 #[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
 #[test_case(amd(AmdArch::Gfx942, 304), true; "gfx942")]
 #[test_case(amd(AmdArch::Gfx1100, 96), false; "gfx1100")]
 fn attention_orientation_spares_the_relayout(target: Target, free: bool) {
-    let kernels: Vec<_> = families(&target).into_iter().filter(|(name, ..)| name.starts_with("attention d")).collect();
+    let kernels: Vec<_> = families(&target)
+        .into_iter()
+        .filter(|(name, ..)| name.starts_with("attention d") && !name.ends_with("bias"))
+        .collect();
     assert!(!kernels.is_empty());
     for (name, prog, lowering) in kernels {
         let tile = lowered_tile(prog, &lowering);
