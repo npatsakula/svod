@@ -65,7 +65,8 @@ pub struct ConvCfg {
     pub split: usize,
 }
 
-/// The tile of the split merge: f32 rows, natural layouts.
+/// Search bound: the tile of the split merge, f32 rows in natural layouts,
+/// one pick the lattice does not search.
 const MERGE_TILE: [usize; 2] = [32, 32];
 
 impl ConvSpec {

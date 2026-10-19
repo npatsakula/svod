@@ -609,7 +609,6 @@ impl<'a> Emit<'a> {
             }
             Stmt::Loop(l) => self.loop_(l),
             Stmt::Pipeline(_) => UnsupportedSnafu { what: "an unexpanded pipeline" }.fail(),
-            Stmt::Role { .. } => UnsupportedSnafu { what: "warp roles" }.fail(),
             Stmt::Warps { body } => {
                 let outer = std::mem::replace(&mut self.scope, Scope::Warp);
                 let out = self.block(body);

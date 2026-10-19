@@ -103,7 +103,7 @@ pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], u
     GemmCfg { tile, stages, warps, group_m: 8, unroll }
 }
 
-/// The knobs a GEMM-shaped kernel is enumerated over: output tile edges
+/// Search bound: the knobs a GEMM-shaped kernel is enumerated over: output tile edges
 /// (48 and 96 columns for the convolution bodies a power of two would pad
 /// by a third), reduction depths and warp grids.
 const ROWS: [usize; 4] = [32, 64, 128, 256];
@@ -221,10 +221,18 @@ impl Problem {
     }
 }
 
-/// How far past the cheapest config's cost the model cannot tell configs
-/// apart: on sm_86 the measured best of Nemotron's projections and of 4096³
+/// Model: how far past the cheapest config's cost the model cannot tell
+/// configs apart: on sm_86 the measured best of Nemotron's projections and of 4096³
 /// sat 12–31% behind the model's first.
 const BAND: f64 = 1.35;
+/// Model: the share of the cache in front of DRAM a fill's distinct bytes
+/// may take and stay resident, the rest left to the other operands and the
+/// outputs streaming through it.
+const CACHE_SHARE: f64 = 0.75;
+/// Model: distinct bytes past this multiple of the resident share all come
+/// from DRAM: an LRU cache streamed past its size by half holds nothing
+/// that is read again.
+const CACHE_SPILL: f64 = 1.5;
 
 /// `ranked` (cheapest first, with its costs) led by the band's classes in
 /// turn: each class's cheapest tile (classes in the order of their
@@ -265,13 +273,13 @@ pub(crate) fn spread<C: Tiled, K: Eq + Hash>(ranked: Vec<(f64, C)>, class: impl 
     out
 }
 
-/// The tiles the tune store measures per shape, compiled in parallel
-/// batches of as many: most of the lattice, since timing a tile costs
+/// Search bound: the tiles the tune store measures per shape, compiled in
+/// parallel batches of as many: most of the lattice, since timing a tile costs
 /// about 20 ms once the device's clock is up and the ranking cannot be
 /// trusted to put the best within a few (see the module docs).
 pub(crate) const SHORTLIST: usize = 64;
-/// Blocks per SM a convolution's grid should reach before its reduction is
-/// left whole: its grids are a few hundred blocks.
+/// Model: blocks per SM a convolution's grid should reach before its
+/// reduction is left whole: its grids are a few hundred blocks.
 const CONV_BLOCKS_PER_SM: usize = 2;
 
 /// A config's tile: all of it but its pipeline (ring depth, unrolling),
@@ -373,7 +381,7 @@ pub(crate) fn clean<C: Tiled>(list: &[C], compile: impl FnMut(&[C]) -> Vec<Compi
     judged(list, list.len(), SHORTLIST, compile, |_| true)
 }
 
-/// Configs compiled at once in search of the first clean one: the first
+/// Search bound: configs compiled at once in search of the first clean one: the first
 /// ranked config nearly always is, and a search is what runs with tuning
 /// off, where no test should pay for a lattice.
 const FIRST: usize = 8;
@@ -484,17 +492,17 @@ impl Planner {
     }
 
     /// What a byte of a fill costs when `fill` bytes stream `unique`
-    /// distinct ones. Where the distinct bytes fit three quarters of the
-    /// cache in front of DRAM (the rest left to other traffic) each comes
-    /// from DRAM once and its re-reads from the cache; past half again as
-    /// much every byte comes from DRAM; between, the two blend.
+    /// distinct ones. Where the distinct bytes fit the [`CACHE_SHARE`] of
+    /// the cache in front of DRAM each comes from DRAM once and its re-reads
+    /// from the cache; past [`CACHE_SPILL`] times that every byte comes from
+    /// DRAM; between, the two blend.
     pub(crate) fn fill_byte(&self, unique: f64, fill: f64) -> f64 {
         let c = &self.device.costs;
-        let held = 0.75 * c.l2_bytes;
+        let held = CACHE_SHARE * c.l2_bytes;
         if held <= 0.0 || fill <= 0.0 {
             return c.global_byte;
         }
-        let fits = ((1.5 * held - unique) / (0.5 * held)).clamp(0.0, 1.0);
+        let fits = ((CACHE_SPILL * held - unique) / ((CACHE_SPILL - 1.0) * held)).clamp(0.0, 1.0);
         let hit = fits * (1.0 - unique / fill).max(0.0);
         hit * c.l2_byte + (1.0 - hit) * c.global_byte
     }
@@ -632,7 +640,7 @@ impl FaCfg {
     }
 }
 
-/// Trips a key block on a causal query block's diagonal counts for: the
+/// Model: trips a key block on a causal query block's diagonal counts for: the
 /// block itself, its mask, and the rows above the diagonal every warp still
 /// runs. A count of the work, not a fit.
 const DIAGONAL: usize = 3;

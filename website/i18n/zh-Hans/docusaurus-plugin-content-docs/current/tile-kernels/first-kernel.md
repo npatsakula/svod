@@ -159,4 +159,4 @@ c.realize()?;
 | 数据移动 | `stage`（全局 → 共享，`CopyMode::Async` 或 `Sync`）、`load`、`store` |
 | 控制 | `loop_`（携带寄存器 tile）、`pipeline`、`if_`、`select_if`（产生 tile 的分支） |
 
-`role_block`、`raw` 和 `transpose` 可以被记录，但尚未被降级：降级对它们返回 `Error::Unsupported`。
+`raw` 和 `transpose` 可以被记录，但尚未被降级：降级对它们返回 `Error::Unsupported`。

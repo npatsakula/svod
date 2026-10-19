@@ -57,6 +57,6 @@ sidebar_label: 可移植性
 | AMD CDNA：ping-pong 模板、MFMA 32×32、`buffer_load … lds` | 未开始 |
 | AMD 测量 | gfx1201 (RX 9070 XT) 已测量：GEMM、卷积和注意力在 Qwen3 和 YOLO 上领先 tk1；gfx1151 (Strix Halo) 已测量：d = 64 和 128 的注意力；CDNA 已编译，未运行 |
 | Apple | 仅有原子；没有配置表，没有发射的内核 |
-| Warp 角色、角色屏障、原始 asm 语句 | 可在 IR 中记录，但被降级拒绝 |
+| 原始 asm 语句 | 可在 IR 中记录，但被降级拒绝 |
 | 卷积（隐式 GEMM） | 在 sm_86 上测量，YOLO26 以 channels-last 运行在其上（`ops::conv2d`）；对 AMD 仅编译 |
 | fp8/int8 权重、GEMV + argmax、持久化网格、注意力反向 | 未开始 |

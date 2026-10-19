@@ -148,7 +148,7 @@ Carried values move into their `phi` at the end of the block that defines them. 
 enforced in `lower/emit.rs`, and a kernel author never handles them.
 :::
 
-`lower::Error::Unsupported` is returned for what is recorded but not lowered yet: warp roles,
-role barriers, `raw` statements and register transposes. An async copy on a target without
+`lower::Error::Unsupported` is returned for what is recorded but not lowered yet: `raw`
+statements and register transposes. An async copy on a target without
 `cp.async` is a synchronous one, and its commits and waits emit nothing.
 `TK3_DUMP_LIST=1` prints the emitted list (see [Testing and Debugging](./testing-and-debugging)).

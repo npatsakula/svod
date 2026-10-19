@@ -6,8 +6,6 @@
 //! that consume each value and keeps them in a side table, starting from the
 //! few an author pins ([`Program::pins`]).
 
-use std::ops::Range;
-
 use svod_dtype::ScalarDType;
 
 macro_rules! id {
@@ -21,7 +19,7 @@ macro_rules! id {
         }
     )*};
 }
-id!(ValId, ScalarId, ParamId, SmemId, RoleId);
+id!(ValId, ScalarId, ParamId, SmemId);
 
 /// Where a tile value lives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -370,11 +368,6 @@ pub enum Stmt {
     },
     Loop(Loop),
     Pipeline(Pipeline),
-    /// Run only by the warps of `role`.
-    Role {
-        role: RoleId,
-        body: Block,
-    },
     /// Every warp of the block runs `body` on its own: `Special::Warp` is
     /// its index, its copies move whole tiles with its lanes alone, and its
     /// barriers gather only itself. What the warps leave in shared memory is
@@ -422,15 +415,6 @@ pub struct SmemAlloc {
     pub along: Axis,
 }
 
-/// A warp-specialized role: which warps run it and, when the target supports
-/// it, how many registers each of its threads may use.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Role {
-    pub name: String,
-    pub warps: Range<u32>,
-    pub regs: Option<u32>,
-}
-
 /// A bound symbolic variable of the launch, with the range it may take.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Var {
@@ -468,7 +452,6 @@ pub struct Program {
     pub vars: Vec<Var>,
     pub grid: [ScalarId; 3],
     pub warps: u32,
-    pub roles: Vec<Role>,
     pub smem: Vec<SmemAlloc>,
     pub scalars: Vec<Scalar>,
     pub values: Vec<Value>,
@@ -506,7 +489,7 @@ impl Block {
                     p.produce.body.walk(depth + 1, out);
                     p.consume.body.walk(depth + 1, out);
                 }
-                Stmt::Role { body, .. } | Stmt::Warps { body } => body.walk(depth + 1, out),
+                Stmt::Warps { body } => body.walk(depth + 1, out),
                 Stmt::If { then, otherwise, .. } => {
                     then.walk(depth + 1, out);
                     otherwise.walk(depth + 1, out);

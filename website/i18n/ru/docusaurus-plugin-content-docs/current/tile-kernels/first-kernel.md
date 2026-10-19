@@ -180,5 +180,5 @@ c.realize()?;
 | Перемещение | `stage` (global → shared, `CopyMode::Async` или `Sync`), `load`, `store` |
 | Управление | `loop_` (переносимые регистровые тайлы), `pipeline`, `if_`, `select_if` (ветви, производящие тайлы) |
 
-`role_block`, `raw` и `transpose` можно записать, но они пока не понижаются: понижение
+`raw` и `transpose` можно записать, но они пока не понижаются: понижение
 возвращает для них `Error::Unsupported`.

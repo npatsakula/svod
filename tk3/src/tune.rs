@@ -35,17 +35,17 @@ use crate::lower::Lowering;
 /// The store's line format, bumped when a line's meaning changes (a file
 /// without a format line is of the first).
 pub(crate) const FORMAT: u32 = 1;
-/// Timed rounds over every candidate after the warm-up.
+/// Search bound: timed rounds over every candidate after the warm-up.
 const ROUNDS: usize = 4;
-/// Rounds past the first go to the candidates within this factor of the
-/// first round's best; the rest cannot win (a round's best of [`RUNS`] runs
+/// Search bound: rounds past the first go to the candidates within this
+/// factor of the first round's best; the rest cannot win (a round's best of [`RUNS`] runs
 /// after a sustain sits within a few percent of the candidate's settled
 /// time), and a shortlist is mostly losers.
 const CONTENDER: f64 = 1.2;
-/// Profiled runs per candidate per round.
+/// Measurement: profiled runs per candidate per round.
 const RUNS: usize = 5;
-/// Device time of back-to-back runs ahead of each candidate's profiled runs,
-/// keeping the lifted clock up where their host overhead would let a short
+/// Measurement: device time of back-to-back runs ahead of each candidate's
+/// profiled runs, keeping the lifted clock up where their host overhead would let a short
 /// kernel's clock sag.
 const SUSTAIN: Duration = Duration::from_millis(5);
 

@@ -75,5 +75,5 @@ A forked kernel program for one vendor is allowed only as a bounded exception.
 | AMD measurements | gfx1201 (RX 9070 XT) measured: GEMM, convolution and attention ahead of tk1 on Qwen3 and YOLO; gfx1151 (Strix Halo) measured: attention at d = 64 and 128; CDNA compiled, not run |
 | Apple | Atoms only; no tables, no emitted kernels |
 | Convolution (implicit GEMM) | Measured on sm_86, where YOLO26 runs on it channels-last (`ops::conv2d`); compiled only for AMD |
-| Warp roles, role barriers, raw asm statements | Recorded in the IR, rejected by the lowering |
+| Raw asm statements | Recorded in the IR, rejected by the lowering |
 | fp8/int8 weights, GEMV + argmax, persistent grid, attention backward | Not started |

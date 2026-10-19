@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use snafu::{ResultExt, Snafu};
+use snafu::{ResultExt, Snafu, ensure};
 use svod_dtype::DeviceSpec;
 use svod_ir::UOp;
 
@@ -24,6 +24,8 @@ pub enum Error {
     Unsupported { what: String },
     #[snafu(display("program assembly: {source}"))]
     Program { source: svod_ir::Error },
+    #[snafu(display("{warps} warps over a grid of {grid}: the grid takes them all, or whole grids run on their own"))]
+    Grid { warps: u32, grid: u32 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -58,6 +60,9 @@ pub struct Lowered {
 /// `params` are the flat buffer UOps in `prog.params` order (placeholders on
 /// the graph path, `UOp::param`s on the direct one).
 pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Lowered> {
+    let grid = lowering.grid.count();
+    let lone = prog.walk().any(|(_, s)| matches!(s, Stmt::Warps { .. }));
+    ensure!(prog.warps.is_multiple_of(grid) && (prog.warps == grid || lone), GridSnafu { warps: prog.warps, grid });
     materialize_operands(&mut prog);
     sync::insert_barriers(&mut prog);
     schedule::expand(&mut prog, lowering.schedule);
@@ -135,7 +140,6 @@ fn scoped(block: &Block, scope: Scope) -> Vec<(&Stmt, Scope)> {
                 out.extend(scoped(&p.produce.body, scope));
                 out.extend(scoped(&p.consume.body, scope));
             }
-            Stmt::Role { body, .. } => out.extend(scoped(body, scope)),
             Stmt::Warps { body } => out.extend(scoped(body, Scope::Warp)),
             Stmt::If { then, otherwise, .. } => {
                 out.extend(scoped(then, scope));
@@ -175,7 +179,7 @@ fn materialize_block(prog: &mut Program, block: Block) -> Block {
                 p.produce.body = materialize_block(prog, std::mem::take(&mut p.produce.body));
                 p.consume.body = materialize_block(prog, std::mem::take(&mut p.consume.body));
             }
-            Stmt::Role { body, .. } | Stmt::Warps { body } => *body = materialize_block(prog, std::mem::take(body)),
+            Stmt::Warps { body } => *body = materialize_block(prog, std::mem::take(body)),
             Stmt::If { then, otherwise, .. } => {
                 *then = materialize_block(prog, std::mem::take(then));
                 *otherwise = materialize_block(prog, std::mem::take(otherwise));

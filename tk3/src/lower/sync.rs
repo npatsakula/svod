@@ -94,7 +94,7 @@ fn written(prog: &Program, block: &Block, into: &mut HashSet<SmemId>) {
                 written(prog, then, into);
                 written(prog, otherwise, into);
             }
-            Stmt::Role { body, .. } | Stmt::Warps { body } => written(prog, body, into),
+            Stmt::Warps { body } => written(prog, body, into),
             Stmt::Pipeline(p) => written(prog, &p.produce.body, into),
             Stmt::Let { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
         }
@@ -111,7 +111,7 @@ fn read(prog: &Program, block: &Block, into: &mut HashSet<SmemId>) {
                 read(prog, then, into);
                 read(prog, otherwise, into);
             }
-            Stmt::Role { body, .. } | Stmt::Warps { body } => read(prog, body, into),
+            Stmt::Warps { body } => read(prog, body, into),
             Stmt::Pipeline(p) => {
                 read(prog, &p.produce.body, into);
                 read(prog, &p.consume.body, into);
@@ -189,11 +189,6 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block,
                 state = s1;
                 state.merge(&s2);
                 Stmt::If { pred, then, otherwise }
-            }
-            Stmt::Role { role, body } => {
-                let (body, end) = walk(prog, body, state, scope);
-                state = end;
-                Stmt::Role { role, body }
             }
             // The warps part on a clean slate (the block's open effects are
             // fenced first, for every warp), fence their own effects among
