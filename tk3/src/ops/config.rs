@@ -210,10 +210,12 @@ pub enum Rejected {
 
 /// A ranking: its configs with their costs ([`Planner::pipelined`] ns of SM
 /// time) and registers by the layout count, cheapest first (then fewer
-/// registers), logged under [`crate::ops::PLAN`] with how many `rejected` it left out.
-fn sorted<C: Debug>(problem: &impl Debug, mut ranked: Vec<(f64, u32, C)>, rejected: usize) -> Vec<(f64, u32, C)> {
+/// registers), logged under [`crate::ops::PLAN`] with how many of the
+/// `spanned` configs it left out.
+fn sorted<C: Debug>(problem: &impl Debug, mut ranked: Vec<(f64, u32, C)>, spanned: usize) -> Vec<(f64, u32, C)> {
     ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    tracing::debug!(target: crate::ops::PLAN, ?problem, ranked = ranked.len(), rejected, "ranking");
+    let (admitted, rejected) = (ranked.len(), spanned - ranked.len());
+    tracing::debug!(target: crate::ops::PLAN, ?problem, admitted, rejected, "ranking");
     for (rank, (ns, regs, cfg)) in ranked.iter().take(LOGGED).enumerate() {
         tracing::debug!(target: crate::ops::PLAN, rank, ns, regs, ?cfg, "ranked");
     }
