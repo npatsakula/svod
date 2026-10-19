@@ -58,5 +58,5 @@ sidebar_label: Переносимость
 | AMD CDNA: шаблон ping-pong, MFMA 32×32, `buffer_load … lds` | Не начато; будет замеряться на удалённом MI300X |
 | AMD RDNA, Apple | Только атомы; ни таблиц, ни выпущенных ядер |
 | Роли варпов, барьеры ролей, инструкции raw asm | Записываются в IR, отвергаются понижением |
-| Свёртка (implicit GEMM) | Только CUDA sm_80+ (`ops::conv2d`); AMD остаётся на графе или tk1, пока нет таблиц, а модель YOLO ещё не подключена |
+| Свёртка (implicit GEMM) | Только CUDA sm_80+ (`ops::conv2d`); YOLO26 работает на ней в channels-last, а на AMD операция идёт через граф, пока у tk3 нет таблиц RDNA |
 | Веса fp8/int8, GEMV + argmax, persistent grid, обратный проход внимания | Не начато |

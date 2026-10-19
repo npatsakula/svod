@@ -12,7 +12,7 @@ Svod का ऑप्टिमाइज़र किसी मॉडल के �
 हैं। ऐसे कर्नेल हाथ से लिखे जाते हैं, और `svod-tk3` ("tk3") उन्हें लिखने का crate है।
 
 tk3 पुराने `svod-tk` crate (tk1) का उत्तराधिकारी है। Transformer मॉडल अपने hand kernels यहाँ बताई
-गई op layer पर चलाते हैं; YOLO का convolution (एक implicit GEMM) `svod-tk` पर चलता है।
+गई op layer पर चलाते हैं, और YOLO26 भी, जिसके convolutions implicit GEMM (`ops::conv2d`) हैं।
 
 ## tk3 क्या है {#what-tk3-is}
 
