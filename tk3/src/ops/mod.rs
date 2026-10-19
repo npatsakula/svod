@@ -100,7 +100,7 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
             let measured = crate::probe::costs(&target)
                 .inspect_err(|e| tracing::warn!("{}: no tk3 planner: {e}", target.arch.target_name()))
                 .ok()?;
-            Some(Arc::new(Planner::measured(target, measured)))
+            Planner::measured(target, measured).map(Arc::new)
         })
         .clone()
 }

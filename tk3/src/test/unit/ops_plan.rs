@@ -28,6 +28,19 @@ fn ext(dims: &[usize]) -> Extent {
     Extent { dims: dims.to_vec(), var: false }
 }
 
+/// The planner of `device`, whose target reports its SM count.
+fn planned(device: Device) -> Planner {
+    Planner::new(device).expect("a target with an SM count")
+}
+
+/// A target without an SM count has no planner: every ranking scales by it.
+#[test]
+fn a_target_without_an_sm_count_has_no_planner() {
+    let target = Target { sms: None, ..sm86() };
+    assert!(Planner::new(Device { target, costs: costs() }).is_none());
+    assert_eq!(planned(Device { target: sm86(), costs: costs() }).sms(), 28);
+}
+
 /// The candidates of a plan that takes the kernel.
 fn kernel_plan<C>(plan: Plan<C>) -> Arc<[C]> {
     match plan {
@@ -184,7 +197,7 @@ fn no_register_count_admits() {
 /// filling the SMs `rounds` times over, each holding `1/actual` of an SM's
 /// shared memory (at most twelve resident: sm_86's 48 waves over four).
 fn pipelined(costs: Costs, [rounds, trips, actual, waves, stages]: [usize; 5], work: f64) -> f64 {
-    let planner = Planner::new(Device { target: sm86(), costs });
+    let planner = planned(Device { target: sm86(), costs });
     let (blocks, smem) = (rounds * actual * planner.sms(), sm86().smem_bytes / actual);
     let run = Run { blocks, smem, regs: 0, waves, atoms: 1, trips, reads: 0.0, work, fill: 0.0, trip: 0.0, stages };
     planner.pipelined(run)
@@ -195,7 +208,7 @@ fn pipelined(costs: Costs, [rounds, trips, actual, waves, stages]: [usize; 5], w
 #[test]
 fn an_sm_issues_its_share_of_blocks() {
     let flat = Costs { latency: 0.0, ..costs() };
-    let planner = Planner::new(Device { target: sm86(), costs: flat });
+    let planner = planned(Device { target: sm86(), costs: flat });
     let sms = planner.sms();
     let run = |blocks| Run {
         blocks,
@@ -236,7 +249,7 @@ fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize) {
     };
     let one = GemmCfg { stages: 1, ..two };
     let cost = |trip_one: f64, cfg: &GemmCfg| {
-        let planner = Planner::new(Device { target: target.clone(), costs: Costs { trip_one, ..costs() } });
+        let planner = planned(Device { target: target.clone(), costs: Costs { trip_one, ..costs() } });
         problem.admit(&planner, cfg).expect("admitted").0
     };
     let c = costs();
@@ -251,7 +264,7 @@ fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize) {
 #[test_case(4; "four")]
 fn a_trip_overhead_is_shared_by_resident_blocks(resident: usize) {
     let flat = Costs { latency: 0.0, ..costs() };
-    let planner = Planner::new(Device { target: sm86(), costs: flat });
+    let planner = planned(Device { target: sm86(), costs: flat });
     let blocks = resident * planner.sms();
     let smem = sm86().smem_bytes / resident;
     let run = |work, trip| Run {
@@ -282,7 +295,7 @@ fn a_lone_wave_pays_its_chain() {
     let flat = |step_lone| Costs { latency: 0.0, step: 5.0, step_lone, ..costs() };
     let waves = sm86().occupancy.simds as usize;
     let cost = |step_lone, resident, work, fill| {
-        let planner = Planner::new(Device { target: sm86(), costs: flat(step_lone) });
+        let planner = planned(Device { target: sm86(), costs: flat(step_lone) });
         let (blocks, smem) = (resident * planner.sms(), sm86().smem_bytes / resident);
         let run =
             Run { blocks, smem, regs: 0, waves, atoms: 1, trips: 1, reads: 0.0, work, fill, trip: 0.0, stages: 2 };
@@ -302,7 +315,7 @@ fn a_lone_wave_pays_its_chain() {
 #[test]
 fn independent_accumulators_hide_the_chain() {
     let flat = Costs { latency: 0.0, step: 5.0, step_lone: 15.0, ..costs() };
-    let planner = Planner::new(Device { target: sm86(), costs: flat });
+    let planner = planned(Device { target: sm86(), costs: flat });
     let (waves, smem) = (sm86().occupancy.simds as usize, sm86().smem_bytes);
     let cost = |atoms, work, reads| {
         let blocks = planner.sms();
@@ -323,7 +336,7 @@ fn independent_accumulators_hide_the_chain() {
 #[test]
 fn pipes_overlap_across_the_waves_a_simd_holds() {
     let flat = Costs { latency: 0.0, step_lone: costs().step, ..costs() };
-    let planner = Planner::new(Device { target: sm86(), costs: flat });
+    let planner = planned(Device { target: sm86(), costs: flat });
     let simds = sm86().occupancy.simds as usize;
     let cost = |resident: usize, waves: usize| {
         let (blocks, smem) = (resident * planner.sms(), sm86().smem_bytes / resident);
@@ -370,7 +383,7 @@ fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
         |warps| GemmCfg { core: Core::Warp, tile: [64, 64, 32], stages: 3, warps, group_m: 8, unroll: false, crews: 1 };
     let p = config::Problem { batches: 1, m: 64 * 28, n: 64 * 28, k: 4096, halves: 1 };
     let ratio = |step_lone| {
-        let planner = Planner::new(Device { target: sm86(), costs: Costs { step_lone, ..costs() } });
+        let planner = planned(Device { target: sm86(), costs: Costs { step_lone, ..costs() } });
         let cost = |c| p.admit(&planner, &c).expect("admitted").0;
         cost(cfg([1, 1])) / cost(cfg([2, 2]))
     };
@@ -389,7 +402,7 @@ fn an_attention_fill_is_priced_by_where_it_comes_from() {
     let unique = (a.tiles * a.tk * a.d * 4) as f64;
     let cost = |l2_bytes| {
         let c = Costs { global_byte: 0.08, l2_byte: 0.01, l2_bytes, ..costs() };
-        let planner = Planner::new(Device { target: sm86(), costs: c });
+        let planner = planned(Device { target: sm86(), costs: c });
         a.admit(&planner, &FaCfg::new(64, 64, 3)).expect("admitted").0
     };
     let (dram, cached, small) = (cost(0.0), cost(4.0 * unique), cost(unique / 4.0));
@@ -405,7 +418,7 @@ fn a_fill_is_priced_by_where_its_bytes_come_from() {
     let mb = (1 << 20) as f64;
     let with = |l2_bytes| {
         let c = Costs { global_byte: 0.08, l2_byte: 0.01, l2_bytes, ..costs() };
-        Planner::new(Device { target: sm86(), costs: c })
+        planned(Device { target: sm86(), costs: c })
     };
     let (none, cached) = (with(0.0), with(4.0 * mb));
     assert_eq!(none.fill_byte(mb, 100.0 * mb, 0.0), 0.08);
@@ -428,13 +441,13 @@ fn a_fill_is_priced_by_where_its_bytes_come_from() {
 fn blocks_in_flight_share_their_lines_past_the_cache() {
     let mb = (1 << 20) as f64;
     let c = Costs { global_byte: 0.08, l2_byte: 0.01, l2_bytes: 4.0 * mb, ..costs() };
-    let planner = Planner::new(Device { target: sm86(), costs: c });
+    let planner = planned(Device { target: sm86(), costs: c });
     assert_eq!(planner.fill_byte(100.0 * mb, 1e4 * mb, 0.0), 0.08);
     assert!((planner.fill_byte(100.0 * mb, 1e4 * mb, 0.75) - (0.75 * 0.01 + 0.25 * 0.08)).abs() < 1e-12);
     assert_eq!(planner.fill_byte(mb, 100.0 * mb, 0.5), planner.fill_byte(mb, 100.0 * mb, 0.0));
     let p = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
-    let dram = Planner::new(Device { target: sm86(), costs: Costs { l2_bytes: 0.0, ..c } });
+    let dram = planned(Device { target: sm86(), costs: Costs { l2_bytes: 0.0, ..c } });
     let (cached, at_dram) = (p.admit(&planner, &cfg).unwrap().0, p.admit(&dram, &cfg).unwrap().0);
     assert!(cached < 0.75 * at_dram, "{cached} cached, {at_dram} from DRAM");
 }
@@ -519,7 +532,7 @@ fn under_latency_resident_blocks_halve_the_cost() {
     let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
     let full = sm86();
     let starved = Target { occupancy: crate::atoms::Occupancy { waves: 2, ..full.occupancy }, ..sm86() };
-    let cost = |target: Target| p.admit(&Planner::new(Device { target, costs: slow }), &cfg).expect("admitted").0;
+    let cost = |target: Target| p.admit(&planned(Device { target, costs: slow }), &cfg).expect("admitted").0;
     let (starved, full) = (cost(starved), cost(full));
     assert!((starved / full - 2.0).abs() < 1e-3, "{starved} starved, {full} full");
     assert!(pipelined(slow, [1, 1, 1, 4, 3], 1.0) < pipelined(slow, [1, 1, 1, 4, 2], 1.0));
@@ -854,7 +867,7 @@ fn a_bias_rides_its_own_ring_slot(target: Target) {
 #[test]
 fn a_planner_over_a_zero_field_still_ranks() {
     let measured = crate::probe::Measured { costs: Costs { step: 0.0, ..costs() }, unmeasured: vec!["step"] };
-    let planner = Planner::measured(sm86(), measured);
+    let planner = Planner::measured(sm86(), measured).expect("an SM count");
     assert_eq!(planner.unmeasured, ["step"]);
     let p = config::Problem { batches: 1, m: 704, n: 1536, k: 512, halves: 1 };
     let ranked = p.ranked(&planner);
@@ -867,7 +880,7 @@ fn a_planner_over_a_zero_field_still_ranks() {
 /// registers first) but finite, and still lists what lowers.
 #[test]
 fn a_ranking_at_zero_costs_is_finite() {
-    let planner = Planner::new(Device { target: sm86(), costs: Costs::default() });
+    let planner = planned(Device { target: sm86(), costs: Costs::default() });
     let p = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     let ranked = p.ranked(&planner);
     assert!(!ranked.is_empty());
@@ -1098,7 +1111,7 @@ fn gfx1151() -> Target {
 #[test_case(128, false, &[(64, 16), (128, 16)]; "d 128")]
 #[test_case(128, true, &[(64, 16), (128, 16)]; "d 128 causal")]
 fn gfx1151_attention_shortlists_hold_the_measured_tiles(d: usize, causal: bool, measured: &[(usize, usize)]) {
-    let planner = Planner::new(Device { target: gfx1151(), costs: super::gfx1151_costs() });
+    let planner = planned(Device { target: gfx1151(), costs: super::gfx1151_costs() });
     let list = first_eight(&planner.attention_ranked(32, 2048, 2048, d, causal, false));
     let tiles: Vec<(usize, usize)> = list.iter().map(|c| (c.bq, c.bkv)).collect();
     assert!(measured.iter().any(|m| tiles.contains(m)), "{measured:?} not in {tiles:?}");
@@ -1109,7 +1122,7 @@ fn gfx1151_attention_shortlists_hold_the_measured_tiles(d: usize, causal: bool, 
 /// at 1–3 TFLOP/s, before a round was bound by one wave's issue).
 #[test]
 fn gfx1151_gemm_ranking_leads_with_full_blocks() {
-    let planner = Planner::new(Device { target: gfx1151(), costs: super::gfx1151_costs() });
+    let planner = planned(Device { target: gfx1151(), costs: super::gfx1151_costs() });
     let list = first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, false));
     let simds = planner.device.target.occupancy.simds;
     assert!(list.iter().all(|c| c.warps[0] * c.warps[1] >= simds), "{list:?}");
@@ -1134,7 +1147,7 @@ fn a_named_split_count_is_honoured(splits: Option<usize>, tk: usize, want: &[(us
 /// the two splits, whichever config leads.
 #[test]
 fn a_decoder_steps_ranking_keeps_its_named_splits() {
-    let planner = Planner::new(Device { target: gfx1151(), costs: super::gfx1151_costs() });
+    let planner = planned(Device { target: gfx1151(), costs: super::gfx1151_costs() });
     let ranked = planner.attention_ranked(5 * 16, 16, 128, 48, false, false);
     let split = split_ranked(&ranked, Some(2), 128);
     assert!(!split.is_empty() && split.iter().all(|c| c.splits == 2 && 128usize.div_ceil(c.bkv) >= 2), "{split:?}");
@@ -1551,5 +1564,5 @@ fn the_warpgroup_core_is_a_tile_of_its_own() {
 }
 
 fn gfx1151_planner() -> Planner {
-    Planner::new(Device { target: super::targets::amd(AmdArch::Gfx1151, 40), costs: super::gfx1151_costs() })
+    planned(Device { target: super::targets::amd(AmdArch::Gfx1151, 40), costs: super::gfx1151_costs() })
 }

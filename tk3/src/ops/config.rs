@@ -620,6 +620,8 @@ fn judged<C: Tiled>(
 #[derive(Debug)]
 pub struct Planner {
     pub device: Device,
+    /// The device's SM count.
+    sms: usize,
     /// The cost fields the device's probes could not measure, ranked at
     /// zero ([`crate::probe::Measured`]); empty for a device that measured.
     pub unmeasured: Vec<&'static str>,
@@ -637,19 +639,28 @@ fn cached<K: std::hash::Hash + Eq + Clone, V>(
 }
 
 impl Planner {
-    pub fn new(device: Device) -> Self {
-        Self { device, unmeasured: vec![], ranked: papaya::HashMap::new(), attention: papaya::HashMap::new() }
+    /// A planner of `device`; `None` where its target reports no SM count,
+    /// which every ranking scales by.
+    pub fn new(device: Device) -> Option<Self> {
+        let sms = device.target.sms? as usize;
+        Some(Self {
+            device,
+            sms,
+            unmeasured: vec![],
+            ranked: papaya::HashMap::new(),
+            attention: papaya::HashMap::new(),
+        })
     }
 
-    /// A planner over what the device's probes measured.
-    pub fn measured(target: Target, measured: crate::probe::Measured) -> Self {
+    /// A planner over what the device's probes measured, as [`Self::new`].
+    pub fn measured(target: Target, measured: crate::probe::Measured) -> Option<Self> {
         let crate::probe::Measured { costs, unmeasured } = measured;
-        Self { unmeasured, ..Self::new(Device { target, costs }) }
+        Some(Self { unmeasured, ..Self::new(Device { target, costs })? })
     }
 
-    /// The device's SM count: a planned target reports one.
+    /// The device's SM count.
     pub fn sms(&self) -> usize {
-        self.device.target.sms.expect("a planned target reports its SM count") as usize
+        self.sms
     }
 
     /// The SM time of `run`. The busiest SM issues the work of

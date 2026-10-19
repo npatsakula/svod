@@ -216,5 +216,5 @@ pub(crate) fn declared(target: Target) -> Device {
 
 /// The planner of `target` under the declared [`costs`].
 pub(crate) fn planner(target: Target) -> Planner {
-    Planner::new(declared(target))
+    Planner::new(declared(target)).expect("a target with an SM count")
 }
