@@ -12,7 +12,7 @@ use crate::build::BF16;
 use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::kernels::{Act, Batch};
-use crate::ops::config::{Attention, DIAGONAL, Problem};
+use crate::ops::config::{Attention, DIAGONAL, Planner, Problem};
 use crate::tune::{Bench, Candidate, Compiled};
 
 /// Each of `ranked` compiled (in ranked batches, as the tuner admits), then
@@ -52,18 +52,13 @@ fn report<C: std::fmt::Debug>(
     eprintln!("pick|{label}|{}|{pick:?}", show(&ns[ranked.len()]));
 }
 
-#[test]
-#[ignore = "perf probe: needs a GPU"]
-fn cost_model_probe() {
-    let Some(planner) = super::device_planner() else { return };
-    eprintln!("costs|{:?}|unmeasured {:?}", planner.device.costs, planner.unmeasured);
+/// The GEMM shapes: `(label, m, n, k, epilogue)`.
+fn gemm_shapes() -> Vec<(&'static str, usize, usize, usize, Epilogue)> {
     let plain = Epilogue::default();
     let gelu = Epilogue { act: Act::Gelu, ..plain };
     let residual = Epilogue { residual: true, ..plain };
     let swiglu = Epilogue { act: Act::Silu, gated: true, ..plain };
-    let only = std::env::var("COST_MODEL_ONLY").ok();
-    let wanted = |label: &str| only.as_deref().is_none_or(|o| o.split(',').any(|w| w == label));
-    for (label, m, n, k, epilogue) in [
+    vec![
         ("gemm4096", 4096, 4096, 4096, plain),
         ("nemotron_qkv", 704, 1536, 512, plain),
         ("nemotron_ff1", 704, 2048, 512, gelu),
@@ -73,39 +68,106 @@ fn cost_model_probe() {
         ("qwen3_down", 3072, 1024, 3072, residual),
         ("whisper_fc1", 1500, 5120, 1280, gelu),
         ("whisper_fc2", 1500, 1280, 5120, residual),
-    ] {
-        if !wanted(label) {
-            continue;
-        }
+    ]
+}
+
+/// The attention shapes: `(label, batch, heads, t, d, causal)`.
+const ATTENTION_SHAPES: [(&str, usize, usize, usize, usize, bool); 6] = [
+    ("fa_d64", 4, 8, 2048, 64, false),
+    ("fa_d64_causal", 4, 8, 2048, 64, true),
+    ("fa_d128", 4, 8, 2048, 128, false),
+    ("fa_d128_causal", 4, 8, 2048, 128, true),
+    ("whisper_enc_attn", 1, 20, 1500, 64, false),
+    ("qwen3_attn", 8, 16, 384, 128, true),
+];
+
+/// Whether `COST_MODEL_ONLY` (comma-separated labels) selects `label`; all
+/// do without it.
+fn wanted(label: &str) -> bool {
+    std::env::var("COST_MODEL_ONLY").ok().is_none_or(|o| o.split(',').any(|w| w == label))
+}
+
+/// A shape's ranking: its label, its configs in ranked order, and the ns
+/// the model ranks each at.
+type Ranking<C> = (&'static str, Vec<C>, Vec<f64>);
+
+/// Every shape's ranking under `planner`, GEMMs then attention.
+fn rankings(planner: &Planner) -> (Vec<Ranking<GemmCfg>>, Vec<Ranking<FaCfg>>) {
+    let gemms = gemm_shapes()
+        .into_iter()
+        .filter(|s| wanted(s.0))
+        .map(|(label, m, n, k, epilogue)| {
+            let p = Problem { batches: 1, m, n, k, halves: if epilogue.gated { 2 } else { 1 } };
+            let ranked: Vec<GemmCfg> = planner.gemm_ranked(1, m, n, k, epilogue.gated).to_vec();
+            let ns = ranked.iter().map(|c| p.admit(planner, c).expect("ranked").0).collect();
+            (label, ranked, ns)
+        })
+        .collect();
+    let attention = ATTENTION_SHAPES
+        .into_iter()
+        .filter(|s| wanted(s.0))
+        .map(|(label, batch, heads, t, d, causal)| {
+            let p = Attention { tiles: batch * heads, t, tk: t, d, causal, bias: false };
+            let ranked: Vec<FaCfg> = planner.attention_ranked(batch * heads, t, t, d, causal, false).to_vec();
+            let ns = ranked.iter().map(|c| p.admit(planner, c).expect("ranked").0).collect();
+            (label, ranked, ns)
+        })
+        .collect();
+    (gemms, attention)
+}
+
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn cost_model_probe() {
+    let Some(planner) = super::device_planner() else { return };
+    eprintln!("costs|{:?}|unmeasured {:?}", planner.device.costs, planner.unmeasured);
+    let (gemms, attentions) = rankings(&planner);
+    for ((label, m, n, k, epilogue), (_, ranked, predicted)) in
+        gemm_shapes().into_iter().filter(|s| wanted(s.0)).zip(gemms)
+    {
         let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: super::device::BIG };
-        let p = Problem { batches: 1, m, n, k, halves: if epilogue.gated { 2 } else { 1 } };
-        let ranked: Vec<GemmCfg> = planner.gemm_ranked(1, m, n, k, epilogue.gated).to_vec();
-        let predicted: Vec<f64> = ranked.iter().map(|c| p.admit(&planner, c).expect("ranked").0).collect();
         let pick = super::device::device_gemms(&planner, &spec).1;
         let build = |cfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
         let (verdicts, ns) = timed(&ranked, &[pick], build);
         report(label, &ranked, &predicted, &verdicts, &ns, &pick);
     }
-    for (label, batch, heads, t, d, causal) in [
-        ("fa_d64", 4, 8, 2048, 64, false),
-        ("fa_d64_causal", 4, 8, 2048, 64, true),
-        ("fa_d128", 4, 8, 2048, 128, false),
-        ("fa_d128_causal", 4, 8, 2048, 128, true),
-        ("whisper_enc_attn", 1, 20, 1500, 64, false),
-        ("qwen3_attn", 8, 16, 384, 128, true),
-    ] {
-        if !wanted(label) {
-            continue;
-        }
+    for ((label, batch, heads, t, d, causal), (_, ranked, predicted)) in
+        ATTENTION_SHAPES.into_iter().filter(|s| wanted(s.0)).zip(attentions)
+    {
         let mask = AttnMask { causal, ..AttnMask::default() };
         let spec = super::attention::probe_spec(batch, heads, t, t, d, mask);
-        let p = Attention { tiles: batch * heads, t, tk: t, d, causal, bias: false };
-        let ranked: Vec<FaCfg> = planner.attention_ranked(batch * heads, t, t, d, causal, false).to_vec();
-        let predicted: Vec<f64> = ranked.iter().map(|c| p.admit(&planner, c).expect("ranked").0).collect();
         let pick = super::attention::device_attention(&planner, &spec).2;
         let build = |cfg| vec![(attention::<BF16>(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
         let (verdicts, ns) = timed(&ranked, &[pick], build);
         report(label, &ranked, &predicted, &verdicts, &ns, &pick);
+    }
+}
+
+/// [`cost_model_probe`]'s rankings on the host for a card (`COST_MODEL_CARD`,
+/// a name of [`crate::atoms::CARDS`]) under the costs its device stored
+/// (`COST_MODEL_STORE`, a tune store directory): one `fit|label|rank|-|ns|-|cfg`
+/// line a config, which a probe's log of the same card times; a model
+/// changed since prices the configs it timed without the device.
+#[test]
+#[ignore = "replays a card's store: needs COST_MODEL_CARD and COST_MODEL_STORE"]
+fn cost_model_replay() {
+    let card = std::env::var("COST_MODEL_CARD").expect("COST_MODEL_CARD");
+    let store = std::env::var("COST_MODEL_STORE").expect("COST_MODEL_STORE");
+    let target = crate::atoms::Target::card(&card).expect("a listed card");
+    let measured = crate::probe::stored(std::path::Path::new(&store), &target).expect("the card's store file");
+    let planner = Planner::measured(target, measured).expect("an SM count");
+    eprintln!("costs|{:?}|unmeasured {:?}", planner.device.costs, planner.unmeasured);
+    let (gemms, attentions) = rankings(&planner);
+    let print = |label: &str, ranked: Vec<String>, ns: Vec<f64>| {
+        for (rank, (c, ns)) in ranked.iter().zip(ns).enumerate() {
+            eprintln!("fit|{label}|{rank}|-|{ns:.1}|-|{c}");
+        }
+    };
+    for (label, ranked, ns) in gemms {
+        print(label, ranked.iter().map(|c| format!("{c:?}")).collect(), ns);
+    }
+    for (label, ranked, ns) in attentions {
+        print(label, ranked.iter().map(|c| format!("{c:?}")).collect(), ns);
     }
 }
 
