@@ -190,6 +190,16 @@ impl Frame<'_> {
                 self.block_run(body)?;
                 self.warp = saved;
             }
+            // The warps run one after another: what one leaves in shared
+            // memory the next sees, as the real ones do after the block fence.
+            Stmt::Warps { body } => {
+                let saved = self.warp;
+                for warp in 0..i64::from(self.prog.warps) {
+                    self.warp = warp;
+                    self.block_run(body)?;
+                }
+                self.warp = saved;
+            }
             Stmt::If { pred, then, otherwise } => {
                 let branch = if self.must(*pred) != 0 { then } else { otherwise };
                 self.block_run(branch)?;

@@ -84,6 +84,13 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
     let lens = AttnMask { key_lens: true, ..AttnMask::default() };
     let spec = fa(1, 150, 64, lens, Some(cache), Batch::Var { name: "b".into(), min: 1, max: 3 }).expect("d 64 plans");
     push("attention d64 cache", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
+    let cfg = crate::kernels::attention::FaCfg {
+        key_warps: 4,
+        splits: 2,
+        ..crate::kernels::attention::FaCfg::new(16, 16, 2)
+    };
+    let spec = AttnSpec { cfg, ..spec };
+    push("attention d64 cache key warps", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
     let merge = CombineSpec { batch: spec.batch.clone(), t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: 4 } };
     push("attention combine", combine::<F16>(&merge), merge.cfg.lowering(&planner.device));
 
@@ -577,7 +584,7 @@ fn tile_ops_in_order(block: &crate::ir::Block) -> Vec<crate::ir::TileOp> {
                 out.extend(tile_ops_in_order(&p.produce.body));
                 out.extend(tile_ops_in_order(&p.consume.body));
             }
-            Stmt::Role { body, .. } => out.extend(tile_ops_in_order(body)),
+            Stmt::Role { body, .. } | Stmt::Warps { body } => out.extend(tile_ops_in_order(body)),
             Stmt::If { then, otherwise, .. } => {
                 out.extend(tile_ops_in_order(then));
                 out.extend(tile_ops_in_order(otherwise));
@@ -598,7 +605,7 @@ fn tile_ops(block: &crate::ir::Block, f: &dyn Fn(&crate::ir::TileOp) -> bool) ->
             Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
             Stmt::Loop(l) => tile_ops(&l.body, f),
             Stmt::Pipeline(p) => tile_ops(&p.produce.body, f) + tile_ops(&p.consume.body, f),
-            Stmt::Role { body, .. } => tile_ops(body, f),
+            Stmt::Role { body, .. } | Stmt::Warps { body } => tile_ops(body, f),
             Stmt::If { then, otherwise, .. } => tile_ops(then, f) + tile_ops(otherwise, f),
         })
         .sum()
@@ -660,7 +667,7 @@ fn fences(block: &crate::ir::Block) -> usize {
             Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
             Stmt::Loop(l) => fences(&l.body),
             Stmt::Pipeline(p) => fences(&p.produce.body) + fences(&p.consume.body),
-            Stmt::Role { body, .. } => fences(body),
+            Stmt::Role { body, .. } | Stmt::Warps { body } => fences(body),
             Stmt::If { then, otherwise, .. } => fences(then) + fences(otherwise),
         })
         .sum()
@@ -697,7 +704,7 @@ fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
             Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
             Stmt::Loop(l) => tile_relayouts(prog, &l.body),
             Stmt::Pipeline(p) => tile_relayouts(prog, &p.produce.body) + tile_relayouts(prog, &p.consume.body),
-            Stmt::Role { body, .. } => tile_relayouts(prog, body),
+            Stmt::Role { body, .. } | Stmt::Warps { body } => tile_relayouts(prog, body),
             Stmt::If { then, otherwise, .. } => tile_relayouts(prog, then) + tile_relayouts(prog, otherwise),
         })
         .sum()

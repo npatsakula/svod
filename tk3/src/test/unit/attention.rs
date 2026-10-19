@@ -290,6 +290,12 @@ const RAW_MAX: FaCfg = FaCfg {
     ..FaCfg::new(64, 32, 2)
 };
 
+/// One row warp of queries sharing its block with `kw` key warps, `bkv` keys
+/// a block, under the plain forms.
+const fn key_warps(kw: usize, bkv: usize) -> FaCfg {
+    FaCfg { key_warps: kw, ..FaCfg::new(16, bkv, 2) }
+}
+
 /// A scale of the caller's choosing, in place of `1/√d`.
 fn scaled(mut spec: AttnSpec, scale: f32) -> AttnSpec {
     spec.scale = scale;
@@ -325,6 +331,12 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(with(RAW_MAX, scaled(spec(128, 128, 64, 64, 32, true, true), 0.3)), &[128, 50]; "the maximum in raw units, a larger scale")]
 #[test_case(with(RAW_MAX, scaled(spec(128, 128, 64, 64, 32, true, true), -0.1)), &[128, 50]; "a negative scale keeps the maximum in the exponent's units")]
 #[test_case(with(RAW_MAX, masked(128, 128, 64, 64, 32, EVERY_BIAS)), &[128, 100]; "a bias keeps the maximum in the exponent's units")]
+#[test_case(with(key_warps(4, 16), spec(16, 200, 64, 16, 16, false, true)), &[200, 70]; "four key warps, key lengths")]
+#[test_case(with(key_warps(2, 32), spec(16, 200, 64, 16, 16, true, true)), &[200, 70]; "two key warps, causal with lengths")]
+#[test_case(with(key_warps(4, 16), spec(16, 48, 64, 16, 16, false, false)), &[48, 48]; "four key warps over three key blocks")]
+#[test_case(with(key_warps(4, 16), spec(16, 16, 64, 16, 16, false, true)), &[16, 0]; "four key warps, a lane with no keys")]
+#[test_case(with(FaCfg { forms: RAW_MAX.forms, ..key_warps(4, 16) }, spec(16, 200, 128, 16, 16, false, true)), &[200, 130]; "four key warps, d 128, the RDNA prefill forms")]
+#[test_case(with(key_warps(4, 16), masked(16, 128, 64, 16, 16, PER_BATCH)), &[128, 128]; "four key warps, bias per batch")]
 fn program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     matches_a_direct_softmax(&case(spec, lens));
 }
@@ -403,6 +415,11 @@ fn counted(mut spec: AttnSpec) -> AttnSpec {
 #[test_case(scaled(cached(1, 200, [4, 4, 64], true, 1, 4), -0.1), &[200, 70]; "four splits merge a negative scale's partial maxima")]
 #[test_case(with(RAW_MAX, cached(1, 200, [4, 4, 64], true, 1, 4)), &[200, 70]; "four splits merge raw partial maxima in the exponent's units")]
 #[test_case(with(RAW_MAX, biased(cached(5, 96, [2, 2, 128], false, 1, 2))), &[64, 96]; "biased, two splits: the maximum stays in the exponent's units")]
+#[test_case(with(key_warps(4, 16), cached(1, 200, [4, 2, 64], true, 1, 1)), &[200, 37]; "four key warps: row map, appended, gqa")]
+#[test_case(with(FaCfg { splits: 3, ..key_warps(2, 32) }, cached(1, 200, [4, 4, 64], true, 1, 1)), &[200, 70]; "two key warps under three splits")]
+#[test_case(with(key_warps(4, 16), counted(cached(16, 128, [2, 2, 64], true, 16, 1))), &[128, 0]; "four key warps, sixteen counted appended rows")]
+#[test_case(with(key_warps(2, 64), cached(1, 7, [6, 6, 64], false, 1, 1)), &[0, 7]; "two key warps, the appended row only")]
+#[test_case(with(key_warps(4, 16), biased(cached(5, 96, [2, 2, 128], false, 1, 1))), &[64, 96]; "four key warps, biased, d 128")]
 fn cached_program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     program_matches_a_direct_softmax(spec, lens);
 }
