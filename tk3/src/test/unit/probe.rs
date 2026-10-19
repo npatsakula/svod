@@ -118,19 +118,20 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
 
 /// A probe that fails leaves its field at zero and names itself; every
 /// other field is what its probe measured, and a primitive the target
-/// lacks (sm_86 has no warpgroup core) costs zero without being unmeasured.
+/// lacks (sm_86 has no warpgroup core, and prices no rolled ring apart
+/// under `cp.async` fills) costs zero without being unmeasured.
 #[test]
 fn an_unmeasured_field_leaves_its_default() {
     let target = sm86();
     let measured = crate::probe::assemble(&target, probes(&target), |p| match p.op {
         "probe:step" => Err(crate::probe::Error::Unmeasured { probe: p.op, last: "no stamps".into() }),
-        "probe:step_group" => unreachable!("an absent primitive is not measured"),
+        "probe:step_group" | "probe:trip_rolled" => unreachable!("an absent primitive is not measured"),
         _ => Ok(1.5),
     });
     assert_eq!(measured.unmeasured, ["step"]);
     let mut costs = measured.costs;
     for (name, value) in costs.fields() {
-        assert_eq!(*value, if ["step", "step_group"].contains(&name) { 0.0 } else { 1.5 }, "{name}");
+        assert_eq!(*value, if ["step", "step_group", "trip_rolled"].contains(&name) { 0.0 } else { 1.5 }, "{name}");
     }
 }
 
@@ -232,7 +233,12 @@ fn units_count_the_primitive(target: Target) {
     for p in &probes {
         let field = p.op.strip_prefix("probe:").expect("a probe op");
         if p.candidates.is_empty() {
-            assert!(field == "step_group" && target.group_mma.is_empty(), "{}: an absent primitive", p.op);
+            let absent = match field {
+                "step_group" => target.group_mma.is_empty(),
+                "trip_rolled" => target.fill == Fill::CpAsync,
+                _ => false,
+            };
+            assert!(absent, "{}: an absent primitive", p.op);
             continue;
         }
         let (_, probe) = pair(p);
@@ -244,7 +250,7 @@ fn units_count_the_primitive(target: Target) {
         }
     }
     assert_eq!(find(&probes, "global_byte").units, STREAM as f64, "the stream is read once");
-    let [trip, rolled] = ["trip", "trip_rolled"].map(|f| find(&probes, f));
+    let [trip, rolled, one] = ["trip", "trip_rolled", "trip_one"].map(|f| find(&probes, f));
     let unroll = |p: &Probe| -> Vec<bool> {
         p.candidates
             .iter()
@@ -254,14 +260,18 @@ fn units_count_the_primitive(target: Target) {
             })
             .collect()
     };
-    assert_eq!((unroll(trip), unroll(rolled)), (vec![true; 2], vec![false; 2]), "the ring unrolled, then rolled");
-    assert_eq!(pair(trip), pair(rolled), "the same programs");
+    assert_eq!(unroll(trip), vec![true; 2], "the ring unrolled");
+    // A rolled ring is priced apart only where the fill goes through registers.
+    let rolled = (target.fill == Fill::Staged).then_some(rolled);
+    if let Some(rolled) = rolled {
+        assert_eq!(unroll(rolled), vec![false; 2], "then rolled");
+        assert_eq!(pair(trip), pair(rolled), "the same programs");
+    }
     // The one-slot trip: the ring one slot deep, rolled, against a baseline
     // reading its fragments from a ring as deep.
-    let one = find(&probes, "trip_one");
     assert_eq!(unroll(one), vec![false; 2], "a one-slot ring has nothing to unroll");
     let ring = |p: &Program| p.smem.iter().map(|a| a.elems).collect::<Vec<_>>();
-    for p in [trip, rolled, one] {
+    for p in [Some(trip), rolled, Some(one)].into_iter().flatten() {
         let (base, probe) = pair(p);
         assert_eq!(ring(base), ring(probe), "{}: the baseline reads a ring as deep as the probe's", p.op);
     }
@@ -451,11 +461,10 @@ fn device_costs_are_physical() {
     // less than it, within what the trip pairs resolve: each pair's
     // run-to-run spread, per unit, timed again here. A one-slot ring is priced
     // on every target; a rolled one only where fills are register-staged
-    // (`Costs::trip`): on `cp.async` targets the planner never reads
-    // `trip_rolled`, and there the two rings differ by less than one
-    // process's measurement differs from the next (sm_86 over four fresh
-    // stores: trip 1.74–2.38 ns, rolled 1.86–2.48, each within 0.1 of its
-    // own re-timing), so their order is noise the ranking never sees.
+    // (`Costs::trip`): on `cp.async` targets the two rings differ by less
+    // than one process's measurement differs from the next (sm_86 over four
+    // fresh stores: trip 1.74–2.38 ns, rolled 1.86–2.48, each within 0.1 of
+    // its own re-timing), so no probe measures the rolled one there.
     let probes = probes(&target);
     let spread = |field: &str| {
         let p = find(&probes, field);
@@ -463,9 +472,11 @@ fn device_costs_are_physical() {
         let r = probe::resolved(&probe::resolve_pairs(&mut built)).unwrap_or_else(|| panic!("{field}: not resolved"));
         r.spread * p.scale / p.units
     };
-    let (trip, rolled, one) = (spread("trip"), spread("trip_rolled"), spread("trip_one"));
-    eprintln!("spreads per unit: trip {trip:.3}, trip_rolled {rolled:.3}, trip_one {one:.3}");
+    let (trip, one) = (spread("trip"), spread("trip_one"));
+    eprintln!("spreads per unit: trip {trip:.3}, trip_one {one:.3}");
     if target.fill == Fill::Staged {
+        let rolled = spread("trip_rolled");
+        eprintln!("trip_rolled {rolled:.3}");
         assert!(c.trip_rolled >= 0.9 * c.trip - (trip + rolled), "{c:?}");
     }
     assert!(c.trip_one >= 0.9 * c.trip - (trip + one), "{c:?}");
@@ -506,7 +517,7 @@ fn probe_signals_are_strong() {
 /// each chunk as the fill loads it (the register half of a fill), from a
 /// region per SM, and reads a fragment back from shared memory as the ring's
 /// consume does; on a target filling through `cp.async.cg` that load stays
-/// out of L1 as the copy does.
+/// out of L1 as the copy does (and no rolled ring is probed).
 #[test_case(sm86(), true; "sm86")]
 #[test_case(hopper(), true; "sm90")]
 #[test_case(gfx1151(), false; "gfx1151")]
@@ -514,6 +525,10 @@ fn trip_baselines_load_as_the_fill_loads(target: Target, l2_only: bool) {
     let probes = probes(&target);
     for field in ["trip", "trip_rolled", "trip_one"] {
         let p = find(&probes, field);
+        if field == "trip_rolled" && l2_only {
+            assert!(p.candidates.is_empty(), "no rolled ring under cp.async");
+            continue;
+        }
         assert_eq!(p.signal, probe::Signal::Resolved, "{field}: a trip rides on the bytes it moves");
         let (base, probe) = pair(p);
         let loads: Vec<CopyMode> = base

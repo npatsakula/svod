@@ -276,7 +276,9 @@ pub struct Costs {
     pub score: f64,
     /// One pipeline trip's fixed overhead (barrier, ring bubble), unrolled.
     pub trip: f64,
-    /// The same for a rolled ring (slot offsets recomputed per trip).
+    /// The same for a rolled ring (slot offsets recomputed per trip),
+    /// register-staged: 0 where fills are `cp.async`, whose ring
+    /// ([`Self::trip`]) never reads it.
     pub trip_rolled: f64,
     /// The same over a ring of one slot: its commit waits behind a
     /// block-wide barrier for every warp to leave the slot and is followed
@@ -604,13 +606,14 @@ pub struct Device {
 }
 
 impl Costs {
-    /// One pipeline trip's fixed overhead over a ring `stages` deep: a ring
-    /// of one slot pays its barrier pair, a `rolled` register-staged ring of
-    /// two recomputes its slot offsets every trip.
-    pub fn trip(&self, stages: usize, rolled: bool) -> f64 {
+    /// One pipeline trip's fixed overhead over a ring `stages` deep that
+    /// `fill` fills, `unroll`ed or not: a ring of one slot pays its barrier
+    /// pair, a rolled register-staged ring of two recomputes its slot
+    /// offsets every trip; a `cp.async` ring's offsets cost alike either way.
+    pub fn trip(&self, fill: Fill, stages: usize, unroll: bool) -> f64 {
         match stages {
             ..=1 => self.trip_one,
-            _ if rolled => self.trip_rolled,
+            _ if !unroll && fill == Fill::Staged => self.trip_rolled,
             _ => self.trip,
         }
     }

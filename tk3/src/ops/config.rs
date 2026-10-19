@@ -334,7 +334,7 @@ impl Problem {
         let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
         let reads = fragments as f64 * costs.smem_byte;
         let work = steps as f64 * step;
-        let trip = costs.trip(stages, !cfg.unroll && target.fill == Fill::Staged);
+        let trip = costs.trip(target.fill, stages, cfg.unroll);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
         Ok((planner.pipelined(run), regs))
     }
@@ -989,7 +989,7 @@ impl Attention {
         let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
         let reads = fragments as f64 * costs.smem_byte;
         let work = steps as f64 * step + (kw * bq * bkv) as f64 * costs.score;
-        let trip = costs.trip(stages, !cfg.unroll && target.fill == Fill::Staged);
+        let trip = costs.trip(target.fill, stages, cfg.unroll);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
         Ok((planner.pipelined(run), regs))
     }

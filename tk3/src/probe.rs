@@ -11,7 +11,7 @@ use snafu::{OptionExt, Snafu};
 use svod_dtype::default_device::default_device;
 use svod_dtype::{GpuArch, ScalarDType};
 
-use crate::atoms::{Core, Costs, Device, Target};
+use crate::atoms::{Core, Costs, Device, Fill, Target};
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{Dim, Layout};
@@ -457,7 +457,7 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
         p.step_lone(),
         p.score(),
         p.trips("probe:trip", true, 2),
-        p.trips("probe:trip_rolled", false, 2),
+        p.rolled_trips(),
         p.trips("probe:trip_one", false, 1),
         p.lane_move(),
         p.smem_trip(),
@@ -651,6 +651,17 @@ impl<'a> Probes<'a> {
     fn step(&self) -> Probe {
         let lowering = self.lowering(WarpGrid { rows: 2, cols: 2 }, false);
         self.steps("probe:step", [64, 64, 16], self.blocks, WARPS, lowering, true)
+    }
+
+    /// [`Self::trips`] over a rolled ring of two slots, priced apart from an
+    /// unrolled one only where the fill goes through registers
+    /// ([`Costs::trip`]); no candidates elsewhere.
+    fn rolled_trips(&self) -> Probe {
+        let mut probe = self.trips("probe:trip_rolled", false, 2);
+        if self.target.fill != Fill::Staged {
+            probe.candidates.clear();
+        }
+        probe
     }
 
     /// The step issued as a warpgroup product ([`crate::atoms::GroupMmaAtom`]):

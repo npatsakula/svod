@@ -96,7 +96,10 @@ fn costs_read_from_a_copied_store() {
     let before: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| std::fs::read(e.unwrap().path()).unwrap()).collect();
     let Measured { costs, unmeasured } = probe::stored(&dir, &target).expect("the device's file");
     assert!(unmeasured.is_empty(), "{unmeasured:?}");
-    let want = |op: &str| H100.iter().find(|f| f.0 == op).expect("a probe").1 as f64 * 1e-6;
+    // A rolled ring is not probed where fills are `cp.async`: its line is passed over.
+    let want = |op: &str| {
+        if op == "trip_rolled" { 0.0 } else { H100.iter().find(|f| f.0 == op).expect("a probe").1 as f64 * 1e-6 }
+    };
     let mut costs = costs;
     for (name, value) in costs.fields() {
         assert_eq!(*value, want(name), "{name}");
