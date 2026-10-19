@@ -4,14 +4,14 @@
 //! `Wqkv: Linear(D, 3D)` (no bias), RoPE applied to Q and K, scaled
 //! dot-product attention, then `Wo: Linear(D, D)` (no bias).
 //!
-//! The fused QKV output along dim -1 is `[Q(H*hd) | K(H*hd) | V(H*hd)]`; each
-//! third becomes `(B, H, L, hd)` for RoPE + SDPA. Sliding-window local layers
-//! pass a `window`; global layers pass `None`.
+//! The fused QKV output along dim -1 is `[Q(H*hd) | K(H*hd) | V(H*hd)]`; the
+//! heads op splits it into rotated sequence-major `(B, L, H, hd)` heads.
+//! Sliding-window local layers pass a `window`; global layers pass `None`.
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
-use svod_tk3::ops;
+use svod_tk3::ops::{self, Attn, KeyMask, Qkv};
 
 use crate::init::fan_in_uniform;
 
@@ -44,7 +44,8 @@ impl ModernBertAttention {
     }
 
     /// Forward. `x`: `(B, L, D)`. Returns `residual + attn(x)`, `(B, L, D)`,
-    /// the add in `Wo`'s epilogue. `rope`: the per-layer `(cos, sin)` table.
+    /// the add in `Wo`'s epilogue. `rope`: the per-layer `(cos, sin)` table,
+    /// `(1, L, 1, hd / 2)`.
     /// `padding_mask`: optional bool `(B, L)` where `true` = real token,
     /// `false` = padding.
     pub fn forward(
@@ -54,28 +55,23 @@ impl ModernBertAttention {
         rope: &(Tensor, Tensor),
         padding_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let d = self.hidden_size;
+        let (b, l, d) = (x.dim(0)?, x.dim(1)?, self.hidden_size);
         let (cos, sin) = rope;
-
-        // Fused QKV: (B, L, 3D) → three (B, L, D) slices → (B, H, L, hd).
         let qkv = ops::linear(x, &self.qkv_weight, ops::Linear::default())?;
-        let heads = |offset: usize| -> Result<Tensor> { Ok(qkv.narrow(-1, offset, d)?.split_heads(self.num_heads)?) };
-        let q = heads(0)?.apply_rotary_emb(cos, sin, false)?;
-        let k = heads(d)?.apply_rotary_emb(cos, sin, false)?;
-        let v = heads(2 * d)?;
-
-        // SDPA, not the op layer: it takes key lengths only, no bool padding
-        // mask and no sliding window. The window restricts keys for local
-        // layers (`None` for global ones).
-        let attn = q
-            .scaled_dot_product_attention()
-            .key(&k)
-            .value(&v)
-            .maybe_key_padding_mask(padding_mask)
-            .maybe_window(self.window)
-            .call()?;
+        let split = Qkv {
+            heads: self.num_heads,
+            kv_heads: self.num_heads,
+            head_dim: self.head_dim,
+            q_norm: None,
+            k_norm: None,
+            eps: 0.0,
+            rope: Some((cos, sin)),
+        };
+        let (q, k, v) = ops::heads(&qkv, split)?;
+        let keys = padding_mask.map_or(KeyMask::None, KeyMask::Bool);
+        let attn = ops::attention(&q, &k, &v, Attn { keys, window: self.window, ..Attn::default() })?;
 
         let opts = ops::Linear { residual: Some(residual), ..Default::default() };
-        Ok(ops::linear(&attn.merge_heads()?, &self.out_weight, opts)?)
+        Ok(ops::linear(&attn.try_reshape([b, l, d.into()])?, &self.out_weight, opts)?)
     }
 }

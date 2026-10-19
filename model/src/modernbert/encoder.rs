@@ -38,8 +38,12 @@ impl Encoder {
         // Two rotary bases (global / local) → two tables. Build them once
         // before the loop and select per layer; every global layer shares one,
         // every local layer the other.
-        let global = Tensor::rope_table(self.config.global_rope_theta, seq_len, head_dim, dtype.clone())?;
-        let local = Tensor::rope_table(self.config.local_rope_theta, seq_len, head_dim, dtype)?;
+        let table = |theta: f64| -> Result<(Tensor, Tensor)> {
+            let (cos, sin) = Tensor::rope_table(theta, seq_len, head_dim, dtype.clone())?;
+            let seq_major = |t: Tensor| t.try_reshape([1, seq_len, 1, head_dim / 2]);
+            Ok((seq_major(cos)?, seq_major(sin)?))
+        };
+        let (global, local) = (table(self.config.global_rope_theta)?, table(self.config.local_rope_theta)?);
 
         let mut h = x.clone();
         for (layer_id, layer) in self.layers.iter().enumerate() {
