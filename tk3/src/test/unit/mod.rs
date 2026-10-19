@@ -13,6 +13,7 @@ mod ops_plan;
 mod parts;
 mod rows;
 mod schedule;
+mod sync;
 mod targets;
 mod tune;
 
