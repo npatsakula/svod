@@ -594,22 +594,99 @@ proptest! {
     }
 }
 
-/// A one-die target lowers the block index as the hardware's; a many-die
-/// one derives every axis from the renumbered linear position, a longer
-/// program.
+/// What a lowering derives from the block index alone, at every hardware
+/// position of its grid (in linear order, x fastest): the values of the
+/// expressions over the block index and constants that the rest of the
+/// kernel reads (addresses, guards), sorted.
+fn block_derived(prog: Program, lowering: &Lowering) -> Vec<Vec<String>> {
+    use std::collections::{HashMap, HashSet};
+    use svod_ir::ConstValue;
+    use svod_ir::uop::eval::{eval_binary_op, eval_ternary_op, eval_unary_op};
+    let root = linear(prog, lowering);
+    let nodes = root.toposort();
+    let axis = |u: &Arc<UOp>| match u.op() {
+        Op::Special(ops::Special { name, .. }) => name.strip_prefix("gidx").map(|a| a.parse::<usize>().unwrap()),
+        _ => None,
+    };
+    // Children come first: a node is pure when it is a constant, a block
+    // index, or arithmetic over pure nodes.
+    let mut pure: HashMap<u64, bool> = HashMap::new();
+    for u in &nodes {
+        let arith = matches!(u.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..));
+        let leaf = matches!(u.op(), Op::Const(_)) || axis(u).is_some();
+        let p = leaf || (arith && u.op().sources().iter().all(|s| pure[&s.id]));
+        pure.insert(u.id, p);
+    }
+    let read: HashSet<u64> = nodes
+        .iter()
+        .filter(|u| !pure[&u.id] && !Arc::ptr_eq(u, &root))
+        .flat_map(|u| u.op().sources().into_iter().map(|s| s.id))
+        .collect();
+    let derived: Vec<&Arc<UOp>> = nodes
+        .iter()
+        .filter(|u| pure[&u.id] && read.contains(&u.id) && u.toposort().iter().any(|s| axis(s).is_some()))
+        .collect();
+    fn eval(u: &Arc<UOp>, at: &dyn Fn(&Arc<UOp>) -> Option<i64>, memo: &mut HashMap<u64, ConstValue>) -> ConstValue {
+        if let Some(v) = memo.get(&u.id) {
+            return *v;
+        }
+        let mut arg = |s: &Arc<UOp>| eval(s, at, memo);
+        let v = match (at(u), u.op()) {
+            (Some(index), _) => ConstValue::Int(index),
+            (None, Op::Const(c)) => c.0,
+            (None, Op::Unary(op, x)) => eval_unary_op(*op, arg(x)).expect("a defined unary"),
+            (None, Op::Binary(op, x, y)) => eval_binary_op(*op, arg(x), arg(y)).expect("a defined binary"),
+            (None, Op::Ternary(op, x, y, z)) => {
+                let (x, y, z) = (arg(x), arg(y), arg(z));
+                eval_ternary_op(*op, x, y, z).expect("a defined ternary")
+            }
+            (None, Op::Cast(ops::Cast { src, dtype })) => arg(src).cast(dtype).expect("a defined cast"),
+            (None, other) => unreachable!("not block arithmetic: {}", other.as_ref()),
+        };
+        memo.insert(u.id, v);
+        v
+    }
+    let mut ends = [1i64; 3];
+    for u in nodes.iter().filter(|u| axis(u).is_some()) {
+        let Op::Special(ops::Special { end, .. }) = u.op() else { unreachable!() };
+        ends[axis(u).unwrap()] = eval(end, &|_| None, &mut HashMap::new()).try_int().expect("a constant grid");
+    }
+    (0..ends.iter().product::<i64>())
+        .map(|l| {
+            let hw = [l % ends[0], l / ends[0] % ends[1], l / (ends[0] * ends[1])];
+            let at = |u: &Arc<UOp>| axis(u).map(|a| hw[a]);
+            let mut memo = HashMap::new();
+            let mut values: Vec<String> = derived.iter().map(|u| format!("{:?}", eval(u, &at, &mut memo))).collect();
+            values.sort();
+            values
+        })
+        .collect()
+}
+
+/// A one-die target lowers the block index as the hardware's; on eight
+/// dies the hardware position `l` computes every block-derived value (each
+/// address and guard) the one-die kernel computes at `die_order(l)`, so
+/// the blocks a die runs are a contiguous run of the kernel's order.
 #[test]
 fn the_block_index_is_renumbered_only_over_several_dies() {
     let cfg = config::gemm_cfg([64, 64, 32], 2, [2, 2], false);
     let spec = GemmSpec { m: 192, n: 320, k: 64, batch: Batch::Static(3), epilogue: Epilogue::default(), cfg };
-    let text = |xcds: u32| {
+    let lowering = |xcds: u32| {
         let target = Target { xcds, ..amd(AmdArch::Gfx942, 304) };
-        let device = crate::atoms::Device { target, costs: super::costs() };
-        render(gemm::<BF16>(&spec), &cfg.lowering(&device))
+        cfg.lowering(&crate::atoms::Device { target, costs: super::costs() })
     };
-    let (one, eight) = (text(1), text(8));
-    assert_ne!(one, eight);
-    assert!(eight.len() > one.len());
-    assert_eq!(one, text(1), "a one-die program is deterministic");
+    let (one, eight) =
+        (block_derived(gemm::<BF16>(&spec), &lowering(1)), block_derived(gemm::<BF16>(&spec), &lowering(8)));
+    let total = one.len() as u64;
+    assert_eq!(total, 3 * 5 * 3, "the grid");
+    for l in 0..total {
+        let block = crate::lower::emit::die_order(l, total, 8);
+        assert_eq!(eight[l as usize], one[block as usize], "position {l} runs block {block}");
+    }
+    assert_ne!(eight, one, "the blocks are renumbered");
+    assert!(one.iter().all(|v| !v.is_empty()), "the block index reaches the kernel");
+    let text = || render(gemm::<BF16>(&spec), &lowering(1));
+    assert_eq!(text(), text(), "a one-die program is deterministic");
 }
 
 /// An `if`'s compare is listed with its scalar: a predicate first met inside
