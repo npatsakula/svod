@@ -111,8 +111,8 @@ Attention throughput probe (B 4, H 8, T 2048, bf16) ने tk1 के मुक�
 | d 128 | 22.3 | 22.3 |
 | d 128 causal | 20.9 | 16.5 |
 
-Decode probe एक Whisper large-v3 decoder step के attention का समय µs में मापता है। कर्नेल मॉडल के
-shapes पर चलते हैं, पर Whisper मॉडल उन्हें अभी नहीं बुलाता:
+Decode probe एक Whisper large-v3 decoder step के attention का समय µs में मापता है। Whisper का
+decoder step इन्हीं कर्नेलों को बुलाता है:
 
 | Case | tk3 | tk1 |
 |---|---|---|

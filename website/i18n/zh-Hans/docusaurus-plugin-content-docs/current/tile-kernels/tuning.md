@@ -57,10 +57,10 @@ SVOD_DEVICE=CUDA:0 cargo test -p svod-tk3 --lib --release -- --ignored --nocaptu
 
 | 探针 | 输出 |
 |---|---|
-| `gemm_throughput_probe` | tk3 GEMM 各配置在 4096³ 上与 tk1 对比的 TFLOP/s |
+| `gemm_throughput_probe` | tk3 GEMM 各配置在 4096³ 上的 TFLOP/s |
 | `gemm_candidates_probe` | Nemotron 投影形状和 4096³ 上的每个 GEMM 候选、未调优时的选择以及胜者 |
-| `attention_throughput_probe` | Flash attention（B 4、H 8、T 2048；d 64/128，因果与非因果）与 tk1 对比 |
-| `decode_throughput_probe` | 一个 Whisper large-v3 解码器步骤的自注意力和交叉注意力与 tk1 对比 |
+| `attention_throughput_probe` | Flash attention（B 4、H 8、T 2048；d 64/128，因果与非因果） |
+| `decode_throughput_probe` | 一个 Whisper large-v3 解码器步骤的自注意力和交叉注意力 |
 | `first_execution_probe` | 构建、降级和准备一个 tk3 GEMM 的主机开销，与图 GEMM 对比 |
 
 最后一个探针测得的主机开销决定了 `launch.rs` 的设计。降级一个 GEMM 主体需要 2.3 ms，因此降级后的主体按程序、降级、设备和占位符形状被记忆化缓存（命中仅需 30 µs）。在 prepare 阶段，调度一个主体仍比图 GEMM 多花约 0.35 ms。

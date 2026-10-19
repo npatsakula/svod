@@ -11,8 +11,8 @@ Svod का ऑप्टिमाइज़र किसी मॉडल के �
 `ldmatrix` fragment loads और swizzled shared layout पर टिका होता है, और ये loop search के कदम नहीं
 हैं। ऐसे कर्नेल हाथ से लिखे जाते हैं, और `svod-tk3` ("tk3") उन्हें लिखने का crate है।
 
-tk3 पुराने `svod-tk` crate (tk1) की जगह लेता है, जिसे रिटायर किया जा रहा है क्योंकि मॉडल यहाँ बताई
-गई op layer पर जा रहे हैं।
+tk3 पुराने `svod-tk` crate (tk1) का उत्तराधिकारी है। Transformer मॉडल अपने hand kernels यहाँ बताई
+गई op layer पर चलाते हैं; YOLO का convolution (एक implicit GEMM) `svod-tk` पर चलता है।
 
 ## tk3 क्या है {#what-tk3-is}
 

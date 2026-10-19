@@ -58,7 +58,5 @@ A forked kernel program for one vendor is allowed only as a bounded exception.
 | AMD CDNA: ping-pong template, MFMA 32×32, `buffer_load … lds` | Not started; to be measured on remote MI300X hardware |
 | AMD RDNA, Apple | Atoms only; no tables, no emitted kernels |
 | Warp roles, role barriers, raw asm statements | Recorded in the IR, rejected by the lowering |
-| Decode attention in models | The cache-mode kernel exists; no model uses it yet |
-| Convolution (implicit GEMM) | Not started |
+| Convolution (implicit GEMM) | Not started in tk3; the YOLO convolution runs on tk1 |
 | fp8/int8 weights, GEMV + argmax, persistent grid, attention backward | Not started |
-| Retiring tk1 | Pending the items above that models still need from it |

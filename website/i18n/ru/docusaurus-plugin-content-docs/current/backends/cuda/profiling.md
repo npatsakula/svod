@@ -118,7 +118,14 @@ SVOD_PMC: 2 of 5 requested counters are not collected on this backend
 способность, от упирающегося в выдачу инструкций.
 
 ```bash
-SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo bench -p svod-tk --bench matmul -- --profile-time 5
+SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
+```
+
+Замеры пропускной способности tk3 измеряют только ручные ядра. Они читают временные метки
+событий, а не счётчики:
+
+```bash
+SVOD_DEVICE=CUDA:0 cargo test -p svod-tk3 --release --lib gemm_throughput_probe -- --ignored --nocapture
 ```
 
 ### Привилегии
