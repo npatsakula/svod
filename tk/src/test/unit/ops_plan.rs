@@ -1266,6 +1266,91 @@ fn heads_need_three_dims() {
     assert_eq!(shape::heads(Some(&planner(sm86())), &[BF16], Some(&x), 64), Plan::Graph(Fallback::Shape));
 }
 
+// ---- nearest -----------------------------------------------------------------------
+
+/// The nearest gate: any depth (padded to the core's), 16-bit operands of
+/// one type, rows and candidates present, no more candidates than the f32
+/// index holds, rows the lane can hold; each listed config fits and holds
+/// its ring.
+#[test_case(&[1000, 5], &[2000, 5], BF16, Ok(()); "a shallow depth pads")]
+#[test_case(&[1 << 16, 64], &[1 << 16, 64], BF16, Ok(()); "a large self-join")]
+#[test_case(&[37, 130], &[1, 130], DType::Float16, Ok(()); "one candidate")]
+#[test_case(&[1000, 64], &[1000, 64], DType::Float32, Err(Fallback::Dtype); "f32 keeps the graph")]
+#[test_case(&[0, 64], &[10, 64], BF16, Err(Fallback::Shape); "no rows")]
+#[test_case(&[10, 64], &[(1 << 24) + 1, 64], BF16, Err(Fallback::Shape); "past the f32 index")]
+#[test_case(&[1000, 4096], &[1000, 4096], BF16, Err(Fallback::Config); "rows too deep to hold")]
+fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, want: Result<(), Fallback>) {
+    use crate::kernels::nearest::{Floors, Metric};
+    for target in [sm86(), gfx1201(), crate::test::unit::targets::amd(AmdArch::Gfx942, 304)] {
+        let planner = planner(target.clone());
+        let plan = shape::nearest(
+            Some(&planner),
+            &[dtype.clone(), dtype.clone()],
+            Some(&ext(x)),
+            Some(&ext(c)),
+            Metric::L2,
+            Floors::default(),
+            true,
+        );
+        match plan {
+            Plan::Kernel(list) => {
+                assert_eq!(want, Ok(()), "{list:?}");
+                let d = planner.nearest_depth(x[1]).unwrap();
+                assert!(d >= x[1] && d.is_multiple_of(16));
+                for (i, cfg) in list.iter().enumerate() {
+                    assert!(cfg.fits(&target, d) && cfg.smem_bytes(d) <= target.smem_bytes, "{cfg:?}");
+                    assert!(!list[..i].contains(cfg), "{cfg:?} twice");
+                }
+            }
+            Plan::Graph(why) => assert_eq!(Err(why), want),
+        }
+    }
+}
+
+/// A bound batch variable takes the graph: the kernel has no batch axis.
+#[test]
+fn a_batched_nearest_takes_the_graph() {
+    use crate::kernels::nearest::{Floors, Metric};
+    let x = Extent { dims: vec![100, 64], var: true };
+    let plan = shape::nearest(
+        Some(&planner(sm86())),
+        &[BF16; 2],
+        Some(&x),
+        Some(&ext(&[100, 64])),
+        Metric::SquaredL2,
+        Floors::default(),
+        false,
+    );
+    assert_eq!(plan, Plan::Graph(Fallback::Symbolic));
+}
+
+/// The cost charges every pair's epilogue beside the product: at a shallow
+/// depth the eighth of the product a 16-deep pair needs still costs more
+/// than an eighth of a 128-deep one, and every operation an option adds a
+/// pair (the row norm, a floor, the groups' compare and select) costs more.
+#[test_case(sm86(); "sm_86")]
+#[test_case(gfx1201(); "gfx1201")]
+fn the_nearest_cost_charges_every_pair(target: Target) {
+    use crate::kernels::nearest::{Floors, Metric, NearestCfg};
+    use crate::ops::config::Nearest;
+    let planner = planner(target.clone());
+    let cfg = NearestCfg::new(64, 64, 2);
+    let cost = |d, metric, floors, groups| {
+        let p = Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors, groups };
+        p.admit(&planner, &cfg).unwrap().0
+    };
+    let plain = |d| cost(d, Metric::ShiftedL2, Floors::default(), false);
+    assert!(plain(16) > plain(128) / 8.0, "{} against {}", plain(16), plain(128));
+    let both = Floors { row: true, col: true };
+    let ladder = [
+        plain(32),
+        cost(32, Metric::SquaredL2, Floors::default(), false),
+        cost(32, Metric::L2, both, false),
+        cost(32, Metric::L2, both, true),
+    ];
+    assert!(ladder.is_sorted_by(|a, b| a < b), "{ladder:?}");
+}
+
 // ---- norms -------------------------------------------------------------------------
 
 #[test_case(1024, Ok(vec![4, 8, 16]); "1024")]

@@ -21,6 +21,7 @@ use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
 use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+use crate::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
 use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch_all;
 use crate::lower::sync::insert_barriers;
@@ -537,7 +538,7 @@ fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
 
 /// Every output parameter of `prog` after launching it under `lowering` on
 /// the default device, `None` for inputs.
-fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>]) -> Vec<Option<Vec<f64>>> {
+pub(super) fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>]) -> Vec<Option<Vec<f64>>> {
     let decl = prog.params.clone();
     let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
     let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
@@ -577,7 +578,7 @@ fn check_on_device(target: &Target) {
             let bad = g
                 .iter()
                 .zip(w)
-                .position(|(g, w)| !(g.is_nan() && w.is_nan() || (g - w).abs() <= 2e-2 * w.abs().max(1.0)));
+                .position(|(g, w)| !(g == w || g.is_nan() && w.is_nan() || (g - w).abs() <= 2e-2 * w.abs().max(1.0)));
             let worst = g.iter().zip(w).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
             eprintln!("{name}: output {i} max abs diff {worst:.3e}");
             assert!(bad.is_none(), "{name}: output {i}[{}] = {} vs {}", bad.unwrap(), g[bad.unwrap()], w[bad.unwrap()]);
@@ -620,7 +621,9 @@ fn register_staged_families_match_on_cuda() {
 /// otherwise time a failure): the GEMM lists of a large, a small-M and a
 /// ragged shape (the large one as deep as the shortlist compiles, on one
 /// target of each fill path), the attention lists of every head size and
-/// both query regimes, and the convolution lists of every YOLO class.
+/// both query regimes, the convolution lists of every YOLO class, and the
+/// nearest lists of a shallow, a middle and a deep self-join under several
+/// metrics, floors and groups.
 #[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
 #[test_case(amd(AmdArch::Gfx1151, 40), false; "gfx1151")]
 #[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
@@ -668,6 +671,16 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
             for (prog, lowering) in spec.programs::<F16>(&planner.device) {
                 launches.push((format!("{g:?} {c:?}"), prog, lowering));
             }
+        }
+    }
+    let (none, both) = (Floors::default(), Floors { row: true, col: true });
+    for (d, metric, floors, groups) in
+        [(16, Metric::ShiftedL2, none, false), (64, Metric::L2, both, true), (128, Metric::SquaredL2, none, true)]
+    {
+        for cfg in first_eight(&planner.nearest_ranked(1 << 16, 1 << 16, d, metric, floors, groups)) {
+            let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, cfg };
+            let name = format!("nearest d{d} {metric:?} {floors:?} {groups} {cfg:?}");
+            launches.push((name, nearest::<BF16>(&spec), cfg.lowering(&planner.device)));
         }
     }
     each(launches, |_, prog, lowering| drop(linear(prog, &lowering)));

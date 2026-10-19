@@ -22,6 +22,7 @@ use crate::kernels::attention::{AttnMask, AttnSpec, Bias, Cache, Chunk, CombineS
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
+use crate::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::lower::{Lowering, lower};
@@ -156,6 +157,19 @@ pub fn families(target: &Target) -> Vec<Launch> {
             cfg,
         };
         push(&format!("heads d{d}"), heads::<BF16>(&spec), cfg.lowering(&planner.device));
+    }
+
+    // The tiles planned for a large self-join, over a ragged small one.
+    let both = Floors { row: true, col: true };
+    for (name, d, metric, floors, groups) in [
+        ("nearest squared l2", 64, Metric::SquaredL2, Floors::default(), false),
+        ("nearest l2 floors", 16, Metric::L2, both, false),
+        ("nearest groups", 32, Metric::ShiftedL2, Floors::default(), true),
+        ("nearest neg dot col floor", 64, Metric::NegDot, Floors { row: false, col: true }, false),
+    ] {
+        let Some(&cfg) = planner.nearest_ranked(1 << 16, 1 << 16, d, metric, floors, groups).first() else { continue };
+        let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, cfg };
+        push(name, nearest::<BF16>(&spec), cfg.lowering(&planner.device));
     }
 
     let silu_bias = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };

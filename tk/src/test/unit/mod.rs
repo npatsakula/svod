@@ -11,6 +11,7 @@ mod interp;
 mod isa;
 mod layout;
 mod layouts;
+mod nearest;
 mod offline;
 mod ops;
 mod ops_plan;
@@ -278,6 +279,7 @@ fn decode(dtype: ScalarDType, bytes: &[u8]) -> Vec<f64> {
         ScalarDType::Float32 => bytes.chunks(4).map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap()))).collect(),
         ScalarDType::BFloat16 => bytes.chunks(2).map(|b| bf16(half(b))).collect(),
         ScalarDType::Float16 => bytes.chunks(2).map(|b| half::f16::from_bits(half(b)).to_f64()).collect(),
+        ScalarDType::Int32 => bytes.chunks(4).map(|b| f64::from(i32::from_le_bytes(b.try_into().unwrap()))).collect(),
         other => unreachable!("{other:?} output"),
     }
 }

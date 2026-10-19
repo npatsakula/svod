@@ -406,6 +406,11 @@ fn a_consume_body_fences_its_own_tiles() {
     scale: 0.125,
     cfg: FaCfg { splits: 2, ..FaCfg::new(16, 64, 3) },
 }); "attention with every mask, a cache and splits")]
+#[test_case(crate::kernels::nearest::nearest::<BF16>(&crate::kernels::nearest::NearestSpec {
+    n: 100, m: 150, d: 32, metric: crate::kernels::nearest::Metric::L2,
+    floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true,
+    cfg: crate::kernels::nearest::NearestCfg::new(32, 32, 3),
+}); "nearest with floors and groups")]
 fn shipped_kernels_need_no_barriers(prog: Program) {
     let mut fenced = prog.clone();
     insert_barriers(&mut fenced).unwrap();
