@@ -9,5 +9,6 @@ fn pipeline_parts_are_send() {
     fn assert_send<T: Send>() {}
     assert_send::<crate::gigaam::GigaAm>();
     assert_send::<crate::gigaam::GigaAmTranscriber>();
+    assert_send::<crate::gigaam::stream::GigaAmStreamer>();
     assert_send::<svod_arch::pipelines::audio::VadSplitter<crate::firered_vad::FireRedVadProbs>>();
 }
