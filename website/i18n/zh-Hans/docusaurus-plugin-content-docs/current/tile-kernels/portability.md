@@ -57,9 +57,5 @@ sidebar_label: 可移植性
 | AMD 注意力寄存器 | 分数 tile 经共享内存进入 P·V，V 操作数逐元素收集；RDNA 上 d = 128 会溢出寄存器 |
 | Apple | 仅有原子；没有配置表，没有发射的内核 |
 | Warp 角色、角色屏障、原始 asm 语句 | 可在 IR 中记录，但被降级拒绝 |
-<<<<<<< HEAD
-| 卷积（隐式 GEMM） | 仅 CUDA sm_80+（`ops::conv2d`）；YOLO26 以 channels-last 运行在其上，在 tk3 拥有 RDNA 配置表之前 AMD 上该算子走图 |
-=======
-| 卷积（隐式 GEMM） | 在 sm_86 上测量，已为 AMD 编译；YOLO 模型尚未接入 |
->>>>>>> b4e4d30b ([*] docs: the tile-kernel target matrix after Hopper, RDNA and CDNA)
+| 卷积（隐式 GEMM） | 在 sm_86 上测量，YOLO26 以 channels-last 运行在其上（`ops::conv2d`）；对 AMD 仅编译 |
 | fp8/int8 权重、GEMV + argmax、持久化网格、注意力反向 | 未开始 |

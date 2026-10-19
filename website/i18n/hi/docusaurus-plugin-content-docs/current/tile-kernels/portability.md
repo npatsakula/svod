@@ -69,9 +69,5 @@ data है, जिसे lowering और op layer चुनते हैं:
 | AMD attention registers | Score tile shared memory से होकर P·V तक पहुँचता है, और V operand element by element इकट्ठा होता है; RDNA पर d = 128 spill करता है |
 | Apple | सिर्फ़ atoms; न tables, न emit किए गए कर्नेल |
 | Warp roles, role barriers, raw asm statements | IR में रिकॉर्ड होते हैं, lowering उन्हें ठुकराती है |
-<<<<<<< HEAD
-| Convolution (implicit GEMM) | केवल CUDA sm_80+ (`ops::conv2d`); YOLO26 इस पर channels-last चलता है, और AMD पर tk3 की RDNA tables आने तक op graph लेता है |
-=======
-| Convolution (implicit GEMM) | sm_86 पर मापा गया, AMD के लिए compile हुआ; YOLO model अभी जुड़ा नहीं है |
->>>>>>> b4e4d30b ([*] docs: the tile-kernel target matrix after Hopper, RDNA and CDNA)
+| Convolution (implicit GEMM) | sm_86 पर मापा गया, जहाँ YOLO26 इस पर channels-last चलता है (`ops::conv2d`); AMD के लिए सिर्फ़ compile हुआ |
 | fp8/int8 weights, GEMV + argmax, persistent grid, attention backward | शुरू नहीं हुआ |

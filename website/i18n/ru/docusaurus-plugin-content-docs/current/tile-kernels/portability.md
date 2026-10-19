@@ -69,9 +69,5 @@ sidebar_label: Переносимость
 | Регистры внимания на AMD | Тайл оценок попадает в P·V через shared-память, а операнд V собирается поэлементно; d = 128 вытесняет регистры на RDNA |
 | Apple | Только атомы; ни таблиц, ни выпущенных ядер |
 | Роли варпов, барьеры ролей, инструкции raw asm | Записываются в IR, отвергаются понижением |
-<<<<<<< HEAD
-| Свёртка (implicit GEMM) | Только CUDA sm_80+ (`ops::conv2d`); YOLO26 работает на ней в channels-last, а на AMD операция идёт через граф, пока у tk3 нет таблиц RDNA |
-=======
-| Свёртка (implicit GEMM) | Замерена на sm_86, скомпилирована для AMD; модель YOLO ещё не подключена |
->>>>>>> b4e4d30b ([*] docs: the tile-kernel target matrix after Hopper, RDNA and CDNA)
+| Свёртка (implicit GEMM) | Замерена на sm_86, где на ней в channels-last работает YOLO26 (`ops::conv2d`); для AMD только скомпилирована |
 | Веса fp8/int8, GEMV + argmax, persistent grid, обратный проход внимания | Не начато |
