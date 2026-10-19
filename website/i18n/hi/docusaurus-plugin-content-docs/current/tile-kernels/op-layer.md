@@ -41,8 +41,10 @@ pub fn supported(device: &DeviceSpec) -> bool;
 ## कर्नेल या ग्राफ़ {#kernel-or-graph}
 
 फ़ैसला `ops::shape` में एक pure function है, `fn(target, dtypes, extents, …) -> Plan<Cfg>`, इसलिए इसे
-बिना GPU के host पर टेस्ट किया जाता है। `Plan::Kernel(candidates)` configs सूचीबद्ध करता है, untuned
-चुनाव पहले। `Plan::Graph(Fallback)` बताता है कि ग्राफ़ क्यों चलता है।
+बिना GPU के host पर टेस्ट किया जाता है। `Plan::Kernel(configs)` configs को rank करता है, untuned
+चुनाव पहले; [tuner](./tuning) उन पहले configs को मापता है जो बिना spill किए compile होते हैं (या, जब हर
+एक spill करे, तो पहले जो compile हों: spills किसी op को कभी ग्राफ़ पर नहीं भेजते)।
+`Plan::Graph(Fallback)` बताता है कि ग्राफ़ क्यों चलता है।
 
 | `Fallback` | कब |
 |---|---|
@@ -60,7 +62,8 @@ sm_86 target पर `test/unit/ops_plan.rs` के असली cases:
 #[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
 #[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
 fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallback>) {
-    assert_eq!(first(shape::linear(Some(&sm86()), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
+    let planner = Planner::new(Device { target: sm86(), costs: costs() });
+    assert_eq!(first(shape::linear(Some(&planner), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
 }
 ```
 

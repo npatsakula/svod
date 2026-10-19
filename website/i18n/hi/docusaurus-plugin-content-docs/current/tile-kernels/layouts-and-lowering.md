@@ -6,7 +6,7 @@ sidebar_label: Layouts और Lowering
 
 `lower::lower(program, &lowering, params, device)` एक tile program को ऐसे Svod program में बदलता है
 जिसकी instruction list पहले से क्रम में है। एक `Lowering` में वह सब होता है जो लेखक ने तय नहीं
-किया: `Target`, `Schedule`, block tile पर `WarpGrid`, और यह कि shared rows swizzle होंगी या नहीं।
+किया: `Device` (target और उसकी costs), `Schedule`, block tile पर `WarpGrid`, और यह कि shared rows swizzle होंगी या नहीं।
 हर कर्नेल config अपना `Lowering` बनाता है (`GemmCfg::lowering`, `FaCfg::lowering`,
 `NormCfg::lowering`)।
 
@@ -61,7 +61,10 @@ layouts उस atom से पढ़ता है जो values को consume �
 ## Layout inference {#layout-inference}
 
 1. **Atoms बीज बोते हैं।** एक `mma` अपने operands और नतीजे को `WarpGrid` पर tile किए गए atom के
-   layouts देता है (`layouts::mma_layouts`)।
+   layouts देता है (`MmaAtom::issue`), और उसे उसी रुख़ (`ir::Orient`) से issue करता है जो lowering की
+   `Costs` के तहत program पर सबसे कम relayout cost छोड़े: `Cᵀ = Bᵀ·Aᵀ` वही instruction है जिसके slots
+   आपस में बदल दिए गए हों, इसलिए square atom पर accumulator बिना किसी cost के अगले product का operand
+   बनकर रखा जा सकता है। Author orientation pin कर सकता है (`Kernel::mma_oriented`)।
 2. **Elementwise ops एक करते हैं।** `binary`, `cast`, `where_` के operands और नतीजा, और किसी loop
    की carried values, एक ही layout साझा करते हैं।
 3. **बिना बंधन वाले tiles natural layout लेते हैं।** Fixed point पर, जिस tile पर कोई बंधन नहीं, उसे
@@ -72,8 +75,17 @@ layouts उस atom से पढ़ता है जो values को consume �
    उसे उस tile से अलग default नहीं करता।
 5. **टकराव relayouts बनते हैं।** जिस value को दो consumers अलग-अलग चाहते हैं, उसके लिए एक
    `TileOp::Relayout` डाला जाता है। `TileLayout::relayout` उसे `Identity`, `RegPermute` (हर lane
-   के भीतर), `LaneShuffle` या `ViaSmem` में वर्गीकृत करता है। Emitter फ़िलहाल `LaneShuffle` और
-   `ViaSmem` दोनों को shared memory के ज़रिए lower करता है।
+   के भीतर), `Exchange` (हर register lane-xor moves से तय साथियों से लिया जाता है, हर warp में
+   एक जैसा) या `ViaSmem` में वर्गीकृत करता है। `Exchange` तभी तक रखा जाता है जब तक
+   उसका काम shared memory से होकर एक round trip से सस्ता हो
+   (`Relayout::work × Costs::lane_move < Costs::smem_trip`, जहाँ काम हर register पर उसकी अलग-अलग
+   non-zero-mask moves और हर अतिरिक्त pick पर एक select है, जहाँ एक select एक move गिना जाता है); वरना tile round trip लेता है। Emitter
+   `Exchange` को target की lane moves (`atoms::LaneMove`: RDNA पर DPP और `permlanex16`, CDNA के wave64
+   पर `ds_bpermute`) से, और `ViaSmem` को shared memory के ज़रिए lower करता है।
+   `Relayout::cost_per_element` हर class की कीमत `Costs` से लगाता है (`RegPermute` मुफ़्त है, क्योंकि
+   compiler registers का नाम बदल देता है; exchange का काम `lane_move` पर; `smem_trip`), और orientation
+   search ऐसे global load के, जिसमें lanes बिखरते हैं, हर element पर `Costs::scatter` भी वसूलता है,
+   इसलिए RDNA3 पर bias वाला attention अपने products direct रखता है और bias को उसकी rows के साथ पढ़ता है।
 
 ## Schedule templates {#schedule-templates}
 

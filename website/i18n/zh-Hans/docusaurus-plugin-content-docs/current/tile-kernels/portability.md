@@ -20,6 +20,8 @@ sidebar_label: 可移植性
 
 `Target::for_device(&spec)` 从实际设备解析目标。`Target::for_arch(arch)` 仅根据架构构造目标，主机测试使用的就是它。`atoms::sm86()` 是带 28 个 SM 的 RTX 3060 目标。
 
+目标只声明芯片能做什么，从不声明其代价。其原语的代价（`atoms::Costs`：一个共享内存字节、一个流式字节、一个分散元素、一步矩阵核心运算、一个分数的 softmax 工作、一次行程、一次 lane 移动、一次共享内存往返、一次寄存器拷贝、全局延迟）在首次使用时于设备上测量（`probe::costs`），并保存在 tune store 中；主机测试则直接声明它们。不存在按家族划分的代价表。这些代价以 `Lowering::costs` 进入降级（方向、交换或往返），以 `Planner::device` 进入算子层（候选排序）。
+
 | 目标 | 原子 | 填充 | 配置表 | 状态 |
 |---|---|---|---|---|
 | CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`，2–3 级 | 有 | 在 RTX 3060 上测量 |
@@ -42,7 +44,7 @@ sidebar_label: 可移植性
 | 矩阵核心原子及其布局 | `atoms`, `layout/atoms.rs` |
 | 拷贝机制（`cp.async`、`ldmatrix`、寄存器分级） | `Target` 标志、发射器 |
 | 调度模板 | `schedule::Schedule` |
-| 配置候选表 | `ops::config` |
+| 配置候选排序 | `ops::config`，依据测得的 `Costs` |
 
 为某个厂商分叉出单独的内核程序只允许作为有限的例外。
 
@@ -53,8 +55,7 @@ sidebar_label: 可移植性
 | Hopper (sm_90a)：wgmma、TMA、mbarrier、warp 专用化模板 | 未开始；Hopper 走 `mma.sync` 路径（基础设施第 5–8 项） |
 | Blackwell (sm_100a)：tcgen05、张量内存 | 未开始；没有 B200 可用 |
 | AMD CDNA：ping-pong 模板、MFMA 32×32、`buffer_load … lds` | 未开始 |
-| AMD 测量 | 尚无 AMD 内核运行过；配置表只是供 tune store 挑选的初始猜测 |
-| AMD 注意力寄存器 | 分数 tile 经共享内存进入 P·V，V 操作数逐元素收集；RDNA 上 d = 128 会溢出寄存器 |
+| AMD 测量 | gfx1201 (RX 9070 XT) 已测量：GEMM、卷积和注意力在 Qwen3 和 YOLO 上领先 tk1；gfx1151 (Strix Halo) 已测量：d = 64 和 128 的注意力；CDNA 已编译，未运行 |
 | Apple | 仅有原子；没有配置表，没有发射的内核 |
 | Warp 角色、角色屏障、原始 asm 语句 | 可在 IR 中记录，但被降级拒绝 |
 | 卷积（隐式 GEMM） | 在 sm_86 上测量，YOLO26 以 channels-last 运行在其上（`ops::conv2d`）；对 AMD 仅编译 |

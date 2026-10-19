@@ -4,7 +4,7 @@ sidebar_label: 布局与降级
 
 # 布局与降级
 
-`lower::lower(program, &lowering, params, device)` 把 tile 程序变成一个指令列表已排好顺序的 Svod 程序。`Lowering` 包含所有作者没有决定的东西：`Target`、`Schedule`、块 tile 上的 `WarpGrid`，以及共享内存行是否做 swizzle。每种内核配置都会构造自己的 `Lowering`（`GemmCfg::lowering`、`FaCfg::lowering`、`NormCfg::lowering`）。
+`lower::lower(program, &lowering, params, device)` 把 tile 程序变成一个指令列表已排好顺序的 Svod 程序。`Lowering` 包含所有作者没有决定的东西：`Device`（目标及其代价）、`Schedule`、块 tile 上的 `WarpGrid`，以及共享内存行是否做 swizzle。每种内核配置都会构造自己的 `Lowering`（`GemmCfg::lowering`、`FaCfg::lowering`、`NormCfg::lowering`）。
 
 | 步骤 | 模块 | 作用 |
 |---|---|---|
@@ -43,15 +43,15 @@ pub fn mma_sync_c() -> Layout {
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_*` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8 | `simdgroup_8x8` |
 
-目前只有 CUDA 这一行有内核表并在硬件上运行（参见[可移植性](./portability)）。
+目前 CUDA 和 AMD 两行都会规划内核并在硬件上运行（已测量 sm_86 和 gfx1201；参见[可移植性](./portability)）。
 
 ## 布局推断 {#layout-inference}
 
-1. **原子提供初始布局。** `mma` 把原子的布局按 `WarpGrid` 平铺后赋给其操作数和结果（`layouts::mma_layouts`）。
+1. **原子提供初始布局。** `mma` 把原子的布局按 `WarpGrid` 平铺后赋给其操作数和结果（`MmaAtom::issue`），并按在降级的 `Costs` 下使程序重布局代价最小的方向（`ir::Orient`）发射：`Cᵀ = Bᵀ·Aᵀ` 是同一条指令、只是交换了槽位，因此在方形原子上，累加器可以零代价地作为下一次乘积的操作数保留。作者可以固定方向（`Kernel::mma_oriented`）。
 2. **逐元素操作统一布局。** `binary`、`cast`、`where_` 的操作数和结果，以及循环的携带值，共享同一布局。
 3. **无约束的 tile 取自然布局。** 到达不动点时，没有任何约束的 tile 获得 `layouts::natural`：每个 lane 持有最多 8 个元素的短行向量，lane 先沿列再沿行遍历，warp 按行切分。tile 先于向量获得布局。
 4. **向量跟随其 tile。** `[rows, 1]` 或 `[1, cols]` 向量（例如 `reduce` 的输出或偏置行）被要求采用其 tile 所蕴含的行或列布局。推断不会脱离该 tile 为它单独设定默认布局。
-5. **冲突变为重布局。** 两个消费者需要不同布局的值，会被插入一个 `TileOp::Relayout`。`TileLayout::relayout` 把它归类为 `Identity`、`RegPermute`（在每个 lane 内）、`LaneShuffle` 或 `ViaSmem`。目前发射器把 `LaneShuffle` 和 `ViaSmem` 都经由共享内存实现。
+5. **冲突变为重布局。** 两个消费者需要不同布局的值，会被插入一个 `TileOp::Relayout`。`TileLayout::relayout` 把它归类为 `Identity`、`RegPermute`（在每个 lane 内）、`Exchange`（每个寄存器通过 lane-xor 移动从固定伙伴取得，在每个 warp 中相同）或 `ViaSmem`。`Exchange` 只在其工作量的代价低于一次经由共享内存的往返时保留（`Relayout::work × Costs::lane_move < Costs::smem_trip`，工作量按每个寄存器计，为其互不相同的非零掩码移动数加上每多取一处的一次选择，一次选择按一次移动计）；否则该 tile 走这次往返。发射器用目标的 lane 间移动（`atoms::LaneMove`：RDNA 上为 DPP 和 `permlanex16`，CDNA 的 wave64 上为 `ds_bpermute`）实现 `Exchange`，而 `ViaSmem` 经由共享内存实现。`Relayout::cost_per_element` 依据 `Costs` 为每一类计价（`RegPermute` 免费，因为编译器会重命名寄存器；交换的工作量按 `lane_move` 计；`smem_trip`），方向搜索还对 lane 分散的全局加载的每个元素收取 `Costs::scatter`，因此 RDNA3 上带 bias 的注意力保持乘积为直接方向，并沿行读取 bias。
 
 ## 调度模板 {#schedule-templates}
 

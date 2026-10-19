@@ -37,7 +37,7 @@ pub fn supported(device: &DeviceSpec) -> bool;
 
 ## 内核还是计算图 {#kernel-or-graph}
 
-决策是 `ops::shape` 中的纯函数 `fn(target, dtypes, extents, …) -> Plan<Cfg>`，因此可以在没有 GPU 的主机上测试。`Plan::Kernel(candidates)` 列出配置，未调优时的选择排在第一。`Plan::Graph(Fallback)` 说明为什么运行计算图。
+决策是 `ops::shape` 中的纯函数 `fn(target, dtypes, extents, …) -> Plan<Cfg>`，因此可以在没有 GPU 的主机上测试。`Plan::Kernel(configs)` 对配置排序，未调优时的选择排在第一；[调优器](./tuning)测量其中最先能编译且不溢出的配置（若每个都溢出，则测量最先能编译的那些：溢出从不会让算子退回计算图）。`Plan::Graph(Fallback)` 说明为什么运行计算图。
 
 | `Fallback` | 何时出现 |
 |---|---|
@@ -55,7 +55,8 @@ pub fn supported(device: &DeviceSpec) -> bool;
 #[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
 #[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
 fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallback>) {
-    assert_eq!(first(shape::linear(Some(&sm86()), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
+    let planner = Planner::new(Device { target: sm86(), costs: costs() });
+    assert_eq!(first(shape::linear(Some(&planner), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
 }
 ```
 

@@ -8,7 +8,7 @@ Every kernel in `svod_tk3::kernels` is a function `fn k<T: Elem>(spec: &Spec) ->
 generic over the 16-bit element type (`BF16` or `F16`). Each spec has a `batch: Batch`:
 `Batch::Static(n)` launches `n` batches, and `Batch::Var { name, min, max }` launches the live
 count of a runtime variable bound by name, with buffers sized for `max`. Each config type has a
-`lowering(target)`. Models reach these kernels through the [op layer](./op-layer), which picks
+`lowering(&device)` (an `atoms::Device`: the target and its costs). Models reach these kernels through the [op layer](./op-layer), which picks
 the config.
 
 | Kernel | Spec → program | Kernel name | Op |
@@ -35,24 +35,34 @@ matrix product runs on the f32 accumulator, and the result is rounded once at th
 `GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll }`. Rows past `m`
 and columns past `n` are bounded views, so `m` and `n` are free. `k` must be a multiple of `bk`.
 
-The op layer does not keep a tile table. `config::Planner::gemm_candidates` enumerates the construct's
+The op layer does not keep a tile table. `config::Planner::gemm_ranked` enumerates the construct's
 knobs (output tiles of 32–256 rows and 48–256 columns, `bk` 16–64, nine warp grids, the ring
 depths the target's prefetch runs, rolled and unrolled), keeps what the lowering can run (the
 atoms tile the warp grid, the fills split into whole 16-byte chunks per thread, the ring fits
-shared memory, a lane's registers fit the file) and ranks the rest by a traffic model: the bytes
-a block's trip moves through shared memory, plus a fixed cost per trip and per matrix-core step,
-over the trips of every round of blocks the device runs, stretched by how few waves an SM holds
-and how few steps its ring keeps in flight. One pipeline per output tile and warp grid is kept,
-at most eight candidates remain, and the [tune store](./tuning) picks among them. A gated weight
+shared memory) and ranks the rest in nanoseconds of SM time from the device's measured `Costs`.
+A block's trip does `work`: every wave's operand fragments read from shared memory, the fill
+streamed in, the matrix-core steps and the trip's fixed cost. A round of the blocks an SM holds
+at once is bound by the SM's issue work, by one wave's own issue (a block of fewer waves than the
+SM has SIMDs leaves the rest idle) or by the memory latency one pipeline stage ahead cannot hide,
+whichever is longest:
+`cost = rounds × trips × max(resident × work, simds × work / waves, latency / (stages − 1))`
+(`Planner::pipelined`). Without the middle bound, gfx1151's ranking led with one-warp 256×256
+tiles that ran at 1–3 TFLOP/s. The layout's register count only estimates how many blocks are resident;
+it admits nothing, since it over-counts where fragments are replicated (gfx11 WMMA). The ranking
+keeps every pipeline of a tile; the [tune store](./tuning) picks among the first eight output
+tiles and warp grids whose compiled kernels do not spill, each at its first clean pipeline (all
+spilling: the first eight that compile). The pipelines are ranked by the model alone, so an
+unrolled ring that spills yields to its rolled twin: on gfx1151 the unrolled 64×16 and 128×16
+attention tiles at d = 128 spill and the rolled ones compile clean. A
+gated weight
 is a `2·bn`-wide B tile and two accumulators to the model, so its lead comes at half width. The
-`Planner` of a device holds its target and the problems it has ranked (an op plans its shape at
-every call; ranking the lattice takes a millisecond), one planner per device for the process.
+`Planner` of a device holds its target, its measured costs and the problems it has ranked (an op
+plans its shape at every call; ranking the lattice takes a millisecond), one planner per device
+for the process.
 
-The model was fitted on gfx1201 against a measured lattice of 94 configs on Qwen3's four
-projections (the measured best is within the shortlist's top five on each) and checked against
-the sm_86 facts the earlier tables recorded (4096³ peaks at 128×128 with 3 stages on a 2×4 warp
-grid; that config stays in the shortlist). Where the model and a measurement disagree, the
-measurement wins: add the shape to `qwen3_gemm_candidates_probe` and refit the constants.
+The model has no fitted constants: every cost is the device's own, measured by a probe. Where the
+ranking and a measurement disagree, the measurement wins: add the shape to
+`qwen3_gemm_candidates_probe` and check which cost the ranking misses.
 
 ## Flash attention
 
@@ -90,17 +100,18 @@ softmax over an empty row does.
 **Key splits** (`FaCfg::splits > 1`) give a few long rows, such as a decoder step, more blocks.
 Each split writes f32 partials `o_part`, `m_part` and `l_part`, and `combine` merges them.
 
-`FaCfg { bq, bkv, stages, splits, unroll }` uses one warp per 16 query rows. Candidates come
-from the same lattice and traffic model as the GEMM's (`Planner::attention_candidates`): query
+`FaCfg { bq, bkv, stages, splits, unroll, .. }` uses one warp per 16 query rows. Candidates come
+from the same lattice and cost model as the GEMM's (`Planner::attention_ranked`): query
 blocks of 16–128 rows, key blocks of 16–128 keys, the ring depths the target runs, rolled and
 unrolled, kept to what lowers (the fills split into chunks per thread, the ring fits shared
-memory, a lane's registers fit) and ranked by the bytes a key block moves (every warp's K and V
-fragments in, the fill out), the matrix-core steps, the softmax's vector work per score and the
-trip's fixed cost, over the key blocks of every round of query blocks, stretched by how few waves
-an SM holds. Two facts the model learned from the ISA on gfx1201: the compiled loop keeps the
-query, key, score, probability and value fragments live together, so the register count is
-their sum and 16-key blocks are what fits at `d = 128`; and a warp past the problem's queries
-hides no latency, so a decoder step leads with one-warp blocks. A causal mask charges each query
+memory) and ranked by what a key block costs (every warp's K and V fragments read, both tiles
+streamed in, the matrix-core steps, the softmax's vector work per score and the trip's fixed
+cost), over the key blocks of every round of query blocks, each round bound as the GEMM's. The
+register estimate is the query, key, score, probability and value fragments, live together in the
+compiled loop; whether a config spills is the compiled kernel's to say. A warp past the problem's
+queries adds the work of its padded rows, so where the tiles fill the device a decoder step leads
+with one-warp blocks; where they leave SIMDs idle a padded warp runs on one of them. A causal
+mask charges each query
 block its diagonal. The value tile is stored column-major where its fill goes through registers
 (see [Layouts and Lowering](./layouts-and-lowering#layouts-and-lowering)), so its fragments gather
 as 16-byte loads like the keys'; measured on gfx1201 that is 5–28% per shape over the row-major
@@ -110,24 +121,34 @@ so its registers hold column runs and store as 16-byte vectors too.
 The softmax step does as little vector work as it can, which matters most where the matrix
 cores share the SIMD's ALUs (RDNA). A row adopts a new running maximum only when it grows by
 more than 8 in log2 units (FlashAttention-4's lazy rescale): otherwise the correction is exactly
-1, while the probabilities stay below 2⁸. The forms follow the target, chosen by the planner
-(`FaCfg::forms`) from `Target::bf16_cvt` and `Target::mma_on_valu`. With `truncate_p`,
+1, while the probabilities stay below 2⁸. The planner offers every config in the plain forms; the
+other four (`FaCfg::forms`: `truncate_p`, `skip_rescale`, `raw_max`, `sum_after`) are tuner knobs, tuned in
+turn with the tiles (`ops::attention::tune`, through `descend`), since a tile may compile clean only under some
+forms: a forms
+pass on the ranking's first config that compiles clean, then the tile and split choice over the
+ranking under the forms it kept, then a forms pass again on that winner (store-backed, so cheap
+when nothing changes). A forms pass is a coordinate descent: each form once, in that order, a
+two-candidate tune of the forms so far against the same with that form
+flipped, the flip kept only where it measures faster (a spilling flip is not admitted). Which
+form saves registers is not a rule anywhere: the measurement decides. With tuning off every
+attention runs the plain forms. With `truncate_p`,
 probabilities held in bf16 are truncated rather than rounded, a pair per instruction where the
 rounding is several, and the row sum adds the values as held, so the normalization stays unbiased;
 targets that round a pair in one instruction (sm_80+, gfx950) round and sum the f32 values, the
 extra conversion of the held values having cost 3–5% on sm_86. With `skip_rescale`, the output
-accumulator's rescale is a `Scale`, skipped by every wave whose rows all kept their maximum; it is
-on wherever the matrix products issue on the vector ALUs, and beside separate matrix cores only
+accumulator's rescale is a `Scale`, skipped by every wave whose rows all kept their maximum; it
+paid wherever the matrix products issue on the vector ALUs, and beside separate matrix cores only
 where a full tile's lane holds 64 output registers (sm_86: +4% at d = 128, neutral at d = 64 and
-5–7% slower on a decoder step, whose one row keeps the plain multiply). With `raw_max`, on RDNA
-tiles full of queries, the running maximum stays in the raw scores' units (a positive scale commutes
+5–7% slower on a decoder step, whose one row keeps the plain multiply). With `raw_max` (paid on RDNA
+tiles full of queries), the running maximum stays in the raw scores' units (a positive scale commutes
 with the maximum; a bias keeps the scaled form), so only the two row values the exponent and the
 correction take are scaled, a multiply per row rather than per score, at the price of a multiply on
-the step's dependent chain, which a decoder step's one wave feels (3%) and a full tile does not. The
-row sum of truncated probabilities follows the product, so both consumers read them packed once (it
-is the bf16 pair dot product where the target has it); rounded ones are summed before the rescale,
-which with the planned forms on sm_86 is 3% at d = 128 over the other order (24.7 against 24.0
-TFLOP/s, 22.4 before this work) and neutral at d = 64 and on a decoder step. Under a causal mask (or chunks seeing every earlier one) the last
+the step's dependent chain, which a decoder step's one wave feels (3%) and a full tile does not. With
+`sum_after`, the row sum follows the product rather than preceding the rescale; truncated
+probabilities are summed as held either way (the bf16 pair dot product where the target has it),
+rounded ones in f32. After the product both consumers read truncated values packed once (gfx1201);
+before it, on sm_86 with rounding, the order was 3% faster at d = 128 (24.7 against 24.0 TFLOP/s,
+22.4 before this work) and neutral at d = 64 and on a decoder step. Under a causal mask (or chunks seeing every earlier one) the last
 query blocks, which score the most keys, run first, so a round's tail is its shortest blocks. On
 gfx1201 the lazy rescale, the truncation, the skip and the raw `exp2` below took the d = 128 kernel
 from 90 to 116 TFLOP/s on random data and Qwen3's causal attention from 63 to 77; the raw maximum,
@@ -136,8 +157,10 @@ d = 64 105 → 108 (causal 87 → 92), the decoder step unchanged. What remains 
 the loop's WMMAs alone would run at is spread thin: the vector work is 15%, the loads, stores,
 barriers and addressing the rest.
 
-Each tile config is crossed with split counts. `Attn::splits = Some(n)` fixes `n`, capped at the
-key block count. With `None`, `config::split_candidates` proposes 1, 2, the counts around two
+Each tile config is crossed with split counts. `Attn::splits = Some(n)` fixes `n`: only the
+configs with at least `n` key blocks are ranked, at `n` (capped at the most key blocks any config
+has), so a named count is never dropped by a large key block. With `None`, `Planner::splits`
+proposes 1, 2, the counts around two
 blocks per SM, and one split per key block. It keeps only counts up to the smaller of the key
 block count and twice that SM target. The unsplit
 config comes first, and a split candidate is timed together with its merge.
@@ -158,6 +181,10 @@ step calls these kernels:
 |---|---|---|
 | Self attention, 200 cached keys + the appended one | 21.5 | 89.1 |
 | Cross attention, 1500 shared keys | 66.3 | 78.8 (636 unsplit) |
+
+Open: the decode `row_map` is still excluded from the tuned shape (the tuner measures on scratch
+caches of one row per lane, where a map would read garbage rows), so a tuned cross attention may
+not be the fastest with its map: on gfx1151 (2026-10-14) it tuned to 90 µs against 60 µs unsplit.
 
 ## Attention prologue
 

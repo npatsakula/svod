@@ -22,6 +22,14 @@ sidebar_label: पोर्टेबिलिटी
 architecture से एक target बनाता है, जिसे host tests इस्तेमाल करते हैं। `atoms::sm86()` 28 SMs वाला
 RTX 3060 target है।
 
+Target बताता है कि chip क्या कर सकता है, कभी यह नहीं कि उसकी कीमत क्या है। उसके primitives की कीमत
+(`atoms::Costs`: एक shared-memory byte, एक streamed byte, एक बिखरा element, एक matrix-core step, एक
+score का softmax काम, एक trip, एक lane move, एक shared round trip, एक register copy, global latency)
+पहली बार इस्तेमाल पर device पर मापी जाती है (`probe::costs`) और tune store में रखी जाती है; host tests
+उसे declare करते हैं। कोई per-family cost tables नहीं हैं। Costs lowering तक `Lowering::costs`
+(orientation, exchange या round trip) के रूप में और op layer तक `Planner::device` (candidate rankings)
+के रूप में पहुँचती हैं।
+
 | Target | Atoms | Fills | Tables | स्थिति |
 |---|---|---|---|---|
 | CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, 2–3 stages | हाँ | RTX 3060 पर मापा गया |
@@ -54,7 +62,7 @@ data है, जिसे lowering और op layer चुनते हैं:
 | Matrix-core atoms और उनके layouts | `atoms`, `layout/atoms.rs` |
 | Copy mechanisms (`cp.async`, `ldmatrix`, register staging) | `Target` flags, emitter |
 | Schedule templates | `schedule::Schedule` |
-| Config candidate tables | `ops::config` |
+| Config candidate rankings | `ops::config`, मापी गई `Costs` से |
 
 किसी एक vendor के लिए fork किया गया कर्नेल program सिर्फ़ एक सीमित अपवाद के रूप में मान्य है।
 
@@ -65,8 +73,7 @@ data है, जिसे lowering और op layer चुनते हैं:
 | Hopper (sm_90a): wgmma, TMA, mbarrier, warp-specialized template | शुरू नहीं हुआ; Hopper `mma.sync` path पर चलता है (substrate items 5–8) |
 | Blackwell (sm_100a): tcgen05, tensor memory | शुरू नहीं हुआ; B200 तक पहुँच नहीं |
 | AMD CDNA: ping-pong template, MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ |
-| AMD पर माप | कोई AMD kernel नहीं चला; tables पहले अनुमान हैं, जिनमें से tune store चुनता है |
-| AMD attention registers | Score tile shared memory से होकर P·V तक पहुँचता है, और V operand element by element इकट्ठा होता है; RDNA पर d = 128 spill करता है |
+| AMD पर माप | gfx1201 (RX 9070 XT) पर मापा गया: Qwen3 और YOLO पर GEMM, convolution और attention tk1 से आगे; gfx1151 (Strix Halo) पर मापा गया: d = 64 और 128 पर attention; CDNA compile हुआ, चलाया नहीं गया |
 | Apple | सिर्फ़ atoms; न tables, न emit किए गए कर्नेल |
 | Warp roles, role barriers, raw asm statements | IR में रिकॉर्ड होते हैं, lowering उन्हें ठुकराती है |
 | Convolution (implicit GEMM) | sm_86 पर मापा गया, जहाँ YOLO26 इस पर channels-last चलता है (`ops::conv2d`); AMD के लिए सिर्फ़ compile हुआ |
