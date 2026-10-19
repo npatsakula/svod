@@ -156,7 +156,7 @@ clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx
 
 一个被缓存的 `clang --print-targets` 探测会把一个不带 NVPTX 的 clang 变成一个
 干净的 `JitCompilation` 错误。`SVOD_DUMP_NVPTX_IR=<dir>` 会把每个内核的 IR 以
-`sm_XY_<module>.ll` 的名字写到那里。
+`sm_XY_<module>_<digest>.ll` 的名字写到那里。
 
 在任何 PTX 抵达驱动之前——无论是新鲜编译的还是来自对象缓存的——
 `validate_ptx` 都会检查它有一个 `.version`、一个等于设备 `sm_XY` 的

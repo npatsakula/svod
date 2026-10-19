@@ -54,12 +54,12 @@ shared alignment broke `svod-codegen` tests while every card's tk3 suite passed)
 ## On a crash, a hang or wrong numbers
 
 ```sh
-SVOD_OBJECT_CACHE=0 SVOD_TK3_TUNE=0 SVOD_DUMP_AMD_IR=dump_ir SVOD_DUMP_NVPTX_IR=dump_ir TK3_DUMP_LIST=1 \
+SVOD_TK3_TUNE=0 SVOD_DUMP_AMD_IR=dump_ir SVOD_DUMP_AMD_ASM=dump_ir SVOD_DUMP_NVPTX_IR=dump_ir TK3_DUMP_LIST=1 \
   RUST_LOG=svod_tk3::plan=debug RUST_BACKTRACE=1 \
   SVOD_DEVICE=… cargo test -p svod-tk3 --release --lib <failing test> -- --nocapture 2> dump_list.txt
 ```
 
-- Without `SVOD_OBJECT_CACHE=0` a cached object skips the compile call and no `.ll` is written.
+- The dumps are written on object-cache hits too, one file per IR (`<arch>_<kernel>_<ir digest>.ll`, `.s`).
 - A GPU hang: note the last family the gate printed and kill the run.
 - AMD `ring gfx_0.0.0 timeout`, then GTT/page faults in every later process: the device is wedged until the box reboots;
   stop timing and tell the user.

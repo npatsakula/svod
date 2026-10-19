@@ -206,7 +206,8 @@ doorbell. Именно `update_queue_percentage` заново привязыва
 | `AMD_DISABLE_SDMA` | не задана | Задайте что угодно, чтобы пропустить SDMA-очередь копирования, принудительно делая буферы видимыми хосту |
 | `SVOD_KFD_TOPOLOGY` | sysfs | Переопределение корня топологии KFD для тестов |
 | `SVOD_DEBUG_DISPATCH` | не задана | Задайте что угодно, чтобы печатать загрузку программ, а также grid, kernarg, scratch и адреса буферов при диспетчеризации |
-| `SVOD_DUMP_AMD_IR` | не задана | Директория, куда AMD LLVM IR каждого ядра пишется как `<mcpu>_<module>.ll` |
+| `SVOD_DUMP_AMD_IR` | не задана | Директория, куда AMD LLVM IR каждого ядра пишется как `<mcpu>_<module>_<digest>.ll` |
+| `SVOD_DUMP_AMD_ASM` | не задана | Директория, куда ассемблер AMDGCN каждого ядра пишется как `<mcpu>_<module>_<digest>.s`, с тем же именем, что и его `.ll` (ещё один запуск clang на ядро) |
 | `SVOD_OBJECT_CACHE`, `SVOD_OBJECT_CACHE_DIR`, `SVOD_OBJECT_CACHE_MAX_BYTES` | включён | Общий дисковый кэш объектов, см. [страницу CPU](../cpu.md) |
 | `SVOD_AM_DEBUG` | не задана | Только для инициализации AM: перечитывать регистры после записи |
 | `SVOD_AM_MCBASE` | не задана | Только для инициализации AM: база MC-апертуры — `raw`, `fb` или `fbxgmi` |

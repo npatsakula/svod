@@ -169,7 +169,7 @@ clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx
 
 A cached `clang --print-targets` probe turns a clang without NVPTX into a
 clean `JitCompilation` error. `SVOD_DUMP_NVPTX_IR=<dir>` writes each kernel's
-IR there as `sm_XY_<module>.ll`.
+IR there as `sm_XY_<module>_<digest>.ll`.
 
 Before any PTX reaches the driver, fresh or from the object cache,
 `validate_ptx` checks that it has a `.version`, a `.target` equal to the

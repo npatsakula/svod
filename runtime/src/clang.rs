@@ -151,21 +151,34 @@ pub(crate) fn path_clang_has_target(target: &'static str) -> bool {
     cached_target(Path::new("clang"), target)
 }
 
-/// When `env_var` names a directory, write `ir` there as `<tag>_<module>.ll`
-/// so each kernel lands in its own file. The module name comes from the
-/// `; ModuleID = '<name>'` directive: the dispatcher pre-compiles many
-/// kernels ahead of any dispatch, so a single fixed path would only ever hold
-/// the last one compiled, never the failing one.
+/// When `env_var` names a directory, write `ir` there as [`dump_name`]`(tag, ir, "ll")`.
 pub(crate) fn dump_ir(env_var: &str, tag: &str, ir: &str) {
+    dump(env_var, &dump_name(tag, ir, "ll"), ir.as_bytes());
+}
+
+/// When `env_var` names a directory, write `bytes` there as `name`.
+pub(crate) fn dump(env_var: &str, name: &str, bytes: &[u8]) {
     let Ok(dir) = std::env::var(env_var) else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(Path::new(&dir).join(name), bytes);
+}
+
+/// The file a dump of what `ir` compiles to takes: `<tag>_<module>_<digest>.<ext>`.
+/// The module name comes from the `; ModuleID = '<name>'` directive, so each
+/// kernel lands in its own file (the dispatcher pre-compiles many kernels
+/// ahead of any dispatch: one fixed path would hold only the last); the
+/// digest, the first four bytes of the IR's SHA-256 in hex, keeps apart two
+/// programs of one name (the configs of a tile kernel) and gives an IR and
+/// its assembly one stem.
+pub(crate) fn dump_name(tag: &str, ir: &str, ext: &str) -> String {
     let module = ir
         .lines()
         .find_map(|l| l.strip_prefix("; ModuleID = '").and_then(|s| s.strip_suffix("'")))
         .unwrap_or("unknown");
     // Kernel names are `[A-Za-z0-9_]` in practice; be defensive anyway.
     let safe: String = module.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(Path::new(&dir).join(format!("{tag}_{safe}.ll")), ir);
+    let digest: String = Sha256::digest(ir.as_bytes())[..4].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{tag}_{safe}_{digest}.{ext}")
 }
 
 /// Probe-cache key for one flag set, or `None` when the result must not be

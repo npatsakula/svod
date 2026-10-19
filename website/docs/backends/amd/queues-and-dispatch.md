@@ -193,7 +193,8 @@ is present, every completion store carries a KFD event-interrupt companion so
 | `AMD_DISABLE_SDMA` | unset | Set to anything to skip the SDMA copy queue, forcing host-visible buffers |
 | `SVOD_KFD_TOPOLOGY` | sysfs | Override KFD topology root for tests |
 | `SVOD_DEBUG_DISPATCH` | unset | Set to anything to print program-load and dispatch grid, kernarg, scratch, and buffer addresses |
-| `SVOD_DUMP_AMD_IR` | unset | Directory receiving each kernel's AMD LLVM IR as `<mcpu>_<module>.ll` |
+| `SVOD_DUMP_AMD_IR` | unset | Directory receiving each kernel's AMD LLVM IR as `<mcpu>_<module>_<digest>.ll` |
+| `SVOD_DUMP_AMD_ASM` | unset | Directory receiving each kernel's AMDGCN assembly as `<mcpu>_<module>_<digest>.s`, the stem of its `.ll` (one more clang run per kernel) |
 | `SVOD_OBJECT_CACHE`, `SVOD_OBJECT_CACHE_DIR`, `SVOD_OBJECT_CACHE_MAX_BYTES` | on | The shared on-disk object cache, see the [CPU page](../cpu.md) |
 | `SVOD_AM_DEBUG` | unset | AM bring-up only: read registers back after writing them |
 | `SVOD_AM_MCBASE` | unset | AM bring-up only: `raw`, `fb`, or `fbxgmi` MC aperture base |

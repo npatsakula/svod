@@ -28,7 +28,7 @@ for host work, `SVOD_DEVICE=CUDA` / `AMD` (or `CUDA:0`, `AMD:1`) for device work
 | What would tk3 run on an H100 / MI300X I don't have? | `cargo run -p svod-tk3 --release --example tk3_dump -- --card h100-sxm --op gemm --shape 4096x4096x4096` (see Offline) |
 | Kernel or graph for a shape, and why | `RUST_LOG=svod_tk3::plan=debug` (`graph … why=Shape`, `ranking`, `ranked`, `compiled`, `tuned`) |
 | Emitted instruction list | `TK3_DUMP_LIST=1` (stderr, every `emit` call); pin one config with `SVOD_TK3_TUNE=0` or use `tk3_dump` |
-| LLVM IR as compiled on a device | `SVOD_OBJECT_CACHE=0 SVOD_DUMP_NVPTX_IR=<dir>` / `SVOD_DUMP_AMD_IR=<dir>` → `<arch>_<kernel>.ll` |
+| LLVM IR / AMDGCN as compiled on a device | `SVOD_DUMP_NVPTX_IR=<dir>` / `SVOD_DUMP_AMD_IR=<dir>` → `<arch>_<kernel>_<ir digest>.ll`, `SVOD_DUMP_AMD_ASM=<dir>` → `.s` |
 | Tuning off | `SVOD_TK3_TUNE=0` (process) or `tune::scoped(false, f)` (this thread): the first clean ranked config runs; probes still measure |
 | GEMM TFLOP/s per config | `SVOD_DEVICE=… cargo test -p svod-tk3 --release --lib gemm_throughput_probe -- --ignored --nocapture --test-threads=1` |
 
@@ -110,8 +110,8 @@ round`/`leaders`/`rounds`/`twins` and `probe pair timed`/`resolved`. Device test
 
 **Dumps.** `TK3_DUMP_LIST` (`lower/emit/mod.rs`) prints `[i] id=N "Op" dtype <- [src ids]`; the tuner lowers every
 candidate and `launch.rs` memoizes, so pin one config (`SVOD_TK3_TUNE=0`, one test, or `tk3_dump --cfg N`).
-`SVOD_DUMP_{NVPTX,AMD}_IR` write inside the compile call, which on a device runs only on an object-cache miss: add
-`SVOD_OBJECT_CACHE=0`. Files are `<arch>_<kernel name>.ll`, so every config of `gemm` overwrites one file. Host IR for
+`SVOD_DUMP_{NVPTX,AMD}_IR` and `SVOD_DUMP_AMD_ASM` write on an object-cache hit too, one file per IR
+(`<arch>_<kernel name>_<ir digest>.{ll,s}`): every config of `gemm` the tuner compiles gets its own. Host IR for
 any target: `lower::render(prog, &lowering)` or `lower::standalone(prog, &lowering)?.text(&target)`.
 
 | Message / symptom | Source and meaning |

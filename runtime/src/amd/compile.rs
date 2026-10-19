@@ -4,7 +4,7 @@
 use svod_dtype::AmdArch;
 use tracing::debug;
 
-use crate::clang::{ClangToolchain, dump_ir, path_clang_has_target};
+use crate::clang::{ClangToolchain, dump, dump_ir, dump_name, path_clang_has_target};
 use crate::error::JitResultExt;
 
 /// Compile AMD LLVM IR text into a fully-linked AMDGPU code object.
@@ -19,7 +19,9 @@ use crate::error::JitResultExt;
 /// - [`crate::Error::JitCompilation`] when `clang` is missing, the AMDGPU
 ///   target is not enabled in the host LLVM, or compilation fails.
 pub fn compile_ir_to_amd_object(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8>> {
-    compile_ir_to_amd_object_with(&amd_toolchain(None)?, ir, arch)
+    let toolchain = amd_toolchain(None)?;
+    dump_amd(&toolchain, ir, arch);
+    compile_ir_to_amd_object_with(&toolchain, ir, arch)
 }
 
 /// The AMDGCN assembly [`compile_ir_to_amd_object`] assembles: the same
@@ -30,9 +32,28 @@ pub fn compile_ir_to_amd_object(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8
 ///
 /// As [`compile_ir_to_amd_object`].
 pub fn compile_ir_to_amd_asm(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8>> {
+    compile_ir_to_amd_asm_with(&amd_toolchain(None)?, ir, arch)
+}
+
+fn compile_ir_to_amd_asm_with(toolchain: &ClangToolchain, ir: &str, arch: AmdArch) -> crate::Result<Vec<u8>> {
     let flags = amd_object_flags(ir, arch).into_iter().map(|f| if f == "-c" { "-S".into() } else { f });
-    let toolchain = amd_toolchain(None)?;
     toolchain.compile_ir(&flags.collect::<Vec<_>>(), ir, &format!("amdgcn assembly (mcpu={})", arch.mcpu()))
+}
+
+/// The dumps of a kernel compiled for `arch`, whether its object then
+/// comes from the object cache or from clang: its IR under
+/// `SVOD_DUMP_AMD_IR`, and under `SVOD_DUMP_AMD_ASM` the AMDGCN assembly of
+/// [`compile_ir_to_amd_asm`] (one more clang run per kernel), each named by
+/// [`dump_name`](crate::clang::dump_name).
+pub(crate) fn dump_amd(toolchain: &ClangToolchain, ir: &str, arch: AmdArch) {
+    dump_ir("SVOD_DUMP_AMD_IR", arch.mcpu(), ir);
+    if std::env::var_os("SVOD_DUMP_AMD_ASM").is_none() {
+        return;
+    }
+    match compile_ir_to_amd_asm_with(toolchain, ir, arch) {
+        Ok(asm) => dump("SVOD_DUMP_AMD_ASM", &dump_name(arch.mcpu(), ir, "s"), &asm),
+        Err(e) => tracing::warn!("SVOD_DUMP_AMD_ASM: {e}"),
+    }
 }
 
 /// The oldest clang whose AMDGPU code is verified. 20.1.2 compiles some kernels
@@ -109,7 +130,6 @@ pub(crate) fn compile_ir_to_amd_object_with(
                 .to_string(),
         });
     }
-    dump_ir("SVOD_DUMP_AMD_IR", arch.mcpu(), ir);
     debug!(arch = arch.mcpu(), ir.length = ir.len(), "compiling amdgcn IR via clang");
     toolchain.compile_ir(&amd_object_flags(ir, arch), ir, &format!("amdgcn (mcpu={})", arch.mcpu()))
 }

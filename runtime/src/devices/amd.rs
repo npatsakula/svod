@@ -198,6 +198,7 @@ struct AmdCompiler {
 
 impl Compiler for AmdCompiler {
     fn compile(&self, spec: &ProgramSpec) -> Result<CompiledSpec> {
+        crate::amd::compile::dump_amd(&self.toolchain, &spec.src, self.arch);
         let key = ObjectCacheKey::new(spec.src.as_bytes(), self.identity.clone());
         let bytes = if let Some(cache) = &self.cache {
             cache.get_or_compile(

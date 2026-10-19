@@ -170,6 +170,8 @@ impl Compiler for CudaCompiler {
         // The ABI is part of the key: a cubin's entry check runs at compile
         // time (below), so a cache hit must have been checked against the
         // ABI it is loaded with.
+        // Dumped whether the cache or the compiler answers.
+        crate::clang::dump_ir("SVOD_DUMP_NVPTX_IR", &self.arch.to_string(), &spec.src);
         let mut source = spec.src.clone().into_bytes();
         source.extend_from_slice(format!("\0abi={:?}", spec.abi).as_bytes());
         let key = ObjectCacheKey::new(&source, self.identity.clone());

@@ -171,7 +171,7 @@ clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx
 
 Кэшированная проверка `clang --print-targets` превращает clang без NVPTX в
 аккуратную ошибку `JitCompilation`. `SVOD_DUMP_NVPTX_IR=<dir>` записывает туда
-IR каждого ядра как `sm_XY_<module>.ll`.
+IR каждого ядра как `sm_XY_<module>_<digest>.ll`.
 
 Прежде чем любой PTX дойдёт до драйвера — свежий или из кэша объектов —
 `validate_ptx` проверяет, что в нём есть `.version`, `.target`, равный `sm_XY`

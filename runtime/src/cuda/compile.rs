@@ -21,6 +21,7 @@ use crate::object_cache::ObjectCache;
 ///   target is not enabled in the host LLVM, or compilation fails.
 pub fn compile_ir_to_ptx(ir: &str, arch: CudaArch) -> crate::Result<Vec<u8>> {
     let toolchain = ClangToolchain::discover(None)?;
+    dump_ir("SVOD_DUMP_NVPTX_IR", &arch.to_string(), ir);
     compile_ir_to_ptx_with(&toolchain, ir, arch)
 }
 
@@ -33,7 +34,6 @@ pub(crate) fn compile_ir_to_ptx_with(toolchain: &ClangToolchain, ir: &str, arch:
                 .to_string(),
         });
     }
-    dump_ir("SVOD_DUMP_NVPTX_IR", &arch.to_string(), ir);
     debug!(arch = %arch, ir.length = ir.len(), "compiling nvptx IR via clang");
     toolchain.compile_ir(&clang_flags(arch), ir, &format!("nvptx (march={})", svod_codegen::llvm::nvptx::march(arch)))
 }
