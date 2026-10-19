@@ -13,6 +13,7 @@ mod ops_plan;
 mod parts;
 mod rows;
 mod schedule;
+mod targets;
 mod tune;
 
 use crate::build::BF16;
