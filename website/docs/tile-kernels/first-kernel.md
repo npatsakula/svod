@@ -1,252 +1,179 @@
 ---
-sidebar_label: Writing a Kernel
+sidebar_label: Your First Kernel
 ---
 
-# Writing Your First Kernel
+# Your First Kernel
 
-[Authoring into the IR](./lowering) explained the builder in the abstract: `Kernel` hands you
-the raw materials, `Group` carries the compute vocabulary, and `finish` wraps everything in a
-`SINK`. This chapter makes that concrete by writing the smallest kernel that does real work —
-**load two `16×16` tiles, add them, store the result** — and running it.
+A tk3 kernel is a Rust function that records a tile program with the `Kernel` builder. Every
+call appends one statement to the open block and returns a typed handle. A handle carries its
+tier (`Gmem<T>`, `Shared<T>`, `Regs<T>`) and element type (`BF16`, `F16`, `F32`, `I32`,
+`Bool`). Shapes are checked when the statement is recorded. Scalars such as block indices,
+offsets and trip counts are `Sc` expressions built with ordinary operators.
 
-It is deliberately the simplest thing that still exercises the whole shape of a kernel: the
-load → compute → store arc from [What Tiling Is](./tiling), made into code. No matrix multiply,
-no shared memory, no loop — just enough to see every step. The matmul and Flash Attention
-kernels are this same skeleton with more on top.
+## A minimal kernel
 
-```mermaid
-flowchart LR
-  A["a (GL)"] -->|"load"| RA["ra (RT)"]
-  B["b (GL)"] -->|"load"| RB["rb (RT)"]
-  RA --> ADD["add"]
-  RB --> ADD
-  ADD --> RC["rc (RT)"]
-  RC -->|"store"| O["out (GL)"]
-```
-
----
-
-## The whole kernel
-
-Here it is end to end — declare the buffers, build the body, run it, read the result back:
+`y = 2·x + 1` over a `[rows, 64]` f32 matrix, 16 rows per block. The view's row bound makes the
+last block's rows past `rows` read as zero and drops their writes, so `rows` need not be a
+multiple of 16.
 
 ```rust
-use svod_dtype::DType;
+use svod_tk3::build::*;
+use svod_tk3::interp::run;
+use svod_tk3::ir::*;
+
+fn axpb(rows: usize) -> Program {
+    let cols = 64;
+    let mut k = Kernel::new("axpb");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    k.grid([Sc::from(rows.div_ceil(16)), Sc::from(1), Sc::from(1)]);
+    k.warps(4);
+    let row0 = k.block(0) * 16;
+    let tile = |k: &mut Kernel, p: ParamRef<F32>| {
+        let v = k.view(p, 0, [cols, 1], Shape::new(16, cols), [Some(Sc::from(rows)), None]);
+        k.at(v, row0.clone(), 0)
+    };
+    let xv = tile(&mut k, x);
+    let v = k.load(xv);
+    let two = k.fill::<F32>(Shape::new(16, cols), Const::Float(2.0));
+    let one = k.fill::<F32>(Shape::new(16, cols), Const::Float(1.0));
+    let v = k.binary(v, two, BinaryOp::Mul);
+    let v = k.binary(v, one, BinaryOp::Add);
+    let yv = tile(&mut k, y);
+    k.store(yv, v);
+    k.finish()
+}
+
+// On the host, no GPU: one Vec<f64> per parameter in, every parameter out.
+let x: Vec<f64> = (0..40 * 64).map(f64::from).collect();
+let out = run(&axpb(40), vec![x, vec![0.0; 40 * 64]], &[])?;
+assert_eq!(out[1][64 * 39 + 1], 2.0 * (64.0 * 39.0 + 1.0) + 1.0);
+```
+
+`view(param, offset, [row_stride, col_stride], shape, bounds)` is a window into a parameter.
+`at(view, rows, cols)` moves it and keeps the bounds relative to the new origin.
+
+## The GEMM, step by step
+
+`kernels/gemm.rs` computes `c = act(a·bᵀ + bias) + residual` (or `act(gate)·up` off a gated
+weight) in about 180 lines including its spec and config types. The excerpts below are verbatim.
+
+**Parameters and grid.** Buffers are flat and sized at batch capacity. A bound batch variable
+becomes grid z.
+
+```rust
+let a = k.param::<T>("a", ParamKind::In, cap * m * kk);
+let b = k.param::<T>("b", ParamKind::In, halves * n * kk);
+let bias = epi.bias.then(|| k.param::<T>("bias", ParamKind::In, halves * n));
+let residual = epi.residual.then(|| k.param::<T>("residual", ParamKind::In, cap * m * n));
+let c = k.param::<T>("c", ParamKind::Out, cap * m * n);
+let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
+let (gz, bb) = batch.axis(&mut k);
+k.grid([Sc::from(gm), Sc::from(gn), gz]);
+k.warps(cfg.warps[0] * cfg.warps[1]);
+```
+
+**Views with bounds instead of padding.** `bound(len, tile)` is `Some(len)` only where the tile
+grid overhangs `len`. Any `m` and `n` run without a copy. Only `k` must be a multiple of `bk`.
+
+```rust
+let (bx, by) = tile_order(&mut k, gm, gn, cfg.group_m);
+let (row0, col0) = (bx * bm, by * bn);
+let (m_bound, n_bound) = (bound(m, bm), bound(n, bn));
+let a_view = k.view(a, batch_offset(&bb, m * kk), [kk, 1], Shape::new(bm, bk), [m_bound.clone(), None]);
+let a_view = k.at(a_view, row0.clone(), 0);
+```
+
+`tile_order` walks groups of `group_m` tile rows so resident blocks share B in L2.
+
+**The pipeline.** `pipeline(extent, stages, init, produce, consume)` declares a producer and a
+consumer over a ring of `stages` shared slots. The author says what to copy into a slot and
+what to compute from it. The [schedule template](./layouts-and-lowering#schedule-templates)
+decides how far ahead copies run and places every wait and barrier.
+
+```rust
+k.pipeline(
+    trips,
+    stages,
+    init,
+    |k, step, slot| {
+        let koff = step * bk;
+        for (src, alloc, shape) in
+            std::iter::once((a, a_s, sa)).chain(bs.into_iter().zip(b_s).map(|(b, s)| (b, s, sb)))
+        {
+            let g = k.at(src, 0, koff.clone());
+            let t = k.smem_slot::<T>(alloc, slot.clone(), shape);
+            k.stage(t, g, CopyMode::Async);
+        }
+    },
+    |k, _step, slot, accs| {
+        let a_t = k.smem_slot::<T>(a_s, slot.clone(), sa);
+        let mut i = 0;
+        accs.map(|acc| {
+            let b_t = k.smem_slot::<T>(b_s[i], slot.clone(), sb);
+            i += 1;
+            k.mma(acc, a_t, false, b_t, true)
+        })
+    },
+)
+```
+
+`mma(acc, a, a_t, b, b_t)` is `acc + A·B` on f32 accumulators. It never names an instruction:
+the lowering picks the target's matrix-core atom and gives `a`, `b` and `acc` its layouts.
+
+**The epilogue** runs on the f32 accumulator, and the result is rounded once at the store. The
+bias is a `[1, bn]` row vector broadcast over the tile, and the residual is a full tile.
+
+```rust
+if let Some(residual) = residual {
+    let r = tile(&mut k, residual);
+    let r = load_f32(&mut k, r);
+    out = k.binary(out, r, BinaryOp::Add);
+}
+let out = k.cast::<F32, T>(out);
+let c_view = tile(&mut k, c);
+k.store(c_view, out);
+k.finish()
+```
+
+## Running it on the device
+
+`launch::graph_launch` takes one tensor per declared parameter, in order, and returns the first
+output as a lazy `Tensor`. The kernel runs when the result is realized, like any graph kernel.
+
+```rust
+use svod_dtype::{DType, default_device::default_device};
 use svod_tensor::Tensor;
-use svod_tk::arch::FragRole;
-use svod_tk::tiles::TileLayout;
-use svod_tk::{run_kernel, MoveIdx};
+use svod_tk3::atoms::Target;
+use svod_tk3::build::BF16;
+use svod_tk3::kernels::Batch;
+use svod_tk3::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk3::launch::graph_launch;
 
-// Two 16×16 inputs and an output, as flat f32 buffers.
-let a: Vec<f32> = (0..256).map(|i| i as f32).collect();
-let b: Vec<f32> = (0..256).map(|i| (2 * i) as f32).collect();
-let ta = Tensor::from_slice(&a);
-let tb = Tensor::from_slice(&b);
-let mut out = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
-
-// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA, CUDA and Metal.
-let arch = svod_tk::target::resolve_arch(&ta.device()).expect("a GPU device");
-let w = svod_tk::ArchCaps::for_arch(arch).wave_size as i64;
-
-run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| {
-    let warp = ker.warp();
-
-    // Globals, in launch order: output first, then the two inputs.
-    let o = ker.gl(&[1, 1, 16, 16], DType::Float32);
-    let ga = ker.gl(&[1, 1, 16, 16], DType::Float32);
-    let gb = ker.gl(&[1, 1, 16, 16], DType::Float32);
-
-    // Ask for the 16×16 f32 fragment by role — arch-correct on wave32 and wave64.
-    let frag = ker.frag(FragRole::Accumulator);
-
-    // global → register
-    let ra = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), ga, MoveIdx::block((0, 0, 0, 0), 2));
-    let rb = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), gb, MoveIdx::block((0, 0, 0, 0), 2));
-
-    // the one compute op
-    let rc = warp.add(ra, &rb);
-
-    // register → global, then close the kernel around its single store
-    let _ = warp.store(o, rc, MoveIdx::block((0, 0, 0, 0), 2));
-    ker.finish(1)
-})
-.expect("tile_add launch");
-
-let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
+let (m, n, k) = (1000, 512, 256);
+let target = Target::for_device(&default_device()).expect("a GPU target");
+let cfg = GemmCfg { tile: [64, 64, 32], stages: 3, warps: [2, 2], group_m: 8, unroll: true };
+let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
+let a = Tensor::empty(&[m * k], DType::BFloat16);
+let b = Tensor::empty(&[n * k], DType::BFloat16);
+let c = Tensor::empty(&[m * n], DType::BFloat16);
+let c = graph_launch(gemm::<BF16>(&spec), &cfg.lowering(target), &[&a, &b, &c])?;
+c.realize()?;
 ```
 
-That's the entire kernel. The rest of this chapter walks each line.
+Models do not do this themselves: [`ops::linear`](./op-layer) picks the config, shapes the
+output and falls back to the graph when the kernel does not apply.
 
----
+## Builder calls
 
-## Step by step
+| Group | Calls |
+|---|---|
+| Declarations | `param`, `var` (a launch variable bound by name), `grid`, `warps`, `smem` |
+| Scalars | `block(axis)`, `warp()`, `load_scalar(param, index)`, `Sc` operators and `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
+| Views | `view`, `at`, `smem_view`, `smem_slot` |
+| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (a row or column vector broadcasts), `compare`, `cast`, `where_`, `reduce`, `mma` |
+| Movement | `stage` (global → shared, `CopyMode::Async` or `Sync`), `load`, `store` |
+| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (branches producing tiles) |
 
-### 1. Declare the launch
-
-`run_kernel` is the direct-dispatch entry from the DEBUG face: it realizes the inputs, allocates
-the outputs, builds a `Kernel` for you, runs your closure to get the `SINK`, then compiles and
-dispatches — writing the outputs in place.
-
-```rust
-run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| { /* body */ })
-```
-
-The `[1, 1, 1]` grid and `w` block are the launch geometry. We use **one workgroup of one wave**:
-the whole `16×16` tile fits in a single wave's registers, so there is nothing to spread across
-blocks. The block size is `w`, the **wave width** — which we queried from the device up front
-(`ArchCaps::for_arch(resolve_arch(&ta.device())).wave_size`), because a wave is 64 lanes on CDNA but 32 on RDNA,
-on NVIDIA and on Apple, and the block dimension *is* that lane count. The output slice comes first, the inputs second — and
-**that order is the contract** the next step depends on.
-
-### 2. Get a wave to work with
-
-```rust
-let warp = ker.warp();
-```
-
-`Group` is the cooperating wave (`warp` is the NVIDIA term for the same thing). Every compute op —
-loads, the add, the store — is a method on it. `ker.warp()` is the single-wave group; `ker.group(n)`
-would give you `n` waves for a bigger tile.
-
-### 3. Declare the globals
-
-```rust
-let o  = ker.gl(&[1, 1, 16, 16], DType::Float32);
-let ga = ker.gl(&[1, 1, 16, 16], DType::Float32);
-let gb = ker.gl(&[1, 1, 16, 16], DType::Float32);
-```
-
-A **global layout** (`GL`) is a typed view over one of the buffers — it knows the logical shape,
-so loads compute the right address. Each `gl()` call binds the *next* buffer in declaration order,
-and that order must match the launch: we passed `&mut [&mut out]` then `&[&ta, &tb]`, so we declare
-`o`, then `ga`, then `gb`. Get this order wrong and the kernel reads and writes the wrong buffers.
-
-The `[1, 1, 16, 16]` shape is the 4-D addressing convention tk kernels use; the two leading `1`s
-are batch/head dimensions a real kernel would iterate, left trivial here. (The input *tensors*
-themselves can be flat 256-element buffers — the `GL` view supplies the logical shape; only the
-output tensor carries its shape, for allocation.)
-
-### 4. Ask for the tile by role
-
-```rust
-let frag = ker.frag(FragRole::Accumulator);
-```
-
-This is the portability move from [Layouts and Wave Sizes](./wave-portability), and it matters even
-in a kernel with no matrix multiply: the same logical `16×16` f32 tile has a *different physical lane
-layout* on each supported architecture, so naming a **role** instead of a hardcoded fragment lets one
-body compile for all of them. We ask the kernel for the `Accumulator` role — simply the role for a
-full-precision result tile, which is what an add produces too, not only an MMA — and `Kernel::frag`
-forwards to `ArchCaps::frag` to resolve the physical fragment for the target: the wave64 stride map
-on CDNA, the even/odd wave32 layout on RDNA3, a strided 8-per-lane map on RDNA4, the two-half
-`mma.sync` layout on CUDA, a 2×2 grid of 8×8 fragments on Apple. (`ker.acc((16, 16), TileLayout::Row)`
-is the one-call shortcut for `ker.rt(.., DType::Float32, .., ker.frag(FragRole::Accumulator))`; the
-library kernels use it.)
-
-### 5. Load: global → register
-
-```rust
-let ra = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), ga, MoveIdx::block((0, 0, 0, 0), 2));
-let rb = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), gb, MoveIdx::block((0, 0, 0, 0), 2));
-```
-
-`ker.rt(...)` allocates a register tile in the fragment layout we just resolved; `warp.load` fills
-it from the global. `MoveIdx::block((0, 0, 0, 0), 2)` says *which* tile of the global to read: the
-tuple is the tile's coordinate along each of the four dimensions — all zeros, because a single
-`16×16` tile has only the `(0, 0)` position — and the `2` is the axis those tiles are stacked along:
-dimension 2, the row dimension of the `[1, 1, 16, 16]` view. (A `[1, 1, 32, 16]` global would hold
-two row-tiles; reading the second would set that coordinate to `1`.) The wave cooperatively pulls the
-256 elements straight into registers, already in the layout compute wants.
-
-This is the *direct* `global → register` path — no shared-memory stop. A kernel that streams large
-tensors would stage through a shared tile first (for coalescing and a conflict-free swizzle, the
-gaps from [Where the FLOPS Hide](./where-flops-hide)); we skip it because a single resident tile
-needs neither.
-
-### 6. Compute: the one op
-
-```rust
-let rc = warp.add(ra, &rb);
-```
-
-The only arithmetic in the kernel. `add` is elementwise over the tile — no lane indexing, no
-address math, just "add these two tiles." (It takes the first operand by value and the second by
-reference, returning the result tile.) This is where, in a real kernel, `mma`, reductions, and
-elementwise maps would go; the mechanics around them are exactly what you see here.
-
-### 7. Store and finish
-
-```rust
-let _ = warp.store(o, rc, MoveIdx::block((0, 0, 0, 0), 2));
-ker.finish(1)
-```
-
-`warp.store` writes the result tile back to the output global — the same indexing in reverse.
-`ker.finish(1)` closes the kernel around its **one** store, producing the `SINK` (stamped
-`opts_to_apply: Some(vec![])` so the optimizer leaves the hand-lowered body alone, as
-[Authoring into the IR](./lowering) described). The number you pass `finish` is how many output
-stores to collect into the `SINK` — we have one output, so `1`.
-
-### 8. Run it and read it back
-
-`run_kernel` compiles and dispatches the moment the closure returns. The output was bound in place,
-so we read it straight off the tensor:
-
-```rust
-let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
-```
-
-With `a[i] = i` and `b[i] = 2i`, every element comes back `3i`.
-
----
-
-## The rules you can't break
-
-A few constraints are load-bearing — get one wrong and you get a compile error, a panic, or a
-wrong answer:
-
-| Rule | Why |
-|------|-----|
-| **Tile dims are a multiple of `16`** | A tile is a whole number of `16×16` matrix-core fragments; `ker.rt` asserts it. |
-| **`gl()` order = launch buffer order** | Outputs first, then inputs. The bind is positional; a mismatch silently swaps buffers — wrong numbers, no error, so the compiler can't catch it. |
-| **Request fragments by role, not by constant** | `ker.frag(role)` is what makes one body run on wave32, on wave64, on NVIDIA's warp32 *and* on Apple's SIMD group. |
-| **It's a GPU kernel** | The builder mints real lane indices (`Op::Special`), so execution targets a GPU — AMD, CUDA or Metal — not the CPU. |
-
----
-
-:::tip[For GPU experts]
-The body lowers to exactly the `RANGE` / `INDEX` / `LOAD` / `STORE` shape from
-[Authoring into the IR](./lowering) — no new node types. The kernel mints a lane-index `Op::Special`
-that the wave's loads ride; each `warp.load` becomes a global `LOAD` under that lane, `warp.add` is a
-single `Op::Binary(Add)`, and the store is one `STORE` the `SINK` closes over. There is **no** `Wmma`
-and **no** `BUFFER` in the `Local` address space: this is a register-only round-trip, the leanest
-kernel the IR can express.
-
-Because the kernel emits `Special` ops, it *is* a fully hand-lowered GPU kernel — the optimizer and
-the workgroup-dimension passes treat a `Special`-bearing graph as already-lowered and pass it
-through (the same gate `opts_to_apply: Some(vec![])` enforces). That is also why it renders only on
-a GPU backend — AMD, NVPTX or Metal: the lane index has no meaning on the scalar CPU path.
-*Building* the `SINK`, though, is pure UOp construction — that needs no GPU; only executing it does.
-That split is what lets a kernel be guarded by a host-side shape check on every build, with a
-separate gated test for the on-device numbers: `tk/src/test/unit/guide.rs` holds this exact body,
-checks its graph shape on every `cargo test`, and runs it on hardware under `--ignored`
-([Debugging](./debugging)).
-:::
-
----
-
-## Why this matters
-
-This tiny kernel is the template every tk kernel is poured into. The GEMM adds an `mma`, a
-shared-memory strip and a K-loop, and the worked [Flash Attention](./flash-attention) example puts
-the matrix core to work alongside an online-softmax recurrence, double-buffered streaming, and a
-layout branch. But the bones are exactly what you just wrote: declare globals in launch order,
-request tiles by role, move data between memory spaces, compute on tiles, `finish`. Learn this
-skeleton and the harder kernels add to it rather than replace it.
-
-And all of it is the one UOp IR. The `SINK` you built is the same kind of object the compiler
-produces for an autotuned kernel — which is the whole point of the section.
-
-Next, the rest of the vocabulary — [The Builder API](./builder-reference) — and then the wrinkle
-that makes hand-authoring genuinely hard, keeping a kernel correct across wave sizes and fragment
-layouts: [Layouts and Wave Sizes](./wave-portability).
+`role_block`, `raw` and `transpose` can be recorded but are not lowered yet: the lowering
+returns `Error::Unsupported` for them.

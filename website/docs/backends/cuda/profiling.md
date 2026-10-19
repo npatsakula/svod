@@ -4,7 +4,7 @@ sidebar_label: Profiling
 
 # Profiling on CUDA
 
-The [layered profiler](../../tile-kernels/profiling.md) is backend-neutral above
+The layered profiler (`ExecutionPlan::profile`) is backend-neutral above
 the `DispatchTimestamps` and `KernelResources` handles. This page is what the
 CUDA backend puts into those handles, and which tiers exist.
 
