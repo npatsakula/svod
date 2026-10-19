@@ -392,7 +392,9 @@ fn attention_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     matches_a_direct_softmax(&case(spec.clone(), lens));
     let Some(target) = super::device_target() else { return };
     let spec = AttnSpec { cfg: FaCfg { stages: target.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
-    if !spec.cfg.fits(&target, spec.d, spec.mask.bias.is_some()) {
+    let bias = spec.mask.bias.is_some();
+    let smem = spec.cfg.smem_bytes(spec.d, bias) + spec.cfg.scratch_bytes(&target);
+    if !spec.cfg.fits(&target, spec.d, bias) || smem > target.smem_bytes {
         return eprintln!("skipped on the device: {:?} does not fit {}", spec.cfg, target.arch.target_name());
     }
     on_device(&spec, lens, target);
