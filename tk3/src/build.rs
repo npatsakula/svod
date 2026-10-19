@@ -127,6 +127,30 @@ sc_ops!(Add add Add, Sub sub Sub, Mul mul Mul, Div div Div, Rem rem Rem);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParamRef<T>(pub ParamId, PhantomData<T>);
 
+/// A shared allocation of `T` elements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SmemRef<T>(pub SmemId, PhantomData<T>);
+
+/// An elementwise comparison ([`Kernel::compare`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    Lt,
+    Le,
+    Eq,
+    Ne,
+}
+
+impl From<CmpOp> for BinaryOp {
+    fn from(op: CmpOp) -> Self {
+        match op {
+            CmpOp::Lt => BinaryOp::Lt,
+            CmpOp::Le => BinaryOp::Le,
+            CmpOp::Eq => BinaryOp::Eq,
+            CmpOp::Ne => BinaryOp::Ne,
+        }
+    }
+}
+
 pub struct Kernel {
     prog: Program,
     blocks: Vec<Block>,
@@ -183,9 +207,9 @@ impl Kernel {
         self.prog.warps = warps;
     }
 
-    pub fn smem<T: Elem>(&mut self, name: impl Into<String>, elems: usize) -> SmemId {
+    pub fn smem<T: Elem>(&mut self, name: impl Into<String>, elems: usize) -> SmemRef<T> {
         self.prog.smem.push(SmemAlloc { name: name.into(), dtype: T::DTYPE, elems, along: Axis::Col });
-        SmemId(self.prog.smem.len() as u32 - 1)
+        SmemRef(SmemId(self.prog.smem.len() as u32 - 1), PhantomData)
     }
 
     // ---- scalars ---------------------------------------------------------
@@ -305,8 +329,7 @@ impl Kernel {
         Tile::new(self.value(dtype, shape, place))
     }
 
-    pub fn smem_view<T: Elem>(&mut self, alloc: SmemId, offset: impl Into<Sc>, shape: Shape) -> Shared<T> {
-        assert_eq!(self.prog.smem[alloc.index()].dtype, T::DTYPE, "shared allocation dtype");
+    pub fn smem_view<T: Elem>(&mut self, alloc: SmemRef<T>, offset: impl Into<Sc>, shape: Shape) -> Shared<T> {
         self.smem_view_as(alloc, offset, shape)
     }
 
@@ -315,7 +338,13 @@ impl Kernel {
     /// are dead, as a key warp's merge state reuses its ring. The allocation
     /// holds a whole number of `T`s; a `T` of the allocation's width or wider
     /// keeps every element of the view aligned.
-    pub fn smem_view_as<T: Elem>(&mut self, alloc: SmemId, offset: impl Into<Sc>, shape: Shape) -> Shared<T> {
+    pub fn smem_view_as<T: Elem>(
+        &mut self,
+        alloc: SmemRef<impl Elem>,
+        offset: impl Into<Sc>,
+        shape: Shape,
+    ) -> Shared<T> {
+        let alloc = alloc.0;
         let a = &self.prog.smem[alloc.index()];
         let (held, bytes) = (a.elems * a.dtype.bytes(), T::DTYPE.bytes());
         assert!(held.is_multiple_of(bytes) && bytes >= a.dtype.bytes(), "{} read as {:?}", a.name, T::DTYPE);
@@ -324,7 +353,7 @@ impl Kernel {
     }
 
     /// Slot `slot` of a ring of `shape` tiles in `alloc`.
-    pub fn smem_slot<T: Elem>(&mut self, alloc: SmemId, slot: impl Into<Sc>, shape: Shape) -> Shared<T> {
+    pub fn smem_slot<T: Elem>(&mut self, alloc: SmemRef<T>, slot: impl Into<Sc>, shape: Shape) -> Shared<T> {
         self.smem_view(alloc, slot.into() * shape.elems(), shape)
     }
 
@@ -373,10 +402,9 @@ impl Kernel {
         self.binary(a, factor, BinaryOp::Scale)
     }
 
-    pub fn compare<T: Elem>(&mut self, a: Regs<T>, b: Regs<T>, f: BinaryOp) -> Regs<Bool> {
-        assert!(matches!(f, BinaryOp::Lt | BinaryOp::Le | BinaryOp::Eq | BinaryOp::Ne), "a comparison");
+    pub fn compare<T: Elem>(&mut self, a: Regs<T>, b: Regs<T>, f: CmpOp) -> Regs<Bool> {
         let shape = self.broadcast_shape(a.0, b.0);
-        self.let_(shape, TileOp::Binary { a: a.0, b: b.0, f })
+        self.let_(shape, TileOp::Binary { a: a.0, b: b.0, f: f.into() })
     }
 
     fn broadcast_shape(&self, a: ValId, b: ValId) -> Shape {

@@ -261,7 +261,10 @@ fn a_pending_async_copy_survives_a_barrier(between: Between) {
 
 /// A pipeline over a 16×16 ring in `ring`, summing its steps, with `before`
 /// and `after` run around it.
-fn around_a_pipeline(before: impl FnOnce(&mut Kernel, SmemId), after: impl FnOnce(&mut Kernel, SmemId)) -> Program {
+fn around_a_pipeline(
+    before: impl FnOnce(&mut Kernel, SmemRef<BF16>),
+    after: impl FnOnce(&mut Kernel, SmemRef<BF16>),
+) -> Program {
     let mut k = Kernel::new("around_a_pipeline");
     let x = k.param::<BF16>("x", ParamKind::In, 4 * 256);
     let g = k.view(x, 0, [16, 1], Shape::new(16, 16), [None, None]);
@@ -291,7 +294,7 @@ fn around_a_pipeline(before: impl FnOnce(&mut Kernel, SmemId), after: impl FnOnc
     k.finish()
 }
 
-fn zero_slot(k: &mut Kernel, ring: SmemId) -> Shared<BF16> {
+fn zero_slot(k: &mut Kernel, ring: SmemRef<BF16>) -> Shared<BF16> {
     let t = k.smem_view::<BF16>(ring, 0, Shape::new(16, 16));
     let z = k.zeros::<BF16>(Shape::new(16, 16));
     k.store(t, z);

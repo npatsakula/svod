@@ -375,7 +375,7 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let m_max = k.binary(m, block_max, BinaryOp::Max);
     let growth = k.binary(m_max, m, BinaryOp::Sub);
     let limit = k.fill::<F32>(rows, Const::Float(RESCALE_ABOVE / unit));
-    let grows = k.compare(limit, growth, BinaryOp::Lt);
+    let grows = k.compare(limit, growth, CmpOp::Lt);
     let m_new = k.where_(grows, m_max, m);
     let corr = k.binary(m, m_new, BinaryOp::Sub);
     let corr = scaled(k, corr);
@@ -583,22 +583,22 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             });
         };
         if causal {
-            let cond = k.compare(col, row, BinaryOp::Le);
+            let cond = k.compare(col, row, CmpOp::Le);
             and(k, cond);
         }
         if keys_masked {
             let len = k.splat::<I32>(shape, len.clone());
-            let cond = k.compare(col, len, BinaryOp::Lt);
+            let cond = k.compare(col, len, CmpOp::Lt);
             and(k, cond);
         }
         if let Some((left, right)) = window {
             let left = k.splat::<I32>(shape, left);
             let reach = k.binary(col, left, BinaryOp::Add);
-            let cond = k.compare(row, reach, BinaryOp::Le);
+            let cond = k.compare(row, reach, CmpOp::Le);
             and(k, cond);
             let right = k.splat::<I32>(shape, right);
             let reach = k.binary(row, right, BinaryOp::Add);
-            let cond = k.compare(col, reach, BinaryOp::Le);
+            let cond = k.compare(col, reach, CmpOp::Le);
             and(k, cond);
         }
         if let Some(Chunk { size, left, right }) = chunk {
@@ -607,12 +607,12 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             let ck = k.binary(col, size, BinaryOp::Div);
             let right = k.splat::<I32>(shape, right);
             let reach = k.binary(cq, right, BinaryOp::Add);
-            let cond = k.compare(ck, reach, BinaryOp::Le);
+            let cond = k.compare(ck, reach, CmpOp::Le);
             and(k, cond);
             if let Some(left) = left {
                 let left = k.splat::<I32>(shape, left);
                 let reach = k.binary(ck, left, BinaryOp::Add);
-                let cond = k.compare(cq, reach, BinaryOp::Le);
+                let cond = k.compare(cq, reach, CmpOp::Le);
                 and(k, cond);
             }
         }
@@ -621,11 +621,11 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             let visible = k.load(tile);
             // Against a full-shape zero: the predicate takes the tile's shape.
             let zero = k.zeros::<I32>(shape);
-            let cond = k.compare(visible, zero, BinaryOp::Ne);
+            let cond = k.compare(visible, zero, CmpOp::Ne);
             and(k, cond);
         }
         if let Some((seg, _, _)) = &seg {
-            let cond = k.compare(*seg, col, BinaryOp::Le);
+            let cond = k.compare(*seg, col, CmpOp::Le);
             and(k, cond);
         }
         hide(k, keep.expect("a mask"), plain)
@@ -738,10 +738,10 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
                 let rows = |k: &mut Kernel, s: Regs<F32>, _: Sc| {
                     let col = k.coord(shape, Axis::Col);
                     let visible = k.splat::<I32>(shape, visible.clone());
-                    let seen = k.compare(col, visible, BinaryOp::Lt);
+                    let seen = k.compare(col, visible, CmpOp::Lt);
                     let zero = k.zeros::<I32>(shape);
                     let owner = k.splat::<I32>(shape, owner.clone());
-                    let owned = k.compare(owner, zero, BinaryOp::Ne);
+                    let owned = k.compare(owner, zero, CmpOp::Ne);
                     let keep = k.binary(seen, owned, BinaryOp::And);
                     hide(k, keep, s)
                 };
@@ -877,7 +877,7 @@ fn merged(k: &mut Kernel, parts: &[State]) -> State {
 fn normalized(k: &mut Kernel, acc: Regs<F32>, l: Regs<F32>, rows: usize) -> Regs<F32> {
     let zero = k.zeros::<F32>(Shape::new(rows, 1));
     let one = k.fill::<F32>(Shape::new(rows, 1), Const::Float(1.0));
-    let empty = k.compare(l, zero, BinaryOp::Eq);
+    let empty = k.compare(l, zero, CmpOp::Eq);
     let l = k.where_(empty, one, l);
     k.binary(acc, l, BinaryOp::Div)
 }
