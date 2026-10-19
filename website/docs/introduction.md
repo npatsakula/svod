@@ -4,13 +4,11 @@ sidebar_label: Introduction
 
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/npatsakula/svod/main/website/static/img/logo.svg" width="120" alt="Svod logo" />
-
 # Svod
 
 **A deep learning compiler and inference engine written in Rust.**
 
-[![CI](https://github.com/npatsakula/svod/actions/workflows/ci.yml/badge.svg)](https://github.com/npatsakula/svod/actions/workflows/ci.yml)
+[![CI](https://github.com/npatsakula/svod/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/npatsakula/svod/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-svod.vpermilp.online-blue)](https://svod.vpermilp.online/docs/introduction)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/npatsakula/svod/tree/main/LICENSE)
 
@@ -43,8 +41,8 @@ PyTorch references, plus an ONNX importer for everything else.
   Runtime bindings and no vendor SDKs.
 - **A familiar API.** The tensor API mirrors PyTorch, down to named arguments,
   so a model port reads like the reference, and porting it is mostly mechanical.
-- **Speed where it counts.** When the compiler is not enough, the `tk` tile DSL
-  gives you hand-written kernels in the same IR. They stay visible to the
+- **Speed where it counts.** When the compiler is not enough, the `tk3` tile
+  language gives you hand-written kernels in the same IR. They stay visible to the
   profiler and the origin tracker instead of living off to the side as opaque
   binaries.
 
@@ -97,35 +95,28 @@ jit_wrapper! {
 // jit.execute()?;     // replay on every chunk
 ```
 
-### Rewrites proven with Z3
+### Rewrites checked with Z3
 
-Every optimization is a declarative rewrite in the `patterns!` DSL. The
-algebraic and index simplifications are checked with the **Z3 SMT solver**: it
-proves that the rewritten expression equals the original for every input, or
-returns a counterexample. Property-based tests cover the rest of the pipeline.
+Graph transformations are written as declarative rules in the `patterns!` DSL.
+Core symbolic simplification rules are pinned by **Z3** equivalence proofs, and
+property tests use Z3 as an oracle on random expressions: the solver proves that
+the simplified expression equals the original or returns a counterexample. These
+checks run in CI (`--features z3`), not at runtime.
 See [Pattern system](https://svod.vpermilp.online/docs/architecture/optimizations/pattern-system).
 
 ### Platform-specific code generation
 
 - **Tensor cores** are chosen per architecture: NVIDIA sm_75/80/89, AMD RDNA3,
   RDNA4 and CDNA3/4, plus Apple Metal. fp8 is available on sm_89 and CDNA3.
-- **Tile kernels (`tk`)**: a ThunderKittens-style tile DSL in Rust for GEMM,
-  flash attention, RMSNorm and k-means. A single kernel source lowers to AMD
-  MFMA/WMMA (gfx942, gfx11, gfx12), CUDA `mma.sync` (sm_80+) and Apple
-  `simdgroup_matrix` (Apple7+). Tile shapes are
-  autotuned on first use and cached. See
+- **Tile kernels (`tk3`)**: GEMM, flash attention, attention prologue, norms
+  and implicit-GEMM convolution written once as structured tile programs over
+  linear layouts, lowered to `mma.sync`/`wgmma` on CUDA sm_80+ and to WMMA/MFMA
+  on AMD RDNA3/3.5/4 and CDNA3, interpreted on the host for tests, and tuned
+  per shape and device on first use with an on-disk store. Measured on sm_86,
+  sm_90, sm_120, gfx1151, gfx1201 and gfx942. Models call them through an op
+  layer that always returns a tensor and builds the graph where no kernel
+  applies. See
   [Tile kernels](https://svod.vpermilp.online/docs/tile-kernels/overview).
-
-  ```rust
-  fn micro_matmul(ker: &Kernel) -> Arc<UOp> {
-      let w = ker.warp();
-      let a = ker.rt((64, 64), DType::BFloat16, Row, RT_16X16);
-      let b = ker.rt((64, 64), DType::BFloat16, Col, RT_16X16);
-      let c = ker.rt((64, 64), DType::Float32, Col, RT_16X16);
-      let out = w.mma_ab(w.zero(c), &a, &b); // one matrix-core instruction per fragment
-      ker.finish(1)
-  }
-  ```
 - **Kernel search**: hand-written heuristics, or BEAM search over the
   optimization space with a persistent on-disk cache. See
   [Kernel search](https://svod.vpermilp.online/docs/architecture/optimizations/kernel-search).
@@ -188,7 +179,8 @@ Morok was Svod's earlier name.
 | [`device`](https://github.com/npatsakula/svod/tree/main/device/) | Buffers, allocators, mmap, KFD, CUDA and Metal drivers, hardware graphs |
 | [`runtime`](https://github.com/npatsakula/svod/tree/main/runtime/) | Kernel compilation, caching, execution plans and the profiler |
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | Lazy tensor API, `nn` modules and the memory planner |
-| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | Tile kernel DSL and kernel library |
+| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | Tile kernel DSL (tk1), no longer called by the models |
+| [`tk3`](https://github.com/npatsakula/svod/tree/main/tk3/) | Tile language, kernel library, planner and tuner behind the op layer |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX importer |
 | [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | Host-side decoders, VAD segmentation and audio pipelines |
 | [`model`](https://github.com/npatsakula/svod/tree/main/model/) | Pretrained models and examples |
