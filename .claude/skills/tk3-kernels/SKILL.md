@@ -8,8 +8,7 @@ description: Write, check, debug and profile tile kernels with the `svod-tk3` cr
 Reader docs (link, do not duplicate): `website/docs/tile-kernels/{overview,first-kernel,layouts-and-lowering,op-layer,kernel-library,tuning,testing-and-debugging,portability}.md`.
 Design: `tk3_design.md`; per-GPU numbers and the commands behind them: `tk3_pr.md` (Tables A/B, "How to add a column").
 Both sit untracked at the root of the integrator's checkout. Graph-side debugging is `/svod-debug`.
-References here: [new-kernel.md](new-kernel.md) (wiring a kernel end to end), [gpu-column.md](gpu-column.md)
-(measuring a GPU, remote and rented boxes, workflow rules).
+References here: [new-kernel.md](new-kernel.md) (wiring a kernel end to end).
 
 ## Quick start
 
@@ -224,8 +223,9 @@ For a change under `ops/config.rs`, `probe.rs`, `tune.rs`, `schedule.rs`, `layou
 2. **Host**: `cargo fmt`, `cargo clippy --workspace --all-targets`, `SVOD_DEVICE=CPU cargo test -p svod-tk3 --release
    --lib`, then the workspace: `cargo test --workspace --no-run` and the `svod-codegen`, `svod-tensor`, `svod-model` lib
    tests (model builds tk3 configs, codegen renders tk3 kernels; two regressions passed every tk3 suite and broke them).
-3. **Device suite per vendor**, from a detached worktree at the commit ([gpu-column.md](gpu-column.md)): fresh
-   `SVOD_TK3_TUNE_DIR`, `device_costs_are_physical` alone, then the suite, each with `SVOD_DEVICE` set.
+3. **Device suite per vendor**, from a detached worktree at the commit (never a checkout others edit mid-run), one
+   GPU job per machine: fresh `SVOD_TK3_TUNE_DIR`, `device_costs_are_physical` alone first (the suite's parallel tests
+   inflate the probes and the store keeps the first measurement), then the suite, each with `SVOD_DEVICE` set.
 4. **Probes and models** of what changed, per `tk3_pr.md` "How to add a column", against that GPU's Table A/B column.
 5. **A/B across builds on one box**: build both commits in their own worktrees, alternate them ≥2–3 times
    (A B A B …), and compare kernels with tuning off (`tune::scoped(false, …)` / `SVOD_TK3_TUNE=0`): a re-tune can pick
