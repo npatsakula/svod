@@ -4,7 +4,7 @@ sidebar_label: Kernel Library
 
 # Kernel Library
 
-Every kernel in `svod_tk3::kernels` is a function `fn k<T: Elem>(spec: &Spec) -> Program`,
+Every kernel in `svod_tk::kernels` is a function `fn k<T: Elem>(spec: &Spec) -> Program`,
 generic over the 16-bit element type (`BF16` or `F16`). Each spec has a `batch: Batch`:
 `Batch::Static(n)` launches `n` batches, and `Batch::Var { name, min, max }` launches the live
 count of a runtime variable bound by name, with buffers sized for `max`. Each config type has a

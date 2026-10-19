@@ -23,7 +23,7 @@ code `device/src/metal/` (device, allocator, compile, program, graph, Metal 4 pr
 
 बैकएंड सितंबर 2026 में आया और इसे एक hardware family पर परखा गया है: macOS 26 के अंतर्गत
 **Apple9** (M3/M4 class), जहाँ tensor suite और ONNX suite green हैं। Metal केवल graph
-कर्नेल चलाता है: tk3 का Apple target बिना कर्नेल का एक `simdgroup` atom है
+कर्नेल चलाता है: tk का Apple target बिना कर्नेल का एक `simdgroup` atom है
 ([Tile कर्नेल](../tile-kernels/overview.md))। पुराने systems के लिए
 लिखे गए paths (public `newLibraryWithSource:` compile fallback, pre-Apple9
 indirect-command-buffer workaround, `metal3.x` / `metal2.0` language standards) implement
@@ -108,8 +108,8 @@ off है (`-fno-fast-math`, या public path पर `MTLMathModeSafe`) त�
 प्रति-shape helper में lower होता है: एक shape, 32 threads पर 8×8×8, प्रति लेन दो elements,
 f32→f32, f16→f32, f16→f16, bf16→f32 और bf16→bf16 के लिए (optimizer profile में
 `METAL_888`)। Dialect hand kernels के लिए `simd_shuffle`, `simd_shuffle_xor` और
-`simdgroup_barrier` builders भी export करता है (`codegen/src/c/metal.rs`); tk3 का emitter
-Apple पर lane move को `simd_shuffle_xor` में lower करता है, पर अभी कोई tk3 कर्नेल Apple पर नहीं चलता।
+`simdgroup_barrier` builders भी export करता है (`codegen/src/c/metal.rs`); tk का emitter
+Apple पर lane move को `simd_shuffle_xor` में lower करता है, पर अभी कोई tk कर्नेल Apple पर नहीं चलता।
 
 ---
 

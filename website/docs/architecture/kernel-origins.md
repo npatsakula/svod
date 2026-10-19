@@ -108,7 +108,7 @@ literals and buffers never carry an origin.
 
 ### Hand-written kernels
 
-A hand kernel (`tk3`) is attributed by the scope active when it is built — the same rule as a graph
+A hand kernel (`tk`) is attributed by the scope active when it is built — the same rule as a graph
 kernel. The scheduler never sees its body, so `UOp::custom_kernel` harvests and strips it at
 construction (`ir/src/uop/constructors/graph.rs`); two layers launching the same hand kernel
 still share one compiled program. Inputs it copies in inherit their producer's origin.

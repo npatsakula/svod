@@ -117,11 +117,11 @@ utilization है; और `dram` bandwidth-bound kernel को issue-bound स�
 SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
 ```
 
-tk3 के throughput probes सिर्फ़ hand kernels का समय मापते हैं। वे event timestamps पढ़ते हैं,
+tk के throughput probes सिर्फ़ hand kernels का समय मापते हैं। वे event timestamps पढ़ते हैं,
 counters नहीं:
 
 ```bash
-SVOD_DEVICE=CUDA:0 cargo test -p svod-tk3 --release --lib gemm_throughput_probe -- --ignored --nocapture
+SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --release --lib gemm_throughput_probe -- --ignored --nocapture
 ```
 
 ### Privileges

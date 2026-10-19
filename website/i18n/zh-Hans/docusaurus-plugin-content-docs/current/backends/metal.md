@@ -23,7 +23,7 @@ metallib。
 
 该后端于 2026 年 9 月合入，并已在一个硬件系列上得到实际运行：macOS 26 下的
 **Apple9**（M3/M4 级别），在其上张量测试套件和 ONNX 测试套件全部通过。Metal 只运行
-图内核：tk3 的 Apple 目标只有 `simdgroup` 原子，没有内核
+图内核：tk 的 Apple 目标只有 `simdgroup` 原子，没有内核
 （[Tile 内核](../tile-kernels/overview.md)）。为旧系统编写的路径
 （公开的 `newLibraryWithSource:` 编译回退、Apple9 之前的间接命令缓冲区变通方案、
 `metal3.x` / `metal2.0` 语言标准）已实现，但尚未在此类硬件上验证。没有 Metal 设备
@@ -104,7 +104,7 @@ f64 降为 f32。bf16 算术经由 `float` 提升，bf16 收窄使用整数就�
 8×8×8，每个通道两个元素，支持 f32→f32、f16→f32、f16→f16、bf16→f32 和 bf16→bf16
 （优化器配置中的 `METAL_888`）。该方言还为手写内核导出 `simd_shuffle`、
 `simd_shuffle_xor` 和 `simdgroup_barrier` 构建器（`codegen/src/c/metal.rs`）；
-tk3 的发射器把 Apple 上的 lane 交换降低为 `simd_shuffle_xor`，但目前还没有 tk3 内核在 Apple 上运行。
+tk 的发射器把 Apple 上的 lane 交换降低为 `simd_shuffle_xor`，但目前还没有 tk 内核在 Apple 上运行。
 
 ---
 

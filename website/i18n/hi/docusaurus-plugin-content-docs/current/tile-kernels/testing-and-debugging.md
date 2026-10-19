@@ -4,9 +4,9 @@ sidebar_label: टेस्टिंग और डिबगिंग
 
 # टेस्टिंग और डिबगिंग {#testing-and-debugging}
 
-हर tk3 कर्नेल दो स्तरों पर जाँचा जाता है। Host पर, उसका tile program interpreter में एक सीधे reference
+हर tk कर्नेल दो स्तरों पर जाँचा जाता है। Host पर, उसका tile program interpreter में एक सीधे reference
 के ख़िलाफ़ चलता है, और lowered program हर target के लिए render होता है और, जहाँ toolchain installed हो,
-compile होता है। tk3 kernels वाले GPU (CUDA या AMD) पर, lowered कर्नेल interpreter के ख़िलाफ़ या op के
+compile होता है। tk kernels वाले GPU (CUDA या AMD) पर, lowered कर्नेल interpreter के ख़िलाफ़ या op के
 अपने graph fallback के ख़िलाफ़ चलता है। Tests IR के hashes नहीं, बल्कि tolerances के भीतर values की तुलना
 करते हैं।
 
@@ -45,18 +45,18 @@ ordering bugs सिर्फ़ device पर दिखते हैं।
 ## Suite चलाना {#running-the-suite}
 
 `SVOD_DEVICE` device चुनता है। Device tests `skipped: …` line के साथ सिर्फ़ वहीं skip होते हैं जहाँ चलाने
-के लिए कुछ नहीं है: `SVOD_DEVICE=CPU`, ऐसा GPU जिसके लिए tk3 के पास kernels नहीं, या न `SVOD_DEVICE` और न
+के लिए कुछ नहीं है: `SVOD_DEVICE=CPU`, ऐसा GPU जिसके लिए tk के पास kernels नहीं, या न `SVOD_DEVICE` और न
 कोई supported GPU जुड़ा हुआ। Supported GPU जुड़ा हो और `SVOD_DEVICE` unset हो, तो वे fail होते हैं और वह
 मान बताते हैं जो set करना है, क्योंकि जिस suite के सारे device tests skip हों वह pass होकर भी कुछ साबित
 नहीं करता।
 
 ```bash
 # Host only, no GPU:
-SVOD_DEVICE=CPU cargo test -p svod-tk3 --release --lib
+SVOD_DEVICE=CPU cargo test -p svod-tk --release --lib
 # On the GPU; on a fresh tune store run the cost probes alone first, since the parallel
 # suite inflates what they measure and the store keeps the first measurement:
-SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib device_costs_are_physical
-SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib
+SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib device_costs_are_physical
+SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib
 ```
 
 `SVOD_DEVICE=AMD` (या `AMD:N`, KFD node क्रम में) एक AMD GPU चुनता है। कोई target तभी मापा हुआ गिना
@@ -66,7 +66,7 @@ SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib
 
 ### नए GPU पर {#on-a-new-gpu}
 
-1. Tune store को किसी ऐसी directory पर रखें जिसे सँभालना है: `SVOD_TK3_TUNE_DIR=$PWD/tk3_tune_$(hostname)`।
+1. Tune store को किसी ऐसी directory पर रखें जिसे सँभालना है: `SVOD_TK_TUNE_DIR=$PWD/tk_tune_$(hostname)`।
 2. कई AMD nodes वाली मशीन पर जाँचें कि `SVOD_DEVICE=AMD:N` जिस node का नाम लेता है वह GPU ही है
    (`/sys/class/kfd/kfd/topology/nodes/*/properties`, `gfx_target_version`)।
 3. पहले `device_costs_are_physical` अकेले चलाएँ, फिर `families_match_the_interpreter_on_the_device`,
@@ -87,21 +87,21 @@ SVOD_DEVICE=CUDA cargo test -p svod-model --release --lib nemotron_diar::parity:
 
 ## किसी दूसरे कार्ड के लिए planning {#planning-for-another-card}
 
-`tk3_dump` example दिखाता है कि tk3 ऐसे कार्ड पर क्या चलाएगा जिसका device इस मशीन पर नहीं है: अनुमानित
+`tk_dump` example दिखाता है कि tk ऐसे कार्ड पर क्या चलाएगा जिसका device इस मशीन पर नहीं है: अनुमानित
 ns के साथ planner की ranking और lattice का हर config क्यों छोड़ा गया (`plan.txt`), चुने गए config का LLVM
 text और, जहाँ tools installed हों, उसका PTX, `ptxas -v` resources और SASS (CUDA) या अपनी resource
 comments के साथ AMDGCN assembly (AMD), और main loop का एक opcode histogram।
 
 ```bash
-cargo run -p svod-tk3 --release --example tk3_dump -- --card h100-pcie --op gemm --shape 4096x4096x4096
-cargo run -p svod-tk3 --release --example tk3_dump -- --arch gfx942 --op attention --shape 8x16x1024x128 --causal --store DIR
+cargo run -p svod-tk --release --example tk_dump -- --card h100-pcie --op gemm --shape 4096x4096x4096
+cargo run -p svod-tk --release --example tk_dump -- --arch gfx942 --op attention --shape 8x16x1024x128 --causal --store DIR
 ```
 
 `--card` `atoms::CARDS` का एक नाम लेता है (`rtx3060`, `h100-pcie`, `h100-sxm`, `rtx5070`,
 `rtx5090`, `mi300x`, `mi355x`, `rx9070xt`, `strix-halo`); `--arch` `--sms`/`--xcds` के साथ या सूची
 के पहले कार्ड वाले मानों के साथ एक architecture लेता है। `--store` कार्ड से copy की गई tune store
 directory है, जिसकी probe lines ranking की कीमत तय करती हैं; उसके बिना guessed costs यह करती हैं।
-`--cfg N` N-वाँ ranked config emit करता है, `--out DIR` output directory का नाम देता है (`tk3_dump`)।
+`--cfg N` N-वाँ ranked config emit करता है, `--out DIR` output directory का नाम देता है (`tk_dump`)।
 
 `--op` `gemm` (`--shape MxNxK`), `attention` (`BxHxTxD`), `norm` (`RxD`), `conv`
 (`BxHxWxCINxCOUT`) या `heads` (`BxTxHxKVxD`) लेता है, हर एक op layer के अपने shape gate और tuning
@@ -109,12 +109,12 @@ directory है, जिसकी probe lines ranking की कीमत तय
 पढ़कर और उसमें कुछ लिखे बिना: stored line op, device, dtype, shape और उस config list से match होती है
 जिससे op layer उसे key करता है, चाहे उसे किसी भी compiler या kernel build ने लिखा हो, और dump पढ़ी गई
 हर key print करता है या बताता है कि कौन-सी line नहीं है। `--compare FILE [--fun NAME]` किसी reference
-kernel (एक `.cubin`, AMD code object, या SASS, PTX या AMDGCN text) का main loop tk3 के main loop के
+kernel (एक `.cubin`, AMD code object, या SASS, PTX या AMDGCN text) का main loop tk के main loop के
 बगल में print करता है, उसी तरह गिना हुआ।
 
 ```bash
-cargo run -p svod-tk3 --release --example tk3_dump -- --card rtx3060 --op gemm --shape 4096x4096x4096 --cfg tuned --store ~/.cache/svod/tk3_tune
-cargo run -p svod-tk3 --release --example tk3_dump -- --card mi300x --op gemm --shape 4096x4096x4096 --compare hk.co --fun NAME
+cargo run -p svod-tk --release --example tk_dump -- --card rtx3060 --op gemm --shape 4096x4096x4096 --cfg tuned --store ~/.cache/svod/tk_tune
+cargo run -p svod-tk --release --example tk_dump -- --card mi300x --op gemm --shape 4096x4096x4096 --compare hk.co --fun NAME
 ```
 
 ## Environment variables {#environment-variables}
@@ -122,10 +122,10 @@ cargo run -p svod-tk3 --release --example tk3_dump -- --card mi300x --op gemm --
 | Variable | असर |
 |---|---|
 | `SVOD_DEVICE` | Default device: `CUDA[:N]`, `AMD[:N]`, `CPU`। यह तय करता है कि kernels लागू होते हैं या नहीं और कौन से device tests चलते हैं |
-| `SVOD_TK3_TUNE=0` | कोई candidate timing नहीं; पहला clean config चलता है (देखें [Tuning](./tuning)) |
-| `SVOD_TK3_TUNE_DIR` | Tune store की directory |
-| `RUST_LOG=svod_tk3::plan=debug` | Planner के फ़ैसले; `svod_tk3=debug` tuner के rounds जोड़ता है |
-| `TK3_DUMP_LIST=1` | Program lower होने पर हर emitted instruction छापता है (`[i] id op dtype <- sources`)। Bodies memoize होती हैं, इसलिए यह हर program की सिर्फ़ पहली lowering छापता है |
+| `SVOD_TK_TUNE=0` | कोई candidate timing नहीं; पहला clean config चलता है (देखें [Tuning](./tuning)) |
+| `SVOD_TK_TUNE_DIR` | Tune store की directory |
+| `RUST_LOG=svod_tk::plan=debug` | Planner के फ़ैसले; `svod_tk=debug` tuner के rounds जोड़ता है |
+| `TK_DUMP_LIST=1` | Program lower होने पर हर emitted instruction छापता है (`[i] id op dtype <- sources`)। Bodies memoize होती हैं, इसलिए यह हर program की सिर्फ़ पहली lowering छापता है |
 | `SVOD_SPEC_DEBUG=1` | जब कोई program IR spec verification में fail हो, तो ठुकराया गया instruction और उसका tree छापता है |
 
 ## किसी मॉडल की profiling {#profiling-a-model}
@@ -137,7 +137,7 @@ profile करता है, और उसकी per-kernel report छापत�
 cargo run -p svod-model --release --example nemotron_diarize -- audio_1.wav --dtype bf16 --profile
 ```
 
-tk3 kernels अपने कर्नेल नामों (`gemm`, `conv`, `flash_attention`, `heads`, `layer_norm`, …) के तहत
+tk kernels अपने कर्नेल नामों (`gemm`, `conv`, `flash_attention`, `heads`, `layer_norm`, …) के तहत
 graph kernels के बगल में दिखते हैं, उसी तरह मापे हुए।
 
 :::tip[शांत GPU पर मापें]

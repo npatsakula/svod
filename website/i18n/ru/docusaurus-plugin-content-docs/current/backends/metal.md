@@ -25,7 +25,7 @@ Linux просто проваливает `dlopen` и никогда не рег
 Бэкенд появился в сентябре 2026 года и опробован на одном семействе железа:
 **Apple9** (класс M3/M4) под macOS 26, где зелёные тестовый набор тензоров,
 набор ONNX (`METAL:0` и `CPU` проходят одни и те же 4577 случаев). Metal
-выполняет только графовые ядра: Apple-таргет tk3 — это атом `simdgroup` без
+выполняет только графовые ядра: Apple-таргет tk — это атом `simdgroup` без
 ядер ([Tile-ядра](../tile-kernels/overview.md)). Пути, написанные для старых систем (публичный запасной путь
 компиляции `newLibraryWithSource:`, обход для indirect command buffers до
 Apple9, языковые стандарты `metal3.x` / `metal2.0`), реализованы, но не
@@ -114,8 +114,8 @@ kernel void r_64_32(device float* data0, device float* data1, constant int& data
 потоках по два элемента на полосу, для f32→f32, f16→f32, f16→f16, bf16→f32 и
 bf16→bf16 (`METAL_888` в профиле оптимизатора). Диалект также экспортирует
 билдеры `simd_shuffle`, `simd_shuffle_xor` и `simdgroup_barrier` для ручных
-ядер (`codegen/src/c/metal.rs`); эмиттер tk3 опускает межлейновый обмен на Apple
-в `simd_shuffle_xor`, но ни одно ядро tk3 пока не работает на Apple.
+ядер (`codegen/src/c/metal.rs`); эмиттер tk опускает межлейновый обмен на Apple
+в `simd_shuffle_xor`, но ни одно ядро tk пока не работает на Apple.
 
 ---
 

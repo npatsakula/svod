@@ -118,7 +118,7 @@ fence होता है।
 ## Emission {#emission}
 
 Emitter हर statement के instructions को program order में एक pre-linearized program में सूचीबद्ध
-करता है, इसलिए Svod के linearizer का toposort किसी tk3 कर्नेल पर कभी नहीं चलता। View के bounds से
+करता है, इसलिए Svod के linearizer का toposort किसी tk कर्नेल पर कभी नहीं चलता। View के bounds से
 आगे के global accesses gated होते हैं: loads शून्य पढ़ते हैं और stores छोड़ दिए जाते हैं। जहाँ row
 में chunks की गिनती दो की घात हो, वहाँ shared rows 16-byte chunks में XOR-swizzle होती हैं
 (`layouts::Swizzle`)। 16-bit tiles के shared से register loads, जहाँ layout अनुमति दे, `ldmatrix.x4`
@@ -134,4 +134,4 @@ scalar होते हैं। Shared और global accesses `SHRINK` vector a
 के अंदर रहते हैं। Carried values उन्हें परिभाषित करने वाले block के अंत में अपने `phi` में जाती हैं।
 :::
 
-`TK3_DUMP_LIST=1` emit की गई list छापता है (देखें [टेस्टिंग और डिबगिंग](./testing-and-debugging))।
+`TK_DUMP_LIST=1` emit की गई list छापता है (देखें [टेस्टिंग और डिबगिंग](./testing-and-debugging))।

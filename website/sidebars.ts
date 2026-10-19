@@ -49,7 +49,7 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
-      label: 'Tile Kernels (tk3)',
+      label: 'Tile Kernels (tk)',
       items: [
         'tile-kernels/overview',
         'tile-kernels/first-kernel',

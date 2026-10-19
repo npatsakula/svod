@@ -20,7 +20,7 @@ tables नहीं हैं। Costs lowering तक `Lowering::device` के
 round trip) और op layer तक `Planner` के device के रूप में (candidate rankings)। मापे गए targets और
 उनके आँकड़े [अवलोकन](./overview#targets) में हैं।
 
-`ops::supported(device)` तब true है जब `device` default device हो, उसके target के पास tk3 kernels हों
+`ops::supported(device)` तब true है जब `device` default device हो, उसके target के पास tk kernels हों
 (`config::has_kernels`) और वह एक SM count बताता हो; cost probes पहले पूछने पर चलते हैं। किसी भी दूसरे
 device पर हर op अपना graph fallback बनाता है (`Fallback::Target`)। Host tests हर atom के operand layouts
 को vendor ISA documents के lane formulas के ख़िलाफ़ जाँचते हैं, और kernels वाले हर target के लिए वे हर

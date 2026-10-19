@@ -58,7 +58,7 @@ candidate programs की एक list है, एक कर्नेल और s
 
 | क्या | मान |
 |---|---|
-| Directory | `$SVOD_TK3_TUNE_DIR`, वरना `$XDG_CACHE_HOME/svod/tk3_tune`, वरना `~/.cache/svod/tk3_tune` |
+| Directory | `$SVOD_TK_TUNE_DIR`, वरना `$XDG_CACHE_HOME/svod/tk_tune`, वरना `~/.cache/svod/tk_tune` |
 | File | हर device और crate version के लिए एक, जैसे `sm_86_28sm-v0.2.0.txt`, जिसकी शुरुआत उसके line format (`format 5`) से होती है; किसी दूसरे format वाली, या बिना इस line वाली फ़ाइल पूरी हटा दी जाती है |
 | Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: एक `choice` में चले हुए candidates होते हैं, सबसे तेज़ पहले, हर एक `index ns`; एक `value` में एक मापी गई संख्या; एक `admitted` में वे ranked indices जिन्हें admission ने रखा; एक `first` में पहले clean config का index |
 | Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, जहाँ `device` arch और SM count है (`sm_86-28sm`) और `compiler` device के compiler का digest है (`tune::compiler`) |
@@ -97,21 +97,21 @@ Host tests इसके बजाय costs घोषित करते है�
 `gfx1151_costs()`)। जिस कार्ड का device इस मशीन पर नहीं है, उसके लिए `Target::offline` या
 `Target::card` target देता है, और `probe::stored` उस कार्ड से copy किए गए tune store से costs पढ़ता है;
 उसके बिना `probe::GUESSED` उसकी जगह लेता है और ranking एक अनुमान है।
-[`tk3_dump` example](./testing-and-debugging#planning-for-another-card) दोनों करता है।
+[`tk_dump` example](./testing-and-debugging#planning-for-another-card) दोनों करता है।
 
 ## Planner log {#the-planner-log}
 
-`RUST_LOG=svod_tk3::plan=debug` planner के फ़ैसले log करता है: ग्राफ़ लेने वाला op और क्यों, किसी
+`RUST_LOG=svod_tk::plan=debug` planner के फ़ैसले log करता है: ग्राफ़ लेने वाला op और क्यों, किसी
 ranking के पहले 16 configs उनके अनुमानित ns के साथ और कितने configs उसने छोड़ दिए, store miss पर हर
 config को compile करने से क्या दिखा (verdict, registers, spilled bytes), और tuned चुनाव।
-`RUST_LOG=svod_tk3=debug` tuner के rounds जोड़ता है।
+`RUST_LOG=svod_tk=debug` tuner के rounds जोड़ता है।
 
 ## इसे बंद करना {#switching-it-off}
 
 | कैसे | असर |
 |---|---|
-| `SVOD_TK3_TUNE=0` | Candidate timing बंद; पहला ranked config जो clean compile हो वह चलता है (`first` line के रूप में रखा जाता है); cost probes फिर भी मापते हैं |
-| `svod_tk3::tune::scoped(false, f)` | इस thread पर (और जिन workers पर यह compile करता है उन पर) `f` के लिए वही, environment के ऊपर; tests इसे इस्तेमाल करते हैं |
+| `SVOD_TK_TUNE=0` | Candidate timing बंद; पहला ranked config जो clean compile हो वह चलता है (`first` line के रूप में रखा जाता है); cost probes फिर भी मापते हैं |
+| `svod_tk::tune::scoped(false, f)` | इस thread पर (और जिन workers पर यह compile करता है उन पर) `f` के लिए वही, environment के ऊपर; tests इसे इस्तेमाल करते हैं |
 
 `tune::TuneStore::at(root)` किसी दूसरे root पर store बनाता है, या `None` के साथ सिर्फ़ memory में।
 
@@ -122,7 +122,7 @@ Probe tests `#[ignore]` tests हैं जो timings छापते हैं
 हुए। इन्हें idle GPU पर एक-एक करके चलाएँ:
 
 ```bash
-SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib gemm_candidates_probe -- --ignored --nocapture --test-threads=1
+SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib gemm_candidates_probe -- --ignored --nocapture --test-threads=1
 ```
 
 | Probe | क्या छापता है |
@@ -135,4 +135,4 @@ SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib gemm_candidates_probe --
 | `decode_throughput_probe` | Whisper large-v3 के decoder step का self और cross attention, tuned splits और बिना split |
 | `conv_throughput_probe` | हर YOLO26 class के लिए हर admit हुआ convolution candidate, graph convolution के ख़िलाफ़ |
 | `norm_bandwidth_probe` | 8192×1024 bf16 पर row kernels, GB/s में |
-| `first_execution_probe` | tk3 GEMM को build, lower और prepare करने की host cost, graph GEMM के ख़िलाफ़ |
+| `first_execution_probe` | tk GEMM को build, lower और prepare करने की host cost, graph GEMM के ख़िलाफ़ |

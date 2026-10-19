@@ -4,8 +4,8 @@ sidebar_label: Op Layer
 
 # Op Layer
 
-`svod_tk3::ops` is what models call. Every op returns a lazy `Tensor`. When the device, dtypes
-and shapes fit a kernel, a tk3 kernel computes it. Otherwise the op builds the equivalent graph
+`svod_tk::ops` is what models call. Every op returns a lazy `Tensor`. When the device, dtypes
+and shapes fit a kernel, a tk kernel computes it. Otherwise the op builds the equivalent graph
 itself. A model never checks whether a kernel applies and never pads to a tile.
 
 ```rust
@@ -48,11 +48,11 @@ so it is tested on the host without a GPU (`test/unit/ops_plan.rs`). `Plan::Kern
 holds the ranked configs; the [tuner](./tuning) measures the first that compile without spilling
 (or, when every one spills, the first that compile: spills never send an op to the graph).
 `Plan::Graph(Fallback)` says why the graph runs, and the planner log names it
-(`RUST_LOG=svod_tk3::plan=debug`).
+(`RUST_LOG=svod_tk::plan=debug`).
 
 | `Fallback` | When |
 |---|---|
-| `Target` | The tensor is not on the default device, the device has no tk3 kernels (`config::has_kernels`: CUDA below sm_80, Metal, the CPU), or its target reports no SM count |
+| `Target` | The tensor is not on the default device, the device has no tk kernels (`config::has_kernels`: CUDA below sm_80, Metal, the CPU), or its target reports no SM count |
 | `Dtype` | Any operand is f32, or the operands do not all share one 16-bit type with a matrix core. `conv2d`: an output type other than the input's or f32, or a residual not in it |
 | `Symbolic` | A dim other than a bound leading one is symbolic (for `linear`, also a symbolic `N`) |
 | `Shape` | `linear`: `N` not a multiple of 8 or no rows. `conv2d`: `groups > 1`, `Cin` not a multiple of 16, `Cout` not a multiple of 8, or an empty output. `attention`: no config fits `D` (on sm_86, 32, 48, 64, 128 and 256 plan and 40 does not) or an empty dim. `heads`: `D` not a power of two in 16..=256. Norms: `D` not a power of two in 256..=2048 |

@@ -4,16 +4,16 @@ sidebar_label: 第一个内核
 
 # 第一个内核 {#your-first-kernel}
 
-tk3 内核是一个 Rust 函数，它用 `Kernel` 构建器记录一个 tile 程序。每次调用都会向当前打开的块追加一条语句，并返回一个带类型的句柄。句柄携带其层级（`Gmem<T>`、`Shared<T>`、`Regs<T>`）和元素类型（`BF16`、`F16`、`F32`、`I32`、`Bool`）；共享内存分配是一个 `SmemRef<T>`。形状在语句被记录时检查。块索引、偏移量和迭代次数等标量是用普通运算符构造的 `Sc` 表达式。
+tk 内核是一个 Rust 函数，它用 `Kernel` 构建器记录一个 tile 程序。每次调用都会向当前打开的块追加一条语句，并返回一个带类型的句柄。句柄携带其层级（`Gmem<T>`、`Shared<T>`、`Regs<T>`）和元素类型（`BF16`、`F16`、`F32`、`I32`、`Bool`）；共享内存分配是一个 `SmemRef<T>`。形状在语句被记录时检查。块索引、偏移量和迭代次数等标量是用普通运算符构造的 `Sc` 表达式。
 
 ## 一个最小的内核 {#a-minimal-kernel}
 
 在 `[rows, 64]` 的 f32 矩阵上计算 `y = 2·x + 1`，每个块处理 16 行。视图的行边界使最后一个块中超出 `rows` 的行读为零、写入被丢弃，因此 `rows` 不必是 16 的倍数。
 
 ```rust
-use svod_tk3::build::*;
-use svod_tk3::interp::run;
-use svod_tk3::ir::*;
+use svod_tk::build::*;
+use svod_tk::interp::run;
+use svod_tk::ir::*;
 
 fn axpb(rows: usize) -> Program {
     let cols = 64;
@@ -108,15 +108,15 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 ```rust
 use svod_dtype::{DType, default_device::default_device};
 use svod_tensor::Tensor;
-use svod_tk3::atoms::{Core, Device, Target};
-use svod_tk3::build::BF16;
-use svod_tk3::kernels::Batch;
-use svod_tk3::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use svod_tk3::launch::graph_launch;
+use svod_tk::atoms::{Core, Device, Target};
+use svod_tk::build::BF16;
+use svod_tk::kernels::Batch;
+use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk::launch::graph_launch;
 
 let (m, n, k) = (1000, 512, 256);
 let target = Target::for_device(&default_device()).expect("a GPU target");
-let device = Device { costs: svod_tk3::probe::costs(&target)?.costs, target };
+let device = Device { costs: svod_tk::probe::costs(&target)?.costs, target };
 let cfg =
     GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true, core: Core::Warp, crews: 1 };
 let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };

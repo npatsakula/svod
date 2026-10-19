@@ -4,7 +4,7 @@ sidebar_label: 算子层
 
 # 算子层 {#op-layer}
 
-`svod_tk3::ops` 是模型调用的接口。每个算子都返回惰性 `Tensor`。当设备、数据类型和形状适合某个内核时，由 tk3 内核计算；否则算子自行构建等价的计算图。模型从不检查内核是否适用，也从不填充到 tile 大小。
+`svod_tk::ops` 是模型调用的接口。每个算子都返回惰性 `Tensor`。当设备、数据类型和形状适合某个内核时，由 tk 内核计算；否则算子自行构建等价的计算图。模型从不检查内核是否适用，也从不填充到 tile 大小。
 
 ```rust
 pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor>;
@@ -33,11 +33,11 @@ pub fn supported(device: &DeviceSpec) -> bool;
 
 ## 内核还是计算图 {#kernel-or-graph}
 
-决策是 `ops::shape` 中的纯函数 `fn(planner, dtypes, extents, …) -> Plan<Cfg>`，因此可以在没有 GPU 的主机上测试（`test/unit/ops_plan.rs`）。`Plan::Kernel(configs)` 持有排序后的配置；[调优器](./tuning)测量其中最先能编译且不溢出的配置（若每个都溢出，则测量最先能编译的那些：溢出从不会让算子退回计算图）。`Plan::Graph(Fallback)` 说明为什么运行计算图，规划器日志会写出该原因（`RUST_LOG=svod_tk3::plan=debug`）。
+决策是 `ops::shape` 中的纯函数 `fn(planner, dtypes, extents, …) -> Plan<Cfg>`，因此可以在没有 GPU 的主机上测试（`test/unit/ops_plan.rs`）。`Plan::Kernel(configs)` 持有排序后的配置；[调优器](./tuning)测量其中最先能编译且不溢出的配置（若每个都溢出，则测量最先能编译的那些：溢出从不会让算子退回计算图）。`Plan::Graph(Fallback)` 说明为什么运行计算图，规划器日志会写出该原因（`RUST_LOG=svod_tk::plan=debug`）。
 
 | `Fallback` | 何时出现 |
 |---|---|
-| `Target` | 张量不在默认设备上，设备没有 tk3 内核（`config::has_kernels`：sm_80 以下的 CUDA、Metal、CPU），或其目标未报告 SM 数量 |
+| `Target` | 张量不在默认设备上，设备没有 tk 内核（`config::has_kernels`：sm_80 以下的 CUDA、Metal、CPU），或其目标未报告 SM 数量 |
 | `Dtype` | 任一操作数为 f32，或操作数没有共享同一种带矩阵核心的 16 位类型。`conv2d`：输出类型既不是输入类型也不是 f32，或残差不是该类型 |
 | `Symbolic` | 除绑定的首维之外还有符号维度（对 `linear` 而言，符号化的 `N` 也算） |
 | `Shape` | `linear`：`N` 不是 8 的倍数或没有行。`conv2d`：`groups > 1`、`Cin` 不是 16 的倍数、`Cout` 不是 8 的倍数或输出为空。`attention`：没有适合 `D` 的配置（在 sm_86 上，32、48、64、128 和 256 能规划，40 不能）或存在空维度。`heads`：`D` 不是 16..=256 范围内的 2 的幂。归一化：`D` 不是 256..=2048 范围内的 2 的幂 |

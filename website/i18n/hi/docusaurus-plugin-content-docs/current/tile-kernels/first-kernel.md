@@ -4,7 +4,7 @@ sidebar_label: आपका पहला कर्नेल
 
 # आपका पहला कर्नेल {#your-first-kernel}
 
-tk3 कर्नेल एक Rust function है जो `Kernel` builder से एक tile program रिकॉर्ड करता है। हर कॉल खुले
+tk कर्नेल एक Rust function है जो `Kernel` builder से एक tile program रिकॉर्ड करता है। हर कॉल खुले
 block में एक statement जोड़ती है और एक typed handle लौटाती है। Handle अपना tier (`Gmem<T>`,
 `Shared<T>`, `Regs<T>`) और element type (`BF16`, `F16`, `F32`, `I32`, `Bool`) साथ रखता है; एक
 shared allocation `SmemRef<T>` होता है। Statement रिकॉर्ड होते समय shapes जाँचे जाते हैं। Block
@@ -17,9 +17,9 @@ block की `rows` से आगे की rows शून्य पढ़ी �
 16 का गुणज होना ज़रूरी नहीं।
 
 ```rust
-use svod_tk3::build::*;
-use svod_tk3::interp::run;
-use svod_tk3::ir::*;
+use svod_tk::build::*;
+use svod_tk::interp::run;
+use svod_tk::ir::*;
 
 fn axpb(rows: usize) -> Program {
     let cols = 64;
@@ -127,15 +127,15 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 ```rust
 use svod_dtype::{DType, default_device::default_device};
 use svod_tensor::Tensor;
-use svod_tk3::atoms::{Core, Device, Target};
-use svod_tk3::build::BF16;
-use svod_tk3::kernels::Batch;
-use svod_tk3::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use svod_tk3::launch::graph_launch;
+use svod_tk::atoms::{Core, Device, Target};
+use svod_tk::build::BF16;
+use svod_tk::kernels::Batch;
+use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk::launch::graph_launch;
 
 let (m, n, k) = (1000, 512, 256);
 let target = Target::for_device(&default_device()).expect("a GPU target");
-let device = Device { costs: svod_tk3::probe::costs(&target)?.costs, target };
+let device = Device { costs: svod_tk::probe::costs(&target)?.costs, target };
 let cfg =
     GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true, core: Core::Warp, crews: 1 };
 let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };

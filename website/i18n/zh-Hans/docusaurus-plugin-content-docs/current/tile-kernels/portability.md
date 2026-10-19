@@ -10,7 +10,7 @@ sidebar_label: 可移植性
 
 目标只声明芯片能做什么，从不声明其代价。其原语的代价（`atoms::Costs`）在首次使用时于设备上测量（`probe::costs`），并保存在调优存储中；主机测试则直接声明它们（[调优](./tuning#device-costs)）。不存在按家族划分的代价表。这些代价以 `Lowering::device` 进入降级（方向、交换或往返），以 `Planner` 的设备进入算子层（候选排序）。已测量的目标及其数字见[概览](./overview#targets)。
 
-当 `device` 是默认设备、其目标有 tk3 内核（`config::has_kernels`）并报告了 SM 数量时，`ops::supported(device)` 为真；代价探针在第一次询问时运行。在其他任何设备上，每个算子都构建自己的计算图回退（`Fallback::Target`）。主机测试把每个原子的操作数布局与厂商 ISA 文档中的 lane 公式逐一核对；对每个有内核的目标，它们降级每个内核族，在降级前后用解释器运行，并在安装了 `ptxas` 或 clang 时编译。“已编译”不等于“在设备上正确”：只有当 `targets::families_match_the_interpreter_on_the_device` 在其硬件上通过后，目标才算已测量。
+当 `device` 是默认设备、其目标有 tk 内核（`config::has_kernels`）并报告了 SM 数量时，`ops::supported(device)` 为真；代价探针在第一次询问时运行。在其他任何设备上，每个算子都构建自己的计算图回退（`Fallback::Target`）。主机测试把每个原子的操作数布局与厂商 ISA 文档中的 lane 公式逐一核对；对每个有内核的目标，它们降级每个内核族，在降级前后用解释器运行，并在安装了 `ptxas` 或 clang 时编译。“已编译”不等于“在设备上正确”：只有当 `targets::families_match_the_interpreter_on_the_device` 在其硬件上通过后，目标才算已测量。
 
 没有 `cp.async` 时（AMD 没有异步的全局 → LDS 拷贝），流水线把每一步加载到寄存器，计算上一步，再把寄存器写入共享内存，使用一个或两个槽位。同一路径也在 CUDA 的设备测试中运行（`register_staged_families_match_on_cuda`）。
 

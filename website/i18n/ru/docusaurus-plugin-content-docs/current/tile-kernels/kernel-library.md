@@ -4,7 +4,7 @@ sidebar_label: Библиотека ядер
 
 # Библиотека ядер {#kernel-library}
 
-Каждое ядро в `svod_tk3::kernels` — функция `fn k<T: Elem>(spec: &Spec) -> Program`, обобщённая
+Каждое ядро в `svod_tk::kernels` — функция `fn k<T: Elem>(spec: &Spec) -> Program`, обобщённая
 по 16-битному типу элемента (`BF16` или `F16`). У каждой спецификации есть `batch: Batch`:
 `Batch::Static(n)` запускает `n` батчей, а `Batch::Var { name, min, max }` — живое количество
 из переменной времени выполнения, связываемой по имени, с буферами, рассчитанными на `max`.

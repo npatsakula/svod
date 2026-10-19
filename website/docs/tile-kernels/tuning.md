@@ -56,7 +56,7 @@ Two guards keep a time honest:
 
 | What | Value |
 |---|---|
-| Directory | `$SVOD_TK3_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk3_tune`, else `~/.cache/svod/tk3_tune` |
+| Directory | `$SVOD_TK_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk_tune`, else `~/.cache/svod/tk_tune` |
 | File | One per device and crate version, e.g. `sm_86_28sm-v0.2.0.txt`, headed by its line format (`format 5`); a file of another format, or without the line, is dropped whole |
 | Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: a `choice` holds the candidates that ran, fastest first, each `index ns`; a `value` a measured number; an `admitted` the ranked indices admission kept; a `first` the first clean config's index |
 | Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, where `device` is arch and SM count (`sm_86-28sm`) and `compiler` digests the device's compiler (`tune::compiler`) |
@@ -94,21 +94,21 @@ Host tests declare costs instead (`test::unit::costs()`, and `gfx1151_costs()` p
 gfx1151 store). For a card this machine has no device for, `Target::offline` or `Target::card`
 gives the target, and `probe::stored` reads the costs from a tune store copied from that card;
 without one, `probe::GUESSED` stands in and the ranking is a guess. The
-[`tk3_dump` example](./testing-and-debugging#planning-for-another-card) does both.
+[`tk_dump` example](./testing-and-debugging#planning-for-another-card) does both.
 
 ## The planner log
 
-`RUST_LOG=svod_tk3::plan=debug` logs the planner's decisions: an op that takes the graph and
+`RUST_LOG=svod_tk::plan=debug` logs the planner's decisions: an op that takes the graph and
 why, a ranking's first 16 configs with their predicted ns and how many configs it left out, on a
 store miss what compiling each config showed (verdict, registers, spilled bytes), and the tuned
-pick. `RUST_LOG=svod_tk3=debug` adds the tuner's rounds.
+pick. `RUST_LOG=svod_tk=debug` adds the tuner's rounds.
 
 ## Switching it off
 
 | How | Effect |
 |---|---|
-| `SVOD_TK3_TUNE=0` | Candidate timing off; the first ranked config that compiles clean runs (kept as a `first` line); the cost probes still measure |
-| `svod_tk3::tune::scoped(false, f)` | The same for `f` on this thread (and the workers it compiles on), over the environment; tests use it |
+| `SVOD_TK_TUNE=0` | Candidate timing off; the first ranked config that compiles clean runs (kept as a `first` line); the cost probes still measure |
+| `svod_tk::tune::scoped(false, f)` | The same for `f` on this thread (and the workers it compiles on), over the environment; tests use it |
 
 `tune::TuneStore::at(root)` builds a store at another root, or in memory only with `None`.
 
@@ -119,7 +119,7 @@ device's probed costs and time the shortlist the tuner admits, marking the tuner
 them one at a time on an idle GPU:
 
 ```bash
-SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib gemm_candidates_probe -- --ignored --nocapture --test-threads=1
+SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib gemm_candidates_probe -- --ignored --nocapture --test-threads=1
 ```
 
 | Probe | Prints |
@@ -132,4 +132,4 @@ SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib gemm_candidates_probe --
 | `decode_throughput_probe` | A Whisper large-v3 decoder step's self and cross attention, tuned splits and unsplit |
 | `conv_throughput_probe` | Every admitted convolution candidate per YOLO26 class against the graph convolution |
 | `norm_bandwidth_probe` | The row kernels on 8192×1024 bf16, in GB/s |
-| `first_execution_probe` | Host cost of building, lowering and preparing a tk3 GEMM against a graph GEMM |
+| `first_execution_probe` | Host cost of building, lowering and preparing a tk GEMM against a graph GEMM |

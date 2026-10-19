@@ -20,7 +20,7 @@ tables. The costs reach the lowering as `Lowering::device` (orientation, exchang
 and the op layer as the `Planner`'s device (the candidate rankings). The measured targets and
 their numbers are in the [Overview](./overview#targets).
 
-`ops::supported(device)` is true when `device` is the default device, its target has tk3
+`ops::supported(device)` is true when `device` is the default device, its target has tk
 kernels (`config::has_kernels`) and reports an SM count; the cost probes run on the first ask.
 On any other device each op builds its graph fallback (`Fallback::Target`). Host tests check
 every atom's operand layouts against the lane formulas of the vendor ISA documents, and for each

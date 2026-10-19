@@ -2,22 +2,23 @@
 sidebar_label: Overview
 ---
 
-# Tile Kernels (tk3)
+# Tile Kernels (tk)
 
 Svod's optimizer finds fast schedules for most of a model by searching over loop
 transformations. Some kernels cannot be found that way. Flash attention is a recurrence: every
 key block updates a running maximum and sum and rescales the accumulator, so there is no single
 reduction to tile. A fast GEMM on a tensor-core GPU depends on a multi-stage `cp.async` ring,
 `ldmatrix` fragment loads and a swizzled shared layout, which are not steps of a loop search.
-Kernels like these are written by hand, and `svod-tk3` ("tk3") is the crate for writing them.
+Kernels like these are written by hand, and `svod-tk` ("tk") is the crate for writing them.
 
-tk3 is the only tile-kernel crate. It replaced tk1 (`svod-tk`), which was removed together with
-its k-means, kNN and Apple kernels; none of them was ported. Eight models run on the op layer: Nemotron-3-Diarization,
-Whisper (the encoder, and the decoder step's attention in cache mode), ModernBERT,
-BGE-M3/XLM-RoBERTa, Qwen3-Embedding, GigaAM, WavLM and YOLO26 (channels-last, its 3×3
-convolutions on `ops::conv2d`).
+`svod-tk` implements the third version of the tile language ("tk3") and is the only tile-kernel
+crate. It replaced tk1, the earlier crate of the same name, which was removed together with its
+k-means, kNN and Apple kernels; none of them was ported. Eight models run on the op layer:
+Nemotron-3-Diarization, Whisper (the encoder, and the decoder step's attention in cache mode),
+ModernBERT, BGE-M3/XLM-RoBERTa, Qwen3-Embedding, GigaAM, WavLM and YOLO26 (channels-last, its
+3×3 convolutions on `ops::conv2d`).
 
-## What tk3 is
+## What tk is
 
 | Piece | Module | What it does |
 |---|---|---|
@@ -34,7 +35,7 @@ convolutions on `ops::conv2d`).
 | Tune store | `tune` | Measures each op's candidates once per shape and device and keeps the winner on disk. |
 
 ```text
-model code ──► svod_tk3::ops          always a Tensor; picks a kernel and config or builds the graph op
+model code ──► svod_tk::ops          always a Tensor; picks a kernel and config or builds the graph op
                    │
                    ▼
               kernels::*               spec ─► tile Program (builder, program order)

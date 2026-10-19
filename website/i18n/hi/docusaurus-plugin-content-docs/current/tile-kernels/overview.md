@@ -2,22 +2,23 @@
 sidebar_label: अवलोकन
 ---
 
-# Tile कर्नेल (tk3) {#tile-kernels-tk3}
+# Tile कर्नेल (tk) {#tile-kernels-tk}
 
 Svod का ऑप्टिमाइज़र किसी मॉडल के ज़्यादातर हिस्से के लिए तेज़ schedules loop transformations पर सर्च
 करके खोज लेता है। कुछ कर्नेल इस तरह नहीं मिलते। Flash attention एक recurrence है: keys का हर block
 एक running maximum और sum को अपडेट करता है और accumulator को rescale करता है, इसलिए tile करने के लिए
 कोई एक reduction है ही नहीं। Tensor-core GPU पर तेज़ GEMM एक multi-stage `cp.async` ring,
 `ldmatrix` fragment loads और swizzled shared layout पर टिका होता है, और ये loop search के कदम नहीं
-हैं। ऐसे कर्नेल हाथ से लिखे जाते हैं, और `svod-tk3` ("tk3") उन्हें लिखने का crate है।
+हैं। ऐसे कर्नेल हाथ से लिखे जाते हैं, और `svod-tk` ("tk") उन्हें लिखने का crate है।
 
-tk3 एकमात्र tile-kernel crate है। इसने tk1 (`svod-tk`) की जगह ली, जिसे उसके k-means, kNN और
+`svod-tk` tile language का तीसरा संस्करण ("tk3") लागू करता है और एकमात्र tile-kernel crate है। इसने
+tk1 की जगह ली, जो इसी नाम का पुराना crate था और जिसे उसके k-means, kNN और
 Apple कर्नेल के साथ हटा दिया गया; इनमें से किसी को port नहीं किया गया। आठ मॉडल op layer पर चलते हैं: Nemotron-3-Diarization,
 Whisper (encoder, और cache mode में decoder step का attention), ModernBERT,
 BGE-M3/XLM-RoBERTa, Qwen3-Embedding, GigaAM, WavLM और YOLO26 (channels-last, जिसके 3×3
 convolutions `ops::conv2d` पर चलते हैं)।
 
-## tk3 क्या है {#what-tk3-is}
+## tk क्या है {#what-tk-is}
 
 | हिस्सा | मॉड्यूल | क्या करता है |
 |---|---|---|
@@ -34,7 +35,7 @@ convolutions `ops::conv2d` पर चलते हैं)।
 | Tune store | `tune` | हर op के candidates को हर shape और device पर एक बार मापता है और विजेता को डिस्क पर रखता है। |
 
 ```text
-model code ──► svod_tk3::ops          always a Tensor; picks a kernel and config or builds the graph op
+model code ──► svod_tk::ops          always a Tensor; picks a kernel and config or builds the graph op
                    │
                    ▼
               kernels::*               spec ─► tile Program (builder, program order)

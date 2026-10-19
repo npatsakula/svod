@@ -4,9 +4,9 @@ sidebar_label: Тестирование и отладка
 
 # Тестирование и отладка {#testing-and-debugging}
 
-Каждое ядро tk3 проверяется на двух уровнях. На хосте его тайловая программа выполняется в
+Каждое ядро tk проверяется на двух уровнях. На хосте его тайловая программа выполняется в
 интерпретаторе и сверяется с прямым эталоном, а пониженная программа рендерится и, где
-установлен тулчейн, компилируется для каждой цели. На GPU с ядрами tk3 (CUDA или AMD)
+установлен тулчейн, компилируется для каждой цели. На GPU с ядрами tk (CUDA или AMD)
 пониженное ядро сверяется с интерпретатором или с графовым запасным вариантом самой операции.
 Тесты сравнивают значения с допусками, а не хэши IR.
 
@@ -46,18 +46,18 @@ let out = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[("b", 1)]).
 ## Запуск набора тестов {#running-the-suite}
 
 `SVOD_DEVICE` выбирает устройство. Тесты на устройстве пропускаются со строкой `skipped: …`
-только там, где запускать не на чем: `SVOD_DEVICE=CPU`, GPU, для которого у tk3 нет ядер, или
+только там, где запускать не на чем: `SVOD_DEVICE=CPU`, GPU, для которого у tk нет ядер, или
 нет ни `SVOD_DEVICE`, ни подключённого поддерживаемого GPU. Если поддерживаемый GPU подключён, а
 `SVOD_DEVICE` не задан, они падают и называют значение, которое нужно задать: набор, в котором
 все тесты на устройстве пропущены, проходит и ничего не доказывает.
 
 ```bash
 # Host only, no GPU:
-SVOD_DEVICE=CPU cargo test -p svod-tk3 --release --lib
+SVOD_DEVICE=CPU cargo test -p svod-tk --release --lib
 # On the GPU; on a fresh tune store run the cost probes alone first, since the parallel
 # suite inflates what they measure and the store keeps the first measurement:
-SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib device_costs_are_physical
-SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib
+SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib device_costs_are_physical
+SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib
 ```
 
 `SVOD_DEVICE=AMD` (или `AMD:N`, в порядке узлов KFD) выбирает GPU AMD. Цель считается
@@ -69,7 +69,7 @@ SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib
 ### На новом GPU {#on-a-new-gpu}
 
 1. Направьте хранилище тюнинга в каталог, который нужно сохранить:
-   `SVOD_TK3_TUNE_DIR=$PWD/tk3_tune_$(hostname)`.
+   `SVOD_TK_TUNE_DIR=$PWD/tk_tune_$(hostname)`.
 2. На машине с несколькими узлами AMD проверьте, что узел, который называет `SVOD_DEVICE=AMD:N`,
    — это GPU (`/sys/class/kfd/kfd/topology/nodes/*/properties`, `gfx_target_version`).
 3. Запустите отдельно `device_costs_are_physical`, затем
@@ -91,15 +91,15 @@ SVOD_DEVICE=CUDA cargo test -p svod-model --release --lib nemotron_diar::parity:
 
 ## Планирование для другой карты {#planning-for-another-card}
 
-Пример `tk3_dump` показывает, что tk3 запустил бы на карте, которой на этой машине нет:
+Пример `tk_dump` показывает, что tk запустил бы на карте, которой на этой машине нет:
 ранжирование планировщика с предсказанными ns и причину, по которой не вошла каждая
 конфигурация решётки (`plan.txt`), текст LLVM выбранной конфигурации и, где установлены
 инструменты, её PTX, ресурсы `ptxas -v` и SASS (CUDA) или ассемблер AMDGCN с комментариями о
 ресурсах (AMD), а также гистограмму опкодов главного цикла.
 
 ```bash
-cargo run -p svod-tk3 --release --example tk3_dump -- --card h100-pcie --op gemm --shape 4096x4096x4096
-cargo run -p svod-tk3 --release --example tk3_dump -- --arch gfx942 --op attention --shape 8x16x1024x128 --causal --store DIR
+cargo run -p svod-tk --release --example tk_dump -- --card h100-pcie --op gemm --shape 4096x4096x4096
+cargo run -p svod-tk --release --example tk_dump -- --arch gfx942 --op attention --shape 8x16x1024x128 --causal --store DIR
 ```
 
 `--card` принимает имя из `atoms::CARDS` (`rtx3060`, `h100-pcie`, `h100-sxm`, `rtx5070`,
@@ -107,7 +107,7 @@ cargo run -p svod-tk3 --release --example tk3_dump -- --arch gfx942 --op attenti
 `--sms`/`--xcds` или с параметрами первой карты из списка. `--store` — каталог хранилища
 тюнинга, скопированный с карты, строки проб которого задают цены ранжирования; без него это
 делают угаданные стоимости. `--cfg N` выпускает N-ю ранжированную конфигурацию, `--out DIR`
-задаёт выходной каталог (`tk3_dump`).
+задаёт выходной каталог (`tk_dump`).
 
 `--op` принимает `gemm` (`--shape MxNxK`), `attention` (`BxHxTxD`), `norm` (`RxD`), `conv`
 (`BxHxWxCINxCOUT`) или `heads` (`BxTxHxKVxD`), каждый через собственные проверку формы и тюнинг
@@ -116,12 +116,12 @@ cargo run -p svod-tk3 --release --example tk3_dump -- --arch gfx942 --op attenti
 устройству, типу, форме и списку конфигураций, по которому её ключует слой операций, каким бы
 компилятором и какой бы сборкой ядер она ни была записана; дамп печатает каждый прочитанный ключ
 или говорит, какой строки нет. `--compare FILE [--fun NAME]` печатает главный цикл эталонного
-ядра (`.cubin`, объект кода AMD или текст SASS, PTX либо AMDGCN) рядом с главным циклом tk3,
+ядра (`.cubin`, объект кода AMD или текст SASS, PTX либо AMDGCN) рядом с главным циклом tk,
 посчитанным тем же способом.
 
 ```bash
-cargo run -p svod-tk3 --release --example tk3_dump -- --card rtx3060 --op gemm --shape 4096x4096x4096 --cfg tuned --store ~/.cache/svod/tk3_tune
-cargo run -p svod-tk3 --release --example tk3_dump -- --card mi300x --op gemm --shape 4096x4096x4096 --compare hk.co --fun NAME
+cargo run -p svod-tk --release --example tk_dump -- --card rtx3060 --op gemm --shape 4096x4096x4096 --cfg tuned --store ~/.cache/svod/tk_tune
+cargo run -p svod-tk --release --example tk_dump -- --card mi300x --op gemm --shape 4096x4096x4096 --compare hk.co --fun NAME
 ```
 
 ## Переменные окружения {#environment-variables}
@@ -129,10 +129,10 @@ cargo run -p svod-tk3 --release --example tk3_dump -- --card mi300x --op gemm --
 | Переменная | Эффект |
 |---|---|
 | `SVOD_DEVICE` | Устройство по умолчанию: `CUDA[:N]`, `AMD[:N]`, `CPU`. Решает, применимы ли ядра и какие тесты на устройстве запускаются |
-| `SVOD_TK3_TUNE=0` | Без замера кандидатов; работает первая чистая конфигурация (см. [Тюнинг](./tuning)) |
-| `SVOD_TK3_TUNE_DIR` | Каталог хранилища тюнинга |
-| `RUST_LOG=svod_tk3::plan=debug` | Решения планировщика; `svod_tk3=debug` добавляет раунды тюнера |
-| `TK3_DUMP_LIST=1` | Печатает каждую выпущенную инструкцию (`[i] id op dtype <- sources`) при понижении программы. Тела мемоизируются, поэтому печатается только первое понижение каждой программы |
+| `SVOD_TK_TUNE=0` | Без замера кандидатов; работает первая чистая конфигурация (см. [Тюнинг](./tuning)) |
+| `SVOD_TK_TUNE_DIR` | Каталог хранилища тюнинга |
+| `RUST_LOG=svod_tk::plan=debug` | Решения планировщика; `svod_tk=debug` добавляет раунды тюнера |
+| `TK_DUMP_LIST=1` | Печатает каждую выпущенную инструкцию (`[i] id op dtype <- sources`) при понижении программы. Тела мемоизируются, поэтому печатается только первое понижение каждой программы |
 | `SVOD_SPEC_DEBUG=1` | Когда программа не проходит проверку спецификации IR, печатает отвергнутую инструкцию и её дерево |
 
 ## Профилирование модели {#profiling-a-model}
@@ -144,7 +144,7 @@ cargo run -p svod-tk3 --release --example tk3_dump -- --card mi300x --op gemm --
 cargo run -p svod-model --release --example nemotron_diarize -- audio_1.wav --dtype bf16 --profile
 ```
 
-Ядра tk3 появляются под своими именами (`gemm`, `conv`, `flash_attention`, `heads`,
+Ядра tk появляются под своими именами (`gemm`, `conv`, `flash_attention`, `heads`,
 `layer_norm`, …) рядом с ядрами графа и замеряются так же.
 
 :::tip[Замеряйте на тихом GPU]

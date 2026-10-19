@@ -119,7 +119,7 @@ another thread reads it, and a tile read since the last fence is fenced before i
 ## Emission
 
 The emitter lists every statement's instructions in program order inside a pre-linearized
-program, so Svod's linearizer toposort never runs on a tk3 kernel. Global accesses past a view's
+program, so Svod's linearizer toposort never runs on a tk kernel. Global accesses past a view's
 bounds are gated: loads read zero and stores are dropped. Shared rows are XOR-swizzled in
 16-byte chunks where the row's chunk count is a power of two (`layouts::Swizzle`). Shared to register loads of 16-bit tiles use `ldmatrix.x4` where the layout
 allows; on RDNA4 global to register loads use `global_load_tr_b128` where the layout is what it
@@ -134,4 +134,4 @@ Shared and global accesses are `SHRINK` vector accesses. Gated stores sit inside
 Carried values move into their `phi` at the end of the block that defines them.
 :::
 
-`TK3_DUMP_LIST=1` prints the emitted list (see [Testing and Debugging](./testing-and-debugging)).
+`TK_DUMP_LIST=1` prints the emitted list (see [Testing and Debugging](./testing-and-debugging)).

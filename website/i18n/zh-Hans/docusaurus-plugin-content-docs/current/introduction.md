@@ -38,7 +38,7 @@ Svod 自带语音、文本和视觉模型，均已对照各自的 PyTorch 参考
   一个二进制文件，没有 LibTorch 或 ONNX Runtime 绑定，也没有厂商 SDK。
 - **熟悉的 API。** 张量 API 对标 PyTorch，连具名参数都一致，因此移植后的模型读起来
   和参考实现一样，移植过程基本是机械性的。
-- **在关键处追求速度。** 当编译器力有不逮时，`tk3` tile 语言让你在同一 IR 中手写
+- **在关键处追求速度。** 当编译器力有不逮时，`tk` tile 语言让你在同一 IR 中手写
   内核。它们对性能分析器和来源追踪器始终可见，而不是作为不透明二进制游离在外。
 
 动机与设计详见
@@ -100,7 +100,7 @@ jit_wrapper! {
 
 - **Tensor core** 按架构选择：NVIDIA sm_75/80/89、AMD RDNA3、RDNA4 与 CDNA3/4，
   以及 Apple Metal。fp8 在 sm_89 和 CDNA3 上可用。
-- **Tile 内核（`tk3`）**：GEMM、flash attention、注意力前处理、归一化和隐式 GEMM
+- **Tile 内核（`tk`）**：GEMM、flash attention、注意力前处理、归一化和隐式 GEMM
   卷积只需编写一次，作为基于线性布局的结构化 tile 程序；在 CUDA sm_80+ 上下沉为
   `mma.sync`/`wgmma`，在 AMD RDNA3/3.5/4 和 CDNA3 上下沉为 WMMA/MFMA；测试时在主机上
   解释执行；首次使用时按形状和设备调优，并保存在磁盘存储中。已在 sm_86、sm_90、
@@ -165,7 +165,7 @@ Morok 是 Svod 之前的名字。
 | [`device`](https://github.com/npatsakula/svod/tree/main/device/) | 缓冲区、分配器、mmap、KFD、CUDA 和 Metal 驱动、硬件图 |
 | [`runtime`](https://github.com/npatsakula/svod/tree/main/runtime/) | 内核编译、缓存、执行计划和性能分析器 |
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | 惰性张量 API、`nn` 模块和内存规划器 |
-| [`tk3`](https://github.com/npatsakula/svod/tree/main/tk3/) | 算子层背后的 tile 语言、内核库、规划器和调优器 |
+| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | 算子层背后的 tile 语言、内核库、规划器和调优器 |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX 导入器 |
 | [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | 宿主端解码器、VAD 分段和音频流水线 |
 | [`model`](https://github.com/npatsakula/svod/tree/main/model/) | 预训练模型与示例 |

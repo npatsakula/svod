@@ -37,7 +37,7 @@ PyTorch references, plus an ONNX importer for everything else.
   Runtime bindings and no vendor SDKs.
 - **A familiar API.** The tensor API mirrors PyTorch, down to named arguments,
   so a model port reads like the reference, and porting it is mostly mechanical.
-- **Speed where it counts.** When the compiler is not enough, the `tk3` tile
+- **Speed where it counts.** When the compiler is not enough, the `tk` tile
   language gives you hand-written kernels in the same IR. They stay visible to the
   profiler and the origin tracker instead of living off to the side as opaque
   binaries.
@@ -104,7 +104,7 @@ See [Pattern system](https://svod.vpermilp.online/docs/architecture/optimization
 
 - **Tensor cores** are chosen per architecture: NVIDIA sm_75/80/89, AMD RDNA3,
   RDNA4 and CDNA3/4, plus Apple Metal. fp8 is available on sm_89 and CDNA3.
-- **Tile kernels (`tk3`)**: GEMM, flash attention, attention prologue, norms
+- **Tile kernels (`tk`)**: GEMM, flash attention, attention prologue, norms
   and implicit-GEMM convolution written once as structured tile programs over
   linear layouts, lowered to `mma.sync`/`wgmma` on CUDA sm_80+ and to WMMA/MFMA
   on AMD RDNA3/3.5/4 and CDNA3, interpreted on the host for tests, and tuned
@@ -175,7 +175,7 @@ Morok was Svod's earlier name.
 | [`device`](device/) | Buffers, allocators, mmap, KFD, CUDA and Metal drivers, hardware graphs |
 | [`runtime`](runtime/) | Kernel compilation, caching, execution plans and the profiler |
 | [`tensor`](tensor/) | Lazy tensor API, `nn` modules and the memory planner |
-| [`tk3`](tk3/) | Tile language, kernel library, planner and tuner behind the op layer |
+| [`tk`](tk/) | Tile language, kernel library, planner and tuner behind the op layer |
 | [`onnx`](onnx/) | ONNX importer |
 | [`arch`](arch/) | Host-side decoders, VAD segmentation and audio pipelines |
 | [`model`](model/) | Pretrained models and examples |

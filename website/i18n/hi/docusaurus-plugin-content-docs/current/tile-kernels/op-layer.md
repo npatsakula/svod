@@ -4,8 +4,8 @@ sidebar_label: Op Layer
 
 # Op Layer {#op-layer}
 
-`svod_tk3::ops` वह है जिसे मॉडल बुलाते हैं। हर op एक lazy `Tensor` लौटाता है। जब device, dtypes और
-shapes किसी कर्नेल में फ़िट होते हैं, तो tk3 कर्नेल गणना करता है। वरना op बराबर का ग्राफ़ ख़ुद बनाता
+`svod_tk::ops` वह है जिसे मॉडल बुलाते हैं। हर op एक lazy `Tensor` लौटाता है। जब device, dtypes और
+shapes किसी कर्नेल में फ़िट होते हैं, तो tk कर्नेल गणना करता है। वरना op बराबर का ग्राफ़ ख़ुद बनाता
 है। मॉडल कभी नहीं जाँचता कि कर्नेल लागू होता है या नहीं, और कभी tile तक pad नहीं करता।
 
 ```rust
@@ -48,11 +48,11 @@ pub fn supported(device: &DeviceSpec) -> bool;
 ranked configs होते हैं; [tuner](./tuning) उनमें से उन पहले configs को मापता है जो बिना spill के
 compile होते हैं (या, अगर हर एक spill करे, तो जो पहले compile हों: spills किसी op को कभी ग्राफ़ पर नहीं
 भेजते)। `Plan::Graph(Fallback)` बताता है कि ग्राफ़ क्यों चलता है, और planner log उसका नाम लेता है
-(`RUST_LOG=svod_tk3::plan=debug`)।
+(`RUST_LOG=svod_tk::plan=debug`)।
 
 | `Fallback` | कब |
 |---|---|
-| `Target` | Tensor default device पर नहीं है, device के पास कोई tk3 kernels नहीं हैं (`config::has_kernels`: sm_80 से नीचे का CUDA, Metal, CPU), या उसका target कोई SM count नहीं बताता |
+| `Target` | Tensor default device पर नहीं है, device के पास कोई tk kernels नहीं हैं (`config::has_kernels`: sm_80 से नीचे का CUDA, Metal, CPU), या उसका target कोई SM count नहीं बताता |
 | `Dtype` | कोई operand f32 है, या सभी operands matrix core वाला एक ही 16-bit type साझा नहीं करते। `conv2d`: input के type या f32 के अलावा कोई output type, या ऐसा residual जो उस type में न हो |
 | `Symbolic` | Bound leading dim के अलावा कोई dim symbolic है (`linear` के लिए symbolic `N` भी) |
 | `Shape` | `linear`: `N` 8 का गुणज नहीं या कोई rows नहीं। `conv2d`: `groups > 1`, `Cin` 16 का गुणज नहीं, `Cout` 8 का गुणज नहीं, या ख़ाली output। `attention`: कोई config `D` पर फ़िट नहीं होता (sm_86 पर 32, 48, 64, 128 और 256 plan होते हैं और 40 नहीं) या कोई ख़ाली dim। `heads`: `D` 16..=256 में दो की घात नहीं। Norms: `D` 256..=2048 में दो की घात नहीं |

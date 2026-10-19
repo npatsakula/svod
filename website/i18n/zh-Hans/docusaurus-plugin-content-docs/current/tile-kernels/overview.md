@@ -2,13 +2,13 @@
 sidebar_label: 概览
 ---
 
-# Tile 内核 (tk3) {#tile-kernels-tk3}
+# Tile 内核 (tk) {#tile-kernels-tk}
 
-Svod 的优化器通过搜索循环变换，为模型的大部分计算找到快速的调度。但有些内核无法用这种方式找到。Flash attention 是一个递推：每个键块都要更新运行中的最大值与和，并重新缩放累加器，因此不存在一个可以直接分块的归约。张量核心 GPU 上的快速 GEMM 依赖多级 `cp.async` 环形缓冲、`ldmatrix` 片段加载以及带 swizzle 的共享内存布局，这些都不是循环搜索中的步骤。这类内核需要手写，而 `svod-tk3`（“tk3”）就是编写它们的 crate。
+Svod 的优化器通过搜索循环变换，为模型的大部分计算找到快速的调度。但有些内核无法用这种方式找到。Flash attention 是一个递推：每个键块都要更新运行中的最大值与和，并重新缩放累加器，因此不存在一个可以直接分块的归约。张量核心 GPU 上的快速 GEMM 依赖多级 `cp.async` 环形缓冲、`ldmatrix` 片段加载以及带 swizzle 的共享内存布局，这些都不是循环搜索中的步骤。这类内核需要手写，而 `svod-tk`（“tk”）就是编写它们的 crate。
 
-tk3 是唯一的 tile 内核 crate。它取代了 tk1（`svod-tk`），tk1 已连同其 k-means、kNN 和 Apple 内核一起移除，这些内核均未移植。有八个模型运行在算子层上：Nemotron-3-Diarization、Whisper（编码器，以及缓存模式下解码器步骤中的注意力）、ModernBERT、BGE-M3/XLM-RoBERTa、Qwen3-Embedding、GigaAM、WavLM 和 YOLO26（通道在后布局，其 3×3 卷积使用 `ops::conv2d`）。
+`svod-tk` 实现了 tile 语言的第三版（“tk3”），是唯一的 tile 内核 crate。它取代了同名的旧 crate tk1，tk1 已连同其 k-means、kNN 和 Apple 内核一起移除，这些内核均未移植。有八个模型运行在算子层上：Nemotron-3-Diarization、Whisper（编码器，以及缓存模式下解码器步骤中的注意力）、ModernBERT、BGE-M3/XLM-RoBERTa、Qwen3-Embedding、GigaAM、WavLM 和 YOLO26（通道在后布局，其 3×3 卷积使用 `ops::conv2d`）。
 
-## tk3 是什么 {#what-tk3-is}
+## tk 是什么 {#what-tk-is}
 
 | 组成部分 | 模块 | 作用 |
 |---|---|---|
@@ -25,7 +25,7 @@ tk3 是唯一的 tile 内核 crate。它取代了 tk1（`svod-tk`），tk1 已�
 | 调优存储 | `tune` | 对每种形状和设备，把每个算子的候选测量一次，并把胜者保存在磁盘上。 |
 
 ```text
-model code ──► svod_tk3::ops          always a Tensor; picks a kernel and config or builds the graph op
+model code ──► svod_tk::ops          always a Tensor; picks a kernel and config or builds the graph op
                    │
                    ▼
               kernels::*               spec ─► tile Program (builder, program order)

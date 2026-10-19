@@ -4,7 +4,7 @@ sidebar_label: कर्नेल लाइब्रेरी
 
 # कर्नेल लाइब्रेरी {#kernel-library}
 
-`svod_tk3::kernels` का हर कर्नेल एक function `fn k<T: Elem>(spec: &Spec) -> Program` है, जो 16-bit
+`svod_tk::kernels` का हर कर्नेल एक function `fn k<T: Elem>(spec: &Spec) -> Program` है, जो 16-bit
 element type (`BF16` या `F16`) पर generic है। हर spec में एक `batch: Batch` होता है:
 `Batch::Static(n)` `n` batches launch करता है, और `Batch::Var { name, min, max }` नाम से bind हुए
 runtime variable की live गिनती launch करता है, buffers `max` के आकार के होते हैं। हर config type में

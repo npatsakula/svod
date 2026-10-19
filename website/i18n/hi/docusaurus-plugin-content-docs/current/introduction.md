@@ -41,7 +41,7 @@ Svod के साथ स्पीच, टेक्स्ट और विज़
   वेंडर SDK के।
 - **जाना-पहचाना API।** टेंसर API PyTorch को नामित आर्ग्युमेंट तक प्रतिबिंबित करता है,
   इसलिए मॉडल पोर्ट संदर्भ की तरह पढ़ा जाता है और पोर्टिंग अधिकतर यांत्रिक होती है।
-- **जहाँ ज़रूरी है वहाँ गति।** जब कंपाइलर पर्याप्त न हो, `tk3` टाइल लैंग्वेज उसी IR में
+- **जहाँ ज़रूरी है वहाँ गति।** जब कंपाइलर पर्याप्त न हो, `tk` टाइल लैंग्वेज उसी IR में
   हाथ से लिखे कर्नेल देती है। वे प्रोफ़ाइलर और ऑरिजिन ट्रैकर को दिखते रहते हैं, अपारदर्शी
   बाइनरी की तरह अलग-थलग नहीं रहते।
 
@@ -107,7 +107,7 @@ tests यादृच्छिक व्यंजकों पर Z3 को orac
 
 - **Tensor cores** आर्किटेक्चर के अनुसार चुने जाते हैं: NVIDIA sm_75/80/89, AMD RDNA3,
   RDNA4 और CDNA3/4, साथ ही Apple Metal। fp8 sm_89 और CDNA3 पर उपलब्ध है।
-- **टाइल कर्नेल (`tk3`)**: GEMM, flash attention, attention prologue, norms
+- **टाइल कर्नेल (`tk`)**: GEMM, flash attention, attention prologue, norms
   और implicit-GEMM convolution, linear layouts पर structured टाइल प्रोग्राम के रूप में
   एक बार लिखे गए, CUDA sm_80+ पर `mma.sync`/`wgmma` में और AMD RDNA3/3.5/4 और CDNA3 पर
   WMMA/MFMA में लोअर होते हैं, टेस्ट के लिए होस्ट पर इंटरप्रेट होते हैं, और पहले उपयोग पर
@@ -176,7 +176,7 @@ Morok Svod का पुराना नाम था।
 | [`device`](https://github.com/npatsakula/svod/tree/main/device/) | बफ़र, एलोकेटर, mmap, KFD, CUDA और Metal ड्राइवर, हार्डवेयर ग्राफ़ |
 | [`runtime`](https://github.com/npatsakula/svod/tree/main/runtime/) | कर्नेल कंपाइलेशन, कैशिंग, एक्ज़ीक्यूशन प्लान और प्रोफ़ाइलर |
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | लेज़ी टेंसर API, `nn` मॉड्यूल और मेमोरी प्लानर |
-| [`tk3`](https://github.com/npatsakula/svod/tree/main/tk3/) | op layer के पीछे की टाइल लैंग्वेज, कर्नेल लाइब्रेरी, प्लानर और ट्यूनर |
+| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | op layer के पीछे की टाइल लैंग्वेज, कर्नेल लाइब्रेरी, प्लानर और ट्यूनर |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX इम्पोर्टर |
 | [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | होस्ट-साइड डिकोडर, VAD सेगमेंटेशन और ऑडियो पाइपलाइन |
 | [`model`](https://github.com/npatsakula/svod/tree/main/model/) | प्रीट्रेन्ड मॉडल और उदाहरण |

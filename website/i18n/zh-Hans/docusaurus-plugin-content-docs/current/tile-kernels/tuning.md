@@ -32,7 +32,7 @@ sidebar_label: 调优
 
 | 项目 | 值 |
 |---|---|
-| 目录 | `$SVOD_TK3_TUNE_DIR`，否则 `$XDG_CACHE_HOME/svod/tk3_tune`，否则 `~/.cache/svod/tk3_tune` |
+| 目录 | `$SVOD_TK_TUNE_DIR`，否则 `$XDG_CACHE_HOME/svod/tk_tune`，否则 `~/.cache/svod/tk_tune` |
 | 文件 | 每个设备和 crate 版本一个，例如 `sm_86_28sm-v0.2.0.txt`，以其行格式作为首行（`format 5`）；其他格式或没有该行的文件整个丢弃 |
 | 行 | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`：`choice` 存放运行过的候选，最快者在前，每个为 `index ns`；`value` 存放一个测得的数；`admitted` 存放准入保留的排序索引；`first` 存放第一个干净配置的索引 |
 | 键 | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`，其中 `device` 是架构和 SM 数量（`sm_86-28sm`），`compiler` 是设备编译器的摘要（`tune::compiler`） |
@@ -50,18 +50,18 @@ value|probe:cached_1m|sm_86-28sm|Int32||0a2d6c02b82988af|9154cc72f03d25cd|d2a8e2
 
 排序所用的代价（`atoms::Costs`：一个共享字节、一个流式字节、一个分散元素、满载 SM 上的一步矩阵核运算以及在 SIMD 上单独一个 wave 和作为 warpgroup 乘积时的一步、一个分数的 softmax、一次流水线行程（环的两个槽位，展开与不展开，以及一个槽位）、一次 lane 移动、一次共享内存往返、全局延迟，以及 L2 的速率和大小）由 `probe::costs` 在进程第一次为该设备做规划时在设备上测量。每个字段是一对程序，其中探针做其基线所做的一切，再加上已知数量的该原语。这些值以 `value|probe:<field>` 行写入同一个存储文件，因此之后的进程会读回它们。失败的探针让其字段保持为零，发出警告，并在 `Planner::unmeasured` 中列出，而设备门控 `device_costs_are_physical` 要求该列表为空：规划器用已有的数据排序，而不是把设备丢给计算图。只有没有 SM 数量的设备才没有规划器。
 
-主机测试则直接声明代价（`test::unit::costs()`，以及从一个 gfx1151 存储中粘贴而来的 `gfx1151_costs()`）。对于本机没有对应设备的显卡，`Target::offline` 或 `Target::card` 给出目标，`probe::stored` 从该卡上拷贝来的调优存储中读取代价；没有这样的存储时，以 `probe::GUESSED` 代替，排序也就只是猜测。[`tk3_dump` 示例](./testing-and-debugging#planning-for-another-card)两者都做。
+主机测试则直接声明代价（`test::unit::costs()`，以及从一个 gfx1151 存储中粘贴而来的 `gfx1151_costs()`）。对于本机没有对应设备的显卡，`Target::offline` 或 `Target::card` 给出目标，`probe::stored` 从该卡上拷贝来的调优存储中读取代价；没有这样的存储时，以 `probe::GUESSED` 代替，排序也就只是猜测。[`tk_dump` 示例](./testing-and-debugging#planning-for-another-card)两者都做。
 
 ## 规划器日志 {#the-planner-log}
 
-`RUST_LOG=svod_tk3::plan=debug` 记录规划器的决策：哪个算子走了计算图及其原因；排序的前 16 个配置及其预测的 ns，以及它略去了多少配置；存储未命中时，编译每个配置的结果（结论、寄存器数、溢出字节数）；以及调优后的选择。`RUST_LOG=svod_tk3=debug` 还会加上调优器的各轮计时。
+`RUST_LOG=svod_tk::plan=debug` 记录规划器的决策：哪个算子走了计算图及其原因；排序的前 16 个配置及其预测的 ns，以及它略去了多少配置；存储未命中时，编译每个配置的结果（结论、寄存器数、溢出字节数）；以及调优后的选择。`RUST_LOG=svod_tk=debug` 还会加上调优器的各轮计时。
 
 ## 关闭调优 {#switching-it-off}
 
 | 方式 | 作用 |
 |---|---|
-| `SVOD_TK3_TUNE=0` | 关闭候选计时；运行排序中第一个编译干净的配置（以 `first` 行保存）；代价探针仍会测量 |
-| `svod_tk3::tune::scoped(false, f)` | 在当前线程（及其用于编译的工作线程）上对 `f` 效果相同，优先于环境变量；测试中使用 |
+| `SVOD_TK_TUNE=0` | 关闭候选计时；运行排序中第一个编译干净的配置（以 `first` 行保存）；代价探针仍会测量 |
+| `svod_tk::tune::scoped(false, f)` | 在当前线程（及其用于编译的工作线程）上对 `f` 效果相同，优先于环境变量；测试中使用 |
 
 `tune::TuneStore::at(root)` 在另一个根目录构建存储，传入 `None` 时仅存在于内存中。
 
@@ -70,7 +70,7 @@ value|probe:cached_1m|sm_86-28sm|Int32||0a2d6c02b82988af|9154cc72f03d25cd|d2a8e2
 探针测试是带 `#[ignore]` 的测试，只打印耗时，从不断言。它们用设备探测到的代价排序，并为调优器准入的短名单计时，同时标出调优器的选择。在空闲的 GPU 上逐个运行：
 
 ```bash
-SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib gemm_candidates_probe -- --ignored --nocapture --test-threads=1
+SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib gemm_candidates_probe -- --ignored --nocapture --test-threads=1
 ```
 
 | 探针 | 输出 |
@@ -83,4 +83,4 @@ SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib gemm_candidates_probe --
 | `decode_throughput_probe` | 一个 Whisper large-v3 解码器步骤的自注意力和交叉注意力，调优后的拆分与不拆分对比 |
 | `conv_throughput_probe` | 每个 YOLO26 类别中每个准入的卷积候选，与图卷积对比 |
 | `norm_bandwidth_probe` | 行内核在 8192×1024 bf16 上的带宽，以 GB/s 计 |
-| `first_execution_probe` | 构建、降级和准备一个 tk3 GEMM 的主机开销，与图 GEMM 对比 |
+| `first_execution_probe` | 构建、降级和准备一个 tk GEMM 的主机开销，与图 GEMM 对比 |
