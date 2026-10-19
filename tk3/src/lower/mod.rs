@@ -13,7 +13,7 @@ use crate::ir::*;
 use crate::layouts::{self, Laid, TileLayout, WarpGrid};
 use crate::schedule::{self, Schedule};
 
-mod emit;
+pub mod emit;
 pub mod sync;
 
 #[derive(Debug, Snafu)]

@@ -7,6 +7,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+use proptest::prelude::*;
 use svod_codegen::Renderer;
 use svod_codegen::llvm::LlvmTextRenderer;
 use svod_dtype::default_device::default_device;
@@ -330,9 +331,49 @@ fn lowering_keeps_the_interpreted_result(target: Target) {
     }
 }
 
-/// An AMD GPU with `cus` compute units and 64 KB of LDS per workgroup.
+/// An AMD GPU with `cus` compute units and 64 KB of LDS per workgroup; a
+/// CDNA3 one is an MI300X of eight dies.
 pub(super) fn amd(arch: AmdArch, cus: u32) -> Target {
-    Target { sms: Some(cus), ..Target::for_arch(GpuArch::Amd(arch)) }
+    let xcds = if arch.is_cdna() { 8 } else { 1 };
+    Target { sms: Some(cus), xcds, ..Target::for_arch(GpuArch::Amd(arch)) }
+}
+
+proptest! {
+    /// Over any dispatch and die count the die order is a permutation of the
+    /// blocks on which each die's blocks (every `dies`th hardware position)
+    /// form one contiguous run, the runs laid out die after die.
+    #[test]
+    fn the_die_order_lays_each_dies_blocks_end_to_end(total in 1u64..600, dies in 1u64..12) {
+        let order: Vec<u64> = (0..total).map(|l| crate::lower::emit::die_order(l, total, dies)).collect();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        prop_assert_eq!(sorted, (0..total).collect::<Vec<_>>());
+        let mut next = 0;
+        for die in 0..dies {
+            let on_die: Vec<u64> = (die..total).step_by(dies as usize).map(|l| order[l as usize]).collect();
+            prop_assert_eq!(on_die.clone(), (next..next + on_die.len() as u64).collect::<Vec<_>>());
+            next += on_die.len() as u64;
+        }
+        prop_assert_eq!(next, total);
+    }
+}
+
+/// A one-die target lowers the block index as the hardware's; a many-die
+/// one derives every axis from the renumbered linear position, a longer
+/// program.
+#[test]
+fn the_block_index_is_renumbered_only_over_several_dies() {
+    let cfg = config::gemm_cfg([64, 64, 32], 2, [2, 2], false);
+    let spec = GemmSpec { m: 192, n: 320, k: 64, batch: Batch::Static(3), epilogue: Epilogue::default(), cfg };
+    let text = |xcds: u32| {
+        let target = Target { xcds, ..amd(AmdArch::Gfx942, 304) };
+        let device = crate::atoms::Device { target, costs: super::costs() };
+        render(gemm::<BF16>(&spec), &cfg.lowering(&device))
+    };
+    let (one, eight) = (text(1), text(8));
+    assert_ne!(one, eight);
+    assert!(eight.len() > one.len());
+    assert_eq!(one, text(1), "a one-die program is deterministic");
 }
 
 /// RDNA WMMA and CDNA MFMA with register-staged fills: every family lowers
