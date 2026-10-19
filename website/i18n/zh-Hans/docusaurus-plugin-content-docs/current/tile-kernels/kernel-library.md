@@ -53,6 +53,7 @@ sidebar_label: 内核库
 | `AttnMask::key_lens` | `[batch]` i32 有效键数；超出长度的块被跳过 |
 | `AttnMask::key_mask` | `[batch, tk]` i32 可见键（行步长向上取整到 8），每个块都读取 |
 | `AttnMask::seg_start` | `[batch, t]` i32 打包行的段起点，沿 `t` 非递减 |
+| `AttnMask::bias` | 与数据流同类型的 `[batch 或 1, heads, t, tk]` 加性偏置（行步长向上取整到 8），每个块都读取，在掩码之前加到缩放后的分数上 |
 
 掩码按 tile 类别处理。只有被因果、窗口、长度或段边缘穿过的键块才计算谓词（基于块起点的 `select_if`）；完全在内部的块不加掩码运行。bool 键掩码在每个块中应用。看不到任何键的查询得到 NaN，与空行上的 softmax 一致。
 

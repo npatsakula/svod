@@ -23,14 +23,14 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | Op | Shapes | Options |
 |---|---|---|
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual }`; gated `w` `[2N, K]` है |
-| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale }` |
+| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` `x` जैसा `residual` लेते हैं और `(x + residual, norm)` लौटाते हैं |
 
 `Attn::keys` `KeyMask::None`, `KeyMask::Lens(&lens)` (`[B]` वैध key गिनतियाँ) या
 `KeyMask::Bool(&mask)` (`[B, Tk]`, जहाँ attend हो वहाँ true) है। `Attn::cache`
 `Cache { head_start, kv_heads, row_map, appended }` लेता है, और `appended` के लिए `KeyMask::Lens` ज़रूरी है।
-`Attn::scale` का default `1/√D` है। `Qkv::rope` `[1, T, 1, D/2]` (position के हिसाब से) या
+`Attn::scale` का default `1/√D` है। `Attn::bias` (`[B, H, T, Tk]` या `[1, H, T, Tk]`, stream dtype में) masks से पहले scaled scores में जोड़ा जाता है, जैसे WavLM का relative position bias। `Qkv::rope` `[1, T, 1, D/2]` (position के हिसाब से) या
 `[B, T, 1, D/2]` (token के हिसाब से) का `(cos, sin)` है। Masks का वर्णन
 [attention कर्नेल](./kernel-library#flash-attention) के साथ है।
 

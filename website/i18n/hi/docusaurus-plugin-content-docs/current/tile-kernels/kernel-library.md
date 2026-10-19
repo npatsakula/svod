@@ -68,6 +68,7 @@ Online-softmax state `(m, l, o)` f32 में `exp2` के साथ carry ह
 | `AttnMask::key_lens` | `[batch]` i32 वैध key गिनतियाँ; लंबाई से आगे के blocks छोड़े जाते हैं |
 | `AttnMask::key_mask` | `[batch, tk]` i32 दिखने वाली keys (row stride 8 तक ऊपर round), हर block में पढ़ी जाती है |
 | `AttnMask::seg_start` | packed rows के `[batch, t]` i32 segment starts, `t` के साथ non-decreasing |
+| `AttnMask::bias` | stream type में `[batch या 1, heads, t, tk]` additive bias (row stride 8 तक rounded), हर block में पढ़ा जाता है और masks से पहले scaled scores में जोड़ा जाता है |
 
 Masks tile-class का काम हैं। सिर्फ़ वे key blocks predicate गिनते हैं जिन्हें causal, window, length
 या segment का कोई किनारा काटता है (block start पर `select_if`); पूरी तरह अंदर वाले blocks बिना mask
