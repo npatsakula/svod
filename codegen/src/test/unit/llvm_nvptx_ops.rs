@@ -592,7 +592,7 @@ fn clang_flags_pin_the_ptx_isa_per_arch(arch: CudaArch, feature: &str) {
     assert_eq!(&flags[..2], ["-x", "ir"]);
     assert!(flags.contains(&"-S".to_string()));
     assert!(flags.contains(&"--target=nvptx64-nvidia-cuda".to_string()));
-    assert!(flags.contains(&format!("-march={arch}")));
+    assert!(flags.contains(&format!("-march={}", crate::llvm::nvptx::march(arch))));
     assert!(flags.contains(&format!("--cuda-feature={feature}")));
     assert_eq!(&flags[flags.len() - 3..], ["-", "-o", "-"]);
 }

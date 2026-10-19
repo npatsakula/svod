@@ -31,7 +31,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
             match ctx.dynamic_local(arg.slot) {
                 Some(offset) => render_dynamic_local(uop, offset, ctx, kernel),
-                None => render_define_local(uop, ctx, kernel),
+                None => render_define_local(uop, ctx, kernel, SHARED_ALIGN),
             }
         }
         // REG buffers keep the CPU emitter's plain `alloca`: NVPTX allocas
@@ -69,6 +69,12 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
 /// when the kernel's total exceeds [`svod_dtype::CudaArch::MAX_STATIC_SHARED_BYTES`].
 const DYNAMIC_SHARED_ARRAY: &str = "@svod_dynamic_shared";
 
+/// Every shared buffer starts on a 1024-byte boundary: the 128-byte swizzle
+/// of a warpgroup product's descriptor (and of a TMA box) is a pattern over
+/// the absolute shared address, which lines up with a tile's row index only
+/// from such a boundary.
+pub const SHARED_ALIGN: usize = 1024;
+
 /// Lay the kernel's LOCAL buffers out at 16-byte aligned offsets. Totals up
 /// to the static cap keep one `addrspace(3)` global per buffer; above it the
 /// buffers become slices of one dynamic shared array, and the module exports
@@ -86,12 +92,14 @@ pub(crate) fn plan_shared_memory(nodes: &[Arc<UOp>], ctx: &mut RenderContext) {
             continue;
         }
         offsets.insert(arg.slot, total);
-        total = (total + node.buffer_size().unwrap_or(1) * arg.dtype.bytes()).next_multiple_of(16);
+        total = (total + node.buffer_size().unwrap_or(1) * arg.dtype.bytes()).next_multiple_of(SHARED_ALIGN);
     }
     if total <= svod_dtype::CudaArch::MAX_STATIC_SHARED_BYTES {
         return;
     }
-    ctx.push_module_prefix(format!("{DYNAMIC_SHARED_ARRAY} = external addrspace(3) global [0 x i8], align 16"));
+    ctx.push_module_prefix(format!(
+        "{DYNAMIC_SHARED_ARRAY} = external addrspace(3) global [0 x i8], align {SHARED_ALIGN}"
+    ));
     ctx.push_module_prefix(format!(
         "@{} = addrspace(4) constant i32 {total}, align 4",
         svod_device::cuda::DYNAMIC_SHARED_BYTES_SYMBOL

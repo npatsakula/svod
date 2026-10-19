@@ -28,7 +28,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Special(ops::Special { name, .. }) => render_special(uop, name, ctx, kernel),
         Op::Barrier(..) => render_barrier(kernel),
         Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
-            render_define_local(uop, ctx, kernel)
+            render_define_local(uop, ctx, kernel, 16)
         }
         Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => {
             render_define_reg(uop, ctx, kernel)

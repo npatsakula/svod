@@ -64,7 +64,12 @@ pub fn local_bounds(nodes: &[Arc<UOp>]) -> Option<[u64; 3]> {
 /// use everywhere else (a bare `ptr addrspace(3)` operand is a type error
 /// there). Both backends recover the fast `ds_*` / `ld.shared` forms through
 /// LLVM's address-space inference at `-O3`.
-pub fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<String>) -> Option<()> {
+pub fn render_define_local(
+    uop: &Arc<UOp>,
+    ctx: &mut RenderContext,
+    kernel: &mut Vec<String>,
+    align: usize,
+) -> Option<()> {
     let dst = ctx.name(uop); // e.g. "%local42"
     let (id, base_dtype) = match uop.op() {
         Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
@@ -76,7 +81,7 @@ pub fn render_define_local(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut
     let base_ty = ldt(&base_dtype);
     let global_name = format!("@local{id}");
     ctx.push_module_prefix(format!(
-        "{global_name} = internal unnamed_addr addrspace(3) global [{size} x {base_ty}] undef, align 16"
+        "{global_name} = internal unnamed_addr addrspace(3) global [{size} x {base_ty}] undef, align {align}"
     ));
     kernel.push(format!("  {dst} = addrspacecast ptr addrspace(3) {global_name} to ptr"));
     Some(())

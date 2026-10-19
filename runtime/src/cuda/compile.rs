@@ -35,7 +35,7 @@ pub(crate) fn compile_ir_to_ptx_with(toolchain: &ClangToolchain, ir: &str, arch:
     }
     dump_ir("SVOD_DUMP_NVPTX_IR", &arch.to_string(), ir);
     debug!(arch = %arch, ir.length = ir.len(), "compiling nvptx IR via clang");
-    toolchain.compile_ir(&clang_flags(arch), ir, &format!("nvptx (march={arch})"))
+    toolchain.compile_ir(&clang_flags(arch), ir, &format!("nvptx (march={})", svod_codegen::llvm::nvptx::march(arch)))
 }
 
 /// Check PTX text before it reaches the driver JIT, on cached and fresh bytes
@@ -53,9 +53,10 @@ pub(crate) fn validate_ptx(bytes: &[u8], arch: CudaArch, kernel_name: &str) -> c
         Some(version) if version.split_once('.').is_some_and(|(a, b)| is_number(a) && is_number(b)) => {}
         _ => return reject("cached PTX has no `.version` directive".into()),
     }
+    let march = svod_codegen::llvm::nvptx::march(arch);
     match directive(".target ") {
-        Some(target) if target.split(',').next().is_some_and(|sm| sm.trim() == arch.to_string()) => {}
-        Some(target) => return reject(format!("cached PTX targets {target}, not {arch}")),
+        Some(target) if target.split(',').next().is_some_and(|sm| sm.trim() == march) => {}
+        Some(target) => return reject(format!("cached PTX targets {target}, not {march}")),
         None => return reject("cached PTX has no `.target` directive".into()),
     }
     if let Some(line) = ptx.lines().find(|line| line.contains(".extern .func")) {
@@ -157,7 +158,8 @@ impl Ptxas {
 /// `ptxas` flags for one kernel: PTX on stdin, cubin on stdout. `ptxas` has no
 /// `-` convention, so both standard streams are named by their device paths.
 pub(crate) fn ptxas_flags(arch: CudaArch) -> Vec<String> {
-    vec![format!("-arch={arch}"), "-o".into(), "/dev/stdout".into(), "/dev/stdin".into()]
+    let march = svod_codegen::llvm::nvptx::march(arch);
+    vec![format!("-arch={march}"), "-o".into(), "/dev/stdout".into(), "/dev/stdin".into()]
 }
 
 fn find_ptxas() -> Option<PathBuf> {
