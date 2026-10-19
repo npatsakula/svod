@@ -107,6 +107,16 @@ as 16-byte loads like the keys'; measured on gfx1201 that is 5–28% per shape o
 tile's one load per key. On RDNA4 the fill itself is a transposing load (`global_load_tr_b128`),
 so its registers hold column runs and store as 16-byte vectors too.
 
+The softmax step does as little vector work as it can, which matters most where the matrix
+cores share the SIMD's ALUs (RDNA). A row adopts a new running maximum only when it grows by
+more than 8 in log2 units (FlashAttention-4's lazy rescale): otherwise the correction is exactly
+1 and the output accumulator's rescale, a `Scale`, is skipped by every wave whose rows all kept
+theirs, while the probabilities stay below 2⁸. Probabilities held in bf16 are truncated rather
+than rounded, a pair per instruction on targets without a bf16 convert, and the row sum adds the
+values as held, so the normalization stays unbiased. On gfx1201 the three (with the raw `exp2`
+below) took the d = 128 kernel from 90 to 119 TFLOP/s on random data and Qwen3's causal
+attention from 63 to 77.
+
 Each tile config is crossed with split counts. `Attn::splits = Some(n)` fixes `n`, capped at the
 key block count. With `None`, `config::split_candidates` proposes 1, 2, the counts around two
 blocks per SM, and one split per key block. It keeps only counts up to the smaller of the key

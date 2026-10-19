@@ -182,6 +182,11 @@ struct Step<'a, T> {
     mask: Mask<'a>,
 }
 
+/// How far (in log2 units) a row's running maximum may fall behind its
+/// scores before the row rescales (FlashAttention-4's lazy rescale): the
+/// probabilities of a block stay below 2^8, well inside bf16 and f32.
+const RESCALE_ABOVE: f64 = 8.0;
+
 fn step<T: Elem, PK: TierMark, PV: TierMark>(
     k: &mut Kernel,
     st: &Step<'_, T>,
@@ -196,16 +201,33 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let s = k.binary(s, scale, BinaryOp::Mul);
     let s = (st.mask)(k, s, block_start);
     let block_max = k.reduce(s, Axis::Row, ReduceOp::Max);
-    let m_new = k.binary(m, block_max, BinaryOp::Max);
+    // A row adopts its new maximum only when it grows by more than
+    // `RESCALE_ABOVE` (log2 units), else keeps the old one: its correction is
+    // then exactly 1 and the accumulator's rescale is skipped, while its
+    // probabilities stay below 2^RESCALE_ABOVE. `o` and `l` share the stale
+    // maximum, so their quotient is the same.
+    let m_max = k.binary(m, block_max, BinaryOp::Max);
+    let growth = k.binary(m_max, m, BinaryOp::Sub);
+    let limit = k.fill::<F32>(k.shape(m), Const::Float(RESCALE_ABOVE));
+    let grows = k.compare(limit, growth, BinaryOp::Lt);
+    let m_new = k.where_(grows, m_max, m);
     let corr = k.binary(m, m_new, BinaryOp::Sub);
     let corr = k.unary(corr, UnaryOp::Exp2);
     let p = k.binary(s, m_new, BinaryOp::Sub);
     let p = k.unary(p, UnaryOp::Exp2);
-    let block_sum = k.reduce(p, Axis::Row, ReduceOp::Sum);
+    // Probabilities in [0, 1] held in bf16 are truncated, a pair per
+    // instruction where rounding to nearest takes several, and the row sum
+    // adds what is held, so the normalization stays unbiased.
+    let (p16, held) = if T::DTYPE == svod_dtype::ScalarDType::BFloat16 {
+        let p16 = k.cast_toward_zero::<T>(p);
+        (p16, k.cast::<T, F32>(p16))
+    } else {
+        (k.cast::<F32, T>(p), p)
+    };
+    let block_sum = k.reduce(held, Axis::Row, ReduceOp::Sum);
     let l = k.binary(l, corr, BinaryOp::Mul);
     let l = k.binary(l, block_sum, BinaryOp::Add);
-    let o = k.binary(o, corr, BinaryOp::Mul);
-    let p16 = k.cast::<F32, T>(p);
+    let o = k.scale(o, corr);
     let o = k.mma(o, p16, false, v_t, false);
     [m_new, l, o]
 }
