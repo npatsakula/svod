@@ -21,14 +21,16 @@ pub enum Error {
     DecoderConfig { message: String },
     #[snafu(display("checkpoint/config mismatch: {message}"))]
     CheckpointConfig { message: String },
+    #[snafu(display("streaming: {message}"))]
+    Streaming { message: String },
     #[snafu(display("invalid encoder dtype: {dtype:?}; expected f16, bf16, or f32"))]
     EncoderDtype { dtype: svod_dtype::DType },
     #[snafu(display("hub error: {source}"), context(false))]
     Hub { source: hf_hub::HFError },
-    #[snafu(display("flash-attention kernel: {source}"))]
-    Tk {
-        #[snafu(source(from(svod_tk::LaunchError, Box::new)))]
-        source: Box<svod_tk::LaunchError>,
+    #[snafu(display("{source}"), context(false))]
+    Ops {
+        #[snafu(source(from(svod_tk::ops::Error, Box::new)))]
+        source: Box<svod_tk::ops::Error>,
     },
 }
 

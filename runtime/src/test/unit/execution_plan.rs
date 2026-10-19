@@ -1500,3 +1500,26 @@ fn empty_ranges_never_conflict() {
     hazards.record(0, &[], std::slice::from_ref(&live));
     assert!(hazards.record(1, std::slice::from_ref(&empty), &[]).is_empty());
 }
+
+/// The storages a plan reports to scoped sync follow the buffers bound at
+/// execute time: a view rebound to its own allocation is reported on its
+/// own, with the write the plan makes through it.
+#[test]
+fn storage_accesses_follow_rebound_buffers() {
+    let source = cpu_buffer(DType::UInt8, 4);
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let read_idx = builder.add_buffer(30_001, source.clone());
+    // A second binding of the same allocation, written by the copy.
+    let alias_idx = builder.add_buffer(30_002, source.clone());
+    builder.add_op(copy_op(30_010, vec![alias_idx, read_idx], vec![]));
+    builder.set_output_buffer(alias_idx);
+    let mut plan = builder.build().expect("build plan");
+    let ids = |plan: &ExecutionPlan| -> Vec<(BufferId, bool)> {
+        plan.storage_accesses().iter().map(|(buffer, writes)| (buffer.storage_id(), *writes)).collect()
+    };
+    assert_eq!(ids(&plan), [(source.storage_id(), true)], "one storage, written");
+
+    let replacement = cpu_buffer(DType::UInt8, 4);
+    *plan.buffer_at_mut(alias_idx).unwrap() = replacement.clone();
+    assert_eq!(ids(&plan), [(source.storage_id(), false), (replacement.storage_id(), true)]);
+}

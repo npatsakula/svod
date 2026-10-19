@@ -3664,16 +3664,17 @@ dependencies = [
 name = "svod-tk"
 version = "0.2.0"
 dependencies = [
- "criterion",
- "ndarray",
+ "half",
+ "libm",
+ "papaya",
  "proptest",
+ "rayon",
  "smallvec",
  "snafu",
  "svod-codegen",
  "svod-device",
  "svod-dtype",
  "svod-ir",
- "svod-macros",
  "svod-runtime",
  "svod-schedule",
  "svod-tensor",

@@ -19,7 +19,7 @@ without a device. Filter on the full path to run one backend.
 | Tree after one post-opt pass (prefix match on label) | `SVOD_DUMP_STAGE=14 cargo test ...` (`SVOD_DUMP_STAGE=` empty = every stage) |
 | Trees for rangeify, kernel cut, pre-opt and post-opt in one file | `./scripts/extract-ir.sh test_x::llvm -p svod-tensor -o /tmp/ir.txt` (needs `rg`, `jaq`; builds `--release`) |
 | LLVM IR as compiled (CPU) / after -O2 | `SVOD_DUMP_LLVM_IR=/tmp/ll` / `SVOD_DUMP_POST_O2_IR=/tmp/ll` → `<kernel>.ll` / `<kernel>.post.ll` |
-| AMD / NVPTX LLVM IR | `SVOD_DUMP_AMD_IR=/tmp/amd` / `SVOD_DUMP_NVPTX_IR=/tmp/ptx` (one `.ll` per kernel) |
+| AMD / NVPTX LLVM IR, AMDGCN | `SVOD_DUMP_AMD_IR=/tmp/amd` / `SVOD_DUMP_NVPTX_IR=/tmp/ptx` → `<arch>_<kernel>_<ir digest>.ll`; `SVOD_DUMP_AMD_ASM=/tmp/amd` → the same stem `.s`. Written on object-cache hits too |
 | Linearized instruction list | `SVOD_DUMP_LINEAR=/tmp/lin` → `tree_<id>.txt`, `linear_<id>.txt` from `do_linearize` |
 | Is the optimizer the culprit? | `SVOD_NOOPT=1` (no opts; pre/post passes still run), `SVOD_TC=0`, `BEAM=4` |
 | Is the backend the culprit? | run `::clang` vs `::llvm`; `SVOD_CPU_BACKEND=clang\|llvm`; `SVOD_LLVM_INPROCESS=0` (shell out instead of in-process LLVM); `SVOD_DEVICE=CPU\|CUDA:0\|AMD:0\|METAL:0` |
@@ -155,7 +155,7 @@ Other useful accessors: `uop.node_count()`, `uop.toposort()`, `uop.shape()? -> O
 | `schedule/src/spec.rs` | type verification (`SVOD_SPEC`) |
 | `codegen/src/program_pipeline.rs` | `program_from_sink`, `do_linearize` (`SVOD_DUMP_LINEAR`), `do_render`, `do_compile` |
 | `codegen/src/llvm/text/mod.rs`, `codegen/src/c/mod.rs` | renderers (`render()`), `generated_code` trace |
-| `runtime/src/llvm.rs`, `runtime/src/{amd,cuda}/compile.rs` | `SVOD_DUMP_LLVM_IR`, `SVOD_DUMP_POST_O2_IR`, `SVOD_DUMP_AMD_IR`, `SVOD_DUMP_NVPTX_IR` |
+| `runtime/src/llvm.rs`, `runtime/src/{amd,cuda}/compile.rs` | `SVOD_DUMP_LLVM_IR`, `SVOD_DUMP_POST_O2_IR`, `SVOD_DUMP_AMD_IR`, `SVOD_DUMP_AMD_ASM`, `SVOD_DUMP_NVPTX_IR` |
 | `ir/src/uop/tree.rs`, `ir/src/uop/canonical.rs` | tree rendering, canonical JSON dump |
 | `schedule/src/testing.rs`, `tensor/src/config.rs` | `setup_test_tracing`, `codegen_tests!` |
 | `scripts/extract-ir.sh` | JSON trace → readable per-stage file |

@@ -12,11 +12,11 @@ use svod_dtype::{DType, DeviceSpec};
 
 use crate::ops;
 use crate::{
-    AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, ConstValue, ConstValueHash, ContiguousHint,
+    AxisId, AxisType, BarrierFence, BinaryOp, BufferizeOpts, CallInfo, ConstValue, ConstValueHash, ContiguousHint,
     CustomFunctionKind, InsArg, KernelInfo, Op, ParamArg, ReduceOp, TernaryOp, UOp, UnaryOp, WmmaMetadata,
 };
 
-pub const OPTIMIZER_WIRE_SCHEMA_VERSION: u32 = 3;
+pub const OPTIMIZER_WIRE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizerWireGraph {
@@ -74,7 +74,7 @@ pub enum OptimizerWireOp {
     EndIf,
     Range(AxisId, AxisType),
     End,
-    Barrier,
+    Barrier(BarrierFence),
     Stack,
     VConst(Vec<ConstValue>),
     DefineVar(String, i64, i64),
@@ -240,7 +240,7 @@ impl OptimizerWireOp {
             Op::EndIf(..) => Self::EndIf,
             Op::Range(ops::Range { axis_id, axis_type, .. }) => Self::Range(axis_id.clone(), *axis_type),
             Op::End(..) => Self::End,
-            Op::Barrier(..) => Self::Barrier,
+            Op::Barrier(ops::Barrier { fence, .. }) => Self::Barrier(*fence),
             Op::Stack(..) => Self::Stack,
             Op::VConst(ops::VConst { values }) => Self::VConst(values.clone()),
             Op::DefineVar(ops::DefineVar { name, min_val, max_val }) => {
@@ -432,9 +432,9 @@ impl OptimizerWireOp {
                 nonempty()?;
                 Op::End(ops::End { computation: one(), ranges: src[1..].iter().cloned().collect() })
             }
-            Self::Barrier => {
+            Self::Barrier(fence) => {
                 nonempty()?;
-                Op::Barrier(ops::Barrier { src: one(), deps: src[1..].iter().cloned().collect() })
+                Op::Barrier(ops::Barrier { src: one(), deps: src[1..].iter().cloned().collect(), fence: *fence })
             }
             Self::Stack => Op::Stack(ops::Stack { sources: src.into_iter().collect() }),
             Self::VConst(values) => {

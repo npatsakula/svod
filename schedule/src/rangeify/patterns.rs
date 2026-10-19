@@ -42,6 +42,7 @@ fn mark_codegen_param(node: Arc<UOp>) -> Arc<UOp> {
 
 // Forward declarations for types from other modules
 use super::indexing::IndexingContext;
+use super::indexing::is_always_contiguous;
 use super::indexing::no_range;
 use super::indexing::ranges_equal;
 use super::kernel::{LocalAddBufferContext, RangeifyBufferContext};
@@ -148,6 +149,11 @@ pub fn early_rewrites() -> TypedPatternMatcher {
         },
         Detach { src: x } => x.clone(),
         ContiguousBackward { src: x } => x.clone(),
+        // A hint-less CONTIGUOUS over a realized node (or a reshape of one) is
+        // that node: its bytes already sit in a buffer, and copying them would
+        // add a kernel per op-layer fallback (tinygrad: contiguous of
+        // buffer/copy/assign is already contiguous).
+        Contiguous { src, opts } if opts.is_empty() && UOp::realized_base(src).is_some() => src.clone(),
         // A COPY transfers one contiguous range, so a source that is resized or
         // reordered by a movement op must be materialised first (tinygrad
         // `schedule/rangeify.py:149`). Without this the transfer is sized by the
@@ -197,6 +203,9 @@ pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
         x @ Pad { src: _, begin_pads: _, end_pads: _ } => convert_pad_to_where(x, ctx),
         // STACK → WHERE select on the leading range, BEFORE bufferization.
         x @ Stack { sources: _ } => convert_stack_to_where(x, ctx),
+        // A CALL reads whole buffers: an argument shared with a ranged consumer
+        // was rewritten into that consumer's indexed load and goes back.
+        c @ Call { body: _, args: _, info: _ } => unindex_call_args(c),
         // ALL ops (including movement) get source bufferization.
         x => apply_bufferize_transform(x, ctx),
         // Movement ops get removed AFTER bufferization - simple logic
@@ -260,6 +269,25 @@ fn convert_stack_to_where(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc
         let key = UOp::const_(selector.dtype(), ConstValue::Int(k as i64));
         UOp::try_where(selector.try_cmpeq(&key).ok()?, source.clone(), acc).ok()
     })
+}
+
+/// A CALL argument that became `INDEX(buffer, ranges)` because a ranged
+/// consumer shares the node (a realized input read by a graph kernel and by
+/// the custom kernel) is the buffer again: the call takes no ranges.
+fn unindex_call_args(call: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Call(ops::Call { body, args, info }) = call.op() else { return None };
+    let mut changed = false;
+    let args = args
+        .iter()
+        .map(|arg| match arg.op() {
+            Op::Index(ops::Index { buffer, .. }) if is_always_contiguous(buffer) => {
+                changed = true;
+                buffer.clone()
+            }
+            _ => arg.clone(),
+        })
+        .collect();
+    changed.then(|| body.call(args, info.clone()).rtag(call.tag().clone()).rorigin(call.origin()))
 }
 
 /// Remove movement ops after source bufferization.

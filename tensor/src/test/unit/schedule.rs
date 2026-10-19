@@ -499,7 +499,7 @@ fn test_create_schedule_collects_end_call_and_call_dependencies() {
     assert_eq!(consumer_item.dependencies, expected);
 }
 
-/// A hand-lowered kernel body (a marked SINK, e.g. svod-tk's tile DSL or
+/// A hand-lowered kernel body (a marked SINK, e.g. a hand-ranged custom kernel or
 /// rangeify's own `reduce_to_acc`) legitimately contains intra-kernel REG
 /// accumulator AFTERs whose deps are `END(STORE)` and `RANGE` — shapes the
 /// inter-kernel callable-dependency grammar (`collect_callable_dep_ids`) does

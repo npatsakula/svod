@@ -109,7 +109,7 @@ Initializers और graph inputs `initializer` और `input` के नीच�
 
 ### हाथ से लिखे कर्नेल {#hand-written-kernels}
 
-एक `tk` कर्नेल उसी scope के खाते में जाता है जो उसे बनाते समय सक्रिय था — वही नियम जो graph
+हाथ से लिखा एक कर्नेल (`tk`) उसी scope के खाते में जाता है जो उसे बनाते समय सक्रिय था — वही नियम जो graph
 कर्नेल पर लागू है। Scheduler उसकी body कभी नहीं देखता, इसलिए `UOp::custom_kernel` construction के
 समय ही उसे harvest करके हटा देता है (`ir/src/uop/constructors/graph.rs`); एक ही हाथ के कर्नेल को
 launch करने वाली दो layers अब भी एक ही compiled program साझा करती हैं। जिन inputs को यह copy

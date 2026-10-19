@@ -122,6 +122,31 @@ fn parse_kernel_descriptor_from_compiled_elf() {
     assert!((parsed.kd_offset as usize) < parsed.image.len(), "the descriptor must lie inside the image");
 }
 
+/// A kernel reading a module global of its own addresses it PC-relative, a
+/// 32-bit half of the offset per relocation: both are applied, and the
+/// global's bytes land in the image.
+#[test]
+fn a_module_globals_pc_relative_address_is_relocated() {
+    const GLOBAL_IR: &str = r#"target triple = "amdgcn-amd-amdhsa"
+@table = internal unnamed_addr addrspace(1) constant [4 x i32] [i32 1515870810, i32 2, i32 3, i32 4], align 16
+declare i32 @llvm.amdgcn.workitem.id.x()
+define amdgpu_kernel void @read_table(ptr addrspace(1) noalias %buf0) #0 {
+  %tid = tail call i32 @llvm.amdgcn.workitem.id.x()
+  %i = and i32 %tid, 3
+  %p = getelementptr inbounds [4 x i32], ptr addrspace(1) @table, i32 0, i32 %i
+  %v = load i32, ptr addrspace(1) %p
+  %q = getelementptr inbounds i32, ptr addrspace(1) %buf0, i32 %tid
+  store i32 %v, ptr addrspace(1) %q
+  ret void
+}
+attributes #0 = { nounwind "amdgpu-flat-work-group-size"="1,64" }
+"#;
+    let Some(bytes) = clang_amdgcn(GLOBAL_IR, "gfx1201") else { return };
+    let parsed = parse_kernel(&bytes, "read_table").expect("a PC-relative global address relocates");
+    let table: Vec<u8> = [1515870810u32, 2, 3, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert!(parsed.image.windows(16).any(|w| w == table), "the global's bytes are in the image");
+}
+
 #[test]
 fn program_code_allocation_is_balanced_on_success_and_failure() {
     let Some(mock) = mock_program(EMPTY_IR, "empty", &[], false) else { return };

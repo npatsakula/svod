@@ -15,7 +15,7 @@ knobs की सूची देता है और बताता है क�
 | Variable | Default | Effect |
 |---|---|---|
 | `SVOD_DEVICE` | `CPU` (macOS पर `METAL:0`) | `CUDA:N` (alias `GPU`) default tensor device चुनता है; `NV` alias *नहीं* है, वह एक userspace driver के लिए सुरक्षित रहता है |
-| `SVOD_DUMP_NVPTX_IR` | unset | वह directory जिसमें हर kernel का NVPTX LLVM IR `sm_XY_<kernel>.ll` के रूप में जाता है |
+| `SVOD_DUMP_NVPTX_IR` | unset | वह directory जिसमें हर kernel का NVPTX LLVM IR `sm_XY_<kernel>_<digest>.ll` के रूप में जाता है |
 | `SVOD_CUDA_PTXAS` | on | `0` `ptxas` वाली pre-assembly छोड़ देता है और PTX text को driver JIT को सौंप देता है |
 | `SVOD_CUDA_SCOPED_SYNC` | on | `0` हर scoped wait को एक पूरे `cuCtxSynchronize` से बदल देता है और copies को synchronous बना देता है ([Architecture](./architecture.md)) |
 | `SVOD_CUDA_CUPTI` | on | `0` `libcupti.so.13` को load करना छोड़ देता है, इसलिए कोई hardware counters नहीं होते |
@@ -97,7 +97,7 @@ SVOD_DUMP_NVPTX_IR=/tmp/nvptx SVOD_DEVICE=CUDA:0 cargo test -p svod-tensor -- so
 
 # Reproduce the exact compile, then assemble with ptxas to see the real diagnostics
 clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 \
-      -Wno-override-module /tmp/nvptx/sm_86_r_64_32.ll -o r_64_32.ptx
+      -Wno-override-module /tmp/nvptx/sm_86_r_64_32_<digest>.ll -o r_64_32.ptx
 ptxas -arch=sm_86 -v r_64_32.ptx -o r_64_32.cubin   # -v prints registers, shared, spills
 nvdisasm r_64_32.cubin | less                         # the SASS
 ```

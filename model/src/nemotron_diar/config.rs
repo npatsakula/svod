@@ -11,6 +11,7 @@ use svod_dtype::DType;
 use crate::audio::{MelConfig, MelLog, MelScale, PadMode};
 
 use super::error::{ConfigSnafu, Result};
+use super::model::SEQ_ALIGN;
 
 /// NeMo's `log_zero_guard_value` for `log_zero_guard_type="add"`.
 const LOG_GUARD: f64 = 1.0 / (1 << 24) as f64;
@@ -184,8 +185,8 @@ impl NemotronDiarConfig {
         if self.max_batch == 0 {
             return ConfigSnafu { message: "max_batch must be positive" }.fail();
         }
-        // The encoder pads a step to a tileable length (see `NemotronDiar::classify`).
-        let padded = self.step_capacity(profile).next_multiple_of(svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE);
+        // The encoder pads a step to `SEQ_ALIGN` (see `NemotronDiar::classify`).
+        let padded = self.step_capacity(profile).next_multiple_of(SEQ_ALIGN);
         if padded > self.max_positions {
             return ConfigSnafu {
                 message: format!(

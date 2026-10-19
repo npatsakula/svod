@@ -1,83 +1,86 @@
 ---
-sidebar_label: 自动调优
+sidebar_label: 调优
 ---
 
-# 首次使用时自动调优
+# 调优 {#tuning}
 
-内核的分块表是一个搜索空间，而不是答案。GEMM 每个架构家族带三到五个分块，flash attention 带四种每 warp 分块，单查询注意力带若干种 K/V 切分——哪一个胜出取决于形状、设备的计算单元数及其时钟。因此，设备第一次遇到某个形状时，`svod-tk` 会编译并计时每个适配的候选，保留最快的那个，并把它记在磁盘上。整套机制就是 `tk/src/tune.rs`。
+每个算子在 `ops::config` 中依据设备测得的代价为每种形状的配置排序（见[设备代价](#device-costs)）。排序是一个模型，寄存器计数也是，因此二者都不决定配置的准入。决定准入的是一条规则：调优器按排序顺序、以每批 64 个（`config::SHORTLIST`）并行编译排序后的配置，直到得到前 64 个编译后内核不溢出的 tile（内核报告了溢出的 scratch 字节即为溢出；什么都不报告的后端视为准入）。tile 以其第一条干净的流水线（环形缓冲深度、展开）被准入，因此会溢出的展开环形缓冲让位于其不展开的孪生配置。当每个能编译的配置都溢出时，仍对其中前 64 个计时：没有算子会因为溢出而退回计算图。
 
----
+准入的配置连同其变体（注意力的键拆分、饥饿卷积的归约拆分）就是调优存储在设备第一次遇到某个形状时测量的候选。随后，领先的各 tile 中处于领先者竞争区间之内的那些（至多八个，`config::TWIN_TILES`）的其余流水线被编译，并与胜者对比计时，无论是否溢出，最快者即为最终选择。注意力轮流调优其 softmax 形式和 tile（见[内核库](./kernel-library#flash-attention)）。当什么都无法编译时（没有可供编译的设备），直接使用前 64 个 tile 而不做测试。
 
-## 首次启动时发生了什么
+关闭调优时不计时：运行排序列表中第一个编译干净的配置，按排序顺序每批八个编译直至找到，并以 `first` 行保存在存储中。设备的代价探针仍会测量，因为排序需要它们。
 
-`GemmPolicy::tuned`、`FaPolicy::tuned` 和 `SqPolicy::tuned`（位于 `tk/src/kernels/`）都通过 `TuneStore::select` 走同一套流程：
+## 何时进行测量 {#when-measurement-happens}
 
-1. **过滤**：把表缩减到能对该形状分块（对 GEMM 而言，还要带有所请求的 `Epilogue`）的候选。若只剩一个或一个都没有：直接返回静态选择，不做任何测量。
-2. **内存缓存（memo）**：一个进程级的 `HashMap<TuneKey, usize>` 无需构建内核即可回答重复的形状——一个 plan 对每个节点都会问一次同样的形状。
-3. **存储**：memo 未命中时，针对占位缓冲区构建每个候选的 `SINK` 并计算指纹（`kernel_fingerprint`）。这些摘要会并入存储行，因此内核函数体一改就会重新测量。然后在该设备的文件中查找这一行。
-4. **测量**：存储未命中时，在该形状的合成操作数上（`Tensor::randn`，转换为目标 dtype，移到设备上）对每个候选执行 `compile_kernel`。第一个构建成功的候选负责把时钟拉起来——`warm_clock` 反复派发它，直到耗时不再下降或已过去 1.5 s；已在负载下的设备几次运行就会进入平台期。随后 `round_robin_min` 轮流对每个候选计时三轮，并保留各自的最小值，这样不会有哪个候选是在其他候选没遇到过的时钟下被评判的。
-5. **保留**最快的那个：写入 memo，也写入存储文件。无法构建或派发的候选会被跳过；若全部失败，则不缓存任何东西，改用静态选择。
+算子在被调用的地方、即构建计算图时进行测量，从不在运行中的计划内部测量。每个候选被构建为程序，在按容量分配的临时缓冲区上启动，所有运行时变量都绑定到其最大值（浮点操作数填充从 `[-1, 1)` 中抽取的值，因此在真实数据下降频的显卡按其实际运行状态计时；整数操作数填充零），然后计时：
 
-只有测出的胜者才会写入文件。`select_with` 是同一套策略，只是测量由调用方提供，`tk/src/test/unit/tune.rs` 中的单元测试正是借此在没有 GPU 的情况下检验它。
+| 步骤 | 设置 |
+|---|---|
+| 预热 | 连续运行直到时钟稳定 |
+| 轮次 | 先对所有候选跑一轮，再对竞争者跑 3 轮：即第一轮成绩在最佳值 1.2 倍以内的候选（候选不足 16 个时为全部）；竞争者多于两个时，再对两名领先者跑 4 轮 |
+| 每轮 | 5 ms 设备时间的连续维持运行（至多 1024 次启动，按该候选上一次运行的时长计算），然后 5 次剖析运行，保留每个候选的最小值 |
+| 一次运行的时间 | 其各内核 GPU 时间戳之和 |
 
----
+维持运行按设备时间计量，因为启动是异步排队的。一个候选是一组程序：对拆分而言是一个内核加上合并其部分结果的内核，其时间是各程序时间之和。构建或运行失败的候选被跳过。如果什么都没测到，就使用第一个候选，并且不存储任何内容。
 
-## 键与存储
+有两道防护保证计时可信：
 
-```rust
-// tk/src/tune.rs
-pub struct TuneKey {
-    pub kernel: &'static str,   // "gemm_nt", "flash_attention", "sq_attention"
-    pub device: String,         // "<arch target name>-<compute units>cu"
-    pub shape: Vec<usize>,      // the kernel's own shape tuple, dtype width and flags included
-    pub config: u64,            // a digest of the candidate set (and anything else the graphs vary with)
-}
-```
+- **一把设备锁。** 进程中的每次计时，无论是调优器的还是代价探针的，都持有同一把锁：共享设备的两次测量会互相干扰计时。两个线程调优同一个键时只测量一次；第二个线程等待第一个的结果。
+- **时间戳防护。** 低于该候选运行中位数一半的运行被视为丢失的时间戳，在保留最快值之前被丢弃，调优器和探针都是如此。
 
-GEMM 以 `[m, k, n, dtype.bytes(), epilogue.code()]` 为键；flash attention 以 `[b, n, h, h_kv, d, causal, mask.code(), dtype.bytes()]` 为键。改动分块表会改变 `config`，因此新增的候选会触发重新测量。
+## 存储 {#the-store}
 
-存储是每个设备、每个 crate 版本一个文件，每个条目一行：
+| 项目 | 值 |
+|---|---|
+| 目录 | `$SVOD_TK_TUNE_DIR`，否则 `$XDG_CACHE_HOME/svod/tk_tune`，否则 `~/.cache/svod/tk_tune` |
+| 文件 | 每个设备和 crate 版本一个，例如 `sm_86_28sm-v0.2.0.txt`，以其行格式作为首行（`format 5`）；其他格式或没有该行的文件整个丢弃 |
+| 行 | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`：`choice` 存放运行过的候选，最快者在前，每个为 `index ns`；`value` 存放一个测得的数；`admitted` 存放准入保留的排序索引；`first` 存放第一个干净配置的索引 |
+| 键 | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`，其中 `device` 是架构和 SM 数量（`sm_86-28sm`），`compiler` 是设备编译器的摘要（`tune::compiler`） |
+
+来自 RTX 3060 上一个真实存储的两行：一条注意力选择（形状 `[batch, t, tk, heads, kv_heads, d]`，候选 0 以 3904 ns 胜出），以及一条代价探针的值（每单位的飞秒数）。
 
 ```text
-<kernel>|<device>|<shape>|<builds digest> <winning index> <ns>
+choice|attention|sm_86-28sm|BFloat16|2x10x12x6x2x64|08bd45c243ff1581|9154cc72f03d25cd|ef103f71226add50 0 3904 1 3936
+value|probe:cached_1m|sm_86-28sm|Int32||0a2d6c02b82988af|9154cc72f03d25cd|d2a8e296bcce85e4 16601
 ```
 
-文件位于以下位置中第一个满足条件的：
+`programs` 字段是候选所发射内核的指纹：降级后的程序以及交给后端的 LLVM 文本，因此对内核或渲染器的改动会触发重新测量，而发射出相同内核的重构不会。一个程序发射什么，按其组成内容、按可执行文件的每次构建记录在存储根目录下的 `emitted/<build>.txt` 中（一周未用的构建会被删除），因此同一构建的热进程无需降级任何东西，而重新构建后每个程序降级一次。只有存储未命中时才编译。写入时会重新读取、合并并原子地替换文件。无法读取或写入的存储视为未命中，从不报错。
 
-| 位置 | 条件 |
+## 设备代价 {#device-costs}
+
+排序所用的代价（`atoms::Costs`：一个共享字节、一个流式字节、一个分散元素、满载 SM 上的一步矩阵核运算以及在 SIMD 上单独一个 wave 和作为 warpgroup 乘积时的一步、一个分数的 softmax、一次流水线行程（环的两个槽位，展开与不展开，以及一个槽位）、SM 上只有一个块时两个槽位和一个槽位的行程、一次 lane 移动、一次共享内存往返、经环的两个槽位（以及在 `cp.async` 填充的目标上经一个槽位）的全局延迟，以及 L2 的速率和大小）由 `probe::costs` 在进程第一次为该设备做规划时在设备上测量。每个字段是一对程序，其中探针做其基线所做的一切，再加上已知数量的该原语。这些值以 `value|probe:<field>` 行写入同一个存储文件，因此之后的进程会读回它们。失败的探针让其字段保持为零，发出警告，并在 `Planner::unmeasured` 中列出，而设备门控 `device_costs_are_physical` 要求该列表为空：规划器用已有的数据排序，而不是把设备丢给计算图。只有没有 SM 数量的设备才没有规划器。
+
+主机测试则直接声明代价（`test::unit::costs()`，以及从一个 gfx1151 存储中粘贴而来的 `gfx1151_costs()`）。对于本机没有对应设备的显卡，`Target::offline` 或 `Target::card` 给出目标，`probe::stored` 从该卡上拷贝来的调优存储中读取代价；没有这样的存储时，以 `probe::GUESSED` 代替，排序也就只是猜测。[`tk_dump` 示例](./testing-and-debugging#planning-for-another-card)两者都做。
+
+## 规划器日志 {#the-planner-log}
+
+`RUST_LOG=svod_tk::plan=debug` 记录规划器的决策：哪个算子走了计算图及其原因；排序的前 16 个配置及其预测的 ns，以及它略去了多少配置；存储未命中时，编译每个配置的结果（结论、寄存器数、溢出字节数）；以及调优后的选择。`RUST_LOG=svod_tk=debug` 还会加上调优器的各轮计时。
+
+## 关闭调优 {#switching-it-off}
+
+| 方式 | 作用 |
 |---|---|
-| `$SVOD_TK_TUNE_DIR/` | 设置了该变量 |
-| `$XDG_CACHE_HOME/svod/tk_tune/` | 否则，若设置了 `XDG_CACHE_HOME` |
-| `$HOME/.cache/svod/tk_tune/` | 其他情况 |
+| `SVOD_TK_TUNE=0` | 关闭候选计时；运行排序中第一个编译干净的配置（以 `first` 行保存）；代价探针仍会测量 |
+| `svod_tk::tune::scoped(false, f)` | 在当前线程（及其用于编译的工作线程）上对 `f` 效果相同，优先于环境变量；测试中使用 |
 
-文件名是设备字符串，其中非字母数字字符被替换（`gfx1201_64cu-v0.1.0.txt`）。写入时会重新读取、合并，并以原子方式重命名，因此两个进程同时调优时，最多丢失对方最新的那一行。目录不可读或不可写只算未命中，绝不报错；若没有可写的根目录，存储就只在内存中。
+`tune::TuneStore::at(root)` 在另一个根目录构建存储，传入 `None` 时仅存在于内存中。
 
----
+## 探针测试 {#probe-tests}
 
-## 关闭调优
+探针测试是带 `#[ignore]` 的测试，只打印耗时，从不断言。它们用设备探测到的代价排序，并为调优器准入的短名单计时，同时标出调优器的选择。在空闲的 GPU 上逐个运行：
 
-| 控制方式 | 效果 |
+```bash
+SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib gemm_candidates_probe -- --ignored --nocapture --test-threads=1
+```
+
+| 探针 | 输出 |
 |---|---|
-| `SVOD_TK_TUNE=0` | 不做测量；每个策略都返回其静态选择（`GemmPolicy::cfg`、`FaPolicy::config`、策略自身的切分） |
-| `svod_tk::tune::set_enabled(false)` | 效果相同，但在代码中设置，并在整个进程内覆盖环境变量——测试框架会调用它，以免一个内核测试对它碰到的每个形状都做调优 |
-| `gemm_nt_with(x, w, cfg)`、`flash_attention_tuned(q, k, v, opts, policy)`、`SqAttentionOpts::split` | 用你自己的选择器在单次启动中绕过策略 |
-
-当设备不打派发时间戳（`dispatch_gpu_ns` 为 `None`）时，调优也会被跳过，因为没有可比较的东西。
-
----
-
-## 调优的对象
-
-| 内核 | 候选 | 分块表 |
-|---|---|---|
-| `gemm_nt` | 该架构家族分块表中能对 `(m, k, n)` 分块且带有该尾声的每个 `GemmCfg` | `tk/src/kernels/gemm.rs` 中的 `CUDA_TILES` (2)、`RDNA_TILES` (3)、`RDNA4_TILES` (5) |
-| `flash_attention` | `FA_TILES` 中 K/V 双缓冲能放进共享内存、且块大小能整除 `N` 的每个 `(q_blk, kv_blk)` | `tk/src/kernels/fa.rs` 中的 `[(16,16), (16,32), (16,64), (32,32)]` |
-| `single_query_attention` | `N` 的约数中最接近设备驻留 wave 预算、且每块至少留下 15 次迭代的那些 | `tk/src/kernels/sq_attention.rs` 中的 `SqPolicy::candidates` |
-
-每个策略回退时采用的静态选择本身也是测量得来的，每个架构家族在一块硬件上测过：GEMM 的 `GemmPolicy::cfg` 优先选最宽的分块，除非它的网格无法把设备的计算单元填满 `resident` 倍；`FaPolicy::tile` 只有在启动网格覆盖整台设备、且头维度低于该家族的上限时，才选更高的每 warp 分块。调优之所以存在，是因为这些交叉点会随形状移动。
-
-:::tip[解读一次测量]
-`SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::gemm_first_use -- --ignored` 会针对一个临时存储运行真实的流程，并断言：只有一个文件、一行记录，且第二次请求无需测量就能读回它。要查看你自己的运行中某个形状选了什么，直接读那个文件即可：索引是上面所列分块表中的位置。
-:::
-
-这笔开销对每个设备上的每个形状只付一次：几次编译，加上冷 GPU 大约两秒的计时。形状经过分桶的模型——Qwen3 把序列长度分桶到 `FLASH_ATTENTION_SEQUENCE_MULTIPLE`——只需调优寥寥几行，之后每个批次都直接走 memo。
+| `gemm_throughput_probe` | 准入的 GEMM 配置在 4096³ bf16 上的 TFLOP/s，以及调优器的选择 |
+| `gemm_candidates_probe` | Nemotron 投影形状和 4096³ 上每个准入的 GEMM 候选：未调优时的选择、最快者以及调优器的选择 |
+| `qwen3_gemm_candidates_probe` | Qwen3-Embedding 的投影：先是短名单，然后是格点中的其余配置 |
+| `attention_throughput_probe` | Flash attention（B 4、H 8、T 2048；d 64/128，因果与非因果，以及带偏置的 d 64）：每个准入的配置，以及调优器的选择及其 softmax 形式 |
+| `attention_candidates_probe` | 格点中的每个注意力配置，与准入的短名单对比 |
+| `decode_throughput_probe` | 一个 Whisper large-v3 解码器步骤的自注意力和交叉注意力，调优后的拆分与不拆分对比 |
+| `conv_throughput_probe` | 每个 YOLO26 类别中每个准入的卷积候选，与图卷积对比 |
+| `norm_bandwidth_probe` | 行内核在 8192×1024 bf16 上的带宽，以 GB/s 计 |
+| `first_execution_probe` | 构建、降级和准备一个 tk GEMM 的主机开销，与图 GEMM 对比 |

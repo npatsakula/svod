@@ -1,112 +1,139 @@
 ---
-sidebar_label: Autotuning
+sidebar_label: Tuning
 ---
 
-# पहले इस्तेमाल पर Autotuning
+# Tuning {#tuning}
 
-किसी कर्नेल की tile table एक search space है, जवाब नहीं। GEMM हर family के लिए तीन से पाँच tiles रखता है,
-flash attention चार per-warp tiles, single-query attention कुछ K/V splits — और कौन-सा जीतता है, यह shape,
-device के compute units की गिनती और उसकी clock पर निर्भर करता है। इसलिए जब कोई device पहली बार किसी shape से
-मिलता है, `svod-tk` हर फ़िट होने वाले candidate को compile और time करता है, सबसे तेज़ को रखता है, और उसे disk
-पर याद रखता है। `tk/src/tune.rs` ही पूरा mechanism है।
+हर op `ops::config` में अपने configs को हर shape के लिए device की मापी गई costs से rank करता है (देखें
+[Device costs](#device-costs))। Ranking एक model है, और register count भी, इसलिए दोनों में से कोई
+config को admit नहीं करता। एक नियम करता है: tuner ranked configs को 64 के batches (`config::SHORTLIST`)
+में, ranked क्रम में और समानांतर रूप से compile करता है, जब तक उसे वे पहले 64 tiles न मिल जाएँ जिनके
+compiled kernels spill नहीं करते (spilled scratch bytes बताने वाला कर्नेल spill करता है; जो backend कुछ
+नहीं बताता वह admit करता है)। एक tile अपनी पहली clean pipeline (ring depth, unrolling) पर admit होता
+है, इसलिए spill करने वाली unrolled ring अपने rolled जुड़वाँ के लिए जगह छोड़ देती है। जब compile होने
+वाला हर config spill करे, तब भी उनमें से पहले 64 मापे जाते हैं: spills की वजह से कोई op ग्राफ़ पर नहीं
+गिरता।
 
----
+Admit हुए configs, अपने variants के साथ (attention के लिए key splits, भूखे convolution के लिए
+reduction splits), वे candidates हैं जिन्हें tune store तब मापता है जब कोई device पहली बार किसी shape
+से मिलता है। फिर अग्रणी tiles की बाक़ी pipelines, जो अग्रणी के contender band के भीतर हों और अधिकतम आठ
+(`config::TWIN_TILES`), compile होकर विजेता के ख़िलाफ़ मापी जाती हैं, spill करें या न करें, और सबसे तेज़
+चुनी जाती है। Attention अपने softmax forms और अपने tiles को बारी-बारी से tune करता है (देखें
+[कर्नेल लाइब्रेरी](./kernel-library#flash-attention))। जब कुछ भी compile नहीं होता (compile करने के लिए
+कोई device नहीं), तो पहले 64 tiles बिना जाँचे इस्तेमाल होते हैं।
 
-## पहले launch पर क्या होता है
+Tuning बंद होने पर कुछ भी मापा नहीं जाता: ranked list का पहला config जो clean compile हो वह चलता है,
+जिसे आठ-आठ के ranked batches में compile करके ढूँढा जाता है और store में एक `first` line के रूप में रखा
+जाता है। Device के cost probes फिर भी मापते हैं, क्योंकि ranking को उनकी ज़रूरत है।
 
-`GemmPolicy::tuned`, `FaPolicy::tuned` और `SqPolicy::tuned` (`tk/src/kernels/` में) `TuneStore::select` के
-ज़रिए एक ही क्रम चलाते हैं:
+## मापन कब होता है {#when-measurement-happens}
 
-1. **Filter:** table को उन candidates तक छाँटें जो shape को tile करते हैं (और, GEMM के लिए, माँगा गया
-   `Epilogue` रखते हैं)। एक candidate या कोई नहीं: static चुनाव लौटाएँ, कुछ measure न करें।
-2. **Memo:** एक process-wide `HashMap<TuneKey, usize>` दोहराए गए shape का जवाब बिना कर्नेल build किए देता
-   है — एक plan हर node पर एक ही shape एक बार पूछता है।
-3. **Store:** memo miss पर, हर candidate का `SINK` placeholder buffers के ख़िलाफ़ build करें और उसका
-   fingerprint लें (`kernel_fingerprint`)। Digests store line में जुड़ते हैं, इसलिए कर्नेल body में बदलाव
-   दोबारा measure करवाता है। Device की file में line खोजें।
-4. **Measure:** store miss पर, हर candidate को shape के synthetic operands (`Tensor::randn`, dtype में cast,
-   device पर moved) पर `compile_kernel` करें। जो पहला build हो गया, वह clock उठाता है — `warm_clock` उसे तब
-   तक dispatch करता है जब तक उसका समय गिरना बंद न हो जाए या 1.5 s न बीत जाएँ; पहले से load में चल रहा device
-   कुछ ही runs में plateau पर पहुँच जाता है। फिर `round_robin_min` तीन rounds तक हर candidate को बारी-बारी
-   time करता है और हर एक का minimum रखता है, ताकि किसी को ऐसी clock पर न आँका जाए जिस पर बाक़ी नहीं थे।
-5. **Keep:** सबसे तेज़ को memo में और store file में रखें। जो candidate build या dispatch नहीं हो पाता, उसे
-   छोड़ दिया जाता है; अगर कोई नहीं हो पाता, तो कुछ cache नहीं होता और static चुनाव इस्तेमाल होता है।
+Op वहीं मापता है जहाँ उसे बुलाया जाता है, ग्राफ़ बनते समय, कभी किसी चलते plan के भीतर नहीं। हर
+candidate एक program के रूप में बनता है, capacity वाले scratch buffers पर launch होता है जहाँ हर runtime
+variable अपने maximum पर bound होता है (float operands में `[-1, 1)` से लिए गए मान होते हैं, ताकि जो
+कार्ड असली data पर clock घटाता है वह वैसे ही मापा जाए जैसे वह चलेगा; integer operands में शून्य होते
+हैं), और मापा जाता है:
 
-File तक सिर्फ़ measure किया गया विजेता पहुँचता है। `select_with` वही policy है जिसमें measurement caller
-देता है, और `tk/src/test/unit/tune.rs` के unit tests इसी तरह उसे बिना GPU के चलाते हैं।
+| क़दम | सेटिंग |
+|---|---|
+| Warm-up | लगातार runs जब तक clock स्थिर न हो जाए |
+| Rounds | हर candidate का एक round, फिर contenders के 3 और: वे जो पहले round के सबसे अच्छे के 1.2× के भीतर हों (16 से कम हों तो हर candidate); फिर दो अग्रणियों के 4 और, जहाँ दो से ज़्यादा contenders चले हों |
+| हर round | लगातार sustain runs में 5 ms device time (अधिकतम 1024 launches, candidate के पिछले run के हिसाब से आकार), फिर 5 profiled runs, हर candidate का minimum रखते हुए |
+| एक run का समय | उसके कर्नेलों के GPU timestamps का जोड़ |
 
----
+Sustain का आकार device time में तय होता है क्योंकि launches asynchronously queue होते हैं। एक
+candidate programs की एक list है, एक कर्नेल और split होने पर उसके partial results का merge, और उसका
+समय उसके programs के समयों का जोड़ है। जो candidate build या run होने में विफल हो उसे छोड़ दिया जाता
+है। अगर कुछ भी नहीं मापा जाता, तो पहला candidate इस्तेमाल होता है और कुछ भी store नहीं होता।
 
-## Key और store
+दो पहरेदार समय को ईमानदार रखते हैं:
 
-```rust
-// tk/src/tune.rs
-pub struct TuneKey {
-    pub kernel: &'static str,   // "gemm_nt", "flash_attention", "sq_attention"
-    pub device: String,         // "<arch target name>-<compute units>cu"
-    pub shape: Vec<usize>,      // the kernel's own shape tuple, dtype width and flags included
-    pub config: u64,            // a digest of the candidate set (and anything else the graphs vary with)
-}
-```
+- **एक device lock.** Process की हर timing, tuner की और cost probes की भी, एक ही lock रखती है: device
+  साझा करने वाले दो मापन एक-दूसरे को माप लेते। एक ही key को tune करने वाले दो threads उसे एक बार
+  मापते हैं; दूसरा पहले के जवाब का इंतज़ार करता है।
+- **Stamp guard.** जो run अपने candidate के runs के median के आधे से कम हो वह खोया हुआ stamp है, और
+  सबसे तेज़ रखने से पहले हटा दिया जाता है, tuner और probes दोनों के लिए।
 
-GEMM की key `[m, k, n, dtype.bytes(), epilogue.code()]` है; flash attention की
-`[b, n, h, h_kv, d, causal, mask.code(), dtype.bytes()]`। Table बदलने से `config` बदलता है, इसलिए नया
-candidate दोबारा measure होता है।
+## Store {#the-store}
 
-Store हर device और crate version के लिए एक file है, हर entry के लिए एक line:
+| क्या | मान |
+|---|---|
+| Directory | `$SVOD_TK_TUNE_DIR`, वरना `$XDG_CACHE_HOME/svod/tk_tune`, वरना `~/.cache/svod/tk_tune` |
+| File | हर device और crate version के लिए एक, जैसे `sm_86_28sm-v0.2.0.txt`, जिसकी शुरुआत उसके line format (`format 5`) से होती है; किसी दूसरे format वाली, या बिना इस line वाली फ़ाइल पूरी हटा दी जाती है |
+| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: एक `choice` में चले हुए candidates होते हैं, सबसे तेज़ पहले, हर एक `index ns`; एक `value` में एक मापी गई संख्या; एक `admitted` में वे ranked indices जिन्हें admission ने रखा; एक `first` में पहले clean config का index |
+| Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, जहाँ `device` arch और SM count है (`sm_86-28sm`) और `compiler` device के compiler का digest है (`tune::compiler`) |
+
+RTX 3060 पर एक असली store की lines: एक attention choice (shape `[batch, t, tk, heads, kv_heads, d]`,
+candidate 0 3904 ns पर) और एक cost probe का value (हर unit पर femtoseconds)।
 
 ```text
-<kernel>|<device>|<shape>|<builds digest> <winning index> <ns>
+choice|attention|sm_86-28sm|BFloat16|2x10x12x6x2x64|08bd45c243ff1581|9154cc72f03d25cd|ef103f71226add50 0 3904 1 3936
+value|probe:cached_1m|sm_86-28sm|Int32||0a2d6c02b82988af|9154cc72f03d25cd|d2a8e296bcce85e4 16601
 ```
 
-इनमें से पहली जगह पर:
+`programs` field उन कर्नेलों का fingerprint है जिन्हें candidates emit करते हैं: lowered program और
+backend को सौंपा गया LLVM text, इसलिए कर्नेलों या renderer में बदलाव दोबारा मापता है और वही कर्नेल emit
+करने वाला refactor नहीं। कोई program क्या emit करता है, यह उस चीज़ से याद रखा जाता है जिससे वह बना है,
+executable के हर build के लिए, store के root के तहत `emitted/<build>.txt` में (एक हफ़्ते से इस्तेमाल न
+हुआ build हटा दिया जाता है), इसलिए उसी build का warm process कुछ lower नहीं करता और rebuild हर program
+को एक बार lower करता है। सिर्फ़ store miss compile करता है। Writes फ़ाइल को दोबारा पढ़ते हैं, merge करते
+हैं और atomically बदलते हैं। न पढ़ा जा सकने वाला या न लिखा जा सकने वाला store miss गिना जाता है, कभी
+error नहीं।
 
-| जगह | कब |
+## Device costs {#device-costs}
+
+Ranking की costs (`atoms::Costs`: एक shared byte, एक streamed byte, एक scattered element, पूरे SM के
+तहत, अपने SIMD पर अकेले और warpgroup product के रूप में एक matrix-core step, एक score का softmax, दो ring
+slots पर unrolled और rolled और एक slot पर एक pipeline trip, अपने SM पर अकेले block के दो और एक slot वाले
+trips, एक lane move, एक shared round trip, दो ring slots से और जहाँ fill `cp.async` है वहाँ एक slot से
+global latency, और L2 की दर और आकार) device पर `probe::costs` से तब मापी जाती हैं जब कोई process पहली बार उसके
+लिए plan करता है। हर field programs की एक जोड़ी है, एक probe जो वह सब करता है जो उसका baseline करता है,
+साथ में primitive की एक ज्ञात मात्रा। मान उसी store फ़ाइल में `value|probe:<field>` lines के रूप में जाते
+हैं, ताकि बाद के processes उन्हें वापस पढ़ें। जो probe विफल हो, वह अपने field को शून्य पर छोड़ता है, उसकी
+चेतावनी दी जाती है, और उसका नाम `Planner::unmeasured` में आता है, जिसे device gate
+`device_costs_are_physical` ख़ाली रखता है: planner device को ग्राफ़ पर छोड़ने के बजाय जो उसके पास है उससे
+rank करता है। सिर्फ़ बिना SM count वाले device के पास कोई planner नहीं होता।
+
+Host tests इसके बजाय costs घोषित करते हैं (`test::unit::costs()`, और gfx1151 store से चिपकाई गई
+`gfx1151_costs()`)। जिस कार्ड का device इस मशीन पर नहीं है, उसके लिए `Target::offline` या
+`Target::card` target देता है, और `probe::stored` उस कार्ड से copy किए गए tune store से costs पढ़ता है;
+उसके बिना `probe::GUESSED` उसकी जगह लेता है और ranking एक अनुमान है।
+[`tk_dump` example](./testing-and-debugging#planning-for-another-card) दोनों करता है।
+
+## Planner log {#the-planner-log}
+
+`RUST_LOG=svod_tk::plan=debug` planner के फ़ैसले log करता है: ग्राफ़ लेने वाला op और क्यों, किसी
+ranking के पहले 16 configs उनके अनुमानित ns के साथ और कितने configs उसने छोड़ दिए, store miss पर हर
+config को compile करने से क्या दिखा (verdict, registers, spilled bytes), और tuned चुनाव।
+`RUST_LOG=svod_tk=debug` tuner के rounds जोड़ता है।
+
+## इसे बंद करना {#switching-it-off}
+
+| कैसे | असर |
 |---|---|
-| `$SVOD_TK_TUNE_DIR/` | variable set हो |
-| `$XDG_CACHE_HOME/svod/tk_tune/` | वरना, जब `XDG_CACHE_HOME` set हो |
-| `$HOME/.cache/svod/tk_tune/` | अन्यथा |
+| `SVOD_TK_TUNE=0` | Candidate timing बंद; पहला ranked config जो clean compile हो वह चलता है (`first` line के रूप में रखा जाता है); cost probes फिर भी मापते हैं |
+| `svod_tk::tune::scoped(false, f)` | इस thread पर (और जिन workers पर यह compile करता है उन पर) `f` के लिए वही, environment के ऊपर; tests इसे इस्तेमाल करते हैं |
 
-File का नाम device string है जिसमें non-alphanumerics बदल दिए जाते हैं
-(`gfx1201_64cu-v0.1.0.txt`)। Writes दोबारा पढ़ते हैं, merge करते हैं और atomically rename करते हैं,
-इसलिए एक साथ tune कर रहे दो processes ज़्यादा से ज़्यादा एक-दूसरे की सबसे नई line खोते हैं। न पढ़ी या न लिखी
-जा सकने वाली directory एक miss है, कभी error नहीं; कोई writable root न हो तो store सिर्फ़ memory में रहता है।
+`tune::TuneStore::at(root)` किसी दूसरे root पर store बनाता है, या `None` के साथ सिर्फ़ memory में।
 
----
+## Probe tests {#probe-tests}
 
-## इसे बंद करना
+Probe tests `#[ignore]` tests हैं जो timings छापते हैं और कभी assert नहीं करते। वे device की probe की
+गई costs से rank करते हैं और tuner की admit की हुई shortlist को मापते हैं, tuner के चुनाव को चिह्नित करते
+हुए। इन्हें idle GPU पर एक-एक करके चलाएँ:
 
-| Control | असर |
+```bash
+SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib gemm_candidates_probe -- --ignored --nocapture --test-threads=1
+```
+
+| Probe | क्या छापता है |
 |---|---|
-| `SVOD_TK_TUNE=0` | कोई measurement नहीं; हर policy अपना static चुनाव लौटाती है (`GemmPolicy::cfg`, `FaPolicy::config`, policy का split) |
-| `svod_tk::tune::set_enabled(false)` | वही, code से, process के लिए environment को override करते हुए — test harnesses इसे call करते हैं ताकि कोई कर्नेल test हर छुए गए shape को tune न करे |
-| `gemm_nt_with(x, w, cfg)`, `flash_attention_tuned(q, k, v, opts, policy)`, `SqAttentionOpts::split` | एक launch के लिए अपने chooser से policy को bypass करें |
-
-जब device कोई dispatch timestamps stamp नहीं करता (`dispatch_gpu_ns` `None` है), तब भी tuning छोड़ दी जाती है,
-क्योंकि तुलना करने को कुछ होगा ही नहीं।
-
----
-
-## क्या tune होता है
-
-| कर्नेल | Candidates | Table |
-|---|---|---|
-| `gemm_nt` | family की table का हर `GemmCfg` जो `(m, k, n)` को tile करता है और epilogue रखता है | `tk/src/kernels/gemm.rs` में `CUDA_TILES` (2), `RDNA_TILES` (3), `RDNA4_TILES` (5) |
-| `flash_attention` | `FA_TILES` का हर `(q_blk, kv_blk)` जिसके K/V double buffers shared memory में फ़िट हों और जिसका block `N` को divide करे | `tk/src/kernels/fa.rs` में `[(16,16), (16,32), (16,64), (32,32)]` |
-| `single_query_attention` | `N` के वे divisors जो device के resident-wave budget के सबसे नज़दीक हों और हर chunk को कम से कम 15 trips दें | `tk/src/kernels/sq_attention.rs` में `SqPolicy::candidates` |
-
-हर policy जिस static चुनाव पर लौटती है, वह ख़ुद भी हर family के एक part पर measure किया गया है: GEMM का
-`GemmPolicy::cfg` सबसे चौड़ी tile पसंद करता है, जब तक उसका grid device के compute units को `resident` गुना
-न भर दे; `FaPolicy::tile` ऊँची per-warp tile तभी चुनता है जब launch grid device को cover कर ले और head dim
-family की सीमा से नीचे हो। Tuning इसलिए है क्योंकि ये crossovers shape के साथ खिसकते हैं।
-
-:::tip[Measurement पढ़ना]
-`SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::gemm_first_use -- --ignored` एक scratch store के
-ख़िलाफ़ असली क्रम चलाता है और assert करता है: एक file, एक line, और यह कि दूसरी request बिना measure किए उसे
-वापस पढ़ती है। अपने run में किसी shape के लिए क्या चुना गया, यह देखने के लिए file पढ़ें: index ऊपर बताई गई
-table में एक position है।
-:::
-
-कीमत हर device पर हर shape के लिए एक बार चुकती है: कुछ compiles, और ठंडे GPU के लिए लगभग दो seconds की
-timing। जिस model के shapes bucketed हों — Qwen3 sequence lengths को `FLASH_ATTENTION_SEQUENCE_MULTIPLE` तक
-bucket करता है — वह मुट्ठी भर lines tune करता है और फिर हर batch memo से चलाता है।
+| `gemm_throughput_probe` | 4096³ bf16 पर admit हुए GEMM configs, TFLOP/s, और tuner का चुनाव |
+| `gemm_candidates_probe` | Nemotron के projection shapes और 4096³ पर हर admit हुआ GEMM candidate: untuned चुनाव, सबसे तेज़ और tuner का चुनाव |
+| `qwen3_gemm_candidates_probe` | Qwen3-Embedding के projections: shortlist, फिर lattice का बाक़ी हिस्सा |
+| `attention_throughput_probe` | Flash attention (B 4, H 8, T 2048; d 64/128, causal और non-causal, bias के साथ d 64): हर admit हुआ config और tuner का चुनाव उसके softmax forms के साथ |
+| `attention_candidates_probe` | Lattice का हर attention config, admit हुई shortlist के ख़िलाफ़ |
+| `decode_throughput_probe` | Whisper large-v3 के decoder step का self और cross attention, tuned splits और बिना split |
+| `conv_throughput_probe` | हर YOLO26 class के लिए हर admit हुआ convolution candidate, graph convolution के ख़िलाफ़ |
+| `norm_bandwidth_probe` | 8192×1024 bf16 पर row kernels, GB/s में |
+| `first_execution_probe` | tk GEMM को build, lower और prepare करने की host cost, graph GEMM के ख़िलाफ़ |

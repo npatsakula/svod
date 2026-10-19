@@ -1,178 +1,326 @@
-mod arch;
+mod atoms;
+mod attention;
+mod build;
 mod conv;
-mod direct_launch;
-mod elementwise;
-mod fa;
-mod fa_batch_var;
-mod gemm;
-mod gemm_batch_var;
-mod golden;
-mod grid;
-mod guide;
-mod index;
-mod kernel_probe;
-mod kmeans;
-mod knn;
+mod cost_model;
+mod device;
+mod emit;
+mod gather;
+mod heads;
+mod interp;
+mod isa;
 mod layout;
-mod loop_scope;
-mod masked;
-mod math;
-mod matmul;
-mod movement;
-mod norm;
-mod proptests;
-mod reductions;
-mod scaffold;
-mod shuffle;
-mod sq_attention;
-mod swizzle;
-mod tiling;
+mod layouts;
+mod offline;
+mod ops;
+mod ops_plan;
+mod parts;
+mod probe;
+mod replay;
+mod rows;
+mod schedule;
+mod sweep;
+mod sync;
+mod targets;
 mod tune;
 
-/// The env-selected device's caps when tk defines its matrix-core fragment layouts
-/// (AMD, CUDA sm_80+), else `None` — the skip gate for fragment-layout HW tests, so
-/// a device without them skips instead of panicking at `Kernel::frag`.
-pub(crate) fn fragment_device() -> Option<crate::ArchCaps> {
-    crate::tune::set_enabled(false);
-    let dev = svod_tensor::Tensor::rand(&[16, 16]).expect("probe tensor").device();
-    crate::target::resolve_arch(&dev).map(crate::ArchCaps::for_arch).filter(crate::ArchCaps::has_matrix_core_layouts)
-}
+use std::sync::{Arc, LazyLock};
 
-/// The env-selected device's caps when its wave is 32 lanes — the gate for the
-/// wave32 fragment-map hardware tests (gfx11, gfx12, CUDA, Metal alike).
-pub(crate) fn wave32_fragment_device() -> Option<crate::ArchCaps> {
-    fragment_device().filter(|caps| caps.wave_size == 32)
-}
+use svod_dtype::default_device::default_device;
+use svod_dtype::{DeviceSpec, ScalarDType};
+use test_case::test_case;
 
-/// Whether the env-selected device is AMD CDNA (gfx942, wave64).
-pub(crate) fn is_cdna_device() -> bool {
-    fragment_device().and_then(|caps| caps.amd()).is_some_and(svod_dtype::AmdArch::is_cdna)
-}
+use crate::atoms::{Core, Costs, Fill, Target};
+use crate::build::BF16;
+use crate::interp::round_to;
+use crate::ir::Program;
+use crate::kernels::Batch;
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::ops::config::{Planner, has_kernels};
+pub(crate) use crate::sweep::{conv_first_eight, costs, declared, first_eight, planner};
 
-/// The env-selected device's caps when its fragment map folds a `Row` tile's
-/// columns per lane row (CDNA's stride map, CUDA's `mma.sync`) — the layouts a
-/// `row_reduce` over a `Row` tile is a per-row reduction on; RDNA's even/odd
-/// accumulator folds rows instead, so it skips.
-pub(crate) fn row_fold_device() -> Option<crate::ArchCaps> {
-    fragment_device()
-        .filter(|caps| caps.frag(crate::arch::FragRole::Accumulator).is_some_and(|f| f.map.folds_cols(false)))
-}
-
-/// Whether the env-selected device is in `archs` with its LLVM backend present —
-/// the self-skip gate for the `#[ignore]`d HW tests of a kernel.
-pub(crate) fn device_supported(archs: crate::ArchSet) -> bool {
-    // A kernel test checks numerics against the graph; tuning every shape it
-    // touches would multiply its GPU time for nothing it asserts.
-    crate::tune::set_enabled(false);
-    let spec = svod_tensor::Tensor::empty(&[1], svod_dtype::DType::Float32).device();
-    crate::target::check_target(&spec, archs).is_ok()
-}
-
-/// The largest `|got - want|`, infinite where the two disagree on finiteness
-/// (`allclose_f32`'s rule). A plain `f32::max` fold drops a NaN operand, so a NaN
-/// output would pass any tolerance.
-pub(crate) fn max_abs_err(got: &[f32], want: &[f32]) -> f32 {
-    svod_tensor::testing::allclose_f32(got, want, 0.0, 0.0).max_abs_err
-}
-
-/// [`max_abs_err`] relative to the reference's largest finite magnitude, the
-/// scale a narrow output's rounding is measured against.
-pub(crate) fn rel_err(got: &[f32], want: &[f32]) -> f32 {
-    let scale = want.iter().filter(|w| w.is_finite()).fold(0f32, |a, w| a.max(w.abs())).max(f32::MIN_POSITIVE);
-    max_abs_err(got, want) / scale
-}
-
-/// The positions of `values` that are not finite.
-pub(crate) fn non_finite(values: &[f32]) -> Vec<usize> {
-    values.iter().enumerate().filter_map(|(at, value)| (!value.is_finite()).then_some(at)).collect()
-}
-
-/// The instructions a tk kernel compiles to on `arch`, in program order: the
-/// optimizer and the target-graph lowering `launch_custom` runs, with no device.
-pub(crate) fn lowered_program(
-    sink: std::sync::Arc<svod_ir::UOp>,
-    arch: svod_dtype::GpuArch,
-) -> Vec<std::sync::Arc<svod_ir::UOp>> {
-    use svod_codegen::traits::Renderer;
-    use svod_dtype::GpuArch;
-
-    let optimizer = match arch {
-        GpuArch::Cuda(cuda) => svod_schedule::OptimizerRenderer::for_cuda_arch(cuda).with_rewrite_capabilities(
-            svod_ir::RendererOps::all(),
-            svod_codegen::llvm::LlvmTextRenderer::nvptx(cuda).decompositor(),
-            Some(svod_codegen::llvm::nvptx_extra_matcher()),
-        ),
-        GpuArch::Amd(amd) => svod_schedule::OptimizerRenderer::for_amd_arch(amd).with_rewrite_capabilities(
-            svod_ir::RendererOps::all(),
-            svod_codegen::llvm::LlvmTextRenderer::amd(amd).decompositor(),
-            Some(svod_codegen::llvm::amd_extra_matcher()),
-        ),
-        other => panic!("no host lowering for {other:?}"),
+/// The default device's target when tk has kernels for it, of any vendor:
+/// the gate of every device test. It skips (`None`) only where there is
+/// nothing to run on: `SVOD_DEVICE=CPU`, a GPU tk has no kernels for, or no
+/// `SVOD_DEVICE` and no GPU tk supports attached. A supported GPU the suite
+/// is not pointed at, or an `SVOD_DEVICE` that does not open, fails the
+/// test, since a suite whose device tests all skip passes and proves nothing.
+fn device_target() -> Option<Target> {
+    traced();
+    let device = default_device();
+    let Some(target) = Target::for_device(&device) else {
+        assert_eq!(device, DeviceSpec::Cpu, "the default device does not open");
+        if std::env::var_os("SVOD_DEVICE").is_some() {
+            eprintln!("skipped: SVOD_DEVICE selects the CPU");
+            return None;
+        }
+        if let Some((select, target)) = attached() {
+            panic!(
+                "tk has kernels for the attached {} but SVOD_DEVICE is unset: run with SVOD_DEVICE={select} \
+                 (SVOD_DEVICE=CPU runs the host tests alone)",
+                target.arch.target_name()
+            );
+        }
+        eprintln!("skipped: no GPU tk has kernels for");
+        return None;
     };
-    let optimized =
-        svod_schedule::optimize_kernel_with_config(sink, &optimizer, &svod_schedule::OptimizerConfig::default())
-            .expect("optimize");
-    let program = svod_codegen::program_pipeline::program_from_sink(optimized, svod_dtype::DeviceSpec::Cpu)
-        .expect("final target graph");
-    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
-    let linear = linearized.toposort().into_iter().find(|u| matches!(u.op(), svod_ir::Op::Linear(..))).expect("LINEAR");
-    let svod_ir::Op::Linear(svod_ir::ops::Linear { ops }) = linear.op() else { unreachable!() };
-    ops.to_vec()
+    if !has_kernels(&target) {
+        eprintln!("skipped: tk has no kernels for {}", target.arch.target_name());
+        return None;
+    }
+    Some(target)
 }
 
-/// The accumulator reads in `program` that sit outside a loop their WMMA runs
-/// in. Such a read sees the tile as it stood before that loop, so the loop's
-/// steps overwrite the sum instead of adding to it. Empty for a sound kernel.
-pub(crate) fn escaped_accumulator_reads(program: &[std::sync::Arc<svod_ir::UOp>]) -> Vec<String> {
-    use std::collections::HashMap;
-    use svod_ir::{AddrSpace, Op, ops};
-
-    // The loops open at each instruction, by id.
-    let mut open: Vec<u64> = Vec::new();
-    let mut scope: HashMap<u64, Vec<u64>> = HashMap::new();
-    for op in program {
-        if let Op::End(ops::End { ranges, .. }) = op.op() {
-            open.retain(|id| ranges.iter().all(|range| range.id != *id));
-        }
-        scope.insert(op.id, open.clone());
-        if matches!(op.op(), Op::Range(..)) {
-            open.push(op.id);
-        }
-    }
-    let reads_a_register = |load: &svod_ir::UOp| {
-        let Op::Load(ops::Load { index, .. }) = load.op() else { return false };
-        let mut buffer = index.clone();
-        loop {
-            buffer = match buffer.op() {
-                Op::Index(ops::Index { buffer, .. }) => buffer.clone(),
-                Op::Shrink(ops::Shrink { src, .. }) | Op::Cast(ops::Cast { src, .. }) => src.clone(),
-                Op::After(ops::After { passthrough, .. }) => passthrough.clone(),
-                _ => return buffer.addrspace() == Some(AddrSpace::Reg),
+/// The first GPU tk has kernels for on this machine and the `SVOD_DEVICE`
+/// that selects it, found without selecting it: AMD ones from the KFD
+/// topology in sysfs, a CUDA one once the driver counts devices (`cuInit`
+/// creates no context; reading the architecture opens device 0's).
+fn attached() -> Option<(String, Target)> {
+    static ATTACHED: LazyLock<Option<(String, Target)>> = LazyLock::new(|| {
+        let amd = (0..svod_device::amd::topology::enumerate().len()).map(|device_id| DeviceSpec::Amd { device_id });
+        let cuda = svod_device::cuda::has_devices().then_some(DeviceSpec::Cuda { device_id: 0 });
+        amd.chain(cuda).find_map(|spec| {
+            let target = Target::for_device(&spec).filter(has_kernels)?;
+            let select = match spec {
+                DeviceSpec::Amd { device_id: 0 } => "AMD".to_string(),
+                DeviceSpec::Amd { device_id } => format!("AMD:{device_id}"),
+                _ => "CUDA".to_string(),
             };
-        }
-    };
+            Some((select, target))
+        })
+    });
+    ATTACHED.clone()
+}
 
-    let mut escaped = Vec::new();
-    for wmma in program {
-        let Op::Wmma(ops::Wmma { c, .. }) = wmma.op() else { continue };
-        let loops = &scope[&wmma.id];
-        // The fragment's lane reads: walk the accumulator operand up to the loads,
-        // never past another WMMA or a store into an earlier step's chain.
-        let mut stack = vec![c.clone()];
-        while let Some(node) = stack.pop() {
-            if reads_a_register(&node) {
-                let at = scope.get(&node.id).map_or(&[][..], Vec::as_slice);
-                let outside: Vec<u64> = loops.iter().filter(|id| !at.contains(id)).copied().collect();
-                if !outside.is_empty() {
-                    escaped.push(format!(
-                        "load {} reads the accumulator outside loops {outside:?} of wmma {}",
-                        node.id, wmma.id
-                    ));
-                }
-            } else if !matches!(node.op(), Op::Wmma(..) | Op::Store(..) | Op::Range(..) | Op::End(..)) {
-                stack.extend(node.op().sources());
-            }
-        }
+/// The default device's planner as the op layer holds it, behind
+/// [`device_target`]'s gate: its costs probed on the device (read from the
+/// tune store after the first run).
+fn device_planner() -> Option<Arc<Planner>> {
+    device_target()?;
+    Some(crate::ops::planner(&default_device()).expect("the device's cost probes measure"))
+}
+
+/// [`device_target`] when the device fills shared memory with `cp.async`,
+/// for the tests that build those lowerings or rings deeper than two slots.
+fn cp_async_target() -> Option<Target> {
+    let target = device_target()?;
+    if target.fill == Fill::Staged {
+        eprintln!("skipped: no cp.async");
     }
-    escaped
+    (target.fill == Fill::CpAsync).then_some(target)
+}
+
+/// [`device_target`] when the device has a warpgroup matrix core.
+fn group_target() -> Option<Target> {
+    let target = device_target()?;
+    let group = !target.group_mma.is_empty();
+    if !group {
+        eprintln!("skipped: no warpgroup matrix core");
+    }
+    group.then_some(target)
+}
+
+/// The crate's tracing under `RUST_LOG` on stderr, for the probes: the
+/// tuner's picks and round times at `svod_tk=debug`.
+fn traced() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .without_time()
+        .try_init();
+}
+
+/// What the tuner makes of `ranked` on the device, as the op layer tunes:
+/// the candidates `expand` makes of the admitted shortlist (compiled, the
+/// spilling ones dropped while clean ones remain) and its pick among them,
+/// none where the planner offers no kernel (the op layer takes the graph).
+pub(crate) fn tuned_on_device<C: crate::ops::config::Tiled + PartialEq + std::fmt::Debug>(
+    planner: &Planner,
+    (op, dtype, shape): (&'static str, svod_dtype::DType, &[usize]),
+    ranked: &[C],
+    expand: impl Fn(&[C]) -> Vec<C>,
+    build: impl Fn(C) -> crate::tune::Candidate,
+) -> (Vec<C>, Option<C>) {
+    let store = crate::tune::TuneStore::global();
+    let mut tuner = crate::ops::Tuner::new(store, &planner.device, dtype, shape, crate::ops::DEVICE_TEST, build);
+    let candidates = expand(&tuner.admitted(op, &crate::ops::config::representatives(ranked)));
+    let pick = (!candidates.is_empty()).then(|| {
+        let ordered = tuner.ordered(op, &candidates);
+        tuner.pipelined(op, &ordered, ranked)
+    });
+    (candidates, pick)
+}
+
+/// Each candidate's best device time in ns, its programs' summed, on
+/// scratch buffers at capacity: compiled, then timed.
+fn measure(candidates: impl IntoIterator<Item = crate::tune::Candidate>) -> Vec<Option<u64>> {
+    let pool = crate::tune::ScratchPool::default();
+    crate::tune::time(&mut crate::tune::compile(candidates.into_iter().collect(), &pool))
+}
+
+/// gfx1151's costs (Strix Halo, 40 CUs) as `probe::costs` measured them on
+/// the device on 2026-10-14.
+pub(crate) fn gfx1151_costs() -> Costs {
+    Costs {
+        smem_byte: 0.00328,
+        global_byte: 0.1877,
+        scatter: 3.05,
+        step: 6.25,
+        step_group: 0.0,
+        // Unmeasured there: equal to `step`, so a lone wave hides nothing.
+        step_lone: 6.25,
+        score: 0.0773,
+        trip: 11.67,
+        trip_rolled: 13.85,
+        // Unmeasured there: a guess at the barrier pair's share.
+        trip_one: 20.0,
+        // Unmeasured there: a lone block's trip costs what the full SM's does.
+        trip_lone: 0.0,
+        trip_one_lone: 0.0,
+        lane_move: 0.0316,
+        smem_trip: 0.0841,
+        latency: 577.9,
+        // A register-staged slot loads a trip ahead as two do: not probed.
+        latency_one: 0.0,
+        l2_byte: 0.0,
+        l2_bytes: 0.0,
+    }
+}
+
+/// sm_86's costs (RTX 3060, 28 SMs) as `probe::costs` measured them on the
+/// device on 2026-10-19.
+pub(crate) fn sm86_costs() -> Costs {
+    Costs {
+        smem_byte: 0.003447,
+        global_byte: 0.08274,
+        scatter: 2.825,
+        step: 8.196,
+        step_group: 0.0,
+        step_lone: 33.25,
+        score: 0.07915,
+        trip: 1.81,
+        trip_rolled: 0.0,
+        trip_one: 3.692,
+        trip_lone: 126.75,
+        trip_one_lone: 149.33,
+        lane_move: 0.09804,
+        smem_trip: 0.2449,
+        latency: 311.79,
+        latency_one: 324.77,
+        l2_byte: 0.016066,
+        l2_bytes: 7.018e6,
+    }
+}
+
+/// gfx1201's costs (RX 9070 XT, 64 CUs) as `probe::costs` measured them on
+/// the device on 2026-10-19.
+pub(crate) fn gfx1201_costs() -> Costs {
+    Costs {
+        smem_byte: 0.00325,
+        global_byte: 0.10823,
+        scatter: 1.8443,
+        step: 2.7104,
+        step_group: 0.0,
+        step_lone: 5.5957,
+        score: 0.059305,
+        trip: 7.3026,
+        trip_rolled: 7.1622,
+        trip_one: 7.3544,
+        trip_lone: 53.623,
+        trip_one_lone: 57.119,
+        lane_move: 0.024552,
+        smem_trip: 0.078096,
+        latency: 243.15,
+        latency_one: 0.0,
+        l2_byte: 0.005929,
+        l2_bytes: 65.97e6,
+    }
+}
+
+/// [`costs`] on a part whose lane moves cost more than a round trip through
+/// shared memory: every exchange becomes the round trip.
+pub(crate) fn lane_moves_dear() -> Costs {
+    Costs { lane_move: 16.0, ..costs() }
+}
+
+/// A plain bf16 `c = a·bᵀ` program on a 2×4 warp grid.
+fn gemm_nt(m: usize, n: usize, k: usize, bm: usize, bn: usize, bk: usize, stages: usize) -> Program {
+    gemm_nt_batched(m, n, k, [bm, bn, bk], stages, Batch::Static(1))
+}
+
+/// A plain bf16 `c = a·bᵀ` program for two crews: a 2×4 warp grid over one slot.
+fn gemm_nt_crews(m: usize, n: usize, k: usize, tile: [usize; 3]) -> Program {
+    let cfg = GemmCfg { tile, stages: 1, warps: [2, 4], group_m: 0, unroll: false, core: Core::Warp, crews: 2 };
+    gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg })
+}
+
+fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, batch: Batch) -> Program {
+    let cfg = GemmCfg { core: Core::Warp, tile, stages, warps: [2, 4], group_m: 0, unroll: true, crews: 1 };
+    gemm::<BF16>(&GemmSpec { m, n, k, batch, epilogue: Epilogue::default(), cfg })
+}
+
+/// The next value of a 64-bit LCG stepping `seed`, uniform in `[-1, 1)`.
+fn lcg(seed: &mut u64) -> f64 {
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    ((*seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
+}
+
+/// `n` values `f(x)` of the [`lcg`] draws `x`, each rounded to `dtype`.
+fn rounded(dtype: ScalarDType, n: usize, seed: &mut u64, f: impl Fn(f64) -> f64) -> Vec<f64> {
+    (0..n).map(|_| round_to(dtype, f(lcg(seed)))).collect()
+}
+
+/// Little-endian `dtype` elements read back from a device buffer.
+fn decode(dtype: ScalarDType, bytes: &[u8]) -> Vec<f64> {
+    let half = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
+    match dtype {
+        ScalarDType::Float32 => bytes.chunks(4).map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap()))).collect(),
+        ScalarDType::BFloat16 => bytes.chunks(2).map(|b| bf16(half(b))).collect(),
+        ScalarDType::Float16 => bytes.chunks(2).map(|b| half::f16::from_bits(half(b)).to_f64()).collect(),
+        other => unreachable!("{other:?} output"),
+    }
+}
+
+/// The bf16 of `bits`.
+fn bf16(bits: u16) -> f64 {
+    half::bf16::from_bits(bits).to_f64()
+}
+
+/// [`decode`] reads a 16-bit output as IEEE does: a NaN (all-ones exponent,
+/// a payload) stays NaN rather than reading as the infinity a check would
+/// take for an overflow, and infinities, subnormals and the largest finite
+/// value are exact.
+#[test_case(ScalarDType::Float16, 0x7e01, None; "f16 NaN")]
+#[test_case(ScalarDType::Float16, 0xfc00, Some(f64::NEG_INFINITY); "f16 negative infinity")]
+#[test_case(ScalarDType::Float16, 0x0001, Some(2f64.powi(-24)); "f16 least subnormal")]
+#[test_case(ScalarDType::Float16, 0x7bff, Some(65504.0); "f16 largest finite")]
+#[test_case(ScalarDType::BFloat16, 0xffc1, None; "bf16 NaN")]
+#[test_case(ScalarDType::BFloat16, 0x7f80, Some(f64::INFINITY); "bf16 infinity")]
+#[test_case(ScalarDType::BFloat16, 0xbf80, Some(-1.0); "bf16 minus one")]
+fn a_16_bit_output_decodes_as_ieee(dtype: ScalarDType, bits: u16, want: Option<f64>) {
+    let got = decode(dtype, &bits.to_le_bytes())[0];
+    assert!(want.map_or(got.is_nan(), |w| got == w), "{bits:#06x}: {got}");
+}
+
+/// `|got - want| ≤ tol·max(|want|, 1)` everywhere: an error relative to the
+/// value, or absolute below one. Returns the largest absolute difference.
+fn assert_rel_close(what: &str, got: &[impl Copy + Into<f64>], want: &[impl Copy + Into<f64>], tol: f64) -> f64 {
+    assert_eq!(got.len(), want.len(), "{what}: element count");
+    let mut worst = 0.0f64;
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let (g, w) = (g.into(), w.into());
+        let diff = (g - w).abs();
+        worst = worst.max(diff);
+        assert!(diff <= tol * w.abs().max(1.0), "{what}[{i}] = {g}, want {w}");
+    }
+    worst
+}
+
+/// `|got - want| ≤ tol` everywhere, whatever the magnitude.
+fn assert_abs_close(what: &str, got: &[f64], want: &[f64], tol: f64) {
+    assert_eq!(got.len(), want.len(), "{what}: element count");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!((g - w).abs() <= tol, "{what}[{i}] = {g}, want {w}");
+    }
 }

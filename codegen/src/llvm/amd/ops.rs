@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use svod_dtype::{DType, ScalarDType};
-use svod_ir::{Op, UnaryOp, prelude::*};
+use svod_ir::{BarrierFence, Op, UnaryOp, prelude::*};
 
 use crate::llvm::amd::wmma;
 use crate::llvm::common::gpu::{AXIS_LETTERS, parse_special_axis, render_define_local};
@@ -26,9 +26,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
     match uop.op() {
         // ── AMD-specific overrides ───────────────────────────────────────
         Op::Special(ops::Special { name, .. }) => render_special(uop, name, ctx, kernel),
-        Op::Barrier(..) => render_barrier(kernel),
+        Op::Barrier(ops::Barrier { fence, .. }) => render_barrier(*fence, kernel),
         Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Local) => {
-            render_define_local(uop, ctx, kernel)
+            render_define_local(uop, ctx, kernel, 16)
         }
         Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_ir::AddrSpace::Reg) => {
             render_define_reg(uop, ctx, kernel)
@@ -129,10 +129,18 @@ fn render_special(uop: &Arc<UOp>, name: &str, ctx: &mut RenderContext, kernel: &
 
 // ── BARRIER: workgroup-scope fence + s.barrier ────────────────────────────
 
-fn render_barrier(kernel: &mut Vec<String>) -> Option<()> {
-    kernel.push("  fence syncscope(\"workgroup\") release".to_string());
+/// `s_barrier` between workgroup fences. On RDNA a plain release fence waits
+/// for every outstanding global load (`s_wait_loadcnt 0`, `s_waitcnt
+/// vmcnt(0)`); a [`BarrierFence::Local`] barrier tags its fences with the
+/// MMRA that limits them to LDS, so a prefetch stays in flight across it.
+fn render_barrier(fence: BarrierFence, kernel: &mut Vec<String>) -> Option<()> {
+    let mmra = match fence {
+        BarrierFence::All => "",
+        BarrierFence::Local => ", !mmra !{!\"amdgpu-synchronize-as\", !\"local\"}",
+    };
+    kernel.push(format!("  fence syncscope(\"workgroup\") release{mmra}"));
     kernel.push("  tail call void @llvm.amdgcn.s.barrier()".to_string());
-    kernel.push("  fence syncscope(\"workgroup\") acquire".to_string());
+    kernel.push(format!("  fence syncscope(\"workgroup\") acquire{mmra}"));
     Some(())
 }
 

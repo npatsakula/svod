@@ -4,7 +4,7 @@ sidebar_label: Profiling
 
 # Profiling on CUDA
 
-The [layered profiler](../../tile-kernels/profiling.md) is backend-neutral above
+The layered profiler (`ExecutionPlan::profile`) is backend-neutral above
 the `DispatchTimestamps` and `KernelResources` handles. This page is what the
 CUDA backend puts into those handles, and which tiers exist.
 
@@ -116,7 +116,14 @@ flash-attention kernel; `dram` is what separates a bandwidth-bound kernel
 from an issue-bound one.
 
 ```bash
-SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo bench -p svod-tk --bench matmul -- --profile-time 5
+SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
+```
+
+The tk throughput probes time the hand kernels alone. They read event timestamps, not
+counters:
+
+```bash
+SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --release --lib gemm_throughput_probe -- --ignored --nocapture
 ```
 
 ### Privileges

@@ -14,20 +14,8 @@ use smallvec::{SmallVec, smallvec};
 use svod_dtype::{AddrSpace, DType};
 use svod_ir::prelude::*;
 
+use crate::llvm::common::gpu::specific_ptr;
 use crate::llvm::common::ldt;
-
-/// `ptr` → `ptr addrspace(N)` for a pointer UOp whose provenance is `space`
-/// (NVPTX numbers global as 1 and shared as 3).
-fn specific_ptr(ptr: &Arc<UOp>, space: AddrSpace) -> Arc<UOp> {
-    assert_eq!(ptr.addrspace(), Some(space), "pointer must resolve to a {space:?} buffer");
-    let num = match space {
-        AddrSpace::Global => 1,
-        AddrSpace::Local => 3,
-        AddrSpace::Reg => unreachable!("register scratch has no cp.async/ldmatrix form"),
-    };
-    let dtype = DType::Void.ptr(None, space).expect("void is not a pointer");
-    UOp::custom(smallvec![ptr.clone()], format!("addrspacecast ptr {{0}} to ptr addrspace({num})"), dtype)
-}
 
 /// Cache policy of a `cp.async` copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -107,6 +95,27 @@ pub fn cp_async_zfill(
 /// per thread.
 pub fn cp_async_16_zfill(dst_shared: &Arc<UOp>, src_global: &Arc<UOp>, src_bytes: &Arc<UOp>) -> Arc<UOp> {
     cp_async_zfill(dst_shared, src_global, 16, src_bytes, CpAsyncCache::Cg)
+}
+
+/// `ld.global.cg.v4.u32 {..}, [src]`: this thread's 16-byte global load
+/// under the policy of a `.cg` [`cp_async`] (cached at L2 only, bypassing
+/// L1), into four 32-bit words; the register half of a fill on a target
+/// whose fill is `cp.async.cg`. Ordered like a copy (a side effect), so two
+/// loads of one address stay two loads.
+pub fn ld_global_cg_16(src_global: &Arc<UOp>) -> [Arc<UOp>; 4] {
+    // The aggregate's braces are doubled: `{`/`}` delimit CUSTOM placeholders.
+    let ret_ty = "{{ i32, i32, i32, i32 }}";
+    let call = UOp::custom(
+        smallvec![specific_ptr(src_global, AddrSpace::Global)],
+        format!(
+            "call {ret_ty} asm sideeffect \"ld.global.cg.v4.u32 {{{{$0, $1, $2, $3}}}}, [$4];\", \"=r,=r,=r,=r,l\"(ptr addrspace(1) {{0}})"
+        ),
+        // Nominal, as for `ldmatrix`: only the `extractvalue`s consume it.
+        DType::Int32.vec(4).expect("i32 vectorizes"),
+    );
+    std::array::from_fn(|i| {
+        UOp::custom(smallvec![call.clone()], format!("extractvalue {ret_ty} {{0}}, {i}"), DType::Int32)
+    })
 }
 
 fn void_call(intrinsic: &str, args: &str, params: &str, deps: SmallVec<[Arc<UOp>; 4]>) -> Arc<UOp> {

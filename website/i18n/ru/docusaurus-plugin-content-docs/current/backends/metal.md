@@ -24,9 +24,9 @@ Linux просто проваливает `dlopen` и никогда не рег
 
 Бэкенд появился в сентябре 2026 года и опробован на одном семействе железа:
 **Apple9** (класс M3/M4) под macOS 26, где зелёные тестовый набор тензоров,
-набор ONNX (`METAL:0` и `CPU` проходят одни и те же 4577 случаев) и
-аппаратные тесты `tk`, а flash attention и GEMM работают через
-`simdgroup_matrix`. Пути, написанные для старых систем (публичный запасной путь
+набор ONNX (`METAL:0` и `CPU` проходят одни и те же 4577 случаев). Metal
+выполняет только графовые ядра: Apple-таргет tk — это атом `simdgroup` без
+ядер ([Tile-ядра](../tile-kernels/overview.md)). Пути, написанные для старых систем (публичный запасной путь
 компиляции `newLibraryWithSource:`, обход для indirect command buffers до
 Apple9, языковые стандарты `metal3.x` / `metal2.0`), реализованы, но не
 проверены на таком железе. Аппаратные тесты сами себя пропускают, когда
@@ -112,10 +112,10 @@ kernel void r_64_32(device float* data0, device float* data1, constant int& data
 **Тензорные ядра.** `Wmma` понижается в хелпер для каждой формы поверх
 `simdgroup_<T>8x8` и `simdgroup_multiply_accumulate`: одна форма, 8×8×8 на 32
 потоках по два элемента на полосу, для f32→f32, f16→f32, f16→f16, bf16→f32 и
-bf16→bf16 (`METAL_888` в профиле оптимизатора). `tk` добавляет билдеры
-`simd_shuffle`, `simd_shuffle_xor` и `simdgroup_barrier`
-(`codegen/src/c/metal.rs`), из которых и собраны ядра flash attention и GEMM
-для Apple.
+bf16→bf16 (`METAL_888` в профиле оптимизатора). Диалект также экспортирует
+билдеры `simd_shuffle`, `simd_shuffle_xor` и `simdgroup_barrier` для ручных
+ядер (`codegen/src/c/metal.rs`); эмиттер tk опускает межлейновый обмен на Apple
+в `simd_shuffle_xor`, но ни одно ядро tk пока не работает на Apple.
 
 ---
 

@@ -2,224 +2,146 @@
 sidebar_label: कर्नेल लाइब्रेरी
 ---
 
-# कर्नेल library
+# कर्नेल लाइब्रेरी {#kernel-library}
 
-USE चेहरा: `svod-tk` के साथ आने वाला हर कर्नेल, जिसे सादे tensors के साथ और tiles की किसी जानकारी के बिना
-call किया जा सकता है। हर एक lazy `Tensor` (एक `Op::Call` node) लौटाता है जो model graph में compose होता है और
-सामान्य `prepare()` path से realize होता है, और हर एक [IR में authoring](./lowering) वाले तीन-तरफ़ा contract
-का पालन करता है:
+`svod_tk::kernels` का हर कर्नेल एक function `fn k<T: Elem>(spec: &Spec) -> Program` है, जो 16-bit
+element type (`BF16` या `F16`) पर generic है। हर spec में एक `batch: Batch` होता है:
+`Batch::Static(n)` `n` batches launch करता है, और `Batch::Var { name, min, max }` नाम से bind हुए
+runtime variable की live गिनती launch करता है, buffers `max` के आकार के होते हैं। हर config type में
+एक `lowering(&device)` है (एक `atoms::Device`: target और उसकी costs)। मॉडल इन कर्नेलों तक
+[op layer](./op-layer) के ज़रिए पहुँचते हैं, जो config चुनती है।
 
-| नतीजा | अर्थ |
+| कर्नेल | Spec → program | कर्नेल का नाम | Op |
+|---|---|---|---|
+| GEMM + epilogue | `GemmSpec` → `gemm::gemm` | `gemm` | `ops::linear` |
+| Implicit-GEMM convolution | `ConvSpec` → `conv::conv` (+ split होने पर `gemm::split_merge`) | `conv`, `split_merge` | `ops::conv2d` |
+| Flash attention forward | `AttnSpec` → `attention::attention` | `flash_attention` | `ops::attention` |
+| Split merge | `CombineSpec` → `attention::combine` | `combine_splits` | splits के साथ `ops::attention` |
+| Attention prologue | `HeadsSpec` → `heads::heads` | `heads` | `ops::heads` |
+| LayerNorm / RMSNorm | `NormSpec` → `rows::norm` | `layer_norm` / `rms_norm` | `ops::{layer_norm, rms_norm, add_*}` |
+
+## GEMM {#gemm}
+
+`c = scale·act(a·bᵀ + bias) + residual`, जहाँ `a [batch·m, k]` और `b [n, k]`। Matrix product के
+बाद का सब कुछ f32 accumulator पर चलता है, और नतीजा store पर एक बार round होता है।
+
+| `Epilogue` field | असर |
 |---|---|
-| `Ok(Some(out))` | कर्नेल चला |
-| `Ok(None)` | यह लागू नहीं होता: device कर्नेल के `ArchSet` से बाहर है, उसका LLVM backend मौजूद नहीं है, या shape tile नहीं होता — जान-बूझकर fallback करें |
-| `Err(LaunchError)` | request ग़लत बना है (dtype, rank, कोई symbolic dim, कोई divisibility नियम) — caller का bug |
+| `bias` | accumulator में जोड़ी गई `[n]` row (gated होने पर `[2n]`) |
+| `act` | `Act::None`, `Act::Gelu` (erf approximation, error अधिकतम 1.5e-7), `Act::Silu` |
+| `gated` | `b` `[2n, k]` है, gate rows ऊपर, up rows नीचे; output `act(gate)·up` (SwiGLU, GeGLU) |
+| `scale` | residual से पहले activated value को गुणा करता है |
+| `residual` | `[batch·m, n]`, सबसे आख़िर में जोड़ा जाता है |
+| `out_f32` | f32 output और residual; accumulator बिना round किए store होता है |
 
-जब तक अलग से न कहा जाए, operands bf16 या f16 हैं; accumulation f32 में होता है।
+`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll, core, crews }`। `m` से
+आगे की rows और `n` से आगे के columns bounded views हैं, इसलिए `m` और `n` मुक्त हैं। `k` का `bk` का
+गुणज होना ज़रूरी है। `core: Core::Group` products को `wgmma` (sm_90) पर issue करता है; `crews: 2` दोनों
+warp rows को एक slot पर ping-pong में चलाता है (CDNA)।
 
----
+कोई tile table नहीं है। `config::Planner::gemm_ranked` tiles, `bk`, warp grids, ring depths और
+unrolling गिनता है, वही रखता है जिसे lowering target पर चलाती है (atoms warp grid को tile करते हैं,
+fills हर thread पर पूरे 16-byte chunks में बँटते हैं, ring shared memory में समाती है) और बाक़ी को
+device की मापी गई `Costs` से SM time के nanoseconds में rank करता है। Ranking का हर device input मापा
+गया है; उसके गिने-चुने model constants (`ops::config` में `BAND`, `CACHE_SHARE`, `CACHE_SPILL`,
+`OVERLAP_WAVES`) हर device पर लागू होने के लिए हैं। Ranking क्रम देती है, और tuner उन पहले 64 tiles
+को मापता है जो बिना spill के compile होते हैं ([Tuning](./tuning))।
 
-## Targets
+## Convolution {#convolution}
 
-हर कर्नेल अपना `ArchSet` (`tk/src/target.rs`) ख़ुद declare करता है: AMD की एक explicit सूची, साथ में एक
-खुला CUDA capability floor और एक Apple GPU-family floor।
+`conv::conv` channels-last `x [b, h, w, cin]` और `w [cout, kh, kw, cin]` पर एक implicit GEMM है:
+A image का row-mapped view है (`conv::im2col_view`), इसलिए padding rows शून्य पढ़ी जाती हैं और कुछ भी
+materialize नहीं होता। `K = kh·kw·cin` एक pipeline के रूप में चलता है, हर step एक tap के भीतर (`bk`
+`cin` को भाग देता है)। एक ही static batch के भूखे grid पर `ConvCfg::split` K को grid z पर बाँटता है
+और `gemm::split_merge` epilogue लागू करता है। `ops::conv2d` 1×1 को `linear` के रूप में लेता है, और
+`groups ≠ 1`, 16 पर न बैठने वाले `cin` और 8 पर न बैठने वाले `cout` को ग्राफ़ पर रखता है।
 
-| कर्नेल | gfx942 (CDNA3) | gfx1151 (RDNA3.5) | gfx1200 / gfx1201 (RDNA4) | CUDA sm_80+ | Metal Apple7+ |
-|---|---|---|---|---|---|
-| `flash_attention` / `_with` / `_tuned` | हाँ | हाँ | हाँ | हाँ | हाँ |
-| `matmul` (square) | हाँ | हाँ | हाँ | हाँ | हाँ |
-| `gemm_nt` / `_with` / `_with_epilogue` | — | हाँ | हाँ | हाँ | — |
-| `rms_norm` / `add_rms_norm` | — | हाँ | हाँ | हाँ | — |
-| `single_query_attention` / `_packed` | हाँ | हाँ | हाँ | हाँ | — |
-| `knn` | हाँ | हाँ | हाँ | — | — |
-| `kmeans_assign` | हाँ | हाँ | हाँ | — | — |
+## Flash attention {#flash-attention}
 
-ये constants `tk/src/kernels/` में `FA_SUPPORTED_ARCHS`, `MATMUL_SUPPORTED_ARCHS`, `GEMM_NT_SUPPORTED_ARCHS`,
-`NORM_SUPPORTED_ARCHS`, `SQ_ATTENTION_SUPPORTED_ARCHS`, `KNN_SUPPORTED_ARCHS` और `KMEANS_SUPPORTED_ARCHS`
-हैं। कोई family किसी कर्नेल में validation से और अपनी tile table ख़ुद measure करके जुड़ती है — `gemm_nt` और
-norms सिर्फ़ wave32 पर हैं क्योंकि किसी ने उनके लिए wave64 table measure नहीं की, इसलिए नहीं कि body वहाँ
-चल नहीं सकता। `flash_attention_supported(&device)` सिर्फ़ arch gate का जवाब देता है, उन callers के लिए जो
-launch से पहले sequence length को pad या bucket करते हैं।
+Sequence-major `q [batch, t, heads, d]` और `k`, `v [batch, tk, kv_heads, d]` पर
+`o = softmax(q·kᵀ·scale + bias)·v`। Q registers में रहता है और K/V एक shared ring से stream होते
+हैं। Online-softmax state `(m, l, o)` `exp2` के सहारे f32 में carry होती है।
 
----
+| Feature | कैसे |
+|---|---|
+| GQA | Query head `h` KV head `h / (heads / kv_heads)` पढ़ता है |
+| Cross attention | `tk ≠ t` views का गुण है |
+| कोई भी `t`, `tk` | Padding की जगह bounds: query tile और आख़िरी key block bounded views हैं, और `tk` से आगे की keys masked हैं |
+| Head dims | कोई भी `d` जिसे दोनों products tile करें और जिसकी fills हर thread पर पूरे chunks में बँटें (`FaCfg::fits`); मॉडल 48, 64 और 128 इस्तेमाल करते हैं |
+| `AttnMask::causal` | Diagonal से आगे के key blocks trip count के ज़रिए छोड़ दिए जाते हैं |
+| `AttnMask::window` | हर query के आसपास `(left, right)`; बाहर के blocks छोड़ दिए जाते हैं |
+| `AttnMask::chunk` | Block attention: query अपना chunk देखती है, उससे पहले `left` chunks (bound न हो तो सभी) और बाद में `right` |
+| `AttnMask::key_lens` | `[batch]` i32 वैध key counts; length से आगे के blocks छोड़ दिए जाते हैं |
+| `AttnMask::key_mask` | `[batch, tk]` i32 दिखने वाली keys (row stride 8 तक ऊपर round), हर block में पढ़ी जाती है |
+| `AttnMask::seg_start` | packed rows के `[batch, t]` i32 segment starts, `t` के साथ non-decreasing |
+| `AttnMask::bias` | stream type में `[batch or 1, heads, t, tk]` additive bias (row stride 8 तक ऊपर round), masks से पहले scaled scores में जोड़ा जाता है |
 
-## Flash attention
+सिर्फ़ वे key blocks predicate की गणना करते हैं जिन्हें कोई causal, window, chunk, length या segment
+किनारा काटता है; पूरी तरह भीतर के blocks बिना mask के चलते हैं। Key mask और bias हर block में पढ़े जाते
+हैं। जो query कोई key नहीं देखती वह शून्य देती है, जैसा ग्राफ़ लिखता है।
 
-```rust
-pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> LaunchResult<Option<Tensor>>
-pub fn flash_attention_with(q, k, v, opts: FaOpts) -> LaunchResult<Option<Tensor>>
-pub fn flash_attention_tuned(q, k, v, opts, policy: impl Fn(&DeviceSpec, GpuArch) -> FaPolicy + Copy) -> ..
+**Cache mode** (`AttnSpec::cache = Some(Cache { .. })`) K और V को एक cache
+`[rows, tk, heads_total, d]` से पढ़ता है जिसमें कई layers के heads होते हैं:
 
-pub struct FaOpts<'a> {
-    pub causal: bool,                      // default true
-    pub key_lens: Option<&'a Tensor>,      // [B] i32 valid-key counts: keys >= key_lens[b] are masked
-    pub seg_start: Option<&'a Tensor>,     // [B, N] i32: query q of batch b sees no key before seg_start[b, q]
-}
-```
+| `Cache` field | असर |
+|---|---|
+| `rows`, `heads_total` | Cache का shape |
+| `row_map` | एक `[batch]` i32 parameter: हर batch lane कौन सी cache row पढ़ती है |
+| `appended` | `[batch, appended, kv_heads, d]` keys और values की rows जो cached prefix के बाद score होती हैं (वे tokens जिन्हें decoder step ने अभी project किया), अधिकतम एक key block |
+| `app_lens` | दिखने वाली appended rows का एक `[batch]` i32 parameter |
 
-`q` `[B, N, H, D]` है, `k`/`v` `[B, N, H_kv, D]` हैं (GQA: `H % H_kv == 0`), output operand dtype में
-`[B, N, H, D]` है। Sequence-major, head-major नहीं — model किसी projection को बिना transpose के सीधे इसमें
-reshape कर देता है।
+इस attention के heads में से पहला एक `[1]` i32 `head_start` parameter है, इसलिए हर layer एक ही
+program चलाती है।
 
-- `Ok(None)`: arch set से बाहर; `N` `q_blk · 8` का multiple नहीं (per-warp Q tile गुणा workgroup की आठ waves;
-  `FLASH_ATTENTION_SEQUENCE_MULTIPLE` baseline का `128` है); KV length जो `N` से अलग हो (cross-attention
-  implement नहीं है); ऐसा head dim जिसकी double-buffered K/V tiles device की shared memory से ज़्यादा हों।
-- `Err`: dtype `{bf16, f16}` से बाहर, या `q` और `k`/`v` के बीच अलग; `D % 16 != 0`; `H % H_kv != 0`;
-  `[B, N, H_kv, D]` के अलावा कोई `k`/`v` shape।
+**Key splits** (`FaCfg::splits > 1`) कुछ लंबी rows, जैसे decoder step, को ज़्यादा blocks देते हैं।
+हर split f32 partials `o_part`, `m_part` और `l_part` लिखता है, और `combine` उन्हें मिलाता है।
+`Attn::splits = Some(n)` गिनती तय करता है; `None` होने पर `Planner::splits` 1, 2, हर SM पर दो blocks
+के आसपास की गिनतियाँ और हर key block पर एक split प्रस्तावित करता है, और tuner हर split candidate को
+उसके merge के साथ मापता है।
 
-`key_lens` सिर्फ़ keys को mask करता है — padded query rows फिर भी compute होती हैं और caller उन्हें फेंक देता
-है। `key_lens[b] == 0` को `1` पर clamp किया जाता है ताकि row finite रहे। `seg_start` कई sequences को एक row में
-pack करता है: हर entry `0..=q` के भीतर होनी चाहिए और कम से कम एक visible key छोड़नी चाहिए।
-[Flash Attention](./flash-attention) worked example है; per-warp tile पहले इस्तेमाल पर measure होती है
-([Autotuning](./tuning))।
+`FaCfg { bq, bkv, stages, splits, unroll, forms, key_warps, warp_rows, core }`:
 
----
+| Field | असर |
+|---|---|
+| `warp_rows` | हर warp की query rows: 16 (एक atom row) या 32 (हर K और V fragment दो atom rows को खिलाता है); 32-row रूप एक variant है जिसे tuner उसके 16-row tile के साथ मापता है |
+| `key_warps` | एक-row-warp block (`bq = 16`, `t ≤ 16` के लिए पेश) अपने key blocks को 1, 2 या 4 warps पर बाँटता है, हर एक के अपने ring slots और softmax state के साथ, जो shared memory के ज़रिए मिलाए जाते हैं |
+| `core` | `Core::Group` दोनों products को `wgmma` (sm_90) पर चलाता है |
+| `forms` | नीचे के softmax forms |
 
-## GEMM
+Candidates GEMM वाली उसी lattice और cost model से आते हैं (`Planner::attention_ranked`)। जहाँ fill
+registers से होकर जाता है, वहाँ value tile column-major store होता है ताकि उसके fragments 16-byte
+loads के रूप में gather हों; RDNA4 पर fill ख़ुद एक transposing load (`global_load_tr_b128`) है।
 
-```rust
-pub fn matmul(a: &Tensor, b: &Tensor) -> LaunchResult<Option<Tensor>>              // [n, n] · [n, n] → f32
-pub fn gemm_nt(x: &Tensor, w: &Tensor) -> LaunchResult<Option<Tensor>>             // [lead..., K] · [N, K]ᵀ → [lead..., N]
-pub fn gemm_nt_with(x, w, cfg: impl Fn(usize, usize, usize) -> Option<GemmCfg> + Copy) -> ..
-pub fn gemm_nt_with_epilogue(x, w, epilogue: Epilogue<&Tensor>) -> LaunchResult<Option<Tensor>>
+Softmax नया running maximum तभी अपनाता है जब वह log2 units में 8 से ज़्यादा बढ़े (FlashAttention-4
+का lazy rescale)। पाँच `Forms` tuner knobs हैं, plan में सभी बंद; tuner हर एक को वहाँ चालू करता है
+जहाँ वह तेज़ मापता है (एक forms pass, फिर उन forms के तहत tiles, फिर विजेता पर forms दोबारा):
 
-pub enum Epilogue<T> {
-    Plain,               // y = x·wᵀ
-    Add(T),              // y = x·wᵀ + residual, residual [lead..., N] in the operand dtype
-    SwiGlu { pair: usize }, // y = silu(gate)·up off a fused [2I, K] gate/up weight; y is [lead..., N/2]
-}
-pub fn swiglu_pair_width(spec: &DeviceSpec) -> Option<usize>
-```
+| `Forms` field | असर |
+|---|---|
+| `truncate_p` | bf16 probabilities round होने के बजाय truncate होती हैं, और row sum वही जोड़ता है जो रखा है |
+| `sum_after` | Row sum rescale से पहले के बजाय P·V product के बाद आता है |
+| `skip_rescale` | Output का rescale एक `Scale` है, जिसे हर वह wave छोड़ देती है जिसकी सभी rows ने अपना maximum बनाए रखा |
+| `raw_max` | Running maximum raw scores की units में रहता है: हर score के बजाय हर row पर एक गुणा |
+| `bias_direct` | हर key block का bias tile ring slot के बजाय सीधे global memory से scores के layout में पढ़ा जाता है |
 
-`matmul` square reference कर्नेल है: कोई भी float dtype अंदर (bf16 में cast), f32 बाहर, हर arch पर। यह DSL
-का performance canary है, production GEMM नहीं।
+## Attention prologue {#attention-prologue}
 
-`gemm_nt` production linear layer है। `x` किसी भी rank ≥ 2 का `[lead..., K]` है (एक `[B, L, K]` activation
-बिना reshape या copy के bind होता है), `w` `[N, K]` है जैसे weight store होता है, और `y` operand dtype में
-`[lead..., N]` है — f32 accumulators registers में ही narrow किए जाते हैं, इसलिए memory से होकर f32 का कोई
-round trip नहीं होता। `M = ∏lead` और `N` 64 के multiples होने चाहिए और `K` 32-wide strip का multiple, कम से
-कम दो strips के साथ; वरना `Ok(None)`, और caller 128 तक pad करता है या `Tensor::linear` इस्तेमाल करता है।
+`heads` एक fused projection `qkv [batch, t, (heads + 2·kv_heads)·d]` को sequence-major
+`q [batch, t, heads, d]` और `k`, `v [batch, t, kv_heads, d]` में बाँटता है। वैकल्पिक रूप से यह `q`
+और `k` को head पर `[d]` weights के साथ RMS-normalize करता है, फिर उन पर rotary embedding लागू करता
+है। Rotation head के दो हिस्सों को जोड़ी बनाता है, `[t, d/2]` की `(cos, sin)` tables इस्तेमाल करते
+हुए, जो साझा या हर batch की अलग होती हैं (`Rope { per_batch }`)। एक block एक head slot की `br` rows
+संभालता है। `d` का 16..=256 में दो की घात होना ज़रूरी है, और candidates `br ∈ {4, 8, 16}` हैं।
 
-Epilogues ही इस कर्नेल के होने की वजह हैं: GEMM के बाद graph जो pass चुकाता, उसे ये इसके store में fold कर
-देते हैं। `Add` residual को store के अपने offset पर पढ़ता है और output dtype में जोड़ता है, ठीक वैसे जैसे
-graph का `try_add` round करता है। `SwiGlu` को fused weight की rows `pair` rows के बारी-बारी gate/up blocks में
-चाहिए — `swiglu_pair_width(&device)` device की tile table का `reg_n / 2` है, या `None` जब tiles आपस में
-असहमत हों (तब caller अलग SwiGLU pass रखता है)। Model weight को उस क्रम में एक बार load करता है, क्योंकि
-launch के समय `M` tile चुनता है और हर candidate tile को वही arrangement पढ़ना होता है।
+## Norms {#norms}
 
-Tile `GemmPolicy` (`tk/src/kernels/gemm.rs`) से आती है: एक per-family table — `CUDA_TILES`, `RDNA_TILES`,
-`RDNA4_TILES` — जो हर shape और epilogue के लिए पहले इस्तेमाल पर measure होती है ([Autotuning](./tuning)), या
-tuning बंद होने पर static `GemmPolicy::cfg` वाला चुनाव। `gemm_nt_with` chooser caller से लेता है (benches इसी
-तरह उसे sweep करते हैं)।
+`rows::norm` हर row पर एक warp और f32 में एक fused reduce-then-map इस्तेमाल करता है:
 
----
+| `Norm` | सूत्र |
+|---|---|
+| `Layer` | `(x − mean)·rsqrt(var + eps)·w + b` |
+| `Rms` | `x·rsqrt(mean(x²) + eps)·w` |
 
-## RMS norm
-
-```rust
-pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> LaunchResult<Option<Tensor>>
-pub fn add_rms_norm(x, residual: &Tensor, weight, eps) -> LaunchResult<Option<(Tensor, Tensor)>>   // (h, y)
-pub fn select_norm_cfg(rows: usize, d: usize, lanes: usize) -> Option<NormCfg>
-```
-
-`x` `[rows..., D]` है, `weight` `[D]`, दोनों एक ही 16-bit dtype में। हर row के लिए एक wave, row registers
-में रहती है, sum of squares एक butterfly shuffle से पूरा होता है — कोई LDS नहीं, कोई barrier नहीं, कोई
-`RANGE` नहीं। Numerics हर op पर graph का अनुसरण करते हैं:
-`y = dtype((f32(x) · rsqrt(Σx²/D + eps)) · f32(w))`, अंत में एक rounding; सिर्फ़ summation का क्रम अलग है।
-`Ok(None)` जब `D` wave का multiple न हो या प्रति lane 64 elements से ज़्यादा हो (wave32 पर `2048`)।
-
-`add_rms_norm` `(h, y)` लौटाता है, जहाँ `h = x + residual` वैसे ही round होता है जैसे graph का add, और
-`y = rms_norm(h)`, ताकि एक pre-norm decoder layer अपनी residual stream एक ही बार लिखे और पढ़े। जब पिछली
-projection residual को `Epilogue::Add` से ले चुकी हो, तब two-pass `rms_norm` काफ़ी है;
-`model/src/qwen3/decoder_layer.rs` हर layer के लिए इनमें से चुनता है।
-
----
-
-## Single-query attention
-
-```rust
-pub fn single_query_attention(q, k, v, opts: SqAttentionOpts<'_>) -> LaunchResult<Option<Tensor>>
-pub fn single_query_attention_packed(q, k, v, head_offset: usize, opts) -> LaunchResult<Option<Tensor>>
-
-pub struct SqAttentionOpts<'a> {
-    pub key_lens: Option<&'a Tensor>,                 // [B] i32, entries in 0..=N
-    pub include_last: bool,                           // also score key N-1 (Whisper's self-cache slot)
-    pub appended: Option<(&'a Tensor, &'a Tensor)>,   // the step's own [B, 1, H, D] K/V, scored after the prefix
-    pub split: Option<usize>,                         // K/V chunks; None = the device's SqPolicy, tuned on first use
-    pub cache_map: Option<&'a Tensor>,                // [B] i32: which K/V row each query row reads
-}
-```
-
-Decode-step कर्नेल: `q` f32 में `[B, 1, H, D]` है, `k`/`v` f32, f16 या bf16 में `[B, N, H_total, D]` हैं
-(या हर row को एक cache से serve करने के लिए `[1, N, H_total, D]`), output f32 में `[B, 1, H, D]`।
-एक wave एक `(batch, head)` की मालिक होती है; `Q` registers में रहता है जबकि K/V `N` पर stream होते हैं; dot
-products XOR-shuffle all-reduces हैं और softmax एक one-pass online update है। कोई LDS नहीं और कोई matrix core
-नहीं, इसीलिए इसका `ArchSet` सबसे चौड़ी AMD सूची और साथ में CUDA है।
-
-`_packed` एक packed cache के heads `head_offset..head_offset + H` को उसे slice किए बिना चुनता है। लंबा
-unmasked attention K/V को contiguous chunks में बाँटता है, हर chunk एक wave, और दूसरे pass में उनकी softmax
-states को merge करता है; `SqPolicy` split का आकार device के resident-wave budget से तय करता है और पहले
-इस्तेमाल पर सबसे नज़दीकी divisors को measure करता है।
-
----
-
-## k-NN और k-means
-
-```rust
-pub fn knn(x: &Tensor, c: &Tensor, k: usize) -> LaunchResult<Option<(Tensor, Tensor)>>           // (dists [N, k] f32, idxs [N, k] i32)
-pub fn kmeans_assign(x: &Tensor, c: &Tensor) -> LaunchResult<Option<(Tensor, Tensor)>>         // (cluster_ids [N] i32, best_dist [N] f32)
-pub fn kmeans_update(x, cluster_ids, old_centroids) -> LaunchResult<(Tensor, Tensor)>           // (new_centroids [K, D], shift [K])
-```
-
-दोनों corpus (centroids) को matrix core से stream करते हैं और x²-free score `‖c‖² − 2⟨x, c⟩` से एक चालू
-top-K (argmin) रखते हैं, इसलिए `[N, M]` distance matrix कभी बनता ही नहीं; host side bf16 में cast करता है,
-`D` (और `N`) को WMMA edge तक pad करता है, और exact f32 distances के लिए `‖x‖²` फिर से जोड़ता है। `knn` `k`
-को `1..=16` में लेता है। `kmeans_update` एक शुद्ध graph op है — हर cluster पर `scatter_reduce`, empty-cluster
-fixup, हर cluster का shift — क्योंकि sort/scatter pattern tile नहीं होता; Lloyd loop caller का है। सिर्फ़ AMD।
-
----
-
-## Model में कर्नेल का इस्तेमाल
-
-Policy — कौन-सा कर्नेल, कौन-सा fallback — model की होती है, कर्नेल की कभी नहीं। `model/src/qwen3/` में
-Qwen3 decoder reference integration है:
-
-```rust
-// model/src/qwen3/linear.rs
-pub(crate) fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
-    if fusable(x, w)
-        && let Some(y) = svod_tk::gemm_nt(x, w).context(TkSnafu)?
-    {
-        return Ok(y);
-    }
-    Ok(x.contiguous().linear().weight(w).call()?)
-}
-```
-
-```rust
-// model/src/qwen3/attention.rs
-if matches!(q.dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16)
-    && let Some(out) =
-        svod_tk::flash_attention_with(q, k, v, svod_tk::FaOpts { causal: true, key_lens: None, seg_start })
-            .context(TkSnafu)?
-{
-    return Ok(out);
-}
-// else: permute to head-major and run scaled_dot_product_attention
-```
-
-नक़ल करने लायक़ तीन आदतें:
-
-- **पहले `fusable` पर gate करें।** `Err` का मतलब है ग़लत बनी request, और caller की तरफ़ एक 16-bit जाँच एक
-  वैध f32 path को bug के रूप में report होने से बचाती है।
-- **Error को bridge करें।** `LaunchError` model के error enum में box होता है
-  (`#[snafu(source(from(svod_tk::LaunchError, Box::new)))]`), इसलिए एक failed build कर्नेल के context के
-  साथ एक model error होता है।
-- **कर्नेल के लिए shape upstream में बनाएँ।** `embed.rs` padded sequence lengths को
-  `FLASH_ATTENTION_SEQUENCE_MULTIPLE` तक bucket करता है, और `feed_forward.rs` load के समय gate/up weight को
-  `swiglu_pair_width` से interleave करता है, ताकि कर्नेल decline करने के बजाय लागू हों।
-
-जो fusion किसी model का memory layout जानता है, वह model के बगल में रहता है: `model/src/qwen3/tk/mod.rs` एक
-QKV-norm-RoPE prologue है, जो norm कर्नेल की row vocabulary पर लिखा गया है, `NORM_SUPPORTED_ARCHS` से gated
-है, और तीन outputs के साथ `graph_launch_multi` से launch होता है। वही `launch_custom` policy लागू होती है —
-यह हर लिहाज़ से एक tk कर्नेल है, सिवाय इसके कि यह कहाँ रहता है।
+`residual: true` के साथ यह element type में round किए गए `x + residual` को normalize करता है और वह
+sum भी लिखता है, जो transformer layer की pre-norm residual stream है। `d` का 256..=2048 में दो की घात
+होना ज़रूरी है, और candidates हर block में `br ∈ {4, 8, 16}` rows हैं।

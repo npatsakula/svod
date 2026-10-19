@@ -52,6 +52,7 @@ impl CUresult {
     pub const DEINITIALIZED: Self = Self(4);
     pub const ECC_UNCORRECTABLE: Self = Self(214);
     pub const NOT_READY: Self = Self(600);
+    pub const NOT_FOUND: Self = Self(500);
     pub const ILLEGAL_ADDRESS: Self = Self(700);
     pub const LAUNCH_OUT_OF_RESOURCES: Self = Self(701);
     pub const LAUNCH_TIMEOUT: Self = Self(702);
@@ -158,6 +159,7 @@ pub mod attribute {
     pub const WARP_SIZE: i32 = 10;
     pub const MULTIPROCESSOR_COUNT: i32 = 16;
     pub const MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
+    pub const MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
     pub const MAX_BLOCKS_PER_MULTIPROCESSOR: i32 = 106;
     pub const MAX_SHARED_MEMORY_PER_MULTIPROCESSOR: i32 = 81;
     pub const MAX_REGISTERS_PER_MULTIPROCESSOR: i32 = 82;
@@ -173,6 +175,7 @@ pub mod func_attribute {
     pub const SHARED_SIZE_BYTES: i32 = 1;
     pub const LOCAL_SIZE_BYTES: i32 = 3;
     pub const NUM_REGS: i32 = 4;
+    pub const MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 }
 
 /// `CUjit_option` ids.
@@ -213,7 +216,9 @@ dl_api! {
     module_load_data_ex = "cuModuleLoadDataEx": fn(*mut CUmodule, *const c_void, u32, *mut c_int, *mut *mut c_void);
     module_unload = "cuModuleUnload": fn(CUmodule);
     module_get_function = "cuModuleGetFunction": fn(*mut CUfunction, CUmodule, *const c_char);
+    module_get_global = "cuModuleGetGlobal_v2": fn(*mut CUdeviceptr, *mut usize, CUmodule, *const c_char);
     func_get_attribute = "cuFuncGetAttribute": fn(*mut c_int, c_int, CUfunction);
+    func_set_attribute = "cuFuncSetAttribute": fn(CUfunction, c_int, c_int);
     occupancy_max_active_blocks_per_multiprocessor =
         "cuOccupancyMaxActiveBlocksPerMultiprocessor": fn(*mut c_int, CUfunction, c_int, usize);
     launch_kernel = "cuLaunchKernel": fn(

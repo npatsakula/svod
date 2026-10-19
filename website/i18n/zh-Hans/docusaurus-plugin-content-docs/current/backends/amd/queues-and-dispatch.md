@@ -177,7 +177,8 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
 | `AMD_DISABLE_SDMA` | 未设置 | 设成任何值都会跳过 SDMA 复制队列，强制使用宿主可见缓冲区 |
 | `SVOD_KFD_TOPOLOGY` | sysfs | 为测试覆盖 KFD 拓扑根目录 |
 | `SVOD_DEBUG_DISPATCH` | 未设置 | 设成任何值即打印程序加载以及调度的 grid、kernarg、scratch 与缓冲区地址 |
-| `SVOD_DUMP_AMD_IR` | 未设置 | 以 `<mcpu>_<module>.ll` 形式接收每个内核的 AMD LLVM IR 的目录 |
+| `SVOD_DUMP_AMD_IR` | 未设置 | 以 `<mcpu>_<module>_<digest>.ll` 形式接收每个内核的 AMD LLVM IR 的目录 |
+| `SVOD_DUMP_AMD_ASM` | 未设置 | 以 `<mcpu>_<module>_<digest>.s` 形式接收每个内核 AMDGCN 汇编的目录，与其 `.ll` 同名（每个内核多一次 clang 运行） |
 | `SVOD_OBJECT_CACHE`、`SVOD_OBJECT_CACHE_DIR`、`SVOD_OBJECT_CACHE_MAX_BYTES` | 开启 | 共享的磁盘 object 缓存，见 [CPU 页面](../cpu.md) |
 | `SVOD_AM_DEBUG` | 未设置 | 仅用于 AM 启动：写入寄存器后再读回 |
 | `SVOD_AM_MCBASE` | 未设置 | 仅用于 AM 启动：`raw`、`fb` 或 `fbxgmi` MC aperture 基址 |

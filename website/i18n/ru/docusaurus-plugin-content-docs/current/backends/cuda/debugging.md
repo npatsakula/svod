@@ -16,7 +16,7 @@ sidebar_label: Отладка
 | Переменная | По умолчанию | Эффект |
 |---|---|---|
 | `SVOD_DEVICE` | `CPU` (`METAL:0` на macOS) | `CUDA:N` (алиас `GPU`) выбирает тензорное устройство по умолчанию; `NV` *не* алиас, это имя остаётся зарезервированным под userspace-драйвер |
-| `SVOD_DUMP_NVPTX_IR` | не задана | Каталог, куда попадает NVPTX LLVM IR каждого ядра в виде `sm_XY_<kernel>.ll` |
+| `SVOD_DUMP_NVPTX_IR` | не задана | Каталог, куда попадает NVPTX LLVM IR каждого ядра в виде `sm_XY_<kernel>_<digest>.ll` |
 | `SVOD_CUDA_PTXAS` | включён | `0` пропускает предассемблирование через `ptxas` и отдаёт текст PTX в JIT драйвера |
 | `SVOD_CUDA_SCOPED_SYNC` | включён | `0` заменяет каждое ожидание с областью видимости полным `cuCtxSynchronize` и делает копии синхронными ([Архитектура](./architecture.md)) |
 | `SVOD_CUDA_CUPTI` | включён | `0` пропускает загрузку `libcupti.so.13`, так что аппаратных счётчиков нет |
@@ -103,7 +103,7 @@ SVOD_DUMP_NVPTX_IR=/tmp/nvptx SVOD_DEVICE=CUDA:0 cargo test -p svod-tensor -- so
 
 # Воспроизвести ту же компиляцию, затем ассемблировать через ptxas, чтобы увидеть настоящую диагностику
 clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 \
-      -Wno-override-module /tmp/nvptx/sm_86_r_64_32.ll -o r_64_32.ptx
+      -Wno-override-module /tmp/nvptx/sm_86_r_64_32_<digest>.ll -o r_64_32.ptx
 ptxas -arch=sm_86 -v r_64_32.ptx -o r_64_32.cubin   # -v печатает регистры, разделяемую память, спиллы
 nvdisasm r_64_32.cubin | less                         # это SASS
 ```

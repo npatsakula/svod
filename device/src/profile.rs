@@ -136,6 +136,10 @@ pub struct CounterSet {
 pub struct KernelResources {
     /// Vector GPRs allocated per lane (AMD).
     pub vgprs: Option<u32>,
+    /// Accumulator GPRs allocated per lane beside `vgprs` where the matrix
+    /// core has a file of its own (CDNA's AGPRs, gfx90a on); 0 when the
+    /// kernel uses none, `None` where the target has no such file.
+    pub agprs: Option<u32>,
     /// Scalar GPRs allocated (AMD).
     pub sgprs: Option<u32>,
     /// LDS / threadgroup memory bytes per workgroup.

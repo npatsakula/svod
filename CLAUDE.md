@@ -57,4 +57,12 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
 ## Task evaluation
 
 - `cargo fmt`, `cargo clippy` and `cargo test` should pass before I can perform review.
+- Run the tk3 suite in release (`SVOD_DEVICE=CUDA|AMD cargo test -p svod-tk --release --lib`, or
+  `SVOD_DEVICE=CPU` for host tests alone): its planner, admission and interpreter paths are Rust-heavy and
+  take ~14 min in debug against ~45 s in release (gfx1201, 2026-10-16). Without `SVOD_DEVICE` the default
+  device is the CPU, and a device test fails when a GPU tk3 supports is attached.
+- On a fresh tune store (`~/.cache/svod/tk_tune`, dropped by a format bump), run
+  `SVOD_DEVICE=CUDA|AMD cargo test -p svod-tk --release --lib device_costs_are_physical` alone before the suite: the suite's
+  parallel tests inflate the probes it measures first (+17 % on the trip probes, sm_86, 2026-10-17), and
+  the store keeps the first measurement.
 - Don't hack/simplify tests, ensure they are comprehensive and cover all edge cases.

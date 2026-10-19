@@ -443,6 +443,29 @@ fn test_arena_packs_disjoint_levels_into_one_arena() {
     assert_eq!(handle_ids.len(), 3, "each view must carry a distinct handle id");
 }
 
+/// An arena holds one class of memory: device-local intermediates pack into
+/// a device-local arena, host-visible ones into another, never one shared.
+#[test]
+fn test_arena_keeps_each_buffer_class() {
+    let alloc = || svod_device::registry::cpu().expect("cpu allocator");
+    let local = svod_device::BufferSpec { cpu_access: false, ..Default::default() };
+    let l0 = Buffer::new(alloc(), DType::Float32, vec![256], local);
+    let l1 = Buffer::new(alloc(), DType::Float32, vec![256], local);
+    let h0 = make_buffer(256);
+
+    let mut schedule =
+        vec![make_sink_item(55, l0.clone()), make_sink_item(56, h0.clone()), make_sink_item(57, l1.clone())];
+    chain_deps(&mut schedule);
+    let result = plan(&schedule, &HashSet::new(), PlannerMode::Arena);
+
+    let view = |item: usize| &result.buffer_replace[&BufferKey { kernel_idx: item, buffer_idx: 0 }];
+    assert_eq!(view(0).spec(), local);
+    assert_eq!(view(2).spec(), local);
+    assert_eq!(view(1).spec(), svod_device::BufferSpec::default());
+    assert_eq!(view(0).storage_id(), view(2).storage_id(), "device-local buffers share their arena");
+    assert_ne!(view(0).storage_id(), view(1).storage_id(), "the classes never share one");
+}
+
 #[test]
 fn test_arena_excludes_output_buffers() {
     // Output buffers must never get rewritten — the runtime returns them

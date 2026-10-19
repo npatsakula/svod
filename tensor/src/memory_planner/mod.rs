@@ -575,11 +575,11 @@ fn process_events(
 // ARENA-BASED ALLOCATION
 // ============================================================================
 
-/// Per-device arena identifier. Buffers are packed into one arena per device;
-/// reuse safety comes entirely from strict level-disjointness (see
-/// [`BufferLiveness`]), so no copy/compute lane split or injected dependency is
-/// needed.
-type LaneKey = DeviceSpec;
+/// Arena identifier: buffers are packed into one arena per device and class
+/// of memory, so a device-local intermediate stays device-local; reuse safety
+/// comes entirely from strict level-disjointness (see [`BufferLiveness`]), so
+/// no copy/compute lane split or injected dependency is needed.
+type LaneKey = (DeviceSpec, svod_device::BufferSpec);
 
 /// Tinygrad-style arena planner: replaces every plannable buffer with a
 /// `Buffer::view` into a per-device arena allocated by [`tlsf::TlsfAllocator`].
@@ -605,7 +605,10 @@ fn memory_plan_arena(
         return empty_result(planner_input.metrics);
     }
 
-    let lane_key = |id: u64| -> LaneKey { liveness[&id].prototype.allocator().device_spec() };
+    let lane_key = |id: u64| -> LaneKey {
+        let prototype = &liveness[&id].prototype;
+        (prototype.allocator().device_spec(), prototype.spec())
+    };
 
     // Per-buffer rounded size: round to `block_size` so the TLSF bucket math stays correct.
     let nbytes_rounded: HashMap<u64, usize> =
@@ -663,12 +666,7 @@ fn memory_plan_arena(
         }
         let arena_size = round_up(peak, MIN_BLOCK_SIZE);
         let prototype = lane_proto.get(lane).expect("every populated lane must have a prototype");
-        let arena = Buffer::new(
-            prototype.allocator_arc(),
-            svod_dtype::DType::UInt8,
-            vec![arena_size],
-            svod_device::allocator::BufferSpec::default(),
-        );
+        let arena = Buffer::new(prototype.allocator_arc(), svod_dtype::DType::UInt8, vec![arena_size], lane.1);
         arenas.insert(lane.clone(), arena);
     }
 

@@ -16,7 +16,7 @@ error.
 | Variable | Default | Effect |
 |---|---|---|
 | `SVOD_DEVICE` | `CPU` (`METAL:0` on macOS) | `CUDA:N` (alias `GPU`) selects the default tensor device; `NV` is *not* an alias, it stays reserved for a userspace driver |
-| `SVOD_DUMP_NVPTX_IR` | unset | Directory receiving each kernel's NVPTX LLVM IR as `sm_XY_<kernel>.ll` |
+| `SVOD_DUMP_NVPTX_IR` | unset | Directory receiving each kernel's NVPTX LLVM IR as `sm_XY_<kernel>_<digest>.ll` |
 | `SVOD_CUDA_PTXAS` | on | `0` skips the `ptxas` pre-assembly and hands PTX text to the driver JIT |
 | `SVOD_CUDA_SCOPED_SYNC` | on | `0` replaces every scoped wait with a full `cuCtxSynchronize` and makes copies synchronous ([Architecture](./architecture.md)) |
 | `SVOD_CUDA_CUPTI` | on | `0` skips loading `libcupti.so.13`, so there are no hardware counters |
@@ -101,7 +101,7 @@ SVOD_DUMP_NVPTX_IR=/tmp/nvptx SVOD_DEVICE=CUDA:0 cargo test -p svod-tensor -- so
 
 # Reproduce the exact compile, then assemble with ptxas to see the real diagnostics
 clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 \
-      -Wno-override-module /tmp/nvptx/sm_86_r_64_32.ll -o r_64_32.ptx
+      -Wno-override-module /tmp/nvptx/sm_86_r_64_32_<digest>.ll -o r_64_32.ptx
 ptxas -arch=sm_86 -v r_64_32.ptx -o r_64_32.cubin   # -v prints registers, shared, spills
 nvdisasm r_64_32.cubin | less                         # the SASS
 ```

@@ -4,7 +4,7 @@ sidebar_label: 剖析
 
 # CUDA 上的剖析
 
-[分层 profiler](../../tile-kernels/profiling.md) 在 `DispatchTimestamps` 与
+分层 profiler (`ExecutionPlan::profile`) 在 `DispatchTimestamps` 与
 `KernelResources` 句柄之上是后端中立的。本页讲的是 CUDA 后端往那些句柄里
 放了什么，以及有哪些层级存在。
 
@@ -111,7 +111,13 @@ SVOD_PMC: 2 of 5 requested counters are not collected on this backend
 限制的内核和受发射限制的内核区分开。
 
 ```bash
-SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo bench -p svod-tk --bench matmul -- --profile-time 5
+SVOD_DEVICE=CUDA:0 SVOD_PMC=1 cargo run --release -p svod-model --example gigaam_infer -- --profile ./audio.wav
+```
+
+tk 的吞吐量探针只为手写内核计时。它们读取事件时间戳，而不是计数器：
+
+```bash
+SVOD_DEVICE=CUDA:0 cargo test -p svod-tk --release --lib gemm_throughput_probe -- --ignored --nocapture
 ```
 
 ### 权限

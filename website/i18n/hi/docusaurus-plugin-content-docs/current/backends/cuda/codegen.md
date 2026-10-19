@@ -159,7 +159,7 @@ clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx
 
 एक cached `clang --print-targets` probe NVPTX के बिना एक clang को एक साफ़ `JitCompilation`
 error में बदल देता है। `SVOD_DUMP_NVPTX_IR=<dir>` हर kernel का IR वहाँ
-`sm_XY_<module>.ll` के रूप में लिख देता है।
+`sm_XY_<module>_<digest>.ll` के रूप में लिख देता है।
 
 कोई भी PTX driver तक पहुँचे उससे पहले, चाहे ताज़ा हो या object cache से, `validate_ptx`
 जाँचता है कि उसमें एक `.version` है, device के `sm_XY` के बराबर एक `.target` है, एक

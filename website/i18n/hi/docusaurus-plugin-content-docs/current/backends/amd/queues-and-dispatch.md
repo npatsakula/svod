@@ -186,7 +186,8 @@ polling के जाग सके।
 | `AMD_DISABLE_SDMA` | unset | SDMA copy queue skip करने के लिए किसी भी value पर सेट करें, जो buffers को host-visible बना देता है |
 | `SVOD_KFD_TOPOLOGY` | sysfs | tests के लिए KFD topology root override करें |
 | `SVOD_DEBUG_DISPATCH` | unset | program-load और dispatch grid, kernarg, scratch, तथा buffer addresses print करने के लिए किसी भी value पर सेट करें |
-| `SVOD_DUMP_AMD_IR` | unset | वह directory जिसमें हर kernel का AMD LLVM IR `<mcpu>_<module>.ll` के रूप में लिखा जाता है |
+| `SVOD_DUMP_AMD_IR` | unset | वह directory जिसमें हर kernel का AMD LLVM IR `<mcpu>_<module>_<digest>.ll` के रूप में लिखा जाता है |
+| `SVOD_DUMP_AMD_ASM` | unset | वह directory जिसमें हर kernel का AMDGCN assembly `<mcpu>_<module>_<digest>.s` के रूप में लिखा जाता है, उसकी `.ll` वाले नाम के साथ (हर kernel पर clang का एक और run) |
 | `SVOD_OBJECT_CACHE`, `SVOD_OBJECT_CACHE_DIR`, `SVOD_OBJECT_CACHE_MAX_BYTES` | on | साझा on-disk object cache, देखें [CPU पेज](../cpu.md) |
 | `SVOD_AM_DEBUG` | unset | केवल AM bring-up: registers लिखने के बाद उन्हें वापस पढ़ें |
 | `SVOD_AM_MCBASE` | unset | केवल AM bring-up: `raw`, `fb`, या `fbxgmi` MC aperture base |

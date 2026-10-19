@@ -1,29 +1,33 @@
-//! Tests for the first-use tuning store ([`crate::tune`]): the memo, the
-//! on-disk round trip, the rule that nothing unmeasured is cached, and — on a
-//! GPU — a real first-use measurement of the GEMM table.
+//! The tune store: memo, on-disk round trip of choices and values, key
+//! stability, the rule that nothing unmeasured is stored, a key measured
+//! once under concurrent asks, a store hit compiling nothing, a run's
+//! stamps and the lost-stamp guard, what counts as a spill, the admission
+//! memo, a fingerprint keyed by what the candidates emit and remembered
+//! by what they are made of, and on the device a real GEMM tuning.
 
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use svod_dtype::{DType, DeviceSpec, GpuArch};
+use svod_dtype::ScalarDType;
+use svod_runtime::KernelResources;
 use test_case::test_case;
 
-use crate::tune::{TUNE_SCHEMA, TuneKey, TuneStore};
+use crate::atoms::{Core, Device, sm86};
+use crate::build::BF16;
+use crate::kernels::Batch;
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::tune::{self, Bench, Entry, FORMAT, Kind, ScratchPool, TuneKey, TuneStore, fingerprint};
 
-/// A key over `candidates` (the cheap identity of the candidate set the memo is
-/// keyed by) — `builds`, the candidate graphs' fingerprints, reaches the store
-/// separately, so it is supplied per call.
-fn key(kernel: &'static str, shape: &[usize], candidates: &[usize]) -> TuneKey {
-    let arch = GpuArch::Amd(svod_dtype::AmdArch::Gfx1151);
-    TuneKey::new(kernel, &DeviceSpec::Cpu, arch, shape, &candidates)
+/// A host key: no device, so no compiler digest.
+fn key(shape: &[usize], candidates: &[usize]) -> TuneKey {
+    TuneKey::new("gemm", &sm86(), 0, ScalarDType::BFloat16, shape, &candidates)
 }
 
-/// A fingerprint closure that records whether it ran: the memo must answer
-/// without it, since building the candidate graphs is what it costs.
-fn builds(digests: &[u128], ran: &std::cell::Cell<bool>) -> impl FnOnce() -> Vec<u128> {
-    move || {
-        ran.set(true);
-        digests.to_vec()
-    }
+/// The store file of [`key`]'s device under `dir`.
+fn store_file(dir: &std::path::Path) -> String {
+    let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
+    std::fs::read_to_string(path).expect("the store file")
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -33,243 +37,707 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// The first selection measures and keeps the fastest; a second store on the
-/// same directory reads it back without measuring; a different candidate set is
-/// a different key, and so is the same set built into different kernels.
+/// A choice made the way [`TuneStore::choose`] makes one, from a closure of
+/// device times rather than compiled candidates.
+pub(super) trait Select {
+    /// The winner among `count` candidates: the memo, then the store under
+    /// the line `programs` fingerprints, else `measure` times every
+    /// candidate (device ns, `None` where one cannot run) and their order is
+    /// stored. `None` when nothing measured.
+    fn select(
+        &self,
+        key: &TuneKey,
+        count: usize,
+        programs: impl FnOnce() -> u64,
+        measure: impl FnOnce() -> Vec<Option<u64>>,
+    ) -> Option<usize>;
+}
+
+impl Select for TuneStore {
+    fn select(
+        &self,
+        key: &TuneKey,
+        count: usize,
+        programs: impl FnOnce() -> u64,
+        measure: impl FnOnce() -> Vec<Option<u64>>,
+    ) -> Option<usize> {
+        let within = |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _)| i < count));
+        let timed = |()| tune::ordered(measure()).map(Entry::Choice);
+        match self.remember(Kind::Choice, key, within, || (programs(), ()), timed)? {
+            Entry::Choice(timed) => Some(timed[0].0),
+            _ => None,
+        }
+    }
+}
+
+/// A measurement that records it ran.
+fn timed<'a>(ns: &'a [Option<u64>], ran: &'a Cell<bool>) -> impl FnOnce() -> Vec<Option<u64>> + 'a {
+    move || {
+        ran.set(true);
+        ns.to_vec()
+    }
+}
+
+/// The fastest is stored, its line holding the candidates that ran in timed
+/// order with their times (one that did not run left out), so a later process
+/// knows the leaders and how close they ran; a second store on the directory
+/// reads it back without measuring; a kernel change (another program
+/// fingerprint) re-measures.
 #[test]
-fn a_measured_winner_round_trips_through_the_store() {
+fn a_winner_round_trips_through_the_store() {
     let dir = scratch("round-trip");
-    let store = TuneStore::at(Some(dir.clone()));
-    let k = key("gemm_nt", &[1024, 1024, 6144], &[1, 2, 3]);
-    let (mut measured, fingerprinted) = (false, std::cell::Cell::new(false));
-    let chosen = store.select_with(&k, 3, builds(&[10, 20, 30], &fingerprinted), || {
-        measured = true;
-        vec![Some(300), Some(100), Some(200)]
-    });
-    assert_eq!((chosen, measured, fingerprinted.get()), (Some(1), true, true));
+    let k = key(&[1, 704, 512, 512], &[1, 2, 3]);
+    let ran = Cell::new(false);
+    let chosen = TuneStore::at(Some(dir.clone())).select(&k, 3, || 7, timed(&[Some(300), None, Some(100)], &ran));
+    assert_eq!((chosen, ran.get()), (Some(2), true));
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 2 100 0 300\n", k.line(Kind::Choice, 7)));
 
     let again = TuneStore::at(Some(dir.clone()));
-    let mut ran = false;
-    let k2 = key("gemm_nt", &[1024, 1024, 6144], &[1, 2, 3]);
-    assert_eq!(
-        again.select_with(&k2, 3, builds(&[10, 20, 30], &std::cell::Cell::new(false)), || {
-            ran = true;
-            vec![None; 3]
-        }),
-        Some(1)
-    );
-    assert!(!ran, "a stored winner is not re-measured");
+    let ran = Cell::new(false);
+    assert_eq!((again.select(&k, 3, || 7, timed(&[None; 3], &ran)), ran.get()), (Some(2), false));
 
-    // The same candidate set built into different kernels shares the memo key
-    // but not the store line, so the store re-measures it.
-    let kernel_change = TuneStore::at(Some(dir.clone()));
-    let mut remeasured = false;
-    assert_eq!(
-        kernel_change.select_with(&k2, 3, builds(&[10, 20, 31], &std::cell::Cell::new(false)), || {
-            remeasured = true;
-            vec![Some(1), Some(2), Some(3)]
-        }),
-        Some(0)
-    );
-    assert!(remeasured, "a kernel change re-measures");
-
-    assert_ne!(key("gemm_nt", &[1024, 1024, 6144], &[1, 2, 4]), k2, "the candidate set is part of the key");
+    let changed = TuneStore::at(Some(dir.clone()));
+    let ran = Cell::new(false);
+    assert_eq!(changed.select(&k, 3, || 8, timed(&[Some(5), Some(9), Some(9)], &ran)), Some(0));
+    assert!(ran.get(), "another kernel fingerprint is a miss");
+    assert_eq!(changed.entries(&k).len(), 2, "both lines are kept");
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A memo hit answers without building a single candidate graph: the whole point
-/// of keying the memo by the request rather than by the built kernels, since a
-/// plan asks the same shape once per node.
+/// A warm memo neither fingerprints nor measures.
 #[test]
-fn a_memoized_choice_builds_no_candidate() {
+fn the_memo_answers_without_building() {
     let store = TuneStore::at(None);
-    let k = key("gemm_nt", &[4096, 1024, 6144], &[1, 2, 3]);
-    let first = std::cell::Cell::new(false);
-    assert_eq!(store.select_with(&k, 3, builds(&[7, 8, 9], &first), || vec![Some(3), Some(1), Some(2)]), Some(1));
-    assert!(first.get(), "the first call fingerprints the candidates for the store line");
-
-    let again = std::cell::Cell::new(false);
-    assert_eq!(store.select_with(&k, 3, builds(&[7, 8, 9], &again), || panic!("a memo hit must not measure")), Some(1));
-    assert!(!again.get(), "a memo hit must not build the candidate kernels");
+    let k = key(&[4096, 4096, 4096], &[0, 1]);
+    assert_eq!(store.select(&k, 2, || 1, || vec![Some(2), Some(1)]), Some(1));
+    let fingerprinted = Cell::new(false);
+    let ran = Cell::new(false);
+    let fp = || {
+        fingerprinted.set(true);
+        1
+    };
+    assert_eq!(store.select(&k, 2, fp, timed(&[None; 2], &ran)), Some(1));
+    assert!(!fingerprinted.get() && !ran.get());
 }
 
-/// A candidate that cannot run is skipped, and when none can, nothing is kept:
-/// the caller falls back to its static choice and the next call measures again.
+/// Nothing measured: no choice, and no line on disk.
 #[test]
-fn unmeasured_candidates_are_never_cached() {
+fn nothing_measured_is_never_stored() {
     let dir = scratch("unmeasured");
     let store = TuneStore::at(Some(dir.clone()));
-    let k = key("fa", &[8, 512, 16, 128], &[1, 2]);
-    let seen = std::cell::Cell::new(false);
-    assert_eq!(store.select_with(&k, 2, builds(&[1, 2], &seen), || vec![None, None]), None);
-    assert_eq!(
-        store.select_with(&k, 2, builds(&[1, 2], &seen), || vec![None, Some(5)]),
-        Some(1),
-        "the runnable candidate wins"
-    );
+    let k = key(&[64, 64, 64], &[0, 1]);
+    assert_eq!(store.select(&k, 2, || 1, || vec![None, None]), None);
+    assert!(store.entries(&k).is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A stored index past the current candidate count (a hand-edited file) is
-/// ignored, and a store with no directory still memoizes within the process.
+/// Two threads asking for one key at once measure it once: the second
+/// waits for the first's value.
 #[test]
-fn a_stale_index_is_ignored_and_a_memory_store_memoizes() {
-    let dir = scratch("stale");
-    let store = TuneStore::at(Some(dir.clone()));
-    let k = key("gemm_nt", &[64, 64, 192], &[7, 8, 9]);
-    let seen = std::cell::Cell::new(false);
-    assert_eq!(store.select_with(&k, 3, builds(&[7, 8, 9], &seen), || vec![Some(10), Some(9), Some(8)]), Some(2));
-    let fresh = TuneStore::at(Some(dir.clone()));
-    let mut measured = false;
-    assert_eq!(
-        fresh.select_with(&k, 2, builds(&[7, 8, 9], &seen), || {
-            measured = true;
-            vec![Some(1), Some(2)]
-        }),
-        Some(0)
-    );
-    assert!(measured, "a stored index past the candidate count is measured again");
-
-    let memory = TuneStore::at(None);
-    let k = key("norm", &[4096, 1024], &[1, 2]);
-    let seen = std::cell::Cell::new(false);
-    let mut runs = 0;
-    assert_eq!(
-        memory.select_with(&k, 2, builds(&[1, 2], &seen), || {
-            runs += 1;
-            vec![Some(2), Some(1)]
-        }),
-        Some(1)
-    );
-    assert_eq!(
-        memory.select_with(&k, 2, builds(&[1, 2], &seen), || {
-            runs += 1;
-            vec![Some(0), Some(0)]
-        }),
-        Some(1)
-    );
-    assert_eq!(runs, 1, "measured once, then memoized");
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// A stored search result the caller no longer accepts, written for a space that
-/// has since changed, is searched again; the new value overwrites the line and is
-/// what the memo and the next store read.
-#[test]
-fn a_searched_value_the_caller_rejects_is_searched_again() {
-    let dir = scratch("rejected");
-    let k = key("conv2d_nhwc", &[1, 80, 80, 64], &[1]);
-    let seen = std::cell::Cell::new(false);
-    let first = TuneStore::at(Some(dir.clone()));
-    assert_eq!(first.searched(&k, builds(&[1], &seen), |_| true, || Some((7, 100))), Some(7));
-
-    let stricter = TuneStore::at(Some(dir.clone()));
-    let mut searched = false;
-    let found = stricter.searched(
-        &k,
-        builds(&[1], &seen),
-        |found| found != 7,
-        || {
-            searched = true;
-            Some((9, 120))
-        },
-    );
-    assert_eq!((found, searched), (Some(9), true), "a rejected line is searched again");
-    let memo = stricter.searched(&k, builds(&[1], &seen), |_| true, || panic!("the memo answers"));
-    assert_eq!(memo, Some(9), "the rejected value never reaches the memo");
-
-    let third = TuneStore::at(Some(dir.clone()));
-    assert_eq!(third.searched(&k, builds(&[1], &seen), |_| true, || panic!("the new line is read")), Some(9));
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Another toolchain reads none of the old lines: the compiler names the file,
-/// so the same request measures again beside it.
-#[test]
-fn another_toolchain_reads_none_of_the_old_lines() {
-    let dir = scratch("toolchain");
-    let k = key("gemm_nt", &[64, 64, 192], &[1, 2]);
-    let seen = std::cell::Cell::new(false);
-    let store = TuneStore::at(Some(dir.clone()));
-    assert_eq!(store.select_with(&k, 2, builds(&[1, 2], &seen), || vec![Some(2), Some(1)]), Some(1));
-
-    let other = TuneKey { compiler: k.compiler ^ 1, ..k.clone() };
-    let fresh = TuneStore::at(Some(dir.clone()));
-    let mut measured = false;
-    let chosen = fresh.select_with(&other, 2, builds(&[1, 2], &seen), || {
-        measured = true;
-        vec![Some(1), Some(2)]
+fn a_key_in_flight_is_measured_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let store = TuneStore::at(None);
+    let k = key(&[2, 2, 2], &[0, 1]);
+    let (measured, start) = (AtomicUsize::new(0), std::sync::Barrier::new(2));
+    let ask = || {
+        start.wait();
+        store.select(
+            &k,
+            2,
+            || 1,
+            || {
+                measured.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                vec![Some(2), Some(1)]
+            },
+        )
+    };
+    let chosen = std::thread::scope(|s| {
+        let other = s.spawn(ask);
+        [ask(), other.join().expect("the other asker")]
     });
-    assert_eq!((chosen, measured), (Some(0), true), "another toolchain measures again");
-    let files: Vec<String> =
-        std::fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
-    assert_eq!(files.len(), 2, "{files:?}");
-    assert!(files.iter().all(|name| name.contains(&format!("-s{TUNE_SCHEMA}-"))), "{files:?}");
-    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!((chosen, measured.load(Ordering::SeqCst)), ([Some(1), Some(1)], 1));
 }
 
-/// On a supported GPU, a first request measures the GEMM table for a shape and
-/// records one line; the winner is a table tile that tiles the shape.
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::gemm_first_use -- --ignored`.
+/// Threads storing other keys of one device file at once lose none of
+/// them: each write re-reads, merges and replaces the file alone.
 #[test]
-#[ignore]
-fn gemm_first_use_measures_the_table_once_gpu() {
-    use crate::kernels::gemm::{Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmPolicy};
-
-    if !super::device_supported(GEMM_NT_SUPPORTED_ARCHS) {
-        eprintln!("skip gemm_first_use_measures_the_table_once_gpu: no supported device / toolchain");
-        return;
-    }
-    let dir = scratch("gemm-gpu");
+fn concurrent_writers_of_one_file_lose_no_line() {
+    let (threads, keys) = (8, 8);
+    let dir = scratch("concurrent");
     let store = TuneStore::at(Some(dir.clone()));
-    let spec = svod_tensor::Tensor::empty(&[1], DType::Float32).device();
-    let arch = crate::target::resolve_arch(&spec).expect("a GPU arch");
-    let policy = GemmPolicy::for_device(&spec, arch);
-    let (m, k, n) = (256usize, 1024usize, 1024usize);
-    let cfg = policy.tuned(&store, &spec, arch, &DType::BFloat16, (m, k, n), Epilogue::Plain).expect("a tile");
-    assert!(policy.tiles.contains(&cfg) && cfg.tiles(m, k, n), "the winner is a table tile that tiles the shape");
-    let files: Vec<_> = std::fs::read_dir(&dir).expect("store dir").flatten().collect();
-    assert_eq!(files.len(), 1, "one file per device");
-    let text = std::fs::read_to_string(files[0].path()).expect("store file");
-    assert_eq!(text.lines().count(), 1, "one line per shape: {text}");
-    assert!(text.starts_with("gemm_nt|"), "{text}");
-    assert_eq!(policy.tuned(&store, &spec, arch, &DType::BFloat16, (m, k, n), Epilogue::Plain), Some(cfg));
+    let start = std::sync::Barrier::new(threads);
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            let (store, start) = (&store, &start);
+            s.spawn(move || {
+                start.wait();
+                for i in 0..keys {
+                    let k = TuneKey { op: "probe:step", ..key(&[t, i], &[0]) };
+                    store.value(&k, || 1, || Some((t * keys + i) as u64));
+                }
+            });
+        }
+    });
+    let again = TuneStore::at(Some(dir.clone()));
+    assert_eq!(again.entries(&key(&[], &[0])).len(), threads * keys);
+    for t in 0..threads {
+        for i in 0..keys {
+            let k = TuneKey { op: "probe:step", ..key(&[t, i], &[0]) };
+            assert_eq!(again.value(&k, || 1, || panic!("lost")), Some((t * keys + i) as u64));
+        }
+    }
+    let leftovers = std::fs::read_dir(&dir).unwrap().count();
+    assert_eq!(leftovers, 1, "a temporary file left behind");
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The attention split's first use measures the policy's candidates (each a
-/// partial + merge pair) once and records one line; the winner is a candidate.
-/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::sq_attention_first_use -- --ignored`.
-#[test_case(5, 640, true; "whisper large's packed cross cache")]
-#[test_case(5, 20, false; "a cache per row")]
-#[ignore]
-fn sq_attention_first_use_measures_the_splits_once_gpu(kv_batch: usize, h_total: usize, cache_map: bool) {
-    use crate::kernels::sq_attention::{HeadSelection, SQ_ATTENTION_SUPPORTED_ARCHS, SqGeom, SqPolicy};
+/// A plain bf16 GEMM's programs at `tile` on sm_86.
+fn gemm_programs(tile: [usize; 3]) -> tune::Candidate {
+    let cfg = GemmCfg { core: Core::Warp, tile, stages: 2, warps: [2, 2], group_m: 8, unroll: true, crews: 1 };
+    let spec = GemmSpec { m: 128, n: 128, k: 128, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
+    vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target: sm86(), costs: super::costs() }))]
+}
 
-    if !super::device_supported(SQ_ATTENTION_SUPPORTED_ARCHS) {
-        eprintln!("skip sq_attention_first_use_measures_the_splits_once_gpu: no supported device / toolchain");
-        return;
-    }
-    let spec = svod_tensor::Tensor::empty(&[1], DType::Float32).device();
-    let arch = crate::target::resolve_arch(&spec).expect("a GPU arch");
-    let policy = SqPolicy::for_device(&spec, arch);
-    let (b, n, h, d) = (5, 1500, 20, 64);
-    let candidates = policy.candidates(b, h, n);
-    if candidates.len() < 2 {
-        eprintln!("skip sq_attention_first_use_measures_the_splits_once_gpu: the family keeps one split");
-        return;
-    }
-    let dir = scratch(&format!("sq-gpu-{kv_batch}-{h_total}-{cache_map}"));
+/// A choice keys by the candidates' programs, each built once: a store
+/// miss compiles each candidate once (and times them where the host's
+/// device runs sm_86 programs), and a store hit in another process builds
+/// the programs to fingerprint them and compiles nothing.
+#[test]
+fn a_store_hit_compiles_nothing() {
+    let dir = scratch("hit");
+    let k = key(&[128, 128, 128], &[0, 1]);
+    let tiles = [[64, 64, 32], [128, 64, 32]];
+    let builds = Cell::new(0);
+    let build = |i: usize| {
+        builds.set(builds.get() + 1);
+        gemm_programs(tiles[i])
+    };
+    let programs = fingerprint(&[gemm_programs(tiles[0]), gemm_programs(tiles[1])]);
+    let mut bench = Bench::default();
+    let missed = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
+    assert_eq!((builds.get(), bench.built.len()), (2, 2), "a miss builds and compiles each once");
+    // Without a device that timed them, what it would have measured, stored
+    // as a timing would; with one, its choice is already stored.
+    let stored = TuneStore::at(Some(dir.clone())).select(&k, 2, || programs, || vec![Some(9), Some(4)]);
+    let missed = missed.map(|timed| timed[0].0);
+    assert_eq!(stored, missed.or(Some(1)), "the device's choice, else the stored timing's");
+    builds.set(0);
+    let mut bench = Bench::default();
+    let hit = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
+    assert_eq!((hit.map(|timed| timed[0].0), builds.get(), bench.built.len()), (stored, 2, 0));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A stored index past the candidate count is a miss.
+#[test]
+fn a_stale_index_is_a_miss() {
+    let dir = scratch("stale");
+    let k = key(&[8, 8, 8], &[0, 1, 2]);
+    TuneStore::at(Some(dir.clone())).select(&k, 3, || 1, || vec![None, None, Some(1)]);
+    let ran = Cell::new(false);
+    assert_eq!(TuneStore::at(Some(dir.clone())).select(&k, 2, || 1, timed(&[Some(1), None], &ran)), Some(0));
+    assert!(ran.get());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A warm memo answers a value without fingerprinting or measuring; an
+/// unmeasured value is memoized as missing and never stored.
+#[test_case(Some(5); "measured")]
+#[test_case(None; "unmeasured")]
+fn the_memo_answers_a_value(measured: Option<u64>) {
+    let dir = scratch(&format!("value-memo-{measured:?}"));
     let store = TuneStore::at(Some(dir.clone()));
-    let heads = HeadSelection { count: h, total: h_total, offset: h_total - h };
-    let geom = SqGeom { b, kv_batch, n, heads, d, kv: DType::Float16 };
-    let split = policy.tuned(&store, &spec, arch, &geom, cache_map);
-    assert!(candidates.contains(&split), "the winner {split} is a candidate of {candidates:?}");
-    let files: Vec<_> = std::fs::read_dir(&dir).expect("store dir").flatten().collect();
-    assert_eq!(files.len(), 1, "one file per device");
-    let text = std::fs::read_to_string(files[0].path()).expect("store file");
-    assert_eq!(text.lines().count(), 1, "one line per shape: {text}");
-    assert!(text.starts_with("sq_attention|"), "{text}");
-    assert_eq!(policy.tuned(&store, &spec, arch, &geom, cache_map), split);
+    let k = key(&[1], &[0]);
+    assert_eq!(store.value(&k, || 1, || measured), measured);
+    assert_eq!(store.entries(&k).len(), usize::from(measured.is_some()));
+    assert_eq!(store.value(&k, || unreachable!("fingerprinted"), || unreachable!("measured")), measured);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Choices and values of one device share its file, a value as a `value`
+/// line holding the number; writing one keeps the other, and a second store
+/// on the directory reads both back without measuring.
+#[test]
+fn choices_and_values_share_a_file() {
+    let dir = scratch("shared");
+    let (choice, value) = (key(&[64, 64, 64], &[0, 1]), TuneKey { op: "probe:step", ..key(&[], &[2]) });
+    TuneStore::at(Some(dir.clone())).select(&choice, 2, || 1, || vec![Some(9), Some(4)]);
+    assert_eq!(TuneStore::at(Some(dir.clone())).value(&value, || 2, || Some(1234)), Some(1234));
+    let lines = [format!("{} 1 4 0 9", choice.line(Kind::Choice, 1)), format!("{} 1234", value.line(Kind::Value, 2))];
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{}\n", lines.join("\n")));
+    let again = TuneStore::at(Some(dir.clone()));
+    assert_eq!(again.entries(&choice).len(), 2);
+    assert_eq!(again.select(&choice, 2, || 1, || panic!("measured twice")), Some(1));
+    assert_eq!(again.value(&value, || 2, || panic!("measured twice")), Some(1234));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A line the store cannot read (an older format, a stray edit) is a miss
+/// and is dropped at the next write; a line of another kind under the same
+/// key is kept, each kind leading its own line.
+#[test]
+fn an_unreadable_line_is_dropped_at_the_next_write() {
+    let dir = scratch("unreadable");
+    let k = key(&[3, 3, 3], &[0, 1]);
+    let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
+    let kept = format!("{} 42", k.line(Kind::Value, 1));
+    let lines = format!("format {FORMAT}\ngemm|sm_86-28sm|BFloat16|3x3x3|0|0|0 1 100\n{kept}\nnonsense\n");
+    std::fs::write(&path, lines).unwrap();
+    let store = TuneStore::at(Some(dir.clone()));
+    assert_eq!(store.entries(&k).len(), 1);
+    assert_eq!(store.select(&k, 2, || 1, || vec![Some(9), Some(4)]), Some(1));
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 1 4 0 9\n{kept}\n", k.line(Kind::Choice, 1)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A run's time sums its kernels (a candidate is a kernel and its merge);
+/// a kernel without both stamps voids the run rather than shortening it.
+#[test_case(&[(Some(10), Some(15)), (Some(20), Some(23))] => Some(8); "kernels summed")]
+#[test_case(&[(Some(10), Some(15)), (Some(20), None)] => None; "a lost end")]
+#[test_case(&[(None, Some(15)), (Some(20), Some(23))] => None; "a lost start")]
+#[test_case(&[(Some(15), Some(10))] => None; "an end before its start")]
+#[test_case(&[] => None; "no kernels")]
+fn a_run_needs_every_stamp(stamps: &[(Option<u64>, Option<u64>)]) -> Option<u64> {
+    tune::stamped(stamps.iter().copied()).map(|d| d.as_nanos() as u64)
+}
+
+/// A line keys the op, the device, the dtype, the shape, the candidates in
+/// order, the compiler (toolchain, flags), the kind and the programs'
+/// fingerprint: another of any is another line, so it re-measures.
+#[test_case(&[1, 704, 512, 512], &[0, 1], 0, true; "the same inputs")]
+#[test_case(&[1, 704, 512, 2048], &[0, 1], 0, false; "another shape")]
+#[test_case(&[1, 704, 512, 512], &[1, 0], 0, false; "another candidate order")]
+#[test_case(&[1, 704, 512, 512], &[0, 1], 1, false; "another compiler")]
+fn keys_are_stable(shape: &[usize], candidates: &[usize], compiler: u64, same: bool) {
+    let base = key(&[1, 704, 512, 512], &[0, 1]);
+    let other = TuneKey { compiler: base.compiler ^ compiler, ..key(shape, candidates) };
+    assert_eq!(base.line(Kind::Choice, 3) == other.line(Kind::Choice, 3), same);
+    let line = base.line(Kind::Choice, 3);
+    assert!(line.starts_with("choice|gemm|sm_86-28sm|BFloat16|1x704x512x512|"), "{line}");
+    assert!(line.contains(&format!("|{:016x}|", base.compiler)), "{line}");
+    assert_ne!(line, base.line(Kind::Choice, 4), "the program fingerprint is part of the line");
+    assert_ne!(line, base.line(Kind::Admitted, 3), "the kind is part of the line");
+}
+
+/// Two candidates of one shape run on the same scratch buffers, parameter by
+/// parameter; a program's two parameters of one size never alias.
+#[test]
+fn candidates_share_scratch_buffers_without_aliasing_a_program() {
+    let spec = |tile| GemmSpec {
+        m: 256,
+        n: 256,
+        k: 256,
+        batch: Batch::Static(1),
+        epilogue: Epilogue::default(),
+        cfg: GemmCfg { core: Core::Warp, tile, stages: 2, warps: [2, 2], group_m: 8, unroll: true, crews: 1 },
+    };
+    let (first, second) = (gemm::<BF16>(&spec([64, 64, 32])), gemm::<BF16>(&spec([128, 64, 32])));
+    let pool = ScratchPool::default();
+    let (a, b) = (pool.buffers(&first.params), pool.buffers(&second.params));
+    let same = |x: &svod_tensor::Tensor, y: &svod_tensor::Tensor| std::sync::Arc::ptr_eq(&x.uop(), &y.uop());
+    assert_eq!(a.len(), 3, "a, b and c");
+    assert!(a.iter().zip(&b).all(|(x, y)| same(x, y)), "the second candidate reuses the first's buffers");
+    assert!(!same(&a[0], &a[1]), "a and b are both [256·256] bf16 yet distinct");
+    assert!(!same(&a[0], &a[2]) && !same(&a[1], &a[2]));
+}
+
+/// A kernel spilled when it reports scratch bytes; a backend reporting no
+/// resources, or no scratch, admits.
+#[test_case(&[] => false; "nothing reported")]
+#[test_case(&[None] => false; "no scratch field")]
+#[test_case(&[Some(0), None] => false; "no scratch used")]
+#[test_case(&[Some(0), Some(16)] => true; "the merge fits, the kernel spills")]
+fn a_kernel_with_scratch_spilled(scratch: &[Option<u32>]) -> bool {
+    let resources: Vec<KernelResources> = scratch
+        .iter()
+        .map(|&scratch_bytes| KernelResources {
+            vgprs: Some(128),
+            agprs: None,
+            sgprs: None,
+            lds_bytes: 0,
+            scratch_bytes,
+            wave_size: 32,
+            occupancy: None,
+        })
+        .collect();
+    tune::spilled(&resources)
+}
+
+/// A scoped setting holds on its thread and on the workers `in_parallel`
+/// runs there, nests, and gives the outer one back on return and on unwind;
+/// another thread follows the environment.
+#[test_case(false; "off")]
+#[test_case(true; "on")]
+fn a_scoped_setting_holds_on_its_thread_alone(on: bool) {
+    let outer = tune::enabled();
+    tune::scoped(on, || {
+        assert_eq!(tune::enabled(), on);
+        assert!(tune::in_parallel((0..64).collect(), |_: i32| tune::enabled()).into_iter().all(|e| e == on));
+        assert_eq!(std::thread::spawn(tune::enabled).join().unwrap(), outer);
+        tune::scoped(!on, || assert_eq!(tune::enabled(), !on));
+        assert_eq!(tune::enabled(), on);
+        assert!(std::panic::catch_unwind(|| tune::scoped(!on, || panic!("unwinds"))).is_err());
+        assert_eq!(tune::enabled(), on);
+    });
+    assert_eq!(tune::enabled(), outer);
+}
+
+/// A ranked list's admission is memoized for the process: a second ask
+/// compiles nothing, and nothing compiled to judge is remembered as such.
+#[test_case(Some(vec![0, 2]); "admitted")]
+#[test_case(None; "nothing built")]
+fn admission_is_memoized(found: Option<Vec<usize>>) {
+    let store = TuneStore::at(None);
+    let k = key(&[1, 2, 3], &[0, 1, 2]);
+    let want = found.clone().map(Into::into);
+    assert_eq!(store.admitted(&k, || 7, || found), want);
+    assert_eq!(store.admitted(&k, || 7, || unreachable!("compiled twice")), want);
+}
+
+/// An admission round-trips through the store as an `admitted` line of its
+/// indices, so a second store on the directory judges nothing; under other
+/// programs (a lowering change) it judges again, and a judgement of nothing
+/// is never stored.
+#[test]
+fn an_admission_round_trips_through_the_store() {
+    let dir = scratch("admission");
+    let k = key(&[1, 2, 3], &[0, 1, 2]);
+    let store = TuneStore::at(Some(dir.clone()));
+    assert_eq!(store.admitted(&key(&[9], &[0]), || 7, || None), None);
+    assert!(store.entries(&k).is_empty());
+    assert_eq!(store.admitted(&k, || 7, || Some(vec![3, 0, 5])).as_deref(), Some(&[3, 0, 5][..]));
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 3 0 5\n", k.line(Kind::Admitted, 7)));
+    let again = TuneStore::at(Some(dir.clone()));
+    assert_eq!(again.admitted(&k, || 7, || unreachable!("judged twice")).as_deref(), Some(&[3, 0, 5][..]));
+    let relowered = TuneStore::at(Some(dir.clone()));
+    assert_eq!(relowered.admitted(&k, || 8, || Some(vec![1])).as_deref(), Some(&[1][..]));
+    assert_eq!(store_file(&dir).lines().count(), 3);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A first clean config round-trips through the store as a `first` line
+/// beside the list's admission, each remembered once: a second store on
+/// the directory searches nothing, and a search that found nothing is not
+/// stored.
+#[test]
+fn a_first_clean_config_round_trips_through_the_store() {
+    let dir = scratch("first");
+    let k = key(&[1, 2, 3], &[0, 1, 2]);
+    let store = TuneStore::at(Some(dir.clone()));
+    assert_eq!(store.first(&key(&[9], &[0]), || 7, || None), None);
+    assert!(store.entries(&k).is_empty());
+    assert_eq!(store.first(&k, || 7, || Some(2)), Some(2));
+    assert_eq!(store.admitted(&k, || 7, || Some(vec![2, 0, 5])).as_deref(), Some(&[2, 0, 5][..]));
+    let lines = format!("format {FORMAT}\n{} 2 0 5\n{} 2\n", k.line(Kind::Admitted, 7), k.line(Kind::First, 7));
+    assert_eq!(store_file(&dir), lines);
+    let again = TuneStore::at(Some(dir.clone()));
+    assert_eq!(again.first(&k, || 7, || unreachable!("searched twice")), Some(2));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A file of another line format, or without a format line (the first
+/// format's), is dropped whole and the next write starts it over in this
+/// one; a file of this format reads as it did and stays as it is until a write.
+#[test_case(Some(FORMAT + 1), false; "another format")]
+#[test_case(Some(FORMAT), true; "this format")]
+#[test_case(None, false; "no format line")]
+fn a_file_of_another_format_is_dropped(written: Option<u32>, kept: bool) {
+    let dir = scratch(&format!("format-{written:?}"));
+    let k = key(&[2, 2, 2], &[0, 1]);
+    let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
+    let line = format!("{} 1 100 0 300", k.line(Kind::Choice, 7));
+    let header = written.map_or(String::new(), |n| format!("format {n}\n"));
+    std::fs::write(&path, format!("{header}{line}\n")).unwrap();
+    let store = TuneStore::at(Some(dir.clone()));
+    assert_eq!(store.entries(&k).len(), usize::from(kept));
+    let measured = Cell::new(false);
+    assert_eq!(store.select(&k, 2, || 7, timed(&[Some(9), Some(4)], &measured)), Some(1));
+    assert_eq!(measured.get(), !kept);
+    let want = if kept {
+        format!("{header}{line}\n")
+    } else {
+        format!("format {FORMAT}\n{} 1 4 0 9\n", k.line(Kind::Choice, 7))
+    };
+    assert_eq!(store_file(&dir), want);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Tunes a Nemotron GEMM on the device into a scratch directory; a second
+/// store on that directory answers from disk without measuring.
+#[test]
+fn a_gemm_tunes_on_the_device() {
+    let Some(planner) = super::device_planner() else { return };
+    let spec = svod_dtype::default_device::default_device();
+    let device = &planner.device;
+    let (m, n, k) = (704, 512, 512);
+    let cfgs = super::first_eight(&planner.gemm_ranked(1, m, n, k, false));
+    let batch = Batch::Var { name: "b".into(), min: 1, max: 1 };
+    let build = |cfg: GemmCfg| {
+        let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue: Epilogue::default(), cfg };
+        vec![(gemm::<BF16>(&spec), cfg.lowering(device))]
+    };
+    let key = TuneKey::new("gemm", &device.target, tune::compiler(&spec), ScalarDType::BFloat16, &[1, m, n, k], &cfgs);
+    let dir = scratch("device");
+    let start = std::time::Instant::now();
+    let chosen = TuneStore::at(Some(dir.clone())).choose(&key, &cfgs, build, &mut Bench::default());
+    let chosen = cfgs[chosen.expect("measured")[0].0];
+    eprintln!("tuned {} candidates in {:.1} s: {chosen:?}", cfgs.len(), start.elapsed().as_secs_f64());
+    let programs = || fingerprint(&cfgs.iter().map(|&c| build(c)).collect::<Vec<_>>());
+    let hit = TuneStore::at(Some(dir.clone())).select(&key, cfgs.len(), programs, || panic!("measured twice"));
+    assert_eq!(hit.map(|i| cfgs[i]), Some(chosen));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A candidate's time is its fastest timed run: a run the device did not
+/// stamp is skipped, not taken as the candidate failing, and one under half
+/// the median of its runs (a stamp the device lost the middle of) is dropped.
+#[test_case(&[Some(5), None, Some(3)] => Some(3); "a lost sample")]
+#[test_case(&[None, Some(7)] => Some(7); "the first lost")]
+#[test_case(&[None, None] => None; "none timed")]
+#[test_case(&[Some(90_000), Some(1), Some(91_000), Some(90_500), Some(92_000)] => Some(90_000); "a bogus stamp")]
+#[test_case(&[Some(100), Some(60), Some(110)] => Some(60); "a fast run within half the median")]
+#[test_case(&[Some(100), Some(49), Some(110)] => Some(100); "past half the median")]
+fn a_candidate_keeps_its_timed_runs(runs: &[Option<u64>]) -> Option<u64> {
+    let runs = runs.iter().map(|r| r.map(std::time::Duration::from_nanos));
+    tune::best(runs).map(|d| d.as_nanos() as u64)
+}
+
+/// Candidates compile on workers that see the caller's default device (a
+/// thread-local): a caller pinning one without `SVOD_DEVICE` builds them
+/// for it, not for the CPU.
+#[test]
+fn workers_see_the_callers_device() {
+    use svod_dtype::DeviceSpec;
+    use svod_dtype::default_device::{default_device, with_default_device};
+    let pinned = DeviceSpec::Amd { device_id: 3 };
+    let seen = with_default_device(pinned.clone(), || tune::in_parallel((0..64).collect(), |_: i32| default_device()));
+    assert!(seen.iter().all(|d| *d == pinned), "{seen:?}");
+}
+
+/// The timed rounds: every candidate runs once, then only those within
+/// [`CONTENDER`](tune::CONTENDER) of the first round's best run the rest
+/// ([`ROUNDS`] in all), or every candidate when there are fewer than
+/// [`CUT_FROM`](tune::CUT_FROM) (`losers` more at 1000 fill a field out);
+/// then, where more than two contenders ran them, the two leaders run
+/// [`ROUNDS`] more.
+/// A candidate that fails (a run of 0 here, its list run out) is excluded
+/// for good, whichever round it fails in; nothing running leaves every
+/// candidate `None`. A candidate's list repeats its last run.
+#[test_case(&[&[100], &[150], &[110], &[500]], 12, &[4, 1, 4, 1], &[Some(100), Some(150), Some(110), Some(500)]; "in a field losers run once and two contenders are the leaders")]
+#[test_case(&[&[100], &[115], &[110], &[500]], 12, &[8, 4, 8, 1], &[Some(100), Some(115), Some(110), Some(500)]; "in a field the leaders of three contenders run again")]
+#[test_case(&[&[100], &[150], &[110], &[500]], 0, &[8, 4, 8, 4], &[Some(100), Some(150), Some(110), Some(500)]; "a short list runs every round")]
+#[test_case(&[&[100, 90, 95, 92], &[118, 121]], 14, &[4, 2], &[Some(90), Some(118)]; "past the bound a contender stops, its minimum standing")]
+#[test_case(&[&[100; 4], &[101; 4], &[150]], 0, &[8, 8, 4], &[Some(100), Some(101), Some(150)]; "the two leaders run again")]
+#[test_case(&[&[100, 100, 100, 100, 95], &[101, 101, 101, 101, 94], &[150]], 0, &[8, 8, 4], &[Some(95), Some(94), Some(150)]; "the leaders' rounds decide")]
+#[test_case(&[&[100, 100, 100, 100, 95], &[101, 101, 101, 101, 94]], 0, &[4, 4], &[Some(100), Some(101)]; "a pair has run together already")]
+#[test_case(&[&[100], &[]], 0, &[4, 1], &[Some(100), None]; "a failure in the first round")]
+#[test_case(&[&[100], &[105, 104, 0]], 0, &[4, 3], &[Some(100), None]; "a failure in a later round")]
+#[test_case(&[&[100, 100, 100, 100, 0], &[101], &[150]], 0, &[5, 8, 4], &[None, Some(101), Some(150)]; "a failure in the leaders' rounds")]
+#[test_case(&[&[], &[]], 0, &[1, 1], &[None, None]; "nothing runs")]
+#[test_case(&[], 0, &[], &[]; "no candidates")]
+fn contenders_run_the_later_rounds(runs: &[&[u64]], losers: usize, want_calls: &[usize], want: &[Option<u64>]) {
+    use std::cell::RefCell;
+    let runs: Vec<&[u64]> = runs.iter().copied().chain(std::iter::repeat_n(&[1000][..], losers)).collect();
+    let calls = RefCell::new(vec![0usize; runs.len()]);
+    let got = tune::rounds(runs.len(), |i| {
+        let mut calls = calls.borrow_mut();
+        let run = runs[i].get(calls[i]).or(runs[i].last()).copied();
+        calls[i] += 1;
+        run.filter(|&t| t > 0).map(Duration::from_nanos)
+    });
+    let got: Vec<Option<u64>> = got.iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect();
+    assert_eq!(got[..want.len()], *want);
+    assert!(got[want.len()..].iter().all(|t| *t == Some(1000)), "{got:?}");
+    let calls = calls.borrow();
+    assert_eq!(calls[..want_calls.len()], *want_calls);
+    assert!(calls[want_calls.len()..].iter().all(|&c| c == 1), "{calls:?}");
+}
+
+/// A candidate's plan is prepared for its measurement alone: two scratch
+/// plans of one program hold two compiled kernels, neither published for
+/// the other, while the same program launched as an op is compiled once.
+#[test]
+fn a_scratch_plan_publishes_nothing() {
+    let Some(planner) = super::device_planner() else { return };
+    let device = &planner.device;
+    let cfg = super::first_eight(&planner.gemm_ranked(1, 704, 512, 512, false))[0];
+    let spec = GemmSpec { m: 704, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
+    let pool = ScratchPool::default();
+    let scratch = || tune::scratch_plan(gemm::<BF16>(&spec), &cfg.lowering(device), &pool).expect("a plan");
+    let kernels = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(std::ptr::from_ref).collect::<Vec<_>>();
+    let (first, second) = (scratch(), scratch());
+    assert!(!kernels(&first.0).is_empty());
+    assert!(kernels(&first.0).iter().zip(kernels(&second.0)).all(|(a, b)| !std::ptr::eq(*a, b)));
+    let names = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(|k| k.entry_point.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&first.0), names(&second.0), "a candidate's kernels are named by their shape alone");
+    let launched = || {
+        let buffers = pool.buffers(&gemm::<BF16>(&spec).params);
+        let tensors: Vec<&svod_tensor::Tensor> = buffers.iter().collect();
+        let out = crate::launch::graph_launch(gemm::<BF16>(&spec), &cfg.lowering(device), &tensors);
+        out.expect("a launch").prepare().expect("a plan")
+    };
+    let (first, second) = (launched(), launched());
+    assert!(kernels(&first).iter().zip(kernels(&second)).all(|(a, b)| std::ptr::eq(*a, b)));
+}
+
+/// The pool's fill is prepared as a candidate is, in passing: a kernel of
+/// the fill's shape prepared after it, as a model's are after a tune, gets
+/// the bare shape name an ephemeral prepare keeps, not the counter's next
+/// (Nemotron's first warm run after a tune compiled its elementwise kernels
+/// again, under `n1` names).
+#[test]
+fn a_scratch_fill_moves_no_kernel_name_counter() {
+    use crate::ir::{Param, ParamKind};
+    use svod_dtype::DType;
+    use svod_tensor::{PrepareConfig, Tensor};
+    // A prime count: no other kernel of the process has the fill's shape.
+    let elems = 999_983;
+    let names = |plan: &svod_runtime::ExecutionPlan| plan.kernels().map(|k| k.entry_point.clone()).collect::<Vec<_>>();
+    let mut ephemeral = PrepareConfig::from_env();
+    ephemeral.ephemeral = true;
+    // A tensor prepares once; the ephemeral prepares publish nothing the
+    // later one could read.
+    let bare = |t: Tensor| names(&t.prepare_with(&ephemeral).expect("a plan"));
+    let (zeros, ones) = (
+        || Tensor::zeros(&[elems], DType::Float32).contiguous(),
+        || Tensor::ones(&[elems], DType::Float32).contiguous(),
+    );
+    let expected = bare(ones());
+    assert!(!expected.is_empty());
+    assert_eq!(bare(zeros()), expected, "the fill and the kernel after it share a shape name");
+    let pool = ScratchPool::default();
+    let param = Param { name: "x".into(), dtype: ScalarDType::Float32, kind: ParamKind::In, elems };
+    assert_eq!(pool.buffers(&[param]).len(), 1);
+    assert_eq!(names(&ones().prepare().expect("a plan")), expected, "the fill moved the counter");
+}
+
+/// A float scratch buffer holds values spread over `[-1, 1)`, an integer one
+/// zeros: the first toggles bits as real data does, the second is read as
+/// the slot a probe reads next.
+#[test]
+fn a_float_scratch_buffer_is_random_and_an_integer_one_is_zero() {
+    use crate::ir::{Param, ParamKind};
+    let pool = ScratchPool::default();
+    let param = |dtype| Param { name: "x".into(), dtype, kind: ParamKind::In, elems: 4096 };
+    let [floats, ints] =
+        pool.buffers(&[param(ScalarDType::Float32), param(ScalarDType::Int32)]).try_into().expect("two");
+    let floats: Vec<f32> = floats.to_vec().expect("values");
+    let ints: Vec<i32> = ints.to_vec().expect("values");
+    assert!(floats.iter().all(|x| (-1.0..1.0).contains(x)), "values in [-1, 1)");
+    let (negative, positive) =
+        (floats.iter().filter(|&&x| x < -0.5).count(), floats.iter().filter(|&&x| x > 0.5).count());
+    assert!(negative > 512 && positive > 512, "spread over the range: {negative} below -0.5, {positive} above 0.5");
+    assert!(ints.iter().all(|&x| x == 0), "an integer parameter is zero");
+}
+
+/// A 4096³ GEMM candidate on the warp-level core for `target` under `costs`.
+fn gemm_candidate(target: crate::atoms::Target, costs: crate::atoms::Costs) -> tune::Candidate {
+    let cfg = crate::ops::config::gemm_cfg([128, 128, 32], 2, [2, 4], true);
+    let spec = GemmSpec { m: 4096, n: 4096, k: 4096, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+    vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target, costs }))]
+}
+
+/// The fingerprint keys the emitted kernel: a target field (the waves a
+/// SIMD schedules, read by the ranking alone) or a cost (the memory
+/// latency) no instruction reads leaves it, a field the lowering reads (the
+/// dies the blocks are renumbered over) moves it.
+#[test]
+fn the_fingerprint_keys_what_is_emitted() {
+    let fingerprint = |c| TuneStore::at(None).fingerprint(&[c]);
+    let (target, costs) = (crate::atoms::Target::card("mi300x").expect("a listed card"), super::costs());
+    let base = fingerprint(gemm_candidate(target.clone(), costs));
+    let occupancy = crate::atoms::Occupancy { waves: 2 * target.occupancy.waves, ..target.occupancy };
+    let planned = crate::atoms::Target { occupancy, ..target.clone() };
+    assert_eq!(fingerprint(gemm_candidate(planned, costs)), base, "a field only the ranking reads");
+    let latency = crate::atoms::Costs { latency: 2.0 * costs.latency, ..costs };
+    assert_eq!(fingerprint(gemm_candidate(target.clone(), latency)), base, "a cost only the ranking reads");
+    let one_die = crate::atoms::Target { xcds: 1, ..target };
+    assert_ne!(fingerprint(gemm_candidate(one_die, costs)), base, "the block order is emitted");
+}
+
+/// Candidates fingerprint as a list: their order and grouping count.
+#[test]
+fn the_fingerprint_keys_the_candidates_in_order() {
+    let store = TuneStore::at(None);
+    let (a, b) = (
+        gemm_candidate(sm86(), super::costs()),
+        gemm_candidate(crate::atoms::Target::card("mi300x").unwrap(), super::costs()),
+    );
+    let ab = store.fingerprint(&[a.clone(), b.clone()]);
+    assert_eq!(TuneStore::at(None).fingerprint(&[a.clone(), b.clone()]), ab, "deterministic");
+    assert_ne!(store.fingerprint(&[b.clone(), a.clone()]), ab);
+    assert_ne!(store.fingerprint(&[[a, b].concat()]), ab);
+}
+
+/// The store under `dir` as a build named `build` sees it.
+fn built(dir: &std::path::Path, build: u64) -> TuneStore {
+    let mut store = TuneStore::at(Some(dir.to_path_buf()));
+    store.build = Some(build);
+    store
+}
+
+/// The digest of what a candidate's one program is made of, as the memo keys it.
+fn made_of(candidate: &tune::Candidate) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&format!("{:?}{:?}", candidate[0].0, candidate[0].1), &mut hasher);
+    std::hash::Hasher::finish(&hasher)
+}
+
+/// What a program emits is kept in its build's file by what it is made
+/// of: a later store of the build reads it rather than lowering, and a
+/// line it cannot read is passed over.
+#[test]
+fn what_a_program_emits_is_remembered_by_its_build() {
+    let dir = scratch("emitted");
+    let candidate = gemm_candidate(sm86(), super::costs());
+    let fresh = built(&dir, 1).fingerprint(std::slice::from_ref(&candidate));
+    assert_eq!(fresh, TuneStore::at(None).fingerprint(std::slice::from_ref(&candidate)));
+    let file = dir.join("emitted").join(format!("{:016x}.txt", 1));
+    let text = std::fs::read_to_string(&file).expect("the build's file");
+    assert!(text.starts_with(&format!("{:016x} ", made_of(&candidate))), "{text}");
+    std::fs::write(&file, format!("not a line\n{:016x} 000000000000002a\n", made_of(&candidate))).expect("a file");
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&vec![vec![42u64]], &mut hasher);
+    let read = built(&dir, 1).fingerprint(std::slice::from_ref(&candidate));
+    assert_eq!(read, std::hash::Hasher::finish(&hasher), "read from the file, not lowered");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Another build consults none of a build's memo: it lowers again, and where
+/// it emits the same code its fingerprint is the first build's, so the
+/// store's entries still answer.
+#[test]
+fn another_build_lowers_again_and_matches_where_the_code_is_the_same() {
+    let dir = scratch("rebuilt");
+    let candidate = gemm_candidate(sm86(), super::costs());
+    let first = built(&dir, 1).fingerprint(std::slice::from_ref(&candidate));
+    let stale = dir.join("emitted").join(format!("{:016x}.txt", 1));
+    std::fs::write(&stale, format!("{:016x} 000000000000002a\n", made_of(&candidate))).expect("a file");
+    assert_eq!(built(&dir, 2).fingerprint(std::slice::from_ref(&candidate)), first, "lowered again, the same code");
+    let mut files: Vec<_> = std::fs::read_dir(dir.join("emitted"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files, [format!("{:016x}.txt", 1), format!("{:016x}.txt", 2)]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Opening the memo removes the files of builds unused for longer than a
+/// build's file is kept, and keeps the recent ones.
+#[test]
+fn a_build_unused_for_long_loses_its_memo() {
+    let dir = scratch("pruned");
+    let emitted = dir.join("emitted");
+    std::fs::create_dir_all(&emitted).expect("the memo dir");
+    let (old, recent) = (emitted.join("old.txt"), emitted.join("recent.txt"));
+    for f in [&old, &recent] {
+        std::fs::write(f, "").expect("a file");
+    }
+    let month = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+    std::fs::File::options().write(true).open(&old).unwrap().set_modified(month).unwrap();
+    built(&dir, 3).fingerprint(&[gemm_candidate(sm86(), super::costs())]);
+    assert!(!old.exists() && recent.exists());
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -37,8 +37,8 @@ PyTorch references, plus an ONNX importer for everything else.
   Runtime bindings and no vendor SDKs.
 - **A familiar API.** The tensor API mirrors PyTorch, down to named arguments,
   so a model port reads like the reference, and porting it is mostly mechanical.
-- **Speed where it counts.** When the compiler is not enough, the `tk` tile DSL
-  gives you hand-written kernels in the same IR. They stay visible to the
+- **Speed where it counts.** When the compiler is not enough, the `tk` tile
+  language gives you hand-written kernels in the same IR. They stay visible to the
   profiler and the origin tracker instead of living off to the side as opaque
   binaries.
 
@@ -104,23 +104,15 @@ See [Pattern system](https://svod.vpermilp.online/docs/architecture/optimization
 
 - **Tensor cores** are chosen per architecture: NVIDIA sm_75/80/89, AMD RDNA3,
   RDNA4 and CDNA3/4, plus Apple Metal. fp8 is available on sm_89 and CDNA3.
-- **Tile kernels (`tk`)**: a ThunderKittens-style tile DSL in Rust for GEMM,
-  flash attention, RMSNorm and k-means. A single kernel source lowers to AMD
-  MFMA/WMMA (gfx942, gfx11, gfx12), CUDA `mma.sync` (sm_80+) and Apple
-  `simdgroup_matrix` (Apple7+). Tile shapes are
-  autotuned on first use and cached. See
+- **Tile kernels (`tk`)**: GEMM, flash attention, attention prologue, norms
+  and implicit-GEMM convolution written once as structured tile programs over
+  linear layouts, lowered to `mma.sync`/`wgmma` on CUDA sm_80+ and to WMMA/MFMA
+  on AMD RDNA3/3.5/4 and CDNA3, interpreted on the host for tests, and tuned
+  per shape and device on first use with an on-disk store. Measured on sm_86,
+  sm_90, sm_120, gfx1151, gfx1201 and gfx942. Models call them through an op
+  layer that always returns a tensor and builds the graph where no kernel
+  applies. See
   [Tile kernels](https://svod.vpermilp.online/docs/tile-kernels/overview).
-
-  ```rust
-  fn micro_matmul(ker: &Kernel) -> Arc<UOp> {
-      let w = ker.warp();
-      let a = ker.rt((64, 64), DType::BFloat16, Row, RT_16X16);
-      let b = ker.rt((64, 64), DType::BFloat16, Col, RT_16X16);
-      let c = ker.rt((64, 64), DType::Float32, Col, RT_16X16);
-      let out = w.mma_ab(w.zero(c), &a, &b); // one matrix-core instruction per fragment
-      ker.finish(1)
-  }
-  ```
 - **Kernel search**: hand-written heuristics, or BEAM search over the
   optimization space with a persistent on-disk cache. See
   [Kernel search](https://svod.vpermilp.online/docs/architecture/optimizations/kernel-search).
@@ -183,7 +175,7 @@ Morok was Svod's earlier name.
 | [`device`](device/) | Buffers, allocators, mmap, KFD, CUDA and Metal drivers, hardware graphs |
 | [`runtime`](runtime/) | Kernel compilation, caching, execution plans and the profiler |
 | [`tensor`](tensor/) | Lazy tensor API, `nn` modules and the memory planner |
-| [`tk`](tk/) | Tile kernel DSL and kernel library |
+| [`tk`](tk/) | Tile language, kernel library, planner and tuner behind the op layer |
 | [`onnx`](onnx/) | ONNX importer |
 | [`arch`](arch/) | Host-side decoders, VAD segmentation and audio pipelines |
 | [`model`](model/) | Pretrained models and examples |
@@ -263,8 +255,7 @@ CPU kernels.
 - **AOT compilation:** serialize optimized graphs and compiled kernels, so a
   model starts instantly and runs where no compiler is available (e.g. WASM).
 - **Data analysis primitives:** FlashAttention-style GPU kernels for k-means,
-  kNN, PCA, SVD, (H)DBSCAN, UMAP and t-SNE on every backend. k-means and kNN
-  already ship in `tk`.
+  kNN, PCA, SVD, (H)DBSCAN, UMAP and t-SNE on every backend.
 - **Formal verification of generated code:** annotated C output that proves
   the absence of out-of-bounds accesses and lossy casts.
 - **More hardware:** server (MI300–MI450, H100–B200), consumer (Ryzen AI,

@@ -28,6 +28,7 @@ fn make_config(conv_norm: ConvNormType) -> GigaAmConfig {
         max_encoder_frames: 5000,
         decoder: CtcDecoder::Greedy(GreedyDecoder::new(Vec::new())),
         transducer: None,
+        streaming: None,
     }
 }
 

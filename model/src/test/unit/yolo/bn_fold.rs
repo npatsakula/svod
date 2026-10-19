@@ -1,10 +1,10 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Module, StateDict};
+use svod_tensor::nn::{BatchNorm2d, Layer, Module, StateDict};
 use test_case::test_case;
 
-use crate::yolo::YoloConv;
 use crate::yolo::loader::fold_batchnorm;
+use crate::yolo::{YOLO_BN_EPS, YoloConv};
 
 fn ramp(n: usize, scale: f32, offset: f32) -> Vec<f32> {
     (0..n).map(|i| ((i * 7919 % 97) as f32 / 97.0 - 0.5) * scale + offset).collect()
@@ -24,22 +24,52 @@ pub(super) fn unfolded_state(cin: usize, cout: usize, k: usize) -> StateDict {
     sd
 }
 
-/// Folding is value-preserving: the biased conv alone reproduces conv + norm.
+/// The graph's conv, then the norm and the activation, over the NHWC map `x`:
+/// what a block computes from an unfolded checkpoint.
+fn conv_then_norm(sd: &StateDict, x: &Tensor, act: bool) -> Vec<f32> {
+    let k = sd["conv.weight"].dim_const(2).unwrap();
+    let p = (k / 2) as isize;
+    let y = x.try_permute(&[0, 3, 1, 2]).unwrap().conv2d().weight(&sd["conv.weight"]).padding(&[(p, p), (p, p)]).call();
+    let norm = BatchNorm2d::new(
+        sd["bn.weight"].clone(),
+        sd["bn.bias"].clone(),
+        sd["bn.running_mean"].clone(),
+        sd["bn.running_var"].clone(),
+        YOLO_BN_EPS,
+    );
+    let y = norm.forward(&y.unwrap()).unwrap();
+    let y = if act { y.silu().unwrap() } else { y };
+    y.try_permute(&[0, 2, 3, 1]).unwrap().contiguous().to_vec::<f32>().unwrap()
+}
+
+/// Folding is value-preserving, whether the loader folds the checkpoint or the
+/// block folds the norm it was handed: both reproduce conv + norm.
 #[test_case(4, 8, 3, true; "3x3 with activation")]
+#[test_case(16, 8, 1, false; "1x1 without")]
 fn a_folded_conv_matches_conv_then_norm(cin: usize, cout: usize, k: usize, act: bool) {
     let sd = unfolded_state(cin, cout, k);
-    let mut plain = YoloConv::empty(cin, cout, k, 1, act);
-    plain.load_state_dict(&sd, "").unwrap();
-    let mut folded = YoloConv::empty(cin, cout, k, 1, act);
-    folded.load_state_dict(&fold_batchnorm(&sd).unwrap(), "").unwrap();
-    assert!(folded.conv.bias.is_some(), "the fold leaves a bias on the conv");
-    assert!(plain.conv.bias.is_none());
+    let x = Tensor::from_slice(ramp(cin * 25, 2.0, 0.1)).try_reshape([1, 5, 5, cin as isize]).unwrap();
+    let want = conv_then_norm(&sd, &x, act);
+    for (path, state) in [("block", sd.clone()), ("loader", fold_batchnorm(&sd).unwrap())] {
+        let mut conv = YoloConv::empty(cin, cout, k, 1, act);
+        conv.load_state_dict(&state, "").unwrap();
+        let got = conv.forward(&x).unwrap().to_vec::<f32>().unwrap();
+        let max = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(max < 1e-5, "the {path} fold drifts by {max}");
+    }
+}
 
-    let x = Tensor::from_slice(ramp(cin * 25, 2.0, 0.1)).try_reshape([1, cin as isize, 5, 5]).unwrap();
-    let want = plain.forward(&x).unwrap().to_vec::<f32>().unwrap();
-    let got = folded.forward(&x).unwrap().to_vec::<f32>().unwrap();
-    let max = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-    assert!(max < 1e-5, "folded conv drifts by {max}");
+/// A conv that carries a bias is already normalized: its own state dict, folded
+/// again, would apply the norm twice.
+#[test]
+fn a_biased_conv_is_not_folded_again() {
+    let mut conv = YoloConv::empty(4, 8, 3, 1, true);
+    conv.load_state_dict(&unfolded_state(4, 8, 3), "").unwrap();
+    let sd = conv.state_dict("");
+    let refolded = fold_batchnorm(&sd).unwrap();
+    for key in ["conv.weight", "conv.bias"] {
+        assert!(std::sync::Arc::ptr_eq(&sd[key].uop(), &refolded[key].uop()), "{key} is handed straight through");
+    }
 }
 
 /// Only a `conv.weight` with a full `bn.*` beside it folds; anything else, such
@@ -57,19 +87,6 @@ fn the_fold_leaves_other_keys_alone() {
     for key in ["bn.weight", "bn.running_var", "head.2.weight", "lone.conv.weight"] {
         assert!(std::sync::Arc::ptr_eq(&sd[key].uop(), &folded[key].uop()), "{key} is handed straight through");
     }
-}
-
-/// The tk convolution is asked for where the kernel says it is worth asking on
-/// the channel counts — a lattice tile serves them and K clears the floor
-/// ([`svod_tk::conv2d_nhwc_worth_asking`]) — and the block is one the model
-/// routes there: dense, and not a 1x1. A block that fails keeps the graph path
-/// rather than paying for a layout change that buys nothing.
-#[test_case(192, 192, 3, true; "192 channels, 3x3")]
-#[test_case(768, 768, 1, false; "a 1x1 stays on the graph")]
-fn the_tk_flag_follows_what_the_kernel_can_tile(cin: usize, cout: usize, k: usize, eligible: bool) {
-    let conv = YoloConv::empty(cin, cout, k, 1, true);
-    assert_eq!(conv.tk_eligible(), eligible);
-    assert_eq!(conv.tk().tk, eligible, "the flag is set only where the kernel can serve");
 }
 
 /// The rounding boundary of a narrow block: downstream of the convolution's
@@ -96,7 +113,7 @@ fn a_narrow_block_rounds_once_after_the_reduce(act: bool) {
     let mut conv = YoloConv::empty(4, 8, 3, 1, act);
     conv.load_state_dict(&sd, "").unwrap();
 
-    let x = Tensor::from_slice(ramp(4 * 25, 2.0, 0.1)).try_reshape([1, 4, 5, 5]).unwrap().cast(DType::Float16);
+    let x = Tensor::from_slice(ramp(4 * 25, 2.0, 0.1)).try_reshape([1, 5, 5, 4]).unwrap().cast(DType::Float16);
     let y = conv.forward(&x).unwrap();
     assert_eq!(y.dtype(), DType::Float16, "the block leaves at the stream's width");
 

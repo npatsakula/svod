@@ -40,7 +40,8 @@ without it the default is `METAL:0` on macOS and `CPU` elsewhere.
 | `SVOD_THREADS` | thread budget and default CPU kernel split (default: host parallelism) |
 | `SVOD_OBJECT_CACHE=0` / `SVOD_OBJECT_CACHE_DIR` | disable / relocate the on-disk object cache |
 | `SVOD_CUDA_PTXAS=0` | hand PTX to the driver JIT even when `ptxas` is installed |
-| `SVOD_DUMP_AMD_IR` / `SVOD_DUMP_NVPTX_IR` | directory that receives each kernel's LLVM IR |
+| `SVOD_DUMP_AMD_IR` / `SVOD_DUMP_NVPTX_IR` | directory that receives each kernel's LLVM IR as `<arch>_<kernel>_<ir digest>.ll`, cached or compiled |
+| `SVOD_DUMP_AMD_ASM` | directory that receives each AMD kernel's AMDGCN assembly under the same stem, `.s` |
 
 The `dlopen-fallback` feature loads C-path kernels as shared libraries through
 `dlopen` instead of the in-memory ELF loader.

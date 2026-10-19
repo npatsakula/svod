@@ -3,7 +3,7 @@
 //! Tokenization is the caller's: rows are the ids the reference tokenizer
 //! produces, each ending in its end-of-text token. Rows are taken longest
 //! first, `max_batch` plan rows at a time, into the smallest length bucket
-//! (a multiple of the flash-attention tile, up to `max_len`) that holds the
+//! (a multiple of [`SEQUENCE_TILE`], up to `max_len`) that holds the
 //! longest of them; the shorter rows that follow fill the space left in each
 //! plan row (first fit), so a batch of short texts costs what its tokens do,
 //! not what `max_batch` full rows would. Each bucket compiles once, on first
@@ -21,6 +21,7 @@ use crate::jit::InputSpec;
 use super::embedder::Qwen3Embedding;
 use super::error::Result;
 use super::jit::Qwen3EmbeddingJit;
+use super::model::SEQUENCE_TILE;
 
 /// Tokens of row capacity per pooled slot: a plan row of `bucket` tokens holds
 /// at most `bucket / SLOT_TOKENS` sequences.
@@ -41,7 +42,7 @@ fn pack(lens: &[usize], max_batch: usize) -> Vec<Batch> {
     pending.sort_by_key(|&i| std::cmp::Reverse(lens[i]));
     let mut batches = Vec::new();
     while let Some(&longest) = pending.first() {
-        let bucket = lens[longest].next_multiple_of(svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE);
+        let bucket = lens[longest].next_multiple_of(SEQUENCE_TILE);
         let slots = bucket / SLOT_TOKENS;
         let (mut fill, mut rows) = (vec![0usize; max_batch], vec![Vec::new(); max_batch]);
         pending.retain(|&i| {
@@ -69,10 +70,10 @@ pub struct Qwen3Embedder {
 }
 
 impl Qwen3Embedder {
-    /// `max_len` is rounded up to a whole flash-attention tile; longer rows
+    /// `max_len` is rounded up to a whole [`SEQUENCE_TILE`]; longer rows
     /// are truncated to it.
     pub fn new(model: Qwen3Embedding, max_batch: usize, max_len: usize) -> Self {
-        let max_len = max_len.max(1).next_multiple_of(svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE);
+        let max_len = max_len.max(1).next_multiple_of(SEQUENCE_TILE);
         let pad_id = model.model.config.pad_token_id as i32;
         Self { model, max_batch: max_batch.max(1), max_len, pad_id, plans: BTreeMap::new() }
     }

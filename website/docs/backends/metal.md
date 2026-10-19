@@ -23,9 +23,10 @@ and `codegen/src/c/metal.rs` (the dialect).
 ## Status
 
 The backend landed in September 2026 and has been exercised on one hardware
-family: **Apple9** (M3/M4 class) under macOS 26, where the tensor suite, the
-ONNX suite and the `tk` hardware tests are green, and flash attention and GEMM
-run through `simdgroup_matrix`. The paths written for older systems (the public
+family: **Apple9** (M3/M4 class) under macOS 26, where the tensor suite and the
+ONNX suite are green. Metal runs graph kernels only: tk's Apple target is a
+`simdgroup` atom with no kernels ([Tile kernels](../tile-kernels/overview.md)).
+The paths written for older systems (the public
 `newLibraryWithSource:` compile fallback, the pre-Apple9 indirect-command-buffer
 workaround, the `metal3.x` / `metal2.0` language standards) are implemented but
 not validated on such hardware. Hardware tests self-skip when no Metal device is
@@ -109,9 +110,10 @@ shared test tolerances hold.
 **Tensor cores.** `Wmma` lowers to a per-shape helper over `simdgroup_<T>8x8`
 and `simdgroup_multiply_accumulate`: one shape, 8×8×8 over 32 threads with two
 elements per lane, for f32→f32, f16→f32, f16→f16, bf16→f32 and bf16→bf16
-(`METAL_888` in the optimizer profile). `tk` adds `simd_shuffle`,
-`simd_shuffle_xor` and `simdgroup_barrier` builders (`codegen/src/c/metal.rs`),
-which is what the Apple flash-attention and GEMM kernels are built from.
+(`METAL_888` in the optimizer profile). The dialect also exports
+`simd_shuffle`, `simd_shuffle_xor` and `simdgroup_barrier` builders for hand
+kernels (`codegen/src/c/metal.rs`); tk's emitter lowers an Apple lane move to
+`simd_shuffle_xor`, but no tk kernel runs on Apple yet.
 
 ---
 

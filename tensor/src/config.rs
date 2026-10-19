@@ -63,6 +63,12 @@ pub struct PrepareConfig {
     /// that need to compare cache-warm vs cache-cold outputs without mutating
     /// process-global env state.
     pub disable_schedule_cache: bool,
+    /// Record nothing this prepare builds: the schedule, optimized-kernel
+    /// and compiled-program caches are read but not written. For a plan
+    /// that runs once and never again under the same key (a tuner's
+    /// candidate on scratch buffers), which would otherwise stay in the
+    /// process's caches for its life.
+    pub ephemeral: bool,
     /// Allocate the plan's OUTPUT buffers device-local (`cpu_access: false`)
     /// on backends that support it. The host then reads results via `copyout`
     /// (staged over the copy engine — SDMA on AMD, ~PCIe speed) instead of
@@ -96,6 +102,7 @@ impl Default for PrepareConfig {
             resolver: Arc::new(EnvResolver),
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
+            ephemeral: false,
             device_local_outputs: false,
             threads: svod_schedule::thread_budget(),
         }
@@ -110,6 +117,7 @@ impl PrepareConfig {
             resolver: Arc::new(EnvResolver),
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
+            ephemeral: false,
             device_local_outputs: false,
             threads: svod_schedule::thread_budget(),
         }
@@ -134,6 +142,7 @@ impl PrepareConfig {
             resolver: Arc::new(CpuBackendResolver(backend)),
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
+            ephemeral: false,
             device_local_outputs: false,
             threads: svod_schedule::thread_budget(),
         }
@@ -224,6 +233,7 @@ impl From<OptimizerConfig> for PrepareConfig {
             resolver: Arc::new(EnvResolver),
             planner_mode: crate::memory_planner::mode_from_env(),
             disable_schedule_cache: false,
+            ephemeral: false,
             device_local_outputs: false,
             threads: svod_schedule::thread_budget(),
         }

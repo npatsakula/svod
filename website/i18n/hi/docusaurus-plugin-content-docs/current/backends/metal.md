@@ -22,8 +22,9 @@ code `device/src/metal/` (device, allocator, compile, program, graph, Metal 4 pr
 ## स्थिति
 
 बैकएंड सितंबर 2026 में आया और इसे एक hardware family पर परखा गया है: macOS 26 के अंतर्गत
-**Apple9** (M3/M4 class), जहाँ tensor suite, ONNX suite और `tk` hardware tests green हैं,
-और flash attention व GEMM `simdgroup_matrix` के माध्यम से चलते हैं। पुराने systems के लिए
+**Apple9** (M3/M4 class), जहाँ tensor suite और ONNX suite green हैं। Metal केवल graph
+कर्नेल चलाता है: tk का Apple target बिना कर्नेल का एक `simdgroup` atom है
+([Tile कर्नेल](../tile-kernels/overview.md))। पुराने systems के लिए
 लिखे गए paths (public `newLibraryWithSource:` compile fallback, pre-Apple9
 indirect-command-buffer workaround, `metal3.x` / `metal2.0` language standards) implement
 किए गए हैं पर ऐसे hardware पर validated नहीं हैं। कोई Metal डिवाइस मौजूद न होने पर hardware
@@ -106,8 +107,9 @@ off है (`-fno-fast-math`, या public path पर `MTLMathModeSafe`) त�
 **Tensor cores.** `Wmma` `simdgroup_<T>8x8` और `simdgroup_multiply_accumulate` के ऊपर एक
 प्रति-shape helper में lower होता है: एक shape, 32 threads पर 8×8×8, प्रति लेन दो elements,
 f32→f32, f16→f32, f16→f16, bf16→f32 और bf16→bf16 के लिए (optimizer profile में
-`METAL_888`)। `tk` `simd_shuffle`, `simd_shuffle_xor` और `simdgroup_barrier` builders जोड़ता
-है (`codegen/src/c/metal.rs`), और Apple flash-attention व GEMM कर्नेल इन्हीं से बने हैं।
+`METAL_888`)। Dialect hand kernels के लिए `simd_shuffle`, `simd_shuffle_xor` और
+`simdgroup_barrier` builders भी export करता है (`codegen/src/c/metal.rs`); tk का emitter
+Apple पर lane move को `simd_shuffle_xor` में lower करता है, पर अभी कोई tk कर्नेल Apple पर नहीं चलता।
 
 ---
 

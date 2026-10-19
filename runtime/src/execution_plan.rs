@@ -463,9 +463,10 @@ pub struct ExecutionPlan {
     /// carries over to replicas.
     input_buffer_indices: HashSet<usize>,
 
-    /// One representative buffer index per distinct storage (arena views
-    /// share one storage), for scoped-sync completion-token recording.
-    distinct_storage_indices: Vec<usize>,
+    /// Indices of the buffers the plan writes. Indices, not storages: a
+    /// buffer rebound through [`Self::buffer_at_mut`] keeps its role, and
+    /// [`Self::storage_accesses`] resolves storages at every execute.
+    written_indices: Vec<usize>,
 
     /// Primary device for this plan.
     device: DeviceSpec,
@@ -1338,6 +1339,7 @@ impl ExecutionPlan {
         // an unknown state, so it must not stay retryable.
         let result = (|| {
             let graph = self.graph_endpoints_match_device()?.then(|| self.graph()).and_then(|graph| graph.as_deref());
+            self.order_after_other_plans(graph)?;
             if graph.is_none()
                 && matches!(self.replay_native_linked_plan()?, svod_device::device::NativeReplayOutcome::Executed)
             {
@@ -1441,7 +1443,9 @@ impl ExecutionPlan {
             let linked = self.hcq_linked.get().expect("HCQ plan linked by builder");
 
             let use_graph = !per_dispatch && self.graph_endpoints_match_device()?;
-            if let Some(graph) = use_graph.then(|| self.graph()).and_then(|graph| graph.as_deref()) {
+            let graph = use_graph.then(|| self.graph()).and_then(|graph| graph.as_deref());
+            self.order_after_other_plans(graph)?;
+            if let Some(graph) = graph {
                 let mut buffers = Vec::new();
                 let mut vals = Vec::new();
                 let mut kernels = Vec::new();
@@ -1701,24 +1705,36 @@ impl ExecutionPlan {
     /// custom-function arguments (no outs list — conservatively all written,
     /// mirroring `hcq_operations`), and the plan's declared outputs.
     fn written_storage_ids(&self) -> HashSet<BufferId> {
-        let storage = |index: &usize| self.buffers.get(*index).map(Buffer::storage_id);
-        let mut written: HashSet<BufferId> = self.output_buffer_indices.iter().filter_map(storage).collect();
-        for op in &self.ops {
+        self.written_indices.iter().filter_map(|&index| self.buffers.get(index).map(Buffer::storage_id)).collect()
+    }
+
+    /// The indices [`Self::written_storage_ids`] resolves, from the ops.
+    fn written_indices(ops: &[PreparedOp], outputs: &[usize]) -> Vec<usize> {
+        let mut written: Vec<usize> = outputs.to_vec();
+        for op in ops {
             match op {
-                PreparedOp::CompiledProgram(kernel) => written.extend(
-                    kernel
-                        .output_indices
-                        .iter()
-                        .filter_map(|&position| kernel.buffer_indices.get(position))
-                        .filter_map(storage),
-                ),
-                PreparedOp::BufferCopy(copy) => written.extend(copy.buffer_indices.first().and_then(storage)),
-                PreparedOp::CustomFunction(custom) => {
-                    written.extend(custom.buffer_indices.iter().filter_map(storage));
-                }
+                PreparedOp::CompiledProgram(kernel) => written
+                    .extend(kernel.output_indices.iter().filter_map(|&position| kernel.buffer_indices.get(position))),
+                PreparedOp::BufferCopy(copy) => written.extend(copy.buffer_indices.first()),
+                PreparedOp::CustomFunction(custom) => written.extend(&custom.buffer_indices),
             }
         }
+        written.sort_unstable();
+        written.dedup();
         written
+    }
+
+    /// Every distinct storage the plan touches (arena views share one) and
+    /// whether it writes it, from the buffers bound now: the scoped-sync
+    /// token recording and cross-context ordering.
+    fn storage_accesses(&self) -> SmallVec<[(&Buffer, bool); 16]> {
+        let written = self.written_storage_ids();
+        let mut seen = HashSet::new();
+        self.buffers
+            .iter()
+            .filter(|buffer| seen.insert(buffer.storage_id()))
+            .map(|buffer| (buffer, written.contains(&buffer.storage_id())))
+            .collect()
     }
 
     /// Declare the buffer at `index` a host-written input: [`Self::replicate`]
@@ -1744,10 +1760,30 @@ impl ExecutionPlan {
     /// tokens (CPU) and on plans whose context was never minted.
     fn record_completion_token(&self, token: Option<std::sync::Arc<dyn svod_device::CompletionToken>>) {
         let Some(token) = token else { return };
-        for &index in &self.distinct_storage_indices {
-            self.buffers[index].record_completion(&token);
+        for (buffer, writes) in self.storage_accesses() {
+            buffer.record_completion(&token, writes);
         }
         token.published();
+    }
+
+    /// Order this epoch's submissions after other plans' in-flight work on
+    /// the storages it touches (a backend whose plans get their own queue
+    /// does not order them otherwise), on the queue they go to: the graph's
+    /// when it replays, else the plan context of the first kernel on the
+    /// plan's device.
+    fn order_after_other_plans(&self, graph: Option<&dyn svod_device::Graph>) -> Result<()> {
+        let accesses = self.storage_accesses();
+        if let Some(graph) = graph {
+            return graph.order_after(&accesses).context(ExecSnafu { context: "order graph after other plans" });
+        }
+        let program = self.ops.iter().find_map(|op| match op {
+            PreparedOp::CompiledProgram(kernel) if kernel.device == self.device => Some(kernel.kernel.program.as_ref()),
+            _ => None,
+        });
+        match program.map(|program| self.plan_ctx(program)).transpose()?.flatten() {
+            Some(ctx) => ctx.order_after(&accesses).context(ExecSnafu { context: "order plan after other plans" }),
+            None => Ok(()),
+        }
     }
 
     /// Deep-copy the plan for concurrent execution. Fork policy per storage:
@@ -2008,16 +2044,7 @@ impl ExecutionPlanBuilder {
             });
         }
 
-        // One representative buffer index per distinct storage, for scoped-sync
-        // token recording on execute.
-        let mut seen_storages = HashSet::new();
-        let distinct_storage_indices: Vec<usize> = self
-            .buffers
-            .iter()
-            .enumerate()
-            .filter(|(_, buffer)| seen_storages.insert(buffer.storage_id()))
-            .map(|(index, _)| index)
-            .collect();
+        let written_indices = ExecutionPlan::written_indices(&self.ops, &self.output_buffer_indices);
 
         let op_order = compute_mixed_op_order_with_instance_dependencies(&self.ops, &self.op_instance_dependencies)?;
         let op_levels = compute_execution_levels_with_instance_dependencies(&self.ops, &self.op_instance_dependencies)?;
@@ -2031,7 +2058,7 @@ impl ExecutionPlanBuilder {
             ast_to_buffer: self.ast_to_buffer,
             output_buffer_indices: self.output_buffer_indices,
             input_buffer_indices: HashSet::new(),
-            distinct_storage_indices,
+            written_indices,
             device: self.device,
             runtime_var_vals: HashMap::new(),
             graph: std::sync::OnceLock::new(),

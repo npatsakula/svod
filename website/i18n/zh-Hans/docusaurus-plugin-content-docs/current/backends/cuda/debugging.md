@@ -15,7 +15,7 @@ sidebar_label: 调试
 | 变量 | 默认 | 效果 |
 |---|---|---|
 | `SVOD_DEVICE` | `CPU`（macOS 上为 `METAL:0`） | `CUDA:N`（别名 `GPU`）选择默认的张量设备；`NV` *不是*别名，它留给未来的用户态驱动 |
-| `SVOD_DUMP_NVPTX_IR` | 未设置 | 接收每个内核 NVPTX LLVM IR 的目录，文件名为 `sm_XY_<kernel>.ll` |
+| `SVOD_DUMP_NVPTX_IR` | 未设置 | 接收每个内核 NVPTX LLVM IR 的目录，文件名为 `sm_XY_<kernel>_<digest>.ll` |
 | `SVOD_CUDA_PTXAS` | 开 | `0` 跳过 `ptxas` 的预汇编，把 PTX 文本交给驱动 JIT |
 | `SVOD_CUDA_SCOPED_SYNC` | 开 | `0` 把每一次带作用域的等待换成一次完整的 `cuCtxSynchronize`，并让复制变为同步（[架构](./architecture.md)） |
 | `SVOD_CUDA_CUPTI` | 开 | `0` 跳过加载 `libcupti.so.13`，于是没有硬件计数器 |
@@ -94,7 +94,7 @@ SVOD_DUMP_NVPTX_IR=/tmp/nvptx SVOD_DEVICE=CUDA:0 cargo test -p svod-tensor -- so
 
 # Reproduce the exact compile, then assemble with ptxas to see the real diagnostics
 clang -x ir -S -O3 --target=nvptx64-nvidia-cuda -march=sm_86 --cuda-feature=+ptx78 \
-      -Wno-override-module /tmp/nvptx/sm_86_r_64_32.ll -o r_64_32.ptx
+      -Wno-override-module /tmp/nvptx/sm_86_r_64_32_<digest>.ll -o r_64_32.ptx
 ptxas -arch=sm_86 -v r_64_32.ptx -o r_64_32.cubin   # -v prints registers, shared, spills
 nvdisasm r_64_32.cubin | less                         # the SASS
 ```

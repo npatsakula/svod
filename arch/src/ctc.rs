@@ -135,6 +135,23 @@ impl GreedyDecoder {
         self.decode_inner(log_probs, stride_frames, valid_frames, true)
     }
 
+    /// The greedy collapse of one run of per-frame argmax `labels` continuing
+    /// a stream: a label is emitted when it is neither the blank nor the label
+    /// before it, `prev` carrying the last label across runs (the blank to
+    /// start). Returns `(token id, index into labels)` pairs; a label past the
+    /// vocabulary is dropped like the blank.
+    pub fn collapse(&self, labels: &[usize], prev: &mut usize) -> Vec<(usize, usize)> {
+        let blank = self.blank_id();
+        let mut out = Vec::new();
+        for (i, &label) in labels.iter().enumerate() {
+            if label < blank && label != *prev {
+                out.push((label, i));
+            }
+            *prev = label;
+        }
+        out
+    }
+
     fn decode_inner(
         &self,
         log_probs: &[f32],

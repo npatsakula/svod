@@ -1,5 +1,5 @@
 use svod_dtype::{AddrSpace, AmdArch, DType};
-use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
+use svod_ir::{AxisId, AxisType, BarrierFence, BinaryOp, ConstValue, Op, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 
 use super::*;
 use crate::Renderer;
@@ -183,7 +183,11 @@ fn amd_loops_indexing_registers_stay_unhinted() {
 // These exercise the AMDLLVMRenderer codegen path; `assert_amd_ir_compiles`
 // hands the result to clang-amdgcn where a host toolchain is available.
 
-fn render_amd_linearized(root: &std::sync::Arc<svod_ir::UOp>, arch: AmdArch, name: &str) -> crate::RenderedKernel {
+pub(crate) fn render_amd_linearized(
+    root: &std::sync::Arc<svod_ir::UOp>,
+    arch: AmdArch,
+    name: &str,
+) -> crate::RenderedKernel {
     let code_renderer = LlvmTextRenderer::amd(arch);
     let optimizer_renderer = svod_schedule::OptimizerRenderer::for_amd_arch(arch).with_rewrite_capabilities(
         svod_ir::RendererOps::all(),
@@ -293,19 +297,31 @@ fn amd_special_emits_workgroup_workitem_intrinsics() {
     }
 }
 
-#[test]
-fn amd_barrier_emits_fence_and_s_barrier() {
-    let barrier = UOp::noop().barrier(smallvec::SmallVec::new());
+/// A graph barrier's fences order every address space; an LDS-only one's
+/// carry the MMRA that keeps RDNA's release fence from waiting for global
+/// loads, inline, so the module needs no metadata node of its own.
+#[test_case::test_case(BarrierFence::All, ""; "graph")]
+#[test_case::test_case(BarrierFence::Local, ", !mmra !{!\"amdgpu-synchronize-as\", !\"local\"}"; "lds only")]
+fn amd_barrier_emits_fence_and_s_barrier(fence: BarrierFence, mmra: &str) {
+    let barrier = UOp::noop().fenced_barrier(smallvec::SmallVec::new(), fence);
     let result = render_amd_linearized(&UOp::sink(vec![barrier]), AmdArch::Gfx1100, "amd_barrier");
 
-    for needle in [
-        "fence syncscope(\"workgroup\") release",
-        "call void @llvm.amdgcn.s.barrier()",
-        "fence syncscope(\"workgroup\") acquire",
-        "declare void @llvm.amdgcn.s.barrier()",
-    ] {
-        assert!(result.code.contains(needle), "missing {needle}:\n{}", result.code);
-    }
+    let lines: Vec<&str> = result.code.lines().map(str::trim).collect();
+    let release = format!("fence syncscope(\"workgroup\") release{mmra}");
+    let at = lines.iter().position(|l| *l == release).unwrap_or_else(|| panic!("missing {release}:\n{}", result.code));
+    assert_eq!(
+        lines[at..at + 3],
+        [
+            release.as_str(),
+            "tail call void @llvm.amdgcn.s.barrier()",
+            &format!("fence syncscope(\"workgroup\") acquire{mmra}")
+        ],
+        "{}",
+        result.code
+    );
+    assert!(result.code.contains("declare void @llvm.amdgcn.s.barrier()"), "{}", result.code);
+    assert_eq!(result.code.contains("!mmra"), !mmra.is_empty(), "{}", result.code);
+    assert_llvm_ir_assembles(&result.code);
 }
 
 #[test]
@@ -567,7 +583,7 @@ fn assert_llvm_ir_assembles(ir: &str) {
 /// As above, but through `clang --target=amdgcn-amd-amdhsa`, which also runs
 /// instruction selection. Returns without asserting when the host clang has no
 /// AMDGPU target.
-fn assert_amd_ir_compiles(ir: &str, arch: &str) {
+pub(crate) fn assert_amd_ir_compiles(ir: &str, arch: &str) {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -648,6 +664,26 @@ fn custom_void_hoists_and_deduplicates_declares_into_the_module_prefix() {
         result.code
     );
     assert!(result.code.contains("call void @llvm.amdgcn.s.barrier()"), "missing call body line:\n{}", result.code);
+}
+
+/// A module global a CUSTOM defines (`@name = ...`) is hoisted to the module
+/// prefix once however many customs define it, its body left an instruction
+/// that names it; clang takes the module.
+#[test]
+fn custom_hoists_and_deduplicates_a_module_global() {
+    let global = "@zeros = internal unnamed_addr addrspace(1) constant [4 x i32] zeroinitializer, align 16";
+    let code = format!("{global}\nload i32, ptr addrspace(1) @zeros, align 16");
+    let read = || UOp::custom(smallvec::SmallVec::new(), code.clone(), DType::Int32);
+    let out = |slot: usize| {
+        let idx = UOp::const_(DType::Int32, ConstValue::Int(slot as i64));
+        UOp::index().buffer(UOp::param(0, 2, DType::Int32, None)).indices(vec![idx]).call().unwrap()
+    };
+    let sink = UOp::sink(vec![out(0).store(read()), out(1).store(read().try_add(&read()).unwrap())]);
+    let result = render_amd_linearized(&sink, AmdArch::Gfx1201, "custom_global");
+    assert_eq!(result.code.matches(global).count(), 1, "the global must be hoisted exactly once:\n{}", result.code);
+    let body = result.code.split("define ").nth(1).expect("a kernel body");
+    assert!(body.contains("= load i32, ptr addrspace(1) @zeros"), "missing the body's load:\n{}", result.code);
+    assert_amd_ir_compiles(&result.code, "gfx1201");
 }
 
 /// Sin must never reach the AMD renderer: the device excludes it from

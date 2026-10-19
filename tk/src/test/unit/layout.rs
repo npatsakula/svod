@@ -1,305 +1,197 @@
-//! [`LaneMap`] tests: the `mma.sync.m16n8k16` A/B/C lane tables from
-//! `fa_cuda_references.md` §(a) verbatim, the lane×register → row×col bijection of
-//! every layout/orientation/arch, and the reduce plan (slots, slot assignment,
-//! cross-lane tree, folded axis) cross-checked against a brute-force evaluation of
-//! the integer map — plus the guarantee that the UOp evaluation of the map folds to
-//! the same integers.
+//! F2 layout tests: the tk1 `LaneMap::rc` closed forms (ported verbatim below) and the
+//! `mma.sync`/Apple lane tables against every atom, exhaustively; the reduce butterfly
+//! against a brute-force partner search; the algebra laws as properties.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
-use svod_dtype::{AmdArch, CudaArch, GpuArch};
-use svod_ir::UOp;
+use svod_dtype::AmdArch;
 use test_case::test_case;
 
-use crate::ArchCaps;
-use crate::arch::FragRole;
-use crate::index::Idx;
-use crate::layout::{LaneMap, LdmatrixX4, ReduceTree};
-use crate::tiles::{
-    RT_8X8_SIMD, RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN,
-    RTBaseShape,
-};
+use crate::layout::Dim::{self, Col, Lane, Reg, Row, Warp};
+use crate::layout::*;
 
-const SM_86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
+/// tk1 `LaneMap`, the integer half of `rc` copied from tk1's
+/// `tk/src/layout.rs` before the crate's removal.
+#[derive(Clone, Copy, Debug)]
+enum LaneMap {
+    Strided { stride: i64 },
+    Interleaved,
+    InterleavedT,
+    MmaSync,
+    SimdgroupMatrix,
+    SimdgroupMatrixT,
+}
 
-/// Every matrix-core fragment tk resolves a role to, with its wave size.
-/// (The `RT_32X32`/`RT_16X32`/`RT_32X16` constants are unused tinygrad carry-overs
-/// whose stride-4 map does not cover a 32-wide fragment; no kernel builds on them.)
-fn all_frags() -> Vec<(RTBaseShape, usize, &'static str)> {
+fn lane_map_rc(map: LaneMap, transpose: bool, lane: i64, rows: i64, cols: i64, j: i64) -> (i64, i64) {
+    match map {
+        LaneMap::Strided { stride } => {
+            if transpose {
+                ((lane / cols) * stride + j, lane % cols)
+            } else {
+                (lane % rows, (lane / rows) * stride + j)
+            }
+        }
+        LaneMap::Interleaved => (j * 2 + lane / cols, lane % cols),
+        LaneMap::InterleavedT => (lane % cols, j * 2 + lane / cols),
+        LaneMap::MmaSync => {
+            let (g, t) = (lane / 4, lane % 4);
+            let (r, c) = (g + (j / 2) % 2 * 8, t * 2 + j % 2 + j / 4 * 8);
+            if transpose { (c, r) } else { (r, c) }
+        }
+        LaneMap::SimdgroupMatrix | LaneMap::SimdgroupMatrixT => {
+            let r = (lane / 16) % 2 * 4 + (lane / 2) % 4;
+            let c = (lane / 8) % 2 * 4 + lane % 2 * 2 + j;
+            if transpose ^ matches!(map, LaneMap::SimdgroupMatrixT) { (c, r) } else { (r, c) }
+        }
+    }
+}
+
+/// Every tk1 fragment (`all_frags` of the tk1 tests) with its F2 atom:
+/// `(name, atom, map, tk1 transpose flag, rows, cols, regs, lanes)`.
+type Frag = (&'static str, fn() -> Layout, LaneMap, bool, i64, i64, u32, u32);
+
+fn frags() -> Vec<Frag> {
     vec![
-        (RT_16X16, 64, "gfx942 RT_16X16"),
-        (RT_16X16_W32_ACC, 32, "gfx1151 acc"),
-        (RT_16X16_W32_IN, 32, "gfx1151 input"),
-        (RT_16X16_W32_ACC_T, 32, "gfx1151 acc_t"),
-        (RT_16X16_MMA, 32, "sm_86 mma.sync"),
-        (RT_8X8_SIMD, 32, "apple simdgroup_matrix"),
-        (RT_16X16_GFX12, 32, "gfx1201 wmma"),
+        ("gfx942 RT_16X16", mfma_16x16x16, LaneMap::Strided { stride: 4 }, false, 16, 16, 4, 64),
+        ("gfx942 RT_16X16 col", || mfma_16x16x16().transpose(), LaneMap::Strided { stride: 4 }, true, 16, 16, 4, 64),
+        ("gfx1151 acc", wmma_gfx11_acc, LaneMap::Interleaved, false, 16, 16, 8, 32),
+        ("gfx1151 acc_t", || wmma_gfx11_acc().transpose(), LaneMap::InterleavedT, false, 16, 16, 8, 32),
+        ("gfx1151 input", wmma_gfx11_input, LaneMap::Strided { stride: 0 }, false, 16, 16, 16, 32),
+        ("gfx1151 input col", || wmma_gfx11_input().transpose(), LaneMap::Strided { stride: 0 }, true, 16, 16, 16, 32),
+        ("gfx1201 wmma", wmma_gfx12, LaneMap::Strided { stride: 8 }, false, 16, 16, 8, 32),
+        ("gfx1201 wmma col", || wmma_gfx12().transpose(), LaneMap::Strided { stride: 8 }, true, 16, 16, 8, 32),
+        ("sm_86 mma.sync", mma_sync_16x16, LaneMap::MmaSync, false, 16, 16, 8, 32),
+        ("sm_86 mma.sync col", || mma_sync_16x16().transpose(), LaneMap::MmaSync, true, 16, 16, 8, 32),
+        ("apple simdgroup", simdgroup_8x8, LaneMap::SimdgroupMatrix, false, 8, 8, 2, 32),
+        ("apple simdgroup T", || simdgroup_8x8().transpose(), LaneMap::SimdgroupMatrixT, false, 8, 8, 2, 32),
     ]
 }
 
-/// The integer `(row, col)` of `(lane, j)` per the fragment map.
-fn rc(f: &RTBaseShape, transpose: bool, lane: usize, j: usize) -> (i64, i64) {
-    f.map.rc(transpose, &(lane as i64), f.base.rows as i64, f.base.cols as i64, &(j as i64))
+/// Every input of `l`: each assignment of its input dims.
+fn all_inputs(l: &Layout) -> Vec<Vec<(Dim, u32)>> {
+    let dims = [Reg, Lane, Warp, Dim::Block, Row, Col].into_iter().filter(|&d| l.in_bits(d) > 0);
+    dims.fold(vec![vec![]], |acc, d| {
+        acc.into_iter().flat_map(|v| (0..l.in_size(d)).map(move |x| [v.clone(), vec![(d, x)]].concat())).collect()
+    })
 }
 
-/// The `mma.sync` A-fragment table (`fa_cuda_references.md` §(a)): register `j` of
-/// lane `l` is `(g + 8·((j/2)%2), 2t + j%2 + 8·(j/4))` — the same map is the C
-/// fragment per n-half and, read transposed, the B fragments.
-#[test_case(0, [(0,0),(0,1),(8,0),(8,1),(0,8),(0,9),(8,8),(8,9)]; "lane 0")]
-#[test_case(1, [(0,2),(0,3),(8,2),(8,3),(0,10),(0,11),(8,10),(8,11)]; "lane 1")]
-#[test_case(3, [(0,6),(0,7),(8,6),(8,7),(0,14),(0,15),(8,14),(8,15)]; "lane 3")]
-#[test_case(4, [(1,0),(1,1),(9,0),(9,1),(1,8),(1,9),(9,8),(9,9)]; "lane 4")]
-#[test_case(13, [(3,2),(3,3),(11,2),(11,3),(3,10),(3,11),(11,10),(11,11)]; "lane 13")]
-#[test_case(18, [(4,4),(4,5),(12,4),(12,5),(4,12),(4,13),(12,12),(12,13)]; "lane 18")]
-#[test_case(27, [(6,6),(6,7),(14,6),(14,7),(6,14),(6,15),(14,14),(14,15)]; "lane 27")]
-#[test_case(31, [(7,6),(7,7),(15,6),(15,7),(7,14),(7,15),(15,14),(15,15)]; "lane 31")]
-fn mma_sync_a_fragment_rows(lane: usize, expect: [(i64, i64); 8]) {
-    let got: Vec<_> = (0..8).map(|j| rc(&RT_16X16_MMA, false, lane, j)).collect();
-    assert_eq!(got, expect);
+/// How many inputs of `l` hold each `(row, col)` they reach.
+fn holders(l: &Layout) -> BTreeMap<(u32, u32), usize> {
+    let mut held = BTreeMap::new();
+    for x in all_inputs(l) {
+        *held.entry(l.apply(&x)).or_insert(0) += 1;
+    }
+    held
 }
 
-/// All 32 lanes of the A table against the closed forms the table was generated
-/// from (`row = g + 8·v1, col = 2t + v0 + 8·v2`), and the C table: n-half `h` of a
-/// `Row` accumulator is registers `4h..4h+4` = `c0..c3` = `(g, 2t), (g, 2t+1),
-/// (g+8, 2t), (g+8, 2t+1)` at columns `8h + ..`.
+/// Whether `l` holds every element of its tile.
+pub(super) fn covers(l: &Layout) -> bool {
+    holders(l).len() == (l.out_size(Row) * l.out_size(Col)) as usize
+}
+
+/// Whether `l` holds every element of its tile exactly once.
+fn bijective(l: &Layout) -> bool {
+    covers(l) && holders(l).values().all(|&n| n == 1)
+}
+
+/// Mask of the input bits of `dim` that reach no output (replication).
+fn free_bits(l: &Layout, dim: Dim) -> u32 {
+    (0..l.in_bits(dim)).filter(|&b| l.basis(dim, b).iter().all(|o| o.1 == 0)).map(|b| 1 << b).sum()
+}
+
+/// Whether every lane of `dst` finds each of its elements in the same lane of `src`.
+fn in_lane(src: &Layout, dst: &Layout) -> bool {
+    (0..dst.in_size(Lane)).all(|lane| {
+        (0..dst.in_size(Reg)).all(|j| {
+            let want = dst.apply(&[(Lane, lane), (Reg, j)]);
+            (0..src.in_size(Reg)).any(|k| src.apply(&[(Lane, lane), (Reg, k)]) == want)
+        })
+    })
+}
+
+fn at(l: &Layout, lane: u32, j: u32) -> (i64, i64) {
+    let (r, c) = l.apply(&[(Lane, lane), (Reg, j)]);
+    (r.into(), c.into())
+}
+
+/// Each atom equals its tk1 closed form on every (lane, register) and covers the tile
+/// exactly `replication` times (RDNA's replicated input: lanes `L`, `L+16` identical,
+/// lane bit 4 free).
 #[test]
-fn mma_sync_a_and_c_tables() {
-    for lane in 0..32 {
-        let (g, t) = (lane as i64 >> 2, lane as i64 & 3);
-        for j in 0..8 {
-            let (v0, v1, v2) = (j as i64 % 2, (j as i64 / 2) % 2, j as i64 / 4);
-            assert_eq!(rc(&RT_16X16_MMA, false, lane, j), (g + 8 * v1, 2 * t + v0 + 8 * v2), "A lane {lane} a{j}");
+fn atoms_match_lane_map_closed_forms() {
+    for (name, atom, map, transpose, rows, cols, regs, lanes) in frags() {
+        let l = atom();
+        assert_eq!((l.in_size(Reg), l.in_size(Lane)), (regs, lanes), "{name}: input sizes");
+        assert_eq!((l.out_size(Row), l.out_size(Col)), (rows as u32, cols as u32), "{name}: tile");
+        let mut hits = vec![0u32; (rows * cols) as usize];
+        for lane in 0..lanes {
+            for j in 0..regs {
+                let want = lane_map_rc(map, transpose, lane.into(), rows, cols, j.into());
+                assert_eq!(at(&l, lane, j), want, "{name}: lane {lane} reg {j}");
+                hits[(want.0 * cols + want.1) as usize] += 1;
+            }
         }
-        for h in 0..2i64 {
-            let c: Vec<_> = (0..4).map(|k| rc(&RT_16X16_MMA, false, lane, (4 * h + k) as usize)).collect();
-            let want =
-                vec![(g, 2 * t + 8 * h), (g, 2 * t + 1 + 8 * h), (g + 8, 2 * t + 8 * h), (g + 8, 2 * t + 1 + 8 * h)];
-            assert_eq!(c, want, "C lane {lane} n-half {h}");
-        }
+        let replication = regs * lanes / (rows * cols) as u32;
+        assert!(hits.iter().all(|&h| h == replication), "{name}: every element held {replication} times");
+        let free = if replication == 2 { 16 } else { 0 };
+        assert_eq!((free_bits(&l, Lane), free_bits(&l, Reg)), (free, 0), "{name}: free bits");
     }
 }
 
-/// The B table (`k = 2t + v0 + 8·v1, n = g`, K×N): n-half `h` of a `Col`-read B tile
-/// is registers `{2h, 2h+1, 2h+4, 2h+5}` — `b0..b3` at `n = g + 8h`.
-#[test_case(0, [(0,0),(1,0),(8,0),(9,0)]; "lane 0")]
-#[test_case(1, [(2,0),(3,0),(10,0),(11,0)]; "lane 1")]
-#[test_case(7, [(6,1),(7,1),(14,1),(15,1)]; "lane 7")]
-#[test_case(12, [(0,3),(1,3),(8,3),(9,3)]; "lane 12")]
-#[test_case(22, [(4,5),(5,5),(12,5),(13,5)]; "lane 22")]
-#[test_case(31, [(6,7),(7,7),(14,7),(15,7)]; "lane 31")]
-fn mma_sync_b_fragment_rows(lane: usize, expect: [(i64, i64); 4]) {
-    for h in 0..2i64 {
-        let got: Vec<_> =
-            [2 * h, 2 * h + 1, 2 * h + 4, 2 * h + 5].map(|j| rc(&RT_16X16_MMA, true, lane, j as usize)).to_vec();
-        let want: Vec<_> = expect.iter().map(|&(k, n)| (k, n + 8 * h)).collect();
-        assert_eq!(got, want, "B lane {lane} n-half {h}");
-    }
-}
-
-/// The complete 32-lane B table, all four registers, against the closed form.
+/// The 16×16 tile is the C fragment tiled over one more register bit (n-half `h` =
+/// registers `4h..4h+4`), and B and C are bijections; where each places its elements
+/// is `atoms::atom_layouts_match_the_isa`'s PTX table.
 #[test]
-fn mma_sync_b_table() {
+fn mma_sync_tile_is_c_over_the_n_halves() {
+    let (b, c) = (mma_sync_b(), mma_sync_c());
+    for lane in 0..32u32 {
+        for h in 0..2 {
+            for k in 0..4 {
+                let (r, cc) = at(&c, lane, k);
+                assert_eq!(at(&mma_sync_16x16(), lane, 4 * h + k), (r, cc + 8 * i64::from(h)), "tile lane {lane}");
+            }
+        }
+    }
+    assert!(bijective(&b) && bijective(&c));
+}
+
+/// The transposed tile holds the two B fragments in registers `{0,1,4,5}` / `{2,3,6,7}`:
+/// a register permutation of B tiled over the n-halves.
+#[test]
+fn mma_sync_transposed_tile_is_two_b_fragments() {
+    let (halves, tile) = (mma_sync_b().product(&Layout::identity(Reg, 2, Col)), mma_sync_16x16().transpose());
     for lane in 0..32 {
-        let (g, t) = (lane as i64 >> 2, lane as i64 & 3);
-        for h in 0..2i64 {
-            for (b, j) in [2 * h, 2 * h + 1, 2 * h + 4, 2 * h + 5].into_iter().enumerate() {
-                let (v0, v1) = (b as i64 % 2, b as i64 / 2);
-                assert_eq!(
-                    rc(&RT_16X16_MMA, true, lane, j as usize),
-                    (2 * t + v0 + 8 * v1, g + 8 * h),
-                    "lane {lane} b{b}"
-                );
-            }
+        for (j, from) in [0, 1, 4, 5, 2, 3, 6, 7].into_iter().enumerate() {
+            assert_eq!(at(&halves, lane, j as u32), at(&tile, lane, from), "lane {lane} register {j}");
         }
     }
 }
 
-/// The legacy AMD maps are unchanged: gfx942 `row = L%16, col = (L/16)·4 + j` (and
-/// its transpose), the RDNA even/odd accumulator `row = 2j + L/16, col = L%16`, its
-/// transpose, and the replicated input `row = L%16, col = j`.
-#[test_case(RT_16X16, false, 37, 2, (5, 10); "gfx942 row")]
-#[test_case(RT_16X16, true, 37, 2, (10, 5); "gfx942 col")]
-#[test_case(RT_16X16_W32_ACC, false, 21, 3, (7, 5); "rdna acc")]
-#[test_case(RT_16X16_W32_ACC, true, 21, 3, (7, 5); "rdna acc ignores transpose")]
-#[test_case(RT_16X16_W32_ACC_T, false, 21, 3, (5, 7); "rdna acc_t")]
-#[test_case(RT_16X16_W32_IN, false, 21, 9, (5, 9); "rdna input")]
-#[test_case(RT_16X16_W32_IN, true, 21, 9, (9, 5); "rdna input col")]
-fn amd_maps(f: RTBaseShape, transpose: bool, lane: usize, j: usize, expect: (i64, i64)) {
-    assert_eq!(rc(&f, transpose, lane, j), expect);
-}
-
-/// The gfx12 (RDNA4, wave32) map, one strided `stride = 8` fragment for every role:
-/// an operand reads `row = L%16, col = 8·(L/16) + j`, a `Col` accumulator and the
-/// N-major store its transpose. The cases are chosen so that both the gfx11
-/// accumulator ([`LaneMap::Interleaved`]) and the gfx11 replicated input
-/// (`Strided { stride: 0 }`) fail them — the two maps gfx12 is not.
-#[test_case(false, 21, 3, (5, 11); "operand upper wave-half is the second K run")]
-#[test_case(true, 21, 3, (11, 5); "col accumulator is the transpose")]
-fn gfx12_map(transpose: bool, lane: usize, j: usize, expect: (i64, i64)) {
-    assert_eq!(rc(&RT_16X16_GFX12, transpose, lane, j), expect);
-}
-
-// Every layout is a bijection lane×register → row×col of the fragment (RDNA's
-// replicated inputs: a 2-to-1 cover, lanes `L` and `L+16` identical), in both
-// orientations, and its UOp evaluation folds to the same integers.
-proptest! {
-    #[test]
-    fn layouts_are_bijections(which in 0usize..7, transpose in any::<bool>()) {
-        let (f, wave, name) = all_frags()[which];
-        let (rows, cols, ept) = (f.base.rows, f.base.cols, f.base.ept);
-        let replication = wave * ept / (rows * cols);
-        prop_assert!(replication >= 1, "{name}: ept·wave covers the fragment");
-        let mut hits = vec![0usize; rows * cols];
-        for lane in 0..wave {
-            for j in 0..ept {
-                let (r, c) = rc(&f, transpose, lane, j);
-                prop_assert!((0..rows as i64).contains(&r) && (0..cols as i64).contains(&c), "{name}: ({lane},{j}) -> ({r},{c})");
-                hits[r as usize * cols + c as usize] += 1;
-                let lane_u = UOp::index_const(lane as i64);
-                let j_u = UOp::index_const(j as i64);
-                let (ru, cu) = f.map.rc(transpose, &lane_u, rows as i64, cols as i64, &j_u);
-                prop_assert_eq!((super::swizzle::eval_const(&ru), super::swizzle::eval_const(&cu)), (r, c), "{} UOp map", name);
-            }
+/// MFMA 32×32×8: A `row = L%32, k = 4(L/32) + j`, B its transpose, C/D `row = 8(j/4) +
+/// 4(L/32) + j%4, col = L%32` (CK `xdlops_gemm.hpp` unmerge `groups(4) × blks(2) ×
+/// group_size(4)`, `blk = L/32`) — all bijections.
+#[test]
+fn mfma_32x32x8_tables() {
+    let (a, c) = (mfma_32x32x8_a(), mfma_32x32x8_c());
+    assert_eq!((a.in_size(Reg), a.in_size(Lane), a.out_size(Row), a.out_size(Col)), (4, 64, 32, 8));
+    assert_eq!((c.in_size(Reg), c.in_size(Lane), c.out_size(Row), c.out_size(Col)), (16, 64, 32, 32));
+    for lane in 0..64u32 {
+        let l = i64::from(lane);
+        for j in 0..4 {
+            assert_eq!(at(&a, lane, j), (l % 32, 4 * (l / 32) + i64::from(j)), "A lane {lane} reg {j}");
+            assert_eq!(at(&a.transpose(), lane, j), (4 * (l / 32) + i64::from(j), l % 32), "B lane {lane} reg {j}");
         }
-        prop_assert!(hits.iter().all(|&h| h == replication), "{name}: every element held by exactly {replication} (lane, j)");
-        if replication > 1 {
-            for lane in 0..wave / 2 {
-                for j in 0..ept {
-                    prop_assert_eq!(rc(&f, transpose, lane, j), rc(&f, transpose, lane + wave / 2, j), "{} replicated halves", name);
-                }
-            }
+        for j in 0..16 {
+            let j = i64::from(j);
+            assert_eq!(at(&c, lane, j as u32), (8 * (j / 4) + 4 * (l / 32) + j % 4, l % 32), "C lane {lane} reg {j}");
         }
     }
+    assert!(bijective(&a) && bijective(&c));
 }
 
-/// Brute-force reduce plan of a map: the coordinate that varies with `j`
-/// (`folds_cols`), the distinct kept coordinates per lane (`slots`, which register
-/// feeds which slot), and the set of lanes sharing a kept coordinate (the tree's
-/// partner set) — all read off the integer table, then compared with the
-/// closed-form [`LaneMap`] answers the reductions build from.
-#[test_case(0; "gfx942 RT_16X16")]
-#[test_case(1; "gfx1151 acc")]
-#[test_case(2; "gfx1151 input")]
-#[test_case(3; "gfx1151 acc_t")]
-#[test_case(4; "sm_86 mma.sync")]
-fn reduce_plan_matches_brute_force(which: usize) {
-    let (f, wave, name) = all_frags()[which];
-    let (rows, cols, ept) = (f.base.rows, f.base.cols, f.base.ept);
-    for transpose in [false, true] {
-        let table: Vec<Vec<(i64, i64)>> =
-            (0..wave).map(|l| (0..ept).map(|j| rc(&f, transpose, l, j)).collect()).collect();
-        let varies = |pick: fn((i64, i64)) -> i64| {
-            table.iter().any(|l| l.iter().map(|&e| pick(e)).collect::<BTreeSet<_>>().len() > 1)
-        };
-        let (rows_vary, cols_vary) = (varies(|e| e.0), varies(|e| e.1));
-        let folds_cols = f.map.folds_cols(transpose);
-        assert!(if folds_cols { cols_vary } else { rows_vary }, "{name} t={transpose}: the folded axis varies with j");
-        // `mma.sync` varies both; the others exactly one.
-        assert_eq!(rows_vary && cols_vary, f.map == LaneMap::MmaSync, "{name} t={transpose}: axes varying with j");
-        let kept = |e: (i64, i64)| if folds_cols { e.0 } else { e.1 };
-
-        // Slots: distinct kept coordinates per lane, ascending; register j's slot.
-        for (lane, regs) in table.iter().enumerate() {
-            let distinct: Vec<i64> = regs.iter().map(|&e| kept(e)).collect::<BTreeSet<_>>().into_iter().collect();
-            assert_eq!(distinct.len(), f.map.slots(), "{name} t={transpose} lane {lane}: kept values per lane");
-            for (j, &e) in regs.iter().enumerate() {
-                let want = distinct.iter().position(|&k| k == kept(e)).unwrap() as i64;
-                let Idx::Const(slot) = f.map.slot_of(&Idx::Const(j as i64)) else { panic!("constant slot") };
-                assert_eq!(slot, want, "{name} t={transpose} lane {lane} j={j}: slot");
-            }
-        }
-
-        // Partners: lanes holding the same kept coordinate at slot 0, as xor deltas.
-        let mut by_kept: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
-        for (lane, regs) in table.iter().enumerate() {
-            by_kept.entry(kept(regs[0])).or_default().push(lane);
-        }
-        let deltas: BTreeSet<i64> = by_kept
-            .values()
-            .flat_map(|lanes| lanes.iter().flat_map(move |&a| lanes.iter().map(move |&b| (a ^ b) as i64)))
-            .filter(|&d| d != 0)
-            .collect();
-        match f.map.tree(wave) {
-            ReduceTree::Gather(offsets) => {
-                assert_eq!(offsets.iter().copied().collect::<BTreeSet<_>>(), deltas, "{name}: sibling gather offsets");
-                let siblings: Vec<i64> = (1..wave as i64 / 16).map(|i| i * 16).collect();
-                assert_eq!(offsets.as_slice(), siblings.as_slice(), "{name}: one gather per sibling row-group");
-            }
-            ReduceTree::Butterfly(masks) => {
-                // The butterfly's masks span the partner group: every delta is a subset-xor of the masks.
-                let span: BTreeSet<i64> = (1..1 << masks.len())
-                    .map(|bits: usize| {
-                        masks
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| bits >> i & 1 == 1)
-                            .map(|(_, &m)| m)
-                            .fold(0, |a, m| a ^ m)
-                    })
-                    .collect();
-                assert_eq!(span, deltas, "{name}: butterfly span");
-            }
-        }
-        let _ = (rows, cols);
-    }
-}
-
-/// The per-arch role table resolves onto maps with the slot count the register
-/// vectors are allocated with, and `Kernel::rv` follows it.
-#[test_case(GpuArch::Amd(AmdArch::Gfx942), 1; "gfx942")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx1151), 1; "gfx1151")]
-#[test_case(SM_86, 2; "sm_86")]
-fn rv_slots_follow_the_accumulator_map(arch: GpuArch, slots: usize) {
-    let caps = ArchCaps::for_arch(arch);
-    let ker = crate::Kernel::new("rv", [1, 1, 1], caps.wave_size as i64, vec![], caps);
-    assert_eq!(caps.frag(FragRole::Accumulator).unwrap().map.slots(), slots);
-    assert_eq!(ker.acc_vec(32).shape(), &[2, slots]);
-}
-
-/// The `ldmatrix.x4` plan of the `mma.sync` fragment (`fa_cuda_references.md` §(c)):
-/// lane `L` addresses row `L % 16`, columns `8·(L/16)..` — matrices TL, BL, TR, BR
-/// — so a `Row` read takes the words in order, and a `Col` read (V) needs `.trans`
-/// with the ThunderKittens `ldsm4t(tmp[0], tmp[2], tmp[1], tmp[3])` permutation.
-/// The AMD maps have no `ldmatrix` form.
-#[test_case(RT_16X16_MMA, false, Some(LdmatrixX4 { trans: false, words: [0, 1, 2, 3] }); "mma.sync row")]
-#[test_case(RT_16X16_MMA, true, Some(LdmatrixX4 { trans: true, words: [0, 2, 1, 3] }); "mma.sync col is ldsm4t")]
-#[test_case(RT_16X16, false, None; "gfx942")]
-#[test_case(RT_16X16_W32_IN, false, None; "gfx1151 input")]
-#[test_case(RT_16X16_W32_ACC, false, None; "gfx1151 acc")]
-fn ldmatrix_x4_plan(f: RTBaseShape, transpose: bool, plan: Option<LdmatrixX4>) {
-    assert_eq!(f.map.ldmatrix_x4(transpose), plan);
-}
-
-/// Following the plan reproduces the map: register pair `p` of lane `L` is what the
-/// hardware hands lane `L` for matrix `words[p]` — `(L/4, 2(L%4) + e)` of the 8×8
-/// block, `(2(L%4) + e, L/4)` under `.trans` — at that block's tile offset.
-#[test_case(false; "row")]
-#[test_case(true; "col")]
-fn ldmatrix_x4_plan_reproduces_the_map(transpose: bool) {
-    let plan = RT_16X16_MMA.map.ldmatrix_x4(transpose).expect("mma.sync has an ldmatrix form");
-    for lane in 0..32i64 {
-        let (g, t) = (lane / 4, lane % 4);
-        for (p, &m) in plan.words.iter().enumerate() {
-            let (rb, cb) = ((m % 2) as i64, (m / 2) as i64); // matrix m = row block + 2·col block
-            for e in 0..2i64 {
-                let got = rc(&RT_16X16_MMA, transpose, lane as usize, 2 * p + e as usize);
-                let want = if plan.trans { (8 * rb + 2 * t + e, 8 * cb + g) } else { (8 * rb + g, 8 * cb + 2 * t + e) };
-                assert_eq!(got, want, "lane {lane} pair {p} element {e}");
-            }
-        }
-    }
-}
-
-// ── Apple `simdgroup_matrix<T, 8, 8>` ─────────────────────────────────────────
-
-/// The Apple lane table, **measured on hardware** (Apple9, macOS 26.6): an 8x8
-/// tile was filled with `row*8 + col`, loaded with `simdgroup_load`, and each
-/// lane's `thread_elements()[0..1]` read back. The ordering is undocumented, so
-/// this table — not the closed form — is the source of truth; the closed form
-/// `row = 4·((L/16)%2) + (L/2)%4, col = 4·((L/8)%2) + 2·(L%2) + j` is what it
-/// pinned. The same table was verified for a `float` MAC **result**, which is
-/// what licenses [`ArchCaps::acc_reusable_as_input`] on Metal.
+/// The Apple lane table measured on hardware (Apple9): the source of truth the
+/// closed form was pinned from.
 #[test_case(0, [(0, 0), (0, 1)]; "lane 0")]
 #[test_case(1, [(0, 2), (0, 3)]; "lane 1")]
 #[test_case(2, [(1, 0), (1, 1)]; "lane 2")]
@@ -310,43 +202,149 @@ fn ldmatrix_x4_plan_reproduces_the_map(transpose: bool) {
 #[test_case(23, [(7, 2), (7, 3)]; "lane 23")]
 #[test_case(24, [(4, 4), (4, 5)]; "lane 24")]
 #[test_case(31, [(7, 6), (7, 7)]; "lane 31")]
-fn simdgroup_matrix_lane_table(lane: usize, want: [(i64, i64); 2]) {
+fn simdgroup_matrix_lane_table(lane: u32, want: [(i64, i64); 2]) {
     for (j, expected) in want.into_iter().enumerate() {
-        assert_eq!(rc(&RT_8X8_SIMD, false, lane, j), expected, "lane {lane} element {j}");
+        assert_eq!(at(&simdgroup_8x8(), lane, j as u32), expected, "lane {lane} element {j}");
     }
 }
 
-/// A row of the 8x8 fragment is held by the four lanes `{L, L^1, L^8, L^9}`, so
-/// the online-softmax fold is the two-mask butterfly `[1, 8]` — one step shorter
-/// than the AMD wave64 sibling gather. Derived here from the map itself so the
-/// tree and the table cannot drift apart.
+/// The derived row-fold butterfly of every atom equals a brute-force partner search:
+/// lanes holding the same row at register 0, as xor deltas, are exactly the span of
+/// the masks. Spot values: tk1's `ReduceTree` (`mma.sync` `[1, 2]`, Apple `[1, 8]`,
+/// gfx942 siblings `16, 32, 48`).
 #[test]
-fn simdgroup_matrix_row_fold() {
-    let mut rows: BTreeMap<i64, BTreeSet<usize>> = BTreeMap::new();
-    for lane in 0..32 {
-        rows.entry(rc(&RT_8X8_SIMD, false, lane, 0).0).or_default().insert(lane);
+fn lanes_sharing_row_matches_brute_force() {
+    for (name, atom, ..) in frags() {
+        let l = atom();
+        let mut by_row: BTreeMap<i64, Vec<u32>> = BTreeMap::new();
+        for lane in 0..l.in_size(Lane) {
+            by_row.entry(at(&l, lane, 0).0).or_default().push(lane);
+        }
+        let deltas: BTreeSet<u32> =
+            by_row.values().flat_map(|ls| ls.iter().flat_map(move |&a| ls.iter().map(move |&b| a ^ b))).collect();
+        let masks = lanes_sharing_row(&l);
+        let span: BTreeSet<u32> = (0..1u32 << masks.len())
+            .map(|s| (0..masks.len()).filter(|i| s >> i & 1 == 1).fold(0, |a, i| a ^ masks[i]))
+            .collect();
+        assert_eq!(span, deltas, "{name}: butterfly span");
     }
-    assert_eq!(rows.len(), 8, "every row is claimed");
-    for (row, lanes) in &rows {
-        let base = *lanes.iter().next().expect("non-empty");
-        let want: BTreeSet<usize> = [base, base ^ 1, base ^ 8, base ^ 9].into_iter().collect();
-        assert_eq!(lanes, &want, "row {row} lanes");
-    }
-    assert_eq!(RT_8X8_SIMD.map.tree(32), ReduceTree::Butterfly([1, 8].into_iter().collect()));
-    assert_eq!(RT_8X8_SIMD.map.slots(), 1, "a lane's two elements share a row, so one kept value");
-    assert!(RT_8X8_SIMD.map.folds_cols(false), "the register axis is the column axis");
-    assert_eq!(RT_8X8_SIMD.map.ldmatrix_x4(false), None, "no PTX ldmatrix analog");
+    assert_eq!(lanes_sharing_row(&mma_sync_16x16()).as_slice(), [1, 2]);
+    assert_eq!(lanes_sharing_row(&simdgroup_8x8()).as_slice(), [1, 8]);
+    assert_eq!(lanes_sharing_row(&mfma_16x16x16()).as_slice(), [16, 32]);
+    assert_eq!(lanes_sharing_row(&mfma_32x32x8_c()).as_slice(), [1, 2, 4, 8, 16]);
 }
 
-/// The Metal fragment resolves for Apple7+ in the two orientations the matrix
-/// core's operand contract calls for: transposed for the `Row`-declared A operand,
-/// plain for the B operand (whose `Col` declaration transposes it already) and for
-/// the accumulators, which must keep tk's `Col`-holds-`Cᵀ` invariant.
+/// `ldmatrix.x4` as a composition: the 8×8 per-matrix
+/// pair layout tiled over the four matrices reproduces the `mma.sync` tile plain, its
+/// transpose under `.trans` (ThunderKittens `ldsm4t(tmp[0], tmp[2], tmp[1], tmp[3])`),
+/// and the matrices land where the addressing lanes `8m..8m+8` point.
+/// A wave32 `global_load_tr_b128` transposes the 8×8 block each group of eight
+/// lanes addresses (lane `k` of the group receives element `k` of every row);
+/// with the blocks addressed in TL, TR, BL, BR order lane `L` holds column
+/// `L % 16` at rows `8·(L/16)..+8`, the RDNA4 WMMA B fragment.
 #[test]
-fn metal_caps_resolve_the_simdgroup_fragment() {
-    let caps = ArchCaps::for_arch(GpuArch::Metal(svod_dtype::MetalFamily::Apple(9)));
-    for role in [FragRole::Accumulator, FragRole::AccumulatorT, FragRole::OperandB] {
-        assert_eq!(caps.frag(role).map(|f| f.map), Some(LaneMap::SimdgroupMatrix), "{role:?}");
+fn global_tr_b128_is_the_transposed_block() {
+    let (l, rows) = (global_tr_b128(), global_tr_rows());
+    assert_eq!(l, strided(8, 32).transpose());
+    for lane in 0..32u32 {
+        let (half, within) = (i64::from(lane / 16), i64::from(lane % 16));
+        for j in 0..8u32 {
+            let (r, c) = rows.apply(&[(Lane, 8 * (lane / 8) + j)]);
+            assert_eq!(at(&l, lane, j), (i64::from(r), i64::from(c) + i64::from(lane % 8)), "lane {lane} register {j}");
+            assert_eq!(at(&l, lane, j), (8 * half + i64::from(j), within));
+        }
     }
-    assert_eq!(caps.frag(FragRole::Operand).map(|f| f.map), Some(LaneMap::SimdgroupMatrixT));
+}
+
+#[test]
+fn ldmatrix_x4_is_the_mma_sync_tile() {
+    assert_eq!(ldmatrix_x4(false), mma_sync_16x16());
+    assert_eq!(ldmatrix_x4(true), mma_sync_16x16().transpose());
+    let rows = ldmatrix_x4_rows();
+    for (trans, words) in [(false, [0, 1, 2, 3]), (true, [0, 2, 1, 3])] {
+        let l = ldmatrix_x4(trans);
+        for lane in 0..32u32 {
+            let (g, t) = (i64::from(lane / 4), i64::from(lane % 4));
+            for (p, &m) in words.iter().enumerate() {
+                let (r0, c0) = rows.apply(&[(Lane, 8 * m)]);
+                for e in 0..2 {
+                    let want = if trans { (2 * t + e, g) } else { (g, 2 * t + e) };
+                    let got = at(&l, lane, 2 * p as u32 + e as u32);
+                    assert_eq!(
+                        got,
+                        (i64::from(r0) + want.0, i64::from(c0) + want.1),
+                        "trans {trans} lane {lane} pair {p}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ── algebra laws ────────────────────────────────────────────────────────────
+
+/// A random linear map `ins → (o0, o1)`.
+fn arb(ins: &'static [(Dim, u32)], outs: [(Dim, u32); 2]) -> impl Strategy<Value = Layout> {
+    let n: u32 = ins.iter().map(|i| i.1.trailing_zeros()).sum();
+    prop::collection::vec((any::<u32>(), any::<u32>()), n as usize).prop_map(move |vals| {
+        let vals: Vec<[u32; 2]> = vals.into_iter().map(|(a, b)| [a % outs[0].1, b % outs[1].1]).collect();
+        let mut rest = vals.as_slice();
+        let bases: Vec<(Dim, &[[u32; 2]])> = ins
+            .iter()
+            .map(|&(d, s)| {
+                let (head, tail) = rest.split_at(s.trailing_zeros() as usize);
+                rest = tail;
+                (d, head)
+            })
+            .collect();
+        Layout::from_bases(outs, &bases)
+    })
+}
+
+const HW: &[(Dim, u32)] = &[(Reg, 8), (Lane, 32)];
+const TILE: [(Dim, u32); 2] = [(Row, 16), (Col, 16)];
+
+proptest! {
+    #[test]
+    fn apply_is_linear(a in arb(HW, TILE), x in (0u32..32, 0u32..8), y in (0u32..32, 0u32..8)) {
+        let f = |(l, j)| a.apply(&[(Lane, l), (Reg, j)]);
+        let (fx, fy, fxy) = (f(x), f(y), f((x.0 ^ y.0, x.1 ^ y.1)));
+        prop_assert_eq!(fxy, (fx.0 ^ fy.0, fx.1 ^ fy.1));
+    }
+
+    #[test]
+    fn product_stacks(a in arb(HW, TILE), b in arb(&[(Reg, 2), (Warp, 4)], [(Row, 4), (Col, 2)]), x in (0u32..32, 0u32..8), y in (0u32..2, 0u32..4)) {
+        let p = a.product(&b);
+        prop_assert_eq!((p.in_size(Reg), p.in_size(Lane), p.in_size(Warp)), (16, 32, 4));
+        prop_assert_eq!((p.out_size(Row), p.out_size(Col)), (64, 32));
+        let (r0, c0) = a.apply(&[(Lane, x.0), (Reg, x.1)]);
+        let (r1, c1) = b.apply(&[(Reg, y.0), (Warp, y.1)]);
+        prop_assert_eq!(p.apply(&[(Lane, x.0), (Reg, x.1 + 8 * y.0), (Warp, y.1)]), (r0 + 16 * r1, c0 + 16 * c1));
+        prop_assert_eq!(p.sublayout(&[Lane], &[Row, Col]).apply(&[(Lane, x.0)]), a.apply(&[(Lane, x.0)]));
+    }
+
+    #[test]
+    fn transpose_swaps(a in arb(HW, TILE), lane in 0u32..32, j in 0u32..8) {
+        let (r, c) = a.apply(&[(Lane, lane), (Reg, j)]);
+        prop_assert_eq!(a.transpose().apply(&[(Lane, lane), (Reg, j)]), (c, r));
+        prop_assert_eq!(&a.transpose().transpose(), &a);
+    }
+
+}
+
+/// The accumulator reaches the next product's B operand for free exactly where tk1's
+/// `ArchCaps::acc_reusable_as_input` held — gfx12 and CDNA, hardware-verified there —
+/// so the F2 algebra subsumes that flag. Its A operand never
+/// does, and that is the handoff `kernels::attention` asks for: it accumulates the
+/// scores as `[bq, bkv]` and feeds them as A, where tk1 accumulates the transpose and
+/// feeds it as B.
+#[test_case(AmdArch::Gfx1201, true; "gfx1201 rdna4")]
+#[test_case(AmdArch::Gfx942, true; "gfx942 cdna3")]
+#[test_case(AmdArch::Gfx1151, false; "gfx1151 rdna3.5")]
+#[test_case(AmdArch::Gfx1100, false; "gfx1100 rdna3")]
+fn amd_accumulator_reuse(arch: AmdArch, reusable: bool) {
+    let target = crate::atoms::Target::for_arch(svod_dtype::GpuArch::Amd(arch));
+    let atom = target.mma.first().expect("a matrix core");
+    assert_eq!(atom.c == atom.b, reusable, "accumulator → B");
+    assert!(!in_lane(&atom.c, &atom.a), "accumulator → A crosses lanes");
 }

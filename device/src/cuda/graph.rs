@@ -283,7 +283,7 @@ impl Exec {
             block_dim_x: bx,
             block_dim_y: by,
             block_dim_z: bz,
-            shared_mem_bytes: 0,
+            shared_mem_bytes: node.launch.dynamic_shared_bytes,
             kernel_params: std::ptr::null_mut(),
             extra: extra.as_mut_ptr(),
             kern: super::sys::CUkernel::NULL,
@@ -388,6 +388,10 @@ impl Graph for CudaGraph {
         exec.patch(&self.nodes, blobs, buffers, vals)?;
         state.last = Some(self.launch(exec)?);
         Ok(())
+    }
+
+    fn order_after(&self, accesses: &[(&crate::Buffer, bool)]) -> Result<()> {
+        self.stream.order_after(accesses)
     }
 
     fn completion_token(&self) -> Option<Arc<dyn CompletionToken>> {

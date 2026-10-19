@@ -22,12 +22,16 @@ use crate::amd::sys::hsa::AmdHsaKernelDescriptor;
 use crate::device::Program;
 use crate::error::{Error, Result};
 
-// AMDGPU relocation types per LLVM `ELFRelocs/AMDGPU.def`. Only the 64-bit
-// kinds that clang emits for our codegen reach us; anything else surfaces as
-// a clean `Runtime` error rather than a silent zero-write.
+// AMDGPU relocation types per LLVM `ELFRelocs/AMDGPU.def`. Only the kinds
+// that clang emits for our codegen reach us: the descriptor's 64-bit ones and
+// the 32-bit halves of a kernel's PC-relative address of a module global;
+// anything else surfaces as a clean `Runtime` error rather than a silent
+// zero-write.
 const R_AMDGPU_ABS64: u32 = 3;
 const R_AMDGPU_REL32: u32 = 4;
 const R_AMDGPU_REL64: u32 = 5;
+const R_AMDGPU_REL32_LO: u32 = 10;
+const R_AMDGPU_REL32_HI: u32 = 11;
 
 /// Pre-execution metadata extracted from a single kernel's ELF.
 #[derive(Debug, Clone)]
@@ -195,12 +199,13 @@ pub fn parse_kernel(bytes: &[u8], kernel_name: &str) -> Result<ParsedKernel> {
                     let value = sym_value + reloc.addend() - off as i64;
                     image[off..off + 8].copy_from_slice(&value.to_le_bytes());
                 }
-                R_AMDGPU_REL32 => {
+                R_AMDGPU_REL32 | R_AMDGPU_REL32_LO | R_AMDGPU_REL32_HI => {
                     if off + 4 > image.len() {
                         return Err(Error::Runtime { message: format!("AMD ELF: reloc out of range at {off:#x}") });
                     }
-                    let value = (sym_value + reloc.addend() - off as i64) as i32;
-                    image[off..off + 4].copy_from_slice(&value.to_le_bytes());
+                    let value = sym_value + reloc.addend() - off as i64;
+                    let half = if r_type == R_AMDGPU_REL32_HI { (value >> 32) as u32 } else { value as u32 };
+                    image[off..off + 4].copy_from_slice(&half.to_le_bytes());
                 }
                 _ => {
                     return Err(Error::Runtime {
@@ -886,12 +891,14 @@ impl Program for AmdProgram {
         Ok(Some(Box::new(owner)))
     }
 
-    /// Decode VGPR/SGPR/LDS/scratch + VGPR-limited occupancy from the kernel
-    /// descriptor. Uses the original (un-patched) `compute_pgm_rsrc1` and the
-    /// descriptor's exact segment sizes — pure static, no GPU access.
+    /// Decode VGPR/AGPR/SGPR/LDS/scratch + VGPR-limited occupancy from the
+    /// kernel descriptor. Uses the original (un-patched) `compute_pgm_rsrc1`,
+    /// `compute_pgm_rsrc3` and the descriptor's exact segment sizes — pure
+    /// static, no GPU access.
     fn resource_usage(&self) -> Option<crate::profile::KernelResources> {
         Some(crate::amd::occupancy::decode_resources(
             self.kd.compute_pgm_rsrc1,
+            self.kd.compute_pgm_rsrc3,
             self.kd.group_segment_fixed_size,
             self.kd.private_segment_fixed_size,
             if self.wave32 { 32 } else { 64 },

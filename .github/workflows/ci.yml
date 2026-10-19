@@ -127,7 +127,7 @@ jobs:
           wait_for_crate svod-tensor "$VERSION"
           wait_for_crate svod-arch "$VERSION"
 
-          # L7: svod-tk + svod-onnx (no inter-dep); svod-tk must precede svod-model
+          # L7: svod-tk, svod-onnx (no inter-dep); svod-tk must precede svod-model
           publish_crate svod-tk &
           publish_crate svod-onnx &
           wait

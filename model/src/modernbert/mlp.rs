@@ -8,6 +8,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
+use svod_tk::ops::{self, Act};
 
 use crate::init::fan_in_uniform;
 
@@ -30,13 +31,12 @@ impl ModernBertGlu {
         Self { hidden_size, intermediate_size, wi_weight, wo_weight }
     }
 
-    /// Forward. `x`: `(B, L, D)` → `(B, L, D)`.
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // (., 2I) → [input (., I) | gate (., I)].
-        let h = x.linear().weight(&self.wi_weight).call()?;
-        let i = self.intermediate_size;
-        // GELU(input) * gate — exact (erf) GELU matches PyTorch's nn.GELU default.
-        let gated = h.narrow(-1, 0usize, i)?.gelu_exact()?.try_mul(&h.narrow(-1, i, i)?)?;
-        Ok(gated.linear().weight(&self.wo_weight).call()?)
+    /// Forward. `x`: `(B, L, D)` → `residual + mlp(x)`, `(B, L, D)`, the add
+    /// in `Wo`'s epilogue.
+    pub fn forward(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
+        // `Wi`'s `[input | gate]` rows are the op layer's gated order: the
+        // first half takes the exact (erf) GELU, PyTorch's nn.GELU default.
+        let gated = ops::linear(x, &self.wi_weight, ops::Linear { act: Act::Gelu, gated: true, ..Default::default() })?;
+        Ok(ops::linear(&gated, &self.wo_weight, ops::Linear { residual: Some(residual), ..Default::default() })?)
     }
 }

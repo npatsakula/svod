@@ -33,6 +33,9 @@ pub struct RenderContext {
     unhinted: HashSet<u64>,
     /// Loop IDs handed out so far, one per hinted back edge.
     loops: usize,
+    /// Byte offset of each LOCAL buffer (by slot) inside the kernel's one
+    /// dynamic shared array; empty when LOCAL buffers are static globals.
+    dynamic_locals: HashMap<usize, usize>,
 }
 
 impl RenderContext {
@@ -46,6 +49,7 @@ impl RenderContext {
             loop_hint: None,
             unhinted: HashSet::new(),
             loops: 0,
+            dynamic_locals: HashMap::new(),
         }
     }
 
@@ -88,6 +92,16 @@ impl RenderContext {
     /// Borrow the accumulated module-level prefix lines.
     pub fn module_prefix(&self) -> &[String] {
         &self.module_prefix
+    }
+
+    /// Carve LOCAL buffers out of one dynamic shared array at these offsets.
+    pub fn set_dynamic_locals(&mut self, offsets: HashMap<usize, usize>) {
+        self.dynamic_locals = offsets;
+    }
+
+    /// The dynamic shared array offset of LOCAL buffer `slot`, if carved.
+    pub fn dynamic_local(&self, slot: usize) -> Option<usize> {
+        self.dynamic_locals.get(&slot).copied()
     }
 
     /// Record an `InvalidGraph` error from a renderer op handler.
@@ -184,6 +198,17 @@ impl RenderContext {
     /// Check if a UOp is already registered.
     pub fn contains(&self, id: u64) -> bool {
         self.names.contains_key(&id)
+    }
+
+    /// A label stem for a block-structured op, numbered by this kernel's
+    /// counter like a value and kept under the op's id for its closing
+    /// half: a program's text then reads the same whatever UOps the process
+    /// minted before it, so its compiled object is found again.
+    pub fn label(&mut self, uop: &Arc<UOp>) -> String {
+        let stem = format!("{}", self.counter);
+        self.counter += 1;
+        self.names.insert(uop.id, stem.clone());
+        stem
     }
 
     /// Alias one ID to another's name.

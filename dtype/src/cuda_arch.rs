@@ -15,6 +15,27 @@ pub struct CudaArch {
 }
 
 impl CudaArch {
+    /// Statically declared `.shared` memory a kernel may use (ptxas rejects
+    /// more); anything above must be dynamic shared memory opted into per
+    /// function with `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`.
+    pub const MAX_STATIC_SHARED_BYTES: usize = 48 << 10;
+
+    /// Shared memory one block may opt into on this architecture
+    /// (`CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`, per the CUDA
+    /// programming guide), for planning without a device; an opened device
+    /// reports the authoritative value in `CudaLimits::shared_per_block_optin`.
+    /// Unknown generations get the portable 48 KB.
+    pub const fn max_shared_per_block_optin(self) -> usize {
+        match (self.major, self.minor) {
+            (7, 0..=2) => 96 << 10,
+            (7, 5) => 64 << 10,
+            (8, 0) | (8, 7) => 163 << 10,
+            (8, 6) | (8, 9) | (12, _) => 99 << 10,
+            (9, 0) | (10 | 11, _) => 227 << 10,
+            _ => Self::MAX_STATIC_SHARED_BYTES,
+        }
+    }
+
     /// From the driver's `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_{MAJOR,MINOR}`.
     pub const fn from_compute_capability(major: u8, minor: u8) -> Self {
         Self { major, minor }

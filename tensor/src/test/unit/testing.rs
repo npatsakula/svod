@@ -1,7 +1,6 @@
 //! Unit + property tests for the shared numeric comparator
 //! [`crate::testing::allclose_f32`]. CPU-only (no device), so they run in normal
-//! `cargo test` — the guard rails the custom-kernel checks and the `svod-tk`
-//! proptest harness both depend on.
+//! `cargo test` — the guard rails the custom-kernel checks depend on.
 
 use proptest::prelude::*;
 

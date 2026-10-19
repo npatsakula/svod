@@ -11,7 +11,7 @@ use serde::Serialize;
 use svod_dtype::{AddrSpace, DType, ImageKind, ScalarDType};
 
 use crate::ops;
-use crate::{AxisId, BinaryOp, ConstValue, Op, SInt, TernaryOp, UOp};
+use crate::{AxisId, BarrierFence, BinaryOp, ConstValue, Op, SInt, TernaryOp, UOp};
 
 /// Version of the canonical graph schema.
 pub const CANONICAL_SCHEMA_VERSION: u32 = 7;
@@ -642,6 +642,9 @@ fn canonical_arg(node: &Arc<UOp>, ids: &FxHashMap<u64, usize>, verbose: bool) ->
         }
         Op::AllReduce(ops::AllReduce { reduce_op, device, .. }) => {
             CanonicalArg::AllReduce { op: reduce_name(*reduce_op).to_string(), device: device.canonicalize() }
+        }
+        Op::Barrier(ops::Barrier { fence: fence @ BarrierFence::Local, .. }) => {
+            CanonicalArg::Name { value: format!("{fence:?}").to_ascii_uppercase() }
         }
         Op::Range(ops::Range { axis_id, axis_type, .. }) => CanonicalArg::Range {
             axis: axis_id.path().to_vec(),
