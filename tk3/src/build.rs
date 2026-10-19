@@ -293,6 +293,18 @@ impl Kernel {
 
     pub fn smem_view<T: Elem>(&mut self, alloc: SmemId, offset: impl Into<Sc>, shape: Shape) -> Shared<T> {
         assert_eq!(self.prog.smem[alloc.index()].dtype, T::DTYPE, "shared allocation dtype");
+        self.smem_view_as(alloc, offset, shape)
+    }
+
+    /// `shape` of `T` at `offset` (in `T` elements) of `alloc`, read under
+    /// `T` whatever the allocation's type: scratch over a region whose tiles
+    /// are dead, as a key warp's merge state reuses its ring. The allocation
+    /// holds a whole number of `T`s; a `T` of the allocation's width or wider
+    /// keeps every element of the view aligned.
+    pub fn smem_view_as<T: Elem>(&mut self, alloc: SmemId, offset: impl Into<Sc>, shape: Shape) -> Shared<T> {
+        let a = &self.prog.smem[alloc.index()];
+        let (held, bytes) = (a.elems * a.dtype.bytes(), T::DTYPE.bytes());
+        assert!(held.is_multiple_of(bytes) && bytes >= a.dtype.bytes(), "{} read as {:?}", a.name, T::DTYPE);
         let offset = self.intern(offset);
         Tile::new(self.value(T::DTYPE, shape, Place::Smem { alloc, offset }))
     }

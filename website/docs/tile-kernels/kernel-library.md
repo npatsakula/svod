@@ -174,8 +174,11 @@ states merge through shared memory at the end, as the split merge does. The plan
 4 key warps for `t ≤ 16`; the tuner picks. On gfx1201 the Whisper large-v3 cross-attention step
 (1500 keys, one cache row shared by five lanes) went from 25.3 to 15.7 µs tuned (four splits) and to
 18.2 unsplit (two key warps), tk1's single-query kernel being 16.1; the self-attention step is
-unchanged. Four key warps at `bkv = 16` lose again: their 32 KB of rings plus the merge scratch
-leave one block per CU. The tuner also measures a cache the way the model reads it: fewer cache
+unchanged. The states merge through the warps' own ring slots, dead once their pipelines end
+(f32 views of the 16-bit rings: a warp's output over its key slots, its maximum and sum over its
+value slots, `Kernel::smem_view_as`), so four key warps at `bkv = 16` take the rings' 32 KB alone
+and two blocks fit a CU: the unsplit cross-attention step went from 19.6 to 15.8 µs, the four-split
+one's time, and the tuner picks it unsplit. The tuner also measures a cache the way the model reads it: fewer cache
 rows than lanes are read through a zero row map, so lanes share a row, where it used to time a row
 per lane, 38 MB from DRAM for a shape that is 7.7 MB in L2.
 

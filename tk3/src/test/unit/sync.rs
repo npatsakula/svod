@@ -77,6 +77,55 @@ fn warps_fence_their_own_effects_and_the_block_fences_theirs() {
     assert_eq!(scopes, [Scope::Warp, Scope::Block]);
 }
 
+/// A key warp's merged state goes over its own ring slots once its
+/// pipeline ends: its output store, an f32 view of the keys it read, is
+/// fenced among its lanes alone, and the block fences the warps' states
+/// before it folds them.
+#[test]
+fn a_key_warps_state_over_its_ring_is_fenced_by_the_warp_then_the_block() {
+    let cfg = FaCfg { key_warps: 4, ..FaCfg::new(16, 16, 2) };
+    let mask = AttnMask::default();
+    let spec = AttnSpec {
+        batch: Batch::Static(1),
+        t: 1,
+        tk: 64,
+        heads: 1,
+        kv_heads: 1,
+        d: 64,
+        mask,
+        cache: None,
+        scale: 0.125,
+        cfg,
+    };
+    let mut prog = attention::<BF16>(&spec);
+    insert_barriers(&mut prog);
+    assert!(
+        prog.smem.iter().all(|a| a.dtype == svod_dtype::ScalarDType::BFloat16),
+        "no merge allocation: {:?}",
+        prog.smem
+    );
+    let f32_smem = |prog: &Program, v: ValId| {
+        let val = prog.value(v);
+        val.tier() == Tier::Smem && val.dtype == svod_dtype::ScalarDType::Float32
+    };
+    let at = prog.body.0.iter().position(|s| matches!(s, Stmt::Warps { .. })).expect("the warps statement");
+    let Stmt::Warps { body } = &prog.body.0[at] else { unreachable!() };
+    let store = body
+        .0
+        .iter()
+        .position(|s| matches!(s, Stmt::Copy { dst, .. } if f32_smem(&prog, *dst)))
+        .expect("the output store");
+    assert!(matches!(body.0[store - 1], Stmt::Sync(Sync::Barrier { scope: Scope::Warp })), "{:?}", kinds(&prog, body));
+    let after = &prog.body.0[at + 1..];
+    let load =
+        after.iter().position(|s| matches!(s, Stmt::Copy { src, .. } if f32_smem(&prog, *src))).expect("a merge load");
+    assert!(
+        after[..load].iter().any(|s| matches!(s, Stmt::Sync(Sync::Barrier { scope: Scope::Block }))),
+        "{:?}",
+        top(&prog)
+    );
+}
+
 /// A warp's asynchronous copy still in flight when the warps end is landed,
 /// not only fenced, before the block reads its tile.
 #[test]

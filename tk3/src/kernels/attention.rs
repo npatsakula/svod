@@ -88,11 +88,9 @@ impl FaCfg {
     }
 
     /// Static shared memory in bytes: the K and V rings of a 16-bit type, one
-    /// per key warp, and the f32 states the key warps merge through.
+    /// per key warp (the states key warps merge through reuse their rings).
     pub fn smem_bytes(&self, d: usize) -> usize {
-        let rings = self.key_warps * 2 * self.stages * self.bkv * d * 2;
-        let merge = if self.key_warps > 1 { self.key_warps * WARP_ROWS * (d + 2) * 4 } else { 0 };
-        rings + merge
+        self.key_warps * 2 * self.stages * self.bkv * d * 2
     }
 
     /// The shared scratch the f32 score tile crosses to become the P·V
@@ -370,10 +368,11 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     k.grid([Sc::from(t.div_ceil(bq) * splits), Sc::from(heads), gz]);
     let kw = cfg.key_warps;
     assert!(kw == 1 || bq == WARP_ROWS, "{kw} key warps share a block of one row warp, not {bq} rows");
+    // A warp's merged output takes 16·d f32 of its 16-bit K ring.
+    assert!(kw == 1 || stages * bkv >= 2 * WARP_ROWS, "{stages} stages of {bkv} keys hold no key warp's output");
     k.warps(cfg.warps());
     let k_s = k.smem::<T>("k_s", kw * stages * bkv * d);
     let v_s = k.smem::<T>("v_s", kw * stages * bkv * d);
-    let merge = (kw > 1).then(|| k.smem::<F32>("merge", kw * WARP_ROWS * (d + 2)));
 
     let (order, split, hh) = (k.block(0) / splits, k.block(0) % splits, k.block(1));
     // Where later queries see more keys (a causal mask, chunks with every
@@ -667,16 +666,18 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         };
         [m, l, acc]
     };
-    let [m, l, acc] = match merge {
-        None => run(&mut k, None),
-        // Every warp leaves its state in its region of the merge scratch; the
-        // block then folds the regions as the split merge does.
-        Some(merge) => {
-            let region = WARP_ROWS * (d + 2);
+    let [m, l, acc] = match kw {
+        1 => run(&mut k, None),
+        // Every warp leaves its state over its own ring slots, dead once its
+        // pipeline ends, as f32 views of the 16-bit rings: the output over
+        // its key slots, the maximum and sum over its value slots; the block
+        // then folds the regions as the split merge does.
+        _ => {
+            let region = stages * bkv * d * T::DTYPE.bytes() / F32::DTYPE.bytes();
             let views = |k: &mut Kernel, at: Sc| {
-                let o = k.smem_view::<F32>(merge, at.clone() * region, Shape::new(WARP_ROWS, d));
-                let m = k.smem_view::<F32>(merge, at.clone() * region + WARP_ROWS * d, Shape::new(WARP_ROWS, 1));
-                let l = k.smem_view::<F32>(merge, at * region + WARP_ROWS * (d + 1), Shape::new(WARP_ROWS, 1));
+                let o = k.smem_view_as::<F32>(k_s, at.clone() * region, Shape::new(WARP_ROWS, d));
+                let m = k.smem_view_as::<F32>(v_s, at.clone() * region, Shape::new(WARP_ROWS, 1));
+                let l = k.smem_view_as::<F32>(v_s, at * region + WARP_ROWS, Shape::new(WARP_ROWS, 1));
                 (o, m, l)
             };
             k.each_warp(|k| {

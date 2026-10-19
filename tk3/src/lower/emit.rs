@@ -62,6 +62,8 @@ struct Emit<'a> {
     /// Per open block: carried values defined in it, moved at its end.
     pending: Vec<Vec<Carried>>,
     smem: Vec<Arc<UOp>>,
+    /// A shared allocation's buffer read under another type, per pair.
+    typed: HashMap<(usize, ScalarDType), Arc<UOp>>,
     scratch: HashMap<ScalarDType, (Arc<UOp>, usize)>,
     lane: Arc<UOp>,
     warp: Arc<UOp>,
@@ -147,6 +149,7 @@ impl<'a> Emit<'a> {
             carried: vec![],
             pending: vec![],
             smem: vec![],
+            typed: HashMap::new(),
             scratch: HashMap::new(),
             last: tid.clone(),
             lane,
@@ -426,10 +429,29 @@ impl<'a> Emit<'a> {
         let val = self.value(v).clone();
         let buf = match &val.place {
             Place::Global { param, .. } => self.params[param.index()].clone(),
-            Place::Smem { alloc, .. } => self.smem[alloc.index()].clone(),
+            Place::Smem { alloc, .. } => self.smem_as(alloc.index(), val.dtype),
             Place::Reg => unreachable!("a memory view"),
         };
         View { buf, place: val.place, shape: val.shape, dtype: val.dtype }
+    }
+
+    /// Allocation `alloc`'s buffer read under `dtype`: its own where they
+    /// agree, else the whole of it as a view typed `dtype` (an address runs
+    /// over the view's type), made once per pair. A view's offset counts its
+    /// own elements, so nothing is scaled.
+    fn smem_as(&mut self, alloc: usize, dtype: ScalarDType) -> Arc<UOp> {
+        let a = &self.prog.smem[alloc];
+        if a.dtype == dtype {
+            return self.smem[alloc].clone();
+        }
+        if let Some(buf) = self.typed.get(&(alloc, dtype)) {
+            return buf.clone();
+        }
+        let elems = (a.elems * a.dtype.bytes() / dtype.bytes()) as i64;
+        let shrink = ops::Shrink { src: self.smem[alloc].clone(), offsets: c32(0), sizes: c32(elems) };
+        let buf = self.hoist(UOp::new(Op::Shrink(shrink), DType::Scalar(dtype)));
+        self.typed.insert((alloc, dtype), buf.clone());
+        buf
     }
 
     /// Element offset of a register's coordinate in a memory view, with the
