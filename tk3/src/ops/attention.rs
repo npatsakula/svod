@@ -12,6 +12,7 @@ use super::{
     DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed,
 };
 use crate::kernels;
+use crate::kernels::Batch;
 pub use crate::kernels::attention::Chunk;
 use crate::kernels::attention::{
     AttnMask, AttnSpec, Bias, CombineSpec, FaCfg, attention as fa, combine, key_mask_stride,
@@ -80,6 +81,9 @@ pub struct Attn<'a> {
 }
 
 const OP: &str = "attention";
+
+/// The lanes a shape is measured at, at most.
+const TUNE_BATCH: usize = 64;
 
 /// `softmax(q·kᵀ·scale + bias)·v` over `q [B, T, H, D]` and `k`/`v [B, Tk, H_kv, D]`,
 /// query head `h` reading KV head `h / (H / H_kv)`; returns `[B, T, H, D]`.
@@ -178,7 +182,6 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let cache = opts.cache.map(|c| kernels::attention::Cache {
         rows: kv_rows,
         heads_total,
-        head_start: c.head_start,
         row_map: c.row_map.is_some(),
         appended,
         app_lens: c.app_lens.is_some(),
@@ -210,19 +213,29 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         })
         .collect();
     let merge = |splits| CombineSpec { batch: batch.clone(), t, heads, d, splits, cfg: NormCfg { br: 4 } };
-    // Measured with the static masks only: scratch parameters would be garbage.
-    let shape = [batch.capacity(), t, tk, heads, kv_heads, d];
-    let salt = (&batch, edges, cache.map(|c| (c.rows, c.heads_total, c.head_start)), opts.splits);
+    // Measured with the static masks only (scratch parameters would be
+    // garbage) and at most `TUNE_BATCH` lanes: more fill the device alike,
+    // and a cache's scratch grows with every lane.
+    let measured = match &batch {
+        Batch::Static(n) if *n > TUNE_BATCH => Batch::Static(TUNE_BATCH),
+        Batch::Var { name, min, max } if *max > TUNE_BATCH as i64 => {
+            Batch::Var { name: name.clone(), min: (*min).min(TUNE_BATCH as i64), max: TUNE_BATCH as i64 }
+        }
+        other => other.clone(),
+    };
+    let shape = [measured.capacity(), t, tk, heads, kv_heads, d];
+    let salt = (&measured, edges, cache.map(|c| c.heads_total), opts.splits);
     let cfg = tuned(OP, &target, q.dtype(), &shape, salt, &cfgs, |cfg| {
         // Scratch caches hold a row per batch lane: no map to read, no garbage rows.
         let plain = cache.map(|c| kernels::attention::Cache {
-            rows: c.rows.max(batch.capacity()),
+            rows: measured.capacity(),
             row_map: false,
             appended: 0,
             app_lens: false,
             ..c
         });
-        let mut programs = vec![(typed!(q.dtype(), fa, &spec(cfg, edges, plain)), cfg.lowering(target.clone()))];
+        let spec = AttnSpec { batch: measured.clone(), ..spec(cfg, edges, plain) };
+        let mut programs = vec![(typed!(q.dtype(), fa, &spec), cfg.lowering(target.clone()))];
         if cfg.splits > 1 {
             let merge = merge(cfg.splits);
             programs.push((typed!(q.dtype(), combine, &merge), merge.cfg.lowering(target.clone())));
@@ -249,6 +262,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         }
     });
     let row_map = opts.cache.and_then(|c| c.row_map).map(i32);
+    let head_start = opts.cache.map(|c| Tensor::from_slice([c.head_start as i32]));
     let (k_app, v_app) = opts.cache.and_then(|c| c.appended).unzip();
     let app_lens = opts.cache.and_then(|c| c.app_lens).map(i32);
     let mask = AttnMask {
@@ -265,6 +279,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         bools.as_ref(),
         segs.as_ref(),
         row_map.as_ref(),
+        head_start.as_ref(),
         k_app,
         v_app,
         app_lens.as_ref(),

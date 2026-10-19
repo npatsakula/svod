@@ -82,7 +82,7 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
     let masked = AttnMask { key_lens: true, key_mask: true, ..AttnMask::default() };
     let spec = fa(37, 75, 64, masked, None, Batch::Var { name: "b".into(), min: 1, max: 2 }).expect("d 64 plans");
     push("attention d64 key masks", attention::<F16>(&spec), spec.cfg.lowering(target.clone()));
-    let cache = Cache { rows: 6, heads_total: 6, head_start: 2, row_map: true, appended: 1, app_lens: false };
+    let cache = Cache { rows: 6, heads_total: 6, row_map: true, appended: 1, app_lens: false };
     let lens = AttnMask { key_lens: true, ..AttnMask::default() };
     let spec = fa(1, 150, 64, lens, Some(cache), Batch::Var { name: "b".into(), min: 1, max: 3 }).expect("d 64 plans");
     push("attention d64 cache", attention::<F16>(&spec), spec.cfg.lowering(target.clone()));

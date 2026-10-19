@@ -42,6 +42,8 @@ struct Case {
     seg_start: Vec<i64>,
     /// `[batch]`: batch `b` reads cache row `rows - 1 - b`.
     row_map: Vec<i64>,
+    /// The first cached head this attention reads.
+    head_start: i64,
     /// `[batch, appended, kv_heads, d]` appended keys and values.
     k_app: Vec<f64>,
     v_app: Vec<f64>,
@@ -92,21 +94,17 @@ fn case(spec: AttnSpec, lens: &[i64]) -> Case {
         .enumerate()
         .map(|(i, x)| if i % stride < keys { 2.0 * x } else { 1e3 })
         .collect();
-    Case { spec, q, k, v, lens: lens.to_vec(), key_mask, seg_start, row_map, k_app, v_app, app_lens, bias }
+    let head_start = spec.kv_heads as i64;
+    Case { spec, q, k, v, lens: lens.to_vec(), key_mask, seg_start, row_map, head_start, k_app, v_app, app_lens, bias }
 }
 
 /// Direct attention in f64 with the same masks and cache reads.
 fn reference(c: &Case) -> Vec<f64> {
     let s = &c.spec;
     let m = s.mask;
-    let cache = s.cache.unwrap_or(Cache {
-        rows: 0,
-        heads_total: s.kv_heads,
-        head_start: 0,
-        row_map: false,
-        appended: 0,
-        app_lens: false,
-    });
+    let cache =
+        s.cache.unwrap_or(Cache { rows: 0, heads_total: s.kv_heads, row_map: false, appended: 0, app_lens: false });
+    let head_start = if s.cache.is_some() { c.head_start as usize } else { 0 };
     let (stride, kv_stride, group) = (s.heads * s.d, cache.heads_total * s.d, s.heads / s.kv_heads);
     let mut out = vec![0.0; s.batch.capacity() * s.t * stride];
     for b in 0..s.batch.capacity() {
@@ -119,7 +117,7 @@ fn reference(c: &Case) -> Vec<f64> {
         let bias_stride = key_mask_stride(keys);
         let bias_row = if m.bias == Some(Bias::PerBatch) { b } else { 0 };
         for h in 0..s.heads {
-            let kv_head = cache.head_start + h / group;
+            let kv_head = head_start + h / group;
             let key = |j: usize, dd: usize, cached: &[f64], appended: &[f64]| {
                 if j < s.tk {
                     cached[(row * s.tk + j) * kv_stride + kv_head * s.d + dd]
@@ -183,6 +181,7 @@ fn extra_params(c: &Case) -> Vec<Vec<f64>> {
             "key_mask" => ints(&c.key_mask),
             "seg_start" => ints(&c.seg_start),
             "row_map" => ints(&c.row_map),
+            "head_start" => vec![c.head_start as f64],
             "k_app" => c.k_app.clone(),
             "v_app" => c.v_app.clone(),
             "app_lens" => ints(&c.app_lens),
@@ -327,7 +326,7 @@ fn cached(
     let mut spec = masked(t, tk, d, 64, 32, AttnMask { key_lens: true, ..AttnMask::default() });
     spec.heads = heads;
     spec.kv_heads = kv_heads;
-    let cache = Cache { rows: 3, heads_total: 3 * kv_heads, head_start: kv_heads, row_map, appended, app_lens: false };
+    let cache = Cache { rows: 3, heads_total: 3 * kv_heads, row_map, appended, app_lens: false };
     spec.cache = Some(cache);
     spec.cfg.splits = splits;
     spec

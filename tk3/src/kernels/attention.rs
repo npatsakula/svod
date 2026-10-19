@@ -107,12 +107,12 @@ pub enum Bias {
 }
 
 /// Keys and values read from a cache of `[rows, tk, heads_total, d]`, the
-/// `kv_heads` heads from `head_start` on.
+/// `kv_heads` heads from a `[1]` i32 `head_start` parameter on: a layer's
+/// slice is a runtime value, so every layer runs the one program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Cache {
     pub rows: usize,
     pub heads_total: usize,
-    pub head_start: usize,
     /// A `[batch]` i32 parameter: the cache row each batch reads.
     pub row_map: bool,
     /// Rows of `[batch, appended, kv_heads, d]` key and value parameters
@@ -150,19 +150,14 @@ impl AttnSpec {
     /// Parameters after the outputs, in order.
     pub fn extra_params(&self) -> Vec<&'static str> {
         let AttnMask { key_lens, key_mask, seg_start, .. } = self.mask;
-        let cache = self.cache.unwrap_or(Cache {
-            rows: 0,
-            heads_total: 0,
-            head_start: 0,
-            row_map: false,
-            appended: 0,
-            app_lens: false,
-        });
+        let cache =
+            self.cache.unwrap_or(Cache { rows: 0, heads_total: 0, row_map: false, appended: 0, app_lens: false });
         [
             (key_lens, "key_lens"),
             (key_mask, "key_mask"),
             (seg_start, "seg_start"),
             (cache.row_map, "row_map"),
+            (self.cache.is_some(), "head_start"),
             (cache.appended > 0, "k_app"),
             (cache.appended > 0, "v_app"),
             (cache.app_lens, "app_lens"),
@@ -227,8 +222,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let AttnMask { causal, window, chunk, key_lens, key_mask, seg_start, bias } = mask;
     let FaCfg { bq, bkv, stages, splits, .. } = cfg;
     let cap = batch.capacity();
-    let (kv_rows, heads_total, head_start) =
-        cache.map_or((cap, kv_heads, 0), |c| (c.rows, c.heads_total, c.head_start));
+    let (kv_rows, heads_total) = cache.map_or((cap, kv_heads), |c| (c.rows, c.heads_total));
     let appended = cache.map_or(0, |c| c.appended);
     assert!(appended <= bkv, "{appended} appended rows overflow a key block of {bkv}");
     let mut k = Kernel::new("flash_attention");
@@ -247,6 +241,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let masks = key_mask.then(|| k.param::<I32>("key_mask", ParamKind::In, cap * mask_stride));
     let segs = seg_start.then(|| k.param::<I32>("seg_start", ParamKind::In, cap * t));
     let row_map = cache.is_some_and(|c| c.row_map).then(|| k.param::<I32>("row_map", ParamKind::In, cap));
+    let head_start = cache.is_some().then(|| k.param::<I32>("head_start", ParamKind::In, 1));
     let app = (appended > 0).then(|| {
         let k_app = k.param::<T>("k_app", ParamKind::In, cap * appended * kv_heads * d);
         let v_app = k.param::<T>("v_app", ParamKind::In, cap * appended * kv_heads * d);
@@ -292,6 +287,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         None => b.clone(),
     };
     let kv_head = hh.clone() / (heads / kv_heads);
+    let head_start = head_start.map_or(Sc::from(0), |p| k.load_scalar(p, 0));
     let kv_base = kv_row * (tk * kv_stride) + (kv_head.clone() + head_start) * d;
     let kv_bound = keys_masked.then(|| len.clone());
     let k_view = k.view(kk, kv_base.clone(), [kv_stride, 1], Shape::new(bkv, d), [kv_bound.clone(), None]);
