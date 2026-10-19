@@ -58,7 +58,7 @@ impl Target {
             GpuArch::Metal(_) => 32,
         };
         let (cp_async, ldmatrix, smem_bytes) = match arch {
-            GpuArch::Cuda(c) => (c.major >= 8, (c.major, c.minor) >= (7, 5), 48 << 10),
+            GpuArch::Cuda(c) => (c.major >= 8, (c.major, c.minor) >= (7, 5), c.max_shared_per_block_optin()),
             GpuArch::Amd(_) => (false, false, 64 << 10),
             GpuArch::Metal(_) => (false, false, 32 << 10),
         };
@@ -69,13 +69,21 @@ impl Target {
     pub fn for_device(spec: &svod_dtype::DeviceSpec) -> Option<Self> {
         use svod_device::registry as reg;
         use svod_dtype::DeviceSpec;
+        let mut smem = None;
         let arch = match spec {
-            DeviceSpec::Cuda { device_id } => GpuArch::Cuda(reg::resolve_cuda_arch(*device_id).ok()?),
+            DeviceSpec::Cuda { device_id } => {
+                smem = reg::resolve_cuda_limits(*device_id).ok().map(|l| l.shared_per_block_optin as usize);
+                GpuArch::Cuda(reg::resolve_cuda_arch(*device_id).ok()?)
+            }
             DeviceSpec::Amd { device_id } => GpuArch::Amd(reg::resolve_amd_arch_from_topology(*device_id).ok()?),
             DeviceSpec::Metal { device_id } => GpuArch::Metal(reg::resolve_metal_family(*device_id).ok()?),
             DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => return None,
         };
-        Some(Self::for_arch(arch))
+        let mut target = Self::for_arch(arch);
+        if let Some(smem) = smem {
+            target.smem_bytes = smem;
+        }
+        Some(target)
     }
 
     /// The matrix core for `dtype_in → dtype_out`, if the target has one.

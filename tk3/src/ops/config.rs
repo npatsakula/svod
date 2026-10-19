@@ -42,8 +42,9 @@ pub fn choose_gemm(target: &Target, m: usize, n: usize, k: usize, gated: bool) -
         .copied()
 }
 
-/// One warp per 16 query rows; `d = 128` takes half-width key blocks to stay
-/// within static shared memory.
+/// One warp per 16 query rows. `d = 128` keeps half-width key blocks even
+/// where shared memory allows 64: measured 18.2 TFLOP/s against 22.2 on
+/// sm_86, since 64 KB per block leaves one block per SM.
 pub fn choose_attention(target: &Target, d: usize) -> Option<FaCfg> {
     let cfg = match d {
         64 => FaCfg { bq: 64, bkv: 64, stages: 2 },

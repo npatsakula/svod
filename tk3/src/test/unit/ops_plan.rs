@@ -30,7 +30,7 @@ fn rdna3() -> Target {
 // ---- linear ------------------------------------------------------------------------
 
 #[test_case(&[4096, 4096], 4096, false, Plan::Kernel(gemm_cfg([128, 128, 32], 3, [2, 4])); "large grid, deepest ring")]
-#[test_case(&[4096, 4096], 4096, true, Plan::Kernel(gemm_cfg([128, 128, 32], 2, [2, 4])); "gated drops a stage for smem")]
+#[test_case(&[4096, 4096], 4096, true, Plan::Kernel(gemm_cfg([128, 128, 32], 3, [2, 4])); "gated keeps the ring in 99 KB")]
 #[test_case(&[8, 37, 512], 512, false, Plan::Kernel(GemmCfg { unroll: true, ..gemm_cfg([128, 64, 32], 2, [2, 2]) }); "medium grid")]
 #[test_case(&[37, 64], 96, false, Plan::Kernel(gemm_cfg([64, 64, 32], 2, [2, 2])); "few rows")]
 #[test_case(&[37, 48], 96, false, Plan::Kernel(gemm_cfg([64, 64, 16], 2, [2, 2])); "k a multiple of 16 only")]
@@ -39,6 +39,15 @@ fn rdna3() -> Target {
 #[test_case(&[0, 64], 96, false, Plan::Graph(Fallback::Shape); "no rows")]
 fn linear_plans(x: &[usize], n: usize, gated: bool, want: Plan<GemmCfg>) {
     assert_eq!(shape::linear(Some(&sm86()), &[BF16, BF16], Some(&ext(x)), n, gated), want);
+}
+
+/// A target capped at static shared memory drops a stage for the gated GEMM.
+#[test]
+fn gated_linear_drops_a_stage_under_a_static_cap() {
+    let mut target = sm86();
+    target.smem_bytes = 48 << 10;
+    let want = Plan::Kernel(gemm_cfg([128, 128, 32], 2, [2, 4]));
+    assert_eq!(shape::linear(Some(&target), &[BF16, BF16], Some(&ext(&[4096, 4096])), 4096, true), want);
 }
 
 #[test_case(None, &[BF16, BF16], true, Fallback::Target; "no target")]
@@ -75,7 +84,7 @@ fn f16_takes_the_kernels() {
 // ---- attention ---------------------------------------------------------------------
 
 #[test_case(64, Plan::Kernel(FaCfg { bq: 64, bkv: 64, stages: 2 }); "d 64")]
-#[test_case(128, Plan::Kernel(FaCfg { bq: 64, bkv: 32, stages: 2 }); "d 128 narrows the key block")]
+#[test_case(128, Plan::Kernel(FaCfg { bq: 64, bkv: 32, stages: 2 }); "d 128 keeps the half-width key block")]
 #[test_case(48, Plan::Graph(Fallback::Shape); "d 48")]
 #[test_case(256, Plan::Graph(Fallback::Shape); "d 256")]
 fn attention_plans(d: usize, want: Plan<FaCfg>) {
