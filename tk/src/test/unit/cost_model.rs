@@ -3,13 +3,16 @@
 //! flash attention at d64/d128 with and without a causal mask) compiled and
 //! timed beside the ns the model ranks it at, and the tuner's pick timed
 //! with them. One `fit|…` line a config and a `pick|…` line a shape, for an
-//! offline fit of rank correlation and regret; never asserts.
+//! offline fit of rank correlation and regret; never asserts. And the
+//! model's terms on the host, from fixture costs.
+
+use proptest::prelude::*;
 
 use crate::build::BF16;
 use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::kernels::{Act, Batch};
-use crate::ops::config::{Attention, Problem};
+use crate::ops::config::{Attention, DIAGONAL, Problem};
 use crate::tune::{Bench, Candidate, Compiled};
 
 /// Each of `ranked` compiled (in ranked batches, as the tuner admits), then
@@ -104,4 +107,45 @@ fn cost_model_probe() {
         let (verdicts, ns) = timed(&ranked, &[pick], build);
         report(label, &ranked, &predicted, &verdicts, &ns, &pick);
     }
+}
+
+/// The key blocks the kernel runs for a causal query block at `q_off`: up to
+/// the block holding its last query's key, at most all of them (the mask is
+/// aligned at the first query and key, `kernels::attention`'s `end`).
+fn kernel_trips(t: usize, tk: usize, bq: usize, bkv: usize) -> f64 {
+    let blocks: Vec<usize> = (0..t.div_ceil(bq)).map(|j| tk.div_ceil(bkv).min((j * bq + bq).div_ceil(bkv))).collect();
+    blocks.iter().sum::<usize>() as f64 / blocks.len() as f64
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// A causal block's trips as the model counts them hold the kernel's
+    /// mean over the query blocks (an appended cache, `t < tk`, included:
+    /// its queries see the first keys, not the last), and its diagonal
+    /// stays within the [`DIAGONAL`] trips a key block of it is charged.
+    #[test]
+    fn causal_trips_hold_the_kernels(
+        t in 1usize..3000,
+        tk in 1usize..5000,
+        bq in prop::sample::select(vec![16usize, 32, 64, 128]),
+        bkv in prop::sample::select(vec![16usize, 32, 64, 128]),
+    ) {
+        let p = Attention { tiles: 1, t, tk, d: 64, causal: true, bias: false };
+        let model = p.causal_trips(bq, bkv) as f64;
+        let diagonal = (DIAGONAL * bq.div_ceil(bkv)) as f64;
+        let kernel = kernel_trips(t, tk, bq, bkv);
+        prop_assert!(kernel <= model + 1.0, "kernel {kernel}, model {model}");
+        prop_assert!(model - diagonal <= kernel + 1.0, "kernel {kernel}, model {model}");
+    }
+}
+
+/// Where queries and keys are one sequence the count is the one before
+/// the mask's alignment was counted: half the key blocks and the diagonal.
+#[test_case::test_case(2048, 64, 64; "d64 blocks")]
+#[test_case::test_case(1500, 128, 32; "whisper")]
+#[test_case::test_case(384, 16, 128; "qwen3")]
+fn causal_trips_of_one_sequence_are_half_the_keys(t: usize, bq: usize, bkv: usize) {
+    let p = Attention { tiles: 1, t, tk: t, d: 64, causal: true, bias: false };
+    assert_eq!(p.causal_trips(bq, bkv), t.div_ceil(2 * bkv) + DIAGONAL * bq.div_ceil(bkv));
 }

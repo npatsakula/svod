@@ -944,7 +944,7 @@ const TWO_ROWS_FROM: usize = 64;
 /// Model: trips a key block on a causal query block's diagonal counts for: the
 /// block itself, its mask, and the rows above the diagonal every warp still
 /// runs. A count of the work, not a fit.
-const DIAGONAL: usize = 3;
+pub(crate) const DIAGONAL: usize = 3;
 
 /// An attention problem: `tiles` independent query rows of `t` queries over
 /// `tk` keys at head size `d` (`tiles` = batch × heads), `causal` when a
@@ -970,9 +970,8 @@ impl Attention {
     /// come from, every tile's keys and values the distinct ones; a bias
     /// tile is filled and read once per trip like them, every one of its
     /// bytes distinct) and steps, the softmax of every score and its
-    /// overhead. A causal query block
-    /// scores half the keys plus its diagonal, a key block per `bkv` of its
-    /// rows, each [`DIAGONAL`] trips. Key warps each take a share of the
+    /// overhead. A causal query block scores the keys its queries see on
+    /// average plus its diagonal ([`Self::causal_trips`]). Key warps each take a share of the
     /// trips, every trip of theirs the block's whole work at once. The query
     /// blocks in flight at once share their tiles' keys and values whatever
     /// the cache holds of the whole; a wave's independent accumulators are
@@ -1018,8 +1017,7 @@ impl Attention {
         let fragments = kv_reads + bias;
         let fill = kw * 2 * bkv * d * ELEM + bias;
         let steps = kw * 2 * bq * bkv * d / STEP;
-        let diagonal = DIAGONAL * bq.div_ceil(bkv);
-        let trips = if self.causal { self.tk.div_ceil(2 * bkv) + diagonal } else { self.tk.div_ceil(bkv) };
+        let trips = if self.causal { self.causal_trips(bq, bkv) } else { self.tk.div_ceil(bkv) };
         let trips = trips.div_ceil(kw);
         let (blocks, stages) = (self.blocks(cfg), cfg.stages);
         let unique = (self.tiles * self.tk * (d * 2 + usize::from(self.bias) * self.t) * ELEM) as f64;
@@ -1031,6 +1029,17 @@ impl Attention {
         let trip = costs.trip(target.fill, stages, cfg.unroll);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
         Ok((planner.pipelined(run), regs))
+    }
+
+    /// The key-block trips of a causal query block of `bq` rows over key
+    /// blocks of `bkv`, on average over the blocks: the mask is aligned at
+    /// the first query and key (query `i` sees keys `0..=i`), so a query
+    /// sees `min(i + 1, tk)` keys and the `t` queries `seen · (2t − seen) / 2`
+    /// on average with `seen = min(t, tk)`; plus the block's diagonal, a key
+    /// block per `bkv` of its rows, each [`DIAGONAL`] trips.
+    pub(crate) fn causal_trips(&self, bq: usize, bkv: usize) -> usize {
+        let (t, seen) = (self.t, self.t.min(self.tk));
+        (seen * (2 * t - seen)).div_ceil(2 * t * bkv) + DIAGONAL * bq.div_ceil(bkv)
     }
 
     /// Every config the ranking spans for this problem on `target`: every
