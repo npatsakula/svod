@@ -283,7 +283,11 @@ impl Problem {
     /// pays its fragment reads, fill, matrix-core steps (padding included)
     /// and overhead. The fill's bytes are the whole operands' distinct ones,
     /// and the blocks in flight at once (one an SM at least) share a group's
-    /// A rows and their B columns whatever the cache holds of the whole.
+    /// A rows and their B columns whatever the cache holds of the whole. Two
+    /// crews are priced as the one-crew pipeline of their tile: the overlap
+    /// of one crew's products with the other's loads has no term, since
+    /// only CDNA runs them ([`Target::crews`]) and no CDNA card has measured
+    /// one; the tuner times them beside the rest.
     pub fn admit(&self, planner: &Planner, cfg: &GemmCfg) -> Result<(f64, u32), Rejected> {
         let Device { target, costs } = &planner.device;
         let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
