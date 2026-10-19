@@ -40,7 +40,9 @@ fn tk1_vs_tk3_gemm_side_by_side() {
         return;
     }
     let target = Target::for_device(&device).expect("a tk3 target");
-    let device = Device { costs: svod_tk3::probe::costs(&target).expect("device costs"), target };
+    let measured = svod_tk3::probe::costs(&target).expect("device costs");
+    assert!(measured.unmeasured.is_empty(), "unmeasured: {:?}", measured.unmeasured);
+    let device = Device { costs: measured.costs, target };
     let plain = Epilogue::default();
     let residual = Epilogue { residual: true, ..plain };
     let swiglu = Epilogue { act: Act::Silu, gated: true, ..plain };
