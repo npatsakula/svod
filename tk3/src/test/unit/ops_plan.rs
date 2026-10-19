@@ -10,6 +10,7 @@ use crate::atoms::{Target, sm86};
 use crate::kernels::attention::FaCfg;
 use crate::kernels::gemm::GemmCfg;
 use crate::kernels::rows::NormCfg;
+use crate::ops::config;
 use crate::ops::shape::{self, Extent, Fallback, Plan, extent};
 use crate::ops::{self as tk, Attn, Cache, Error, KeyMask, Linear, Qkv};
 
@@ -180,6 +181,29 @@ fn attention_candidates(d: usize, smem: usize, count: usize) {
     for bq in [64, 128] {
         assert!(list.iter().any(|c| c.bq == bq));
     }
+}
+
+/// A decoder step's shapes get one-warp query tiles.
+#[test_case(1, 64, 3; "one query, d 64")]
+#[test_case(16, 128, 3; "sixteen queries, d 128")]
+#[test_case(17, 64, 6; "seventeen queries keep the prefill list")]
+fn decode_attention_candidates(t: usize, d: usize, count: usize) {
+    let (q, kv) = (ext(&[4, t, 8, d]), ext(&[4, 1500, 8, d]));
+    let Plan::Kernel(list) = shape::attention(Some(&sm86()), &[BF16; 3], Some(&q), Some(&kv)) else { panic!() };
+    assert_eq!(list.len(), count, "{list:?}");
+    assert!(list.iter().all(|c| (c.bq == 16) == (t <= 16)));
+}
+
+/// One and two always; around two blocks per SM otherwise, never past the
+/// key blocks, and none without an SM count.
+#[test_case(20, 24, &[1, 2, 3, 6]; "twenty tiles on 28 SMs")]
+#[test_case(20, 2, &[1, 2]; "two key blocks")]
+#[test_case(224, 24, &[1, 2]; "enough tiles already")]
+#[test_case(1, 24, &[1, 2, 24]; "one tile: the blocks cap")]
+fn split_candidates(tiles: usize, blocks: usize, want: &[usize]) {
+    assert_eq!(config::split_candidates(&sm86(), tiles, blocks), want);
+    let unknown = Target { sms: None, ..sm86() };
+    assert_eq!(config::split_candidates(&unknown, tiles, blocks), [1]);
 }
 
 #[test]

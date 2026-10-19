@@ -79,15 +79,37 @@ pub fn gemm_candidates(target: &Target, batches: usize, m: usize, n: usize, k: u
 /// 64-wide ones measured 18.2 TFLOP/s against 22.2 on sm_86, since 64 KB
 /// per block leaves one block per SM. `d = 48` keeps the shapes whose K/V
 /// fills divide among the block's threads (96-byte rows, 16-byte chunks).
-pub fn attention_candidates(target: &Target, d: usize) -> Vec<FaCfg> {
+/// A decoder step (`t ≤ 16`) is bandwidth-bound: one-warp blocks, which
+/// leave room for several per SM.
+pub fn attention_candidates(target: &Target, d: usize, t: usize) -> Vec<FaCfg> {
     let fa = FaCfg::new;
-    let list = match d {
-        48 => vec![fa(64, 64, 2), fa(64, 64, 3)],
-        64 => vec![fa(64, 64, 2), fa(64, 64, 3), fa(128, 64, 2), fa(64, 32, 2), fa(128, 32, 2), fa(64, 32, 3)],
-        128 => vec![fa(64, 32, 2), fa(64, 32, 3), fa(128, 32, 2), fa(64, 64, 2), fa(128, 64, 2), fa(128, 32, 3)],
+    let list = match (d, t <= 16) {
+        (48 | 64 | 128, true) => vec![fa(16, 64, 2), fa(16, 64, 3), fa(16, 32, 2)],
+        (48, false) => vec![fa(64, 64, 2), fa(64, 64, 3)],
+        (64, false) => vec![fa(64, 64, 2), fa(64, 64, 3), fa(128, 64, 2), fa(64, 32, 2), fa(128, 32, 2), fa(64, 32, 3)],
+        (128, false) => {
+            vec![fa(64, 32, 2), fa(64, 32, 3), fa(128, 32, 2), fa(64, 64, 2), fa(128, 64, 2), fa(128, 32, 3)]
+        }
         _ => return vec![],
     };
     list.into_iter().filter(|c| c.smem_bytes(d) <= target.smem_bytes).collect()
+}
+
+/// Key splits worth measuring for `tiles` independent query tiles over
+/// `blocks` key blocks: one, two, the counts around what keeps two blocks
+/// per SM busy, and every block its own split when that is within reach
+/// (the merge costs a launch, so never past the blocks). A target without
+/// an SM count keeps one.
+pub fn split_candidates(target: &Target, tiles: usize, blocks: usize) -> Vec<usize> {
+    let Some(sms) = target.sms else { return vec![1] };
+    let want = (2 * sms as usize).div_ceil(tiles.max(1));
+    let mut out: Vec<usize> = [1, 2, want / 2, want, 2 * want, blocks]
+        .into_iter()
+        .filter(|&s| (1..=blocks.min(2 * want)).contains(&s))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// One warp per head row, the head split in halves a warp spreads over.

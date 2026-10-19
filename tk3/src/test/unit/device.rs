@@ -191,7 +191,7 @@ fn gemm_candidates_probe() {
         let cfgs = gemm_candidates(&target, 1, m, n, k, false);
         let build = |cfg| {
             let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };
-            (gemm::<BF16>(&spec), cfg.lowering(target.clone()))
+            vec![(gemm::<BF16>(&spec), cfg.lowering(target.clone()))]
         };
         let ns = crate::tune::measure(cfgs.iter().map(|&c| build(c)));
         let tflops = |ns: u64| 2.0 * (m * n * k) as f64 / ns as f64 / 1e3;

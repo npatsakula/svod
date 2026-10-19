@@ -6,6 +6,7 @@ use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
+use super::config;
 use super::shape::{self, Plan, extent, shape_of};
 use super::{
     DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed,
@@ -156,14 +157,31 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         scale: opts.scale.unwrap_or(1.0 / (d as f32).sqrt()),
         cfg,
     };
+    // Every config with every split count worth measuring (a given one is
+    // capped at the key blocks), the unsplit pick first.
+    let cfgs: Vec<FaCfg> = cfgs
+        .into_iter()
+        .flat_map(|c| {
+            let blocks = tk.div_ceil(c.bkv);
+            let splits = match opts.splits {
+                Some(n) => vec![n.clamp(1, blocks)],
+                None => config::split_candidates(&target, batch.capacity() * heads * t.div_ceil(c.bq), blocks),
+            };
+            splits.into_iter().map(move |splits| FaCfg { splits, ..c })
+        })
+        .collect();
+    let merge = |splits| CombineSpec { batch: batch.clone(), t, heads, d, splits, cfg: NormCfg { br: 4 } };
     // Measured with the static masks only: scratch parameters would be garbage.
-    let splits = opts.splits.unwrap_or(1).clamp(1, tk.div_ceil(cfgs[0].bkv));
-    let cfgs: Vec<FaCfg> = cfgs.into_iter().map(|c| FaCfg { splits: splits.min(tk.div_ceil(c.bkv)), ..c }).collect();
     let shape = [batch.capacity(), t, tk, heads, kv_heads, d];
-    let salt = (&batch, edges, cache.map(|c| (c.rows, c.heads_total, c.head_start)));
+    let salt = (&batch, edges, cache.map(|c| (c.rows, c.heads_total, c.head_start)), opts.splits);
     let cfg = tuned(OP, &target, q.dtype(), &shape, salt, &cfgs, |cfg| {
         let plain = cache.map(|c| kernels::attention::Cache { row_map: false, appended: false, ..c });
-        (typed!(q.dtype(), fa, &spec(cfg, edges, plain)), cfg.lowering(target.clone()))
+        let mut programs = vec![(typed!(q.dtype(), fa, &spec(cfg, edges, plain)), cfg.lowering(target.clone()))];
+        if cfg.splits > 1 {
+            let merge = merge(cfg.splits);
+            programs.push((typed!(q.dtype(), combine, &merge), merge.cfg.lowering(target.clone())));
+        }
+        programs
     });
     let i32 = |t: &Tensor| if t.dtype() == DType::Int32 { t.clone() } else { t.cast(DType::Int32) };
     let lens = lens.map(i32);
@@ -198,7 +216,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         .collect();
     let parts =
         launch::graph_launch_all(typed!(q.dtype(), fa, &spec), &lowering, &ins).context(LaunchSnafu { op: OP })?;
-    let merge = CombineSpec { batch: batch.clone(), t, heads, d, splits: cfg.splits, cfg: NormCfg { br: 4 } };
+    let merge = merge(cfg.splits);
     let o = output(&q_ext.dims, &var, q.dtype());
     let ins = [&parts[3], &parts[4], &parts[5], &o];
     launch::graph_launch(typed!(q.dtype(), combine, &merge), &merge.cfg.lowering(target), &ins)

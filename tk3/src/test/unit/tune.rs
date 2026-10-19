@@ -134,7 +134,7 @@ fn a_gemm_tunes_on_the_device() {
     let batch = Batch::Var { name: "b".into(), min: 1, max: 1 };
     let build = |cfg: GemmCfg| {
         let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue: Epilogue::default(), cfg };
-        (gemm::<BF16>(&spec), cfg.lowering(target.clone()))
+        vec![(gemm::<BF16>(&spec), cfg.lowering(target.clone()))]
     };
     let key = TuneKey::new("gemm", &target, ScalarDType::BFloat16, &[1, m, n, k], &cfgs);
     let dir = scratch("device");

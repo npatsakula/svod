@@ -26,10 +26,8 @@ pub use self::heads::{Qkv, heads};
 pub use self::linear::{Linear, linear};
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
 use crate::atoms::Target;
-use crate::ir::Program;
 pub use crate::kernels::Act;
 use crate::kernels::Batch;
-use crate::lower::Lowering;
 use crate::tune::{self, TuneKey, TuneStore};
 use shape::BatchVar;
 
@@ -80,7 +78,7 @@ fn tuned<C: Copy + std::fmt::Debug>(
     shape: &[usize],
     salt: impl std::fmt::Debug,
     candidates: &[C],
-    build: impl Fn(C) -> (Program, Lowering),
+    build: impl Fn(C) -> tune::Candidate,
 ) -> C {
     if candidates.len() == 1 || !tune::enabled() {
         return candidates[0];

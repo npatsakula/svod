@@ -141,7 +141,7 @@ pub fn attention(target: Option<&Target>, dtypes: &[DType], q: Option<&Extent>, 
         if q.dims.contains(&0) || k.dims.contains(&0) {
             return Err(Fallback::Shape);
         }
-        candidates(config::attention_candidates(target, q.dims[3]), Fallback::Shape)
+        candidates(config::attention_candidates(target, q.dims[3], q.dims[1]), Fallback::Shape)
     })
 }
 
