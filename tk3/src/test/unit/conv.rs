@@ -14,12 +14,12 @@ use crate::atoms::sm86;
 use crate::build::F16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
-use crate::kernels::conv::{ConvGeom, ConvSpec, conv};
+use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec, conv};
 use crate::kernels::gemm::{Epilogue, GemmCfg};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch;
 use crate::lower::lower;
-use crate::ops::config::{conv_candidates, conv_cfg_fits};
+use crate::ops::config::{conv_candidates, conv_cfg_fits, conv_tiles};
 
 pub(super) fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, p: usize, d: usize) -> ConvGeom {
     ConvGeom { h: hw[0], w: hw[1], cin, cout, kernel: [k, k], stride: [s, s], pad: [p, p], dilation: [d, d] }
@@ -114,7 +114,7 @@ fn cfg(tile: [usize; 3], warps: [u32; 2], stages: usize) -> GemmCfg {
 
 fn check_interp(g: ConvGeom, batch: Batch, epi: Epilogue, c: GemmCfg) {
     let images = batch.capacity();
-    let prog = conv::<F16>(&ConvSpec { batch: batch.clone(), geom: g, epilogue: epi, cfg: c });
+    let prog = conv::<F16>(&ConvSpec { batch: batch.clone(), geom: g, epilogue: epi, cfg: c, split: 1 });
     let params = inputs(&g, images, epi, 3);
     let want = reference(&g, images, epi, &params);
     let vars: Vec<(&str, i64)> = match &batch {
@@ -145,14 +145,39 @@ fn a_bound_batch_walks_grid_z() {
     check_interp(geom([6, 5], 16, 32, 3, 2, 1, 1), batch, SILU_BIAS, cfg([32, 32, 16], [2, 2], 3));
 }
 
+/// A reduction split over grid z: the partial program writes one f32
+/// accumulator per split, the merge adds them under the whole epilogue.
+#[test_case(3, Epilogue { residual: true, ..SILU_BIAS }; "three splits, residual")]
+#[test_case(9, Epilogue { out_f32: true, ..SILU_BIAS }; "a split per tap, f32 out")]
+fn split_conv_matches_the_direct_convolution(split: usize, epi: Epilogue) {
+    let (g, images) = (geom([7, 6], 32, 40, 3, 1, 1, 1), 2);
+    let spec =
+        ConvSpec { batch: Batch::Static(images), geom: g, epilogue: epi, cfg: cfg([32, 32, 32], [2, 2], 2), split };
+    let params = inputs(&g, images, epi, 6);
+    let want = reference(&g, images, epi, &params);
+    let [ho, wo] = g.out_hw();
+    let progs = spec.programs::<F16>(&sm86());
+    let partial = vec![0.0; split * images * ho * wo * g.cout];
+    let parts = run(&progs[0].0, vec![params[0].clone(), params[1].clone(), partial], &[]).unwrap();
+    let mut merge_in = vec![parts[2].clone()];
+    merge_in.extend(params[2..].iter().cloned());
+    let got = run(&progs[1].0, merge_in, &[]).unwrap();
+    assert_close("y", got.last().unwrap(), &want, tolerance(epi));
+}
+
 /// The padding is data: an Inf in the corner pixel reaches exactly the
 /// outputs whose window covers it, and no padded tap turns it into NaN.
 #[test]
 fn an_inf_reaches_only_the_windows_over_it() {
     let g = geom([6, 6], 16, 8, 3, 1, 1, 1);
     let epi = Epilogue::DEFAULT;
-    let prog =
-        conv::<F16>(&ConvSpec { batch: Batch::Static(1), geom: g, epilogue: epi, cfg: cfg([32, 32, 16], [2, 2], 2) });
+    let prog = conv::<F16>(&ConvSpec {
+        batch: Batch::Static(1),
+        geom: g,
+        epilogue: epi,
+        cfg: cfg([32, 32, 16], [2, 2], 2),
+        split: 1,
+    });
     let mut params = inputs(&g, 1, epi, 5);
     params[0][0] = f64::INFINITY;
     let y = run(&prog, params, &[]).unwrap().pop().unwrap();
@@ -222,7 +247,8 @@ fn divisions(ops: &[Arc<UOp>]) -> usize {
 fn the_conv_row_decode_sits_in_the_prologue() {
     let c = cfg([64, 64, 32], [2, 2], 3);
     let g = geom([40, 40], 192, 192, 3, 1, 1, 1);
-    let list = emitted(conv::<F16>(&ConvSpec { batch: Batch::Static(1), geom: g, epilogue: SILU_BIAS, cfg: c }), c);
+    let list =
+        emitted(conv::<F16>(&ConvSpec { batch: Batch::Static(1), geom: g, epilogue: SILU_BIAS, cfg: c, split: 1 }), c);
     let start = list.iter().position(|u| matches!(u.op(), Op::Range(..))).unwrap();
     let end = start + list[start..].iter().position(|u| matches!(u.op(), Op::End(..))).unwrap();
     let body = &list[start..end];
@@ -263,10 +289,11 @@ fn conv_candidates_lower() {
     for class in YOLO {
         let g = yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        let cands = conv_candidates(&target, 1, ho * wo, g.cout, g.k(), g.cin);
+        let cands = conv_tiles(&target, 1, ho * wo, &g);
         assert!(!cands.is_empty() || g.cin == 48, "{g:?}");
-        for c in cands {
+        for ConvCfg { gemm: c, split } in cands {
             assert!(conv_cfg_fits(&c) && g.cin.is_multiple_of(c.tile[2]) && c.smem_bytes(false) <= target.smem_bytes);
+            assert!((g.k() / c.tile[2]).is_multiple_of(split));
         }
     }
 }
@@ -280,15 +307,34 @@ fn conv_candidates_lower() {
 fn conv_lead_tiles(cin: usize, cout: usize, hw: usize, s: usize, tile: Option<[usize; 3]>) {
     let g = geom([hw, hw], cin, cout, 3, s, 1, 1);
     let [ho, wo] = g.out_hw();
-    let lead = conv_candidates(&sm86(), 1, ho * wo, cout, g.k(), cin).first().map(|c| c.tile);
+    let lead = conv_tiles(&sm86(), 1, ho * wo, &g).first().map(|c| c.gemm.tile);
     assert_eq!(lead, tile);
+}
+
+/// The classes measured to lose keep the graph: shallow stride-1 bodies
+/// whose grid fills the device; the starved ones and every deep or
+/// stride-2 class keep their tiles.
+#[test]
+fn shallow_stride_one_bodies_on_a_full_grid_have_no_candidates() {
+    let declined: Vec<(usize, usize, [usize; 2])> = YOLO
+        .into_iter()
+        .map(yolo_geom)
+        .filter(|g| {
+            let [ho, wo] = g.out_hw();
+            conv_candidates(&sm86(), 1, ho * wo, g).is_empty()
+        })
+        .map(|g| (g.cin, g.cout, [g.h, g.w]))
+        .collect();
+    assert_eq!(declined, [(192, 192, [40, 40]), (96, 96, [80, 80]), (48, 48, [160, 160])]);
+    let starved = geom([20, 20], 192, 192, 3, 1, 1, 1);
+    assert!(conv_candidates(&sm86(), 1, 400, &starved).iter().any(|c| c.split > 1));
 }
 
 #[test_case(3; "rgb stem")]
 #[test_case(8; "eight channels")]
 #[test_case(40; "a multiple of 8 only")]
 fn too_few_channels_have_no_candidates(cin: usize) {
-    assert!(conv_candidates(&sm86(), 1, 6400, 64, 9 * cin, cin).is_empty());
+    assert!(conv_tiles(&sm86(), 1, 6400, &geom([80, 80], cin, 64, 3, 1, 1, 1)).is_empty());
 }
 
 // ---- on the device -----------------------------------------------------------------
@@ -354,7 +400,19 @@ fn on_device(spec: &ConvSpec, target: &crate::atoms::Target, params: &[Vec<f64>]
         })
         .collect();
     let refs: Vec<&Tensor> = tensors.iter().collect();
-    let y = graph_launch(conv::<F16>(spec), &spec.cfg.lowering(target.clone()), &refs).unwrap();
+    let mut programs = spec.programs::<F16>(target).into_iter();
+    let (prog, lowering) = programs.next().unwrap();
+    let y = match programs.next() {
+        None => graph_launch(prog, &lowering, &refs).unwrap(),
+        Some((merge, merge_lowering)) => {
+            let [ho, wo] = spec.geom.out_hw();
+            let partial =
+                Tensor::empty(&[spec.split * spec.batch.capacity() * ho * wo * spec.geom.cout], DType::Float32);
+            let partial = graph_launch(prog, &lowering, &[refs[0], refs[1], &partial]).unwrap();
+            let rest: Vec<&Tensor> = std::iter::once(&partial).chain(refs[2..].iter().copied()).collect();
+            graph_launch(merge, &merge_lowering, &rest).unwrap()
+        }
+    };
     y.cast(DType::Float32).to_vec::<f32>().unwrap()
 }
 
@@ -382,8 +440,9 @@ fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
         let [ho, wo] = g.out_hw();
         let params = inputs(&g, 1, RESIDUAL_SILU_BIAS, 13);
         let want = graph_reference(&g, 1, RESIDUAL_SILU_BIAS, &params);
-        for c in conv_candidates(&target, 1, ho * wo, g.cout, g.k(), g.cin) {
-            let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue: RESIDUAL_SILU_BIAS, cfg: c };
+        for c in conv_tiles(&target, 1, ho * wo, &g) {
+            let (epilogue, split) = (RESIDUAL_SILU_BIAS, c.split);
+            let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue, cfg: c.gemm, split };
             let got = on_device(&spec, &target, &params);
             let worst = assert_close_f32(&format!("{g:?} {c:?}"), &got, &want, 2e-3);
             eprintln!("{}->{} {}x{} s{} {c:?}: max abs diff {worst:.2e}", g.cin, g.cout, g.h, g.w, g.stride[0]);
@@ -400,7 +459,7 @@ fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
 fn conv_matches_on_the_device(g: ConvGeom, images: usize, epi: Epilogue, tile: [usize; 3]) {
     let Some(target) = cuda_target() else { return };
     let warps = if tile[1] == 48 { [2, 1] } else { [2, 2] };
-    let spec = ConvSpec { batch: Batch::Static(images), geom: g, epilogue: epi, cfg: cfg(tile, warps, 3) };
+    let spec = ConvSpec { batch: Batch::Static(images), geom: g, epilogue: epi, cfg: cfg(tile, warps, 3), split: 1 };
     let params = inputs(&g, images, epi, 21);
     let got = on_device(&spec, &target, &params);
     let want = reference(&g, images, epi, &params);
@@ -419,7 +478,8 @@ fn an_inf_gives_the_graphs_non_finite_set_on_the_device() {
     let epi = SILU_BIAS;
     let mut params = inputs(&g, 1, epi, 8);
     params[0][0] = f64::INFINITY;
-    let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue: epi, cfg: cfg([64, 64, 32], [2, 2], 3) };
+    let spec =
+        ConvSpec { batch: Batch::Static(1), geom: g, epilogue: epi, cfg: cfg([64, 64, 32], [2, 2], 3), split: 1 };
     let got = on_device(&spec, &target, &params);
     let want = graph_reference(&g, 1, epi, &params);
     let bad = |v: &[f32]| v.iter().enumerate().filter(|(_, x)| !x.is_finite()).map(|(i, _)| i).collect::<Vec<_>>();
@@ -440,6 +500,7 @@ fn a_bound_batch_runs_the_live_images_on_the_device() {
         geom: g,
         epilogue: RESIDUAL_SILU_BIAS,
         cfg: cfg([64, 64, 32], [2, 2], 3),
+        split: 1,
     };
     let params = inputs(&g, cap, RESIDUAL_SILU_BIAS, 4);
     let tensors: Vec<Tensor> = params.iter().map(|p| upload(p, DType::Float16)).collect();
@@ -463,4 +524,92 @@ fn half_to_f32(h: u16) -> f32 {
         e => (1.0 + frac / 1024.0) * 2f32.powi(e - 15),
     };
     if sign == 1 { -v } else { v }
+}
+
+/// `(cin, cout, input side, stride, channels-last in the model)` of the
+/// memo's §3.4 classes at YOLO26x 640², batch 1, 3×3 padded 1.
+const PROBE: [(usize, usize, usize, usize, bool); 12] = [
+    (384, 384, 160, 2, false),
+    (768, 768, 80, 2, false),
+    (384, 384, 80, 2, false),
+    (768, 768, 40, 2, false),
+    (96, 192, 320, 2, false),
+    (192, 192, 40, 1, true),
+    (192, 192, 20, 1, true),
+    (96, 96, 80, 1, true),
+    (384, 96, 80, 1, false),
+    (768, 96, 40, 1, false),
+    (768, 96, 20, 1, false),
+    (48, 48, 160, 1, true),
+];
+
+/// Device time of one run of `plan`: every kernel's, summed.
+fn plan_ns(plan: &svod_runtime::ExecutionPlan) -> u64 {
+    let profile = plan.execute_profiled().unwrap();
+    profile.iter().filter_map(|k| k.gpu_end_ns?.checked_sub(k.gpu_start_ns?)).sum()
+}
+
+/// Throughput of every conv candidate per class, timed as the tune store
+/// times them, against the graph's f16 conv (bias and SiLU at f32, one
+/// rounding) over the layout the model holds; run under `BEAM=4` for the
+/// graph arm the model gets. Prints µs and TFLOP/s and never asserts.
+#[test]
+#[ignore = "perf probe: needs a CUDA device"]
+fn conv_throughput_probe() {
+    let Some(target) = cuda_target() else { return };
+    let dtype = DType::Float16;
+    for (cin, cout, side, stride, chain) in PROBE {
+        let g = geom([side, side], cin, cout, 3, stride, 1, 1);
+        let [ho, wo] = g.out_hw();
+        let flops = 2.0 * (ho * wo * cout * g.k()) as f64;
+        let tflops = |ns: f64| flops / ns / 1e3;
+        let label = format!("{cin}->{cout} s{stride} @{side}");
+        let cands = conv_tiles(&target, 1, ho * wo, &g);
+        let declined = conv_candidates(&target, 1, ho * wo, &g).is_empty();
+        let build = |c: ConvCfg| {
+            let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue: SILU_BIAS, cfg: c.gemm, split: c.split };
+            spec.programs::<F16>(&target)
+        };
+        let times = crate::tune::measure(cands.iter().map(|&c| build(c)));
+        for (ConvCfg { gemm: c, split }, t) in cands.iter().zip(&times) {
+            let t =
+                t.map_or("failed".into(), |t| format!("{:8.1} us {:5.1} TFLOP/s", t as f64 / 1e3, tflops(t as f64)));
+            eprintln!("  {label} tk3 {:?} s{} {:?} unroll={} split {split}: {t}", c.tile, c.stages, c.warps, c.unroll);
+        }
+
+        let mut seed = 1;
+        let mut rand = |shape: &[usize]| upload(&halves(shape.iter().product(), &mut seed, 1.0), dtype.clone());
+        let shape = |dims: &[usize]| dims.iter().map(|&d| d as isize).collect::<Vec<_>>();
+        let w = rand(&[cout, 3, 3, cin]).try_reshape(shape(&[cout, 3, 3, cin])).unwrap();
+        let x = if chain {
+            let x = rand(&[side, side, cin]).try_reshape(shape(&[1, side, side, cin])).unwrap();
+            x.try_permute(&[0, 3, 1, 2]).unwrap()
+        } else {
+            rand(&[cin, side, side]).try_reshape(shape(&[1, cin, side, side])).unwrap()
+        };
+        let bias = rand(&[cout]);
+        let y = x
+            .conv2d()
+            .weight(&w.try_permute(&[0, 3, 1, 2]).unwrap())
+            .bias(&bias)
+            .stride(&[stride, stride])
+            .padding(&[(1, 1), (1, 1)])
+            .acc_dtype(DType::Float32)
+            .call()
+            .unwrap()
+            .silu()
+            .unwrap()
+            .cast(dtype.clone())
+            .contiguous();
+        let plan = y.prepare().unwrap();
+        let warm = std::time::Instant::now();
+        while warm.elapsed().as_millis() < 500 {
+            plan.execute().unwrap();
+        }
+        let graph = (0..20).map(|_| plan_ns(&plan)).min().unwrap() as f64;
+        let best = times.iter().flatten().min().map(|&t| t as f64);
+        let tk3 = best.map_or("none".into(), |t| format!("{:.1} us {:.1} TFLOP/s", t / 1e3, tflops(t)));
+        let tk3 = if declined { format!("{tk3} (declined: the graph runs)") } else { tk3 };
+        eprintln!("{label}: tk3 {tk3}; graph {:.1} us {:.1} TFLOP/s", graph / 1e3, tflops(graph));
+    }
 }

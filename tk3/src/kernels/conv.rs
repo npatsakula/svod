@@ -3,9 +3,11 @@
 //! and `K = kh·kw·cin` walked tap-major, one pipeline over every tap.
 
 use super::Batch;
-use super::gemm::{Epilogue, GemmCfg, GemmSpec, mainloop_gemm};
+use super::gemm::{Epilogue, GemmCfg, GemmSpec, MergeSpec, mainloop_gemm, split_merge};
+use crate::atoms::Target;
 use crate::build::*;
 use crate::ir::*;
+use crate::lower::Lowering;
 
 /// Shapes of one image's convolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -33,6 +35,11 @@ impl ConvGeom {
         [extent(0), extent(1)]
     }
 
+    /// The same geometry padded `pad` on both axes.
+    pub fn with_pad(self, pad: usize) -> Self {
+        Self { pad: [pad, pad], ..self }
+    }
+
     /// The reduction dim `kh·kw·cin`.
     pub fn k(&self) -> usize {
         self.kernel[0] * self.kernel[1] * self.cin
@@ -46,7 +53,20 @@ pub struct ConvSpec {
     pub geom: ConvGeom,
     pub epilogue: Epilogue,
     pub cfg: GemmCfg,
+    /// Reduction splits over grid z (a static batch only): the kernel writes
+    /// f32 partials and [`split_merge`] adds them under the epilogue.
+    pub split: usize,
 }
+
+/// A convolution's tile config and reduction split, as the tune store picks them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ConvCfg {
+    pub gemm: GemmCfg,
+    pub split: usize,
+}
+
+/// The tile of the split merge: f32 rows, natural layouts.
+const MERGE_TILE: [usize; 2] = [32, 32];
 
 impl ConvSpec {
     /// The GEMM this convolution is: rows, columns, reduction and grid batch.
@@ -58,12 +78,30 @@ impl ConvSpec {
         };
         GemmSpec { m, n: self.geom.cout, k: self.geom.k(), batch, epilogue: self.epilogue, cfg: self.cfg }
     }
+
+    /// The merge of a split convolution.
+    pub fn merge(&self) -> MergeSpec {
+        let gemm = self.gemm();
+        MergeSpec { m: gemm.m, n: gemm.n, split: self.split, epilogue: self.epilogue, tile: MERGE_TILE }
+    }
+
+    /// The programs to launch in order with their lowerings: the convolution,
+    /// or its partials and their merge.
+    pub fn programs<T: Elem>(&self, target: &Target) -> Vec<(Program, Lowering)> {
+        let mut out = vec![(conv::<T>(self), self.cfg.lowering(target.clone()))];
+        if self.split > 1 {
+            let merge = self.merge();
+            out.push((split_merge::<T>(&merge), merge.lowering(target.clone())));
+        }
+        out
+    }
 }
 
 /// Parameters in order: `x [batch, h, w, cin]`, `w [cout, kh, kw, cin]`,
 /// `bias [cout]` if any, `residual [batch, ho, wo, cout]` if any,
-/// `y [batch, ho, wo, cout]`. `cin` must be a multiple of `bk`, so a K step
-/// never straddles two taps.
+/// `y [batch, ho, wo, cout]`; split, only `x`, `w` and the f32 partials
+/// `[split, batch·ho·wo, cout]`. `cin` must be a multiple of `bk`, so a K
+/// step never straddles two taps.
 pub fn conv<T: Elem>(spec: &ConvSpec) -> Program {
     let g = spec.geom;
     let gemm = spec.gemm();
@@ -73,7 +111,7 @@ pub fn conv<T: Elem>(spec: &ConvSpec) -> Program {
         Batch::Static(n) => n,
         Batch::Var { .. } => 1,
     };
-    mainloop_gemm::<T, _>("conv", &gemm, images * g.h * g.w * g.cin, |_k, x, bb, row0| {
+    mainloop_gemm::<T, _>("conv", &gemm, images * g.h * g.w * g.cin, spec.split, |_k, x, bb, row0| {
         let base = bb.clone().map_or(Sc::from(0), |b| b * (g.h * g.w * g.cin));
         let shape = Shape::new(spec.cfg.tile[0], bk);
         move |k: &mut Kernel, step: Sc, _koff: Sc| {
