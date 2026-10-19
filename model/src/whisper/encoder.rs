@@ -3,14 +3,19 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, Layer, LayerNorm, Linear, Module};
+use svod_tk3::ops::{self, Act};
 
 use crate::init::{Bias, conv1d, layer_norm, linear};
 use crate::state::{scoped, scoped_index};
 
-use super::attention::{MultiHeadAttention, padded_fa_sequence_len};
-use super::blocks::{linear_forward, sinusoids};
+use super::attention::MultiHeadAttention;
+use super::blocks::{project, sinusoids};
 use super::config::ModelDimensions;
 use super::error::Result;
+
+fn norm(layer: &LayerNorm, x: &Tensor) -> Result<Tensor> {
+    Ok(ops::layer_norm(x, &layer.weight, layer.bias.as_ref(), layer.eps)?)
+}
 
 /// Encoder transformer block: self-attention + MLP, pre-norm.
 #[derive(Clone, Module)]
@@ -43,20 +48,14 @@ impl EncoderBlock {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.forward_with_key_lens(x, None)
-    }
-
-    fn forward_with_key_lens(&self, x: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
-        // Self-attention (pre-norm)
-        let h = scoped("attn_ln", || self.attn_ln.forward(x))?;
-        let attn_out = scoped("attn", || self.attn.forward_with_key_lens(&h, None, None, key_lens))?;
-        let x = x.try_add(&attn_out)?;
-
-        // MLP (pre-norm)
-        let h = scoped("mlp_ln", || self.mlp_ln.forward(&x))?;
-        let h = linear_forward(&self.mlp0, &h)?.gelu_exact()?;
-        let h = linear_forward(&self.mlp2, &h)?;
-        Ok(x.try_add(&h)?)
+        let h = scoped("attn_ln", || norm(&self.attn_ln, x))?;
+        // The residual adds stay out of the GEMM epilogue: with the norm on
+        // the graph path, a launch whose residual operand the norm also reads
+        // fails kernel-graph verification.
+        let x = x.try_add(&scoped("attn", || self.attn.encode(&h))?)?;
+        let h = scoped("mlp_ln", || norm(&self.mlp_ln, &x))?;
+        let h = project(&self.mlp0, &h, Act::Gelu)?;
+        Ok(x.try_add(&project(&self.mlp2, &h, Act::None)?)?)
     }
 }
 
@@ -102,49 +101,17 @@ impl AudioEncoder {
         // [B, D, T/2] → [B, T/2, D]
         let x = x.try_permute(&[0, 2, 1])?;
 
-        // Add positional embedding [n_audio_ctx, D]
-        let x = x.try_add(&self.positional_embedding)?.cast(dtype.clone());
-
-        let (batch, sequence) = (x.dim_const(0)?, x.dim_const(1)?);
-        let padded_sequence = encoder_padded_sequence_len(&x.device(), &x.dtype(), sequence);
-        let (mut x, key_lens) = match padded_sequence {
-            Some(padded) => {
-                let x = x.try_pad(&[(0, 0), (0, (padded - sequence) as isize), (0, 0)])?;
-                let lens =
-                    Tensor::full(&[batch], svod_ir::ConstValue::Int(sequence as i64), DType::Int32).to(x.device());
-                (x, Some(lens))
-            }
-            None => (x, None),
-        };
-
-        // Transformer blocks
+        // Add the positional embedding [n_audio_ctx, D]. The 1500 frames stay
+        // unpadded: the attention kernel masks its ragged last tile, and
+        // padding to 1536 measured 12% slower on large-v3.
+        let mut x = x.try_add(&self.positional_embedding)?.cast(dtype.clone());
         for (index, block) in self.blocks.iter().enumerate() {
-            x = scoped_index("blocks", index, || block.forward_with_key_lens(&x, key_lens.as_ref()))?;
-        }
-        if padded_sequence.is_some() {
-            x = x.narrow(1, 0usize, sequence)?;
+            x = scoped_index("blocks", index, || block.forward(&x))?;
         }
 
         // The features feed the decoder's cross projection, which runs in the
         // compute dtype, so they stay in it: the final norm keeps its checkpoint
         // precision and would otherwise widen the largest encoder output.
-        Ok(scoped("ln_post", || self.ln_post.forward(&x))?.cast(dtype))
+        Ok(scoped("ln_post", || norm(&self.ln_post, &x))?.cast(dtype))
     }
-}
-
-/// The padded sequence length, or `None` to leave the sequence alone.
-///
-/// The padding exists only so flash attention can tile the sequence, so it earns
-/// nothing unless that kernel will actually run: it needs a supported device *and*
-/// activations that are already 16-bit, since it cannot take fp32 without silently
-/// downgrading precision (see `MultiHeadAttention::fa_attention`).
-pub(crate) fn encoder_padded_sequence_len(
-    device: &svod_dtype::DeviceSpec,
-    dtype: &DType,
-    sequence: usize,
-) -> Option<usize> {
-    let sixteen_bit = *dtype == DType::BFloat16 || *dtype == DType::Float16;
-    (sixteen_bit && svod_tk::flash_attention_supported(device))
-        .then(|| padded_fa_sequence_len(false, sequence, sequence, sequence))
-        .flatten()
 }
