@@ -74,7 +74,7 @@ impl Value {
 
 /// A view into an allocation. Global and shared views are windows the author
 /// moves with scalar expressions; registers are the value itself.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Place {
     Reg,
     /// `alloc[offset + r·cols + c]`, `offset` in elements.
@@ -99,6 +99,27 @@ pub enum Place {
         bounds: [Option<ScalarId>; 2],
         rows: Option<RowMap>,
     },
+}
+
+/// The tune store fingerprints programs by this text: a view without a row
+/// map prints as it did before the field existed, so stored choices apply.
+impl std::fmt::Debug for Place {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Place::Reg => f.write_str("Reg"),
+            Place::Smem { alloc, offset } => {
+                f.debug_struct("Smem").field("alloc", alloc).field("offset", offset).finish()
+            }
+            Place::Global { param, offset, stride, bounds, rows } => {
+                let mut s = f.debug_struct("Global");
+                s.field("param", param).field("offset", offset).field("stride", stride).field("bounds", bounds);
+                if let Some(rows) = rows {
+                    s.field("rows", rows);
+                }
+                s.finish()
+            }
+        }
+    }
 }
 
 /// A per-row offset and validity, expressions over [`Scalar::Row`].
