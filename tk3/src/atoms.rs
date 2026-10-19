@@ -59,6 +59,10 @@ pub struct Target {
     pub smem_bytes: usize,
     /// Streaming multiprocessors (compute units), when the device reports them.
     pub sms: Option<u32>,
+    /// The machine scheduler hoists a pipeline trip's shared-memory commit above
+    /// its products unless fenced (`Sync::Fence` → `sched_barrier`), leaving
+    /// the block waiting on global memory with no product in flight: RDNA4.
+    pub commit_fence: bool,
 }
 
 impl Target {
@@ -73,7 +77,8 @@ impl Target {
             GpuArch::Amd(_) => (false, false, 64 << 10),
             GpuArch::Metal(_) => (false, false, 32 << 10),
         };
-        Self { arch, wave, mma: mma_atoms(arch), cp_async, ldmatrix, smem_bytes, sms: None }
+        let commit_fence = matches!(arch, GpuArch::Amd(a) if a.is_rdna4());
+        Self { arch, wave, mma: mma_atoms(arch), cp_async, ldmatrix, smem_bytes, sms: None, commit_fence }
     }
 
     /// The target behind a device, when the backend reports its architecture.

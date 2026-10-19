@@ -292,6 +292,28 @@ impl<'a> Emit<'a> {
         self.scalar(id).1
     }
 
+    /// The value of a scalar that is arithmetic over constants.
+    fn constant(&self, id: ScalarId) -> Option<i64> {
+        match self.prog.scalar(id) {
+            Scalar::Const(v) => Some(*v),
+            Scalar::Bin(op, a, b) => {
+                let (a, b) = (self.constant(*a)?, self.constant(*b)?);
+                match op {
+                    BinOp::Add => Some(a + b),
+                    BinOp::Sub => Some(a - b),
+                    BinOp::Mul => Some(a * b),
+                    BinOp::Min => Some(a.min(b)),
+                    BinOp::Max => Some(a.max(b)),
+                    BinOp::Lt => Some(i64::from(a < b)),
+                    BinOp::Le => Some(i64::from(a <= b)),
+                    BinOp::Eq => Some(i64::from(a == b)),
+                    BinOp::Div | BinOp::Rem | BinOp::And | BinOp::Or => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     // ---- memory accesses ------------------------------------------------------
 
     /// The access node of a `w`-wide element run at `off`, listed where its
@@ -557,14 +579,11 @@ impl<'a> Emit<'a> {
     /// A rolled loop, or `unroll` copies of the body per iteration followed by
     /// a rolled remainder (skipped when a constant extent divides evenly).
     fn loop_(&mut self, l: &Loop) -> Result<()> {
-        let extent = self.sc(l.extent);
+        let (start, extent) = (self.sc(l.start), self.sc(l.extent));
         let u = l.unroll.max(1) as i64;
-        let constant = match self.prog.scalar(l.extent) {
-            Scalar::Const(e) => Some(*e),
-            _ => None,
-        };
+        let constant = self.constant(l.extent);
         if u == 1 {
-            return self.loop_rolled(l, extent, |_, range| range);
+            return self.loop_rolled(l, extent, |_, range| add(&start, &range));
         }
         let main = self.hoist(extent.try_cdiv(&c32(u)).expect("trips"));
         let rem = self.hoist(extent.try_cmod(&c32(u)).expect("remainder"));
@@ -572,7 +591,7 @@ impl<'a> Emit<'a> {
             self.loop_unrolled(l, main.clone(), u)?;
         }
         if constant.is_none_or(|e| e % u != 0) {
-            let base = self.hoist(mul(&main, &c32(u)));
+            let base = self.hoist(add(&start, &mul(&main, &c32(u))));
             self.loop_rolled(l, rem, move |_, range| add(&base, &range))?;
         }
         Ok(())
@@ -639,9 +658,10 @@ impl<'a> Emit<'a> {
     }
 
     fn loop_unrolled(&mut self, l: &Loop, trips: Arc<UOp>, u: i64) -> Result<()> {
+        let start = self.sc(l.start);
         let range = self.open_range(trips);
         let level = self.level();
-        let base = mul(&range, &c32(u));
+        let base = add(&start, &mul(&range, &c32(u)));
         for copy in 0..u {
             self.bind(l.iv, level, add(&base, &c32(copy)));
             self.body(l)?;
@@ -663,6 +683,12 @@ impl<'a> Emit<'a> {
             Sync::CommitAsync | Sync::WaitAsync { .. } => {
                 return UnsupportedSnafu { what: "async copies off CUDA" }.fail();
             }
+            Sync::Fence if self.low.target.commit_fence => UOp::custom(
+                smallvec![self.last.clone()],
+                "declare void @llvm.amdgcn.sched.barrier(i32)\ncall void @llvm.amdgcn.sched.barrier(i32 0)".to_string(),
+                DType::Void,
+            ),
+            Sync::Fence => return Ok(()),
         };
         self.push(u);
         Ok(())

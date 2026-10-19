@@ -87,7 +87,7 @@ Only the CUDA row has kernel tables and runs on hardware today (see [Portability
 |---|---|
 | `CpAsync`, `stages ≥ 2` | One loop of `extent + stages − 1` iterations. Each iteration waits until at most `stages − 2` copy groups are pending, then barriers and consumes step `i − (stages − 1)`. It then issues step `i`'s `cp.async` copies into the slot freed one iteration earlier and commits them as one group (an empty group past the end keeps the count uniform). |
 | `CpAsync`, `stages = 1` | Copy, commit, wait for all, barrier, consume, barrier. |
-| `RegisterStaged` (2 stages) | Global → register loads for step `i`, consume step `i − 1`, register → shared stores, barrier. |
+| `RegisterStaged` (2 stages) | Three loops over one induction variable: the first trip loads step 0 into registers, stores it to its slot and barriers; a steady trip loads step `i` into registers, consumes step `i − 1`, fences, stores the registers to step `i`'s slot and barriers, with no branch in its body; the last trip only consumes. |
 
 `unroll` copies the loop body once per ring slot so slot arithmetic folds to constants. Whether
 it helps is measured per config, not assumed (see the GEMM table in the

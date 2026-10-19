@@ -113,6 +113,7 @@ impl Expander<'_> {
         let total = self.bin(BinOp::Add, extent, ahead);
         let nstages = self.c(stages as i64);
         let zero = self.c(0);
+        let start = zero;
         self.define(produce.step, Scalar::Bin(BinOp::Add, iv, zero));
         self.define(produce.slot, Scalar::Bin(BinOp::Rem, produce.step, nstages));
         self.define(consume.step, Scalar::Bin(BinOp::Sub, iv, ahead));
@@ -127,7 +128,7 @@ impl Expander<'_> {
             Self::if_(producing, produce.body.0),
             Stmt::Sync(Sync::CommitAsync),
         ];
-        vec![Stmt::Loop(Loop { iv, extent: total, carried, body: Block(body), unroll: stages as u32 })]
+        vec![Stmt::Loop(Loop { iv, start, extent: total, carried, body: Block(body), unroll: stages as u32 })]
     }
 
     /// One slot: copy, wait, consume, and fence before the slot is refilled.
@@ -138,6 +139,7 @@ impl Expander<'_> {
             self.define(stage.step, Scalar::Bin(BinOp::Add, iv, zero));
             self.define(stage.slot, Scalar::Const(0));
         }
+        let start = zero;
         let mut body = produce.body.0;
         body.extend([
             Stmt::Sync(Sync::CommitAsync),
@@ -146,12 +148,16 @@ impl Expander<'_> {
         ]);
         body.extend(consume.body.0);
         body.push(Stmt::Sync(Sync::Barrier { role: None }));
-        vec![Stmt::Loop(Loop { iv, extent, carried, body: Block(body), unroll: 1 })]
+        vec![Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll: 1 })]
     }
 
-    /// Two slots: every iteration loads step `i` into registers, consumes step
-    /// `i - 1` from the other slot, writes the registers to this step's slot
-    /// and fences.
+    /// Two slots, one step ahead: a trip loads step `i` into registers,
+    /// consumes step `i - 1` from the other slot, writes the registers to
+    /// this step's slot and fences. The first trip only loads and the last
+    /// only consumes, so each is peeled into a one-trip loop and the steady
+    /// loop has no branches: a trip is one basic block, which a machine
+    /// scheduler may reorder freely, and the [`Sync::Fence`] between the
+    /// products and the commit is what keeps the two slots' order.
     fn register_staged(
         &mut self,
         extent: ScalarId,
@@ -165,13 +171,13 @@ impl Expander<'_> {
         let one = self.c(1);
         let two = self.c(2);
         let zero = self.c(0);
-        let total = self.bin(BinOp::Add, extent, one);
+        // An empty pipeline runs no trip at all (a range never counts down).
+        let nonempty = self.bin(BinOp::Lt, zero, extent);
+        let steady = self.bin(BinOp::Sub, extent, nonempty);
         self.define(produce.step, Scalar::Bin(BinOp::Add, iv, zero));
         self.define(produce.slot, Scalar::Bin(BinOp::Rem, produce.step, two));
         self.define(consume.step, Scalar::Bin(BinOp::Sub, iv, one));
         self.define(consume.slot, Scalar::Bin(BinOp::Rem, consume.step, two));
-        let consuming = self.bin(BinOp::Le, one, iv);
-        let producing = self.bin(BinOp::Lt, iv, extent);
         // Split every global→shared copy into its load and its store halves.
         let (mut issue, mut commit) = (vec![], vec![]);
         for stmt in produce.body.0 {
@@ -186,12 +192,19 @@ impl Expander<'_> {
                 other => issue.push(other),
             }
         }
-        let body = vec![
-            Self::if_(producing, issue),
-            Self::if_(consuming, consume.body.0),
-            Self::if_(producing, commit),
-            Stmt::Sync(Sync::Barrier { role: None }),
-        ];
-        vec![Stmt::Loop(Loop { iv, extent: total, carried, body: Block(body), unroll: 2 })]
+        let barrier = Stmt::Sync(Sync::Barrier { role: None });
+        let head: Vec<Stmt> = issue.iter().chain(&commit).cloned().chain([barrier.clone()]).collect();
+        let fenced = [Stmt::Sync(Sync::Fence)].into_iter().chain(commit).chain([barrier]);
+        let body: Vec<Stmt> = issue.into_iter().chain(consume.body.0.iter().cloned()).chain(fenced).collect();
+        // The drain's carried registers hold what the steady loop left.
+        let drained: Vec<Carried> = carried.iter().map(|c| Carried { init: c.phi, ..*c }).collect();
+        let trips = |start, extent, carried, body: Vec<Stmt>, unroll| {
+            Stmt::Loop(Loop { iv, start, extent, carried, body: Block(body), unroll })
+        };
+        vec![
+            trips(zero, nonempty, vec![], head, 1),
+            trips(one, steady, carried, body, 2),
+            trips(extent, nonempty, drained, consume.body.0, 1),
+        ]
     }
 }
