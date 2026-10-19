@@ -9,19 +9,23 @@ use svod_tk3::ops::{self, Act};
 
 use super::error::Result;
 
-/// `act(x·wᵀ + b)` through the tile op layer, whose kernel keeps the
-/// accumulator, bias and activation in f32 until one final rounding. A scaled
-/// or fp8 weight takes [`linear_forward`].
-pub(crate) fn project(layer: &Linear, x: &Tensor, act: Act) -> Result<Tensor> {
+/// `act(x·wᵀ + b) + residual` through the tile op layer, whose kernel keeps
+/// the accumulator, bias, activation and residual in f32 until one final
+/// rounding. A scaled or fp8 weight takes [`linear_forward`].
+pub(crate) fn project(layer: &Linear, x: &Tensor, act: Act, residual: Option<&Tensor>) -> Result<Tensor> {
     if layer.weight_scale.is_none() && layer.weight.dtype() == x.dtype() {
-        let opts = ops::Linear { bias: layer.bias.as_ref(), act, ..ops::Linear::default() };
+        let opts = ops::Linear { bias: layer.bias.as_ref(), act, residual, ..ops::Linear::default() };
         return Ok(ops::linear(x, &layer.weight, opts)?);
     }
     let y = linear_forward(layer, x)?;
-    Ok(match act {
+    let y = match act {
         Act::None => y,
         Act::Gelu => y.gelu_exact()?,
         Act::Silu => y.silu()?,
+    };
+    Ok(match residual {
+        Some(r) => r.try_add(&y)?,
+        None => y,
     })
 }
 
