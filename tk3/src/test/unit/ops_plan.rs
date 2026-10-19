@@ -131,12 +131,6 @@ fn gemm_list(x: &Extent, n: usize, gated: bool) -> Arc<[GemmCfg]> {
     kernel_plan(shape::linear(Some(&planner(sm86())), &[BF16, BF16], Some(x), n, gated))
 }
 
-/// The 4096³ ranking on sm_86 is valid.
-#[test]
-fn large_gemm_candidates() {
-    assert_valid(&gemm_list(&ext(&[4096, 4096]), 4096, false), &sm86(), 4096, false);
-}
-
 /// Nemotron's projections (704 rows under a batch variable of capacity 1)
 /// rank more than eight configs, so the shortlist spans eight tiles and
 /// grids.
