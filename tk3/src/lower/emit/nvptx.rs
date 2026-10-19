@@ -1,19 +1,12 @@
 //! NVPTX instruction bodies: `ldmatrix` gathers, `ld.global.cg` loads, the
 //! warpgroup products over shared descriptors and a warp's own barrier.
 
-use std::sync::Arc;
-
-use smallvec::smallvec;
-
 use svod_codegen::llvm::nvptx::smem::{ld_global_cg_16, ldmatrix};
-use svod_codegen::llvm::nvptx::wgmma;
-use svod_dtype::DType;
-use svod_ir::{UOp, WmmaMetadata};
+use svod_ir::WmmaMetadata;
 
 use crate::layout::Dim::Lane;
 use crate::layout::Layout;
-use crate::layouts::{Swizzle, TileLayout};
-use crate::lower::{Result, UnsupportedSnafu};
+use crate::layouts::Swizzle;
 use snafu::OptionExt;
 
 use super::*;

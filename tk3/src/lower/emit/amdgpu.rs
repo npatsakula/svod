@@ -2,16 +2,9 @@
 //! product, lane moves on the vector unit and through the LDS crossbar,
 //! the hardware `exp2`, and the scheduling and priority barriers.
 
-use std::sync::Arc;
-
-use smallvec::smallvec;
 use svod_codegen::llvm::amd::tr::{global_load_tr_b128, global_load_tr_b128_or_zeros};
-use svod_dtype::{DType, ScalarDType};
-use svod_ir::UOp;
 
 use crate::layout as frag;
-use crate::layouts::TileLayout;
-use crate::lower::Result;
 
 use super::*;
 

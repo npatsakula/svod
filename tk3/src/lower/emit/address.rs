@@ -1,14 +1,11 @@
 //! Where a register's element lives in memory: views, the offsets and
 //! bounds gates of their coordinates, and the runs a layout is accessed by.
 
-use std::sync::Arc;
-
-use svod_dtype::{DType, ScalarDType};
-use svod_ir::{Op, UOp, ops};
+use svod_ir::ops;
 
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
 use crate::layout::Layout;
-use crate::layouts::{Swizzle, TileLayout};
+use crate::layouts::Swizzle;
 
 use super::*;
 

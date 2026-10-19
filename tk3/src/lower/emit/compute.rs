@@ -1,17 +1,11 @@
 //! Tile operations on registers: elementwise, products, reductions, and the
 //! lane moves a reduction or an exchange issues.
 
-use std::sync::Arc;
-
-use smallvec::smallvec;
 use svod_codegen::llvm::nvptx::ops::shfl_bfly;
-use svod_dtype::{DType, ScalarDType};
-use svod_ir::{ConstValue, UOp};
+use svod_ir::ConstValue;
 
 use crate::atoms::LaneMove;
 use crate::layout::Dim::{Col, Row};
-use crate::layouts::TileLayout;
-use crate::lower::{Result, UnsupportedSnafu};
 use snafu::OptionExt;
 
 use super::*;

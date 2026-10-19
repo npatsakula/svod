@@ -1,18 +1,12 @@
 //! Copies between the tiers: fills of shared memory, register loads from
 //! shared and global memory, stores, and relayouts between register layouts.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use smallvec::smallvec;
 use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill};
-use svod_dtype::{AddrSpace, DType};
-use svod_ir::{ConstValue, Op, UOp};
+use svod_ir::ConstValue;
 
-use crate::atoms::Fill;
 use crate::layout as frag;
-use crate::layouts::{Relayout, TileLayout};
-use crate::lower::{DivergentBarrierSnafu, Result, UnsupportedSnafu};
+use crate::layouts::Relayout;
+use crate::lower::DivergentBarrierSnafu;
 
 use super::*;
 
