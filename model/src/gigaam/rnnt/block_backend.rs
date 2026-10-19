@@ -126,6 +126,13 @@ impl<const W: usize> RnntBlockBackend<W> {
         self.set_valid(valid)
     }
 
+    /// The sizes of every device buffer the backend's plans own, in bytes.
+    pub fn device_buffers(&self) -> crate::jit::Result<Vec<usize>> {
+        let mut sizes: Vec<usize> = self.jit.buffers()?.iter().map(|b| b.size()).collect();
+        sizes.extend(self.proj.buffers()?.iter().map(|b| b.size()));
+        Ok(sizes)
+    }
+
     /// The lanes' encoder rows already projected for the joint, on the
     /// device: `[lanes, max_t, joint_hidden]` f32.
     pub fn bind_projected(&mut self, projected: &svod_device::Buffer) -> crate::jit::Result<()> {

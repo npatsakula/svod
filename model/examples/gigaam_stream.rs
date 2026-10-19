@@ -89,11 +89,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let t_prepare = Instant::now();
     let mut streamer = GigaAmStreamer::new(model, args.streams)?;
+    let mut buffers = streamer.device_buffers()?;
+    buffers.sort_unstable_by(|a, b| b.cmp(a));
+    let bytes: usize = buffers.iter().sum();
     println!(
-        "prepared {} lanes in {:.2} s; latency {:.0} ms",
+        "prepared {} lanes in {:.2} s; latency {:.0} ms; {} device buffers, {:.0} MiB ({:.1} MiB per lane), largest {:?} MiB",
         args.streams,
         t_prepare.elapsed().as_secs_f32(),
-        streamer.latency_seconds() * 1e3
+        streamer.latency_seconds() * 1e3,
+        buffers.len(),
+        bytes as f64 / 1048576.0,
+        bytes as f64 / 1048576.0 / args.streams as f64,
+        buffers.iter().take(6).map(|b| b / 1048576).collect::<Vec<_>>(),
     );
 
     let ids: Vec<StreamId> = (0..args.streams).map(|_| streamer.open().expect("a free lane")).collect();
