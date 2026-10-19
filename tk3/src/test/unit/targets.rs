@@ -290,33 +290,6 @@ pub(super) fn hopper() -> Target {
     Target { sms: Some(132), ..Target::for_arch(GpuArch::Cuda(CudaArch { major: 9, minor: 0 })) }
 }
 
-/// Every family lowers for Hopper, clang emits its PTX for `sm_90a` (the
-/// warpgroup products need the arch-specific feature set, so every kernel
-/// targets it) and `ptxas` assembles it.
-#[test]
-fn every_family_assembles_for_hopper() {
-    let target = hopper();
-    assert!(config::has_kernels(&target));
-    assert_eq!(target.smem_bytes, 227 << 10);
-    let Some(ptxas) = ptxas() else {
-        each(families(&target), |_, prog, lowering| drop(render(prog, &lowering)));
-        eprintln!("skipped: no ptxas; rendered only");
-        return;
-    };
-    let GpuArch::Cuda(arch) = target.arch else { unreachable!() };
-    each(families(&target), |_, prog, lowering| {
-        let ir = render(prog, &lowering);
-        let ptx = match svod_runtime::cuda::compile_ir_to_ptx(&ir, arch) {
-            Ok(ptx) => ptx,
-            Err(e) if e.to_string().contains("NVPTX target") => return eprintln!("skipped: clang has no NVPTX target"),
-            Err(e) => panic!("{e}"),
-        };
-        let mut command = Command::new(&ptxas);
-        command.args(["-arch=sm_90a", "-o", "/dev/null", "/dev/stdin"]);
-        run(command, &ptx, "ptxas sm_90a").unwrap_or_else(|e| panic!("{e}"));
-    });
-}
-
 /// GEMM tiles on Hopper's warpgroup core: one to four warpgroups down the
 /// rows, one or two across, every swizzle span (16-, 32- and 64-deep rings
 /// are 32-, 64- and 128-byte rows), a 96-wide tile of three `n32` and a
@@ -401,83 +374,189 @@ fn every_group_attention_assembles_for_hopper() {
     }
 }
 
-/// Every warpgroup GEMM lowers for sm_90a and assembles: its main loop
-/// holds `wgmma.mma_async` products over descriptors and no warp-level
-/// product or fragment load, since both operands stay in shared memory.
-#[test]
-fn every_group_gemm_assembles_for_hopper() {
-    let target = hopper();
-    assert_eq!(target.group_mma.len(), 2);
-    let GpuArch::Cuda(arch) = target.arch else { unreachable!() };
+/// What a target's families show beyond their numbers.
+struct Facts {
+    /// The axis a register-staged attention's value ring lies along (its key
+    /// ring and every GEMM and convolution tile lie along the columns): along
+    /// the rows where the product's B fragments hold runs of keys and the
+    /// fill scatters through registers, row-major where a `cp.async` fill
+    /// copies chunks, which cannot scatter (`ldmatrix.trans` transposes).
+    values: Axis,
+    /// The softmax's `exp2` is the hardware `v_exp_f32` alone, with no
+    /// denormal range reduction around it, rather than `llvm.exp2`.
+    raw_exp2: bool,
+    /// A lane reads another lane's register on the vector unit (DPP within a
+    /// row of 16, `permlanex16` across them) rather than through the LDS
+    /// crossbar; `None` off AMD.
+    dpp: Option<bool>,
+    /// The accumulator is its operand's transpose, so the inference issues
+    /// attention's products the way round that hands the scores to P·V as
+    /// they stand: no tile relayout in an attention kernel without a bias
+    /// (whose tiles come from global memory in a layout of their own; on
+    /// gfx942 a biased kernel re-holds three tiles however the products are
+    /// issued). Where neither way is free (RDNA3) the relayout remains, under
+    /// the declared costs a register exchange between the half-waves. `None`
+    /// off AMD.
+    free_scores: Option<bool>,
+}
+
+const fn facts(values: Axis, raw_exp2: bool, dpp: Option<bool>, free_scores: Option<bool>) -> Facts {
+    Facts { values, raw_exp2, dpp, free_scores }
+}
+
+/// Every family the op layer plans on `target` (and on Hopper every
+/// warpgroup GEMM) lowers once and is checked whole, every failure of every
+/// family collected before the test fails:
+/// - the interpreter gives the same result before and after the lowering
+///   (schedule expansion, operand loads, barriers, relayouts): the
+///   bookkeeping the target's template adds keeps the numerics;
+/// - every access the lowering lists reads an allocation or a view of its
+///   whole, never a crop at an offset (once a program's placeholders are
+///   bound, an access of a crop is folded into the buffer at the summed
+///   offset and nothing lists the sum, so the LLVM renderer finds no name
+///   for it: key warps re-holding a biased score tile through their regions
+///   of the relayout scratch hit this on gfx1151);
+/// - the [`Facts`] of its shared tiles, exponentials, lane moves and score
+///   relayouts hold; an attention's column-major value tile fills by
+///   transposing loads exactly where the target has them (RDNA4), its staged
+///   registers holding column runs straight from global memory, and a plain
+///   GEMM's row-major fill stays a chunk copy;
+/// - its LLVM text compiles where the toolchain is installed: clang to an
+///   AMDGPU code object holding the kernel's descriptor, or clang to PTX
+///   that `ptxas` assembles (Hopper's for `sm_90a`, the arch-specific
+///   feature set its warpgroup products need). A missing tool skips.
+///
+/// A warpgroup GEMM's main loop holds `wgmma.mma_async` products over
+/// descriptors, fenced, and no warp-level product or fragment load: both
+/// operands stay in shared memory and no operand tile is loaded into
+/// registers; a ring of three slots or more leaves the chain in flight, the
+/// wait the template's intrinsic rather than the chain's own.
+#[test_case(crate::atoms::sm86(), facts(Axis::Col, false, None, None); "sm_86")]
+#[test_case(hopper(), facts(Axis::Col, false, None, None); "sm_90")]
+#[test_case(amd(AmdArch::Gfx1201, 64), facts(Axis::Row, true, Some(true), Some(true)); "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40), facts(Axis::Row, true, Some(true), Some(false)); "gfx1151")]
+#[test_case(amd(AmdArch::Gfx1100, 96), facts(Axis::Row, true, Some(true), Some(false)); "gfx1100")]
+#[test_case(amd(AmdArch::Gfx942, 304), facts(Axis::Row, true, Some(false), Some(true)); "gfx942")]
+fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Facts) {
+    assert!(config::has_kernels(&target));
+    if let Some(free) = facts.free_scores {
+        let atom = target.mma.first().expect("a matrix core");
+        assert_eq!(atom.accumulator_feeds(target.wave), free, "what the planner charges for the scratch");
+    }
+    let mut launches = families(&target);
+    if target.arch == hopper().arch {
+        assert_eq!((target.smem_bytes, target.group_mma.len()), (227 << 10, 2));
+        launches.extend(group_families(&target));
+    }
     let ptxas = ptxas();
-    for (name, prog, lowering) in group_families(&target) {
-        let ir = render(prog, &lowering);
-        assert!(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "{name}: no warpgroup product");
-        assert!(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "{name}: a warp-level product");
-        assert!(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async"), "{name}: unfenced chain");
-        // A ring of three slots or more leaves the chain in flight: the wait
-        // is the template's intrinsic, not the chain's own.
-        let in_flight =
-            lowering.schedule == Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false, async_products: true };
-        assert_eq!(ir.contains("@llvm.nvvm.wgmma.wait_group"), in_flight, "{name}: the template's wait");
-        assert_eq!(ir.contains("wgmma.wait_group.sync.aligned 0;"), !in_flight, "{name}: the chain's own wait");
-        let ptx = match svod_runtime::cuda::compile_ir_to_ptx(&ir, arch) {
-            Ok(ptx) => ptx,
-            Err(e) if e.to_string().contains("NVPTX target") => {
-                eprintln!("skipped: clang has no NVPTX target");
-                return;
+    each(launches, |name, prog, lowering| {
+        let mut failed: Vec<String> = vec![];
+        let mut check = |ok: bool, what: &str| {
+            if !ok {
+                failed.push(what.to_string());
             }
-            Err(e) => panic!("{name}: {e}"),
         };
-        let text = String::from_utf8_lossy(&ptx);
-        assert!(text.contains(".target sm_90a"), "{name}: not the arch-specific target");
-        let Some(ptxas) = &ptxas else { continue };
-        let mut command = Command::new(ptxas);
-        command.args(["-arch=sm_90a", "-o", "/dev/null", "/dev/stdin"]);
-        run(command, &ptx, &format!("ptxas sm_90a {name}")).unwrap_or_else(|e| panic!("{e}"));
-        eprintln!("{name}: assembled for sm_90a");
-    }
-}
-
-/// The lowered warpgroup GEMM keeps the interpreter's result: the shared
-/// operands it leaves in place are read as the register tiles were.
-#[test]
-fn group_lowering_keeps_the_interpreted_result() {
-    for (name, prog, lowering) in group_families(&hopper()) {
-        let params = inputs(&name, &prog);
-        let want = interp::run(&prog, params.clone(), &[]).unwrap();
-        let tile = lowered_tile(prog.clone(), &lowering);
-        assert!(tile.walk().all(|(_, s)| !matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16)), "{name}: an operand was loaded into registers");
-        let got = interp::run(&tile, params, &[]).unwrap();
-        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            assert!(g.iter().zip(w).all(|(a, b)| a == b), "{name}: parameter {i} differs after lowering");
-        }
-    }
-}
-
-/// The interpreter gives the same result for a family's program before and
-/// after its lowering for `target` (schedule expansion, operand loads,
-/// barriers, relayouts): the bookkeeping the target's template adds keeps
-/// the numerics.
-#[test_case(hopper(); "sm_90")]
-#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
-#[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
-#[test_case(amd(AmdArch::Gfx1100, 96); "gfx1100")]
-#[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
-fn lowering_keeps_the_interpreted_result(target: Target) {
-    each(families(&target), |name, prog, lowering| {
-        let params = inputs(name, &prog);
         let vars: Vec<(&str, i64)> = prog.vars.iter().map(|v| (v.name.as_str(), v.max)).collect();
+        let params = inputs(name, &prog);
         let want = interp::run(&prog, params.clone(), &vars).unwrap();
-        let tile = lowered_tile(prog.clone(), &lowering);
-        let got = interp::run(&tile, params, &vars).unwrap();
+        let low = lowered(prog.clone(), &lowering).unwrap();
+        let tile = &low.tile;
+        let got = interp::run(tile, params, &vars).unwrap();
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
             let same = g.iter().zip(w).all(|(a, b)| a == b || (a.is_nan() && b.is_nan()));
-            assert!(same, "parameter {i} differs after lowering");
+            check(same, &format!("parameter {i} differs after lowering"));
         }
+
+        let Op::Program(ops::Program { linear: Some(linear), .. }) = low.program.op() else { panic!("a program") };
+        let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
+        let zero = |u: &Arc<UOp>| matches!(u.op(), Op::Const(v) if v.0.try_int() == Some(0));
+        for u in list.iter() {
+            let buf = match u.op() {
+                Op::Index(ops::Index { buffer, .. }) => buffer,
+                Op::Shrink(ops::Shrink { src, .. }) => src,
+                _ => continue,
+            };
+            if let Op::Shrink(ops::Shrink { offsets, .. }) = buf.op() {
+                check(zero(offsets), &format!("{} {} reads a crop at an offset", u.id, u.op().as_ref()));
+            }
+        }
+
+        let along = |ring: &str| tile.smem.iter().find(|a| a.name == ring).map(|a| a.along);
+        let attention = name.starts_with("attention d");
+        let rings = (along("k_s"), along("v_s"));
+        if attention {
+            check(rings == (Some(Axis::Col), Some(facts.values)), &format!("k_s and v_s lie along {rings:?}"));
+            if let (Some(free), false) = (facts.free_scores, name.ends_with("bias")) {
+                let n = tile_relayouts(tile, &tile.body);
+                check((n == 0) == free, &format!("{n} tile relayouts"));
+            }
+        } else if name.starts_with("gemm") || name.starts_with("group gemm") || name.starts_with("conv") {
+            check(tile.smem.iter().all(|a| a.along == Axis::Col), "a GEMM tile stored column-major");
+        }
+
+        let ir = low.text(&target).unwrap();
+        let tr_loads = ir.matches("@llvm.amdgcn.global.load.tr.b128.").count();
+        let transposing = match rings.1 {
+            Some(Axis::Row) => target.tr_load,
+            _ => target.tr_load && !name.starts_with("gemm #"),
+        };
+        check(tr_loads == 0 || transposing, &format!("{tr_loads} transposing loads"));
+        if attention {
+            check((tr_loads > 0) == transposing, &format!("{tr_loads} transposing loads of the values"));
+            let (raw, exp2) = (ir.contains("@llvm.amdgcn.exp2.f32("), ir.contains("@llvm.exp2.f32("));
+            check((raw, exp2) == (facts.raw_exp2, !facts.raw_exp2), &format!("v_exp_f32 {raw}, llvm.exp2 {exp2}"));
+        }
+        if let (Some(dpp), true) = (facts.dpp, name.ends_with("norm")) {
+            let moves = (ir.contains("@llvm.amdgcn.update.dpp.i32("), ir.contains("@llvm.amdgcn.ds.bpermute("));
+            check(moves == (dpp, !dpp), &format!("DPP and ds_bpermute: {moves:?}"));
+        }
+        if name.starts_with("group gemm") {
+            let reg_operand = |s: &crate::ir::Stmt| matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16);
+            check(!tile.walk().any(|(_, s)| reg_operand(s)), "an operand was loaded into registers");
+            check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
+            check(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "a warp-level product");
+            check(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async"), "an unfenced chain");
+            let in_flight = lowering.schedule
+                == Schedule::Uniform { prefetch: Prefetch::CpAsync, unroll: false, async_products: true };
+            check(ir.contains("@llvm.nvvm.wgmma.wait_group") == in_flight, "the template's wait");
+            check(ir.contains("wgmma.wait_group.sync.aligned 0;") == !in_flight, "the chain's own wait");
+        }
+
+        match target.arch {
+            GpuArch::Amd(arch) => match svod_runtime::amd::compile_ir_to_amd_object(&ir, arch) {
+                Ok(object) => {
+                    let descriptor = format!("{}.kd", prog.name);
+                    check(object.starts_with(b"\x7fELF"), "an ELF code object");
+                    check(
+                        object.windows(descriptor.len()).any(|w| w == descriptor.as_bytes()),
+                        &format!("no {descriptor}"),
+                    );
+                }
+                Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
+                    eprintln!("skipped: {e}")
+                }
+                Err(e) => check(false, &e.to_string()),
+            },
+            GpuArch::Cuda(arch) => match svod_runtime::cuda::compile_ir_to_ptx(&ir, arch) {
+                Ok(ptx) => {
+                    let sm = format!("sm_{}{}{}", arch.major, arch.minor, if arch.major >= 9 { "a" } else { "" });
+                    check(String::from_utf8_lossy(&ptx).contains(&format!(".target {sm}")), &format!("not {sm}"));
+                    if let Some(ptxas) = &ptxas {
+                        let mut command = Command::new(ptxas);
+                        command.args([&format!("-arch={sm}"), "-o", "/dev/null", "/dev/stdin"]);
+                        if let Err(e) = run(command, &ptx, &format!("ptxas {sm}")) {
+                            check(false, &e);
+                        }
+                    }
+                }
+                Err(e) if e.to_string().contains("NVPTX target") => eprintln!("skipped: clang has no NVPTX target"),
+                Err(e) => check(false, &e.to_string()),
+            },
+            GpuArch::Metal(_) => unreachable!("Metal has no families"),
+        }
+        assert!(failed.is_empty(), "{}", failed.join("; "));
     });
 }
-
 /// An AMD GPU with `cus` compute units and 64 KB of LDS per workgroup; a
 /// CDNA3 one is an MI300X of eight dies.
 pub(super) fn amd(arch: AmdArch, cus: u32) -> Target {
@@ -523,32 +602,6 @@ fn the_block_index_is_renumbered_only_over_several_dies() {
     assert_eq!(one, text(1), "a one-die program is deterministic");
 }
 
-/// RDNA WMMA and CDNA MFMA with register-staged fills: every family lowers
-/// for the target and, where clang has the AMDGPU backend, compiles to a
-/// code object holding the kernel's descriptor.
-#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
-#[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
-#[test_case(amd(AmdArch::Gfx1100, 96); "gfx1100")]
-#[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
-fn every_family_compiles_for_amd(target: Target) {
-    assert!(config::has_kernels(&target));
-    let GpuArch::Amd(arch) = target.arch else { unreachable!() };
-    each(families(&target), |_, prog, lowering| {
-        let kernel = prog.name.clone();
-        let ir = render(prog, &lowering);
-        let object = match svod_runtime::amd::compile_ir_to_amd_object(&ir, arch) {
-            Ok(object) => object,
-            Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
-                return eprintln!("skipped: {e}");
-            }
-            Err(e) => panic!("{e}"),
-        };
-        assert_eq!(&object[..4], b"\x7fELF", "an ELF code object");
-        let descriptor = format!("{kernel}.kd");
-        assert!(object.windows(descriptor.len()).any(|w| w == descriptor.as_bytes()), "no {descriptor}");
-    });
-}
-
 /// An `if`'s compare is listed with its scalar: a predicate first met inside
 /// another branch still guards a later `if` on it outside that branch. With
 /// the compare left to its first user it sat inside the first branch, and
@@ -583,33 +636,6 @@ fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
             eprintln!("skipped: {e}");
         }
         Err(e) => panic!("{e}"),
-    }
-}
-
-/// Every access a lowering lists reads an allocation or a view of its
-/// whole, never a crop at an offset: once a program's placeholders are
-/// bound, an access of a crop is folded into the buffer at the summed
-/// offset, and nothing lists the sum, so the LLVM renderer finds no name
-/// for it. Key warps re-holding a biased score tile through their regions
-/// of the relayout scratch hit this on gfx1151.
-#[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
-#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
-#[test_case(crate::atoms::sm86(); "sm86")]
-fn accesses_address_allocations_not_crops(target: Target) {
-    let zero = |u: &Arc<UOp>| matches!(u.op(), Op::Const(v) if v.0.try_int() == Some(0));
-    for (name, prog, lowering) in families(&target) {
-        let linear = linear(prog, &lowering);
-        let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("{name}: a linear list") };
-        for u in list.iter() {
-            let buf = match u.op() {
-                Op::Index(ops::Index { buffer, .. }) => buffer,
-                Op::Shrink(ops::Shrink { src, .. }) => src,
-                _ => continue,
-            };
-            if let Op::Shrink(ops::Shrink { offsets, .. }) = buf.op() {
-                assert!(zero(offsets), "{name}: {} {} reads a crop at an offset", u.id, u.op().as_ref());
-            }
-        }
     }
 }
 
@@ -751,60 +777,6 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
     each(launches, |_, prog, lowering| drop(linear(prog, &lowering)));
 }
 
-/// A shared tile lies along the axis its readers' fragments run along: the
-/// value tile of a register-staged attention kernel is stored column-major,
-/// since the product's B fragments hold runs of keys, and gathers as 16-byte
-/// loads; the key tile, whose fragments hold runs of head elements, and a
-/// GEMM's operand tiles stay row-major. A `cp.async` target fills its tiles
-/// in chunks, which cannot scatter, so there every tile stays row-major and
-/// `ldmatrix.trans` does the transposing.
-#[test_case(amd(AmdArch::Gfx1201, 64), Axis::Row; "gfx1201 stores values column-major")]
-#[test_case(amd(AmdArch::Gfx942, 304), Axis::Row; "gfx942 stores values column-major")]
-#[test_case(crate::atoms::sm86(), Axis::Col; "sm_86 keeps every tile row-major")]
-fn shared_tiles_lie_along_their_fragments(target: Target, values: Axis) {
-    let families = families(&target);
-    let (_, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("attention d128")).unwrap().clone();
-    let rings = |tile: Program| {
-        let along = |name: &str| tile.smem.iter().find(|a| a.name == name).map(|a| a.along).unwrap();
-        (along("k_s"), along("v_s"))
-    };
-    assert_eq!(rings(lowered_tile(prog, &lowering)), (Axis::Col, values));
-    // The key warps' f32 merge views over the rings cast no vote.
-    let (_, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("attention d64 cache key warps")).unwrap();
-    assert_eq!(rings(lowered_tile(prog.clone(), lowering)), (Axis::Col, values));
-    let (_, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("gemm #0")).unwrap().clone();
-    assert!(lowered_tile(prog, &lowering).smem.iter().all(|a| a.along == Axis::Col));
-}
-
-/// Where the target loads 16×16 blocks transposed (RDNA4), the staged
-/// registers of a column-major tile hold column runs straight from global
-/// memory and store them as 16-byte vectors; elsewhere the staged registers
-/// are walked down the rows.
-#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201 loads values transposed")]
-#[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942 walks the rows")]
-fn column_major_tiles_fill_by_transposing_loads(target: Target, transposing: bool) {
-    assert_eq!(target.tr_load, transposing);
-    let families = families(&target);
-    let (name, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("attention d128")).unwrap().clone();
-    let ir = render(prog, &lowering);
-    let calls = ir.matches("call <8 x bfloat> @llvm.amdgcn.global.load.tr.b128.v8bf16(ptr addrspace(1) %").count();
-    assert_eq!(calls > 0, transposing, "{name}: {calls} transposing loads");
-    let (_, prog, lowering) = families.iter().find(|(n, ..)| n.starts_with("gemm #0")).unwrap().clone();
-    assert!(!render(prog, &lowering).contains("global.load.tr"), "a row-major fill stays a chunk copy");
-}
-
-/// On AMD the softmax's `exp2` is the hardware `v_exp_f32` alone, with no
-/// denormal range reduction around it; other targets keep `llvm.exp2`.
-#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
-#[test_case(crate::atoms::sm86(), false; "sm_86")]
-fn attention_exponentials_are_the_hardware_ones_on_amd(target: Target, raw: bool) {
-    let (name, prog, lowering) =
-        families(&target).into_iter().find(|(n, ..)| n.starts_with("attention d128")).expect("an attention family");
-    let ir = render(prog, &lowering);
-    assert_eq!(ir.contains("@llvm.amdgcn.exp2.f32("), raw, "{name}");
-    assert_eq!(ir.contains("@llvm.exp2.f32("), !raw, "{name}");
-}
-
 /// The attention program carries the softmax forms its config declares: a
 /// cast toward zero where bf16 probabilities are truncated (an f16 stream
 /// rounds either way), a `Scale` where the rescale is skipped, and the row
@@ -931,19 +903,6 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
     assert!(dot2 || ir.contains("fpext bfloat"), "{ir}");
 }
 
-/// A lane reads another lane's register on the vector unit on RDNA (DPP within
-/// a row of 16, `permlanex16` across the rows), through the LDS crossbar on CDNA.
-#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
-#[test_case(amd(AmdArch::Gfx1151, 40), true; "gfx1151")]
-#[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
-fn rdna_lane_moves_stay_on_the_vector_unit(target: Target, vector: bool) {
-    let (name, prog, lowering) =
-        families(&target).into_iter().find(|(n, ..)| n.starts_with("rms norm")).expect("a norm family");
-    let ir = render(prog, &lowering);
-    assert_eq!(ir.contains("@llvm.amdgcn.update.dpp.i32("), vector, "{name}");
-    assert_eq!(ir.contains("@llvm.amdgcn.ds.bpermute("), !vector, "{name}");
-}
-
 /// `Sync::Fence` statements in `block`, recursively.
 fn fences(block: &crate::ir::Block) -> usize {
     use crate::ir::{Stmt, Sync};
@@ -965,8 +924,8 @@ fn fences(block: &crate::ir::Block) -> usize {
 /// products and its commit on every target that runs it; the fence is an
 /// instruction only where the scheduler would otherwise hoist the commit
 /// (RDNA4), and the interpreter never sees it, so
-/// `lowering_keeps_the_interpreted_result` covers its placement. One slot
-/// needs none: a barrier holds the commit back.
+/// `every_family_lowers_keeps_its_numbers_and_compiles` covers its
+/// placement. One slot needs none: a barrier holds the commit back.
 #[test_case(AmdArch::Gfx1201, true; "gfx1201 fences")]
 #[test_case(AmdArch::Gfx942, false; "gfx942 keeps order")]
 #[test_case(AmdArch::Gfx1100, false; "gfx1100 keeps order")]
@@ -1001,34 +960,6 @@ fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
             Stmt::If { then, otherwise, .. } => tile_relayouts(prog, then) + tile_relayouts(prog, otherwise),
         })
         .sum()
-}
-
-/// Where the accumulator is its operand's transpose (gfx12, CDNA) the
-/// inference issues attention's products the way round that hands the scores
-/// to P·V as they stand, so no attention kernel re-holds a score tile (the
-/// decoder step's cache kernel still moves its softmax state, a 16-element
-/// vector, between the cached keys and the appended one); where neither way
-/// is free (RDNA3) the tile relayout remains, under the declared [`costs`] a
-/// register exchange between the half-waves. The biased kernel is left out:
-/// its bias tiles come from global memory in a layout of their own, and on
-/// gfx942 the kernel re-holds three tiles however the products are issued.
-#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
-#[test_case(amd(AmdArch::Gfx942, 304), true; "gfx942")]
-#[test_case(amd(AmdArch::Gfx1100, 96), false; "gfx1100")]
-fn attention_orientation_spares_the_relayout(target: Target, free: bool) {
-    let kernels: Vec<_> = families(&target)
-        .into_iter()
-        .filter(|(name, ..)| name.starts_with("attention d") && !name.ends_with("bias"))
-        .collect();
-    assert!(!kernels.is_empty());
-    for (name, prog, lowering) in kernels {
-        let tile = lowered_tile(prog, &lowering);
-        let n = tile_relayouts(&tile, &tile.body);
-        assert_eq!(n == 0, free, "{name}: {n} tile relayouts");
-    }
-    // What the planner charges for the scratch agrees with the lowering.
-    let atom = target.mma.first().unwrap();
-    assert_eq!(atom.accumulator_feeds(target.wave), free);
 }
 
 /// The probe's plain attention at head size `d` under `cfg` on `target`.
