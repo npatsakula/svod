@@ -49,9 +49,31 @@ fn gemm_matches_the_interpreter(
         return;
     };
     let cfg = GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m: 0, unroll: true };
-    let prog = plain_gemm(m, n, k, cfg);
-    let lowering = cfg.lowering(target);
+    check_gemm(&target, m, n, k, cfg);
+}
 
+/// Every config the op layer may pick or tune to, on a grid with partial
+/// row and column tiles.
+#[test]
+fn every_gemm_candidate_matches_the_interpreter() {
+    let Some(target) = cuda_target() else {
+        eprintln!("skipped: no CUDA device");
+        return;
+    };
+    let mut cfgs = crate::ops::config::gemm_candidates(&target, 1, 4096, 4096, 4096, false);
+    for cfg in crate::ops::config::gemm_candidates(&target, 1, 704, 512, 512, false) {
+        if !cfgs.contains(&cfg) {
+            cfgs.push(cfg);
+        }
+    }
+    for cfg in cfgs {
+        check_gemm(&target, 200, 136, 128, cfg);
+    }
+}
+
+fn check_gemm(target: &Target, m: usize, n: usize, k: usize, cfg: GemmCfg) {
+    let prog = plain_gemm(m, n, k, cfg);
+    let lowering = cfg.lowering(target.clone());
     let mut seed = 11;
     let a: Vec<f32> = (0..m * k).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect();
     let b: Vec<f32> = (0..n * k).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed) as f64) as f32).collect();
@@ -71,9 +93,9 @@ fn gemm_matches_the_interpreter(
     for (i, (g, w)) in got.iter().zip(&want[2]).enumerate() {
         let diff = (*g as f64 - w).abs();
         worst = worst.max(diff);
-        assert!(diff <= 1.6e-2 * w.abs().max(1.0), "c[{}, {}] = {g}, interpreter {w}", i / n, i % n);
+        assert!(diff <= 1.6e-2 * w.abs().max(1.0), "{cfg:?}: c[{}, {}] = {g}, interpreter {w}", i / n, i % n);
     }
-    eprintln!("max abs diff {worst:.3e}");
+    eprintln!("{cfg:?}: max abs diff {worst:.3e}");
 }
 
 /// Throughput probe against tk1's `gemm_nt` on the same device and shapes;
@@ -140,5 +162,57 @@ fn gemm_throughput_probe() {
     }
     for ((label, _), secs) in plans.iter().zip(&best) {
         eprintln!("{label}: {:.2} ms, {:.1} TFLOP/s", secs * 1e3, flops / secs / 1e12);
+    }
+}
+
+/// Every GEMM candidate of `ops::config` timed as the tune store times them,
+/// on Nemotron's projections (704 rows under a batch variable of capacity 1)
+/// and 4096³, marking the old fixed ladder's pick for the small shapes;
+/// prints the first fit (the untuned pick) and the winner per shape.
+#[test]
+#[ignore = "perf probe: needs a CUDA device"]
+fn gemm_candidates_probe() {
+    use crate::kernels::Act;
+    use crate::ops::config::gemm_candidates;
+    let Some(target) = cuda_target() else {
+        eprintln!("skipped: no CUDA device");
+        return;
+    };
+    let ladder = GemmCfg { tile: [128, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true };
+    let plain = Epilogue::default();
+    for (m, n, k, epilogue, var) in [
+        (704, 1536, 512, plain, true),
+        (704, 512, 512, plain, true),
+        (704, 2048, 512, Epilogue { act: Act::Gelu, ..plain }, true),
+        (704, 512, 2048, Epilogue { residual: true, ..plain }, true),
+        (4096, 4096, 4096, plain, false),
+    ] {
+        let batch = if var { Batch::Var { name: "b".into(), min: 1, max: 1 } } else { Batch::Static(1) };
+        let cfgs = gemm_candidates(&target, 1, m, n, k, false);
+        let build = |cfg| {
+            let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };
+            (gemm::<BF16>(&spec), cfg.lowering(target.clone()))
+        };
+        let ns = crate::tune::measure(cfgs.iter().map(|&c| build(c)));
+        let tflops = |ns: u64| 2.0 * (m * n * k) as f64 / ns as f64 / 1e3;
+        eprintln!("== {m}x{n}x{k} {epilogue:?}");
+        for (i, (c, t)) in cfgs.iter().zip(&ns).enumerate() {
+            let label = match (i, var && *c == ladder) {
+                (0, _) => " first fit",
+                (_, true) => " old ladder pick",
+                _ => "",
+            };
+            let t = t.map_or("failed".into(), |t| format!("{:6.1} us {:5.1} TFLOP/s", t as f64 / 1e3, tflops(t)));
+            eprintln!("  {:?} s{} {:?} unroll={}: {t}{label}", c.tile, c.stages, c.warps, c.unroll);
+        }
+        let (t, i) = ns.iter().enumerate().filter_map(|(i, t)| Some((t.as_ref().copied()?, i))).min().unwrap();
+        eprintln!(
+            "  tuned: {:?} s{} {:?} unroll={} at {:.1} TFLOP/s",
+            cfgs[i].tile,
+            cfgs[i].stages,
+            cfgs[i].warps,
+            cfgs[i].unroll,
+            tflops(t)
+        );
     }
 }

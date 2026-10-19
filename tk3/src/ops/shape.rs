@@ -15,7 +15,8 @@ use crate::kernels::rows::NormCfg;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Plan<C> {
-    Kernel(C),
+    /// The tile config candidates, the untuned pick first.
+    Kernel(Vec<C>),
     Graph(Fallback),
 }
 
@@ -108,8 +109,12 @@ fn reduced(x: &Extent) -> Result<usize, Fallback> {
     }
 }
 
-fn plan<C>(f: impl FnOnce() -> Result<C, Fallback>) -> Plan<C> {
+fn plan<C>(f: impl FnOnce() -> Result<Vec<C>, Fallback>) -> Plan<C> {
     f().map_or_else(Plan::Graph, Plan::Kernel)
+}
+
+fn candidates<C>(list: Vec<C>, none: Fallback) -> Result<Vec<C>, Fallback> {
+    if list.is_empty() { Err(none) } else { Ok(list) }
 }
 
 /// `x [lead..., k] · w [n·halves, k]ᵀ`; `dtypes` are those of every operand.
@@ -117,12 +122,14 @@ pub fn linear(target: Option<&Target>, dtypes: &[DType], x: Option<&Extent>, n: 
     plan(|| {
         let (target, x) = (gate(target, dtypes)?, x.ok_or(Fallback::Symbolic)?);
         let k = reduced(x)?;
-        let rows: usize = x.dims[..x.dims.len() - 1].iter().product();
+        // A bound batch walks grid z; each batch is a GEMM over the rows behind it.
+        let lead = &x.dims[..x.dims.len() - 1];
+        let (batches, rows) = if x.var { (lead[0], lead[1..].iter().product()) } else { (1, lead.iter().product()) };
         // Columns are stored in vector runs: a run never straddles `n`.
-        if !n.is_multiple_of(8) || rows == 0 {
+        if !n.is_multiple_of(8) || rows * batches == 0 {
             return Err(Fallback::Shape);
         }
-        config::choose_gemm(target, rows, n, k, gated).ok_or(Fallback::Config)
+        candidates(config::gemm_candidates(target, batches, rows, n, k, gated), Fallback::Config)
     })
 }
 
@@ -134,7 +141,7 @@ pub fn attention(target: Option<&Target>, dtypes: &[DType], q: Option<&Extent>, 
         if q.dims.contains(&0) || k.dims.contains(&0) {
             return Err(Fallback::Shape);
         }
-        config::choose_attention(target, q.dims[3]).ok_or(Fallback::Shape)
+        candidates(config::attention_candidates(target, q.dims[3]), Fallback::Shape)
     })
 }
 
@@ -146,7 +153,7 @@ pub fn norm(target: Option<&Target>, dtypes: &[DType], x: Option<&Extent>) -> Pl
         if x.dims.contains(&0) {
             return Err(Fallback::Shape);
         }
-        config::choose_norm(target, d).ok_or(Fallback::Shape)
+        candidates(config::norm_candidates(target, d), Fallback::Shape)
     })
 }
 

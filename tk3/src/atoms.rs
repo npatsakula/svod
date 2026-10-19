@@ -48,6 +48,8 @@ pub struct Target {
     pub ldmatrix: bool,
     /// Shared memory a block may use without special launch attributes.
     pub smem_bytes: usize,
+    /// Streaming multiprocessors (compute units), when the device reports them.
+    pub sms: Option<u32>,
 }
 
 impl Target {
@@ -62,17 +64,17 @@ impl Target {
             GpuArch::Amd(_) => (false, false, 64 << 10),
             GpuArch::Metal(_) => (false, false, 32 << 10),
         };
-        Self { arch, wave, mma: mma_atoms(arch), cp_async, ldmatrix, smem_bytes }
+        Self { arch, wave, mma: mma_atoms(arch), cp_async, ldmatrix, smem_bytes, sms: None }
     }
 
     /// The target behind a device, when the backend reports its architecture.
     pub fn for_device(spec: &svod_dtype::DeviceSpec) -> Option<Self> {
         use svod_device::registry as reg;
         use svod_dtype::DeviceSpec;
-        let mut smem = None;
+        let mut limits = None;
         let arch = match spec {
             DeviceSpec::Cuda { device_id } => {
-                smem = reg::resolve_cuda_limits(*device_id).ok().map(|l| l.shared_per_block_optin as usize);
+                limits = reg::resolve_cuda_limits(*device_id).ok();
                 GpuArch::Cuda(reg::resolve_cuda_arch(*device_id).ok()?)
             }
             DeviceSpec::Amd { device_id } => GpuArch::Amd(reg::resolve_amd_arch_from_topology(*device_id).ok()?),
@@ -80,8 +82,9 @@ impl Target {
             DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => return None,
         };
         let mut target = Self::for_arch(arch);
-        if let Some(smem) = smem {
-            target.smem_bytes = smem;
+        if let Some(limits) = limits {
+            target.smem_bytes = limits.shared_per_block_optin as usize;
+            target.sms = Some(limits.sm_count);
         }
         Some(target)
     }
@@ -175,7 +178,7 @@ fn amd_accumulator(arch: AmdArch) -> Layout {
     }
 }
 
-/// The CUDA sm_86 target the development machine has.
+/// The CUDA sm_86 target of the development machine's RTX 3060 (28 SMs).
 pub fn sm86() -> Target {
-    Target::for_arch(GpuArch::Cuda(CudaArch { major: 8, minor: 6 }))
+    Target { sms: Some(28), ..Target::for_arch(GpuArch::Cuda(CudaArch { major: 8, minor: 6 })) }
 }

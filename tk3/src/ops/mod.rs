@@ -24,8 +24,11 @@ pub use self::attention::{Attn, KeyMask, attention};
 pub use self::linear::{Linear, linear};
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
 use crate::atoms::Target;
+use crate::ir::Program;
 pub use crate::kernels::Act;
 use crate::kernels::Batch;
+use crate::lower::Lowering;
+use crate::tune::{self, TuneKey, TuneStore};
 use shape::BatchVar;
 
 #[derive(Debug, Snafu)]
@@ -69,6 +72,26 @@ fn target(device: &DeviceSpec) -> Option<Target> {
     }
     let mut cache = TARGETS.get_or_init(Mutex::default).lock().expect("target cache");
     cache.entry(device.clone()).or_insert_with(|| Target::for_device(device)).clone()
+}
+
+/// The candidate to launch: the global store's measured winner for `shape`
+/// when tuning is on, else the first. `salt` is what else the programs `build`
+/// makes vary with.
+fn tuned<C: Copy + std::fmt::Debug>(
+    op: &'static str,
+    target: &Target,
+    dtype: DType,
+    shape: &[usize],
+    salt: impl std::fmt::Debug,
+    candidates: &[C],
+    build: impl Fn(C) -> (Program, Lowering),
+) -> C {
+    if candidates.len() == 1 || !tune::enabled() {
+        return candidates[0];
+    }
+    let scalar = dtype.scalar().expect("a kernel dtype");
+    let key = TuneKey::new(op, target, scalar, shape, &format!("{salt:?} {candidates:?}"));
+    TuneStore::global().pick(&key, candidates, build)
 }
 
 fn fmt_shape(shape: &[SInt]) -> String {

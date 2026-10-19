@@ -17,6 +17,7 @@ pub mod layouts;
 pub mod lower;
 pub mod ops;
 pub mod schedule;
+pub mod tune;
 
 #[cfg(test)]
 mod test;

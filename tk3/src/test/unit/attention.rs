@@ -101,6 +101,10 @@ fn spec(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, causal: bool, key_
     }
 }
 
+fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
+    AttnSpec { cfg, ..spec }
+}
+
 #[test_case(spec(64, 64, 64, 64, 64, false, false), &[64, 64]; "one block")]
 #[test_case(spec(128, 192, 64, 64, 64, false, false), &[192, 192]; "three key blocks")]
 #[test_case(spec(128, 128, 64, 64, 64, true, false), &[128, 128]; "causal")]
@@ -133,6 +137,8 @@ fn only_the_live_batch_runs() {
 #[test_case(spec(256, 256, 64, 64, 64, true, false), &[256, 256]; "causal")]
 #[test_case(spec(128, 256, 64, 64, 64, false, true), &[200, 33]; "key lengths")]
 #[test_case(spec(128, 128, 128, 64, 32, true, true), &[128, 64]; "d 128, causal with lengths")]
+#[test_case(with(FaCfg { bq: 128, bkv: 64, stages: 3 }, spec(256, 192, 64, 0, 0, true, true)), &[192, 70]; "bq 128, three stages")]
+#[test_case(with(FaCfg { bq: 128, bkv: 32, stages: 2 }, spec(200, 130, 128, 0, 0, false, true)), &[130, 99]; "d 128, bq 128, ragged")]
 fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
     let device = default_device();
     let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {

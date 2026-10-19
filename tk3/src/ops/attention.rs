@@ -7,7 +7,9 @@ use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
 use super::shape::{self, Plan, extent, shape_of};
-use super::{DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, typed};
+use super::{
+    DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, batch_of, fmt_shape, output, tuned, typed,
+};
 use crate::kernels::attention::{AttnSpec, attention as fa};
 use crate::launch;
 
@@ -61,25 +63,32 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let k_ext = extent(&ks).map(|(e, _)| e);
     let target = super::target(&q.device());
     let plan = shape::attention(target.as_ref(), &[q.dtype(), k.dtype(), v.dtype()], q_ext.as_ref(), k_ext.as_ref());
-    let Plan::Kernel(cfg) = plan else { return graph(q, k, v, opts, lens).context(GraphSnafu { op: OP }) };
+    let Plan::Kernel(cfgs) = plan else { return graph(q, k, v, opts, lens).context(GraphSnafu { op: OP }) };
     let (q_ext, k_ext, var) = (q_ext.expect("planned"), k_ext.expect("planned"), var.flatten());
+    let target = target.expect("planned");
     let ([b, t, heads, d], [_, tk, kv_heads, _]) = (dims4(&q_ext.dims), dims4(&k_ext.dims));
-    let spec = AttnSpec {
-        batch: batch_of(&var, b),
+    let batch = batch_of(&var, b);
+    let spec = |cfg, key_lens| AttnSpec {
+        batch: batch.clone(),
         t,
         tk,
         heads,
         kv_heads,
         d,
         causal: opts.causal,
-        key_lens: lens.is_some(),
+        key_lens,
         scale: opts.scale.unwrap_or(1.0 / (d as f32).sqrt()),
         cfg,
     };
+    // Measured without the length mask, whose scratch lengths would be garbage.
+    let shape = [batch.capacity(), t, tk, heads, kv_heads, d];
+    let cfg = tuned(OP, &target, q.dtype(), &shape, (&batch, opts.causal), &cfgs, |cfg| {
+        (typed!(q.dtype(), fa, &spec(cfg, false)), cfg.lowering(target.clone()))
+    });
     let o = output(&q_ext.dims, &var, q.dtype());
     let lens = lens.map(|l| if l.dtype() == DType::Int32 { l.clone() } else { l.cast(DType::Int32) });
     let ins: Vec<&Tensor> = [Some(q), Some(k), Some(v), Some(&o), lens.as_ref()].into_iter().flatten().collect();
-    launch::graph_launch(typed!(q.dtype(), fa, &spec), &cfg.lowering(target.expect("planned")), &ins)
+    launch::graph_launch(typed!(q.dtype(), fa, &spec(cfg, lens.is_some())), &cfg.lowering(target), &ins)
         .context(LaunchSnafu { op: OP })
 }
 

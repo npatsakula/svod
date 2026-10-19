@@ -8,7 +8,10 @@ use test_case::test_case;
 
 use crate::ops::{self as tk, Act, Attn, KeyMask, Linear};
 
+/// A CUDA device to run on, with tuning off so a test does not measure
+/// every shape it touches (the untuned pick runs).
 fn device() -> bool {
+    crate::tune::set_enabled(false);
     let device = default_device();
     let ok = matches!(device, DeviceSpec::Cuda { .. }) && tk::supported(&device);
     if !ok {
