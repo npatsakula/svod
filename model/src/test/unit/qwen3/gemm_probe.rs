@@ -1,7 +1,7 @@
-//! Side by side, one process, one loop: tk1's `gemm_nt` and tk3's GEMM on
-//! Qwen3-Embedding-0.6B's four projections at M 4096, bf16 — the op layer's
-//! tuned pick and pinned configs worth watching — reported as the min and
-//! the mean of the same runs, so no harness's statistic is compared against
+//! Side by side, one process, one loop: tk3's GEMM on Qwen3-Embedding-0.6B's
+//! four projections at M 4096, bf16 — the op layer's tuned pick as the model
+//! runs it, and pinned configs worth watching — reported as the min and the
+//! mean of the same runs, so no harness's statistic is compared against
 //! another's.
 
 use svod_dtype::default_device::default_device;
@@ -33,7 +33,7 @@ const fn cfg(tile: [usize; 3], warps: [u32; 2], unroll: bool) -> GemmCfg {
 
 #[test]
 #[ignore = "perf probe: needs a GPU"]
-fn tk1_vs_tk3_gemm_side_by_side() {
+fn tk3_gemm_tuned_vs_pinned() {
     let device = default_device();
     if !matches!(device, DeviceSpec::Amd { .. } | DeviceSpec::Cuda { .. }) {
         eprintln!("skipped: no GPU");
@@ -77,17 +77,6 @@ fn tk1_vs_tk3_gemm_side_by_side() {
         let (x2, w2) = (a.try_reshape([m, k]).unwrap(), b.try_reshape([halves * n, k]).unwrap());
         let r2 = r.as_ref().map(|r| r.try_reshape([m, n]).unwrap());
         let mut plans = vec![];
-
-        // tk1, as the model on `origin/main` ran it.
-        let tk1 = if epi.gated {
-            let pair = svod_tk::swiglu_pair_width(&x2.device()).expect("a pair width");
-            svod_tk::gemm_nt_with_epilogue(&x2, &w2, svod_tk::Epilogue::SwiGlu { pair })
-        } else if let Some(r2) = &r2 {
-            svod_tk::gemm_nt_with_epilogue(&x2, &w2, svod_tk::Epilogue::Add(r2))
-        } else {
-            svod_tk::gemm_nt(&x2, &w2)
-        };
-        plans.push(("tk1".to_string(), tk1.expect("tk1 builds").expect("tk1 applies").prepare().unwrap()));
 
         // tk3 through the op layer: the tune store's pick, as the model runs it.
         let opts = Linear { gated: epi.gated, act: epi.act, residual: r2.as_ref(), ..Linear::default() };
