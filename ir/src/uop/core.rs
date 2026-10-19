@@ -1319,9 +1319,9 @@ impl UOp {
                 assert!(!new_srcs.is_empty());
                 Op::End(ops::End { computation: src(0), ranges: new_srcs[1..].iter().cloned().collect() })
             }
-            Op::Barrier(..) => {
+            Op::Barrier(ops::Barrier { fence, .. }) => {
                 assert!(!new_srcs.is_empty());
-                Op::Barrier(ops::Barrier { src: src(0), deps: new_srcs[1..].iter().cloned().collect() })
+                Op::Barrier(ops::Barrier { src: src(0), deps: new_srcs[1..].iter().cloned().collect(), fence: *fence })
             }
 
             Op::Stack(..) => {

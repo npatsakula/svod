@@ -1,5 +1,5 @@
 use svod_dtype::{AddrSpace, CudaArch, DType};
-use svod_ir::UOp;
+use svod_ir::{BarrierFence, UOp};
 
 use super::*;
 use crate::Renderer;
@@ -173,9 +173,10 @@ fn nvptx_direct_global_axis_reads_the_block_index() {
 /// `llvm.nvvm.barrier0` declares no memory attributes, so LLVM will not move an
 /// access across it, and `bar.sync` orders every prior access of the
 /// participating threads before it completes.
-#[test]
-fn nvptx_barrier_is_bar_sync_alone() {
-    let barrier = UOp::noop().barrier(smallvec::SmallVec::new());
+#[test_case::test_case(BarrierFence::All; "graph")]
+#[test_case::test_case(BarrierFence::Local; "lds only")]
+fn nvptx_barrier_is_bar_sync_alone(fence: BarrierFence) {
+    let barrier = UOp::noop().fenced_barrier(smallvec::SmallVec::new(), fence);
     let result = render_nvptx_linearized(&UOp::sink(vec![barrier]), SM86, "nvptx_barrier");
 
     assert!(result.code.contains("tail call void @llvm.nvvm.barrier0()"), "{}", result.code);

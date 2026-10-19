@@ -862,6 +862,17 @@ impl ProgramInfo {
     }
 }
 
+/// The memory a workgroup BARRIER makes visible across it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum BarrierFence {
+    /// Every address space: what a graph kernel's barrier promises.
+    #[default]
+    All,
+    /// Shared (LDS) memory only: in-flight global loads may cross the barrier.
+    Local,
+}
+
 /// Axis type for loop ranges and reductions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]

@@ -1,5 +1,5 @@
 use svod_dtype::{AddrSpace, AmdArch, DType};
-use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
+use svod_ir::{AxisId, AxisType, BarrierFence, BinaryOp, ConstValue, Op, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 
 use super::*;
 use crate::Renderer;
@@ -297,19 +297,31 @@ fn amd_special_emits_workgroup_workitem_intrinsics() {
     }
 }
 
-#[test]
-fn amd_barrier_emits_fence_and_s_barrier() {
-    let barrier = UOp::noop().barrier(smallvec::SmallVec::new());
+/// A graph barrier's fences order every address space; an LDS-only one's
+/// carry the MMRA that keeps RDNA's release fence from waiting for global
+/// loads, inline, so the module needs no metadata node of its own.
+#[test_case::test_case(BarrierFence::All, ""; "graph")]
+#[test_case::test_case(BarrierFence::Local, ", !mmra !{!\"amdgpu-synchronize-as\", !\"local\"}"; "lds only")]
+fn amd_barrier_emits_fence_and_s_barrier(fence: BarrierFence, mmra: &str) {
+    let barrier = UOp::noop().fenced_barrier(smallvec::SmallVec::new(), fence);
     let result = render_amd_linearized(&UOp::sink(vec![barrier]), AmdArch::Gfx1100, "amd_barrier");
 
-    for needle in [
-        "fence syncscope(\"workgroup\") release",
-        "call void @llvm.amdgcn.s.barrier()",
-        "fence syncscope(\"workgroup\") acquire",
-        "declare void @llvm.amdgcn.s.barrier()",
-    ] {
-        assert!(result.code.contains(needle), "missing {needle}:\n{}", result.code);
-    }
+    let lines: Vec<&str> = result.code.lines().map(str::trim).collect();
+    let release = format!("fence syncscope(\"workgroup\") release{mmra}");
+    let at = lines.iter().position(|l| *l == release).unwrap_or_else(|| panic!("missing {release}:\n{}", result.code));
+    assert_eq!(
+        lines[at..at + 3],
+        [
+            release.as_str(),
+            "tail call void @llvm.amdgcn.s.barrier()",
+            &format!("fence syncscope(\"workgroup\") acquire{mmra}")
+        ],
+        "{}",
+        result.code
+    );
+    assert!(result.code.contains("declare void @llvm.amdgcn.s.barrier()"), "{}", result.code);
+    assert_eq!(result.code.contains("!mmra"), !mmra.is_empty(), "{}", result.code);
+    assert_llvm_ir_assembles(&result.code);
 }
 
 #[test]

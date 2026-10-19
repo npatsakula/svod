@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
-use svod_ir::{AxisType, Op, UOp, ops};
+use svod_ir::{AxisType, BarrierFence, Op, UOp, ops};
 use test_case::test_case;
 
 use crate::optimizer::implicit_barriers::add_implicit_barriers;
@@ -48,7 +48,7 @@ fn after_store_barrier_follows_the_addrspace(addrspace: AddrSpace, barriered: bo
     assert_same!(passthrough, memory);
     if barriered {
         assert!(matches!(deps.as_slice(), [barrier]
-            if matches!(barrier.op(), Op::Barrier(ops::Barrier { src, deps })
+            if matches!(barrier.op(), Op::Barrier(ops::Barrier { src, deps, fence: BarrierFence::All })
                 if Arc::ptr_eq(src, &stored) && deps.is_empty())));
     } else {
         assert!(matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &stored)));
@@ -74,7 +74,7 @@ fn raw_barrier_keeps_every_dependency(barriered: bool) {
 
     let (_, deps) = expect_after(&result);
     assert!(matches!(deps.as_slice(), [barrier]
-        if matches!(barrier.op(), Op::Barrier(ops::Barrier { src, deps })
+        if matches!(barrier.op(), Op::Barrier(ops::Barrier { src, deps, fence: BarrierFence::All })
             if Arc::ptr_eq(src, &first) && matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &second)))));
 }
 
@@ -103,7 +103,7 @@ fn local_store_and_load_get_a_war_barrier(axis_type: AxisType) {
     let result = add_implicit_barriers(stored.end(smallvec![range.clone()]));
 
     let (computation, ranges) = expect_end(&result);
-    assert!(matches!(computation.op(), Op::Barrier(ops::Barrier { src, deps })
+    assert!(matches!(computation.op(), Op::Barrier(ops::Barrier { src, deps, fence: BarrierFence::All })
         if Arc::ptr_eq(src, &stored) && matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &loaded))));
     assert!(matches!(ranges.as_slice(), [closed] if Arc::ptr_eq(closed, &range)));
 }
@@ -118,7 +118,7 @@ fn end_computation_load_participates_in_war_detection() {
     let result = add_implicit_barriers(loaded.end(smallvec![range]));
 
     assert!(matches!(result.op(), Op::End(ops::End { computation, .. })
-        if matches!(computation.op(), Op::Barrier(ops::Barrier { src, deps })
+        if matches!(computation.op(), Op::Barrier(ops::Barrier { src, deps, fence: BarrierFence::All })
             if matches!(src.op(), Op::Load(..)) && matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, src)))));
 }
 

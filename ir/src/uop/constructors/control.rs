@@ -14,7 +14,7 @@ use svod_dtype::DType;
 
 use crate::op::Op;
 use crate::ops;
-use crate::types::{AxisId, AxisType};
+use crate::types::{AxisId, AxisType, BarrierFence};
 use crate::uop::UOp;
 
 impl UOp {
@@ -91,7 +91,12 @@ impl UOp {
     /// Self passes through; `deps` are operations that must complete before
     /// any consumer of this barrier executes.
     pub fn barrier(self: &Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
-        Self::new(Op::Barrier(ops::Barrier { src: self.clone(), deps }), DType::Void)
+        self.fenced_barrier(deps, BarrierFence::All)
+    }
+
+    /// [`Self::barrier`] whose fence makes only `fence`'s memory visible across it.
+    pub fn fenced_barrier(self: &Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>, fence: BarrierFence) -> Arc<Self> {
+        Self::new(Op::Barrier(ops::Barrier { src: self.clone(), deps, fence }), DType::Void)
     }
 
     // =========================================================================

@@ -10,7 +10,7 @@ use smallvec::smallvec;
 use svod_codegen::llvm::nvptx::smem::{cp_async_commit, cp_async_wait};
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
-use svod_ir::{AxisId, AxisType, KernelInfo, Op, UOp};
+use svod_ir::{AxisId, AxisType, BarrierFence, KernelInfo, Op, UOp};
 
 use crate::atoms::{Core, Fill};
 use crate::index::*;
@@ -658,9 +658,10 @@ impl<'a> Emit<'a> {
     fn sync(&mut self, sync: Sync) -> Result<()> {
         let target = &self.low.device.target;
         let u = match sync {
+            // A tk3 barrier orders shared memory only (`Sync::Barrier`).
             Sync::Barrier { scope: Scope::Block } => {
                 let tag = self.next_tag();
-                self.last.clone().barrier(smallvec![]).rtag(Some(smallvec![tag as usize]))
+                self.last.clone().fenced_barrier(smallvec![], BarrierFence::Local).rtag(Some(smallvec![tag as usize]))
             }
             Sync::Barrier { scope: Scope::Warp } if target.sync.warp_barrier => nvptx::warp_barrier(&self.last),
             Sync::Barrier { scope: Scope::Warp } => return Ok(()),

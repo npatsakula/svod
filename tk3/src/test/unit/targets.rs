@@ -793,6 +793,58 @@ fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
     }
 }
 
+/// Whether some barrier in `asm` is reached with a global load in flight: one
+/// issued since the last wait that left none outstanding (`s_wait_loadcnt
+/// 0x0` and its merged forms on gfx12, `vmcnt(0)` before).
+fn a_load_crosses_a_barrier(asm: &str) -> bool {
+    let mut in_flight = false;
+    for op in asm.lines().map(str::trim).filter(|l| !l.starts_with(';')) {
+        if op.starts_with("global_load") {
+            in_flight = true;
+        } else if (op.starts_with("s_wait_loadcnt") && op.ends_with(" 0x0")) || op.contains("vmcnt(0)") {
+            in_flight = false;
+        } else if (op == "s_barrier" || op.starts_with("s_barrier_signal ")) && in_flight {
+            return true;
+        }
+    }
+    false
+}
+
+/// A tk3 barrier fences shared memory only, so the one-slot register-staged
+/// trip's barrier between its products and its commit leaves the next step's
+/// loads in flight. A plain workgroup release fence on RDNA would wait for
+/// them first (`s_wait_loadcnt 0x0` on gfx12, `vmcnt(0)` on gfx11); CDNA's
+/// fence never waited, and its code is unchanged.
+#[test_case(AmdArch::Gfx1201, true; "gfx1201")]
+#[test_case(AmdArch::Gfx1151, true; "gfx1151")]
+#[test_case(AmdArch::Gfx1100, true; "gfx1100")]
+#[test_case(AmdArch::Gfx942, false; "gfx942")]
+#[test_case(AmdArch::Gfx950, false; "gfx950")]
+fn prefetch_loads_stay_in_flight_across_a_barrier(arch: AmdArch, rdna: bool) {
+    let device = declared(amd(arch, 64));
+    let cfg = config::gemm_cfg([64, 64, 32], 1, [2, 2], false);
+    let spec = GemmSpec { m: 256, n: 256, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+    let ir = render(gemm::<BF16>(&spec), &cfg.lowering(&device));
+    let mmra = r#", !mmra !{!"amdgpu-synchronize-as", !"local"}"#;
+    let fences = ir.matches("fence syncscope(\"workgroup\")").count();
+    assert!(fences > 0 && ir.matches(mmra).count() == fences, "every barrier fence is LDS-only:\n{ir}");
+    let asm = |ir: &str| match svod_runtime::amd::compile_ir_to_amd_asm(ir, arch) {
+        Ok(asm) => Some(String::from_utf8(asm).unwrap()),
+        Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => None,
+        Err(e) => panic!("{e}"),
+    };
+    let (Some(local), Some(plain)) = (asm(&ir), asm(&ir.replace(mmra, ""))) else {
+        eprintln!("skipped: clang has no AMDGPU target");
+        return;
+    };
+    assert!(a_load_crosses_a_barrier(&local), "the next step's loads drain at the barrier:\n{local}");
+    if rdna {
+        assert!(!a_load_crosses_a_barrier(&plain), "a plain workgroup fence no longer drains:\n{plain}");
+    } else {
+        assert_eq!(local, plain, "the LDS-only fence changed CDNA code");
+    }
+}
+
 /// `Relayout` statements of tiles in `block`, recursively; vectors are not
 /// counted.
 fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {

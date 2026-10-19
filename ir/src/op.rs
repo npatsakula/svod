@@ -184,6 +184,7 @@ pub enum Op {
     Barrier {
         src: Arc<UOp>,
         deps: SmallVec<[Arc<UOp>; 4]>,
+        fence: BarrierFence,
     },
 
     // Shaped values and late vector operations
@@ -391,7 +392,7 @@ impl Op {
                 children.extend(ranges.iter());
                 children
             }
-            Self::Barrier(ops::Barrier { src, deps }) => {
+            Self::Barrier(ops::Barrier { src, deps, .. }) => {
                 let mut children = SmallVec::from_slice(&[src]);
                 children.extend(deps.iter());
                 children

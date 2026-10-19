@@ -4,8 +4,8 @@ use smallvec::{SmallVec, smallvec};
 
 use crate::ops;
 use crate::{
-    AxisId, AxisType, CallInfo, DType, DeviceSpec, KernelInfo, Op, Opt, OptimizerWireGraph, ParamArg, ReduceOp,
-    RendererDevice, UOp, WmmaMetadata, WmmaUpcastAxes,
+    AxisId, AxisType, BarrierFence, CallInfo, CanonicalArg, DType, DeviceSpec, KernelInfo, Op, Opt, OptimizerWireGraph,
+    ParamArg, ReduceOp, RendererDevice, UOp, WmmaMetadata, WmmaUpcastAxes,
 };
 
 fn tagged(op: Op, dtype: DType, tag: &[usize]) -> Arc<UOp> {
@@ -123,4 +123,30 @@ fn optimizer_wire_rejects_executable_stages_and_type_erased_metadata() {
 
     let with_metadata = sink.with_metadata(String::from("opaque"));
     assert!(OptimizerWireGraph::from_root(&with_metadata).unwrap_err().to_string().contains("type-erased metadata"));
+}
+
+/// A barrier's fence is part of its identity: it survives the wire and a
+/// source rewrite, and the canonical form names an LDS-only fence while a
+/// graph barrier keeps Tinygrad's argument-free form.
+#[test_case::test_case(BarrierFence::All, CanonicalArg::None; "graph")]
+#[test_case::test_case(BarrierFence::Local, CanonicalArg::Name { value: "LOCAL".into() }; "lds only")]
+fn barrier_fence_round_trips(fence: BarrierFence, canonical: CanonicalArg) {
+    let barrier = UOp::native_const(1i32).fenced_barrier(smallvec![], fence);
+    assert_ne!(barrier, UOp::native_const(1i32).fenced_barrier(smallvec![], other(fence)));
+    let fence_of = |u: &Arc<UOp>| match u.op() {
+        Op::Barrier(ops::Barrier { fence, .. }) => *fence,
+        op => panic!("not a barrier: {op:?}"),
+    };
+    let decoded = OptimizerWireGraph::from_root(&barrier).unwrap().decode_root().unwrap();
+    assert_eq!(fence_of(&decoded), fence);
+    assert_eq!(fence_of(&barrier.with_sources(vec![UOp::native_const(2i32)])), fence);
+    let arg = crate::CanonicalGraph::from_root("wire", &barrier).unwrap().nodes.last().unwrap().arg.clone();
+    assert_eq!(arg, canonical);
+}
+
+fn other(fence: BarrierFence) -> BarrierFence {
+    match fence {
+        BarrierFence::All => BarrierFence::Local,
+        BarrierFence::Local => BarrierFence::All,
+    }
 }
