@@ -75,7 +75,7 @@ const DYNAMIC_SHARED_ARRAY: &str = "@svod_dynamic_shared";
 /// from such a boundary.
 pub const SHARED_ALIGN: usize = 1024;
 
-/// Lay the kernel's LOCAL buffers out at 16-byte aligned offsets. Totals up
+/// Lay the kernel's LOCAL buffers out at [`SHARED_ALIGN`]-aligned offsets. Totals up
 /// to the static cap keep one `addrspace(3)` global per buffer; above it the
 /// buffers become slices of one dynamic shared array, and the module exports
 /// the byte count as the `.const` [`DYNAMIC_SHARED_BYTES_SYMBOL`], which the
