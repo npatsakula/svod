@@ -500,6 +500,16 @@ impl Kernel {
         Tile::new(dst)
     }
 
+    /// Global → registers as the register half of the target's fill loads:
+    /// the same instruction class and cache policy as a fill of `src`
+    /// ([`CopyMode::Staged`]), where [`Self::load`] is a plain load.
+    pub fn load_as_fill<T: Elem>(&mut self, src: Gmem<T>) -> Regs<T> {
+        let Value { dtype, shape, .. } = self.prog.value(src.0).clone();
+        let dst = self.value(dtype, shape, Place::Reg);
+        self.copy(dst, src.0, CopyMode::Staged);
+        Tile::new(dst)
+    }
+
     /// Registers → shared or global.
     pub fn store<T: Elem, P: TierMark>(&mut self, dst: Tile<P, T>, src: Regs<T>) {
         self.copy(dst.0, src.0, CopyMode::Sync);

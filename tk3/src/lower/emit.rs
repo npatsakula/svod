@@ -9,7 +9,9 @@ use std::sync::Arc;
 use smallvec::smallvec;
 use svod_codegen::llvm::amd::tr::global_load_tr_b128;
 use svod_codegen::llvm::nvptx::ops::shfl_bfly;
-use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill, cp_async_commit, cp_async_wait, ldmatrix};
+use svod_codegen::llvm::nvptx::smem::{
+    cp_async_16, cp_async_16_zfill, cp_async_commit, cp_async_wait, ld_global_cg_16, ldmatrix,
+};
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, GpuArch, ScalarDType};
 use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp, WmmaMetadata, ops};
@@ -21,6 +23,7 @@ use crate::ir::*;
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
 use crate::layout::{self as frag, Layout};
 use crate::layouts::{Laid, Relayout, TileLayout};
+use crate::schedule::Prefetch;
 use snafu::{OptionExt, ResultExt};
 
 pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Arc<UOp>> {
@@ -909,7 +912,7 @@ impl<'a> Emit<'a> {
         match (self.value(dst).tier(), self.value(src).tier()) {
             (Tier::Smem, Tier::Global) => self.fill(dst, src, mode, scope),
             (Tier::Reg, Tier::Smem) => self.gather(dst, src),
-            (Tier::Reg, Tier::Global) => self.load_regs(dst, src),
+            (Tier::Reg, Tier::Global) => self.load_regs(dst, src, mode),
             (Tier::Smem | Tier::Global, Tier::Reg) => self.store_regs(dst, src),
             (Tier::Reg, Tier::Reg) => self.relayout(dst, src),
             (d, s) => UnsupportedSnafu { what: format!("a {s:?} → {d:?} copy") }.fail(),
@@ -1063,16 +1066,27 @@ impl<'a> Emit<'a> {
 
     /// Global → registers: past a plain bound the load is gated; a gathered
     /// row outside its map reads element 0 and one select zeroes the run.
-    fn load_regs(&mut self, dst: ValId, src: ValId) -> Result<()> {
+    /// Global → registers. The register half of a fill ([`CopyMode::Staged`])
+    /// reads as the kernel's fills read: where those are `cp.async.cg`
+    /// copies, its 16-byte runs load at L2 only, bypassing L1 as the copies
+    /// do; under register staging, as plain loads.
+    fn load_regs(&mut self, dst: ValId, src: ValId, mode: CopyMode) -> Result<()> {
         let l = self.layout(dst).clone();
         let s = self.view(src);
         if let Some(perm) = self.transposing(&l, &s) {
             return self.tr_load_regs(dst, &s, &l, &perm);
         }
         let gathered = matches!(s.place, Place::Global { rows: Some(_), .. });
+        let cuda = matches!(self.low.device.target.arch, GpuArch::Cuda(_));
+        let l2_only = mode == CopyMode::Staged && cuda && self.low.schedule.prefetch() == Prefetch::CpAsync;
         for (j, w) in self.runs(&l, &s) {
             let c = self.coord(&l, j);
             let (off, gate) = self.address(&s, &c);
+            if l2_only && w as usize * s.dtype.bytes() == 16 {
+                let vals = self.load_l2_only(&s, off, gate, w as usize);
+                self.reg_store(dst, j, vals);
+                continue;
+            }
             let v = match gate {
                 Some(g) if gathered => {
                     let safe = self.hoist(UOp::try_where(g.clone(), off, c32(0)).expect("safe offset"));
@@ -1085,6 +1099,36 @@ impl<'a> Emit<'a> {
             self.reg_store(dst, j, vals);
         }
         Ok(())
+    }
+
+    /// A 16-byte run of `w` elements of `s` at `off` loaded at L2 only (as a
+    /// `cp.async.cg` fill reads), a run past `gate` reading element 0 and
+    /// landing as zeros.
+    fn load_l2_only(&mut self, s: &View, off: Arc<UOp>, gate: Option<Arc<UOp>>, w: usize) -> Vec<Arc<UOp>> {
+        let safe = match &gate {
+            Some(g) => self.hoist(UOp::try_where(g.clone(), off, c32(0)).expect("safe offset")),
+            None => off,
+        };
+        let src = self.access(&s.buf, &safe, 1);
+        let words = ld_global_cg_16(&src);
+        let per_word = w / words.len();
+        let vals: Vec<Arc<UOp>> = (0..w)
+            .map(|e| {
+                let word = &words[e / per_word];
+                match per_word {
+                    1 if word.dtype() == s.dtype.into() => word.clone(),
+                    1 => word.bitcast(s.dtype.into()),
+                    n => elem(&word.bitcast(s.dtype.vec(n)), e % n, n),
+                }
+            })
+            .collect();
+        match gate {
+            Some(g) => vals
+                .into_iter()
+                .map(|v| UOp::try_where(g.clone(), v.clone(), v.const_like(0)).expect("zeroed"))
+                .collect(),
+            None => vals,
+        }
     }
 
     /// The register permutation under which `l` is what transposing 16×16

@@ -31,6 +31,17 @@ pub enum Schedule {
     PingPong { crew: u32 },
 }
 
+impl Schedule {
+    /// How the schedule's fills move data in; a ping-pong's slot is
+    /// register-staged.
+    pub fn prefetch(&self) -> Prefetch {
+        match *self {
+            Schedule::Uniform { prefetch, .. } => prefetch,
+            Schedule::PingPong { .. } => Prefetch::RegisterStaged,
+        }
+    }
+}
+
 /// Replace every [`Stmt::Pipeline`] of `prog` by loops, branches and explicit
 /// synchronization according to `schedule`.
 pub fn expand(prog: &mut Program, schedule: Schedule) {

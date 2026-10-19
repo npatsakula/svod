@@ -61,6 +61,77 @@ pub(crate) struct Probe {
     /// What the difference is scaled by before dividing by `units`: the SM
     /// count for a throughput probe, else 1.
     pub(crate) scale: f64,
+    pub(crate) signal: Signal,
+}
+
+/// How a pair's signal (probe less baseline) is told from noise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Signal {
+    /// At least half the probe's own time ([`strong`]): a primitive the pair
+    /// can make dominate its scaffolding.
+    Dominant,
+    /// Above the pair's own run-to-run spread ([`resolved`]): a primitive
+    /// that rides on work it cannot shed, as a trip moves its tile's bytes,
+    /// and is small next to it.
+    Resolved,
+}
+
+/// Measurement: timings of a [`Signal::Resolved`] pair, compiled once: the
+/// spread of five bounds the noise a difference must clear.
+const RESOLVE_TRIES: usize = 5;
+
+/// A pair's difference and the noise it is told from, both in ns.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Resolved {
+    /// The median of the pairs' differences, probe less baseline.
+    pub(crate) difference: f64,
+    /// The run-to-run spread of the baselines plus that of the probes, each
+    /// with its extremes trimmed.
+    pub(crate) spread: f64,
+}
+
+impl Resolved {
+    pub(crate) fn clear(&self) -> bool {
+        self.difference > self.spread
+    }
+
+    /// The difference where it clears the spread; else the spread, an upper
+    /// bound on a primitive the pair cannot tell from zero.
+    pub(crate) fn value(&self) -> f64 {
+        if self.clear() { self.difference } else { self.spread }
+    }
+}
+
+/// `pairs` (`[baseline, probe]` timings of one compiled pair) resolved;
+/// `None` without a pair. A probe that runs faster than its baseline adds
+/// nothing the baseline's work did not cost (sm_120's `cp.async` ring moves
+/// its bytes a few percent cheaper than the same bytes loaded into
+/// registers), so its value is the spread, the bound on what it adds.
+pub(crate) fn resolved(pairs: &[(u64, u64)]) -> Option<Resolved> {
+    // A side's range with its extremes trimmed once three timings allow:
+    // a first run below the lifted clock is noise, not the pair's spread.
+    let spread = |side: fn(&(u64, u64)) -> u64| {
+        let mut t: Vec<u64> = pairs.iter().map(side).collect();
+        t.sort_unstable();
+        let kept = if t.len() >= 3 { &t[1..t.len() - 1] } else { &t[..] };
+        kept.last().zip(kept.first()).map_or(0.0, |(hi, lo)| (hi - lo) as f64)
+    };
+    let spread = spread(|p| p.0) + spread(|p| p.1);
+    let mut diffs: Vec<f64> = pairs.iter().map(|&(base, probe)| probe as f64 - base as f64).collect();
+    diffs.sort_by(f64::total_cmp);
+    let difference = *diffs.get(diffs.len() / 2)?;
+    Some(Resolved { difference, spread })
+}
+
+/// [`RESOLVE_TRIES`] timings of a compiled pair; those that lost a stamp or
+/// failed are left out.
+pub(crate) fn resolve_pairs(built: &mut [Built]) -> Vec<(u64, u64)> {
+    (0..RESOLVE_TRIES)
+        .filter_map(|_| match tune::time(built)[..] {
+            [Some(base), Some(probe)] => Some((base, probe)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Whether a pair's signal (probe less baseline, ns) is at least half the
@@ -96,12 +167,6 @@ pub fn costs(target: &Target) -> Result<Measured> {
         unmeasured.push("l2_bytes");
         (costs.global_byte, 0.0)
     });
-    // A plan prices a trip's fragment reads by `smem_byte`, so a trip is
-    // what its pipeline adds besides reading its tile from the ring.
-    let fragment = (trip_tile(target).elems() * 4) as f64 * costs.smem_byte;
-    costs.trip = (costs.trip - fragment).max(0.0);
-    costs.trip_rolled = (costs.trip_rolled - fragment).max(0.0);
-    costs.trip_one = (costs.trip_one - fragment).max(0.0);
     Ok(measured)
 }
 
@@ -134,7 +199,7 @@ pub(crate) fn assemble(target: &Target, probes: Vec<Probe>, mut measure: impl Fn
 /// costs a few picoseconds, which whole picoseconds would round by a third.
 /// The pair compiles once and is timed until a timing holds.
 fn measured(target: &Target, compiler: u64, probe: Probe) -> Result<f64> {
-    let Probe { op, dtype, candidates, units, scale } = probe;
+    let Probe { op, dtype, candidates, units, scale, signal } = probe;
     let programs = tune::fingerprint(&candidates);
     let key = TuneKey::new(op, target, compiler, dtype, &[], &programs);
     let mut last = String::from("not run");
@@ -143,6 +208,13 @@ fn measured(target: &Target, compiler: u64, probe: Probe) -> Result<f64> {
         || programs,
         || {
             let mut built = tune::compile(candidates, &ScratchPool::default());
+            if signal == Signal::Resolved {
+                let pairs = resolve_pairs(&mut built);
+                last = format!("no difference resolved from {pairs:?}");
+                let r = resolved(&pairs)?;
+                tracing::debug!(op, ?pairs, ?r, "probe pair resolved");
+                return Some((r.value() * scale / units * 1e6).round() as u64);
+            }
             least((0..TRIES).filter_map(|_| match timed(&mut built, scale / units) {
                 Ok((fs, base_ns, probe_ns)) => {
                     tracing::debug!(op, base_ns, probe_ns, fs, "probe pair timed");
@@ -350,7 +422,7 @@ impl<'a> Probes<'a> {
     ) -> Probe {
         let candidates = [false, true].map(|on| vec![(build(on), lowering.clone())]).into();
         let scale = if per_sm { self.sms as f64 } else { 1.0 };
-        Probe { op, dtype, candidates, units, scale }
+        Probe { op, dtype, candidates, units, scale, signal: Signal::Dominant }
     }
 
     /// Operand bytes read from shared memory: an f32 tile loaded and summed
@@ -587,44 +659,94 @@ impl<'a> Probes<'a> {
     }
 
     /// [`TRIPS`] trips of a pipeline over the least fill a block copies, a
-    /// 16-byte chunk per thread (eight to a 32-wide i32 row), from a region
-    /// every block shares so it stays in cache, through a ring `stages` deep
-    /// as the target runs it, lowered `unroll`ed (a trip's fixed cost) or
-    /// rolled (slot offsets recomputed per trip). The baseline
-    /// loads the same chunks into registers in a plain loop of as many trips,
-    /// held as the fill holds them (a 16-byte load a lane, pinned: summed in
-    /// the tile's natural layout a lane loads four separate words, which on
-    /// gfx942 cost more than the ring itself and left the pair no signal),
-    /// so the difference is a whole trip: the ring's store, fences and load,
-    /// and the loads the compiler does not hoist. [`costs`] takes the load
-    /// out.
+    /// 16-byte chunk per thread (eight to a 32-wide i32 row), through a ring
+    /// `stages` deep as the target runs it, lowered `unroll`ed (a trip's
+    /// fixed cost) or rolled (slot offsets recomputed per trip).
+    ///
+    /// `Costs::trip*` is what one trip adds besides moving its tile's bytes
+    /// (priced by `global_byte` and `l2_byte`) and besides reading its
+    /// fragment back (priced by `smem_byte`). So the baseline does both in a
+    /// plain loop of as many trips:
+    /// - it moves the same bytes along the same path: the same chunks of the
+    ///   same source, loaded as the fill loads them ([`Kernel::load_as_fill`]:
+    ///   at L2 only behind a `cp.async.cg`, a plain global load behind a
+    ///   register-staged fill) and held as the fill holds them (a 16-byte
+    ///   load a lane, pinned: summed in the tile's natural layout a lane
+    ///   loads four separate words, which on gfx942 cost more than the ring
+    ///   itself and left the pair no signal);
+    /// - the source is a region per SM, so no line is a hot spot every SM
+    ///   shares (a region all blocks read made the ring's L2 traffic contend
+    ///   against a baseline served by L1), and the regions stay where the
+    ///   fill's cache level serves them;
+    /// - it keeps as many loads in flight as the ring holds slots, issuing a
+    ///   group of `stages` trips' loads before summing any, so neither side
+    ///   waits out a load the other hides;
+    /// - it reads a fragment back from a ring as deep as the probe's.
+    ///
+    /// The difference is then the trip itself: the ring's store, waits and
+    /// barriers, its slot arithmetic, and the loads the compiler does not
+    /// hoist. Next to the bytes it is small (a few percent of the pair), so
+    /// it is [`Signal::Resolved`]: the median of several timings, held
+    /// against their spread, which bounds it where it cannot be told from
+    /// zero.
     fn trips(&self, op: &'static str, unroll: bool, stages: usize) -> Probe {
         let (tile, region) = (trip_tile(self.target), 16);
         let stages = self.target.stages(stages);
         let units = (self.blocks * TRIPS) as f64;
         let chunks = chunked(tile, 4, WARPS, self.target.wave, Axis::Col).expect("a chunk layout");
-        self.make(op, ScalarDType::Int32, units, true, self.lowering(ROWS, unroll), |on| {
+        let sms = self.sms as usize;
+        let probe = self.make(op, ScalarDType::Int32, units, true, self.lowering(ROWS, unroll), |on| {
             // Every trip probe runs these programs, named alike.
             let mut k = kernel("probe:trip", self.blocks, WARPS);
-            let src = k.param::<I32>("src", ParamKind::In, region * tile.elems());
+            let src = k.param::<I32>("src", ParamKind::In, sms * region * tile.elems());
+            let first = k.block(0) % sms * region;
             let zero = k.fill::<I32>(tile, Const::Int(0));
-            let chunk =
-                |k: &mut Kernel, step: Sc| k.view(src, step % region * tile.elems(), [32, 1], tile, [None, None]);
+            let chunk = |k: &mut Kernel, step: Sc| {
+                k.view(src, (first.clone() + step % region) * tile.elems(), [32, 1], tile, [None, None])
+            };
             let sum = if on {
                 ring_sum(&mut k, TRIPS, stages, zero, chunk)
             } else {
+                // The ring's slots, written once and fenced before the loop; a
+                // trip reads the one a parameter names (zeros at run), as the
+                // ring's consume reads its tile, and no read is invariant for
+                // the compiler to hoist.
+                let ring = k.smem::<I32>("ring", stages * tile.elems());
+                for slot in 0..stages {
+                    let s = k.smem_slot::<I32>(ring, slot, tile);
+                    k.store(s, zero);
+                }
+                let order = k.param::<I32>("order", ParamKind::In, TRIPS);
+                k.barrier();
                 k.pin(zero, chunks.clone());
-                let [sum] = k.loop_(TRIPS, [zero], |k, i, [sum]| {
-                    let v = chunk(k, i);
-                    let y = k.load(v);
-                    k.pin(y, chunks.clone());
-                    [k.binary(sum, y, BinaryOp::Add)]
+                // As many loads in flight as the ring holds slots: each
+                // iteration issues `stages` trips' loads before it sums any.
+                let [sum] = k.loop_(TRIPS / stages, [zero], |k, i, [mut sum]| {
+                    let trips: Vec<Sc> = (0..stages).map(|j| i.clone() * stages + j).collect();
+                    let loaded: Vec<Regs<I32>> = trips
+                        .iter()
+                        .map(|t| {
+                            let v = chunk(k, t.clone());
+                            let y = k.load_as_fill(v);
+                            k.pin(y, chunks.clone());
+                            y
+                        })
+                        .collect();
+                    for (t, y) in trips.into_iter().zip(loaded) {
+                        let slot = k.load_scalar(order, t) % stages;
+                        let s = k.smem_slot::<I32>(ring, slot, tile);
+                        let fragment = k.load(s);
+                        sum = k.binary(sum, y, BinaryOp::Add);
+                        sum = k.binary(sum, fragment, BinaryOp::Add);
+                    }
+                    [sum]
                 });
                 sum
             };
             output(&mut k, self.blocks, sum);
             k.finish()
-        })
+        });
+        Probe { signal: Signal::Resolved, ..probe }
     }
 
     /// The half-wave exchanges of a relayout between two products: lanes

@@ -114,9 +114,12 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
             let moved: f64 = relayouts(target, find(probes, field), 1).iter().map(Relayout::work).sum();
             extent as f64 * moved * (carried() / warps) as f64
         }
-        // Every trip of the pipeline, which the baseline loads in a plain loop.
+        // Every trip of the pipeline, which the baseline loads in a plain
+        // loop, a group of loads per iteration.
         "trip" | "trip_rolled" | "trip_one" => {
-            assert_eq!(base_extent, extent, "{field}: as many trips");
+            let (base, _) = pair(find(probes, field));
+            let group = loads_from(base, Tier::Global).len();
+            assert_eq!(base_extent * group, extent, "{field}: as many trips");
             (blocks * extent) as f64
         }
         // Each wave waits its own trips out, alongside the others.
@@ -265,10 +268,15 @@ fn units_count_the_primitive(target: Target) {
     };
     assert_eq!((unroll(trip), unroll(rolled)), (vec![true; 2], vec![false; 2]), "the ring unrolled, then rolled");
     assert_eq!(pair(trip), pair(rolled), "the same programs");
-    // The one-slot trip: the same baseline, the ring one slot deep, rolled.
+    // The one-slot trip: the ring one slot deep, rolled, against a baseline
+    // reading its fragments from a ring as deep.
     let one = find(&probes, "trip_one");
     assert_eq!(unroll(one), vec![false; 2], "a one-slot ring has nothing to unroll");
-    assert_eq!(pair(one).0, pair(trip).0, "the same baseline");
+    let ring = |p: &Program| p.smem.iter().map(|a| a.elems).collect::<Vec<_>>();
+    for p in [trip, rolled, one] {
+        let (base, probe) = pair(p);
+        assert_eq!(ring(base), ring(probe), "{}: the baseline reads a ring as deep as the probe's", p.op);
+    }
     let depth = |p: &Program| {
         p.walk().find_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some(p.stages) } else { None }).expect("a ring")
     };
@@ -448,15 +456,28 @@ fn device_costs_are_physical() {
     assert!(c.l2_byte > 0.0 && c.l2_byte <= c.global_byte, "{c:?}");
     assert!(c.latency > c.step, "{c:?}");
     assert!(c.step_lone >= c.step, "{c:?}");
-    assert!(c.trip_rolled >= 0.9 * c.trip, "{c:?}");
-    assert!(c.trip_one >= 0.9 * c.trip, "{c:?}");
     assert!(c.smem_trip > 0.0, "{c:?}");
+    // A rolled ring and a one-slot ring do no less than an unrolled one,
+    // within what the trip pairs resolve: each pair's run-to-run spread, per
+    // unit, timed again here.
+    let probes = probes(&target);
+    let spread = |field: &str| {
+        let p = find(&probes, field);
+        let mut built = crate::tune::compile(p.candidates.clone(), &crate::tune::ScratchPool::default());
+        let r = probe::resolved(&probe::resolve_pairs(&mut built)).unwrap_or_else(|| panic!("{field}: not resolved"));
+        r.spread * p.scale / p.units
+    };
+    let (trip, rolled, one) = (spread("trip"), spread("trip_rolled"), spread("trip_one"));
+    eprintln!("spreads per unit: trip {trip:.3}, trip_rolled {rolled:.3}, trip_one {one:.3}");
+    assert!(c.trip_rolled >= 0.9 * c.trip - (trip + rolled), "{c:?}");
+    assert!(c.trip_one >= 0.9 * c.trip - (trip + one), "{c:?}");
 }
 
-/// Every probe's signal on the attached GPU, timed once: at least half the
-/// probe's own time, else the probe times its scaffolding more than its
-/// primitive. Another kernel sharing the device breaks this, so it runs
-/// alone.
+/// Every probe's signal on the attached GPU: a dominant one at least half
+/// the probe's own time, else the probe times its scaffolding more than its
+/// primitive; a resolved one clear of its pair's run-to-run spread. Another
+/// kernel sharing the device breaks this, so it runs alone; a primitive the
+/// target lacks has no pair.
 #[test]
 #[ignore = "perf probe: times every pair alone, run with --ignored under the GPU lock"]
 fn probe_signals_are_strong() {
@@ -464,12 +485,73 @@ fn probe_signals_are_strong() {
         eprintln!("skipped: no device with kernels");
         return;
     };
-    for p in &probes(&target) {
+    for p in probes(&target).iter().filter(|p| !p.candidates.is_empty()) {
         let [Some(base), Some(with)] = crate::tune::measure(p.candidates.clone())[..] else {
             panic!("{}: not timed", p.op)
         };
         let signal = (with as f64 - base as f64) / with as f64;
         eprintln!("{}: baseline {base} ns, probe {with} ns, signal {signal:.3} of the probe", p.op);
-        assert!(probe::strong(base, with), "{}: the signal is {signal:.3} of the probe's time", p.op);
+        match p.signal {
+            probe::Signal::Dominant => {
+                assert!(probe::strong(base, with), "{}: the signal is {signal:.3} of the probe's time", p.op)
+            }
+            probe::Signal::Resolved => {
+                let mut built = crate::tune::compile(p.candidates.clone(), &crate::tune::ScratchPool::default());
+                let pairs = probe::resolve_pairs(&mut built);
+                let resolved = probe::resolved(&pairs);
+                assert!(resolved.is_some_and(|r| r.clear()), "{}: {pairs:?} resolve to {resolved:?}", p.op);
+            }
+        }
     }
+}
+
+/// A trip pair moves the same bytes along the same path: the baseline loads
+/// each chunk as the fill loads it (the register half of a fill), from a
+/// region per SM, and reads a fragment back from shared memory as the ring's
+/// consume does; on a target filling through `cp.async.cg` that load stays
+/// out of L1 as the copy does.
+#[test_case(sm86(), true; "sm86")]
+#[test_case(hopper(), true; "sm90")]
+#[test_case(gfx1151(), false; "gfx1151")]
+fn trip_baselines_load_as_the_fill_loads(target: Target, l2_only: bool) {
+    let probes = probes(&target);
+    for field in ["trip", "trip_rolled", "trip_one"] {
+        let p = find(&probes, field);
+        assert_eq!(p.signal, probe::Signal::Resolved, "{field}: a trip rides on the bytes it moves");
+        let (base, probe) = pair(p);
+        let loads: Vec<CopyMode> = base
+            .walk()
+            .filter_map(|(_, s)| match s {
+                Stmt::Copy { src, dst, mode, .. }
+                    if base.value(*src).tier() == Tier::Global && base.value(*dst).tier() == Tier::Reg =>
+                {
+                    Some(*mode)
+                }
+                _ => None,
+            })
+            .collect();
+        let depth = |p: &Program| p.smem.iter().map(|a| a.elems).sum::<usize>() / (4 * target.wave / 8 * 32) as usize;
+        assert_eq!(
+            loads,
+            vec![CopyMode::Staged; depth(probe)],
+            "{field}: a load per slot, as the fill's register half"
+        );
+        let src = |prog: &Program| prog.params.iter().find(|q| q.name == "src").expect("a source").elems;
+        let tile = (4 * target.wave / 8 * 32) as usize;
+        assert_eq!(src(base), target.sms.unwrap() as usize * 16 * tile, "{field}: sixteen tiles per SM");
+        assert_eq!(src(base), src(probe), "{field}: one source");
+        let (_, lowering) = &p.candidates[0][0];
+        let code = render(base.clone(), lowering);
+        assert_eq!(code.contains("ld.global.cg.v4.u32"), l2_only, "{field}: the baseline's load policy");
+    }
+}
+
+#[test_case(&[(100, 160), (102, 161), (101, 159)], Some((59.0, 0.0, 59.0)); "clear of the spread")]
+#[test_case(&[(100, 103), (110, 104), (104, 112), (100, 106), (103, 105)], Some((3.0, 6.0, 6.0)); "inside the spread, bounded by it")]
+#[test_case(&[(150, 160), (100, 140), (101, 141), (102, 139), (99, 140)], Some((40.0, 3.0, 40.0)); "a slow first run trimmed")]
+#[test_case(&[(200, 100), (201, 101)], Some((-100.0, 2.0, 2.0)); "faster than its baseline, bounded by the spread")]
+#[test_case(&[], None; "no pair")]
+fn a_resolved_difference_clears_its_spread(pairs: &[(u64, u64)], want: Option<(f64, f64, f64)>) {
+    let got = probe::resolved(pairs).map(|r| (r.difference, r.spread, r.value()));
+    assert_eq!(got, want);
 }

@@ -277,7 +277,10 @@ pub enum CopyMode {
     /// May complete later; the schedule template waits and fences it.
     Async,
     /// One half of a register-staged copy the schedule template placed and
-    /// fences itself.
+    /// fences itself. Its global → register half loads as the kernel's fills
+    /// read (at L2 only where they are `cp.async.cg` copies, plain loads
+    /// where they are register-staged), so a register load in this mode
+    /// moves bytes exactly as a fill would.
     Staged,
 }
 
