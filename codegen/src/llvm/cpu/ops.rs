@@ -513,9 +513,10 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        // CUSTOM emits raw LLVM IR. Any `declare ...` lines are hoisted to the
-        // module prefix (deduplicated) so custom bodies may reference intrinsics
-        // not in the renderer's built-in declaration set; remaining lines form
+        // CUSTOM emits raw LLVM IR. Any `declare ...` line and any module
+        // global (`@name = ...`) is hoisted to the module prefix (deduplicated)
+        // so custom bodies may reference intrinsics not in the renderer's
+        // built-in declaration set and constants of their own; remaining lines form
         // the body. A `Void` custom is a bare statement block; a typed custom is
         // a single instruction whose rendered text is the assignment RHS
         // (e.g. `fmul float {0}, 2.0` → `%vN = fmul float %op, 2.0`) — the LLVM
@@ -536,7 +537,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 if trimmed.is_empty() {
                     continue;
                 }
-                if trimmed.starts_with("declare ") {
+                if trimmed.starts_with("declare ") || trimmed.starts_with('@') {
                     let decl = trimmed.to_string();
                     if !ctx.module_prefix().iter().any(|l| l == &decl) {
                         ctx.push_module_prefix(decl);

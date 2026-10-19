@@ -654,6 +654,26 @@ fn custom_void_hoists_and_deduplicates_declares_into_the_module_prefix() {
     assert!(result.code.contains("call void @llvm.amdgcn.s.barrier()"), "missing call body line:\n{}", result.code);
 }
 
+/// A module global a CUSTOM defines (`@name = ...`) is hoisted to the module
+/// prefix once however many customs define it, its body left an instruction
+/// that names it; clang takes the module.
+#[test]
+fn custom_hoists_and_deduplicates_a_module_global() {
+    let global = "@zeros = internal unnamed_addr addrspace(1) constant [4 x i32] zeroinitializer, align 16";
+    let code = format!("{global}\nload i32, ptr addrspace(1) @zeros, align 16");
+    let read = || UOp::custom(smallvec::SmallVec::new(), code.clone(), DType::Int32);
+    let out = |slot: usize| {
+        let idx = UOp::const_(DType::Int32, ConstValue::Int(slot as i64));
+        UOp::index().buffer(UOp::param(0, 2, DType::Int32, None)).indices(vec![idx]).call().unwrap()
+    };
+    let sink = UOp::sink(vec![out(0).store(read()), out(1).store(read().try_add(&read()).unwrap())]);
+    let result = render_amd_linearized(&sink, AmdArch::Gfx1201, "custom_global");
+    assert_eq!(result.code.matches(global).count(), 1, "the global must be hoisted exactly once:\n{}", result.code);
+    let body = result.code.split("define ").nth(1).expect("a kernel body");
+    assert!(body.contains("= load i32, ptr addrspace(1) @zeros"), "missing the body's load:\n{}", result.code);
+    assert_amd_ir_compiles(&result.code, "gfx1201");
+}
+
 /// Sin must never reach the AMD renderer: the device excludes it from
 /// `supported_ops` so the scheduler always decomposes it (`@llvm.sin.f32`
 /// lowers to `v_sin_f32` behind an f32 `1/(2π)` pre-scale that is wrong for
