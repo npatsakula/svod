@@ -225,7 +225,14 @@ fn an_sm_issues_its_share_of_blocks() {
 fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize) {
     let problem = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     // A small tile: its residency is bound by shared memory, not registers.
-    let two = GemmCfg { tile: [64, 64, bk], stages: target.stages(3), warps: [2, 2], group_m: 8, unroll: false };
+    let two = GemmCfg {
+        core: Core::Warp,
+        tile: [64, 64, bk],
+        stages: target.stages(3),
+        warps: [2, 2],
+        group_m: 8,
+        unroll: false,
+    };
     let one = GemmCfg { stages: 1, ..two };
     let cost = |trip_one: f64, cfg: &GemmCfg| {
         let planner = Planner::new(Device { target: target.clone(), costs: Costs { trip_one, ..costs() } });
