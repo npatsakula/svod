@@ -136,6 +136,13 @@ impl FaCfg {
         Lowering { core: self.core, ..Lowering::uniform(device, self.unroll, grid) }
     }
 
+    /// Whether the config holds `appended` rows: they ride one key block,
+    /// read from global memory, which the warpgroup core's shared operands
+    /// cannot.
+    pub fn holds_appended(&self, appended: usize) -> bool {
+        self.bkv >= appended && (appended == 0 || self.core == Core::Warp)
+    }
+
     /// Whether a bias rides the ring: under a bias, unless the forms read it
     /// directly.
     pub fn bias_ring(&self, bias: bool) -> bool {

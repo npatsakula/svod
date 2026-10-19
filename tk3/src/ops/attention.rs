@@ -11,7 +11,6 @@ use super::{
     DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
     output, typed,
 };
-use crate::atoms::Core;
 use crate::kernels;
 use crate::kernels::Batch;
 pub use crate::kernels::attention::Chunk;
@@ -171,10 +170,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let biased = bias_rows.is_some();
     let plan = shape::attention(planner.as_deref(), &dtypes, q_ext.as_ref(), k_ext.as_ref(), causal, biased);
     let Some(cfgs) = super::kernel(OP, plan) else { return graph(q, k, v, opts).context(GraphSnafu { op: OP }) };
-    // The appended rows ride one key block, read from global memory, which
-    // the warpgroup core's shared operands cannot.
-    let cfgs: Vec<FaCfg> =
-        cfgs.iter().copied().filter(|c| c.bkv >= appended && (appended == 0 || c.core == Core::Warp)).collect();
+    let cfgs: Vec<FaCfg> = cfgs.iter().copied().filter(|c| c.holds_appended(appended)).collect();
     if cfgs.is_empty() {
         tracing::debug!(target: super::PLAN, op = OP, appended, "graph: no config holds the appended rows");
         return graph(q, k, v, opts).context(GraphSnafu { op: OP });

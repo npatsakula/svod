@@ -124,6 +124,14 @@ impl GemmCfg {
         Lowering { core: self.core, schedule, ..Lowering::uniform(device, self.unroll, grid) }
     }
 
+    /// The k-slices each operand of a slot is held as, one after another:
+    /// under two crews one matrix-core step deep ([`KSLICE`]), so a slice is
+    /// a plain view and a product's fragments are one cluster's reads; else
+    /// the slot whole.
+    pub fn slices(&self) -> usize {
+        if self.crews == 2 { self.tile[2] / KSLICE } else { 1 }
+    }
+
     /// Static shared memory of the operand ring, in bytes of a 16-bit type.
     pub fn smem_bytes(&self, gated: bool) -> usize {
         let [bm, bn, bk] = self.tile;
@@ -221,10 +229,10 @@ fn build<T: Elem, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     let sa = Shape::new(bm, bk);
     let accs = if epi.gated {
         let halves = [b_view(&mut k, 0), b_view(&mut k, 1)];
-        mainloop(&mut k, sa, &a_tile, halves, trips / split, stages, bk, first_step, cfg.crews).to_vec()
+        mainloop(&mut k, sa, &a_tile, halves, trips / split, stages, bk, first_step, cfg.slices()).to_vec()
     } else {
         let whole = [b_view(&mut k, 0)];
-        mainloop(&mut k, sa, &a_tile, whole, trips / split, stages, bk, first_step, cfg.crews).to_vec()
+        mainloop(&mut k, sa, &a_tile, whole, trips / split, stages, bk, first_step, cfg.slices()).to_vec()
     };
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
     finish::<T, U>(&mut k, accs, epi, bias, residual, c, &bb, &tile);
@@ -357,7 +365,8 @@ fn tile_order(k: &mut Kernel, gm: usize, gn: usize, group_m: usize) -> (Sc, Sc) 
 }
 
 /// The K-streaming pipeline: the `sa`-shaped A tile `a(step, step·bk)` and
-/// `N` B tiles per step into a `stages`-deep shared ring, one f32
+/// `N` B tiles per step into a `stages`-deep shared ring, each operand of a
+/// slot held as `slices` k-slices ([`GemmCfg::slices`]), one f32
 /// accumulator per B.
 #[allow(clippy::too_many_arguments)]
 fn mainloop<T: Elem, const N: usize>(
@@ -369,13 +378,9 @@ fn mainloop<T: Elem, const N: usize>(
     stages: usize,
     bk: usize,
     first_step: Option<Sc>,
-    crews: u32,
+    slices: usize,
 ) -> [Regs<F32>; N] {
     let sb = k.shape(bs[0]);
-    // Under two crews a slot holds each operand as k-slices one after
-    // another, so a slice is a plain view and a product's fragments are one
-    // cluster's reads.
-    let slices = if crews == 2 { bk / KSLICE } else { 1 };
     let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
     let a_s = k.smem::<T>("a_s", stages * sa.elems());
     let b_s = [(); N].map(|()| k.smem::<T>("b_s", stages * sb.elems()));
