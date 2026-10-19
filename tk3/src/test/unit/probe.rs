@@ -120,6 +120,32 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
     }
 }
 
+/// A probe that fails leaves its field at zero and names itself; every
+/// other field is what its probe measured.
+#[test]
+fn an_unmeasured_field_leaves_its_default() {
+    let target = sm86();
+    let measured = crate::probe::assemble(&target, probes(&target), |p| match p.op {
+        "probe:step" => Err(crate::probe::Error::Unmeasured { probe: p.op, last: "no stamps".into() }),
+        _ => Ok(1.5),
+    });
+    assert_eq!(measured.unmeasured, ["step"]);
+    let mut costs = measured.costs;
+    for (name, value) in costs.fields() {
+        assert_eq!(*value, if name == "step" { 0.0 } else { 1.5 }, "{name}");
+    }
+}
+
+/// The ladder's reading: the cache's byte is the smallest footprint's, never
+/// dearer than DRAM's, and its bytes the largest footprint nearer that rate
+/// than DRAM's on a log scale; a footprint slower than DRAM holds nothing.
+#[test_case(&[(1 << 20, 10.0), (2 << 20, 11.0), (4 << 20, 60.0), (8 << 20, 95.0)], 100.0, (10.0, 2.0 * (1 << 20) as f64); "a knee at two")]
+#[test_case(&[(1 << 20, 10.0), (2 << 20, 12.0), (4 << 20, 30.0), (8 << 20, 31.0), (16 << 20, 90.0)], 100.0, (10.0, 8.0 * (1 << 20) as f64); "a second level nearer the cache counts as cache")]
+#[test_case(&[(1 << 20, 120.0), (2 << 20, 130.0)], 100.0, (100.0, 0.0); "slower than DRAM holds nothing")]
+fn the_ladder_reads_the_cache(rates: &[(usize, f64)], global_byte: f64, want: (f64, f64)) {
+    assert_eq!(crate::probe::held(rates, global_byte), want);
+}
+
 /// A cache probe's region holds a prime number of tiles that nearly fills
 /// its footprint, so on every target's occupancy the sweep of its blocks
 /// reaches every tile and the blocks an SM runs together, dealt any stride
@@ -333,23 +359,27 @@ fn costs_need_the_sm_count() {
     assert!(matches!(probe::probes(&target), Err(probe::Error::NoSms { .. })));
 }
 
-/// On the attached GPU every cost measures, finite and non-negative, and
-/// ordered as the hardware is: a lone trip's wait outlasts a matrix step, a
-/// rolled ring's trip about an unrolled one's or more, and a round trip
-/// through shared memory costs something. The retries absorb a pair timed alongside another
-/// test's kernels.
+/// On the attached GPU every cost measures (none is left at zero), finite
+/// and non-negative, and ordered as the hardware is: a shared byte cheaper
+/// than a global one, a cached one no dearer than DRAM's, a lone trip's wait
+/// outlasting a matrix step, a rolled ring's trip about an unrolled one's or
+/// more, and a round trip through shared memory costing something. The
+/// retries absorb a pair timed alongside another test's kernels.
 #[test]
 fn device_costs_are_physical() {
     let Some(target) = super::device_target() else {
         eprintln!("skipped: no device with kernels");
         return;
     };
-    let c = probe::costs(&target).unwrap();
+    let probe::Measured { costs: c, unmeasured } = probe::costs(&target).unwrap();
     eprintln!("{} ({:?} SMs): {c:#?}", target.arch.target_name(), target.sms);
+    assert!(unmeasured.is_empty(), "unmeasured: {unmeasured:?}");
     let mut fields = c;
     for (field, v) in fields.fields() {
         assert!(v.is_finite() && *v >= 0.0, "{field}: {c:?}");
     }
+    assert!(c.smem_byte > 0.0 && c.smem_byte < c.global_byte, "{c:?}");
+    assert!(c.l2_byte > 0.0 && c.l2_byte <= c.global_byte, "{c:?}");
     assert!(c.latency > c.step, "{c:?}");
     assert!(c.trip_rolled >= 0.9 * c.trip, "{c:?}");
     assert!(c.smem_trip > 0.0, "{c:?}");

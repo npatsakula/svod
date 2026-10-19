@@ -65,26 +65,59 @@ pub(crate) fn strong(base_ns: u64, probe_ns: u64) -> bool {
     probe_ns >= 2 * base_ns
 }
 
+/// A device's measured costs, and the fields its probes could not measure,
+/// left at [`Costs::default`]'s zero: the planner ranks with what it has
+/// rather than leaving the device to the graph, and the device gate holds
+/// the list empty.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Measured {
+    pub costs: Costs,
+    pub unmeasured: Vec<&'static str>,
+}
+
 /// The costs of the default device, whose target is `target`: every field
 /// measured once per device, compiler and probe program, then read from the
-/// tune store.
-pub fn costs(target: &Target) -> Result<Costs> {
+/// tune store. Only a target without an SM count, which no probe can scale
+/// to, is an error.
+pub fn costs(target: &Target) -> Result<Measured> {
     let probes = probes(target)?;
     let compiler = tune::compiler(&default_device());
-    let mut costs = Costs::default();
-    let fields = costs.fields();
-    assert_eq!(fields.len(), probes.len(), "a probe per field");
-    for ((name, value), probe) in fields.into_iter().zip(probes) {
-        assert_eq!(probe.op.strip_prefix("probe:"), Some(name), "probes in field order");
-        *value = measured(target, compiler, probe)?;
-    }
-    (costs.l2_byte, costs.l2_bytes) = cache(target, compiler, costs.global_byte)?;
+    let mut measured = assemble(target, probes, |probe| self::measured(target, compiler, probe));
+    let Measured { costs, unmeasured } = &mut measured;
+    // The cache ladder is read against the DRAM rate; without one, or when a
+    // footprint fails, the cache is unmeasured and fills are priced as DRAM.
+    let ladder = if unmeasured.contains(&"global_byte") { None } else { cache(target, compiler, costs.global_byte)? };
+    (costs.l2_byte, costs.l2_bytes) = ladder.unwrap_or_else(|| {
+        unmeasured.push("l2_bytes");
+        (costs.global_byte, 0.0)
+    });
     // A plan prices a trip's fragment reads by `smem_byte`, so a trip is
     // what its pipeline adds besides reading its tile from the ring.
     let fragment = (trip_tile(target).elems() * 4) as f64 * costs.smem_byte;
     costs.trip = (costs.trip - fragment).max(0.0);
     costs.trip_rolled = (costs.trip_rolled - fragment).max(0.0);
-    Ok(costs)
+    Ok(measured)
+}
+
+/// `probes`, in [`Costs::fields`] order, each measured by `measure` into its
+/// field; a probe that fails leaves its field at zero, names itself in
+/// `unmeasured`, and is warned about once.
+pub(crate) fn assemble(target: &Target, probes: Vec<Probe>, mut measure: impl FnMut(Probe) -> Result<f64>) -> Measured {
+    let mut costs = Costs::default();
+    let fields = costs.fields();
+    assert_eq!(fields.len(), probes.len(), "a probe per field");
+    let mut unmeasured = vec![];
+    for ((name, value), probe) in fields.into_iter().zip(probes) {
+        assert_eq!(probe.op.strip_prefix("probe:"), Some(name), "probes in field order");
+        match measure(probe) {
+            Ok(v) => *value = v,
+            Err(e) => {
+                tracing::warn!("{}: {e}; {name} costs nothing in the ranking", target.arch.target_name());
+                unmeasured.push(name);
+            }
+        }
+    }
+    Measured { costs, unmeasured }
 }
 
 /// A probe's value in ns per unit, stored in femtoseconds: a shared byte
@@ -100,18 +133,27 @@ fn measured(target: &Target, compiler: u64, probe: Probe) -> Result<f64> {
         || programs,
         || {
             let mut built = tune::compile(candidates, &ScratchPool::default());
-            (0..TRIES).find_map(|_| timed(&mut built, scale / units).map_err(|e| last = e).ok())
+            (0..TRIES).find_map(|_| match timed(&mut built, scale / units) {
+                Ok((fs, base_ns, probe_ns)) => {
+                    tracing::debug!(op, base_ns, probe_ns, fs, "probe pair timed");
+                    Some(fs)
+                }
+                Err(e) => {
+                    last = e;
+                    None
+                }
+            })
         },
     );
     Ok(fs.context(UnmeasuredSnafu { probe: op, last })? as f64 * 1e-6)
 }
 
 /// One timing of a compiled pair: its difference times `per`, in
-/// femtoseconds, or why it does not hold.
-fn timed(built: &mut [Built], per: f64) -> Result<u64, String> {
+/// femtoseconds, with the pair's own nanoseconds, or why it does not hold.
+fn timed(built: &mut [Built], per: f64) -> Result<(u64, u64, u64), String> {
     match tune::time(built)[..] {
         [Some(base_ns), Some(probe_ns)] if strong(base_ns, probe_ns) => {
-            Ok(((probe_ns - base_ns) as f64 * per * 1e6).round() as u64)
+            Ok((((probe_ns - base_ns) as f64 * per * 1e6).round() as u64, base_ns, probe_ns))
         }
         [Some(base_ns), Some(probe_ns)] => {
             let signal = (probe_ns as f64 - base_ns as f64) / probe_ns as f64;
@@ -134,27 +176,33 @@ const FOOTPRINTS: [(&str, usize); 8] = [
     ("probe:cached_128m", 128 << 20),
 ];
 
-/// The cache in front of DRAM: a streamed byte's cost from the smallest
-/// footprint, which stays in it, and its bytes, the largest footprint still
-/// read nearer that rate than `global_byte`'s (on a log scale), so a second,
-/// slower cache level counts as DRAM. No cache faster than DRAM: its bytes
-/// price fills as DRAM does. A cache that cannot be measured prices them so
-/// too, with a warning: the planner keeps its device either way.
-fn cache(target: &Target, compiler: u64, global_byte: f64) -> Result<(f64, f64)> {
+/// The cache in front of DRAM, as [`held`] reads the ladder of footprints;
+/// `None`, with a warning, when a footprint cannot be measured.
+fn cache(target: &Target, compiler: u64, global_byte: f64) -> Result<Option<(f64, f64)>> {
     let mut rates = Vec::with_capacity(FOOTPRINTS.len());
     for (footprint, probe) in cache_probes(target)? {
         match measured(target, compiler, probe) {
             Ok(rate) => rates.push((footprint, rate)),
             Err(e) => {
-                tracing::warn!("{}: {e}; fills priced as DRAM", target.arch.target_name());
-                return Ok((global_byte, 0.0));
+                tracing::warn!("{}: {e}; the cache is unmeasured", target.arch.target_name());
+                return Ok(None);
             }
         }
     }
-    let near = rates[0].1;
+    Ok(Some(held(&rates, global_byte)))
+}
+
+/// What a ladder of `(footprint, ns a byte)` says of the cache in front of
+/// DRAM: a streamed byte's cost from the smallest footprint, which stays in
+/// it, and its bytes, the largest footprint still read nearer that rate than
+/// `global_byte`'s (on a log scale), so a second, slower cache level counts
+/// as DRAM. No cache faster than DRAM: a byte costs DRAM's at most, and no
+/// footprint is held.
+pub(crate) fn held(rates: &[(usize, f64)], global_byte: f64) -> (f64, f64) {
+    let near = rates[0].1.min(global_byte);
     let mid = (near * global_byte).sqrt();
     let held = rates.iter().take_while(|(_, r)| *r <= mid).last().map_or(0, |&(f, _)| f);
-    Ok((near, held as f64))
+    (near, held as f64)
 }
 
 /// The tiles a cache probe's region of `footprint` bytes holds: the largest

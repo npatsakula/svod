@@ -427,6 +427,9 @@ fn judged<C: Tiled>(
 #[derive(Debug)]
 pub struct Planner {
     pub device: Device,
+    /// The cost fields the device's probes could not measure, ranked at
+    /// zero ([`crate::probe::Measured`]); empty for a device that measured.
+    pub unmeasured: Vec<&'static str>,
     ranked: papaya::HashMap<Problem, Arc<[GemmCfg]>>,
     attention: papaya::HashMap<Attention, Arc<[FaCfg]>>,
 }
@@ -442,7 +445,13 @@ fn cached<K: std::hash::Hash + Eq + Clone, V>(
 
 impl Planner {
     pub fn new(device: Device) -> Self {
-        Self { device, ranked: papaya::HashMap::new(), attention: papaya::HashMap::new() }
+        Self { device, unmeasured: vec![], ranked: papaya::HashMap::new(), attention: papaya::HashMap::new() }
+    }
+
+    /// A planner over what the device's probes measured.
+    pub fn measured(target: Target, measured: crate::probe::Measured) -> Self {
+        let crate::probe::Measured { costs, unmeasured } = measured;
+        Self { unmeasured, ..Self::new(Device { target, costs }) }
     }
 
     /// The device's SM count: a planned target reports one.
