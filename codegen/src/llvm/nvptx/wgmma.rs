@@ -222,8 +222,9 @@ pub fn render(
         };
         let b_text = format!("${operand}");
         operand += 1;
-        // scale-d = 1 (accumulate), scale-a = scale-b = 1, no transposes.
-        let tail = if from_registers { "p,1,1,1" } else { "p,1,1,0,0" };
+        // scale-d = 1 (accumulate), scale-a = scale-b = 1, no transposes (a
+        // register A has no transpose flag: its last operand is B's).
+        let tail = if from_registers { "p,1,1,0" } else { "p,1,1,0,0" };
         text.push_str(&format!(
             "{{.reg .pred p; setp.ne.b32 p,1,0; wgmma.mma_async.sync.aligned.m{M}n{n}k{K}.f32.{ty}.{ty} {{{d_list}}},{a_text},{b_text},{tail};}}\\0A"
         ));
