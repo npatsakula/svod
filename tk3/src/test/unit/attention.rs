@@ -704,7 +704,7 @@ fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg>, Vec<FaCf
     let build = |cfg: FaCfg| vec![(flash_attention(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
     let shape = [spec.batch.capacity(), t, tk, heads, d];
     let mut tuner = crate::ops::Tuner::new(&planner.device, DType::BFloat16, &shape, mask, build);
-    let plain = tuner.admitted("attention", &ranked);
+    let plain = tuner.admitted("attention", &crate::ops::config::representatives(&ranked));
     let formed = std::cell::RefCell::new(vec![]);
     let pick = tune(&mut tuner, &ranked, mask.bias.is_some(), |admitted| {
         *formed.borrow_mut() = admitted.to_vec();

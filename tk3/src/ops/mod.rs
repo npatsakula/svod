@@ -148,6 +148,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     /// in the store under the batch's programs: what runs with tuning off,
     /// and where a pass that starts from one config starts.
     pub(crate) fn first_clean(&mut self, op: &'static str, ranked: &[C]) -> Option<C> {
+        let ranked = &config::representatives(ranked);
         let key = self.key(op, ranked);
         let (bench, build) = (&mut self.bench, &self.build);
         let programs = || Self::programs(build, &ranked[..ranked.len().min(config::FIRST)]);
@@ -196,11 +197,12 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     }
 
     /// The candidate to launch: `expand` makes the admitted configs of
-    /// `ranked` the candidates (adding variants, such as key splits, the
+    /// `ranked`'s tile [representatives](config::Tiled::represents) the
+    /// candidates (adding variants, such as key splits, the
     /// plain one first), they are timed, and the fastest pipeline of the
     /// leading tiles ([`Self::pipelined`]) is the choice.
     pub(crate) fn tuned(&mut self, op: &'static str, ranked: &[C], expand: impl Fn(&[C]) -> Vec<C>) -> C {
-        let candidates = expand(&self.admitted(op, ranked));
+        let candidates = expand(&self.admitted(op, &config::representatives(ranked)));
         let ordered = self.ordered(op, &candidates);
         self.pipelined(op, &ordered, ranked)
     }

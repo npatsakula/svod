@@ -396,6 +396,18 @@ pub(crate) trait Tiled: Copy + Eq + Hash {
     /// The configs of `ranked` sharing this tile, each under this config's
     /// variant (a split count the tuner added): every pipeline of the tile.
     fn twins(&self, ranked: &[Self]) -> Vec<Self>;
+
+    /// Whether the config may stand for its tile in the shortlist and the
+    /// first clean search; one that may not (a variant the twins stage
+    /// explores) is timed only as a twin of a contender tile.
+    fn represents(&self) -> bool {
+        true
+    }
+}
+
+/// The configs of `ranked` that may stand for their tiles, in order.
+pub(crate) fn representatives<C: Tiled>(ranked: &[C]) -> Vec<C> {
+    ranked.iter().copied().filter(Tiled::represents).collect()
 }
 
 impl Tiled for GemmCfg {
@@ -427,21 +439,27 @@ impl Tiled for ConvCfg {
 }
 
 /// The blocks, the splits and the softmax forms: a forms pair is two tiles.
-/// A tile is its query and key block sizes, its key warps and its rows per
-/// warp: a different number of either is a different kernel structure, not
-/// a pipeline of the same one.
+/// A tile is its query and key block sizes and its key warps: a different
+/// number of key warps is a different kernel structure, not a pipeline of
+/// the same one. Its rows per warp are a variant its twins carry, as its
+/// pipelines are: the one-row config represents the tile.
 impl Tiled for FaCfg {
     fn tile(&self) -> Self {
-        FaCfg { stages: 0, unroll: false, ..*self }
+        FaCfg { stages: 0, unroll: false, warp_rows: WARP_ROWS, ..*self }
     }
 
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
-        let block = |c: &FaCfg| (c.bq, c.bkv, c.key_warps, c.warp_rows);
+        let block = |c: &FaCfg| (c.bq, c.bkv, c.key_warps);
         ranked
             .iter()
             .filter(|c| block(c) == block(self))
-            .map(|c| FaCfg { stages: c.stages, unroll: c.unroll, ..*self })
+            .map(|c| FaCfg { stages: c.stages, unroll: c.unroll, warp_rows: c.warp_rows, ..*self })
             .collect()
+    }
+
+    /// Two atom rows per warp are a variant of the one-row tile.
+    fn represents(&self) -> bool {
+        self.warp_rows == WARP_ROWS
     }
 }
 
@@ -796,6 +814,9 @@ impl FaCfg {
     }
 }
 
+/// Model: the fewest queries a block offers two atom rows per warp for.
+const TWO_ROWS_FROM: usize = 64;
+
 /// Model: trips a key block on a causal query block's diagonal counts for: the
 /// block itself, its mask, and the rows above the diagonal every warp still
 /// runs. A count of the work, not a fit.
@@ -872,9 +893,13 @@ impl Attention {
 
     /// The lattice's configs that run this problem on the planner's target,
     /// cheapest first, then by fewer registers, every pipeline of every query
-    /// and key block size at one or two atom rows per warp, in the plain
-    /// softmax forms (the tuner sets the others); the shortlist keeps a
-    /// tile's first clean one.
+    /// and key block size at one atom row per warp, in the plain softmax
+    /// forms (the tuner sets the others); the shortlist keeps a tile's first
+    /// clean one. After them, the same configs at two atom rows per warp
+    /// where that can pay ([`Self::two_rows_pay`]), in their twins' order: a
+    /// variant of a tile (its rows per warp are not part of it), so the
+    /// shortlist holds the one-row representatives and the twins stage times
+    /// the variant beside them for the contender tiles.
     pub fn ranked(&self, planner: &Planner) -> Vec<FaCfg> {
         let stages: &[usize] = if planner.device.target.cp_async { &[3, 2] } else { &[2] };
         let mut ranked: Vec<(f64, u32, FaCfg)> = vec![];
@@ -884,14 +909,10 @@ impl Attention {
             for bkv in [16, 32, 64, 128] {
                 for &stages in stages {
                     for unroll in [false, true] {
-                        for warp_rows in [WARP_ROWS, 2 * WARP_ROWS] {
-                            // Key warps share a block of one row warp.
-                            let key_warps = if warp_rows == WARP_ROWS { key_warps } else { &[1][..] };
-                            for &key_warps in key_warps {
-                                let cfg = FaCfg { unroll, key_warps, warp_rows, ..FaCfg::new(bq, bkv, stages) };
-                                if let Some((cost, regs)) = self.admit(planner, &cfg) {
-                                    ranked.push((cost, regs, cfg));
-                                }
+                        for &key_warps in key_warps {
+                            let cfg = FaCfg { unroll, key_warps, ..FaCfg::new(bq, bkv, stages) };
+                            if let Some((cost, regs)) = self.admit(planner, &cfg) {
+                                ranked.push((cost, regs, cfg));
                             }
                         }
                     }
@@ -899,7 +920,34 @@ impl Attention {
             }
         }
         ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        ranked.into_iter().map(|(_, _, c)| c).collect()
+        let one: Vec<FaCfg> = ranked.into_iter().map(|(_, _, c)| c).collect();
+        let two = one
+            .iter()
+            .map(|&c| (c, FaCfg { warp_rows: 2 * WARP_ROWS, ..c }))
+            .filter(|&(c, wide)| self.two_rows_pay(planner, &c, &wide))
+            .map(|(_, wide)| wide)
+            .collect::<Vec<_>>();
+        [one, two].concat()
+    }
+
+    /// Whether `wide`, `one` at two atom rows per warp, can pay: a block of
+    /// at least [`TWO_ROWS_FROM`] queries (fewer leave half the warps a
+    /// block holds, too few to hide a chain), one key warp, admitted, and as
+    /// many blocks resident as `one` keeps (the wider tiles' registers must
+    /// not cost the occupancy the shared fragments buy back).
+    fn two_rows_pay(&self, planner: &Planner, one: &FaCfg, wide: &FaCfg) -> bool {
+        let target = &planner.device.target;
+        let resident = |cfg: &FaCfg| -> Option<usize> {
+            let smem = cfg.smem_bytes(self.d, self.bias) + cfg.scratch_bytes(target);
+            let regs = cfg.registers(target, self.d, self.bias)?;
+            let o = target.occupancy;
+            let per_simd = o.waves.min(o.file / regs.max(1)) as usize;
+            Some((target.smem_bytes / smem.max(1)).min(o.simds as usize * per_simd / cfg.warps() as usize))
+        };
+        one.bq >= TWO_ROWS_FROM
+            && one.key_warps == 1
+            && self.admit(planner, wide).is_some()
+            && resident(wide).zip(resident(one)).is_some_and(|(w, o)| w >= o)
     }
 }
 

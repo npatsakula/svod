@@ -13,7 +13,7 @@ use super::{costs, first_eight, planner};
 use crate::atoms::{Costs, Device, Target, sm86};
 use crate::build::BF16 as BF16T;
 use crate::kernels::Batch;
-use crate::kernels::attention::{FaCfg, Forms};
+use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS};
 use crate::kernels::conv::ConvCfg;
 use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::NormCfg;
@@ -1500,4 +1500,34 @@ fn rdna_plans_register_staged_kernels() {
         shape::norm(Some(&planner(target.clone())), &[BF16; 2], Some(&ext(&[37, 1024]))),
         Plan::Kernel(_)
     ));
+}
+
+/// Two atom rows per warp are a variant of a tile, never its representative:
+/// the d64 biased attention's shortlist on gfx1151 (under its measured
+/// costs) and gfx1201 is the one of a lattice without the variant, tile for
+/// tile, and every two-row config follows its one-row twin, from blocks of
+/// 64 queries, so the twins stage times it beside the contender tiles. On
+/// gfx942 the d128 pick's tile carries its two-row pipelines as twins.
+#[test_case(gfx1151_planner(), &[(128, 32), (64, 32), (64, 16), (64, 64), (32, 16), (32, 32), (32, 64), (16, 16), (16, 32), (16, 64)]; "gfx1151")]
+#[test_case(planner(gfx1201()), &[(128, 32), (128, 64), (64, 16), (64, 32), (64, 64), (32, 16), (32, 32), (16, 16), (32, 64), (16, 32), (16, 64)]; "gfx1201")]
+fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usize)]) {
+    use crate::ops::config::{representatives, shortlist};
+    let ranked = target.attention_ranked(32, 2048, 2048, 64, false, true);
+    let reps = representatives(&ranked);
+    assert!(reps.iter().all(|c| c.warp_rows == WARP_ROWS), "{reps:?}");
+    let at = shortlist(&reps, |b| vec![crate::tune::Compiled::Clean; b.len()]).expect("a shortlist");
+    assert_eq!(at.iter().map(|&i| (reps[i].bq, reps[i].bkv)).collect::<Vec<_>>(), tiles);
+    for (i, wide) in ranked.iter().enumerate().filter(|(_, c)| !c.represents()) {
+        let one = FaCfg { warp_rows: WARP_ROWS, ..*wide };
+        assert!(wide.bq >= 64 && ranked[..i].contains(&one), "{wide:?} without its one-row twin before it");
+        assert!(one.twins(&ranked).contains(wide), "{wide:?} is not its tile's twin");
+    }
+    let gfx942 = planner(super::targets::amd(AmdArch::Gfx942, 304));
+    let ranked = gfx942.attention_ranked(32, 2048, 2048, 128, false, false);
+    let pick = FaCfg::new(128, 32, 2);
+    assert!(pick.twins(&ranked).iter().any(|c| c.warp_rows == 2 * WARP_ROWS), "{ranked:?}");
+}
+
+fn gfx1151_planner() -> Planner {
+    Planner::new(Device { target: super::targets::amd(AmdArch::Gfx1151, 40), costs: super::gfx1151_costs() })
 }

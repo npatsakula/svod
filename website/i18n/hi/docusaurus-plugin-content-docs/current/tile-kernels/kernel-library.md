@@ -110,7 +110,7 @@ Masks tile-class का काम हैं। सिर्फ़ वे key blo
 **Key splits** (`FaCfg::splits > 1`) कुछ लंबी rows को, जैसे decoder step को, ज़्यादा blocks देते हैं।
 हर split f32 partials `o_part`, `m_part` और `l_part` लिखता है, और `combine` उन्हें मिलाता है।
 
-`FaCfg { bq, bkv, stages, splits, unroll, warp_rows, .. }` हर `warp_rows` query rows पर एक warp इस्तेमाल करता है: 16 (एक atom row) या 32 (warp का पढ़ा हर key और value fragment दो atom rows के products को खिलाता है, प्रति lane दुगने accumulators की क़ीमत पर)। Candidates
+`FaCfg { bq, bkv, stages, splits, unroll, warp_rows, .. }` हर `warp_rows` query rows पर एक warp इस्तेमाल करता है: 16 (एक atom row) या 32 (warp का पढ़ा हर key और value fragment दो atom rows के products को खिलाता है, प्रति lane दुगने accumulators की क़ीमत पर)। 32-row रूप अपने 16-row tile का एक variant है: यह 64 या ज़्यादा queries के blocks के लिए दिया जाता है जहाँ यह उतने ही blocks resident रखता है, shortlist में कभी tile का प्रतिनिधित्व नहीं करता, और tuner इसे दावेदार tiles के pipelines के साथ मापता है। Candidates
 GEMM वाले ही lattice और cost model से आते हैं (`Planner::attention_ranked`): 16–128 rows के query blocks,
 16–128 keys के key blocks, वे ring depths जो target चलाता है, rolled और unrolled, उतने तक सीमित जो lower हो
 (fills हर thread पर chunks में बँटते हैं, ring shared memory में समाती है) और इस हिसाब से rank होते हैं कि
