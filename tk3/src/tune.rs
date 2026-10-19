@@ -25,7 +25,7 @@ use svod_runtime::benchmark::round_robin_min;
 use svod_tensor::Tensor;
 
 use crate::atoms::Target;
-use crate::ir::Program;
+use crate::ir::{Param, Program};
 use crate::launch;
 use crate::lower::Lowering;
 
@@ -184,9 +184,10 @@ impl TuneStore {
 pub fn measure(candidates: impl IntoIterator<Item = Candidate>) -> Vec<Option<u64>> {
     use rayon::prelude::*;
     let candidates: Vec<Candidate> = candidates.into_iter().collect();
+    let pool = ScratchPool::default();
     let compiled: Vec<Option<Vec<Scratch>>> = candidates
         .into_par_iter()
-        .map(|programs| programs.into_iter().map(|(p, l)| scratch_plan(p, &l)).collect())
+        .map(|programs| programs.into_iter().map(|(p, l)| scratch_plan(p, &l, &pool)).collect())
         .collect();
     let plans: Vec<Option<Vec<ExecutionPlan>>> = compiled
         .into_iter()
@@ -219,9 +220,39 @@ pub fn measure(candidates: impl IntoIterator<Item = Candidate>) -> Vec<Option<u6
 /// A compiled plan over scratch buffers and the variable bindings it runs at.
 type Scratch = (ExecutionPlan, Vec<(String, i64)>);
 
-fn scratch_plan(prog: Program, lowering: &Lowering) -> Option<Scratch> {
+/// The scratch buffers every candidate of a measurement runs on: one per
+/// `(dtype, capacity, ordinal within a program)`, so a program's equal-sized
+/// parameters stay distinct while the candidates share. A cache-mode attention
+/// would otherwise hold a whole key and value cache per candidate at once.
+#[derive(Default)]
+pub(crate) struct ScratchPool(Mutex<HashMap<(ScalarDType, usize, usize), Tensor>>);
+
+impl ScratchPool {
+    pub(crate) fn buffers(&self, params: &[Param]) -> Vec<Tensor> {
+        let mut seen: HashMap<(ScalarDType, usize), usize> = HashMap::new();
+        let mut pool = self.0.lock().expect("scratch pool");
+        params
+            .iter()
+            .map(|p| {
+                let ordinal = seen.entry((p.dtype, p.elems)).or_insert(0);
+                let key = (p.dtype, p.elems, std::mem::replace(ordinal, *ordinal + 1));
+                pool.entry(key)
+                    .or_insert_with(|| {
+                        // Written here: an unrealized buffer is allocated by
+                        // every plan that reads it, one per candidate.
+                        let t = Tensor::zeros(&[p.elems], p.dtype.into()).contiguous();
+                        t.realize().expect("a scratch buffer");
+                        t
+                    })
+                    .clone()
+            })
+            .collect()
+    }
+}
+
+fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPool) -> Option<Scratch> {
     let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
-    let buffers: Vec<Tensor> = prog.params.iter().map(|p| Tensor::empty(&[p.elems], p.dtype.into())).collect();
+    let buffers = pool.buffers(&prog.params);
     let out = launch::graph_launch(prog, lowering, &buffers.iter().collect::<Vec<_>>()).ok()?;
     Some((out.prepare().ok()?, vars))
 }
