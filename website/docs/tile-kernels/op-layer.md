@@ -24,8 +24,12 @@ pub fn supported(device: &DeviceSpec) -> bool;
 |---|---|---|
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual }`; gated `w` is `[2N, K]` |
 | `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
+| `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`; gated `w` is `[2N, K]` |
+| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale }` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` take `residual` like `x` and return `(x + residual, norm)` |
+
+`Linear::scale` multiplies the activated value before the residual add: `scale·act(x·wᵀ + bias) + residual`, so a Conformer half-step `x + 0.5·ffn(x)` is one GEMM.
 
 `Attn::keys` is `KeyMask::None`, `KeyMask::Lens(&lens)` (`[B]` valid key counts) or
 `KeyMask::Bool(&mask)` (`[B, Tk]`, true where attended). `Attn::cache` takes
