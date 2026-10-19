@@ -245,7 +245,15 @@ pub fn attention_candidates(target: &Target, d: usize, t: usize) -> Vec<FaCfg> {
         }
         _ => return vec![],
     };
-    list.into_iter().filter(|c| c.smem_bytes(d) <= target.smem_bytes).collect()
+    let mut out: Vec<FaCfg> = vec![];
+    for c in list {
+        // A ring the target's prefetch cannot run deep folds into a shallower one.
+        let c = FaCfg { stages: target.stages(c.stages), ..c };
+        if c.smem_bytes(d) <= target.smem_bytes && !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// AMD attention on the two-slot register-staged ring. The score tile
