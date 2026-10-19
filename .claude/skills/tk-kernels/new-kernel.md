@@ -1,10 +1,10 @@
-# A new tk3 kernel, end to end
+# A new tk kernel, end to end
 
 The norms are the smallest complete path: kernel `kernels/rows.rs`, gate `ops/shape.rs::norm`, candidates
 `ops/config.rs::norm_candidates`, entry `ops/norm.rs`, tests `test/unit/rows.rs` and `test/unit/ops.rs`. Copy their
 shape; the excerpts below are verbatim (trimmed) at 2e9d5edb.
 
-## 1. The kernel (`tk3/src/kernels/x.rs`, `pub mod x;` in `kernels/mod.rs`)
+## 1. The kernel (`tk/src/kernels/x.rs`, `pub mod x;` in `kernels/mod.rs`)
 
 - `XCfg` (`Clone + Copy + Debug + PartialEq + Eq + Hash`): the knobs the tuner picks, with
   `fn lowering(&self, device: &Device) -> Lowering`. A row kernel:
@@ -71,11 +71,11 @@ pub fn norm_candidates(d: usize) -> Vec<NormCfg> {
 A ranked lattice when it does: a key like `Problem`/`Attention` with
 `admit(&self, &Planner, &cfg) -> Result<(f64, u32), Rejected>` (ns of SM time from `Costs`, layout registers; the
 `Rejected` reason otherwise) and a ranking cached per planner like `Planner::gemm_ranked` (`papaya::HashMap`), sorted
-through `sorted(..)` so it is logged under `svod_tk3::plan`. Every config also needs `impl Tiled for XCfg`
+through `sorted(..)` so it is logged under `svod_tk::plan`. Every config also needs `impl Tiled for XCfg`
 (`tile()` = the config minus its pipeline knobs, `twins(ranked)` = the ranked configs sharing that tile,
 `represents()` false for variants only the twins stage times). Name every new constant with its kind (model, search
 bound, measurement, numeric; `lib.rs` doc). Pin the ranking on the host in `ops_plan.rs` under declared costs
-(`costs()`, `gfx1151_costs()`): which tiles lead and why `admit` drops the rest. `tk3_dump` shows the same ranking for
+(`costs()`, `gfx1151_costs()`): which tiles lead and why `admit` drops the rest. `tk_dump` shows the same ranking for
 any card (add an `--op` arm there if the kernel should be inspectable offline).
 
 ## 4. The entry (`ops/x.rs`, re-exported from `ops/mod.rs`)
@@ -106,7 +106,7 @@ let mut outs = launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &cfg.l
 - `output(..)` allocates at capacity with the live batch in dim 0, device-local (`kernel_buffer`).
 - Keep `fn graph(..)` `pub(crate)`: the ops tests compare against it.
 
-## 5. Tests (`tk3/src/test/unit/`, the module added to `mod.rs`)
+## 5. Tests (`tk/src/test/unit/`, the module added to `mod.rs`)
 
 | Test | Template |
 |---|---|
@@ -123,5 +123,5 @@ Host IR of the new kernel for any target, no GPU: `crate::lower::render(prog, &l
 `svod_runtime::amd::compile_ir_to_amd_object(&ir, arch)` / to PTX with `svod_runtime::cuda::compile_ir_to_ptx(&ir, arch)`,
 as the sweep does.
 
-Then the whole-workspace check and the perf protocol in SKILL.md: model crates build tk3 configs, codegen renders their
+Then the whole-workspace check and the perf protocol in SKILL.md: model crates build tk configs, codegen renders their
 kernels.

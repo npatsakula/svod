@@ -1,9 +1,9 @@
 ---
-name: tk3-kernels
-description: Write, check, debug and profile tile kernels with the `svod-tk3` crate (tk3/src). Use when adding or changing a tile program (`build::Kernel`), wiring it into `svod_tk3::ops` and the config lattice, running it in the host interpreter or on a GPU, reading a lowering/layout/admission rejection, dumping a tk3 kernel's instruction list, LLVM IR, PTX/SASS or AMDGCN for a card this machine does not have, comparing its main loop with cuBLAS/CUTLASS/ThunderKittens/HipKittens/AITER ISA, reading the planner log or the tune store (or the config a card's store chose, offline), running the device probes and gates, or checking a change for perf regressions or proving a refactor byte-identical. Covers SVOD_DEVICE for the device gate, the tk3_dump example (--cfg tuned, --compare), the tk3_digest example, SVOD_DUMP_AMD_ASM, RUST_LOG=svod_tk3::plan, TK3_DUMP_LIST, SVOD_TK3_TUNE, SVOD_TK3_TUNE_DIR, device_costs_are_physical, families_match_the_interpreter_on_the_device, the *_probe tests.
+name: tk-kernels
+description: Write, check, debug and profile tile kernels with the `svod-tk` crate (tk/src). Use when adding or changing a tile program (`build::Kernel`), wiring it into `svod_tk::ops` and the config lattice, running it in the host interpreter or on a GPU, reading a lowering/layout/admission rejection, dumping a tk kernel's instruction list, LLVM IR, PTX/SASS or AMDGCN for a card this machine does not have, comparing its main loop with cuBLAS/CUTLASS/ThunderKittens/HipKittens/AITER ISA, reading the planner log or the tune store (or the config a card's store chose, offline), running the device probes and gates, or checking a change for perf regressions or proving a refactor byte-identical. Covers SVOD_DEVICE for the device gate, the tk_dump example (--cfg tuned, --compare), the tk_digest example, SVOD_DUMP_AMD_ASM, RUST_LOG=svod_tk::plan, TK_DUMP_LIST, SVOD_TK_TUNE, SVOD_TK_TUNE_DIR, device_costs_are_physical, families_match_the_interpreter_on_the_device, the *_probe tests.
 ---
 
-# tk3 tile kernels
+# tk tile kernels
 
 Reader docs (link, do not duplicate): `website/docs/tile-kernels/{overview,first-kernel,layouts-and-lowering,op-layer,kernel-library,tuning,testing-and-debugging,portability}.md`.
 Design: `tk3_design.md`; per-GPU numbers and the commands behind them: `tk3_pr.md` (Tables A/B, "How to add a column").
@@ -13,28 +13,28 @@ References here: [new-kernel.md](new-kernel.md) (wiring a kernel end to end).
 ## Quick start
 
 Always `--release` (~45 s host suite in release, ~14 min in debug). Every device test goes through one gate,
-`device_target()` (`tk3/src/test/unit/mod.rs`): it **fails** when a GPU tk3 supports is attached and `SVOD_DEVICE` is
+`device_target()` (`tk/src/test/unit/mod.rs`): it **fails** when a GPU tk supports is attached and `SVOD_DEVICE` is
 unset, skips (`skipped: …`, test passes) under `SVOD_DEVICE=CPU` or where there is no supported GPU. So: `SVOD_DEVICE=CPU`
 for host work, `SVOD_DEVICE=CUDA` / `AMD` (or `CUDA:0`, `AMD:1`) for device work. One timed process per GPU.
 
 | Question | Command |
 |----------|---------|
-| Host suite (no GPU touched) | `SVOD_DEVICE=CPU cargo test -p svod-tk3 --release --lib` (818 passed, 12 ignored, 44 s at 2e9d5edb) |
-| Host gate: every family lowers on sm_86/sm_90/gfx1201/gfx1151/gfx1100/gfx942, keeps its interpreted numbers, compiles | `SVOD_DEVICE=CPU cargo test -p svod-tk3 --release --lib every_family_lowers_keeps_its_numbers_and_compiles` (39 s; no clang AMDGPU / NVPTX → `skipped:`; no `ptxas` → PTX not assembled) |
+| Host suite (no GPU touched) | `SVOD_DEVICE=CPU cargo test -p svod-tk --release --lib` (818 passed, 12 ignored, 44 s at 2e9d5edb) |
+| Host gate: every family lowers on sm_86/sm_90/gfx1201/gfx1151/gfx1100/gfx942, keeps its interpreted numbers, compiles | `SVOD_DEVICE=CPU cargo test -p svod-tk --release --lib every_family_lowers_keeps_its_numbers_and_compiles` (39 s; no clang AMDGPU / NVPTX → `skipped:`; no `ptxas` → PTX not assembled) |
 | One `test_case` variant | filter on the generated suffix: `…compiles::test_case_3_gfx1201` |
-| Device gate: each family vs the interpreter | `SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib families_match_the_interpreter_on_the_device -- --nocapture` |
-| Cost probes on a fresh store (alone, first) | `SVOD_DEVICE=… cargo test -p svod-tk3 --release --lib device_costs_are_physical -- --nocapture` |
-| What would tk3 run on an H100 / MI300X I don't have? | `cargo run -p svod-tk3 --release --example tk3_dump -- --card h100-sxm --op gemm --shape 4096x4096x4096` (see Offline) |
+| Device gate: each family vs the interpreter | `SVOD_DEVICE=CUDA cargo test -p svod-tk --release --lib families_match_the_interpreter_on_the_device -- --nocapture` |
+| Cost probes on a fresh store (alone, first) | `SVOD_DEVICE=… cargo test -p svod-tk --release --lib device_costs_are_physical -- --nocapture` |
+| What would tk run on an H100 / MI300X I don't have? | `cargo run -p svod-tk --release --example tk_dump -- --card h100-sxm --op gemm --shape 4096x4096x4096` (see Offline) |
 | What did the tuner pick on that card? | the same with `--cfg tuned --store <its tune store>` (read-only replay) |
 | Main loop beside cuBLAS/TK/HK/AITER | the same with `--compare <.cubin/.co/.s/.sass> [--fun NAME]` |
-| Did a refactor change any emitted kernel? | `tk3_digest --out A` at base and change, `tk3_digest --diff A B` (see Performance-regression protocol) |
-| Kernel or graph for a shape, and why | `RUST_LOG=svod_tk3::plan=debug` (`graph … why=Shape`, `ranking`, `ranked`, `compiled`, `admitted`, `choice`, `tuned`) |
-| Emitted instruction list | `TK3_DUMP_LIST=1` (stderr, every `emit` call); pin one config with `SVOD_TK3_TUNE=0` or use `tk3_dump` |
+| Did a refactor change any emitted kernel? | `tk_digest --out A` at base and change, `tk_digest --diff A B` (see Performance-regression protocol) |
+| Kernel or graph for a shape, and why | `RUST_LOG=svod_tk::plan=debug` (`graph … why=Shape`, `ranking`, `ranked`, `compiled`, `admitted`, `choice`, `tuned`) |
+| Emitted instruction list | `TK_DUMP_LIST=1` (stderr, every `emit` call); pin one config with `SVOD_TK_TUNE=0` or use `tk_dump` |
 | LLVM IR / AMDGCN as compiled on a device | `SVOD_DUMP_NVPTX_IR=<dir>` / `SVOD_DUMP_AMD_IR=<dir>` → `<arch>_<kernel>_<ir digest>.ll`, `SVOD_DUMP_AMD_ASM=<dir>` → `.s` |
-| Tuning off | `SVOD_TK3_TUNE=0` (process) or `tune::scoped(false, f)` (this thread): the first clean ranked config runs; probes still measure |
-| GEMM TFLOP/s per config | `SVOD_DEVICE=… cargo test -p svod-tk3 --release --lib gemm_throughput_probe -- --ignored --nocapture --test-threads=1` |
+| Tuning off | `SVOD_TK_TUNE=0` (process) or `tune::scoped(false, f)` (this thread): the first clean ranked config runs; probes still measure |
+| GEMM TFLOP/s per config | `SVOD_DEVICE=… cargo test -p svod-tk --release --lib gemm_throughput_probe -- --ignored --nocapture --test-threads=1` |
 
-Not for tk3 kernels: `SVOD_DUMP_STAGE`, `SVOD_PER_STAGE_UOPS`, `SVOD_DUMP_LINEAR`, `BEAM`, `SVOD_NOOPT`. A tk3 body is a
+Not for tk kernels: `SVOD_DUMP_STAGE`, `SVOD_PER_STAGE_UOPS`, `SVOD_DUMP_LINEAR`, `BEAM`, `SVOD_NOOPT`. A tk body is a
 pre-linearized PROGRAM (`UOp::linear_program`): the optimizer skips it (`schedule/src/optimizer/mod.rs`, "A PROGRAM is past
 optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`codegen/src/program_pipeline.rs`), and
 `adopt_program` only verifies it (`SVOD_SPEC`/`SVOD_SPEC_DEBUG` apply).
@@ -86,7 +86,7 @@ Rules the code enforces:
 
 ## Checking correctness
 
-Tests live in `tk3/src/test/unit/<topic>.rs` (never in-place; `test_case` tables, `proptest` shapes). Shared helpers in
+Tests live in `tk/src/test/unit/<topic>.rs` (never in-place; `test_case` tables, `proptest` shapes). Shared helpers in
 `mod.rs`: `device_target()`, `device_planner()`, `cp_async_target()`, `group_target()`, `tuned_on_device`, `measure`,
 `first_eight`, `costs()` (GUESSED, `step_group` 0), `gfx1151_costs()`, `declared`, `planner`, `rounded`, `decode`,
 `assert_rel_close`. Targets: `atoms::sm86()`, `targets::hopper()`, `targets::amd(AmdArch::Gfx1201, 64)`.
@@ -105,15 +105,15 @@ Tests live in `tk3/src/test/unit/<topic>.rs` (never in-place; `test_case` tables
 
 ## Debugging
 
-**Planner log.** `RUST_LOG=svod_tk3::plan=debug` (`ops::PLAN`): `graph op why` (the silent fallback),
+**Planner log.** `RUST_LOG=svod_tk::plan=debug` (`ops::PLAN`): `graph op why` (the silent fallback),
 `ranking problem admitted rejected`, the first 16 `ranked rank ns regs cfg`, on a store miss `compiled cfg verdict
 registers scratch`, then each stage's configs as Debug text (the store's lines hold indices only): `first cfg stored`,
 `admitted configs stored` (`stored=false`: nothing compiled, the untested shortlist), `choice timed=[(cfg, ns)…]`,
-`twins admitted compiled`, then `tuned op shape pick` / `attention tuned`; a replay adds `replayed lookup`. `RUST_LOG=svod_tk3=debug` adds `tuner's first
-round`/`leaders`/`rounds`/`twins` and `probe pair timed`/`resolved`. Device tests install the subscriber (`traced()` inside `device_target()`); `tk3_dump` installs its own.
+`twins admitted compiled`, then `tuned op shape pick` / `attention tuned`; a replay adds `replayed lookup`. `RUST_LOG=svod_tk=debug` adds `tuner's first
+round`/`leaders`/`rounds`/`twins` and `probe pair timed`/`resolved`. Device tests install the subscriber (`traced()` inside `device_target()`); `tk_dump` installs its own.
 
-**Dumps.** `TK3_DUMP_LIST` (`lower/emit/mod.rs`) prints `[i] id=N "Op" dtype <- [src ids]`; the tuner lowers every
-candidate and `launch.rs` memoizes, so pin one config (`SVOD_TK3_TUNE=0`, one test, or `tk3_dump --cfg N|tuned`).
+**Dumps.** `TK_DUMP_LIST` (`lower/emit/mod.rs`) prints `[i] id=N "Op" dtype <- [src ids]`; the tuner lowers every
+candidate and `launch.rs` memoizes, so pin one config (`SVOD_TK_TUNE=0`, one test, or `tk_dump --cfg N|tuned`).
 `SVOD_DUMP_{NVPTX,AMD}_IR` and `SVOD_DUMP_AMD_ASM` write on an object-cache hit too, one file per IR
 (`<arch>_<kernel name>_<ir digest>.{ll,s}`): every config of `gemm` the tuner compiles gets its own. Host IR for
 any target: `lower::render(prog, &lowering)` or `lower::standalone(prog, &lowering)?.text(&target)`.
@@ -124,28 +124,28 @@ any target: `lower::render(prog, &lowering)` or `lower::standalone(prog, &loweri
 | `N warps over a grid of M: …` | `lower::Error::Grid` (`targets::a_grid_takes_every_warp_or_whole_grids_run_alone`) |
 | `<what> is not lowered yet` | `lower::Error::Unsupported`: cross-warp reductions, a cross-thread transpose, column-major chunk fills, odd warpgroup operands |
 | `… is a block barrier under a branch on the warp, which some warps skip` | `lower::Error::DivergentBarrier` (sync pass or a relayout through shared memory) |
-| `program assembly: …` / `rendering <name>: …` | `svod_ir::Error` from `UOp::linear_program` / the LLVM renderer; rerun with `SVOD_SPEC_DEBUG=1 TK3_DUMP_LIST=1` |
+| `program assembly: …` / `rendering <name>: …` | `svod_ir::Error` from `UOp::linear_program` / the LLVM renderer; rerun with `SVOD_SPEC_DEBUG=1 TK_DUMP_LIST=1` |
 | `element I of NAME is accessed, which holds N` / `scalar A Div B is undefined` (also `Rem`) | `interp::Error::{OutOfBounds, Division}`; also `UnboundVar`, `ParamSize` |
-| `Rejected::{Lowers, Shallow, Divides, Smem, Layout, Registers}` | why `admit` left a lattice config out (`tk3_dump` counts them, `plan.txt` lists each) |
+| `Rejected::{Lowers, Shallow, Divides, Smem, Layout, Registers}` | why `admit` left a lattice config out (`tk_dump` counts them, `plan.txt` lists each) |
 | op silently runs graph kernels (`E_…`, `r_…` in a profile) | `Plan::Graph(Fallback::…)`: the `graph` line of the planner log says which |
 | RDNA4 reads past a view's bounds | transposing loads read a zero run there (`emit::a_transposed_element_past_the_bounds_reads_zero`) |
 
 **Device gate failure**: `check_on_device` prints `<family>: output i max abs diff X` and panics on the first element past
-`2e-2·max(|w|,1)`; rerun the family's own device test with `TK3_DUMP_LIST=1`. `register_staged_families_match_on_cuda`
+`2e-2·max(|w|,1)`; rerun the family's own device test with `TK_DUMP_LIST=1`. `register_staged_families_match_on_cuda`
 runs the AMD data path on NVIDIA. A target counts as measured only once its gate passes.
 
 ## Offline: plan and ISA for a card you don't have
 
-`cargo run -p svod-tk3 --release --example tk3_dump -- (--card NAME | --arch sm_90a|gfx942|… [--sms N] [--xcds N])
+`cargo run -p svod-tk --release --example tk_dump -- (--card NAME | --arch sm_90a|gfx942|… [--sms N] [--xcds N])
 --op OP --shape S [--dtype bf16|f16] [--cfg I|tuned] [--top N] [--store DIR] [--out DIR] [--compare FILE [--fun NAME]]`
-(`tk3/examples/tk3_dump.rs`; `--out` defaults to `./tk3_dump`). `OP`/`S`: `gemm MxNxK` (`--bias --residual --gated
+(`tk/examples/tk_dump.rs`; `--out` defaults to `./tk_dump`). `OP`/`S`: `gemm MxNxK` (`--bias --residual --gated
 --act silu|gelu`), `attention BxHxTxD` (`--causal`), `norm RxD` (`--norm rms|layer --residual --bias`), `conv
 BxHxWxCINxCOUT` (`--kernel --stride --pad --dilation`, epilogue flags), `heads BxTxHxKVxD` (`--qk-norm --rope`), each
 through `ops::shape` and `ops::tuned` as the op runs. Prints the costs used (`GUESSED fixture` unless `--store` holds
 that card's `<arch>_<sms>sm` file), the top configs with predicted ns and registers, rejection counts by `Rejected`
 reason, then writes `plan.txt`, `kernel.ll`, and on CUDA `kernel.ptx`, `ptxas.txt` (`ptxas -v -warn-spills`),
 `kernel.cubin`, `kernel.sass` (`nvdisasm -c`; tools from `PATH` or `/opt/cuda/bin`), on AMD `kernel.s` with its
-`; NumVgprs … Occupancy` line, and the **main-loop opcode histogram** (`svod_tk3::isa::main_loop`: the innermost
+`; NumVgprs … Occupancy` line, and the **main-loop opcode histogram** (`svod_tk::isa::main_loop`: the innermost
 back-edge holding a matrix instruction). A split conv/attention emits its first program only.
 
 `--cfg I` is the ranking's `I`th config (`0` is not the tuner's pick: a guessed gfx1201 4096³ ranking leads with a
@@ -155,11 +155,11 @@ the salt and the config list's Debug text, so the ranking must be the card's: it
 digest (no device here); among several, this build's programs fingerprint (`Own`), else other builds' (`Built`, or
 `Disagree`: first taken). Each key read is printed; a `Missing` key is an error with the shape's other lines counted.
 A GEMM reads `linear`'s lines, else the device tests'/GEMM probes' (`gemm`, `ops::DEVICE_TEST`); with
-`SVOD_TK3_TUNE=0` the `first` lines. `TK3_DUMP_LIST` and `SVOD_DUMP_NVPTX_IR` work under it too.
+`SVOD_TK_TUNE=0` the `first` lines. `TK_DUMP_LIST` and `SVOD_DUMP_NVPTX_IR` work under it too.
 
 ## Comparing with vendor kernels offline
 
-Build the reference side, then `tk3_dump … --compare <file> [--fun NAME]` prints both main loops per opcode side by
+Build the reference side, then `tk_dump … --compare <file> [--fun NAME]` prints both main loops per opcode side by
 side (`isa::table`; a `.cubin` through `nvdisasm -c`, a `.co`/`.hsaco` through `llvm-objdump -d --symbolize-operands`,
 anything else as SASS/PTX/AMDGCN text; `--fun` is required when the file holds several kernels, the error lists them;
 `reference.*` keeps the text). Compare per main-loop step: matrix
@@ -178,11 +178,11 @@ Reference sources are local checkouts under `submodules/` (untracked; may be abs
 What a static comparison cannot tell: stall reasons, achieved overlap of copies and products, L2/MALL hit rates and
 bank conflicts as they happen, clocks and power. It answers "what does each step issue" (an extra `s_waitcnt`/`BAR.SYNC`,
 a spill, address math per `LDGSTS`, an MMA count off the tile/atom ratio); timing needs the card (Nsight Compute,
-rocprof, or tk3's probes). `llvm-mca` on AMDGPU is a one-wave, no-memory model and prices RDNA WMMA as one VALU cycle.
+rocprof, or tk's probes). `llvm-mca` on AMDGPU is a one-wave, no-memory model and prices RDNA WMMA as one VALU cycle.
 
 ## Tune store
 
-`$SVOD_TK3_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk3_tune`, else `~/.cache/svod/tk3_tune`; one file per device
+`$SVOD_TK_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk_tune`, else `~/.cache/svod/tk_tune`; one file per device
 `<arch>_<sms>sm-v<crate version>.txt` (`sm_86_28sm-v0.2.0.txt`) under a `format 5` line (`tune::FORMAT`); lines
 `choice|…` (candidate index + ns pairs, fastest first), `admitted|…`/`first|…` (ranked indices), `value|…` (one number;
 probes in femtoseconds) keyed by op, device, dtype, shape, candidate digest, compiler digest and the
@@ -190,7 +190,7 @@ fingerprint of the **emitted kernels** (lowered program + LLVM text), so only a 
 The emitted fingerprints are memoized per build in `emitted/<build>.txt` (dropped after 7 days unused). A new FORMAT
 orphans every file: the next run re-probes and re-tunes every shape (budget the cold run). Read the probes without
 re-running: `grep '^value|probe:' <file>`; indices point into the ranked list: the planner log names their configs,
-`tk3_dump --cfg tuned` follows them offline.
+`tk_dump --cfg tuned` follows them offline.
 
 ## Measuring
 
@@ -209,26 +209,26 @@ The `#[ignore]` probes print and never assert; one at a time on an idle GPU:
 
 Ad hoc timing in a test: `super::measure(candidates)` (compile + time, ns per candidate on scratch buffers). Models:
 `tk3_pr.md` Table B gives each row's command and line (e.g. `--example nemotron_diarize -- <wav> --dtype bf16 --profile`;
-tk3 kernels appear as `gemm`, `flash_attention`, `heads`, `layer_norm`/`rms_norm`, `conv`).
+tk kernels appear as `gemm`, `flash_attention`, `heads`, `layer_norm`/`rms_norm`, `conv`).
 
 ## Performance-regression protocol
 
 For a change under `ops/config.rs`, `probe.rs`, `tune.rs`, `schedule.rs`, `layouts.rs`, `layout/`, `atoms.rs`, `lower/`:
 
-1. **What changed in the code emitted**: `cargo run -p svod-tk3 --release --example tk3_digest -- --out <dir>` in a
+1. **What changed in the code emitted**: `cargo run -p svod-tk --release --example tk_digest -- --out <dir>` in a
    worktree at the base and at the change (≈45 s each: ~600 kernels × ten targets, `sweep::digested` under the declared
    costs: families, shortlists, attention/conv/norm/heads/probe variants; `--targets sm_86,gfx942`, `--full` keeps the
-   `.ll`), then `tk3_digest --diff <a> <b>`: kernels changed/removed/added per target and whether `rankings.txt`
+   `.ll`), then `tk_digest --diff <a> <b>`: kernels changed/removed/added per target and whether `rankings.txt`
    moved; exit 1 on any. Byte-identical output needs no device run; a refactor meant to be neutral proves it this way.
-2. **Host**: `cargo fmt`, `cargo clippy --workspace --all-targets`, `SVOD_DEVICE=CPU cargo test -p svod-tk3 --release
+2. **Host**: `cargo fmt`, `cargo clippy --workspace --all-targets`, `SVOD_DEVICE=CPU cargo test -p svod-tk --release
    --lib`, then the workspace: `cargo test --workspace --no-run` and the `svod-codegen`, `svod-tensor`, `svod-model` lib
-   tests (model builds tk3 configs, codegen renders tk3 kernels; two regressions passed every tk3 suite and broke them).
+   tests (model builds tk configs, codegen renders tk kernels; two regressions passed every tk suite and broke them).
 3. **Device suite per vendor**, from a detached worktree at the commit (never a checkout others edit mid-run), one
-   GPU job per machine: fresh `SVOD_TK3_TUNE_DIR`, `device_costs_are_physical` alone first (the suite's parallel tests
+   GPU job per machine: fresh `SVOD_TK_TUNE_DIR`, `device_costs_are_physical` alone first (the suite's parallel tests
    inflate the probes and the store keeps the first measurement), then the suite, each with `SVOD_DEVICE` set.
 4. **Probes and models** of what changed, per `tk3_pr.md` "How to add a column", against that GPU's Table A/B column.
 5. **A/B across builds on one box**: build both commits in their own worktrees, alternate them ≥2–3 times
-   (A B A B …), and compare kernels with tuning off (`tune::scoped(false, …)` / `SVOD_TK3_TUNE=0`): a re-tune can pick
+   (A B A B …), and compare kernels with tuning off (`tune::scoped(false, …)` / `SVOD_TK_TUNE=0`): a re-tune can pick
    another config from a near-tie (on gfx1201 the 4096³ best tile's standing drifted 4th–10th across processes), which reads as a
    regression of the change. Compare picks separately, through the planner log.
 
@@ -236,12 +236,12 @@ For a change under `ops/config.rs`, `probe.rs`, `tune.rs`, `schedule.rs`, `layou
 
 | File | Purpose |
 |------|---------|
-| `tk3/src/ir.rs`, `build.rs` | statement tree, `Kernel` builder, `Sc` scalars, `CopyMode::{Sync,Async,Staged}`, `SmemRef`, `CmpOp` |
-| `tk3/src/kernels/{gemm,attention,conv,heads,rows,mod}.rs` | the kernels; `Batch`, `Act`, `bound`, `batch_offset` |
-| `tk3/src/lower/{mod,sync}.rs`, `lower/emit/*.rs` | `lower`, `standalone`, `render`, errors; barrier pass; emitter (`TK3_DUMP_LIST`) |
-| `tk3/src/schedule.rs`, `layouts.rs`, `layout/`, `atoms.rs` | templates; inference, `Swizzle`; F2 algebra; `Target`, `CARDS`, `Costs` |
-| `tk3/src/ops/{mod,shape,config,linear,attention,heads,norm,conv}.rs` | op layer, `PLAN`, plan gate, lattice, `Planner`, `Rejected`, `Tuner` |
-| `tk3/src/tune.rs`, `probe.rs`, `launch.rs`, `interp.rs` | store, `scoped`, timing; probes, `stored`, `GUESSED`; launch memo; interpreter |
-| `tk3/src/test/unit/{mod,targets,device,offline,ops,ops_plan,probe,tune,replay,isa,sweep,emit,sync}.rs` | gate, sweep, device tests, probes, store replay, ISA reader |
-| `tk3/src/isa.rs`, `tk3/src/sweep.rs` (`#[doc(hidden)]`) | main loop, functions, side-by-side table; the sweep's targets, families, digest set |
-| `tk3/examples/tk3_dump.rs`, `tk3_digest.rs` | offline plan + IR + ISA + `--cfg tuned` + `--compare`; render digests + `--diff` |
+| `tk/src/ir.rs`, `build.rs` | statement tree, `Kernel` builder, `Sc` scalars, `CopyMode::{Sync,Async,Staged}`, `SmemRef`, `CmpOp` |
+| `tk/src/kernels/{gemm,attention,conv,heads,rows,mod}.rs` | the kernels; `Batch`, `Act`, `bound`, `batch_offset` |
+| `tk/src/lower/{mod,sync}.rs`, `lower/emit/*.rs` | `lower`, `standalone`, `render`, errors; barrier pass; emitter (`TK_DUMP_LIST`) |
+| `tk/src/schedule.rs`, `layouts.rs`, `layout/`, `atoms.rs` | templates; inference, `Swizzle`; F2 algebra; `Target`, `CARDS`, `Costs` |
+| `tk/src/ops/{mod,shape,config,linear,attention,heads,norm,conv}.rs` | op layer, `PLAN`, plan gate, lattice, `Planner`, `Rejected`, `Tuner` |
+| `tk/src/tune.rs`, `probe.rs`, `launch.rs`, `interp.rs` | store, `scoped`, timing; probes, `stored`, `GUESSED`; launch memo; interpreter |
+| `tk/src/test/unit/{mod,targets,device,offline,ops,ops_plan,probe,tune,replay,isa,sweep,emit,sync}.rs` | gate, sweep, device tests, probes, store replay, ISA reader |
+| `tk/src/isa.rs`, `tk/src/sweep.rs` (`#[doc(hidden)]`) | main loop, functions, side-by-side table; the sweep's targets, families, digest set |
+| `tk/examples/tk_dump.rs`, `tk_digest.rs` | offline plan + IR + ISA + `--cfg tuned` + `--compare`; render digests + `--diff` |
