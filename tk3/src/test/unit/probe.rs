@@ -588,9 +588,10 @@ fn trip_pairs_load_inside_their_loops(target: Target) {
 }
 
 #[test_case(&[(100, 160), (102, 161), (101, 159)], Some((59.0, 0.0, 59.0)); "clear of the spread")]
-#[test_case(&[(100, 103), (110, 104), (104, 112), (100, 106), (103, 105)], Some((3.0, 6.0, 6.0)); "inside the spread, bounded by it")]
+#[test_case(&[(100, 103), (110, 104), (104, 112), (100, 106), (103, 105)], Some((3.0, 4.0, 4.0)); "inside the spread, bounded by it")]
 #[test_case(&[(150, 160), (100, 140), (101, 141), (102, 139), (99, 140)], Some((40.0, 3.0, 40.0)); "a slow first run trimmed")]
-#[test_case(&[(200, 100), (201, 101)], Some((-100.0, 2.0, 2.0)); "faster than its baseline, bounded by the spread")]
+#[test_case(&[(200, 100), (201, 101)], Some((-100.0, 0.0, 0.0)); "faster than its baseline, bounded by the spread")]
+#[test_case(&[(3000, 3230), (3300, 3525), (3100, 3328), (3400, 3633), (3200, 3420)], Some((228.0, 5.0, 228.0)); "a clock drifting between pairs")]
 #[test_case(&[], None; "no pair")]
 fn a_resolved_difference_clears_its_spread(pairs: &[(u64, u64)], want: Option<(f64, f64, f64)>) {
     let got = probe::resolved(pairs).map(|r| (r.difference, r.spread, r.value()));

@@ -85,8 +85,8 @@ const RESOLVE_TRIES: usize = 5;
 pub(crate) struct Resolved {
     /// The median of the pairs' differences, probe less baseline.
     pub(crate) difference: f64,
-    /// The run-to-run spread of the baselines plus that of the probes, each
-    /// with its extremes trimmed.
+    /// The run-to-run spread of the pairs' differences, its extremes
+    /// trimmed.
     pub(crate) spread: f64,
     /// The median baseline and probe timings.
     pub(crate) baseline: f64,
@@ -119,20 +119,24 @@ impl Resolved {
 /// its bytes a few percent cheaper than the same bytes loaded into
 /// registers), so its value is the spread, the bound on what it adds.
 pub(crate) fn resolved(pairs: &[(u64, u64)]) -> Option<Resolved> {
-    // A side's range with its extremes trimmed once three timings allow:
-    // a first run below the lifted clock is noise, not the pair's spread.
-    let spread = |side: fn(&(u64, u64)) -> u64| {
-        let mut t: Vec<u64> = pairs.iter().map(side).collect();
-        t.sort_unstable();
-        let kept = if t.len() >= 3 { &t[1..t.len() - 1] } else { &t[..] };
-        kept.last().zip(kept.first()).map_or(0.0, |(hi, lo)| (hi - lo) as f64)
+    let diffs: Vec<f64> = pairs.iter().map(|&(base, probe)| probe as f64 - base as f64).collect();
+    // The differences' range with its extremes trimmed once three pairs
+    // allow (a first run below the lifted clock is noise). A pair's two
+    // programs run back to back, so a clock that drifts between pairs moves
+    // both sides and leaves the difference: on gfx1151 the sides' own
+    // ranges summed 5–40× the differences' (283 µs against 34 µs on a
+    // 226 µs trip) and called a clear trip unresolved.
+    let spread = {
+        let mut d = diffs.clone();
+        d.sort_by(f64::total_cmp);
+        let kept = if d.len() >= 3 { &d[1..d.len() - 1] } else { &d[..] };
+        kept.last().zip(kept.first()).map_or(0.0, |(hi, lo)| hi - lo)
     };
-    let spread = spread(|p| p.0) + spread(|p| p.1);
     let median = |mut v: Vec<f64>| {
         v.sort_by(f64::total_cmp);
         v.get(v.len() / 2).copied()
     };
-    let difference = median(pairs.iter().map(|&(base, probe)| probe as f64 - base as f64).collect())?;
+    let difference = median(diffs)?;
     let baseline = median(pairs.iter().map(|p| p.0 as f64).collect())?;
     let probe = median(pairs.iter().map(|p| p.1 as f64).collect())?;
     Some(Resolved { difference, spread, baseline, probe })
