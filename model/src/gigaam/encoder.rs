@@ -32,19 +32,30 @@ fn build_rope_cache(config: &GigaAmConfig) -> svod_tensor::error::Result<(Tensor
 
 type Result<T> = super::Result<T>;
 
-/// `act(x·wᵀ + bias)`, through the tile op layer unless the weight carries a
-/// dynamic-quantization scale. The scale's presence is a property of the
+/// `act(x·wᵀ + bias) + residual`, through the tile op layer unless the weight
+/// carries a dynamic-quantization scale. The scale's presence is a property of the
 /// *weight dtype*, not of the state dict, so the pair is loaded together by
 /// the owner's `Module` impl rather than derived.
-fn linear(x: &Tensor, weight: &Tensor, bias: &Tensor, weight_scale: Option<&Tensor>, act: Act) -> Result<Tensor> {
+fn linear(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    weight_scale: Option<&Tensor>,
+    act: Act,
+    residual: Option<&Tensor>,
+) -> Result<Tensor> {
     let Some(scale) = weight_scale else {
-        return Ok(ops::linear(x, weight, ops::Linear { bias: Some(bias), act, ..ops::Linear::default() })?);
+        return Ok(ops::linear(x, weight, ops::Linear { bias: Some(bias), act, residual, ..ops::Linear::default() })?);
     };
     let y = x.dynamic_quantized_linear().weight(weight).weight_scale(scale).bias(bias).call()?;
-    Ok(match act {
+    let y = match act {
         Act::None => y,
         Act::Silu => y.silu()?,
         Act::Gelu => y.gelu_exact()?,
+    };
+    Ok(match residual {
+        Some(r) => r.try_add(&y)?,
+        None => y,
     })
 }
 
@@ -90,8 +101,8 @@ impl FeedForward {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let y = scoped("norm", || self.norm.forward(x))?;
-        let y = linear(&y, &self.linear1.weight, bias_of(&self.linear1), self.linear1_scale.as_ref(), Act::Silu)?;
-        linear(&y, &self.linear2.weight, bias_of(&self.linear2), self.linear2_scale.as_ref(), Act::None)
+        let y = linear(&y, &self.linear1.weight, bias_of(&self.linear1), self.linear1_scale.as_ref(), Act::Silu, None)?;
+        linear(&y, &self.linear2.weight, bias_of(&self.linear2), self.linear2_scale.as_ref(), Act::None, None)
     }
 }
 
@@ -150,7 +161,7 @@ impl MultiHeadSelfAttention {
         }
     }
 
-    /// `key_lens`, when present, is a realized `[B]` `i32` tensor of valid
+    /// `x + mhsa(x)`. `key_lens`, when present, is a realized `[B]` `i32` tensor of valid
     /// (unpadded) key positions per batch — keys at index `>= key_lens[b]` are
     /// masked.
     pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
@@ -180,9 +191,9 @@ impl MultiHeadSelfAttention {
             .try_transpose(0, 1)?
             .contiguous();
 
-        let q = linear(&qk_input, &self.q_proj, &self.q_bias, self.q_weight_scale.as_ref(), Act::None)?;
-        let k = linear(&qk_input, &self.k_proj, &self.k_bias, self.k_weight_scale.as_ref(), Act::None)?;
-        let v = linear(&y, &self.v_proj, &self.v_bias, self.v_weight_scale.as_ref(), Act::None)?;
+        let q = linear(&qk_input, &self.q_proj, &self.q_bias, self.q_weight_scale.as_ref(), Act::None, None)?;
+        let k = linear(&qk_input, &self.k_proj, &self.k_bias, self.k_weight_scale.as_ref(), Act::None, None)?;
+        let v = linear(&y, &self.v_proj, &self.v_bias, self.v_weight_scale.as_ref(), Act::None, None)?;
 
         // Head-split into the attention's sequence-major `[B, T, H, d_k]`, not
         // `Tensor::split_heads`, which lands head-major `[B, H, T, d_k]`.
@@ -197,7 +208,7 @@ impl MultiHeadSelfAttention {
         // Head-merge is a plain reshape here: the attention output is already
         // seq-major, so there is no transpose to undo.
         let out = attn.try_reshape([b, t, SInt::Const(d_model)])?;
-        linear(&out, &self.out_proj, &self.out_bias, self.out_weight_scale.as_ref(), Act::None)
+        linear(&out, &self.out_proj, &self.out_bias, self.out_weight_scale.as_ref(), Act::None, Some(x))
     }
 }
 
@@ -536,9 +547,8 @@ impl ConformerLayer {
         let ffn1 = scoped("ffn1", || self.ffn1.forward(x))?;
         let x = x.try_add(&ffn1.try_mul(0.5)?)?;
 
-        // MHSA
-        let mhsa = scoped("mhsa", || self.mhsa.forward(&x, cos, sin, key_lens))?;
-        let x = x.try_add(&mhsa)?;
+        // MHSA, the residual added in the out projection's epilogue
+        let x = scoped("mhsa", || self.mhsa.forward(&x, cos, sin, key_lens))?;
 
         // Convolution
         let conv = scoped("conv", || self.conv.forward(&x, pad_valid))?;
