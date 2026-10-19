@@ -115,7 +115,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
             extent as f64 * moved * (carried() / warps) as f64
         }
         // Every trip of the pipeline, which the baseline loads in a plain loop.
-        "trip" | "trip_rolled" => {
+        "trip" | "trip_rolled" | "trip_one" => {
             assert_eq!(base_extent, extent, "{field}: as many trips");
             (blocks * extent) as f64
         }
@@ -256,6 +256,14 @@ fn units_count_the_primitive(target: Target) {
     };
     assert_eq!((unroll(trip), unroll(rolled)), (vec![true; 2], vec![false; 2]), "the ring unrolled, then rolled");
     assert_eq!(pair(trip), pair(rolled), "the same programs");
+    // The one-slot trip: the same baseline, the ring one slot deep, rolled.
+    let one = find(&probes, "trip_one");
+    assert_eq!(unroll(one), vec![false; 2], "a one-slot ring has nothing to unroll");
+    assert_eq!(pair(one).0, pair(trip).0, "the same baseline");
+    let depth = |p: &Program| {
+        p.walk().find_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some(p.stages) } else { None }).expect("a ring")
+    };
+    assert_eq!((depth(pair(one).1), depth(pair(trip).1)), (1, target.stages(2)), "one slot against the target's two");
     let (_, latency) = pair(find(&probes, "latency"));
     assert_eq!((work(latency).0, latency.warps), (target.sms.unwrap() as usize, 1), "a lone wave per SM");
     let tile = loads_from(latency, Tier::Smem)[0].1;
@@ -409,8 +417,9 @@ fn a_probe_keeps_the_least_of_agreeing_timings(timings: &[u64]) -> (Option<u64>,
 /// On the attached GPU every cost measures (none is left at zero), finite
 /// and non-negative, and ordered as the hardware is: a shared byte cheaper
 /// than a global one, a cached one no dearer than DRAM's, a lone trip's wait
-/// outlasting a matrix step, a rolled ring's trip about an unrolled one's or
-/// more, and a round trip through shared memory costing something. The
+/// outlasting a matrix step, a rolled ring's trip and a one-slot ring's about
+/// an unrolled two-slot one's or more, and a round trip through shared
+/// memory costing something. The
 /// retries absorb a pair timed alongside another test's kernels.
 #[test]
 fn device_costs_are_physical() {
@@ -430,6 +439,7 @@ fn device_costs_are_physical() {
     assert!(c.latency > c.step, "{c:?}");
     assert!(c.step_lone >= c.step, "{c:?}");
     assert!(c.trip_rolled >= 0.9 * c.trip, "{c:?}");
+    assert!(c.trip_one >= 0.9 * c.trip, "{c:?}");
     assert!(c.smem_trip > 0.0, "{c:?}");
 }
 

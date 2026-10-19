@@ -100,7 +100,7 @@ warm run के सारे fingerprints मिलकर 45 ms); सिर्�
 
 Ranking की costs (`atoms::Costs`: एक shared byte, एक streamed byte, भरे SM पर और अपने SIMD पर अकेली wave का
 एक matrix-core step, एक score का
-softmax, एक pipeline trip, lane moves, global latency, ...) device पर `probe::costs` से मापी जाती हैं, पहली
+softmax, दो ring slots पर (unrolled और rolled) और एक पर एक pipeline trip, lane moves, global latency, ...) device पर `probe::costs` से मापी जाती हैं, पहली
 बार जब कोई process उसके लिए plan करता है: हर field programs की एक जोड़ी है, एक probe जो वह सब करता है जो
 उसका baseline करता है, साथ में primitive की एक ज्ञात मात्रा। Values उसी store फ़ाइल में `probe:<field>` lines
 के रूप में जाती हैं (index 0, `ns` slot में femtoseconds), ताकि बाद के processes उन्हें वापस पढ़ें। Planner हर

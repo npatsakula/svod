@@ -98,6 +98,8 @@ pub(crate) fn costs() -> Costs {
         score: 0.5,
         trip: 150.0,
         trip_rolled: 170.0,
+        // A guess: the barrier pair costs about what the two-slot trip does again.
+        trip_one: 300.0,
         lane_move: 1.0,
         smem_trip: 8.0,
         latency: 600.0,
@@ -119,6 +121,8 @@ pub(crate) fn gfx1151_costs() -> Costs {
         score: 0.0773,
         trip: 11.67,
         trip_rolled: 13.85,
+        // Unmeasured there: a guess at the barrier pair's share.
+        trip_one: 20.0,
         lane_move: 0.0316,
         smem_trip: 0.0841,
         latency: 577.9,
