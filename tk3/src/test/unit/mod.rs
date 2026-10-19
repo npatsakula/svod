@@ -82,6 +82,8 @@ pub(crate) fn costs() -> Costs {
         lane_move: 1.0,
         smem_trip: 8.0,
         latency: 600.0,
+        l2_byte: 0.0,
+        l2_bytes: 0.0,
     }
 }
 
@@ -99,6 +101,8 @@ pub(crate) fn gfx1151_costs() -> Costs {
         lane_move: 0.0316,
         smem_trip: 0.0841,
         latency: 577.9,
+        l2_byte: 0.0,
+        l2_bytes: 0.0,
     }
 }
 

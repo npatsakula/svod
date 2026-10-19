@@ -181,7 +181,92 @@ fn no_register_count_admits() {
 fn pipelined(costs: Costs, [rounds, trips, actual, waves, stages]: [usize; 5], work: f64) -> f64 {
     let planner = Planner::new(Device { target: sm86(), costs });
     let (blocks, smem) = (rounds * actual * planner.sms(), sm86().smem_bytes / actual);
-    planner.pipelined(Run { blocks, smem, regs: 0, waves, trips, work, stages })
+    planner.pipelined(Run { blocks, smem, regs: 0, waves, trips, work, trip: 0.0, stages })
+}
+
+/// The busiest SM issues `⌈blocks / sms⌉` blocks' work, not whole rounds of
+/// what it holds: nine blocks an SM over rounds of four cost nine blocks.
+#[test]
+fn an_sm_issues_its_share_of_blocks() {
+    let flat = Costs { latency: 0.0, ..costs() };
+    let planner = Planner::new(Device { target: sm86(), costs: flat });
+    let sms = planner.sms();
+    let run = |blocks| Run {
+        blocks,
+        smem: sm86().smem_bytes / 4,
+        regs: 0,
+        waves: 4,
+        trips: 1,
+        work: 100.0,
+        trip: 0.0,
+        stages: 2,
+    };
+    assert_eq!(planner.pipelined(run(9 * sms)), 900.0);
+    assert_eq!(planner.pipelined(run(9 * sms + 1)), 1000.0);
+}
+
+/// A trip's fixed overhead is shared by the blocks an SM holds at once,
+/// its work is not.
+#[test_case(1; "one block an SM")]
+#[test_case(4; "four")]
+fn a_trip_overhead_is_shared_by_resident_blocks(resident: usize) {
+    let flat = Costs { latency: 0.0, ..costs() };
+    let planner = Planner::new(Device { target: sm86(), costs: flat });
+    let blocks = resident * planner.sms();
+    let smem = sm86().smem_bytes / resident;
+    let run = |work, trip| Run { blocks, smem, regs: 0, waves: 4, trips: 1, work, trip, stages: 2 };
+    let base = planner.pipelined(run(100.0, 0.0));
+    assert_eq!(planner.pipelined(run(100.0, 40.0)) - base, 40.0);
+}
+
+/// A fill's byte is DRAM's where no cache was measured or the distinct
+/// operands overflow it, the cache's for the re-reads where they fit, and in
+/// between as much nearer DRAM as they overflow three quarters of it.
+#[test]
+fn a_fill_is_priced_by_where_its_bytes_come_from() {
+    let mb = (1 << 20) as f64;
+    let with = |l2_bytes| {
+        let c = Costs { global_byte: 0.08, l2_byte: 0.01, l2_bytes, ..costs() };
+        Planner::new(Device { target: sm86(), costs: c })
+    };
+    let (none, cached) = (with(0.0), with(4.0 * mb));
+    assert_eq!(none.fill_byte(mb, 100.0 * mb), 0.08);
+    // 1 MB read 100 times over: one byte in a hundred from DRAM.
+    assert!((cached.fill_byte(mb, 100.0 * mb) - (0.01 * 0.99 + 0.08 * 0.01)).abs() < 1e-12);
+    // Past 1.5 × 3 MB every byte comes from DRAM.
+    assert_eq!(cached.fill_byte(5.0 * mb, 100.0 * mb), 0.08);
+    let edge: Vec<f64> = [2.0, 3.0, 3.5, 4.0, 4.5].iter().map(|&u| cached.fill_byte(u * mb, 100.0 * mb)).collect();
+    assert!(edge.windows(2).all(|w| w[0] <= w[1]), "{edge:?}");
+    // A fill that reads each byte once pays DRAM whatever the cache.
+    assert_eq!(cached.fill_byte(mb, mb), 0.08);
+}
+
+/// The ranking's front spreads over the band's block tiles: a block tile's
+/// second tile comes after every class's first, and every config is kept.
+#[test]
+fn the_ranking_leads_with_a_tile_of_each_block() {
+    let cfg = |tile: [usize; 3], warps: [u32; 2], stages| GemmCfg { tile, stages, warps, group_m: 8, unroll: false };
+    let ranked = vec![
+        (100.0, cfg([128, 128, 64], [2, 2], 3)),
+        (100.0, cfg([128, 128, 64], [2, 2], 2)),
+        (101.0, cfg([128, 128, 64], [1, 4], 3)),
+        (102.0, cfg([128, 128, 32], [2, 2], 3)),
+        (110.0, cfg([64, 64, 32], [2, 2], 3)),
+        (120.0, cfg([64, 128, 32], [1, 2], 2)),
+        (200.0, cfg([32, 64, 32], [1, 1], 2)),
+    ];
+    let spread = config::spread(ranked.clone(), |c| [c.tile[0], c.tile[1]]);
+    let blocks: Vec<[usize; 2]> = config::distinct(&spread).take(3).map(|c| [c.tile[0], c.tile[1]]).collect();
+    assert_eq!(blocks, [[128, 128], [64, 64], [64, 128]]);
+    // A tile's pipelines follow it; the band's second tiles come next; then
+    // what lies past the band.
+    assert_eq!(spread[..2], [ranked[0].1, ranked[1].1]);
+    assert_eq!(spread[spread.len() - 1], ranked[6].1);
+    let mut sorted = spread.clone();
+    sorted.sort_by_key(|c| format!("{c:?}"));
+    let mut want: Vec<GemmCfg> = ranked.iter().map(|(_, c)| *c).collect();
+    want.sort_by_key(|c| format!("{c:?}"));
+    assert_eq!(sorted, want);
 }
 
 /// Without latency a round is its issue work: linear in the work, the
