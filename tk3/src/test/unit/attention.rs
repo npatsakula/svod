@@ -130,8 +130,8 @@ fn reference(c: &Case) -> Vec<f64> {
             for i in 0..s.t {
                 let qi = &c.q[(b * s.t + i) * stride + h * s.d..][..s.d];
                 let chunked = |j: usize| {
-                    m.chunk.is_some_and(|Chunk { size, left }| {
-                        j / size > i / size || left.is_some_and(|l| j / size + l < i / size)
+                    m.chunk.is_some_and(|Chunk { size, left, right }| {
+                        j / size > i / size + right || left.is_some_and(|l| j / size + l < i / size)
                     })
                 };
                 let hidden = |j: usize| {
@@ -257,13 +257,13 @@ const WINDOW: AttnMask = AttnMask { window: Some((20, 5)), key_lens: true, ..NON
 const KEY_MASK: AttnMask = AttnMask { key_mask: true, ..NONE };
 const SEGMENTS: AttnMask = AttnMask { causal: true, seg_start: true, ..NONE };
 /// Chunks of 16 with two behind: the block edges fall inside 32- and 64-wide key blocks.
-const CHUNKED: AttnMask = AttnMask { chunk: Some(Chunk { size: 16, left: Some(2) }), key_lens: true, ..NONE };
-/// Chunks of 24 with every earlier one: the edges off the key block grid.
-const CHUNKED_ALL: AttnMask = AttnMask { chunk: Some(Chunk { size: 24, left: None }), ..NONE };
+const CHUNKED: AttnMask = AttnMask { chunk: Some(Chunk { size: 16, left: Some(2), right: 0 }), key_lens: true, ..NONE };
+/// Chunks of 24 with every earlier one and one ahead: the edges off the key block grid.
+const CHUNKED_ALL: AttnMask = AttnMask { chunk: Some(Chunk { size: 24, left: None, right: 1 }), ..NONE };
 const EVERY: AttnMask = AttnMask {
     causal: true,
     window: Some((50, 0)),
-    chunk: Some(Chunk { size: 32, left: Some(3) }),
+    chunk: Some(Chunk { size: 32, left: Some(3), right: 0 }),
     key_lens: true,
     key_mask: true,
     seg_start: true,
@@ -293,7 +293,7 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(masked(128, 128, 64, 64, 64, KEY_MASK), &[128, 128]; "key mask")]
 #[test_case(masked(128, 128, 64, 64, 32, SEGMENTS), &[128, 128]; "causal segments")]
 #[test_case(masked(128, 128, 64, 64, 32, CHUNKED), &[128, 90]; "chunks with lengths")]
-#[test_case(masked(100, 100, 64, 64, 64, CHUNKED_ALL), &[100, 100]; "chunks, every earlier one, ragged")]
+#[test_case(masked(100, 100, 64, 64, 64, CHUNKED_ALL), &[100, 100]; "chunks, every earlier one and one ahead, ragged")]
 #[test_case(masked(128, 128, 64, 64, 32, EVERY), &[128, 100]; "every mask")]
 #[test_case(masked(96, 96, 48, 64, 64, SEGMENTS), &[96, 96]; "d 48")]
 #[test_case(masked(128, 128, 64, 64, 64, PER_BATCH), &[128, 128]; "bias per batch")]
@@ -380,7 +380,7 @@ fn only_the_live_batch_runs() {
 #[test_case(masked(100, 100, 64, 64, 64, KEY_MASK), &[100, 100]; "key mask, ragged")]
 #[test_case(masked(128, 128, 64, 64, 32, SEGMENTS), &[128, 128]; "causal segments")]
 #[test_case(masked(128, 128, 64, 64, 32, CHUNKED), &[128, 90]; "chunks with lengths")]
-#[test_case(masked(100, 100, 64, 64, 64, CHUNKED_ALL), &[100, 100]; "chunks, every earlier one, ragged")]
+#[test_case(masked(100, 100, 64, 64, 64, CHUNKED_ALL), &[100, 100]; "chunks, every earlier one and one ahead, ragged")]
 #[test_case(masked(128, 128, 128, 64, 32, EVERY), &[128, 100]; "every mask, d 128")]
 #[test_case(with(FaCfg::new(64, 64, 3), masked(200, 200, 48, 0, 0, SEGMENTS)), &[200, 200]; "d 48, three stages")]
 #[test_case(cached(1, 100, [4, 2, 64], true, 1, 1), &[100, 37]; "cache: row map, appended, gqa")]

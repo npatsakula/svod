@@ -84,13 +84,15 @@ pub struct AttnMask {
 }
 
 /// Block attention: position `p` lies in chunk `p / size`, and a query sees
-/// the keys of its own chunk and of the `left` chunks before it (every
-/// earlier chunk without a bound), none after. Positions are the query and
-/// key indices, so the queries' and keys' sequences must be the same one.
+/// the keys of its own chunk, of the `left` chunks before it (every earlier
+/// chunk without a bound) and of the `right` chunks after it. Positions are
+/// the query and key indices, so the queries' and keys' sequences must be the
+/// same one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Chunk {
     pub size: usize,
     pub left: Option<usize>,
+    pub right: usize,
 }
 
 /// The rows of the `bias` parameter, `[rows, heads, t, key_mask_stride(keys)]`
@@ -323,7 +325,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     if let Some((left, _)) = window {
         first = first.max((q_off.clone().max(left) - left) / bkv);
     }
-    if let (Some(Chunk { size, left: Some(left) }), Some((cq0, _))) = (chunk, &chunks) {
+    if let (Some(Chunk { size, left: Some(left), .. }), Some((cq0, _))) = (chunk, &chunks) {
         first = first.max((cq0.clone().max(left) - left) * size / bkv);
     }
     if let Some((_, seg_first, _)) = &seg {
@@ -336,8 +338,8 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     if let Some((_, right)) = window {
         end = end.min((q_off.clone() + bq + right + bkv - 1) / bkv);
     }
-    if let (Some(Chunk { size, .. }), Some((_, cq1))) = (chunk, &chunks) {
-        end = end.min(((cq1.clone() + 1) * size + (bkv - 1)) / bkv);
+    if let (Some(Chunk { size, right, .. }), Some((_, cq1))) = (chunk, &chunks) {
+        end = end.min(((cq1.clone() + (1 + right)) * size + (bkv - 1)) / bkv);
     }
     if key_lens {
         end = end.min((len.clone() + bkv - 1) / bkv);
@@ -403,11 +405,13 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             let cond = k.compare(col, reach, BinaryOp::Le);
             and(k, cond);
         }
-        if let Some(Chunk { size, left }) = chunk {
+        if let Some(Chunk { size, left, right }) = chunk {
             let size = k.splat::<I32>(shape, size);
             let cq = k.binary(row, size, BinaryOp::Div);
             let ck = k.binary(col, size, BinaryOp::Div);
-            let cond = k.compare(ck, cq, BinaryOp::Le);
+            let right = k.splat::<I32>(shape, right);
+            let reach = k.binary(cq, right, BinaryOp::Add);
+            let cond = k.compare(ck, reach, BinaryOp::Le);
             and(k, cond);
             if let Some(left) = left {
                 let left = k.splat::<I32>(shape, left);
@@ -453,10 +457,10 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
             let right_edge = (q_off.clone() + right + 1).lt(block_end.clone());
             partial = partial.or(left_edge).or(right_edge);
         }
-        if let (Some(Chunk { size, left }), Some((cq0, cq1))) = (chunk, &chunks) {
+        if let (Some(Chunk { size, left, right }), Some((cq0, cq1))) = (chunk, &chunks) {
             // Every row sees a block within the last row's reach behind and
-            // the first row's chunk ahead.
-            partial = partial.or(((cq0.clone() + 1) * size).lt(block_end.clone()));
+            // the first row's reach ahead.
+            partial = partial.or(((cq0.clone() + (1 + right)) * size).lt(block_end.clone()));
             if let Some(left) = left {
                 partial = partial.or(block_start.clone().lt((cq1.clone().max(left) - left) * size));
             }
