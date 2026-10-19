@@ -7,6 +7,7 @@ mod emit;
 mod gather;
 mod heads;
 mod interp;
+mod isa;
 mod layout;
 mod layouts;
 mod offline;

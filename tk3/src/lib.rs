@@ -19,6 +19,7 @@ pub mod build;
 pub mod index;
 pub mod interp;
 pub mod ir;
+pub mod isa;
 pub mod kernels;
 pub mod launch;
 pub mod layout;

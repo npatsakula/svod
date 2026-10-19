@@ -18,6 +18,13 @@
 //! `heads BxTxHxKVxD` (`--qk-norm`, `--rope`). Each goes through the op
 //! layer's own shape gate (`ops::shape`) and tuning (`ops::tuned`).
 //!
+//! `--compare FILE [--fun NAME]` sets the main loop of a reference kernel
+//! beside tk3's, counted by the same [`svod_tk3::isa::main_loop`]: a
+//! `.cubin` (`nvdisasm -c`), an AMD code object `.co`/`.hsaco`
+//! (`llvm-objdump -d --symbolize-operands` for the target's mcpu), or a
+//! SASS/PTX/AMDGCN text; `--fun` picks one kernel of several (a cubin
+//! extracted from cuBLASLt holds dozens).
+//!
 //! `--arch` takes the SMs and dies of the first card of `svod_tk3::atoms::CARDS`
 //! of the architecture unless `--sms`/`--xcds` say otherwise; `--store` is a
 //! tune store directory copied from the card (its probe lines price the
@@ -39,6 +46,7 @@ use svod_dtype::{AmdArch, CudaArch, DType, GpuArch};
 use svod_tk3::atoms::{CARDS, Target};
 use svod_tk3::build::{BF16, F16};
 use svod_tk3::ir::Program;
+use svod_tk3::isa;
 use svod_tk3::kernels::attention::{AttnMask, AttnSpec, attention};
 use svod_tk3::kernels::conv::{ConvGeom, ConvSpec};
 use svod_tk3::kernels::gemm::{Epilogue, GemmSpec, gemm};
@@ -266,10 +274,22 @@ fn main() -> Result<()> {
         GpuArch::Amd(arch) => (amd(&out, &ir, arch)?, "AMDGCN"),
         GpuArch::Metal(_) => return Err("Metal renders no LLVM text".into()),
     };
-    if let Some((asm, what)) = asm.map(|a| (a, name)) {
-        histogram(&asm, what);
+    let ours = asm.and_then(|asm| histogram(&asm, name));
+    if let Some(path) = opt("--compare") {
+        let path = Path::new(path);
+        let theirs = reference(path, opt("--fun"), &target, &out)?;
+        let label = file_name(path);
+        let what = opt("--fun").map_or_else(|| label.clone(), |f| format!("{label}, function {f}"));
+        let theirs = isa::main_loop(&theirs).ok_or_else(|| format!("{what}: no loop issues a matrix instruction"))?;
+        let ours = ours.ok_or("tk3's kernel has no main loop to compare")?;
+        println!("main loop per trip, tk3's {name} against {what}:");
+        print!("{}", isa::table(&[("tk3", &ours), (&label, &theirs)]));
     }
     Ok(())
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 /// The ranked configs of a kernel plan; the fallback otherwise.
@@ -434,61 +454,66 @@ fn skip(what: &str, why: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// One assembly line: a label, or an instruction's opcode with its branch
-/// target, from SASS (`nvdisasm`), PTX or AMDGCN text alike.
-enum Line {
-    Label(String),
-    Op(String, Option<String>),
-}
-
-fn lines(asm: &str) -> Vec<Line> {
-    asm.lines()
-        .filter_map(|l| {
-            // SASS addresses and encodings sit in `/* */`, PTX comments follow
-            // `//`, AMDGCN's `;`, and SASS and PTX end a statement with `;`.
-            let mut s = l.split("//").next()?.to_string();
-            while let (Some(a), Some(b)) = (s.find("/*"), s.find("*/")) {
-                s.replace_range(a..b + 2, "");
-            }
-            let t = s.split(';').next()?.trim();
-            if t.ends_with(':') && !t.contains(char::is_whitespace) {
-                return Some(Line::Label(t.trim_end_matches(':').to_string()));
-            }
-            if t.is_empty() || t.starts_with(['.', '{', '}', '-']) {
-                return None;
-            }
-            let words: Vec<&str> = t.split_whitespace().filter(|w| !w.starts_with('@')).collect();
-            let op = words.first()?;
-            let branch = ["bra", "BRA", "s_branch", "s_cbranch"].iter().any(|b| op.starts_with(b));
-            let target = words.last().filter(|_| branch).map(|w| w.trim_matches(|c| "`(),".contains(c)).to_string());
-            Some(Line::Op(op.to_string(), target))
-        })
-        .collect()
-}
-
-/// The opcodes of the innermost loop (a backward branch's span) that issues
-/// a matrix instruction, by count: the main loop's step.
-fn histogram(asm: &str, what: &str) {
-    let lines = lines(asm);
-    let at = |name: &str| lines.iter().position(|l| matches!(l, Line::Label(n) if n == name));
-    let is_mma = |op: &str| op.contains("MMA") || op.contains("mma") || op.contains("mfma") || op.contains("wmma");
-    let loops = lines.iter().enumerate().filter_map(|(j, l)| match l {
-        Line::Op(_, Some(target)) => at(target).filter(|&i| i < j).map(|i| (i, j)),
-        _ => None,
-    });
-    let body = |(i, j): (usize, usize)| {
-        lines[i..=j].iter().filter_map(|l| if let Line::Op(op, _) = l { Some(op.as_str()) } else { None })
-    };
-    let Some((i, j)) = loops.filter(|&span| body(span).any(is_mma)).min_by_key(|(i, j)| j - i) else {
+/// The main loop of `asm` ([`isa::main_loop`]) on stdout, `what` naming its dialect.
+fn histogram(asm: &str, what: &str) -> Option<isa::MainLoop> {
+    let Some(main) = isa::main_loop(asm) else {
         println!("{what}: no loop issues a matrix instruction (the reduction unrolled whole?)");
-        return;
+        return None;
     };
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    body((i, j)).for_each(|op| *counts.entry(op).or_default() += 1);
-    let mut counts: Vec<(&str, usize)> = counts.into_iter().collect();
-    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-    println!("{what} main loop ({} instructions):", counts.iter().map(|c| c.1).sum::<usize>());
-    for (op, n) in counts {
+    println!("{what} main loop ({} instructions):", main.instructions());
+    for (op, n) in &main.ops {
         println!("  {n:>5} {op}");
     }
+    Some(main)
+}
+
+/// The reference kernel's assembly text: a cubin through `nvdisasm -c`, an
+/// AMD code object through `llvm-objdump -d --symbolize-operands` for the
+/// target's `mcpu`, any other file read as text (SASS, PTX, AMDGCN `.s`);
+/// cut to the function `fun`, which a text of several functions needs.
+fn reference(path: &Path, fun: Option<&str>, target: &Target, out: &Path) -> Result<String> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let text = match ext {
+        "cubin" => {
+            let nvdisasm = tool("nvdisasm").ok_or("a cubin is read by nvdisasm, which is not installed")?;
+            run(Command::new(nvdisasm).arg("-c").arg(path))?
+        }
+        "co" | "hsaco" | "o" | "elf" => {
+            let GpuArch::Amd(arch) = target.arch else {
+                return Err(format!("{}: an AMD code object compares with an AMD target", path.display()).into());
+            };
+            let objdump = rocm_tool("llvm-objdump").ok_or("an AMD code object is read by llvm-objdump")?;
+            let mcpu = format!("--mcpu={}", arch.mcpu());
+            run(Command::new(objdump).args(["-d", "--symbolize-operands", &mcpu]).arg(path))?
+        }
+        _ => std::fs::read_to_string(path)?,
+    };
+    let names = isa::functions(&text);
+    let text = match fun {
+        Some(name) => isa::function(&text, name)
+            .ok_or_else(|| format!("{}: no function {name}; it holds {names:?}", path.display()))?
+            .to_string(),
+        None if names.len() > 1 => {
+            let shown: Vec<&str> = names.iter().take(20).copied().collect();
+            return Err(format!("{}: {} functions, pick one with --fun: {shown:?}", path.display(), names.len()).into());
+        }
+        None => text,
+    };
+    write(out, &format!("reference.{}", if ext == "co" || ext == "hsaco" { "s" } else { "txt" }), text.as_bytes())?;
+    Ok(text)
+}
+
+/// A tool's stdout, an error with its stderr when it fails.
+fn run(command: &mut Command) -> Result<String> {
+    let done = command.output()?;
+    if !done.status.success() {
+        return Err(format!("{command:?}: {}", String::from_utf8_lossy(&done.stderr)).into());
+    }
+    Ok(String::from_utf8_lossy(&done.stdout).into_owned())
+}
+
+/// A ROCm LLVM tool on `PATH` or under `/opt/rocm/llvm/bin`.
+fn rocm_tool(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+    [PathBuf::from("/opt/rocm/llvm/bin")].into_iter().chain(path).map(|d| d.join(name)).find(|p| p.is_file())
 }
