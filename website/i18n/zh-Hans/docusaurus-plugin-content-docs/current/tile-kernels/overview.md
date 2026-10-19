@@ -6,7 +6,7 @@ sidebar_label: 概览
 
 Svod 的优化器通过搜索循环变换，为模型的大部分计算找到快速的调度。但有些内核无法用这种方式找到。Flash attention 是一个递推：每个键块都要更新运行中的最大值与和，并重新缩放累加器，因此不存在一个可以直接分块的归约。张量核心 GPU 上的快速 GEMM 依赖多级 `cp.async` 环形缓冲、`ldmatrix` 片段加载以及带 swizzle 的共享内存布局，这些都不是循环搜索中的步骤。这类内核需要手写，而 `svod-tk3`（“tk3”）就是编写它们的 crate。
 
-tk3 取代 tk1（`svod-tk`），成为模型手写内核的来源；已经没有模型再调用 tk1，`tk/` 仍保留在代码树中。有八个模型运行在算子层上：Nemotron-3-Diarization、Whisper（编码器，以及缓存模式下解码器步骤中的注意力）、ModernBERT、BGE-M3/XLM-RoBERTa、Qwen3-Embedding、GigaAM、WavLM 和 YOLO26（通道在后布局，其 3×3 卷积使用 `ops::conv2d`）。
+tk3 是唯一的 tile 内核 crate。它取代了 tk1（`svod-tk`），tk1 已连同其 k-means、kNN 和 Apple 内核一起移除，这些内核均未移植。有八个模型运行在算子层上：Nemotron-3-Diarization、Whisper（编码器，以及缓存模式下解码器步骤中的注意力）、ModernBERT、BGE-M3/XLM-RoBERTa、Qwen3-Embedding、GigaAM、WavLM 和 YOLO26（通道在后布局，其 3×3 卷积使用 `ops::conv2d`）。
 
 ## tk3 是什么 {#what-tk3-is}
 

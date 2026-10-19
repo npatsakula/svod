@@ -182,7 +182,6 @@ Morok — прежнее название Svod.
 | [`device`](https://github.com/npatsakula/svod/tree/main/device/) | Буферы, аллокаторы, mmap, драйверы KFD, CUDA и Metal, аппаратные графы |
 | [`runtime`](https://github.com/npatsakula/svod/tree/main/runtime/) | Компиляция ядер, кэширование, планы выполнения и профилировщик |
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | Ленивый тензорный API, модули `nn` и планировщик памяти |
-| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | Tile-DSL ядер (tk1), модели его больше не вызывают |
 | [`tk3`](https://github.com/npatsakula/svod/tree/main/tk3/) | Тайловый язык, библиотека ядер, планировщик и тюнер за слоем операций |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | Импортёр ONNX |
 | [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | Хост-декодеры, VAD-сегментация и аудио-пайплайны |
@@ -265,8 +264,7 @@ cargo test --workspace --features z3,proptest
   ядер, чтобы модель стартовала мгновенно и работала там, где компилятора нет
   (например, WASM).
 - **Примитивы анализа данных:** GPU-ядра в стиле FlashAttention для k-means,
-  kNN, PCA, SVD, (H)DBSCAN, UMAP и t-SNE на всех бэкендах. k-means и kNN уже
-  есть в `tk`.
+  kNN, PCA, SVD, (H)DBSCAN, UMAP и t-SNE на всех бэкендах.
 - **Формальная верификация сгенерированного кода:** аннотированный C-вывод,
   доказывающий отсутствие выходов за границы массивов и lossy-приведений.
 - **Больше оборудования:** серверные (MI300–MI450, H100–B200), потребительские

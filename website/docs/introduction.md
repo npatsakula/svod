@@ -179,7 +179,6 @@ Morok was Svod's earlier name.
 | [`device`](https://github.com/npatsakula/svod/tree/main/device/) | Buffers, allocators, mmap, KFD, CUDA and Metal drivers, hardware graphs |
 | [`runtime`](https://github.com/npatsakula/svod/tree/main/runtime/) | Kernel compilation, caching, execution plans and the profiler |
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | Lazy tensor API, `nn` modules and the memory planner |
-| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | Tile kernel DSL (tk1), no longer called by the models |
 | [`tk3`](https://github.com/npatsakula/svod/tree/main/tk3/) | Tile language, kernel library, planner and tuner behind the op layer |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX importer |
 | [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | Host-side decoders, VAD segmentation and audio pipelines |
@@ -260,8 +259,7 @@ CPU kernels.
 - **AOT compilation:** serialize optimized graphs and compiled kernels, so a
   model starts instantly and runs where no compiler is available (e.g. WASM).
 - **Data analysis primitives:** FlashAttention-style GPU kernels for k-means,
-  kNN, PCA, SVD, (H)DBSCAN, UMAP and t-SNE on every backend. k-means and kNN
-  already ship in `tk`.
+  kNN, PCA, SVD, (H)DBSCAN, UMAP and t-SNE on every backend.
 - **Formal verification of generated code:** annotated C output that proves
   the absence of out-of-bounds accesses and lossy casts.
 - **More hardware:** server (MI300–MI450, H100–B200), consumer (Ryzen AI,

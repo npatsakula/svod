@@ -175,7 +175,6 @@ Morok was Svod's earlier name.
 | [`device`](device/) | Buffers, allocators, mmap, KFD, CUDA and Metal drivers, hardware graphs |
 | [`runtime`](runtime/) | Kernel compilation, caching, execution plans and the profiler |
 | [`tensor`](tensor/) | Lazy tensor API, `nn` modules and the memory planner |
-| [`tk`](tk/) | Tile kernel DSL (tk1), no longer called by the models |
 | [`tk3`](tk3/) | Tile language, kernel library, planner and tuner behind the op layer |
 | [`onnx`](onnx/) | ONNX importer |
 | [`arch`](arch/) | Host-side decoders, VAD segmentation and audio pipelines |
@@ -256,8 +255,7 @@ CPU kernels.
 - **AOT compilation:** serialize optimized graphs and compiled kernels, so a
   model starts instantly and runs where no compiler is available (e.g. WASM).
 - **Data analysis primitives:** FlashAttention-style GPU kernels for k-means,
-  kNN, PCA, SVD, (H)DBSCAN, UMAP and t-SNE on every backend. k-means and kNN
-  already ship in `tk`.
+  kNN, PCA, SVD, (H)DBSCAN, UMAP and t-SNE on every backend.
 - **Formal verification of generated code:** annotated C output that proves
   the absence of out-of-bounds accesses and lossy casts.
 - **More hardware:** server (MI300–MI450, H100–B200), consumer (Ryzen AI,

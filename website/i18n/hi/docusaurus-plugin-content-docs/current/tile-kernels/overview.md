@@ -11,8 +11,8 @@ Svod का ऑप्टिमाइज़र किसी मॉडल के �
 `ldmatrix` fragment loads और swizzled shared layout पर टिका होता है, और ये loop search के कदम नहीं
 हैं। ऐसे कर्नेल हाथ से लिखे जाते हैं, और `svod-tk3` ("tk3") उन्हें लिखने का crate है।
 
-मॉडलों के hand kernels के स्रोत के रूप में tk3 ने tk1 (`svod-tk`) की जगह ले ली है; अब कोई मॉडल tk1 को
-नहीं बुलाता, और `tk/` tree में बना रहता है। आठ मॉडल op layer पर चलते हैं: Nemotron-3-Diarization,
+tk3 एकमात्र tile-kernel crate है। इसने tk1 (`svod-tk`) की जगह ली, जिसे उसके k-means, kNN और
+Apple कर्नेल के साथ हटा दिया गया; इनमें से किसी को port नहीं किया गया। आठ मॉडल op layer पर चलते हैं: Nemotron-3-Diarization,
 Whisper (encoder, और cache mode में decoder step का attention), ModernBERT,
 BGE-M3/XLM-RoBERTa, Qwen3-Embedding, GigaAM, WavLM और YOLO26 (channels-last, जिसके 3×3
 convolutions `ops::conv2d` पर चलते हैं)।

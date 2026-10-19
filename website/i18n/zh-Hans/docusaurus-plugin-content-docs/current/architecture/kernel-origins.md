@@ -83,7 +83,7 @@ self.vad.probs(waveform)?;
 
 ### 手写内核 {#hand-written-kernels}
 
-手写内核（`tk3`，或 tk1 的 `tk`）按其构建时活跃的作用域归属——与图内核规则相同。调度器从不看到它的内核体，因此 `UOp::custom_kernel` 在构造时就收集并剥除来源（`ir/src/uop/constructors/graph.rs`）；两个层启动同一个手写内核，仍共享同一个编译后的程序。它拷入的输入继承其生产者的来源。
+手写内核（`tk3`）按其构建时活跃的作用域归属——与图内核规则相同。调度器从不看到它的内核体，因此 `UOp::custom_kernel` 在构造时就收集并剥除来源（`ir/src/uop/constructors/graph.rs`）；两个层启动同一个手写内核，仍共享同一个编译后的程序。它拷入的输入继承其生产者的来源。
 
 ---
 

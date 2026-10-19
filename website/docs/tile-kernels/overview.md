@@ -11,8 +11,8 @@ reduction to tile. A fast GEMM on a tensor-core GPU depends on a multi-stage `cp
 `ldmatrix` fragment loads and a swizzled shared layout, which are not steps of a loop search.
 Kernels like these are written by hand, and `svod-tk3` ("tk3") is the crate for writing them.
 
-tk3 replaces tk1 (`svod-tk`) as the source of the models' hand kernels; no model calls tk1 any
-more, and `tk/` stays in the tree. Eight models run on the op layer: Nemotron-3-Diarization,
+tk3 is the only tile-kernel crate. It replaced tk1 (`svod-tk`), which was removed together with
+its k-means, kNN and Apple kernels; none of them was ported. Eight models run on the op layer: Nemotron-3-Diarization,
 Whisper (the encoder, and the decoder step's attention in cache mode), ModernBERT,
 BGE-M3/XLM-RoBERTa, Qwen3-Embedding, GigaAM, WavLM and YOLO26 (channels-last, its 3×3
 convolutions on `ops::conv2d`).

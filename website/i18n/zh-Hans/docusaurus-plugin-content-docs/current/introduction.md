@@ -165,7 +165,6 @@ Morok 是 Svod 之前的名字。
 | [`device`](https://github.com/npatsakula/svod/tree/main/device/) | 缓冲区、分配器、mmap、KFD、CUDA 和 Metal 驱动、硬件图 |
 | [`runtime`](https://github.com/npatsakula/svod/tree/main/runtime/) | 内核编译、缓存、执行计划和性能分析器 |
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | 惰性张量 API、`nn` 模块和内存规划器 |
-| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | Tile 内核 DSL（tk1），模型已不再调用 |
 | [`tk3`](https://github.com/npatsakula/svod/tree/main/tk3/) | 算子层背后的 tile 语言、内核库、规划器和调优器 |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX 导入器 |
 | [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | 宿主端解码器、VAD 分段和音频流水线 |
@@ -245,7 +244,7 @@ cargo test --workspace --features z3,proptest
 - **AOT 编译：**序列化优化后的图和已编译的内核，使模型即时启动，并能在没有编译器
   的环境（例如 WASM）中运行。
 - **数据分析原语：**面向 k-means、kNN、PCA、SVD、(H)DBSCAN、UMAP 和 t-SNE 的
-  FlashAttention 风格 GPU 内核，覆盖所有后端。k-means 和 kNN 已随 `tk` 提供。
+  FlashAttention 风格 GPU 内核，覆盖所有后端。
 - **生成代码的形式化验证：**带注解的 C 输出，证明不存在越界访问和有损转换。
 - **更多硬件：**服务器（MI300–MI450、H100–B200）、消费级（Ryzen AI、Apple M3–M5、
   RTX 30–50）和嵌入式（Snapdragon X、RK3588）目标统一在一个张量 API 之后，外加一个

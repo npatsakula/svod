@@ -176,7 +176,6 @@ Morok Svod का पुराना नाम था।
 | [`device`](https://github.com/npatsakula/svod/tree/main/device/) | बफ़र, एलोकेटर, mmap, KFD, CUDA और Metal ड्राइवर, हार्डवेयर ग्राफ़ |
 | [`runtime`](https://github.com/npatsakula/svod/tree/main/runtime/) | कर्नेल कंपाइलेशन, कैशिंग, एक्ज़ीक्यूशन प्लान और प्रोफ़ाइलर |
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | लेज़ी टेंसर API, `nn` मॉड्यूल और मेमोरी प्लानर |
-| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | टाइल कर्नेल DSL (tk1), जिसे अब मॉडल नहीं बुलाते |
 | [`tk3`](https://github.com/npatsakula/svod/tree/main/tk3/) | op layer के पीछे की टाइल लैंग्वेज, कर्नेल लाइब्रेरी, प्लानर और ट्यूनर |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX इम्पोर्टर |
 | [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | होस्ट-साइड डिकोडर, VAD सेगमेंटेशन और ऑडियो पाइपलाइन |
@@ -257,7 +256,7 @@ cargo test --workspace --features z3,proptest
 - **AOT कंपाइलेशन:** ऑप्टिमाइज़्ड ग्राफ़ और कंपाइल किए गए कर्नेल को सीरियलाइज़ करना,
   ताकि मॉडल तुरंत शुरू हो और वहाँ भी चले जहाँ कोई कंपाइलर उपलब्ध नहीं (जैसे WASM)।
 - **डेटा विश्लेषण प्रिमिटिव:** हर बैकएंड पर k-means, kNN, PCA, SVD, (H)DBSCAN, UMAP और
-  t-SNE के लिए FlashAttention-शैली के GPU कर्नेल। k-means और kNN पहले से `tk` में हैं।
+  t-SNE के लिए FlashAttention-शैली के GPU कर्नेल।
 - **जनरेट किए गए कोड का औपचारिक सत्यापन:** एनोटेटेड C आउटपुट जो आउट-ऑफ़-बाउंड्स
   एक्सेस और लॉसी कास्ट की अनुपस्थिति सिद्ध करता है।
 - **और हार्डवेयर:** सर्वर (MI300–MI450, H100–B200), कंज़्यूमर (Ryzen AI, Apple M3–M5,
