@@ -5,6 +5,7 @@
 //! instructions are atoms that bring their own layouts, and the lowering emits a
 //! pre-linearized instruction list so no toposort ever decides the order.
 
+pub mod atoms;
 pub mod build;
 pub mod interp;
 pub mod ir;

@@ -12,6 +12,7 @@ svod-dtype = { path = "../dtype", version = "=0.2.0" }
 svod-ir = { path = "../ir", version = "=0.2.0" }
 smallvec = { workspace = true }
 snafu = "0.9"
+svod-schedule = { path = "../schedule", version = "=0.2.0" }
 
 [dev-dependencies]
 proptest = "1.9"
