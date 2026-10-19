@@ -305,6 +305,11 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
     AttnSpec { cfg, ..spec }
 }
 
+/// The program in the interpreter against a direct f64 softmax, and on a
+/// device its lowered kernel against the program, the ring as deep as the
+/// device's fill runs (register staging: two slots at most): every mask form,
+/// ragged blocks, caches, appended rows, splits, key warps and two atom rows
+/// a warp.
 #[test_case(spec(64, 64, 64, 64, 64, false, false), &[64, 64]; "one block")]
 #[test_case(spec(128, 192, 64, 64, 64, false, false), &[192, 192]; "three key blocks")]
 #[test_case(spec(128, 128, 64, 64, 64, true, false), &[128, 128]; "causal")]
@@ -341,8 +346,56 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(with(rows32(128, 64), masked(100, 150, 64, 128, 64, AttnMask { key_lens: true, ..PER_BATCH })), &[150, 77]; "two atom rows a warp, bias")]
 #[test_case(with(rows32(64, 32), masked(100, 150, 64, 64, 32, AttnMask { causal: true, key_lens: true, ..PER_BATCH })), &[150, 77]; "two atom rows a warp, causal bias")]
 #[test_case(with(FaCfg { stages: 1, ..rows32(64, 32) }, spec(100, 150, 64, 64, 32, true, true)), &[150, 77]; "two atom rows a warp, one slot")]
-fn program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
-    matches_a_direct_softmax(&case(spec, lens));
+#[test_case(cached(1, 100, [4, 4, 64], false, 0, 1), &[100, 37]; "cache slice")]
+#[test_case(cached(1, 100, [4, 2, 64], true, 1, 1), &[100, 37]; "row map, appended, gqa")]
+#[test_case(cached(1, 200, [4, 4, 64], true, 1, 4), &[200, 70]; "four splits")]
+#[test_case(cached(5, 96, [2, 2, 128], false, 1, 2), &[64, 96]; "d 128, two splits, five queries")]
+#[test_case(cached(1, 64, [2, 2, 64], false, 0, 4), &[64, 40]; "more splits than blocks for a row")]
+#[test_case(cached(1, 7, [6, 6, 64], false, 1, 1), &[0, 7]; "appended row only, one split")]
+#[test_case(cached(1, 7, [6, 6, 64], false, 1, 2), &[0, 3]; "appended row only, two splits")]
+#[test_case(cached(8, 128, [4, 4, 48], false, 8, 1), &[128, 40]; "eight queries, eight appended, d 48")]
+#[test_case(cached(16, 128, [2, 2, 64], true, 16, 2), &[128, 0]; "sixteen appended, a block of them, two splits")]
+#[test_case(counted(cached(8, 128, [4, 4, 48], false, 8, 1)), &[128, 40]; "counted appended rows")]
+#[test_case(counted(cached(16, 96, [2, 2, 64], false, 16, 3)), &[0, 96]; "counted appended rows only, three splits")]
+#[test_case(biased(cached(1, 100, [4, 2, 64], true, 1, 1)), &[100, 37]; "biased: row map, appended, gqa")]
+#[test_case(biased(cached(5, 96, [2, 2, 128], false, 1, 2)), &[64, 96]; "biased: d 128, two splits")]
+#[test_case(biased(cached(1, 200, [4, 4, 64], false, 0, 4)), &[200, 70]; "biased: four splits")]
+#[test_case(biased(counted(cached(8, 64, [2, 2, 64], false, 8, 2))), &[64, 20]; "biased: counted appended rows")]
+#[test_case(cached(1, 100, [4, 4, 64], false, 0, 1), &[100, 0]; "a cached lane with no keys")]
+#[test_case(cached(1, 200, [4, 4, 64], false, 0, 4), &[0, 70]; "a cached lane with no keys, four splits")]
+#[test_case(scaled(cached(1, 200, [4, 4, 64], true, 1, 4), -0.1), &[200, 70]; "four splits merge a negative scale's partial maxima")]
+#[test_case(with(RAW_MAX, cached(1, 200, [4, 4, 64], true, 1, 4)), &[200, 70]; "four splits merge raw partial maxima in the exponent's units")]
+#[test_case(with(RAW_MAX, biased(cached(5, 96, [2, 2, 128], false, 1, 2))), &[64, 96]; "biased, two splits: the maximum stays in the exponent's units")]
+#[test_case(with(key_warps(4, 16), cached(1, 200, [4, 2, 64], true, 1, 1)), &[200, 37]; "four key warps: row map, appended, gqa")]
+#[test_case(with(FaCfg { splits: 3, ..key_warps(2, 32) }, cached(1, 200, [4, 4, 64], true, 1, 1)), &[200, 70]; "two key warps under three splits")]
+#[test_case(with(key_warps(4, 16), counted(cached(16, 128, [2, 2, 64], true, 16, 1))), &[128, 0]; "four key warps, sixteen counted appended rows")]
+#[test_case(with(key_warps(2, 64), cached(1, 7, [6, 6, 64], false, 1, 1)), &[0, 7]; "two key warps, the appended row only")]
+#[test_case(with(key_warps(4, 16), biased(cached(5, 96, [2, 2, 128], false, 1, 1))), &[64, 96]; "four key warps, biased, d 128")]
+#[test_case(spec(128, 128, 64, 64, 64, false, false), &[128, 128]; "plain")]
+#[test_case(spec(256, 256, 64, 64, 64, true, false), &[256, 256]; "causal, 256 queries")]
+#[test_case(spec(128, 256, 64, 64, 64, false, true), &[200, 33]; "key lengths, 256 keys")]
+#[test_case(spec(128, 128, 128, 64, 32, true, true), &[128, 64]; "d 128, causal with lengths")]
+#[test_case(with(RAW_MAX, spec(128, 128, 128, 0, 0, true, true)), &[128, 64]; "d 128, the RDNA prefill forms")]
+#[test_case(with(FaCfg::new(128, 64, 3), spec(256, 192, 64, 0, 0, true, true)), &[192, 70]; "bq 128, three stages")]
+#[test_case(with(FaCfg::new(128, 32, 2), spec(200, 130, 128, 0, 0, false, true)), &[130, 99]; "d 128, bq 128, ragged")]
+#[test_case(masked(100, 100, 64, 64, 64, KEY_MASK), &[100, 100]; "key mask, ragged")]
+#[test_case(masked(128, 128, 128, 64, 32, EVERY), &[128, 100]; "every mask, d 128")]
+#[test_case(with(FaCfg::new(64, 64, 3), masked(200, 200, 48, 0, 0, SEGMENTS)), &[200, 200]; "d 48, three stages")]
+#[test_case(with(FaCfg::new(64, 64, 2), cached(8, 128, [4, 4, 48], false, 8, 1)), &[128, 40]; "cache: eight appended, d 48")]
+#[test_case(counted(cached(16, 128, [2, 2, 64], true, 16, 2)), &[128, 0]; "cache: sixteen counted appended, two splits")]
+#[test_case(with(FaCfg { splits: 3, ..FaCfg::new(16, 64, 2) }, cached(1, 1500, [4, 4, 64], true, 0, 1)), &[1500, 1200]; "cache: bq 16, three splits of 1500 keys")]
+#[test_case(masked(256, 256, 64, 64, 64, CAUSAL_BIAS), &[256, 256]; "causal bias, 256 queries")]
+#[test_case(with(FaCfg::new(128, 32, 2), masked(200, 130, 128, 0, 0, LENS_BIAS)), &[130, 99]; "d 128 bias with lengths, bq 128")]
+#[test_case(masked(128, 128, 128, 64, 32, EVERY_BIAS), &[128, 100]; "every mask and a bias, d 128")]
+#[test_case(biased(counted(cached(5, 96, [2, 2, 128], false, 8, 2))), &[64, 96]; "cache biased: d 128, eight counted appended, two splits")]
+fn attention_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
+    matches_a_direct_softmax(&case(spec.clone(), lens));
+    let Some(target) = super::device_target() else { return };
+    let spec = AttnSpec { cfg: FaCfg { stages: target.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
+    if !spec.cfg.fits(&target, spec.d, spec.mask.bias.is_some()) {
+        return eprintln!("skipped on the device: {:?} does not fit {}", spec.cfg, target.arch.target_name());
+    }
+    on_device(&spec, lens, target);
 }
 
 /// Scores that climb from key block to key block, through a bias ramp along
@@ -397,35 +450,6 @@ fn cached(
 fn counted(mut spec: AttnSpec) -> AttnSpec {
     spec.cache = spec.cache.map(|c| Cache { app_lens: true, ..c });
     spec
-}
-
-#[test_case(cached(1, 100, [4, 4, 64], false, 0, 1), &[100, 37]; "cache slice")]
-#[test_case(cached(1, 100, [4, 2, 64], true, 1, 1), &[100, 37]; "row map, appended, gqa")]
-#[test_case(cached(1, 200, [4, 4, 64], true, 1, 4), &[200, 70]; "four splits")]
-#[test_case(cached(5, 96, [2, 2, 128], false, 1, 2), &[64, 96]; "d 128, two splits, five queries")]
-#[test_case(cached(1, 64, [2, 2, 64], false, 0, 4), &[64, 40]; "more splits than blocks for a row")]
-#[test_case(cached(1, 7, [6, 6, 64], false, 1, 1), &[0, 7]; "appended row only, one split")]
-#[test_case(cached(1, 7, [6, 6, 64], false, 1, 2), &[0, 3]; "appended row only, two splits")]
-#[test_case(cached(8, 128, [4, 4, 48], false, 8, 1), &[128, 40]; "eight queries, eight appended, d 48")]
-#[test_case(cached(16, 128, [2, 2, 64], true, 16, 2), &[128, 0]; "sixteen appended, a block of them, two splits")]
-#[test_case(counted(cached(8, 128, [4, 4, 48], false, 8, 1)), &[128, 40]; "counted appended rows")]
-#[test_case(counted(cached(16, 96, [2, 2, 64], false, 16, 3)), &[0, 96]; "counted appended rows only, three splits")]
-#[test_case(biased(cached(1, 100, [4, 2, 64], true, 1, 1)), &[100, 37]; "biased: row map, appended, gqa")]
-#[test_case(biased(cached(5, 96, [2, 2, 128], false, 1, 2)), &[64, 96]; "biased: d 128, two splits")]
-#[test_case(biased(cached(1, 200, [4, 4, 64], false, 0, 4)), &[200, 70]; "biased: four splits")]
-#[test_case(biased(counted(cached(8, 64, [2, 2, 64], false, 8, 2))), &[64, 20]; "biased: counted appended rows")]
-#[test_case(cached(1, 100, [4, 4, 64], false, 0, 1), &[100, 0]; "a cached lane with no keys")]
-#[test_case(cached(1, 200, [4, 4, 64], false, 0, 4), &[0, 70]; "a cached lane with no keys, four splits")]
-#[test_case(scaled(cached(1, 200, [4, 4, 64], true, 1, 4), -0.1), &[200, 70]; "four splits merge a negative scale's partial maxima")]
-#[test_case(with(RAW_MAX, cached(1, 200, [4, 4, 64], true, 1, 4)), &[200, 70]; "four splits merge raw partial maxima in the exponent's units")]
-#[test_case(with(RAW_MAX, biased(cached(5, 96, [2, 2, 128], false, 1, 2))), &[64, 96]; "biased, two splits: the maximum stays in the exponent's units")]
-#[test_case(with(key_warps(4, 16), cached(1, 200, [4, 2, 64], true, 1, 1)), &[200, 37]; "four key warps: row map, appended, gqa")]
-#[test_case(with(FaCfg { splits: 3, ..key_warps(2, 32) }, cached(1, 200, [4, 4, 64], true, 1, 1)), &[200, 70]; "two key warps under three splits")]
-#[test_case(with(key_warps(4, 16), counted(cached(16, 128, [2, 2, 64], true, 16, 1))), &[128, 0]; "four key warps, sixteen counted appended rows")]
-#[test_case(with(key_warps(2, 64), cached(1, 7, [6, 6, 64], false, 1, 1)), &[0, 7]; "two key warps, the appended row only")]
-#[test_case(with(key_warps(4, 16), biased(cached(5, 96, [2, 2, 128], false, 1, 1))), &[64, 96]; "four key warps, biased, d 128")]
-fn cached_program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
-    program_matches_a_direct_softmax(spec, lens);
 }
 
 /// A batch whose key mask hides every key attends to nothing: its rows come
@@ -508,48 +532,6 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
     let reference = reference(&c);
     let worst = got.iter().zip(&reference).map(|(g, w)| (super::bf16(*g) - w).abs()).fold(0.0, f64::max);
     assert!(worst < 2e-2, "max abs diff {worst} against the reference");
-}
-
-/// `spec`'s kernel on the device against the program, its ring as deep as
-/// the device's fill runs (register staging: two slots at most).
-#[test_case(spec(64, 64, 64, 64, 64, false, false), &[64, 64]; "one key block")]
-#[test_case(spec(128, 128, 64, 64, 64, false, false), &[128, 128]; "plain")]
-#[test_case(spec(256, 256, 64, 64, 64, true, false), &[256, 256]; "causal")]
-#[test_case(spec(128, 256, 64, 64, 64, false, true), &[200, 33]; "key lengths")]
-#[test_case(spec(128, 128, 128, 64, 32, true, true), &[128, 64]; "d 128, causal with lengths")]
-#[test_case(with(RAW_MAX, spec(128, 128, 128, 0, 0, true, true)), &[128, 64]; "d 128, the RDNA prefill forms")]
-#[test_case(with(FaCfg::new(128, 64, 3), spec(256, 192, 64, 0, 0, true, true)), &[192, 70]; "bq 128, three stages")]
-#[test_case(with(FaCfg::new(128, 32, 2), spec(200, 130, 128, 0, 0, false, true)), &[130, 99]; "d 128, bq 128, ragged")]
-#[test_case(masked(128, 128, 64, 64, 32, WINDOW), &[128, 90]; "window with lengths")]
-#[test_case(masked(100, 100, 64, 64, 64, KEY_MASK), &[100, 100]; "key mask, ragged")]
-#[test_case(masked(128, 128, 64, 64, 32, SEGMENTS), &[128, 128]; "causal segments")]
-#[test_case(masked(128, 128, 64, 64, 32, CHUNKED), &[128, 90]; "chunks with lengths")]
-#[test_case(masked(100, 100, 64, 64, 64, CHUNKED_ALL), &[100, 100]; "chunks, every earlier one and one ahead, ragged")]
-#[test_case(masked(128, 128, 128, 64, 32, EVERY), &[128, 100]; "every mask, d 128")]
-#[test_case(with(FaCfg::new(64, 64, 3), masked(200, 200, 48, 0, 0, SEGMENTS)), &[200, 200]; "d 48, three stages")]
-#[test_case(cached(1, 100, [4, 2, 64], true, 1, 1), &[100, 37]; "cache: row map, appended, gqa")]
-#[test_case(cached(1, 200, [4, 4, 64], true, 1, 4), &[200, 70]; "cache: four splits")]
-#[test_case(cached(5, 96, [2, 2, 128], false, 1, 2), &[64, 96]; "cache: d 128, two splits")]
-#[test_case(cached(1, 7, [6, 6, 64], false, 1, 1), &[0, 7]; "cache: appended row only")]
-#[test_case(cached(1, 7, [6, 6, 64], false, 1, 2), &[0, 3]; "cache: appended row only, two splits")]
-#[test_case(with(FaCfg::new(64, 64, 2), cached(8, 128, [4, 4, 48], false, 8, 1)), &[128, 40]; "cache: eight appended, d 48")]
-#[test_case(counted(cached(16, 128, [2, 2, 64], true, 16, 2)), &[128, 0]; "cache: sixteen counted appended, two splits")]
-#[test_case(with(FaCfg { splits: 3, ..FaCfg::new(16, 64, 2) }, cached(1, 1500, [4, 4, 64], true, 0, 1)), &[1500, 1200]; "cache: bq 16, three splits of 1500 keys")]
-#[test_case(masked(128, 128, 64, 64, 64, PER_BATCH), &[128, 128]; "bias per batch")]
-#[test_case(masked(100, 130, 64, 64, 64, SHARED), &[130, 130]; "shared bias, ragged")]
-#[test_case(masked(256, 256, 64, 64, 64, CAUSAL_BIAS), &[256, 256]; "causal bias")]
-#[test_case(masked(99, 99, 64, 64, 64, LENS_BIAS), &[99, 41]; "bias with key lengths, odd keys")]
-#[test_case(with(FaCfg::new(128, 32, 2), masked(200, 130, 128, 0, 0, LENS_BIAS)), &[130, 99]; "d 128 bias with lengths, bq 128")]
-#[test_case(masked(128, 128, 128, 64, 32, EVERY_BIAS), &[128, 100]; "every mask and a bias, d 128")]
-#[test_case(biased(cached(1, 100, [4, 2, 64], true, 1, 1)), &[100, 37]; "cache biased: row map, appended, gqa")]
-#[test_case(biased(counted(cached(5, 96, [2, 2, 128], false, 8, 2))), &[64, 96]; "cache biased: d 128, eight counted appended, two splits")]
-fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
-    let Some(target) = super::device_target() else { return };
-    let spec = AttnSpec { cfg: FaCfg { stages: target.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
-    if !spec.cfg.fits(&target, spec.d, spec.mask.bias.is_some()) {
-        return eprintln!("skipped: {:?} does not fit {}", spec.cfg, target.arch.target_name());
-    }
-    on_device(&spec, lens, target);
 }
 
 /// The cache operand's first elements a decoder step never reads (its rows
