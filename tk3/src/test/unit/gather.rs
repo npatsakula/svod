@@ -15,6 +15,8 @@ use crate::atoms::{Target, sm86};
 use crate::build::*;
 use crate::interp::{round_to, run};
 use crate::ir::*;
+use crate::kernels::Batch;
+use crate::kernels::conv::{ConvSpec, conv};
 use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
 use crate::lower::{Lowering, lower};
@@ -200,20 +202,41 @@ fn loop_body(list: &[Arc<UOp>]) -> &[Arc<UOp>] {
     &list[start..end]
 }
 
-/// Whether `u` depends on the thread index.
-fn per_thread(u: &Arc<UOp>) -> bool {
-    u.toposort().iter().any(|s| matches!(s.op(), Op::Special(ops::Special { name, .. }) if name == "lidx0"))
+/// The per-thread divisions and remainders of `ops` (a row decode's).
+fn divisions(ops: &[Arc<UOp>]) -> usize {
+    let per_thread = |u: &Arc<UOp>| {
+        u.toposort().iter().any(|s| matches!(s.op(), Op::Special(ops::Special { name, .. }) if name == "lidx0"))
+    };
+    let division = |u: &&Arc<UOp>| {
+        matches!(u.op(), Op::Binary(UBinary::CDiv | UBinary::CMod | UBinary::FloorDiv | UBinary::FloorMod, ..))
+    };
+    ops.iter().filter(division).filter(|u| per_thread(u)).count()
 }
 
 const PIN: ([usize; 3], usize, [u32; 2]) = ([64, 64, 32], 2, [2, 2]);
 
-/// cp.async: every A chunk is one zero-filling copy, B keeps the plain
-/// form, and no per-thread division or remainder (the row decode) is left
-/// inside the loop.
-#[test]
-fn the_row_decode_is_hoisted_and_padding_rows_zero_fill() {
-    let (tile, stages, warps) = PIN;
-    let list = emitted(gathered_gemm(128, 64, 224, tile, stages, warps), Prefetch::CpAsync, warps);
+/// 192→192 3×3 at 40×40 over a three-slot ring of 64×64×32 tiles: the
+/// implicit GEMM's A rows are gathered.
+const CONV: ([usize; 3], usize, [u32; 2]) = ([64, 64, 32], 3, [2, 2]);
+
+fn conv_3x3((tile, stages, warps): ([usize; 3], usize, [u32; 2])) -> Program {
+    let cfg = crate::ops::config::gemm_cfg(tile, stages, warps, true);
+    let geom = super::conv::geom([40, 40], 192, 192, 3, 1, 1, 1);
+    let spec = ConvSpec { batch: Batch::Static(1), geom, epilogue: super::conv::SILU_BIAS, cfg, split: 1 };
+    conv::<F16>(&spec)
+}
+
+/// cp.async, for a gathered GEMM and a convolution's implicit one: the row
+/// decode of every A chunk sits before the loop, and inside it every A chunk
+/// is one zero-filling copy, B keeps the plain form, and no per-thread
+/// division or remainder is left.
+#[test_case(gathered_gemm(128, 64, 224, PIN.0, PIN.1, PIN.2), PIN; "a gathered GEMM")]
+#[test_case(conv_3x3(CONV), CONV; "a 3x3 convolution")]
+fn the_row_decode_is_hoisted_and_padding_rows_zero_fill(
+    prog: Program,
+    (tile, stages, warps): ([usize; 3], usize, [u32; 2]),
+) {
+    let list = emitted(prog, Prefetch::CpAsync, warps);
     let body = loop_body(&list);
     let threads = (warps[0] * warps[1] * 32) as usize;
     let copies = |suffix: &str| {
@@ -224,18 +247,9 @@ fn the_row_decode_is_hoisted_and_padding_rows_zero_fill() {
     let per_step = |rows: usize| rows * tile[2] / 8 / threads;
     assert_eq!(copies(".s"), per_step(tile[0]) * stages, "zero-filling A copies per unrolled loop");
     assert_eq!(copies(""), per_step(tile[1]) * stages, "plain B copies per unrolled loop");
-    let decode = |ops: &[Arc<UOp>]| -> Vec<Arc<UOp>> {
-        ops.iter()
-            .filter(|u| {
-                matches!(u.op(), Op::Binary(UBinary::CDiv | UBinary::CMod | UBinary::FloorDiv | UBinary::FloorMod, ..))
-            })
-            .filter(|u| per_thread(u))
-            .cloned()
-            .collect()
-    };
     let start = list.iter().position(|u| matches!(u.op(), Op::Range(..))).unwrap();
-    assert!(!decode(&list[..start]).is_empty(), "the row decode sits in the prologue");
-    assert!(decode(body).is_empty(), "per-thread division in the loop: {:?}", decode(body));
+    assert!(divisions(&list[..start]) > 0, "the row decode sits in the prologue");
+    assert_eq!(divisions(body), 0, "no per-thread division in the loop");
 }
 
 /// Register staging: every gathered run is an ungated load from a clamped

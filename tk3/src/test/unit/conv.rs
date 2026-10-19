@@ -1,12 +1,9 @@
 //! The implicit-GEMM convolution: the interpreter against an f64 direct
-//! convolution, the emitted program's row decode and fills on sm_86, and
-//! the config table's invariants.
-
-use std::sync::Arc;
+//! convolution, the config table's invariants, and the kernel on the device
+//! (its emitted row decode is `gather`'s).
 
 use proptest::prelude::*;
-use svod_dtype::{AmdArch, DType, DeviceSpec, GpuArch, ScalarDType};
-use svod_ir::{BinaryOp as UBinary, Op, UOp, ops};
+use svod_dtype::{AmdArch, DType, GpuArch, ScalarDType};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
@@ -14,12 +11,10 @@ use super::{conv_first_eight, declared, planner};
 use crate::atoms::{Target, sm86};
 use crate::build::F16;
 use crate::interp::{round_to, run};
-use crate::ir::Program;
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec, conv};
 use crate::kernels::gemm::{Core, Epilogue, GemmCfg};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch;
-use crate::lower::lower;
 use crate::ops::config::Planner;
 
 pub(super) fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, p: usize, d: usize) -> ConvGeom {
@@ -126,7 +121,7 @@ fn check_interp(g: ConvGeom, batch: Batch, epi: Epilogue, c: GemmCfg) {
     assert_close("y", got.last().unwrap(), &want, tolerance(epi));
 }
 
-const SILU_BIAS: Epilogue = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
+pub(super) const SILU_BIAS: Epilogue = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
 
 #[test_case(geom([5, 7], 16, 24, 3, 1, 1, 1), 2, SILU_BIAS, [32, 32, 16]; "3x3 same, ragged m and n")]
 #[test_case(geom([9, 8], 32, 48, 3, 2, 1, 1), 1, SILU_BIAS, [64, 48, 32]; "3x3 stride 2, 48-wide")]
@@ -215,51 +210,6 @@ proptest! {
         prop_assume!(g.out_hw().iter().all(|&d| d > 0));
         check_interp(g, Batch::Static(images), epi, cfg(tile, [2, 2], 2));
     }
-}
-
-// ---- the emitted program ---------------------------------------------------------
-
-fn emitted(prog: Program, c: GemmCfg) -> Vec<Arc<UOp>> {
-    let params =
-        prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
-    let lowered = lower(prog, &c.lowering(&declared(sm86())), params, DeviceSpec::Cuda { device_id: 0 }).unwrap();
-    let Op::Program(ops::Program { linear: Some(linear), .. }) = lowered.program.op() else { panic!("a program") };
-    let Op::Linear(ops::Linear { ops }) = linear.op() else { panic!("a linear list") };
-    ops.to_vec()
-}
-
-fn per_thread(u: &Arc<UOp>) -> bool {
-    u.toposort().iter().any(|s| matches!(s.op(), Op::Special(ops::Special { name, .. }) if name == "lidx0"))
-}
-
-fn divisions(ops: &[Arc<UOp>]) -> usize {
-    ops.iter()
-        .filter(|u| {
-            matches!(u.op(), Op::Binary(UBinary::CDiv | UBinary::CMod | UBinary::FloorDiv | UBinary::FloorMod, ..))
-        })
-        .filter(|u| per_thread(u))
-        .count()
-}
-
-/// 192→192 3×3 at 40×40 on 64×64×32: the `(b, oy, ox)` decode of every
-/// A chunk sits before the loop; inside it, each A chunk is one zero-filling
-/// copy and no per-thread division is left.
-#[test]
-fn the_conv_row_decode_sits_in_the_prologue() {
-    let c = cfg([64, 64, 32], [2, 2], 3);
-    let g = geom([40, 40], 192, 192, 3, 1, 1, 1);
-    let list =
-        emitted(conv::<F16>(&ConvSpec { batch: Batch::Static(1), geom: g, epilogue: SILU_BIAS, cfg: c, split: 1 }), c);
-    let start = list.iter().position(|u| matches!(u.op(), Op::Range(..))).unwrap();
-    let end = start + list[start..].iter().position(|u| matches!(u.op(), Op::End(..))).unwrap();
-    let body = &list[start..end];
-    assert!(divisions(&list[..start]) > 0, "the decode is in the prologue");
-    assert_eq!(divisions(body), 0, "no per-thread division in the loop");
-    let zfill = body
-        .iter()
-        .filter(|u| matches!(u.op(), Op::Custom(ops::Custom { code, .. }) if code.contains("global.16.s(ptr")))
-        .count();
-    assert_eq!(zfill, 64 * 32 / 8 / 128 * 3, "one zero-filling copy per A chunk per unrolled step");
 }
 
 // ---- configs ---------------------------------------------------------------------
