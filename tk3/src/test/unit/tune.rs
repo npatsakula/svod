@@ -45,20 +45,23 @@ fn timed<'a>(ns: &'a [Option<u64>], ran: &'a Cell<bool>) -> impl FnOnce() -> Vec
     }
 }
 
-/// The fastest is stored; a second store on the directory reads it back
-/// without measuring; a kernel change (another program fingerprint) re-measures.
+/// The fastest is stored, its line holding the candidates that ran in timed
+/// order with their times (one that did not run left out), so a later process
+/// knows the leaders and how close they ran; a second store on the directory
+/// reads it back without measuring; a kernel change (another program
+/// fingerprint) re-measures.
 #[test]
 fn a_winner_round_trips_through_the_store() {
     let dir = scratch("round-trip");
     let k = key(&[1, 704, 512, 512], &[1, 2, 3]);
     let ran = Cell::new(false);
-    let chosen = TuneStore::at(Some(dir.clone())).select(&k, 3, || 7, timed(&[Some(300), Some(100), None], &ran));
-    assert_eq!((chosen, ran.get()), (Some(1), true));
-    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 1 100 0 300\n", k.line(Kind::Choice, 7)));
+    let chosen = TuneStore::at(Some(dir.clone())).select(&k, 3, || 7, timed(&[Some(300), None, Some(100)], &ran));
+    assert_eq!((chosen, ran.get()), (Some(2), true));
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 2 100 0 300\n", k.line(Kind::Choice, 7)));
 
     let again = TuneStore::at(Some(dir.clone()));
     let ran = Cell::new(false);
-    assert_eq!((again.select(&k, 3, || 7, timed(&[None; 3], &ran)), ran.get()), (Some(1), false));
+    assert_eq!((again.select(&k, 3, || 7, timed(&[None; 3], &ran)), ran.get()), (Some(2), false));
 
     let changed = TuneStore::at(Some(dir.clone()));
     let ran = Cell::new(false);
@@ -190,23 +193,6 @@ fn a_store_hit_compiles_nothing() {
     let mut bench = Bench::default();
     let hit = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
     assert_eq!((hit.map(|timed| timed[0].0), builds.get(), bench.built.len()), (stored, 2, 0));
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// A choice line holds the candidates that ran in timed order, each with
-/// its time, so a later process knows the leaders and how close they ran.
-#[test]
-fn a_choice_line_holds_the_timed_order() {
-    let dir = scratch("order");
-    let k = key(&[16, 16, 16], &[0, 1, 2]);
-    assert_eq!(TuneStore::at(Some(dir.clone())).select(&k, 3, || 1, || vec![Some(9), None, Some(4)]), Some(2));
-    let text = std::fs::read_dir(&dir)
-        .expect("a store dir")
-        .filter_map(|e| std::fs::read_to_string(e.ok()?.path()).ok())
-        .find(|t| t.contains("choice|"))
-        .expect("a store file");
-    let line = text.lines().find(|l| l.starts_with("choice|")).expect("a choice line");
-    assert!(line.ends_with(" 2 4 0 9"), "{line}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
