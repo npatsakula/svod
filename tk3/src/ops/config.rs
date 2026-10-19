@@ -11,12 +11,13 @@ use crate::kernels::rows::NormCfg;
 
 /// Targets with tables: `mma.sync` + `cp.async` + `ldmatrix` (sm_80+, measured
 /// on sm_86; Hopper and Blackwell run the same path, no wgmma or TMA), and
-/// RDNA3/RDNA3.5/RDNA4 WMMA with register-staged fills (conservative tiles,
-/// compiled but not yet measured).
+/// AMD matrix cores with register-staged fills: RDNA3/RDNA3.5/RDNA4 WMMA and
+/// CDNA3/4 MFMA 16×16×16 on wave64 (conservative tiles, compiled but not yet
+/// measured).
 pub fn has_tables(target: &Target) -> bool {
     match target.arch {
         GpuArch::Cuda(c) => c.major >= 8,
-        GpuArch::Amd(a) => a.is_rdna3() || a.is_rdna3_5() || a.is_rdna4(),
+        GpuArch::Amd(a) => a.has_matrix_cores(),
         GpuArch::Metal(_) => false,
     }
 }
@@ -53,11 +54,11 @@ const GEMM_FAMILIES: [GemmCfg; 4] = [
     gemm_cfg([64, 64, 32], 3, [2, 2], true),
 ];
 
-/// RDNA output tiles, largest first, on the register-staged two-slot ring:
+/// AMD output tiles (RDNA and CDNA), largest first, on the register-staged two-slot ring:
 /// a wave's sub-tile stays at most 64×32 (eight 16×16 accumulators) so the
 /// accumulators, both operand fragments and the staged fill fit in the
-/// wave32 register file. Unmeasured: the tune store picks among them.
-const GEMM_FAMILIES_RDNA: [GemmCfg; 4] = [
+/// wave32 register file (CDNA has twice that). Unmeasured: the tune store picks among them.
+const GEMM_FAMILIES_AMD: [GemmCfg; 4] = [
     gemm_cfg([128, 128, 32], 2, [2, 4], false),
     gemm_cfg([128, 64, 32], 2, [2, 2], true),
     gemm_cfg([64, 128, 32], 2, [2, 2], true),
@@ -66,7 +67,7 @@ const GEMM_FAMILIES_RDNA: [GemmCfg; 4] = [
 
 fn gemm_families(target: &Target) -> &'static [GemmCfg] {
     match target.arch {
-        GpuArch::Amd(_) => &GEMM_FAMILIES_RDNA,
+        GpuArch::Amd(_) => &GEMM_FAMILIES_AMD,
         _ => &GEMM_FAMILIES,
     }
 }
@@ -232,7 +233,7 @@ pub fn conv_candidates(target: &Target, batches: usize, m: usize, g: &ConvGeom) 
 /// leave room for several per SM.
 pub fn attention_candidates(target: &Target, d: usize, t: usize) -> Vec<FaCfg> {
     if let GpuArch::Amd(_) = target.arch {
-        return rdna_attention_candidates(target, d, t);
+        return amd_attention_candidates(target, d, t);
     }
     let fa = FaCfg::new;
     let list = match (d, t <= 16) {
@@ -247,12 +248,12 @@ pub fn attention_candidates(target: &Target, d: usize, t: usize) -> Vec<FaCfg> {
     list.into_iter().filter(|c| c.smem_bytes(d) <= target.smem_bytes).collect()
 }
 
-/// RDNA attention on the two-slot register-staged ring. The score tile
+/// AMD attention on the two-slot register-staged ring. The score tile
 /// reaches the P·V product through shared memory (the WMMA accumulator is
 /// not the operand layout), so that `bq × bkv` f32 scratch counts against
 /// the 64 KB of LDS too; the K/V fill must split into whole 16-byte chunks
 /// per thread. Unmeasured: the tune store picks among them.
-fn rdna_attention_candidates(target: &Target, d: usize, t: usize) -> Vec<FaCfg> {
+fn amd_attention_candidates(target: &Target, d: usize, t: usize) -> Vec<FaCfg> {
     let fa = FaCfg::new;
     let list = match (d, t <= 16) {
         (48 | 64 | 128, true) => vec![fa(16, 32, 2), fa(16, 16, 2), fa(16, 64, 2)],
