@@ -307,7 +307,8 @@ impl Target {
         };
         let (cp_async, ldmatrix, smem_bytes) = match arch {
             GpuArch::Cuda(c) => (c.major >= 8, (c.major, c.minor) >= (7, 5), c.max_shared_per_block_optin()),
-            GpuArch::Amd(_) => (false, false, 64 << 10),
+            // A workgroup's LDS: 160 KB on gfx950, 64 KB on the others.
+            GpuArch::Amd(a) => (false, false, if a == AmdArch::Gfx950 { 160 << 10 } else { 64 << 10 }),
             GpuArch::Metal(_) => (false, false, 32 << 10),
         };
         let commit_fence = matches!(arch, GpuArch::Amd(a) if a.is_rdna4());
@@ -362,6 +363,18 @@ impl Target {
             lane_move,
             hardware_exp2,
         }
+    }
+
+    /// The target of a card this machine has no device for: what
+    /// [`Self::for_device`] reports for it, the architecture's facts with the
+    /// card's SMs (CUs) and the dies its dispatch spreads blocks over.
+    pub fn offline(arch: GpuArch, sms: u32, xcds: u32) -> Self {
+        Self { sms: Some(sms), xcds, ..Self::for_arch(arch) }
+    }
+
+    /// The [`Self::offline`] target of a card of [`CARDS`] by name.
+    pub fn card(name: &str) -> Option<Self> {
+        CARDS.iter().find(|c| c.0 == name).map(|&(_, arch, sms, xcds)| Self::offline(arch, sms, xcds))
     }
 
     /// The target behind a device, when the backend reports its architecture.
@@ -568,7 +581,25 @@ impl Costs {
     }
 }
 
+const fn sm(major: u8, minor: u8) -> GpuArch {
+    GpuArch::Cuda(CudaArch { major, minor })
+}
+
+/// Cards as a device query reports them: name, architecture, SMs (CUs) and
+/// dies (CDNA's XCDs).
+pub const CARDS: [(&str, GpuArch, u32, u32); 9] = [
+    ("rtx3060", sm(8, 6), 28, 1),
+    ("h100-pcie", sm(9, 0), 114, 1),
+    ("h100-sxm", sm(9, 0), 132, 1),
+    ("rtx5070", sm(12, 0), 48, 1),
+    ("rtx5090", sm(12, 0), 170, 1),
+    ("mi300x", GpuArch::Amd(AmdArch::Gfx942), 304, 8),
+    ("mi355x", GpuArch::Amd(AmdArch::Gfx950), 256, 8),
+    ("rx9070xt", GpuArch::Amd(AmdArch::Gfx1201), 64, 1),
+    ("strix-halo", GpuArch::Amd(AmdArch::Gfx1151), 40, 1),
+];
+
 /// The CUDA sm_86 target of the development machine's RTX 3060 (28 SMs).
 pub fn sm86() -> Target {
-    Target { sms: Some(28), ..Target::for_arch(GpuArch::Cuda(CudaArch { major: 8, minor: 6 })) }
+    Target::card("rtx3060").expect("a listed card")
 }

@@ -8,6 +8,7 @@ mod heads;
 mod interp;
 mod layout;
 mod layouts;
+mod offline;
 mod ops;
 mod ops_plan;
 mod parts;
