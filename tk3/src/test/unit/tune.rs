@@ -208,19 +208,6 @@ fn a_stale_index_is_a_miss() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A value is stored as a `value` line holding the number; a second store
-/// on the directory reads it back without measuring.
-#[test]
-fn a_value_round_trips_through_the_store() {
-    let dir = scratch("value");
-    let k = key(&[], &[9]);
-    assert_eq!(TuneStore::at(Some(dir.clone())).value(&k, || 7, || Some(1234)), Some(1234));
-    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 1234\n", k.line(Kind::Value, 7)));
-    let measured = || panic!("measured twice");
-    assert_eq!(TuneStore::at(Some(dir.clone())).value(&k, || 7, measured), Some(1234));
-    let _ = std::fs::remove_dir_all(dir);
-}
-
 /// A warm memo answers a value without fingerprinting or measuring; an
 /// unmeasured value is memoized as missing and never stored.
 #[test_case(Some(5); "measured")]
@@ -235,28 +222,22 @@ fn the_memo_answers_a_value(measured: Option<u64>) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Choices and values of one device share its file; writing one keeps the other.
+/// Choices and values of one device share its file, a value as a `value`
+/// line holding the number; writing one keeps the other, and a second store
+/// on the directory reads both back without measuring.
 #[test]
 fn choices_and_values_share_a_file() {
     let dir = scratch("shared");
     let (choice, value) = (key(&[64, 64, 64], &[0, 1]), TuneKey { op: "probe:step", ..key(&[], &[2]) });
     TuneStore::at(Some(dir.clone())).select(&choice, 2, || 1, || vec![Some(9), Some(4)]);
-    TuneStore::at(Some(dir.clone())).value(&value, || 2, || Some(42));
+    assert_eq!(TuneStore::at(Some(dir.clone())).value(&value, || 2, || Some(1234)), Some(1234));
+    let lines = [format!("{} 1 4 0 9", choice.line(Kind::Choice, 1)), format!("{} 1234", value.line(Kind::Value, 2))];
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{}\n", lines.join("\n")));
     let again = TuneStore::at(Some(dir.clone()));
     assert_eq!(again.entries(&choice).len(), 2);
     assert_eq!(again.select(&choice, 2, || 1, || panic!("measured twice")), Some(1));
-    assert_eq!(again.value(&value, || 2, || panic!("measured twice")), Some(42));
+    assert_eq!(again.value(&value, || 2, || panic!("measured twice")), Some(1234));
     let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Another compiler (toolchain, flags) is another line, so it re-measures.
-#[test]
-fn the_compiler_is_part_of_the_line() {
-    let base = key(&[8, 8, 8], &[0, 1]);
-    let other = TuneKey { compiler: base.compiler ^ 1, ..base.clone() };
-    assert_ne!(base.line(Kind::Choice, 3), other.line(Kind::Choice, 3));
-    let line = base.line(Kind::Choice, 3);
-    assert!(line.contains(&format!("|{:016x}|", base.compiler)), "{line}");
 }
 
 /// A line the store cannot read (an older format, a stray edit) is a miss
@@ -288,15 +269,20 @@ fn a_run_needs_every_stamp(stamps: &[(Option<u64>, Option<u64>)]) -> Option<u64>
     tune::stamped(stamps.iter().copied()).map(|d| d.as_nanos() as u64)
 }
 
-#[test_case(&[1, 704, 512, 512], &[0, 1], true; "the same inputs")]
-#[test_case(&[1, 704, 512, 2048], &[0, 1], false; "another shape")]
-#[test_case(&[1, 704, 512, 512], &[1, 0], false; "another candidate order")]
-fn keys_are_stable(shape: &[usize], candidates: &[usize], same: bool) {
+/// A line keys the op, the device, the dtype, the shape, the candidates in
+/// order, the compiler (toolchain, flags), the kind and the programs'
+/// fingerprint: another of any is another line, so it re-measures.
+#[test_case(&[1, 704, 512, 512], &[0, 1], 0, true; "the same inputs")]
+#[test_case(&[1, 704, 512, 2048], &[0, 1], 0, false; "another shape")]
+#[test_case(&[1, 704, 512, 512], &[1, 0], 0, false; "another candidate order")]
+#[test_case(&[1, 704, 512, 512], &[0, 1], 1, false; "another compiler")]
+fn keys_are_stable(shape: &[usize], candidates: &[usize], compiler: u64, same: bool) {
     let base = key(&[1, 704, 512, 512], &[0, 1]);
-    let other = key(shape, candidates);
+    let other = TuneKey { compiler: base.compiler ^ compiler, ..key(shape, candidates) };
     assert_eq!(base.line(Kind::Choice, 3) == other.line(Kind::Choice, 3), same);
     let line = base.line(Kind::Choice, 3);
     assert!(line.starts_with("choice|gemm|sm_86-28sm|BFloat16|1x704x512x512|"), "{line}");
+    assert!(line.contains(&format!("|{:016x}|", base.compiler)), "{line}");
     assert_ne!(line, base.line(Kind::Choice, 4), "the program fingerprint is part of the line");
     assert_ne!(line, base.line(Kind::Admitted, 3), "the kind is part of the line");
 }
