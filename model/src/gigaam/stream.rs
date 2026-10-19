@@ -11,7 +11,7 @@
 //! of a stream equals the whole-sequence forward of the streaming encoder
 //! over its audio, whatever the pushes and whoever shares the step.
 
-use snafu::Snafu;
+use snafu::{OptionExt, ResultExt, Snafu};
 use svod_arch::ctc::GreedyDecoder;
 use svod_arch::pipelines::audio::{Transcript, words_to_text};
 use svod_arch::rnnt::{RnntDecoder, RnntOpts, TokenEmission};
@@ -19,7 +19,7 @@ use svod_dtype::DType;
 use svod_macros::jit_wrapper;
 use svod_tensor::PrepareConfig;
 
-use crate::audio::{FrameCursor, MelConfig, MelJit, MelSpectrogram};
+use crate::audio::{FrameCursor, MelJit, MelSpectrogram};
 use crate::gigaam::encoder::{StreamCaches, StreamCursors};
 use crate::gigaam::model::{GigaAm, Head};
 use crate::gigaam::rnnt::RnntBlockBackend;
@@ -75,7 +75,10 @@ pub enum StreamError {
         source: Box<svod_device::error::Error>,
     },
     #[snafu(display("{source}"))]
-    RnntDecode { source: Box<svod_arch::rnnt::RnntDecodeError<JitError>> },
+    RnntDecode {
+        #[snafu(source(from(svod_arch::rnnt::RnntDecodeError<JitError>, Box::new)))]
+        source: Box<svod_arch::rnnt::RnntDecodeError<JitError>>,
+    },
     #[snafu(display("the model is not a streaming one; enable streaming on it first"))]
     NotStreaming,
     #[snafu(display("stream {id:?} is not open"))]
@@ -115,12 +118,22 @@ struct Lane {
     pending: usize,
     /// `finish` was called: the rest of the audio goes out as it is.
     finished: bool,
-    /// Nothing more will be emitted.
-    done: bool,
-    /// CTC: the last argmax label; RN-T: no chunk decoded yet.
+    /// CTC: the last argmax label.
     prev: usize,
-    fresh: bool,
     emissions: Vec<TokenEmission>,
+}
+
+impl Lane {
+    /// Mel frames framed but not yet fed.
+    fn waiting(&self) -> usize {
+        self.cursor.available().saturating_sub(self.fed)
+    }
+
+    /// Nothing more will come out: the audio has ended and been fed, and no
+    /// chunk awaits its look-ahead.
+    fn spent(&self) -> bool {
+        self.finished && self.waiting() == 0 && self.pending == 0
+    }
 }
 
 /// A lane's part in a step.
@@ -166,21 +179,9 @@ impl GigaAmStreamer {
     /// Prepare the step for `lanes` concurrent streams of a streaming model
     /// (see [`GigaAm::enable_streaming`]).
     pub fn new(model: GigaAm, lanes: usize) -> Result<Self> {
-        let streaming = model.config.streaming.ok_or(StreamError::NotStreaming)?;
+        let streaming = model.config.streaming.context(NotStreamingSnafu)?;
         let cfg = &model.config;
-        let mel = MelSpectrogram::new(&MelConfig {
-            sample_rate: cfg.sample_rate,
-            n_fft: cfg.n_fft,
-            hop_length: cfg.hop_length,
-            win_length: cfg.win_length,
-            n_mels: cfg.n_mels,
-            center: cfg.mel_center,
-            mel_scale: crate::audio::MelScale::Htk,
-            periodic: true,
-            pad_mode: crate::audio::PadMode::Reflect,
-            preemphasis: None,
-            log: MelSpectrogram::LOG,
-        });
+        let mel = model.mel_spectrogram();
         let chunk = streaming.chunk_size;
         let chunk_mel = chunk * cfg.subsampling_factor;
         let framed_len = mel.frames_len(chunk_mel);
@@ -307,9 +308,7 @@ impl GigaAmStreamer {
             emitted: 0,
             pending: 0,
             finished: false,
-            done: false,
             prev: blank,
-            fresh: true,
             emissions: Vec::new(),
         });
         Ok(Some(id))
@@ -380,11 +379,6 @@ impl GigaAmStreamer {
         Transcript { text: words_to_text(&words), words, ..Default::default() }
     }
 
-    /// Encoder frames a chunk of `mel` valid mel frames subsamples to.
-    fn frames_of(mel: usize) -> usize {
-        mel.div_ceil(2).div_ceil(2)
-    }
-
     /// What each lane feeds the next step, or nothing for every lane.
     fn feeds(&self) -> Option<Vec<Feed>> {
         let look_ahead = self.streaming.right_context_chunks > 0;
@@ -394,10 +388,7 @@ impl GigaAmStreamer {
             .iter()
             .map(|lane| {
                 let Some(lane) = lane else { return Feed::default() };
-                if lane.done {
-                    return Feed::default();
-                }
-                let waiting = lane.cursor.available().saturating_sub(lane.fed);
+                let waiting = lane.waiting();
                 let (valid, flush) = if waiting >= self.chunk_mel {
                     (self.chunk_mel, false)
                 } else if lane.finished && waiting > 0 {
@@ -408,7 +399,7 @@ impl GigaAmStreamer {
                     return Feed::default();
                 };
                 any = true;
-                let out = if look_ahead { lane.pending } else { Self::frames_of(valid) };
+                let out = if look_ahead { lane.pending } else { self.model.encoder.subsampling_output_length(valid) };
                 Feed { valid, flush, out }
             })
             .collect();
@@ -416,14 +407,29 @@ impl GigaAmStreamer {
     }
 
     /// Run steps until no stream holds a whole chunk (or a finished stream's
-    /// remainder); returns every emission, in lane order per step. A stream
-    /// whose last frames came out is closed, its event carrying the transcript.
+    /// remainder); returns every emission, in lane order per step. A finished
+    /// stream with nothing left to come out is closed, its last event carrying
+    /// the transcript.
     pub fn step(&mut self) -> Result<Vec<StreamEvent>> {
         let mut events = Vec::new();
-        while let Some(feeds) = self.feeds() {
+        loop {
+            self.retire(&mut events);
+            let Some(feeds) = self.feeds() else { break };
             self.run(&feeds, &mut events)?;
         }
         Ok(events)
+    }
+
+    /// Close every spent stream with its transcript.
+    fn retire(&mut self, events: &mut Vec<StreamEvent>) {
+        for i in 0..self.lanes.len() {
+            if self.lanes[i].as_ref().is_some_and(Lane::spent) {
+                let lane = self.lanes[i].take().expect("a spent lane");
+                let id = StreamId { lane: i as u32, generation: lane.generation };
+                let transcript = Some(self.assemble(&lane.emissions));
+                events.push(StreamEvent { id, emissions: Vec::new(), transcript });
+            }
+        }
     }
 
     fn run(&mut self, feeds: &[Feed], events: &mut Vec<StreamEvent>) -> Result<()> {
@@ -471,12 +477,11 @@ impl GigaAmStreamer {
                 }
             }
             StreamHead::Rnnt { backend, decoder } => {
-                let fresh: Vec<bool> = self.lanes.iter().map(|l| l.as_ref().is_some_and(|l| l.fresh)).collect();
+                // A lane decoding its first chunk starts the predictor afresh.
+                let fresh: Vec<bool> = self.lanes.iter().map(|l| l.as_ref().is_some_and(|l| l.emitted == 0)).collect();
                 backend.begin_chunk(&outs, &fresh)?;
                 backend.bind_projected(self.jit.frames()?)?;
-                let decoded = decoder
-                    .resume_batch_blocks(&outs, backend)
-                    .map_err(|e| StreamError::RnntDecode { source: Box::new(e) })?;
+                let decoded = decoder.resume_batch_blocks(&outs, backend).context(RnntDecodeSnafu)?;
                 for (i, (_, emissions)) in decoded.into_iter().enumerate() {
                     new[i] = emissions
                         .into_iter()
@@ -506,18 +511,12 @@ impl GigaAmStreamer {
             lane.fed += feed.valid;
             lane.cursor.discard(lane.fed);
             lane.emitted += feed.out;
-            if feed.out > 0 {
-                lane.fresh = false;
-            }
-            lane.pending = if look_ahead && !feed.flush { Self::frames_of(feed.valid) } else { 0 };
+            lane.pending =
+                if look_ahead && !feed.flush { self.model.encoder.subsampling_output_length(feed.valid) } else { 0 };
             lane.emissions.extend_from_slice(&new[i]);
-            let remaining = lane.cursor.available().saturating_sub(lane.fed);
-            lane.done = lane.finished && remaining == 0 && (!look_ahead || lane.pending == 0);
-            let (id, done) = (StreamId { lane: i as u32, generation: lane.generation }, lane.done);
-            let closed = if done { self.lanes[i].take() } else { None };
-            let transcript = closed.map(|lane| self.assemble(&lane.emissions));
-            if !new[i].is_empty() || transcript.is_some() {
-                events.push(StreamEvent { id, emissions: std::mem::take(&mut new[i]), transcript });
+            if !new[i].is_empty() {
+                let id = StreamId { lane: i as u32, generation: lane.generation };
+                events.push(StreamEvent { id, emissions: std::mem::take(&mut new[i]), transcript: None });
             }
         }
         Ok(())

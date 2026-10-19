@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 right_context_chunks: args.right_context,
             };
             println!("offline weights streamed as {streaming:?}");
-            model.enable_streaming(streaming);
+            model.enable_streaming(streaming)?;
         }
     }
 
@@ -108,7 +108,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ids: Vec<StreamId> =
         (0..args.streams).map(|_| streamer.open().map(|id| id.expect("a free lane"))).collect::<Result<_, _>>()?;
-    let push = args.push_ms * sample_rate as usize / 1000;
+    let push = (args.push_ms * sample_rate as usize / 1000).max(1);
+    if wave.is_empty() {
+        return Err("the WAV holds no samples".into());
+    }
     let (mut t_step, mut steps, mut slowest) = (Duration::ZERO, 0usize, Duration::ZERO);
     let mut finals = vec![None; args.streams];
     let t_run = Instant::now();

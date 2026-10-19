@@ -26,7 +26,7 @@ use svod_tensor::PrepareConfig;
 
 pub use svod_arch::rnnt::Word;
 
-use crate::audio::{EncoderBounds, MelConfig, MelJit, MelSpectrogram};
+use crate::audio::{EncoderBounds, MelJit, MelSpectrogram};
 use crate::gigaam::ctc::GigaAmCtcJit;
 use crate::gigaam::jit::GigaAmEncoderJit;
 use crate::gigaam::model::{GigaAm, Head};
@@ -226,19 +226,7 @@ impl GigaAmTranscriber {
     /// encoder's capacity. `model` is cloned into each JIT (cheap: weights are
     /// shared via `Tensor` handle Arcs).
     pub fn new(model: GigaAm, opts: TranscribeOpts, max_chunk_samples: usize) -> Result<Self, TranscribeError> {
-        let mel = MelSpectrogram::new(&MelConfig {
-            sample_rate: model.config.sample_rate,
-            n_fft: model.config.n_fft,
-            hop_length: model.config.hop_length,
-            win_length: model.config.win_length,
-            n_mels: model.config.n_mels,
-            center: model.config.mel_center,
-            mel_scale: crate::audio::MelScale::Htk,
-            periodic: true,
-            pad_mode: crate::audio::PadMode::Reflect,
-            preemphasis: None,
-            log: crate::audio::MelSpectrogram::LOG,
-        });
+        let mel = model.mel_spectrogram();
 
         let subsampling_factor = model.config.subsampling_factor;
         let hop_length = model.config.hop_length;
