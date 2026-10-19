@@ -3,6 +3,7 @@
 
 pub mod attention;
 pub mod gemm;
+pub mod heads;
 pub mod rows;
 
 use std::f64::consts::{FRAC_1_SQRT_2, LOG2_E};

@@ -145,6 +145,17 @@ pub fn attention(target: Option<&Target>, dtypes: &[DType], q: Option<&Extent>, 
     })
 }
 
+/// `qkv [b, t, slots·d]` into heads of width `d`.
+pub fn heads(target: Option<&Target>, dtypes: &[DType], x: Option<&Extent>, d: usize) -> Plan<NormCfg> {
+    plan(|| {
+        let (target, x) = (gate(target, dtypes)?, x.ok_or(Fallback::Symbolic)?);
+        if x.dims.len() != 3 || x.dims.contains(&0) {
+            return Err(Fallback::Shape);
+        }
+        candidates(config::heads_candidates(target, d), Fallback::Shape)
+    })
+}
+
 /// A norm over the last dim of `x`.
 pub fn norm(target: Option<&Target>, dtypes: &[DType], x: Option<&Extent>) -> Plan<NormCfg> {
     plan(|| {
@@ -155,9 +166,4 @@ pub fn norm(target: Option<&Target>, dtypes: &[DType], x: Option<&Extent>) -> Pl
         }
         candidates(config::norm_candidates(target, d), Fallback::Shape)
     })
-}
-
-/// Whether the attention kernel would take `dtype` on `target`.
-pub fn attention_runs(target: Option<&Target>, dtype: &DType) -> bool {
-    gate(target, std::slice::from_ref(dtype)).is_ok()
 }
