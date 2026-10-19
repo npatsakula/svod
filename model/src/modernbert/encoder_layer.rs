@@ -55,11 +55,7 @@ impl EncoderLayer {
             Some(ln) => norm(ln, x)?,
             None => x.clone(),
         };
-        // The residual adds stay out of the GEMM epilogue: with the 768-wide
-        // norm on the graph path, a launch whose residual operand the norm
-        // also reads fails kernel-graph verification.
-        let h = x.try_add(&self.attention.forward(&normed, rope, padding_mask)?)?;
-        let delta = self.mlp.forward(&norm(&self.mlp_norm, &h)?)?;
-        Ok(h.try_add(&delta)?)
+        let h = self.attention.forward(&normed, x, rope, padding_mask)?;
+        self.mlp.forward(&norm(&self.mlp_norm, &h)?, &h)
     }
 }

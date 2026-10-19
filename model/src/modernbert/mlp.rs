@@ -31,11 +31,12 @@ impl ModernBertGlu {
         Self { hidden_size, intermediate_size, wi_weight, wo_weight }
     }
 
-    /// Forward. `x`: `(B, L, D)` → `(B, L, D)`.
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// Forward. `x`: `(B, L, D)` → `residual + mlp(x)`, `(B, L, D)`, the add
+    /// in `Wo`'s epilogue.
+    pub fn forward(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
         // `Wi`'s `[input | gate]` rows are the op layer's gated order: the
         // first half takes the exact (erf) GELU, PyTorch's nn.GELU default.
         let gated = ops::linear(x, &self.wi_weight, ops::Linear { act: Act::Gelu, gated: true, ..Default::default() })?;
-        Ok(ops::linear(&gated, &self.wo_weight, ops::Linear::default())?)
+        Ok(ops::linear(&gated, &self.wo_weight, ops::Linear { residual: Some(residual), ..Default::default() })?)
     }
 }
