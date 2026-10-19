@@ -456,6 +456,30 @@ impl<'a> Emit<'a> {
         (0..w).map(|e| self.reg_load(v, j + e)).collect()
     }
 
+    /// Registers `j..j + w` of `v` as one `w`-wide value (one for `w` = 1):
+    /// a fragment read whole, so a loop carries it as one vector and the
+    /// backend keeps it in the core's register file (gfx942's AGPRs) instead
+    /// of moving each element through a vector register every trip.
+    fn reg_load_vec(&mut self, v: ValId, j: u32, w: u32) -> Arc<UOp> {
+        if w == 1 {
+            return self.reg_load(v, j);
+        }
+        let buf = self.reg_buf(v);
+        let idx = self.access(&buf, &c32(j as i64), w);
+        let tag = self.next_tag();
+        self.push(load_at(&idx, tag))
+    }
+
+    /// The `w`-wide `val` stored whole to registers `j..j + w` of `v`.
+    fn reg_store_vec(&mut self, v: ValId, j: u32, w: u32, val: Arc<UOp>) {
+        if w == 1 {
+            return self.reg_store(v, j, vec![val]);
+        }
+        let buf = self.reg_buf(v);
+        let idx = self.access(&buf, &c32(j as i64), w);
+        self.push(idx.store(val));
+    }
+
     fn reg_store(&mut self, v: ValId, j: u32, vals: Vec<Arc<UOp>>) {
         let buf = self.reg_buf(v);
         for (e, val) in vals.into_iter().enumerate() {
@@ -652,10 +676,13 @@ impl<'a> Emit<'a> {
         for stmt in &block.0 {
             self.stmt(stmt)?;
         }
+        // A carried tile moves a fragment at a time, as the products read
+        // it, so the backend carries vectors and never unpacks them.
         for c in self.pending.pop().expect("the block just opened") {
-            for j in 0..self.layout(c.phi).regs() {
-                let x = self.reg_load(c.next, j);
-                self.reg_store(c.phi, j, vec![x]);
+            let (regs, w) = (self.layout(c.phi).regs(), self.layout(c.phi).frag_regs().max(1));
+            for j in (0..regs).step_by(w as usize) {
+                let x = self.reg_load_vec(c.next, j, w);
+                self.reg_store_vec(c.phi, j, w, x);
             }
         }
         Ok(())
@@ -1341,15 +1368,14 @@ impl<'a> Emit<'a> {
         for i in 0..rm {
             for j in 0..rn {
                 let cblock = i * rn + j;
-                let mut c = UOp::stack(self.reg_loads(acc, cblock * rc, rc).into_iter().collect());
+                let mut c = self.reg_load_vec(acc, cblock * rc, rc);
                 for kk in 0..rk {
                     let xa = UOp::stack(self.reg_loads(a, block_a(i, kk) * ra, ra).into_iter().collect());
                     let xb = UOp::stack(self.reg_loads(b, block_b(j, kk) * rb, rb).into_iter().collect());
                     let (x, y) = if swapped { (xb, xa) } else { (xa, xb) };
                     c = UOp::wmma(x, y, c, atom.meta.clone());
                 }
-                let vals = (0..rc as usize).map(|p| elem(&c, p, rc as usize)).collect();
-                self.reg_store(dst, cblock * rc, vals);
+                self.reg_store_vec(dst, cblock * rc, rc, c);
             }
         }
         Ok(())
