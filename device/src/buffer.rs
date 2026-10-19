@@ -638,6 +638,11 @@ impl Buffer {
         Arc::clone(&self.data.allocator)
     }
 
+    /// The class of memory behind this buffer (device-local, host-visible…).
+    pub fn spec(&self) -> BufferSpec {
+        self.data.options
+    }
+
     /// Get the unique identifier for this buffer **handle**.
     ///
     /// Each `Buffer` value (including each view) carries its own `BufferId`;
