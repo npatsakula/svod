@@ -125,8 +125,9 @@ pub type Candidate = Vec<(Program, Lowering)>;
 /// The fingerprint of candidates' programs: the kernels they emit
 /// ([`emitted`]), so a field of the target or the costs no instruction
 /// reads keys nothing, added, renamed or deleted. What a program emits is
-/// remembered by what it is made of, by the process and by the global
-/// store ([`TuneStore::fingerprint`]): lowering a shortlist takes 0.05–1.6 s,
+/// remembered by what it is made of, by the process and, for later
+/// processes of the same build, by the global store
+/// ([`TuneStore::fingerprint`]): lowering a shortlist takes 0.05–1.6 s,
 /// and a warm process lowers nothing.
 pub fn fingerprint(candidates: &[Candidate]) -> u64 {
     TuneStore::global().fingerprint(candidates)
@@ -136,7 +137,8 @@ pub fn fingerprint(candidates: &[Candidate]) -> u64 {
 /// it lowers to (its instructions, grid and parameters) and the text the
 /// backend's compiler is handed, which a renderer change moves. Lowered
 /// outside any origin scope, which would key the call site; `None` where it
-/// does not lower or render.
+/// does not lower or render, and the caller keys it by its inputs: a
+/// program that fails to lower fails the same way until they change.
 fn emitted(prog: &Program, lowering: &Lowering) -> Option<u64> {
     let _capture = svod_ir::origin::capture_for_thread(false);
     let _scope = svod_ir::origin::install(None);
@@ -210,6 +212,18 @@ impl Entry {
     }
 }
 
+/// Removes the files under `dir` not modified for [`EMITTED_KEPT`].
+fn prune(dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(dir);
+    let Ok(files) = std::fs::read_dir(dir) else { return };
+    for file in files.flatten() {
+        let age = file.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+        if age.is_some_and(|age| age > EMITTED_KEPT) {
+            let _ = std::fs::remove_file(file.path());
+        }
+    }
+}
+
 /// A memo of this process's entries, backed by one file per device under `root`.
 #[derive(Debug)]
 pub struct TuneStore {
@@ -218,28 +232,55 @@ pub struct TuneStore {
     memo: Once<(Kind, TuneKey), Option<Entry>>,
     /// What programs emit by what they are made of ([`Self::fingerprint`]).
     emitted: OnceLock<Mutex<HashMap<u64, u64>>>,
+    /// The running executable's [`build`], which names its file of what
+    /// programs emit; `None`: the memo stays in memory.
+    pub(crate) build: Option<u64>,
+}
+
+/// Search bound: how long a build's file of what programs emit
+/// ([`TuneStore::fingerprint`]) outlives its last use: a build not run for
+/// as long is gone, and another lowers its programs once again.
+const EMITTED_KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// The running executable's identity: a digest of its path, length and
+/// modification time, which every rebuild moves (its contents are not read).
+fn build() -> Option<u64> {
+    let exe = std::env::current_exe().ok()?;
+    let meta = std::fs::metadata(&exe).ok()?;
+    Some(digest(&(exe, meta.len(), meta.modified().ok()?)))
 }
 
 impl TuneStore {
     /// The store rooted at `root` (`None`: memory only).
     pub fn at(root: Option<PathBuf>) -> Self {
-        Self { root, memo: Mutex::default(), emitted: OnceLock::new() }
+        Self { root, memo: Mutex::default(), emitted: OnceLock::new(), build: build() }
     }
 
     /// [`fingerprint`] under this store: what each program emits is read
-    /// from what the process and the root's `emitted` file know by the
-    /// digest of what it is made of (its program and lowering whole), else
-    /// lowered, in parallel, and added to both. A program that does not
-    /// lower is keyed by what it is made of. The memo keys inputs, not
-    /// code: a lowering that emits otherwise for the same inputs is seen
-    /// after a [`FORMAT`] bump, which starts the file afresh.
+    /// from what the process and its build's file (`emitted/<build>.txt`
+    /// under the root) know by the digest of what it is made of (its program
+    /// and lowering whole), else lowered, in parallel, and added to both. A
+    /// program that does not lower is keyed by what it is made of. The memo
+    /// keys inputs, so it is the build's own: a rebuild, whose lowering or
+    /// renderer may emit otherwise for the same inputs, lowers every program
+    /// once and finds the store's entries again wherever the code is the
+    /// same. Opening the file marks it used and removes the builds' files
+    /// unused for [`EMITTED_KEPT`]; each line is appended by one write, so
+    /// processes of one build share the file.
     pub fn fingerprint(&self, candidates: &[Candidate]) -> u64 {
         use rayon::prelude::*;
         let made_of: Vec<Vec<u64>> =
             candidates.iter().map(|c| c.iter().map(|(p, l)| digest(&format!("{p:?}{l:?}"))).collect()).collect();
-        let file =
-            self.root.as_ref().map(|root| root.join(format!("emitted-v{}-{FORMAT}.txt", env!("CARGO_PKG_VERSION"))));
+        let dir = self.root.as_ref().map(|root| root.join("emitted"));
+        let file = dir.as_ref().zip(self.build).map(|(dir, build)| dir.join(format!("{build:016x}.txt")));
         let memo = self.emitted.get_or_init(|| {
+            if let Some(dir) = &dir {
+                prune(dir);
+            }
+            let open = |f: &PathBuf| std::fs::OpenOptions::new().create(true).append(true).open(f);
+            if let Some(Ok(f)) = file.as_ref().map(open) {
+                let _ = f.set_modified(std::time::SystemTime::now());
+            }
             let text = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
             let hex = |s: &str| u64::from_str_radix(s, 16).ok();
             Mutex::new(
@@ -255,9 +296,12 @@ impl TuneStore {
         let found: Vec<(u64, u64)> =
             missing.into_par_iter().map(|(m, (prog, lowering))| (m, emitted(prog, lowering).unwrap_or(m))).collect();
         if let (Some(file), false) = (file, found.is_empty()) {
-            let lines: String = found.iter().map(|(m, e)| format!("{m:016x} {e:016x}\n")).collect();
             let append = std::fs::OpenOptions::new().create(true).append(true).open(file);
-            let _ = append.and_then(|mut f| std::io::Write::write_all(&mut f, lines.as_bytes()));
+            if let Ok(mut f) = append {
+                for (m, e) in &found {
+                    let _ = std::io::Write::write_all(&mut f, format!("{m:016x} {e:016x}\n").as_bytes());
+                }
+            }
         }
         let mut known = memo.lock().expect("emitted memo");
         known.extend(found);

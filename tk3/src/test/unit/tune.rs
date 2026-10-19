@@ -630,27 +630,74 @@ fn the_fingerprint_keys_the_candidates_in_order() {
     assert_ne!(store.fingerprint(&[[a, b].concat()]), ab);
 }
 
-/// What a program emits is kept beside the store's files by what it is
-/// made of: a later store on the directory reads it rather than lowering,
-/// and a line it cannot read is passed over.
+/// The store under `dir` as a build named `build` sees it.
+fn built(dir: &std::path::Path, build: u64) -> TuneStore {
+    let mut store = TuneStore::at(Some(dir.to_path_buf()));
+    store.build = Some(build);
+    store
+}
+
+/// The digest of what a candidate's one program is made of, as the memo keys it.
+fn made_of(candidate: &tune::Candidate) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&format!("{:?}{:?}", candidate[0].0, candidate[0].1), &mut hasher);
+    std::hash::Hasher::finish(&hasher)
+}
+
+/// What a program emits is kept in its build's file by what it is made
+/// of: a later store of the build reads it rather than lowering, and a
+/// line it cannot read is passed over.
 #[test]
-fn what_a_program_emits_is_remembered_by_the_store() {
+fn what_a_program_emits_is_remembered_by_its_build() {
     let dir = scratch("emitted");
     let candidate = gemm_candidate(sm86(), super::costs());
-    let fresh = TuneStore::at(Some(dir.clone())).fingerprint(std::slice::from_ref(&candidate));
+    let fresh = built(&dir, 1).fingerprint(std::slice::from_ref(&candidate));
     assert_eq!(fresh, TuneStore::at(None).fingerprint(std::slice::from_ref(&candidate)));
-    let file = dir.join(format!("emitted-v{}-{FORMAT}.txt", env!("CARGO_PKG_VERSION")));
-    let made_of = {
-        let mut hasher = std::hash::DefaultHasher::new();
-        std::hash::Hash::hash(&format!("{:?}{:?}", candidate[0].0, candidate[0].1), &mut hasher);
-        std::hash::Hasher::finish(&hasher)
-    };
-    let text = std::fs::read_to_string(&file).expect("the emitted file");
-    assert!(text.starts_with(&format!("{made_of:016x} ")), "{text}");
-    std::fs::write(&file, format!("not a line\n{made_of:016x} 000000000000002a\n")).expect("a rewritten file");
-    let read = TuneStore::at(Some(dir.clone())).fingerprint(&[candidate]);
+    let file = dir.join("emitted").join(format!("{:016x}.txt", 1));
+    let text = std::fs::read_to_string(&file).expect("the build's file");
+    assert!(text.starts_with(&format!("{:016x} ", made_of(&candidate))), "{text}");
+    std::fs::write(&file, format!("not a line\n{:016x} 000000000000002a\n", made_of(&candidate))).expect("a file");
     let mut hasher = std::hash::DefaultHasher::new();
     std::hash::Hash::hash(&vec![vec![42u64]], &mut hasher);
+    let read = built(&dir, 1).fingerprint(std::slice::from_ref(&candidate));
     assert_eq!(read, std::hash::Hasher::finish(&hasher), "read from the file, not lowered");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Another build consults none of a build's memo: it lowers again, and where
+/// it emits the same code its fingerprint is the first build's, so the
+/// store's entries still answer.
+#[test]
+fn another_build_lowers_again_and_matches_where_the_code_is_the_same() {
+    let dir = scratch("rebuilt");
+    let candidate = gemm_candidate(sm86(), super::costs());
+    let first = built(&dir, 1).fingerprint(std::slice::from_ref(&candidate));
+    let stale = dir.join("emitted").join(format!("{:016x}.txt", 1));
+    std::fs::write(&stale, format!("{:016x} 000000000000002a\n", made_of(&candidate))).expect("a file");
+    assert_eq!(built(&dir, 2).fingerprint(std::slice::from_ref(&candidate)), first, "lowered again, the same code");
+    let mut files: Vec<_> = std::fs::read_dir(dir.join("emitted"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files, [format!("{:016x}.txt", 1), format!("{:016x}.txt", 2)]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Opening the memo removes the files of builds unused for longer than a
+/// build's file is kept, and keeps the recent ones.
+#[test]
+fn a_build_unused_for_long_loses_its_memo() {
+    let dir = scratch("pruned");
+    let emitted = dir.join("emitted");
+    std::fs::create_dir_all(&emitted).expect("the memo dir");
+    let (old, recent) = (emitted.join("old.txt"), emitted.join("recent.txt"));
+    for f in [&old, &recent] {
+        std::fs::write(f, "").expect("a file");
+    }
+    let month = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+    std::fs::File::options().write(true).open(&old).unwrap().set_modified(month).unwrap();
+    built(&dir, 3).fingerprint(&[gemm_candidate(sm86(), super::costs())]);
+    assert!(!old.exists() && recent.exists());
     let _ = std::fs::remove_dir_all(dir);
 }
