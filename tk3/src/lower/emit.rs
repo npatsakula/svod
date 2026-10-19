@@ -647,8 +647,12 @@ impl<'a> Emit<'a> {
             }
             Stmt::If { pred, then, otherwise } => {
                 let pred = self.sc(*pred);
-                let cond = pred.try_cmpne(&c32(0)).expect("predicate");
-                for (branch, cond) in [(then, cond.clone()), (otherwise, cond.not())] {
+                // Listed like any scalar: a compare left to its first user
+                // would land inside whichever branch meets it first and not
+                // reach a later `if` on the same predicate outside it.
+                let cond = self.hoist(pred.try_cmpne(&c32(0)).expect("predicate"));
+                let not = self.hoist(cond.not());
+                for (branch, cond) in [(then, cond), (otherwise, not)] {
                     if branch.0.is_empty() {
                         continue;
                     }

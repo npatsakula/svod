@@ -363,6 +363,43 @@ fn every_family_compiles_for_amd(target: Target) {
     }
 }
 
+/// An `if`'s compare is listed with its scalar: a predicate first met inside
+/// another branch still guards a later `if` on it outside that branch. With
+/// the compare left to its first user it sat inside the first branch, and
+/// clang refused the kernel ("Instruction does not dominate all uses"); seen
+/// on gfx1201 with a warp guard nested in a crew guard.
+#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40); "gfx1151")]
+fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
+    use crate::build::{I32, Kernel, Sc};
+    use crate::ir::{Const, Shape};
+    use crate::layouts::WarpGrid;
+    let GpuArch::Amd(arch) = target.arch else { unreachable!() };
+    let mut k = Kernel::new("nested_if");
+    k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
+    k.warps(2);
+    let tile = Shape::new(16, 16);
+    let y = k.param::<I32>("y", ParamKind::Out, 4 * 2 * tile.elems());
+    let slot = k.block(0) * 2 + k.warp();
+    let dst = k.view(y, slot * tile.elems(), [tile.cols, 1], tile, [None, None]);
+    let (outer, inner) = (k.block(0).lt(2), k.warp().eq(0));
+    let ones = k.fill::<I32>(tile, Const::Int(1));
+    let twos = k.fill::<I32>(tile, Const::Int(2));
+    k.if_(outer, |k| k.if_(inner.clone(), |k| k.store(dst, ones), |_| {}), |_| {});
+    k.if_(inner, |k| k.store(dst, twos), |_| {});
+    let prog = k.finish();
+    let device = crate::atoms::Device { target: target.clone(), costs: crate::atoms::Costs::default() };
+    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: 2, cols: 1 });
+    let ir = render(prog, &lowering);
+    match svod_runtime::amd::compile_ir_to_amd_object(&ir, arch) {
+        Ok(object) => assert_eq!(&object[..4], b"\x7fELF"),
+        Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
+            eprintln!("skipped: {e}");
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
+
 /// Every access a lowering lists reads an allocation or a view of its
 /// whole, never a crop at an offset: once a program's placeholders are
 /// bound, an access of a crop is folded into the buffer at the summed
