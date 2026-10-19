@@ -210,10 +210,8 @@ impl Emit<'_> {
         let (from, to) = (self.value(src).dtype, self.value(dst).dtype);
         let dot2 =
             from != to && from == ScalarDType::BFloat16 && f == ReduceOp::Sum && self.low.device.target.dot2_bf16;
-        let (fold_masks, across) = match axis {
-            Axis::Row => (ls.row_fold_masks(), ls.warps.out_size(Col)),
-            Axis::Col => (ls.col_fold_masks(), ls.warps.out_size(Row)),
-        };
+        let fold_masks = ls.fold_masks(axis);
+        let across = ls.warps.out_size(if axis == Axis::Row { Col } else { Row });
         snafu::ensure!(across == 1, UnsupportedSnafu { what: "a reduction across warps" });
         let key = |l: &TileLayout, lane: u32, j: u32| {
             let (r, c) = l.coord(0, lane, j);

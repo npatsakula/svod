@@ -452,15 +452,18 @@ fn graph_seconds(n: usize, d: usize, metric: Metric, floors: Floors, groups: boo
 /// How a row's minimum folds under each way of issuing the product: on a
 /// square core (RDNA, CDNA) the swapped issue holds a row's candidates along
 /// a lane's registers, one or two lane moves a reduction where the direct
-/// issue spreads a row over 16 lanes (four); CUDA's `m16n8k16` issues one
-/// way, a row over the four lanes of a quad. The inference weighs relayouts
-/// and scattered loads alone, so it leaves the product direct.
+/// issue spreads a row over 16 lanes (four, for each row a lane holds);
+/// CUDA's `m16n8k16` issues one way, a row over the four lanes of a quad. No
+/// relayout or scattered load tells the two apart, so the folds' lane moves
+/// decide: the inference swaps where the core can.
 #[test_case(crate::atoms::sm86(), 2, None; "sm_86")]
 #[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), 4, Some(1); "gfx1201")]
 #[test_case(crate::sweep::amd(AmdArch::Gfx1100, 96), 4, Some(1); "gfx1100")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), 4, Some(1); "gfx1151")]
 #[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), 4, Some(2); "gfx942")]
 fn a_swapped_product_folds_a_row_in_lanes(target: Target, direct: usize, swapped: Option<usize>) {
     use crate::ir::{Block, Stmt, TileOp};
+    let how = target.lane_move;
     let planner = super::planner(target.clone());
     let cfg = NearestCfg { warp_rows: 32, ..NearestCfg::new(128, 64, 2) };
     let spec = NearestSpec { n: 1000, m: 1000, d: 64, metric: Metric::SquaredL2, floors: NONE, groups: false, cfg };
@@ -473,28 +476,38 @@ fn a_swapped_product_folds_a_row_in_lanes(target: Target, direct: usize, swapped
             }
         }
     }
-    // The lane moves of each reduction, and the product's orientation.
+    // Each reduction's fold masks and the lane moves a lane issues for it,
+    // and the product's orientation.
     let folds = |orient: Option<Orient>| {
         let mut prog = nearest::<BF16>(&spec);
         if let Some(o) = orient {
             pin(&mut prog.body, o);
         }
         let laid = crate::layouts::infer(prog, &planner.device, grid, Core::Warp).unwrap();
-        let (mut moves, mut issued) = (vec![], vec![]);
+        let (mut masks, mut moves, mut issued) = (vec![], vec![], vec![]);
         for (_, s) in laid.prog.walk() {
             match s {
                 Stmt::Let { op: TileOp::Mma { orient, .. }, .. } => issued.push(orient.unwrap()),
-                Stmt::Let { op: TileOp::Reduce { src, .. }, .. } => {
-                    moves.push(laid.layouts[src.index()].as_ref().unwrap().row_fold_masks().len())
+                Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } => {
+                    let (ls, ld) =
+                        (laid.layouts[src.index()].as_ref().unwrap(), laid.layouts[dst.index()].as_ref().unwrap());
+                    masks.push(ls.fold_masks(*axis).len());
+                    moves.push(ls.fold_moves(ld, *axis, how));
                 }
                 Stmt::Let { op: TileOp::Relayout { .. }, .. } => panic!("a relayout"),
                 _ => {}
             }
         }
-        (moves, issued)
+        (masks, moves, issued)
     };
-    assert_eq!(folds(None), (vec![direct; 2], vec![Orient::Direct]), "as inferred");
-    if let Some(swapped) = swapped {
-        assert_eq!(folds(Some(Orient::Swapped)).0, vec![swapped; 2], "swapped");
-    }
+    let as_direct = folds(Some(Orient::Direct));
+    assert_eq!(as_direct.0, vec![direct; 2], "direct");
+    let Some(swapped) = swapped else {
+        assert_eq!(folds(None), as_direct, "as inferred: one way to issue");
+        return;
+    };
+    let as_swapped = folds(Some(Orient::Swapped));
+    assert_eq!(as_swapped.0, vec![swapped; 2], "swapped");
+    assert!(as_swapped.1.iter().zip(&as_direct.1).all(|(s, d)| s < d), "{:?} vs {:?}", as_swapped.1, as_direct.1);
+    assert_eq!(folds(None), as_swapped, "as inferred");
 }

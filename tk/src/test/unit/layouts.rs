@@ -283,7 +283,14 @@ fn attention_step(bias: bool) -> Program {
 /// The orientation `infer` gives each product of `prog` on gfx1151 (RDNA3.5)
 /// at `costs`, and the layouts each inserted relayout re-holds a tile between.
 fn gfx1151_attention(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLayout, TileLayout)>) {
+    let (orients, relayouts, _) = gfx1151_attention_folds(prog, costs);
+    (orients, relayouts)
+}
+
+/// [`gfx1151_attention`] and the lane moves each lane issues per reduction.
+fn gfx1151_attention_folds(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLayout, TileLayout)>, Vec<u32>) {
     let target = Target::for_arch(GpuArch::Amd(AmdArch::Gfx1151));
+    let how = target.lane_move;
     let Laid { prog, layouts: lay } =
         infer(prog, &Device { target, costs: *costs }, WarpGrid { rows: 4, cols: 1 }, Core::Warp).unwrap();
     let orients = prog
@@ -302,7 +309,16 @@ fn gfx1151_attention(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLay
             _ => None,
         })
         .collect();
-    (orients, relayouts)
+    let folds = prog
+        .walk()
+        .filter_map(|(_, s)| match s {
+            Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } => {
+                Some(lay[src.index()].as_ref()?.fold_moves(lay[dst.index()].as_ref()?, *axis, how))
+            }
+            _ => None,
+        })
+        .collect();
+    (orients, relayouts, folds)
 }
 
 /// On gfx11 the score accumulator never feeds the next product as laid. With
@@ -320,13 +336,30 @@ fn rdna3_attention_trades_probabilities_between_half_waves() {
     assert!(picks.iter().all(|p| p.len() <= 2 && p.iter().all(|p| p.mask < 32)), "{picks:?}");
 }
 
-/// A bias tile read into the swapped scores would scatter, a row per lane:
-/// where a scattered element costs what a round trip does (the declared
-/// [`costs`]) the products stay direct and the bias is read along its rows.
-#[test]
-fn rdna3_attention_reads_a_bias_along_its_rows() {
-    let (orients, _) = gfx1151_attention(attention_step(true), &costs());
-    assert_eq!(orients, [Orient::Direct, Orient::Direct]);
+/// Biased scores weigh the bias's scattered lines against the folds' lane
+/// moves. Direct, the bias is read along its rows, but a row of scores
+/// spreads over 16 lanes: its maximum folds in four DPP moves for each of a
+/// lane's 8 rows (32), and P reaches PV through shared memory alone. Swapped,
+/// a lane holds a query: one `permlanex16` folds its row and the half-waves
+/// trade P (1.5 moves an element), but the bias is read a row per lane, a
+/// line per lane. Over 4 warps of 32 lanes, a 64×16 bias and P at the
+/// declared [`costs`] (a lane move 1, a round trip 8), direct costs
+/// `8·1024 + 32·128 = 12288` and swapped `1.5·1024 + 1·128 + 1024·scatter`:
+/// they cross at a scattered element of 10.375.
+#[test_case(8.0, Orient::Swapped; "a line at a round trip's cost: the folds decide")]
+#[test_case(10.25, Orient::Swapped; "just under the crossover")]
+#[test_case(10.5, Orient::Direct; "just over it: the bias is read along its rows")]
+fn rdna3_biased_attention_weighs_scattered_lines_against_fold_moves(scatter: f64, qk: Orient) {
+    let costs = Costs { scatter, ..costs() };
+    let (orients, pairs, folds) = gfx1151_attention_folds(attention_step(true), &costs);
+    assert_eq!(orients, [qk, Orient::Direct], "QKᵀ, PV");
+    assert_eq!(pairs.len(), 1, "only P changes role");
+    let relayout = pairs[0].0.relayout(&pairs[0].1, 4, 32, &costs);
+    let (fold, exchanged) = (folds, matches!(relayout, Relayout::Exchange(_)));
+    match qk {
+        Orient::Direct => assert_eq!((fold, relayout), (vec![32], Relayout::ViaSmem)),
+        Orient::Swapped => assert_eq!((fold, exchanged, relayout.work()), (vec![1], true, 1.5)),
+    }
 }
 
 /// Where a lane move costs more than a round trip through shared memory, P
@@ -471,4 +504,60 @@ fn warpgroups_are_consecutive_warps_down_the_rows() {
 fn a_shared_row_swizzles_by_its_chunks(cols: usize, bytes: usize, want: Swizzle, spans: bool) {
     assert_eq!(Swizzle::of_row(cols, bytes), want);
     assert_eq!(Swizzle::spans(cols, bytes), spans);
+}
+
+/// What the orientation search prices a reduction is what the emitter
+/// issues: per lane, a butterfly over the fold masks for each register of the
+/// result, a mask moved as the target moves it (on RDNA a DPP `row_xmask`
+/// and a `permlanex16` for a mask with bits on both sides of 16).
+#[test_case(sm86(), Orient::Direct, Axis::Row; "sm_86 rows")]
+#[test_case(sm86(), Orient::Direct, Axis::Col; "sm_86 columns")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Direct, Axis::Row; "gfx1201 direct rows")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Swapped, Axis::Row; "gfx1201 swapped rows")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Direct, Axis::Row; "gfx1151 direct rows")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Swapped, Axis::Row; "gfx1151 swapped rows")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Direct, Axis::Col; "gfx1151 direct columns")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Direct, Axis::Row; "gfx942 direct rows")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Swapped, Axis::Row; "gfx942 swapped rows")]
+fn a_fold_issues_the_lane_moves_it_is_priced(target: Target, orient: Orient, axis: Axis) {
+    // One warp: a fold across warps is not lowered.
+    let grid = WarpGrid { rows: 1, cols: 1 };
+    let (rows, cols) = (32, 32);
+    let atom = target.mma(svod_dtype::ScalarDType::BFloat16, svod_dtype::ScalarDType::Float32).unwrap().clone();
+    let held = atom.issue(orient, grid, rows, cols, 16).unwrap().c;
+    let mut k = Kernel::new("fold");
+    k.warps(grid.count());
+    let tile = Shape::new(rows, cols);
+    let x = k.param::<F32>("x", ParamKind::In, tile.elems());
+    let x = k.view(x, 0, [cols, 1], tile, [None, None]);
+    let x = k.load(x);
+    k.pin(x, held.clone());
+    let folded = k.reduce(x, axis, ReduceOp::Max);
+    let out = k.shape(folded);
+    let y = k.param::<F32>("y", ParamKind::Out, out.elems());
+    let y = k.view(y, 0, [out.cols, 1], out, [None, None]);
+    k.store(y, folded);
+    let device = Device { target: target.clone(), costs: costs() };
+    let lowering = crate::lower::Lowering::uniform(&device, false, grid);
+    let prog = k.finish();
+    let laid = infer(prog.clone(), &device, grid, Core::Warp).unwrap();
+    let priced: u32 = laid
+        .prog
+        .walk()
+        .filter_map(|(_, s)| match s {
+            Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } => {
+                Some(laid.layouts[src.index()].as_ref()?.fold_moves(
+                    laid.layouts[dst.index()].as_ref()?,
+                    *axis,
+                    target.lane_move,
+                ))
+            }
+            _ => None,
+        })
+        .sum();
+    let ir = crate::lower::render(prog, &lowering).unwrap();
+    let moves = ["update.dpp", "permlanex16", "ds.bpermute", "shfl"];
+    let issued = ir.lines().filter(|l| l.contains("call") && moves.iter().any(|m| l.contains(m))).count();
+    assert!(priced > 0);
+    assert_eq!(issued as u32, priced, "{ir}");
 }

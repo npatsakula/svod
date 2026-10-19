@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use snafu::{OptionExt, Snafu, ensure};
 
-use crate::atoms::{Core, Costs, Device, GroupMmaAtom, MmaAtom, Target};
+use crate::atoms::{Core, Costs, Device, GroupMmaAtom, LaneMove, MmaAtom, Target};
 use crate::ir::*;
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
 use crate::layout::{self as frag, Layout};
@@ -169,6 +169,22 @@ impl TileLayout {
 
     pub fn col_fold_masks(&self) -> smallvec::SmallVec<[u32; 6]> {
         crate::layout::lanes_sharing_row(&self.frag.transpose())
+    }
+
+    /// The fold masks of a reduction along `axis`: [`Self::row_fold_masks`]
+    /// over rows, [`Self::col_fold_masks`] over columns.
+    pub fn fold_masks(&self, axis: Axis) -> smallvec::SmallVec<[u32; 6]> {
+        match axis {
+            Axis::Row => self.row_fold_masks(),
+            Axis::Col => self.col_fold_masks(),
+        }
+    }
+
+    /// The lane moves each lane issues reducing `self` along `axis` into
+    /// `dst`: a butterfly over the [`Self::fold_masks`] per register of
+    /// `dst`, each mask moved as `how` moves it.
+    pub fn fold_moves(&self, dst: &Self, axis: Axis, how: LaneMove) -> u32 {
+        dst.regs() * self.fold_masks(axis).iter().map(|&m| how.issues(m)).sum::<u32>()
     }
 
     /// How `self` becomes `dst`, for `warps` warps of `lanes` lanes: lanes
@@ -619,8 +635,9 @@ pub struct Laid {
 /// layouts.
 ///
 /// A product may be issued either way round at no cost, and which way it goes
-/// decides whether the next product takes its result as it stands. The
-/// assignment that forces the least relayout traffic wins — every assignment
+/// decides whether the next product takes its result as it stands and how
+/// many lanes a reduction of it folds across. The assignment of the least
+/// relayout traffic, scattered loads and fold moves wins — every assignment
 /// is tried while the free products are few, one flip at a time beyond that —
 /// so an accumulator that feeds another product reaches it in the layout that
 /// product wants, which on a target whose accumulator is its operand's
@@ -668,7 +685,7 @@ fn scatters(prog: &Program, lay: &TileLayout, from: &Value, lanes: u32) -> bool 
 }
 
 /// Write an orientation into every product of `prog`: the pinned ones stay,
-/// the rest take the assignment of least relayout and scatter cost.
+/// the rest take the assignment of least relayout, scatter and fold cost.
 fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Core) -> Result<()> {
     let Device { target, costs } = device;
     // A product listed twice (a peeled loop trip) is one decision; a
@@ -713,7 +730,20 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Co
                 _ => None,
             })
             .sum();
-        Ok(relayouts + costs.scatter * scattered)
+        // A reduction folds across the lanes that share its rows (or
+        // columns): what the emitter issues per lane, over every lane.
+        let folds: f64 = trial
+            .walk()
+            .filter_map(|(_, s)| match s {
+                Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } => {
+                    let (ls, ld) = (it.lay[src.index()].as_ref()?, it.lay[dst.index()].as_ref()?);
+                    let moves = ls.fold_moves(ld, *axis, target.lane_move) * target.wave * grid.count();
+                    Some(moves as f64)
+                }
+                _ => None,
+            })
+            .sum();
+        Ok(relayouts + costs.scatter * scattered + costs.lane_move * folds)
     };
     let mut best: HashMap<ValId, Orient> = HashMap::new();
     let mut best_cost = cost_of(&best)?;

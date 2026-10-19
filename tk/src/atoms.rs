@@ -243,6 +243,18 @@ pub enum LaneMove {
     Dpp,
 }
 
+impl LaneMove {
+    /// The instructions moving a register from lane `lane ^ mask`: on RDNA a
+    /// DPP `row_xmask` for the bits within a row of 16 and a `permlanex16`
+    /// for the bit across them, one instruction elsewhere.
+    pub fn issues(self, mask: u32) -> u32 {
+        match self {
+            LaneMove::Dpp if mask < 32 => u32::from(mask & 15 != 0) + u32::from(mask & 16 != 0),
+            _ => 1,
+        }
+    }
+}
+
 /// What a device's primitives cost, measured on it by [`crate::probe::costs`]
 /// or declared by a test. The throughput fields are ns of one SM's time per
 /// unit with the device full (device time × SMs / units), so a ranking sums
