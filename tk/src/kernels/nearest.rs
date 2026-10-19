@@ -1,0 +1,302 @@
+//! Each query row's cheapest candidate: query rows resident in registers,
+//! candidate tiles streamed through a shared ring, one `x·cᵀ` product per
+//! tile on the matrix core, then the scores folded into a carried running
+//! minimum and its candidate index rather than a softmax.
+
+use super::attention::WARP_ROWS;
+use super::bound;
+use crate::atoms::Device;
+use crate::build::*;
+use crate::ir::*;
+use crate::layouts::WarpGrid;
+use crate::lower::Lowering;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NearestCfg {
+    /// Query rows per block.
+    pub bq: usize,
+    /// Candidates per trip.
+    pub bkv: usize,
+    pub stages: usize,
+    /// The ring loop unrolled over its slots.
+    pub unroll: bool,
+    /// Query rows a warp owns: [`WARP_ROWS`] or a multiple, every candidate
+    /// fragment read from the ring feeding that many rows.
+    pub warp_rows: usize,
+}
+
+impl NearestCfg {
+    pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
+        Self { bq, bkv, stages, unroll: false, warp_rows: WARP_ROWS }
+    }
+
+    pub fn warps(&self) -> u32 {
+        (self.bq / self.warp_rows) as u32
+    }
+
+    pub fn lowering(&self, device: &Device) -> Lowering {
+        Lowering::uniform(device, self.unroll, WarpGrid { rows: self.warps(), cols: 1 })
+    }
+
+    /// Static shared memory in bytes: the candidate ring of a 16-bit type at
+    /// depth `d`.
+    pub fn smem_bytes(&self, d: usize) -> usize {
+        self.stages * self.bkv * d * 2
+    }
+}
+
+/// What a pair `(i, j)` scores before its floors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Metric {
+    /// `|x_i − c_j|²`, as `|x_i|² + |c_j|² − 2·x_i·c_j` (a rounding may
+    /// leave it a little under zero).
+    #[default]
+    SquaredL2,
+    /// `|c_j|² − 2·x_i·c_j`: the squared distance less the row's own
+    /// `|x_i|²`, which orders a row's candidates alike (an assignment).
+    ShiftedL2,
+    /// `|x_i − c_j|`, the squared distance clamped at zero.
+    L2,
+    /// `−x_i·c_j`: the largest inner product is the least score.
+    NegDot,
+}
+
+impl Metric {
+    /// Whether the candidates' squared norms are an input.
+    pub fn col_norms(self) -> bool {
+        self != Metric::NegDot
+    }
+
+    /// Whether the rows' squared norms are an input.
+    pub fn row_norms(self) -> bool {
+        matches!(self, Metric::SquaredL2 | Metric::L2)
+    }
+}
+
+/// Lower bounds on the scores: `score = max(metric, row_floor[i],
+/// col_floor[j])`, either side optional.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Floors {
+    /// An `[n]` f32 floor per row.
+    pub row: bool,
+    /// An `[m]` f32 floor per candidate.
+    pub col: bool,
+}
+
+/// The rows of `x [n, d]` against the candidates `c [m, d]`, `d` a multiple
+/// of the matrix core's depth (zero columns pad it exactly).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NearestSpec {
+    pub n: usize,
+    pub m: usize,
+    pub d: usize,
+    pub metric: Metric,
+    pub floors: Floors,
+    /// `[n]` and `[m]` i32 group ids: a pair of equal ids is skipped (a
+    /// self-join under groups skips `j = i` with them).
+    pub groups: bool,
+    pub cfg: NearestCfg,
+}
+
+/// The most candidates a kernel ranks: the running index is held in f32,
+/// exact below 2^24.
+pub const MAX_CANDIDATES: usize = 1 << 24;
+
+impl NearestSpec {
+    /// The input parameters in order; the outputs `score [n]` (f32) and
+    /// `index [n]` (i32) follow them.
+    pub fn inputs(&self) -> Vec<&'static str> {
+        [
+            (true, "x"),
+            (true, "c"),
+            (self.metric.col_norms(), "c_sq"),
+            (self.metric.row_norms(), "x_sq"),
+            (self.floors.row, "row_floor"),
+            (self.floors.col, "col_floor"),
+            (self.groups, "row_group"),
+            (self.groups, "col_group"),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| name)
+        .collect()
+    }
+}
+
+/// For every row `i` of `x`, the least score over the candidates `c` (over
+/// `j` with `row_group[i] ≠ col_group[j]` under groups) and the smallest
+/// candidate index scoring it: the row's minimum, then the least column
+/// where a score equals it. A row with no admissible candidate scores `+∞`
+/// at index −1. Parameters as [`NearestSpec::inputs`] names them (`c_sq`,
+/// `x_sq` the squared norms in f32, the floors f32, the groups i32), then
+/// `score [n]` f32 and `index [n]` i32.
+///
+/// The L2 family's scores are compared halved (`c_sq/2 − x·c`, plus `x_sq/2`,
+/// against halved floors; [`Metric::L2`] against its floors clamped at zero
+/// and squared, its square root taken once per row), which orders them as
+/// the metric's own.
+pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
+    let NearestSpec { n, m, d, metric, floors, groups, cfg } = *spec;
+    let NearestCfg { bq, bkv, stages, .. } = cfg;
+    assert!(m <= MAX_CANDIDATES, "{m} candidates pass the f32 index's {MAX_CANDIDATES}");
+    let halved = metric != Metric::NegDot;
+    let mut k = Kernel::new("nearest");
+    let x = k.param::<T>("x", ParamKind::In, n * d);
+    let c = k.param::<T>("c", ParamKind::In, m * d);
+    let c_sq = metric.col_norms().then(|| k.param::<F32>("c_sq", ParamKind::In, m));
+    let x_sq = metric.row_norms().then(|| k.param::<F32>("x_sq", ParamKind::In, n));
+    let row_floor = floors.row.then(|| k.param::<F32>("row_floor", ParamKind::In, n));
+    let col_floor = floors.col.then(|| k.param::<F32>("col_floor", ParamKind::In, m));
+    let grouped =
+        groups.then(|| (k.param::<I32>("row_group", ParamKind::In, n), k.param::<I32>("col_group", ParamKind::In, m)));
+    let score_out = k.param::<F32>("score", ParamKind::Out, n);
+    let index_out = k.param::<I32>("index", ParamKind::Out, n);
+    k.grid([Sc::from(n.div_ceil(bq)), Sc::from(1), Sc::from(1)]);
+    k.warps(cfg.warps());
+    let c_s = k.smem::<T>("c_s", stages * bkv * d);
+
+    let q_off = k.block(0) * bq;
+    let shape = Shape::new(bq, bkv);
+    let rows = Shape::new(bq, 1);
+    // The block's rows of an `[n]` parameter, and a trip's columns of an `[m]` one.
+    fn row_view<E: Elem>(k: &mut Kernel, p: ParamRef<E>, n: usize, bq: usize, q_off: Sc) -> Gmem<E> {
+        let v = k.view(p, 0, [1, 1], Shape::new(bq, 1), [bound(n, bq), None]);
+        k.at(v, q_off, 0)
+    }
+    fn col_view<E: Elem>(k: &mut Kernel, p: ParamRef<E>, m: usize, bkv: usize, start: Sc) -> Gmem<E> {
+        let v = k.view(p, 0, [0, 1], Shape::new(1, bkv), [None, bound(m, bkv)]);
+        k.at(v, 0, start)
+    }
+    let half = |k: &mut Kernel, v: Regs<F32>| {
+        let h = k.fill::<F32>(k.shape(v), Const::Float(0.5));
+        k.binary(v, h, BinaryOp::Mul)
+    };
+    // A floor in the units the scores are compared in.
+    let floor = |k: &mut Kernel, f: Regs<F32>| match metric {
+        Metric::NegDot => f,
+        Metric::SquaredL2 | Metric::ShiftedL2 => half(k, f),
+        Metric::L2 => {
+            let zero = k.zeros::<F32>(k.shape(f));
+            let f = k.binary(f, zero, BinaryOp::Max);
+            let f = k.binary(f, f, BinaryOp::Mul);
+            half(k, f)
+        }
+    };
+    let x_view = k.view(x, 0, [d, 1], Shape::new(bq, d), [bound(n, bq), None]);
+    let x_view = k.at(x_view, q_off.clone(), 0);
+    let q_r = k.load(x_view);
+    let x_sq = x_sq.map(|p| {
+        let v = row_view(&mut k, p, n, bq, q_off.clone());
+        let x_sq = k.load(v);
+        half(&mut k, x_sq)
+    });
+    let row_floor = row_floor.map(|p| {
+        let v = row_view(&mut k, p, n, bq, q_off.clone());
+        let f = k.load(v);
+        floor(&mut k, f)
+    });
+    let row_group = grouped.map(|(p, _)| {
+        let v = row_view(&mut k, p, n, bq, q_off.clone());
+        k.load(v)
+    });
+    let c_view = k.view(c, 0, [d, 1], Shape::new(bkv, d), [bound(m, bkv), None]);
+    let inf = |k: &mut Kernel| k.fill::<F32>(shape, Const::Float(f64::INFINITY));
+
+    let best0 = k.fill::<F32>(rows, Const::Float(f64::INFINITY));
+    let index0 = k.fill::<F32>(rows, Const::Float(-1.0));
+    let [best, index] = k.pipeline(
+        m.div_ceil(bkv),
+        stages,
+        [best0, index0],
+        |k, step, slot| {
+            let c_g = k.at(c_view, step * bkv, 0);
+            let c_t = k.smem_slot::<T>(c_s, slot, Shape::new(bkv, d));
+            k.stage(c_t, c_g, CopyMode::Async);
+        },
+        |k, step, slot, [best, index]| {
+            let start = step * bkv;
+            let c_t = k.smem_slot::<T>(c_s, slot, Shape::new(bkv, d));
+            let zero = k.zeros::<F32>(shape);
+            let dot = k.mma(zero, q_r, false, c_t, true);
+            let mut s = match c_sq {
+                Some(p) => {
+                    let v = col_view(k, p, m, bkv, start.clone());
+                    let c_sq = k.load(v);
+                    let c_sq = half(k, c_sq);
+                    k.binary(c_sq, dot, BinaryOp::Sub)
+                }
+                None => k.unary(dot, UnaryOp::Neg),
+            };
+            if let Some(x_sq) = x_sq {
+                s = k.binary(s, x_sq, BinaryOp::Add);
+            }
+            if let Some(p) = col_floor {
+                let v = col_view(k, p, m, bkv, start.clone());
+                let f = k.load(v);
+                let f = floor(k, f);
+                s = k.binary(s, f, BinaryOp::Max);
+            }
+            if let Some(f) = row_floor {
+                s = k.binary(s, f, BinaryOp::Max);
+            }
+            // A floor clamps the distance already.
+            if metric == Metric::L2 && floors == Floors::default() {
+                let zero = k.zeros::<F32>(shape);
+                s = k.binary(s, zero, BinaryOp::Max);
+            }
+            if let (Some(row_group), Some((_, col_group))) = (row_group, grouped) {
+                let v = col_view(k, col_group, m, bkv, start.clone());
+                let col_group = k.load(v);
+                // Against a full-shape zero: the predicate takes the tile's shape.
+                let zero = k.zeros::<I32>(shape);
+                let row_group = k.binary(row_group, zero, BinaryOp::Add);
+                let same = k.compare(row_group, col_group, CmpOp::Eq);
+                let skipped = inf(k);
+                s = k.where_(same, skipped, s);
+            }
+            // The last trip's columns past `m` read the clamped last row.
+            if !m.is_multiple_of(bkv) {
+                let partial = Sc::from(m).lt(start.clone() + bkv);
+                [s] = k.select_if(
+                    partial,
+                    |k| {
+                        let col = k.coord(shape, Axis::Col);
+                        let left = k.splat::<I32>(shape, Sc::from(m) - start.clone());
+                        let inside = k.compare(col, left, CmpOp::Lt);
+                        let past = inf(k);
+                        [k.where_(inside, s, past)]
+                    },
+                    |_| [s],
+                );
+            }
+            // The columns in f32 (exact below 2^24, as the carried index):
+            // a float minimum folds its negations into the lane moves an
+            // integer one pays for.
+            let low = k.reduce(s, Axis::Row, ReduceOp::Min);
+            let at_low = k.compare(s, low, CmpOp::Eq);
+            let col = k.coord(shape, Axis::Col);
+            let col = k.cast::<I32, F32>(col);
+            let none = inf(k);
+            let cols = k.where_(at_low, col, none);
+            let first = k.reduce(cols, Axis::Row, ReduceOp::Min);
+            let start = k.splat::<F32>(rows, start);
+            let first = k.binary(first, start, BinaryOp::Add);
+            // Strictly lower: an earlier trip's equal score keeps its smaller index.
+            let lower = k.compare(low, best, CmpOp::Lt);
+            [k.where_(lower, low, best), k.where_(lower, first, index)]
+        },
+    );
+    let best = if halved {
+        let two = k.fill::<F32>(rows, Const::Float(2.0));
+        k.binary(best, two, BinaryOp::Mul)
+    } else {
+        best
+    };
+    let best = if metric == Metric::L2 { k.unary(best, UnaryOp::Sqrt) } else { best };
+    let v = row_view(&mut k, score_out, n, bq, q_off.clone());
+    k.store(v, best);
+    let index = k.cast::<F32, I32>(index);
+    let v = row_view(&mut k, index_out, n, bq, q_off);
+    k.store(v, index);
+    k.finish()
+}

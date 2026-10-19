@@ -5,6 +5,7 @@ pub mod attention;
 pub mod conv;
 pub mod gemm;
 pub mod heads;
+pub mod nearest;
 pub mod rows;
 
 use std::f64::consts::{FRAC_1_SQRT_2, LOG2_E};
