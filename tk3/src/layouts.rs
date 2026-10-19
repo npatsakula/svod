@@ -89,6 +89,42 @@ impl TileLayout {
         (wr * sr + rr * fr_n + fr, wc * sc + rc * fc_n + fc)
     }
 
+    /// Register runs `(start, width)` of elements consecutive along `along`
+    /// (columns of one row, or rows of one column) in every lane, aligned to
+    /// their width and at most `max_width` long.
+    pub fn runs(&self, lanes: u32, max_width: u32, along: Axis) -> Vec<(u32, u32)> {
+        let pos = |(r, c): (u32, u32)| if along == Axis::Col { c } else { r };
+        let step = |(r, c): (u32, u32), e: u32| if along == Axis::Col { (r, c + e) } else { (r + e, c) };
+        let mut out = vec![];
+        let mut j = 0;
+        while j < self.regs() {
+            let mut w = max_width.min(self.regs() - j);
+            while w > 1 {
+                let ok = (0..lanes).all(|lane| {
+                    let at = self.coord(0, lane, j);
+                    pos(at) % w == 0 && (1..w).all(|e| self.coord(0, lane, j + e) == step(at, e))
+                });
+                if ok {
+                    break;
+                }
+                w /= 2;
+            }
+            out.push((j, w));
+            j += w;
+        }
+        out
+    }
+
+    /// The register permutation under which this layout is `produced` (what
+    /// an instruction leaves a tile in), if it is one lane for lane.
+    pub fn as_permutation_of(&self, produced: &Self, warps: u32, lanes: u32) -> Option<Vec<u32>> {
+        match produced.relayout(self, warps, lanes) {
+            Relayout::Identity => Some((0..self.regs()).collect()),
+            Relayout::RegPermute(perm) => Some(perm),
+            Relayout::LaneShuffle(_) | Relayout::ViaSmem => None,
+        }
+    }
+
     pub fn transposed(&self) -> Self {
         Self { frag: self.frag.transpose(), reps: [self.reps[1], self.reps[0]], warps: self.warps.transpose() }
     }
@@ -287,26 +323,46 @@ pub fn natural(shape: Shape, warps: u32, lanes: u32) -> Option<TileLayout> {
 }
 
 /// The layout of a register-staged fill: each lane holds a 16-byte run of
-/// a row (the `cp.async` chunk), lanes then warps walk the runs row-major,
-/// and registers repeat the pattern down the rows and across the columns.
-/// Dims only need a power-of-two part as wide as the lanes and warps use,
-/// so 48- and 96-wide tiles repeat by three; warps past the rows replicate.
-pub fn chunked(shape: Shape, elem_bytes: usize, warps: u32, lanes: u32) -> Option<TileLayout> {
+/// a row (the `cp.async` chunk), consecutive lanes walk the runs along
+/// `walk` first (`Col`: along the row, as a row-major tile is written;
+/// `Row`: down the rows, so lanes writing a column-major tile store
+/// consecutive elements), then warps, and registers repeat the pattern down
+/// the rows and across the columns. Dims only need a power-of-two part as
+/// wide as the lanes and warps use, so 48- and 96-wide tiles repeat by
+/// three; warps past the tile replicate.
+pub fn chunked(shape: Shape, elem_bytes: usize, warps: u32, lanes: u32, walk: Axis) -> Option<TileLayout> {
     let pow2 = |n: u32| 1u32 << n.trailing_zeros();
     let (rows, cols) = (shape.rows as u32, shape.cols as u32);
     if rows == 0 || cols == 0 {
         return None;
     }
     let v = (16 / elem_bytes as u32).min(pow2(cols));
-    let lane_cols = pow2(cols / v).min(lanes);
-    let lane_rows = (lanes / lane_cols).min(pow2(rows));
+    let (lane_rows, lane_cols) = match walk {
+        Axis::Col => {
+            let lane_cols = pow2(cols / v).min(lanes);
+            ((lanes / lane_cols).min(pow2(rows)), lane_cols)
+        }
+        Axis::Row => {
+            let lane_rows = pow2(rows).min(lanes);
+            (lane_rows, (lanes / lane_rows).min(pow2(cols / v)))
+        }
+    };
+    let (first, second) = match walk {
+        Axis::Col => (Layout::identity(Lane, lane_cols, Col), Layout::identity(Lane, lane_rows, Row)),
+        Axis::Row => (Layout::identity(Lane, lane_rows, Row), Layout::identity(Lane, lane_cols, Col)),
+    };
+    // Warps tile the rows the lanes left, then the columns, so a tile a wave
+    // covers in rows is divided among the warps instead of written by each.
     let warp_rows = pow2(rows / lane_rows).min(warps);
+    let warp_cols = pow2(cols / (v * lane_cols)).min(warps / warp_rows);
     let frag = Layout::identity(Reg, v, Col)
-        .product(&Layout::identity(Lane, lane_cols, Col))
-        .product(&Layout::identity(Lane, lane_rows, Row))
+        .product(&first)
+        .product(&second)
         .product(&Layout::zeros(Lane, lanes / (lane_cols * lane_rows)));
-    let warps_layout = Layout::identity(Warp, warp_rows, Row).product(&Layout::zeros(Warp, warps / warp_rows));
-    let reps = [rows / (lane_rows * warp_rows), cols / (v * lane_cols)];
+    let warps_layout = Layout::identity(Warp, warp_rows, Row)
+        .product(&Layout::identity(Warp, warp_cols, Col))
+        .product(&Layout::zeros(Warp, warps / (warp_rows * warp_cols)));
+    let reps = [rows / (lane_rows * warp_rows), cols / (v * lane_cols * warp_cols)];
     Some(TileLayout { frag, reps, warps: warps_layout })
 }
 
@@ -551,7 +607,7 @@ impl<'a> Infer<'a> {
                     let (d, s) = (self.prog.value(*dst), self.prog.value(*src));
                     if d.place == Place::Reg && s.tier() == Tier::Global {
                         let (warps, lanes) = (self.prog.warps, self.target.wave);
-                        if let Some(l) = chunked(d.shape, d.dtype.bytes(), warps, lanes) {
+                        if let Some(l) = chunked(d.shape, d.dtype.bytes(), warps, lanes, Axis::Col) {
                             self.set(*dst, l);
                         }
                     }

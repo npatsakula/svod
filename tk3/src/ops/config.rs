@@ -11,7 +11,7 @@ use std::sync::Arc;
 use svod_dtype::GpuArch;
 
 use crate::atoms::Target;
-use crate::ir::{Orient, Shape};
+use crate::ir::{Axis, Orient, Shape};
 use crate::kernels::attention::FaCfg;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
@@ -68,7 +68,7 @@ impl GemmCfg {
             0
         } else {
             let fill =
-                |rows: usize| chunked(Shape::new(rows, bk), 2, wr * wc, target.wave).map(|l| l.regs());
+                |rows: usize| chunked(Shape::new(rows, bk), 2, wr * wc, target.wave, Axis::Col).map(|l| l.regs());
             (fill(bm)? + fill(bn * halves as usize)?).div_ceil(2)
         };
         Some(acc + operands + fill)
@@ -339,7 +339,7 @@ impl FaCfg {
         let fill = if target.cp_async {
             0
         } else {
-            let tile = chunked(Shape::new(self.bkv, d), 2, self.warps(), target.wave)?;
+            let tile = chunked(Shape::new(self.bkv, d), 2, self.warps(), target.wave, Axis::Col)?;
             2 * half(tile.regs())
         };
         let (q, o) = (half(qk.a.regs()), pv.c.regs());

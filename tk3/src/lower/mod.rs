@@ -50,10 +50,65 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     schedule::expand(&mut prog, lowering.schedule);
     materialize_operands(&mut prog);
     sync::insert_barriers(&mut prog);
-    let laid = layouts::infer(prog, &lowering.target, lowering.grid).context(LayoutSnafu)?;
+    let mut laid = layouts::infer(prog, &lowering.target, lowering.grid).context(LayoutSnafu)?;
+    orient_shared(&mut laid, &lowering.target);
     let program = emit::emit(&laid, lowering, params, device)?;
     let Laid { prog, layouts } = laid;
     Ok(Lowered { program, tile: prog, layouts })
+}
+
+/// Store every shared allocation along the axis its readers' fragments run
+/// along: a tile whose consumers each hold runs of rows (a value tile under
+/// the product's B operand, say) is kept column-major, so the gathers are
+/// 16-byte loads instead of one load per element. Only allocations filled
+/// through registers can be stored transposed (the stores scatter; a chunk
+/// copy cannot), and readers that disagree keep the row-major default.
+fn orient_shared(laid: &mut Laid, target: &Target) {
+    let Laid { prog, layouts } = laid;
+    let lanes = target.wave;
+    let alloc = |prog: &Program, v: ValId| match prog.value(v).place {
+        Place::Smem { alloc, .. } => Some(alloc.index()),
+        _ => None,
+    };
+    let mut wants: Vec<Option<Axis>> = vec![None; prog.smem.len()];
+    let mut staged = vec![true; prog.smem.len()];
+    for (_, stmt) in prog.walk() {
+        let Stmt::Copy { dst, src, mode } = stmt else { continue };
+        if let (Some(a), Tier::Global) = (alloc(prog, *dst), prog.value(*src).tier()) {
+            staged[a] &= *mode == CopyMode::Staged;
+        }
+        let (Some(a), Tier::Reg) = (alloc(prog, *src), prog.value(*dst).tier()) else { continue };
+        let l = layouts[dst.index()].as_ref().expect("a laid register tile");
+        let width = 16 / prog.value(*dst).dtype.bytes() as u32;
+        let widest = |along| l.runs(lanes, width, along).iter().map(|&(_, w)| w).max().unwrap_or(1);
+        let along = if widest(Axis::Row) > widest(Axis::Col) { Axis::Row } else { Axis::Col };
+        wants[a] = Some(match wants[a] {
+            Some(other) if other != along => Axis::Col,
+            _ => along,
+        });
+    }
+    let transposed: Vec<usize> = (0..prog.smem.len()).filter(|&i| staged[i] && wants[i] == Some(Axis::Row)).collect();
+    for &i in &transposed {
+        prog.smem[i].along = Axis::Row;
+    }
+    // The staged registers of a column-major tile are walked down its rows,
+    // so a wave's lanes store consecutive elements.
+    let walked: Vec<(ValId, TileLayout)> = prog
+        .walk()
+        .filter_map(|(_, stmt)| match stmt {
+            Stmt::Copy { dst, src, mode: CopyMode::Staged }
+                if alloc(prog, *dst).is_some_and(|a| transposed.contains(&a))
+                    && prog.value(*src).tier() == Tier::Reg =>
+            {
+                let tmp = prog.value(*src);
+                layouts::chunked(tmp.shape, tmp.dtype.bytes(), prog.warps, lanes, Axis::Row).map(|l| (*src, l))
+            }
+            _ => None,
+        })
+        .collect();
+    for (tmp, l) in walked {
+        layouts[tmp.index()] = Some(l);
+    }
 }
 
 /// An `Mma` reads registers: a shared or global operand becomes an explicit

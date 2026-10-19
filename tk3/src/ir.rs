@@ -407,11 +407,16 @@ pub struct Param {
     pub elems: usize,
 }
 
+/// A shared allocation. Its tiles are stored with consecutive elements
+/// along `along`: `Col` is row-major, `Row` column-major. The lowering sets
+/// it to the axis the tiles' consumers read fragments along
+/// (`lower::orient_shared`); an author never does.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SmemAlloc {
     pub name: String,
     pub dtype: ScalarDType,
     pub elems: usize,
+    pub along: Axis,
 }
 
 /// A warp-specialized role: which warps run it and, when the target supports
