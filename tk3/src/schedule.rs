@@ -188,9 +188,16 @@ impl Expander<'_> {
         let started = self.bin(BinOp::Le, one, iv);
         let before_end = self.bin(BinOp::Lt, produce.step, extent);
         let producing = self.bin(BinOp::And, started, before_end);
+        // A consume that places its own waits keeps them: a wait of the
+        // template's after them would close a pipeline stage over the
+        // accumulators the consume rewrote since, and `ptxas` would
+        // serialize every chain of the kernel.
+        let waits = consume.body.0.iter().any(|s| matches!(s, Stmt::Sync(Sync::WaitProducts { .. })));
         let mut consume_body = vec![Stmt::Sync(Sync::WaitAsync { pending: stages as u32 - 3 }), self.barrier()];
         consume_body.extend(consume.body.0);
-        consume_body.push(Stmt::Sync(Sync::WaitProducts { pending: 1 }));
+        if !waits {
+            consume_body.push(Stmt::Sync(Sync::WaitProducts { pending: 1 }));
+        }
         let body = vec![
             Self::if_(consuming, consume_body),
             Self::if_(producing, produce.body.0),
