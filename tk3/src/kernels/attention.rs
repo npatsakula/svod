@@ -326,7 +326,12 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let k_s = k.smem::<T>("k_s", stages * bkv * d);
     let v_s = k.smem::<T>("v_s", stages * bkv * d);
 
-    let (qb, split, hh) = (k.block(0) / splits, k.block(0) % splits, k.block(1));
+    let (order, split, hh) = (k.block(0) / splits, k.block(0) % splits, k.block(1));
+    // Where later queries see more keys (a causal mask, chunks with every
+    // earlier one) the last query blocks run first, so the grid's tail is its
+    // shortest blocks.
+    let descending = causal || chunk.is_some_and(|c| c.left.is_none());
+    let qb = if descending { Sc::from(t.div_ceil(bq) - 1) - order } else { order };
     let q_off = qb * bq;
     let b = bb.clone().unwrap_or(Sc::from(0));
     // Keys past the length are masked; keys past `tk` too when blocks overhang it.
