@@ -3,6 +3,7 @@ mod attention;
 mod build;
 mod conv;
 mod device;
+mod emit;
 mod gather;
 mod heads;
 mod interp;

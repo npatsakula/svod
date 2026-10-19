@@ -302,7 +302,7 @@ impl<'a> Emit<'a> {
                     BinOp::Mul => a.try_mul(&b),
                     BinOp::Div => a.try_cdiv(&b),
                     BinOp::Rem => a.try_cmod(&b),
-                    BinOp::Min => a.try_max(&b).map(|m| a.try_add(&b).unwrap().try_sub(&m).unwrap()),
+                    BinOp::Min => minimum(&a, &b),
                     BinOp::Max => a.try_max(&b),
                     BinOp::Lt => a.try_cmplt(&b).map(|c| c.cast(DType::Int32)),
                     BinOp::Le => a.try_cmple(&b).map(|c| c.cast(DType::Int32)),
@@ -1365,7 +1365,7 @@ impl<'a> Emit<'a> {
                         BinaryOp::Div if x.dtype().is_float() => x.try_div(&y),
                         BinaryOp::Div => x.try_cdiv(&y),
                         BinaryOp::Max => x.try_max(&y),
-                        BinaryOp::Min => x.try_max(&y).map(|m| x.try_add(&y).unwrap().try_sub(&m).unwrap()),
+                        BinaryOp::Min => minimum(&x, &y),
                         BinaryOp::Lt => x.try_cmplt(&y),
                         BinaryOp::Le => x.try_cmple(&y),
                         BinaryOp::Eq => x.try_cmpeq(&y),
@@ -1608,7 +1608,7 @@ impl<'a> Emit<'a> {
             match f {
                 ReduceOp::Sum => x.try_add(y),
                 ReduceOp::Max => x.try_max(y),
-                ReduceOp::Min => x.try_max(y).map(|m| x.try_add(y).unwrap().try_sub(&m).unwrap()),
+                ReduceOp::Min => minimum(x, y),
             }
             .expect("reduce op")
         };
@@ -1766,6 +1766,16 @@ pub fn die_order(linear: u64, total: u64, dies: u64) -> u64 {
     let (base, tall) = (total / dies, total % dies);
     let (die, local) = (linear % dies, linear / dies);
     die * base + die.min(tall) + local
+}
+
+/// `min(x, y)`, which the IR has no node for: a float's is `-max(-x, -y)`,
+/// exact at infinities and NaN-ignoring as `max` is; an integer's is
+/// `x + y - max(x, y)`, exact short of overflow.
+pub(crate) fn minimum(x: &Arc<UOp>, y: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
+    if x.dtype().is_float() {
+        return Ok(x.neg().try_max(&y.neg())?.neg());
+    }
+    x.try_add(y)?.try_sub(&x.try_max(y)?)
 }
 
 /// DPP's `row_xmask` control: OR the lane xor-mask within a row of 16.
