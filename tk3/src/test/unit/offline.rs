@@ -147,7 +147,8 @@ fn a_planner_plans_for_a_card_without_it() {
     let target = Target::card("h100-pcie").expect("a listed card");
     let lines: Vec<String> = H100.iter().map(|&(op, fs)| line("sm_90-114sm", op, "0000000000000001", fs)).collect();
     let dir = store("planner", &target, &lines);
-    let planner = Planner::measured(target, probe::stored(&dir, &Target::card("h100-pcie").unwrap()).unwrap());
+    let planner = Planner::measured(target, probe::stored(&dir, &Target::card("h100-pcie").unwrap()).unwrap())
+        .expect("an H100 has SMs");
     let _ = std::fs::remove_dir_all(dir);
     let bf16 = [DType::BFloat16; 2];
     let x = Extent { dims: vec![4096, 4096], var: false };

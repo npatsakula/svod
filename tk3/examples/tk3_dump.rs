@@ -54,7 +54,8 @@ fn main() -> Result<()> {
             Measured { costs: probe::GUESSED, unmeasured: vec![] }
         }
     };
-    let planner = Planner::measured(target.clone(), measured);
+    let planner = Planner::measured(target.clone(), measured)
+        .ok_or("the planner needs the card's SM count: pass --sms or --card")?;
     let dims: Vec<usize> =
         opt("--shape").ok_or("--shape")?.split('x').map(str::parse).collect::<std::result::Result<_, _>>()?;
     let bf16 = opt("--dtype").unwrap_or("bf16") == "bf16";
