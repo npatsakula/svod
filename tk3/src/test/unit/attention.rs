@@ -413,7 +413,7 @@ fn only_the_live_batch_runs() {
 #[test_case(cached(5, 96, [2, 2, 128], false, 1, 2), &[64, 96]; "cache: d 128, two splits")]
 #[test_case(cached(1, 7, [6, 6, 64], false, 1, 1), &[0, 7]; "cache: appended row only")]
 #[test_case(cached(1, 7, [6, 6, 64], false, 1, 2), &[0, 3]; "cache: appended row only, two splits")]
-#[test_case(cached(8, 128, [4, 4, 48], false, 8, 1), &[128, 40]; "cache: eight appended, d 48")]
+#[test_case(with(FaCfg::new(64, 64, 2), cached(8, 128, [4, 4, 48], false, 8, 1)), &[128, 40]; "cache: eight appended, d 48")]
 #[test_case(counted(cached(16, 128, [2, 2, 64], true, 16, 2)), &[128, 0]; "cache: sixteen counted appended, two splits")]
 #[test_case(with(FaCfg { splits: 3, ..FaCfg::new(16, 64, 2) }, cached(1, 1500, [4, 4, 64], true, 0, 1)), &[1500, 1200]; "cache: bq 16, three splits of 1500 keys")]
 #[test_case(masked(128, 128, 64, 64, 64, PER_BATCH), &[128, 128]; "bias per batch")]
