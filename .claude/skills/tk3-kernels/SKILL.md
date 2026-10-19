@@ -1,6 +1,6 @@
 ---
 name: tk3-kernels
-description: Write, check, debug and profile tile kernels with the `svod-tk3` crate (tk3/src). Use when adding or changing a tile program (`build::Kernel`), wiring it into `svod_tk3::ops` and the config lattice, running it in the host interpreter or on a GPU, reading a lowering/layout/admission rejection, dumping a tk3 kernel's instruction list, LLVM IR, PTX/SASS or AMDGCN for a card this machine does not have, comparing it with cuBLAS/CUTLASS/HipKittens ISA, reading the planner log or the tune store, running the device probes and gates, or checking a change for perf regressions. Covers SVOD_DEVICE for the device gate, the tk3_dump example, RUST_LOG=svod_tk3::plan, TK3_DUMP_LIST, SVOD_TK3_TUNE, SVOD_TK3_TUNE_DIR, device_costs_are_physical, families_match_the_interpreter_on_the_device, the *_probe tests.
+description: Write, check, debug and profile tile kernels with the `svod-tk3` crate (tk3/src). Use when adding or changing a tile program (`build::Kernel`), wiring it into `svod_tk3::ops` and the config lattice, running it in the host interpreter or on a GPU, reading a lowering/layout/admission rejection, dumping a tk3 kernel's instruction list, LLVM IR, PTX/SASS or AMDGCN for a card this machine does not have, comparing its main loop with cuBLAS/CUTLASS/ThunderKittens/HipKittens/AITER ISA, reading the planner log or the tune store (or the config a card's store chose, offline), running the device probes and gates, or checking a change for perf regressions or proving a refactor byte-identical. Covers SVOD_DEVICE for the device gate, the tk3_dump example (--cfg tuned, --compare), the tk3_digest example, SVOD_DUMP_AMD_ASM, RUST_LOG=svod_tk3::plan, TK3_DUMP_LIST, SVOD_TK3_TUNE, SVOD_TK3_TUNE_DIR, device_costs_are_physical, families_match_the_interpreter_on_the_device, the *_probe tests.
 ---
 
 # tk3 tile kernels
@@ -26,7 +26,10 @@ for host work, `SVOD_DEVICE=CUDA` / `AMD` (or `CUDA:0`, `AMD:1`) for device work
 | Device gate: each family vs the interpreter | `SVOD_DEVICE=CUDA cargo test -p svod-tk3 --release --lib families_match_the_interpreter_on_the_device -- --nocapture` |
 | Cost probes on a fresh store (alone, first) | `SVOD_DEVICE=… cargo test -p svod-tk3 --release --lib device_costs_are_physical -- --nocapture` |
 | What would tk3 run on an H100 / MI300X I don't have? | `cargo run -p svod-tk3 --release --example tk3_dump -- --card h100-sxm --op gemm --shape 4096x4096x4096` (see Offline) |
-| Kernel or graph for a shape, and why | `RUST_LOG=svod_tk3::plan=debug` (`graph … why=Shape`, `ranking`, `ranked`, `compiled`, `tuned`) |
+| What did the tuner pick on that card? | the same with `--cfg tuned --store <its tune store>` (read-only replay) |
+| Main loop beside cuBLAS/TK/HK/AITER | the same with `--compare <.cubin/.co/.s/.sass> [--fun NAME]` |
+| Did a refactor change any emitted kernel? | `tk3_digest --out A` at base and change, `tk3_digest --diff A B` (see Performance-regression protocol) |
+| Kernel or graph for a shape, and why | `RUST_LOG=svod_tk3::plan=debug` (`graph … why=Shape`, `ranking`, `ranked`, `compiled`, `admitted`, `choice`, `tuned`) |
 | Emitted instruction list | `TK3_DUMP_LIST=1` (stderr, every `emit` call); pin one config with `SVOD_TK3_TUNE=0` or use `tk3_dump` |
 | LLVM IR / AMDGCN as compiled on a device | `SVOD_DUMP_NVPTX_IR=<dir>` / `SVOD_DUMP_AMD_IR=<dir>` → `<arch>_<kernel>_<ir digest>.ll`, `SVOD_DUMP_AMD_ASM=<dir>` → `.s` |
 | Tuning off | `SVOD_TK3_TUNE=0` (process) or `tune::scoped(false, f)` (this thread): the first clean ranked config runs; probes still measure |
@@ -105,11 +108,13 @@ Tests live in `tk3/src/test/unit/<topic>.rs` (never in-place; `test_case` tables
 
 **Planner log.** `RUST_LOG=svod_tk3::plan=debug` (`ops::PLAN`): `graph op why` (the silent fallback),
 `ranking problem admitted rejected`, the first 16 `ranked rank ns regs cfg`, on a store miss `compiled cfg verdict
-registers scratch`, then `tuned op shape pick` / `attention tuned`. `RUST_LOG=svod_tk3=debug` adds `tuner's first
+registers scratch`, then each stage's configs as Debug text (the store's lines hold indices only): `first cfg stored`,
+`admitted configs stored` (`stored=false`: nothing compiled, the untested shortlist), `choice timed=[(cfg, ns)…]`,
+`twins admitted compiled`, then `tuned op shape pick` / `attention tuned`; a replay adds `replayed lookup`. `RUST_LOG=svod_tk3=debug` adds `tuner's first
 round`/`leaders`/`rounds`/`twins` and `probe pair timed`/`resolved`. Device tests install the subscriber (`traced()` inside `device_target()`); `tk3_dump` installs its own.
 
 **Dumps.** `TK3_DUMP_LIST` (`lower/emit/mod.rs`) prints `[i] id=N "Op" dtype <- [src ids]`; the tuner lowers every
-candidate and `launch.rs` memoizes, so pin one config (`SVOD_TK3_TUNE=0`, one test, or `tk3_dump --cfg N`).
+candidate and `launch.rs` memoizes, so pin one config (`SVOD_TK3_TUNE=0`, one test, or `tk3_dump --cfg N|tuned`).
 `SVOD_DUMP_{NVPTX,AMD}_IR` and `SVOD_DUMP_AMD_ASM` write on an object-cache hit too, one file per IR
 (`<arch>_<kernel name>_<ir digest>.{ll,s}`): every config of `gemm` the tuner compiles gets its own. Host IR for
 any target: `lower::render(prog, &lowering)` or `lower::standalone(prog, &lowering)?.text(&target)`.
@@ -133,19 +138,32 @@ runs the AMD data path on NVIDIA. A target counts as measured only once its gate
 ## Offline: plan and ISA for a card you don't have
 
 `cargo run -p svod-tk3 --release --example tk3_dump -- (--card NAME | --arch sm_90a|gfx942|… [--sms N] [--xcds N])
---op gemm|attention --shape MxNxK|BxHxTxD [--causal] [--dtype bf16|f16] [--cfg I] [--top N] [--store DIR] [--out DIR]`
-(`tk3/examples/tk3_dump.rs`; `--out` defaults to `./tk3_dump`). Prints the costs used (`GUESSED fixture` unless
-`--store` holds a copied tune store with that card's `<arch>_<sms>sm` file), the top configs with predicted ns and
-registers, rejection counts by `Rejected` reason, then writes `plan.txt` (every ranked and rejected config),
-`kernel.ll`, and on CUDA `kernel.ptx`, `ptxas.txt` (`ptxas -v -warn-spills`), `kernel.cubin`, `kernel.sass`
-(`nvdisasm -c`; tools from `PATH` or `/opt/cuda/bin`), on AMD `kernel.s` with its `; NumVgprs … Occupancy` line, and a
-**main-loop opcode histogram** (innermost back-edge holding a matrix instruction). Caveats: `--cfg 0` is the ranking's
-first config, not the tuner's pick (a guessed gfx1201 4096³ ranking leads with a spilling 256×256 tile, `ScratchSize:
-524`); emit the next ones with `--cfg 1`, `--cfg 2`, …. `TK3_DUMP_LIST` and `SVOD_DUMP_NVPTX_IR` work under it too.
+--op OP --shape S [--dtype bf16|f16] [--cfg I|tuned] [--top N] [--store DIR] [--out DIR] [--compare FILE [--fun NAME]]`
+(`tk3/examples/tk3_dump.rs`; `--out` defaults to `./tk3_dump`). `OP`/`S`: `gemm MxNxK` (`--bias --residual --gated
+--act silu|gelu`), `attention BxHxTxD` (`--causal`), `norm RxD` (`--norm rms|layer --residual --bias`), `conv
+BxHxWxCINxCOUT` (`--kernel --stride --pad --dilation`, epilogue flags), `heads BxTxHxKVxD` (`--qk-norm --rope`), each
+through `ops::shape` and `ops::tuned` as the op runs. Prints the costs used (`GUESSED fixture` unless `--store` holds
+that card's `<arch>_<sms>sm` file), the top configs with predicted ns and registers, rejection counts by `Rejected`
+reason, then writes `plan.txt`, `kernel.ll`, and on CUDA `kernel.ptx`, `ptxas.txt` (`ptxas -v -warn-spills`),
+`kernel.cubin`, `kernel.sass` (`nvdisasm -c`; tools from `PATH` or `/opt/cuda/bin`), on AMD `kernel.s` with its
+`; NumVgprs … Occupancy` line, and the **main-loop opcode histogram** (`svod_tk3::isa::main_loop`: the innermost
+back-edge holding a matrix instruction). A split conv/attention emits its first program only.
+
+`--cfg I` is the ranking's `I`th config (`0` is not the tuner's pick: a guessed gfx1201 4096³ ranking leads with a
+spilling 256×256 tile). `--cfg tuned` replays the op's tuning through `TuneStore::replay(--store)`, which never
+writes (no line, no `emitted/` memo): a line matches by `kind|op|device|dtype|shape|candidates` (`candidates` digests
+the salt and the config list's Debug text, so the ranking must be the card's: its stored probes), any compiler
+digest (no device here); among several, this build's programs fingerprint (`Own`), else other builds' (`Built`, or
+`Disagree`: first taken). Each key read is printed; a `Missing` key is an error with the shape's other lines counted.
+A GEMM reads `linear`'s lines, else the device tests'/GEMM probes' (`gemm`, `ops::DEVICE_TEST`); with
+`SVOD_TK3_TUNE=0` the `first` lines. `TK3_DUMP_LIST` and `SVOD_DUMP_NVPTX_IR` work under it too.
 
 ## Comparing with vendor kernels offline
 
-Build the reference side to the same artefacts `tk3_dump` writes, then compare per main-loop step: matrix
+Build the reference side, then `tk3_dump … --compare <file> [--fun NAME]` prints both main loops per opcode side by
+side (`isa::table`; a `.cubin` through `nvdisasm -c`, a `.co`/`.hsaco` through `llvm-objdump -d --symbolize-operands`,
+anything else as SASS/PTX/AMDGCN text; `--fun` is required when the file holds several kernels, the error lists them;
+`reference.*` keeps the text). Compare per main-loop step: matrix
 instructions, global/shared loads and stores, waits and barriers, address arithmetic; plus registers, spills, LDS/smem,
 occupancy. Local toolchains: CUDA 13.4 in `/opt/cuda/bin` (`nvcc`, `ptxas`, `nvdisasm`, `cuobjdump`), ROCm in
 `/opt/rocm` (`hipcc`, `roc-obj-ls`/`roc-obj-extract`; `llvm-objdump`, `llvm-readelf`, `llvm-mca` in `/opt/rocm/llvm/bin`).
@@ -154,8 +172,8 @@ Reference sources are local checkouts under `submodules/` (untracked; may be abs
 | Reference | How |
 |---|---|
 | cuBLASLt | `cuobjdump -lelf /opt/cuda/lib64/libcublasLt.so.13.8.0.4` lists the embedded cubins by arch (1376 `sm_90a`, 1608 `sm_120`, 118 `sm_86`); in an empty dir `cuobjdump -arch sm_90a -xelf all <lib>` extracts them (0.4 s, 396 MB), `grep -l -a -F <kernel> *.cubin` finds the one holding a kernel (names read like `sm90_xmma_gemm_bf16bf16_bf16f32_f32_nt_n_tilesize64x256x64_…`), then `cuobjdump -sass -fun <kernel> <cubin>` and `-res-usage` (registers, shared). Which kernel cuBLAS picks for a shape needs the card (`nsys` there). `-fun` over the whole 545 MB library visits every cubin (> 5 min) |
-| CUTLASS / ThunderKittens / FA3 | one instantiation, compiled only: `nvcc -std=c++20 -O3 -arch=sm_90a -DKITTENS_HOPPER -I…/include -I…/prototype -cubin -Xptxas -v x.cu -o x.cubin` (TK `kernels/gemm/bf16_h100`: 1 s, `matmul_template<2,4,8>` 168 regs, 12 `HGMMA` in `nvdisasm -c`); `--keep` leaves the PTX. FA3: one file such as `submodules/flash-attention/hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu` (not built here; the whole extension takes ~1 h) |
-| HipKittens / CK | `hipcc -std=c++20 -O3 --offload-arch=gfx942 --offload-device-only -S -Rpass-analysis=kernel-resource-usage -I<hk>/include -I<hk>/prototype -I/opt/rocm/include -I/opt/rocm/include/hip $(python3 -m pybind11 --includes) …/256_256_64_16.cpp -o hk.s` (2 s; remarks give VGPR/AGPR/SGPR/LDS/scratch/occupancy; `-save-temps` keeps every stage). CK: one `example/ck_tile/01_fmha` instance the same way |
+| CUTLASS / ThunderKittens / FA3 | one instantiation, compiled only: `nvcc -std=c++20 -O3 --use_fast_math --expt-extended-lambda --expt-relaxed-constexpr -DNDEBUG -arch=sm_90a -DKITTENS_HOPPER -I…/include -I…/prototype -cubin -Xptxas -v x.cu -o x.cubin` (TK `kernels/gemm/bf16_h100`: 1 s, `matmul_template<2,4,8>` 168 regs, a 170-instruction main loop of 8 `HGMMA.64x256x16`; without `--expt-relaxed-constexpr` CUDA 13 refuses `bit_cast`); `--keep` leaves the PTX. FA3: one file such as `submodules/flash-attention/hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu` (not built here; the whole extension takes ~1 h) |
+| HipKittens / CK | `hipcc -std=c++20 -O3 --offload-arch=gfx942 --offload-device-only -S -Rpass-analysis=kernel-resource-usage -I<hk>/include -I<hk>/prototype -I/opt/rocm/include -I/opt/rocm/include/hip $(python3 -m pybind11 --includes) …/256_256_64_16.cpp -o hk.s` (2 s; remarks give VGPR/AGPR/SGPR/LDS/scratch/occupancy; `-save-temps` keeps every stage); `-c --no-gpu-bundle-output` instead of `-S` gives the ELF `.co` (without it, an offload bundle `llvm-objdump` cannot read). CK: one `example/ck_tile/01_fmha` instance the same way |
 | hipBLASLt / AITER | prebuilt `.co` (hipBLASLt's are not installed here: take them from a ROCm wheel or image; AITER ships `hsa/gfx942/*.co`): `llvm-objdump -d --mcpu=gfx942`, `llvm-readelf --notes` for `.vgpr_count`/`.group_segment_fixed_size` |
 
 What a static comparison cannot tell: stall reasons, achieved overlap of copies and products, L2/MALL hit rates and
@@ -172,7 +190,8 @@ probes in femtoseconds) keyed by op, device, dtype, shape, candidate digest, com
 fingerprint of the **emitted kernels** (lowered program + LLVM text), so only a change in what a kernel emits re-measures.
 The emitted fingerprints are memoized per build in `emitted/<build>.txt` (dropped after 7 days unused). A new FORMAT
 orphans every file: the next run re-probes and re-tunes every shape (budget the cold run). Read the probes without
-re-running: `grep '^value|probe:' <file>`; indices point into the ranked list, so map them with the planner log.
+re-running: `grep '^value|probe:' <file>`; indices point into the ranked list: the planner log names their configs,
+`tk3_dump --cfg tuned` follows them offline.
 
 ## Measuring
 
@@ -197,9 +216,11 @@ tk3 kernels appear as `gemm`, `flash_attention`, `heads`, `layer_norm`/`rms_norm
 
 For a change under `ops/config.rs`, `probe.rs`, `tune.rs`, `schedule.rs`, `layouts.rs`, `layout/`, `atoms.rs`, `lower/`:
 
-1. **What changed in the code emitted**: before/after, render the affected families with `lower::render` (a scratch
-   host test over `targets::families(&target)` per target of the sweep, or `tk3_dump` per card) and diff or digest the text; byte-identical output needs no device run. A refactor meant to be neutral
-   should prove it this way on every target of the sweep.
+1. **What changed in the code emitted**: `cargo run -p svod-tk3 --release --example tk3_digest -- --out <dir>` in a
+   worktree at the base and at the change (≈45 s each: ~600 kernels × ten targets, `sweep::digested` under the declared
+   costs: families, shortlists, attention/conv/norm/heads/probe variants; `--targets sm_86,gfx942`, `--full` keeps the
+   `.ll`), then `tk3_digest --diff <a> <b>`: kernels changed/removed/added per target and whether `rankings.txt`
+   moved; exit 1 on any. Byte-identical output needs no device run; a refactor meant to be neutral proves it this way.
 2. **Host**: `cargo fmt`, `cargo clippy --workspace --all-targets`, `SVOD_DEVICE=CPU cargo test -p svod-tk3 --release
    --lib`, then the workspace: `cargo test --workspace --no-run` and the `svod-codegen`, `svod-tensor`, `svod-model` lib
    tests (model builds tk3 configs, codegen renders tk3 kernels; two regressions passed every tk3 suite and broke them).
@@ -221,5 +242,6 @@ For a change under `ops/config.rs`, `probe.rs`, `tune.rs`, `schedule.rs`, `layou
 | `tk3/src/schedule.rs`, `layouts.rs`, `layout/`, `atoms.rs` | templates; inference, `Swizzle`; F2 algebra; `Target`, `CARDS`, `Costs` |
 | `tk3/src/ops/{mod,shape,config,linear,attention,heads,norm,conv}.rs` | op layer, `PLAN`, plan gate, lattice, `Planner`, `Rejected`, `Tuner` |
 | `tk3/src/tune.rs`, `probe.rs`, `launch.rs`, `interp.rs` | store, `scoped`, timing; probes, `stored`, `GUESSED`; launch memo; interpreter |
-| `tk3/src/test/unit/{mod,targets,device,offline,ops,ops_plan,probe,tune,emit,sync}.rs` | gate, sweep, device tests, probes |
-| `tk3/examples/tk3_dump.rs` | offline plan + IR + ISA + main-loop histogram |
+| `tk3/src/test/unit/{mod,targets,device,offline,ops,ops_plan,probe,tune,replay,isa,sweep,emit,sync}.rs` | gate, sweep, device tests, probes, store replay, ISA reader |
+| `tk3/src/isa.rs`, `tk3/src/sweep.rs` (`#[doc(hidden)]`) | main loop, functions, side-by-side table; the sweep's targets, families, digest set |
+| `tk3/examples/tk3_dump.rs`, `tk3_digest.rs` | offline plan + IR + ISA + `--cfg tuned` + `--compare`; render digests + `--diff` |

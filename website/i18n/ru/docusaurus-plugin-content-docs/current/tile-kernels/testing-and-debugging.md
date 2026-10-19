@@ -109,6 +109,21 @@ cargo run -p svod-tk3 --release --example tk3_dump -- --arch gfx942 --op attenti
 делают угаданные стоимости. `--cfg N` выпускает N-ю ранжированную конфигурацию, `--out DIR`
 задаёт выходной каталог (`tk3_dump`).
 
+`--op` принимает `gemm` (`--shape MxNxK`), `attention` (`BxHxTxD`), `norm` (`RxD`), `conv`
+(`BxHxWxCINxCOUT`) или `heads` (`BxTxHxKVxD`), каждый через собственные проверку формы и тюнинг
+слоя операций. `--cfg tuned` выпускает конфигурацию, которую тюнер выбрал на карте, читая её из
+копии `--store` и ничего в неё не записывая: сохранённая строка совпадает по операции,
+устройству, типу, форме и списку конфигураций, по которому её ключует слой операций, каким бы
+компилятором и какой бы сборкой ядер она ни была записана; дамп печатает каждый прочитанный ключ
+или говорит, какой строки нет. `--compare FILE [--fun NAME]` печатает главный цикл эталонного
+ядра (`.cubin`, объект кода AMD или текст SASS, PTX либо AMDGCN) рядом с главным циклом tk3,
+посчитанным тем же способом.
+
+```bash
+cargo run -p svod-tk3 --release --example tk3_dump -- --card rtx3060 --op gemm --shape 4096x4096x4096 --cfg tuned --store ~/.cache/svod/tk3_tune
+cargo run -p svod-tk3 --release --example tk3_dump -- --card mi300x --op gemm --shape 4096x4096x4096 --compare hk.co --fun NAME
+```
+
 ## Переменные окружения {#environment-variables}
 
 | Переменная | Эффект |

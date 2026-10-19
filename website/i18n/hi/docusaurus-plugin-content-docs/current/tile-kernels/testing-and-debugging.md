@@ -103,6 +103,20 @@ cargo run -p svod-tk3 --release --example tk3_dump -- --arch gfx942 --op attenti
 directory है, जिसकी probe lines ranking की कीमत तय करती हैं; उसके बिना guessed costs यह करती हैं।
 `--cfg N` N-वाँ ranked config emit करता है, `--out DIR` output directory का नाम देता है (`tk3_dump`)।
 
+`--op` `gemm` (`--shape MxNxK`), `attention` (`BxHxTxD`), `norm` (`RxD`), `conv`
+(`BxHxWxCINxCOUT`) या `heads` (`BxTxHxKVxD`) लेता है, हर एक op layer के अपने shape gate और tuning
+से होकर। `--cfg tuned` वह config emit करता है जो tuner ने कार्ड पर चुना था, उसे `--store` copy से
+पढ़कर और उसमें कुछ लिखे बिना: stored line op, device, dtype, shape और उस config list से match होती है
+जिससे op layer उसे key करता है, चाहे उसे किसी भी compiler या kernel build ने लिखा हो, और dump पढ़ी गई
+हर key print करता है या बताता है कि कौन-सी line नहीं है। `--compare FILE [--fun NAME]` किसी reference
+kernel (एक `.cubin`, AMD code object, या SASS, PTX या AMDGCN text) का main loop tk3 के main loop के
+बगल में print करता है, उसी तरह गिना हुआ।
+
+```bash
+cargo run -p svod-tk3 --release --example tk3_dump -- --card rtx3060 --op gemm --shape 4096x4096x4096 --cfg tuned --store ~/.cache/svod/tk3_tune
+cargo run -p svod-tk3 --release --example tk3_dump -- --card mi300x --op gemm --shape 4096x4096x4096 --compare hk.co --fun NAME
+```
+
 ## Environment variables {#environment-variables}
 
 | Variable | असर |

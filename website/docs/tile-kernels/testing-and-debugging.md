@@ -103,6 +103,20 @@ cargo run -p svod-tk3 --release --example tk3_dump -- --arch gfx942 --op attenti
 card, whose probe lines price the ranking; without it the guessed costs do. `--cfg N` emits the
 N-th ranked config, `--out DIR` names the output directory (`tk3_dump`).
 
+`--op` takes `gemm` (`--shape MxNxK`), `attention` (`BxHxTxD`), `norm` (`RxD`), `conv`
+(`BxHxWxCINxCOUT`) or `heads` (`BxTxHxKVxD`), each through the op layer's own shape gate and
+tuning. `--cfg tuned` emits the config the tuner chose on the card, read from the `--store`
+copy without writing to it: a stored line matches by op, device, dtype, shape and the config list
+the op layer keys it by, whatever compiler or kernel build wrote it, and the dump prints each key
+it read or says which line is missing. `--compare FILE [--fun NAME]` prints the main loop of a
+reference kernel (a `.cubin`, an AMD code object, or SASS, PTX or AMDGCN text) beside tk3's,
+counted the same way.
+
+```bash
+cargo run -p svod-tk3 --release --example tk3_dump -- --card rtx3060 --op gemm --shape 4096x4096x4096 --cfg tuned --store ~/.cache/svod/tk3_tune
+cargo run -p svod-tk3 --release --example tk3_dump -- --card mi300x --op gemm --shape 4096x4096x4096 --compare hk.co --fun NAME
+```
+
 ## Environment variables
 
 | Variable | Effect |
