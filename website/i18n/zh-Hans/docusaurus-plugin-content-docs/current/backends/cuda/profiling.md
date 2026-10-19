@@ -4,7 +4,7 @@ sidebar_label: 剖析
 
 # CUDA 上的剖析
 
-[分层 profiler](../../tile-kernels/profiling.md) 在 `DispatchTimestamps` 与
+分层 profiler (`ExecutionPlan::profile`) 在 `DispatchTimestamps` 与
 `KernelResources` 句柄之上是后端中立的。本页讲的是 CUDA 后端往那些句柄里
 放了什么，以及有哪些层级存在。
 

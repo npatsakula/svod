@@ -1,250 +1,180 @@
 ---
-sidebar_label: एक कर्नेल लिखना
+sidebar_label: आपका पहला कर्नेल
 ---
 
-# अपना पहला कर्नेल लिखना
+# आपका पहला कर्नेल
 
-[IR में authoring](./lowering) ने builder को theory में समझाया था: `Kernel` आपको कच्चा माल देता है,
-`Group` compute वाली शब्दावली साथ रखता है, और `finish` सब कुछ एक `SINK` में wrap कर देता है। यह chapter
-इसे ठोस बनाता है — सबसे छोटा कर्नेल लिखकर जो असल में कुछ काम करता है (**दो `16×16` tiles load करो, उन्हें
-add करो, नतीजा store करो**), और फिर उसे run करके।
+tk3 कर्नेल एक Rust function है जो `Kernel` builder से एक tile program रिकॉर्ड करता है। हर कॉल खुले
+block में एक statement जोड़ती है और एक typed handle लौटाती है। Handle अपना tier (`Gmem<T>`,
+`Shared<T>`, `Regs<T>`) और element type (`BF16`, `F16`, `F32`, `I32`, `Bool`) साथ रखता है।
+Statement रिकॉर्ड होते समय shapes जाँचे जाते हैं। Block indices, offsets और trip counts जैसे
+scalars साधारण operators से बने `Sc` expressions हैं।
 
-यह जान-बूझकर सबसे सरल चीज़ है जो फिर भी एक कर्नेल के पूरे shape को छू लेती है: [Tiling क्या है](./tiling)
-वाला load → compute → store का सफ़र, code में ढला हुआ। न कोई matrix multiply, न shared memory, न कोई loop —
-बस इतना कि हर step नज़र आ जाए। matmul और Flash Attention कर्नेल इसी skeleton पर बने हैं, बस ऊपर और सामान
-चढ़ा हुआ है।
+## एक न्यूनतम कर्नेल {#a-minimal-kernel}
 
-```mermaid
-flowchart LR
-  A["a (GL)"] -->|"load"| RA["ra (RT)"]
-  B["b (GL)"] -->|"load"| RB["rb (RT)"]
-  RA --> ADD["add"]
-  RB --> ADD
-  ADD --> RC["rc (RT)"]
-  RC -->|"store"| O["out (GL)"]
-```
-
----
-
-## पूरा कर्नेल
-
-यह रहा end to end — buffers declare करो, body बनाओ, run करो, और नतीजा वापस पढ़ो:
+`[rows, 64]` f32 matrix पर `y = 2·x + 1`, हर block में 16 rows। View की row bound की वजह से आख़िरी
+block की `rows` से आगे की rows शून्य पढ़ी जाती हैं और उनके writes छोड़ दिए जाते हैं, इसलिए `rows` का
+16 का गुणज होना ज़रूरी नहीं।
 
 ```rust
-use svod_dtype::DType;
+use svod_tk3::build::*;
+use svod_tk3::interp::run;
+use svod_tk3::ir::*;
+
+fn axpb(rows: usize) -> Program {
+    let cols = 64;
+    let mut k = Kernel::new("axpb");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    k.grid([Sc::from(rows.div_ceil(16)), Sc::from(1), Sc::from(1)]);
+    k.warps(4);
+    let row0 = k.block(0) * 16;
+    let tile = |k: &mut Kernel, p: ParamRef<F32>| {
+        let v = k.view(p, 0, [cols, 1], Shape::new(16, cols), [Some(Sc::from(rows)), None]);
+        k.at(v, row0.clone(), 0)
+    };
+    let xv = tile(&mut k, x);
+    let v = k.load(xv);
+    let two = k.fill::<F32>(Shape::new(16, cols), Const::Float(2.0));
+    let one = k.fill::<F32>(Shape::new(16, cols), Const::Float(1.0));
+    let v = k.binary(v, two, BinaryOp::Mul);
+    let v = k.binary(v, one, BinaryOp::Add);
+    let yv = tile(&mut k, y);
+    k.store(yv, v);
+    k.finish()
+}
+
+// On the host, no GPU: one Vec<f64> per parameter in, every parameter out.
+let x: Vec<f64> = (0..40 * 64).map(f64::from).collect();
+let out = run(&axpb(40), vec![x, vec![0.0; 40 * 64]], &[])?;
+assert_eq!(out[1][64 * 39 + 1], 2.0 * (64.0 * 39.0 + 1.0) + 1.0);
+```
+
+`view(param, offset, [row_stride, col_stride], shape, bounds)` किसी parameter में एक window है।
+`at(view, rows, cols)` उसे खिसकाता है और bounds को नए origin के सापेक्ष रखता है।
+
+## GEMM, क़दम दर क़दम {#the-gemm-step-by-step}
+
+`kernels/gemm.rs` `c = act(a·bᵀ + bias) + residual` (या gated weight से `act(gate)·up`) की गणना
+लगभग 180 lines में करता है, जिनमें इसके spec और config types भी शामिल हैं। नीचे के अंश हूबहू हैं।
+
+**Parameters और grid.** Buffers flat हैं और batch capacity के हिसाब से आकार लेते हैं। Bound batch
+variable grid z बन जाता है।
+
+```rust
+let a = k.param::<T>("a", ParamKind::In, cap * m * kk);
+let b = k.param::<T>("b", ParamKind::In, halves * n * kk);
+let bias = epi.bias.then(|| k.param::<T>("bias", ParamKind::In, halves * n));
+let residual = epi.residual.then(|| k.param::<T>("residual", ParamKind::In, cap * m * n));
+let c = k.param::<T>("c", ParamKind::Out, cap * m * n);
+let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
+let (gz, bb) = batch.axis(&mut k);
+k.grid([Sc::from(gm), Sc::from(gn), gz]);
+k.warps(cfg.warps[0] * cfg.warps[1]);
+```
+
+**Padding की जगह bounds वाले views.** `bound(len, tile)` सिर्फ़ वहीं `Some(len)` है जहाँ tile grid
+`len` से आगे निकलता है। कोई भी `m` और `n` बिना copy के चलते हैं। सिर्फ़ `k` का `bk` का गुणज होना
+ज़रूरी है।
+
+```rust
+let (bx, by) = tile_order(&mut k, gm, gn, cfg.group_m);
+let (row0, col0) = (bx * bm, by * bn);
+let (m_bound, n_bound) = (bound(m, bm), bound(n, bn));
+let a_view = k.view(a, batch_offset(&bb, m * kk), [kk, 1], Shape::new(bm, bk), [m_bound.clone(), None]);
+let a_view = k.at(a_view, row0.clone(), 0);
+```
+
+`tile_order` `group_m` tile rows के समूहों में चलता है ताकि resident blocks L2 में B साझा करें।
+
+**Pipeline.** `pipeline(extent, stages, init, produce, consume)` `stages` shared slots की ring पर
+एक producer और एक consumer घोषित करता है। लेखक बताता है कि slot में क्या copy करना है और उससे क्या
+गणना करनी है। [Schedule template](./layouts-and-lowering#schedule-templates) तय करता है कि copies
+कितना आगे चलें और हर wait और barrier कहाँ रखा जाए।
+
+```rust
+k.pipeline(
+    trips,
+    stages,
+    init,
+    |k, step, slot| {
+        let koff = step * bk;
+        for (src, alloc, shape) in
+            std::iter::once((a, a_s, sa)).chain(bs.into_iter().zip(b_s).map(|(b, s)| (b, s, sb)))
+        {
+            let g = k.at(src, 0, koff.clone());
+            let t = k.smem_slot::<T>(alloc, slot.clone(), shape);
+            k.stage(t, g, CopyMode::Async);
+        }
+    },
+    |k, _step, slot, accs| {
+        let a_t = k.smem_slot::<T>(a_s, slot.clone(), sa);
+        let mut i = 0;
+        accs.map(|acc| {
+            let b_t = k.smem_slot::<T>(b_s[i], slot.clone(), sb);
+            i += 1;
+            k.mma(acc, a_t, false, b_t, true)
+        })
+    },
+)
+```
+
+`mma(acc, a, a_t, b, b_t)` f32 accumulators पर `acc + A·B` है। यह कभी किसी instruction का नाम नहीं
+लेता: lowering target का matrix-core atom चुनती है और `a`, `b` और `acc` को उसके layouts देती है।
+
+**Epilogue** f32 accumulator पर चलता है, और नतीजा store पर एक ही बार round होता है। Bias एक
+`[1, bn]` row vector है जो tile पर broadcast होता है, और residual एक पूरा tile है।
+
+```rust
+if let Some(residual) = residual {
+    let r = tile(&mut k, residual);
+    let r = load_f32(&mut k, r);
+    out = k.binary(out, r, BinaryOp::Add);
+}
+let out = k.cast::<F32, T>(out);
+let c_view = tile(&mut k, c);
+k.store(c_view, out);
+k.finish()
+```
+
+## इसे device पर चलाना {#running-it-on-the-device}
+
+`launch::graph_launch` हर घोषित parameter के लिए क्रम से एक tensor लेता है और पहला output एक lazy
+`Tensor` के रूप में लौटाता है। नतीजा realize होने पर कर्नेल चलता है, किसी भी graph kernel की तरह।
+
+```rust
+use svod_dtype::{DType, default_device::default_device};
 use svod_tensor::Tensor;
-use svod_tk::arch::FragRole;
-use svod_tk::tiles::TileLayout;
-use svod_tk::{run_kernel, MoveIdx};
+use svod_tk3::atoms::Target;
+use svod_tk3::build::BF16;
+use svod_tk3::kernels::Batch;
+use svod_tk3::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk3::launch::graph_launch;
 
-// Two 16×16 inputs and an output, as flat f32 buffers.
-let a: Vec<f32> = (0..256).map(|i| i as f32).collect();
-let b: Vec<f32> = (0..256).map(|i| (2 * i) as f32).collect();
-let ta = Tensor::from_slice(&a);
-let tb = Tensor::from_slice(&b);
-let mut out = Tensor::empty(&[1, 1, 16, 16], DType::Float32);
-
-// One wave covers the tile; its width is 64 on CDNA, 32 on RDNA, CUDA and Metal.
-let arch = svod_tk::target::resolve_arch(&ta.device()).expect("a GPU device");
-let w = svod_tk::ArchCaps::for_arch(arch).wave_size as i64;
-
-run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| {
-    let warp = ker.warp();
-
-    // Globals, in launch order: output first, then the two inputs.
-    let o = ker.gl(&[1, 1, 16, 16], DType::Float32);
-    let ga = ker.gl(&[1, 1, 16, 16], DType::Float32);
-    let gb = ker.gl(&[1, 1, 16, 16], DType::Float32);
-
-    // Ask for the 16×16 f32 fragment by role — arch-correct on wave32 and wave64.
-    let frag = ker.frag(FragRole::Accumulator);
-
-    // global → register
-    let ra = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), ga, MoveIdx::block((0, 0, 0, 0), 2));
-    let rb = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), gb, MoveIdx::block((0, 0, 0, 0), 2));
-
-    // the one compute op
-    let rc = warp.add(ra, &rb);
-
-    // register → global, then close the kernel around its single store
-    let _ = warp.store(o, rc, MoveIdx::block((0, 0, 0, 0), 2));
-    ker.finish(1)
-})
-.expect("tile_add launch");
-
-let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
+let (m, n, k) = (1000, 512, 256);
+let target = Target::for_device(&default_device()).expect("a GPU target");
+let cfg = GemmCfg { tile: [64, 64, 32], stages: 3, warps: [2, 2], group_m: 8, unroll: true };
+let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
+let a = Tensor::empty(&[m * k], DType::BFloat16);
+let b = Tensor::empty(&[n * k], DType::BFloat16);
+let c = Tensor::empty(&[m * n], DType::BFloat16);
+let c = graph_launch(gemm::<BF16>(&spec), &cfg.lowering(target), &[&a, &b, &c])?;
+c.realize()?;
 ```
 
-बस यही पूरा कर्नेल है। बाक़ी का chapter इसकी एक-एक line पर चलता है।
+मॉडल यह ख़ुद नहीं करते: [`ops::linear`](./op-layer) config चुनता है, output को shape देता है और
+कर्नेल लागू न होने पर ग्राफ़ पर लौट जाता है।
 
----
+## Builder कॉल्स {#builder-calls}
 
-## Step by step
+| समूह | कॉल्स |
+|---|---|
+| घोषणाएँ | `param`, `var` (launch variable जो नाम से bind होता है), `grid`, `warps`, `smem` |
+| Scalars | `block(axis)`, `warp()`, `load_scalar(param, index)`, `Sc` operators और `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
+| Views | `view`, `at`, `smem_view`, `smem_slot` |
+| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `compare`, `cast`, `where_`, `reduce`, `mma` |
+| Movement | `stage` (global → shared, `CopyMode::Async` या `Sync`), `load`, `store` |
+| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches) |
 
-### 1. Launch declare करें
-
-`run_kernel` DEBUG चेहरे से direct-dispatch वाली entry है: यह inputs realize करता है, outputs allocate
-करता है, आपके लिए एक `Kernel` बनाता है, `SINK` पाने के लिए आपका closure run करता है, फिर compile और
-dispatch करता है — और outputs को सीधे जगह पर लिख देता है।
-
-```rust
-run_kernel("tile_add", [1, 1, 1], w, &mut [&mut out], &[&ta, &tb], |ker| { /* body */ })
-```
-
-`[1, 1, 1]` grid और `w` block — यही launch geometry है। हम **एक wave का एक workgroup** इस्तेमाल करते हैं:
-पूरा `16×16` tile एक ही wave के registers में समा जाता है, इसलिए blocks भर में फैलाने को कुछ है ही नहीं।
-block size `w` है, यानी **wave width** — जिसे हमने पहले ही device से query कर लिया था
-(`ArchCaps::for_arch(resolve_arch(&ta.device())).wave_size`), क्योंकि एक wave CDNA पर 64 lanes की होती है पर
-RDNA, NVIDIA और Apple पर 32, और block dimension *वही* lane count है। output slice पहले आता है, inputs बाद
-में — और **यही order वह contract है** जिस पर अगला step टिका है।
-
-### 2. काम के लिए एक wave लें
-
-```rust
-let warp = ker.warp();
-```
-
-`Group` ही वह एक साथ काम करने वाली wave है (`warp` उसी चीज़ के लिए NVIDIA का शब्द है)। हर compute op —
-loads, add, store — इसी पर एक method है। `ker.warp()` single-wave group देता है; `ker.group(n)` किसी बड़े
-tile के लिए आपको `n` waves दे देता।
-
-### 3. Globals declare करें
-
-```rust
-let o  = ker.gl(&[1, 1, 16, 16], DType::Float32);
-let ga = ker.gl(&[1, 1, 16, 16], DType::Float32);
-let gb = ker.gl(&[1, 1, 16, 16], DType::Float32);
-```
-
-एक **global layout** (`GL`) किसी एक buffer पर एक typed view है — यह logical shape जानता है, इसलिए loads
-सही address compute कर पाते हैं। हर `gl()` call declaration order में *अगला* buffer bind करता है, और वह
-order launch से मेल खाना चाहिए: हमने `&mut [&mut out]` फिर `&[&ta, &tb]` पास किया था, इसलिए हम `o`, फिर
-`ga`, फिर `gb` declare करते हैं। इस order में चूक हुई, तो कर्नेल ग़लत buffers पढ़ता और लिखता है।
-
-`[1, 1, 16, 16]` shape वही 4-D addressing convention है जो tk कर्नेल इस्तेमाल करते हैं; दो शुरुआती `1`s
-batch/head dimensions हैं, जिन्हें असली कर्नेल iterate करता, पर यहाँ trivial छोड़ दी गई हैं। (input *tensors*
-ख़ुद flat 256-element buffers हो सकते हैं — logical shape तो `GL` view देता है; अपना shape सिर्फ़ output
-tensor साथ रखता है, allocation के लिए।)
-
-### 4. role से tile माँगें
-
-```rust
-let frag = ker.frag(FragRole::Accumulator);
-```
-
-यह [Layouts और wave size](./wave-portability) वाली portability की चाल है, और यह उस कर्नेल में भी मायने रखती
-है जिसमें कोई matrix multiply है ही नहीं: वही logical `16×16` f32 tile हर supported architecture पर एक *अलग
-physical lane layout* रखता है, इसलिए किसी hardcoded fragment के बजाय एक **role** का नाम लेने से एक ही body
-उन सबके लिए compile हो जाती है। हम कर्नेल से `Accumulator` role माँगते हैं — यानी बस एक
-full-precision result tile का role, जो एक add भी produce करता है, सिर्फ़ MMA ही नहीं — और `Kernel::frag`
-इसे `ArchCaps::frag` को आगे सौंप देता है ताकि target के लिए physical fragment resolve हो सके: CDNA पर wave64
-stride map, RDNA3 पर even/odd wave32 layout, RDNA4 पर प्रति lane 8 वाला strided map, CUDA पर two-half
-`mma.sync` layout, और Apple पर 8×8 fragments का 2×2 grid। (`ker.acc((16, 16), TileLayout::Row)`
-`ker.rt(.., DType::Float32, .., ker.frag(FragRole::Accumulator))` का एक-call वाला shortcut है; library
-कर्नेल इसी को इस्तेमाल करते हैं।)
-
-### 5. Load: global → register
-
-```rust
-let ra = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), ga, MoveIdx::block((0, 0, 0, 0), 2));
-let rb = warp.load(ker.rt((16, 16), DType::Float32, TileLayout::Row, frag), gb, MoveIdx::block((0, 0, 0, 0), 2));
-```
-
-`ker.rt(...)` अभी resolve हुई fragment layout में एक register tile allocate करता है; `warp.load` इसे global
-से भर देता है। `MoveIdx::block((0, 0, 0, 0), 2)` बताता है कि global का *कौन-सा* tile पढ़ना है: यह tuple चारों
-dimensions में से हर एक पर tile का coordinate है — सब zero, क्योंकि एक अकेले `16×16` tile की बस `(0, 0)`
-position होती है — और `2` वह axis है जिसके साथ ये tiles stacked हैं: dimension 2, यानी `[1, 1, 16, 16]`
-view का row dimension। (एक `[1, 1, 32, 16]` global में दो row-tiles होते; दूसरे को पढ़ने पर वह coordinate
-`1` हो जाता।) wave मिलकर 256 elements को सीधे registers में खींच लेती है, पहले से ही उस layout में
-जो compute चाहता है।
-
-यह *सीधा* `global → register` path है — बीच में कोई shared-memory रुकावट नहीं। जो कर्नेल बड़े tensors stream
-करता, वह पहले एक shared tile से होकर stage करता (coalescing और एक conflict-free swizzle के लिए, यानी
-[FLOPS कहाँ छिपते हैं](./where-flops-hide) वाले gaps); हम इसे छोड़ देते हैं क्योंकि एक अकेले resident tile को
-इनमें से किसी की ज़रूरत नहीं।
-
-### 6. Compute: इकलौता op
-
-```rust
-let rc = warp.add(ra, &rb);
-```
-
-कर्नेल में इकलौती arithmetic। `add` tile पर elementwise है — न कोई lane indexing, न address math, बस "इन
-दो tiles को add कर दो।" (यह पहला operand by value और दूसरा by reference लेता है, और result tile लौटाता
-है।) यहीं, असली कर्नेल में, `mma`, reductions, और elementwise maps आते; उनके इर्द-गिर्द की mechanics ठीक
-वही है जो आप यहाँ देख रहे हैं।
-
-### 7. Store और finish
-
-```rust
-let _ = warp.store(o, rc, MoveIdx::block((0, 0, 0, 0), 2));
-ker.finish(1)
-```
-
-`warp.store` result tile को वापस output global में लिख देता है — वही indexing, बस उलटे क्रम में।
-`ker.finish(1)` कर्नेल को इसके **इकलौते** store के इर्द-गिर्द बंद करता है और `SINK` produce करता है (stamped
-`opts_to_apply: Some(vec![])`, ताकि optimizer hand-lowered body को अकेला छोड़ दे, जैसा
-[IR में authoring](./lowering) ने बताया था)। `finish` को आप जो number पास करते हैं वह यह है कि कितने output
-stores को `SINK` में collect करना है — हमारे पास एक output है, इसलिए `1`।
-
-### 8. इसे run करें और वापस पढ़ें
-
-closure जैसे ही return करता है, `run_kernel` उसी पल compile और dispatch कर देता है। output सीधे जगह पर
-bound था, इसलिए हम इसे tensor से सीधे पढ़ लेते हैं:
-
-```rust
-let result = out.as_vec::<f32>().expect("read out"); // result[i] == 3 * i
-```
-
-`a[i] = i` और `b[i] = 2i` के साथ, हर element `3i` बनकर वापस आता है।
-
----
-
-## वे नियम जिन्हें आप तोड़ नहीं सकते
-
-कुछ constraints load-bearing हैं — एक में भी चूक हुई तो आपको compile error, एक panic, या एक ग़लत जवाब
-मिलता है:
-
-| नियम | क्यों |
-|------|-----|
-| **Tile dims `16` के गुणक हों** | एक tile `16×16` matrix-core fragments की पूरी संख्या है; `ker.rt` इसे assert करता है। |
-| **`gl()` order = launch buffer order** | पहले outputs, फिर inputs। bind positional है; एक mismatch चुपचाप buffers swap कर देता है — ग़लत numbers, कोई error नहीं, इसलिए compiler इसे पकड़ नहीं पाता। |
-| **fragments role से माँगें, constant से नहीं** | `ker.frag(role)` ही वह चीज़ है जो एक body को wave32 पर, wave64 पर, NVIDIA के warp32 पर *और* Apple के SIMD group पर चलाती है। |
-| **यह एक GPU कर्नेल है** | builder असली lane indices (`Op::Special`) mint करता है, इसलिए execution एक GPU को target करता है — AMD, CUDA या Metal — CPU को नहीं। |
-
----
-
-:::tip[GPU विशेषज्ञों के लिए]
-body बिल्कुल [IR में authoring](./lowering) वाले `RANGE` / `INDEX` / `LOAD` / `STORE` shape में lower होता
-है — कोई नए node types नहीं। कर्नेल एक lane-index `Op::Special` mint करता है जिस पर wave के loads सवार होते
-हैं; हर `warp.load` उस lane के तहत एक global `LOAD` बनता है, `warp.add` एक अकेला `Op::Binary(Add)` है, और
-store एक `STORE` है जिस पर `SINK` close होता है। यहाँ **न** कोई `Wmma` है **न** `Local` address space वाला
-कोई `BUFFER`: यह एक register-only round-trip है, सबसे compact कर्नेल जिसे IR express कर सकता है।
-
-चूँकि कर्नेल `Special` ops emit करता है, यह एक पूरी तरह hand-lowered GPU कर्नेल *है* — optimizer और
-workgroup-dimension passes एक `Special`-bearing graph को already-lowered मानकर उसे pass through कर देते हैं
-(वही gate जिसे `opts_to_apply: Some(vec![])` enforce करता है)। इसीलिए यह सिर्फ़ किसी GPU backend — AMD, NVPTX
-या Metal — पर render होता है: lane index का scalar CPU path पर कोई मतलब नहीं। हालाँकि `SINK` *बनाना* तो
-विशुद्ध UOp construction है — इसके लिए किसी GPU की ज़रूरत नहीं; ज़रूरत सिर्फ़ इसे execute करने में पड़ती है।
-यही बँटवारा एक कर्नेल को हर build पर एक host-side shape check से guarded रहने देता है, और on-device numbers
-के लिए एक अलग gated test रखता है: `tk/src/test/unit/guide.rs` में ठीक यही body है, जो हर `cargo test` पर
-इसका graph shape जाँचती है, और `--ignored` के तहत इसे hardware पर चलाती है ([डीबगिंग](./debugging))।
-:::
-
----
-
-## यह क्यों ज़रूरी है
-
-यह नन्हा कर्नेल वही template है जिसमें हर tk कर्नेल ढाला जाता है। GEMM इसमें एक `mma`, एक shared-memory
-strip और एक K-loop जोड़ता है, और worked [Flash Attention](./flash-attention) example matrix core को एक
-online-softmax recurrence, double-buffered streaming, और एक layout branch के साथ काम पर लगाता है। पर बुनियादी
-ढाँचा ठीक वही है जो आपने अभी लिखा: globals को launch order में declare करो, tiles को role से माँगो, memory
-spaces के बीच data move करो, tiles पर compute करो, और `finish`। इस skeleton को सीख लीजिए, फिर मुश्किल कर्नेल
-इसे बदलते नहीं, बस इसमें और जोड़ते जाते हैं।
-
-और यह सब एक ही UOp IR है। जो `SINK` आपने बनाया, वह उसी तरह की object है जो compiler एक autotuned कर्नेल के
-लिए produce करता है — और यही इस पूरे section का असल मक़सद है।
-
-आगे बाक़ी शब्दावली — [Builder API](./builder-reference) — और फिर वह बारीकी जो हाथ से authoring को सचमुच
-मुश्किल बना देती है, यानी एक कर्नेल को wave sizes और fragment layouts भर में correct रखना:
-[Layouts और wave size](./wave-portability)।
+`role_block`, `raw` और `transpose` रिकॉर्ड किए जा सकते हैं पर अभी lower नहीं होते: lowering उनके
+लिए `Error::Unsupported` लौटाती है।

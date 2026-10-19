@@ -4,7 +4,7 @@ sidebar_label: Profiling
 
 # CUDA पर Profiling
 
-[स्तरित profiler](../../tile-kernels/profiling.md) `DispatchTimestamps` और
+स्तरित profiler (`ExecutionPlan::profile`) `DispatchTimestamps` और
 `KernelResources` handles के ऊपर backend-neutral है। यह पेज बताता है कि CUDA बैकएंड उन
 handles में क्या डालता है, और कौन-से tiers मौजूद हैं।
 
