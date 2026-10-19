@@ -660,7 +660,10 @@ fn grouped(spec: AttnSpec) -> AttnSpec {
 /// The warpgroup core's kernel (four row warps a group of 64 query rows,
 /// both products chains over shared descriptors) against the program on
 /// every mask form, ragged blocks and a cache without appended rows, and
-/// against the warp-level kernel's output bits.
+/// within one bf16 ulp of the warp-level kernel's output: the two cores
+/// accumulate a `k16` step alike (bit for bit in the GEMM,
+/// `device::warpgroup_gemm_matches_the_warp_core`), and the softmax around
+/// them is the same code.
 #[test_case(spec(64, 64, 64, 64, 64, false, false), &[64, 64]; "one key block")]
 #[test_case(spec(128, 192, 64, 64, 64, false, false), &[192, 192]; "three key blocks")]
 #[test_case(spec(256, 256, 64, 64, 64, true, false), &[256, 256]; "causal")]
@@ -695,8 +698,11 @@ fn warpgroup_kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
     let group = on_device(&spec, lens, target.clone());
     let warp = on_device(&AttnSpec { cfg: FaCfg { core: Core::Warp, ..spec.cfg }, ..spec }, lens, target);
     let equal = group.iter().zip(&warp).filter(|(g, w)| g == w).count();
-    let ulps = group.iter().zip(&warp).map(|(g, w)| (*g as i32 - *w as i32).unsigned_abs()).max().unwrap_or(0);
+    // Bits as a signed magnitude, so ±0 agree and a sign change counts its steps.
+    let ordered = |b: u16| if b & 0x8000 == 0 { i32::from(b) } else { -i32::from(b & 0x7fff) };
+    let ulps = group.iter().zip(&warp).map(|(g, w)| (ordered(*g) - ordered(*w)).unsigned_abs()).max().unwrap_or(0);
     eprintln!("{equal} of {} bit-equal to the warp-level kernel, at most {ulps} bf16 ulps apart", group.len());
+    assert!(ulps <= 1, "the warpgroup kernel is {ulps} bf16 ulps from the warp-level one");
 }
 
 /// The split merge alone: random partials through the kernel against the
