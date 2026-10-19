@@ -46,12 +46,28 @@ fn a_float_minimum_is_exact(a: f64, b: f64, want: f64) {
     }
 }
 
-/// An integer minimum keeps its exact sum form.
+/// An integer minimum is exact.
 #[test_case(-7, 3; "mixed signs")]
 #[test_case(5, 5; "equal sides")]
 fn an_integer_minimum_is_exact(a: i64, b: i64) {
     let c = |v| UOp::const_(DType::Int32, ConstValue::Int(v));
     assert_eq!(eval(&minimum(&c(a), &c(b)).unwrap()), ConstValue::Int(a.min(b)));
+}
+
+/// An integer minimum's range is the minimum of its sides' ranges, plain and
+/// sound: no wider than either side, as an index bounded by one side is.
+#[test_case((0, 9), (3, 5); "one range inside the other")]
+#[test_case((0, 9), (10, 20); "disjoint")]
+#[test_case((-4, 6), (2, 30); "overlapping")]
+fn an_integer_minimum_keeps_its_range_exact(a: (i64, i64), b: (i64, i64)) {
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::SoundVminVmaxProperty;
+    let x = UOp::scalar_param(0, Some("x".into()), DType::Int32, a.0, a.1);
+    let y = UOp::scalar_param(1, Some("y".into()), DType::Int32, b.0, b.1);
+    let m = minimum(&x, &y).unwrap();
+    let want = (ConstValue::Int(a.0.min(b.0)), ConstValue::Int(a.1.min(b.1)));
+    assert_eq!((*m.vmin(), *m.vmax()), want, "plain range");
+    assert_eq!(*SoundVminVmaxProperty::get(&m), Some(want), "sound range");
 }
 
 /// Lowered, a float tile's elementwise and reduced minimum add and subtract
@@ -227,4 +243,46 @@ fn a_register_transpose_lowers(tile: Shape, warps: u32, pinned: bool) {
     let device = Device { target: crate::atoms::sm86(), costs: super::costs() };
     let lowering = Lowering::uniform(&device, false, WarpGrid { rows: warps, cols: 1 });
     linear(k.finish(), &lowering);
+}
+
+/// The segment mask's last-row start, `seg_start[b·t + min(q_off + bq − 1, t − 1)]`,
+/// is inside its parameter wherever the block is, so it is read once ahead
+/// of the key loop, not under the pipeline's per-trip consume branch.
+#[test_case(false; "warp core on sm_86")]
+#[test_case(true; "warpgroup core on sm_90")]
+fn the_segment_bounds_are_read_ahead_of_the_key_loop(group: bool) {
+    use crate::kernels::Batch;
+    use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
+    use crate::kernels::gemm::Core;
+
+    let (target, cfg) = if group {
+        (super::targets::hopper(), FaCfg { core: Core::Group, ..FaCfg::new(64, 64, 2) })
+    } else {
+        (crate::atoms::sm86(), FaCfg::new(64, 64, 3))
+    };
+    let spec = AttnSpec {
+        batch: Batch::Var { name: "b".into(), min: 1, max: 4 },
+        t: 100,
+        tk: 100,
+        heads: 4,
+        kv_heads: 2,
+        d: 64,
+        mask: AttnMask { seg_start: true, ..AttnMask::default() },
+        cache: None,
+        scale: 0.125,
+        cfg,
+    };
+    let prog = attention::<F16>(&spec);
+    let slot = prog.params.iter().position(|p| p.name == "seg_start").expect("a segment parameter");
+    let lowering = cfg.lowering(&super::declared(target));
+    let linear = linear(prog, &lowering);
+    let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
+    let reads_segments = |u: &Arc<UOp>| {
+        let Op::Load(ops::Load { index, .. }) = u.op() else { return false };
+        index.toposort().iter().any(|n| matches!(n.op(), Op::Param(p) if p.arg.slot == slot))
+    };
+    let reads: Vec<usize> = (0..list.len()).filter(|&i| reads_segments(&list[i])).collect();
+    let key_loop = list.iter().position(|u| matches!(u.op(), Op::Range(..))).expect("a key loop");
+    assert!(reads.len() >= 2, "the first and last rows' starts, read at {reads:?}");
+    assert!(reads.iter().all(|&i| i < key_loop), "reads at {reads:?}, key loop from {key_loop}");
 }

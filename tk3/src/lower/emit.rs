@@ -1834,14 +1834,15 @@ pub fn die_order(linear: u64, total: u64, dies: u64) -> u64 {
     die * base + die.min(tall) + local
 }
 
-/// `min(x, y)`, which the IR has no node for: a float's is `-max(-x, -y)`,
-/// exact at infinities and NaN-ignoring as `max` is; an integer's is
-/// `x + y - max(x, y)`, exact short of overflow.
+/// `min(x, y)`, which the IR has no node for: `-max(-x, -y)`. A float's is
+/// exact at infinities and NaN-ignoring as `max` is. An integer's range is
+/// exact, `[min(x₀, y₀), min(x₁, y₁)]`, where `x + y - max(x, y)` loses the
+/// correlation of its terms and widens an index past its parameter; its
+/// negation wraps, so a side of `i32::MIN` yields the other side. Only a
+/// scalar read from memory can hold `i32::MIN`, a length no valid input has:
+/// every other operand is a size, a coordinate or a variable in its range.
 pub(crate) fn minimum(x: &Arc<UOp>, y: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
-    if x.dtype().is_float() {
-        return Ok(x.neg().try_max(&y.neg())?.neg());
-    }
-    x.try_add(y)?.try_sub(&x.try_max(y)?)
+    Ok(x.neg().try_max(&y.neg())?.neg())
 }
 
 /// DPP's `row_xmask` control: OR the lane xor-mask within a row of 16.
