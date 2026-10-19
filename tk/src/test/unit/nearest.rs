@@ -382,25 +382,7 @@ fn nearest_throughput_probe() {
             for (metric, floors, groups) in
                 [(Metric::SquaredL2, NONE, false), (Metric::SquaredL2, NONE, true), (Metric::L2, BOTH, false)]
             {
-                let what = format!("d{d} {metric:?} {floors:?} groups={groups}");
-                let (admitted, pick) = device_nearest(&planner, ROWS, d, metric, floors, groups);
-                let mut timed = admitted.clone();
-                if !timed.contains(&pick) {
-                    timed.push(pick);
-                }
-                let spec = |cfg| NearestSpec { n: ROWS, m: ROWS, d, metric, floors, groups, cfg };
-                let ns = super::measure(
-                    timed.iter().map(|&cfg| vec![(nearest::<BF16>(&spec(cfg)), cfg.lowering(&planner.device))]),
-                );
-                eprintln!("== nearest {what}: {} admitted", admitted.len());
-                let pairs = (ROWS * ROWS) as f64;
-                for (cfg, ns) in timed.iter().zip(ns) {
-                    let mark = if *cfg == pick { " (tuner's pick)" } else { "" };
-                    let rate = ns.map_or("failed".into(), |ns| {
-                        format!("{:8.2} ms {:7.1} Gpairs/s", ns as f64 / 1e6, pairs / ns as f64)
-                    });
-                    eprintln!("  {cfg:?}: {rate}{mark}");
-                }
+                time_nearest(&planner, ROWS, d, metric, floors, groups);
                 match graph_seconds(GRAPH_ROWS, d, metric, floors, groups) {
                     Some(s) => eprintln!(
                         "  graph at {GRAPH_ROWS}: {:8.2} ms {:7.1} Gpairs/s",
@@ -412,6 +394,68 @@ fn nearest_throughput_probe() {
             }
         }
     });
+}
+
+/// Pairs a second and TFLOP/s (`2·d` a pair) over a self-join of `ROWS`
+/// rows at the depths of embeddings, whose rows stream, of the tuner's pick
+/// and every config it admitted: squared distances and the inner product
+/// (cosine over normalized rows); beside the tuner's GEMM pick on the same
+/// device at `8192 × 8192 × d` and at 4096³, timed alike. Prints, never
+/// asserts (run with `--ignored --nocapture --test-threads=1`).
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn nearest_wide_probe() {
+    const ROWS: usize = 1 << 16;
+    let Some(planner) = super::device_planner() else { return };
+    crate::tune::scoped(true, || {
+        for d in [256, 512, 768, 1024] {
+            for metric in [Metric::SquaredL2, Metric::NegDot] {
+                time_nearest(&planner, ROWS, d, metric, NONE, false);
+            }
+            time_gemm(&planner, 8192, 8192, d);
+        }
+        time_gemm(&planner, 4096, 4096, 4096);
+    });
+}
+
+/// Times the tuner's pick for an `n`-row self-join and every config it
+/// admitted, printing each one's pairs a second and TFLOP/s.
+fn time_nearest(planner: &Planner, n: usize, d: usize, metric: Metric, floors: Floors, groups: bool) {
+    let (admitted, pick) = device_nearest(planner, n, d, metric, floors, groups);
+    let mut timed = admitted.clone();
+    if !timed.contains(&pick) {
+        timed.push(pick);
+    }
+    let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups, cfg };
+    let ns =
+        super::measure(timed.iter().map(|&cfg| vec![(nearest::<BF16>(&spec(cfg)), cfg.lowering(&planner.device))]));
+    eprintln!("== nearest {n}x{n}x{d} {metric:?} {floors:?} groups={groups}: {} admitted", admitted.len());
+    let pairs = (n * n) as f64;
+    for (cfg, ns) in timed.iter().zip(ns) {
+        let mark = if *cfg == pick { " (tuner's pick)" } else { "" };
+        let rate = ns.map_or("failed".into(), |ns| {
+            let ns = ns as f64;
+            format!("{:8.2} ms {:7.1} Gpairs/s {:6.2} TFLOP/s", ns / 1e6, pairs / ns, 2.0 * d as f64 * pairs / ns / 1e3)
+        });
+        eprintln!("  {cfg:?}: {rate}{mark}");
+    }
+}
+
+/// Times the tuner's GEMM pick for `m × n × k`, as the tuner times it.
+fn time_gemm(planner: &Planner, m: usize, n: usize, k: usize) {
+    use crate::kernels::Batch;
+    use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: super::device::BIG };
+    let (_, cfg) = super::device::device_gemms(planner, &spec);
+    let [ns] = super::measure([vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec }), cfg.lowering(&planner.device))]])[..]
+    else {
+        unreachable!("one candidate")
+    };
+    let rate = ns.map_or("failed".into(), |ns| {
+        let ns = ns as f64;
+        format!("{:8.2} ms {:6.2} TFLOP/s", ns / 1e6, 2.0 * (m * n * k) as f64 / ns / 1e3)
+    });
+    eprintln!("== gemm {m}x{n}x{k} {cfg:?}: {rate} (tuner's pick)");
 }
 
 /// The configs the tuner admits for an `n`-row self-join on the device, and its pick.
