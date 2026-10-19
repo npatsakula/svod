@@ -19,7 +19,7 @@ use crate::kernels::gemm::{Epilogue, GemmCfg};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch;
 use crate::lower::lower;
-use crate::ops::config::{conv_candidates, conv_cfg_fits, conv_tiles};
+use crate::ops::config::{conv_candidates, conv_cfg_fits};
 
 pub(super) fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, p: usize, d: usize) -> ConvGeom {
     ConvGeom { h: hw[0], w: hw[1], cin, cout, kernel: [k, k], stride: [s, s], pad: [p, p], dilation: [d, d] }
@@ -289,7 +289,7 @@ fn conv_candidates_lower() {
     for class in YOLO {
         let g = yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        let cands = conv_tiles(&target, 1, ho * wo, &g);
+        let cands = conv_candidates(&target, 1, ho * wo, &g);
         assert!(!cands.is_empty() || g.cin == 48, "{g:?}");
         for ConvCfg { gemm: c, split } in cands {
             assert!(conv_cfg_fits(&c) && g.cin.is_multiple_of(c.tile[2]) && c.smem_bytes(false) <= target.smem_bytes);
@@ -307,25 +307,24 @@ fn conv_candidates_lower() {
 fn conv_lead_tiles(cin: usize, cout: usize, hw: usize, s: usize, tile: Option<[usize; 3]>) {
     let g = geom([hw, hw], cin, cout, 3, s, 1, 1);
     let [ho, wo] = g.out_hw();
-    let lead = conv_tiles(&sm86(), 1, ho * wo, &g).first().map(|c| c.gemm.tile);
+    let lead = conv_candidates(&sm86(), 1, ho * wo, &g).first().map(|c| c.gemm.tile);
     assert_eq!(lead, tile);
 }
 
-/// The classes measured to lose keep the graph: shallow stride-1 bodies
-/// whose grid fills the device; the starved ones and every deep or
-/// stride-2 class keep their tiles.
+/// Every YOLO26x 3×3 class but the 48-channel bodies has candidates; a
+/// starved grid has split ones.
 #[test]
-fn shallow_stride_one_bodies_on_a_full_grid_have_no_candidates() {
-    let declined: Vec<(usize, usize, [usize; 2])> = YOLO
+fn only_the_48_channel_bodies_have_no_candidates() {
+    let none: Vec<(usize, usize)> = YOLO
         .into_iter()
         .map(yolo_geom)
         .filter(|g| {
             let [ho, wo] = g.out_hw();
             conv_candidates(&sm86(), 1, ho * wo, g).is_empty()
         })
-        .map(|g| (g.cin, g.cout, [g.h, g.w]))
+        .map(|g| (g.cin, g.cout))
         .collect();
-    assert_eq!(declined, [(192, 192, [40, 40]), (96, 96, [80, 80]), (48, 48, [160, 160])]);
+    assert_eq!(none, [(48, 48)]);
     let starved = geom([20, 20], 192, 192, 3, 1, 1, 1);
     assert!(conv_candidates(&sm86(), 1, 400, &starved).iter().any(|c| c.split > 1));
 }
@@ -334,7 +333,7 @@ fn shallow_stride_one_bodies_on_a_full_grid_have_no_candidates() {
 #[test_case(8; "eight channels")]
 #[test_case(40; "a multiple of 8 only")]
 fn too_few_channels_have_no_candidates(cin: usize) {
-    assert!(conv_tiles(&sm86(), 1, 6400, &geom([80, 80], cin, 64, 3, 1, 1, 1)).is_empty());
+    assert!(conv_candidates(&sm86(), 1, 6400, &geom([80, 80], cin, 64, 3, 1, 1, 1)).is_empty());
 }
 
 // ---- on the device -----------------------------------------------------------------
@@ -440,7 +439,7 @@ fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
         let [ho, wo] = g.out_hw();
         let params = inputs(&g, 1, RESIDUAL_SILU_BIAS, 13);
         let want = graph_reference(&g, 1, RESIDUAL_SILU_BIAS, &params);
-        for c in conv_tiles(&target, 1, ho * wo, &g) {
+        for c in conv_candidates(&target, 1, ho * wo, &g) {
             let (epilogue, split) = (RESIDUAL_SILU_BIAS, c.split);
             let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue, cfg: c.gemm, split };
             let got = on_device(&spec, &target, &params);
@@ -564,8 +563,7 @@ fn conv_throughput_probe() {
         let flops = 2.0 * (ho * wo * cout * g.k()) as f64;
         let tflops = |ns: f64| flops / ns / 1e3;
         let label = format!("{cin}->{cout} s{stride} @{side}");
-        let cands = conv_tiles(&target, 1, ho * wo, &g);
-        let declined = conv_candidates(&target, 1, ho * wo, &g).is_empty();
+        let cands = conv_candidates(&target, 1, ho * wo, &g);
         let build = |c: ConvCfg| {
             let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue: SILU_BIAS, cfg: c.gemm, split: c.split };
             spec.programs::<F16>(&target)
@@ -609,7 +607,6 @@ fn conv_throughput_probe() {
         let graph = (0..20).map(|_| plan_ns(&plan)).min().unwrap() as f64;
         let best = times.iter().flatten().min().map(|&t| t as f64);
         let tk3 = best.map_or("none".into(), |t| format!("{:.1} us {:.1} TFLOP/s", t / 1e3, tflops(t)));
-        let tk3 = if declined { format!("{tk3} (declined: the graph runs)") } else { tk3 };
         eprintln!("{label}: tk3 {tk3}; graph {:.1} us {:.1} TFLOP/s", graph / 1e3, tflops(graph));
     }
 }
