@@ -20,6 +20,17 @@ fn gemm_records_as_a_pipeline_with_a_carried_accumulator() {
     assert!(matches!(prog.scalar(prog.grid[2]), Scalar::Var(v) if v == "b"));
 }
 
+/// A variable asked for again is the same one; asked for over another
+/// range, it is refused rather than kept at its first.
+#[test_case::test_case(1, 8; "the same range")]
+#[test_case::test_case(1, 16 => panics "variable b is in 1..=8"; "another range")]
+fn a_variable_asked_for_again_keeps_its_range(min: i64, max: i64) {
+    let mut k = crate::build::Kernel::new("vars");
+    k.var("b", 1, 8);
+    k.var("b", min, max);
+    assert_eq!(k.finish().vars, vec![Var { name: "b".into(), min: 1, max: 8 }]);
+}
+
 /// A scalar read is of an input and no store writes an input, so the
 /// lowering may list a read anywhere its index is known.
 #[test_case::test_case(ParamKind::Out; "a read of an output")]
