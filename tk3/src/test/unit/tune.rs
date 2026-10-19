@@ -123,6 +123,39 @@ fn a_key_in_flight_is_measured_once() {
     assert_eq!((chosen, measured.load(Ordering::SeqCst)), ([Some(1), Some(1)], 1));
 }
 
+/// Threads storing other keys of one device file at once lose none of
+/// them: each write re-reads, merges and replaces the file alone.
+#[test]
+fn concurrent_writers_of_one_file_lose_no_line() {
+    let (threads, keys) = (8, 8);
+    let dir = scratch("concurrent");
+    let store = TuneStore::at(Some(dir.clone()));
+    let start = std::sync::Barrier::new(threads);
+    std::thread::scope(|s| {
+        for t in 0..threads {
+            let (store, start) = (&store, &start);
+            s.spawn(move || {
+                start.wait();
+                for i in 0..keys {
+                    let k = TuneKey { op: "probe:step", ..key(&[t, i], &[0]) };
+                    store.value(&k, || 1, || Some((t * keys + i) as u64));
+                }
+            });
+        }
+    });
+    let again = TuneStore::at(Some(dir.clone()));
+    assert_eq!(again.entries(&key(&[], &[0])).len(), threads * keys);
+    for t in 0..threads {
+        for i in 0..keys {
+            let k = TuneKey { op: "probe:step", ..key(&[t, i], &[0]) };
+            assert_eq!(again.value(&k, || 1, || panic!("lost")), Some((t * keys + i) as u64));
+        }
+    }
+    let leftovers = std::fs::read_dir(&dir).unwrap().count();
+    assert_eq!(leftovers, 1, "a temporary file left behind");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A plain bf16 GEMM's programs at `tile` on sm_86.
 fn gemm_programs(tile: [usize; 3]) -> tune::Candidate {
     let cfg = GemmCfg { core: Core::Warp, tile, stages: 2, warps: [2, 2], group_m: 8, unroll: true, crews: 1 };
@@ -249,7 +282,8 @@ fn an_unreadable_line_is_dropped_at_the_next_write() {
     let k = key(&[3, 3, 3], &[0, 1]);
     let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
     let kept = format!("{} 42", k.line(Kind::Value, 1));
-    std::fs::write(&path, format!("gemm|sm_86-28sm|BFloat16|3x3x3|0|0|0 1 100\n{kept}\nnonsense\n")).unwrap();
+    let lines = format!("format {FORMAT}\ngemm|sm_86-28sm|BFloat16|3x3x3|0|0|0 1 100\n{kept}\nnonsense\n");
+    std::fs::write(&path, lines).unwrap();
     let store = TuneStore::at(Some(dir.clone()));
     assert_eq!(store.entries(&k).len(), 1);
     assert_eq!(store.select(&k, 2, || 1, || vec![Some(9), Some(4)]), Some(1));
@@ -397,12 +431,12 @@ fn a_first_clean_config_round_trips_through_the_store() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A file of another line format is dropped whole and the next write starts
-/// it over in this one; a file of this format, or without a format line
-/// (the first format's), reads as it did and stays as it is until a write.
+/// A file of another line format, or without a format line (the first
+/// format's), is dropped whole and the next write starts it over in this
+/// one; a file of this format reads as it did and stays as it is until a write.
 #[test_case(Some(FORMAT + 1), false; "another format")]
 #[test_case(Some(FORMAT), true; "this format")]
-#[test_case(None, true; "no format line")]
+#[test_case(None, false; "no format line")]
 fn a_file_of_another_format_is_dropped(written: Option<u32>, kept: bool) {
     let dir = scratch(&format!("format-{written:?}"));
     let k = key(&[2, 2, 2], &[0, 1]);

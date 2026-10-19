@@ -20,6 +20,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -334,8 +335,7 @@ impl TuneStore {
     /// unreadable or of another format.
     pub fn entries(&self, key: &TuneKey) -> HashMap<String, Entry> {
         let Some(text) = self.path(key).and_then(|p| std::fs::read_to_string(p).ok()) else { return HashMap::new() };
-        let format = text.lines().next().and_then(|l| l.strip_prefix("format ")).map(|n| n.parse::<u32>().ok());
-        if format.is_some_and(|n| n != Some(FORMAT)) {
+        if text.lines().next() != Some(format!("format {FORMAT}").as_str()) {
             return HashMap::new();
         }
         text.lines()
@@ -348,15 +348,21 @@ impl TuneStore {
             .collect()
     }
 
-    /// Re-read, merge and replace the file atomically, so concurrent writers
-    /// lose at most each other's newest line, never the file.
+    /// Re-read, merge and replace the file atomically, one writer of a file
+    /// at a time in this process, so writers of other processes lose at
+    /// most each other's newest line, never the file, and this process's
+    /// lose nothing.
     fn put(&self, key: &TuneKey, line: String, entry: &Entry) {
+        static WRITERS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = LazyLock::new(Mutex::default);
+        static TEMPS: AtomicU64 = AtomicU64::new(0);
         let Some(path) = self.path(key) else { return };
+        let writer = WRITERS.lock().unwrap_or_else(PoisonError::into_inner).entry(path.clone()).or_default().clone();
+        let _writing = writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut entries = self.entries(key);
         entries.insert(line, entry.clone());
         let mut lines: Vec<String> = entries.iter().map(|(line, entry)| format!("{line} {}", entry.render())).collect();
         lines.sort();
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        let tmp = path.with_extension(format!("tmp{}-{}", std::process::id(), TEMPS.fetch_add(1, Ordering::Relaxed)));
         let text = format!("format {FORMAT}\n{}\n", lines.join("\n"));
         if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
             let _ = std::fs::remove_file(&tmp);
