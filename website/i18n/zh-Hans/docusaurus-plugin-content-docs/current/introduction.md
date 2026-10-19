@@ -38,7 +38,7 @@ Svod 自带语音、文本和视觉模型，均已对照各自的 PyTorch 参考
   一个二进制文件，没有 LibTorch 或 ONNX Runtime 绑定，也没有厂商 SDK。
 - **熟悉的 API。** 张量 API 对标 PyTorch，连具名参数都一致，因此移植后的模型读起来
   和参考实现一样，移植过程基本是机械性的。
-- **在关键处追求速度。** 当编译器力有不逮时，`tk` tile DSL 让你在同一 IR 中手写
+- **在关键处追求速度。** 当编译器力有不逮时，`tk3` tile 语言让你在同一 IR 中手写
   内核。它们对性能分析器和来源追踪器始终可见，而不是作为不透明二进制游离在外。
 
 动机与设计详见
@@ -100,23 +100,13 @@ jit_wrapper! {
 
 - **Tensor core** 按架构选择：NVIDIA sm_75/80/89、AMD RDNA3、RDNA4 与 CDNA3/4，
   以及 Apple Metal。fp8 在 sm_89 和 CDNA3 上可用。
-- **Tile 内核（`tk`）**：Rust 实现的 ThunderKittens 风格 tile DSL，覆盖 GEMM、
-  flash attention、RMSNorm 和 k-means。同一份内核源码可下沉为 AMD MFMA/WMMA
-  （gfx942、gfx11、gfx12）、CUDA `mma.sync`（sm_80+）和 Apple
-  `simdgroup_matrix`（Apple7+）。tile 形状在首次使用时自动
-  调优并缓存。参见
+- **Tile 内核（`tk3`）**：GEMM、flash attention、注意力前处理、归一化和隐式 GEMM
+  卷积只需编写一次，作为基于线性布局的结构化 tile 程序；在 CUDA sm_80+ 上下沉为
+  `mma.sync`/`wgmma`，在 AMD RDNA3/3.5/4 和 CDNA3 上下沉为 WMMA/MFMA；测试时在主机上
+  解释执行；首次使用时按形状和设备调优，并保存在磁盘存储中。已在 sm_86、sm_90、
+  sm_120、gfx1151、gfx1201 和 gfx942 上测量。模型通过算子层调用它们，算子层总是返回
+  张量，并在没有内核适用时构建计算图。参见
   [Tile 内核](https://svod.vpermilp.online/docs/tile-kernels/overview)。
-
-  ```rust
-  fn micro_matmul(ker: &Kernel) -> Arc<UOp> {
-      let w = ker.warp();
-      let a = ker.rt((64, 64), DType::BFloat16, Row, RT_16X16);
-      let b = ker.rt((64, 64), DType::BFloat16, Col, RT_16X16);
-      let c = ker.rt((64, 64), DType::Float32, Col, RT_16X16);
-      let out = w.mma_ab(w.zero(c), &a, &b); // one matrix-core instruction per fragment
-      ker.finish(1)
-  }
-  ```
 - **内核搜索**：手写启发式，或在优化空间上做 BEAM 搜索并带持久化磁盘缓存。参见
   [内核搜索](https://svod.vpermilp.online/docs/architecture/optimizations/kernel-search)。
 - **CPU**：在进程内编译向量化 LLVM IR，自研 ELF 加载器支持 x86_64、aarch64、
@@ -175,7 +165,8 @@ Morok 是 Svod 之前的名字。
 | [`device`](https://github.com/npatsakula/svod/tree/main/device/) | 缓冲区、分配器、mmap、KFD、CUDA 和 Metal 驱动、硬件图 |
 | [`runtime`](https://github.com/npatsakula/svod/tree/main/runtime/) | 内核编译、缓存、执行计划和性能分析器 |
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | 惰性张量 API、`nn` 模块和内存规划器 |
-| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | Tile 内核 DSL 与内核库 |
+| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | Tile 内核 DSL（tk1），模型已不再调用 |
+| [`tk3`](https://github.com/npatsakula/svod/tree/main/tk3/) | 算子层背后的 tile 语言、内核库、规划器和调优器 |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX 导入器 |
 | [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | 宿主端解码器、VAD 分段和音频流水线 |
 | [`model`](https://github.com/npatsakula/svod/tree/main/model/) | 预训练模型与示例 |

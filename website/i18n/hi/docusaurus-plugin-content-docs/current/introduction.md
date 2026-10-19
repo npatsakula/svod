@@ -41,8 +41,8 @@ Svod के साथ स्पीच, टेक्स्ट और विज़
   वेंडर SDK के।
 - **जाना-पहचाना API।** टेंसर API PyTorch को नामित आर्ग्युमेंट तक प्रतिबिंबित करता है,
   इसलिए मॉडल पोर्ट संदर्भ की तरह पढ़ा जाता है और पोर्टिंग अधिकतर यांत्रिक होती है।
-- **जहाँ ज़रूरी है वहाँ गति।** जब कंपाइलर पर्याप्त न हो, `tk` टाइल DSL उसी IR में
-  हाथ से लिखे कर्नेल देता है। वे प्रोफ़ाइलर और ऑरिजिन ट्रैकर को दिखते रहते हैं, अपारदर्शी
+- **जहाँ ज़रूरी है वहाँ गति।** जब कंपाइलर पर्याप्त न हो, `tk3` टाइल लैंग्वेज उसी IR में
+  हाथ से लिखे कर्नेल देती है। वे प्रोफ़ाइलर और ऑरिजिन ट्रैकर को दिखते रहते हैं, अपारदर्शी
   बाइनरी की तरह अलग-थलग नहीं रहते।
 
 प्रेरणा और डिज़ाइन
@@ -107,23 +107,14 @@ tests यादृच्छिक व्यंजकों पर Z3 को orac
 
 - **Tensor cores** आर्किटेक्चर के अनुसार चुने जाते हैं: NVIDIA sm_75/80/89, AMD RDNA3,
   RDNA4 और CDNA3/4, साथ ही Apple Metal। fp8 sm_89 और CDNA3 पर उपलब्ध है।
-- **टाइल कर्नेल (`tk`)**: GEMM, flash attention, RMSNorm और k-means के लिए Rust में
-  ThunderKittens-शैली का टाइल DSL। एक ही कर्नेल सोर्स AMD MFMA/WMMA (gfx942, gfx11,
-  gfx12), CUDA `mma.sync` (sm_80+) और Apple
-  `simdgroup_matrix` (Apple7+) में लोअर होता है। टाइल आकार पहले उपयोग पर
-  ऑटोट्यून होकर कैश हो जाते हैं। देखें
+- **टाइल कर्नेल (`tk3`)**: GEMM, flash attention, attention prologue, norms
+  और implicit-GEMM convolution, linear layouts पर structured टाइल प्रोग्राम के रूप में
+  एक बार लिखे गए, CUDA sm_80+ पर `mma.sync`/`wgmma` में और AMD RDNA3/3.5/4 और CDNA3 पर
+  WMMA/MFMA में लोअर होते हैं, टेस्ट के लिए होस्ट पर इंटरप्रेट होते हैं, और पहले उपयोग पर
+  हर shape और डिवाइस के लिए ट्यून होकर डिस्क पर स्टोर हो जाते हैं। sm_86, sm_90, sm_120,
+  gfx1151, gfx1201 और gfx942 पर मापे गए। मॉडल इन्हें एक op layer के ज़रिए बुलाते हैं जो
+  हमेशा एक टेंसर लौटाती है और जहाँ कोई कर्नेल लागू न हो वहाँ ग्राफ़ बनाती है। देखें
   [टाइल कर्नेल](https://svod.vpermilp.online/docs/tile-kernels/overview)।
-
-  ```rust
-  fn micro_matmul(ker: &Kernel) -> Arc<UOp> {
-      let w = ker.warp();
-      let a = ker.rt((64, 64), DType::BFloat16, Row, RT_16X16);
-      let b = ker.rt((64, 64), DType::BFloat16, Col, RT_16X16);
-      let c = ker.rt((64, 64), DType::Float32, Col, RT_16X16);
-      let out = w.mma_ab(w.zero(c), &a, &b); // one matrix-core instruction per fragment
-      ker.finish(1)
-  }
-  ```
 - **कर्नेल खोज**: हाथ से लिखे ह्यूरिस्टिक, या ऑप्टिमाइज़ेशन स्पेस पर BEAM खोज, जिसका
   कैश डिस्क पर स्थायी रहता है। देखें
   [कर्नेल खोज](https://svod.vpermilp.online/docs/architecture/optimizations/kernel-search)।
@@ -185,7 +176,8 @@ Morok Svod का पुराना नाम था।
 | [`device`](https://github.com/npatsakula/svod/tree/main/device/) | बफ़र, एलोकेटर, mmap, KFD, CUDA और Metal ड्राइवर, हार्डवेयर ग्राफ़ |
 | [`runtime`](https://github.com/npatsakula/svod/tree/main/runtime/) | कर्नेल कंपाइलेशन, कैशिंग, एक्ज़ीक्यूशन प्लान और प्रोफ़ाइलर |
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | लेज़ी टेंसर API, `nn` मॉड्यूल और मेमोरी प्लानर |
-| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | टाइल कर्नेल DSL और कर्नेल लाइब्रेरी |
+| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | टाइल कर्नेल DSL (tk1), जिसे अब मॉडल नहीं बुलाते |
+| [`tk3`](https://github.com/npatsakula/svod/tree/main/tk3/) | op layer के पीछे की टाइल लैंग्वेज, कर्नेल लाइब्रेरी, प्लानर और ट्यूनर |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX इम्पोर्टर |
 | [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | होस्ट-साइड डिकोडर, VAD सेगमेंटेशन और ऑडियो पाइपलाइन |
 | [`model`](https://github.com/npatsakula/svod/tree/main/model/) | प्रीट्रेन्ड मॉडल और उदाहरण |

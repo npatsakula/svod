@@ -2,7 +2,7 @@
 sidebar_label: 算子层
 ---
 
-# 算子层
+# 算子层 {#op-layer}
 
 `svod_tk3::ops` 是模型调用的接口。每个算子都返回惰性 `Tensor`。当设备、数据类型和形状适合某个内核时，由 tk3 内核计算；否则算子自行构建等价的计算图。模型从不检查内核是否适用，也从不填充到 tile 大小。
 
@@ -21,44 +21,29 @@ pub fn supported(device: &DeviceSpec) -> bool;
 
 | 算子 | 形状 | 选项 |
 |---|---|---|
-| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
-| `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
-| `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` 接收与 `x` 同形的 `residual`，返回 `(x + residual, norm)` |
-
-`Attn::keys` 可以是 `KeyMask::None`、`KeyMask::Lens(&lens)`（`[B]` 有效键数）或 `KeyMask::Bool(&mask)`（`[B, Tk]`，被关注处为 true）。`Attn::cache` 接收 `Cache { head_start, kv_heads, row_map, appended }`，而 `appended` 要求 `KeyMask::Lens`。`Attn::scale` 默认为 `1/√D`。`Attn::bias`（`[B, H, T, Tk]` 或 `[1, H, T, Tk]`，与数据流同一 dtype）在掩码之前加到缩放后的分数上，例如 WavLM 的相对位置偏置。`Qkv::rope` 是 `[1, T, 1, D/2]`（按位置）或 `[B, T, 1, D/2]`（按 token）的 `(cos, sin)`。掩码的说明见[注意力内核](./kernel-library#flash-attention)。
+| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, chunk, seg_start, cache, splits, scale, bias }` |
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`；门控的 `w` 为 `[2N, K]` |
 | `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`；1×1 卷积即 `linear` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` 接收与 `x` 同形的 `residual`，返回 `(x + residual, norm)` |
 
-`Linear::scale` 在加上 residual 之前乘以激活后的值：`scale·act(x·wᵀ + bias) + residual`，因此 Conformer 的半步 `x + 0.5·ffn(x)` 只需一个 GEMM。
+`Linear::scale` 在加上残差之前乘以激活后的值：`scale·act(x·wᵀ + bias) + residual`，因此 Conformer 的半步 `x + 0.5·ffn(x)` 只需一个 GEMM。
 
-`Attn::keys` 可以是 `KeyMask::None`、`KeyMask::Lens(&lens)`（`[B]` 有效键数）或 `KeyMask::Bool(&mask)`（`[B, Tk]`，被关注处为 true）。`Attn::cache` 接收 `Cache { head_start, kv_heads, row_map, appended }`，而 `appended` 要求 `KeyMask::Lens`。`Attn::scale` 默认为 `1/√D`。`Qkv::rope` 是 `[1, T, 1, D/2]`（按位置）或 `[B, T, 1, D/2]`（按 token）的 `(cos, sin)`。掩码的说明见[注意力内核](./kernel-library#flash-attention)。
+`Attn::keys` 可以是 `KeyMask::None`、`KeyMask::Lens(&lens)`（`[B]` 有效键数）或 `KeyMask::Bool(&mask)`（`[B, Tk]`，被关注处为 true）。`Attn::cache` 接收 `Cache { head_start, kv_heads, row_map, appended, app_lens }`，而 `appended` 要求 `KeyMask::Lens`。`Attn::chunk` 是分块注意力（`Chunk { size, left, right }`）。`Attn::scale` 默认为 `1/√D`。`Attn::bias`（`[B, H, T, Tk]` 或 `[1, H, T, Tk]`，与数据流同一 dtype）在掩码之前加到缩放后的分数上，例如 WavLM 的相对位置偏置。`Qkv::rope` 是 `[1, T, 1, D/2]`（按位置）或 `[B, T, 1, D/2]`（按 token）的 `(cos, sin)`。掩码的说明见[注意力内核](./kernel-library#flash-attention)。
 
 ## 内核还是计算图 {#kernel-or-graph}
 
-决策是 `ops::shape` 中的纯函数 `fn(target, dtypes, extents, …) -> Plan<Cfg>`，因此可以在没有 GPU 的主机上测试。`Plan::Kernel(configs)` 对配置排序，未调优时的选择排在第一；[调优器](./tuning)测量其中最先能编译且不溢出的配置（若每个都溢出，则测量最先能编译的那些：溢出从不会让算子退回计算图）。`Plan::Graph(Fallback)` 说明为什么运行计算图。
+决策是 `ops::shape` 中的纯函数 `fn(planner, dtypes, extents, …) -> Plan<Cfg>`，因此可以在没有 GPU 的主机上测试（`test/unit/ops_plan.rs`）。`Plan::Kernel(configs)` 持有排序后的配置；[调优器](./tuning)测量其中最先能编译且不溢出的配置（若每个都溢出，则测量最先能编译的那些：溢出从不会让算子退回计算图）。`Plan::Graph(Fallback)` 说明为什么运行计算图，规划器日志会写出该原因（`RUST_LOG=svod_tk3::plan=debug`）。
 
 | `Fallback` | 何时出现 |
 |---|---|
-| `Target` | 张量不在默认设备上，或设备没有 tk3 配置表（目前：除 CUDA sm_80+ 之外的一切） |
-| `Dtype` | 任一操作数为 f32，或操作数没有共享同一种带矩阵核心的 16 位类型 |
+| `Target` | 张量不在默认设备上，设备没有 tk3 内核（`config::has_kernels`：sm_80 以下的 CUDA、Metal、CPU），或其目标未报告 SM 数量 |
+| `Dtype` | 任一操作数为 f32，或操作数没有共享同一种带矩阵核心的 16 位类型。`conv2d`：输出类型既不是输入类型也不是 f32，或残差不是该类型 |
 | `Symbolic` | 除绑定的首维之外还有符号维度（对 `linear` 而言，符号化的 `N` 也算） |
-| `Shape` | `linear`：`N` 不是 8 的倍数或没有行。`attention`：`D ∉ {48, 64, 128}` 或存在空维度。`heads`：`D` 不是 16..=256 范围内的 2 的幂。归一化：`D` 不是 256..=2048 范围内的 2 的幂。`conv2d`：`groups > 1`、`Cin` 不是 16 的倍数、`Cout` 不是 8 的倍数或输出为空 |
+| `Shape` | `linear`：`N` 不是 8 的倍数或没有行。`conv2d`：`groups > 1`、`Cin` 不是 16 的倍数、`Cout` 不是 8 的倍数或输出为空。`attention`：没有适合 `D` 的配置（在 sm_86 上，32、48、64、128 和 256 能规划，40 不能）或存在空维度。`heads`：`D` 不是 16..=256 范围内的 2 的幂。归一化：`D` 不是 256..=2048 范围内的 2 的幂 |
 | `Config` | 没有合适的 tile 配置。对 `linear` 而言，`K` 不是 16 的倍数 |
 
-`test/unit/ops_plan.rs` 中的真实用例，基于 sm_86 目标：
-
-```rust
-#[test_case(&[4096, 4096], 4096, false, Ok(BIG); "large grid, deepest ring")]
-#[test_case(&[8, 37, 512], 512, false, Ok(SMALL); "medium grid")]
-#[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
-#[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
-fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallback>) {
-    let planner = Planner::new(Device { target: sm86(), costs: costs() });
-    assert_eq!(first(shape::linear(Some(&planner), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
-}
-```
+当追加行比所有配置的键块都宽时，`attention` 也会走计算图。
 
 :::note[为什么 f32 保留计算图]
 内核只接受 16 位操作数。把 f32 模型向下转换会用大约三位十进制精度换取速度，因此算子层把这个选择留给模型的数据类型。
@@ -66,7 +51,7 @@ fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallba
 
 ## 批次变量 {#batch-variables}
 
-当操作数的第 0 维绑定到运行时变量时，它可以是符号维度。该变量可以是 JIT 的 `batch_var`，也可以是带最小值和最大值的 `DefineVar`/有界 `Param`。此时内核在网格 z 维上按实际数量启动，缓冲区按最大值分配。输出按容量分配，并在形状中保留符号维度（`Tensor::empty_dynamic`）。因此下一个内核直接绑定已 realize 的缓冲区，不会为了缩小它而产生拷贝。其他任何符号维度都是 `Fallback::Symbolic`。
+当操作数的第 0 维绑定到运行时变量时，它可以是符号维度。该变量可以是 JIT 的 `batch_var`，也可以是带最小值和最大值的 `DefineVar`/有界 `Param`。此时内核在网格 z 维上按实际数量启动，缓冲区按最大值分配。输出按容量分配，并在形状中保留符号维度（`Tensor::empty_dynamic_spec`）。因此下一个内核直接绑定已实现的缓冲区本身，不会为了缩小它而产生拷贝。其他任何符号维度都是 `Fallback::Symbolic`。
 
 ## 错误 {#errors}
 

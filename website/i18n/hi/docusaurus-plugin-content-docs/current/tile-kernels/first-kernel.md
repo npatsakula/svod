@@ -2,13 +2,13 @@
 sidebar_label: आपका पहला कर्नेल
 ---
 
-# आपका पहला कर्नेल
+# आपका पहला कर्नेल {#your-first-kernel}
 
 tk3 कर्नेल एक Rust function है जो `Kernel` builder से एक tile program रिकॉर्ड करता है। हर कॉल खुले
 block में एक statement जोड़ती है और एक typed handle लौटाती है। Handle अपना tier (`Gmem<T>`,
-`Shared<T>`, `Regs<T>`) और element type (`BF16`, `F16`, `F32`, `I32`, `Bool`) साथ रखता है।
-Statement रिकॉर्ड होते समय shapes जाँचे जाते हैं। Block indices, offsets और trip counts जैसे
-scalars साधारण operators से बने `Sc` expressions हैं।
+`Shared<T>`, `Regs<T>`) और element type (`BF16`, `F16`, `F32`, `I32`, `Bool`) साथ रखता है; एक
+shared allocation `SmemRef<T>` होता है। Statement रिकॉर्ड होते समय shapes जाँचे जाते हैं। Block
+indices, offsets और trip counts जैसे scalars साधारण operators से बने `Sc` expressions हैं।
 
 ## एक न्यूनतम कर्नेल {#a-minimal-kernel}
 
@@ -37,8 +37,7 @@ fn axpb(rows: usize) -> Program {
     let v = k.load(xv);
     let two = k.fill::<F32>(Shape::new(16, cols), Const::Float(2.0));
     let one = k.fill::<F32>(Shape::new(16, cols), Const::Float(1.0));
-    let v = k.binary(v, two, BinaryOp::Mul);
-    let v = k.binary(v, one, BinaryOp::Add);
+    let v = k.mul_add(v, two, one);
     let yv = tile(&mut k, y);
     k.store(yv, v);
     k.finish()
@@ -53,109 +52,92 @@ assert_eq!(out[1][64 * 39 + 1], 2.0 * (64.0 * 39.0 + 1.0) + 1.0);
 `view(param, offset, [row_stride, col_stride], shape, bounds)` किसी parameter में एक window है।
 `at(view, rows, cols)` उसे खिसकाता है और bounds को नए origin के सापेक्ष रखता है।
 
-## GEMM, क़दम दर क़दम {#the-gemm-step-by-step}
+## एक GEMM {#a-gemm}
 
-`kernels/gemm.rs` `c = act(a·bᵀ + bias) + residual` (या gated weight से `act(gate)·up`) की गणना
-लगभग 180 lines में करता है, जिनमें इसके spec और config types भी शामिल हैं। नीचे के अंश हूबहू हैं।
-
-**Parameters और grid.** Buffers flat हैं और batch capacity के हिसाब से आकार लेते हैं। Bound batch
-variable grid z बन जाता है।
+bf16 `a [m, k]` और `b [n, k]` पर `c = a·bᵀ`, f32 में accumulate होते हुए। यह `kernels/gemm.rs` का एक
+छोटा रूप है, जो इसके ऊपर epilogues (bias, activation, gated weights, scale, residual, f32 output),
+grouped tile order, split reductions, warpgroup core और two-crew ping-pong जोड़ता है।
 
 ```rust
-let a = k.param::<T>("a", ParamKind::In, cap * m * kk);
-let b = k.param::<T>("b", ParamKind::In, halves * n * kk);
-let bias = epi.bias.then(|| k.param::<T>("bias", ParamKind::In, halves * n));
-let residual = epi.residual.then(|| k.param::<T>("residual", ParamKind::In, cap * m * n));
-let c = k.param::<T>("c", ParamKind::Out, cap * m * n);
-let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
-let (gz, bb) = batch.axis(&mut k);
-k.grid([Sc::from(gm), Sc::from(gn), gz]);
-k.warps(cfg.warps[0] * cfg.warps[1]);
+fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usize) -> Program {
+    assert!(kk.is_multiple_of(bk), "k is a multiple of bk");
+    let mut k = Kernel::new("gemm_nt");
+    let a = k.param::<BF16>("a", ParamKind::In, m * kk);
+    let b = k.param::<BF16>("b", ParamKind::In, n * kk);
+    let c = k.param::<BF16>("c", ParamKind::Out, m * n);
+    k.grid([Sc::from(m.div_ceil(bm)), Sc::from(n.div_ceil(bn)), Sc::from(1)]);
+    k.warps(4);
+    let (row0, col0) = (k.block(0) * bm, k.block(1) * bn);
+    let bound = |len: usize, tile: usize| (!len.is_multiple_of(tile)).then(|| Sc::from(len));
+    let a_view = k.view(a, 0, [kk, 1], Shape::new(bm, bk), [bound(m, bm), None]);
+    let a_view = k.at(a_view, row0.clone(), 0);
+    let b_view = k.view(b, 0, [kk, 1], Shape::new(bn, bk), [bound(n, bn), None]);
+    let b_view = k.at(b_view, col0.clone(), 0);
+    let (sa, sb) = (Shape::new(bm, bk), Shape::new(bn, bk));
+    let a_s = k.smem::<BF16>("a_s", stages * sa.elems());
+    let b_s = k.smem::<BF16>("b_s", stages * sb.elems());
+    let acc = k.zeros::<F32>(Shape::new(bm, bn));
+    let [acc] = k.pipeline(
+        kk / bk,
+        stages,
+        [acc],
+        |k, step, slot| {
+            let koff = step * bk;
+            let a_g = k.at(a_view, 0, koff.clone());
+            let a_t = k.smem_slot(a_s, slot.clone(), sa);
+            k.stage(a_t, a_g, CopyMode::Async);
+            let b_g = k.at(b_view, 0, koff);
+            let b_t = k.smem_slot(b_s, slot, sb);
+            k.stage(b_t, b_g, CopyMode::Async);
+        },
+        |k, _step, slot, [acc]| {
+            let a_t = k.smem_slot(a_s, slot.clone(), sa);
+            let b_t = k.smem_slot(b_s, slot, sb);
+            [k.mma(acc, a_t, false, b_t, true)]
+        },
+    );
+    let out = k.cast::<F32, BF16>(acc);
+    let c_view = k.view(c, 0, [n, 1], Shape::new(bm, bn), [bound(m, bm), bound(n, bn)]);
+    let c_view = k.at(c_view, row0, col0);
+    k.store(c_view, out);
+    k.finish()
+}
 ```
 
-**Padding की जगह bounds वाले views.** `bound(len, tile)` सिर्फ़ वहीं `Some(len)` है जहाँ tile grid
-`len` से आगे निकलता है। कोई भी `m` और `n` बिना copy के चलते हैं। सिर्फ़ `k` का `bk` का गुणज होना
-ज़रूरी है।
-
-```rust
-let (bx, by) = tile_order(&mut k, gm, gn, cfg.group_m);
-let (row0, col0) = (bx * bm, by * bn);
-let (m_bound, n_bound) = (bound(m, bm), bound(n, bn));
-let a_view = k.view(a, batch_offset(&bb, m * kk), [kk, 1], Shape::new(bm, bk), [m_bound.clone(), None]);
-let a_view = k.at(a_view, row0.clone(), 0);
-```
-
-`tile_order` `group_m` tile rows के समूहों में चलता है ताकि resident blocks L2 में B साझा करें।
+**Padding की जगह bounds.** `bound(len, tile)` सिर्फ़ वहीं `Some(len)` है जहाँ tile grid `len` से आगे
+निकलता है, इसलिए कोई भी `m` और `n` बिना copy के चलते हैं। सिर्फ़ `k` का `bk` का गुणज होना ज़रूरी है।
 
 **Pipeline.** `pipeline(extent, stages, init, produce, consume)` `stages` shared slots की ring पर
-एक producer और एक consumer घोषित करता है। लेखक बताता है कि slot में क्या copy करना है और उससे क्या
-गणना करनी है। [Schedule template](./layouts-and-lowering#schedule-templates) तय करता है कि copies
-कितना आगे चलें और हर wait और barrier कहाँ रखा जाए।
+एक producer और एक consumer घोषित करता है, और `init` (यहाँ accumulator) को consumer के ज़रिए आगे
+ले जाता है। लेखक बताता है कि slot में क्या copy करना है और उससे क्या गणना करनी है।
+[Schedule template](./layouts-and-lowering#schedule-templates) तय करता है कि copies कितना आगे चलें,
+और हर wait और barrier को जगह देता है।
 
-```rust
-k.pipeline(
-    trips,
-    stages,
-    init,
-    |k, step, slot| {
-        let koff = step * bk;
-        for (src, alloc, shape) in
-            std::iter::once((a, a_s, sa)).chain(bs.into_iter().zip(b_s).map(|(b, s)| (b, s, sb)))
-        {
-            let g = k.at(src, 0, koff.clone());
-            let t = k.smem_slot::<T>(alloc, slot.clone(), shape);
-            k.stage(t, g, CopyMode::Async);
-        }
-    },
-    |k, _step, slot, accs| {
-        let a_t = k.smem_slot::<T>(a_s, slot.clone(), sa);
-        let mut i = 0;
-        accs.map(|acc| {
-            let b_t = k.smem_slot::<T>(b_s[i], slot.clone(), sb);
-            i += 1;
-            k.mma(acc, a_t, false, b_t, true)
-        })
-    },
-)
-```
-
-`mma(acc, a, a_t, b, b_t)` f32 accumulators पर `acc + A·B` है। यह कभी किसी instruction का नाम नहीं
-लेता: lowering target का matrix-core atom चुनती है और `a`, `b` और `acc` को उसके layouts देती है।
-
-**Epilogue** f32 accumulator पर चलता है, और नतीजा store पर एक ही बार round होता है। Bias एक
-`[1, bn]` row vector है जो tile पर broadcast होता है, और residual एक पूरा tile है।
-
-```rust
-if let Some(residual) = residual {
-    let r = tile(&mut k, residual);
-    let r = load_f32(&mut k, r);
-    out = k.binary(out, r, BinaryOp::Add);
-}
-let out = k.cast::<F32, T>(out);
-let c_view = tile(&mut k, c);
-k.store(c_view, out);
-k.finish()
-```
+**गुणनफल.** `mma(acc, a, a_t, b, b_t)` f32 accumulators पर `acc + A·B` है, यहाँ `B` transposed
+पढ़ा जाता है। यह कभी किसी instruction का नाम नहीं लेता: lowering target का matrix-core atom चुनती है
+और `a`, `b` और `acc` को उसके layouts देती है। नतीजा एक ही बार round होता है, store से पहले के cast
+पर।
 
 ## इसे device पर चलाना {#running-it-on-the-device}
 
 `launch::graph_launch` हर घोषित parameter के लिए क्रम से एक tensor लेता है और पहला output एक lazy
 `Tensor` के रूप में लौटाता है। नतीजा realize होने पर कर्नेल चलता है, किसी भी graph kernel की तरह।
+लाइब्रेरी का GEMM एक `GemmCfg` लेता है, जिसके `lowering` को device की मापी गई costs चाहिए।
 
 ```rust
 use svod_dtype::{DType, default_device::default_device};
 use svod_tensor::Tensor;
-use svod_tk3::atoms::{Device, Target};
+use svod_tk3::atoms::{Core, Device, Target};
 use svod_tk3::build::BF16;
 use svod_tk3::kernels::Batch;
-use svod_tk3::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk3::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use svod_tk3::launch::graph_launch;
 
 let (m, n, k) = (1000, 512, 256);
 let target = Target::for_device(&default_device()).expect("a GPU target");
-let device = Device { costs: svod_tk3::probe::costs(&target)?, target };
+let device = Device { costs: svod_tk3::probe::costs(&target)?.costs, target };
 let cfg =
-    GemmCfg { tile: [64, 64, 32], stages: 3, warps: [2, 2], group_m: 8, unroll: true, core: Core::Warp, crews: 1 };
+    GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true, core: Core::Warp, crews: 1 };
 let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
 let a = Tensor::empty(&[m * k], DType::BFloat16);
 let b = Tensor::empty(&[n * k], DType::BFloat16);
@@ -172,11 +154,8 @@ c.realize()?;
 | समूह | कॉल्स |
 |---|---|
 | घोषणाएँ | `param`, `var` (launch variable जो नाम से bind होता है), `grid`, `warps`, `smem` |
-| Scalars | `block(axis)`, `warp()`, `load_scalar(param, index)`, `Sc` operators और `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
-| Views | `view`, `at`, `smem_view`, `smem_view_as`, `smem_slot` |
-| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `compare`, `cast`, `where_`, `mul_add` (एक ही rounding), `reduce`, `mma` |
-| Movement | `stage` (global → shared, `CopyMode::Async` या `Sync`), `load`, `store` |
-| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches) |
-
-`raw` और `transpose` रिकॉर्ड किए जा सकते हैं पर अभी lower नहीं होते: lowering उनके
-लिए `Error::Unsupported` लौटाती है।
+| Scalars | `block(axis)`, `warp()`, `row()` (gather map के भीतर), `load_scalar(param, index)`, `Sc` operators और `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
+| Views | `view`, `gather` (row-mapped view), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
+| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (एक ही rounding), `reduce`, `reduce_f32`, `transpose`, `mma`, `mma_oriented`, `pin` |
+| Movement | `stage` (global → shared, `CopyMode::Async` या `Sync`), `load`, `load_as_fill`, `store` |
+| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches), `each_warp` (एक `Warps` statement), `barrier` |

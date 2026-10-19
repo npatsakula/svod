@@ -2,80 +2,59 @@
 sidebar_label: पोर्टेबिलिटी
 ---
 
-# पोर्टेबिलिटी
+# पोर्टेबिलिटी {#portability}
 
 ## Targets {#targets}
 
-`atoms::Target` वह सब है जो lowering किसी GPU के बारे में जानती है:
+`atoms::Target` वह रखता है जो कोई GPU कर सकता है: उसके matrix-core atoms, global memory shared ring
+तक कैसे पहुँचती है (`Fill::CpAsync` या `Fill::Staged`), `ldmatrix` और transposing loads, lane moves,
+कौन से syncs instructions हैं (`SyncCaps`), occupancy, shared memory और SM count; इसका rustdoc देखें।
+`Target::for_device(&spec)` किसी live device से target निकालता है, `Target::for_arch` सिर्फ़ एक
+architecture से (जो host tests इस्तेमाल करते हैं), और `Target::offline(arch, sms, xcds)` या
+`Target::card(name)` ऐसे कार्ड का वर्णन करता है जिसका device इस मशीन पर नहीं है।
 
-| Field | मतलब |
-|---|---|
-| `arch` | `GpuArch::{Cuda, Amd, Metal}` |
-| `wave` | हर warp या wave में lanes |
-| `mma` | अपने operand layouts के साथ matrix-core atoms |
-| `group_mma` | shared-memory descriptors पर warpgroup matrix atoms (CUDA sm_90) |
-| `cp_async` | Asynchronous global → shared copies (CUDA sm_80+) |
-| `ldmatrix` | Warp-collective 8×8 b16 fragment loads (CUDA sm_75+) |
-| `smem_bytes` | हर block की shared memory (device बताए तो opt-in सीमा) |
-| `sms` | SM या CU गिनती, जब device बताए |
+Target यह घोषित करता है कि chip क्या कर सकता है, यह कभी नहीं कि उसकी कीमत क्या है। उसके primitives
+की कीमत (`atoms::Costs`) पहले इस्तेमाल पर device पर मापी जाती है (`probe::costs`) और tune store में रखी
+जाती है; host tests इसे घोषित करते हैं ([Tuning](./tuning#device-costs))। हर family के लिए कोई cost
+tables नहीं हैं। Costs lowering तक `Lowering::device` के रूप में पहुँचती हैं (orientation, exchange या
+round trip) और op layer तक `Planner` के device के रूप में (candidate rankings)। मापे गए targets और
+उनके आँकड़े [अवलोकन](./overview#targets) में हैं।
 
-`Target::for_device(&spec)` एक live device से target निकालता है। `Target::for_arch(arch)` सिर्फ़
-architecture से एक target बनाता है, जिसे host tests इस्तेमाल करते हैं। `atoms::sm86()` 28 SMs वाला
-RTX 3060 target है।
+`ops::supported(device)` तब true है जब `device` default device हो, उसके target के पास tk3 kernels हों
+(`config::has_kernels`) और वह एक SM count बताता हो; cost probes पहले पूछने पर चलते हैं। किसी भी दूसरे
+device पर हर op अपना graph fallback बनाता है (`Fallback::Target`)। Host tests हर atom के operand layouts
+को vendor ISA documents के lane formulas के ख़िलाफ़ जाँचते हैं, और kernels वाले हर target के लिए वे हर
+kernel family को lower करते हैं, lowering से पहले और बाद में उसे interpret करते हैं, और जहाँ `ptxas` या
+clang installed हों वहाँ उनसे compile करते हैं। "Compile हुआ" का मतलब "device पर सही" नहीं है: कोई target
+तभी मापा हुआ है जब उसके hardware पर `targets::families_match_the_interpreter_on_the_device` pass हो जाए।
 
-Target बताता है कि chip क्या कर सकता है, कभी यह नहीं कि उसकी कीमत क्या है। उसके primitives की कीमत
-(`atoms::Costs`: एक shared-memory byte, एक streamed byte, एक बिखरा element, एक matrix-core step, एक
-score का softmax काम, एक trip, एक lane move, एक shared round trip, एक register copy, global latency)
-पहली बार इस्तेमाल पर device पर मापी जाती है (`probe::costs`) और tune store में रखी जाती है; host tests
-उसे declare करते हैं। कोई per-family cost tables नहीं हैं। Costs lowering तक `Lowering::costs`
-(orientation, exchange या round trip) के रूप में और op layer तक `Planner::device` (candidate rankings)
-के रूप में पहुँचती हैं।
-
-| Target | Atoms | Fills | Tables | स्थिति |
-|---|---|---|---|---|
-| CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, 2–3 stages | हाँ | RTX 3060 पर मापा गया |
-| CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix`; shared descriptors पर `wgmma` m64nNk16 (GEMM) | `cp.async`, 227 KB तक shared | हाँ | H100 PCIe पर मापा गया: GEMM 4096³ bf16 warpgroup core पर 433 TFLOP/s (`mma.sync` पर 234; cuBLASLt 524) |
-| AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, हर lane में 8 values | register-staged, 1–2 stages | हाँ | RX 9070 XT (gfx1201) पर मापा गया: GEMM 4096³ bf16 148 TFLOP/s (rocBLAS 80), attention d64 117 |
-| AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 1–2 stages | हाँ | Strix Halo (gfx1151) पर मापा गया: GEMM 4096³ bf16 28 TFLOP/s (rocBLAS 32.5), attention d64 28; gfx1100–1102 compile हुए, चलाए नहीं गए |
-| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages, two crews | हाँ | MI300X (gfx942) पर मापा गया: GEMM 4096³ bf16 एक-slot ring पर दो crews के साथ 555 TFLOP/s (hipBLASLt 615), attention d64 282, d128 343 (हर wave में 32 query rows); gfx950 compile हुआ, चलाया नहीं गया |
-| Apple | simdgroup 8×8×8 | कोई नहीं | नहीं | सिर्फ़ atoms |
-
-`ops::supported(device)` वहीं true है जहाँ config tables हैं; किसी और device पर हर op अपना
-graph fallback बनाता है (`Fallback::Target`)। Host tests हर atom के operand layouts को vendor
-ISA documents के lane formulas से मिलाते हैं, और tables वाले हर target के लिए हर kernel family
-को lower करते हैं, lowering से पहले और बाद interpret करते हैं, और `ptxas` या clang installed
-हों तो compile करते हैं। "Compile हुआ" का मतलब "device पर सही" नहीं है: कोई target तभी मापा
-हुआ माना जाता है जब उसके hardware पर `targets::families_match_the_interpreter_on_the_device`
-pass हो।
-
-`cp.async` के बिना (RDNA में global → LDS copy नहीं है) pipeline हर step को registers में load
-करती है, पिछले step की गणना करती है, फिर registers को shared memory में लिखती है, दो slots पर।
-यही path CUDA पर एक device test में चलता है (`register_staged_families_match_on_cuda`)।
+`cp.async` के बिना (AMD के पास कोई asynchronous global → LDS copy नहीं है) pipeline हर step को registers
+में load करती है, पिछले step की गणना करती है, फिर registers को shared memory में लिखती है, एक या दो
+slots पर। यही path CUDA पर एक device test में चलता है (`register_staged_families_match_on_cuda`)।
 
 ## रणनीति {#strategy}
 
 तय किया गया तरीक़ा है **हर op के लिए एक साझा tile program**। `kernels/gemm.rs` जैसा कर्नेल tile values
-के ख़िलाफ़ एक बार लिखा जाता है और कभी vendor पर branch नहीं करता। हर target के साथ जो बदलता है वह
-data है, जिसे lowering और op layer चुनते हैं:
+के ख़िलाफ़ एक बार लिखा जाता है और कभी vendor पर branch नहीं करता। हर target पर जो बदलता है वह data है
+जिसे lowering और op layer चुनते हैं:
 
-| हर target के लिए | कहाँ |
+| हर target पर | कहाँ |
 |---|---|
 | Matrix-core atoms और उनके layouts | `atoms`, `layout/atoms.rs` |
-| Copy mechanisms (`cp.async`, `ldmatrix`, register staging) | `Target` flags, emitter |
+| Copy के तरीक़े (`cp.async`, `ldmatrix`, register staging, transposing loads) | `Target` fields, emitter |
 | Schedule templates | `schedule::Schedule` |
 | Config candidate rankings | `ops::config`, मापी गई `Costs` से |
 
-किसी एक vendor के लिए fork किया गया कर्नेल program सिर्फ़ एक सीमित अपवाद के रूप में मान्य है।
+किसी एक vendor के लिए अलग किया गया kernel program सिर्फ़ एक सीमित अपवाद के रूप में अनुमत है।
 
-## अभी पूरा नहीं {#not-done}
+## इस रिलीज़ में नहीं {#not-in-this-release}
 
-| आइटम | स्थिति |
+| चीज़ | स्थिति |
 |---|---|
-| Hopper (sm_90a): TMA, mbarrier, warp-specialized template; attention के लिए `wgmma` और trips के बीच उसका overlap | शुरू नहीं हुआ; GEMM `wgmma` पर चलता है जहाँ हर product की chain अपने statement के भीतर पूरी होने का इंतज़ार करती है, attention `mma.sync` पर |
-| Blackwell (sm_100a): tcgen05, tensor memory | शुरू नहीं हुआ; B200 तक पहुँच नहीं |
-| AMD CDNA: MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ |
-| AMD पर माप | gfx1201 (RX 9070 XT) पर मापा गया: Qwen3 और YOLO पर GEMM, convolution और attention tk1 से आगे; gfx1151 (Strix Halo) पर मापा गया: d = 64 और 128 पर attention; CDNA compile हुआ, चलाया नहीं गया |
-| Apple | सिर्फ़ atoms; न tables, न emit किए गए कर्नेल |
-| Raw asm statements | IR में रिकॉर्ड होते हैं, lowering उन्हें ठुकराती है |
-| Convolution (implicit GEMM) | sm_86 पर मापा गया, जहाँ YOLO26 इस पर channels-last चलता है (`ops::conv2d`); AMD के लिए सिर्फ़ compile हुआ |
-| fp8/int8 weights, GEMV + argmax, persistent grid, attention backward | शुरू नहीं हुआ |
+| Hopper TMA, mbarrier, warp-specialized producers | शुरू नहीं हुआ; GEMM और attention `cp.async` से भरे जाने वाले `wgmma` चलाते हैं |
+| Blackwell `tcgen05`, tensor memory | शुरू नहीं हुआ; sm_120 sm_80 path चलाता है |
+| CDNA MFMA 32×32, `buffer_load … lds` | शुरू नहीं हुआ (32×32 layouts मौजूद हैं, atom नहीं) |
+| CDNA के बाहर two-crew ping-pong | `Target::crews` सिर्फ़ वहीं 2 है जहाँ matrix core vector units के बगल में चलता है और एक lane की file दो crews के accumulators रखती है (CDNA) |
+| Apple | सिर्फ़ atoms; कोई kernels नहीं |
+| Convolution का image-staged रूप, depthwise, grouped | ग्राफ़ |
+| fp8/int8, attention backward | शुरू नहीं हुआ |

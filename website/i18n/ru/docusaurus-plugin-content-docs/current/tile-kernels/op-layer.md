@@ -24,49 +24,44 @@ pub fn supported(device: &DeviceSpec) -> bool;
 
 | Операция | Формы | Опции |
 |---|---|---|
-| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
+| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, chunk, seg_start, cache, splits, scale, bias }` |
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`; gated `w` имеет форму `[2N, K]` |
 | `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`; свёртка 1×1 — это `linear` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` принимают `residual` той же формы, что `x`, и возвращают `(x + residual, norm)` |
 
-`Linear::scale` умножает значение после активации до прибавления residual: `scale·act(x·wᵀ + bias) + residual`, так что полушаг Conformer `x + 0.5·ffn(x)` — это один GEMM.
+`Linear::scale` умножает значение после активации до прибавления residual:
+`scale·act(x·wᵀ + bias) + residual`, так что полушаг Conformer `x + 0.5·ffn(x)` — это один GEMM.
 
 `Attn::keys` — это `KeyMask::None`, `KeyMask::Lens(&lens)` (`[B]` — число валидных ключей) или
 `KeyMask::Bool(&mask)` (`[B, Tk]`, true там, где ключ учитывается). `Attn::cache` принимает
-`Cache { head_start, kv_heads, row_map, appended }`, причём `appended` требует `KeyMask::Lens`.
-`Attn::scale` по умолчанию равен `1/√D`. `Attn::bias` (`[B, H, T, Tk]` или `[1, H, T, Tk]` в типе потока) прибавляется к масштабированным оценкам до масок, как относительное позиционное смещение WavLM. `Qkv::rope` — это `(cos, sin)` формы `[1, T, 1, D/2]`
-(по позиции) или `[B, T, 1, D/2]` (по токену). Маски описаны вместе с
+`Cache { head_start, kv_heads, row_map, appended, app_lens }`, причём `appended` требует
+`KeyMask::Lens`. `Attn::chunk` — блочное внимание (`Chunk { size, left, right }`).
+`Attn::scale` по умолчанию равен `1/√D`. `Attn::bias` (`[B, H, T, Tk]` или `[1, H, T, Tk]` в
+типе потока) прибавляется к масштабированным оценкам до масок, как относительное позиционное
+смещение WavLM. `Qkv::rope` — это `(cos, sin)` формы `[1, T, 1, D/2]` (по позиции) или
+`[B, T, 1, D/2]` (по токену). Маски описаны вместе с
 [ядром внимания](./kernel-library#flash-attention).
 
 ## Ядро или граф {#kernel-or-graph}
 
-Решение — чистая функция в `ops::shape`, `fn(target, dtypes, extents, …) -> Plan<Cfg>`, поэтому
-оно тестируется на хосте без GPU. `Plan::Kernel(configs)` ранжирует конфигурации, первой —
-выбор без тюнинга; [тюнер](./tuning) замеряет первые, которые компилируются без вытеснения
-регистров (или, если вытесняют все, первые, которые компилируются: вытеснение никогда не
-отправляет операцию в граф). `Plan::Graph(Fallback)` говорит, почему работает граф.
+Решение — чистая функция в `ops::shape`, `fn(planner, dtypes, extents, …) -> Plan<Cfg>`, поэтому
+оно тестируется на хосте без GPU (`test/unit/ops_plan.rs`). `Plan::Kernel(configs)` содержит
+ранжированные конфигурации; [тюнер](./tuning) замеряет первые, которые компилируются без
+вытеснения регистров (или, если вытесняют все, первые, которые компилируются: вытеснение никогда
+не отправляет операцию в граф). `Plan::Graph(Fallback)` говорит, почему работает граф, и журнал
+планировщика это называет (`RUST_LOG=svod_tk3::plan=debug`).
 
 | `Fallback` | Когда |
 |---|---|
-| `Target` | Тензор не на устройстве по умолчанию, или у устройства нет таблиц tk3 (сегодня — всё, кроме CUDA sm_80+) |
-| `Dtype` | Какой-либо операнд в f32, или операнды не имеют общего 16-битного типа с матричным ядром |
+| `Target` | Тензор не на устройстве по умолчанию, у устройства нет ядер tk3 (`config::has_kernels`: CUDA ниже sm_80, Metal, CPU) или его цель не сообщает число SM |
+| `Dtype` | Какой-либо операнд в f32, или операнды не имеют общего 16-битного типа с матричным ядром. `conv2d`: тип выхода, отличный от типа входа и от f32, или residual не в этом типе |
 | `Symbolic` | Символьна размерность, отличная от связанной ведущей (для `linear` — также символьное `N`) |
-| `Shape` | `linear`: `N` не кратно 8 или нет строк. `attention`: `D ∉ {48, 64, 128}` или пустая размерность. `heads`: `D` не степень двойки в 16..=256. Нормализации: `D` не степень двойки в 256..=2048. `conv2d`: `groups > 1`, `Cin` не кратно 16, `Cout` не кратно 8 или пустой выход |
+| `Shape` | `linear`: `N` не кратно 8 или нет строк. `conv2d`: `groups > 1`, `Cin` не кратно 16, `Cout` не кратно 8 или пустой выход. `attention`: ни одна конфигурация не подходит для `D` (на sm_86 планируются 32, 48, 64, 128 и 256, а 40 — нет) или пустая размерность. `heads`: `D` не степень двойки в 16..=256. Нормализации: `D` не степень двойки в 256..=2048 |
 | `Config` | Ни одна тайловая конфигурация не подходит. Для `linear` — `K` не кратно 16 |
 
-Реальные случаи из `test/unit/ops_plan.rs` на цели sm_86:
-
-```rust
-#[test_case(&[4096, 4096], 4096, false, Ok(BIG); "large grid, deepest ring")]
-#[test_case(&[8, 37, 512], 512, false, Ok(SMALL); "medium grid")]
-#[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
-#[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
-fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallback>) {
-    let planner = Planner::new(Device { target: sm86(), costs: costs() });
-    assert_eq!(first(shape::linear(Some(&planner), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
-}
-```
+`attention` также уходит на граф, когда добавленных строк больше, чем вмещает блок ключей любой
+конфигурации.
 
 :::note[Почему f32 остаётся на графе]
 Ядра принимают только 16-битные операнды. Приведение модели в f32 вниз обменяло бы около трёх
@@ -80,8 +75,8 @@ fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallba
 выполнения. Такая переменная — либо `batch_var` из JIT, либо `DefineVar`/ограниченный `Param` с
 минимумом и максимумом. Тогда ядро запускается на живое количество по оси z сетки, а его буферы
 рассчитаны на максимум. Выходы выделяются на полную ёмкость с сохранением символьной размерности
-в форме (`Tensor::empty_dynamic`). Поэтому следующее ядро привязывает сам реализованный буфер, и
-копия для его сжатия не делается. Любая другая символьная размерность — это
+в форме (`Tensor::empty_dynamic_spec`). Поэтому следующее ядро привязывает сам реализованный
+буфер, и копия для его сжатия не делается. Любая другая символьная размерность — это
 `Fallback::Symbolic`.
 
 ## Ошибки {#errors}

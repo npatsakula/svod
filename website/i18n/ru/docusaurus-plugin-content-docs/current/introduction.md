@@ -42,8 +42,8 @@ Svod поставляется с речевыми, текстовыми и ви�
 - **Знакомый API.** Тензорный API повторяет PyTorch вплоть до именованных
   аргументов, поэтому порт модели читается как референс, а сам перенос в
   основном механический.
-- **Скорость там, где она важна.** Когда компилятора недостаточно, tile-DSL `tk`
-  даёт рукописные ядра в том же IR. Они остаются видимыми профилировщику и
+- **Скорость там, где она важна.** Когда компилятора недостаточно, тайловый язык
+  `tk3` даёт рукописные ядра в том же IR. Они остаются видимыми профилировщику и
   трекеру происхождения, а не живут где-то сбоку непрозрачными бинарниками.
 
 Мотивация и дизайн описаны в статье
@@ -109,23 +109,15 @@ jit_wrapper! {
 
 - **Тензорные ядра** выбираются по архитектуре: NVIDIA sm_75/80/89, AMD RDNA3,
   RDNA4 и CDNA3/4, а также Apple Metal. fp8 доступен на sm_89 и CDNA3.
-- **Tile-ядра (`tk`)**: tile-DSL в стиле ThunderKittens на Rust для GEMM,
-  flash attention, RMSNorm и k-means. Один исходник ядра опускается в AMD
-  MFMA/WMMA (gfx942, gfx11, gfx12), CUDA `mma.sync` (sm_80+) и Apple
-  `simdgroup_matrix` (Apple7+). Формы тайлов
-  автоматически подбираются при первом использовании и кэшируются. См.
+- **Tile-ядра (`tk3`)**: GEMM, flash attention, пролог внимания, нормализации
+  и свёртка в виде неявного GEMM, написанные один раз как структурированные
+  тайловые программы над линейными раскладками, понижаемые в `mma.sync`/`wgmma`
+  на CUDA sm_80+ и в WMMA/MFMA на AMD RDNA3/3.5/4 и CDNA3, интерпретируемые на
+  хосте для тестов и настраиваемые под форму и устройство при первом
+  использовании с хранилищем на диске. Замерены на sm_86, sm_90, sm_120, gfx1151,
+  gfx1201 и gfx942. Модели вызывают их через слой операций, который всегда
+  возвращает тензор и строит граф там, где ни одно ядро не подходит. См.
   [Tile-ядра](https://svod.vpermilp.online/docs/tile-kernels/overview).
-
-  ```rust
-  fn micro_matmul(ker: &Kernel) -> Arc<UOp> {
-      let w = ker.warp();
-      let a = ker.rt((64, 64), DType::BFloat16, Row, RT_16X16);
-      let b = ker.rt((64, 64), DType::BFloat16, Col, RT_16X16);
-      let c = ker.rt((64, 64), DType::Float32, Col, RT_16X16);
-      let out = w.mma_ab(w.zero(c), &a, &b); // one matrix-core instruction per fragment
-      ker.finish(1)
-  }
-  ```
 - **Поиск ядер**: рукописные эвристики или BEAM-поиск по пространству
   оптимизаций с постоянным кэшем на диске. См.
   [Поиск ядер](https://svod.vpermilp.online/docs/architecture/optimizations/kernel-search).
@@ -190,7 +182,8 @@ Morok — прежнее название Svod.
 | [`device`](https://github.com/npatsakula/svod/tree/main/device/) | Буферы, аллокаторы, mmap, драйверы KFD, CUDA и Metal, аппаратные графы |
 | [`runtime`](https://github.com/npatsakula/svod/tree/main/runtime/) | Компиляция ядер, кэширование, планы выполнения и профилировщик |
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | Ленивый тензорный API, модули `nn` и планировщик памяти |
-| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | Tile-DSL ядер и библиотека ядер |
+| [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | Tile-DSL ядер (tk1), модели его больше не вызывают |
+| [`tk3`](https://github.com/npatsakula/svod/tree/main/tk3/) | Тайловый язык, библиотека ядер, планировщик и тюнер за слоем операций |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | Импортёр ONNX |
 | [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | Хост-декодеры, VAD-сегментация и аудио-пайплайны |
 | [`model`](https://github.com/npatsakula/svod/tree/main/model/) | Предобученные модели и примеры |

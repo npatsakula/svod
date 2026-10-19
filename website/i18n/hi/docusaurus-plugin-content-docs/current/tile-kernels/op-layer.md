@@ -2,7 +2,7 @@
 sidebar_label: Op Layer
 ---
 
-# Op Layer
+# Op Layer {#op-layer}
 
 `svod_tk3::ops` वह है जिसे मॉडल बुलाते हैं। हर op एक lazy `Tensor` लौटाता है। जब device, dtypes और
 shapes किसी कर्नेल में फ़िट होते हैं, तो tk3 कर्नेल गणना करता है। वरना op बराबर का ग्राफ़ ख़ुद बनाता
@@ -23,49 +23,42 @@ pub fn supported(device: &DeviceSpec) -> bool;
 
 | Op | Shapes | Options |
 |---|---|---|
-| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, seg_start, cache, splits, scale, bias }` |
+| `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, chunk, seg_start, cache, splits, scale, bias }` |
 | `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`; gated `w` `[2N, K]` है |
-| `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`; 1×1 convolution `linear` है |
+| `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`; 1×1 `linear` है |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` `x` जैसा `residual` लेते हैं और `(x + residual, norm)` लौटाते हैं |
 
-`Linear::scale` residual जोड़ने से पहले activated मान को गुणा करता है: `scale·act(x·wᵀ + bias) + residual`, इसलिए Conformer का half-step `x + 0.5·ffn(x)` एक ही GEMM है।
+`Linear::scale` residual जोड़ने से पहले activated मान को गुणा करता है:
+`scale·act(x·wᵀ + bias) + residual`, इसलिए Conformer का half-step `x + 0.5·ffn(x)` एक ही GEMM है।
 
 `Attn::keys` `KeyMask::None`, `KeyMask::Lens(&lens)` (`[B]` वैध key गिनतियाँ) या
 `KeyMask::Bool(&mask)` (`[B, Tk]`, जहाँ attend हो वहाँ true) है। `Attn::cache`
-`Cache { head_start, kv_heads, row_map, appended }` लेता है, और `appended` के लिए `KeyMask::Lens` ज़रूरी है।
-`Attn::scale` का default `1/√D` है। `Attn::bias` (`[B, H, T, Tk]` या `[1, H, T, Tk]`, stream dtype में) masks से पहले scaled scores में जोड़ा जाता है, जैसे WavLM का relative position bias। `Qkv::rope` `[1, T, 1, D/2]` (position के हिसाब से) या
-`[B, T, 1, D/2]` (token के हिसाब से) का `(cos, sin)` है। Masks का वर्णन
-[attention कर्नेल](./kernel-library#flash-attention) के साथ है।
+`Cache { head_start, kv_heads, row_map, appended, app_lens }` लेता है, और `appended` के लिए
+`KeyMask::Lens` ज़रूरी है। `Attn::chunk` block attention है (`Chunk { size, left, right }`)।
+`Attn::scale` का default `1/√D` है। `Attn::bias` (`[B, H, T, Tk]` या `[1, H, T, Tk]`, stream dtype
+में) masks से पहले scaled scores में जोड़ा जाता है, जैसे WavLM का relative position bias।
+`Qkv::rope` `[1, T, 1, D/2]` (position के हिसाब से) या `[B, T, 1, D/2]` (token के हिसाब से) का
+`(cos, sin)` है। Masks का वर्णन [attention कर्नेल](./kernel-library#flash-attention) के साथ है।
 
 ## कर्नेल या ग्राफ़ {#kernel-or-graph}
 
-फ़ैसला `ops::shape` में एक pure function है, `fn(target, dtypes, extents, …) -> Plan<Cfg>`, इसलिए इसे
-बिना GPU के host पर टेस्ट किया जाता है। `Plan::Kernel(configs)` configs को rank करता है, untuned
-चुनाव पहले; [tuner](./tuning) उन पहले configs को मापता है जो बिना spill किए compile होते हैं (या, जब हर
-एक spill करे, तो पहले जो compile हों: spills किसी op को कभी ग्राफ़ पर नहीं भेजते)।
-`Plan::Graph(Fallback)` बताता है कि ग्राफ़ क्यों चलता है।
+फ़ैसला `ops::shape` में एक pure function है, `fn(planner, dtypes, extents, …) -> Plan<Cfg>`, इसलिए
+इसे बिना GPU के host पर टेस्ट किया जाता है (`test/unit/ops_plan.rs`)। `Plan::Kernel(configs)` में
+ranked configs होते हैं; [tuner](./tuning) उनमें से उन पहले configs को मापता है जो बिना spill के
+compile होते हैं (या, अगर हर एक spill करे, तो जो पहले compile हों: spills किसी op को कभी ग्राफ़ पर नहीं
+भेजते)। `Plan::Graph(Fallback)` बताता है कि ग्राफ़ क्यों चलता है, और planner log उसका नाम लेता है
+(`RUST_LOG=svod_tk3::plan=debug`)।
 
 | `Fallback` | कब |
 |---|---|
-| `Target` | Tensor default device पर नहीं है, या device के पास tk3 tables नहीं हैं (आज: CUDA sm_80+ के अलावा सब) |
-| `Dtype` | कोई operand f32 है, या सारे operands matrix core वाला एक ही 16-bit type साझा नहीं करते |
+| `Target` | Tensor default device पर नहीं है, device के पास कोई tk3 kernels नहीं हैं (`config::has_kernels`: sm_80 से नीचे का CUDA, Metal, CPU), या उसका target कोई SM count नहीं बताता |
+| `Dtype` | कोई operand f32 है, या सभी operands matrix core वाला एक ही 16-bit type साझा नहीं करते। `conv2d`: input के type या f32 के अलावा कोई output type, या ऐसा residual जो उस type में न हो |
 | `Symbolic` | Bound leading dim के अलावा कोई dim symbolic है (`linear` के लिए symbolic `N` भी) |
-| `Shape` | `linear`: `N` 8 का गुणज नहीं या कोई row नहीं। `attention`: `D ∉ {48, 64, 128}` या कोई ख़ाली dim। `heads`: `D` 16..=256 में दो की घात नहीं। Norms: `D` 256..=2048 में दो की घात नहीं। `conv2d`: `groups > 1`, `Cin` 16 का गुणज नहीं, `Cout` 8 का गुणज नहीं, या ख़ाली output |
-| `Config` | कोई tile config फ़िट नहीं होता। `linear` के लिए, `K` 16 का गुणज नहीं |
+| `Shape` | `linear`: `N` 8 का गुणज नहीं या कोई rows नहीं। `conv2d`: `groups > 1`, `Cin` 16 का गुणज नहीं, `Cout` 8 का गुणज नहीं, या ख़ाली output। `attention`: कोई config `D` पर फ़िट नहीं होता (sm_86 पर 32, 48, 64, 128 और 256 plan होते हैं और 40 नहीं) या कोई ख़ाली dim। `heads`: `D` 16..=256 में दो की घात नहीं। Norms: `D` 256..=2048 में दो की घात नहीं |
+| `Config` | कोई tile config फ़िट नहीं होता। `linear` के लिए, `K` 16 का गुणज नहीं है |
 
-sm_86 target पर `test/unit/ops_plan.rs` के असली cases:
-
-```rust
-#[test_case(&[4096, 4096], 4096, false, Ok(BIG); "large grid, deepest ring")]
-#[test_case(&[8, 37, 512], 512, false, Ok(SMALL); "medium grid")]
-#[test_case(&[37, 40], 96, false, Err(Fallback::Config); "k off every bk")]
-#[test_case(&[37, 64], 100, false, Err(Fallback::Shape); "n not a multiple of 8")]
-fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallback>) {
-    let planner = Planner::new(Device { target: sm86(), costs: costs() });
-    assert_eq!(first(shape::linear(Some(&planner), &[BF16, BF16], Some(&ext(x)), n, gated)), want);
-}
-```
+जब appended rows हर config के key block से चौड़ी हों, तब भी `attention` ग्राफ़ लेता है।
 
 :::note[f32 ग्राफ़ पर क्यों रहता है]
 कर्नेल सिर्फ़ 16-bit operands लेते हैं। किसी f32 मॉडल को नीचे cast करने से गति के बदले precision के
@@ -77,8 +70,8 @@ fn linear_plans(x: &[usize], n: usize, gated: bool, want: Result<GemmCfg, Fallba
 किसी operand का dim 0 symbolic हो सकता है जब वह किसी runtime variable से bound हो। वह variable या तो
 JIT का `batch_var` है या min और max वाला `DefineVar`/bounded `Param`। तब कर्नेल grid z में live गिनती
 पर launch होता है, और उसके buffers अधिकतम आकार के होते हैं। Outputs capacity पर allocate होते हैं और
-symbolic dim उनके shape में बना रहता है (`Tensor::empty_dynamic`)। इसलिए अगला कर्नेल realized buffer को
-ही bind करता है, और उसे छोटा करने के लिए कोई copy नहीं बनती। कोई भी दूसरा symbolic dim
+symbolic dim उनके shape में बना रहता है (`Tensor::empty_dynamic_spec`)। इसलिए अगला कर्नेल realized
+buffer को ही bind करता है, और उसे छोटा करने के लिए कोई copy नहीं बनती। कोई भी दूसरा symbolic dim
 `Fallback::Symbolic` है।
 
 ## Errors {#errors}
