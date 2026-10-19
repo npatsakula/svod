@@ -130,6 +130,8 @@ pub struct ParamRef<T>(pub ParamId, PhantomData<T>);
 pub struct Kernel {
     prog: Program,
     blocks: Vec<Block>,
+    /// Whose lanes the statements being recorded belong to.
+    scope: Scope,
 }
 
 impl Kernel {
@@ -148,6 +150,7 @@ impl Kernel {
                 pins: vec![],
             },
             blocks: vec![Block::default()],
+            scope: Scope::Block,
         };
         let one = k.push_scalar(Scalar::Const(1));
         k.prog.grid = [one; 3];
@@ -467,7 +470,7 @@ impl Kernel {
         let (d, s) = (self.prog.value(dst), self.prog.value(src));
         assert_eq!(d.shape, s.shape, "copy shapes");
         assert_eq!(d.dtype, s.dtype, "copy dtypes");
-        self.push(Stmt::Copy { dst, src, mode });
+        self.push(Stmt::Copy { dst, src, mode, scope: self.scope });
     }
 
     /// Global → shared; `Async` lets the lowering overlap it.
@@ -551,7 +554,9 @@ impl Kernel {
     /// is its index there, and what it leaves in shared memory is visible to
     /// the block afterwards.
     pub fn each_warp(&mut self, body: impl FnOnce(&mut Self)) {
+        let outer = std::mem::replace(&mut self.scope, Scope::Warp);
         let body = self.with_block(body);
+        self.scope = outer;
         self.push(Stmt::Warps { body });
     }
 

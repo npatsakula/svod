@@ -624,8 +624,8 @@ impl<'a> Emit<'a> {
                 self.advance(*dst);
                 Ok(())
             }
-            Stmt::Copy { dst, src, mode } => {
-                self.copy(*dst, *src, *mode)?;
+            Stmt::Copy { dst, src, mode, scope } => {
+                self.copy(*dst, *src, *mode, *scope)?;
                 self.advance(*dst);
                 Ok(())
             }
@@ -785,23 +785,14 @@ impl<'a> Emit<'a> {
 
     // ---- copies ---------------------------------------------------------------
 
-    fn copy(&mut self, dst: ValId, src: ValId, mode: CopyMode) -> Result<()> {
+    fn copy(&mut self, dst: ValId, src: ValId, mode: CopyMode, scope: Scope) -> Result<()> {
         match (self.value(dst).tier(), self.value(src).tier()) {
-            (Tier::Smem, Tier::Global) => self.fill(dst, src, mode),
+            (Tier::Smem, Tier::Global) => self.fill(dst, src, mode, scope),
             (Tier::Reg, Tier::Smem) => self.gather(dst, src),
             (Tier::Reg, Tier::Global) => self.load_regs(dst, src),
             (Tier::Smem | Tier::Global, Tier::Reg) => self.store_regs(dst, src),
             (Tier::Reg, Tier::Reg) => self.relayout(dst, src),
             (d, s) => UnsupportedSnafu { what: format!("a {s:?} → {d:?} copy") }.fail(),
-        }
-    }
-
-    /// The warps whose threads a copy of the statement being emitted is
-    /// spread over: the block's, or one inside a [`Stmt::Warps`].
-    fn warps(&self) -> u32 {
-        match self.scope {
-            Scope::Block => self.prog.warps,
-            Scope::Warp => 1,
         }
     }
 
@@ -811,13 +802,17 @@ impl<'a> Emit<'a> {
         self.low.grid.count()
     }
 
-    /// Global → shared, every thread of the scope moving 16-byte chunks.
-    fn fill(&mut self, dst: ValId, src: ValId, mode: CopyMode) -> Result<()> {
+    /// Global → shared, every thread of the copy's scope (the block's, or
+    /// one warp's own) moving 16-byte chunks.
+    fn fill(&mut self, dst: ValId, src: ValId, mode: CopyMode, scope: Scope) -> Result<()> {
         let (d, s) = (self.view(dst), self.view(src));
         let chunk = 16 / d.dtype.bytes() as i64;
         let cols = d.shape.cols as i64;
-        let threads = (self.warps() * self.low.device.target.wave) as i64;
-        let tid = if self.scope == Scope::Warp { self.lane.clone() } else { self.tid.clone() };
+        let (warps, tid) = match scope {
+            Scope::Block => (self.prog.warps, self.tid.clone()),
+            Scope::Warp => (1, self.lane.clone()),
+        };
+        let threads = (warps * self.low.device.target.wave) as i64;
         let chunks = d.shape.rows as i64 * cols / chunk;
         let cuda = matches!(self.low.device.target.arch, GpuArch::Cuda(_));
         snafu::ensure!(

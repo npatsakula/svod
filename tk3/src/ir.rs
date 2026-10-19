@@ -365,6 +365,9 @@ pub enum Stmt {
         dst: ValId,
         src: ValId,
         mode: CopyMode,
+        /// Whose lanes move it: the block's, or one warp's own inside a
+        /// [`Stmt::Warps`].
+        scope: Scope,
     },
     Loop(Loop),
     Pipeline(Pipeline),
