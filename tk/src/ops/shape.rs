@@ -11,6 +11,7 @@ use super::config::{self, Planner};
 use crate::kernels::attention::FaCfg;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
+use crate::kernels::nearest::{Floors, MAX_CANDIDATES, Metric, NearestCfg};
 use crate::kernels::rows::NormCfg;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,4 +218,36 @@ pub fn norm(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>) -> 
         }
         candidates(config::norm_candidates(d).into(), Fallback::Shape)
     })
+}
+
+/// `x [n, d]` against the candidates `c [m, d]`, each row's cheapest by
+/// `metric` above `floors` (under `groups`); `dtypes` are those of `x` and `c`. Any depth runs,
+/// padded with zeros to the matrix core's ([`Planner::nearest_depth`]); a
+/// bound batch is not, nor are more candidates than the f32 index holds.
+pub fn nearest(
+    planner: Option<&Planner>,
+    dtypes: &[DType],
+    x: Option<&Extent>,
+    c: Option<&Extent>,
+    metric: Metric,
+    floors: Floors,
+    groups: bool,
+) -> Plan<NearestCfg> {
+    plan(|| {
+        let planner = gate(planner, dtypes)?;
+        let (x, c) = (x.ok_or(Fallback::Symbolic)?, c.ok_or(Fallback::Symbolic)?);
+        if x.var || c.var {
+            return Err(Fallback::Symbolic);
+        }
+        let ([n, d], [m, _]) = (dims2(x)?, dims2(c)?);
+        if n * m * d == 0 || m > MAX_CANDIDATES {
+            return Err(Fallback::Shape);
+        }
+        let d = planner.nearest_depth(d).ok_or(Fallback::Target)?;
+        candidates(planner.nearest_ranked(n, m, d, metric, floors, groups), Fallback::Config)
+    })
+}
+
+fn dims2(x: &Extent) -> Result<[usize; 2], Fallback> {
+    x.dims[..].try_into().map_err(|_| Fallback::Shape)
 }

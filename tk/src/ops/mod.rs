@@ -10,6 +10,7 @@ pub mod config;
 pub(crate) mod conv;
 pub(crate) mod heads;
 pub(crate) mod linear;
+pub(crate) mod nearest;
 pub(crate) mod norm;
 pub mod shape;
 
@@ -28,6 +29,7 @@ pub use self::attention::{Attn, Cache, Chunk, KeyMask, attention};
 pub use self::conv::{Conv, conv2d};
 pub use self::heads::{Qkv, heads};
 pub use self::linear::{Linear, linear};
+pub use self::nearest::{Metric, Nearest, nearest};
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
 use crate::atoms::{Device, Target};
 pub use crate::kernels::Act;
@@ -51,6 +53,7 @@ pub mod tuned {
     pub use super::conv::tuned as conv;
     pub use super::heads::tuned as heads;
     pub use super::linear::{probed as gemm_probe, tuned as linear};
+    pub use super::nearest::tuned as nearest;
     pub use super::norm::tuned as norm;
 }
 
