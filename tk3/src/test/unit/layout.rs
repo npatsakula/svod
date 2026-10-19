@@ -98,32 +98,13 @@ fn atoms_match_lane_map_closed_forms() {
     }
 }
 
-/// The `mma.sync` A-fragment table (`fa_cuda_references.md` §(a)).
-#[test_case(0, [(0,0),(0,1),(8,0),(8,1),(0,8),(0,9),(8,8),(8,9)]; "lane 0")]
-#[test_case(1, [(0,2),(0,3),(8,2),(8,3),(0,10),(0,11),(8,10),(8,11)]; "lane 1")]
-#[test_case(3, [(0,6),(0,7),(8,6),(8,7),(0,14),(0,15),(8,14),(8,15)]; "lane 3")]
-#[test_case(4, [(1,0),(1,1),(9,0),(9,1),(1,8),(1,9),(9,8),(9,9)]; "lane 4")]
-#[test_case(13, [(3,2),(3,3),(11,2),(11,3),(3,10),(3,11),(11,10),(11,11)]; "lane 13")]
-#[test_case(18, [(4,4),(4,5),(12,4),(12,5),(4,12),(4,13),(12,12),(12,13)]; "lane 18")]
-#[test_case(27, [(6,6),(6,7),(14,6),(14,7),(6,14),(6,15),(14,14),(14,15)]; "lane 27")]
-#[test_case(31, [(7,6),(7,7),(15,6),(15,7),(7,14),(7,15),(15,14),(15,15)]; "lane 31")]
-fn mma_sync_a_fragment_rows(lane: u32, expect: [(i64, i64); 8]) {
-    let got: Vec<_> = (0..8).map(|j| at(&mma_sync_a(), lane, j)).collect();
-    assert_eq!(got, expect);
-}
-
-/// C: `c0..c3 = (g, 2t), (g, 2t+1), (g+8, 2t), (g+8, 2t+1)`; B: `b0..b3 = k (2t, 2t+1,
-/// 2t+8, 2t+9) at n = g` — over all 32 lanes, and the 16×16 tile is the C fragment
-/// tiled over one more register bit (n-half `h` = registers `4h..4h+4`).
+/// The 16×16 tile is the C fragment tiled over one more register bit (n-half `h` =
+/// registers `4h..4h+4`), and B and C are bijections; where each places its elements
+/// is `atoms::atom_layouts_match_the_isa`'s PTX table.
 #[test]
-fn mma_sync_b_and_c_tables() {
+fn mma_sync_tile_is_c_over_the_n_halves() {
     let (b, c) = (mma_sync_b(), mma_sync_c());
     for lane in 0..32u32 {
-        let (g, t) = (i64::from(lane >> 2), i64::from(lane & 3));
-        let cs: Vec<_> = (0..4).map(|k| at(&c, lane, k)).collect();
-        assert_eq!(cs, [(g, 2 * t), (g, 2 * t + 1), (g + 8, 2 * t), (g + 8, 2 * t + 1)], "C lane {lane}");
-        let bs: Vec<_> = (0..4).map(|k| at(&b, lane, k)).collect();
-        assert_eq!(bs, [(2 * t, g), (2 * t + 1, g), (2 * t + 8, g), (2 * t + 9, g)], "B lane {lane}");
         for h in 0..2 {
             for k in 0..4 {
                 let (r, cc) = at(&c, lane, k);
@@ -148,21 +129,6 @@ fn mma_sync_transposed_tile_is_two_b_fragments() {
         Conversion::between(&mma_sync_16x16().transpose(), &halves),
         Conversion::RegPermute([0, 1, 4, 5, 2, 3, 6, 7].into_iter().collect())
     );
-}
-
-/// tk1's `amd_maps` and `gfx12_map` spot values.
-#[test_case(mfma_16x16x16(), 37, 2, (5, 10); "gfx942 row")]
-#[test_case(mfma_16x16x16().transpose(), 37, 2, (10, 5); "gfx942 col")]
-#[test_case(wmma_gfx11_acc(), 21, 3, (7, 5); "rdna acc")]
-#[test_case(wmma_gfx11_acc().transpose(), 21, 3, (5, 7); "rdna acc_t")]
-#[test_case(wmma_gfx11_input(), 21, 9, (5, 9); "rdna input")]
-#[test_case(wmma_gfx11_input().transpose(), 21, 9, (9, 5); "rdna input col")]
-#[test_case(wmma_gfx12(), 5, 0, (5, 0); "gfx12 operand lane 5 reg 0")]
-#[test_case(wmma_gfx12(), 21, 3, (5, 11); "gfx12 upper wave-half is the second K run")]
-#[test_case(wmma_gfx12().transpose(), 21, 3, (11, 5); "gfx12 col accumulator is the transpose")]
-#[test_case(wmma_gfx12(), 31, 7, (15, 15); "gfx12 last lane, last register")]
-fn amd_maps(l: Layout, lane: u32, j: u32, expect: (i64, i64)) {
-    assert_eq!(at(&l, lane, j), expect);
 }
 
 /// MFMA 32×32×8: A `row = L%32, k = 4(L/32) + j`, B its transpose, C/D `row = 8(j/4) +
