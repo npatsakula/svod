@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use snafu::{Snafu, ensure};
+use snafu::{OptionExt, Snafu, ensure};
 use svod_dtype::ScalarDType;
 
 use crate::ir::*;
@@ -18,6 +18,8 @@ pub enum Error {
     ParamSize { name: String, got: usize, want: usize },
     #[snafu(display("raw statements cannot be interpreted: {code}"))]
     Raw { code: String },
+    #[snafu(display("scalar {a} {op:?} {b} is undefined"))]
+    Division { op: BinOp, a: i64, b: i64 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -90,10 +92,10 @@ pub fn run(prog: &Program, params: Vec<Vec<f64>>, vars: &[(&str, i64)]) -> Resul
     for var in &prog.vars {
         ensure!(frame.vars.contains_key(&var.name), UnboundVarSnafu { name: var.name.clone() });
     }
-    let grid = prog.grid.map(|g| frame.scalar(g).unwrap_or(1));
-    for z in 0..grid[2] {
-        for y in 0..grid[1] {
-            for x in 0..grid[0] {
+    let [x_end, y_end, z_end] = [frame.scalar(prog.grid[0])?, frame.scalar(prog.grid[1])?, frame.scalar(prog.grid[2])?];
+    for z in 0..z_end {
+        for y in 0..y_end {
+            for x in 0..x_end {
                 frame.block = [x, y, z];
                 frame.regs.clear();
                 frame.block_run(&prog.body)?;
@@ -104,27 +106,28 @@ pub fn run(prog: &Program, params: Vec<Vec<f64>>, vars: &[(&str, i64)]) -> Resul
 }
 
 impl Frame<'_> {
-    fn scalar(&self, id: ScalarId) -> Option<i64> {
+    fn scalar(&self, id: ScalarId) -> Result<i64> {
         self.scalar_at(id, None)
     }
 
     /// `id` with [`Scalar::Row`] bound to `row`.
-    fn scalar_at(&self, id: ScalarId, row: Option<i64>) -> Option<i64> {
-        Some(match self.prog.scalar(id) {
-            Scalar::Row => row?,
+    fn scalar_at(&self, id: ScalarId, row: Option<i64>) -> Result<i64> {
+        Ok(match self.prog.scalar(id) {
+            Scalar::Row => row.expect("a row map is evaluated at a row"),
             Scalar::Const(v) => *v,
-            Scalar::Var(name) => *self.vars.get(name)?,
+            Scalar::Var(name) => self.vars[name],
             Scalar::Special(Special::Block(axis)) => self.block[*axis as usize],
             Scalar::Special(Special::Warp) => self.warp,
-            Scalar::Induction => *self.induction.get(&id)?,
+            Scalar::Induction => self.induction[&id],
             Scalar::Bin(op, a, b) => {
                 let (a, b) = (self.scalar_at(*a, row)?, self.scalar_at(*b, row)?);
                 match op {
                     BinOp::Add => a + b,
                     BinOp::Sub => a - b,
                     BinOp::Mul => a * b,
-                    BinOp::Div => a.div_euclid(b),
-                    BinOp::Rem => a.rem_euclid(b),
+                    // Truncating, as the device's `sdiv` and `srem` are.
+                    BinOp::Div => a.checked_div(b).context(DivisionSnafu { op: *op, a, b })?,
+                    BinOp::Rem => a.checked_rem(b).context(DivisionSnafu { op: *op, a, b })?,
                     BinOp::Min => a.min(b),
                     BinOp::Max => a.max(b),
                     BinOp::Lt => i64::from(a < b),
@@ -141,10 +144,6 @@ impl Frame<'_> {
         })
     }
 
-    fn must(&self, id: ScalarId) -> i64 {
-        self.scalar(id).expect("every scalar of a running block is defined")
-    }
-
     fn block_run(&mut self, block: &Block) -> Result<()> {
         for stmt in &block.0 {
             self.stmt(stmt)?;
@@ -155,15 +154,15 @@ impl Frame<'_> {
     fn stmt(&mut self, stmt: &Stmt) -> Result<()> {
         match stmt {
             Stmt::Let { dst, op } => {
-                let out = self.tile_op(*dst, op);
+                let out = self.tile_op(*dst, op)?;
                 self.regs.insert(*dst, out);
             }
             Stmt::Copy { dst, src, .. } => {
-                let data = self.read(*src);
-                self.write(*dst, &data);
+                let data = self.read(*src)?;
+                self.write(*dst, &data)?;
             }
             Stmt::Loop(l) => {
-                let (start, extent) = (self.must(l.start), self.must(l.extent));
+                let (start, extent) = (self.scalar(l.start)?, self.scalar(l.extent)?);
                 self.enter(&l.carried);
                 for i in start..start + extent {
                     self.induction.insert(l.iv, i);
@@ -172,7 +171,7 @@ impl Frame<'_> {
                 }
             }
             Stmt::Pipeline(p) => {
-                let extent = self.must(p.extent);
+                let extent = self.scalar(p.extent)?;
                 self.enter(&p.carried);
                 for i in 0..extent {
                     for stage in [&p.produce, &p.consume] {
@@ -194,7 +193,7 @@ impl Frame<'_> {
                 self.warp = saved;
             }
             Stmt::If { pred, then, otherwise } => {
-                let branch = if self.must(*pred) != 0 { then } else { otherwise };
+                let branch = if self.scalar(*pred)? != 0 { then } else { otherwise };
                 self.block_run(branch)?;
             }
             Stmt::Sync(_) => {}
@@ -221,31 +220,33 @@ impl Frame<'_> {
     }
 
     /// Element coordinates → flat index of a view, or `None` out of bounds.
-    fn address(&self, place: &Place, r: usize, c: usize, shape: Shape) -> Option<usize> {
+    fn address(&self, place: &Place, r: usize, c: usize, shape: Shape) -> Result<Option<usize>> {
         let Shape { rows, cols } = shape;
-        match place {
+        Ok(match place {
             Place::Reg => Some(r * cols + c),
             Place::Smem { alloc, offset } => Some(
-                self.must(*offset) as usize
+                self.scalar(*offset)? as usize
                     + if self.prog.smem[alloc.index()].along == Axis::Row { c * rows + r } else { r * cols + c },
             ),
             Place::Global { offset, stride, bounds, rows, .. } => {
-                let inside = |b: Option<ScalarId>, i: usize| b.is_none_or(|b| (i as i64) < self.must(b));
-                let at = |id: ScalarId| self.scalar_at(id, Some(r as i64)).expect("a defined row map");
+                let inside = |b: Option<ScalarId>, i: usize| b.map_or(Ok(true), |b| Ok((i as i64) < self.scalar(b)?));
+                let at = |id: ScalarId| self.scalar_at(id, Some(r as i64));
                 let (row_ok, row_off) = match rows {
-                    Some(map) => (map.valid.is_none_or(|v| at(v) != 0), at(map.offset)),
-                    None => (inside(bounds[0], r), r as i64 * self.must(stride[0])),
+                    Some(map) => (map.valid.map_or(Ok(true), |v| Ok(at(v)? != 0))?, at(map.offset)?),
+                    None => (inside(bounds[0], r)?, r as i64 * self.scalar(stride[0])?),
                 };
-                (row_ok && inside(bounds[1], c))
-                    .then(|| (self.must(*offset) + row_off + c as i64 * self.must(stride[1])) as usize)
+                if !(row_ok && inside(bounds[1], c)?) {
+                    return Ok(None);
+                }
+                Some((self.scalar(*offset)? + row_off + c as i64 * self.scalar(stride[1])?) as usize)
             }
-        }
+        })
     }
 
-    fn read(&self, id: ValId) -> Vec<f64> {
+    fn read(&self, id: ValId) -> Result<Vec<f64>> {
         let v = self.prog.value(id);
         let Shape { rows, cols } = v.shape;
-        match &v.place {
+        Ok(match &v.place {
             Place::Reg => self.regs[&id].clone(),
             Place::Smem { .. } | Place::Global { .. } => {
                 let store = match v.place {
@@ -256,17 +257,17 @@ impl Frame<'_> {
                 let mut out = vec![0.0; rows * cols];
                 for r in 0..rows {
                     for c in 0..cols {
-                        if let Some(i) = self.address(&v.place, r, c, v.shape) {
+                        if let Some(i) = self.address(&v.place, r, c, v.shape)? {
                             out[r * cols + c] = store.get(i).copied().unwrap_or(0.0);
                         }
                     }
                 }
                 out
             }
-        }
+        })
     }
 
-    fn write(&mut self, id: ValId, data: &[f64]) {
+    fn write(&mut self, id: ValId, data: &[f64]) -> Result<()> {
         let v = self.prog.value(id).clone();
         let Shape { rows, cols } = v.shape;
         let rounded: Vec<f64> = data.iter().map(|&x| round_to(v.dtype, x)).collect();
@@ -278,7 +279,7 @@ impl Frame<'_> {
                 let mut writes = Vec::with_capacity(rows * cols);
                 for r in 0..rows {
                     for c in 0..cols {
-                        if let Some(i) = self.address(&v.place, r, c, v.shape) {
+                        if let Some(i) = self.address(&v.place, r, c, v.shape)? {
                             writes.push((i, rounded[r * cols + c]));
                         }
                     }
@@ -295,9 +296,10 @@ impl Frame<'_> {
                 }
             }
         }
+        Ok(())
     }
 
-    fn tile_op(&self, dst: ValId, op: &TileOp) -> Vec<f64> {
+    fn tile_op(&self, dst: ValId, op: &TileOp) -> Result<Vec<f64>> {
         let out = self.prog.value(dst);
         let Shape { rows, cols } = out.shape;
         let data = match op {
@@ -308,7 +310,7 @@ impl Frame<'_> {
                 };
                 vec![v; rows * cols]
             }
-            TileOp::Splat(id) => vec![self.must(*id) as f64; rows * cols],
+            TileOp::Splat(id) => vec![self.scalar(*id)? as f64; rows * cols],
             TileOp::Coord(axis) => (0..rows * cols)
                 .map(|i| match axis {
                     Axis::Row => (i / cols) as f64,
@@ -316,7 +318,7 @@ impl Frame<'_> {
                 })
                 .collect(),
             TileOp::Unary { src, f } => self
-                .read(*src)
+                .read(*src)?
                 .into_iter()
                 .map(|x| match f {
                     UnaryOp::Neg => -x,
@@ -330,7 +332,7 @@ impl Frame<'_> {
                 })
                 .collect(),
             TileOp::Binary { a, b, f } => {
-                let (va, vb) = (self.broadcast(*a, out.shape), self.broadcast(*b, out.shape));
+                let (va, vb) = (self.broadcast(*a, out.shape)?, self.broadcast(*b, out.shape)?);
                 va.iter()
                     .zip(&vb)
                     .map(|(&x, &y)| match f {
@@ -350,16 +352,16 @@ impl Frame<'_> {
                     .collect()
             }
             TileOp::Cast { src, round: Round::Zero, .. } => {
-                self.read(*src).into_iter().map(|x| f32::from_bits((x as f32).to_bits() & 0xffff_0000) as f64).collect()
+                self.read(*src)?.into_iter().map(|x| f32::from_bits((x as f32).to_bits() & 0xffff_0000) as f64).collect()
             }
-            TileOp::Cast { src, .. } | TileOp::Relayout { src } | TileOp::Move { src } => self.read(*src),
+            TileOp::Cast { src, .. } | TileOp::Relayout { src } | TileOp::Move { src } => self.read(*src)?,
             TileOp::Mma { acc, a, b, a_t, b_t, .. } => {
-                let (va, vb) = (self.read(*a), self.read(*b));
+                let (va, vb) = (self.read(*a)?, self.read(*b)?);
                 let (sa, sb) = (self.prog.value(*a).shape, self.prog.value(*b).shape);
                 let k = if *a_t { sa.rows } else { sa.cols };
                 let at = |m: usize, kk: usize| if *a_t { va[kk * sa.cols + m] } else { va[m * sa.cols + kk] };
                 let bt = |kk: usize, n: usize| if *b_t { vb[n * sb.cols + kk] } else { vb[kk * sb.cols + n] };
-                let mut out = self.read(*acc);
+                let mut out = self.read(*acc)?;
                 for m in 0..rows {
                     for n in 0..cols {
                         let mut sum = 0.0;
@@ -372,7 +374,7 @@ impl Frame<'_> {
                 out
             }
             TileOp::Reduce { src, axis, f } => {
-                let v = self.read(*src);
+                let v = self.read(*src)?;
                 let s = self.prog.value(*src).shape;
                 let fold = |acc: f64, x: f64| match f {
                     ReduceOp::Sum => acc + x,
@@ -392,34 +394,34 @@ impl Frame<'_> {
                 }
             }
             TileOp::Where { pred, a, b } => {
-                let p = self.read(*pred);
-                let (va, vb) = (self.broadcast(*a, out.shape), self.broadcast(*b, out.shape));
+                let p = self.read(*pred)?;
+                let (va, vb) = (self.broadcast(*a, out.shape)?, self.broadcast(*b, out.shape)?);
                 p.iter().zip(va.iter().zip(&vb)).map(|(&p, (&x, &y))| if p != 0.0 { x } else { y }).collect()
             }
             TileOp::MulAdd { a, b, c } => {
                 let (va, vb, vc) =
-                    (self.broadcast(*a, out.shape), self.broadcast(*b, out.shape), self.broadcast(*c, out.shape));
+                    (self.broadcast(*a, out.shape)?, self.broadcast(*b, out.shape)?, self.broadcast(*c, out.shape)?);
                 va.iter().zip(&vb).zip(&vc).map(|((&x, &y), &z)| x.mul_add(y, z)).collect()
             }
             TileOp::Transpose { src } => {
-                let v = self.read(*src);
+                let v = self.read(*src)?;
                 (0..rows * cols).map(|i| v[(i % cols) * rows + i / cols]).collect()
             }
         };
-        data.into_iter().map(|x| round_to(out.dtype, x)).collect()
+        Ok(data.into_iter().map(|x| round_to(out.dtype, x)).collect())
     }
 
-    fn broadcast(&self, id: ValId, to: Shape) -> Vec<f64> {
-        let v = self.read(id);
+    fn broadcast(&self, id: ValId, to: Shape) -> Result<Vec<f64>> {
+        let v = self.read(id)?;
         let s = self.prog.value(id).shape;
         if s == to {
-            return v;
+            return Ok(v);
         }
-        (0..to.rows * to.cols)
+        Ok((0..to.rows * to.cols)
             .map(|i| {
                 let (r, c) = (i / to.cols, i % to.cols);
                 v[(if s.rows == 1 { 0 } else { r }) * s.cols + if s.cols == 1 { 0 } else { c }]
             })
-            .collect()
+            .collect())
     }
 }

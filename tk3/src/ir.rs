@@ -141,7 +141,9 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
+    /// Truncating toward zero, as C's.
     Div,
+    /// The remainder of [`BinOp::Div`]: the numerator's sign.
     Rem,
     Min,
     Max,

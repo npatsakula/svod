@@ -178,3 +178,23 @@ fn scale_is_a_product() {
     let want: Vec<f64> = xs.iter().enumerate().map(|(i, x)| x * fs[i / cols]).collect();
     assert_eq!(got[2], want);
 }
+
+/// Scalar division and remainder truncate toward zero, as the device's
+/// `sdiv` and `srem` do (a ring's slot `-1 % stages` is `-1` there); a
+/// zero divisor is an error, not a panic.
+#[test_case(-7, 2 => Ok([-3.0, -1.0]); "a negative numerator")]
+#[test_case(7, -2 => Ok([-3.0, 1.0]); "a negative divisor")]
+#[test_case(-1, 3 => Ok([0.0, -1.0]); "a step before the ring")]
+#[test_case(7, 0 => Err("scalar 7 Div 0 is undefined".to_string()); "a zero divisor")]
+fn scalar_division_truncates(n: i64, d: i64) -> Result<[f64; 2], String> {
+    let mut k = Kernel::new("div");
+    let (nv, dv) = (k.var("n", -8, 8), k.var("d", -8, 8));
+    let y = k.param::<I32>("y", ParamKind::Out, 2);
+    for (i, v) in [nv.clone() / dv.clone(), nv % dv].into_iter().enumerate() {
+        let tile = k.splat::<I32>(Shape::new(1, 1), v);
+        let out = k.view(y, i, [1, 1], Shape::new(1, 1), [None, None]);
+        k.store(out, tile);
+    }
+    let out = run(&k.finish(), vec![vec![0.0; 2]], &[("n", n), ("d", d)]).map_err(|e| e.to_string())?;
+    Ok([out[0][0], out[0][1]])
+}
