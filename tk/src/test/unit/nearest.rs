@@ -213,12 +213,13 @@ impl Case {
 }
 
 /// The configs of a small lattice: every ring depth, one or two atom rows
-/// per warp.
+/// per warp, the rows resident or streamed 16 or 32 deep a trip.
 fn small_cfg() -> impl Strategy<Value = NearestCfg> {
-    (0usize..3, 0usize..3, 1usize..4, any::<bool>(), any::<bool>()).prop_map(|(q, kv, stages, wide, unroll)| {
+    let shape = (0usize..3, 0usize..3, 1usize..4, any::<bool>(), any::<bool>());
+    (shape, prop::option::of(0usize..2)).prop_map(|((q, kv, stages, wide, unroll), bk)| {
         let bq = 16 << q;
         let warp_rows = if wide && bq >= 32 { 32 } else { 16 };
-        NearestCfg { unroll, warp_rows, ..NearestCfg::new(bq, 16 << kv, stages) }
+        NearestCfg { unroll, warp_rows, bk: bk.map(|k| 16 << k), ..NearestCfg::new(bq, 16 << kv, stages) }
     })
 }
 
@@ -231,9 +232,10 @@ fn draws() -> impl Strategy<Value = Draw> {
 
 proptest! {
     /// The program computes each row's least score and its first index over
-    /// any shape (ragged rows and candidates, depths padded to the core's),
-    /// every metric, either floor, with and without groups (rows left with
-    /// no candidate included), and exact ties.
+    /// any shape (ragged rows and candidates, depths padded to the core's,
+    /// a streamed depth's last chunk overhanging it), every metric, either
+    /// floor, with and without groups (rows left with no candidate
+    /// included), and exact ties.
     #[test]
     fn nearest_interpreter_matches_the_reference(
         n in 1usize..70,
@@ -296,6 +298,9 @@ fn a_floor_above_every_score_picks_the_first_candidate() {
 #[test_case(130, 270, 37, draw(Metric::L2, BOTH, Some(2), true, true); "integer ties d37")]
 #[test_case(64, 1000, 128, draw(Metric::NegDot, Floors { row: false, col: true }, Some(4), false, false); "neg dot d128")]
 #[test_case(100, 200, 32, draw(Metric::SquaredL2, NONE, None, false, false); "squared l2 d32")]
+#[test_case(200, 300, 512, draw(Metric::NegDot, NONE, None, false, false); "streamed neg dot d512")]
+#[test_case(130, 170, 1000, draw(Metric::L2, BOTH, Some(3), true, true); "streamed integer ties d1000")]
+#[test_case(150, 250, 768, draw(Metric::SquaredL2, NONE, Some(2), false, false); "streamed squared l2 groups d768")]
 fn nearest_matches_on_device(n: usize, m: usize, d: usize, draw: Draw) {
     let Some(planner) = super::device_planner() else { return };
     let case = Case::draw(n, m, d, draw, 7);
@@ -322,12 +327,14 @@ fn host(t: &Tensor) -> Vec<f64> {
 /// assignment at a depth the kernel pads, squared distances, L2 over a
 /// self-join under floors (each row may find itself) and under groups too
 /// (which skip each row itself), the largest inner product under groups at a
-/// deep row.
+/// deep row, and at the depths of embeddings, whose rows stream.
 #[test_case(300, 500, 5, draw(Metric::ShiftedL2, NONE, None, false, false), false; "assignment d5")]
 #[test_case(257, 1000, 37, draw(Metric::SquaredL2, NONE, None, false, false), false; "squared l2 d37")]
 #[test_case(200, 200, 64, draw(Metric::L2, BOTH, None, false, false), true; "l2 floors self-join")]
 #[test_case(300, 300, 16, draw(Metric::L2, BOTH, Some(5), false, false), true; "l2 floors groups self-join")]
 #[test_case(100, 130, 128, draw(Metric::NegDot, NONE, Some(3), false, false), false; "neg dot groups d128")]
+#[test_case(500, 700, 768, draw(Metric::NegDot, NONE, None, false, false), false; "streamed neg dot d768")]
+#[test_case(300, 300, 1000, draw(Metric::SquaredL2, BOTH, Some(4), false, false), true; "streamed self-join d1000")]
 fn nearest_matches_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join: bool) {
     super::ops::untuned(|| {
         let mut case = Case::draw(n, m, d, draw, 11);

@@ -623,7 +623,8 @@ fn register_staged_families_match_on_cuda() {
 /// target of each fill path), the attention lists of every head size and
 /// both query regimes, the convolution lists of every YOLO class, and the
 /// nearest lists of a shallow, a middle and a deep self-join under several
-/// metrics, floors and groups.
+/// metrics, floors and groups, and of the depths that stream the rows (a
+/// last chunk overhanging 800).
 #[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
 #[test_case(amd(AmdArch::Gfx1151, 40), false; "gfx1151")]
 #[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
@@ -674,9 +675,14 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
         }
     }
     let (none, both) = (Floors::default(), Floors { row: true, col: true });
-    for (d, metric, floors, groups) in
-        [(16, Metric::ShiftedL2, none, false), (64, Metric::L2, both, true), (128, Metric::SquaredL2, none, true)]
-    {
+    for (d, metric, floors, groups) in [
+        (16, Metric::ShiftedL2, none, false),
+        (64, Metric::L2, both, true),
+        (128, Metric::SquaredL2, none, true),
+        (512, Metric::NegDot, none, false),
+        (800, Metric::SquaredL2, both, true),
+        (1024, Metric::ShiftedL2, none, false),
+    ] {
         for cfg in first_eight(&planner.nearest_ranked(1 << 16, 1 << 16, d, metric, floors, groups)) {
             let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, cfg };
             let name = format!("nearest d{d} {metric:?} {floors:?} {groups} {cfg:?}");

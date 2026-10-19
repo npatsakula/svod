@@ -1268,17 +1268,17 @@ fn heads_need_three_dims() {
 
 // ---- nearest -----------------------------------------------------------------------
 
-/// The nearest gate: any depth (padded to the core's), 16-bit operands of
-/// one type, rows and candidates present, no more candidates than the f32
-/// index holds, rows the lane can hold; each listed config fits and holds
-/// its ring.
+/// The nearest gate: any depth (padded to the core's, rows past what a lane
+/// holds streamed), 16-bit operands of one type, rows and candidates
+/// present, no more candidates than the f32 index holds; each listed config
+/// fits and holds its ring.
 #[test_case(&[1000, 5], &[2000, 5], BF16, Ok(()); "a shallow depth pads")]
 #[test_case(&[1 << 16, 64], &[1 << 16, 64], BF16, Ok(()); "a large self-join")]
 #[test_case(&[37, 130], &[1, 130], DType::Float16, Ok(()); "one candidate")]
 #[test_case(&[1000, 64], &[1000, 64], DType::Float32, Err(Fallback::Dtype); "f32 keeps the graph")]
 #[test_case(&[0, 64], &[10, 64], BF16, Err(Fallback::Shape); "no rows")]
 #[test_case(&[10, 64], &[(1 << 24) + 1, 64], BF16, Err(Fallback::Shape); "past the f32 index")]
-#[test_case(&[1000, 4096], &[1000, 4096], BF16, Err(Fallback::Config); "rows too deep to hold")]
+#[test_case(&[1000, 4096], &[1000, 4096], BF16, Ok(()); "rows too deep to hold stream")]
 fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, want: Result<(), Fallback>) {
     use crate::kernels::nearest::{Floors, Metric};
     for target in [sm86(), gfx1201(), crate::test::unit::targets::amd(AmdArch::Gfx942, 304)] {
@@ -1305,6 +1305,53 @@ fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, want: Result<(), Fallba
             Plan::Graph(why) => assert_eq!(Err(why), want),
         }
     }
+}
+
+/// Modern embeddings plan a kernel: past the depth a lane holds (`held`,
+/// of the depths here) the ranking leads with rows streamed along the
+/// depth, and where they fit with resident rows, which a streamed tile
+/// reads again for every candidate tile. CDNA's 512-register lanes hold
+/// 512.
+#[test_case(sm86(), 64; "sm_86")]
+#[test_case(gfx1201(), 64; "gfx1201")]
+#[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40), 64; "gfx1151")]
+#[test_case(crate::test::unit::targets::amd(AmdArch::Gfx942, 304), 512; "gfx942")]
+fn deep_rows_stream(target: Target, held: usize) {
+    use crate::kernels::nearest::{Floors, Metric};
+    let planner = planner(target.clone());
+    for metric in [Metric::SquaredL2, Metric::NegDot] {
+        for d in [64, 512, 768, 1024] {
+            let plan = shape::nearest(
+                Some(&planner),
+                &[BF16; 2],
+                Some(&ext(&[1 << 16, d])),
+                Some(&ext(&[1 << 16, d])),
+                metric,
+                Floors::default(),
+                false,
+            );
+            let Plan::Kernel(list) = plan else { panic!("d{d} {metric:?}: {plan:?}") };
+            assert_eq!(list[0].bk.is_some(), d > held, "d{d} {metric:?}: {:?}", list[0]);
+        }
+    }
+}
+
+/// A streamed tile costs more than the resident one where the rows fit: it
+/// fills and reads its query rows again for every candidate tile and starts
+/// its ring empty at each; past the lane's registers only it is admitted.
+#[test_case(sm86(); "sm_86")]
+#[test_case(gfx1201(); "gfx1201")]
+fn a_streamed_tile_pays_its_rows_again(target: Target) {
+    use crate::kernels::nearest::{Floors, Metric, NearestCfg};
+    use crate::ops::config::{Nearest, Rejected};
+    let planner = planner(target);
+    let (resident, streamed) = (NearestCfg::new(64, 64, 2), NearestCfg::streamed(64, 64, 32, 2));
+    let p =
+        |d| Nearest { n: 1 << 16, m: 1 << 16, d, metric: Metric::SquaredL2, floors: Floors::default(), groups: false };
+    let (r, s) = (p(64).admit(&planner, &resident).unwrap().0, p(64).admit(&planner, &streamed).unwrap().0);
+    assert!(r < s, "resident {r} against streamed {s}");
+    assert!(matches!(p(1024).admit(&planner, &resident), Err(Rejected::Registers { .. } | Rejected::Smem { .. })));
+    assert!(p(1024).admit(&planner, &streamed).is_ok());
 }
 
 /// A bound batch variable takes the graph: the kernel has no batch axis.

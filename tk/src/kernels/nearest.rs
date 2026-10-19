@@ -1,17 +1,22 @@
-//! Each query row's cheapest candidate: query rows resident in registers,
-//! candidate tiles streamed through a shared ring, one `x·cᵀ` product per
-//! tile on the matrix core, then the scores folded into a carried running
-//! minimum and its candidate index rather than a softmax.
+//! Each query row's cheapest candidate: one `x·cᵀ` product per candidate
+//! tile on the matrix core, its scores folded into a carried running minimum
+//! and its candidate index rather than a softmax. The query rows stay
+//! resident in registers while candidate tiles stream through a shared ring,
+//! or, at a depth the registers cannot hold, both stream along the depth
+//! through the GEMM's K pipeline once per candidate tile.
+
+use std::fmt;
 
 use super::attention::WARP_ROWS;
 use super::bound;
+use super::gemm::mainloop;
 use crate::atoms::Device;
 use crate::build::*;
 use crate::ir::*;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NearestCfg {
     /// Query rows per block.
     pub bq: usize,
@@ -23,11 +28,34 @@ pub struct NearestCfg {
     /// Query rows a warp owns: [`WARP_ROWS`] or a multiple, every candidate
     /// fragment read from the ring feeding that many rows.
     pub warp_rows: usize,
+    /// The depth a trip streams of the query rows and of the candidates
+    /// alike, a candidate tile's product accumulated over `⌈d / bk⌉` trips;
+    /// `None`: the rows stay resident and a trip streams candidates whole.
+    pub bk: Option<usize>,
+}
+
+/// The tune store keys by this text: a resident config prints as it did
+/// before the depth chunk existed, so its stored choices still apply.
+impl fmt::Debug for NearestCfg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("NearestCfg");
+        s.field("bq", &self.bq).field("bkv", &self.bkv).field("stages", &self.stages);
+        s.field("unroll", &self.unroll).field("warp_rows", &self.warp_rows);
+        if let Some(bk) = self.bk {
+            s.field("bk", &bk);
+        }
+        s.finish()
+    }
 }
 
 impl NearestCfg {
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
-        Self { bq, bkv, stages, unroll: false, warp_rows: WARP_ROWS }
+        Self { bq, bkv, stages, unroll: false, warp_rows: WARP_ROWS, bk: None }
+    }
+
+    /// Rows and candidates both streamed `bk` deep a trip.
+    pub const fn streamed(bq: usize, bkv: usize, bk: usize, stages: usize) -> Self {
+        Self { bk: Some(bk), ..Self::new(bq, bkv, stages) }
     }
 
     pub fn warps(&self) -> u32 {
@@ -38,10 +66,13 @@ impl NearestCfg {
         Lowering::uniform(device, self.unroll, WarpGrid { rows: self.warps(), cols: 1 })
     }
 
-    /// Static shared memory in bytes: the candidate ring of a 16-bit type at
-    /// depth `d`.
+    /// Static shared memory in bytes of a 16-bit type at depth `d`: the
+    /// candidate ring, or streamed, the ring of both operands' chunks.
     pub fn smem_bytes(&self, d: usize) -> usize {
-        self.stages * self.bkv * d * 2
+        match self.bk {
+            None => self.stages * self.bkv * d * 2,
+            Some(bk) => self.stages * (self.bq + self.bkv) * bk * 2,
+        }
     }
 }
 
@@ -84,7 +115,8 @@ pub struct Floors {
 }
 
 /// The rows of `x [n, d]` against the candidates `c [m, d]`, `d` a multiple
-/// of the matrix core's depth (zero columns pad it exactly).
+/// of the matrix core's depth (zero columns pad it exactly); a streamed
+/// config's last chunk may overhang it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NearestSpec {
     pub n: usize,
@@ -139,6 +171,8 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
     let NearestSpec { n, m, d, metric, floors, groups, cfg } = *spec;
     let NearestCfg { bq, bkv, stages, .. } = cfg;
     assert!(m <= MAX_CANDIDATES, "{m} candidates pass the f32 index's {MAX_CANDIDATES}");
+    // A fill zeroes the 16-byte chunks past an overhanging chunk's depth.
+    assert!(cfg.bk.is_none() || d.is_multiple_of(8), "a streamed depth {d} of whole 16-byte chunks");
     let halved = metric != Metric::NegDot;
     let mut k = Kernel::new("nearest");
     let x = k.param::<T>("x", ParamKind::In, n * d);
@@ -153,7 +187,7 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
     let index_out = k.param::<I32>("index", ParamKind::Out, n);
     k.grid([Sc::from(n.div_ceil(bq)), Sc::from(1), Sc::from(1)]);
     k.warps(cfg.warps());
-    let c_s = k.smem::<T>("c_s", stages * bkv * d);
+    let c_s = cfg.bk.is_none().then(|| k.smem::<T>("c_s", stages * bkv * d));
 
     let q_off = k.block(0) * bq;
     let shape = Shape::new(bq, bkv);
@@ -182,9 +216,10 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
             half(k, f)
         }
     };
-    let x_view = k.view(x, 0, [d, 1], Shape::new(bq, d), [bound(n, bq), None]);
+    let depth = cfg.bk.unwrap_or(d);
+    let x_view = k.view(x, 0, [d, 1], Shape::new(bq, depth), [bound(n, bq), bound(d, depth)]);
     let x_view = k.at(x_view, q_off.clone(), 0);
-    let q_r = k.load(x_view);
+    let q_r = cfg.bk.is_none().then(|| k.load(x_view));
     let x_sq = x_sq.map(|p| {
         let v = row_view(&mut k, p, n, bq, q_off.clone());
         let x_sq = k.load(v);
@@ -199,93 +234,109 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
         let v = row_view(&mut k, p, n, bq, q_off.clone());
         k.load(v)
     });
-    let c_view = k.view(c, 0, [d, 1], Shape::new(bkv, d), [bound(m, bkv), None]);
+    let c_view = k.view(c, 0, [d, 1], Shape::new(bkv, depth), [bound(m, bkv), bound(d, depth)]);
     let inf = |k: &mut Kernel| k.fill::<F32>(shape, Const::Float(f64::INFINITY));
+    // The candidate tile at `start`'s products `dot` folded into the row's
+    // carried least score and its first index.
+    let fold = |k: &mut Kernel, dot: Regs<F32>, start: Sc, best: Regs<F32>, index: Regs<F32>| {
+        let mut s = match c_sq {
+            Some(p) => {
+                let v = col_view(k, p, m, bkv, start.clone());
+                let c_sq = k.load(v);
+                let c_sq = half(k, c_sq);
+                k.binary(c_sq, dot, BinaryOp::Sub)
+            }
+            None => k.unary(dot, UnaryOp::Neg),
+        };
+        if let Some(x_sq) = x_sq {
+            s = k.binary(s, x_sq, BinaryOp::Add);
+        }
+        if let Some(p) = col_floor {
+            let v = col_view(k, p, m, bkv, start.clone());
+            let f = k.load(v);
+            let f = floor(k, f);
+            s = k.binary(s, f, BinaryOp::Max);
+        }
+        if let Some(f) = row_floor {
+            s = k.binary(s, f, BinaryOp::Max);
+        }
+        // A floor clamps the distance already.
+        if metric == Metric::L2 && floors == Floors::default() {
+            let zero = k.zeros::<F32>(shape);
+            s = k.binary(s, zero, BinaryOp::Max);
+        }
+        if let (Some(row_group), Some((_, col_group))) = (row_group, grouped) {
+            let v = col_view(k, col_group, m, bkv, start.clone());
+            let col_group = k.load(v);
+            // Against a full-shape zero: the predicate takes the tile's shape.
+            let zero = k.zeros::<I32>(shape);
+            let row_group = k.binary(row_group, zero, BinaryOp::Add);
+            let same = k.compare(row_group, col_group, CmpOp::Eq);
+            let skipped = inf(k);
+            s = k.where_(same, skipped, s);
+        }
+        // The last trip's columns past `m` read the clamped last row.
+        if !m.is_multiple_of(bkv) {
+            let partial = Sc::from(m).lt(start.clone() + bkv);
+            [s] = k.select_if(
+                partial,
+                |k| {
+                    let col = k.coord(shape, Axis::Col);
+                    let left = k.splat::<I32>(shape, Sc::from(m) - start.clone());
+                    let inside = k.compare(col, left, CmpOp::Lt);
+                    let past = inf(k);
+                    [k.where_(inside, s, past)]
+                },
+                |_| [s],
+            );
+        }
+        // The columns in f32 (exact below 2^24, as the carried index):
+        // a float minimum folds its negations into the lane moves an
+        // integer one pays for.
+        let low = k.reduce(s, Axis::Row, ReduceOp::Min);
+        let at_low = k.compare(s, low, CmpOp::Eq);
+        let col = k.coord(shape, Axis::Col);
+        let col = k.cast::<I32, F32>(col);
+        let none = inf(k);
+        let cols = k.where_(at_low, col, none);
+        let first = k.reduce(cols, Axis::Row, ReduceOp::Min);
+        let start = k.splat::<F32>(rows, start);
+        let first = k.binary(first, start, BinaryOp::Add);
+        // Strictly lower: an earlier trip's equal score keeps its smaller index.
+        let lower = k.compare(low, best, CmpOp::Lt);
+        [k.where_(lower, low, best), k.where_(lower, first, index)]
+    };
 
     let best0 = k.fill::<F32>(rows, Const::Float(f64::INFINITY));
     let index0 = k.fill::<F32>(rows, Const::Float(-1.0));
-    let [best, index] = k.pipeline(
-        m.div_ceil(bkv),
-        stages,
-        [best0, index0],
-        |k, step, slot| {
-            let c_g = k.at(c_view, step * bkv, 0);
-            let c_t = k.smem_slot::<T>(c_s, slot, Shape::new(bkv, d));
-            k.stage(c_t, c_g, CopyMode::Async);
-        },
-        |k, step, slot, [best, index]| {
-            let start = step * bkv;
-            let c_t = k.smem_slot::<T>(c_s, slot, Shape::new(bkv, d));
-            let zero = k.zeros::<F32>(shape);
-            let dot = k.mma(zero, q_r, false, c_t, true);
-            let mut s = match c_sq {
-                Some(p) => {
-                    let v = col_view(k, p, m, bkv, start.clone());
-                    let c_sq = k.load(v);
-                    let c_sq = half(k, c_sq);
-                    k.binary(c_sq, dot, BinaryOp::Sub)
-                }
-                None => k.unary(dot, UnaryOp::Neg),
-            };
-            if let Some(x_sq) = x_sq {
-                s = k.binary(s, x_sq, BinaryOp::Add);
-            }
-            if let Some(p) = col_floor {
-                let v = col_view(k, p, m, bkv, start.clone());
-                let f = k.load(v);
-                let f = floor(k, f);
-                s = k.binary(s, f, BinaryOp::Max);
-            }
-            if let Some(f) = row_floor {
-                s = k.binary(s, f, BinaryOp::Max);
-            }
-            // A floor clamps the distance already.
-            if metric == Metric::L2 && floors == Floors::default() {
+    let tiles = m.div_ceil(bkv);
+    let [best, index] = match (q_r, c_s) {
+        (Some(q_r), Some(c_s)) => k.pipeline(
+            tiles,
+            stages,
+            [best0, index0],
+            |k, step, slot| {
+                let c_g = k.at(c_view, step * bkv, 0);
+                let c_t = k.smem_slot::<T>(c_s, slot, Shape::new(bkv, d));
+                k.stage(c_t, c_g, CopyMode::Async);
+            },
+            |k, step, slot, [best, index]| {
+                let start = step * bkv;
+                let c_t = k.smem_slot::<T>(c_s, slot, Shape::new(bkv, d));
                 let zero = k.zeros::<F32>(shape);
-                s = k.binary(s, zero, BinaryOp::Max);
-            }
-            if let (Some(row_group), Some((_, col_group))) = (row_group, grouped) {
-                let v = col_view(k, col_group, m, bkv, start.clone());
-                let col_group = k.load(v);
-                // Against a full-shape zero: the predicate takes the tile's shape.
-                let zero = k.zeros::<I32>(shape);
-                let row_group = k.binary(row_group, zero, BinaryOp::Add);
-                let same = k.compare(row_group, col_group, CmpOp::Eq);
-                let skipped = inf(k);
-                s = k.where_(same, skipped, s);
-            }
-            // The last trip's columns past `m` read the clamped last row.
-            if !m.is_multiple_of(bkv) {
-                let partial = Sc::from(m).lt(start.clone() + bkv);
-                [s] = k.select_if(
-                    partial,
-                    |k| {
-                        let col = k.coord(shape, Axis::Col);
-                        let left = k.splat::<I32>(shape, Sc::from(m) - start.clone());
-                        let inside = k.compare(col, left, CmpOp::Lt);
-                        let past = inf(k);
-                        [k.where_(inside, s, past)]
-                    },
-                    |_| [s],
-                );
-            }
-            // The columns in f32 (exact below 2^24, as the carried index):
-            // a float minimum folds its negations into the lane moves an
-            // integer one pays for.
-            let low = k.reduce(s, Axis::Row, ReduceOp::Min);
-            let at_low = k.compare(s, low, CmpOp::Eq);
-            let col = k.coord(shape, Axis::Col);
-            let col = k.cast::<I32, F32>(col);
-            let none = inf(k);
-            let cols = k.where_(at_low, col, none);
-            let first = k.reduce(cols, Axis::Row, ReduceOp::Min);
-            let start = k.splat::<F32>(rows, start);
-            let first = k.binary(first, start, BinaryOp::Add);
-            // Strictly lower: an earlier trip's equal score keeps its smaller index.
-            let lower = k.compare(low, best, CmpOp::Lt);
-            [k.where_(lower, low, best), k.where_(lower, first, index)]
-        },
-    );
+                let dot = k.mma(zero, q_r, false, c_t, true);
+                fold(k, dot, start, best, index)
+            },
+        ),
+        _ => k.loop_(tiles, [best0, index0], |k, step, [best, index]| {
+            let start = step * bkv;
+            let c_g = k.at(c_view, start.clone(), 0);
+            let x_chunk = |k: &mut Kernel, _: Sc, col: Sc| k.at(x_view, 0, col);
+            let chunks = d.div_ceil(depth);
+            let [dot] = mainloop(k, Shape::new(bq, depth), &x_chunk, [c_g], chunks, stages, depth, None, 1);
+            fold(k, dot, start, best, index)
+        }),
+    };
     let best = if halved {
         let two = k.fill::<F32>(rows, Const::Float(2.0));
         k.binary(best, two, BinaryOp::Mul)

@@ -166,6 +166,8 @@ pub fn families(target: &Target) -> Vec<Launch> {
         ("nearest l2 floors", 16, Metric::L2, both, false),
         ("nearest groups", 32, Metric::ShiftedL2, Floors::default(), true),
         ("nearest neg dot col floor", 64, Metric::NegDot, Floors { row: false, col: true }, false),
+        ("nearest streamed neg dot", 800, Metric::NegDot, Floors::default(), false),
+        ("nearest streamed l2 floors groups", 512, Metric::L2, both, true),
     ] {
         let Some(&cfg) = planner.nearest_ranked(1 << 16, 1 << 16, d, metric, floors, groups).first() else { continue };
         let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, cfg };
@@ -482,8 +484,9 @@ pub fn unique(launches: Vec<Launch>) -> Vec<Launch> {
 /// The rankings the planner makes on `target` for the shapes [`digested`]
 /// draws from and a few more: GEMMs plain and gated, attention per head
 /// size, query and key count with and without a causal mask or a bias, the
-/// YOLO convolutions and their splits. A ranking change moves no kernel's
-/// text but what the tuner chooses among.
+/// YOLO convolutions and their splits, nearest self-joins resident and
+/// streamed. A ranking change moves no kernel's text but what the tuner
+/// chooses among.
 pub fn rankings(target: &Target) -> String {
     let planner = planner(target.clone());
     let mut s = String::new();
@@ -506,6 +509,12 @@ pub fn rankings(target: &Target) -> String {
         let ranked = planner.conv_ranked(1, ho * wo, &g);
         s += &format!("conv {g:?}: {:?}\n", &*ranked);
         s += &format!("splits: {:?}\n", planner.conv_splits(1, ho * wo, &g, &ranked[..ranked.len().min(8)]));
+    }
+    for d in [16, 64, 256, 512, 1024] {
+        for metric in [Metric::SquaredL2, Metric::NegDot] {
+            let ranked = planner.nearest_ranked(1 << 16, 1 << 16, d, metric, Floors::default(), false);
+            s += &format!("nearest d{d} {metric:?}: {:?}\n", &*ranked);
+        }
     }
     s
 }

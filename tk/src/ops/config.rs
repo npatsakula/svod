@@ -198,7 +198,8 @@ pub enum Rejected {
     /// Its step is shallower than two matrix-core depths where the
     /// reduction allows one.
     Shallow,
-    /// Its step does not divide the reduction.
+    /// Its step does not divide the reduction (a nearest chunk: is deeper
+    /// than the whole reduction, a product over zeros).
     Divides,
     /// Its shared memory passes the block's.
     Smem { need: usize, have: usize },
@@ -1163,38 +1164,55 @@ impl Attention {
 }
 
 impl NearestCfg {
+    /// The depth a trip's product spans: the whole `d` resident, else a chunk.
+    fn depth(&self, d: usize) -> usize {
+        self.bk.unwrap_or(d)
+    }
+
+    /// The rows of each operand tile a trip fills: the candidates, and
+    /// streamed the query rows too.
+    fn filled(&self) -> impl Iterator<Item = usize> {
+        [Some(self.bkv), self.bk.map(|_| self.bq)].into_iter().flatten()
+    }
+
     /// Whether the config lowers on `target` at depth `d`: the atom's M is
     /// [`WARP_ROWS`], a warp owns whole atom rows of queries and the block
-    /// whole warps, the product tiles the atoms, and the candidate fill
-    /// splits into whole 16-byte chunks per thread.
+    /// whole warps, the product tiles the atoms, and each operand fill
+    /// splits into whole 16-byte chunks per thread; a streamed depth is
+    /// whole 16-byte chunks too, which an overhanging chunk's fill zeroes
+    /// past it.
     pub fn fits(&self, target: &Target, d: usize) -> bool {
         let Some(atom) = target.geometry() else { return false };
-        let (bq, bkv, rows) = (self.bq, self.bkv, self.warp_rows);
+        let (bq, bkv, rows, depth) = (self.bq, self.bkv, self.warp_rows, self.depth(d));
         let threads = self.warps() as usize * target.wave as usize;
+        let fills = self.filled().all(|rows| (rows * depth / 8).is_multiple_of(threads));
         atom.m as usize == WARP_ROWS
             && rows.is_multiple_of(WARP_ROWS)
             && rows > 0
             && bq.is_multiple_of(rows)
             && bq > 0
             && bkv.is_multiple_of(atom.n as usize)
-            && d.is_multiple_of(atom.k as usize)
-            && (bkv * d / 8).is_multiple_of(threads)
+            && depth.is_multiple_of(atom.k as usize)
+            && d.is_multiple_of(if self.bk.is_some() { 8 } else { atom.k as usize })
+            && fills
             && target.fill.stages(self.stages) == self.stages
     }
 
     /// The registers a lane holds at depth `d`, from the layouts the lowering
-    /// assigns: the query fragments, live across the candidate loop; a
-    /// trip's candidate fragments and its f32 scores beside the tile the
-    /// argmin selects the columns in; the staged candidate chunks where the
-    /// fill goes through registers. Addressing and the row vectors are not
-    /// counted.
+    /// assigns: the query fragments, live across the candidate loop (a
+    /// chunk's, streamed); a trip's candidate fragments and its f32 scores
+    /// (streamed, its accumulators) beside the tile the argmin selects the
+    /// columns in; the staged chunks where the fill goes through registers.
+    /// Addressing and the row vectors are not counted.
     pub fn registers(&self, target: &Target, d: usize) -> Option<u32> {
-        let grid = WarpGrid { rows: self.warps(), cols: 1 };
-        let qk = target.issue(Core::Warp, grid, self.bq, self.bkv, d)?;
+        let (warps, depth) = (self.warps(), self.depth(d));
+        let grid = WarpGrid { rows: warps, cols: 1 };
+        let qk = target.issue(Core::Warp, grid, self.bq, self.bkv, depth)?;
         let half = |regs: u32| regs.div_ceil(2);
+        let staged = |rows| chunked(Shape::new(rows, depth), 2, warps, target.wave, Axis::Col).map(|l| l.regs());
         let fill = match target.fill {
             Fill::CpAsync => 0,
-            Fill::Staged => half(chunked(Shape::new(self.bkv, d), 2, self.warps(), target.wave, Axis::Col)?.regs()),
+            Fill::Staged => half(self.filled().map(staged).sum::<Option<u32>>()?),
         };
         Some(half(qk.a.regs()) + half(qk.b.regs()) + 2 * qk.c.regs() + fill)
     }
@@ -1218,6 +1236,9 @@ const CANDIDATE_BLOCKS: [usize; 4] = [16, 32, 64, 128];
 const NEAREST_WARP_ROWS: [usize; 2] = [WARP_ROWS, 2 * WARP_ROWS];
 /// Search bound: a nearest block's warps at most.
 const NEAREST_WARPS: usize = 8;
+/// Search bound: the depth chunks a streamed nearest block's trip spans, the
+/// GEMM's, and none: the rows resident.
+const NEAREST_DEPTHS: [Option<usize>; 4] = [None, Some(DEPTHS[0]), Some(DEPTHS[1]), Some(DEPTHS[2])];
 
 /// A nearest-candidate problem: `n` query rows against `m` candidates at
 /// depth `d`, scored by `metric` above `floors`, under groups or not.
@@ -1241,11 +1262,27 @@ impl Nearest {
     /// small depth outweighs the product. A wave's independent accumulators
     /// are its atom rows times the trip's atom columns. Left out past the
     /// lane's register budget: the queries stay resident.
+    ///
+    /// Streamed, a candidate tile takes `⌈d / bk⌉` trips of the GEMM's K
+    /// pipeline, each reading and filling both operands' chunks: the block's
+    /// own query rows again for every candidate tile (the blocks in flight
+    /// share the candidate chunk only), its pairs' epilogue shared out over
+    /// them, and the ring, which prefetches within a tile only, starting
+    /// empty at every tile: a memory latency a round of blocks waits
+    /// unhidden ([`Costs::latency`]). Its step is at least two matrix-core
+    /// depths where the depth allows one, as the GEMM's.
     pub fn admit(&self, planner: &Planner, cfg: &NearestCfg) -> Result<(f64, u32), Rejected> {
         let Device { target, costs } = &planner.device;
         let (bq, bkv, d) = (cfg.bq, cfg.bkv, self.d);
         if !cfg.fits(target, d) {
             return Err(Rejected::Lowers);
+        }
+        let atom = target.geometry().ok_or(Rejected::Lowers)?;
+        if cfg.bk.is_some_and(|bk| bk < 2 * atom.k as usize && d.is_multiple_of(2 * atom.k as usize)) {
+            return Err(Rejected::Shallow);
+        }
+        if cfg.bk.is_some_and(|bk| bk > d) {
+            return Err(Rejected::Divides);
         }
         let smem = cfg.smem_bytes(d);
         if smem > target.smem_bytes {
@@ -1257,29 +1294,47 @@ impl Nearest {
         if regs > budget {
             return Err(Rejected::Registers { need: regs, have: budget });
         }
-        let atom = target.geometry().ok_or(Rejected::Lowers)?;
         let atoms = (cfg.warp_rows / atom.m as usize) * (bkv / atom.n as usize);
-        let tile = bkv * d * ELEM;
-        let steps = (bq * bkv * d).div_ceil(STEP);
         let Floors { row, col } = self.floors;
         let clamp = self.metric == Metric::L2 && !(row || col);
         let ops = [self.metric.row_norms(), row, col, clamp].into_iter().filter(|&on| on).count();
         let pair = NEAREST_PAIR + ops as f64 * PAIR_OP + if self.groups { GROUPS_PAIR } else { 0.0 };
-        let (blocks, trips, stages) = (self.n.div_ceil(bq), self.m.div_ceil(bkv), cfg.stages);
+        let (blocks, tiles, stages) = (self.n.div_ceil(bq), self.m.div_ceil(bkv), cfg.stages);
+        let depth = cfg.bk.unwrap_or(d);
+        let chunks = d.div_ceil(depth);
+        // The rows a trip fills and every wave reads: the candidates, and
+        // streamed the block's queries (a wave's own rows of them).
+        let (filled, read) = match cfg.bk {
+            None => (bkv, waves * bkv),
+            Some(_) => (bq + bkv, waves * (cfg.warp_rows + bkv)),
+        };
+        let tile = filled * depth * ELEM;
+        let steps = (bq * bkv * depth).div_ceil(STEP);
+        let trips = tiles * chunks;
         let unique = ((self.n + self.m) * d * ELEM) as f64;
         let flight = planner.sms().min(blocks).max(1);
-        let shared = 1.0 - 1.0 / flight as f64;
+        let distinct = flight * (filled - bkv) + bkv;
+        let shared = 1.0 - distinct as f64 / (flight * filled) as f64;
         let fill = tile as f64 * planner.fill_byte(unique, (blocks * trips * tile) as f64, shared);
-        let reads = (waves * tile) as f64 * costs.smem_byte;
-        let work = steps as f64 * costs.step + (bq * bkv) as f64 * pair * costs.score;
+        let reads = (read * depth * ELEM) as f64 * costs.smem_byte;
+        let epilogue = (bq * bkv) as f64 * pair * costs.score / chunks as f64;
+        let work = steps as f64 * costs.step + epilogue;
         let trip = costs.trip(target.fill, stages, cfg.unroll);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
-        Ok((planner.pipelined(run), regs))
+        let restarts = match cfg.bk {
+            None => 0.0,
+            Some(_) => {
+                let rounds = blocks.div_ceil(planner.sms()).div_ceil(planner.resident(smem, regs, waves).max(1));
+                (tiles * rounds) as f64 * costs.latency
+            }
+        };
+        Ok((planner.pipelined(run) + restarts, regs))
     }
 
     /// Every config the ranking spans on `target`: every query block of up
     /// to [`NEAREST_WARPS`] warps owning one or two atom rows each, every
-    /// candidate block, ring depth and unrolling.
+    /// candidate block, the rows resident or streamed at every depth chunk,
+    /// every ring depth and unrolling.
     pub fn lattice(&self, target: &Target) -> Vec<NearestCfg> {
         let stages: &[usize] = if target.fill == Fill::CpAsync { &FA_STAGES } else { &FA_STAGES[1..] };
         let mut out = vec![];
@@ -1289,9 +1344,11 @@ impl Nearest {
                     continue;
                 }
                 for bkv in CANDIDATE_BLOCKS {
-                    for &stages in stages {
-                        for unroll in [false, true] {
-                            out.push(NearestCfg { unroll, warp_rows, ..NearestCfg::new(bq, bkv, stages) });
+                    for bk in NEAREST_DEPTHS {
+                        for &stages in stages {
+                            for unroll in [false, true] {
+                                out.push(NearestCfg { unroll, warp_rows, bk, ..NearestCfg::new(bq, bkv, stages) });
+                            }
                         }
                     }
                 }
@@ -1313,8 +1370,8 @@ impl Nearest {
     }
 }
 
-/// A tile is its query and candidate blocks and its rows per warp; its ring
-/// depth and unrolling are its pipelines.
+/// A tile is its query and candidate blocks, its rows per warp and its depth
+/// chunk; its ring depth and unrolling are its pipelines.
 impl Tiled for NearestCfg {
     fn tile(&self) -> Self {
         NearestCfg { stages: 0, unroll: false, ..*self }

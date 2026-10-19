@@ -369,7 +369,7 @@ fn tile_order(k: &mut Kernel, gm: usize, gn: usize, group_m: usize) -> (Sc, Sc) 
 /// slot held as `slices` k-slices ([`GemmCfg::slices`]), one f32
 /// accumulator per B.
 #[allow(clippy::too_many_arguments)]
-fn mainloop<T: Elem, const N: usize>(
+pub(super) fn mainloop<T: Elem, const N: usize>(
     k: &mut Kernel,
     sa: Shape,
     a: &impl Fn(&mut Kernel, Sc, Sc) -> Gmem<T>,

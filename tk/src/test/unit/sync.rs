@@ -454,3 +454,28 @@ fn a_block_barrier_under_a_branch_on_the_warp_is_refused(
     let Stmt::If { then, .. } = stmt else { panic!("a branch") };
     Ok(kinds(&prog, then))
 }
+
+/// A streamed nearest runs the depth pipeline once per candidate tile: the
+/// pass fences the ring where the next tile's first fill meets the last
+/// tile's reads of it, one barrier at the head of the pipeline in the loop,
+/// and adds nothing else.
+#[test]
+fn a_ring_restarted_in_a_loop_is_fenced_at_its_head() {
+    use crate::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec, nearest};
+    let cfg = NearestCfg::streamed(32, 32, 32, 3);
+    let spec = NearestSpec { n: 100, m: 150, d: 80, metric: Metric::L2, floors: Floors::default(), groups: true, cfg };
+    let prog = nearest::<BF16>(&spec);
+    let mut fenced = prog.clone();
+    insert_barriers(&mut fenced).unwrap();
+    let body = |prog: &Program| {
+        let Some(Stmt::Loop(l)) = prog.body.0.iter().find(|s| matches!(s, Stmt::Loop(_))) else { panic!("a loop") };
+        l.body.clone()
+    };
+    let (before, after) = (body(&prog), body(&fenced));
+    let at = before.0.iter().position(|s| matches!(s, Stmt::Pipeline(_))).expect("a pipeline");
+    assert_eq!(kinds(&fenced, &after)[at..at + 2], ["barrier", "pipeline"]);
+    let mut unfenced = after.0.clone();
+    unfenced.remove(at);
+    assert!(unfenced == before.0);
+    assert!(top(&fenced) == top(&prog));
+}
