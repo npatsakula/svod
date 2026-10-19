@@ -14,7 +14,7 @@ pub mod shape;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use snafu::{ResultExt, Snafu};
+use snafu::Snafu;
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DType, DeviceSpec};
 use svod_ir::SInt;
@@ -84,13 +84,14 @@ fn batch_of(var: &Option<BatchVar>, static_batches: usize) -> Batch {
     }
 }
 
-/// A kernel output allocated at capacity, as consumers see it: the live batch.
-fn live(op: &'static str, y: Tensor, var: &Option<BatchVar>) -> Result<Tensor> {
-    let Some(var) = var else { return Ok(y) };
-    let rank = y.shape().context(GraphSnafu { op })?.len();
-    let mut ranges: Vec<Option<(SInt, SInt)>> = vec![None; rank];
-    ranges[0] = Some((SInt::Const(0), var.dim.clone()));
-    y.try_shrink(ranges).context(GraphSnafu { op })
+/// A kernel output: allocated at capacity, shaped with the live batch in dim 0
+/// so a consumer kernel binds the realized buffer itself rather than a copy.
+fn output(dims: &[usize], var: &Option<BatchVar>, dtype: DType) -> Tensor {
+    let mut shape: Vec<SInt> = dims.iter().map(|&d| SInt::Const(d)).collect();
+    if let Some(var) = var {
+        shape[0] = var.dim.clone();
+    }
+    Tensor::empty_dynamic(&shape, dtype)
 }
 
 /// `f::<T>(spec)` for the 16-bit element type `dtype`.
