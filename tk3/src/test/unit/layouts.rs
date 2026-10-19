@@ -9,7 +9,9 @@ use crate::atoms::{Core, Costs, Device, Target, sm86};
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{self as frag, Dim};
-use crate::layouts::{Issue, Laid, Pick, Relayout, TileLayout, WarpGrid, chunked, infer, natural, transposing};
+use crate::layouts::{
+    Issue, Laid, Pick, Relayout, Swizzle, TileLayout, WarpGrid, chunked, infer, natural, transposing,
+};
 
 fn coords(l: &TileLayout, warps: u32, lanes: u32) -> Vec<(u32, u32)> {
     (0..warps)
@@ -453,4 +455,20 @@ fn warpgroups_are_consecutive_warps_down_the_rows() {
     assert!(atom.issue(WarpGrid { rows: 2, cols: 1 }, 32, 64, 16).is_err(), "half a warpgroup");
     assert!(atom.issue(WarpGrid { rows: 4, cols: 1 }, 128, 64, 16).is_err(), "two row blocks a group");
     assert!(atom.issue(WarpGrid { rows: 4, cols: 1 }, 64, 64, 24).is_err(), "a k off the step");
+}
+
+/// A shared row's swizzle by its 16-byte chunks: a power-of-two count, two
+/// at least, XOR-ed against as many row bits up to three; a warpgroup
+/// descriptor reads a row that is one whole span.
+#[test_case(8, 2, Swizzle::None, false; "one chunk")]
+#[test_case(12, 2, Swizzle::None, false; "a split chunk")]
+#[test_case(48, 2, Swizzle::None, false; "six chunks")]
+#[test_case(16, 2, Swizzle::B32, true; "32-byte rows")]
+#[test_case(8, 4, Swizzle::B32, true; "32-byte f32 rows")]
+#[test_case(32, 2, Swizzle::B64, true; "64-byte rows")]
+#[test_case(64, 2, Swizzle::B128, true; "128-byte rows")]
+#[test_case(128, 2, Swizzle::B128, false; "a 256-byte row in 128-byte spans")]
+fn a_shared_row_swizzles_by_its_chunks(cols: usize, bytes: usize, want: Swizzle, spans: bool) {
+    assert_eq!(Swizzle::of_row(cols, bytes), want);
+    assert_eq!(Swizzle::spans(cols, bytes), spans);
 }

@@ -453,6 +453,60 @@ impl GroupMmaAtom {
     }
 }
 
+/// The XOR swizzle of a row-major shared row: its 16-byte chunks exchanged
+/// against bits of the row index, so the rows a fragment read meets fall in
+/// distinct banks (CuTe's `Swizzle<B, 4, 3>` in the modes a warpgroup
+/// descriptor names). Decided here alone: the emitter's shared addresses,
+/// the descriptors and the planner's admissible warpgroup rows read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Swizzle {
+    /// A row other than a power-of-two count of chunks, two at least: an
+    /// XOR would leave the row.
+    None,
+    /// 32-byte rows: chunk `^= (row >> 2) & 1`.
+    B32,
+    /// 64-byte rows: chunk `^= (row >> 1) & 3`.
+    B64,
+    /// 128-byte spans: chunk `^= row & 7`, on every span of a longer row.
+    B128,
+}
+
+impl Swizzle {
+    /// The swizzle of a row of `cols` elements of `bytes` each.
+    pub fn of_row(cols: usize, bytes: usize) -> Self {
+        let chunk = 16 / bytes;
+        match cols / chunk {
+            chunks if !cols.is_multiple_of(chunk) || !chunks.is_power_of_two() => Swizzle::None,
+            0 | 1 => Swizzle::None,
+            2 => Swizzle::B32,
+            4 => Swizzle::B64,
+            _ => Swizzle::B128,
+        }
+    }
+
+    /// The bits of a row's chunk index the XOR flips.
+    pub fn bits(self) -> u32 {
+        match self {
+            Swizzle::None => 0,
+            Swizzle::B32 => 1,
+            Swizzle::B64 => 2,
+            Swizzle::B128 => 3,
+        }
+    }
+
+    /// The bytes one swizzle pattern spans: 32, 64 or 128 (16 unswizzled).
+    pub fn span(self) -> usize {
+        16 << self.bits()
+    }
+
+    /// Whether a row of `cols` elements of `bytes` each is one whole
+    /// swizzle span, as a warpgroup descriptor reads a row.
+    pub fn spans(cols: usize, bytes: usize) -> bool {
+        let swizzle = Self::of_row(cols, bytes);
+        swizzle != Swizzle::None && swizzle.span() == cols * bytes
+    }
+}
+
 /// A layout for a tile nothing constrains: each lane holds a short row
 /// vector, lanes walk the columns then the rows, warps split the rows. The
 /// vector is as wide as a wave can spread over one row, up to 8 elements,

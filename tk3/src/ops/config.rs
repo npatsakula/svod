@@ -29,7 +29,7 @@ use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
 use crate::kernels::rows::NormCfg;
-use crate::layouts::{Issue, WarpGrid, chunked};
+use crate::layouts::{Issue, Swizzle, WarpGrid, chunked};
 use crate::tune::Compiled;
 
 /// Targets with kernels: `mma.sync` + `cp.async` + `ldmatrix` (sm_80+, measured
@@ -59,7 +59,7 @@ impl GemmCfg {
     /// (32, 64 or 128 bytes), the descriptor's own.
     fn tiles(&self, target: &Target) -> bool {
         let bk = self.tile[2];
-        let row = self.core == Core::Warp || matches!(bk * 2, 32 | 64 | 128);
+        let row = self.core == Core::Warp || Swizzle::spans(bk, 2);
         // Two crews: the two warp rows of the warp-level core, one slot, and
         // k-slices of a product each with another to overlap, on a target
         // that interleaves crews.
@@ -839,7 +839,7 @@ impl FaCfg {
                     && groups.is_power_of_two()
                     && g.n_for(bkv as u32).is_some()
                     && g.n_for(d as u32).is_some()
-                    && (matches!(d * 2, 32 | 64 | 128) || (d * 2).is_multiple_of(128))
+                    && (Swizzle::spans(d, 2) || (d * 2).is_multiple_of(Swizzle::B128.span()))
             }),
         };
         core && atom.m as usize == WARP_ROWS

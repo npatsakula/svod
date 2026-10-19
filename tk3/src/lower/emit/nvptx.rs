@@ -12,7 +12,7 @@ use svod_ir::{UOp, WmmaMetadata};
 
 use crate::layout::Dim::Lane;
 use crate::layout::Layout;
-use crate::layouts::TileLayout;
+use crate::layouts::{Swizzle, TileLayout};
 use crate::lower::{Result, UnsupportedSnafu};
 use snafu::OptionExt;
 
@@ -133,7 +133,13 @@ impl Emit<'_> {
             );
             let (rows, e) = (view.shape.rows, view.dtype.bytes());
             let pc = this.panel_cols(view.shape.cols, e).unwrap_or(view.shape.cols);
-            let swizzle = wgmma::Swizzle::for_row_bytes(pc * e)
+            let swizzle = Swizzle::spans(pc, e)
+                .then(|| match Swizzle::of_row(pc, e) {
+                    Swizzle::B32 => wgmma::Swizzle::B32,
+                    Swizzle::B64 => wgmma::Swizzle::B64,
+                    Swizzle::B128 => wgmma::Swizzle::B128,
+                    Swizzle::None => wgmma::Swizzle::None,
+                })
                 .context(UnsupportedSnafu { what: format!("a warpgroup operand over {}-byte shared rows", pc * e) })?;
             snafu::ensure!(
                 k_major || n_atom.is_multiple_of(pc),

@@ -3,13 +3,12 @@
 
 use std::sync::Arc;
 
-use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::{Op, UOp, ops};
 
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
 use crate::layout::Layout;
-use crate::layouts::TileLayout;
+use crate::layouts::{Swizzle, TileLayout};
 
 use super::*;
 
@@ -132,16 +131,11 @@ impl Emit<'_> {
                     None => (None, cols),
                 };
                 let chunk = 16 / bytes as i64;
-                let cpr = cols / chunk;
-                // The XOR must stay within the row: a power-of-two chunk count.
-                let col = if self.low.swizzle && cols % chunk == 0 && cpr >= 2 && (cpr as u64).is_power_of_two() {
-                    let bits = chunk.trailing_zeros();
-                    let (c, within) = (shr(&col, bits), and(&col, &c32(chunk - 1)));
-                    let sw = if cpr >= 8 {
-                        and(&row, &c32(7))
-                    } else {
-                        and(&shr(&row, (8 / cpr).trailing_zeros()), &c32(cpr - 1))
-                    };
+                let swizzle = if self.low.swizzle { Swizzle::of_row(cols as usize, bytes) } else { Swizzle::None };
+                let col = if swizzle != Swizzle::None {
+                    let (c, within) = (shr(&col, chunk.trailing_zeros()), and(&col, &c32(chunk - 1)));
+                    let (shift, mask) = (3 - swizzle.bits(), c32((1 << swizzle.bits()) - 1));
+                    let sw = if shift == 0 { and(&row, &mask) } else { and(&shr(&row, shift), &mask) };
                     add(&mul(&xor(&c, &sw), &c32(chunk)), &within)
                 } else {
                     col
@@ -241,9 +235,9 @@ impl Emit<'_> {
     /// a row-major region of its own, so a descriptor's canonical layout
     /// reaches every row; `None` keeps the row whole.
     pub(super) fn panel_cols(&self, cols: usize, bytes: usize) -> Option<usize> {
-        let row = cols * bytes;
-        (self.low.core == Core::Group && self.low.swizzle && row > wgmma::SPAN && row.is_multiple_of(wgmma::SPAN))
-            .then_some(wgmma::SPAN / bytes)
+        let (row, span) = (cols * bytes, Swizzle::B128.span());
+        (self.low.core == Core::Group && self.low.swizzle && row > span && row.is_multiple_of(span))
+            .then_some(span / bytes)
     }
 
     /// The register runs of `l` a view is accessed by: 16-byte vectors along
