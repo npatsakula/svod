@@ -11,4 +11,4 @@
 
 pub mod compile;
 
-pub use compile::{compile_ir_to_amd_object, has_amdgpu_target};
+pub use compile::{compile_ir_to_amd_asm, compile_ir_to_amd_object, has_amdgpu_target};

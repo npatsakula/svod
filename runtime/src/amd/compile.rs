@@ -22,6 +22,19 @@ pub fn compile_ir_to_amd_object(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8
     compile_ir_to_amd_object_with(&amd_toolchain(None)?, ir, arch)
 }
 
+/// The AMDGCN assembly [`compile_ir_to_amd_object`] assembles: the same
+/// flags, `-S` for `-c`, for reading what the code object holds (its
+/// comments carry the registers, LDS, scratch and occupancy).
+///
+/// # Errors
+///
+/// As [`compile_ir_to_amd_object`].
+pub fn compile_ir_to_amd_asm(ir: &str, arch: AmdArch) -> crate::Result<Vec<u8>> {
+    let flags = amd_object_flags(ir, arch).into_iter().map(|f| if f == "-c" { "-S".into() } else { f });
+    let toolchain = amd_toolchain(None)?;
+    toolchain.compile_ir(&flags.collect::<Vec<_>>(), ir, &format!("amdgcn assembly (mcpu={})", arch.mcpu()))
+}
+
 /// The oldest clang whose AMDGPU code is verified. 20.1.2 compiles some kernels
 /// that spill to wrong values or NaN, with the loop hint in place too.
 pub(crate) const MIN_AMD_CLANG_MAJOR: u32 = 22;
