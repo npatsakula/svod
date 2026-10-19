@@ -10,7 +10,7 @@ use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::kernels::Batch;
-use crate::kernels::attention::{AttnSpec, FaCfg, attention};
+use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention, key_mask_stride};
 use crate::launch::graph_launch;
 
 fn flash_attention(spec: &AttnSpec) -> Program {
@@ -22,12 +22,19 @@ fn lcg(seed: &mut u64) -> f64 {
     ((*seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
 }
 
+/// Segment length of the packed rows the `seg_start` cases mask.
+const SEGMENT: usize = 40;
+
 struct Case {
     spec: AttnSpec,
     q: Vec<f64>,
     k: Vec<f64>,
     v: Vec<f64>,
     lens: Vec<i64>,
+    /// `[batch, key_mask_stride(tk)]`: key `j` of batch `b` hidden where `(b + j) % 5 == 2`.
+    key_mask: Vec<i64>,
+    /// `[batch, t]`: segments of `SEGMENT` rows.
+    seg_start: Vec<i64>,
 }
 
 fn case(spec: AttnSpec, lens: &[i64]) -> Case {
@@ -41,22 +48,33 @@ fn case(spec: AttnSpec, lens: &[i64]) -> Case {
         n(batch * spec.tk * spec.kv_heads * spec.d, &mut seed),
         n(batch * spec.tk * spec.kv_heads * spec.d, &mut seed),
     );
-    Case { spec, q, k, v, lens: lens.to_vec() }
+    let stride = key_mask_stride(spec.tk);
+    let key_mask = (0..batch * stride).map(|x| i64::from((x / stride + x % stride) % 5 != 2)).collect();
+    let seg_start = (0..batch * spec.t).map(|x| (x % spec.t - x % spec.t % SEGMENT) as i64).collect();
+    Case { spec, q, k, v, lens: lens.to_vec(), key_mask, seg_start }
 }
 
 /// Direct attention in f64 with the same masks.
 fn reference(c: &Case) -> Vec<f64> {
     let s = &c.spec;
+    let m = s.mask;
     let (stride, kv_stride, group) = (s.heads * s.d, s.kv_heads * s.d, s.heads / s.kv_heads);
     let mut out = vec![0.0; s.batch.capacity() * s.t * stride];
     for b in 0..s.batch.capacity() {
-        let len = if s.key_lens { c.lens[b].max(1) as usize } else { s.tk };
+        let len = if m.key_lens { c.lens[b].max(1) as usize } else { s.tk };
         for h in 0..s.heads {
             for i in 0..s.t {
                 let qi = &c.q[(b * s.t + i) * stride + h * s.d..][..s.d];
+                let hidden = |j: usize| {
+                    j >= len
+                        || (m.causal && j > i)
+                        || m.window.is_some_and(|(l, r)| j + l < i || j > i + r)
+                        || (m.key_mask && c.key_mask[b * key_mask_stride(s.tk) + j] == 0)
+                        || (m.seg_start && (j as i64) < c.seg_start[b * s.t + i])
+                };
                 let scores: Vec<f64> = (0..s.tk)
                     .map(|j| {
-                        if j >= len || (s.causal && j > i) {
+                        if hidden(j) {
                             return f64::NEG_INFINITY;
                         }
                         let kj = &c.k[(b * s.tk + j) * kv_stride + h / group * s.d..][..s.d];
@@ -77,16 +95,29 @@ fn reference(c: &Case) -> Vec<f64> {
     out
 }
 
+/// The mask parameters in order, as i64 vectors.
+fn mask_params(c: &Case) -> Vec<Vec<i64>> {
+    let m = c.spec.mask;
+    [(m.key_lens, &c.lens), (m.key_mask, &c.key_mask), (m.seg_start, &c.seg_start)]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, v)| v.clone())
+        .collect()
+}
+
 fn params(c: &Case) -> Vec<Vec<f64>> {
     let s = &c.spec;
     let mut p = vec![c.q.clone(), c.k.clone(), c.v.clone(), vec![0.0; s.batch.capacity() * s.t * s.heads * s.d]];
-    if s.key_lens {
-        p.push(c.lens.iter().map(|&l| l as f64).collect());
-    }
+    p.extend(mask_params(c).iter().map(|v| v.iter().map(|&x| x as f64).collect()));
     p
 }
 
 fn spec(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, causal: bool, key_lens: bool) -> AttnSpec {
+    let mask = AttnMask { causal, key_lens, ..AttnMask::default() };
+    masked(t, tk, d, bq, bkv, mask)
+}
+
+fn masked(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, mask: AttnMask) -> AttnSpec {
     AttnSpec {
         batch: Batch::Var { name: "b".into(), min: 1, max: 2 },
         t,
@@ -94,12 +125,18 @@ fn spec(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, causal: bool, key_
         heads: 2,
         kv_heads: 2,
         d,
-        causal,
-        key_lens,
+        mask,
         scale: 1.0 / (d as f32).sqrt(),
         cfg: FaCfg { bq, bkv, stages: 2 },
     }
 }
+
+const WINDOW: AttnMask =
+    AttnMask { window: Some((20, 5)), key_lens: true, causal: false, key_mask: false, seg_start: false };
+const KEY_MASK: AttnMask = AttnMask { key_mask: true, causal: false, window: None, key_lens: false, seg_start: false };
+const SEGMENTS: AttnMask = AttnMask { causal: true, seg_start: true, window: None, key_lens: false, key_mask: false };
+const EVERY: AttnMask =
+    AttnMask { causal: true, window: Some((50, 0)), key_lens: true, key_mask: true, seg_start: true };
 
 fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
     AttnSpec { cfg, ..spec }
@@ -110,6 +147,11 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(spec(128, 128, 64, 64, 64, true, false), &[128, 128]; "causal")]
 #[test_case(spec(128, 128, 64, 64, 64, false, true), &[100, 7]; "key lengths")]
 #[test_case(spec(128, 128, 64, 64, 32, true, true), &[128, 50]; "causal with lengths, narrow kv")]
+#[test_case(masked(128, 128, 64, 64, 32, WINDOW), &[128, 90]; "window with lengths")]
+#[test_case(masked(128, 128, 64, 64, 64, KEY_MASK), &[128, 128]; "key mask")]
+#[test_case(masked(128, 128, 64, 64, 32, SEGMENTS), &[128, 128]; "causal segments")]
+#[test_case(masked(128, 128, 64, 64, 32, EVERY), &[128, 100]; "every mask")]
+#[test_case(masked(96, 96, 48, 64, 64, SEGMENTS), &[96, 96]; "d 48")]
 fn program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     let c = case(spec.clone(), lens);
     let got = run(&flash_attention(&spec), params(&c), &[("b", 2)]).unwrap();
@@ -139,6 +181,11 @@ fn only_the_live_batch_runs() {
 #[test_case(spec(128, 128, 128, 64, 32, true, true), &[128, 64]; "d 128, causal with lengths")]
 #[test_case(with(FaCfg { bq: 128, bkv: 64, stages: 3 }, spec(256, 192, 64, 0, 0, true, true)), &[192, 70]; "bq 128, three stages")]
 #[test_case(with(FaCfg { bq: 128, bkv: 32, stages: 2 }, spec(200, 130, 128, 0, 0, false, true)), &[130, 99]; "d 128, bq 128, ragged")]
+#[test_case(masked(128, 128, 64, 64, 32, WINDOW), &[128, 90]; "window with lengths")]
+#[test_case(masked(100, 100, 64, 64, 64, KEY_MASK), &[100, 100]; "key mask, ragged")]
+#[test_case(masked(128, 128, 64, 64, 32, SEGMENTS), &[128, 128]; "causal segments")]
+#[test_case(masked(128, 128, 128, 64, 32, EVERY), &[128, 100]; "every mask, d 128")]
+#[test_case(with(FaCfg { bq: 64, bkv: 64, stages: 3 }, masked(200, 200, 48, 0, 0, SEGMENTS)), &[200, 200]; "d 48, three stages")]
 fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
     let device = default_device();
     let Some(target) = matches!(device, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&device)).flatten() else {
@@ -152,11 +199,10 @@ fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
     let to_bf16 = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
     let (q, k, v) = (to_bf16(&c.q), to_bf16(&c.k), to_bf16(&c.v));
     let o = Tensor::empty(&[batch * spec.t * spec.heads * spec.d], DType::BFloat16);
-    let lens_t = Tensor::from_slice(c.lens.iter().map(|&l| l as i32).collect::<Vec<_>>());
+    let masks: Vec<Tensor> =
+        mask_params(&c).iter().map(|v| Tensor::from_slice(v.iter().map(|&x| x as i32).collect::<Vec<_>>())).collect();
     let mut tensors = vec![&q, &k, &v, &o];
-    if spec.key_lens {
-        tensors.push(&lens_t);
-    }
+    tensors.extend(&masks);
     let out = graph_launch(flash_attention(&spec), &lowering, &tensors).unwrap();
     let mut plan = out.prepare().unwrap();
     plan.execute_with_vars(&[("b", batch as i64)]).unwrap();
@@ -205,8 +251,7 @@ fn attention_throughput_probe() {
             heads,
             kv_heads: heads,
             d,
-            causal,
-            key_lens: false,
+            mask: AttnMask { causal, ..AttnMask::default() },
             scale: 1.0 / (d as f32).sqrt(),
             cfg: FaCfg { bq, bkv, stages: 2 },
         };

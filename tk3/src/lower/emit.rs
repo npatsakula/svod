@@ -382,7 +382,8 @@ impl<'a> Emit<'a> {
                 let cols = view.shape.cols as i64;
                 let chunk = 16 / view.dtype.bytes() as i64;
                 let cpr = cols / chunk;
-                let col = if self.low.swizzle && cols % chunk == 0 && cpr >= 2 {
+                // The XOR must stay within the row: a power-of-two chunk count.
+                let col = if self.low.swizzle && cols % chunk == 0 && cpr >= 2 && (cpr as u64).is_power_of_two() {
                     let bits = chunk.trailing_zeros();
                     let (c, within) = (shr(col, bits), and(col, &c32(chunk - 1)));
                     let sw = if cpr >= 8 {

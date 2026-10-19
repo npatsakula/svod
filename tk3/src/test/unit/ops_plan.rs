@@ -158,7 +158,8 @@ fn f16_takes_the_kernels() {
 
 #[test_case(64, Ok(FaCfg { bq: 64, bkv: 64, stages: 2 }); "d 64")]
 #[test_case(128, Ok(FaCfg { bq: 64, bkv: 32, stages: 2 }); "d 128 keeps the half-width key block")]
-#[test_case(48, Err(Fallback::Shape); "d 48")]
+#[test_case(48, Ok(FaCfg { bq: 64, bkv: 64, stages: 2 }); "d 48")]
+#[test_case(32, Err(Fallback::Shape); "d 32")]
 #[test_case(256, Err(Fallback::Shape); "d 256")]
 fn attention_plans(d: usize, want: Result<FaCfg, Fallback>) {
     let (q, kv) = (ext(&[2, 100, 8, d]), ext(&[2, 37, 2, d]));
@@ -260,6 +261,12 @@ fn semantic_mismatches_are_errors() {
     let lens = t(&[2, 1], DType::Int32);
     let opts = Attn { keys: KeyMask::Lens(&lens), ..Attn::default() };
     assert!(matches!(err(tk::attention(&q, &kv2, &kv2, opts)), Error::Shape { operand: "key lens", .. }));
+    let mask = t(&[2, 10], DType::Bool);
+    let opts = Attn { keys: KeyMask::Bool(&mask), ..Attn::default() };
+    assert!(matches!(err(tk::attention(&q, &kv2, &kv2, opts)), Error::Shape { operand: "key mask", .. }));
+    let seg = t(&[2, 12], DType::Int32);
+    let opts = Attn { seg_start: Some(&seg), ..Attn::default() };
+    assert!(matches!(err(tk::attention(&q, &kv2, &kv2, opts)), Error::Shape { operand: "seg start", .. }));
 
     let w = t(&[32], BF16);
     assert!(matches!(err(tk::layer_norm(&x, &w, None, 1e-5)), Error::Shape { operand: "w", .. }));
