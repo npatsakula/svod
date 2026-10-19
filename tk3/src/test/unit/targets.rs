@@ -27,6 +27,7 @@ use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::launch::graph_launch_all;
+use crate::lower::sync::insert_barriers;
 use crate::lower::{Lowering, lower};
 use crate::ops::config;
 use crate::schedule::{Prefetch, Schedule};
@@ -410,6 +411,8 @@ const fn facts(values: Axis, raw_exp2: bool, dpp: Option<bool>, free_scores: Opt
 /// - the interpreter gives the same result before and after the lowering
 ///   (schedule expansion, operand loads, barriers, relayouts): the
 ///   bookkeeping the target's template adds keeps the numerics;
+/// - the barrier pass is idempotent: run again on what it fenced, it adds
+///   nothing;
 /// - every access the lowering lists reads an allocation or a view of its
 ///   whole, never a crop at an offset (once a program's placeholders are
 ///   bound, an access of a crop is folded into the buffer at the summed
@@ -466,6 +469,13 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             let same = g.iter().zip(w).all(|(a, b)| a == b || (a.is_nan() && b.is_nan()));
             check(same, &format!("parameter {i} differs after lowering"));
         }
+
+        let mut once = prog.clone();
+        crate::lower::materialize_operands(&mut once, lowering.group);
+        insert_barriers(&mut once).unwrap();
+        let mut twice = once.clone();
+        insert_barriers(&mut twice).unwrap();
+        check(twice == once, "the barrier pass fences what it fenced again");
 
         let Op::Program(ops::Program { linear: Some(linear), .. }) = low.program.op() else { panic!("a program") };
         let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
