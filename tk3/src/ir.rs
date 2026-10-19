@@ -497,6 +497,16 @@ impl Program {
     pub fn param(&self, id: ParamId) -> &Param {
         &self.params[id.index()]
     }
+    /// Whether scalar `id` reads [`Special::Warp`]: the warps of a block may
+    /// see it differ.
+    pub fn varies_by_warp(&self, id: ScalarId) -> bool {
+        match self.scalar(id) {
+            Scalar::Special(Special::Warp) => true,
+            Scalar::Bin(_, a, b) => self.varies_by_warp(*a) || self.varies_by_warp(*b),
+            Scalar::Load { index, .. } => self.varies_by_warp(*index),
+            _ => false,
+        }
+    }
     /// Every statement, outermost first, with its nesting depth.
     pub fn walk(&self) -> impl Iterator<Item = (usize, &Stmt)> {
         let mut out = Vec::new();

@@ -61,7 +61,7 @@ fn warps_fence_their_own_effects_and_the_block_fences_theirs() {
     let o = out_view(&mut k, out, 256);
     k.store(o, merged);
     let mut prog = k.finish();
-    insert_barriers(&mut prog);
+    insert_barriers(&mut prog).unwrap();
     assert_eq!(
         top(&prog),
         ["other", "barrier", "load", "out"],
@@ -98,7 +98,7 @@ fn a_key_warps_state_over_its_ring_is_fenced_by_the_warp_then_the_block() {
         cfg,
     };
     let mut prog = attention::<BF16>(&spec);
-    insert_barriers(&mut prog);
+    insert_barriers(&mut prog).unwrap();
     assert!(
         prog.smem.iter().all(|a| a.dtype == svod_dtype::ScalarDType::BFloat16),
         "no merge allocation: {:?}",
@@ -146,7 +146,7 @@ fn a_warps_async_copy_is_landed_before_the_block_reads_it() {
     let o = out_view(&mut k, out, 0);
     k.store(o, merged);
     let mut prog = k.finish();
-    insert_barriers(&mut prog);
+    insert_barriers(&mut prog).unwrap();
     assert_eq!(top(&prog), ["other", "commit", "wait", "barrier", "load", "out"]);
 }
 
@@ -168,7 +168,7 @@ fn a_store_before_a_loop_is_fenced_past_it() {
     let mut prog = k.finish();
     let Some(Stmt::Loop(l)) = prog.body.0.iter_mut().find(|s| matches!(s, Stmt::Loop(_))) else { panic!("a loop") };
     l.body.0.push(Stmt::Sync(Sync::Barrier { scope: Scope::Block }));
-    insert_barriers(&mut prog);
+    insert_barriers(&mut prog).unwrap();
     let k = top(&prog);
     let at = k.iter().position(|k| *k == "loop").unwrap();
     assert_eq!(k[at + 1..at + 3], ["barrier", "load"], "{k:?}");
@@ -189,7 +189,7 @@ fn an_async_copy_is_waited_for_before_a_read() {
     let o = out_view(&mut k, out, 0);
     k.store(o, y);
     let mut prog = k.finish();
-    insert_barriers(&mut prog);
+    insert_barriers(&mut prog).unwrap();
     assert_eq!(top(&prog), ["async", "commit", "wait", "barrier", "load", "out"]);
 }
 
@@ -250,7 +250,7 @@ fn a_pending_async_copy_survives_a_barrier(between: Between) {
         }
         Between::Fence => {}
     }
-    insert_barriers(&mut prog);
+    insert_barriers(&mut prog).unwrap();
     let k = top(&prog);
     let reads: Vec<usize> = (0..k.len()).filter(|&i| k[i] == "load").collect();
     let [.., first, second] = reads[..] else { panic!("two reads of a: {k:?}") };
@@ -308,7 +308,7 @@ fn a_ring_read_before_its_pipeline_is_fenced_at_entry() {
         },
         |_, _| {},
     );
-    insert_barriers(&mut prog);
+    insert_barriers(&mut prog).unwrap();
     let k = top(&prog);
     let at = k.iter().position(|s| *s == "pipeline").unwrap();
     assert_eq!(k[..at], ["other", "store", "barrier", "load", "other", "barrier"]);
@@ -324,7 +324,7 @@ fn a_ring_written_after_its_pipeline_is_fenced() {
             zero_slot(k, ring);
         },
     );
-    insert_barriers(&mut prog);
+    insert_barriers(&mut prog).unwrap();
     let k = top(&prog);
     let at = k.iter().position(|s| *s == "pipeline").unwrap();
     assert_eq!(k[at + 1..at + 4], ["other", "barrier", "store"], "{k:?}");
@@ -344,7 +344,7 @@ fn an_async_copy_is_landed_before_a_pipeline() {
         },
         |_, _| {},
     );
-    insert_barriers(&mut prog);
+    insert_barriers(&mut prog).unwrap();
     let k = top(&prog);
     let at = k.iter().position(|s| *s == "pipeline").unwrap();
     assert_eq!(k[at - 3..at], ["commit", "wait", "barrier"], "{k:?}");
@@ -381,7 +381,7 @@ fn a_consume_body_fences_its_own_tiles() {
     let o = out_view(&mut k, out, 0);
     k.store(o, last);
     let mut prog = k.finish();
-    insert_barriers(&mut prog);
+    insert_barriers(&mut prog).unwrap();
     let Some(Stmt::Pipeline(p)) = prog.body.0.iter().find(|s| matches!(s, Stmt::Pipeline(_))) else {
         panic!("a pipeline")
     };
@@ -404,6 +404,44 @@ fn a_consume_body_fences_its_own_tiles() {
 }); "attention with every mask, a cache and splits")]
 fn shipped_kernels_need_no_barriers(prog: Program) {
     let mut fenced = prog.clone();
-    insert_barriers(&mut fenced);
+    insert_barriers(&mut fenced).unwrap();
     assert!(fenced == prog);
+}
+
+/// A tile stored and read back under a branch needs a block barrier between
+/// the two: under a branch on the block every warp meets it, under one on
+/// the warp some skip it and the rest would wait forever, so the lowering
+/// refuses it; inside the warps' own statement the barrier is the warp's.
+#[test_case(false, false => Ok(vec!["other", "store", "barrier", "load", "out"]); "a branch on the block")]
+#[test_case(true, false => Err("a shared tile's fence is a block barrier under a branch on the warp, which some warps skip".into()); "a branch on the warp")]
+#[test_case(true, true => Ok(vec!["other", "store", "barrier", "load", "out"]); "a branch on the warp inside the warps")]
+fn a_block_barrier_under_a_branch_on_the_warp_is_refused(
+    on_warp: bool,
+    own: bool,
+) -> Result<Vec<&'static str>, String> {
+    let mut k = Kernel::new("divergent");
+    let s = k.smem::<F32>("s", 256);
+    let out = k.param::<F32>("o", ParamKind::Out, 256);
+    let pred = if on_warp { k.warp().lt(2) } else { k.block(0).lt(2) };
+    let body = |k: &mut Kernel| {
+        let tile = k.smem_view::<F32>(s, 0, Shape::new(16, 16));
+        let x = k.zeros::<F32>(Shape::new(16, 16));
+        k.store(tile, x);
+        let y = k.load(tile);
+        let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
+        k.store(o, y);
+    };
+    if own {
+        k.each_warp(|k| k.if_(pred, body, |_| {}));
+    } else {
+        k.if_(pred, body, |_| {});
+    }
+    let mut prog = k.finish();
+    insert_barriers(&mut prog).map_err(|e| e.to_string())?;
+    let mut stmt = &prog.body.0[0];
+    if let Stmt::Warps { body } = stmt {
+        stmt = &body.0[0];
+    }
+    let Stmt::If { then, .. } = stmt else { panic!("a branch") };
+    Ok(kinds(&prog, then))
 }

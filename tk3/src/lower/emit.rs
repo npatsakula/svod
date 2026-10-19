@@ -16,7 +16,7 @@ use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, GpuArch, ScalarDType};
 use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp, WmmaMetadata, ops};
 
-use super::{Lowering, ProgramSnafu, Result, UnsupportedSnafu};
+use super::{DivergentBarrierSnafu, Lowering, ProgramSnafu, Result, UnsupportedSnafu};
 use crate::atoms::LaneMove;
 use crate::index::*;
 use crate::ir::*;
@@ -53,6 +53,8 @@ struct Emit<'a> {
     headers: Vec<usize>,
     /// The levels of the open branches, innermost last.
     guards: Vec<usize>,
+    /// Open branches on the warp of the block's scope: some warps skip them.
+    divergent: usize,
     /// The level every hoisted value sits at.
     levels: HashMap<u64, usize>,
     scalars: HashMap<ScalarId, (usize, Arc<UOp>)>,
@@ -155,6 +157,7 @@ impl<'a> Emit<'a> {
             list: vec![],
             headers: vec![0],
             guards: vec![],
+            divergent: 0,
             levels: HashMap::new(),
             scalars: HashMap::new(),
             row_scalars: HashMap::new(),
@@ -768,12 +771,14 @@ impl<'a> Emit<'a> {
                 out
             }
             Stmt::If { pred, then, otherwise } => {
+                let divergent = usize::from(self.scope == Scope::Block && self.prog.varies_by_warp(*pred));
                 let pred = self.sc(*pred);
                 // Listed like any scalar: a compare left to its first user
                 // would land inside whichever branch meets it first and not
                 // reach a later `if` on the same predicate outside it.
                 let cond = self.hoist(pred.try_cmpne(&c32(0)).expect("predicate"));
                 let not = self.hoist(cond.not());
+                self.divergent += divergent;
                 for (branch, cond) in [(then, cond), (otherwise, not)] {
                     if branch.0.is_empty() {
                         continue;
@@ -790,6 +795,7 @@ impl<'a> Emit<'a> {
                     self.row_scalars.retain(|_, (l, _)| *l < level);
                     self.push(UOp::endif(if_));
                 }
+                self.divergent -= divergent;
                 Ok(())
             }
             Stmt::Sync(sync) => self.sync(*sync),
@@ -1309,6 +1315,10 @@ impl<'a> Emit<'a> {
         let region = (regions > 1).then(|| self.hoist(mul(&self.warp, &c32(elems as i64))));
         let place = Place::Smem { alloc: SmemId(u32::MAX), offset: self.zero() };
         let view = View { buf: scratch, place, shape, dtype, region };
+        snafu::ensure!(
+            self.scope == Scope::Warp || self.divergent == 0,
+            DivergentBarrierSnafu { what: "a relayout through shared memory" }
+        );
         self.sync(Sync::Barrier { scope: self.scope })?;
         self.store_view(&view, src)?;
         self.sync(Sync::Barrier { scope: self.scope })?;

@@ -10,6 +10,9 @@
 
 use std::collections::HashSet;
 
+use snafu::ensure;
+
+use super::{DivergentBarrierSnafu, Result};
 use crate::ir::*;
 
 #[derive(Clone, Default)]
@@ -49,16 +52,19 @@ impl State {
 
     /// Emit what `need` asks for into `out`, the barrier over `scope`. A
     /// barrier orders threads but lands no copy, so only the wait clears
-    /// `pending`.
-    fn meet(&mut self, need: Need, scope: Scope, out: &mut Vec<Stmt>) {
+    /// `pending`. Under a branch some of the block's warps skip
+    /// (`divergent`), a block barrier would wait for them forever.
+    fn meet(&mut self, need: Need, scope: Scope, divergent: bool, out: &mut Vec<Stmt>) -> Result<()> {
         if need == Need::Land {
             out.extend([Stmt::Sync(Sync::CommitAsync), Stmt::Sync(Sync::WaitAsync { pending: 0 })]);
             self.pending.clear();
         }
         if need >= Need::Fence {
+            ensure!(!divergent || scope == Scope::Warp, DivergentBarrierSnafu { what: "a shared tile's fence" });
             out.push(Stmt::Sync(Sync::Barrier { scope }));
             self.fenced();
         }
+        Ok(())
     }
 
     fn any(&self) -> bool {
@@ -71,10 +77,11 @@ impl State {
     }
 }
 
-pub fn insert_barriers(prog: &mut Program) {
+pub fn insert_barriers(prog: &mut Program) -> Result<()> {
     let body = std::mem::take(&mut prog.body);
-    let (body, _) = walk(prog, body, State::default(), Scope::Block);
+    let (body, _) = walk(prog, body, State::default(), Scope::Block, false)?;
     prog.body = body;
+    Ok(())
 }
 
 fn alloc(prog: &Program, v: ValId) -> Option<SmemId> {
@@ -121,16 +128,16 @@ fn read(prog: &Program, block: &Block, into: &mut HashSet<SmemId>) {
     }
 }
 
-/// Rewrite `block` under the incoming `state`, its barriers over `scope`;
-/// returns it with the state at its end.
-fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block, State) {
+/// Rewrite `block` under the incoming `state`, its barriers over `scope`,
+/// `divergent` under a branch on the warp; returns it with the state at its end.
+fn walk(prog: &Program, block: Block, mut state: State, scope: Scope, divergent: bool) -> Result<(Block, State)> {
     let mut out = Vec::with_capacity(block.0.len());
     for stmt in block.0 {
         let stmt = match stmt {
             Stmt::Copy { dst, src, mode, scope: own } => {
                 assert_eq!(own, scope, "a copy's scope is its enclosing statement's");
                 let (wr, rd) = (alloc(prog, dst), alloc(prog, src));
-                state.meet(state.need(rd, false).max(state.need(wr, true)), scope, &mut out);
+                state.meet(state.need(rd, false).max(state.need(wr, true)), scope, divergent, &mut out)?;
                 if let Some(a) = wr {
                     match mode {
                         CopyMode::Async => state.pending.insert(a),
@@ -154,9 +161,9 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block,
                 // The body's end state flows back to its start, and the state
                 // before the loop flows past it: it may run no trip.
                 let before = state.clone();
-                let (_, back) = walk(prog, l.body.clone(), state.clone(), scope);
+                let (_, back) = walk(prog, l.body.clone(), state.clone(), scope, divergent)?;
                 state.merge(&back);
-                let (body, end) = walk(prog, std::mem::take(&mut l.body), state, scope);
+                let (body, end) = walk(prog, std::mem::take(&mut l.body), state, scope, divergent)?;
                 l.body = body;
                 state = end;
                 state.merge(&before);
@@ -170,13 +177,13 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block,
                 written(prog, &p.produce.body, &mut ring);
                 let need = ring.iter().map(|&a| state.need(Some(a), true)).max().unwrap_or(Need::Nothing);
                 let landing = if state.pending.is_empty() { Need::Nothing } else { Need::Land };
-                state.meet(need.max(landing), scope, &mut out);
+                state.meet(need.max(landing), scope, divergent, &mut out)?;
                 // Landed copies are fenced by the template's barrier before
                 // the first consume, as is every later consume's start, but
                 // an async copy a consume issues is still pending at the next.
-                let (_, back) = walk(prog, p.consume.body.clone(), State::default(), scope);
+                let (_, back) = walk(prog, p.consume.body.clone(), State::default(), scope, divergent)?;
                 let start = State { pending: back.pending, ..State::default() };
-                let (body, mut end) = walk(prog, std::mem::take(&mut p.consume.body), start, scope);
+                let (body, mut end) = walk(prog, std::mem::take(&mut p.consume.body), start, scope, divergent)?;
                 p.consume.body = body;
                 // No barrier follows the last consume: its effects and its
                 // ring reads stay open. With no step, the state passes through.
@@ -185,8 +192,9 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block,
                 Stmt::Pipeline(p)
             }
             Stmt::If { pred, then, otherwise } => {
-                let (then, s1) = walk(prog, then, state.clone(), scope);
-                let (otherwise, s2) = walk(prog, otherwise, state, scope);
+                let divergent = divergent || (scope == Scope::Block && prog.varies_by_warp(pred));
+                let (then, s1) = walk(prog, then, state.clone(), scope, divergent)?;
+                let (otherwise, s2) = walk(prog, otherwise, state, scope, divergent)?;
                 state = s1;
                 state.merge(&s2);
                 Stmt::If { pred, then, otherwise }
@@ -199,9 +207,9 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block,
             Stmt::Warps { body } => {
                 let open = if state.pending.is_empty() { Need::Fence } else { Need::Land };
                 if state.any() {
-                    state.meet(open, scope, &mut out);
+                    state.meet(open, scope, divergent, &mut out)?;
                 }
-                let (body, end) = walk(prog, body, State::default(), Scope::Warp);
+                let (body, end) = walk(prog, body, State::default(), Scope::Warp, divergent)?;
                 let mut touched = HashSet::new();
                 written(prog, &body, &mut touched);
                 read(prog, &body, &mut touched);
@@ -213,5 +221,5 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope) -> (Block,
         };
         out.push(stmt);
     }
-    (Block(out), state)
+    Ok((Block(out), state))
 }

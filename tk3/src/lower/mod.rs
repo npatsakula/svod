@@ -34,6 +34,8 @@ pub enum Error {
         #[snafu(source(from(svod_codegen::Error, Box::new)))]
         source: Box<svod_codegen::Error>,
     },
+    #[snafu(display("{what} is a block barrier under a branch on the warp, which some warps skip"))]
+    DivergentBarrier { what: &'static str },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -77,7 +79,7 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     let lone = prog.walk().any(|(_, s)| matches!(s, Stmt::Warps { .. }));
     ensure!(prog.warps.is_multiple_of(grid) && (prog.warps == grid || lone), GridSnafu { warps: prog.warps, grid });
     materialize_operands(&mut prog, lowering.group);
-    sync::insert_barriers(&mut prog);
+    sync::insert_barriers(&mut prog)?;
     schedule::expand(&mut prog, lowering.schedule);
     let mut laid = layouts::infer(prog, &lowering.device, lowering.grid, lowering.group).context(LayoutSnafu)?;
     orient_shared(&mut laid, &lowering.device.target);
