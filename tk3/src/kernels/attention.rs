@@ -261,18 +261,18 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let m_exp = scaled(k, m_new);
     let p = k.binary(s, m_exp, BinaryOp::Sub);
     let p = k.unary(p, UnaryOp::Exp2);
-    // Truncated probabilities are summed as held, so the normalization stays
-    // unbiased; rounded ones in f32.
-    let (p16, block_sum) = if st.cfg.truncate_p && T::DTYPE == svod_dtype::ScalarDType::BFloat16 {
-        let p16 = k.cast_toward_zero::<T>(p);
-        (p16, k.reduce_f32(p16, Axis::Row, ReduceOp::Sum))
-    } else {
-        (k.cast::<F32, T>(p), k.reduce(p, Axis::Row, ReduceOp::Sum))
-    };
-    let l = k.binary(l, corr, BinaryOp::Mul);
-    let l = k.binary(l, block_sum, BinaryOp::Add);
+    let truncate = st.cfg.truncate_p && T::DTYPE == svod_dtype::ScalarDType::BFloat16;
+    let p16 = if truncate { k.cast_toward_zero::<T>(p) } else { k.cast::<F32, T>(p) };
     let o = if st.cfg.skip_rescale { k.scale(o, corr) } else { k.binary(o, corr, BinaryOp::Mul) };
     let o = k.mma(o, p16, false, v_t, false);
+    // Truncated probabilities are summed as held, so the normalization stays
+    // unbiased; rounded ones in f32. The sum follows the product so that both
+    // read the probabilities packed once, on the same side of the rescale's
+    // branch.
+    let block_sum =
+        if truncate { k.reduce_f32(p16, Axis::Row, ReduceOp::Sum) } else { k.reduce(p, Axis::Row, ReduceOp::Sum) };
+    let l = k.binary(l, corr, BinaryOp::Mul);
+    let l = k.binary(l, block_sum, BinaryOp::Add);
     [m_new, l, o]
 }
 
