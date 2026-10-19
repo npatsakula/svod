@@ -62,7 +62,10 @@ Only the CUDA row has kernel tables and runs on hardware today (see [Portability
 ## Layout inference
 
 1. **Atoms seed.** An `mma` gives its operands and result the atom's layouts tiled over the
-   `WarpGrid` (`layouts::mma_layouts`).
+   `WarpGrid` (`MmaAtom::issue`), issued whichever way round (`ir::Orient`) leaves the program
+   the least relayout traffic: `Cᵀ = Bᵀ·Aᵀ` is the same instruction with its slots exchanged,
+   so on a square atom an accumulator can be held as the next product's operand at no cost.
+   An author may pin the orientation (`Kernel::mma_oriented`).
 2. **Elementwise ops unify.** Operands and the result of `binary`, `cast`, `where_` and the
    carried values of a loop share one layout.
 3. **Unconstrained tiles take a natural layout.** At a fixed point, a tile nothing constrains

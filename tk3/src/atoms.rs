@@ -37,6 +37,14 @@ impl MmaAtom {
     }
 }
 
+impl MmaAtom {
+    /// Whether the atom can issue [`crate::ir::Orient::Swapped`]: a square
+    /// atom, whose `m` and `n` extents are interchangeable.
+    pub fn swappable(&self) -> bool {
+        self.m == self.n
+    }
+}
+
 /// What a target offers the lowering.
 #[derive(Clone, Debug)]
 pub struct Target {

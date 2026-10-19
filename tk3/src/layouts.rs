@@ -177,6 +177,20 @@ pub enum Relayout {
     ViaSmem,
 }
 
+impl Relayout {
+    /// What moving one element this way is worth avoiding, for the inference
+    /// to weigh one assignment against another. The classes are ordered, not
+    /// calibrated, and a lane shuffle is priced as a round trip because that
+    /// is what the emitter lowers one into today.
+    pub fn cost_per_element(&self) -> u32 {
+        match self {
+            Relayout::Identity => 0,
+            Relayout::RegPermute(_) => 1,
+            Relayout::LaneShuffle(_) | Relayout::ViaSmem => 16,
+        }
+    }
+}
+
 /// Keep the input bits that tell `axis` apart; the rest of the registers are
 /// dropped (they would be copies) and the rest of the lanes replicate.
 fn keep_axis(frag: &Layout, axis: crate::layout::Dim) -> Layout {
@@ -193,23 +207,61 @@ fn keep_axis(frag: &Layout, axis: crate::layout::Dim) -> Layout {
     Layout::from_bases([(axis, size)], &[(Reg, &reg), (Lane, &lane)])
 }
 
-/// The operand layouts of an `[m, n] += [m, k] · [k, n]` product on `atom`
-/// over `grid`.
-pub fn mma_layouts(atom: &MmaAtom, grid: WarpGrid, m: usize, n: usize, k: usize) -> Result<[TileLayout; 3]> {
-    let (wr, wc) = (grid.rows, grid.cols);
-    ensure!(
-        m.is_multiple_of((wr * atom.m) as usize) && n.is_multiple_of((wc * atom.n) as usize),
-        NotTileableSnafu { rows: m, cols: n, wr, wc, m: atom.m, n: atom.n }
-    );
-    ensure!(k.is_multiple_of(atom.k as usize), ReductionNotTileableSnafu { k, atom_k: atom.k });
-    let (rm, rn, rk) =
-        ((m / (wr * atom.m) as usize) as u32, (n / (wc * atom.n) as usize) as u32, (k / atom.k as usize) as u32);
-    let warps = grid.layout();
-    Ok([
-        TileLayout { frag: atom.a.clone(), reps: [rm, rk], warps: warps.sublayout(&[Warp], &[Row]) },
-        TileLayout { frag: atom.b.clone(), reps: [rk, rn], warps: warps.sublayout(&[Warp], &[Col]) },
-        TileLayout { frag: atom.c.clone(), reps: [rm, rn], warps },
-    ])
+/// A product as the matrix core issues it: the layout each operand is held
+/// in and whether the slots are exchanged, from [`MmaAtom::issue`], so the
+/// layouts and the slot order agree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Issue {
+    pub a: TileLayout,
+    pub b: TileLayout,
+    pub c: TileLayout,
+    /// The core computes `Cᵀ = Bᵀ·Aᵀ`: `b` feeds its A slot and `a` its B
+    /// slot.
+    pub swapped: bool,
+}
+
+impl MmaAtom {
+    /// The `[m, n] += [m, k] · [k, n]` product over `grid`, issued `orient`
+    /// way round. Swapped, our A feeds the slot expecting `atom.b` (as Aᵀ)
+    /// and our B the one expecting `atom.a`, so each is held in the other's
+    /// transpose and the accumulator in its own; the warp grid and repeat
+    /// counts are the direct form's either way, so no warp's work moves.
+    /// Whether an accumulator feeds the next product without moving: the
+    /// accumulator of an `m × k` product as its A operand directly, or that
+    /// of a `k × n` product as the B operand of the swapped product (both
+    /// products issued swapped, the accumulator holds the transpose).
+    pub fn accumulator_feeds(&self, lanes: u32) -> bool {
+        let (m, n, k) = (self.m as usize, self.n as usize, self.k as usize);
+        let one = WarpGrid { rows: 1, cols: 1 };
+        let feeds = |rows, cols, operand: fn(&Issue) -> &TileLayout| {
+            self.issue(Orient::Direct, one, rows, cols, k)
+                .is_ok_and(|p| matches!(p.c.relayout(operand(&p), 1, lanes), Relayout::Identity))
+        };
+        feeds(m, k, |p| &p.a) || (self.swappable() && feeds(k, n, |p| &p.b))
+    }
+
+    pub fn issue(&self, orient: Orient, grid: WarpGrid, m: usize, n: usize, k: usize) -> Result<Issue> {
+        assert!(orient == Orient::Direct || self.swappable(), "a {}×{} atom cannot issue swapped", self.m, self.n);
+        let (wr, wc) = (grid.rows, grid.cols);
+        ensure!(
+            m.is_multiple_of((wr * self.m) as usize) && n.is_multiple_of((wc * self.n) as usize),
+            NotTileableSnafu { rows: m, cols: n, wr, wc, m: self.m, n: self.n }
+        );
+        ensure!(k.is_multiple_of(self.k as usize), ReductionNotTileableSnafu { k, atom_k: self.k });
+        let (rm, rn, rk) =
+            ((m / (wr * self.m) as usize) as u32, (n / (wc * self.n) as usize) as u32, (k / self.k as usize) as u32);
+        let warps = grid.layout();
+        let (fa, fb, fc, swapped) = match orient {
+            Orient::Direct => (self.a.clone(), self.b.clone(), self.c.clone(), false),
+            Orient::Swapped => (self.b.transpose(), self.a.transpose(), self.c.transpose(), true),
+        };
+        Ok(Issue {
+            a: TileLayout { frag: fa, reps: [rm, rk], warps: warps.sublayout(&[Warp], &[Row]) },
+            b: TileLayout { frag: fb, reps: [rk, rn], warps: warps.sublayout(&[Warp], &[Col]) },
+            c: TileLayout { frag: fc, reps: [rm, rn], warps },
+            swapped,
+        })
+    }
 }
 
 /// A layout for a tile nothing constrains: each lane holds a short row
@@ -259,7 +311,7 @@ pub fn chunked(shape: Shape, elem_bytes: usize, warps: u32, lanes: u32) -> Optio
 }
 
 struct Infer<'a> {
-    prog: &'a mut Program,
+    prog: &'a Program,
     target: &'a Target,
     grid: WarpGrid,
     lay: Vec<Option<TileLayout>>,
@@ -270,45 +322,158 @@ struct Infer<'a> {
     pos: usize,
 }
 
-/// Assign a layout to every register value of `prog`, inserting relayouts
-/// where a value is consumed under two layouts. Returns the layouts by value.
-pub fn infer(prog: &mut Program, target: &Target, grid: WarpGrid) -> Result<Vec<Option<TileLayout>>> {
-    let n = prog.values.len();
-    let mut it = Infer { prog, target, grid, lay: vec![None; n], changed: true, conflicts: HashMap::new(), pos: 0 };
-    let (warps, lanes) = (it.prog.warps, it.target.wave);
-    for _ in 0..4 * n + 4 {
-        if !it.changed {
-            // At a fixed point, a value nothing constrains takes the natural
-            // layout and the passes go on, so what consumes it (a vector it
-            // broadcasts over, say) is demanded from it rather than defaulted
-            // apart from it. Tiles seed before vectors: a vector's layout is
-            // its tile's to decide.
-            let Some(v) = it.unconstrained() else { break };
-            let shape = it.prog.values[v.index()].shape;
-            let l = natural(shape, warps, lanes).context(UndeterminedSnafu {
-                value: v,
-                rows: shape.rows,
-                cols: shape.cols,
-            })?;
-            it.set(v, l);
-        }
-        it.changed = false;
-        it.conflicts.clear();
-        it.pos = 0;
-        let body = std::mem::take(&mut it.prog.body);
-        it.pass(&body)?;
-        it.prog.body = body;
-    }
-    if !it.conflicts.is_empty() {
-        it.pos = 0;
-        let body = std::mem::take(&mut it.prog.body);
-        let body = it.insert(body);
-        it.prog.body = body;
-    }
-    Ok(it.lay)
+/// A program whose register values all have a layout and whose products are
+/// all oriented: what [`infer`] makes and the emitter consumes.
+pub struct Laid {
+    pub prog: Program,
+    pub layouts: Vec<Option<TileLayout>>,
 }
 
-impl Infer<'_> {
+/// Assign a layout to every register value of `prog` and an [`Orient`] to
+/// every product, inserting relayouts where a value is consumed under two
+/// layouts.
+///
+/// A product may be issued either way round at no cost, and which way it goes
+/// decides whether the next product takes its result as it stands. The
+/// assignment that forces the least relayout traffic wins — every assignment
+/// is tried while the free products are few, one flip at a time beyond that —
+/// so an accumulator that feeds another product reaches it in the layout that
+/// product wants, which on a target whose accumulator is its operand's
+/// transpose is free (what tk1's `acc_reusable_as_input` flag used to say).
+/// Products the author oriented stay as pinned.
+pub fn infer(mut prog: Program, target: &Target, grid: WarpGrid) -> Result<Laid> {
+    orient_products(&mut prog, target, grid)?;
+    let mut it = Infer::new(&prog, target, grid);
+    it.solve()?;
+    let (mut layouts, conflicts) = (it.lay, it.conflicts);
+    if !conflicts.is_empty() {
+        let body = std::mem::take(&mut prog.body);
+        let body = Rewrite { prog: &mut prog, lay: &mut layouts, conflicts, pos: 0 }.insert(body);
+        prog.body = body;
+    }
+    Ok(Laid { prog, layouts })
+}
+
+/// Up to this many free products every orientation is tried; past it each is
+/// flipped on its own and a flip that lowers the cost is kept.
+const EXHAUSTIVE_UP_TO: usize = 6;
+
+/// Write an orientation into every product of `prog`: the pinned ones stay,
+/// the rest take the assignment of least relayout cost.
+fn orient_products(prog: &mut Program, target: &Target, grid: WarpGrid) -> Result<()> {
+    // A product listed twice (a peeled loop trip) is one decision.
+    let mut free: Vec<ValId> = vec![];
+    for (_, s) in prog.walk() {
+        if let Stmt::Let { dst, op: TileOp::Mma { a, orient: None, .. } } = s {
+            let (va, vd) = (prog.value(*a), prog.value(*dst));
+            if target.mma(va.dtype, vd.dtype).is_some_and(MmaAtom::swappable) && !free.contains(dst) {
+                free.push(*dst);
+            }
+        }
+    }
+    let cost_of = |choice: &HashMap<ValId, Orient>| -> Result<u32> {
+        let mut trial = prog.clone();
+        set_orient(&mut trial.body, choice);
+        let mut it = Infer::new(&trial, target, grid);
+        it.solve()?;
+        Ok(it
+            .conflicts
+            .iter()
+            .map(|((_, v), want)| match &it.lay[v.index()] {
+                Some(have) => {
+                    let shape = trial.value(*v).shape;
+                    have.relayout(want, trial.warps, target.wave).cost_per_element() * (shape.rows * shape.cols) as u32
+                }
+                None => 0,
+            })
+            .sum())
+    };
+    let mut best: HashMap<ValId, Orient> = HashMap::new();
+    let mut best_cost = cost_of(&best)?;
+    let swapped = |bits: u32| -> HashMap<ValId, Orient> {
+        free.iter().enumerate().filter(|(i, _)| bits >> i & 1 == 1).map(|(_, &v)| (v, Orient::Swapped)).collect()
+    };
+    if free.len() <= EXHAUSTIVE_UP_TO {
+        for bits in 1..1u32 << free.len() {
+            let choice = swapped(bits);
+            if let Ok(cost) = cost_of(&choice)
+                && cost < best_cost
+            {
+                (best, best_cost) = (choice, cost);
+            }
+        }
+    } else {
+        for &v in &free {
+            let mut choice = best.clone();
+            choice.insert(v, Orient::Swapped);
+            if let Ok(cost) = cost_of(&choice)
+                && cost < best_cost
+            {
+                (best, best_cost) = (choice, cost);
+            }
+        }
+    }
+    set_orient(&mut prog.body, &best);
+    Ok(())
+}
+
+/// Orient every free product of `block`: as `choice` says, else direct.
+fn set_orient(block: &mut Block, choice: &HashMap<ValId, Orient>) {
+    for stmt in &mut block.0 {
+        match stmt {
+            Stmt::Let { dst, op: TileOp::Mma { orient: orient @ None, .. } } => {
+                *orient = Some(choice.get(dst).copied().unwrap_or(Orient::Direct));
+            }
+            Stmt::Let { .. } | Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => {}
+            Stmt::Loop(l) => set_orient(&mut l.body, choice),
+            Stmt::Pipeline(p) => {
+                set_orient(&mut p.produce.body, choice);
+                set_orient(&mut p.consume.body, choice);
+            }
+            Stmt::Role { body, .. } => set_orient(body, choice),
+            Stmt::If { then, otherwise, .. } => {
+                set_orient(then, choice);
+                set_orient(otherwise, choice);
+            }
+        }
+    }
+}
+
+impl<'a> Infer<'a> {
+    fn new(prog: &'a Program, target: &'a Target, grid: WarpGrid) -> Self {
+        let n = prog.values.len();
+        Infer { prog, target, grid, lay: vec![None; n], changed: true, conflicts: HashMap::new(), pos: 0 }
+    }
+
+    /// Run the propagation to its fixed point, seeding what nothing constrains.
+    fn solve(&mut self) -> Result<()> {
+        let prog = self.prog;
+        let n = self.lay.len();
+        let (warps, lanes) = (prog.warps, self.target.wave);
+        for _ in 0..4 * n + 4 {
+            if !self.changed {
+                // At a fixed point, a value nothing constrains takes the natural
+                // layout and the passes go on, so what consumes it (a vector it
+                // broadcasts over, say) is demanded from it rather than defaulted
+                // apart from it. Tiles seed before vectors: a vector's layout is
+                // its tile's to decide.
+                let Some(v) = self.unconstrained() else { break };
+                let shape = prog.values[v.index()].shape;
+                let l = natural(shape, warps, lanes).context(UndeterminedSnafu {
+                    value: v,
+                    rows: shape.rows,
+                    cols: shape.cols,
+                })?;
+                self.set(v, l);
+            }
+            self.changed = false;
+            self.conflicts.clear();
+            self.pos = 0;
+            self.pass(&prog.body)?;
+        }
+        Ok(())
+    }
+
     /// The first register value without a layout, tiles before vectors.
     fn unconstrained(&self) -> Option<ValId> {
         let open = |vector: bool| {
@@ -465,7 +630,7 @@ impl Infer<'_> {
                     self.set(src, l.transposed());
                 }
             }
-            TileOp::Mma { acc, a, b, a_t, b_t } => {
+            TileOp::Mma { acc, a, b, a_t, b_t, orient } => {
                 let (va, vc) = (self.prog.value(a).clone(), self.prog.value(dst).clone());
                 let atom = self
                     .target
@@ -473,7 +638,9 @@ impl Infer<'_> {
                     .context(NoMatrixCoreSnafu { arch: self.target.arch, dtype_in: va.dtype, dtype_out: vc.dtype })?
                     .clone();
                 let k = if a_t { va.shape.rows } else { va.shape.cols };
-                let [la, lb, lc] = mma_layouts(&atom, self.grid, vc.shape.rows, vc.shape.cols, k)?;
+                let orient = orient.expect("products are oriented before their layouts are solved");
+                let Issue { a: la, b: lb, c: lc, .. } =
+                    atom.issue(orient, self.grid, vc.shape.rows, vc.shape.cols, k)?;
                 self.demand(acc, lc.clone());
                 self.demand(dst, lc);
                 if self.prog.value(a).place == Place::Reg {
@@ -486,7 +653,18 @@ impl Infer<'_> {
         }
         Ok(())
     }
+}
 
+/// The rewrite that follows a solved inference: a fresh register value for
+/// each conflicting operand, re-held just before its consumer.
+struct Rewrite<'a> {
+    prog: &'a mut Program,
+    lay: &'a mut Vec<Option<TileLayout>>,
+    conflicts: HashMap<(usize, ValId), TileLayout>,
+    pos: usize,
+}
+
+impl Rewrite<'_> {
     /// Re-hold every conflicting operand just before its consumer.
     fn insert(&mut self, block: Block) -> Block {
         let mut out = Vec::with_capacity(block.0.len());

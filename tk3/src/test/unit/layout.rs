@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
+use svod_dtype::AmdArch;
 use test_case::test_case;
 
 use crate::layout::Dim::{self, Col, Lane, Reg, Row, Warp};
@@ -455,4 +456,21 @@ proptest! {
             Conversion::ViaSmem => {}
         }
     }
+}
+
+/// The accumulator reaches the next product's B operand for free exactly where tk1's
+/// `ArchCaps::acc_reusable_as_input` held — gfx12 and CDNA, hardware-verified there —
+/// so the F2 algebra subsumes that flag (`tk3_design.md` §3.2). Its A operand never
+/// does, and that is the handoff `kernels::attention` asks for: it accumulates the
+/// scores as `[bq, bkv]` and feeds them as A, where tk1 accumulates the transpose and
+/// feeds it as B.
+#[test_case(AmdArch::Gfx1201, true; "gfx1201 rdna4")]
+#[test_case(AmdArch::Gfx942, true; "gfx942 cdna3")]
+#[test_case(AmdArch::Gfx1151, false; "gfx1151 rdna3.5")]
+#[test_case(AmdArch::Gfx1100, false; "gfx1100 rdna3")]
+fn amd_accumulator_reuse(arch: AmdArch, reusable: bool) {
+    let target = crate::atoms::Target::for_arch(svod_dtype::GpuArch::Amd(arch));
+    let atom = target.mma.first().expect("a matrix core");
+    assert_eq!(Conversion::between(&atom.c, &atom.b) == Conversion::Identity, reusable, "accumulator → B");
+    assert!(matches!(Conversion::between(&atom.c, &atom.a), Conversion::LaneShuffle(_)), "accumulator → A");
 }

@@ -17,16 +17,11 @@ use crate::index::*;
 use crate::ir::*;
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
 use crate::layout::{self as frag, Layout};
-use crate::layouts::{Relayout, TileLayout};
+use crate::layouts::{Laid, Relayout, TileLayout};
 use snafu::ResultExt;
 
-pub fn emit(
-    prog: &Program,
-    lay: &[Option<TileLayout>],
-    low: &Lowering,
-    params: Vec<Arc<UOp>>,
-    device: DeviceSpec,
-) -> Result<Arc<UOp>> {
+pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Arc<UOp>> {
+    let (prog, lay) = (&laid.prog, laid.layouts.as_slice());
     let mut e = Emit::new(prog, lay, low, params);
     e.prologue()?;
     e.block(&prog.body)?;
@@ -1013,7 +1008,7 @@ impl<'a> Emit<'a> {
                     self.reg_store(dst, j, vec![UOp::try_where(p, x, y).expect("where")]);
                 }
             }
-            TileOp::Mma { acc, a, b, a_t, b_t } => self.mma(dst, acc, a, b, a_t, b_t)?,
+            TileOp::Mma { .. } => self.mma(dst, op)?,
             TileOp::Reduce { src, axis, f } => self.reduce(dst, src, axis, f)?,
             TileOp::Transpose { .. } => return UnsupportedSnafu { what: "register transposes" }.fail(),
             TileOp::Relayout { src } => self.relayout(dst, src)?,
@@ -1054,14 +1049,20 @@ impl<'a> Emit<'a> {
             .collect()
     }
 
-    fn mma(&mut self, dst: ValId, acc: ValId, a: ValId, b: ValId, a_t: bool, b_t: bool) -> Result<()> {
+    fn mma(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
+        let TileOp::Mma { acc, a, b, a_t, b_t, orient } = *op else { unreachable!("a product") };
+        let orient = orient.expect("a laid program orients every product");
         let (va, vd) = (self.value(a).clone(), self.value(dst).clone());
         let atom = self.low.target.mma(va.dtype, vd.dtype).expect("inference found the core").clone();
-        let lc = self.layout(dst).clone();
-        let [rm, rn] = lc.reps;
-        let k = if a_t { va.shape.rows } else { va.shape.cols } as u32;
-        let rk = k / atom.k;
-        let (ra, rb, rc) = (atom.a.in_size(Reg), atom.b.in_size(Reg), atom.c.in_size(Reg));
+        let k = if a_t { va.shape.rows } else { va.shape.cols };
+        // The product as laid, from the one function the inference used: the
+        // slot each operand feeds and the registers each fragment holds.
+        let issue =
+            atom.issue(orient, self.low.grid, vd.shape.rows, vd.shape.cols, k).expect("inference laid this product");
+        let [rm, rn] = issue.c.reps;
+        let rk = (k / atom.k as usize) as u32;
+        let (ra, rb, rc) = (issue.a.frag_regs(), issue.b.frag_regs(), issue.c.frag_regs());
+        let swapped = issue.swapped;
         // Fragment block index of each operand for a (m, n, k) step.
         let block_a = |i: u32, kk: u32| if a_t { kk * rm + i } else { i * rk + kk };
         let block_b = |j: u32, kk: u32| if b_t { j * rk + kk } else { kk * rn + j };
@@ -1070,8 +1071,9 @@ impl<'a> Emit<'a> {
                 let cblock = i * rn + j;
                 let mut c = UOp::stack(self.reg_loads(acc, cblock * rc, rc).into_iter().collect());
                 for kk in 0..rk {
-                    let x = UOp::stack(self.reg_loads(a, block_a(i, kk) * ra, ra).into_iter().collect());
-                    let y = UOp::stack(self.reg_loads(b, block_b(j, kk) * rb, rb).into_iter().collect());
+                    let xa = UOp::stack(self.reg_loads(a, block_a(i, kk) * ra, ra).into_iter().collect());
+                    let xb = UOp::stack(self.reg_loads(b, block_b(j, kk) * rb, rb).into_iter().collect());
+                    let (x, y) = if swapped { (xb, xa) } else { (xa, xb) };
                     c = UOp::wmma(x, y, c, atom.meta.clone());
                 }
                 let vals = (0..rc as usize).map(|p| elem(&c, p, rc as usize)).collect();

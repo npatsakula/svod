@@ -343,7 +343,7 @@ impl Frame<'_> {
                     .collect()
             }
             TileOp::Cast { src, .. } | TileOp::Relayout { src } | TileOp::Move { src } => self.read(*src),
-            TileOp::Mma { acc, a, b, a_t, b_t } => {
+            TileOp::Mma { acc, a, b, a_t, b_t, .. } => {
                 let (va, vb) = (self.read(*a), self.read(*b));
                 let (sa, sb) = (self.prog.value(*a).shape, self.prog.value(*b).shape);
                 let k = if *a_t { sa.rows } else { sa.cols };

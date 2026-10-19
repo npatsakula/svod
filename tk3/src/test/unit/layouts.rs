@@ -6,7 +6,7 @@ use crate::atoms::sm86;
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{self as frag, Dim};
-use crate::layouts::{Relayout, TileLayout, WarpGrid, chunked, infer, mma_layouts, natural};
+use crate::layouts::{Issue, Laid, Relayout, TileLayout, WarpGrid, chunked, infer, natural};
 
 fn coords(l: &TileLayout, warps: u32, lanes: u32) -> Vec<(u32, u32)> {
     (0..warps)
@@ -21,7 +21,7 @@ fn coords(l: &TileLayout, warps: u32, lanes: u32) -> Vec<(u32, u32)> {
 fn gemm_accumulator_gets_the_core_layout_over_the_warp_grid() {
     let mut prog = super::gemm_nt(256, 256, 256, 128, 128, 32, 3);
     prog.warps = 8;
-    let lay = infer(&mut prog, &sm86(), WarpGrid { rows: 2, cols: 4 }).unwrap();
+    let Laid { prog, layouts: lay } = infer(prog, &sm86(), WarpGrid { rows: 2, cols: 4 }).unwrap();
     let Stmt::Pipeline(p) = &prog.body.0[1] else { panic!("pipeline") };
     let acc = lay[p.carried[0].phi.index()].as_ref().unwrap();
     assert_eq!(acc.frag, frag::mma_sync_c());
@@ -66,7 +66,7 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     k.store(o_g, o);
     let mut prog = k.finish();
     prog.warps = 4;
-    let lay = infer(&mut prog, &sm86(), WarpGrid { rows: 4, cols: 1 }).unwrap();
+    let Laid { prog, layouts: lay } = infer(prog, &sm86(), WarpGrid { rows: 4, cols: 1 }).unwrap();
     let relayouts: Vec<_> = prog
         .walk()
         .filter_map(|(_, s)| match s {
@@ -101,9 +101,10 @@ fn natural_layouts_hold_every_element_once(rows: usize, cols: usize, warps: u32,
 fn shapes_that_do_not_tile_the_grid_are_rejected() {
     let target = sm86();
     let atom = target.mma(svod_dtype::ScalarDType::BFloat16, svod_dtype::ScalarDType::Float32).unwrap();
-    assert!(mma_layouts(atom, WarpGrid { rows: 2, cols: 4 }, 48, 128, 32).is_err(), "48 rows over 2 warps of 16");
-    assert!(mma_layouts(atom, WarpGrid { rows: 2, cols: 4 }, 64, 128, 24).is_err(), "k = 24");
-    let [a, b, c] = mma_layouts(atom, WarpGrid { rows: 1, cols: 1 }, 16, 48, 32).unwrap();
+    let direct = crate::ir::Orient::Direct;
+    assert!(atom.issue(direct, WarpGrid { rows: 2, cols: 4 }, 48, 128, 32).is_err(), "48 rows over 2 warps of 16");
+    assert!(atom.issue(direct, WarpGrid { rows: 2, cols: 4 }, 64, 128, 24).is_err(), "k = 24");
+    let Issue { a, b, c, .. } = atom.issue(direct, WarpGrid { rows: 1, cols: 1 }, 16, 48, 32).unwrap();
     assert_eq!((a.reps, b.reps, c.reps), ([1, 2], [2, 6], [1, 6]), "48 columns are six n-halves");
 }
 
