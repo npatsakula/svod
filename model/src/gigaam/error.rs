@@ -21,6 +21,8 @@ pub enum Error {
     DecoderConfig { message: String },
     #[snafu(display("checkpoint/config mismatch: {message}"))]
     CheckpointConfig { message: String },
+    #[snafu(display("streaming: {message}"))]
+    Streaming { message: String },
     #[snafu(display("invalid encoder dtype: {dtype:?}; expected f16, bf16, or f32"))]
     EncoderDtype { dtype: svod_dtype::DType },
     #[snafu(display("hub error: {source}"), context(false))]

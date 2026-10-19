@@ -27,6 +27,7 @@ pub(super) fn test_config() -> GigaAmConfig {
         max_encoder_frames: 128,
         decoder: CtcDecoder::Greedy(GreedyDecoder::new(Vec::new())),
         transducer: None,
+        streaming: None,
     }
 }
 
@@ -48,12 +49,12 @@ fn test_output_length_matches_forward() {
     let model = GigaAm::with_random_weights(test_config());
 
     let x = Tensor::full(&[1, 100, 64], 0.0f32, DType::Float32);
-    let out = model.encoder.subsampling.forward(&x).unwrap();
+    let out = model.encoder.subsampling.forward(&x, false).unwrap();
     let actual_t = out.dim_const(1).unwrap();
     assert_eq!(model.encoder.subsampling_output_length(100), actual_t);
 
     let x2 = Tensor::full(&[1, 50, 64], 0.0f32, DType::Float32);
-    let out2 = model.encoder.subsampling.forward(&x2).unwrap();
+    let out2 = model.encoder.subsampling.forward(&x2, false).unwrap();
     let actual_t2 = out2.dim_const(1).unwrap();
     assert_eq!(model.encoder.subsampling_output_length(50), actual_t2);
 }
