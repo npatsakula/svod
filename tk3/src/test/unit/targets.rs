@@ -200,6 +200,20 @@ fn lowered_tile(prog: Program, lowering: &Lowering) -> Program {
     lowered(prog, lowering).unwrap().tile
 }
 
+/// `check` on every launch at once, failing with every launch whose check
+/// panics, so one failure does not hide another.
+fn each(launches: Vec<Launch>, check: impl Fn(&str, Program, Lowering) + Sync) {
+    let failed: Vec<String> = crate::tune::in_parallel(launches, |(name, prog, lowering)| {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&name, prog, lowering))).err()?;
+        let why = panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied());
+        Some(format!("{name}: {}", why.unwrap_or("a panic")))
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    assert!(failed.is_empty(), "{} failed:\n{}", failed.len(), failed.join("\n"));
+}
+
 /// A lowering takes a program whose warps its grid takes all, or one whose
 /// warps run on their own ([`Stmt::Warps`]) in whole grids; any other
 /// pairing is refused before a layout is inferred.
@@ -290,28 +304,22 @@ fn every_family_assembles_for_hopper() {
     assert!(config::has_kernels(&target));
     assert_eq!(target.smem_bytes, 227 << 10);
     let Some(ptxas) = ptxas() else {
-        for (_, prog, lowering) in families(&target) {
-            render(prog, &lowering);
-        }
+        each(families(&target), |_, prog, lowering| drop(render(prog, &lowering)));
         eprintln!("skipped: no ptxas; rendered only");
         return;
     };
     let GpuArch::Cuda(arch) = target.arch else { unreachable!() };
-    for (name, prog, lowering) in families(&target) {
+    each(families(&target), |_, prog, lowering| {
         let ir = render(prog, &lowering);
         let ptx = match svod_runtime::cuda::compile_ir_to_ptx(&ir, arch) {
             Ok(ptx) => ptx,
-            Err(e) if e.to_string().contains("NVPTX target") => {
-                eprintln!("skipped: clang has no NVPTX target");
-                return;
-            }
-            Err(e) => panic!("{name}: {e}"),
+            Err(e) if e.to_string().contains("NVPTX target") => return eprintln!("skipped: clang has no NVPTX target"),
+            Err(e) => panic!("{e}"),
         };
         let mut command = Command::new(&ptxas);
         command.args(["-arch=sm_90a", "-o", "/dev/null", "/dev/stdin"]);
-        run(command, &ptx, &format!("ptxas sm_90a {name}")).unwrap_or_else(|e| panic!("{e}"));
-        eprintln!("{name}: assembled for sm_90a");
-    }
+        run(command, &ptx, "ptxas sm_90a").unwrap_or_else(|e| panic!("{e}"));
+    });
 }
 
 /// GEMM tiles on Hopper's warpgroup core: one to four warpgroups down the
@@ -462,17 +470,17 @@ fn group_lowering_keeps_the_interpreted_result() {
 #[test_case(amd(AmdArch::Gfx1100, 96); "gfx1100")]
 #[test_case(amd(AmdArch::Gfx942, 304); "gfx942")]
 fn lowering_keeps_the_interpreted_result(target: Target) {
-    for (name, prog, lowering) in families(&target) {
-        let params = inputs(&name, &prog);
+    each(families(&target), |name, prog, lowering| {
+        let params = inputs(name, &prog);
         let vars: Vec<(&str, i64)> = prog.vars.iter().map(|v| (v.name.as_str(), v.max)).collect();
         let want = interp::run(&prog, params.clone(), &vars).unwrap();
         let tile = lowered_tile(prog.clone(), &lowering);
         let got = interp::run(&tile, params, &vars).unwrap();
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
             let same = g.iter().zip(w).all(|(a, b)| a == b || (a.is_nan() && b.is_nan()));
-            assert!(same, "{name}: parameter {i} differs after lowering");
+            assert!(same, "parameter {i} differs after lowering");
         }
-    }
+    });
 }
 
 /// An AMD GPU with `cus` compute units and 64 KB of LDS per workgroup; a
@@ -530,22 +538,20 @@ fn the_block_index_is_renumbered_only_over_several_dies() {
 fn every_family_compiles_for_amd(target: Target) {
     assert!(config::has_kernels(&target));
     let GpuArch::Amd(arch) = target.arch else { unreachable!() };
-    for (name, prog, lowering) in families(&target) {
+    each(families(&target), |_, prog, lowering| {
         let kernel = prog.name.clone();
         let ir = render(prog, &lowering);
         let object = match svod_runtime::amd::compile_ir_to_amd_object(&ir, arch) {
             Ok(object) => object,
             Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
-                eprintln!("skipped: {e}");
-                return;
+                return eprintln!("skipped: {e}");
             }
-            Err(e) => panic!("{name}: {e}"),
+            Err(e) => panic!("{e}"),
         };
-        assert_eq!(&object[..4], b"\x7fELF", "{name}: an ELF code object");
+        assert_eq!(&object[..4], b"\x7fELF", "an ELF code object");
         let descriptor = format!("{kernel}.kd");
-        assert!(object.windows(descriptor.len()).any(|w| w == descriptor.as_bytes()), "{name}: {descriptor}");
-        eprintln!("{name}: compiled for {}", arch.mcpu());
-    }
+        assert!(object.windows(descriptor.len()).any(|w| w == descriptor.as_bytes()), "no {descriptor}");
+    });
 }
 
 /// An `if`'s compare is listed with its scalar: a predicate first met inside
@@ -725,19 +731,17 @@ fn register_staged_families_match_on_cuda() {
 #[test_case(hopper(), false; "hopper")]
 fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
     let planner = planner(target.clone());
-    let mut gemms = vec![];
+    let mut launches: Vec<Launch> = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
         for gated in [false, true] {
             let ranked = planner.gemm_ranked(1, m, n, k, gated);
             let deep = if m == 4096 && shortlist_deep { config::SHORTLIST } else { 8 };
             for cfg in config::distinct(&ranked).take(deep) {
                 let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
-                gemms.push(GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue, cfg });
+                let spec = GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue, cfg };
+                launches.push((format!("{m}x{n}x{k} {cfg:?}"), gemm::<BF16>(&spec), cfg.lowering(&planner.device)));
             }
         }
-    }
-    for spec in gemms {
-        linear(gemm::<BF16>(&spec), &spec.cfg.lowering(&planner.device));
     }
     for d in [32, 48, 64, 128] {
         for t in [1, 16, 100] {
@@ -754,7 +758,7 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
                     scale: 0.125,
                     cfg,
                 };
-                linear(attention::<BF16>(&spec), &cfg.lowering(&planner.device));
+                launches.push((format!("d{d} t{t} {cfg:?}"), attention::<BF16>(&spec), cfg.lowering(&planner.device)));
             }
         }
     }
@@ -765,10 +769,11 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
             let spec =
                 ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, cfg: c.gemm, split: c.split };
             for (prog, lowering) in spec.programs::<F16>(&planner.device) {
-                linear(prog, &lowering);
+                launches.push((format!("{g:?} {c:?}"), prog, lowering));
             }
         }
     }
+    each(launches, |_, prog, lowering| drop(linear(prog, &lowering)));
 }
 
 /// A shared tile lies along the axis its readers' fragments run along: the
