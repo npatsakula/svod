@@ -608,9 +608,10 @@ fn attention_throughput_probe() {
             mask: AttnMask { causal, bias, ..AttnMask::default() },
             cache: None,
             scale: 1.0 / (d as f32).sqrt(),
-            // The blocks measured on sm_86; elsewhere the op layer's first pick.
+            // The blocks measured on sm_86, in the planned forms; elsewhere
+            // the op layer's first pick.
             cfg: if target.cp_async {
-                FaCfg::new(bq, bkv, 2)
+                FaCfg::new(bq, bkv, 2).forms(&target, d, t)
             } else {
                 crate::ops::config::Planner::new(target.clone()).attention_candidates(batch * heads, t, t, d, causal)[0]
             },

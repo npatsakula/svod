@@ -279,18 +279,17 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let truncate = st.cfg.truncate_p && T::DTYPE == svod_dtype::ScalarDType::BFloat16;
     let p16 = if truncate { k.cast_toward_zero::<T>(p) } else { k.cast::<F32, T>(p) };
     // Truncated probabilities are summed as held, so the normalization stays
-    // unbiased; rounded ones in f32. The sum follows the product where the
-    // rescale is a branch, so both consumers of the probabilities sit on one
-    // side of it and read them packed once (sm_86 d = 128: +7%); with a plain
-    // rescale it comes first (sm_86 d = 64 causal: +5% over the other order).
+    // unbiased, and the sum follows the product so that both consumers read
+    // them packed once (gfx1201); rounded ones are summed in f32 before the
+    // rescale (sm_86 with the planned forms: 3% at d = 128 over the other
+    // order, d = 64 and a decoder step unchanged).
     let summed = |k: &mut Kernel| {
         let block_sum =
             if truncate { k.reduce_f32(p16, Axis::Row, ReduceOp::Sum) } else { k.reduce(p, Axis::Row, ReduceOp::Sum) };
         let l = k.binary(l, corr, BinaryOp::Mul);
         k.binary(l, block_sum, BinaryOp::Add)
     };
-    let after = truncate || st.cfg.skip_rescale;
-    let early = (!after).then(|| summed(k));
+    let early = (!truncate).then(|| summed(k));
     let o = if st.cfg.skip_rescale { k.scale(o, corr) } else { k.binary(o, corr, BinaryOp::Mul) };
     let o = k.mma(o, p16, false, v_t, false);
     let l = early.unwrap_or_else(|| summed(k));
