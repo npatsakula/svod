@@ -1146,7 +1146,7 @@ impl<'a> Emit<'a> {
         let os = self.value(operand).shape;
         let ds = self.value(dst).shape;
         if os == ds {
-            debug_assert_eq!(ld, lo, "elementwise operands share a layout");
+            assert_eq!(ld, lo, "the inference holds elementwise operands in the result's layout");
             return (0..ld.regs()).collect();
         }
         let key = |r: u32, c: u32| if os.cols == 1 { (r, 0) } else { (0, c) };

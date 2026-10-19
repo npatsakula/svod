@@ -581,6 +581,11 @@ impl<'a> Infer<'a> {
     }
 
     /// `a` and `b` are held alike; a disagreement is resolved on `b`'s side.
+    /// Hold `a` and `b` alike: an unlaid one takes the other's layout, and
+    /// where both are laid differently `b` is re-held as `a` before the
+    /// statement. An op unifies its result with each operand in that order,
+    /// so the operands reach it in the result's layout (a conflict is only
+    /// ever resolved on a statement's operand).
     fn unify(&mut self, a: ValId, b: ValId) {
         match (self.lay[a.index()].clone(), self.lay[b.index()].clone()) {
             (Some(l), None) => self.set(b, l),
@@ -670,12 +675,10 @@ impl<'a> Infer<'a> {
     fn elementwise(&mut self, dst: ValId, a: ValId, b: ValId) {
         match self.broadcast(a, b) {
             None => {
-                self.unify(a, b);
-                self.unify(a, dst);
                 self.unify(dst, a);
+                self.unify(dst, b);
             }
             Some((tile, vector, axis)) => {
-                self.unify(tile, dst);
                 self.unify(dst, tile);
                 if let Some(want) = self.vector_of(tile, axis) {
                     self.demand(vector, want);
@@ -687,10 +690,7 @@ impl<'a> Infer<'a> {
     fn let_(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
         match *op {
             TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) | TileOp::Relayout { .. } => {}
-            TileOp::Unary { src, .. } | TileOp::Cast { src, .. } | TileOp::Move { src } => {
-                self.unify(src, dst);
-                self.unify(dst, src);
-            }
+            TileOp::Unary { src, .. } | TileOp::Cast { src, .. } | TileOp::Move { src } => self.unify(dst, src),
             TileOp::Binary { a, b, .. } => self.elementwise(dst, a, b),
             TileOp::Where { pred, a, b } => {
                 self.elementwise(dst, a, b);
