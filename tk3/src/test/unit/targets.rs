@@ -54,6 +54,9 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
         let spec = GemmSpec { cfg, ..plain.clone() };
         push(&format!("gemm #{i} {:?}x{}", cfg.tile, cfg.stages), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
     }
+    // One slot holds a tile twice as deep in the same shared memory.
+    let one_slot = GemmSpec { cfg: config::gemm_cfg([64, 64, 64], 1, [2, 2], false), ..plain.clone() };
+    push("gemm one slot", gemm::<BF16>(&one_slot), one_slot.cfg.lowering(&planner.device));
     let swiglu = gemm_spec(70, 64, 64, Epilogue { bias: true, act: Act::Silu, gated: true, ..Epilogue::DEFAULT });
     push("gemm swiglu", gemm::<F16>(&swiglu), swiglu.cfg.lowering(&planner.device));
     let half_step = Epilogue { residual: true, act: Act::Gelu, scale: Some(Scale::new(0.5)), ..Epilogue::DEFAULT };
@@ -843,20 +846,25 @@ fn fences(block: &crate::ir::Block) -> usize {
         .sum()
 }
 
-/// The register-staged template fences every trip between its products and
-/// its commit on every target that runs it; the fence is an instruction only
-/// where the scheduler would otherwise hoist the commit (RDNA4), and the
-/// interpreter never sees it, so `lowering_keeps_the_interpreted_result`
-/// covers its placement.
+/// The two-slot register-staged template fences every trip between its
+/// products and its commit on every target that runs it; the fence is an
+/// instruction only where the scheduler would otherwise hoist the commit
+/// (RDNA4), and the interpreter never sees it, so
+/// `lowering_keeps_the_interpreted_result` covers its placement. One slot
+/// needs none: a barrier holds the commit back.
 #[test_case(AmdArch::Gfx1201, true; "gfx1201 fences")]
 #[test_case(AmdArch::Gfx942, false; "gfx942 keeps order")]
 #[test_case(AmdArch::Gfx1100, false; "gfx1100 keeps order")]
 fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
     let target = amd(arch, 64);
     assert_eq!(target.commit_fence, emitted);
-    let (name, prog, lowering) = families(&target).into_iter().find(|(n, ..)| n.starts_with("gemm #0")).unwrap();
-    let tile = lowered_tile(prog, &lowering);
-    assert_eq!(fences(&tile.body), 1, "{name}: one fence per pipeline");
+    let device = declared(target);
+    for (stages, want) in [(2, 1), (1, 0)] {
+        let cfg = config::gemm_cfg([64, 64, 32], stages, [2, 2], stages == 2);
+        let spec = GemmSpec { m: 130, n: 192, k: 128, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+        let tile = lowered_tile(gemm::<BF16>(&spec), &cfg.lowering(&device));
+        assert_eq!(fences(&tile.body), want, "{stages} slots: a fence per two-slot pipeline");
+    }
 }
 
 /// `Relayout` statements of tiles in `block`, recursively; vectors are not

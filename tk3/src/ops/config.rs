@@ -117,14 +117,16 @@ const GRIDS: [[u32; 2]; 9] = [[1, 1], [1, 2], [2, 1], [2, 2], [1, 4], [4, 1], [2
 /// Every config the construct spans on `target`: the tiles and warp grids,
 /// the ring depths its prefetch runs, rolled and unrolled.
 fn lattice(target: &Target) -> Vec<GemmCfg> {
-    let stages: &[usize] = if target.cp_async { &[3, 2] } else { &[2] };
+    let stages: &[usize] = if target.cp_async { &[3, 2, 1] } else { &[2, 1] };
     let mut out = vec![];
     for bm in ROWS {
         for bn in COLS {
             for bk in DEPTHS {
                 for warps in GRIDS {
                     for &stages in stages {
-                        out.extend([false, true].map(|unroll| gemm_cfg([bm, bn, bk], stages, warps, unroll)));
+                        // One slot has no slot arithmetic to fold: rolled only.
+                        let unrolls: &[bool] = if stages == 1 { &[false] } else { &[false, true] };
+                        out.extend(unrolls.iter().map(|&unroll| gemm_cfg([bm, bn, bk], stages, warps, unroll)));
                     }
                 }
             }

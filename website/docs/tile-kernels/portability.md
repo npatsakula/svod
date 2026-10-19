@@ -34,9 +34,9 @@ lowering as `Lowering::costs` (orientation, exchange or round trip) and the op l
 |---|---|---|---|---|
 | CUDA sm_80+ (sm_86) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, 2–3 stages | yes | Measured on an RTX 3060 |
 | CUDA sm_90 (Hopper) | `mma.sync` m16n8k16, `ldmatrix` | `cp.async`, up to 227 KB shared | sm_80 tables | Compiled: every family assembles with `ptxas -arch=sm_90` and `sm_90a`; not run |
-| AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, 8 values per lane | register-staged, 2 stages | yes, unmeasured | Compiled to code objects; not run |
-| AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 2 stages | yes, unmeasured | Compiled to code objects; not run |
-| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 2 stages | yes, unmeasured | Compiled for gfx942; not run |
+| AMD RDNA4 (gfx1200, gfx1201) | WMMA 16×16×16, 8 values per lane | register-staged, 1–2 stages | yes, unmeasured | Compiled to code objects; not run |
+| AMD RDNA3 / RDNA3.5 (gfx1100–1102, gfx1151) | WMMA 16×16×16, replicated inputs | register-staged, 1–2 stages | yes, unmeasured | Compiled to code objects; not run |
+| AMD CDNA3 / CDNA4 (gfx942, gfx950) | MFMA 16×16×16, wave64 | register-staged, 1–2 stages | yes, unmeasured | Compiled for gfx942; not run |
 | Apple | simdgroup 8×8×8 | none | no | Atoms only |
 
 `ops::supported(device)` is true where config tables exist; on any other device each op builds

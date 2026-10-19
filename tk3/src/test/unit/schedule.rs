@@ -16,6 +16,7 @@ fn count(prog: &Program, pred: impl Fn(&Stmt) -> bool) -> usize {
 #[test_case(Prefetch::CpAsync, 2; "cp.async two stages")]
 #[test_case(Prefetch::CpAsync, 4; "cp.async four stages")]
 #[test_case(Prefetch::RegisterStaged, 2; "register staged")]
+#[test_case(Prefetch::RegisterStaged, 1; "register staged, one slot")]
 fn expansion_preserves_the_result(prefetch: Prefetch, stages: usize) {
     let (m, n, k) = (64usize, 32usize, 160usize);
     let mut prog = super::gemm_nt(m, n, k, 32, 32, 32, stages);
@@ -29,8 +30,14 @@ fn expansion_preserves_the_result(prefetch: Prefetch, stages: usize) {
     let staged = prefetch == Prefetch::RegisterStaged;
     assert_eq!(count(&prog, |s| matches!(s, Stmt::Loop(_))), if staged { 3 } else { 1 }, "peeled or one loop");
     let barriers = count(&prog, |s| matches!(s, Stmt::Sync(Sync::Barrier { .. })));
-    let want = if staged || (prefetch == Prefetch::CpAsync && stages == 1) { 2 } else { 1 };
-    assert_eq!(barriers, want, "one per trip, plus the peeled prologue's");
+    let want = if staged && stages == 1 {
+        3
+    } else if staged || (prefetch == Prefetch::CpAsync && stages == 1) {
+        2
+    } else {
+        1
+    };
+    assert_eq!(barriers, want, "one per trip (two around a one-slot commit), plus the peeled prologue's");
     if prefetch == Prefetch::CpAsync && stages >= 2 {
         let waits: Vec<_> = prog
             .walk()
@@ -136,4 +143,39 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops() {
     assert_eq!(steady.carried.len(), 1);
     let (s, d) = (steady.carried[0], drain.carried[0]);
     assert_eq!((d.init, d.phi, d.next), (s.phi, s.phi, s.next), "the drain continues the steady accumulator");
+}
+
+/// Over one slot the steady trip's commit sits between two barriers (the
+/// slot is read out before it is overwritten, then seen) where two slots
+/// need a fence, both slot scalars are the constant 0, and the steady loop
+/// is not unrolled: there is no slot arithmetic to fold.
+#[test]
+fn one_slot_staging_commits_between_two_barriers() {
+    let mut prog = super::gemm_nt(32, 32, 64, 32, 32, 32, 1);
+    let slots: Vec<ScalarId> = prog
+        .walk()
+        .filter_map(|(_, s)| if let Stmt::Pipeline(p) = s { Some([p.produce.slot, p.consume.slot]) } else { None })
+        .flatten()
+        .collect();
+    expand(&mut prog, Schedule::Uniform { prefetch: Prefetch::RegisterStaged, unroll: true });
+    assert!(!slots.is_empty() && slots.iter().all(|&s| *prog.scalar(s) == Scalar::Const(0)), "one slot");
+    let loops: Vec<&Loop> =
+        prog.body.0.iter().filter_map(|s| if let Stmt::Loop(l) = s { Some(l) } else { None }).collect();
+    let [head, steady, drain] = loops[..] else { panic!("three loops, got {}", loops.len()) };
+    let kind = |s: &Stmt| match s {
+        Stmt::Copy { mode: CopyMode::Staged, .. } => "copy",
+        Stmt::Let { .. } => "compute",
+        Stmt::Sync(Sync::Barrier { .. }) => "barrier",
+        other => panic!("{other:?}"),
+    };
+    let kinds = |l: &Loop| l.body.0.iter().map(kind).collect::<Vec<_>>();
+    assert_eq!(kinds(head), ["copy", "copy", "copy", "copy", "barrier"]);
+    let k = kinds(steady);
+    let computes = k.len() - 6;
+    assert_eq!(k[..2], ["copy", "copy"]);
+    assert!(computes > 0 && k[2..2 + computes].iter().all(|k| *k == "compute"), "{k:?}");
+    assert_eq!(k[2 + computes..], ["barrier", "copy", "copy", "barrier"]);
+    assert_eq!(kinds(drain), vec!["compute"; computes]);
+    assert_eq!((head.unroll, steady.unroll, drain.unroll), (1, 1, 1));
+    assert_eq!(count(&prog, |s| matches!(s, Stmt::Sync(Sync::Fence))), 0, "no fence over one slot");
 }
