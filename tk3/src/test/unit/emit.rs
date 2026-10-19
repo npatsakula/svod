@@ -193,3 +193,31 @@ fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
     let nodes = linear(prog, &lowering).toposort();
     assert!(nodes.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "no round trip through shared memory");
 }
+
+/// A register transpose lowers as the builder and the interpreter take it:
+/// each thread keeps the elements it holds, its registers reordered, over
+/// one warp or several and over a fragment repeated along both dimensions.
+/// A result held under another layout has its operand re-held first.
+#[test_case(Shape::new(16, 32), 1, false; "one warp")]
+#[test_case(Shape::new(64, 32), 4, false; "four warps")]
+#[test_case(Shape::new(32, 32), 1, true; "a result laid otherwise")]
+fn a_register_transpose_lowers(tile: Shape, warps: u32, pinned: bool) {
+    let lanes = 32;
+    let mut k = Kernel::new("transpose");
+    k.warps(warps);
+    let x = k.param::<F32>("x", ParamKind::In, tile.elems());
+    let y = k.param::<F32>("y", ParamKind::Out, tile.elems());
+    let src = k.view(x, 0, [tile.cols, 1], tile, [None, None]);
+    let a = k.load(src);
+    let t = k.transpose(a);
+    if pinned {
+        let l = crate::layouts::chunked(tile.transposed(), 4, warps, lanes, Axis::Row).expect("a layout");
+        k.pin(t, l);
+    }
+    let out = tile.transposed();
+    let dst = k.view(y, 0, [out.cols, 1], out, [None, None]);
+    k.store(dst, t);
+    let device = Device { target: crate::atoms::sm86(), costs: super::costs() };
+    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: warps, cols: 1 });
+    linear(k.finish(), &lowering);
+}

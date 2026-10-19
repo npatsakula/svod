@@ -1451,7 +1451,7 @@ impl<'a> Emit<'a> {
             TileOp::Mma { .. } if self.low.group => self.group_mma(dst, op)?,
             TileOp::Mma { .. } => self.mma(dst, op)?,
             TileOp::Reduce { src, axis, f } => self.reduce(dst, src, axis, f)?,
-            TileOp::Transpose { .. } => return UnsupportedSnafu { what: "register transposes" }.fail(),
+            TileOp::Transpose { src } => self.transpose(dst, src)?,
             TileOp::Relayout { src } => self.relayout(dst, src)?,
             TileOp::Move { src } => {
                 for j in 0..regs {
@@ -1459,6 +1459,28 @@ impl<'a> Emit<'a> {
                     self.reg_store(dst, j, vec![x]);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// `dst = srcᵀ` by moving registers within each thread: the inference
+    /// holds `dst` under `src`'s transposed layout, in which every thread
+    /// holds the elements it holds of `src`, at registers of another order
+    /// where the layout repeats its fragment along both dimensions.
+    fn transpose(&mut self, dst: ValId, src: ValId) -> Result<()> {
+        let (ls, ld) = (self.layout(src).clone(), self.layout(dst).clone());
+        let (warps, lanes) = (self.grid_warps(), self.low.device.target.wave);
+        for k in 0..ld.regs() {
+            let held = |w: u32, l: u32| {
+                let (r, c) = ld.coord(w, l, k);
+                (c, r)
+            };
+            let j = (0..ls.regs()).find(|&j| ls.coord(0, 0, j) == held(0, 0));
+            let j = j
+                .filter(|&j| (0..warps).all(|w| (0..lanes).all(|l| ls.coord(w, l, j) == held(w, l))))
+                .context(UnsupportedSnafu { what: "a transpose that moves elements between threads" })?;
+            let x = self.reg_load(src, j);
+            self.reg_store(dst, k, vec![x]);
         }
         Ok(())
     }

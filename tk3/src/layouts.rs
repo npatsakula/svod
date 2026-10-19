@@ -902,13 +902,13 @@ impl<'a> Infer<'a> {
                     self.demand(dst, want);
                 }
             }
-            TileOp::Transpose { src } => {
-                if let Some(l) = self.lay[src.index()].clone() {
-                    self.demand(dst, l.transposed());
-                } else if let Some(l) = self.lay[dst.index()].clone() {
-                    self.set(src, l.transposed());
-                }
-            }
+            // The result is held under its operand's transposed layout; one
+            // laid otherwise has the operand re-held to match it.
+            TileOp::Transpose { src } => match (self.lay[src.index()].clone(), self.lay[dst.index()].clone()) {
+                (_, Some(l)) => self.demand(src, l.transposed()),
+                (Some(l), None) => self.set(dst, l.transposed()),
+                (None, None) => {}
+            },
             TileOp::Mma { acc, a, b, a_t, .. } if self.group => {
                 let (va, vc) = (self.prog.value(a).clone(), self.prog.value(dst).clone());
                 let atom = self
