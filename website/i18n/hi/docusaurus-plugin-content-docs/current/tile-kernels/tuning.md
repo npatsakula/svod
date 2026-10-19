@@ -19,8 +19,8 @@ configs बचे हों: जब हर compile होने वाला con
 फ़ैसला समय करता है और spill करने वाला kernel भी ग्राफ़ को हरा देता है। एक config की list भी इसी रास्ते से
 जाती है, और कोई op spills की वजह से ग्राफ़ पर नहीं गिरता। Admit हुए configs, अपने variants के साथ (attention
 के लिए key splits, भूखी convolution के लिए reduction splits), वे candidates हैं जिन्हें tune store तब मापता है
-जब कोई device पहली बार किसी shape से मिलता है, और वह उनका समय-क्रम रखता है; फिर चार अग्रणी tiles
-(`config::TWIN_TILES`) की बाक़ी
+जब कोई device पहली बार किसी shape से मिलता है, और वह उनका समय-क्रम रखता है; फिर leader के contender band के भीतर हर tile, ज़्यादा से ज़्यादा आठ
+(`config::TWIN_TILES`), की बाक़ी
 pipelines compile होकर उसके मुक़ाबले मापी जाती हैं, spill करें या न करें (एक tile की pipelines के बीच
 अकेले समय ही फ़ैसला करता है, और थोड़ा spill करती unrolled ring सबसे तेज़ हो सकती है), और सबसे तेज़
 चुनाव बनती है। Attention अपने softmax forms
@@ -76,15 +76,15 @@ Sustain device time में इसलिए नापा जाता है �
 | क्या | मान |
 |---|---|
 | Directory | `$SVOD_TK3_TUNE_DIR`, वरना `$XDG_CACHE_HOME/svod/tk3_tune`, वरना `~/.cache/svod/tk3_tune` |
-| फ़ाइल | हर device और crate version के लिए एक, जैसे `sm_86_28sm-v0.2.0.txt`, पहली line में उसका line format (`format 2`, `tune::FORMAT`); दूसरे format की फ़ाइल पूरी छोड़ दी जाती है |
-| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: `choice` में सबसे तेज़ का `ns` और चले हुए candidates, सबसे तेज़ पहले, `value` में एक मापा हुआ अंक, `admitted` में admission के रखे हुए ranked indices, `first` में पहले clean config का index |
+| फ़ाइल | हर device और crate version के लिए एक, जैसे `sm_86_28sm-v0.2.0.txt`, पहली line में उसका line format (`format 4`, `tune::FORMAT`); दूसरे format की फ़ाइल पूरी छोड़ दी जाती है |
+| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: `choice` में चले हुए candidates, सबसे तेज़ पहले, हर एक `index ns`, `value` में एक मापा हुआ अंक, `admitted` में admission के रखे हुए ranked indices, `first` में पहले clean config का index |
 | Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, जहाँ `device` arch और SM count है (`sm_86-28sm`) और `compiler` device के compiler का digest है (`tune::compiler`) |
 
 एक असली store की दो lines: attention, bf16, shape `[batch, t, tk, heads, kv_heads, d]`, candidate
 0 62.3 µs पर जीता; 4096³ GEMM का admission, उसके clean tiles के ranked indices (छोटा किया हुआ)।
 
 ```text
-choice|attention|sm_86-28sm|BFloat16|1x704x704x8x8x64|23f7784292d1b0a0|9154cc72f03d25cd|1640bd140bf8e08b 62304 0 3 1
+choice|attention|sm_86-28sm|BFloat16|1x704x704x8x8x64|23f7784292d1b0a0|9154cc72f03d25cd|1640bd140bf8e08b 0 62304 3 63010 1 64877
 admitted|gemm|sm_86-28sm|BFloat16|1x4096x4096x4096|47ed81ff601380fe|9154cc72f03d25cd|1f0f4f6116dbeee7 4 10 18 22 30 …
 ```
 

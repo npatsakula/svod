@@ -53,7 +53,7 @@ fn a_winner_round_trips_through_the_store() {
     let ran = Cell::new(false);
     let chosen = TuneStore::at(Some(dir.clone())).select(&k, 3, || 7, timed(&[Some(300), Some(100), None], &ran));
     assert_eq!((chosen, ran.get()), (Some(1), true));
-    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 100 1 0\n", k.line(Kind::Choice, 7)));
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 1 100 0 300\n", k.line(Kind::Choice, 7)));
 
     let again = TuneStore::at(Some(dir.clone()));
     let ran = Cell::new(false);
@@ -150,17 +150,17 @@ fn a_store_hit_compiles_nothing() {
     // Without a device that timed them, what it would have measured, stored
     // as a timing would; with one, its choice is already stored.
     let stored = TuneStore::at(Some(dir.clone())).select(&k, 2, || programs, || vec![Some(9), Some(4)]);
-    let missed = missed.map(|order| order[0]);
+    let missed = missed.map(|timed| timed[0].0);
     assert_eq!(stored, missed.or(Some(1)), "the device's choice, else the stored timing's");
     builds.set(0);
     let mut bench = Bench::default();
     let hit = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
-    assert_eq!((hit.map(|order| order[0]), builds.get(), bench.built.len()), (stored, 2, 0));
+    assert_eq!((hit.map(|timed| timed[0].0), builds.get(), bench.built.len()), (stored, 2, 0));
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A choice line holds the candidates that ran in timed order after the
-/// fastest's time, so a later process knows the leaders, not the winner alone.
+/// A choice line holds the candidates that ran in timed order, each with
+/// its time, so a later process knows the leaders and how close they ran.
 #[test]
 fn a_choice_line_holds_the_timed_order() {
     let dir = scratch("order");
@@ -172,7 +172,7 @@ fn a_choice_line_holds_the_timed_order() {
         .find(|t| t.contains("choice|"))
         .expect("a store file");
     let line = text.lines().find(|l| l.starts_with("choice|")).expect("a choice line");
-    assert!(line.ends_with(" 4 2 0"), "{line}");
+    assert!(line.ends_with(" 2 4 0 9"), "{line}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -252,7 +252,7 @@ fn an_unreadable_line_is_dropped_at_the_next_write() {
     let store = TuneStore::at(Some(dir.clone()));
     assert_eq!(store.entries(&k).len(), 1);
     assert_eq!(store.select(&k, 2, || 1, || vec![Some(9), Some(4)]), Some(1));
-    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 4 1 0\n{kept}\n", k.line(Kind::Choice, 1)));
+    assert_eq!(store_file(&dir), format!("format {FORMAT}\n{} 1 4 0 9\n{kept}\n", k.line(Kind::Choice, 1)));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -397,7 +397,7 @@ fn a_file_of_another_format_is_dropped(written: Option<u32>, kept: bool) {
     let dir = scratch(&format!("format-{written:?}"));
     let k = key(&[2, 2, 2], &[0, 1]);
     let path = dir.join(format!("sm_86_28sm-v{}.txt", env!("CARGO_PKG_VERSION")));
-    let line = format!("{} 100 1 0", k.line(Kind::Choice, 7));
+    let line = format!("{} 1 100 0 300", k.line(Kind::Choice, 7));
     let header = written.map_or(String::new(), |n| format!("format {n}\n"));
     std::fs::write(&path, format!("{header}{line}\n")).unwrap();
     let store = TuneStore::at(Some(dir.clone()));
@@ -408,7 +408,7 @@ fn a_file_of_another_format_is_dropped(written: Option<u32>, kept: bool) {
     let want = if kept {
         format!("{header}{line}\n")
     } else {
-        format!("format {FORMAT}\n{} 4 1 0\n", k.line(Kind::Choice, 7))
+        format!("format {FORMAT}\n{} 1 4 0 9\n", k.line(Kind::Choice, 7))
     };
     assert_eq!(store_file(&dir), want);
     let _ = std::fs::remove_dir_all(dir);
@@ -435,7 +435,7 @@ fn a_gemm_tunes_on_the_device() {
     let dir = scratch("device");
     let start = std::time::Instant::now();
     let chosen = TuneStore::at(Some(dir.clone())).choose(&key, &cfgs, build, &mut Bench::default());
-    let chosen = cfgs[chosen.expect("measured")[0]];
+    let chosen = cfgs[chosen.expect("measured")[0].0];
     eprintln!("tuned {} candidates in {:.1} s: {chosen:?}", cfgs.len(), start.elapsed().as_secs_f64());
     let programs = || fingerprint(&cfgs.iter().map(|&c| build(c)).collect::<Vec<_>>());
     let hit = TuneStore::at(Some(dir.clone())).select(&key, cfgs.len(), programs, || panic!("measured twice"));

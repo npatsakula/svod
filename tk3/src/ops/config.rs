@@ -303,14 +303,15 @@ pub(crate) fn spread<C: Tiled, K: Eq + Hash>(ranked: Vec<(f64, C)>, class: impl 
 /// about 20 ms once the device's clock is up and the ranking cannot be
 /// trusted to put the best within a few (see the module docs).
 pub(crate) const SHORTLIST: usize = 64;
-/// Search bound: the leading tiles of a timing whose other pipelines are
-/// timed after it: a tile enters the shortlist as its first clean pipeline,
-/// and on gfx1201 the 4096³ GEMM's measured best entered as a pipeline 8 %
-/// behind its best, third in the timed order, and lost the shortlist to
-/// another tile. Over three cards' exhaustive sweeps four is the knee: the
-/// best tile sits within the first four on 11 of 17 shapes and a deeper
-/// stage reaches no more until eight, at twice the compiles.
-pub(crate) const TWIN_TILES: usize = 4;
+/// Search bound: the most tiles of a timing whose other pipelines are
+/// timed after it, among those within the tuner's contender band
+/// ([`crate::tune::CONTENDER`]) of the leader: a tile enters the shortlist
+/// as its first clean pipeline, on gfx1201 the 4096³ GEMM's measured best
+/// entered 8 % behind its best and its standing drifts between fourth and
+/// tenth across runs while the top ten sit within 10 %, so a fixed depth
+/// cut it on some runs. Over three cards' exhaustive sweeps eight reaches
+/// every tile a deeper stage would.
+pub(crate) const TWIN_TILES: usize = 8;
 /// Model: blocks per SM a convolution's grid should reach before its
 /// reduction is left whole: its grids are a few hundred blocks.
 const CONV_BLOCKS_PER_SM: usize = 2;

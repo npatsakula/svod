@@ -34,7 +34,7 @@ use crate::lower::Lowering;
 
 /// The store's line format, bumped when a line's meaning changes (a file
 /// without a format line is of the first).
-pub(crate) const FORMAT: u32 = 3;
+pub(crate) const FORMAT: u32 = 4;
 /// Search bound: timed rounds over every candidate after the warm-up, and
 /// the rounds the two leaders then run again.
 const ROUNDS: usize = 4;
@@ -46,8 +46,9 @@ const CUT_FROM: usize = 16;
 /// Search bound: rounds past the first go to the candidates within this
 /// factor of the first round's best; the rest cannot win (a round's best of [`RUNS`] runs
 /// after a sustain sits within a few percent of the candidate's settled
-/// time), and a shortlist is mostly losers.
-const CONTENDER: f64 = 1.2;
+/// time), and a shortlist is mostly losers. The twins stage keeps the tiles
+/// within it of the leader for the same reason.
+pub(crate) const CONTENDER: f64 = 1.2;
 /// Measurement: profiled runs per candidate per round.
 const RUNS: usize = 5;
 /// Measurement: device time of back-to-back runs ahead of each candidate's
@@ -130,8 +131,8 @@ fn once<K: Clone + Eq + Hash, V: Clone>(map: &Once<K, V>, key: &K, init: impl Fn
 /// What a store line records, under its kind, key and fingerprint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
-    /// The candidates that ran, fastest first, and the fastest's device ns.
-    Choice { order: Arc<[usize]>, ns: u64 },
+    /// The candidates that ran, fastest first, each with its device ns.
+    Choice(Arc<[(usize, u64)]>),
     /// A measured number: a probe's cost.
     Value(u64),
     /// The ranked indices admission kept, or the one its search for a
@@ -164,9 +165,7 @@ impl Entry {
     /// The entry's numbers as its line holds them after the key.
     fn render(&self) -> String {
         match self {
-            Entry::Choice { order, ns } => {
-                format!("{ns} {}", order.iter().map(usize::to_string).collect::<Vec<_>>().join(" "))
-            }
+            Entry::Choice(timed) => timed.iter().map(|(i, ns)| format!("{i} {ns}")).collect::<Vec<_>>().join(" "),
             Entry::Value(v) => v.to_string(),
             Entry::Admitted(at) => at.iter().map(usize::to_string).collect::<Vec<_>>().join(" "),
         }
@@ -175,8 +174,8 @@ impl Entry {
     /// The entry a line of `kind` with `numbers` after its key records.
     fn parse(kind: &str, numbers: &[u64]) -> Option<Self> {
         match (kind, numbers) {
-            ("choice", &[ns, ref order @ ..]) if !order.is_empty() => {
-                Some(Entry::Choice { order: order.iter().map(|&i| i as usize).collect(), ns })
+            ("choice", pairs) if !pairs.is_empty() && pairs.len().is_multiple_of(2) => {
+                Some(Entry::Choice(pairs.chunks(2).map(|p| (p[0] as usize, p[1])).collect()))
             }
             ("value", &[v]) => Some(Entry::Value(v)),
             ("admitted", at) if !at.is_empty() => Some(Entry::Admitted(at.iter().map(|&i| i as usize).collect())),
@@ -261,10 +260,10 @@ impl TuneStore {
         programs: impl FnOnce() -> u64,
         measure: impl FnOnce() -> Vec<Option<u64>>,
     ) -> Option<usize> {
-        let within = |entry: &Entry| matches!(entry, Entry::Choice { order, .. } if order.iter().all(|&i| i < count));
-        let timed = |()| ordered(measure()).map(|(order, ns)| Entry::Choice { order, ns });
+        let within = |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _)| i < count));
+        let timed = |()| ordered(measure()).map(Entry::Choice);
         match self.remember(Kind::Choice, key, within, || (programs(), ()), timed)? {
-            Entry::Choice { order, .. } => Some(order[0]),
+            Entry::Choice(timed) => Some(timed[0].0),
             _ => None,
         }
     }
@@ -305,26 +304,26 @@ impl TuneStore {
         })
     }
 
-    /// The indices of `candidates` that ran, fastest first, as
-    /// [`Self::select`] finds them, keyed by the fingerprint of the programs
-    /// `build` makes (each built once); only a store miss compiles them
-    /// (those `bench` has not) and [`time`]s them.
+    /// The indices of `candidates` that ran, fastest first, each with its
+    /// device ns, as [`Self::select`] finds them, keyed by the fingerprint
+    /// of the programs `build` makes (each built once); only a store miss
+    /// compiles them (those `bench` has not) and [`time`]s them.
     pub fn choose<C: Copy + PartialEq>(
         &self,
         key: &TuneKey,
         candidates: &[C],
         build: impl Fn(C) -> Candidate,
         bench: &mut Bench<C>,
-    ) -> Option<Arc<[usize]>> {
+    ) -> Option<Arc<[(usize, u64)]>> {
         let programs = || {
             let built: Vec<Candidate> = candidates.iter().map(|&c| build(c)).collect();
             (fingerprint(&built), built)
         };
         let within =
-            |entry: &Entry| matches!(entry, Entry::Choice { order, .. } if order.iter().all(|&i| i < candidates.len()));
-        let timed = |built| ordered(bench.time(candidates, built)).map(|(order, ns)| Entry::Choice { order, ns });
+            |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _)| i < candidates.len()));
+        let timed = |built| ordered(bench.time(candidates, built)).map(Entry::Choice);
         match self.remember(Kind::Choice, key, within, programs, timed)? {
-            Entry::Choice { order, .. } => Some(order),
+            Entry::Choice(timed) => Some(timed),
             _ => None,
         }
     }
@@ -367,13 +366,12 @@ impl TuneStore {
 }
 
 /// The fastest of candidates' device times as `(index, ns)`.
-/// The candidates that ran, fastest first, with the fastest's ns; `None`
-/// when none did.
-fn ordered(ns: Vec<Option<u64>>) -> Option<(Arc<[usize]>, u64)> {
+/// The candidates that ran, fastest first, each with its ns; `None` when
+/// none did.
+fn ordered(ns: Vec<Option<u64>>) -> Option<Arc<[(usize, u64)]>> {
     let mut ran: Vec<(u64, usize)> = ns.into_iter().enumerate().filter_map(|(i, ns)| Some((ns?, i))).collect();
     ran.sort_unstable();
-    let &(ns, _) = ran.first()?;
-    Some((ran.into_iter().map(|(_, i)| i).collect(), ns))
+    (!ran.is_empty()).then(|| ran.into_iter().map(|(ns, i)| (i, ns)).collect())
 }
 
 /// A candidate compiled on scratch buffers: its plans (`None` when one
