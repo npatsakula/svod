@@ -720,3 +720,41 @@ fn conv2d_rejects_mismatched_operands() {
     let opts = Conv { bias: Some(&b), ..Conv::default() };
     assert!(matches!(tk::conv2d(&x, &w, opts), Err(tk::Error::Shape { operand: "bias", .. })));
 }
+
+/// Key lengths name one key count per batch row: a tensor of another length
+/// is an error (the kernel would read past it where the graph broadcasts).
+#[test_case(&[1]; "one length for two rows")]
+#[test_case(&[3]; "three lengths for two rows")]
+#[test_case(&[2, 1]; "a matrix")]
+fn attention_rejects_key_lengths_off_the_batch(lens: &[usize]) {
+    let q = Tensor::empty(&[2, 16, 4, 64], DType::BFloat16);
+    let kv = Tensor::empty(&[2, 32, 4, 64], DType::BFloat16);
+    let lens = Tensor::empty(lens, DType::Int32);
+    let opts = Attn { keys: KeyMask::Lens(&lens), ..Attn::default() };
+    assert!(matches!(tk::attention(&q, &kv, &kv, opts), Err(tk::Error::Shape { operand: "key lens", .. })));
+}
+
+/// A batch row no key reaches, by a zero key length or a mask hiding every
+/// key, comes out of the kernel as the graph writes it: zeros, not NaN.
+#[test_case(true; "a zero key length")]
+#[test_case(false; "every key masked")]
+fn attention_to_no_key_is_zeros(lens: bool) {
+    if !device() {
+        return;
+    }
+    let (b, t, tk, h, d) = (2, 64, 96, 4, 64);
+    let q = rand(&[b, t, h, d], 30, 1.0, DType::BFloat16);
+    let k = rand(&[b, tk, h, d], 31, 1.0, DType::BFloat16);
+    let v = rand(&[b, tk, h, d], 32, 1.0, DType::BFloat16);
+    let len = Tensor::from_slice([tk as i32, 0]);
+    let visible: Vec<bool> = (0..b * tk).map(|x| x < tk).collect();
+    let mask = Tensor::from_slice(&visible).try_reshape([b, tk]).unwrap();
+    let keys = if lens { KeyMask::Lens(&len) } else { KeyMask::Bool(&mask) };
+    let opts = Attn { keys, ..Attn::default() };
+    let o = tk::attention(&q, &k, &v, opts).unwrap();
+    assert_kernel(&o, "flash_attention");
+    let got = values(&o);
+    assert!(got.iter().all(|x| x.is_finite()), "no NaN");
+    assert!(got[got.len() / 2..].iter().all(|x| *x == 0.0), "the unreached batch is zeros");
+    assert_close("attention to no key", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
+}

@@ -267,7 +267,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let keys_masked = key_lens || !tk.is_multiple_of(bkv);
     let len = match lens {
         Some(lens) if appended > 0 => k.load_scalar(lens, b.clone()).min(tk),
-        Some(lens) => k.load_scalar(lens, b.clone()).max(1).min(tk),
+        Some(lens) => k.load_scalar(lens, b.clone()).min(tk),
         None => Sc::from(tk),
     };
     let (q_stride, kv_stride) = (heads * d, heads_total * d);
@@ -525,7 +525,7 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     };
     match (o, parts) {
         (Some(o), _) => {
-            let out = k.binary(acc, l, BinaryOp::Div);
+            let out = normalized(&mut k, acc, l, bq);
             let out = k.cast::<F32, T>(out);
             let o_view = rows(&mut k, o);
             k.store(o_view, out);
@@ -568,6 +568,17 @@ pub struct CombineSpec {
     pub d: usize,
     pub splits: usize,
     pub cfg: NormCfg,
+}
+
+/// `acc / l` row by row, where a row no key reached (its sum `l` is zero,
+/// and so is its accumulator) comes out as zeros, as the graph writes it,
+/// rather than as the NaN of a division by zero.
+fn normalized(k: &mut Kernel, acc: Regs<F32>, l: Regs<F32>, rows: usize) -> Regs<F32> {
+    let zero = k.zeros::<F32>(Shape::new(rows, 1));
+    let one = k.fill::<F32>(Shape::new(rows, 1), Const::Float(1.0));
+    let empty = k.compare(l, zero, BinaryOp::Eq);
+    let l = k.where_(empty, one, l);
+    k.binary(acc, l, BinaryOp::Div)
 }
 
 /// Parameters in order: `o_part`, `m_part`, `l_part` (f32, as the
@@ -613,7 +624,7 @@ pub fn combine<T: Elem>(spec: &CombineSpec) -> Program {
         });
     }
     let (l, acc) = (l.expect("a split"), acc.expect("a split"));
-    let out = k.binary(acc, l, BinaryOp::Div);
+    let out = normalized(&mut k, acc, l, br);
     let out = k.cast::<F32, T>(out);
     let view = k.view(o, batch_offset(&bb, rows * d), [d, 1], Shape::new(br, d), [bound(rows, br), None]);
     let view = k.at(view, row0, 0);
