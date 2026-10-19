@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use smallvec::smallvec;
-use svod_codegen::llvm::amd::tr::global_load_tr_b128;
+use svod_codegen::llvm::amd::tr::{global_load_tr_b128, global_load_tr_b128_or_zeros};
 use svod_codegen::llvm::nvptx::ops::shfl_bfly;
 use svod_codegen::llvm::nvptx::smem::{
     cp_async_16, cp_async_16_zfill, cp_async_commit, cp_async_wait, ld_global_cg_16, ldmatrix,
@@ -74,9 +74,6 @@ struct Emit<'a> {
     /// A shared allocation's buffer read under another type, per pair.
     typed: HashMap<(usize, ScalarDType), Arc<UOp>>,
     scratch: HashMap<ScalarDType, (Arc<UOp>, usize)>,
-    /// The registers (by buffer and index) a transposing load filled from
-    /// where its view's bounds may not reach ([`Self::tr_load_regs`]).
-    unchecked: HashMap<(u64, u32), Unchecked>,
     lane: Arc<UOp>,
     warp: Arc<UOp>,
     tid: Arc<UOp>,
@@ -106,17 +103,6 @@ struct View {
     /// Added to a shared view's offset: a warp's region of the relayout
     /// scratch inside a [`Stmt::Warps`].
     region: Option<Arc<UOp>>,
-}
-
-/// A register a transposing load filled from where its view's bounds may
-/// not reach: zeroed under `inside` where it is read rather than where it
-/// lands, so the zeroing waits for the load no earlier than its reader
-/// does. `whole` holds where the view holds its whole tile.
-#[derive(Clone)]
-struct Unchecked {
-    buf: Arc<UOp>,
-    inside: Arc<UOp>,
-    whole: Option<Arc<UOp>>,
 }
 
 /// A register's coordinate in its tile: the part the lane and warp decide,
@@ -186,7 +172,6 @@ impl<'a> Emit<'a> {
             smem: vec![],
             typed: HashMap::new(),
             scratch: HashMap::new(),
-            unchecked: HashMap::new(),
             last: tid.clone(),
             lane,
             warp,
@@ -490,49 +475,10 @@ impl<'a> Emit<'a> {
 
     /// Registers are scalar accesses (the coalescer never widens them).
     fn reg_load(&mut self, v: ValId, j: u32) -> Arc<UOp> {
-        self.reg_read(v, j, true)
-    }
-
-    /// Register `j` of `v`, an unchecked one zeroed outside its view's
-    /// bounds where `checked` ([`Unchecked`]).
-    fn reg_read(&mut self, v: ValId, j: u32, checked: bool) -> Arc<UOp> {
         let buf = self.reg_buf(v);
         let idx = self.access(&buf, &c32(j as i64), 1);
         let tag = self.next_tag();
-        let x = self.push(load_at(&idx, tag));
-        match self.unchecked.get(&(buf.id, j)).filter(|_| checked) {
-            Some(u) => UOp::try_where(u.inside.clone(), x.clone(), x.const_like(0)).expect("zeroed"),
-            None => x,
-        }
-    }
-
-    /// Zero the unchecked registers whose gates are listed at `level` or
-    /// deeper, in place: past the level's end no read reaches the gates.
-    fn settle(&mut self, level: usize) {
-        let deep = |this: &Self, u: &Unchecked| this.levels.get(&u.inside.id).is_some_and(|&l| l >= level);
-        let mut settled: Vec<(u32, Unchecked)> =
-            self.unchecked.iter().filter(|(_, u)| deep(self, u)).map(|(&(_, j), u)| (j, u.clone())).collect();
-        settled.sort_by_key(|(j, u)| (u.buf.id, *j));
-        for (j, u) in settled {
-            self.unchecked.remove(&(u.buf.id, j));
-            let idx = self.access(&u.buf, &c32(j as i64), 1);
-            let tag = self.next_tag();
-            let x = self.push(load_at(&idx, tag));
-            let x = UOp::try_where(u.inside, x.clone(), x.const_like(0)).expect("zeroed");
-            self.push(store_at(&idx, vec![x]));
-        }
-    }
-
-    /// Where the unchecked registers of `v`, all of one view, may be read as
-    /// they are: the view holding its whole tile. `None` for a value
-    /// without them or with another view's.
-    fn whole(&mut self, v: ValId) -> Option<Arc<UOp>> {
-        let buf = self.reg_buf(v);
-        let regs = self.layout(v).regs();
-        let wholes: Vec<Option<Arc<UOp>>> =
-            (0..regs).filter_map(|j| self.unchecked.get(&(buf.id, j))).map(|u| u.whole.clone()).collect();
-        let whole = wholes.first().cloned().flatten()?;
-        wholes.iter().all(|w| w.as_ref() == Some(&whole)).then_some(whole)
+        self.push(load_at(&idx, tag))
     }
 
     fn reg_loads(&mut self, v: ValId, j: u32, w: u32) -> Vec<Arc<UOp>> {
@@ -544,11 +490,10 @@ impl<'a> Emit<'a> {
     /// backend keeps it in the core's register file (gfx942's AGPRs) instead
     /// of moving each element through a vector register every trip.
     fn reg_load_vec(&mut self, v: ValId, j: u32, w: u32) -> Arc<UOp> {
-        let buf = self.reg_buf(v);
-        if w == 1 || (j..j + w).any(|r| self.unchecked.contains_key(&(buf.id, r))) {
-            let x = self.reg_loads(v, j, w);
-            return if w == 1 { x[0].clone() } else { UOp::stack(x.into_iter().collect()) };
+        if w == 1 {
+            return self.reg_load(v, j);
         }
+        let buf = self.reg_buf(v);
         let idx = self.access(&buf, &c32(j as i64), w);
         let tag = self.next_tag();
         self.push(load_at(&idx, tag))
@@ -560,7 +505,6 @@ impl<'a> Emit<'a> {
             return self.reg_store(v, j, vec![val]);
         }
         let buf = self.reg_buf(v);
-        (j..j + w).for_each(|r| drop(self.unchecked.remove(&(buf.id, r))));
         let idx = self.access(&buf, &c32(j as i64), w);
         self.push(idx.store(val));
     }
@@ -568,7 +512,6 @@ impl<'a> Emit<'a> {
     fn reg_store(&mut self, v: ValId, j: u32, vals: Vec<Arc<UOp>>) {
         let buf = self.reg_buf(v);
         for (e, val) in vals.into_iter().enumerate() {
-            self.unchecked.remove(&(buf.id, j + e as u32));
             let idx = self.access(&buf, &c32(j as i64 + e as i64), 1);
             self.push(store_at(&idx, vec![val]));
         }
@@ -850,7 +793,6 @@ impl<'a> Emit<'a> {
                     self.headers.push(self.list.len());
                     self.guards.push(self.level());
                     self.block(branch)?;
-                    self.settle(self.level());
                     let level = self.guards.pop().expect("the branch just opened");
                     self.headers.pop();
                     // What was listed under the branch is out of reach past it.
@@ -898,7 +840,6 @@ impl<'a> Emit<'a> {
     }
 
     fn close_range(&mut self, range: Arc<UOp>) {
-        self.settle(self.level());
         self.headers.pop();
         let end = self.last.clone().end(smallvec![range]);
         self.push(end);
@@ -1011,10 +952,7 @@ impl<'a> Emit<'a> {
             (Tier::Smem, Tier::Global) => self.fill(dst, src, mode, scope),
             (Tier::Reg, Tier::Smem) => self.gather(dst, src),
             (Tier::Reg, Tier::Global) => self.load_regs(dst, src, mode),
-            (Tier::Smem | Tier::Global, Tier::Reg) => {
-                self.store_regs(dst, src);
-                Ok(())
-            }
+            (Tier::Smem | Tier::Global, Tier::Reg) => self.store_regs(dst, src),
             (Tier::Reg, Tier::Reg) => self.relayout(dst, src),
             (d, s) => UnsupportedSnafu { what: format!("a {s:?} → {d:?} copy") }.fail(),
         }
@@ -1233,10 +1171,13 @@ impl<'a> Emit<'a> {
     }
 
     /// The register permutation under which `l` is what transposing 16×16
-    /// loads leave a row-major 16-bit `view` in, where the target has them.
+    /// loads leave a row-major 16-bit `view` in, where the target has them
+    /// and a column bound ends a 16-byte run, which such a load reads whole.
     fn transposing(&self, l: &TileLayout, view: &View) -> Option<Vec<u32>> {
         let [sub_r, sub_c] = l.sub_shape();
-        let global = matches!(view.place, Some(Place::Global { .. })) && self.along(view) == (Axis::Col, true);
+        let Some(Place::Global { bounds, .. }) = view.place else { return None };
+        let runs = bounds[1].is_none_or(|b| multiple_of(self.prog, b, 16 / view.dtype.bytes() as i64));
+        let global = self.along(view) == (Axis::Col, true) && runs;
         if !self.low.device.target.tr_load || !global || view.dtype.bytes() != 2 || sub_r % 16 != 0 || sub_c % 16 != 0 {
             return None;
         }
@@ -1247,92 +1188,37 @@ impl<'a> Emit<'a> {
 
     /// Global → registers by transposing loads, one per 16×16 block, its
     /// lanes addressing the block's rows in [`frag::global_tr_rows`] order and
-    /// receiving column runs. A lane whose row is past the view's bounds, or
-    /// a gathered row outside its map, addresses the operand's first
-    /// elements instead; every element received from outside reads zero,
-    /// judged at its own coordinate, since a lane receives other lanes' rows,
-    /// and where it is read ([`Unchecked`]).
+    /// receiving column runs. Each 16-byte row run is one lane's address and
+    /// reaches the lanes it scatters to whole, so a lane whose run lies past
+    /// the view's bounds, or whose gathered row is outside its map, addresses
+    /// a run of zeros instead and every element it supplies reads zero.
     fn tr_load_regs(&mut self, dst: ValId, s: &View, l: &TileLayout, perm: &[u32]) -> Result<()> {
-        let whole = self.inside_whole(s);
         let [sub_r, sub_c] = l.sub_shape();
         let rows = TileLayout { frag: frag::global_tr_rows(), reps: [sub_r / 16, sub_c / 16], warps: l.warps.clone() };
         for block in 0..rows.regs() {
             let c = self.coord(&rows, block);
             let (off, gate) = self.address(s, &c);
-            let bounded = gate.is_some();
-            let off = match gate {
-                Some(g) => self.hoist(UOp::try_where(g, off, c32(0)).expect("safe offset")),
-                None => off,
-            };
             let idx = self.access(&s.buf, &off, 1);
-            let elems = global_load_tr_b128(&idx, s.dtype);
+            let elems = match gate {
+                Some(inside) => global_load_tr_b128_or_zeros(&idx, &inside, s.dtype),
+                None => global_load_tr_b128(&idx, s.dtype),
+            };
             for (jd, &js) in perm.iter().enumerate() {
-                if js / 8 != block {
-                    continue;
-                }
-                self.reg_store(dst, jd as u32, vec![elems[(js % 8) as usize].clone()]);
-                if bounded {
-                    let held = self.coord(l, jd as u32);
-                    let inside = self.inside_shifted(s, &held).expect("a bounded view");
-                    let (inside, buf) = (self.hoist(inside), self.reg_buf(dst));
-                    self.unchecked.insert((buf.id, jd as u32), Unchecked { buf, inside, whole: whole.clone() });
+                if js / 8 == block {
+                    self.reg_store(dst, jd as u32, vec![elems[(js % 8) as usize].clone()]);
                 }
             }
         }
         Ok(())
     }
 
-    /// Whether a plain bounded view holds its whole tile: the steady state
-    /// of a loop whose last step overhangs the bounds. `None` for a gathered
-    /// view or one without bounds.
-    fn inside_whole(&mut self, view: &View) -> Option<Arc<UOp>> {
-        let Some(Place::Global { bounds, rows: None, .. }) = &view.place else { return None };
-        let extents = [view.shape.rows, view.shape.cols];
-        let inside = bounds
-            .iter()
-            .zip(extents)
-            .filter_map(|(b, n)| b.map(|b| (self.sc(b), n)))
-            .map(|(b, n)| c32(n as i64 - 1).try_cmplt(&b).expect("bound compare"));
-        inside.reduce(|a, b| a.try_and_op(&b).expect("and")).map(|g| self.hoist(g))
-    }
-
-    /// [`Self::inside`] with a plain view's bounds less the register's
-    /// constant, compared with the lane's part alone: a uniform bound per
-    /// register against one lane value, where the full coordinates would
-    /// each hold a register.
-    fn inside_shifted(&mut self, view: &View, c: &Coord) -> Option<Arc<UOp>> {
-        let Some(Place::Global { bounds, rows: None, .. }) = &view.place else { return self.inside(view, c) };
-        let shifted = [(bounds[0], &c.row, c.dr), (bounds[1], &c.col, c.dc)].map(|(b, lane, d)| {
-            b.map(|b| {
-                let bound = self.sc(b);
-                let bound = if d == 0 { bound } else { self.hoist(bound.try_sub(&c32(d)).expect("shifted bound")) };
-                lane.try_cmplt(&bound).expect("bound compare")
-            })
-        });
-        shifted.into_iter().flatten().reduce(|a, b| a.try_and_op(&b).expect("and"))
-    }
-
-    /// Registers → shared or global. Unchecked registers of one view are
-    /// stored as they are, and again zeroed outside the bounds under one
-    /// branch on the view not holding its whole tile: the steady state
-    /// stores as an unbounded view does.
-    fn store_regs(&mut self, dst: ValId, src: ValId) {
-        let Some(whole) = self.whole(src) else { return self.store_runs(dst, src, true) };
-        self.store_runs(dst, src, false);
-        let outside = self.hoist(whole.not());
-        let tag = self.next_tag();
-        let if_ = self.push(UOp::if_(outside, smallvec![]).rtag(Some(smallvec![tag as usize])));
-        self.store_runs(dst, src, true);
-        self.push(UOp::endif(if_));
-    }
-
-    fn store_runs(&mut self, dst: ValId, src: ValId, checked: bool) {
+    fn store_regs(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let l = self.layout(src).clone();
         let d = self.view(dst);
         for (j, w) in self.runs(&l, &d) {
             let c = self.coord(&l, j);
             let (off, gate) = self.address(&d, &c);
-            let vals = (0..w).map(|e| self.reg_read(src, j + e, checked)).collect();
+            let vals = self.reg_loads(src, j, w);
             match gate {
                 Some(gate) => {
                     let tag = self.next_tag();
@@ -1343,6 +1229,7 @@ impl<'a> Emit<'a> {
                 None => self.mem_store(&d.buf, &off, vals),
             }
         }
+        Ok(())
     }
 
     fn relayout(&mut self, dst: ValId, src: ValId) -> Result<()> {
@@ -1980,6 +1867,18 @@ fn as_word(value: &Arc<UOp>) -> (Arc<UOp>, impl Fn(Arc<UOp>) -> Arc<UOp>) {
         }
     };
     (word, back)
+}
+
+/// Whether scalar `id` is a multiple of `m` whatever its inputs.
+fn multiple_of(prog: &Program, id: ScalarId, m: i64) -> bool {
+    match prog.scalar(id) {
+        Scalar::Const(v) => v % m == 0,
+        Scalar::Bin(BinOp::Add | BinOp::Sub | BinOp::Min | BinOp::Max, a, b) => {
+            multiple_of(prog, *a, m) && multiple_of(prog, *b, m)
+        }
+        Scalar::Bin(BinOp::Mul, a, b) => multiple_of(prog, *a, m) || multiple_of(prog, *b, m),
+        _ => false,
+    }
 }
 
 /// Whether scalar `id` reads [`Scalar::Row`], memoized in `memo`.

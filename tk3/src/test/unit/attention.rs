@@ -563,12 +563,35 @@ fn kernel_matches_the_program(spec: AttnSpec, lens: &[i64]) {
     on_device(&spec, lens, target);
 }
 
+/// The cache operand's first elements a decoder step never reads (its rows
+/// map past the cache's first row) are an infinity and a NaN, as memory
+/// nothing initialised may hold, and its last key block is partial: the
+/// kernel reads zeros past the keys, never those elements, so its output is
+/// finite and matches the program's, through the transposing loads on RDNA4.
+#[test_case(FaCfg { splits: 4, ..FaCfg::new(16, 16, 2) }; "a decoder step over four splits")]
+#[test_case(key_warps(4, 16); "four key warps")]
+fn a_non_finite_unread_element_never_reaches_the_output(cfg: FaCfg) {
+    let Some(target) = super::device_target() else { return };
+    let spec = with(cfg, cached(1, 100, [4, 4, 64], true, 0, 1));
+    let spec = AttnSpec { cfg: FaCfg { stages: target.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
+    let mut c = case(spec, &[100, 37]);
+    assert!(c.row_map.iter().all(|&r| r > 0), "no batch reads the cache's first row");
+    c.v[0] = f64::INFINITY;
+    c.v[1] = f64::NAN;
+    let bits = on_device_case(c, target);
+    assert!(bits.iter().all(|&b| f32::from_bits(u32::from(b) << 16).is_finite()), "a non-finite output");
+}
+
 /// `spec`'s kernel on the device against the program in the interpreter
 /// (within 2e-2 of it), its bf16 output's bits returned.
 fn on_device(spec: &AttnSpec, lens: &[i64], target: Target) -> Vec<u16> {
-    let spec = spec.clone();
+    on_device_case(case(spec.clone(), lens), target)
+}
+
+/// [`on_device`] of the parameters `c` holds.
+fn on_device_case(c: Case, target: Target) -> Vec<u16> {
+    let spec = c.spec.clone();
     let batch = spec.batch.capacity();
-    let c = case(spec.clone(), lens);
     let raw = run(&flash_attention(&spec), params(&c), &[("b", batch as i64)]).unwrap();
     let want = output(&c, raw.clone(), batch as i64);
     let lowering = spec.cfg.lowering(&declared(target.clone()));
