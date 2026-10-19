@@ -3,7 +3,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, LayerNorm, Linear, Module};
-use svod_tk3::ops::{self, Attn, Cache, KeyMask};
+use svod_tk::ops::{self, Attn, Cache, KeyMask};
 
 use crate::init::{Bias, fan_in_uniform, layer_norm, linear};
 use crate::state::{scope_index, scoped, scoped_index};

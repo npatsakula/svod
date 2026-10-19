@@ -3,11 +3,11 @@
 //! run at the base and at the change, then `--diff` the two.
 //!
 //! ```text
-//! cargo run -p svod-tk3 --release --example tk3_digest -- --out DIR [--targets sm_86,gfx942] [--full]
-//! cargo run -p svod-tk3 --release --example tk3_digest -- --diff DIR_A DIR_B
+//! cargo run -p svod-tk --release --example tk_digest -- --out DIR [--targets sm_86,gfx942] [--full]
+//! cargo run -p svod-tk --release --example tk_digest -- --diff DIR_A DIR_B
 //! ```
 //!
-//! The kernels are `svod_tk3::sweep::digested` (every family, the planner's
+//! The kernels are `svod_tk::sweep::digested` (every family, the planner's
 //! shortlists, the attention, convolution, norm, heads and probe variants)
 //! under the declared costs, on the sweep's ten targets unless `--targets`
 //! names some. Each target gets `DIR/<target>/digests.tsv` (an FNV-1a digest
@@ -22,7 +22,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
-use svod_tk3::sweep::{self, Diff};
+use svod_tk::sweep::{self, Diff};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 

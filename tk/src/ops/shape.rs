@@ -24,7 +24,7 @@ pub enum Plan<C> {
 /// Why the graph op runs instead of a kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fallback {
-    /// No tk3 target for the device.
+    /// No tk target for the device.
     Target,
     /// f32 (precision policy) or another type without a kernel on the target.
     Dtype,

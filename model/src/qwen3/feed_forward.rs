@@ -3,13 +3,13 @@
 //! The checkpoint stores `gate_proj` and `up_proj` separately; they read the
 //! same input, so they are stacked gate over up into one `[2I, H]` weight at
 //! load, and the GEMM that reads it writes `silu(gate)·up` from its epilogue
-//! where the tile kernel runs ([`svod_tk3::ops::Linear::gated`]). The state
+//! where the tile kernel runs ([`svod_tk::ops::Linear::gated`]). The state
 //! dict keeps the published two-key layout.
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Module, StateDict, get_tensor, prefixed};
-use svod_tk3::ops::{self, Act};
+use svod_tk::ops::{self, Act};
 
 use crate::init::fan_in_uniform;
 

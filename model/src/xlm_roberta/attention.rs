@@ -11,7 +11,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
-use svod_tk3::ops::{self, Attn, KeyMask};
+use svod_tk::ops::{self, Attn, KeyMask};
 
 use crate::init::{fan_in_uniform, zeros};
 

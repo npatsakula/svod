@@ -177,7 +177,7 @@ fn check_gemm(device: &Device, m: usize, n: usize, k: usize, cfg: GemmCfg) -> Ve
     got
 }
 
-/// Throughput probe of tk3 GEMM configs at 4096³ bf16: the configs the
+/// Throughput probe of tk GEMM configs at 4096³ bf16: the configs the
 /// tuner admits on the device (the sm_86 measured set on `cp.async`
 /// targets) and the tuner's pick; prints TFLOP/s and never asserts (run
 /// with `--ignored --nocapture`). tk1's `gemm_nt`, last measured here on
@@ -253,7 +253,9 @@ fn gemm_throughput_probe() {
         let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
         let picked = if cfg == pick { " (tuner's pick)" } else { "" };
         plans.push((
-            format!("tk3 {bm}x{bn}x{bk} s{stages} {wr}x{wc} group_m={group_m} unroll={unroll} {core:?} crews={crews}{picked}"),
+            format!(
+                "tk {bm}x{bn}x{bk} s{stages} {wr}x{wc} group_m={group_m} unroll={unroll} {core:?} crews={crews}{picked}"
+            ),
             out.prepare().unwrap(),
         ));
     }
@@ -330,7 +332,7 @@ fn gemm_candidates_probe() {
     }
 }
 
-/// Host-side cost of a tk3 GEMM against the graph GEMM: building, lowering
+/// Host-side cost of a tk GEMM against the graph GEMM: building, lowering
 /// (memoized after the first call) and preparing, then the wall time of the
 /// first executions of a fresh plan with dynamic and with static shared
 /// memory; prints milliseconds and never asserts.
@@ -360,7 +362,7 @@ fn first_execution_probe() {
         };
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(plain_gemm(m, n, k, cfg), &cfg.lowering(&device), &[&a_t, &b_t, &c_t]).unwrap();
-        plans.push((format!("tk3 {bm}x{bn} s{stages}"), out.prepare().unwrap()));
+        plans.push((format!("tk {bm}x{bn} s{stages}"), out.prepare().unwrap()));
     }
     let a2 = a_t.try_reshape([m, k]).unwrap();
     let b2 = b_t.try_reshape([n, k]).unwrap();
@@ -383,7 +385,7 @@ fn first_execution_probe() {
         let prepared = t.elapsed();
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
         eprintln!(
-            "tk3 #{i}: build {:.2} ms, debug text {:.2} ms ({} bytes), lower + bind {:.2} ms, prepare {:.2} ms",
+            "tk #{i}: build {:.2} ms, debug text {:.2} ms ({} bytes), lower + bind {:.2} ms, prepare {:.2} ms",
             ms(built),
             ms(formatted - built),
             text.len(),

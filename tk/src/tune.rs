@@ -3,15 +3,15 @@
 //! is kept in the process memo and on disk.
 //!
 //! The store is one line per [`Entry`] (`kind|key numbers`) under a
-//! `format N` line ([`FORMAT`]) in `$SVOD_TK3_TUNE_DIR` (else
-//! `$XDG_CACHE_HOME/svod/tk3_tune`, else `$HOME/.cache/svod/tk3_tune`), one
+//! `format N` line ([`FORMAT`]) in `$SVOD_TK_TUNE_DIR` (else
+//! `$XDG_CACHE_HOME/svod/tk_tune`, else `$HOME/.cache/svod/tk_tune`), one
 //! file per device and crate version. A line's key carries a digest of the
 //! device's compiler ([`compiler`]) and a fingerprint of the kernels the
 //! candidates emit ([`fingerprint`]), so a toolchain or kernel change
 //! re-measures and nothing else does. An unreadable or
 //! unwritable store is a miss, never an error; a line the store cannot read
 //! is dropped at its next write, and a file of another format whole.
-//! `SVOD_TK3_TUNE=0`, or [`scoped`] on a thread, turns candidate timing off:
+//! `SVOD_TK_TUNE=0`, or [`scoped`] on a thread, turns candidate timing off:
 //! the first ranked config that compiles without spilling is used (that
 //! verdict is still stored), while a device's probes still measure.
 
@@ -405,9 +405,9 @@ impl TuneStore {
         static STORE: OnceLock<TuneStore> = OnceLock::new();
         STORE.get_or_init(|| {
             let var = |name| std::env::var_os(name).map(PathBuf::from);
-            let root = var("SVOD_TK3_TUNE_DIR")
-                .or_else(|| var("XDG_CACHE_HOME").map(|c| c.join("svod/tk3_tune")))
-                .or_else(|| var("HOME").map(|h| h.join(".cache/svod/tk3_tune")));
+            let root = var("SVOD_TK_TUNE_DIR")
+                .or_else(|| var("XDG_CACHE_HOME").map(|c| c.join("svod/tk_tune")))
+                .or_else(|| var("HOME").map(|h| h.join(".cache/svod/tk_tune")));
             Self::at(root.filter(|dir| std::fs::create_dir_all(dir).is_ok()))
         })
     }
@@ -890,10 +890,10 @@ thread_local! {
     static SCOPED: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// The innermost [`scoped`] setting on this thread, else `SVOD_TK3_TUNE`
+/// The innermost [`scoped`] setting on this thread, else `SVOD_TK_TUNE`
 /// is not `0`.
 pub fn enabled() -> bool {
-    SCOPED.get().unwrap_or_else(|| std::env::var("SVOD_TK3_TUNE").map_or(true, |v| v != "0"))
+    SCOPED.get().unwrap_or_else(|| std::env::var("SVOD_TK_TUNE").map_or(true, |v| v != "0"))
 }
 
 /// `f` with measuring on or off on this thread, over the environment; the

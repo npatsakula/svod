@@ -810,7 +810,7 @@ fn a_load_crosses_a_barrier(asm: &str) -> bool {
     false
 }
 
-/// A tk3 barrier fences shared memory only, so the one-slot register-staged
+/// A tk barrier fences shared memory only, so the one-slot register-staged
 /// trip's barrier between its products and its commit leaves the next step's
 /// loads in flight. A plain workgroup release fence on RDNA would wait for
 /// them first (`s_wait_loadcnt 0x0` on gfx12, `vmcnt(0)` on gfx11); CDNA's

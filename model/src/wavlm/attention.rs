@@ -26,7 +26,7 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::nn::{Layer, Linear, Module};
 use svod_tensor::{Tensor, s};
-use svod_tk3::ops::{self, Attn};
+use svod_tk::ops::{self, Attn};
 
 use crate::init::{Bias, linear, ones};
 

@@ -11,7 +11,7 @@
 
 use svod_tensor::Tensor;
 use svod_tensor::nn::{LayerNorm, Module};
-use svod_tk3::ops;
+use svod_tk::ops;
 
 use super::attention::ModernBertAttention;
 use super::error::Result;

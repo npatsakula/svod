@@ -72,7 +72,7 @@ fn line(device: &str, op: &str, programs: &str, fs: u64) -> String {
 
 /// A scratch directory holding `lines` as the store file of `target`'s device.
 fn store(name: &str, target: &Target, lines: &[String]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("svod-tk3-offline-{}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("svod-tk-offline-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let file = TuneStore::at(Some(dir.clone())).file(&tune::device(target)).expect("a rooted store");

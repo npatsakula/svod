@@ -29,8 +29,8 @@ pub enum Error {
     Hub { source: hf_hub::HFError },
     #[snafu(display("{source}"), context(false))]
     Ops {
-        #[snafu(source(from(svod_tk3::ops::Error, Box::new)))]
-        source: Box<svod_tk3::ops::Error>,
+        #[snafu(source(from(svod_tk::ops::Error, Box::new)))]
+        source: Box<svod_tk::ops::Error>,
     },
 }
 

@@ -127,11 +127,11 @@ fn cached_step_key_lengths_admit_only_prefix_and_appended_key() {
 }
 
 #[test]
-#[ignore = "GPU: the op layer's cached self/cross attention vs generic SDPA on a tk3 device"]
+#[ignore = "GPU: the op layer's cached self/cross attention vs generic SDPA on a tk device"]
 fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
     let device = Tensor::empty(&[1], DType::Float32).device();
-    if !svod_tk3::ops::supported(&device) {
-        eprintln!("skip: {device:?} has no tk3 kernels");
+    if !svod_tk::ops::supported(&device) {
+        eprintln!("skip: {device:?} has no tk kernels");
         return;
     }
 

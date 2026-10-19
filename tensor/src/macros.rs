@@ -1,5 +1,5 @@
 //! Declarative helpers for **custom (hand-built) kernels** — the generic
-//! definition/check surface any kernel author (e.g. the `svod-tk3` tile kernels) reuses.
+//! definition/check surface any kernel author (e.g. the `svod-tk` tile kernels) reuses.
 //!
 //! The *definition* half is the runtime helper [`Tensor::graph_kernel`](crate::Tensor::graph_kernel)
 //! (wrap a SINK builder as an `Op::Call` graph node). This module adds the *check*
@@ -22,9 +22,9 @@
 ///
 /// ```ignore
 /// use svod_tensor::{Result, Tensor};
-/// use svod_tk3::ops::{Attn, attention};
+/// use svod_tk::ops::{Attn, attention};
 ///
-/// // tk3 takes `[B, T, H, D]`; the graph op takes `[B, H, T, D]`.
+/// // tk takes `[B, T, H, D]`; the graph op takes `[B, H, T, D]`.
 /// fn causal_sdpa(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
 ///     let heads_first = |t: &Tensor| t.try_transpose(1, 2);
 ///     let (q, k, v) = (heads_first(q)?, heads_first(k)?, heads_first(v)?);

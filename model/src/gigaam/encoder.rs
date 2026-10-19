@@ -3,7 +3,7 @@ use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, LayerNorm, Linear, Module, Pad1d, StateDict, get_tensor, prefixed};
-use svod_tk3::ops::{self, Act, Attn, Cache, Chunk, KeyMask};
+use svod_tk::ops::{self, Act, Attn, Cache, Chunk, KeyMask};
 
 use crate::init::{Bias, fan_in_uniform, layer_norm, ones, zeros};
 use crate::state::{scoped, scoped_index};

@@ -8,12 +8,12 @@ use test_case::test_case;
 
 use crate::yolo::{Yolo26Detect, YoloBottleneck, YoloConfig, YoloConv, YoloScale};
 
-/// Whether `device` runs tk3 kernels at all; a shape can still take the graph.
+/// Whether `device` runs tk kernels at all; a shape can still take the graph.
 pub(super) fn tk_device(device: &DeviceSpec) -> bool {
-    svod_tk3::ops::supported(device)
+    svod_tk::ops::supported(device)
 }
 
-/// The tk3 kernels in `t`'s graph whose name starts with `name`, counted before
+/// The tk kernels in `t`'s graph whose name starts with `name`, counted before
 /// it is realized.
 pub(super) fn tk_calls(t: &Tensor, name: &str) -> usize {
     let named = |info: &svod_ir::CallInfo| info.name.as_deref().is_some_and(|n| n.starts_with(name));

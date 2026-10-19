@@ -190,7 +190,7 @@ fn attention_matches_reference_formula() {
     }
 }
 
-/// The 16-bit forward (tk3's flash attention with the gated bias on a GPU,
+/// The 16-bit forward (tk's flash attention with the gated bias on a GPU,
 /// the graph elsewhere) against the f32 formula: pruned heads of width 64,
 /// two batches, a length off every tile.
 #[test_case(DType::Float16; "f16")]

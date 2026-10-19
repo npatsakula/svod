@@ -226,7 +226,7 @@ fn qwen3_0_6b_structural() -> Qwen3Config {
     }
 }
 
-/// A config the tk3 kernels apply to on a supported device: a 128-wide hidden
+/// A config the tk kernels apply to on a supported device: a 128-wide hidden
 /// state and head dim, and grouped query heads.
 fn fusable_cfg() -> Qwen3Config {
     Qwen3Config {

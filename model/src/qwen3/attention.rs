@@ -10,7 +10,7 @@
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, Module, RmsNorm, StateDict, get_tensor, prefixed};
-use svod_tk3::ops::{self, Attn, Qkv};
+use svod_tk::ops::{self, Attn, Qkv};
 
 use crate::init::fan_in_uniform;
 

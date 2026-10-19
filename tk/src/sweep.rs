@@ -1,5 +1,5 @@
 //! The kernels the host sweep lowers, shared by the tests and the
-//! `tk3_digest` tool: every family the op layer plans per target
+//! `tk_digest` tool: every family the op layer plans per target
 //! ([`families`], [`group_families`]) and, for a byte-identical refactor
 //! gate, the wider set of the planner's shortlists and the attention,
 //! convolution, norm, heads and probe variants ([`digested`]), all under
@@ -275,7 +275,7 @@ pub fn try_render(prog: Program, lowering: &Lowering) -> Result<String, svod_cod
 }
 
 /// The targets of the refactor sweep, by the names the gate files them
-/// under: one of each CUDA generation and AMD family tk3 has kernels for.
+/// under: one of each CUDA generation and AMD family tk has kernels for.
 pub fn targets() -> Vec<(&'static str, Target)> {
     let cuda = |major, minor, sms| Target::offline(GpuArch::Cuda(CudaArch { major, minor }), sms, 1);
     vec![

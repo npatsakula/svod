@@ -1000,7 +1000,7 @@ fn decode_throughput_probe() {
             };
             let opts = Attn { keys: KeyMask::Lens(&lens), cache: Some(cache), splits, ..Attn::default() };
             let o = tk::attention(&q, &self_k, &self_v, opts).unwrap();
-            plans.push((format!("tk3 self {name}"), o.prepare().unwrap()));
+            plans.push((format!("tk self {name}"), o.prepare().unwrap()));
             let cache = Cache {
                 head_start: layer * heads,
                 kv_heads: heads,
@@ -1010,7 +1010,7 @@ fn decode_throughput_probe() {
             };
             let o =
                 tk::attention(&q, &cross_k, &cross_v, Attn { cache: Some(cache), splits, ..Attn::default() }).unwrap();
-            plans.push((format!("tk3 cross {name}"), o.prepare().unwrap()));
+            plans.push((format!("tk cross {name}"), o.prepare().unwrap()));
         }
         let warm = std::time::Instant::now();
         while warm.elapsed().as_millis() < 500 {

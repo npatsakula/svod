@@ -39,7 +39,7 @@ fn repeated_names_are_numbered() {
     assert_eq!(names, [first.to_string(), format!("{first} #2"), format!("{first} #3")]);
 }
 
-/// The sweep lists ten targets tk3 has kernels for, and on each its kernel
+/// The sweep lists ten targets tk has kernels for, and on each its kernel
 /// set holds every family under names that tell its launches apart.
 #[test]
 fn every_target_digests_its_families_under_unique_names() {

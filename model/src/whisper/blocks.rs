@@ -5,7 +5,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Linear;
-use svod_tk3::ops::{self, Act};
+use svod_tk::ops::{self, Act};
 
 use super::error::Result;
 

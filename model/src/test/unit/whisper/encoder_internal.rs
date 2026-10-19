@@ -36,7 +36,7 @@ fn encoder_plan_has_one_flash_attention_per_block() {
     // The encoder gates on its activations' device, which follows the weights
     // onto the process default device.
     let device = svod_dtype::default_device::default_device();
-    if !svod_tk3::ops::supported(&device) {
+    if !svod_tk::ops::supported(&device) {
         eprintln!("skipping: no tile kernels on {device:?}");
         return;
     }

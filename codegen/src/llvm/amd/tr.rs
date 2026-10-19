@@ -2,7 +2,7 @@
 //! wave reads 16 bytes of 16-bit elements, and each group of eight lanes
 //! receives the 8×8 block its rows form transposed, lane `k` of the group
 //! taking element `k` of every row. Verified against clang 22 at `gfx1201`
-//! and on an RX 9070 XT (tk3 `transposing_loads_land_as_their_layout`).
+//! and on an RX 9070 XT (tk `transposing_loads_land_as_their_layout`).
 
 use std::sync::Arc;
 

@@ -1,4 +1,4 @@
-//! The consumer surface: every op returns a Tensor. A tk3 kernel runs when the
+//! The consumer surface: every op returns a Tensor. A tk kernel runs when the
 //! device, dtype and shape fit; otherwise the op builds the equivalent graph
 //! itself. `Err` is reserved for what the graph op would also reject.
 //!
@@ -58,7 +58,7 @@ pub mod tuned {
 /// takes the graph and why, a ranking's front with each config's predicted
 /// ns and how many it left out, on a store miss what compiling each config
 /// showed (its verdict, registers and spilled bytes), and the tuned pick.
-pub const PLAN: &str = "svod_tk3::plan";
+pub const PLAN: &str = "svod_tk::plan";
 
 /// `plan`'s ranked configs, or `None` with why `op` takes the graph logged.
 fn kernel<C>(op: &'static str, plan: Plan<C>) -> Option<Arc<[C]>> {
@@ -117,7 +117,7 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
             // A device no probe can scale to (no SM count) has no planner; a
             // probe that fails leaves its field at zero and the planner ranks on.
             let measured = crate::probe::costs(&target)
-                .inspect_err(|e| tracing::warn!("{}: no tk3 planner: {e}", target.arch.target_name()))
+                .inspect_err(|e| tracing::warn!("{}: no tk planner: {e}", target.arch.target_name()))
                 .ok()?;
             Planner::measured(target, measured).map(Arc::new)
         })
@@ -133,7 +133,7 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
 /// compiling, no device: the first [`SHORTLIST`](config::SHORTLIST) tiles,
 /// untested), [`Self::fastest`] times a list on a store miss, and
 /// [`Self::pipelined`] times the winning tile's other pipelines. With tuning
-/// off (`SVOD_TK3_TUNE=0`) nothing is timed: the ranked list's
+/// off (`SVOD_TK_TUNE=0`) nothing is timed: the ranked list's
 /// [`Self::first_clean`] config runs (its verdict kept as a `first` line), and
 /// the device's cost probes still measure once ([`planner`]).
 pub(crate) struct Tuner<'a, C, B> {

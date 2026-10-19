@@ -1,4 +1,4 @@
-//! Side by side, one process, one loop: tk3's GEMM on Qwen3-Embedding-0.6B's
+//! Side by side, one process, one loop: tk's GEMM on Qwen3-Embedding-0.6B's
 //! four projections at M 4096, bf16 — the op layer's tuned pick as the model
 //! runs it, and pinned configs worth watching — reported as the min and the
 //! mean of the same runs, so no harness's statistic is compared against
@@ -7,12 +7,12 @@
 use svod_dtype::default_device::default_device;
 use svod_dtype::{DType, DeviceSpec};
 use svod_tensor::Tensor;
-use svod_tk3::atoms::{Core, Device, Target};
-use svod_tk3::build::BF16;
-use svod_tk3::kernels::Batch;
-use svod_tk3::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use svod_tk3::launch::graph_launch;
-use svod_tk3::ops::{self, Act, Linear};
+use svod_tk::atoms::{Core, Device, Target};
+use svod_tk::build::BF16;
+use svod_tk::kernels::Batch;
+use svod_tk::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use svod_tk::launch::graph_launch;
+use svod_tk::ops::{self, Act, Linear};
 
 fn lcg(seed: &mut u64) -> f32 {
     *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -33,14 +33,14 @@ const fn cfg(tile: [usize; 3], warps: [u32; 2], unroll: bool) -> GemmCfg {
 
 #[test]
 #[ignore = "perf probe: needs a GPU"]
-fn tk3_gemm_tuned_vs_pinned() {
+fn tk_gemm_tuned_vs_pinned() {
     let device = default_device();
     if !matches!(device, DeviceSpec::Amd { .. } | DeviceSpec::Cuda { .. }) {
         eprintln!("skipped: no GPU");
         return;
     }
-    let target = Target::for_device(&device).expect("a tk3 target");
-    let measured = svod_tk3::probe::costs(&target).expect("device costs");
+    let target = Target::for_device(&device).expect("a tk target");
+    let measured = svod_tk::probe::costs(&target).expect("device costs");
     assert!(measured.unmeasured.is_empty(), "unmeasured: {:?}", measured.unmeasured);
     let device = Device { costs: measured.costs, target };
     let plain = Epilogue::default();
@@ -78,11 +78,11 @@ fn tk3_gemm_tuned_vs_pinned() {
         let r2 = r.as_ref().map(|r| r.try_reshape([m, n]).unwrap());
         let mut plans = vec![];
 
-        // tk3 through the op layer: the tune store's pick, as the model runs it.
+        // tk through the op layer: the tune store's pick, as the model runs it.
         let opts = Linear { gated: epi.gated, act: epi.act, residual: r2.as_ref(), ..Linear::default() };
-        plans.push(("tk3 ops (tuned)".to_string(), ops::linear(&x2, &w2, opts).unwrap().prepare().unwrap()));
+        plans.push(("tk ops (tuned)".to_string(), ops::linear(&x2, &w2, opts).unwrap().prepare().unwrap()));
 
-        // tk3 at a pinned config.
+        // tk at a pinned config.
         let mut pinned = |label: &str, c: GemmCfg| {
             let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: epi, cfg: c };
             let out = Tensor::empty(&[m * n], DType::BFloat16);
@@ -92,7 +92,7 @@ fn tk3_gemm_tuned_vs_pinned() {
             }
             params.push(&out);
             let y = graph_launch(gemm::<BF16>(&spec), &c.lowering(&device), &params).unwrap();
-            plans.push((format!("tk3 {label} {:?} {:?} unroll={}", c.tile, c.warps, c.unroll), y.prepare().unwrap()));
+            plans.push((format!("tk {label} {:?} {:?} unroll={}", c.tile, c.warps, c.unroll), y.prepare().unwrap()));
         };
         pinned("tabled", tabled);
         if let Some(l) = lattice {

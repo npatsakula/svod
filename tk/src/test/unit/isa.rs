@@ -122,14 +122,14 @@ fn metadata_and_blocks_are_not_functions() {
 /// count in each column and zero where a loop issues none.
 #[test]
 fn main_loops_sit_side_by_side() {
-    let tk3 = MainLoop { ops: vec![("HMMA".into(), 32), ("LDSM".into(), 12), ("BRA".into(), 1)] };
+    let tk = MainLoop { ops: vec![("HMMA".into(), 32), ("LDSM".into(), 12), ("BRA".into(), 1)] };
     let reference = MainLoop { ops: vec![("HMMA".into(), 32), ("LDGSTS".into(), 16)] };
-    let text = table(&[("tk3", &tk3), ("cublas", &reference)]);
+    let text = table(&[("tk", &tk), ("cublas", &reference)]);
     let rows: Vec<Vec<&str>> = text.lines().map(|l| l.split_whitespace().collect()).collect();
     assert_eq!(
         rows,
         [
-            vec!["tk3", "cublas"],
+            vec!["tk", "cublas"],
             vec!["instructions", "45", "48"],
             vec!["HMMA", "32", "32"],
             vec!["LDGSTS", "0", "16"],

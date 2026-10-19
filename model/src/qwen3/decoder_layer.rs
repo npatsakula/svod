@@ -9,7 +9,7 @@
 
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Module, RmsNorm};
-use svod_tk3::ops;
+use svod_tk::ops;
 
 use super::attention::Qwen3Attention;
 use super::error::Result;

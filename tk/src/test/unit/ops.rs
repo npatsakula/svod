@@ -8,7 +8,7 @@ use test_case::test_case;
 
 use crate::ops::{self as tk, Act, Attn, Cache, Chunk, Conv, KeyMask, Linear, Qkv};
 
-/// `test` on a device with tk3 tables, with tuning off on its thread so it
+/// `test` on a device with tk tables, with tuning off on its thread so it
 /// does not measure every shape it touches (the untuned pick runs).
 fn untuned(test: impl FnOnce()) {
     if super::device_planner().is_some() {

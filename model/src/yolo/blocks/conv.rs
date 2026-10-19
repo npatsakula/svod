@@ -2,7 +2,7 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{BatchNorm2d, Conv2d, ConvTranspose2d, Layer, Module, StateDict, get_tensor, prefixed};
-use svod_tk3::ops::{self, Act};
+use svod_tk::ops::{self, Act};
 
 use crate::blocks::batchnorm2d_with_eps;
 use crate::init::fan_in_uniform;

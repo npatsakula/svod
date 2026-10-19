@@ -1,7 +1,7 @@
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
-use svod_tk3::ops::{self, Attn};
+use svod_tk::ops::{self, Attn};
 
 use super::conv::YoloConv;
 use crate::state::{scoped, scoped_index};

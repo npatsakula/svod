@@ -18,7 +18,7 @@ use crate::ops::{DEVICE_TEST, tuned};
 use crate::tune::{self, Entry, FORMAT, Found, Kind, TuneKey, TuneStore};
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("svod-tk3-replay-{}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("svod-tk-replay-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
@@ -194,7 +194,7 @@ fn a_replayed_gemm_follows_the_admission_and_the_choice() {
 /// the parallel suite can miss events whose interest another thread cached.
 #[test]
 fn the_planner_log_names_the_admitted_and_chosen_configs() {
-    const CHILD: &str = "SVOD_TK3_TEST_PLAN_LOG_DIR";
+    const CHILD: &str = "SVOD_TK_TEST_PLAN_LOG_DIR";
     if let Some(dir) = std::env::var_os(CHILD) {
         super::traced();
         let (planner, ranked, _) = admitted_and_chosen(Path::new(&dir));

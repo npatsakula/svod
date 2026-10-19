@@ -23,7 +23,7 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, Layer, LayerNorm, Linear, Module, get_tensor, prefixed};
-use svod_tk3::ops::{self, Act, Attn, KeyMask, Qkv};
+use svod_tk::ops::{self, Act, Attn, KeyMask, Qkv};
 
 use crate::audio::MelSpectrogram;
 use crate::init::{Bias, conv1d, layer_norm, linear};

@@ -3551,7 +3551,7 @@ dependencies = [
  "svod-macros",
  "svod-runtime",
  "svod-tensor",
- "svod-tk3",
+ "svod-tk",
  "tempfile",
  "test-case",
  "tiktoken-rs",
@@ -3661,7 +3661,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "svod-tk3"
+name = "svod-tk"
 version = "0.2.0"
 dependencies = [
  "half",

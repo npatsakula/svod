@@ -1,4 +1,4 @@
-//! What tk3 would run on a card this machine has no device for: the planner's
+//! What tk would run on a card this machine has no device for: the planner's
 //! ranking (predicted ns, and why each config of the lattice was left out),
 //! the chosen config's LLVM text and, where the tools are installed, its
 //! PTX, `ptxas -v` resources and SASS (CUDA) or AMDGCN assembly and its
@@ -6,9 +6,9 @@
 //! that issues matrix instructions: the main loop.
 //!
 //! ```text
-//! cargo run -p svod-tk3 --release --example tk3_dump -- --arch sm_90a --sms 114 \
+//! cargo run -p svod-tk --release --example tk_dump -- --arch sm_90a --sms 114 \
 //!     --op gemm --shape 4096x4096x4096 [--dtype bf16] [--cfg 0|tuned] [--store DIR] [--out DIR]
-//! cargo run -p svod-tk3 --release --example tk3_dump -- --card mi300x --op attention --shape 8x16x1024x128 --causal
+//! cargo run -p svod-tk --release --example tk_dump -- --card mi300x --op attention --shape 8x16x1024x128 --causal
 //! ```
 //!
 //! `--op` and its `--shape`: `gemm MxNxK` (`--bias`, `--residual`, `--gated`,
@@ -19,13 +19,13 @@
 //! layer's own shape gate (`ops::shape`) and tuning (`ops::tuned`).
 //!
 //! `--compare FILE [--fun NAME]` sets the main loop of a reference kernel
-//! beside tk3's, counted by the same [`svod_tk3::isa::main_loop`]: a
+//! beside tk's, counted by the same [`svod_tk::isa::main_loop`]: a
 //! `.cubin` (`nvdisasm -c`), an AMD code object `.co`/`.hsaco`
 //! (`llvm-objdump -d --symbolize-operands` for the target's mcpu), or a
 //! SASS/PTX/AMDGCN text; `--fun` picks one kernel of several (a cubin
 //! extracted from cuBLASLt holds dozens).
 //!
-//! `--arch` takes the SMs and dies of the first card of `svod_tk3::atoms::CARDS`
+//! `--arch` takes the SMs and dies of the first card of `svod_tk::atoms::CARDS`
 //! of the architecture unless `--sms`/`--xcds` say otherwise; `--store` is a
 //! tune store directory copied from the card (its probe lines price the
 //! ranking), else the guessed costs do. `--cfg I` emits the ranking's `I`th
@@ -35,7 +35,7 @@
 //! the op layer keys it by, whatever compiler and kernel build wrote it, so
 //! the ranking must be the card's (its stored costs). A GEMM reads `linear`'s
 //! lines, else those the device tests and GEMM probes tuned (`gemm`,
-//! `ops::DEVICE_TEST`). `RUST_LOG=svod_tk3::plan=debug` logs the planner's
+//! `ops::DEVICE_TEST`). `RUST_LOG=svod_tk::plan=debug` logs the planner's
 //! decisions.
 
 use std::collections::BTreeMap;
@@ -43,22 +43,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use svod_dtype::{AmdArch, CudaArch, DType, GpuArch};
-use svod_tk3::atoms::{CARDS, Target};
-use svod_tk3::build::{BF16, F16};
-use svod_tk3::ir::Program;
-use svod_tk3::isa;
-use svod_tk3::kernels::attention::{AttnMask, AttnSpec, attention};
-use svod_tk3::kernels::conv::{ConvGeom, ConvSpec};
-use svod_tk3::kernels::gemm::{Epilogue, GemmSpec, gemm};
-use svod_tk3::kernels::heads::{HeadsSpec, Rope, heads};
-use svod_tk3::kernels::rows::{Norm, NormSpec, norm};
-use svod_tk3::kernels::{Act, Batch};
-use svod_tk3::lower::Lowering;
-use svod_tk3::ops::config::{Attention, Planner, Problem, gemm_lattice};
-use svod_tk3::ops::shape::{self, Extent, Plan};
-use svod_tk3::ops::tuned;
-use svod_tk3::probe::{self, Measured};
-use svod_tk3::tune::{Found, TuneStore};
+use svod_tk::atoms::{CARDS, Target};
+use svod_tk::build::{BF16, F16};
+use svod_tk::ir::Program;
+use svod_tk::isa;
+use svod_tk::kernels::attention::{AttnMask, AttnSpec, attention};
+use svod_tk::kernels::conv::{ConvGeom, ConvSpec};
+use svod_tk::kernels::gemm::{Epilogue, GemmSpec, gemm};
+use svod_tk::kernels::heads::{HeadsSpec, Rope, heads};
+use svod_tk::kernels::rows::{Norm, NormSpec, norm};
+use svod_tk::kernels::{Act, Batch};
+use svod_tk::lower::Lowering;
+use svod_tk::ops::config::{Attention, Planner, Problem, gemm_lattice};
+use svod_tk::ops::shape::{self, Extent, Plan};
+use svod_tk::ops::tuned;
+use svod_tk::probe::{self, Measured};
+use svod_tk::tune::{Found, TuneStore};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
         opt("--shape").ok_or("--shape")?.split('x').map(str::parse).collect::<std::result::Result<_, _>>()?;
     let dtype = if opt("--dtype").unwrap_or("bf16") == "bf16" { DType::BFloat16 } else { DType::Float16 };
     let bf16 = dtype == DType::BFloat16;
-    let out = PathBuf::from(opt("--out").unwrap_or("tk3_dump"));
+    let out = PathBuf::from(opt("--out").unwrap_or("tk_dump"));
     std::fs::create_dir_all(&out)?;
     let top = num("--top")?.unwrap_or(16);
     let pick = match opt("--cfg") {
@@ -267,7 +267,7 @@ fn main() -> Result<()> {
     }
     let (prog, lowering) = programs.into_iter().next().expect("a program");
 
-    let ir = svod_tk3::lower::standalone(prog, &lowering)?.text(&target)?;
+    let ir = svod_tk::lower::standalone(prog, &lowering)?.text(&target)?;
     write(&out, "kernel.ll", ir.as_bytes())?;
     let (asm, name) = match target.arch {
         GpuArch::Cuda(arch) => (cuda(&out, &ir, arch)?, "SASS"),
@@ -281,9 +281,9 @@ fn main() -> Result<()> {
         let label = file_name(path);
         let what = opt("--fun").map_or_else(|| label.clone(), |f| format!("{label}, function {f}"));
         let theirs = isa::main_loop(&theirs).ok_or_else(|| format!("{what}: no loop issues a matrix instruction"))?;
-        let ours = ours.ok_or("tk3's kernel has no main loop to compare")?;
-        println!("main loop per trip, tk3's {name} against {what}:");
-        print!("{}", isa::table(&[("tk3", &ours), (&label, &theirs)]));
+        let ours = ours.ok_or("tk's kernel has no main loop to compare")?;
+        println!("main loop per trip, tk's {name} against {what}:");
+        print!("{}", isa::table(&[("tk", &ours), (&label, &theirs)]));
     }
     Ok(())
 }

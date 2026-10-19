@@ -38,10 +38,10 @@ use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::ops::config::{Planner, has_kernels};
 pub(crate) use crate::sweep::{conv_first_eight, costs, declared, first_eight, planner};
 
-/// The default device's target when tk3 has kernels for it, of any vendor:
+/// The default device's target when tk has kernels for it, of any vendor:
 /// the gate of every device test. It skips (`None`) only where there is
-/// nothing to run on: `SVOD_DEVICE=CPU`, a GPU tk3 has no kernels for, or no
-/// `SVOD_DEVICE` and no GPU tk3 supports attached. A supported GPU the suite
+/// nothing to run on: `SVOD_DEVICE=CPU`, a GPU tk has no kernels for, or no
+/// `SVOD_DEVICE` and no GPU tk supports attached. A supported GPU the suite
 /// is not pointed at, or an `SVOD_DEVICE` that does not open, fails the
 /// test, since a suite whose device tests all skip passes and proves nothing.
 fn device_target() -> Option<Target> {
@@ -55,22 +55,22 @@ fn device_target() -> Option<Target> {
         }
         if let Some((select, target)) = attached() {
             panic!(
-                "tk3 has kernels for the attached {} but SVOD_DEVICE is unset: run with SVOD_DEVICE={select} \
+                "tk has kernels for the attached {} but SVOD_DEVICE is unset: run with SVOD_DEVICE={select} \
                  (SVOD_DEVICE=CPU runs the host tests alone)",
                 target.arch.target_name()
             );
         }
-        eprintln!("skipped: no GPU tk3 has kernels for");
+        eprintln!("skipped: no GPU tk has kernels for");
         return None;
     };
     if !has_kernels(&target) {
-        eprintln!("skipped: tk3 has no kernels for {}", target.arch.target_name());
+        eprintln!("skipped: tk has no kernels for {}", target.arch.target_name());
         return None;
     }
     Some(target)
 }
 
-/// The first GPU tk3 has kernels for on this machine and the `SVOD_DEVICE`
+/// The first GPU tk has kernels for on this machine and the `SVOD_DEVICE`
 /// that selects it, found without selecting it: AMD ones from the KFD
 /// topology in sysfs, a CUDA one once the driver counts devices (`cuInit`
 /// creates no context; reading the architecture opens device 0's).
@@ -120,7 +120,7 @@ fn group_target() -> Option<Target> {
 }
 
 /// The crate's tracing under `RUST_LOG` on stderr, for the probes: the
-/// tuner's picks and round times at `svod_tk3=debug`.
+/// tuner's picks and round times at `svod_tk=debug`.
 fn traced() {
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()

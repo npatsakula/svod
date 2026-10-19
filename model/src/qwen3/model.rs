@@ -49,9 +49,9 @@ pub struct Qwen3Model {
     inv_freq: Tensor,
 }
 
-/// The length multiple 16-bit sequences run at on a tk3 device, and the
+/// The length multiple 16-bit sequences run at on a tk device, and the
 /// embedder's plan bucket: the JIT bucket granularity, bounding how many
-/// sequence lengths compile a plan. It is not a kernel tile; tk3's kernels
+/// sequence lengths compile a plan. It is not a kernel tile; tk's kernels
 /// bound any length.
 pub(crate) const SEQUENCE_TILE: usize = 128;
 
@@ -141,12 +141,12 @@ impl Qwen3Model {
         Ok((angles.cos()?.cast(dtype.clone()), angles.sin()?.cast(dtype)))
     }
 
-    /// Sequence length the stack runs at: on a device with tk3 kernels,
+    /// Sequence length the stack runs at: on a device with tk kernels,
     /// 16-bit activations pad up to [`SEQUENCE_TILE`]; padded rows are
     /// causal-invisible and sliced off again.
     fn padded_len(&self, seq_len: usize) -> usize {
         let sixteen_bit = matches!(self.config.dtype.base(), ScalarDType::BFloat16 | ScalarDType::Float16);
-        if sixteen_bit && svod_tk3::ops::supported(&self.embeddings.weight.device()) {
+        if sixteen_bit && svod_tk::ops::supported(&self.embeddings.weight.device()) {
             seq_len.next_multiple_of(SEQUENCE_TILE)
         } else {
             seq_len

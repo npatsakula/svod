@@ -1,5 +1,5 @@
 [package]
-name = "svod-tk3"
+name = "svod-tk"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

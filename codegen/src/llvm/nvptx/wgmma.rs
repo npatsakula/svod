@@ -11,7 +11,7 @@
 //!
 //! A shared operand reaches the core through a 64-bit matrix descriptor
 //! ([`descriptor`]) over its shared address, the canonical layouts whose
-//! swizzle modes are those of the TMA (and of tk3's XOR swizzle of 16-byte
+//! swizzle modes are those of the TMA (and of tk's XOR swizzle of 16-byte
 //! chunks against the row): K-major, or for B also MN-major (its rows run
 //! along N, the instruction transposing them).
 
@@ -59,7 +59,7 @@ pub fn name(from_registers: bool, b_mn: bool, waits: bool) -> String {
 
 /// The swizzle a descriptor declares over its operand's shared rows: the
 /// 16-byte chunk index of a row XORed with row bits, exactly as the TMA
-/// modes and tk3's shared layout do it.
+/// modes and tk's shared layout do it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Swizzle {
     None = 0,

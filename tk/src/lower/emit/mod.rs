@@ -30,7 +30,7 @@ pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSp
     let mut e = Emit::new(prog, lay, low, params);
     e.prologue()?;
     e.block(&prog.body)?;
-    if std::env::var_os("TK3_DUMP_LIST").is_some() {
+    if std::env::var_os("TK_DUMP_LIST").is_some() {
         for (i, u) in e.list.iter().enumerate() {
             let srcs: Vec<u64> = u.op().sources().iter().map(|s| s.id).collect();
             eprintln!("[{i:4}] id={} {:?} {:?} <- {srcs:?}", u.id, u.op().as_ref(), u.dtype());
@@ -658,7 +658,7 @@ impl<'a> Emit<'a> {
     fn sync(&mut self, sync: Sync) -> Result<()> {
         let target = &self.low.device.target;
         let u = match sync {
-            // A tk3 barrier orders shared memory only (`Sync::Barrier`).
+            // A tk barrier orders shared memory only (`Sync::Barrier`).
             Sync::Barrier { scope: Scope::Block } => {
                 let tag = self.next_tag();
                 self.last.clone().fenced_barrier(smallvec![], BarrierFence::Local).rtag(Some(smallvec![tag as usize]))

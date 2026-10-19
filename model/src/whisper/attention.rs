@@ -10,7 +10,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Linear, Module};
-use svod_tk3::ops::{self, Act, Attn};
+use svod_tk::ops::{self, Act, Attn};
 
 use crate::init::{Bias, linear};
 use crate::state::scoped;

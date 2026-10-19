@@ -514,7 +514,7 @@ fn conv_throughput_probe() {
                 t.map_or("failed".into(), |t| format!("{:8.1} us {:5.1} TFLOP/s", t as f64 / 1e3, tflops(t as f64)));
             let picked = if Some(*cand) == pick { " (tuner's pick)" } else { "" };
             eprintln!(
-                "  {label} tk3 {:?} s{} {:?} unroll={} split {split}: {t}{picked}",
+                "  {label} tk {:?} s{} {:?} unroll={} split {split}: {t}{picked}",
                 c.tile, c.stages, c.warps, c.unroll
             );
         }
@@ -550,7 +550,7 @@ fn conv_throughput_probe() {
         }
         let graph = (0..20).filter_map(|_| plan_ns(&plan)).fold(f64::INFINITY, f64::min);
         let best = times.iter().flatten().min().map(|&t| t as f64);
-        let tk3 = best.map_or("none".into(), |t| format!("{:.1} us {:.1} TFLOP/s", t / 1e3, tflops(t)));
-        eprintln!("{label}: tk3 {tk3}; graph {:.1} us {:.1} TFLOP/s", graph / 1e3, tflops(graph));
+        let tk = best.map_or("none".into(), |t| format!("{:.1} us {:.1} TFLOP/s", t / 1e3, tflops(t)));
+        eprintln!("{label}: tk {tk}; graph {:.1} us {:.1} TFLOP/s", graph / 1e3, tflops(graph));
     }
 }
