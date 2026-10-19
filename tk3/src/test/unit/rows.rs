@@ -3,7 +3,7 @@
 //! unless `SVOD_DEVICE` names one).
 
 use proptest::prelude::*;
-use svod_dtype::{DType, DeviceSpec, ScalarDType, default_device::default_device};
+use svod_dtype::{DType, ScalarDType};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
@@ -36,9 +36,10 @@ fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: 
     norm::<BF16>(&spec)
 }
 
-fn cuda_target() -> Option<Target> {
-    let spec = default_device();
-    matches!(spec, DeviceSpec::Cuda { .. }).then(|| Target::for_device(&spec)).flatten()
+/// Row kernels have no pipeline and no matrix core: every vendor with
+/// tables runs them.
+fn gpu_target() -> Option<Target> {
+    super::device_target()
 }
 
 fn lcg(seed: &mut u64) -> f64 {
@@ -180,8 +181,8 @@ fn bias_vector_takes_the_accumulators_column_layout() {
 #[test_case(64, 64, 64, [64, 64, 32], 2, 2, 2; "small")]
 #[test_case(256, 256, 256, [128, 64, 32], 2, 2, 2; "256 cubed")]
 fn epilogues_match_on_device(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, wr: u32, wc: u32) {
-    let Some(target) = cuda_target() else {
-        eprintln!("skipped: no CUDA device");
+    let Some(target) = gpu_target() else {
+        eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
     for epi in EPILOGUES {
@@ -291,8 +292,8 @@ proptest! {
 #[test_case(Norm::Layer, 512, true, true, 8; "layer 512 residual, 8 rows a block")]
 #[test_case(Norm::Rms, 2048, false, false, 16; "rms 2048, 16 rows a block")]
 fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: usize) {
-    let Some(target) = cuda_target() else {
-        eprintln!("skipped: no CUDA device");
+    let Some(target) = gpu_target() else {
+        eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
     let (rows, eps) = (37, 1e-5);
@@ -336,10 +337,10 @@ fn gpu_seconds(plan: &svod_runtime::ExecutionPlan) -> f64 {
 /// moving as many bytes; prints GB/s and never asserts (run with
 /// `--ignored --nocapture`).
 #[test]
-#[ignore = "perf probe: needs a CUDA device"]
+#[ignore = "perf probe: needs a GPU"]
 fn norm_bandwidth_probe() {
-    let Some(target) = cuda_target() else {
-        eprintln!("skipped: no CUDA device");
+    let Some(target) = gpu_target() else {
+        eprintln!("skipped: no GPU with tk3 tables");
         return;
     };
     let (rows, d, eps) = (8192, 1024, 1e-5);
