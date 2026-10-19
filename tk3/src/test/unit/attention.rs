@@ -399,6 +399,7 @@ fn only_the_live_batch_runs() {
 #[test_case(spec(256, 256, 64, 64, 64, true, false), &[256, 256]; "causal")]
 #[test_case(spec(128, 256, 64, 64, 64, false, true), &[200, 33]; "key lengths")]
 #[test_case(spec(128, 128, 128, 64, 32, true, true), &[128, 64]; "d 128, causal with lengths")]
+#[test_case(with(FaCfg { truncate_p: true, skip_rescale: true, ..FaCfg::new(64, 32, 2) }, spec(128, 128, 128, 0, 0, true, true)), &[128, 64]; "d 128, truncated probabilities, skipped rescale")]
 #[test_case(with(FaCfg::new(128, 64, 3), spec(256, 192, 64, 0, 0, true, true)), &[192, 70]; "bq 128, three stages")]
 #[test_case(with(FaCfg::new(128, 32, 2), spec(200, 130, 128, 0, 0, false, true)), &[130, 99]; "d 128, bq 128, ragged")]
 #[test_case(masked(128, 128, 64, 64, 32, WINDOW), &[128, 90]; "window with lengths")]

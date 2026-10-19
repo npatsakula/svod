@@ -516,6 +516,41 @@ fn attention_exponentials_are_the_hardware_ones_on_amd(target: Target, raw: bool
     assert_eq!(ir.contains("@llvm.exp2.f32("), !raw, "{name}");
 }
 
+/// The attention program carries the softmax forms the planner chose for the
+/// target: a cast toward zero and a `Scale` on gfx1201 (an f16 stream rounds
+/// either way); on sm_86 neither at `d = 64` and the `Scale` alone at
+/// `d = 128`.
+#[test_case(crate::atoms::sm86(), "attention d64 causal #0", (false, false); "sm_86 d 64")]
+#[test_case(crate::atoms::sm86(), "attention d128 causal #0", (false, true); "sm_86 d 128")]
+#[test_case(amd(AmdArch::Gfx1201, 64), "attention d64 causal #0", (true, true); "gfx1201 d 64")]
+#[test_case(amd(AmdArch::Gfx1201, 64), "attention d128 causal #0", (true, true); "gfx1201 d 128")]
+#[test_case(amd(AmdArch::Gfx1201, 64), "attention d64 key masks", (false, true); "gfx1201 f16 rounds")]
+fn attention_softmax_takes_the_planned_forms(target: Target, family: &str, (truncated, skipped): (bool, bool)) {
+    use crate::ir::{BinaryOp, Round, TileOp};
+    let (name, prog, _) =
+        families(&target).into_iter().find(|(n, ..)| n.starts_with(family)).expect("an attention family");
+    let casts = tile_ops(&prog.body, &|op| matches!(op, TileOp::Cast { round: Round::Zero, .. }));
+    let scales = tile_ops(&prog.body, &|op| matches!(op, TileOp::Binary { f: BinaryOp::Scale, .. }));
+    assert_eq!((casts > 0, scales > 0), (truncated, skipped), "{name}: {casts} casts toward zero, {scales} scales");
+}
+
+/// The tile ops of `block` (recursively) that `f` picks.
+fn tile_ops(block: &crate::ir::Block, f: &dyn Fn(&crate::ir::TileOp) -> bool) -> usize {
+    use crate::ir::Stmt;
+    block
+        .0
+        .iter()
+        .map(|s| match s {
+            Stmt::Let { op, .. } => usize::from(f(op)),
+            Stmt::Copy { .. } | Stmt::Sync(_) | Stmt::Raw(_) => 0,
+            Stmt::Loop(l) => tile_ops(&l.body, f),
+            Stmt::Pipeline(p) => tile_ops(&p.produce.body, f) + tile_ops(&p.consume.body, f),
+            Stmt::Role { body, .. } => tile_ops(body, f),
+            Stmt::If { then, otherwise, .. } => tile_ops(then, f) + tile_ops(otherwise, f),
+        })
+        .sum()
+}
+
 /// `Sync::Fence` statements in `block`, recursively.
 fn fences(block: &crate::ir::Block) -> usize {
     use crate::ir::{Stmt, Sync};

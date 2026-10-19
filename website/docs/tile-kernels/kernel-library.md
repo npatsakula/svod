@@ -110,12 +110,18 @@ so its registers hold column runs and store as 16-byte vectors too.
 The softmax step does as little vector work as it can, which matters most where the matrix
 cores share the SIMD's ALUs (RDNA). A row adopts a new running maximum only when it grows by
 more than 8 in log2 units (FlashAttention-4's lazy rescale): otherwise the correction is exactly
-1 and the output accumulator's rescale, a `Scale`, is skipped by every wave whose rows all kept
-theirs, while the probabilities stay below 2⁸. Probabilities held in bf16 are truncated rather
-than rounded, a pair per instruction on targets without a bf16 convert, and the row sum adds the
-values as held, so the normalization stays unbiased. On gfx1201 the three (with the raw `exp2`
-below) took the d = 128 kernel from 90 to 119 TFLOP/s on random data and Qwen3's causal
-attention from 63 to 77.
+1, while the probabilities stay below 2⁸. Two forms follow the target, chosen by the planner
+(`FaCfg::forms`) from `Target::bf16_cvt` and `Target::mma_on_valu`. With `truncate_p`,
+probabilities held in bf16 are truncated rather than rounded, a pair per instruction where the
+rounding is several, and the row sum adds the values as held, so the normalization stays unbiased;
+targets that round a pair in one instruction (sm_80+, gfx950) round and sum the f32 values, the
+extra conversion of the held values having cost 3–5% on sm_86. With `skip_rescale`, the output
+accumulator's rescale is a `Scale`, skipped by every wave whose rows all kept their maximum; it is
+on wherever the matrix products issue on the vector ALUs, and beside separate matrix cores only
+where a full tile's lane holds 64 output registers (sm_86: +4% at d = 128, neutral at d = 64 and
+5–7% slower on a decoder step, whose one row keeps the plain multiply). On gfx1201 the lazy
+rescale, the truncation, the skip and the raw `exp2` below took the d = 128 kernel from 90 to 119
+TFLOP/s on random data and Qwen3's causal attention from 63 to 77.
 
 Each tile config is crossed with split counts. `Attn::splits = Some(n)` fixes `n`, capped at the
 key block count. With `None`, `config::split_candidates` proposes 1, 2, the counts around two
