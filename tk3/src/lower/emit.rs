@@ -534,22 +534,17 @@ impl<'a> Emit<'a> {
     /// gathered row and a swizzled shared row need the full coordinate.
     fn address(&mut self, view: &View, c: &Coord) -> (Arc<UOp>, Option<Arc<UOp>>) {
         match &view.place {
-            Place::Global { offset, stride, bounds, rows: Some(map), .. } => {
+            Place::Global { offset, stride, rows: Some(map), .. } => {
                 let (row, col) = c.full();
                 let ((_, offset), (_, s1)) = (self.scalar(*offset), self.scalar(stride[1]));
                 let (_, start) = self.scalar_at(map.offset, Some(&row));
                 // The view's offset moves per step; the row's start and the
                 // column are listed where their inputs are.
                 let off = add(&offset, &add(&start, &mul(&col, &s1)));
-                let valid = map.valid.map(|v| {
-                    let (_, v) = self.scalar_at(v, Some(&row));
-                    v.try_cmpne(&c32(0)).expect("row gate")
-                });
-                let in_cols = bounds[1].map(|b| col.try_cmplt(&self.sc(b)).expect("bound compare"));
-                let gate = valid.into_iter().chain(in_cols).reduce(|a, b| a.try_and_op(&b).expect("and"));
+                let gate = self.inside(view, c);
                 (self.hoist(off), gate.map(|g| self.hoist(g)))
             }
-            Place::Global { offset, stride, bounds, .. } => {
+            Place::Global { offset, stride, .. } => {
                 let ((_, offset), (_, s0), (_, s1)) =
                     (self.scalar(*offset), self.scalar(stride[0]), self.scalar(stride[1]));
                 let lane = self.hoist(add(&mul(&c.row, &s0), &mul(&c.col, &s1)));
@@ -559,13 +554,7 @@ impl<'a> Emit<'a> {
                 if let Some(delta) = delta.reduce(|a, b| add(&a, &b)) {
                     off = add(&off, &delta);
                 }
-                let (row, col) = c.full();
-                let gate = bounds
-                    .iter()
-                    .zip([row, col])
-                    .filter_map(|(b, i)| b.map(|b| (self.sc(b), i)))
-                    .map(|(bound, i)| i.try_cmplt(&bound).expect("bound compare"))
-                    .reduce(|a, b| a.try_and_op(&b).expect("and"));
+                let gate = self.inside(view, c);
                 (self.hoist(off), gate.map(|g| self.hoist(g)))
             }
             Place::Smem { offset, .. } => {
@@ -618,6 +607,22 @@ impl<'a> Emit<'a> {
             }
             Place::Reg => unreachable!(),
         }
+    }
+
+    /// Whether coordinate `c` of a global view lies within its bounds and,
+    /// gathered, inside its row map; `None` where the view has neither.
+    fn inside(&mut self, view: &View, c: &Coord) -> Option<Arc<UOp>> {
+        let Place::Global { bounds, rows, .. } = &view.place else { return None };
+        let (row, col) = c.full();
+        let in_rows = match rows {
+            Some(map) => map.valid.map(|v| {
+                let (_, v) = self.scalar_at(v, Some(&row));
+                v.try_cmpne(&c32(0)).expect("row gate")
+            }),
+            None => bounds[0].map(|b| row.try_cmplt(&self.sc(b)).expect("bound compare")),
+        };
+        let in_cols = bounds[1].map(|b| col.try_cmplt(&self.sc(b)).expect("bound compare"));
+        in_rows.into_iter().chain(in_cols).reduce(|a, b| a.try_and_op(&b).expect("and"))
     }
 
     /// The coordinate register `j` of this thread holds in layout `l`:
@@ -1146,15 +1151,17 @@ impl<'a> Emit<'a> {
 
     /// Global → registers by transposing loads, one per 16×16 block, its
     /// lanes addressing the block's rows in [`frag::global_tr_rows`] order and
-    /// receiving column runs. A row past the view's bounds, or a gathered row outside
-    /// its map, reads the operand's first elements instead: finite values the
-    /// consumer masks, as after a chunk fill.
+    /// receiving column runs. A lane whose row is past the view's bounds, or
+    /// a gathered row outside its map, addresses the operand's first
+    /// elements instead; every element received from outside reads zero,
+    /// judged at its own coordinate, since a lane receives other lanes' rows.
     fn tr_load_regs(&mut self, dst: ValId, s: &View, l: &TileLayout, perm: &[u32]) -> Result<()> {
         let [sub_r, sub_c] = l.sub_shape();
         let rows = TileLayout { frag: frag::global_tr_rows(), reps: [sub_r / 16, sub_c / 16], warps: l.warps.clone() };
         for block in 0..rows.regs() {
             let c = self.coord(&rows, block);
             let (off, gate) = self.address(s, &c);
+            let bounded = gate.is_some();
             let off = match gate {
                 Some(g) => self.hoist(UOp::try_where(g, off, c32(0)).expect("safe offset")),
                 None => off,
@@ -1162,9 +1169,16 @@ impl<'a> Emit<'a> {
             let idx = self.access(&s.buf, &off, 1);
             let elems = global_load_tr_b128(&idx, s.dtype);
             for (jd, &js) in perm.iter().enumerate() {
-                if js / 8 == block {
-                    self.reg_store(dst, jd as u32, vec![elems[(js % 8) as usize].clone()]);
+                if js / 8 != block {
+                    continue;
                 }
+                let mut e = elems[(js % 8) as usize].clone();
+                if bounded {
+                    let held = self.coord(l, jd as u32);
+                    let inside = self.inside(s, &held).expect("a bounded view");
+                    e = UOp::try_where(self.hoist(inside), e.clone(), e.const_like(0)).expect("zeroed");
+                }
+                self.reg_store(dst, jd as u32, vec![e]);
             }
         }
         Ok(())
