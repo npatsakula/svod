@@ -500,6 +500,49 @@ impl Program {
     pub fn walk(&self) -> impl Iterator<Item = (usize, &Stmt)> {
         self.body.walk()
     }
+
+    /// The values scalar `id` may take, `lo..=hi`, from its inputs' ranges
+    /// (a variable's, a block index's grid, the warps, and an induction's as
+    /// `induction` bounds it where it is bound); `None` where an input is
+    /// unbounded (a value read from memory, a row coordinate) or a bound
+    /// leaves `i64`. Each operation is bounded on its own: a truncating
+    /// quotient over a divisor of one sign, a remainder by the numerator's
+    /// sign and the divisor's magnitude, a comparison `0..=1`.
+    pub fn bounds(&self, id: ScalarId, induction: &impl Fn(ScalarId) -> Option<(i64, i64)>) -> Option<(i64, i64)> {
+        match self.scalar(id) {
+            Scalar::Const(v) => Some((*v, *v)),
+            Scalar::Var(name) => self.vars.iter().find(|v| v.name == *name).map(|v| (v.min, v.max)),
+            Scalar::Special(Special::Block(axis)) => {
+                Some((0, self.bounds(self.grid[*axis as usize], induction)?.1 - 1))
+            }
+            Scalar::Special(Special::Warp) => Some((0, i64::from(self.warps) - 1)),
+            Scalar::Induction => induction(id),
+            Scalar::Bin(op, a, b) => {
+                let ((a0, a1), (b0, b1)) = (self.bounds(*a, induction)?, self.bounds(*b, induction)?);
+                let corners = |f: fn(i64, i64) -> Option<i64>| -> Option<(i64, i64)> {
+                    let v = [f(a0, b0)?, f(a0, b1)?, f(a1, b0)?, f(a1, b1)?];
+                    Some((v.into_iter().min()?, v.into_iter().max()?))
+                };
+                match op {
+                    BinOp::Add => Some((a0.checked_add(b0)?, a1.checked_add(b1)?)),
+                    BinOp::Sub => Some((a0.checked_sub(b1)?, a1.checked_sub(b0)?)),
+                    BinOp::Mul => corners(i64::checked_mul),
+                    BinOp::Div if b0 > 0 || b1 < 0 => corners(i64::checked_div),
+                    BinOp::Rem if b0 > 0 || b1 < 0 => {
+                        let most = b0.unsigned_abs().max(b1.unsigned_abs()) as i64 - 1;
+                        Some((if a0 < 0 { a0.max(-most) } else { 0 }, if a1 > 0 { a1.min(most) } else { 0 }))
+                    }
+                    BinOp::Div | BinOp::Rem => None,
+                    BinOp::Min => Some((a0.min(b0), a1.min(b1))),
+                    BinOp::Max => Some((a0.max(b0), a1.max(b1))),
+                    BinOp::Lt | BinOp::Le | BinOp::Eq => Some((0, 1)),
+                    BinOp::And | BinOp::Or if a0 >= 0 && b0 >= 0 && a1 <= 1 && b1 <= 1 => Some((0, 1)),
+                    BinOp::And | BinOp::Or => None,
+                }
+            }
+            Scalar::Load { .. } | Scalar::Row => None,
+        }
+    }
 }
 
 impl Block {

@@ -285,3 +285,31 @@ fn the_segment_bounds_are_read_ahead_of_the_key_loop(group: bool) {
     assert!(reads.len() >= 2, "the first and last rows' starts, read at {reads:?}");
     assert!(reads.iter().all(|&i| i < key_loop), "reads at {reads:?}, key loop from {key_loop}");
 }
+
+/// A scalar's bounds are its operation's over its inputs' (here `n` in
+/// `-7..=9`): a quotient and a remainder truncate as C's do, a divisor of
+/// either sign bounds both, one that may be zero bounds neither, and a
+/// value read from memory is unbounded.
+#[test_case(|_, n| n / 2, Some((-3, 4)); "a halved index")]
+#[test_case(|_, n| n / -2, Some((-4, 3)); "a negative divisor")]
+#[test_case(|_, n| n.clone() / (n + 8), Some((-7, 9)); "a divisor of one sign")]
+#[test_case(|_, n| n.clone() / n, None; "a divisor that may be zero")]
+#[test_case(|_, n| n % 4, Some((-3, 3)); "a remainder")]
+#[test_case(|_, n| n % -4, Some((-3, 3)); "a remainder by a negative divisor")]
+#[test_case(|_, n| n.min(3), Some((-7, 3)); "a minimum")]
+#[test_case(|_, n| n.max(0), Some((0, 9)); "a maximum")]
+#[test_case(|_, n| n * -2, Some((-18, 14)); "a negative factor")]
+#[test_case(|_, n| n - 10, Some((-17, -1)); "a difference")]
+#[test_case(|_, n| n.lt(2), Some((0, 1)); "a comparison")]
+#[test_case(|k, _| k.block(0), Some((0, 4)); "a block index on its grid")]
+#[test_case(|k, _| k.warp() + 1, Some((1, 4)); "a warp index")]
+#[test_case(|k, n| { let p = k.param::<I32>("p", ParamKind::In, 4); k.load_scalar(p, n) }, None; "a value read")]
+fn a_scalars_bounds_are_its_operations(f: fn(&mut Kernel, Sc) -> Sc, want: Option<(i64, i64)>) {
+    let mut k = Kernel::new("bounds");
+    k.warps(4);
+    k.grid([Sc::from(5), Sc::from(1), Sc::from(1)]);
+    let n = k.var("n", -7, 9);
+    let v = f(&mut k, n);
+    let id = k.intern(v);
+    assert_eq!(k.finish().bounds(id, &|_| None), want);
+}

@@ -10,8 +10,6 @@ use smallvec::smallvec;
 use svod_codegen::llvm::nvptx::smem::{cp_async_commit, cp_async_wait};
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ScalarDType};
-use svod_ir::uop::cached_property::CachedProperty;
-use svod_ir::uop::properties::SoundVminVmaxProperty;
 use svod_ir::{AxisId, AxisType, KernelInfo, Op, UOp};
 
 use crate::atoms::{Core, Fill};
@@ -325,19 +323,20 @@ impl<'a> Emit<'a> {
             }
             // The parameter is an input, so no store moves under its read; a
             // read whose index may leave the parameter stays under the
-            // branches it is met in, where the index is in range. Only a sound
-            // range proves it inside: the plain one has no rule for a
-            // truncating quotient or remainder.
-            Scalar::Load { param, index } => {
-                let (level, index) = self.scalar_at(*index, row);
+            // branches it is met in, where the index is in range.
+            Scalar::Load { param, index: at } => {
+                let (level, index) = self.scalar_at(*at, row);
                 let buf = self.params[param.index()].clone();
                 let idx = self.access(&buf, &index, 1);
                 let tag = self.next_tag();
                 let elems = self.prog.params[param.index()].elems as i64;
-                let inside = SoundVminVmaxProperty::get(&index)
-                    .as_ref()
-                    .and_then(|(lo, hi)| Some((lo.try_int()?, hi.try_int()?)))
-                    .is_some_and(|(lo, hi)| lo >= 0 && hi < elems);
+                // An induction is bounded as it is bound here: an unrolled
+                // copy's trip, a peeled one.
+                let bound = |iv| {
+                    let (_, u) = self.inductions.get(&iv)?;
+                    Some((u.vmin().try_int()?, u.vmax().try_int()?))
+                };
+                let inside = self.prog.bounds(*at, &bound).is_some_and(|(lo, hi)| lo >= 0 && hi < elems);
                 let level = if inside { level } else { level.max(self.guards.last().copied().unwrap_or(0)) };
                 let load = self.hoist_at(load_at(&idx, tag), level);
                 (level, load.cast(DType::Int32))
@@ -694,10 +693,10 @@ pub fn die_order(linear: u64, total: u64, dies: u64) -> u64 {
 /// `min(x, y)`, which the IR has no node for: `-max(-x, -y)`. A float's is
 /// exact at infinities and NaN-ignoring as `max` is. An integer's range is
 /// exact, `[min(x₀, y₀), min(x₁, y₁)]`, where `x + y - max(x, y)` loses the
-/// correlation of its terms and widens an index past its parameter; its
-/// negation wraps, so a side of `i32::MIN` yields the other side. Only a
-/// scalar read from memory can hold `i32::MIN`, a length no valid input has:
-/// every other operand is a size, a coordinate or a variable in its range.
+/// correlation of its terms; its negation wraps, so a side of `i32::MIN`
+/// yields the other side. Only a scalar read from memory can hold
+/// `i32::MIN`, a length no valid input has: every other operand is a size, a
+/// coordinate or a variable in its range.
 pub(crate) fn minimum(x: &Arc<UOp>, y: &Arc<UOp>) -> svod_ir::Result<Arc<UOp>> {
     Ok(x.neg().try_max(&y.neg())?.neg())
 }
