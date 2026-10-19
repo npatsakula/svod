@@ -400,17 +400,22 @@ fn nearest_throughput_probe() {
 /// rows at the depths of embeddings, whose rows stream, of the tuner's pick
 /// and every config it admitted: squared distances and the inner product
 /// (cosine over normalized rows); beside the tuner's GEMM pick on the same
-/// device at `8192 × 8192 × d` and at 4096³, timed alike. Prints, never
-/// asserts (run with `--ignored --nocapture --test-threads=1`).
+/// device at `8192 × 8192 × d` and at 4096³, timed alike. `NEAREST_ROWS`
+/// sets other rows and `NEAREST_DEPTHS` (comma-separated) other depths.
+/// Prints, never asserts (run with `--ignored --nocapture --test-threads=1`).
 #[test]
 #[ignore = "perf probe: needs a GPU"]
 fn nearest_wide_probe() {
-    const ROWS: usize = 1 << 16;
+    let var = |name| std::env::var(name).ok();
+    let rows = var("NEAREST_ROWS").map_or(1 << 16, |v| v.parse().expect("NEAREST_ROWS is a row count"));
+    let depths: Vec<usize> = var("NEAREST_DEPTHS").map_or(vec![256, 512, 768, 1024], |v| {
+        v.split(',').map(|d| d.trim().parse().expect("NEAREST_DEPTHS lists depths")).collect()
+    });
     let Some(planner) = super::device_planner() else { return };
     crate::tune::scoped(true, || {
-        for d in [256, 512, 768, 1024] {
+        for d in depths {
             for metric in [Metric::SquaredL2, Metric::NegDot] {
-                time_nearest(&planner, ROWS, d, metric, NONE, false);
+                time_nearest(&planner, rows, d, metric, NONE, false);
             }
             time_gemm(&planner, 8192, 8192, d);
         }
