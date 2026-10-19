@@ -6,10 +6,13 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
+use super::config::Planner;
 use super::shape::{self, extent, shape_of};
 use super::{GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output, typed};
 use crate::kernels::heads::{HeadsSpec, Rope, heads as kernel};
+use crate::kernels::rows::NormCfg;
 use crate::launch;
+use crate::tune::TuneStore;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Qkv<'a> {
@@ -70,8 +73,8 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
     let batch = batch_of(&var, b);
     let per_batch = rope.is_some_and(|(cos, _)| cos.shape().is_ok_and(|s| s[0] != SInt::Const(1)));
     let rope_spec = rope.map(|_| Rope { per_batch });
-    let spec = |cfg| HeadsSpec {
-        batch: batch.clone(),
+    let spec = HeadsSpec {
+        batch,
         t,
         heads,
         kv_heads,
@@ -80,26 +83,31 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
         k_norm: k_norm.is_some(),
         eps,
         rope: rope_spec,
-        cfg,
+        cfg: cfgs[0],
     };
-    let shape = [batch.capacity(), t, heads, kv_heads, d];
-    let salt = (&batch, q_norm.is_some(), k_norm.is_some(), rope_spec);
-    let cfg = Tuner::new(&planner.device, qkv.dtype(), &shape, salt, |cfg| {
-        vec![(typed!(qkv.dtype(), kernel, &spec(cfg)), cfg.lowering(&planner.device))]
-    })
-    .tuned(OP, &cfgs, <[_]>::to_vec);
+    let spec = tuned(TuneStore::global(), &planner, qkv.dtype(), &cfgs, spec);
     let q = output(&[b, t, heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;
     let k = output(&[b, t, kv_heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;
     let v = output(&[b, t, kv_heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;
     let ins: Vec<&Tensor> =
         [Some(qkv), q_norm, k_norm, cos, sin, Some(&q), Some(&k), Some(&v)].into_iter().flatten().collect();
     let mut outs =
-        launch::graph_launch_all(typed!(qkv.dtype(), kernel, &spec(cfg)), &cfg.lowering(&planner.device), &ins)
+        launch::graph_launch_all(typed!(qkv.dtype(), kernel, &spec), &spec.cfg.lowering(&planner.device), &ins)
             .context(LaunchSnafu { op: OP })?;
     let v = outs.pop().expect("v");
     let k = outs.pop().expect("k");
     let q = outs.pop().expect("q");
     Ok((q, k, v))
+}
+
+/// `spec` under the config [`heads`] launches for its shape: the tuner's
+/// pick among `ranked`, through `store`.
+pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[NormCfg], spec: HeadsSpec) -> HeadsSpec {
+    let shape = [spec.batch.capacity(), spec.t, spec.heads, spec.kv_heads, spec.d];
+    let salt = (&spec.batch, spec.q_norm, spec.k_norm, spec.rope);
+    let build = |cfg| vec![(typed!(dtype, kernel, &HeadsSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build).tuned(OP, ranked, <[_]>::to_vec);
+    HeadsSpec { cfg, ..spec }
 }
 
 /// The split, head views, norms and rotations as graph ops.

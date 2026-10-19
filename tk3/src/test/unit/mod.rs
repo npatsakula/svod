@@ -14,6 +14,7 @@ mod ops;
 mod ops_plan;
 mod parts;
 mod probe;
+mod replay;
 mod rows;
 mod schedule;
 mod sync;
@@ -138,7 +139,8 @@ pub(crate) fn tuned_on_device<C: crate::ops::config::Tiled + PartialEq + std::fm
     expand: impl Fn(&[C]) -> Vec<C>,
     build: impl Fn(C) -> crate::tune::Candidate,
 ) -> (Vec<C>, Option<C>) {
-    let mut tuner = crate::ops::Tuner::new(&planner.device, dtype, shape, "a device test", build);
+    let store = crate::tune::TuneStore::global();
+    let mut tuner = crate::ops::Tuner::new(store, &planner.device, dtype, shape, crate::ops::DEVICE_TEST, build);
     let candidates = expand(&tuner.admitted(op, &crate::ops::config::representatives(ranked)));
     let pick = (!candidates.is_empty()).then(|| {
         let ordered = tuner.ordered(op, &candidates);

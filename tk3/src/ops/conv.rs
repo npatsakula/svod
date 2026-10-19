@@ -5,6 +5,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
+use super::config::Planner;
 use super::shape::{self, extent, shape_of};
 use super::{
     Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
@@ -15,6 +16,7 @@ use crate::kernels::Batch;
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use crate::kernels::gemm::{Epilogue, Scale};
 use crate::launch;
+use crate::tune::TuneStore;
 
 #[derive(Clone, Debug)]
 pub struct Conv<'a> {
@@ -125,37 +127,9 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
         scale: opts.scale.map(Scale::new),
         out_f32: out_dtype != x.dtype(),
     };
-    let spec = |c: ConvCfg| ConvSpec { batch: batch.clone(), geom, epilogue, cfg: c.gemm, split: c.split };
-    let programs = |spec: &ConvSpec| match x.dtype().scalar() {
-        Some(ScalarDType::BFloat16) => spec.programs::<BF16>(&planner.device),
-        Some(ScalarDType::Float16) => spec.programs::<F16>(&planner.device),
-        other => unreachable!("{other:?} has no kernel"),
-    };
-    let key = [
-        images,
-        h,
-        wi,
-        cin,
-        geom.cout,
-        geom.kernel[0],
-        geom.kernel[1],
-        geom.stride[0],
-        geom.stride[1],
-        geom.pad[0],
-        geom.pad[1],
-        geom.dilation[0],
-        geom.dilation[1],
-    ];
-    let (batches, m) = shape::conv_grid(&ext, &geom);
-    let expand = |admitted: &[ConvCfg]| {
-        let mut list = planner.conv_splits(batches, m, &geom, admitted);
-        // Grid z is the batch's when it is bound.
-        list.retain(|c| c.split == 1 || var.is_none());
-        list
-    };
-    let cfg = Tuner::new(&planner.device, x.dtype(), &key, (&batch, epilogue), |c| programs(&spec(c)))
-        .tuned(OP, &cfgs, expand);
-    let mut programs = programs(&spec(cfg)).into_iter();
+    let spec = ConvSpec { batch, geom, epilogue, cfg: cfgs[0].gemm, split: cfgs[0].split };
+    let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
+    let mut programs = programs(&spec, &x.dtype(), &planner).into_iter();
     let y = output(&[images, ho, wo, geom.cout], &var, out_dtype).context(GraphSnafu { op: OP })?;
     let (prog, lowering) = programs.next().expect("the convolution");
     let ins = [Some(x), Some(w), opts.bias, opts.residual, Some(&y)];
@@ -163,11 +137,54 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
         let ins: Vec<&Tensor> = ins.into_iter().flatten().collect();
         return launch::graph_launch(prog, &lowering, &ins).context(LaunchSnafu { op: OP });
     };
-    let partial = kernel_buffer(&[SInt::Const(cfg.split * images * ho * wo * geom.cout)], DType::Float32)
+    let partial = kernel_buffer(&[SInt::Const(spec.split * images * ho * wo * geom.cout)], DType::Float32)
         .context(GraphSnafu { op: OP })?;
     let partial = launch::graph_launch(prog, &lowering, &[x, w, &partial]).context(LaunchSnafu { op: OP })?;
     let ins: Vec<&Tensor> = [Some(&partial), opts.bias, opts.residual, Some(&y)].into_iter().flatten().collect();
     launch::graph_launch(merge, &merge_lowering, &ins).context(LaunchSnafu { op: OP })
+}
+
+fn programs(spec: &ConvSpec, dtype: &DType, planner: &Planner) -> crate::tune::Candidate {
+    match dtype.scalar() {
+        Some(ScalarDType::BFloat16) => spec.programs::<BF16>(&planner.device),
+        Some(ScalarDType::Float16) => spec.programs::<F16>(&planner.device),
+        other => unreachable!("{other:?} has no kernel"),
+    }
+}
+
+/// `spec` under the config and split [`conv2d`] launches for its geometry,
+/// batch and epilogue: the tuner's pick among `ranked` and their splits,
+/// through `store`.
+pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[ConvCfg], spec: ConvSpec) -> ConvSpec {
+    let g = spec.geom;
+    let images = spec.batch.capacity();
+    let key = [
+        images,
+        g.h,
+        g.w,
+        g.cin,
+        g.cout,
+        g.kernel[0],
+        g.kernel[1],
+        g.stride[0],
+        g.stride[1],
+        g.pad[0],
+        g.pad[1],
+        g.dilation[0],
+        g.dilation[1],
+    ];
+    let bound = matches!(spec.batch, Batch::Var { .. });
+    let (batches, m) = shape::conv_grid(&shape::Extent { dims: vec![images], var: bound }, &g);
+    let expand = |admitted: &[ConvCfg]| {
+        let mut list = planner.conv_splits(batches, m, &g, admitted);
+        // Grid z is the batch's when it is bound.
+        list.retain(|c| c.split == 1 || !bound);
+        list
+    };
+    let build = |c: ConvCfg| programs(&ConvSpec { cfg: c.gemm, split: c.split, ..spec.clone() }, &dtype, planner);
+    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &key, (&spec.batch, spec.epilogue), build)
+        .tuned(OP, ranked, expand);
+    ConvSpec { cfg: cfg.gemm, split: cfg.split, ..spec }
 }
 
 /// The graph's convolution of the same op: NCHW views, the accumulator,

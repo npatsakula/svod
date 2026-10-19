@@ -36,6 +36,24 @@ use crate::tune::{self, Bench, TuneKey, TuneStore};
 use config::Planner;
 use shape::{BatchVar, Plan};
 
+/// The salt of the tunings the device tests and GEMM probes run, keyed by
+/// the kernel's name (`gemm`) rather than an op's: [`tuned::gemm_probe`]
+/// reads what they chose.
+pub const DEVICE_TEST: &str = "a device test";
+
+/// Each op's tuning off the tensors: the spec the op launches for a shape,
+/// given the configs its shape gate ranked ([`shape`]) and a spec of any
+/// config (the pick replaces it), with the choices read from and kept in a
+/// store: [`TuneStore::global`] as the op runs, a [`TuneStore::replay`] of
+/// a store copied from a card to read what was tuned there.
+pub mod tuned {
+    pub use super::attention::tuned as attention;
+    pub use super::conv::tuned as conv;
+    pub use super::heads::tuned as heads;
+    pub use super::linear::{probed as gemm_probe, tuned as linear};
+    pub use super::norm::tuned as norm;
+}
+
 /// The tracing target of the planner's decisions, at debug: an op that
 /// takes the graph and why, a ranking's front with each config's predicted
 /// ns and how many it left out, on a store miss what compiling each config
@@ -119,24 +137,35 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
 /// [`Self::first_clean`] config runs (its verdict kept as a `first` line), and
 /// the device's cost probes still measure once ([`planner`]).
 pub(crate) struct Tuner<'a, C, B> {
+    store: &'a TuneStore,
     target: &'a Target,
     compiler: u64,
     dtype: ScalarDType,
-    shape: &'a [usize],
+    shape: Vec<usize>,
     salt: String,
     build: B,
     bench: Bench<C>,
 }
 
 impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> {
-    /// `salt` is what else the programs `build` makes vary with.
-    pub(crate) fn new(device: &'a Device, dtype: DType, shape: &'a [usize], salt: impl Debug, build: B) -> Self {
-        let (compiler, dtype) = (tune::compiler(&default_device()), dtype.scalar().expect("a kernel dtype"));
+    /// `salt` is what else the programs `build` makes vary with; the
+    /// choices are read from and kept in `store`. A replaying store keys no
+    /// compiler (it matches any), so no device opens.
+    pub(crate) fn new(
+        store: &'a TuneStore,
+        device: &'a Device,
+        dtype: DType,
+        shape: &[usize],
+        salt: impl Debug,
+        build: B,
+    ) -> Self {
+        let compiler = if store.replays() { 0 } else { tune::compiler(&default_device()) };
         Self {
+            store,
             target: &device.target,
             compiler,
-            dtype,
-            shape,
+            dtype: dtype.scalar().expect("a kernel dtype"),
+            shape: shape.to_vec(),
             salt: format!("{salt:?}"),
             build,
             bench: Bench::default(),
@@ -145,8 +174,8 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
 
     /// The fingerprint of the programs `build` makes of `list`, what an
     /// admission's store line carries: a lowering change re-judges.
-    fn programs(build: &B, list: &[C]) -> u64 {
-        tune::fingerprint(&list.iter().map(|&c| build(c)).collect::<Vec<_>>())
+    fn programs(store: &TuneStore, build: &B, list: &[C]) -> u64 {
+        store.fingerprint(&list.iter().map(|&c| build(c)).collect::<Vec<_>>())
     }
 
     fn key(&self, op: &'static str, list: &[C]) -> TuneKey {
@@ -158,7 +187,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     /// orphaned rather than read.
     fn keyed(&self, op: &'static str, rule: &str, list: &[C]) -> TuneKey {
         let candidates = format!("{}{rule} {list:?}", self.salt);
-        TuneKey::new(op, self.target, self.compiler, self.dtype, self.shape, &candidates)
+        TuneKey::new(op, self.target, self.compiler, self.dtype, &self.shape, &candidates)
     }
 
     /// The first config of `ranked` whose compiled kernel does not spill
@@ -169,10 +198,10 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     pub(crate) fn first_clean(&mut self, op: &'static str, ranked: &[C]) -> Option<C> {
         let ranked = &config::representatives(ranked);
         let key = self.key(op, ranked);
-        let (bench, build) = (&mut self.bench, &self.build);
-        let programs = || Self::programs(build, &ranked[..ranked.len().min(config::FIRST)]);
+        let (store, bench, build) = (self.store, &mut self.bench, &self.build);
+        let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::FIRST)]);
         let find = || config::first_clean(ranked, |batch| bench.admit(batch, build));
-        let at = TuneStore::global().first(&key, programs, find);
+        let at = self.store.first(&key, programs, find);
         ranked.get(at.unwrap_or(0)).copied()
     }
 
@@ -185,10 +214,10 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
             return self.first_clean(op, ranked).into_iter().collect();
         }
         let key = self.key(op, ranked);
-        let (bench, build) = (&mut self.bench, &self.build);
-        let programs = || Self::programs(build, &ranked[..ranked.len().min(config::SHORTLIST)]);
+        let (store, bench, build) = (self.store, &mut self.bench, &self.build);
+        let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::SHORTLIST)]);
         let admit = || config::shortlist(ranked, |batch| bench.admit(batch, build));
-        let found = TuneStore::global().admitted(&key, programs, admit);
+        let found = self.store.admitted(&key, programs, admit);
         match found {
             Some(at) => at.iter().map(|&i| ranked[i]).collect(),
             None => config::distinct(ranked).take(config::SHORTLIST).collect(),
@@ -204,7 +233,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
             return untimed();
         }
         let key = self.key(op, candidates);
-        match TuneStore::global().choose(&key, candidates, &self.build, &mut self.bench) {
+        match self.store.choose(&key, candidates, &self.build, &mut self.bench) {
             Some(timed) => timed.iter().map(|&(i, ns)| (candidates[i], Some(ns))).collect(),
             None => untimed(),
         }
@@ -250,9 +279,9 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
             return winner;
         }
         let key = self.keyed(op, " compiled", &twins);
-        let (bench, build) = (&mut self.bench, &self.build);
+        let (store, bench, build) = (self.store, &mut self.bench, &self.build);
         let admit = || config::compiled(&twins, |batch| bench.admit(batch, build));
-        let judged = TuneStore::global().admitted(&key, || Self::programs(build, &twins), admit);
+        let judged = self.store.admitted(&key, || Self::programs(store, build, &twins), admit);
         match judged {
             Some(at) if at.len() > 1 => self.fastest(op, &at.iter().map(|&i| twins[i]).collect::<Vec<_>>()),
             _ => winner,

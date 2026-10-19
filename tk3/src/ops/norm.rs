@@ -1,13 +1,16 @@
 //! LayerNorm and RMSNorm over the last dim, optionally after a residual add.
 
 use snafu::{ResultExt, ensure};
+use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
+use super::config::Planner;
 use super::shape::{self, extent, shape_of};
 use super::{GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output, typed};
-use crate::kernels::rows::{Norm, NormSpec, norm as kernel};
+use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm as kernel};
 use crate::launch;
+use crate::tune::TuneStore;
 
 /// `(x - mean)·rsqrt(var + eps)·w + b` over the last dim of `x`.
 pub fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Tensor> {
@@ -45,10 +48,7 @@ fn norm(
     b: Option<&Tensor>,
     eps: f64,
 ) -> Result<(Option<Tensor>, Tensor)> {
-    let op = match kind {
-        Norm::Layer => "layer_norm",
-        Norm::Rms => "rms_norm",
-    };
+    let op = op(kind);
     let shape = |t: &Tensor| shape_of(t).context(GraphSnafu { op });
     let xs = shape(x)?;
     let shape_err = |operand, got: &[SInt], expected: String| ShapeSnafu { op, operand, got: fmt_shape(got), expected };
@@ -73,23 +73,39 @@ fn norm(
     let (ext, var, planner) = (ext.expect("planned"), var.flatten(), planner.expect("planned"));
     let (lead, d) = (&ext.dims[..ext.dims.len() - 1], ext.dims[ext.dims.len() - 1]);
     let rows = lead[usize::from(var.is_some())..].iter().product();
-    let batch = batch_of(&var, 1);
-    let (residual_, bias) = (residual.is_some(), b.is_some());
-    let spec = |cfg| NormSpec { norm: kind, rows, d, batch: batch.clone(), eps, residual: residual_, bias, cfg };
-    let shape = [batch.capacity(), rows, d];
-    let cfg = Tuner::new(&planner.device, x.dtype(), &shape, (&batch, kind, residual_, bias), |cfg| {
-        vec![(typed!(x.dtype(), kernel, &spec(cfg)), cfg.lowering(&planner.device))]
-    })
-    .tuned(op, &cfgs, <[_]>::to_vec);
-    let spec = spec(cfg);
+    let (batch, residual_, bias) = (batch_of(&var, 1), residual.is_some(), b.is_some());
+    let spec = NormSpec { norm: kind, rows, d, batch, eps, residual: residual_, bias, cfg: cfgs[0] };
+    let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
     let out = output(&ext.dims, &var, x.dtype()).context(GraphSnafu { op })?;
     let sum = residual.map(|_| output(&ext.dims, &var, x.dtype())).transpose().context(GraphSnafu { op })?;
     let ins: Vec<&Tensor> = [Some(x), residual, Some(w), b, Some(&out), sum.as_ref()].into_iter().flatten().collect();
     let at = ins.len() - 1 - usize::from(sum.is_some());
-    let mut outs = launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &cfg.lowering(&planner.device), &ins)
-        .context(LaunchSnafu { op })?;
+    let mut outs =
+        launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &spec.cfg.lowering(&planner.device), &ins)
+            .context(LaunchSnafu { op })?;
     let sum = sum.map(|_| outs.pop().expect("the sum"));
     Ok((sum, outs.swap_remove(at)))
+}
+
+fn op(kind: Norm) -> &'static str {
+    match kind {
+        Norm::Layer => "layer_norm",
+        Norm::Rms => "rms_norm",
+    }
+}
+
+/// `spec` under the config the norm op launches for its shape: the
+/// tuner's pick among `ranked`, through `store`.
+pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[NormCfg], spec: NormSpec) -> NormSpec {
+    let shape = [spec.batch.capacity(), spec.rows, spec.d];
+    let salt = (&spec.batch, spec.norm, spec.residual, spec.bias);
+    let build = |cfg| vec![(typed!(dtype, kernel, &NormSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build).tuned(
+        op(spec.norm),
+        ranked,
+        <[_]>::to_vec,
+    );
+    NormSpec { cfg, ..spec }
 }
 
 pub(crate) fn graph(

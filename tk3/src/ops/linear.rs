@@ -1,14 +1,22 @@
 //! `scale·act(x·wᵀ + bias) + residual`, or `scale·act(gate)·up + residual`
 //! off a gated weight.
 
+use std::fmt::Debug;
+
 use snafu::{ResultExt, ensure};
+use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
+use super::config::Planner;
 use super::shape::{self, Plan, extent, shape_of};
-use super::{Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output, typed};
-use crate::kernels::gemm::{Epilogue, GemmSpec, Scale, gemm};
+use super::{
+    Act, DEVICE_TEST, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output,
+    typed,
+};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::launch;
+use crate::tune::TuneStore;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Linear<'a> {
@@ -73,17 +81,39 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
         scale: opts.scale.map(Scale::new),
         out_f32: false,
     };
-    let batch = batch_of(&var, 1);
-    let spec = |cfg| GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };
-    let shape = [batch.capacity(), m, n, k];
-    let cfg = Tuner::new(&planner.device, x.dtype(), &shape, (&batch, epilogue), |cfg| {
-        vec![(typed!(x.dtype(), gemm, &spec(cfg)), cfg.lowering(&planner.device))]
-    })
-    .tuned(OP, &cfgs, <[_]>::to_vec);
+    let spec = GemmSpec { m, n, k, batch: batch_of(&var, 1), epilogue, cfg: cfgs[0] };
+    let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
     let y = output(&[lead, &[n]].concat(), &var, x.dtype()).context(GraphSnafu { op: OP })?;
     let ins: Vec<&Tensor> = [Some(x), Some(w), opts.bias, opts.residual, Some(&y)].into_iter().flatten().collect();
-    launch::graph_launch(typed!(x.dtype(), gemm, &spec(cfg)), &cfg.lowering(&planner.device), &ins)
+    launch::graph_launch(typed!(x.dtype(), gemm, &spec), &spec.cfg.lowering(&planner.device), &ins)
         .context(LaunchSnafu { op: OP })
+}
+
+/// `spec` under the config [`linear`] launches for its shape and epilogue:
+/// the tuner's pick among `ranked`, through `store`.
+pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[GemmCfg], spec: GemmSpec) -> GemmSpec {
+    let salt = (&spec.batch, spec.epilogue);
+    tune(store, planner, dtype, ranked, (OP, salt), spec.clone())
+}
+
+/// [`tuned`] as the device tests and GEMM probes tune: under the kernel's
+/// name and [`DEVICE_TEST`].
+pub fn probed(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[GemmCfg], spec: GemmSpec) -> GemmSpec {
+    tune(store, planner, dtype, ranked, ("gemm", DEVICE_TEST), spec)
+}
+
+fn tune(
+    store: &TuneStore,
+    planner: &Planner,
+    dtype: DType,
+    ranked: &[GemmCfg],
+    (op, salt): (&'static str, impl Debug),
+    spec: GemmSpec,
+) -> GemmSpec {
+    let shape = [spec.batch.capacity(), spec.m, spec.n, spec.k];
+    let build = |cfg| vec![(typed!(dtype, gemm, &GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build).tuned(op, ranked, <[_]>::to_vec);
+    GemmSpec { cfg, ..spec }
 }
 
 /// The generic graph of the same op; the input is materialized, since a lazy

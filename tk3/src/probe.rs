@@ -208,7 +208,8 @@ fn priced(target: &Target, mut measure: impl FnMut(Probe) -> Result<f64>) -> Res
 /// or the target no SM count.
 pub fn stored(dir: &std::path::Path, target: &Target) -> Option<Measured> {
     let device = tune::device(target);
-    let file = TuneStore::at(Some(dir.to_path_buf())).file(&device)?;
+    let store = TuneStore::replay(dir.to_path_buf());
+    let file = store.file(&device)?;
     let text = std::fs::read_to_string(&file).ok()?;
     // `value|op|device|dtype|shape|candidates|compiler|programs femtoseconds`
     let lines: Vec<(&str, &str, u64)> = text
@@ -224,7 +225,7 @@ pub fn stored(dir: &std::path::Path, target: &Target) -> Option<Measured> {
         let fs = match found[..] {
             [only] => Some(only.2),
             _ => {
-                let programs = format!("{:016x}", tune::fingerprint(&probe.candidates));
+                let programs = format!("{:016x}", store.fingerprint(&probe.candidates));
                 found.iter().find(|l| l.1 == programs).map(|l| l.2)
             }
         };

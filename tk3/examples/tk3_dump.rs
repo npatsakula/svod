@@ -7,32 +7,59 @@
 //!
 //! ```text
 //! cargo run -p svod-tk3 --release --example tk3_dump -- --arch sm_90a --sms 114 \
-//!     --op gemm --shape 4096x4096x4096 [--dtype bf16] [--cfg 0] [--store DIR] [--out DIR]
+//!     --op gemm --shape 4096x4096x4096 [--dtype bf16] [--cfg 0|tuned] [--store DIR] [--out DIR]
 //! cargo run -p svod-tk3 --release --example tk3_dump -- --card mi300x --op attention --shape 8x16x1024x128 --causal
 //! ```
+//!
+//! `--op` and its `--shape`: `gemm MxNxK` (`--bias`, `--residual`, `--gated`,
+//! `--act silu|gelu`), `attention BxHxTxD` (`--causal`), `norm RxD` (`--norm
+//! rms|layer`, `--bias`, `--residual`), `conv BxHxWxCINxCOUT` (`--kernel K`,
+//! `--stride S`, `--pad P`, `--dilation D`, `--bias`, `--residual`, `--act`),
+//! `heads BxTxHxKVxD` (`--qk-norm`, `--rope`). Each goes through the op
+//! layer's own shape gate (`ops::shape`) and tuning (`ops::tuned`).
 //!
 //! `--arch` takes the SMs and dies of the first card of `svod_tk3::atoms::CARDS`
 //! of the architecture unless `--sms`/`--xcds` say otherwise; `--store` is a
 //! tune store directory copied from the card (its probe lines price the
-//! ranking), else the guessed costs do. `RUST_LOG=svod_tk3::plan=debug` logs
-//! the planner's decisions.
+//! ranking), else the guessed costs do. `--cfg I` emits the ranking's `I`th
+//! config; `--cfg tuned` the one the tuner chose on the card, read from the
+//! store's `admitted`/`choice` lines ([`TuneStore::replay`]): a line matches
+//! by op, device, dtype, shape and the digest of the salt and config list
+//! the op layer keys it by, whatever compiler and kernel build wrote it, so
+//! the ranking must be the card's (its stored costs). A GEMM reads `linear`'s
+//! lines, else those the device tests and GEMM probes tuned (`gemm`,
+//! `ops::DEVICE_TEST`). `RUST_LOG=svod_tk3::plan=debug` logs the planner's
+//! decisions.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use svod_dtype::{AmdArch, CudaArch, GpuArch};
+use svod_dtype::{AmdArch, CudaArch, DType, GpuArch};
 use svod_tk3::atoms::{CARDS, Target};
 use svod_tk3::build::{BF16, F16};
 use svod_tk3::ir::Program;
-use svod_tk3::kernels::Batch;
 use svod_tk3::kernels::attention::{AttnMask, AttnSpec, attention};
+use svod_tk3::kernels::conv::{ConvGeom, ConvSpec};
 use svod_tk3::kernels::gemm::{Epilogue, GemmSpec, gemm};
+use svod_tk3::kernels::heads::{HeadsSpec, Rope, heads};
+use svod_tk3::kernels::rows::{Norm, NormSpec, norm};
+use svod_tk3::kernels::{Act, Batch};
 use svod_tk3::lower::Lowering;
 use svod_tk3::ops::config::{Attention, Planner, Problem, gemm_lattice};
+use svod_tk3::ops::shape::{self, Extent, Plan};
+use svod_tk3::ops::tuned;
 use svod_tk3::probe::{self, Measured};
+use svod_tk3::tune::{Found, TuneStore};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// What `--cfg` asks for.
+#[derive(Clone, Copy)]
+enum Pick {
+    Ranked(usize),
+    Tuned,
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
@@ -58,38 +85,179 @@ fn main() -> Result<()> {
         .ok_or("the planner needs the card's SM count: pass --sms or --card")?;
     let dims: Vec<usize> =
         opt("--shape").ok_or("--shape")?.split('x').map(str::parse).collect::<std::result::Result<_, _>>()?;
-    let bf16 = opt("--dtype").unwrap_or("bf16") == "bf16";
+    let dtype = if opt("--dtype").unwrap_or("bf16") == "bf16" { DType::BFloat16 } else { DType::Float16 };
+    let bf16 = dtype == DType::BFloat16;
     let out = PathBuf::from(opt("--out").unwrap_or("tk3_dump"));
     std::fs::create_dir_all(&out)?;
-    let (top, pick) = (num("--top")?.unwrap_or(16), num("--cfg")?.unwrap_or(0));
+    let top = num("--top")?.unwrap_or(16);
+    let pick = match opt("--cfg") {
+        Some("tuned") => Pick::Tuned,
+        Some(i) => Pick::Ranked(i.parse()?),
+        None => Pick::Ranked(0),
+    };
+    let store = || -> Result<TuneStore> {
+        let dir = opt("--store").ok_or("--cfg tuned reads the tuner's choice from --store DIR")?;
+        Ok(TuneStore::replay(PathBuf::from(dir)))
+    };
+    let act = match opt("--act") {
+        None => Act::None,
+        Some("silu") => Act::Silu,
+        Some("gelu") => Act::Gelu,
+        Some(other) => return Err(format!("--act {other}: silu or gelu").into()),
+    };
+    let epilogue = Epilogue { bias: flag("--bias"), act, residual: flag("--residual"), ..Epilogue::DEFAULT };
+    let extent = |dims: &[usize]| Extent { dims: dims.to_vec(), var: false };
+    let gate = |op: &'static str| move |why| format!("{op}: the op layer takes the graph ({why:?})");
 
     let mut plan = String::new();
-    let (prog, lowering): (Program, Lowering) = match (opt("--op").ok_or("--op")?, &dims[..]) {
+    let programs: Vec<(Program, Lowering)> = match (opt("--op").ok_or("--op")?, &dims[..]) {
         ("gemm", &[m, n, k]) => {
-            let p = Problem { batches: 1, m, n, k, halves: 1 };
-            let ranked = planner.gemm_ranked(1, m, n, k, false);
-            let lattice = gemm_lattice(&target);
-            report(&mut plan, top, &ranked, &lattice, |c| p.admit(&planner, c));
-            let cfg = *ranked.get(pick).ok_or("no such ranked config")?;
-            println!("emitting #{pick}: {cfg:?}");
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
-            (if bf16 { gemm::<BF16>(&spec) } else { gemm::<F16>(&spec) }, cfg.lowering(&planner.device))
+            let gated = flag("--gated");
+            let epilogue = Epilogue { gated, ..epilogue };
+            let operands = vec![dtype.clone(); 2 + usize::from(epilogue.bias) + usize::from(epilogue.residual)];
+            let ranked = kernel(shape::linear(Some(&planner), &operands, Some(&extent(&[m, k])), n, gated))
+                .map_err(gate("linear"))?;
+            let p = Problem { batches: 1, m, n, k, halves: if gated { 2 } else { 1 } };
+            report(&mut plan, top, &ranked, &gemm_lattice(&target), |c| p.admit(&planner, c));
+            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: ranked[0] };
+            let spec = match pick {
+                Pick::Ranked(i) => GemmSpec { cfg: *ranked.get(i).ok_or("no such ranked config")?, ..spec },
+                Pick::Tuned => {
+                    let linear = |s: &TuneStore| tuned::linear(s, &planner, dtype.clone(), &ranked, spec.clone());
+                    let probed = |s: &TuneStore| tuned::gemm_probe(s, &planner, dtype.clone(), &ranked, spec.clone());
+                    replayed(&store()?, "linear", linear).or_else(|why| {
+                        println!("{why}\ntrying the device tests' and GEMM probes' tuning (op gemm)");
+                        replayed(&store()?, "gemm", probed)
+                    })?
+                }
+            };
+            println!("emitting {:?}", spec.cfg);
+            vec![(if bf16 { gemm::<BF16>(&spec) } else { gemm::<F16>(&spec) }, spec.cfg.lowering(&planner.device))]
         }
         ("attention", &[b, h, t, d]) => {
-            let a = Attention { tiles: b * h, t, tk: t, d, causal: flag("--causal"), bias: false };
-            let ranked = planner.attention_ranked(b * h, t, t, d, a.causal, false);
+            let causal = flag("--causal");
+            let qkv = extent(&[b, t, h, d]);
+            let operands = [dtype.clone(), dtype.clone(), dtype.clone()];
+            let ranked = kernel(shape::attention(Some(&planner), &operands, Some(&qkv), Some(&qkv), causal, false))
+                .map_err(gate("attention"))?;
+            let a = Attention { tiles: b * h, t, tk: t, d, causal, bias: false };
             report(&mut plan, top, &ranked, &a.lattice(&target), |c| a.admit(&planner, c));
-            let cfg = *ranked.get(pick).ok_or("no such ranked config")?;
-            println!("emitting #{pick}: {cfg:?}");
-            let mask = AttnMask { causal: a.causal, ..AttnMask::default() };
+            let mask = AttnMask { causal, ..AttnMask::default() };
             let scale = 1.0 / (d as f32).sqrt();
+            let cfg = ranked[0];
             let spec =
                 AttnSpec { batch: Batch::Static(b), t, tk: t, heads: h, kv_heads: h, d, mask, cache: None, scale, cfg };
-            (if bf16 { attention::<BF16>(&spec) } else { attention::<F16>(&spec) }, cfg.lowering(&planner.device))
+            let spec = match pick {
+                Pick::Ranked(i) => AttnSpec { cfg: *ranked.get(i).ok_or("no such ranked config")?, ..spec },
+                Pick::Tuned => replayed(&store()?, "attention", |s| {
+                    tuned::attention(s, &planner, dtype.clone(), &ranked, spec.clone(), None)
+                })?,
+            };
+            println!("emitting {:?}", spec.cfg);
+            let fa = if bf16 { attention::<BF16>(&spec) } else { attention::<F16>(&spec) };
+            vec![(fa, spec.cfg.lowering(&planner.device))]
         }
-        (op, dims) => return Err(format!("{op} over {dims:?}: gemm takes MxNxK, attention BxHxTxD").into()),
+        ("norm", &[rows, d]) => {
+            let kind = match opt("--norm").unwrap_or("rms") {
+                "rms" => Norm::Rms,
+                "layer" => Norm::Layer,
+                other => return Err(format!("--norm {other}: rms or layer").into()),
+            };
+            let (residual, bias) = (flag("--residual"), flag("--bias") && kind == Norm::Layer);
+            let operands = vec![dtype.clone(); 2 + usize::from(residual) + usize::from(bias)];
+            let ranked =
+                kernel(shape::norm(Some(&planner), &operands, Some(&extent(&[rows, d])))).map_err(gate("norm"))?;
+            listed(&mut plan, &ranked);
+            let cfg = ranked[0];
+            let spec = NormSpec { norm: kind, rows, d, batch: Batch::Static(1), eps: 1e-5, residual, bias, cfg };
+            let spec = match pick {
+                Pick::Ranked(i) => NormSpec { cfg: *ranked.get(i).ok_or("no such config")?, ..spec },
+                Pick::Tuned => {
+                    replayed(&store()?, "norm", |s| tuned::norm(s, &planner, dtype.clone(), &ranked, spec.clone()))?
+                }
+            };
+            println!("emitting {:?}", spec.cfg);
+            vec![(if bf16 { norm::<BF16>(&spec) } else { norm::<F16>(&spec) }, spec.cfg.lowering(&planner.device))]
+        }
+        ("conv", &[b, h, w, cin, cout]) => {
+            let k = num("--kernel")?.unwrap_or(3);
+            let [stride, pad, dilation] =
+                [num("--stride")?.unwrap_or(1), num("--pad")?.unwrap_or(k / 2), num("--dilation")?.unwrap_or(1)];
+            let geom = ConvGeom {
+                h,
+                w,
+                cin,
+                cout,
+                kernel: [k, k],
+                stride: [stride; 2],
+                pad: [pad; 2],
+                dilation: [dilation; 2],
+            };
+            if k == 1 && stride == 1 && pad == 0 {
+                return Err("a pointwise convolution runs as a linear: --op gemm".into());
+            }
+            let operands = vec![dtype.clone(); 2 + usize::from(epilogue.bias)];
+            let residual = epilogue.residual.then(|| dtype.clone());
+            let x = extent(&[b, h, w, cin]);
+            let ranked = kernel(shape::conv2d(Some(&planner), &operands, dtype.clone(), residual, Some(&x), &geom, 1))
+                .map_err(gate("conv2d"))?;
+            let (batches, m) = shape::conv_grid(&x, &geom);
+            let p = Problem { batches, m, n: cout, k: geom.k(), halves: 1 };
+            let gemms: Vec<_> = ranked.iter().map(|c| c.gemm).collect();
+            report(&mut plan, top, &gemms, &[], |c| p.admit(&planner, c));
+            let c = ranked[0];
+            let spec = ConvSpec { batch: Batch::Static(b), geom, epilogue, cfg: c.gemm, split: c.split };
+            let spec = match pick {
+                Pick::Ranked(i) => {
+                    let c = *ranked.get(i).ok_or("no such ranked config")?;
+                    ConvSpec { cfg: c.gemm, split: c.split, ..spec }
+                }
+                Pick::Tuned => {
+                    replayed(&store()?, "conv2d", |s| tuned::conv(s, &planner, dtype.clone(), &ranked, spec.clone()))?
+                }
+            };
+            println!("emitting {:?} split {}", spec.cfg, spec.split);
+            if bf16 { spec.programs::<BF16>(&planner.device) } else { spec.programs::<F16>(&planner.device) }
+        }
+        ("heads", &[b, t, heads_, kv_heads, d]) => {
+            let (qk_norm, rope) = (flag("--qk-norm"), flag("--rope"));
+            let operands = vec![dtype.clone(); 1 + 2 * usize::from(qk_norm) + 2 * usize::from(rope)];
+            let x = extent(&[b, t, (heads_ + 2 * kv_heads) * d]);
+            let ranked = kernel(shape::heads(Some(&planner), &operands, Some(&x), d)).map_err(gate("heads"))?;
+            listed(&mut plan, &ranked);
+            let spec = HeadsSpec {
+                batch: Batch::Static(b),
+                t,
+                heads: heads_,
+                kv_heads,
+                d,
+                q_norm: qk_norm,
+                k_norm: qk_norm,
+                eps: 1e-6,
+                rope: rope.then_some(Rope { per_batch: false }),
+                cfg: ranked[0],
+            };
+            let spec = match pick {
+                Pick::Ranked(i) => HeadsSpec { cfg: *ranked.get(i).ok_or("no such config")?, ..spec },
+                Pick::Tuned => {
+                    replayed(&store()?, "heads", |s| tuned::heads(s, &planner, dtype.clone(), &ranked, spec.clone()))?
+                }
+            };
+            println!("emitting {:?}", spec.cfg);
+            vec![(if bf16 { heads::<BF16>(&spec) } else { heads::<F16>(&spec) }, spec.cfg.lowering(&planner.device))]
+        }
+        (op, dims) => {
+            return Err(format!(
+                "{op} over {dims:?}: gemm takes MxNxK, attention BxHxTxD, norm RxD, conv BxHxWxCINxCOUT, heads BxTxHxKVxD"
+            )
+            .into());
+        }
     };
     std::fs::write(out.join("plan.txt"), plan)?;
+    if programs.len() > 1 {
+        println!("{} programs (a split and its merge): the first is emitted", programs.len());
+    }
+    let (prog, lowering) = programs.into_iter().next().expect("a program");
 
     let ir = svod_tk3::lower::standalone(prog, &lowering)?.text(&target)?;
     write(&out, "kernel.ll", ir.as_bytes())?;
@@ -102,6 +270,56 @@ fn main() -> Result<()> {
         histogram(&asm, what);
     }
     Ok(())
+}
+
+/// The ranked configs of a kernel plan; the fallback otherwise.
+fn kernel<C>(plan: Plan<C>) -> std::result::Result<std::sync::Arc<[C]>, shape::Fallback> {
+    match plan {
+        Plan::Kernel(ranked) => Ok(ranked),
+        Plan::Graph(why) => Err(why),
+    }
+}
+
+/// What `tune` picked through a replay of the tune store, each key it read
+/// printed with what it found; an error when a key had no line, since the
+/// pick is then not the tuner's.
+fn replayed<S>(store: &TuneStore, op: &str, tune: impl FnOnce(&TuneStore) -> S) -> Result<S> {
+    let spec = tune(store);
+    let lookups = store.lookups();
+    println!("tuned {op}: {} store keys read", lookups.len());
+    for l in &lookups {
+        let entry = l.entry.as_ref().map_or("-".to_string(), |e| format!("{e:?}"));
+        let entry: String = entry.chars().take(96).collect();
+        println!("  {:<8} {:<28} {}  {entry}", l.kind.name(), format!("{:?}", l.found), l.key);
+    }
+    let missing: Vec<_> = lookups.iter().filter(|l| matches!(l.found, Found::Missing { .. })).collect();
+    match missing.first() {
+        None if lookups.is_empty() => {
+            Err(format!("{op}: tuning read no store key (tuning off, or one candidate)").into())
+        }
+        None => Ok(spec),
+        Some(l) => {
+            let Found::Missing { others } = l.found else { unreachable!() };
+            Err(format!(
+                "{op}: no `{}` line for {} ({others} {} lines of the shape under other candidate lists: another \
+                 ranking, salt or rule; a ranking moves with the costs, so --store must hold the card's probes)",
+                l.kind.name(),
+                l.key,
+                l.kind.name()
+            )
+            .into())
+        }
+    }
+}
+
+/// A fixed candidate list (no cost model ranks it) on stdout and into `plan`.
+fn listed<C: std::fmt::Debug>(plan: &mut String, ranked: &[C]) {
+    for (i, c) in ranked.iter().enumerate() {
+        let line = format!("#{i:<4} {c:?}");
+        println!("{line}");
+        plan.push_str(&line);
+        plan.push('\n');
+    }
 }
 
 /// The target of `--card`, else of `--arch` with the SMs and dies of its

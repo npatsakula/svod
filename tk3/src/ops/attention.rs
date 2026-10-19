@@ -6,6 +6,7 @@ use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
+use super::config::Planner;
 use super::shape::{self, extent, shape_of};
 use super::{
     DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
@@ -19,6 +20,7 @@ use crate::kernels::attention::{
 };
 use crate::kernels::rows::NormCfg;
 use crate::launch;
+use crate::tune::TuneStore;
 
 /// Which keys each batch row attends to.
 #[derive(Clone, Copy, Debug, Default)]
@@ -191,70 +193,11 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         app_lens: c.app_lens.is_some(),
     });
     let edges = AttnMask { causal: opts.causal, window: opts.window, chunk: opts.chunk, ..AttnMask::default() };
-    let spec = |cfg, mask, cache| AttnSpec {
-        batch: batch.clone(),
-        t,
-        tk,
-        heads,
-        kv_heads,
-        d,
-        mask,
-        cache,
-        scale: opts.scale.unwrap_or(1.0 / (d as f32).sqrt()),
-        cfg,
-    };
-    // The configs are admitted at a given split count, else unsplit; then
-    // each comes with every split count worth measuring, the unsplit first.
-    let ranked = split_ranked(&cfgs, opts.splits, tk);
-    let expand = |admitted: &[FaCfg]| -> Vec<FaCfg> {
-        let splits = |c: &FaCfg| match opts.splits {
-            Some(_) => vec![c.splits],
-            None => planner.splits(batch.capacity() * heads * t.div_ceil(c.bq), tk.div_ceil(c.bkv)),
-        };
-        admitted.iter().flat_map(|c| splits(c).into_iter().map(|splits| FaCfg { splits, ..*c })).collect()
-    };
-    let merge = |splits| CombineSpec { batch: batch.clone(), t, heads, d, splits, cfg: NormCfg { br: MERGE_ROWS } };
-    // Measured with the static masks and the bias only (scratch parameters
-    // would be garbage; a bias streams the same whatever it holds) and at
-    // most `TUNE_BATCH` lanes: more fill the device alike, and a cache's
-    // scratch grows with every lane.
-    let measured_mask = AttnMask { bias: bias_rows, ..edges };
-    let measured = match &batch {
-        Batch::Static(n) if *n > TUNE_BATCH => Batch::Static(TUNE_BATCH),
-        Batch::Var { name, min, max } if *max > TUNE_BATCH as i64 => {
-            Batch::Var { name: name.clone(), min: (*min).min(TUNE_BATCH as i64), max: TUNE_BATCH as i64 }
-        }
-        other => other.clone(),
-    };
-    // A cache with fewer rows than lanes is read through a map (zeros, in
-    // the scratch): lanes sharing a row is what makes a cross cache cheap,
-    // and the tuner should see it. Otherwise a row per lane, no map.
-    let rows = cache.map(|c| c.rows.min(measured.capacity()));
-    let mapped = cache.is_some_and(|c| c.row_map) && rows.is_some_and(|r| r < measured.capacity());
-    let shape = [measured.capacity(), t, tk, heads, kv_heads, d];
-    let salt = (&measured, measured_mask, cache.map(|c| c.heads_total), rows, mapped, opts.splits);
-    let mut tuner = Tuner::new(&planner.device, q.dtype(), &shape, salt, |cfg: FaCfg| {
-        // Scratch caches hold no appended rows and no garbage: a zero map.
-        let plain = cache.map(|c| kernels::attention::Cache {
-            rows: rows.expect("a cache"),
-            row_map: mapped,
-            appended: 0,
-            app_lens: false,
-            ..c
-        });
-        let spec = AttnSpec { batch: measured.clone(), ..spec(cfg, measured_mask, plain) };
-        let mut programs = timed_keys(tk, cache.is_some() || lens.is_some(), &cfg)
-            .into_iter()
-            .map(|tk| (typed!(q.dtype(), fa, &AttnSpec { tk, ..spec.clone() }), cfg.lowering(&planner.device)))
-            .collect::<Vec<_>>();
-        if cfg.splits > 1 {
-            let merge = merge(cfg.splits);
-            programs.push((typed!(q.dtype(), combine, &merge), merge.cfg.lowering(&planner.device)));
-        }
-        programs
-    });
-    let cfg = tune(&mut tuner, &ranked, biased, expand);
-    tracing::debug!(target: super::PLAN, op = OP, ?shape, pick = ?cfg, "attention tuned");
+    // `lens`, `bools` and `segs` are set below; the tuner reads the key lengths' presence.
+    let mask = AttnMask { key_lens: lens.is_some(), bias: bias_rows, ..edges };
+    let scale = opts.scale.unwrap_or(1.0 / (d as f32).sqrt());
+    let spec = AttnSpec { batch: batch.clone(), t, tk, heads, kv_heads, d, mask, cache, scale, cfg: cfgs[0] };
+    let cfg = tuned(TuneStore::global(), &planner, q.dtype(), &cfgs, spec.clone(), opts.splits).cfg;
     let i32 = |t: &Tensor| if t.dtype() == DType::Int32 { t.clone() } else { t.cast(DType::Int32) };
     let lens = lens.map(i32);
     // Rows padded to the kernel's aligned stride.
@@ -285,7 +228,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         bias: bias_rows,
         ..edges
     };
-    let spec = spec(cfg, mask, cache);
+    let spec = AttnSpec { mask, cfg, ..spec };
     let lowering = cfg.lowering(&planner.device);
     let extras = [
         lens.as_ref(),
@@ -319,11 +262,89 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         .collect();
     let parts =
         launch::graph_launch_all(typed!(q.dtype(), fa, &spec), &lowering, &ins).context(LaunchSnafu { op: OP })?;
-    let merge = merge(cfg.splits);
+    let merge = merge(batch, t, heads, d, cfg.splits);
     let o = output(&q_ext.dims, &var, q.dtype()).context(GraphSnafu { op: OP })?;
     let ins = [&parts[3], &parts[4], &parts[5], &o];
     launch::graph_launch(typed!(q.dtype(), combine, &merge), &merge.cfg.lowering(&planner.device), &ins)
         .context(LaunchSnafu { op: OP })
+}
+
+/// The merge of `splits` partial results.
+fn merge(batch: Batch, t: usize, heads: usize, d: usize, splits: usize) -> CombineSpec {
+    CombineSpec { batch, t, heads, d, splits, cfg: NormCfg { br: MERGE_ROWS } }
+}
+
+/// `spec` under the config [`attention`] launches for its shape and masks
+/// (`spec.mask` as launched: the key lengths' presence and the bias are
+/// what the tuner reads of it): the tuner's pick among `ranked` (the shape
+/// gate's list, the configs that hold `spec`'s appended rows), at the
+/// split count `splits` names or every one worth measuring, through `store`.
+pub fn tuned(
+    store: &TuneStore,
+    planner: &Planner,
+    dtype: DType,
+    ranked: &[FaCfg],
+    spec: AttnSpec,
+    splits: Option<usize>,
+) -> AttnSpec {
+    let AttnSpec { t, tk, heads, d, cache, .. } = spec;
+    let lens = spec.mask.key_lens;
+    let edges =
+        AttnMask { causal: spec.mask.causal, window: spec.mask.window, chunk: spec.mask.chunk, ..AttnMask::default() };
+    let bias_rows = spec.mask.bias;
+    // The configs are admitted at a given split count, else unsplit; then
+    // each comes with every split count worth measuring, the unsplit first.
+    let split = split_ranked(ranked, splits, tk);
+    let expand = |admitted: &[FaCfg]| -> Vec<FaCfg> {
+        let counts = |c: &FaCfg| match splits {
+            Some(_) => vec![c.splits],
+            None => planner.splits(spec.batch.capacity() * heads * t.div_ceil(c.bq), tk.div_ceil(c.bkv)),
+        };
+        admitted.iter().flat_map(|c| counts(c).into_iter().map(|splits| FaCfg { splits, ..*c })).collect()
+    };
+    // Measured with the static masks and the bias only (scratch parameters
+    // would be garbage; a bias streams the same whatever it holds) and at
+    // most `TUNE_BATCH` lanes: more fill the device alike, and a cache's
+    // scratch grows with every lane.
+    let measured_mask = AttnMask { bias: bias_rows, ..edges };
+    let measured = match &spec.batch {
+        Batch::Static(n) if *n > TUNE_BATCH => Batch::Static(TUNE_BATCH),
+        Batch::Var { name, min, max } if *max > TUNE_BATCH as i64 => {
+            Batch::Var { name: name.clone(), min: (*min).min(TUNE_BATCH as i64), max: TUNE_BATCH as i64 }
+        }
+        other => other.clone(),
+    };
+    // A cache with fewer rows than lanes is read through a map (zeros, in
+    // the scratch): lanes sharing a row is what makes a cross cache cheap,
+    // and the tuner should see it. Otherwise a row per lane, no map.
+    let rows = cache.map(|c| c.rows.min(measured.capacity()));
+    let mapped = cache.is_some_and(|c| c.row_map) && rows.is_some_and(|r| r < measured.capacity());
+    let shape = [measured.capacity(), t, tk, heads, spec.kv_heads, d];
+    let salt = (&measured, measured_mask, cache.map(|c| c.heads_total), rows, mapped, splits);
+    let build = |cfg: FaCfg| {
+        // Scratch caches hold no appended rows and no garbage: a zero map.
+        let plain = cache.map(|c| kernels::attention::Cache {
+            rows: rows.expect("a cache"),
+            row_map: mapped,
+            appended: 0,
+            app_lens: false,
+            ..c
+        });
+        let spec = AttnSpec { batch: measured.clone(), mask: measured_mask, cache: plain, cfg, ..spec.clone() };
+        let mut programs = timed_keys(tk, cache.is_some() || lens, &cfg)
+            .into_iter()
+            .map(|tk| (typed!(dtype, fa, &AttnSpec { tk, ..spec.clone() }), cfg.lowering(&planner.device)))
+            .collect::<Vec<_>>();
+        if cfg.splits > 1 {
+            let merge = merge(spec.batch.clone(), t, heads, d, cfg.splits);
+            programs.push((typed!(dtype, combine, &merge), merge.cfg.lowering(&planner.device)));
+        }
+        programs
+    };
+    let mut tuner = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build);
+    let cfg = tune(&mut tuner, &split, bias_rows.is_some(), expand);
+    tracing::debug!(target: super::PLAN, op = OP, ?shape, pick = ?cfg, "attention tuned");
+    AttnSpec { cfg, ..spec }
 }
 
 /// `cfgs` (ranked) at the split count the caller names, else unsplit. A

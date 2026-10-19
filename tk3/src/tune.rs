@@ -100,10 +100,19 @@ impl TuneKey {
     /// The store line of a `kind` of entry for the candidate programs
     /// fingerprinted as `programs`.
     pub fn line(&self, kind: Kind, programs: u64) -> String {
+        format!("{}|{:016x}|{programs:016x}", self.candidates(kind), self.compiler)
+    }
+
+    /// A line's key up to the candidates' digest: what a [`TuneStore::replay`]
+    /// matches, whatever compiler and programs keyed the line.
+    pub fn candidates(&self, kind: Kind) -> String {
+        format!("{}|{:016x}", self.shape(kind), self.candidates)
+    }
+
+    /// A line's key up to the shape: the lines of one shape, any candidates.
+    fn shape(&self, kind: Kind) -> String {
         let shape: Vec<String> = self.shape.iter().map(usize::to_string).collect();
-        let (op, device, dtype, compiler) = (self.op, &self.device, self.dtype, self.compiler);
-        let (kind, candidates) = (kind.name(), self.candidates);
-        format!("{kind}|{op}|{device}|{dtype:?}|{}|{candidates:016x}|{compiler:016x}|{programs:016x}", shape.join("x"))
+        format!("{}|{}|{}|{:?}|{}", kind.name(), self.op, self.device, self.dtype, shape.join("x"))
     }
 }
 
@@ -171,6 +180,34 @@ pub enum Entry {
     Admitted(Arc<[usize]>),
 }
 
+/// What a [`TuneStore::replay`] found for one key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lookup {
+    pub kind: Kind,
+    /// The key up to its candidates' digest ([`TuneKey::candidates`]).
+    pub key: String,
+    /// The entry read, `None` when missing.
+    pub entry: Option<Entry>,
+    pub found: Found,
+}
+
+/// Which of a key's lines a replay read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Found {
+    /// The line of the programs this build emits.
+    Own,
+    /// No line of this build's programs; `lines` of other builds (another
+    /// kernel text), all holding the one entry read.
+    Built { lines: usize },
+    /// As [`Found::Built`], but the lines disagree: the first in the file's
+    /// order is read.
+    Disagree { lines: usize },
+    /// No line of the key; `others` lines of the kind for the same op,
+    /// device, dtype and shape under other candidate lists (another ranking,
+    /// another salt or rule).
+    Missing { others: usize },
+}
+
 /// An [`Entry`]'s kind, leading its line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -182,7 +219,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Kind::Choice => "choice",
             Kind::Value => "value",
@@ -232,6 +269,9 @@ fn prune(dir: &std::path::Path) {
 #[derive(Debug)]
 pub struct TuneStore {
     root: Option<PathBuf>,
+    /// What a [`Self::replay`] found per key asked, in order; `None` for a
+    /// store that measures and writes.
+    replayed: Option<Mutex<Vec<Lookup>>>,
     /// The entry per kind and key, `None` where nothing could be measured.
     memo: Once<(Kind, TuneKey), Option<Entry>>,
     /// What programs emit by what they are made of ([`Self::fingerprint`]).
@@ -257,7 +297,55 @@ fn build() -> Option<u64> {
 impl TuneStore {
     /// The store rooted at `root` (`None`: memory only).
     pub fn at(root: Option<PathBuf>) -> Self {
-        Self { root, memo: Mutex::default(), emitted: OnceLock::new(), build: build() }
+        Self { root, replayed: None, memo: Mutex::default(), emitted: OnceLock::new(), build: build() }
+    }
+
+    /// The store at `root` read back without a device, written to never
+    /// (its `emitted` memo included): the entries a tuner reads are the
+    /// lines of each key up to its candidates' digest ([`TuneKey::candidates`]),
+    /// whatever compiler keyed them (no device opens here to name its own)
+    /// and whatever programs: the line of the programs this build emits
+    /// where there is one, else the other builds' lines. Nothing is
+    /// measured: a key without a line answers `None`, as an unmeasured one
+    /// does. [`Self::lookups`] says what each key found.
+    pub fn replay(root: PathBuf) -> Self {
+        Self { replayed: Some(Mutex::default()), ..Self::at(Some(root)) }
+    }
+
+    /// Whether this is a [`Self::replay`].
+    pub fn replays(&self) -> bool {
+        self.replayed.is_some()
+    }
+
+    /// What a [`Self::replay`] found for each key asked, in order.
+    pub fn lookups(&self) -> Vec<Lookup> {
+        self.replayed.as_ref().map(|r| r.lock().expect("replay log").clone()).unwrap_or_default()
+    }
+
+    /// The entry a replay reads for `key` ([`Self::replay`]), logged in
+    /// [`Self::lookups`].
+    fn replayed(&self, kind: Kind, key: &TuneKey, programs: u64, valid: impl Fn(&Entry) -> bool) -> Option<Entry> {
+        let entries = self.entries(key);
+        let (prefix, shape) = (format!("{}|", key.candidates(kind)), format!("{}|", key.shape(kind)));
+        let mut lines: Vec<(&String, &Entry)> =
+            entries.iter().filter(|(line, entry)| line.starts_with(&prefix) && valid(entry)).collect();
+        lines.sort_by_key(|(line, _)| line.as_str());
+        let own = lines.iter().find(|(line, _)| line.ends_with(&format!("|{programs:016x}")));
+        let (found, entry) = match (own, lines.first()) {
+            (Some(&(_, entry)), _) => (Found::Own, Some(entry)),
+            (None, Some(&(_, entry))) if lines.iter().all(|(_, e)| *e == entry) => {
+                (Found::Built { lines: lines.len() }, Some(entry))
+            }
+            (None, Some(&(_, entry))) => (Found::Disagree { lines: lines.len() }, Some(entry)),
+            (None, None) => {
+                let others = entries.keys().filter(|line| line.starts_with(&shape)).count();
+                (Found::Missing { others }, None)
+            }
+        };
+        let lookup = Lookup { kind, key: key.candidates(kind), entry: entry.cloned(), found };
+        tracing::debug!(target: crate::ops::PLAN, ?lookup, "replayed");
+        self.replayed.as_ref().expect("a replay").lock().expect("replay log").push(lookup);
+        entry.cloned()
     }
 
     /// [`fingerprint`] under this store: what each program emits is read
@@ -275,7 +363,7 @@ impl TuneStore {
         use rayon::prelude::*;
         let made_of: Vec<Vec<u64>> =
             candidates.iter().map(|c| c.iter().map(|(p, l)| digest(&format!("{p:?}{l:?}"))).collect()).collect();
-        let dir = self.root.as_ref().map(|root| root.join("emitted"));
+        let dir = self.root.as_ref().filter(|_| !self.replays()).map(|root| root.join("emitted"));
         let file = dir.as_ref().zip(self.build).map(|(dir, build)| dir.join(format!("{build:016x}.txt")));
         let memo = self.emitted.get_or_init(|| {
             if let Some(dir) = &dir {
@@ -358,7 +446,7 @@ impl TuneStore {
     fn put(&self, key: &TuneKey, line: String, entry: &Entry) {
         static WRITERS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = LazyLock::new(Mutex::default);
         static TEMPS: AtomicU64 = AtomicU64::new(0);
-        let Some(path) = self.path(key) else { return };
+        let Some(path) = self.path(key).filter(|_| !self.replays()) else { return };
         let writer = WRITERS.lock().unwrap_or_else(PoisonError::into_inner).entry(path.clone()).or_default().clone();
         let _writing = writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut entries = self.entries(key);
@@ -400,6 +488,9 @@ impl TuneStore {
     ) -> Option<Entry> {
         once(&self.memo, &(kind, key.clone()), || {
             let (programs, built) = programs();
+            if self.replays() {
+                return self.replayed(kind, key, programs, &valid);
+            }
             let line = key.line(kind, programs);
             self.entries(key).remove(&line).filter(&valid).or_else(|| {
                 tracing::debug!(target: crate::ops::PLAN, line, "store miss");
@@ -424,7 +515,7 @@ impl TuneStore {
     ) -> Option<Arc<[(usize, u64)]>> {
         let programs = || {
             let built: Vec<Candidate> = candidates.iter().map(|&c| build(c)).collect();
-            (fingerprint(&built), built)
+            (self.fingerprint(&built), built)
         };
         let within =
             |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _)| i < candidates.len()));
