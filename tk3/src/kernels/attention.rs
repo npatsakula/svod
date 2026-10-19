@@ -687,32 +687,14 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
                 k.store(m_v, m);
                 k.store(l_v, l);
             });
-            let parts: Vec<_> = (0..kw)
+            let parts: Vec<State> = (0..kw)
                 .map(|w| {
                     let (o_v, m_v, l_v) = views(&mut k, Sc::from(w));
-                    (k.load(o_v), k.load(m_v), k.load(l_v))
+                    State { m: k.load(m_v), l: k.load(l_v), o: k.load(o_v) }
                 })
                 .collect();
-            let mut m = parts[0].1;
-            for (_, mw, _) in &parts[1..] {
-                m = k.binary(m, *mw, BinaryOp::Max);
-            }
-            let (mut l, mut acc) = (None, None);
-            for (ow, mw, lw) in &parts {
-                let w = k.binary(*mw, m, BinaryOp::Sub);
-                let w = k.unary(w, UnaryOp::Exp2);
-                let lw = k.binary(*lw, w, BinaryOp::Mul);
-                let ow = k.binary(*ow, w, BinaryOp::Mul);
-                l = Some(match l {
-                    Some(l) => k.binary(l, lw, BinaryOp::Add),
-                    None => lw,
-                });
-                acc = Some(match acc {
-                    Some(acc) => k.binary(acc, ow, BinaryOp::Add),
-                    None => ow,
-                });
-            }
-            [m, l.expect("a key warp"), acc.expect("a key warp")]
+            let State { m, l, o } = merged(&mut k, &parts);
+            [m, l, o]
         }
     };
     match (o, parts) {
@@ -762,6 +744,39 @@ pub struct CombineSpec {
     pub cfg: NormCfg,
 }
 
+/// A partial online-softmax state: the maximum in the exponent's units, the
+/// sum and the output accumulator over some of the keys.
+struct State {
+    m: Regs<F32>,
+    l: Regs<F32>,
+    o: Regs<F32>,
+}
+
+/// The state over every part's keys: each part rescaled to the largest
+/// maximum and summed.
+fn merged(k: &mut Kernel, parts: &[State]) -> State {
+    let mut m = parts[0].m;
+    for part in &parts[1..] {
+        m = k.binary(m, part.m, BinaryOp::Max);
+    }
+    let (mut l, mut o) = (None, None);
+    for part in parts {
+        let w = k.binary(part.m, m, BinaryOp::Sub);
+        let w = k.unary(w, UnaryOp::Exp2);
+        let lw = k.binary(part.l, w, BinaryOp::Mul);
+        let ow = k.binary(part.o, w, BinaryOp::Mul);
+        l = Some(match l {
+            Some(l) => k.binary(l, lw, BinaryOp::Add),
+            None => lw,
+        });
+        o = Some(match o {
+            Some(o) => k.binary(o, ow, BinaryOp::Add),
+            None => ow,
+        });
+    }
+    State { m, l: l.expect("a part"), o: o.expect("a part") }
+}
+
 /// `acc / l` row by row, where a row no key reached (its sum `l` is zero,
 /// and so is its accumulator) comes out as zeros, as the graph writes it,
 /// rather than as the NaN of a division by zero.
@@ -793,29 +808,10 @@ pub fn combine<T: Elem>(spec: &CombineSpec) -> Program {
         let tile = k.at(view, row0.clone(), 0);
         k.load(tile)
     };
-    let ms: Vec<Regs<F32>> = (0..splits).map(|s| part(&mut k, m_part, s, 1)).collect();
-    let mut m = ms[0];
-    for &ms in &ms[1..] {
-        m = k.binary(m, ms, BinaryOp::Max);
-    }
-    let (mut l, mut acc) = (None, None);
-    for (s, &ms) in ms.iter().enumerate() {
-        let w = k.binary(ms, m, BinaryOp::Sub);
-        let w = k.unary(w, UnaryOp::Exp2);
-        let ls = part(&mut k, l_part, s, 1);
-        let ls = k.binary(ls, w, BinaryOp::Mul);
-        let os = part(&mut k, o_part, s, d);
-        let os = k.binary(os, w, BinaryOp::Mul);
-        l = Some(match l {
-            Some(l) => k.binary(l, ls, BinaryOp::Add),
-            None => ls,
-        });
-        acc = Some(match acc {
-            Some(acc) => k.binary(acc, os, BinaryOp::Add),
-            None => os,
-        });
-    }
-    let (l, acc) = (l.expect("a split"), acc.expect("a split"));
+    let parts: Vec<State> = (0..splits)
+        .map(|s| State { m: part(&mut k, m_part, s, 1), l: part(&mut k, l_part, s, 1), o: part(&mut k, o_part, s, d) })
+        .collect();
+    let State { l, o: acc, .. } = merged(&mut k, &parts);
     let out = normalized(&mut k, acc, l, br);
     let out = k.cast::<F32, T>(out);
     let view = k.view(o, batch_offset(&bb, rows * d), [d, 1], Shape::new(br, d), [bound(rows, br), None]);
