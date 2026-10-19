@@ -7,7 +7,7 @@ use svod_dtype::{AmdArch, DType, GpuArch, ScalarDType};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use super::{conv_first_eight, declared, planner};
+use super::{assert_rel_close, conv_first_eight, declared, planner};
 use crate::atoms::{Target, sm86};
 use crate::build::F16;
 use crate::interp::{round_to, run};
@@ -21,13 +21,8 @@ pub(super) fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, 
     ConvGeom { h: hw[0], w: hw[1], cin, cout, kernel: [k, k], stride: [s, s], pad: [p, p], dilation: [d, d] }
 }
 
-fn lcg(seed: &mut u64) -> f64 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    ((*seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
-}
-
-pub(super) fn halves(n: usize, seed: &mut u64, scale: f64) -> Vec<f64> {
-    (0..n).map(|_| round_to(ScalarDType::Float16, scale * lcg(seed))).collect()
+fn halves(n: usize, seed: &mut u64, scale: f64) -> Vec<f64> {
+    super::rounded(ScalarDType::Float16, n, seed, |x| scale * x)
 }
 
 /// The parameters of `conv` in order, f16-valued: `x`, `w`, `bias`, `residual`, `y`.
@@ -86,18 +81,6 @@ pub(super) fn reference(g: &ConvGeom, images: usize, epi: Epilogue, p: &[Vec<f64
     y
 }
 
-/// `|got - want| ≤ tol·max(|want|, 1)`; returns the max abs diff.
-pub(super) fn assert_close(what: &str, got: &[f64], want: &[f64], tol: f64) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let mut worst = 0.0f64;
-    for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        let diff = (g - w).abs();
-        worst = worst.max(diff);
-        assert!(diff <= tol * w.abs().max(1.0), "{what}[{i}] = {g}, want {w}");
-    }
-    worst
-}
-
 /// One rounding to f16 (half an ulp, 2⁻¹¹) plus f32 accumulation; f32 out
 /// keeps only the latter.
 pub(super) fn tolerance(epi: Epilogue) -> f64 {
@@ -118,7 +101,7 @@ fn check_interp(g: ConvGeom, batch: Batch, epi: Epilogue, c: GemmCfg) {
         Batch::Static(_) => vec![],
     };
     let got = run(&prog, params, &vars).unwrap();
-    assert_close("y", got.last().unwrap(), &want, tolerance(epi));
+    assert_rel_close("y", got.last().unwrap(), &want, tolerance(epi));
 }
 
 pub(super) const SILU_BIAS: Epilogue = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
@@ -147,7 +130,7 @@ fn split_conv_matches_the_direct_convolution(split: usize, epi: Epilogue) {
     let mut merge_in = vec![parts[2].clone()];
     merge_in.extend(params[2..].iter().cloned());
     let got = run(&progs[1].0, merge_in, &[]).unwrap();
-    assert_close("y", got.last().unwrap(), &want, tolerance(epi));
+    assert_rel_close("y", got.last().unwrap(), &want, tolerance(epi));
 }
 
 /// The padding is data: an Inf in the corner pixel reaches exactly the
@@ -381,17 +364,6 @@ fn on_device(spec: &ConvSpec, target: &crate::atoms::Target, params: &[Vec<f64>]
     y.cast(DType::Float32).to_vec::<f32>().unwrap()
 }
 
-fn assert_close_f32(what: &str, got: &[f32], want: &[f32], tol: f32) -> f32 {
-    assert_eq!(got.len(), want.len(), "{what}: element count");
-    let mut worst = 0.0f32;
-    for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        let diff = (g - w).abs();
-        worst = worst.max(diff);
-        assert!(diff <= tol * w.abs().max(1.0), "{what}[{i}] = {g}, graph {w}");
-    }
-    worst
-}
-
 const RESIDUAL_SILU_BIAS: Epilogue = Epilogue { residual: true, ..SILU_BIAS };
 
 /// Every candidate of every YOLO26x dense 3×3 class matches the graph's
@@ -409,7 +381,7 @@ fn every_conv_candidate_matches_the_graph_on_yolo_shapes() {
             let (epilogue, split) = (RESIDUAL_SILU_BIAS, c.split);
             let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue, cfg: c.gemm, split };
             let got = on_device(&spec, target, &params);
-            let worst = assert_close_f32(&format!("{g:?} {c:?}"), &got, &want, 2e-3);
+            let worst = assert_rel_close(&format!("{g:?} {c:?}"), &got, &want, 2e-3);
             eprintln!("{}->{} {}x{} s{} {c:?}: max abs diff {worst:.2e}", g.cin, g.cout, g.h, g.w, g.stride[0]);
         }
     }
@@ -434,10 +406,8 @@ fn conv_matches_on_the_device(g: ConvGeom, images: usize, epi: Epilogue, tile: [
     };
     let params = inputs(&g, images, epi, 21);
     let got = on_device(&spec, &target, &params);
-    let want = reference(&g, images, epi, &params);
-    let want: Vec<f32> = want.iter().map(|&w| w as f32).collect();
-    assert_close_f32("y vs f64", &got, &want, tolerance(epi) as f32);
-    assert_close_f32("y vs graph", &got, &graph_reference(&g, images, epi, &params), tolerance(epi) as f32);
+    assert_rel_close("y vs f64", &got, &reference(&g, images, epi, &params), tolerance(epi));
+    assert_rel_close("y vs graph", &got, &graph_reference(&g, images, epi, &params), tolerance(epi));
 }
 
 /// An Inf in the first input element gives exactly the graph's set of
@@ -487,20 +457,9 @@ fn a_bound_batch_runs_the_live_images_on_the_device() {
     plan.execute_with_vars(&[("b", live as i64)]).unwrap();
     let mut bytes = vec![0u8; live * ho * wo * g.cout * 2];
     plan.output_buffer().unwrap().copyout_prefix(&mut bytes).unwrap();
-    let got: Vec<f32> = bytes.chunks(2).map(|b| half_to_f32(u16::from_le_bytes([b[0], b[1]]))).collect();
+    let got = super::decode(ScalarDType::Float16, &bytes);
     let want = reference(&g, cap, RESIDUAL_SILU_BIAS, &params);
-    let want: Vec<f32> = want[..got.len()].iter().map(|&w| w as f32).collect();
-    assert_close_f32("live images", &got, &want, 2e-3);
-}
-
-fn half_to_f32(h: u16) -> f32 {
-    let (sign, exp, frac) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
-    let v = match exp {
-        0 => frac * 2f32.powi(-24),
-        31 => f32::INFINITY,
-        e => (1.0 + frac / 1024.0) * 2f32.powi(e - 15),
-    };
-    if sign == 1 { -v } else { v }
+    assert_rel_close("live images", &got, &want[..got.len()], 2e-3);
 }
 
 /// `(cin, cout, input side, stride, channels-last in the model)` of the

@@ -8,7 +8,7 @@ use test_case::test_case;
 
 use super::declared;
 use crate::build::*;
-use crate::interp::{round_to, run};
+use crate::interp::run;
 use crate::ir::*;
 use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
@@ -16,12 +16,7 @@ use crate::lower::Lowering;
 use crate::schedule::{Prefetch, Schedule};
 
 fn data(n: usize, seed: &mut u64) -> Vec<f64> {
-    (0..n)
-        .map(|_| {
-            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            round_to(ScalarDType::BFloat16, ((*seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0)
-        })
-        .collect()
+    super::rounded(ScalarDType::BFloat16, n, seed, |x| x)
 }
 
 fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, warps: u32, tol: f64) {

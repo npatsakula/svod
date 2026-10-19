@@ -22,11 +22,12 @@ mod tune;
 
 use std::sync::{Arc, LazyLock};
 
-use svod_dtype::DeviceSpec;
 use svod_dtype::default_device::default_device;
+use svod_dtype::{DeviceSpec, ScalarDType};
 
 use crate::atoms::{Costs, Device, Target};
 use crate::build::BF16;
+use crate::interp::round_to;
 use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
@@ -217,4 +218,53 @@ pub(crate) fn declared(target: Target) -> Device {
 /// The planner of `target` under the declared [`costs`].
 pub(crate) fn planner(target: Target) -> Planner {
     Planner::new(declared(target)).expect("a target with an SM count")
+}
+
+/// The next value of a 64-bit LCG stepping `seed`, uniform in `[-1, 1)`.
+fn lcg(seed: &mut u64) -> f64 {
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    ((*seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
+}
+
+/// `n` values `f(x)` of the [`lcg`] draws `x`, each rounded to `dtype`.
+fn rounded(dtype: ScalarDType, n: usize, seed: &mut u64, f: impl Fn(f64) -> f64) -> Vec<f64> {
+    (0..n).map(|_| round_to(dtype, f(lcg(seed)))).collect()
+}
+
+/// Little-endian `dtype` elements read back from a device buffer.
+fn decode(dtype: ScalarDType, bytes: &[u8]) -> Vec<f64> {
+    let half = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
+    match dtype {
+        ScalarDType::Float32 => bytes.chunks(4).map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap()))).collect(),
+        ScalarDType::BFloat16 => bytes.chunks(2).map(|b| bf16(half(b))).collect(),
+        ScalarDType::Float16 => bytes.chunks(2).map(|b| half::f16::from_bits(half(b)).to_f64()).collect(),
+        other => unreachable!("{other:?} output"),
+    }
+}
+
+/// The bf16 of `bits`.
+fn bf16(bits: u16) -> f64 {
+    half::bf16::from_bits(bits).to_f64()
+}
+
+/// `|got - want| ≤ tol·max(|want|, 1)` everywhere: an error relative to the
+/// value, or absolute below one. Returns the largest absolute difference.
+fn assert_rel_close(what: &str, got: &[impl Copy + Into<f64>], want: &[impl Copy + Into<f64>], tol: f64) -> f64 {
+    assert_eq!(got.len(), want.len(), "{what}: element count");
+    let mut worst = 0.0f64;
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let (g, w) = (g.into(), w.into());
+        let diff = (g - w).abs();
+        worst = worst.max(diff);
+        assert!(diff <= tol * w.abs().max(1.0), "{what}[{i}] = {g}, want {w}");
+    }
+    worst
+}
+
+/// `|got - want| ≤ tol` everywhere, whatever the magnitude.
+fn assert_abs_close(what: &str, got: &[f64], want: &[f64], tol: f64) {
+    assert_eq!(got.len(), want.len(), "{what}: element count");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!((g - w).abs() <= tol, "{what}[{i}] = {g}, want {w}");
+    }
 }

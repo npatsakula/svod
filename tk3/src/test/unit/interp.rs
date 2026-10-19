@@ -6,11 +6,6 @@ use crate::build::*;
 use crate::interp::{round_to, run};
 use crate::ir::*;
 
-fn lcg(seed: &mut u64) -> f64 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    ((*seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
-}
-
 /// The pipelined GEMM program computes `a · bᵀ` with bf16 inputs and f32
 /// accumulation, for every block of the grid, whatever the stage count.
 #[test_case(64, 64, 64, 32, 32, 16, 1; "single stage")]
@@ -19,8 +14,8 @@ fn lcg(seed: &mut u64) -> f64 {
 fn gemm_matches_a_naive_reference(m: usize, n: usize, k: usize, bm: usize, bn: usize, bk: usize, stages: usize) {
     let prog = super::gemm_nt(m, n, k, bm, bn, bk, stages);
     let mut seed = 7;
-    let a: Vec<f64> = (0..m * k).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed))).collect();
-    let b: Vec<f64> = (0..n * k).map(|_| round_to(ScalarDType::BFloat16, lcg(&mut seed))).collect();
+    let a = super::rounded(ScalarDType::BFloat16, m * k, &mut seed, |x| x);
+    let b = super::rounded(ScalarDType::BFloat16, n * k, &mut seed, |x| x);
     let out = run(&prog, vec![a.clone(), b.clone(), vec![0.0; m * n]], &[("b", 1)]).unwrap();
     for i in 0..m {
         for j in 0..n {

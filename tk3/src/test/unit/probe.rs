@@ -4,31 +4,19 @@
 //! costs are finite and ordered as the hardware is.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use svod_dtype::{AmdArch, DType, DeviceSpec, GpuArch};
-use svod_ir::UOp;
+use svod_dtype::{AmdArch, GpuArch};
 use test_case::test_case;
 
-use super::targets::{amd, hopper, render, run};
+use super::targets::{amd, hopper, lowered, render, run};
 use crate::atoms::{Costs, Target, sm86};
 use crate::ir::*;
 use crate::layouts::Relayout;
-use crate::lower::{Lowered, Lowering, lower};
+use crate::lower::Lowered;
 use crate::probe::{self, Probe, STREAM};
 
 fn gfx1151() -> Target {
     amd(AmdArch::Gfx1151, 40)
-}
-
-fn lowered(prog: &Program, lowering: &Lowering) -> Lowered {
-    let params: Vec<Arc<UOp>> =
-        prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
-    let device = match lowering.device.target.arch {
-        GpuArch::Cuda(_) => DeviceSpec::Cuda { device_id: 0 },
-        _ => DeviceSpec::Amd { device_id: 0 },
-    };
-    lower(prog.clone(), lowering, params, device).unwrap_or_else(|e| panic!("{}: {e}", prog.name))
 }
 
 fn probes(target: &Target) -> Vec<Probe> {
@@ -362,7 +350,8 @@ fn shared_reads_are_unfenced(target: Target, barrier: &str) {
 /// baseline, and the probe's per loop trip.
 fn relayouts(target: &Target, p: &Probe, i: usize) -> Vec<Relayout> {
     let (prog, lowering) = &p.candidates[i][0];
-    let Lowered { tile, layouts, .. } = lowered(prog, lowering);
+    let Lowered { tile, layouts, .. } =
+        lowered(prog.clone(), lowering).unwrap_or_else(|e| panic!("{}: {e}", prog.name));
     let lay = |v: ValId| layouts[v.index()].clone().expect("laid");
     tile.walk()
         .filter_map(|(_, s)| match s {

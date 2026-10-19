@@ -5,7 +5,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use super::declared;
+use super::{assert_abs_close, declared};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::kernels::Batch;
@@ -13,13 +13,8 @@ use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch_all;
 
-fn lcg(seed: &mut u64) -> f64 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    ((*seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
-}
-
 fn bf16s(n: usize, seed: &mut u64, f: impl Fn(f64) -> f64) -> Vec<f64> {
-    (0..n).map(|_| round_to(ScalarDType::BFloat16, f(lcg(seed)))).collect()
+    super::rounded(ScalarDType::BFloat16, n, seed, f)
 }
 
 fn spec(batch: Batch, t: usize, [heads, kv_heads, d]: [usize; 3], norms: [bool; 2], rope: Option<bool>) -> HeadsSpec {
@@ -108,12 +103,6 @@ fn reference(s: &HeadsSpec, p: &[Vec<f64>]) -> [Vec<f64>; 3] {
     out
 }
 
-fn assert_close(what: &str, got: &[f64], want: &[f64], tol: f64) {
-    assert_eq!(got.len(), want.len(), "{what}: length");
-    let worst = got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
-    assert!(worst <= tol, "{what}: max abs diff {worst}");
-}
-
 const STATIC: Batch = Batch::Static(2);
 fn var() -> Batch {
     Batch::Var { name: "b".into(), min: 1, max: 2 }
@@ -130,7 +119,7 @@ fn program_matches_the_reference(s: HeadsSpec) {
     let got = run(&heads::<BF16>(&s), p, &[("b", 2)]).unwrap();
     let outputs = got.len() - 3;
     for (i, name) in ["q", "k", "v"].into_iter().enumerate() {
-        assert_close(name, &got[outputs + i], &want[i], 2e-2);
+        assert_abs_close(name, &got[outputs + i], &want[i], 2e-2);
     }
 }
 
@@ -166,10 +155,6 @@ fn kernel_matches_the_program(s: HeadsSpec) {
         plan.execute_with_vars(&[("b", cap as i64)]).unwrap();
         let mut bytes = vec![0u8; want[outputs + i].len() * 2];
         out.buffer().unwrap().copyout(&mut bytes).unwrap();
-        let got: Vec<f64> = bytes
-            .chunks(2)
-            .map(|b| f64::from(f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)))
-            .collect();
-        assert_close(name, &got, &want[outputs + i], 1e-2);
+        assert_abs_close(name, &super::decode(ScalarDType::BFloat16, &bytes), &want[outputs + i], 1e-2);
     }
 }

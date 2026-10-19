@@ -6,7 +6,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use super::declared;
+use super::{assert_rel_close, declared};
 use crate::atoms::{Target, sm86};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
@@ -36,25 +36,8 @@ fn norm_rows(norm_: Norm, rows: usize, d: usize, br: usize, eps: f64, residual: 
     norm::<BF16>(&spec)
 }
 
-fn lcg(seed: &mut u64) -> f64 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    ((*seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
-}
-
 fn bf16s(n: usize, seed: &mut u64, f: impl Fn(f64) -> f64) -> Vec<f64> {
-    (0..n).map(|_| round_to(ScalarDType::BFloat16, f(lcg(seed)))).collect()
-}
-
-/// `|got - want| ≤ tol·max(|want|, 1)` everywhere; returns the max abs diff.
-fn assert_close(what: &str, got: &[f64], want: &[f64], tol: f64) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let mut worst = 0.0f64;
-    for (i, (g, w)) in got.iter().zip(want).enumerate() {
-        let diff = (g - w).abs();
-        worst = worst.max(diff);
-        assert!(diff <= tol * w.abs().max(1.0), "{what}[{i}] = {g}, want {w}");
-    }
-    worst
+    super::rounded(ScalarDType::BFloat16, n, seed, f)
 }
 
 fn upload(params: &[Vec<f64>]) -> Vec<Tensor> {
@@ -147,7 +130,7 @@ fn epilogue_interpreter_matches_the_reference(which: usize) {
     let params = gemm_inputs(m, n, k, epi);
     let want = gemm_reference(m, n, k, epi, &params);
     let out = run(&prog, params, &[]).unwrap();
-    assert_close("c", out.last().unwrap(), &want, 1.6e-2);
+    assert_rel_close("c", out.last().unwrap(), &want, 1.6e-2);
 }
 
 /// A `[1, n]` bias loaded from global memory is held as the column vector of
@@ -184,8 +167,8 @@ fn epilogues_match_on_device(m: usize, n: usize, k: usize, tile: [usize; 3], sta
         let cfg = GemmCfg { core: Core::Warp, tile, stages, warps: [wr, wc], group_m: 0, unroll: true, crews: 1 };
         let got = on_device(prog, &cfg.lowering(&declared(target.clone())), &params);
         let (got, interp) = (got.last().unwrap(), interp.last().unwrap());
-        let d_interp = assert_close("c vs interpreter", got, interp, 1.6e-2);
-        let d_ref = assert_close("c vs reference", got, &want, 1.6e-2);
+        let d_interp = assert_rel_close("c vs interpreter", got, interp, 1.6e-2);
+        let d_ref = assert_rel_close("c vs reference", got, &want, 1.6e-2);
         eprintln!("{m}x{n}x{k} {epi:?}: max abs diff {d_interp:.3e} (interpreter), {d_ref:.3e} (f64)");
     }
 }
@@ -266,9 +249,9 @@ proptest! {
         let (want, want_sum) = norm_reference(norm, rows, d, eps, residual, bias, &params);
         let out = run(&prog, params, &[]).unwrap();
         let (o, s) = norm_outputs(norm, residual, bias);
-        assert_close("out", &out[o], &want, 1e-2);
+        assert_rel_close("out", &out[o], &want, 1e-2);
         if residual {
-            assert_close("sum", &out[s], &want_sum, 0.0);
+            assert_rel_close("sum", &out[s], &want_sum, 0.0);
         }
     }
 }
@@ -291,10 +274,10 @@ fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: u
     let interp = run(&prog, params.clone(), &[]).unwrap();
     let got = on_device(prog, &row_lowering(target, br), &params);
     let (o, s) = norm_outputs(norm, residual, bias);
-    let d_interp = assert_close("out vs interpreter", &got[o], &interp[o], 1e-2);
-    let d_ref = assert_close("out vs reference", &got[o], &want, 1e-2);
+    let d_interp = assert_rel_close("out vs interpreter", &got[o], &interp[o], 1e-2);
+    let d_ref = assert_rel_close("out vs reference", &got[o], &want, 1e-2);
     if residual {
-        assert_close("sum", &got[s], &want_sum, 0.0);
+        assert_rel_close("sum", &got[s], &want_sum, 0.0);
     }
     eprintln!("{norm:?} d={d} residual={residual}: max abs diff {d_interp:.3e} (interpreter), {d_ref:.3e} (f64)");
 }

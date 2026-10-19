@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use svod_dtype::{DType, DeviceSpec, ScalarDType};
+use svod_dtype::{DType, ScalarDType};
 use svod_ir::{BinaryOp as UBinary, Op, TernaryOp, UOp, ops};
 use svod_tensor::Tensor;
 use test_case::test_case;
@@ -13,22 +13,17 @@ use test_case::test_case;
 use super::declared;
 use crate::atoms::{Target, sm86};
 use crate::build::*;
-use crate::interp::{round_to, run};
+use crate::interp::run;
 use crate::ir::*;
 use crate::kernels::Batch;
 use crate::kernels::conv::{ConvSpec, conv};
 use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
-use crate::lower::{Lowering, lower};
+use crate::lower::Lowering;
 use crate::schedule::{Prefetch, Schedule};
 
 fn data(n: usize, seed: &mut u64) -> Vec<f64> {
-    (0..n)
-        .map(|_| {
-            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            round_to(ScalarDType::BFloat16, ((*seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0)
-        })
-        .collect()
+    super::rounded(ScalarDType::BFloat16, n, seed, |x| x)
 }
 
 /// Source row and validity of gathered row `i` of an `m`-row operand.
@@ -185,12 +180,7 @@ fn lowering(target: Target, prefetch: Prefetch, warps: [u32; 2]) -> Lowering {
 
 /// The emitted instruction list of `prog` on sm_86.
 fn emitted(prog: Program, prefetch: Prefetch, warps: [u32; 2]) -> Vec<Arc<UOp>> {
-    let params =
-        prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
-    let lowered = lower(prog, &lowering(sm86(), prefetch, warps), params, DeviceSpec::Cuda { device_id: 0 }).unwrap();
-    let Op::Program(ops::Program { linear: Some(linear), .. }) = lowered.program.op() else {
-        panic!("a linear program")
-    };
+    let linear = super::targets::linear(prog, &lowering(sm86(), prefetch, warps));
     let Op::Linear(ops::Linear { ops }) = linear.op() else { panic!("a linear list") };
     ops.to_vec()
 }

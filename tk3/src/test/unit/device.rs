@@ -32,9 +32,9 @@ fn device_gemms(planner: &Planner, spec: &GemmSpec) -> (Vec<GemmCfg>, GemmCfg) {
     (admitted, pick.expect("a GEMM the planner runs"))
 }
 
+/// The next [`lcg`](super::lcg) draw as an f32.
 fn lcg(seed: &mut u64) -> f32 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    ((*seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+    super::lcg(seed) as f32
 }
 
 /// The pipelined GEMM matches the interpreter's bf16/f32 result on every
@@ -542,8 +542,7 @@ fn transposing_loads_land_as_their_layout() {
     t.prepare().unwrap().execute_with_vars(&[]).unwrap();
     let mut bytes = vec![0u8; 512];
     t.buffer().unwrap().copyout(&mut bytes).unwrap();
-    let held: Vec<u32> =
-        bytes.chunks(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16) as u32).collect();
+    let held: Vec<u32> = super::decode(ScalarDType::BFloat16, &bytes).into_iter().map(|x| x as u32).collect();
     let (l, rows) = (global_tr_b128(), global_tr_rows());
     for lane in 0..32u32 {
         for j in 0..8u32 {

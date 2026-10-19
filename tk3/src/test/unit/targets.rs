@@ -17,7 +17,7 @@ use test_case::test_case;
 
 use crate::atoms::Target;
 use crate::build::{BF16, F16};
-use crate::interp::{self, round_to};
+use crate::interp;
 use crate::ir::{Axis, ParamKind, Program};
 use crate::kernels::Act;
 use crate::kernels::Batch;
@@ -178,18 +178,13 @@ fn inputs(name: &str, prog: &Program) -> Vec<Vec<f64>> {
     let mut seed = name.len() as u64;
     let params = prog.params.iter().map(|p| match p.dtype {
         ScalarDType::Int32 => vec![1.0; p.elems],
-        dtype => (0..p.elems)
-            .map(|_| {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                round_to(dtype, ((seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0)
-            })
-            .collect(),
+        dtype => super::rounded(dtype, p.elems, &mut seed, |x| x),
     });
     params.collect()
 }
 
 /// `prog` lowered for its lowering's target, parameters declared flat.
-fn lowered(prog: Program, lowering: &Lowering) -> crate::lower::Result<crate::lower::Lowered> {
+pub(super) fn lowered(prog: Program, lowering: &Lowering) -> crate::lower::Result<crate::lower::Lowered> {
     let params =
         prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
     lower(prog, lowering, params, device(&lowering.device.target))
@@ -641,30 +636,10 @@ fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>]) -> Vec<Opt
                 t.prepare().unwrap().execute_with_vars(&vars).unwrap();
                 let mut bytes = vec![0u8; p.elems * p.dtype.bytes()];
                 t.buffer().unwrap().copyout(&mut bytes).unwrap();
-                let half = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
-                match p.dtype {
-                    ScalarDType::Float32 => {
-                        bytes.chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()) as f64).collect()
-                    }
-                    ScalarDType::BFloat16 => {
-                        bytes.chunks(2).map(|b| f32::from_bits(u32::from(half(b)) << 16) as f64).collect()
-                    }
-                    ScalarDType::Float16 => bytes.chunks(2).map(|b| f16_bits(half(b))).collect(),
-                    other => unreachable!("{other:?} output"),
-                }
+                super::decode(p.dtype, &bytes)
             })
         })
         .collect()
-}
-
-fn f16_bits(h: u16) -> f64 {
-    let (sign, exp, frac) = (if h >> 15 == 1 { -1.0 } else { 1.0 }, (h >> 10) & 0x1f, f64::from(h & 0x3ff));
-    sign * match exp {
-        0 => frac * 2f64.powi(-24),
-        31 if frac == 0.0 => f64::INFINITY,
-        31 => f64::NAN,
-        e => (1.0 + frac / 1024.0) * 2f64.powi(i32::from(e) - 15),
-    }
 }
 
 /// Each family on the GPU against the interpreter: within two 16-bit ulps

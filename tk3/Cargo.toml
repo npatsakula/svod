@@ -22,6 +22,7 @@ rayon = "1.12.0"
 tracing = "0.1"
 
 [dev-dependencies]
+half = "2.7.1"
 libm = "0.2.16"
 proptest = "1.9"
 test-case = "3.3.1"

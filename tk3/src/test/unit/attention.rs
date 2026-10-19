@@ -24,11 +24,6 @@ fn flash_attention(spec: &AttnSpec) -> Program {
     attention::<BF16>(spec)
 }
 
-fn lcg(seed: &mut u64) -> f64 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    ((*seed >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
-}
-
 /// Segment length of the packed rows the `seg_start` cases mask.
 const SEGMENT: usize = 40;
 
@@ -69,9 +64,7 @@ fn keys(spec: &AttnSpec) -> usize {
 
 fn case(spec: AttnSpec, lens: &[i64]) -> Case {
     let mut seed = 5;
-    let n = |elems: usize, seed: &mut u64| -> Vec<f64> {
-        (0..elems).map(|_| round_to(ScalarDType::BFloat16, lcg(seed))).collect()
-    };
+    let n = |elems: usize, seed: &mut u64| super::rounded(ScalarDType::BFloat16, elems, seed, |x| x);
     let batch = spec.batch.capacity();
     let (rows, heads_total) = spec.cache.map_or((batch, spec.kv_heads), |c| (c.rows, c.heads_total));
     let (q, k, v) = (
@@ -513,11 +506,7 @@ fn two_atom_rows_match_one_on_the_device(causal: bool, bias: bool, d: usize, bq:
     let same = got.iter().zip(&want).filter(|(a, b)| a == b).count();
     assert_eq!(same, got.len(), "{} of {} outputs differ from the 16-row kernel's", got.len() - same, got.len());
     let reference = reference(&c);
-    let worst = got
-        .iter()
-        .zip(&reference)
-        .map(|(g, w)| (f64::from(f32::from_bits(u32::from(*g) << 16)) - w).abs())
-        .fold(0.0, f64::max);
+    let worst = got.iter().zip(&reference).map(|(g, w)| (super::bf16(*g) - w).abs()).fold(0.0, f64::max);
     assert!(worst < 2e-2, "max abs diff {worst} against the reference");
 }
 
@@ -579,7 +568,7 @@ fn a_non_finite_unread_element_never_reaches_the_output(cfg: FaCfg) {
     c.v[0] = f64::INFINITY;
     c.v[1] = f64::NAN;
     let bits = on_device_case(c, target);
-    assert!(bits.iter().all(|&b| f32::from_bits(u32::from(b) << 16).is_finite()), "a non-finite output");
+    assert!(bits.iter().all(|&b| super::bf16(b).is_finite()), "a non-finite output");
 }
 
 /// `spec`'s kernel on the device against the program in the interpreter
@@ -630,7 +619,7 @@ fn on_device_case(c: Case, target: Target) -> Vec<u16> {
         plan.execute_with_vars(&[("b", batch as i64)]).unwrap();
         let mut bytes = vec![0u8; raw[3 + i].len() * 4];
         part.buffer().unwrap().copyout(&mut bytes).unwrap();
-        let got: Vec<f64> = bytes.chunks(4).map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap()))).collect();
+        let got = super::decode(ScalarDType::Float32, &bytes);
         let worst = got.iter().zip(&raw[3 + i]).map(|(g, w)| (g - w).abs() / w.abs().max(1.0)).fold(0.0, f64::max);
         let at = got.iter().zip(&raw[3 + i]).position(|(g, w)| (g - w).abs() / w.abs().max(1.0) > 1e-2);
         eprintln!("{name}: max rel diff {worst:.3e} vs interpreter, first over 1e-2 at {at:?} of {}", got.len());
@@ -652,19 +641,19 @@ fn on_device_case(c: Case, target: Target) -> Vec<u16> {
     let mut bytes = vec![0u8; elems * 2];
     out.buffer().unwrap().copyout(&mut bytes).unwrap();
     let bits: Vec<u16> = bytes.chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-    let got: Vec<f32> = bits.iter().map(|&b| f32::from_bits(u32::from(b) << 16)).collect();
+    let got: Vec<f64> = bits.iter().map(|&b| super::bf16(b)).collect();
     let reference = reference(&c);
     let mut worst = 0.0f64;
     let (mut over, mut worst_at) = (0usize, 0usize);
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-        let d = (*g as f64 - w).abs();
+        let d = (g - w).abs();
         if d > worst {
             worst = d;
             worst_at = i;
         }
         over += usize::from(d > 1e-2);
     }
-    let vs_ref = got.iter().zip(&reference).map(|(g, w)| (*g as f64 - w).abs()).fold(0.0, f64::max);
+    let vs_ref = got.iter().zip(&reference).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
     let stride = spec.heads * spec.d;
     eprintln!(
         "max abs diff {worst:.3e} at batch {} row {} head {} col {} ({over} elements over 1e-2); vs f64 reference {vs_ref:.3e}",
@@ -735,12 +724,9 @@ fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, 
     let spec = CombineSpec { batch: Batch::Static(batch), t, heads, d, splits, cfg: NormCfg { br: 4 } };
     let rows = splits * batch * t * heads;
     let mut seed = 9;
-    let f32s = |n: usize, seed: &mut u64, f: &dyn Fn(f64) -> f64| -> Vec<f64> {
-        (0..n).map(|_| round_to(ScalarDType::Float32, f(lcg(seed)))).collect()
-    };
-    let o_part = f32s(rows * d, &mut seed, &|x| 10.0 * x);
-    let m_part = f32s(rows, &mut seed, &|x| 4.0 * x);
-    let l_part = f32s(rows, &mut seed, &|x| 1.5 + x);
+    let o_part = super::rounded(ScalarDType::Float32, rows * d, &mut seed, |x| 10.0 * x);
+    let m_part = super::rounded(ScalarDType::Float32, rows, &mut seed, |x| 4.0 * x);
+    let l_part = super::rounded(ScalarDType::Float32, rows, &mut seed, |x| 1.5 + x);
     let params = vec![o_part, m_part, l_part, vec![0.0; batch * t * heads * d]];
     let want = run(&combine::<BF16>(&spec), params.clone(), &[]).unwrap().swap_remove(3);
     let tensors: Vec<Tensor> = params
@@ -988,7 +974,7 @@ fn decode_throughput_probe() {
         let f16 = |shape: &[usize], seed: u64| {
             let mut s = seed;
             let n: usize = shape.iter().product();
-            let data: Vec<f32> = (0..n).map(|_| lcg(&mut s) as f32).collect();
+            let data: Vec<f32> = (0..n).map(|_| super::lcg(&mut s) as f32).collect();
             let t =
                 Tensor::from_slice(&data).try_reshape(shape.iter().map(|&x| x as isize).collect::<Vec<_>>()).unwrap();
             let t = t.cast(DType::Float16).contiguous();
