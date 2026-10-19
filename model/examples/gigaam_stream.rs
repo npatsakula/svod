@@ -32,6 +32,9 @@ struct Args {
     revision: Option<String>,
     #[arg(long)]
     rnnt: bool,
+    /// Weights file in the repo, e.g. `model_int8.safetensors`.
+    #[arg(long, default_value = "model.safetensors")]
+    weights: String,
     /// Encoder frames per chunk (40 ms each), for weights without streaming settings.
     #[arg(long, default_value_t = 8)]
     chunk_size: usize,
@@ -62,12 +65,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let local = PathBuf::from(&args.repo);
     let mut model = if local.is_dir() {
-        GigaAm::from_dir_with_weights_and_encoder_dtype(&local, "model.safetensors", DType::Float16)?
+        GigaAm::from_dir_with_weights_and_encoder_dtype(&local, &args.weights, DType::Float16)?
     } else {
         GigaAm::from_hub_with_revision_and_weights_and_encoder_dtype(
             &args.repo,
             &revision,
-            "model.safetensors",
+            &args.weights,
             DType::Float16,
         )?
     };
