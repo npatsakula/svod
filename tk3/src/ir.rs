@@ -227,6 +227,11 @@ pub enum TileOp {
     Relayout {
         src: ValId,
     },
+    /// A copy into a value that mutually exclusive branches each define once
+    /// (the merge of an `if`).
+    Move {
+        src: ValId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

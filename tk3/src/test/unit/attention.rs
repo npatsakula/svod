@@ -179,9 +179,22 @@ fn attention_throughput_probe() {
     };
     let (batch, heads, t) = (4usize, 8usize, 2048usize);
     for (d, causal, bq, bkv) in [(64, false, 64, 64), (64, true, 64, 64), (128, false, 64, 32), (128, true, 64, 32)] {
-        let spec = FaSpec { batch, t, tk: t, heads, d, bq, bkv, stages: 2, causal, key_lens: false, scale: 1.0 / (d as f32).sqrt() };
+        let spec = FaSpec {
+            batch,
+            t,
+            tk: t,
+            heads,
+            d,
+            bq,
+            bkv,
+            stages: 2,
+            causal,
+            key_lens: false,
+            scale: 1.0 / (d as f32).sqrt(),
+        };
         let c = case(spec, &[]);
-        let to_bf16 = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+        let to_bf16 =
+            |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
         let (q, k, v) = (to_bf16(&c.q), to_bf16(&c.k), to_bf16(&c.v));
         for x in [&q, &k, &v] {
             x.realize().unwrap();
@@ -202,10 +215,16 @@ fn attention_throughput_probe() {
             plans.push((format!("tk3 d{d} causal={causal} bq{bq} bkv{bkv}"), plan));
         }
         let shape = [batch, t, heads, d];
-        let (q4, k4, v4) = (q.try_reshape(shape).unwrap(), k.try_reshape(shape).unwrap(), v.try_reshape(shape).unwrap());
+        let (q4, k4, v4) =
+            (q.try_reshape(shape).unwrap(), k.try_reshape(shape).unwrap(), v.try_reshape(shape).unwrap());
         let opts = svod_tk::FaOpts { causal, ..Default::default() };
         if let Ok(Some(tk1)) = svod_tk::flash_attention_with(&q4, &k4, &v4, opts) {
             plans.push((format!("tk1 d{d} causal={causal}"), tk1.prepare().unwrap()));
+        }
+        // The 3060 idles at a low clock: spin the first plan for half a second.
+        let warm = std::time::Instant::now();
+        while warm.elapsed().as_millis() < 500 {
+            plans[0].1.execute().unwrap();
         }
         let mut best = vec![f64::INFINITY; plans.len()];
         for _ in 0..4 {

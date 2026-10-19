@@ -940,6 +940,12 @@ impl<'a> Emit<'a> {
             TileOp::Reduce { src, axis, f } => self.reduce(dst, src, axis, f)?,
             TileOp::Transpose { .. } => return UnsupportedSnafu { what: "register transposes" }.fail(),
             TileOp::Relayout { src } => self.relayout(dst, src)?,
+            TileOp::Move { src } => {
+                for j in 0..regs {
+                    let x = self.reg_load(src, j);
+                    self.reg_store(dst, j, vec![x]);
+                }
+            }
         }
         Ok(())
     }

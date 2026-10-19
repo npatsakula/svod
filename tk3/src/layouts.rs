@@ -397,7 +397,7 @@ impl Infer<'_> {
     fn let_(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
         match *op {
             TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) | TileOp::Relayout { .. } => {}
-            TileOp::Unary { src, .. } | TileOp::Cast { src, .. } => {
+            TileOp::Unary { src, .. } | TileOp::Cast { src, .. } | TileOp::Move { src } => {
                 self.unify(src, dst);
                 self.unify(dst, src);
             }
@@ -461,7 +461,8 @@ impl Infer<'_> {
                     TileOp::Unary { src, .. }
                     | TileOp::Cast { src, .. }
                     | TileOp::Transpose { src }
-                    | TileOp::Relayout { src } => rewrite(self, src),
+                    | TileOp::Relayout { src }
+                    | TileOp::Move { src } => rewrite(self, src),
                     TileOp::Binary { a, b, .. } => {
                         rewrite(self, a);
                         rewrite(self, b);

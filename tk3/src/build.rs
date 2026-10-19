@@ -479,6 +479,37 @@ impl Kernel {
         self.push(Stmt::If { pred, then, otherwise });
     }
 
+    /// `if pred { then } else { otherwise }` producing `N` register tiles:
+    /// each branch computes its values and the merged tiles are returned.
+    pub fn select_if<T: Elem, const N: usize>(
+        &mut self,
+        pred: impl Into<Sc>,
+        then: impl FnOnce(&mut Self) -> [Regs<T>; N],
+        otherwise: impl FnOnce(&mut Self) -> [Regs<T>; N],
+    ) -> [Regs<T>; N] {
+        let pred = self.intern(pred);
+        let mut merged: Option<[ValId; N]> = None;
+        let mut branch = |k: &mut Self, f: Box<dyn FnOnce(&mut Self) -> [Regs<T>; N] + '_>| {
+            k.with_block(|k| {
+                let vals = f(k);
+                let out = *merged.get_or_insert_with(|| {
+                    vals.map(|v| {
+                        let Value { dtype, shape, .. } = k.prog.value(v.0).clone();
+                        k.value(dtype, shape, Place::Reg)
+                    })
+                });
+                for (dst, v) in out.into_iter().zip(vals) {
+                    assert_eq!(k.shape(dst), k.shape(v), "both branches produce the same shapes");
+                    k.push(Stmt::Let { dst, op: TileOp::Move { src: v.0 } });
+                }
+            })
+        };
+        let then = branch(self, Box::new(then));
+        let otherwise = branch(self, Box::new(otherwise));
+        self.push(Stmt::If { pred, then, otherwise });
+        merged.expect("both branches ran").map(Tile::new)
+    }
+
     pub fn raw(&mut self, raw: Raw) {
         self.push(Stmt::Raw(raw));
     }
