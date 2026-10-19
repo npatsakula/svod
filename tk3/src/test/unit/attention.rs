@@ -592,7 +592,8 @@ fn on_device_case(c: Case, target: Target) -> Vec<u16> {
     tensors.extend(&outputs);
     tensors.extend(&extras);
     let outs = graph_launch_all(flash_attention(&spec), &lowering, &tensors).unwrap();
-    // The partials themselves, before the merge.
+    // The partials themselves, before the merge: a bug the merge hides is
+    // still one. Equal infinities (a split no key reaches) agree; a NaN never.
     for (i, name) in
         ["o_part", "m_part", "l_part"].into_iter().enumerate().take(if spec.cfg.splits > 1 { 3 } else { 0 })
     {
@@ -602,9 +603,12 @@ fn on_device_case(c: Case, target: Target) -> Vec<u16> {
         let mut bytes = vec![0u8; raw[3 + i].len() * 4];
         part.buffer().unwrap().copyout(&mut bytes).unwrap();
         let got = super::decode(ScalarDType::Float32, &bytes);
-        let worst = got.iter().zip(&raw[3 + i]).map(|(g, w)| (g - w).abs() / w.abs().max(1.0)).fold(0.0, f64::max);
-        let at = got.iter().zip(&raw[3 + i]).position(|(g, w)| (g - w).abs() / w.abs().max(1.0) > 1e-2);
-        eprintln!("{name}: max rel diff {worst:.3e} vs interpreter, first over 1e-2 at {at:?} of {}", got.len());
+        let rel = |(g, w): (&f64, &f64)| if g == w { 0.0 } else { (g - w).abs() / w.abs().max(1.0) };
+        let worst = got.iter().zip(&raw[3 + i]).map(rel).fold(0.0, f64::max);
+        eprintln!("{name}: max rel diff {worst:.3e} vs interpreter");
+        if let Some(at) = got.iter().zip(&raw[3 + i]).position(|p| rel(p).is_nan() || rel(p) > 1e-2) {
+            panic!("{name}[{at}] = {}, the interpreter's {}", got[at], raw[3 + i][at]);
+        }
     }
     let out = if spec.cfg.splits == 1 {
         outs[3].clone()
