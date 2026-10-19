@@ -58,7 +58,9 @@ pub struct Attn<'a> {
     pub cache: Option<Cache<'a>>,
     /// Key blocks split over this many blocks per query tile, merged by a
     /// second kernel: parallelism for a few long rows (a decoder step).
-    /// Capped at the key block count; `None` is one.
+    /// Capped at the key block count; `None` lets the tune store choose
+    /// among one, two, the counts around two blocks per SM and the block
+    /// count (one when tuning is off).
     pub splits: Option<usize>,
     /// Defaults to `1/√D`.
     pub scale: Option<f32>,

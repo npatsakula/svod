@@ -74,9 +74,10 @@ fn norm(
     let (lead, d) = (&ext.dims[..ext.dims.len() - 1], ext.dims[ext.dims.len() - 1]);
     let rows = lead[usize::from(var.is_some())..].iter().product();
     let batch = batch_of(&var, 1);
-    let spec = |cfg| NormSpec { norm: kind, rows, d, batch: batch.clone(), eps, residual: residual.is_some(), cfg };
+    let (residual_, bias) = (residual.is_some(), b.is_some());
+    let spec = |cfg| NormSpec { norm: kind, rows, d, batch: batch.clone(), eps, residual: residual_, bias, cfg };
     let shape = [batch.capacity(), rows, d];
-    let cfg = tuned(op, &target, x.dtype(), &shape, (&batch, kind, residual.is_some()), &cfgs, |cfg| {
+    let cfg = tuned(op, &target, x.dtype(), &shape, (&batch, kind, residual_, bias), &cfgs, |cfg| {
         vec![(typed!(x.dtype(), kernel, &spec(cfg)), cfg.lowering(target.clone()))]
     });
     let spec = spec(cfg);
