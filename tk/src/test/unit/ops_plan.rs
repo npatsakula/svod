@@ -234,15 +234,18 @@ fn an_sm_issues_its_share_of_blocks() {
     assert_eq!(cost(9 * sms + 1), 1000.0);
 }
 
-/// A ring's trips are charged at the probe of its depth: a one-slot ring
-/// halves a tile's shared memory, so more of its blocks share a trip's
-/// overhead, and it wins only while its measured trip (the commit's barrier
-/// pair) costs little more than the two-slot trip; charged a dear one it
-/// ranks behind the two-slot pipeline of the same tile, on every fill
-/// (the cp.async target's one slot is its single-stage expansion).
-#[test_case(sm86(), 32; "sm86 three slots against one")]
-#[test_case(rdna3(), 32; "rdna3 two slots against one")]
-fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize) {
+/// A ring's trips are charged at the probe of its depth: charged a dear
+/// one, a one-slot ring ranks behind the deeper pipeline of the same tile,
+/// on every fill (the cp.async target's one slot is its single-stage
+/// expansion), and the deeper ring never pays it. A register-staged slot
+/// loads a trip ahead as two do and halves a tile's shared memory, so more
+/// of its blocks run at once and fewer rounds wait out the latency: it wins
+/// while its trip (the commit's barrier pair) costs little more than the
+/// two-slot one. A three-slot `cp.async` ring waits half of it: every
+/// block-trip pays its trip at the blocks at once, which share none of it.
+#[test_case(sm86(), 32, false; "sm86 three slots against one")]
+#[test_case(rdna3(), 32, true; "rdna3 two slots against one")]
+fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize, cheap_wins: bool) {
     let problem = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     // A small tile: its residency is bound by shared memory, not registers.
     let two = GemmCfg {
@@ -255,25 +258,39 @@ fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize) {
         crews: 1,
     };
     let one = GemmCfg { stages: 1, ..two };
+    let c = costs();
     let cost = |trip_one: f64, cfg: &GemmCfg| {
-        let planner = planned(Device { target: target.clone(), costs: Costs { trip_one, ..costs() } });
+        let planner = planned(Device { target: target.clone(), costs: Costs { trip_one, ..c } });
         problem.admit(&planner, cfg).expect("admitted").0
     };
-    let c = costs();
-    assert!(cost(c.trip_rolled, &one) < cost(c.trip_rolled, &two), "a cheap one-slot trip wins on residency");
+    assert_eq!(cost(c.trip_rolled, &one) < cost(c.trip_rolled, &two), cheap_wins, "a cheap one-slot trip");
     assert!(cost(10.0 * c.trip_rolled, &one) > cost(10.0 * c.trip_rolled, &two), "a dear one loses");
     assert_eq!(cost(c.trip_rolled, &two), cost(10.0 * c.trip_rolled, &two), "the two-slot ring never pays it");
 }
 
-/// A trip's fixed overhead is shared by the blocks an SM holds at once,
-/// its work is not.
+/// A trip's fixed overhead, measured with the SM full of blocks, is paid
+/// by every block-trip, however many blocks the SM holds at once; a block
+/// alone on its SM pays at least that.
 #[test_case(1; "one block an SM")]
 #[test_case(4; "four")]
-fn a_trip_overhead_is_shared_by_resident_blocks(resident: usize) {
+fn a_trip_overhead_is_paid_by_every_block_trip(resident: usize) {
     let flat = Costs { latency: 0.0, ..costs() };
     let planner = planned(Device { target: sm86(), costs: flat });
     let cost = |trip| planner.pipelined(run(resident * planner.sms(), resident, 4, 1, 1, [0.0, 100.0, 0.0, trip], 2));
-    assert_eq!(cost(40.0) - cost(0.0), 40.0);
+    assert_eq!(cost(40.0) - cost(0.0), resident as f64 * 40.0);
+}
+
+/// A block-trip pays a lone block's trip overhead (`trip_lone`) over the
+/// square of the blocks its SM runs at once, never less than the trip with
+/// the SM full; an unmeasured lone trip (zero) costs that.
+#[test_case(400.0, 1 => 500.0; "alone")]
+#[test_case(400.0, 2 => 2.0 * 200.0; "two share out their waits")]
+#[test_case(400.0, 4 => 4.0 * 140.0; "four hide them under the full trip")]
+#[test_case(0.0, 1 => 140.0; "unmeasured")]
+fn a_trip_overhead_shrinks_with_the_blocks_at_once(trip_lone: f64, resident: usize) -> f64 {
+    let costs = Costs { latency: 0.0, step_lone: costs().step, trip_lone, ..costs() };
+    let planner = planned(Device { target: sm86(), costs });
+    planner.pipelined(run(resident * planner.sms(), resident, 4, 1, 1, [0.0, 100.0, 0.0, 40.0], 2))
 }
 
 /// A SIMD holding fewer waves than hide a matrix-core chain (`step_lone /
@@ -1478,7 +1495,7 @@ fn rdna_plans_register_staged_kernels() {
 /// 64 queries, so the twins stage times it beside the contender tiles. On
 /// gfx942 the d128 pick's tile carries its two-row pipelines as twins.
 #[test_case(gfx1151_planner(), &[(128, 32), (64, 32), (64, 16), (64, 64), (32, 16), (32, 32), (32, 64), (16, 16), (16, 32), (16, 64)]; "gfx1151")]
-#[test_case(planner(gfx1201()), &[(128, 32), (128, 64), (64, 16), (64, 32), (64, 64), (32, 16), (32, 32), (16, 16), (32, 64), (16, 32), (16, 64)]; "gfx1201")]
+#[test_case(planner(gfx1201()), &[(128, 64), (128, 32), (64, 32), (64, 64), (64, 16), (32, 32), (32, 16), (32, 64), (16, 32), (16, 16), (16, 64)]; "gfx1201")]
 fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usize)]) {
     use crate::ops::config::{representatives, shortlist};
     let ranked = target.attention_ranked(32, 2048, 2048, 64, false, true);

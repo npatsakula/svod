@@ -251,6 +251,9 @@ pub const GUESSED: Costs = Costs {
     trip_rolled: 170.0,
     // The barrier pair costs about what the two-slot trip does again.
     trip_one: 300.0,
+    // Nothing guessed: a lone block's trip costs what the SM's full does.
+    trip_lone: 0.0,
+    trip_one_lone: 0.0,
     lane_move: 1.0,
     smem_trip: 8.0,
     latency: 600.0,
@@ -460,10 +463,28 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
         p.trips("probe:trip", true, 2),
         p.rolled_trips(),
         p.trips("probe:trip_one", false, 1),
+        p.lone_trips("probe:trip_lone", true, 2),
+        p.lone_trips("probe:trip_one_lone", false, 1),
         p.lane_move(),
         p.smem_trip(),
         p.latency(),
     ])
+}
+
+/// A trip probe of `blocks_per_sm` blocks an SM (one round where the SM
+/// holds them all), to tell a trip's per-block issue from what the resident
+/// blocks hide of it.
+#[cfg(test)]
+pub(crate) fn trips_at(
+    target: &Target,
+    op: &'static str,
+    unroll: bool,
+    stages: usize,
+    blocks_per_sm: usize,
+) -> Result<Probe> {
+    let mut p = Probes::new(target)?;
+    p.blocks = p.sms as usize * blocks_per_sm;
+    Ok(p.trips(op, unroll, stages))
 }
 
 /// The trip probes' i32 tile: a 16-byte chunk per thread, eight to a row.
@@ -803,14 +824,27 @@ impl<'a> Probes<'a> {
     /// against their spread, which bounds it where it cannot be told from
     /// zero.
     fn trips(&self, op: &'static str, unroll: bool, stages: usize) -> Probe {
+        self.trips_of(op, unroll, stages, self.blocks)
+    }
+
+    /// [`Self::trips`] of a block alone on each SM: its trip waits out what
+    /// no other block's work hides. The ring dominates a lone block's time
+    /// (its baseline is a load's latency, too short for
+    /// [`Resolved::measurable`]), so the pair is [`Signal::Dominant`].
+    fn lone_trips(&self, op: &'static str, unroll: bool, stages: usize) -> Probe {
+        Probe { signal: Signal::Dominant, ..self.trips_of(op, unroll, stages, self.sms as usize) }
+    }
+
+    /// [`Self::trips`] over `blocks` blocks.
+    fn trips_of(&self, op: &'static str, unroll: bool, stages: usize, blocks: usize) -> Probe {
         let (tile, region) = (trip_tile(self.target), 16);
         let stages = self.target.fill.stages(stages);
-        let units = (self.blocks * TRIPS) as f64;
+        let units = (blocks * TRIPS) as f64;
         let chunks = chunked(tile, 4, WARPS, self.target.wave, Axis::Col).expect("a chunk layout");
         let sms = self.sms as usize;
         let probe = self.make(op, ScalarDType::Int32, units, true, self.lowering(ROWS, unroll), |on| {
             // Every trip probe runs these programs, named alike.
-            let mut k = kernel("probe:trip", self.blocks, WARPS);
+            let mut k = kernel("probe:trip", blocks, WARPS);
             let src = k.param::<I32>("src", ParamKind::In, sms * region * tile.elems());
             // Zeros at run (the scratch pool's integers), unknown to the
             // compiler: every trip's chunk and fragment slot is a runtime
@@ -860,7 +894,7 @@ impl<'a> Probes<'a> {
                 });
                 sum
             };
-            output(&mut k, self.blocks, sum);
+            output(&mut k, blocks, sum);
             k.finish()
         });
         Probe { signal: Signal::Resolved, ..probe }

@@ -175,11 +175,62 @@ pub(crate) fn gfx1151_costs() -> Costs {
         trip_rolled: 13.85,
         // Unmeasured there: a guess at the barrier pair's share.
         trip_one: 20.0,
+        // Unmeasured there: a lone block's trip costs what the full SM's does.
+        trip_lone: 0.0,
+        trip_one_lone: 0.0,
         lane_move: 0.0316,
         smem_trip: 0.0841,
         latency: 577.9,
         l2_byte: 0.0,
         l2_bytes: 0.0,
+    }
+}
+
+/// sm_86's costs (RTX 3060, 28 SMs) as `probe::costs` measured them on the
+/// device on 2026-10-19.
+pub(crate) fn sm86_costs() -> Costs {
+    Costs {
+        smem_byte: 0.003447,
+        global_byte: 0.08274,
+        scatter: 2.825,
+        step: 8.196,
+        step_group: 0.0,
+        step_lone: 33.25,
+        score: 0.07915,
+        trip: 1.81,
+        trip_rolled: 0.0,
+        trip_one: 3.692,
+        trip_lone: 126.75,
+        trip_one_lone: 149.33,
+        lane_move: 0.09804,
+        smem_trip: 0.2449,
+        latency: 311.79,
+        l2_byte: 0.016066,
+        l2_bytes: 7.018e6,
+    }
+}
+
+/// gfx1201's costs (RX 9070 XT, 64 CUs) as `probe::costs` measured them on
+/// the device on 2026-10-19.
+pub(crate) fn gfx1201_costs() -> Costs {
+    Costs {
+        smem_byte: 0.00325,
+        global_byte: 0.10823,
+        scatter: 1.8443,
+        step: 2.7104,
+        step_group: 0.0,
+        step_lone: 5.5957,
+        score: 0.059305,
+        trip: 7.3026,
+        trip_rolled: 7.1622,
+        trip_one: 7.3544,
+        trip_lone: 53.623,
+        trip_one_lone: 57.119,
+        lane_move: 0.024552,
+        smem_trip: 0.078096,
+        latency: 243.15,
+        l2_byte: 0.005929,
+        l2_bytes: 65.97e6,
     }
 }
 

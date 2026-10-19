@@ -8,11 +8,12 @@
 
 use proptest::prelude::*;
 
+use crate::atoms::{Costs, Device, Target};
 use crate::build::BF16;
 use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::kernels::{Act, Batch};
-use crate::ops::config::{Attention, DIAGONAL, Planner, Problem};
+use crate::ops::config::{Attention, DIAGONAL, Planner, Problem, gemm_cfg};
 use crate::tune::{Bench, Candidate, Compiled};
 
 /// Each of `ranked` compiled (in ranked batches, as the tuner admits), then
@@ -167,16 +168,68 @@ fn cost_model_replay() {
     let planner = Planner::measured(target, measured).expect("an SM count");
     eprintln!("costs|{:?}|unmeasured {:?}", planner.device.costs, planner.unmeasured);
     let (gemms, attentions) = rankings(&planner);
-    let print = |label: &str, ranked: Vec<String>, ns: Vec<f64>| {
-        for (rank, (c, ns)) in ranked.iter().zip(ns).enumerate() {
-            eprintln!("fit|{label}|{rank}|-|{ns:.1}|-|{c}");
+    let target = &planner.device.target;
+    // The blocks an SM runs at once: those it holds, at most its share.
+    let at_once = |blocks: usize, smem: usize, regs: u32, waves: u32| {
+        planner.resident(smem, regs, waves as usize).max(1).min(blocks.div_ceil(planner.sms()))
+    };
+    let print = |label: &str, ranked: Vec<(String, usize)>, ns: Vec<f64>| {
+        for (rank, ((c, at_once), ns)) in ranked.iter().zip(ns).enumerate() {
+            eprintln!("fit|{label}|{rank}|-|{ns:.1}|-|{c}|{at_once}");
         }
     };
-    for (label, ranked, ns) in gemms {
-        print(label, ranked.iter().map(|c| format!("{c:?}")).collect(), ns);
+    for ((label, ranked, ns), (_, m, n, _, epilogue)) in
+        gemms.into_iter().zip(gemm_shapes().into_iter().filter(|s| wanted(s.0)))
+    {
+        let halves = if epilogue.gated { 2 } else { 1 };
+        let row = |c: &GemmCfg| {
+            let blocks = m.div_ceil(c.tile[0]) * n.div_ceil(c.tile[1]);
+            let regs = c.registers(target, halves).expect("ranked");
+            (format!("{c:?}"), at_once(blocks, c.smem_bytes(epilogue.gated), regs, c.warps[0] * c.warps[1]))
+        };
+        print(label, ranked.iter().map(row).collect(), ns);
     }
-    for (label, ranked, ns) in attentions {
-        print(label, ranked.iter().map(|c| format!("{c:?}")).collect(), ns);
+    for ((label, ranked, ns), (_, batch, heads, t, d, _)) in
+        attentions.into_iter().zip(ATTENTION_SHAPES.into_iter().filter(|s| wanted(s.0)))
+    {
+        let row = |c: &FaCfg| {
+            let (smem, regs) =
+                (c.smem_bytes(d, false) + c.scratch_bytes(target), c.registers(target, d, false).expect("ranked"));
+            (format!("{c:?}"), at_once(batch * heads * t.div_ceil(c.bq), smem, regs, c.warps()))
+        };
+        print(label, ranked.iter().map(row).collect(), ns);
+    }
+}
+
+/// The trip pairs at 1..48 blocks an SM, each probe's SM time per
+/// block-trip (`trip`) and the wall time a round of them adds per trip
+/// (`wall`, the SM time times the blocks): flat SM time is per-block
+/// issue, SM time falling as the blocks grow is a wait the resident blocks
+/// hide. Prints, never asserts.
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn trip_by_residency_probe() {
+    let Some(target) = super::device_target() else { return };
+    for (op, unroll, stages) in [("probe:trip", true, 2), ("probe:trip_rolled", false, 2), ("probe:trip_one", false, 1)]
+    {
+        for per_sm in [1usize, 2, 3, 4, 6, 8, 12, 24, 48] {
+            let p = crate::probe::trips_at(&target, op, unroll, stages, per_sm).expect("an SM count");
+            let mut built = crate::tune::compile(p.candidates.clone(), &crate::tune::ScratchPool::default());
+            let pairs = crate::probe::resolve_pairs(&mut built);
+            let Some(r) = crate::probe::resolved(&pairs) else {
+                eprintln!("residency|{op}|{per_sm}|unresolved {pairs:?}");
+                continue;
+            };
+            let unit = p.scale / p.units;
+            eprintln!(
+                "residency|{op}|{per_sm}|trip {:.3}|wall {:.3}|spread {:.3}|base {:.3}|measurable {}",
+                r.difference * unit,
+                r.difference * unit * per_sm as f64,
+                r.spread * unit,
+                r.baseline * unit,
+                r.measurable(),
+            );
+        }
     }
 }
 
@@ -219,4 +272,30 @@ proptest! {
 fn causal_trips_of_one_sequence_are_half_the_keys(t: usize, bq: usize, bkv: usize) {
     let p = Attention { tiles: 1, t, tk: t, d: 64, causal: true, bias: false };
     assert_eq!(p.causal_trips(bq, bkv), t.div_ceil(2 * bkv) + DIAGONAL * bq.div_ceil(bkv));
+}
+
+/// Pairs of GEMM configs the model orders as the device measured them
+/// under that device's costs, the faster first (`cost_model_probe` on three
+/// fresh stores each, 2026-10-19), each a block alone on its SM against a
+/// tile the SM runs several of at once: a lone block's trip waits out what
+/// other blocks' work hides ([`Costs::trip_at`]). Before that term the
+/// model ranked every slow one first.
+#[test_case::test_case(crate::test::unit::sm86_costs(), "rtx3060", [3072, 3072, 1024, 2],
+    gemm_cfg([64, 64, 32], 2, [4, 1], true), gemm_cfg([128, 64, 64], 2, [4, 2], false);
+    "sm86 Qwen3 gate-up: 1.52 ms at three an SM, 2.01 alone")]
+#[test_case::test_case(crate::test::unit::gfx1201_costs(), "rx9070xt", [1500, 1280, 5120, 1],
+    gemm_cfg([128, 128, 32], 2, [4, 2], false), gemm_cfg([256, 128, 32], 2, [2, 4], false);
+    "gfx1201 Whisper fc2: 156 us at two a CU, 172 alone")]
+fn a_block_alone_ranks_behind_the_measured_faster_tile(
+    costs: Costs,
+    card: &str,
+    [m, n, k, halves]: [usize; 4],
+    fast: GemmCfg,
+    slow: GemmCfg,
+) {
+    let target = Target::card(card).expect("a listed card");
+    let planner = Planner::new(Device { target, costs }).expect("an SM count");
+    let p = Problem { batches: 1, m, n, k, halves };
+    let cost = |c: &GemmCfg| p.admit(&planner, c).expect("admitted").0;
+    assert!(cost(&fast) < cost(&slow), "{} against {}", cost(&fast), cost(&slow));
 }

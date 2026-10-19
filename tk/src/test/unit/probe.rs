@@ -104,7 +104,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
         }
         // Every trip of the pipeline, which the baseline loads in a plain
         // loop, a group of loads per iteration.
-        "trip" | "trip_rolled" | "trip_one" => {
+        "trip" | "trip_rolled" | "trip_one" | "trip_lone" | "trip_one_lone" => {
             let (base, _) = pair(find(probes, field));
             let group = loads_from(base, Tier::Global).len();
             assert_eq!(base_extent * group, extent, "{field}: as many trips");
@@ -224,7 +224,8 @@ fn every_probe_renders(target: Target) {
 /// What each value divides by is what its programs do: a throughput
 /// probe's blocks, a relayout probe's one wave, times its loop's extent
 /// times the primitive per trip (the extra trips over the baseline's, for a
-/// pipeline; every trip, for the rolled ring).
+/// pipeline; every trip, for the rolled ring). A lone trip probe runs a
+/// block an SM.
 #[test_case(sm86(); "sm86")]
 #[test_case(hopper(); "sm90")]
 #[test_case(gfx1151(); "gfx1151")]
@@ -243,6 +244,9 @@ fn units_count_the_primitive(target: Target) {
         }
         let (_, probe) = pair(p);
         assert_eq!(p.units, counted(&target, &probes, field), "{}", p.op);
+        if field.ends_with("_lone") && field.starts_with("trip") {
+            assert_eq!(work(probe).0 as u32, target.sms.unwrap(), "{}: a block an SM", p.op);
+        }
         if ["scatter", "step_lone", "lane_move", "smem_trip"].contains(&field) {
             let (blocks, warps) = (work(probe).0, probe.warps);
             let simds = target.occupancy.simds;
@@ -438,9 +442,9 @@ fn a_probe_keeps_the_least_of_agreeing_timings(timings: &[u64]) -> (Option<u64>,
 /// On the attached GPU every cost measures (none is left at zero), finite
 /// and non-negative, and ordered as the hardware is: a shared byte cheaper
 /// than a global one, a cached one no dearer than DRAM's, a lone trip's wait
-/// outlasting a matrix step, a rolled ring's trip and a one-slot ring's about
-/// an unrolled two-slot one's or more, and a round trip through shared
-/// memory costing something. The
+/// outlasting a matrix step, a rolled ring's trip and a one-slot ring's about an unrolled two-slot one's
+/// or more, a lone block's trip no cheaper than one with the SM full, and a
+/// round trip through shared memory costing something. The
 /// retries absorb a pair timed alongside another test's kernels.
 #[test]
 fn device_costs_are_physical() {
@@ -455,6 +459,7 @@ fn device_costs_are_physical() {
     assert!(c.smem_byte > 0.0 && c.smem_byte < c.global_byte, "{c:?}");
     assert!(c.l2_byte > 0.0 && c.l2_byte <= c.global_byte, "{c:?}");
     assert!(c.latency > c.step, "{c:?}");
+    assert!(c.trip_lone >= c.trip && c.trip_one_lone >= c.trip_one, "{c:?}");
     assert!(c.step_lone >= c.step, "{c:?}");
     assert!(c.smem_trip > 0.0, "{c:?}");
     // A ring the planner prices apart from the unrolled two-slot one does no

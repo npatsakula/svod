@@ -271,7 +271,9 @@ pub struct Costs {
     pub step_lone: f64,
     /// One score element's softmax vector work (scale, max, exp2, sum).
     pub score: f64,
-    /// One pipeline trip's fixed overhead (barrier, ring bubble), unrolled.
+    /// One pipeline trip's fixed overhead (barrier, ring bubble), unrolled,
+    /// with the SM full of blocks: a block-trip's share of the SM's time
+    /// once the others hide its waits ([`Self::trip_at`]).
     pub trip: f64,
     /// The same for a rolled ring (slot offsets recomputed per trip),
     /// register-staged: 0 where fills are `cp.async`, whose ring
@@ -283,6 +285,12 @@ pub struct Costs {
     /// fence); on a target with asynchronous copies, its single-stage
     /// expansion's wait and barriers.
     pub trip_one: f64,
+    /// [`Self::trip`] of a block alone on its SM: the wall time its waits
+    /// and barriers add to the block's trip, which other blocks' work hides
+    /// ([`Self::trip_at`]).
+    pub trip_lone: f64,
+    /// [`Self::trip_one`] of a block alone on its SM.
+    pub trip_one_lone: f64,
     /// One unit of an exchange's [`crate::layouts::Relayout::work`] (a lane
     /// move, or a select): averaged over the moves a half-wave exchange
     /// issues, on RDNA a `permlanex16` across the rows of 16 and a DPP
@@ -304,7 +312,7 @@ pub struct Costs {
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
     /// order: all but the cache's, which a series of footprints measures.
-    pub fn fields(&mut self) -> [(&'static str, &mut f64); 13] {
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 15] {
         let Costs {
             smem_byte,
             global_byte,
@@ -316,6 +324,8 @@ impl Costs {
             trip,
             trip_rolled,
             trip_one,
+            trip_lone,
+            trip_one_lone,
             lane_move,
             smem_trip,
             latency,
@@ -333,6 +343,8 @@ impl Costs {
             ("trip", trip),
             ("trip_rolled", trip_rolled),
             ("trip_one", trip_one),
+            ("trip_lone", trip_lone),
+            ("trip_one_lone", trip_one_lone),
             ("lane_move", lane_move),
             ("smem_trip", smem_trip),
             ("latency", latency),
@@ -621,7 +633,27 @@ impl Costs {
             _ => self.trip,
         }
     }
+
+    /// What one block-trip over a ring `stages` deep adds to its SM's time
+    /// with `blocks` blocks at once, whose trip with the SM full costs
+    /// `trip`: a lone block's trip ([`Self::trip_lone`],
+    /// [`Self::trip_one_lone`]) over the blocks to the [`TRIP_HIDING`]
+    /// power, never under `trip` (which stands in where the lone trip is
+    /// unmeasured).
+    pub fn trip_at(&self, stages: usize, trip: f64, blocks: usize) -> f64 {
+        let lone = if stages <= 1 { self.trip_one_lone } else { self.trip_lone };
+        trip.max(lone / (blocks.max(1) as f64).powi(TRIP_HIDING))
+    }
 }
+
+/// Model: the power of the blocks an SM runs at once by which a lone
+/// block's trip overhead shrinks per block-trip: the blocks overlap one
+/// another's waits and share out what a round still waits. Measured per
+/// block-trip at one to four blocks an SM, sm_86 falls 127, 41, 16, 3 ns
+/// (about the square) and gfx1201 65, 27, 17, 11 (about the blocks); the
+/// square ranks both cards' configs closer to their measured order than
+/// either card's own exponent.
+pub const TRIP_HIDING: i32 = 2;
 
 const fn sm(major: u8, minor: u8) -> GpuArch {
     GpuArch::Cuda(CudaArch { major, minor })

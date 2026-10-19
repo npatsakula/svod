@@ -48,7 +48,7 @@ value|probe:cached_1m|sm_86-28sm|Int32||0a2d6c02b82988af|9154cc72f03d25cd|d2a8e2
 
 ## 设备代价 {#device-costs}
 
-排序所用的代价（`atoms::Costs`：一个共享字节、一个流式字节、一个分散元素、满载 SM 上的一步矩阵核运算以及在 SIMD 上单独一个 wave 和作为 warpgroup 乘积时的一步、一个分数的 softmax、一次流水线行程（环的两个槽位，展开与不展开，以及一个槽位）、一次 lane 移动、一次共享内存往返、全局延迟，以及 L2 的速率和大小）由 `probe::costs` 在进程第一次为该设备做规划时在设备上测量。每个字段是一对程序，其中探针做其基线所做的一切，再加上已知数量的该原语。这些值以 `value|probe:<field>` 行写入同一个存储文件，因此之后的进程会读回它们。失败的探针让其字段保持为零，发出警告，并在 `Planner::unmeasured` 中列出，而设备门控 `device_costs_are_physical` 要求该列表为空：规划器用已有的数据排序，而不是把设备丢给计算图。只有没有 SM 数量的设备才没有规划器。
+排序所用的代价（`atoms::Costs`：一个共享字节、一个流式字节、一个分散元素、满载 SM 上的一步矩阵核运算以及在 SIMD 上单独一个 wave 和作为 warpgroup 乘积时的一步、一个分数的 softmax、一次流水线行程（环的两个槽位，展开与不展开，以及一个槽位）、SM 上只有一个块时两个槽位和一个槽位的行程、一次 lane 移动、一次共享内存往返、全局延迟，以及 L2 的速率和大小）由 `probe::costs` 在进程第一次为该设备做规划时在设备上测量。每个字段是一对程序，其中探针做其基线所做的一切，再加上已知数量的该原语。这些值以 `value|probe:<field>` 行写入同一个存储文件，因此之后的进程会读回它们。失败的探针让其字段保持为零，发出警告，并在 `Planner::unmeasured` 中列出，而设备门控 `device_costs_are_physical` 要求该列表为空：规划器用已有的数据排序，而不是把设备丢给计算图。只有没有 SM 数量的设备才没有规划器。
 
 主机测试则直接声明代价（`test::unit::costs()`，以及从一个 gfx1151 存储中粘贴而来的 `gfx1151_costs()`）。对于本机没有对应设备的显卡，`Target::offline` 或 `Target::card` 给出目标，`probe::stored` 从该卡上拷贝来的调优存储中读取代价；没有这样的存储时，以 `probe::GUESSED` 代替，排序也就只是猜测。[`tk_dump` 示例](./testing-and-debugging#planning-for-another-card)两者都做。
 

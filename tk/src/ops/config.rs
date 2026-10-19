@@ -677,20 +677,23 @@ impl Planner {
     /// The SM time of `run`. The busiest SM issues the work of
     /// `⌈blocks / sms⌉` blocks, each taken up as another ends (measured on
     /// sm_86: a 64×64 GEMM's time steps with that count, not with whole
-    /// rounds of resident blocks), a trip's fixed overhead shared with the
-    /// blocks it holds at once ([`Self::resident`]). A trip's pipes (the fragment
-    /// reads, the matrix-core steps, the fill) overlap across the waves a
-    /// SIMD holds: the longest is paid whole, the rest in a share of one over
-    /// the waves per SIMD up to [`OVERLAP_WAVES`], the blocks the SM holds at
-    /// once pooling theirs (measured on gfx1201 and sm_86: a block at one
-    /// wave per SIMD pays about their sum, at four or more the longest). A SIMD holding fewer
-    /// waves than hide a matrix-core chain's latency (`step_lone / step` of
-    /// them, a wave's independent accumulators counting as waves) runs the
-    /// steps that many times slower. A round of blocks is at least one wave's
-    /// own issue (a block of fewer waves than SIMDs leaves the rest idle),
-    /// and every round of every trip pays the memory latency the ring cannot
-    /// hide (it prefetches `stages - 1` trips ahead) on top of its issue:
-    /// measured on both, the latency adds rather than hides under the issue.
+    /// rounds of resident blocks), every block-trip paying a trip's fixed
+    /// overhead at the blocks the SM runs at once ([`crate::atoms::Costs::trip_at`]: the
+    /// trip probes measure it per block-trip, alone and with the SM full).
+    /// A trip's pipes (the fragment reads, the matrix-core steps, the fill)
+    /// overlap across the waves a SIMD holds: the longest is paid whole, the
+    /// rest in a share of one over the waves per SIMD up to
+    /// [`OVERLAP_WAVES`], the blocks the SM holds at once ([`Self::resident`])
+    /// pooling theirs (measured on gfx1201 and sm_86: a block at one wave per
+    /// SIMD pays about their sum, at four or more the longest). A SIMD
+    /// holding fewer waves than hide a matrix-core chain's latency
+    /// (`step_lone / step` of them, a wave's independent accumulators
+    /// counting as waves) runs the steps that many times slower. A round of
+    /// blocks is at least one wave's own issue (a block of fewer waves than
+    /// SIMDs leaves the rest idle), and every round of every trip pays the
+    /// memory latency the ring cannot hide (it prefetches `stages - 1` trips
+    /// ahead) on top of its issue: measured on both, the latency adds rather
+    /// than hides under the issue.
     pub(crate) fn pipelined(&self, run: Run) -> f64 {
         let Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages } = run;
         let Device { target, costs } = &self.device;
@@ -710,7 +713,7 @@ impl Planner {
             longest + (pipes.iter().sum::<f64>() - longest) / per_simd(waves).min(OVERLAP_WAVES)
         };
         let at_once = resident.min(per_sm);
-        let issue = per_sm as f64 * (body(at_once * waves) + trip / at_once as f64);
+        let issue = per_sm as f64 * (body(at_once * waves) + costs.trip_at(stages, trip, at_once));
         let wave = o.simds as f64 * (body(waves) + trip) / waves as f64;
         let wait = costs.latency / stages.saturating_sub(1).max(1) as f64;
         trips as f64 * (issue.max(rounds as f64 * wave) + rounds as f64 * wait)
