@@ -35,8 +35,14 @@ use crate::lower::Lowering;
 /// The store's line format, bumped when a line's meaning changes (a file
 /// without a format line is of the first).
 pub(crate) const FORMAT: u32 = 1;
-/// Search bound: timed rounds over every candidate after the warm-up.
+/// Search bound: timed rounds over every candidate after the warm-up, and
+/// the rounds the two leaders then run again.
 const ROUNDS: usize = 4;
+/// Search bound: candidates from which the first round cuts the field to
+/// its [`CONTENDER`]s; fewer run every round, a cut saving little and a
+/// short list being what a decode step's splits or a coordinate descent
+/// ask, where the candidates sit within a few percent of each other.
+const CUT_FROM: usize = 16;
 /// Search bound: rounds past the first go to the candidates within this
 /// factor of the first round's best; the rest cannot win (a round's best of [`RUNS`] runs
 /// after a sustain sits within a few percent of the candidate's settled
@@ -483,17 +489,33 @@ pub(crate) fn time<B: BorrowMut<Built>>(built: &mut [B]) -> Vec<Option<u64>> {
 
 /// Each candidate's minimum over the timed rounds: one round of every
 /// candidate, then [`ROUNDS`]` - 1` more ([`round_robin_min`]) of the
-/// [`CONTENDER`]s of the first round's best. `None` where a candidate
-/// failed to run.
+/// [`CONTENDER`]s of the first round's best (of every candidate, under
+/// [`CUT_FROM`]), then, where more than two contenders ran them, [`ROUNDS`]
+/// more of the two leaders, whose gap is often within a round's drift (two
+/// contenders have run every round together already). `None` where a
+/// candidate failed to run.
 pub(crate) fn rounds(count: usize, mut time: impl FnMut(usize) -> Option<Duration>) -> Vec<Option<Duration>> {
     let mut best = round_robin_min(count, 1, None, &mut time);
     let Some(lead) = best.iter().flatten().min().copied() else { return best };
-    let bound = lead.mul_f64(CONTENDER);
-    let contenders: Vec<usize> = (0..count).filter(|&i| best[i].is_some_and(|t| t <= bound)).collect();
+    let bound = (count >= CUT_FROM).then(|| lead.mul_f64(CONTENDER));
+    let contenders: Vec<usize> =
+        (0..count).filter(|&i| best[i].is_some_and(|t| bound.is_none_or(|bound| t <= bound))).collect();
     tracing::debug!(first = ?best, ?contenders, "tuner's first round");
-    let more = round_robin_min(contenders.len(), ROUNDS - 1, Some(bound), |j| time(contenders[j]));
-    for (&i, more) in contenders.iter().zip(more) {
-        best[i] = more.and_then(|m| best[i].map(|b| b.min(m)));
+    let again = |best: &mut Vec<Option<Duration>>, among: &[usize], rounds, bound, time: &mut dyn FnMut(usize) -> _| {
+        let more = round_robin_min(among.len(), rounds, bound, |j| time(among[j]));
+        for (&i, more) in among.iter().zip(more) {
+            best[i] = more.and_then(|m| best[i].map(|b| b.min(m)));
+        }
+    };
+    again(&mut best, &contenders, ROUNDS - 1, bound, &mut time);
+    if contenders.len() > 2 {
+        let mut leaders: Vec<usize> = (0..count).filter(|&i| best[i].is_some()).collect();
+        leaders.sort_by_key(|&i| best[i]);
+        leaders.truncate(2);
+        if let [first, second] = leaders[..] {
+            again(&mut best, &leaders, ROUNDS, None, &mut time);
+            tracing::debug!(leader = first, runner_up = second, times = ?(best[first], best[second]), "tuner's leaders");
+        }
     }
     tracing::debug!(?best, "tuner's rounds");
     best

@@ -43,7 +43,7 @@ variable उसकी अधिकतम value से bound होता है,
 | क़दम | सेटिंग |
 |---|---|
 | Warm-up | लगातार runs, जब तक clock स्थिर न हो जाए (RTX 3060 idle में 210 MHz पर रहता है) |
-| Rounds | सभी candidates पर एक round, फिर contenders पर 3 और: वे जो पहले round के सर्वश्रेष्ठ के 1.2× के भीतर हैं |
+| Rounds | सभी candidates पर एक round, फिर contenders पर 3 और: वे जो पहले round के सर्वश्रेष्ठ के 1.2× के भीतर हैं (16 से कम candidates हों तो सभी); फिर, जब contenders दो से अधिक रहे हों, दो leaders पर 4 और |
 | हर round | 5 ms device time के लगातार sustain runs (candidate के पिछले run से नापे हुए), फिर 5 profiled runs, हर candidate का न्यूनतम रखते हुए |
 | एक run का समय | उसके कर्नेलों के GPU timestamps का योग |
 
