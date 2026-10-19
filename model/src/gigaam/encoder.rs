@@ -3,6 +3,7 @@ use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, LayerNorm, Linear, Module, StateDict, get_tensor, prefixed};
+use svod_tk3::ops::{self, Act};
 
 use crate::init::{Bias, fan_in_uniform, layer_norm, ones, zeros};
 use crate::state::{scoped, scoped_index};
@@ -31,14 +32,20 @@ fn build_rope_cache(config: &GigaAmConfig) -> svod_tensor::error::Result<(Tensor
 
 type Result<T> = super::Result<T>;
 
-/// `nn::Linear` with an optional dynamic-quantization scale. The scale's
-/// presence is a property of the *weight dtype*, not of the state dict, so the
-/// pair is loaded together by the owner's `Module` impl rather than derived.
-fn linear(x: &Tensor, weight: &Tensor, bias: &Tensor, weight_scale: Option<&Tensor>) -> Result<Tensor> {
-    match weight_scale {
-        Some(scale) => Ok(x.dynamic_quantized_linear().weight(weight).weight_scale(scale).bias(bias).call()?),
-        None => Ok(x.linear().weight(weight).bias(bias).call()?),
-    }
+/// `act(x·wᵀ + bias)`, through the tile op layer unless the weight carries a
+/// dynamic-quantization scale. The scale's presence is a property of the
+/// *weight dtype*, not of the state dict, so the pair is loaded together by
+/// the owner's `Module` impl rather than derived.
+fn linear(x: &Tensor, weight: &Tensor, bias: &Tensor, weight_scale: Option<&Tensor>, act: Act) -> Result<Tensor> {
+    let Some(scale) = weight_scale else {
+        return Ok(ops::linear(x, weight, ops::Linear { bias: Some(bias), act, ..ops::Linear::default() })?);
+    };
+    let y = x.dynamic_quantized_linear().weight(weight).weight_scale(scale).bias(bias).call()?;
+    Ok(match act {
+        Act::None => y,
+        Act::Silu => y.silu()?,
+        Act::Gelu => y.gelu_exact()?,
+    })
 }
 
 /// Every `Linear` in this encoder carries PyTorch's own fan-in uniform bias.
@@ -82,13 +89,9 @@ impl FeedForward {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // The two-linear FFN lowers to GEMM1+silu → h → GEMM2 (two reduces force `h`
-        // to realize between them), which the generic optimizer fuses + (with BEAM)
-        // tunes as well as a hand kernel — so the FFN stays plain graph ops.
         let y = scoped("norm", || self.norm.forward(x))?;
-        let y = linear(&y, &self.linear1.weight, bias_of(&self.linear1), self.linear1_scale.as_ref())?;
-        let y = y.silu()?;
-        linear(&y, &self.linear2.weight, bias_of(&self.linear2), self.linear2_scale.as_ref())
+        let y = linear(&y, &self.linear1.weight, bias_of(&self.linear1), self.linear1_scale.as_ref(), Act::Silu)?;
+        linear(&y, &self.linear2.weight, bias_of(&self.linear2), self.linear2_scale.as_ref(), Act::None)
     }
 }
 
@@ -149,7 +152,7 @@ impl MultiHeadSelfAttention {
 
     /// `key_lens`, when present, is a realized `[B]` `i32` tensor of valid
     /// (unpadded) key positions per batch — keys at index `>= key_lens[b]` are
-    /// masked (see [`crate::attention::attend`]).
+    /// masked.
     pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, key_lens: Option<&Tensor>) -> Result<Tensor> {
         let shape = x.shape()?;
         let b = shape[0].clone();
@@ -177,24 +180,24 @@ impl MultiHeadSelfAttention {
             .try_transpose(0, 1)?
             .contiguous();
 
-        let q = linear(&qk_input, &self.q_proj, &self.q_bias, self.q_weight_scale.as_ref())?;
-        let k = linear(&qk_input, &self.k_proj, &self.k_bias, self.k_weight_scale.as_ref())?;
-        let v = linear(&y, &self.v_proj, &self.v_bias, self.v_weight_scale.as_ref())?;
+        let q = linear(&qk_input, &self.q_proj, &self.q_bias, self.q_weight_scale.as_ref(), Act::None)?;
+        let k = linear(&qk_input, &self.k_proj, &self.k_bias, self.k_weight_scale.as_ref(), Act::None)?;
+        let v = linear(&y, &self.v_proj, &self.v_bias, self.v_weight_scale.as_ref(), Act::None)?;
 
-        // Head-split into `[B, T, H, d_k]` — the layout `flash_attention_with`
-        // consumes directly (seq second, head third, head_dim last). Not
-        // `Tensor::split_heads`, which lands head-major `[B, H, T, d_k]`: the
-        // hand kernel and the SDPA fallback both take/return `[B, T, H, d_k]`.
+        // Head-split into the attention's sequence-major `[B, T, H, d_k]`, not
+        // `Tensor::split_heads`, which lands head-major `[B, H, T, d_k]`.
         let split = |p: Tensor| -> Result<Tensor> {
             Ok(p.try_reshape([b.clone(), t.clone(), SInt::Const(h), SInt::Const(d_k)])?)
         };
         let (q, k, v) = (split(q)?, split(k)?, split(v)?);
 
+        // tk1's attention, not the op layer's: at head dim 48 the latter runs
+        // SDPA, which measured 3x slower for the whole encoder.
         let attn = crate::attention::attend(&q, &k, &v, false, key_lens)?;
         // Head-merge is a plain reshape here: the attention output is already
         // seq-major, so there is no transpose to undo.
         let out = attn.try_reshape([b, t, SInt::Const(d_model)])?;
-        linear(&out, &self.out_proj, &self.out_bias, self.out_weight_scale.as_ref())
+        linear(&out, &self.out_proj, &self.out_bias, self.out_weight_scale.as_ref(), Act::None)
     }
 }
 
