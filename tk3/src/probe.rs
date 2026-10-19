@@ -220,14 +220,19 @@ fn mid(rates: &[(usize, f64)], global_byte: f64) -> f64 {
 
 /// What a ladder of `(footprint, ns a byte)` says of the cache in front of
 /// DRAM: a streamed byte's cost from the smallest footprint, which stays in
-/// it, and its bytes, the largest footprint still read nearer that rate than
-/// `global_byte`'s (on a log scale), so a second, slower cache level counts
-/// as DRAM. No cache faster than DRAM: a byte costs DRAM's at most, and no
-/// footprint is held.
+/// it, and its bytes, the most any footprint shows it answering: a
+/// footprint read at a rate between the cache's and DRAM's was answered
+/// for that share of its bytes (the rates mix linearly), so the cache holds
+/// about the share times the footprint; a footprint that fits shows its own
+/// size, one far past the cache shows the cache's, and a slower cache level
+/// counts for the share it answers. No cache faster than DRAM: a byte costs
+/// DRAM's at most, and nothing is held.
 pub(crate) fn held(rates: &[(usize, f64)], global_byte: f64) -> (f64, f64) {
-    let mid = mid(rates, global_byte);
-    let held = rates.iter().take_while(|(_, r)| *r <= mid).last().map_or(0, |&(f, _)| f);
-    (rates[0].1.min(global_byte), held as f64)
+    let near = rates[0].1.min(global_byte);
+    // A cache no faster than DRAM answers nothing.
+    let answered = |r: f64| if global_byte > near { ((global_byte - r) / (global_byte - near)).max(0.0) } else { 0.0 };
+    let bytes = rates.iter().map(|&(f, r)| f as f64 * answered(r)).fold(0.0, f64::max);
+    (near, bytes)
 }
 
 /// The tiles a cache probe's region of `footprint` bytes holds: the largest
