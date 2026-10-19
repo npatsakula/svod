@@ -678,9 +678,7 @@ impl Planner {
     /// `⌈blocks / sms⌉` blocks, each taken up as another ends (measured on
     /// sm_86: a 64×64 GEMM's time steps with that count, not with whole
     /// rounds of resident blocks), a trip's fixed overhead shared with the
-    /// blocks it holds at once: by its shared memory and by its register file
-    /// under the layout estimate, at least one (the compiled kernel, not the
-    /// estimate, decides whether a block runs). A trip's pipes (the fragment
+    /// blocks it holds at once ([`Self::resident`]). A trip's pipes (the fragment
     /// reads, the matrix-core steps, the fill) overlap across the waves a
     /// SIMD holds: the longest is paid whole, the rest in a share of one over
     /// the waves per SIMD up to [`OVERLAP_WAVES`], the blocks the SM holds at
@@ -697,8 +695,9 @@ impl Planner {
         let Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages } = run;
         let Device { target, costs } = &self.device;
         let (o, sms) = (target.occupancy, self.sms());
-        let per_simd = o.waves.min(o.file / regs.max(1)) as usize;
-        let resident = (target.smem_bytes / smem).min(o.simds as usize * per_simd / waves).max(1);
+        // At least one: the compiled kernel, not the layout count, decides
+        // whether a block runs.
+        let resident = self.resident(smem, regs, waves).max(1);
         let per_sm = blocks.div_ceil(sms);
         let rounds = per_sm.div_ceil(resident);
         let hide =
@@ -715,6 +714,16 @@ impl Planner {
         let wave = o.simds as f64 * (body(waves) + trip) / waves as f64;
         let wait = costs.latency / stages.saturating_sub(1).max(1) as f64;
         trips as f64 * (issue.max(rounds as f64 * wave) + rounds as f64 * wait)
+    }
+
+    /// The blocks of `waves` waves an SM holds at once, each holding `smem`
+    /// bytes of shared memory and `regs` registers a lane: by its shared
+    /// memory and by its SIMDs' register files and wave slots; none where a
+    /// block's registers by the layout count pass the SM's.
+    pub(crate) fn resident(&self, smem: usize, regs: u32, waves: usize) -> usize {
+        let (target, o) = (&self.device.target, self.device.target.occupancy);
+        let per_simd = o.waves.min(o.file / regs.max(1)) as usize;
+        (target.smem_bytes / smem.max(1)).min(o.simds as usize * per_simd / waves.max(1))
     }
 
     /// What a byte of a fill costs when `fill` bytes stream `unique`
@@ -1089,10 +1098,7 @@ impl Attention {
         let target = &planner.device.target;
         let resident = |cfg: &FaCfg| -> Option<usize> {
             let smem = cfg.smem_bytes(self.d, self.bias) + cfg.scratch_bytes(target);
-            let regs = cfg.registers(target, self.d, self.bias)?;
-            let o = target.occupancy;
-            let per_simd = o.waves.min(o.file / regs.max(1)) as usize;
-            Some((target.smem_bytes / smem.max(1)).min(o.simds as usize * per_simd / cfg.warps() as usize))
+            Some(planner.resident(smem, cfg.registers(target, self.d, self.bias)?, cfg.warps() as usize))
         };
         one.core == Core::Warp
             && one.bq >= TWO_ROWS_FROM
