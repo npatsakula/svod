@@ -257,6 +257,8 @@ pub const GUESSED: Costs = Costs {
     lane_move: 1.0,
     smem_trip: 8.0,
     latency: 600.0,
+    // A one-slot ring waits out the whole load, half again a ring's leftover.
+    latency_one: 900.0,
     l2_byte: 0.0,
     l2_bytes: 0.0,
 };
@@ -467,7 +469,8 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
         p.lone_trips("probe:trip_one_lone", false, 1),
         p.lane_move(),
         p.smem_trip(),
-        p.latency(),
+        p.latency("probe:latency", 2),
+        p.latency_one(),
     ])
 }
 
@@ -960,19 +963,30 @@ impl<'a> Probes<'a> {
         })
     }
 
-    /// One wave per SM streaming a 16-byte chunk per lane through a
-    /// two-stage ring, the waves' trips interleaved over [`STREAM`] so no
-    /// line is read twice in a run: with nothing else resident and nothing
-    /// to compute, every trip waits out its load on a nearly idle memory.
-    /// The baseline is the ring's depth in trips. A lone wave's 16 bytes a
-    /// lane are not bandwidth-bound: the difference is the wait alone.
-    fn latency(&self) -> Probe {
-        let op = "probe:latency";
+    /// [`Self::latency`] through a one-slot ring where fills are `cp.async`;
+    /// no candidates where they are register-staged, whose one slot loads a
+    /// trip ahead as two do ([`Costs::latency_one`]).
+    fn latency_one(&self) -> Probe {
+        let mut probe = self.latency("probe:latency_one", 1);
+        if self.target.fill != Fill::CpAsync {
+            probe.candidates.clear();
+        }
+        probe
+    }
+
+    /// One wave per SM streaming a 16-byte chunk per lane through a ring
+    /// `stages` deep as the target runs it, the waves' trips interleaved over
+    /// [`STREAM`] so no line is read twice in a run: with nothing else
+    /// resident and nothing to compute, every trip waits out what of its
+    /// load the ring does not prefetch on a nearly idle memory. The baseline
+    /// is the ring's depth in trips. A lone wave's 16 bytes a lane are not
+    /// bandwidth-bound: the difference is the wait alone.
+    fn latency(&self, op: &'static str, stages: usize) -> Probe {
         // A 16-byte chunk of i32 per lane.
         let tile = Shape::new(self.target.wave as usize, 4);
         let waves = self.sms as usize;
         let trips = LATENCY_TRIPS.min(STREAM / 4 / tile.elems() / waves);
-        let stages = self.target.fill.stages(2);
+        let stages = self.target.fill.stages(stages);
         let lowering = self.lowering(WarpGrid { rows: 1, cols: 1 }, false);
         self.make(op, ScalarDType::Int32, (trips - stages) as f64, false, lowering, |on| {
             let mut k = kernel(op, waves, 1);

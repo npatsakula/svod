@@ -82,8 +82,9 @@ replace the file. An unreadable or unwritable store counts as a miss, never an e
 The ranking's costs (`atoms::Costs`: a shared byte, a streamed byte, a scattered element, a
 matrix-core step under a full SM, alone on its SIMD and as a warpgroup product, a score's
 softmax, a pipeline trip over two ring slots unrolled and rolled and over one, the two-slot and
-one-slot trips of a block alone on its SM, a lane move, a shared round trip, the global latency, and the L2 rate and size) are measured on the device by
-`probe::costs` the first time a process plans for it. Each field is a pair of programs, a probe
+one-slot trips of a block alone on its SM, a lane move, a shared round trip, the global latency
+through two ring slots and, where fills are `cp.async`, through one, and the L2 rate and size)
+are measured on the device by `probe::costs` the first time a process plans for it. Each field is a pair of programs, a probe
 doing all its baseline does plus a known amount of the primitive. The values go in the same
 store file as `value|probe:<field>` lines, so later processes read them back. A probe that
 fails leaves its field at zero, is warned about, and is named in `Planner::unmeasured`, which

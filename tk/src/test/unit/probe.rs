@@ -111,7 +111,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
             (blocks * extent) as f64
         }
         // Each wave waits its own trips out, alongside the others.
-        "latency" => (extent - base_extent) as f64,
+        "latency" | "latency_one" => (extent - base_extent) as f64,
         other => unreachable!("{other}"),
     }
 }
@@ -237,6 +237,7 @@ fn units_count_the_primitive(target: Target) {
             let absent = match field {
                 "step_group" => target.group_mma.is_empty(),
                 "trip_rolled" => target.fill == Fill::CpAsync,
+                "latency_one" => target.fill == Fill::Staged,
                 _ => false,
             };
             assert!(absent, "{}: an absent primitive", p.op);
@@ -287,10 +288,14 @@ fn units_count_the_primitive(target: Target) {
         (1, target.fill.stages(2)),
         "one slot against the target's two"
     );
-    let (_, latency) = pair(find(&probes, "latency"));
-    assert_eq!((work(latency).0, latency.warps), (target.sms.unwrap() as usize, 1), "a lone wave per SM");
-    let tile = loads_from(latency, Tier::Smem)[0].1;
-    assert!(work(latency).0 * work(latency).1 * tile <= STREAM, "no line read twice in a run");
+    let one = (target.fill == Fill::CpAsync).then_some(("latency_one", 1));
+    for (field, stages) in [("latency", target.fill.stages(2))].into_iter().chain(one) {
+        let (_, latency) = pair(find(&probes, field));
+        assert_eq!((work(latency).0, latency.warps), (target.sms.unwrap() as usize, 1), "{field}: a lone wave per SM");
+        let tile = loads_from(latency, Tier::Smem)[0].1;
+        assert!(work(latency).0 * work(latency).1 * tile <= STREAM, "{field}: no line read twice in a run");
+        assert_eq!(depth(latency), stages, "{field}: its ring's depth");
+    }
     let (_, step) = pair(find(&probes, "step"));
     let o = target.occupancy;
     let waves = work(step).0 as u32 * step.warps;
@@ -442,7 +447,8 @@ fn a_probe_keeps_the_least_of_agreeing_timings(timings: &[u64]) -> (Option<u64>,
 /// On the attached GPU every cost measures (none is left at zero), finite
 /// and non-negative, and ordered as the hardware is: a shared byte cheaper
 /// than a global one, a cached one no dearer than DRAM's, a lone trip's wait
-/// outlasting a matrix step, a rolled ring's trip and a one-slot ring's about an unrolled two-slot one's
+/// (through a one-slot `cp.async` ring too) outlasting a matrix step, a
+/// rolled ring's trip and a one-slot ring's about an unrolled two-slot one's
 /// or more, a lone block's trip no cheaper than one with the SM full, and a
 /// round trip through shared memory costing something. The
 /// retries absorb a pair timed alongside another test's kernels.
@@ -459,6 +465,7 @@ fn device_costs_are_physical() {
     assert!(c.smem_byte > 0.0 && c.smem_byte < c.global_byte, "{c:?}");
     assert!(c.l2_byte > 0.0 && c.l2_byte <= c.global_byte, "{c:?}");
     assert!(c.latency > c.step, "{c:?}");
+    assert!(target.fill != Fill::CpAsync || c.latency_one > c.step, "{c:?}");
     assert!(c.trip_lone >= c.trip && c.trip_one_lone >= c.trip_one, "{c:?}");
     assert!(c.step_lone >= c.step, "{c:?}");
     assert!(c.smem_trip > 0.0, "{c:?}");

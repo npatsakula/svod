@@ -278,11 +278,15 @@ fn causal_trips_of_one_sequence_are_half_the_keys(t: usize, bq: usize, bkv: usiz
 /// under that device's costs, the faster first (`cost_model_probe` on three
 /// fresh stores each, 2026-10-19), each a block alone on its SM against a
 /// tile the SM runs several of at once: a lone block's trip waits out what
-/// other blocks' work hides ([`Costs::trip_at`]). Before that term the
-/// model ranked every slow one first.
+/// other blocks' work hides ([`Costs::trip_at`]), and a lone one-slot
+/// `cp.async` block fills after its products. Before either term the model
+/// ranked every slow one first.
 #[test_case::test_case(crate::test::unit::sm86_costs(), "rtx3060", [3072, 3072, 1024, 2],
     gemm_cfg([64, 64, 32], 2, [4, 1], true), gemm_cfg([128, 64, 64], 2, [4, 2], false);
     "sm86 Qwen3 gate-up: 1.52 ms at three an SM, 2.01 alone")]
+#[test_case::test_case(crate::test::unit::sm86_costs(), "rtx3060", [3072, 3072, 1024, 2],
+    gemm_cfg([64, 64, 64], 1, [4, 1], false), gemm_cfg([64, 128, 64], 1, [4, 4], false);
+    "sm86 Qwen3 gate-up one slot: 1.55 ms at two an SM, 2.23 alone")]
 #[test_case::test_case(crate::test::unit::gfx1201_costs(), "rx9070xt", [1500, 1280, 5120, 1],
     gemm_cfg([128, 128, 32], 2, [4, 2], false), gemm_cfg([256, 128, 32], 2, [2, 4], false);
     "gfx1201 Whisper fc2: 156 us at two a CU, 172 alone")]

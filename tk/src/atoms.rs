@@ -298,8 +298,14 @@ pub struct Costs {
     pub lane_move: f64,
     /// One element's round trip through shared memory (store, barrier, load).
     pub smem_trip: f64,
-    /// Global memory latency one trip waits unhidden, ns.
+    /// Global memory latency one trip of a two-slot ring waits unhidden, ns:
+    /// what prefetching one trip ahead leaves.
     pub latency: f64,
+    /// The same of a one-slot ring on a target with asynchronous copies, ns:
+    /// its single-stage expansion prefetches nothing, so a trip waits out its
+    /// whole load. 0 where fills are register-staged: a one-slot ring loads a
+    /// trip ahead as two do ([`Self::latency`]).
+    pub latency_one: f64,
     /// One byte streamed into a block from the cache in front of DRAM (L2),
     /// as `global_byte` from a footprint that stays in it.
     pub l2_byte: f64,
@@ -312,7 +318,7 @@ pub struct Costs {
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
     /// order: all but the cache's, which a series of footprints measures.
-    pub fn fields(&mut self) -> [(&'static str, &mut f64); 15] {
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 16] {
         let Costs {
             smem_byte,
             global_byte,
@@ -329,6 +335,7 @@ impl Costs {
             lane_move,
             smem_trip,
             latency,
+            latency_one,
             l2_byte: _,
             l2_bytes: _,
         } = self;
@@ -348,6 +355,7 @@ impl Costs {
             ("lane_move", lane_move),
             ("smem_trip", smem_trip),
             ("latency", latency),
+            ("latency_one", latency_one),
         ]
     }
 }

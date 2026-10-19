@@ -85,8 +85,8 @@ error नहीं।
 Ranking की costs (`atoms::Costs`: एक shared byte, एक streamed byte, एक scattered element, पूरे SM के
 तहत, अपने SIMD पर अकेले और warpgroup product के रूप में एक matrix-core step, एक score का softmax, दो ring
 slots पर unrolled और rolled और एक slot पर एक pipeline trip, अपने SM पर अकेले block के दो और एक slot वाले
-trips, एक lane move, एक shared round trip, global
-latency, और L2 की दर और आकार) device पर `probe::costs` से तब मापी जाती हैं जब कोई process पहली बार उसके
+trips, एक lane move, एक shared round trip, दो ring slots से और जहाँ fill `cp.async` है वहाँ एक slot से
+global latency, और L2 की दर और आकार) device पर `probe::costs` से तब मापी जाती हैं जब कोई process पहली बार उसके
 लिए plan करता है। हर field programs की एक जोड़ी है, एक probe जो वह सब करता है जो उसका baseline करता है,
 साथ में primitive की एक ज्ञात मात्रा। मान उसी store फ़ाइल में `value|probe:<field>` lines के रूप में जाते
 हैं, ताकि बाद के processes उन्हें वापस पढ़ें। जो probe विफल हो, वह अपने field को शून्य पर छोड़ता है, उसकी

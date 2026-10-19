@@ -96,10 +96,10 @@ fn costs_read_from_a_copied_store() {
     let before: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| std::fs::read(e.unwrap().path()).unwrap()).collect();
     let Measured { costs, unmeasured } = probe::stored(&dir, &target).expect("the device's file");
     // Probes added since the store was copied are unmeasured.
-    assert_eq!(unmeasured, ["trip_lone", "trip_one_lone"]);
+    assert_eq!(unmeasured, ["trip_lone", "trip_one_lone", "latency_one"]);
     // A rolled ring is not probed where fills are `cp.async`: its line is passed over.
     let want = |op: &str| match op {
-        "trip_rolled" | "trip_lone" | "trip_one_lone" => 0.0,
+        "trip_rolled" | "trip_lone" | "trip_one_lone" | "latency_one" => 0.0,
         _ => H100.iter().find(|f| f.0 == op).expect("a probe").1 as f64 * 1e-6,
     };
     let mut costs = costs;
@@ -138,7 +138,7 @@ fn a_probe_of_several_lines_takes_this_builds() {
     let Measured { costs, unmeasured } = probe::stored(&dir, &target).expect("the device's file");
     assert_eq!(costs.step, 2.0);
     assert_eq!((costs.trip, costs.latency, costs.l2_bytes), (0.0, 0.0, 0.0));
-    assert_eq!(unmeasured, ["trip", "trip_lone", "trip_one_lone", "latency", "l2_bytes"]);
+    assert_eq!(unmeasured, ["trip", "trip_lone", "trip_one_lone", "latency", "latency_one", "l2_bytes"]);
     let _ = std::fs::remove_dir_all(dir);
 }
 

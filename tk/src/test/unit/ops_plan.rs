@@ -237,12 +237,12 @@ fn an_sm_issues_its_share_of_blocks() {
 /// A ring's trips are charged at the probe of its depth: charged a dear
 /// one, a one-slot ring ranks behind the deeper pipeline of the same tile,
 /// on every fill (the cp.async target's one slot is its single-stage
-/// expansion), and the deeper ring never pays it. A register-staged slot
-/// loads a trip ahead as two do and halves a tile's shared memory, so more
-/// of its blocks run at once and fewer rounds wait out the latency: it wins
-/// while its trip (the commit's barrier pair) costs little more than the
-/// two-slot one. A three-slot `cp.async` ring waits half of it: every
-/// block-trip pays its trip at the blocks at once, which share none of it.
+/// expansion, here waiting what the deeper ring does), and the deeper ring
+/// never pays it. A register-staged slot loads a trip ahead as two do and
+/// halves a tile's shared memory, so more of its blocks run at once and
+/// fewer rounds wait out the latency: it wins while its trip (the commit's
+/// barrier pair) costs little more than the two-slot one. Every block-trip
+/// pays its trip whole, so a residency shares none of it.
 #[test_case(sm86(), 32, false; "sm86 three slots against one")]
 #[test_case(rdna3(), 32, true; "rdna3 two slots against one")]
 fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize, cheap_wins: bool) {
@@ -259,8 +259,10 @@ fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize, cheap_wins
     };
     let one = GemmCfg { stages: 1, ..two };
     let c = costs();
+    let latency_one = c.latency / (two.stages - 1) as f64;
     let cost = |trip_one: f64, cfg: &GemmCfg| {
-        let planner = planned(Device { target: target.clone(), costs: Costs { trip_one, ..c } });
+        let costs = Costs { trip_one, latency: latency_one * (two.stages - 1) as f64, latency_one, ..c };
+        let planner = planned(Device { target: target.clone(), costs });
         problem.admit(&planner, cfg).expect("admitted").0
     };
     assert_eq!(cost(c.trip_rolled, &one) < cost(c.trip_rolled, &two), cheap_wins, "a cheap one-slot trip");
@@ -291,6 +293,27 @@ fn a_trip_overhead_shrinks_with_the_blocks_at_once(trip_lone: f64, resident: usi
     let costs = Costs { latency: 0.0, step_lone: costs().step, trip_lone, ..costs() };
     let planner = planned(Device { target: sm86(), costs });
     planner.pipelined(run(resident * planner.sms(), resident, 4, 1, 1, [0.0, 100.0, 0.0, 40.0], 2))
+}
+
+/// A one-slot `cp.async` ring copies, waits and then computes: a block
+/// alone pays its fill after its steps, two at once overlap one another's
+/// fills with their steps; a register-staged slot loads a trip ahead and
+/// overlaps its own.
+#[test]
+fn a_one_slot_cp_async_block_fills_alone() {
+    let cost = |target: Target, stages: usize, resident: usize| {
+        let flat = Costs { latency: 0.0, latency_one: 0.0, step_lone: costs().step, ..costs() };
+        let planner = planned(Device { target: target.clone(), costs: flat });
+        let run = Run {
+            smem: target.smem_bytes / resident,
+            ..run(resident * planner.sms(), resident, 16, 1, 1, [0.0, 100.0, 60.0, 0.0], stages)
+        };
+        planner.pipelined(run)
+    };
+    assert_eq!(cost(sm86(), 1, 1), 160.0);
+    assert_eq!(cost(sm86(), 2, 1), 115.0);
+    assert_eq!(cost(sm86(), 1, 2), 2.0 * 115.0);
+    assert_eq!(cost(rdna3(), 1, 1), cost(rdna3(), 2, 1));
 }
 
 /// A SIMD holding fewer waves than hide a matrix-core chain (`step_lone /
@@ -570,14 +593,26 @@ fn a_lane_holds_what_its_files_take(acc_file: u32, acc: u32, rest: u32) -> bool 
     crate::atoms::Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file }.holds(acc, rest)
 }
 
-/// A ring of one stage or none prefetches nothing: the round waits the
-/// whole latency, never a division by zero.
+/// A ring of one stage or none waits what a one-slot ring leaves
+/// (`latency_one`), never a division by zero; under costs probed before it
+/// (zero) at least what a ring one trip ahead does.
 #[test_case(0; "no ring")]
 #[test_case(1; "one stage")]
 fn a_ring_without_prefetch_waits_the_latency(stages: usize) {
-    let c = costs();
-    assert_eq!(pipelined(c, [1, 1, 1, 4, stages], 0.0), c.latency);
-    assert_eq!(pipelined(c, [1, 1, 1, 4, stages], 0.0), pipelined(c, [1, 1, 1, 4, 2], 0.0));
+    let c = Costs { trip_one: costs().trip, ..costs() };
+    assert_eq!(pipelined(c, [1, 1, 1, 4, stages], 0.0), c.latency_one);
+    let unprobed = Costs { latency_one: 0.0, ..c };
+    assert_eq!(pipelined(unprobed, [1, 1, 1, 4, stages], 0.0), pipelined(unprobed, [1, 1, 1, 4, 2], 0.0));
+}
+
+/// A register-staged slot loads a trip ahead as two do: its round waits
+/// what a two-slot ring's does, whatever `latency_one` says.
+#[test]
+fn a_register_staged_slot_waits_what_two_slots_do() {
+    let planner = planned(Device { target: rdna3(), costs: Costs { latency_one: 10.0 * costs().latency, ..costs() } });
+    let cost = |stages| planner.pipelined(run(planner.sms(), 1, 4, 1, 1, [0.0, 0.0, 0.0, 0.0], stages));
+    assert_eq!(cost(1), cost(2));
+    assert_eq!(cost(1), costs().latency);
 }
 
 /// A ranked config of the shortlist tests: its position, and the tile it

@@ -685,15 +685,17 @@ impl Planner {
     /// rest in a share of one over the waves per SIMD up to
     /// [`OVERLAP_WAVES`], the blocks the SM holds at once ([`Self::resident`])
     /// pooling theirs (measured on gfx1201 and sm_86: a block at one wave per
-    /// SIMD pays about their sum, at four or more the longest). A SIMD
-    /// holding fewer waves than hide a matrix-core chain's latency
-    /// (`step_lone / step` of them, a wave's independent accumulators
-    /// counting as waves) runs the steps that many times slower. A round of
-    /// blocks is at least one wave's own issue (a block of fewer waves than
-    /// SIMDs leaves the rest idle), and every round of every trip pays the
-    /// memory latency the ring cannot hide (it prefetches `stages - 1` trips
-    /// ahead) on top of its issue: measured on both, the latency adds rather
-    /// than hides under the issue.
+    /// SIMD pays about their sum, at four or more the longest); a one-slot
+    /// `cp.async` ring copies, waits and only then computes, so a block alone
+    /// on its SM overlaps nothing with its fill. A SIMD holding fewer waves
+    /// than hide a matrix-core chain's latency (`step_lone / step` of them, a
+    /// wave's independent accumulators counting as waves) runs the steps that
+    /// many times slower. A round of blocks is at least one wave's own issue
+    /// (a block of fewer waves than SIMDs leaves the rest idle), and every
+    /// round of every trip pays the memory latency the ring cannot hide (it
+    /// prefetches `stages - 1` trips ahead; a one-slot `cp.async` ring none,
+    /// [`crate::atoms::Costs::latency_one`]) on top of its issue: measured on
+    /// both, the latency adds rather than hides under the issue.
     pub(crate) fn pipelined(&self, run: Run) -> f64 {
         let Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages } = run;
         let Device { target, costs } = &self.device;
@@ -707,15 +709,24 @@ impl Planner {
             if costs.step > 0.0 && costs.step_lone > 0.0 { (costs.step_lone / costs.step).max(1.0) } else { 1.0 };
         let per_simd = |waves: usize| (waves as f64 / o.simds as f64).max(1.0);
         let lone = |waves: usize| (hide / (per_simd(waves) * atoms.max(1) as f64)).max(1.0);
-        let body = |waves: usize| {
-            let pipes = [reads, work * lone(waves), fill];
+        let serial = stages <= 1 && target.fill == Fill::CpAsync;
+        // `alone`: one block's pipes, its fill after the rest where serial.
+        let body = |waves: usize, alone: bool| {
+            let fill = if alone && serial { (0.0, fill) } else { (fill, 0.0) };
+            let pipes = [reads, work * lone(waves), fill.0];
             let longest = pipes.into_iter().fold(0.0, f64::max);
-            longest + (pipes.iter().sum::<f64>() - longest) / per_simd(waves).min(OVERLAP_WAVES)
+            longest + (pipes.iter().sum::<f64>() - longest) / per_simd(waves).min(OVERLAP_WAVES) + fill.1
         };
         let at_once = resident.min(per_sm);
-        let issue = per_sm as f64 * (body(at_once * waves) + costs.trip_at(stages, trip, at_once));
-        let wave = o.simds as f64 * (body(waves) + trip) / waves as f64;
-        let wait = costs.latency / stages.saturating_sub(1).max(1) as f64;
+        let issue = per_sm as f64 * (body(at_once * waves, at_once == 1) + costs.trip_at(stages, trip, at_once));
+        let wave = o.simds as f64 * (body(waves, true) + trip) / waves as f64;
+        // A register-staged slot loads a trip ahead as two do; a store
+        // probed before `latency_one` has none (zero): a one-slot ring waits
+        // at least what a ring one trip ahead leaves.
+        let wait = match stages {
+            ..=1 if serial => costs.latency_one.max(costs.latency),
+            s => costs.latency / s.saturating_sub(1).max(1) as f64,
+        };
         trips as f64 * (issue.max(rounds as f64 * wave) + rounds as f64 * wait)
     }
 

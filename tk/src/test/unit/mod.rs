@@ -181,6 +181,8 @@ pub(crate) fn gfx1151_costs() -> Costs {
         lane_move: 0.0316,
         smem_trip: 0.0841,
         latency: 577.9,
+        // A register-staged slot loads a trip ahead as two do: not probed.
+        latency_one: 0.0,
         l2_byte: 0.0,
         l2_bytes: 0.0,
     }
@@ -205,6 +207,7 @@ pub(crate) fn sm86_costs() -> Costs {
         lane_move: 0.09804,
         smem_trip: 0.2449,
         latency: 311.79,
+        latency_one: 324.77,
         l2_byte: 0.016066,
         l2_bytes: 7.018e6,
     }
@@ -229,6 +232,7 @@ pub(crate) fn gfx1201_costs() -> Costs {
         lane_move: 0.024552,
         smem_trip: 0.078096,
         latency: 243.15,
+        latency_one: 0.0,
         l2_byte: 0.005929,
         l2_bytes: 65.97e6,
     }
