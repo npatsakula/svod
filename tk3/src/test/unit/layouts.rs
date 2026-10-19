@@ -42,6 +42,18 @@ fn transposing_layouts_hold_16_byte_column_runs(rows: usize, cols: usize, warps:
 
 /// The GEMM's accumulator takes the matrix core's C layout tiled over the
 /// warp grid, and the output cast inherits it.
+/// Inference that runs out of passes before every value is laid is an error,
+/// not a program the emitter finds unlaid values in.
+#[test_case(0 => matches Err(crate::layouts::Error::NotConverged { passes: 0 }); "out of passes")]
+#[test_case(64 => matches Ok(()); "within its passes")]
+fn inference_out_of_passes_is_an_error(passes: usize) -> crate::layouts::Result<()> {
+    let mut prog = super::gemm_nt(256, 256, 256, 128, 128, 32, 3);
+    prog.warps = 8;
+    let (target, grid) = (sm86(), WarpGrid { rows: 2, cols: 4 });
+    let Laid { prog, .. } = infer(prog, &declared(target.clone()), grid, false).unwrap();
+    crate::layouts::Infer::new(&prog, &target, grid, false).solve_within(passes)
+}
+
 #[test]
 fn gemm_accumulator_gets_the_core_layout_over_the_warp_grid() {
     let mut prog = super::gemm_nt(256, 256, 256, 128, 128, 32, 3);

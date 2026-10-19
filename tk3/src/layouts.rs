@@ -25,6 +25,8 @@ pub enum Error {
     Undetermined { value: ValId, rows: usize, cols: usize },
     #[snafu(display("a warpgroup product takes {what}"))]
     GroupOperand { what: String },
+    #[snafu(display("the layouts reach no fixed point in {passes} passes"))]
+    NotConverged { passes: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -539,7 +541,7 @@ pub fn transposing(shape: Shape, warps: u32, lanes: u32) -> Option<TileLayout> {
     Some(TileLayout { frag: frag::global_tr_b128(), reps, warps: warps_layout })
 }
 
-struct Infer<'a> {
+pub(crate) struct Infer<'a> {
     prog: &'a Program,
     target: &'a Target,
     grid: WarpGrid,
@@ -706,7 +708,7 @@ fn set_orient(block: &mut Block, choice: &HashMap<ValId, Orient>) {
 }
 
 impl<'a> Infer<'a> {
-    fn new(prog: &'a Program, target: &'a Target, grid: WarpGrid, group: bool) -> Self {
+    pub(crate) fn new(prog: &'a Program, target: &'a Target, grid: WarpGrid, group: bool) -> Self {
         let mut lay = vec![None; prog.values.len()];
         for (v, l) in &prog.pins {
             lay[v.index()] = Some(l.clone());
@@ -716,17 +718,21 @@ impl<'a> Infer<'a> {
 
     /// Run the propagation to its fixed point, seeding what nothing constrains.
     fn solve(&mut self) -> Result<()> {
+        self.solve_within(4 * self.lay.len() + 4)
+    }
+
+    /// [`Self::solve`] within `passes` passes after the first.
+    pub(crate) fn solve_within(&mut self, passes: usize) -> Result<()> {
         let prog = self.prog;
-        let n = self.lay.len();
         let (warps, lanes) = (self.grid.count(), self.target.wave);
-        for _ in 0..4 * n + 4 {
+        for _ in 0..=passes {
             if !self.changed {
                 // At a fixed point, a value nothing constrains takes the natural
                 // layout and the passes go on, so what consumes it (a vector it
                 // broadcasts over, say) is demanded from it rather than defaulted
                 // apart from it. Tiles seed before vectors: a vector's layout is
                 // its tile's to decide.
-                let Some(v) = self.unconstrained() else { break };
+                let Some(v) = self.unconstrained() else { return Ok(()) };
                 let shape = prog.values[v.index()].shape;
                 let l = natural(shape, warps, lanes).context(UndeterminedSnafu {
                     value: v,
@@ -740,7 +746,7 @@ impl<'a> Infer<'a> {
             self.pos = 0;
             self.pass(&prog.body)?;
         }
-        Ok(())
+        NotConvergedSnafu { passes }.fail()
     }
 
     /// The first register value without a layout, tiles before vectors.
