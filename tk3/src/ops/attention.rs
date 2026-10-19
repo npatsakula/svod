@@ -175,7 +175,13 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let shape = [batch.capacity(), t, tk, heads, kv_heads, d];
     let salt = (&batch, edges, cache.map(|c| (c.rows, c.heads_total, c.head_start)), opts.splits);
     let cfg = tuned(OP, &target, q.dtype(), &shape, salt, &cfgs, |cfg| {
-        let plain = cache.map(|c| kernels::attention::Cache { row_map: false, appended: false, ..c });
+        // Scratch caches hold a row per batch lane: no map to read, no garbage rows.
+        let plain = cache.map(|c| kernels::attention::Cache {
+            rows: c.rows.max(batch.capacity()),
+            row_map: false,
+            appended: false,
+            ..c
+        });
         let mut programs = vec![(typed!(q.dtype(), fa, &spec(cfg, edges, plain)), cfg.lowering(target.clone()))];
         if cfg.splits > 1 {
             let merge = merge(cfg.splits);
