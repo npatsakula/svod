@@ -551,6 +551,38 @@ fn tile_ops(block: &crate::ir::Block, f: &dyn Fn(&crate::ir::TileOp) -> bool) ->
         .sum()
 }
 
+/// A bf16 tile summed into f32 lowers to the pair dot product where the
+/// target has it (RDNA3 on, gfx950), and widens each element elsewhere.
+#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
+#[test_case(amd(AmdArch::Gfx950, 256), true; "gfx950")]
+#[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
+#[test_case(crate::atoms::sm86(), false; "sm_86")]
+fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, dot2: bool) {
+    use crate::build::{F32, Kernel};
+    use crate::ir::{ReduceOp, Shape};
+    assert_eq!(target.dot2_bf16, dot2);
+    let (rows, cols) = (4usize, 128usize);
+    let mut k = Kernel::new("held_sum");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows);
+    let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let xr = k.load(xv);
+    let held = k.cast_toward_zero::<BF16>(xr);
+    let sum = k.reduce_f32(held, Axis::Row, ReduceOp::Sum);
+    let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
+    k.store(yv, sum);
+    let lowering = Lowering {
+        schedule: crate::schedule::Schedule::Uniform { prefetch: target.prefetch(), unroll: false },
+        target,
+        grid: crate::layouts::WarpGrid { rows: 1, cols: 1 },
+        swizzle: false,
+    };
+    let ir = render(k.finish(), &lowering);
+    assert_eq!(ir.contains("@llvm.amdgcn.fdot2.f32.bf16("), dot2, "{ir}");
+    // A lane's odd member out is widened on every target.
+    assert!(dot2 || ir.contains("fpext bfloat"), "{ir}");
+}
+
 /// `Sync::Fence` statements in `block`, recursively.
 fn fences(block: &crate::ir::Block) -> usize {
     use crate::ir::{Stmt, Sync};

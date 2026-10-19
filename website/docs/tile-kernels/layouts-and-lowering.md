@@ -118,7 +118,9 @@ running pointer per view and an immediate per register instead of rebuilding eve
 every trip; a gathered row and a swizzled shared row take the full coordinate. A `Scale`
 (a product, exactly) puts its multiplies under a branch on whether any factor the thread holds
 differs from 1, which a wave whose factors are all ones jumps over. A cast toward zero to bf16
-keeps the upper half of the f32's bits. On AMD an f32 `Exp2` is the hardware `v_exp_f32`
+keeps the upper half of the f32's bits. A reduction of a bf16 tile into f32 folds in f32: where the
+target has `v_dot2_f32_bf16` (RDNA3 on, gfx950) a lane's pairs are added as held, one instruction
+each; elsewhere each element is widened first. On AMD an f32 `Exp2` is the hardware `v_exp_f32`
 (`llvm.amdgcn.exp2`), without the range reduction `llvm.exp2` adds to keep results below 2⁻¹²⁶
 denormal; those flush to zero. The CUDA backend
 places shared memory above the 48 KB static limit in one dynamic array. Config candidates are

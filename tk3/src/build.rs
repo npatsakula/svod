@@ -427,6 +427,17 @@ impl Kernel {
         self.let_(shape, TileOp::Reduce { src: src.0, axis, f })
     }
 
+    /// A reduction of a 16-bit tile folded in f32: the values as held, summed
+    /// without the rounding a 16-bit fold would add.
+    pub fn reduce_f32<T: Elem>(&mut self, src: Regs<T>, axis: Axis, f: ReduceOp) -> Regs<F32> {
+        let s = self.shape(src);
+        let shape = match axis {
+            Axis::Row => Shape::new(s.rows, 1),
+            Axis::Col => Shape::new(1, s.cols),
+        };
+        self.let_(shape, TileOp::Reduce { src: src.0, axis, f })
+    }
+
     pub fn where_<T: Elem>(&mut self, pred: Regs<Bool>, a: Regs<T>, b: Regs<T>) -> Regs<T> {
         let shape = self.broadcast_shape(a.0, b.0);
         assert_eq!(self.shape(pred), shape, "predicate shape");

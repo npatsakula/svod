@@ -255,7 +255,8 @@ pub enum TileOp {
         orient: Option<Orient>,
     },
     /// Reduce along `axis`: `Row` folds every row to one column (`[rows, 1]`),
-    /// `Col` folds every column to one row (`[1, cols]`).
+    /// `Col` folds every column to one row (`[1, cols]`). The fold runs in
+    /// the destination's type, so a 16-bit source may be summed in f32.
     Reduce {
         src: ValId,
         axis: Axis,

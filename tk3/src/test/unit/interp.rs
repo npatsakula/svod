@@ -132,6 +132,31 @@ fn a_truncating_cast_keeps_the_upper_half(x: f64, nearest: f64, toward_zero: f64
     assert_eq!((out[1][0], out[2][0]), (nearest, toward_zero));
 }
 
+/// A bf16 tile summed into f32 adds the values as held: the truncated ones,
+/// not the f32 values they came from.
+#[test]
+fn a_bf16_tile_is_summed_as_held() {
+    let (rows, cols) = (4usize, 64usize);
+    let mut k = Kernel::new("held_sum");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows);
+    let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let xr = k.load(xv);
+    let held = k.cast_toward_zero::<BF16>(xr);
+    let sum = k.reduce_f32(held, Axis::Row, ReduceOp::Sum);
+    let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
+    k.store(yv, sum);
+    let xs: Vec<f64> = (0..rows * cols).map(|i| 1.0 + (i as f64 + 0.37) / 300.0).collect();
+    let got = run(&k.finish(), vec![xs.clone(), vec![0.0; rows]], &[]).unwrap();
+    let trunc = |v: f64| f64::from(f32::from_bits((v as f32).to_bits() & 0xffff_0000));
+    for r in 0..rows {
+        let row = &xs[r * cols..(r + 1) * cols];
+        let (held, plain): (f64, f64) = (row.iter().map(|&v| trunc(v)).sum(), row.iter().sum());
+        assert!((got[1][r] - held).abs() < 1e-5, "row {r}: {} against {held}", got[1][r]);
+        assert!((got[1][r] - plain).abs() > 1e-3, "row {r}: the held values differ from the f32 ones");
+    }
+}
+
 /// `scale` is a product whatever its factors: ones (which the lowering may
 /// skip) and others alike.
 #[test]

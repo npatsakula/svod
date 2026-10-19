@@ -261,13 +261,14 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     let m_exp = scaled(k, m_new);
     let p = k.binary(s, m_exp, BinaryOp::Sub);
     let p = k.unary(p, UnaryOp::Exp2);
-    let (p16, held) = if st.cfg.truncate_p && T::DTYPE == svod_dtype::ScalarDType::BFloat16 {
+    // Truncated probabilities are summed as held, so the normalization stays
+    // unbiased; rounded ones in f32.
+    let (p16, block_sum) = if st.cfg.truncate_p && T::DTYPE == svod_dtype::ScalarDType::BFloat16 {
         let p16 = k.cast_toward_zero::<T>(p);
-        (p16, k.cast::<T, F32>(p16))
+        (p16, k.reduce_f32(p16, Axis::Row, ReduceOp::Sum))
     } else {
-        (k.cast::<F32, T>(p), p)
+        (k.cast::<F32, T>(p), k.reduce(p, Axis::Row, ReduceOp::Sum))
     };
-    let block_sum = k.reduce(held, Axis::Row, ReduceOp::Sum);
     let l = k.binary(l, corr, BinaryOp::Mul);
     let l = k.binary(l, block_sum, BinaryOp::Add);
     let o = if st.cfg.skip_rescale { k.scale(o, corr) } else { k.binary(o, corr, BinaryOp::Mul) };
