@@ -196,15 +196,29 @@ fn no_register_count_admits() {
     }
 }
 
+/// A run of `blocks` blocks on sm_86, `resident` of them sharing an SM's
+/// shared memory, each of `waves` waves and `atoms` independent
+/// accumulators a wave, `trips` trips of `[reads, work, fill, trip]` over a
+/// ring of `stages`.
+fn run(
+    blocks: usize,
+    resident: usize,
+    waves: usize,
+    atoms: usize,
+    trips: usize,
+    [reads, work, fill, trip]: [f64; 4],
+    stages: usize,
+) -> Run {
+    Run { blocks, smem: sm86().smem_bytes / resident, regs: 0, waves, atoms, trips, reads, work, fill, trip, stages }
+}
+
 /// The SM time of `rounds` rounds of `actual` resident blocks of `waves`
 /// waves, each `trips` trips of `work`, on sm_86 under `costs`: blocks
 /// filling the SMs `rounds` times over, each holding `1/actual` of an SM's
 /// shared memory (at most twelve resident: sm_86's 48 waves over four).
 fn pipelined(costs: Costs, [rounds, trips, actual, waves, stages]: [usize; 5], work: f64) -> f64 {
     let planner = planned(Device { target: sm86(), costs });
-    let (blocks, smem) = (rounds * actual * planner.sms(), sm86().smem_bytes / actual);
-    let run = Run { blocks, smem, regs: 0, waves, atoms: 1, trips, reads: 0.0, work, fill: 0.0, trip: 0.0, stages };
-    planner.pipelined(run)
+    planner.pipelined(run(rounds * actual * planner.sms(), actual, waves, 1, trips, [0.0, work, 0.0, 0.0], stages))
 }
 
 /// The busiest SM issues `⌈blocks / sms⌉` blocks' work, not whole rounds of
@@ -214,21 +228,9 @@ fn an_sm_issues_its_share_of_blocks() {
     let flat = Costs { latency: 0.0, ..costs() };
     let planner = planned(Device { target: sm86(), costs: flat });
     let sms = planner.sms();
-    let run = |blocks| Run {
-        blocks,
-        smem: sm86().smem_bytes / 4,
-        regs: 0,
-        waves: 4,
-        atoms: 1,
-        trips: 1,
-        reads: 0.0,
-        work: 100.0,
-        fill: 0.0,
-        trip: 0.0,
-        stages: 2,
-    };
-    assert_eq!(planner.pipelined(run(9 * sms)), 900.0);
-    assert_eq!(planner.pipelined(run(9 * sms + 1)), 1000.0);
+    let cost = |blocks| planner.pipelined(run(blocks, 4, 4, 1, 1, [0.0, 100.0, 0.0, 0.0], 2));
+    assert_eq!(cost(9 * sms), 900.0);
+    assert_eq!(cost(9 * sms + 1), 1000.0);
 }
 
 /// A ring's trips are charged at the probe of its depth: a one-slot ring
@@ -269,23 +271,8 @@ fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize) {
 fn a_trip_overhead_is_shared_by_resident_blocks(resident: usize) {
     let flat = Costs { latency: 0.0, ..costs() };
     let planner = planned(Device { target: sm86(), costs: flat });
-    let blocks = resident * planner.sms();
-    let smem = sm86().smem_bytes / resident;
-    let run = |work, trip| Run {
-        blocks,
-        smem,
-        regs: 0,
-        waves: 4,
-        atoms: 1,
-        trips: 1,
-        reads: 0.0,
-        work,
-        fill: 0.0,
-        trip,
-        stages: 2,
-    };
-    let base = planner.pipelined(run(100.0, 0.0));
-    assert_eq!(planner.pipelined(run(100.0, 40.0)) - base, 40.0);
+    let cost = |trip| planner.pipelined(run(resident * planner.sms(), resident, 4, 1, 1, [0.0, 100.0, 0.0, trip], 2));
+    assert_eq!(cost(40.0) - cost(0.0), 40.0);
 }
 
 /// A SIMD holding fewer waves than hide a matrix-core chain (`step_lone /
@@ -300,10 +287,7 @@ fn a_lone_wave_pays_its_chain() {
     let waves = sm86().occupancy.simds as usize;
     let cost = |step_lone, resident, work, fill| {
         let planner = planned(Device { target: sm86(), costs: flat(step_lone) });
-        let (blocks, smem) = (resident * planner.sms(), sm86().smem_bytes / resident);
-        let run =
-            Run { blocks, smem, regs: 0, waves, atoms: 1, trips: 1, reads: 0.0, work, fill, trip: 0.0, stages: 2 };
-        planner.pipelined(run)
+        planner.pipelined(run(resident * planner.sms(), resident, waves, 1, 1, [0.0, work, fill, 0.0], 2))
     };
     assert_eq!(cost(15.0, 1, 100.0, 0.0), 300.0);
     assert_eq!(cost(15.0, 1, 100.0, 50.0), 350.0);
@@ -320,12 +304,9 @@ fn a_lone_wave_pays_its_chain() {
 fn independent_accumulators_hide_the_chain() {
     let flat = Costs { latency: 0.0, step: 5.0, step_lone: 15.0, ..costs() };
     let planner = planned(Device { target: sm86(), costs: flat });
-    let (waves, smem) = (sm86().occupancy.simds as usize, sm86().smem_bytes);
-    let cost = |atoms, work, reads| {
-        let blocks = planner.sms();
-        let run = Run { blocks, smem, regs: 0, waves, atoms, trips: 1, reads, work, fill: 0.0, trip: 0.0, stages: 2 };
-        planner.pipelined(run)
-    };
+    let waves = sm86().occupancy.simds as usize;
+    let cost =
+        |atoms, work, reads| planner.pipelined(run(planner.sms(), 1, waves, atoms, 1, [reads, work, 0.0, 0.0], 2));
     assert_eq!(cost(1, 100.0, 0.0), 300.0);
     assert_eq!(cost(3, 100.0, 0.0), 100.0);
     assert_eq!(cost(1, 0.0, 100.0), 100.0);
@@ -343,21 +324,7 @@ fn pipes_overlap_across_the_waves_a_simd_holds() {
     let planner = planned(Device { target: sm86(), costs: flat });
     let simds = sm86().occupancy.simds as usize;
     let cost = |resident: usize, waves: usize| {
-        let (blocks, smem) = (resident * planner.sms(), sm86().smem_bytes / resident);
-        let run = Run {
-            blocks,
-            smem,
-            regs: 0,
-            waves,
-            atoms: 1,
-            trips: 1,
-            reads: 40.0,
-            work: 100.0,
-            fill: 60.0,
-            trip: 0.0,
-            stages: 2,
-        };
-        planner.pipelined(run)
+        planner.pipelined(run(resident * planner.sms(), resident, waves, 1, 1, [40.0, 100.0, 60.0, 0.0], 2))
     };
     assert_eq!(cost(1, simds), 200.0);
     assert_eq!(cost(1, 4 * simds), 125.0);
