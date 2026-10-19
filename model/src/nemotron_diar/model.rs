@@ -23,7 +23,7 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Conv1d, Layer, LayerNorm, Linear, Module, get_tensor, prefixed};
-use svod_tk3::ops::{self, Act, Attn, KeyMask};
+use svod_tk3::ops::{self, Act, Attn, KeyMask, Qkv};
 
 use crate::audio::MelSpectrogram;
 use crate::init::{Bias, conv1d, layer_norm, linear};
@@ -76,20 +76,17 @@ impl Attention {
     fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor), key_lens: &Tensor, residual: &Tensor) -> Result<Tensor> {
         let (b, s, d) = (x.dim(0)?, x.dim(1)?, x.dim_const(2)?);
         let qkv = ops::linear(x, &self.qkv_weight, ops::Linear::default())?;
-        let heads = |part: usize| {
-            qkv.narrow(-1, part * d, d)?.try_reshape([
-                b.clone(),
-                s.clone(),
-                SInt::Const(self.num_heads),
-                SInt::Const(d / self.num_heads),
-            ])
-        };
         let (cos, sin) = rope;
-        // Materialized: left lazy, the rotation fuses into the score GEMM and is
-        // recomputed inside its reduction.
-        let q = heads(0)?.apply_rotary_emb(cos, sin, false)?.contiguous();
-        let k = heads(1)?.apply_rotary_emb(cos, sin, false)?.contiguous();
-        let v = heads(2)?;
+        let split = Qkv {
+            heads: self.num_heads,
+            kv_heads: self.num_heads,
+            head_dim: d / self.num_heads,
+            q_norm: None,
+            k_norm: None,
+            eps: 0.0,
+            rope: Some((cos, sin)),
+        };
+        let (q, k, v) = ops::heads(&qkv, split)?;
         let opts = Attn { keys: KeyMask::Lens(key_lens), ..Attn::default() };
         let out = ops::attention(&q, &k, &v, opts)?;
         project(&self.o_proj, &out.try_reshape([b, s, SInt::Const(d)])?, Act::None, Some(residual))
