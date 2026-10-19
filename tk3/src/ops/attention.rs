@@ -236,7 +236,10 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
             ..c
         });
         let spec = AttnSpec { batch: measured.clone(), ..spec(cfg, edges, plain) };
-        let mut programs = vec![(typed!(q.dtype(), fa, &spec), cfg.lowering(&planner.device))];
+        let mut programs = timed_keys(tk, cache.is_some() || lens.is_some(), &cfg)
+            .into_iter()
+            .map(|tk| (typed!(q.dtype(), fa, &AttnSpec { tk, ..spec.clone() }), cfg.lowering(&planner.device)))
+            .collect::<Vec<_>>();
         if cfg.splits > 1 {
             let merge = merge(cfg.splits);
             programs.push((typed!(q.dtype(), combine, &merge), merge.cfg.lowering(&planner.device)));
@@ -321,6 +324,17 @@ pub(crate) fn split_ranked(cfgs: &[FaCfg], splits: Option<usize>, tk: usize) -> 
     let most = cfgs.iter().map(blocks).max().unwrap_or(1);
     let splits = splits.map_or(1, |n| n.clamp(1, most));
     cfgs.iter().filter(|c| blocks(c) >= splits).map(|&c| FaCfg { splits, ..c }).collect()
+}
+
+/// The key counts a candidate is timed at, their times summed: the shape's
+/// `tk`, and where the keys live `below` it (a cache's capacity, a length
+/// parameter the scratch holds at zero) half of it too, at least the key
+/// blocks its splits need. At capacity a decode step's leaders tie within
+/// a round's drift, and the step's own length told them apart by 4–12 %
+/// on every card, so the length a step runs at most of its life decides.
+pub(crate) fn timed_keys(tk: usize, below: bool, cfg: &FaCfg) -> Vec<usize> {
+    let half = (tk / 2).max(cfg.splits * cfg.bkv);
+    if below && half < tk { vec![tk, half] } else { vec![tk] }
 }
 
 /// Search bound: the softmax forms, each flipped in turn by [`forms`].

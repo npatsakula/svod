@@ -647,6 +647,17 @@ fn a_gemm_tiles_twins_are_its_pipelines() {
     assert_eq!(config::distinct_configs(&twins), twins);
 }
 
+/// A cached or length-masked shape is timed at its capacity and at half of
+/// it, no shorter than its splits' key blocks; a plain shape at its keys alone.
+#[test_case(448, false, 1, 16 => vec![448]; "plain shape")]
+#[test_case(448, true, 1, 16 => vec![448, 224]; "cache at half")]
+#[test_case(448, true, 8, 32 => vec![448, 256]; "splits need their blocks")]
+#[test_case(16, true, 1, 16 => vec![16]; "one block is its own half")]
+fn a_cached_shape_is_timed_at_half_its_capacity_too(tk: usize, below: bool, splits: usize, bkv: usize) -> Vec<usize> {
+    let cfg = FaCfg { splits, bkv, ..FaCfg::new(64, bkv, 2) };
+    crate::ops::attention::timed_keys(tk, below, &cfg)
+}
+
 /// A split convolution's twins keep its split; a split attention's keep its
 /// splits and its tuned softmax forms, the ranking's being plain; a norm
 /// config is its own only twin.
