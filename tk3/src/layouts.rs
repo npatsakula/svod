@@ -9,7 +9,7 @@ use snafu::{OptionExt, Snafu, ensure};
 use crate::atoms::{MmaAtom, Target};
 use crate::ir::*;
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
-use crate::layout::Layout;
+use crate::layout::{self as frag, Layout};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -364,6 +364,25 @@ pub fn chunked(shape: Shape, elem_bytes: usize, warps: u32, lanes: u32, walk: Ax
         .product(&Layout::zeros(Warp, warps / (warp_rows * warp_cols)));
     let reps = [rows / (lane_rows * warp_rows), cols / (v * lane_cols * warp_cols)];
     Some(TileLayout { frag, reps, warps: warps_layout })
+}
+
+/// The layout transposing 16×16 loads ([`frag::global_tr_b128`]) leave a
+/// `shape` tile of 16-bit elements in: every lane holds 16-byte column runs,
+/// and the blocks are divided among the warps, rows first. Wave32 only, and
+/// `None` unless 16 divides both sides.
+pub fn transposing(shape: Shape, warps: u32, lanes: u32) -> Option<TileLayout> {
+    let pow2 = |n: u32| 1u32 << n.trailing_zeros();
+    let (rows, cols) = (shape.rows as u32, shape.cols as u32);
+    if lanes != 32 || rows == 0 || cols == 0 || rows % 16 != 0 || cols % 16 != 0 {
+        return None;
+    }
+    let warp_rows = pow2(rows / 16).min(warps);
+    let warp_cols = pow2(cols / 16).min(warps / warp_rows);
+    let warps_layout = Layout::identity(Warp, warp_rows, Row)
+        .product(&Layout::identity(Warp, warp_cols, Col))
+        .product(&Layout::zeros(Warp, warps / (warp_rows * warp_cols)));
+    let reps = [rows / (16 * warp_rows), cols / (16 * warp_cols)];
+    Some(TileLayout { frag: frag::global_tr_b128(), reps, warps: warps_layout })
 }
 
 struct Infer<'a> {

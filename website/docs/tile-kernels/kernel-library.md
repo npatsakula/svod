@@ -104,7 +104,8 @@ hides no latency, so a decoder step leads with one-warp blocks. A causal mask ch
 block its diagonal. The value tile is stored column-major where its fill goes through registers
 (see [Layouts and Lowering](./layouts-and-lowering#layouts-and-lowering)), so its fragments gather
 as 16-byte loads like the keys'; measured on gfx1201 that is 5–28% per shape over the row-major
-tile's one load per key.
+tile's one load per key. On RDNA4 the fill itself is a transposing load (`global_load_tr_b128`),
+so its registers hold column runs and store as 16-byte vectors too.
 
 Each tile config is crossed with split counts. `Attn::splits = Some(n)` fixes `n`, capped at the
 key block count. With `None`, `config::split_candidates` proposes 1, 2, the counts around two

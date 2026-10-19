@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use smallvec::smallvec;
+use svod_codegen::llvm::amd::tr::global_load_tr_b128;
 use svod_codegen::llvm::nvptx::ops::shfl_bfly;
 use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill, cp_async_commit, cp_async_wait, ldmatrix};
 use svod_dtype::{AddrSpace, DType, DeviceSpec, GpuArch, ScalarDType};
@@ -891,6 +892,9 @@ impl<'a> Emit<'a> {
     fn load_regs(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let l = self.layout(dst).clone();
         let s = self.view(src);
+        if let Some(perm) = self.transposing(&l, &s) {
+            return self.tr_load_regs(dst, &s, &l, &perm);
+        }
         let gathered = matches!(s.place, Place::Global { rows: Some(_), .. });
         for (j, w) in self.runs(&l, &s) {
             let c = self.coord(&l, j);
@@ -905,6 +909,45 @@ impl<'a> Emit<'a> {
             };
             let vals = (0..w as usize).map(|e| elem(&v, e, w as usize)).collect();
             self.reg_store(dst, j, vals);
+        }
+        Ok(())
+    }
+
+    /// The register permutation under which `l` is what transposing 16×16
+    /// loads leave a row-major 16-bit `view` in, where the target has them.
+    fn transposing(&self, l: &TileLayout, view: &View) -> Option<Vec<u32>> {
+        let [sub_r, sub_c] = l.sub_shape();
+        let global = matches!(view.place, Place::Global { .. }) && self.along(view) == (Axis::Col, true);
+        if !self.low.target.tr_load || !global || view.dtype.bytes() != 2 || sub_r % 16 != 0 || sub_c % 16 != 0 {
+            return None;
+        }
+        let produced =
+            TileLayout { frag: frag::global_tr_b128(), reps: [sub_r / 16, sub_c / 16], warps: l.warps.clone() };
+        l.as_permutation_of(&produced, self.prog.warps, self.low.target.wave)
+    }
+
+    /// Global → registers by transposing loads, one per 16×16 block, its
+    /// lanes addressing the block's rows in [`frag::global_tr_rows`] order and
+    /// receiving column runs. A row past the view's bounds, or a gathered row outside
+    /// its map, reads the operand's first elements instead: finite values the
+    /// consumer masks, as after a chunk fill.
+    fn tr_load_regs(&mut self, dst: ValId, s: &View, l: &TileLayout, perm: &[u32]) -> Result<()> {
+        let [sub_r, sub_c] = l.sub_shape();
+        let rows = TileLayout { frag: frag::global_tr_rows(), reps: [sub_r / 16, sub_c / 16], warps: l.warps.clone() };
+        for block in 0..rows.regs() {
+            let c = self.coord(&rows, block);
+            let (off, gate) = self.address(s, &c);
+            let off = match gate {
+                Some(g) => self.hoist(UOp::try_where(g, off, c32(0)).expect("safe offset")),
+                None => off,
+            };
+            let idx = self.access(&s.buf, &off, 1);
+            let elems = global_load_tr_b128(&idx, s.dtype);
+            for (jd, &js) in perm.iter().enumerate() {
+                if js / 8 == block {
+                    self.reg_store(dst, jd as u32, vec![elems[(js % 8) as usize].clone()]);
+                }
+            }
         }
         Ok(())
     }

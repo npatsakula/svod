@@ -7,10 +7,11 @@
 
 use std::sync::Arc;
 
-use svod_dtype::DType;
+use svod_dtype::{AddrSpace, DType};
 use svod_ir::{Op, ops, prelude::*};
 
 use super::{RenderContext, ldt};
+use smallvec::smallvec;
 
 /// Parse a SPECIAL axis name: `'g'/'l'/'i'` prefix + 0/1/2 axis suffix.
 ///
@@ -99,3 +100,18 @@ pub fn wmma_operand_dtype(uop: &Arc<UOp>) -> DType {
 #[cfg(test)]
 #[path = "../../test/unit/llvm_common_gpu.rs"]
 mod tests;
+
+/// `ptr` → `ptr addrspace(N)` for a pointer UOp whose provenance is `space`:
+/// Svod pointers stay generic through a kernel body, and NVPTX and AMDGPU
+/// both number global as 1 and shared as 3, so an intrinsic that wants a
+/// specific space gets a cast LLVM folds back onto the buffer at `-O3`.
+pub fn specific_ptr(ptr: &Arc<UOp>, space: AddrSpace) -> Arc<UOp> {
+    assert_eq!(ptr.addrspace(), Some(space), "pointer must resolve to a {space:?} buffer");
+    let num = match space {
+        AddrSpace::Global => 1,
+        AddrSpace::Local => 3,
+        AddrSpace::Reg => unreachable!("register scratch has no address-space form"),
+    };
+    let dtype = DType::Void.ptr(None, space).expect("void is not a pointer");
+    UOp::custom(smallvec![ptr.clone()], format!("addrspacecast ptr {{0}} to ptr addrspace({num})"), dtype)
+}

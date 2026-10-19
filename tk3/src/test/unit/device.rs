@@ -389,3 +389,54 @@ fn qwen3_gemm_candidates_probe() {
     }
 }
 
+/// A transposing load of a row-major 16×16 tile, its lanes addressing the
+/// rows in `global_tr_rows` order, lands every element where `global_tr_b128`
+/// says. The lane mapping of the instruction is measured here, not quoted.
+#[test]
+fn transposing_loads_land_as_their_layout() {
+    use crate::index::{access, add, c32, mul, store_at};
+    use crate::layout::Dim::{Lane, Reg};
+    use crate::layout::{global_tr_b128, global_tr_rows};
+    use svod_codegen::llvm::amd::tr::global_load_tr_b128;
+    use svod_ir::{CallInfo, KernelInfo, UOp};
+    let device = default_device();
+    if !Target::for_device(&device).is_some_and(|t| t.tr_load) {
+        eprintln!("skipped: no device with transposing loads");
+        return;
+    }
+    let input = Tensor::from_slice((0..256).map(|i| i as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+    let out = Tensor::from_slice(vec![0f32; 256]).cast(DType::BFloat16);
+    let name = "tr_probe".to_string();
+    let outs = out
+        .custom_kernel_with(&[&input], CallInfo { name: Some(name.clone()), ..CallInfo::default() }, |ph| {
+            let (out, inp) = (ph[0].base(), ph[1].base());
+            let tid = UOp::special_dtype(c32(32), "lidx0".to_string(), DType::Int32);
+            // Row `L % 8 + 8·(L/16)` at column `8·((L/8) % 2)`.
+            let row = add(&tid.try_cmod(&c32(8)).unwrap(), &mul(&tid.try_cdiv(&c32(16)).unwrap(), &c32(8)));
+            let col = mul(&tid.try_cdiv(&c32(8)).unwrap().try_cmod(&c32(2)).unwrap(), &c32(8));
+            let at = add(&mul(&row, &c32(16)), &col);
+            let elems = global_load_tr_b128(&access(&inp, &at, 1), ScalarDType::BFloat16);
+            let mut list = vec![tid.clone()];
+            for (i, e) in elems.iter().enumerate() {
+                let o = access(&out, &add(&mul(&tid, &c32(8)), &c32(i as i64)), 1);
+                list.push(store_at(&o, vec![e.clone()]));
+            }
+            UOp::linear_program(KernelInfo { name: Some(name.clone()), ..Default::default() }, list, device.clone())
+                .unwrap()
+        })
+        .unwrap();
+    let t = &outs[0];
+    t.prepare().unwrap().execute_with_vars(&[]).unwrap();
+    let mut bytes = vec![0u8; 512];
+    t.buffer().unwrap().copyout(&mut bytes).unwrap();
+    let held: Vec<u32> =
+        bytes.chunks(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16) as u32).collect();
+    let (l, rows) = (global_tr_b128(), global_tr_rows());
+    for lane in 0..32u32 {
+        for j in 0..8u32 {
+            let (r, c) = l.apply(&[(Lane, lane), (Reg, j)]);
+            assert_eq!(held[(lane * 8 + j) as usize], r * 16 + c, "lane {lane} register {j}");
+        }
+        assert_eq!(rows.apply(&[(Lane, lane)]), (lane % 8 + 8 * (lane / 16), 8 * (lane / 8 % 2)));
+    }
+}

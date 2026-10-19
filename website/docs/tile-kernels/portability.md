@@ -64,8 +64,8 @@ A forked kernel program for one vendor is allowed only as a bounded exception.
 | Hopper (sm_90a): wgmma, TMA, mbarrier, warp-specialized template | Not started; Hopper runs the `mma.sync` path (substrate items 5–8) |
 | Blackwell (sm_100a): tcgen05, tensor memory | Not started; no B200 access |
 | AMD CDNA: ping-pong template, MFMA 32×32, `buffer_load … lds` | Not started |
-| AMD measurements | No AMD kernel has run; the tables are first guesses for the tune store to choose among |
-| AMD attention registers | The score tile reaches P·V through shared memory, and the V operand is gathered element by element; d = 128 spills on RDNA |
+| AMD measurements | gfx1201 (RX 9070 XT) measured: GEMM, convolution and attention ahead of tk1 on Qwen3 and YOLO; CDNA compiled, not run |
+| RDNA3 attention at d = 128 | The score tile still crosses shared memory there (the accumulator feeds neither operand) and the configs overrun the register file, so the graph runs it |
 | Apple | Atoms only; no tables, no emitted kernels |
 | Convolution (implicit GEMM) | Measured on sm_86, where YOLO26 runs on it channels-last (`ops::conv2d`); compiled only for AMD |
 | Warp roles, role barriers, raw asm statements | Recorded in the IR, rejected by the lowering |

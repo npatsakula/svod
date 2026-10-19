@@ -57,6 +57,23 @@ pub fn ldmatrix_x4_rows() -> Layout {
     Layout::from_bases([(Row, 16), (Col, 16)], &[(Lane, &[[1, 0], [2, 0], [4, 0], [8, 0], [0, 8]])])
 }
 
+/// The registers one wave32 `global_load_tr_b128` fills: each group of eight
+/// lanes reads eight 16-byte rows and receives them transposed, lane `k` of the
+/// group taking element `k` of every row (`ldmatrix.trans` per group). With the
+/// four 8×8 blocks of a 16×16 tile addressed in [`global_tr_rows`] order, lane
+/// `L` holds column `L % 16` at rows `8·(L/16) + j`: the RDNA4 WMMA B fragment,
+/// [`strided`]`(8, 32)` read transposed.
+pub fn global_tr_b128() -> Layout {
+    strided(8, 32).transpose()
+}
+
+/// Its addressing: lane `L` supplies the 16-byte row `L % 8 + 8·(L/16)` at
+/// column `8·((L/8) % 2)`, so lane groups `0..8`, `8..16`, `16..24`, `24..32`
+/// read the TL, TR, BL, BR blocks.
+pub fn global_tr_rows() -> Layout {
+    Layout::from_bases([(Row, 16), (Col, 16)], &[(Lane, &[[1, 0], [2, 0], [4, 0], [0, 8], [8, 0]])])
+}
+
 /// tk `LaneMap::Strided { stride }` on a 16×16 tile over `lanes` lanes: `row = L % 16,
 /// col = (L / 16)·stride + j`, `j < stride` (`j < 16` at `stride = 0`, where every
 /// lane-group holds the same K run and the high lane bits are free).

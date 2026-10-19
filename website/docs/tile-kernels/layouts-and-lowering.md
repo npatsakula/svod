@@ -16,7 +16,7 @@ are swizzled. Each kernel config builds its own (`GemmCfg::lowering`, `FaCfg::lo
 | 2. Operand materialization | `lower` | A shared or global `mma` operand gets an explicit load into a fresh register tile |
 | 3. Barriers | `lower::sync` | Barriers are inserted around author-level shared memory traffic |
 | 4. Layout inference | `layouts::infer` | Every register tile gets a layout; conflicts get a `Relayout` |
-| 5. Shared orientation | `lower::orient_shared` | A shared allocation is stored along the axis its readers' fragments run along, so a gather is 16-byte loads; only register-staged fills can scatter, so `cp.async` tiles stay row-major. |
+| 5. Shared orientation | `lower::orient_shared` | A shared allocation is stored along the axis its readers' fragments run along, so a gather is 16-byte loads; only register-staged fills can scatter, so `cp.async` tiles stay row-major. The staged registers of a column-major tile hold column runs straight from a transposing load where the target has one (RDNA4), else are walked down the rows |
 | 6. Emission | `lower/emit.rs` | Statements are emitted in program order into `UOp::linear_program` |
 
 ## F2 linear layouts
@@ -106,8 +106,12 @@ program, so Svod's linearizer toposort never runs on a tk3 kernel. Global access
 bounds are gated: loads read zero and stores are dropped. Shared rows are XOR-swizzled in
 16-byte chunks when the chunk count per row is a power of two (of the stored row: a column of a
 column-major tile). Shared to register loads of 16-bit tiles use `ldmatrix.x4` where the layout
-allows; elsewhere a register run is one vector access along whichever axis the view is contiguous
-in, a single element where it is contiguous in neither. An
+allows, and global to register loads of 16-bit tiles `global_load_tr_b128` where the target has
+it and the layout is what it leaves (`layout::global_tr_b128`: each group of eight lanes receives
+the 8×8 block it addresses transposed, which the RDNA4 accumulator and B fragments are); elsewhere
+a register run is one vector access along whichever axis the view is contiguous in, a single
+element where it is contiguous in neither. A row a transposing load reads past the view's bounds
+comes from the operand's first elements, which the consumer masks, as after a chunk fill. An
 address into a plain global view is the view's offset plus the lane's part of the coordinate, one
 value listed once in the prologue, plus the register's constant last, so the compiler keeps a
 running pointer per view and an immediate per register instead of rebuilding every address on

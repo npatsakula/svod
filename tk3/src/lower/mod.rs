@@ -91,8 +91,9 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
     for &i in &transposed {
         prog.smem[i].along = Axis::Row;
     }
-    // The staged registers of a column-major tile are walked down its rows,
-    // so a wave's lanes store consecutive elements.
+    // The staged registers of a column-major tile hold column runs where the
+    // target loads them transposed, else are walked down its rows so a
+    // wave's lanes store consecutive elements.
     let walked: Vec<(ValId, TileLayout)> = prog
         .walk()
         .filter_map(|(_, stmt)| match stmt {
@@ -101,7 +102,11 @@ fn orient_shared(laid: &mut Laid, target: &Target) {
                     && prog.value(*src).tier() == Tier::Reg =>
             {
                 let tmp = prog.value(*src);
-                layouts::chunked(tmp.shape, tmp.dtype.bytes(), prog.warps, lanes, Axis::Row).map(|l| (*src, l))
+                let bytes = tmp.dtype.bytes();
+                layouts::transposing(tmp.shape, prog.warps, lanes)
+                    .filter(|_| target.tr_load && bytes == 2)
+                    .or_else(|| layouts::chunked(tmp.shape, bytes, prog.warps, lanes, Axis::Row))
+                    .map(|l| (*src, l))
             }
             _ => None,
         })

@@ -235,6 +235,24 @@ fn lanes_sharing_row_matches_brute_force() {
 /// pair layout tiled over the four matrices reproduces the `mma.sync` tile plain, its
 /// transpose under `.trans` (ThunderKittens `ldsm4t(tmp[0], tmp[2], tmp[1], tmp[3])`),
 /// and the matrices land where the addressing lanes `8m..8m+8` point.
+/// A wave32 `global_load_tr_b128` transposes the 8×8 block each group of eight
+/// lanes addresses (lane `k` of the group receives element `k` of every row);
+/// with the blocks addressed in TL, TR, BL, BR order lane `L` holds column
+/// `L % 16` at rows `8·(L/16)..+8`, the RDNA4 WMMA B fragment.
+#[test]
+fn global_tr_b128_is_the_transposed_block() {
+    let (l, rows) = (global_tr_b128(), global_tr_rows());
+    assert_eq!(l, strided(8, 32).transpose());
+    for lane in 0..32u32 {
+        let (half, within) = (i64::from(lane / 16), i64::from(lane % 16));
+        for j in 0..8u32 {
+            let (r, c) = rows.apply(&[(Lane, 8 * (lane / 8) + j)]);
+            assert_eq!(at(&l, lane, j), (i64::from(r), i64::from(c) + i64::from(lane % 8)), "lane {lane} register {j}");
+            assert_eq!(at(&l, lane, j), (8 * half + i64::from(j), within));
+        }
+    }
+}
+
 #[test]
 fn ldmatrix_x4_is_the_mma_sync_tile() {
     assert_eq!(ldmatrix_x4(false), mma_sync_16x16());
