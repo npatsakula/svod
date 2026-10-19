@@ -128,17 +128,19 @@ fn a_transposed_element_past_the_bounds_reads_zero(family: &str) {
 /// A scalar read whose index may leave its parameter stays under the branch
 /// that keeps the index in range, and one met again past the branch is read
 /// again there, unguarded; a read the range analysis keeps inside the parameter is
-/// listed where its index is, ahead of the branch.
-#[test_case(8, true; "an index the branch keeps in range")]
-#[test_case(3, false; "an index always in range")]
-fn a_guarded_scalar_read_stays_under_its_guard(max: i64, guarded: bool) {
+/// listed where its index is, ahead of the branch, a truncating quotient's too.
+#[test_case(8, 1, true; "an index the branch keeps in range")]
+#[test_case(3, 1, false; "an index always in range")]
+#[test_case(7, 2, false; "a halved index always in range")]
+fn a_guarded_scalar_read_stays_under_its_guard(max: i64, div: i64, guarded: bool) {
     let tile = Shape::new(16, 32);
     let mut k = Kernel::new("guarded");
     k.warps(1);
     let lens = k.param::<I32>("lens", ParamKind::In, 4);
     let y = k.param::<F32>("y", ParamKind::Out, 2 * tile.elems());
     let n = k.var("n", 0, max);
-    let len = k.load_scalar(lens, n.clone());
+    let index = if div > 1 { n.clone() / div } else { n.clone() };
+    let len = k.load_scalar(lens, index);
     let at = |k: &mut Kernel, i: usize| k.view(y, i * tile.elems(), [tile.cols, 1], tile, [None, None]);
     k.if_(
         n.lt(4),

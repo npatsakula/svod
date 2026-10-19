@@ -14,6 +14,8 @@ use svod_codegen::llvm::nvptx::smem::{
 };
 use svod_codegen::llvm::nvptx::wgmma;
 use svod_dtype::{AddrSpace, DType, DeviceSpec, GpuArch, ScalarDType};
+use svod_ir::uop::cached_property::CachedProperty;
+use svod_ir::uop::properties::SoundVminVmaxProperty;
 use svod_ir::{AxisId, AxisType, ConstValue, KernelInfo, Op, UOp, WmmaMetadata, ops};
 
 use super::{DivergentBarrierSnafu, Lowering, ProgramSnafu, Result, UnsupportedSnafu};
@@ -328,15 +330,19 @@ impl<'a> Emit<'a> {
             }
             // The parameter is an input, so no store moves under its read; a
             // read whose index may leave the parameter stays under the
-            // branches it is met in, where the index is in range.
+            // branches it is met in, where the index is in range. Only a sound
+            // range proves it inside: the plain one has no rule for a
+            // truncating quotient or remainder.
             Scalar::Load { param, index } => {
                 let (level, index) = self.scalar_at(*index, row);
                 let buf = self.params[param.index()].clone();
                 let idx = self.access(&buf, &index, 1);
                 let tag = self.next_tag();
                 let elems = self.prog.params[param.index()].elems as i64;
-                let (lo, hi) = (index.vmin().try_int(), index.vmax().try_int());
-                let inside = lo.is_some_and(|lo| lo >= 0) && hi.is_some_and(|hi| hi < elems);
+                let inside = SoundVminVmaxProperty::get(&index)
+                    .as_ref()
+                    .and_then(|(lo, hi)| Some((lo.try_int()?, hi.try_int()?)))
+                    .is_some_and(|(lo, hi)| lo >= 0 && hi < elems);
                 let level = if inside { level } else { level.max(self.guards.last().copied().unwrap_or(0)) };
                 let load = self.hoist_at(load_at(&idx, tag), level);
                 (level, load.cast(DType::Int32))
