@@ -3,7 +3,7 @@ use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Layer, LayerNorm, Linear, Module, StateDict, get_tensor, prefixed};
-use svod_tk3::ops::{self, Act};
+use svod_tk3::ops::{self, Act, Attn, KeyMask};
 
 use crate::init::{Bias, fan_in_uniform, layer_norm, ones, zeros};
 use crate::state::{scoped, scoped_index};
@@ -202,9 +202,8 @@ impl MultiHeadSelfAttention {
         };
         let (q, k, v) = (split(q)?, split(k)?, split(v)?);
 
-        // tk1's attention, not the op layer's: at head dim 48 the latter runs
-        // SDPA, which measured 3x slower for the whole encoder.
-        let attn = crate::attention::attend(&q, &k, &v, false, key_lens)?;
+        let keys = key_lens.map_or(KeyMask::None, KeyMask::Lens);
+        let attn = ops::attention(&q, &k, &v, Attn { keys, ..Attn::default() })?;
         // Head-merge is a plain reshape here: the attention output is already
         // seq-major, so there is no transpose to undo.
         let out = attn.try_reshape([b, t, SInt::Const(d_model)])?;
