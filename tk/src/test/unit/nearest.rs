@@ -178,7 +178,8 @@ impl Case {
     }
 
     /// `score` and `index` are each row's least and where: every score
-    /// within `tol` of the reference's (relative, absolute below one) and
+    /// within `tol` of the reference's (relative, absolute below one; L2's
+    /// squared) and
     /// `+∞` exactly where it is; every index admissible, scoring the row's
     /// least within `tol` (a near-tie may fall either way under another
     /// rounding) and the first of the candidates alike; and, where `exact`,
@@ -186,7 +187,13 @@ impl Case {
     fn check(&self, what: &str, score: &[f64], index: &[f64], tol: f64, exact: bool) {
         let (best, at) = self.reference();
         assert_eq!((score.len(), index.len()), (self.n, self.n), "{what}: rows");
-        let near = |a: f64, b: f64| a == b || (a - b).abs() <= tol * b.abs().max(1.0);
+        // L2 is compared squared: a distance near zero is the root of a
+        // difference of norms, its error that of the norms.
+        let l2 = self.metric == Metric::L2;
+        let near = |a: f64, b: f64| {
+            let (a, b) = if l2 { (a * a, b * b) } else { (a, b) };
+            a == b || (a - b).abs() <= tol * b.abs().max(1.0)
+        };
         for i in 0..self.n {
             let (s, j) = (score[i], index[i]);
             assert!(near(s, best[i]), "{what}: row {i} scores {s}, want {}", best[i]);
