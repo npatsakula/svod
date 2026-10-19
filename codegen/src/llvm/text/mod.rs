@@ -148,6 +148,9 @@ impl Renderer for LlvmTextRenderer {
 
         // -- Build function body --
         kernel.push("".to_string());
+        if self.target.is_nvptx() {
+            nvptx::ops::plan_shared_memory(&nodes, &mut ctx);
+        }
 
         for node in &nodes {
             if matches!(node.op(), Op::Noop | Op::Group(..)) {
@@ -214,7 +217,7 @@ impl Renderer for LlvmTextRenderer {
         // Module-level prefix:
         //   1. amdgcn intrinsic declarations + CPU intrinsic declarations
         //   2. fp8 helper (AMD-only, only when the kernel uses fp8)
-        //   3. addrspace(3) LDS globals from LOCAL BUFFERs (AMD-only)
+        //   3. addrspace(3) globals from LOCAL BUFFERs (GPU targets)
         let mut module_blocks: Vec<String> = Vec::new();
         module_blocks.push(generate_intrinsic_declarations(&kernel, &self.target));
         if self.target.is_amd()

@@ -33,6 +33,9 @@ pub struct RenderContext {
     unhinted: HashSet<u64>,
     /// Loop IDs handed out so far, one per hinted back edge.
     loops: usize,
+    /// Byte offset of each LOCAL buffer (by slot) inside the kernel's one
+    /// dynamic shared array; empty when LOCAL buffers are static globals.
+    dynamic_locals: HashMap<usize, usize>,
 }
 
 impl RenderContext {
@@ -76,6 +79,7 @@ impl RenderContext {
                 .chain((1..=self.loops).map(|n| format!("!{n} = distinct !{{!{n}, !0}}")))
                 .collect(),
             _ => Vec::new(),
+            dynamic_locals: HashMap::new(),
         }
     }
 
@@ -88,6 +92,16 @@ impl RenderContext {
     /// Borrow the accumulated module-level prefix lines.
     pub fn module_prefix(&self) -> &[String] {
         &self.module_prefix
+    }
+
+    /// Carve LOCAL buffers out of one dynamic shared array at these offsets.
+    pub fn set_dynamic_locals(&mut self, offsets: HashMap<usize, usize>) {
+        self.dynamic_locals = offsets;
+    }
+
+    /// The dynamic shared array offset of LOCAL buffer `slot`, if carved.
+    pub fn dynamic_local(&self, slot: usize) -> Option<usize> {
+        self.dynamic_locals.get(&slot).copied()
     }
 
     /// Record an `InvalidGraph` error from a renderer op handler.
