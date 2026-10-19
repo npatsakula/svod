@@ -321,10 +321,31 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(with(RAW_MAX, scaled(spec(128, 128, 64, 64, 32, true, true), -0.1)), &[128, 50]; "a negative scale keeps the maximum in the exponent's units")]
 #[test_case(with(RAW_MAX, masked(128, 128, 64, 64, 32, EVERY_BIAS)), &[128, 100]; "a bias keeps the maximum in the exponent's units")]
 fn program_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
-    let c = case(spec.clone(), lens);
-    let got = run(&flash_attention(&spec), params(&c), &[("b", 2)]).unwrap();
-    let got = output(&c, got, 2);
-    let want = reference(&c);
+    matches_a_direct_softmax(&case(spec, lens));
+}
+
+/// Scores that climb from key block to key block, through a bias ramp along
+/// the keys: slowly, a row keeps its stale maximum for several blocks and
+/// then adopts a new one; steeply, it adopts one every block. Either way the
+/// accumulator is rescaled while it holds earlier blocks' work.
+#[test_case(0.1, false; "a slow climb")]
+#[test_case(1.0, false; "a steep climb")]
+#[test_case(0.1, true; "a slow causal climb")]
+fn climbing_scores_rescale_the_accumulator(per_key: f64, causal: bool) {
+    let mask = AttnMask { causal, ..PER_BATCH };
+    let mut c = case(masked(128, 128, 64, 64, 16, mask), &[128, 128]);
+    let stride = key_mask_stride(keys(&c.spec));
+    for (i, b) in c.bias.iter_mut().enumerate().filter(|(i, _)| i % stride < 128) {
+        *b = round_to(ScalarDType::BFloat16, per_key * (i % stride) as f64);
+    }
+    matches_a_direct_softmax(&c);
+}
+
+fn matches_a_direct_softmax(c: &Case) {
+    let spec = &c.spec;
+    let got = run(&flash_attention(spec), params(c), &[("b", 2)]).unwrap();
+    let got = output(c, got, 2);
+    let want = reference(c);
     let mut worst = 0.0f64;
     for (g, w) in got.iter().zip(&want) {
         worst = worst.max((g - w).abs());
@@ -645,13 +666,9 @@ fn attention_throughput_probe() {
         for _ in 0..4 {
             for (i, (_, plan)) in plans.iter().enumerate() {
                 for _ in 0..5 {
-                    let run = plan
-                        .execute_profiled()
-                        .unwrap()
-                        .iter()
-                        .filter_map(|kp| Some((kp.gpu_end_ns? - kp.gpu_start_ns?) as f64 * 1e-9))
-                        .fold(0.0, f64::max);
-                    best[i] = best[i].min(run);
+                    if let Some(run) = super::kernel_secs(plan) {
+                        best[i] = best[i].min(run.into_iter().fold(0.0, f64::max));
+                    }
                 }
             }
         }
@@ -799,13 +816,9 @@ fn decode_throughput_probe() {
     for _ in 0..4 {
         for (i, (_, plan)) in plans.iter().enumerate() {
             for _ in 0..5 {
-                let run: f64 = plan
-                    .execute_profiled()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|kp| Some((kp.gpu_end_ns? - kp.gpu_start_ns?) as f64 * 1e-3))
-                    .sum();
-                best[i] = best[i].min(run);
+                if let Some(run) = super::kernel_secs(plan) {
+                    best[i] = best[i].min(run.into_iter().sum::<f64>() * 1e6);
+                }
             }
         }
     }

@@ -219,13 +219,9 @@ fn mma_peak_probe() {
     let mut best = f64::INFINITY;
     for _ in 0..20 {
         // The longest kernel of the run is the one under test (inputs may cast).
-        let run = plan
-            .execute_profiled()
-            .unwrap()
-            .iter()
-            .filter_map(|kp| Some((kp.gpu_end_ns? - kp.gpu_start_ns?) as f64 * 1e-9))
-            .fold(0.0, f64::max);
-        best = best.min(run);
+        if let Some(run) = super::kernel_secs(&plan) {
+            best = best.min(run.into_iter().fold(0.0, f64::max));
+        }
     }
     let flops = 2.0 * (bm * bn * bk) as f64 * iters as f64 * blocks as f64;
     eprintln!("mma.sync bf16→f32 ceiling: {:.3} ms, {:.1} TFLOP/s", best * 1e3, flops / best / 1e12);

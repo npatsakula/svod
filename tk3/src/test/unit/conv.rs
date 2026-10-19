@@ -571,10 +571,10 @@ const PROBE: [(usize, usize, usize, usize, bool); 12] = [
     (48, 48, 160, 1, true),
 ];
 
-/// Device time of one run of `plan`: every kernel's, summed.
-fn plan_ns(plan: &svod_runtime::ExecutionPlan) -> u64 {
-    let profile = plan.execute_profiled().unwrap();
-    profile.iter().filter_map(|k| k.gpu_end_ns?.checked_sub(k.gpu_start_ns?)).sum()
+/// Device time of one run of `plan` in ns, every kernel's summed; `None`
+/// when a kernel lost its stamps.
+fn plan_ns(plan: &svod_runtime::ExecutionPlan) -> Option<f64> {
+    super::kernel_secs(plan).map(|t| t.into_iter().sum::<f64>() * 1e9)
 }
 
 /// Throughput of every conv candidate per class, timed as the tune store
@@ -636,7 +636,7 @@ fn conv_throughput_probe() {
         while warm.elapsed().as_millis() < 500 {
             plan.execute().unwrap();
         }
-        let graph = (0..20).map(|_| plan_ns(&plan)).min().unwrap() as f64;
+        let graph = (0..20).filter_map(|_| plan_ns(&plan)).fold(f64::INFINITY, f64::min);
         let best = times.iter().flatten().min().map(|&t| t as f64);
         let tk3 = best.map_or("none".into(), |t| format!("{:.1} us {:.1} TFLOP/s", t / 1e3, tflops(t)));
         eprintln!("{label}: tk3 {tk3}; graph {:.1} us {:.1} TFLOP/s", graph / 1e3, tflops(graph));

@@ -79,7 +79,7 @@ impl FaCfg {
 }
 
 /// Which keys each query sees; the masks apply together. A query with no
-/// visible key yields NaN, as a softmax over an empty row does.
+/// visible key yields zeros, as the graph writes it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AttnMask {
     /// Key `j` is visible to query `i` only when `j ≤ i`.

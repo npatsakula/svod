@@ -94,6 +94,27 @@ pub struct Target {
     /// work saved is matrix time gained; CUDA's tensor cores and CDNA's matrix
     /// cores run beside the vector units.
     pub mma_on_valu: bool,
+    /// How a lane reads the register of lane `lane ^ mask`.
+    pub lane_move: LaneMove,
+    /// An f32 `exp2` is the hardware instruction alone, without the range
+    /// reduction that keeps results below 2^-126 denormal (they flush to
+    /// zero, which no kernel tells apart): AMD's `v_exp_f32`.
+    pub hardware_exp2: bool,
+}
+
+/// How a lane reads the register of lane `lane ^ mask`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneMove {
+    /// `shfl.sync.bfly` (CUDA).
+    Shuffle,
+    /// `simd_shuffle_xor` (Metal).
+    SimdShuffle,
+    /// `ds_bpermute`, a trip through the LDS crossbar (CDNA).
+    Permute,
+    /// On the vector unit itself: DPP `row_xmask` within a row of 16 lanes and
+    /// `permlanex16` between the two rows of a wave32 (RDNA); a mask past 31
+    /// takes [`LaneMove::Permute`].
+    Dpp,
 }
 
 impl Target {
@@ -115,6 +136,13 @@ impl Target {
             GpuArch::Metal(_) => false,
         };
         let mma_on_valu = matches!(arch, GpuArch::Amd(a) if !a.is_cdna());
+        let lane_move = match arch {
+            GpuArch::Cuda(_) => LaneMove::Shuffle,
+            GpuArch::Metal(_) => LaneMove::SimdShuffle,
+            GpuArch::Amd(a) if a.is_cdna() => LaneMove::Permute,
+            GpuArch::Amd(_) => LaneMove::Dpp,
+        };
+        let hardware_exp2 = matches!(arch, GpuArch::Amd(_));
         let tr_load = matches!(arch, GpuArch::Amd(a) if a.is_rdna4() && wave == 32);
         let dot2_bf16 = matches!(arch, GpuArch::Amd(a) if !a.is_cdna() || a == AmdArch::Gfx950);
         let occupancy = match arch {
@@ -144,6 +172,8 @@ impl Target {
             bf16_cvt,
             mma_on_valu,
             occupancy,
+            lane_move,
+            hardware_exp2,
         }
     }
 

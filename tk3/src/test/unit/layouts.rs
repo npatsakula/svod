@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use test_case::test_case;
 
-use crate::atoms::sm86;
+use svod_dtype::{AmdArch, GpuArch};
+
+use crate::atoms::{Target, sm86};
 use crate::build::*;
 use crate::ir::*;
 use crate::layout::{self as frag, Dim};
@@ -222,4 +224,86 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
     }
     assert_eq!(checked, 4);
     assert!(prog.walk().any(|(_, s)| matches!(s, Stmt::Let { op: TileOp::Relayout { .. }, .. })), "one re-held");
+}
+
+/// One attention step as `infer` sees it: QKᵀ, a row softmax and PV over four
+/// warps, the scores plus a `[bq, bkv]` bias tile read from global memory
+/// when `bias`.
+fn attention_step(bias: bool) -> Program {
+    let (bq, bkv, d) = (64usize, 16usize, 64usize);
+    let mut k = Kernel::new("fa");
+    let q = k.param::<BF16>("q", ParamKind::In, bq * d);
+    let b = k.param::<BF16>("bias", ParamKind::In, bq * bkv);
+    let kk = k.smem::<BF16>("k", bkv * d);
+    let vv = k.smem::<BF16>("v", bkv * d);
+    let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
+    let q_r = k.load(q_g);
+    let k_s = k.smem_view::<BF16>(kk, 0, Shape::new(bkv, d));
+    let v_s = k.smem_view::<BF16>(vv, 0, Shape::new(bkv, d));
+    let zero = k.zeros::<F32>(Shape::new(bq, bkv));
+    let mut s = k.mma(zero, q_r, false, k_s, true);
+    if bias {
+        let b_g = k.view(b, 0, [bkv, 1], Shape::new(bq, bkv), [None, None]);
+        let b_r = k.load(b_g);
+        let b_r = k.cast::<BF16, F32>(b_r);
+        s = k.binary(s, b_r, BinaryOp::Add);
+    }
+    let m = k.reduce(s, Axis::Row, ReduceOp::Max);
+    let p = k.binary(s, m, BinaryOp::Sub);
+    let p = k.unary(p, UnaryOp::Exp2);
+    let p16 = k.cast::<F32, BF16>(p);
+    let o0 = k.zeros::<F32>(Shape::new(bq, d));
+    let o = k.mma(o0, p16, false, v_s, false);
+    let out = k.param::<F32>("o", ParamKind::Out, bq * d);
+    let o_g = k.view(out, 0, [d, 1], Shape::new(bq, d), [None, None]);
+    k.store(o_g, o);
+    let mut prog = k.finish();
+    prog.warps = 4;
+    prog
+}
+
+/// The orientation `infer` gives each product of `prog` on gfx1151, and the
+/// relayouts it inserts.
+fn rdna3_attention(prog: Program) -> (Vec<Orient>, Vec<Relayout>) {
+    let target = Target::for_arch(GpuArch::Amd(AmdArch::Gfx1151));
+    let Laid { prog, layouts: lay } = infer(prog, &target, WarpGrid { rows: 4, cols: 1 }).unwrap();
+    let orients = prog
+        .walk()
+        .filter_map(|(_, s)| match s {
+            Stmt::Let { op: TileOp::Mma { orient, .. }, .. } => *orient,
+            _ => None,
+        })
+        .collect();
+    let relayouts = prog
+        .walk()
+        .filter_map(|(_, s)| match s {
+            Stmt::Let { dst, op: TileOp::Relayout { src } } => {
+                let (from, to) = (lay[src.index()].as_ref()?, lay[dst.index()].as_ref()?);
+                Some(from.relayout(to, 4, 32))
+            }
+            _ => None,
+        })
+        .collect();
+    (orients, relayouts)
+}
+
+/// On gfx11 the score accumulator never feeds the next product as laid. With
+/// QKᵀ issued swapped each lane holds one query, so its row statistics stay in
+/// the lane, and P reaches PV by the two half-waves trading registers, with
+/// no shared-memory round trip.
+#[test]
+fn rdna3_attention_trades_probabilities_between_half_waves() {
+    let (orients, relayouts) = rdna3_attention(attention_step(false));
+    assert_eq!(orients[0], Orient::Swapped, "QKᵀ: {orients:?}");
+    assert_eq!(relayouts.len(), 1, "only P changes role: {relayouts:?}");
+    let Relayout::Exchange(picks) = &relayouts[0] else { panic!("an exchange: {:?}", relayouts[0]) };
+    assert!(picks.iter().all(|p| p.len() <= 2 && p.iter().all(|p| p.mask < 32)), "{picks:?}");
+}
+
+/// A bias tile read into the swapped scores would scatter, a row per lane, so
+/// the products stay direct and the bias is read along its rows.
+#[test]
+fn rdna3_attention_reads_a_bias_along_its_rows() {
+    let (orients, _) = rdna3_attention(attention_step(true));
+    assert_eq!(orients, [Orient::Direct, Orient::Direct]);
 }

@@ -49,8 +49,8 @@ pub struct Cache<'a> {
     pub app_lens: Option<&'a Tensor>,
 }
 
-/// The masks apply together; a query with no visible key yields NaN, as a
-/// softmax over an empty row does.
+/// The masks apply together; a query with no visible key yields zeros, as
+/// the graph writes it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Attn<'a> {
     /// Key `j` is visible to query `i` only when `j ≤ i`.

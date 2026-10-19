@@ -61,8 +61,7 @@ pub(super) fn families(target: &Target) -> Vec<Launch> {
     push("gemm gelu scale residual", gemm::<BF16>(&half_step), half_step.cfg.lowering(target.clone()));
 
     // The planner's lead for the shape; a head size it plans no kernel for
-    // (RDNA3 at `d = 128`: replicated fragments and the per-key value gather
-    // overrun the register file) has no family.
+    // has no family.
     let fa = |t, tk, d, mask: AttnMask, cache: Option<Cache>, batch| {
         let cfg = *Planner::new(target.clone()).attention_candidates(8, t, tk, d, mask.causal).first()?;
         let splits = if cache.is_some() { 2 } else { 1 };
@@ -628,6 +627,19 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
     assert!(dot2 || ir.contains("fpext bfloat"), "{ir}");
 }
 
+/// A lane reads another lane's register on the vector unit on RDNA (DPP within
+/// a row of 16, `permlanex16` across the rows), through the LDS crossbar on CDNA.
+#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40), true; "gfx1151")]
+#[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
+fn rdna_lane_moves_stay_on_the_vector_unit(target: Target, vector: bool) {
+    let (name, prog, lowering) =
+        families(&target).into_iter().find(|(n, ..)| n.starts_with("rms norm")).expect("a norm family");
+    let ir = render(prog, &lowering);
+    assert_eq!(ir.contains("@llvm.amdgcn.update.dpp.i32("), vector, "{name}");
+    assert_eq!(ir.contains("@llvm.amdgcn.ds.bpermute("), !vector, "{name}");
+}
+
 /// `Sync::Fence` statements in `block`, recursively.
 fn fences(block: &crate::ir::Block) -> usize {
     use crate::ir::{Stmt, Sync};
@@ -687,7 +699,7 @@ fn tile_relayouts(prog: &Program, block: &crate::ir::Block) -> usize {
 /// they stand, so no attention kernel re-holds a score tile (the decoder step's
 /// cache kernel still moves its softmax state, a 16-element vector, between the
 /// cached keys and the appended one); where neither way is free (RDNA3) the
-/// tile relayout remains, as it did before the choice existed.
+/// tile relayout remains, a register exchange between the half-waves.
 #[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
 #[test_case(amd(AmdArch::Gfx942, 304), true; "gfx942")]
 #[test_case(amd(AmdArch::Gfx1100, 96), false; "gfx1100")]

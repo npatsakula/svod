@@ -121,7 +121,7 @@ impl TileLayout {
         match produced.relayout(self, warps, lanes) {
             Relayout::Identity => Some((0..self.regs()).collect()),
             Relayout::RegPermute(perm) => Some(perm),
-            Relayout::LaneShuffle(_) | Relayout::ViaSmem => None,
+            Relayout::Exchange(_) | Relayout::LaneShuffle(_) | Relayout::ViaSmem => None,
         }
     }
 
@@ -193,13 +193,68 @@ impl TileLayout {
         if cross_warp {
             Relayout::ViaSmem
         } else if cross_lane || !uniform {
-            Relayout::LaneShuffle(sources)
+            self.exchange(dst, &holders, warps, lanes).map_or(Relayout::LaneShuffle(sources), Relayout::Exchange)
         } else if perm.iter().enumerate().all(|(j, &p)| j as u32 == p) {
             Relayout::Identity
         } else {
             Relayout::RegPermute(perm)
         }
     }
+
+    /// Every destination register as at most [`EXCHANGE_PICKS`] lane-xor moves
+    /// of one source register each, the same in every warp: lanes of a wave of
+    /// at most 32 trading registers with fixed partners (a wave64 keeps its
+    /// round trip, unmeasured). `holders` lists who holds each element.
+    fn exchange(&self, dst: &Self, holders: &[Vec<(u32, u32, u32)>], warps: u32, lanes: u32) -> Option<Vec<Vec<Pick>>> {
+        if lanes > 32 {
+            return None;
+        }
+        let cols = self.shape().cols;
+        // The (mask, source register) moves that bring lane `l` of warp `w` its element `j`.
+        let moves = |w: u32, l: u32, j: u32| -> Vec<(u32, u32)> {
+            let (r, c) = dst.coord(w, l, j);
+            holders[r as usize * cols + c as usize].iter().filter(|h| h.0 == w).map(|h| (h.1 ^ l, h.2)).collect()
+        };
+        (0..dst.regs())
+            .map(|j| {
+                // Greedy cover: the move serving the most lanes still open, until none are.
+                let mut picks: Vec<Pick> = vec![];
+                let mut open: u64 = (1u64 << lanes) - 1;
+                while open != 0 {
+                    let lanes_of = |mv: (u32, u32)| {
+                        (0..lanes)
+                            .filter(|&m| open >> m & 1 == 1 && moves(0, m, j).contains(&mv))
+                            .fold(0u64, |a, m| a | 1 << m)
+                    };
+                    let (mask, reg) = (0..lanes)
+                        .filter(|l| open >> l & 1 == 1)
+                        .flat_map(|l| moves(0, l, j))
+                        .max_by_key(|&mv| lanes_of(mv).count_ones())?;
+                    let covered = lanes_of((mask, reg));
+                    open &= !covered;
+                    picks.push(Pick { mask, reg, lanes: covered });
+                }
+                let every_warp = (1..warps).all(|w| {
+                    picks.iter().all(|p| {
+                        (0..lanes).filter(|l| p.lanes >> l & 1 == 1).all(|l| moves(w, l, j).contains(&(p.mask, p.reg)))
+                    })
+                });
+                (picks.len() <= EXCHANGE_PICKS && every_warp).then_some(picks)
+            })
+            .collect()
+    }
+}
+
+/// The most lane-xor moves an [`Relayout::Exchange`] selects among per register.
+const EXCHANGE_PICKS: usize = 2;
+
+/// One lane-xor move of a [`Relayout::Exchange`]: the lanes in `lanes` take
+/// source register `reg` of lane `lane ^ mask`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pick {
+    pub mask: u32,
+    pub reg: u32,
+    pub lanes: u64,
 }
 
 /// What re-holding a tile costs.
@@ -208,6 +263,8 @@ pub enum Relayout {
     Identity,
     /// Destination register `j` is source register `perm[j]` of the same lane.
     RegPermute(Vec<u32>),
+    /// Per destination register, the lane-xor moves that fill it, selected by lane.
+    Exchange(Vec<Vec<Pick>>),
     /// Per `(warp, lane, dst reg)` in row-major order: the `(warp, lane, reg)` it reads.
     LaneShuffle(Vec<(u32, u32, u32)>),
     ViaSmem,
@@ -222,6 +279,7 @@ impl Relayout {
         match self {
             Relayout::Identity => 0,
             Relayout::RegPermute(_) => 1,
+            Relayout::Exchange(_) => 2,
             Relayout::LaneShuffle(_) | Relayout::ViaSmem => 16,
         }
     }
@@ -438,6 +496,26 @@ const EXHAUSTIVE_UP_TO: usize = 6;
 
 /// Write an orientation into every product of `prog`: the pinned ones stay,
 /// the rest take the assignment of least relayout cost.
+/// Whether lanes reading global view `from` into layout `lay` scatter: each
+/// lane's run along the view's unit-stride axis is under 16 bytes and the next
+/// lane does not continue it, so a wave's request touches a line per lane.
+fn scatters(prog: &Program, lay: &TileLayout, from: &Value, lanes: u32) -> bool {
+    let Place::Global { stride, .. } = from.place else { return false };
+    let unit = |s: ScalarId| matches!(prog.scalar(s), Scalar::Const(1));
+    let along = if unit(stride[1]) {
+        Axis::Col
+    } else if unit(stride[0]) {
+        Axis::Row
+    } else {
+        return false;
+    };
+    let bytes = from.dtype.bytes() as u32;
+    let run = lay.runs(lanes, (16 / bytes).max(1), along).first().map_or(1, |r| r.1);
+    let ((r0, c0), next) = (lay.coord(0, 0, 0), lay.coord(0, 1, 0));
+    let continued = if along == Axis::Col { next == (r0, c0 + run) } else { next == (r0 + run, c0) };
+    run * bytes < 16 && !continued
+}
+
 fn orient_products(prog: &mut Program, target: &Target, grid: WarpGrid) -> Result<()> {
     // A product listed twice (a peeled loop trip) is one decision.
     let mut free: Vec<ValId> = vec![];
@@ -454,7 +532,7 @@ fn orient_products(prog: &mut Program, target: &Target, grid: WarpGrid) -> Resul
         set_orient(&mut trial.body, choice);
         let mut it = Infer::new(&trial, target, grid);
         it.solve()?;
-        Ok(it
+        let relayouts: u32 = it
             .conflicts
             .iter()
             .map(|((_, v), want)| match &it.lay[v.index()] {
@@ -464,7 +542,20 @@ fn orient_products(prog: &mut Program, target: &Target, grid: WarpGrid) -> Resul
                 }
                 None => 0,
             })
-            .sum())
+            .sum();
+        // A register tile loaded from global memory in a layout whose lanes
+        // scatter costs what a lane shuffle does: a memory line per lane.
+        let scattered: u32 = trial
+            .walk()
+            .filter_map(|(_, s)| match s {
+                Stmt::Copy { dst, src, .. } if trial.value(*dst).tier() == Tier::Reg => {
+                    let (lay, from) = (it.lay[dst.index()].as_ref()?, trial.value(*src));
+                    scatters(&trial, lay, from, target.wave).then(|| from.shape.elems() as u32)
+                }
+                _ => None,
+            })
+            .sum();
+        Ok(relayouts + Relayout::LaneShuffle(vec![]).cost_per_element() * scattered)
     };
     let mut best: HashMap<ValId, Orient> = HashMap::new();
     let mut best_cost = cost_of(&best)?;
