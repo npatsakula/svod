@@ -134,7 +134,8 @@ pub enum Entry {
     Choice { index: usize, ns: u64 },
     /// A measured number: a probe's cost.
     Value(u64),
-    /// The ranked indices admission kept.
+    /// The ranked indices admission kept, or the one its search for a
+    /// first clean config found.
     Admitted(Arc<[usize]>),
 }
 
@@ -144,6 +145,8 @@ pub enum Kind {
     Choice,
     Value,
     Admitted,
+    /// An admission of one: the first clean config of a ranked list.
+    First,
 }
 
 impl Kind {
@@ -152,6 +155,7 @@ impl Kind {
             Kind::Choice => "choice",
             Kind::Value => "value",
             Kind::Admitted => "admitted",
+            Kind::First => "first",
         }
     }
 }
@@ -172,6 +176,7 @@ impl Entry {
             ("choice", &[index, ns]) => Some(Entry::Choice { index: index as usize, ns }),
             ("value", &[v]) => Some(Entry::Value(v)),
             ("admitted", at) if !at.is_empty() => Some(Entry::Admitted(at.iter().map(|&i| i as usize).collect())),
+            ("first", &[at]) => Some(Entry::Admitted([at as usize].into())),
             _ => None,
         }
     }
@@ -333,6 +338,23 @@ impl TuneStore {
         let judged = |()| admit().map(|at| Entry::Admitted(at.into()));
         match self.remember(Kind::Admitted, key, |_| true, || (programs(), ()), judged)? {
             Entry::Admitted(at) => Some(at),
+            _ => None,
+        }
+    }
+
+    /// The index `find` names as the first clean config of the ranked list
+    /// `key` names (`None`: nothing compiled), by the same path as
+    /// [`Self::admitted`] under its own kind, so a list's full admission and
+    /// its first clean config are each remembered once.
+    pub fn first(
+        &self,
+        key: &TuneKey,
+        programs: impl FnOnce() -> u64,
+        find: impl FnOnce() -> Option<usize>,
+    ) -> Option<usize> {
+        let found = |()| find().map(|at| Entry::Admitted([at].into()));
+        match self.remember(Kind::First, key, |_| true, || (programs(), ()), found)? {
+            Entry::Admitted(at) => at.first().copied(),
             _ => None,
         }
     }

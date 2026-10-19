@@ -371,7 +371,7 @@ pub(crate) fn tune<B: Fn(FaCfg) -> crate::tune::Candidate>(
     let tuner = std::cell::RefCell::new(tuner);
     descend(
         ranked,
-        |r| tuner.borrow_mut().first_clean(r).expect("a ranked attention config"),
+        |r| tuner.borrow_mut().first_clean(OP, r).expect("a ranked attention config"),
         |r| tuner.borrow_mut().tuned(OP, r, &expand),
         |pair| {
             let mut tuner = tuner.borrow_mut();

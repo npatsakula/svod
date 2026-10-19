@@ -28,9 +28,10 @@ winner पर दोबारा forms (देखें [कर्नेल ल�
 जाती है, इसलिए warm store विजेता के सिवा कुछ compile नहीं करता। जब कुछ भी compile नहीं होता (compile करने को
 कोई device नहीं) तो पहले 64 tiles बिना परखे इस्तेमाल होते हैं।
 
-Tuning बंद होने पर (`SVOD_TK3_TUNE=0`) न कुछ मापा जाता है न store होता है: ranked list का पहला clean compile
-होने वाला config चलता है, जो ranked क्रम में आठ-आठ के batches में compile करके मिलता है। Device के cost
-probes फिर भी मापते हैं, हर device पर एक बार (gfx1151 पर लगभग 4 s), क्योंकि ranking को उनकी ज़रूरत है।
+Tuning बंद होने पर (`SVOD_TK3_TUNE=0`) कुछ मापा नहीं जाता: ranked list का पहला clean compile होने वाला config
+चलता है, जो ranked क्रम में आठ-आठ के batches में compile करके मिलता है और store में `first` line के रूप में रखा
+जाता है (attention का forms pass भी उसी config से शुरू होता है)। Device के cost probes फिर भी मापते हैं, हर
+device पर एक बार (gfx1151 पर लगभग 4 s), क्योंकि ranking को उनकी ज़रूरत है।
 
 बेहतर fixed default काफ़ी नहीं था। Nemotron के GEMMs (M = 704, N 512–2048) पुरानी fixed tile ladder
 के साथ लगभग 14 TFLOP/s पर चलते थे: 28 SMs पर 48 blocks। Tune store के साथ RTX 3060 पर उनका औसत समय
@@ -73,7 +74,7 @@ Sustain device time में इसलिए नापा जाता है �
 |---|---|
 | Directory | `$SVOD_TK3_TUNE_DIR`, वरना `$XDG_CACHE_HOME/svod/tk3_tune`, वरना `~/.cache/svod/tk3_tune` |
 | फ़ाइल | हर device और crate version के लिए एक, जैसे `sm_86_28sm-v0.2.0.txt`, पहली line में उसका line format (`format 1`, `tune::FORMAT`); दूसरे format की फ़ाइल पूरी छोड़ दी जाती है |
-| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: `choice` में विजेता का `index ns`, `value` में एक मापा हुआ अंक, `admitted` में admission के रखे हुए ranked indices |
+| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: `choice` में विजेता का `index ns`, `value` में एक मापा हुआ अंक, `admitted` में admission के रखे हुए ranked indices, `first` में पहले clean config का index |
 | Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, जहाँ `device` arch और SM count है (`sm_86-28sm`) और `compiler` device के compiler का digest है (`tune::compiler`) |
 
 एक असली store की दो lines: attention, bf16, shape `[batch, t, tk, heads, kv_heads, d]`, candidate
