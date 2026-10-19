@@ -23,3 +23,4 @@ macros/src/module/test.rs
 macros/src/patterns/test/
 macros/src/jit/test.rs
 tk3/src/test/
+tk3/src/sweep.rs

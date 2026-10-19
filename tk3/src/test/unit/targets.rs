@@ -8,9 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use proptest::prelude::*;
-use svod_codegen::Renderer;
-use svod_codegen::llvm::LlvmTextRenderer;
-use svod_dtype::{AmdArch, CudaArch, DType, DeviceSpec, GpuArch, ScalarDType};
+use svod_dtype::{AmdArch, DType, GpuArch, ScalarDType};
 use svod_ir::{Op, UOp, ops};
 use svod_tensor::Tensor;
 use test_case::test_case;
@@ -19,159 +17,20 @@ use crate::atoms::{Core, Fill, Target};
 use crate::build::{BF16, F16};
 use crate::interp;
 use crate::ir::{Axis, ParamKind, Program};
-use crate::kernels::Act;
 use crate::kernels::Batch;
-use crate::kernels::attention::{AttnMask, AttnSpec, Bias, Cache, CombineSpec, Forms, attention, combine};
+use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
-use crate::kernels::heads::{HeadsSpec, Rope, heads};
-use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
+use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch_all;
 use crate::lower::sync::insert_barriers;
 use crate::lower::{Lowering, lower};
 use crate::ops::config;
 use crate::schedule::Schedule;
 
-use super::conv::geom;
 use super::{conv_first_eight, declared, first_eight, planner};
-
-/// One launch of a family: its name, program and lowering.
-pub(super) type Launch = (String, Program, Lowering);
-
-/// The first candidate the op layer plans for each kernel family on `target`.
-pub(super) fn families(target: &Target) -> Vec<Launch> {
-    let mut out: Vec<Launch> = vec![];
-    let mut push = |name: &str, prog: Program, lowering: Lowering| out.push((name.to_string(), prog, lowering));
-    let planner = planner(target.clone());
-
-    // Shapes stay small for the interpreter; the tiles are those planned
-    // for a large GEMM, so the biggest register tiles are lowered too.
-    let gemm_spec = |m, n, k, epilogue: Epilogue| {
-        let cfg = planner.gemm_ranked(1, 4096, 4096, k, epilogue.gated)[0];
-        GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg }
-    };
-    let plain = gemm_spec(130, 192, 128, Epilogue::DEFAULT);
-    for (i, cfg) in first_eight(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).into_iter().enumerate() {
-        let spec = GemmSpec { cfg, ..plain.clone() };
-        push(&format!("gemm #{i} {:?}x{}", cfg.tile, cfg.stages), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
-    }
-    // One slot holds a tile twice as deep in the same shared memory.
-    let one_slot = GemmSpec { cfg: config::gemm_cfg([64, 64, 64], 1, [2, 2], false), ..plain.clone() };
-    push("gemm one slot", gemm::<BF16>(&one_slot), one_slot.cfg.lowering(&planner.device));
-    if target.crews >= 2 {
-        let cfg = GemmCfg { crews: 2, ..config::gemm_cfg([64, 64, 64], 1, [2, 4], false) };
-        let crews = GemmSpec { cfg, ..plain.clone() };
-        push("gemm two crews", gemm::<BF16>(&crews), cfg.lowering(&planner.device));
-    }
-    let swiglu = gemm_spec(70, 64, 64, Epilogue { bias: true, act: Act::Silu, gated: true, ..Epilogue::DEFAULT });
-    push("gemm swiglu", gemm::<F16>(&swiglu), swiglu.cfg.lowering(&planner.device));
-    let half_step = Epilogue { residual: true, act: Act::Gelu, scale: Some(Scale::new(0.5)), ..Epilogue::DEFAULT };
-    let half_step =
-        GemmSpec { cfg: planner.gemm_ranked(1, 300, 512, 256, false)[0], ..gemm_spec(100, 96, 256, half_step) };
-    push("gemm gelu scale residual", gemm::<BF16>(&half_step), half_step.cfg.lowering(&planner.device));
-
-    // The planner's lead for the shape; a head size it plans no kernel for
-    // has no family.
-    let fa = |t, tk, d, mask: AttnMask, cache: Option<Cache>, batch| {
-        let cfg = *planner.attention_ranked(8, t, tk, d, mask.causal, mask.bias.is_some()).first()?;
-        let splits = if cache.is_some() { 2 } else { 1 };
-        let cfg = crate::kernels::attention::FaCfg { splits, ..cfg };
-        Some(AttnSpec { batch, t, tk, heads: 4, kv_heads: 2, d, mask, cache, scale: 0.125, cfg })
-    };
-    let causal = AttnMask { causal: true, ..AttnMask::default() };
-    for d in [64, 128] {
-        let Some(spec) = fa(100, 100, d, causal, None, Batch::Static(2)) else { continue };
-        for (i, cfg) in first_eight(&planner.attention_ranked(8, 100, 100, d, true, false)).into_iter().enumerate() {
-            let spec = AttnSpec { cfg, ..spec.clone() };
-            let name = format!("attention d{d} causal #{i} {}x{}x{}", cfg.bq, cfg.bkv, cfg.stages);
-            push(&name, attention::<BF16>(&spec), cfg.lowering(&planner.device));
-        }
-    }
-    let masked = AttnMask { key_lens: true, key_mask: true, ..AttnMask::default() };
-    let spec = fa(37, 75, 64, masked, None, Batch::Var { name: "b".into(), min: 1, max: 2 }).expect("d 64 plans");
-    push("attention d64 key masks", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
-    // The bias streams through its own ring slot; its 75 keys end inside a
-    // key block, so the ring's fill meets the column bound.
-    let biased = AttnMask { key_lens: true, bias: Some(Bias::PerBatch), ..AttnMask::default() };
-    let spec = fa(37, 75, 64, biased, None, Batch::Static(2)).expect("d 64 plans with a bias");
-    push("attention d64 bias", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
-    let cache = Cache { rows: 6, heads_total: 6, row_map: true, appended: 1, app_lens: false };
-    let lens = AttnMask { key_lens: true, ..AttnMask::default() };
-    let spec = fa(1, 150, 64, lens, Some(cache), Batch::Var { name: "b".into(), min: 1, max: 3 }).expect("d 64 plans");
-    push("attention d64 cache", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
-    let cfg = crate::kernels::attention::FaCfg {
-        key_warps: 4,
-        splits: 2,
-        ..crate::kernels::attention::FaCfg::new(16, 16, 2)
-    };
-    let spec = AttnSpec { cfg, ..spec };
-    push("attention d64 cache key warps", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
-    // Key warps re-hold the biased score tile through their own regions of
-    // the relayout scratch where the core's accumulator cannot feed a product.
-    let spec = AttnSpec { mask: AttnMask { bias: Some(Bias::PerBatch), ..lens }, ..spec };
-    push("attention d64 cache key warps bias", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
-    let merge = CombineSpec { batch: spec.batch.clone(), t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: 4 } };
-    push("attention combine", combine::<F16>(&merge), merge.cfg.lowering(&planner.device));
-
-    for (name, kind, d, residual, bias) in
-        [("layer norm", Norm::Layer, 1024, true, true), ("rms norm", Norm::Rms, 512, false, false)]
-    {
-        let cfg = config::norm_candidates(d)[0];
-        let spec = NormSpec { norm: kind, rows: 37, d, batch: Batch::Static(1), eps: 1e-5, residual, bias, cfg };
-        push(name, norm::<BF16>(&spec), cfg.lowering(&planner.device));
-    }
-
-    for d in [64, 128] {
-        let cfg = config::heads_candidates(d)[0];
-        let spec = HeadsSpec {
-            batch: Batch::Static(2),
-            t: 20,
-            heads: 4,
-            kv_heads: 2,
-            d,
-            q_norm: true,
-            k_norm: true,
-            eps: 1e-6,
-            rope: Some(Rope { per_batch: false }),
-            cfg,
-        };
-        push(&format!("heads d{d}"), heads::<BF16>(&spec), cfg.lowering(&planner.device));
-    }
-
-    let silu_bias = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
-    for (name, g, images) in [
-        ("conv 3x3", geom([12, 12], 64, 64, 3, 1, 1, 1), 2),
-        ("conv 3x3 stride 2 split", geom([16, 16], 128, 64, 3, 2, 1, 1), 1),
-    ] {
-        let [ho, wo] = g.out_hw();
-        let cfgs = conv_first_eight(&planner, 1, images * ho * wo, &g);
-        let c = cfgs.iter().find(|c| (c.split > 1) == name.ends_with("split")).unwrap_or(&cfgs[0]);
-        let spec = ConvSpec { batch: Batch::Static(images), geom: g, epilogue: silu_bias, cfg: c.gemm, split: c.split };
-        for (i, (prog, lowering)) in spec.programs::<F16>(&planner.device).into_iter().enumerate() {
-            push(&format!("{name} #{i}"), prog, lowering);
-        }
-    }
-    out
-}
-
-fn device(target: &Target) -> DeviceSpec {
-    match target.arch {
-        GpuArch::Cuda(_) => DeviceSpec::Cuda { device_id: 0 },
-        GpuArch::Amd(_) => DeviceSpec::Amd { device_id: 0 },
-        GpuArch::Metal(_) => DeviceSpec::Metal { device_id: 0 },
-    }
-}
-
-/// The lowered instruction list of `prog`.
-pub(super) fn linear(prog: Program, lowering: &Lowering) -> Arc<UOp> {
-    let params =
-        prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
-    let name = prog.name.clone();
-    let lowered =
-        lower(prog, lowering, params, device(&lowering.device.target)).unwrap_or_else(|e| panic!("{name}: {e}"));
-    let Op::Program(ops::Program { linear: Some(linear), .. }) = lowered.program.op() else { panic!("a program") };
-    linear.clone()
-}
+use crate::sweep::device;
+pub(super) use crate::sweep::{Launch, amd, families, group_families, hopper, linear, render};
 
 /// Random parameters of `prog` rounded to their types; every i32 parameter
 /// (key counts, masks, segment starts, row maps) is 1.
@@ -250,18 +109,6 @@ fn a_grid_takes_every_warp_or_whole_grids_run_alone(
     lowered(prog, &lowering).map(drop)
 }
 
-/// LLVM text of `prog` for its lowering's target.
-pub(super) fn render(prog: Program, lowering: &Lowering) -> String {
-    let name = prog.name.clone();
-    let renderer = match lowering.device.target.arch {
-        GpuArch::Cuda(arch) => LlvmTextRenderer::nvptx(arch),
-        GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
-        GpuArch::Metal(_) => unreachable!("Metal renders C"),
-    };
-    let linear = linear(prog, lowering);
-    renderer.render(&linear, Some(&name)).unwrap_or_else(|e| panic!("{name}: {e}")).code
-}
-
 pub(super) fn run(mut command: Command, input: &[u8], what: &str) -> Result<Vec<u8>, String> {
     let mut child = command
         .stdin(Stdio::piped())
@@ -285,37 +132,6 @@ fn ptxas() -> Option<std::path::PathBuf> {
         .map(|dir| dir.join("ptxas"));
     let toolkits = ["/opt/cuda/bin/ptxas", "/usr/local/cuda/bin/ptxas"].map(std::path::PathBuf::from);
     on_path.chain(toolkits).find(|p| p.is_file())
-}
-
-pub(super) fn hopper() -> Target {
-    Target { sms: Some(132), ..Target::for_arch(GpuArch::Cuda(CudaArch { major: 9, minor: 0 })) }
-}
-
-/// GEMM tiles on Hopper's warpgroup core: one to four warpgroups down the
-/// rows, one or two across, every swizzle span (16-, 32- and 64-deep rings
-/// are 32-, 64- and 128-byte rows), a 96-wide tile of three `n32` and a
-/// `k` of several trips. Shapes stay small for the interpreter.
-pub(super) fn group_families(target: &Target) -> Vec<Launch> {
-    let planner = planner(target.clone());
-    let tiles: [([usize; 3], [u32; 2], usize); 7] = [
-        ([128, 128, 64], [8, 1], 3),
-        ([128, 256, 64], [8, 1], 2),
-        ([64, 128, 32], [4, 1], 3),
-        ([64, 64, 16], [4, 1], 3),
-        ([128, 96, 64], [8, 1], 2),
-        ([256, 128, 64], [16, 1], 2),
-        ([128, 256, 64], [8, 2], 2),
-    ];
-    tiles
-        .into_iter()
-        .map(|(tile, warps, stages)| {
-            let cfg = GemmCfg { tile, stages, warps, group_m: 8, unroll: false, core: Core::Group, crews: 1 };
-            assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
-            let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
-            let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
-            (format!("group gemm {:?} {:?}", cfg.tile, cfg.warps), gemm::<BF16>(&spec), cfg.lowering(&planner.device))
-        })
-        .collect()
 }
 
 /// Every warpgroup attention lowers for sm_90a and assembles: the scores
@@ -567,13 +383,6 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         assert!(failed.is_empty(), "{}", failed.join("; "));
     });
 }
-/// An AMD GPU with `cus` compute units and 64 KB of LDS per workgroup; a
-/// CDNA3 one is an MI300X of eight dies.
-pub(super) fn amd(arch: AmdArch, cus: u32) -> Target {
-    let xcds = if arch.is_cdna() { 8 } else { 1 };
-    Target { sms: Some(cus), xcds, ..Target::for_arch(GpuArch::Amd(arch)) }
-}
-
 proptest! {
     /// Over any dispatch and die count the die order is a permutation of the
     /// blocks on which each die's blocks (every `dies`th hardware position)

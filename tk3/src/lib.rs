@@ -28,6 +28,8 @@ pub mod lower;
 pub mod ops;
 pub mod probe;
 pub mod schedule;
+#[doc(hidden)]
+pub mod sweep;
 pub mod tune;
 
 #[cfg(test)]

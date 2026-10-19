@@ -18,6 +18,7 @@ mod probe;
 mod replay;
 mod rows;
 mod schedule;
+mod sweep;
 mod sync;
 mod targets;
 mod tune;
@@ -28,14 +29,14 @@ use svod_dtype::default_device::default_device;
 use svod_dtype::{DeviceSpec, ScalarDType};
 use test_case::test_case;
 
-use crate::atoms::{Core, Costs, Device, Fill, Target};
+use crate::atoms::{Core, Costs, Fill, Target};
 use crate::build::BF16;
 use crate::interp::round_to;
 use crate::ir::Program;
 use crate::kernels::Batch;
-use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::ops::config::{Planner, has_kernels};
+pub(crate) use crate::sweep::{conv_first_eight, costs, declared, first_eight, planner};
 
 /// The default device's target when tk3 has kernels for it, of any vendor:
 /// the gate of every device test. It skips (`None`) only where there is
@@ -157,24 +158,6 @@ fn measure(candidates: impl IntoIterator<Item = crate::tune::Candidate>) -> Vec<
     crate::tune::time(&mut crate::tune::compile(candidates.into_iter().collect(), &pool))
 }
 
-/// The front of a ranking: its first eight tiles, what a host test judges
-/// a ranking by (the tuner's shortlist, which compiles on a device, runs
-/// [`SHORTLIST`](crate::ops::config::SHORTLIST) deep).
-pub(crate) fn first_eight<C: crate::ops::config::Tiled>(ranked: &[C]) -> Vec<C> {
-    crate::ops::config::distinct(ranked).take(8).collect()
-}
-
-/// The convolution candidates of a ranking's [`first_eight`].
-pub(crate) fn conv_first_eight(planner: &Planner, batches: usize, m: usize, g: &ConvGeom) -> Vec<ConvCfg> {
-    planner.conv_splits(batches, m, g, &first_eight(&planner.conv_ranked(batches, m, g)))
-}
-
-/// Costs a test declares where it needs a ranking or an orientation: the
-/// guessed sm_86-class fixture, the warpgroup step free.
-pub(crate) fn costs() -> Costs {
-    Costs { step_group: 0.0, ..crate::probe::GUESSED }
-}
-
 /// gfx1151's costs (Strix Halo, 40 CUs) as `probe::costs` measured them on
 /// the device on 2026-10-14.
 pub(crate) fn gfx1151_costs() -> Costs {
@@ -219,16 +202,6 @@ fn gemm_nt_crews(m: usize, n: usize, k: usize, tile: [usize; 3]) -> Program {
 fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, batch: Batch) -> Program {
     let cfg = GemmCfg { core: Core::Warp, tile, stages, warps: [2, 4], group_m: 0, unroll: true, crews: 1 };
     gemm::<BF16>(&GemmSpec { m, n, k, batch, epilogue: Epilogue::default(), cfg })
-}
-
-/// `target` under the declared [`costs`].
-pub(crate) fn declared(target: Target) -> Device {
-    Device { target, costs: costs() }
-}
-
-/// The planner of `target` under the declared [`costs`].
-pub(crate) fn planner(target: Target) -> Planner {
-    Planner::new(declared(target)).expect("a target with an SM count")
 }
 
 /// The next value of a 64-bit LCG stepping `seed`, uniform in `[-1, 1)`.

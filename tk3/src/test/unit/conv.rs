@@ -17,9 +17,7 @@ use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch;
 use crate::ops::config::Planner;
 
-pub(super) fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, p: usize, d: usize) -> ConvGeom {
-    ConvGeom { h: hw[0], w: hw[1], cin, cout, kernel: [k, k], stride: [s, s], pad: [p, p], dilation: [d, d] }
-}
+pub(super) use crate::sweep::{YOLO, geom, yolo_geom};
 
 fn halves(n: usize, seed: &mut u64, scale: f64) -> Vec<f64> {
     super::rounded(ScalarDType::Float16, n, seed, |x| scale * x)
@@ -194,24 +192,6 @@ proptest! {
 }
 
 // ---- configs ---------------------------------------------------------------------
-
-/// `(cin, cout, k, [h, w], stride)` of the YOLO26x dense 3×3 classes at
-/// 640² (the memo's census), padded `k / 2`.
-pub(super) const YOLO: [(usize, usize, usize, [usize; 2], usize); 9] = [
-    (192, 192, 3, [40, 40], 1),
-    (96, 96, 3, [80, 80], 1),
-    (384, 384, 3, [160, 160], 2),
-    (768, 768, 3, [80, 80], 2),
-    (96, 192, 3, [320, 320], 2),
-    (48, 48, 3, [160, 160], 1),
-    (768, 768, 3, [40, 40], 2),
-    (384, 96, 3, [80, 80], 1),
-    (768, 96, 3, [20, 20], 1),
-];
-
-pub(super) fn yolo_geom((cin, cout, k, hw, s): (usize, usize, usize, [usize; 2], usize)) -> ConvGeom {
-    geom(hw, cin, cout, k, s, k / 2, 1)
-}
 
 /// Every YOLO26x 3×3 class but the 48-channel one (whose steps would be one
 /// depth: the graph's on the cp.async path) has candidates on sm_86, at most
