@@ -5,8 +5,10 @@
 use std::sync::Arc;
 
 use snafu::{ResultExt, Snafu, ensure};
-use svod_dtype::DeviceSpec;
-use svod_ir::UOp;
+use svod_codegen::Renderer;
+use svod_codegen::llvm::LlvmTextRenderer;
+use svod_dtype::{DType, DeviceSpec, GpuArch};
+use svod_ir::{Op, UOp, ops};
 
 use crate::atoms::{Device, Target};
 use crate::ir::*;
@@ -26,6 +28,12 @@ pub enum Error {
     Program { source: svod_ir::Error },
     #[snafu(display("{warps} warps over a grid of {grid}: the grid takes them all, or whole grids run on their own"))]
     Grid { warps: u32, grid: u32 },
+    #[snafu(display("rendering {name}: {source}"))]
+    Render {
+        name: String,
+        #[snafu(source(from(svod_codegen::Error, Box::new)))]
+        source: Box<svod_codegen::Error>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -76,6 +84,42 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     let program = emit::emit(&laid, lowering, params, device)?;
     let Laid { prog, layouts } = laid;
     Ok(Lowered { program, tile: prog, layouts })
+}
+
+/// `prog` lowered for its lowering's target alone, its parameters declared
+/// flat: what a graph launch on the target's device would emit, with no
+/// graph and no device.
+pub fn standalone(prog: Program, lowering: &Lowering) -> Result<Lowered> {
+    let params =
+        prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
+    let device = match lowering.device.target.arch {
+        GpuArch::Cuda(_) => DeviceSpec::Cuda { device_id: 0 },
+        GpuArch::Amd(_) => DeviceSpec::Amd { device_id: 0 },
+        GpuArch::Metal(_) => DeviceSpec::Metal { device_id: 0 },
+    };
+    lower(prog, lowering, params, device)
+}
+
+/// The LLVM text of `prog` [`standalone`] ([`Lowered::text`]).
+pub fn render(prog: Program, lowering: &Lowering) -> Result<String> {
+    standalone(prog, lowering)?.text(&lowering.device.target)
+}
+
+impl Lowered {
+    /// The LLVM text of the program for `target`: what the backend's
+    /// compiler is handed. Metal renders C, which has no text here.
+    pub fn text(&self, target: &Target) -> Result<String> {
+        let renderer = match target.arch {
+            GpuArch::Cuda(arch) => LlvmTextRenderer::nvptx(arch),
+            GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
+            GpuArch::Metal(_) => return UnsupportedSnafu { what: "Metal's LLVM text" }.fail(),
+        };
+        let Op::Program(ops::Program { linear: Some(linear), .. }) = self.program.op() else {
+            unreachable!("a lowering emits a linear program")
+        };
+        let name = &self.tile.name;
+        Ok(renderer.render(linear, Some(name)).context(RenderSnafu { name })?.code)
+    }
 }
 
 /// Store every shared allocation along the axis its readers' fragments run

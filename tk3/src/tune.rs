@@ -6,8 +6,9 @@
 //! `format N` line ([`FORMAT`]) in `$SVOD_TK3_TUNE_DIR` (else
 //! `$XDG_CACHE_HOME/svod/tk3_tune`, else `$HOME/.cache/svod/tk3_tune`), one
 //! file per device and crate version. A line's key carries a digest of the
-//! device's compiler ([`compiler`]) and a fingerprint of the candidate
-//! programs, so a toolchain or kernel change re-measures. An unreadable or
+//! device's compiler ([`compiler`]) and a fingerprint of the kernels the
+//! candidates emit ([`fingerprint`]), so a toolchain or kernel change
+//! re-measures and nothing else does. An unreadable or
 //! unwritable store is a miss, never an error; a line the store cannot read
 //! is dropped at its next write, and a file of another format whole.
 //! `SVOD_TK3_TUNE=0`, or [`scoped`] on a thread, turns candidate timing off:
@@ -34,8 +35,10 @@ use crate::launch;
 use crate::lower::Lowering;
 
 /// The store's line format, bumped when a line's meaning changes (a file
-/// without a format line is of the first).
-pub(crate) const FORMAT: u32 = 4;
+/// without a format line is of the first); 5 fingerprints the emitted
+/// kernels, where 4 fingerprinted the programs and lowerings, targets and
+/// costs whole.
+pub(crate) const FORMAT: u32 = 5;
 /// Search bound: timed rounds over every candidate after the warm-up, and
 /// the rounds the two leaders then run again.
 const ROUNDS: usize = 4;
@@ -119,9 +122,26 @@ pub fn compiler(spec: &DeviceSpec) -> u64 {
 /// its partial results, say).
 pub type Candidate = Vec<(Program, Lowering)>;
 
-/// The fingerprint of candidates' programs: their tile programs and lowerings.
+/// The fingerprint of candidates' programs: the kernels they emit
+/// ([`emitted`]), so a field of the target or the costs no instruction
+/// reads keys nothing, added, renamed or deleted. What a program emits is
+/// remembered by what it is made of, by the process and by the global
+/// store ([`TuneStore::fingerprint`]): lowering a shortlist takes 0.05–1.6 s,
+/// and a warm process lowers nothing.
 pub fn fingerprint(candidates: &[Candidate]) -> u64 {
-    digest(&candidates.iter().map(|c| digest(&format!("{c:?}"))).collect::<Vec<_>>())
+    TuneStore::global().fingerprint(candidates)
+}
+
+/// What `prog` emits under `lowering`: the structural hash of the program
+/// it lowers to (its instructions, grid and parameters) and the text the
+/// backend's compiler is handed, which a renderer change moves. Lowered
+/// outside any origin scope, which would key the call site; `None` where it
+/// does not lower or render.
+fn emitted(prog: &Program, lowering: &Lowering) -> Option<u64> {
+    let _capture = svod_ir::origin::capture_for_thread(false);
+    let _scope = svod_ir::origin::install(None);
+    let lowered = crate::lower::standalone(prog.clone(), lowering).ok()?;
+    Some(digest(&(digest(&lowered.program), lowered.text(&lowering.device.target).ok()?)))
 }
 
 /// Values per key, each made once: a caller asking for a key in flight
@@ -196,12 +216,52 @@ pub struct TuneStore {
     root: Option<PathBuf>,
     /// The entry per kind and key, `None` where nothing could be measured.
     memo: Once<(Kind, TuneKey), Option<Entry>>,
+    /// What programs emit by what they are made of ([`Self::fingerprint`]).
+    emitted: OnceLock<Mutex<HashMap<u64, u64>>>,
 }
 
 impl TuneStore {
     /// The store rooted at `root` (`None`: memory only).
     pub fn at(root: Option<PathBuf>) -> Self {
-        Self { root, memo: Mutex::default() }
+        Self { root, memo: Mutex::default(), emitted: OnceLock::new() }
+    }
+
+    /// [`fingerprint`] under this store: what each program emits is read
+    /// from what the process and the root's `emitted` file know by the
+    /// digest of what it is made of (its program and lowering whole), else
+    /// lowered, in parallel, and added to both. A program that does not
+    /// lower is keyed by what it is made of. The memo keys inputs, not
+    /// code: a lowering that emits otherwise for the same inputs is seen
+    /// after a [`FORMAT`] bump, which starts the file afresh.
+    pub fn fingerprint(&self, candidates: &[Candidate]) -> u64 {
+        use rayon::prelude::*;
+        let made_of: Vec<Vec<u64>> =
+            candidates.iter().map(|c| c.iter().map(|(p, l)| digest(&format!("{p:?}{l:?}"))).collect()).collect();
+        let file =
+            self.root.as_ref().map(|root| root.join(format!("emitted-v{}-{FORMAT}.txt", env!("CARGO_PKG_VERSION"))));
+        let memo = self.emitted.get_or_init(|| {
+            let text = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default();
+            let hex = |s: &str| u64::from_str_radix(s, 16).ok();
+            Mutex::new(
+                text.lines().filter_map(|l| l.split_once(' ').and_then(|(a, b)| Some((hex(a)?, hex(b)?)))).collect(),
+            )
+        });
+        let missing: Vec<(u64, &(Program, Lowering))> = {
+            let known = memo.lock().expect("emitted memo");
+            let mut seen = std::collections::HashSet::new();
+            let programs = made_of.iter().flatten().zip(candidates.iter().flatten());
+            programs.filter(|(m, _)| !known.contains_key(*m) && seen.insert(**m)).map(|(&m, p)| (m, p)).collect()
+        };
+        let found: Vec<(u64, u64)> =
+            missing.into_par_iter().map(|(m, (prog, lowering))| (m, emitted(prog, lowering).unwrap_or(m))).collect();
+        if let (Some(file), false) = (file, found.is_empty()) {
+            let lines: String = found.iter().map(|(m, e)| format!("{m:016x} {e:016x}\n")).collect();
+            let append = std::fs::OpenOptions::new().create(true).append(true).open(file);
+            let _ = append.and_then(|mut f| std::io::Write::write_all(&mut f, lines.as_bytes()));
+        }
+        let mut known = memo.lock().expect("emitted memo");
+        known.extend(found);
+        digest(&made_of.iter().map(|c| c.iter().map(|m| known[m]).collect::<Vec<_>>()).collect::<Vec<_>>())
     }
 
     /// The process-wide store per the environment (see the module docs).

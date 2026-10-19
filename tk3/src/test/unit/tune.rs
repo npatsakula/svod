@@ -2,7 +2,8 @@
 //! stability, the rule that nothing unmeasured is stored, a key measured
 //! once under concurrent asks, a store hit compiling nothing, a run's
 //! stamps and the lost-stamp guard, what counts as a spill, the admission
-//! memo, and on the device a real GEMM tuning.
+//! memo, a fingerprint keyed by what the candidates emit and remembered
+//! by what they are made of, and on the device a real GEMM tuning.
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -589,4 +590,67 @@ fn a_float_scratch_buffer_is_random_and_an_integer_one_is_zero() {
         (floats.iter().filter(|&&x| x < -0.5).count(), floats.iter().filter(|&&x| x > 0.5).count());
     assert!(negative > 512 && positive > 512, "spread over the range: {negative} below -0.5, {positive} above 0.5");
     assert!(ints.iter().all(|&x| x == 0), "an integer parameter is zero");
+}
+
+/// A 4096³ GEMM candidate on the warp-level core for `target` under `costs`.
+fn gemm_candidate(target: crate::atoms::Target, costs: crate::atoms::Costs) -> tune::Candidate {
+    let cfg = crate::ops::config::gemm_cfg([128, 128, 32], 2, [2, 4], true);
+    let spec = GemmSpec { m: 4096, n: 4096, k: 4096, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
+    vec![(gemm::<BF16>(&spec), cfg.lowering(&Device { target, costs }))]
+}
+
+/// The fingerprint keys the emitted kernel: a target field (whether the
+/// matrix core issues on the vector unit, read by the ranking alone) or a
+/// cost (the memory latency) no instruction reads leaves it, a field the
+/// lowering reads (the dies the blocks are renumbered over) moves it.
+#[test]
+fn the_fingerprint_keys_what_is_emitted() {
+    let fingerprint = |c| TuneStore::at(None).fingerprint(&[c]);
+    let (target, costs) = (crate::atoms::Target::card("mi300x").expect("a listed card"), super::costs());
+    let base = fingerprint(gemm_candidate(target.clone(), costs));
+    let planned = crate::atoms::Target { mma_on_valu: !target.mma_on_valu, ..target.clone() };
+    assert_eq!(fingerprint(gemm_candidate(planned, costs)), base, "a field only the ranking reads");
+    let latency = crate::atoms::Costs { latency: 2.0 * costs.latency, ..costs };
+    assert_eq!(fingerprint(gemm_candidate(target.clone(), latency)), base, "a cost only the ranking reads");
+    let one_die = crate::atoms::Target { xcds: 1, ..target };
+    assert_ne!(fingerprint(gemm_candidate(one_die, costs)), base, "the block order is emitted");
+}
+
+/// Candidates fingerprint as a list: their order and grouping count.
+#[test]
+fn the_fingerprint_keys_the_candidates_in_order() {
+    let store = TuneStore::at(None);
+    let (a, b) = (
+        gemm_candidate(sm86(), super::costs()),
+        gemm_candidate(crate::atoms::Target::card("mi300x").unwrap(), super::costs()),
+    );
+    let ab = store.fingerprint(&[a.clone(), b.clone()]);
+    assert_eq!(TuneStore::at(None).fingerprint(&[a.clone(), b.clone()]), ab, "deterministic");
+    assert_ne!(store.fingerprint(&[b.clone(), a.clone()]), ab);
+    assert_ne!(store.fingerprint(&[[a, b].concat()]), ab);
+}
+
+/// What a program emits is kept beside the store's files by what it is
+/// made of: a later store on the directory reads it rather than lowering,
+/// and a line it cannot read is passed over.
+#[test]
+fn what_a_program_emits_is_remembered_by_the_store() {
+    let dir = scratch("emitted");
+    let candidate = gemm_candidate(sm86(), super::costs());
+    let fresh = TuneStore::at(Some(dir.clone())).fingerprint(std::slice::from_ref(&candidate));
+    assert_eq!(fresh, TuneStore::at(None).fingerprint(std::slice::from_ref(&candidate)));
+    let file = dir.join(format!("emitted-v{}-{FORMAT}.txt", env!("CARGO_PKG_VERSION")));
+    let made_of = {
+        let mut hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&format!("{:?}{:?}", candidate[0].0, candidate[0].1), &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    };
+    let text = std::fs::read_to_string(&file).expect("the emitted file");
+    assert!(text.starts_with(&format!("{made_of:016x} ")), "{text}");
+    std::fs::write(&file, format!("not a line\n{made_of:016x} 000000000000002a\n")).expect("a rewritten file");
+    let read = TuneStore::at(Some(dir.clone())).fingerprint(&[candidate]);
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&vec![vec![42u64]], &mut hasher);
+    assert_eq!(read, std::hash::Hasher::finish(&hasher), "read from the file, not lowered");
+    let _ = std::fs::remove_dir_all(dir);
 }
