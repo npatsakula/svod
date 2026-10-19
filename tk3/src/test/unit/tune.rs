@@ -17,7 +17,7 @@ use crate::atoms::{Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Core, Epilogue, GemmCfg, GemmSpec, gemm};
-use crate::tune::{self, Bench, FORMAT, Kind, ScratchPool, TuneKey, TuneStore, fingerprint};
+use crate::tune::{self, Bench, Entry, FORMAT, Kind, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.
 fn key(shape: &[usize], candidates: &[usize]) -> TuneKey {
@@ -35,6 +35,39 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
+}
+
+/// A choice made the way [`TuneStore::choose`] makes one, from a closure of
+/// device times rather than compiled candidates.
+pub(super) trait Select {
+    /// The winner among `count` candidates: the memo, then the store under
+    /// the line `programs` fingerprints, else `measure` times every
+    /// candidate (device ns, `None` where one cannot run) and their order is
+    /// stored. `None` when nothing measured.
+    fn select(
+        &self,
+        key: &TuneKey,
+        count: usize,
+        programs: impl FnOnce() -> u64,
+        measure: impl FnOnce() -> Vec<Option<u64>>,
+    ) -> Option<usize>;
+}
+
+impl Select for TuneStore {
+    fn select(
+        &self,
+        key: &TuneKey,
+        count: usize,
+        programs: impl FnOnce() -> u64,
+        measure: impl FnOnce() -> Vec<Option<u64>>,
+    ) -> Option<usize> {
+        let within = |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _)| i < count));
+        let timed = |()| tune::ordered(measure()).map(Entry::Choice);
+        match self.remember(Kind::Choice, key, within, || (programs(), ()), timed)? {
+            Entry::Choice(timed) => Some(timed[0].0),
+            _ => None,
+        }
+    }
 }
 
 /// A measurement that records it ran.

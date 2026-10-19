@@ -147,6 +147,13 @@ pub(crate) fn tuned_on_device<C: crate::ops::config::Tiled + PartialEq + std::fm
     (candidates, pick)
 }
 
+/// Each candidate's best device time in ns, its programs' summed, on
+/// scratch buffers at capacity: compiled, then timed.
+fn measure(candidates: impl IntoIterator<Item = crate::tune::Candidate>) -> Vec<Option<u64>> {
+    let pool = crate::tune::ScratchPool::default();
+    crate::tune::time(&mut crate::tune::compile(candidates.into_iter().collect(), &pool))
+}
+
 /// The front of a ranking: its first eight tiles, what a host test judges
 /// a ranking by (the tuner's shortlist, which compiles on a device, runs
 /// [`SHORTLIST`](crate::ops::config::SHORTLIST) deep).

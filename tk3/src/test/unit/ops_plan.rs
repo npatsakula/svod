@@ -9,6 +9,7 @@ use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
 use super::conv::geom;
+use super::tune::Select;
 use super::{costs, first_eight, planner};
 use crate::atoms::{Costs, Device, Target, sm86};
 use crate::build::BF16 as BF16T;

@@ -369,27 +369,8 @@ impl TuneStore {
         }
     }
 
-    /// The winner among `count` candidates: the memo, then the store under
-    /// the line `programs` fingerprints, else `measure` times every candidate
-    /// (device ns, `None` where one cannot run) and their order is stored.
-    /// `None` when nothing measured; that is memoized but never stored.
-    pub fn select(
-        &self,
-        key: &TuneKey,
-        count: usize,
-        programs: impl FnOnce() -> u64,
-        measure: impl FnOnce() -> Vec<Option<u64>>,
-    ) -> Option<usize> {
-        let within = |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _)| i < count));
-        let timed = |()| ordered(measure()).map(Entry::Choice);
-        match self.remember(Kind::Choice, key, within, || (programs(), ()), timed)? {
-            Entry::Choice(timed) => Some(timed[0].0),
-            _ => None,
-        }
-    }
-
     /// A measured number (a probe's cost, say) by the same path as
-    /// [`Self::select`]: the memo, the store, else `measure`, stored when `Some`.
+    /// [`Self::choose`]: the memo, the store, else `measure`, stored when `Some`.
     pub fn value(
         &self,
         key: &TuneKey,
@@ -405,7 +386,8 @@ impl TuneStore {
     /// The memo, then the stored entry of `kind` that is `valid` under the
     /// fingerprint `programs` makes, else `measure`'s entry of what
     /// `programs` built, stored when there is one and memoized either way.
-    fn remember<T>(
+    /// `None` when nothing measured; that is memoized but never stored.
+    pub(crate) fn remember<T>(
         &self,
         kind: Kind,
         key: &TuneKey,
@@ -426,9 +408,10 @@ impl TuneStore {
     }
 
     /// The indices of `candidates` that ran, fastest first, each with its
-    /// device ns, as [`Self::select`] finds them, keyed by the fingerprint
-    /// of the programs `build` makes (each built once); only a store miss
-    /// compiles them (those `bench` has not) and [`time`]s them.
+    /// device ns: the memo, then the store under the line the programs
+    /// `build` makes fingerprint (each built once), else, on a store miss,
+    /// those `bench` has not compiled are compiled and every candidate is
+    /// [`time`]d, their order stored.
     pub fn choose<C: Copy + PartialEq>(
         &self,
         key: &TuneKey,
@@ -450,7 +433,7 @@ impl TuneStore {
     }
 
     /// The indices `admit` finds for the ranked list `key` names (`None`:
-    /// nothing compiled to judge) by the same path as [`Self::select`]: the
+    /// nothing compiled to judge) by the same path as [`Self::choose`]: the
     /// memo, the store under the line `programs` fingerprints, else `admit`,
     /// stored when it judged. What compiles without spilling is the
     /// compiler's and the programs' alone, both in the line, so a later
@@ -486,10 +469,9 @@ impl TuneStore {
     }
 }
 
-/// The fastest of candidates' device times as `(index, ns)`.
 /// The candidates that ran, fastest first, each with its ns; `None` when
 /// none did.
-fn ordered(ns: Vec<Option<u64>>) -> Option<Arc<[(usize, u64)]>> {
+pub(crate) fn ordered(ns: Vec<Option<u64>>) -> Option<Arc<[(usize, u64)]>> {
     let mut ran: Vec<(u64, usize)> = ns.into_iter().enumerate().filter_map(|(i, ns)| Some((ns?, i))).collect();
     ran.sort_unstable();
     (!ran.is_empty()).then(|| ran.into_iter().map(|(ns, i)| (i, ns)).collect())
@@ -582,12 +564,6 @@ impl<C: Copy + PartialEq> Bench<C> {
         let ns = time(&mut built);
         candidates.iter().map(|c| ns[timed.iter().position(|t| t == c).expect("compiled")]).collect()
     }
-}
-
-/// Each candidate's best device time in ns, its programs' summed, on scratch
-/// buffers at capacity: [`compile`], then [`time`].
-pub fn measure(candidates: impl IntoIterator<Item = Candidate>) -> Vec<Option<u64>> {
-    time(&mut compile(candidates.into_iter().collect(), &ScratchPool::default()))
 }
 
 /// Builds each candidate's plans on `pool`'s scratch buffers at capacity

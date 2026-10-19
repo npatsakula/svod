@@ -527,7 +527,7 @@ fn conv_throughput_probe() {
             let spec = ConvSpec { batch: Batch::Static(1), geom: g, epilogue: SILU_BIAS, cfg: c.gemm, split: c.split };
             spec.programs::<F16>(&planner.device)
         };
-        let times = crate::tune::measure(cands.iter().map(|&c| build(c)));
+        let times = super::measure(cands.iter().map(|&c| build(c)));
         for (cand, t) in cands.iter().zip(&times) {
             let ConvCfg { gemm: c, split } = cand;
             let t =

@@ -477,9 +477,7 @@ fn device_costs_are_physical() {
 fn probe_signals_are_strong() {
     let Some(target) = super::device_target() else { return };
     for p in probes(&target).iter().filter(|p| !p.candidates.is_empty()) {
-        let [Some(base), Some(with)] = crate::tune::measure(p.candidates.clone())[..] else {
-            panic!("{}: not timed", p.op)
-        };
+        let [Some(base), Some(with)] = super::measure(p.candidates.clone())[..] else { panic!("{}: not timed", p.op) };
         let signal = (with as f64 - base as f64) / with as f64;
         eprintln!("{}: baseline {base} ns, probe {with} ns, signal {signal:.3} of the probe", p.op);
         match p.signal {

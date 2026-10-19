@@ -828,7 +828,7 @@ fn attention_throughput_probe() {
             }
             let build =
                 |cfg: FaCfg| vec![(flash_attention(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
-            let ns = crate::tune::measure(timed.iter().map(|&c| build(c)));
+            let ns = super::measure(timed.iter().map(|&c| build(c)));
             let flops = 4.0 * (batch * heads * t * t * d) as f64 / if causal { 2.0 } else { 1.0 };
             eprintln!(
                 "== attention d{d} causal={causal} bias={bias}: {} admitted plain, {} under the first forms",
@@ -924,7 +924,7 @@ fn attention_candidates_probe() {
             }
         }
         let flops = 4.0 * (batch * heads * t * tk * d) as f64 / if causal { 2.0 } else { 1.0 };
-        let ns = crate::tune::measure(
+        let ns = super::measure(
             cfgs.iter()
                 .map(|&c| vec![(flash_attention(&AttnSpec { cfg: c, ..spec.clone() }), c.lowering(&planner.device))]),
         );

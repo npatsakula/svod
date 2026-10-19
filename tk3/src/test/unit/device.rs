@@ -305,7 +305,7 @@ fn gemm_candidates_probe() {
             let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };
             vec![(gemm::<BF16>(&spec), cfg.lowering(&planner.device))]
         };
-        let ns = crate::tune::measure(cfgs.iter().map(|&c| build(c)));
+        let ns = super::measure(cfgs.iter().map(|&c| build(c)));
         let tflops = |ns: u64| 2.0 * (m * n * k) as f64 / ns as f64 / 1e3;
         eprintln!("== {m}x{n}x{k} {epilogue:?}");
         for (i, (c, t)) in cfgs.iter().zip(&ns).enumerate() {
@@ -484,8 +484,8 @@ fn qwen3_gemm_candidates_probe() {
             shortlist.len(),
             lattice.len()
         );
-        let s_best = show("short", &shortlist, &crate::tune::measure(shortlist.iter().map(|&c| build(c))));
-        let l_best = show("lattice", &lattice, &crate::tune::measure(lattice.iter().map(|&c| build(c))));
+        let s_best = show("short", &shortlist, &super::measure(shortlist.iter().map(|&c| build(c))));
+        let l_best = show("lattice", &lattice, &super::measure(lattice.iter().map(|&c| build(c))));
         let fmt = |b: Option<(u64, GemmCfg)>| {
             b.map_or("none".to_string(), |(t, c)| {
                 format!(
