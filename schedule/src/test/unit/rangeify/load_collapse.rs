@@ -501,6 +501,9 @@ fn a_u64_bound_past_i64_never_wraps_through_the_lt_collapse(arange: U64Arange) {
             let pinned = folded.substitute(&[(UOpKey(loaded.clone()), constant(cut))].into_iter().collect());
             assert_eq!(count(&pinned), Some(arange.count_below(cut)), "load = {cut}:\n{}", folded.tree());
         }
+    }
+}
+
 /// An embedding compares an int64 index with the int32 arange widened to it:
 /// `sum(where(idx == Cast(Cast(r, i32), i64), expr, 0))`. Casts that hold the
 /// whole range are peeled; a chain through a type that wraps it is not the
