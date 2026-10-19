@@ -333,7 +333,7 @@ impl Frame<'_> {
                     .map(|(&x, &y)| match f {
                         BinaryOp::Add => x + y,
                         BinaryOp::Sub => x - y,
-                        BinaryOp::Mul => x * y,
+                        BinaryOp::Mul | BinaryOp::Scale => x * y,
                         BinaryOp::Div => x / y,
                         BinaryOp::Max => x.max(y),
                         BinaryOp::Min => x.min(y),
@@ -345,6 +345,9 @@ impl Frame<'_> {
                         BinaryOp::Or => f64::from(x != 0.0 || y != 0.0),
                     })
                     .collect()
+            }
+            TileOp::Cast { src, round: Round::Zero, .. } => {
+                self.read(*src).into_iter().map(|x| f32::from_bits((x as f32).to_bits() & 0xffff_0000) as f64).collect()
             }
             TileOp::Cast { src, .. } | TileOp::Relayout { src } | TileOp::Move { src } => self.read(*src),
             TileOp::Mma { acc, a, b, a_t, b_t, .. } => {

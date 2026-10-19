@@ -1077,7 +1077,7 @@ impl<'a> Emit<'a> {
                     let x = self.reg_load(src, j);
                     let y = match f {
                         UnaryOp::Neg => x.neg(),
-                        UnaryOp::Exp2 => x.try_exp2().expect("exp2"),
+                        UnaryOp::Exp2 => self.exp2(&x),
                         UnaryOp::Log2 => x.try_log2().expect("log2"),
                         UnaryOp::Recip => UOp::try_reciprocal(&x).expect("recip"),
                         UnaryOp::Sqrt => x.try_sqrt().expect("sqrt"),
@@ -1088,6 +1088,7 @@ impl<'a> Emit<'a> {
                     self.reg_store(dst, j, vec![y]);
                 }
             }
+            TileOp::Binary { a, b, f: BinaryOp::Scale } => self.scale(dst, a, b),
             TileOp::Binary { a, b, f } => {
                 let (ja, jb) = (self.operand_regs(dst, a), self.operand_regs(dst, b));
                 for j in 0..regs {
@@ -1095,7 +1096,7 @@ impl<'a> Emit<'a> {
                     let z = match f {
                         BinaryOp::Add => x.try_add(&y),
                         BinaryOp::Sub => x.try_sub(&y),
-                        BinaryOp::Mul => x.try_mul(&y),
+                        BinaryOp::Mul | BinaryOp::Scale => x.try_mul(&y),
                         BinaryOp::Div if x.dtype().is_float() => x.try_div(&y),
                         BinaryOp::Div => x.try_cdiv(&y),
                         BinaryOp::Max => x.try_max(&y),
@@ -1111,10 +1112,15 @@ impl<'a> Emit<'a> {
                     self.reg_store(dst, j, vec![z]);
                 }
             }
-            TileOp::Cast { src, to } => {
+            TileOp::Cast { src, to, round } => {
                 for j in 0..regs {
                     let x = self.reg_load(src, j);
-                    self.reg_store(dst, j, vec![x.cast(DType::Scalar(to))]);
+                    let y = match round {
+                        Round::Nearest => x.cast(DType::Scalar(to)),
+                        // The upper half of the f32's bits.
+                        Round::Zero => shr(&x.bitcast(DType::Int32), 16).cast(DType::Int16).bitcast(DType::Scalar(to)),
+                    };
+                    self.reg_store(dst, j, vec![y]);
                 }
             }
             TileOp::Where { pred, a, b } => {
@@ -1237,6 +1243,37 @@ impl<'a> Emit<'a> {
         Ok(())
     }
 
+    /// `dst = a · b` ([`BinaryOp::Scale`]): `a` as it is, then the products
+    /// under a branch on whether any factor this thread holds differs from 1,
+    /// which a wave whose threads all hold ones jumps over.
+    fn scale(&mut self, dst: ValId, a: ValId, b: ValId) {
+        let (ja, jb) = (self.operand_regs(dst, a), self.operand_regs(dst, b));
+        let regs = ja.len();
+        for (j, &src) in ja.iter().enumerate() {
+            let x = self.reg_load(a, src);
+            self.reg_store(dst, j as u32, vec![x]);
+        }
+        let mut held = jb.clone();
+        held.sort_unstable();
+        held.dedup();
+        let one = |f: &Arc<UOp>| UOp::const_(f.dtype(), ConstValue::Float(1.0));
+        let pred = held
+            .into_iter()
+            .map(|r| {
+                let f = self.reg_load(b, r);
+                f.try_cmpne(&one(&f)).expect("factor test")
+            })
+            .reduce(|p, q| p.try_or_op(&q).expect("or"))
+            .expect("a factor");
+        let tag = self.next_tag();
+        let if_ = self.push(UOp::if_(pred, smallvec![]).rtag(Some(smallvec![tag as usize])));
+        for j in 0..regs {
+            let (x, y) = (self.reg_load(a, ja[j]), self.reg_load(b, jb[j]));
+            self.reg_store(dst, j as u32, vec![x.try_mul(&y).expect("product")]);
+        }
+        self.push(UOp::endif(if_));
+    }
+
     /// `v` where `gate` holds, else zeros: one select over the whole run (a
     /// multiply would turn an Inf read in its place into NaN).
     fn zeroed(&mut self, gate: &Arc<UOp>, v: Arc<UOp>) -> Arc<UOp> {
@@ -1249,6 +1286,20 @@ impl<'a> Emit<'a> {
     /// first use, which another branch would not reach; a scalar is a literal.
     fn hoist_zero(&mut self, zero: Arc<UOp>) -> Arc<UOp> {
         if matches!(zero.op(), Op::Const(..) | Op::VConst(..)) { zero } else { self.hoist(zero) }
+    }
+
+    /// `2^x`. On AMD an f32 one is the hardware `v_exp_f32` alone, without the
+    /// range reduction LLVM wraps `llvm.exp2` in to keep results below 2^-126
+    /// denormal: those flush to zero, which no kernel tells apart.
+    fn exp2(&mut self, x: &Arc<UOp>) -> Arc<UOp> {
+        match self.low.target.arch {
+            GpuArch::Amd(_) if x.dtype() == DType::Float32 => UOp::custom(
+                smallvec![x.clone()],
+                "declare float @llvm.amdgcn.exp2.f32(float)\ncall float @llvm.amdgcn.exp2.f32(float {0})".to_string(),
+                DType::Float32,
+            ),
+            _ => x.try_exp2().expect("exp2"),
+        }
     }
 
     fn shuffle_xor(&mut self, value: &Arc<UOp>, mask: u32) -> Arc<UOp> {

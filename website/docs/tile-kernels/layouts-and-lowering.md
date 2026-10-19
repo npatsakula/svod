@@ -115,7 +115,12 @@ comes from the operand's first elements, which the consumer masks, as after a ch
 address into a plain global view is the view's offset plus the lane's part of the coordinate, one
 value listed once in the prologue, plus the register's constant last, so the compiler keeps a
 running pointer per view and an immediate per register instead of rebuilding every address on
-every trip; a gathered row and a swizzled shared row take the full coordinate. The CUDA backend
+every trip; a gathered row and a swizzled shared row take the full coordinate. A `Scale`
+(a product, exactly) puts its multiplies under a branch on whether any factor the thread holds
+differs from 1, which a wave whose factors are all ones jumps over. A cast toward zero to bf16
+keeps the upper half of the f32's bits. On AMD an f32 `Exp2` is the hardware `v_exp_f32`
+(`llvm.amdgcn.exp2`), without the range reduction `llvm.exp2` adds to keep results below 2⁻¹²⁶
+denormal; those flush to zero. The CUDA backend
 places shared memory above the 48 KB static limit in one dynamic array. Config candidates are
 filtered against the target's opt-in limit (`Target::smem_bytes`).
 
