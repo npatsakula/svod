@@ -28,6 +28,26 @@ fn markers_are_replaced_by_their_source(marked: fn(&Arc<UOp>) -> Arc<UOp>, sourc
     assert_same_ptr(&rewritten(&patterns::early_rewrites(), &marked(&x), &mut ()), &source(&x));
 }
 
+/// A hint-less CONTIGUOUS over a realized node, or a reshape of one, is that
+/// node; a constant, a plain buffer and a hinted CONTIGUOUS keep theirs.
+#[test_case(|b: &Arc<UOp>| b.after(smallvec![UOp::noop()]), true ; "after")]
+#[test_case(|b: &Arc<UOp>| reshape_op(b.after(smallvec![UOp::noop()]), shape(&[2, 2])), true ; "reshape of after")]
+#[test_case(|b: &Arc<UOp>| b.clone(), false ; "buffer")]
+#[test_case(|_: &Arc<UOp>| UOp::native_const(1.0f32), false ; "const")]
+fn a_contiguous_over_a_realized_node_is_that_node(source: fn(&Arc<UOp>) -> Arc<UOp>, folds: bool) {
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let src = source(&buffer);
+    let contiguous = src.contiguous();
+    if folds {
+        assert_same_ptr(&rewritten(&patterns::early_rewrites(), &contiguous, &mut ()), &src);
+    } else {
+        assert_no_match(&patterns::early_rewrites(), &contiguous, &mut ());
+    }
+    let hinted =
+        src.contiguous_with_opts(vec![svod_ir::ContiguousHint { op: "UPCAST".into(), axis: Some(0), arg: Some(4) }]);
+    assert_no_match(&patterns::early_rewrites(), &hinted, &mut ());
+}
+
 #[test]
 fn a_same_device_copy_is_replaced_by_its_source() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);

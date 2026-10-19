@@ -149,6 +149,11 @@ pub fn early_rewrites() -> TypedPatternMatcher {
         },
         Detach { src: x } => x.clone(),
         ContiguousBackward { src: x } => x.clone(),
+        // A hint-less CONTIGUOUS over a realized node (or a reshape of one) is
+        // that node: its bytes already sit in a buffer, and copying them would
+        // add a kernel per op-layer fallback (tinygrad: contiguous of
+        // buffer/copy/assign is already contiguous).
+        Contiguous { src, opts } if opts.is_empty() && UOp::realized_base(src).is_some() => src.clone(),
         // A COPY transfers one contiguous range, so a source that is resized or
         // reordered by a movement op must be materialised first (tinygrad
         // `schedule/rangeify.py:149`). Without this the transfer is sized by the
