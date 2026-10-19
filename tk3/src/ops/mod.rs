@@ -130,7 +130,14 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     }
 
     fn key(&self, op: &'static str, list: &[C]) -> TuneKey {
-        let candidates = format!("{} {list:?}", self.salt);
+        self.keyed(op, "", list)
+    }
+
+    /// [`Self::key`] under `rule`, the name of the judgement stored where it
+    /// is not the plain one: a verdict stored under an older rule is left
+    /// orphaned rather than read.
+    fn keyed(&self, op: &'static str, rule: &str, list: &[C]) -> TuneKey {
+        let candidates = format!("{}{rule} {list:?}", self.salt);
         TuneKey::new(op, self.target, self.compiler, self.dtype, self.shape, &candidates)
     }
 
@@ -185,7 +192,8 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     }
 
     /// The fastest pipeline of `winner`'s tile: its [twins](config::Tiled::twins)
-    /// in `ranked` compiled and timed together, the winner among them (the
+    /// in `ranked` compiled and timed together, every one that compiles,
+    /// spilling or not ([`config::compiled`]), the winner among them (the
     /// shortlist held one pipeline per tile, the model's first clean one).
     /// The winner itself with tuning off, alone, or where no other twin
     /// compiles to be judged.
@@ -194,9 +202,9 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         if !tune::enabled() || twins.len() < 2 {
             return winner;
         }
-        let key = self.key(op, &twins);
+        let key = self.keyed(op, " compiled", &twins);
         let (bench, build) = (&mut self.bench, &self.build);
-        let admit = || config::clean(&twins, |batch| bench.admit(batch, build));
+        let admit = || config::compiled(&twins, |batch| bench.admit(batch, build));
         let judged = TuneStore::global().admitted(&key, || Self::programs(build, &twins), admit);
         match judged {
             Some(at) if at.len() > 1 => self.fastest(op, &at.iter().map(|&i| twins[i]).collect::<Vec<_>>()),

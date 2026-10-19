@@ -377,12 +377,18 @@ pub(crate) fn shortlist<C: Tiled>(ranked: &[C], compile: impl FnMut(&[C]) -> Vec
     judged(ranked, SHORTLIST, SHORTLIST, compile, |c| tiles.insert(c.tile()))
 }
 
-/// The indices of every config of `list` whose compiled kernel does not
-/// spill, judged as [`shortlist`] judges (every one spilling: all of them;
-/// nothing compiling: `None`) but with none set aside for sharing a tile:
-/// a tile's [twins](Tiled::twins) are judged so.
-pub(crate) fn clean<C: Tiled>(list: &[C], compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<Vec<usize>> {
-    judged(list, list.len(), SHORTLIST, compile, |_| true)
+/// The indices of every config of `list` that compiles, spilling or not,
+/// in order; `None` when nothing does. A tile's [twins](Tiled::twins) are
+/// judged so: the shortlist set its spilling pipelines aside for a clean
+/// one, but among a tile's pipelines the time alone decides, and an
+/// unrolled ring that spills a little is often the fastest.
+pub(crate) fn compiled<C: Tiled>(list: &[C], mut compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<Vec<usize>> {
+    let mut out = vec![];
+    for (n, chunk) in list.chunks(SHORTLIST).enumerate() {
+        let built = compile(chunk).into_iter().enumerate().filter(|(_, c)| *c != Compiled::Failed);
+        out.extend(built.map(|(i, _)| n * SHORTLIST + i));
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Search bound: configs compiled at once in search of the first clean one: the first

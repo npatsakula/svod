@@ -355,7 +355,8 @@ pub struct Built {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Compiled {
     Failed,
-    /// A kernel [`spilled`]: timed only where every candidate does.
+    /// A kernel [`spilled`]: admitted only where every candidate does, timed
+    /// among a tile's pipelines.
     Spilled,
     Clean,
 }

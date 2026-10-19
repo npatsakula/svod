@@ -503,18 +503,18 @@ fn the_first_clean_config_is_searched_in_small_batches(
     assert!(asked.iter().flatten().eq(ranked.iter().take(8 * batches)), "ranked batches: {asked:?}");
 }
 
-/// A tile's twins are judged whole: every clean one, in order, none set
-/// aside for sharing the tile; every one spilling, all of them; nothing
-/// compiling, nothing.
+/// A tile's twins are judged by the time alone: every one that compiles,
+/// in order, spilling or not, none set aside for sharing the tile; only a
+/// failure is dropped; nothing compiling, nothing.
 #[test_case(&[], &[], 4, Some(&[0, 1, 2, 3]); "all clean")]
-#[test_case(&[1], &[3], 4, Some(&[0, 2]); "a spill and a failure dropped")]
+#[test_case(&[1], &[3], 4, Some(&[0, 1, 2]); "a spill kept, a failure dropped")]
 #[test_case(&[0, 1, 2], &[], 3, Some(&[0, 1, 2]); "every one spills")]
-#[test_case(&[0], &[1], 2, Some(&[0]); "the spilled when nothing is clean")]
+#[test_case(&[0], &[1], 2, Some(&[0]); "the spilled when nothing else compiles")]
 #[test_case(&[], &[0, 1], 2, None; "nothing compiles")]
-fn twins_are_judged_whole(spilled: &[usize], failed: &[usize], count: usize, want: Option<&[usize]>) {
+fn twins_are_judged_by_time_alone(spilled: &[usize], failed: &[usize], count: usize, want: Option<&[usize]>) {
     use crate::tune::Compiled;
     let twins: Vec<Pipe> = (0..count).map(|at| Pipe { at, tile: 0 }).collect();
-    let got = config::clean(&twins, |batch| {
+    let got = config::compiled(&twins, |batch| {
         assert_eq!(batch.len(), count, "one batch");
         let verdict = |p: &Pipe| match (spilled.contains(&p.at), failed.contains(&p.at)) {
             (_, true) => Compiled::Failed,
