@@ -160,7 +160,7 @@ impl FaCfg {
     /// operand where the core's accumulator cannot feed a product as it
     /// stands (RDNA3); nothing where it can.
     pub fn scratch_bytes(&self, target: &Target) -> usize {
-        match target.mma.first() {
+        match target.geometry() {
             Some(atom) if !atom.accumulator_feeds(target.wave) => self.bq * self.bkv * 4,
             _ => 0,
         }

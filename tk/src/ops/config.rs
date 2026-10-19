@@ -66,7 +66,7 @@ impl GemmCfg {
             || (self.crews == 2
                 && self.core == Core::Warp
                 && target.crews >= 2
-                && target.mma.first().is_some_and(|atom| atom.k as usize == KSLICE)
+                && target.geometry().is_some_and(|atom| atom.k as usize == KSLICE)
                 && self.stages == 1
                 && self.warps[0] == 2
                 && bk.is_multiple_of(KSLICE)
@@ -288,7 +288,7 @@ impl Problem {
         let Device { target, costs } = &planner.device;
         let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
         let gated = self.halves == 2;
-        let atom = target.mma.first().ok_or(Rejected::Lowers)?;
+        let atom = target.geometry().ok_or(Rejected::Lowers)?;
         // A step is at least two matrix-core depths, unless the reduction dim
         // allows nothing deeper.
         let depth = 2 * atom.k as usize;
@@ -787,7 +787,7 @@ impl Planner {
         }
         let p = Problem { batches, m, n, k, halves: 1 };
         let target = &self.device.target;
-        let depth = match (target.fill, target.mma.first()) {
+        let depth = match (target.fill, target.geometry()) {
             (Fill::CpAsync, Some(atom)) => 2 * atom.k as usize,
             _ => 0,
         };
@@ -854,7 +854,7 @@ impl FaCfg {
     /// (one swizzle span, or 128-byte panels) and no key warps split the
     /// block.
     pub fn fits(&self, target: &Target, d: usize, bias: bool) -> bool {
-        let Some(atom) = target.mma.first() else { return false };
+        let Some(atom) = target.geometry() else { return false };
         let (bq, bkv, rows) = (self.bq, self.bkv, self.warp_rows);
         // Key warps fill their own tiles alone.
         let threads = self.row_warps() as usize * target.wave as usize;
@@ -1007,7 +1007,7 @@ impl Attention {
         // the register file.
         let (atoms, kv_reads, step) = match cfg.core {
             Core::Warp => {
-                let atom = target.mma.first().ok_or(Rejected::Lowers)?;
+                let atom = target.geometry().ok_or(Rejected::Lowers)?;
                 let atoms = (cfg.warp_rows / atom.m as usize) * (bkv.min(d) / atom.n as usize);
                 (atoms, 2 * waves * bkv * d * ELEM, costs.step)
             }

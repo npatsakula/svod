@@ -82,3 +82,24 @@ fn atom_layouts_match_the_isa(arch: GpuArch, isa: Isa, wave: u32, mnk: (u32, u32
     }
     assert!(target.mma(ScalarDType::Float32, ScalarDType::Float32).is_none(), "no f32 core");
 }
+
+/// The planner prices one atom a target ([`Target::geometry`]) and the
+/// lowering issues the dtype's own: every atom of every target, bf16 and
+/// f16 alike, has the geometry's shape and operand layouts, so what is
+/// priced is what runs.
+#[test]
+fn every_atom_of_a_target_shares_its_geometry() {
+    let metal = Target::for_arch(GpuArch::Metal(svod_dtype::MetalFamily::Apple(9)));
+    let cards = crate::atoms::CARDS.iter().map(|c| Target::card(c.0).expect("a listed card"));
+    let targets = crate::sweep::targets().into_iter().map(|(_, t)| t).chain(cards).chain([metal]);
+    for target in targets {
+        let geometry = target.geometry().unwrap_or_else(|| panic!("{:?}: a matrix core", target.arch));
+        let shape = |a: &crate::atoms::MmaAtom| (a.m, a.n, a.k, a.a.clone(), a.b.clone(), a.c.clone());
+        for atom in &target.mma {
+            assert_eq!(shape(atom), shape(geometry), "{:?} {:?}", target.arch, atom.dtype_in);
+        }
+        for dtype in [ScalarDType::BFloat16, ScalarDType::Float16] {
+            assert!(target.mma(dtype, ScalarDType::Float32).is_some(), "{:?} {dtype:?}", target.arch);
+        }
+    }
+}

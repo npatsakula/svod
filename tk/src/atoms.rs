@@ -421,12 +421,21 @@ impl Target {
         self.mma.iter().find(|a| a.dtype_in == dtype_in && a.dtype_out == dtype_out)
     }
 
-    /// The `[m, n] += [m, k] · [k, n]` product over `grid` on `core`'s first
-    /// atom as the planner prices it, issued direct; `None` where the target
-    /// lacks the core or the product does not tile its atoms.
+    /// The warp-level matrix core's geometry: its `m × n × k` and operand
+    /// layouts, which every input dtype's atom shares (16-bit operands only,
+    /// `test::unit::atoms::every_atom_of_a_target_shares_its_geometry`). The
+    /// planner prices it; the lowering issues the dtype's own ([`Self::mma`]).
+    pub fn geometry(&self) -> Option<&MmaAtom> {
+        self.mma.first()
+    }
+
+    /// The `[m, n] += [m, k] · [k, n]` product over `grid` on `core`'s
+    /// [geometry](Self::geometry) as the planner prices it, issued direct;
+    /// `None` where the target lacks the core or the product does not tile
+    /// its atoms.
     pub fn issue(&self, core: Core, grid: WarpGrid, m: usize, n: usize, k: usize) -> Option<Issue> {
         match core {
-            Core::Warp => self.mma.first()?.issue(Orient::Direct, grid, m, n, k).ok(),
+            Core::Warp => self.geometry()?.issue(Orient::Direct, grid, m, n, k).ok(),
             Core::Group => self.group_mma.first()?.issue(grid, m, n, k).ok(),
         }
     }
