@@ -128,6 +128,13 @@ pub enum Scalar {
     },
     /// The row coordinate inside the view whose [`RowMap`] reads it.
     Row,
+    /// Whether some element of a boolean register tile is set among those
+    /// the warp evaluating it holds: one for the whole block in the
+    /// interpreter, whose block is one thread. Only a branch reads it, and
+    /// only one whose results agree with the other branch's wherever the
+    /// tile is clear ([`crate::build::Kernel::where_any`]), so how the
+    /// lowering spreads the tile over warps cannot change them.
+    Any(ValId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -493,7 +500,7 @@ impl Program {
     /// see it differ.
     pub fn varies_by_warp(&self, id: ScalarId) -> bool {
         match self.scalar(id) {
-            Scalar::Special(Special::Warp) => true,
+            Scalar::Special(Special::Warp) | Scalar::Any(_) => true,
             Scalar::Bin(_, a, b) => self.varies_by_warp(*a) || self.varies_by_warp(*b),
             Scalar::Load { index, .. } => self.varies_by_warp(*index),
             _ => false,
@@ -519,6 +526,7 @@ impl Program {
                 Some((0, self.bounds(self.grid[*axis as usize], induction)?.1 - 1))
             }
             Scalar::Special(Special::Warp) => Some((0, i64::from(self.warps) - 1)),
+            Scalar::Any(_) => Some((0, 1)),
             Scalar::Induction => induction(id),
             Scalar::Bin(op, a, b) => {
                 let ((a0, a1), (b0, b1)) = (self.bounds(*a, induction)?, self.bounds(*b, induction)?);

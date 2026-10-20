@@ -302,6 +302,7 @@ impl<'a> Emit<'a> {
             Scalar::Special(Special::Block(axis)) => (0, self.block_index(*axis as usize)),
             Scalar::Special(Special::Warp) => (0, self.warp.clone()),
             Scalar::Induction => return self.inductions[&id].clone(),
+            Scalar::Any(_) => unreachable!("a branch reads an any as its predicate, nothing else does"),
             Scalar::Bin(op, a, b) => {
                 let ((la, a), (lb, b)) = (self.scalar_at(*a, row), self.scalar_at(*b, row));
                 let u = match op {
@@ -530,12 +531,18 @@ impl<'a> Emit<'a> {
             }
             Stmt::If { pred, then, otherwise } => {
                 let divergent = usize::from(self.scope == Scope::Block && self.prog.varies_by_warp(*pred));
-                let pred = self.sc(*pred);
-                // Listed like any scalar: a compare left to its first user
-                // would land inside whichever branch meets it first and not
-                // reach a later `if` on the same predicate outside it.
-                let cond = self.hoist(pred.try_cmpne(&c32(0)).expect("predicate"));
-                let not = self.hoist(cond.not());
+                let (cond, not) = if let Scalar::Any(v) = *self.prog.scalar(*pred) {
+                    // Listed here, after the tile it reads, never hoisted.
+                    let cond = self.vote_any(v);
+                    (cond.clone(), self.push(cond.not()))
+                } else {
+                    let pred = self.sc(*pred);
+                    // Listed like any scalar: a compare left to its first user
+                    // would land inside whichever branch meets it first and not
+                    // reach a later `if` on the same predicate outside it.
+                    let cond = self.hoist(pred.try_cmpne(&c32(0)).expect("predicate"));
+                    (cond.clone(), self.hoist(cond.not()))
+                };
                 self.divergent += divergent;
                 for (branch, cond) in [(then, cond), (otherwise, not)] {
                     if branch.0.is_empty() {
@@ -723,7 +730,7 @@ fn reads_row(prog: &Program, id: ScalarId, memo: &mut Vec<Option<bool>>) -> bool
         Scalar::Row => true,
         Scalar::Bin(_, a, b) => reads_row(prog, *a, memo) | reads_row(prog, *b, memo),
         Scalar::Load { index, .. } => reads_row(prog, *index, memo),
-        Scalar::Const(_) | Scalar::Var(_) | Scalar::Special(_) | Scalar::Induction => false,
+        Scalar::Const(_) | Scalar::Var(_) | Scalar::Special(_) | Scalar::Induction | Scalar::Any(_) => false,
     };
     memo[id.index()] = Some(dep);
     dep

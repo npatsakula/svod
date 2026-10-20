@@ -298,6 +298,43 @@ impl Emit<'_> {
         }
     }
 
+    /// Whether some element of the boolean tile `v` this warp holds is set
+    /// ([`Scalar::Any`]): each lane's own elements or'd, then the warp's
+    /// vote, uniform over its lanes. Listed at this point, behind a compiler
+    /// memory barrier: the branch on it would otherwise let the backend sink
+    /// the loads listed above it (a pipeline's next step, used past the
+    /// branch) below it, where their latency is no longer hidden.
+    pub(super) fn vote_any(&mut self, v: ValId) -> Arc<UOp> {
+        let mut lane = self.reg_load(v, 0);
+        for j in 1..self.layout(v).regs() {
+            let x = self.reg_load(v, j);
+            lane = self.push(lane.try_or_op(&x).expect("a boolean or"));
+        }
+        if !matches!(self.low.device.target.lane_move, LaneMove::SimdShuffle) {
+            let pin = UOp::custom(
+                smallvec![lane.clone()],
+                "call void asm sideeffect \"\", \"~{{memory}}\"()".to_string(),
+                DType::Void,
+            );
+            self.push(pin);
+        }
+        let vote = match self.low.device.target.lane_move {
+            LaneMove::Shuffle => UOp::custom(
+                smallvec![lane],
+                "declare i1 @llvm.nvvm.vote.any.sync(i32, i1)\ncall i1 @llvm.nvvm.vote.any.sync(i32 -1, i1 {0})"
+                    .to_string(),
+                DType::Bool,
+            ),
+            LaneMove::SimdShuffle => UOp::custom(smallvec![lane], "simd_any({0})".to_string(), DType::Bool),
+            LaneMove::Permute | LaneMove::Dpp => {
+                let ballot = super::amdgpu::ballot(&lane, self.low.device.target.wave);
+                let ballot = self.push(ballot);
+                ballot.try_cmpne(&ballot.const_like(0)).expect("a ballot compare")
+            }
+        };
+        self.push(vote)
+    }
+
     pub(super) fn shuffle_xor(&mut self, value: &Arc<UOp>, mask: u32) -> Arc<UOp> {
         match self.low.device.target.lane_move {
             LaneMove::Shuffle => shfl_bfly(value, &c32(mask as i64)),

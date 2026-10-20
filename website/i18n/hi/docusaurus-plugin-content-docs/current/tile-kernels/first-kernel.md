@@ -158,4 +158,4 @@ c.realize()?;
 | Views | `view`, `gather` (row-mapped view), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
 | Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (एक ही rounding), `reduce`, `reduce_f32`, `transpose`, `mma`, `mma_oriented`, `pin` |
 | Movement | `stage` (global → shared, `CopyMode::Async` या `Sync`), `load`, `load_as_fill`, `store` |
-| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches), `each_warp` (एक `Warps` statement), `barrier` |
+| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (tiles बनाने वाली branches), `where_any` (एक `where_` जिसका चुना हुआ पक्ष केवल वे warps गणना करते हैं जिनके पास predicate का कोई set element है), `each_warp` (एक `Warps` statement), `barrier` |

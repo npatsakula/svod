@@ -159,4 +159,4 @@ output and falls back to the graph when the kernel does not apply.
 | Views | `view`, `gather` (a row-mapped view), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
 | Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (a row or column vector broadcasts), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (one rounding), `reduce`, `reduce_f32`, `transpose`, `mma`, `mma_oriented`, `pin` |
 | Movement | `stage` (global → shared, `CopyMode::Async` or `Sync`), `load`, `load_as_fill`, `store` |
-| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (branches producing tiles), `each_warp` (a `Warps` statement), `barrier` |
+| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (branches producing tiles), `where_any` (a `where_` whose taken side only the warps holding a set predicate element compute), `each_warp` (a `Warps` statement), `barrier` |

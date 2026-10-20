@@ -290,21 +290,39 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
                 |_| [s],
             );
         }
-        // The columns in f32 (exact below 2^24, as the carried index):
-        // a float minimum folds its negations into the lane moves an
-        // integer one pays for.
         let low = k.reduce(s, Axis::Row, ReduceOp::Min);
-        let at_low = k.compare(s, low, CmpOp::Eq);
-        let col = k.coord(shape, Axis::Col);
-        let col = k.cast::<I32, F32>(col);
-        let none = inf(k);
-        let cols = k.where_(at_low, col, none);
-        let first = k.reduce(cols, Axis::Row, ReduceOp::Min);
-        let start = k.splat::<F32>(rows, start);
-        let first = k.binary(first, start, BinaryOp::Add);
-        // Strictly lower: an earlier trip's equal score keeps its smaller index.
-        let lower = k.compare(low, best, CmpOp::Lt);
-        [k.where_(lower, low, best), k.where_(lower, first, index)]
+        let first = |k: &mut Kernel| {
+            // The columns in f32 (exact below 2^24, as the carried index):
+            // a float minimum folds its negations into the lane moves an
+            // integer one pays for.
+            let at_low = k.compare(s, low, CmpOp::Eq);
+            let col = k.coord(shape, Axis::Col);
+            let col = k.cast::<I32, F32>(col);
+            let none = inf(k);
+            let cols = k.where_(at_low, col, none);
+            let first = k.reduce(cols, Axis::Row, ReduceOp::Min);
+            let start = k.splat::<F32>(rows, start);
+            [k.binary(first, start, BinaryOp::Add)]
+        };
+        // Strictly lower: an earlier trip's equal score keeps its smaller
+        // index. A row's least falls ever more rarely as the trips pass, so
+        // resident the warps none of whose rows a trip lowers skip finding
+        // where it is. Streamed, a tile folds once per depth pipeline, and
+        // the branch costs the registers and the overlap of the next tile's
+        // fill it would save (on gfx1151 a 64-row tile of 64 candidates
+        // spills).
+        match cfg.bk {
+            None => {
+                let lower = k.compare(low, best, CmpOp::Lt);
+                let [index] = k.where_any(lower, first, [index]);
+                [k.where_(lower, low, best), index]
+            }
+            Some(_) => {
+                let [first] = first(k);
+                let lower = k.compare(low, best, CmpOp::Lt);
+                [k.where_(lower, low, best), k.where_(lower, first, index)]
+            }
+        }
     };
 
     let best0 = k.fill::<F32>(rows, Const::Float(f64::INFINITY));

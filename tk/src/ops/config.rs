@@ -1255,7 +1255,8 @@ impl NearestCfg {
 /// and second minimum, in units of [`Costs::score`] (a softmax score's scale,
 /// row maximum, subtract, `exp2` and row sum): as many vector operations,
 /// two of them reductions, where the softmax's `exp2` stands for the
-/// argmin's select.
+/// argmin's select. The argmin's three run only in the warps a trip lowers
+/// some row of, ever fewer as the trips pass; the model charges them all.
 const NEAREST_PAIR: f64 = 1.0;
 /// Model: one more elementwise operation a pair, in the same units: the
 /// row's norm added, a floor's maximum, the L2 clamp.

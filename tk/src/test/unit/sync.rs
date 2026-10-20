@@ -455,6 +455,35 @@ fn a_block_barrier_under_a_branch_on_the_warp_is_refused(
     Ok(kinds(&prog, then))
 }
 
+/// A branch on a vote is a branch on the warp: a shared tile stored and read
+/// back under it would need a block barrier some warps skip, so the lowering
+/// refuses it; reductions within the warp need none.
+#[test_case(true => Err("a shared tile's fence is a block barrier under a branch on the warp, which some warps skip".into()); "through shared memory")]
+#[test_case(false => Ok(()); "in registers")]
+fn a_block_barrier_under_a_vote_is_refused(shared: bool) -> Result<(), String> {
+    let mut k = Kernel::new("voted");
+    let s = k.smem::<F32>("s", 256);
+    let x = k.zeros::<F32>(Shape::new(16, 16));
+    let low = k.reduce(x, Axis::Row, ReduceOp::Min);
+    let zero = k.zeros::<F32>(Shape::new(16, 1));
+    let pred = k.compare(low, zero, CmpOp::Lt);
+    k.where_any(
+        pred,
+        |k| {
+            if shared {
+                let tile = k.smem_view::<F32>(s, 0, Shape::new(16, 16));
+                k.store(tile, x);
+                let y = k.load(tile);
+                return [k.reduce(y, Axis::Row, ReduceOp::Max)];
+            }
+            [k.reduce(x, Axis::Row, ReduceOp::Max)]
+        },
+        [low],
+    );
+    let mut prog = k.finish();
+    insert_barriers(&mut prog).map_err(|e| e.to_string())
+}
+
 /// A streamed nearest runs the depth pipeline once per candidate tile: the
 /// pass fences the ring where the next tile's first fill meets the last
 /// tile's reads of it, one barrier at the head of the pipeline in the loop,

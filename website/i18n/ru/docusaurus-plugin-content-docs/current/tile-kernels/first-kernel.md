@@ -162,4 +162,4 @@ c.realize()?;
 | View | `view`, `gather` (view с отображением строк), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
 | Тайловые операции | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (вектор-строка или вектор-столбец транслируется), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (одно округление), `reduce`, `reduce_f32`, `transpose`, `mma`, `mma_oriented`, `pin` |
 | Перемещение | `stage` (global → shared, `CopyMode::Async` или `Sync`), `load`, `load_as_fill`, `store` |
-| Управление | `loop_` (переносимые регистровые тайлы), `pipeline`, `if_`, `select_if` (ветви, производящие тайлы), `each_warp` (инструкция `Warps`), `barrier` |
+| Управление | `loop_` (переносимые регистровые тайлы), `pipeline`, `if_`, `select_if` (ветви, производящие тайлы), `where_any` (`where_`, выбранную сторону которого вычисляют только варпы с установленным элементом предиката), `each_warp` (инструкция `Warps`), `barrier` |

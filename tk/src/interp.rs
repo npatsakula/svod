@@ -149,6 +149,7 @@ impl Frame<'_> {
                 let (store, index) = (&self.globals[param.index()], self.scalar_at(*index, row)?);
                 store[slot(&self.prog.params[param.index()].name, store, index)?] as i64
             }
+            Scalar::Any(v) => i64::from(self.read(*v)?.iter().any(|&b| b != 0.0)),
         })
     }
 

@@ -138,4 +138,4 @@ c.realize()?;
 | 视图 | `view`、`gather`（按行映射的视图）、`at`、`narrow`、`smem_view`、`smem_view_as`、`smem_slot` |
 | Tile 操作 | `fill`、`zeros`、`splat`、`coord`、`unary`、`binary`（行向量或列向量会广播）、`scale`、`compare`（`CmpOp`）、`cast`、`cast_toward_zero`、`where_`、`mul_add`（只舍入一次）、`reduce`、`reduce_f32`、`transpose`、`mma`、`mma_oriented`、`pin` |
 | 数据移动 | `stage`（全局 → 共享，`CopyMode::Async` 或 `Sync`）、`load`、`load_as_fill`、`store` |
-| 控制 | `loop_`（携带寄存器 tile）、`pipeline`、`if_`、`select_if`（产生 tile 的分支）、`each_warp`（一条 `Warps` 语句）、`barrier` |
+| 控制 | `loop_`（携带寄存器 tile）、`pipeline`、`if_`、`select_if`（产生 tile 的分支）、`where_any`（一个 `where_`，只有持有已置位谓词元素的 warp 计算其选中一侧）、`each_warp`（一条 `Warps` 语句）、`barrier` |

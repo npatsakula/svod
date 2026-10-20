@@ -920,3 +920,144 @@ fn two_atom_rows_per_warp_lower(target: Target) {
     let keyed = FaCfg { warp_rows: 2 * WARP_ROWS, key_warps: 2, ..FaCfg::new(32, 16, 2) };
     assert!(!keyed.fits(&target, 64, false), "key warps share a block of one atom row warp");
 }
+
+/// Four warps of one 256-wide row each: every row's maximum, and its sum
+/// instead where the maximum is positive, the sums taken under
+/// [`Kernel::where_any`](crate::build::Kernel::where_any) (rows 1 and 3 of
+/// [`voted_input`] pass, so warps 0 and 2 skip them).
+fn voted_rows() -> (Program, crate::layouts::WarpGrid) {
+    use crate::build::{CmpOp, F32, Kernel};
+    use crate::ir::{ReduceOp, Shape};
+    let (rows, d) = (4, 256);
+    let mut k = Kernel::new("voted");
+    let x = k.param::<F32>("x", ParamKind::In, rows * d);
+    let y = k.param::<F32>("y", ParamKind::Out, rows);
+    k.warps(rows as u32);
+    let xv = k.view(x, 0, [d, 1], Shape::new(rows, d), [None, None]);
+    let xs = k.load(xv);
+    let most = k.reduce(xs, Axis::Row, ReduceOp::Max);
+    let zero = k.zeros::<F32>(Shape::new(rows, 1));
+    let positive = k.compare(zero, most, CmpOp::Lt);
+    let [out] = k.where_any(positive, |k| [k.reduce(xs, Axis::Row, ReduceOp::Sum)], [most]);
+    let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
+    k.store(yv, out);
+    (k.finish(), crate::layouts::WarpGrid { rows: rows as u32, cols: 1 })
+}
+
+/// Small integers, every one of rows 0 and 2 negative, so their sums and
+/// maxima are exact and only rows 1 and 3 take their sums.
+fn voted_input() -> Vec<f64> {
+    (0..4 * 256).map(|e| if (e / 256) % 2 == 0 { -1.0 - (e % 5) as f64 } else { (e % 7) as f64 - 3.0 }).collect()
+}
+
+/// What [`voted_rows`] computes from [`voted_input`]: rows 0 and 2 their
+/// maxima, rows 1 and 3 their sums.
+fn voted_want() -> Vec<f64> {
+    let x = voted_input();
+    (0..4)
+        .map(|r| {
+            let row = &x[r * 256..(r + 1) * 256];
+            let most = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            if most > 0.0 { row.iter().sum() } else { most }
+        })
+        .collect()
+}
+
+/// The interpreter takes a branch on a vote as the block's one warp: the
+/// sums are found for every row and kept where the rows pass.
+#[test]
+fn a_branch_on_a_vote_keeps_the_otherwise_where_the_tile_is_clear() {
+    let (prog, _) = voted_rows();
+    let out = interp::run(&prog, vec![voted_input(), vec![0.0; 4]], &[]).unwrap();
+    assert_eq!(out[1], voted_want());
+}
+
+/// A branch on a vote is a warp's vote on each target, behind a compiler
+/// memory barrier; the kernel compiles where the toolchain is installed.
+#[test_case(amd(AmdArch::Gfx1201, 64), "call i32 @llvm.amdgcn.ballot.i32(i1"; "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40), "call i32 @llvm.amdgcn.ballot.i32(i1"; "gfx1151")]
+#[test_case(amd(AmdArch::Gfx942, 304), "call i64 @llvm.amdgcn.ballot.i64(i1"; "gfx942")]
+#[test_case(crate::atoms::sm86(), "call i1 @llvm.nvvm.vote.any.sync(i32 -1, i1"; "sm_86")]
+#[test_case(hopper(), "call i1 @llvm.nvvm.vote.any.sync(i32 -1, i1"; "sm_90")]
+fn a_branch_on_a_vote_lowers_to_the_warps_vote(target: Target, vote: &str) {
+    let (prog, grid) = voted_rows();
+    let device = declared(target.clone());
+    let ir = render(prog, &Lowering::uniform(&device, false, grid));
+    let (pin, at) = (ir.find(r#"asm sideeffect "", "~{memory}"()"#), ir.find(vote));
+    assert!(pin.zip(at).is_some_and(|(p, v)| p < v), "a pinned vote:\n{ir}");
+    assert_eq!(ir.matches(vote).count(), 1, "one vote:\n{ir}");
+    if let GpuArch::Amd(arch) = target.arch {
+        match svod_runtime::amd::compile_ir_to_amd_object(&ir, arch) {
+            Ok(object) => assert_eq!(&object[..4], b"\x7fELF"),
+            Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
+                eprintln!("skipped: {e}");
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+/// On the device the warps whose rows all fail skip the sums and keep their
+/// maxima; the others take them: the interpreter's numbers exactly.
+#[test]
+fn a_branch_on_a_vote_matches_the_interpreter_on_the_device() {
+    let Some(target) = super::device_target() else { return };
+    let (prog, grid) = voted_rows();
+    let device = declared(target);
+    let got = on_device(prog, &Lowering::uniform(&device, false, grid), &[voted_input(), vec![0.0; 4]]);
+    assert_eq!(got[1].as_deref(), Some(&voted_want()[..]));
+}
+
+/// The labels the conditional branches on a vote mask in `asm` jump to
+/// (`s_cbranch_vccz`/`vccnz`, the vote's mask in VCC), and whether a global
+/// load lies between each such label and the next barrier: the next step's
+/// loads sunk past the branch, waited on before the commit.
+fn loads_sunk_past_a_vote(asm: &str) -> Vec<(String, bool)> {
+    let lines: Vec<&str> = asm.lines().map(str::trim).filter(|l| !l.starts_with(';')).collect();
+    let targets = lines.iter().filter_map(|l| {
+        let rest = l.strip_prefix("s_cbranch_vccz ").or_else(|| l.strip_prefix("s_cbranch_vccnz "))?;
+        Some(rest.trim().to_string())
+    });
+    targets
+        .map(|label| {
+            let head = lines.iter().position(|l| l.starts_with(&format!("{label}:"))).expect("a branch target");
+            let block = lines[head + 1..].iter().take_while(|l| !l.starts_with("s_barrier"));
+            let sunk = block.clone().any(|l| l.starts_with("global_load"));
+            (label, sunk)
+        })
+        .collect()
+}
+
+/// A resident nearest kernel's steady trip issues the next step's global
+/// loads before its products and branches on a vote after them; the loads
+/// are used only past the branch, and without the vote's memory barrier the
+/// backend sinks them there, where the commit waits on them at once. They
+/// stay at the head of the trip.
+#[test_case(AmdArch::Gfx1201; "gfx1201")]
+#[test_case(AmdArch::Gfx1151; "gfx1151")]
+fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
+    use crate::kernels::nearest::NearestCfg;
+    let device = declared(amd(arch, 64));
+    let cfg = NearestCfg { warp_rows: 32, ..NearestCfg::new(128, 16, 2) };
+    let spec = NearestSpec {
+        n: 32768,
+        m: 32768,
+        d: 256,
+        metric: Metric::NegDot,
+        floors: Floors::default(),
+        groups: false,
+        cfg,
+    };
+    let ir = render(nearest::<BF16>(&spec), &cfg.lowering(&device));
+    let asm = match svod_runtime::amd::compile_ir_to_amd_asm(&ir, arch) {
+        Ok(asm) => String::from_utf8(asm).unwrap(),
+        Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
+            eprintln!("skipped: {e}");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
+    let votes = loads_sunk_past_a_vote(&asm);
+    assert!(!votes.is_empty(), "a branch on a vote:\n{asm}");
+    assert!(votes.iter().all(|(_, sunk)| !sunk), "{votes:?}:\n{asm}");
+}

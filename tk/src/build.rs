@@ -657,6 +657,30 @@ impl Kernel {
         merged.expect("both branches ran").map(Tile::new)
     }
 
+    /// `where_(pred, then(k), otherwise)` for each pair of tiles, `then` run
+    /// only by the warps holding some set element of `pred` ([`Scalar::Any`]):
+    /// work most warps skip where `pred` is mostly clear. `then` must hold
+    /// no block barrier.
+    pub fn where_any<T: Elem, const N: usize>(
+        &mut self,
+        pred: Regs<Bool>,
+        then: impl FnOnce(&mut Self) -> [Regs<T>; N],
+        otherwise: [Regs<T>; N],
+    ) -> [Regs<T>; N] {
+        let any = self.scalar(Scalar::Any(pred.0));
+        self.select_if(
+            any,
+            |k| {
+                let mut taken = then(k).into_iter().zip(otherwise);
+                [(); N].map(|()| {
+                    let (t, o) = taken.next().expect("a tile per output");
+                    k.where_(pred, t, o)
+                })
+            },
+            |_| otherwise,
+        )
+    }
+
     /// A barrier across the block's warps, and a fence of its shared memory;
     /// block-wide even inside [`Self::each_warp`].
     pub fn barrier(&mut self) {

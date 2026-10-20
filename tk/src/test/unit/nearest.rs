@@ -265,17 +265,68 @@ fn rows_without_a_candidate_score_infinity_at_minus_one() {
 }
 
 /// Equal scores in different trips and in one trip resolve to the smallest
-/// index: every candidate repeats one row, so each row's least is everywhere.
-#[test_case(16; "a trip per pair of candidates")]
-#[test_case(64; "every candidate in one trip")]
-fn ties_resolve_to_the_smallest_index(bkv: usize) {
-    let mut case = Case::draw(30, 50, 8, draw(Metric::SquaredL2, NONE, None, true, false), 2);
+/// index: every candidate repeats one row, so each row's least is everywhere
+/// (under the inner product, of either sign).
+#[test_case(16, Metric::SquaredL2; "a trip per pair of candidates")]
+#[test_case(64, Metric::SquaredL2; "every candidate in one trip")]
+#[test_case(16, Metric::NegDot; "signed scores a trip per pair of candidates")]
+#[test_case(64, Metric::NegDot; "signed scores in one trip")]
+fn ties_resolve_to_the_smallest_index(bkv: usize, metric: Metric) {
+    let mut case = Case::draw(30, 50, 8, draw(metric, NONE, None, true, false), 2);
     for j in 1..case.m {
         case.c.copy_within(0..case.d, j * case.d);
+    }
+    if metric == Metric::NegDot {
+        let (best, _) = case.reference();
+        assert!(best.iter().any(|s| *s < 0.0) && best.iter().any(|s| *s > 0.0), "scores of both signs: {best:?}");
     }
     let (score, index) = case.interpreted(NearestCfg::new(16, bkv, 2));
     assert!(index.iter().all(|i| *i == 0.0), "{index:?}");
     case.check("ties", &score, &index, 0.0, true);
+}
+
+/// Where a row's least falls among the candidates: in the last one, each
+/// candidate scoring below every earlier one (every trip lowers every row's
+/// least); in the first one, the rest scoring above it (no trip after the
+/// first lowers it); everywhere at once, every candidate alike.
+#[derive(Clone, Copy, Debug)]
+enum Order {
+    Falling,
+    Rising,
+    Flat,
+}
+
+/// Rows `x_i = (1 + i mod 3, …)` against candidates `c_j = (v_j, …)` of small
+/// integers in `order`, every other entry a small integer too: the inner
+/// products are exact and their order is `order`'s whatever the row.
+fn ordered(n: usize, m: usize, d: usize, order: Order) -> Case {
+    let mut case = Case::draw(n, m, d, draw(Metric::NegDot, NONE, None, true, false), 5);
+    for i in 0..n {
+        case.x[i * d] = 1.0 + (i % 3) as f64;
+        case.x[i * d + 1..(i + 1) * d].fill(0.0);
+    }
+    for j in 0..m {
+        case.c[j * d] = match order {
+            Order::Falling => (j + 1) as f64,
+            Order::Rising => (m - j) as f64,
+            Order::Flat => 7.0,
+        };
+    }
+    case
+}
+
+/// The least is found and placed whichever trip lowers it: every trip, the
+/// first alone, or the first with every later one tying it.
+#[test_case(Order::Falling, 200; "the last candidate")]
+#[test_case(Order::Rising, 0; "the first candidate")]
+#[test_case(Order::Flat, 0; "every candidate alike")]
+fn the_trip_that_lowers_a_row_places_its_least(order: Order, want: usize) {
+    let case = ordered(40, 201, 16, order);
+    for cfg in [NearestCfg::new(32, 16, 2), NearestCfg::new(16, 64, 1), NearestCfg::streamed(32, 32, 16, 2)] {
+        let (score, index) = case.interpreted(cfg);
+        assert!(index.iter().all(|&i| i == want as f64), "{cfg:?}: {index:?}");
+        case.check(&format!("{cfg:?}"), &score, &index, 0.0, true);
+    }
 }
 
 /// A floor above every score ties a row's candidates: the first one wins,
@@ -315,6 +366,40 @@ fn nearest_matches_on_device(n: usize, m: usize, d: usize, draw: Draw) {
         case.check(&format!("{cfg:?}"), &score, &index, 1e-3, draw.integer);
         let same = index.iter().zip(&want_index).filter(|(a, b)| a == b).count();
         eprintln!("{cfg:?}: {same} of {n} indices as interpreted");
+    }
+}
+
+/// A resident trip finds its least's column only in the warps it lowers some
+/// row of, by a vote; a streamed tile, folded once per depth pipeline, finds
+/// it straight.
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), "@llvm.amdgcn.ballot.i32("; "gfx1201")]
+#[test_case(crate::atoms::sm86(), "@llvm.nvvm.vote.any.sync("; "sm_86")]
+fn a_resident_trip_votes_before_it_places_its_least(target: Target, vote: &str) {
+    let device = crate::sweep::declared(target);
+    let case = |cfg| NearestSpec { n: 300, m: 500, d: 64, metric: Metric::NegDot, floors: NONE, groups: false, cfg };
+    for (cfg, votes) in [(NearestCfg::new(64, 32, 2), true), (NearestCfg::streamed(64, 32, 32, 2), false)] {
+        let ir = crate::sweep::render(nearest::<BF16>(&case(cfg)), &cfg.lowering(&device));
+        assert_eq!(ir.contains(vote), votes, "{cfg:?}");
+    }
+}
+
+/// [`the_trip_that_lowers_a_row_places_its_least`] for every config of the
+/// first eight tiles ranked on the device, where warps whose rows no trip
+/// lowers skip finding the least's column: exactly the reference's index.
+#[test_case(Order::Falling; "the last candidate")]
+#[test_case(Order::Rising; "the first candidate")]
+#[test_case(Order::Flat; "every candidate alike")]
+fn the_trip_that_lowers_a_row_places_its_least_on_device(order: Order) {
+    let Some(planner) = super::device_planner() else { return };
+    for d in [16, 512] {
+        let case = ordered(150, 230, d, order);
+        let ranked = planner.nearest_ranked(case.n, case.m, d, Metric::NegDot, NONE, false);
+        for cfg in first_eight(&ranked) {
+            let prog = nearest::<BF16>(&case.spec(d, cfg));
+            let mut outs = super::targets::on_device(prog, &cfg.lowering(&planner.device), &case.params(d));
+            let (index, score) = (outs.pop().flatten().unwrap(), outs.pop().flatten().unwrap());
+            case.check(&format!("{cfg:?}"), &score, &index, 0.0, true);
+        }
     }
 }
 

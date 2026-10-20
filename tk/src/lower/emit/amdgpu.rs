@@ -119,6 +119,17 @@ pub(super) fn dpp_xor(value: &Arc<UOp>, mask: u32) -> Arc<UOp> {
     back(word)
 }
 
+/// The lanes of a `wave`-lane wave where `lane` holds, as a mask: an
+/// integer of the wave's width, uniform over its lanes.
+pub(super) fn ballot(lane: &Arc<UOp>, wave: u32) -> Arc<UOp> {
+    let (bits, dtype) = if wave == 64 { (64, DType::Int64) } else { (32, DType::Int32) };
+    UOp::custom(
+        smallvec![lane.clone()],
+        format!("declare i{bits} @llvm.amdgcn.ballot.i{bits}(i1)\ncall i{bits} @llvm.amdgcn.ballot.i{bits}(i1 {{0}})"),
+        dtype,
+    )
+}
+
 /// An f32 `2^x` as the hardware instruction alone (`v_exp_f32`).
 pub(super) fn exp2_f32(x: &Arc<UOp>) -> Arc<UOp> {
     UOp::custom(
