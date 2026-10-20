@@ -212,22 +212,22 @@ fn row_drift(got: &[f32], want: &[f32], mask: &[i64], l: usize, d: usize) -> Vec
 
 /// The 16-bit backbone against the f32 golden, bounded by PyTorch's own bf16
 /// drift on the same rows (`convert_modernbert.py --long --long-length L`: a
-/// full row and a 27-token one right-padded to `L`; 500 pads the attention to its
-/// tile and leaves the GEMMs off theirs, 512 is on both). Four paths: the eager
-/// forward and the JIT with its batch pinned (flash attention, the local layers
-/// banded, tk's GEMMs where the rows tile), the JIT with its batch free (SDPA,
-/// the generic GEMMs), and the full row alone with no mask (the attention masks
-/// its own tile padding, if any). Each row's mean drift, and its 95th-percentile
-/// token, stays within a quarter over the worst of PyTorch's bf16 paths on that
-/// row — SDPA and eager on the CPU and on CUDA, batched and each row alone. They
-/// differ by rounding alone, yet on the full row at 512 one lands at 1.61×
-/// another's p95, so a single run is no yardstick; svod's own tile and kernel
-/// choices spread as wide and reach PyTorch's worst, and a seventh draw from one
-/// spread passes six draws' worst one time in seven — hence the quarter. Not the
-/// single worst token either: a few tokens amplify bf16 rounding chaotically
-/// (0.8 mean |Δ| on one of the 512), and which ones blow up differs by path. The
-/// control — the same forward ignoring the padding — must break the short row's
-/// bound, or the bound proves nothing.
+/// full row and a 27-token one right-padded to `L`; 500 leaves the attention and
+/// the GEMMs a partial tile, 512 none). Four paths, all on tk's op layer (flash
+/// attention with the local layers banded and the padding as its key mask, tk's
+/// GEMMs): the eager forward, the JIT with its batch pinned, the JIT with its
+/// batch free, and the full row alone with no mask (the attention masks the keys
+/// its last block overhangs, if any). Each row's mean drift, and its
+/// 95th-percentile token, stays within a quarter over the worst of PyTorch's
+/// bf16 paths on that row — SDPA and eager on the CPU and on CUDA, batched and
+/// each row alone. They differ by rounding alone, yet on the full row at 512 one
+/// lands at 1.61× another's p95, so a single run is no yardstick; svod's own
+/// tile and kernel choices spread as wide and reach PyTorch's worst, and a
+/// seventh draw from one spread passes six draws' worst one time in seven —
+/// hence the quarter. Not the single worst token either: a few tokens amplify
+/// bf16 rounding chaotically (0.8 mean |Δ| on one of the 512), and which ones
+/// blow up differs by path. The control — the same forward ignoring the padding
+/// — must break the short row's bound, or the bound proves nothing.
 #[test_case::test_case(500; "ragged")]
 #[test_case::test_case(512; "tile aligned")]
 #[ignore = "heavy: real ModernBERT-base weights + the long PyTorch golden, on a bf16 GPU"]
@@ -295,7 +295,7 @@ fn bf16_drift_tracks_pytorch_bf16(length: usize) {
         assert!(got.iter().all(|x| x.is_finite()), "{name}: non-finite output");
         paths.push((name, row_drift(&got, &want, &mask, l, d)));
     }
-    // The full row alone and unmasked: the attention masks its own tile padding.
+    // The full row alone and unmasked: the attention masks the keys its last block overhangs.
     let row = Tensor::from_slice(&ids[..l]).try_reshape([1, l as isize]).unwrap();
     let alone = model.forward(&row, None).expect("forward").cast(DType::Float32);
     alone.realize().expect("realize");
