@@ -540,7 +540,7 @@ fn contenders_run_the_later_rounds(runs: &[&[u64]], losers: usize, want_calls: &
     use std::cell::RefCell;
     let runs: Vec<&[u64]> = runs.iter().copied().chain(std::iter::repeat_n(&[1000][..], losers)).collect();
     let calls = RefCell::new(vec![0usize; runs.len()]);
-    let got = tune::rounds(runs.len(), |i| {
+    let got = tune::rounds(runs.len(), None, |i, _| {
         let mut calls = calls.borrow_mut();
         let run = runs[i].get(calls[i]).or(runs[i].last()).copied();
         calls[i] += 1;
@@ -552,6 +552,56 @@ fn contenders_run_the_later_rounds(runs: &[&[u64]], losers: usize, want_calls: &
     let calls = calls.borrow();
     assert_eq!(calls[..want_calls.len()], *want_calls);
     assert!(calls[want_calls.len()..].iter().all(|&c| c == 1), "{calls:?}");
+}
+
+/// Under a hopeless factor of 2, a candidate's first run past twice the
+/// best time so far is its time (its settled runs skipped, `aborted`), and
+/// a short list's later rounds leave out what sits past twice the first
+/// round's best: candidates are `(first run, settled)`, the first
+/// candidate is never cut short (there is no time before it), the bar is
+/// the best so far, not the first candidate's, and a run at the bar runs on.
+#[test_case(&[(100, 100), (300, 250), (110, 105)], &[4, 1, 4], &[false, true, false], &[100, 300, 105]; "a slow first run stops")]
+#[test_case(&[(500, 500), (100, 100)], &[1, 4], &[false, false], &[500, 100]; "the first candidate runs whole")]
+#[test_case(&[(100, 100), (150, 90), (190, 190)], &[4, 4, 1], &[false, false, true], &[100, 90, 190]; "the bar is the best so far")]
+#[test_case(&[(100, 100), (200, 199)], &[4, 4], &[false, false], &[100, 199]; "a run at the bar runs on")]
+#[test_case(&[(100, 100), (150, 250)], &[4, 1], &[false, false], &[100, 250]; "a settled time past the bar runs no later round")]
+fn hopeless_candidates_stop_at_their_first_run(
+    runs: &[(u64, u64)],
+    want_calls: &[usize],
+    want_aborted: &[bool],
+    want: &[u64],
+) {
+    use std::cell::RefCell;
+    let (calls, aborted) = (RefCell::new(vec![0usize; runs.len()]), RefCell::new(vec![false; runs.len()]));
+    let got = tune::rounds(runs.len(), Some(2.0), |i, bar| {
+        let (first, settled) = runs[i];
+        let mut calls = calls.borrow_mut();
+        calls[i] += 1;
+        if calls[i] == 1 && bar.is_some_and(|bar| Duration::from_nanos(first) > bar) {
+            aborted.borrow_mut()[i] = true;
+            return Some(Duration::from_nanos(first));
+        }
+        Some(Duration::from_nanos(settled))
+    });
+    let got: Vec<u64> = got.iter().map(|t| t.expect("a time").as_nanos() as u64).collect();
+    assert_eq!(got, want);
+    assert_eq!(*calls.borrow(), want_calls);
+    assert_eq!(*aborted.borrow(), want_aborted);
+}
+
+/// Without a hopeless factor nothing is cut short and a short list runs
+/// every round, however far behind (the probes' pairs, a probe at least
+/// twice its baseline, are timed so).
+#[test]
+fn without_a_hopeless_factor_every_candidate_runs_whole() {
+    let mut calls = vec![0; 2];
+    let got = tune::rounds(2, None, |i, bar| {
+        assert_eq!(bar, None);
+        calls[i] += 1;
+        Some(Duration::from_nanos([100, 1000][i]))
+    });
+    assert_eq!(got, [Some(Duration::from_nanos(100)), Some(Duration::from_nanos(1000))]);
+    assert_eq!(calls, [4, 4]);
 }
 
 /// A candidate's plan is prepared for its measurement alone: two scratch

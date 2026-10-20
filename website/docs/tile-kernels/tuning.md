@@ -5,7 +5,8 @@ sidebar_label: Tuning
 # Tuning
 
 Each op ranks its configs per shape in `ops::config` from the device's measured costs (see
-[Device costs](#device-costs)). The ranking is a model, and so is a register count, so neither
+[Device costs](#device-costs)), dropping the configs priced past 2.5× the cheapest once 16 tiles are
+kept (`config::PRUNED_PAST`): on sm_86 none of them ran within the contender band. The ranking is a model, and so is a register count, so neither
 admits a config. One rule does: the tuner compiles the ranked configs in batches of 64
 (`config::SHORTLIST`), in ranked order and in parallel, until it has the first 64 tiles whose
 compiled kernels do not spill (a kernel reporting scratch bytes spilled; a backend that reports
@@ -35,7 +36,7 @@ clocks down under real data is timed as it will run; integer operands hold zeros
 | Step | Setting |
 |---|---|
 | Warm-up | Back-to-back runs until the clock plateaus |
-| Rounds | One round of every candidate, then 3 more of the contenders: those within 1.2× of the first round's best (every candidate, under 16 of them); then 4 more of the two leaders, where more than two contenders ran |
+| Rounds | One round of every candidate in ranked order, where a candidate whose first timed run passes 2× the best so far keeps that run as its time; then 3 more of the contenders: those within 1.2× of the first round's best (within 2×, under 16 candidates); then 4 more of the two leaders, where more than two contenders ran |
 | Per round | 5 ms of device time in back-to-back sustain runs (at most 1024 launches, sized by the candidate's last run), then 5 profiled runs, keeping each candidate's minimum |
 | Time of a run | The sum of its kernels' GPU timestamps |
 

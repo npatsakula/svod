@@ -633,6 +633,50 @@ impl config::Tiled for Pipe {
     }
 }
 
+proptest::proptest! {
+    /// A ranking keeps every config within [`PRUNED_PAST`](config::PRUNED_PAST)
+    /// of the cheapest one's cost, and past it the configs ahead of the
+    /// [`KEPT_TILES`](config::KEPT_TILES)th tile kept, in ranked order: a
+    /// config dropped is past the factor with that many tiles ahead of it.
+    #[test]
+    fn a_ranking_drops_what_cannot_win(
+        costs in proptest::collection::vec((1.0f64..10.0, 0usize..24), 0..80),
+    ) {
+        let mut ranked: Vec<(f64, u32, Pipe)> =
+            costs.iter().enumerate().map(|(at, &(cost, tile))| (cost, 0, Pipe { at, tile })).collect();
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let all = ranked.clone();
+        config::prune(&mut ranked);
+        let reach = all.first().map_or(0.0, |c| c.0 * config::PRUNED_PAST);
+        let mut kept = ranked.iter().peekable();
+        let mut tiles = std::collections::HashSet::new();
+        for config in &all {
+            let ahead = tiles.len();
+            if kept.next_if(|k| k.2 == config.2).is_some() {
+                tiles.insert(config.2.tile);
+                proptest::prop_assert!(config.0 <= reach || ahead < config::KEPT_TILES, "{config:?} kept");
+            } else {
+                proptest::prop_assert!(config.0 > reach && ahead >= config::KEPT_TILES, "{config:?} dropped");
+            }
+        }
+        proptest::prop_assert!(kept.next().is_none(), "kept in ranked order");
+    }
+}
+
+/// A ranking of `tiles` tiles at costs `1, 1 + step, …`, one pipeline
+/// each, keeps the first [`KEPT_TILES`](config::KEPT_TILES) and those
+/// within [`PRUNED_PAST`](config::PRUNED_PAST) of the cheapest.
+#[test_case(4, 1.0 => 4; "a short ranking stays whole")]
+#[test_case(30, 1.0 => 16; "past the kept tiles the costly ones go")]
+#[test_case(30, 0.05 => 30; "a close ranking stays whole")]
+#[test_case(30, 0.06 => 26; "up to the factor of the cheapest")]
+fn a_ranking_keeps_its_cheapest_tiles(tiles: usize, step: f64) -> usize {
+    let mut ranked: Vec<(f64, u32, Pipe)> =
+        (0..tiles).map(|at| (1.0 + step * at as f64, 0, Pipe { at, tile: at })).collect();
+    config::prune(&mut ranked);
+    ranked.len()
+}
+
 /// The tuner's shortlist is the first [`SHORTLIST`] ranked configs whose
 /// compiled kernels do not spill, one per tile (its first clean pipeline),
 /// in ranked order, compiled in batches of as many until that many tiles

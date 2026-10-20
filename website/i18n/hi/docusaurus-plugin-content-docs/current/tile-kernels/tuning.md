@@ -5,7 +5,8 @@ sidebar_label: Tuning
 # Tuning {#tuning}
 
 हर op `ops::config` में अपने configs को हर shape के लिए device की मापी गई costs से rank करता है (देखें
-[Device costs](#device-costs))। Ranking एक model है, और register count भी, इसलिए दोनों में से कोई
+[Device costs](#device-costs)), और 16 tiles रख लेने के बाद सबसे सस्ते के 2.5× से महँगे configs छोड़ देता है
+(`config::PRUNED_PAST`): sm_86 पर उनमें से कोई contender band में नहीं चला। Ranking एक model है, और register count भी, इसलिए दोनों में से कोई
 config को admit नहीं करता। एक नियम करता है: tuner ranked configs को 64 के batches (`config::SHORTLIST`)
 में, ranked क्रम में और समानांतर रूप से compile करता है, जब तक उसे वे पहले 64 tiles न मिल जाएँ जिनके
 compiled kernels spill नहीं करते (spilled scratch bytes बताने वाला कर्नेल spill करता है; जो backend कुछ
@@ -37,7 +38,7 @@ variable अपने maximum पर bound होता है (float operands �
 | क़दम | सेटिंग |
 |---|---|
 | Warm-up | लगातार runs जब तक clock स्थिर न हो जाए |
-| Rounds | हर candidate का एक round, फिर contenders के 3 और: वे जो पहले round के सबसे अच्छे के 1.2× के भीतर हों (16 से कम हों तो हर candidate); फिर दो अग्रणियों के 4 और, जहाँ दो से ज़्यादा contenders चले हों |
+| Rounds | ranked क्रम में हर candidate का एक round, जिसमें जिस candidate का पहला timed run अब तक के सबसे अच्छे के 2× से ज़्यादा हो, उसका वही run उसका time रहता है; फिर contenders के 3 और: वे जो पहले round के सबसे अच्छे के 1.2× के भीतर हों (16 से कम candidates हों तो 2× के भीतर); फिर दो अग्रणियों के 4 और, जहाँ दो से ज़्यादा contenders चले हों |
 | हर round | लगातार sustain runs में 5 ms device time (अधिकतम 1024 launches, candidate के पिछले run के हिसाब से आकार), फिर 5 profiled runs, हर candidate का minimum रखते हुए |
 | एक run का समय | उसके कर्नेलों के GPU timestamps का जोड़ |
 

@@ -55,6 +55,13 @@ const CUT_FROM: usize = 16;
 /// time), and a shortlist is mostly losers. The twins stage keeps the tiles
 /// within it of the leader for the same reason.
 pub(crate) const CONTENDER: f64 = 1.2;
+/// Search bound: a candidate whose first run takes this factor of the best
+/// time so far is timed no further, and no later round of a short list
+/// runs it: it cannot win. The first timed run follows an untimed one, and
+/// over 908 candidates on sm_86 (nearest, the 4096³ GEMM) it sat within
+/// 0.93–1.15 of the candidate's settled time: one aborted settles past 1.7
+/// times the best.
+pub(crate) const HOPELESS: f64 = 2.0;
 /// Measurement: profiled runs per candidate per round.
 const RUNS: usize = 5;
 /// Measurement: device time of back-to-back runs ahead of each candidate's
@@ -648,15 +655,19 @@ impl<C: Copy + PartialEq> Bench<C> {
         batch.iter().map(verdict).collect()
     }
 
-    /// Each of `candidates`' best device time ([`time`]); those not compiled
-    /// yet compile from `programs`, theirs in order.
+    /// Each of `candidates`' best device time, timed in their order (the
+    /// ranking's, so a good time is soon the bar the [`HOPELESS`] ones miss);
+    /// those not compiled yet compile from `programs`, theirs in order.
     pub fn time(&mut self, candidates: &[C], programs: Vec<Candidate>) -> Vec<Option<u64>> {
         let mut programs: Vec<Option<Candidate>> = programs.into_iter().map(Some).collect();
         self.compile(candidates, |i| programs[i].take().expect("a candidate's programs"));
-        let (timed, mut built): (Vec<C>, Vec<&mut Built>) =
-            self.built.iter_mut().filter(|(c, _)| candidates.contains(c)).map(|(c, b)| (*c, b)).unzip();
-        let ns = time(&mut built);
-        candidates.iter().map(|c| ns[timed.iter().position(|t| t == c).expect("compiled")]).collect()
+        let at = |c: &C| candidates.iter().position(|t| t == c);
+        let mut built: Vec<(usize, &mut Built)> =
+            self.built.iter_mut().filter_map(|(c, b)| Some((at(c)?, b))).collect();
+        built.sort_by_key(|(i, _)| *i);
+        let (timed, mut built): (Vec<usize>, Vec<&mut Built>) = built.into_iter().unzip();
+        let ns = time_with(&mut built, Some(HOPELESS));
+        candidates.iter().map(|c| ns[timed.iter().position(|&t| Some(t) == at(c)).expect("compiled")]).collect()
     }
 }
 
@@ -680,6 +691,12 @@ static DEVICE: Mutex<()> = Mutex::new(());
 /// `None` where one failed to build or run. The device runs them one at a
 /// time, after the clock is lifted, under the process's one timing lock.
 pub(crate) fn time<B: BorrowMut<Built>>(built: &mut [B]) -> Vec<Option<u64>> {
+    time_with(built, None)
+}
+
+/// [`time`] through [`rounds`] under `hopeless`: a candidate whose first
+/// timed run passes that factor of the best so far keeps that run's time.
+fn time_with<B: BorrowMut<Built>>(built: &mut [B], hopeless: Option<f64>) -> Vec<Option<u64>> {
     let _device = DEVICE.lock().unwrap_or_else(PoisonError::into_inner);
     let plans: Vec<Option<Vec<&ExecutionPlan>>> = built
         .iter_mut()
@@ -701,42 +718,61 @@ pub(crate) fn time<B: BorrowMut<Built>>(built: &mut [B]) -> Vec<Option<u64>> {
     // A plan's last timed run sizes its sustain, one timed run first.
     let mut last: Vec<Vec<Option<Duration>>> =
         plans.iter().map(|p| vec![None; p.as_ref().map_or(0, Vec::len)]).collect();
-    let time = |i: usize| {
-        let plans = plans[i].as_ref()?;
+    let time = |i: usize, abort: Option<Duration>| {
+        let (plans, last) = (plans[i].as_ref()?, &mut last[i]);
+        for (plan, last) in plans.iter().zip(last.iter_mut()).filter(|(_, last)| last.is_none()) {
+            *last = Some(run(plan)?);
+        }
+        let first: Duration = last.iter().flatten().sum();
+        if abort.is_some_and(|abort| first > abort) {
+            return Some(first);
+        }
         plans
             .iter()
-            .zip(&mut last[i])
+            .zip(last.iter_mut())
             .map(|(plan, last)| {
-                let per_run = match *last {
-                    Some(t) => t,
-                    None => run(plan)?,
-                };
-                sustain(plan, SUSTAIN, per_run);
+                sustain(plan, SUSTAIN, last.expect("a timed run"));
                 let t = best((0..RUNS).map(|_| run(plan)))?;
                 *last = Some(t);
                 Some(t)
             })
             .sum::<Option<Duration>>()
     };
-    rounds(plans.len(), time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
+    rounds(plans.len(), hopeless, time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
 }
 
 /// Each candidate's minimum over the timed rounds: one round of every
 /// candidate, then [`ROUNDS`]` - 1` more ([`round_robin_min`]) of the
-/// [`CONTENDER`]s of the first round's best (of every candidate, under
-/// [`CUT_FROM`]), then, where more than two contenders ran them, [`ROUNDS`]
-/// more of the two leaders, whose gap is often within a round's drift (two
-/// contenders have run every round together already). `None` where a
+/// [`CONTENDER`]s of the first round's best (under [`CUT_FROM`], those
+/// within `hopeless` of it, else every candidate), then, where more than
+/// two contenders ran them, [`ROUNDS`] more of the two leaders, whose gap
+/// is often within a round's drift (two contenders have run every round
+/// together already). `time` times a candidate; in the first round its
+/// second argument is the bar, `hopeless` times the best time so far, past
+/// which the candidate's first run may stand as its time. `None` where a
 /// candidate failed to run.
-pub(crate) fn rounds(count: usize, mut time: impl FnMut(usize) -> Option<Duration>) -> Vec<Option<Duration>> {
-    let mut best = round_robin_min(count, 1, None, &mut time);
+pub(crate) fn rounds(
+    count: usize,
+    hopeless: Option<f64>,
+    mut time: impl FnMut(usize, Option<Duration>) -> Option<Duration>,
+) -> Vec<Option<Duration>> {
+    let mut lead: Option<Duration> = None;
+    let mut best = round_robin_min(count, 1, None, |i| {
+        let t = time(i, hopeless.zip(lead).map(|(k, lead)| lead.mul_f64(k)));
+        lead = t.map(|t| lead.map_or(t, |lead| lead.min(t))).or(lead);
+        t
+    });
     let Some(lead) = best.iter().flatten().min().copied() else { return best };
-    let bound = (count >= CUT_FROM).then(|| lead.mul_f64(CONTENDER));
+    let bound = if count >= CUT_FROM { Some(CONTENDER) } else { hopeless }.map(|k| lead.mul_f64(k));
     let contenders: Vec<usize> =
         (0..count).filter(|&i| best[i].is_some_and(|t| bound.is_none_or(|bound| t <= bound))).collect();
     tracing::debug!(first = ?best, ?contenders, "tuner's first round");
-    let again = |best: &mut Vec<Option<Duration>>, among: &[usize], rounds, bound, time: &mut dyn FnMut(usize) -> _| {
-        let more = round_robin_min(among.len(), rounds, bound, |j| time(among[j]));
+    let again = |best: &mut Vec<Option<Duration>>,
+                 among: &[usize],
+                 rounds,
+                 bound,
+                 time: &mut dyn FnMut(usize, Option<Duration>) -> _| {
+        let more = round_robin_min(among.len(), rounds, bound, |j| time(among[j], None));
         for (&i, more) in among.iter().zip(more) {
             best[i] = more.and_then(|m| best[i].map(|b| b.min(m)));
         }

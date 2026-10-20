@@ -211,20 +211,53 @@ pub enum Rejected {
 
 /// A ranking: its configs with their costs ([`Planner::pipelined`] ns of SM
 /// time) and registers by the layout count, cheapest first (then fewer
-/// registers), logged under [`crate::ops::PLAN`] with how many of the
-/// `spanned` configs it left out.
-fn sorted<C: Debug>(problem: &impl Debug, mut ranked: Vec<(f64, u32, C)>, spanned: usize) -> Vec<(f64, u32, C)> {
+/// registers) and [pruned](prune), logged under [`crate::ops::PLAN`] with how
+/// many of the `spanned` configs it left out.
+fn sorted<C: Tiled + Debug>(
+    problem: &impl Debug,
+    mut ranked: Vec<(f64, u32, C)>,
+    spanned: usize,
+) -> Vec<(f64, u32, C)> {
     ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let (admitted, rejected) = (ranked.len(), spanned - ranked.len());
-    tracing::debug!(target: crate::ops::PLAN, ?problem, admitted, rejected, "ranking");
+    let admitted = ranked.len();
+    prune(&mut ranked);
+    let (pruned, rejected) = (admitted - ranked.len(), spanned - admitted);
+    tracing::debug!(target: crate::ops::PLAN, ?problem, admitted, rejected, pruned, "ranking");
     for (rank, (ns, regs, cfg)) in ranked.iter().take(LOGGED).enumerate() {
         tracing::debug!(target: crate::ops::PLAN, rank, ns, regs, ?cfg, "ranked");
     }
     ranked
 }
 
+/// Drops the configs of `ranked` (cheapest first) past [`PRUNED_PAST`] times
+/// the cheapest one's cost once [`KEPT_TILES`] tiles are kept.
+pub(crate) fn prune<C: Tiled>(ranked: &mut Vec<(f64, u32, C)>) {
+    let Some(&(cheapest, ..)) = ranked.first() else { return };
+    let mut tiles = HashSet::new();
+    ranked.retain(|(cost, _, c)| {
+        let keep = *cost <= PRUNED_PAST * cheapest || tiles.len() < KEPT_TILES;
+        if keep {
+            tiles.insert(c.tile());
+        }
+        keep
+    });
+}
+
 /// Search bound: the configs of a ranking logged with their costs.
 const LOGGED: usize = 16;
+/// Search bound: a config this factor past the cheapest one's cost cannot
+/// win. Over the shortlists sm_86 timed (GEMMs from 1024³ to 8192²×768,
+/// attention, nearest from 8192² to 16384² at depths 128–1024) the measured
+/// best was predicted within 1.19 of the cheapest, every config within the
+/// tuner's contender band ([`crate::tune::CONTENDER`]) within 1.63, and no
+/// config ran faster than 0.52 of its predicted share: one predicted 2.5
+/// times the cheapest runs at least 1.3 times the best. Nearest's small
+/// candidate blocks run 3.5 to 6 times its best, seconds a launch at 65536²
+/// rows.
+pub(crate) const PRUNED_PAST: f64 = 2.5;
+/// Search bound: the tiles a ranking keeps whatever their cost, so a shortlist
+/// whose cheapest tiles fail to compile clean still holds some to time.
+pub(crate) const KEPT_TILES: usize = 16;
 
 /// How a problem runs under one config: `blocks` blocks of `waves` waves,
 /// each holding `smem` bytes of shared memory and `regs` registers a lane

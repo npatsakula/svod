@@ -572,3 +572,127 @@ fn a_swapped_product_folds_a_row_in_lanes(target: Target, direct: usize, swapped
     assert!(as_swapped.1.iter().zip(&as_direct.1).all(|(s, d)| s < d), "{:?} vs {:?}", as_swapped.1, as_direct.1);
     assert_eq!(folds(None), as_swapped, "as inferred");
 }
+
+/// Tuning wall time, the pick's throughput and predicted against measured
+/// ns per timed config: nearest NegDot at `TUNE_ROWS` (16384) squared by
+/// `TUNE_DEPTHS` (256,512,768,1024), the GEMMs `TUNE_GEMMS` (`MxNxK,…`,
+/// 4096³) and the attentions `TUNE_ATTN` (`batch:heads:t:d:causal,…`, none).
+/// Run on a store holding only the device's probes (its `value|probe:`
+/// lines), so every shape tunes cold; the predicted spread is what
+/// [`PRUNED_PAST`](crate::ops::config::PRUNED_PAST) is chosen from. Prints,
+/// never asserts (`--ignored --nocapture --test-threads=1`).
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn tuning_probe() {
+    use crate::kernels::Batch;
+    use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
+    use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+    use crate::ops::config::{Attention, Nearest as Problem, Problem as Gemm};
+    let var = |name| std::env::var(name).ok();
+    let list = |name, default: &str| -> Vec<Vec<usize>> {
+        let text = var(name).unwrap_or(default.into());
+        text.split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(['x', ':']).map(|v| v.parse().unwrap()).collect())
+            .collect()
+    };
+    let rows: usize = var("TUNE_ROWS").map_or(16384, |v| v.parse().unwrap());
+    let depths: Vec<usize> = list("TUNE_DEPTHS", "256,512,768,1024").concat();
+    let Some(planner) = super::device_planner() else { return };
+    fn report<C: crate::ops::config::Tiled + std::fmt::Debug>(
+        planner: &Planner,
+        name: String,
+        (op, shape, salt): (&'static str, &[usize], impl std::fmt::Debug),
+        ranked: &[C],
+        build: impl Fn(C) -> crate::tune::Candidate,
+        predicted: impl Fn(&C) -> f64,
+        work: f64,
+    ) {
+        let start = std::time::Instant::now();
+        let store = crate::tune::TuneStore::global();
+        let mut tuner = crate::ops::Tuner::new(store, &planner.device, DType::BFloat16, shape, salt, &build);
+        let admitted = tuner.admitted(op, &crate::ops::config::representatives(ranked));
+        let ordered = tuner.ordered(op, &admitted);
+        let pick = tuner.pipelined(op, &ordered, ranked);
+        let wall = start.elapsed().as_secs_f64();
+        let [ns] = super::measure([build(pick)])[..] else { unreachable!() };
+        let rate =
+            ns.map_or("failed".into(), |ns| format!("{:.3} ms {:.2} TFLOP/s", ns as f64 / 1e6, work / ns as f64 / 1e3));
+        eprintln!("== {name}: tuning {wall:.2} s, {} admitted, pick {rate} {pick:?}", admitted.len());
+        let best_pred = admitted.iter().map(&predicted).fold(f64::INFINITY, f64::min);
+        let best_meas = ordered.iter().filter_map(|o| o.1).min().unwrap_or(1) as f64;
+        for c in &admitted {
+            let meas = ordered.iter().find(|(o, _)| o == c).and_then(|o| o.1);
+            let m = meas.map_or("-".into(), |m| format!("{:.3}", m as f64 / best_meas));
+            let p = predicted(c);
+            eprintln!(
+                "  pred {:7.3} meas {m:>7} {:10.3} ms pred {:10.3} ms {c:?}",
+                p / best_pred,
+                meas.unwrap_or(0) as f64 / 1e6,
+                p / 1e6
+            );
+        }
+    }
+    crate::tune::scoped(true, || {
+        for d in depths {
+            let (n, metric, floors) = (rows, Metric::NegDot, NONE);
+            let ranked = planner.nearest_ranked(n, n, d, metric, floors, false);
+            let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups: false, cfg };
+            let build = |cfg: NearestCfg| vec![(nearest::<BF16>(&spec(cfg)), cfg.lowering(&planner.device))];
+            let p = Problem { n, m: n, d, metric, floors, groups: false };
+            let salt = (crate::ops::DEVICE_TEST, metric, floors, false);
+            let name = format!("nearest {n}x{n}x{d} {metric:?}");
+            let work = 2.0 * (n * n * d) as f64;
+            report(
+                &planner,
+                name,
+                ("nearest", &[n, n, d], salt),
+                &ranked,
+                build,
+                |c| p.admit(&planner, c).unwrap().0,
+                work,
+            );
+        }
+        for s in list("TUNE_GEMMS", "4096x4096x4096") {
+            let [m, n, k] = s[..] else { panic!("MxNxK") };
+            let ranked = planner.gemm_ranked(1, m, n, k, false);
+            let spec =
+                GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: super::device::BIG };
+            let build =
+                |cfg: GemmCfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+            let p = Gemm { batches: 1, m, n, k, halves: 1 };
+            let work = 2.0 * (m * n * k) as f64;
+            let key = ("gemm", &[1, m, n, k][..], crate::ops::DEVICE_TEST);
+            report(
+                &planner,
+                format!("gemm {m}x{n}x{k}"),
+                key,
+                &ranked,
+                build,
+                |c| p.admit(&planner, c).unwrap().0,
+                work,
+            );
+        }
+        for s in list("TUNE_ATTN", "") {
+            let [batch, heads, t, d, causal] = s[..] else { panic!("batch:heads:t:d:causal") };
+            let mask = AttnMask { causal: causal == 1, ..AttnMask::default() };
+            let spec = super::attention::probe_spec(batch, heads, t, t, d, mask);
+            let ranked = planner.attention_ranked(batch * heads, t, t, d, mask.causal, false);
+            let build = |cfg: FaCfg| {
+                vec![(attention::<BF16>(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))]
+            };
+            let p = Attention { tiles: batch * heads, t, tk: t, d, causal: mask.causal, bias: false };
+            let work = 4.0 * (batch * heads * t * t * d) as f64 / if mask.causal { 2.0 } else { 1.0 };
+            let shape = [batch, t, t, heads, d];
+            report(
+                &planner,
+                format!("attention {s:?}"),
+                ("attention", &shape, mask),
+                &ranked,
+                build,
+                |c| p.admit(&planner, c).unwrap().0,
+                work,
+            );
+        }
+    });
+}
