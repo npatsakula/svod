@@ -945,3 +945,155 @@ fn tuning_probe() {
         }
     });
 }
+
+/// The 16-bit product against f64 on f32 vectors: per file of
+/// `NEAREST_VECTORS` (comma-separated; `u32 n, u32 d`, then `n·d` f32
+/// rows, a `<stem>.labels` of `n` i32 beside it optional), dtype (bf16,
+/// f16) and metric (NegDot, SquaredL2), the first `NEAREST_QUERIES` rows
+/// (2000) against the rest and the first `NEAREST_SELF` rows (20000)
+/// against themselves, one group a row. Per case: rows whose index is not
+/// f64's (smallest on ties); for those, f64's gap from the true neighbour
+/// (absolute and over the row's score deviation), the returned candidate's
+/// rank, how many lie within the first-order rounding bound of the two
+/// pairs, and, labelled, how many change the neighbour's label; the
+/// returned score's error against f64. `NEAREST_DUMP` writes each case's
+/// indices there (`<stem>_<case>_<dtype>_<metric>.i32`); untuned unless
+/// `NEAREST_TUNED` is set. Prints, never
+/// asserts (`--ignored --nocapture --test-threads=1`).
+#[test]
+#[ignore = "accuracy probe: needs a GPU and NEAREST_VECTORS"]
+fn nearest_precision_probe() {
+    use rayon::prelude::*;
+    let var = |name: &str| std::env::var(name).ok();
+    let Some(files) = var("NEAREST_VECTORS") else { return eprintln!("skipped: NEAREST_VECTORS unset") };
+    let queries: usize = var("NEAREST_QUERIES").map_or(2000, |v| v.parse().expect("NEAREST_QUERIES is a row count"));
+    let self_rows: usize = var("NEAREST_SELF").map_or(20000, |v| v.parse().expect("NEAREST_SELF is a row count"));
+    let dump = var("NEAREST_DUMP");
+    let tuned = var("NEAREST_TUNED").is_some();
+    if super::device_planner().is_none() {
+        return;
+    }
+    for path in files.split(',') {
+        let bytes = std::fs::read(path).expect("NEAREST_VECTORS names a readable file");
+        let word = |i: usize| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()) as usize;
+        let (rows, d) = (word(0), word(1));
+        let data: Vec<f32> = (0..rows * d).map(|i| f32::from_bits(word(2 + i) as u32)).collect();
+        let stem = path.strip_suffix(".bin").unwrap_or(path);
+        let labels: Option<Vec<i32>> = std::fs::read(format!("{stem}.labels"))
+            .ok()
+            .map(|b| b.as_chunks::<4>().0.iter().map(|&w| i32::from_le_bytes(w)).collect());
+        let name = std::path::Path::new(stem).file_name().unwrap().to_string_lossy().into_owned();
+        let q = queries.min(rows / 2);
+        let s = self_rows.min(rows);
+        for (case, xs, cs, own) in [("query", 0..q, q..rows, false), ("self", 0..s, 0..s, true)] {
+            let (n, m) = (xs.len(), cs.len());
+            let x64: Vec<f64> = data[xs.start * d..xs.end * d].iter().map(|&v| v as f64).collect();
+            let c64: Vec<f64> = data[cs.start * d..cs.end * d].iter().map(|&v| v as f64).collect();
+            let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f64>();
+            let sq = |v: &[f64]| (0..v.len() / d).map(|i| dot(&v[i * d..][..d], &v[i * d..][..d])).collect::<Vec<_>>();
+            let (x_sq, c_sq) = (sq(&x64), sq(&c64));
+            let score = |metric: Metric, i: usize, j: usize| {
+                let p = dot(&x64[i * d..][..d], &c64[j * d..][..d]);
+                if metric == Metric::NegDot { -p } else { x_sq[i] + c_sq[j] - 2.0 * p }
+            };
+            let tensor = |r: std::ops::Range<usize>| {
+                let t = Tensor::from_slice(&data[r.start * d..r.end * d]);
+                t.try_reshape([r.len() as isize, d as isize]).unwrap()
+            };
+            let (xt, ct) = (tensor(xs.clone()), tensor(cs.clone()));
+            let ids = Tensor::from_slice((0..n as i32).collect::<Vec<_>>());
+            for metric in [Metric::NegDot, Metric::SquaredL2] {
+                // f64's least per row, smallest index on ties; the row's score deviation.
+                let reference: Vec<(usize, f64, f64)> = (0..n)
+                    .into_par_iter()
+                    .map(|i| {
+                        let (mut best, mut at, mut sum, mut sum_sq) = (f64::INFINITY, 0, 0.0, 0.0);
+                        for j in (0..m).filter(|&j| !(own && j == i)) {
+                            let v = score(metric, i, j);
+                            (sum, sum_sq) = (sum + v, sum_sq + v * v);
+                            if v < best {
+                                (best, at) = (v, j);
+                            }
+                        }
+                        let k = (m - usize::from(own)) as f64;
+                        (at, best, (sum_sq / k - (sum / k).powi(2)).max(0.0).sqrt())
+                    })
+                    .collect();
+                for (dtype, scalar, u) in [
+                    (DType::BFloat16, ScalarDType::BFloat16, 2f64.powi(-8)),
+                    (DType::Float16, ScalarDType::Float16, 2f64.powi(-11)),
+                ] {
+                    let (x, c) = (xt.cast(dtype.clone()), if own { None } else { Some(ct.cast(dtype.clone())) });
+                    let c = c.as_ref().unwrap_or(&x);
+                    if case == "query" && metric == Metric::NegDot {
+                        let cast = host(&x);
+                        let off = (0..n * d).filter(|&k| cast[k] != round_to(scalar, x64[k])).count();
+                        eprintln!("{name} {dtype:?} cast: {off} of {} elements off round-to-nearest-even", n * d);
+                    }
+                    let opts = Nearest { metric, groups: own.then_some((&ids, &ids)), ..Nearest::default() };
+                    let (got_score, got_index) = crate::tune::scoped(tuned, || tk::nearest(&x, c, opts).unwrap());
+                    let (got_score, got_index) = (host(&got_score), host(&got_index));
+                    if let Some(dir) = &dump {
+                        let out: Vec<u8> = got_index.iter().flat_map(|&v| (v as i32).to_le_bytes()).collect();
+                        std::fs::write(format!("{dir}/{name}_{case}_{dtype:?}_{metric:?}.i32"), out).unwrap();
+                    }
+                    // The first-order bound on a pair's rounding error: inputs `u` each,
+                    // f32 sums over `d` terms and the epilogue's few roundings.
+                    let bound = |i: usize, j: usize| {
+                        let (a, b) = (&x64[i * d..][..d], &c64[j * d..][..d]);
+                        let abs = a.iter().zip(b).map(|(a, b)| (a * b).abs()).sum::<f64>();
+                        let e = (2.0 * u + u * u + d as f64 * 2f64.powi(-24)) * abs;
+                        match metric {
+                            Metric::NegDot => e,
+                            _ => {
+                                2.0 * e + (2.0 * u + u * u) * c_sq[j] + 2f64.powi(-22) * (x_sq[i] + c_sq[j] + 2.0 * abs)
+                            }
+                        }
+                    };
+                    let (mut wrong, mut within, mut flips) = (vec![], 0, 0);
+                    let mut err: Vec<f64> = vec![];
+                    for i in 0..n {
+                        let (at, best, dev) = reference[i];
+                        let j = got_index[i] as usize;
+                        err.push((got_score[i] - score(metric, i, j)).abs());
+                        if j == at {
+                            continue;
+                        }
+                        let gap = score(metric, i, j) - best;
+                        within += usize::from(gap <= bound(i, j) + bound(i, at));
+                        if let Some(l) = &labels {
+                            flips += usize::from(l[cs.start + j] != l[cs.start + at]);
+                        }
+                        wrong.push((i, gap, gap / dev.max(f64::MIN_POSITIVE)));
+                    }
+                    let ranks: Vec<usize> = wrong
+                        .par_iter()
+                        .map(|&(i, ..)| {
+                            let s = score(metric, i, got_index[i] as usize);
+                            1 + (0..m).filter(|&j| !(own && j == i) && score(metric, i, j) < s).count()
+                        })
+                        .collect();
+                    let stat = |mut v: Vec<f64>| {
+                        v.sort_by(f64::total_cmp);
+                        match v.len() {
+                            0 => "-".to_string(),
+                            k => format!("{:.2e}/{:.2e}/{:.2e}", v[k / 2], v[k * 99 / 100], v[k - 1]),
+                        }
+                    };
+                    let rms = (err.iter().map(|e| e * e).sum::<f64>() / n as f64).sqrt();
+                    let labelled = labels.as_ref().map_or(String::new(), |_| format!(" label flips {flips}"));
+                    eprintln!(
+                        "{name} d={d} {case} {n}x{m} {dtype:?} {metric:?}: wrong {} ({:.3} %), within bound {within}{labelled}; \
+                         gap p50/p99/max {} rel {}; rank {}; score err rms {rms:.2e} max {:.2e}",
+                        wrong.len(),
+                        100.0 * wrong.len() as f64 / n as f64,
+                        stat(wrong.iter().map(|w| w.1).collect()),
+                        stat(wrong.iter().map(|w| w.2).collect()),
+                        stat(ranks.into_iter().map(|r| r as f64).collect()),
+                        err.iter().copied().fold(0.0, f64::max),
+                    );
+                }
+            }
+        }
+    }
+}
