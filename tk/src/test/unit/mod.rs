@@ -148,7 +148,7 @@ pub(crate) fn tuned_on_device<C: crate::ops::config::Tiled + PartialEq + std::fm
     let mut tuner = crate::ops::Tuner::new(store, &planner.device, dtype, shape, salt, build);
     let candidates = expand(&tuner.admitted(op, &crate::ops::config::representatives(ranked)));
     let pick = (!candidates.is_empty()).then(|| {
-        let ordered = tuner.ordered(op, &candidates);
+        let ordered = tuner.ordered(op, &candidates, crate::tune::Pass::Screen);
         tuner.pipelined(op, &ordered, ranked)
     });
     (candidates, pick)

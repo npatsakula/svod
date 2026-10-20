@@ -38,8 +38,8 @@ variable अपने maximum पर bound होता है (float operands �
 | क़दम | सेटिंग |
 |---|---|
 | Warm-up | लगातार runs जब तक clock स्थिर न हो जाए |
-| Rounds | ranked क्रम में हर candidate का एक round, जिसमें जिस candidate का पहला timed run अब तक के सबसे अच्छे के 2× से ज़्यादा हो, उसका वही run उसका time रहता है; फिर contenders के 3 और: वे जो पहले round के सबसे अच्छे के 1.2× के भीतर हों (16 से कम candidates हों तो 2× के भीतर); फिर दो अग्रणियों के 4 और, जहाँ दो से ज़्यादा contenders चले हों |
-| हर round | लगातार sustain runs में 5 ms device time (अधिकतम 1024 launches, candidate के पिछले run के हिसाब से आकार), फिर 5 profiled runs, हर candidate का minimum रखते हुए |
+| Rounds | ranked क्रम में हर candidate का एक round, जिसमें जिस candidate का पहला timed run अब तक के सबसे अच्छे के 2× से ज़्यादा हो, उसका वही run उसका time रहता है; फिर contenders के 3 और: वे जो पहले round के सबसे अच्छे के 1.2× के भीतर हों (8 से कम candidates हों तो 2× के भीतर), दूसरे round के बाद सिर्फ़ वे जो अब तक के सबसे अच्छे के 1.05× के भीतर हों, और बाद के rounds बारी-बारी से उल्टे और सीधे क्रम में चलते हैं ताकि हर candidate अपने दोनों पड़ोसियों के बाद चले; फिर दो अग्रणियों के 4 और, जहाँ दो से ज़्यादा contenders चले हों। tuning की पहली timing, जो सिर्फ़ अग्रणी tiles चुनती है, दूसरे round के बाद रुक जाती है: उन tiles को उनकी बाकी pipelines के साथ फिर से मापा जाता है |
+| हर round | candidate के programs के क्रम से लगातार sustain runs में 5 ms device time (अधिकतम 1024 launches, candidate के पिछले run के हिसाब से आकार), फिर हर program के 5 profiled runs, हर candidate का minimum रखते हुए |
 | एक run का समय | उसके कर्नेलों के GPU timestamps का जोड़ |
 
 Sustain का आकार device time में तय होता है क्योंकि launches asynchronously queue होते हैं। एक

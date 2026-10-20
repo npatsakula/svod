@@ -842,7 +842,10 @@ impl Planner {
     /// else whole, and the first whole as well, so a shape no split serves
     /// is timed (at 32768² rows and depth 768 on sm_86 every one of 36
     /// tiles ran faster split, 1.05–2.7 times, and timing both took 2.7
-    /// times as long to tune).
+    /// times as long to tune; at 16384² rows and depths 512–1024 the best
+    /// whole tile ran 8–12 % behind the best split on gfx1201, its unrolled
+    /// pipeline included, 10–12 % on sm_86 (depth 768) and 18–34 % on
+    /// gfx1151).
     pub fn nearest_splits(&self, n: usize, m: usize, d: usize, admitted: &[NearestCfg]) -> Vec<NearestCfg> {
         let split = |c: &NearestCfg| self.nearest_split(n, m, d, c).map(|splits| NearestCfg { splits, ..*c });
         let whole = |i: usize, c: &NearestCfg, split: bool| (!split || i == 0).then_some(*c);

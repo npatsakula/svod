@@ -34,7 +34,7 @@ pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
 use crate::atoms::{Device, Target};
 pub use crate::kernels::Act;
 use crate::kernels::Batch;
-use crate::tune::{self, Bench, TuneKey, TuneStore};
+use crate::tune::{self, Bench, Pass, TuneKey, TuneStore};
 use config::Planner;
 use shape::{BatchVar, Plan};
 
@@ -232,15 +232,17 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     }
 
     /// `candidates` in the order they ran by the global store under `op`,
-    /// fastest first, each with its device ns, timed on a miss; as given
-    /// and untimed when tuning is off, alone or nothing ran.
-    pub(crate) fn ordered(&mut self, op: &'static str, candidates: &[C]) -> Vec<(C, Option<u64>)> {
+    /// fastest first, each with its device ns, timed through `pass` on a
+    /// miss (a screen's order kept under its own key); as given and untimed
+    /// when tuning is off, alone or nothing ran.
+    pub(crate) fn ordered(&mut self, op: &'static str, candidates: &[C], pass: Pass) -> Vec<(C, Option<u64>)> {
         let untimed = || candidates.iter().map(|&c| (c, None)).collect();
         if !tune::enabled() || candidates.len() == 1 {
             return untimed();
         }
-        let key = self.key(op, candidates);
-        let Some(timed) = self.store.choose(&key, candidates, &self.build, &mut self.bench) else { return untimed() };
+        let key = self.keyed(op, if pass == Pass::Screen { " screened" } else { "" }, candidates);
+        let bench = &mut self.bench;
+        let Some(timed) = self.store.choose(&key, candidates, &self.build, bench, pass) else { return untimed() };
         let timed: Vec<(C, u64)> = timed.iter().map(|&(i, ns)| (candidates[i], ns)).collect();
         tracing::debug!(target: PLAN, op, shape = ?self.shape, ?timed, "choice");
         timed.into_iter().map(|(c, ns)| (c, Some(ns))).collect()
@@ -248,17 +250,18 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
 
     /// The fastest of `candidates` ([`Self::ordered`]).
     pub(crate) fn fastest(&mut self, op: &'static str, candidates: &[C]) -> C {
-        self.ordered(op, candidates)[0].0
+        self.ordered(op, candidates, Pass::Whole)[0].0
     }
 
     /// The candidate to launch: `expand` makes the admitted configs of
     /// `ranked`'s tile [representatives](config::Tiled::represents) the
     /// candidates (adding variants, such as key splits, the
-    /// plain one first), they are timed, and the fastest pipeline of the
-    /// leading tiles ([`Self::pipelined`]) is the choice.
+    /// plain one first), they are screened ([`Pass::Screen`]), and the
+    /// fastest pipeline of the leading tiles ([`Self::pipelined`], which
+    /// times them again) is the choice.
     pub(crate) fn tuned(&mut self, op: &'static str, ranked: &[C], expand: impl Fn(&[C]) -> Vec<C>) -> C {
         let candidates = expand(&self.admitted(op, &config::representatives(ranked)));
-        let ordered = self.ordered(op, &candidates);
+        let ordered = self.ordered(op, &candidates, Pass::Screen);
         let pick = self.pipelined(op, &ordered, ranked);
         tracing::debug!(target: PLAN, op, shape = ?self.shape, ?pick, "tuned");
         pick

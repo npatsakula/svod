@@ -139,18 +139,19 @@ fn a_gemm_tuning_reads_the_key_the_op_layer_writes(probe: bool) {
 }
 
 /// A store under `dir` holding a 512³ GEMM's admission, of the ranking's
-/// third and second representatives, and their choice, the second at 900 ns
-/// and the third at 2000 (outside the contender band); the planner and its
-/// ranking's representatives.
+/// third and second representatives, and their screened choice, the second
+/// at 900 ns and the third at 2000 (outside the contender band); the
+/// planner and its ranking's representatives.
 fn admitted_and_chosen(dir: &Path) -> (Planner, Arc<[GemmCfg]>, Vec<GemmCfg>) {
     let planner = super::planner(sm86());
     let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
     let reps = representatives(&ranked);
     let salt = format!("{:?}", (Batch::Static(1), Epilogue::DEFAULT));
-    let at = |list: &[GemmCfg]| {
-        TuneKey::new("linear", &sm86(), 0, ScalarDType::BFloat16, &[1, 512, 512, 512], &format!("{salt} {list:?}"))
+    let at = |rule: &str, list: &[GemmCfg]| {
+        let candidates = format!("{salt}{rule} {list:?}");
+        TuneKey::new("linear", &sm86(), 0, ScalarDType::BFloat16, &[1, 512, 512, 512], &candidates)
     };
-    let (admitted, candidates) = (at(&reps), at(&[reps[2], reps[1]]));
+    let (admitted, candidates) = (at("", &reps), at(" screened", &[reps[2], reps[1]]));
     write(
         dir,
         &admitted,

@@ -861,7 +861,7 @@ fn tuning_probe() {
         let store = crate::tune::TuneStore::global();
         let mut tuner = crate::ops::Tuner::new(store, &planner.device, DType::BFloat16, shape, salt, &build);
         let admitted = expand(&tuner.admitted(op, &crate::ops::config::representatives(ranked)));
-        let ordered = tuner.ordered(op, &admitted);
+        let ordered = tuner.ordered(op, &admitted, crate::tune::Pass::Screen);
         let pick = tuner.pipelined(op, &ordered, ranked);
         let wall = start.elapsed().as_secs_f64();
         let [ns] = super::measure([build(pick)])[..] else { unreachable!() };

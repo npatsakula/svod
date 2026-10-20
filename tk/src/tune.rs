@@ -44,17 +44,39 @@ pub(crate) const FORMAT: u32 = 5;
 /// candidate, the rest over the contenders), and the rounds the two leaders
 /// then run again ([`rounds`]).
 const ROUNDS: usize = 4;
+/// How far a timing goes ([`rounds`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pass {
+    /// Every round, then the leaders' rounds: the order is the choice.
+    Whole,
+    /// The first round and one more of its contenders: the order only
+    /// chooses what a later pass times again with the rest of its kind (a
+    /// tuning's leading tiles, whose pipelines the twins stage times with
+    /// them), and the rounds that would settle its leaders run there.
+    Screen,
+}
 /// Search bound: candidates from which the first round cuts the field to
 /// its [`CONTENDER`]s; fewer run every round, a cut saving little and a
 /// short list being what a decode step's splits or a coordinate descent
-/// ask, where the candidates sit within a few percent of each other.
-const CUT_FROM: usize = 16;
+/// ask, where the candidates sit within a few percent of each other. A
+/// list of 8 to 15 is a shortlist all the same (gfx1151 admits 15 tiles of
+/// a split nearest at depth 768, a third of them past 1.4 times the best).
+const CUT_FROM: usize = 8;
 /// Search bound: rounds past the first go to the candidates within this
 /// factor of the first round's best; the rest cannot win (a round's best of [`RUNS`] runs
 /// after a sustain sits within a few percent of the candidate's settled
 /// time), and a shortlist is mostly losers. The twins stage keeps the tiles
 /// within it of the leader for the same reason.
 pub(crate) const CONTENDER: f64 = 1.2;
+/// Search bound: rounds past the second go to the contenders within this
+/// factor of the best so far. Two rounds in, a candidate's best sits within
+/// a few percent of its settled time, and a flat field (a split nearest's
+/// tiles, the GEMM's twins) keeps most of its contenders through every
+/// round of a 1.2 band: replaying the rounds recorded on sm_86, gfx1201 and
+/// gfx1151 (nearest at depths 512–1024, the 4096³ GEMM, an attention; 27
+/// timed lists) under a cut at 1.02–1.08 moved no pick, and one at 1.05
+/// times a fourth fewer candidates.
+const SETTLED: f64 = 1.05;
 /// Search bound: a candidate whose first run takes this factor of the best
 /// time so far is timed no further, and no later round of a short list
 /// runs it: it cannot win. The first timed run follows an untimed one, and
@@ -512,13 +534,14 @@ impl TuneStore {
     /// device ns: the memo, then the store under the line the programs
     /// `build` makes fingerprint (each built once), else, on a store miss,
     /// those `bench` has not compiled are compiled and every candidate is
-    /// [`time`]d, their order stored.
+    /// [`time`]d through `pass`, their order stored.
     pub fn choose<C: Copy + PartialEq>(
         &self,
         key: &TuneKey,
         candidates: &[C],
         build: impl Fn(C) -> Candidate,
         bench: &mut Bench<C>,
+        pass: Pass,
     ) -> Option<Arc<[(usize, u64)]>> {
         let programs = || {
             let built: Vec<Candidate> = candidates.iter().map(|&c| build(c)).collect();
@@ -526,7 +549,7 @@ impl TuneStore {
         };
         let within =
             |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _)| i < candidates.len()));
-        let timed = |built| ordered(bench.time(candidates, built)).map(Entry::Choice);
+        let timed = |built| ordered(bench.time(candidates, built, pass)).map(Entry::Choice);
         match self.remember(Kind::Choice, key, within, programs, timed)? {
             Entry::Choice(timed) => Some(timed),
             _ => None,
@@ -658,7 +681,7 @@ impl<C: Copy + PartialEq> Bench<C> {
     /// Each of `candidates`' best device time, timed in their order (the
     /// ranking's, so a good time is soon the bar the [`HOPELESS`] ones miss);
     /// those not compiled yet compile from `programs`, theirs in order.
-    pub fn time(&mut self, candidates: &[C], programs: Vec<Candidate>) -> Vec<Option<u64>> {
+    pub fn time(&mut self, candidates: &[C], programs: Vec<Candidate>, pass: Pass) -> Vec<Option<u64>> {
         let mut programs: Vec<Option<Candidate>> = programs.into_iter().map(Some).collect();
         self.compile(candidates, |i| programs[i].take().expect("a candidate's programs"));
         let at = |c: &C| candidates.iter().position(|t| t == c);
@@ -666,7 +689,7 @@ impl<C: Copy + PartialEq> Bench<C> {
             self.built.iter_mut().filter_map(|(c, b)| Some((at(c)?, b))).collect();
         built.sort_by_key(|(i, _)| *i);
         let (timed, mut built): (Vec<usize>, Vec<&mut Built>) = built.into_iter().unzip();
-        let ns = time_with(&mut built, Some(HOPELESS));
+        let ns = time_with(&mut built, Some(HOPELESS), pass);
         candidates.iter().map(|c| ns[timed.iter().position(|&t| Some(t) == at(c)).expect("compiled")]).collect()
     }
 }
@@ -691,12 +714,13 @@ static DEVICE: Mutex<()> = Mutex::new(());
 /// `None` where one failed to build or run. The device runs them one at a
 /// time, after the clock is lifted, under the process's one timing lock.
 pub(crate) fn time<B: BorrowMut<Built>>(built: &mut [B]) -> Vec<Option<u64>> {
-    time_with(built, None)
+    time_with(built, None, Pass::Whole)
 }
 
-/// [`time`] through [`rounds`] under `hopeless`: a candidate whose first
-/// timed run passes that factor of the best so far keeps that run's time.
-fn time_with<B: BorrowMut<Built>>(built: &mut [B], hopeless: Option<f64>) -> Vec<Option<u64>> {
+/// [`time`] through [`rounds`] under `hopeless` and `pass`: a candidate
+/// whose first timed run passes that factor of the best so far keeps that
+/// run's time.
+fn time_with<B: BorrowMut<Built>>(built: &mut [B], hopeless: Option<f64>, pass: Pass) -> Vec<Option<u64>> {
     let _device = DEVICE.lock().unwrap_or_else(PoisonError::into_inner);
     let plans: Vec<Option<Vec<&ExecutionPlan>>> = built
         .iter_mut()
@@ -727,33 +751,41 @@ fn time_with<B: BorrowMut<Built>>(built: &mut [B], hopeless: Option<f64>) -> Vec
         if abort.is_some_and(|abort| first > abort) {
             return Some(first);
         }
+        sustain(plans, SUSTAIN, first);
         plans
             .iter()
             .zip(last.iter_mut())
             .map(|(plan, last)| {
-                sustain(plan, SUSTAIN, last.expect("a timed run"));
                 let t = best((0..RUNS).map(|_| run(plan)))?;
                 *last = Some(t);
                 Some(t)
             })
             .sum::<Option<Duration>>()
     };
-    rounds(plans.len(), hopeless, time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
+    rounds(plans.len(), hopeless, pass, time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
 }
 
 /// Each candidate's minimum over the timed rounds: one round of every
-/// candidate, then [`ROUNDS`]` - 1` more ([`round_robin_min`]) of the
-/// [`CONTENDER`]s of the first round's best (under [`CUT_FROM`], those
-/// within `hopeless` of it, else every candidate), then, where more than
+/// candidate, then [`ROUNDS`]` - 1` more of the [`CONTENDER`]s of the first
+/// round's best (under [`CUT_FROM`], those within `hopeless` of it, else
+/// every candidate), each round past the second left to those within
+/// [`SETTLED`] of the best (from [`CUT_FROM`]), then, where more than
 /// two contenders ran them, [`ROUNDS`] more of the two leaders, whose gap
 /// is often within a round's drift (two contenders have run every round
-/// together already). `time` times a candidate; in the first round its
+/// together already); a [`Pass::Screen`] stops after the second round.
+/// The first round runs in the given order, the later ones in turn
+/// backwards and forwards: a candidate runs slower after some others (on
+/// sm_86 a nearest tile ran 4 % slower after its tile's other pipelines than
+/// after a larger tile, timed in one order or the other), and its minimum
+/// over both neighbours' runs keeps that out of the choice.
+/// `time` times a candidate; in the first round its
 /// second argument is the bar, `hopeless` times the best time so far, past
 /// which the candidate's first run may stand as its time. `None` where a
 /// candidate failed to run.
 pub(crate) fn rounds(
     count: usize,
     hopeless: Option<f64>,
+    pass: Pass,
     mut time: impl FnMut(usize, Option<Duration>) -> Option<Duration>,
 ) -> Vec<Option<Duration>> {
     let mut lead: Option<Duration> = None;
@@ -767,23 +799,28 @@ pub(crate) fn rounds(
     let contenders: Vec<usize> =
         (0..count).filter(|&i| best[i].is_some_and(|t| bound.is_none_or(|bound| t <= bound))).collect();
     tracing::debug!(first = ?best, ?contenders, "tuner's first round");
-    let again = |best: &mut Vec<Option<Duration>>,
-                 among: &[usize],
-                 rounds,
-                 bound,
-                 time: &mut dyn FnMut(usize, Option<Duration>) -> _| {
-        let more = round_robin_min(among.len(), rounds, bound, |j| time(among[j], None));
-        for (&i, more) in among.iter().zip(more) {
-            best[i] = more.and_then(|m| best[i].map(|b| b.min(m)));
+    let (mut live, mut later) = (contenders.clone(), vec![None; count]);
+    let screened = pass == Pass::Screen;
+    for round in 1..if screened { 2 } else { ROUNDS } {
+        let order: Vec<usize> = if round % 2 == 1 { live.iter().rev().copied().collect() } else { live.clone() };
+        for &i in &order {
+            let t = time(i, None);
+            later[i] = t.map(|t| later[i].map_or(t, |l: Duration| l.min(t)));
+            best[i] = t.and_then(|t| best[i].map(|b| b.min(t)));
         }
-    };
-    again(&mut best, &contenders, ROUNDS - 1, bound, &mut time);
-    if contenders.len() > 2 {
+        let settled = best.iter().flatten().min().map(|lead| lead.mul_f64(SETTLED)).filter(|_| count >= CUT_FROM);
+        let near = |i: usize| best[i].is_some_and(|t| settled.is_none_or(|settled| t <= settled));
+        live.retain(|&i| later[i].is_some_and(|t| bound.is_none_or(|bound| t <= bound)) && near(i));
+    }
+    if contenders.len() > 2 && !screened {
         let mut leaders: Vec<usize> = (0..count).filter(|&i| best[i].is_some()).collect();
         leaders.sort_by_key(|&i| best[i]);
         leaders.truncate(2);
         if let [first, second] = leaders[..] {
-            again(&mut best, &leaders, ROUNDS, None, &mut time);
+            let more = round_robin_min(2, ROUNDS, None, |j| time(leaders[j], None));
+            for (&i, more) in leaders.iter().zip(more) {
+                best[i] = more.and_then(|m| best[i].map(|b| b.min(m)));
+            }
             tracing::debug!(leader = first, runner_up = second, times = ?(best[first], best[second]), "tuner's leaders");
         }
     }
@@ -859,14 +896,20 @@ pub(crate) fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPoo
     Some((out.prepare_with(&config).ok()?, vars))
 }
 
-/// Runs `plan` back to back, unsynchronized, for about `budget` of device
-/// time at `per_run` a run. Launches queue without waiting, so a spin of
-/// host time would queue a thousand runs of a short kernel and every timed
-/// run after it would wait for the queue to drain.
-fn sustain(plan: &ExecutionPlan, budget: Duration, per_run: Duration) {
+/// Runs a candidate's `plans` back to back, in order, unsynchronized, for
+/// about `budget` of device time at `per_run` a run of them all. Launches
+/// queue without waiting, so a spin of host time would queue a thousand
+/// runs of a short kernel and every timed run after it would wait for the
+/// queue to drain. The candidate is sustained whole, not each plan for the
+/// budget: a split's merge alone queued a thousand microsecond launches,
+/// and the candidates timed after it ran slow (on gfx1201 an unsplit
+/// nearest at depth 768 timed 106–110 TFLOP/s among split ones, 124–126
+/// alone or with each candidate sustained whole, so the tuner never chose
+/// it).
+fn sustain(plans: &[&ExecutionPlan], budget: Duration, per_run: Duration) {
     let launches = budget.as_nanos().div_ceil(per_run.as_nanos().max(1)).clamp(1, SUSTAIN_LAUNCHES);
     for _ in 0..launches {
-        if plan.execute().is_err() {
+        if plans.iter().any(|plan| plan.execute().is_err()) {
             break;
         }
     }

@@ -17,7 +17,7 @@ use crate::atoms::{Core, Device, sm86};
 use crate::build::BF16;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use crate::tune::{self, Bench, Entry, FORMAT, Kind, ScratchPool, TuneKey, TuneStore, fingerprint};
+use crate::tune::{self, Bench, Entry, FORMAT, Kind, Pass, ScratchPool, TuneKey, TuneStore, fingerprint};
 
 /// A host key: no device, so no compiler digest.
 fn key(shape: &[usize], candidates: &[usize]) -> TuneKey {
@@ -215,7 +215,7 @@ fn a_store_hit_compiles_nothing() {
     };
     let programs = fingerprint(&[gemm_programs(tiles[0]), gemm_programs(tiles[1])]);
     let mut bench = Bench::default();
-    let missed = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
+    let missed = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench, Pass::Whole);
     assert_eq!((builds.get(), bench.built.len()), (2, 2), "a miss builds and compiles each once");
     // Without a device that timed them, what it would have measured, stored
     // as a timing would; with one, its choice is already stored.
@@ -224,7 +224,7 @@ fn a_store_hit_compiles_nothing() {
     assert_eq!(stored, missed.or(Some(1)), "the device's choice, else the stored timing's");
     builds.set(0);
     let mut bench = Bench::default();
-    let hit = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench);
+    let hit = TuneStore::at(Some(dir.clone())).choose(&k, &[0, 1], build, &mut bench, Pass::Whole);
     assert_eq!((hit.map(|timed| timed[0].0), builds.get(), bench.built.len()), (stored, 2, 0));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -480,7 +480,7 @@ fn a_gemm_tunes_on_the_device() {
     let key = TuneKey::new("gemm", &device.target, tune::compiler(&spec), ScalarDType::BFloat16, &[1, m, n, k], &cfgs);
     let dir = scratch("device");
     let start = std::time::Instant::now();
-    let chosen = TuneStore::at(Some(dir.clone())).choose(&key, &cfgs, build, &mut Bench::default());
+    let chosen = TuneStore::at(Some(dir.clone())).choose(&key, &cfgs, build, &mut Bench::default(), Pass::Whole);
     let chosen = cfgs[chosen.expect("measured")[0].0];
     eprintln!("tuned {} candidates in {:.1} s: {chosen:?}", cfgs.len(), start.elapsed().as_secs_f64());
     let programs = || fingerprint(&cfgs.iter().map(|&c| build(c)).collect::<Vec<_>>());
@@ -517,15 +517,19 @@ fn workers_see_the_callers_device() {
 
 /// The timed rounds: every candidate runs once, then only those within
 /// [`CONTENDER`](tune::CONTENDER) of the first round's best run the rest
-/// ([`ROUNDS`] in all), or every candidate when there are fewer than
-/// [`CUT_FROM`](tune::CUT_FROM) (`losers` more at 1000 fill a field out);
-/// then, where more than two contenders ran them, the two leaders run
-/// [`ROUNDS`] more.
+/// ([`ROUNDS`] in all), past the second only those within
+/// [`SETTLED`](tune::SETTLED) of the best so far, or every candidate every
+/// round when there are fewer than [`CUT_FROM`](tune::CUT_FROM) (`losers`
+/// more at 1000 fill a field out); then, where more than two contenders ran
+/// them, the two leaders run [`ROUNDS`] more.
 /// A candidate that fails (a run of 0 here, its list run out) is excluded
 /// for good, whichever round it fails in; nothing running leaves every
 /// candidate `None`. A candidate's list repeats its last run.
-#[test_case(&[&[100], &[150], &[110], &[500]], 12, &[4, 1, 4, 1], &[Some(100), Some(150), Some(110), Some(500)]; "in a field losers run once and two contenders are the leaders")]
-#[test_case(&[&[100], &[115], &[110], &[500]], 12, &[8, 4, 8, 1], &[Some(100), Some(115), Some(110), Some(500)]; "in a field the leaders of three contenders run again")]
+#[test_case(&[&[100], &[150], &[110], &[500]], 12, &[4, 1, 2, 1], &[Some(100), Some(150), Some(110), Some(500)]; "in a field losers run once and an unsettled contender twice")]
+#[test_case(&[&[100], &[150], &[110], &[500]], 4, &[4, 1, 2, 1], &[Some(100), Some(150), Some(110), Some(500)]; "eight candidates are a field")]
+#[test_case(&[&[100], &[115], &[110], &[500]], 12, &[8, 2, 6, 1], &[Some(100), Some(115), Some(110), Some(500)]; "in a field the leaders of three contenders run again")]
+#[test_case(&[&[100], &[104], &[107], &[103, 103, 98]], 12, &[8, 3, 2, 8], &[Some(100), Some(104), Some(107), Some(98)]; "past the second round the settled contenders run on")]
+#[test_case(&[&[100], &[110, 104]], 14, &[4, 4], &[Some(100), Some(104)]; "a contender settles by its best after the round")]
 #[test_case(&[&[100], &[150], &[110], &[500]], 0, &[8, 4, 8, 4], &[Some(100), Some(150), Some(110), Some(500)]; "a short list runs every round")]
 #[test_case(&[&[100, 90, 95, 92], &[118, 121]], 14, &[4, 2], &[Some(90), Some(118)]; "past the bound a contender stops, its minimum standing")]
 #[test_case(&[&[100; 4], &[101; 4], &[150]], 0, &[8, 8, 4], &[Some(100), Some(101), Some(150)]; "the two leaders run again")]
@@ -537,10 +541,17 @@ fn workers_see_the_callers_device() {
 #[test_case(&[&[], &[]], 0, &[1, 1], &[None, None]; "nothing runs")]
 #[test_case(&[], 0, &[], &[]; "no candidates")]
 fn contenders_run_the_later_rounds(runs: &[&[u64]], losers: usize, want_calls: &[usize], want: &[Option<u64>]) {
+    scripted_rounds(runs, losers, Pass::Whole, want_calls, want);
+}
+
+/// [`tune::rounds`] under `pass` over candidates whose runs are scripted
+/// (`losers` more at 1000), checked against the times and the calls each
+/// gets, every loser's one.
+fn scripted_rounds(runs: &[&[u64]], losers: usize, pass: Pass, want_calls: &[usize], want: &[Option<u64>]) {
     use std::cell::RefCell;
     let runs: Vec<&[u64]> = runs.iter().copied().chain(std::iter::repeat_n(&[1000][..], losers)).collect();
     let calls = RefCell::new(vec![0usize; runs.len()]);
-    let got = tune::rounds(runs.len(), None, |i, _| {
+    let got = tune::rounds(runs.len(), None, pass, |i, _| {
         let mut calls = calls.borrow_mut();
         let run = runs[i].get(calls[i]).or(runs[i].last()).copied();
         calls[i] += 1;
@@ -552,6 +563,31 @@ fn contenders_run_the_later_rounds(runs: &[&[u64]], losers: usize, want_calls: &
     let calls = calls.borrow();
     assert_eq!(calls[..want_calls.len()], *want_calls);
     assert!(calls[want_calls.len()..].iter().all(|&c| c == 1), "{calls:?}");
+}
+
+/// The first round runs in the given order and the later ones backwards and
+/// forwards in turn, so each candidate runs after both its neighbours; the
+/// leaders' rounds alternate the two. A screen's second round runs backwards.
+#[test_case(Pass::Whole, &[0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1]; "every round")]
+#[test_case(Pass::Screen, &[0, 1, 2, 3, 3, 2, 1, 0]; "a screen")]
+fn later_rounds_alternate_their_order(pass: Pass, want: &[usize]) {
+    let mut order = vec![];
+    tune::rounds(4, None, pass, |i, _| {
+        order.push(i);
+        Some(Duration::from_nanos(100 + i as u64))
+    });
+    assert_eq!(order, want);
+}
+
+/// A screen runs the first round and one more of its contenders, and no
+/// leaders' rounds: a later pass times its leaders again. A short list's
+/// screen runs every candidate twice.
+#[test_case(&[&[100], &[150], &[110], &[500]], 12, &[2, 1, 2, 1], &[Some(100), Some(150), Some(110), Some(500)]; "a field")]
+#[test_case(&[&[100], &[103, 101], &[104], &[500]], 12, &[2, 2, 2, 1], &[Some(100), Some(101), Some(104), Some(500)]; "a field of settled contenders")]
+#[test_case(&[&[100], &[150], &[110], &[500]], 0, &[2, 2, 2, 2], &[Some(100), Some(150), Some(110), Some(500)]; "a short list")]
+#[test_case(&[&[100], &[105, 0]], 0, &[2, 2], &[Some(100), None]; "a failure in the second round")]
+fn a_screen_runs_two_rounds(runs: &[&[u64]], losers: usize, want_calls: &[usize], want: &[Option<u64>]) {
+    scripted_rounds(runs, losers, Pass::Screen, want_calls, want);
 }
 
 /// Under a hopeless factor of 2, a candidate's first run past twice the
@@ -573,7 +609,7 @@ fn hopeless_candidates_stop_at_their_first_run(
 ) {
     use std::cell::RefCell;
     let (calls, aborted) = (RefCell::new(vec![0usize; runs.len()]), RefCell::new(vec![false; runs.len()]));
-    let got = tune::rounds(runs.len(), Some(2.0), |i, bar| {
+    let got = tune::rounds(runs.len(), Some(2.0), Pass::Whole, |i, bar| {
         let (first, settled) = runs[i];
         let mut calls = calls.borrow_mut();
         calls[i] += 1;
@@ -595,7 +631,7 @@ fn hopeless_candidates_stop_at_their_first_run(
 #[test]
 fn without_a_hopeless_factor_every_candidate_runs_whole() {
     let mut calls = vec![0; 2];
-    let got = tune::rounds(2, None, |i, bar| {
+    let got = tune::rounds(2, None, Pass::Whole, |i, bar| {
         assert_eq!(bar, None);
         calls[i] += 1;
         Some(Duration::from_nanos([100, 1000][i]))

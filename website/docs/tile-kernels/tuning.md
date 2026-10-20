@@ -36,8 +36,8 @@ clocks down under real data is timed as it will run; integer operands hold zeros
 | Step | Setting |
 |---|---|
 | Warm-up | Back-to-back runs until the clock plateaus |
-| Rounds | One round of every candidate in ranked order, where a candidate whose first timed run passes 2× the best so far keeps that run as its time; then 3 more of the contenders: those within 1.2× of the first round's best (within 2×, under 16 candidates); then 4 more of the two leaders, where more than two contenders ran |
-| Per round | 5 ms of device time in back-to-back sustain runs (at most 1024 launches, sized by the candidate's last run), then 5 profiled runs, keeping each candidate's minimum |
+| Rounds | One round of every candidate in ranked order, where a candidate whose first timed run passes 2× the best so far keeps that run as its time; then 3 more of the contenders: those within 1.2× of the first round's best (within 2×, under 8 candidates), each round past the second only those within 1.05× of the best so far, the later rounds running backwards and forwards in turn so that each candidate runs after both its neighbours; then 4 more of the two leaders, where more than two contenders ran. The first timing of a tuning, which only picks its leading tiles, stops after the second round: those tiles are timed again with their other pipelines |
+| Per round | 5 ms of device time in back-to-back sustain runs of the candidate's programs in order (at most 1024 launches, sized by the candidate's last run), then 5 profiled runs of each program, keeping each candidate's minimum |
 | Time of a run | The sum of its kernels' GPU timestamps |
 
 The sustain is sized in device time because launches queue asynchronously. A candidate is a
