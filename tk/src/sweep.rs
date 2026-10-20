@@ -22,7 +22,7 @@ use crate::kernels::attention::{AttnMask, AttnSpec, Bias, Cache, Chunk, CombineS
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
-use crate::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
+use crate::kernels::nearest::{Floors, MergeSpec, Metric, NearestCfg, NearestSpec, nearest, nearest_merge};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::lower::{Lowering, lower};
@@ -173,6 +173,12 @@ pub fn families(target: &Target) -> Vec<Launch> {
         let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, cfg };
         push(name, nearest::<BF16>(&spec), cfg.lowering(&planner.device));
     }
+    // Split over the candidates (shares of one tile and of two), and a merge of shares.
+    let cfg = NearestCfg { splits: 2, ..NearestCfg::streamed(32, 32, 32, 2) };
+    let spec = NearestSpec { n: 100, m: 90, d: 64, metric: Metric::L2, floors: Floors::default(), groups: true, cfg };
+    push("nearest split", nearest::<BF16>(&spec), cfg.lowering(&planner.device));
+    let merge = MergeSpec { n: 300, splits: 3, metric: Metric::L2 };
+    push("nearest merge", nearest_merge(&merge), merge.lowering(&planner.device));
 
     let silu_bias = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
     for (name, g, images) in [
@@ -514,6 +520,8 @@ pub fn rankings(target: &Target) -> String {
         for metric in [Metric::SquaredL2, Metric::NegDot] {
             let ranked = planner.nearest_ranked(1 << 16, 1 << 16, d, metric, Floors::default(), false);
             s += &format!("nearest d{d} {metric:?}: {:?}\n", &*ranked);
+            let split = planner.nearest_splits(1 << 16, 1 << 16, d, &first_eight(&ranked));
+            s += &format!("splits: {split:?}\n");
         }
     }
     s

@@ -11,7 +11,9 @@ use super::config::Planner;
 use super::shape::{self, extent, shape_of};
 use super::{DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, fmt_shape, output, typed};
 pub use crate::kernels::nearest::Metric;
-use crate::kernels::nearest::{Floors, NearestCfg, NearestSpec, nearest as kernel};
+use crate::kernels::nearest::{
+    Floors, MergeSpec, NearestCfg, NearestSpec, nearest as kernel, nearest_merge, share_stride,
+};
 use crate::launch;
 use crate::tune::TuneStore;
 
@@ -42,6 +44,18 @@ impl Nearest<'_> {
 /// scores, `[N]` i32 indices`)`. A row with no admissible candidate scores
 /// `+∞` at index −1. A self-join passes the same tensor as `x` and `c`.
 pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)> {
+    let dtype = x.dtype();
+    picked(x, c, opts, |planner, ranked, spec| tuned(TuneStore::global(), planner, dtype, ranked, spec))
+}
+
+/// [`nearest`] launching the spec `pick` makes of the planned one, given
+/// the planner and the shape gate's ranking.
+pub(crate) fn picked(
+    x: &Tensor,
+    c: &Tensor,
+    opts: Nearest,
+    pick: impl FnOnce(&Planner, &[NearestCfg], NearestSpec) -> NearestSpec,
+) -> Result<(Tensor, Tensor)> {
     let shape = |t: &Tensor| shape_of(t).context(GraphSnafu { op: OP });
     let (xs, cs) = (shape(x)?, shape(c)?);
     let shape_err =
@@ -77,9 +91,11 @@ pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)
     let (row_floor, col_floor) = (opts.row_floor.map(f32), opts.col_floor.map(f32));
     let (row_group, col_group) = opts.groups.map(|(r, c)| (r.cast(DType::Int32), c.cast(DType::Int32))).unzip();
     let spec = NearestSpec { n, m, d: depth, metric, floors, groups, cfg: cfgs[0] };
-    let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
-    let score_t = output(&[n], &None, DType::Float32).context(graph_err)?;
-    let index_t = output(&[n], &None, DType::Int32).context(graph_err)?;
+    let spec = pick(&planner, &cfgs, spec);
+    let splits = spec.cfg.splits;
+    let parts = if splits == 1 { n } else { splits * share_stride(n) };
+    let score_t = output(&[parts], &None, DType::Float32).context(graph_err)?;
+    let index_t = output(&[parts], &None, DType::Int32).context(graph_err)?;
     let ins: Vec<&Tensor> = [Some(&xp), Some(&cp), c_sq.as_ref(), x_sq.as_ref()]
         .into_iter()
         .chain([row_floor.as_ref(), col_floor.as_ref(), row_group.as_ref(), col_group.as_ref()])
@@ -89,6 +105,19 @@ pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)
     let mut outs =
         launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &spec.cfg.lowering(&planner.device), &ins)
             .context(LaunchSnafu { op: OP })?;
+    let (index, score) = (outs.pop().expect("the index"), outs.pop().expect("the score"));
+    if splits == 1 {
+        return Ok((score, index));
+    }
+    let merge = MergeSpec { n, splits, metric };
+    let score_t = output(&[n], &None, DType::Float32).context(graph_err)?;
+    let index_t = output(&[n], &None, DType::Int32).context(graph_err)?;
+    let mut outs = launch::graph_launch_all(
+        nearest_merge(&merge),
+        &merge.lowering(&planner.device),
+        &[&score, &index, &score_t, &index_t],
+    )
+    .context(LaunchSnafu { op: OP })?;
     let index = outs.pop().expect("the index");
     Ok((outs.pop().expect("the score"), index))
 }
@@ -104,11 +133,21 @@ pub fn tuned(
 ) -> NearestSpec {
     let shape = [spec.n, spec.m, spec.d];
     let salt = (spec.metric, spec.floors, spec.groups);
-    let build = |cfg: NearestCfg| {
-        vec![(typed!(dtype, kernel, &NearestSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))]
-    };
-    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build).tuned(OP, ranked, <[_]>::to_vec);
+    let build = |cfg: NearestCfg| programs(planner, dtype.clone(), &NearestSpec { cfg, ..spec.clone() });
+    let expand = |admitted: &[NearestCfg]| planner.nearest_splits(spec.n, spec.m, spec.d, admitted);
+    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build).tuned(OP, ranked, expand);
     NearestSpec { cfg, ..spec }
+}
+
+/// The programs `spec` launches in order: the kernel, and split, the merge
+/// of its shares.
+pub(crate) fn programs(planner: &Planner, dtype: DType, spec: &NearestSpec) -> crate::tune::Candidate {
+    let mut programs = vec![(typed!(dtype, kernel, spec), spec.cfg.lowering(&planner.device))];
+    if spec.cfg.splits > 1 {
+        let merge = MergeSpec { n: spec.n, splits: spec.cfg.splits, metric: spec.metric };
+        programs.push((nearest_merge(&merge), merge.lowering(&planner.device)));
+    }
+    programs
 }
 
 /// The scores of every pair in f32 (L2 compared squared against its floors

@@ -28,7 +28,7 @@ use crate::ir::{Axis, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::{GemmCfg, KSLICE};
-use crate::kernels::nearest::{Floors, Metric, NearestCfg};
+use crate::kernels::nearest::{Floors, Metric, NearestCfg, SPLIT_GROUP};
 use crate::kernels::rows::NormCfg;
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked};
 use crate::tune::Compiled;
@@ -836,6 +836,46 @@ impl Planner {
         cached(&self.nearest, p, || p.ranked(self))
     }
 
+    /// The candidates of `admitted` (the shortlist of
+    /// [`Self::nearest_ranked`] for `n` rows over `m` candidates at depth
+    /// `d`): each split its [`Self::nearest_split`] ways where it splits,
+    /// else whole, and the first whole as well, so a shape no split serves
+    /// is timed (at 32768² rows and depth 768 on sm_86 every one of 36
+    /// tiles ran faster split, 1.05–2.7 times, and timing both took 2.7
+    /// times as long to tune).
+    pub fn nearest_splits(&self, n: usize, m: usize, d: usize, admitted: &[NearestCfg]) -> Vec<NearestCfg> {
+        let split = |c: &NearestCfg| self.nearest_split(n, m, d, c).map(|splits| NearestCfg { splits, ..*c });
+        let whole = |i: usize, c: &NearestCfg, split: bool| (!split || i == 0).then_some(*c);
+        admitted.iter().enumerate().flat_map(|(i, c)| [split(c), whole(i, c, split(c).is_some())]).flatten().collect()
+    }
+
+    /// The shares a query block of `cfg` splits `m` candidates into, if
+    /// any: a power of two, each share [`SPLIT_TILES`] candidate tiles at
+    /// least, enough that the blocks in flight (every SM's resident ones)
+    /// span the query blocks they walk at once. Streamed, those are a group
+    /// of [`SPLIT_GROUP`] (the grid's raster), so the blocks share their
+    /// query and candidate lines as a GEMM's grouped tiles do: whole, a
+    /// block's own query rows fall out of the cache between its candidate
+    /// tiles (at depth 1024, 104 TFLOP/s whole and 129 split at 32768² rows
+    /// on gfx1201, 21 and 25 on sm_86, 20 and 31 at 16384² on gfx1151).
+    /// Resident, a block reads its rows once and only a grid of fewer blocks
+    /// than SMs splits, a block an SM (at depth 128 a split ran 5–18 %
+    /// behind whole on gfx1201).
+    pub fn nearest_split(&self, n: usize, m: usize, d: usize, cfg: &NearestCfg) -> Option<usize> {
+        let target = &self.device.target;
+        let blocks = n.div_ceil(cfg.bq);
+        let (flight, rows) = match cfg.bk {
+            Some(_) => {
+                let resident = self.resident(cfg.smem_bytes(d), cfg.registers(target, d)?, cfg.warps() as usize);
+                (self.sms() * resident.max(1), blocks.min(SPLIT_GROUP))
+            }
+            None => (self.sms(), blocks),
+        };
+        let most = m.div_ceil(cfg.bkv) / SPLIT_TILES;
+        let splits = flight.div_ceil(rows).next_power_of_two().min(prev_power_of_two(most));
+        (splits > 1).then_some(splits)
+    }
+
     /// The depth a nearest kernel runs `d` at: a multiple of the matrix
     /// core's, the columns past `d` zero.
     pub fn nearest_depth(&self, d: usize) -> Option<usize> {
@@ -1239,6 +1279,25 @@ impl NearestCfg {
     /// columns in; the staged chunks where the fill goes through registers.
     /// Addressing and the row vectors are not counted.
     pub fn registers(&self, target: &Target, d: usize) -> Option<u32> {
+        let [operands, scores] = self.lane_parts(target, d)?;
+        Some(operands + 2 * scores)
+    }
+
+    /// The registers [`Nearest::admit`] holds against the lane's budget:
+    /// [`Self::registers`], or streamed, the depth pipeline's alone (its
+    /// fragments, accumulators and staged chunks). A streamed tile folds
+    /// once its pipeline has drained, its fragments dead, and whether the
+    /// columns it selects fit beside the scores is the compiler's call,
+    /// which the tuner's admission checks: on sm_86 32 rows by 128
+    /// candidates hold 236 registers, unspilled, where the estimate says 336.
+    pub fn held(&self, target: &Target, d: usize) -> Option<u32> {
+        let [operands, scores] = self.lane_parts(target, d)?;
+        Some(operands + if self.bk.is_some() { scores } else { 2 * scores })
+    }
+
+    /// A lane's operand registers (the fragments and the staged chunks) and
+    /// its f32 scores', as [`Self::registers`] counts them.
+    fn lane_parts(&self, target: &Target, d: usize) -> Option<[u32; 2]> {
         let (warps, depth) = (self.warps(), self.depth(d));
         let grid = WarpGrid { rows: warps, cols: 1 };
         let qk = target.issue(Core::Warp, grid, self.bq, self.bkv, depth)?;
@@ -1248,7 +1307,7 @@ impl NearestCfg {
             Fill::CpAsync => 0,
             Fill::Staged => half(self.filled().map(staged).sum::<Option<u32>>()?),
         };
-        Some(half(qk.a.regs()) + half(qk.b.regs()) + 2 * qk.c.regs() + fill)
+        Some([half(qk.a.regs()) + half(qk.b.regs()) + fill, qk.c.regs()])
     }
 }
 
@@ -1265,10 +1324,23 @@ const PAIR_OP: f64 = 0.2;
 /// Model: what groups add to a pair: a compare and a select.
 const GROUPS_PAIR: f64 = 2.0 * PAIR_OP;
 
+/// Search bound: the fewest candidate tiles a share of a split nearest
+/// block walks ([`Planner::nearest_split`]).
+const SPLIT_TILES: usize = 4;
+
+/// The largest power of two not past `n` (zero for zero).
+fn prev_power_of_two(n: usize) -> usize {
+    if n == 0 { 0 } else { 1 << n.ilog2() }
+}
+
 /// Search bound: a nearest block's candidates a trip.
 const CANDIDATE_BLOCKS: [usize; 4] = [16, 32, 64, 128];
 /// Search bound: the query rows a warp owns.
 const NEAREST_WARP_ROWS: [usize; 2] = [WARP_ROWS, 2 * WARP_ROWS];
+/// Search bound: a register-staged nearest ring's slots, the GEMM's: one
+/// slot measured faster than two on gfx1151 (64 rows by 64 candidates,
+/// streamed at depth 768: +7 %).
+const NEAREST_STAGED: [usize; 2] = [2, 1];
 /// Search bound: a nearest block's warps at most.
 const NEAREST_WARPS: usize = 8;
 /// Search bound: the depth chunks a streamed nearest block's trip spans, the
@@ -1325,9 +1397,9 @@ impl Nearest {
         }
         let regs = cfg.registers(target, d).ok_or(Rejected::Layout)?;
         let waves = cfg.warps() as usize;
-        let budget = target.lane_budget(waves as u32);
-        if regs > budget {
-            return Err(Rejected::Registers { need: regs, have: budget });
+        let (held, budget) = (cfg.held(target, d).ok_or(Rejected::Layout)?, target.lane_budget(waves as u32));
+        if held > budget {
+            return Err(Rejected::Registers { need: held, have: budget });
         }
         let atoms = (cfg.warp_rows / atom.m as usize) * (bkv / atom.n as usize);
         let Floors { row, col } = self.floors;
@@ -1371,7 +1443,7 @@ impl Nearest {
     /// candidate block, the rows resident or streamed at every depth chunk,
     /// every ring depth and unrolling.
     pub fn lattice(&self, target: &Target) -> Vec<NearestCfg> {
-        let stages: &[usize] = if target.fill == Fill::CpAsync { &FA_STAGES } else { &FA_STAGES[1..] };
+        let stages: &[usize] = if target.fill == Fill::CpAsync { &FA_STAGES } else { &NEAREST_STAGED };
         let mut out = vec![];
         for bq in QUERY_BLOCKS {
             for warp_rows in NEAREST_WARP_ROWS.into_iter().filter(|&r| bq.is_multiple_of(r)) {
@@ -1412,8 +1484,11 @@ impl Tiled for NearestCfg {
         NearestCfg { stages: 0, unroll: false, ..*self }
     }
 
+    /// The ranked (unsplit) pipelines of the tile, at the split the tuner
+    /// gave this config.
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
-        ranked.iter().filter(|c| c.tile() == self.tile()).copied().collect()
+        let split = |c: &Self| NearestCfg { splits: self.splits, ..*c };
+        ranked.iter().map(split).filter(|c| c.tile() == self.tile()).collect()
     }
 }
 

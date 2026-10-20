@@ -13,7 +13,9 @@ use crate::atoms::{Core, Target};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::Orient;
-use crate::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec, nearest};
+use crate::kernels::nearest::{
+    Floors, MergeSpec, Metric, NearestCfg, NearestSpec, nearest, nearest_merge, share_stride,
+};
 use crate::ops::config::Planner;
 use crate::ops::{self as tk, Nearest};
 
@@ -137,8 +139,9 @@ impl Case {
     }
 
     /// The kernel's parameters at `depth` (zero columns past `d`), the norms
-    /// in f32 as the op computes them, then the two outputs.
-    fn params(&self, depth: usize) -> Vec<Vec<f64>> {
+    /// in f32 as the op computes them, then the two outputs (of every share,
+    /// split `splits` ways).
+    fn params(&self, depth: usize, splits: usize) -> Vec<Vec<f64>> {
         let pad = |v: &[f64], rows: usize| {
             (0..rows * depth)
                 .map(|e| if e % depth < self.d { v[e / depth * self.d + e % depth] } else { 0.0 })
@@ -160,7 +163,8 @@ impl Case {
         if let Some((r, c)) = &self.groups {
             params.extend([r, c].map(|g| g.iter().map(|&v| f64::from(v)).collect()));
         }
-        params.extend([vec![0.0; self.n], vec![0.0; self.n]]);
+        let parts = if splits == 1 { self.n } else { splits * share_stride(self.n) };
+        params.extend([vec![0.0; parts], vec![0.0; parts]]);
         params
     }
 
@@ -169,12 +173,32 @@ impl Case {
         NearestSpec { n, m, d: depth, metric, floors, groups, cfg }
     }
 
-    /// The scores and indices the interpreter computes under `cfg`.
+    /// The scores and indices the interpreter computes under `cfg`, split,
+    /// its shares merged.
     fn interpreted(&self, cfg: NearestCfg) -> (Vec<f64>, Vec<f64>) {
         let depth = self.d.next_multiple_of(16);
-        let mut out = run(&nearest::<BF16>(&self.spec(depth, cfg)), self.params(depth), &[]).unwrap();
-        let index = out.pop().unwrap();
-        (out.pop().unwrap(), index)
+        let mut out = run(&nearest::<BF16>(&self.spec(depth, cfg)), self.params(depth, cfg.splits), &[]).unwrap();
+        let (index, score) = (out.pop().unwrap(), out.pop().unwrap());
+        if cfg.splits == 1 {
+            return (score, index);
+        }
+        merged(&MergeSpec { n: self.n, splits: cfg.splits, metric: self.metric }, score, index)
+    }
+
+    /// The scores and indices `cfg` computes on the device (split, its
+    /// shares merged there).
+    fn on_device(&self, planner: &Planner, depth: usize, cfg: NearestCfg) -> (Vec<f64>, Vec<f64>) {
+        let prog = nearest::<BF16>(&self.spec(depth, cfg));
+        let mut outs = super::targets::on_device(prog, &cfg.lowering(&planner.device), &self.params(depth, cfg.splits));
+        let (index, score) = (outs.pop().flatten().unwrap(), outs.pop().flatten().unwrap());
+        if cfg.splits == 1 {
+            return (score, index);
+        }
+        let merge = MergeSpec { n: self.n, splits: cfg.splits, metric: self.metric };
+        let params = [score, index, vec![0.0; self.n], vec![0.0; self.n]];
+        let mut outs = super::targets::on_device(nearest_merge(&merge), &merge.lowering(&planner.device), &params);
+        let index = outs.pop().flatten().unwrap();
+        (outs.pop().flatten().unwrap(), index)
     }
 
     /// `score` and `index` are each row's least and where: every score
@@ -212,15 +236,29 @@ impl Case {
     }
 }
 
+/// The interpreter's merge of a split kernel's shares.
+fn merged(spec: &MergeSpec, score: Vec<f64>, index: Vec<f64>) -> (Vec<f64>, Vec<f64>) {
+    let params = vec![score, index, vec![0.0; spec.n], vec![0.0; spec.n]];
+    let mut out = run(&nearest_merge(spec), params, &[]).unwrap();
+    let index = out.pop().unwrap();
+    (out.pop().unwrap(), index)
+}
+
 /// The configs of a small lattice: every ring depth, one or two atom rows
-/// per warp, the rows resident or streamed 16 or 32 deep a trip.
+/// per warp, the rows resident or streamed 16 or 32 deep a trip, the
+/// candidates split up to four ways (at most a share per candidate tile).
 fn small_cfg() -> impl Strategy<Value = NearestCfg> {
     let shape = (0usize..3, 0usize..3, 1usize..4, any::<bool>(), any::<bool>());
-    (shape, prop::option::of(0usize..2)).prop_map(|((q, kv, stages, wide, unroll), bk)| {
+    (shape, prop::option::of(0usize..2), 1usize..5).prop_map(|((q, kv, stages, wide, unroll), bk, splits)| {
         let bq = 16 << q;
         let warp_rows = if wide && bq >= 32 { 32 } else { 16 };
-        NearestCfg { unroll, warp_rows, bk: bk.map(|k| 16 << k), ..NearestCfg::new(bq, 16 << kv, stages) }
+        NearestCfg { unroll, warp_rows, bk: bk.map(|k| 16 << k), splits, ..NearestCfg::new(bq, 16 << kv, stages) }
     })
+}
+
+/// `cfg` with at most a share per candidate tile of `m` candidates.
+fn shared_out(cfg: NearestCfg, m: usize) -> NearestCfg {
+    NearestCfg { splits: cfg.splits.min(m.div_ceil(cfg.bkv)), ..cfg }
 }
 
 fn draws() -> impl Strategy<Value = Draw> {
@@ -233,9 +271,10 @@ fn draws() -> impl Strategy<Value = Draw> {
 proptest! {
     /// The program computes each row's least score and its first index over
     /// any shape (ragged rows and candidates, depths padded to the core's,
-    /// a streamed depth's last chunk overhanging it), every metric, either
-    /// floor, with and without groups (rows left with no candidate
-    /// included), and exact ties.
+    /// a streamed depth's last chunk overhanging it, the candidates split
+    /// into shares the merge folds), every metric, either floor, with and
+    /// without groups (rows left with no candidate included), and exact
+    /// ties.
     #[test]
     fn nearest_interpreter_matches_the_reference(
         n in 1usize..70,
@@ -246,7 +285,7 @@ proptest! {
         seed in any::<u64>(),
     ) {
         let case = Case::draw(n, m, d, draw, seed);
-        let (score, index) = case.interpreted(cfg);
+        let (score, index) = case.interpreted(shared_out(cfg, m));
         case.check("interpreter", &score, &index, 1e-4, draw.integer);
     }
 }
@@ -264,14 +303,16 @@ fn rows_without_a_candidate_score_infinity_at_minus_one() {
     case.check("one admissible candidate", &score, &index, 1e-4, false);
 }
 
-/// Equal scores in different trips and in one trip resolve to the smallest
-/// index: every candidate repeats one row, so each row's least is everywhere
-/// (under the inner product, of either sign).
-#[test_case(16, Metric::SquaredL2; "a trip per pair of candidates")]
-#[test_case(64, Metric::SquaredL2; "every candidate in one trip")]
-#[test_case(16, Metric::NegDot; "signed scores a trip per pair of candidates")]
-#[test_case(64, Metric::NegDot; "signed scores in one trip")]
-fn ties_resolve_to_the_smallest_index(bkv: usize, metric: Metric) {
+/// Equal scores in different trips, in one trip and in different shares
+/// resolve to the smallest index: every candidate repeats one row, so each
+/// row's least is everywhere (under the inner product, of either sign).
+#[test_case(16, Metric::SquaredL2, 1; "a trip per pair of candidates")]
+#[test_case(64, Metric::SquaredL2, 1; "every candidate in one trip")]
+#[test_case(16, Metric::NegDot, 1; "signed scores a trip per pair of candidates")]
+#[test_case(64, Metric::NegDot, 1; "signed scores in one trip")]
+#[test_case(16, Metric::SquaredL2, 3; "three shares")]
+#[test_case(16, Metric::NegDot, 4; "signed scores a share per trip")]
+fn ties_resolve_to_the_smallest_index(bkv: usize, metric: Metric, splits: usize) {
     let mut case = Case::draw(30, 50, 8, draw(metric, NONE, None, true, false), 2);
     for j in 1..case.m {
         case.c.copy_within(0..case.d, j * case.d);
@@ -280,7 +321,7 @@ fn ties_resolve_to_the_smallest_index(bkv: usize, metric: Metric) {
         let (best, _) = case.reference();
         assert!(best.iter().any(|s| *s < 0.0) && best.iter().any(|s| *s > 0.0), "scores of both signs: {best:?}");
     }
-    let (score, index) = case.interpreted(NearestCfg::new(16, bkv, 2));
+    let (score, index) = case.interpreted(NearestCfg { splits, ..NearestCfg::new(16, bkv, 2) });
     assert!(index.iter().all(|i| *i == 0.0), "{index:?}");
     case.check("ties", &score, &index, 0.0, true);
 }
@@ -339,6 +380,115 @@ fn a_floor_above_every_score_picks_the_first_candidate() {
     assert!(score.iter().all(|s| *s == 100.0) && index.iter().all(|i| *i == 0.0), "{score:?} {index:?}");
 }
 
+/// Split into shares, each row's least and first index are the unsplit
+/// ones, bit for bit: exact ties run across every share boundary (each
+/// candidate repeats one of the first three), the last candidate tile is
+/// ragged, under every metric, floors and groups, the rows resident or
+/// streamed, a share per candidate tile at most.
+#[test_case(Metric::SquaredL2, NONE, None; "squared l2")]
+#[test_case(Metric::ShiftedL2, NONE, Some(3); "assignment groups")]
+#[test_case(Metric::L2, BOTH, Some(2); "l2 floors groups")]
+#[test_case(Metric::NegDot, Floors { row: false, col: true }, None; "neg dot col floor")]
+#[test_case(Metric::NegDot, Floors { row: true, col: false }, Some(4); "neg dot row floor groups")]
+fn shares_merge_to_the_unsplit_answer(metric: Metric, floors: Floors, groups: Option<i32>) {
+    let case = Case::draw(70, 230, 24, draw(metric, floors, groups, true, true), 9);
+    for base in [NearestCfg::new(32, 16, 2), NearestCfg::streamed(32, 32, 16, 1)] {
+        let unsplit = case.interpreted(base);
+        case.check("unsplit", &unsplit.0, &unsplit.1, 1e-4, true);
+        for splits in [2, 3, 5, case.m.div_ceil(base.bkv)] {
+            let cfg = NearestCfg { splits, ..base };
+            let split = case.interpreted(cfg);
+            case.check(&format!("{cfg:?}"), &split.0, &split.1, 1e-4, true);
+            assert_eq!(split, unsplit, "{cfg:?}");
+        }
+    }
+}
+
+/// A share whose candidates are all skipped leaves `+∞` at −1, which the
+/// merge passes over: every row's group holds the first `skipped`
+/// candidates, so the first shares hold none of a row's; with every one
+/// skipped, every row scores `+∞` at −1.
+#[test_case(150; "the first shares empty")]
+#[test_case(200; "every share empty")]
+fn shares_without_a_candidate_leave_infinity(skipped: usize) {
+    let mut case = Case::draw(40, 200, 16, draw(Metric::L2, BOTH, Some(2), false, false), 4);
+    let (rows, cols) = case.groups.as_mut().unwrap();
+    rows.fill(0);
+    for (j, g) in cols.iter_mut().enumerate() {
+        *g = i32::from(j >= skipped);
+    }
+    for splits in [2, 4, 7, 13] {
+        let cfg = NearestCfg { splits, ..NearestCfg::new(16, 16, 2) };
+        let (score, index) = case.interpreted(cfg);
+        case.check(&format!("{cfg:?}"), &score, &index, 1e-4, false);
+        match skipped == case.m {
+            true => assert!(score.iter().all(|s| *s == f64::INFINITY) && index.iter().all(|i| *i == -1.0)),
+            false => assert!(index.iter().all(|&i| i >= skipped as f64), "{cfg:?}: {index:?}"),
+        }
+    }
+}
+
+/// The merge folds the shares in order: one with no candidate (`+∞` at −1)
+/// is passed over, equal scores keep the earlier share's index, and the
+/// least comes out in the metric's units (the L2 family's doubled, L2's
+/// square root taken); rows past a block of the merge are ragged.
+#[test_case(Metric::NegDot; "neg dot")]
+#[test_case(Metric::SquaredL2; "squared l2")]
+#[test_case(Metric::L2; "l2")]
+fn the_merge_folds_shares_in_order(metric: Metric) {
+    let (n, splits, inf) = (300, 3, f64::INFINITY);
+    let stride = share_stride(n);
+    let (mut score, mut index) = (vec![0.0; splits * stride], vec![0.0; splits * stride]);
+    let mut want = vec![];
+    for i in 0..n {
+        let parts: [(f64, f64); 3] = match i % 4 {
+            0 => [(inf, -1.0), (inf, -1.0), (inf, -1.0)],
+            1 => [(inf, -1.0), (2.5, 40.0), (2.5, 90.0)],
+            2 => [(1.0, 3.0), (-0.5, 41.0), (0.75, 95.0)],
+            _ => [(0.25, 7.0), (inf, -1.0), (0.25, 99.0)],
+        };
+        let parts = parts.map(|(v, j)| if metric == Metric::NegDot { (v, j) } else { (v.abs(), j) });
+        for (s, (v, j)) in parts.into_iter().enumerate() {
+            (score[s * stride + i], index[s * stride + i]) = (v, j);
+        }
+        let (v, j) = parts.into_iter().fold((inf, -1.0), |(b, at), (v, j)| if v < b { (v, j) } else { (b, at) });
+        let v = match metric {
+            Metric::NegDot => v,
+            Metric::L2 => round_to(ScalarDType::Float32, (2.0 * v).sqrt()),
+            _ => 2.0 * v,
+        };
+        want.push((v, j));
+    }
+    let (score, index) = merged(&MergeSpec { n, splits, metric }, score, index);
+    for (i, want) in want.into_iter().enumerate() {
+        assert_eq!((score[i], index[i]), want, "row {i}");
+    }
+}
+
+/// The planner splits a streamed tile's candidates at a large self-join,
+/// where the blocks in flight span more query blocks than a group, and a
+/// resident tile's only where its query blocks leave SMs idle; every share
+/// keeps four candidate tiles. The tuner times each admitted config split
+/// where it splits, whole where not, and the first whole as well.
+#[test_case(crate::atoms::sm86(); "sm_86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64); "gfx1201")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40); "gfx1151")]
+fn splits_serve_rereads_and_idle_sms(target: Target) {
+    let planner = super::planner(target);
+    let (streamed, resident, big) = (NearestCfg::streamed(128, 128, 32, 2), NearestCfg::new(128, 32, 2), 1 << 15);
+    let split = |n, m, d, cfg| planner.nearest_split(n, m, d, &cfg);
+    let s = split(big, big, 768, streamed).expect("a streamed self-join splits");
+    assert!(s.is_power_of_two() && big.div_ceil(streamed.bkv) / s >= 4, "{s}");
+    assert_eq!(split(big, big, 128, resident), None, "a resident self-join fills the SMs whole");
+    assert!(split(300, big, 128, resident).is_some(), "three query blocks leave SMs idle");
+    assert_eq!(split(big, 7 * 128, 768, streamed), None, "seven candidate tiles make one share of four");
+    let admitted = [streamed, NearestCfg::streamed(64, 64, 32, 2), resident];
+    let timed = planner.nearest_splits(big, big, 768, &admitted);
+    let whole: Vec<NearestCfg> = timed.iter().filter(|c| c.splits == 1).copied().collect();
+    assert_eq!(whole, [streamed, resident], "{timed:?}");
+    assert_eq!(timed.len(), 4, "{timed:?}");
+}
+
 // ---- device ------------------------------------------------------------------
 
 /// Every config of the first eight tiles ranked for the case's shape, lowered
@@ -359,14 +509,21 @@ fn nearest_matches_on_device(n: usize, m: usize, d: usize, draw: Draw) {
     let ranked = planner.nearest_ranked(n, m, depth, draw.metric, draw.floors, draw.groups.is_some());
     let (want_score, want_index) = case.interpreted(ranked[0]);
     case.check("interpreter", &want_score, &want_index, 1e-4, draw.integer);
-    for cfg in first_eight(&ranked) {
-        let prog = nearest::<BF16>(&case.spec(depth, cfg));
-        let mut outs = super::targets::on_device(prog, &cfg.lowering(&planner.device), &case.params(depth));
-        let (index, score) = (outs.pop().flatten().unwrap(), outs.pop().flatten().unwrap());
+    for cfg in split_too(&planner, &case, depth, &ranked) {
+        let (score, index) = case.on_device(&planner, depth, cfg);
         case.check(&format!("{cfg:?}"), &score, &index, 1e-3, draw.integer);
         let same = index.iter().zip(&want_index).filter(|(a, b)| a == b).count();
         eprintln!("{cfg:?}: {same} of {n} indices as interpreted");
     }
+}
+
+/// The first eight tiles of `ranked` as the tuner times them (each unsplit,
+/// then at the planner's split where there is one) and the first also split
+/// two and three ways.
+fn split_too(planner: &Planner, case: &Case, depth: usize, ranked: &[NearestCfg]) -> Vec<NearestCfg> {
+    let mut cfgs = planner.nearest_splits(case.n, case.m, depth, &first_eight(ranked));
+    cfgs.extend([2, 3].map(|splits| shared_out(NearestCfg { splits, ..ranked[0] }, case.m)));
+    cfgs
 }
 
 /// A resident trip finds its least's column only in the warps it lowers some
@@ -394,10 +551,8 @@ fn the_trip_that_lowers_a_row_places_its_least_on_device(order: Order) {
     for d in [16, 512] {
         let case = ordered(150, 230, d, order);
         let ranked = planner.nearest_ranked(case.n, case.m, d, Metric::NegDot, NONE, false);
-        for cfg in first_eight(&ranked) {
-            let prog = nearest::<BF16>(&case.spec(d, cfg));
-            let mut outs = super::targets::on_device(prog, &cfg.lowering(&planner.device), &case.params(d));
-            let (index, score) = (outs.pop().flatten().unwrap(), outs.pop().flatten().unwrap());
+        for cfg in split_too(&planner, &case, d, &ranked) {
+            let (score, index) = case.on_device(&planner, d, cfg);
             case.check(&format!("{cfg:?}"), &score, &index, 0.0, true);
         }
     }
@@ -413,14 +568,16 @@ fn host(t: &Tensor) -> Vec<f64> {
 /// self-join under floors (each row may find itself) and under groups too
 /// (which skip each row itself), the largest inner product under groups at a
 /// deep row, and at the depths of embeddings, whose rows stream.
-#[test_case(300, 500, 5, draw(Metric::ShiftedL2, NONE, None, false, false), false; "assignment d5")]
-#[test_case(257, 1000, 37, draw(Metric::SquaredL2, NONE, None, false, false), false; "squared l2 d37")]
-#[test_case(200, 200, 64, draw(Metric::L2, BOTH, None, false, false), true; "l2 floors self-join")]
-#[test_case(300, 300, 16, draw(Metric::L2, BOTH, Some(5), false, false), true; "l2 floors groups self-join")]
-#[test_case(100, 130, 128, draw(Metric::NegDot, NONE, Some(3), false, false), false; "neg dot groups d128")]
-#[test_case(500, 700, 768, draw(Metric::NegDot, NONE, None, false, false), false; "streamed neg dot d768")]
-#[test_case(300, 300, 1000, draw(Metric::SquaredL2, BOTH, Some(4), false, false), true; "streamed self-join d1000")]
-fn nearest_matches_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join: bool) {
+#[test_case(300, 500, 5, draw(Metric::ShiftedL2, NONE, None, false, false), false, 1; "assignment d5")]
+#[test_case(257, 1000, 37, draw(Metric::SquaredL2, NONE, None, false, false), false, 1; "squared l2 d37")]
+#[test_case(200, 200, 64, draw(Metric::L2, BOTH, None, false, false), true, 1; "l2 floors self-join")]
+#[test_case(300, 300, 16, draw(Metric::L2, BOTH, Some(5), false, false), true, 1; "l2 floors groups self-join")]
+#[test_case(100, 130, 128, draw(Metric::NegDot, NONE, Some(3), false, false), false, 1; "neg dot groups d128")]
+#[test_case(500, 700, 768, draw(Metric::NegDot, NONE, None, false, false), false, 1; "streamed neg dot d768")]
+#[test_case(300, 300, 1000, draw(Metric::SquaredL2, BOTH, Some(4), false, false), true, 1; "streamed self-join d1000")]
+#[test_case(300, 300, 16, draw(Metric::L2, BOTH, Some(5), false, false), true, 3; "l2 floors groups self-join split")]
+#[test_case(500, 700, 768, draw(Metric::NegDot, NONE, None, false, false), false, 2; "streamed neg dot d768 split")]
+fn nearest_matches_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join: bool, splits: usize) {
     super::ops::untuned(|| {
         let mut case = Case::draw(n, m, d, draw, 11);
         if self_join {
@@ -443,8 +600,16 @@ fn nearest_matches_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join
             col_floor: col_floor.as_ref(),
             groups: groups.as_ref().map(|(r, c)| (r, c)),
         };
-        let (score, index) = tk::nearest(&x, &c, opts).unwrap();
-        super::ops::assert_kernel(&score, "nearest");
+        // Split, the ranking's first config, its candidates in `splits` shares.
+        let split = |_: &Planner, ranked: &[NearestCfg], spec: NearestSpec| {
+            let cfg = shared_out(NearestCfg { splits, ..ranked[0] }, spec.m);
+            NearestSpec { cfg, ..spec }
+        };
+        let (score, index) = match splits {
+            1 => tk::nearest(&x, &c, opts).unwrap(),
+            _ => tk::nearest::picked(&x, &c, opts, split).unwrap(),
+        };
+        super::ops::assert_kernel(&score, if splits == 1 { "nearest" } else { "nearest_merge" });
         case.check("kernel", &host(&score), &host(&index), 1e-3, false);
         let (score, index) = tk::nearest::graph(&x, &c, opts).unwrap();
         case.check("graph", &host(&score), &host(&index), 1e-3, false);
@@ -517,8 +682,7 @@ fn time_nearest(planner: &Planner, n: usize, d: usize, metric: Metric, floors: F
         timed.push(pick);
     }
     let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups, cfg };
-    let ns =
-        super::measure(timed.iter().map(|&cfg| vec![(nearest::<BF16>(&spec(cfg)), cfg.lowering(&planner.device))]));
+    let ns = super::measure(timed.iter().map(|&cfg| tk::nearest::programs(planner, DType::BFloat16, &spec(cfg))));
     eprintln!("== nearest {n}x{n}x{d} {metric:?} {floors:?} groups={groups}: {} admitted", admitted.len());
     let pairs = (n * n) as f64;
     for (cfg, ns) in timed.iter().zip(ns) {
@@ -559,13 +723,13 @@ fn device_nearest(
 ) -> (Vec<NearestCfg>, NearestCfg) {
     let ranked = planner.nearest_ranked(n, n, d, metric, floors, groups);
     let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups, cfg };
-    let build = |cfg: NearestCfg| vec![(nearest::<BF16>(&spec(cfg)), cfg.lowering(&planner.device))];
+    let build = |cfg: NearestCfg| tk::nearest::programs(planner, DType::BFloat16, &spec(cfg));
     let shape = [n, n, d];
     let (admitted, pick) = super::tuned_on_device(
         planner,
         ("nearest", DType::BFloat16, &shape, (crate::ops::DEVICE_TEST, metric, floors, groups)),
         &ranked,
-        <[_]>::to_vec,
+        |admitted| planner.nearest_splits(n, n, d, admitted),
         build,
     );
     (admitted, pick.expect("a nearest kernel the planner runs"))
@@ -688,7 +852,7 @@ fn tuning_probe() {
         planner: &Planner,
         name: String,
         (op, shape, salt): (&'static str, &[usize], impl std::fmt::Debug),
-        ranked: &[C],
+        (ranked, expand): (&[C], impl Fn(&[C]) -> Vec<C>),
         build: impl Fn(C) -> crate::tune::Candidate,
         predicted: impl Fn(&C) -> f64,
         work: f64,
@@ -696,7 +860,7 @@ fn tuning_probe() {
         let start = std::time::Instant::now();
         let store = crate::tune::TuneStore::global();
         let mut tuner = crate::ops::Tuner::new(store, &planner.device, DType::BFloat16, shape, salt, &build);
-        let admitted = tuner.admitted(op, &crate::ops::config::representatives(ranked));
+        let admitted = expand(&tuner.admitted(op, &crate::ops::config::representatives(ranked)));
         let ordered = tuner.ordered(op, &admitted);
         let pick = tuner.pipelined(op, &ordered, ranked);
         let wall = start.elapsed().as_secs_f64();
@@ -723,7 +887,7 @@ fn tuning_probe() {
             let (n, metric, floors) = (rows, Metric::NegDot, NONE);
             let ranked = planner.nearest_ranked(n, n, d, metric, floors, false);
             let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups: false, cfg };
-            let build = |cfg: NearestCfg| vec![(nearest::<BF16>(&spec(cfg)), cfg.lowering(&planner.device))];
+            let build = |cfg: NearestCfg| tk::nearest::programs(&planner, DType::BFloat16, &spec(cfg));
             let p = Problem { n, m: n, d, metric, floors, groups: false };
             let salt = (crate::ops::DEVICE_TEST, metric, floors, false);
             let name = format!("nearest {n}x{n}x{d} {metric:?}");
@@ -732,7 +896,7 @@ fn tuning_probe() {
                 &planner,
                 name,
                 ("nearest", &[n, n, d], salt),
-                &ranked,
+                (&ranked, |a: &[NearestCfg]| planner.nearest_splits(n, n, d, a)),
                 build,
                 |c| p.admit(&planner, c).unwrap().0,
                 work,
@@ -752,7 +916,7 @@ fn tuning_probe() {
                 &planner,
                 format!("gemm {m}x{n}x{k}"),
                 key,
-                &ranked,
+                (&ranked, <[_]>::to_vec),
                 build,
                 |c| p.admit(&planner, c).unwrap().0,
                 work,
@@ -773,7 +937,7 @@ fn tuning_probe() {
                 &planner,
                 format!("attention {s:?}"),
                 ("attention", &shape, mask),
-                &ranked,
+                (&ranked, <[_]>::to_vec),
                 build,
                 |c| p.admit(&planner, c).unwrap().0,
                 work,

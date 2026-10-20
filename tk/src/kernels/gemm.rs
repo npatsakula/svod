@@ -353,7 +353,7 @@ fn merge<T: Elem, U: Elem>(spec: &MergeSpec) -> Program {
 }
 
 /// The `(row, col)` tile of this block, walking groups of `group_m` tile rows.
-fn tile_order(k: &mut Kernel, gm: usize, gn: usize, group_m: usize) -> (Sc, Sc) {
+pub(super) fn tile_order(k: &mut Kernel, gm: usize, gn: usize, group_m: usize) -> (Sc, Sc) {
     if group_m == 0 {
         return (k.block(0), k.block(1));
     }
