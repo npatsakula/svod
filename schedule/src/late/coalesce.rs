@@ -202,7 +202,9 @@ pub fn indexing_simplify() -> &'static TypedPatternMatcher {
 /// Tinygrad's `({}, ren)` context for the `add images` rewrite.
 pub type AddImageContext = (HashMap<usize, (usize, usize)>, Renderer);
 
-/// Tinygrad `pm_simplify_add_image`, preserving source rule order.
+/// Tinygrad `pm_simplify_add_image`, preserving source rule order. A
+/// float's Float16 roundtrip rounds and stays (Tinygrad 885ab362 elides it
+/// only into a half image's store, which converts by itself).
 ///
 /// Image creation has no mapping here: its supported Tinygrad targets (QCOM,
 /// CL, PYTHON, NULL) have no corresponding `RendererDevice` variant. Existing
@@ -226,10 +228,6 @@ pub fn pm_simplify_add_image() -> TypedPatternMatcher<AddImageContext> {
                 Op::Store(ops::Store { index: index.clone(), value: value.cast(DType::Float32), gate: gate.clone() }),
                 DType::Void,
             )),
-
-        Cast { src: Cast { src, dtype: inner_dtype }, dtype }
-            if *inner_dtype == DType::Float16 && *dtype == DType::Float32 && src.dtype() == DType::Float32
-            => Some(src.clone()),
     }
 }
 

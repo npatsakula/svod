@@ -1,5 +1,7 @@
 use ndarray::{Array1, Array3, array};
 
+use svod_dtype::DType;
+
 use crate::Tensor;
 
 // =========================================================================
@@ -164,6 +166,15 @@ fn test_roundtrip_vec() {
     let t = Tensor::from_slice(&original);
     let view = t.array_view::<f32>().unwrap();
     assert_eq!(view.as_slice().unwrap(), &original);
+}
+
+/// A narrowing cast rounds even when a widening one follows it lazily.
+#[test_case::test_case(DType::Float16, 1.0 + 1.0 / 4096.0, 1.0; "f16 drops a bit past its mantissa")]
+#[test_case::test_case(DType::Float16, 0.137_225_46, 281.0 / 2048.0; "f16 to nearest")]
+#[test_case::test_case(DType::BFloat16, 0.137_225_46, 141.0 / 1024.0; "bf16 to nearest")]
+fn test_a_narrowing_roundtrip_rounds(dtype: DType, value: f32, want: f32) {
+    let got = Tensor::from_slice([value]).cast(dtype).cast(DType::Float32).to_vec::<f32>().unwrap();
+    assert_eq!(got, [want]);
 }
 
 // =========================================================================
