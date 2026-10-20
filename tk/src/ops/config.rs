@@ -249,11 +249,12 @@ const LOGGED: usize = 16;
 /// win. Over the shortlists sm_86 timed (GEMMs from 1024³ to 8192²×768,
 /// attention, nearest from 8192² to 16384² at depths 128–1024) the measured
 /// best was predicted within 1.19 of the cheapest, every config within the
-/// tuner's contender band ([`crate::tune::CONTENDER`]) within 1.63, and no
-/// config ran faster than 0.52 of its predicted share: one predicted 2.5
-/// times the cheapest runs at least 1.3 times the best. Nearest's small
-/// candidate blocks run 3.5 to 6 times its best, seconds a launch at 65536²
-/// rows.
+/// tuner's contender band ([`crate::tune::CONTENDER`]) within 1.63. On
+/// gfx1201 and gfx1151 (nearest at 16384², depths 256–1024, a 4096³ GEMM,
+/// attention) the best was predicted within 1.09, though the model errs
+/// wider there: a pruned config ran 1.23 times the best on gfx1201 and 1.08
+/// on gfx1151, never within the tuner's drift. Nearest's small candidate
+/// blocks run 3.5 to 6 times its best, seconds a launch at 65536² rows.
 pub(crate) const PRUNED_PAST: f64 = 2.5;
 /// Search bound: the tiles a ranking keeps whatever their cost, so a shortlist
 /// whose cheapest tiles fail to compile clean still holds some to time.
