@@ -85,8 +85,23 @@ const SETTLED: f64 = 1.05;
 /// 0.93–1.15 of the candidate's settled time: one aborted settles past 1.7
 /// times the best.
 pub(crate) const HOPELESS: f64 = 2.0;
-/// Measurement: profiled runs per candidate per round.
+/// Measurement: profiled runs per candidate per round, the most a tuner's
+/// round gives one ([`runs`]) and what the leaders' rounds and the probes give.
 const RUNS: usize = 5;
+/// Measurement: the device time a tuner's round gives a candidate's profiled
+/// runs, at least [`MIN_RUNS`] of them ([`runs`]): a 10 ms kernel's best of
+/// two sits where its best of five does, within a round's drift.
+const RUN_BUDGET: Duration = Duration::from_millis(20);
+/// Measurement: the fewest profiled runs a tuner's round gives a candidate.
+const MIN_RUNS: usize = 2;
+
+/// The profiled runs a tuner's round gives a candidate whose last run took
+/// `t`: those [`RUN_BUDGET`] holds, [`MIN_RUNS`] to [`RUNS`]. A candidate
+/// of [`SUSTAIN`] or more is not sustained: its runs keep the clock up, and
+/// its first timed run counts among them.
+pub(crate) fn runs(t: Duration) -> usize {
+    (RUN_BUDGET.as_nanos().div_ceil(t.as_nanos().max(1)) as usize).clamp(MIN_RUNS, RUNS)
+}
 /// Measurement: device time of back-to-back runs ahead of each candidate's
 /// profiled runs, keeping the lifted clock up where their host overhead would let a short
 /// kernel's clock sag.
@@ -835,7 +850,7 @@ impl<C: Copy + PartialEq + std::fmt::Debug + Send> Bench<C> {
         let ns = self.compiling(store, threads().saturating_sub(1), |stream| {
             missing.into_iter().for_each(|job| stream.push(job));
             let arrive = || stream.next().map(|(i, built, _)| (i, built));
-            time_with(&mut slots, arrive, Some(HOPELESS), pass)
+            time_with(&mut slots, arrive, Some(HOPELESS), pass, true)
         });
         for (&c, built) in candidates.iter().zip(slots) {
             self.built.extend(built.map(|b| (c, b)));
@@ -906,7 +921,7 @@ static DEVICE: Mutex<()> = Mutex::new(());
 /// time, after the clock is lifted, under the process's one timing lock.
 pub(crate) fn time(built: &mut [Built]) -> Vec<Option<u64>> {
     let mut slots: Vec<Option<&mut Built>> = built.iter_mut().map(Some).collect();
-    time_with(&mut slots, || None, None, Pass::Whole)
+    time_with(&mut slots, || None, None, Pass::Whole, false)
 }
 
 /// [`time`] through [`rounds`] under `hopeless` and `pass` of the
@@ -919,6 +934,7 @@ fn time_with<B: BorrowMut<Built>>(
     mut arrive: impl FnMut() -> Option<(usize, B)>,
     hopeless: Option<f64>,
     pass: Pass,
+    budgeted: bool,
 ) -> Vec<Option<u64>> {
     let _device = DEVICE.lock().unwrap_or_else(PoisonError::into_inner);
     let count = slots.len();
@@ -931,23 +947,36 @@ fn time_with<B: BorrowMut<Built>>(
     warm_clock(CLOCK_WARMUP, || run(plan));
     // A plan's last timed run sizes its sustain, one timed run first.
     let mut last: Vec<Vec<Option<Duration>>> = vec![vec![]; count];
-    let mut time = |i: usize, abort: Option<Duration>| {
+    let mut time = |i: usize, abort: Option<Duration>, leader: bool| {
         let plans = ready(i, slots, &mut arrive, &mut ran)?;
         let last = &mut last[i];
         last.resize(plans.len(), None);
-        for (plan, last) in plans.iter().zip(last.iter_mut()).filter(|(_, last)| last.is_none()) {
+        // The first timed run, where this call takes it.
+        let mut fresh = vec![None; plans.len()];
+        for ((plan, last), fresh) in plans.iter().zip(last.iter_mut()).zip(&mut fresh).filter(|((_, l), _)| l.is_none())
+        {
             *last = Some(run(plan)?);
+            *fresh = *last;
         }
         let first: Duration = last.iter().flatten().sum();
         if abort.is_some_and(|abort| first > abort) {
             return Some(first);
         }
-        sustain(&plans, SUSTAIN, first);
+        let (runs, sustained) = match budgeted && !leader {
+            true => (runs(first), first < SUSTAIN),
+            false => (RUNS, true),
+        };
+        if sustained {
+            sustain(&plans, SUSTAIN, first);
+        }
         plans
             .iter()
             .zip(last.iter_mut())
-            .map(|(plan, last)| {
-                let t = best((0..RUNS).map(|_| run(plan)))?;
+            .zip(fresh)
+            .map(|((plan, last), fresh)| {
+                // Unsustained, the first run is as good as the next ones.
+                let kept = fresh.filter(|_| !sustained);
+                let t = best(kept.map(Some).into_iter().chain((kept.is_some() as usize..runs).map(|_| run(plan))))?;
                 *last = Some(t);
                 Some(t)
             })
@@ -994,17 +1023,18 @@ fn ready<'s, B: BorrowMut<Built>>(
 /// over both neighbours' runs keeps that out of the choice.
 /// `time` times a candidate; in the first round its
 /// second argument is the bar, `hopeless` times the best time so far, past
-/// which the candidate's first run may stand as its time. `None` where a
-/// candidate failed to run.
+/// which the candidate's first run may stand as its time; its third says a
+/// leaders' round (timed at full [`RUNS`]). `None` where a candidate failed
+/// to run.
 pub(crate) fn rounds(
     count: usize,
     hopeless: Option<f64>,
     pass: Pass,
-    mut time: impl FnMut(usize, Option<Duration>) -> Option<Duration>,
+    mut time: impl FnMut(usize, Option<Duration>, bool) -> Option<Duration>,
 ) -> Vec<Option<Duration>> {
     let mut lead: Option<Duration> = None;
     let mut best = round_robin_min(count, 1, None, |i| {
-        let t = time(i, hopeless.zip(lead).map(|(k, lead)| lead.mul_f64(k)));
+        let t = time(i, hopeless.zip(lead).map(|(k, lead)| lead.mul_f64(k)), false);
         lead = t.map(|t| lead.map_or(t, |lead| lead.min(t))).or(lead);
         t
     });
@@ -1018,7 +1048,7 @@ pub(crate) fn rounds(
     for round in 1..if screened { 2 } else { ROUNDS } {
         let order: Vec<usize> = if round % 2 == 1 { live.iter().rev().copied().collect() } else { live.clone() };
         for &i in &order {
-            let t = time(i, None);
+            let t = time(i, None, false);
             later[i] = t.map(|t| later[i].map_or(t, |l: Duration| l.min(t)));
             best[i] = t.and_then(|t| best[i].map(|b| b.min(t)));
         }
@@ -1031,7 +1061,7 @@ pub(crate) fn rounds(
         leaders.sort_by_key(|&i| best[i]);
         leaders.truncate(2);
         if let [first, second] = leaders[..] {
-            let more = round_robin_min(2, ROUNDS, None, |j| time(leaders[j], None));
+            let more = round_robin_min(2, ROUNDS, None, |j| time(leaders[j], None, true));
             for (&i, more) in leaders.iter().zip(more) {
                 best[i] = more.and_then(|m| best[i].map(|b| b.min(m)));
             }

@@ -551,7 +551,7 @@ fn scripted_rounds(runs: &[&[u64]], losers: usize, pass: Pass, want_calls: &[usi
     use std::cell::RefCell;
     let runs: Vec<&[u64]> = runs.iter().copied().chain(std::iter::repeat_n(&[1000][..], losers)).collect();
     let calls = RefCell::new(vec![0usize; runs.len()]);
-    let got = tune::rounds(runs.len(), None, pass, |i, _| {
+    let got = tune::rounds(runs.len(), None, pass, |i, _, _| {
         let mut calls = calls.borrow_mut();
         let run = runs[i].get(calls[i]).or(runs[i].last()).copied();
         calls[i] += 1;
@@ -567,15 +567,17 @@ fn scripted_rounds(runs: &[&[u64]], losers: usize, pass: Pass, want_calls: &[usi
 
 /// The first round runs in the given order and the later ones backwards and
 /// forwards in turn, so each candidate runs after both its neighbours; the
-/// leaders' rounds alternate the two. A screen's second round runs backwards.
-#[test_case(Pass::Whole, &[0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1]; "every round")]
-#[test_case(Pass::Screen, &[0, 1, 2, 3, 3, 2, 1, 0]; "a screen")]
-fn later_rounds_alternate_their_order(pass: Pass, want: &[usize]) {
+/// leaders' rounds alternate the two, the only calls told they are a
+/// leaders' round. A screen's second round runs backwards.
+#[test_case(Pass::Whole, &[0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 2, 3, 3, 2, 1, 0], &[0, 1, 0, 1, 0, 1, 0, 1]; "every round")]
+#[test_case(Pass::Screen, &[0, 1, 2, 3, 3, 2, 1, 0], &[]; "a screen")]
+fn later_rounds_alternate_their_order(pass: Pass, want: &[usize], leaders: &[usize]) {
     let mut order = vec![];
-    tune::rounds(4, None, pass, |i, _| {
-        order.push(i);
+    tune::rounds(4, None, pass, |i, _, leader| {
+        order.push((i, leader));
         Some(Duration::from_nanos(100 + i as u64))
     });
+    let want: Vec<(usize, bool)> = want.iter().map(|&i| (i, false)).chain(leaders.iter().map(|&i| (i, true))).collect();
     assert_eq!(order, want);
 }
 
@@ -609,7 +611,7 @@ fn hopeless_candidates_stop_at_their_first_run(
 ) {
     use std::cell::RefCell;
     let (calls, aborted) = (RefCell::new(vec![0usize; runs.len()]), RefCell::new(vec![false; runs.len()]));
-    let got = tune::rounds(runs.len(), Some(2.0), Pass::Whole, |i, bar| {
+    let got = tune::rounds(runs.len(), Some(2.0), Pass::Whole, |i, bar, _| {
         let (first, settled) = runs[i];
         let mut calls = calls.borrow_mut();
         calls[i] += 1;
@@ -631,7 +633,7 @@ fn hopeless_candidates_stop_at_their_first_run(
 #[test]
 fn without_a_hopeless_factor_every_candidate_runs_whole() {
     let mut calls = vec![0; 2];
-    let got = tune::rounds(2, None, Pass::Whole, |i, bar| {
+    let got = tune::rounds(2, None, Pass::Whole, |i, bar, _| {
         assert_eq!(bar, None);
         calls[i] += 1;
         Some(Duration::from_nanos([100, 1000][i]))
@@ -845,6 +847,18 @@ fn a_tuning_lowers_each_program_once() {
     assert_eq!(fresh.lowered(prog, lowering, &keep), Some(alone));
     assert_eq!(fresh.fingerprint_keeping(std::slice::from_ref(&candidate), Some(&keep)), fingerprinted);
     assert!(keep.0.lock().unwrap().is_empty(), "nothing lowered: the compile remembered what it emits");
+}
+
+/// A tuner's round gives a candidate the runs 20 ms of device time holds,
+/// two to five: a short kernel the five a probe's round gives.
+#[test_case(1_000, 5; "a short kernel")]
+#[test_case(4_000, 5; "five fit")]
+#[test_case(5_000, 4; "four fit")]
+#[test_case(8_000, 3; "three fit")]
+#[test_case(10_000, 2; "two fit")]
+#[test_case(70_000, 2; "a long kernel still runs twice")]
+fn a_round_gives_the_runs_its_budget_holds(us: u64, want: usize) {
+    assert_eq!(tune::runs(Duration::from_micros(us)), want);
 }
 
 /// A stream runs its jobs on the pool at most `width` at once, starting
