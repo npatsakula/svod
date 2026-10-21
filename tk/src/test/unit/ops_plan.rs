@@ -731,12 +731,11 @@ fn the_shortlist_is_the_first_tiles_that_do_not_spill(
             _ => Compiled::Clean,
         })
         .collect();
-    let mut asked = vec![];
-    let got = config::shortlist(&ranked, |batch| {
-        asked.extend(batch.iter().map(|p| p.at));
-        batch.iter().map(|p| verdicts[p.at]).collect()
-    });
+    let mut compiles =
+        Verdicts { verdicts: &verdicts, order: [0].iter().cycle(), room: 0, flight: vec![], asked: vec![] };
+    let got = config::shortlist(&ranked, &mut compiles);
     assert_eq!(got.as_deref(), want);
+    let mut asked = compiles.asked;
     asked.sort_unstable();
     assert_eq!(asked, walked(&ranked, &verdicts), "compiled as a walk compiles");
     assert_eq!(asked.len(), compiled);
@@ -789,11 +788,13 @@ fn batched(ranked: &[Pipe], verdicts: &[Compiled]) -> Option<Vec<usize>> {
 proptest::proptest! {
     /// Whatever the tiles and verdicts, and in whatever order compiles
     /// finish, the search admits what the batched shortlist admitted and
-    /// compiles what a walk in ranked order compiles.
+    /// compiles what a walk in ranked order compiles, only that where the
+    /// compiler has no room to start pipelines early.
     #[test]
     fn the_search_admits_what_the_batches_did(
         configs in proptest::collection::vec((0usize..120, 0u8..10), 0..400),
         order in proptest::collection::vec(proptest::num::usize::ANY, 1..64),
+        room in 1usize..12,
     ) {
         let ranked: Vec<Pipe> = configs.iter().enumerate().map(|(at, &(tile, _))| Pipe { at, tile }).collect();
         let verdicts: Vec<Compiled> = configs
@@ -805,28 +806,47 @@ proptest::proptest! {
             })
             .collect();
         let want = batched(&ranked, &verdicts);
-        let mut asked = vec![];
-        let got = config::shortlist(&ranked, |batch| {
-            asked.extend(batch.iter().map(|p| p.at));
-            batch.iter().map(|p| verdicts[p.at]).collect()
-        });
-        proptest::prop_assert_eq!(&got, &want);
-        asked.sort_unstable();
         let walk = walked(&ranked, &verdicts);
-        proptest::prop_assert_eq!(&asked, &walk);
-        // Verdicts back one at a time in an arbitrary order, more asked between.
-        let mut search = config::Search::new(&ranked, SHORTLIST);
-        let (mut flight, mut done, mut picks) = (vec![], vec![], order.iter().cycle());
-        loop {
-            flight.extend(std::iter::from_fn(|| search.next()));
-            let Some(&pick) = picks.next().filter(|_| !flight.is_empty()) else { break };
-            let at = flight.swap_remove(pick % flight.len());
-            search.record(at, verdicts[at]);
-            done.push(at);
+        for (order, room) in [(vec![0], 0), (order.clone(), 0), (order, room)] {
+            let mut compiles = Verdicts { verdicts: &verdicts, order: order.iter().cycle(), room, flight: vec![], asked: vec![] };
+            let got = config::shortlist(&ranked, &mut compiles);
+            proptest::prop_assert_eq!(&got, &want);
+            compiles.asked.sort_unstable();
+            if room == 0 {
+                proptest::prop_assert_eq!(&compiles.asked, &walk);
+            } else {
+                proptest::prop_assert!(walk.iter().all(|at| compiles.asked.contains(at)), "the walk's compiles");
+            }
         }
-        done.sort_unstable();
-        proptest::prop_assert_eq!(&search.judged(), &want);
-        proptest::prop_assert_eq!(&done, &walk);
+    }
+}
+
+/// Compiles whose verdicts are known, finished in the order `order` picks
+/// among those in flight (`[0]`: the order started, as one at a time), idle
+/// with fewer than `room` in flight (0: never, nothing started early).
+struct Verdicts<'a, I> {
+    verdicts: &'a [Compiled],
+    order: I,
+    room: usize,
+    flight: Vec<usize>,
+    asked: Vec<usize>,
+}
+
+impl<'a, C, I: Iterator<Item = &'a usize>> config::Compiles<C> for Verdicts<'a, I> {
+    fn start(&mut self, at: usize, _: C) {
+        assert!(!self.asked.contains(&at), "started once");
+        self.flight.push(at);
+        self.asked.push(at);
+    }
+
+    fn idle(&self) -> bool {
+        self.flight.len() < self.room
+    }
+
+    fn finished(&mut self) -> Option<(usize, Compiled)> {
+        let pick = self.order.next().copied().unwrap_or(0) % self.flight.len().max(1);
+        let at = (!self.flight.is_empty()).then(|| self.flight.remove(pick))?;
+        Some((at, self.verdicts[at]))
     }
 }
 
@@ -1940,7 +1960,9 @@ fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usiz
     let ranked = target.attention_ranked(32, 2048, 2048, 64, false, true);
     let reps = representatives(&ranked);
     assert!(reps.iter().all(|c| c.warp_rows == WARP_ROWS), "{reps:?}");
-    let at = shortlist(&reps, |b| vec![crate::tune::Compiled::Clean; b.len()]).expect("a shortlist");
+    let clean = vec![Compiled::Clean; reps.len()];
+    let mut compiles = Verdicts { verdicts: &clean, order: [0].iter().cycle(), room: 0, flight: vec![], asked: vec![] };
+    let at = shortlist(&reps, &mut compiles).expect("a shortlist");
     assert_eq!(at.iter().map(|&i| (reps[i].bq, reps[i].bkv)).collect::<Vec<_>>(), tiles);
     for (i, wide) in ranked.iter().enumerate().filter(|(_, c)| !c.represents()) {
         let one = FaCfg { warp_rows: WARP_ROWS, ..*wide };

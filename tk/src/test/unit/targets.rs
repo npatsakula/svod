@@ -551,6 +551,18 @@ pub(super) fn on_device_with(
     params: &[Vec<f64>],
     vars: &[(&str, i64)],
 ) -> Vec<Option<Vec<f64>>> {
+    launched(prog, lowering, params, vars, false)
+}
+
+/// [`on_device_with`], the program lowered for its target alone first and
+/// launched as that body where `lowered`, as the tuner launches it.
+fn launched(
+    prog: Program,
+    lowering: &Lowering,
+    params: &[Vec<f64>],
+    vars: &[(&str, i64)],
+    lowered: bool,
+) -> Vec<Option<Vec<f64>>> {
     let decl = prog.params.clone();
     let tensors: Vec<Tensor> = decl
         .iter()
@@ -561,7 +573,13 @@ pub(super) fn on_device_with(
         })
         .collect();
     let refs: Vec<&Tensor> = tensors.iter().collect();
-    let outs = graph_launch_all(prog, lowering, &refs).unwrap();
+    let outs = match lowered {
+        true => {
+            let body = crate::lower::standalone(prog.clone(), lowering).unwrap().program;
+            crate::launch::graph_launch_lowered(&prog, lowering, body, &refs).unwrap()
+        }
+        false => graph_launch_all(prog, lowering, &refs).unwrap(),
+    };
     decl.iter()
         .zip(outs)
         .map(|(p, t)| {
@@ -603,6 +621,24 @@ fn check_on_device(target: &Target) {
 fn families_match_the_interpreter_on_the_device() {
     let Some(target) = super::device_target() else { return };
     check_on_device(&target);
+}
+
+/// Each family lowered for its target alone and launched as that body, as
+/// the tuner launches a candidate it fingerprinted, writes bit for bit what
+/// the same program lowered at its launch writes.
+#[test]
+fn a_program_lowered_alone_runs_as_one_lowered_at_launch() {
+    let Some(target) = super::device_target() else { return };
+    for (name, prog, lowering) in families(&target) {
+        let params = inputs(&name, &prog);
+        let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
+        let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        let bits = |outs: Vec<Option<Vec<f64>>>| -> Vec<Option<Vec<u64>>> {
+            outs.into_iter().map(|o| o.map(|v| v.iter().map(|x| x.to_bits()).collect())).collect()
+        };
+        let at_launch = bits(launched(prog.clone(), &lowering, &params, &vars, false));
+        assert_eq!(bits(launched(prog, &lowering, &params, &vars, true)), at_launch, "{name}");
+    }
 }
 
 /// The device's occupancy facts come from the device where it reports them

@@ -827,3 +827,60 @@ fn a_build_unused_for_long_loses_its_memo() {
     assert!(!old.exists() && recent.exists());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A program is lowered once per tuning: what a fingerprint lowers is kept
+/// for the compile and handed over once, the program its target lowers to
+/// alone; one the compile lowers first is remembered, so the fingerprint
+/// after it finds what it emits without lowering, the same as lowering it.
+#[test]
+fn a_tuning_lowers_each_program_once() {
+    let candidate = gemm_candidate(sm86(), super::costs());
+    let [(prog, lowering)] = &candidate[..] else { unreachable!("one program") };
+    let alone = crate::lower::standalone(prog.clone(), lowering).expect("lowers").program;
+    let (store, keep) = (TuneStore::at(None), tune::Lowerings::default());
+    let fingerprinted = store.fingerprint_keeping(std::slice::from_ref(&candidate), Some(&keep));
+    assert_eq!(store.lowered(prog, lowering, &keep), Some(alone.clone()), "kept by the fingerprint");
+    assert_eq!(store.lowered(prog, lowering, &keep), Some(alone.clone()), "lowered again once taken");
+    let (fresh, keep) = (TuneStore::at(None), tune::Lowerings::default());
+    assert_eq!(fresh.lowered(prog, lowering, &keep), Some(alone));
+    assert_eq!(fresh.fingerprint_keeping(std::slice::from_ref(&candidate), Some(&keep)), fingerprinted);
+    assert!(keep.0.lock().unwrap().is_empty(), "nothing lowered: the compile remembered what it emits");
+}
+
+/// A stream runs its jobs on the pool at most `width` at once, starting
+/// them in the order queued, every result back once; a job's panic resumes
+/// on the caller's thread.
+#[test]
+fn a_stream_runs_width_jobs_at_once_in_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let started = std::sync::Mutex::new(vec![]);
+    let run = |job: usize| {
+        started.lock().unwrap().push(job);
+        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+        most.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(5));
+        running.fetch_sub(1, Ordering::SeqCst);
+        job * 2
+    };
+    let mut got = tune::streamed(2, run, |stream| {
+        (0..12).for_each(|job| stream.push(job));
+        std::iter::from_fn(|| stream.next()).collect::<Vec<_>>()
+    });
+    got.sort_unstable();
+    assert_eq!(got, (0..12).map(|j| j * 2).collect::<Vec<_>>());
+    assert!(most.load(Ordering::SeqCst) <= 2, "at most two at once");
+    let started = started.into_inner().unwrap();
+    assert!(started.iter().enumerate().all(|(i, &j)| i.abs_diff(j) < 2), "started in queue order: {started:?}");
+    let panicked = std::panic::catch_unwind(|| {
+        tune::streamed(
+            2,
+            |job: usize| assert!(job != 3, "job 3 fails"),
+            |stream| {
+                (0..6).for_each(|job| stream.push(job));
+                while stream.next().is_some() {}
+            },
+        )
+    });
+    assert!(panicked.is_err(), "the job's panic reached the caller");
+}

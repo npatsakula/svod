@@ -15,7 +15,10 @@ config को admit नहीं करता। एक नियम करत�
 उसके tile की उससे ऊपर ranked pipelines spill या fail हुईं, और 64वें clean tile के बाद कोई नहीं: ठीक
 वही जो ranked क्रम में एक-एक config compile करने वाला walk compile करता (`config::Search`)। जब compile होने
 वाला हर config spill करे, तब भी उनमें से पहले 64 मापे जाते हैं: spills की वजह से कोई op ग्राफ़ पर नहीं
-गिरता।
+गिरता। किसी config का compile thread pool पर तभी शुरू हो जाता है जब search उसे माँगती है (pool में जगह हो तो tile की अगली pipeline तभी शुरू हो जाती है जब पिछली अभी compile हो रही हो, और उसका verdict वहीं गिना जाता है जहाँ walk उसे माँगता); जिसका compiler
+30 s (`tune::COMPILE_TIMEOUT`) से ज़्यादा चले उसे kill करके fail की तरह reject किया जाता है, और planner
+log यह बताता है (`compile timed out`)। हर program एक tuning में एक बार lower होता है: store के fingerprint
+ने जो lower किया वही body compile launch करता है।
 
 Admit हुए configs, अपने variants के साथ (attention के लिए key splits, भूखे convolution के लिए
 reduction splits), वे candidates हैं जिन्हें tune store तब मापता है जब कोई device पहली बार किसी shape
@@ -46,7 +49,9 @@ variable अपने maximum पर bound होता है (float operands �
 
 Sustain का आकार device time में तय होता है क्योंकि launches asynchronously queue होते हैं। एक
 candidate programs की एक list है, एक कर्नेल और split होने पर उसके partial results का merge, और उसका
-समय उसके programs के समयों का जोड़ है। जो candidate build या run होने में विफल हो उसे छोड़ दिया जाता
+समय उसके programs के समयों का जोड़ है। जो candidates timing शुरू होने तक compile नहीं हुए (split के variants,
+tile के twins) वे pool के एक को छोड़ बाकी सभी threads पर compile होते हैं जबकि तैयार candidates मापे जाते हैं,
+हर एक तब जब ranked क्रम उस तक पहुँचे। जो candidate build या run होने में विफल हो उसे छोड़ दिया जाता
 है। अगर कुछ भी नहीं मापा जाता, तो पहला candidate इस्तेमाल होता है और कुछ भी store नहीं होता।
 
 दो पहरेदार समय को ईमानदार रखते हैं:

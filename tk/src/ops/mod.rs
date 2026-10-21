@@ -181,8 +181,9 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
 
     /// The fingerprint of the programs `build` makes of `list`, what an
     /// admission's store line carries: a lowering change re-judges.
-    fn programs(store: &TuneStore, build: &B, list: &[C]) -> u64 {
-        store.fingerprint(&list.iter().map(|&c| build(c)).collect::<Vec<_>>())
+    /// The programs lowered for it are kept in `keep` for their compile.
+    fn programs(store: &TuneStore, build: &B, list: &[C], keep: &tune::Lowerings) -> u64 {
+        store.fingerprint_keeping(&list.iter().map(|&c| build(c)).collect::<Vec<_>>(), Some(keep))
     }
 
     fn key(&self, op: &'static str, list: &[C]) -> TuneKey {
@@ -206,8 +207,9 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         let ranked = &config::representatives(ranked);
         let key = self.key(op, ranked);
         let (store, bench, build) = (self.store, &mut self.bench, &self.build);
-        let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::FIRST)]);
-        let find = || config::first_clean(ranked, |batch| bench.admit(batch, build));
+        let keep = bench.lowered.clone();
+        let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::FIRST)], &keep);
+        let find = || config::first_clean(ranked, |batch| bench.admit(batch, build, store));
         let at = store.first(&key, programs, find);
         let cfg = ranked.get(at.unwrap_or(0)).copied();
         tracing::debug!(target: PLAN, op, shape = ?self.shape, ?cfg, stored = at.is_some(), "first");
@@ -224,8 +226,9 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         }
         let key = self.key(op, ranked);
         let (store, bench, build) = (self.store, &mut self.bench, &self.build);
-        let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::SHORTLIST)]);
-        let admit = || config::shortlist(ranked, |batch| bench.admit(batch, build));
+        let keep = bench.lowered.clone();
+        let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::SHORTLIST)], &keep);
+        let admit = || bench.shortlist(ranked, build, store);
         let found = store.admitted(&key, programs, admit);
         let configs: Vec<C> = match &found {
             Some(at) => at.iter().map(|&i| ranked[i]).collect(),
@@ -294,8 +297,9 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         }
         let key = self.keyed(op, " compiled", &twins);
         let (store, bench, build) = (self.store, &mut self.bench, &self.build);
-        let admit = || config::compiled(&twins, |batch| bench.admit(batch, build));
-        let judged = store.admitted(&key, || Self::programs(store, build, &twins), admit);
+        let keep = bench.lowered.clone();
+        let admit = || config::compiled(&twins, |batch| bench.admit(batch, build, store));
+        let judged = store.admitted(&key, || Self::programs(store, build, &twins, &keep), admit);
         let compiled: Vec<C> = judged.iter().flat_map(|at| at.iter().map(|&i| twins[i])).collect();
         tracing::debug!(target: PLAN, op, shape = ?self.shape, ?compiled, "twins admitted");
         if compiled.len() > 1 { self.fastest(op, &compiled) } else { winner }

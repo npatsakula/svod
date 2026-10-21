@@ -494,7 +494,7 @@ const SPLIT_BLOCKS_PER_SM: usize = 16;
 /// refuse, so the shortlist holds one config per tile, its first clean
 /// pipeline ([`shortlist`]); the tile that wins has its other pipelines,
 /// its [`twins`](Self::twins), timed after.
-pub(crate) trait Tiled: Copy + Eq + Hash {
+pub(crate) trait Tiled: Copy + Eq + Hash + Send {
     fn tile(&self) -> Self;
 
     /// The configs of `ranked` sharing this tile, each under this config's
@@ -593,21 +593,33 @@ pub(crate) fn distinct_configs<C: Tiled>(list: &[C]) -> Vec<C> {
 /// so a spilling unrolled ring yields to its rolled twin), in ranked order;
 /// where every config that compiled spills, the first [`SHORTLIST`] of
 /// those (the time judges, and a spilling kernel still beats the graph's).
-/// `compile` is asked about what the [`Search`] wants, all of it at once
-/// (the tuner compiles in parallel), until it wants nothing more. `None`
-/// when nothing compiled: no device to judge on.
-pub(crate) fn shortlist<C: Tiled>(ranked: &[C], mut compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<Vec<usize>> {
+/// `compiles` is handed what the [`Search`] wants as soon as it wants it
+/// (the tuner compiles in parallel, in the order handed), each verdict
+/// taken as it lands, until nothing more is wanted. `None` when nothing
+/// compiled: no device to judge on.
+pub(crate) fn shortlist<C: Tiled>(ranked: &[C], compiles: &mut impl Compiles<C>) -> Option<Vec<usize>> {
     let mut search = Search::new(ranked, SHORTLIST);
     loop {
-        let wave: Vec<usize> = std::iter::from_fn(|| search.next()).collect();
-        if wave.is_empty() {
-            return search.judged();
+        while let Some(at) = search.next() {
+            compiles.start(at, ranked[at]);
         }
-        let configs: Vec<C> = wave.iter().map(|&at| ranked[at]).collect();
-        for (at, verdict) in wave.into_iter().zip(compile(&configs)) {
-            search.record(at, verdict);
+        while compiles.idle()
+            && let Some(at) = search.spare()
+        {
+            compiles.start(at, ranked[at]);
         }
+        let Some((at, verdict)) = compiles.finished() else { return search.judged() };
+        search.record(at, verdict);
     }
+}
+
+/// Compiles started by a ranked index, their verdicts back in any order.
+pub(crate) trait Compiles<C> {
+    fn start(&mut self, at: usize, config: C);
+    /// Whether a compile started now would run at once, beside nothing queued.
+    fn idle(&self) -> bool;
+    /// A compile that finished, waiting for one; `None` when none is in flight.
+    fn finished(&mut self) -> Option<(usize, Compiled)>;
 }
 
 /// The shortlist's search of a ranked list: it compiles what a walk in
@@ -616,8 +628,12 @@ pub(crate) fn shortlist<C: Tiled>(ranked: &[C], mut compile: impl FnMut(&[C]) ->
 /// `limit`th tile found clean and skips a config once a pipeline of its
 /// tile ahead of it is clean; here a config is wanted ([`Self::next`]) once
 /// every pipeline of its tile ahead of it is judged unclean and fewer than
-/// `limit` tiles ahead of it are clean or have a compile in flight.
-pub(crate) struct Search {
+/// `limit` tiles ahead of it are clean or have a compile in flight. Where
+/// the compiler has room, the next pipeline of a tile whose pipeline ahead
+/// is still compiling may start early ([`Self::spare`]): a slow compile
+/// (one killed at its deadline) holds no chain of its tile's pipelines up
+/// one after another, and the walk ignores what it would not have asked.
+struct Search {
     /// Each config's tile, numbered in order of first appearance.
     tiles: Vec<usize>,
     limit: usize,
@@ -626,7 +642,7 @@ pub(crate) struct Search {
 }
 
 impl Search {
-    pub(crate) fn new<C: Tiled>(ranked: &[C], limit: usize) -> Self {
+    fn new<C: Tiled>(ranked: &[C], limit: usize) -> Self {
         let mut ids = HashMap::new();
         let tiles = ranked
             .iter()
@@ -640,7 +656,7 @@ impl Search {
 
     /// The next config wanted, marked asked; `None` while the rest wait on
     /// verdicts in flight, and once nothing more is wanted.
-    pub(crate) fn next(&mut self) -> Option<usize> {
+    fn next(&mut self) -> Option<usize> {
         let (mut clean, mut open) = (HashSet::new(), HashSet::new());
         for (at, &tile) in self.tiles.iter().enumerate() {
             if clean.len() + open.len() >= self.limit {
@@ -662,12 +678,42 @@ impl Search {
         None
     }
 
-    pub(crate) fn record(&mut self, at: usize, verdict: Compiled) {
+    /// A pipeline the walk may yet want, marked asked: the first not asked
+    /// of a tile whose pipeline ahead of it is compiling, within the tiles
+    /// [`Self::next`] reaches. Its verdict counts only where the walk asks
+    /// for it: a clean pipeline ahead of it takes its tile first, and past
+    /// the `limit`th clean tile the shortlist ends.
+    fn spare(&mut self) -> Option<usize> {
+        let (mut clean, mut open) = (HashSet::new(), HashSet::new());
+        for (at, &tile) in self.tiles.iter().enumerate() {
+            if clean.len() + open.len() >= self.limit {
+                return None;
+            }
+            if clean.contains(&tile) {
+                continue;
+            }
+            if open.contains(&tile) {
+                if self.verdicts[at].is_none() && !self.asked[at] {
+                    self.asked[at] = true;
+                    return Some(at);
+                }
+                continue;
+            }
+            match self.verdicts[at] {
+                Some(Compiled::Clean) => _ = clean.insert(tile),
+                None if self.asked[at] => _ = open.insert(tile),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn record(&mut self, at: usize, verdict: Compiled) {
         self.verdicts[at] = Some(verdict);
     }
 
     /// The shortlist the verdicts make ([`shortlist`]).
-    pub(crate) fn judged(&self) -> Option<Vec<usize>> {
+    fn judged(&self) -> Option<Vec<usize>> {
         let mut tiles = HashSet::new();
         let at = |want| self.verdicts.iter().enumerate().filter(move |(_, v)| **v == Some(want)).map(|(i, _)| i);
         let clean: Vec<usize> = at(Compiled::Clean).filter(|&i| tiles.insert(self.tiles[i])).collect();

@@ -95,3 +95,28 @@ fn dumps_of_one_kernel_name_do_not_collide() {
 fn a_dump_is_named_by_its_module(ir: &str, stem: &str) {
     assert!(dump_name("sm_86", ir, "ll").starts_with(stem));
 }
+
+/// A compiler process past the thread's deadline is killed and its compile
+/// fails at once; one that exits first returns its output whole, however much
+/// it writes; outside the deadline's scope nothing is killed.
+#[test]
+fn a_compile_past_its_deadline_is_killed() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    let sleeper = || {
+        let mut c = Command::new("sh");
+        c.args(["-c", "sleep 5; echo late"]);
+        c
+    };
+    let start = Instant::now();
+    let killed = with_compile_deadline(start + Duration::from_millis(100), || run_piped(sleeper(), b"", "sleep"));
+    assert!(killed.is_err_and(|e| e.to_string().contains("deadline")));
+    assert!(start.elapsed() < Duration::from_secs(2), "killed at the deadline, not after the sleep");
+    let input = vec![b'x'; 1 << 20];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let echoed = with_compile_deadline(deadline, || run_piped(Command::new("cat"), &input, "cat"));
+    assert_eq!(echoed.unwrap(), input);
+    let mut quick = Command::new("sh");
+    quick.args(["-c", "sleep 0.2; echo done"]);
+    assert_eq!(run_piped(quick, b"", "sleep").unwrap(), b"done\n");
+}

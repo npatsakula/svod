@@ -14,7 +14,11 @@ admitted at its first clean pipeline (ring depth, unrolling), so an unrolled rin
 yields to its rolled twin. A pipeline is compiled only when the tile's pipelines ranked ahead of
 it spilled or failed, and none past the 64th clean tile: what a walk in ranked order compiling
 one config at a time would compile (`config::Search`). When every config that compiles spills,
-the first 64 of those are timed anyway: no op falls to the graph because of spills.
+the first 64 of those are timed anyway: no op falls to the graph because of spills. A config's
+compile starts as soon as the search wants it, on the thread pool (where the pool has room, a tile's next pipeline starts while the one ahead still compiles, its verdict used only where the walk would have asked for it); one whose compiler runs past
+30 s (`tune::COMPILE_TIMEOUT`) is killed and rejected as a failure would be, and the planner log
+says so (`compile timed out`). Each program is lowered once per tuning: what the store's
+fingerprint lowered is the body the compile launches.
 
 The admitted configs, with their variants (key splits for attention, reduction splits for a
 starved convolution), are the candidates the tune store measures the first time a device meets
@@ -44,7 +48,9 @@ clocks down under real data is timed as it will run; integer operands hold zeros
 
 The sustain is sized in device time because launches queue asynchronously. A candidate is a
 list of programs, a kernel plus the merge of its partial results for a split, and its time is
-the sum of its programs' times. A candidate that fails to build or run is skipped. If nothing
+the sum of its programs' times. Candidates not compiled yet when a timing starts (a split's
+variants, a tile's twins) compile on all but one of the pool's threads while the ones ready are
+timed, each timed when the ranked order reaches it. A candidate that fails to build or run is skipped. If nothing
 measures, the first candidate is used and nothing is stored.
 
 Two guards keep a time honest:

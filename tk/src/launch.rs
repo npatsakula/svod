@@ -61,7 +61,47 @@ pub(crate) fn graph_launch_once(prog: Program, lowering: &Lowering, tensors: &[&
     Ok(launch_all(prog, lowering, tensors, false)?.swap_remove(out_at))
 }
 
-fn first_output(prog: &Program) -> usize {
+/// [`graph_launch_all`] of `body`, `prog` lowered already for its target
+/// alone ([`lower::standalone`]), kept in no memo: its parameters are
+/// positional in `prog.params` order, so the call binds `tensors` in that
+/// order. Where this device or the tensors' placeholders are not the ones it
+/// was lowered over, `prog` is lowered again for them.
+pub(crate) fn graph_launch_lowered(
+    prog: &Program,
+    lowering: &Lowering,
+    body: Arc<UOp>,
+    tensors: &[&Tensor],
+) -> Result<Vec<Tensor>> {
+    let name = prog.name.clone();
+    snafu::ensure!(
+        tensors.len() == prog.params.len(),
+        AritySnafu { name: name.clone(), want: prog.params.len(), got: tensors.len() }
+    );
+    let standalone = match lowering.device.target.arch {
+        svod_dtype::GpuArch::Cuda(_) => DeviceSpec::Cuda { device_id: 0 },
+        svod_dtype::GpuArch::Amd(_) => DeviceSpec::Amd { device_id: 0 },
+        svod_dtype::GpuArch::Metal(_) => DeviceSpec::Metal { device_id: 0 },
+    };
+    if default_device() != standalone || tensors.is_empty() {
+        return launch_all(prog.clone(), lowering, tensors, false);
+    }
+    let origin = svod_ir::origin::current();
+    let info =
+        CallInfo { name: Some(name.clone()), origin, origins: origin.into_iter().collect(), ..CallInfo::default() };
+    let mut fits = true;
+    let outs = tensors[0].custom_kernel_with(&tensors[1..], info, |ph| {
+        let param =
+            |(i, p): (usize, &crate::ir::Param)| UOp::param(i, p.elems, svod_dtype::DType::Scalar(p.dtype), None);
+        fits = ph.iter().zip(prog.params.iter().enumerate().map(param)).all(|(ph, param)| ph.base() == param);
+        if fits { body.without_origins() } else { UOp::noop() }
+    });
+    if !fits {
+        return launch_all(prog.clone(), lowering, tensors, false);
+    }
+    outs.context(GraphSnafu { name })
+}
+
+pub(crate) fn first_output(prog: &Program) -> usize {
     prog.params
         .iter()
         .position(|p| matches!(p.kind, ParamKind::Out | ParamKind::InOut))
