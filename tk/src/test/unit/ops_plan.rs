@@ -1502,22 +1502,49 @@ fn a_streamed_tile_pays_its_rows_again(target: Target) {
     assert!(p(1024).admit(&planner, &streamed).is_ok());
 }
 
-/// A bound batch variable takes the graph: the kernel has no batch axis.
+/// Rows bound to a variable plan as the rows at their bound (the kernels
+/// take the bound rows at launch); bound candidates take the graph.
 #[test]
-fn a_batched_nearest_takes_the_graph() {
+fn bound_rows_plan_at_their_bound_bound_candidates_take_the_graph() {
     use crate::kernels::nearest::{Floors, Metric};
-    let x = Extent { dims: vec![100, 64], var: true };
+    let planner = planner(sm86());
+    let plan = |x: Extent, c: Extent| {
+        shape::nearest(Some(&planner), &[BF16; 2], Some(&x), Some(&c), Metric::SquaredL2, Floors::default(), false, 1)
+    };
+    let bound = Extent { dims: vec![100, 64], var: true };
+    assert_eq!(plan(bound.clone(), ext(&[300, 64])), plan(ext(&[100, 64]), ext(&[300, 64])));
+    assert!(matches!(plan(bound.clone(), ext(&[300, 64])), Plan::Kernel(_)));
+    assert_eq!(plan(ext(&[100, 64]), bound), Plan::Graph(Fallback::Symbolic));
+}
+
+/// A list's way follows its length's bound, a live list planned as the
+/// list of its bound: registers up to [`config::REGISTER_K`], queued into the
+/// outputs and through a score matrix from 33 on, and nothing past the
+/// candidates' f32 index.
+#[test_case(16, true, false; "registers alone")]
+#[test_case(33, true, true; "registers and the long ways")]
+#[test_case(64, true, true; "the longest register list")]
+#[test_case(65, false, true; "past the registers")]
+#[test_case(1024, false, true; "the long ways alone")]
+fn a_list_plans_by_its_bound(k: usize, registers: bool, long: bool) {
+    use crate::kernels::nearest::{Floors, Metric};
+    let planner = planner(sm86());
+    let x = Extent { dims: vec![4096, 128], var: true };
     let plan = shape::nearest(
-        Some(&planner(sm86())),
+        Some(&planner),
         &[BF16; 2],
         Some(&x),
-        Some(&ext(&[100, 64])),
-        Metric::SquaredL2,
+        Some(&ext(&[8192, 128])),
+        Metric::NegDot,
         Floors::default(),
         false,
-        1,
+        k,
     );
-    assert_eq!(plan, Plan::Graph(Fallback::Symbolic));
+    let Plan::Kernel(ranked) = plan else { panic!("k {k} plans no kernel: {plan:?}") };
+    let has = |f: fn(&crate::kernels::nearest::NearestCfg) -> bool| ranked.iter().any(f);
+    assert_eq!(has(|c| c.queue.is_none() && c.select.is_none()), registers, "k {k}: register lists");
+    assert_eq!(has(|c| c.queue.is_some()), long, "k {k}: queued lists");
+    assert_eq!(has(|c| c.select.is_some()), long, "k {k}: score matrices");
 }
 
 /// The cost charges every pair's epilogue beside the product: at a shallow

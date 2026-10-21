@@ -222,7 +222,7 @@ impl Case {
 
     fn spec(&self, depth: usize, cfg: NearestCfg, k: usize) -> NearestSpec {
         let (n, m, metric, floors, groups) = (self.n, self.m, self.metric, self.floors(), self.groups.is_some());
-        NearestSpec { n, m, d: depth, metric, floors, groups, k, cfg }
+        NearestSpec { n, m, d: depth, metric, floors, groups, k, cfg, live: Default::default() }
     }
 
     /// The kernel of `k` scores a row under `cfg` at `depth`, in the case's type.
@@ -232,7 +232,7 @@ impl Case {
     }
 
     fn merge(&self, splits: usize, k: usize) -> MergeSpec {
-        MergeSpec { n: self.n, splits, metric: self.metric, k }
+        MergeSpec { n: self.n, splits, metric: self.metric, k, live: Default::default() }
     }
 
     /// The scores and indices the interpreter computes under `cfg`, split,
@@ -283,7 +283,15 @@ impl Case {
                 params.truncate(params.len() - 2);
                 params.push(vec![0.0; rows * width]);
                 let matrix = run(part.program(depth, cfg, k), &scored, params).pop().unwrap();
-                let spec = SelectSpec { n: rows, cols: width, k, metric: self.metric, first: c0 == 0, cfg: select };
+                let spec = SelectSpec {
+                    n: rows,
+                    cols: width,
+                    k,
+                    metric: self.metric,
+                    first: c0 == 0,
+                    cfg: select,
+                    live: Default::default(),
+                };
                 let chunk = vec![c0 as f64, f64::from(c0 + width == self.m)];
                 let carried = if c0 == 0 { vec![] } else { lists };
                 let params = [vec![matrix, chunk], carried, vec![vec![0.0; rows * k]; 2]].concat();
@@ -639,7 +647,7 @@ fn the_merge_folds_shares_in_order(metric: Metric) {
         };
         want.push((v, j));
     }
-    let (score, index) = merged(&MergeSpec { n, splits, metric, k: 1 }, score, index);
+    let (score, index) = merged(&MergeSpec { n, splits, metric, k: 1, live: Default::default() }, score, index);
     for (i, want) in want.into_iter().enumerate() {
         assert_eq!((score[i], index[i]), want, "row {i}");
     }
@@ -892,7 +900,7 @@ fn the_merge_offers_lists_in_order(metric: Metric) {
         };
         want.extend(entries[..k].iter().map(|&(v, at)| (finish(v), at)));
     }
-    let (score, index) = merged(&MergeSpec { n, splits, metric, k }, score, index);
+    let (score, index) = merged(&MergeSpec { n, splits, metric, k, live: Default::default() }, score, index);
     for (e, want) in want.into_iter().enumerate() {
         assert_eq!((score[e], index[e]), want, "row {} slot {}", e / k, e % k);
     }
@@ -975,8 +983,17 @@ fn split_too(planner: &Planner, case: &Case, depth: usize, k: usize, ranked: &[N
 #[test_case(crate::atoms::sm86(), "@llvm.nvvm.vote.any.sync("; "sm_86")]
 fn a_resident_trip_votes_before_it_places_its_least(target: Target, vote: &str) {
     let device = crate::sweep::declared(target);
-    let case =
-        |cfg| NearestSpec { n: 300, m: 500, d: 64, metric: Metric::NegDot, floors: NONE, groups: false, k: 1, cfg };
+    let case = |cfg| NearestSpec {
+        n: 300,
+        m: 500,
+        d: 64,
+        metric: Metric::NegDot,
+        floors: NONE,
+        groups: false,
+        k: 1,
+        cfg,
+        live: Default::default(),
+    };
     for (cfg, votes) in [(NearestCfg::new(64, 32, 2), true), (NearestCfg::streamed(64, 32, 32, 2), false)] {
         let ir = crate::sweep::render(nearest::<BF16>(&case(cfg)), &cfg.lowering(&device));
         assert_eq!(ir.contains(vote), votes, "{cfg:?}");
@@ -1077,8 +1094,17 @@ fn the_trips_that_lower_a_row_list_its_least(order: Order) {
 #[test_case(crate::atoms::sm86(), "@llvm.nvvm.vote.any.sync("; "sm_86")]
 fn a_list_votes_before_its_rounds(target: Target, vote: &str) {
     let device = crate::sweep::declared(target);
-    let case =
-        |cfg| NearestSpec { n: 300, m: 500, d: 64, metric: Metric::NegDot, floors: NONE, groups: false, k: 8, cfg };
+    let case = |cfg| NearestSpec {
+        n: 300,
+        m: 500,
+        d: 64,
+        metric: Metric::NegDot,
+        floors: NONE,
+        groups: false,
+        k: 8,
+        cfg,
+        live: Default::default(),
+    };
     for cfg in [NearestCfg::new(64, 32, 2), NearestCfg::streamed(64, 32, 32, 2)] {
         let ir = crate::sweep::render(nearest::<BF16>(&case(cfg)), &cfg.lowering(&device));
         assert!(ir.contains(vote), "{cfg:?}");
@@ -1099,8 +1125,17 @@ fn a_list_is_held_beside_its_rows(target: Target) {
     for (cfg, k) in
         [(NearestCfg::new(64, 32, 2), 8), (NearestCfg::streamed(64, 64, 32, 2), 16), (NearestCfg::new(32, 16, 2), 3)]
     {
-        let spec =
-            NearestSpec { n: 300, m: 500, d: 64, metric: Metric::SquaredL2, floors: NONE, groups: false, k, cfg };
+        let spec = NearestSpec {
+            n: 300,
+            m: 500,
+            d: 64,
+            metric: Metric::SquaredL2,
+            floors: NONE,
+            groups: false,
+            k,
+            cfg,
+            live: Default::default(),
+        };
         let grid = crate::layouts::WarpGrid { rows: cfg.warps(), cols: 1 };
         let laid = crate::layouts::infer(nearest::<BF16>(&spec), &device, grid, Core::Warp).unwrap();
         let mut lists = 0;
@@ -1355,7 +1390,7 @@ fn time_list(planner: &Planner, p: config::Nearest, dtype: DType) {
     if !timed.contains(&pick) {
         timed.push(pick);
     }
-    let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups, k, cfg };
+    let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups, k, cfg, live: Default::default() };
     let ns = super::measure(timed.iter().map(|&cfg| tk::nearest::programs(planner, dtype.clone(), &spec(cfg))));
     eprintln!(
         "== nearest {n}x{n}x{d} k{k} {dtype:?} {metric:?} {floors:?} groups={groups}: {} admitted",
@@ -1406,7 +1441,17 @@ fn knn_probe() {
                             time_list(&planner, p, DType::Float16);
                         }
                         let (_, pick) = device_nearest(&planner, p, DType::Float16);
-                        let spec = NearestSpec { n, m, d, metric, floors: NONE, groups: false, k, cfg: pick };
+                        let spec = NearestSpec {
+                            n,
+                            m,
+                            d,
+                            metric,
+                            floors: NONE,
+                            groups: false,
+                            k,
+                            cfg: pick,
+                            live: Default::default(),
+                        };
                         let [ns] = super::measure([tk::nearest::programs(&planner, DType::Float16, &spec)])[..] else {
                             unreachable!("one candidate")
                         };
@@ -1449,7 +1494,7 @@ fn time_gemm(planner: &Planner, m: usize, n: usize, k: usize) {
 fn device_nearest(planner: &Planner, p: config::Nearest, dtype: DType) -> (Vec<NearestCfg>, NearestCfg) {
     let config::Nearest { n, m, d, metric, floors, groups, k } = p;
     let ranked = planner.nearest_ranked(p);
-    let spec = |cfg| NearestSpec { n, m, d, metric, floors, groups, k, cfg };
+    let spec = |cfg| NearestSpec { n, m, d, metric, floors, groups, k, cfg, live: Default::default() };
     let build = |cfg: NearestCfg| tk::nearest::programs(planner, dtype.clone(), &spec(cfg));
     let shape = [n, m, d, k];
     let shape = if k == 1 { &shape[..3] } else { &shape[..] };
@@ -1520,8 +1565,17 @@ fn a_swapped_product_folds_a_row_in_lanes(target: Target, direct: usize, swapped
     let how = target.lane_move;
     let planner = super::planner(target.clone());
     let cfg = NearestCfg { warp_rows: 32, ..NearestCfg::new(128, 64, 2) };
-    let spec =
-        NearestSpec { n: 1000, m: 1000, d: 64, metric: Metric::SquaredL2, floors: NONE, groups: false, k: 1, cfg };
+    let spec = NearestSpec {
+        n: 1000,
+        m: 1000,
+        d: 64,
+        metric: Metric::SquaredL2,
+        floors: NONE,
+        groups: false,
+        k: 1,
+        cfg,
+        live: Default::default(),
+    };
     let grid = crate::layouts::WarpGrid { rows: cfg.warps(), cols: 1 };
     fn pin(block: &mut Block, to: Orient) {
         for s in &mut block.0 {
@@ -1633,7 +1687,8 @@ fn tuning_probe() {
             let (n, metric, floors) = (rows, Metric::NegDot, NONE);
             let p = Problem { n, m: n, d, metric, floors, groups: false, k };
             let ranked = planner.nearest_ranked(p);
-            let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups: false, k, cfg };
+            let spec =
+                |cfg| NearestSpec { n, m: n, d, metric, floors, groups: false, k, cfg, live: Default::default() };
             let build = |cfg: NearestCfg| tk::nearest::programs(&planner, DType::BFloat16, &spec(cfg));
             let salt = (crate::ops::DEVICE_TEST, metric, floors, false);
             let name = format!("nearest {n}x{n}x{d} k{k} {metric:?}");
@@ -1844,3 +1899,5 @@ fn nearest_precision_probe() {
         }
     }
 }
+
+mod live;

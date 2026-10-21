@@ -353,13 +353,14 @@ fn merge<T: Elem, U: Elem>(spec: &MergeSpec) -> Program {
 }
 
 /// The `(row, col)` tile of this block, walking groups of `group_m` tile rows.
-pub(super) fn tile_order(k: &mut Kernel, gm: usize, gn: usize, group_m: usize) -> (Sc, Sc) {
+pub(super) fn tile_order(k: &mut Kernel, gm: impl Into<Sc>, gn: usize, group_m: usize) -> (Sc, Sc) {
     if group_m == 0 {
         return (k.block(0), k.block(1));
     }
-    let id = k.block(0) + k.block(1) * gm;
+    let gm = gm.into();
+    let id = k.block(0) + k.block(1) * gm.clone();
     let first_m = id.clone() / (group_m * gn) * group_m;
-    let rows = (Sc::from(gm) - first_m.clone()).min(group_m);
+    let rows = (gm - first_m.clone()).min(group_m);
     let within = id % (group_m * gn);
     (first_m + within.clone() % rows.clone(), within / rows)
 }

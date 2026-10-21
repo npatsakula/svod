@@ -539,9 +539,19 @@ fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
 /// Every output parameter of `prog` after launching it under `lowering` on
 /// the default device, `None` for inputs.
 pub(super) fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>]) -> Vec<Option<Vec<f64>>> {
-    let decl = prog.params.clone();
     let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
     let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+    on_device_with(prog, lowering, params, &vars)
+}
+
+/// [`on_device`] with the program's variables bound to `vars`.
+pub(super) fn on_device_with(
+    prog: Program,
+    lowering: &Lowering,
+    params: &[Vec<f64>],
+    vars: &[(&str, i64)],
+) -> Vec<Option<Vec<f64>>> {
+    let decl = prog.params.clone();
     let tensors: Vec<Tensor> = decl
         .iter()
         .zip(params)
@@ -556,7 +566,7 @@ pub(super) fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>])
         .zip(outs)
         .map(|(p, t)| {
             (p.kind != ParamKind::In).then(|| {
-                t.prepare().unwrap().execute_with_vars(&vars).unwrap();
+                t.prepare().unwrap().execute_with_vars(vars).unwrap();
                 let mut bytes = vec![0u8; p.elems * p.dtype.bytes()];
                 t.buffer().unwrap().copyout(&mut bytes).unwrap();
                 super::decode(p.dtype, &bytes)
@@ -689,7 +699,7 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
     ] {
         let p = Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors, groups, k };
         for cfg in first_eight(&planner.nearest_ranked(p)) {
-            let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg };
+            let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Default::default() };
             let name = format!("nearest d{d} {metric:?} {floors:?} {groups} k{k} {cfg:?}");
             launches.push((name, nearest::<BF16>(&spec), cfg.lowering(&planner.device)));
         }
@@ -1053,6 +1063,7 @@ fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
         groups: false,
         k: 1,
         cfg,
+        live: Default::default(),
     };
     let ir = render(nearest::<BF16>(&spec), &cfg.lowering(&device));
     let asm = match svod_runtime::amd::compile_ir_to_amd_asm(&ir, arch) {

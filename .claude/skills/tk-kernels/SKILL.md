@@ -207,6 +207,7 @@ The `#[ignore]` probes print and never assert; one at a time on an idle GPU:
 | `device::first_execution_probe` (cp.async), `parts::mma_peak_probe` (CUDA) | build/lower/prepare cost; `mma.sync` ceiling |
 | `probe::probe_signals_are_strong` | every probe pair's signal (run alone) |
 | `nearest::knn_probe` | k-nearest lists: the tuned pick's Gpairs/s per `KNN_ROWS`/`KNN_DEPTHS`/`KNN_KS` (f16, NegDot and SquaredL2) and its share of k=1's (register lists to 64, queued into the outputs and score-matrix lists past 32); `KNN_CANDIDATES` for a search instead of a self-join, `KNN_GRAPH`/`KNN_GRAPH_K` the graph fallback beside, `KNN_ALL` times every admitted config |
+| `nearest::live::live_probe` | the op over rows bound to a variable against the op at the bound count (`LIVE_ROWS`, `LIVE_DEPTHS`, `LIVE_KS`): the concrete pick, the live op under that config and under its own pick, rows bound at twice the count run at it |
 | `nearest::tuning_probe` | cold tuning wall time, the pick, predicted vs measured per timed config (nearest at `TUNE_KS`, `TUNE_GEMMS`, `TUNE_ATTN`); run on a store of the probes' lines alone |
 
 Ad hoc timing in a test: `super::measure(candidates)` (compile + time, ns per candidate on scratch buffers). Models:

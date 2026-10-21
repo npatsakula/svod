@@ -85,6 +85,8 @@ pub enum Error {
     Heads { op: &'static str, heads: usize, kv_heads: usize },
     #[snafu(display("{op}: a row keeps no score (k = 0)"))]
     NoScores { op: &'static str },
+    #[snafu(display("{op}: k is {got}, neither a count nor a bound variable"))]
+    Unbound { op: &'static str, got: String },
     #[snafu(display("{op}: {source}"))]
     Graph {
         op: &'static str,

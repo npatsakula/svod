@@ -458,7 +458,7 @@ pub struct SmemAlloc {
 }
 
 /// A bound symbolic variable of the launch, with the range it may take.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Var {
     pub name: String,
     pub min: i64,

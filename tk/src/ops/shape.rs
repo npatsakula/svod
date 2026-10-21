@@ -67,6 +67,13 @@ pub fn extent(shape: &[SInt]) -> Option<(Extent, Option<BatchVar>)> {
     Some((Extent { dims: dims?, var: var.is_some() }, var))
 }
 
+/// `dim`'s bound variable: `None` for a constant or another expression.
+pub fn bound_var(dim: &SInt) -> Option<BatchVar> {
+    let SInt::Symbolic(var) = dim else { return None };
+    let (name, min, max) = batch_var(var)?;
+    Some(BatchVar { dim: dim.clone(), name, min, max })
+}
+
 fn batch_var(dim: &Arc<UOp>) -> Option<(String, i64, i64)> {
     let var = match dim.op() {
         Op::Bind(ops::Bind { var, .. }) => var,
@@ -222,9 +229,9 @@ pub fn norm(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>) -> 
 
 /// `x [n, d]` against the candidates `c [m, d]`, each row's cheapest by
 /// `metric` above `floors` (under `groups`); `dtypes` are those of `x` and `c`. Any depth runs,
-/// padded with zeros to the matrix core's ([`Planner::nearest_depth`]); a
-/// bound batch is not, nor are more candidates than the f32 index holds;
-/// each row keeps its `k` least, past what a register list holds by the graph.
+/// padded with zeros to the matrix core's ([`Planner::nearest_depth`]), and
+/// rows bound to a variable, planned at its bound (as is a list's `k`); bound
+/// candidates are not, nor are more than the f32 index holds.
 #[allow(clippy::too_many_arguments)]
 pub fn nearest(
     planner: Option<&Planner>,
@@ -239,7 +246,7 @@ pub fn nearest(
     plan(|| {
         let planner = gate(planner, dtypes)?;
         let (x, c) = (x.ok_or(Fallback::Symbolic)?, c.ok_or(Fallback::Symbolic)?);
-        if x.var || c.var {
+        if c.var {
             return Err(Fallback::Symbolic);
         }
         let ([n, d], [m, _]) = (dims2(x)?, dims2(c)?);

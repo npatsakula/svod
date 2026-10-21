@@ -158,6 +158,63 @@ pub struct NearestSpec {
     /// The least scores a row keeps, ascending; 1: its least alone.
     pub k: usize,
     pub cfg: NearestCfg,
+    /// The rows and the list length a launch binds, where they vary: `n`
+    /// and `k` are then their bounds.
+    pub live: Live,
+}
+
+/// What a launch binds by name where a dim varies: a symbolic dim's bound
+/// variable, its spec's dim then the variable's bound (or a panel of it).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Live {
+    /// The query rows and the first one a launch takes: it launches the
+    /// blocks of those past it, at most its spec's `n`, one where the
+    /// variable ends before it; the per-row inputs hold the variable's bound
+    /// from row 0.
+    pub rows: Option<(Var, usize)>,
+    /// The scores a row keeps, its bound past 1: a list held for the bound,
+    /// voting on and ending at the live length.
+    pub k: Option<Var>,
+}
+
+impl Live {
+    /// The rows the per-row inputs hold, a launch taking at most `n`.
+    fn held(&self, n: usize) -> usize {
+        self.rows.as_ref().map_or(n, |(v, _)| v.max as usize)
+    }
+
+    /// The first row of the per-row inputs a launch takes.
+    fn from(&self) -> usize {
+        self.rows.as_ref().map_or(0, |(_, from)| *from)
+    }
+
+    /// The rows a launch of at most `n` takes, where they vary.
+    fn rows(&self, k: &mut Kernel, n: usize) -> Option<Sc> {
+        let (v, from) = self.rows.as_ref()?;
+        let mut rows = k.var(v.name.clone(), v.min, v.max);
+        if *from > 0 {
+            rows = (rows - *from).max(0);
+        }
+        if (v.max as usize).saturating_sub(*from) > n {
+            rows = rows.min(n);
+        }
+        Some(rows)
+    }
+
+    /// The scores a row keeps, where they vary.
+    fn k(&self, k: &mut Kernel) -> Option<Sc> {
+        self.k.as_ref().map(|v| k.var(v.name.clone(), v.min, v.max))
+    }
+}
+
+/// The blocks of `per` rows a launch of `n` rows takes, `live` of them where
+/// they vary: one at least, as a launch has no empty grid (its rows bound
+/// off).
+fn launched(live: &Option<Sc>, n: usize, per: usize) -> Sc {
+    match live {
+        Some(rows) => ((rows.clone() + (per - 1)) / per).max(1),
+        None => Sc::from(n.div_ceil(per)),
+    }
 }
 
 /// The most candidates a kernel ranks: the running index is held in f32,
@@ -223,7 +280,7 @@ impl NearestSpec {
 /// and squared, its square root taken once per row), which orders them as
 /// the metric's own.
 pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
-    let NearestSpec { n, m, d, metric, floors, groups, k: top, cfg } = *spec;
+    let NearestSpec { n, m, d, metric, floors, groups, k: top, cfg, ref live } = *spec;
     let NearestCfg { bq, bkv, stages, splits, .. } = cfg;
     let tiles = m.div_ceil(bkv);
     assert!(m <= MAX_CANDIDATES, "{m} candidates pass the f32 index's {MAX_CANDIDATES}");
@@ -237,15 +294,19 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
         "a queue of {held} below a list of {top}, unsplit"
     );
     assert!(cfg.select.is_none() || (cfg.queue.is_none() && splits == 1), "a score matrix, whole and unqueued");
+    assert!(live.k.is_none() || top > 1, "a live list of more than one score");
+    assert!(live.rows.is_none() || live.from() == 0 || cfg.select.is_some(), "a panel of a score matrix");
+    let (held_rows, from) = (live.held(n), live.from());
     let mut k = Kernel::new("nearest");
-    let x = k.param::<T>("x", ParamKind::In, n * d);
+    let x = k.param::<T>("x", ParamKind::In, held_rows * d);
     let c = k.param::<T>("c", ParamKind::In, m * d);
     let c_sq = metric.col_norms().then(|| k.param::<F32>("c_sq", ParamKind::In, m));
-    let x_sq = metric.row_norms().then(|| k.param::<F32>("x_sq", ParamKind::In, n));
-    let row_floor = floors.row.then(|| k.param::<F32>("row_floor", ParamKind::In, n));
+    let x_sq = metric.row_norms().then(|| k.param::<F32>("x_sq", ParamKind::In, held_rows));
+    let row_floor = floors.row.then(|| k.param::<F32>("row_floor", ParamKind::In, held_rows));
     let col_floor = floors.col.then(|| k.param::<F32>("col_floor", ParamKind::In, m));
-    let grouped =
-        groups.then(|| (k.param::<I32>("row_group", ParamKind::In, n), k.param::<I32>("col_group", ParamKind::In, m)));
+    let grouped = groups.then(|| {
+        (k.param::<I32>("row_group", ParamKind::In, held_rows), k.param::<I32>("col_group", ParamKind::In, m))
+    });
     let split = splits > 1;
     let matrix = cfg.select.is_some();
     let (score, index) = if split { ("score_part", "index_part") } else { ("score", "index") };
@@ -254,8 +315,15 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
         true => (k.param::<F32>("scores", ParamKind::Out, n * m), None),
         false => (k.param::<F32>(score, ParamKind::Out, parts), Some(k.param::<I32>(index, ParamKind::Out, parts))),
     };
-    let blocks = n.div_ceil(bq);
-    k.grid([Sc::from(blocks), Sc::from(splits), Sc::from(1)]);
+    let rows_live = live.rows(&mut k, n);
+    let k_live = live.k(&mut k);
+    // The rows a block's views hold: those of the capacity even where the
+    // rows are live, the blocks past the live ones never launched and the
+    // live rows' last block reading and writing rows past them that the
+    // buffers hold, which an output's shape leaves out.
+    let rb = bound(n, bq);
+    let blocks = launched(&rows_live, n, bq);
+    k.grid([blocks.clone(), Sc::from(splits), Sc::from(1)]);
     k.warps(cfg.warps());
     let c_s = cfg.bk.is_none().then(|| k.smem::<T>("c_s", stages * bkv * d));
 
@@ -263,7 +331,7 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
     // how many it takes.
     let (q_block, share) = match split {
         true => {
-            let (q_block, part) = tile_order(&mut k, blocks, splits, SPLIT_GROUP);
+            let (q_block, part) = tile_order(&mut k, blocks.clone(), splits, SPLIT_GROUP);
             let first = part.clone() * tiles / splits;
             let count = (part.clone() + 1) * tiles / splits - first.clone();
             (q_block, Some((part, first, count)))
@@ -280,16 +348,17 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
     let shape = Shape::new(bq, bkv);
     let rows = Shape::new(bq, 1);
     // The block's rows of an `[n]` parameter (of the one at `base` of
-    // several, its rows `step` apart), and a trip's columns of an `[m]` one.
+    // several, its rows `step` apart), `rows` of them, and a trip's columns
+    // of an `[m]` one.
     fn row_view<E: Elem>(
         k: &mut Kernel,
         p: ParamRef<E>,
         (base, step): (Sc, usize),
-        n: usize,
+        rows: Option<Sc>,
         bq: usize,
         q_off: Sc,
     ) -> Gmem<E> {
-        let v = k.view(p, base, [step, 1], Shape::new(bq, 1), [bound(n, bq), None]);
+        let v = k.view(p, base, [step, 1], Shape::new(bq, 1), [rows, None]);
         k.at(v, q_off, 0)
     }
     fn col_view<E: Elem>(k: &mut Kernel, p: ParamRef<E>, m: usize, bkv: usize, start: Sc) -> Gmem<E> {
@@ -312,21 +381,21 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
         }
     };
     let depth = cfg.bk.unwrap_or(d);
-    let x_view = k.view(x, 0, [d, 1], Shape::new(bq, depth), [bound(n, bq), bound(d, depth)]);
+    let x_view = k.view(x, from * d, [d, 1], Shape::new(bq, depth), [rb.clone(), bound(d, depth)]);
     let x_view = k.at(x_view, q_off.clone(), 0);
     let q_r = cfg.bk.is_none().then(|| k.load(x_view));
     let x_sq = x_sq.map(|p| {
-        let v = row_view(&mut k, p, (Sc::from(0), 1), n, bq, q_off.clone());
+        let v = row_view(&mut k, p, (Sc::from(from), 1), rb.clone(), bq, q_off.clone());
         let x_sq = k.load(v);
         half(&mut k, x_sq)
     });
     let row_floor = row_floor.map(|p| {
-        let v = row_view(&mut k, p, (Sc::from(0), 1), n, bq, q_off.clone());
+        let v = row_view(&mut k, p, (Sc::from(from), 1), rb.clone(), bq, q_off.clone());
         let f = k.load(v);
         floor(&mut k, f)
     });
     let row_group = grouped.map(|(p, _)| {
-        let v = row_view(&mut k, p, (Sc::from(0), 1), n, bq, q_off.clone());
+        let v = row_view(&mut k, p, (Sc::from(from), 1), rb.clone(), bq, q_off.clone());
         k.load(v)
     });
     let c_view = k.view(c, 0, [d, 1], Shape::new(bkv, depth), [bound(m, bkv), bound(d, depth)]);
@@ -433,36 +502,54 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
     // the reset queue and the list's `top`-th score (the vote's), unless
     // `last`.
     let list = Shape::new(bq, held);
+    // The list's slots a row holds, its bound's even where it is live: the
+    // slots past the live ones its last run reads are masked, those it
+    // writes left out of an output's shape.
+    let kb = bound(top, held);
     let chunk = |k: &mut Kernel, p: ParamRef<F32>, c: Sc| {
-        let v = k.view(p, 0, [top, 1], list, [bound(n, bq), bound(top, held)]);
+        let v = k.view(p, 0, [top, 1], list, [rb.clone(), kb.clone()]);
         k.at(v, q_off.clone(), c * held)
     };
     let index_chunk = |k: &mut Kernel, c: Sc| {
-        let v = k.view(index_out.expect("an index output"), 0, [top, 1], list, [bound(n, bq), bound(top, held)]);
+        let v = k.view(index_out.expect("an index output"), 0, [top, 1], list, [rb.clone(), kb.clone()]);
         k.at(v, q_off.clone(), c * held)
     };
+    // The list's runs of `held` slots, the last one's index and its slots
+    // (the live list's where it varies).
     let runs = top.div_ceil(held);
+    let tail = top - (runs - 1) * held;
+    let (run_count, last_run, live_tail) = match &k_live {
+        None => (Sc::from(runs), Sc::from(runs - 1), None),
+        Some(live) => {
+            let runs = (live.clone() + (held - 1)) / held;
+            (runs.clone(), runs.clone() - 1, Some(live.clone() - (runs - 1) * held))
+        }
+    };
+    // A list column of the last run's slot `tail` less `before`, as `i32`.
+    let tail_col = |k: &mut Kernel, before: usize| match &live_tail {
+        None => k.fill::<I32>(list, Const::Int((tail - before) as i64)),
+        Some(live) => k.splat::<I32>(list, live.clone() - before),
+    };
     let flush = |k: &mut Kernel, queue: [Regs<F32>; 2], last: bool| {
         // Run `c` (the list's slots its first `tail` where it is the last
         // run) merged with the carry, its lower half stored and the list's
         // `top`-th score taken from it where it is the last.
-        let tail = top - (runs - 1) * held;
         let unset = k.fill::<F32>(rows, Const::Float(f64::INFINITY));
         let init = queue.into_iter().chain((!last).then_some(unset)).collect();
-        let out = k.loop_vec(runs, init, |k, c, carried| {
+        let out = k.loop_vec(run_count.clone(), init, |k, c, carried| {
             let v = chunk(k, score_out, c.clone());
             let mut run = [k.load(v), {
                 let v = index_chunk(k, c.clone());
                 let i = k.load(v);
                 k.cast::<I32, F32>(i)
             }];
-            let ends = c.clone().eq(runs - 1);
-            if tail < held {
+            let ends = c.clone().eq(last_run.clone());
+            if tail < held || live_tail.is_some() {
                 run = k.select_if(
                     ends.clone(),
                     |k| {
                         let col = k.coord(list, Axis::Col);
-                        let width = k.fill::<I32>(list, Const::Int(tail as i64));
+                        let width = tail_col(k, 0);
                         let inside = k.compare(col, width, CmpOp::Lt);
                         let empty = [Const::Float(f64::INFINITY), Const::Float(-1.0)].map(|e| k.fill::<F32>(list, e));
                         [0, 1].map(|j| k.where_(inside, run[j], empty[j]))
@@ -484,7 +571,7 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
                 ends,
                 |k| {
                     let col = k.coord(list, Axis::Col);
-                    let at = k.fill::<I32>(list, Const::Int(tail as i64 - 1));
+                    let at = tail_col(k, 1);
                     let here = k.compare(col, at, CmpOp::Eq);
                     let none = k.fill::<F32>(list, Const::Float(f64::NEG_INFINITY));
                     let kth = k.where_(here, lo[0], none);
@@ -500,6 +587,24 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
         })
     };
 
+    // The register list's vote: its `k`-th score, its last but where the
+    // list is live.
+    let vote = |k: &mut Kernel, best: Regs<F32>| match &k_live {
+        None => k.reduce(best, Axis::Row, ReduceOp::Max),
+        Some(live) => {
+            let col = k.coord(list, Axis::Col);
+            let at = k.splat::<I32>(list, live.clone() - 1);
+            let here = k.compare(col, at, CmpOp::Eq);
+            let none = k.fill::<F32>(list, Const::Float(f64::NEG_INFINITY));
+            let kth = k.where_(here, best, none);
+            k.reduce(kth, Axis::Row, ReduceOp::Max)
+        }
+    };
+    // A trip offers at most a list's or a trip's scores.
+    let offers = match &k_live {
+        None => Sc::from(top.min(bkv)),
+        Some(live) => live.clone().min(bkv),
+    };
     // The tile's scores offered to the row's carried list (`[bq, held]` of
     // its least scores ascending, their indices, and its last score: the
     // vote's, a row vector as the row minimum is), its least first,
@@ -521,7 +626,7 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
                 let none = inf(k);
                 let origin = k.splat::<F32>(rows, start);
                 let init = [s, low].into_iter().chain(list.iter().copied()).collect();
-                let out = k.loop_vec(top.min(bkv), init, |k, _, carried| {
+                let out = k.loop_vec(offers.clone(), init, |k, _, carried| {
                     let [s, low, best, at, last] = carried[..] else { unreachable!("five carried tiles") };
                     let lower = k.compare(low, last, CmpOp::Lt);
                     k.if_any(
@@ -536,7 +641,7 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
                             let next = k.reduce(rest, Axis::Row, ReduceOp::Min);
                             if cfg.queue.is_none() {
                                 let [best, at] = offer(k, [best, at], low, index);
-                                let last = k.reduce(best, Axis::Row, ReduceOp::Max);
+                                let last = vote(k, best);
                                 return vec![rest, next, best, at, last];
                             }
                             let unset = k.fill::<F32>(rows, Const::Float(f64::INFINITY));
@@ -569,7 +674,7 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
     // queue is: a lane reads back the slots it writes.
     if cfg.queue.is_some() {
         let (score0, index0) = (init[0], k.cast::<F32, I32>(init[1]));
-        k.loop_vec::<F32>(runs, vec![], |k, c, _| {
+        k.loop_vec::<F32>(run_count.clone(), vec![], |k, c, _| {
             let v = chunk(k, score_out, c.clone());
             k.store(v, score0);
             let v = index_chunk(k, c);
@@ -581,7 +686,7 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
     let folded = |k: &mut Kernel, dot: Regs<F32>, start: Sc, carried: Vec<Regs<F32>>| match (matrix, top) {
         (true, _) => {
             let s = scores(k, dot, start.clone());
-            let v = k.view(score_out, 0, [m, 1], shape, [bound(n, bq), bound(m, bkv)]);
+            let v = k.view(score_out, 0, [m, 1], shape, [rb.clone(), bound(m, bkv)]);
             let v = k.at(v, q_off.clone(), start);
             k.store(v, s);
             vec![]
@@ -636,16 +741,16 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
         p: ParamRef<E>,
         (base, step): (Sc, [usize; 2]),
         list: Shape,
-        n: usize,
+        rows: Option<Sc>,
         q_off: Sc,
     ) -> Gmem<E> {
-        let v = k.view(p, base, step, list, [bound(n, list.rows), None]);
+        let v = k.view(p, base, step, list, [rows, None]);
         k.at(v, q_off, 0)
     }
-    let v = slots(&mut k, score_out, at.clone(), list, n, q_off.clone());
+    let v = slots(&mut k, score_out, at.clone(), list, rb.clone(), q_off.clone());
     k.store(v, best);
     let index = k.cast::<F32, I32>(index);
-    let v = slots(&mut k, index_out.expect("an index output"), at, list, n, q_off.clone());
+    let v = slots(&mut k, index_out.expect("an index output"), at, list, rb, q_off.clone());
     k.store(v, index);
     k.finish()
 }
@@ -708,6 +813,9 @@ pub struct SelectSpec {
     /// `index_in` (in the units the scores are compared in).
     pub first: bool,
     pub cfg: SelectCfg,
+    /// The rows and the list length a launch binds, where they vary (its
+    /// inputs and outputs the panel's own).
+    pub live: Live,
 }
 
 /// Each row's `k` least of `scores [n, cols]` (as a score-matrix
@@ -723,7 +831,7 @@ pub struct SelectSpec {
 /// and merges them into the list (a bitonic merge of the list and the
 /// queues reversed).
 pub fn nearest_select(spec: &SelectSpec) -> Program {
-    let SelectSpec { n, cols, k: top, metric, first, cfg } = *spec;
+    let SelectSpec { n, cols, k: top, metric, first, cfg, ref live } = *spec;
     assert!(cfg.fits(top), "{cfg:?} lists {top}");
     let (rows, depth, runs) = (cfg.warps as usize, cfg.queue, select_runs(top));
     let mut k = Kernel::new("nearest_select");
@@ -735,29 +843,46 @@ pub fn nearest_select(spec: &SelectSpec) -> Program {
     let score_out = k.param::<F32>("score", ParamKind::Out, n * top);
     let index_out = k.param::<I32>("index", ParamKind::Out, n * top);
     let (base, last) = (k.load_scalar(chunk, 0), k.load_scalar(chunk, 1));
-    k.grid([Sc::from(n.div_ceil(rows)), Sc::from(1), Sc::from(1)]);
+    let rows_live = live.rows(&mut k, n);
+    let k_live = live.k(&mut k);
+    // The rows and slots of the capacity, as `nearest`'s live views.
+    let (rb, kb) = (bound(n, rows), bound(top, LANES));
+    k.grid([launched(&rows_live, n, rows), Sc::from(1), Sc::from(1)]);
     k.warps(cfg.warps);
     let row0 = k.block(0) * rows;
     let lane = Shape::new(rows, LANES);
     let empty = |k: &mut Kernel| [Const::Float(f64::INFINITY), Const::Float(-1.0)].map(|e| k.fill::<F32>(lane, e));
     // Run `t` of the block's lists.
     let run = |k: &mut Kernel, (score, index): (ParamRef<F32>, ParamRef<I32>), t: usize| {
-        let bounds = [bound(n, rows), bound(top, LANES)];
+        let bounds = [rb.clone(), kb.clone()];
         let s = k.view(score, 0, [top, 1], lane, bounds.clone());
         let s = k.at(s, row0.clone(), t * LANES);
         let i = k.view(index, 0, [top, 1], lane, bounds);
         (s, k.at(i, row0.clone(), t * LANES))
     };
-    // The list's `top`-th score.
+    let held = top.div_ceil(LANES);
+    // The list's `top`-th score (the live length's where it varies: each
+    // run's slot of it, if any, the most of them).
     let kth = |k: &mut Kernel, list: &[[Regs<F32>; 2]]| {
         let col = k.coord(lane, Axis::Col);
-        let at = k.fill::<I32>(lane, Const::Int(((top - 1) % LANES) as i64));
-        let here = k.compare(col, at, CmpOp::Eq);
+        let Some(live) = &k_live else {
+            let at = k.fill::<I32>(lane, Const::Int(((top - 1) % LANES) as i64));
+            let here = k.compare(col, at, CmpOp::Eq);
+            let none = k.fill::<F32>(lane, Const::Float(f64::NEG_INFINITY));
+            let v = k.where_(here, list[(top - 1) / LANES][0], none);
+            return k.reduce(v, Axis::Row, ReduceOp::Max);
+        };
         let none = k.fill::<F32>(lane, Const::Float(f64::NEG_INFINITY));
-        let v = k.where_(here, list[(top - 1) / LANES][0], none);
-        k.reduce(v, Axis::Row, ReduceOp::Max)
+        let mut kth = None;
+        for (t, run) in list.iter().take(held).enumerate() {
+            let at = k.splat::<I32>(lane, live.clone() - (t * LANES + 1));
+            let here = k.compare(col, at, CmpOp::Eq);
+            let v = k.where_(here, run[0], none);
+            let v = k.reduce(v, Axis::Row, ReduceOp::Max);
+            kth = Some(kth.map_or(v, |kth| k.binary(kth, v, BinaryOp::Max)));
+        }
+        kth.expect("a run")
     };
-    let held = top.div_ceil(LANES);
     let loaded = |k: &mut Kernel| {
         (0..runs)
             .flat_map(|t| {
@@ -768,9 +893,12 @@ pub fn nearest_select(spec: &SelectSpec) -> Program {
                 let s = k.load(s);
                 let i = k.load(i);
                 let mut v = [s, k.cast::<I32, F32>(i)];
-                if (t + 1) * LANES > top {
+                if (t + 1) * LANES > top || k_live.is_some() {
                     let col = k.coord(lane, Axis::Col);
-                    let width = k.fill::<I32>(lane, Const::Int((top - t * LANES) as i64));
+                    let width = match &k_live {
+                        None => k.fill::<I32>(lane, Const::Int((top - t * LANES) as i64)),
+                        Some(live) => k.splat::<I32>(lane, live.clone() - t * LANES),
+                    };
                     let inside = k.compare(col, width, CmpOp::Lt);
                     let e = empty(k);
                     v = [0, 1].map(|j| k.where_(inside, v[j], e[j]));
@@ -806,7 +934,7 @@ pub fn nearest_select(spec: &SelectSpec) -> Program {
     let init: Vec<Regs<F32>> = list.iter().chain(&queue).flatten().copied().chain([tau]).collect();
     // A step past the last merges what is still queued.
     let steps = cols.div_ceil(LANES);
-    let view = k.view(scores, 0, [cols, 1], lane, [bound(n, rows), bound(cols, LANES)]);
+    let view = k.view(scores, 0, [cols, 1], lane, [rb.clone(), bound(cols, LANES)]);
     let carried = k.loop_vec(steps + 1, init, |k, step, carried| {
         let (list, queue, tau) = split(carried.clone());
         let [s] = k.select_if(
@@ -1018,13 +1146,16 @@ fn finished(k: &mut Kernel, best: Regs<F32>, metric: Metric) -> Regs<F32> {
 
 /// The partial results of [`nearest`] split `splits` ways over `n` rows,
 /// folded under `metric`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MergeSpec {
     pub n: usize,
     pub splits: usize,
     pub metric: Metric,
-    /// The scores a row's list holds.
+    /// The scores a row's list holds (its bound where the list is live:
+    /// every slot of the bound merged).
     pub k: usize,
+    /// The rows a launch binds, where they vary.
+    pub live: Live,
 }
 
 /// Rows a merge block folds, one warp's.
@@ -1055,28 +1186,30 @@ pub fn nearest_merge(spec: &MergeSpec) -> Program {
     if spec.k > 1 {
         return merge_lists(spec);
     }
-    let MergeSpec { n, splits, metric, .. } = *spec;
+    let MergeSpec { n, splits, metric, ref live, .. } = *spec;
     let mut k = Kernel::new("nearest_merge");
     let stride = share_stride(n);
     let score_part = k.param::<F32>("score_part", ParamKind::In, splits * stride);
     let index_part = k.param::<I32>("index_part", ParamKind::In, splits * stride);
     let score = k.param::<F32>("score", ParamKind::Out, n);
     let index = k.param::<I32>("index", ParamKind::Out, n);
-    k.grid([Sc::from(n.div_ceil(MERGE_ROWS)), Sc::from(1), Sc::from(1)]);
+    let live = live.rows(&mut k, n);
+    k.grid([launched(&live, n, MERGE_ROWS), Sc::from(1), Sc::from(1)]);
     k.warps(1);
     let row0 = k.block(0) * MERGE_ROWS;
     let shape = Shape::new(1, MERGE_ROWS);
-    // The block's rows of the `[n]` parameter at `base`.
-    fn rows<E: Elem>(k: &mut Kernel, p: ParamRef<E>, n: usize, row0: Sc, base: Sc) -> Gmem<E> {
-        let v = k.view(p, base, [0, 1], Shape::new(1, MERGE_ROWS), [None, bound(n, MERGE_ROWS)]);
+    let n = bound(n, MERGE_ROWS);
+    // The block's rows of the `[n]` parameter at `base`, `n` of them.
+    fn rows<E: Elem>(k: &mut Kernel, p: ParamRef<E>, n: &Option<Sc>, row0: Sc, base: Sc) -> Gmem<E> {
+        let v = k.view(p, base, [0, 1], Shape::new(1, MERGE_ROWS), [None, n.clone()]);
         k.at(v, 0, row0)
     }
     let best0 = k.fill::<F32>(shape, Const::Float(f64::INFINITY));
     let index0 = k.fill::<F32>(shape, Const::Float(-1.0));
     let [best, at] = k.loop_(splits, [best0, index0], |k, part, [best, at]| {
-        let v = rows(k, score_part, n, row0.clone(), part.clone() * stride);
+        let v = rows(k, score_part, &n, row0.clone(), part.clone() * stride);
         let s = k.load(v);
-        let v = rows(k, index_part, n, row0.clone(), part * stride);
+        let v = rows(k, index_part, &n, row0.clone(), part * stride);
         let i = k.load(v);
         // Exact in f32 below `MAX_CANDIDATES`, as the kernel's index.
         let i = k.cast::<I32, F32>(i);
@@ -1084,30 +1217,32 @@ pub fn nearest_merge(spec: &MergeSpec) -> Program {
         [k.where_(lower, s, best), k.where_(lower, i, at)]
     });
     let best = finished(&mut k, best, metric);
-    let v = rows(&mut k, score, n, row0.clone(), Sc::from(0));
+    let v = rows(&mut k, score, &n, row0.clone(), Sc::from(0));
     k.store(v, best);
     let at = k.cast::<F32, I32>(at);
-    let v = rows(&mut k, index, n, row0, Sc::from(0));
+    let v = rows(&mut k, index, &n, row0, Sc::from(0));
     k.store(v, at);
     k.finish()
 }
 
 /// [`nearest_merge`] of `k > 1` scores a row.
 fn merge_lists(spec: &MergeSpec) -> Program {
-    let MergeSpec { n, splits, metric, k: top } = *spec;
+    let MergeSpec { n, splits, metric, k: top, ref live } = *spec;
     let mut k = Kernel::new("nearest_merge");
     let stride = share_stride(n);
     let score_part = k.param::<F32>("score_part", ParamKind::In, splits * top * stride);
     let index_part = k.param::<I32>("index_part", ParamKind::In, splits * top * stride);
     let score = k.param::<F32>("score", ParamKind::Out, n * top);
     let index = k.param::<I32>("index", ParamKind::Out, n * top);
-    k.grid([Sc::from(n.div_ceil(LIST_ROWS)), Sc::from(1), Sc::from(1)]);
+    let live = live.rows(&mut k, n);
+    k.grid([launched(&live, n, LIST_ROWS), Sc::from(1), Sc::from(1)]);
     k.warps(1);
     let row0 = k.block(0) * LIST_ROWS;
     let shape = Shape::new(1, LIST_ROWS);
-    // The block's rows of a parameter, row `r` at `base + r·step`.
-    fn rows<E: Elem>(k: &mut Kernel, p: ParamRef<E>, n: usize, row0: Sc, (base, step): (Sc, usize)) -> Gmem<E> {
-        let v = k.view(p, base, [0, step], Shape::new(1, LIST_ROWS), [None, bound(n, LIST_ROWS)]);
+    let n = bound(n, LIST_ROWS);
+    // The block's rows of a parameter, `n` of them, row `r` at `base + r·step`.
+    fn rows<E: Elem>(k: &mut Kernel, p: ParamRef<E>, n: &Option<Sc>, row0: Sc, (base, step): (Sc, usize)) -> Gmem<E> {
+        let v = k.view(p, base, [0, step], Shape::new(1, LIST_ROWS), [None, n.clone()]);
         k.at(v, 0, row0)
     }
     let scores = (0..top).map(|_| k.fill::<F32>(shape, Const::Float(f64::INFINITY))).collect::<Vec<_>>();
@@ -1115,9 +1250,9 @@ fn merge_lists(spec: &MergeSpec) -> Program {
     let list = k.loop_vec(splits, init, |k, part, mut list| {
         for j in 0..top {
             let at = (part.clone() * top + j) * stride;
-            let v = rows(k, score_part, n, row0.clone(), (at.clone(), 1));
+            let v = rows(k, score_part, &n, row0.clone(), (at.clone(), 1));
             let s = k.load(v);
-            let v = rows(k, index_part, n, row0.clone(), (at, 1));
+            let v = rows(k, index_part, &n, row0.clone(), (at, 1));
             let i = k.load(v);
             let i = k.cast::<I32, F32>(i);
             list = insert(k, &list, s, i);
@@ -1127,10 +1262,10 @@ fn merge_lists(spec: &MergeSpec) -> Program {
     let (list, indices) = list.split_at(top);
     for (j, (&best, &at)) in list.iter().zip(indices).enumerate() {
         let best = finished(&mut k, best, metric);
-        let v = rows(&mut k, score, n, row0.clone(), (Sc::from(j), top));
+        let v = rows(&mut k, score, &n, row0.clone(), (Sc::from(j), top));
         k.store(v, best);
         let at = k.cast::<F32, I32>(at);
-        let v = rows(&mut k, index, n, row0.clone(), (Sc::from(j), top));
+        let v = rows(&mut k, index, &n, row0.clone(), (Sc::from(j), top));
         k.store(v, at);
     }
     k.finish()
