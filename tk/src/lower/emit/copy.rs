@@ -7,6 +7,7 @@ use svod_ir::ConstValue;
 use crate::layout as frag;
 use crate::layouts::Relayout;
 use crate::lower::DivergentBarrierSnafu;
+use snafu::OptionExt;
 
 use super::*;
 
@@ -248,6 +249,43 @@ impl Emit<'_> {
             }
             Relayout::ViaSmem => self.relayout_via_smem(dst, src),
         }
+    }
+
+    /// `dst = src` one step on along `axis`, `fill` first: in-lane where a
+    /// lane holds the predecessor, else the lane moves of
+    /// [`TileLayout::shift`], selected by lane as an exchange's.
+    pub(super) fn shift(&mut self, dst: ValId, src: ValId, axis: Axis, fill: Const) -> Result<()> {
+        let l = self.layout(src).clone();
+        let moves = l
+            .shift(axis, self.grid_warps(), self.low.device.target.wave)
+            .context(UnsupportedSnafu { what: "a shift whose predecessors are in another warp" })?;
+        let dtype = DType::Scalar(self.value(dst).dtype);
+        let fill = match fill {
+            Const::Int(i) => UOp::const_(dtype, ConstValue::Int(i)),
+            Const::Float(f) => UOp::const_(dtype, ConstValue::Float(f)),
+        };
+        let mut moved: HashMap<(u32, u32), Arc<UOp>> = HashMap::new();
+        for (jd, (picks, first)) in moves.into_iter().enumerate() {
+            let mut out = (first != 0).then(|| fill.clone());
+            for p in picks.into_iter().rev() {
+                let v = moved
+                    .entry((p.mask, p.reg))
+                    .or_insert_with(|| {
+                        let x = self.reg_load(src, p.reg);
+                        if p.mask == 0 { x } else { self.shuffle_xor(&x, p.mask) }
+                    })
+                    .clone();
+                out = Some(match out {
+                    None => v,
+                    Some(rest) => {
+                        let mine = self.hoist(self.lane_in(p.lanes));
+                        UOp::try_where(mine, v, rest).expect("shift select")
+                    }
+                });
+            }
+            self.reg_store(dst, jd as u32, vec![out.expect("a source per register")]);
+        }
+        Ok(())
     }
 
     /// Whether this lane is one of `lanes`: a 32-bit word on a wave of 32,

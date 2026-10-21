@@ -157,6 +157,87 @@ impl TileLayout {
         Self { frag: keep_axis(&self.frag, Row), reps: [self.reps[0], 1], warps: self.warps.sublayout(&[Warp], &[Row]) }
     }
 
+    /// A `[rows, cols]` tile whose [`Self::row_vector`] is `vector` (a
+    /// `[rows, 1]` layout): a lane holds runs of a row's consecutive columns
+    /// in its registers, and the lanes that hold the same rows of `vector`
+    /// hold its successive runs, so a row's columns are held once rather
+    /// than in every lane sharing it, and only a run's first column has its
+    /// predecessor in another lane. The columns' power-of-two part spreads
+    /// so; the registers repeat the rest.
+    pub fn spread_row(vector: &Self, cols: u32) -> Self {
+        let (frag, rows) = (&vector.frag, vector.frag.out_size(Row));
+        let row_of = |dim, bit| frag.basis(dim, bit).first().map_or(0, |o| o.1);
+        let free = (0..frag.in_bits(Lane)).filter(|&b| row_of(Lane, b) == 0).count() as u32;
+        let part = cols.trailing_zeros();
+        let (spread, run) = (free.min(part), part - free.min(part));
+        let regs: Vec<[u32; 2]> =
+            (0..frag.in_bits(Reg)).map(|b| [row_of(Reg, b), 0]).chain((0..run).map(|b| [0, 1 << b])).collect();
+        let mut taken = 0;
+        let lanes: Vec<[u32; 2]> = (0..frag.in_bits(Lane))
+            .map(|b| match row_of(Lane, b) {
+                0 if taken < spread => {
+                    taken += 1;
+                    [0, 1 << (run + taken - 1)]
+                }
+                r => [r, 0],
+            })
+            .collect();
+        let frag = Layout::from_bases([(Row, rows), (Col, 1 << part)], &[(Reg, &regs), (Lane, &lanes)]);
+        Self { frag, reps: [vector.reps[0], cols >> part], warps: vector.warps.clone() }
+    }
+
+    /// The moves of a [`TileOp::Shift`] along `axis`: per register, the
+    /// lane-xor moves bringing each lane the element one step back, as an
+    /// [`Relayout::Exchange`]'s, and the lanes whose element is the first
+    /// (the fill); `None` where an element's predecessor is in another warp
+    /// or the moves differ between warps.
+    pub fn shift(&self, axis: Axis, warps: u32, lanes: u32) -> Option<Vec<(Vec<Pick>, u64)>> {
+        let back = |(r, c): (u32, u32)| match axis {
+            Axis::Col => c.checked_sub(1).map(|c| (r, c)),
+            Axis::Row => r.checked_sub(1).map(|r| (r, c)),
+        };
+        // The (mask, register) moves that bring lane `l` of warp `w` element `j`'s predecessor.
+        let moves = |w: u32, l: u32, j: u32| -> Option<Vec<(u32, u32)>> {
+            let want = back(self.coord(w, l, j))?;
+            let found = (0..lanes).flat_map(|from| (0..self.regs()).map(move |reg| (from, reg)));
+            Some(
+                found
+                    .filter(|&(from, reg)| self.coord(w, from, reg) == want)
+                    .map(|(from, reg)| (from ^ l, reg))
+                    .collect(),
+            )
+        };
+        (0..self.regs())
+            .map(|j| {
+                let fill = (0..lanes).filter(|&l| moves(0, l, j).is_none()).fold(0u64, |a, l| a | 1 << l);
+                let mut open: u64 = (u64::MAX >> (64 - lanes)) & !fill;
+                let mut picks: Vec<Pick> = vec![];
+                while open != 0 {
+                    let lanes_of = |mv: (u32, u32)| {
+                        (0..lanes)
+                            .filter(|&m| open >> m & 1 == 1 && moves(0, m, j).is_some_and(|v| v.contains(&mv)))
+                            .fold(0u64, |a, m| a | 1 << m)
+                    };
+                    // The same lane first, then the move serving the most lanes still open.
+                    let (mask, reg) = (0..lanes)
+                        .filter(|l| open >> l & 1 == 1)
+                        .flat_map(|l| moves(0, l, j).unwrap_or_default())
+                        .max_by_key(|&mv| (lanes_of(mv).count_ones(), mv.0 == 0))?;
+                    let covered = lanes_of((mask, reg));
+                    open &= !covered;
+                    picks.push(Pick { mask, reg, lanes: covered });
+                }
+                let every_warp = (1..warps).all(|w| {
+                    (0..lanes).all(|l| match moves(w, l, j) {
+                        None => fill >> l & 1 == 1,
+                        Some(v) => picks.iter().any(|p| p.lanes >> l & 1 == 1 && v.contains(&(p.mask, p.reg))),
+                    })
+                });
+                every_warp.then_some((picks, fill))
+            })
+            .collect()
+    }
+
     pub fn col_vector(&self) -> Self {
         Self { frag: keep_axis(&self.frag, Col), reps: [1, self.reps[1]], warps: self.warps.sublayout(&[Warp], &[Col]) }
     }
@@ -811,9 +892,12 @@ impl<'a> Infer<'a> {
                 // broadcasts over, say) is demanded from it rather than defaulted
                 // apart from it. Tiles seed before vectors: a vector's layout is
                 // its tile's to decide.
-                let Some(v) = self.unconstrained() else { return Ok(()) };
+                // A tile a laid vector spreads into first: its loop's
+                // initial value and its next take its layout from it.
+                let spread = self.open_tiles().find_map(|v| Some((v, self.spread(v)?)));
+                let Some(v) = spread.as_ref().map(|s| s.0).or_else(|| self.unconstrained()) else { return Ok(()) };
                 let shape = prog.values[v.index()].shape;
-                let l = natural(shape, warps, lanes).context(UndeterminedSnafu {
+                let l = spread.map(|s| s.1).or_else(|| natural(shape, warps, lanes)).context(UndeterminedSnafu {
                     value: v,
                     rows: shape.rows,
                     cols: shape.cols,
@@ -826,6 +910,35 @@ impl<'a> Infer<'a> {
             self.pass(&prog.body)?;
         }
         NotConvergedSnafu { passes }.fail()
+    }
+
+    /// For a tile `v` nothing constrains that a laid row vector broadcasts
+    /// over (or a column vector, transposed), the tile it [spreads
+    /// into](TileLayout::spread_row): a list of a row's values held beside
+    /// that row's.
+    fn spread(&self, v: ValId) -> Option<TileLayout> {
+        let cols = self.shape(v).cols as u32;
+        self.prog.walk().find_map(|(_, stmt)| {
+            let Stmt::Let { dst, op } = stmt else { return None };
+            let pairs = match *op {
+                TileOp::Binary { a, b, .. } | TileOp::Where { a, b, .. } | TileOp::MulAdd { a, b, .. } => [a, b],
+                _ => return None,
+            };
+            let (tile, vector, axis) = self.broadcast(pairs[0], pairs[1])?;
+            let vector = self.lay[vector.index()].as_ref()?;
+            ((tile == v || *dst == v) && self.lay[dst.index()].is_none()).then(|| match axis {
+                Axis::Row => TileLayout::spread_row(vector, cols),
+                Axis::Col => TileLayout::spread_row(&vector.transposed(), self.shape(v).rows as u32).transposed(),
+            })
+        })
+    }
+
+    /// The register tiles (not vectors) without a layout.
+    fn open_tiles(&self) -> impl Iterator<Item = ValId> + '_ {
+        self.prog.values.iter().enumerate().filter_map(|(i, v)| {
+            let open = v.place == Place::Reg && self.lay[i].is_none() && v.shape.rows != 1 && v.shape.cols != 1;
+            open.then_some(ValId(i as u32))
+        })
     }
 
     /// The first register value without a layout, tiles before vectors.
@@ -955,7 +1068,9 @@ impl<'a> Infer<'a> {
     fn let_(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
         match *op {
             TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) | TileOp::Relayout { .. } => {}
-            TileOp::Unary { src, .. } | TileOp::Cast { src, .. } | TileOp::Move { src } => self.unify(dst, src),
+            TileOp::Unary { src, .. } | TileOp::Cast { src, .. } | TileOp::Move { src } | TileOp::Shift { src, .. } => {
+                self.unify(dst, src)
+            }
             TileOp::Binary { a, b, .. } => self.elementwise(dst, a, b),
             TileOp::Where { pred, a, b } => {
                 self.elementwise(dst, a, b);
@@ -1052,6 +1167,7 @@ impl Rewrite<'_> {
                     TileOp::Unary { src, .. }
                     | TileOp::Cast { src, .. }
                     | TileOp::Transpose { src }
+                    | TileOp::Shift { src, .. }
                     | TileOp::Relayout { src }
                     | TileOp::Move { src } => rewrite(self, src),
                     TileOp::Binary { a, b, .. } => {

@@ -206,6 +206,7 @@ The `#[ignore]` probes print and never assert; one at a time on an idle GPU:
 | `attention::key_warp_resources_probe` | registers/LDS/spill per key-warp config |
 | `device::first_execution_probe` (cp.async), `parts::mma_peak_probe` (CUDA) | build/lower/prepare cost; `mma.sync` ceiling |
 | `probe::probe_signals_are_strong` | every probe pair's signal (run alone) |
+| `nearest::knn_probe` | k-nearest lists: the tuned pick's Gpairs/s per `KNN_ROWS`/`KNN_DEPTHS`/`KNN_KS` (f16, NegDot and SquaredL2) and its share of k=1's; `KNN_ALL` times every admitted config |
 | `nearest::tuning_probe` | cold tuning wall time, the pick, predicted vs measured per timed config (nearest, `TUNE_GEMMS`, `TUNE_ATTN`); run on a store of the probes' lines alone |
 
 Ad hoc timing in a test: `super::measure(candidates)` (compile + time, ns per candidate on scratch buffers). Models:

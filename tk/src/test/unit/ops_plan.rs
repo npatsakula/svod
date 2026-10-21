@@ -1362,15 +1362,17 @@ fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, k: usize, want: Result<
     }
 }
 
-/// A list holds two row vectors a slot beside the scores (one register per
-/// 16 rows a vector where RDNA issues the product swapped, two on CUDA), and
-/// its rounds cost: the cost and registers rise with `k`, from a least alone,
+/// A list holds two `[rows, k]` tiles beside the scores, its slots spread
+/// over the lanes sharing a row (one register per 16 rows a slot pair of a
+/// row's two lanes where RDNA issues the product swapped, two for a quad of
+/// lanes on CUDA; a list shorter than them spreads over as many), and its
+/// rounds cost: the cost and registers rise with `k`, from a least alone,
 /// whose registers the scores' count covers; past
 /// [`REGISTER_K`](config::REGISTER_K) a list is left out.
-#[test_case(sm86(), 2; "sm_86")]
-#[test_case(gfx1201(), 1; "gfx1201")]
-#[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40), 1; "gfx1151")]
-fn a_list_costs_its_registers_and_rounds(target: Target, per_16_rows: u32) {
+#[test_case(sm86(), 2, 4; "sm_86")]
+#[test_case(gfx1201(), 1, 2; "gfx1201")]
+#[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40), 1, 2; "gfx1151")]
+fn a_list_costs_its_registers_and_rounds(target: Target, per_16_rows: u32, sharing: u32) {
     use crate::kernels::nearest::{Floors, Metric, NearestCfg};
     use crate::ops::config::{Nearest, REGISTER_K, Rejected};
     let planner = planner(target.clone());
@@ -1386,7 +1388,8 @@ fn a_list_costs_its_registers_and_rounds(target: Target, per_16_rows: u32) {
     };
     let regs = |k| cfg.registers(&target, 64, k).unwrap();
     for k in [2, 8, 32] {
-        assert_eq!(regs(k) - regs(1), 2 * k as u32 * per_16_rows, "k {k}");
+        let last = per_16_rows;
+        assert_eq!(regs(k) - regs(1), 2 * k as u32 * per_16_rows / sharing.min(k as u32) + last, "k {k}");
     }
     let costs: Vec<f64> = [1, 2, 4, 8, 16].map(|k| p(k).admit(&planner, &cfg).unwrap().0).to_vec();
     assert!(costs.is_sorted_by(|a, b| a < b), "{costs:?}");

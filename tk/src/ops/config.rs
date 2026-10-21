@@ -30,7 +30,7 @@ use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::{GemmCfg, KSLICE};
 use crate::kernels::nearest::{Floors, Metric, NearestCfg, SPLIT_GROUP};
 use crate::kernels::rows::NormCfg;
-use crate::layouts::{Issue, Swizzle, WarpGrid, chunked};
+use crate::layouts::{Issue, Swizzle, TileLayout, WarpGrid, chunked};
 use crate::tune::Compiled;
 
 /// Targets with kernels: CUDA sm_80+ on `mma.sync` + `cp.async` + `ldmatrix`,
@@ -846,8 +846,11 @@ impl Planner {
 
     /// The shares a query block of `cfg` splits the candidates of `p` into, if
     /// any: a power of two, each share [`SPLIT_TILES`] candidate tiles at
-    /// least, enough that the blocks in flight (every SM's resident ones)
-    /// span the query blocks they walk at once. Streamed, those are a group
+    /// least for each score a row keeps (every share fills its list again:
+    /// at 16384² and depth 128 on sm_86 a 16-way split of 16 scores ran at
+    /// 0.63 of the whole tile, a 4-way one of 128 candidates at 0.77),
+    /// enough that the blocks in flight (every SM's resident ones) span the
+    /// query blocks they walk at once. Streamed, those are a group
     /// of [`SPLIT_GROUP`] (the grid's raster), so the blocks share their
     /// query and candidate lines as a GEMM's grouped tiles do: whole, a
     /// block's own query rows fall out of the cache between its candidate
@@ -867,7 +870,7 @@ impl Planner {
             }
             None => (self.sms(), blocks),
         };
-        let most = p.m.div_ceil(cfg.bkv) / SPLIT_TILES;
+        let most = p.m.div_ceil(cfg.bkv) / (SPLIT_TILES * p.k);
         let splits = flight.div_ceil(rows).next_power_of_two().min(prev_power_of_two(most));
         (splits > 1).then_some(splits)
     }
@@ -1295,20 +1298,24 @@ impl NearestCfg {
     }
 
     /// A lane's registers of a list of `k > 1` scores and indices a row: two
-    /// row vectors a slot, each held as the products' row minimum is, under
-    /// the cheaper of the two ways a square core issues them (one register
-    /// every 16 rows on RDNA swapped, two on CUDA's `m16n8k16`); none at
-    /// `k = 1`, whose least and index the scores' count covers.
+    /// `[bq, k]` tiles [spread](TileLayout::spread_row) from the products'
+    /// row minimum and its last score as that minimum is held, under the cheaper of the two ways a square core issues
+    /// them (RDNA swapped: a row a lane of 16, its 16 others holding the
+    /// row's other half; CUDA's `m16n8k16`: two rows a lane, a quad's lanes
+    /// each holding a quarter); none at `k = 1`, whose least and index the
+    /// scores' count covers.
     fn list_registers(&self, target: &Target, d: usize, k: usize) -> Option<u32> {
         if k == 1 {
             return Some(0);
         }
         let atom = target.geometry()?;
         let grid = WarpGrid { rows: self.warps(), cols: 1 };
-        let row = |o| atom.issue(o, grid, self.bq, self.bkv, self.depth(d)).ok().map(|i| i.c.row_vector().regs());
-        let direct = row(Orient::Direct)?;
-        let held = if atom.swappable() { row(Orient::Swapped).map_or(direct, |s| s.min(direct)) } else { direct };
-        Some(2 * k as u32 * held)
+        let list = |o| {
+            let row = atom.issue(o, grid, self.bq, self.bkv, self.depth(d)).ok()?.c.row_vector();
+            Some(2 * TileLayout::spread_row(&row, k as u32).regs() + row.regs())
+        };
+        let direct = list(Orient::Direct)?;
+        Some(if atom.swappable() { list(Orient::Swapped).map_or(direct, |s| s.min(direct)) } else { direct })
     }
 
     /// A lane's operand registers (the fragments and the staged chunks) and
@@ -1344,9 +1351,9 @@ const GROUPS_PAIR: f64 = 2.0 * PAIR_OP;
 /// finding its least's column, that column's mask and the next row
 /// minimum, the K=1 argmin's work.
 const ROUND_PAIR: f64 = NEAREST_PAIR;
-/// Model: a round's offer into a row's list, a slot: a compare and four
-/// selects, in units of [`Costs::score`] a pair.
-const OFFER_SLOT: f64 = 5.0 * PAIR_OP;
+/// Model: a round's offer into a row's list, a slot a lane holds: two
+/// compares and four selects, in units of [`Costs::score`] a pair.
+const OFFER_SLOT: f64 = 6.0 * PAIR_OP;
 /// Search bound: the most scores a row's register list keeps; more take the
 /// graph (a shared-memory selection would serve them).
 pub const REGISTER_K: usize = 32;
@@ -1462,7 +1469,10 @@ impl Nearest {
         let reads = (read * depth * ELEM) as f64 * costs.smem_byte;
         let mut epilogue = (bq * bkv) as f64 * pair * costs.score / chunks as f64;
         if k > 1 {
-            let round = ((bq * bkv) as f64 * ROUND_PAIR + (bq * k) as f64 * OFFER_SLOT) * costs.score;
+            // The list's slots its lanes hold, each one a lane offers to:
+            // a row's `k` once a row, more where lanes share them.
+            let held = cfg.list_registers(target, d, k).ok_or(Rejected::Layout)? / 2 * target.wave * waves as u32;
+            let round = ((bq * bkv) as f64 * ROUND_PAIR + f64::from(held) * OFFER_SLOT) * costs.score;
             epilogue += self.rounds(cfg) * round / chunks as f64;
         }
         let work = steps as f64 * costs.step + epilogue;

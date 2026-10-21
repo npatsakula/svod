@@ -183,9 +183,11 @@ impl NearestSpec {
 ///
 /// With `k > 1` a row keeps its `k` least scores (`score [n, k]`, `index
 /// [n, k]`, row-major), ascending, an equal score at the smaller index, the
-/// slots past its admissible candidates `+∞` at −1: a sorted list carried in
-/// registers, into which each trip offers its scores one row minimum at a
-/// time, only while some row of the warp has one below its `k`-th
+/// slots past its admissible candidates `+∞` at −1: a sorted `[bq, k]` list
+/// carried in registers, its slots spread over the lanes holding the same
+/// rows ([`crate::layouts::TileLayout::spread_row`]), into which each trip
+/// offers its scores one row minimum at a time ([`TileOp::Shift`] moving the
+/// slots past it), only while some row of the warp has one below its `k`-th
 /// ([`Kernel::if_any`]). Split, share `s` leaves slot `j` of its list at
 /// `(s·k + j)·`[`share_stride`].
 ///
@@ -387,16 +389,17 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
         }
     };
 
-    // The tile's scores offered to the row's carried list (its `top` least
-    // scores, then their indices), its least first, then each next least
-    // once the least before it is masked out: a trip offers at most `top`,
-    // and only while some row of the warp still has a score below its
-    // list's last. A row whose offer misses its list masks its least all the
-    // same: its scores only rise, so it misses again.
+    // The tile's scores offered to the row's carried list (`[bq, top]` of
+    // its least scores ascending, their indices, and its last score: the
+    // vote's, a row vector as the row minimum is), its least first,
+    // then each next least once the least before it is masked out: a trip
+    // offers at most `top`, and only while some row of the warp still has a
+    // score below one in its list. A row whose offer misses its list masks
+    // its least all the same: its scores only rise, so it misses again.
     let fold_list = |k: &mut Kernel, dot: Regs<F32>, start: Sc, list: Vec<Regs<F32>>| {
         let s = scores(k, dot, start.clone());
         let low = k.reduce(s, Axis::Row, ReduceOp::Min);
-        let lower = k.compare(low, list[top - 1], CmpOp::Lt);
+        let lower = k.compare(low, list[2], CmpOp::Lt);
         k.if_any(
             lower,
             |k| {
@@ -406,8 +409,8 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
                 let origin = k.splat::<F32>(rows, start);
                 let init = [s, low].into_iter().chain(list.iter().copied()).collect();
                 let out = k.loop_vec(top.min(bkv), init, |k, _, carried| {
-                    let (s, low) = (carried[0], carried[1]);
-                    let lower = k.compare(low, carried[2 + top - 1], CmpOp::Lt);
+                    let [s, low, best, at, last] = carried[..] else { unreachable!("five carried tiles") };
+                    let lower = k.compare(low, last, CmpOp::Lt);
                     k.if_any(
                         lower,
                         |k| {
@@ -418,8 +421,9 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
                             let hit = k.compare(col, first, CmpOp::Eq);
                             let rest = k.where_(hit, none, s);
                             let next = k.reduce(rest, Axis::Row, ReduceOp::Min);
-                            let list = insert(k, &carried[2..], low, index);
-                            [rest, next].into_iter().chain(list).collect()
+                            let [best, at] = offer(k, [best, at], low, index);
+                            let last = k.reduce(best, Axis::Row, ReduceOp::Max);
+                            vec![rest, next, best, at, last]
                         },
                         carried.clone(),
                     )
@@ -430,13 +434,11 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
         )
     };
 
-    let init = match top {
-        1 => vec![k.fill::<F32>(rows, Const::Float(f64::INFINITY)), k.fill::<F32>(rows, Const::Float(-1.0))],
-        _ => {
-            let scores = (0..top).map(|_| k.fill::<F32>(rows, Const::Float(f64::INFINITY))).collect::<Vec<_>>();
-            scores.into_iter().chain((0..top).map(|_| k.fill::<F32>(rows, Const::Float(-1.0)))).collect()
-        }
-    };
+    let list = Shape::new(bq, top);
+    let mut init = vec![k.fill::<F32>(list, Const::Float(f64::INFINITY)), k.fill::<F32>(list, Const::Float(-1.0))];
+    if top > 1 {
+        init.push(k.fill::<F32>(rows, Const::Float(f64::INFINITY)));
+    }
     let folded = |k: &mut Kernel, dot: Regs<F32>, start: Sc, carried: Vec<Regs<F32>>| match top {
         1 => fold(k, dot, start, carried[0], carried[1]).to_vec(),
         _ => fold_list(k, dot, start, carried),
@@ -471,19 +473,28 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
     // A share's partial results, a row's least in the units the merge
     // compares; slot `j` of a row's list at `j` of its `top` (unsplit) or
     // in the share's `j`th run of rows (split).
-    let (list, indices) = carried.split_at(top);
-    for (j, (&best, &index)) in list.iter().zip(indices).enumerate() {
-        let (best, at) = match &share {
-            Some((part, ..)) if top == 1 => (best, (part.clone() * share_stride(n), 1)),
-            Some((part, ..)) => (best, ((part.clone() * top + j) * share_stride(n), 1)),
-            None => (finished(&mut k, best, metric), (Sc::from(j), top)),
-        };
-        let v = row_view(&mut k, score_out, at.clone(), n, bq, q_off.clone());
-        k.store(v, best);
-        let index = k.cast::<F32, I32>(index);
-        let v = row_view(&mut k, index_out, at, n, bq, q_off.clone());
-        k.store(v, index);
+    let [best, index] = carried[..2] else { unreachable!("a score and an index") };
+    let (best, at) = match &share {
+        Some((part, ..)) if top == 1 => (best, (part.clone() * share_stride(n), [1, 1])),
+        Some((part, ..)) => (best, (part.clone() * top * share_stride(n), [1, share_stride(n)])),
+        None => (finished(&mut k, best, metric), (Sc::from(0), [top, 1])),
+    };
+    fn slots<E: Elem>(
+        k: &mut Kernel,
+        p: ParamRef<E>,
+        (base, step): (Sc, [usize; 2]),
+        list: Shape,
+        n: usize,
+        q_off: Sc,
+    ) -> Gmem<E> {
+        let v = k.view(p, base, step, list, [bound(n, list.rows), None]);
+        k.at(v, q_off, 0)
     }
+    let v = slots(&mut k, score_out, at.clone(), list, n, q_off.clone());
+    k.store(v, best);
+    let index = k.cast::<F32, I32>(index);
+    let v = slots(&mut k, index_out, at, list, n, q_off.clone());
+    k.store(v, index);
     k.finish()
 }
 
@@ -517,6 +528,23 @@ fn insert(k: &mut Kernel, list: &[Regs<F32>], v: Regs<F32>, i: Regs<F32>) -> Vec
     };
     let scores = slots(k, scores, v);
     scores.into_iter().chain(slots(k, indices, i)).collect()
+}
+
+/// A row's list (`[rows, k]` scores ascending and their indices) with the
+/// score `v` at index `i` (`[rows, 1]`) offered, as [`insert`] does it slot
+/// by slot: every slot below `v` keeps its score, the first above it takes
+/// `v` and the rest the one before them, the last dropped.
+fn offer(k: &mut Kernel, [best, at]: [Regs<F32>; 2], v: Regs<F32>, i: Regs<F32>) -> [Regs<F32>; 2] {
+    let below = k.compare(v, best, CmpOp::Lt);
+    let before = k.shift(best, Axis::Col, Const::Float(f64::NEG_INFINITY));
+    let moved = k.compare(v, before, CmpOp::Lt);
+    let at_before = k.shift(at, Axis::Col, Const::Float(-1.0));
+    let best = {
+        let here = k.where_(below, v, best);
+        k.where_(moved, before, here)
+    };
+    let here = k.where_(below, i, at);
+    [best, k.where_(moved, at_before, here)]
 }
 
 /// A row's least in the metric's own units, from the units it was compared

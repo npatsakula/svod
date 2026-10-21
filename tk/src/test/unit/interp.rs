@@ -240,3 +240,30 @@ fn an_access_past_the_capacity_is_an_error(access: Access, at: i64) -> Result<()
     k.store(dst, v);
     run(&k.finish(), vec![vec![1.0; 16], vec![0.0; 16]], &[]).map(drop).map_err(|e| e.to_string())
 }
+
+/// A shift moves every element one step on along its axis and fills the
+/// first column (or row).
+#[test_case(Axis::Col; "along the columns")]
+#[test_case(Axis::Row; "down the rows")]
+fn a_shift_moves_every_element_one_step(axis: Axis) {
+    let (rows, cols) = (3usize, 5usize);
+    let mut k = Kernel::new("shift");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let xr = k.load(xv);
+    let out = k.shift(xr, axis, Const::Float(-9.0));
+    let yv = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    k.store(yv, out);
+    let xs: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
+    let got = run(&k.finish(), vec![xs, vec![0.0; rows * cols]], &[]).unwrap();
+    let want: Vec<f64> = (0..rows * cols)
+        .map(|i| match axis {
+            Axis::Col if i % cols == 0 => -9.0,
+            Axis::Row if i < cols => -9.0,
+            Axis::Col => (i - 1) as f64,
+            Axis::Row => (i - cols) as f64,
+        })
+        .collect();
+    assert_eq!(got[1], want);
+}

@@ -270,6 +270,13 @@ pub enum TileOp {
     Transpose {
         src: ValId,
     },
+    /// Every element one step on along `axis` (`out[r][c] = src[r][c − 1]`
+    /// along `Col`), the first row or column `fill`.
+    Shift {
+        src: ValId,
+        axis: Axis,
+        fill: Const,
+    },
     /// The same elements held under the layout its consumer needs; inserted
     /// by the layout inference, never by an author (who pins layouts instead).
     Relayout {

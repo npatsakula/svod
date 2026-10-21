@@ -211,10 +211,7 @@ pub(crate) fn graph_k(x: &Tensor, c: &Tensor, k: usize, opts: Nearest) -> svod_t
     let cols = Tensor::arange(0, Some(m as i64), None)?.cast(DType::Int32).try_unsqueeze(0)?;
     let (mut scores, mut indices) = (vec![], vec![]);
     for slot in 0..k {
-        // Held apart from the argmin's reduction over the same axis: fused,
-        // a ragged axis (5 candidates) renders an INDEX the LLVM renderer
-        // refuses.
-        let best = s.min(1isize)?.contiguous();
+        let best = s.min(1isize)?;
         let none = best.try_eq(f32::INFINITY)?;
         let index = Tensor::const_(-1i32, DType::Int32).where_(&none, &s.argmin(1)?)?;
         if slot + 1 < k {

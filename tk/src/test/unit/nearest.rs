@@ -905,6 +905,38 @@ fn a_list_votes_before_its_rounds(target: Target, vote: &str) {
     }
 }
 
+/// A list is held as its rows' least is, its slots spread over the lanes
+/// sharing those rows ([`TileLayout::spread_row`]), so no value of the
+/// kernel is re-held, resident or streamed, on every target.
+#[test_case(crate::atoms::sm86(); "sm_86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64); "gfx1201")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40); "gfx1151")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304); "gfx942")]
+fn a_list_is_held_beside_its_rows(target: Target) {
+    use crate::ir::{Stmt, TileOp};
+    use crate::layouts::TileLayout;
+    let device = crate::sweep::declared(target);
+    for (cfg, k) in
+        [(NearestCfg::new(64, 32, 2), 8), (NearestCfg::streamed(64, 64, 32, 2), 16), (NearestCfg::new(32, 16, 2), 3)]
+    {
+        let spec =
+            NearestSpec { n: 300, m: 500, d: 64, metric: Metric::SquaredL2, floors: NONE, groups: false, k, cfg };
+        let grid = crate::layouts::WarpGrid { rows: cfg.warps(), cols: 1 };
+        let laid = crate::layouts::infer(nearest::<BF16>(&spec), &device, grid, Core::Warp).unwrap();
+        let mut lists = 0;
+        for (_, stmt) in laid.prog.walk() {
+            let Stmt::Let { dst, op } = stmt else { continue };
+            assert!(!matches!(op, TileOp::Relayout { .. }), "{cfg:?} k{k}: a relayout of {dst:?}");
+            if laid.prog.value(*dst).shape == crate::ir::Shape::new(cfg.bq, k) {
+                let l = laid.layouts[dst.index()].as_ref().unwrap();
+                assert_eq!(*l, TileLayout::spread_row(&l.row_vector(), k as u32), "{cfg:?} k{k}");
+                lists += 1;
+            }
+        }
+        assert!(lists > 0, "{cfg:?} k{k}: a list");
+    }
+}
+
 /// `t` on the host as f64.
 fn host(t: &Tensor) -> Vec<f64> {
     t.cast(DType::Float32).to_vec::<f32>().unwrap().into_iter().map(f64::from).collect()
@@ -1115,14 +1147,23 @@ fn nearest_wide_probe() {
 /// Times the tuner's pick for an `n`-row self-join and every config it
 /// admitted, printing each one's pairs a second and TFLOP/s.
 fn time_nearest(planner: &Planner, n: usize, d: usize, metric: Metric, floors: Floors, groups: bool) {
-    let (admitted, pick) = device_nearest(planner, n, d, metric, floors, groups);
+    time_list(planner, config::Nearest { n, m: n, d, metric, floors, groups, k: 1 }, DType::BFloat16);
+}
+
+/// [`time_nearest`] of the self-join `p` (its `k` scores a row) in `dtype`.
+fn time_list(planner: &Planner, p: config::Nearest, dtype: DType) {
+    let config::Nearest { n, d, metric, floors, groups, k, .. } = p;
+    let (admitted, pick) = device_nearest(planner, p, dtype.clone());
     let mut timed = admitted.clone();
     if !timed.contains(&pick) {
         timed.push(pick);
     }
-    let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups, k: 1, cfg };
-    let ns = super::measure(timed.iter().map(|&cfg| tk::nearest::programs(planner, DType::BFloat16, &spec(cfg))));
-    eprintln!("== nearest {n}x{n}x{d} {metric:?} {floors:?} groups={groups}: {} admitted", admitted.len());
+    let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups, k, cfg };
+    let ns = super::measure(timed.iter().map(|&cfg| tk::nearest::programs(planner, dtype.clone(), &spec(cfg))));
+    eprintln!(
+        "== nearest {n}x{n}x{d} k{k} {dtype:?} {metric:?} {floors:?} groups={groups}: {} admitted",
+        admitted.len()
+    );
     let pairs = (n * n) as f64;
     for (cfg, ns) in timed.iter().zip(ns) {
         let mark = if *cfg == pick { " (tuner's pick)" } else { "" };
@@ -1132,6 +1173,48 @@ fn time_nearest(planner: &Planner, n: usize, d: usize, metric: Metric, floors: F
         });
         eprintln!("  {cfg:?}: {rate}{mark}");
     }
+}
+
+/// A row's `k` least over a self-join, per `KNN_ROWS` (comma-separated,
+/// 16384), `KNN_DEPTHS` (128,256,768) and `KNN_KS` (1,4,8,16), the inner
+/// product and squared distances in f16: the tuner's pick for each, as the
+/// op tunes it, its pairs a second and their share of `k = 1`'s; with
+/// `KNN_ALL` set, every config the tuner admitted too. Prints, never
+/// asserts (`--ignored --nocapture --test-threads=1`).
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn knn_probe() {
+    let list = |name: &str, default: &str| -> Vec<usize> {
+        let text = std::env::var(name).unwrap_or(default.into());
+        text.split(',').map(|v| v.trim().parse().expect("a comma-separated list of counts")).collect()
+    };
+    let (rows, depths, ks) = (list("KNN_ROWS", "16384"), list("KNN_DEPTHS", "128,256,768"), list("KNN_KS", "1,4,8,16"));
+    let Some(planner) = super::device_planner() else { return };
+    crate::tune::scoped(true, || {
+        for &n in &rows {
+            for &d in &depths {
+                for metric in [Metric::NegDot, Metric::SquaredL2] {
+                    let mut least = None;
+                    for &k in &ks {
+                        let p = config::Nearest { n, m: n, d, metric, floors: NONE, groups: false, k };
+                        if std::env::var_os("KNN_ALL").is_some() {
+                            time_list(&planner, p, DType::Float16);
+                        }
+                        let (_, pick) = device_nearest(&planner, p, DType::Float16);
+                        let spec = NearestSpec { n, m: n, d, metric, floors: NONE, groups: false, k, cfg: pick };
+                        let [ns] = super::measure([tk::nearest::programs(&planner, DType::Float16, &spec)])[..] else {
+                            unreachable!("one candidate")
+                        };
+                        let rate = ns.map(|ns| (n * n) as f64 / ns as f64);
+                        least = least.or(rate.filter(|_| k == 1));
+                        let share = rate.zip(least).map_or("-".into(), |(r, l)| format!("{:5.1} %", 100.0 * r / l));
+                        let rate = rate.map_or("failed".into(), |r| format!("{r:7.1} Gpairs/s"));
+                        eprintln!("knn {n}² d{d} {metric:?} k{k}: {rate} {share} of k=1, {pick:?}");
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Times the tuner's GEMM pick for `m × n × k`, as the tuner times it.
@@ -1151,23 +1234,18 @@ fn time_gemm(planner: &Planner, m: usize, n: usize, k: usize) {
     eprintln!("== gemm {m}x{n}x{k} {cfg:?}: {rate} (tuner's pick)");
 }
 
-/// The configs the tuner admits for an `n`-row self-join on the device, and its pick.
-fn device_nearest(
-    planner: &Planner,
-    n: usize,
-    d: usize,
-    metric: Metric,
-    floors: Floors,
-    groups: bool,
-) -> (Vec<NearestCfg>, NearestCfg) {
-    let p = config::Nearest { n, m: n, d, metric, floors, groups, k: 1 };
+/// The configs the tuner admits for the self-join `p` on the device in
+/// `dtype`, and its pick.
+fn device_nearest(planner: &Planner, p: config::Nearest, dtype: DType) -> (Vec<NearestCfg>, NearestCfg) {
+    let config::Nearest { n, d, metric, floors, groups, k, .. } = p;
     let ranked = planner.nearest_ranked(p);
-    let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups, k: 1, cfg };
-    let build = |cfg: NearestCfg| tk::nearest::programs(planner, DType::BFloat16, &spec(cfg));
-    let shape = [n, n, d];
+    let spec = |cfg| NearestSpec { n, m: n, d, metric, floors, groups, k, cfg };
+    let build = |cfg: NearestCfg| tk::nearest::programs(planner, dtype.clone(), &spec(cfg));
+    let shape = [n, n, d, k];
+    let shape = if k == 1 { &shape[..3] } else { &shape[..] };
     let (admitted, pick) = super::tuned_on_device(
         planner,
-        ("nearest", DType::BFloat16, &shape, (crate::ops::DEVICE_TEST, metric, floors, groups)),
+        ("nearest", dtype.clone(), shape, (crate::ops::DEVICE_TEST, metric, floors, groups)),
         &ranked,
         |admitted| planner.nearest_splits(&p, admitted),
         build,

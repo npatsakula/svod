@@ -561,3 +561,33 @@ fn a_fold_issues_the_lane_moves_it_is_priced(target: Target, orient: Orient, axi
     assert!(priced > 0);
     assert_eq!(issued as u32, priced, "{ir}");
 }
+
+/// A tile spread from a product's row minimum holds the vector as its row
+/// vector, every element once a lane group (the lanes sharing a row hold
+/// successive runs of its columns, a column count's odd part repeating in
+/// registers), and shifts along its columns, a power-of-two count with lane
+/// moves only into a run's first register.
+#[test_case(sm86(), Orient::Direct; "sm_86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Swapped; "gfx1201 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Swapped; "gfx1151 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Direct; "gfx942")]
+fn a_spread_tile_holds_its_rows_vector(target: Target, orient: Orient) {
+    let (warps, lanes) = (4, target.wave);
+    let grid = WarpGrid { rows: warps, cols: 1 };
+    let atom = target.geometry().unwrap().clone();
+    let vector = atom.issue(orient, grid, 64, 64, 32).unwrap().c.row_vector();
+    for cols in [2, 3, 4, 8, 12, 16, 32] {
+        let t = TileLayout::spread_row(&vector, cols);
+        assert_eq!((t.shape(), t.row_vector()), (Shape::new(64, cols as usize), vector.clone()), "{cols}");
+        let held: HashSet<(u32, u32)> = coords(&t, warps, lanes).into_iter().collect();
+        assert_eq!(held.len(), 64 * cols as usize, "{cols}: every element held");
+        let moves = t.shift(Axis::Col, warps, lanes).expect("a shift within the warp");
+        for (j, (_, fill)) in moves.iter().enumerate() {
+            assert_eq!(*fill != 0, (0..lanes).any(|l| t.coord(0, l, j as u32).1 == 0), "{cols}: register {j} fills");
+        }
+        let crossing = moves.iter().filter(|(picks, _)| picks.iter().any(|p| p.mask != 0)).count();
+        if cols.is_power_of_two() {
+            assert_eq!(crossing as u32, vector.regs(), "{cols}: a run's first register a row crosses lanes");
+        }
+    }
+}

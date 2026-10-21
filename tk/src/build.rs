@@ -503,6 +503,12 @@ impl Kernel {
         self.let_(shape, TileOp::Transpose { src: src.0 })
     }
 
+    /// `src` one step on along `axis`, `fill` first ([`TileOp::Shift`]).
+    pub fn shift<T: Elem>(&mut self, src: Regs<T>, axis: Axis, fill: Const) -> Regs<T> {
+        let shape = self.shape(src);
+        self.let_(shape, TileOp::Shift { src: src.0, axis, fill })
+    }
+
     /// Hold `v` under `layout` (see [`Program::pins`]).
     pub fn pin<T: Elem>(&mut self, v: Regs<T>, layout: crate::layouts::TileLayout) {
         assert_eq!(layout.shape(), self.shape(v), "a pin covers its tile");

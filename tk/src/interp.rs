@@ -422,6 +422,20 @@ impl Frame<'_> {
                 let v = self.read(*src)?;
                 (0..rows * cols).map(|i| v[(i % cols) * rows + i / cols]).collect()
             }
+            TileOp::Shift { src, axis, fill } => {
+                let v = self.read(*src)?;
+                let fill = match fill {
+                    Const::Int(i) => *i as f64,
+                    Const::Float(f) => *f,
+                };
+                let step = if *axis == Axis::Col { 1 } else { cols };
+                (0..rows * cols)
+                    .map(|i| {
+                        let first = if *axis == Axis::Col { i % cols == 0 } else { i < cols };
+                        if first { fill } else { v[i - step] }
+                    })
+                    .collect()
+            }
         };
         Ok(data.into_iter().map(|x| round_to(out.dtype, x)).collect())
     }
