@@ -196,8 +196,7 @@ pub(crate) fn picked(
 
 /// The merge of a split `spec`'s shares.
 fn merge_of(spec: &NearestSpec) -> MergeSpec {
-    let live = Live { rows: spec.live.rows.clone(), k: None };
-    MergeSpec { n: spec.n, splits: spec.cfg.splits, metric: spec.metric, k: spec.k, live }
+    MergeSpec { n: spec.n, splits: spec.cfg.splits, metric: spec.metric, k: spec.k, live: spec.live.clone() }
 }
 
 /// A score-matrix `spec`'s launches in order: per block of

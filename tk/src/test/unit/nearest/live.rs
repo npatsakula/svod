@@ -59,7 +59,7 @@ fn concrete_way(cfg: NearestCfg, k: usize) -> NearestCfg {
 
 /// The ways of keeping a list of `kmax` the tests take: a register list
 /// resident, streamed and split three ways (up to [`config::REGISTER_K`]),
-/// queued and through a score matrix (from 33 on).
+/// queued, queued and split, and through a score matrix (from 33 on).
 fn ways(kmax: usize, m: usize) -> Vec<NearestCfg> {
     let mut out = vec![];
     if kmax <= config::REGISTER_K {
@@ -67,7 +67,9 @@ fn ways(kmax: usize, m: usize) -> Vec<NearestCfg> {
         out.extend([NearestCfg::new(32, 16, 2), NearestCfg::streamed(32, 32, 16, 1), split]);
     }
     if kmax >= 33 {
-        out.extend(long_cfgs(kmax));
+        let long = long_cfgs(kmax);
+        out.push(shared_out(NearestCfg { splits: 3, ..long[0] }, m));
+        out.extend(long);
     }
     out
 }
@@ -136,8 +138,7 @@ impl Case {
                 if cfg.splits == 1 {
                     (score, index)
                 } else {
-                    let live = Live { rows: live.rows.clone(), k: None };
-                    let merge = MergeSpec { live, ..self.merge(cfg.splits, kmax) };
+                    let merge = MergeSpec { live: live.clone(), ..self.merge(cfg.splits, kmax) };
                     let params = vec![score, index, vec![0.0; self.n * kmax], vec![0.0; self.n * kmax]];
                     let mut out = exec(nearest_merge(&merge), &merge.lowering(device), params, &vars);
                     let index = out.pop().unwrap();
@@ -220,8 +221,11 @@ proptest! {
 #[test_case(NearestCfg::new(32, 16, 2), 16; "registers")]
 #[test_case(NearestCfg::streamed(32, 32, 16, 1), config::REGISTER_K; "streamed registers")]
 #[test_case(NearestCfg { splits: 3, ..NearestCfg::new(32, 16, 2) }, 8; "split registers")]
+#[test_case(NearestCfg { splits: 3, ..NearestCfg::new(32, 16, 2) }, config::REGISTER_K; "split registers longest")]
 #[test_case(NearestCfg { queue: Some(16), ..NearestCfg::new(32, 16, 2) }, 100; "queued")]
+#[test_case(NearestCfg { queue: Some(16), splits: 3, ..NearestCfg::new(32, 16, 2) }, 100; "split queued")]
 #[test_case(NearestCfg { queue: Some(32), ..NearestCfg::streamed(32, 32, 16, 1) }, 256; "streamed queued")]
+#[test_case(NearestCfg { queue: Some(32), splits: 4, ..NearestCfg::streamed(32, 32, 16, 1) }, 256; "split streamed queued")]
 #[test_case(NearestCfg { select: Some(SelectCfg { warps: 2, queue: 2 }), ..NearestCfg::new(16, 16, 2) }, 100; "score matrix")]
 #[test_case(NearestCfg { select: Some(SelectCfg { warps: 4, queue: 8 }), ..NearestCfg::new(64, 64, 1) }, 1024; "score matrix 1024")]
 fn live_bounds_keep_their_edges(cfg: NearestCfg, kmax: usize) {
@@ -247,7 +251,7 @@ fn live_bounds_keep_their_edges(cfg: NearestCfg, kmax: usize) {
 #[test_case(16, 64; "registers d64")]
 #[test_case(64, 768; "registers streamed d768")]
 #[test_case(8, 128; "split registers d128")]
-#[test_case(100, 128; "queued and score matrix k100")]
+#[test_case(100, 128; "split queued and score matrix k100")]
 #[test_case(256, 768; "queued and score matrix k256 d768")]
 fn live_lists_keep_the_lists_of_their_values_on_device(kmax: usize, d: usize) {
     let Some(planner) = super::super::device_planner() else { return };
@@ -256,8 +260,9 @@ fn live_lists_keep_the_lists_of_their_values_on_device(kmax: usize, d: usize) {
     let depth = d.next_multiple_of(16);
     let problem = case.problem(depth, kmax);
     let ranked = planner.nearest_ranked(problem);
-    let splits = |c: &NearestCfg| match kmax {
-        8 => planner.nearest_split(&problem, c).map(|splits| NearestCfg { splits, ..*c }).unwrap_or(*c),
+    // Split three ways where the way splits (a score matrix never does).
+    let splits = |c: &NearestCfg| match (kmax, c.select) {
+        (8 | 100, None) => shared_out(NearestCfg { splits: 3, ..*c }, m),
         _ => *c,
     };
     let mut kinds = vec![];
@@ -404,6 +409,7 @@ fn way(queue: bool, select: bool, splits: usize) -> impl Fn(&Planner, &[NearestC
 #[test_case(64, 768, false, false, 1, &[(300, 64), (1, 64), (77, 63), (300, 1)]; "registers streamed")]
 #[test_case(8, 128, false, false, 3, &[(300, 8), (17, 3), (300, 1)]; "split registers")]
 #[test_case(100, 128, true, false, 1, &[(300, 100), (1, 33), (151, 99), (300, 2)]; "queued")]
+#[test_case(100, 128, true, false, 4, &[(300, 100), (1, 33), (151, 99), (300, 2)]; "split queued")]
 #[test_case(256, 64, false, true, 1, &[(300, 256), (2, 1), (151, 100), (300, 255)]; "score matrix")]
 fn live_op_keeps_the_op_lists(
     kmax: usize,

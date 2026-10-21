@@ -5,7 +5,7 @@
 //! or, at a depth the registers cannot hold, both stream along the depth
 //! through the GEMM's K pipeline once per candidate tile. The candidates may
 //! split over several blocks per query block, each leaving a partial least
-//! and index that [`nearest_merge`] folds. A row's `k` least are a list in
+//! and index (or list) that [`nearest_merge`] folds. A row's `k` least are a list in
 //! registers fed by its lanes' queues, or past what they hold a register
 //! queue merged into the rest held in the outputs; or the kernel stores the
 //! scores as a matrix, block by block, whose rows [`nearest_select`] lists a
@@ -320,14 +320,16 @@ impl NearestSpec {
 /// of stops the pass, the warp sorts every queue (a bitonic network,
 /// [`TileOp::Flip`] across the lanes) and merges them into its rows' lists,
 /// takes the new `k`-th, and deals again from there. Split, share `s` leaves
-/// slot `j` of its list at `(s·k + j)·`[`share_stride`].
+/// row `i`'s list at `(s·`[`share_stride`]` + i)·k`, in the units the
+/// scores are compared in, for [`nearest_merge`].
 ///
 /// [Queued](NearestCfg::queue), the register list is a queue of the scores
 /// below the row's `k`-th, and the list proper is the outputs' (`+∞` at −1
-/// to start): once some row's could not take another lanes' queue whole the
-/// warp merges every row's into it, run by run of the queue's length (the
-/// lower half of a bitonic merge of the run and the carried queue stored,
-/// the upper half carried on), and takes the new `k`-th.
+/// to start; split, its share's): once some row's could not take another
+/// lanes' queue whole the warp merges every row's into it, run by run of the
+/// queue's length (the lower half of a bitonic merge of the run and the
+/// carried queue stored, the upper half carried on), and takes the new
+/// `k`-th.
 /// Under [`NearestCfg::select`] the outputs are `scores [n, m]` alone, each
 /// pair's score in the units compared.
 ///
@@ -346,8 +348,8 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
     assert!(cfg.bk.is_none() || d.is_multiple_of(8), "a streamed depth {d} of whole 16-byte chunks");
     let held = cfg.queue.unwrap_or(top);
     assert!(
-        cfg.queue.is_none_or(|q| q.is_power_of_two() && (2..top).contains(&q) && splits == 1),
-        "a queue of {held} below a list of {top}, unsplit"
+        cfg.queue.is_none_or(|q| q.is_power_of_two() && (2..top).contains(&q)),
+        "a queue of {held} below a list of {top}"
     );
     assert!(cfg.select.is_none() || (cfg.queue.is_none() && splits == 1), "a score matrix, whole and unqueued");
     assert!(live.k.is_none() || top > 1, "a live list of more than one score");
@@ -571,12 +573,16 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
     // the slots past the live ones its last run reads masked, those it
     // writes left out of an output's shape.
     let kb = bound(top, held);
+    // A row's list in the outputs: row-major, split, in the share's own
+    // `[stride, k]` region.
+    let list_base = share.as_ref().map_or(Sc::from(0), |(part, ..)| part.clone() * (share_stride(n) * top));
     let pair_view = |k: &mut Kernel, p: ParamRef<F32>, c: Sc, t: usize| {
-        let v = k.view(p, 0, [top, 1], lane, [rb.clone(), kb.clone()]);
+        let v = k.view(p, list_base.clone(), [top, 1], lane, [rb.clone(), kb.clone()]);
         k.at(v, q_off.clone(), c * held + t * w)
     };
     let index_view = |k: &mut Kernel, c: Sc, t: usize| {
-        let v = k.view(index_out.expect("an index output"), 0, [top, 1], lane, [rb.clone(), kb.clone()]);
+        let v =
+            k.view(index_out.expect("an index output"), list_base.clone(), [top, 1], lane, [rb.clone(), kb.clone()]);
         k.at(v, q_off.clone(), c * held + t * w)
     };
     let runs = top.div_ceil(held);
@@ -633,7 +639,8 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
             }
             let (lo, hi) = merged(k, &run, &pairs(&carried[..2 * pairs_held]));
             for (t, [s, i]) in lo.iter().enumerate() {
-                let stored = if last { finished(k, *s, metric) } else { *s };
+                // A share's list stays in the units the merge compares.
+                let stored = if last && !split { finished(k, *s, metric) } else { *s };
                 let v = pair_view(k, score_out, c.clone(), t);
                 k.store(v, stored);
                 let i = k.cast::<F32, I32>(*i);
@@ -890,21 +897,16 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
         flush(&mut k, list, true);
         return k.finish();
     }
-    // A share's partial lists in the units the merge compares, slot `j` of
-    // a row's list in the share's `j`th run of rows (split); else the
-    // metric's, at `j` of its `top`.
-    let (base, step) = match &share {
-        Some((part, ..)) => (part.clone() * top * share_stride(n), [1, share_stride(n)]),
-        None => (Sc::from(0), [top, 1]),
-    };
+    // A row's list at `j` of its `top`, in the metric's units; split, in
+    // its share's region in the units the merge compares.
     for (t, [s, i]) in list.into_iter().take(top.div_ceil(w)).enumerate() {
-        let s = if share.is_some() { s } else { finished(&mut k, s, metric) };
-        let v = k.view(score_out, base.clone(), step, lane, [rb.clone(), Some(Sc::from(top))]);
+        let s = if split { s } else { finished(&mut k, s, metric) };
+        let v = k.view(score_out, list_base.clone(), [top, 1], lane, [rb.clone(), Some(Sc::from(top))]);
         let v = k.at(v, q_off.clone(), t * w);
         k.store(v, s);
         let i = k.cast::<F32, I32>(i);
-        let v =
-            k.view(index_out.expect("an index output"), base.clone(), step, lane, [rb.clone(), Some(Sc::from(top))]);
+        let index = index_out.expect("an index output");
+        let v = k.view(index, list_base.clone(), [top, 1], lane, [rb.clone(), Some(Sc::from(top))]);
         let v = k.at(v, q_off.clone(), t * w);
         k.store(v, i);
     }
@@ -1387,22 +1389,22 @@ pub struct MergeSpec {
     pub n: usize,
     pub splits: usize,
     pub metric: Metric,
-    /// The scores a row's list holds (its bound where the list is live:
-    /// every slot of the bound merged).
+    /// The scores a row's list holds (its bound where the list is live).
     pub k: usize,
-    /// The rows a launch binds, where they vary.
+    /// The rows and the list length a launch binds, where they vary: a
+    /// share's slots past the live length are passed over.
     pub live: Live,
 }
 
 /// Rows a merge block folds, one warp's.
 const MERGE_ROWS: usize = 256;
-/// Rows a merge block of lists folds, one warp's: a lane's row of each slot
-/// in one register.
-const LIST_ROWS: usize = 32;
+/// Rows a merge block of lists folds, a warp each.
+pub const LIST_WARPS: u32 = 4;
 
 impl MergeSpec {
     pub fn lowering(&self, device: &Device) -> Lowering {
-        Lowering::uniform(device, false, WarpGrid { rows: 1, cols: 1 })
+        let rows = if self.k > 1 { LIST_WARPS } else { 1 };
+        Lowering::uniform(device, false, WarpGrid { rows, cols: 1 })
     }
 }
 
@@ -1413,11 +1415,15 @@ impl MergeSpec {
 /// candidates come before the later shares'), so the smallest index; `+∞`
 /// at −1 where no share has a candidate.
 ///
-/// With `k > 1` the shares' lists, slot `j` of share `s` at
-/// `(s·k + j)·`[`share_stride`], are merged into `score [n, k]` and
-/// `index [n, k]` as [`nearest`] leaves them unsplit: each share's scores
-/// offered in order to a running list, so an equal score keeps the earlier
-/// share's (smaller) index and the empty slots, `+∞`, are passed over.
+/// With `k > 1` the shares' lists, row `i` of share `s` at
+/// `(s·`[`share_stride`]` + i)·k`, are merged into `score [n, k]` and
+/// `index [n, k]` as [`nearest`] leaves them unsplit: ascending in `(score,
+/// index)`, so an equal score at the smaller index, `+∞` at −1 past the
+/// admissible candidates. A warp holds a row's running list in runs of
+/// [`LANES`] slots, a register a lane each (as [`nearest_select`]), and
+/// merges each share's list into it by the lower half of a bitonic merge:
+/// the share's runs reversed against the list's, the earlier of each pair
+/// kept, then the list's bitonic order.
 pub fn nearest_merge(spec: &MergeSpec) -> Program {
     if spec.k > 1 {
         return merge_lists(spec);
@@ -1464,45 +1470,77 @@ pub fn nearest_merge(spec: &MergeSpec) -> Program {
 /// [`nearest_merge`] of `k > 1` scores a row.
 fn merge_lists(spec: &MergeSpec) -> Program {
     let MergeSpec { n, splits, metric, k: top, ref live } = *spec;
+    let (rows, runs) = (LIST_WARPS as usize, select_runs(top));
     let mut k = Kernel::new("nearest_merge");
     let stride = share_stride(n);
-    let score_part = k.param::<F32>("score_part", ParamKind::In, splits * top * stride);
-    let index_part = k.param::<I32>("index_part", ParamKind::In, splits * top * stride);
+    let score_part = k.param::<F32>("score_part", ParamKind::In, splits * stride * top);
+    let index_part = k.param::<I32>("index_part", ParamKind::In, splits * stride * top);
     let score = k.param::<F32>("score", ParamKind::Out, n * top);
     let index = k.param::<I32>("index", ParamKind::Out, n * top);
-    let live = live.rows(&mut k, n);
-    k.grid([launched(&live, n, LIST_ROWS), Sc::from(1), Sc::from(1)]);
-    k.warps(1);
-    let row0 = k.block(0) * LIST_ROWS;
-    let shape = Shape::new(1, LIST_ROWS);
-    let n = bound(n, LIST_ROWS);
-    // The block's rows of a parameter, `n` of them, row `r` at `base + r·step`.
-    fn rows<E: Elem>(k: &mut Kernel, p: ParamRef<E>, n: &Option<Sc>, row0: Sc, (base, step): (Sc, usize)) -> Gmem<E> {
-        let v = k.view(p, base, [0, step], Shape::new(1, LIST_ROWS), [None, n.clone()]);
-        k.at(v, 0, row0)
-    }
-    let scores = (0..top).map(|_| k.fill::<F32>(shape, Const::Float(f64::INFINITY))).collect::<Vec<_>>();
-    let init = scores.into_iter().chain((0..top).map(|_| k.fill::<F32>(shape, Const::Float(-1.0)))).collect();
-    let list = k.loop_vec(splits, init, |k, part, mut list| {
-        for j in 0..top {
-            let at = (part.clone() * top + j) * stride;
-            let v = rows(k, score_part, &n, row0.clone(), (at.clone(), 1));
-            let s = k.load(v);
-            let v = rows(k, index_part, &n, row0.clone(), (at, 1));
-            let i = k.load(v);
-            let i = k.cast::<I32, F32>(i);
-            list = insert(k, &list, s, i);
+    let rows_live = live.rows(&mut k, n);
+    let k_live = live.k(&mut k);
+    // The rows and slots of the capacity, as `nearest`'s live views.
+    let (rb, kb) = (bound(n, rows), bound(top, LANES));
+    k.grid([launched(&rows_live, n, rows), Sc::from(1), Sc::from(1)]);
+    k.warps(LIST_WARPS);
+    let row0 = k.block(0) * rows;
+    let lane = Shape::new(rows, LANES);
+    // Run `t` of the block's lists in `p` from `base`.
+    let run = |k: &mut Kernel, p: ParamRef<F32>, base: Sc, t: usize| {
+        let v = k.view(p, base, [top, 1], lane, [rb.clone(), kb.clone()]);
+        k.at(v, row0.clone(), t * LANES)
+    };
+    let index_run = |k: &mut Kernel, p: ParamRef<I32>, base: Sc, t: usize| {
+        let v = k.view(p, base, [top, 1], lane, [rb.clone(), kb.clone()]);
+        k.at(v, row0.clone(), t * LANES)
+    };
+    // Run `t` of share `s`'s lists, its slots past the list (the live
+    // length) empty; `None` where none is.
+    let loaded = |k: &mut Kernel, s: Sc, t: usize| {
+        if t * LANES >= top {
+            return None;
         }
-        list
+        let base = s * (stride * top);
+        let v = run(k, score_part, base.clone(), t);
+        let v = k.load(v);
+        let i = index_run(k, index_part, base, t);
+        let i = k.load(i);
+        let mut pair = [v, k.cast::<I32, F32>(i)];
+        if (t + 1) * LANES > top || k_live.is_some() {
+            let col = k.coord(lane, Axis::Col);
+            let width = match &k_live {
+                None => k.fill::<I32>(lane, Const::Int((top - t * LANES) as i64)),
+                Some(live) => k.splat::<I32>(lane, live.clone() - t * LANES),
+            };
+            let inside = k.compare(col, width, CmpOp::Lt);
+            let empty = empty_seq(k, lane, 1)[0];
+            pair = [0, 1].map(|j| k.where_(inside, pair[j], empty[j]));
+        }
+        Some(pair)
+    };
+    // The first share's lists as they are, every later one merged in.
+    let first: Seq =
+        (0..runs).map(|t| loaded(&mut k, Sc::from(0), t).unwrap_or_else(|| empty_seq(&mut k, lane, 1)[0])).collect();
+    let list = k.loop_vec(splits - 1, flat(&first).collect(), |k, s, list| {
+        let list = pairs(&list);
+        let mut lo: Seq = (0..runs)
+            .map(|t| {
+                let Some(other) = loaded(k, s.clone() + 1, runs - 1 - t) else { return list[t] };
+                let rev = other.map(|v| k.flip(v, Axis::Col, LANES as u32 - 1));
+                let first = before(k, list[t], rev);
+                [0, 1].map(|j| k.where_(first, list[t][j], rev[j]))
+            })
+            .collect();
+        network(k, &mut lo, [runs * LANES]);
+        flat(&lo).collect()
     });
-    let (list, indices) = list.split_at(top);
-    for (j, (&best, &at)) in list.iter().zip(indices).enumerate() {
-        let best = finished(&mut k, best, metric);
-        let v = rows(&mut k, score, &n, row0.clone(), (Sc::from(j), top));
-        k.store(v, best);
-        let at = k.cast::<F32, I32>(at);
-        let v = rows(&mut k, index, &n, row0.clone(), (Sc::from(j), top));
-        k.store(v, at);
+    for (t, [s, i]) in pairs(&list).into_iter().take(top.div_ceil(LANES)).enumerate() {
+        let s = finished(&mut k, s, metric);
+        let v = run(&mut k, score, Sc::from(0), t);
+        k.store(v, s);
+        let i = k.cast::<F32, I32>(i);
+        let v = index_run(&mut k, index, Sc::from(0), t);
+        k.store(v, i);
     }
     k.finish()
 }

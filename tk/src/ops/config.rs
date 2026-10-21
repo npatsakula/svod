@@ -859,8 +859,17 @@ impl Planner {
     /// Resident, a block reads its rows once and only a grid of fewer blocks
     /// than SMs splits, a block an SM (at depth 128 a split ran 5–18 %
     /// behind whole on gfx1201).
+    ///
+    /// A list of `k > 1` (in registers or queued; a score matrix never
+    /// splits, its scores stored whole) splits as the model prices cheapest
+    /// ([`Nearest::admit`]: a few query blocks over many candidates leave SMs
+    /// idle, against every share's list filled again and the merge of the
+    /// shares; at 256 queries by 2^20 candidates at depth 128 on sm_86 the
+    /// best of 4–64 shares measured 16–32 for 16 and 64 scores, 8 for 256,
+    /// 8 at 1024 queries, as the model's), streamed up to [`REREAD_K`] at
+    /// least as the rereads split, which the model does not see.
     pub fn nearest_split(&self, p: &Nearest, cfg: &NearestCfg) -> Option<usize> {
-        if cfg.queue.is_some() || cfg.select.is_some() || p.k > SPLIT_K {
+        if cfg.select.is_some() {
             return None;
         }
         let (target, d) = (&self.device.target, p.d);
@@ -873,8 +882,15 @@ impl Planner {
             }
             None => (self.sms(), blocks),
         };
-        let most = p.m.div_ceil(cfg.bkv) / (SPLIT_TILES * p.k);
-        let splits = flight.div_ceil(rows).next_power_of_two().min(prev_power_of_two(most));
+        let most = prev_power_of_two(p.m.div_ceil(cfg.bkv) / (SPLIT_TILES * p.k));
+        let fill = flight.div_ceil(rows).next_power_of_two().min(most);
+        if p.k == 1 || most < 2 {
+            return (fill > 1).then_some(fill);
+        }
+        let cost = |splits| p.admit(self, &NearestCfg { splits, ..*cfg }).ok().map(|(ns, _)| ns);
+        let priced = (0..=most.ilog2()).map(|b| 1 << b).filter_map(|s| cost(s).map(|ns| (ns, s)));
+        let priced = priced.min_by(|a, b| a.0.total_cmp(&b.0)).map_or(1, |(_, s)| s);
+        let splits = if cfg.bk.is_some() && p.k <= REREAD_K { fill.max(priced) } else { priced };
         (splits > 1).then_some(splits)
     }
 
@@ -1453,10 +1469,11 @@ const MATRIX_TILES: usize = 3;
 /// Search bound: the rows a select block lists.
 const SELECT_WARPS: u32 = 4;
 
-/// Search bound: the longest list a split's shares merge
-/// ([`crate::kernels::nearest::nearest_merge`] holds the merged list a lane:
-/// one of 64 compiled on gfx1201 to a kernel needing a dispatch packet).
-const SPLIT_K: usize = 32;
+/// Search bound: the longest list a streamed split shares as a least's
+/// rereads do ([`Planner::nearest_split`]): past it every share fills a long
+/// list again (at 4096 queries by 2^20 candidates at depth 768 on gfx1201,
+/// 16 shares ran 14 % behind 2 for 64 scores and 24 % for 256).
+const REREAD_K: usize = 32;
 /// Search bound: the fewest candidate tiles a share of a split nearest
 /// block walks ([`Planner::nearest_split`]).
 const SPLIT_TILES: usize = 4;
@@ -1525,7 +1542,7 @@ impl Nearest {
         let (bq, bkv, d, k) = (cfg.bq, cfg.bkv, self.d, self.k);
         match (cfg.queue, cfg.select) {
             (None, None) if k > REGISTER_K => return Err(Rejected::TopK { k, most: REGISTER_K }),
-            (Some(q), None) if q >= k || cfg.splits > 1 => return Err(Rejected::Lowers),
+            (Some(q), None) if q >= k => return Err(Rejected::Lowers),
             (Some(_), Some(_)) => return Err(Rejected::Lowers),
             (None, Some(s)) if !s.fits(k) || cfg.splits > 1 => return Err(Rejected::Lowers),
             _ => {}
@@ -1556,7 +1573,10 @@ impl Nearest {
         let ops = [self.metric.row_norms(), row, col, clamp].into_iter().filter(|&on| on).count();
         let first = if cfg.select.is_some() { MATRIX_PAIR } else { NEAREST_PAIR };
         let pair = first + ops as f64 * PAIR_OP + if self.groups { GROUPS_PAIR } else { 0.0 };
-        let (blocks, tiles, stages) = (self.n.div_ceil(bq), self.m.div_ceil(bkv), cfg.stages);
+        // Split, every query block's candidate tiles in shares, a block each.
+        let splits = cfg.splits;
+        let (blocks, tiles, stages) = (self.n.div_ceil(bq) * splits, self.m.div_ceil(bkv).div_ceil(splits), cfg.stages);
+        let share = Nearest { m: self.m.min(tiles * bkv), ..*self };
         let depth = cfg.bk.unwrap_or(d);
         let chunks = d.div_ceil(depth);
         // The rows a trip fills and every wave reads: the candidates, and
@@ -1570,7 +1590,16 @@ impl Nearest {
         let trips = tiles * chunks;
         let unique = ((self.n + self.m) * d * ELEM) as f64;
         let flight = planner.sms().min(blocks).max(1);
-        let distinct = flight * (filled - bkv) + bkv;
+        // The query blocks and shares the blocks in flight read: split, a
+        // group of query blocks walks every share ([`SPLIT_GROUP`]).
+        let (queries, shares) = match splits {
+            1 => (flight, 1),
+            _ => {
+                let group = self.n.div_ceil(bq).min(SPLIT_GROUP);
+                (flight.min(group), flight.div_ceil(group).min(splits))
+            }
+        };
+        let distinct = queries * (filled - bkv) + shares * bkv;
         let shared = 1.0 - distinct as f64 / (flight * filled) as f64;
         let mut fill = tile as f64 * planner.fill_byte(unique, (blocks * trips * tile) as f64, shared);
         if cfg.select.is_some() {
@@ -1593,7 +1622,7 @@ impl Nearest {
             {
                 return Err(Rejected::Lowers);
             }
-            epilogue += self.listing(cfg, lanes, target.wave) * waves as f64 * costs.score / (tiles * chunks) as f64;
+            epilogue += share.listing(cfg, lanes, target.wave) * waves as f64 * costs.score / (tiles * chunks) as f64;
         }
         let work = steps as f64 * costs.step + epilogue;
         let trip = costs.trip(target.fill, stages, cfg.unroll);
@@ -1606,7 +1635,24 @@ impl Nearest {
             }
         };
         let listed = cfg.select.map_or(0.0, |s| self.select_cost(planner, &s));
-        Ok((planner.pipelined(run) + restarts + listed, regs))
+        let merged = if splits > 1 { self.merge_cost(planner, splits) } else { 0.0 };
+        Ok((planner.pipelined(run) + restarts + listed + merged, regs))
+    }
+
+    /// What [`crate::kernels::nearest::nearest_merge`] costs folding
+    /// `splits` shares of this problem, ns: each row's shares read once from
+    /// DRAM, or its work, whichever is longer, spread over the SMs, and at
+    /// least a memory latency a share (a block's loads wait on the share
+    /// before). A row's least compares once a share; a list merges every
+    /// later share by a bitonic merge's lower half over its runs of
+    /// [`LANES`], a [`MERGE_SLOT`] each slot a stage.
+    fn merge_cost(&self, planner: &Planner, splits: usize) -> f64 {
+        let costs = &planner.device.costs;
+        let slots = if self.k == 1 { 1.0 } else { (select_runs(self.k) * LANES) as f64 };
+        let row = (splits - 1) as f64 * slots * (slots.log2() + 1.0) * MERGE_SLOT;
+        let bytes = ((splits + 1) * self.k * 8) as f64 * costs.global_byte;
+        let spread = self.n as f64 * (row * costs.score).max(bytes) / planner.sms() as f64;
+        spread.max(splits as f64 * costs.latency)
     }
 
     /// What [`crate::kernels::nearest::nearest_select`] costs listing this
@@ -1740,13 +1786,20 @@ impl Nearest {
     }
 
     /// The [`lattice`](Self::lattice)'s configs that run this problem on the
-    /// planner's target, cheapest first, then by fewer registers.
+    /// planner's target, cheapest first, then by fewer registers. A list of
+    /// `k > 1` is priced at its [split](Planner::nearest_split) where that
+    /// is cheaper, as the tuner times it.
     pub fn ranked(&self, planner: &Planner) -> Vec<NearestCfg> {
         let lattice = self.lattice(&planner.device.target);
         let count = lattice.len();
+        let split = |c: &NearestCfg, whole: f64| {
+            let splits = planner.nearest_split(self, c).filter(|_| self.k > 1);
+            let split = splits.and_then(|splits| self.admit(planner, &NearestCfg { splits, ..*c }).ok());
+            split.map_or(whole, |(ns, _)| ns.min(whole))
+        };
         let mut admitted: Vec<(f64, u32, NearestCfg)> = lattice
             .into_iter()
-            .filter_map(|c| self.admit(planner, &c).ok().map(|(cost, regs)| (cost, regs, c)))
+            .filter_map(|c| self.admit(planner, &c).ok().map(|(cost, regs)| (split(&c, cost), regs, c)))
             .collect();
         // A score matrix's listing costs alike whatever its product's tile:
         // the cheapest few products a listing.

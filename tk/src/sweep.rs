@@ -193,9 +193,10 @@ pub fn families(target: &Target) -> Vec<Launch> {
         push(name, nearest::<BF16>(&spec), cfg.lowering(&planner.device));
     }
     // Split over the candidates (shares of one tile and of two), and a merge
-    // of shares, of a least alone and of lists.
-    for (k, name) in [(1, ""), (8, " 8")] {
-        let cfg = NearestCfg { splits: 2, ..NearestCfg::streamed(32, 32, 32, 2) };
+    // of shares, of a least alone and of lists: in registers, the longest
+    // there, and queued.
+    for (k, queue, name) in [(1, None, ""), (8, None, " 8"), (64, None, " 64"), (256, Some(32), " 256 queued")] {
+        let cfg = NearestCfg { splits: 2, queue, ..NearestCfg::streamed(32, 32, 32, 2) };
         let (metric, floors, live) = (Metric::L2, Floors::default(), Live::default());
         let spec = NearestSpec { n: 100, m: 90, d: 64, metric, floors, groups: true, k, cfg, live };
         push(&format!("nearest{name} split"), nearest::<BF16>(&spec), cfg.lowering(&planner.device));
@@ -234,7 +235,7 @@ pub fn families(target: &Target) -> Vec<Launch> {
     let (metric, floors) = (Metric::NegDot, Floors::default());
     let spec = NearestSpec { n: 100, m: 90, d: 64, metric, floors, groups: false, k: 8, cfg, live: live(0, 8) };
     push("nearest live split", nearest::<BF16>(&spec), cfg.lowering(&planner.device));
-    let merge = MergeSpec { n: 100, splits: 3, metric, k: 8, live: Live { k: None, ..live(0, 8) } };
+    let merge = MergeSpec { n: 100, splits: 3, metric, k: 8, live: live(0, 8) };
     push("nearest live merge", nearest_merge(&merge), merge.lowering(&planner.device));
     let cfg = NearestCfg { select: Some(select), ..NearestCfg::new(64, 32, 2) };
     let (metric, live) = (Metric::L2, live(30, 100));
