@@ -268,6 +268,7 @@ fn the_segment_bounds_are_read_ahead_of_the_key_loop(group: bool) {
         d: 64,
         mask: AttnMask { seg_start: true, ..AttnMask::default() },
         cache: None,
+        packed: false,
         scale: 0.125,
         cfg,
     };

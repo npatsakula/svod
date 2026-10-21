@@ -98,13 +98,21 @@ fn gemm_reference(m: usize, n: usize, k: usize, epi: Epilogue, p: &[Vec<f64>]) -
 }
 
 const EPILOGUES: [Epilogue; 8] = [
-    Epilogue { bias: true, residual: false, act: Act::None, gated: false, scale: None, out_f32: false },
-    Epilogue { bias: false, residual: true, act: Act::None, gated: false, scale: None, out_f32: false },
-    Epilogue { bias: true, residual: false, act: Act::Gelu, gated: false, scale: None, out_f32: false },
-    Epilogue { bias: true, residual: true, act: Act::Silu, gated: false, scale: None, out_f32: false },
-    Epilogue { bias: true, residual: false, act: Act::Silu, gated: true, scale: None, out_f32: false },
-    Epilogue { bias: false, residual: true, act: Act::Gelu, gated: true, scale: None, out_f32: false },
-    Epilogue { bias: true, residual: true, act: Act::None, gated: false, scale: Some(Scale::new(0.5)), out_f32: false },
+    Epilogue { bias: true, residual: false, act: Act::None, gated: false, scale: None, out_f32: false, rope: None },
+    Epilogue { bias: false, residual: true, act: Act::None, gated: false, scale: None, out_f32: false, rope: None },
+    Epilogue { bias: true, residual: false, act: Act::Gelu, gated: false, scale: None, out_f32: false, rope: None },
+    Epilogue { bias: true, residual: true, act: Act::Silu, gated: false, scale: None, out_f32: false, rope: None },
+    Epilogue { bias: true, residual: false, act: Act::Silu, gated: true, scale: None, out_f32: false, rope: None },
+    Epilogue { bias: false, residual: true, act: Act::Gelu, gated: true, scale: None, out_f32: false, rope: None },
+    Epilogue {
+        bias: true,
+        residual: true,
+        act: Act::None,
+        gated: false,
+        scale: Some(Scale::new(0.5)),
+        out_f32: false,
+        rope: None,
+    },
     Epilogue {
         bias: true,
         residual: false,
@@ -112,6 +120,7 @@ const EPILOGUES: [Epilogue; 8] = [
         gated: true,
         scale: Some(Scale::new(-1.5)),
         out_f32: false,
+        rope: None,
     },
 ];
 

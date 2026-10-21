@@ -235,6 +235,7 @@ fn masked(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, mask: AttnMask) 
         d,
         mask,
         cache: None,
+        packed: false,
         scale: 1.0 / (d as f32).sqrt(),
         cfg: FaCfg::new(bq, bkv, 2),
     }
@@ -760,7 +761,7 @@ pub(super) fn device_attention(planner: &Planner, spec: &AttnSpec) -> (Vec<FaCfg
         crate::ops::Tuner::new(crate::tune::TuneStore::global(), &planner.device, DType::BFloat16, &shape, mask, build);
     let plain = tuner.admitted("attention", &crate::ops::config::representatives(&ranked));
     let formed = std::cell::RefCell::new(vec![]);
-    let pick = tune(&mut tuner, &ranked, mask.bias.is_some(), |admitted| {
+    let pick = tune("attention", &mut tuner, &ranked, mask.bias.is_some(), |admitted| {
         *formed.borrow_mut() = admitted.to_vec();
         admitted.to_vec()
     });
@@ -778,6 +779,7 @@ pub(super) fn probe_spec(batch: usize, heads: usize, t: usize, tk: usize, d: usi
         d,
         mask,
         cache: None,
+        packed: false,
         scale: 1.0 / (d as f32).sqrt(),
         cfg: FaCfg::new(64, 64, 2),
     }

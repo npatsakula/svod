@@ -995,7 +995,7 @@ fn the_graph_scales_before_the_residual(act: Act, gated: bool) {
     let (m, n, k) = (5, 6, 4);
     let rows = if gated { 2 * n } else { n };
     let (x, w, b, r) = (f(&[m, k], 1), f(&[rows, k], 2), f(&[rows], 3), f(&[m, n], 4));
-    let opts = Linear { bias: Some(&b), act, gated, residual: Some(&r), scale: Some(-0.75) };
+    let opts = Linear { bias: Some(&b), act, gated, residual: Some(&r), scale: Some(-0.75), rope: None };
     let got = tk::linear(&x, &w, opts).unwrap().to_vec::<f32>().unwrap();
     let unscaled = Linear { residual: None, scale: None, ..opts };
     let y = tk::linear(&x, &w, unscaled).unwrap().to_vec::<f32>().unwrap();

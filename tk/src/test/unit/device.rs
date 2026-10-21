@@ -12,7 +12,7 @@ use crate::build::*;
 use crate::interp::{round_to, run};
 use crate::ir::*;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Rope, gemm};
 use crate::launch::graph_launch;
 use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
@@ -620,4 +620,48 @@ fn a_periodic_table_matches_the_interpreter(period: usize) {
     let got = graph_launch(prog, &Lowering::uniform(&declared(target), false, grid), &[&x_t, &y_t]).unwrap();
     let got: Vec<f64> = got.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
     assert_eq!(got, want[1]);
+}
+
+/// The configs the tuner admits for a fused projection that turns its
+/// heads ([`GemmCfg::turns`]), and a 256-wide tile across the last turned
+/// head, compute what the interpreter computes: 6 turned heads of 64 and 3
+/// plain ones, rows no tile divides, positions wrapping every 50 rows.
+#[test]
+fn turning_gemms_match_the_interpreter() {
+    let Some(planner) = super::device_planner() else { return };
+    let (m, n, k, d) = (200, 576, 128, 64);
+    let rope = Rope { heads: 6, head_dim: d, seq: 50 };
+    let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: BIG };
+    let ranked: Vec<GemmCfg> = planner.gemm_ranked(1, m, n, k, false).iter().copied().filter(|c| c.turns(d)).collect();
+    let build = |cfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+    let shape = [1, m, n, k];
+    let (mut cfgs, _) =
+        super::tuned_on_device(&planner, ("gemm", DType::BFloat16, &shape), &ranked, <[_]>::to_vec, build);
+    let across = crate::ops::config::gemm_cfg([64, 256, 32], 2, [1, 4], false);
+    assert!(across.turns(d) && !(6 * d).is_multiple_of(256), "a tile across the last turned head");
+    cfgs.push(across);
+    let mut seed = 13;
+    let mut data = |n: usize| super::rounded(ScalarDType::BFloat16, n, &mut seed, |x| x);
+    let (a, b) = (data(m * k), data(n * k));
+    let (cos, sin): (Vec<f64>, Vec<f64>) = (0..rope.seq * d / 2)
+        .map(|i| {
+            let angle = (i / (d / 2)) as f64 * 10_000f64.powf(-2.0 * (i % (d / 2)) as f64 / d as f64);
+            (round_to(ScalarDType::BFloat16, angle.cos()), round_to(ScalarDType::BFloat16, angle.sin()))
+        })
+        .unzip();
+    let tensor = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+    let (a_t, b_t, cos_t, sin_t) = (tensor(&a), tensor(&b), tensor(&cos), tensor(&sin));
+    for cfg in &cfgs {
+        let prog = gemm::<BF16>(&GemmSpec { cfg: *cfg, ..spec.clone() });
+        let want = run(&prog, vec![a.clone(), b.clone(), cos.clone(), sin.clone(), vec![0.0; m * n]], &[]).unwrap();
+        let c_t = Tensor::empty(&[m * n], DType::BFloat16);
+        let got = graph_launch(prog, &cfg.lowering(&planner.device), &[&a_t, &b_t, &cos_t, &sin_t, &c_t]).unwrap();
+        let got: Vec<f32> = got.cast(DType::Float32).to_vec::<f32>().unwrap();
+        for (i, (g, w)) in got.iter().zip(&want[4]).enumerate() {
+            let diff = (*g as f64 - w).abs();
+            assert!(diff <= 1.6e-2 * w.abs().max(1.0), "{cfg:?}: c[{}, {}] = {g}, interpreter {w}", i / n, i % n);
+        }
+        eprintln!("{cfg:?}: matches");
+    }
 }

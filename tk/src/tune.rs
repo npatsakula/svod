@@ -94,6 +94,7 @@ impl TuneKey {
         shape: &[usize],
         candidates: &impl Hash,
     ) -> Self {
+        assert!(!op.contains([' ', '|']), "{op:?}: a store line is split at spaces and bars");
         Self { op, device: device(target), dtype, shape: shape.to_vec(), candidates: digest(candidates), compiler }
     }
 

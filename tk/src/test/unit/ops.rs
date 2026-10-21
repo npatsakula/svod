@@ -6,7 +6,7 @@ use svod_ir::{Op, SInt, ops};
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
-use crate::ops::{self as tk, Act, Attn, Cache, Chunk, Conv, KeyMask, Linear, Qkv};
+use crate::ops::{self as tk, Act, Attn, Cache, Chunk, Conv, KeyMask, Linear, Qkv, Rotary};
 
 /// `test` on a device with tk tables, with tuning off on its thread so it
 /// does not measure every shape it touches (the untuned pick runs).
@@ -74,6 +74,15 @@ fn assert_kernel(t: &Tensor, name: &str) {
 }
 
 /// [`assert_rel_close`](super::assert_rel_close) of two tensors' values.
+/// The tensors the first `name` kernel `t` depends on binds.
+fn kernel_args(t: &Tensor, name: &str) -> usize {
+    let call = t.uop().toposort().into_iter().find_map(|u| match u.op() {
+        Op::Call(ops::Call { info, args, .. }) if info.name.as_deref() == Some(name) => Some(args.len()),
+        _ => None,
+    });
+    call.unwrap_or_else(|| panic!("no {name} kernel"))
+}
+
 fn assert_tensors_close(what: &str, got: &Tensor, want: &Tensor, tol: f64) {
     assert_values_close(what, &values(got), &values(want), tol);
 }
@@ -112,7 +121,9 @@ fn first(ts: &[&Tensor], n: usize) -> Vec<Tensor> {
 fn linear_reference(x: &Tensor, w: &Tensor, opts: Linear) -> Tensor {
     let f32 = |t: &Tensor| t.cast(DType::Float32);
     let (bias, residual) = (opts.bias.map(f32), opts.residual.map(f32));
-    let opts = Linear { bias: bias.as_ref(), residual: residual.as_ref(), ..opts };
+    let tables = opts.rope.map(|r| (f32(r.cos), f32(r.sin)));
+    let rope = opts.rope.zip(tables.as_ref()).map(|(r, (cos, sin))| Rotary { cos, sin, ..r });
+    let opts = Linear { bias: bias.as_ref(), residual: residual.as_ref(), rope, ..opts };
     tk::linear::graph(&f32(x), &f32(w), opts).unwrap()
 }
 
@@ -136,7 +147,8 @@ fn linear_matches_the_graph(
         let w = rand(&[n, k], 2, 0.5, DType::BFloat16);
         let b = rand(&[n], 3, 1.0, DType::BFloat16);
         let r = rand(&[lead, &[n]].concat(), 4, 2.0, DType::BFloat16);
-        let opts = Linear { bias: bias.then_some(&b), act, gated: false, residual: residual.then_some(&r), scale };
+        let opts =
+            Linear { bias: bias.then_some(&b), act, gated: false, residual: residual.then_some(&r), scale, rope: None };
         let y = tk::linear(&x, &w, opts).unwrap();
         assert_kernel(&y, "gemm");
         assert_tensors_close("linear", &y, &linear_reference(&x, &w, opts), 2e-2);
@@ -206,7 +218,8 @@ fn linear_under_a_batch_variable() {
         let b = rand(&[2 * n], 13, 1.0, DType::BFloat16);
         let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
         let [xb, rb] = <[Tensor; 2]>::try_from(bound(&[&x, &r], &var)).unwrap();
-        let opts = Linear { bias: Some(&b), act: Act::Silu, gated: true, residual: Some(&rb), scale: Some(0.5) };
+        let opts =
+            Linear { bias: Some(&b), act: Act::Silu, gated: true, residual: Some(&rb), scale: Some(0.5), rope: None };
         let y = tk::linear(&xb, &w, opts).unwrap();
         assert_eq!(y.shape().unwrap()[0], var.as_sint());
         assert_kernel(&y, "gemm");
@@ -217,6 +230,52 @@ fn linear_under_a_batch_variable() {
         let [xs, rs] = <[Tensor; 2]>::try_from(first(&[&x, &r], 1)).unwrap();
         let want = values(&linear_reference(&xs, &w, Linear { residual: Some(&rs), ..opts }));
         assert_values_close("rebound linear", &rebound(&y, 1, rows * n), &want, 2e-2);
+    });
+}
+
+/// A fused projection's first heads turn in the GEMM's store, its values
+/// after them stored as they are: against the graph's rotation of the f32
+/// product, on rows no tile divides and under a bias; tables off the stream
+/// dtype leave the turn to the graph, after a plain kernel. `args`: the
+/// tensors the kernel binds, the tables among them where it turns.
+#[test_case(&[2, 37], [4, 2, 64], false, DType::BFloat16, 5; "grouped heads, partial rows")]
+#[test_case(&[1, 100], [12, 12, 64], true, DType::BFloat16, 6; "ModernBERT's heads under a bias")]
+#[test_case(&[3, 16], [2, 1, 128], false, DType::BFloat16, 5; "d 128")]
+#[test_case(&[2, 37], [4, 2, 64], false, DType::Float32, 3; "f32 tables")]
+fn turned_linear_matches_the_graph(lead: &[usize], [h, h_kv, d]: [usize; 3], bias: bool, tables: DType, args: usize) {
+    untuned(|| {
+        let (k, n) = (128, (h + 2 * h_kv) * d);
+        let x = rand(&[lead, &[k]].concat(), 40, 1.0, DType::BFloat16);
+        let w = rand(&[n, k], 41, 0.3, DType::BFloat16);
+        let b = rand(&[n], 42, 1.0, DType::BFloat16);
+        let (cos, sin) = rope_tables(1, lead[1], d, tables);
+        let rope = Rotary { cos: &cos, sin: &sin, heads: h + h_kv, head_dim: d };
+        let opts = Linear { bias: bias.then_some(&b), rope: Some(rope), ..Linear::default() };
+        let y = tk::linear(&x, &w, opts).unwrap();
+        assert_eq!(kernel_args(&y, "gemm"), args, "the tensors the GEMM binds");
+        assert_tensors_close("turned linear", &y, &linear_reference(&x, &w, opts), 2e-2);
+    });
+}
+
+/// The turn under a batch bound below its capacity: every batch's rows at
+/// the table's positions.
+#[test]
+fn turned_linear_under_a_batch_variable() {
+    untuned(|| {
+        let (cap, live, t, [h, h_kv, d], k) = (4, 3, 37, [4, 2, 64], 128);
+        let n = (h + 2 * h_kv) * d;
+        let x = rand(&[cap, t, k], 43, 1.0, DType::BFloat16);
+        let w = rand(&[n, k], 44, 0.3, DType::BFloat16);
+        let (cos, sin) = rope_tables(1, t, d, DType::BFloat16);
+        let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
+        let [xb] = <[Tensor; 1]>::try_from(bound(&[&x], &var)).unwrap();
+        let opts =
+            Linear { rope: Some(Rotary { cos: &cos, sin: &sin, heads: h + h_kv, head_dim: d }), ..Linear::default() };
+        let y = tk::linear(&xb, &w, opts).unwrap();
+        assert_eq!(y.shape().unwrap()[0], var.as_sint());
+        assert_eq!(kernel_args(&y, "gemm"), 5, "the kernel turns");
+        let [xs] = <[Tensor; 1]>::try_from(first(&[&x], live)).unwrap();
+        assert_tensors_close("batched turned linear", &y, &linear_reference(&xs, &w, opts), 2e-2);
     });
 }
 
@@ -370,6 +429,56 @@ fn climbing_scores_match_the_graph(per_key: f32, causal: bool) {
         assert_kernel(&o, "flash_attention");
         let want = tk::attention::graph(&inputs.q, &inputs.k, &inputs.v, opts).unwrap();
         assert_tensors_close("climbing attention", &o, &want, 2e-2);
+    });
+}
+
+/// A packed projection `[B, T, (h + 2·h_kv)·d]` and its three parts.
+fn packed(c: &AttnCase, cap: usize) -> (Tensor, [Tensor; 3]) {
+    let qkv = rand(&[cap, c.t, (c.h + 2 * c.h_kv) * c.d], 24, 1.0, DType::BFloat16);
+    let parts = qkv.split(&[c.h * c.d, c.h_kv * c.d, c.h_kv * c.d], -1).unwrap();
+    let head = |p: &Tensor, n: usize| p.try_reshape([cap, c.t, n, c.d]).unwrap().contiguous();
+    let (q, k, v) = (head(&parts[0], c.h), head(&parts[1], c.h_kv), head(&parts[2], c.h_kv));
+    (qkv, [q, k, v])
+}
+
+/// Attention over a packed projection reads its heads in place: it matches
+/// the graph over the parts, and the split kernel bit for bit, under a
+/// window, a key mask, key lengths, causal masking and grouped heads.
+#[test_case(case(2, [100, 100], [4, 4], 64, false, None); "plain")]
+#[test_case(AttnCase { key_mask: true, window: Some((64, 64)), ..case(2, [300, 300], [4, 4], 64, false, None) }; "bool mask, window")]
+#[test_case(case(2, [128, 128], [8, 2], 64, true, Some(&[128, 77])); "gqa causal lens")]
+#[test_case(case(1, [96, 96], [2, 1], 128, false, None); "d 128 gqa")]
+fn packed_attention_matches_the_split_kernel(c: AttnCase) {
+    untuned(|| {
+        let inputs = attn_inputs(&c, c.b);
+        let opts = inputs.opts(&c);
+        let (qkv, [q, k, v]) = packed(&c, c.b);
+        let o = tk::attention_packed(&qkv, c.h, c.h_kv, opts).unwrap();
+        assert_kernel(&o, "flash_attention_packed");
+        assert_tensors_close("packed attention", &o, &tk::attention::graph(&q, &k, &v, opts).unwrap(), 2e-2);
+        let split = tk::attention(&q, &k, &v, opts).unwrap();
+        assert_kernel(&split, "flash_attention");
+        assert!(values(&o) == values(&split), "packed and split kernels differ");
+    });
+}
+
+#[test]
+fn packed_attention_under_a_batch_variable() {
+    untuned(|| {
+        let (cap, live) = (3, 2);
+        let c = AttnCase { key_mask: true, ..case(cap, [96, 96], [4, 2], 64, false, None) };
+        let AttnInputs { key_mask, .. } = attn_inputs(&c, cap);
+        let key_mask = key_mask.unwrap();
+        let (qkv, [q, k, v]) = packed(&c, cap);
+        let var = Variable::new("b", 1, cap as i64).bind(live as i64).unwrap();
+        let [qkv_b, mask_b] = <[Tensor; 2]>::try_from(bound(&[&qkv, &key_mask], &var)).unwrap();
+        let opts = |mask| Attn { keys: KeyMask::Bool(mask), window: Some((16, 16)), ..Attn::default() };
+        let o = tk::attention_packed(&qkv_b, c.h, c.h_kv, opts(&mask_b)).unwrap();
+        assert_eq!(o.shape().unwrap()[0], var.as_sint());
+        assert_kernel(&o, "flash_attention_packed");
+        let [qs, ks, vs, ms] = <[Tensor; 4]>::try_from(first(&[&q, &k, &v, &key_mask], live)).unwrap();
+        let want = tk::attention::graph(&qs, &ks, &vs, opts(&ms)).unwrap();
+        assert_tensors_close("batched packed attention", &o, &want, 2e-2);
     });
 }
 

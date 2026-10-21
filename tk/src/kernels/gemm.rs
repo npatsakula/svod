@@ -27,11 +27,25 @@ pub struct Epilogue {
     pub scale: Option<Scale>,
     /// The output (and residual) is f32: the accumulator is stored unrounded.
     pub out_f32: bool,
+    /// Rotates the output's first heads after the bias, alone in an epilogue.
+    pub rope: Option<Rope>,
 }
 
 impl Epilogue {
     pub const DEFAULT: Self =
-        Self { bias: false, act: Act::None, gated: false, residual: false, scale: None, out_f32: false };
+        Self { bias: false, act: Act::None, gated: false, residual: false, scale: None, out_f32: false, rope: None };
+}
+
+/// A rotary embedding of the output's first `heads` heads of `head_dim`
+/// columns by `[seq, head_dim / 2]` cos and sin tables, output row `m` at
+/// position `m % seq`: a head's halves turn together as `apply_rotary_emb`
+/// turns split halves, `x₁·cos − x₂·sin` and `x₂·cos + x₁·sin`. The columns
+/// after them (a fused projection's values) are stored as they are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Rope {
+    pub heads: usize,
+    pub head_dim: usize,
+    pub seq: usize,
 }
 
 /// The tune store keys by this text: an epilogue without a scale prints as
@@ -46,6 +60,9 @@ impl fmt::Debug for Epilogue {
         }
         if self.out_f32 {
             s.field("out_f32", &true);
+        }
+        if let Some(rope) = self.rope {
+            s.field("rope", &rope);
         }
         s.finish()
     }
@@ -132,6 +149,15 @@ impl GemmCfg {
         if self.crews == 2 { self.tile[2] / KSLICE } else { 1 }
     }
 
+    /// Whether the tile carries an [`Epilogue::rope`] of `head_dim` heads:
+    /// the block's columns and each warp's hold whole heads, so a lane holds
+    /// both halves of its heads and the turn moves no data between lanes.
+    pub fn turns(&self, head_dim: usize) -> bool {
+        let bn = self.tile[1];
+        let warp_cols = bn / self.warps[1] as usize;
+        (head_dim / 2).is_power_of_two() && bn.is_multiple_of(head_dim) && warp_cols.is_multiple_of(head_dim)
+    }
+
     /// Static shared memory of the operand ring, in bytes of a 16-bit type.
     pub fn smem_bytes(&self, gated: bool) -> usize {
         let [bm, bn, bk] = self.tile;
@@ -151,9 +177,10 @@ pub struct GemmSpec {
 }
 
 /// Parameters in order: `a [batch·m, k]`, `b [n, k]` (`[2n, k]` gated),
-/// `bias` if any, `residual [batch·m, n]` if any, `c [batch·m, n]`. Rows past
-/// `m` and weight rows past `n` are clamped reads whose results are never
-/// stored; `k` must be a multiple of `bk`.
+/// `bias` if any, `residual [batch·m, n]` if any, the `cos` and `sin`
+/// tables of a [`Rope`], `c [batch·m, n]`. Rows past `m` and weight rows
+/// past `n` are clamped reads whose results are never stored; `k` must be a
+/// multiple of `bk`.
 pub fn gemm<T: Elem>(spec: &GemmSpec) -> Program {
     let GemmSpec { m, k: kk, cfg, .. } = *spec;
     let [bm, _, bk] = cfg.tile;
@@ -210,6 +237,13 @@ fn build<T: Elem, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     let b = k.param::<T>("b", ParamKind::In, halves * n * kk);
     let bias = epi.bias.then(|| k.param::<T>("bias", ParamKind::In, halves * n));
     let residual = epi.residual.then(|| k.param::<U>("residual", ParamKind::In, cap * m * n));
+    let rope = epi.rope.map(|rope| {
+        let plain = Epilogue { bias: epi.bias, rope: epi.rope, ..Epilogue::DEFAULT };
+        assert!(epi == plain && rope.heads * rope.head_dim <= n, "{epi:?} turns no more than a bias");
+        assert!(cfg.turns(rope.head_dim), "{cfg:?} holds no whole heads of {}", rope.head_dim);
+        let table = rope.seq * rope.head_dim / 2;
+        (rope, k.param::<T>("cos", ParamKind::In, table), k.param::<T>("sin", ParamKind::In, table))
+    });
     let c = k.param::<U>("c", ParamKind::Out, cap.max(split) * m * n);
     let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
     let (gz, bb) = if partial { (Sc::from(split), Some(k.block(2))) } else { batch.axis(&mut k) };
@@ -235,7 +269,7 @@ fn build<T: Elem, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
         mainloop(&mut k, sa, &a_tile, whole, trips / split, stages, bk, first_step, cfg.slices()).to_vec()
     };
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
-    finish::<T, U>(&mut k, accs, epi, bias, residual, c, &bb, &tile);
+    finish::<T, U>(&mut k, accs, epi, bias, residual, rope, c, &bb, &tile);
     k.finish()
 }
 
@@ -257,6 +291,7 @@ fn finish<T: Elem, U: Elem>(
     epi: Epilogue,
     bias: Option<ParamRef<T>>,
     residual: Option<ParamRef<U>>,
+    rope: Option<(Rope, ParamRef<T>, ParamRef<T>)>,
     c: ParamRef<U>,
     bb: &Option<Sc>,
     t: &Tile2,
@@ -282,6 +317,9 @@ fn finish<T: Elem, U: Elem>(
         let s = konst(k, out, f64::from(scale.get()));
         out = k.binary(out, s, BinaryOp::Mul);
     }
+    if let Some((rope, cos, sin)) = rope {
+        out = turn(k, out, rope, cos, sin, t);
+    }
     let tile = |k: &mut Kernel, p: ParamRef<U>| {
         let v = k.view(p, batch_offset(bb, m * n), [n, 1], Shape::new(bm, bn), [m_bound.clone(), n_bound.clone()]);
         k.at(v, row0.clone(), col0.clone())
@@ -294,6 +332,53 @@ fn finish<T: Elem, U: Elem>(
     let out = k.cast::<F32, U>(out);
     let c_view = tile(k, c);
     k.store(c_view, out);
+}
+
+/// [`Epilogue::rope`] on the output tile `x`, in a tile holding rotated
+/// columns: `x·cos + x'·sin`, `x'` the element half a head along
+/// ([`Kernel::swap_halves`]) and `sin` negated over a head's first half.
+/// A tile across the last rotated head keeps `x` past it.
+fn turn<T: Elem>(k: &mut Kernel, x: Regs<F32>, rope: Rope, cos: ParamRef<T>, sin: ParamRef<T>, t: &Tile2) -> Regs<F32> {
+    let Tile2 { bm, bn, ref row0, ref col0, .. } = *t;
+    let (half, turned) = (rope.head_dim / 2, rope.heads * rope.head_dim);
+    let [y] = k.select_if(
+        col0.clone().lt(turned),
+        |k| {
+            // Every head of row `r` reads the table row of its position.
+            let table = |k: &mut Kernel, p: ParamRef<T>| {
+                let at = (row0.clone() + k.row()) % rope.seq * half;
+                let v = k.gather(p, 0, at, None, Shape::new(bm, bn), None);
+                let v = k.periodic(v, half);
+                load_f32(k, v)
+            };
+            let (c, s) = (table(k, cos), table(k, sin));
+            let cols = Shape::new(1, bn);
+            let col = k.coord(cols, Axis::Col);
+            let int = |k: &mut Kernel, v: Sc| k.splat::<I32>(cols, v);
+            // A column of a head's first half: `c / half` is twice `c / head_dim`.
+            let (halves, heads, two) = (int(k, Sc::from(half)), int(k, Sc::from(rope.head_dim)), int(k, Sc::from(2)));
+            let in_half = k.binary(col, halves, BinaryOp::Div);
+            let head = k.binary(col, heads, BinaryOp::Div);
+            let twice = k.binary(head, two, BinaryOp::Mul);
+            let first = k.compare(in_half, twice, CmpOp::Eq);
+            let (minus, plus) = (k.fill::<F32>(cols, Const::Float(-1.0)), k.fill::<F32>(cols, Const::Float(1.0)));
+            let sign = k.where_(first, minus, plus);
+            let s = k.binary(s, sign, BinaryOp::Mul);
+            let partner = k.swap_halves(x, half);
+            let xc = k.binary(x, c, BinaryOp::Mul);
+            let y = k.mul_add(partner, s, xc);
+            if turned.is_multiple_of(bn) {
+                return [y];
+            }
+            let whole = Shape::new(bm, bn);
+            let at = k.coord(whole, Axis::Col);
+            let end = k.splat::<I32>(whole, Sc::from(turned) - col0.clone());
+            let inside = k.compare(at, end, CmpOp::Lt);
+            [k.where_(inside, y, x)]
+        },
+        |_| [x],
+    );
+    y
 }
 
 /// The second program of a split reduction: `c = epilogue(Σ_z partial[z])`
@@ -331,7 +416,7 @@ pub fn split_merge<T: Elem>(spec: &MergeSpec) -> Program {
 
 fn merge<T: Elem, U: Elem>(spec: &MergeSpec) -> Program {
     let MergeSpec { m, n, split, epilogue: epi, tile: [bm, bn] } = *spec;
-    assert!(!epi.gated, "a gated weight is not split");
+    assert!(!epi.gated && epi.rope.is_none(), "a gated or turned output is not split");
     let mut k = Kernel::new("split_merge");
     let partial = k.param::<F32>("partial", ParamKind::In, split * m * n);
     let bias = epi.bias.then(|| k.param::<T>("bias", ParamKind::In, n));
@@ -348,7 +433,7 @@ fn merge<T: Elem, U: Elem>(spec: &MergeSpec) -> Program {
         [k.binary(acc, part, BinaryOp::Add)]
     });
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
-    finish::<T, U>(&mut k, vec![sum], epi, bias, residual, c, &None, &tile);
+    finish::<T, U>(&mut k, vec![sum], epi, bias, residual, None, c, &None, &tile);
     k.finish()
 }
 
