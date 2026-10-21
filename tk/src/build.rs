@@ -509,6 +509,16 @@ impl Kernel {
         self.let_(shape, TileOp::Shift { src: src.0, axis, fill })
     }
 
+    /// `src` with every element exchanged across the bits of `mask` along
+    /// `axis` ([`TileOp::Flip`]).
+    pub fn flip<T: Elem>(&mut self, src: Regs<T>, axis: Axis, mask: u32) -> Regs<T> {
+        let shape = self.shape(src);
+        let len = if axis == Axis::Col { shape.cols } else { shape.rows };
+        let span = (mask as usize + 1).next_power_of_two();
+        assert!(mask > 0 && len.is_multiple_of(span), "a flip across {mask:#b} of {len}");
+        self.let_(shape, TileOp::Flip { src: src.0, axis, mask })
+    }
+
     /// Hold `v` under `layout` (see [`Program::pins`]).
     pub fn pin<T: Elem>(&mut self, v: Regs<T>, layout: crate::layouts::TileLayout) {
         assert_eq!(layout.shape(), self.shape(v), "a pin covers its tile");

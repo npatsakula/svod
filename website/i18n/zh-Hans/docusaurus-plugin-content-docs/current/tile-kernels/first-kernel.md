@@ -136,6 +136,6 @@ c.realize()?;
 | 声明 | `param`、`var`（按名称绑定的启动变量）、`grid`、`warps`、`smem` |
 | 标量 | `block(axis)`、`warp()`、`row()`（在 gather 映射内部）、`load_scalar(param, index)`、`Sc` 运算符以及 `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | 视图 | `view`、`gather`（按行映射的视图）、`at`、`narrow`、`smem_view`、`smem_view_as`、`smem_slot` |
-| Tile 操作 | `fill`、`zeros`、`splat`、`coord`、`unary`、`binary`（行向量或列向量会广播）、`scale`、`compare`（`CmpOp`）、`cast`、`cast_toward_zero`、`where_`、`mul_add`（只舍入一次）、`reduce`、`reduce_f32`、`transpose`、`mma`、`mma_oriented`、`pin` |
+| Tile 操作 | `fill`、`zeros`、`splat`、`coord`、`unary`、`binary`（行向量或列向量会广播）、`scale`、`compare`（`CmpOp`）、`cast`、`cast_toward_zero`、`where_`、`mul_add`（只舍入一次）、`reduce`、`reduce_f32`、`transpose`、`shift`（沿某轴移动一步，首位填充）、`flip`（每个元素沿某轴与掩码各位相异的元素交换：排序网络的一步）、`mma`、`mma_oriented`、`pin` |
 | 数据移动 | `stage`（全局 → 共享，`CopyMode::Async` 或 `Sync`）、`load`、`load_as_fill`、`store` |
 | 控制 | `loop_`（携带寄存器 tile）、`pipeline`、`if_`、`select_if`（产生 tile 的分支）、`where_any`（一个 `where_`，只有持有已置位谓词元素的 warp 计算其选中一侧）、`each_warp`（一条 `Warps` 语句）、`barrier` |

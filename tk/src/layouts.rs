@@ -192,20 +192,49 @@ impl TileLayout {
     /// (the fill); `None` where an element's predecessor is in another warp
     /// or the moves differ between warps.
     pub fn shift(&self, axis: Axis, warps: u32, lanes: u32) -> Option<Vec<(Vec<Pick>, u64)>> {
-        let back = |(r, c): (u32, u32)| match axis {
+        self.moves(warps, lanes, |(r, c)| match axis {
             Axis::Col => c.checked_sub(1).map(|c| (r, c)),
             Axis::Row => r.checked_sub(1).map(|r| (r, c)),
-        };
-        // The (mask, register) moves that bring lane `l` of warp `w` element `j`'s predecessor.
+        })
+    }
+
+    /// The moves of a [`TileOp::Flip`] across the bits of `mask` along
+    /// `axis`, as [`Self::shift`]'s; no lane fills.
+    pub fn flip(&self, axis: Axis, mask: u32, warps: u32, lanes: u32) -> Option<Vec<(Vec<Pick>, u64)>> {
+        self.moves(warps, lanes, |(r, c)| {
+            Some(match axis {
+                Axis::Col => (r, c ^ mask),
+                Axis::Row => (r ^ mask, c),
+            })
+        })
+    }
+
+    /// Per register, the lane-xor moves bringing each lane the element at
+    /// `from` of the one it holds, and the lanes `from` leaves without one.
+    fn moves(
+        &self,
+        warps: u32,
+        lanes: u32,
+        from: impl Fn((u32, u32)) -> Option<(u32, u32)>,
+    ) -> Option<Vec<(Vec<Pick>, u64)>> {
+        // Per warp, the (lane, register) pairs holding each element, in order.
+        type Holders = HashMap<(u32, u32), Vec<(u32, u32)>>;
+        let held: Vec<Holders> = (0..warps)
+            .map(|w| {
+                let mut at = Holders::new();
+                for from in 0..lanes {
+                    for reg in 0..self.regs() {
+                        at.entry(self.coord(w, from, reg)).or_default().push((from, reg));
+                    }
+                }
+                at
+            })
+            .collect();
+        // The (mask, register) moves that bring lane `l` of warp `w` element `j`'s source.
         let moves = |w: u32, l: u32, j: u32| -> Option<Vec<(u32, u32)>> {
-            let want = back(self.coord(w, l, j))?;
-            let found = (0..lanes).flat_map(|from| (0..self.regs()).map(move |reg| (from, reg)));
-            Some(
-                found
-                    .filter(|&(from, reg)| self.coord(w, from, reg) == want)
-                    .map(|(from, reg)| (from ^ l, reg))
-                    .collect(),
-            )
+            let want = from(self.coord(w, l, j))?;
+            let found = held[w as usize].get(&want).map_or(&[][..], Vec::as_slice);
+            Some(found.iter().map(|&(from, reg)| (from ^ l, reg)).collect())
         };
         (0..self.regs())
             .map(|j| {
@@ -1068,9 +1097,11 @@ impl<'a> Infer<'a> {
     fn let_(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
         match *op {
             TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) | TileOp::Relayout { .. } => {}
-            TileOp::Unary { src, .. } | TileOp::Cast { src, .. } | TileOp::Move { src } | TileOp::Shift { src, .. } => {
-                self.unify(dst, src)
-            }
+            TileOp::Unary { src, .. }
+            | TileOp::Cast { src, .. }
+            | TileOp::Move { src }
+            | TileOp::Shift { src, .. }
+            | TileOp::Flip { src, .. } => self.unify(dst, src),
             TileOp::Binary { a, b, .. } => self.elementwise(dst, a, b),
             TileOp::Where { pred, a, b } => {
                 self.elementwise(dst, a, b);
@@ -1168,6 +1199,7 @@ impl Rewrite<'_> {
                     | TileOp::Cast { src, .. }
                     | TileOp::Transpose { src }
                     | TileOp::Shift { src, .. }
+                    | TileOp::Flip { src, .. }
                     | TileOp::Relayout { src }
                     | TileOp::Move { src } => rewrite(self, src),
                     TileOp::Binary { a, b, .. } => {

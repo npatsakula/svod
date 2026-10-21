@@ -267,3 +267,40 @@ fn a_shift_moves_every_element_one_step(axis: Axis) {
         .collect();
     assert_eq!(got[1], want);
 }
+
+/// A flip exchanges every element with the one whose coordinate along its
+/// axis differs by the mask's bits.
+#[test_case(Axis::Col, 1; "neighbouring columns")]
+#[test_case(Axis::Col, 3; "a run of four reversed")]
+#[test_case(Axis::Col, 6; "pairs two and four apart")]
+#[test_case(Axis::Row, 1; "neighbouring rows")]
+fn a_flip_exchanges_across_its_mask(axis: Axis, mask: u32) {
+    let (rows, cols) = (4usize, 8usize);
+    let mut k = Kernel::new("flip");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let xr = k.load(xv);
+    let out = k.flip(xr, axis, mask);
+    let yv = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    k.store(yv, out);
+    let xs: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
+    let got = run(&k.finish(), vec![xs, vec![0.0; rows * cols]], &[]).unwrap();
+    let m = mask as usize;
+    let want: Vec<f64> = (0..rows * cols)
+        .map(|i| match axis {
+            Axis::Col => (i / cols * cols + ((i % cols) ^ m)) as f64,
+            Axis::Row => (((i / cols) ^ m) * cols + i % cols) as f64,
+        })
+        .collect();
+    assert_eq!(got[1], want);
+}
+
+/// A flip spans whole runs of its mask's power of two along its axis.
+#[test]
+#[should_panic(expected = "a flip across")]
+fn a_flip_spans_whole_runs() {
+    let mut k = Kernel::new("flip");
+    let v = k.fill::<F32>(Shape::new(4, 6), Const::Float(0.0));
+    k.flip(v, Axis::Col, 3);
+}

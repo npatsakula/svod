@@ -1314,9 +1314,9 @@ fn heads_need_three_dims() {
 
 /// The nearest gate: any depth (padded to the core's, rows past what a lane
 /// holds streamed), 16-bit operands of one type, rows and candidates
-/// present, no more candidates than the f32 index holds, a row's least alone
-/// or a list of up to [`REGISTER_K`](config::REGISTER_K) (no list empty);
-/// each listed config fits, holds its ring and its list's registers.
+/// present, no more candidates than the f32 index holds, a list of any
+/// length (none empty); each listed config fits, holds its ring and its
+/// list's registers.
 #[test_case(&[1000, 5], &[2000, 5], BF16, 1, Ok(()); "a shallow depth pads")]
 #[test_case(&[1 << 16, 64], &[1 << 16, 64], BF16, 1, Ok(()); "a large self-join")]
 #[test_case(&[37, 130], &[1, 130], DType::Float16, 1, Ok(()); "one candidate")]
@@ -1328,7 +1328,9 @@ fn heads_need_three_dims() {
 #[test_case(&[1 << 16, 768], &[1 << 16, 768], DType::Float16, 16, Ok(()); "a list of 16 streamed")]
 #[test_case(&[37, 130], &[5, 130], BF16, 8, Ok(()); "a list longer than the candidates")]
 #[test_case(&[1 << 16, 128], &[1 << 16, 128], BF16, 32, Ok(()); "the longest register list")]
-#[test_case(&[1 << 16, 128], &[1 << 16, 128], BF16, 33, Err(Fallback::Config); "past the register list")]
+#[test_case(&[1 << 16, 128], &[1 << 16, 128], BF16, 33, Ok(()); "past the register list")]
+#[test_case(&[1 << 16, 768], &[1 << 16, 768], DType::Float16, 1024, Ok(()); "a list of 1024 streamed")]
+#[test_case(&[1000, 64], &[1 << 20, 64], BF16, 100, Ok(()); "a long list of many candidates")]
 #[test_case(&[1000, 64], &[1000, 64], DType::Float32, 8, Err(Fallback::Dtype); "an f32 list keeps the graph")]
 #[test_case(&[1000, 64], &[1000, 64], BF16, 0, Err(Fallback::Shape); "an empty list")]
 fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, k: usize, want: Result<(), Fallback>) {
@@ -1395,6 +1397,54 @@ fn a_list_costs_its_registers_and_rounds(target: Target, per_16_rows: u32, shari
     assert!(costs.is_sorted_by(|a, b| a < b), "{costs:?}");
     let past = REGISTER_K + 1;
     assert_eq!(p(past).admit(&planner, &cfg), Err(Rejected::TopK { k: past, most: REGISTER_K }));
+}
+
+/// A list past 32 is ranked two ways besides the registers (up to
+/// [`REGISTER_K`](config::REGISTER_K)): a register queue merged into the
+/// outputs, whose lanes hold its tiles and the merge's beside them (not the
+/// list's), and a score matrix whose listing kernel holds the list (its
+/// product holds none). Both cost more the longer the list; a register list
+/// past its most is left out.
+#[test_case(sm86(); "sm_86")]
+#[test_case(gfx1201(); "gfx1201")]
+#[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40); "gfx1151")]
+fn a_long_list_is_queued_or_listed_from_a_matrix(target: Target) {
+    use crate::kernels::nearest::{Floors, Metric, NearestCfg, SelectCfg};
+    use crate::ops::config::{Nearest, REGISTER_K, Rejected};
+    let planner = planner(target.clone());
+    let p = |k| Nearest {
+        n: 1 << 15,
+        m: 1 << 15,
+        d: 64,
+        metric: Metric::SquaredL2,
+        floors: Floors::default(),
+        groups: false,
+        k,
+    };
+    let base = NearestCfg::new(32, 16, 2);
+    let queued = NearestCfg { queue: Some(32), ..base };
+    let matrix = NearestCfg { select: Some(SelectCfg { warps: 4, queue: 2 }), ..base };
+    let regs = |cfg: &NearestCfg, k| cfg.registers(&target, 64, k).unwrap();
+    for k in [64, 256, 1024] {
+        assert_eq!(regs(&queued, k), regs(&queued, 64), "a queue's registers whatever its list's length");
+        assert_eq!(regs(&matrix, k), regs(&base, 1), "a score matrix's product holds no list");
+    }
+    assert!(regs(&queued, 64) > regs(&base, REGISTER_K), "the merge's tiles beside the queue's");
+    for cfg in [queued, matrix] {
+        let costs: Vec<f64> = [64, 128, 256, 1024].map(|k| p(k).admit(&planner, &cfg).unwrap().0).to_vec();
+        assert!(costs.is_sorted_by(|a, b| a < b), "{cfg:?}: {costs:?}");
+    }
+    let past = REGISTER_K + 1;
+    assert_eq!(p(past).admit(&planner, &base), Err(Rejected::TopK { k: past, most: REGISTER_K }));
+    assert_eq!(p(16).admit(&planner, &queued), Err(Rejected::Lowers), "a queue as long as the list");
+    let ways = |k| {
+        let lattice = p(k).lattice(&target);
+        let has = |f: fn(&NearestCfg) -> bool| lattice.iter().any(f);
+        [has(|c| c.queue.is_none() && c.select.is_none()), has(|c| c.queue.is_some()), has(|c| c.select.is_some())]
+    };
+    assert_eq!(ways(32), [true, false, false], "a list of 32 in registers alone");
+    assert_eq!(ways(REGISTER_K), [true, true, true], "a list of {REGISTER_K} every way");
+    assert_eq!(ways(REGISTER_K + 1), [false, true, true], "past the registers");
 }
 
 /// Modern embeddings plan a kernel: past the depth a lane holds (`held`,

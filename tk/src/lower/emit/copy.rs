@@ -5,7 +5,7 @@ use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill};
 use svod_ir::ConstValue;
 
 use crate::layout as frag;
-use crate::layouts::Relayout;
+use crate::layouts::{Pick, Relayout};
 use crate::lower::DivergentBarrierSnafu;
 use snafu::OptionExt;
 
@@ -185,10 +185,25 @@ impl Emit<'_> {
         l.as_permutation_of(&produced, self.grid_warps(), self.low.device.target.wave)
     }
 
+    /// Registers → memory in the runs [`Self::runs`] gives, gated by the
+    /// view's bounds; a run that a column bound may end inside (one not
+    /// known to be a multiple of its width) is stored element by element,
+    /// each gated, so nothing past the bound is written.
     pub(super) fn store_regs(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let l = self.layout(src).clone();
         let d = self.view(dst);
-        for (j, w) in self.runs(&l, &d) {
+        let ragged = |w: u32| match &d.place {
+            Some(Place::Global { bounds: [_, Some(b)], .. }) => {
+                self.along(&d).0 == Axis::Col && !multiple_of(self.prog, *b, i64::from(w))
+            }
+            _ => false,
+        };
+        let runs: Vec<(u32, u32)> = self
+            .runs(&l, &d)
+            .into_iter()
+            .flat_map(|(j, w)| if w > 1 && ragged(w) { (j..j + w).map(|e| (e, 1)).collect() } else { vec![(j, w)] })
+            .collect();
+        for (j, w) in runs {
             let c = self.coord(&l, j);
             let (off, gate) = self.address(&d, &c);
             let vals = self.reg_loads(src, j, w);
@@ -264,9 +279,28 @@ impl Emit<'_> {
             Const::Int(i) => UOp::const_(dtype, ConstValue::Int(i)),
             Const::Float(f) => UOp::const_(dtype, ConstValue::Float(f)),
         };
+        self.moved(dst, src, moves, Some(fill));
+        Ok(())
+    }
+
+    /// `dst = src` exchanged across the bits of `mask` along `axis`: a
+    /// register renaming where a lane holds the partner, else the lane moves
+    /// of [`TileLayout::flip`].
+    pub(super) fn flip(&mut self, dst: ValId, src: ValId, axis: Axis, mask: u32) -> Result<()> {
+        let l = self.layout(src).clone();
+        let moves = l
+            .flip(axis, mask, self.grid_warps(), self.low.device.target.wave)
+            .context(UnsupportedSnafu { what: "a flip whose partners are in another warp" })?;
+        self.moved(dst, src, moves, None);
+        Ok(())
+    }
+
+    /// Each register of `dst` from the `moves` of `src` per lane, `fill` in
+    /// the lanes without one.
+    fn moved(&mut self, dst: ValId, src: ValId, moves: Vec<(Vec<Pick>, u64)>, fill: Option<Arc<UOp>>) {
         let mut moved: HashMap<(u32, u32), Arc<UOp>> = HashMap::new();
         for (jd, (picks, first)) in moves.into_iter().enumerate() {
-            let mut out = (first != 0).then(|| fill.clone());
+            let mut out = (first != 0).then(|| fill.clone().expect("a fill where a lane has no source"));
             for p in picks.into_iter().rev() {
                 let v = moved
                     .entry((p.mask, p.reg))
@@ -285,7 +319,6 @@ impl Emit<'_> {
             }
             self.reg_store(dst, jd as u32, vec![out.expect("a source per register")]);
         }
-        Ok(())
     }
 
     /// Whether this lane is one of `lanes`: a 32-bit word on a wave of 32,

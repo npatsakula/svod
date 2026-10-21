@@ -12,7 +12,8 @@ use super::shape::{self, extent, shape_of};
 use super::{DtypeSnafu, GraphSnafu, LaunchSnafu, NoScoresSnafu, Result, ShapeSnafu, Tuner, fmt_shape, output, typed};
 pub use crate::kernels::nearest::Metric;
 use crate::kernels::nearest::{
-    Floors, MergeSpec, NearestCfg, NearestSpec, nearest as kernel, nearest_merge, share_stride,
+    Floors, MergeSpec, NearestCfg, NearestSpec, SelectSpec, nearest as kernel, nearest_merge, nearest_select,
+    select_blocks, share_stride,
 };
 use crate::launch;
 use crate::tune::TuneStore;
@@ -114,6 +115,11 @@ pub(crate) fn picked(
     let (row_group, col_group) = opts.groups.map(|(r, c)| (r.cast(DType::Int32), c.cast(DType::Int32))).unzip();
     let spec = NearestSpec { n, m, d: depth, metric, floors, groups, k, cfg: cfgs[0] };
     let spec = pick(&planner, &cfgs, spec);
+    let rows_in = [Some(&xp), x_sq.as_ref(), row_floor.as_ref(), row_group.as_ref()];
+    let cols_in = [Some(&cp), c_sq.as_ref(), col_floor.as_ref(), col_group.as_ref()];
+    if spec.cfg.select.is_some() {
+        return matrix(&planner, x.dtype(), &spec, rows_in, cols_in);
+    }
     let splits = spec.cfg.splits;
     // Whole, a row's `k` scores; split, every share's runs of `n` rows.
     let rows: &[usize] = match (splits, k) {
@@ -150,6 +156,72 @@ pub(crate) fn picked(
     Ok((outs.pop().expect("the score"), index))
 }
 
+/// [`picked`]'s lists through a score matrix: per block of
+/// [`select_blocks`], its scores computed, then listed into its rows'
+/// lists. `rows` and `cols` are the inputs per row and per candidate in the
+/// kernel's order (`x`, then `x_sq`, the floor and the group; `c`, then
+/// `c_sq`, the floor and the group), where present.
+fn matrix(
+    planner: &Planner,
+    dtype: DType,
+    spec: &NearestSpec,
+    rows: [Option<&Tensor>; 4],
+    cols: [Option<&Tensor>; 4],
+) -> Result<(Tensor, Tensor)> {
+    let NearestSpec { n, m, k, metric, cfg, .. } = *spec;
+    let select = cfg.select.expect("a score matrix");
+    let graph_err = || GraphSnafu { op: OP };
+    let (panel, block) = select_blocks(n, m, k, &cfg);
+    // `len` of `inputs` from `start`, of `whole` each.
+    let part = |inputs: [Option<&Tensor>; 4], start: usize, len: usize, whole: usize| {
+        inputs.map(|t| {
+            t.map(|t| if len == whole { Ok(t.clone()) } else { t.narrow(0, start, len).map(|t| t.contiguous()) })
+                .transpose()
+        })
+    };
+    let lowered = |p: [svod_tensor::error::Result<Option<Tensor>>; 4]| -> Result<[Option<Tensor>; 4]> {
+        let [a, b, c, d] = p;
+        Ok([a.context(graph_err())?, b.context(graph_err())?, c.context(graph_err())?, d.context(graph_err())?])
+    };
+    let mut lists = vec![];
+    for r0 in (0..n).step_by(panel) {
+        let nr = panel.min(n - r0);
+        let r = lowered(part(rows, r0, nr, n))?;
+        let mut list: Vec<Tensor> = vec![];
+        for c0 in (0..m).step_by(block) {
+            let mc = block.min(m - c0);
+            let c = lowered(part(cols, c0, mc, m))?;
+            let a = NearestSpec { n: nr, m: mc, ..spec.clone() };
+            let scores = output(&[nr * mc], &None, DType::Float32).context(graph_err())?;
+            // The kernel's order: x, c, c_sq, x_sq, the floors, the groups.
+            let ins: Vec<&Tensor> = [&r[0], &c[0], &c[1], &r[1], &r[2], &c[2], &r[3], &c[3]]
+                .into_iter()
+                .flatten()
+                .chain([&scores])
+                .collect();
+            let lowering = a.cfg.lowering(&planner.device);
+            let scores =
+                launch::graph_launch(typed!(dtype, kernel, &a), &lowering, &ins).context(LaunchSnafu { op: OP })?;
+            let b = SelectSpec { n: nr, cols: mc, k, metric, first: c0 == 0, cfg: select };
+            let chunk = Tensor::from_slice([c0 as i32, i32::from(c0 + mc == m)]);
+            let outs = [output(&[nr, k], &None, DType::Float32), output(&[nr, k], &None, DType::Int32)]
+                .into_iter()
+                .collect::<svod_tensor::error::Result<Vec<_>>>()
+                .context(graph_err())?;
+            let ins: Vec<&Tensor> = [&scores, &chunk].into_iter().chain(&list).chain(&outs).collect();
+            let mut outs = launch::graph_launch_all(nearest_select(&b), &select.lowering(&planner.device), &ins)
+                .context(LaunchSnafu { op: OP })?;
+            list = outs.split_off(outs.len() - 2);
+        }
+        lists.push(list);
+    }
+    let cat = |j: usize| match lists.len() {
+        1 => Ok(lists[0][j].clone()),
+        _ => Tensor::cat(&lists.iter().map(|l| &l[j]).collect::<Vec<_>>(), 0).context(graph_err()),
+    };
+    Ok((cat(0)?, cat(1)?))
+}
+
 /// `spec` under the config [`nearest`] launches for its shape: the tuner's
 /// pick among `ranked` (the shape gate's list), through `store`.
 pub fn tuned(
@@ -173,6 +245,22 @@ pub fn tuned(
 /// The programs `spec` launches in order: the kernel, and split, the merge
 /// of its shares.
 pub(crate) fn programs(planner: &Planner, dtype: DType, spec: &NearestSpec) -> crate::tune::Candidate {
+    if let Some(select) = spec.cfg.select {
+        // Every block's scores, then their listing, as [`matrix`] launches them.
+        let NearestSpec { n, m, k, metric, cfg, .. } = *spec;
+        let (panel, block) = select_blocks(n, m, k, &cfg);
+        let mut programs = vec![];
+        for r0 in (0..n).step_by(panel) {
+            for c0 in (0..m).step_by(block) {
+                let (nr, mc) = (panel.min(n - r0), block.min(m - c0));
+                let a = NearestSpec { n: nr, m: mc, ..spec.clone() };
+                programs.push((typed!(dtype.clone(), kernel, &a), cfg.lowering(&planner.device)));
+                let b = SelectSpec { n: nr, cols: mc, k, metric, first: c0 == 0, cfg: select };
+                programs.push((nearest_select(&b), select.lowering(&planner.device)));
+            }
+        }
+        return programs;
+    }
     let mut programs = vec![(typed!(dtype, kernel, spec), spec.cfg.lowering(&planner.device))];
     if spec.cfg.splits > 1 {
         let merge = MergeSpec { n: spec.n, splits: spec.cfg.splits, metric: spec.metric, k: spec.k };

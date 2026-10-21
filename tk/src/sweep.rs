@@ -22,7 +22,9 @@ use crate::kernels::attention::{AttnMask, AttnSpec, Bias, Cache, Chunk, CombineS
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
-use crate::kernels::nearest::{Floors, MergeSpec, Metric, NearestCfg, NearestSpec, nearest, nearest_merge};
+use crate::kernels::nearest::{
+    Floors, MergeSpec, Metric, NearestCfg, NearestSpec, SelectCfg, SelectSpec, nearest, nearest_merge, nearest_select,
+};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::lower::{Lowering, lower};
@@ -173,9 +175,19 @@ pub fn families(target: &Target) -> Vec<Launch> {
         ("nearest 16 l2 floors groups", 32, Metric::L2, both, true, 16),
         ("nearest 8 streamed neg dot", 768, Metric::NegDot, Floors::default(), false, 8),
         ("nearest 32 streamed shifted l2 groups", 512, Metric::ShiftedL2, Floors::default(), true, 32),
+        ("nearest 64 queued squared l2", 64, Metric::SquaredL2, Floors::default(), false, 64),
+        ("nearest 100 queued l2 floors groups", 32, Metric::L2, both, true, 100),
+        ("nearest 256 queued streamed neg dot", 256, Metric::NegDot, Floors::default(), false, 256),
+        ("nearest 48 registers l2 floors", 64, Metric::L2, both, false, 48),
     ] {
         let p = Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors, groups, k };
-        let Some(&cfg) = planner.nearest_ranked(p).first() else { continue };
+        // A named way's first config, else the ranking's first.
+        let way = |c: &&NearestCfg| match name {
+            _ if name.contains("queued") => c.queue.is_some(),
+            _ if name.contains("registers") => c.queue.is_none() && c.select.is_none(),
+            _ => true,
+        };
+        let Some(&cfg) = planner.nearest_ranked(p).iter().find(way) else { continue };
         let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg };
         push(name, nearest::<BF16>(&spec), cfg.lowering(&planner.device));
     }
@@ -188,6 +200,18 @@ pub fn families(target: &Target) -> Vec<Launch> {
         push(&format!("nearest{name} split"), nearest::<BF16>(&spec), cfg.lowering(&planner.device));
         let merge = MergeSpec { n: 300, splits: 3, metric: Metric::L2, k };
         push(&format!("nearest{name} merge"), nearest_merge(&merge), merge.lowering(&planner.device));
+    }
+
+    // A score matrix, and its listing into empty lists of 100 and of 1024
+    // (carried lists hold an order the scratch inputs would not).
+    let select = SelectCfg { warps: 4, queue: 2 };
+    let cfg = NearestCfg { select: Some(select), ..NearestCfg::new(64, 32, 2) };
+    let spec = NearestSpec { n: 100, m: 150, d: 64, metric: Metric::L2, floors: both, groups: true, k: 100, cfg };
+    push("nearest matrix", nearest::<BF16>(&spec), cfg.lowering(&planner.device));
+    for (k, queue, name) in [(100, 2, "100"), (100, 4, "100 queue 4"), (1024, 8, "1024")] {
+        let select = SelectCfg { queue, ..select };
+        let b = SelectSpec { n: 100, cols: 150, k, metric: Metric::L2, first: true, cfg: select };
+        push(&format!("nearest select {name}"), nearest_select(&b), select.lowering(&planner.device));
     }
 
     let silu_bias = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };

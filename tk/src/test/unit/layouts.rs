@@ -591,3 +591,37 @@ fn a_spread_tile_holds_its_rows_vector(target: Target, orient: Orient) {
         }
     }
 }
+
+/// A flip of a spread tile across a column bit its lane holds is a renaming
+/// of registers, across one its lane group spreads a lane move a register;
+/// every element is exchanged with its partner, whatever the mask.
+#[test_case(sm86(), Orient::Direct; "sm_86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Swapped; "gfx1201 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Swapped; "gfx1151 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Direct; "gfx942")]
+fn a_spread_tile_flips_within_its_lane_group(target: Target, orient: Orient) {
+    let (warps, lanes) = (4, target.wave);
+    let grid = WarpGrid { rows: warps, cols: 1 };
+    let atom = target.geometry().unwrap().clone();
+    let vector = atom.issue(orient, grid, 64, 64, 32).unwrap().c.row_vector();
+    for cols in [2u32, 8, 16, 32] {
+        let t = TileLayout::spread_row(&vector, cols);
+        // The column bits a lane holds in its registers.
+        let (r0, c0) = t.coord(0, 0, 0);
+        let in_lane = |bit: u32| (0..t.regs()).any(|j| t.coord(0, 0, j) == (r0, c0 ^ (1 << bit)));
+        for mask in 1..cols {
+            let lane_bits = (0..cols.ilog2()).any(|b| mask >> b & 1 == 1 && !in_lane(b));
+            let moves = t.flip(Axis::Col, mask, warps, lanes).expect("a flip within the warp");
+            for (j, (picks, fill)) in moves.iter().enumerate() {
+                assert_eq!(*fill, 0, "{cols}/{mask:#b}: register {j} has a partner in every lane");
+                let crossing = picks.iter().any(|p| p.mask != 0);
+                assert_eq!(crossing, lane_bits, "{cols}/{mask:#b}: register {j}: {picks:?}");
+                for l in 0..lanes {
+                    let p = picks.iter().find(|p| p.lanes >> l & 1 == 1).expect("a source");
+                    let (r, c) = t.coord(0, l, j as u32);
+                    assert_eq!(t.coord(0, l ^ p.mask, p.reg), (r, c ^ mask), "{cols}/{mask:#b}: lane {l}");
+                }
+            }
+        }
+    }
+}

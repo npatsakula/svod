@@ -110,6 +110,7 @@ impl Emit<'_> {
             TileOp::Reduce { src, axis, f } => self.reduce(dst, src, axis, f)?,
             TileOp::Transpose { src } => self.transpose(dst, src)?,
             TileOp::Shift { src, axis, fill } => self.shift(dst, src, axis, fill)?,
+            TileOp::Flip { src, axis, mask } => self.flip(dst, src, axis, mask)?,
             TileOp::Relayout { src } => self.relayout(dst, src)?,
             TileOp::Move { src } => {
                 for j in 0..regs {

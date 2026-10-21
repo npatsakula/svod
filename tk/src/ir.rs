@@ -277,6 +277,15 @@ pub enum TileOp {
         axis: Axis,
         fill: Const,
     },
+    /// Every element exchanged with the one whose coordinate along `axis`
+    /// differs by the bits of `mask` (`out[r][c] = src[r][c ^ mask]` along
+    /// `Col`): a butterfly, a step of a sorting or merging network. The
+    /// axis is a multiple of the power of two past `mask` long.
+    Flip {
+        src: ValId,
+        axis: Axis,
+        mask: u32,
+    },
     /// The same elements held under the layout its consumer needs; inserted
     /// by the layout inference, never by an author (who pins layouts instead).
     Relayout {

@@ -436,6 +436,16 @@ impl Frame<'_> {
                     })
                     .collect()
             }
+            TileOp::Flip { src, axis, mask } => {
+                let v = self.read(*src)?;
+                let m = *mask as usize;
+                (0..rows * cols)
+                    .map(|i| match axis {
+                        Axis::Col => v[i / cols * cols + ((i % cols) ^ m)],
+                        Axis::Row => v[((i / cols) ^ m) * cols + i % cols],
+                    })
+                    .collect()
+            }
         };
         Ok(data.into_iter().map(|x| round_to(out.dtype, x)).collect())
     }
