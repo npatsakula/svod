@@ -266,6 +266,7 @@ proptest! {
 #[test_case(Norm::Rms, 1024, false, false, 4; "rms 1024")]
 #[test_case(Norm::Layer, 512, true, true, 8; "layer 512 residual, 8 rows a block")]
 #[test_case(Norm::Rms, 2048, false, false, 16; "rms 2048, 16 rows a block")]
+#[test_case(Norm::Layer, 768, false, false, 4; "layer 768 without a bias, three spans a row")]
 fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: usize) {
     let Some(target) = super::device_target() else { return };
     let (rows, eps) = (37, 1e-5);

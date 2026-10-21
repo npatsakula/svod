@@ -5,6 +5,7 @@
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Embedding, Layer, LayerNorm, Module};
+use svod_tk::ops;
 
 use crate::init::embedding;
 
@@ -24,6 +25,7 @@ impl Embeddings {
 
     /// Forward. `input_ids`: `(B, L)` int64 → `(B, L, D)`.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        Ok(self.norm.forward(&self.tok_embeddings.forward(input_ids)?)?)
+        let x = self.tok_embeddings.forward(input_ids)?;
+        Ok(ops::layer_norm(&x, &self.norm.weight, self.norm.bias.as_ref(), self.norm.eps)?)
     }
 }

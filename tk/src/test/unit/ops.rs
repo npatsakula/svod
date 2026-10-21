@@ -542,6 +542,7 @@ fn heads_under_a_batch_variable() {
 
 #[test_case(true, false, true, 1024; "layer 1024")]
 #[test_case(true, false, false, 512; "layer 512 without a bias")]
+#[test_case(true, false, false, 768; "layer 768 without a bias")]
 #[test_case(true, true, true, 256; "add layer 256")]
 #[test_case(false, false, false, 2048; "rms 2048")]
 #[test_case(false, true, false, 1024; "add rms 1024")]

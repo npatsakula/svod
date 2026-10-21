@@ -133,9 +133,11 @@ pub fn families(target: &Target) -> Vec<Launch> {
     let merge = CombineSpec { batch: spec.batch.clone(), t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: 4 } };
     push("attention combine", combine::<F16>(&merge), merge.cfg.lowering(&planner.device));
 
-    for (name, kind, d, residual, bias) in
-        [("layer norm", Norm::Layer, 1024, true, true), ("rms norm", Norm::Rms, 512, false, false)]
-    {
+    for (name, kind, d, residual, bias) in [
+        ("layer norm", Norm::Layer, 1024, true, true),
+        ("layer norm 768", Norm::Layer, 768, false, false),
+        ("rms norm", Norm::Rms, 512, false, false),
+    ] {
         let cfg = config::norm_candidates(d)[0];
         let spec = NormSpec { norm: kind, rows: 37, d, batch: Batch::Static(1), eps: 1e-5, residual, bias, cfg };
         push(name, norm::<BF16>(&spec), cfg.lowering(&planner.device));
