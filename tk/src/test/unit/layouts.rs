@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use test_case::test_case;
 
-use svod_dtype::{AmdArch, GpuArch};
+use svod_dtype::{AmdArch, GpuArch, ScalarDType};
 
 use super::{costs, declared, lane_moves_dear};
 use crate::atoms::{Core, Costs, Device, Target, sm86};
@@ -390,6 +390,25 @@ fn a_half_swap_moves_and_selects_once_per_register(lane: u32, mask: u32) {
     let masks: HashSet<u32> = p.iter().flatten().map(|p| p.mask).collect();
     assert_eq!(masks, HashSet::from([0, mask]));
     assert_eq!(exchange.work(), 2.0);
+}
+
+/// A halves swap of a GEMM accumulator stays in each lane where a warp's
+/// columns hold both halves, trades lanes where the halves share an atom's
+/// columns, and takes the round trip where different warps hold them.
+#[test_case(sm86(), [2, 2], 32 => "in lane"; "sm_86, 64 columns a warp")]
+#[test_case(sm86(), [2, 2], 4 => "across lanes"; "sm_86, halves within an atom")]
+#[test_case(sm86(), [2, 4], 32 => "via smem"; "sm_86, 32 columns a warp")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), [2, 2], 32 => "in lane"; "gfx1201, 64 columns a warp")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), [2, 4], 32 => "via smem"; "gfx1201, 32 columns a warp")]
+fn an_accumulator_swaps_halves_as_near_as_they_lie(target: Target, grid: [u32; 2], half: u32) -> &'static str {
+    let atom = target.mma(ScalarDType::BFloat16, ScalarDType::Float32).expect("a bf16 matrix core");
+    let c = atom.issue(Orient::Direct, WarpGrid { rows: grid[0], cols: grid[1] }, 128, 128, 16).unwrap().c;
+    match c.relayout_flipped(&c, half, grid[0] * grid[1], target.wave, &costs()) {
+        Relayout::Identity => "identity",
+        Relayout::RegPermute(_) => "in lane",
+        Relayout::Exchange(_) => "across lanes",
+        Relayout::ViaSmem => "via smem",
+    }
 }
 
 /// The per-element cost of each way to re-hold a tile is its work in the

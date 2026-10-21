@@ -72,13 +72,24 @@ impl Emit<'_> {
     /// gathered row and a swizzled shared row need the full coordinate.
     pub(super) fn address(&mut self, view: &View, c: &Coord) -> (Arc<UOp>, Option<Arc<UOp>>) {
         match &view.place {
-            Some(Place::Global { offset, stride, rows: Some(map), .. }) => {
+            Some(Place::Global { offset, stride, rows: Some(map), period, .. }) => {
                 let (row, col) = c.full();
+                let col = wrapped(&col, *period);
                 let ((_, offset), (_, s1)) = (self.scalar(*offset), self.scalar(stride[1]));
                 let (_, start) = self.scalar_at(map.offset, Some(&row));
                 // The view's offset moves per step; the row's start and the
                 // column are listed where their inputs are.
                 let off = add(&offset, &add(&start, &mul(&col, &s1)));
+                let gate = self.inside(view, c);
+                (self.hoist(off), gate.map(|g| self.hoist(g)))
+            }
+            // A periodic column is the full coordinate's remainder.
+            Some(Place::Global { offset, stride, period: Some(p), .. }) => {
+                let ((_, offset), (_, s0), (_, s1)) =
+                    (self.scalar(*offset), self.scalar(stride[0]), self.scalar(stride[1]));
+                let (row, col) = c.full();
+                let col = wrapped(&col, Some(*p));
+                let off = add(&offset, &add(&mul(&row, &s0), &mul(&col, &s1)));
                 let gate = self.inside(view, c);
                 (self.hoist(off), gate.map(|g| self.hoist(g)))
             }
@@ -241,7 +252,20 @@ impl Emit<'_> {
     /// the view's axis where it is contiguous, else single elements.
     pub(super) fn runs(&self, l: &TileLayout, view: &View) -> Vec<(u32, u32)> {
         let (along, contiguous) = self.along(view);
-        let width = if contiguous { 16 / view.dtype.bytes() as u32 } else { 1 };
+        let mut width = if contiguous { 16 / view.dtype.bytes() as u32 } else { 1 };
+        // An aligned run no wider than the power of two dividing a period stays within one.
+        if let Some(Place::Global { period: Some(p), .. }) = &view.place {
+            width = width.min(1 << p.trailing_zeros());
+        }
         l.runs(self.low.device.target.wave, width, along)
+    }
+}
+
+/// `col` within its period, if any.
+fn wrapped(col: &Arc<UOp>, period: Option<usize>) -> Arc<UOp> {
+    match period {
+        Some(p) if p.is_power_of_two() => and(col, &c32(p as i64 - 1)),
+        Some(p) => col.try_cmod(&c32(p as i64)).expect("periodic column"),
+        None => col.clone(),
     }
 }
