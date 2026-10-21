@@ -559,3 +559,62 @@ fn transposing_loads_land_as_their_layout() {
         assert_eq!(rows.apply(&[(Lane, lane)]), (lane % 8 + 8 * (lane / 16), 8 * (lane / 8 % 2)));
     }
 }
+
+/// A product's scores dealt over its lanes on the device: every row's dealt
+/// columns are its columns once, each dealt value the product's at its
+/// dealt column, as the interpreter's are in its own order.
+#[test_case(1; "a lane's columns each deal")]
+#[test_case(2; "two of a lane's columns each deal")]
+fn a_product_deals_its_columns_on_device(per_lane: usize) {
+    use crate::build::{F32, I32, Kernel};
+    use crate::ir::{ParamKind, Shape};
+    use crate::layouts::WarpGrid;
+    let Some(target) = super::device_target() else { return };
+    let device = declared(target);
+    let (rows, cols, depth) = (64usize, 64usize, 32usize);
+    let w = 4 * per_lane;
+    let mut k = Kernel::new("deal");
+    let x = k.param::<BF16>("x", ParamKind::In, rows * depth);
+    let c = k.param::<BF16>("c", ParamKind::In, cols * depth);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let at = k.param::<I32>("at", ParamKind::Out, rows * cols);
+    k.warps(4);
+    let xv = k.view(x, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
+    let cv = k.view(c, 0, [depth, 1], Shape::new(cols, depth), [None, None]);
+    let (xr, cr) = (k.load(xv), k.load(cv));
+    let zero = k.zeros::<F32>(Shape::new(rows, cols));
+    let s = k.mma(zero, xr, false, cr, true);
+    for j in 0..cols / w {
+        let (v, col) = (k.deal(s, w, j), k.deal_col(s, w, j));
+        let yv = k.view(y, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(yv, v);
+        let av = k.view(at, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(av, col);
+    }
+    let prog = k.finish();
+    let mut seed = 3;
+    let xs = super::rounded(ScalarDType::BFloat16, rows * depth, &mut seed, |v| v);
+    let cs = super::rounded(ScalarDType::BFloat16, cols * depth, &mut seed, |v| v);
+    let product = |r: usize, j: usize| (0..depth).map(|e| xs[r * depth + e] * cs[j * depth + e]).sum::<f64>();
+    let params = vec![xs.clone(), cs.clone(), vec![0.0; rows * cols], vec![0.0; rows * cols]];
+    let interpreted = run(&prog, params.clone(), &[]).unwrap();
+    let lowering = crate::lower::Lowering::uniform(&device, false, WarpGrid { rows: 4, cols: 1 });
+    let outs = super::targets::on_device(prog, &lowering, &params);
+    for (what, y, at) in [
+        ("interpreted", interpreted[2].clone(), interpreted[3].clone()),
+        ("device", outs[2].clone().unwrap(), outs[3].clone().unwrap()),
+    ] {
+        for r in 0..rows {
+            let mut taken: Vec<usize> = at[r * cols..(r + 1) * cols].iter().map(|&c| c as usize).collect();
+            for (i, &j) in taken.iter().enumerate() {
+                let (got, want) = (y[r * cols + i], product(r, j));
+                assert!(
+                    (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                    "{what}: row {r} slot {i} column {j}: {got} vs {want}"
+                );
+            }
+            taken.sort_unstable();
+            assert_eq!(taken, (0..cols).collect::<Vec<_>>(), "{what}: row {r} takes each column once");
+        }
+    }
+}

@@ -279,7 +279,7 @@ impl Emit<'_> {
             Const::Int(i) => UOp::const_(dtype, ConstValue::Int(i)),
             Const::Float(f) => UOp::const_(dtype, ConstValue::Float(f)),
         };
-        self.moved(dst, src, moves, Some(fill));
+        self.moved(dst, moves, Some(fill), false, |e, reg| e.reg_load(src, reg));
         Ok(())
     }
 
@@ -291,13 +291,42 @@ impl Emit<'_> {
         let moves = l
             .flip(axis, mask, self.grid_warps(), self.low.device.target.wave)
             .context(UnsupportedSnafu { what: "a flip whose partners are in another warp" })?;
-        self.moved(dst, src, moves, None);
+        self.moved(dst, moves, None, false, |e, reg| e.reg_load(src, reg));
         Ok(())
     }
 
-    /// Each register of `dst` from the `moves` of `src` per lane, `fill` in
-    /// the lanes without one.
-    fn moved(&mut self, dst: ValId, src: ValId, moves: Vec<(Vec<Pick>, u64)>, fill: Option<Arc<UOp>>) {
+    /// `dst` the `j`th of the columns each lane holds of `src`'s rows (with
+    /// `col`, their columns): a renaming where the lane holds it, else the
+    /// lane moves of [`TileLayout::deal`].
+    pub(super) fn deal(&mut self, dst: ValId, src: ValId, j: u32, col: bool) -> Result<()> {
+        let (ls, ld) = (self.layout(src).clone(), self.layout(dst).clone());
+        let moves = ls
+            .deal(&ld, j, self.grid_warps(), self.low.device.target.wave)
+            .context(UnsupportedSnafu { what: "a deal of columns another warp holds" })?;
+        match col {
+            false => self.moved(dst, moves, None, false, |e, reg| e.reg_load(src, reg)),
+            true => self.moved(dst, moves, None, true, |e, reg| {
+                let (_, c) = e.coord(&ls, reg).full();
+                e.hoist(c)
+            }),
+        }
+        Ok(())
+    }
+
+    /// Each register of `dst` from the `moves` of the source registers
+    /// `load` reads per lane, `fill` in the lanes without one. A `pure`
+    /// source (what `load` reads is listed nowhere: a lane's coordinate) is
+    /// moved by values hoisted as it is, which every branch reaching it may
+    /// share.
+    fn moved(
+        &mut self,
+        dst: ValId,
+        moves: Vec<(Vec<Pick>, u64)>,
+        fill: Option<Arc<UOp>>,
+        pure: bool,
+        load: impl Fn(&mut Self, u32) -> Arc<UOp>,
+    ) {
+        let place = |e: &mut Self, u: Arc<UOp>| if pure { e.hoist(u) } else { u };
         let mut moved: HashMap<(u32, u32), Arc<UOp>> = HashMap::new();
         for (jd, (picks, first)) in moves.into_iter().enumerate() {
             let mut out = (first != 0).then(|| fill.clone().expect("a fill where a lane has no source"));
@@ -305,15 +334,19 @@ impl Emit<'_> {
                 let v = moved
                     .entry((p.mask, p.reg))
                     .or_insert_with(|| {
-                        let x = self.reg_load(src, p.reg);
-                        if p.mask == 0 { x } else { self.shuffle_xor(&x, p.mask) }
+                        let x = load(self, p.reg);
+                        if p.mask == 0 {
+                            return x;
+                        }
+                        let moved = self.shuffle_xor(&x, p.mask);
+                        place(self, moved)
                     })
                     .clone();
                 out = Some(match out {
                     None => v,
                     Some(rest) => {
                         let mine = self.hoist(self.lane_in(p.lanes));
-                        UOp::try_where(mine, v, rest).expect("shift select")
+                        place(self, UOp::try_where(mine, v, rest).expect("shift select"))
                     }
                 });
             }

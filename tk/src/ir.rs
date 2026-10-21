@@ -286,13 +286,28 @@ pub enum TileOp {
         axis: Axis,
         mask: u32,
     },
+    /// The `j`th of the columns each lane holds of its rows: `src` is
+    /// `[rows, w·n]`, the result `[rows, w]` (`w` its columns, `j < n`), each
+    /// element one of the same row of `src`, or with `col` that element's
+    /// column (`i32`). Over `j < n` a row's results take each of its columns
+    /// once, in the order the lowering holds them: column `c` of the result
+    /// is held by the lanes holding `src`'s columns it takes, so dealing is
+    /// a renaming of registers wherever the layouts allow, else the
+    /// interpreter's order, column `c·n + j`. What a program computes from
+    /// a deal must not depend on that order but through `col`.
+    Deal {
+        src: ValId,
+        j: u32,
+        col: bool,
+    },
     /// The same elements held under the layout its consumer needs; inserted
     /// by the layout inference, never by an author (who pins layouts instead).
     Relayout {
         src: ValId,
     },
     /// A copy into a value that mutually exclusive branches each define once
-    /// (the merge of an `if`).
+    /// (the merge of an `if`), or that is defined before an `if` and again
+    /// in its branch, which replaces it ([`crate::build::Kernel::if_any`]).
     Move {
         src: ValId,
     },

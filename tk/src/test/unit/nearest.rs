@@ -14,8 +14,8 @@ use crate::build::{BF16, F16};
 use crate::interp::{round_to, run};
 use crate::ir::Orient;
 use crate::kernels::nearest::{
-    Floors, MergeSpec, Metric, NearestCfg, NearestSpec, SelectCfg, SelectSpec, nearest, nearest_merge, nearest_select,
-    share_stride,
+    Floors, LaneQueue, MergeSpec, Metric, NearestCfg, NearestSpec, SelectCfg, SelectSpec, nearest, nearest_merge,
+    nearest_select, share_stride,
 };
 use crate::ops::config::{self, Planner};
 use crate::ops::{self as tk, Nearest};
@@ -1088,6 +1088,38 @@ fn the_trips_that_lower_a_row_list_its_least(order: Order) {
     }
 }
 
+/// Every lane queue width and depth lists exactly where every candidate
+/// lowers its row's `k`-th (falling scores: every score is pushed, queues
+/// fill and passes stop many times a trip), where every candidate ties
+/// (the vote's index decides), and on random scores with groups: in
+/// registers and queued into the outputs.
+#[test_case(Order::Falling; "every candidate lower")]
+#[test_case(Order::Flat; "every candidate alike")]
+fn every_lane_queue_lists_its_least(order: Order) {
+    let falling = ordered(40, 230, 16, order);
+    let random = Case::draw(40, 230, 16, draw(Metric::SquaredL2, NONE, Some(3), true, true), 11);
+    for width in [2, 4, 8, 16] {
+        for depth in [1, 2, 4, 8] {
+            let lanes = Some(LaneQueue { width, depth });
+            let cfgs = [(NearestCfg::new(32, 16, 2), [3, 16, 64]), (NearestCfg::new(16, 64, 1), [1, 5, 33])];
+            for (cfg, ks) in cfgs.into_iter().filter(|(c, _)| c.bkv.is_multiple_of(width)) {
+                for k in ks.into_iter().filter(|&k| k > 1) {
+                    let cfg = NearestCfg { lanes, ..cfg };
+                    for case in [&falling, &random] {
+                        let (score, index) = case.listed(cfg, k);
+                        case.check_list(&format!("{cfg:?} k{k}"), k, &score, &index, 0.0, true);
+                    }
+                }
+            }
+            if 2 * width * depth <= 32 {
+                let cfg = NearestCfg { lanes, queue: Some(32), ..NearestCfg::new(32, 16, 2) };
+                let (score, index) = falling.listed(cfg, 100);
+                falling.check_list(&format!("{cfg:?} k100"), 100, &score, &index, 0.0, true);
+            }
+        }
+    }
+}
+
 /// A list's rounds run behind a vote whether its rows are resident or
 /// streamed: the trips that lower no row's last score skip them.
 #[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), "@llvm.amdgcn.ballot.i32("; "gfx1201")]
@@ -1111,9 +1143,10 @@ fn a_list_votes_before_its_rounds(target: Target, vote: &str) {
     }
 }
 
-/// A list is held as its rows' least is, its slots spread over the lanes
-/// sharing those rows ([`TileLayout::spread_row`]), so no value of the
-/// kernel is re-held, resident or streamed, on every target.
+/// A list and its lanes' queues are held as their rows' least is, their
+/// pairs' columns spread over the lanes sharing those rows
+/// ([`TileLayout::spread_row`]), so no value of the kernel is re-held,
+/// resident or streamed, on every target.
 #[test_case(crate::atoms::sm86(); "sm_86")]
 #[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64); "gfx1201")]
 #[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40); "gfx1151")]
@@ -1138,17 +1171,24 @@ fn a_list_is_held_beside_its_rows(target: Target) {
         };
         let grid = crate::layouts::WarpGrid { rows: cfg.warps(), cols: 1 };
         let laid = crate::layouts::infer(nearest::<BF16>(&spec), &device, grid, Core::Warp).unwrap();
-        let mut lists = 0;
+        let (mut lists, mut deals) = (0, 0);
         for (_, stmt) in laid.prog.walk() {
             let Stmt::Let { dst, op } = stmt else { continue };
             assert!(!matches!(op, TileOp::Relayout { .. }), "{cfg:?} k{k}: a relayout of {dst:?}");
-            if laid.prog.value(*dst).shape == crate::ir::Shape::new(cfg.bq, k) {
+            if let TileOp::Deal { src, j, .. } = *op {
+                let [s, d] = [src, *dst].map(|v| laid.layouts[v.index()].as_ref().unwrap());
+                let moves = s.deal(d, j, cfg.warps(), device.target.wave).unwrap();
+                assert!(moves.iter().all(|(picks, _)| picks.iter().all(|p| p.mask == 0)), "{cfg:?} k{k}: deal {j}");
+                deals += 1;
+            }
+            let w = cfg.lanes.unwrap_or(LaneQueue::PORTABLE).width;
+            if laid.prog.value(*dst).shape == crate::ir::Shape::new(cfg.bq, w) {
                 let l = laid.layouts[dst.index()].as_ref().unwrap();
-                assert_eq!(*l, TileLayout::spread_row(&l.row_vector(), k as u32), "{cfg:?} k{k}");
+                assert_eq!(*l, TileLayout::spread_row(&l.row_vector(), w as u32), "{cfg:?} k{k}");
                 lists += 1;
             }
         }
-        assert!(lists > 0, "{cfg:?} k{k}: a list");
+        assert!(lists > 0 && deals > 0, "{cfg:?} k{k}: a list dealt to");
     }
 }
 
@@ -1901,3 +1941,90 @@ fn nearest_precision_probe() {
 }
 
 mod live;
+
+/// Writes the LLVM IR of list kernels to `LIST_IR` (a directory), one
+/// `<k>_<cfg index>.ll` per `LIST_KS` (16) list and config of
+/// `LIST_CFGS` (`bq:bkv:stages:depth:width[:queue]`, semicolon-separated,
+/// their rings unrolled under `LIST_UNROLL`),
+/// for `LIST_TARGET` (sm_86 or gfx1201): what a register count is read
+/// from. Prints nothing else.
+#[test]
+#[ignore = "IR dump: set LIST_IR"]
+fn list_ir_dump() {
+    let Ok(dir) = std::env::var("LIST_IR") else { return };
+    let target = match std::env::var("LIST_TARGET").as_deref() {
+        Ok("gfx1201") => crate::sweep::amd(AmdArch::Gfx1201, 64),
+        _ => crate::atoms::sm86(),
+    };
+    let device = crate::sweep::declared(target);
+    let ks: Vec<usize> =
+        std::env::var("LIST_KS").unwrap_or("16".into()).split(',').map(|v| v.parse().unwrap()).collect();
+    let cfgs = std::env::var("LIST_CFGS").unwrap_or("64:64:2:2:4".into());
+    for (i, text) in cfgs.split(';').enumerate() {
+        let v: Vec<usize> = text.split(':').map(|v| v.parse().unwrap()).collect();
+        let lanes = Some(LaneQueue { width: v[4], depth: v[3] });
+        let unroll = std::env::var_os("LIST_UNROLL").is_some();
+        let cfg = NearestCfg { lanes, unroll, queue: v.get(5).copied(), ..NearestCfg::new(v[0], v[1], v[2]) };
+        for &k in &ks {
+            let spec = NearestSpec {
+                n: 1 << 14,
+                m: 1 << 14,
+                d: 128,
+                metric: Metric::SquaredL2,
+                floors: NONE,
+                groups: false,
+                k,
+                cfg,
+                live: Default::default(),
+            };
+            let ir = crate::sweep::render(nearest::<F16>(&spec), &cfg.lowering(&device));
+            std::fs::write(format!("{dir}/{k}_{i}.ll"), ir).unwrap();
+        }
+    }
+}
+
+/// Times list configs untuned on the device: `LIST_CFGS` as
+/// [`list_ir_dump`] reads them, at `LIST_KS` (16) scores a row,
+/// `LIST_ROWS` (16384) rows self-joined at `LIST_DEPTH` (128), f16
+/// squared distances; `LIST_RUNS` (3) runs each, alternating. Prints, never
+/// asserts (`--ignored --nocapture --test-threads=1`).
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn list_time_probe() {
+    let Some(planner) = super::device_planner() else { return };
+    let var = |name: &str, default: &str| std::env::var(name).unwrap_or(default.into());
+    let ks: Vec<usize> = var("LIST_KS", "16").split(',').map(|v| v.parse().unwrap()).collect();
+    let (n, d): (usize, usize) =
+        (var("LIST_ROWS", "16384").parse().unwrap(), var("LIST_DEPTH", "128").parse().unwrap());
+    let runs: usize = var("LIST_RUNS", "3").parse().unwrap();
+    let cfgs: Vec<NearestCfg> = var("LIST_CFGS", "64:32:3:2:4")
+        .split(';')
+        .map(|text| {
+            let v: Vec<usize> = text.split(':').map(|v| v.parse().unwrap()).collect();
+            let lanes = Some(LaneQueue { width: v[4], depth: v[3] });
+            let unroll = std::env::var_os("LIST_UNROLL").is_some();
+            NearestCfg { lanes, unroll, queue: v.get(5).copied(), ..NearestCfg::new(v[0], v[1], v[2]) }
+        })
+        .collect();
+    for &k in &ks {
+        let spec = |cfg| NearestSpec {
+            n,
+            m: n,
+            d,
+            metric: Metric::SquaredL2,
+            floors: NONE,
+            groups: false,
+            k,
+            cfg,
+            live: Default::default(),
+        };
+        for run in 0..runs {
+            let ns =
+                super::measure(cfgs.iter().map(|&cfg| tk::nearest::programs(&planner, DType::Float16, &spec(cfg))));
+            for (cfg, ns) in cfgs.iter().zip(ns) {
+                let rate = ns.map_or("failed".into(), |ns| format!("{:7.1} Gpairs/s", (n * n) as f64 / ns as f64));
+                eprintln!("list k{k} d{d} run {run}: {rate} {cfg:?}");
+            }
+        }
+    }
+}

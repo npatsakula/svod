@@ -304,3 +304,41 @@ fn a_flip_spans_whole_runs() {
     let v = k.fill::<F32>(Shape::new(4, 6), Const::Float(0.0));
     k.flip(v, Axis::Col, 3);
 }
+
+/// A deal takes the `j`th of each row's runs of its columns, column `c·n +
+/// j` in the interpreter, and with `col` that column's index.
+#[test_case(2; "two columns a row")]
+#[test_case(4; "four columns a row")]
+#[test_case(8; "every column")]
+fn a_deal_takes_a_column_of_each_run(w: usize) {
+    let (rows, cols) = (3usize, 8usize);
+    let n = cols / w;
+    let mut k = Kernel::new("deal");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let (y, at) = (k.param::<F32>("y", ParamKind::Out, rows * cols), k.param::<I32>("at", ParamKind::Out, rows * cols));
+    let xv = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let xr = k.load(xv);
+    for j in 0..n {
+        let (v, c) = (k.deal(xr, w, j), k.deal_col(xr, w, j));
+        let yv = k.view(y, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(yv, v);
+        let av = k.view(at, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(av, c);
+    }
+    let xs: Vec<f64> = (0..rows * cols).map(|i| (i * 7 % 11) as f64).collect();
+    let got = run(&k.finish(), vec![xs.clone(), vec![0.0; rows * cols], vec![0.0; rows * cols]], &[]).unwrap();
+    for (i, (&v, &c)) in got[1].iter().zip(&got[2]).enumerate() {
+        let (r, j, c_) = (i / cols, i % cols / w, i % w);
+        assert_eq!(c, (c_ * n + j) as f64, "element {i}");
+        assert_eq!(v, xs[r * cols + c as usize], "element {i}");
+    }
+}
+
+/// A deal's width divides its source's columns.
+#[test]
+#[should_panic(expected = "deal")]
+fn a_deal_divides_its_columns() {
+    let mut k = Kernel::new("deal");
+    let v = k.fill::<F32>(Shape::new(4, 6), Const::Float(0.0));
+    k.deal(v, 4, 0);
+}

@@ -519,6 +519,23 @@ impl Kernel {
         self.let_(shape, TileOp::Flip { src: src.0, axis, mask })
     }
 
+    /// The `j`th of the columns each lane holds of `src`'s rows, `w` a row
+    /// ([`TileOp::Deal`]): over `j < cols / w`, every column of a row once.
+    pub fn deal<T: Elem>(&mut self, src: Regs<T>, w: usize, j: usize) -> Regs<T> {
+        self.dealt(src, w, j, false)
+    }
+
+    /// The columns of `src` that [`Self::deal`] of the same `w` and `j` takes.
+    pub fn deal_col<T: Elem>(&mut self, src: Regs<T>, w: usize, j: usize) -> Regs<I32> {
+        self.dealt(src, w, j, true)
+    }
+
+    fn dealt<T: Elem, U: Elem>(&mut self, src: Regs<T>, w: usize, j: usize, col: bool) -> Regs<U> {
+        let shape = self.shape(src);
+        assert!(w > 0 && shape.cols.is_multiple_of(w) && j < shape.cols / w, "deal {j} of {shape:?} by {w}");
+        self.let_(Shape::new(shape.rows, w), TileOp::Deal { src: src.0, j: j as u32, col })
+    }
+
     /// Hold `v` under `layout` (see [`Program::pins`]).
     pub fn pin<T: Elem>(&mut self, v: Regs<T>, layout: crate::layouts::TileLayout) {
         assert_eq!(layout.shape(), self.shape(v), "a pin covers its tile");
@@ -743,6 +760,10 @@ impl Kernel {
     /// what `otherwise` leads to wherever `pred` is clear (a tile it changes
     /// there may only feed work that changes nothing there). `then` must hold
     /// no block barrier.
+    ///
+    /// The results hold `otherwise` before the branch, which `then`'s
+    /// replace: no path past it leaves them unset, so a loop around it
+    /// carries none of them from its last trip.
     pub fn if_any<T: Elem>(
         &mut self,
         pred: Regs<Bool>,
@@ -750,7 +771,26 @@ impl Kernel {
         otherwise: Vec<Regs<T>>,
     ) -> Vec<Regs<T>> {
         let any = self.scalar(Scalar::Any(pred.0));
-        self.select_if_vec(any, then, |_| otherwise)
+        let held: Vec<ValId> = otherwise
+            .iter()
+            .map(|v| {
+                let Value { dtype, shape, .. } = self.prog.value(v.0).clone();
+                let dst = self.value(dtype, shape, Place::Reg);
+                self.push(Stmt::Let { dst, op: TileOp::Move { src: v.0 } });
+                dst
+            })
+            .collect();
+        let then = self.with_block(|k| {
+            let vals = then(k);
+            assert_eq!(vals.len(), held.len(), "both branches produce as many tiles");
+            for (&dst, v) in held.iter().zip(vals) {
+                assert_eq!(k.shape(dst), k.shape(v), "both branches produce the same shapes");
+                k.push(Stmt::Let { dst, op: TileOp::Move { src: v.0 } });
+            }
+        });
+        let pred = self.intern(any);
+        self.push(Stmt::If { pred, then, otherwise: Block::default() });
+        held.into_iter().map(Tile::new).collect()
     }
 
     /// A barrier across the block's warps, and a fence of its shared memory;

@@ -625,3 +625,47 @@ fn a_spread_tile_flips_within_its_lane_group(target: Target, orient: Orient) {
         }
     }
 }
+
+/// A product's scores deal into `[rows, w]` tiles spread over the lanes
+/// sharing each of its rows: as a renaming of registers where `w` is a
+/// multiple of those lanes, else by lane moves; either way a lane's register
+/// of a deal brings it the element its table says, and over the deals every
+/// column of a row is taken once.
+#[test_case(sm86(), Orient::Direct, 4; "sm_86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Swapped, 2; "gfx1201 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Direct, 16; "gfx1201 direct")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Swapped, 2; "gfx1151 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Swapped, 4; "gfx942 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Direct, 16; "gfx942 direct")]
+fn a_product_deals_its_rows_in_lane(target: Target, orient: Orient, sharing: u32) {
+    let (warps, lanes) = (4, target.wave);
+    let grid = WarpGrid { rows: warps, cols: 1 };
+    let atom = target.geometry().unwrap().clone();
+    let scores = atom.issue(orient, grid, 64, 64, 32).unwrap().c;
+    assert_eq!(1 << scores.row_fold_masks().len(), sharing, "lanes sharing a row");
+    for w in [sharing / 2, sharing, 2 * sharing, 4 * sharing].into_iter().filter(|&w| (2..=64).contains(&w)) {
+        let dst = TileLayout::spread_row(&scores.row_vector(), w);
+        let n = 64 / w;
+        let taken = scores.dealt(&dst, warps, lanes);
+        for r in 0..64 {
+            let mut cols: Vec<u32> = (0..w).flat_map(|c| taken[&(r, c)].clone()).collect();
+            cols.sort_unstable();
+            assert_eq!(cols, (0..64).collect::<Vec<_>>(), "w {w}: row {r} takes each column once");
+        }
+        for j in 0..n {
+            let moves = scores.deal(&dst, j, warps, lanes).expect("a deal within the warp");
+            for (reg, (picks, fill)) in moves.iter().enumerate() {
+                assert_eq!(*fill, 0, "w {w} j {j}: register {reg} has a source");
+                assert_eq!(picks.iter().any(|p| p.mask != 0), w < sharing, "w {w} j {j}: register {reg}: {picks:?}");
+                for warp in 0..warps {
+                    for l in 0..lanes {
+                        let p = picks.iter().find(|p| p.lanes >> l & 1 == 1).expect("a source");
+                        let (r, c) = dst.coord(warp, l, reg as u32);
+                        let want = (r, taken[&(r, c)][j as usize]);
+                        assert_eq!(scores.coord(warp, l ^ p.mask, p.reg), want, "w {w} j {j}: lane {l}");
+                    }
+                }
+            }
+        }
+    }
+}

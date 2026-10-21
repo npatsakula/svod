@@ -436,6 +436,17 @@ impl Frame<'_> {
                     })
                     .collect()
             }
+            TileOp::Deal { src, j, col } => {
+                let s = self.prog.value(*src).shape;
+                let n = s.cols / cols;
+                let v = if *col { vec![] } else { self.read(*src)? };
+                (0..rows * cols)
+                    .map(|i| {
+                        let at = (i % cols) * n + *j as usize;
+                        if *col { at as f64 } else { v[i / cols * s.cols + at] }
+                    })
+                    .collect()
+            }
             TileOp::Flip { src, axis, mask } => {
                 let v = self.read(*src)?;
                 let m = *mask as usize;

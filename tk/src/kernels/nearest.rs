@@ -6,9 +6,10 @@
 //! through the GEMM's K pipeline once per candidate tile. The candidates may
 //! split over several blocks per query block, each leaving a partial least
 //! and index that [`nearest_merge`] folds. A row's `k` least are a list in
-//! registers, or past what they hold a register queue merged into the rest
-//! held in the outputs; or the kernel stores the scores as a matrix, block
-//! by block, whose rows [`nearest_select`] lists a warp each.
+//! registers fed by its lanes' queues, or past what they hold a register
+//! queue merged into the rest held in the outputs; or the kernel stores the
+//! scores as a matrix, block by block, whose rows [`nearest_select`] lists a
+//! warp each.
 
 use std::fmt;
 
@@ -50,6 +51,29 @@ pub struct NearestCfg {
     /// candidates), whose rows [`nearest_select`] lists under this config;
     /// `None`: the kernel lists them itself.
     pub select: Option<SelectCfg>,
+    /// How the lanes queue a row's candidates in front of its list (`k > 1`
+    /// listed by the kernel itself); `None` at `k = 1`.
+    pub lanes: Option<LaneQueue>,
+}
+
+/// A row's queues in front of its list: each lane holding a row deals out
+/// its columns of a trip's scores a register at a time and queues those
+/// below the row's `k`-th, `depth` deep, until some lane's queue is full and
+/// the warp merges every queue into its rows' lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LaneQueue {
+    /// A row's queues side by side, the columns a deal takes of a row: a
+    /// power of two, a multiple of the lanes a product spreads a row over,
+    /// so a deal renames registers.
+    pub width: usize,
+    /// The scores a queue holds, a power of two.
+    pub depth: usize,
+}
+
+impl LaneQueue {
+    /// What a list config without its own takes: as wide as the lanes
+    /// CUDA's and RDNA's swapped products spread a row over, or more.
+    pub const PORTABLE: Self = Self { width: 4, depth: 2 };
 }
 
 /// The tune store keys by this text: a resident, unsplit config prints as it
@@ -72,13 +96,27 @@ impl fmt::Debug for NearestCfg {
         if let Some(select) = self.select {
             s.field("select", &select);
         }
+        if let Some(lanes) = self.lanes {
+            s.field("lanes", &lanes);
+        }
         s.finish()
     }
 }
 
 impl NearestCfg {
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
-        Self { bq, bkv, stages, unroll: false, warp_rows: WARP_ROWS, bk: None, splits: 1, queue: None, select: None }
+        Self {
+            bq,
+            bkv,
+            stages,
+            unroll: false,
+            warp_rows: WARP_ROWS,
+            bk: None,
+            splits: 1,
+            queue: None,
+            select: None,
+            lanes: None,
+        }
     }
 
     /// Rows and candidates both streamed `bk` deep a trip.
@@ -92,6 +130,18 @@ impl NearestCfg {
 
     pub fn lowering(&self, device: &Device) -> Lowering {
         Lowering::uniform(device, self.unroll, WarpGrid { rows: self.warps(), cols: 1 })
+    }
+
+    /// The lane queues a list takes ([`LaneQueue::PORTABLE`] unless set).
+    pub fn lane_queue(&self) -> LaneQueue {
+        self.lanes.unwrap_or(LaneQueue::PORTABLE)
+    }
+
+    /// The slots of a list of `k` a row holds in registers: queued, the
+    /// queue's, else the list's in whole pairs of the lane queues' width, a
+    /// power of two.
+    pub fn list_slots(&self, k: usize) -> usize {
+        self.queue.unwrap_or(k.next_power_of_two().max(self.lane_queue().width))
     }
 
     /// Static shared memory in bytes of a 16-bit type at depth `d`: the
@@ -258,20 +308,26 @@ impl NearestSpec {
 ///
 /// With `k > 1` a row keeps its `k` least scores (`score [n, k]`, `index
 /// [n, k]`, row-major), ascending, an equal score at the smaller index, the
-/// slots past its admissible candidates `+∞` at −1: a sorted `[bq, k]` list
-/// carried in registers, its slots spread over the lanes holding the same
-/// rows ([`crate::layouts::TileLayout::spread_row`]), into which each trip
-/// offers its scores one row minimum at a time ([`TileOp::Shift`] moving the
-/// slots past it), only while some row of the warp has one below its `k`-th
-/// ([`Kernel::if_any`]). Split, share `s` leaves slot `j` of its list at
-/// `(s·k + j)·`[`share_stride`].
+/// slots past its admissible candidates `+∞` at −1: a sorted list carried
+/// in registers as `[bq, w]` pairs ([`LaneQueue`]: their columns spread
+/// over the lanes holding the same rows,
+/// [`crate::layouts::TileLayout::spread_row`]), in front of which each lane
+/// queues the scores of its own columns below its row's `k`-th. A trip some
+/// row of the warp has a score below its `k`-th in ([`Kernel::if_any`])
+/// deals its scores out `w` a row at a time ([`TileOp::Deal`], a renaming
+/// of registers), a deal some row has one below the `k`-th in pushing them
+/// onto the lanes' queues; a deal some lane's full queue would take another
+/// of stops the pass, the warp sorts every queue (a bitonic network,
+/// [`TileOp::Flip`] across the lanes) and merges them into its rows' lists,
+/// takes the new `k`-th, and deals again from there. Split, share `s` leaves
+/// slot `j` of its list at `(s·k + j)·`[`share_stride`].
 ///
 /// [Queued](NearestCfg::queue), the register list is a queue of the scores
 /// below the row's `k`-th, and the list proper is the outputs' (`+∞` at −1
-/// to start): once some row of a warp fills its queue the warp merges every
-/// row's into it, run by run of the queue's length (the lower half of a
-/// bitonic merge of the run and the carried queue stored, the upper half
-/// carried on, [`TileOp::Flip`] pairing the slots), and takes the new `k`-th.
+/// to start): once some row's could not take another lanes' queue whole the
+/// warp merges every row's into it, run by run of the queue's length (the
+/// lower half of a bitonic merge of the run and the carried queue stored,
+/// the upper half carried on), and takes the new `k`-th.
 /// Under [`NearestCfg::select`] the outputs are `scores [n, m]` alone, each
 /// pair's score in the units compared.
 ///
@@ -494,28 +550,35 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
         }
     };
 
-    // A row's queue (`[bq, held]` scores ascending and their indices)
-    // merged into the rest of its list, the outputs' `[bq, top]` in the
-    // units the scores are compared in (`last`: the metric's own, the list
-    // complete): run by run of `held` slots, each the lower half of merging
-    // it with the queue's carry, which the upper half goes on as. Returns
-    // the reset queue and the list's `top`-th score (the vote's), unless
-    // `last`.
-    let list = Shape::new(bq, held);
-    // The list's slots a row holds, its bound's even where it is live: the
-    // slots past the live ones its last run reads are masked, those it
+    // A row's list (`k > 1`): `[score, index]` pairs of `[bq, w]` tiles,
+    // its sequence's element `t·w + c` at column `c` of pair `t`, ascending,
+    // `+∞` at −1 past the candidates it holds (see [`Seq`]); in front of it
+    // a queue of `depth` pairs, column `c` of each a queue a lane holds of
+    // the scores it is dealt below the row's `k`-th, unsorted.
+    let LaneQueue { width: w, depth: slots } = cfg.lane_queue();
+    assert!(
+        top == 1 || matrix || (w.is_power_of_two() && w > 1 && slots.is_power_of_two() && bkv.is_multiple_of(w)),
+        "lane queues {:?} dealing {bkv} candidates",
+        cfg.lanes
+    );
+    let lane = Shape::new(bq, w);
+    // The slots the register list holds: the list's (its bound's where it
+    // is live) in a power of two of whole pairs; queued, the queue's.
+    let held = cfg.list_slots(top);
+    let pairs_held = held / w;
+    // The list's runs of `held` slots in the outputs (queued), and the
+    // slots a row's list holds there: its bound's even where it is live,
+    // the slots past the live ones its last run reads masked, those it
     // writes left out of an output's shape.
     let kb = bound(top, held);
-    let chunk = |k: &mut Kernel, p: ParamRef<F32>, c: Sc| {
-        let v = k.view(p, 0, [top, 1], list, [rb.clone(), kb.clone()]);
-        k.at(v, q_off.clone(), c * held)
+    let pair_view = |k: &mut Kernel, p: ParamRef<F32>, c: Sc, t: usize| {
+        let v = k.view(p, 0, [top, 1], lane, [rb.clone(), kb.clone()]);
+        k.at(v, q_off.clone(), c * held + t * w)
     };
-    let index_chunk = |k: &mut Kernel, c: Sc| {
-        let v = k.view(index_out.expect("an index output"), 0, [top, 1], list, [rb.clone(), kb.clone()]);
-        k.at(v, q_off.clone(), c * held)
+    let index_view = |k: &mut Kernel, c: Sc, t: usize| {
+        let v = k.view(index_out.expect("an index output"), 0, [top, 1], lane, [rb.clone(), kb.clone()]);
+        k.at(v, q_off.clone(), c * held + t * w)
     };
-    // The list's runs of `held` slots, the last one's index and its slots
-    // (the live list's where it varies).
     let runs = top.div_ceil(held);
     let tail = top - (runs - 1) * held;
     let (run_count, last_run, live_tail) = match &k_live {
@@ -525,160 +588,241 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
             (runs.clone(), runs.clone() - 1, Some(live.clone() - (runs - 1) * held))
         }
     };
-    // A list column of the last run's slot `tail` less `before`, as `i32`.
-    let tail_col = |k: &mut Kernel, before: usize| match &live_tail {
-        None => k.fill::<I32>(list, Const::Int((tail - before) as i64)),
-        Some(live) => k.splat::<I32>(list, live.clone() - before),
-    };
-    let flush = |k: &mut Kernel, queue: [Regs<F32>; 2], last: bool| {
-        // Run `c` (the list's slots its first `tail` where it is the last
-        // run) merged with the carry, its lower half stored and the list's
-        // `top`-th score taken from it where it is the last.
-        let unset = k.fill::<F32>(rows, Const::Float(f64::INFINITY));
-        let init = queue.into_iter().chain((!last).then_some(unset)).collect();
+    // The last run's slots, the live list's where it varies.
+    let tail_len = || live_tail.clone().unwrap_or(Sc::from(tail));
+    // The register list's `k`-th slot (the live length's where it varies).
+    let kth_slot = k_live.clone().map_or(Sc::from(top - 1), |live| live - 1);
+
+    // The queue (sorted ascending) merged into the rest of the list held
+    // in the outputs (in the units the scores are compared in; `last`: the
+    // metric's own, the list complete): run by run of `held` slots, each the
+    // lower half of merging it with the queue's carry, which the upper half
+    // goes on as. Returns the list's `k`-th score and index (the vote's),
+    // unless `last`.
+    let flush = |k: &mut Kernel, queue: Seq, last: bool| {
+        let unset = [f64::INFINITY, -1.0].map(|e| k.fill::<F32>(rows, Const::Float(e)));
+        let init = flat(&queue).chain(if last { vec![] } else { unset.to_vec() }).collect();
         let out = k.loop_vec(run_count.clone(), init, |k, c, carried| {
-            let v = chunk(k, score_out, c.clone());
-            let mut run = [k.load(v), {
-                let v = index_chunk(k, c.clone());
-                let i = k.load(v);
-                k.cast::<I32, F32>(i)
-            }];
+            let mut run: Seq = (0..pairs_held)
+                .map(|t| {
+                    let v = pair_view(k, score_out, c.clone(), t);
+                    let v = k.load(v);
+                    let i = index_view(k, c.clone(), t);
+                    let i = k.load(i);
+                    [v, k.cast::<I32, F32>(i)]
+                })
+                .collect();
             let ends = c.clone().eq(last_run.clone());
             if tail < held || live_tail.is_some() {
-                run = k.select_if(
+                let masked = k.select_if_vec(
                     ends.clone(),
                     |k| {
-                        let col = k.coord(list, Axis::Col);
-                        let width = tail_col(k, 0);
-                        let inside = k.compare(col, width, CmpOp::Lt);
-                        let empty = [Const::Float(f64::INFINITY), Const::Float(-1.0)].map(|e| k.fill::<F32>(list, e));
-                        [0, 1].map(|j| k.where_(inside, run[j], empty[j]))
+                        let col = k.coord(lane, Axis::Col);
+                        let empty = empty_seq(k, lane, 1)[0];
+                        let mut out = vec![];
+                        for (t, pair) in run.iter().enumerate() {
+                            let width = k.splat::<I32>(lane, tail_len() - t * w);
+                            let inside = k.compare(col, width, CmpOp::Lt);
+                            out.extend([0, 1].map(|j| k.where_(inside, pair[j], empty[j])));
+                        }
+                        out
                     },
-                    |_| run,
+                    |_| flat(&run).collect(),
                 );
+                run = pairs(&masked);
             }
-            let [lo, hi] = merged(k, run, [carried[0], carried[1]]);
-            let stored = if last { finished(k, lo[0], metric) } else { lo[0] };
-            let v = chunk(k, score_out, c.clone());
-            k.store(v, stored);
-            let i = k.cast::<F32, I32>(lo[1]);
-            let v = index_chunk(k, c);
-            k.store(v, i);
+            let (lo, hi) = merged(k, &run, &pairs(&carried[..2 * pairs_held]));
+            for (t, [s, i]) in lo.iter().enumerate() {
+                let stored = if last { finished(k, *s, metric) } else { *s };
+                let v = pair_view(k, score_out, c.clone(), t);
+                k.store(v, stored);
+                let i = k.cast::<F32, I32>(*i);
+                let v = index_view(k, c.clone(), t);
+                k.store(v, i);
+            }
             if last {
-                return hi.to_vec();
+                return flat(&hi).collect();
             }
-            let [kth] = k.select_if(
+            let kth = k.select_if(
                 ends,
-                |k| {
-                    let col = k.coord(list, Axis::Col);
-                    let at = tail_col(k, 1);
-                    let here = k.compare(col, at, CmpOp::Eq);
-                    let none = k.fill::<F32>(list, Const::Float(f64::NEG_INFINITY));
-                    let kth = k.where_(here, lo[0], none);
-                    [k.reduce(kth, Axis::Row, ReduceOp::Max)]
-                },
-                |_| [carried[2]],
+                |k| element(k, &lo, tail_len() - 1),
+                |_| [carried[2 * pairs_held], carried[2 * pairs_held + 1]],
             );
-            vec![hi[0], hi[1], kth]
+            flat(&hi).chain(kth).collect()
         });
-        (!last).then(|| {
-            let empty = [Const::Float(f64::INFINITY), Const::Float(-1.0)].map(|e| k.fill::<F32>(list, e));
-            vec![empty[0], empty[1], out[2]]
-        })
+        (!last).then(|| [out[2 * pairs_held], out[2 * pairs_held + 1]])
     };
 
-    // The register list's vote: its `k`-th score, its last but where the
-    // list is live.
-    let vote = |k: &mut Kernel, best: Regs<F32>| match &k_live {
-        None => k.reduce(best, Axis::Row, ReduceOp::Max),
-        Some(live) => {
-            let col = k.coord(list, Axis::Col);
-            let at = k.splat::<I32>(list, live.clone() - 1);
-            let here = k.compare(col, at, CmpOp::Eq);
-            let none = k.fill::<F32>(list, Const::Float(f64::NEG_INFINITY));
-            let kth = k.where_(here, best, none);
-            k.reduce(kth, Axis::Row, ReduceOp::Max)
+    // The carried state of a list: the register list, the lanes' queue,
+    // and the vote's `k`-th score and index (queued: the outputs' list's).
+    let state = |v: &[Regs<F32>]| {
+        let (list, rest) = v.split_at(2 * pairs_held);
+        let (queue, kth) = rest.split_at(2 * slots);
+        (pairs(list), pairs(queue), [kth[0], kth[1]])
+    };
+    let packed = |list: &Seq, queue: &Seq, kth: [Regs<F32>; 2]| -> Vec<Regs<F32>> {
+        flat(list).chain(flat(queue)).chain(kth).collect()
+    };
+    // The lanes' queue merged into the register list, the vote's `k`-th
+    // taken from it; queued, into the queue held in registers, which a
+    // warp merges into the outputs once some row's could not take another
+    // lanes' queue whole.
+    let merge = |k: &mut Kernel, carried: &[Regs<F32>]| -> Vec<Regs<F32>> {
+        let (list, queue, kth) = state(carried);
+        let list = queued_into(k, list, queue);
+        let fresh = empty_seq(k, lane, slots);
+        if cfg.queue.is_none() {
+            let kth = element(k, &list, kth_slot.clone());
+            return packed(&list, &fresh, kth);
         }
+        let room = held - (slots * w).min(held);
+        let filled = element(k, &list, Sc::from(room))[1];
+        let unset = k.fill::<F32>(rows, Const::Float(-1.0));
+        let full = k.compare(unset, filled, CmpOp::Lt);
+        let kept = packed(&list, &fresh, kth);
+        k.if_any(
+            full,
+            |k| {
+                let kth = flush(k, list.clone(), false).expect("a vote");
+                packed(&empty_seq(k, lane, pairs_held), &fresh, kth)
+            },
+            kept,
+        )
     };
-    // A trip offers at most a list's or a trip's scores.
-    let offers = match &k_live {
-        None => Sc::from(top.min(bkv)),
-        Some(live) => live.clone().min(bkv),
-    };
-    // The tile's scores offered to the row's carried list (`[bq, held]` of
-    // its least scores ascending, their indices, and its last score: the
-    // vote's, a row vector as the row minimum is), its least first,
-    // then each next least once the least before it is masked out: a trip
-    // offers at most `top`, and only while some row of the warp still has a
-    // score below one in its list. A row whose offer misses its list masks
-    // its least all the same: its scores only rise, so it misses again.
-    // Queued, the vote's score is the list's `top`-th and a row offers only
-    // below it, into a queue merged into the list once some row fills its own.
-    let fold_list = |k: &mut Kernel, dot: Regs<F32>, start: Sc, list: Vec<Regs<F32>>| {
+    // Deals a trip's scores out a pair of `[bq, w]` tiles at a time.
+    let deals = bkv / w;
+    // A trip's deals, from the first not yet taken: none past one a lane's
+    // full queue cannot take, the queues merged after it, then again from
+    // it; each pass deals at least `slots` past a merge.
+    let passes = deals.div_ceil(slots) + 1;
+    // The tile's scores offered to the row's carried list: while some row
+    // of the warp has a score below its `k`-th, each deal's below it pushed
+    // onto its lane's queue (equal scores taken too, the vote's slot's index
+    // deciding which order before it). A pass stops at a deal some lane's
+    // full queue would take another of, merges, and the next starts there.
+    let fold_list = |k: &mut Kernel, dot: Regs<F32>, start: Sc, carried: Vec<Regs<F32>>| {
         let s = scores(k, dot, start.clone());
         let low = k.reduce(s, Axis::Row, ReduceOp::Min);
-        let lower = k.compare(low, list[2], CmpOp::Lt);
+        let kth = carried[carried.len() - 2];
+        let near = k.compare(low, kth, CmpOp::Le);
+        // The trip's deals from where `from` says (a row's first deal to take,
+        // `deals` for none) up to one some lane's full queue would take
+        // another of, the state's queue pushed onto: the state with the deal
+        // a pass stopped at (else `deals`) and whether it stopped. A first
+        // pass takes the rows with a score below their `k`-th whole.
+        let (at_from, at_stop) = (2 * pairs_held + 2 * slots + 2, 2 * pairs_held + 2 * slots + 3);
+        let pass = |k: &mut Kernel, carried: &[Regs<F32>], from: Option<Regs<F32>>| -> Vec<Regs<F32>> {
+            let (list, queue, [kth, kth_i]) = state(carried);
+            let origin = k.splat::<F32>(lane, start.clone());
+            let (half, end) = (k.fill::<F32>(rows, Const::Float(0.5)), k.fill::<F32>(rows, Const::Float(deals as f64)));
+            // A deal changes the queue alone, where the pass stopped and that it did.
+            let (q_from, q_stop) = (2 * slots, 2 * slots + 1);
+            let mut q: Vec<Regs<F32>> = flat(&queue).chain([end, k.zeros::<F32>(rows)]).collect();
+            for j in 0..deals {
+                let queue = pairs(&q[..q_from]);
+                let v = k.deal(s, w, j);
+                let at = k.fill::<F32>(rows, Const::Float(j as f64));
+                let running = k.compare(q[q_stop], half, CmpOp::Lt);
+                let go = match from {
+                    Some(from) => {
+                        let due = k.compare(from, at, CmpOp::Le);
+                        k.binary(due, running, BinaryOp::And)
+                    }
+                    None if j == 0 => near,
+                    None => k.binary(near, running, BinaryOp::And),
+                };
+                let below = k.compare(v, kth, CmpOp::Le);
+                let hit = k.binary(below, go, BinaryOp::And);
+                q = k.if_any(
+                    hit,
+                    |k| {
+                        let col = k.deal_col(s, w, j);
+                        let col = k.cast::<I32, F32>(col);
+                        let index = k.binary(col, origin, BinaryOp::Add);
+                        // Below the `k`-th, or tying it at a smaller index.
+                        let lower = k.compare(v, kth, CmpOp::Lt);
+                        let earlier = k.compare(index, kth_i, CmpOp::Lt);
+                        let first = k.binary(lower, earlier, BinaryOp::Or);
+                        let ins = k.binary(first, hit, BinaryOp::And);
+                        let unset = k.fill::<F32>(lane, Const::Float(-1.0));
+                        let full = k.compare(unset, queue[slots - 1][1], CmpOp::Lt);
+                        let blocked = k.binary(ins, full, BinaryOp::And);
+                        let mut stopped = q.clone();
+                        stopped[q_from] = at;
+                        stopped[q_stop] = k.fill::<F32>(rows, Const::Float(1.0));
+                        let queue = pushed(k, &queue, ins, [v, index]);
+                        let taken = flat(&queue).chain([q[q_from], q[q_stop]]).collect();
+                        k.if_any(blocked, |_| stopped, taken)
+                    },
+                    q.clone(),
+                );
+            }
+            packed(&list, &pairs(&q[..q_from]), [kth, kth_i]).into_iter().chain([q[q_from], q[q_stop]]).collect()
+        };
+        // The queues merged once a pass stopped, then the deals again from
+        // where it did.
+        let merged_from = |k: &mut Kernel, st: Vec<Regs<F32>>| -> Vec<Regs<F32>> {
+            let half = k.fill::<F32>(rows, Const::Float(0.5));
+            let halted = k.compare(half, st[at_stop], CmpOp::Lt);
+            k.if_any(
+                halted,
+                |k| merge(k, &st[..at_from]).into_iter().chain([st[at_from], st[at_stop]]).collect(),
+                st.clone(),
+            )
+        };
         k.if_any(
-            lower,
+            near,
             |k| {
-                let col = k.coord(shape, Axis::Col);
-                let col = k.cast::<I32, F32>(col);
-                let none = inf(k);
-                let origin = k.splat::<F32>(rows, start);
-                let init = [s, low].into_iter().chain(list.iter().copied()).collect();
-                let out = k.loop_vec(offers.clone(), init, |k, _, carried| {
-                    let [s, low, best, at, last] = carried[..] else { unreachable!("five carried tiles") };
-                    let lower = k.compare(low, last, CmpOp::Lt);
-                    k.if_any(
-                        lower,
-                        |k| {
-                            let at_low = k.compare(s, low, CmpOp::Eq);
-                            let cols = k.where_(at_low, col, none);
-                            let first = k.reduce(cols, Axis::Row, ReduceOp::Min);
-                            let index = k.binary(first, origin, BinaryOp::Add);
-                            let hit = k.compare(col, first, CmpOp::Eq);
-                            let rest = k.where_(hit, none, s);
-                            let next = k.reduce(rest, Axis::Row, ReduceOp::Min);
-                            if cfg.queue.is_none() {
-                                let [best, at] = offer(k, [best, at], low, index);
-                                let last = vote(k, best);
-                                return vec![rest, next, best, at, last];
-                            }
-                            let unset = k.fill::<F32>(rows, Const::Float(f64::INFINITY));
-                            let below = k.compare(low, last, CmpOp::Lt);
-                            let low = k.where_(below, low, unset);
-                            let [best, at] = offer(k, [best, at], low, index);
-                            let most = k.reduce(best, Axis::Row, ReduceOp::Max);
-                            let full = k.compare(most, unset, CmpOp::Lt);
-                            let queue =
-                                k.if_any(full, |k| flush(k, [best, at], false).expect("a vote"), vec![best, at, last]);
-                            [rest, next].into_iter().chain(queue).collect()
-                        },
-                        carried.clone(),
-                    )
-                });
-                out[2..].to_vec()
+                let first = pass(k, &carried, None);
+                let half = k.fill::<F32>(rows, Const::Float(0.5));
+                let halted = k.compare(half, first[at_stop], CmpOp::Lt);
+                let out = k.if_any(
+                    halted,
+                    |k| {
+                        let st = merged_from(k, first.clone());
+                        k.loop_vec(passes - 1, st, |k, _, st| {
+                            let end = k.fill::<F32>(rows, Const::Float(deals as f64));
+                            let pending = k.compare(st[at_from], end, CmpOp::Lt);
+                            k.if_any(
+                                pending,
+                                |k| {
+                                    let next = pass(k, &st[..at_from], Some(st[at_from]));
+                                    merged_from(k, next)
+                                },
+                                st.clone(),
+                            )
+                        })
+                    },
+                    first.clone(),
+                );
+                out[..at_from].to_vec()
             },
-            list.clone(),
+            carried.clone(),
         )
     };
 
     let mut init = vec![];
-    if !matrix {
-        init = vec![k.fill::<F32>(list, Const::Float(f64::INFINITY)), k.fill::<F32>(list, Const::Float(-1.0))];
+    if !matrix && top == 1 {
+        init = vec![k.fill::<F32>(rows, Const::Float(f64::INFINITY)), k.fill::<F32>(rows, Const::Float(-1.0))];
     }
     if top > 1 && !matrix {
-        init.push(k.fill::<F32>(rows, Const::Float(f64::INFINITY)));
+        let list = empty_seq(&mut k, lane, pairs_held);
+        let queue = empty_seq(&mut k, lane, slots);
+        let kth = [f64::INFINITY, -1.0].map(|e| k.fill::<F32>(rows, Const::Float(e)));
+        init = packed(&list, &queue, kth);
     }
     // Queued, the block's lists start empty in the outputs, held as the
     // queue is: a lane reads back the slots it writes.
     if cfg.queue.is_some() {
-        let (score0, index0) = (init[0], k.cast::<F32, I32>(init[1]));
+        let [score0, index0] = empty_seq(&mut k, lane, 1)[0];
+        let index0 = k.cast::<F32, I32>(index0);
         k.loop_vec::<F32>(run_count.clone(), vec![], |k, c, _| {
-            let v = chunk(k, score_out, c.clone());
-            k.store(v, score0);
-            let v = index_chunk(k, c);
-            k.store(v, index0);
+            for t in 0..pairs_held {
+                let v = pair_view(k, score_out, c.clone(), t);
+                k.store(v, score0);
+                let v = index_view(k, c.clone(), t);
+                k.store(v, index0);
+            }
             vec![]
         });
     }
@@ -721,37 +865,49 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
             folded(k, dot, start, carried)
         }),
     };
-    if cfg.queue.is_some() {
-        flush(&mut k, [carried[0], carried[1]], true);
-    }
-    if matrix || cfg.queue.is_some() {
+    if matrix {
         return k.finish();
     }
-    // A share's partial results, a row's least in the units the merge
-    // compares; slot `j` of a row's list at `j` of its `top` (unsplit) or
-    // in the share's `j`th run of rows (split).
-    let [best, index] = carried[..2] else { unreachable!("a score and an index") };
-    let (best, at) = match &share {
-        Some((part, ..)) if top == 1 => (best, (part.clone() * share_stride(n), [1, 1])),
-        Some((part, ..)) => (best, (part.clone() * top * share_stride(n), [1, share_stride(n)])),
-        None => (finished(&mut k, best, metric), (Sc::from(0), [top, 1])),
-    };
-    fn slots<E: Elem>(
-        k: &mut Kernel,
-        p: ParamRef<E>,
-        (base, step): (Sc, [usize; 2]),
-        list: Shape,
-        rows: Option<Sc>,
-        q_off: Sc,
-    ) -> Gmem<E> {
-        let v = k.view(p, base, step, list, [rows, None]);
-        k.at(v, q_off, 0)
+    if top == 1 {
+        // A share's partial results, a row's least in the units the merge
+        // compares (split), else in the metric's.
+        let [best, index] = carried[..] else { unreachable!("a score and an index") };
+        let (best, at) = match &share {
+            Some((part, ..)) => (best, part.clone() * share_stride(n)),
+            None => (finished(&mut k, best, metric), Sc::from(0)),
+        };
+        let v = row_view(&mut k, score_out, (at.clone(), 1), rb.clone(), bq, q_off.clone());
+        k.store(v, best);
+        let index = k.cast::<F32, I32>(index);
+        let v = row_view(&mut k, index_out.expect("an index output"), (at, 1), rb, bq, q_off);
+        k.store(v, index);
+        return k.finish();
     }
-    let v = slots(&mut k, score_out, at.clone(), list, rb.clone(), q_off.clone());
-    k.store(v, best);
-    let index = k.cast::<F32, I32>(index);
-    let v = slots(&mut k, index_out.expect("an index output"), at, list, rb, q_off.clone());
-    k.store(v, index);
+    // What the lanes still queue merged in.
+    let (list, queue, _) = state(&carried);
+    let list = queued_into(&mut k, list, queue);
+    if cfg.queue.is_some() {
+        flush(&mut k, list, true);
+        return k.finish();
+    }
+    // A share's partial lists in the units the merge compares, slot `j` of
+    // a row's list in the share's `j`th run of rows (split); else the
+    // metric's, at `j` of its `top`.
+    let (base, step) = match &share {
+        Some((part, ..)) => (part.clone() * top * share_stride(n), [1, share_stride(n)]),
+        None => (Sc::from(0), [top, 1]),
+    };
+    for (t, [s, i]) in list.into_iter().take(top.div_ceil(w)).enumerate() {
+        let s = if share.is_some() { s } else { finished(&mut k, s, metric) };
+        let v = k.view(score_out, base.clone(), step, lane, [rb.clone(), Some(Sc::from(top))]);
+        let v = k.at(v, q_off.clone(), t * w);
+        k.store(v, s);
+        let i = k.cast::<F32, I32>(i);
+        let v =
+            k.view(index_out.expect("an index output"), base.clone(), step, lane, [rb.clone(), Some(Sc::from(top))]);
+        let v = k.at(v, q_off.clone(), t * w);
+        k.store(v, i);
+    }
     k.finish()
 }
 
@@ -1026,23 +1182,6 @@ fn insert(k: &mut Kernel, list: &[Regs<F32>], v: Regs<F32>, i: Regs<F32>) -> Vec
     scores.into_iter().chain(slots(k, indices, i)).collect()
 }
 
-/// A row's list (`[rows, k]` scores ascending and their indices) with the
-/// score `v` at index `i` (`[rows, 1]`) offered, as [`insert`] does it slot
-/// by slot: every slot below `v` keeps its score, the first above it takes
-/// `v` and the rest the one before them, the last dropped.
-fn offer(k: &mut Kernel, [best, at]: [Regs<F32>; 2], v: Regs<F32>, i: Regs<F32>) -> [Regs<F32>; 2] {
-    let below = k.compare(v, best, CmpOp::Lt);
-    let before = k.shift(best, Axis::Col, Const::Float(f64::NEG_INFINITY));
-    let moved = k.compare(v, before, CmpOp::Lt);
-    let at_before = k.shift(at, Axis::Col, Const::Float(-1.0));
-    let best = {
-        let here = k.where_(below, v, best);
-        k.where_(moved, before, here)
-    };
-    let here = k.where_(below, i, at);
-    [best, k.where_(moved, at_before, here)]
-}
-
 /// Whether each element of `a` orders before `b`'s, both `[score, index]`:
 /// a lower score, or an equal one at a smaller index.
 fn before(k: &mut Kernel, [a, ai]: [Regs<F32>; 2], [b, bi]: [Regs<F32>; 2]) -> Regs<Bool> {
@@ -1116,20 +1255,117 @@ fn network(k: &mut Kernel, seq: &mut [[Regs<F32>; 2]], sizes: impl IntoIterator<
     }
 }
 
-/// The lower and upper halves of two runs of `[score, index]` in order
-/// merged, each in order: `b` reversed, every pair across the two ordered
-/// (the lower half holding the least half), then each half's bitonic run.
-fn merged(k: &mut Kernel, a: [Regs<F32>; 2], b: [Regs<F32>; 2]) -> [[Regs<F32>; 2]; 2] {
-    let last = k.shape(b[0]).cols as u32 - 1;
-    let rev = b.map(|t| k.flip(t, Axis::Col, last));
-    let first = before(k, a, rev);
-    let lo = [0, 1].map(|j| k.where_(first, a[j], rev[j]));
-    let hi = [0, 1].map(|j| k.where_(first, rev[j], a[j]));
-    let w = k.shape(lo[0]).cols;
-    let ([mut lo], [mut hi]) = ([lo], [hi]);
-    network(k, std::slice::from_mut(&mut lo), [w]);
-    network(k, std::slice::from_mut(&mut hi), [w]);
-    [lo, hi]
+/// `[score, index]` pairs of `[rows, w]` tiles holding a sequence a row,
+/// its element `t·w + c` at column `c` of pair `t`.
+type Seq = Vec<[Regs<F32>; 2]>;
+
+/// `len` pairs of `shape` holding nothing: `+∞` at −1.
+fn empty_seq(k: &mut Kernel, shape: Shape, len: usize) -> Seq {
+    (0..len).map(|_| [f64::INFINITY, -1.0].map(|e| k.fill::<F32>(shape, Const::Float(e)))).collect()
+}
+
+/// A sequence's tiles in order.
+fn flat(seq: &[[Regs<F32>; 2]]) -> impl Iterator<Item = Regs<F32>> + '_ {
+    seq.iter().flatten().copied()
+}
+
+/// [`flat`]'s tiles as pairs again.
+fn pairs(tiles: &[Regs<F32>]) -> Seq {
+    tiles.chunks(2).map(|p| [p[0], p[1]]).collect()
+}
+
+/// The value of `sc` where it is arithmetic over constants.
+fn constant(sc: &Sc) -> Option<i64> {
+    match sc {
+        Sc::Const(v) => Some(*v),
+        Sc::Bin(op, a, b) => {
+            let (a, b) = (constant(a)?, constant(b)?);
+            match op {
+                BinOp::Add => Some(a + b),
+                BinOp::Sub => Some(a - b),
+                BinOp::Mul => Some(a * b),
+                _ => None,
+            }
+        }
+        Sc::Id(_) => None,
+    }
+}
+
+/// Element `p` of `seq`, its score and index as row vectors: a constant
+/// `p`'s column of its pair, else the column of each pair `p` may be in.
+fn element(k: &mut Kernel, seq: &[[Regs<F32>; 2]], p: Sc) -> [Regs<F32>; 2] {
+    let shape = k.shape(seq[0][0]);
+    let w = shape.cols;
+    let col = k.coord(shape, Axis::Col);
+    let none = k.fill::<F32>(shape, Const::Float(f64::NEG_INFINITY));
+    let most = |k: &mut Kernel, pair: [Regs<F32>; 2], at: Regs<I32>| {
+        let here = k.compare(col, at, CmpOp::Eq);
+        pair.map(|v| k.where_(here, v, none))
+    };
+    let held = match constant(&p) {
+        Some(p) => {
+            let at = k.fill::<I32>(shape, Const::Int(p % w as i64));
+            most(k, seq[p as usize / w], at)
+        }
+        None => {
+            let mut held: Option<[Regs<F32>; 2]> = None;
+            for (t, &pair) in seq.iter().enumerate() {
+                let at = k.splat::<I32>(shape, p.clone() - t * w);
+                let v = most(k, pair, at);
+                held = Some(held.map_or(v, |h| [0, 1].map(|j| k.binary(h[j], v[j], BinaryOp::Max))));
+            }
+            held.expect("a pair")
+        }
+    };
+    held.map(|v| k.reduce(v, Axis::Row, ReduceOp::Max))
+}
+
+/// `queue` with `v` pushed onto its front where `ins`, each pair there
+/// moving one on, the last dropped (a full queue takes none).
+fn pushed(k: &mut Kernel, queue: &[[Regs<F32>; 2]], ins: Regs<Bool>, v: [Regs<F32>; 2]) -> Seq {
+    (0..queue.len())
+        .map(|t| {
+            let from = if t == 0 { v } else { queue[t - 1] };
+            [0, 1].map(|j| k.where_(ins, from[j], queue[t][j]))
+        })
+        .collect()
+}
+
+/// `list` (ascending) with the least of `queue` (unsorted) merged in, as
+/// many as it holds: the queue sorted, its least reversed against the
+/// list's last slots and the earlier of each pair kept, then the list's
+/// bitonic order.
+fn queued_into(k: &mut Kernel, mut list: Seq, mut queue: Seq) -> Seq {
+    let w = k.shape(list[0][0]).cols;
+    let sizes = (1..=(queue.len() * w).ilog2()).map(|b| 1 << b);
+    network(k, &mut queue, sizes);
+    for (t, q) in queue.iter().take(list.len()).enumerate() {
+        let at = list.len() - 1 - t;
+        let rev = q.map(|v| k.flip(v, Axis::Col, w as u32 - 1));
+        let first = before(k, list[at], rev);
+        list[at] = [0, 1].map(|j| k.where_(first, list[at][j], rev[j]));
+    }
+    let len = list.len() * w;
+    network(k, &mut list, [len]);
+    list
+}
+
+/// The lower and upper halves of two ascending sequences of as many pairs
+/// merged, each ascending: `b` reversed, every pair across the two ordered
+/// (the lower half holding the least half), then each half's bitonic order.
+fn merged(k: &mut Kernel, a: &[[Regs<F32>; 2]], b: &[[Regs<F32>; 2]]) -> (Seq, Seq) {
+    let w = k.shape(a[0][0]).cols;
+    let (mut lo, mut hi) = (vec![], vec![]);
+    for (x, y) in a.iter().zip(b.iter().rev()) {
+        let rev = y.map(|v| k.flip(v, Axis::Col, w as u32 - 1));
+        let first = before(k, *x, rev);
+        lo.push([0, 1].map(|j| k.where_(first, x[j], rev[j])));
+        hi.push([0, 1].map(|j| k.where_(first, rev[j], x[j])));
+    }
+    let len = a.len() * w;
+    network(k, &mut lo, [len]);
+    network(k, &mut hi, [len]);
+    (lo, hi)
 }
 
 /// A row's least in the metric's own units, from the units it was compared

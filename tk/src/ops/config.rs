@@ -28,7 +28,7 @@ use crate::ir::{Axis, Orient, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::{GemmCfg, KSLICE};
-use crate::kernels::nearest::{Floors, LANES, Metric, NearestCfg, SPLIT_GROUP, SelectCfg, select_runs};
+use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, SPLIT_GROUP, SelectCfg, select_runs};
 use crate::kernels::rows::NormCfg;
 use crate::layouts::{Issue, Swizzle, TileLayout, WarpGrid, chunked};
 use crate::tune::Compiled;
@@ -1293,43 +1293,68 @@ impl NearestCfg {
     /// columns it selects fit beside the scores is the compiler's call,
     /// which the tuner's admission checks: on sm_86 32 rows by 128
     /// candidates hold 236 registers, unspilled, where the estimate says 336.
-    /// A list of `k > 1` scores is live across the pipeline, so it counts
-    /// either way.
+    /// A list of `k > 1` scores is live across the pipeline, and the
+    /// scores beside it across the deals, so a list counts it all either way
+    /// (gfx1151, 32 rows by 64 candidates streamed 32 deep, a list of 64:
+    /// estimated 252 so, 284 whole, 256 and spilled compiled).
     pub fn held(&self, target: &Target, d: usize, k: usize) -> Option<u32> {
         let [operands, scores] = self.lane_parts(target, d)?;
-        Some(operands + if self.bk.is_some() { scores } else { 2 * scores } + self.list_registers(target, d, k)?)
+        let listed = k > 1 && self.select.is_none();
+        let scores = if self.bk.is_some() && !listed { scores } else { 2 * scores };
+        Some(operands + scores + self.list_registers(target, d, k)?)
     }
 
-    /// A lane's registers of a list of `k > 1` scores and indices a row: two
-    /// `[bq, k]` tiles [spread](TileLayout::spread_row) from the products'
-    /// row minimum and its last score as that minimum is held, under the cheaper of the two ways a square core issues
-    /// them (RDNA swapped: a row a lane of 16, its 16 others holding the
-    /// row's other half; CUDA's `m16n8k16`: two rows a lane, a quad's lanes
-    /// each holding a quarter); none at `k = 1`, whose least and index the
-    /// scores' count covers. [Queued](NearestCfg::queue), the queue's tiles
-    /// and the [`FLUSH_TILES`] its merge into the outputs holds beside them.
+    /// A lane's registers of a list of `k > 1` scores and indices a row
+    /// ([`LaneQueue`]): its pairs of `[bq, w]` tiles
+    /// [spread](TileLayout::spread_row) from the products' row minimum
+    /// under the issue a row spreads over fewer lanes ([`Self::scores_layout`]),
+    /// the lanes' queue's pairs, and the row vectors the vote and the passes
+    /// carry; none at `k = 1`, whose least and index the scores' count
+    /// covers; a merge's network holds half as many tiles again beside them.
+    /// [Queued](NearestCfg::queue), the queue's pairs and the
+    /// [`FLUSH_TILES`] its merge into the outputs holds beside them. A
+    /// register-staged ring unrolled over its slots holds a list's pairs and
+    /// the staged chunks once more (gfx1151, 16 rows by 32 candidates, a list
+    /// of 64 at depth 48: 226 registers rolled, 255 and spilled unrolled).
     fn list_registers(&self, target: &Target, d: usize, k: usize) -> Option<u32> {
         if k == 1 || self.select.is_some() {
             return Some(0);
         }
-        let tiles = 2 + if self.queue.is_some() { FLUSH_TILES } else { 0 };
-        let [tile, row] = self.spread_registers(target, d, self.queue.unwrap_or(k))?;
-        Some(tiles * tile + row)
+        let LaneQueue { width, depth } = self.lane_queue();
+        let row = self.scores_layout(target, d)?.row_vector();
+        let tile = TileLayout::spread_row(&row, width as u32).regs();
+        let pairs = (self.list_slots(k) / width) as u32;
+        let flush = if self.queue.is_some() { FLUSH_TILES * pairs } else { 0 };
+        let tiles = 2 * pairs + 2 * depth as u32 + flush + pairs;
+        let unrolled = match target.fill {
+            Fill::Staged if self.unroll => 2 * pairs * tile + self.lane_parts(target, d)?[0] / 2,
+            _ => 0,
+        };
+        Some(tiles * tile + 4 * row.regs() + unrolled)
     }
 
-    /// A lane's registers of one `[bq, cols]` tile spread from the products'
-    /// row minimum and of that minimum, under the cheaper issue (see
-    /// [`Self::list_registers`]).
-    fn spread_registers(&self, target: &Target, d: usize, cols: usize) -> Option<[u32; 2]> {
+    /// The layout of the products' scores under the issue spreading a row
+    /// over fewer lanes, as the layout inference issues a product a list is
+    /// folded from (RDNA swapped: a row a lane of 16, its 16 others holding
+    /// the row's other half; CUDA's `m16n8k16`: two rows a lane, a quad's
+    /// lanes each holding a quarter).
+    fn scores_layout(&self, target: &Target, d: usize) -> Option<TileLayout> {
         let atom = target.geometry()?;
         let grid = WarpGrid { rows: self.warps(), cols: 1 };
-        let list = |o| {
-            let row = atom.issue(o, grid, self.bq, self.bkv, self.depth(d)).ok()?.c.row_vector();
-            Some([TileLayout::spread_row(&row, cols as u32).regs(), row.regs()])
-        };
-        let direct = list(Orient::Direct)?;
-        let cheaper = |s: [u32; 2]| if 2 * s[0] + s[1] < 2 * direct[0] + direct[1] { s } else { direct };
-        Some(if atom.swappable() { list(Orient::Swapped).map_or(direct, cheaper) } else { direct })
+        let scores = |o| Some(atom.issue(o, grid, self.bq, self.bkv, self.depth(d)).ok()?.c);
+        let direct = scores(Orient::Direct)?;
+        let sharing = |c: &TileLayout| c.row_fold_masks().len();
+        Some(match atom.swappable().then(|| scores(Orient::Swapped)).flatten() {
+            Some(swapped) if sharing(&swapped) < sharing(&direct) => swapped,
+            _ => direct,
+        })
+    }
+
+    /// The lanes the products spread a row of the scores over
+    /// ([`Self::scores_layout`]): the narrowest lane queues a deal renames
+    /// registers into.
+    pub fn sharing(&self, target: &Target, d: usize) -> Option<usize> {
+        Some(1 << self.scores_layout(target, d)?.row_fold_masks().len())
     }
 
     /// A lane's operand registers (the fragments and the staged chunks) and
@@ -1360,14 +1385,31 @@ const NEAREST_PAIR: f64 = 1.0;
 const PAIR_OP: f64 = 0.2;
 /// Model: what groups add to a pair: a compare and a select.
 const GROUPS_PAIR: f64 = 2.0 * PAIR_OP;
-/// Model: a list round's work a pair ([`crate::kernels::nearest::nearest`]
-/// with `k > 1`), in units of [`Costs::score`]: the compare and select
-/// finding its least's column, that column's mask and the next row
-/// minimum, the K=1 argmin's work.
-const ROUND_PAIR: f64 = NEAREST_PAIR;
-/// Model: a round's offer into a row's list, a slot a lane holds: two
-/// compares and four selects, in units of [`Costs::score`] a pair.
-const OFFER_SLOT: f64 = 6.0 * PAIR_OP;
+/// Model: a deal's vote an element ([`crate::kernels::nearest::nearest`]
+/// with `k > 1`), in units of [`Costs::score`]: its compare against the
+/// row's `k`-th and the pass's test. Fitted with [`DEAL_LANE`],
+/// [`HIT_ELEM`], [`PUSH_ELEM`] and [`LIST_SLOT`] to 18 list configs on
+/// sm_86 (16384² f16 at depth 128, `k` 16–64, queues 2–8 deep, 16 and 32
+/// candidates a trip) against the pushes and merges a simulation of the
+/// kernel counts: votes, pushes and merges each cost about as much there.
+const DEAL_ELEM: f64 = 2.0 * PAIR_OP;
+/// Model: a vote a lane, the lane's or of its elements and the branch.
+const DEAL_LANE: f64 = 2.0 * PAIR_OP;
+/// Model: a pushed deal's work an element but for its queue: its index and
+/// order against the `k`-th, the full queue's test.
+const HIT_ELEM: f64 = 1.3 * PAIR_OP;
+/// Model: a push's work an element a queue slot: its selects.
+const PUSH_ELEM: f64 = 1.3 * PAIR_OP;
+/// Model: a merge's work a row's slot a stage, its lanes sharing it.
+const LIST_SLOT: f64 = PAIR_OP;
+/// Search bound: the scores a lane queues of a row before the warp merges
+/// the queues into the lists.
+const LANE_DEPTHS: [usize; 2] = [2, 4];
+/// Search bound: the deals a trip's scores are dealt in: each is a branch
+/// of the trip's code, twice over (the first pass and the later ones); 64
+/// of them (gfx1151, 128 candidates in pairs of lanes) built a program
+/// past the graph rewrite's depth.
+const MOST_DEALS: usize = 16;
 /// Search bound: the most scores a row's register list keeps; a longer list
 /// is held in the outputs, a register queue merged into it
 /// ([`NearestCfg::queue`]), or listed from a score matrix
@@ -1379,9 +1421,8 @@ pub const REGISTER_K: usize = 64;
 const LONG_FROM: usize = 33;
 /// Search bound: the queues of a list held in the outputs.
 const QUEUES: [usize; 2] = [16, 32];
-/// Model: the tiles of a queue's length a merge into the outputs holds
-/// beside the queue: a run of the list and the carry, each scores and
-/// indices.
+/// Model: the tiles a merge into the outputs holds a pair of the queue
+/// beside it: a run of the list and the carry, each scores and indices.
 const FLUSH_TILES: u32 = 4;
 /// Model: a merge step's work a slot, in units of [`Costs::score`]: the
 /// partner's score and index, the order (three compares, two logic
@@ -1473,15 +1514,12 @@ impl Nearest {
     /// unhidden ([`Costs::latency`]). Its step is at least two matrix-core
     /// depths where the depth allows one, as the GEMM's.
     ///
-    /// A list of `k > 1` scores a row adds its rounds: each a pair's
-    /// [`ROUND_PAIR`] and a row's [`OFFER_SLOT`] a slot, as many a trip as
-    /// [`Self::rounds`] expects; past [`REGISTER_K`] a register list is left
-    /// out. Queued, the merges into the outputs as well: one each time the
-    /// warp's queues fill a [`QUEUE_FILLED`] share on average (offering
-    /// [`Self::offers`]), and one at the end, each walking the list's runs
-    /// through `1 + 2·log2(queue)` stages a [`MERGE_SLOT`] a slot. Through a
-    /// score matrix, a pair costs [`MATRIX_PAIR`] and its store, and the
-    /// listing kernel's [`Self::select_cost`] is added.
+    /// A list of `k > 1` scores a row adds its deals, pushes and merges
+    /// ([`Self::listing`]), its lane queues at least as wide as the lanes a
+    /// row spreads over ([`NearestCfg::sharing`]) and, queued, at most half
+    /// the register queue; past [`REGISTER_K`] a register list is left out.
+    /// Through a score matrix, a pair costs [`MATRIX_PAIR`] and its store,
+    /// and the listing kernel's [`Self::select_cost`] is added.
     pub fn admit(&self, planner: &Planner, cfg: &NearestCfg) -> Result<(f64, u32), Rejected> {
         let Device { target, costs } = &planner.device;
         let (bq, bkv, d, k) = (cfg.bq, cfg.bkv, self.d, self.k);
@@ -1542,21 +1580,20 @@ impl Nearest {
         let reads = (read * depth * ELEM) as f64 * costs.smem_byte;
         let mut epilogue = (bq * bkv) as f64 * pair * costs.score / chunks as f64;
         if k > 1 && cfg.select.is_none() {
-            // The list's slots its lanes hold, each one a lane offers to:
-            // a row's `k` once a row, more where lanes share them.
-            let lanes = target.wave * waves as u32;
-            let [tile, row] = cfg.spread_registers(target, d, cfg.queue.unwrap_or(k)).ok_or(Rejected::Layout)?;
-            let held = (2 * tile + row) / 2 * lanes;
-            let round = ((bq * bkv) as f64 * ROUND_PAIR + f64::from(held) * OFFER_SLOT) * costs.score;
-            epilogue += self.rounds(cfg) * round / chunks as f64;
-            if let Some(q) = cfg.queue {
-                // Each merge walks the list's runs, every slot through the
-                // halves' stages, once a queue fills and once at the end.
-                let stages = 1.0 + 2.0 * (q as f64).log2();
-                let merge = (k.div_ceil(q) * q * bq) as f64 * stages * MERGE_SLOT * costs.score;
-                let merges = self.offers() / (q as f64 * QUEUE_FILLED) + 1.0;
-                epilogue += merges * merge / (tiles * chunks) as f64;
+            let lanes = cfg.lane_queue();
+            let sharing = cfg.sharing(target, d).ok_or(Rejected::Layout)?;
+            let queued = lanes.width * lanes.depth;
+            let deals = bkv / lanes.width;
+            if lanes.width < sharing.max(2)
+                || !lanes.width.is_power_of_two()
+                || !lanes.depth.is_power_of_two()
+                || !bkv.is_multiple_of(lanes.width)
+                || deals > MOST_DEALS
+                || cfg.queue.is_some_and(|q| 2 * queued > q)
+            {
+                return Err(Rejected::Lowers);
             }
+            epilogue += self.listing(cfg, lanes, target.wave) * waves as f64 * costs.score / (tiles * chunks) as f64;
         }
         let work = steps as f64 * costs.step + epilogue;
         let trip = costs.trip(target.fill, stages, cfg.unroll);
@@ -1594,22 +1631,54 @@ impl Nearest {
         self.n as f64 * (row * costs.score).max(bytes) / planner.sms() as f64
     }
 
-    /// The rounds a warp of `cfg` runs a trip on average over a block's
-    /// candidate tiles, as a stream in random order offers them: trip `t`
-    /// lowers a row's `k`-th score `λ = k·ln((t+1)/t)` times (every one of
-    /// its scores while the list fills), and its warp runs about the most of
-    /// its rows' counts, `λ` plus the chance one of `warp_rows` rows has one.
-    fn rounds(&self, cfg: &NearestCfg) -> f64 {
-        let (k, tiles) = (self.k as f64, self.m.div_ceil(cfg.bkv));
-        let rows = cfg.warp_rows as f64;
-        let trip = |t: usize| {
-            let lam = match t * cfg.bkv < self.k {
-                true => cfg.bkv.min(self.k) as f64,
-                false => k * ((t + 1) as f64 / t as f64).ln(),
-            };
-            (lam + 1.0 - (-rows * lam).exp()).min(k)
+    /// The scores of trip `t` of `cfg` below a row's `k`-th as a stream in
+    /// random order offers them: `λ = k·ln((t+1)/t)` (every one of them
+    /// while the list fills).
+    fn lowered(&self, cfg: &NearestCfg, t: usize) -> f64 {
+        match t * cfg.bkv < self.k {
+            true => cfg.bkv.min(self.k) as f64,
+            false => self.k as f64 * ((t + 1) as f64 / t as f64).ln(),
+        }
+    }
+
+    /// A warp's list work over a block's candidates under `lanes`, in units
+    /// of [`Costs::score`] a pair: each trip some row of the warp has a
+    /// score below its `k`-th in (`warp_rows` rows' [`Self::lowered`])
+    /// votes on every deal ([`DEAL_ELEM`] an element, [`DEAL_LANE`] a
+    /// lane), and each deal some row is dealt one below it in pushes it
+    /// ([`HIT_ELEM`], [`PUSH_ELEM`] a queue slot, a vote); then the merges,
+    /// one each time some queue of the warp takes a score past its depth
+    /// (`N` pushes into `Q` queues fill one past `t` from about
+    /// `N = (Q^t·(t+1)!)^(1/(t+1))`) and one at the end: the queues'
+    /// bitonic sort and the merge into the list held in registers,
+    /// [`LIST_SLOT`] a row's slot a stage. Queued, the merges of that list
+    /// into the outputs too, one each time the warp's lists take a
+    /// [`QUEUE_FILLED`] share of the room they leave the lanes' queues.
+    fn listing(&self, cfg: &NearestCfg, lanes: LaneQueue, wave: u32) -> f64 {
+        let LaneQueue { width, depth } = lanes;
+        let (rows, tiles, wave) = (cfg.warp_rows as f64, self.m.div_ceil(cfg.bkv), f64::from(wave));
+        let deals = (cfg.bkv / width) as f64;
+        let (elems, t) = (rows * width as f64, depth as f64);
+        let trip = |i: usize| {
+            let hits = rows * self.lowered(cfg, i);
+            let entered = 1.0 - (-hits).exp();
+            let dealt = deals * (1.0 - (-hits / deals).exp());
+            entered * deals * (elems * DEAL_ELEM + wave * DEAL_LANE)
+                + dealt * (elems * (HIT_ELEM + t * PUSH_ELEM) + wave * DEAL_LANE)
         };
-        (0..tiles).map(trip).sum::<f64>() / tiles as f64
+        let walk: f64 = (0..tiles).map(trip).sum();
+        let fact: f64 = (1..=depth + 1).map(|i| i as f64).product();
+        let per_merge = (elems.powf(t) * fact).powf(1.0 / (t + 1.0));
+        let (held, queued) = (cfg.list_slots(self.k) as f64, (width * depth) as f64);
+        let sort = queued * queued.log2() * (queued.log2() + 1.0) / 2.0;
+        let merge = rows * (sort + held * (held.log2() + 1.0)) * LIST_SLOT;
+        let mut list = walk + (rows * self.offers() / per_merge + 1.0) * merge;
+        if let Some(q) = cfg.queue {
+            let stages = 1.0 + 2.0 * (q as f64).log2();
+            let flush = (self.k.div_ceil(q) * q) as f64 * rows * stages * MERGE_SLOT;
+            list += (self.offers() / ((held - queued) * QUEUE_FILLED) + 1.0) * flush;
+        }
+        list
     }
 
     /// The scores a row offers its list over the candidates in random order:
@@ -1646,7 +1715,20 @@ impl Nearest {
                             for unroll in [false, true] {
                                 for &(queue, select) in &lists {
                                     let cfg = NearestCfg::new(bq, bkv, stages);
-                                    out.push(NearestCfg { unroll, warp_rows, bk, queue, select, ..cfg });
+                                    let cfg = NearestCfg { unroll, warp_rows, bk, queue, select, ..cfg };
+                                    if self.k == 1 || select.is_some() {
+                                        out.push(cfg);
+                                        continue;
+                                    }
+                                    // Lane queues as wide as the lanes a row spreads over or
+                                    // twice, dealing a trip's scores in at most `MOST_DEALS`.
+                                    let Some(sharing) = cfg.sharing(target, self.d) else { continue };
+                                    let narrowest = sharing.max(bkv / MOST_DEALS).max(2);
+                                    for width in [narrowest, 2 * narrowest].into_iter().filter(|&w| w <= bkv) {
+                                        for depth in LANE_DEPTHS {
+                                            out.push(NearestCfg { lanes: Some(LaneQueue { width, depth }), ..cfg });
+                                        }
+                                    }
                                 }
                             }
                         }
