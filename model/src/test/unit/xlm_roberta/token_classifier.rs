@@ -66,11 +66,14 @@ fn load_sat_fixture(golden: &str, dtype: DType) -> (XlmRobertaTokenClassifier, V
     (classifier, encodings, golden)
 }
 
-/// Every chunk's logits, flat in the golden's `(B, L, labels)` layout.
-fn classify(classifier: &mut XlmRobertaTokenClassifier, encodings: &[Encoding]) -> Vec<f32> {
+/// Every chunk's logits, flat in the golden's `(B, L, labels)` layout, and
+/// whether the plan launched tk's flash attention.
+fn classify(classifier: &mut XlmRobertaTokenClassifier, encodings: &[Encoding]) -> (Vec<f32>, bool) {
     let refs: Vec<&Encoding> = encodings.iter().collect();
-    let (out, _) = classifier.run_batch(&refs, false).expect("classify tokens");
-    out.into_iter().flat_map(|c| c.logits).collect()
+    let (out, profile) = classifier.run_batch(&refs, true).expect("classify tokens");
+    let kernels = profile.expect("profiled run").stages.into_iter().flat_map(|stage| stage.kernels);
+    let flash = kernels.into_iter().any(|k| k.kernel.entry_point.starts_with("flash_attention"));
+    (out.into_iter().flat_map(|c| c.logits).collect(), flash)
 }
 
 /// f32 logits at the real tokens against `XLMRobertaForTokenClassification`:
@@ -82,15 +85,16 @@ fn classify(classifier: &mut XlmRobertaTokenClassifier, encodings: &[Encoding]) 
 fn sat_logits_match_pytorch(golden: &str) {
     let (mut classifier, encodings, golden) = load_sat_fixture(golden, DType::Float32);
     let (mask, labels) = (load_golden_vec::<i64>(&golden, "attention_mask"), classifier.num_labels());
-    let got = real_rows(&classify(&mut classifier, &encodings), &mask, labels);
+    let got = real_rows(&classify(&mut classifier, &encodings).0, &mask, labels);
     let want = real_rows(&load_golden_vec(&golden, "expected_logits"), &mask, labels);
     let delta = max_abs_delta(&got, &want);
     eprintln!("real-token logits max |delta| = {delta:.3e}");
     assert!(delta < 1e-3, "token logits drifted from PyTorch golden: max |delta| = {delta}");
 }
 
-/// The classifier in bf16 against the f32 golden, bounded by PyTorch's own
-/// bf16 drift.
+/// The classifier in bf16 — where its attention runs on tk's flash attention
+/// wherever tk has it, which the f32 tests never reach — bounded by PyTorch's
+/// own bf16 drift.
 #[test_case::test_case("golden_sat.safetensors"; "short")]
 #[test_case::test_case("golden_sat_512.safetensors"; "full position table")]
 #[ignore = "heavy: real sat-3l-sm weights (HF Hub) + PyTorch golden, on a bf16 device"]
@@ -102,6 +106,10 @@ fn sat_bf16_tracks_pytorch_bf16(golden: &str) {
     }
     let (mut classifier, encodings, golden) = load_sat_fixture(golden, dtype);
     let mask = load_golden_vec::<i64>(&golden, "attention_mask");
-    let got = classify(&mut classifier, &encodings);
+    let (got, flash) = classify(&mut classifier, &encodings);
+    let device = svod_dtype::default_device::default_device();
+    let tk = svod_tk::ops::supported(&device);
+    eprintln!("sat on {device:?}: flash attention {flash}");
+    assert_eq!(flash, tk, "flash attention ran: {flash}, tk has it on {device:?}: {tk}");
     assert_tracks_pytorch_bf16("sat", got, &golden, "expected_logits", Some((&mask, classifier.num_labels())));
 }
