@@ -94,7 +94,9 @@ attention configs both offer this core on sm_90.
    partners) or `ViaSmem`. An `Exchange` is kept only while its work costs less than a round
    trip through shared memory (`Relayout::work × Costs::lane_move < Costs::smem_trip`). The
    emitter lowers an `Exchange` with the target's `atoms::LaneMove` (`shfl.sync` on CUDA, DPP
-   and `permlanex16` on RDNA, `ds_bpermute` on CDNA).
+   and `permlanex16` on RDNA, `ds_bpermute` on CDNA). A `swap_halves` keeps its operand's
+   layout and moves by the same classes: it is a relayout whose destination column is the
+   source's xor `half` (`TileLayout::relayout_flipped`).
 
 ## Schedule templates
 

@@ -12,6 +12,7 @@ itself. A model never checks whether a kernel applies and never pads to a tile.
 pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor>;
 pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor>;
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tensor>;
+pub fn attention_packed(qkv: &Tensor, heads: usize, kv_heads: usize, opts: Attn) -> Result<Tensor>;
 pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)>;
 pub fn layer_norm(x: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64) -> Result<Tensor>;
 pub fn add_layer_norm(x: &Tensor, residual: &Tensor, w: &Tensor, b: Option<&Tensor>, eps: f64)
@@ -24,13 +25,22 @@ pub fn supported(device: &DeviceSpec) -> bool;
 | Op | Shapes | Options |
 |---|---|---|
 | `attention` | `q [B, T, H, D]`, `k`/`v [B, Tk, H_kv, D]` → `[B, T, H, D]` | `Attn { causal, keys, window, chunk, seg_start, cache, splits, scale, bias }` |
-| `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale }`; gated `w` is `[2N, K]` |
+| `attention_packed` | `qkv [B, T, (H + 2·H_kv)·D]` → `[B, T, H, D]` | `Attn` without a cache; `heads`, `kv_heads` |
+| `linear` | `x [lead..., K]`, `w [N, K]` → `[lead..., N]` | `Linear { bias, act, gated, residual, scale, rope }`; gated `w` is `[2N, K]` |
 | `conv2d` | `x [B, H, W, Cin]`, `w [Cout, kh, kw, Cin / groups]` → `[B, Ho, Wo, Cout]` | `Conv { stride, pad, dilation, groups, bias, act, residual, scale, out_dtype }`; a 1×1 is `linear` |
 | `heads` | `qkv [B, T, (H + 2·H_kv)·D]` → `q`, `k`, `v` | `Qkv { heads, kv_heads, head_dim, q_norm, k_norm, eps, rope }` |
 | `layer_norm`, `rms_norm` | `x [..., D]`, `w`/`b [D]` | `add_*` take `residual` like `x` and return `(x + residual, norm)` |
 
 `Linear::scale` multiplies the activated value before the residual add:
 `scale·act(x·wᵀ + bias) + residual`, so a Conformer half-step `x + 0.5·ffn(x)` is one GEMM.
+
+`Linear::rope` is `Rotary { cos, sin, heads, head_dim }`: the output's first `heads` heads of
+`head_dim` columns are rotated after the bias by `(cos, sin)` tables of `[1, T, 1, head_dim/2]`,
+the head's two halves paired as `apply_rotary_emb` pairs them, for `x [B, T, K]`. Beside an
+activation, a residual or a scale the whole linear runs on the graph. Otherwise the GEMM rotates
+them in its store when the tables share `x`'s dtype and a tile holds whole heads per warp, and if
+not, a plain GEMM runs and the graph rotates its output. `attention_packed` then reads such
+a projection's queries, keys and values in place, where `heads` would copy them out.
 
 `Attn::keys` is `KeyMask::None`, `KeyMask::Lens(&lens)` (`[B]` valid key counts) or
 `KeyMask::Bool(&mask)` (`[B, Tk]`, true where attended). `Attn::cache` takes
@@ -55,7 +65,7 @@ holds the ranked configs; the [tuner](./tuning) measures the first that compile 
 | `Target` | The tensor is not on the default device, the device has no tk kernels (`config::has_kernels`: CUDA below sm_80, Metal, the CPU), or its target reports no SM count |
 | `Dtype` | Any operand is f32, or the operands do not all share one 16-bit type with a matrix core. `conv2d`: an output type other than the input's or f32, or a residual not in it |
 | `Symbolic` | A dim other than a bound leading one is symbolic (for `linear`, also a symbolic `N`) |
-| `Shape` | `linear`: `N` not a multiple of 8 or no rows. `conv2d`: `groups > 1`, `Cin` not a multiple of 16, `Cout` not a multiple of 8, or an empty output. `attention`: no config fits `D` (on sm_86, 32, 48, 64, 128 and 256 plan and 40 does not) or an empty dim. `heads`: `D` not a power of two in 16..=256. Norms: `D` not a power of two in 256..=2048 |
+| `Shape` | `linear`: `N` not a multiple of 8 or no rows. `conv2d`: `groups > 1`, `Cin` not a multiple of 16, `Cout` not a multiple of 8, or an empty output. `attention`: no config fits `D` (on sm_86, 32, 48, 64, 128 and 256 plan and 40 does not) or an empty dim. `heads`: `D` not a power of two in 16..=256. Norms: `D` not a multiple of 256 in 256..=2048 |
 | `Config` | No tile config fits. For `linear`, `K` is not a multiple of 16 |
 
 `attention` also takes the graph when appended rows are wider than every config's key block.
