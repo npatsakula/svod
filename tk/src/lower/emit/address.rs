@@ -239,9 +239,18 @@ impl Emit<'_> {
 
     /// The register runs of `l` a view is accessed by: 16-byte vectors along
     /// the view's axis where it is contiguous, else single elements.
+    /// A row-major global view whose rows are a constant stride apart that
+    /// is no multiple of the vector's elements is accessed element by
+    /// element: its rows start off the vector alignment.
     pub(super) fn runs(&self, l: &TileLayout, view: &View) -> Vec<(u32, u32)> {
         let (along, contiguous) = self.along(view);
         let width = if contiguous { 16 / view.dtype.bytes() as u32 } else { 1 };
-        l.runs(self.low.device.target.wave, width, along)
+        let misaligned = match &view.place {
+            Some(Place::Global { stride, rows: None, .. }) if along == Axis::Col && view.shape.rows > 1 => {
+                matches!(self.prog.scalar(stride[0]), Scalar::Const(s) if s % i64::from(width) != 0)
+            }
+            _ => false,
+        };
+        l.runs(self.low.device.target.wave, if misaligned { 1 } else { width }, along)
     }
 }
