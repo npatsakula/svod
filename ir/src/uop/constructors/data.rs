@@ -171,10 +171,29 @@ impl UOp {
         addrspace: svod_dtype::AddrSpace,
         device: Option<DeviceSpec>,
     ) -> Arc<Self> {
+        let shape = crate::shape::shape_to_uop(&smallvec::smallvec![crate::SInt::Const(size)]);
+        Self::buffer_shaped(shape, slot, dtype, addrspace, device)
+    }
+
+    /// [`Self::buffer`] off the global address space with its shape
+    /// committed as a program commits it ([`Self::committed_shape`]), no weak
+    /// constant made: what a pre-linearized program ([`Self::linear_program`])
+    /// declares, which its assembly then has nothing to commit in.
+    pub fn committed_buffer(slot: usize, size: usize, dtype: DType, addrspace: svod_dtype::AddrSpace) -> Arc<Self> {
+        let size = ConstValue::Int(size as i64);
+        Self::buffer_shaped(Self::const_(Self::committed_int(size), size), slot, dtype, addrspace, None)
+    }
+
+    fn buffer_shaped(
+        shape: Arc<Self>,
+        slot: usize,
+        dtype: DType,
+        addrspace: svod_dtype::AddrSpace,
+        device: Option<DeviceSpec>,
+    ) -> Arc<Self> {
         assert_eq!(device.is_some(), addrspace == svod_dtype::AddrSpace::Global);
         assert!(!dtype.is_weak(), "BUFFER storage dtype cannot be weak");
         assert!(!matches!(dtype, DType::Ptr { .. }), "BUFFER dtype is the stored element dtype, not a pointer");
-        let shape = crate::shape::shape_to_uop(&smallvec::smallvec![crate::SInt::Const(size)]);
         let arg = crate::ParamArg::buffer(slot, dtype.clone(), addrspace, device);
         Self::new(Op::Buffer(ops::Buffer { shape, arg: arg.into() }), dtype)
     }

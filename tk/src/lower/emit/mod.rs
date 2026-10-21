@@ -15,7 +15,7 @@ use svod_ir::{AxisId, AxisType, BarrierFence, KernelInfo, Op, UOp};
 use crate::atoms::{Core, Fill};
 use crate::index::*;
 use crate::ir::*;
-use crate::layouts::{Laid, TileLayout};
+use crate::layouts::{Laid, Moves, TileLayout};
 use crate::lower::{Lowering, ProgramSnafu, Result, UnsupportedSnafu};
 use snafu::ResultExt;
 
@@ -27,17 +27,61 @@ mod nvptx;
 
 pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Arc<UOp>> {
     let (prog, lay) = (&laid.prog, laid.layouts.as_slice());
+    // Parameters and buffers committed up front: the assembly rebuilds none
+    // of the ops reading them to commit their shapes.
+    let params = params.iter().map(UOp::committed_shape).collect();
     let mut e = Emit::new(prog, lay, low, params);
     e.prologue()?;
     e.block(&prog.body)?;
+    let list = e.list.listed();
     if std::env::var_os("TK_DUMP_LIST").is_some() {
-        for (i, u) in e.list.iter().enumerate() {
+        for (i, u) in list.iter().enumerate() {
             let srcs: Vec<u64> = u.op().sources().iter().map(|s| s.id).collect();
             eprintln!("[{i:4}] id={} {:?} {:?} <- {srcs:?}", u.id, u.op().as_ref(), u.dtype());
         }
     }
     let info = KernelInfo { name: Some(prog.name.clone()), ..Default::default() };
-    UOp::linear_program(info, e.list, device).context(ProgramSnafu)
+    UOp::linear_program(info, list, device).context(ProgramSnafu)
+}
+
+/// The instruction list cut at the insertion point of every nesting level
+/// (the kernel's, then every open loop's body and branch of an `If`): a
+/// value hoisted to a level appends to its segment, a statement to the
+/// last one, the innermost level's body.
+struct Listing(Vec<Vec<Arc<UOp>>>);
+
+impl Listing {
+    fn new() -> Self {
+        Self(vec![vec![], vec![]])
+    }
+
+    /// The innermost open level.
+    fn level(&self) -> usize {
+        self.0.len() - 2
+    }
+
+    fn push(&mut self, u: Arc<UOp>) {
+        self.0.last_mut().expect("a body").push(u);
+    }
+
+    fn hoist(&mut self, level: usize, u: Arc<UOp>) {
+        self.0[level].push(u);
+    }
+
+    /// A level opens here: what follows is its body.
+    fn open(&mut self) {
+        self.0.push(vec![]);
+    }
+
+    /// The innermost level closes: its body joins the level around it.
+    fn close(&mut self) {
+        let body = self.0.pop().expect("an open level");
+        self.0.last_mut().expect("a body").extend(body);
+    }
+
+    fn listed(self) -> Vec<Arc<UOp>> {
+        self.0.concat()
+    }
 }
 
 struct Emit<'a> {
@@ -46,10 +90,7 @@ struct Emit<'a> {
     low: &'a Lowering,
     params: Vec<Arc<UOp>>,
     vars: HashMap<String, Arc<UOp>>,
-    list: Vec<Arc<UOp>>,
-    /// Insertion point of values computed at each nesting level: the
-    /// kernel's, then every open loop's body and branch of an `If`.
-    headers: Vec<usize>,
+    list: Listing,
     /// The levels of the open branches, innermost last.
     guards: Vec<usize>,
     /// Open branches on the warp of the block's scope: some warps skip them.
@@ -73,6 +114,8 @@ struct Emit<'a> {
     /// A shared allocation's buffer read under another type, per pair.
     typed: HashMap<(usize, ScalarDType), Arc<UOp>>,
     scratch: HashMap<ScalarDType, (Arc<UOp>, usize)>,
+    /// The lane moves of every shift, flip and deal, by their layouts.
+    moves: Moves,
     lane: Arc<UOp>,
     warp: Arc<UOp>,
     tid: Arc<UOp>,
@@ -163,8 +206,7 @@ impl<'a> Emit<'a> {
             low,
             params,
             vars: HashMap::new(),
-            list: vec![],
-            headers: vec![0],
+            list: Listing::new(),
             guards: vec![],
             divergent: 0,
             levels: HashMap::new(),
@@ -179,6 +221,7 @@ impl<'a> Emit<'a> {
             smem: vec![],
             typed: HashMap::new(),
             scratch: HashMap::new(),
+            moves: Moves::new(low.grid.count(), low.device.target.wave),
             last: tid.clone(),
             lane,
             warp,
@@ -241,17 +284,13 @@ impl<'a> Emit<'a> {
             }
             level = level.max(self.level_of(&src));
         }
-        let at = self.headers[level];
-        self.list.insert(at, u.clone());
-        for h in &mut self.headers[level..] {
-            *h += 1;
-        }
+        self.list.hoist(level, u.clone());
         self.levels.insert(u.id, level);
         u
     }
 
     fn level(&self) -> usize {
-        self.headers.len() - 1
+        self.list.level()
     }
 
     fn next_tag(&mut self) -> u64 {
@@ -270,7 +309,7 @@ impl<'a> Emit<'a> {
         self.hoist(self.lane.clone());
         self.hoist(self.warp.clone());
         for (i, alloc) in self.prog.smem.iter().enumerate() {
-            let buf = UOp::buffer(i, alloc.elems, DType::Scalar(alloc.dtype), AddrSpace::Local, None);
+            let buf = UOp::committed_buffer(i, alloc.elems, DType::Scalar(alloc.dtype), AddrSpace::Local);
             let buf = self.hoist(buf);
             self.smem.push(buf);
         }
@@ -446,7 +485,7 @@ impl<'a> Emit<'a> {
         }
         let regs = self.layout(root).regs() as usize;
         let dtype = DType::Scalar(self.value(root).dtype);
-        let buf = UOp::buffer(self.reg_slot, regs, dtype, AddrSpace::Reg, None);
+        let buf = UOp::committed_buffer(self.reg_slot, regs, dtype, AddrSpace::Reg);
         self.reg_slot += 1;
         let buf = self.hoist(buf);
         self.regs.insert(root, buf.clone());
@@ -558,11 +597,11 @@ impl<'a> Emit<'a> {
                     }
                     let tag = self.next_tag();
                     let if_ = self.push(UOp::if_(cond, smallvec![]).rtag(Some(smallvec![tag as usize])));
-                    self.headers.push(self.list.len());
+                    self.list.open();
                     self.guards.push(self.level());
                     self.block(branch)?;
                     let level = self.guards.pop().expect("the branch just opened");
-                    self.headers.pop();
+                    self.list.close();
                     // What was listed under the branch is out of reach past it.
                     self.scalars.retain(|_, (l, _)| *l < level);
                     self.row_scalars.retain(|_, (l, _)| *l < level);
@@ -609,14 +648,14 @@ impl<'a> Emit<'a> {
         let range = UOp::range_axis_dtype(end, AxisId::Renumbered(self.range_id), AxisType::Loop, DType::Int32);
         self.range_id += 1;
         let range = self.push(range);
-        self.headers.push(self.list.len());
+        self.list.open();
         // The induction variable belongs to the level it opens.
         self.levels.insert(range.id, self.level());
         range
     }
 
     fn close_range(&mut self, range: Arc<UOp>) {
-        self.headers.pop();
+        self.list.close();
         let end = self.last.clone().end(smallvec![range]);
         self.push(end);
     }

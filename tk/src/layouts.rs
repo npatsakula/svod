@@ -70,7 +70,7 @@ impl WarpGrid {
 /// How a block holds a register tile: a fragment over `(Reg, Lane)`, repeated
 /// `reps` times (row-major, by register) inside each warp's sub-tile, and the
 /// warps' sub-tile coordinates (free warp bits replicate the sub-tile).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileLayout {
     pub frag: Layout,
     pub reps: [u32; 2],
@@ -213,7 +213,11 @@ impl TileLayout {
     /// `[rows, w]` result), as [`Self::shift`]'s, and the column of this tile
     /// each element of the result takes ([`Self::dealt`]).
     pub fn deal(&self, dst: &Self, j: u32, warps: u32, lanes: u32) -> Option<Vec<(Vec<Pick>, u64)>> {
-        let taken = self.dealt(dst, warps, lanes);
+        self.deal_taking(dst, &self.dealt(dst, warps, lanes), j, warps, lanes)
+    }
+
+    /// [`Self::deal`] with the columns each element takes, `taken`.
+    fn deal_taking(&self, dst: &Self, taken: &Dealt, j: u32, warps: u32, lanes: u32) -> Option<Vec<(Vec<Pick>, u64)>> {
         self.moves_into(dst, warps, lanes, |(r, c)| Some((r, taken[&(r, c)][j as usize])))
     }
 
@@ -223,7 +227,7 @@ impl TileLayout {
     /// lanes holding a row's columns of `dst` hold all of its columns here
     /// once, the `q`th of a lane's `dst` columns takes its `(j·w_lane + q)`th
     /// here (in register order), else column `c·n + j`.
-    pub fn dealt(&self, dst: &Self, warps: u32, lanes: u32) -> HashMap<(u32, u32), Vec<u32>> {
+    pub fn dealt(&self, dst: &Self, warps: u32, lanes: u32) -> Dealt {
         let (Shape { rows, cols }, w) = (self.shape(), dst.shape().cols as u32);
         let n = cols as u32 / w;
         let plain = || {
@@ -286,14 +290,16 @@ impl TileLayout {
         lanes: u32,
         from: impl Fn((u32, u32)) -> Option<(u32, u32)>,
     ) -> Option<Vec<(Vec<Pick>, u64)>> {
-        // Per warp, the (lane, register) pairs holding each element, in order.
-        type Holders = HashMap<(u32, u32), Vec<(u32, u32)>>;
+        // Per warp, the (lane, register) pairs holding each element (row-major), in order.
+        type Holders = Vec<smallvec::SmallVec<[(u32, u32); 2]>>;
+        let Shape { rows, cols } = self.shape();
         let held: Vec<Holders> = (0..warps)
             .map(|w| {
-                let mut at = Holders::new();
+                let mut at = vec![smallvec::SmallVec::new(); rows * cols];
                 for from in 0..lanes {
                     for reg in 0..self.regs() {
-                        at.entry(self.coord(w, from, reg)).or_default().push((from, reg));
+                        let (r, c) = self.coord(w, from, reg);
+                        at[r as usize * cols + c as usize].push((from, reg));
                     }
                 }
                 at
@@ -301,25 +307,30 @@ impl TileLayout {
             .collect();
         // The (mask, register) moves that bring lane `l` of warp `w` element `j`'s source.
         let moves = |w: u32, l: u32, j: u32| -> Option<Vec<(u32, u32)>> {
-            let want = from(dst.coord(w, l, j))?;
-            let found = held[w as usize].get(&want).map_or(&[][..], Vec::as_slice);
+            let (r, c) = from(dst.coord(w, l, j))?;
+            let (r, c) = (r as usize, c as usize);
+            let found = if r < rows && c < cols { &held[w as usize][r * cols + c][..] } else { &[] };
             Some(found.iter().map(|&(from, reg)| (from ^ l, reg)).collect())
         };
         (0..dst.regs())
             .map(|j| {
-                let fill = (0..lanes).filter(|&l| moves(0, l, j).is_none()).fold(0u64, |a, l| a | 1 << l);
+                // Each lane's moves in the first warp, and the lanes each move serves.
+                let first: Vec<Option<Vec<(u32, u32)>>> = (0..lanes).map(|l| moves(0, l, j)).collect();
+                let mut serves: HashMap<(u32, u32), u64> = HashMap::new();
+                for (l, mv) in first.iter().enumerate() {
+                    for &mv in mv.iter().flatten() {
+                        *serves.entry(mv).or_default() |= 1 << l;
+                    }
+                }
+                let fill = (0..lanes).filter(|&l| first[l as usize].is_none()).fold(0u64, |a, l| a | 1 << l);
                 let mut open: u64 = (u64::MAX >> (64 - lanes)) & !fill;
                 let mut picks: Vec<Pick> = vec![];
                 while open != 0 {
-                    let lanes_of = |mv: (u32, u32)| {
-                        (0..lanes)
-                            .filter(|&m| open >> m & 1 == 1 && moves(0, m, j).is_some_and(|v| v.contains(&mv)))
-                            .fold(0u64, |a, m| a | 1 << m)
-                    };
+                    let lanes_of = |mv: (u32, u32)| serves[&mv] & open;
                     // The same lane first, then the move serving the most lanes still open.
                     let (mask, reg) = (0..lanes)
                         .filter(|l| open >> l & 1 == 1)
-                        .flat_map(|l| moves(0, l, j).unwrap_or_default())
+                        .flat_map(|l| first[l as usize].iter().flatten().copied())
                         .max_by_key(|&mv| (lanes_of(mv).count_ones(), mv.0 == 0))?;
                     let covered = lanes_of((mask, reg));
                     open &= !covered;
@@ -488,6 +499,68 @@ pub struct Pick {
     pub mask: u32,
     pub reg: u32,
     pub lanes: u64,
+}
+
+/// Per register of a shift's, flip's or deal's result, the lane moves that
+/// fill it and the lanes the fill takes ([`TileLayout::shift`]).
+pub type LaneMoves = Vec<(Vec<Pick>, u64)>;
+
+/// Per element `(r, c)` of a deal's result, the column of its source each
+/// deal `j` takes ([`TileLayout::dealt`]).
+pub type Dealt = HashMap<(u32, u32), Vec<u32>>;
+
+/// A tile op that moves elements across lanes: what besides its layouts
+/// decides its moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Move {
+    Shift(Axis),
+    Flip(Axis, u32),
+    Deal(u32),
+}
+
+impl Move {
+    /// `op`'s source and move, if it is a shift, flip or deal.
+    pub fn of(op: &TileOp) -> Option<(ValId, Self)> {
+        Some(match *op {
+            TileOp::Shift { src, axis, .. } => (src, Move::Shift(axis)),
+            TileOp::Flip { src, axis, mask } => (src, Move::Flip(axis, mask)),
+            TileOp::Deal { src, j, .. } => (src, Move::Deal(j)),
+            _ => return None,
+        })
+    }
+}
+
+/// The moves of shifts, flips and deals over `warps` warps of `lanes` lanes,
+/// by their layouts: a sorting network flips one layout across the same
+/// masks stage after stage.
+pub(crate) struct Moves {
+    warps: u32,
+    lanes: u32,
+    memo: HashMap<(TileLayout, TileLayout, Move), Option<LaneMoves>>,
+    /// What every deal of a source into a result takes, whichever `j`.
+    dealt: HashMap<(TileLayout, TileLayout), Dealt>,
+}
+
+impl Moves {
+    pub fn new(warps: u32, lanes: u32) -> Self {
+        Self { warps, lanes, memo: HashMap::new(), dealt: HashMap::new() }
+    }
+
+    /// The moves of `how` from `src` into `dst` ([`TileLayout::shift`],
+    /// [`TileLayout::flip`], [`TileLayout::deal`]).
+    pub fn get(&mut self, src: &TileLayout, dst: &TileLayout, how: Move) -> Option<&LaneMoves> {
+        let Self { warps, lanes, memo, dealt } = self;
+        let (warps, lanes) = (*warps, *lanes);
+        let moves = memo.entry((src.clone(), dst.clone(), how)).or_insert_with(|| match how {
+            Move::Shift(axis) => src.shift(axis, warps, lanes),
+            Move::Flip(axis, mask) => src.flip(axis, mask, warps, lanes),
+            Move::Deal(j) => {
+                let taken = dealt.entry((src.clone(), dst.clone())).or_insert_with(|| src.dealt(dst, warps, lanes));
+                src.deal_taking(dst, taken, j, warps, lanes)
+            }
+        });
+        moves.as_ref()
+    }
 }
 
 /// What re-holding a tile costs.
@@ -881,7 +954,8 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Co
             }
         }
     }
-    let cost_of = |choice: &HashMap<ValId, Orient>| -> Result<f64> {
+    let mut moved = Moves::new(grid.count(), target.wave);
+    let mut cost_of = |choice: &HashMap<ValId, Orient>| -> Result<f64> {
         let mut trial = prog.clone();
         set_orient(&mut trial.body, choice);
         let mut it = Infer::new(&trial, target, grid, core);
@@ -924,28 +998,15 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Co
             .sum();
         // A shift, flip or deal moves across the lanes its layouts hold
         // apart: the moves a lane issues, over every lane.
-        let mut priced: HashMap<(ValId, ValId, u32), u32> = HashMap::new();
         let exchanges: f64 = trial
             .walk()
             .filter_map(|(_, s)| {
                 let Stmt::Let { dst, op } = s else { return None };
-                let (src, key) = match *op {
-                    TileOp::Shift { src, axis, .. } => (src, axis as u32),
-                    TileOp::Flip { src, axis, mask } => (src, 2 + axis as u32 + 2 * mask),
-                    TileOp::Deal { src, j, .. } => (src, 1 << 31 | j),
-                    _ => return None,
-                };
+                let (src, how) = Move::of(op)?;
                 let (ls, ld) = (it.lay[src.index()].as_ref()?, it.lay[dst.index()].as_ref()?);
-                let issued = *priced.entry((src, *dst, key)).or_insert_with(|| {
-                    let (warps, lanes) = (grid.count(), target.wave);
-                    let moves = match *op {
-                        TileOp::Shift { axis, .. } => ls.shift(axis, warps, lanes),
-                        TileOp::Flip { axis, mask, .. } => ls.flip(axis, mask, warps, lanes),
-                        _ => ls.deal(ld, key & !(1 << 31), warps, lanes),
-                    };
-                    let crossing = |picks: &[Pick]| picks.iter().filter(|p| p.mask != 0).count() as u32;
-                    moves.map_or(0, |m| m.iter().map(|(picks, _)| crossing(picks)).sum())
-                });
+                let crossing = |picks: &[Pick]| picks.iter().filter(|p| p.mask != 0).count() as u32;
+                let moves = moved.get(ls, ld, how);
+                let issued: u32 = moves.map_or(0, |m| m.iter().map(|(picks, _)| crossing(picks)).sum());
                 Some(f64::from(issued * target.wave * grid.count()))
             })
             .sum();
@@ -1019,7 +1080,7 @@ impl<'a> Infer<'a> {
                 // its tile's to decide.
                 // A tile a laid vector spreads into first: its loop's
                 // initial value and its next take its layout from it.
-                let spread = self.open_tiles().find_map(|v| Some((v, self.spread(v)?)));
+                let spread = self.spread();
                 let Some(v) = spread.as_ref().map(|s| s.0).or_else(|| self.unconstrained()) else { return Ok(()) };
                 let shape = prog.values[v.index()].shape;
                 let l = spread.map(|s| s.1).or_else(|| natural(shape, warps, lanes)).context(UndeterminedSnafu {
@@ -1037,33 +1098,38 @@ impl<'a> Infer<'a> {
         NotConvergedSnafu { passes }.fail()
     }
 
-    /// For a tile `v` nothing constrains that a laid row vector broadcasts
-    /// over (or a column vector, transposed), the tile it [spreads
-    /// into](TileLayout::spread_row): a list of a row's values held beside
-    /// that row's.
-    fn spread(&self, v: ValId) -> Option<TileLayout> {
-        let cols = self.shape(v).cols as u32;
-        self.prog.walk().find_map(|(_, stmt)| {
-            let Stmt::Let { dst, op } = stmt else { return None };
+    /// The first register tile (not vector) nothing constrains that a laid
+    /// row vector broadcasts over (or a column vector, transposed), and the
+    /// tile it [spreads into](TileLayout::spread_row) at its first such
+    /// statement: a list of a row's values held beside that row's.
+    fn spread(&self) -> Option<(ValId, TileLayout)> {
+        let open = |v: ValId| {
+            let Value { place, shape, .. } = self.prog.value(v);
+            *place == Place::Reg && self.lay[v.index()].is_none() && shape.rows != 1 && shape.cols != 1
+        };
+        let mut first: Option<(ValId, TileLayout)> = None;
+        for (_, stmt) in self.prog.walk() {
+            let Stmt::Let { dst, op } = stmt else { continue };
             let pairs = match *op {
                 TileOp::Binary { a, b, .. } | TileOp::Where { a, b, .. } | TileOp::MulAdd { a, b, .. } => [a, b],
-                _ => return None,
+                _ => continue,
             };
-            let (tile, vector, axis) = self.broadcast(pairs[0], pairs[1])?;
-            let vector = self.lay[vector.index()].as_ref()?;
-            ((tile == v || *dst == v) && self.lay[dst.index()].is_none()).then(|| match axis {
-                Axis::Row => TileLayout::spread_row(vector, cols),
-                Axis::Col => TileLayout::spread_row(&vector.transposed(), self.shape(v).rows as u32).transposed(),
-            })
-        })
-    }
-
-    /// The register tiles (not vectors) without a layout.
-    fn open_tiles(&self) -> impl Iterator<Item = ValId> + '_ {
-        self.prog.values.iter().enumerate().filter_map(|(i, v)| {
-            let open = v.place == Place::Reg && self.lay[i].is_none() && v.shape.rows != 1 && v.shape.cols != 1;
-            open.then_some(ValId(i as u32))
-        })
+            let Some((tile, vector, axis)) = self.broadcast(pairs[0], pairs[1]) else { continue };
+            let Some(vector) = self.lay[vector.index()].as_ref().filter(|_| self.lay[dst.index()].is_none()) else {
+                continue;
+            };
+            for v in [tile, *dst] {
+                if open(v) && first.as_ref().is_none_or(|(f, _)| v.index() < f.index()) {
+                    let Shape { rows, cols } = self.shape(v);
+                    let l = match axis {
+                        Axis::Row => TileLayout::spread_row(vector, cols as u32),
+                        Axis::Col => TileLayout::spread_row(&vector.transposed(), rows as u32).transposed(),
+                    };
+                    first = Some((v, l));
+                }
+            }
+        }
+        first
     }
 
     /// The first register value without a layout, tiles before vectors.
@@ -1100,11 +1166,11 @@ impl<'a> Infer<'a> {
     /// so the operands reach it in the result's layout (a conflict is only
     /// ever resolved on a statement's operand).
     fn unify(&mut self, a: ValId, b: ValId) {
-        match (self.lay[a.index()].clone(), self.lay[b.index()].clone()) {
-            (Some(l), None) => self.set(b, l),
-            (None, Some(l)) => self.set(a, l),
+        match (&self.lay[a.index()], &self.lay[b.index()]) {
+            (Some(l), None) => self.set(b, l.clone()),
+            (None, Some(l)) => self.set(a, l.clone()),
             (Some(x), Some(y)) if x != y => {
-                self.conflicts.insert((self.pos, b), x);
+                self.conflicts.insert((self.pos, b), x.clone());
             }
             _ => {}
         }
@@ -1113,9 +1179,9 @@ impl<'a> Infer<'a> {
     fn carried(&mut self, carried: &[Carried]) -> Result<()> {
         for c in carried {
             for (x, y) in [(c.init, c.phi), (c.next, c.phi)] {
-                match (self.lay[x.index()].clone(), self.lay[y.index()].clone()) {
-                    (Some(l), None) => self.set(y, l),
-                    (None, Some(l)) => self.set(x, l),
+                match (&self.lay[x.index()], &self.lay[y.index()]) {
+                    (Some(l), None) => self.set(y, l.clone()),
+                    (None, Some(l)) => self.set(x, l.clone()),
                     (Some(a), Some(b)) => ensure!(a == b, CarriedLayoutChangesSnafu { value: c.phi }),
                     _ => {}
                 }

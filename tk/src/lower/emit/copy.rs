@@ -5,7 +5,7 @@ use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill};
 use svod_ir::ConstValue;
 
 use crate::layout as frag;
-use crate::layouts::{Pick, Relayout};
+use crate::layouts::{Move, Pick, Relayout};
 use crate::lower::DivergentBarrierSnafu;
 use snafu::OptionExt;
 
@@ -270,9 +270,8 @@ impl Emit<'_> {
     /// lane holds the predecessor, else the lane moves of
     /// [`TileLayout::shift`], selected by lane as an exchange's.
     pub(super) fn shift(&mut self, dst: ValId, src: ValId, axis: Axis, fill: Const) -> Result<()> {
-        let l = self.layout(src).clone();
-        let moves = l
-            .shift(axis, self.grid_warps(), self.low.device.target.wave)
+        let moves = self
+            .moves_of(dst, src, Move::Shift(axis))
             .context(UnsupportedSnafu { what: "a shift whose predecessors are in another warp" })?;
         let dtype = DType::Scalar(self.value(dst).dtype);
         let fill = match fill {
@@ -287,9 +286,8 @@ impl Emit<'_> {
     /// register renaming where a lane holds the partner, else the lane moves
     /// of [`TileLayout::flip`].
     pub(super) fn flip(&mut self, dst: ValId, src: ValId, axis: Axis, mask: u32) -> Result<()> {
-        let l = self.layout(src).clone();
-        let moves = l
-            .flip(axis, mask, self.grid_warps(), self.low.device.target.wave)
+        let moves = self
+            .moves_of(dst, src, Move::Flip(axis, mask))
             .context(UnsupportedSnafu { what: "a flip whose partners are in another warp" })?;
         self.moved(dst, moves, None, false, |e, reg| e.reg_load(src, reg));
         Ok(())
@@ -299,9 +297,9 @@ impl Emit<'_> {
     /// `col`, their columns): a renaming where the lane holds it, else the
     /// lane moves of [`TileLayout::deal`].
     pub(super) fn deal(&mut self, dst: ValId, src: ValId, j: u32, col: bool) -> Result<()> {
-        let (ls, ld) = (self.layout(src).clone(), self.layout(dst).clone());
-        let moves = ls
-            .deal(&ld, j, self.grid_warps(), self.low.device.target.wave)
+        let ls = self.layout(src).clone();
+        let moves = self
+            .moves_of(dst, src, Move::Deal(j))
             .context(UnsupportedSnafu { what: "a deal of columns another warp holds" })?;
         match col {
             false => self.moved(dst, moves, None, false, |e, reg| e.reg_load(src, reg)),
@@ -311,6 +309,13 @@ impl Emit<'_> {
             }),
         }
         Ok(())
+    }
+
+    /// The moves of `how` from `src`'s layout into `dst`'s.
+    fn moves_of(&mut self, dst: ValId, src: ValId, how: Move) -> Option<Vec<(Vec<Pick>, u64)>> {
+        let lay = self.lay;
+        let at = |v: ValId| lay[v.index()].as_ref().expect("every register value has a layout");
+        self.moves.get(at(src), at(dst), how).cloned()
     }
 
     /// Each register of `dst` from the `moves` of the source registers
@@ -375,7 +380,8 @@ impl Emit<'_> {
         let scratch = match self.scratch.get(&dtype) {
             Some((buf, size)) if *size >= elems * regions => buf.clone(),
             _ => {
-                let buf = UOp::buffer(self.local_slot, elems * regions, DType::Scalar(dtype), AddrSpace::Local, None);
+                let buf =
+                    UOp::committed_buffer(self.local_slot, elems * regions, DType::Scalar(dtype), AddrSpace::Local);
                 self.local_slot += 1;
                 let buf = self.hoist(buf);
                 self.scratch.insert(dtype, (buf.clone(), elems * regions));
