@@ -551,11 +551,13 @@ impl Kernel {
 
     // ---- control ---------------------------------------------------------
 
-    fn carried<const N: usize>(&mut self, init: [ValId; N]) -> [ValId; N] {
-        init.map(|i| {
-            let Value { dtype, shape, .. } = self.prog.value(i).clone();
-            self.value(dtype, shape, Place::Reg)
-        })
+    fn carried<T>(&mut self, init: &[Regs<T>]) -> Vec<ValId> {
+        init.iter()
+            .map(|i| {
+                let Value { dtype, shape, .. } = self.prog.value(i.0).clone();
+                self.value(dtype, shape, Place::Reg)
+            })
+            .collect()
     }
 
     fn with_block(&mut self, f: impl FnOnce(&mut Self)) -> Block {
@@ -572,14 +574,25 @@ impl Kernel {
         init: [Regs<T>; N],
         body: impl FnOnce(&mut Self, Sc, [Regs<T>; N]) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
+        let out = self.loop_vec(extent, init.to_vec(), |k, iv, phi| body(k, iv, tiles(phi)).to_vec());
+        tiles(out)
+    }
+
+    /// [`Self::loop_`] over as many tiles as `init` holds.
+    pub fn loop_vec<T: Elem>(
+        &mut self,
+        extent: impl Into<Sc>,
+        init: Vec<Regs<T>>,
+        body: impl FnOnce(&mut Self, Sc, Vec<Regs<T>>) -> Vec<Regs<T>>,
+    ) -> Vec<Regs<T>> {
         let (start, extent) = (self.intern(0), self.intern(extent));
         let iv = self.push_scalar(Scalar::Induction);
-        let phi = self.carried(init.map(ValId::from));
-        let mut next = [ValId(0); N];
-        let block = self.with_block(|k| next = body(k, Sc::Id(iv), phi.map(Tile::new)).map(ValId::from));
-        let carried = (0..N).map(|i| Carried { init: init[i].0, phi: phi[i], next: next[i] }).collect();
+        let phi = self.carried(&init);
+        let mut next = vec![];
+        let block = self.with_block(|k| next = body(k, Sc::Id(iv), phi.iter().map(|&v| Tile::new(v)).collect()));
+        let carried = carry(&init, &phi, &next);
         self.push(Stmt::Loop(Loop { iv, start, extent, carried, body: block, unroll: 1 }));
-        phi.map(Tile::new)
+        phi.into_iter().map(Tile::new).collect()
     }
 
     /// A producer/consumer loop over `extent` steps with `stages` slots.
@@ -593,19 +606,33 @@ impl Kernel {
         produce: impl FnOnce(&mut Self, Sc, Sc),
         consume: impl FnOnce(&mut Self, Sc, Sc, [Regs<T>; N]) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
+        let consume = |k: &mut Self, step, slot, phi: Vec<Regs<T>>| consume(k, step, slot, tiles(phi)).to_vec();
+        tiles(self.pipeline_vec(extent, stages, init.to_vec(), produce, consume))
+    }
+
+    /// [`Self::pipeline`] over as many tiles as `init` holds.
+    pub fn pipeline_vec<T: Elem>(
+        &mut self,
+        extent: impl Into<Sc>,
+        stages: usize,
+        init: Vec<Regs<T>>,
+        produce: impl FnOnce(&mut Self, Sc, Sc),
+        consume: impl FnOnce(&mut Self, Sc, Sc, Vec<Regs<T>>) -> Vec<Regs<T>>,
+    ) -> Vec<Regs<T>> {
         assert!(stages >= 1, "at least one stage");
         let extent = self.intern(extent);
         let [pstep, pslot, cstep, cslot] = [(); 4].map(|()| self.push_scalar(Scalar::Induction));
-        let phi = self.carried(init.map(ValId::from));
+        let phi = self.carried(&init);
         let body = self.with_block(|k| produce(k, Sc::Id(pstep), Sc::Id(pslot)));
         let produce = Stage { step: pstep, slot: pslot, body };
-        let mut next = [ValId(0); N];
-        let body =
-            self.with_block(|k| next = consume(k, Sc::Id(cstep), Sc::Id(cslot), phi.map(Tile::new)).map(ValId::from));
+        let mut next = vec![];
+        let body = self.with_block(|k| {
+            next = consume(k, Sc::Id(cstep), Sc::Id(cslot), phi.iter().map(|&v| Tile::new(v)).collect())
+        });
         let consume = Stage { step: cstep, slot: cslot, body };
-        let carried = (0..N).map(|i| Carried { init: init[i].0, phi: phi[i], next: next[i] }).collect();
+        let carried = carry(&init, &phi, &next);
         self.push(Stmt::Pipeline(Pipeline { extent, stages, carried, produce, consume }));
-        phi.map(Tile::new)
+        phi.into_iter().map(Tile::new).collect()
     }
 
     /// Every warp runs `body` on its own ([`Stmt::Warps`]): [`warp`](Self::warp)
@@ -633,19 +660,32 @@ impl Kernel {
         then: impl FnOnce(&mut Self) -> [Regs<T>; N],
         otherwise: impl FnOnce(&mut Self) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
+        tiles(self.select_if_vec(pred, |k| then(k).to_vec(), |k| otherwise(k).to_vec()))
+    }
+
+    /// [`Self::select_if`] over as many tiles as the branches produce.
+    pub fn select_if_vec<T: Elem>(
+        &mut self,
+        pred: impl Into<Sc>,
+        then: impl FnOnce(&mut Self) -> Vec<Regs<T>>,
+        otherwise: impl FnOnce(&mut Self) -> Vec<Regs<T>>,
+    ) -> Vec<Regs<T>> {
         let pred = self.intern(pred);
-        let mut merged: Option<[ValId; N]> = None;
-        type Branch<'a, T, const N: usize> = Box<dyn FnOnce(&mut Kernel) -> [Regs<T>; N] + 'a>;
-        let mut branch = |k: &mut Self, f: Branch<'_, T, N>| {
+        let mut merged: Option<Vec<ValId>> = None;
+        type Branch<'a, T> = Box<dyn FnOnce(&mut Kernel) -> Vec<Regs<T>> + 'a>;
+        let mut branch = |k: &mut Self, f: Branch<'_, T>| {
             k.with_block(|k| {
                 let vals = f(k);
-                let out = *merged.get_or_insert_with(|| {
-                    vals.map(|v| {
-                        let Value { dtype, shape, .. } = k.prog.value(v.0).clone();
-                        k.value(dtype, shape, Place::Reg)
-                    })
+                let out = merged.get_or_insert_with(|| {
+                    vals.iter()
+                        .map(|v| {
+                            let Value { dtype, shape, .. } = k.prog.value(v.0).clone();
+                            k.value(dtype, shape, Place::Reg)
+                        })
+                        .collect()
                 });
-                for (dst, v) in out.into_iter().zip(vals) {
+                assert_eq!(out.len(), vals.len(), "both branches produce as many tiles");
+                for (&dst, v) in out.iter().zip(vals) {
                     assert_eq!(k.shape(dst), k.shape(v), "both branches produce the same shapes");
                     k.push(Stmt::Let { dst, op: TileOp::Move { src: v.0 } });
                 }
@@ -654,7 +694,7 @@ impl Kernel {
         let then = branch(self, Box::new(then));
         let otherwise = branch(self, Box::new(otherwise));
         self.push(Stmt::If { pred, then, otherwise });
-        merged.expect("both branches ran").map(Tile::new)
+        merged.expect("both branches ran").into_iter().map(Tile::new).collect()
     }
 
     /// `where_(pred, then(k), otherwise)` for each pair of tiles, `then` run
@@ -681,6 +721,22 @@ impl Kernel {
         )
     }
 
+    /// `then(k)`, run only by the warps holding some set element of `pred`
+    /// ([`Scalar::Any`]), else `otherwise`; unlike [`Self::where_any`] nothing
+    /// selects between them, so `then` must itself leave the program's results
+    /// what `otherwise` leads to wherever `pred` is clear (a tile it changes
+    /// there may only feed work that changes nothing there). `then` must hold
+    /// no block barrier.
+    pub fn if_any<T: Elem>(
+        &mut self,
+        pred: Regs<Bool>,
+        then: impl FnOnce(&mut Self) -> Vec<Regs<T>>,
+        otherwise: Vec<Regs<T>>,
+    ) -> Vec<Regs<T>> {
+        let any = self.scalar(Scalar::Any(pred.0));
+        self.select_if_vec(any, then, |_| otherwise)
+    }
+
     /// A barrier across the block's warps, and a fence of its shared memory;
     /// block-wide even inside [`Self::each_warp`].
     pub fn barrier(&mut self) {
@@ -692,4 +748,15 @@ impl Kernel {
         self.prog.body = self.blocks.pop().expect("the root block");
         self.prog
     }
+}
+
+/// `N` tiles of a list as long.
+fn tiles<T, const N: usize>(list: Vec<Regs<T>>) -> [Regs<T>; N] {
+    list.try_into().unwrap_or_else(|l: Vec<_>| panic!("{} tiles where {N} are carried", l.len()))
+}
+
+/// Each `init`'s carried register: its `phi` and its `next`.
+fn carry<T>(init: &[Regs<T>], phi: &[ValId], next: &[Regs<T>]) -> Vec<Carried> {
+    assert_eq!(next.len(), init.len(), "a body returns a tile per carried one");
+    (0..init.len()).map(|i| Carried { init: init[i].0, phi: phi[i], next: next[i].0 }).collect()
 }

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use svod_dtype::GpuArch;
 
 use crate::atoms::{Core, Device, Fill, GroupMmaAtom, Target};
-use crate::ir::{Axis, Shape};
+use crate::ir::{Axis, Orient, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::{GemmCfg, KSLICE};
@@ -207,6 +207,8 @@ pub enum Rejected {
     Layout,
     /// The registers a lane holds at once pass what it may.
     Registers { need: u32, have: u32 },
+    /// It keeps more least scores a row than a register list holds.
+    TopK { k: usize, most: usize },
 }
 
 /// A ranking: its configs with their costs ([`Planner::pipelined`] ns of SM
@@ -818,27 +820,17 @@ impl Planner {
         cached(&self.attention, p, || p.ranked(self))
     }
 
-    /// Every nearest-candidate config for `n` query rows over `m` candidates
-    /// at depth `d` ([`Nearest`]), the cheapest first.
-    pub fn nearest_ranked(
-        &self,
-        n: usize,
-        m: usize,
-        d: usize,
-        metric: Metric,
-        floors: Floors,
-        groups: bool,
-    ) -> Arc<[NearestCfg]> {
-        if n * m * d == 0 {
+    /// Every config of the nearest-candidate problem `p`, the cheapest first.
+    pub fn nearest_ranked(&self, p: Nearest) -> Arc<[NearestCfg]> {
+        if p.n * p.m * p.d * p.k == 0 {
             return Arc::new([]);
         }
-        let p = Nearest { n, m, d, metric, floors, groups };
         cached(&self.nearest, p, || p.ranked(self))
     }
 
     /// The candidates of `admitted` (the shortlist of
-    /// [`Self::nearest_ranked`] for `n` rows over `m` candidates at depth
-    /// `d`): each split its [`Self::nearest_split`] ways where it splits,
+    /// [`Self::nearest_ranked`] for `p`): each split its
+    /// [`Self::nearest_split`] ways where it splits,
     /// else whole, and the first whole as well, so a shape no split serves
     /// is timed (at 32768² rows and depth 768 on sm_86 every one of 36
     /// tiles ran faster split, 1.05–2.7 times, and timing both took 2.7
@@ -846,13 +838,13 @@ impl Planner {
     /// whole tile ran 8–12 % behind the best split on gfx1201, its unrolled
     /// pipeline included, 10–12 % on sm_86 (depth 768) and 18–34 % on
     /// gfx1151).
-    pub fn nearest_splits(&self, n: usize, m: usize, d: usize, admitted: &[NearestCfg]) -> Vec<NearestCfg> {
-        let split = |c: &NearestCfg| self.nearest_split(n, m, d, c).map(|splits| NearestCfg { splits, ..*c });
+    pub fn nearest_splits(&self, p: &Nearest, admitted: &[NearestCfg]) -> Vec<NearestCfg> {
+        let split = |c: &NearestCfg| self.nearest_split(p, c).map(|splits| NearestCfg { splits, ..*c });
         let whole = |i: usize, c: &NearestCfg, split: bool| (!split || i == 0).then_some(*c);
         admitted.iter().enumerate().flat_map(|(i, c)| [split(c), whole(i, c, split(c).is_some())]).flatten().collect()
     }
 
-    /// The shares a query block of `cfg` splits `m` candidates into, if
+    /// The shares a query block of `cfg` splits the candidates of `p` into, if
     /// any: a power of two, each share [`SPLIT_TILES`] candidate tiles at
     /// least, enough that the blocks in flight (every SM's resident ones)
     /// span the query blocks they walk at once. Streamed, those are a group
@@ -864,17 +856,18 @@ impl Planner {
     /// Resident, a block reads its rows once and only a grid of fewer blocks
     /// than SMs splits, a block an SM (at depth 128 a split ran 5–18 %
     /// behind whole on gfx1201).
-    pub fn nearest_split(&self, n: usize, m: usize, d: usize, cfg: &NearestCfg) -> Option<usize> {
-        let target = &self.device.target;
-        let blocks = n.div_ceil(cfg.bq);
+    pub fn nearest_split(&self, p: &Nearest, cfg: &NearestCfg) -> Option<usize> {
+        let (target, d) = (&self.device.target, p.d);
+        let blocks = p.n.div_ceil(cfg.bq);
         let (flight, rows) = match cfg.bk {
             Some(_) => {
-                let resident = self.resident(cfg.smem_bytes(d), cfg.registers(target, d)?, cfg.warps() as usize);
+                let regs = cfg.registers(target, d, p.k)?;
+                let resident = self.resident(cfg.smem_bytes(d), regs, cfg.warps() as usize);
                 (self.sms() * resident.max(1), blocks.min(SPLIT_GROUP))
             }
             None => (self.sms(), blocks),
         };
-        let most = m.div_ceil(cfg.bkv) / SPLIT_TILES;
+        let most = p.m.div_ceil(cfg.bkv) / SPLIT_TILES;
         let splits = flight.div_ceil(rows).next_power_of_two().min(prev_power_of_two(most));
         (splits > 1).then_some(splits)
     }
@@ -1280,10 +1273,11 @@ impl NearestCfg {
     /// chunk's, streamed); a trip's candidate fragments and its f32 scores
     /// (streamed, its accumulators) beside the tile the argmin selects the
     /// columns in; the staged chunks where the fill goes through registers.
-    /// Addressing and the row vectors are not counted.
-    pub fn registers(&self, target: &Target, d: usize) -> Option<u32> {
+    /// Addressing and the row vectors are not counted, but for the `k`
+    /// least scores and indices a row's list holds past one.
+    pub fn registers(&self, target: &Target, d: usize, k: usize) -> Option<u32> {
         let [operands, scores] = self.lane_parts(target, d)?;
-        Some(operands + 2 * scores)
+        Some(operands + 2 * scores + self.list_registers(target, d, k)?)
     }
 
     /// The registers [`Nearest::admit`] holds against the lane's budget:
@@ -1293,9 +1287,28 @@ impl NearestCfg {
     /// columns it selects fit beside the scores is the compiler's call,
     /// which the tuner's admission checks: on sm_86 32 rows by 128
     /// candidates hold 236 registers, unspilled, where the estimate says 336.
-    pub fn held(&self, target: &Target, d: usize) -> Option<u32> {
+    /// A list of `k > 1` scores is live across the pipeline, so it counts
+    /// either way.
+    pub fn held(&self, target: &Target, d: usize, k: usize) -> Option<u32> {
         let [operands, scores] = self.lane_parts(target, d)?;
-        Some(operands + if self.bk.is_some() { scores } else { 2 * scores })
+        Some(operands + if self.bk.is_some() { scores } else { 2 * scores } + self.list_registers(target, d, k)?)
+    }
+
+    /// A lane's registers of a list of `k > 1` scores and indices a row: two
+    /// row vectors a slot, each held as the products' row minimum is, under
+    /// the cheaper of the two ways a square core issues them (one register
+    /// every 16 rows on RDNA swapped, two on CUDA's `m16n8k16`); none at
+    /// `k = 1`, whose least and index the scores' count covers.
+    fn list_registers(&self, target: &Target, d: usize, k: usize) -> Option<u32> {
+        if k == 1 {
+            return Some(0);
+        }
+        let atom = target.geometry()?;
+        let grid = WarpGrid { rows: self.warps(), cols: 1 };
+        let row = |o| atom.issue(o, grid, self.bq, self.bkv, self.depth(d)).ok().map(|i| i.c.row_vector().regs());
+        let direct = row(Orient::Direct)?;
+        let held = if atom.swappable() { row(Orient::Swapped).map_or(direct, |s| s.min(direct)) } else { direct };
+        Some(2 * k as u32 * held)
     }
 
     /// A lane's operand registers (the fragments and the staged chunks) and
@@ -1326,6 +1339,17 @@ const NEAREST_PAIR: f64 = 1.0;
 const PAIR_OP: f64 = 0.2;
 /// Model: what groups add to a pair: a compare and a select.
 const GROUPS_PAIR: f64 = 2.0 * PAIR_OP;
+/// Model: a list round's work a pair ([`crate::kernels::nearest::nearest`]
+/// with `k > 1`), in units of [`Costs::score`]: the compare and select
+/// finding its least's column, that column's mask and the next row
+/// minimum, the K=1 argmin's work.
+const ROUND_PAIR: f64 = NEAREST_PAIR;
+/// Model: a round's offer into a row's list, a slot: a compare and four
+/// selects, in units of [`Costs::score`] a pair.
+const OFFER_SLOT: f64 = 5.0 * PAIR_OP;
+/// Search bound: the most scores a row's register list keeps; more take the
+/// graph (a shared-memory selection would serve them).
+pub const REGISTER_K: usize = 32;
 
 /// Search bound: the fewest candidate tiles a share of a split nearest
 /// block walks ([`Planner::nearest_split`]).
@@ -1351,7 +1375,8 @@ const NEAREST_WARPS: usize = 8;
 const NEAREST_DEPTHS: [Option<usize>; 4] = [None, Some(DEPTHS[0]), Some(DEPTHS[1]), Some(DEPTHS[2])];
 
 /// A nearest-candidate problem: `n` query rows against `m` candidates at
-/// depth `d`, scored by `metric` above `floors`, under groups or not.
+/// depth `d`, scored by `metric` above `floors`, under groups or not, each
+/// row keeping its `k` least scores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Nearest {
     pub n: usize,
@@ -1360,6 +1385,7 @@ pub struct Nearest {
     pub metric: Metric,
     pub floors: Floors,
     pub groups: bool,
+    pub k: usize,
 }
 
 impl Nearest {
@@ -1381,9 +1407,16 @@ impl Nearest {
     /// empty at every tile: a memory latency a round of blocks waits
     /// unhidden ([`Costs::latency`]). Its step is at least two matrix-core
     /// depths where the depth allows one, as the GEMM's.
+    ///
+    /// A list of `k > 1` scores a row adds its rounds: each a pair's
+    /// [`ROUND_PAIR`] and a row's [`OFFER_SLOT`] a slot, as many a trip as
+    /// [`Self::rounds`] expects; past [`REGISTER_K`] it is left out.
     pub fn admit(&self, planner: &Planner, cfg: &NearestCfg) -> Result<(f64, u32), Rejected> {
         let Device { target, costs } = &planner.device;
-        let (bq, bkv, d) = (cfg.bq, cfg.bkv, self.d);
+        let (bq, bkv, d, k) = (cfg.bq, cfg.bkv, self.d, self.k);
+        if k > REGISTER_K {
+            return Err(Rejected::TopK { k, most: REGISTER_K });
+        }
         if !cfg.fits(target, d) {
             return Err(Rejected::Lowers);
         }
@@ -1398,9 +1431,9 @@ impl Nearest {
         if smem > target.smem_bytes {
             return Err(Rejected::Smem { need: smem, have: target.smem_bytes });
         }
-        let regs = cfg.registers(target, d).ok_or(Rejected::Layout)?;
+        let regs = cfg.registers(target, d, k).ok_or(Rejected::Layout)?;
         let waves = cfg.warps() as usize;
-        let (held, budget) = (cfg.held(target, d).ok_or(Rejected::Layout)?, target.lane_budget(waves as u32));
+        let (held, budget) = (cfg.held(target, d, k).ok_or(Rejected::Layout)?, target.lane_budget(waves as u32));
         if held > budget {
             return Err(Rejected::Registers { need: held, have: budget });
         }
@@ -1427,7 +1460,11 @@ impl Nearest {
         let shared = 1.0 - distinct as f64 / (flight * filled) as f64;
         let fill = tile as f64 * planner.fill_byte(unique, (blocks * trips * tile) as f64, shared);
         let reads = (read * depth * ELEM) as f64 * costs.smem_byte;
-        let epilogue = (bq * bkv) as f64 * pair * costs.score / chunks as f64;
+        let mut epilogue = (bq * bkv) as f64 * pair * costs.score / chunks as f64;
+        if k > 1 {
+            let round = ((bq * bkv) as f64 * ROUND_PAIR + (bq * k) as f64 * OFFER_SLOT) * costs.score;
+            epilogue += self.rounds(cfg) * round / chunks as f64;
+        }
         let work = steps as f64 * costs.step + epilogue;
         let trip = costs.trip(target.fill, stages, cfg.unroll);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
@@ -1439,6 +1476,24 @@ impl Nearest {
             }
         };
         Ok((planner.pipelined(run) + restarts, regs))
+    }
+
+    /// The rounds a warp of `cfg` runs a trip on average over a block's
+    /// candidate tiles, as a stream in random order offers them: trip `t`
+    /// lowers a row's `k`-th score `λ = k·ln((t+1)/t)` times (every one of
+    /// its scores while the list fills), and its warp runs about the most of
+    /// its rows' counts, `λ` plus the chance one of `warp_rows` rows has one.
+    fn rounds(&self, cfg: &NearestCfg) -> f64 {
+        let (k, tiles) = (self.k as f64, self.m.div_ceil(cfg.bkv));
+        let rows = cfg.warp_rows as f64;
+        let trip = |t: usize| {
+            let lam = match t * cfg.bkv < self.k {
+                true => cfg.bkv.min(self.k) as f64,
+                false => k * ((t + 1) as f64 / t as f64).ln(),
+            };
+            (lam + 1.0 - (-rows * lam).exp()).min(k)
+        };
+        (0..tiles).map(trip).sum::<f64>() / tiles as f64
     }
 
     /// Every config the ranking spans on `target`: every query block of up

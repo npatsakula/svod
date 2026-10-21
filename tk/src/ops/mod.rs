@@ -29,7 +29,7 @@ pub use self::attention::{Attn, Cache, Chunk, KeyMask, attention};
 pub use self::conv::{Conv, conv2d};
 pub use self::heads::{Qkv, heads};
 pub use self::linear::{Linear, linear};
-pub use self::nearest::{Metric, Nearest, nearest};
+pub use self::nearest::{Metric, Nearest, k_nearest, nearest};
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
 use crate::atoms::{Device, Target};
 pub use crate::kernels::Act;
@@ -83,6 +83,8 @@ pub enum Error {
     Dtype { op: &'static str, operand: &'static str, got: DType, want: DType },
     #[snafu(display("{op}: {heads} query heads are not a multiple of {kv_heads} key/value heads"))]
     Heads { op: &'static str, heads: usize, kv_heads: usize },
+    #[snafu(display("{op}: a row keeps no score (k = 0)"))]
+    NoScores { op: &'static str },
     #[snafu(display("{op}: {source}"))]
     Graph {
         op: &'static str,

@@ -1314,16 +1314,24 @@ fn heads_need_three_dims() {
 
 /// The nearest gate: any depth (padded to the core's, rows past what a lane
 /// holds streamed), 16-bit operands of one type, rows and candidates
-/// present, no more candidates than the f32 index holds; each listed config
-/// fits and holds its ring.
-#[test_case(&[1000, 5], &[2000, 5], BF16, Ok(()); "a shallow depth pads")]
-#[test_case(&[1 << 16, 64], &[1 << 16, 64], BF16, Ok(()); "a large self-join")]
-#[test_case(&[37, 130], &[1, 130], DType::Float16, Ok(()); "one candidate")]
-#[test_case(&[1000, 64], &[1000, 64], DType::Float32, Err(Fallback::Dtype); "f32 keeps the graph")]
-#[test_case(&[0, 64], &[10, 64], BF16, Err(Fallback::Shape); "no rows")]
-#[test_case(&[10, 64], &[(1 << 24) + 1, 64], BF16, Err(Fallback::Shape); "past the f32 index")]
-#[test_case(&[1000, 4096], &[1000, 4096], BF16, Ok(()); "rows too deep to hold stream")]
-fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, want: Result<(), Fallback>) {
+/// present, no more candidates than the f32 index holds, a row's least alone
+/// or a list of up to [`REGISTER_K`](config::REGISTER_K) (no list empty);
+/// each listed config fits, holds its ring and its list's registers.
+#[test_case(&[1000, 5], &[2000, 5], BF16, 1, Ok(()); "a shallow depth pads")]
+#[test_case(&[1 << 16, 64], &[1 << 16, 64], BF16, 1, Ok(()); "a large self-join")]
+#[test_case(&[37, 130], &[1, 130], DType::Float16, 1, Ok(()); "one candidate")]
+#[test_case(&[1000, 64], &[1000, 64], DType::Float32, 1, Err(Fallback::Dtype); "f32 keeps the graph")]
+#[test_case(&[0, 64], &[10, 64], BF16, 1, Err(Fallback::Shape); "no rows")]
+#[test_case(&[10, 64], &[(1 << 24) + 1, 64], BF16, 1, Err(Fallback::Shape); "past the f32 index")]
+#[test_case(&[1000, 4096], &[1000, 4096], BF16, 1, Ok(()); "rows too deep to hold stream")]
+#[test_case(&[1 << 16, 64], &[1 << 16, 64], BF16, 2, Ok(()); "a list of two")]
+#[test_case(&[1 << 16, 768], &[1 << 16, 768], DType::Float16, 16, Ok(()); "a list of 16 streamed")]
+#[test_case(&[37, 130], &[5, 130], BF16, 8, Ok(()); "a list longer than the candidates")]
+#[test_case(&[1 << 16, 128], &[1 << 16, 128], BF16, 32, Ok(()); "the longest register list")]
+#[test_case(&[1 << 16, 128], &[1 << 16, 128], BF16, 33, Err(Fallback::Config); "past the register list")]
+#[test_case(&[1000, 64], &[1000, 64], DType::Float32, 8, Err(Fallback::Dtype); "an f32 list keeps the graph")]
+#[test_case(&[1000, 64], &[1000, 64], BF16, 0, Err(Fallback::Shape); "an empty list")]
+fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, k: usize, want: Result<(), Fallback>) {
     use crate::kernels::nearest::{Floors, Metric};
     for target in [sm86(), gfx1201(), crate::test::unit::targets::amd(AmdArch::Gfx942, 304)] {
         let planner = planner(target.clone());
@@ -1335,6 +1343,7 @@ fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, want: Result<(), Fallba
             Metric::L2,
             Floors::default(),
             true,
+            k,
         );
         match plan {
             Plan::Kernel(list) => {
@@ -1343,12 +1352,46 @@ fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, want: Result<(), Fallba
                 assert!(d >= x[1] && d.is_multiple_of(16));
                 for (i, cfg) in list.iter().enumerate() {
                     assert!(cfg.fits(&target, d) && cfg.smem_bytes(d) <= target.smem_bytes, "{cfg:?}");
+                    let held = cfg.held(&target, d, k).unwrap();
+                    assert!(held <= target.lane_budget(cfg.warps()), "{cfg:?} holds {held}");
                     assert!(!list[..i].contains(cfg), "{cfg:?} twice");
                 }
             }
             Plan::Graph(why) => assert_eq!(Err(why), want),
         }
     }
+}
+
+/// A list holds two row vectors a slot beside the scores (one register per
+/// 16 rows a vector where RDNA issues the product swapped, two on CUDA), and
+/// its rounds cost: the cost and registers rise with `k`, from a least alone,
+/// whose registers the scores' count covers; past
+/// [`REGISTER_K`](config::REGISTER_K) a list is left out.
+#[test_case(sm86(), 2; "sm_86")]
+#[test_case(gfx1201(), 1; "gfx1201")]
+#[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40), 1; "gfx1151")]
+fn a_list_costs_its_registers_and_rounds(target: Target, per_16_rows: u32) {
+    use crate::kernels::nearest::{Floors, Metric, NearestCfg};
+    use crate::ops::config::{Nearest, REGISTER_K, Rejected};
+    let planner = planner(target.clone());
+    let cfg = NearestCfg::new(64, 32, 2);
+    let p = |k| Nearest {
+        n: 1 << 16,
+        m: 1 << 16,
+        d: 64,
+        metric: Metric::SquaredL2,
+        floors: Floors::default(),
+        groups: false,
+        k,
+    };
+    let regs = |k| cfg.registers(&target, 64, k).unwrap();
+    for k in [2, 8, 32] {
+        assert_eq!(regs(k) - regs(1), 2 * k as u32 * per_16_rows, "k {k}");
+    }
+    let costs: Vec<f64> = [1, 2, 4, 8, 16].map(|k| p(k).admit(&planner, &cfg).unwrap().0).to_vec();
+    assert!(costs.is_sorted_by(|a, b| a < b), "{costs:?}");
+    let past = REGISTER_K + 1;
+    assert_eq!(p(past).admit(&planner, &cfg), Err(Rejected::TopK { k: past, most: REGISTER_K }));
 }
 
 /// Modern embeddings plan a kernel: past the depth a lane holds (`held`,
@@ -1373,6 +1416,7 @@ fn deep_rows_stream(target: Target, held: usize) {
                 metric,
                 Floors::default(),
                 false,
+                1,
             );
             let Plan::Kernel(list) = plan else { panic!("d{d} {metric:?}: {plan:?}") };
             assert_eq!(list[0].bk.is_some(), d > held, "d{d} {metric:?}: {:?}", list[0]);
@@ -1390,8 +1434,15 @@ fn a_streamed_tile_pays_its_rows_again(target: Target) {
     use crate::ops::config::{Nearest, Rejected};
     let planner = planner(target);
     let (resident, streamed) = (NearestCfg::new(64, 64, 2), NearestCfg::streamed(64, 64, 32, 2));
-    let p =
-        |d| Nearest { n: 1 << 16, m: 1 << 16, d, metric: Metric::SquaredL2, floors: Floors::default(), groups: false };
+    let p = |d| Nearest {
+        n: 1 << 16,
+        m: 1 << 16,
+        d,
+        metric: Metric::SquaredL2,
+        floors: Floors::default(),
+        groups: false,
+        k: 1,
+    };
     let (r, s) = (p(64).admit(&planner, &resident).unwrap().0, p(64).admit(&planner, &streamed).unwrap().0);
     assert!(r < s, "resident {r} against streamed {s}");
     assert!(matches!(p(1024).admit(&planner, &resident), Err(Rejected::Registers { .. } | Rejected::Smem { .. })));
@@ -1411,6 +1462,7 @@ fn a_batched_nearest_takes_the_graph() {
         Metric::SquaredL2,
         Floors::default(),
         false,
+        1,
     );
     assert_eq!(plan, Plan::Graph(Fallback::Symbolic));
 }
@@ -1427,7 +1479,7 @@ fn the_nearest_cost_charges_every_pair(target: Target) {
     let planner = planner(target.clone());
     let cfg = NearestCfg::new(64, 64, 2);
     let cost = |d, metric, floors, groups| {
-        let p = Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors, groups };
+        let p = Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors, groups, k: 1 };
         p.admit(&planner, &cfg).unwrap().0
     };
     let plain = |d| cost(d, Metric::ShiftedL2, Floors::default(), false);

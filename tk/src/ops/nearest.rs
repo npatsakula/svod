@@ -1,6 +1,6 @@
-//! Each query row's cheapest candidate: nearest-neighbour search (k = 1),
-//! k-means assignment, maximum inner product, with optional score floors and
-//! group exclusion.
+//! Each query row's cheapest candidates: nearest-neighbour search, k-means
+//! assignment, maximum inner product, with optional score floors and group
+//! exclusion.
 
 use snafu::{ResultExt, ensure};
 use svod_dtype::DType;
@@ -9,7 +9,7 @@ use svod_tensor::Tensor;
 
 use super::config::Planner;
 use super::shape::{self, extent, shape_of};
-use super::{DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, fmt_shape, output, typed};
+use super::{DtypeSnafu, GraphSnafu, LaunchSnafu, NoScoresSnafu, Result, ShapeSnafu, Tuner, fmt_shape, output, typed};
 pub use crate::kernels::nearest::Metric;
 use crate::kernels::nearest::{
     Floors, MergeSpec, NearestCfg, NearestSpec, nearest as kernel, nearest_merge, share_stride,
@@ -45,14 +45,33 @@ impl Nearest<'_> {
 /// `+∞` at index −1. A self-join passes the same tensor as `x` and `c`.
 pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)> {
     let dtype = x.dtype();
-    picked(x, c, opts, |planner, ranked, spec| tuned(TuneStore::global(), planner, dtype, ranked, spec))
+    picked(x, c, 1, opts, |planner, ranked, spec| tuned(TuneStore::global(), planner, dtype, ranked, spec))
 }
 
-/// [`nearest`] launching the spec `pick` makes of the planned one, given
-/// the planner and the shape gate's ranking.
+/// For every row of `x [N, D]`, its `k` least scores over the candidates
+/// [`nearest`] admits, ascending, and the candidate indices scoring them, an
+/// equal score at the smaller index: `([N, k]` f32 scores, `[N, k]` i32
+/// indices`)`. The slots past a row's admissible candidates score `+∞` at
+/// index −1.
+pub fn k_nearest(x: &Tensor, c: &Tensor, k: usize, opts: Nearest) -> Result<(Tensor, Tensor)> {
+    ensure!(k > 0, NoScoresSnafu { op: OP });
+    let dtype = x.dtype();
+    let (score, index) =
+        picked(x, c, k, opts, |planner, ranked, spec| tuned(TuneStore::global(), planner, dtype, ranked, spec))?;
+    if k > 1 {
+        return Ok((score, index));
+    }
+    let column = |t: Tensor| t.try_unsqueeze(1).context(GraphSnafu { op: OP });
+    Ok((column(score)?, column(index)?))
+}
+
+/// [`k_nearest`] (`[N]` outputs at `k = 1`, as [`nearest`]'s) launching the
+/// spec `pick` makes of the planned one, given the planner and the shape
+/// gate's ranking.
 pub(crate) fn picked(
     x: &Tensor,
     c: &Tensor,
+    k: usize,
     opts: Nearest,
     pick: impl FnOnce(&Planner, &[NearestCfg], NearestSpec) -> NearestSpec,
 ) -> Result<(Tensor, Tensor)> {
@@ -76,8 +95,11 @@ pub(crate) fn picked(
     let planner = super::planner(&x.device());
     let (metric, floors, groups) = (opts.metric, opts.floors(), opts.groups.is_some());
     let dtypes = [x.dtype(), c.dtype()];
-    let plan = shape::nearest(planner.as_deref(), &dtypes, x_ext.as_ref(), c_ext.as_ref(), metric, floors, groups);
-    let Some(cfgs) = super::kernel(OP, plan) else { return graph(x, c, opts).context(GraphSnafu { op: OP }) };
+    let plan = shape::nearest(planner.as_deref(), &dtypes, x_ext.as_ref(), c_ext.as_ref(), metric, floors, groups, k);
+    let Some(cfgs) = super::kernel(OP, plan) else {
+        let graph = if k == 1 { graph(x, c, opts) } else { graph_k(x, c, k, opts) };
+        return graph.context(GraphSnafu { op: OP });
+    };
     let planner = planner.expect("planned");
     let ([n, d], m) = (x_ext.expect("planned").dims[..].try_into().expect("rank 2"), c_ext.expect("planned").dims[0]);
     let depth = planner.nearest_depth(d).expect("planned");
@@ -90,12 +112,17 @@ pub(crate) fn picked(
     let f32 = |t: &Tensor| t.cast(DType::Float32);
     let (row_floor, col_floor) = (opts.row_floor.map(f32), opts.col_floor.map(f32));
     let (row_group, col_group) = opts.groups.map(|(r, c)| (r.cast(DType::Int32), c.cast(DType::Int32))).unzip();
-    let spec = NearestSpec { n, m, d: depth, metric, floors, groups, cfg: cfgs[0] };
+    let spec = NearestSpec { n, m, d: depth, metric, floors, groups, k, cfg: cfgs[0] };
     let spec = pick(&planner, &cfgs, spec);
     let splits = spec.cfg.splits;
-    let parts = if splits == 1 { n } else { splits * share_stride(n) };
-    let score_t = output(&[parts], &None, DType::Float32).context(graph_err)?;
-    let index_t = output(&[parts], &None, DType::Int32).context(graph_err)?;
+    // Whole, a row's `k` scores; split, every share's runs of `n` rows.
+    let rows: &[usize] = match (splits, k) {
+        (1, 1) => &[n],
+        (1, _) => &[n, k],
+        _ => &[k * splits * share_stride(n)],
+    };
+    let score_t = output(rows, &None, DType::Float32).context(graph_err)?;
+    let index_t = output(rows, &None, DType::Int32).context(graph_err)?;
     let ins: Vec<&Tensor> = [Some(&xp), Some(&cp), c_sq.as_ref(), x_sq.as_ref()]
         .into_iter()
         .chain([row_floor.as_ref(), col_floor.as_ref(), row_group.as_ref(), col_group.as_ref()])
@@ -109,9 +136,10 @@ pub(crate) fn picked(
     if splits == 1 {
         return Ok((score, index));
     }
-    let merge = MergeSpec { n, splits, metric };
-    let score_t = output(&[n], &None, DType::Float32).context(graph_err)?;
-    let index_t = output(&[n], &None, DType::Int32).context(graph_err)?;
+    let merge = MergeSpec { n, splits, metric, k };
+    let rows: &[usize] = if k == 1 { &[n] } else { &[n, k] };
+    let score_t = output(rows, &None, DType::Float32).context(graph_err)?;
+    let index_t = output(rows, &None, DType::Int32).context(graph_err)?;
     let mut outs = launch::graph_launch_all(
         nearest_merge(&merge),
         &merge.lowering(&planner.device),
@@ -131,11 +159,14 @@ pub fn tuned(
     ranked: &[NearestCfg],
     spec: NearestSpec,
 ) -> NearestSpec {
-    let shape = [spec.n, spec.m, spec.d];
+    // A row's least alone keys as it did before the lists existed.
+    let shape = [spec.n, spec.m, spec.d, spec.k];
+    let shape = if spec.k == 1 { &shape[..3] } else { &shape[..] };
     let salt = (spec.metric, spec.floors, spec.groups);
     let build = |cfg: NearestCfg| programs(planner, dtype.clone(), &NearestSpec { cfg, ..spec.clone() });
-    let expand = |admitted: &[NearestCfg]| planner.nearest_splits(spec.n, spec.m, spec.d, admitted);
-    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build).tuned(OP, ranked, expand);
+    let p = problem(&spec);
+    let expand = |admitted: &[NearestCfg]| planner.nearest_splits(&p, admitted);
+    let cfg = Tuner::new(store, &planner.device, dtype.clone(), shape, salt, build).tuned(OP, ranked, expand);
     NearestSpec { cfg, ..spec }
 }
 
@@ -144,10 +175,16 @@ pub fn tuned(
 pub(crate) fn programs(planner: &Planner, dtype: DType, spec: &NearestSpec) -> crate::tune::Candidate {
     let mut programs = vec![(typed!(dtype, kernel, spec), spec.cfg.lowering(&planner.device))];
     if spec.cfg.splits > 1 {
-        let merge = MergeSpec { n: spec.n, splits: spec.cfg.splits, metric: spec.metric };
+        let merge = MergeSpec { n: spec.n, splits: spec.cfg.splits, metric: spec.metric, k: spec.k };
         programs.push((nearest_merge(&merge), merge.lowering(&planner.device)));
     }
     programs
+}
+
+/// The planner's problem of `spec`.
+pub(crate) fn problem(spec: &NearestSpec) -> crate::ops::config::Nearest {
+    let NearestSpec { n, m, d, metric, floors, groups, k, .. } = *spec;
+    crate::ops::config::Nearest { n, m, d, metric, floors, groups, k }
 }
 
 /// The scores of every pair in f32 (L2 compared squared against its floors
@@ -155,6 +192,46 @@ pub(crate) fn programs(planner: &Planner, dtype: DType, spec: &NearestSpec) -> c
 /// as the kernel orders them), each row's least and its first index, −1
 /// where it is `+∞`.
 pub(crate) fn graph(x: &Tensor, c: &Tensor, opts: Nearest) -> svod_tensor::error::Result<(Tensor, Tensor)> {
+    let s = scored(x, c, opts)?;
+    let best = s.min(1isize)?;
+    let none = best.try_eq(f32::INFINITY)?;
+    let index = Tensor::const_(-1i32, DType::Int32).where_(&none, &s.argmin(1)?)?;
+    let best = if opts.metric == Metric::L2 { best.try_sqrt()? } else { best };
+    Ok((best, index))
+}
+
+/// [`graph`]'s `k` least scores a row and their indices, `[N, k]`: the
+/// least, then the least of the rest once each one found is masked out.
+pub(crate) fn graph_k(x: &Tensor, c: &Tensor, k: usize, opts: Nearest) -> svod_tensor::error::Result<(Tensor, Tensor)> {
+    // Held once: every slot reads the scores again.
+    let mut s = scored(x, c, opts)?.contiguous();
+    let m = c.shape()?[0]
+        .as_const()
+        .ok_or(svod_tensor::error::ErrorKind::SymbolicShapeUnsupported { operation: "nearest's candidates".into() })?;
+    let cols = Tensor::arange(0, Some(m as i64), None)?.cast(DType::Int32).try_unsqueeze(0)?;
+    let (mut scores, mut indices) = (vec![], vec![]);
+    for slot in 0..k {
+        // Held apart from the argmin's reduction over the same axis: fused,
+        // a ragged axis (5 candidates) renders an INDEX the LLVM renderer
+        // refuses.
+        let best = s.min(1isize)?.contiguous();
+        let none = best.try_eq(f32::INFINITY)?;
+        let index = Tensor::const_(-1i32, DType::Int32).where_(&none, &s.argmin(1)?)?;
+        if slot + 1 < k {
+            let found = cols.try_eq(&index.try_unsqueeze(1)?)?;
+            s = Tensor::const_(f32::INFINITY, DType::Float32).where_(&found, &s)?.contiguous();
+        }
+        scores.push(best);
+        indices.push(index);
+    }
+    let stack = |v: Vec<Tensor>| Tensor::stack(&v.iter().collect::<Vec<_>>(), 1);
+    let best = stack(scores)?;
+    let best = if opts.metric == Metric::L2 { best.try_sqrt()? } else { best };
+    Ok((best, stack(indices)?))
+}
+
+/// Every pair's score in f32, `+∞` where its groups match.
+fn scored(x: &Tensor, c: &Tensor, opts: Nearest) -> svod_tensor::error::Result<Tensor> {
     let f32 = |t: &Tensor| t.cast(DType::Float32);
     let (x, c) = (f32(x), f32(c));
     let dot = x.matmul(&c.try_transpose(0, 1)?)?;
@@ -186,9 +263,5 @@ pub(crate) fn graph(x: &Tensor, c: &Tensor, opts: Nearest) -> svod_tensor::error
         let same = i32(row_group, 1)?.try_eq(&i32(col_group, 0)?)?;
         s = Tensor::const_(f32::INFINITY, DType::Float32).where_(&same, &s)?;
     }
-    let best = s.min(1isize)?;
-    let none = best.try_eq(f32::INFINITY)?;
-    let index = Tensor::const_(-1i32, DType::Int32).where_(&none, &s.argmin(1)?)?;
-    let best = if metric == Metric::L2 { best.try_sqrt()? } else { best };
-    Ok((best, index))
+    Ok(s)
 }

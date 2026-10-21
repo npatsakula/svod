@@ -17,7 +17,7 @@
 //! `--stride S`, `--pad P`, `--dilation D`, `--bias`, `--residual`, `--act`),
 //! `heads BxTxHxKVxD` (`--qk-norm`, `--rope`), `nearest NxMxD` (`--metric
 //! squared-l2|shifted-l2|l2|neg-dot`, `--row-floor`, `--col-floor`,
-//! `--groups`). Each goes through the op layer's own shape gate
+//! `--groups`, `--k K` least scores a row). Each goes through the op layer's own shape gate
 //! (`ops::shape`) and tuning (`ops::tuned`).
 //!
 //! `--compare FILE [--fun NAME]` sets the main loop of a reference kernel
@@ -266,14 +266,16 @@ fn main() -> Result<()> {
                 other => return Err(format!("--metric {other}: squared-l2, shifted-l2, l2 or neg-dot").into()),
             };
             let (floors, groups) = (Floors { row: flag("--row-floor"), col: flag("--col-floor") }, flag("--groups"));
+            let k = num("--k")?.unwrap_or(1);
             let operands = [dtype.clone(), dtype.clone()];
             let (x, c) = (extent(&[n, d]), extent(&[m, d]));
-            let ranked = kernel(shape::nearest(Some(&planner), &operands, Some(&x), Some(&c), metric, floors, groups))
-                .map_err(gate("nearest"))?;
+            let ranked =
+                kernel(shape::nearest(Some(&planner), &operands, Some(&x), Some(&c), metric, floors, groups, k))
+                    .map_err(gate("nearest"))?;
             let d = planner.nearest_depth(d).ok_or("no matrix core")?;
-            let p = Nearest { n, m, d, metric, floors, groups };
+            let p = Nearest { n, m, d, metric, floors, groups, k };
             report(&mut plan, top, &ranked, &p.lattice(&target), |c| p.admit(&planner, c));
-            let spec = NearestSpec { n, m, d, metric, floors, groups, cfg: ranked[0] };
+            let spec = NearestSpec { n, m, d, metric, floors, groups, k, cfg: ranked[0] };
             let spec = match pick {
                 Pick::Ranked(i) => NearestSpec { cfg: *ranked.get(i).ok_or("no such ranked config")?, ..spec },
                 Pick::Tuned => replayed(&store()?, "nearest", |s| {

@@ -26,7 +26,7 @@ use crate::kernels::nearest::{Floors, MergeSpec, Metric, NearestCfg, NearestSpec
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::lower::{Lowering, lower};
-use crate::ops::config::{self, Planner};
+use crate::ops::config::{self, Nearest, Planner};
 
 /// Costs a test declares where it needs a ranking or an orientation: the
 /// guessed sm_86-class fixture, the warpgroup step free.
@@ -159,26 +159,36 @@ pub fn families(target: &Target) -> Vec<Launch> {
         push(&format!("heads d{d}"), heads::<BF16>(&spec), cfg.lowering(&planner.device));
     }
 
-    // The tiles planned for a large self-join, over a ragged small one.
+    // The tiles planned for a large self-join, over a ragged small one; a
+    // row's least alone, and lists of its least scores.
     let both = Floors { row: true, col: true };
-    for (name, d, metric, floors, groups) in [
-        ("nearest squared l2", 64, Metric::SquaredL2, Floors::default(), false),
-        ("nearest l2 floors", 16, Metric::L2, both, false),
-        ("nearest groups", 32, Metric::ShiftedL2, Floors::default(), true),
-        ("nearest neg dot col floor", 64, Metric::NegDot, Floors { row: false, col: true }, false),
-        ("nearest streamed neg dot", 800, Metric::NegDot, Floors::default(), false),
-        ("nearest streamed l2 floors groups", 512, Metric::L2, both, true),
+    for (name, d, metric, floors, groups, k) in [
+        ("nearest squared l2", 64, Metric::SquaredL2, Floors::default(), false, 1),
+        ("nearest l2 floors", 16, Metric::L2, both, false, 1),
+        ("nearest groups", 32, Metric::ShiftedL2, Floors::default(), true, 1),
+        ("nearest neg dot col floor", 64, Metric::NegDot, Floors { row: false, col: true }, false, 1),
+        ("nearest streamed neg dot", 800, Metric::NegDot, Floors::default(), false, 1),
+        ("nearest streamed l2 floors groups", 512, Metric::L2, both, true, 1),
+        ("nearest 4 squared l2", 64, Metric::SquaredL2, Floors::default(), false, 4),
+        ("nearest 16 l2 floors groups", 32, Metric::L2, both, true, 16),
+        ("nearest 8 streamed neg dot", 768, Metric::NegDot, Floors::default(), false, 8),
+        ("nearest 32 streamed shifted l2 groups", 512, Metric::ShiftedL2, Floors::default(), true, 32),
     ] {
-        let Some(&cfg) = planner.nearest_ranked(1 << 16, 1 << 16, d, metric, floors, groups).first() else { continue };
-        let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, cfg };
+        let p = Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors, groups, k };
+        let Some(&cfg) = planner.nearest_ranked(p).first() else { continue };
+        let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg };
         push(name, nearest::<BF16>(&spec), cfg.lowering(&planner.device));
     }
-    // Split over the candidates (shares of one tile and of two), and a merge of shares.
-    let cfg = NearestCfg { splits: 2, ..NearestCfg::streamed(32, 32, 32, 2) };
-    let spec = NearestSpec { n: 100, m: 90, d: 64, metric: Metric::L2, floors: Floors::default(), groups: true, cfg };
-    push("nearest split", nearest::<BF16>(&spec), cfg.lowering(&planner.device));
-    let merge = MergeSpec { n: 300, splits: 3, metric: Metric::L2 };
-    push("nearest merge", nearest_merge(&merge), merge.lowering(&planner.device));
+    // Split over the candidates (shares of one tile and of two), and a merge
+    // of shares, of a least alone and of lists.
+    for (k, name) in [(1, ""), (8, " 8")] {
+        let cfg = NearestCfg { splits: 2, ..NearestCfg::streamed(32, 32, 32, 2) };
+        let spec =
+            NearestSpec { n: 100, m: 90, d: 64, metric: Metric::L2, floors: Floors::default(), groups: true, k, cfg };
+        push(&format!("nearest{name} split"), nearest::<BF16>(&spec), cfg.lowering(&planner.device));
+        let merge = MergeSpec { n: 300, splits: 3, metric: Metric::L2, k };
+        push(&format!("nearest{name} merge"), nearest_merge(&merge), merge.lowering(&planner.device));
+    }
 
     let silu_bias = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
     for (name, g, images) in [
@@ -516,13 +526,22 @@ pub fn rankings(target: &Target) -> String {
         s += &format!("conv {g:?}: {:?}\n", &*ranked);
         s += &format!("splits: {:?}\n", planner.conv_splits(1, ho * wo, &g, &ranked[..ranked.len().min(8)]));
     }
+    let self_join =
+        |d, metric, k| Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors: Floors::default(), groups: false, k };
     for d in [16, 64, 256, 512, 1024] {
         for metric in [Metric::SquaredL2, Metric::NegDot] {
-            let ranked = planner.nearest_ranked(1 << 16, 1 << 16, d, metric, Floors::default(), false);
+            let p = self_join(d, metric, 1);
+            let ranked = planner.nearest_ranked(p);
             s += &format!("nearest d{d} {metric:?}: {:?}\n", &*ranked);
-            let split = planner.nearest_splits(1 << 16, 1 << 16, d, &first_eight(&ranked));
+            let split = planner.nearest_splits(&p, &first_eight(&ranked));
             s += &format!("splits: {split:?}\n");
         }
+    }
+    for (d, k) in [(128, 4), (256, 16), (768, 8), (768, 32)] {
+        let p = self_join(d, Metric::SquaredL2, k);
+        let ranked = planner.nearest_ranked(p);
+        s += &format!("nearest d{d} k{k}: {:?}\n", &*ranked);
+        s += &format!("splits: {:?}\n", planner.nearest_splits(&p, &first_eight(&ranked)));
     }
     s
 }

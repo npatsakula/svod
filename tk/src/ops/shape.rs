@@ -223,7 +223,9 @@ pub fn norm(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>) -> 
 /// `x [n, d]` against the candidates `c [m, d]`, each row's cheapest by
 /// `metric` above `floors` (under `groups`); `dtypes` are those of `x` and `c`. Any depth runs,
 /// padded with zeros to the matrix core's ([`Planner::nearest_depth`]); a
-/// bound batch is not, nor are more candidates than the f32 index holds.
+/// bound batch is not, nor are more candidates than the f32 index holds;
+/// each row keeps its `k` least, past what a register list holds by the graph.
+#[allow(clippy::too_many_arguments)]
 pub fn nearest(
     planner: Option<&Planner>,
     dtypes: &[DType],
@@ -232,6 +234,7 @@ pub fn nearest(
     metric: Metric,
     floors: Floors,
     groups: bool,
+    k: usize,
 ) -> Plan<NearestCfg> {
     plan(|| {
         let planner = gate(planner, dtypes)?;
@@ -240,11 +243,11 @@ pub fn nearest(
             return Err(Fallback::Symbolic);
         }
         let ([n, d], [m, _]) = (dims2(x)?, dims2(c)?);
-        if n * m * d == 0 || m > MAX_CANDIDATES {
+        if n * m * d * k == 0 || m > MAX_CANDIDATES {
             return Err(Fallback::Shape);
         }
         let d = planner.nearest_depth(d).ok_or(Fallback::Target)?;
-        candidates(planner.nearest_ranked(n, m, d, metric, floors, groups), Fallback::Config)
+        candidates(planner.nearest_ranked(config::Nearest { n, m, d, metric, floors, groups, k }), Fallback::Config)
     })
 }
 

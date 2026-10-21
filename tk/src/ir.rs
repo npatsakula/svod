@@ -132,7 +132,8 @@ pub enum Scalar {
     /// the warp evaluating it holds: one for the whole block in the
     /// interpreter, whose block is one thread. Only a branch reads it, and
     /// only one whose results agree with the other branch's wherever the
-    /// tile is clear ([`crate::build::Kernel::where_any`]), so how the
+    /// tile is clear ([`crate::build::Kernel::where_any`] selects so,
+    /// [`crate::build::Kernel::if_any`] leaves it to its author), so how the
     /// lowering spreads the tile over warps cannot change them.
     Any(ValId),
 }

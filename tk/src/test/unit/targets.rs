@@ -26,7 +26,7 @@ use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch_all;
 use crate::lower::sync::insert_barriers;
 use crate::lower::{Lowering, lower};
-use crate::ops::config;
+use crate::ops::config::{self, Nearest};
 use crate::schedule::Schedule;
 
 use super::{conv_first_eight, declared, first_eight, planner};
@@ -624,7 +624,7 @@ fn register_staged_families_match_on_cuda() {
 /// both query regimes, the convolution lists of every YOLO class, and the
 /// nearest lists of a shallow, a middle and a deep self-join under several
 /// metrics, floors and groups, and of the depths that stream the rows (a
-/// last chunk overhanging 800).
+/// last chunk overhanging 800), a row's least alone and lists of 4 to 32.
 #[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
 #[test_case(amd(AmdArch::Gfx1151, 40), false; "gfx1151")]
 #[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
@@ -675,17 +675,22 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
         }
     }
     let (none, both) = (Floors::default(), Floors { row: true, col: true });
-    for (d, metric, floors, groups) in [
-        (16, Metric::ShiftedL2, none, false),
-        (64, Metric::L2, both, true),
-        (128, Metric::SquaredL2, none, true),
-        (512, Metric::NegDot, none, false),
-        (800, Metric::SquaredL2, both, true),
-        (1024, Metric::ShiftedL2, none, false),
+    for (d, metric, floors, groups, k) in [
+        (16, Metric::ShiftedL2, none, false, 1),
+        (64, Metric::L2, both, true, 1),
+        (128, Metric::SquaredL2, none, true, 1),
+        (512, Metric::NegDot, none, false, 1),
+        (800, Metric::SquaredL2, both, true, 1),
+        (1024, Metric::ShiftedL2, none, false, 1),
+        (64, Metric::SquaredL2, none, false, 4),
+        (128, Metric::NegDot, none, true, 16),
+        (768, Metric::SquaredL2, none, false, 8),
+        (768, Metric::NegDot, none, false, 32),
     ] {
-        for cfg in first_eight(&planner.nearest_ranked(1 << 16, 1 << 16, d, metric, floors, groups)) {
-            let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, cfg };
-            let name = format!("nearest d{d} {metric:?} {floors:?} {groups} {cfg:?}");
+        let p = Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors, groups, k };
+        for cfg in first_eight(&planner.nearest_ranked(p)) {
+            let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg };
+            let name = format!("nearest d{d} {metric:?} {floors:?} {groups} k{k} {cfg:?}");
             launches.push((name, nearest::<BF16>(&spec), cfg.lowering(&planner.device)));
         }
     }
@@ -1046,6 +1051,7 @@ fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
         metric: Metric::NegDot,
         floors: Floors::default(),
         groups: false,
+        k: 1,
         cfg,
     };
     let ir = render(nearest::<BF16>(&spec), &cfg.lowering(&device));

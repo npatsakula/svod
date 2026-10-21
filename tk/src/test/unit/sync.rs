@@ -408,9 +408,14 @@ fn a_consume_body_fences_its_own_tiles() {
 }); "attention with every mask, a cache and splits")]
 #[test_case(crate::kernels::nearest::nearest::<BF16>(&crate::kernels::nearest::NearestSpec {
     n: 100, m: 150, d: 32, metric: crate::kernels::nearest::Metric::L2,
-    floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true,
+    floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true, k: 1,
     cfg: crate::kernels::nearest::NearestCfg::new(32, 32, 3),
 }); "nearest with floors and groups")]
+#[test_case(crate::kernels::nearest::nearest::<BF16>(&crate::kernels::nearest::NearestSpec {
+    n: 100, m: 150, d: 32, metric: crate::kernels::nearest::Metric::L2,
+    floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true, k: 8,
+    cfg: crate::kernels::nearest::NearestCfg::new(32, 32, 3),
+}); "nearest lists with floors and groups")]
 fn shipped_kernels_need_no_barriers(prog: Program) {
     let mut fenced = prog.clone();
     insert_barriers(&mut fenced).unwrap();
@@ -492,7 +497,8 @@ fn a_block_barrier_under_a_vote_is_refused(shared: bool) -> Result<(), String> {
 fn a_ring_restarted_in_a_loop_is_fenced_at_its_head() {
     use crate::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec, nearest};
     let cfg = NearestCfg::streamed(32, 32, 32, 3);
-    let spec = NearestSpec { n: 100, m: 150, d: 80, metric: Metric::L2, floors: Floors::default(), groups: true, cfg };
+    let spec =
+        NearestSpec { n: 100, m: 150, d: 80, metric: Metric::L2, floors: Floors::default(), groups: true, k: 1, cfg };
     let prog = nearest::<BF16>(&spec);
     let mut fenced = prog.clone();
     insert_barriers(&mut fenced).unwrap();
