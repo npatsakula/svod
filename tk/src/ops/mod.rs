@@ -215,7 +215,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     }
 
     /// The configs of `ranked` (best guess first) the tuner chooses among
-    /// ([`config::shortlist`]), compiled in ranked batches on a store miss
+    /// ([`config::shortlist`]), compiled in parallel on a store miss
     /// and kept in the store under the shortlist's programs; with tuning
     /// off, the [`Self::first_clean`] alone.
     pub(crate) fn admitted(&mut self, op: &'static str, ranked: &[C]) -> Vec<C> {

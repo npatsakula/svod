@@ -464,8 +464,8 @@ pub(crate) fn spread<C: Tiled, K: Eq + Hash>(ranked: Vec<(f64, C)>, class: impl 
     out
 }
 
-/// Search bound: the tiles the tune store measures per shape, compiled in
-/// parallel batches of as many: most of the lattice, since timing a tile costs
+/// Search bound: the tiles the tune store measures per shape, their
+/// pipelines compiled in parallel ([`Search`]): most of the lattice, since timing a tile costs
 /// about 20 ms once the device's clock is up and the ranking cannot be
 /// trusted to put the best within a few (see the module docs).
 pub(crate) const SHORTLIST: usize = 64;
@@ -593,12 +593,87 @@ pub(crate) fn distinct_configs<C: Tiled>(list: &[C]) -> Vec<C> {
 /// so a spilling unrolled ring yields to its rolled twin), in ranked order;
 /// where every config that compiled spills, the first [`SHORTLIST`] of
 /// those (the time judges, and a spilling kernel still beats the graph's).
-/// `compile` is asked about batches of [`SHORTLIST`] in that order (the
-/// tuner compiles a batch in parallel) until enough tiles are clean or the
-/// list ends. `None` when nothing compiled: no device to judge on.
-pub(crate) fn shortlist<C: Tiled>(ranked: &[C], compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<Vec<usize>> {
-    let mut tiles = HashSet::new();
-    judged(ranked, SHORTLIST, SHORTLIST, compile, |c| tiles.insert(c.tile()))
+/// `compile` is asked about what the [`Search`] wants, all of it at once
+/// (the tuner compiles in parallel), until it wants nothing more. `None`
+/// when nothing compiled: no device to judge on.
+pub(crate) fn shortlist<C: Tiled>(ranked: &[C], mut compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<Vec<usize>> {
+    let mut search = Search::new(ranked, SHORTLIST);
+    loop {
+        let wave: Vec<usize> = std::iter::from_fn(|| search.next()).collect();
+        if wave.is_empty() {
+            return search.judged();
+        }
+        let configs: Vec<C> = wave.iter().map(|&at| ranked[at]).collect();
+        for (at, verdict) in wave.into_iter().zip(compile(&configs)) {
+            search.record(at, verdict);
+        }
+    }
+}
+
+/// The shortlist's search of a ranked list: it compiles what a walk in
+/// ranked order compiling one config at a time compiles, so the verdicts
+/// alone decide, never the order they come back in. That walk stops at the
+/// `limit`th tile found clean and skips a config once a pipeline of its
+/// tile ahead of it is clean; here a config is wanted ([`Self::next`]) once
+/// every pipeline of its tile ahead of it is judged unclean and fewer than
+/// `limit` tiles ahead of it are clean or have a compile in flight.
+pub(crate) struct Search {
+    /// Each config's tile, numbered in order of first appearance.
+    tiles: Vec<usize>,
+    limit: usize,
+    verdicts: Vec<Option<Compiled>>,
+    asked: Vec<bool>,
+}
+
+impl Search {
+    pub(crate) fn new<C: Tiled>(ranked: &[C], limit: usize) -> Self {
+        let mut ids = HashMap::new();
+        let tiles = ranked
+            .iter()
+            .map(|c| {
+                let next = ids.len();
+                *ids.entry(c.tile()).or_insert(next)
+            })
+            .collect();
+        Self { tiles, limit, verdicts: vec![None; ranked.len()], asked: vec![false; ranked.len()] }
+    }
+
+    /// The next config wanted, marked asked; `None` while the rest wait on
+    /// verdicts in flight, and once nothing more is wanted.
+    pub(crate) fn next(&mut self) -> Option<usize> {
+        let (mut clean, mut open) = (HashSet::new(), HashSet::new());
+        for (at, &tile) in self.tiles.iter().enumerate() {
+            if clean.len() + open.len() >= self.limit {
+                return None;
+            }
+            if clean.contains(&tile) || open.contains(&tile) {
+                continue;
+            }
+            match self.verdicts[at] {
+                Some(Compiled::Clean) => _ = clean.insert(tile),
+                Some(_) => {}
+                None if self.asked[at] => _ = open.insert(tile),
+                None => {
+                    self.asked[at] = true;
+                    return Some(at);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn record(&mut self, at: usize, verdict: Compiled) {
+        self.verdicts[at] = Some(verdict);
+    }
+
+    /// The shortlist the verdicts make ([`shortlist`]).
+    pub(crate) fn judged(&self) -> Option<Vec<usize>> {
+        let mut tiles = HashSet::new();
+        let at = |want| self.verdicts.iter().enumerate().filter(move |(_, v)| **v == Some(want)).map(|(i, _)| i);
+        let clean: Vec<usize> = at(Compiled::Clean).filter(|&i| tiles.insert(self.tiles[i])).collect();
+        let out: Vec<usize> = if clean.is_empty() { at(Compiled::Spilled).collect() } else { clean };
+        (!out.is_empty()).then(|| out.into_iter().take(self.limit).collect())
+    }
 }
 
 /// The indices of every config of `list` that compiles, spilling or not,
@@ -624,40 +699,18 @@ pub(crate) const FIRST: usize = 8;
 /// not spill, judged as [`shortlist`] judges (every one spilling: the first
 /// that compiles; nothing compiling: `None`), `compile` asked about batches
 /// of [`FIRST`] in ranked order until one passes.
-pub(crate) fn first_clean<C: Tiled>(ranked: &[C], compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<usize> {
-    judged(ranked, 1, FIRST, compile, |_| true).map(|at| at[0])
-}
-
-fn judged<C: Tiled>(
-    ranked: &[C],
-    limit: usize,
-    batch: usize,
-    mut compile: impl FnMut(&[C]) -> Vec<Compiled>,
-    mut keep: impl FnMut(&C) -> bool,
-) -> Option<Vec<usize>> {
-    let (mut clean, mut spilled) = (vec![], vec![]);
-    for (n, chunk) in ranked.chunks(batch).enumerate() {
+pub(crate) fn first_clean<C: Tiled>(ranked: &[C], mut compile: impl FnMut(&[C]) -> Vec<Compiled>) -> Option<usize> {
+    let mut spilled = None;
+    for (n, chunk) in ranked.chunks(FIRST).enumerate() {
         for (i, compiled) in compile(chunk).into_iter().enumerate() {
-            let at = n * batch + i;
             match compiled {
-                Compiled::Clean if keep(&chunk[i]) => clean.push(at),
-                Compiled::Clean | Compiled::Failed => {}
-                Compiled::Spilled => spilled.push(at),
+                Compiled::Clean => return Some(n * FIRST + i),
+                Compiled::Spilled => _ = spilled.get_or_insert(n * FIRST + i),
+                Compiled::Failed => {}
             }
         }
-        if clean.len() >= limit {
-            break;
-        }
     }
-    let mut out = if !clean.is_empty() {
-        clean
-    } else if !spilled.is_empty() {
-        spilled
-    } else {
-        return None;
-    };
-    out.truncate(limit);
-    Some(out)
+    spilled
 }
 
 /// What the op layer plans with on one device: its target, what its

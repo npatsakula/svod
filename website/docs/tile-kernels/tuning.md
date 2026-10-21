@@ -7,11 +7,13 @@ sidebar_label: Tuning
 Each op ranks its configs per shape in `ops::config` from the device's measured costs (see
 [Device costs](#device-costs)), dropping the configs priced past 2.5× the cheapest once 16 tiles are
 kept (`config::PRUNED_PAST`): on sm_86 none of them ran within the contender band. The ranking is a model, and so is a register count, so neither
-admits a config. One rule does: the tuner compiles the ranked configs in batches of 64
-(`config::SHORTLIST`), in ranked order and in parallel, until it has the first 64 tiles whose
-compiled kernels do not spill (a kernel reporting scratch bytes spilled; a backend that reports
-nothing admits). A tile is admitted at its first clean pipeline (ring depth, unrolling), so an
-unrolled ring that spills yields to its rolled twin. When every config that compiles spills,
+admits a config. One rule does: the tuner compiles the ranked configs in parallel until it has
+the first 64 tiles in ranked order (`config::SHORTLIST`) whose compiled kernels do not spill (a
+kernel reporting scratch bytes spilled; a backend that reports nothing admits). A tile is
+admitted at its first clean pipeline (ring depth, unrolling), so an unrolled ring that spills
+yields to its rolled twin. A pipeline is compiled only when the tile's pipelines ranked ahead of
+it spilled or failed, and none past the 64th clean tile: what a walk in ranked order compiling
+one config at a time would compile (`config::Search`). When every config that compiles spills,
 the first 64 of those are timed anyway: no op falls to the graph because of spills.
 
 The admitted configs, with their variants (key splits for attention, reduction splits for a

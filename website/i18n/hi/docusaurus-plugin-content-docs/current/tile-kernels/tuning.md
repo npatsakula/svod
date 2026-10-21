@@ -7,11 +7,13 @@ sidebar_label: Tuning
 हर op `ops::config` में अपने configs को हर shape के लिए device की मापी गई costs से rank करता है (देखें
 [Device costs](#device-costs)), और 16 tiles रख लेने के बाद सबसे सस्ते के 2.5× से महँगे configs छोड़ देता है
 (`config::PRUNED_PAST`): sm_86 पर उनमें से कोई contender band में नहीं चला। Ranking एक model है, और register count भी, इसलिए दोनों में से कोई
-config को admit नहीं करता। एक नियम करता है: tuner ranked configs को 64 के batches (`config::SHORTLIST`)
-में, ranked क्रम में और समानांतर रूप से compile करता है, जब तक उसे वे पहले 64 tiles न मिल जाएँ जिनके
-compiled kernels spill नहीं करते (spilled scratch bytes बताने वाला कर्नेल spill करता है; जो backend कुछ
-नहीं बताता वह admit करता है)। एक tile अपनी पहली clean pipeline (ring depth, unrolling) पर admit होता
-है, इसलिए spill करने वाली unrolled ring अपने rolled जुड़वाँ के लिए जगह छोड़ देती है। जब compile होने
+config को admit नहीं करता। एक नियम करता है: tuner ranked configs को समानांतर रूप से compile करता है, जब
+तक उसे ranked क्रम में वे पहले 64 tiles (`config::SHORTLIST`) न मिल जाएँ जिनके compiled kernels spill
+नहीं करते (spilled scratch bytes बताने वाला कर्नेल spill करता है; जो backend कुछ नहीं बताता वह admit
+करता है)। एक tile अपनी पहली clean pipeline (ring depth, unrolling) पर admit होता है, इसलिए spill करने
+वाली unrolled ring अपने rolled जुड़वाँ के लिए जगह छोड़ देती है। कोई pipeline तभी compile होती है जब
+उसके tile की उससे ऊपर ranked pipelines spill या fail हुईं, और 64वें clean tile के बाद कोई नहीं: ठीक
+वही जो ranked क्रम में एक-एक config compile करने वाला walk compile करता (`config::Search`)। जब compile होने
 वाला हर config spill करे, तब भी उनमें से पहले 64 मापे जाते हैं: spills की वजह से कोई op ग्राफ़ पर नहीं
 गिरता।
 

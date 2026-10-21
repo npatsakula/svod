@@ -22,6 +22,7 @@ use crate::ops::attention::{descend, split_ranked};
 use crate::ops::config::{self, Planner, Run, SHORTLIST, Tiled, gemm_cfg};
 use crate::ops::shape::{self, Extent, Fallback, Plan, extent};
 use crate::ops::{self as tk, Act, Attn, Cache, Error, KeyMask, Linear, Qkv};
+use crate::tune::Compiled;
 
 const BF16: DType = DType::BFloat16;
 
@@ -679,35 +680,36 @@ fn a_ranking_keeps_its_cheapest_tiles(tiles: usize, step: f64) -> usize {
 
 /// The tuner's shortlist is the first [`SHORTLIST`] ranked configs whose
 /// compiled kernels do not spill, one per tile (its first clean pipeline),
-/// in ranked order, compiled in batches of as many until that many tiles
-/// pass: a batch past that is never compiled. Where every config that
-/// compiles spills, the first [`SHORTLIST`] of those are timed anyway;
-/// where nothing compiles there is nothing to judge. `twins` are `(config,
-/// the config whose tile it shares)`; `ranked` is in shortlists.
-#[test_case(&[], &[], &[], 1.5, Some(&(0..SHORTLIST).collect::<Vec<_>>()), 1; "nothing spills: the first batch")]
-#[test_case(&[1, 4, 9], &[], &[], 1.5, Some(&(0..SHORTLIST + 3).filter(|i| ![1, 4, 9].contains(i)).collect::<Vec<_>>()), 2; "spills skipped, order kept")]
-#[test_case(&[0, 1, 2], &[], &[], 0.0, Some(&[3, 4]), 1; "a short ranking keeps what passes")]
-#[test_case(&[0, 2, 3], &[1], &[], 0.0, Some(&[4]), 1; "a failure is never timed")]
-#[test_case(&[0, 1], &[], &[], 0.0, Some(&[0, 1]), 1; "every config spills: they are timed anyway")]
+/// in ranked order. A config is compiled only where a walk in ranked order
+/// would: never past the [`SHORTLIST`]th clean tile, never once a pipeline
+/// of its tile ahead of it is clean. Where every config that compiles
+/// spills, the first [`SHORTLIST`] of those are timed anyway; where nothing
+/// compiles there is nothing to judge. `twins` are `(config, the config
+/// whose tile it shares)`; `ranked` is in shortlists; `compiled` counts the
+/// configs compiled.
+#[test_case(&[], &[], &[], 1.5, Some(&(0..SHORTLIST).collect::<Vec<_>>()), SHORTLIST; "nothing spills: the first tiles")]
+#[test_case(&[1, 4, 9], &[], &[], 1.5, Some(&(0..SHORTLIST + 3).filter(|i| ![1, 4, 9].contains(i)).collect::<Vec<_>>()), SHORTLIST + 3; "spills skipped, order kept")]
+#[test_case(&[0, 1, 2], &[], &[], 0.0, Some(&[3, 4]), 5; "a short ranking keeps what passes")]
+#[test_case(&[0, 2, 3], &[1], &[], 0.0, Some(&[4]), 5; "a failure is never timed")]
+#[test_case(&[0, 1], &[], &[], 0.0, Some(&[0, 1]), 2; "every config spills: they are timed anyway")]
 #[test_case(&[0], &[], &[], 0.0, Some(&[0]), 1; "a single spilling config is timed alike")]
 #[test_case(&[], &[], &[], 0.0, Some(&[0]), 1; "a single clean config")]
-#[test_case(&(0..2 * SHORTLIST).collect::<Vec<_>>(), &[], &[], 2.0, Some(&(0..SHORTLIST).collect::<Vec<_>>()), 2; "every config spills")]
-#[test_case(&[0, 1], &[2], &[], 0.0, Some(&[0, 1]), 1; "spilled and failed: the spilled")]
-#[test_case(&[], &[0, 1, 2], &[], 0.0, None, 1; "nothing compiles")]
+#[test_case(&(0..2 * SHORTLIST).collect::<Vec<_>>(), &[], &[], 2.0, Some(&(0..SHORTLIST).collect::<Vec<_>>()), 2 * SHORTLIST; "every config spills")]
+#[test_case(&[0, 1], &[2], &[], 0.0, Some(&[0, 1]), 3; "spilled and failed: the spilled")]
+#[test_case(&[], &[0, 1, 2], &[], 0.0, None, 3; "nothing compiles")]
 #[test_case(&[], &[], &[], 0.0, None, 0; "nothing ranked")]
-#[test_case(&[0], &[], &[(1, 0)], 0.0, Some(&[1, 2]), 1; "a spilling unrolled ring yields to its clean rolled twin")]
-#[test_case(&[], &[], &[(1, 0)], 0.0, Some(&[0, 2]), 1; "two clean pipelines of one tile: the first")]
-#[test_case(&[], &[], &[(1, 0), (3, 2)], 1.5, Some(&[0, 2].into_iter().chain(4..SHORTLIST + 2).collect::<Vec<_>>()), 2; "tiles, not configs")]
-#[test_case(&[0, 1], &[], &[(1, 0)], 0.0, Some(&[0, 1]), 1; "both pipelines spill: both are timed")]
+#[test_case(&[0], &[], &[(1, 0)], 0.0, Some(&[1, 2]), 3; "a spilling unrolled ring yields to its clean rolled twin")]
+#[test_case(&[], &[], &[(1, 0)], 0.0, Some(&[0, 2]), 2; "two clean pipelines of one tile: the first, the second never compiled")]
+#[test_case(&[], &[], &[(1, 0), (3, 2)], 1.5, Some(&[0, 2].into_iter().chain(4..SHORTLIST + 2).collect::<Vec<_>>()), SHORTLIST; "tiles, not configs")]
+#[test_case(&[0, 1], &[], &[(1, 0)], 0.0, Some(&[0, 1]), 2; "both pipelines spill: both are timed")]
 fn the_shortlist_is_the_first_tiles_that_do_not_spill(
     spilled: &[usize],
     failed: &[usize],
     twins: &[(usize, usize)],
     ranked: f64,
     want: Option<&[usize]>,
-    batches: usize,
+    compiled: usize,
 ) {
-    use crate::tune::Compiled;
     // Short rankings are as long as what they name.
     let ranked = if ranked == 0.0 {
         spilled
@@ -722,19 +724,110 @@ fn the_shortlist_is_the_first_tiles_that_do_not_spill(
     };
     let tile = |at: usize| twins.iter().find(|(c, _)| *c == at).map_or(at, |(_, t)| *t);
     let ranked: Vec<Pipe> = (0..ranked).map(|at| Pipe { at, tile: tile(at) }).collect();
-    let mut asked = vec![];
-    let got = config::shortlist(&ranked, |batch| {
-        asked.push(batch.to_vec());
-        let verdict = |p: &Pipe| match (spilled.contains(&p.at), failed.contains(&p.at)) {
+    let verdicts: Vec<Compiled> = (0..ranked.len())
+        .map(|at| match (spilled.contains(&at), failed.contains(&at)) {
             (_, true) => Compiled::Failed,
             (true, _) => Compiled::Spilled,
             _ => Compiled::Clean,
-        };
-        batch.iter().map(verdict).collect()
+        })
+        .collect();
+    let mut asked = vec![];
+    let got = config::shortlist(&ranked, |batch| {
+        asked.extend(batch.iter().map(|p| p.at));
+        batch.iter().map(|p| verdicts[p.at]).collect()
     });
     assert_eq!(got.as_deref(), want);
-    assert_eq!(asked.len(), batches, "{asked:?}");
-    assert!(asked.iter().flatten().eq(ranked.iter().take(SHORTLIST * batches)), "ranked batches: {asked:?}");
+    asked.sort_unstable();
+    assert_eq!(asked, walked(&ranked, &verdicts), "compiled as a walk compiles");
+    assert_eq!(asked.len(), compiled);
+}
+
+/// The configs a walk in ranked order compiling one at a time compiles
+/// for the shortlist: until [`SHORTLIST`] tiles are clean, each config
+/// whose tile has no clean pipeline ahead of it.
+fn walked(ranked: &[Pipe], verdicts: &[Compiled]) -> Vec<usize> {
+    let mut clean = std::collections::HashSet::new();
+    let mut out = vec![];
+    for (at, p) in ranked.iter().enumerate() {
+        if clean.len() == SHORTLIST {
+            break;
+        }
+        if clean.contains(&p.tile) {
+            continue;
+        }
+        out.push(at);
+        if verdicts[at] == Compiled::Clean {
+            clean.insert(p.tile);
+        }
+    }
+    out
+}
+
+/// The shortlist as it was judged before the search: batches of
+/// [`SHORTLIST`] in ranked order, every pipeline of a batch compiled, until
+/// a batch ends with that many clean tiles.
+fn batched(ranked: &[Pipe], verdicts: &[Compiled]) -> Option<Vec<usize>> {
+    let (mut clean, mut spilled, mut tiles) = (vec![], vec![], std::collections::HashSet::new());
+    for (n, chunk) in ranked.chunks(SHORTLIST).enumerate() {
+        for (i, p) in chunk.iter().enumerate() {
+            let at = n * SHORTLIST + i;
+            match verdicts[at] {
+                Compiled::Clean if tiles.insert(p.tile) => clean.push(at),
+                Compiled::Clean | Compiled::Failed => {}
+                Compiled::Spilled => spilled.push(at),
+            }
+        }
+        if clean.len() >= SHORTLIST {
+            break;
+        }
+    }
+    let mut out = if clean.is_empty() { spilled } else { clean };
+    out.truncate(SHORTLIST);
+    (!out.is_empty()).then_some(out)
+}
+
+proptest::proptest! {
+    /// Whatever the tiles and verdicts, and in whatever order compiles
+    /// finish, the search admits what the batched shortlist admitted and
+    /// compiles what a walk in ranked order compiles.
+    #[test]
+    fn the_search_admits_what_the_batches_did(
+        configs in proptest::collection::vec((0usize..120, 0u8..10), 0..400),
+        order in proptest::collection::vec(proptest::num::usize::ANY, 1..64),
+    ) {
+        let ranked: Vec<Pipe> = configs.iter().enumerate().map(|(at, &(tile, _))| Pipe { at, tile }).collect();
+        let verdicts: Vec<Compiled> = configs
+            .iter()
+            .map(|&(_, v)| match v {
+                0 => Compiled::Failed,
+                1..=2 => Compiled::Spilled,
+                _ => Compiled::Clean,
+            })
+            .collect();
+        let want = batched(&ranked, &verdicts);
+        let mut asked = vec![];
+        let got = config::shortlist(&ranked, |batch| {
+            asked.extend(batch.iter().map(|p| p.at));
+            batch.iter().map(|p| verdicts[p.at]).collect()
+        });
+        proptest::prop_assert_eq!(&got, &want);
+        asked.sort_unstable();
+        let walk = walked(&ranked, &verdicts);
+        proptest::prop_assert_eq!(&asked, &walk);
+        // Verdicts back one at a time in an arbitrary order, more asked between.
+        let mut search = config::Search::new(&ranked, SHORTLIST);
+        let (mut flight, mut done, mut picks) = (vec![], vec![], order.iter().cycle());
+        loop {
+            flight.extend(std::iter::from_fn(|| search.next()));
+            let Some(&pick) = picks.next().filter(|_| !flight.is_empty()) else { break };
+            let at = flight.swap_remove(pick % flight.len());
+            search.record(at, verdicts[at]);
+            done.push(at);
+        }
+        done.sort_unstable();
+        proptest::prop_assert_eq!(&search.judged(), &want);
+        proptest::prop_assert_eq!(&done, &walk);
+    }
 }
 
 /// The first clean config is searched for in ranked batches of eight, the
@@ -755,7 +848,6 @@ fn the_first_clean_config_is_searched_in_small_batches(
     want: Option<usize>,
     batches: usize,
 ) {
-    use crate::tune::Compiled;
     let ranked: Vec<Pipe> = (0..count).map(|at| Pipe { at, tile: at }).collect();
     let mut asked = vec![];
     let got = config::first_clean(&ranked, |batch| {
@@ -782,7 +874,6 @@ fn the_first_clean_config_is_searched_in_small_batches(
 #[test_case(&[0], &[1], 2, Some(&[0]); "the spilled when nothing else compiles")]
 #[test_case(&[], &[0, 1], 2, None; "nothing compiles")]
 fn twins_are_judged_by_time_alone(spilled: &[usize], failed: &[usize], count: usize, want: Option<&[usize]>) {
-    use crate::tune::Compiled;
     let twins: Vec<Pipe> = (0..count).map(|at| Pipe { at, tile: 0 }).collect();
     let got = config::compiled(&twins, |batch| {
         assert_eq!(batch.len(), count, "one batch");
