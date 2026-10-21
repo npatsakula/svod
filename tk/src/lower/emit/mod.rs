@@ -132,16 +132,24 @@ impl<'a> Emit<'a> {
         let wave = c32(low.device.target.wave as i64);
         let lane = tid.try_cmod(&wave).expect("lane");
         let warp = tid.try_cdiv(&wave).expect("warp");
+        // `init` starts in place; `next` is moved into `phi` at the end of
+        // every iteration (a body may read `phi` after computing `next`). A
+        // value that starts several loops starts none in place: each copies
+        // it in ([`Self::loop_`]).
+        let carried = |stmt: &Stmt| match stmt {
+            Stmt::Loop(l) => l.carried.clone(),
+            Stmt::Pipeline(p) => p.carried.clone(),
+            _ => vec![],
+        };
+        let mut starts: HashMap<ValId, usize> = HashMap::new();
+        for (_, stmt) in prog.walk() {
+            for c in carried(stmt) {
+                *starts.entry(c.init).or_default() += 1;
+            }
+        }
         let mut alias = HashMap::new();
         for (_, stmt) in prog.walk() {
-            let carried = match stmt {
-                Stmt::Loop(l) => &l.carried,
-                Stmt::Pipeline(p) => &p.carried,
-                _ => continue,
-            };
-            // `init` starts in place; `next` is moved into `phi` at the end of
-            // every iteration (a body may read `phi` after computing `next`).
-            for c in carried {
+            for c in carried(stmt).into_iter().filter(|c| starts[&c.init] == 1) {
                 alias.insert(c.init, c.phi);
             }
         }
@@ -570,6 +578,15 @@ impl<'a> Emit<'a> {
     /// A rolled loop, or `unroll` copies of the body per iteration followed by
     /// a rolled remainder (skipped when a constant extent divides evenly).
     fn loop_(&mut self, l: &Loop) -> Result<()> {
+        let copied: Vec<Carried> =
+            l.carried.iter().filter(|c| self.root(c.init) != self.root(c.phi)).copied().collect();
+        for c in copied {
+            let (regs, w) = (self.layout(c.phi).regs(), self.layout(c.phi).frag_regs().max(1));
+            for j in (0..regs).step_by(w as usize) {
+                let x = self.reg_load_vec(c.init, j, w);
+                self.reg_store_vec(c.phi, j, w, x);
+            }
+        }
         let (start, extent) = (self.sc(l.start), self.sc(l.extent));
         let u = l.unroll.max(1) as i64;
         let constant = self.constant(l.extent);
