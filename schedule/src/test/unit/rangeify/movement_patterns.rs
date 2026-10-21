@@ -94,21 +94,21 @@ fn a_right_only_pad_does_not_gate_the_index() {
     assert!(matches!(expect_index(&result).0.op(), Op::Buffer(..)));
 }
 
-/// EXPAND whose new shape outranks the source pads the missing leading axes with
-/// index 0 (`indexing.rs:947-990`). The source here is a bare rank-1 BUFFER, so
-/// there is no RESHAPE left to fold the padded axis away: both indices survive,
-/// and the padded one reads 0 rather than the range.
+/// EXPAND whose new shape outranks the source aligns the source with the
+/// trailing axes, and the leading axes it adds index nothing in the source
+/// (Tinygrad `indexing.py`: `rngs[len(arg):]`). The rank-1 BUFFER keeps one
+/// index, the trailing range, not a padded 0 for the added axis.
 ///
 /// A non-movement source has nothing to fold into, so the INDEX keeps it as it is.
 #[test]
-fn expand_pads_the_rank_and_a_non_movement_source_is_left_alone() {
+fn expand_drops_the_added_axes_and_a_non_movement_source_is_left_alone() {
     let result =
         rewrite(&movement_op_patterns(), with_ranges(broadcast(reshaped(buffer(20), &[20]), &[3, 20]), &[3, 20]));
 
     let (storage, indices) = expect_index(&result);
     assert!(matches!(storage.op(), Op::Buffer(..)), "no EXPAND may survive: {}", result.tree());
-    assert_eq!(indices.len(), 2, "the padded axis is still addressed: {}", result.tree());
-    assert!(indices.iter().any(|index| matches!(index.op(), Op::Const(c) if c.0 == svod_ir::ConstValue::Int(0))));
+    assert_eq!(indices.len(), 1, "one index per source axis: {}", result.tree());
+    assert_eq!(expect_range_extent(&indices[0]), 20, "the trailing range survives: {}", result.tree());
 
     let computed = buffer(100).try_sqrt().expect("sqrt");
     let indexed = index_of(Arc::clone(&computed), range(100, AxisType::Loop, 0));
