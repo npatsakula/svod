@@ -1578,6 +1578,29 @@ fn lists_match_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join: bo
     });
 }
 
+/// The op's filtered score matrix bounds each row's list by the `k`-th of
+/// its trips' leasts, listed from them, and keeps the reference's lists,
+/// resident and streamed, whole and split. (The op once bounded the lists
+/// by the leasts themselves, the first of the bound listing's parameters:
+/// half of each row's list went missing.)
+#[test_case(None, 1; "resident")]
+#[test_case(Some(32), 1; "streamed")]
+#[test_case(Some(32), 4; "streamed split")]
+fn a_filtered_score_matrix_keeps_the_lists(bk: Option<usize>, splits: usize) {
+    use crate::kernels::nearest::SelectCfg;
+    super::ops::untuned(|| {
+        let (n, m, d, k) = (100, 3000, 64, 40);
+        let case = Case::draw(n, m, d, draw(Metric::SquaredL2, NONE, None, false, false), 3);
+        let (x, c, opts) = operands(&case, DType::BFloat16, false);
+        let select = Some(SelectCfg { warps: 4, queue: 2, filter: true });
+        let cfg = NearestCfg { select, bk, splits, ..NearestCfg::new(64, 64, 2) };
+        let pick = |_: &Planner, _: &[NearestCfg], spec: NearestSpec| NearestSpec { cfg, ..spec };
+        let (score, index) = tk::nearest::picked(&x, &c, k, options(&case, &opts), None, pick).unwrap();
+        super::ops::assert_kernel(&score, "nearest_select");
+        case.check_list("filtered", k, &host(&score), &host(&index), 1e-3, false);
+    });
+}
+
 /// What the kernel does not serve takes the graph and keeps the same lists,
 /// on any device: f32 operands, a list longer than a register list holds,
 /// one longer than the candidates; `k = 1` as a column of the least.

@@ -583,7 +583,9 @@ fn matrix(
                 let ins: Vec<&Tensor> = [&mins, &unit].into_iter().chain(&outs).collect();
                 let mut outs =
                     launch::graph_launch_all(nearest_select(&bound), &listing, &ins).context(LaunchSnafu { op: OP })?;
-                outs.truncate(1);
+                // Every parameter after the launch: the leasts' lists are its
+                // last two, their scores the bound.
+                outs.truncate(outs.len() - 1);
                 vec![mins, outs.pop().expect("the bound")]
             }
             None => vec![],
