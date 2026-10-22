@@ -1400,6 +1400,26 @@ impl Rewrite<'_> {
                     }
                 }
             }
+            // A reduction whose result its consumers laid otherwise than
+            // its operand's vector reduces into that vector, then re-holds
+            // it: the emitter folds a register's lanes as the operand holds
+            // them, so a result laid apart would hold other rows' values.
+            if let Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } = &stmt
+                && self.conflicts.remove(&(pos, *dst)).is_some()
+            {
+                let held = self.lay[src.index()].as_ref().map(|l| match axis {
+                    Axis::Row => l.row_vector(),
+                    Axis::Col => l.col_vector(),
+                });
+                let Value { dtype, shape, .. } = self.prog.value(*dst).clone();
+                self.prog.values.push(Value { dtype, shape, place: Place::Reg });
+                let fresh = ValId(self.prog.values.len() as u32 - 1);
+                self.lay.push(held);
+                let dst = *dst;
+                let Stmt::Let { op, .. } = stmt else { unreachable!("a reduction") };
+                out.push(Stmt::Let { dst: fresh, op });
+                stmt = Stmt::Let { dst, op: TileOp::Relayout { src: fresh } };
+            }
             out.push(stmt);
         }
         Block(out)

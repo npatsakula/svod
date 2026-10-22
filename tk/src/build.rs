@@ -593,6 +593,33 @@ impl Kernel {
             .collect()
     }
 
+    /// A carried value whose next is defined outside its body (another
+    /// carried value, as a ring rotating its slots, or a value from before
+    /// the loop) takes a copy of it made where the body starts: the moves
+    /// into the carried values then read what the iteration began with,
+    /// as the interpreter's simultaneous assignment does, and a next the
+    /// body never defines still moves.
+    fn snapshot_carried<T: Elem>(&mut self, body: &mut Block, phi: &[ValId], next: &mut [Regs<T>]) {
+        let defined: std::collections::HashSet<ValId> = body
+            .walk()
+            .filter_map(|(_, s)| match s {
+                Stmt::Let { dst, .. } | Stmt::Copy { dst, .. } => Some(*dst),
+                _ => None,
+            })
+            .collect();
+        let mut copies = vec![];
+        for (n, &p) in next.iter_mut().zip(phi) {
+            if n.0 == p || defined.contains(&n.0) {
+                continue;
+            }
+            let Value { dtype, shape, .. } = self.prog.value(n.0).clone();
+            let dst = self.value(dtype, shape, Place::Reg);
+            copies.push(Stmt::Let { dst, op: TileOp::Move { src: n.0 } });
+            *n = Tile::new(dst);
+        }
+        body.0.splice(0..0, copies);
+    }
+
     fn with_block(&mut self, f: impl FnOnce(&mut Self)) -> Block {
         self.blocks.push(Block::default());
         f(self);
@@ -622,7 +649,8 @@ impl Kernel {
         let iv = self.push_scalar(Scalar::Induction);
         let phi = self.carried(&init);
         let mut next = vec![];
-        let block = self.with_block(|k| next = body(k, Sc::Id(iv), phi.iter().map(|&v| Tile::new(v)).collect()));
+        let mut block = self.with_block(|k| next = body(k, Sc::Id(iv), phi.iter().map(|&v| Tile::new(v)).collect()));
+        self.snapshot_carried(&mut block, &phi, &mut next);
         let carried = carry(&init, &phi, &next);
         self.push(Stmt::Loop(Loop { iv, start, extent, carried, body: block, unroll: 1 }));
         phi.into_iter().map(Tile::new).collect()
@@ -659,9 +687,10 @@ impl Kernel {
         let body = self.with_block(|k| produce(k, Sc::Id(pstep), Sc::Id(pslot)));
         let produce = Stage { step: pstep, slot: pslot, body };
         let mut next = vec![];
-        let body = self.with_block(|k| {
+        let mut body = self.with_block(|k| {
             next = consume(k, Sc::Id(cstep), Sc::Id(cslot), phi.iter().map(|&v| Tile::new(v)).collect())
         });
+        self.snapshot_carried(&mut body, &phi, &mut next);
         let consume = Stage { step: cstep, slot: cslot, body };
         let carried = carry(&init, &phi, &next);
         self.push(Stmt::Pipeline(Pipeline { extent, stages, carried, produce, consume }));

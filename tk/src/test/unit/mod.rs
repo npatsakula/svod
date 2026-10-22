@@ -6,6 +6,7 @@ mod cost_model;
 mod device;
 mod emit;
 mod gather;
+mod hazards;
 mod heads;
 mod interp;
 mod isa;
