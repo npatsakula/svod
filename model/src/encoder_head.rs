@@ -24,6 +24,7 @@
 //! A head records the device it was built for and compiles every later plan
 //! there, whichever thread runs it: the default device is thread-local, and a
 //! serving pipeline builds a head on one thread and runs it on another.
+//! [`HeadPlans::warm_up`] compiles a shape ahead of its first batch.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -259,18 +260,54 @@ impl<J: HeadJit> HeadPlans<J> {
         with_default_device(self.device.clone(), || self.run_on_device(batch, profile))
     }
 
-    fn run_on_device(&mut self, batch: &[&Encoding], profile: bool) -> Result<HeadRun, HeadError> {
-        let (b, stage) = (batch.len(), self.stage);
-        if b == 0 {
-            return Ok(HeadRun { output: Vec::new(), len: 0, profile: profile.then(RunProfile::default) });
+    /// Compile the plan a batch of `batch` chunks, the longest `len` tokens,
+    /// runs on, and execute it once on padding: prepare compiles and tunes,
+    /// but the first execute still captures the graph, makes the plan's
+    /// context and leases queues. A shape already prepared only executes; a
+    /// batch of none runs no plan, so warms none.
+    pub(crate) fn warm_up(&mut self, batch: usize, len: usize) -> Result<(), HeadError> {
+        if batch == 0 {
+            return Ok(());
         }
+        self.check(batch, len)?;
+        with_default_device(self.device.clone(), || self.execute(&[], plan_shape(batch, len, self.max_batch), false))
+            .map(drop)
+    }
+
+    /// The `(rows, len)` shapes prepared so far.
+    #[cfg(test)]
+    pub(crate) fn shapes(&self) -> Vec<(usize, usize)> {
+        self.plans.keys().copied().collect()
+    }
+
+    fn check(&self, b: usize, longest: usize) -> Result<(), HeadError> {
+        let stage = self.stage;
         ensure!(b <= self.max_batch, CapacityExceededSnafu { stage, got: b, max: self.max_batch });
         // Chunks built outside the pipeline's chunker (the public chunk seam)
         // can exceed max_seq: catch it rather than silently truncating.
-        let longest = batch.iter().map(|e| e.input_ids.len()).max().unwrap_or(0);
         ensure!(longest <= self.max_seq, SequenceTooLongSnafu { stage, got: longest, max: self.max_seq });
+        Ok(())
+    }
 
-        let (rows, len) = plan_shape(b, longest, self.max_batch);
+    fn run_on_device(&mut self, batch: &[&Encoding], profile: bool) -> Result<HeadRun, HeadError> {
+        let b = batch.len();
+        if b == 0 {
+            return Ok(HeadRun { output: Vec::new(), len: 0, profile: profile.then(RunProfile::default) });
+        }
+        let longest = batch.iter().map(|e| e.input_ids.len()).max().unwrap_or(0);
+        self.check(b, longest)?;
+        self.execute(batch, plan_shape(b, longest, self.max_batch), profile)
+    }
+
+    /// Pack `batch` into the `(rows, len)` plan, compiling it on first use,
+    /// execute it, and read back the live rows.
+    fn execute(
+        &mut self,
+        batch: &[&Encoding],
+        (rows, len): (usize, usize),
+        profile: bool,
+    ) -> Result<HeadRun, HeadError> {
+        let (stage, pad_id) = (self.stage, self.pad_id);
         let jit = match self.plans.entry((rows, len)) {
             std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::btree_map::Entry::Vacant(e) => {
@@ -287,7 +324,7 @@ impl<J: HeadJit> HeadPlans<J> {
             jit.input_ids_view_mut().context(JitSnafu)?.as_slice_mut().expect("contiguous ids"),
             batch,
             len,
-            self.pad_id,
+            pad_id,
         );
         pack_mask(
             jit.attention_mask_view_mut().context(JitSnafu)?.as_slice_mut().expect("contiguous mask"),
@@ -307,7 +344,7 @@ impl<J: HeadJit> HeadPlans<J> {
         };
 
         let mut output = jit.read_output().context(JitSnafu)?;
-        output.truncate(output.len() / rows * b);
+        output.truncate(output.len() / rows * batch.len());
         Ok(HeadRun { output, len, profile })
     }
 }

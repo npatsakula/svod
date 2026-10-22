@@ -8,12 +8,12 @@ use svod_arch::pipelines::text::{EncoderHead, Encoding};
 use svod_dtype::default_device::{default_device, set_default_device, with_default_device};
 use svod_dtype::{DType, DeviceSpec};
 
-use crate::encoder_head::{HeadOptions, pack_ids, pack_mask, plan_shape};
+use crate::encoder_head::{HeadError, HeadOptions, HeadPlans, pack_ids, pack_mask, plan_shape};
 use crate::modernbert::{ModernBertClassifier, ModernBertEmbedder, ModernBertTokenClassifier};
 use crate::state::StateDict;
 use crate::test::unit::xlm_roberta::model::tiny_cfg;
 use crate::test::unit::{load_golden_vec, max_abs_delta, nan_max};
-use crate::xlm_roberta::{XlmRobertaTokenClassificationModel, XlmRobertaTokenClassifier};
+use crate::xlm_roberta::{XlmRobertaTokenClassificationModel, XlmRobertaTokenClassifier, XlmRobertaTokenClassifierJit};
 
 /// A chunk of `real_ids` (mask 1) followed by `n_pad` pad positions (id 0,
 /// mask 0).
@@ -156,6 +156,44 @@ fn pack_inputs_pad_stride_and_truncate_correctly() {
 #[test_case::test_case(2, 0, 8 => (2, 128); "empty chunks still take a tile")]
 fn plan_shape_rounds_rows_and_length(b: usize, longest: usize, max_batch: usize) -> (usize, usize) {
     plan_shape(b, longest, max_batch)
+}
+
+// ── warm-up ─────────────────────────────────────────────────────────────────
+
+/// Plans for the tiny XLM-R token head: up to 4 chunks of up to 16 tokens.
+fn tiny_plans(model: XlmRobertaTokenClassificationModel) -> HeadPlans<XlmRobertaTokenClassifierJit> {
+    HeadPlans::new(model, 4, 16, tiny_cfg().max_sequence_length(), tiny_cfg().pad_token_id, "classify_tokens")
+        .expect("plans")
+}
+
+/// Warming a shape compiles exactly the plan a batch of that shape runs on;
+/// the batch then runs on it, with no second plan and the logits a cold head
+/// gives.
+#[test]
+fn warm_up_prepares_the_plan_a_batch_runs_on() {
+    with_default_device(DeviceSpec::Cpu, || {
+        let model = XlmRobertaTokenClassificationModel::empty(tiny_cfg());
+        let (mut warm, mut cold) = (tiny_plans(model.clone()), tiny_plans(model));
+        warm.warm_up(3, 10).expect("warm up");
+        assert_eq!(warm.shapes(), [(4, 128)]);
+
+        let chunks: Vec<Encoding> = (0..3).map(|i| encoding(&[0, 10 + i, 20, 30, 40, 50, 60, 70, 80, 2], 0)).collect();
+        let batch: Vec<&Encoding> = chunks.iter().collect();
+        let warmed = warm.run(&batch, false).expect("warm run").output;
+        assert_eq!(warm.shapes(), [(4, 128)], "the batch ran on the warmed plan");
+        assert_eq!(warmed, cold.run(&batch, false).expect("cold run").output);
+    })
+}
+
+/// Warm-up meets `run`'s guards; a batch of no chunks runs no plan, so warms
+/// none. Returns the shapes prepared.
+#[test_case::test_case(5, 10 => matches Err(HeadError::CapacityExceeded { got: 5, max: 4, .. }); "too many chunks")]
+#[test_case::test_case(1, 17 => matches Err(HeadError::SequenceTooLong { got: 17, max: 16, .. }); "too long")]
+#[test_case::test_case(0, 10 => matches Ok(0); "no chunks")]
+fn warm_up_checks_the_shape(batch: usize, len: usize) -> Result<usize, HeadError> {
+    let mut plans = tiny_plans(XlmRobertaTokenClassificationModel::empty(tiny_cfg()));
+    plans.warm_up(batch, len)?;
+    Ok(plans.shapes().len())
 }
 
 // ── options, threads and devices ────────────────────────────────────────────

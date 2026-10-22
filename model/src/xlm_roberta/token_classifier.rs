@@ -137,6 +137,10 @@ impl EncoderHead for XlmRobertaTokenClassifier {
             .collect();
         Ok((results, run.profile))
     }
+
+    fn warm_up(&mut self, batch: usize, len: usize) -> std::result::Result<(), HeadError> {
+        self.plans.warm_up(batch, len)
+    }
 }
 
 impl ClassifyTokens for XlmRobertaTokenClassifier {
