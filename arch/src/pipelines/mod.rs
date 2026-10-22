@@ -5,7 +5,8 @@
 //! trait defaults so a model only implements its irreducible part.
 //!
 //! [`text`] is the encoder-head text pipeline: tokenize → chunk → model →
-//! aggregate (embeddings / classification / token classification). It reuses
+//! aggregate (embeddings / classification of texts or sentence pairs / token
+//! classification). It reuses
 //! [`audio`]'s host-side, model-agnostic skeleton deliberately — a small
 //! supertrait + trait defaults + host-side composer — adapted to text's
 //! domain (sub-batching over byte offsets, span decoding). Future pipeline
