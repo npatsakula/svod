@@ -43,6 +43,13 @@ fn enumerate_skips_cpu_nodes_and_parses_gpu() {
             "gpu_id 5710\nsimd_count 4\narray_count 4\nsimd_arrays_per_engine 2\ngfx_target_version 110000\ndrm_render_minor 128\nwave_front_size 32\nnum_cp_queues 8\n"
         )
         .unwrap();
+    // Two frame-buffer banks and a system heap, which is not the GPU's.
+    for (bank, heap, bytes) in [(0, 1, 1u64 << 33), (1, 2, 1 << 30), (2, 0, 1 << 34)] {
+        let dir = n1.join("mem_banks").join(bank.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = std::fs::File::create(dir.join("properties")).unwrap();
+        write!(f, "heap_type {heap}\nsize_in_bytes {bytes}\nflags 0\n").unwrap();
+    }
 
     unsafe {
         std::env::set_var("SVOD_KFD_TOPOLOGY", &root);
@@ -59,6 +66,7 @@ fn enumerate_skips_cpu_nodes_and_parses_gpu() {
     assert_eq!(nodes[0].wave_front_size, 32);
     assert_eq!(nodes[0].num_cp_queues, 8);
     assert_eq!(nodes[0].simd_arrays_per_engine, 2);
+    assert_eq!(nodes[0].memory_bytes, (1 << 33) + (1 << 30));
 }
 
 fn tempfile_dir() -> PathBuf {

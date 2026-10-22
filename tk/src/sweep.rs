@@ -206,15 +206,25 @@ pub fn families(target: &Target) -> Vec<Launch> {
 
     // A score matrix, and its listing into empty lists of 100 and of 1024
     // (carried lists hold an order the scratch inputs would not).
-    let select = SelectCfg { warps: 4, queue: 2 };
+    let select = SelectCfg { warps: 4, queue: 2, filter: false };
     let cfg = NearestCfg { select: Some(select), ..NearestCfg::new(64, 32, 2) };
     let (metric, live) = (Metric::L2, Live::default());
     let spec = NearestSpec { n: 100, m: 150, d: 64, metric, floors: both, groups: true, k: 100, cfg, live };
     push("nearest matrix", nearest::<BF16>(&spec), cfg.lowering(&planner.device));
     for (k, queue, name) in [(100, 2, "100"), (100, 4, "100 queue 4"), (1024, 8, "1024")] {
         let select = SelectCfg { queue, ..select };
-        let b =
-            SelectSpec { n: 100, cols: 150, k, metric: Metric::L2, first: true, cfg: select, live: Live::default() };
+        let b = SelectSpec {
+            n: 100,
+            cols: 150,
+            k,
+            metric: Metric::L2,
+            first: true,
+            cfg: select,
+            live: Live::default(),
+            wide: select.wide(planner.device.target.wave),
+            filter: None,
+            shares: 1,
+        };
         push(&format!("nearest select {name}"), nearest_select(&b), select.lowering(&planner.device));
     }
     // Rows and lists bound at launch: a register list and a queued one, a
@@ -242,8 +252,20 @@ pub fn families(target: &Target) -> Vec<Launch> {
     let spec =
         NearestSpec { n: 64, m: 150, d: 64, metric, floors: both, groups: true, k: 100, cfg, live: live.clone() };
     push("nearest live matrix panel", nearest::<BF16>(&spec), cfg.lowering(&planner.device));
-    let b = SelectSpec { n: 64, cols: 150, k: 100, metric, first: true, cfg: select, live };
+    let wide = select.wide(planner.device.target.wave);
+    let b =
+        SelectSpec { n: 64, cols: 150, k: 100, metric, first: true, cfg: select, live, wide, filter: None, shares: 1 };
     push("nearest live select", nearest_select(&b), select.lowering(&planner.device));
+    // Filtered: the trips' leasts stored beside the scores, a listing bound
+    // by them, in shares and merged.
+    let filtered = SelectCfg { queue: 1, filter: true, ..select };
+    let cfg = NearestCfg { select: Some(filtered), splits: 2, ..NearestCfg::new(64, 32, 2) };
+    let (metric, live) = (Metric::NegDot, Live::default());
+    let spec = NearestSpec { n: 100, m: 300, d: 64, metric, floors: both, groups: true, k: 2, cfg, live: live.clone() };
+    push("nearest matrix filtered", nearest::<F16>(&spec), cfg.lowering(&planner.device));
+    let (wide, filter) = (filtered.wide(planner.device.target.wave), Some(32));
+    let b = SelectSpec { n: 100, cols: 300, k: 2, metric, first: true, cfg: filtered, live, wide, filter, shares: 3 };
+    push("nearest select filtered shares", nearest_select(&b), select.lowering(&planner.device));
 
     let silu_bias = Epilogue { bias: true, act: Act::Silu, ..Epilogue::DEFAULT };
     for (name, g, images) in [

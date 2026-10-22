@@ -1539,7 +1539,7 @@ fn a_long_list_is_queued_or_listed_from_a_matrix(target: Target) {
     };
     let base = NearestCfg::new(32, 16, 2);
     let queued = NearestCfg { queue: Some(32), ..base };
-    let matrix = NearestCfg { select: Some(SelectCfg { warps: 4, queue: 2 }), ..base };
+    let matrix = NearestCfg { select: Some(SelectCfg { warps: 4, queue: 2, filter: false }), ..base };
     let regs = |cfg: &NearestCfg, k| cfg.registers(&target, 64, k).unwrap();
     for k in [64, 256, 1024] {
         assert_eq!(regs(&queued, k), regs(&queued, 64), "a queue's registers whatever its list's length");

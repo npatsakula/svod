@@ -49,6 +49,10 @@ pub struct AmdNode {
     /// to `simd_per_cu * max_waves_per_simd` (matches RDNA scratch slot
     /// budgeting) when absent.
     pub max_slots_scratch_cu: u32,
+    /// Bytes of the node's frame-buffer memory banks (`mem_banks/*/properties`
+    /// of heap type 1 or 2, public or private): its VRAM, or an APU's
+    /// carve-out. 0 when KFD lists none.
+    pub memory_bytes: u64,
 }
 
 /// Sysfs root for KFD topology. Public so tests can override via env.
@@ -122,6 +126,7 @@ pub fn enumerate() -> Vec<AmdNode> {
                 .copied()
                 .map(|v| v as u32)
                 .unwrap_or_else(|| simd_per_cu.max(1) * max_waves_per_simd.max(1)),
+            memory_bytes: frame_buffer_bytes(&node_dir),
         });
     }
     nodes.sort_by_key(|n| n.node_id);
@@ -137,6 +142,22 @@ pub fn enumerate() -> Vec<AmdNode> {
 /// uses, so registration and device-open agree on "supported".
 pub fn has_devices() -> bool {
     enumerate().iter().any(|n| svod_dtype::AmdArch::from_gfx_target_version(n.gfx_target_version).is_some())
+}
+
+/// KFD's frame-buffer heap types (`HSA_HEAPTYPE_FRAME_BUFFER_PUBLIC` and
+/// `_PRIVATE`).
+const FRAME_BUFFER_HEAPS: [u64; 2] = [1, 2];
+
+/// The bytes of a node's frame-buffer memory banks, 0 where none is listed.
+fn frame_buffer_bytes(node_dir: &std::path::Path) -> u64 {
+    let Ok(banks) = fs::read_dir(node_dir.join("mem_banks")) else { return 0 };
+    banks
+        .flatten()
+        .filter_map(|bank| fs::read_to_string(bank.path().join("properties")).ok())
+        .map(|props| parse_properties(&props))
+        .filter(|map| map.get("heap_type").is_some_and(|h| FRAME_BUFFER_HEAPS.contains(h)))
+        .filter_map(|map| map.get("size_in_bytes").copied())
+        .sum()
 }
 
 pub(crate) fn parse_properties(s: &str) -> HashMap<String, u64> {

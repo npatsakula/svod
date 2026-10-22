@@ -166,6 +166,9 @@ pub struct Target {
     pub smem_bytes: usize,
     /// Streaming multiprocessors (compute units), when the device reports them.
     pub sms: Option<u32>,
+    /// Bytes of device memory, when the device reports them: the share a
+    /// planner's scratch may take scales with it.
+    pub memory_bytes: Option<u64>,
     /// Crews a block's warps may split into, one stream of clusters offset by
     /// a cluster so one crew's products overlap the other's loads: two where
     /// the matrix core runs beside the vector units and a lane's file holds
@@ -419,6 +422,7 @@ impl Target {
                         target.occupancy.waves = node.max_waves_per_simd;
                     }
                     target.xcds = node.num_xcc.max(1);
+                    target.memory_bytes = (node.memory_bytes > 0).then_some(node.memory_bytes);
                 }
                 return Some(target);
             }
@@ -426,6 +430,9 @@ impl Target {
             DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => return None,
         };
         let mut target = Self::for_arch(arch);
+        if let DeviceSpec::Cuda { device_id } = spec {
+            target.memory_bytes = reg::resolve_cuda_memory(*device_id).ok().map(|b| b as u64);
+        }
         if let Some(limits) = limits {
             target.smem_bytes = limits.shared_per_block_optin as usize;
             target.sms = Some(limits.sm_count);
@@ -496,6 +503,7 @@ fn cuda(c: CudaArch) -> Target {
         dot2_bf16: false,
         smem_bytes: c.max_shared_per_block_optin(),
         sms: None,
+        memory_bytes: None,
         crews: 1,
         xcds: 1,
         occupancy: Occupancy { simds: 4, file: 512, waves, registers: 255, acc_file: 0 },
@@ -538,6 +546,7 @@ fn amd(a: AmdArch) -> Target {
         dot2_bf16: !cdna || a == AmdArch::Gfx950,
         smem_bytes: if a == AmdArch::Gfx950 { 160 << 10 } else { 64 << 10 },
         sms: None,
+        memory_bytes: None,
         crews: if cdna { 2 } else { 1 },
         xcds: 1,
         occupancy,
@@ -561,6 +570,7 @@ fn metal(f: MetalFamily) -> Target {
         dot2_bf16: false,
         smem_bytes: 32 << 10,
         sms: None,
+        memory_bytes: None,
         crews: 1,
         xcds: 1,
         occupancy: Occupancy { simds: 4, file: 1024, waves: 8, registers: 128, acc_file: 0 },

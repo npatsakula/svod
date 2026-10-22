@@ -14,8 +14,8 @@ use crate::build::{BF16, F16};
 use crate::interp::{round_to, run};
 use crate::ir::Orient;
 use crate::kernels::nearest::{
-    Floors, LaneQueue, MergeSpec, Metric, NearestCfg, NearestSpec, SelectCfg, SelectSpec, nearest, nearest_merge,
-    nearest_select, share_stride,
+    Floors, LaneQueue, MergeSpec, Metric, NearestCfg, NearestSpec, SCRATCH, SelectCfg, SelectSpec, nearest,
+    nearest_merge, nearest_select, share_stride,
 };
 use crate::ops::config::{self, Planner};
 use crate::ops::{self as tk, Nearest};
@@ -245,9 +245,11 @@ impl Case {
     /// matrix's in the blocks the op takes.
     fn listed(&self, cfg: NearestCfg, k: usize) -> (Vec<f64>, Vec<f64>) {
         if cfg.select.is_some() {
-            let blocks = crate::kernels::nearest::select_blocks(self.n, self.m, k, &cfg);
+            let blocks = crate::kernels::nearest::select_blocks(self.n, self.m, k, &cfg, SCRATCH);
+            let shares = cfg.select.is_some_and(|s| s.filter).then_some(1);
             let device = crate::sweep::declared(crate::atoms::sm86());
-            return self.selected(cfg, k, blocks, &device, &|prog, _, params| run(&prog, params, &[]).unwrap());
+            let interpret = |prog, _: &_, params| run(&prog, params, &[]).unwrap();
+            return self.selected(cfg, k, blocks, shares, &device, &interpret);
         }
         let depth = self.d.next_multiple_of(16);
         let mut out = run(&self.program(depth, cfg, k), self.params(depth, cfg.splits, k), &[]).unwrap();
@@ -260,18 +262,23 @@ impl Case {
 
     /// [`Self::listed`] through a score matrix (`cfg.select`), its rows
     /// listed by [`nearest_select`] in panels of `panel` rows and blocks of
-    /// `cols` candidates, the lists carried from block to block; each
+    /// `cols` candidates, the lists carried from block to block, each block
+    /// filtered by the `k` least of its trips' leasts where `shares` is set,
+    /// a block of whole rows listed in that many shares merged after; each
     /// program `run` on its lowering.
     fn selected(
         &self,
         cfg: NearestCfg,
         k: usize,
         (panel, cols): (usize, usize),
+        shares: Option<usize>,
         device: &crate::atoms::Device,
         run: &impl Fn(crate::ir::Program, &crate::lower::Lowering, Vec<Vec<f64>>) -> Vec<Vec<f64>>,
     ) -> (Vec<f64>, Vec<f64>) {
         let depth = self.d.next_multiple_of(16);
-        let select = cfg.select.expect("a score matrix");
+        let filtered = shares.is_some();
+        let select = SelectCfg { filter: filtered, ..cfg.select.expect("a score matrix") };
+        let cfg = NearestCfg { select: Some(select), ..cfg };
         let (scored, listing) = (cfg.lowering(device), select.lowering(device));
         let (score, index) = (0..self.n).step_by(panel).fold((vec![], vec![]), |(mut score, mut index), r0| {
             let rows = panel.min(self.n - r0);
@@ -281,22 +288,50 @@ impl Case {
                 let part = self.part(r0..r0 + rows, c0..c0 + width);
                 let mut params = part.params(depth, 1, k);
                 params.truncate(params.len() - 2);
+                let groups = width.div_ceil(cfg.bkv);
                 params.push(vec![0.0; rows * width]);
-                let matrix = run(part.program(depth, cfg, k), &scored, params).pop().unwrap();
-                let spec = SelectSpec {
+                if filtered {
+                    params.push(vec![0.0; rows * groups]);
+                }
+                let mut out = run(part.program(depth, cfg, k), &scored, params);
+                let mins = if filtered { out.pop().unwrap() } else { vec![] };
+                let matrix = out.pop().unwrap();
+                let spec = |cols, first, filter, shares| SelectSpec {
                     n: rows,
-                    cols: width,
+                    cols,
                     k,
                     metric: self.metric,
-                    first: c0 == 0,
+                    first,
                     cfg: select,
                     live: Default::default(),
+                    wide: select.wide(device.target.wave),
+                    filter,
+                    shares,
                 };
+                // Filtered, the `k` least of the trips' leasts bound the lists.
+                let filter = filtered.then(|| {
+                    let params = vec![mins.clone(), vec![0.0; 2], vec![0.0; rows * k], vec![0.0; rows * k]];
+                    let mut out = run(nearest_select(&spec(groups, true, None, 1)), &listing, params);
+                    out.truncate(out.len() - 1);
+                    vec![mins, out.pop().unwrap()]
+                });
+                // Shares of a block of whole rows, at most a step each.
+                let whole = spec(width, true, filtered.then_some(cfg.bkv), 1);
+                let shares = shares.filter(|_| width == self.m).map_or(1, |s| s.min(whole.steps()));
+                let spec = spec(width, c0 == 0, filtered.then_some(cfg.bkv), shares);
                 let chunk = vec![c0 as f64, f64::from(c0 + width == self.m)];
                 let carried = if c0 == 0 { vec![] } else { lists };
-                let params = [vec![matrix, chunk], carried, vec![vec![0.0; rows * k]; 2]].concat();
+                let filter = filter.unwrap_or_default();
+                let parts = k * if shares > 1 { shares * share_stride(rows) } else { rows };
+                let params = [vec![matrix, chunk], carried, filter, vec![vec![0.0; parts]; 2]].concat();
                 let mut out = run(nearest_select(&spec), &listing, params);
                 lists = out.split_off(out.len() - 2);
+                if shares > 1 {
+                    let merge = MergeSpec { n: rows, splits: shares, metric: self.metric, k, live: Default::default() };
+                    let params = [lists, vec![vec![0.0; rows * k]; 2]].concat();
+                    let mut out = run(nearest_merge(&merge), &merge.lowering(device), params);
+                    lists = out.split_off(out.len() - 2);
+                }
             }
             score.extend(&lists[0]);
             index.extend(&lists[1]);
@@ -326,12 +361,17 @@ impl Case {
     /// (split, its shares merged there).
     fn on_device(&self, planner: &Planner, depth: usize, cfg: NearestCfg, k: usize) -> (Vec<f64>, Vec<f64>) {
         if cfg.select.is_some() {
-            // Two panels of rows and three blocks of candidates: lists carried.
-            let blocks = (self.n.div_ceil(2), self.m.div_ceil(3));
-            return self.selected(cfg, k, blocks, &planner.device, &|prog, lowering, params| {
+            // Two panels of rows and three blocks of candidates, filtered
+            // (lists carried), the same as whole rows in three shares.
+            let device = |prog, lowering: &crate::lower::Lowering, params: Vec<Vec<f64>>| -> Vec<Vec<f64>> {
                 let outs = super::targets::on_device(prog, lowering, &params);
                 outs.into_iter().zip(params).map(|(o, p)| o.unwrap_or(p)).collect()
-            });
+            };
+            let blocks = (self.n.div_ceil(2), self.m.div_ceil(3));
+            let carried = self.selected(cfg, k, blocks, Some(1), &planner.device, &device);
+            let shared = self.selected(cfg, k, (self.n, self.m), Some(3), &planner.device, &device);
+            assert_eq!(carried, shared, "{cfg:?} in shares");
+            return carried;
         }
         let (prog, params) = (self.program(depth, cfg, k), self.params(depth, cfg.splits, k));
         let mut outs = super::targets::on_device(prog, &cfg.lowering(&planner.device), &params);
@@ -840,7 +880,8 @@ fn long_cfgs(k: usize) -> Vec<NearestCfg> {
     let queued = [(16, NearestCfg::new(32, 16, 2)), (32, NearestCfg::streamed(32, 32, 16, 1))];
     let queued = queued.map(|(q, cfg)| NearestCfg { queue: Some(q), ..cfg });
     let runs = crate::kernels::nearest::select_runs(k);
-    let selects = [(1, 1), (2, 2), (4, 8)].map(|(warps, queue)| SelectCfg { warps, queue: queue.min(runs) });
+    let selects =
+        [(1, 1), (2, 2), (4, 8)].map(|(warps, queue)| SelectCfg { warps, queue: queue.min(runs), filter: false });
     let bases = [NearestCfg::new(16, 16, 2), NearestCfg::streamed(32, 32, 16, 2), NearestCfg::new(64, 64, 1)];
     let matrices = selects.into_iter().zip(bases).map(|(s, cfg)| NearestCfg { select: Some(s), ..cfg });
     queued.into_iter().chain(matrices).collect()
@@ -864,6 +905,8 @@ proptest! {
         panel in 1usize..40,
         cols in 1usize..300,
         f16 in any::<bool>(),
+        filtered in any::<bool>(),
+        shares in 1usize..5,
         seed in any::<u64>(),
     ) {
         let case = Case::draw(n, m, d, draw, seed);
@@ -873,7 +916,8 @@ proptest! {
             None => case.listed(cfg, k),
             Some(_) => {
                 let device = crate::sweep::declared(crate::atoms::sm86());
-                case.selected(cfg, k, (panel, cols), &device, &|prog, _, params| run(&prog, params, &[]).unwrap())
+                let interpret = |prog, _: &_, params| run(&prog, params, &[]).unwrap();
+                case.selected(cfg, k, (panel, cols), filtered.then_some(shares), &device, &interpret)
             }
         };
         case.check_list("interpreter", k, &score, &index, 1e-4, draw.integer);
@@ -901,8 +945,12 @@ fn long_lists_match_in_every_regime(metric: Metric, floors: Floors, groups: Opti
             for cfg in long_cfgs(k) {
                 lists.push((format!("{cfg:?}"), case.listed(cfg, k)));
                 if cfg.select.is_some() {
-                    let blocks = case.selected(cfg, k, (17, 40), &device, &interpret);
-                    lists.push((format!("{cfg:?} in blocks"), blocks));
+                    for shares in [None, Some(1)] {
+                        let blocks = case.selected(cfg, k, (17, 40), shares, &device, &interpret);
+                        lists.push((format!("{cfg:?} in blocks filtered {shares:?}"), blocks));
+                    }
+                    let whole = case.selected(cfg, k, (case.n, case.m), Some(3), &device, &interpret);
+                    lists.push((format!("{cfg:?} filtered in shares"), whole));
                 }
             }
             for (what, (score, index)) in &lists {
@@ -910,6 +958,42 @@ fn long_lists_match_in_every_regime(metric: Metric, floors: Floors, groups: Opti
                 assert_eq!((score, index), (&lists[0].1.0, &lists[0].1.1), "{what} k{k}");
             }
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    /// A score matrix listed through the `k` least of its trips' leasts,
+    /// many more than `k` (most trips passed over unread), keeps each row's
+    /// `k` least as the unfiltered listing does, bit for bit, over any shape
+    /// and blocks, every metric, floors and groups, exact ties (a tie at the
+    /// bound included), in bf16 and f16; past a row's admissible candidates
+    /// `+∞` at −1.
+    #[test]
+    fn filtered_lists_match_the_unfiltered(
+        n in 1usize..24,
+        m in 1usize..400,
+        d in 1usize..24,
+        draw in draws(),
+        k in 1usize..12,
+        bkv in prop::sample::select(vec![16usize, 32]),
+        panel in 1usize..24,
+        cols in 16usize..400,
+        shares in 1usize..6,
+        f16 in any::<bool>(),
+        seed in any::<u64>(),
+    ) {
+        let case = Case::draw(n, m, d, draw, seed);
+        let case = if f16 { case.in_f16() } else { case };
+        let select = SelectCfg { warps: 2, queue: 1, filter: false };
+        let cfg = NearestCfg { select: Some(select), ..NearestCfg::new(16, bkv, 2) };
+        let device = crate::sweep::declared(crate::atoms::sm86());
+        let interpret = |prog, _: &_, params| run(&prog, params, &[]).unwrap();
+        // Blocks of whole rows (`cols` past `m`) list in shares.
+        let filtered = case.selected(cfg, k, (panel, cols), Some(shares), &device, &interpret);
+        let whole = case.selected(cfg, k, (panel, cols), None, &device, &interpret);
+        case.check_list("filtered", k, &filtered.0, &filtered.1, 1e-4, draw.integer);
+        prop_assert_eq!(filtered, whole);
     }
 }
 
@@ -1051,12 +1135,13 @@ fn splits_serve_rereads_and_idle_sms(target: Target) {
     assert_eq!(timed.len(), 4, "{timed:?}");
 }
 
-/// A few queries over many candidates leave SMs idle whole: each list way
-/// but a score matrix (its scores stored whole) splits its candidates
-/// into shares of at least four candidate tiles a score,
-/// until the grid's blocks reach half the SMs at least, a register list and
-/// a queued one alike, resident and streamed; a self-join's resident tiles
-/// at depth 128 fill them whole.
+/// A few queries over many candidates leave SMs idle whole: each way of the
+/// ranking's front splits its candidates into shares of at least four
+/// candidate tiles a score of a list (a score matrix's shares store their
+/// scores, four tiles each, as a least's), until the grid's blocks reach
+/// half the SMs at least, register lists, queued ones and score matrices
+/// alike, resident and streamed; a self-join's resident tiles at depth 128
+/// fill them whole.
 #[test_case(crate::atoms::sm86(); "sm_86")]
 #[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64); "gfx1201")]
 #[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40); "gfx1151")]
@@ -1065,23 +1150,16 @@ fn few_queries_split_their_lists_to_fill_the_gpu(target: Target) {
     let m = 1 << 20;
     for (n, d, k) in [(256, 128, 16), (256, 768, 64), (1024, 128, 64), (1024, 768, 256), (256, 128, 256)] {
         let p = config::Nearest { m, ..self_join(n, n, d, Metric::NegDot, k) };
-        let ranked = planner.nearest_ranked(p);
-        let mut ways = std::collections::HashSet::new();
-        for cfg in first_eight(&ranked) {
+        for cfg in first_eight(&planner.nearest_ranked(p)) {
             let split = planner.nearest_split(&p, &cfg);
             eprintln!("n {n} d {d} k {k} {cfg:?}: {split:?}");
-            if cfg.select.is_some() {
-                assert_eq!(split, None, "{cfg:?}");
-                continue;
-            }
             let s = split.unwrap_or_else(|| panic!("n {n} d {d} k {k} {cfg:?} splits"));
-            assert!(s.is_power_of_two() && m.div_ceil(cfg.bkv) / s >= 4 * k, "{cfg:?}: {s}");
+            let per = if cfg.select.is_some() { 1 } else { k };
+            assert!(s.is_power_of_two() && m.div_ceil(cfg.bkv) / s >= 4 * per, "{cfg:?}: {s}");
             // At least half the SMs: past that, a round more of blocks or a
             // long list filled again in every share may cost more.
             assert!(2 * n.div_ceil(cfg.bq) * s >= planner.sms(), "{cfg:?}: {s} shares leave SMs idle");
-            ways.insert(cfg.queue.is_some());
         }
-        assert!(!ways.is_empty(), "n {n} d {d} k {k}: a way splits");
     }
     let resident = NearestCfg::new(128, 64, 2);
     assert_eq!(planner.nearest_split(&self_join(1 << 16, 1 << 16, 128, Metric::NegDot, 16), &resident), None);

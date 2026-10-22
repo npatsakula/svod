@@ -101,6 +101,9 @@ impl Case {
         let vars: Vec<(&str, i64)> = rows_var.chain(live.k.iter().map(|_| (LIST, k as i64))).collect();
         let (score, index) = match cfg.select {
             Some(select) => {
+                // Filtered, its bound read at the live length.
+                let select = SelectCfg { filter: true, ..select };
+                let cfg = NearestCfg { select: Some(select), ..cfg };
                 let (scored, listing) = (cfg.lowering(device), select.lowering(device));
                 let (mut score, mut index) = (vec![], vec![]);
                 for r0 in (0..self.n).step_by(panel) {
@@ -114,16 +117,45 @@ impl Case {
                         let part = self.part(held, c0..c0 + width);
                         let mut params = part.params(depth, 1, kmax);
                         params.truncate(params.len() - 2);
-                        params.push(vec![0.0; rows * width]);
+                        let groups = width.div_ceil(cfg.bkv);
+                        params.extend([vec![0.0; rows * width], vec![0.0; rows * groups]]);
                         let spec = NearestSpec { n: rows, m: width, live: live.clone(), ..part.spec(depth, cfg, kmax) };
-                        let matrix = exec(part.compiled(&spec), &scored, params, &vars).pop().unwrap();
-                        let (metric, first, live) = (self.metric, c0 == 0, live.clone());
-                        let spec = SelectSpec { n: rows, cols: width, k: kmax, metric, first, cfg: select, live };
+                        let mut out = exec(part.compiled(&spec), &scored, params, &vars);
+                        let (mins, matrix) = (out.pop().unwrap(), out.pop().unwrap());
+                        let (metric, first) = (self.metric, c0 == 0);
+                        let spec = |cols, first, filter, shares| SelectSpec {
+                            n: rows,
+                            cols,
+                            k: kmax,
+                            metric,
+                            first,
+                            cfg: select,
+                            live: live.clone(),
+                            wide: select.wide(device.target.wave),
+                            filter,
+                            shares,
+                        };
+                        // Filtered by the live `k`-th of the trips' leasts.
+                        let lists_out = vec![vec![0.0; rows * kmax]; 2];
+                        let params = [vec![mins.clone(), vec![0.0; 2]], lists_out].concat();
+                        let mut out = exec(nearest_select(&spec(groups, true, None, 1)), &listing, params, &vars);
+                        out.truncate(out.len() - 1);
+                        let filter = vec![mins, out.pop().unwrap()];
+                        // Whole rows list in two shares, merged at the live length.
+                        let shares = if width == self.m { spec(width, true, None, 1).steps().min(2) } else { 1 };
+                        let spec = spec(width, first, Some(cfg.bkv), shares);
                         let chunk = vec![c0 as f64, f64::from(c0 + width == self.m)];
                         let carried = if first { vec![] } else { lists };
-                        let params = [vec![matrix, chunk], carried, vec![vec![0.0; rows * kmax]; 2]].concat();
+                        let parts = kmax * if shares > 1 { shares * share_stride(rows) } else { rows };
+                        let params = [vec![matrix, chunk], carried, filter, vec![vec![0.0; parts]; 2]].concat();
                         let mut out = exec(nearest_select(&spec), &listing, params, &vars);
                         lists = out.split_off(out.len() - 2);
+                        if shares > 1 {
+                            let merge = MergeSpec { n: rows, splits: shares, metric, k: kmax, live: live.clone() };
+                            let params = [lists, vec![vec![0.0; rows * kmax]; 2]].concat();
+                            let mut out = exec(nearest_merge(&merge), &merge.lowering(device), params, &vars);
+                            lists = out.split_off(out.len() - 2);
+                        }
                     }
                     score.extend(&lists[0]);
                     index.extend(&lists[1]);
@@ -226,8 +258,8 @@ proptest! {
 #[test_case(NearestCfg { queue: Some(16), splits: 3, ..NearestCfg::new(32, 16, 2) }, 100; "split queued")]
 #[test_case(NearestCfg { queue: Some(32), ..NearestCfg::streamed(32, 32, 16, 1) }, 256; "streamed queued")]
 #[test_case(NearestCfg { queue: Some(32), splits: 4, ..NearestCfg::streamed(32, 32, 16, 1) }, 256; "split streamed queued")]
-#[test_case(NearestCfg { select: Some(SelectCfg { warps: 2, queue: 2 }), ..NearestCfg::new(16, 16, 2) }, 100; "score matrix")]
-#[test_case(NearestCfg { select: Some(SelectCfg { warps: 4, queue: 8 }), ..NearestCfg::new(64, 64, 1) }, 1024; "score matrix 1024")]
+#[test_case(NearestCfg { select: Some(SelectCfg { warps: 2, queue: 2, filter: false }), ..NearestCfg::new(16, 16, 2) }, 100; "score matrix")]
+#[test_case(NearestCfg { select: Some(SelectCfg { warps: 4, queue: 8, filter: false }), ..NearestCfg::new(64, 64, 1) }, 1024; "score matrix 1024")]
 fn live_bounds_keep_their_edges(cfg: NearestCfg, kmax: usize) {
     let cap = 45;
     for m in [150, 20] {
@@ -440,8 +472,12 @@ fn live_rows_span_the_panels_of_a_score_matrix() {
         let pick = way(false, true, 1);
         let panels = |planner: &Planner, ranked: &[NearestCfg], spec: NearestSpec| {
             let spec = pick(planner, ranked, spec);
-            let (panel, _) = crate::kernels::nearest::select_blocks(spec.n, spec.m, spec.k, &spec.cfg);
-            assert!(panel < cap && panel > 1, "{panel} rows a panel of {cap}");
+            // Panels where an eighth of the device's memory is short of the
+            // matrix (12 GB and less), whole rows past it.
+            let scratch = crate::kernels::nearest::scratch(planner.device.target.memory_bytes);
+            let (panel, _) = crate::kernels::nearest::select_blocks(spec.n, spec.m, spec.k, &spec.cfg, scratch);
+            let paneled = spec.n * spec.m > scratch;
+            assert!(panel > 1 && (panel < cap) == paneled, "{panel} rows a panel of {cap} under {scratch}");
             spec
         };
         let bindings = [(cap, kmax), (100, kmax), (131_073, 7), (cap - 1, 1)];
