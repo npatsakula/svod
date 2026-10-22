@@ -143,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The pipeline owns the tokenizer + chunker + classifier; the chunk seam
     // (classify_tokens_chunks) bypasses the first two, so we drive them
     // explicitly here to tokenize + window once, then feed the chunks back in.
-    let mut pipeline = EncoderPipeline::new(tokenizer, chunker, classifier);
+    let mut pipeline = EncoderPipeline::new(tokenizer, chunker, classifier)?;
 
     println!("\nTagging {} chars via the chunk seam (scheme = {})...", text.len(), args.scheme);
     let t = Instant::now();
