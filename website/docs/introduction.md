@@ -57,13 +57,15 @@ The motivation and design are covered in
 | Voice activity | FireRedVAD, Silero VAD |
 | Speech enhancement | GTCRN |
 | Speaker analysis | Nemotron-3-Diarization, DiariZen, WeSpeaker |
-| Text embeddings and reranking | BGE-M3, Qwen3-Embedding, ModernBERT |
+| Text embeddings and reranking | BGE-M3, BGE-reranker-v2-m3, Qwen3-Embedding, Qwen3-Reranker, ModernBERT |
+| Text classification | ModernBERT and XLM-RoBERTa, each for whole texts and for single tokens |
+| Sentence segmentation | SaT |
 | Vision | YOLO26, ResNet |
 | Anything else | [ONNX importer](https://github.com/npatsakula/svod/tree/main/onnx/) ([op coverage](https://github.com/npatsakula/svod/tree/main/onnx/PARITY.md)) |
 
 Weights come straight from the Hugging Face Hub, and outputs are checked
 against the reference implementations. [`model/`](https://github.com/npatsakula/svod/tree/main/model/) lists variants,
-upstream links and runnable examples; [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) holds the decoders and the long-form audio pipeline.
+upstream links and runnable examples; [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) holds the CTC and RNN-T decoders, the long-form audio pipeline, and the text pipeline. The text pipeline cuts long texts into windows, encodes the windows in batches and merges their results, so an embedding, a score or a labelling covers the text as a whole.
 
 ## Engine
 
@@ -181,7 +183,7 @@ Morok was Svod's earlier name.
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | Lazy tensor API, `nn` modules and the memory planner |
 | [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | Tile language, kernel library, planner and tuner behind the op layer |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX importer |
-| [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | Host-side decoders, VAD segmentation and audio pipelines |
+| [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | Host-side decoders, VAD segmentation, audio and text pipelines |
 | [`model`](https://github.com/npatsakula/svod/tree/main/model/) | Pretrained models and examples |
 
 ## Using the library

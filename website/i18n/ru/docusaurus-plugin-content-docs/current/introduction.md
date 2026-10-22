@@ -57,13 +57,15 @@ Svod поставляется с речевыми, текстовыми и ви�
 | Детекция речи (VAD) | FireRedVAD, Silero VAD |
 | Улучшение речи | GTCRN |
 | Анализ дикторов | Nemotron-3-Diarization, DiariZen, WeSpeaker |
-| Текстовые эмбеддинги и реранкинг | BGE-M3, Qwen3-Embedding, ModernBERT |
+| Текстовые эмбеддинги и реранкинг | BGE-M3, BGE-reranker-v2-m3, Qwen3-Embedding, Qwen3-Reranker, ModernBERT |
+| Классификация текста | ModernBERT и XLM-RoBERTa: обе модели классифицируют и текст целиком, и отдельные токены |
+| Разбиение на предложения | SaT |
 | Зрение | YOLO26, ResNet |
 | Всё остальное | [Импортёр ONNX](https://github.com/npatsakula/svod/tree/main/onnx/) ([покрытие операторов](https://github.com/npatsakula/svod/tree/main/onnx/PARITY.md)) |
 
 Веса берутся напрямую из Hugging Face Hub, а выходы сверяются с референсными
 реализациями. В [`model/`](https://github.com/npatsakula/svod/tree/main/model/) перечислены варианты, ссылки на
-исходные модели и запускаемые примеры; [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) содержит декодеры и пайплайн для длинного аудио.
+исходные модели и запускаемые примеры; [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) содержит CTC- и RNN-T-декодеры, пайплайн для длинного аудио и текстовый пайплайн. Текстовый пайплайн разбивает длинные тексты на окна, пропускает окна через энкодер батчами и объединяет результаты по окнам, так что эмбеддинг, оценка или разметка получаются для текста целиком.
 
 ## Движок
 
@@ -184,7 +186,7 @@ Morok — прежнее название Svod.
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | Ленивый тензорный API, модули `nn` и планировщик памяти |
 | [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | Тайловый язык, библиотека ядер, планировщик и тюнер за слоем операций |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | Импортёр ONNX |
-| [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | Хост-декодеры, VAD-сегментация и аудио-пайплайны |
+| [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | Хост-декодеры, VAD-сегментация, аудио- и текстовый пайплайны |
 | [`model`](https://github.com/npatsakula/svod/tree/main/model/) | Предобученные модели и примеры |
 
 ## Использование библиотеки
