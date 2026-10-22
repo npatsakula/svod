@@ -37,12 +37,18 @@
 //! **Chunk seam.** The verb `_chunks` variants feed pre-built [`TextChunk`]s,
 //! skipping tokenize/chunk entirely — tokenize once, then reuse the same chunks
 //! across several pipelines. Their profile carries encoder stages only.
+//!
+//! **Pairs.** A cross-encoder reads two texts as one sequence: a
+//! [`PairTokenizer`] encodes them, the chunkers cut or window the second text
+//! and keep the first whole, and [`classify_pair`](EncoderPipeline::classify_pair)
+//! scores them.
 
+use std::ops::Range;
 #[cfg(feature = "hf-tokenizers")]
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use snafu::{ResultExt, Snafu, ensure};
+use snafu::{OptionExt, ResultExt, Snafu, ensure};
 
 pub use svod_runtime::RunProfile;
 use svod_runtime::StageProfile;
@@ -110,10 +116,11 @@ impl From<()> for RunOptions {
 
 // ─── Encoding (tokenizer output) ────────────────────────────────────────────
 
-/// The tokenized form of one input: ids and the masks/offsets HF `tokenizers`
-/// produces natively. All integer fields are `Vec<u32>` to match HF's types (no
-/// casts in the adapter); the model casts to its buffer dtype at the boundary.
-#[derive(Clone, Debug)]
+/// The tokenized form of one input — a text, or a pair of texts: ids and the
+/// masks/offsets HF `tokenizers` produces natively. Every field keeps HF's own
+/// type (no casts in the adapter); the model casts to its buffer dtype at the
+/// boundary.
+#[derive(Clone, Debug, Default)]
 pub struct Encoding {
     pub input_ids: Vec<u32>,
     pub attention_mask: Vec<u32>,
@@ -122,14 +129,22 @@ pub struct Encoding {
     /// Byte offsets into the source text (HF `tokenizers` default). Each entry
     /// is the `(start, end)` byte span of one token; byte offsets (not char) so
     /// they index `&str` directly. Token classification re-bases per-token
-    /// entity spans through these.
+    /// entity spans through these. A pair's second text has offsets into
+    /// itself, not into the first.
     pub offsets: Vec<(usize, usize)>,
     pub special_tokens_mask: Vec<u32>,
+    /// The text each token comes from (HF `get_sequence_ids`): `None` for a
+    /// special, `Some(0)` / `Some(1)` for a pair's first / second text. Empty
+    /// when not recorded: the chunkers then read the encoding as one text.
+    pub sequence_ids: Vec<Option<usize>>,
+    /// Whether this encodes a pair (HF `n_sequences() == 2`) — set even when
+    /// the second text has no tokens, which leaves no `Some(1)` to find.
+    pub pair: bool,
 }
 
 impl Encoding {
-    /// Copy the five getter slices out of an HF `Encoding`. The borrow ends
-    /// here — the adapter owns its own `Vec`s, so the source can be dropped.
+    /// Copy the getter slices out of an HF `Encoding`. The borrow ends here —
+    /// the adapter owns its own `Vec`s, so the source can be dropped.
     #[cfg(feature = "hf-tokenizers")]
     pub fn from_hf(enc: &tokenizers::Encoding) -> Self {
         Self {
@@ -138,6 +153,8 @@ impl Encoding {
             token_type_ids: enc.get_type_ids().to_vec(),
             offsets: enc.get_offsets().to_vec(),
             special_tokens_mask: enc.get_special_tokens_mask().to_vec(),
+            sequence_ids: enc.get_sequence_ids(),
+            pair: enc.n_sequences() == 2,
         }
     }
 
@@ -162,6 +179,20 @@ pub trait Tokenizer {
     /// Encode several inputs. Defaults to looping [`encode`](Tokenizer::encode).
     fn encode_batch(&mut self, texts: &[&str]) -> Result<Vec<Encoding>, Self::Error> {
         texts.iter().map(|t| self.encode(t)).collect()
+    }
+}
+
+/// A [`Tokenizer`] that also encodes a pair of texts into one sequence, as a
+/// cross-encoder (reranker, NLI) reads it — `[CLS] first [SEP] second [SEP]`
+/// or the checkpoint's own template — with [`Encoding::sequence_ids`] and
+/// [`Encoding::pair`] set.
+pub trait PairTokenizer: Tokenizer {
+    fn encode_pair(&mut self, first: &str, second: &str) -> Result<Encoding, Self::Error>;
+
+    /// Encode several pairs. Defaults to looping
+    /// [`encode_pair`](PairTokenizer::encode_pair).
+    fn encode_pair_batch(&mut self, pairs: &[(&str, &str)]) -> Result<Vec<Encoding>, Self::Error> {
+        pairs.iter().map(|&(first, second)| self.encode_pair(first, second)).collect()
     }
 }
 
@@ -201,11 +232,14 @@ impl From<tokenizers::Error> for HfTokenizerError {
 }
 
 #[cfg(feature = "hf-tokenizers")]
-/// The provided [`Tokenizer`] impl: wraps a HuggingFace `tokenizers::Tokenizer`.
+/// The provided [`Tokenizer`] and [`PairTokenizer`] impl: wraps a HuggingFace
+/// `tokenizers::Tokenizer`.
 ///
-/// `encode` calls `inner.encode(text, add_special_tokens = true)`. It does
-/// **not** configure truncation/padding — the [`Chunker`] owns the `max_seq`
-/// policy, so [`SlidingWindowChunker`] can still see the full token stream.
+/// `encode` calls `inner.encode(text, add_special_tokens = true)`. The
+/// [`Chunker`] owns the `max_seq` policy, so [`new`](Self::new) clears the
+/// truncation and padding a `tokenizer.json` may carry (the CoNLL NER
+/// fine-tune cuts at 512): [`SlidingWindowChunker`] sees the full token stream,
+/// as Python `transformers` does unless asked to truncate.
 ///
 /// HF fetching (`from_hub(repo)`) is intentionally absent here — `hf-hub` lives
 /// in `svod-model`, which fetches `tokenizer.json` and hands the cached path to
@@ -216,7 +250,9 @@ pub struct HfTokenizer {
 
 #[cfg(feature = "hf-tokenizers")]
 impl HfTokenizer {
-    pub fn new(inner: tokenizers::Tokenizer) -> Self {
+    pub fn new(mut inner: tokenizers::Tokenizer) -> Self {
+        inner.with_truncation(None).expect("clearing truncation checks nothing");
+        inner.with_padding(None);
         Self { inner }
     }
 
@@ -244,8 +280,20 @@ impl Tokenizer for HfTokenizer {
     }
 
     fn encode_batch(&mut self, texts: &[&str]) -> Result<Vec<Encoding>, HfTokenizerError> {
-        let inputs: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
-        let encs = self.inner.encode_batch(inputs, true)?;
+        let encs = self.inner.encode_batch(texts.to_vec(), true)?;
+        Ok(encs.iter().map(Encoding::from_hf).collect())
+    }
+}
+
+#[cfg(feature = "hf-tokenizers")]
+impl PairTokenizer for HfTokenizer {
+    fn encode_pair(&mut self, first: &str, second: &str) -> Result<Encoding, HfTokenizerError> {
+        let enc = self.inner.encode((first, second), true)?;
+        Ok(Encoding::from_hf(&enc))
+    }
+
+    fn encode_pair_batch(&mut self, pairs: &[(&str, &str)]) -> Result<Vec<Encoding>, HfTokenizerError> {
+        let encs = self.inner.encode_batch(pairs.to_vec(), true)?;
         Ok(encs.iter().map(Encoding::from_hf).collect())
     }
 }
@@ -253,13 +301,15 @@ impl Tokenizer for HfTokenizer {
 // ─── Chunker (chunk source) ─────────────────────────────────────────────────
 
 /// One chunked slice of an [`Encoding`], plus where it begins in the source:
-/// the byte offset and the token index of its first content token.
+/// the byte offset and the token index of its first content token. For a pair
+/// both refer to its second text, the one a chunker truncates or windows.
 #[derive(Clone, Debug)]
 pub struct TextChunk {
     pub encoding: Encoding,
     pub byte_offset: usize,
     /// The index of the chunk's first content token among the source
-    /// encoding's content tokens (those between its boundary specials).
+    /// encoding's content tokens (those between its boundary specials, or a
+    /// pair's second text).
     pub first_token: usize,
 }
 
@@ -283,61 +333,7 @@ pub trait Chunker {
     }
 }
 
-/// Drops ids beyond `max_seq` and emits a single chunk at `byte_offset = 0`. For
-/// long documents that exceed `max_seq`, use [`SlidingWindowChunker`].
-#[derive(Debug)]
-pub struct TruncatingChunker {
-    max_seq: usize,
-}
-
-/// Construction error for [`TruncatingChunker`]: the only invariant is
-/// `max_seq >= 1` (zero would slice to an empty chunk). [`chunk`](Chunker::chunk)
-/// itself is infallible, so this type carries no chunk-time variants.
-#[derive(Debug, Snafu)]
-pub enum TruncatingChunkerError {
-    #[snafu(display("max_seq must be >= 1"))]
-    MaxSeqTooSmall,
-}
-
-impl TruncatingChunker {
-    /// Fallible form of [`new`](Self::new): returns `Err` unless `max_seq >= 1`.
-    pub fn try_new(max_seq: usize) -> Result<Self, TruncatingChunkerError> {
-        ensure!(max_seq >= 1, MaxSeqTooSmallSnafu);
-        Ok(Self { max_seq })
-    }
-
-    /// Panics unless `max_seq >= 1`. A convenience over
-    /// [`try_new`](Self::try_new) for callers with known-valid args.
-    pub fn new(max_seq: usize) -> Self {
-        Self::try_new(max_seq).unwrap_or_else(|e| match e {
-            TruncatingChunkerError::MaxSeqTooSmall => panic!("max_seq must be >= 1"),
-        })
-    }
-}
-
-impl Chunker for TruncatingChunker {
-    type Error = std::convert::Infallible;
-
-    fn max_seq(&self) -> usize {
-        self.max_seq
-    }
-
-    fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, std::convert::Infallible> {
-        // Keep every field's length consistent: slice to the common cap so ids,
-        // masks, and offsets stay aligned.
-        let take = self.max_seq.min(enc.input_ids.len());
-        let encoding = Encoding {
-            input_ids: enc.input_ids[..take].to_vec(),
-            attention_mask: enc.attention_mask[..take].to_vec(),
-            token_type_ids: enc.token_type_ids[..take].to_vec(),
-            offsets: enc.offsets[..take].to_vec(),
-            special_tokens_mask: enc.special_tokens_mask[..take].to_vec(),
-        };
-        Ok(vec![TextChunk { encoding, byte_offset: 0, first_token: 0 }])
-    }
-}
-
-// ─── SlidingWindowChunker ────────────────────────────────────────────────────
+// ─── Chunk geometry ─────────────────────────────────────────────────────────
 
 /// Detect boundary special-token counts: leading and trailing runs of
 /// `special_tokens_mask == 1`. Interior specials (e.g. `[UNK]`) remain content.
@@ -347,49 +343,221 @@ fn boundary_specials(mask: &[u32]) -> (usize, usize) {
     (lead, trail)
 }
 
-/// Reassemble one windowed [`Encoding`]: `lead` boundary specials from the head,
-/// the content body `[body_start..body_end]`, then `trail` specials from the
-/// tail. All five fields are built in lockstep.
-fn build_window(enc: &Encoding, lead: usize, trail: usize, content_start: usize, content_end: usize) -> Encoding {
-    let body_start = lead + content_start;
-    let body_end = lead + content_end;
-    let tail_start = enc.input_ids.len() - trail;
+/// Where an encoding's parts lie, as token ranges in order. `prefix` is kept
+/// whole ahead of the content: the leading specials, and for a pair its first
+/// text and the specials after it. `first` is a pair's first text (empty for
+/// one text), `content` the text a chunker truncates or windows (the only
+/// text, or a pair's second), and `trail` the trailing specials.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Segments {
+    prefix: Range<usize>,
+    first: Range<usize>,
+    content: Range<usize>,
+    trail: Range<usize>,
+}
 
-    fn reassemble<T: Clone>(v: &[T], lead: usize, body_start: usize, body_end: usize, tail_start: usize) -> Vec<T> {
-        let mut out = Vec::with_capacity(lead + (body_end - body_start) + (v.len() - tail_start));
-        out.extend_from_slice(&v[..lead]);
-        out.extend_from_slice(&v[body_start..body_end]);
-        out.extend_from_slice(&v[tail_start..]);
-        out
-    }
-
-    Encoding {
-        input_ids: reassemble(&enc.input_ids, lead, body_start, body_end, tail_start),
-        attention_mask: reassemble(&enc.attention_mask, lead, body_start, body_end, tail_start),
-        token_type_ids: reassemble(&enc.token_type_ids, lead, body_start, body_end, tail_start),
-        offsets: reassemble(&enc.offsets, lead, body_start, body_end, tail_start),
-        special_tokens_mask: reassemble(&enc.special_tokens_mask, lead, body_start, body_end, tail_start),
+impl Segments {
+    fn of(enc: &Encoding) -> Self {
+        let len = enc.len();
+        if enc.pair && enc.sequence_ids.len() == len {
+            let span = |id| {
+                let start = enc.sequence_ids.iter().position(|&s| s == Some(id))?;
+                let end = enc.sequence_ids.iter().rposition(|&s| s == Some(id))? + 1;
+                Some(start..end)
+            };
+            // An empty second text leaves the whole encoding fixed, so where
+            // its empty range sits among the specials changes nothing.
+            let content = span(1).unwrap_or(len..len);
+            let first = span(0).unwrap_or(content.start..content.start);
+            return Self { prefix: 0..content.start, first, trail: content.end..len, content };
+        }
+        let (lead, trail) = boundary_specials(&enc.special_tokens_mask);
+        Self { prefix: 0..lead, first: lead..lead, content: lead..len - trail, trail: len - trail..len }
     }
 }
 
+/// Copy the listed token ranges of every field, in order, into one encoding.
+fn gather(enc: &Encoding, ranges: &[Range<usize>]) -> Encoding {
+    fn pick<T: Clone>(v: &[T], ranges: &[Range<usize>]) -> Vec<T> {
+        let mut out = Vec::with_capacity(ranges.iter().map(|r| r.len()).sum());
+        for r in ranges {
+            out.extend_from_slice(&v[r.clone()]);
+        }
+        out
+    }
+    let recorded = enc.sequence_ids.len() == enc.len();
+    Encoding {
+        input_ids: pick(&enc.input_ids, ranges),
+        attention_mask: pick(&enc.attention_mask, ranges),
+        token_type_ids: pick(&enc.token_type_ids, ranges),
+        offsets: pick(&enc.offsets, ranges),
+        special_tokens_mask: pick(&enc.special_tokens_mask, ranges),
+        sequence_ids: if recorded { pick(&enc.sequence_ids, ranges) } else { Vec::new() },
+        pair: enc.pair,
+    }
+}
+
+// ─── TruncatingChunker ──────────────────────────────────────────────────────
+
+/// Cuts an input to `max_seq` tokens, its boundary specials kept, and emits it
+/// as one chunk at `byte_offset = 0`: a text keeps its first `max_seq -
+/// specials` content tokens, and a pair is cut as its [`PairTruncation`] says.
+/// For long documents that exceed `max_seq`, use [`SlidingWindowChunker`].
+#[derive(Debug)]
+pub struct TruncatingChunker {
+    max_seq: usize,
+    pair_truncation: PairTruncation,
+}
+
+/// How [`TruncatingChunker`] shortens a pair, as HF `tokenizers` does, errors
+/// included. A single text is always cut as itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PairTruncation {
+    /// Cut the longer text first; when both must give, split the budget
+    /// evenly, the odd token to the longer (HF's default).
+    #[default]
+    LongestFirst,
+    /// Cut the first text only.
+    OnlyFirst,
+    /// Cut the second text only.
+    OnlySecond,
+}
+
+/// Error from [`TruncatingChunker`]: [`try_new`](TruncatingChunker::try_new)
+/// rejects `max_seq == 0`; [`chunk`](Chunker::chunk) fails when the input's
+/// specials alone exceed `max_seq`, or when the one text an `Only*`
+/// [`PairTruncation`] may cut cannot absorb the excess.
+#[derive(Debug, Snafu)]
+pub enum TruncatingChunkerError {
+    #[snafu(display("max_seq must be >= 1"))]
+    MaxSeqTooSmall,
+    #[snafu(display("max_seq ({max_seq}) is below the input's {specials} special tokens"))]
+    MaxSeqTooSmallForSpecials { max_seq: usize, specials: usize },
+    #[snafu(display("{strategy:?} cannot remove {excess} tokens from a text of {len}"))]
+    PairTooLong { strategy: PairTruncation, len: usize, excess: usize },
+}
+
+impl TruncatingChunker {
+    /// Fallible form of [`new`](Self::new): returns `Err` unless `max_seq >= 1`.
+    pub fn try_new(max_seq: usize) -> Result<Self, TruncatingChunkerError> {
+        ensure!(max_seq >= 1, MaxSeqTooSmallSnafu);
+        Ok(Self { max_seq, pair_truncation: PairTruncation::default() })
+    }
+
+    /// Panics unless `max_seq >= 1`. A convenience over
+    /// [`try_new`](Self::try_new) for callers with known-valid args.
+    pub fn new(max_seq: usize) -> Self {
+        Self::try_new(max_seq).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Shorten pairs as `strategy` says ([`PairTruncation::LongestFirst`]
+    /// unless set).
+    pub fn with_pair_truncation(mut self, strategy: PairTruncation) -> Self {
+        self.pair_truncation = strategy;
+        self
+    }
+}
+
+/// The lengths a pair's texts keep within `budget` content tokens: HF
+/// `tokenizers`' `truncate_encodings` arithmetic, errors included, as
+/// tokenizers 0.22 (and Python `transformers` on it) truncates. 0.23's
+/// `encode` also cuts each text to `max_length` while it tokenizes, which can
+/// flip which text LongestFirst takes for the longer.
+fn pair_lengths(
+    n1: usize,
+    n2: usize,
+    budget: usize,
+    strategy: PairTruncation,
+) -> Result<(usize, usize), TruncatingChunkerError> {
+    let excess = (n1 + n2).saturating_sub(budget);
+    if excess == 0 {
+        return Ok((n1, n2));
+    }
+    if budget == 0 {
+        return Ok((0, 0));
+    }
+    match strategy {
+        PairTruncation::LongestFirst => {
+            let short = n1.min(n2);
+            let mut keep = (short, if short > budget { short } else { short.max(budget - short) });
+            if keep.0 + keep.1 > budget {
+                keep = (budget / 2, budget / 2 + budget % 2);
+            }
+            let (k1, k2) = if n1 > n2 { (keep.1, keep.0) } else { keep };
+            Ok((n1.min(k1), n2.min(k2)))
+        }
+        PairTruncation::OnlyFirst => {
+            ensure!(n1 > excess, PairTooLongSnafu { strategy, len: n1, excess });
+            Ok((n1 - excess, n2))
+        }
+        PairTruncation::OnlySecond => {
+            ensure!(n2 > excess, PairTooLongSnafu { strategy, len: n2, excess });
+            Ok((n1, n2 - excess))
+        }
+    }
+}
+
+impl Chunker for TruncatingChunker {
+    type Error = TruncatingChunkerError;
+
+    fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+
+    fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, TruncatingChunkerError> {
+        if enc.is_empty() {
+            return Ok(Vec::new());
+        }
+        let encoding = if enc.len() <= self.max_seq {
+            enc.clone()
+        } else {
+            let s = Segments::of(enc);
+            let specials = enc.len() - s.first.len() - s.content.len();
+            let budget = (self.max_seq.checked_sub(specials))
+                .context(MaxSeqTooSmallForSpecialsSnafu { max_seq: self.max_seq, specials })?;
+            let (n1, n2) = if enc.pair {
+                pair_lengths(s.first.len(), s.content.len(), budget, self.pair_truncation)?
+            } else {
+                (0, budget)
+            };
+            gather(
+                enc,
+                &[
+                    0..s.first.start,
+                    s.first.start..s.first.start + n1,
+                    s.first.end..s.content.start,
+                    s.content.start..s.content.start + n2,
+                    s.trail,
+                ],
+            )
+        };
+        Ok(vec![TextChunk { encoding, byte_offset: 0, first_token: 0 }])
+    }
+}
+
+// ─── SlidingWindowChunker ────────────────────────────────────────────────────
+
 /// Windows a long token stream into overlapping chunks of `window` total tokens
-/// (specials + content), advancing `stride` tokens per step. Each window is a
-/// well-formed sequence: boundary specials (`[CLS]`/`[SEP]` for BERT/ModernBERT)
-/// are re-attached to every window, detected generically from
-/// `special_tokens_mask` rather than hardcoded.
+/// (fixed tokens + content), advancing `stride` tokens per step. Each window is
+/// a well-formed sequence: the fixed tokens are re-attached to every window —
+/// the boundary specials (`[CLS]`/`[SEP]` for BERT/ModernBERT), detected
+/// generically from `special_tokens_mask` rather than hardcoded, and for a
+/// pair its whole first text, so only the second text is windowed (a long
+/// passage under one query).
 ///
 /// `window` is the total per-chunk length — `max_seq()` returns it so the
 /// encoder JIT is sized for full windows. `stride` is the **step** between
 /// consecutive window starts in content-token space: `stride == window` gives
 /// adjacent (non-overlapping) chunks; `stride < window` gives an overlap of
 /// `window - stride` tokens. Clamped to the content length so `stride == window`
-/// never skips content despite specials consuming part of the budget.
+/// never skips content despite the fixed tokens consuming part of the budget.
 ///
 /// The last window may be shorter than `window` when content doesn't divide
 /// evenly — the embedder pads it — unless
 /// [`with_full_last_window`](Self::with_full_last_window) pulls it back. Each
 /// [`TextChunk`] carries the byte offset and the content-token index of its
-/// first content token.
+/// first content token. An input with no content (specials only, or a pair
+/// whose second text is empty) is one window of its fixed tokens.
 #[derive(Debug)]
 pub struct SlidingWindowChunker {
     window: usize,
@@ -399,21 +567,22 @@ pub struct SlidingWindowChunker {
 
 /// Construction / chunk error for [`SlidingWindowChunker`]. The two
 /// construction variants are rejected by [`try_new`](SlidingWindowChunker::try_new);
-/// [`WindowTooSmallForSpecials`](Self::WindowTooSmallForSpecials) is detected at
-/// [`chunk`](Chunker::chunk) time, since the boundary-special budget comes from
-/// the tokenizer's runtime output, not the constructor args.
+/// [`WindowTooSmallForFixed`](Self::WindowTooSmallForFixed) is detected at
+/// [`chunk`](Chunker::chunk) time, since the fixed tokens (the boundary
+/// specials, and a pair's first text) come from the tokenizer's runtime
+/// output, not the constructor args.
 #[derive(Debug, Snafu)]
 pub enum SlidingWindowChunkerError {
     #[snafu(display("window must be >= 1"))]
     WindowTooSmall,
     #[snafu(display("stride must be in 1..=window"))]
     StrideOutOfRange,
-    #[snafu(display("window ({window}) too small for {specials} boundary special tokens"))]
-    WindowTooSmallForSpecials { window: usize, specials: usize },
+    #[snafu(display("window ({window}) leaves no room for content past {fixed} fixed tokens"))]
+    WindowTooSmallForFixed { window: usize, fixed: usize },
 }
 
 impl SlidingWindowChunker {
-    /// `window` = total sequence length per chunk (incl. specials);
+    /// `window` = total sequence length per chunk (incl. fixed tokens);
     /// `stride` = step between window starts. Fallible form of [`new`](Self::new):
     /// returns `Err` unless `1 <= stride <= window`.
     pub fn try_new(window: usize, stride: usize) -> Result<Self, SlidingWindowChunkerError> {
@@ -432,21 +601,11 @@ impl SlidingWindowChunker {
         self
     }
 
-    /// `window` = total sequence length per chunk (incl. specials);
+    /// `window` = total sequence length per chunk (incl. fixed tokens);
     /// `stride` = step between window starts. Panics unless `1 <= stride <= window`.
     /// A convenience over [`try_new`](Self::try_new) for callers with known-valid args.
     pub fn new(window: usize, stride: usize) -> Self {
-        Self::try_new(window, stride).unwrap_or_else(|e| match e {
-            SlidingWindowChunkerError::WindowTooSmall => panic!("window must be >= 1"),
-            SlidingWindowChunkerError::StrideOutOfRange => panic!("stride must be in 1..=window"),
-            SlidingWindowChunkerError::WindowTooSmallForSpecials { .. } => {
-                unreachable!(
-                    "WindowTooSmallForSpecials is only returned by `Chunker::chunk` — when a \
-                     window can't fit the tokenizer's boundary specials — never by `try_new`; \
-                     reaching it here means that construction-time invariant has changed"
-                )
-            }
-        })
+        Self::try_new(window, stride).unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
@@ -458,17 +617,22 @@ impl Chunker for SlidingWindowChunker {
     }
 
     fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, SlidingWindowChunkerError> {
-        let (lead, trail) = boundary_specials(&enc.special_tokens_mask);
-        let content_len = enc.input_ids.len().saturating_sub(lead + trail);
-        if content_len == 0 {
+        if enc.is_empty() {
             return Ok(Vec::new());
         }
+        let s = Segments::of(enc);
+        let fixed = s.prefix.len() + s.trail.len();
+        let content_len = s.content.len();
+        if content_len == 0 {
+            ensure!(fixed <= self.window, WindowTooSmallForFixedSnafu { window: self.window, fixed });
+            return Ok(vec![TextChunk { encoding: enc.clone(), byte_offset: 0, first_token: 0 }]);
+        }
 
-        let specials = lead + trail;
-        let content_window = self.window.saturating_sub(specials);
-        ensure!(content_window >= 1, WindowTooSmallForSpecialsSnafu { window: self.window, specials });
+        let content_window = self.window.saturating_sub(fixed);
+        ensure!(content_window >= 1, WindowTooSmallForFixedSnafu { window: self.window, fixed });
 
         let step = self.stride.min(content_window);
+        let at = s.content.start;
 
         let mut chunks = Vec::new();
         let mut start = 0;
@@ -477,8 +641,8 @@ impl Chunker for SlidingWindowChunker {
                 start = content_len.saturating_sub(content_window);
             }
             let end = (start + content_window).min(content_len);
-            let byte_offset = enc.offsets.get(lead + start).map_or(0, |o| o.0);
-            let encoding = build_window(enc, lead, trail, start, end);
+            let byte_offset = enc.offsets.get(at + start).map_or(0, |o| o.0);
+            let encoding = gather(enc, &[s.prefix.clone(), at + start..at + end, s.trail.clone()]);
             chunks.push(TextChunk { encoding, byte_offset, first_token: start });
             if end >= content_len {
                 break;
@@ -571,6 +735,20 @@ pub struct ChunkTokenClassification {
     pub num_labels: usize,
     pub token_offsets: Vec<(usize, usize)>,
     pub special_tokens_mask: Vec<u32>,
+    /// The token positions of the text the chunker windowed — the only text,
+    /// or a pair's second — which the decoders number from `first_token`.
+    /// `None` (a hand-built chunk) takes the run between the boundary specials.
+    pub content: Option<Range<usize>>,
+}
+
+impl ChunkTokenClassification {
+    /// [`content`](Self::content), or the run between the boundary specials.
+    fn content_range(&self) -> Range<usize> {
+        self.content.clone().unwrap_or_else(|| {
+            let (lead, trail) = boundary_specials(&self.special_tokens_mask);
+            lead..self.special_tokens_mask.len() - trail
+        })
+    }
 }
 
 /// Aggregated token-classification output: one [`ChunkTokenClassification`] per
@@ -705,13 +883,13 @@ type PipelineError<T, C, M> =
 type ModelOutputs<M> = (Vec<<M as EncoderHead>::Output>, Option<RunProfile>);
 
 /// `(position-agnostic outputs, the source chunks they map to, optional profile)`
-/// — the single-text run shape returned by [`EncoderPipeline::run_single_inner`].
+/// — the single-input run shape returned by [`EncoderPipeline::run_one`].
 /// The verb facades pair the parallel `outputs` / `chunks` into position-attached
 /// results. Aliased (`clippy::type_complexity`).
 type SingleRun<M> = (Vec<<M as EncoderHead>::Output>, Vec<TextChunk>, Option<RunProfile>);
 
-/// `(per-text outputs, per-text source chunks, optional profile)` — the batch
-/// run shape returned by [`EncoderPipeline::run_batch_inner`]. Aliased.
+/// `(per-input outputs, per-input source chunks, optional profile)` — the batch
+/// run shape returned by [`EncoderPipeline::run_encoded`]. Aliased.
 type BatchRun<M> = (Vec<Vec<<M as EncoderHead>::Output>>, Vec<Vec<TextChunk>>, Option<RunProfile>);
 
 /// `(per-text model outputs, optional profile)` — the batch chunk-seam shape
@@ -759,53 +937,26 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
         Ok((all, merged_prof))
     }
 
-    /// Tokenize → chunk → encode → assemble profile for a single text. Returns
-    /// the position-agnostic outputs, the source chunks they map to, and the
-    /// assembled profile; the verb facades pair outputs↔chunks into the named
-    /// aggregate ([`Embeddings`] / [`Classifications`] / …). [`RunOptions`] is a
-    /// per-call switch: the same pipeline serves profiled and unprofiled runs
-    /// without rebuilding. When `opts.profile` is set, the tokenize and chunk
-    /// stages are timed and recorded ahead of the encoder's stages — so the
-    /// profile leads with `[tokenize, <chunker label>, <encoder …>]`.
-    fn run_single_inner(&mut self, text: &str, opts: RunOptions) -> Result<SingleRun<M>, PipelineError<T, C, M>> {
-        let t = Instant::now();
-        let encoding = self.tokenizer.encode(text).context(TokenizeSnafu)?;
-        let tok_wall = t.elapsed();
-
-        let t = Instant::now();
-        let chunks = self.chunker.chunk(&encoding).context(ChunkSnafu)?;
-        let chunk_wall = t.elapsed();
-
-        let chunk_refs: Vec<&TextChunk> = chunks.iter().collect();
-        let (outputs, enc_prof) = self.run_chunks_flat(&chunk_refs, opts.profile).context(EncodeSnafu)?;
-
-        let profile = opts.profile.then(|| {
-            let mut p = RunProfile::default();
-            p.push(StageProfile::host("tokenize", tok_wall));
-            p.push(StageProfile::host(self.chunker.profile_label(), chunk_wall));
-            if let Some(rest) = enc_prof {
-                p.merge(rest);
-            }
-            p
-        });
-        Ok((outputs, chunks, profile))
-    }
-
-    /// Tokenize → chunk → encode multiple texts in one call. All chunks from all
-    /// texts are flattened into a single stream and batched through the encoder
-    /// (sub-batched to `model.capacity().0` when the total exceeds it),
-    /// maximizing throughput. Returns one (outputs, chunks) pair per input text —
-    /// moved out of the flat stream by each text's chunk count — plus a shared
-    /// batch-level profile.
-    fn run_batch_inner(&mut self, texts: &[&str], opts: RunOptions) -> Result<BatchRun<M>, PipelineError<T, C, M>> {
-        let t = Instant::now();
-        let encodings = self.tokenizer.encode_batch(texts).context(TokenizeSnafu)?;
-        let tok_wall = t.elapsed();
-
+    /// Chunk → encode → assemble profile for tokenized inputs (texts or pairs).
+    /// All chunks from all inputs are flattened into a single stream and
+    /// batched through the encoder (sub-batched to `model.capacity().0` when
+    /// the total exceeds it), maximizing throughput. Returns one (outputs,
+    /// chunks) pair per input — moved out of the flat stream by each input's
+    /// chunk count — plus a shared profile. [`RunOptions`] is a per-call switch:
+    /// the same pipeline serves profiled and unprofiled runs without
+    /// rebuilding. When `opts.profile` is set, the profile leads with
+    /// `[tokenize, <chunker label>, <encoder …>]`, `tok_wall` timing the
+    /// tokenize stage the caller ran.
+    fn run_encoded(
+        &mut self,
+        encodings: &[Encoding],
+        tok_wall: Duration,
+        opts: RunOptions,
+    ) -> Result<BatchRun<M>, PipelineError<T, C, M>> {
         let t = Instant::now();
         let mut all_chunks: Vec<TextChunk> = Vec::new();
-        let mut counts: Vec<usize> = Vec::with_capacity(texts.len());
-        for enc in &encodings {
+        let mut counts: Vec<usize> = Vec::with_capacity(encodings.len());
+        for enc in encodings {
             let chunks = self.chunker.chunk(enc).context(ChunkSnafu)?;
             counts.push(chunks.len());
             all_chunks.extend(chunks);
@@ -815,15 +966,15 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
         let chunk_refs: Vec<&TextChunk> = all_chunks.iter().collect();
         let (all_outs, enc_prof) = self.run_chunks_flat(&chunk_refs, opts.profile).context(EncodeSnafu)?;
 
-        // Reassemble per-text: drain the flat outputs AND the flat chunks by
-        // each text's chunk count (moving, not cloning).
-        let mut per_text_outs = Vec::with_capacity(texts.len());
-        let mut per_text_chunks = Vec::with_capacity(texts.len());
+        // Reassemble per input: drain the flat outputs AND the flat chunks by
+        // each input's chunk count (moving, not cloning).
+        let mut per_input_outs = Vec::with_capacity(encodings.len());
+        let mut per_input_chunks = Vec::with_capacity(encodings.len());
         let mut out_iter = all_outs.into_iter();
         let mut chunk_iter = all_chunks.into_iter();
         for &count in &counts {
-            per_text_outs.push(out_iter.by_ref().take(count).collect::<Vec<M::Output>>());
-            per_text_chunks.push(chunk_iter.by_ref().take(count).collect::<Vec<TextChunk>>());
+            per_input_outs.push(out_iter.by_ref().take(count).collect::<Vec<M::Output>>());
+            per_input_chunks.push(chunk_iter.by_ref().take(count).collect::<Vec<TextChunk>>());
         }
 
         let profile = opts.profile.then(|| {
@@ -835,7 +986,36 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
             }
             p
         });
-        Ok((per_text_outs, per_text_chunks, profile))
+        Ok((per_input_outs, per_input_chunks, profile))
+    }
+
+    /// [`run_encoded`](Self::run_encoded) for one input: its position-agnostic
+    /// outputs, the source chunks they map to, and the profile; the verb
+    /// facades pair outputs↔chunks into the named aggregate ([`Embeddings`] /
+    /// [`Classifications`] / …).
+    fn run_one(
+        &mut self,
+        encoding: Encoding,
+        tok_wall: Duration,
+        opts: RunOptions,
+    ) -> Result<SingleRun<M>, PipelineError<T, C, M>> {
+        let (mut outs, mut chunks, profile) = self.run_encoded(std::slice::from_ref(&encoding), tok_wall, opts)?;
+        Ok((outs.pop().unwrap_or_default(), chunks.pop().unwrap_or_default(), profile))
+    }
+
+    /// Tokenize one text, then [`run_one`](Self::run_one).
+    fn run_text(&mut self, text: &str, opts: RunOptions) -> Result<SingleRun<M>, PipelineError<T, C, M>> {
+        let t = Instant::now();
+        let encoding = self.tokenizer.encode(text).context(TokenizeSnafu)?;
+        self.run_one(encoding, t.elapsed(), opts)
+    }
+
+    /// Tokenize several texts in one call, then
+    /// [`run_encoded`](Self::run_encoded).
+    fn run_texts(&mut self, texts: &[&str], opts: RunOptions) -> Result<BatchRun<M>, PipelineError<T, C, M>> {
+        let t = Instant::now();
+        let encodings = self.tokenizer.encode_batch(texts).context(TokenizeSnafu)?;
+        self.run_encoded(&encodings, t.elapsed(), opts)
     }
 
     /// Run pre-built [`TextChunk`]s through the encoder, skipping tokenize and
@@ -861,7 +1041,7 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
     /// Run pre-built per-text chunk lists through the encoder — the batch form
     /// of [`run_chunks`](Self::run_chunks). All chunks across all texts are
     /// flattened into one stream and sub-batched across text boundaries (same
-    /// throughput shape as [`run_batch_inner`](Self::run_batch_inner)), then
+    /// throughput shape as [`run_encoded`](Self::run_encoded)), then
     /// re-split per text by each input's chunk count. Returns per-text
     /// position-agnostic outputs plus the encoder-only profile (no
     /// tokenize/chunk stages, since those ran before this call). Only the
@@ -894,6 +1074,28 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
     }
 }
 
+impl<T: PairTokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
+    /// Tokenize one pair, then [`run_one`](Self::run_one).
+    fn run_pair(
+        &mut self,
+        first: &str,
+        second: &str,
+        opts: RunOptions,
+    ) -> Result<SingleRun<M>, PipelineError<T, C, M>> {
+        let t = Instant::now();
+        let encoding = self.tokenizer.encode_pair(first, second).context(TokenizeSnafu)?;
+        self.run_one(encoding, t.elapsed(), opts)
+    }
+
+    /// Tokenize several pairs in one call, then
+    /// [`run_encoded`](Self::run_encoded).
+    fn run_pairs(&mut self, pairs: &[(&str, &str)], opts: RunOptions) -> Result<BatchRun<M>, PipelineError<T, C, M>> {
+        let t = Instant::now();
+        let encodings = self.tokenizer.encode_pair_batch(pairs).context(TokenizeSnafu)?;
+        self.run_encoded(&encodings, t.elapsed(), opts)
+    }
+}
+
 // ─── Verb facades ───────────────────────────────────────────────────────────
 //
 // `embed` / `classify` / `classify_tokens` (and their `_batch` siblings) are bounded
@@ -904,7 +1106,7 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
 // source chunks' positions (the old per-model `EncoderHead::attach`).
 
 /// Pair finished embeddings with their source chunks' byte offsets — the
-/// position-attachment step the embed facade runs after [`EncoderPipeline::run_single_inner`].
+/// position-attachment step the embed facade runs after [`EncoderPipeline::run_one`].
 fn attach_embed(outputs: Vec<Embedding>, chunks: &[TextChunk]) -> Vec<ChunkEmbedding> {
     chunks.iter().zip(outputs).map(|(c, o)| ChunkEmbedding { byte_offset: c.byte_offset, values: o.values }).collect()
 }
@@ -921,7 +1123,8 @@ fn attach_classify(outputs: Vec<Classification>, chunks: &[TextChunk]) -> Vec<Ch
 
 /// Pair per-token logits with their source chunks' positions and per-token byte
 /// geometry — the classify_tokens facade's attachment step. The only task that pulls
-/// extra fields (`offsets` / `special_tokens_mask`) from the chunk.
+/// extra fields (`offsets` / `special_tokens_mask` / the content range) from the
+/// chunk.
 fn attach_token(outputs: Vec<TokenClassification>, chunks: &[TextChunk]) -> Vec<ChunkTokenClassification> {
     chunks
         .iter()
@@ -931,6 +1134,7 @@ fn attach_token(outputs: Vec<TokenClassification>, chunks: &[TextChunk]) -> Vec<
             first_token: c.first_token,
             token_offsets: c.encoding.offsets.clone(),
             special_tokens_mask: c.encoding.special_tokens_mask.clone(),
+            content: Some(Segments::of(&c.encoding).content),
             logits: o.logits,
             num_labels: o.num_labels,
         })
@@ -943,7 +1147,7 @@ impl<T: Tokenizer, C: Chunker, M: Embed> EncoderPipeline<T, C, M> {
     /// stages, then the encoder's.
     pub fn embed(&mut self, text: &str, opts: impl Into<RunOptions>) -> Result<Embeddings, PipelineError<T, C, M>> {
         let opts = opts.into();
-        let (outputs, chunks, profile) = self.run_single_inner(text, opts)?;
+        let (outputs, chunks, profile) = self.run_text(text, opts)?;
         Ok(Embeddings { chunks: attach_embed(outputs, &chunks), profile })
     }
 
@@ -957,7 +1161,7 @@ impl<T: Tokenizer, C: Chunker, M: Embed> EncoderPipeline<T, C, M> {
         opts: impl Into<RunOptions>,
     ) -> Result<BatchEmbeddings, PipelineError<T, C, M>> {
         let opts = opts.into();
-        let (per_text_outs, per_text_chunks, profile) = self.run_batch_inner(texts, opts)?;
+        let (per_text_outs, per_text_chunks, profile) = self.run_texts(texts, opts)?;
         let results = per_text_outs
             .into_iter()
             .zip(per_text_chunks.iter())
@@ -1013,7 +1217,7 @@ impl<T: Tokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
         opts: impl Into<RunOptions>,
     ) -> Result<Classifications, PipelineError<T, C, M>> {
         let opts = opts.into();
-        let (outputs, chunks, profile) = self.run_single_inner(text, opts)?;
+        let (outputs, chunks, profile) = self.run_text(text, opts)?;
         Ok(Classifications { chunks: attach_classify(outputs, &chunks), profile })
     }
 
@@ -1027,7 +1231,7 @@ impl<T: Tokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
         opts: impl Into<RunOptions>,
     ) -> Result<BatchClassifications, PipelineError<T, C, M>> {
         let opts = opts.into();
-        let (per_text_outs, per_text_chunks, profile) = self.run_batch_inner(texts, opts)?;
+        let (per_text_outs, per_text_chunks, profile) = self.run_texts(texts, opts)?;
         let results = per_text_outs
             .into_iter()
             .zip(per_text_chunks.iter())
@@ -1074,6 +1278,39 @@ impl<T: Tokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
     }
 }
 
+impl<T: PairTokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
+    /// Tokenize the pair → chunk → classify → assemble profile: a
+    /// cross-encoder's score for (`first`, `second`), such as a reranker's for
+    /// (query, passage). Chunks' positions refer to `second`, the text a
+    /// chunker cuts or windows.
+    pub fn classify_pair(
+        &mut self,
+        first: &str,
+        second: &str,
+        opts: impl Into<RunOptions>,
+    ) -> Result<Classifications, PipelineError<T, C, M>> {
+        let (outputs, chunks, profile) = self.run_pair(first, second, opts.into())?;
+        Ok(Classifications { chunks: attach_classify(outputs, &chunks), profile })
+    }
+
+    /// [`classify_pair`](Self::classify_pair) for several pairs in one call:
+    /// one [`Classifications`] per pair, plus a shared batch-level
+    /// [`RunProfile`] on [`BatchClassifications::profile`].
+    pub fn classify_pair_batch(
+        &mut self,
+        pairs: &[(&str, &str)],
+        opts: impl Into<RunOptions>,
+    ) -> Result<BatchClassifications, PipelineError<T, C, M>> {
+        let (per_pair_outs, per_pair_chunks, profile) = self.run_pairs(pairs, opts.into())?;
+        let results = per_pair_outs
+            .into_iter()
+            .zip(per_pair_chunks.iter())
+            .map(|(outs, chunks)| Classifications { chunks: attach_classify(outs, chunks), profile: None })
+            .collect();
+        Ok(BatchClassifications { results, profile })
+    }
+}
+
 impl<T: Tokenizer, C: Chunker, M: ClassifyTokens> EncoderPipeline<T, C, M> {
     /// Tokenize → chunk → classify_tokens → assemble profile. With
     /// [`RunOptions::profile`] set, the profile leads with the tokenize and chunk
@@ -1085,7 +1322,7 @@ impl<T: Tokenizer, C: Chunker, M: ClassifyTokens> EncoderPipeline<T, C, M> {
         opts: impl Into<RunOptions>,
     ) -> Result<TokenClassifications, PipelineError<T, C, M>> {
         let opts = opts.into();
-        let (outputs, chunks, profile) = self.run_single_inner(text, opts)?;
+        let (outputs, chunks, profile) = self.run_text(text, opts)?;
         Ok(TokenClassifications { chunks: attach_token(outputs, &chunks), profile })
     }
 
@@ -1099,7 +1336,7 @@ impl<T: Tokenizer, C: Chunker, M: ClassifyTokens> EncoderPipeline<T, C, M> {
         opts: impl Into<RunOptions>,
     ) -> Result<BatchTokenClassifications, PipelineError<T, C, M>> {
         let opts = opts.into();
-        let (per_text_outs, per_text_chunks, profile) = self.run_batch_inner(texts, opts)?;
+        let (per_text_outs, per_text_chunks, profile) = self.run_texts(texts, opts)?;
         let results = per_text_outs
             .into_iter()
             .zip(per_text_chunks.iter())
@@ -1210,15 +1447,17 @@ pub struct Entity {
 /// entity spans under a prefix scheme. A head that scores each label on its
 /// own — one label, or several that may hold at once — decodes with
 /// [`token_scores_document`] instead: the softmax of one logit is always 1.
+/// Only the text the chunker windowed is decoded: a pair's first text is
+/// skipped (see [`ChunkTokenClassification::content`]).
 pub fn labels_for_tokens<'a, F>(chunk: &ChunkTokenClassification, id2label: F) -> Vec<TokenLabel<'a>>
 where
     F: Fn(u32) -> &'a str,
 {
     let nl = chunk.num_labels.max(1);
-    let (lead, _) = boundary_specials(&chunk.special_tokens_mask);
+    let content = chunk.content_range();
     let mut out = Vec::new();
     for (t, (row, special)) in chunk.logits.chunks_exact(nl).zip(&chunk.special_tokens_mask).enumerate() {
-        if *special != 0 {
+        if *special != 0 || !content.contains(&t) {
             continue;
         }
         let id = argmax(row);
@@ -1229,8 +1468,7 @@ where
         let score = (row[id] - max).exp() / sum;
         let label_id = id as u32;
         let (start, end) = chunk.token_offsets.get(t).copied().unwrap_or((0, 0));
-        // The leading specials are skipped above, so `t >= lead`.
-        let token_index = chunk.first_token + t - lead;
+        let token_index = chunk.first_token + t - content.start;
         out.push(TokenLabel { label_id, label: id2label(label_id), start, end, token_index, score });
     }
     out
@@ -1415,12 +1653,8 @@ pub fn token_scores_document(chunks: &[ChunkTokenClassification], weighting: Win
     let Some(num_labels) = chunks.first().map(|c| c.num_labels).filter(|&nl| nl > 0) else {
         return TokenScores::default();
     };
-    let content = |c: &ChunkTokenClassification| {
-        let (lead, trail) = boundary_specials(&c.special_tokens_mask);
-        (lead, c.special_tokens_mask.len().saturating_sub(lead + trail))
-    };
     let lo = chunks.iter().map(|c| c.first_token).min().unwrap_or(0);
-    let hi = chunks.iter().map(|c| c.first_token + content(c).1).max().unwrap_or(0);
+    let hi = chunks.iter().map(|c| c.first_token + c.content_range().len()).max().unwrap_or(0);
 
     // Per source token: Σ w·logit per label, Σ w, and the byte span.
     let mut sums = vec![0.0f32; (hi - lo) * num_labels];
@@ -1428,14 +1662,14 @@ pub fn token_scores_document(chunks: &[ChunkTokenClassification], weighting: Win
     let mut spans = vec![(0, 0); hi - lo];
     for chunk in chunks {
         assert_eq!(chunk.num_labels, num_labels, "every window of a text scores the same labels");
-        let (lead, n) = content(chunk);
+        let content = chunk.content_range();
         let rows = chunk.logits.chunks_exact(num_labels).zip(&chunk.special_tokens_mask).zip(&chunk.token_offsets);
         for (t, ((row, &special), &span)) in rows.enumerate() {
-            if special != 0 {
+            if special != 0 || !content.contains(&t) {
                 continue;
             }
-            let k = t - lead;
-            let (w, i) = (weighting.weight(k, n), chunk.first_token + k - lo);
+            let k = t - content.start;
+            let (w, i) = (weighting.weight(k, content.len()), chunk.first_token + k - lo);
             for (sum, &logit) in sums[i * num_labels..][..num_labels].iter_mut().zip(row) {
                 *sum += w * logit;
             }
