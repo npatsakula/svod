@@ -14,8 +14,8 @@ plans.
 | `state` | Safetensors loading (single-file and sharded), dtype casting, and the origin scopes that name a module's weights. The `StateDict` / `Module` contract itself lives in `svod_tensor::nn`. |
 | `blocks` | Shared `conv2d`, `batchnorm2d`, `BasicBlock`, `Bottleneck`, `ResidualStage` reused by every ResNet-shaped backbone. timm/torchvision key convention. |
 | `wavlm` | WavLM speech-representation backbone (Conv1d feature extractor + gated rel-pos Transformer, per-layer pruning) consumed by `diarizen`. |
-| `encoder_head` | The text encoder heads' static per-shape plans (`HeadPlans`), input packing, `HeadError`, and the `HeadOptions` (capacity, dtype, device) and `HubOptions` their loaders take. |
-| `xlm_roberta` | XLM-RoBERTa text encoder backbone (absolute position embeddings, post-norm Transformer) consumed by `bgem3`, plus a token-classification head. |
+| `encoder_head` | The text encoder heads' static per-shape plans (`HeadPlans`) and their warm-up, input packing, `HeadError`, the embedders' `Pooling` (read from a checkpoint's sentence-transformers config), and the `HeadOptions` (capacity, dtype, device) and `HubOptions` their loaders take. |
+| `xlm_roberta` | XLM-RoBERTa text encoder backbone (absolute position embeddings, post-norm Transformer) consumed by `bgem3`, plus embedding, sequence-classification (cross-encoder reranking) and token-classification heads. |
 | `qwen3` | Qwen3 decoder-only LLM backbone (causal attention, GQA, per-head Q/K RMSNorm, RoPE, SwiGLU) consumed by embedding models. |
 | `sentencepiece` | Minimal SentencePiece `.model` protobuf loader (vocab piece extraction). |
 
@@ -30,8 +30,8 @@ plans.
 | DiariZen segmentation (WavLM + Conformer) | Speaker diarization | `diarizen` | [BUT-FIT/DiariZen](https://github.com/BUTSpeechFIT/DiariZen) | [`BUT-FIT/diarizen-wavlm-large-s80-md-v2`](https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2) |
 | Nemotron-3-Diarization (offline + streaming Sortformer, 8 speakers) | Speaker diarization | `nemotron_diar` | [NVIDIA NeMo](https://github.com/NVIDIA-NeMo/Speech) | [`nvidia/Nemotron-3-Diarization`](https://huggingface.co/nvidia/Nemotron-3-Diarization) |
 | ModernBERT (base / large) | Text embeddings, sequence classification, token classification, fill-mask (MLM, model layer only) | `modernbert` | [Answer.AI ModernBERT](https://github.com/AnswerDotAI/ModernBERT) | [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) |
-| BGE-M3 (dense / sparse / ColBERT) | Text embeddings, retrieval | `bgem3` | [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (XLM-RoBERTa-large) | [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) |
-| BGE-reranker-v2-m3 | Cross-encoder reranking | `bgem3` | [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) | [`BAAI/bge-reranker-v2-m3`](https://huggingface.co/BAAI/bge-reranker-v2-m3) |
+| BGE-M3 (dense / sparse / ColBERT) | Text embeddings, retrieval | `bgem3`, `xlm_roberta` (dense) | [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) (XLM-RoBERTa-large) | [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) |
+| BGE-reranker-v2-m3 | Cross-encoder reranking | `xlm_roberta` | [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) | [`BAAI/bge-reranker-v2-m3`](https://huggingface.co/BAAI/bge-reranker-v2-m3) |
 | SaT (Segment any Text) | Sentence segmentation (token classification) | `xlm_roberta` | [segment-any-text/wtpsplit](https://github.com/segment-any-text/wtpsplit) (XLM-RoBERTa-base) | [`segment-any-text/sat-3l-sm`](https://huggingface.co/segment-any-text/sat-3l-sm) |
 | Qwen3-Embedding-0.6B | Text embeddings, retrieval | `qwen3` | [Qwen team](https://huggingface.co/Qwen) (Qwen3 LLM) | [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) |
 | Qwen3-Reranker-0.6B | Cross-encoder reranking | `qwen3` | [Qwen team](https://huggingface.co/Qwen) (Qwen3 LLM) | [`Qwen/Qwen3-Reranker-0.6B`](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B) |
@@ -61,4 +61,5 @@ cargo run -p svod-model --release --example modernbert_embed_batch_infer -- "one
 cargo run -p svod-model --release --example modernbert_classify_infer -- "This movie was great!" # sentence classification
 cargo run -p svod-model --release --example modernbert_token_infer -- "Barack Obama was born in Hawaii" # token classification / NER
 cargo run -p svod-model --release --example modernbert_token_chunks_infer -- < long_doc.txt # long-doc NER via the chunk seam (group_spans_document)
+cargo run -p svod-model --release --example xlm_roberta_rerank_infer -- "what is panda?" "hi" "The giant panda is a bear species endemic to China." # reranking (MaxP over pair windows)
 ```

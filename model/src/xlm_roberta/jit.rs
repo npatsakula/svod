@@ -1,10 +1,13 @@
-//! JIT wrappers for [`super::model::XlmRobertaModel`] and the token classifier.
+//! JIT wrappers for [`super::model::XlmRobertaModel`] and its heads.
 //! `XlmRobertaJit` returns the `(B, L, D)` last-hidden-state under a rebindable
-//! batch; `XlmRobertaTokenClassifierJit` is a static plan fusing the backbone
-//! and the token head, reading back only the `(B, L, num_labels)` logits.
+//! batch; the head wrappers are static plans fusing the backbone and a head,
+//! reading back only its output: `(B, D)` embeddings, `(B, num_labels)` or
+//! `(B, L, num_labels)` logits.
 
 use svod_macros::jit_wrapper;
 
+use super::classifier::XlmRobertaClassificationModel;
+use super::embedder::XlmRobertaEmbeddingModel;
 use super::model::XlmRobertaModel;
 use super::token_classifier::XlmRobertaTokenClassificationModel;
 use crate::encoder_head::head_jit;
@@ -37,3 +40,33 @@ jit_wrapper! {
 }
 
 head_jit!(XlmRobertaTokenClassifierJit, XlmRobertaTokenClassificationModel, logits_to_vec);
+
+jit_wrapper! {
+    XlmRobertaEmbedderJit(XlmRobertaEmbeddingModel) {
+        input_ids: Tensor,
+        attention_mask: Tensor,
+
+        outputs { embeddings }
+
+        build(input_ids, attention_mask) {
+            model.forward(input_ids, attention_mask)
+        }
+    }
+}
+
+head_jit!(XlmRobertaEmbedderJit, XlmRobertaEmbeddingModel, embeddings_to_vec);
+
+jit_wrapper! {
+    XlmRobertaClassifierJit(XlmRobertaClassificationModel) {
+        input_ids: Tensor,
+        attention_mask: Tensor,
+
+        outputs { logits }
+
+        build(input_ids, attention_mask) {
+            model.forward(input_ids, attention_mask)
+        }
+    }
+}
+
+head_jit!(XlmRobertaClassifierJit, XlmRobertaClassificationModel, logits_to_vec);

@@ -17,7 +17,10 @@ use crate::modernbert::{ModernBertClassifier, ModernBertEmbedder, ModernBertToke
 use crate::state::StateDict;
 use crate::test::unit::xlm_roberta::model::tiny_cfg;
 use crate::test::unit::{load_golden_vec, max_abs_delta, nan_max};
-use crate::xlm_roberta::{XlmRobertaTokenClassificationModel, XlmRobertaTokenClassifier, XlmRobertaTokenClassifierJit};
+use crate::xlm_roberta::{
+    XlmRobertaClassifier, XlmRobertaEmbedder, XlmRobertaTokenClassificationModel, XlmRobertaTokenClassifier,
+    XlmRobertaTokenClassifierJit,
+};
 
 /// A chunk of `real_ids` (mask 1) followed by `n_pad` pad positions (id 0,
 /// mask 0).
@@ -304,6 +307,8 @@ fn heads_are_send() {
     assert_send::<ModernBertEmbedder>();
     assert_send::<ModernBertClassifier>();
     assert_send::<ModernBertTokenClassifier>();
+    assert_send::<XlmRobertaEmbedder>();
+    assert_send::<XlmRobertaClassifier>();
     assert_send::<XlmRobertaTokenClassifier>();
 }
 
