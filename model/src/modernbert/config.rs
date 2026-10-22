@@ -18,15 +18,7 @@ use serde::Deserialize;
 use svod_dtype::DType;
 
 use super::error::{Error, Result};
-use crate::encoder_head::dense_id2label;
-
-/// Pooling strategy for the classification head. HF ModernBERT defaults to
-/// `"cls"` (take the first token); `"mean"` does a masked mean over the sequence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClassifierPooling {
-    Cls,
-    Mean,
-}
+use crate::encoder_head::{PoolingMode, dense_id2label};
 
 /// Clean, resolved ModernBERT backbone config.
 #[derive(Clone, Debug)]
@@ -63,7 +55,7 @@ pub struct ModernBertConfig {
     pub num_labels: usize,
     /// `"cls"` (take token 0) or `"mean"` (masked mean) — HF's
     /// `classifier_pooling`.
-    pub classifier_pooling: ClassifierPooling,
+    pub classifier_pooling: PoolingMode,
     /// Whether `head.dense` has a bias term (HF's `classifier_bias`).
     pub classifier_bias: bool,
     /// Whether LayerNorm biases are present (HF's `norm_bias`).
@@ -123,7 +115,7 @@ impl Default for ModernBertConfig {
             dtype: crate::default_compute_dtype(),
             max_batch_size: 1,
             num_labels: 2,
-            classifier_pooling: ClassifierPooling::Cls,
+            classifier_pooling: PoolingMode::Cls,
             classifier_bias: false,
             norm_bias: false,
             id2label: vec![],
@@ -175,8 +167,8 @@ impl ModernBertConfig {
             max_batch_size: d.max_batch_size,
             num_labels: raw.num_labels.unwrap_or(if id2label.is_empty() { d.num_labels } else { id2label.len() }),
             classifier_pooling: match raw.classifier_pooling.as_deref() {
-                Some("mean") => ClassifierPooling::Mean,
-                _ => ClassifierPooling::Cls,
+                Some("mean") => PoolingMode::Mean,
+                _ => PoolingMode::Cls,
             },
             classifier_bias: raw.classifier_bias.unwrap_or(d.classifier_bias),
             norm_bias: raw.norm_bias.unwrap_or(d.norm_bias),

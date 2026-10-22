@@ -3,7 +3,8 @@ use svod_tensor::Tensor;
 
 use svod_tensor::nn::{Module, StateDict};
 
-use crate::modernbert::{ClassifierPooling, ModernBert, ModernBertConfig};
+use crate::encoder_head::PoolingMode;
+use crate::modernbert::{ModernBert, ModernBertConfig};
 
 /// A tiny config for fast unit tests: 2 layers, hidden 32, 4 heads (head_dim 8),
 /// vocab 64, intermediate 64, f32 compute. Global-every-3 still gives layer 0
@@ -27,7 +28,7 @@ pub(crate) fn tiny_cfg() -> ModernBertConfig {
         dtype: DType::Float32,
         max_batch_size: 1,
         num_labels: 3,
-        classifier_pooling: ClassifierPooling::Cls,
+        classifier_pooling: PoolingMode::Cls,
         classifier_bias: false,
         norm_bias: false,
         id2label: vec![],

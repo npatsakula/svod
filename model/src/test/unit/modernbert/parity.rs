@@ -27,7 +27,7 @@ use svod_arch::pipelines::text::{Classify, ClassifyTokens, EncoderHead, Encoding
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::encoder_head::HeadOptions;
+use crate::encoder_head::{HeadOptions, Pooling};
 use crate::modernbert::{
     ModernBert, ModernBertClassifier, ModernBertConfig, ModernBertEmbedder, ModernBertForMaskedLm,
     ModernBertTokenClassifier,
@@ -331,8 +331,8 @@ fn load_embed_fixture(dtype: DType) -> (ModernBertEmbedder, Encoding, StateDict)
     let golden = crate::state::load_safetensors(&real_file("golden.safetensors")).expect("golden");
     let enc = golden_encodings(&golden).pop().expect("one row");
     let opts = HeadOptions { max_seq: Some(enc.len()), dtype: Some(dtype), ..HeadOptions::default() };
-    let embedder = ModernBertEmbedder::from_files(&real_file("config.json"), &real_file("model.safetensors"), &opts)
-        .expect("embedder");
+    let (config, weights) = (real_file("config.json"), real_file("model.safetensors"));
+    let embedder = ModernBertEmbedder::from_files(&config, &weights, Pooling::default(), &opts).expect("embedder");
     (embedder, enc, golden)
 }
 

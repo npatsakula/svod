@@ -7,7 +7,7 @@
 
 use svod_arch::pipelines::text::{EncoderHead, Encoding};
 
-use crate::encoder_head::HeadError;
+use crate::encoder_head::{HeadError, Pooling};
 use crate::modernbert::{ModernBert, ModernBertEmbedder};
 use crate::test::unit::encoder_head::encoding;
 use crate::test::unit::modernbert::model::tiny_cfg;
@@ -18,7 +18,7 @@ const MAX_SEQ: usize = 16;
 /// An embedder over the tiny backbone. Construction compiles nothing: a plan
 /// compiles on its shape's first batch, which these tests never reach.
 fn embedder() -> ModernBertEmbedder {
-    ModernBertEmbedder::new(ModernBert::empty(tiny_cfg()), MAX_BATCH, MAX_SEQ).expect("embedder")
+    ModernBertEmbedder::new(ModernBert::empty(tiny_cfg()), Pooling::default(), MAX_BATCH, MAX_SEQ).expect("embedder")
 }
 
 /// A batch exceeding `max_batch` is rejected up front (CapacityExceeded), not
@@ -65,5 +65,5 @@ fn empty_batch_is_noop() {
 #[test_case::test_case(4, 0 => matches Err(HeadError::EmptyCapacity { .. }); "zero length")]
 #[test_case::test_case(4, 128 => matches Ok((4, 128)); "all positions")]
 fn embedder_capacity_is_validated(max_batch: usize, max_seq: usize) -> Result<(usize, usize), HeadError> {
-    ModernBertEmbedder::new(ModernBert::empty(tiny_cfg()), max_batch, max_seq).map(|e| e.capacity())
+    ModernBertEmbedder::new(ModernBert::empty(tiny_cfg()), Pooling::default(), max_batch, max_seq).map(|e| e.capacity())
 }

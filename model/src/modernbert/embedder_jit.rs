@@ -1,6 +1,6 @@
 //! JIT wrapper for the ModernBERT **embedder**: backbone forward (with the
-//! padding mask) + fused masked mean-pool + L2-normalize, compiled as ONE static
-//! JIT plan. `input_ids` `(B, L)` int64 + `attention_mask` `(B, L)` int64 → finished
+//! padding mask) + fused pooling (and L2-normalize, when the checkpoint asks),
+//! compiled as ONE static JIT plan. `input_ids` `(B, L)` int64 + `attention_mask` `(B, L)` int64 → finished
 //! `(B, D)` f32 embeddings.
 //!
 //! Distinct from [`super::jit::ModernBertJit`] (the bare backbone JIT, which
@@ -15,20 +15,19 @@ use svod_macros::jit_wrapper;
 
 use crate::encoder_head::head_jit;
 
-use super::embedder::pool_embed;
-use super::model::ModernBert;
+use super::embedder::ModernBertEmbeddingModel;
 
 jit_wrapper! {
-    ModernBertEmbedderJit(ModernBert) {
+    ModernBertEmbedderJit(ModernBertEmbeddingModel) {
         input_ids: Tensor,
         attention_mask: Tensor,
 
         outputs { embeddings }
 
         build(input_ids, attention_mask) {
-            pool_embed(&model.forward(input_ids, Some(attention_mask))?, attention_mask)
+            model.forward(input_ids, attention_mask)
         }
     }
 }
 
-head_jit!(ModernBertEmbedderJit, ModernBert, embeddings_to_vec);
+head_jit!(ModernBertEmbedderJit, ModernBertEmbeddingModel, embeddings_to_vec);

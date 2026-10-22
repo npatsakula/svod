@@ -1,7 +1,8 @@
 //! Hub loaders for ModernBERT: fetch `config.json`, `model.safetensors`, and
-//! `tokenizer.json` from a pinned revision, build the head from the two files
-//! (each head's `from_files`), and hand it back beside its tokenizer, ready for
-//! an [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline).
+//! `tokenizer.json` from a pinned revision (and, for the embedder, its
+//! sentence-transformers pooling), build the head from the files (each head's
+//! `from_files`), and hand it back beside its tokenizer, ready for an
+//! [`EncoderPipeline`](svod_arch::pipelines::text::EncoderPipeline).
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +15,8 @@ use super::config::ModernBertConfig;
 use super::embedder::ModernBertEmbedder;
 use super::error::{Result, TokenizerSnafu};
 use super::token_classifier::ModernBertTokenClassifier;
-use crate::encoder_head::HubOptions;
+use crate::encoder_head::{HubOptions, pooling_from_hub};
+use crate::hub::HubRepo;
 use crate::state::StateDict;
 
 /// The checkpoint's config computing in `dtype`, its weights, and the head's
@@ -33,23 +35,26 @@ pub(super) fn load_checkpoint(
 
 /// `config.json` and `model.safetensors` from `opts.revision`, and the
 /// tokenizer (see [`HubOptions::tokenizer_repo`]).
-fn fetch_hub(model_id: &str, opts: &HubOptions) -> Result<(PathBuf, PathBuf, HfTokenizer)> {
-    let repo = crate::hub::HubRepo::open(model_id, &opts.revision)?;
-    let tokenizer = HfTokenizer::from_path(&opts.tokenizer_json(&repo)?).context(TokenizerSnafu)?;
+fn fetch_hub(repo: &HubRepo, opts: &HubOptions) -> Result<(PathBuf, PathBuf, HfTokenizer)> {
+    let tokenizer = HfTokenizer::from_path(&opts.tokenizer_json(repo)?).context(TokenizerSnafu)?;
     Ok((repo.get("config.json")?, repo.get("model.safetensors")?, tokenizer))
 }
 
 /// Download a ModernBERT checkpoint and build its embedder with
-/// [`ModernBertEmbedder::from_files`] under `opts.head`, beside its tokenizer.
+/// [`ModernBertEmbedder::from_files`] under `opts.head`, pooling as its
+/// sentence-transformers config says (mean, then L2, without one), beside its
+/// tokenizer.
 pub fn from_hub(model_id: &str, opts: &HubOptions) -> Result<(HfTokenizer, ModernBertEmbedder)> {
-    let (config, weights, tokenizer) = fetch_hub(model_id, opts)?;
-    Ok((tokenizer, ModernBertEmbedder::from_files(&config, &weights, &opts.head)?))
+    let repo = HubRepo::open(model_id, &opts.revision)?;
+    let pooling = pooling_from_hub(&repo)?;
+    let (config, weights, tokenizer) = fetch_hub(&repo, opts)?;
+    Ok((tokenizer, ModernBertEmbedder::from_files(&config, &weights, pooling, &opts.head)?))
 }
 
 /// [`from_hub`] for a sequence-classification fine-tune
 /// ([`ModernBertClassifier::from_files`]).
 pub fn from_hub_classifier(model_id: &str, opts: &HubOptions) -> Result<(HfTokenizer, ModernBertClassifier)> {
-    let (config, weights, tokenizer) = fetch_hub(model_id, opts)?;
+    let (config, weights, tokenizer) = fetch_hub(&HubRepo::open(model_id, &opts.revision)?, opts)?;
     Ok((tokenizer, ModernBertClassifier::from_files(&config, &weights, &opts.head)?))
 }
 
@@ -59,6 +64,6 @@ pub fn from_hub_token_classification(
     model_id: &str,
     opts: &HubOptions,
 ) -> Result<(HfTokenizer, ModernBertTokenClassifier)> {
-    let (config, weights, tokenizer) = fetch_hub(model_id, opts)?;
+    let (config, weights, tokenizer) = fetch_hub(&HubRepo::open(model_id, &opts.revision)?, opts)?;
     Ok((tokenizer, ModernBertTokenClassifier::from_files(&config, &weights, &opts.head)?))
 }
