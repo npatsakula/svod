@@ -5,7 +5,9 @@ sidebar_label: कर्नेल लाइब्रेरी
 # कर्नेल लाइब्रेरी {#kernel-library}
 
 `svod_tk::kernels` का हर कर्नेल एक function `fn k<T: Elem>(spec: &Spec) -> Program` है, जो 16-bit
-element type (`BF16` या `F16`) पर generic है। हर spec में एक `batch: Batch` होता है:
+element type (`BF16` या `F16`) पर generic है; `gemm` और `nearest` 8-bit integers (`I8`) भी लेते हैं,
+जो i32 में exact रूप से accumulate होते हैं: `gemm` f32 store करता है, और `nearest` हर row के
+products को rows के `x_scale` और `c_scale` से scale करता है। हर spec में एक `batch: Batch` होता है:
 `Batch::Static(n)` `n` batches launch करता है, और `Batch::Var { name, min, max }` नाम से bind हुए
 runtime variable की live गिनती launch करता है, buffers `max` के आकार के होते हैं। हर config type में
 एक `lowering(&device)` है (एक `atoms::Device`: target और उसकी costs)। मॉडल इन कर्नेलों तक

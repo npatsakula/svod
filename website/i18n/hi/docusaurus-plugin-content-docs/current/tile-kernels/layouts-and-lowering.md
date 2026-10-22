@@ -64,6 +64,12 @@ layouts उस atom से पढ़ता है जो values को consume �
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_input`, `wmma_gfx11_acc` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8 (सिर्फ़ atom; कोई kernels नहीं) | `simdgroup_8x8` |
 
+Kernels वाले हर target में i32 में जाने वाला एक 8-bit integer atom भी है (`Target::geometry_of(Int8)`):
+`mma.sync` m16n8k32 s8 और CDNA का MFMA 16×16×32 i8 16-bit fragments के bytes रखते हैं, दोगुनी
+गहराई के साथ (`mma_sync_a8`, `mma_sync_b8`, `mfma_16x16x32_i8`); RDNA का `iu8` WMMA 16-bit layouts
+को depth 16 पर रखता है। इसके `m` और `n` 16-bit atom वाले ही हैं। Planner 16-bit geometry
+(`Target::geometry`) की cost लगाता है, सिवाय 8-bit rows पर किसी problem के।
+
 `atoms::GroupMmaAtom` एक warpgroup instruction है: चार लगातार warps मिलकर 64 × n का product जारी
 करते हैं, operands shared memory से descriptors के ज़रिए पढ़े जाते हैं (`B` हमेशा, `A` तब तक जब तक वह
 register tile न हो), और accumulator पूरे group पर फैला रहता है, हर warp अपनी 16 rows `mma.sync` के C
@@ -122,7 +128,7 @@ Emitter हर statement के instructions को program order में ए�
 आगे के global accesses gated होते हैं: loads शून्य पढ़ते हैं और stores छोड़ दिए जाते हैं। जहाँ row
 में chunks की गिनती दो की घात हो, वहाँ shared rows 16-byte chunks में XOR-swizzle होती हैं
 (`layouts::Swizzle`)। 16-bit tiles के shared से register loads, जहाँ layout अनुमति दे, `ldmatrix.x4`
-इस्तेमाल करते हैं; RDNA4 पर global से register loads `global_load_tr_b128` इस्तेमाल करते हैं जहाँ
+इस्तेमाल करते हैं, और 8-bit tiles के loads 16×32 bytes पर उसका untransposed रूप; RDNA4 पर global से register loads `global_load_tr_b128` इस्तेमाल करते हैं जहाँ
 layout वही हो जो वह छोड़ता है। एक `Warps` statement अपनी body को हर warp पर अकेले, अपनी copies और
 barriers के साथ चलाता है। AMD पर f32 `exp2` hardware का `v_exp_f32` है, जो 2⁻¹²⁶ से नीचे के results को
 शून्य कर देता है। CUDA पर 48 KB से ऊपर की shared memory एक dynamic array है; candidates

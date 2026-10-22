@@ -57,4 +57,5 @@ slots पर। यही path CUDA पर एक device test में चल�
 | CDNA के बाहर two-crew ping-pong | `Target::crews` सिर्फ़ वहीं 2 है जहाँ matrix core vector units के बगल में चलता है और एक lane की file दो crews के accumulators रखती है (CDNA) |
 | Apple | सिर्फ़ atoms; कोई kernels नहीं |
 | Convolution का image-staged रूप, depthwise, grouped | ग्राफ़ |
-| fp8/int8, attention backward | शुरू नहीं हुआ |
+| int8 | Kernels वाले हर target पर atoms (`m16n8k32` s8, RDNA `iu8`, CDNA `16x16x32` i8, i32 में); nearest-neighbour कर्नेल और `k_nearest_reranked` इन्हें इस्तेमाल करते हैं, GEMM और attention ops नहीं |
+| fp8, attention backward | शुरू नहीं हुआ |

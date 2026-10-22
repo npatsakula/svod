@@ -2024,3 +2024,32 @@ fn the_warpgroup_core_is_a_tile_of_its_own() {
 fn gfx1151_planner() -> Planner {
     planned(Device { target: super::targets::amd(AmdArch::Gfx1151, 40), costs: super::gfx1151_costs() })
 }
+
+/// The 8-bit search is priced at its own step: where a card's 8-bit core
+/// runs a step at a quarter (sm_86) or half (gfx1201) of the 16-bit cost,
+/// its best ranked self-join at 16384 rows by depth 768 costs less than the
+/// f16 one's (the model: 0.30 and 0.57 of it, its fill and fragment bytes
+/// halved too).
+#[test_case(sm86(), crate::test::unit::sm86_costs(), 0.2, 0.4; "sm_86")]
+#[test_case(gfx1201(), crate::test::unit::gfx1201_costs(), 0.45, 0.7; "gfx1201")]
+fn an_8_bit_search_is_priced_at_its_step(target: Target, costs: Costs, low: f64, high: f64) {
+    use crate::kernels::nearest::{Floors, Metric};
+    use svod_dtype::ScalarDType;
+    let planner = planned(Device { target, costs });
+    let best = |dtype| {
+        let p = config::Nearest {
+            n: 16384,
+            m: 16384,
+            d: 768,
+            dtype,
+            metric: Metric::NegDot,
+            floors: Floors::default(),
+            groups: false,
+            k: 1,
+        };
+        let ranked = planner.nearest_ranked(p);
+        p.admit(&planner, &ranked[0]).expect("ranked").0
+    };
+    let ratio = best(ScalarDType::Int8) / best(ScalarDType::Float16);
+    assert!((low..high).contains(&ratio), "8-bit over f16: {ratio:.3}");
+}

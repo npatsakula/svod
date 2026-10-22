@@ -113,7 +113,8 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 [Schedule template](./layouts-and-lowering#schedule-templates) तय करता है कि copies कितना आगे चलें,
 और हर wait और barrier को जगह देता है।
 
-**गुणनफल.** `mma(acc, a, a_t, b, b_t)` f32 accumulators पर `acc + A·B` है, यहाँ `B` transposed
+**गुणनफल.** `mma(acc, a, a_t, b, b_t)` f32 accumulators (8-bit integers पर i32, `MmaIn::Acc`) पर `acc + A·B` है,
+यहाँ `B` transposed
 पढ़ा जाता है। यह कभी किसी instruction का नाम नहीं लेता: lowering target का matrix-core atom चुनती है
 और `a`, `b` और `acc` को उसके layouts देती है। नतीजा एक ही बार round होता है, store से पहले के cast
 पर।

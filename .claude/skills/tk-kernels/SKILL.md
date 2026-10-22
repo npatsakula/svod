@@ -50,7 +50,8 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
    (F2 `TileLayout` per register tile, priced relayouts) → `orient_shared` → `emit::emit` (`lower/emit/{mod,address,
    copy,compute,nvptx,amdgpu}.rs`; vendor intrinsics only in the last two). `Lowering { device, schedule, grid,
    swizzle, core }`; `Lowering::uniform(device, unroll, grid)` for plain kernels; `layouts::Swizzle::{None,B32,B64,B128}`.
-3. **Target** (`atoms.rs`): matrix cores (`mma: Vec<MmaAtom>`, `group_mma`), `fill: Fill::{CpAsync, Staged}`
+3. **Target** (`atoms.rs`): matrix cores (`mma: Vec<MmaAtom>`, `group_mma`; `geometry()` the 16-bit atom the
+   planner prices, `geometry_of(Int8)` the 8-bit one into i32: NVIDIA m16n8k32, CDNA 16×16×32, RDNA `iu8` 16×16×16), `fill: Fill::{CpAsync, Staged}`
    (`Fill::stages` clamps a staged ring to 1–2), `ldmatrix`, `tr_load`, `sync: SyncCaps { warp_barrier, commit_fence,
    priority }`, `occupancy`, `crews`, `sms`, `xcds`. Built by `Target::for_device(&spec)`, `for_arch(arch)`,
    `offline(arch, sms, xcds)` or `card(name)` from `atoms::CARDS` (rtx3060, h100-pcie, h100-sxm, rtx5070, rtx5090,
@@ -76,8 +77,10 @@ Masks, `select_if`, `each_warp`, `smem_view_as`, `load_scalar`, `where_`, `mul_a
 gathers (`Kernel::gather`): `kernels/conv.rs`. Builder call table: `first-kernel.md`. Full wiring: [new-kernel.md](new-kernel.md).
 
 Rules the code enforces:
-- Split `XSpec` (shapes, options, `cfg`) / `XCfg::lowering(&self, &Device) -> Lowering` / `pub fn x<T: Elem>(&XSpec)
-  -> Program`, dispatched on bf16/f16 by `ops::typed!`. 16-bit operands only; f32 stays on the graph.
+- Split `XSpec` (shapes, options, `cfg`) / `XCfg::lowering(&self, &Device) -> Lowering` / `pub fn x<T: Half>(&XSpec)
+  -> Program`, dispatched on bf16/f16 by `ops::typed!` (`typed!(…, int8)` adds `I8`). `Kernel::mma` takes `T: MmaIn`
+  (bf16/f16 → f32, `I8` → i32 exact; `MmaIn::widened` to f32): `gemm` and `nearest` run over `I8`, the rest 16-bit
+  only; f32 stays on the graph except `k_nearest_reranked` (8-bit or f16 search, f32 pass by `nearest_rescore`).
 - Effects are not declared by hand: async stages inside a `pipeline` belong to the template, `Sync` copies and shared
   stores are fenced by `sync::insert_barriers`; `k.barrier()` is the only hand-placed sync. A block barrier under a
   branch on the warp is `lower::Error::DivergentBarrier`.
@@ -207,6 +210,8 @@ The `#[ignore]` probes print and never assert; one at a time on an idle GPU:
 | `device::first_execution_probe` (cp.async), `parts::mma_peak_probe` (CUDA) | build/lower/prepare cost; `mma.sync` ceiling |
 | `probe::probe_signals_are_strong` | every probe pair's signal (run alone) |
 | `nearest::knn_probe` | k-nearest lists: the tuned pick's Gpairs/s per `KNN_ROWS`/`KNN_DEPTHS`/`KNN_KS` (f16, NegDot and SquaredL2) and its share of k=1's (register lists to 64, queued into the outputs and score-matrix lists past 32; a score matrix splits over candidates as a least does and, `SelectCfg { filter }`, lists only the steps its trips' leasts bound, in shares merged by `nearest_merge`); `KNN_CANDIDATES` for a search instead of a self-join, `KNN_METRICS` one metric, `KNN_GRAPH`/`KNN_GRAPH_K` the graph fallback beside, `KNN_ALL` times every admitted config |
+| `nearest::rerank_probe` | `k_nearest_reranked`'s parts: the f16 search of `k`, the 8-bit and f16 searches of `k + MARGIN`, the exact pass, ms and Gpairs/s (`RR_ROWS`, `RR_CANDIDATES`, `RR_DEPTHS`, `RR_KS`, `RR_METRIC`, `RR_TUNE=0` pins) |
+| `nearest::recall_probe` | the reranked op's recall per search against the f64 top-k on `real_<d>.bin` embeddings (`RECALL_DIR`, `RECALL_QUERIES`, `RECALL_DEPTHS`) |
 | `nearest::list_time_probe` | list configs untuned, alternating runs (`LIST_CFGS` = `bq:bkv:stages:depth:width[:queue]`;…, `LIST_BK`, `LIST_SPLITS`, `LIST_KS`, `LIST_ROWS`, `LIST_CANDIDATES`, `LIST_DEPTH`, `LIST_RUNS`): the A/B of a list kernel change, split counts forced |
 | `nearest::list_ir_dump` | the LLVM IR of those configs into `LIST_IR` (`LIST_TARGET` sm_86/gfx1201), for `ptxas -v` register counts |
 | `nearest::live::live_probe` | the op over rows bound to a variable against the op at the bound count (`LIVE_ROWS`, `LIVE_DEPTHS`, `LIVE_KS`): the concrete pick, the live op under that config and under its own pick, rows bound at twice the count run at it |

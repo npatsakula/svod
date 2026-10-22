@@ -47,6 +47,8 @@ pub fn mma_sync_c() -> Layout {
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_input`、`wmma_gfx11_acc` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8（仅原子；无内核） | `simdgroup_8x8` |
 
+每个有内核的目标还有一个 8 位整数到 i32 的原子（`Target::geometry_of(Int8)`）：`mma.sync` m16n8k32 s8 和 CDNA 的 MFMA 16×16×32 i8 用 16 位片段的字节承载、深度加倍（`mma_sync_a8`、`mma_sync_b8`、`mfma_16x16x32_i8`）；RDNA 的 `iu8` WMMA 保留 16 位布局，深度为 16。它的 `m` 和 `n` 与 16 位原子相同。规划器按 16 位几何（`Target::geometry`）定价，8 位行上的问题除外。
+
 `atoms::GroupMmaAtom` 是一条 warpgroup 指令：四个相邻的 warp 一起发出一个 64 × n 的乘积，操作数通过描述符从共享内存读取（`B` 总是如此，`A` 除非是寄存器 tile），累加器分布在整个 group 上，每个 warp 以 `mma.sync` 的 C 布局持有 16 行。`core` 为 `Core::Group` 的配置把乘积降级到它上面：网格的行是 warpgroup，共享操作数留在原地而不被加载，发射器把每个乘积写成一条跨环形缓冲 swizzle 行的 `wgmma` 链（描述符的 swizzle 模式就是降级自身的 XOR，即 `layouts::Swizzle`）。GEMM 和注意力的配置在 sm_90 上都提供这种核心。
 
 ## 布局推断 {#layout-inference}
@@ -74,7 +76,7 @@ pub fn mma_sync_c() -> Layout {
 
 ## 发射 {#emission}
 
-发射器在预线性化程序中按程序顺序列出每条语句的指令，因此 Svod 线性化器的拓扑排序从不在 tk 内核上运行。超出视图边界的全局访问会被门控：加载读为零，存储被丢弃。当每行的块数为 2 的幂时，共享内存行按 16 字节块做 XOR swizzle（`layouts::Swizzle`）。在布局允许时，16 位 tile 从共享内存到寄存器的加载使用 `ldmatrix.x4`；在 RDNA4 上，当布局恰好是 `global_load_tr_b128` 所产生的布局时，从全局内存到寄存器的加载使用该指令。`Warps` 语句在每个 warp 上单独运行其主体，带有自己的拷贝和屏障。在 AMD 上，f32 的 `exp2` 就是硬件的 `v_exp_f32`，它会把低于 2⁻¹²⁶ 的结果刷为零。在 CUDA 上，超过 48 KB 的共享内存放在一个动态数组中；候选会按 `Target::smem_bytes` 过滤。
+发射器在预线性化程序中按程序顺序列出每条语句的指令，因此 Svod 线性化器的拓扑排序从不在 tk 内核上运行。超出视图边界的全局访问会被门控：加载读为零，存储被丢弃。当每行的块数为 2 的幂时，共享内存行按 16 字节块做 XOR swizzle（`layouts::Swizzle`）。在布局允许时，16 位 tile 从共享内存到寄存器的加载使用 `ldmatrix.x4`，8 位 tile 则使用其非转置形式、覆盖 16×32 字节；在 RDNA4 上，当布局恰好是 `global_load_tr_b128` 所产生的布局时，从全局内存到寄存器的加载使用该指令。`Warps` 语句在每个 warp 上单独运行其主体，带有自己的拷贝和屏障。在 AMD 上，f32 的 `exp2` 就是硬件的 `v_exp_f32`，它会把低于 2⁻¹²⁶ 的结果刷为零。在 CUDA 上，超过 48 KB 的共享内存放在一个动态数组中；候选会按 `Target::smem_bytes` 过滤。
 
 :::note[由发射器而非作者维护的不变量]
 纯值被列在其输入所需的循环层级。寄存器访问是标量访问。共享与全局访问是 `SHRINK` 向量访问。门控存储位于 `If` 内部。携带值在定义它们的块末尾移入其 `phi`。

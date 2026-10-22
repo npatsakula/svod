@@ -99,7 +99,7 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 
 **流水线。** `pipeline(extent, stages, init, produce, consume)` 在由 `stages` 个共享槽组成的环上声明一个生产者和一个消费者，并让 `init`（这里是累加器）贯穿消费者传递。作者只说明要把什么拷贝进槽、以及从槽中计算什么。[调度模板](./layouts-and-lowering#schedule-templates)决定拷贝提前多少步，并放置每一个等待和屏障。
 
-**乘积。** `mma(acc, a, a_t, b, b_t)` 在 f32 累加器上计算 `acc + A·B`，这里 `B` 以转置方式读取。它从不指名某条指令：降级会选择目标的矩阵核心原子，并为 `a`、`b` 和 `acc` 赋予该原子的布局。结果只在存储前的类型转换处舍入一次。
+**乘积。** `mma(acc, a, a_t, b, b_t)` 在 f32 累加器（8 位整数时为 i32，`MmaIn::Acc`）上计算 `acc + A·B`，这里 `B` 以转置方式读取。它从不指名某条指令：降级会选择目标的矩阵核心原子，并为 `a`、`b` 和 `acc` 赋予该原子的布局。结果只在存储前的类型转换处舍入一次。
 
 ## 在设备上运行 {#running-it-on-the-device}
 

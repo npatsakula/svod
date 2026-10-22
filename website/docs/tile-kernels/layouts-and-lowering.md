@@ -65,6 +65,12 @@ inference reads the operand layouts from the atom that consumes the values.
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_input`, `wmma_gfx11_acc` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8 (atom only; no kernels) | `simdgroup_8x8` |
 
+Each target with kernels also has an 8-bit integer atom into i32 (`Target::geometry_of(Int8)`):
+`mma.sync` m16n8k32 s8 and CDNA's MFMA 16×16×32 i8 hold the 16-bit fragments' bytes, twice as
+deep (`mma_sync_a8`, `mma_sync_b8`, `mfma_16x16x32_i8`); RDNA's `iu8` WMMA keeps the 16-bit
+layouts at depth 16. Its `m` and `n` are the 16-bit atom's. The planner prices the 16-bit
+geometry (`Target::geometry`) except for a problem over 8-bit rows.
+
 An `atoms::GroupMmaAtom` is a warpgroup instruction: four consecutive warps issue a 64 × n
 product together over operands read from shared memory through descriptors (`B` always, `A`
 unless it is a register tile), the accumulator spread over the group with each warp holding
@@ -122,7 +128,7 @@ The emitter lists every statement's instructions in program order inside a pre-l
 program, so Svod's linearizer toposort never runs on a tk kernel. Global accesses past a view's
 bounds are gated: loads read zero and stores are dropped. Shared rows are XOR-swizzled in
 16-byte chunks where the row's chunk count is a power of two (`layouts::Swizzle`). Shared to register loads of 16-bit tiles use `ldmatrix.x4` where the layout
-allows; on RDNA4 global to register loads use `global_load_tr_b128` where the layout is what it
+allows, and of 8-bit ones its untransposed form over 16×32 bytes; on RDNA4 global to register loads use `global_load_tr_b128` where the layout is what it
 leaves. A `Warps` statement runs its body on each warp alone, with its own copies and barriers.
 On AMD an f32 `exp2` is the hardware `v_exp_f32`, which flushes results below 2⁻¹²⁶ to zero.
 Shared memory above 48 KB is one dynamic array on CUDA; candidates are filtered against

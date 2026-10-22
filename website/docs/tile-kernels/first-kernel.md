@@ -114,7 +114,8 @@ the consumer. The author says what to copy into a slot and what to compute from 
 [schedule template](./layouts-and-lowering#schedule-templates) decides how far ahead copies
 run and places every wait and barrier.
 
-**The product.** `mma(acc, a, a_t, b, b_t)` is `acc + A·B` on f32 accumulators, here with `B`
+**The product.** `mma(acc, a, a_t, b, b_t)` is `acc + A·B` on f32 accumulators (i32 over 8-bit
+integers, `MmaIn::Acc`), here with `B`
 read transposed. It never names an instruction: the lowering picks the target's matrix-core
 atom and gives `a`, `b` and `acc` its layouts. The result is rounded once, at the cast before
 the store.
