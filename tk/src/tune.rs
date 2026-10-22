@@ -200,7 +200,9 @@ pub fn fingerprint(candidates: &[Candidate]) -> u64 {
 fn emitted(prog: &Program, lowering: &Lowering) -> Option<(u64, Arc<UOp>)> {
     let _capture = svod_ir::origin::capture_for_thread(false);
     let _scope = svod_ir::origin::install(None);
-    let lowered = crate::lower::standalone(prog.clone(), lowering).ok()?;
+    let lowered = crate::lower::standalone(prog.clone(), lowering)
+        .inspect_err(|e| tracing::debug!(target: crate::ops::PLAN, name = prog.name, error = %e, "does not lower"))
+        .ok()?;
     let emitted = digest(&(digest(&lowered.program), lowered.text(&lowering.device.target).ok()?));
     Some((emitted, lowered.program))
 }

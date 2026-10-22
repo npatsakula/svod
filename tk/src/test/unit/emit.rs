@@ -191,6 +191,36 @@ fn a_guarded_scalar_read_stays_under_its_guard(max: i64, div: i64, guarded: bool
 /// A tile re-held through the relayout scratch lowers in a program that
 /// interns no zero: the scratch is addressed from its start, not at an
 /// offset scalar of the program.
+/// A program emitting more instructions than a kernel may on its target
+/// ([`crate::atoms::Target::most_instructions`]: the CUDA bound above the
+/// AMD one) is refused by the lowering, before any compiler sees it,
+/// naming its count and the bound.
+#[test]
+fn a_program_past_the_instruction_bound_is_refused() {
+    use crate::lower::Error;
+    let target = amd(AmdArch::Gfx1201, 64);
+    let (most, shape) = (target.most_instructions(), Shape::new(64, 64));
+    assert!(most < crate::atoms::sm86().most_instructions());
+    let regs = shape.elems() / (4 * target.wave as usize);
+    let mut k = Kernel::new("huge");
+    k.warps(4);
+    let out = k.param::<F32>("o", ParamKind::Out, shape.elems());
+    let one = k.fill::<F32>(shape, Const::Float(1.0));
+    let mut x = k.zeros::<F32>(shape);
+    for _ in 0..most / regs + 1 {
+        x = k.binary(x, one, BinaryOp::Add);
+    }
+    let v = k.view(out, 0, [shape.cols, 1], shape, [None, None]);
+    k.store(v, x);
+    let grid = WarpGrid { rows: 4, cols: 1 };
+    let lowering = crate::lower::Lowering::uniform(&super::declared(target), false, grid);
+    let err = crate::lower::standalone(k.finish(), &lowering).err().expect("refused");
+    let Error::TooLarge { name, instructions, most: bound } = &err else { panic!("{err}") };
+    assert_eq!((name.as_str(), *bound), ("huge", most));
+    assert!(*instructions > most, "{instructions}");
+    assert_eq!(err.to_string(), format!("huge emits {instructions} instructions, past the {most} a kernel may"));
+}
+
 #[test]
 fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
     use crate::layouts::{Relayout, chunked};

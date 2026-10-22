@@ -16,8 +16,8 @@ use crate::atoms::{Core, Fill};
 use crate::index::*;
 use crate::ir::*;
 use crate::layouts::{Laid, Moves, TileLayout};
-use crate::lower::{Lowering, ProgramSnafu, Result, UnsupportedSnafu};
-use snafu::ResultExt;
+use crate::lower::{Lowering, ProgramSnafu, Result, TooLargeSnafu, UnsupportedSnafu};
+use snafu::{ResultExt, ensure};
 
 mod address;
 mod amdgpu;
@@ -34,6 +34,8 @@ pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSp
     e.prologue()?;
     e.block(&prog.body)?;
     let list = e.list.listed();
+    let most = low.device.target.most_instructions();
+    ensure!(list.len() <= most, TooLargeSnafu { name: &prog.name, instructions: list.len(), most });
     if std::env::var_os("TK_DUMP_LIST").is_some() {
         for (i, u) in list.iter().enumerate() {
             let srcs: Vec<u64> = u.op().sources().iter().map(|s| s.id).collect();

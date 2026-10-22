@@ -383,6 +383,25 @@ impl Costs {
 }
 
 impl Target {
+    /// The most instructions a lowered program may emit for this target;
+    /// past it the lowering refuses the program
+    /// ([`crate::lower::Error::TooLarge`]) and the tuner rejects the config
+    /// as one that fails to compile, before the backend's compiler is
+    /// handed it. The largest kernels the planner ranks (nearest lists at
+    /// depth 128, `k` 64–80, 16384² rows) emit 270k on sm_86 (a register
+    /// list of 64 over 8-bit rows, a three-slot ring unrolled; the NVPTX
+    /// backend folds a 211k one to 25k lines of PTX, 236 registers, no
+    /// spill) and 176k on gfx1201 (a queued list of 80 over 8-bit rows,
+    /// unrolled: 4 s of clang), where a queued list whose product the
+    /// inference issued the wide way round emitted 400k, which took clang
+    /// 100 s and 700 MB a config and a pool of them the RX 9070 XT's 60 GB.
+    pub fn most_instructions(&self) -> usize {
+        match self.arch {
+            GpuArch::Amd(_) => 1 << 18,
+            GpuArch::Cuda(_) | GpuArch::Metal(_) => 1 << 19,
+        }
+    }
+
     pub fn for_arch(arch: GpuArch) -> Self {
         match arch {
             GpuArch::Cuda(c) => cuda(c),

@@ -127,6 +127,7 @@ any target: `lower::render(prog, &lowering)` or `lower::standalone(prog, &loweri
 | `N warps over a grid of M: …` | `lower::Error::Grid` (`targets::a_grid_takes_every_warp_or_whole_grids_run_alone`) |
 | `<what> is not lowered yet` | `lower::Error::Unsupported`: cross-warp reductions, a cross-thread transpose, column-major chunk fills, odd warpgroup operands |
 | `… is a block barrier under a branch on the warp, which some warps skip` | `lower::Error::DivergentBarrier` (sync pass or a relayout through shared memory) |
+| `NAME emits N instructions, past the M a kernel may` | `lower::Error::TooLarge` (`Target::most_instructions`: 2^18 AMD, 2^19 CUDA): refused before any compiler sees it; the tuner rejects the config as failed |
 | `program assembly: …` / `rendering <name>: …` | `svod_ir::Error` from `UOp::linear_program` / the LLVM renderer; rerun with `SVOD_SPEC_DEBUG=1 TK_DUMP_LIST=1` |
 | `element I of NAME is accessed, which holds N` / `scalar A Div B is undefined` (also `Rem`) | `interp::Error::{OutOfBounds, Division}`; also `UnboundVar`, `ParamSize` |
 | `Rejected::{Lowers, Shallow, Divides, Smem, Layout, Registers}` | why `admit` left a lattice config out (`tk_dump` counts them, `plan.txt` lists each) |

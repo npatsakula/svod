@@ -36,6 +36,8 @@ pub enum Error {
     },
     #[snafu(display("{what} is a block barrier under a branch on the warp, which some warps skip"))]
     DivergentBarrier { what: &'static str },
+    #[snafu(display("{name} emits {instructions} instructions, past the {most} a kernel may"))]
+    TooLarge { name: String, instructions: usize, most: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -108,6 +110,15 @@ pub fn render(prog: Program, lowering: &Lowering) -> Result<String> {
 }
 
 impl Lowered {
+    /// The instructions the program emitted (within
+    /// [`Target::most_instructions`]).
+    pub fn instructions(&self) -> usize {
+        let Op::Program(ops::Program { linear: Some(linear), .. }) = self.program.op() else {
+            unreachable!("a lowering emits a linear program")
+        };
+        linear.op().sources().len()
+    }
+
     /// The LLVM text of the program for `target`: what the backend's
     /// compiler is handed. Metal renders C, which has no text here.
     pub fn text(&self, target: &Target) -> Result<String> {
