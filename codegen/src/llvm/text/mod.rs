@@ -94,7 +94,12 @@ impl Renderer for LlvmTextRenderer {
 
         let mut ctx = RenderContext::new();
         if self.target.is_amd() {
-            ctx.set_loop_hint(amd::LOOP_HINT, amd::register_indexing_ranges(&nodes));
+            ctx.set_loop_hint(
+                amd::LOOP_HINT,
+                amd::ROLLED_HINT,
+                amd::register_indexing_ranges(&nodes),
+                amd::product_ranges(&nodes),
+            );
         }
         let mut kernel: Vec<String> = Vec::new();
         let mut operations = Vec::new();

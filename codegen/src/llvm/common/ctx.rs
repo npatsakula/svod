@@ -26,13 +26,15 @@ pub struct RenderContext {
     /// by AMD LOCAL BUFFER rendering to emit `@local_N = addrspace(3) global ...`
     /// declarations, which cannot be expressed inline in the function body.
     module_prefix: Vec<String>,
-    /// Metadata tuple a loop's back edge carries (an unroll hint); `None`
-    /// renders loops bare.
-    loop_hint: Option<&'static str>,
+    /// Metadata tuples a loop's back edge carries: the unroll hint, and the
+    /// one a loop kept rolled carries instead; `None` renders loops bare.
+    loop_hints: Option<[&'static str; 2]>,
     /// RANGE ids whose loops stay bare even with a hint set.
     unhinted: HashSet<u64>,
-    /// Loop IDs handed out so far, one per hinted back edge.
-    loops: usize,
+    /// RANGE ids whose loops carry the rolled hint.
+    rolled: HashSet<u64>,
+    /// The hint (its index) each hinted back edge carries, in order.
+    loops: Vec<usize>,
     /// Byte offset of each LOCAL buffer (by slot) inside the kernel's one
     /// dynamic shared array; empty when LOCAL buffers are static globals.
     dynamic_locals: HashMap<usize, usize>,
@@ -46,41 +48,58 @@ impl RenderContext {
             range_stack: Vec::new(),
             pending_error: None,
             module_prefix: Vec::new(),
-            loop_hint: None,
+            loop_hints: None,
             unhinted: HashSet::new(),
-            loops: 0,
+            rolled: HashSet::new(),
+            loops: Vec::new(),
             dynamic_locals: HashMap::new(),
         }
     }
 
-    /// Attach `hint`, a metadata tuple such as `!{!"llvm.loop.unroll.disable"}`,
+    /// Attach `hint`, a metadata tuple such as `!{!"amdgpu.loop.unroll.threshold", i32 300}`,
     /// to every loop rendered from here on except those over the RANGEs in
-    /// `unhinted`.
-    pub fn set_loop_hint(&mut self, hint: &'static str, unhinted: HashSet<u64>) {
-        self.loop_hint = Some(hint);
+    /// `unhinted`, which stay bare, and those in `rolled`, which carry
+    /// `rolled_hint` instead.
+    pub fn set_loop_hint(
+        &mut self,
+        hint: &'static str,
+        rolled_hint: &'static str,
+        unhinted: HashSet<u64>,
+        rolled: HashSet<u64>,
+    ) {
+        self.loop_hints = Some([hint, rolled_hint]);
         self.unhinted = unhinted;
+        self.rolled = rolled;
+    }
+
+    /// The hint nodes the module declares: the rolled one only where a loop
+    /// carries it.
+    fn hint_nodes(&self) -> usize {
+        1 + usize::from(!self.rolled.is_empty())
     }
 
     /// The branch that closes the loop over `range` (axis `id`) — back to its
-    /// latch, with a loop ID of its own when it carries the hint.
+    /// latch, with a loop ID of its own when it carries a hint.
     pub fn back_edge(&mut self, range: &Arc<UOp>, id: &str) -> String {
         let branch = format!("  br label %loop_latch_{id}");
-        if self.loop_hint.is_none() || self.unhinted.contains(&range.id) {
+        if self.loop_hints.is_none() || self.unhinted.contains(&range.id) {
             return branch;
         }
-        self.loops += 1;
-        format!("{branch}, !llvm.loop !{}", self.loops)
+        self.loops.push(usize::from(self.rolled.contains(&range.id)));
+        format!("{branch}, !llvm.loop !{}", self.hint_nodes() + self.loops.len() - 1)
     }
 
-    /// The module-level nodes the back edges refer to: the hint as `!0`, then
+    /// The module-level nodes the back edges refer to: the hints first, then
     /// one distinct, self-referential loop ID per loop, as LLVM requires.
     pub fn loop_metadata(&self) -> Vec<String> {
-        match self.loop_hint {
-            Some(hint) if self.loops > 0 => std::iter::once(format!("!0 = {hint}"))
-                .chain((1..=self.loops).map(|n| format!("!{n} = distinct !{{!{n}, !0}}")))
-                .collect(),
-            _ => Vec::new(),
-        }
+        let Some(hints) = self.loop_hints.filter(|_| !self.loops.is_empty()) else { return Vec::new() };
+        let nodes = self.hint_nodes();
+        let heads = hints.iter().take(nodes).enumerate().map(|(i, hint)| format!("!{i} = {hint}"));
+        let loops = self.loops.iter().enumerate().map(|(i, &hint)| {
+            let n = nodes + i;
+            format!("!{n} = distinct !{{!{n}, !{hint}}}")
+        });
+        heads.chain(loops).collect()
     }
 
     /// Append a line to the module-level prefix block. Used by AMD's
