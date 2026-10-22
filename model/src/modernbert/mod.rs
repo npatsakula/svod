@@ -30,7 +30,7 @@ pub(crate) use classifier::ClassifierHead;
 pub(crate) use classifier::ModernBertClassificationModel;
 pub use classifier::ModernBertClassifier;
 pub use classifier_jit::ModernBertClassifierJit;
-pub use config::{ClassifierPooling, ModernBertConfig};
+pub use config::ModernBertConfig;
 pub use embedder::ModernBertEmbedder;
 pub use embedder_jit::ModernBertEmbedderJit;
 pub use encoder::Encoder;

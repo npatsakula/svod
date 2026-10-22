@@ -20,10 +20,10 @@ use svod_tensor::Tensor;
 use svod_tensor::nn::{LayerNorm, Linear, Module};
 use svod_tk::ops::{self, Act};
 
-use crate::encoder_head::{HeadError, HeadOptions, HeadPlans};
+use crate::encoder_head::{HeadError, HeadOptions, HeadPlans, PoolingMode};
 use crate::init::{Bias, linear};
 use crate::modernbert::classifier_jit::ModernBertClassifierJit;
-use crate::modernbert::config::{ClassifierPooling, ModernBertConfig};
+use crate::modernbert::config::ModernBertConfig;
 use crate::modernbert::error::{HeadSnafu, Result};
 use crate::modernbert::model::ModernBert;
 use crate::modernbert::pipeline::load_checkpoint;
@@ -93,7 +93,7 @@ pub(crate) struct ModernBertClassificationModel {
     #[module(key = "")]
     head: ClassifierHead,
     #[module(skip)]
-    pooling: ClassifierPooling,
+    pooling: PoolingMode,
 }
 
 impl ModernBertClassificationModel {
@@ -117,9 +117,9 @@ impl ModernBertClassificationModel {
     pub(crate) fn forward(&self, input_ids: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let hidden = self.backbone.forward(input_ids, Some(mask))?;
         let pooled = match self.pooling {
-            ClassifierPooling::Cls => hidden.take_index(1, 0)?,
+            PoolingMode::Cls => hidden.take_index(1, 0)?,
             // The mean accumulates in f32; the head runs at the model's dtype.
-            ClassifierPooling::Mean => hidden.masked_mean(mask, 1)?.cast(hidden.dtype()),
+            PoolingMode::Mean => hidden.masked_mean(mask, 1)?.cast(hidden.dtype()),
         };
         self.head.forward(&pooled)
     }

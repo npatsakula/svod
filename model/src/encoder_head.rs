@@ -25,19 +25,23 @@
 //! there, whichever thread runs it: the default device is thread-local, and a
 //! serving pipeline builds a head on one thread and runs it on another.
 //! [`HeadPlans::warm_up`] compiles a shape ahead of its first batch.
+//!
+//! The embedders pool as a checkpoint's sentence-transformers config says
+//! ([`Pooling`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use hf_hub::HFError;
+use serde::Deserialize;
 use snafu::{ResultExt, Snafu, ensure};
 use svod_arch::pipelines::text::{Encoding, RunProfile};
 use svod_dtype::default_device::{default_device, with_default_device};
 use svod_dtype::{DType, DeviceSpec};
 use svod_runtime::{KernelProfile, StageProfile};
-use svod_tensor::PrepareConfig;
 use svod_tensor::jit::rt::ArrayViewMutD;
+use svod_tensor::{PrepareConfig, Tensor};
 
 use crate::hub::HubRepo;
 use crate::jit::{self, InputSpec};
@@ -123,6 +127,162 @@ impl HubOptions {
             None => model.get("tokenizer.json"),
         }
     }
+}
+
+// ── pooling ─────────────────────────────────────────────────────────────────
+
+/// Which tokens' states a head pools into one vector.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PoolingMode {
+    /// The first token's (`[CLS]` / `<s>`).
+    Cls,
+    /// The mean over the real tokens.
+    #[default]
+    Mean,
+}
+
+/// How an embedder turns a chunk's token states into its embedding: the
+/// sentence-transformers `Pooling` (and optional `Normalize`) modules. The
+/// default, mean then L2, is what a checkpoint without that config gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pooling {
+    pub mode: PoolingMode,
+    /// Scale each embedding to unit length.
+    pub normalize: bool,
+}
+
+impl Default for Pooling {
+    fn default() -> Self {
+        Self { mode: PoolingMode::Mean, normalize: true }
+    }
+}
+
+/// Why a checkpoint's pooling could not be read, or is one these heads do not
+/// reproduce.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum PoolingError {
+    #[snafu(display("fetching the pooling config: {source}"))]
+    Hub { source: HFError },
+    #[snafu(display("reading {}: {source}", path.display()))]
+    Read { path: PathBuf, source: std::io::Error },
+    #[snafu(display("parsing {file}: {source}"))]
+    Json { file: String, source: serde_json::Error },
+    #[snafu(display("sentence-transformers {what} is not supported"))]
+    Unsupported { what: String },
+}
+
+/// One entry of sentence-transformers' `modules.json`.
+#[derive(Deserialize)]
+struct StModule {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    path: String,
+}
+
+/// sentence-transformers' `Pooling` config; older files lack the later keys.
+#[derive(Deserialize)]
+struct StPooling {
+    #[serde(default)]
+    pooling_mode_cls_token: bool,
+    #[serde(default)]
+    pooling_mode_mean_tokens: bool,
+    #[serde(default)]
+    pooling_mode_max_tokens: bool,
+    #[serde(default)]
+    pooling_mode_mean_sqrt_len_tokens: bool,
+    #[serde(default)]
+    pooling_mode_weightedmean_tokens: bool,
+    #[serde(default)]
+    pooling_mode_lasttoken: bool,
+    #[serde(default = "include_prompt_default")]
+    include_prompt: bool,
+}
+
+fn include_prompt_default() -> bool {
+    true
+}
+
+impl Pooling {
+    /// Read a sentence-transformers layout: `modules_json` is its
+    /// `modules.json`, and `read` returns a file of the checkpoint by its
+    /// repository path (the pooling module's `<path>/config.json`). Anything
+    /// these heads would compute differently is an error, not a guess: a
+    /// pooling mode other than CLS or mean, several at once, a prompt left out
+    /// of the pool, the transformer in a subdirectory, or any module past
+    /// `Pooling` and `Normalize` (a `Dense` projection, say).
+    pub fn from_sentence_transformers(
+        modules_json: &str,
+        read: impl FnOnce(&str) -> Result<String, PoolingError>,
+    ) -> Result<Self, PoolingError> {
+        let modules: Vec<StModule> = serde_json::from_str(modules_json).context(JsonSnafu { file: "modules.json" })?;
+        let (mut pooling_path, mut normalize) = (None, false);
+        for module in &modules {
+            match module.kind.rsplit('.').next().unwrap_or_default() {
+                "Transformer" => ensure!(
+                    module.path.is_empty(),
+                    UnsupportedSnafu { what: format!("a transformer under {:?}", module.path) }
+                ),
+                "Pooling" => pooling_path = Some(module.path.as_str()),
+                "Normalize" => normalize = true,
+                _ => return UnsupportedSnafu { what: format!("module {}", module.kind) }.fail(),
+            }
+        }
+        let path = pooling_path.ok_or_else(|| UnsupportedSnafu { what: "a layout without Pooling" }.build())?;
+        let file = if path.is_empty() { "config.json".to_owned() } else { format!("{path}/config.json") };
+        let config: StPooling = serde_json::from_str(&read(&file)?).context(JsonSnafu { file: file.as_str() })?;
+        ensure!(config.include_prompt, UnsupportedSnafu { what: "include_prompt = false" });
+        let modes = [
+            (config.pooling_mode_cls_token, Some(PoolingMode::Cls)),
+            (config.pooling_mode_mean_tokens, Some(PoolingMode::Mean)),
+            (config.pooling_mode_max_tokens, None),
+            (config.pooling_mode_mean_sqrt_len_tokens, None),
+            (config.pooling_mode_weightedmean_tokens, None),
+            (config.pooling_mode_lasttoken, None),
+        ];
+        let mut set = modes.iter().filter(|(on, _)| *on).map(|&(_, mode)| mode);
+        let mode = match (set.next(), set.next()) {
+            (Some(Some(mode)), None) => mode,
+            (Some(None), None) => return UnsupportedSnafu { what: "a pooling mode other than CLS or mean" }.fail(),
+            (None, _) => return UnsupportedSnafu { what: "a Pooling without a mode" }.fail(),
+            (Some(_), Some(_)) => return UnsupportedSnafu { what: "several pooling modes at once" }.fail(),
+        };
+        Ok(Self { mode, normalize })
+    }
+}
+
+/// The pooling a hub checkpoint's sentence-transformers config gives, or
+/// [`Pooling::default`] when the repository has no `modules.json`. Only a
+/// missing file (a 404, or the cache's record of one) takes the default: a
+/// file the cache never fetched is an error offline, since guessing could
+/// pool differently than the checkpoint says — run once online.
+pub(crate) fn pooling_from_hub(repo: &HubRepo) -> Result<Pooling, PoolingError> {
+    let read = |file: &str| {
+        let path = repo.get(file).context(HubSnafu)?;
+        std::fs::read_to_string(&path).context(ReadSnafu { path })
+    };
+    match repo.get("modules.json") {
+        Err(HFError::EntryNotFound { .. }) => Ok(Pooling::default()),
+        Err(source) => Err(PoolingError::Hub { source }),
+        Ok(path) => {
+            let modules = std::fs::read_to_string(&path).context(ReadSnafu { path })?;
+            Pooling::from_sentence_transformers(&modules, read)
+        }
+    }
+}
+
+/// Pool `hidden` `(B, L, D)` over the real tokens of `mask` `(B, L)` as
+/// `pooling` says, into finished `(B, D)` f32 embeddings. The mean runs in
+/// f32, as the reference pools: a bf16 mean rounds the pooled vector itself,
+/// an error no averaging over tokens washes out. An all-pad row pools to the
+/// zero vector and stays zero.
+pub(crate) fn pool(hidden: &Tensor, mask: &Tensor, pooling: Pooling) -> svod_tensor::error::Result<Tensor> {
+    let pooled = match pooling.mode {
+        PoolingMode::Cls => hidden.take_index(1, 0)?.cast(DType::Float32),
+        PoolingMode::Mean => hidden.cast(DType::Float32).masked_mean(mask, 1)?,
+    };
+    if pooling.normalize { pooled.lp_normalize(-1, 2) } else { Ok(pooled) }
 }
 
 /// Build a dense `Vec<String>` from a sparse HF `id2label` map (`config.json`):

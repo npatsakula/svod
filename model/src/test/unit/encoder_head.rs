@@ -4,11 +4,15 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::json;
 use svod_arch::pipelines::text::{EncoderHead, Encoding};
 use svod_dtype::default_device::{default_device, set_default_device, with_default_device};
 use svod_dtype::{DType, DeviceSpec};
+use svod_tensor::Tensor;
 
-use crate::encoder_head::{HeadError, HeadOptions, HeadPlans, pack_ids, pack_mask, plan_shape};
+use crate::encoder_head::{
+    HeadError, HeadOptions, HeadPlans, Pooling, PoolingError, PoolingMode, pack_ids, pack_mask, plan_shape, pool,
+};
 use crate::modernbert::{ModernBertClassifier, ModernBertEmbedder, ModernBertTokenClassifier};
 use crate::state::StateDict;
 use crate::test::unit::xlm_roberta::model::tiny_cfg;
@@ -194,6 +198,87 @@ fn warm_up_checks_the_shape(batch: usize, len: usize) -> Result<usize, HeadError
     let mut plans = tiny_plans(XlmRobertaTokenClassificationModel::empty(tiny_cfg()));
     plans.warm_up(batch, len)?;
     Ok(plans.shapes().len())
+}
+
+// ── pooling ─────────────────────────────────────────────────────────────────
+
+/// BGE-M3's `modules.json` and `1_Pooling/config.json`, verbatim.
+const BGE_M3_MODULES: &str = r#"[
+  {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+  {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"},
+  {"idx": 2, "name": "2", "path": "2_Normalize", "type": "sentence_transformers.models.Normalize"}
+]"#;
+const BGE_M3_POOLING: &str = r#"{
+  "word_embedding_dimension": 1024,
+  "pooling_mode_cls_token": true,
+  "pooling_mode_mean_tokens": false,
+  "pooling_mode_max_tokens": false,
+  "pooling_mode_mean_sqrt_len_tokens": false
+}"#;
+
+/// A `modules.json` of `(type, path)` modules.
+fn st_modules(modules: &[(&str, &str)]) -> String {
+    let entries: Vec<_> = modules
+        .iter()
+        .enumerate()
+        .map(
+            |(i, (kind, path))| json!({"idx": i, "path": path, "type": format!("sentence_transformers.models.{kind}")}),
+        )
+        .collect();
+    json!(entries).to_string()
+}
+
+/// A Pooling config with the `pooling_mode_*` keys in `on` set.
+fn st_pooling(on: &[&str], include_prompt: bool) -> String {
+    let mut config = json!({"word_embedding_dimension": 8, "include_prompt": include_prompt});
+    for mode in on {
+        config[format!("pooling_mode_{mode}")] = json!(true);
+    }
+    config.to_string()
+}
+
+/// Read a layout whose pooling config is `pooling`, checking it is asked for
+/// at the path `modules.json` gives.
+fn read_layout(modules: &str, pooling: &str) -> Result<Pooling, PoolingError> {
+    Pooling::from_sentence_transformers(modules, |file| {
+        assert_eq!(file, "1_Pooling/config.json");
+        Ok(pooling.to_owned())
+    })
+}
+
+/// The pooling a sentence-transformers layout gives, or why these heads
+/// cannot reproduce it.
+#[test_case::test_case(BGE_M3_MODULES, BGE_M3_POOLING => matches Ok(Pooling { mode: PoolingMode::Cls, normalize: true }); "bge-m3")]
+#[test_case::test_case(&st_modules(&[("Transformer", ""), ("Pooling", "1_Pooling")]), &st_pooling(&["mean_tokens"], true) => matches Ok(Pooling { mode: PoolingMode::Mean, normalize: false }); "mean without normalize")]
+#[test_case::test_case(BGE_M3_MODULES, &st_pooling(&["max_tokens"], true) => matches Err(PoolingError::Unsupported { .. }); "max")]
+#[test_case::test_case(BGE_M3_MODULES, &st_pooling(&["mean_sqrt_len_tokens"], true) => matches Err(PoolingError::Unsupported { .. }); "mean sqrt len")]
+#[test_case::test_case(BGE_M3_MODULES, &st_pooling(&["weightedmean_tokens"], true) => matches Err(PoolingError::Unsupported { .. }); "weighted mean")]
+#[test_case::test_case(BGE_M3_MODULES, &st_pooling(&["lasttoken"], true) => matches Err(PoolingError::Unsupported { .. }); "last token")]
+#[test_case::test_case(BGE_M3_MODULES, &st_pooling(&["cls_token", "mean_tokens"], true) => matches Err(PoolingError::Unsupported { .. }); "several modes")]
+#[test_case::test_case(BGE_M3_MODULES, &st_pooling(&[], true) => matches Err(PoolingError::Unsupported { .. }); "no mode")]
+#[test_case::test_case(BGE_M3_MODULES, &st_pooling(&["mean_tokens"], false) => matches Err(PoolingError::Unsupported { .. }); "prompt left out")]
+#[test_case::test_case(&st_modules(&[("Transformer", ""), ("Pooling", "1_Pooling"), ("Dense", "2_Dense")]), BGE_M3_POOLING => matches Err(PoolingError::Unsupported { .. }); "dense projection")]
+#[test_case::test_case(&st_modules(&[("Transformer", "0_Transformer"), ("Pooling", "1_Pooling")]), BGE_M3_POOLING => matches Err(PoolingError::Unsupported { .. }); "transformer in a subdirectory")]
+#[test_case::test_case(&st_modules(&[("Transformer", "")]), BGE_M3_POOLING => matches Err(PoolingError::Unsupported { .. }); "no pooling")]
+#[test_case::test_case("{", BGE_M3_POOLING => matches Err(PoolingError::Json { .. }); "broken modules.json")]
+fn sentence_transformers_layout_pools(modules: &str, pooling: &str) -> Result<Pooling, PoolingError> {
+    read_layout(modules, pooling)
+}
+
+/// CLS takes the first token; mean averages the real tokens only; normalize
+/// scales to unit length.
+#[test_case::test_case(PoolingMode::Cls, false => vec![3.0, 4.0]; "cls")]
+#[test_case::test_case(PoolingMode::Mean, false => vec![2.0, 3.0]; "mean")]
+#[test_case::test_case(PoolingMode::Cls, true => vec![0.6, 0.8]; "cls normalized")]
+fn pool_reads_the_real_tokens(mode: PoolingMode, normalize: bool) -> Vec<f32> {
+    with_default_device(DeviceSpec::Cpu, || {
+        // One row of three tokens, the last padding (which a mean must skip).
+        let hidden = Tensor::from_slice([3.0f32, 4.0, 1.0, 2.0, 100.0, 100.0]).try_reshape([1, 3, 2]).unwrap();
+        let mask = Tensor::from_slice([1i64, 1, 0]).try_reshape([1, 3]).unwrap();
+        let pooled = pool(&hidden, &mask, Pooling { mode, normalize }).expect("pool");
+        pooled.realize().expect("realize");
+        pooled.as_vec::<f32>().expect("readout")
+    })
 }
 
 // ── options, threads and devices ────────────────────────────────────────────
