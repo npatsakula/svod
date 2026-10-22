@@ -257,15 +257,17 @@ impl ClassifyTokens for StubRecognize {
 }
 
 /// Records the chunk lengths of every batch handed to `run_batch` (then echoes
-/// ids as embeddings) — lets a test observe *how* the pipeline sub-batches.
+/// ids as embeddings), and every shape it is warmed up for — lets a test
+/// observe *how* the pipeline sub-batches.
 struct BatchSpy {
     batches: Vec<Vec<usize>>,
+    warmed: Vec<(usize, usize)>,
     max_batch: usize,
 }
 
 impl BatchSpy {
     fn new(max_batch: usize) -> Self {
-        Self { batches: Vec::new(), max_batch }
+        Self { batches: Vec::new(), warmed: Vec::new(), max_batch }
     }
 
     fn sizes(&self) -> Vec<usize> {
@@ -288,6 +290,10 @@ impl EncoderHead for BatchSpy {
         let values =
             batch.iter().map(|e| Embedding { values: e.input_ids.iter().map(|&id| id as f32).collect() }).collect();
         Ok((values, None))
+    }
+    fn warm_up(&mut self, batch: usize, len: usize) -> Result<(), Infallible> {
+        self.warmed.push((batch, len));
+        Ok(())
     }
 }
 
@@ -1048,6 +1054,16 @@ fn classification_document_max_is_the_best_window() {
 fn no_chunks_pool_to_nothing() {
     assert_eq!(embedding_document(&[], DocumentPooling::Mean, true), None);
     assert_eq!(classification_document(&[], DocumentPooling::Max), None);
+}
+
+// ─── warm_up ────────────────────────────────────────────────────────────────
+
+#[test]
+fn warm_up_hands_each_shape_to_the_head() {
+    let mut p = EncoderPipeline::new(ByteTokenizer, TruncatingChunker::new(8), BatchSpy::new(4));
+    p.warm_up(&[(1, 8), (4, 128)]).unwrap();
+    assert_eq!(p.embedder_mut().warmed, [(1, 8), (4, 128)]);
+    assert!(p.embedder_mut().batches.is_empty(), "warming runs no request");
 }
 
 // ─── chunk-level seam (*_chunks / *_chunks_batch) ───────────────────────────

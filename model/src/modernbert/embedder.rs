@@ -90,6 +90,10 @@ impl EncoderHead for ModernBertEmbedder {
             run.output.chunks_exact(self.hidden_size).map(|row| Embedding { values: row.to_vec() }).collect();
         Ok((embeddings, run.profile))
     }
+
+    fn warm_up(&mut self, batch: usize, len: usize) -> Result<(), HeadError> {
+        self.plans.warm_up(batch, len)
+    }
 }
 
 impl Embed for ModernBertEmbedder {

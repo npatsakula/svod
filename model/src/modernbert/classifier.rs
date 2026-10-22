@@ -188,6 +188,10 @@ impl EncoderHead for ModernBertClassifier {
             run.output.chunks_exact(self.num_classes).map(|row| Classification { logits: row.to_vec() }).collect();
         Ok((classifications, run.profile))
     }
+
+    fn warm_up(&mut self, batch: usize, len: usize) -> std::result::Result<(), HeadError> {
+        self.plans.warm_up(batch, len)
+    }
 }
 
 impl Classify for ModernBertClassifier {

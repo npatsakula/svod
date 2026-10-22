@@ -47,6 +47,10 @@
 //! counts, so [`embedding_document`] / [`classification_document`] fold a long
 //! text's windows into one, as [`group_spans_document`] /
 //! [`token_scores_document`] do for tokens.
+//!
+//! **Warm-up.** A head that compiles a plan per batch shape on first use pays
+//! that on the first request of each shape; [`EncoderPipeline::warm_up`] pays
+//! it ahead for the shapes a server expects.
 
 use std::ops::Range;
 #[cfg(feature = "hf-tokenizers")]
@@ -821,6 +825,15 @@ pub trait EncoderHead {
         let (mut values, prof) = self.run_batch(&[enc], profile)?;
         Ok((values.pop().unwrap_or_default(), prof))
     }
+
+    /// Get ready, ahead of the first request, for a batch of `batch` chunks
+    /// whose longest is `len` tokens: a head that compiles a plan per shape on
+    /// first use compiles (and runs once) the one such a batch runs on. The
+    /// default does nothing, for heads that compile nothing lazily.
+    fn warm_up(&mut self, batch: usize, len: usize) -> Result<(), Self::Error> {
+        let _ = (batch, len);
+        Ok(())
+    }
 }
 
 /// Finished-embeddings head. A specialization of [`EncoderHead`] fixing
@@ -1087,6 +1100,15 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
     /// expose `embedder_mut` / `classifier_mut` / `token_classifier_mut` aliases.
     pub fn model_mut(&mut self) -> &mut M {
         &mut self.model
+    }
+
+    /// Get the head ready for each `(batch, len)` — a batch of `batch` chunks,
+    /// the longest `len` tokens — ahead of the first request, so a server pays
+    /// its plans' compile and tuning at startup (see
+    /// [`EncoderHead::warm_up`]). Only the
+    /// [`Encode`](EncoderPipelineError::Encode) arm is reachable here.
+    pub fn warm_up(&mut self, shapes: &[(usize, usize)]) -> Result<(), PipelineError<T, C, M>> {
+        shapes.iter().try_for_each(|&(batch, len)| self.model.warm_up(batch, len)).context(EncodeSnafu)
     }
 }
 
