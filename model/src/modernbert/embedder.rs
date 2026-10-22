@@ -96,4 +96,8 @@ impl Embed for ModernBertEmbedder {
     fn hidden_size(&self) -> usize {
         self.hidden_size
     }
+
+    fn normalized(&self) -> bool {
+        true
+    }
 }
