@@ -42,6 +42,11 @@
 //! [`PairTokenizer`] encodes them, the chunkers cut or window the second text
 //! and keep the first whole, and [`classify_pair`](EncoderPipeline::classify_pair)
 //! scores them.
+//!
+//! **One result per document.** Chunk results carry their content token
+//! counts, so [`embedding_document`] / [`classification_document`] fold a long
+//! text's windows into one, as [`group_spans_document`] /
+//! [`token_scores_document`] do for tokens.
 
 use std::ops::Range;
 #[cfg(feature = "hf-tokenizers")]
@@ -76,6 +81,9 @@ pub struct Embedding {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChunkEmbedding {
     pub byte_offset: usize,
+    /// The chunk's content tokens (specials, and a pair's first text, not
+    /// counted): [`embedding_document`]'s weight.
+    pub tokens: usize,
     pub values: Vec<f32>,
 }
 
@@ -672,6 +680,9 @@ pub struct Classification {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChunkClassification {
     pub byte_offset: usize,
+    /// The chunk's content tokens (specials, and a pair's first text, not
+    /// counted): [`classification_document`]'s weight.
+    pub tokens: usize,
     pub logits: Vec<f32>,
 }
 
@@ -814,11 +825,16 @@ pub trait EncoderHead {
 
 /// Finished-embeddings head. A specialization of [`EncoderHead`] fixing
 /// [`Output`](EncoderHead::Output) = [`Embedding`]; implement
-/// [`EncoderHead::run_batch`] plus [`hidden_size`](Embed::hidden_size).
+/// [`EncoderHead::run_batch`] plus [`hidden_size`](Embed::hidden_size) and
+/// [`normalized`](Embed::normalized).
 pub trait Embed: EncoderHead<Output = Embedding> {
     /// The model's hidden size — the length of each finished [`Embedding`] (the
     /// model pools the sequence dimension before returning it).
     fn hidden_size(&self) -> usize;
+
+    /// Whether each [`Embedding`] is unit length — what
+    /// [`embedding_document`] should restore after pooling.
+    fn normalized(&self) -> bool;
 }
 
 /// Sentence/text-classification head. A specialization of [`EncoderHead`] fixing
@@ -1105,19 +1121,32 @@ impl<T: PairTokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
 // named aggregate, pairing the model's position-agnostic outputs with their
 // source chunks' positions (the old per-model `EncoderHead::attach`).
 
-/// Pair finished embeddings with their source chunks' byte offsets — the
-/// position-attachment step the embed facade runs after [`EncoderPipeline::run_one`].
+/// Pair finished embeddings with their source chunks' byte offsets and content
+/// token counts — the position-attachment step the embed facade runs after
+/// [`EncoderPipeline::run_one`].
 fn attach_embed(outputs: Vec<Embedding>, chunks: &[TextChunk]) -> Vec<ChunkEmbedding> {
-    chunks.iter().zip(outputs).map(|(c, o)| ChunkEmbedding { byte_offset: c.byte_offset, values: o.values }).collect()
+    chunks
+        .iter()
+        .zip(outputs)
+        .map(|(c, o)| ChunkEmbedding {
+            byte_offset: c.byte_offset,
+            tokens: Segments::of(&c.encoding).content.len(),
+            values: o.values,
+        })
+        .collect()
 }
 
-/// Pair class logits with their source chunks' byte offsets — the classify facade's
-/// attachment step.
+/// Pair class logits with their source chunks' byte offsets and content token
+/// counts — the classify facade's attachment step.
 fn attach_classify(outputs: Vec<Classification>, chunks: &[TextChunk]) -> Vec<ChunkClassification> {
     chunks
         .iter()
         .zip(outputs)
-        .map(|(c, o)| ChunkClassification { byte_offset: c.byte_offset, logits: o.logits })
+        .map(|(c, o)| ChunkClassification {
+            byte_offset: c.byte_offset,
+            tokens: Segments::of(&c.encoding).content.len(),
+            logits: o.logits,
+        })
         .collect()
 }
 
@@ -1282,7 +1311,7 @@ impl<T: PairTokenizer, C: Chunker, M: Classify> EncoderPipeline<T, C, M> {
     /// Tokenize the pair → chunk → classify → assemble profile: a
     /// cross-encoder's score for (`first`, `second`), such as a reranker's for
     /// (query, passage). Chunks' positions refer to `second`, the text a
-    /// chunker cuts or windows.
+    /// chunker cuts or windows; pool windows with [`classification_document`].
     pub fn classify_pair(
         &mut self,
         first: &str,
@@ -1381,6 +1410,67 @@ impl<T: Tokenizer, C: Chunker, M: ClassifyTokens> EncoderPipeline<T, C, M> {
     pub fn token_classifier_mut(&mut self) -> &mut M {
         &mut self.model
     }
+}
+
+// ─── Document pooling (host free-fns) ───────────────────────────────────────
+
+/// How [`embedding_document`] and [`classification_document`] fold a text's
+/// chunks into one result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentPooling {
+    /// Each chunk weighted by its content tokens, so a short last window
+    /// counts for what it holds (and an overlap as often as windows hold it).
+    Mean,
+    /// The element-wise maximum: for logits, the best window (MaxP when
+    /// reranking a long passage).
+    Max,
+}
+
+impl DocumentPooling {
+    /// Fold `rows` (all of one length), each with its weight; `None` for no
+    /// rows.
+    fn pool<'a>(self, rows: impl Iterator<Item = (&'a [f32], usize)> + Clone) -> Option<Vec<f32>> {
+        let width = rows.clone().next()?.0.len();
+        let mut out = vec![if self == Self::Max { f32::NEG_INFINITY } else { 0.0 }; width];
+        let mut total = 0.0;
+        for (row, weight) in rows {
+            assert_eq!(row.len(), width, "every chunk of a text has the same width");
+            let weight = weight.max(1) as f32;
+            total += weight;
+            for (acc, &x) in out.iter_mut().zip(row) {
+                *acc = match self {
+                    Self::Mean => *acc + weight * x,
+                    Self::Max => acc.max(x),
+                };
+            }
+        }
+        if self == Self::Mean {
+            out.iter_mut().for_each(|x| *x /= total);
+        }
+        Some(out)
+    }
+}
+
+/// One embedding for a text from its chunks' (one per window under
+/// [`SlidingWindowChunker`]), or `None` for no chunks. With `normalize` the
+/// result is scaled back to unit length, which a mean of unit vectors loses:
+/// pass the head's [`Embed::normalized`].
+pub fn embedding_document(chunks: &[ChunkEmbedding], pooling: DocumentPooling, normalize: bool) -> Option<Vec<f32>> {
+    let mut out = pooling.pool(chunks.iter().map(|c| (c.values.as_slice(), c.tokens)))?;
+    if normalize {
+        let norm = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            out.iter_mut().for_each(|x| *x /= norm);
+        }
+    }
+    Some(out)
+}
+
+/// One row of logits for a text (or a pair) from its chunks', or `None` for no
+/// chunks. Logits are pooled before any softmax or sigmoid, as
+/// [`token_scores_document`] does.
+pub fn classification_document(chunks: &[ChunkClassification], pooling: DocumentPooling) -> Option<Vec<f32>> {
+    pooling.pool(chunks.iter().map(|c| (c.logits.as_slice(), c.tokens)))
 }
 
 // ─── Span / label decoding (host free-fns) ──────────────────────────────────

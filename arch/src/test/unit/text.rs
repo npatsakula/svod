@@ -7,10 +7,11 @@ use test_case::test_case;
 #[cfg(feature = "hf-tokenizers")]
 use crate::pipelines::text::HfTokenizer;
 use crate::pipelines::text::{
-    ChunkTokenClassification, Chunker, Classification, Classify, ClassifyTokens, Embed, Embedding, EncoderHead,
-    EncoderPipeline, EncoderPipelineError, Encoding, PairTokenizer, PairTruncation, RunOptions, RunProfile, Scheme,
-    SlidingWindowChunker, SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, TokenScores,
-    Tokenizer, TruncatingChunker, TruncatingChunkerError, WindowWeighting, argmax, group_spans, group_spans_document,
+    ChunkClassification, ChunkEmbedding, ChunkTokenClassification, Chunker, Classification, Classify, ClassifyTokens,
+    DocumentPooling, Embed, Embedding, EncoderHead, EncoderPipeline, EncoderPipelineError, Encoding, PairTokenizer,
+    PairTruncation, RunOptions, RunProfile, Scheme, SlidingWindowChunker, SlidingWindowChunkerError, TextChunk,
+    TokenClassification, TokenLabel, TokenScores, Tokenizer, TruncatingChunker, TruncatingChunkerError,
+    WindowWeighting, argmax, classification_document, embedding_document, group_spans, group_spans_document,
     labels_for_tokens, sigmoid, softmax, token_scores_document,
 };
 
@@ -178,6 +179,10 @@ impl Embed for StubEmbed {
     fn hidden_size(&self) -> usize {
         self.hidden_size
     }
+
+    fn normalized(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, snafu::Snafu)]
@@ -289,6 +294,10 @@ impl EncoderHead for BatchSpy {
 impl Embed for BatchSpy {
     fn hidden_size(&self) -> usize {
         0
+    }
+
+    fn normalized(&self) -> bool {
+        false
     }
 }
 
@@ -969,17 +978,76 @@ fn classify_tokens_batch_basic_three_texts() {
     assert_eq!(stage_names(out.profile), ["tokenize", "chunk", "classify_tokens"]);
 }
 
-/// Each pair is one sequence the head scores, and the batch keeps the pairs'
-/// order.
+/// Each pair is one sequence the head scores; its chunk counts the second
+/// text's tokens, and the batch keeps the pairs' order.
 #[test]
-fn classify_pair_batch_keeps_order() {
+fn classify_pair_batch_keeps_order_and_counts_the_second_text() {
     let mut p =
         EncoderPipeline::new(ByteTokenizer, TruncatingChunker::new(32), StubClassify { num_labels: 32, max_batch: 8 });
     let out = p.classify_pair_batch(&[("ab", "c"), ("d", "efg")], RunOptions { profile: true }).unwrap();
     assert_eq!(out.results[0].chunks[0].logits, [2.0, 97.0, 98.0, 3.0, 99.0, 3.0]);
     assert_eq!(out.results[1].chunks[0].logits, [2.0, 100.0, 3.0, 101.0, 102.0, 103.0, 3.0]);
+    assert_eq!(out.results.iter().map(|r| r.chunks[0].tokens).collect::<Vec<_>>(), [1, 3]);
     assert_eq!(stage_names(out.profile), ["tokenize", "chunk", "classify"]);
     assert_eq!(p.classify_pair("ab", "c", ()).unwrap().chunks, out.results[0].chunks);
+}
+
+/// Each chunk counts the content tokens it holds, the weight a document
+/// pools it with.
+#[test]
+fn chunk_results_count_their_content_tokens() {
+    let mut p = EncoderPipeline::new(
+        ByteTokenizer,
+        SlidingWindowChunker::new(4, 4),
+        StubEmbed { hidden_size: 4, max_batch: 2, error: false },
+    );
+    let out = p.embed("abcdefghij", ()).unwrap();
+    assert_eq!(out.chunks.iter().map(|c| c.tokens).collect::<Vec<_>>(), [4, 4, 2]);
+}
+
+// ─── Document pooling ───────────────────────────────────────────────────────
+
+fn embedded(tokens: usize, values: &[f32]) -> ChunkEmbedding {
+    ChunkEmbedding { byte_offset: 0, tokens, values: values.to_vec() }
+}
+
+fn classified(tokens: usize, logits: &[f32]) -> ChunkClassification {
+    ChunkClassification { byte_offset: 0, tokens, logits: logits.to_vec() }
+}
+
+/// Mean weighs each chunk by its content tokens; max takes each element's
+/// largest.
+#[test_case(DocumentPooling::Mean => vec![0.25, 0.75]; "mean")]
+#[test_case(DocumentPooling::Max => vec![1.0, 1.0]; "max")]
+fn embedding_document_pools_chunks(pooling: DocumentPooling) -> Vec<f32> {
+    embedding_document(&[embedded(1, &[1.0, 0.0]), embedded(3, &[0.0, 1.0])], pooling, false).unwrap()
+}
+
+#[test]
+fn embedding_document_restores_unit_length() {
+    let pooled =
+        embedding_document(&[embedded(1, &[1.0, 0.0]), embedded(3, &[0.0, 1.0])], DocumentPooling::Mean, true).unwrap();
+    let expected = [0.25 / 0.625f32.sqrt(), 0.75 / 0.625f32.sqrt()];
+    assert!(pooled.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-6), "{pooled:?}");
+}
+
+#[test]
+fn a_chunk_without_content_weighs_one() {
+    let pooled = classification_document(&[classified(0, &[2.0]), classified(1, &[0.0])], DocumentPooling::Mean);
+    assert_eq!(pooled, Some(vec![1.0]));
+}
+
+/// Max over windows is the best window's logits (MaxP reranking).
+#[test]
+fn classification_document_max_is_the_best_window() {
+    let windows = [classified(4, &[-1.0, 0.0]), classified(4, &[3.0, -2.0]), classified(1, &[0.5, 1.0])];
+    assert_eq!(classification_document(&windows, DocumentPooling::Max), Some(vec![3.0, 1.0]));
+}
+
+#[test]
+fn no_chunks_pool_to_nothing() {
+    assert_eq!(embedding_document(&[], DocumentPooling::Mean, true), None);
+    assert_eq!(classification_document(&[], DocumentPooling::Max), None);
 }
 
 // ─── chunk-level seam (*_chunks / *_chunks_batch) ───────────────────────────
