@@ -20,7 +20,7 @@ CTC / RN-T decoders, VAD chunking और long-form ऑडियो पाइप�
 | स्पीकर डायराइज़ेशन | DiariZen (WavLM + Conformer) | `diarizen` | `BUT-FIT/diarizen-wavlm-large-s80-md-v2` |
 | स्पीकर डायराइज़ेशन | Nemotron-3-Diarization (ऑफ़लाइन, स्ट्रीमिंग; अधिकतम 8 स्पीकर) | `nemotron_diar` | `nvidia/Nemotron-3-Diarization` |
 | स्पीकर एम्बेडिंग | WeSpeaker ResNet34 | `wespeaker` | `pyannote/wespeaker-voxceleb-resnet34-LM` |
-| टेक्स्ट एम्बेडिंग | BGE-M3 (dense, sparse, ColBERT), BGE-reranker-v2-m3 | `bgem3` | `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3` |
+| टेक्स्ट एम्बेडिंग | BGE-M3 (dense, sparse, ColBERT), BGE-reranker-v2-m3 | `bgem3`, `xlm_roberta` | `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3` |
 | टेक्स्ट एम्बेडिंग | Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B | `qwen3` | `Qwen/Qwen3-Embedding-0.6B` |
 | टेक्स्ट एम्बेडिंग, fill-mask | ModernBERT base / large | `modernbert` | `answerdotai/ModernBERT-base` |
 | विज़न | ResNet 18 / 34 / 50 / 101 / 152 | `resnet` | `timm/resnet*.a1_in1k` |
@@ -330,10 +330,18 @@ let rows: Vec<Vec<u32>> = texts.iter().map(|t| tokenize(t)).collect();
 let embeddings: Vec<Vec<f32>> = embedder.embed(&rows)?; // L2-normalized, one row per text
 ```
 
-`BgeM3Embedder` (`encode_dense`, `encode_colbert`, sparse
-weights के साथ `encode`), BGE और Qwen3 rerankers और `ModernBert` उसी
-`from_hub(model_id, config)` परिपाटी का पालन करते हैं; `svod_model::default_compute_dtype()`
-जहाँ डिवाइस में bf16 tensor cores हों वहाँ bf16 और अन्यथा f32 चुनता है।
+`BgeM3` (`encode_dense`, `encode_colbert`, sparse weights के साथ `encode`),
+Qwen3 reranker और `ModernBert` उसी `from_hub(model_id, config)` परिपाटी का
+पालन करते हैं; `svod_model::default_compute_dtype()` जहाँ डिवाइस में bf16
+tensor cores हों वहाँ bf16 और अन्यथा f32 चुनता है।
+
+इसके विपरीत, `svod_arch::pipelines::text` में चलने वाले encoder heads अपने
+tokenizer के साथ आते हैं: `modernbert::from_hub*` और `xlm_roberta::from_hub*`
+model id और `HubOptions` लेते हैं और tokenizer व head दोनों लौटाते हैं। इनमें
+केवल BGE-M3 का dense vector देने वाला embedder (`xlm_roberta::from_hub`; sparse
+weights और ColBERT vectors `BgeM3` के पास ही रहते हैं) और BGE reranker
+(`xlm_roberta::from_hub_classifier`) शामिल हैं, जो query–passage जोड़ियों को
+स्कोर देता है।
 
 ---
 

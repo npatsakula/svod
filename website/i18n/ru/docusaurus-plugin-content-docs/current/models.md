@@ -21,7 +21,7 @@ sidebar_label: Запуск моделей
 | Диаризация дикторов | DiariZen (WavLM + Conformer) | `diarizen` | `BUT-FIT/diarizen-wavlm-large-s80-md-v2` |
 | Диаризация дикторов | Nemotron-3-Diarization (офлайн, потоковый режим; до 8 дикторов) | `nemotron_diar` | `nvidia/Nemotron-3-Diarization` |
 | Эмбеддинги дикторов | WeSpeaker ResNet34 | `wespeaker` | `pyannote/wespeaker-voxceleb-resnet34-LM` |
-| Текстовые эмбеддинги | BGE-M3 (dense, sparse, ColBERT), BGE-reranker-v2-m3 | `bgem3` | `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3` |
+| Текстовые эмбеддинги | BGE-M3 (dense, sparse, ColBERT), BGE-reranker-v2-m3 | `bgem3`, `xlm_roberta` | `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3` |
 | Текстовые эмбеддинги | Qwen3-Embedding-0.6B, Qwen3-Reranker-0.6B | `qwen3` | `Qwen/Qwen3-Embedding-0.6B` |
 | Текстовые эмбеддинги, fill-mask | ModernBERT base / large | `modernbert` | `answerdotai/ModernBERT-base` |
 | Компьютерное зрение | ResNet 18 / 34 / 50 / 101 / 152 | `resnet` | `timm/resnet*.a1_in1k` |
@@ -341,11 +341,19 @@ let rows: Vec<Vec<u32>> = texts.iter().map(|t| tokenize(t)).collect();
 let embeddings: Vec<Vec<f32>> = embedder.embed(&rows)?; // L2-normalized, one row per text
 ```
 
-`BgeM3Embedder` (`encode_dense`, `encode_colbert`, `encode` с разреженными
-весами), реранкеры BGE и Qwen3 и `ModernBert` следуют тому же соглашению
+`BgeM3` (`encode_dense`, `encode_colbert` и `encode`, который возвращает также
+разреженные веса), реранкер Qwen3 и `ModernBert` следуют тому же соглашению
 `from_hub(model_id, config)`; `svod_model::default_compute_dtype()` выбирает
 bf16, если у устройства есть tensor cores с поддержкой bf16, и f32 в
 противном случае.
+
+Модели для текстового конвейера `svod_arch::pipelines::text`, напротив,
+загружаются вместе с токенизатором: функции модулей `modernbert::from_hub*` и
+`xlm_roberta::from_hub*` принимают идентификатор модели и `HubOptions`, а
+возвращают токенизатор и модель. Одна из таких моделей выдаёт только
+dense-вектор BGE-M3 (`xlm_roberta::from_hub`), а разреженные веса и векторы
+ColBERT даёт только `BgeM3`. Ещё одна — реранкер BGE
+(`xlm_roberta::from_hub_classifier`), который оценивает пары «запрос — отрывок».
 
 ---
 

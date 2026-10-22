@@ -19,7 +19,7 @@ sidebar_label: 运行模型
 | 说话人日志 | DiariZen（WavLM + Conformer） | `diarizen` | `BUT-FIT/diarizen-wavlm-large-s80-md-v2` |
 | 说话人日志 | Nemotron-3-Diarization（离线、流式；最多 8 名说话人） | `nemotron_diar` | `nvidia/Nemotron-3-Diarization` |
 | 说话人嵌入 | WeSpeaker ResNet34 | `wespeaker` | `pyannote/wespeaker-voxceleb-resnet34-LM` |
-| 文本嵌入 | BGE-M3（dense、sparse、ColBERT）、BGE-reranker-v2-m3 | `bgem3` | `BAAI/bge-m3`、`BAAI/bge-reranker-v2-m3` |
+| 文本嵌入 | BGE-M3（dense、sparse、ColBERT）、BGE-reranker-v2-m3 | `bgem3`、`xlm_roberta` | `BAAI/bge-m3`、`BAAI/bge-reranker-v2-m3` |
 | 文本嵌入 | Qwen3-Embedding-0.6B、Qwen3-Reranker-0.6B | `qwen3` | `Qwen/Qwen3-Embedding-0.6B` |
 | 文本嵌入、填空 | ModernBERT base / large | `modernbert` | `answerdotai/ModernBERT-base` |
 | 视觉 | ResNet 18 / 34 / 50 / 101 / 152 | `resnet` | `timm/resnet*.a1_in1k` |
@@ -314,9 +314,15 @@ let rows: Vec<Vec<u32>> = texts.iter().map(|t| tokenize(t)).collect();
 let embeddings: Vec<Vec<f32>> = embedder.embed(&rows)?; // L2-normalized, one row per text
 ```
 
-`BgeM3Embedder`（`encode_dense`、`encode_colbert`、带稀疏权重的 `encode`）、BGE 和
-Qwen3 的重排序器以及 `ModernBert` 遵循同样的 `from_hub(model_id, config)` 约定；
+`BgeM3`（`encode_dense`、`encode_colbert`、带稀疏权重的 `encode`）、Qwen3 的重排序器
+以及 `ModernBert` 遵循同样的 `from_hub(model_id, config)` 约定；
 `svod_model::default_compute_dtype()` 在设备有 bf16 tensor core 时选择 bf16，否则 f32。
+
+在 `svod_arch::pipelines::text` 中运行的编码器头则自带分词器：`modernbert::from_hub*`
+和 `xlm_roberta::from_hub*` 接受模型 id 和 `HubOptions`，同时返回分词器和编码器头。
+其中包括只输出 BGE-M3 dense 向量的嵌入器（`xlm_roberta::from_hub`；稀疏权重和
+ColBERT 向量只由 `BgeM3` 提供），以及为查询–段落对打分的 BGE 重排序器
+（`xlm_roberta::from_hub_classifier`）。
 
 ---
 
