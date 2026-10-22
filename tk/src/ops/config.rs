@@ -1993,11 +1993,14 @@ impl Nearest {
     }
 }
 
-/// A tile is its query and candidate blocks, its rows per warp and its depth
-/// chunk; its ring depth and unrolling are its pipelines.
+/// A tile is its query and candidate blocks, its rows per warp, its depth
+/// chunk and its lists; its ring depth and unrolling are its pipelines, and
+/// whether its lane queues take a trip in rounds or in passes its twins too
+/// (timed where the tile leads, never taking a place of the shortlist).
 impl Tiled for NearestCfg {
     fn tile(&self) -> Self {
-        NearestCfg { stages: 0, unroll: false, ..*self }
+        let lanes = self.lanes.map(|l| LaneQueue { passes: false, ..l });
+        NearestCfg { stages: 0, unroll: false, lanes, ..*self }
     }
 
     /// The ranked (unsplit) pipelines of the tile, at the split the tuner
