@@ -221,6 +221,16 @@ Ad hoc timing in a test: `super::measure(candidates)` (compile + time, ns per ca
 `tk3_pr.md` Table B gives each row's command and line (e.g. `--example nemotron_diarize -- <wav> --dtype bf16 --profile`;
 tk kernels appear as `gemm`, `flash_attention`, `heads`, `layer_norm`/`rms_norm`, `conv`).
 
+**RDNA ceilings (measured 2026-10-23, HIP probes of chained `v_wmma` on registers).** gfx1201 (RX 9070 XT): 201 TOPS
+f16/bf16 and 408 int8 with nothing else in the loop; one raw `ds_load_b128` a product (no wait on it) leaves 129
+TOPS, one a two products 147, two a product 101, and the same bytes as `ds_load_b64` cost the same: an LDS byte
+into registers costs the matrix pipe ~1/64 cycle a SIMD. A 64×64 warp tile reads half a fragment a product
+(A+B frags over M·N products), which bounds an LDS-fed GEMM near 157 TF; tk's 4096³ bf16 runs 153 and hipBLASLt
+142 (`hipblasLtMatmulAlgoGetHeuristic`'s 32 algos, best; rocBLAS 95). Barriers, a `global_load_b128` a 4 products
+(−14 %) and VALU moves (~1 cycle each) cost less. gfx1151 (Strix Halo): 46–49 TOPS f16 = bf16 = int8 (the `iu8`
+WMMA runs at the 16-bit rate there, so 8-bit search gains only operand bytes), a `ds_load_b128` a product −12 %,
+two −16 %: its GEMM (31 TF tk, 26 hipBLASLt) is bound by memory, not the loop.
+
 ## Performance-regression protocol
 
 For a change under `ops/config.rs`, `probe.rs`, `tune.rs`, `schedule.rs`, `layouts.rs`, `layout/`, `atoms.rs`, `lower/`:
