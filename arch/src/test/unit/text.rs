@@ -8,10 +8,10 @@ use test_case::test_case;
 use crate::pipelines::text::HfTokenizer;
 use crate::pipelines::text::{
     ChunkTokenClassification, Chunker, Classification, Classify, ClassifyTokens, Embed, Embedding, EncoderHead,
-    EncoderPipeline, EncoderPipelineError, Encoding, RunOptions, RunProfile, Scheme, SlidingWindowChunker,
-    SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, TokenScores, Tokenizer, TruncatingChunker,
-    TruncatingChunkerError, WindowWeighting, argmax, group_spans, group_spans_document, labels_for_tokens, sigmoid,
-    softmax, token_scores_document,
+    EncoderPipeline, EncoderPipelineError, Encoding, PairTokenizer, PairTruncation, RunOptions, RunProfile, Scheme,
+    SlidingWindowChunker, SlidingWindowChunkerError, TextChunk, TokenClassification, TokenLabel, TokenScores,
+    Tokenizer, TruncatingChunker, TruncatingChunkerError, WindowWeighting, argmax, group_spans, group_spans_document,
+    labels_for_tokens, sigmoid, softmax, token_scores_document,
 };
 
 fn enc(ids: &[u32]) -> Encoding {
@@ -24,6 +24,7 @@ fn enc(ids: &[u32]) -> Encoding {
         token_type_ids: vec![0; n],
         offsets: (0..n).map(|i| (i, i + 1)).collect(),
         special_tokens_mask: vec![0; n],
+        ..Encoding::default()
     }
 }
 
@@ -45,7 +46,39 @@ fn enc_with_specials(ids: &[u32]) -> Encoding {
     special_tokens_mask[0] = 1;
     special_tokens_mask[n - 1] = 1;
 
-    Encoding { input_ids, attention_mask: vec![1; n], token_type_ids: vec![0; n], offsets, special_tokens_mask }
+    Encoding {
+        input_ids,
+        attention_mask: vec![1; n],
+        token_type_ids: vec![0; n],
+        offsets,
+        special_tokens_mask,
+        ..Encoding::default()
+    }
+}
+
+/// A BERT-style pair, `[CLS] first [SEP] second [SEP]` (`[CLS]`=2, `[SEP]`=3),
+/// with its sequence ids. Each text's token `j` spans bytes `(j, j+1)` of that
+/// text, as HF offsets a pair's second text into itself.
+fn pair_enc(first: &[u32], second: &[u32]) -> Encoding {
+    let mut e = Encoding { pair: true, ..Encoding::default() };
+    let mut push = |id: u32, offset: (usize, usize), sequence: Option<usize>| {
+        e.input_ids.push(id);
+        e.attention_mask.push(1);
+        e.token_type_ids.push(sequence.unwrap_or(0) as u32);
+        e.offsets.push(offset);
+        e.special_tokens_mask.push(u32::from(sequence.is_none()));
+        e.sequence_ids.push(sequence);
+    };
+    push(2, (0, 0), None);
+    first.iter().enumerate().for_each(|(j, &id)| push(id, (j, j + 1), Some(0)));
+    push(3, (0, 0), None);
+    second.iter().enumerate().for_each(|(j, &id)| push(id, (j, j + 1), Some(1)));
+    push(3, (0, 0), None);
+    e
+}
+
+fn chunk_ids(chunks: &[TextChunk]) -> Vec<Vec<u32>> {
+    chunks.iter().map(|c| c.encoding.input_ids.clone()).collect()
 }
 
 fn assert_field_lengths(enc: &Encoding, expected: usize) {
@@ -54,6 +87,9 @@ fn assert_field_lengths(enc: &Encoding, expected: usize) {
     assert_eq!(enc.token_type_ids.len(), expected);
     assert_eq!(enc.offsets.len(), expected);
     assert_eq!(enc.special_tokens_mask.len(), expected);
+    if enc.pair {
+        assert_eq!(enc.sequence_ids.len(), expected);
+    }
 }
 
 fn stage_names(profile: Option<RunProfile>) -> Vec<String> {
@@ -90,6 +126,14 @@ impl Tokenizer for ByteTokenizer {
     type Error = Infallible;
     fn encode(&mut self, text: &str) -> Result<Encoding, Infallible> {
         Ok(enc(&text.bytes().map(|b| b as u32).collect::<Vec<_>>()))
+    }
+}
+
+/// A pair as [`pair_enc`] lays it out, each byte its own id.
+impl PairTokenizer for ByteTokenizer {
+    fn encode_pair(&mut self, first: &str, second: &str) -> Result<Encoding, Infallible> {
+        let bytes = |t: &str| t.bytes().map(u32::from).collect::<Vec<_>>();
+        Ok(pair_enc(&bytes(first), &bytes(second)))
     }
 }
 
@@ -285,6 +329,70 @@ fn truncating_try_new_bounds_max_seq_at_one() {
     assert!(TruncatingChunker::try_new(1).is_ok());
 }
 
+/// A long text keeps its boundary specials and the content that fits beside
+/// them; at a budget of 0 only the specials remain.
+#[test_case(8 => vec![2, 10, 11, 12, 13, 14, 3]; "fits")]
+#[test_case(4 => vec![2, 10, 11, 3]; "long keeps CLS and SEP")]
+#[test_case(2 => vec![2, 3]; "room for the specials only")]
+fn truncating_keeps_the_boundary_specials(max_seq: usize) -> Vec<u32> {
+    let chunks = TruncatingChunker::new(max_seq).chunk(&enc_with_specials(&[10, 11, 12, 13, 14])).unwrap();
+    assert_eq!(chunks.len(), 1);
+    chunks[0].encoding.input_ids.clone()
+}
+
+#[test]
+fn truncating_keeps_every_field_aligned_with_the_kept_tokens() {
+    let e = TruncatingChunker::new(4).chunk(&enc_with_specials(&[10, 11, 12, 13, 14])).unwrap().remove(0).encoding;
+    assert_eq!(e.offsets, [(0, 0), (0, 1), (1, 2), (5, 5)]);
+    assert_eq!(e.special_tokens_mask, [1, 0, 0, 1]);
+    assert_field_lengths(&e, 4);
+}
+
+#[test]
+fn truncating_fails_below_the_specials() {
+    let err = TruncatingChunker::new(1).chunk(&enc_with_specials(&[10])).unwrap_err();
+    assert!(matches!(err, TruncatingChunkerError::MaxSeqTooSmallForSpecials { max_seq: 1, specials: 2 }));
+}
+
+/// The lengths each text of a pair keeps, as HF's `truncate_encodings` gives
+/// them (`pair_enc` adds three specials), errors included.
+#[test_case(3, 10, 11, PairTruncation::LongestFirst => matches Ok((3, 5)); "longest first cuts the longer")]
+#[test_case(10, 3, 11, PairTruncation::LongestFirst => matches Ok((5, 3)); "the first is the longer")]
+#[test_case(6, 6, 11, PairTruncation::LongestFirst => matches Ok((4, 4)); "both give evenly")]
+#[test_case(5, 5, 10, PairTruncation::LongestFirst => matches Ok((3, 4)); "the odd token goes to the second")]
+#[test_case(4, 5, 10, PairTruncation::LongestFirst => matches Ok((3, 4)); "the odd token goes to the longer")]
+#[test_case(6, 0, 5, PairTruncation::LongestFirst => matches Ok((2, 0)); "empty second text")]
+#[test_case(10, 3, 11, PairTruncation::OnlyFirst => matches Ok((5, 3)); "only first")]
+#[test_case(3, 10, 11, PairTruncation::OnlySecond => matches Ok((3, 5)); "only second")]
+#[test_case(10, 3, 11, PairTruncation::OnlySecond => matches Err(TruncatingChunkerError::PairTooLong { len: 3, excess: 5, .. }); "only second too short")]
+#[test_case(8, 3, 11, PairTruncation::OnlySecond => matches Err(TruncatingChunkerError::PairTooLong { len: 3, excess: 3, .. }); "only second cannot empty it")]
+#[test_case(4, 4, 3, PairTruncation::OnlySecond => matches Ok((0, 0)); "budget 0 empties both")]
+fn truncating_cuts_a_pair_as_hf(
+    first: usize,
+    second: usize,
+    max_seq: usize,
+    strategy: PairTruncation,
+) -> Result<(usize, usize), TruncatingChunkerError> {
+    let e = pair_enc(&vec![10; first], &vec![20; second]);
+    let kept = TruncatingChunker::new(max_seq).with_pair_truncation(strategy).chunk(&e)?.remove(0).encoding;
+    assert_field_lengths(&kept, kept.len());
+    let count = |id| kept.sequence_ids.iter().filter(|&&s| s == Some(id)).count();
+    let (n1, n2) = (count(0), count(1));
+    assert_eq!(kept.input_ids, pair_enc(&vec![10; n1], &vec![20; n2]).input_ids, "each text keeps its head");
+    Ok((n1, n2))
+}
+
+/// No tokens give no chunk; specials alone are one chunk in both chunkers, so
+/// a text that tokenizes to nothing embeds as `[CLS] [SEP]`.
+#[test_case(enc(&[]) => Vec::<Vec<u32>>::new(); "empty")]
+#[test_case(enc_with_specials(&[]) => vec![vec![2, 3]]; "specials only")]
+#[test_case(pair_enc(&[20], &[]) => vec![vec![2, 20, 3, 3]]; "pair with an empty second text")]
+fn contentless_input_chunks_alike(e: Encoding) -> Vec<Vec<u32>> {
+    let truncated = chunk_ids(&TruncatingChunker::new(8).chunk(&e).unwrap());
+    assert_eq!(truncated, chunk_ids(&SlidingWindowChunker::new(8, 2).chunk(&e).unwrap()), "both chunkers agree");
+    truncated
+}
+
 // ─── SlidingWindowChunker ─────────────────────────────────────────────────────
 
 #[test]
@@ -377,7 +485,36 @@ fn sliding_chunk_needs_one_content_slot_beyond_specials() {
         SlidingWindowChunker::new(3, 1).chunk(&e).unwrap().into_iter().map(|c| c.encoding.input_ids).collect();
     assert_eq!(ids, [[2, 10, 3], [2, 20, 3]]);
     let err = SlidingWindowChunker::new(2, 1).chunk(&e).unwrap_err();
-    assert!(matches!(err, SlidingWindowChunkerError::WindowTooSmallForSpecials { window: 2, specials: 2 }));
+    assert!(matches!(err, SlidingWindowChunkerError::WindowTooSmallForFixed { window: 2, fixed: 2 }));
+}
+
+#[test]
+fn sliding_specials_only_must_fit_the_window() {
+    let err = SlidingWindowChunker::new(1, 1).chunk(&enc_with_specials(&[])).unwrap_err();
+    assert!(matches!(err, SlidingWindowChunkerError::WindowTooSmallForFixed { window: 1, fixed: 2 }));
+}
+
+/// A pair's windows repeat its first text whole and window the second; their
+/// positions are the second text's.
+#[test]
+fn sliding_windows_a_pairs_second_text() {
+    // [CLS] 20 21 [SEP] 10 11 12 13 14 [SEP]: five fixed tokens, so window=7
+    // leaves two content tokens per window.
+    let chunks = SlidingWindowChunker::new(7, 2).chunk(&pair_enc(&[20, 21], &[10, 11, 12, 13, 14])).unwrap();
+    assert_eq!(
+        chunk_ids(&chunks),
+        [vec![2, 20, 21, 3, 10, 11, 3], vec![2, 20, 21, 3, 12, 13, 3], vec![2, 20, 21, 3, 14, 3]]
+    );
+    assert_eq!(chunks.iter().map(|c| (c.first_token, c.byte_offset)).collect::<Vec<_>>(), [(0, 0), (2, 2), (4, 4)]);
+    for c in &chunks {
+        assert_field_lengths(&c.encoding, c.encoding.len());
+    }
+}
+
+#[test]
+fn sliding_pair_needs_room_past_its_first_text() {
+    let err = SlidingWindowChunker::new(5, 1).chunk(&pair_enc(&[20, 21], &[10])).unwrap_err();
+    assert!(matches!(err, SlidingWindowChunkerError::WindowTooSmallForFixed { window: 5, fixed: 5 }));
 }
 
 // ─── EncoderPipeline: single text ─────────────────────────────────────────────
@@ -568,6 +705,102 @@ fn hf_tokenizer_encode_batch_matches_per_input_encode() {
     }
 }
 
+/// A tokenizer.json's own truncation and padding are cleared: the chunker owns
+/// the length policy, so a sliding window sees the whole stream.
+#[cfg(feature = "hf-tokenizers")]
+#[test]
+fn hf_tokenizer_clears_the_files_truncation_and_padding() {
+    let mut inner = fixture_tokenizer();
+    inner.with_truncation(Some(tokenizers::TruncationParams { max_length: 3, ..Default::default() })).unwrap();
+    inner.with_padding(Some(tokenizers::PaddingParams {
+        strategy: tokenizers::PaddingStrategy::Fixed(16),
+        ..Default::default()
+    }));
+    let mut tok = HfTokenizer::from_bytes(inner.to_string(false).unwrap()).unwrap();
+    assert_eq!(tok.encode("hello world foo bar").unwrap().input_ids, [2, 4, 5, 6, 7, 3]);
+    let lens: Vec<usize> = tok.encode_batch(&["hello", "hello world"]).unwrap().iter().map(Encoding::len).collect();
+    assert_eq!(lens, [3, 4]);
+}
+
+#[cfg(feature = "hf-tokenizers")]
+#[test]
+fn hf_tokenizer_encodes_a_pair_with_its_sequences() {
+    let mut tok = HfTokenizer::from_bytes(fixture_json()).unwrap();
+    let e = tok.encode_pair("hello world", "foo").unwrap();
+    assert!(e.pair);
+    assert_eq!(e.input_ids, [2, 4, 5, 3, 6, 3]);
+    assert_eq!(e.sequence_ids, [None, Some(0), Some(0), None, Some(1), None]);
+    assert_eq!(e.offsets[4], (0, 3), "the second text's offsets index the second text");
+    assert_eq!(tok.encode_pair_batch(&[("hello world", "foo")]).unwrap()[0].input_ids, e.input_ids);
+    assert!(!tok.encode("hello").unwrap().pair);
+}
+
+#[cfg(feature = "hf-tokenizers")]
+#[test]
+fn hf_tokenizer_marks_a_pair_whose_second_text_is_empty() {
+    let e = HfTokenizer::from_bytes(fixture_json()).unwrap().encode_pair("hello", "").unwrap();
+    assert!(e.pair);
+    assert!(!e.sequence_ids.contains(&Some(1)));
+}
+
+/// `n` fixture words.
+#[cfg(feature = "hf-tokenizers")]
+fn fixture_words(n: usize) -> String {
+    ["hello", "world", "foo", "bar"].iter().cycle().take(n).copied().collect::<Vec<_>>().join(" ")
+}
+
+/// HF's pair truncation to `max_length`, end to end as tokenizers 0.22 (the
+/// Python goldens' version) encodes: each text tokenized whole, cut by
+/// `truncate_encodings`, then wrapped in the specials. 0.23's `encode` also
+/// cuts each text to `max_length` while it tokenizes, which can flip which text
+/// is the longer, so it is not the oracle here.
+#[cfg(feature = "hf-tokenizers")]
+fn hf_truncated_pair(
+    a: &str,
+    b: &str,
+    max_length: usize,
+    strategy: tokenizers::TruncationStrategy,
+) -> Option<Vec<u32>> {
+    let hf = fixture_tokenizer();
+    let (ea, eb) = (hf.encode(a, false).unwrap(), hf.encode(b, false).unwrap());
+    let added = 3; // [CLS] a [SEP] b [SEP]
+    let params = tokenizers::TruncationParams { max_length: max_length - added, strategy, ..Default::default() };
+    let (ea, eb) = tokenizers::truncate_encodings(ea, Some(eb), &params).ok()?;
+    Some(hf.post_process(ea, eb, true).unwrap().get_ids().to_vec())
+}
+
+#[cfg(feature = "hf-tokenizers")]
+proptest! {
+    /// Truncating the full pair is HF truncating it: the same ids, or an error
+    /// from both, under every strategy.
+    #[test]
+    fn prop_pair_truncation_matches_hf(first in 0usize..8, second in 0usize..8, max_length in 3usize..20, strategy in 0usize..3) {
+        let (ours, theirs) = [
+            (PairTruncation::LongestFirst, tokenizers::TruncationStrategy::LongestFirst),
+            (PairTruncation::OnlyFirst, tokenizers::TruncationStrategy::OnlyFirst),
+            (PairTruncation::OnlySecond, tokenizers::TruncationStrategy::OnlySecond),
+        ][strategy];
+        let (a, b) = (fixture_words(first), fixture_words(second));
+        let expected = hf_truncated_pair(&a, &b, max_length, theirs);
+        let full = HfTokenizer::from_bytes(fixture_json()).unwrap().encode_pair(&a, &b).unwrap();
+        let got = TruncatingChunker::new(max_length).with_pair_truncation(ours).chunk(&full).ok().map(|mut c| c.remove(0).encoding.input_ids);
+        prop_assert_eq!(got, expected);
+    }
+
+    /// A single text truncates as HF truncates it.
+    #[test]
+    fn prop_text_truncation_matches_hf(words in 0usize..12, max_length in 2usize..16) {
+        let text = fixture_words(words);
+        let mut hf = fixture_tokenizer();
+        hf.with_truncation(Some(tokenizers::TruncationParams { max_length, ..Default::default() })).unwrap();
+        let expected = hf.encode(text.as_str(), true).unwrap();
+        let full = HfTokenizer::from_bytes(fixture_json()).unwrap().encode(&text).unwrap();
+        let got = TruncatingChunker::new(max_length).chunk(&full).unwrap().remove(0).encoding;
+        prop_assert_eq!(got.input_ids, expected.get_ids());
+        prop_assert_eq!(got.offsets, expected.get_offsets());
+    }
+}
+
 // ─── embed_batch (multi-text) ─────────────────────────────────────────────────
 
 #[test]
@@ -734,6 +967,19 @@ fn classify_tokens_batch_basic_three_texts() {
     assert_eq!(out.results[2].chunks[0].logits, vec![104.0, 101.0, 108.0, 108.0, 111.0]);
     assert!(out.results.iter().all(|r| r.profile.is_none()));
     assert_eq!(stage_names(out.profile), ["tokenize", "chunk", "classify_tokens"]);
+}
+
+/// Each pair is one sequence the head scores, and the batch keeps the pairs'
+/// order.
+#[test]
+fn classify_pair_batch_keeps_order() {
+    let mut p =
+        EncoderPipeline::new(ByteTokenizer, TruncatingChunker::new(32), StubClassify { num_labels: 32, max_batch: 8 });
+    let out = p.classify_pair_batch(&[("ab", "c"), ("d", "efg")], RunOptions { profile: true }).unwrap();
+    assert_eq!(out.results[0].chunks[0].logits, [2.0, 97.0, 98.0, 3.0, 99.0, 3.0]);
+    assert_eq!(out.results[1].chunks[0].logits, [2.0, 100.0, 3.0, 101.0, 102.0, 103.0, 3.0]);
+    assert_eq!(stage_names(out.profile), ["tokenize", "chunk", "classify"]);
+    assert_eq!(p.classify_pair("ab", "c", ()).unwrap().chunks, out.results[0].chunks);
 }
 
 // ─── chunk-level seam (*_chunks / *_chunks_batch) ───────────────────────────
@@ -930,6 +1176,7 @@ fn token_chunk(spec: &[(u32, (usize, usize), bool)], num_labels: usize) -> Chunk
         num_labels,
         token_offsets: offsets,
         special_tokens_mask: specials,
+        content: None,
     }
 }
 
@@ -1182,7 +1429,27 @@ fn scored_chunk(first_token: usize, rows: &[&[f32]]) -> ChunkTokenClassification
         num_labels,
         token_offsets: [(0, 0)].into_iter().chain(content).chain([(0, 0)]).collect(),
         special_tokens_mask,
+        content: None,
     }
+}
+
+/// A pair chunk's decoders number its second text only; the first text is
+/// context, not tagged.
+#[test]
+fn decoders_number_only_a_pairs_second_text() {
+    // Five fixed tokens and window=6: one content token per window.
+    let chunks = SlidingWindowChunker::new(6, 1).chunk(&pair_enc(&[20, 21], &[10, 11, 12])).unwrap();
+    let mut p =
+        EncoderPipeline::new(ByteTokenizer, TruncatingChunker::new(8), StubRecognize { num_labels: 1, max_batch: 4 });
+    let out = p.classify_tokens_chunks(&chunks, ()).unwrap();
+    let indices: Vec<Vec<usize>> =
+        out.chunks.iter().map(|c| labels_for_tokens(c, |_| "x").iter().map(|t| t.token_index).collect()).collect();
+    assert_eq!(indices, [[0], [1], [2]]);
+    let scores: Vec<(usize, f32)> = token_scores_document(&out.chunks, WindowWeighting::Uniform)
+        .iter()
+        .map(|t| (t.token_index, t.probs[0]))
+        .collect();
+    assert_eq!(scores, [(0, sigmoid(10.0)), (1, sigmoid(11.0)), (2, sigmoid(12.0))]);
 }
 
 /// `(token_index, span, probs)` per scored token.

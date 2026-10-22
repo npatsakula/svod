@@ -29,6 +29,7 @@ pub(super) fn encoding(real_ids: &[u32], n_pad: usize) -> Encoding {
         token_type_ids: vec![0; l],
         offsets: (0..l).map(|i| (i, i + 1)).collect(),
         special_tokens_mask: vec![0; l],
+        ..Encoding::default()
     }
 }
 
@@ -46,6 +47,7 @@ pub(super) fn golden_encodings(golden: &StateDict) -> Vec<Encoding> {
             token_type_ids: vec![0; seq_len],
             offsets: vec![(0, 0); seq_len],
             special_tokens_mask: vec![0; seq_len],
+            ..Encoding::default()
         })
         .collect()
 }
