@@ -1139,6 +1139,7 @@ pub(crate) fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPoo
 /// ([`crate::lower::standalone`]) where given.
 fn scratch_plan_of(prog: Program, lowering: &Lowering, pool: &ScratchPool, body: Option<Arc<UOp>>) -> Option<Scratch> {
     let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
+    let name = prog.name.clone();
     let buffers = pool.buffers(&prog.params);
     let tensors: Vec<&Tensor> = buffers.iter().collect();
     let out = match body {
@@ -1149,7 +1150,13 @@ fn scratch_plan_of(prog: Program, lowering: &Lowering, pool: &ScratchPool, body:
     .ok()?;
     let mut config = PrepareConfig::from_env();
     config.ephemeral = true;
-    Some((out.prepare_with(&config).ok()?, vars))
+    // A program past what the scheduler's rewrites hold (a queued list two
+    // lanes wide 32 deep built 518k nodes on gfx1201, past the rewrite
+    // engine's stack) panics there: the candidate fails to build, as one
+    // the compiler refuses, rather than taking the tuning down.
+    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| out.prepare_with(&config)));
+    let plan = prepared.map_err(|_| tracing::warn!(kernel = name, "a candidate's graph failed to schedule")).ok()?;
+    Some((plan.ok()?, vars))
 }
 
 /// Runs a candidate's `plans` back to back, in order, unsynchronized, for
