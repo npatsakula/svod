@@ -452,10 +452,14 @@ fn a_probe_keeps_the_least_of_agreeing_timings(timings: &[u64]) -> (Option<u64>,
 /// and non-negative, and ordered as the hardware is: a shared byte cheaper
 /// than a global one, a cached one no dearer than DRAM's, a lone trip's wait
 /// (through a one-slot `cp.async` ring too) outlasting a matrix step, a
-/// rolled ring's trip and a one-slot ring's about an unrolled two-slot one's
-/// or more, a lone block's trip no cheaper than one with the SM full, and a
-/// round trip through shared memory costing something. The
-/// retries absorb a pair timed alongside another test's kernels.
+/// rolled ring's trip about an unrolled two-slot one's or more, a one-slot
+/// ring's within a factor of two of it either way (its two barriers a trip
+/// cost more, its half footprint runs twice the blocks that hide them:
+/// gfx1201 measures 5.9 ns to the two-slot ring's 7.5 once a trip's loads
+/// are fenced ahead of its products, 7.2 to 7.2 before), a lone block's
+/// trip no cheaper than one with the SM full, and a round trip through
+/// shared memory costing something. The retries absorb a pair timed
+/// alongside another test's kernels.
 #[test]
 fn device_costs_are_physical() {
     let Some(target) = super::device_target() else { return };
@@ -497,7 +501,7 @@ fn device_costs_are_physical() {
         eprintln!("trip_rolled {rolled:.3}");
         assert!(c.trip_rolled >= 0.9 * c.trip - (trip + rolled), "{c:?}");
     }
-    assert!(c.trip_one >= 0.9 * c.trip - (trip + one), "{c:?}");
+    assert!(c.trip_one >= 0.5 * c.trip - (trip + one) && c.trip_one <= 2.0 * c.trip + (trip + one), "{c:?}");
 }
 
 /// Every probe's signal on the attached GPU: a dominant one at least half
