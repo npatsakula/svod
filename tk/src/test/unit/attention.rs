@@ -868,10 +868,13 @@ fn key_warp_resources_probe() {
     }
 }
 
-/// The tuner's d = 128 attention kernel on gfx1151 compiles without
-/// spilling: admission drops what spills while a clean config remains.
+/// The tuner's d = 128 attention kernel on gfx1151 compiles, and where it
+/// spills it was timed beside a clean candidate and won: the shortlist
+/// times the tiles none of whose pipelines compile clean after the clean
+/// ones (64 queries by 32 keys, two slots, spilling 8 bytes a lane at 256
+/// registers, won the 4×8×2048² shape so).
 #[test]
-fn the_tuned_d128_attention_does_not_spill_on_gfx1151() {
+fn the_tuned_d128_attention_compiles_on_gfx1151() {
     let Some(planner) = super::device_planner()
         .filter(|p| p.device.target.arch == svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx1151))
     else {
@@ -879,14 +882,20 @@ fn the_tuned_d128_attention_does_not_spill_on_gfx1151() {
         return;
     };
     let spec = probe_spec(4, 8, 2048, 2048, 128, AttnMask::default());
-    let (.., formed) = device_attention(&planner, &spec);
-    let spec = AttnSpec { cfg: formed, ..spec };
-    let prog = flash_attention(&spec);
+    let (_, candidates, formed) = device_attention(&planner, &spec);
     let pool = crate::tune::ScratchPool::default();
-    let (plan, _) = crate::tune::scratch_plan(prog, &formed.lowering(&planner.device), &pool).expect("compiles");
-    let resources = crate::tune::resources(&plan);
-    eprintln!("{}: {resources:?}", label(&formed));
-    assert!(!resources.is_empty() && !crate::tune::spilled(&resources), "{formed:?} spills: {resources:?}");
+    let resources = |cfg: FaCfg| {
+        let prog = flash_attention(&AttnSpec { cfg, ..spec.clone() });
+        let (plan, _) = crate::tune::scratch_plan(prog, &cfg.lowering(&planner.device), &pool).expect("compiles");
+        crate::tune::resources(&plan)
+    };
+    let picked = resources(formed);
+    eprintln!("{}: {picked:?}", label(&formed));
+    assert!(!picked.is_empty(), "{formed:?}: no resources");
+    if crate::tune::spilled(&picked) {
+        let clean = candidates.iter().filter(|&&c| c != formed).find(|&&c| !crate::tune::spilled(&resources(c)));
+        assert!(clean.is_some(), "{formed:?} spills with no clean candidate timed beside it: {candidates:?}");
+    }
 }
 
 /// Every attention config the construct spans against the tuner's admitted
