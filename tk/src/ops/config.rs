@@ -1441,12 +1441,14 @@ impl NearestCfg {
         if k == 1 || self.select.is_some() {
             return Some(0);
         }
-        let LaneQueue { width, depth } = self.lane_queue();
+        let LaneQueue { width, depth, passes } = self.lane_queue();
         let row = self.scores_layout(target, d)?.row_vector();
         let tile = TileLayout::spread_row(&row, width as u32).regs();
         let pairs = (self.list_slots(k) / width) as u32;
         let flush = if self.queue.is_some() { FLUSH_TILES * pairs } else { 0 };
-        let tiles = 2 * pairs + 2 * depth as u32 + flush + pairs;
+        // Rounds hold the trip's deals not yet offered across them.
+        let rest = if passes { 0 } else { (self.bkv / width) as u32 };
+        let tiles = 2 * pairs + 2 * depth as u32 + flush + pairs + rest;
         let unrolled = match target.fill {
             Fill::Staged if self.unroll => 2 * pairs * tile + self.lane_parts(target, d)?[0] / 2,
             _ => 0,
@@ -1512,6 +1514,19 @@ const GROUPS_PAIR: f64 = 2.0 * PAIR_OP;
 const DEAL_ELEM: f64 = 1.0 * PAIR_OP;
 /// Model: a vote a lane, the lane's or of its elements and the branch.
 const DEAL_LANE: f64 = 2.0 * PAIR_OP;
+/// Model: a pass's vote an element ([`LaneQueue::passes`]): its compare
+/// against the row's `k`-th and the pass's test. Fitted with [`DEAL_LANE`],
+/// [`HIT_ELEM`], [`PUSH_ELEM`] and [`LIST_SLOT`] to 18 list configs on sm_86
+/// (16384² f16 at depth 128, `k` 16–64, queues 2–8 deep, 16 and 32
+/// candidates a trip) against the pushes and merges a simulation of the
+/// kernel counts.
+const PASS_ELEM: f64 = 2.0 * PAIR_OP;
+/// Model: a pushed deal's work an element but for its queue: its index and
+/// order against the `k`-th, the full queue's test.
+const HIT_ELEM: f64 = 1.3 * PAIR_OP;
+/// Search bound: the fewest deals a trip a list is also ranked passing
+/// over ([`LaneQueue::passes`]): rounds hold every deal of a trip.
+const PASS_DEALS: usize = 8;
 /// Model: a round's work a dealt element: the column of its lane's least
 /// (a compare, a select and a minimum), its removal (a compare and a
 /// select) and the next least (a minimum), at half their count: against
@@ -1845,13 +1860,20 @@ impl Nearest {
     /// into the outputs too, one each time the warp's lists take a
     /// [`QUEUE_FILLED`] share of the room they leave the lanes' queues.
     fn listing(&self, cfg: &NearestCfg, lanes: LaneQueue, wave: u32) -> f64 {
-        let LaneQueue { width, depth } = lanes;
+        let LaneQueue { width, depth, passes } = lanes;
         let (rows, tiles, wave) = (cfg.warp_rows as f64, self.m.div_ceil(cfg.bkv), f64::from(wave));
         let deals = (cfg.bkv / width) as f64;
         let (elems, t) = (rows * width as f64, depth as f64);
         let trip = |i: usize| {
             let hits = rows * self.lowered(cfg, i);
             let entered = 1.0 - (-hits).exp();
+            if passes {
+                // A vote on every deal of a trip some row enters, and a push
+                // on each deal some row is dealt one below its `k`-th in.
+                let dealt = deals * (1.0 - (-hits / deals).exp());
+                return entered * deals * (elems * PASS_ELEM + wave * DEAL_LANE)
+                    + dealt * (elems * (HIT_ELEM + t * PUSH_ELEM) + wave * DEAL_LANE);
+            }
             let lambda = hits / elems;
             let rounds = (1.0 + lambda + (2.0 * lambda * elems.ln()).sqrt()).min(deals);
             let round = deals * elems * ROUND_ELEM + elems * t * PUSH_ELEM + wave * DEAL_LANE;
@@ -1921,7 +1943,12 @@ impl Nearest {
                                     let narrowest = sharing.max(bkv / MOST_DEALS).max(2);
                                     for width in [narrowest, 2 * narrowest].into_iter().filter(|&w| w <= bkv) {
                                         for depth in LANE_DEPTHS {
-                                            out.push(NearestCfg { lanes: Some(LaneQueue { width, depth }), ..cfg });
+                                            let ways =
+                                                [false, true].into_iter().filter(|&p| !p || bkv / width >= PASS_DEALS);
+                                            for passes in ways {
+                                                let lanes = Some(LaneQueue { width, depth, passes });
+                                                out.push(NearestCfg { lanes, ..cfg });
+                                            }
                                         }
                                     }
                                 }

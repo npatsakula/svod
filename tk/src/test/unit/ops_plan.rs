@@ -1481,7 +1481,8 @@ fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, k: usize, want: Result<
 /// columns spread over the lanes sharing a row (one register per 16 rows a
 /// column pair of a row's two lanes where RDNA issues the product swapped,
 /// two for a quad of lanes on CUDA), and four row vectors (the vote's slot
-/// and the pass); its deals and merges cost: the cost and registers rise
+/// and the pass), and in rounds the trip's deals; its deals and merges
+/// cost: the cost and registers rise
 /// with `k`, from a least alone, whose registers the scores' count covers;
 /// past [`REGISTER_K`](config::REGISTER_K) a list is left out.
 #[test_case(sm86(), 2, 4; "sm_86")]
@@ -1502,12 +1503,17 @@ fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, shari
         k,
     };
     let regs = |k| cfg.registers(&target, 64, k).unwrap();
-    let LaneQueue { width, depth } = LaneQueue::PORTABLE;
+    let LaneQueue { width, depth, .. } = LaneQueue::PORTABLE;
     assert_eq!(cfg.sharing(&target, 64), Some(sharing as usize));
+    let deals = (cfg.bkv / width) as u32;
     for k in [2, 8, 32] {
         let pairs = (k as u32).next_power_of_two().max(width as u32) / width as u32;
         let tile = per_16_rows * width as u32 / sharing;
-        assert_eq!(regs(k) - regs(1), (3 * pairs + 2 * depth as u32) * tile + 4 * per_16_rows, "k {k}");
+        let want = (3 * pairs + 2 * depth as u32 + deals) * tile + 4 * per_16_rows;
+        assert_eq!(regs(k) - regs(1), want, "k {k}");
+        let passes = NearestCfg { lanes: Some(LaneQueue { passes: true, ..LaneQueue::PORTABLE }), ..cfg };
+        let held = passes.registers(&target, 64, k).unwrap() - regs(1);
+        assert_eq!(held, want - deals * tile, "k {k} in passes");
     }
     let costs: Vec<f64> = [1, 2, 4, 8, 16].map(|k| p(k).admit(&planner, &cfg).unwrap().0).to_vec();
     assert!(costs.is_sorted_by(|a, b| a < b), "{costs:?}");

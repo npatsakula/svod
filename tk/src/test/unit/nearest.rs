@@ -1329,15 +1329,15 @@ fn the_trips_that_lower_a_row_list_its_least(order: Order) {
 /// lowers its row's `k`-th (falling scores: every score is pushed, queues
 /// fill and passes stop many times a trip), where every candidate ties
 /// (the vote's index decides), and on random scores with groups: in
-/// registers and queued into the outputs.
+/// registers and queued into the outputs, in rounds and in passes.
 #[test_case(Order::Falling; "every candidate lower")]
 #[test_case(Order::Flat; "every candidate alike")]
 fn every_lane_queue_lists_its_least(order: Order) {
     let falling = ordered(40, 230, 16, order);
     let random = Case::draw(40, 230, 16, draw(Metric::SquaredL2, NONE, Some(3), true, true), 11);
     for width in [2, 4, 8, 16] {
-        for depth in [1, 2, 4, 8] {
-            let lanes = Some(LaneQueue { width, depth });
+        for (depth, passes) in [1, 2, 4, 8].into_iter().flat_map(|d| [(d, false), (d, true)]) {
+            let lanes = Some(LaneQueue { width, depth, passes });
             let cfgs = [(NearestCfg::new(32, 16, 2), [3, 16, 64]), (NearestCfg::new(16, 64, 1), [1, 5, 33])];
             for (cfg, ks) in cfgs.into_iter().filter(|(c, _)| c.bkv.is_multiple_of(width)) {
                 for k in ks.into_iter().filter(|&k| k > 1) {
@@ -2209,7 +2209,8 @@ fn list_ir_dump() {
     let cfgs = std::env::var("LIST_CFGS").unwrap_or("64:64:2:2:4".into());
     for (i, text) in cfgs.split(';').enumerate() {
         let v: Vec<usize> = text.split(':').map(|v| v.parse().unwrap()).collect();
-        let lanes = Some(LaneQueue { width: v[4], depth: v[3] });
+        let passes = std::env::var_os("LIST_PASSES").is_some();
+        let lanes = Some(LaneQueue { width: v[4], depth: v[3], passes });
         let unroll = std::env::var_os("LIST_UNROLL").is_some();
         let cfg = NearestCfg { lanes, unroll, queue: v.get(5).copied(), ..NearestCfg::new(v[0], v[1], v[2]) };
         for &k in &ks {
@@ -2253,7 +2254,8 @@ fn list_time_probe() {
         .split(';')
         .flat_map(|text| {
             let v: Vec<usize> = text.split(':').map(|v| v.parse().unwrap()).collect();
-            let lanes = Some(LaneQueue { width: v[4], depth: v[3] });
+            let passes = std::env::var_os("LIST_PASSES").is_some();
+            let lanes = Some(LaneQueue { width: v[4], depth: v[3], passes });
             let unroll = std::env::var_os("LIST_UNROLL").is_some();
             let cfg = NearestCfg { lanes, unroll, bk, queue: v.get(5).copied(), ..NearestCfg::new(v[0], v[1], v[2]) };
             splits.iter().map(move |&splits| NearestCfg { splits, ..cfg })
@@ -2284,7 +2286,7 @@ fn list_time_probe() {
 
 /// A config as `cfg_time_probe` reads it: `key=value` fields split by `/`
 /// (`bq`, `bkv`, `stages`, `unroll`, `warp_rows`, `bk`, `splits`, `queue`,
-/// `lanes=WxD`, `select=WARPSxQUEUE[f]`, `f` filtered), unset ones the
+/// `lanes=WxD[p]`, `p` in passes, `select=WARPSxQUEUE[f]`, `f` filtered), unset ones the
 /// defaults of [`NearestCfg::new`].
 fn parsed_cfg(text: &str) -> NearestCfg {
     let mut cfg = NearestCfg::new(64, 64, 2);
@@ -2301,8 +2303,9 @@ fn parsed_cfg(text: &str) -> NearestCfg {
             "splits" => cfg.splits = n(),
             "queue" => cfg.queue = Some(n()),
             "lanes" => {
-                let (w, d) = value.split_once('x').expect("WxD");
-                cfg.lanes = Some(LaneQueue { width: w.parse().unwrap(), depth: d.parse().unwrap() });
+                let passes = value.ends_with('p');
+                let (w, d) = value.trim_end_matches('p').split_once('x').expect("WxD");
+                cfg.lanes = Some(LaneQueue { width: w.parse().unwrap(), depth: d.parse().unwrap(), passes });
             }
             "select" => {
                 let filter = value.ends_with('f');
