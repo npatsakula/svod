@@ -279,7 +279,8 @@ fn live_bounds_keep_their_edges(cfg: NearestCfg, kmax: usize) {
 
 /// The device keeps each way's live lists bit for bit as it keeps the lists
 /// of their values (the same products, folded alike), at a few bindings of
-/// both bounds: the planner's first config of each way for the bound.
+/// both bounds: the planner's first config of each way for the bound, and a
+/// queued list's past the registers where the ranking pruned them.
 #[test_case(16, 64; "registers d64")]
 #[test_case(64, 768; "registers streamed d768")]
 #[test_case(8, 128; "split registers d128")]
@@ -297,8 +298,16 @@ fn live_lists_keep_the_lists_of_their_values_on_device(kmax: usize, d: usize) {
         (8 | 100, None) => shared_out(NearestCfg { splits: 3, ..*c }, m),
         _ => *c,
     };
+    let queued = (kmax > config::REGISTER_K)
+        .then(|| {
+            problem
+                .lattice(&planner.device.target)
+                .into_iter()
+                .find(|c| c.queue.is_some() && problem.admit(&planner, c).is_ok())
+        })
+        .flatten();
     let mut kinds = vec![];
-    for cfg in ranked.iter().map(splits) {
+    for cfg in ranked.iter().copied().chain(queued).map(|c| splits(&c)) {
         let kind = (cfg.queue.is_some(), cfg.select.is_some(), cfg.splits > 1);
         if !kinds.contains(&kind) {
             kinds.push(kind);

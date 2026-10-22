@@ -1635,8 +1635,9 @@ fn bound_rows_plan_at_their_bound_bound_candidates_take_the_graph() {
 
 /// A list's way follows its length's bound, a live list planned as the
 /// list of its bound: registers up to [`config::REGISTER_K`], queued into the
-/// outputs and through a score matrix from 33 on, and nothing past the
-/// candidates' f32 index.
+/// outputs and through a score matrix from 33 on (at 1024 scores the score
+/// matrix's tiles prune the queued lists, many times its cost), and nothing
+/// past the candidates' f32 index.
 #[test_case(16, true, false; "registers alone")]
 #[test_case(33, true, true; "registers and the long ways")]
 #[test_case(64, true, true; "the longest register list")]
@@ -1659,7 +1660,7 @@ fn a_list_plans_by_its_bound(k: usize, registers: bool, long: bool) {
     let Plan::Kernel(ranked) = plan else { panic!("k {k} plans no kernel: {plan:?}") };
     let has = |f: fn(&crate::kernels::nearest::NearestCfg) -> bool| ranked.iter().any(f);
     assert_eq!(has(|c| c.queue.is_none() && c.select.is_none()), registers, "k {k}: register lists");
-    assert_eq!(has(|c| c.queue.is_some()), long, "k {k}: queued lists");
+    assert_eq!(has(|c| c.queue.is_some()), long && k < 1024, "k {k}: queued lists");
     assert_eq!(has(|c| c.select.is_some()), long, "k {k}: score matrices");
 }
 

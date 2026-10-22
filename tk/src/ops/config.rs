@@ -960,8 +960,8 @@ impl Planner {
     /// behind whole on gfx1201).
     ///
     /// A score matrix splits as a least does, each share storing its own
-    /// scores. A list of `k > 1` (in registers or queued) splits as the
-    /// model prices cheapest
+    /// scores, where its query blocks are fewer than the SMs. A list of `k >
+    /// 1` (in registers or queued) splits as the model prices cheapest
     /// ([`Nearest::admit`]: a few query blocks over many candidates leave SMs
     /// idle, against every share's list filled again and the merge of the
     /// shares; at 256 queries by 2^20 candidates at depth 128 on sm_86 the
@@ -971,6 +971,12 @@ impl Planner {
     pub fn nearest_split(&self, p: &Nearest, cfg: &NearestCfg) -> Option<usize> {
         let (target, d) = (&self.device.target, p.d);
         let blocks = p.n.div_ceil(cfg.bq);
+        // A score matrix splits only to fill SMs its query blocks leave
+        // idle: split over many rows its larger tiles priced cheapest
+        // spilled on gfx1151 (16384² at depth 768, 1024 scores).
+        if cfg.select.is_some() && blocks >= self.sms() {
+            return None;
+        }
         let (flight, rows) = match cfg.bk {
             Some(_) => {
                 let regs = cfg.registers(target, d, p.k)?;
@@ -1567,8 +1573,11 @@ const SELECT_QUEUES: [usize; 4] = [2, 4, 8, 16];
 const LINE: usize = 128;
 /// Model: the bytes a scattered store moves, a sector.
 const SECTOR: usize = 32;
-/// Search bound: the product tiles a score matrix's listing is ranked with.
-const MATRIX_TILES: usize = 3;
+/// Search bound: the product tiles a score matrix's listing is ranked with:
+/// at 16384² and depth 768, 1024 scores, gfx1151 spilled the three cheapest
+/// (128 and 256 rows), and with no matrix admitted the tuner took a queued
+/// list at 0.8 Gpairs/s; the sixth is 64 rows by 128, which ran at 5.9.
+const MATRIX_TILES: usize = 6;
 /// Search bound: the rows a select block lists.
 const SELECT_WARPS: u32 = 4;
 /// Search bound: the trips a filtered listing takes per score of a row's
