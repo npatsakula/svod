@@ -394,9 +394,10 @@ pub enum Sync {
     /// Block until at most `pending` of this thread's committed groups are in
     /// flight.
     WaitAsync { pending: u32 },
-    /// No instruction moves across this point: a pipeline trip's commit stays
-    /// after its products, where a machine scheduler would otherwise hoist
-    /// it above them. Nothing to a target that keeps program order.
+    /// No instruction moves across this point: a pipeline trip's loads stay
+    /// before its products and its commit after them, where a machine
+    /// scheduler would otherwise move either past them. Nothing to a target
+    /// that keeps program order.
     Fence,
     /// Block until at most `pending` of this thread's warpgroup product
     /// chains are in flight (`wgmma.wait_group`): the products of the block

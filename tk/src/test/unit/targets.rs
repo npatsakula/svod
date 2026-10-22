@@ -849,24 +849,29 @@ fn fences(block: &crate::ir::Block) -> usize {
     block.walk().filter(|(_, s)| matches!(s, Stmt::Sync(Sync::Fence))).count()
 }
 
-/// The two-slot register-staged template fences every trip between its
-/// products and its commit on every target that runs it; the fence is an
-/// instruction only where the scheduler would otherwise hoist the commit
-/// (RDNA4), and the interpreter never sees it, so
-/// `every_family_lowers_keeps_its_numbers_and_compiles` covers its
-/// placement. One slot needs none: a barrier holds the commit back.
+/// The register-staged template fences every trip between its loads and its
+/// products, and over two slots again between its products and its commit,
+/// on every target that runs it; the fences are instructions only where the
+/// scheduler would otherwise move the loads or the commit past the products
+/// (RDNA), and the interpreter never sees them, so
+/// `every_family_lowers_keeps_its_numbers_and_compiles` covers their
+/// placement. One slot's commit needs none: a barrier holds it back.
 #[test_case(AmdArch::Gfx1201, true; "gfx1201 fences")]
+#[test_case(AmdArch::Gfx1100, true; "gfx1100 fences")]
 #[test_case(AmdArch::Gfx942, false; "gfx942 keeps order")]
-#[test_case(AmdArch::Gfx1100, false; "gfx1100 keeps order")]
 fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
     let target = amd(arch, 64);
     assert_eq!(target.sync.commit_fence, emitted);
     let device = declared(target);
-    for (stages, want) in [(2, 1), (1, 0)] {
+    for (stages, want) in [(2, 2), (1, 1)] {
         let cfg = config::gemm_cfg([64, 64, 32], stages, [2, 2], stages == 2);
         let spec = GemmSpec { m: 130, n: 192, k: 128, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
         let tile = lowered_tile(gemm::<BF16>(&spec), &cfg.lowering(&device));
-        assert_eq!(fences(&tile.body), want, "{stages} slots: a fence per two-slot pipeline");
+        assert_eq!(
+            fences(&tile.body),
+            want,
+            "{stages} slots: a fence after the loads, one more before a two-slot commit"
+        );
     }
 }
 

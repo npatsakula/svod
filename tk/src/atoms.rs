@@ -222,10 +222,11 @@ pub struct SyncCaps {
     /// independently, where an AMD wave issues its LDS accesses in order and
     /// waits on their counters.
     pub warp_barrier: bool,
-    /// The machine scheduler hoists a pipeline trip's shared-memory commit
-    /// above its products unless fenced (`Sync::Fence` → `sched_barrier`),
-    /// leaving the block waiting on global memory with no product in
-    /// flight: RDNA4.
+    /// The machine scheduler moves a pipeline trip's global loads below its
+    /// products, or its shared-memory commit above them, unless fenced
+    /// (`Sync::Fence` → `sched_barrier`), leaving the block waiting on global
+    /// memory with no product in flight: RDNA (gfx1151 sank a two-slot
+    /// 128×128×64 GEMM trip's loads to its commit; gfx1201 hoisted a commit).
     pub commit_fence: bool,
     /// A wave's issue priority is settable (`Sync::Prio` → `s_setprio`): AMD.
     pub priority: bool,
@@ -579,7 +580,7 @@ fn amd(a: AmdArch) -> Target {
         crews: if cdna { 2 } else { 1 },
         xcds: 1,
         occupancy,
-        sync: SyncCaps { warp_barrier: false, commit_fence: a.is_rdna4(), priority: true },
+        sync: SyncCaps { warp_barrier: false, commit_fence: !cdna, priority: true },
         lane_move: if cdna { LaneMove::Permute } else { LaneMove::Dpp },
         hardware_exp2: true,
     }

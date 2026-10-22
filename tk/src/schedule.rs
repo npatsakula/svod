@@ -354,13 +354,15 @@ impl Expander<'_> {
 
     /// One step ahead over two slots or one: a trip loads step `i` into
     /// registers, consumes step `i - 1` from its slot, writes the registers
-    /// to step `i`'s slot. With two slots a fence keeps the commit after the
-    /// products; with one the commit waits behind a barrier for every warp
-    /// to finish the slot, then barriers again, so the slot holds a step at
-    /// a time and a tile twice as deep fits the same shared memory. The first
-    /// trip only loads and the last only consumes, so each is peeled into a
-    /// one-trip loop and the steady loop has no branches: a trip is one
-    /// basic block, which a machine scheduler may reorder freely.
+    /// to step `i`'s slot. A fence after the loads keeps them ahead of the
+    /// products, where their latency hides behind the products; with two
+    /// slots another keeps the commit after the products; with one the
+    /// commit waits behind a barrier for every warp to finish the slot, then
+    /// barriers again, so the slot holds a step at a time and a tile twice
+    /// as deep fits the same shared memory. The first trip only loads and
+    /// the last only consumes, so each is peeled into a one-trip loop and
+    /// the steady loop has no branches: a trip is one basic block, which a
+    /// machine scheduler may reorder freely between the fences.
     fn register_staged(
         &mut self,
         extent: ScalarId,
@@ -387,7 +389,8 @@ impl Expander<'_> {
         let head: Vec<Stmt> = issue.iter().chain(&commit).cloned().chain([barrier.clone()]).collect();
         let before = if stages == 1 { barrier.clone() } else { Stmt::Sync(Sync::Fence) };
         let fenced = [before].into_iter().chain(commit).chain([barrier]);
-        let body: Vec<Stmt> = issue.into_iter().chain(consume.body.0.iter().cloned()).chain(fenced).collect();
+        let issued = issue.into_iter().chain([Stmt::Sync(Sync::Fence)]);
+        let body: Vec<Stmt> = issued.chain(consume.body.0.iter().cloned()).chain(fenced).collect();
         // The drain's carried registers hold what the steady loop left.
         let drained: Vec<Carried> = carried.iter().map(|c| Carried { init: c.phi, ..*c }).collect();
         let trips = |start, extent, carried, body: Vec<Stmt>, unroll| {
