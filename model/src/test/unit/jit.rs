@@ -414,8 +414,15 @@ fn test_jit_symbolic_batch_matches_const_batch() {
             // extent). At b=1 the symbolic plan must reach the *same* schedule
             // as the constant one, with the batch added as a symbolic axis
             // (`3F`) — not a merged `b*T` extent that drops the const-axis opts.
+            // `unique_kernel_name` suffixes the n-th kernel sharing a name with
+            // `n{n-1}` from a PROCESS-wide counter, so the suffix depends on what
+            // else the test binary compiled first: compare the base names.
+            let base = |name: &str| match name.rsplit_once('n') {
+                Some((base, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => base.to_string(),
+                _ => name.to_string(),
+            };
             let names = |ks: Vec<&svod_runtime::PreparedKernel>| {
-                ks.iter().map(|k| k.kernel.entry_point.clone()).collect::<Vec<_>>()
+                ks.iter().map(|k| base(&k.kernel.entry_point)).collect::<Vec<_>>()
             };
             let want: Vec<String> =
                 names(fixed.prepared_kernels().unwrap()).iter().map(|n| n.replacen('_', "_3F_", 1)).collect();
