@@ -1690,7 +1690,7 @@ fn reranked_lists_match_the_reference(n: usize, m: usize, d: usize, draw: Draw, 
         super::ops::assert_kernel(&score, "nearest_select");
         case.check_list("reranked", k, &host(&score), &host(&index), 1e-5, true);
         let (x8, c8) = (tk::Quantized::new(&x).unwrap(), tk::Quantized::new(&c).unwrap());
-        let rerank = tk::Rerank { margin: 24, x8: Some(&x8), c8: Some(&c8) };
+        let rerank = tk::Rerank { margin: 24, x8: Some(&x8), c8: Some(&c8), search: Some(ScalarDType::Int8) };
         let (score, index) = tk::k_nearest_reranked(&x, &c, k, opts, rerank).unwrap();
         case.check_list("quantized beforehand", k, &host(&score), &host(&index), 1e-5, true);
     });
@@ -1950,6 +1950,77 @@ fn rerank_probe() {
             }
         }
     });
+}
+
+/// The reranked op's recall on real embeddings against the f64 top-`k`:
+/// `RECALL_DIR` (default `~/projects/tk-nearest-work/recall`) holds
+/// `real_<d>.bin` (`u32 n, u32 d`, then `n·d` f32 rows), its first
+/// `RECALL_QUERIES` (2000) rows the queries and the rest the candidates;
+/// per depth (`RECALL_DEPTHS`), metric and `k` of 1, 16 and 64, the share
+/// of the reference's candidates each search (8-bit, f16) finds through
+/// the op, and the rows missing any. Prints, never asserts
+/// (`--ignored --nocapture --test-threads=1`).
+#[test]
+#[ignore = "perf probe: needs a GPU and the embeddings"]
+fn recall_probe() {
+    use rayon::prelude::*;
+    let Some(_) = super::device_planner() else { return };
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dir = std::env::var("RECALL_DIR").unwrap_or(format!("{home}/projects/tk-nearest-work/recall"));
+    let queries: usize = std::env::var("RECALL_QUERIES").map_or(2000, |v| v.parse().expect("a row count"));
+    let depths = std::env::var("RECALL_DEPTHS").unwrap_or("128,256,512,768".into());
+    for d in depths.split(',').map(|v| v.trim().parse::<usize>().expect("a depth")) {
+        let bytes = std::fs::read(format!("{dir}/real_{d}.bin")).expect("the embeddings");
+        let word = |i: usize| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()) as usize;
+        let (n, depth) = (word(0), word(1));
+        assert_eq!(depth, d);
+        let rows: Vec<f32> = bytes[8..].chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let (q, m) = (queries, n - queries);
+        let (xs, cs) = rows.split_at(q * d);
+        let x = Tensor::from_slice(xs).try_reshape([q as isize, d as isize]).unwrap().contiguous();
+        let c = Tensor::from_slice(cs).try_reshape([m as isize, d as isize]).unwrap().contiguous();
+        for metric in [Metric::NegDot, Metric::SquaredL2] {
+            let score = |i: usize, j: usize| {
+                let (a, b) = (&xs[i * d..][..d], &cs[j * d..][..d]);
+                let dot: f64 = a.iter().zip(b).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum();
+                let sq = |v: &[f32]| v.iter().map(|&a| f64::from(a) * f64::from(a)).sum::<f64>();
+                if metric == Metric::NegDot { -dot } else { sq(a) + sq(b) - 2.0 * dot }
+            };
+            let reference: Vec<Vec<usize>> = (0..q)
+                .into_par_iter()
+                .map(|i| {
+                    let mut row: Vec<(f64, usize)> = (0..m).map(|j| (score(i, j), j)).collect();
+                    row.select_nth_unstable_by(63, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    row.truncate(64);
+                    row.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    row.into_iter().map(|p| p.1).collect()
+                })
+                .collect();
+            for k in [1, 16, 64] {
+                for search in [ScalarDType::Int8, ScalarDType::Float16] {
+                    let rerank = tk::Rerank { search: Some(search), ..tk::Rerank::default() };
+                    let opts = Nearest { metric, ..Nearest::default() };
+                    let (_, index) = tk::k_nearest_reranked(&x, &c, k, opts, rerank).unwrap();
+                    let got = host(&index);
+                    let (mut found, mut short) = (0, vec![]);
+                    for (i, want) in reference.iter().enumerate() {
+                        let row = &got[i * k..][..k];
+                        let hits = want[..k].iter().filter(|&&j| row.contains(&(j as f64))).count();
+                        found += hits;
+                        if hits < k {
+                            short.push(i);
+                        }
+                    }
+                    let recall = 100.0 * found as f64 / (q * k) as f64;
+                    let rows = &short[..short.len().min(8)];
+                    eprintln!(
+                        "recall d{d} {metric:?} k{k} {search:?}: {recall:.3} % ({} rows short: {rows:?})",
+                        short.len()
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// The best of a few runs of the reranked op's exact pass over `coarse`

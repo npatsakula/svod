@@ -116,11 +116,14 @@ pub struct Rerank<'a> {
     /// `x` and `c` quantized beforehand ([`Quantized::new`]), else here.
     pub x8: Option<&'a Quantized>,
     pub c8: Option<&'a Quantized>,
+    /// The search's rows: [`ScalarDType::Int8`] or [`ScalarDType::Float16`];
+    /// `None`, whichever runs faster.
+    pub search: Option<ScalarDType>,
 }
 
 impl Default for Rerank<'_> {
     fn default() -> Self {
-        Self { margin: MARGIN, x8: None, c8: None }
+        Self { margin: MARGIN, x8: None, c8: None, search: None }
     }
 }
 
@@ -160,7 +163,8 @@ pub fn k_nearest_reranked(
     // Each search's rows, what scores them, and its pick for the shape.
     let x8 = || rerank.x8.cloned().map_or_else(|| Quantized::new(x), Ok);
     let c8 = || rerank.c8.cloned().map_or_else(|| Quantized::new(c), Ok);
-    let searches = [ScalarDType::Int8, ScalarDType::Float16].into_iter().filter_map(|dtype| {
+    let dtypes = rerank.search.map_or(vec![ScalarDType::Int8, ScalarDType::Float16], |d| vec![d]);
+    let searches = dtypes.into_iter().filter_map(|dtype| {
         let (cfg, ns, cost) = searched(&planner, dtype, &xs, &cs, coarse, opts)?;
         Some((dtype, cfg, ns, cost))
     });
