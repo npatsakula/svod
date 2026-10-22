@@ -682,15 +682,15 @@ fn a_ranking_keeps_its_cheapest_tiles(tiles: usize, step: f64) -> usize {
 /// compiled kernels do not spill, one per tile (its first clean pipeline),
 /// in ranked order. A config is compiled only where a walk in ranked order
 /// would: never past the [`SHORTLIST`]th clean tile, never once a pipeline
-/// of its tile ahead of it is clean. Where every config that compiles
-/// spills, the first [`SHORTLIST`] of those are timed anyway; where nothing
-/// compiles there is nothing to judge. `twins` are `(config, the config
+/// of its tile ahead of it is clean. The tiles none of whose pipelines
+/// compile clean follow the clean ones within the [`SHORTLIST`], a
+/// pipeline each; where nothing compiles there is nothing to judge. `twins` are `(config, the config
 /// whose tile it shares)`; `ranked` is in shortlists; `compiled` counts the
 /// configs compiled.
 #[test_case(&[], &[], &[], 1.5, Some(&(0..SHORTLIST).collect::<Vec<_>>()), SHORTLIST; "nothing spills: the first tiles")]
 #[test_case(&[1, 4, 9], &[], &[], 1.5, Some(&(0..SHORTLIST + 3).filter(|i| ![1, 4, 9].contains(i)).collect::<Vec<_>>()), SHORTLIST + 3; "spills skipped, order kept")]
-#[test_case(&[0, 1, 2], &[], &[], 0.0, Some(&[3, 4]), 5; "a short ranking keeps what passes")]
-#[test_case(&[0, 2, 3], &[1], &[], 0.0, Some(&[4]), 5; "a failure is never timed")]
+#[test_case(&[0, 1, 2], &[], &[], 0.0, Some(&[3, 4, 0, 1, 2]), 5; "a short ranking times its spilling tiles after the clean")]
+#[test_case(&[0, 2, 3], &[1], &[], 0.0, Some(&[4, 0, 2, 3]), 5; "a failure is never timed")]
 #[test_case(&[0, 1], &[], &[], 0.0, Some(&[0, 1]), 2; "every config spills: they are timed anyway")]
 #[test_case(&[0], &[], &[], 0.0, Some(&[0]), 1; "a single spilling config is timed alike")]
 #[test_case(&[], &[], &[], 0.0, Some(&[0]), 1; "a single clean config")]
@@ -701,7 +701,7 @@ fn a_ranking_keeps_its_cheapest_tiles(tiles: usize, step: f64) -> usize {
 #[test_case(&[0], &[], &[(1, 0)], 0.0, Some(&[1, 2]), 3; "a spilling unrolled ring yields to its clean rolled twin")]
 #[test_case(&[], &[], &[(1, 0)], 0.0, Some(&[0, 2]), 2; "two clean pipelines of one tile: the first, the second never compiled")]
 #[test_case(&[], &[], &[(1, 0), (3, 2)], 1.5, Some(&[0, 2].into_iter().chain(4..SHORTLIST + 2).collect::<Vec<_>>()), SHORTLIST; "tiles, not configs")]
-#[test_case(&[0, 1], &[], &[(1, 0)], 0.0, Some(&[0, 1]), 2; "both pipelines spill: both are timed")]
+#[test_case(&[0, 1], &[], &[(1, 0)], 0.0, Some(&[0]), 2; "both pipelines spill: the first is timed, its twin after")]
 fn the_shortlist_is_the_first_tiles_that_do_not_spill(
     spilled: &[usize],
     failed: &[usize],
@@ -764,7 +764,8 @@ fn walked(ranked: &[Pipe], verdicts: &[Compiled]) -> Vec<usize> {
 
 /// The shortlist as it was judged before the search: batches of
 /// [`SHORTLIST`] in ranked order, every pipeline of a batch compiled, until
-/// a batch ends with that many clean tiles.
+/// a batch ends with that many clean tiles; the spilling tiles none of
+/// whose pipelines compiled clean follow the clean ones.
 fn batched(ranked: &[Pipe], verdicts: &[Compiled]) -> Option<Vec<usize>> {
     let (mut clean, mut spilled, mut tiles) = (vec![], vec![], std::collections::HashSet::new());
     for (n, chunk) in ranked.chunks(SHORTLIST).enumerate() {
@@ -780,7 +781,8 @@ fn batched(ranked: &[Pipe], verdicts: &[Compiled]) -> Option<Vec<usize>> {
             break;
         }
     }
-    let mut out = if clean.is_empty() { spilled } else { clean };
+    let mut out = clean;
+    out.extend(spilled.into_iter().filter(|&at| tiles.insert(ranked[at].tile)));
     out.truncate(SHORTLIST);
     (!out.is_empty()).then_some(out)
 }

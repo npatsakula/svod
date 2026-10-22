@@ -591,8 +591,12 @@ pub(crate) fn distinct_configs<C: Tiled>(list: &[C]) -> Vec<C> {
 /// The indices of the first [`SHORTLIST`] configs of `ranked` whose
 /// compiled kernels do not spill, one per tile (its first clean pipeline,
 /// so a spilling unrolled ring yields to its rolled twin), in ranked order;
-/// where every config that compiled spills, the first [`SHORTLIST`] of
-/// those (the time judges, and a spilling kernel still beats the graph's).
+/// after them, within the [`SHORTLIST`], the tiles none of whose pipelines
+/// compiled clean, each by its first spilling one: the compiled kernel
+/// judges what it can and the time the rest (a spilling kernel still beats
+/// the graph's, and on gfx1201 the 16384² depth-768 nearest's best tile,
+/// 128 rows by 128 candidates at 32 rows a warp, spills 196 bytes a lane
+/// and runs 86.4 Gpairs/s to the clean pick's 84.7).
 /// `compiles` is handed what the [`Search`] wants as soon as it wants it
 /// (the tuner compiles in parallel, in the order handed), each verdict
 /// taken as it lands, until nothing more is wanted. `None` when nothing
@@ -712,13 +716,14 @@ impl Search {
         self.verdicts[at] = Some(verdict);
     }
 
-    /// The shortlist the verdicts make ([`shortlist`]).
+    /// The shortlist the verdicts make ([`shortlist`]): the clean tiles,
+    /// then the spilling ones, a pipeline each.
     fn judged(&self) -> Option<Vec<usize>> {
         let mut tiles = HashSet::new();
         let at = |want| self.verdicts.iter().enumerate().filter(move |(_, v)| **v == Some(want)).map(|(i, _)| i);
-        let clean: Vec<usize> = at(Compiled::Clean).filter(|&i| tiles.insert(self.tiles[i])).collect();
-        let out: Vec<usize> = if clean.is_empty() { at(Compiled::Spilled).collect() } else { clean };
-        (!out.is_empty()).then(|| out.into_iter().take(self.limit).collect())
+        let first = |i: &usize| tiles.insert(self.tiles[*i]);
+        let out: Vec<usize> = at(Compiled::Clean).chain(at(Compiled::Spilled)).filter(first).take(self.limit).collect();
+        (!out.is_empty()).then_some(out)
     }
 }
 

@@ -13,11 +13,16 @@ kernel reporting scratch bytes spilled; a backend that reports nothing admits). 
 admitted at its first clean pipeline (ring depth, unrolling), so an unrolled ring that spills
 yields to its rolled twin. A pipeline is compiled only when the tile's pipelines ranked ahead of
 it spilled or failed, and none past the 64th clean tile: what a walk in ranked order compiling
-one config at a time would compile (`config::Search`). When every config that compiles spills,
-the first 64 of those are timed anyway: no op falls to the graph because of spills. A config's
+one config at a time would compile (`config::Search`). The tiles none of whose pipelines compile
+clean follow the clean ones within the 64, a pipeline each: the compiled kernel judges what it
+can and the time the rest (no op falls to the graph because of spills, and on gfx1201 the 16384²
+depth-768 nearest's best tile spills 196 bytes a lane and runs 2 % ahead of the clean pick). A config's
 compile starts as soon as the search wants it, on the thread pool (where the pool has room, a tile's next pipeline starts while the one ahead still compiles, its verdict used only where the walk would have asked for it); one whose compiler runs past
 30 s (`tune::COMPILE_TIMEOUT`) is killed and rejected as a failure would be, and the planner log
-says so (`compile timed out`). Each program is lowered once per tuning: what the store's
+says so (`compile timed out`); one whose lowered program emits more instructions than its target
+may (`Target::most_instructions`: 2^18 on AMD, 2^19 on CUDA, above the largest ranked kernels) is
+refused by the lowering before any compiler sees it (`lower::Error::TooLarge`, `does not lower` in
+the planner log) and rejected alike. Each program is lowered once per tuning: what the store's
 fingerprint lowered is the body the compile launches.
 
 The admitted configs, with their variants (key splits for attention, reduction splits for a

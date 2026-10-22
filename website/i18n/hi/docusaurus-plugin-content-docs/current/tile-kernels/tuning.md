@@ -13,11 +13,16 @@ config को admit नहीं करता। एक नियम करत�
 करता है)। एक tile अपनी पहली clean pipeline (ring depth, unrolling) पर admit होता है, इसलिए spill करने
 वाली unrolled ring अपने rolled जुड़वाँ के लिए जगह छोड़ देती है। कोई pipeline तभी compile होती है जब
 उसके tile की उससे ऊपर ranked pipelines spill या fail हुईं, और 64वें clean tile के बाद कोई नहीं: ठीक
-वही जो ranked क्रम में एक-एक config compile करने वाला walk compile करता (`config::Search`)। जब compile होने
-वाला हर config spill करे, तब भी उनमें से पहले 64 मापे जाते हैं: spills की वजह से कोई op ग्राफ़ पर नहीं
-गिरता। किसी config का compile thread pool पर तभी शुरू हो जाता है जब search उसे माँगती है (pool में जगह हो तो tile की अगली pipeline तभी शुरू हो जाती है जब पिछली अभी compile हो रही हो, और उसका verdict वहीं गिना जाता है जहाँ walk उसे माँगता); जिसका compiler
+वही जो ranked क्रम में एक-एक config compile करने वाला walk compile करता (`config::Search`)। जिन tiles की कोई
+pipeline clean compile नहीं होती, वे उन्हीं 64 के भीतर clean tiles के बाद आते हैं, हर एक की एक pipeline:
+compiled kernel जो आँक सकता है वह आँकता है और बाक़ी समय आँकता है (spills की वजह से कोई op ग्राफ़ पर नहीं
+गिरता, और gfx1201 पर 16384² depth-768 nearest का सबसे अच्छा tile प्रति lane 196 bytes spill करके clean
+pick से 2 % आगे चलता है)। किसी config का compile thread pool पर तभी शुरू हो जाता है जब search उसे माँगती है (pool में जगह हो तो tile की अगली pipeline तभी शुरू हो जाती है जब पिछली अभी compile हो रही हो, और उसका verdict वहीं गिना जाता है जहाँ walk उसे माँगता); जिसका compiler
 30 s (`tune::COMPILE_TIMEOUT`) से ज़्यादा चले उसे kill करके fail की तरह reject किया जाता है, और planner
-log यह बताता है (`compile timed out`)। हर program एक tuning में एक बार lower होता है: store के fingerprint
+log यह बताता है (`compile timed out`); जिसका lowered program उसके target की अनुमति से ज़्यादा instructions
+emit करे (`Target::most_instructions`: AMD पर 2^18, CUDA पर 2^19, सबसे बड़े ranked kernels से ऊपर) उसे
+lowering ही किसी compiler के देखने से पहले मना कर देती है (`lower::Error::TooLarge`, planner log में
+`does not lower`) और वैसे ही reject किया जाता है। हर program एक tuning में एक बार lower होता है: store के fingerprint
 ने जो lower किया वही body compile launch करता है।
 
 Admit हुए configs, अपने variants के साथ (attention के लिए key splits, भूखे convolution के लिए
