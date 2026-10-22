@@ -110,7 +110,8 @@ fn rerank(pairs: &[(String, String)], max_seq: usize, dtype: DType) -> Vec<f32> 
     let classifier =
         XlmRobertaClassifier::from_files(&reranker_file("config.json"), &reranker_file("model.safetensors"), &opts)
             .expect("classifier");
-    let mut pipeline = EncoderPipeline::new(tokenizer(), TruncatingChunker::new(max_seq), classifier);
+    let mut pipeline =
+        EncoderPipeline::new(tokenizer(), TruncatingChunker::new(max_seq), classifier).expect("pipeline");
     let pairs: Vec<(&str, &str)> = pairs.iter().map(|(q, p)| (q.as_str(), p.as_str())).collect();
     let out = pipeline.classify_pair_batch(&pairs, ()).expect("rerank");
     out.results.into_iter().flat_map(|r| r.chunks.into_iter().flat_map(|c| c.logits)).collect()

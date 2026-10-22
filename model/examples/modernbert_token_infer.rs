@@ -114,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let label_of = |id: u32| id2label.get(id as usize).map_or("", |s| s.as_str());
 
     println!("Chunker: truncating max_seq={max_seq}");
-    let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), classifier);
+    let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), classifier)?;
 
     println!("\nTagging {} chars (scheme = {})...", text.len(), args.scheme);
     let t = Instant::now();

@@ -160,7 +160,7 @@ fn sat_window_scores_match_wtpsplit(weighting: WindowWeighting, key: &str) {
         XlmRobertaTokenClassifier::from_files(&sat_file("config.json"), &sat_file("model.safetensors"), &opts)
             .expect("classifier");
     let chunker = SlidingWindowChunker::new(classifier.capacity().1, stride).with_full_last_window();
-    let mut pipeline = EncoderPipeline::new(tokenizer, chunker, classifier);
+    let mut pipeline = EncoderPipeline::new(tokenizer, chunker, classifier).expect("pipeline");
     let chunks = pipeline.classify_tokens(&text, ()).expect("classify tokens").chunks;
     let scores = token_scores_document(&chunks, weighting);
 

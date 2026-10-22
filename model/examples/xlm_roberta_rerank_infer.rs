@@ -90,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading reranker from {} ({})...", args.repo, args.revision);
     let (tokenizer, reranker) = xlm_roberta::from_hub_classifier(&args.repo, &opts)?;
     let chunker = SlidingWindowChunker::try_new(args.window, args.stride)?;
-    let mut pipeline = EncoderPipeline::new(tokenizer, chunker, reranker);
+    let mut pipeline = EncoderPipeline::new(tokenizer, chunker, reranker)?;
 
     let pairs: Vec<(&str, &str)> = args.passages.iter().map(|p| (args.query.as_str(), p.as_str())).collect();
 

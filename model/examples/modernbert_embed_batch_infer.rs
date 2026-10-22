@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         texts.len()
     );
 
-    let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), embedder);
+    let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), embedder)?;
 
     println!("\nBatched embed...");
     let t = Instant::now();

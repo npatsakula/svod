@@ -330,8 +330,9 @@ pub struct TextChunk {
 pub trait Chunker {
     type Error: std::error::Error + 'static;
 
-    /// The sequence length this chunker targets — the value threaded into the
-    /// encoder's JIT at assembly (see [`EncoderPipeline::assemble`]).
+    /// The longest chunk this chunker emits, specials included: the length
+    /// [`EncoderPipeline::assemble`] sizes the head for, and the one
+    /// [`EncoderPipeline::new`] checks the head takes.
     fn max_seq(&self) -> usize;
 
     fn chunk(&mut self, enc: &Encoding) -> Result<Vec<TextChunk>, Self::Error>;
@@ -809,9 +810,8 @@ pub trait EncoderHead {
     type Error: std::error::Error + 'static;
 
     /// `(max_batch, max_seq)`: the most chunks one [`run_batch`](EncoderHead::run_batch)
-    /// takes, and the longest chunk. The pipeline sub-batches to `max_batch`;
-    /// [`assemble`](EncoderPipeline::assemble) sizes the encoder from the
-    /// chunker's `max_seq`, so the two agree by construction.
+    /// takes, and the longest chunk. The pipeline sub-batches to `max_batch`, and
+    /// refuses to compose a chunker whose chunks run longer than `max_seq`.
     fn capacity(&self) -> (usize, usize);
 
     /// Run every chunk through the model (the model owns its batching/padding),
@@ -877,7 +877,9 @@ pub trait ClassifyTokens: EncoderHead<Output = TokenClassification> {
 /// for "how do I embed" still finds a named verb. Build with
 /// [`assemble`](EncoderPipeline::assemble) to size the encoder from the
 /// chunker's `max_seq`, or [`new`](EncoderPipeline::new) to
-/// compose three already-built parts.
+/// compose three already-built parts. Either refuses a head that takes shorter
+/// chunks than the chunker cuts, which would otherwise fail on the first text
+/// long enough.
 pub struct EncoderPipeline<T: Tokenizer, C: Chunker, M: EncoderHead> {
     tokenizer: T,
     chunker: C,
@@ -899,6 +901,13 @@ pub enum EncoderPipelineError<
     Chunk { source: C },
     #[snafu(display("encoding: {source}"))]
     Encode { source: M },
+}
+
+/// [`EncoderPipeline::new`] refusing its parts.
+#[derive(Debug, Snafu)]
+pub enum EncoderPipelineBuildError {
+    #[snafu(display("the chunker cuts chunks of up to {chunker} tokens, but the head takes up to {head}"))]
+    ChunkerExceedsHead { chunker: usize, head: usize },
 }
 
 /// The three sub-trait errors folded into [`EncoderPipelineError`]. Spelled once
@@ -927,16 +936,25 @@ type BatchRun<M> = (Vec<Vec<<M as EncoderHead>::Output>>, Vec<Vec<TextChunk>>, O
 type BatchModelOutputs<M> = (Vec<Vec<<M as EncoderHead>::Output>>, Option<RunProfile>);
 
 impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
-    pub fn new(tokenizer: T, chunker: C, model: M) -> Self {
-        Self { tokenizer, chunker, model }
+    /// Compose three built parts, provided the head takes the longest chunk
+    /// the chunker cuts ([`Chunker::max_seq`] against [`EncoderHead::capacity`]).
+    pub fn new(tokenizer: T, chunker: C, model: M) -> Result<Self, EncoderPipelineBuildError> {
+        let (chunker_max, head_max) = (chunker.max_seq(), model.capacity().1);
+        ensure!(chunker_max <= head_max, ChunkerExceedsHeadSnafu { chunker: chunker_max, head: head_max });
+        Ok(Self { tokenizer, chunker, model })
     }
 
     /// Build the encoder sized to the chunker's `max_seq`
     /// ([`Chunker::max_seq`]), then compose — so the caller never hand-threads
-    /// the sequence length between chunker and encoder.
-    pub fn assemble<EE>(tokenizer: T, chunker: C, build: impl FnOnce(usize) -> Result<M, EE>) -> Result<Self, EE> {
+    /// the sequence length between chunker and encoder. A head built shorter
+    /// than it was asked for is refused as in [`new`](Self::new).
+    pub fn assemble<EE: From<EncoderPipelineBuildError>>(
+        tokenizer: T,
+        chunker: C,
+        build: impl FnOnce(usize) -> Result<M, EE>,
+    ) -> Result<Self, EE> {
         let model = build(chunker.max_seq())?;
-        Ok(Self::new(tokenizer, chunker, model))
+        Ok(Self::new(tokenizer, chunker, model)?)
     }
 
     /// Run a flat list of chunks through the encoder, sub-batching to respect
@@ -1092,12 +1110,15 @@ impl<T: Tokenizer, C: Chunker, M: EncoderHead> EncoderPipeline<T, C, M> {
         &mut self.tokenizer
     }
 
+    /// A chunker swapped in through this escapes [`new`](Self::new)'s length
+    /// check; the head still refuses an over-long chunk when it runs.
     pub fn chunker_mut(&mut self) -> &mut C {
         &mut self.chunker
     }
 
     /// Generic typed accessor for the encoder model. The task facades also
     /// expose `embedder_mut` / `classifier_mut` / `token_classifier_mut` aliases.
+    /// A head swapped in through this escapes [`new`](Self::new)'s length check.
     pub fn model_mut(&mut self) -> &mut M {
         &mut self.model
     }

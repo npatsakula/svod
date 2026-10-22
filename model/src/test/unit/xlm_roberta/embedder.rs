@@ -86,7 +86,7 @@ fn embed(golden: &StateDict, texts: &[String], max_seq: usize, dtype: DType) -> 
     let opts = HubOptions { revision: BGE_M3_REPO.1.into(), head, ..HubOptions::default() };
     let (tokenizer, embedder) = crate::xlm_roberta::from_hub(BGE_M3_REPO.0, &opts).expect("bge-m3");
     assert_eq!(embedder.pooling(), Pooling { mode: PoolingMode::Cls, normalize: true });
-    let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), embedder);
+    let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), embedder).expect("pipeline");
 
     let (ids, mask) = (load_golden_vec::<i64>(golden, "input_ids"), load_golden_vec::<i64>(golden, "attention_mask"));
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();

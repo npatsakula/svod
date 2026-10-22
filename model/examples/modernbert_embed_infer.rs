@@ -147,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let chunker =
                 SlidingWindowChunker::try_new(window, stride).map_err(|e| format!("invalid --window/--stride: {e}"))?;
             println!("Chunker: sliding window={window}, stride={stride}");
-            let mut pipeline = EncoderPipeline::new(tokenizer, chunker, embedder);
+            let mut pipeline = EncoderPipeline::new(tokenizer, chunker, embedder)?;
             embed_and_report(&mut pipeline, &text, args.profile)?;
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -155,7 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         (None, None) => {
             println!("Chunker: truncating max_seq={max_seq}");
-            let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), embedder);
+            let mut pipeline = EncoderPipeline::new(tokenizer, TruncatingChunker::new(max_seq), embedder)?;
             embed_and_report(&mut pipeline, &text, args.profile)?;
         }
     }
