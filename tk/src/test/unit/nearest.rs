@@ -2281,3 +2281,69 @@ fn list_time_probe() {
         }
     }
 }
+
+/// A config as `cfg_time_probe` reads it: `key=value` fields split by `/`
+/// (`bq`, `bkv`, `stages`, `unroll`, `warp_rows`, `bk`, `splits`, `queue`,
+/// `lanes=WxD`, `select=WARPSxQUEUE[f]`, `f` filtered), unset ones the
+/// defaults of [`NearestCfg::new`].
+fn parsed_cfg(text: &str) -> NearestCfg {
+    let mut cfg = NearestCfg::new(64, 64, 2);
+    for field in text.split('/') {
+        let (key, value) = field.split_once('=').expect("key=value");
+        let n = || value.parse::<usize>().expect("a count");
+        match key {
+            "bq" => cfg.bq = n(),
+            "bkv" => cfg.bkv = n(),
+            "stages" => cfg.stages = n(),
+            "unroll" => cfg.unroll = n() == 1,
+            "warp_rows" => cfg.warp_rows = n(),
+            "bk" => cfg.bk = Some(n()),
+            "splits" => cfg.splits = n(),
+            "queue" => cfg.queue = Some(n()),
+            "lanes" => {
+                let (w, d) = value.split_once('x').expect("WxD");
+                cfg.lanes = Some(LaneQueue { width: w.parse().unwrap(), depth: d.parse().unwrap() });
+            }
+            "select" => {
+                let filter = value.ends_with('f');
+                let (w, q) = value.trim_end_matches('f').split_once('x').expect("WARPSxQUEUE");
+                cfg.select = Some(SelectCfg { warps: w.parse().unwrap(), queue: q.parse().unwrap(), filter });
+            }
+            _ => panic!("unknown field {key}"),
+        }
+    }
+    cfg
+}
+
+/// Times configs untuned on the device, alternating runs: `CFGS` (`;`
+/// between [`parsed_cfg`]'s), the shape `CFG_SHAPE` (`n,m,d,k`, f16 NegDot),
+/// `CFG_RUNS` (3) rounds. The A/B of a pick across builds. Prints, never
+/// asserts (`--ignored --nocapture --test-threads=1`).
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn cfg_time_probe() {
+    let Some(planner) = super::device_planner() else { return };
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    let shape: Vec<usize> = var("CFG_SHAPE").split(',').map(|v| v.trim().parse().expect("n,m,d,k")).collect();
+    let [n, m, d, k] = shape[..] else { panic!("CFG_SHAPE is n,m,d,k") };
+    let runs: usize = var("CFG_RUNS").parse().unwrap_or(3);
+    let cfgs: Vec<NearestCfg> = var("CFGS").split(';').map(parsed_cfg).collect();
+    let spec = |cfg| NearestSpec {
+        n,
+        m,
+        d,
+        metric: Metric::NegDot,
+        floors: NONE,
+        groups: false,
+        k,
+        cfg,
+        live: Default::default(),
+    };
+    for run in 0..runs {
+        let ns = super::measure(cfgs.iter().map(|&cfg| tk::nearest::programs(&planner, DType::Float16, &spec(cfg))));
+        for (cfg, ns) in cfgs.iter().zip(ns) {
+            let rate = ns.map_or("failed".into(), |ns| format!("{:7.1} Gpairs/s", (n * m) as f64 / ns as f64));
+            eprintln!("cfg {n}x{m} d{d} k{k} run {run}: {rate} {cfg:?}");
+        }
+    }
+}
