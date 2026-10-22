@@ -21,7 +21,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
 
-use svod_dtype::GpuArch;
+use svod_dtype::{GpuArch, ScalarDType};
 
 use crate::atoms::{Core, Device, Fill, GroupMmaAtom, Target};
 use crate::ir::{Axis, Orient, Shape};
@@ -979,8 +979,8 @@ impl Planner {
         }
         let (flight, rows) = match cfg.bk {
             Some(_) => {
-                let regs = cfg.registers(target, d, p.k)?;
-                let resident = self.resident(cfg.smem_bytes(d), regs, cfg.warps() as usize);
+                let regs = cfg.registers(target, d, p.k, p.dtype)?;
+                let resident = self.resident(cfg.smem_bytes(d, p.dtype), regs, cfg.warps() as usize);
                 (self.sms() * resident.max(1), blocks.min(SPLIT_GROUP))
             }
             None => (self.sms(), blocks),
@@ -999,10 +999,10 @@ impl Planner {
         (splits > 1).then_some(splits)
     }
 
-    /// The depth a nearest kernel runs `d` at: a multiple of the matrix
-    /// core's, the columns past `d` zero.
-    pub fn nearest_depth(&self, d: usize) -> Option<usize> {
-        Some(d.next_multiple_of(self.device.target.geometry()?.k as usize))
+    /// The depth a nearest kernel over `dtype` runs `d` at: a multiple of
+    /// its matrix core's, the columns past `d` zero.
+    pub fn nearest_depth(&self, d: usize, dtype: ScalarDType) -> Option<usize> {
+        Some(d.next_multiple_of(self.device.target.geometry_of(dtype)?.k as usize))
     }
 
     fn ranked(&self, p: Problem) -> Arc<[GemmCfg]> {
@@ -1372,17 +1372,18 @@ impl NearestCfg {
         [Some(self.bkv), self.bk.map(|_| self.bq)].into_iter().flatten()
     }
 
-    /// Whether the config lowers on `target` at depth `d`: the atom's M is
-    /// [`WARP_ROWS`], a warp owns whole atom rows of queries and the block
-    /// whole warps, the product tiles the atoms, and each operand fill
-    /// splits into whole 16-byte chunks per thread; a streamed depth is
-    /// whole 16-byte chunks too, which an overhanging chunk's fill zeroes
-    /// past it.
-    pub fn fits(&self, target: &Target, d: usize) -> bool {
-        let Some(atom) = target.geometry() else { return false };
+    /// Whether the config lowers on `target` at depth `d` over operands of
+    /// `dtype`: the atom's M is [`WARP_ROWS`], a warp owns whole atom rows of
+    /// queries and the block whole warps, the product tiles the atoms, and
+    /// each operand fill splits into whole 16-byte chunks per thread; a
+    /// streamed depth is whole 16-byte chunks too, which an overhanging
+    /// chunk's fill zeroes past it.
+    pub fn fits(&self, target: &Target, d: usize, dtype: ScalarDType) -> bool {
+        let Some(atom) = target.geometry_of(dtype) else { return false };
         let (bq, bkv, rows, depth) = (self.bq, self.bkv, self.warp_rows, self.depth(d));
         let threads = self.warps() as usize * target.wave as usize;
-        let fills = self.filled().all(|rows| (rows * depth / 8).is_multiple_of(threads));
+        let chunk = 16 / dtype.bytes();
+        let fills = self.filled().all(|rows| (rows * depth / chunk).is_multiple_of(threads));
         atom.m as usize == WARP_ROWS
             && rows.is_multiple_of(WARP_ROWS)
             && rows > 0
@@ -1390,7 +1391,7 @@ impl NearestCfg {
             && bq > 0
             && bkv.is_multiple_of(atom.n as usize)
             && depth.is_multiple_of(atom.k as usize)
-            && d.is_multiple_of(if self.bk.is_some() { 8 } else { atom.k as usize })
+            && d.is_multiple_of(if self.bk.is_some() { chunk } else { atom.k as usize })
             && fills
             && target.fill.stages(self.stages) == self.stages
     }
@@ -1402,9 +1403,9 @@ impl NearestCfg {
     /// columns in; the staged chunks where the fill goes through registers.
     /// Addressing and the row vectors are not counted, but for the `k`
     /// least scores and indices a row's list holds past one.
-    pub fn registers(&self, target: &Target, d: usize, k: usize) -> Option<u32> {
-        let [operands, scores] = self.lane_parts(target, d)?;
-        Some(operands + 2 * scores + self.list_registers(target, d, k)?)
+    pub fn registers(&self, target: &Target, d: usize, k: usize, dtype: ScalarDType) -> Option<u32> {
+        let [operands, scores] = self.lane_parts(target, d, dtype)?;
+        Some(operands + 2 * scores + self.list_registers(target, d, k, dtype)?)
     }
 
     /// The registers [`Nearest::admit`] holds against the lane's budget:
@@ -1418,11 +1419,11 @@ impl NearestCfg {
     /// scores beside it across the deals, so a list counts it all either way
     /// (gfx1151, 32 rows by 64 candidates streamed 32 deep, a list of 64:
     /// estimated 252 so, 284 whole, 256 and spilled compiled).
-    pub fn held(&self, target: &Target, d: usize, k: usize) -> Option<u32> {
-        let [operands, scores] = self.lane_parts(target, d)?;
+    pub fn held(&self, target: &Target, d: usize, k: usize, dtype: ScalarDType) -> Option<u32> {
+        let [operands, scores] = self.lane_parts(target, d, dtype)?;
         let listed = k > 1 && self.select.is_none();
         let scores = if self.bk.is_some() && !listed { scores } else { 2 * scores };
-        Some(operands + scores + self.list_registers(target, d, k)?)
+        Some(operands + scores + self.list_registers(target, d, k, dtype)?)
     }
 
     /// A lane's registers of a list of `k > 1` scores and indices a row
@@ -1437,12 +1438,12 @@ impl NearestCfg {
     /// register-staged ring unrolled over its slots holds a list's pairs and
     /// the staged chunks once more (gfx1151, 16 rows by 32 candidates, a list
     /// of 64 at depth 48: 226 registers rolled, 255 and spilled unrolled).
-    fn list_registers(&self, target: &Target, d: usize, k: usize) -> Option<u32> {
+    fn list_registers(&self, target: &Target, d: usize, k: usize, dtype: ScalarDType) -> Option<u32> {
         if k == 1 || self.select.is_some() {
             return Some(0);
         }
         let LaneQueue { width, depth, passes } = self.lane_queue();
-        let row = self.scores_layout(target, d)?.row_vector();
+        let row = self.scores_layout(target, d, dtype)?.row_vector();
         let tile = TileLayout::spread_row(&row, width as u32).regs();
         let pairs = (self.list_slots(k) / width) as u32;
         let flush = if self.queue.is_some() { FLUSH_TILES * pairs } else { 0 };
@@ -1450,7 +1451,7 @@ impl NearestCfg {
         let rest = if passes { 0 } else { (self.bkv / width) as u32 };
         let tiles = 2 * pairs + 2 * depth as u32 + flush + pairs + rest;
         let unrolled = match target.fill {
-            Fill::Staged if self.unroll => 2 * pairs * tile + self.lane_parts(target, d)?[0] / 2,
+            Fill::Staged if self.unroll => 2 * pairs * tile + self.lane_parts(target, d, dtype)?[0] / 2,
             _ => 0,
         };
         Some(tiles * tile + 4 * row.regs() + unrolled)
@@ -1461,8 +1462,8 @@ impl NearestCfg {
     /// folded from (RDNA swapped: a row a lane of 16, its 16 others holding
     /// the row's other half; CUDA's `m16n8k16`: two rows a lane, a quad's
     /// lanes each holding a quarter).
-    fn scores_layout(&self, target: &Target, d: usize) -> Option<TileLayout> {
-        let atom = target.geometry()?;
+    fn scores_layout(&self, target: &Target, d: usize, dtype: ScalarDType) -> Option<TileLayout> {
+        let atom = target.geometry_of(dtype)?;
         let grid = WarpGrid { rows: self.warps(), cols: 1 };
         let scores = |o| Some(atom.issue(o, grid, self.bq, self.bkv, self.depth(d)).ok()?.c);
         let direct = scores(Orient::Direct)?;
@@ -1476,18 +1477,20 @@ impl NearestCfg {
     /// The lanes the products spread a row of the scores over
     /// ([`Self::scores_layout`]): the narrowest lane queues a deal renames
     /// registers into.
-    pub fn sharing(&self, target: &Target, d: usize) -> Option<usize> {
-        Some(1 << self.scores_layout(target, d)?.row_fold_masks().len())
+    pub fn sharing(&self, target: &Target, d: usize, dtype: ScalarDType) -> Option<usize> {
+        Some(1 << self.scores_layout(target, d, dtype)?.row_fold_masks().len())
     }
 
-    /// A lane's operand registers (the fragments and the staged chunks) and
-    /// its f32 scores', as [`Self::registers`] counts them.
-    fn lane_parts(&self, target: &Target, d: usize) -> Option<[u32; 2]> {
+    /// A lane's 32-bit operand registers (the fragments and the staged
+    /// chunks, `dtype`'s elements packed) and its f32 scores', as
+    /// [`Self::registers`] counts them.
+    fn lane_parts(&self, target: &Target, d: usize, dtype: ScalarDType) -> Option<[u32; 2]> {
         let (warps, depth) = (self.warps(), self.depth(d));
         let grid = WarpGrid { rows: warps, cols: 1 };
-        let qk = target.issue(Core::Warp, grid, self.bq, self.bkv, depth)?;
-        let half = |regs: u32| regs.div_ceil(2);
-        let staged = |rows| chunked(Shape::new(rows, depth), 2, warps, target.wave, Axis::Col).map(|l| l.regs());
+        let qk = target.geometry_of(dtype)?.issue(Orient::Direct, grid, self.bq, self.bkv, depth).ok()?;
+        let bytes = dtype.bytes();
+        let half = |regs: u32| regs.div_ceil(4 / bytes as u32);
+        let staged = |rows| chunked(Shape::new(rows, depth), bytes, warps, target.wave, Axis::Col).map(|l| l.regs());
         let fill = match target.fill {
             Fill::CpAsync => 0,
             Fill::Staged => half(self.filled().map(staged).sum::<Option<u32>>()?),
@@ -1629,13 +1632,15 @@ const NEAREST_WARPS: usize = 8;
 const NEAREST_DEPTHS: [Option<usize>; 4] = [None, Some(DEPTHS[0]), Some(DEPTHS[1]), Some(DEPTHS[2])];
 
 /// A nearest-candidate problem: `n` query rows against `m` candidates at
-/// depth `d`, scored by `metric` above `floors`, under groups or not, each
-/// row keeping its `k` least scores.
+/// depth `d`, their elements of `dtype` (16-bit floats, or 8-bit integers
+/// scaled per row), scored by `metric` above `floors`, under groups or not,
+/// each row keeping its `k` least scores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Nearest {
     pub n: usize,
     pub m: usize,
     pub d: usize,
+    pub dtype: ScalarDType,
     pub metric: Metric,
     pub floors: Floors,
     pub groups: bool,
@@ -1678,30 +1683,34 @@ impl Nearest {
             (None, Some(s)) if !s.fits(k) => return Err(Rejected::Lowers),
             _ => {}
         }
-        if !cfg.fits(target, d) {
+        let dtype = self.dtype;
+        if !cfg.fits(target, d, dtype) {
             return Err(Rejected::Lowers);
         }
-        let atom = target.geometry().ok_or(Rejected::Lowers)?;
+        let atom = target.geometry_of(dtype).ok_or(Rejected::Lowers)?;
+        let elem = dtype.bytes();
         if cfg.bk.is_some_and(|bk| bk < 2 * atom.k as usize && d.is_multiple_of(2 * atom.k as usize)) {
             return Err(Rejected::Shallow);
         }
         if cfg.bk.is_some_and(|bk| bk > d) {
             return Err(Rejected::Divides);
         }
-        let smem = cfg.smem_bytes(d);
+        let smem = cfg.smem_bytes(d, dtype);
         if smem > target.smem_bytes {
             return Err(Rejected::Smem { need: smem, have: target.smem_bytes });
         }
-        let regs = cfg.registers(target, d, k).ok_or(Rejected::Layout)?;
+        let regs = cfg.registers(target, d, k, dtype).ok_or(Rejected::Layout)?;
         let waves = cfg.warps() as usize;
-        let (held, budget) = (cfg.held(target, d, k).ok_or(Rejected::Layout)?, target.lane_budget(waves as u32));
+        let (held, budget) = (cfg.held(target, d, k, dtype).ok_or(Rejected::Layout)?, target.lane_budget(waves as u32));
         if held > budget {
             return Err(Rejected::Registers { need: held, have: budget });
         }
         let atoms = (cfg.warp_rows / atom.m as usize) * (bkv / atom.n as usize);
         let Floors { row, col } = self.floors;
         let clamp = self.metric == Metric::L2 && !(row || col);
-        let ops = [self.metric.row_norms(), row, col, clamp].into_iter().filter(|&on| on).count();
+        // 8-bit products are widened and scaled by both rows' scales.
+        let scaled = if elem == 1 { 3 } else { 0 };
+        let ops = [self.metric.row_norms(), row, col, clamp].into_iter().filter(|&on| on).count() + scaled;
         let first = if cfg.select.is_some() { MATRIX_PAIR } else { NEAREST_PAIR };
         let pair = first + ops as f64 * PAIR_OP + if self.groups { GROUPS_PAIR } else { 0.0 };
         // Split, every query block's candidate tiles in shares, a block each.
@@ -1716,10 +1725,10 @@ impl Nearest {
             None => (bkv, waves * bkv),
             Some(_) => (bq + bkv, waves * (cfg.warp_rows + bkv)),
         };
-        let tile = filled * depth * ELEM;
+        let tile = filled * depth * elem;
         let steps = (bq * bkv * depth).div_ceil(STEP);
         let trips = tiles * chunks;
-        let unique = ((self.n + self.m) * d * ELEM) as f64;
+        let unique = ((self.n + self.m) * d * elem) as f64;
         let flight = planner.sms().min(blocks).max(1);
         // The query blocks and shares the blocks in flight read: split, a
         // group of query blocks walks every share ([`SPLIT_GROUP`]).
@@ -1741,11 +1750,11 @@ impl Nearest {
                 fill += (bq * SECTOR) as f64 * costs.global_byte / chunks as f64;
             }
         }
-        let reads = (read * depth * ELEM) as f64 * costs.smem_byte;
+        let reads = (read * depth * elem) as f64 * costs.smem_byte;
         let mut epilogue = (bq * bkv) as f64 * pair * costs.score / chunks as f64;
         if k > 1 && cfg.select.is_none() {
             let lanes = cfg.lane_queue();
-            let sharing = cfg.sharing(target, d).ok_or(Rejected::Layout)?;
+            let sharing = cfg.sharing(target, d, dtype).ok_or(Rejected::Layout)?;
             let queued = lanes.width * lanes.depth;
             let deals = bkv / lanes.width;
             if lanes.width < sharing.max(2)
@@ -1759,7 +1768,8 @@ impl Nearest {
             }
             epilogue += share.listing(cfg, lanes, target.wave) * waves as f64 * costs.score / (tiles * chunks) as f64;
         }
-        let work = steps as f64 * costs.step + epilogue;
+        let step = if elem == 1 { costs.step_i8 } else { costs.step };
+        let work = steps as f64 * step + epilogue;
         let trip = costs.trip(target.fill, stages, cfg.unroll);
         let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
         let restarts = match cfg.bk {
@@ -1927,7 +1937,8 @@ impl Nearest {
                     continue;
                 }
                 for bkv in CANDIDATE_BLOCKS {
-                    for bk in NEAREST_DEPTHS {
+                    // An 8-bit chunk as many bytes deep as a 16-bit one.
+                    for bk in NEAREST_DEPTHS.map(|bk| bk.map(|bk| bk * 2 / self.dtype.bytes())) {
                         for &stages in stages {
                             for unroll in [false, true] {
                                 for &(queue, select) in &lists {
@@ -1939,7 +1950,7 @@ impl Nearest {
                                     }
                                     // Lane queues as wide as the lanes a row spreads over or
                                     // twice, dealing a trip's scores in at most `MOST_DEALS`.
-                                    let Some(sharing) = cfg.sharing(target, self.d) else { continue };
+                                    let Some(sharing) = cfg.sharing(target, self.d, self.dtype) else { continue };
                                     let narrowest = sharing.max(bkv / MOST_DEALS).max(2);
                                     for width in [narrowest, 2 * narrowest].into_iter().filter(|&w| w <= bkv) {
                                         for depth in LANE_DEPTHS {

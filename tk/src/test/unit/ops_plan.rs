@@ -1442,12 +1442,16 @@ fn heads_need_three_dims() {
 #[test_case(&[1 << 16, 128], &[1 << 16, 128], BF16, 33, Ok(()); "past the register list")]
 #[test_case(&[1 << 16, 768], &[1 << 16, 768], DType::Float16, 1024, Ok(()); "a list of 1024 streamed")]
 #[test_case(&[1000, 64], &[1 << 20, 64], BF16, 100, Ok(()); "a long list of many candidates")]
+#[test_case(&[1 << 16, 768], &[1 << 16, 768], DType::Int8, 8, Ok(()); "8-bit rows streamed")]
+#[test_case(&[1000, 100], &[1 << 20, 100], DType::Int8, 80, Ok(()); "8-bit rows at a padded depth")]
+#[test_case(&[37, 130], &[5, 130], DType::Int8, 1, Ok(()); "8-bit rows past the candidates")]
 #[test_case(&[1000, 64], &[1000, 64], DType::Float32, 8, Err(Fallback::Dtype); "an f32 list keeps the graph")]
 #[test_case(&[1000, 64], &[1000, 64], BF16, 0, Err(Fallback::Shape); "an empty list")]
 fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, k: usize, want: Result<(), Fallback>) {
     use crate::kernels::nearest::{Floors, Metric};
     for target in [sm86(), gfx1201(), crate::test::unit::targets::amd(AmdArch::Gfx942, 304)] {
         let planner = planner(target.clone());
+        let scalar = dtype.scalar().unwrap();
         let plan = shape::nearest(
             Some(&planner),
             &[dtype.clone(), dtype.clone()],
@@ -1461,11 +1465,12 @@ fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, k: usize, want: Result<
         match plan {
             Plan::Kernel(list) => {
                 assert_eq!(want, Ok(()), "{list:?}");
-                let d = planner.nearest_depth(x[1]).unwrap();
-                assert!(d >= x[1] && d.is_multiple_of(16));
+                let d = planner.nearest_depth(x[1], scalar).unwrap();
+                let atom = target.geometry_of(scalar).unwrap();
+                assert!(d >= x[1] && d.is_multiple_of(atom.k as usize) && d.is_multiple_of(16));
                 for (i, cfg) in list.iter().enumerate() {
-                    assert!(cfg.fits(&target, d) && cfg.smem_bytes(d) <= target.smem_bytes, "{cfg:?}");
-                    let held = cfg.held(&target, d, k).unwrap();
+                    assert!(cfg.fits(&target, d, scalar) && cfg.smem_bytes(d, scalar) <= target.smem_bytes, "{cfg:?}");
+                    let held = cfg.held(&target, d, k, scalar).unwrap();
                     assert!(held <= target.lane_budget(cfg.warps()), "{cfg:?} holds {held}");
                     assert!(!list[..i].contains(cfg), "{cfg:?} twice");
                 }
@@ -1494,6 +1499,7 @@ fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, shari
     let planner = planner(target.clone());
     let cfg = NearestCfg::new(64, 32, 2);
     let p = |k| Nearest {
+        dtype: svod_dtype::ScalarDType::Float16,
         n: 1 << 16,
         m: 1 << 16,
         d: 64,
@@ -1502,9 +1508,9 @@ fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, shari
         groups: false,
         k,
     };
-    let regs = |k| cfg.registers(&target, 64, k).unwrap();
+    let regs = |k| cfg.registers(&target, 64, k, svod_dtype::ScalarDType::Float16).unwrap();
     let LaneQueue { width, depth, .. } = LaneQueue::PORTABLE;
-    assert_eq!(cfg.sharing(&target, 64), Some(sharing as usize));
+    assert_eq!(cfg.sharing(&target, 64, svod_dtype::ScalarDType::Float16), Some(sharing as usize));
     let deals = (cfg.bkv / width) as u32;
     for k in [2, 8, 32] {
         let pairs = (k as u32).next_power_of_two().max(width as u32) / width as u32;
@@ -1512,7 +1518,7 @@ fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, shari
         let want = (3 * pairs + 2 * depth as u32 + deals) * tile + 4 * per_16_rows;
         assert_eq!(regs(k) - regs(1), want, "k {k}");
         let passes = NearestCfg { lanes: Some(LaneQueue { passes: true, ..LaneQueue::PORTABLE }), ..cfg };
-        let held = passes.registers(&target, 64, k).unwrap() - regs(1);
+        let held = passes.registers(&target, 64, k, svod_dtype::ScalarDType::Float16).unwrap() - regs(1);
         assert_eq!(held, want - deals * tile, "k {k} in passes");
     }
     let costs: Vec<f64> = [1, 2, 4, 8, 16].map(|k| p(k).admit(&planner, &cfg).unwrap().0).to_vec();
@@ -1535,6 +1541,7 @@ fn a_long_list_is_queued_or_listed_from_a_matrix(target: Target) {
     use crate::ops::config::{Nearest, REGISTER_K, Rejected};
     let planner = planner(target.clone());
     let p = |k| Nearest {
+        dtype: svod_dtype::ScalarDType::Float16,
         n: 1 << 15,
         m: 1 << 15,
         d: 64,
@@ -1546,7 +1553,7 @@ fn a_long_list_is_queued_or_listed_from_a_matrix(target: Target) {
     let base = NearestCfg::new(32, 16, 2);
     let queued = NearestCfg { queue: Some(32), ..base };
     let matrix = NearestCfg { select: Some(SelectCfg { warps: 4, queue: 2, filter: false }), ..base };
-    let regs = |cfg: &NearestCfg, k| cfg.registers(&target, 64, k).unwrap();
+    let regs = |cfg: &NearestCfg, k| cfg.registers(&target, 64, k, svod_dtype::ScalarDType::Float16).unwrap();
     for k in [64, 256, 1024] {
         assert_eq!(regs(&queued, k), regs(&queued, 64), "a queue's registers whatever its list's length");
         assert_eq!(regs(&matrix, k), regs(&base, 1), "a score matrix's product holds no list");
@@ -1610,6 +1617,7 @@ fn a_streamed_tile_pays_its_rows_again(target: Target) {
     let planner = planner(target);
     let (resident, streamed) = (NearestCfg::new(64, 64, 2), NearestCfg::streamed(64, 64, 32, 2));
     let p = |d| Nearest {
+        dtype: svod_dtype::ScalarDType::Float16,
         n: 1 << 16,
         m: 1 << 16,
         d,
@@ -1682,7 +1690,16 @@ fn the_nearest_cost_charges_every_pair(target: Target) {
     let planner = planner(target.clone());
     let cfg = NearestCfg::new(64, 64, 2);
     let cost = |d, metric, floors, groups| {
-        let p = Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors, groups, k: 1 };
+        let p = Nearest {
+            n: 1 << 16,
+            m: 1 << 16,
+            d,
+            dtype: svod_dtype::ScalarDType::Float16,
+            metric,
+            floors,
+            groups,
+            k: 1,
+        };
         p.admit(&planner, &cfg).unwrap().0
     };
     let plain = |d| cost(d, Metric::ShiftedL2, Floors::default(), false);

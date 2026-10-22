@@ -119,7 +119,7 @@ impl Case {
     /// The planner's problem of the case at `depth`, keeping `k` scores a row.
     fn problem(&self, depth: usize, k: usize) -> config::Nearest {
         let (n, m, metric, floors, groups) = (self.n, self.m, self.metric, self.floors(), self.groups.is_some());
-        config::Nearest { n, m, d: depth, metric, floors, groups, k }
+        config::Nearest { n, m, d: depth, dtype: svod_dtype::ScalarDType::Float16, metric, floors, groups, k }
     }
 
     fn row(v: &[f64], d: usize, i: usize) -> &[f64] {
@@ -1168,7 +1168,7 @@ fn few_queries_split_their_lists_to_fill_the_gpu(target: Target) {
 /// The planner's problem of `n` rows against `m` candidates at depth `d`,
 /// keeping `k` scores a row, with neither floors nor groups.
 fn self_join(n: usize, m: usize, d: usize, metric: Metric, k: usize) -> config::Nearest {
-    config::Nearest { n, m, d, metric, floors: NONE, groups: false, k }
+    config::Nearest { n, m, d, dtype: svod_dtype::ScalarDType::Float16, metric, floors: NONE, groups: false, k }
 }
 
 // ---- device ------------------------------------------------------------------
@@ -1187,7 +1187,7 @@ fn self_join(n: usize, m: usize, d: usize, metric: Metric, k: usize) -> config::
 fn nearest_matches_on_device(n: usize, m: usize, d: usize, draw: Draw) {
     let Some(planner) = super::device_planner() else { return };
     let case = Case::draw(n, m, d, draw, 7).unsigned(draw.integer);
-    let depth = planner.nearest_depth(d).unwrap();
+    let depth = planner.nearest_depth(d, svod_dtype::ScalarDType::Float16).unwrap();
     let ranked = planner.nearest_ranked(case.problem(depth, 1));
     let (want_score, want_index) = case.interpreted(ranked[0]);
     case.check("interpreter", &want_score, &want_index, 1e-4, draw.integer);
@@ -1280,7 +1280,7 @@ fn lists_match_on_device(n: usize, m: usize, d: usize, draw: Draw, k: usize) {
     let Some(planner) = super::device_planner() else { return };
     let bf16 = Case::draw(n, m, d, draw, 7).unsigned(draw.integer);
     for case in [bf16.clone(), bf16.in_f16()] {
-        let depth = planner.nearest_depth(d).unwrap();
+        let depth = planner.nearest_depth(d, svod_dtype::ScalarDType::Float16).unwrap();
         let ranked = planner.nearest_ranked(case.problem(depth, k));
         let (want_score, want_index) = case.listed(ranked[0], k);
         case.check_list("interpreter", k, &want_score, &want_index, 1e-4, draw.integer);
@@ -1478,7 +1478,7 @@ fn nearest_matches_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join
         };
         let (score, index) = match splits {
             1 => tk::nearest(&x, &c, opts).unwrap(),
-            _ => tk::nearest::picked(&x, &c, 1, opts, split).unwrap(),
+            _ => tk::nearest::picked(&x, &c, 1, opts, None, split).unwrap(),
         };
         super::ops::assert_kernel(&score, if splits == 1 { "nearest" } else { "nearest_merge" });
         case.check("kernel", &host(&score), &host(&index), 1e-3, false);
@@ -1552,7 +1552,7 @@ fn lists_match_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join: bo
             };
             let (score, index) = match splits {
                 1 => tk::k_nearest(&x, &c, k, opts).unwrap(),
-                _ => tk::nearest::picked(&x, &c, k, opts, split).unwrap(),
+                _ => tk::nearest::picked(&x, &c, k, opts, None, split).unwrap(),
             };
             let rows = if splits == 1 && k == 1 { vec![n, 1] } else { vec![n, k] };
             assert_eq!(score.dims().unwrap(), rows, "{f16}");
@@ -1562,13 +1562,13 @@ fn lists_match_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join: bo
             for matrix in (k > config::REGISTER_K).then_some([false, true]).into_iter().flatten() {
                 // The way's best ranked config, or where the ranking prunes it, its first admitted.
                 let way = |planner: &Planner, ranked: &[NearestCfg], spec: NearestSpec| {
-                    let p = tk::nearest::problem(&spec);
+                    let p = tk::nearest::problem(&spec, svod_dtype::ScalarDType::Float16);
                     let lattice = p.lattice(&planner.device.target);
                     let admitted = lattice.iter().filter(|c| p.admit(planner, c).is_ok());
                     let mut ways = ranked.iter().chain(admitted).filter(|c| c.select.is_some() == matrix);
                     NearestSpec { cfg: *ways.next().expect("a way of a long list"), ..spec }
                 };
-                let (score, index) = tk::nearest::picked(&x, &c, k, opts, way).unwrap();
+                let (score, index) = tk::nearest::picked(&x, &c, k, opts, None, way).unwrap();
                 super::ops::assert_kernel(&score, if matrix { "nearest_select" } else { "nearest" });
                 case.check_list(&format!("matrix {matrix} f16 {f16}"), k, &host(&score), &host(&index), 1e-3, false);
             }
@@ -1591,6 +1591,109 @@ fn a_list_the_kernel_does_not_serve_takes_the_graph(dtype: DType, k: usize, m: u
     let (score, index) = tk::k_nearest(&x, &c, k, options(&case, &opts)).unwrap();
     assert_eq!(score.dims().unwrap(), [m, k]);
     case.check_list("graph", k, &host(&score), &host(&index), 1e-4, true);
+}
+
+/// Over 8-bit rows the op runs the 8-bit kernel, each row as the integers
+/// it holds (a scale of 1, the norms its own), and lists exactly what the
+/// graph lists of them in f32: the products are exact in i32, and every
+/// score an integer f32 holds.
+#[test_case(300, 500, 64, draw(Metric::SquaredL2, NONE, None, true, false), false, 1; "squared l2 k1")]
+#[test_case(300, 300, 128, draw(Metric::L2, BOTH, Some(5), true, false), true, 8; "l2 floors groups self-join k8")]
+#[test_case(200, 700, 768, draw(Metric::NegDot, NONE, Some(3), true, true), false, 16; "streamed neg dot groups k16")]
+#[test_case(200, 900, 128, draw(Metric::ShiftedL2, NONE, None, true, true), false, 100; "assignment k100")]
+fn integer_rows_list_what_the_graph_lists(n: usize, m: usize, d: usize, draw: Draw, self_join: bool, k: usize) {
+    super::ops::untuned(|| {
+        let planner = super::device_planner().expect("a device");
+        if planner.device.target.geometry_of(ScalarDType::Int8).is_none() {
+            return eprintln!("skipped: no 8-bit core");
+        }
+        let case = Case::draw(n, m, d, draw, 5);
+        let case = if self_join { self_joined(case) } else { case };
+        let (x, c, opts) = operands(&case, DType::Int8, self_join);
+        let opts = options(&case, &opts);
+        let (score, index) = tk::k_nearest(&x, &c, k, opts).unwrap();
+        super::ops::assert_kernel(&score, if k > config::REGISTER_K { "nearest_select" } else { "nearest" });
+        case.check_list("kernel", k, &host(&score), &host(&index), 1e-6, false);
+        let (graph_score, graph_index) = tk::nearest::graph_k(&x, &c, k, opts).unwrap();
+        assert_eq!((host(&score), host(&index)), (host(&graph_score), host(&graph_index)));
+    });
+}
+
+/// The exact pass scores every pair as the reference does, in f32 against
+/// f64, on the device as in the interpreter: a ragged depth, candidates of
+/// none (−1), floors, every metric.
+#[test_case(Metric::SquaredL2, NONE; "squared l2")]
+#[test_case(Metric::L2, BOTH; "l2 floors")]
+#[test_case(Metric::NegDot, NONE; "neg dot")]
+#[test_case(Metric::ShiftedL2, BOTH; "shifted l2 floors")]
+fn rescored_pairs_match_the_reference(metric: Metric, floors: Floors) {
+    use crate::kernels::nearest::{Live, RescoreSpec, nearest_rescore};
+    let (n, m, d, cols) = (300, 500, 100, 17);
+    let case = Case::draw(n, m, d, draw(metric, floors, None, false, false), 9);
+    let index: Vec<f64> = (0..n * cols).map(|p| if p % 7 == 3 { -1.0 } else { ((p * 31) % m) as f64 }).collect();
+    let spec = RescoreSpec { n, m, d, cols, metric, floors, live: Live::default() };
+    let mut params = vec![case.x.clone(), case.c.clone(), index.clone()];
+    params.extend(case.row_floor.clone());
+    params.extend(case.col_floor.clone());
+    params.push(vec![0.0; n * cols]);
+    let want: Vec<f64> = (0..n * cols)
+        .map(|p| if index[p] < 0.0 { f64::INFINITY } else { case.pair(p / cols, index[p] as usize) })
+        .collect();
+    let check = |what: &str, got: &[f64]| {
+        for (p, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!(g == w || (g - w).abs() <= 1e-4 * w.abs().max(1.0), "{what}: pair {p} scores {g}, want {w}");
+        }
+    };
+    let prog = nearest_rescore(&spec);
+    check("interpreter", &run(&prog, params.clone(), &[]).unwrap().pop().unwrap());
+    let Some(planner) = super::device_planner() else { return };
+    let got = super::targets::on_device(prog, &spec.lowering(&planner.device), &params);
+    check("device", &got.last().cloned().flatten().unwrap());
+}
+
+/// A row quantized to 8 bits: its integers within ±127, the largest
+/// magnitude 127, each within half a step of the row over its scale; a
+/// row of zeros scales by 1.
+#[test]
+fn rows_quantize_within_half_a_step() {
+    let rows: Vec<f32> = vec![0.5, -1.0, 0.25, 0.0, 3.0, 2.9, -0.01, 1.0, 0.0, 0.0, 0.0, 0.0];
+    let x = Tensor::from_slice(rows.clone()).try_reshape([3, 4]).unwrap();
+    let q = tk::Quantized::new(&x).unwrap();
+    let (ints, scales) = (host(&q.rows), host(&q.scale));
+    assert_eq!(q.rows.dtype(), DType::Int8);
+    assert_eq!(scales, [1.0 / 127.0, 3.0 / 127.0, 1.0].map(|s: f64| f64::from(s as f32)));
+    for (i, &v) in rows.iter().enumerate() {
+        let (q, s) = (ints[i], scales[i / 4]);
+        assert!(q.abs() <= 127.0 && (q - f64::from(v) / s).abs() <= 0.5 + 1e-4, "{i}: {v} as {q}·{s}");
+    }
+    assert_eq!([ints[1], ints[4], ints[8]], [-127.0, 127.0, 0.0]);
+}
+
+/// The reranked op lists each row's `k` least exactly as scored in f32 over
+/// f32 rows (the reference's own candidates), whichever search it runs:
+/// the metrics, floors and groups of the plain op, a self-join, rows that
+/// stream, a list longer than the candidates the margin leaves, and with
+/// the rows quantized beforehand and a margin of its own.
+#[test_case(300, 500, 64, draw(Metric::SquaredL2, NONE, None, false, false), false, 1; "squared l2 k1")]
+#[test_case(300, 300, 128, draw(Metric::L2, BOTH, Some(5), false, false), true, 8; "l2 floors groups self-join k8")]
+#[test_case(200, 700, 768, draw(Metric::NegDot, NONE, Some(3), false, false), false, 16; "streamed neg dot groups k16")]
+#[test_case(300, 400, 256, draw(Metric::ShiftedL2, NONE, None, false, false), false, 64; "assignment k64")]
+#[test_case(100, 60, 64, draw(Metric::SquaredL2, NONE, None, false, false), false, 50; "a margin past the candidates")]
+fn reranked_lists_match_the_reference(n: usize, m: usize, d: usize, draw: Draw, self_join: bool, k: usize) {
+    super::ops::untuned(|| {
+        let case = Case::draw(n, m, d, draw, 7);
+        let case = if self_join { self_joined(case) } else { case };
+        let (x, c, opts) = operands(&case, DType::Float32, self_join);
+        let opts = options(&case, &opts);
+        let (score, index) = tk::k_nearest_reranked(&x, &c, k, opts, tk::Rerank::default()).unwrap();
+        assert_eq!(score.dims().unwrap(), [n, k]);
+        super::ops::assert_kernel(&score, "nearest_select");
+        case.check_list("reranked", k, &host(&score), &host(&index), 1e-5, true);
+        let (x8, c8) = (tk::Quantized::new(&x).unwrap(), tk::Quantized::new(&c).unwrap());
+        let rerank = tk::Rerank { margin: 24, x8: Some(&x8), c8: Some(&c8) };
+        let (score, index) = tk::k_nearest_reranked(&x, &c, k, opts, rerank).unwrap();
+        case.check_list("quantized beforehand", k, &host(&score), &host(&index), 1e-5, true);
+    });
 }
 
 /// A list of no scores is an error, not an empty tensor.
@@ -1660,7 +1763,11 @@ fn nearest_wide_probe() {
 /// Times the tuner's pick for an `n`-row self-join and every config it
 /// admitted, printing each one's pairs a second and TFLOP/s.
 fn time_nearest(planner: &Planner, n: usize, d: usize, metric: Metric, floors: Floors, groups: bool) {
-    time_list(planner, config::Nearest { n, m: n, d, metric, floors, groups, k: 1 }, DType::BFloat16);
+    time_list(
+        planner,
+        config::Nearest { n, m: n, d, dtype: svod_dtype::ScalarDType::Float16, metric, floors, groups, k: 1 },
+        DType::BFloat16,
+    );
 }
 
 /// [`time_nearest`] of the self-join `p` (its `k` scores a row) in `dtype`.
@@ -1723,7 +1830,16 @@ fn knn_probe() {
                     let mut least = None;
                     for &k in &ks {
                         let m = candidates.unwrap_or(n);
-                        let p = config::Nearest { n, m, d, metric, floors: NONE, groups: false, k };
+                        let p = config::Nearest {
+                            n,
+                            m,
+                            d,
+                            dtype: svod_dtype::ScalarDType::Float16,
+                            metric,
+                            floors: NONE,
+                            groups: false,
+                            k,
+                        };
                         if std::env::var_os("KNN_ALL").is_some() && m == n {
                             time_list(&planner, p, DType::Float16);
                         }
@@ -1759,6 +1875,116 @@ fn knn_probe() {
     });
 }
 
+/// The reranked op's parts per `RR_ROWS` × `RR_CANDIDATES` (default a
+/// self-join), `RR_DEPTHS`, `RR_KS` and `RR_METRIC` (`NegDot` or
+/// `SquaredL2`): the f16 search of `k` (the plain op's), the 8-bit and f16
+/// searches of `k + MARGIN` (the tuner's picks; `RR_TUNE=0` pins each
+/// ranking's first clean config), and the exact pass over `k + MARGIN`
+/// candidates a row (scores gathered in f32 and listed), in ms and
+/// Gpairs/s; the 8-bit search with the pass against the plain f16 search.
+/// Prints, never asserts (`--ignored --nocapture --test-threads=1`).
+#[test]
+#[ignore = "perf probe: needs a GPU"]
+fn rerank_probe() {
+    let list = |name: &str, default: &str| -> Vec<usize> {
+        let text = std::env::var(name).unwrap_or(default.into());
+        text.split(',').map(|v| v.trim().parse().expect("a comma-separated list of counts")).collect()
+    };
+    let (rows, depths, ks) = (list("RR_ROWS", "16384"), list("RR_DEPTHS", "128,256,512,768"), list("RR_KS", "1,16,64"));
+    let candidates: Option<usize> = std::env::var("RR_CANDIDATES").ok().map(|v| v.parse().expect("a count"));
+    let metric = match std::env::var("RR_METRIC").as_deref() {
+        Ok("SquaredL2") => Metric::SquaredL2,
+        _ => Metric::NegDot,
+    };
+    let tuned = std::env::var("RR_TUNE").as_deref() != Ok("0");
+    let Some(planner) = super::device_planner() else { return };
+    let ms = |ns: Option<u64>| ns.map_or(f64::NAN, |ns| ns as f64 / 1e6);
+    crate::tune::scoped(tuned, || {
+        for &n in &rows {
+            let m = candidates.unwrap_or(n);
+            for &d in &depths {
+                for &k in &ks {
+                    let coarse = (k + tk::MARGIN).min(m);
+                    let search = |dtype: ScalarDType, k: usize| {
+                        let p = config::Nearest { n, m, d, dtype, metric, floors: NONE, groups: false, k };
+                        if planner.nearest_ranked(p).is_empty() {
+                            return (None, None);
+                        }
+                        let (_, pick) = device_nearest(&planner, p, DType::Scalar(dtype));
+                        let spec = NearestSpec {
+                            n,
+                            m,
+                            d,
+                            metric,
+                            floors: NONE,
+                            groups: false,
+                            k,
+                            cfg: pick,
+                            live: Default::default(),
+                        };
+                        let [ns] = super::measure([tk::nearest::programs(&planner, DType::Scalar(dtype), &spec)])[..]
+                        else {
+                            unreachable!("one candidate")
+                        };
+                        (ns, Some(pick))
+                    };
+                    let (f16, f16_cfg) = search(ScalarDType::Float16, k);
+                    let (f16c, _) = search(ScalarDType::Float16, coarse);
+                    let (int8, int8_cfg) = search(ScalarDType::Int8, coarse);
+                    let pass = rerank_seconds(&planner, n, m, d, coarse, k, metric).map(|s| (s * 1e9) as u64);
+                    let rate = |ns: Option<u64>| ns.map_or(f64::NAN, |ns| (n * m) as f64 / ns as f64);
+                    let with = int8.zip(pass).map(|(a, b)| a + b);
+                    eprintln!(
+                        "rr {n}x{m} d{d} {metric:?} k{k}: f16 k {:.3} ms ({:.1} Gpairs/s) | f16 k' {:.3} | int8 k' {:.3} ms ({:.1}) | pass {:.3} ms | int8+pass {:.3} ms ({:.1}), {:.2}x f16 | {int8_cfg:?} {f16_cfg:?}",
+                        ms(f16),
+                        rate(f16),
+                        ms(f16c),
+                        ms(int8),
+                        rate(int8),
+                        ms(pass),
+                        ms(with),
+                        rate(with),
+                        ms(f16) / ms(with),
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// The best of a few runs of the reranked op's exact pass over `coarse`
+/// random candidates a row of `n` rows among `m` at depth `d`, keeping `k`,
+/// in seconds.
+fn rerank_seconds(
+    planner: &Planner,
+    n: usize,
+    m: usize,
+    d: usize,
+    coarse: usize,
+    k: usize,
+    metric: Metric,
+) -> Option<f64> {
+    let mut seed = 5;
+    let mut rows = |r: usize| {
+        let data: Vec<f32> = (0..r * d).map(|_| super::lcg(&mut seed) as f32).collect();
+        Tensor::from_slice(&data).try_reshape([r as isize, d as isize]).ok().map(|t| t.contiguous())
+    };
+    let (x, c) = (rows(n)?, rows(m)?);
+    let index: Vec<i32> = (0..n * coarse).map(|i| ((i as u64 * 2654435761) % m as u64) as i32).collect();
+    let index = Tensor::from_slice(&index).try_reshape([n as isize, coarse as isize]).ok()?.contiguous();
+    for t in [&x, &c, &index] {
+        t.realize().ok()?;
+    }
+    let opts = Nearest { metric, ..Nearest::default() };
+    let (_, at) = tk::nearest::rescored(planner, (&x, &c, &index), k, opts, &None, &None).ok()?;
+    let plan = at.prepare().ok()?;
+    let mut best = f64::INFINITY;
+    for _ in 0..3 {
+        best = best.min(crate::tune::run(&plan)?.as_secs_f64());
+    }
+    Some(best)
+}
+
 /// Times the tuner's GEMM pick for `m × n × k`, as the tuner times it.
 fn time_gemm(planner: &Planner, m: usize, n: usize, k: usize) {
     use crate::kernels::Batch;
@@ -1779,7 +2005,7 @@ fn time_gemm(planner: &Planner, m: usize, n: usize, k: usize) {
 /// The configs the tuner admits for the self-join `p` on the device in
 /// `dtype`, and its pick.
 fn device_nearest(planner: &Planner, p: config::Nearest, dtype: DType) -> (Vec<NearestCfg>, NearestCfg) {
-    let config::Nearest { n, m, d, metric, floors, groups, k } = p;
+    let config::Nearest { n, m, d, metric, floors, groups, k, .. } = p;
     let ranked = planner.nearest_ranked(p);
     let spec = |cfg| NearestSpec { n, m, d, metric, floors, groups, k, cfg, live: Default::default() };
     let build = |cfg: NearestCfg| tk::nearest::programs(planner, dtype.clone(), &spec(cfg));
@@ -1972,7 +2198,7 @@ fn tuning_probe() {
     crate::tune::scoped(true, || {
         for (d, k) in depths.iter().flat_map(|&d| ks.iter().map(move |&k| (d, k))) {
             let (n, metric, floors) = (rows, Metric::NegDot, NONE);
-            let p = Problem { n, m: n, d, metric, floors, groups: false, k };
+            let p = Problem { n, m: n, d, dtype: svod_dtype::ScalarDType::Float16, metric, floors, groups: false, k };
             let ranked = planner.nearest_ranked(p);
             let spec =
                 |cfg| NearestSpec { n, m: n, d, metric, floors, groups: false, k, cfg, live: Default::default() };

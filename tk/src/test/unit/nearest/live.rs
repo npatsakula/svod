@@ -395,7 +395,7 @@ fn assert_live_op(
         used = Some(spec.cfg);
         spec
     };
-    let (score, index) = tk::nearest::picked(&x, &c, k_var.as_sint(), options(case, &opts), live_pick).unwrap();
+    let (score, index) = tk::nearest::picked(&x, &c, k_var.as_sint(), options(case, &opts), None, live_pick).unwrap();
     assert_eq!(score.shape().unwrap().to_vec(), [n_var.as_sint(), k_var.as_sint()]);
     assert_eq!(index.shape().unwrap().to_vec(), [n_var.as_sint(), k_var.as_sint()]);
     if let Some(cfg) = used {
@@ -415,7 +415,7 @@ fn assert_live_op(
             Some(cfg) => NearestSpec { cfg: concrete_way(cfg, k), ..spec },
             None => spec,
         };
-        let (score, index) = tk::nearest::picked(&x, &c, k, options(&small, &opts), same).unwrap();
+        let (score, index) = tk::nearest::picked(&x, &c, k, options(&small, &opts), None, same).unwrap();
         let rows = |t: &Tensor| t.try_reshape([(n * k) as isize]).unwrap();
         let want = [host(&rows(&score)), host(&rows(&index))];
         assert_eq!(got, want, "n {n} k {k} under {used:?}");
@@ -431,7 +431,7 @@ fn assert_live_op(
 /// ranking prunes all but the cheapest products of a score matrix).
 fn way(queue: bool, select: bool, splits: usize) -> impl Fn(&Planner, &[NearestCfg], NearestSpec) -> NearestSpec {
     move |planner, ranked, spec| {
-        let p = tk::nearest::problem(&spec);
+        let p = tk::nearest::problem(&spec, svod_dtype::ScalarDType::Float16);
         let lattice = p.lattice(&planner.device.target);
         let admitted = lattice.iter().filter(|c| p.admit(planner, c).is_ok());
         let mut ways =
@@ -467,6 +467,29 @@ fn live_op_keeps_the_op_lists(
         // Past the candidates: the slots past them `+∞` at −1.
         let few = Case::draw(300, 20, d, draw(Metric::NegDot, BOTH, Some(4), false, false), 13);
         assert_live_op(&few, DType::Float16, kmax, &[(300, kmax), (7, kmax)], &way(queue, select, splits));
+    });
+}
+
+/// The reranked op over live rows and lists: one plan rebound from the
+/// bounds to fewer rows and shorter lists keeps each row's exact `k` least
+/// at every binding, the outputs `[N, k]`.
+#[test_case(16, 128, Metric::SquaredL2, &[(300, 16), (1, 1), (151, 5)]; "squared l2")]
+#[test_case(64, 768, Metric::NegDot, &[(300, 64), (77, 63), (300, 1)]; "streamed neg dot")]
+fn live_reranked_op_keeps_exact_lists(kmax: usize, d: usize, metric: Metric, bindings: &[(usize, usize)]) {
+    super::super::ops::untuned(|| {
+        let case = Case::draw(300, 1000, d, draw(metric, NONE, Some(4), false, false), 17);
+        let n_var = Variable::new(ROWS, 1, case.n as i64).bind(bindings[0].0 as i64).unwrap();
+        let k_var = Variable::new(LIST, 1, kmax as i64).bind(bindings[0].1 as i64).unwrap();
+        let (x, c, opts) = bound_operands(&case, DType::Float32, Some(&n_var));
+        let rerank = tk::Rerank::default();
+        let (score, index) = tk::k_nearest_reranked(&x, &c, k_var.as_sint(), options(&case, &opts), rerank).unwrap();
+        assert_eq!(score.shape().unwrap().to_vec(), [n_var.as_sint(), k_var.as_sint()]);
+        super::super::ops::assert_kernel(&score, "nearest_select");
+        let mut plans = Rebound::new(&[&score, &index]);
+        for &(n, k) in bindings {
+            let got = plans.run(&[(ROWS, n as i64), (LIST, k as i64)], (n, k, kmax));
+            case.first(n).check_list(&format!("n {n} k {k}"), k, &got[0], &got[1], 1e-5, true);
+        }
     });
 }
 
@@ -639,7 +662,7 @@ fn live_probe() {
                 let tuned = |cfg| tuned_into(cfg, dtype.clone());
                 // The concrete op and its pick.
                 let pick = std::cell::Cell::new(None);
-                let (_, index) = tk::nearest::picked(&x, &c, k, opts, tuned(&pick)).unwrap();
+                let (_, index) = tk::nearest::picked(&x, &c, k, opts, None, tuned(&pick)).unwrap();
                 let mut concrete = index.prepare().unwrap();
                 // Rows bound at the count, under the concrete pick.
                 let at = Variable::new(ROWS, 1, n as i64).bind(n as i64).unwrap();
@@ -651,17 +674,17 @@ fn live_probe() {
                 // static buffer would be copied first.
                 let xb = bound(&x, &at).contiguous();
                 xb.realize().unwrap();
-                let (_, index) = tk::nearest::picked(&xb, &c, k, opts, same).unwrap();
+                let (_, index) = tk::nearest::picked(&xb, &c, k, opts, None, same).unwrap();
                 let mut live_same = index.prepare().unwrap();
                 // Rows bound at the count under their own pick, and at twice it.
                 let own = std::cell::Cell::new(None);
-                let (_, index) = tk::nearest::picked(&xb, &c, k, opts, tuned(&own)).unwrap();
+                let (_, index) = tk::nearest::picked(&xb, &c, k, opts, None, tuned(&own)).unwrap();
                 let mut live_own = index.prepare().unwrap();
                 let twice = Variable::new(ROWS, 1, 2 * n as i64).bind(n as i64).unwrap();
                 let wide = std::cell::Cell::new(None);
                 let xw = bound(&all, &twice).contiguous();
                 xw.realize().unwrap();
-                let (_, index) = tk::nearest::picked(&xw, &c, k, opts, tuned(&wide)).unwrap();
+                let (_, index) = tk::nearest::picked(&xw, &c, k, opts, None, tuned(&wide)).unwrap();
                 let mut live_wide = index.prepare().unwrap();
                 let vars = [(ROWS, n as i64)];
                 let mut best = [f64::INFINITY; 4];

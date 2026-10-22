@@ -23,8 +23,8 @@ use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::nearest::{
-    Floors, Live, MergeSpec, Metric, NearestCfg, NearestSpec, SelectCfg, SelectSpec, nearest, nearest_merge,
-    nearest_select,
+    Floors, Live, MergeSpec, Metric, NearestCfg, NearestSpec, RescoreSpec, SelectCfg, SelectSpec, nearest,
+    nearest_merge, nearest_rescore, nearest_select,
 };
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
@@ -191,7 +191,7 @@ pub fn families(target: &Target) -> Vec<Launch> {
         ("nearest 256 queued streamed neg dot", 256, Metric::NegDot, Floors::default(), false, 256),
         ("nearest 48 registers l2 floors", 64, Metric::L2, both, false, 48),
     ] {
-        let p = Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors, groups, k };
+        let p = Nearest { n: 1 << 16, m: 1 << 16, d, dtype: ScalarDType::Float16, metric, floors, groups, k };
         // A named way's first config, else the ranking's first.
         let way = |c: &&NearestCfg| match name {
             _ if name.contains("queued") => c.queue.is_some(),
@@ -201,6 +201,48 @@ pub fn families(target: &Target) -> Vec<Launch> {
         let Some(&cfg) = planner.nearest_ranked(p).iter().find(way) else { continue };
         let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Live::default() };
         push(name, nearest::<BF16>(&spec), cfg.lowering(&planner.device));
+    }
+    // Over 8-bit rows scaled per row, where the target has the core: the
+    // planner's first config of each way, and a split.
+    let int8 = [
+        ("nearest int8 squared l2", 128, Metric::SquaredL2, Floors::default(), false, 1),
+        ("nearest int8 streamed neg dot", 800, Metric::NegDot, Floors::default(), false, 1),
+        ("nearest int8 16 l2 floors groups", 64, Metric::L2, both, true, 16),
+        ("nearest int8 8 streamed neg dot", 768, Metric::NegDot, Floors::default(), false, 8),
+        ("nearest int8 64 queued squared l2", 64, Metric::SquaredL2, Floors::default(), false, 64),
+    ];
+    for (name, d, metric, floors, groups, k) in
+        int8.into_iter().filter(|_| target.geometry_of(ScalarDType::Int8).is_some())
+    {
+        let d = planner.nearest_depth(d, ScalarDType::Int8).expect("an 8-bit core");
+        let dtype = ScalarDType::Int8;
+        let p = Nearest { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors, groups, k };
+        let way = |c: &&NearestCfg| !name.contains("queued") || c.queue.is_some();
+        let streamed = |c: &&NearestCfg| name.contains("streamed") == c.bk.is_some();
+        let ranked = planner.nearest_ranked(p);
+        let Some(&cfg) = ranked.iter().filter(way).find(streamed).or(ranked.iter().find(way)) else { continue };
+        let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Live::default() };
+        push(name, nearest::<I8>(&spec), cfg.lowering(&planner.device));
+    }
+    // A reranked search's exact pass: a ragged depth, floors, rows bound at launch.
+    let n_var = Var { name: "n".into(), min: 1, max: 100 };
+    for (name, metric, floors, live) in [
+        ("nearest rescore l2 floors", Metric::L2, Floors { row: true, col: true }, Live::default()),
+        (
+            "nearest rescore live neg dot",
+            Metric::NegDot,
+            Floors::default(),
+            Live { rows: Some((n_var.clone(), 0)), k: None },
+        ),
+    ] {
+        let spec = RescoreSpec { n: 100, m: 150, d: 100, cols: 20, metric, floors, live };
+        push(name, nearest_rescore(&spec), spec.lowering(&planner.device));
+    }
+    if target.geometry_of(ScalarDType::Int8).is_some() {
+        let cfg = NearestCfg { splits: 2, ..NearestCfg::streamed(32, 32, 64, 2) };
+        let (metric, floors, live) = (Metric::SquaredL2, Floors::default(), Live::default());
+        let spec = NearestSpec { n: 100, m: 90, d: 128, metric, floors, groups: true, k: 8, cfg, live };
+        push("nearest int8 8 split", nearest::<I8>(&spec), cfg.lowering(&planner.device));
     }
     // Split over the candidates (shares of one tile and of two), and a merge
     // of shares, of a least alone and of lists: in registers, the longest
@@ -244,7 +286,16 @@ pub fn families(target: &Target) -> Vec<Launch> {
     let var = |name: &str, max: i64| Var { name: name.into(), min: 1, max };
     let live = |from: usize, k: i64| Live { rows: Some((var("n", 100), from)), k: Some(var("k", k)) };
     for (name, d, k, queued) in [("nearest live 16", 64, 16, false), ("nearest live queued 256", 256, 256, true)] {
-        let p = Nearest { n: 1 << 16, m: 1 << 16, d, metric: Metric::SquaredL2, floors: both, groups: true, k };
+        let p = Nearest {
+            n: 1 << 16,
+            m: 1 << 16,
+            d,
+            dtype: ScalarDType::Float16,
+            metric: Metric::SquaredL2,
+            floors: both,
+            groups: true,
+            k,
+        };
         let way = |c: &&NearestCfg| c.queue.is_some() == queued && c.select.is_none();
         let Some(&cfg) = planner.nearest_ranked(p).iter().find(way) else { continue };
         let (metric, floors, live) = (Metric::SquaredL2, both, live(0, k as i64));
@@ -613,8 +664,10 @@ pub fn rankings(target: &Target) -> String {
         s += &format!("conv {g:?}: {:?}\n", &*ranked);
         s += &format!("splits: {:?}\n", planner.conv_splits(1, ho * wo, &g, &ranked[..ranked.len().min(8)]));
     }
-    let self_join =
-        |d, metric, k| Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors: Floors::default(), groups: false, k };
+    let self_join = |d, metric, k| {
+        let dtype = ScalarDType::Float16;
+        Nearest { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors: Floors::default(), groups: false, k }
+    };
     for d in [16, 64, 256, 512, 1024] {
         for metric in [Metric::SquaredL2, Metric::NegDot] {
             let p = self_join(d, metric, 1);

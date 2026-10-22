@@ -163,10 +163,11 @@ fn measure(candidates: impl IntoIterator<Item = crate::tune::Candidate>) -> Vec<
 }
 
 /// The 8-bit step `probe::costs` measured on each fixture's device on
-/// 2026-10-22, after the fixture's other fields.
-const STEP_I8_GFX1151: f64 = 0.0;
+/// 2026-10-22, after the fixture's other fields; the bf16 `step` of the
+/// same run: gfx1151 7.77 (1.22x), sm_86 8.10 (4.0x), gfx1201 2.73 (2.0x).
+const STEP_I8_GFX1151: f64 = 6.3627;
 const STEP_I8_SM86: f64 = 2.0166;
-const STEP_I8_GFX1201: f64 = 0.0;
+const STEP_I8_GFX1201: f64 = 1.3564;
 
 /// gfx1151's costs (Strix Halo, 40 CUs) as `probe::costs` measured them on
 /// the device on 2026-10-14.

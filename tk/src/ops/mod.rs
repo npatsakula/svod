@@ -29,7 +29,7 @@ pub use self::attention::{Attn, Cache, Chunk, KeyMask, attention};
 pub use self::conv::{Conv, conv2d};
 pub use self::heads::{Qkv, heads};
 pub use self::linear::{Linear, linear};
-pub use self::nearest::{Metric, Nearest, k_nearest, nearest};
+pub use self::nearest::{MARGIN, Metric, Nearest, Quantized, Rerank, k_nearest, k_nearest_reranked, nearest};
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
 use crate::atoms::{Device, Target};
 pub use crate::kernels::Act;
@@ -267,11 +267,21 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     /// fastest pipeline of the leading tiles ([`Self::pipelined`], which
     /// times them again) is the choice.
     pub(crate) fn tuned(&mut self, op: &'static str, ranked: &[C], expand: impl Fn(&[C]) -> Vec<C>) -> C {
+        self.tuned_timed(op, ranked, expand).0
+    }
+
+    /// [`Self::tuned`] with the pick's device ns as last timed, where it was.
+    pub(crate) fn tuned_timed(
+        &mut self,
+        op: &'static str,
+        ranked: &[C],
+        expand: impl Fn(&[C]) -> Vec<C>,
+    ) -> (C, Option<u64>) {
         let candidates = expand(&self.admitted(op, &config::representatives(ranked)));
         let ordered = self.ordered(op, &candidates, Pass::Screen);
-        let pick = self.pipelined(op, &ordered, ranked);
-        tracing::debug!(target: PLAN, op, shape = ?self.shape, ?pick, "tuned");
-        pick
+        let (pick, ns) = self.pipelined_timed(op, &ordered, ranked);
+        tracing::debug!(target: PLAN, op, shape = ?self.shape, ?pick, ns, "tuned");
+        (pick, ns)
     }
 
     /// The fastest pipeline of the leading tiles of `ordered` (fastest
@@ -282,7 +292,13 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     /// shortlist held one pipeline per tile, the model's first clean one,
     /// and a tile's place in it is that pipeline's). The leader itself with
     /// tuning off, alone, or where no other twin compiles to be judged.
+    #[cfg(test)]
     pub(crate) fn pipelined(&mut self, op: &'static str, ordered: &[(C, Option<u64>)], ranked: &[C]) -> C {
+        self.pipelined_timed(op, ordered, ranked).0
+    }
+
+    /// [`Self::pipelined`] with the pick's device ns as last timed.
+    fn pipelined_timed(&mut self, op: &'static str, ordered: &[(C, Option<u64>)], ranked: &[C]) -> (C, Option<u64>) {
         let (winner, lead) = ordered[0];
         let near: Vec<C> = ordered
             .iter()
@@ -293,7 +309,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         let twins: Vec<C> = config::distinct_configs(&leaders.iter().flat_map(|l| l.twins(ranked)).collect::<Vec<_>>());
         tracing::debug!(?leaders, twins = twins.len(), "tuner's twins");
         if !tune::enabled() || twins.len() < 2 {
-            return winner;
+            return (winner, lead);
         }
         let key = self.keyed(op, " compiled", &twins);
         let (store, bench, build) = (self.store, &mut self.bench, &self.build);
@@ -302,7 +318,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         let judged = store.admitted(&key, || Self::programs(store, build, &twins, &keep), admit);
         let compiled: Vec<C> = judged.iter().flat_map(|at| at.iter().map(|&i| twins[i])).collect();
         tracing::debug!(target: PLAN, op, shape = ?self.shape, ?compiled, "twins admitted");
-        if compiled.len() > 1 { self.fastest(op, &compiled) } else { winner }
+        if compiled.len() > 1 { self.ordered(op, &compiled, Pass::Whole)[0] } else { (winner, lead) }
     }
 }
 
@@ -337,8 +353,15 @@ fn kernel_buffer(shape: &[SInt], dtype: DType) -> svod_tensor::error::Result<Ten
     Tensor::empty_dynamic_spec(shape, dtype, BufferSpec { cpu_access: !local, ..BufferSpec::default() })
 }
 
-/// `f::<T>(spec)` for the 16-bit element type `dtype`.
+/// `f::<T>(spec)` for the 16-bit element type `dtype`; with `int8`, an
+/// 8-bit integer one too.
 macro_rules! typed {
+    ($dtype:expr, $f:ident, $spec:expr, int8) => {
+        match $dtype.scalar() {
+            Some(svod_dtype::ScalarDType::Int8) => $f::<crate::build::I8>($spec),
+            _ => typed!($dtype, $f, $spec),
+        }
+    };
     ($dtype:expr, $f:ident, $spec:expr) => {
         match $dtype.scalar() {
             Some(svod_dtype::ScalarDType::BFloat16) => $f::<crate::build::BF16>($spec),

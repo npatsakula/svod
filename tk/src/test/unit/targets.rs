@@ -740,7 +740,7 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
         (768, Metric::SquaredL2, none, false, 8),
         (768, Metric::NegDot, none, false, 32),
     ] {
-        let p = Nearest { n: 1 << 16, m: 1 << 16, d, metric, floors, groups, k };
+        let p = Nearest { n: 1 << 16, m: 1 << 16, d, dtype: ScalarDType::Float16, metric, floors, groups, k };
         for cfg in first_eight(&planner.nearest_ranked(p)) {
             let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Default::default() };
             let name = format!("nearest d{d} {metric:?} {floors:?} {groups} k{k} {cfg:?}");

@@ -228,7 +228,9 @@ pub fn norm(planner: Option<&Planner>, dtypes: &[DType], x: Option<&Extent>) -> 
 }
 
 /// `x [n, d]` against the candidates `c [m, d]`, each row's cheapest by
-/// `metric` above `floors` (under `groups`); `dtypes` are those of `x` and `c`. Any depth runs,
+/// `metric` above `floors` (under `groups`); `dtypes` are those of `x` and
+/// `c`: 16-bit floats, or 8-bit integers on a target with an 8-bit core
+/// (rows scaled per row, [`crate::kernels::nearest::nearest`]). Any depth runs,
 /// padded with zeros to the matrix core's ([`Planner::nearest_depth`]), and
 /// rows bound to a variable, planned at its bound (as is a list's `k`); bound
 /// candidates are not, nor are more than the f32 index holds.
@@ -244,7 +246,19 @@ pub fn nearest(
     k: usize,
 ) -> Plan<NearestCfg> {
     plan(|| {
-        let planner = gate(planner, dtypes)?;
+        let int8 = dtypes.iter().all(|d| d.scalar() == Some(ScalarDType::Int8));
+        let planner = match int8 {
+            true => planner
+                .filter(|p| config::has_kernels(&p.device.target))
+                .ok_or(Fallback::Target)?
+                .device
+                .target
+                .geometry_of(ScalarDType::Int8)
+                .and(planner)
+                .ok_or(Fallback::Dtype)?,
+            false => gate(planner, dtypes)?,
+        };
+        let dtype = dtypes[0].scalar().ok_or(Fallback::Dtype)?;
         let (x, c) = (x.ok_or(Fallback::Symbolic)?, c.ok_or(Fallback::Symbolic)?);
         if c.var {
             return Err(Fallback::Symbolic);
@@ -253,8 +267,9 @@ pub fn nearest(
         if n * m * d * k == 0 || m > MAX_CANDIDATES {
             return Err(Fallback::Shape);
         }
-        let d = planner.nearest_depth(d).ok_or(Fallback::Target)?;
-        candidates(planner.nearest_ranked(config::Nearest { n, m, d, metric, floors, groups, k }), Fallback::Config)
+        let d = planner.nearest_depth(d, dtype).ok_or(Fallback::Target)?;
+        let p = config::Nearest { n, m, d, dtype, metric, floors, groups, k };
+        candidates(planner.nearest_ranked(p), Fallback::Config)
     })
 }
 

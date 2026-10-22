@@ -272,8 +272,9 @@ fn main() -> Result<()> {
             let ranked =
                 kernel(shape::nearest(Some(&planner), &operands, Some(&x), Some(&c), metric, floors, groups, k))
                     .map_err(gate("nearest"))?;
-            let d = planner.nearest_depth(d).ok_or("no matrix core")?;
-            let p = Nearest { n, m, d, metric, floors, groups, k };
+            let scalar = dtype.scalar().ok_or("a scalar dtype")?;
+            let d = planner.nearest_depth(d, scalar).ok_or("no matrix core")?;
+            let p = Nearest { n, m, d, dtype: scalar, metric, floors, groups, k };
             report(&mut plan, top, &ranked, &p.lattice(&target), |c| p.admit(&planner, c));
             let spec = NearestSpec { n, m, d, metric, floors, groups, k, cfg: ranked[0], live: Default::default() };
             let spec = match pick {
