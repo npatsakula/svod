@@ -356,7 +356,7 @@ impl NearestSpec {
 /// against halved floors; [`Metric::L2`] against its floors clamped at zero
 /// and squared, its square root taken once per row), which orders them as
 /// the metric's own.
-pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
+pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
     let NearestSpec { n, m, d, metric, floors, groups, k: top, cfg, ref live } = *spec;
     let NearestCfg { bq, bkv, stages, splits, .. } = cfg;
     let tiles = m.div_ceil(bkv);
@@ -996,8 +996,9 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
             |k, step, slot, carried| {
                 let start = tile_start(step);
                 let c_t = k.smem_slot::<T>(c_s, slot, Shape::new(bkv, d));
-                let zero = k.zeros::<F32>(shape);
+                let zero = k.zeros::<T::Acc>(shape);
                 let dot = k.mma(zero, q_r, false, c_t, true);
+                let dot = T::widened(k, dot);
                 folded(k, dot, start, carried)
             },
         ),
@@ -1007,6 +1008,7 @@ pub fn nearest<T: Elem>(spec: &NearestSpec) -> Program {
             let x_chunk = |k: &mut Kernel, _: Sc, col: Sc| k.at(x_view, 0, col);
             let chunks = d.div_ceil(depth);
             let [dot] = mainloop(k, Shape::new(bq, depth), &x_chunk, [c_g], chunks, stages, depth, None, 1);
+            let dot = T::widened(k, dot);
             folded(k, dot, start, carried)
         }),
     };

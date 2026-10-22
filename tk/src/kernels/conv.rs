@@ -88,7 +88,7 @@ impl ConvSpec {
 
     /// The programs to launch in order with their lowerings: the convolution,
     /// or its partials and their merge.
-    pub fn programs<T: Elem>(&self, device: &Device) -> Vec<(Program, Lowering)> {
+    pub fn programs<T: Half>(&self, device: &Device) -> Vec<(Program, Lowering)> {
         let mut out = vec![(conv::<T>(self), self.cfg.lowering(device))];
         if self.split > 1 {
             let merge = self.merge();
@@ -103,7 +103,7 @@ impl ConvSpec {
 /// `y [batch, ho, wo, cout]`; split, only `x`, `w` and the f32 partials
 /// `[split, batch·ho·wo, cout]`. `cin` must be a multiple of `bk`, so a K
 /// step never straddles two taps.
-pub fn conv<T: Elem>(spec: &ConvSpec) -> Program {
+pub fn conv<T: Half>(spec: &ConvSpec) -> Program {
     let g = spec.geom;
     let gemm = spec.gemm();
     let bk = spec.cfg.tile[2];

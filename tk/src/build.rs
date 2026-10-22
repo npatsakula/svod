@@ -22,7 +22,42 @@ macro_rules! elem {
         }
     )*};
 }
-elem!(BF16 = BFloat16, F16 = Float16, F32 = Float32, I32 = Int32, Bool = Bool);
+elem!(BF16 = BFloat16, F16 = Float16, I8 = Int8, F32 = Float32, I32 = Int32, Bool = Bool);
+
+/// An element a matrix core multiplies, and the element it accumulates into:
+/// f32 for 16-bit floats, i32 for 8-bit integers (exact, as their products
+/// and sums are).
+pub trait MmaIn: Elem {
+    type Acc: Elem;
+
+    /// An accumulator's values in f32: as held, or converted from i32.
+    fn widened(k: &mut Kernel, acc: Regs<Self::Acc>) -> Regs<F32>;
+}
+
+/// A 16-bit float operand, accumulated in f32.
+pub trait Half: MmaIn<Acc = F32> {}
+
+macro_rules! half {
+    ($($name:ident),*) => {$(
+        impl MmaIn for $name {
+            type Acc = F32;
+
+            fn widened(_: &mut Kernel, acc: Regs<F32>) -> Regs<F32> {
+                acc
+            }
+        }
+        impl Half for $name {}
+    )*};
+}
+half!(BF16, F16);
+
+impl MmaIn for I8 {
+    type Acc = I32;
+
+    fn widened(k: &mut Kernel, acc: Regs<I32>) -> Regs<F32> {
+        k.cast::<I32, F32>(acc)
+    }
+}
 
 pub trait TierMark: Copy {
     const TIER: Tier;
@@ -434,29 +469,29 @@ impl Kernel {
 
     /// `acc + A·B` where `A` is `[m, k]` (or `[k, m]` when `a_t`) and `B` is
     /// `[k, n]` (or `[n, k]` when `b_t`); operands may live in registers or
-    /// shared memory.
-    pub fn mma<T: Elem, PA: TierMark, PB: TierMark>(
+    /// shared memory, the accumulator in `T`'s type ([`MmaIn::Acc`]).
+    pub fn mma<T: MmaIn, PA: TierMark, PB: TierMark>(
         &mut self,
-        acc: Regs<F32>,
+        acc: Regs<T::Acc>,
         a: Tile<PA, T>,
         a_t: bool,
         b: Tile<PB, T>,
         b_t: bool,
-    ) -> Regs<F32> {
+    ) -> Regs<T::Acc> {
         self.mma_oriented(acc, a, a_t, b, b_t, None)
     }
 
     /// [`Self::mma`] pinned to issue `orient` way round; `None` leaves the
     /// choice to the layout inference.
-    pub fn mma_oriented<T: Elem, PA: TierMark, PB: TierMark>(
+    pub fn mma_oriented<T: MmaIn, PA: TierMark, PB: TierMark>(
         &mut self,
-        acc: Regs<F32>,
+        acc: Regs<T::Acc>,
         a: Tile<PA, T>,
         a_t: bool,
         b: Tile<PB, T>,
         b_t: bool,
         orient: Option<Orient>,
-    ) -> Regs<F32> {
+    ) -> Regs<T::Acc> {
         let (sacc, sa, sb) = (self.shape(acc), self.shape(a), self.shape(b));
         let (m, ka) = if a_t { (sa.cols, sa.rows) } else { (sa.rows, sa.cols) };
         let (kb, n) = if b_t { (sb.cols, sb.rows) } else { (sb.rows, sb.cols) };

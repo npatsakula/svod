@@ -88,7 +88,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
         probe.value(l.carried[0].phi).shape.elems()
     };
     match field {
-        "step" | "step_group" => (blocks * extent * mma(probe) / 4096) as f64,
+        "step" | "step_group" | "step_i8" => (blocks * extent * mma(probe) / 4096) as f64,
         "smem_byte" | "global_byte" => {
             let tier = if field == "smem_byte" { Tier::Smem } else { Tier::Global };
             (blocks * extent * loads_from(probe, tier).iter().map(|l| l.1).sum::<usize>()) as f64
@@ -236,6 +236,7 @@ fn units_count_the_primitive(target: Target) {
         if p.candidates.is_empty() {
             let absent = match field {
                 "step_group" => target.group_mma.is_empty(),
+                "step_i8" => target.geometry_of(svod_dtype::ScalarDType::Int8).is_none(),
                 "trip_rolled" => target.fill == Fill::CpAsync,
                 "latency_one" => target.fill == Fill::Staged,
                 _ => false,
@@ -335,6 +336,9 @@ fn in_loop(ir: &str) -> &str {
 #[test_case(sm86(), "step", "@llvm.nvvm.mma."; "sm86 mma.sync")]
 #[test_case(gfx1151(), "step", "@llvm.amdgcn.wmma."; "gfx1151 wmma")]
 #[test_case(hopper(), "step_group", "wgmma.mma_async.sync.aligned.m64n256k16"; "sm90 wgmma")]
+#[test_case(sm86(), "step_i8", "@llvm.nvvm.mma.m16n8k32.row.col.satfinite.s8"; "sm86 s8 mma.sync")]
+#[test_case(gfx1151(), "step_i8", "@llvm.amdgcn.wmma.i32.16x16x16.iu8"; "gfx1151 iu8 wmma")]
+#[test_case(amd(AmdArch::Gfx942, 304), "step_i8", "@llvm.amdgcn.mfma.i32.16x16x32.i8"; "gfx942 i8 mfma")]
 #[test_case(sm86(), "step_lone", "@llvm.nvvm.mma."; "sm86 lone mma.sync")]
 #[test_case(gfx1151(), "step_lone", "@llvm.amdgcn.wmma."; "gfx1151 lone wmma")]
 #[test_case(sm86(), "smem_byte", "ptr %local0"; "sm86 shared load")]
@@ -468,6 +472,8 @@ fn device_costs_are_physical() {
     assert!(target.fill != Fill::CpAsync || c.latency_one > c.step, "{c:?}");
     assert!(c.trip_lone >= c.trip && c.trip_one_lone >= c.trip_one, "{c:?}");
     assert!(c.step_lone >= c.step, "{c:?}");
+    let int8 = target.geometry_of(svod_dtype::ScalarDType::Int8).is_some();
+    assert_eq!(c.step_i8 > 0.0, int8, "{c:?}");
     assert!(c.smem_trip > 0.0, "{c:?}");
     // A ring the planner prices apart from the unrolled two-slot one does no
     // less than it, within what the trip pairs resolve: each pair's

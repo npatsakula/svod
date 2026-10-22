@@ -22,6 +22,10 @@ use ScalarDType::{BFloat16, Bool, FP8E4M3, FP8E5M2, Float16, Float32, Int8, Int3
 #[test_case::test_case(Gfx942, FP8E4M3, Float32, 32 => Some("llvm.amdgcn.mfma.f32.16x16x32.fp8.fp8".into()))]
 #[test_case::test_case(Gfx942, FP8E5M2, Float32, 32 => Some("llvm.amdgcn.mfma.f32.16x16x32.bf8.bf8".into()))]
 #[test_case::test_case(Gfx942, FP8E4M3, Float32, 16 => None)]
+#[test_case::test_case(Gfx942, Int8, Int32, 32 => Some("llvm.amdgcn.mfma.i32.16x16x32.i8".into()))]
+#[test_case::test_case(Gfx950, Int8, Int32, 32 => Some("llvm.amdgcn.mfma.i32.16x16x32.i8".into()))]
+#[test_case::test_case(Gfx942, Int8, Float32, 32 => None; "the int8 mfma only accumulates in i32")]
+#[test_case::test_case(Gfx942, Int8, Int32, 16 => None; "the int8 mfma is k32")]
 #[test_case::test_case(Gfx950, FP8E4M3, Float32, 16 => None)]
 #[test_case::test_case(Gfx950, FP8E4M3, Float32, 32 => Some("llvm.amdgcn.mfma.f32.16x16x32.fp8.fp8".into()); "cdna4 keeps the unscaled k32 fp8 mfma")]
 // The dotted K=32 double-rate forms and the scaled K=128 form are CDNA4-only,
@@ -42,7 +46,7 @@ use ScalarDType::{BFloat16, Bool, FP8E4M3, FP8E5M2, Float16, Float32, Int8, Int3
 #[test_case::test_case(Gfx1100, Float16, Float32, 16 => Some("llvm.amdgcn.wmma.f32.16x16x16.f16".into()))]
 #[test_case::test_case(Gfx1201, Float16, Float32, 16 => Some("llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16".into()))]
 #[test_case::test_case(Gfx1201, BFloat16, BFloat16, 16 => Some("llvm.amdgcn.wmma.bf16.16x16x16.bf16.v8i16.v8i16".into()))]
-#[test_case::test_case(Gfx1201, FP8E4M3, Float32, 16 => None; "rdna4 has no native fp8 wmma")]
+#[test_case::test_case(Gfx1201, FP8E4M3, Float32, 16 => None; "the renderer maps no rdna4 fp8 wmma")]
 #[test_case::test_case(Gfx1151, FP8E4M3, Float32, 16 => None)]
 #[test_case::test_case(Gfx1151, FP8E4M3, Float32, 32 => None; "rdna must not inherit the cdna fp8 mfma")]
 // The accumulator is pinned to the operand and RDNA's WMMA is K=16 only; the

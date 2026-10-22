@@ -376,6 +376,9 @@ impl Frame<'_> {
                 let k = if *a_t { sa.rows } else { sa.cols };
                 let at = |m: usize, kk: usize| if *a_t { va[kk * sa.cols + m] } else { va[m * sa.cols + kk] };
                 let bt = |kk: usize, n: usize| if *b_t { vb[n * sb.cols + kk] } else { vb[kk * sb.cols + n] };
+                // An integer accumulator adds exactly (8-bit products sum
+                // well inside an f64's integers); a float one in f32.
+                let exact = !out.dtype.is_float();
                 let mut out = self.read(*acc)?;
                 for m in 0..rows {
                     for n in 0..cols {
@@ -383,7 +386,8 @@ impl Frame<'_> {
                         for kk in 0..k {
                             sum += at(m, kk) * bt(kk, n);
                         }
-                        out[m * cols + n] = (out[m * cols + n] as f32 + sum as f32) as f64;
+                        let held = out[m * cols + n];
+                        out[m * cols + n] = if exact { held + sum } else { (held as f32 + sum as f32) as f64 };
                     }
                 }
                 out

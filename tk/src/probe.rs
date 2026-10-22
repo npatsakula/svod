@@ -244,6 +244,8 @@ pub const GUESSED: Costs = Costs {
     scatter: 8.0,
     step: 5.0,
     step_group: 5.0,
+    // Twice the 16-bit rate, as most cores with an 8-bit one run it.
+    step_i8: 2.5,
     // Three waves a SIMD hide the chain.
     step_lone: 15.0,
     score: 0.5,
@@ -460,6 +462,7 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
         p.scatter(),
         p.step(),
         p.step_group(),
+        p.step_i8(),
         p.step_lone(),
         p.score(),
         p.trips("probe:trip", true, 2),
@@ -675,7 +678,18 @@ impl<'a> Probes<'a> {
     /// independent accumulators per warp.
     fn step(&self) -> Probe {
         let lowering = self.lowering(WarpGrid { rows: 2, cols: 2 }, false);
-        self.steps("probe:step", [64, 64, 16], self.blocks, WARPS, lowering, true)
+        self.steps::<BF16>("probe:step", [64, 64, 16], self.blocks, WARPS, lowering, true)
+    }
+
+    /// [`Self::step`] over 8-bit integers into i32, two NVIDIA or CDNA atoms
+    /// deep; no candidates where the target has no such core.
+    fn step_i8(&self) -> Probe {
+        let lowering = self.lowering(WarpGrid { rows: 2, cols: 2 }, false);
+        let mut probe = self.steps::<I8>("probe:step_i8", [64, 64, 64], self.blocks, WARPS, lowering, true);
+        if self.target.geometry_of(ScalarDType::Int8).is_none() {
+            probe.candidates.clear();
+        }
+        probe
     }
 
     /// [`Self::trips`] over a rolled ring of two slots, priced apart from an
@@ -727,13 +741,13 @@ impl<'a> Probes<'a> {
     fn step_lone(&self) -> Probe {
         let warps = self.warps;
         let tile = [32 * warps as usize, 32, 16];
-        self.steps("probe:step_lone", tile, self.sms as usize, warps, self.chain(Costs::default()), false)
+        self.steps::<BF16>("probe:step_lone", tile, self.sms as usize, warps, self.chain(Costs::default()), false)
     }
 
     /// `blocks` of `warps` each accumulating a `bm × bn` product over `bk`
     /// every iteration, where the baseline holds the zero accumulator; a
     /// unit is a 16×16×16 step of the SM (`per_sm`) or of one wave.
-    fn steps(
+    fn steps<T: MmaIn>(
         &self,
         op: &'static str,
         [bm, bn, bk]: [usize; 3],
@@ -745,11 +759,11 @@ impl<'a> Probes<'a> {
         let iters = 1024;
         let steps = iters * bm * bn * bk / 4096;
         let units = if per_sm { blocks * steps } else { steps / warps as usize } as f64;
-        self.make(op, ScalarDType::BFloat16, units, per_sm, lowering, |on| {
+        self.make(op, T::DTYPE, units, per_sm, lowering, |on| {
             let mut k = kernel(op, blocks, warps);
-            let a = input::<BF16>(&mut k, Shape::new(bm, bk));
-            let b = input::<BF16>(&mut k, Shape::new(bn, bk));
-            let zero = k.zeros::<F32>(Shape::new(bm, bn));
+            let a = input::<T>(&mut k, Shape::new(bm, bk));
+            let b = input::<T>(&mut k, Shape::new(bn, bk));
+            let zero = k.zeros::<T::Acc>(Shape::new(bm, bn));
             let [acc] = if on {
                 k.loop_(iters, [zero], |k, _, [acc]| [k.mma_oriented(acc, a, false, b, true, Some(Orient::Direct))])
             } else {

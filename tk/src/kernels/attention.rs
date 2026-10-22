@@ -330,7 +330,7 @@ impl<T> Step<'_, T> {
 /// what keeps that sum finite for any value magnitude.
 const RESCALE_ABOVE: f64 = 8.0;
 
-fn step<T: Elem, PK: TierMark, PV: TierMark>(
+fn step<T: Half, PK: TierMark, PV: TierMark>(
     k: &mut Kernel,
     st: &Step<'_, T>,
     k_t: Tile<PK, T>,
@@ -407,7 +407,7 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
 /// skipped through the first block and the trip count, the rest shared
 /// evenly by the splits; only blocks a mask edge crosses pay for the mask,
 /// except under a key mask or a bias, which every block reads.
-pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
+pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, scale, cfg } = *spec;
     let AttnMask { causal, window, chunk, key_lens, key_mask, seg_start, bias } = mask;
     let FaCfg { bq, bkv, stages, splits, .. } = cfg;

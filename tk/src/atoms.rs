@@ -281,6 +281,10 @@ pub struct Costs {
     /// The same step issued as part of a warpgroup product
     /// ([`GroupMmaAtom`]), 0 where the target has none.
     pub step_group: f64,
+    /// The same step's 16×16×16 products over 8-bit integers into i32
+    /// ([`Target::geometry_of`]), the SM full of waves; 0 where the target
+    /// has no such core.
+    pub step_i8: f64,
     /// The same step of a wave alone on its SIMD: a dependent chain's
     /// latency, which `step_lone / step` waves a SIMD hide.
     pub step_lone: f64,
@@ -333,13 +337,14 @@ pub struct Costs {
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
     /// order: all but the cache's, which a series of footprints measures.
-    pub fn fields(&mut self) -> [(&'static str, &mut f64); 16] {
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 17] {
         let Costs {
             smem_byte,
             global_byte,
             scatter,
             step,
             step_group,
+            step_i8,
             step_lone,
             score,
             trip,
@@ -360,6 +365,7 @@ impl Costs {
             ("scatter", scatter),
             ("step", step),
             ("step_group", step_group),
+            ("step_i8", step_i8),
             ("step_lone", step_lone),
             ("score", score),
             ("trip", trip),
@@ -460,12 +466,20 @@ impl Target {
         self.mma.iter().find(|a| a.dtype_in == dtype_in && a.dtype_out == dtype_out)
     }
 
-    /// The warp-level matrix core's geometry: its `m × n × k` and operand
-    /// layouts, which every input dtype's atom shares (16-bit operands only,
-    /// `test::unit::atoms::every_atom_of_a_target_shares_its_geometry`). The
-    /// planner prices it; the lowering issues the dtype's own ([`Self::mma`]).
+    /// The warp-level matrix core's geometry over 16-bit operands: its
+    /// `m × n × k` and operand layouts, which every 16-bit input's atom
+    /// shares (`test::unit::atoms::every_atom_of_a_target_shares_its_geometry`).
+    /// The planner prices it; the lowering issues the dtype's own
+    /// ([`Self::mma`]).
     pub fn geometry(&self) -> Option<&MmaAtom> {
-        self.mma.first()
+        self.mma.iter().find(|a| a.dtype_in.bytes() == 2)
+    }
+
+    /// The warp-level matrix core over `dtype_in` into its accumulator (f32
+    /// for a 16-bit float, i32 for an 8-bit integer): an 8-bit atom is as
+    /// deep as its bytes allow (`k` 32 on NVIDIA and CDNA, 16 on RDNA).
+    pub fn geometry_of(&self, dtype_in: ScalarDType) -> Option<&MmaAtom> {
+        self.mma.iter().find(|a| a.dtype_in == dtype_in)
     }
 
     /// The `[m, n] += [m, k] · [k, n]` product over `grid` on `core`'s
@@ -491,7 +505,9 @@ impl Target {
 fn cuda(c: CudaArch) -> Target {
     let renderer = Renderer::for_cuda_arch(c);
     let waves = if (c.major == 8 && c.minor >= 6) || c.major == 12 { 12 } else { 16 };
-    let mma = mma_atoms(&renderer, (8, 16, 16), [frag::mma_sync_a(), frag::mma_sync_b(), frag::mma_sync_c()]);
+    let mut mma = mma_atoms(&renderer, (8, 16, 16), [frag::mma_sync_a(), frag::mma_sync_b(), frag::mma_sync_c()]);
+    let bytes = [frag::mma_sync_a8(), frag::mma_sync_b8(), frag::mma_sync_c()];
+    mma.extend(int8_atom(renderer.tensor_cores.iter(), renderer.device, (8, 16, 32), bytes));
     Target {
         arch: GpuArch::Cuda(c),
         wave: c.wave_size(),
@@ -529,7 +545,20 @@ fn amd(a: AmdArch) -> Target {
     } else {
         (frag::wmma_gfx11_input(), frag::wmma_gfx11_acc())
     };
-    let layouts = [operand.clone(), operand.transpose(), accumulator];
+    let layouts = [operand.clone(), operand.transpose(), accumulator.clone()];
+    let renderer = Renderer::for_amd_arch(a);
+    let mut mma = mma_atoms(&renderer, (16, 16, 16), layouts.clone());
+    // CDNA's 8-bit core takes eight bytes a lane, twice the 16-bit depth (the
+    // scheduler's table lists it only as fp8, so it is built here); RDNA's
+    // `iu8` takes its 16-bit operands' layouts packed into fewer registers.
+    let int8 = if cdna {
+        let tc = svod_schedule::optimizer::renderer::AMD_CDNA_161632.build(DType::Int8, DType::Int32);
+        let operand = frag::mfma_16x16x32_i8();
+        int8_atom([tc].iter(), renderer.device, (16, 16, 32), [operand.clone(), operand.transpose(), accumulator])
+    } else {
+        int8_atom(renderer.tensor_cores.iter(), renderer.device, (16, 16, 16), layouts)
+    };
+    mma.extend(int8);
     let occupancy = if cdna {
         Occupancy { simds: 4, file: 512, waves: 8, registers: 256, acc_file: 256 }
     } else {
@@ -538,7 +567,7 @@ fn amd(a: AmdArch) -> Target {
     Target {
         arch: GpuArch::Amd(a),
         wave: a.wave_size(),
-        mma: mma_atoms(&Renderer::for_amd_arch(a), (16, 16, 16), layouts),
+        mma,
         group_mma: vec![],
         fill: Fill::Staged,
         ldmatrix: false,
@@ -620,23 +649,41 @@ fn metadata(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
 /// The renderer's 16-bit-in, f32-out tensor cores of shape `dims` (the
 /// scheduler table's `(N, M, K)`), each with the operand layouts `[a, b, c]`
 /// of that shape.
-fn mma_atoms(renderer: &Renderer, dims: (usize, usize, usize), [a, b, c]: [Layout; 3]) -> Vec<MmaAtom> {
+fn mma_atoms(renderer: &Renderer, dims: (usize, usize, usize), layouts: [Layout; 3]) -> Vec<MmaAtom> {
     renderer
         .tensor_cores
         .iter()
         .filter(|tc| tc.dims == dims && is_half(&tc.dtype_in) && tc.dtype_out == DType::Float32)
-        .map(|tc| MmaAtom {
-            m: dims.1 as u32,
-            n: dims.0 as u32,
-            k: dims.2 as u32,
-            a: a.clone(),
-            b: b.clone(),
-            c: c.clone(),
-            dtype_in: tc.dtype_in.scalar().expect("a scalar operand dtype"),
-            dtype_out: ScalarDType::Float32,
-            meta: metadata(tc, renderer.device),
-        })
+        .map(|tc| atom(tc, renderer.device, layouts.clone()))
         .collect()
+}
+
+/// The 8-bit integer core into i32 of shape `dims` among `cores`, if any,
+/// with the operand layouts `[a, b, c]` of its bytes.
+fn int8_atom<'a>(
+    mut cores: impl Iterator<Item = &'a TensorCore>,
+    device: RendererDevice,
+    dims: (usize, usize, usize),
+    layouts: [Layout; 3],
+) -> Option<MmaAtom> {
+    let tc = cores.find(|tc| tc.dims == dims && tc.dtype_in == DType::Int8 && tc.dtype_out == DType::Int32)?;
+    Some(atom(tc, device, layouts))
+}
+
+/// The atom of the tensor core `tc` with the operand layouts `[a, b, c]`.
+fn atom(tc: &TensorCore, device: RendererDevice, [a, b, c]: [Layout; 3]) -> MmaAtom {
+    let scalar = |d: &DType| d.scalar().expect("a scalar operand dtype");
+    MmaAtom {
+        m: tc.dims.1 as u32,
+        n: tc.dims.0 as u32,
+        k: tc.dims.2 as u32,
+        a,
+        b,
+        c,
+        dtype_in: scalar(&tc.dtype_in),
+        dtype_out: scalar(&tc.dtype_out),
+        meta: metadata(tc, device),
+    }
 }
 
 fn is_half(dtype: &DType) -> bool {

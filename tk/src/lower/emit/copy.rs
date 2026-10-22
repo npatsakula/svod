@@ -102,21 +102,22 @@ impl Emit<'_> {
     }
 
     /// Shared → registers under the destination's layout: `ldmatrix.x4` per
-    /// 16×16 block when the layout is a register permutation of what it
-    /// produces, else vector loads per register run.
+    /// 16×16 block of 16-bit elements (16×32 of 8-bit ones, untransposed)
+    /// when the layout is a register permutation of what it produces, else
+    /// vector loads per register run.
     pub(super) fn gather(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let l = self.layout(dst).clone();
         let s = self.view(src);
         let [sub_r, sub_c] = l.sub_shape();
         // `ldmatrix` reads 16-byte memory rows: a row-major tile only.
         let rows = self.along(&s).0 == Axis::Col;
-        if self.low.device.target.ldmatrix && rows && s.dtype.bytes() == 2 && sub_r % 16 == 0 && sub_c % 16 == 0 {
-            for trans in [false, true] {
-                let produced = TileLayout {
-                    frag: frag::ldmatrix_x4(trans),
-                    reps: [sub_r / 16, sub_c / 16],
-                    warps: l.warps.clone(),
-                };
+        let bytes = s.dtype.bytes() as u32;
+        let cols = 16 * 2 / bytes;
+        if self.low.device.target.ldmatrix && rows && matches!(bytes, 1 | 2) && sub_r % 16 == 0 && sub_c % cols == 0 {
+            let forms: &[bool] = if bytes == 2 { &[false, true] } else { &[false] };
+            for &trans in forms {
+                let frag = if bytes == 2 { frag::ldmatrix_x4(trans) } else { frag::ldmatrix_x4_bytes() };
+                let produced = TileLayout { frag, reps: [sub_r / 16, sub_c / cols], warps: l.warps.clone() };
                 if let Some(perm) = l.as_permutation_of(&produced, self.grid_warps(), self.low.device.target.wave) {
                     return self.ldmatrix_gather(dst, &s, &l, trans, &perm);
                 }

@@ -12,11 +12,11 @@ use std::sync::Arc;
 
 use svod_codegen::Renderer;
 use svod_codegen::llvm::LlvmTextRenderer;
-use svod_dtype::{AmdArch, CudaArch, DType, DeviceSpec, GpuArch};
+use svod_dtype::{AmdArch, CudaArch, DType, DeviceSpec, GpuArch, ScalarDType};
 use svod_ir::{Op, UOp, ops};
 
 use crate::atoms::{Core, Costs, Device, Target};
-use crate::build::{BF16, F16};
+use crate::build::{BF16, F16, I8};
 use crate::ir::{Program, Var};
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, Cache, Chunk, CombineSpec, FaCfg, attention, combine};
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
@@ -93,6 +93,16 @@ pub fn families(target: &Target) -> Vec<Launch> {
     let half_step =
         GemmSpec { cfg: planner.gemm_ranked(1, 300, 512, 256, false)[0], ..gemm_spec(100, 96, 256, half_step) };
     push("gemm gelu scale residual", gemm::<BF16>(&half_step), half_step.cfg.lowering(&planner.device));
+    // The 8-bit integer core where the target has one: its products exact
+    // into f32, over a whole tile two atoms deep and over a lone warp row.
+    if target.geometry_of(ScalarDType::Int8).is_some() {
+        let out_f32 = Epilogue { out_f32: true, ..Epilogue::DEFAULT };
+        for cfg in [config::gemm_cfg([64, 64, 64], 2, [2, 2], true), config::gemm_cfg([32, 64, 64], 1, [1, 2], false)] {
+            let spec = GemmSpec { m: 130, n: 192, k: 256, batch: Batch::Static(1), epilogue: out_f32, cfg };
+            let name = format!("gemm int8 {:?}x{}", cfg.tile, cfg.stages);
+            push(&name, gemm::<I8>(&spec), cfg.lowering(&planner.device));
+        }
+    }
 
     // The planner's lead for the shape; a head size it plans no kernel for
     // has no family.

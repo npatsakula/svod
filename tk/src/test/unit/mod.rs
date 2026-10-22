@@ -162,6 +162,12 @@ fn measure(candidates: impl IntoIterator<Item = crate::tune::Candidate>) -> Vec<
     crate::tune::time(&mut crate::tune::compile(candidates.into_iter().collect(), &pool))
 }
 
+/// The 8-bit step `probe::costs` measured on each fixture's device on
+/// 2026-10-22, after the fixture's other fields.
+const STEP_I8_GFX1151: f64 = 0.0;
+const STEP_I8_SM86: f64 = 2.0166;
+const STEP_I8_GFX1201: f64 = 0.0;
+
 /// gfx1151's costs (Strix Halo, 40 CUs) as `probe::costs` measured them on
 /// the device on 2026-10-14.
 pub(crate) fn gfx1151_costs() -> Costs {
@@ -171,6 +177,7 @@ pub(crate) fn gfx1151_costs() -> Costs {
         scatter: 3.05,
         step: 6.25,
         step_group: 0.0,
+        step_i8: STEP_I8_GFX1151,
         // Unmeasured there: equal to `step`, so a lone wave hides nothing.
         step_lone: 6.25,
         score: 0.0773,
@@ -200,6 +207,7 @@ pub(crate) fn sm86_costs() -> Costs {
         scatter: 2.825,
         step: 8.196,
         step_group: 0.0,
+        step_i8: STEP_I8_SM86,
         step_lone: 33.25,
         score: 0.07915,
         trip: 1.81,
@@ -225,6 +233,7 @@ pub(crate) fn gfx1201_costs() -> Costs {
         scatter: 1.8443,
         step: 2.7104,
         step_group: 0.0,
+        step_i8: STEP_I8_GFX1201,
         step_lone: 5.5957,
         score: 0.059305,
         trip: 7.3026,

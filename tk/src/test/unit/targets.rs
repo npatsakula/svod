@@ -34,11 +34,13 @@ use crate::sweep::device;
 pub(super) use crate::sweep::{Launch, amd, families, group_families, hopper, linear, render};
 
 /// Random parameters of `prog` rounded to their types; every i32 parameter
-/// (key counts, masks, segment starts, row maps) is 1.
+/// (key counts, masks, segment starts, row maps) is 1, every i8 one an
+/// integer of the full range.
 fn inputs(name: &str, prog: &Program) -> Vec<Vec<f64>> {
     let mut seed = name.len() as u64;
     let params = prog.params.iter().map(|p| match p.dtype {
         ScalarDType::Int32 => vec![1.0; p.elems],
+        ScalarDType::Int8 => super::rounded(ScalarDType::Int8, p.elems, &mut seed, |x| (127.0 * x).round()),
         dtype => super::rounded(dtype, p.elems, &mut seed, |x| x),
     });
     params.collect()
@@ -336,6 +338,11 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         if let (Some(dpp), true) = (facts.dpp, name.ends_with("norm")) {
             let moves = (ir.contains("@llvm.amdgcn.update.dpp.i32("), ir.contains("@llvm.amdgcn.ds.bpermute("));
             check(moves == (dpp, !dpp), &format!("DPP and ds_bpermute: {moves:?}"));
+        }
+        if name.starts_with("gemm int8") {
+            let cores = ["mma.m16n8k32.row.col.satfinite.s8", "wmma.i32.16x16x16.iu8", "mfma.i32.16x16x32.i8"];
+            check(cores.iter().any(|c| ir.contains(c)), "no 8-bit product");
+            check(ir.contains("ldmatrix") == target.ldmatrix, "fragments not read by ldmatrix where it is");
         }
         if name.starts_with("group gemm") {
             let reg_operand = |s: &crate::ir::Stmt| matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16);

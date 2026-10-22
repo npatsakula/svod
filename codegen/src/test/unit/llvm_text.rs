@@ -406,6 +406,9 @@ fn wmma_ssa_sink(
 #[test_case::test_case(AmdArch::Gfx950, 32, DType::FP8E4M3, 8, DType::Float32, 4, 4,
     &["bitcast <8 x i8>", " to i64", "(i64, i64, <4 x float>, i32, i32, i32)"],
     &[]; "cdna4 fp8 packs eight lanes into one i64")]
+#[test_case::test_case(AmdArch::Gfx942, 32, DType::Int8, 8, DType::Int32, 4, 4,
+    &["bitcast <8 x i8>", " to i64", "@llvm.amdgcn.mfma.i32.16x16x32.i8(i64", "(i64, i64, <4 x i32>, i32, i32, i32)"],
+    &["i1 true"]; "cdna3 int8 packs eight lanes into one i64")]
 // `llc -mcpu=gfx950` accepts `<8 x bfloat>` and rejects `<8 x i16>` for the K=32
 // double-rate MFMA, so unlike the K=16 `bf16.1k` form this must not bitcast.
 #[test_case::test_case(AmdArch::Gfx950, 32, DType::BFloat16, 8, DType::Float32, 4, 4,

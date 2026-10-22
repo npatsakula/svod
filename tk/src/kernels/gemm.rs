@@ -153,8 +153,10 @@ pub struct GemmSpec {
 /// Parameters in order: `a [batch·m, k]`, `b [n, k]` (`[2n, k]` gated),
 /// `bias` if any, `residual [batch·m, n]` if any, `c [batch·m, n]`. Rows past
 /// `m` and weight rows past `n` are clamped reads whose results are never
-/// stored; `k` must be a multiple of `bk`.
-pub fn gemm<T: Elem>(spec: &GemmSpec) -> Program {
+/// stored; `k` must be a multiple of `bk`. Over 8-bit integers the i32
+/// accumulator is widened to f32 for the epilogue, which stores f32
+/// (`out_f32`): exact while the sums stay below 2^24.
+pub fn gemm<T: MmaIn>(spec: &GemmSpec) -> Program {
     let GemmSpec { m, k: kk, cfg, .. } = *spec;
     let [bm, _, bk] = cfg.tile;
     mainloop_gemm::<T, _>("gemm", spec, m * kk, 1, |k, a, bb, row0| {
@@ -172,13 +174,14 @@ pub fn gemm<T: Elem>(spec: &GemmSpec) -> Program {
 /// With `split > 1` (a single static batch) grid z splits the reduction:
 /// split `z` walks steps `z·trips/split..`, and the kernel writes its raw f32
 /// accumulator to `c [split, m, n]` for [`split_merge`] to finish.
-pub(crate) fn mainloop_gemm<T: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
+pub(crate) fn mainloop_gemm<T: MmaIn, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     name: &str,
     spec: &GemmSpec,
     a_elems: usize,
     split: usize,
     a: impl FnOnce(&mut Kernel, ParamRef<T>, &Option<Sc>, Sc) -> S,
 ) -> Program {
+    assert!(T::DTYPE.bytes() == 2 || spec.epilogue.out_f32 || split > 1, "an 8-bit product stores f32");
     if split > 1 {
         build::<T, F32, S>(name, spec, a_elems, split, a)
     } else if spec.epilogue.out_f32 {
@@ -188,7 +191,7 @@ pub(crate) fn mainloop_gemm<T: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     }
 }
 
-fn build<T: Elem, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
+fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     name: &str,
     spec: &GemmSpec,
     a_elems: usize,
@@ -234,6 +237,7 @@ fn build<T: Elem, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
         let whole = [b_view(&mut k, 0)];
         mainloop(&mut k, sa, &a_tile, whole, trips / split, stages, bk, first_step, cfg.slices()).to_vec()
     };
+    let accs = accs.into_iter().map(|acc| T::widened(&mut k, acc)).collect();
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
     finish::<T, U>(&mut k, accs, epi, bias, residual, c, &bb, &tile);
     k.finish()
@@ -367,10 +371,10 @@ pub(super) fn tile_order(k: &mut Kernel, gm: impl Into<Sc>, gn: usize, group_m: 
 
 /// The K-streaming pipeline: the `sa`-shaped A tile `a(step, step·bk)` and
 /// `N` B tiles per step into a `stages`-deep shared ring, each operand of a
-/// slot held as `slices` k-slices ([`GemmCfg::slices`]), one f32
-/// accumulator per B.
+/// slot held as `slices` k-slices ([`GemmCfg::slices`]), one accumulator
+/// per B ([`MmaIn::Acc`]).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn mainloop<T: Elem, const N: usize>(
+pub(super) fn mainloop<T: MmaIn, const N: usize>(
     k: &mut Kernel,
     sa: Shape,
     a: &impl Fn(&mut Kernel, Sc, Sc) -> Gmem<T>,
@@ -380,12 +384,12 @@ pub(super) fn mainloop<T: Elem, const N: usize>(
     bk: usize,
     first_step: Option<Sc>,
     slices: usize,
-) -> [Regs<F32>; N] {
+) -> [Regs<T::Acc>; N] {
     let sb = k.shape(bs[0]);
     let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
     let a_s = k.smem::<T>("a_s", stages * sa.elems());
     let b_s = [(); N].map(|()| k.smem::<T>("b_s", stages * sb.elems()));
-    let init = [(); N].map(|()| k.zeros::<F32>(Shape::new(sa.rows, sb.rows)));
+    let init = [(); N].map(|()| k.zeros::<T::Acc>(Shape::new(sa.rows, sb.rows)));
     k.pipeline(
         trips,
         stages,

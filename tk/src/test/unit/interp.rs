@@ -27,6 +27,26 @@ fn gemm_matches_a_naive_reference(m: usize, n: usize, k: usize, bm: usize, bn: u
     }
 }
 
+/// An 8-bit product accumulates in i32 exactly: a sum past 2^24 that f32
+/// would round to an even neighbour (`127² · 1057` is odd) stays itself.
+#[test]
+fn an_8_bit_product_accumulates_exactly_in_i32() {
+    let (rows, depth) = (16, 1057);
+    let mut k = Kernel::new("int8");
+    let a = k.param::<I8>("a", ParamKind::In, rows * depth);
+    let c = k.param::<I32>("c", ParamKind::Out, rows * rows);
+    let view = k.view(a, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
+    let x = k.load(view);
+    let zero = k.zeros::<I32>(Shape::new(rows, rows));
+    let acc = k.mma(zero, x, false, x, true);
+    let out = k.view(c, 0, [rows, 1], Shape::new(rows, rows), [None, None]);
+    k.store(out, acc);
+    let out = run(&k.finish(), vec![vec![127.0; rows * depth], vec![0.0; rows * rows]], &[]).unwrap();
+    let want = (127 * 127 * depth) as f64;
+    assert_ne!(f64::from(want as f32), want, "f32 rounds the sum");
+    assert!(out[1].iter().all(|&v| v == want), "{} vs {want}", out[1][0]);
+}
+
 /// A loop-carried register holds its last update after the loop, and the
 /// induction variable drives the addressing: a row-wise prefix sum.
 #[test]
