@@ -10,7 +10,7 @@ use test_case::test_case;
 
 use super::first_eight;
 use crate::atoms::{Core, Target};
-use crate::build::{BF16, F16};
+use crate::build::{BF16, F16, I8};
 use crate::interp::{round_to, run};
 use crate::ir::Orient;
 use crate::kernels::nearest::{
@@ -1429,6 +1429,75 @@ fn a_list_is_held_beside_its_rows(target: Target) {
     }
 }
 
+/// A list's product is issued the way round that spreads a row over the
+/// fewest lanes ([`crate::atoms::MmaAtom::narrow`]), the one the planner
+/// prices its deals as register renamings under
+/// ([`NearestCfg::sharing`]), whatever the device's costs: under gfx1201's
+/// measured ones the search issued a queued list of 16 candidates a trip
+/// the wide way round (a scattered element 90 lane moves), which held
+/// every tile of its state in eight registers a lane, dealt by lane moves,
+/// emitted 400k instructions and took clang 100 s a config, 24 of them at
+/// once the RX's memory. The queued lists the planner ranks first for the
+/// 8-bit rerank's search (`k + 16`, at depth 128) lower within the bound a
+/// lowering refuses past ([`Target::most_instructions`]), their deals
+/// rename registers, and the sharing the planner admitted them at is their
+/// product's.
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), crate::test::unit::gfx1201_costs(); "gfx1201")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), crate::test::unit::gfx1151_costs(); "gfx1151")]
+#[test_case(crate::atoms::sm86(), crate::test::unit::sm86_costs(); "sm_86")]
+fn a_list_is_dealt_in_lane_under_measured_costs(target: Target, costs: crate::atoms::Costs) {
+    use crate::ir::{Stmt, TileOp};
+    use crate::layouts::WarpGrid;
+    let device = crate::atoms::Device { target, costs };
+    let planner = Planner::new(device.clone()).unwrap();
+    let (n, m, d, k) = (1 << 14, 1 << 14, 128, 64 + tk::MARGIN);
+    for dtype in [ScalarDType::Int8, ScalarDType::Float16] {
+        let p = config::Nearest { n, m, d, dtype, metric: Metric::NegDot, floors: NONE, groups: false, k };
+        let atom = device.target.geometry_of(dtype).unwrap();
+        let ranked = p.ranked(&planner);
+        let queued = |bkv| ranked.iter().filter(move |c| c.queue == Some(32) && c.bkv == bkv).take(3).copied();
+        let queued: Vec<NearestCfg> = queued(16).chain(queued(32)).collect();
+        assert!(queued.len() >= 3, "{dtype:?}: queued lists of 16 or 32 candidates a trip ranked: {queued:?}");
+        for cfg in queued {
+            let sharing = cfg.sharing(&device.target, d, dtype).unwrap();
+            let metric = p.metric;
+            let spec = NearestSpec { n, m, d, metric, floors: NONE, groups: false, k, cfg, live: Default::default() };
+            let prog = match dtype {
+                ScalarDType::Int8 => nearest::<I8>(&spec),
+                _ => nearest::<F16>(&spec),
+            };
+            let lowered = crate::lower::standalone(prog, &cfg.lowering(&device)).unwrap();
+            let instructions = lowered.instructions();
+            let most = device.target.most_instructions();
+            assert!(instructions <= most, "{dtype:?} {cfg:?}: {instructions} instructions");
+            let grid = WarpGrid { rows: cfg.warps(), cols: 1 };
+            let (narrow, issue) = atom.narrow(grid, cfg.bq, cfg.bkv, d).unwrap();
+            assert_eq!(sharing, 1 << issue.c.row_fold_masks().len(), "{dtype:?} {cfg:?}");
+            let (mut products, mut deals) = (0, 0);
+            for (_, stmt) in lowered.tile.walk() {
+                let Stmt::Let { dst, op } = stmt else { continue };
+                match *op {
+                    TileOp::Mma { orient, .. } => {
+                        assert_eq!(orient, Some(narrow), "{dtype:?} {cfg:?}: the product's orientation");
+                        products += 1;
+                    }
+                    TileOp::Deal { src, j, .. } => {
+                        let [s, t] = [src, *dst].map(|v| lowered.layouts[v.index()].as_ref().unwrap());
+                        let moves = s.deal(t, j, cfg.warps(), device.target.wave).unwrap();
+                        assert!(
+                            moves.iter().all(|(picks, _)| picks.iter().all(|p| p.mask == 0)),
+                            "{dtype:?} {cfg:?}: deal {j} moves across lanes"
+                        );
+                        deals += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(products > 0 && deals > 0, "{dtype:?} {cfg:?}: a product dealt");
+        }
+    }
+}
+
 /// `t` on the host as f64.
 fn host(t: &Tensor) -> Vec<f64> {
     t.cast(DType::Float32).to_vec::<f32>().unwrap().into_iter().map(f64::from).collect()
@@ -2519,11 +2588,22 @@ mod live;
 #[ignore = "IR dump: set LIST_IR"]
 fn list_ir_dump() {
     let Ok(dir) = std::env::var("LIST_IR") else { return };
+    super::traced();
     let target = match std::env::var("LIST_TARGET").as_deref() {
         Ok("gfx1201") => crate::sweep::amd(AmdArch::Gfx1201, 64),
+        Ok("gfx1151") => crate::sweep::amd(AmdArch::Gfx1151, 40),
         _ => crate::atoms::sm86(),
     };
-    let device = crate::sweep::declared(target);
+    let int8 = std::env::var_os("LIST_INT8").is_some();
+    // `LIST_STORE`: a copied tune store, whose probes price the lowering
+    // (the orientation of each product) as the card's own would.
+    let device = match std::env::var("LIST_STORE") {
+        Ok(dir) => {
+            let costs = crate::probe::stored(std::path::Path::new(&dir), &target).expect("the card's probes").costs;
+            crate::atoms::Device { target, costs }
+        }
+        Err(_) => crate::sweep::declared(target),
+    };
     let ks: Vec<usize> =
         std::env::var("LIST_KS").unwrap_or("16".into()).split(',').map(|v| v.parse().unwrap()).collect();
     let cfgs = std::env::var("LIST_CFGS").unwrap_or("64:64:2:2:4".into());
@@ -2545,7 +2625,10 @@ fn list_ir_dump() {
                 cfg,
                 live: Default::default(),
             };
-            let ir = crate::sweep::render(nearest::<F16>(&spec), &cfg.lowering(&device));
+            let start = std::time::Instant::now();
+            let prog = if int8 { nearest::<I8>(&spec) } else { nearest::<F16>(&spec) };
+            let ir = crate::sweep::render(prog, &cfg.lowering(&device));
+            eprintln!("{k}_{i} {cfg:?}: {} lines in {:.1?}", ir.lines().count(), start.elapsed());
             std::fs::write(format!("{dir}/{k}_{i}.ll"), ir).unwrap();
         }
     }

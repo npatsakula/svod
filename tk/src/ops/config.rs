@@ -1458,20 +1458,14 @@ impl NearestCfg {
     }
 
     /// The layout of the products' scores under the issue spreading a row
-    /// over fewer lanes, as the layout inference issues a product a list is
-    /// folded from (RDNA swapped: a row a lane of 16, its 16 others holding
-    /// the row's other half; CUDA's `m16n8k16`: two rows a lane, a quad's
-    /// lanes each holding a quarter).
+    /// over the fewest lanes ([`crate::atoms::MmaAtom::narrow`]), the one
+    /// the lowering issues a product whose scores are dealt (RDNA swapped:
+    /// a row a lane of 16, its 16 others holding the row's other half;
+    /// CUDA's `m16n8k16`: two rows a lane, a quad's lanes each holding a
+    /// quarter).
     fn scores_layout(&self, target: &Target, d: usize, dtype: ScalarDType) -> Option<TileLayout> {
-        let atom = target.geometry_of(dtype)?;
         let grid = WarpGrid { rows: self.warps(), cols: 1 };
-        let scores = |o| Some(atom.issue(o, grid, self.bq, self.bkv, self.depth(d)).ok()?.c);
-        let direct = scores(Orient::Direct)?;
-        let sharing = |c: &TileLayout| c.row_fold_masks().len();
-        Some(match atom.swappable().then(|| scores(Orient::Swapped)).flatten() {
-            Some(swapped) if sharing(&swapped) < sharing(&direct) => swapped,
-            _ => direct,
-        })
+        Some(target.geometry_of(dtype)?.narrow(grid, self.bq, self.bkv, self.depth(d)).ok()?.1.c)
     }
 
     /// The lanes the products spread a row of the scores over

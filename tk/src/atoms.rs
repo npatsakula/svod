@@ -55,6 +55,25 @@ impl MmaAtom {
     pub fn swappable(&self) -> bool {
         self.m == self.n
     }
+
+    /// The `[m, n]` product over `grid` ([`Self::issue`]) issued the way
+    /// round that spreads a row of its result over the fewest lanes (its
+    /// rows fold across the fewest masks,
+    /// [`crate::layouts::TileLayout::row_fold_masks`]): where a row
+    /// reduction folds cheapest, and where a deal of its rows
+    /// ([`crate::ir::TileOp::Deal`]) into as many columns a lane renames
+    /// registers ([`crate::layouts::TileLayout::dealt`]). Direct unless
+    /// swapped spreads narrower: RDNA and CDNA hold a row in a lane
+    /// swapped and over 16 lanes direct; CUDA's `m16n8k16` cannot swap.
+    pub fn narrow(&self, grid: WarpGrid, m: usize, n: usize, k: usize) -> crate::layouts::Result<(Orient, Issue)> {
+        let direct = self.issue(Orient::Direct, grid, m, n, k)?;
+        if !self.swappable() {
+            return Ok((Orient::Direct, direct));
+        }
+        let swapped = self.issue(Orient::Swapped, grid, m, n, k)?;
+        let sharing = |issue: &Issue| issue.c.row_fold_masks().len();
+        Ok(if sharing(&swapped) < sharing(&direct) { (Orient::Swapped, swapped) } else { (Orient::Direct, direct) })
+    }
 }
 
 /// A warpgroup matrix instruction: four consecutive warps issue

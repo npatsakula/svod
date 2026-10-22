@@ -626,6 +626,27 @@ fn a_spread_tile_flips_within_its_lane_group(target: Target, orient: Orient) {
     }
 }
 
+/// The narrow orientation of a product spreads a row over the fewest lanes:
+/// swapped on RDNA and CDNA, whose accumulator holds a column a lane;
+/// direct where the atom cannot swap.
+#[test_case(sm86(), Orient::Direct, 4; "sm_86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Swapped, 2; "gfx1201")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Swapped, 2; "gfx1151")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Swapped, 4; "gfx942")]
+fn the_narrow_orientation_folds_a_row_across_the_fewest_lanes(target: Target, want: Orient, sharing: usize) {
+    let grid = WarpGrid { rows: 4, cols: 1 };
+    let atom = target.geometry().unwrap();
+    let (orient, issue) = atom.narrow(grid, 64, 32, 32).unwrap();
+    assert_eq!(orient, want);
+    assert_eq!(1 << issue.c.row_fold_masks().len(), sharing);
+    assert_eq!(issue.c, atom.issue(orient, grid, 64, 32, 32).unwrap().c);
+    if atom.swappable() {
+        let other = if orient == Orient::Direct { Orient::Swapped } else { Orient::Direct };
+        let wide = atom.issue(other, grid, 64, 32, 32).unwrap().c;
+        assert!(wide.row_fold_masks().len() > issue.c.row_fold_masks().len(), "{other:?} spreads a row wider");
+    }
+}
+
 /// A product's scores deal into `[rows, w]` tiles spread over the lanes
 /// sharing each of its rows: as a renaming of registers where `w` is a
 /// multiple of those lanes, else by lane moves; either way a lane's register

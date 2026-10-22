@@ -84,7 +84,10 @@ ring की swizzled rows पर एक `wgmma` chain के रूप में
    layouts देता है (`MmaAtom::issue`), और उसे उसी रुख़ (`ir::Orient`) से issue करता है जो lowering की
    `Costs` के तहत program पर सबसे कम relayout cost छोड़े: `Cᵀ = Bᵀ·Aᵀ` वही instruction है जिसके slots
    आपस में बदल दिए गए हों, इसलिए square atom पर accumulator बिना किसी cost के अगले product का operand
-   बनकर रखा जा सकता है। लेखक orientation pin कर सकता है (`Kernel::mma_oriented`)।
+   बनकर रखा जा सकता है। जिस product का नतीजा deal होता है (`TileOp::Deal`, किसी list की lane queues)
+   वह उसी रुख़ से issue होता है जो एक row को सबसे कम lanes पर फैलाए (`MmaAtom::narrow`): वहीं deal
+   registers का नाम बदलना भर है, जैसा op layer उसकी क़ीमत लगाती है। लेखक orientation pin कर सकता है
+   (`Kernel::mma_oriented`)।
 2. **Elementwise ops एक करते हैं।** `binary`, `cast`, `where_`, `mul_add` के operands और नतीजा, और
    किसी loop की carried values, एक ही layout साझा करते हैं।
 3. **बिना बंधन वाले tiles natural layout लेते हैं।** Fixed point पर, जिस tile पर कोई बंधन नहीं, उसे

@@ -937,19 +937,42 @@ fn scatters(prog: &Program, lay: &TileLayout, from: &Value, lanes: u32) -> bool 
 }
 
 /// Write an orientation into every product of `prog`: the pinned ones stay,
-/// the rest take the assignment of least relayout, scatter and fold cost.
+/// a product whose result is dealt issues the way round that spreads a row
+/// over the fewest lanes ([`MmaAtom::narrow`]), the rest take the
+/// assignment of least relayout, scatter and fold cost.
+///
+/// A deal renames registers only where its rows spread over the fewest
+/// lanes ([`TileLayout::dealt`]), which is how the op layer prices a list
+/// ([`crate::kernels::nearest::NearestCfg::sharing`]). Left to the search,
+/// a static count of the scattered loads beside the deals (a list's merge
+/// into the outputs) outweighed the deals' lane moves under gfx1201's
+/// measured costs (a scattered element 90 lane moves) for a queued list
+/// dealing 16 candidates a trip; issued the other way round, every tile of
+/// its state took eight registers a lane instead of one and every deal lane
+/// moves: 400k instructions where the narrow way emits 60k, 5 KB of spill
+/// and 100 s of clang a config.
 fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Core) -> Result<()> {
     let Device { target, costs } = device;
+    let dealt = dealt_values(prog);
     // A product listed twice (a peeled loop trip) is one decision; a
     // warpgroup product is never square, so it issues one way.
     let mut free: Vec<ValId> = vec![];
+    let mut fixed: HashMap<ValId, Orient> = HashMap::new();
     for (_, s) in prog.walk() {
-        if let Stmt::Let { dst, op: TileOp::Mma { a, orient: None, .. } } = s {
+        if let Stmt::Let { dst, op: TileOp::Mma { a, a_t, orient: None, .. } } = s {
             let (va, vd) = (prog.value(*a), prog.value(*dst));
-            if core == Core::Warp
-                && target.mma(va.dtype, vd.dtype).is_some_and(MmaAtom::swappable)
-                && !free.contains(dst)
-            {
+            let Some(atom) = target.mma(va.dtype, vd.dtype).filter(|atom| core == Core::Warp && atom.swappable())
+            else {
+                continue;
+            };
+            if dealt.contains(dst) {
+                let k = if *a_t { va.shape.rows } else { va.shape.cols };
+                if let Ok((orient, _)) = atom.narrow(grid, vd.shape.rows, vd.shape.cols, k) {
+                    fixed.insert(*dst, orient);
+                    continue;
+                }
+            }
+            if !free.contains(dst) {
                 free.push(*dst);
             }
         }
@@ -1012,10 +1035,11 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Co
             .sum();
         Ok(relayouts + costs.scatter * scattered + costs.lane_move * (folds + exchanges))
     };
-    let mut best: HashMap<ValId, Orient> = HashMap::new();
+    let mut best = fixed.clone();
     let mut best_cost = cost_of(&best)?;
     let swapped = |bits: u32| -> HashMap<ValId, Orient> {
-        free.iter().enumerate().filter(|(i, _)| bits >> i & 1 == 1).map(|(_, &v)| (v, Orient::Swapped)).collect()
+        let swapped = free.iter().enumerate().filter(|(i, _)| bits >> i & 1 == 1).map(|(_, &v)| (v, Orient::Swapped));
+        fixed.iter().map(|(&v, &o)| (v, o)).chain(swapped).collect()
     };
     if free.len() <= EXHAUSTIVE_UP_TO {
         for bits in 1..1u32 << free.len() {
@@ -1037,8 +1061,68 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Co
             }
         }
     }
+    let swapped = best.values().filter(|&&o| o == Orient::Swapped).count();
+    tracing::debug!(name = prog.name, free = free.len(), dealt = fixed.len(), swapped, cost = best_cost, "oriented");
     set_orient(&mut prog.body, &best);
     Ok(())
+}
+
+/// The register values a deal ([`TileOp::Deal`]) takes its columns of, with
+/// every value held in their layout: the operands of the elementwise ops,
+/// casts, moves and exchanges feeding them and the carries of the loops
+/// they come out of (what [`Infer::let_`] and [`Infer::carried`] unify),
+/// back to the products they come from.
+fn dealt_values(prog: &Program) -> HashSet<ValId> {
+    let stmts: Vec<&Stmt> = prog.walk().map(|(_, s)| s).collect();
+    let mut dealt: HashSet<ValId> = stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Let { op: TileOp::Deal { src, .. }, .. } => Some(*src),
+            _ => None,
+        })
+        .collect();
+    // Definitions precede uses, so a pass backwards reaches a value's
+    // sources; a loop's carry is defined in its body, after the loop
+    // statement, so the passes repeat until nothing is added.
+    loop {
+        let before = dealt.len();
+        for s in stmts.iter().rev() {
+            match s {
+                Stmt::Let { dst, op } if dealt.contains(dst) => dealt.extend(unified(op)),
+                Stmt::Loop(Loop { carried, .. }) | Stmt::Pipeline(Pipeline { carried, .. }) => {
+                    let sources: Vec<ValId> =
+                        carried.iter().filter(|c| dealt.contains(&c.phi)).flat_map(|c| [c.init, c.next]).collect();
+                    dealt.extend(sources);
+                }
+                _ => {}
+            }
+        }
+        if dealt.len() == before {
+            return dealt;
+        }
+    }
+}
+
+/// The operands of `op` held in its result's layout ([`Infer::let_`]).
+fn unified(op: &TileOp) -> Vec<ValId> {
+    match *op {
+        TileOp::Unary { src, .. }
+        | TileOp::Cast { src, .. }
+        | TileOp::Move { src }
+        | TileOp::Shift { src, .. }
+        | TileOp::Flip { src, .. } => vec![src],
+        TileOp::Binary { a, b, .. } => vec![a, b],
+        TileOp::Where { pred, a, b } => vec![pred, a, b],
+        TileOp::MulAdd { a, b, c } => vec![a, b, c],
+        TileOp::Fill(_)
+        | TileOp::Splat(_)
+        | TileOp::Coord(_)
+        | TileOp::Relayout { .. }
+        | TileOp::Mma { .. }
+        | TileOp::Reduce { .. }
+        | TileOp::Transpose { .. }
+        | TileOp::Deal { .. } => vec![],
+    }
 }
 
 /// Orient every free product of `block`: as `choice` says, else direct.

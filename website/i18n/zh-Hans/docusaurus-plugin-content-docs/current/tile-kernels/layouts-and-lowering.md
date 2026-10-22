@@ -53,7 +53,7 @@ pub fn mma_sync_c() -> Layout {
 
 ## 布局推断 {#layout-inference}
 
-1. **原子提供初始布局。** `mma` 把原子的布局按 `WarpGrid` 平铺后赋给其操作数和结果（`MmaAtom::issue`），并按在降级的 `Costs` 下使程序重布局代价最小的方向（`ir::Orient`）发射：`Cᵀ = Bᵀ·Aᵀ` 是同一条指令、只是交换了槽位，因此在方形原子上，累加器可以零代价地作为下一次乘积的操作数保留。作者可以固定方向（`Kernel::mma_oriented`）。
+1. **原子提供初始布局。** `mma` 把原子的布局按 `WarpGrid` 平铺后赋给其操作数和结果（`MmaAtom::issue`），并按在降级的 `Costs` 下使程序重布局代价最小的方向（`ir::Orient`）发射：`Cᵀ = Bᵀ·Aᵀ` 是同一条指令、只是交换了槽位，因此在方形原子上，累加器可以零代价地作为下一次乘积的操作数保留。结果会被分发的乘积（`TileOp::Deal`，列表的 lane 队列）按把一行摊到最少 lane 上的方向发射（`MmaAtom::narrow`）：在那里分发只是寄存器重命名，算子层也正是这样定价的。作者可以固定方向（`Kernel::mma_oriented`）。
 2. **逐元素操作统一布局。** `binary`、`cast`、`where_`、`mul_add` 的操作数和结果，以及循环的携带值，共享同一布局。
 3. **无约束的 tile 取自然布局。** 到达不动点时，没有任何约束的 tile 获得 `layouts::natural`：每个 lane 持有最多 8 个元素的短行向量，lane 先沿列再沿行遍历，warp 按行切分。
 4. **向量跟随其 tile。** `[rows, 1]` 或 `[1, cols]` 向量（例如 `reduce` 的输出或偏置行）被要求采用其 tile 所蕴含的行或列布局。

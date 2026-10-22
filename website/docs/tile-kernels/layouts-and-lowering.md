@@ -86,7 +86,10 @@ attention configs both offer this core on sm_90.
    `WarpGrid` (`MmaAtom::issue`), issued whichever way round (`ir::Orient`) leaves the program
    the least relayout cost under the lowering's `Costs`: `Cᵀ = Bᵀ·Aᵀ` is the same instruction
    with its slots exchanged, so on a square atom an accumulator can be held as the next
-   product's operand at no cost. An author may pin the orientation (`Kernel::mma_oriented`).
+   product's operand at no cost. A product whose result is dealt (`TileOp::Deal`, a list's lane
+   queues) is issued the way round that spreads a row over the fewest lanes (`MmaAtom::narrow`),
+   where a deal renames registers, as the op layer prices it. An author may pin the orientation
+   (`Kernel::mma_oriented`).
 2. **Elementwise ops unify.** Operands and the result of `binary`, `cast`, `where_`, `mul_add`
    and the carried values of a loop share one layout.
 3. **Unconstrained tiles take a natural layout.** At a fixed point, a tile nothing constrains

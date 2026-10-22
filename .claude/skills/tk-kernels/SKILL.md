@@ -47,7 +47,8 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
 2. **`lower::lower`** (`lower/mod.rs`): grid check → `materialize_operands` (non-register `mma` operands become loads;
    on `Core::Group` shared operands stay in place) → `sync::insert_barriers` (fences from shared-memory effects) →
    `schedule::expand` (`Schedule::Uniform { fill, unroll, async_products }` or `PingPong { crew }`) → `layouts::infer`
-   (F2 `TileLayout` per register tile, priced relayouts) → `orient_shared` → `emit::emit` (`lower/emit/{mod,address,
+   (F2 `TileLayout` per register tile, priced relayouts; a product whose result is dealt issues the narrow way,
+   `MmaAtom::narrow`) → `orient_shared` → `emit::emit` (`lower/emit/{mod,address,
    copy,compute,nvptx,amdgpu}.rs`; vendor intrinsics only in the last two). `Lowering { device, schedule, grid,
    swizzle, core }`; `Lowering::uniform(device, unroll, grid)` for plain kernels; `layouts::Swizzle::{None,B32,B64,B128}`.
 3. **Target** (`atoms.rs`): matrix cores (`mma: Vec<MmaAtom>`, `group_mma`; `geometry()` the 16-bit atom the
@@ -112,8 +113,10 @@ Tests live in `tk/src/test/unit/<topic>.rs` (never in-place; `test_case` tables,
 `ranking problem admitted rejected`, the first 16 `ranked rank ns regs cfg`, on a store miss `compiled cfg verdict
 registers scratch`, then each stage's configs as Debug text (the store's lines hold indices only): `first cfg stored`,
 `admitted configs stored` (`stored=false`: nothing compiled, the untested shortlist), `choice timed=[(cfg, ns)…]`,
-`twins admitted compiled`, then `tuned op shape pick` / `attention tuned`; a replay adds `replayed lookup`. `RUST_LOG=svod_tk=debug` adds `tuner's first
-round`/`leaders`/`rounds`/`twins` and `probe pair timed`/`resolved`. Device tests install the subscriber (`traced()` inside `device_target()`); `tk_dump` installs its own.
+`twins admitted compiled`, then `tuned op shape pick` / `attention tuned`; a replay adds `replayed lookup`, a config
+that does not lower `does not lower` with the error. `RUST_LOG=svod_tk=debug` adds `tuner's first
+round`/`leaders`/`rounds`/`twins` and `probe pair timed`/`resolved`; `svod_tk::layouts=debug` adds `oriented` per
+lowered program (its free and dealt products, how many issue swapped, the cost). Device tests install the subscriber (`traced()` inside `device_target()`); `tk_dump` installs its own.
 
 **Dumps.** `TK_DUMP_LIST` (`lower/emit/mod.rs`) prints `[i] id=N "Op" dtype <- [src ids]`; the tuner lowers every
 candidate and `launch.rs` memoizes, so pin one config (`SVOD_TK_TUNE=0`, one test, or `tk_dump --cfg N|tuned`).
@@ -214,7 +217,7 @@ The `#[ignore]` probes print and never assert; one at a time on an idle GPU:
 | `nearest::rerank_probe` | `k_nearest_reranked`'s parts: the f16 search of `k`, the 8-bit and f16 searches of `k + MARGIN`, the exact pass, ms and Gpairs/s (`RR_ROWS`, `RR_CANDIDATES`, `RR_DEPTHS`, `RR_KS`, `RR_METRIC`, `RR_TUNE=0` pins) |
 | `nearest::recall_probe` | the reranked op's recall per search against the f64 top-k on `real_<d>.bin` embeddings (`RECALL_DIR`, `RECALL_QUERIES`, `RECALL_DEPTHS`) |
 | `nearest::list_time_probe` | list configs untuned, alternating runs (`LIST_CFGS` = `bq:bkv:stages:depth:width[:queue]`;…, `LIST_BK`, `LIST_SPLITS`, `LIST_KS`, `LIST_ROWS`, `LIST_CANDIDATES`, `LIST_DEPTH`, `LIST_RUNS`): the A/B of a list kernel change, split counts forced |
-| `nearest::list_ir_dump` | the LLVM IR of those configs into `LIST_IR` (`LIST_TARGET` sm_86/gfx1201), for `ptxas -v` register counts |
+| `nearest::list_ir_dump` | the LLVM IR of those configs into `LIST_IR` (`LIST_TARGET` sm_86/gfx1201/gfx1151, `LIST_INT8` over 8-bit rows, `LIST_STORE` a copied tune store whose probes orient the products as the card's own would), with each one's lines and lowering time, for `ptxas -v` register counts or `clang -S` |
 | `nearest::live::live_probe` | the op over rows bound to a variable against the op at the bound count (`LIVE_ROWS`, `LIVE_DEPTHS`, `LIVE_KS`): the concrete pick, the live op under that config and under its own pick, rows bound at twice the count run at it |
 | `nearest::tuning_probe` | cold tuning wall time, the pick, predicted vs measured per timed config (nearest at `TUNE_KS`, `TUNE_GEMMS`, `TUNE_ATTN`); run on a store of the probes' lines alone |
 
