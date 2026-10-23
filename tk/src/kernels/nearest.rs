@@ -18,11 +18,8 @@ use svod_dtype::ScalarDType;
 use super::attention::WARP_ROWS;
 use super::bound;
 use super::gemm::{mainloop, tile_order};
-use crate::atoms::Device;
 use crate::build::*;
 use crate::ir::*;
-use crate::layouts::WarpGrid;
-use crate::lower::Lowering;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NearestCfg {
@@ -189,8 +186,9 @@ impl NearestCfg {
         (self.bq / self.warp_rows) as u32
     }
 
-    pub fn lowering(&self, device: &Device) -> Lowering {
-        Lowering::uniform(device, self.unroll, WarpGrid { rows: self.warps(), cols: 1 })
+    /// The pipelines' ring.
+    pub fn ring(&self) -> Ring {
+        Ring { stages: self.stages, unroll: self.unroll, crews: 1 }
     }
 
     /// The lane queues a list takes ([`LaneQueue::PORTABLE`] unless set).
@@ -1015,7 +1013,7 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
     let carried = match (q_r, c_s) {
         (Some(q_r), Some(c_s)) => k.pipeline_vec(
             count,
-            stages,
+            cfg.ring(),
             init,
             |k, step, slot| {
                 let c_g = k.at(c_view, tile_start(step), 0);
@@ -1036,7 +1034,7 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
             let c_g = k.at(c_view, start.clone(), 0);
             let x_chunk = |k: &mut Kernel, _: Sc, col: Sc| k.at(x_view, 0, col);
             let chunks = d.div_ceil(depth);
-            let [dot] = mainloop(k, Shape::new(bq, depth), &x_chunk, [c_g], chunks, stages, depth, None, 1);
+            let [dot] = mainloop(k, Shape::new(bq, depth), &x_chunk, [c_g], chunks, cfg.ring(), depth, None, 1);
             let dot = T::widened(k, dot);
             folded(k, dot, start, carried)
         }),
@@ -1110,10 +1108,6 @@ impl fmt::Debug for SelectCfg {
 }
 
 impl SelectCfg {
-    pub fn lowering(&self, device: &Device) -> Lowering {
-        Lowering::uniform(device, false, WarpGrid { rows: self.warps, cols: 1 })
-    }
-
     /// The scores a lane reads a step on a target of `wave` lanes:
     /// [`SELECT_WIDE`] at most, half its queue, so a merge leaves room for
     /// several steps; one where a wave holds more than a row's [`LANES`].
@@ -1739,13 +1733,6 @@ const MERGE_ROWS: usize = 256;
 /// each — one pick the lattice does not search.
 pub(crate) const LIST_WARPS: u32 = 4;
 
-impl NearestMergeSpec {
-    pub fn lowering(&self, device: &Device) -> Lowering {
-        let rows = if self.k > 1 { LIST_WARPS } else { 1 };
-        Lowering::uniform(device, false, WarpGrid { rows, cols: 1 })
-    }
-}
-
 /// Parameters in order: `score_part` f32 and `index_part` i32, `splits`
 /// shares [`share_stride`] apart as a split [`nearest`] leaves them, then
 /// `score [n]` f32 and `index [n]` i32: each row's least over the shares, in
@@ -1906,12 +1893,6 @@ pub struct RescoreSpec {
     pub floors: Floors,
     /// The rows a launch binds, where they vary (`n` their bound).
     pub live: Live,
-}
-
-impl RescoreSpec {
-    pub fn lowering(&self, device: &Device) -> Lowering {
-        Lowering::uniform(device, false, WarpGrid { rows: RESCORE_WARPS, cols: 1 })
-    }
 }
 
 /// Every candidate `index [n, cols]` (i32, −1 for none) of the rows of `x

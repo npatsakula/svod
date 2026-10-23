@@ -104,7 +104,7 @@ impl Case {
                 // Filtered, its bound read at the live length.
                 let select = SelectCfg { filter: true, ..select };
                 let cfg = NearestCfg { select: Some(select), ..cfg };
-                let (scored, listing) = (cfg.lowering(device), select.lowering(device));
+                let (scored, listing) = (Lowering::new(device), Lowering::new(device));
                 let (mut score, mut index) = (vec![], vec![]);
                 for r0 in (0..self.n).step_by(panel) {
                     let rows = panel.min(self.n - r0);
@@ -154,7 +154,7 @@ impl Case {
                             let merge =
                                 NearestMergeSpec { n: rows, splits: shares, metric, k: kmax, live: live.clone() };
                             let params = [lists, vec![vec![0.0; rows * kmax]; 2]].concat();
-                            let mut out = exec(nearest_merge(&merge), &merge.lowering(device), params, &vars);
+                            let mut out = exec(nearest_merge(&merge), &Lowering::new(device), params, &vars);
                             lists = out.split_off(out.len() - 2);
                         }
                     }
@@ -166,14 +166,14 @@ impl Case {
             None => {
                 let spec = NearestSpec { live: live.clone(), ..self.spec(depth, cfg, kmax) };
                 let params = self.params(depth, cfg.splits, kmax);
-                let mut out = exec(self.compiled(&spec), &cfg.lowering(device), params, &vars);
+                let mut out = exec(self.compiled(&spec), &Lowering::new(device), params, &vars);
                 let (index, score) = (out.pop().unwrap(), out.pop().unwrap());
                 if cfg.splits == 1 {
                     (score, index)
                 } else {
                     let merge = NearestMergeSpec { live: live.clone(), ..self.merge(cfg.splits, kmax) };
                     let params = vec![score, index, vec![0.0; self.n * kmax], vec![0.0; self.n * kmax]];
-                    let mut out = exec(nearest_merge(&merge), &merge.lowering(device), params, &vars);
+                    let mut out = exec(nearest_merge(&merge), &Lowering::new(device), params, &vars);
                     let index = out.pop().unwrap();
                     (out.pop().unwrap(), index)
                 }

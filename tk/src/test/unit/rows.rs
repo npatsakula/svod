@@ -7,7 +7,7 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::{assert_rel_close, declared};
-use crate::atoms::{Core, Target, sm86};
+use crate::atoms::{Core, sm86};
 use crate::build::BF16;
 use crate::interp::{round_to, run};
 use crate::ir::*;
@@ -15,7 +15,7 @@ use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch_all;
-use crate::layouts::{Laid, WarpGrid, infer};
+use crate::layouts::{Laid, infer};
 use crate::lower::Lowering;
 
 fn gemm_nt_epilogue(
@@ -139,8 +139,7 @@ fn epilogue_interpreter_matches_the_reference(which: usize) {
 fn bias_vector_takes_the_accumulators_column_layout() {
     let epi = Epilogue { bias: true, ..Epilogue::default() };
     let prog = gemm_nt_epilogue(128, 128, 64, [128, 128, 32], 2, [2, 4], epi);
-    let Laid { prog, layouts: lay } =
-        infer(prog, &declared(sm86()), WarpGrid { rows: 2, cols: 4 }, Core::Warp).unwrap();
+    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), Core::Warp).unwrap();
     let add = prog
         .walk()
         .find_map(|(_, s)| match s {
@@ -273,7 +272,7 @@ fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: u
     let params = norm_inputs(norm, rows, d, residual, bias, 5);
     let (want, want_sum) = norm_reference(norm, rows, d, eps, residual, bias, &params);
     let interp = run(&prog, params.clone(), &[]).unwrap();
-    let got = on_device(prog, &row_lowering(target, br), &params);
+    let got = on_device(prog, &Lowering::new(&declared(target)), &params);
     let (o, s) = norm_outputs(norm, residual, bias);
     let d_interp = assert_rel_close("out vs interpreter", &got[o], &interp[o], 1e-2);
     let d_ref = assert_rel_close("out vs reference", &got[o], &want, 1e-2);
@@ -289,15 +288,11 @@ fn norms_match_on_device(norm: Norm, d: usize, residual: bool, bias: bool, br: u
 fn a_lane_norms_one_row_whatever_the_block() {
     let shuffles = |br: usize| {
         let prog = norm_rows(Norm::Rms, 8192, 1024, br, 1e-5, false, false);
-        super::targets::render(prog, &row_lowering(sm86(), br)).matches("shfl").count()
+        super::targets::render(prog, &Lowering::new(&declared(sm86()))).matches("shfl").count()
     };
     let four = shuffles(4);
     assert!(four > 0);
     assert_eq!([shuffles(8), shuffles(16)], [four, four]);
-}
-
-fn row_lowering(target: Target, br: usize) -> Lowering {
-    NormCfg { br }.lowering(&declared(target))
 }
 
 /// Fastest GPU time of `plan`'s kernels after a warm-up long enough for the
@@ -342,7 +337,8 @@ fn norm_bandwidth_probe() {
         for br in [4, 8, 16] {
             let prog = norm_rows(norm, rows, d, br, eps, residual, bias);
             let (o, _) = norm_outputs(norm, residual, bias);
-            let plan = graph_launch_all(prog, &row_lowering(target.clone(), br), &refs).unwrap()[o].prepare().unwrap();
+            let plan =
+                graph_launch_all(prog, &Lowering::new(&declared(target.clone())), &refs).unwrap()[o].prepare().unwrap();
             let secs = gpu_seconds(&plan);
             eprintln!("{norm:?} residual={residual} br={br}: {:.1} us, {:.0} GB/s", secs * 1e6, gbs(bytes, secs));
         }

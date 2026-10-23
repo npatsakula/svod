@@ -46,8 +46,6 @@ const TRIES: usize = 3;
 const AGREE: f64 = 0.1;
 /// Measurement: warps of a throughput probe's block.
 const WARPS: u32 = 4;
-/// Measurement: a throughput probe's warp grid: [`WARPS`] rows of warps.
-const ROWS: WarpGrid = WarpGrid { rows: WARPS, cols: 1 };
 
 /// One measurement: `candidates` are `[baseline, probe]`, the probe doing
 /// `units` more of the primitive.
@@ -517,8 +515,8 @@ impl<'a> Probes<'a> {
         Ok(Self { target, sms, blocks, warps: o.simds })
     }
 
-    fn lowering(&self, grid: WarpGrid, unroll: bool) -> Lowering {
-        Lowering::uniform(&Device { target: self.target.clone(), costs: Costs::default() }, unroll, grid)
+    fn lowering(&self) -> Lowering {
+        Lowering::new(&Device { target: self.target.clone(), costs: Costs::default() })
     }
 
     /// A relayout-class probe's lowering: a block per SM of a warp per SIMD,
@@ -526,7 +524,7 @@ impl<'a> Probes<'a> {
     /// a barrier spans waves, as in a kernel's block), as a relayout between
     /// two products does; its value is that wait per unit of one wave.
     fn chain(&self, costs: Costs) -> Lowering {
-        let mut lowering = self.lowering(WarpGrid { rows: self.warps, cols: 1 }, false);
+        let mut lowering = self.lowering();
         lowering.device.costs = costs;
         lowering
     }
@@ -557,7 +555,7 @@ impl<'a> Probes<'a> {
     fn smem_byte(&self) -> Probe {
         let (op, tile, iters) = ("probe:smem_byte", Shape::new(32, 128), 1024);
         let units = (self.blocks * iters * tile.elems() * 4) as f64;
-        self.make(op, ScalarDType::Float32, units, true, self.lowering(ROWS, false), |on| {
+        self.make(op, ScalarDType::Float32, units, true, self.lowering(), |on| {
             let mut k = kernel(op, self.blocks, WARPS);
             let x = input::<F32>(&mut k, tile);
             let ring = on.then(|| {
@@ -593,7 +591,7 @@ impl<'a> Probes<'a> {
     fn global_byte(&self) -> Probe {
         let (op, tile) = ("probe:global_byte", Shape::new(32, 128));
         let (blocks, iters) = self.stream_grid(tile.elems() * 4);
-        self.make(op, ScalarDType::Int32, STREAM as f64, true, self.lowering(ROWS, false), |on| {
+        self.make(op, ScalarDType::Int32, STREAM as f64, true, self.lowering(), |on| {
             let mut k = kernel(op, blocks, WARPS);
             let src = k.param::<I32>("src", ParamKind::In, STREAM / 4);
             let block = k.block(0);
@@ -625,7 +623,7 @@ impl<'a> Probes<'a> {
         let iters = 4 * STREAM / (tile.elems() * 4) / blocks;
         let region = region_tiles(footprint);
         let units = (blocks * iters * tile.elems() * 4) as f64;
-        self.make(op, ScalarDType::Int32, units, true, self.lowering(ROWS, false), |on| {
+        self.make(op, ScalarDType::Int32, units, true, self.lowering(), |on| {
             let mut k = kernel(op, blocks, WARPS);
             let src = k.param::<I32>("src", ParamKind::In, region * tile.elems());
             let block = k.block(0);
@@ -677,15 +675,15 @@ impl<'a> Probes<'a> {
     /// 16×16×16 matrix-core steps on register operands into four
     /// independent accumulators per warp.
     fn step(&self) -> Probe {
-        let lowering = self.lowering(WarpGrid { rows: 2, cols: 2 }, false);
-        self.steps::<BF16>("probe:step", [64, 64, 16], self.blocks, WARPS, lowering, true)
+        let grid = WarpGrid { rows: 2, cols: 2 };
+        self.steps::<BF16>("probe:step", [64, 64, 16], self.blocks, grid, self.lowering(), true)
     }
 
     /// [`Self::step`] over 8-bit integers into i32, two NVIDIA or CDNA atoms
     /// deep; no candidates where the target has no such core.
     fn step_i8(&self) -> Probe {
-        let lowering = self.lowering(WarpGrid { rows: 2, cols: 2 }, false);
-        let mut probe = self.steps::<I8>("probe:step_i8", [64, 64, 64], self.blocks, WARPS, lowering, true);
+        let grid = WarpGrid { rows: 2, cols: 2 };
+        let mut probe = self.steps::<I8>("probe:step_i8", [64, 64, 64], self.blocks, grid, self.lowering(), true);
         if self.target.geometry_of(ScalarDType::Int8).is_none() {
             probe.candidates.clear();
         }
@@ -711,7 +709,7 @@ impl<'a> Probes<'a> {
         let (op, [bm, bn, bk]) = ("probe:step_group", [64usize, 256, 64]);
         let iters = 1024;
         let units = (self.blocks * iters * bm * bn * bk / 4096) as f64;
-        let mut lowering = self.lowering(ROWS, false);
+        let mut lowering = self.lowering();
         lowering.core = Core::Group;
         let mut probe = self.make(op, ScalarDType::BFloat16, units, true, lowering, |on| {
             let mut k = kernel(op, self.blocks, WARPS);
@@ -741,7 +739,14 @@ impl<'a> Probes<'a> {
     fn step_lone(&self) -> Probe {
         let warps = self.warps;
         let tile = [32 * warps as usize, 32, 16];
-        self.steps::<BF16>("probe:step_lone", tile, self.sms as usize, warps, self.chain(Costs::default()), false)
+        self.steps::<BF16>(
+            "probe:step_lone",
+            tile,
+            self.sms as usize,
+            warps.into(),
+            self.chain(Costs::default()),
+            false,
+        )
     }
 
     /// `blocks` of `warps` each accumulating a `bm × bn` product over `bk`
@@ -752,15 +757,15 @@ impl<'a> Probes<'a> {
         op: &'static str,
         [bm, bn, bk]: [usize; 3],
         blocks: usize,
-        warps: u32,
+        grid: WarpGrid,
         lowering: Lowering,
         per_sm: bool,
     ) -> Probe {
         let iters = 1024;
         let steps = iters * bm * bn * bk / 4096;
-        let units = if per_sm { blocks * steps } else { steps / warps as usize } as f64;
+        let units = if per_sm { blocks * steps } else { steps / grid.count() as usize } as f64;
         self.make(op, T::DTYPE, units, per_sm, lowering, |on| {
-            let mut k = kernel(op, blocks, warps);
+            let mut k = kernel(op, blocks, grid);
             let a = input::<T>(&mut k, Shape::new(bm, bk));
             let b = input::<T>(&mut k, Shape::new(bn, bk));
             let zero = k.zeros::<T::Acc>(Shape::new(bm, bn));
@@ -779,7 +784,7 @@ impl<'a> Probes<'a> {
     fn score(&self) -> Probe {
         let (op, tile, iters) = ("probe:score", Shape::new(64, 128), 256);
         let units = (self.blocks * iters * tile.elems()) as f64;
-        self.make(op, ScalarDType::Float32, units, true, self.lowering(ROWS, false), |on| {
+        self.make(op, ScalarDType::Float32, units, true, self.lowering(), |on| {
             let mut k = kernel(op, self.blocks, WARPS);
             let x = input::<F32>(&mut k, tile);
             let zero = k.zeros::<F32>(Shape::new(tile.rows, 1));
@@ -859,7 +864,7 @@ impl<'a> Probes<'a> {
         let units = (blocks * TRIPS) as f64;
         let chunks = chunked(tile, 4, WARPS, self.target.wave, Axis::Col).expect("a chunk layout");
         let sms = self.sms as usize;
-        let probe = self.make(op, ScalarDType::Int32, units, true, self.lowering(ROWS, unroll), |on| {
+        let probe = self.make(op, ScalarDType::Int32, units, true, self.lowering(), |on| {
             // Every trip probe runs these programs, named alike.
             let mut k = kernel("probe:trip", blocks, WARPS);
             let src = k.param::<I32>("src", ParamKind::In, sms * region * tile.elems());
@@ -875,7 +880,7 @@ impl<'a> Probes<'a> {
                 k.view(src, (first.clone() + at) * tile.elems(), [32, 1], tile, [None, None])
             };
             let sum = if on {
-                ring_sum(&mut k, TRIPS, stages, zero, chunk)
+                ring_sum(&mut k, TRIPS, Ring { stages, unroll, crews: 1 }, zero, chunk)
             } else {
                 // The ring's slots, written once and fenced before the loop; a
                 // trip reads the slot `order` names, as the ring's consume
@@ -1001,7 +1006,7 @@ impl<'a> Probes<'a> {
         let waves = self.sms as usize;
         let trips = LATENCY_TRIPS.min(STREAM / 4 / tile.elems() / waves);
         let stages = self.target.fill.stages(stages);
-        let lowering = self.lowering(WarpGrid { rows: 1, cols: 1 }, false);
+        let lowering = self.lowering();
         self.make(op, ScalarDType::Int32, (trips - stages) as f64, false, lowering, |on| {
             let mut k = kernel(op, waves, 1);
             let src = k.param::<I32>("src", ParamKind::In, STREAM / 4);
@@ -1016,7 +1021,7 @@ impl<'a> Probes<'a> {
     }
 }
 
-fn kernel(op: &str, blocks: usize, warps: u32) -> Kernel {
+fn kernel(op: &str, blocks: usize, warps: impl Into<WarpGrid>) -> Kernel {
     let mut k = Kernel::new(op.replace(':', "_"));
     k.grid([Sc::from(blocks), Sc::from(1), Sc::from(1)]);
     k.warps(warps);
@@ -1043,23 +1048,23 @@ fn sum_loads<T: Elem>(
 fn ring_sum(
     k: &mut Kernel,
     trips: usize,
-    stages: usize,
+    ring: impl Into<Ring>,
     init: Regs<I32>,
     view: impl FnOnce(&mut Kernel, Sc) -> Gmem<I32>,
 ) -> Regs<I32> {
-    let tile = k.shape(init);
-    let ring = k.smem::<I32>("ring", stages * tile.elems());
+    let (tile, ring) = (k.shape(init), ring.into());
+    let slots = k.smem::<I32>("ring", ring.stages * tile.elems());
     let [sum] = k.pipeline(
         trips,
-        stages,
+        ring,
         [init],
         |k, step, slot| {
             let v = view(k, step);
-            let s = k.smem_slot::<I32>(ring, slot, tile);
+            let s = k.smem_slot::<I32>(slots, slot, tile);
             k.stage(s, v, CopyMode::Async);
         },
         |k, _, slot, [sum]| {
-            let s = k.smem_slot::<I32>(ring, slot, tile);
+            let s = k.smem_slot::<I32>(slots, slot, tile);
             let y = k.load(s);
             [k.binary(sum, y, BinaryOp::Add)]
         },

@@ -27,7 +27,6 @@ use crate::launch::graph_launch_all;
 use crate::lower::sync::insert_barriers;
 use crate::lower::{Lowering, lower};
 use crate::ops::config::{self, NearestProblem, Planner};
-use crate::schedule::Schedule;
 
 use super::{conv_first_eight, declared, first_eight, planner};
 use crate::sweep::device;
@@ -86,7 +85,7 @@ fn a_grid_takes_every_warp_or_whole_grids_run_alone(
     key_warps: bool,
 ) -> crate::lower::Result<()> {
     let device = super::declared(crate::atoms::sm86());
-    let lowering = Lowering::uniform(&device, false, crate::layouts::WarpGrid { rows: grid[0], cols: grid[1] });
+    let lowering = Lowering::new(&device);
     let batch = Batch::Static(1);
     let prog = if key_warps {
         let cfg = crate::kernels::attention::FaCfg {
@@ -109,6 +108,7 @@ fn a_grid_takes_every_warp_or_whole_grids_run_alone(
     } else {
         combine::<F16>(&CombineSpec { batch, t: 1, heads: 4, d: 64, splits: 2, cfg: NormCfg { br: warps as usize } })
     };
+    let prog = Program { warp_grid: crate::layouts::WarpGrid { rows: grid[0], cols: grid[1] }, ..prog };
     lowered(prog, &lowering).map(drop)
 }
 
@@ -350,8 +350,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
             check(ir.contains("wgmma.mma_async.sync.aligned.m64n"), "no warpgroup product");
             check(!ir.contains("@llvm.nvvm.mma.") && !ir.contains("ldmatrix"), "a warp-level product");
             check(ir.contains("wgmma.fence") && ir.contains("fence.proxy.async"), "an unfenced chain");
-            let in_flight =
-                lowering.schedule == Schedule::Uniform { fill: Fill::CpAsync, unroll: false, async_products: true };
+            let in_flight = prog.walk().any(|(_, s)| matches!(s, crate::ir::Stmt::Pipeline(p) if p.stages >= 3));
             check(ir.contains("@llvm.nvvm.wgmma.wait_group") == in_flight, "the template's wait");
             check(ir.contains("wgmma.wait_group.sync.aligned 0;") == !in_flight, "the chain's own wait");
         }
@@ -516,7 +515,6 @@ fn the_block_index_is_renumbered_only_over_several_dies() {
 fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
     use crate::build::{I32, Kernel, Sc};
     use crate::ir::{Const, Shape};
-    use crate::layouts::WarpGrid;
     let GpuArch::Amd(arch) = target.arch else { unreachable!() };
     let mut k = Kernel::new("nested_if");
     k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
@@ -532,7 +530,7 @@ fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
     k.if_(inner, |k| k.store(dst, twos), |_| {});
     let prog = k.finish();
     let device = crate::atoms::Device { target: target.clone(), costs: crate::atoms::Costs::default() };
-    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: 2, cols: 1 });
+    let lowering = Lowering::new(&device);
     let ir = render(prog, &lowering);
     match svod_runtime::amd::compile_ir_to_amd_object(&ir, arch) {
         Ok(object) => assert_eq!(&object[..4], b"\x7fELF"),
@@ -746,7 +744,7 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
         for cfg in first_eight(&planner.nearest_ranked(p)) {
             let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Default::default() };
             let name = format!("nearest d{d} {metric:?} {floors:?} {groups} k{k} {cfg:?}");
-            let launch = (name, nearest::<BF16>(&spec), cfg.lowering(&planner.device));
+            let launch = (name, nearest::<BF16>(&spec), Lowering::new(&planner.device));
             launches.push((launch, (cfg.smem_bytes(d, dtype), 0)));
         }
     }
@@ -875,13 +873,7 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
     let sum = k.reduce_f32(held, Axis::Row, ReduceOp::Sum);
     let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
     k.store(yv, sum);
-    let lowering = Lowering {
-        core: Core::Warp,
-        schedule: crate::schedule::Schedule::Uniform { fill: target.fill, unroll: false, async_products: false },
-        device: declared(target),
-        grid: crate::layouts::WarpGrid { rows: 1, cols: 1 },
-    };
-    let ir = render(k.finish(), &lowering);
+    let ir = render(k.finish(), &Lowering::new(&declared(target)));
     assert_eq!(ir.contains("@llvm.amdgcn.fdot2.f32.bf16("), dot2, "{ir}");
     // A lane's odd member out is widened on every target.
     assert!(dot2 || ir.contains("fpext bfloat"), "{ir}");
@@ -1032,7 +1024,7 @@ fn two_atom_rows_per_warp_lower(target: Target) {
 /// instead where the maximum is positive, the sums taken under
 /// [`Kernel::where_any`](crate::build::Kernel::where_any) (rows 1 and 3 of
 /// [`voted_input`] pass, so warps 0 and 2 skip them).
-fn voted_rows() -> (Program, crate::layouts::WarpGrid) {
+fn voted_rows() -> Program {
     use crate::build::{CmpOp, F32, Kernel};
     use crate::ir::{ReduceOp, Shape};
     let (rows, d) = (4, 256);
@@ -1048,7 +1040,7 @@ fn voted_rows() -> (Program, crate::layouts::WarpGrid) {
     let [out] = k.where_any(positive, |k| [k.reduce(xs, Axis::Row, ReduceOp::Sum)], [most]);
     let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
     k.store(yv, out);
-    (k.finish(), crate::layouts::WarpGrid { rows: rows as u32, cols: 1 })
+    k.finish()
 }
 
 /// Small integers, every one of rows 0 and 2 negative, so their sums and
@@ -1074,7 +1066,7 @@ fn voted_want() -> Vec<f64> {
 /// sums are found for every row and kept where the rows pass.
 #[test]
 fn a_branch_on_a_vote_keeps_the_otherwise_where_the_tile_is_clear() {
-    let (prog, _) = voted_rows();
+    let prog = voted_rows();
     let out = interp::run(&prog, vec![voted_input(), vec![0.0; 4]], &[]).unwrap();
     assert_eq!(out[1], voted_want());
 }
@@ -1087,9 +1079,9 @@ fn a_branch_on_a_vote_keeps_the_otherwise_where_the_tile_is_clear() {
 #[test_case(crate::atoms::sm86(), "call i1 @llvm.nvvm.vote.any.sync(i32 -1, i1"; "sm_86")]
 #[test_case(hopper(), "call i1 @llvm.nvvm.vote.any.sync(i32 -1, i1"; "sm_90")]
 fn a_branch_on_a_vote_lowers_to_the_warps_vote(target: Target, vote: &str) {
-    let (prog, grid) = voted_rows();
+    let prog = voted_rows();
     let device = declared(target.clone());
-    let ir = render(prog, &Lowering::uniform(&device, false, grid));
+    let ir = render(prog, &Lowering::new(&device));
     let (pin, at) = (ir.find(r#"asm sideeffect "", "~{memory}"()"#), ir.find(vote));
     assert!(pin.zip(at).is_some_and(|(p, v)| p < v), "a pinned vote:\n{ir}");
     assert_eq!(ir.matches(vote).count(), 1, "one vote:\n{ir}");
@@ -1109,9 +1101,9 @@ fn a_branch_on_a_vote_lowers_to_the_warps_vote(target: Target, vote: &str) {
 #[test]
 fn a_branch_on_a_vote_matches_the_interpreter_on_the_device() {
     let Some(target) = super::device_target() else { return };
-    let (prog, grid) = voted_rows();
+    let prog = voted_rows();
     let device = declared(target);
-    let got = on_device(prog, &Lowering::uniform(&device, false, grid), &[voted_input(), vec![0.0; 4]]);
+    let got = on_device(prog, &Lowering::new(&device), &[voted_input(), vec![0.0; 4]]);
     assert_eq!(got[1].as_deref(), Some(&voted_want()[..]));
 }
 
@@ -1157,7 +1149,7 @@ fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
         cfg,
         live: Default::default(),
     };
-    let ir = render(nearest::<BF16>(&spec), &cfg.lowering(&device));
+    let ir = render(nearest::<BF16>(&spec), &Lowering::new(&device));
     let asm = match svod_runtime::amd::compile_ir_to_amd_asm(&ir, arch) {
         Ok(asm) => String::from_utf8(asm).unwrap(),
         Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {

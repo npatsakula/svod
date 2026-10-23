@@ -22,6 +22,7 @@ use crate::kernels::attention::{
 };
 use crate::kernels::rows::NormCfg;
 use crate::launch;
+use crate::lower::Lowering;
 use crate::tune::TuneStore;
 
 /// Which keys each batch row attends to.
@@ -269,7 +270,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let merge = merge(batch, t, heads, d, cfg.splits);
     let o = output(&q_ext.dims, &var, q.dtype()).context(GraphSnafu { op: OP })?;
     let ins = [&parts[3], &parts[4], &parts[5], &o];
-    launch::graph_launch(typed!(q.dtype(), combine, &merge), &merge.cfg.lowering(&planner.device), &ins)
+    launch::graph_launch(typed!(q.dtype(), combine, &merge), &Lowering::new(&planner.device), &ins)
         .context(LaunchSnafu { op: OP })
 }
 
@@ -341,7 +342,7 @@ pub fn tuned(
             .collect::<Vec<_>>();
         if cfg.splits > 1 {
             let merge = merge(spec.batch.clone(), t, heads, d, cfg.splits);
-            programs.push((typed!(dtype, combine, &merge), merge.cfg.lowering(&planner.device)));
+            programs.push((typed!(dtype, combine, &merge), Lowering::new(&planner.device)));
         }
         programs
     };

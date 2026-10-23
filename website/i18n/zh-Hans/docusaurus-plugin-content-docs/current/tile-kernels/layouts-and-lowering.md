@@ -4,7 +4,7 @@ sidebar_label: 布局与降级
 
 # 布局与降级 {#layouts-and-lowering}
 
-`lower::lower(program, &lowering, params, device)` 把 tile 程序变成一个指令列表已排好顺序的 Svod 程序。`Lowering` 包含所有作者没有决定的东西：`Device`（目标及其代价）、`Schedule`、块 tile 上的 `WarpGrid`，以及乘积在哪种矩阵指令上发出（`core`）；共享内存行总是做 XOR swizzle。每种内核配置都会构造自己的降级参数（`GemmCfg::lowering`、`FaCfg::lowering`、`NormCfg::lowering`）。`lower::standalone(program, &lowering)` 针对未连接设备的目标进行降级，`lower::render` 返回将交给后端编译器的 LLVM 文本。
+`lower::lower(program, &lowering, params, device)` 把 tile 程序变成一个指令列表已排好顺序的 Svod 程序。`Lowering` 包含程序本身没有说明的东西：`Device`（目标及其代价），以及乘积在哪种矩阵指令上发出（`core`）：warp 级核心用 `Lowering::new(&device)`，`GemmCfg::lowering` 和 `FaCfg::lowering` 用其配置的核心。块 tile 上的 `WarpGrid`（`Kernel::warps`）和每个环的调度（`pipeline` 的 `Ring`）属于程序本身；共享内存行总是做 XOR swizzle。`lower::standalone(program, &lowering)` 针对未连接设备的目标进行降级，`lower::render` 返回将交给后端编译器的 LLVM 文本。
 
 | 步骤 | 模块 | 作用 |
 |---|---|---|
@@ -61,16 +61,16 @@ pub fn mma_sync_c() -> Layout {
 
 ## 调度模板 {#schedule-templates}
 
-`schedule::Schedule::Uniform { fill, unroll, async_products }`：每个 warp 都负责加载和计算。`Schedule::PingPong { crew }`：两个各含 `crew` 个 warp 的工作组共用一个寄存器暂存槽（CDNA GEMM，`GemmCfg::crews == 2`）。
+`schedule::expand` 按每个 `Pipeline` 的 `Ring { stages, unroll, crews }` 和目标的 `Fill` 展开它。一个工作组：每个 warp 都负责加载和计算。两个工作组：块内的 warp 分成两个相隔一个簇的工作组，共用一个寄存器暂存槽（CDNA GEMM，`GemmCfg::crews == 2`）。
 
-| 填充方式 | `pipeline(extent, stages, …)` 的展开方式 |
+| 填充方式 | `pipeline(extent, ring, …)` 的展开方式 |
 |---|---|
 | `Fill::CpAsync`，`stages ≥ 2` | 一个 `extent + stages − 1` 次迭代的循环。每次迭代等待直到至多 `stages − 2` 个拷贝组未完成，然后执行屏障并消费第 `i − (stages − 1)` 步。接着把第 `i` 步的 `cp.async` 拷贝发往上一次迭代释放的槽，并把它们作为一组提交（超出末尾时提交空组，使组数保持一致）。 |
-| `Fill::CpAsync`，`stages ≥ 3`，`async_products` | 与上相同，但消费阶段的 `wgmma` 链在下一次填充期间保持在途：被重新填充的是两次行程之前消费过的槽，每次消费之后，每个线程等待除最新一条之外的所有链完成（`Sync::WaitProducts`）。 |
+| `Fill::CpAsync`，`stages ≥ 3`，warpgroup 核心，消费阶段的乘积只供给后续乘积 | 与上相同，但消费阶段的 `wgmma` 链在下一次填充期间保持在途：被重新填充的是两次行程之前消费过的槽，每次消费之后，每个线程等待除最新一条之外的所有链完成（`Sync::WaitProducts`）。 |
 | `Fill::CpAsync`，`stages = 1` | 拷贝、等待、消费，并在重新填充该槽之前插入一次屏障。 |
 | `Fill::Staged`，2 级 | 在同一个归纳变量上的三个循环：第一次行程把第 0 步加载到寄存器并存入其槽；稳态行程把第 `i` 步加载到寄存器，同步，消费第 `i − 1` 步，同步，再把寄存器存入第 `i` 步的槽，其循环体中没有分支（在 RDNA 上这两道同步把加载留在乘积之前、把提交留在乘积之后）；最后一次行程只做消费。 |
 | `Fill::Staged`，1 级 | 同样的三个循环，只用一个槽：存储在屏障之后等待所有 warp 用完该槽，然后再插入一次屏障，因此同样的共享内存可容纳深一倍的 tile。 |
-| `PingPong` | 一次行程在其乘积处被切成加载簇和乘积簇，每簇之后一个块屏障，于是一个工作组以提高的发射优先级从寄存器计算乘积时，另一个工作组在加载。 |
+| 两个工作组 | 一次行程在其乘积处被切成加载簇和乘积簇，每簇之后一个块屏障，于是一个工作组以提高的发射优先级从寄存器计算乘积时，另一个工作组在加载。 |
 
 `unroll` 为每个环形槽复制一份循环体，使槽地址运算折叠为常量；调优器对两种情况都做测量。异步拷贝和暂存拷贝归模板管理，由模板负责同步。`lower::sync` pass 处理其余情况：由同步拷贝写入的共享 tile 在被其他线程读取之前加屏障，自上次屏障以来被读过的 tile 在被覆盖之前加屏障。
 

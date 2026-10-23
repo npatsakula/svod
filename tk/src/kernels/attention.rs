@@ -8,7 +8,6 @@ use super::{Batch, batch_offset, bound, load_f32};
 use crate::atoms::{Core, Device, Target};
 use crate::build::*;
 use crate::ir::*;
-use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -159,8 +158,7 @@ impl FaCfg {
     }
 
     pub fn lowering(&self, device: &Device) -> Lowering {
-        let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
-        Lowering { core: self.core, ..Lowering::uniform(device, self.unroll, grid) }
+        Lowering { core: self.core, ..Lowering::new(device) }
     }
 
     /// Whether the config holds `appended` rows: they ride one key block,
@@ -484,7 +482,8 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     if let Err(e) = cfg.shares_keys() {
         panic!("{e}");
     }
-    k.warps(cfg.warps());
+    k.warps(cfg.row_warps());
+    k.lone_warps(cfg.warps());
     let k_s = k.smem::<T>("k_s", kw * stages * bkv * d);
     let v_s = k.smem::<T>("v_s", kw * stages * bkv * d);
     // The bias streams through a ring of its own beside K and V, unless the
@@ -736,7 +735,7 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
         };
         let [m, l, acc] = k.pipeline(
             w_blocks,
-            stages,
+            Ring { stages, unroll: cfg.unroll, crews: 1 },
             [m0, l0, o0],
             |k, step, slot| {
                 let (kv_off, slot) = ((w_first.clone() + step) * bkv, slot0.clone() + slot);

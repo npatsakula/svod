@@ -9,6 +9,7 @@ use std::rc::Rc;
 use svod_dtype::ScalarDType;
 
 use crate::ir::*;
+pub use crate::layouts::WarpGrid;
 
 pub trait Elem: Copy {
     const DTYPE: ScalarDType;
@@ -182,6 +183,22 @@ impl From<CmpOp> for BinaryOp {
     }
 }
 
+/// How a [`Kernel::pipeline`] runs its ring: `stages` slots, the loop
+/// copied once per slot or not, over one crew or two ([`Pipeline`]); a
+/// count of slots is a rolled ring of one crew.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ring {
+    pub stages: usize,
+    pub unroll: bool,
+    pub crews: u32,
+}
+
+impl From<usize> for Ring {
+    fn from(stages: usize) -> Self {
+        Self { stages, unroll: false, crews: 1 }
+    }
+}
+
 pub struct Kernel {
     prog: Program,
     blocks: Vec<Block>,
@@ -198,6 +215,7 @@ impl Kernel {
                 vars: vec![],
                 grid: [ScalarId(0); 3],
                 warps: 4,
+                warp_grid: WarpGrid { rows: 4, cols: 1 },
                 smem: vec![],
                 scalars: vec![],
                 values: vec![],
@@ -234,7 +252,18 @@ impl Kernel {
         self.prog.grid = dims.map(|s| self.intern(s));
     }
 
-    pub fn warps(&mut self, warps: u32) {
+    /// The block's warps and how a register tile spreads over them; a count
+    /// is a grid of one column.
+    pub fn warps(&mut self, grid: impl Into<WarpGrid>) {
+        let grid = grid.into();
+        self.prog.warp_grid = grid;
+        self.prog.warps = grid.count();
+    }
+
+    /// `warps` warps a block, whole copies of the grid: the ones past it run
+    /// only inside [`Self::each_warp`].
+    pub fn lone_warps(&mut self, warps: u32) {
+        assert!(warps.is_multiple_of(self.prog.warp_grid.count()), "whole copies of the warp grid");
         self.prog.warps = warps;
     }
 
@@ -693,25 +722,27 @@ impl Kernel {
     pub fn pipeline<T: Elem, const N: usize>(
         &mut self,
         extent: impl Into<Sc>,
-        stages: usize,
+        ring: impl Into<Ring>,
         init: [Regs<T>; N],
         produce: impl FnOnce(&mut Self, Sc, Sc),
         consume: impl FnOnce(&mut Self, Sc, Sc, [Regs<T>; N]) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
         let consume = |k: &mut Self, step, slot, phi: Vec<Regs<T>>| consume(k, step, slot, tiles(phi)).to_vec();
-        tiles(self.pipeline_vec(extent, stages, init.to_vec(), produce, consume))
+        tiles(self.pipeline_vec(extent, ring, init.to_vec(), produce, consume))
     }
 
     /// [`Self::pipeline`] over as many tiles as `init` holds.
     pub fn pipeline_vec<T: Elem>(
         &mut self,
         extent: impl Into<Sc>,
-        stages: usize,
+        ring: impl Into<Ring>,
         init: Vec<Regs<T>>,
         produce: impl FnOnce(&mut Self, Sc, Sc),
         consume: impl FnOnce(&mut Self, Sc, Sc, Vec<Regs<T>>) -> Vec<Regs<T>>,
     ) -> Vec<Regs<T>> {
+        let Ring { stages, unroll, crews } = ring.into();
         assert!(stages >= 1, "at least one stage");
+        assert!(crews == 1 || (crews == 2 && stages == 1), "two crews run over one slot");
         let extent = self.intern(extent);
         let [pstep, pslot, cstep, cslot] = [(); 4].map(|()| self.push_scalar(Scalar::Induction));
         let phi = self.carried(&init);
@@ -724,7 +755,7 @@ impl Kernel {
         self.snapshot_carried(&mut body, &phi, &mut next);
         let consume = Stage { step: cstep, slot: cslot, body };
         let carried = carry(&init, &phi, &next);
-        self.push(Stmt::Pipeline(Pipeline { extent, stages, carried, produce, consume }));
+        self.push(Stmt::Pipeline(Pipeline { extent, stages, unroll, crews, carried, produce, consume }));
         phi.into_iter().map(Tile::new).collect()
     }
 

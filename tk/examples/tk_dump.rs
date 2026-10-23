@@ -188,7 +188,7 @@ fn main() -> Result<()> {
                 }
             };
             println!("emitting {:?}", spec.cfg);
-            vec![(if bf16 { norm::<BF16>(&spec) } else { norm::<F16>(&spec) }, spec.cfg.lowering(&planner.device))]
+            vec![(if bf16 { norm::<BF16>(&spec) } else { norm::<F16>(&spec) }, Lowering::new(&planner.device))]
         }
         ("conv", &[b, h, w, cin, cout]) => {
             let k = num("--kernel")?.unwrap_or(3);
@@ -255,7 +255,7 @@ fn main() -> Result<()> {
                 }
             };
             println!("emitting {:?}", spec.cfg);
-            vec![(if bf16 { heads::<BF16>(&spec) } else { heads::<F16>(&spec) }, spec.cfg.lowering(&planner.device))]
+            vec![(if bf16 { heads::<BF16>(&spec) } else { heads::<F16>(&spec) }, Lowering::new(&planner.device))]
         }
         ("nearest", &[n, m, d]) => {
             let metric = match opt("--metric").unwrap_or("squared-l2") {
@@ -285,7 +285,7 @@ fn main() -> Result<()> {
             };
             println!("emitting {:?} at depth {d}", spec.cfg);
             let prog = if bf16 { nearest::<BF16>(&spec) } else { nearest::<F16>(&spec) };
-            vec![(prog, spec.cfg.lowering(&planner.device))]
+            vec![(prog, Lowering::new(&planner.device))]
         }
         (op, dims) => {
             return Err(format!(

@@ -12,7 +12,6 @@ use test_case::test_case;
 use crate::atoms::{Core, Costs, Device};
 use crate::build::*;
 use crate::ir::*;
-use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 use crate::lower::emit::minimum;
 
@@ -89,7 +88,7 @@ fn a_lowered_float_minimum_adds_nothing(reduced: bool) {
     let out = k.view(y, 0, [out_shape.cols, 1], out_shape, [None, None]);
     k.store(out, m);
     let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
-    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: 1, cols: 1 });
+    let lowering = Lowering::new(&device);
     let nodes = linear(k.finish(), &lowering).toposort();
     let float = |u: &Arc<UOp>| u.dtype().is_float();
     let sums = nodes
@@ -171,7 +170,7 @@ fn a_guarded_scalar_read_stays_under_its_guard(max: i64, div: i64, guarded: bool
     let out = at(&mut k, 1);
     k.store(out, v);
     let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
-    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: 1, cols: 1 });
+    let lowering = Lowering::new(&device);
     let linear = linear(k.finish(), &lowering);
     let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
     let at = |f: &dyn Fn(&Arc<UOp>) -> bool| (0..list.len()).filter(|&i| f(&list[i])).collect::<Vec<_>>();
@@ -218,7 +217,7 @@ fn a_loop_extent_below_zero_runs_no_trip(steps: i64, steady: bool, floored: bool
     let out = k.view(y, at, [tile.cols, 1], tile, [None, None]);
     k.store(out, sum);
     let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
-    let linear = linear(k.finish(), &Lowering::uniform(&device, false, WarpGrid { rows: 1, cols: 1 }));
+    let linear = linear(k.finish(), &Lowering::new(&device));
     let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
     let ends: Vec<&Arc<UOp>> =
         list.iter().filter_map(|u| if let Op::Range(r) = u.op() { Some(&r.end) } else { None }).collect();
@@ -256,8 +255,7 @@ fn a_program_past_the_instruction_bound_is_refused() {
     }
     let v = k.view(out, 0, [shape.cols, 1], shape, [None, None]);
     k.store(v, x);
-    let grid = WarpGrid { rows: 4, cols: 1 };
-    let lowering = crate::lower::Lowering::uniform(&super::declared(target), false, grid);
+    let lowering = crate::lower::Lowering::new(&super::declared(target));
     let err = crate::lower::standalone(k.finish(), &lowering).err().expect("refused");
     let Error::TooLarge { name, instructions, most: bound } = &err else { panic!("{err}") };
     assert_eq!((name.as_str(), *bound), ("huge", most));
@@ -286,7 +284,7 @@ fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
     let prog = k.finish();
     assert!(!prog.scalars.contains(&Scalar::Const(0)), "the program interns a zero");
     let device = Device { target: crate::atoms::sm86(), costs };
-    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: 1, cols: 1 });
+    let lowering = Lowering::new(&device);
     let nodes = linear(prog, &lowering).toposort();
     assert!(nodes.iter().any(|u| matches!(u.op(), Op::Barrier { .. })), "no round trip through shared memory");
 }
@@ -315,7 +313,7 @@ fn a_register_transpose_lowers(tile: Shape, warps: u32, pinned: bool) {
     let dst = k.view(y, 0, [out.cols, 1], out, [None, None]);
     k.store(dst, t);
     let device = Device { target: crate::atoms::sm86(), costs: super::costs() };
-    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: warps, cols: 1 });
+    let lowering = Lowering::new(&device);
     linear(k.finish(), &lowering);
 }
 
@@ -410,7 +408,7 @@ fn a_fill_goes_in_whole_chunks_per_thread(rows: usize, cols: usize, fills: bool)
     let r = k.load(v);
     let out = k.view(y, 0, [cols, 1], held, [None, None]);
     k.store(out, r);
-    let lowering = Lowering::uniform(&super::declared(crate::atoms::sm86()), false, WarpGrid { rows: 1, cols: 1 });
+    let lowering = Lowering::new(&super::declared(crate::atoms::sm86()));
     match crate::lower::standalone(k.finish(), &lowering) {
         Ok(_) => assert!(fills, "a {rows}×{cols} fill lowered"),
         Err(crate::lower::Error::Unsupported { what }) => {

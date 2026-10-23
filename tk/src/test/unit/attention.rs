@@ -18,6 +18,7 @@ use crate::kernels::attention::{
 use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch;
 use crate::launch::graph_launch_all;
+use crate::lower::Lowering;
 use crate::ops::config::Planner;
 
 fn flash_attention(spec: &AttnSpec) -> Program {
@@ -623,12 +624,8 @@ fn on_device_case(c: Case, target: Target) -> Vec<u16> {
     } else {
         let merge = combine_spec(&spec);
         let o = Tensor::empty(&[elems], DType::BFloat16);
-        graph_launch(
-            combine::<BF16>(&merge),
-            &merge.cfg.lowering(&declared(target)),
-            &[&outs[3], &outs[4], &outs[5], &o],
-        )
-        .unwrap()
+        graph_launch(combine::<BF16>(&merge), &Lowering::new(&declared(target)), &[&outs[3], &outs[4], &outs[5], &o])
+            .unwrap()
     };
     let mut plan = out.prepare().unwrap();
     plan.execute_with_vars(&[("b", batch as i64)]).unwrap();
@@ -738,7 +735,7 @@ fn combine_matches_the_program(t: usize, heads: usize, d: usize, splits: usize, 
         })
         .collect();
     let refs: Vec<&Tensor> = tensors.iter().collect();
-    let out = graph_launch(combine::<BF16>(&spec), &spec.cfg.lowering(&declared(target)), &refs).unwrap();
+    let out = graph_launch(combine::<BF16>(&spec), &Lowering::new(&declared(target)), &refs).unwrap();
     let got: Vec<f64> = out.cast(DType::Float32).to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
     let worst = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
     let bad: Vec<usize> =

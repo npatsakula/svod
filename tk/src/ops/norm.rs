@@ -10,6 +10,7 @@ use super::shape::{self, extent, shape_of};
 use super::{GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output, typed};
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm as kernel};
 use crate::launch;
+use crate::lower::Lowering;
 use crate::tune::TuneStore;
 
 /// `(x - mean)·rsqrt(var + eps)·w + b` over the last dim of `x`.
@@ -81,9 +82,8 @@ fn norm(
     let sum = residual.map(|_| output(&ext.dims, &var, x.dtype())).transpose().context(GraphSnafu { op })?;
     let ins: Vec<&Tensor> = [Some(x), residual, Some(w), b, Some(&out), sum.as_ref()].into_iter().flatten().collect();
     let at = ins.len() - 1 - usize::from(sum.is_some());
-    let mut outs =
-        launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &spec.cfg.lowering(&planner.device), &ins)
-            .context(LaunchSnafu { op })?;
+    let mut outs = launch::graph_launch_all(typed!(x.dtype(), kernel, &spec), &Lowering::new(&planner.device), &ins)
+        .context(LaunchSnafu { op })?;
     let sum = sum.map(|_| outs.pop().expect("the sum"));
     Ok((sum, outs.swap_remove(at)))
 }
@@ -100,7 +100,7 @@ fn op(kind: Norm) -> &'static str {
 pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[NormCfg], spec: NormSpec) -> NormSpec {
     let shape = [spec.batch.capacity(), spec.rows, spec.d];
     let salt = (&spec.batch, spec.norm, spec.residual, spec.bias);
-    let build = |cfg| vec![(typed!(dtype, kernel, &NormSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+    let build = |cfg| vec![(typed!(dtype, kernel, &NormSpec { cfg, ..spec.clone() }), Lowering::new(&planner.device))];
     let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build).tuned(
         op(spec.norm),
         ranked,

@@ -523,7 +523,6 @@ fn transposing_loads_land_as_their_layout() {
 fn a_product_deals_its_columns_on_device(per_lane: usize) {
     use crate::build::{F32, I32, Kernel};
     use crate::ir::{ParamKind, Shape};
-    use crate::layouts::WarpGrid;
     let Some(target) = super::device_target() else { return };
     let device = declared(target);
     let (rows, cols, depth) = (64usize, 64usize, 32usize);
@@ -553,7 +552,7 @@ fn a_product_deals_its_columns_on_device(per_lane: usize) {
     let product = |r: usize, j: usize| (0..depth).map(|e| xs[r * depth + e] * cs[j * depth + e]).sum::<f64>();
     let params = vec![xs.clone(), cs.clone(), vec![0.0; rows * cols], vec![0.0; rows * cols]];
     let interpreted = run(&prog, params.clone(), &[]).unwrap();
-    let lowering = crate::lower::Lowering::uniform(&device, false, WarpGrid { rows: 4, cols: 1 });
+    let lowering = crate::lower::Lowering::new(&device);
     let outs = super::targets::on_device(prog, &lowering, &params);
     for (what, y, at) in [
         ("interpreted", interpreted[2].clone(), interpreted[3].clone()),

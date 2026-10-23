@@ -46,11 +46,13 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
    allocations as `SmemRef<T>`; comparisons are `k.compare(a, b, CmpOp::{Lt,Le,Eq,Ne})` → `Regs<Bool>`. No DAG.
 2. **`lower::lower`** (`lower/mod.rs`): grid check → `materialize_operands` (non-register `mma` operands become loads;
    on `Core::Group` shared operands stay in place) → `sync::insert_barriers` (fences from shared-memory effects) →
-   `schedule::expand` (`Schedule::Uniform { fill, unroll, async_products }` or `PingPong { crew }`) → `layouts::infer`
+   `schedule::expand` (each `Pipeline`'s `Ring { stages, unroll, crews }` under the target's `Fill`; on the warpgroup
+   core a `cp.async` ring of ≥ 3 slots whose consume only chains products leaves them in flight) → `layouts::infer`
    (F2 `TileLayout` per register tile, priced relayouts; a product whose result is dealt issues the narrow way,
    `MmaAtom::narrow`) → `orient_shared` → `emit::emit` (`lower/emit/{mod,address,
-   copy,compute,nvptx,amdgpu}.rs`; vendor intrinsics only in the last two). `Lowering { device, schedule, grid,
-   swizzle, core }`; `Lowering::uniform(device, unroll, grid)` for plain kernels; `layouts::Swizzle::{None,B32,B64,B128}`.
+   copy,compute,nvptx,amdgpu}.rs`; vendor intrinsics only in the last two). `Lowering { device, core }`
+   (`Lowering::new(device)` on the warp-level core); the warp grid is the program's (`Kernel::warps`,
+   `Program::warp_grid`); `layouts::Swizzle::{None,B32,B64,B128}`.
 3. **Target** (`atoms.rs`): matrix cores (`mma: Vec<MmaAtom>`, `group_mma`; `geometry()` the 16-bit atom the
    planner prices, `geometry_of(Int8)` the 8-bit one into i32: NVIDIA m16n8k32, CDNA 16×16×32, RDNA `iu8` 16×16×16), `fill: Fill::{CpAsync, Staged}`
    (`Fill::stages` clamps a staged ring to 1–2), `ldmatrix`, `tr_load`, `sync: SyncCaps { warp_barrier, commit_fence,
@@ -79,7 +81,7 @@ Masks, `select_if`, `each_warp`, `smem_view_as`, `load_scalar`, `where_`, `mul_a
 gathers (`Kernel::gather`): `kernels/conv.rs`. Builder call table: `first-kernel.md`. Full wiring: [new-kernel.md](new-kernel.md).
 
 Rules the code enforces:
-- Split `XSpec` (shapes, options, `cfg`) / `XCfg::lowering(&self, &Device) -> Lowering` / `pub fn x<T: Half>(&XSpec)
+- Split `XSpec` (shapes, options, `cfg`) / `Lowering::new(&device)` (or `GemmCfg`/`FaCfg::lowering`) / `pub fn x<T: Half>(&XSpec)
   -> Program`, dispatched on bf16/f16 by `ops::typed!` (`typed!(…, int8)` adds `I8`). `Kernel::mma` takes `T: MmaIn`
   (bf16/f16 → f32, `I8` → i32 exact; `MmaIn::widened` to f32): `gemm` and `nearest` run over `I8`, the rest 16-bit
   only; f32 stays on the graph except `k_nearest_reranked` (8-bit or f16 search, f32 pass by `nearest_rescore`).
@@ -87,7 +89,7 @@ Rules the code enforces:
   stores are fenced by `sync::insert_barriers`; `k.barrier()` is the only hand-placed sync. A block barrier under a
   branch on the warp is `lower::Error::DivergentBarrier`.
 - `pin` and `mma_oriented` are for probes/tests; layouts come from inference.
-- The warp grid takes every warp (`prog.warps == grid.count()`) unless the extra warps live in `each_warp` bodies.
+- `k.warps(grid)` declares every warp of the block; `k.lone_warps(n)` adds whole copies of the grid that run only in `each_warp` bodies.
 
 ## Checking correctness
 

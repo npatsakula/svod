@@ -109,7 +109,8 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 overhangs `len`, so any `m` and `n` run without a copy. Only `k` must be a multiple of `bk`.
 
 **The pipeline.** `pipeline(extent, stages, init, produce, consume)` declares a producer and a
-consumer over a ring of `stages` shared slots, carrying `init` (here the accumulator) through
+consumer over a ring of `stages` shared slots (a `Ring { stages, unroll, crews }` also copies
+the loop once per slot or runs two crews), carrying `init` (here the accumulator) through
 the consumer. The author says what to copy into a slot and what to compute from it. The
 [schedule template](./layouts-and-lowering#schedule-templates) decides how far ahead copies
 run and places every wait and barrier.
@@ -155,7 +156,7 @@ output and falls back to the graph when the kernel does not apply.
 
 | Group | Calls |
 |---|---|
-| Declarations | `param`, `var` (a launch variable bound by name), `grid`, `warps`, `smem` |
+| Declarations | `param`, `var` (a launch variable bound by name), `grid`, `warps` (a count, a column of warps, or a `WarpGrid` the register tiles spread over), `smem` |
 | Scalars | `block(axis)`, `warp()`, `row()` (inside a gather map), `load_scalar(param, index)`, `Sc` operators and `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | Views | `view`, `gather` (a row-mapped view), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
 | Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (a row or column vector broadcasts), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (one rounding), `reduce`, `reduce_f32`, `transpose`, `shift` (one step along an axis, a fill first), `flip` (each element exchanged across a mask's bits along an axis: a sorting network's step), `mma`, `mma_oriented`, `pin` |

@@ -12,6 +12,7 @@ use crate::kernels::Batch;
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch_all;
+use crate::lower::Lowering;
 
 fn bf16s(n: usize, seed: &mut u64, f: impl Fn(f64) -> f64) -> Vec<f64> {
     super::rounded(ScalarDType::BFloat16, n, seed, f)
@@ -147,7 +148,7 @@ fn kernel_matches_the_program(s: HeadsSpec) {
         .map(|v| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16))
         .collect();
     let refs: Vec<&Tensor> = tensors.iter().collect();
-    let outs = graph_launch_all(heads::<BF16>(&s), &s.cfg.lowering(&declared(target)), &refs).unwrap();
+    let outs = graph_launch_all(heads::<BF16>(&s), &Lowering::new(&declared(target)), &refs).unwrap();
     let outputs = outs.len() - 3;
     for (i, name) in ["q", "k", "v"].into_iter().enumerate() {
         let out = &outs[outputs + i];

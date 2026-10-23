@@ -49,19 +49,17 @@ fn transposing_layouts_hold_16_byte_column_runs(rows: usize, cols: usize, warps:
 #[test_case(0 => matches Err(crate::layouts::Error::NotConverged { passes: 0 }); "out of passes")]
 #[test_case(64 => matches Ok(()); "within its passes")]
 fn inference_out_of_passes_is_an_error(passes: usize) -> crate::layouts::Result<()> {
-    let mut prog = super::gemm_nt(256, 256, 256, 128, 128, 32, 3);
-    prog.warps = 8;
     let (target, grid) = (sm86(), WarpGrid { rows: 2, cols: 4 });
-    let Laid { prog, .. } = infer(prog, &declared(target.clone()), grid, Core::Warp).unwrap();
+    let prog = Program { warps: 8, warp_grid: grid, ..super::gemm_nt(256, 256, 256, 128, 128, 32, 3) };
+    let Laid { prog, .. } = infer(prog, &declared(target.clone()), Core::Warp).unwrap();
     crate::layouts::Infer::new(&prog, &target, grid, Core::Warp).solve_within(passes)
 }
 
 #[test]
 fn gemm_accumulator_gets_the_core_layout_over_the_warp_grid() {
-    let mut prog = super::gemm_nt(256, 256, 256, 128, 128, 32, 3);
-    prog.warps = 8;
-    let Laid { prog, layouts: lay } =
-        infer(prog, &declared(sm86()), WarpGrid { rows: 2, cols: 4 }, Core::Warp).unwrap();
+    let grid = WarpGrid { rows: 2, cols: 4 };
+    let prog = Program { warps: 8, warp_grid: grid, ..super::gemm_nt(256, 256, 256, 128, 128, 32, 3) };
+    let Laid { prog, layouts: lay } = infer(prog, &declared(sm86()), Core::Warp).unwrap();
     let Stmt::Pipeline(p) = &prog.body.0[1] else { panic!("pipeline") };
     let acc = lay[p.carried[0].phi.index()].as_ref().unwrap();
     assert_eq!(acc.frag, frag::mma_sync_c());
@@ -104,10 +102,8 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     let out = k.param::<F32>("o", ParamKind::Out, bq * d);
     let o_g = k.view(out, 0, [d, 1], Shape::new(bq, d), [None, None]);
     k.store(o_g, o);
-    let mut prog = k.finish();
-    prog.warps = 4;
-    let Laid { prog, layouts: lay } =
-        infer(prog, &declared(sm86()), WarpGrid { rows: 4, cols: 1 }, Core::Warp).unwrap();
+    k.warps(4);
+    let Laid { prog, layouts: lay } = infer(k.finish(), &declared(sm86()), Core::Warp).unwrap();
     let relayouts: Vec<_> = prog
         .walk()
         .filter_map(|(_, s)| match s {
@@ -159,6 +155,7 @@ fn shapes_that_do_not_tile_the_grid_are_rejected() {
 fn a_product_result_pinned_off_its_atom_is_refused() {
     let shape = Shape::new(16, 16);
     let mut k = Kernel::new("pinned_product");
+    k.warps(1);
     let a = k.param::<BF16>("a", ParamKind::In, shape.elems());
     let c = k.param::<F32>("c", ParamKind::Out, shape.elems());
     let v = k.view(a, 0, [16, 1], shape, [None, None]);
@@ -168,7 +165,7 @@ fn a_product_result_pinned_off_its_atom_is_refused() {
     k.pin(acc, natural(shape, 1, 32).unwrap());
     let out = k.view(c, 0, [16, 1], shape, [None, None]);
     k.store(out, acc);
-    let err = infer(k.finish(), &declared(sm86()), WarpGrid { rows: 1, cols: 1 }, Core::Warp).err();
+    let err = infer(k.finish(), &declared(sm86()), Core::Warp).err();
     assert!(matches!(err, Some(crate::layouts::Error::Unresolved { value }) if value == acc.0), "{err:?}");
 }
 
@@ -251,8 +248,7 @@ fn elementwise_operands_reach_the_op_in_its_layout() {
     let out = k.param::<F32>("o", ParamKind::Out, 256);
     let o = k.view(out, 0, [16, 1], Shape::new(16, 16), [None, None]);
     k.store(o, both);
-    let Laid { prog, layouts } =
-        infer(k.finish(), &declared(sm86()), WarpGrid { rows: 1, cols: 1 }, Core::Warp).unwrap();
+    let Laid { prog, layouts } = infer(k.finish(), &declared(sm86()), Core::Warp).unwrap();
     let lay = |v: &ValId| layouts[v.index()].clone().unwrap();
     let mut checked = 0;
     for (_, s) in prog.walk() {
@@ -312,8 +308,7 @@ fn gfx1151_attention(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLay
 fn gfx1151_attention_folds(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLayout, TileLayout)>, Vec<u32>) {
     let target = Target::for_arch(GpuArch::Amd(AmdArch::Gfx1151));
     let how = target.lane_move;
-    let Laid { prog, layouts: lay } =
-        infer(prog, &Device { target, costs: *costs }, WarpGrid { rows: 4, cols: 1 }, Core::Warp).unwrap();
+    let Laid { prog, layouts: lay } = infer(prog, &Device { target, costs: *costs }, Core::Warp).unwrap();
     let orients = prog
         .walk()
         .filter_map(|(_, s)| match s {
@@ -547,7 +542,7 @@ fn a_fold_issues_the_lane_moves_it_is_priced(target: Target, orient: Orient, axi
     let atom = target.mma(svod_dtype::ScalarDType::BFloat16, svod_dtype::ScalarDType::Float32).unwrap().clone();
     let held = atom.issue(orient, grid, rows, cols, 16).unwrap().c;
     let mut k = Kernel::new("fold");
-    k.warps(grid.count());
+    k.warps(grid);
     let tile = Shape::new(rows, cols);
     let x = k.param::<F32>("x", ParamKind::In, tile.elems());
     let x = k.view(x, 0, [cols, 1], tile, [None, None]);
@@ -559,9 +554,9 @@ fn a_fold_issues_the_lane_moves_it_is_priced(target: Target, orient: Orient, axi
     let y = k.view(y, 0, [out.cols, 1], out, [None, None]);
     k.store(y, folded);
     let device = Device { target: target.clone(), costs: costs() };
-    let lowering = crate::lower::Lowering::uniform(&device, false, grid);
+    let lowering = crate::lower::Lowering::new(&device);
     let prog = k.finish();
-    let laid = infer(prog.clone(), &device, grid, Core::Warp).unwrap();
+    let laid = infer(prog.clone(), &device, Core::Warp).unwrap();
     let priced: u32 = laid
         .prog
         .walk()

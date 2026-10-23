@@ -17,6 +17,7 @@ use crate::kernels::nearest::{
     Floors, Invalid, LaneQueue, Metric, NearestCfg, NearestMergeSpec, NearestSpec, SCRATCH, SelectCfg, SelectSpec,
     nearest, nearest_merge, nearest_select, share_stride,
 };
+use crate::lower::Lowering;
 use crate::ops::config::{self, Planner};
 use crate::ops::{self as tk, Nearest};
 
@@ -279,7 +280,7 @@ impl Case {
         let filtered = shares.is_some();
         let select = SelectCfg { filter: filtered, ..cfg.select.expect("a score matrix") };
         let cfg = NearestCfg { select: Some(select), ..cfg };
-        let (scored, listing) = (cfg.lowering(device), select.lowering(device));
+        let (scored, listing) = (Lowering::new(device), Lowering::new(device));
         let (score, index) = (0..self.n).step_by(panel).fold((vec![], vec![]), |(mut score, mut index), r0| {
             let rows = panel.min(self.n - r0);
             let mut lists = vec![vec![0.0; rows * k], vec![0.0; rows * k]];
@@ -330,7 +331,7 @@ impl Case {
                     let merge =
                         NearestMergeSpec { n: rows, splits: shares, metric: self.metric, k, live: Default::default() };
                     let params = [lists, vec![vec![0.0; rows * k]; 2]].concat();
-                    let mut out = run(nearest_merge(&merge), &merge.lowering(device), params);
+                    let mut out = run(nearest_merge(&merge), &Lowering::new(device), params);
                     lists = out.split_off(out.len() - 2);
                 }
             }
@@ -375,14 +376,14 @@ impl Case {
             return carried;
         }
         let (prog, params) = (self.program(depth, cfg, k), self.params(depth, cfg.splits, k));
-        let mut outs = super::targets::on_device(prog, &cfg.lowering(&planner.device), &params);
+        let mut outs = super::targets::on_device(prog, &Lowering::new(&planner.device), &params);
         let (index, score) = (outs.pop().flatten().unwrap(), outs.pop().flatten().unwrap());
         if cfg.splits == 1 {
             return (score, index);
         }
         let merge = self.merge(cfg.splits, k);
         let params = [score, index, vec![0.0; self.n * k], vec![0.0; self.n * k]];
-        let mut outs = super::targets::on_device(nearest_merge(&merge), &merge.lowering(&planner.device), &params);
+        let mut outs = super::targets::on_device(nearest_merge(&merge), &Lowering::new(&planner.device), &params);
         let index = outs.pop().flatten().unwrap();
         (outs.pop().flatten().unwrap(), index)
     }
@@ -1223,7 +1224,7 @@ fn a_resident_trip_votes_before_it_places_its_least(target: Target, vote: &str) 
     let device = crate::sweep::declared(target);
     let case = |cfg| plain(300, 500, 64, Metric::NegDot, 1, cfg);
     for (cfg, votes) in [(NearestCfg::new(64, 32, 2), true), (NearestCfg::streamed(64, 32, 32, 2), false)] {
-        let ir = crate::sweep::render(nearest::<BF16>(&case(cfg)), &cfg.lowering(&device));
+        let ir = crate::sweep::render(nearest::<BF16>(&case(cfg)), &Lowering::new(&device));
         assert_eq!(ir.contains(vote), votes, "{cfg:?}");
     }
 }
@@ -1356,7 +1357,7 @@ fn a_list_votes_before_its_rounds(target: Target, vote: &str) {
     let device = crate::sweep::declared(target);
     let case = |cfg| plain(300, 500, 64, Metric::NegDot, 8, cfg);
     for cfg in [NearestCfg::new(64, 32, 2), NearestCfg::streamed(64, 32, 32, 2)] {
-        let ir = crate::sweep::render(nearest::<BF16>(&case(cfg)), &cfg.lowering(&device));
+        let ir = crate::sweep::render(nearest::<BF16>(&case(cfg)), &Lowering::new(&device));
         assert!(ir.contains(vote), "{cfg:?}");
     }
 }
@@ -1377,8 +1378,7 @@ fn a_list_is_held_beside_its_rows(target: Target) {
         [(NearestCfg::new(64, 32, 2), 8), (NearestCfg::streamed(64, 64, 32, 2), 16), (NearestCfg::new(32, 16, 2), 3)]
     {
         let spec = plain(300, 500, 64, Metric::SquaredL2, k, cfg);
-        let grid = crate::layouts::WarpGrid { rows: cfg.warps(), cols: 1 };
-        let laid = crate::layouts::infer(nearest::<BF16>(&spec), &device, grid, Core::Warp).unwrap();
+        let laid = crate::layouts::infer(nearest::<BF16>(&spec), &device, Core::Warp).unwrap();
         let (mut lists, mut deals) = (0, 0);
         for (_, stmt) in laid.prog.walk() {
             let Stmt::Let { dst, op } = stmt else { continue };
@@ -1437,7 +1437,7 @@ fn a_list_is_dealt_in_lane_under_measured_costs(target: Target, costs: crate::at
                 ScalarDType::Int8 => nearest::<I8>(&spec),
                 _ => nearest::<F16>(&spec),
             };
-            let lowered = crate::lower::standalone(prog, &cfg.lowering(&device)).unwrap();
+            let lowered = crate::lower::standalone(prog, &Lowering::new(&device)).unwrap();
             let instructions = lowered.instructions();
             let most = device.target.most_instructions();
             assert!(instructions <= most, "{dtype:?} {cfg:?}: {instructions} instructions");
@@ -1732,7 +1732,7 @@ fn rescored_pairs_match_the_reference(metric: Metric, floors: Floors) {
     let prog = nearest_rescore(&spec);
     check("interpreter", &run(&prog, params.clone(), &[]).unwrap().pop().unwrap());
     let Some(planner) = super::device_planner() else { return };
-    let got = super::targets::on_device(prog, &spec.lowering(&planner.device), &params);
+    let got = super::targets::on_device(prog, &Lowering::new(&planner.device), &params);
     check("device", &got.last().cloned().flatten().unwrap());
 }
 
@@ -2213,7 +2213,6 @@ fn a_swapped_product_folds_a_row_in_lanes(target: Target, direct: usize, swapped
     let planner = super::planner(target.clone());
     let cfg = NearestCfg { warp_rows: 32, ..NearestCfg::new(128, 64, 2) };
     let spec = plain(1000, 1000, 64, Metric::SquaredL2, 1, cfg);
-    let grid = crate::layouts::WarpGrid { rows: cfg.warps(), cols: 1 };
     fn pin(block: &mut Block, to: Orient) {
         for s in &mut block.0 {
             match s {
@@ -2229,7 +2228,7 @@ fn a_swapped_product_folds_a_row_in_lanes(target: Target, direct: usize, swapped
         if let Some(o) = orient {
             pin(&mut prog.body, o);
         }
-        let laid = crate::layouts::infer(prog, &planner.device, grid, Core::Warp).unwrap();
+        let laid = crate::layouts::infer(prog, &planner.device, Core::Warp).unwrap();
         let (mut masks, mut moves, mut issued) = (vec![], vec![], vec![]);
         for (_, s) in laid.prog.walk() {
             match s {
@@ -2587,7 +2586,7 @@ fn list_ir_dump() {
             let spec = plain(1 << 14, 1 << 14, 128, Metric::SquaredL2, k, cfg);
             let start = std::time::Instant::now();
             let prog = if int8 { nearest::<I8>(&spec) } else { nearest::<F16>(&spec) };
-            let ir = crate::sweep::render(prog, &cfg.lowering(&device));
+            let ir = crate::sweep::render(prog, &Lowering::new(&device));
             eprintln!("{k}_{i} {cfg:?}: {} lines in {:.1?}", ir.lines().count(), start.elapsed());
             std::fs::write(format!("{dir}/{k}_{i}.ll"), ir).unwrap();
         }

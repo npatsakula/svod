@@ -836,14 +836,14 @@ fn a_program_that_does_not_lower_is_lowered_once() {
     let candidate = gemm_candidate(sm86(), super::costs());
     let [(prog, lowering)] = &candidate[..] else { unreachable!("one program") };
     // Half the warps of the grid: the lowering refuses it.
-    let lowering = crate::lower::Lowering { grid: crate::layouts::WarpGrid { rows: 1, cols: 4 }, ..lowering.clone() };
-    assert!(matches!(crate::lower::standalone(prog.clone(), &lowering), Err(crate::lower::Error::Grid { .. })));
+    let prog = &crate::ir::Program { warp_grid: crate::layouts::WarpGrid { rows: 1, cols: 4 }, ..prog.clone() };
+    assert!(matches!(crate::lower::standalone(prog.clone(), lowering), Err(crate::lower::Error::Grid { .. })));
     let candidate = vec![(prog.clone(), lowering.clone())];
     let (store, keep) = (TuneStore::at(None), tune::Lowerings::default());
     store.fingerprint_keeping(std::slice::from_ref(&candidate), Some(&keep));
-    let m = tune::made_of(prog, &lowering);
+    let m = tune::made_of(prog, lowering);
     assert_eq!(keep.0.lock().unwrap().get(&m), Some(&None), "kept as one that does not lower");
-    assert_eq!(store.lowered(prog, &lowering, &keep), None);
+    assert_eq!(store.lowered(prog, lowering, &keep), None);
     assert_eq!(keep.0.lock().unwrap().get(&m), Some(&None), "the verdict stays");
     let mut bench = Bench::default();
     bench.lowered = std::sync::Arc::new(keep);

@@ -3,52 +3,32 @@
 //! ring (the sync pass fences only where the ring meets the code around it);
 //! the author's `produce`/`consume` bodies are placed, never edited.
 
-use crate::atoms::Fill;
+use crate::atoms::{Core, Fill};
 use crate::ir::*;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Schedule {
-    /// Every warp loads and computes; `unroll` copies the loop body once per
-    /// ring slot so slot addressing folds to constants. With
-    /// `async_products` a consume's warpgroup products are left in flight
-    /// over the next trip's fill (`cp.async` rings of three slots or more):
-    /// the ring refills the slot consumed two trips ago, and the template
-    /// waits for all but the youngest chain after every consume that places
-    /// no wait of its own, and for every chain after the loop
-    /// ([`Sync::WaitProducts`]).
-    Uniform { fill: Fill, unroll: bool, async_products: bool },
-    /// Two crews of `crew` warps run one stream of clusters a cluster apart
-    /// over one register-staged slot: a crew's product, its fragments already
-    /// in registers, runs while the other crew loads, reads its next
-    /// fragments and commits the slot ([`Expander::ping_pong`]).
-    PingPong { crew: u32 },
-}
-
-impl Schedule {
-    /// How the schedule's fills move data in; a ping-pong's slot is
-    /// register-staged.
-    pub fn fill(&self) -> Fill {
-        match *self {
-            Schedule::Uniform { fill, .. } => fill,
-            Schedule::PingPong { .. } => Fill::Staged,
-        }
-    }
-}
 
 /// The highest issue priority a wave takes (`s_setprio 3`), a crew's over
 /// its products.
 const RAISED: u8 = 3;
 
 /// Replace every [`Stmt::Pipeline`] of `prog` by loops, branches and explicit
-/// synchronization according to `schedule`.
-pub fn expand(prog: &mut Program, schedule: Schedule) {
+/// synchronization: a ring of one crew runs every warp alike, its fills as
+/// the target's `fill` moves data in, its loop unrolled over the slots as
+/// the pipeline says; two crews run a cluster apart over one register-staged
+/// slot ([`Expander::ping_pong`]). On the warpgroup `core` a `cp.async` ring
+/// of three slots or more whose consume only chains its products leaves them
+/// in flight over the next trip's fill: the ring refills the slot consumed
+/// two trips ago, and the template waits for all but the youngest chain
+/// after every consume that places no wait of its own, and for every chain
+/// after the loop ([`Sync::WaitProducts`]).
+pub fn expand(prog: &mut Program, fill: Fill, core: Core) {
     let body = std::mem::take(&mut prog.body);
-    prog.body = Expander { prog, schedule, scope: Scope::Block }.block(body);
+    prog.body = Expander { prog, fill, core, scope: Scope::Block }.block(body);
 }
 
 struct Expander<'p> {
     prog: &'p mut Program,
-    schedule: Schedule,
+    fill: Fill,
+    core: Core,
     /// Whose barriers a pipeline's template emits: the block's, or one
     /// warp's own inside a [`Stmt::Warps`].
     scope: Scope,
@@ -98,15 +78,16 @@ impl Expander<'_> {
     }
 
     fn pipeline(&mut self, p: Pipeline) -> Vec<Stmt> {
-        let Pipeline { extent, stages, carried, produce, consume } = p;
+        let Pipeline { extent, stages, unroll, crews, carried, produce, consume } = p;
         let produce = Stage { body: self.block(produce.body), ..produce };
         let consume = Stage { body: self.block(consume.body), ..consume };
-        let Schedule::Uniform { fill, unroll, async_products } = self.schedule else {
-            let Schedule::PingPong { crew } = self.schedule else { unreachable!() };
+        if crews == 2 {
+            let crew = self.prog.warps / crews;
             return self.ping_pong(extent, stages, carried, produce, consume, crew);
-        };
-        let mut out = match fill {
-            Fill::CpAsync if stages >= 3 && async_products => {
+        }
+        let in_flight = self.core == Core::Group && chains_only(&consume.body);
+        let mut out = match self.fill {
+            Fill::CpAsync if stages >= 3 && in_flight => {
                 self.cp_async_products(extent, stages, carried, produce, consume)
             }
             Fill::CpAsync if stages >= 2 => self.cp_async(extent, stages, carried, produce, consume),
@@ -248,7 +229,7 @@ impl Expander<'_> {
         (issue, commit)
     }
 
-    /// One slot, two crews a cluster apart. The consume body is cut at its
+    /// One slot, two crews of `crew` warps a cluster apart. The consume body is cut at its
     /// products into clusters: the statements before a product (its fragment
     /// reads) make a load cluster, the product an MFMA cluster, each closed
     /// by a block barrier, so a barrier meets a crew's cluster `k` with the
@@ -402,4 +383,26 @@ impl Expander<'_> {
             trips(extent, nonempty, drained, consume.body.0, 1),
         ]
     }
+}
+
+/// Whether every product `consume` issues feeds only later products'
+/// accumulators (or leaves the consume as a carried value): nothing in the
+/// consume waits on one.
+fn chains_only(consume: &Block) -> bool {
+    let mut products = vec![];
+    for (_, stmt) in consume.walk() {
+        match stmt {
+            Stmt::Let { dst, op: TileOp::Mma { acc, a, b, .. } } => {
+                if products.contains(a) || products.contains(b) {
+                    return false;
+                }
+                products.retain(|p| p != acc);
+                products.push(*dst);
+            }
+            Stmt::Let { op, .. } if op.srcs().any(|v| products.contains(&v)) => return false,
+            Stmt::Copy { src, .. } if products.contains(src) => return false,
+            _ => {}
+        }
+    }
+    true
 }

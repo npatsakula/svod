@@ -20,6 +20,7 @@ use crate::kernels::nearest::{
     nearest_rescore, nearest_select, scratch, select_blocks, share_stride,
 };
 use crate::launch;
+use crate::lower::Lowering;
 use crate::tune::TuneStore;
 
 const OP: &str = "nearest";
@@ -315,7 +316,7 @@ pub(crate) fn rescored(
     let floors = [opts.row_floor.map(f32), opts.col_floor.map(f32)];
     let scores = output(&[n, cols], x_var, DType::Float32).context(graph_err())?;
     let ins: Vec<&Tensor> = [x, c, index].into_iter().chain(floors.iter().flatten()).chain([&scores]).collect();
-    let scores = launch::graph_launch(nearest_rescore(&spec), &spec.lowering(&planner.device), &ins)
+    let scores = launch::graph_launch(nearest_rescore(&spec), &Lowering::new(&planner.device), &ins)
         .context(LaunchSnafu { op: OP })?;
     listed(planner, &scores, index, top, k_var, x_var)
 }
@@ -349,7 +350,7 @@ pub(crate) fn listed(
     let [score_t, at_t] = outs.map(|t| t.context(graph_err()));
     let (score_t, at_t) = (score_t?, at_t?);
     let ins = [&scores.contiguous(), &chunk, &score_t, &at_t];
-    let mut outs = launch::graph_launch_all(nearest_select(&spec), &cfg.lowering(&planner.device), &ins)
+    let mut outs = launch::graph_launch_all(nearest_select(&spec), &Lowering::new(&planner.device), &ins)
         .context(LaunchSnafu { op: OP })?;
     let (at, score) = (outs.pop().expect("the columns"), outs.pop().expect("the scores"));
     let candidates = || -> svod_tensor::error::Result<Tensor> {
@@ -484,7 +485,7 @@ pub(crate) fn picked(
         .flatten()
         .collect();
     let mut outs =
-        launch::graph_launch_all(typed!(x.dtype(), kernel, &spec, int8), &spec.cfg.lowering(&planner.device), &ins)
+        launch::graph_launch_all(typed!(x.dtype(), kernel, &spec, int8), &Lowering::new(&planner.device), &ins)
             .context(LaunchSnafu { op: OP })?;
     let (index, score) = (outs.pop().expect("the index"), outs.pop().expect("the score"));
     if splits == 1 {
@@ -496,7 +497,7 @@ pub(crate) fn picked(
     let index_t = output(rows, &x_var, DType::Int32).context(graph_err)?;
     let mut outs = launch::graph_launch_all(
         nearest_merge(&merge),
-        &merge.lowering(&planner.device),
+        &Lowering::new(&planner.device),
         &[&score, &index, &score_t, &index_t],
     )
     .context(LaunchSnafu { op: OP })?;
@@ -605,7 +606,7 @@ fn matrix(
         }
         Ok(out)
     };
-    let listing = select.lowering(&planner.device);
+    let lowering = Lowering::new(&planner.device);
     let mut lists: Vec<Vec<Tensor>> = vec![];
     let mut r = [None, None, None, None, None];
     for Block { r0, c0, scores: a, bound, list: b } in launches(spec, planner) {
@@ -627,7 +628,6 @@ fn matrix(
         // The kernel's order: x, c, the scales, c_sq, x_sq, the floors, the groups.
         let order = [&r[0], &c[0], &r[1], &c[1], &c[2], &r[2], &r[3], &c[3], &r[4], &c[4]];
         let ins: Vec<&Tensor> = order.into_iter().flatten().chain(&outs).collect();
-        let lowering = a.cfg.lowering(&planner.device);
         let mut outs = launch::graph_launch_all(typed!(dtype, kernel, &a, int8), &lowering, &ins)
             .context(LaunchSnafu { op: OP })?;
         let mins = groups.map(|_| outs.pop().expect("the minima"));
@@ -645,8 +645,8 @@ fn matrix(
                 // The leasts listed in the units compared.
                 let (unit, outs) = (Tensor::from_slice([0i32, 0]), lists_out()?);
                 let ins: Vec<&Tensor> = [&mins, &unit].into_iter().chain(&outs).collect();
-                let mut outs =
-                    launch::graph_launch_all(nearest_select(&bound), &listing, &ins).context(LaunchSnafu { op: OP })?;
+                let mut outs = launch::graph_launch_all(nearest_select(&bound), &lowering, &ins)
+                    .context(LaunchSnafu { op: OP })?;
                 // Every parameter after the launch: the leasts' lists are its
                 // last two, their scores the bound.
                 outs.truncate(outs.len() - 1);
@@ -665,14 +665,14 @@ fn matrix(
             }
         };
         let ins: Vec<&Tensor> = [&scores, &chunk].into_iter().chain(list.iter()).chain(&filter).chain(&outs).collect();
-        let mut outs = launch::graph_launch_all(nearest_select(&b), &listing, &ins).context(LaunchSnafu { op: OP })?;
+        let mut outs = launch::graph_launch_all(nearest_select(&b), &lowering, &ins).context(LaunchSnafu { op: OP })?;
         let mut parts = outs.split_off(outs.len() - 2);
         if b.shares > 1 {
             let merge = NearestMergeSpec { n: nr, splits: b.shares, metric: b.metric, k, live: b.live.clone() };
             let merged = lists_out()?;
             let ins: Vec<&Tensor> = parts.iter().chain(&merged).collect();
-            let mut outs = launch::graph_launch_all(nearest_merge(&merge), &merge.lowering(&planner.device), &ins)
-                .context(LaunchSnafu { op: OP })?;
+            let mut outs =
+                launch::graph_launch_all(nearest_merge(&merge), &lowering, &ins).context(LaunchSnafu { op: OP })?;
             parts = outs.split_off(outs.len() - 2);
         }
         *list = parts;
@@ -742,12 +742,12 @@ pub(crate) fn timed(
 /// The programs `spec` launches in order: the kernel, and split, the merge
 /// of its shares.
 pub(crate) fn programs(planner: &Planner, dtype: DType, spec: &NearestSpec) -> crate::tune::Candidate {
-    if let Some(select) = spec.cfg.select {
+    let lowering = Lowering::new(&planner.device);
+    if spec.cfg.select.is_some() {
         // Every block's scores, bound and listing, as [`matrix`] launches them.
-        let listing = select.lowering(&planner.device);
         let blocks = launches(spec, planner).into_iter().flat_map(|Block { scores, bound, list, .. }| {
-            let scores = (typed!(dtype.clone(), kernel, &scores, int8), spec.cfg.lowering(&planner.device));
-            let bound = bound.map(|b| (nearest_select(&b), listing.clone()));
+            let scores = (typed!(dtype.clone(), kernel, &scores, int8), lowering.clone());
+            let bound = bound.map(|b| (nearest_select(&b), lowering.clone()));
             let merge = (list.shares > 1).then(|| {
                 let merge = NearestMergeSpec {
                     n: list.n,
@@ -756,16 +756,16 @@ pub(crate) fn programs(planner: &Planner, dtype: DType, spec: &NearestSpec) -> c
                     k: list.k,
                     live: list.live.clone(),
                 };
-                (nearest_merge(&merge), merge.lowering(&planner.device))
+                (nearest_merge(&merge), lowering.clone())
             });
-            [Some(scores), bound, Some((nearest_select(&list), listing.clone())), merge].into_iter().flatten()
+            [Some(scores), bound, Some((nearest_select(&list), lowering.clone())), merge].into_iter().flatten()
         });
         return blocks.collect();
     }
-    let mut programs = vec![(typed!(dtype, kernel, spec, int8), spec.cfg.lowering(&planner.device))];
+    let mut programs = vec![(typed!(dtype, kernel, spec, int8), lowering.clone())];
     if spec.cfg.splits > 1 {
         let merge = merge_of(spec);
-        programs.push((nearest_merge(&merge), merge.lowering(&planner.device)));
+        programs.push((nearest_merge(&merge), lowering));
     }
     programs
 }

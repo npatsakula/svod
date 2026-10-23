@@ -313,6 +313,29 @@ pub enum TileOp {
     },
 }
 
+impl TileOp {
+    /// The register values the op reads.
+    pub fn srcs(&self) -> impl Iterator<Item = ValId> {
+        let [a, b, c] = match *self {
+            TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) => [None; 3],
+            TileOp::Unary { src, .. }
+            | TileOp::Cast { src, .. }
+            | TileOp::Reduce { src, .. }
+            | TileOp::Transpose { src }
+            | TileOp::Shift { src, .. }
+            | TileOp::Flip { src, .. }
+            | TileOp::Deal { src, .. }
+            | TileOp::Relayout { src }
+            | TileOp::Move { src } => [Some(src), None, None],
+            TileOp::Binary { a, b, .. } => [Some(a), Some(b), None],
+            TileOp::Mma { acc, a, b, .. } => [Some(acc), Some(a), Some(b)],
+            TileOp::Where { pred, a, b } => [Some(pred), Some(a), Some(b)],
+            TileOp::MulAdd { a, b, c } => [Some(a), Some(b), Some(c)],
+        };
+        [a, b, c].into_iter().flatten()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CopyMode {
     /// Complete before the next statement; the sync pass fences it.
@@ -368,6 +391,12 @@ pub struct Stage {
 pub struct Pipeline {
     pub extent: ScalarId,
     pub stages: usize,
+    /// The loop copied once per ring slot, so slot addressing folds to
+    /// constants.
+    pub unroll: bool,
+    /// 1: every warp loads and computes; 2: the block's warps as two crews
+    /// a cluster apart over one slot ([`crate::schedule`]'s ping-pong).
+    pub crews: u32,
     pub carried: Vec<Carried>,
     pub produce: Stage,
     pub consume: Stage,
@@ -510,6 +539,10 @@ pub struct Program {
     pub vars: Vec<Var>,
     pub grid: [ScalarId; 3],
     pub warps: u32,
+    /// How the warps spread a block-wide register tile: every warp, or a
+    /// whole grid of them where the others run only inside
+    /// [`Stmt::Warps`].
+    pub warp_grid: crate::layouts::WarpGrid,
     pub smem: Vec<SmemAlloc>,
     pub scalars: Vec<Scalar>,
     pub values: Vec<Value>,

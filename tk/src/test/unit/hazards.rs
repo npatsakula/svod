@@ -5,7 +5,6 @@
 use crate::build::*;
 use crate::interp;
 use crate::ir::*;
-use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 
 /// Rows a block holds, a warp each, as [`crate::kernels::nearest::nearest_select`] does.
@@ -17,7 +16,7 @@ const COLS: usize = 12;
 fn device_matches(prog: Program) {
     let Some(target) = super::device_target() else { return };
     let device = crate::sweep::declared(target);
-    let lowering = Lowering::uniform(&device, false, WarpGrid { rows: ROWS as u32, cols: 1 });
+    let lowering = Lowering::new(&device);
     let params: Vec<Vec<f64>> = prog
         .params
         .iter()

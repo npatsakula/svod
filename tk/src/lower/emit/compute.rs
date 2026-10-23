@@ -180,8 +180,9 @@ impl Emit<'_> {
         let k = if a_t { va.shape.rows } else { va.shape.cols };
         // The product as laid, from the one function the inference used: the
         // slot each operand feeds and the registers each fragment holds.
-        let issue =
-            atom.issue(orient, self.low.grid, vd.shape.rows, vd.shape.cols, k).expect("inference laid this product");
+        let issue = atom
+            .issue(orient, self.prog.warp_grid, vd.shape.rows, vd.shape.cols, k)
+            .expect("inference laid this product");
         let [rm, rn] = issue.c.reps;
         let rk = (k / atom.k as usize) as u32;
         let (ra, rb, rc) = (issue.a.frag_regs(), issue.b.frag_regs(), issue.c.frag_regs());

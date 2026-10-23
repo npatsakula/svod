@@ -109,7 +109,7 @@ impl Emit<'_> {
             !a_t && vb.tier() == Tier::Smem,
             UnsupportedSnafu { what: "a warpgroup product over other than an untransposed A and shared B" }
         );
-        let grid = self.low.grid;
+        let grid = self.prog.warp_grid;
         let k = va.shape.cols;
         let issue = atom.issue(grid, vd.shape.rows, vd.shape.cols, k).expect("inference laid this product");
         let n_atom = atom.n_for(vd.shape.cols as u32 / grid.cols).expect("inference laid this product") as usize;

@@ -108,6 +108,7 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 निकलता है, इसलिए कोई भी `m` और `n` बिना copy के चलते हैं। सिर्फ़ `k` का `bk` का गुणज होना ज़रूरी है।
 
 **Pipeline.** `pipeline(extent, stages, init, produce, consume)` `stages` shared slots की ring पर
+(`Ring { stages, unroll, crews }` loop को हर slot पर एक बार copy भी कर सकता है या दो crews चला सकता है)
 एक producer और एक consumer घोषित करता है, और `init` (यहाँ accumulator) को consumer के ज़रिए आगे
 ले जाता है। लेखक बताता है कि slot में क्या copy करना है और उससे क्या गणना करनी है।
 [Schedule template](./layouts-and-lowering#schedule-templates) तय करता है कि copies कितना आगे चलें,
@@ -154,7 +155,7 @@ c.realize()?;
 
 | समूह | कॉल्स |
 |---|---|
-| घोषणाएँ | `param`, `var` (launch variable जो नाम से bind होता है), `grid`, `warps`, `smem` |
+| घोषणाएँ | `param`, `var` (launch variable जो नाम से bind होता है), `grid`, `warps` (एक गिनती, warps का एक column, या `WarpGrid` जिस पर register tiles फैलती हैं), `smem` |
 | Scalars | `block(axis)`, `warp()`, `row()` (gather map के भीतर), `load_scalar(param, index)`, `Sc` operators और `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | Views | `view`, `gather` (row-mapped view), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
 | Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (row या column vector broadcast होता है), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (एक ही rounding), `reduce`, `reduce_f32`, `transpose`, `shift` (axis के साथ एक step आगे, पहले स्थान पर fill), `flip` (हर element axis के साथ mask के bits पार अपने partner से बदलता है: sorting network का एक step), `mma`, `mma_oriented`, `pin` |

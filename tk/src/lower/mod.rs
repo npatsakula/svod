@@ -12,8 +12,8 @@ use svod_ir::{Op, UOp, ops};
 
 use crate::atoms::{Core, Device, Target};
 use crate::ir::*;
-use crate::layouts::{self, Laid, TileLayout, WarpGrid};
-use crate::schedule::{self, Schedule};
+use crate::layouts::{self, Laid, TileLayout};
+use crate::schedule;
 
 pub mod emit;
 pub mod sync;
@@ -42,26 +42,25 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Everything the lowering decides that the author did not.
+/// What the lowering is given beside the program: the target and its
+/// costs, and the matrix instruction products issue on. The warp grid and
+/// each ring's schedule are the program's own ([`Program::warp_grid`],
+/// [`Pipeline`]).
 #[derive(Clone, Debug)]
 pub struct Lowering {
     /// The target and what its primitives cost: the costs decide each
     /// product's orientation and how a tile is re-held.
     pub device: Device,
-    pub schedule: Schedule,
-    pub grid: WarpGrid,
-    /// The matrix instruction products issue on; on the warpgroup atom
-    /// ([`crate::atoms::GroupMmaAtom`]) the grid's rows are warpgroups of
-    /// four warps, shared operands are read through descriptors (over the
-    /// swizzled rows) and never loaded into registers.
+    /// On the warpgroup atom ([`crate::atoms::GroupMmaAtom`]) the grid's
+    /// rows are warpgroups of four warps, shared operands are read through
+    /// descriptors (over the swizzled rows) and never loaded into registers.
     pub core: Core,
 }
 
 impl Lowering {
-    /// `device`'s uniform pipeline over `grid`, its ring `unroll`ed or not.
-    pub fn uniform(device: &Device, unroll: bool, grid: WarpGrid) -> Self {
-        let schedule = Schedule::Uniform { fill: device.target.fill, unroll, async_products: false };
-        Self { device: device.clone(), schedule, grid, core: Core::Warp }
+    /// `device`'s warp-level core.
+    pub fn new(device: &Device) -> Self {
+        Self { device: device.clone(), core: Core::Warp }
     }
 }
 
@@ -74,13 +73,13 @@ pub struct Lowered {
 /// `params` are the flat buffer UOps in `prog.params` order (placeholders on
 /// the graph path, `UOp::param`s on the direct one).
 pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Lowered> {
-    let grid = lowering.grid.count();
+    let grid = prog.warp_grid.count();
     let lone = prog.walk().any(|(_, s)| matches!(s, Stmt::Warps { .. }));
     ensure!(prog.warps.is_multiple_of(grid) && (prog.warps == grid || lone), GridSnafu { warps: prog.warps, grid });
     materialize_operands(&mut prog, lowering.core);
     sync::insert_barriers(&mut prog)?;
-    schedule::expand(&mut prog, lowering.schedule);
-    let mut laid = layouts::infer(prog, &lowering.device, lowering.grid, lowering.core).context(LayoutSnafu)?;
+    schedule::expand(&mut prog, lowering.device.target.fill, lowering.core);
+    let mut laid = layouts::infer(prog, &lowering.device, lowering.core).context(LayoutSnafu)?;
     orient_shared(&mut laid, &lowering.device.target);
     let program = emit::emit(&laid, lowering, params, device)?;
     let Laid { prog, layouts } = laid;

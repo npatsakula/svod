@@ -5,11 +5,12 @@ sidebar_label: Layouts and Lowering
 # Layouts and Lowering
 
 `lower::lower(program, &lowering, params, device)` turns a tile program into a Svod program
-whose instruction list is already in order. A `Lowering` holds everything the author did not
-decide: the `Device` (the target and its costs), the `Schedule`, the `WarpGrid` over the block
-tile, and which matrix instruction the products issue on (`core`); shared rows are always
-XOR-swizzled. Each kernel config builds its own (`GemmCfg::lowering`, `FaCfg::lowering`,
-`NormCfg::lowering`). `lower::standalone(program, &lowering)` lowers for a target with no device
+whose instruction list is already in order. A `Lowering` holds what the program does not say:
+the `Device` (the target and its costs) and which matrix instruction the products issue on
+(`core`): `Lowering::new(&device)` for the warp-level core, `GemmCfg::lowering` and
+`FaCfg::lowering` for their config's. The `WarpGrid` over the block tile (`Kernel::warps`) and
+each ring's schedule (`pipeline`'s `Ring`) are the program's own; shared rows are always
+XOR-swizzled. `lower::standalone(program, &lowering)` lowers for a target with no device
 attached, and `lower::render` returns the LLVM text the backend's compiler would be handed.
 
 | Step | Module | Effect |
@@ -107,18 +108,18 @@ attention configs both offer this core on sm_90.
 
 ## Schedule templates
 
-`schedule::Schedule::Uniform { fill, unroll, async_products }`: every warp loads and computes.
-`Schedule::PingPong { crew }`: two crews of `crew` warps over one register-staged slot (CDNA
-GEMM, `GemmCfg::crews == 2`).
+`schedule::expand` runs each `Pipeline` by its `Ring { stages, unroll, crews }` and the
+target's `Fill`. One crew: every warp loads and computes. Two crews: the block's warps as two
+crews a cluster apart over one register-staged slot (CDNA GEMM, `GemmCfg::crews == 2`).
 
-| Fill | Expansion of `pipeline(extent, stages, …)` |
+| Fill | Expansion of `pipeline(extent, ring, …)` |
 |---|---|
 | `Fill::CpAsync`, `stages ≥ 2` | One loop of `extent + stages − 1` iterations. Each iteration waits until at most `stages − 2` copy groups are pending, then barriers and consumes step `i − (stages − 1)`. It then issues step `i`'s `cp.async` copies into the slot freed one iteration earlier and commits them as one group (an empty group past the end keeps the count uniform). |
-| `Fill::CpAsync`, `stages ≥ 3`, `async_products` | The same, with the consume's `wgmma` chains left in flight over the next fill: the slot consumed two trips ago is refilled, and after each consume every thread waits for all but its youngest chain (`Sync::WaitProducts`). |
+| `Fill::CpAsync`, `stages ≥ 3`, warpgroup core, a consume whose products only feed products | The same, with the consume's `wgmma` chains left in flight over the next fill: the slot consumed two trips ago is refilled, and after each consume every thread waits for all but its youngest chain (`Sync::WaitProducts`). |
 | `Fill::CpAsync`, `stages = 1` | Copy, wait, consume, and a barrier before the slot is refilled. |
 | `Fill::Staged`, 2 stages | Three loops over one induction variable: the first trip loads step 0 into registers and stores it to its slot; a steady trip loads step `i` into registers, fences, consumes step `i − 1`, fences, and stores the registers to step `i`'s slot, with no branch in its body (the fences keep the loads ahead of the products and the commit behind them on RDNA); the last trip only consumes. |
 | `Fill::Staged`, 1 stage | The same three loops over one slot: the store waits behind a barrier for every warp to finish the slot, then barriers again, so a tile twice as deep fits the same shared memory. |
-| `PingPong` | A trip is cut at its products into load clusters and product clusters, a block barrier after each, so one crew's products run from registers at raised issue priority while the other crew loads. |
+| two crews | A trip is cut at its products into load clusters and product clusters, a block barrier after each, so one crew's products run from registers at raised issue priority while the other crew loads. |
 
 `unroll` copies the loop body once per ring slot so slot arithmetic folds to constants; the
 tuner measures both. Async and staged copies belong to the template, which fences them. The

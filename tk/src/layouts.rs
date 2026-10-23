@@ -40,6 +40,13 @@ pub struct WarpGrid {
     pub cols: u32,
 }
 
+/// A column of `rows` warps.
+impl From<u32> for WarpGrid {
+    fn from(rows: u32) -> Self {
+        Self { rows, cols: 1 }
+    }
+}
+
 impl WarpGrid {
     pub fn count(self) -> u32 {
         self.rows * self.cols
@@ -908,7 +915,8 @@ pub struct Laid {
 /// product wants, which on a target whose accumulator is its operand's
 /// transpose is free.
 /// Products the author oriented stay as pinned.
-pub fn infer(mut prog: Program, device: &Device, grid: WarpGrid, core: Core) -> Result<Laid> {
+pub fn infer(mut prog: Program, device: &Device, core: Core) -> Result<Laid> {
+    let grid = prog.warp_grid;
     orient_products(&mut prog, device, grid, core)?;
     let mut it = Infer::new(&prog, &device.target, grid, core);
     it.solve()?;

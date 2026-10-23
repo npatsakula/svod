@@ -238,7 +238,7 @@ impl<'a> Emit<'a> {
             smem: vec![],
             typed: HashMap::new(),
             scratch: HashMap::new(),
-            moves: Moves::new(low.grid.count(), low.device.target.wave),
+            moves: Moves::new(prog.warp_grid.count(), low.device.target.wave),
             last: tid.clone(),
             lane,
             warp,

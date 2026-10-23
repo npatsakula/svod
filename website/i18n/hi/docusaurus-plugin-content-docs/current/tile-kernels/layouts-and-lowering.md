@@ -5,11 +5,12 @@ sidebar_label: Layouts और Lowering
 # Layouts और Lowering {#layouts-and-lowering}
 
 `lower::lower(program, &lowering, params, device)` एक tile program को ऐसे Svod program में बदलता है
-जिसकी instruction list पहले से क्रम में है। एक `Lowering` में वह सब होता है जो लेखक ने तय नहीं
-किया: `Device` (target और उसकी costs), `Schedule`, block tile पर `WarpGrid`, और products किस
-matrix instruction पर issue होंगे (`core`); shared rows हमेशा XOR-swizzle होती हैं। हर
-कर्नेल config अपना `Lowering` बनाता है (`GemmCfg::lowering`, `FaCfg::lowering`,
-`NormCfg::lowering`)। `lower::standalone(program, &lowering)` बिना जुड़े device के किसी target के
+जिसकी instruction list पहले से क्रम में है। एक `Lowering` में वह होता है जो program नहीं कहता:
+`Device` (target और उसकी costs) और products किस matrix instruction पर issue होंगे (`core`):
+warp-level core के लिए `Lowering::new(&device)`, अपने config के core के लिए `GemmCfg::lowering`
+और `FaCfg::lowering`। Block tile पर `WarpGrid` (`Kernel::warps`) और हर ring का schedule
+(`pipeline` का `Ring`) program के अपने हैं; shared rows हमेशा XOR-swizzle होती हैं।
+`lower::standalone(program, &lowering)` बिना जुड़े device के किसी target के
 लिए lower करता है, और `lower::render` वह LLVM text लौटाता है जो backend के compiler को सौंपा जाता।
 
 | क़दम | मॉड्यूल | असर |
@@ -105,18 +106,18 @@ ring की swizzled rows पर एक `wgmma` chain के रूप में
 
 ## Schedule templates {#schedule-templates}
 
-`schedule::Schedule::Uniform { fill, unroll, async_products }`: हर warp load भी करता है और compute
-भी। `Schedule::PingPong { crew }`: एक register-staged slot पर `crew` warps की दो crews (CDNA GEMM,
-`GemmCfg::crews == 2`)।
+`schedule::expand` हर `Pipeline` को उसके `Ring { stages, unroll, crews }` और target के `Fill` से
+चलाता है। एक crew: हर warp load भी करता है और compute भी। दो crews: block के warps एक
+register-staged slot पर एक cluster के अंतर से दो crews में (CDNA GEMM, `GemmCfg::crews == 2`)।
 
-| Fill | `pipeline(extent, stages, …)` का expansion |
+| Fill | `pipeline(extent, ring, …)` का expansion |
 |---|---|
 | `Fill::CpAsync`, `stages ≥ 2` | `extent + stages − 1` iterations का एक loop। हर iteration तब तक रुकता है जब तक अधिकतम `stages − 2` copy groups बाक़ी न रहें, फिर barrier करके step `i − (stages − 1)` consume करता है। फिर step `i` की `cp.async` copies को एक iteration पहले ख़ाली हुए slot में भेजता है और उन्हें एक group के रूप में commit करता है (अंत के बाद एक ख़ाली group गिनती को एकसमान रखता है)। |
-| `Fill::CpAsync`, `stages ≥ 3`, `async_products` | वही, पर consume की `wgmma` chains अगले fill के दौरान चलती रहती हैं: दो trips पहले consume हुआ slot फिर से भरा जाता है, और हर consume के बाद हर thread अपनी सबसे नई chain को छोड़कर बाक़ी सबका wait करता है (`Sync::WaitProducts`)। |
+| `Fill::CpAsync`, `stages ≥ 3`, warpgroup core, ऐसा consume जिसके products सिर्फ़ products को feed करते हैं | वही, पर consume की `wgmma` chains अगले fill के दौरान चलती रहती हैं: दो trips पहले consume हुआ slot फिर से भरा जाता है, और हर consume के बाद हर thread अपनी सबसे नई chain को छोड़कर बाक़ी सबका wait करता है (`Sync::WaitProducts`)। |
 | `Fill::CpAsync`, `stages = 1` | Copy, wait, consume, और slot फिर से भरने से पहले एक barrier। |
 | `Fill::Staged`, 2 stages | एक ही induction variable पर तीन loops: पहला trip step 0 को registers में load करके उसके slot में store करता है; steady trip step `i` को registers में load करता है, fence करता है, step `i − 1` consume करता है, fence करता है, और registers को step `i` के slot में store करता है, उसकी body में कोई branch नहीं (RDNA पर fences loads को products से पहले और commit को उनके बाद रखते हैं); आख़िरी trip सिर्फ़ consume करता है। |
 | `Fill::Staged`, 1 stage | एक ही slot पर वही तीन loops: store एक barrier के पीछे तब तक रुकता है जब तक हर warp slot से निपट न जाए, फिर दोबारा barrier, ताकि उसी shared memory में दोगुना गहरा tile समा जाए। |
-| `PingPong` | एक trip अपने products पर कटकर load clusters और product clusters में बँटता है, हर एक के बाद block barrier, ताकि एक crew के products बढ़ी issue priority पर registers से चलें जबकि दूसरी crew load कर रही हो। |
+| दो crews | एक trip अपने products पर कटकर load clusters और product clusters में बँटता है, हर एक के बाद block barrier, ताकि एक crew के products बढ़ी issue priority पर registers से चलें जबकि दूसरी crew load कर रही हो। |
 
 `unroll` loop body को हर ring slot के लिए एक बार copy करता है ताकि slot arithmetic constants में fold
 हो जाए; tuner दोनों को मापता है। Async और staged copies template की ज़िम्मेदारी हैं, जो उन्हें fence

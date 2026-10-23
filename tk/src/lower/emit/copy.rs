@@ -26,7 +26,7 @@ impl Emit<'_> {
     /// The warps a register tile is spread over: the lowering's grid, which
     /// key warps sharing a block's tiles are not part of.
     pub(super) fn grid_warps(&self) -> u32 {
-        self.low.grid.count()
+        self.prog.warp_grid.count()
     }
 
     /// Global → shared, every thread of the copy's scope (the block's, or
@@ -140,7 +140,7 @@ impl Emit<'_> {
             return self.tr_load_regs(dst, &s, &l, &perm);
         }
         let gathered = matches!(s.place, Some(Place::Global { rows: Some(_), .. }));
-        let l2_only = mode == CopyMode::Staged && self.low.schedule.fill() == Fill::CpAsync;
+        let l2_only = mode == CopyMode::Staged && self.low.device.target.fill == Fill::CpAsync;
         for (j, w) in self.runs(&l, &s) {
             let c = self.coord(&l, j);
             let (off, gate) = self.address(&s, &c);

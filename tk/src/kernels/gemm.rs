@@ -8,9 +8,7 @@ use super::{Act, Batch, batch_offset, bound, konst, load_f32};
 use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
-use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
-use crate::schedule::Schedule;
 
 /// What runs on the accumulator before the single rounding at the store.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -118,14 +116,12 @@ pub const KSLICE: usize = 16;
 
 impl GemmCfg {
     pub fn lowering(&self, device: &Device) -> Lowering {
-        let grid = WarpGrid { rows: self.warps[0], cols: self.warps[1] };
-        if self.crews == 2 {
-            let schedule = Schedule::PingPong { crew: self.warps[1] };
-            return Lowering { schedule, ..Lowering::uniform(device, false, grid) };
-        }
-        let async_products = self.core == Core::Group && self.stages >= 3;
-        let schedule = Schedule::Uniform { fill: device.target.fill, unroll: self.unroll, async_products };
-        Lowering { core: self.core, schedule, ..Lowering::uniform(device, self.unroll, grid) }
+        Lowering { core: self.core, ..Lowering::new(device) }
+    }
+
+    /// The pipeline's ring.
+    pub fn ring(&self) -> Ring {
+        Ring { stages: self.stages, unroll: self.unroll, crews: self.crews }
     }
 
     /// The k-slices each operand of a slot is held as, one after another:
@@ -223,7 +219,7 @@ fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     let (gm, gn) = (m.div_ceil(bm), n.div_ceil(bn));
     let (gz, bb) = if partial { (Sc::from(split), Some(k.block(2))) } else { batch.axis(&mut k) };
     k.grid([Sc::from(gm), Sc::from(gn), gz]);
-    k.warps(cfg.warps[0] * cfg.warps[1]);
+    k.warps(WarpGrid { rows: cfg.warps[0], cols: cfg.warps[1] });
 
     let (bx, by) = tile_order(&mut k, gm, gn);
     let (row0, col0) = (bx * bm, by * bn);
@@ -233,15 +229,15 @@ fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
         let v = k.view(b, half * n * kk, [kk, 1], Shape::new(bn, bk), [n_bound.clone(), None]);
         k.at(v, col0.clone(), 0)
     };
-    let stages = cfg.stages;
+    let ring = cfg.ring();
     let first_step = partial.then(|| bb.clone().expect("the split index") * (trips / split));
     let sa = Shape::new(bm, bk);
     let accs = if epi.gated {
         let halves = [b_view(&mut k, 0), b_view(&mut k, 1)];
-        mainloop(&mut k, sa, &a_tile, halves, trips / split, stages, bk, first_step, cfg.slices()).to_vec()
+        mainloop(&mut k, sa, &a_tile, halves, trips / split, ring, bk, first_step, cfg.slices()).to_vec()
     } else {
         let whole = [b_view(&mut k, 0)];
-        mainloop(&mut k, sa, &a_tile, whole, trips / split, stages, bk, first_step, cfg.slices()).to_vec()
+        mainloop(&mut k, sa, &a_tile, whole, trips / split, ring, bk, first_step, cfg.slices()).to_vec()
     };
     let accs = accs.into_iter().map(|acc| T::widened(&mut k, acc)).collect();
     let tile = Tile2 { m, n, bm, bn, row0, col0 };
@@ -318,20 +314,6 @@ pub struct SplitMergeSpec {
     pub tile: [usize; 2],
 }
 
-impl SplitMergeSpec {
-    pub fn lowering(&self, device: &Device) -> Lowering {
-        GemmCfg {
-            tile: [self.tile[0], self.tile[1], 16],
-            stages: 1,
-            warps: [4, 1],
-            unroll: false,
-            core: Core::Warp,
-            crews: 1,
-        }
-        .lowering(device)
-    }
-}
-
 /// Parameters in order: `partial [split, m, n]` f32, `bias [n]` if any,
 /// `residual [m, n]` if any, `c [m, n]` (f32 when `out_f32`).
 pub fn split_merge<T: Elem>(spec: &SplitMergeSpec) -> Program {
@@ -382,19 +364,20 @@ pub(super) fn mainloop<T: MmaIn, const N: usize>(
     a: &impl Fn(&mut Kernel, Sc, Sc) -> Gmem<T>,
     bs: [Gmem<T>; N],
     trips: usize,
-    stages: usize,
+    ring: Ring,
     bk: usize,
     first_step: Option<Sc>,
     slices: usize,
 ) -> [Regs<T::Acc>; N] {
     let sb = k.shape(bs[0]);
     let (sa_s, sb_s) = (Shape::new(sa.rows, bk / slices), Shape::new(sb.rows, bk / slices));
+    let stages = ring.stages;
     let a_s = k.smem::<T>("a_s", stages * sa.elems());
     let b_s = [(); N].map(|()| k.smem::<T>("b_s", stages * sb.elems()));
     let init = [(); N].map(|()| k.zeros::<T::Acc>(Shape::new(sa.rows, sb.rows)));
     k.pipeline(
         trips,
-        stages,
+        ring,
         init,
         |k, step, slot| {
             let step = first_step.map_or(step.clone(), |s| s + step);

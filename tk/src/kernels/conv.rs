@@ -92,7 +92,7 @@ impl ConvSpec {
         let mut out = vec![(conv::<T>(self), self.cfg.lowering(device))];
         if self.split > 1 {
             let merge = self.merge();
-            out.push((split_merge::<T>(&merge), merge.lowering(device)));
+            out.push((split_merge::<T>(&merge), Lowering::new(device)));
         }
         out
     }

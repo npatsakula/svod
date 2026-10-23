@@ -257,25 +257,39 @@ fn units_count_the_primitive(target: Target) {
     }
     assert_eq!(find(&probes, "global_byte").units, STREAM as f64, "the stream is read once");
     let [trip, rolled, one] = ["trip", "trip_rolled", "trip_one"].map(|f| find(&probes, f));
-    let unroll = |p: &Probe| -> Vec<bool> {
-        p.candidates
-            .iter()
-            .map(|c| match c[0].1.schedule {
-                crate::schedule::Schedule::Uniform { unroll, .. } => unroll,
-                crate::schedule::Schedule::PingPong { .. } => panic!("a probe runs every warp alike"),
+    // Each candidate's ring: unrolled or not, `None` without one.
+    let unroll = |p: &Probe| -> Vec<Option<bool>> {
+        let ring = |c: &crate::tune::Candidate| {
+            c[0].0.walk().find_map(|(_, s)| match s {
+                Stmt::Pipeline(p) => {
+                    assert_eq!(p.crews, 1, "a probe runs every warp alike");
+                    Some(p.unroll)
+                }
+                _ => None,
             })
-            .collect()
+        };
+        p.candidates.iter().map(ring).collect()
     };
-    assert_eq!(unroll(trip), vec![true; 2], "the ring unrolled");
+    assert_eq!(unroll(trip), [None, Some(true)], "the ring unrolled");
     // A rolled ring is priced apart only where the fill goes through registers.
     let rolled = (target.fill == Fill::Staged).then_some(rolled);
     if let Some(rolled) = rolled {
-        assert_eq!(unroll(rolled), vec![false; 2], "then rolled");
-        assert_eq!(pair(trip), pair(rolled), "the same programs");
+        assert_eq!(unroll(rolled), [None, Some(false)], "then rolled");
+        fn roll(block: &mut Block) {
+            for s in &mut block.0 {
+                if let Stmt::Pipeline(p) = s {
+                    p.unroll = false;
+                }
+                s.blocks_mut().for_each(roll);
+            }
+        }
+        let (base, mut probe) = (pair(trip).0.clone(), pair(trip).1.clone());
+        roll(&mut probe.body);
+        assert_eq!((&base, &probe), pair(rolled), "the same programs");
     }
     // The one-slot trip: the ring one slot deep, rolled, against a baseline
     // reading its fragments from a ring as deep.
-    assert_eq!(unroll(one), vec![false; 2], "a one-slot ring has nothing to unroll");
+    assert_eq!(unroll(one), [None, Some(false)], "a one-slot ring has nothing to unroll");
     let ring = |p: &Program| p.smem.iter().map(|a| a.elems).collect::<Vec<_>>();
     for p in [Some(trip), rolled, Some(one)].into_iter().flatten() {
         let (base, probe) = pair(p);
