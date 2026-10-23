@@ -1,3 +1,4 @@
+mod aligner;
 mod batched_step;
 mod batched_transcribe;
 mod beam;

@@ -5,6 +5,7 @@ use ndarray::array;
 use svod_dtype::DType;
 use svod_ir::Op;
 use svod_ir::ops;
+use test_case::test_case;
 
 #[test]
 fn test_axis_spec_all() {
@@ -881,4 +882,29 @@ fn test_prod_with_preserves_dtype_by_default() {
     let x = Tensor::from_slice([2i8, 3, 4]);
     assert_eq!(x.prod_with().axes(()).call().unwrap().uop().dtype(), DType::Int8);
     assert_eq!(x.prod_with().axes(()).promote(true).call().unwrap().uop().dtype(), DType::Int32);
+}
+
+/// `min` and `argmin` over the same axis fuse into one kernel whose upcast
+/// output lanes carry the `min` accumulator; its float lowering negates with a
+/// rank-0 `-1` expanded to the lane shape, which once kept one index per lane
+/// axis and reached the LLVM renderer as a multi-index INDEX of a constant.
+#[test_case(5 ; "five")]
+#[test_case(6 ; "six")]
+#[test_case(8 ; "eight")]
+fn test_argmin_fuses_with_min_of_the_same_axis(m: usize) {
+    // Row 0 is all infinity, so the `where` takes both branches.
+    let data: Vec<f32> = (0..m * m).map(|v| if v < m { f32::INFINITY } else { ((v * 7) % 11) as f32 }).collect();
+    let s = Tensor::from_slice(&data).try_reshape([m as isize, m as isize]).unwrap();
+    let none = s.min(1isize).unwrap().try_eq(f32::INFINITY).unwrap();
+    let w = Tensor::const_(-1i32, DType::Int32).where_(&none, s.argmin(1).unwrap()).unwrap();
+    w.realize().unwrap();
+
+    let expected: Vec<i32> = data
+        .chunks(m)
+        .map(|row| {
+            let min = row.iter().copied().fold(f32::INFINITY, f32::min);
+            if min == f32::INFINITY { -1 } else { row.iter().position(|&x| x == min).unwrap() as i32 }
+        })
+        .collect();
+    assert_eq!(w.as_vec::<i32>().unwrap(), expected);
 }

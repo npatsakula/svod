@@ -60,29 +60,27 @@ impl Emit<'_> {
 const DPP_ROW_XMASK: u32 = 0x160;
 
 /// `value` as the 32-bit word a lane move carries, and the way back: a
-/// 16-bit value travels zero-extended. A lane move carries one 2- or 4-byte
-/// scalar, nothing else.
+/// narrower value travels zero-extended. A lane move carries one 1-, 2- or
+/// 4-byte scalar, nothing else.
 fn as_word(value: &Arc<UOp>) -> (Arc<UOp>, impl Fn(Arc<UOp>) -> Arc<UOp>) {
     let dtype = value.dtype();
     let bytes = dtype.scalar().map(|s| s.bytes());
-    assert!(matches!(bytes, Some(2 | 4)), "a lane move carries a 2- or 4-byte scalar, not {dtype:?}");
-    let wide = bytes == Some(4);
-    let int = dtype == DType::Int32;
-    let word = if int {
-        value.clone()
-    } else if wide {
-        value.bitcast(DType::Int32)
-    } else {
-        value.bitcast(DType::Scalar(ScalarDType::UInt16)).cast(DType::Int32)
+    let narrow = match bytes {
+        Some(1) => Some(ScalarDType::UInt8),
+        Some(2) => Some(ScalarDType::UInt16),
+        Some(4) => None,
+        _ => panic!("a lane move carries a 1-, 2- or 4-byte scalar, not {dtype:?}"),
     };
-    let back = move |w: Arc<UOp>| {
-        if int {
-            w
-        } else if wide {
-            w.bitcast(dtype.clone())
-        } else {
-            w.cast(DType::Scalar(ScalarDType::UInt16)).bitcast(dtype.clone())
-        }
+    let int = dtype == DType::Int32;
+    let word = match narrow {
+        _ if int => value.clone(),
+        None => value.bitcast(DType::Int32),
+        Some(unsigned) => value.bitcast(DType::Scalar(unsigned)).cast(DType::Int32),
+    };
+    let back = move |w: Arc<UOp>| match narrow {
+        _ if int => w,
+        None => w.bitcast(dtype.clone()),
+        Some(unsigned) => w.cast(DType::Scalar(unsigned)).bitcast(dtype.clone()),
     };
     (word, back)
 }
@@ -117,6 +115,17 @@ pub(super) fn dpp_xor(value: &Arc<UOp>, mask: u32) -> Arc<UOp> {
         );
     }
     back(word)
+}
+
+/// The lanes of a `wave`-lane wave where `lane` holds, as a mask: an
+/// integer of the wave's width, uniform over its lanes.
+pub(super) fn ballot(lane: &Arc<UOp>, wave: u32) -> Arc<UOp> {
+    let (bits, dtype) = if wave == 64 { (64, DType::Int64) } else { (32, DType::Int32) };
+    UOp::custom(
+        smallvec![lane.clone()],
+        format!("declare i{bits} @llvm.amdgcn.ballot.i{bits}(i1)\ncall i{bits} @llvm.amdgcn.ballot.i{bits}(i1 {{0}})"),
+        dtype,
+    )
 }
 
 /// An f32 `2^x` as the hardware instruction alone (`v_exp_f32`).

@@ -641,12 +641,12 @@ pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &mut IndexingContext)
     if any_changed { Some(new_sources) } else { None }
 }
 
-/// Flatten multi-range STAGE to single-range via RESHAPE to 1D.
+/// Flatten multi-range STAGE to single-range via RESHAPE to 1D (Tinygrad `flatten_bufferize`).
 ///
-/// 1. Reshapes multi-dim ranges to a single flat index via apply_reshape_ranges
-/// 2. Creates new STAGE with single computed range
-/// 3. Wraps with RESHAPE back to original shape for downstream movement ops
-/// 4. For symbolic range ends, adds SHRINK to symbolic shape
+/// The flat index spans the STAGE's concrete extents `int(r.vmax+1)`, the RESHAPE
+/// restores them, and a SHRINK narrows symbolic range ends back to the symbolic
+/// shape. Flattening over the symbolic shape instead leaves `idx % (n*c)`, whose
+/// bounds are unknown once `n` may be 0, so no buffer size can be derived from it.
 ///
 /// After this, `bufferize_to_store` only sees single-range STAGE.
 fn flatten_bufferize(stage: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -654,43 +654,28 @@ fn flatten_bufferize(stage: &Arc<UOp>) -> Option<Arc<UOp>> {
     if ranges.len() <= 1 {
         return None;
     }
-    // Extract shape from ranges: RANGE(end) → SInt::from(end), CONST(0) → 1
-    let shape: Vec<svod_ir::SInt> = ranges
+    let shape: Shape = ranges.iter().map(|r| svod_ir::SInt::from(range_extent(r))).collect();
+    let flat_shape = [svod_ir::sint_prod(&shape)];
+    let flat_indices = super::indexing::apply_reshape_ranges(&flat_shape, &shape, ranges);
+    assert_eq!(flat_indices.len(), 1, "flatten_bufferize: expected 1 flat index, got {}", flat_indices.len());
+    let flat_buf = UOp::stage(compute.clone(), vec![flat_indices[0].clone()], opts.clone());
+    let reshaped = flat_buf.try_reshape(&shape).expect("flatten_bufferize: try_reshape failed");
+
+    let symbolic_end = |r: &Arc<UOp>| match r.op() {
+        Op::Range(ops::Range { end, .. }) if !matches!(end.op(), Op::Const(_)) => Some(end.clone()),
+        _ => None,
+    };
+    if !ranges.iter().any(|r| symbolic_end(r).is_some()) {
+        return Some(reshaped);
+    }
+    let sym_ranges: Vec<(svod_ir::SInt, svod_ir::SInt)> = ranges
         .iter()
-        .map(|r| match r.op() {
-            Op::Range(ops::Range { end, .. }) => svod_ir::SInt::from(end.clone()),
-            _ => svod_ir::SInt::from(1usize),
+        .zip(&shape)
+        .map(|(r, extent)| {
+            (svod_ir::SInt::from(0usize), symbolic_end(r).map_or_else(|| extent.clone(), svod_ir::SInt::from))
         })
         .collect();
-
-    // Flatten: apply_reshape_ranges(in_shape=(prod,), out_shape=shape, rngs=ranges)
-    let flat_shape = vec![svod_ir::sint_prod(&shape)];
-    let ranges_vec: Vec<Arc<UOp>> = ranges.iter().cloned().collect();
-    let flat_indices = super::indexing::apply_reshape_ranges(&flat_shape, &shape, &ranges_vec);
-    assert_eq!(flat_indices.len(), 1, "flatten_bufferize: expected 1 flat index, got {}", flat_indices.len());
-    // New STAGE with single range
-    let flat_buf = UOp::stage(compute.clone(), vec![flat_indices[0].clone()], opts.clone());
-
-    // RESHAPE back to original shape.
-    let shape_smallvec: Shape = shape.iter().cloned().collect();
-    let reshaped = flat_buf.try_reshape(&shape_smallvec).expect("flatten_bufferize: try_reshape failed");
-
-    // For symbolic range ends, add SHRINK to symbolic shape.
-    let has_symbolic =
-        ranges.iter().any(|r| matches!(r.op(), Op::Range(ops::Range { end, .. }) if !matches!(end.op(), Op::Const(_))));
-
-    if has_symbolic {
-        let sym_ranges: Vec<(svod_ir::SInt, svod_ir::SInt)> = ranges
-            .iter()
-            .map(|r| match r.op() {
-                Op::Range(ops::Range { end, .. }) => (svod_ir::SInt::from(0usize), svod_ir::SInt::from(end.clone())),
-                _ => (svod_ir::SInt::from(0usize), svod_ir::SInt::from(1usize)),
-            })
-            .collect();
-        Some(reshaped.try_shrink(&sym_ranges).expect("flatten_bufferize: try_shrink failed for symbolic ranges"))
-    } else {
-        Some(reshaped)
-    }
+    Some(reshaped.try_shrink(&sym_ranges).expect("flatten_bufferize: try_shrink failed for symbolic ranges"))
 }
 
 /// Push movement op or INDEX through AFTER: `AFTER(r(x, ...), deps) → r(AFTER(x, deps), ...)`.
@@ -854,22 +839,19 @@ fn calculate_size_from_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> usize {
         return 1;
     }
 
-    ranges
-        .iter()
-        .map(|r| {
-            // int(r.vmax+1) — works for both RANGE and computed expressions.
-            let vmax = r.vmax();
-            match vmax {
-                ConstValue::Int(v) if *v >= 0 => (*v + 1) as usize,
-                ConstValue::UInt(v) => (*v + 1) as usize,
-                other => panic!(
-                    "Cannot allocate buffer: range vmax resolved to {:?}. \
-                     Buffers require concrete sizes (no symbolic-sized buffers).",
-                    other
-                ),
-            }
-        })
-        .product()
+    ranges.iter().map(range_extent).product()
+}
+
+/// `int(r.vmax+1)`: the concrete extent of a STAGE range, RANGE or computed expression.
+fn range_extent(r: &Arc<UOp>) -> usize {
+    match r.vmax() {
+        ConstValue::Int(v) if *v >= 0 => (*v + 1) as usize,
+        ConstValue::UInt(v) => (*v + 1) as usize,
+        other => panic!(
+            "Cannot allocate buffer: range vmax resolved to {other:?}. \
+             Buffers require concrete sizes (no symbolic-sized buffers)."
+        ),
+    }
 }
 
 /// Sort ranges by (axis_id, axis_type) for correct row-major linearization.

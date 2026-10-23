@@ -116,7 +116,8 @@ fn gemm_nt(m: usize, n: usize, kk: usize, [bm, bn, bk]: [usize; 3], stages: usiz
 [Шаблон расписания](./layouts-and-lowering#schedule-templates) решает, насколько вперёд идут
 копии, и расставляет каждое ожидание и барьер.
 
-**Произведение.** `mma(acc, a, a_t, b, b_t)` — это `acc + A·B` на аккумуляторах f32, здесь `B`
+**Произведение.** `mma(acc, a, a_t, b, b_t)` — это `acc + A·B` на аккумуляторах f32 (i32 над 8-битными
+целыми, `MmaIn::Acc`), здесь `B`
 читается транспонированной. Инструкцию оно никогда не называет: понижение выбирает атом
 матричного ядра цели и даёт `a`, `b` и `acc` его раскладки. Результат округляется один раз — при
 приведении типа перед записью.
@@ -160,6 +161,6 @@ c.realize()?;
 | Объявления | `param`, `var` (переменная запуска, связываемая по имени), `grid`, `warps`, `smem` |
 | Скаляры | `block(axis)`, `warp()`, `row()` (внутри отображения gather), `load_scalar(param, index)`, операторы `Sc` и `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | View | `view`, `gather` (view с отображением строк), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
-| Тайловые операции | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (вектор-строка или вектор-столбец транслируется), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (одно округление), `reduce`, `reduce_f32`, `transpose`, `mma`, `mma_oriented`, `pin` |
+| Тайловые операции | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (вектор-строка или вектор-столбец транслируется), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (одно округление), `reduce`, `reduce_f32`, `transpose`, `shift` (сдвиг на шаг вдоль оси, первым — заполнитель), `flip` (обмен каждого элемента с партнёром через биты маски вдоль оси: шаг сортирующей сети), `mma`, `mma_oriented`, `pin` |
 | Перемещение | `stage` (global → shared, `CopyMode::Async` или `Sync`), `load`, `load_as_fill`, `store` |
-| Управление | `loop_` (переносимые регистровые тайлы), `pipeline`, `if_`, `select_if` (ветви, производящие тайлы), `each_warp` (инструкция `Warps`), `barrier` |
+| Управление | `loop_` (переносимые регистровые тайлы), `pipeline`, `if_`, `select_if` (ветви, производящие тайлы), `where_any` (`where_`, выбранную сторону которого вычисляют только варпы с установленным элементом предиката), `each_warp` (инструкция `Warps`), `barrier` |

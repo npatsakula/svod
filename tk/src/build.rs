@@ -22,18 +22,49 @@ macro_rules! elem {
         }
     )*};
 }
-elem!(BF16 = BFloat16, F16 = Float16, F32 = Float32, I32 = Int32, Bool = Bool);
+elem!(BF16 = BFloat16, F16 = Float16, I8 = Int8, F32 = Float32, I32 = Int32, Bool = Bool);
 
-pub trait TierMark: Copy {
-    const TIER: Tier;
+/// An element a matrix core multiplies, and the element it accumulates into:
+/// f32 for 16-bit floats, i32 for 8-bit integers (exact, as their products
+/// and sums are).
+pub trait MmaIn: Elem {
+    type Acc: Elem;
+
+    /// An accumulator's values in f32: as held, or converted from i32.
+    fn widened(k: &mut Kernel, acc: Regs<Self::Acc>) -> Regs<F32>;
 }
+
+/// A 16-bit float operand, accumulated in f32.
+pub trait Half: MmaIn<Acc = F32> {}
+
+macro_rules! half {
+    ($($name:ident),*) => {$(
+        impl MmaIn for $name {
+            type Acc = F32;
+
+            fn widened(_: &mut Kernel, acc: Regs<F32>) -> Regs<F32> {
+                acc
+            }
+        }
+        impl Half for $name {}
+    )*};
+}
+half!(BF16, F16);
+
+impl MmaIn for I8 {
+    type Acc = I32;
+
+    fn widened(k: &mut Kernel, acc: Regs<I32>) -> Regs<F32> {
+        k.cast::<I32, F32>(acc)
+    }
+}
+
+pub trait TierMark: Copy {}
 macro_rules! tier {
     ($($name:ident),*) => {$(
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub struct $name;
-        impl TierMark for $name {
-            const TIER: Tier = Tier::$name;
-        }
+        impl TierMark for $name {}
     )*};
 }
 tier!(Global, Smem, Reg);
@@ -434,29 +465,29 @@ impl Kernel {
 
     /// `acc + A·B` where `A` is `[m, k]` (or `[k, m]` when `a_t`) and `B` is
     /// `[k, n]` (or `[n, k]` when `b_t`); operands may live in registers or
-    /// shared memory.
-    pub fn mma<T: Elem, PA: TierMark, PB: TierMark>(
+    /// shared memory, the accumulator in `T`'s type ([`MmaIn::Acc`]).
+    pub fn mma<T: MmaIn, PA: TierMark, PB: TierMark>(
         &mut self,
-        acc: Regs<F32>,
+        acc: Regs<T::Acc>,
         a: Tile<PA, T>,
         a_t: bool,
         b: Tile<PB, T>,
         b_t: bool,
-    ) -> Regs<F32> {
+    ) -> Regs<T::Acc> {
         self.mma_oriented(acc, a, a_t, b, b_t, None)
     }
 
     /// [`Self::mma`] pinned to issue `orient` way round; `None` leaves the
     /// choice to the layout inference.
-    pub fn mma_oriented<T: Elem, PA: TierMark, PB: TierMark>(
+    pub fn mma_oriented<T: MmaIn, PA: TierMark, PB: TierMark>(
         &mut self,
-        acc: Regs<F32>,
+        acc: Regs<T::Acc>,
         a: Tile<PA, T>,
         a_t: bool,
         b: Tile<PB, T>,
         b_t: bool,
         orient: Option<Orient>,
-    ) -> Regs<F32> {
+    ) -> Regs<T::Acc> {
         let (sacc, sa, sb) = (self.shape(acc), self.shape(a), self.shape(b));
         let (m, ka) = if a_t { (sa.cols, sa.rows) } else { (sa.rows, sa.cols) };
         let (kb, n) = if b_t { (sb.cols, sb.rows) } else { (sb.rows, sb.cols) };
@@ -501,6 +532,39 @@ impl Kernel {
     pub fn transpose<T: Elem>(&mut self, src: Regs<T>) -> Regs<T> {
         let shape = self.shape(src).transposed();
         self.let_(shape, TileOp::Transpose { src: src.0 })
+    }
+
+    /// `src` one step on along `axis`, `fill` first ([`TileOp::Shift`]).
+    pub fn shift<T: Elem>(&mut self, src: Regs<T>, axis: Axis, fill: Const) -> Regs<T> {
+        let shape = self.shape(src);
+        self.let_(shape, TileOp::Shift { src: src.0, axis, fill })
+    }
+
+    /// `src` with every element exchanged across the bits of `mask` along
+    /// `axis` ([`TileOp::Flip`]).
+    pub fn flip<T: Elem>(&mut self, src: Regs<T>, axis: Axis, mask: u32) -> Regs<T> {
+        let shape = self.shape(src);
+        let len = if axis == Axis::Col { shape.cols } else { shape.rows };
+        let span = (mask as usize + 1).next_power_of_two();
+        assert!(mask > 0 && len.is_multiple_of(span), "a flip across {mask:#b} of {len}");
+        self.let_(shape, TileOp::Flip { src: src.0, axis, mask })
+    }
+
+    /// The `j`th of the columns each lane holds of `src`'s rows, `w` a row
+    /// ([`TileOp::Deal`]): over `j < cols / w`, every column of a row once.
+    pub fn deal<T: Elem>(&mut self, src: Regs<T>, w: usize, j: usize) -> Regs<T> {
+        self.dealt(src, w, j, false)
+    }
+
+    /// The columns of `src` that [`Self::deal`] of the same `w` and `j` takes.
+    pub fn deal_col<T: Elem>(&mut self, src: Regs<T>, w: usize, j: usize) -> Regs<I32> {
+        self.dealt(src, w, j, true)
+    }
+
+    fn dealt<T: Elem, U: Elem>(&mut self, src: Regs<T>, w: usize, j: usize, col: bool) -> Regs<U> {
+        let shape = self.shape(src);
+        assert!(w > 0 && shape.cols.is_multiple_of(w) && j < shape.cols / w, "deal {j} of {shape:?} by {w}");
+        self.let_(Shape::new(shape.rows, w), TileOp::Deal { src: src.0, j: j as u32, col })
     }
 
     /// Hold `v` under `layout` (see [`Program::pins`]).
@@ -551,11 +615,40 @@ impl Kernel {
 
     // ---- control ---------------------------------------------------------
 
-    fn carried<const N: usize>(&mut self, init: [ValId; N]) -> [ValId; N] {
-        init.map(|i| {
-            let Value { dtype, shape, .. } = self.prog.value(i).clone();
-            self.value(dtype, shape, Place::Reg)
-        })
+    fn carried<T>(&mut self, init: &[Regs<T>]) -> Vec<ValId> {
+        init.iter()
+            .map(|i| {
+                let Value { dtype, shape, .. } = self.prog.value(i.0).clone();
+                self.value(dtype, shape, Place::Reg)
+            })
+            .collect()
+    }
+
+    /// A carried value whose next is defined outside its body (another
+    /// carried value, as a ring rotating its slots, or a value from before
+    /// the loop) takes a copy of it made where the body starts: the moves
+    /// into the carried values then read what the iteration began with,
+    /// as the interpreter's simultaneous assignment does, and a next the
+    /// body never defines still moves.
+    fn snapshot_carried<T: Elem>(&mut self, body: &mut Block, phi: &[ValId], next: &mut [Regs<T>]) {
+        let defined: std::collections::HashSet<ValId> = body
+            .walk()
+            .filter_map(|(_, s)| match s {
+                Stmt::Let { dst, .. } | Stmt::Copy { dst, .. } => Some(*dst),
+                _ => None,
+            })
+            .collect();
+        let mut copies = vec![];
+        for (n, &p) in next.iter_mut().zip(phi) {
+            if n.0 == p || defined.contains(&n.0) {
+                continue;
+            }
+            let Value { dtype, shape, .. } = self.prog.value(n.0).clone();
+            let dst = self.value(dtype, shape, Place::Reg);
+            copies.push(Stmt::Let { dst, op: TileOp::Move { src: n.0 } });
+            *n = Tile::new(dst);
+        }
+        body.0.splice(0..0, copies);
     }
 
     fn with_block(&mut self, f: impl FnOnce(&mut Self)) -> Block {
@@ -572,14 +665,26 @@ impl Kernel {
         init: [Regs<T>; N],
         body: impl FnOnce(&mut Self, Sc, [Regs<T>; N]) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
+        let out = self.loop_vec(extent, init.to_vec(), |k, iv, phi| body(k, iv, tiles(phi)).to_vec());
+        tiles(out)
+    }
+
+    /// [`Self::loop_`] over as many tiles as `init` holds.
+    pub fn loop_vec<T: Elem>(
+        &mut self,
+        extent: impl Into<Sc>,
+        init: Vec<Regs<T>>,
+        body: impl FnOnce(&mut Self, Sc, Vec<Regs<T>>) -> Vec<Regs<T>>,
+    ) -> Vec<Regs<T>> {
         let (start, extent) = (self.intern(0), self.intern(extent));
         let iv = self.push_scalar(Scalar::Induction);
-        let phi = self.carried(init.map(ValId::from));
-        let mut next = [ValId(0); N];
-        let block = self.with_block(|k| next = body(k, Sc::Id(iv), phi.map(Tile::new)).map(ValId::from));
-        let carried = (0..N).map(|i| Carried { init: init[i].0, phi: phi[i], next: next[i] }).collect();
+        let phi = self.carried(&init);
+        let mut next = vec![];
+        let mut block = self.with_block(|k| next = body(k, Sc::Id(iv), phi.iter().map(|&v| Tile::new(v)).collect()));
+        self.snapshot_carried(&mut block, &phi, &mut next);
+        let carried = carry(&init, &phi, &next);
         self.push(Stmt::Loop(Loop { iv, start, extent, carried, body: block, unroll: 1 }));
-        phi.map(Tile::new)
+        phi.into_iter().map(Tile::new).collect()
     }
 
     /// A producer/consumer loop over `extent` steps with `stages` slots.
@@ -593,19 +698,34 @@ impl Kernel {
         produce: impl FnOnce(&mut Self, Sc, Sc),
         consume: impl FnOnce(&mut Self, Sc, Sc, [Regs<T>; N]) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
+        let consume = |k: &mut Self, step, slot, phi: Vec<Regs<T>>| consume(k, step, slot, tiles(phi)).to_vec();
+        tiles(self.pipeline_vec(extent, stages, init.to_vec(), produce, consume))
+    }
+
+    /// [`Self::pipeline`] over as many tiles as `init` holds.
+    pub fn pipeline_vec<T: Elem>(
+        &mut self,
+        extent: impl Into<Sc>,
+        stages: usize,
+        init: Vec<Regs<T>>,
+        produce: impl FnOnce(&mut Self, Sc, Sc),
+        consume: impl FnOnce(&mut Self, Sc, Sc, Vec<Regs<T>>) -> Vec<Regs<T>>,
+    ) -> Vec<Regs<T>> {
         assert!(stages >= 1, "at least one stage");
         let extent = self.intern(extent);
         let [pstep, pslot, cstep, cslot] = [(); 4].map(|()| self.push_scalar(Scalar::Induction));
-        let phi = self.carried(init.map(ValId::from));
+        let phi = self.carried(&init);
         let body = self.with_block(|k| produce(k, Sc::Id(pstep), Sc::Id(pslot)));
         let produce = Stage { step: pstep, slot: pslot, body };
-        let mut next = [ValId(0); N];
-        let body =
-            self.with_block(|k| next = consume(k, Sc::Id(cstep), Sc::Id(cslot), phi.map(Tile::new)).map(ValId::from));
+        let mut next = vec![];
+        let mut body = self.with_block(|k| {
+            next = consume(k, Sc::Id(cstep), Sc::Id(cslot), phi.iter().map(|&v| Tile::new(v)).collect())
+        });
+        self.snapshot_carried(&mut body, &phi, &mut next);
         let consume = Stage { step: cstep, slot: cslot, body };
-        let carried = (0..N).map(|i| Carried { init: init[i].0, phi: phi[i], next: next[i] }).collect();
+        let carried = carry(&init, &phi, &next);
         self.push(Stmt::Pipeline(Pipeline { extent, stages, carried, produce, consume }));
-        phi.map(Tile::new)
+        phi.into_iter().map(Tile::new).collect()
     }
 
     /// Every warp runs `body` on its own ([`Stmt::Warps`]): [`warp`](Self::warp)
@@ -633,19 +753,32 @@ impl Kernel {
         then: impl FnOnce(&mut Self) -> [Regs<T>; N],
         otherwise: impl FnOnce(&mut Self) -> [Regs<T>; N],
     ) -> [Regs<T>; N] {
+        tiles(self.select_if_vec(pred, |k| then(k).to_vec(), |k| otherwise(k).to_vec()))
+    }
+
+    /// [`Self::select_if`] over as many tiles as the branches produce.
+    pub fn select_if_vec<T: Elem>(
+        &mut self,
+        pred: impl Into<Sc>,
+        then: impl FnOnce(&mut Self) -> Vec<Regs<T>>,
+        otherwise: impl FnOnce(&mut Self) -> Vec<Regs<T>>,
+    ) -> Vec<Regs<T>> {
         let pred = self.intern(pred);
-        let mut merged: Option<[ValId; N]> = None;
-        type Branch<'a, T, const N: usize> = Box<dyn FnOnce(&mut Kernel) -> [Regs<T>; N] + 'a>;
-        let mut branch = |k: &mut Self, f: Branch<'_, T, N>| {
+        let mut merged: Option<Vec<ValId>> = None;
+        type Branch<'a, T> = Box<dyn FnOnce(&mut Kernel) -> Vec<Regs<T>> + 'a>;
+        let mut branch = |k: &mut Self, f: Branch<'_, T>| {
             k.with_block(|k| {
                 let vals = f(k);
-                let out = *merged.get_or_insert_with(|| {
-                    vals.map(|v| {
-                        let Value { dtype, shape, .. } = k.prog.value(v.0).clone();
-                        k.value(dtype, shape, Place::Reg)
-                    })
+                let out = merged.get_or_insert_with(|| {
+                    vals.iter()
+                        .map(|v| {
+                            let Value { dtype, shape, .. } = k.prog.value(v.0).clone();
+                            k.value(dtype, shape, Place::Reg)
+                        })
+                        .collect()
                 });
-                for (dst, v) in out.into_iter().zip(vals) {
+                assert_eq!(out.len(), vals.len(), "both branches produce as many tiles");
+                for (&dst, v) in out.iter().zip(vals) {
                     assert_eq!(k.shape(dst), k.shape(v), "both branches produce the same shapes");
                     k.push(Stmt::Let { dst, op: TileOp::Move { src: v.0 } });
                 }
@@ -654,7 +787,70 @@ impl Kernel {
         let then = branch(self, Box::new(then));
         let otherwise = branch(self, Box::new(otherwise));
         self.push(Stmt::If { pred, then, otherwise });
-        merged.expect("both branches ran").map(Tile::new)
+        merged.expect("both branches ran").into_iter().map(Tile::new).collect()
+    }
+
+    /// `where_(pred, then(k), otherwise)` for each pair of tiles, `then` run
+    /// only by the warps holding some set element of `pred` ([`Scalar::Any`]):
+    /// work most warps skip where `pred` is mostly clear. `then` must hold
+    /// no block barrier.
+    pub fn where_any<T: Elem, const N: usize>(
+        &mut self,
+        pred: Regs<Bool>,
+        then: impl FnOnce(&mut Self) -> [Regs<T>; N],
+        otherwise: [Regs<T>; N],
+    ) -> [Regs<T>; N] {
+        let any = self.scalar(Scalar::Any(pred.0));
+        self.select_if(
+            any,
+            |k| {
+                let mut taken = then(k).into_iter().zip(otherwise);
+                [(); N].map(|()| {
+                    let (t, o) = taken.next().expect("a tile per output");
+                    k.where_(pred, t, o)
+                })
+            },
+            |_| otherwise,
+        )
+    }
+
+    /// `then(k)`, run only by the warps holding some set element of `pred`
+    /// ([`Scalar::Any`]), else `otherwise`; unlike [`Self::where_any`] nothing
+    /// selects between them, so `then` must itself leave the program's results
+    /// what `otherwise` leads to wherever `pred` is clear (a tile it changes
+    /// there may only feed work that changes nothing there). `then` must hold
+    /// no block barrier.
+    ///
+    /// The results hold `otherwise` before the branch, which `then`'s
+    /// replace: no path past it leaves them unset, so a loop around it
+    /// carries none of them from its last trip.
+    pub fn if_any<T: Elem>(
+        &mut self,
+        pred: Regs<Bool>,
+        then: impl FnOnce(&mut Self) -> Vec<Regs<T>>,
+        otherwise: Vec<Regs<T>>,
+    ) -> Vec<Regs<T>> {
+        let any = self.scalar(Scalar::Any(pred.0));
+        let held: Vec<ValId> = otherwise
+            .iter()
+            .map(|v| {
+                let Value { dtype, shape, .. } = self.prog.value(v.0).clone();
+                let dst = self.value(dtype, shape, Place::Reg);
+                self.push(Stmt::Let { dst, op: TileOp::Move { src: v.0 } });
+                dst
+            })
+            .collect();
+        let then = self.with_block(|k| {
+            let vals = then(k);
+            assert_eq!(vals.len(), held.len(), "both branches produce as many tiles");
+            for (&dst, v) in held.iter().zip(vals) {
+                assert_eq!(k.shape(dst), k.shape(v), "both branches produce the same shapes");
+                k.push(Stmt::Let { dst, op: TileOp::Move { src: v.0 } });
+            }
+        });
+        let pred = self.intern(any);
+        self.push(Stmt::If { pred, then, otherwise: Block::default() });
+        held.into_iter().map(Tile::new).collect()
     }
 
     /// A barrier across the block's warps, and a fence of its shared memory;
@@ -668,4 +864,15 @@ impl Kernel {
         self.prog.body = self.blocks.pop().expect("the root block");
         self.prog
     }
+}
+
+/// `N` tiles of a list as long.
+fn tiles<T, const N: usize>(list: Vec<Regs<T>>) -> [Regs<T>; N] {
+    list.try_into().unwrap_or_else(|l: Vec<_>| panic!("{} tiles where {N} are carried", l.len()))
+}
+
+/// Each `init`'s carried register: its `phi` and its `next`.
+fn carry<T>(init: &[Regs<T>], phi: &[ValId], next: &[Regs<T>]) -> Vec<Carried> {
+    assert_eq!(next.len(), init.len(), "a body returns a tile per carried one");
+    (0..init.len()).map(|i| Carried { init: init[i].0, phi: phi[i], next: next[i].0 }).collect()
 }

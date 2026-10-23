@@ -10,7 +10,7 @@ use test_case::test_case;
 
 use super::conv::geom;
 use super::tune::Select;
-use super::{costs, first_eight, planner};
+use super::{costs, first_eight, planner, self_join};
 use crate::atoms::{Core, Costs, Device, Fill, Target, sm86};
 use crate::build::BF16 as BF16T;
 use crate::kernels::Batch;
@@ -22,6 +22,7 @@ use crate::ops::attention::{descend, split_ranked};
 use crate::ops::config::{self, Planner, Run, SHORTLIST, Tiled, gemm_cfg};
 use crate::ops::shape::{self, Extent, Fallback, Plan, extent};
 use crate::ops::{self as tk, Act, Attn, Cache, Error, KeyMask, Linear, Qkv};
+use crate::tune::Compiled;
 
 const BF16: DType = DType::BFloat16;
 
@@ -71,8 +72,7 @@ fn apple() -> Target {
 
 /// The config measured fastest at 4096³ on the 3060 (25.4 TFLOP/s): the
 /// 128×128 tile and three 32-deep slots over eight warps.
-const BIG_MEASURED: GemmCfg =
-    GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 3, warps: [2, 4], group_m: 8, unroll: false, crews: 1 };
+const BIG_MEASURED: GemmCfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
 
 /// A list the planner offers for `k` on `target`: not empty, each config
 /// once, lowering there with its ring in shared memory and dividing `k`;
@@ -81,7 +81,7 @@ fn assert_valid(list: &[GemmCfg], target: &Target, k: usize, gated: bool) {
     assert!(!list.is_empty(), "{list:?}");
     for (i, c) in list.iter().enumerate() {
         assert!(c.fits(target) && k.is_multiple_of(c.tile[2]), "{c:?}");
-        assert!(c.smem_bytes(gated) <= target.smem_bytes, "{c:?}");
+        assert!(c.smem_bytes(gated, 2) <= target.smem_bytes, "{c:?}");
         assert!(!list[..i].contains(c), "{c:?} twice");
     }
     let short = first_eight(list);
@@ -179,7 +179,7 @@ fn a_gated_gemm_is_a_double_width_problem() {
     assert_valid(&gated, &target, 1024, true);
     assert!(gated.iter().all(|c| c.tile[2] >= 32), "{gated:?}");
     let p = config::Problem { batches: 1, m: 4096, n: 3072, k: 1024, halves: 2 };
-    assert!(deep.smem_bytes(true) > target.smem_bytes && p.admit(&planner(target), &deep).is_err());
+    assert!(deep.smem_bytes(true, 2) > target.smem_bytes && p.admit(&planner(target), &deep).is_err());
 }
 
 /// The layout count over-counts gfx11's replicated WMMA fragments: at
@@ -248,15 +248,7 @@ fn an_sm_issues_its_share_of_blocks() {
 fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize, cheap_wins: bool) {
     let problem = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     // A small tile: its residency is bound by shared memory, not registers.
-    let two = GemmCfg {
-        core: Core::Warp,
-        tile: [64, 64, bk],
-        stages: target.fill.stages(3),
-        warps: [2, 2],
-        group_m: 8,
-        unroll: false,
-        crews: 1,
-    };
+    let two = gemm_cfg([64, 64, bk], target.fill.stages(3), [2, 2], false);
     let one = GemmCfg { stages: 1, ..two };
     let c = costs();
     let latency_one = c.latency / (two.stages - 1) as f64;
@@ -391,8 +383,7 @@ fn a_round_pays_the_latency_its_ring_leaves() {
 /// changes nothing.
 #[test]
 fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
-    let cfg =
-        |warps| GemmCfg { core: Core::Warp, tile: [64, 64, 32], stages: 3, warps, group_m: 8, unroll: false, crews: 1 };
+    let cfg = |warps| gemm_cfg([64, 64, 32], 3, warps, false);
     let p = config::Problem { batches: 1, m: 64 * 28, n: 64 * 28, k: 4096, halves: 1 };
     let ratio = |step_lone| {
         let planner = planned(Device { target: sm86(), costs: Costs { step_lone, ..costs() } });
@@ -468,15 +459,7 @@ fn blocks_in_flight_share_their_lines_past_the_cache() {
 /// second tile comes after every class's first, and every config is kept.
 #[test]
 fn the_ranking_leads_with_a_tile_of_each_block() {
-    let cfg = |tile: [usize; 3], warps: [u32; 2], stages| GemmCfg {
-        core: Core::Warp,
-        tile,
-        stages,
-        warps,
-        group_m: 8,
-        unroll: false,
-        crews: 1,
-    };
+    let cfg = |tile, warps, stages| gemm_cfg(tile, stages, warps, false);
     let ranked = vec![
         (100.0, cfg([128, 128, 64], [2, 2], 3)),
         (100.0, cfg([128, 128, 64], [2, 2], 2)),
@@ -633,37 +616,82 @@ impl config::Tiled for Pipe {
     }
 }
 
+proptest::proptest! {
+    /// A ranking keeps every config within [`PRUNED_PAST`](config::PRUNED_PAST)
+    /// of the cheapest one's cost, and past it the configs ahead of the
+    /// [`KEPT_TILES`](config::KEPT_TILES)th tile kept, in ranked order: a
+    /// config dropped is past the factor with that many tiles ahead of it.
+    #[test]
+    fn a_ranking_drops_what_cannot_win(
+        costs in proptest::collection::vec((1.0f64..10.0, 0usize..24), 0..80),
+    ) {
+        let mut ranked: Vec<(f64, u32, Pipe)> =
+            costs.iter().enumerate().map(|(at, &(cost, tile))| (cost, 0, Pipe { at, tile })).collect();
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let all = ranked.clone();
+        config::prune(&mut ranked);
+        let reach = all.first().map_or(0.0, |c| c.0 * config::PRUNED_PAST);
+        let mut kept = ranked.iter().peekable();
+        let mut tiles = std::collections::HashSet::new();
+        for config in &all {
+            let ahead = tiles.len();
+            if kept.next_if(|k| k.2 == config.2).is_some() {
+                tiles.insert(config.2.tile);
+                proptest::prop_assert!(config.0 <= reach || ahead < config::KEPT_TILES, "{config:?} kept");
+            } else {
+                proptest::prop_assert!(config.0 > reach && ahead >= config::KEPT_TILES, "{config:?} dropped");
+            }
+        }
+        proptest::prop_assert!(kept.next().is_none(), "kept in ranked order");
+    }
+}
+
+/// A ranking of `tiles` tiles at costs `1, 1 + step, …`, one pipeline
+/// each, keeps the first [`KEPT_TILES`](config::KEPT_TILES) and those
+/// within [`PRUNED_PAST`](config::PRUNED_PAST) of the cheapest.
+#[test_case(4, 1.0 => 4; "a short ranking stays whole")]
+#[test_case(30, 1.0 => 16; "past the kept tiles the costly ones go")]
+#[test_case(30, 0.05 => 30; "a close ranking stays whole")]
+#[test_case(30, 0.06 => 26; "up to the factor of the cheapest")]
+fn a_ranking_keeps_its_cheapest_tiles(tiles: usize, step: f64) -> usize {
+    let mut ranked: Vec<(f64, u32, Pipe)> =
+        (0..tiles).map(|at| (1.0 + step * at as f64, 0, Pipe { at, tile: at })).collect();
+    config::prune(&mut ranked);
+    ranked.len()
+}
+
 /// The tuner's shortlist is the first [`SHORTLIST`] ranked configs whose
 /// compiled kernels do not spill, one per tile (its first clean pipeline),
-/// in ranked order, compiled in batches of as many until that many tiles
-/// pass: a batch past that is never compiled. Where every config that
-/// compiles spills, the first [`SHORTLIST`] of those are timed anyway;
-/// where nothing compiles there is nothing to judge. `twins` are `(config,
-/// the config whose tile it shares)`; `ranked` is in shortlists.
-#[test_case(&[], &[], &[], 1.5, Some(&(0..SHORTLIST).collect::<Vec<_>>()), 1; "nothing spills: the first batch")]
-#[test_case(&[1, 4, 9], &[], &[], 1.5, Some(&(0..SHORTLIST + 3).filter(|i| ![1, 4, 9].contains(i)).collect::<Vec<_>>()), 2; "spills skipped, order kept")]
-#[test_case(&[0, 1, 2], &[], &[], 0.0, Some(&[3, 4]), 1; "a short ranking keeps what passes")]
-#[test_case(&[0, 2, 3], &[1], &[], 0.0, Some(&[4]), 1; "a failure is never timed")]
-#[test_case(&[0, 1], &[], &[], 0.0, Some(&[0, 1]), 1; "every config spills: they are timed anyway")]
+/// in ranked order. A config is compiled only where a walk in ranked order
+/// would: never past the [`SHORTLIST`]th clean tile, never once a pipeline
+/// of its tile ahead of it is clean. The tiles none of whose pipelines
+/// compile clean follow the clean ones within the [`SHORTLIST`], a
+/// pipeline each; where nothing compiles there is nothing to judge. `twins` are `(config, the config
+/// whose tile it shares)`; `ranked` is in shortlists; `compiled` counts the
+/// configs compiled.
+#[test_case(&[], &[], &[], 1.5, Some(&(0..SHORTLIST).collect::<Vec<_>>()), SHORTLIST; "nothing spills: the first tiles")]
+#[test_case(&[1, 4, 9], &[], &[], 1.5, Some(&(0..SHORTLIST + 3).filter(|i| ![1, 4, 9].contains(i)).collect::<Vec<_>>()), SHORTLIST + 3; "spills skipped, order kept")]
+#[test_case(&[0, 1, 2], &[], &[], 0.0, Some(&[3, 4, 0, 1, 2]), 5; "a short ranking times its spilling tiles after the clean")]
+#[test_case(&[0, 2, 3], &[1], &[], 0.0, Some(&[4, 0, 2, 3]), 5; "a failure is never timed")]
+#[test_case(&[0, 1], &[], &[], 0.0, Some(&[0, 1]), 2; "every config spills: they are timed anyway")]
 #[test_case(&[0], &[], &[], 0.0, Some(&[0]), 1; "a single spilling config is timed alike")]
 #[test_case(&[], &[], &[], 0.0, Some(&[0]), 1; "a single clean config")]
-#[test_case(&(0..2 * SHORTLIST).collect::<Vec<_>>(), &[], &[], 2.0, Some(&(0..SHORTLIST).collect::<Vec<_>>()), 2; "every config spills")]
-#[test_case(&[0, 1], &[2], &[], 0.0, Some(&[0, 1]), 1; "spilled and failed: the spilled")]
-#[test_case(&[], &[0, 1, 2], &[], 0.0, None, 1; "nothing compiles")]
+#[test_case(&(0..2 * SHORTLIST).collect::<Vec<_>>(), &[], &[], 2.0, Some(&(0..SHORTLIST).collect::<Vec<_>>()), 2 * SHORTLIST; "every config spills")]
+#[test_case(&[0, 1], &[2], &[], 0.0, Some(&[0, 1]), 3; "spilled and failed: the spilled")]
+#[test_case(&[], &[0, 1, 2], &[], 0.0, None, 3; "nothing compiles")]
 #[test_case(&[], &[], &[], 0.0, None, 0; "nothing ranked")]
-#[test_case(&[0], &[], &[(1, 0)], 0.0, Some(&[1, 2]), 1; "a spilling unrolled ring yields to its clean rolled twin")]
-#[test_case(&[], &[], &[(1, 0)], 0.0, Some(&[0, 2]), 1; "two clean pipelines of one tile: the first")]
-#[test_case(&[], &[], &[(1, 0), (3, 2)], 1.5, Some(&[0, 2].into_iter().chain(4..SHORTLIST + 2).collect::<Vec<_>>()), 2; "tiles, not configs")]
-#[test_case(&[0, 1], &[], &[(1, 0)], 0.0, Some(&[0, 1]), 1; "both pipelines spill: both are timed")]
+#[test_case(&[0], &[], &[(1, 0)], 0.0, Some(&[1, 2]), 3; "a spilling unrolled ring yields to its clean rolled twin")]
+#[test_case(&[], &[], &[(1, 0)], 0.0, Some(&[0, 2]), 2; "two clean pipelines of one tile: the first, the second never compiled")]
+#[test_case(&[], &[], &[(1, 0), (3, 2)], 1.5, Some(&[0, 2].into_iter().chain(4..SHORTLIST + 2).collect::<Vec<_>>()), SHORTLIST; "tiles, not configs")]
+#[test_case(&[0, 1], &[], &[(1, 0)], 0.0, Some(&[0]), 2; "both pipelines spill: the first is timed, its twin after")]
 fn the_shortlist_is_the_first_tiles_that_do_not_spill(
     spilled: &[usize],
     failed: &[usize],
     twins: &[(usize, usize)],
     ranked: f64,
     want: Option<&[usize]>,
-    batches: usize,
+    compiled: usize,
 ) {
-    use crate::tune::Compiled;
     // Short rankings are as long as what they name.
     let ranked = if ranked == 0.0 {
         spilled
@@ -678,19 +706,132 @@ fn the_shortlist_is_the_first_tiles_that_do_not_spill(
     };
     let tile = |at: usize| twins.iter().find(|(c, _)| *c == at).map_or(at, |(_, t)| *t);
     let ranked: Vec<Pipe> = (0..ranked).map(|at| Pipe { at, tile: tile(at) }).collect();
-    let mut asked = vec![];
-    let got = config::shortlist(&ranked, |batch| {
-        asked.push(batch.to_vec());
-        let verdict = |p: &Pipe| match (spilled.contains(&p.at), failed.contains(&p.at)) {
+    let verdicts: Vec<Compiled> = (0..ranked.len())
+        .map(|at| match (spilled.contains(&at), failed.contains(&at)) {
             (_, true) => Compiled::Failed,
             (true, _) => Compiled::Spilled,
             _ => Compiled::Clean,
-        };
-        batch.iter().map(verdict).collect()
-    });
+        })
+        .collect();
+    let mut compiles =
+        Verdicts { verdicts: &verdicts, order: [0].iter().cycle(), room: 0, flight: vec![], asked: vec![] };
+    let got = config::shortlist(&ranked, &mut compiles);
     assert_eq!(got.as_deref(), want);
-    assert_eq!(asked.len(), batches, "{asked:?}");
-    assert!(asked.iter().flatten().eq(ranked.iter().take(SHORTLIST * batches)), "ranked batches: {asked:?}");
+    let mut asked = compiles.asked;
+    asked.sort_unstable();
+    assert_eq!(asked, walked(&ranked, &verdicts), "compiled as a walk compiles");
+    assert_eq!(asked.len(), compiled);
+}
+
+/// The configs a walk in ranked order compiling one at a time compiles
+/// for the shortlist: until [`SHORTLIST`] tiles are clean, each config
+/// whose tile has no clean pipeline ahead of it.
+fn walked(ranked: &[Pipe], verdicts: &[Compiled]) -> Vec<usize> {
+    let mut clean = std::collections::HashSet::new();
+    let mut out = vec![];
+    for (at, p) in ranked.iter().enumerate() {
+        if clean.len() == SHORTLIST {
+            break;
+        }
+        if clean.contains(&p.tile) {
+            continue;
+        }
+        out.push(at);
+        if verdicts[at] == Compiled::Clean {
+            clean.insert(p.tile);
+        }
+    }
+    out
+}
+
+/// The shortlist as it was judged before the search: batches of
+/// [`SHORTLIST`] in ranked order, every pipeline of a batch compiled, until
+/// a batch ends with that many clean tiles; the spilling tiles none of
+/// whose pipelines compiled clean follow the clean ones.
+fn batched(ranked: &[Pipe], verdicts: &[Compiled]) -> Option<Vec<usize>> {
+    let (mut clean, mut spilled, mut tiles) = (vec![], vec![], std::collections::HashSet::new());
+    for (n, chunk) in ranked.chunks(SHORTLIST).enumerate() {
+        for (i, p) in chunk.iter().enumerate() {
+            let at = n * SHORTLIST + i;
+            match verdicts[at] {
+                Compiled::Clean if tiles.insert(p.tile) => clean.push(at),
+                Compiled::Clean | Compiled::Failed => {}
+                Compiled::Spilled => spilled.push(at),
+            }
+        }
+        if clean.len() >= SHORTLIST {
+            break;
+        }
+    }
+    let mut out = clean;
+    out.extend(spilled.into_iter().filter(|&at| tiles.insert(ranked[at].tile)));
+    out.truncate(SHORTLIST);
+    (!out.is_empty()).then_some(out)
+}
+
+proptest::proptest! {
+    /// Whatever the tiles and verdicts, and in whatever order compiles
+    /// finish, the search admits what the batched shortlist admitted and
+    /// compiles what a walk in ranked order compiles, only that where the
+    /// compiler has no room to start pipelines early.
+    #[test]
+    fn the_search_admits_what_the_batches_did(
+        configs in proptest::collection::vec((0usize..120, 0u8..10), 0..400),
+        order in proptest::collection::vec(proptest::num::usize::ANY, 1..64),
+        room in 1usize..12,
+    ) {
+        let ranked: Vec<Pipe> = configs.iter().enumerate().map(|(at, &(tile, _))| Pipe { at, tile }).collect();
+        let verdicts: Vec<Compiled> = configs
+            .iter()
+            .map(|&(_, v)| match v {
+                0 => Compiled::Failed,
+                1..=2 => Compiled::Spilled,
+                _ => Compiled::Clean,
+            })
+            .collect();
+        let want = batched(&ranked, &verdicts);
+        let walk = walked(&ranked, &verdicts);
+        for (order, room) in [(vec![0], 0), (order.clone(), 0), (order, room)] {
+            let mut compiles = Verdicts { verdicts: &verdicts, order: order.iter().cycle(), room, flight: vec![], asked: vec![] };
+            let got = config::shortlist(&ranked, &mut compiles);
+            proptest::prop_assert_eq!(&got, &want);
+            compiles.asked.sort_unstable();
+            if room == 0 {
+                proptest::prop_assert_eq!(&compiles.asked, &walk);
+            } else {
+                proptest::prop_assert!(walk.iter().all(|at| compiles.asked.contains(at)), "the walk's compiles");
+            }
+        }
+    }
+}
+
+/// Compiles whose verdicts are known, finished in the order `order` picks
+/// among those in flight (`[0]`: the order started, as one at a time), idle
+/// with fewer than `room` in flight (0: never, nothing started early).
+struct Verdicts<'a, I> {
+    verdicts: &'a [Compiled],
+    order: I,
+    room: usize,
+    flight: Vec<usize>,
+    asked: Vec<usize>,
+}
+
+impl<'a, C, I: Iterator<Item = &'a usize>> config::Compiles<C> for Verdicts<'a, I> {
+    fn start(&mut self, at: usize, _: C) {
+        assert!(!self.asked.contains(&at), "started once");
+        self.flight.push(at);
+        self.asked.push(at);
+    }
+
+    fn idle(&self) -> bool {
+        self.flight.len() < self.room
+    }
+
+    fn finished(&mut self) -> Option<(usize, Compiled)> {
+        let pick = self.order.next().copied().unwrap_or(0) % self.flight.len().max(1);
+        let at = (!self.flight.is_empty()).then(|| self.flight.remove(pick))?;
+        Some((at, self.verdicts[at]))
+    }
 }
 
 /// The first clean config is searched for in ranked batches of eight, the
@@ -711,7 +852,6 @@ fn the_first_clean_config_is_searched_in_small_batches(
     want: Option<usize>,
     batches: usize,
 ) {
-    use crate::tune::Compiled;
     let ranked: Vec<Pipe> = (0..count).map(|at| Pipe { at, tile: at }).collect();
     let mut asked = vec![];
     let got = config::first_clean(&ranked, |batch| {
@@ -738,7 +878,6 @@ fn the_first_clean_config_is_searched_in_small_batches(
 #[test_case(&[0], &[1], 2, Some(&[0]); "the spilled when nothing else compiles")]
 #[test_case(&[], &[0, 1], 2, None; "nothing compiles")]
 fn twins_are_judged_by_time_alone(spilled: &[usize], failed: &[usize], count: usize, want: Option<&[usize]>) {
-    use crate::tune::Compiled;
     let twins: Vec<Pipe> = (0..count).map(|at| Pipe { at, tile: 0 }).collect();
     let got = config::compiled(&twins, |batch| {
         assert_eq!(batch.len(), count, "one batch");
@@ -1266,6 +1405,290 @@ fn heads_need_three_dims() {
     assert_eq!(shape::heads(Some(&planner(sm86())), &[BF16], Some(&x), 64), Plan::Graph(Fallback::Shape));
 }
 
+// ---- nearest -----------------------------------------------------------------------
+
+/// The nearest gate: any depth (padded to the core's, rows past what a lane
+/// holds streamed), 16-bit operands of one type, rows and candidates
+/// present, no more candidates than the f32 index holds, a list of any
+/// length (none empty); each listed config fits, holds its ring and its
+/// list's registers.
+#[test_case(&[1000, 5], &[2000, 5], BF16, 1, Ok(()); "a shallow depth pads")]
+#[test_case(&[1 << 16, 64], &[1 << 16, 64], BF16, 1, Ok(()); "a large self-join")]
+#[test_case(&[37, 130], &[1, 130], DType::Float16, 1, Ok(()); "one candidate")]
+#[test_case(&[1000, 64], &[1000, 64], DType::Float32, 1, Err(Fallback::Dtype); "f32 keeps the graph")]
+#[test_case(&[0, 64], &[10, 64], BF16, 1, Err(Fallback::Shape); "no rows")]
+#[test_case(&[10, 64], &[(1 << 24) + 1, 64], BF16, 1, Err(Fallback::Shape); "past the f32 index")]
+#[test_case(&[1000, 4096], &[1000, 4096], BF16, 1, Ok(()); "rows too deep to hold stream")]
+#[test_case(&[1 << 16, 64], &[1 << 16, 64], BF16, 2, Ok(()); "a list of two")]
+#[test_case(&[1 << 16, 768], &[1 << 16, 768], DType::Float16, 16, Ok(()); "a list of 16 streamed")]
+#[test_case(&[37, 130], &[5, 130], BF16, 8, Ok(()); "a list longer than the candidates")]
+#[test_case(&[1 << 16, 128], &[1 << 16, 128], BF16, 32, Ok(()); "the longest register list")]
+#[test_case(&[1 << 16, 128], &[1 << 16, 128], BF16, 33, Ok(()); "past the register list")]
+#[test_case(&[1 << 16, 768], &[1 << 16, 768], DType::Float16, 1024, Ok(()); "a list of 1024 streamed")]
+#[test_case(&[1000, 64], &[1 << 20, 64], BF16, 100, Ok(()); "a long list of many candidates")]
+#[test_case(&[1 << 16, 768], &[1 << 16, 768], DType::Int8, 8, Ok(()); "8-bit rows streamed")]
+#[test_case(&[1000, 100], &[1 << 20, 100], DType::Int8, 80, Ok(()); "8-bit rows at a padded depth")]
+#[test_case(&[37, 130], &[5, 130], DType::Int8, 1, Ok(()); "8-bit rows past the candidates")]
+#[test_case(&[1000, 64], &[1000, 64], DType::Float32, 8, Err(Fallback::Dtype); "an f32 list keeps the graph")]
+#[test_case(&[1000, 64], &[1000, 64], BF16, 0, Err(Fallback::Shape); "an empty list")]
+fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, k: usize, want: Result<(), Fallback>) {
+    use crate::kernels::nearest::{Floors, Metric};
+    for target in [sm86(), gfx1201(), crate::test::unit::targets::amd(AmdArch::Gfx942, 304)] {
+        let planner = planner(target.clone());
+        let scalar = dtype.scalar().unwrap();
+        let plan = shape::nearest(
+            Some(&planner),
+            &[dtype.clone(), dtype.clone()],
+            Some(&ext(x)),
+            Some(&ext(c)),
+            Metric::L2,
+            Floors::default(),
+            true,
+            k,
+        );
+        match plan {
+            Plan::Kernel(list) => {
+                assert_eq!(want, Ok(()), "{list:?}");
+                let d = planner.nearest_depth(x[1], scalar).unwrap();
+                let atom = target.geometry_of(scalar).unwrap();
+                assert!(d >= x[1] && d.is_multiple_of(atom.k as usize) && d.is_multiple_of(16));
+                for (i, cfg) in list.iter().enumerate() {
+                    assert!(cfg.fits(&target, d, scalar) && cfg.smem_bytes(d, scalar) <= target.smem_bytes, "{cfg:?}");
+                    let held = cfg.held(&target, d, k, scalar).unwrap();
+                    assert!(held <= target.lane_budget(cfg.warps()), "{cfg:?} holds {held}");
+                    assert!(!list[..i].contains(cfg), "{cfg:?} twice");
+                }
+            }
+            Plan::Graph(why) => assert_eq!(Err(why), want),
+        }
+    }
+}
+
+/// A list holds its pairs of `[rows, w]` tiles (and half as many again for
+/// a merge's network) and its lanes' queue beside the scores
+/// ([`LaneQueue`](crate::kernels::nearest::LaneQueue)), their
+/// columns spread over the lanes sharing a row (one register per 16 rows a
+/// column pair of a row's two lanes where RDNA issues the product swapped,
+/// two for a quad of lanes on CUDA), and four row vectors (the vote's slot
+/// and the pass), and in rounds the trip's deals; its deals and merges
+/// cost: the cost and registers rise
+/// with `k`, from a least alone, whose registers the scores' count covers;
+/// past [`REGISTER_K`](config::REGISTER_K) a list is left out.
+#[test_case(sm86(), 2, 4; "sm_86")]
+#[test_case(gfx1201(), 1, 2; "gfx1201")]
+#[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40), 1, 2; "gfx1151")]
+fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, sharing: u32) {
+    use crate::kernels::nearest::{LaneQueue, Metric, NearestCfg};
+    use crate::ops::config::{REGISTER_K, Rejected};
+    let planner = planner(target.clone());
+    let cfg = NearestCfg::new(64, 32, 2);
+    let p = |k| self_join(1 << 16, 1 << 16, 64, Metric::SquaredL2, k);
+    let regs = |k| cfg.registers(&target, 64, k, svod_dtype::ScalarDType::Float16).unwrap();
+    let LaneQueue { width, depth, .. } = LaneQueue::PORTABLE;
+    assert_eq!(cfg.sharing(&target, 64, svod_dtype::ScalarDType::Float16), Some(sharing as usize));
+    let deals = (cfg.bkv / width) as u32;
+    for k in [2, 8, 32] {
+        let pairs = (k as u32).next_power_of_two().max(width as u32) / width as u32;
+        let tile = per_16_rows * width as u32 / sharing;
+        let want = (3 * pairs + 2 * depth as u32 + deals) * tile + 4 * per_16_rows;
+        assert_eq!(regs(k) - regs(1), want, "k {k}");
+        let passes = NearestCfg { lanes: Some(LaneQueue { passes: true, ..LaneQueue::PORTABLE }), ..cfg };
+        let held = passes.registers(&target, 64, k, svod_dtype::ScalarDType::Float16).unwrap() - regs(1);
+        assert_eq!(held, want - deals * tile, "k {k} in passes");
+    }
+    let costs: Vec<f64> = [1, 2, 4, 8, 16].map(|k| p(k).admit(&planner, &cfg).unwrap().0).to_vec();
+    assert!(costs.is_sorted_by(|a, b| a < b), "{costs:?}");
+    let past = REGISTER_K + 1;
+    assert_eq!(p(past).admit(&planner, &cfg), Err(Rejected::TopK { k: past, most: REGISTER_K }));
+}
+
+/// A list past 32 is ranked two ways besides the registers (up to
+/// [`REGISTER_K`](config::REGISTER_K)): a register queue merged into the
+/// outputs, whose lanes hold its tiles and the merge's beside them (not the
+/// list's), and a score matrix whose listing kernel holds the list (its
+/// product holds none). Both cost more the longer the list; a register list
+/// past its most is left out.
+#[test_case(sm86(); "sm_86")]
+#[test_case(gfx1201(); "gfx1201")]
+#[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40); "gfx1151")]
+fn a_long_list_is_queued_or_listed_from_a_matrix(target: Target) {
+    use crate::kernels::nearest::{Floors, Metric, NearestCfg, SelectCfg};
+    use crate::ops::config::{Nearest, REGISTER_K, Rejected};
+    let planner = planner(target.clone());
+    let p = |k| Nearest {
+        dtype: svod_dtype::ScalarDType::Float16,
+        n: 1 << 15,
+        m: 1 << 15,
+        d: 64,
+        metric: Metric::SquaredL2,
+        floors: Floors::default(),
+        groups: false,
+        k,
+    };
+    let base = NearestCfg::new(32, 16, 2);
+    let queued = NearestCfg { queue: Some(32), ..base };
+    let matrix = NearestCfg { select: Some(SelectCfg { warps: 4, queue: 2, filter: false }), ..base };
+    let regs = |cfg: &NearestCfg, k| cfg.registers(&target, 64, k, svod_dtype::ScalarDType::Float16).unwrap();
+    for k in [64, 256, 1024] {
+        assert_eq!(regs(&queued, k), regs(&queued, 64), "a queue's registers whatever its list's length");
+        assert_eq!(regs(&matrix, k), regs(&base, 1), "a score matrix's product holds no list");
+    }
+    assert!(regs(&queued, 64) > regs(&base, REGISTER_K), "the merge's tiles beside the queue's");
+    for cfg in [queued, matrix] {
+        let costs: Vec<f64> = [64, 128, 256, 1024].map(|k| p(k).admit(&planner, &cfg).unwrap().0).to_vec();
+        assert!(costs.is_sorted_by(|a, b| a < b), "{cfg:?}: {costs:?}");
+    }
+    let past = REGISTER_K + 1;
+    assert_eq!(p(past).admit(&planner, &base), Err(Rejected::TopK { k: past, most: REGISTER_K }));
+    assert_eq!(p(16).admit(&planner, &queued), Err(Rejected::Lowers), "a queue as long as the list");
+    let ways = |k| {
+        let lattice = p(k).lattice(&target);
+        let has = |f: fn(&NearestCfg) -> bool| lattice.iter().any(f);
+        [has(|c| c.queue.is_none() && c.select.is_none()), has(|c| c.queue.is_some()), has(|c| c.select.is_some())]
+    };
+    assert_eq!(ways(32), [true, false, false], "a list of 32 in registers alone");
+    assert_eq!(ways(REGISTER_K), [true, true, true], "a list of {REGISTER_K} every way");
+    assert_eq!(ways(REGISTER_K + 1), [false, true, true], "past the registers");
+}
+
+/// Modern embeddings plan a kernel: past the depth a lane holds (`held`,
+/// of the depths here) the ranking leads with rows streamed along the
+/// depth, and where they fit with resident rows, which a streamed tile
+/// reads again for every candidate tile. CDNA's 512-register lanes hold
+/// 512.
+#[test_case(sm86(), 64; "sm_86")]
+#[test_case(gfx1201(), 64; "gfx1201")]
+#[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40), 64; "gfx1151")]
+#[test_case(crate::test::unit::targets::amd(AmdArch::Gfx942, 304), 512; "gfx942")]
+fn deep_rows_stream(target: Target, held: usize) {
+    use crate::kernels::nearest::{Floors, Metric};
+    let planner = planner(target.clone());
+    for metric in [Metric::SquaredL2, Metric::NegDot] {
+        for d in [64, 512, 768, 1024] {
+            let plan = shape::nearest(
+                Some(&planner),
+                &[BF16; 2],
+                Some(&ext(&[1 << 16, d])),
+                Some(&ext(&[1 << 16, d])),
+                metric,
+                Floors::default(),
+                false,
+                1,
+            );
+            let Plan::Kernel(list) = plan else { panic!("d{d} {metric:?}: {plan:?}") };
+            assert_eq!(list[0].bk.is_some(), d > held, "d{d} {metric:?}: {:?}", list[0]);
+        }
+    }
+}
+
+/// A streamed tile costs more than the resident one where the rows fit: it
+/// fills and reads its query rows again for every candidate tile and starts
+/// its ring empty at each; past the lane's registers only it is admitted.
+#[test_case(sm86(); "sm_86")]
+#[test_case(gfx1201(); "gfx1201")]
+fn a_streamed_tile_pays_its_rows_again(target: Target) {
+    use crate::kernels::nearest::{Floors, Metric, NearestCfg};
+    use crate::ops::config::{Nearest, Rejected};
+    let planner = planner(target);
+    let (resident, streamed) = (NearestCfg::new(64, 64, 2), NearestCfg::streamed(64, 64, 32, 2));
+    let p = |d| Nearest {
+        dtype: svod_dtype::ScalarDType::Float16,
+        n: 1 << 16,
+        m: 1 << 16,
+        d,
+        metric: Metric::SquaredL2,
+        floors: Floors::default(),
+        groups: false,
+        k: 1,
+    };
+    let (r, s) = (p(64).admit(&planner, &resident).unwrap().0, p(64).admit(&planner, &streamed).unwrap().0);
+    assert!(r < s, "resident {r} against streamed {s}");
+    assert!(matches!(p(1024).admit(&planner, &resident), Err(Rejected::Registers { .. } | Rejected::Smem { .. })));
+    assert!(p(1024).admit(&planner, &streamed).is_ok());
+}
+
+/// Rows bound to a variable plan as the rows at their bound (the kernels
+/// take the bound rows at launch); bound candidates take the graph.
+#[test]
+fn bound_rows_plan_at_their_bound_bound_candidates_take_the_graph() {
+    use crate::kernels::nearest::{Floors, Metric};
+    let planner = planner(sm86());
+    let plan = |x: Extent, c: Extent| {
+        shape::nearest(Some(&planner), &[BF16; 2], Some(&x), Some(&c), Metric::SquaredL2, Floors::default(), false, 1)
+    };
+    let bound = Extent { dims: vec![100, 64], var: true };
+    assert_eq!(plan(bound.clone(), ext(&[300, 64])), plan(ext(&[100, 64]), ext(&[300, 64])));
+    assert!(matches!(plan(bound.clone(), ext(&[300, 64])), Plan::Kernel(_)));
+    assert_eq!(plan(ext(&[100, 64]), bound), Plan::Graph(Fallback::Symbolic));
+}
+
+/// A list's way follows its length's bound, a live list planned as the
+/// list of its bound: registers up to [`config::REGISTER_K`], queued into the
+/// outputs and through a score matrix from 33 on (at 1024 scores the score
+/// matrix's tiles prune the queued lists, many times its cost), and nothing
+/// past the candidates' f32 index.
+#[test_case(16, true, false; "registers alone")]
+#[test_case(33, true, true; "registers and the long ways")]
+#[test_case(64, true, true; "the longest register list")]
+#[test_case(65, false, true; "past the registers")]
+#[test_case(1024, false, true; "the long ways alone")]
+fn a_list_plans_by_its_bound(k: usize, registers: bool, long: bool) {
+    use crate::kernels::nearest::{Floors, Metric};
+    let planner = planner(sm86());
+    let x = Extent { dims: vec![4096, 128], var: true };
+    let plan = shape::nearest(
+        Some(&planner),
+        &[BF16; 2],
+        Some(&x),
+        Some(&ext(&[8192, 128])),
+        Metric::NegDot,
+        Floors::default(),
+        false,
+        k,
+    );
+    let Plan::Kernel(ranked) = plan else { panic!("k {k} plans no kernel: {plan:?}") };
+    let has = |f: fn(&crate::kernels::nearest::NearestCfg) -> bool| ranked.iter().any(f);
+    assert_eq!(has(|c| c.queue.is_none() && c.select.is_none()), registers, "k {k}: register lists");
+    assert_eq!(has(|c| c.queue.is_some()), long && k < 1024, "k {k}: queued lists");
+    assert_eq!(has(|c| c.select.is_some()), long, "k {k}: score matrices");
+}
+
+/// The cost charges every pair's epilogue beside the product: at a shallow
+/// depth the eighth of the product a 16-deep pair needs still costs more
+/// than an eighth of a 128-deep one, and every operation an option adds a
+/// pair (the row norm, a floor, the groups' compare and select) costs more.
+#[test_case(sm86(); "sm_86")]
+#[test_case(gfx1201(); "gfx1201")]
+fn the_nearest_cost_charges_every_pair(target: Target) {
+    use crate::kernels::nearest::{Floors, Metric, NearestCfg};
+    use crate::ops::config::Nearest;
+    let planner = planner(target.clone());
+    let cfg = NearestCfg::new(64, 64, 2);
+    let cost = |d, metric, floors, groups| {
+        let p = Nearest {
+            n: 1 << 16,
+            m: 1 << 16,
+            d,
+            dtype: svod_dtype::ScalarDType::Float16,
+            metric,
+            floors,
+            groups,
+            k: 1,
+        };
+        p.admit(&planner, &cfg).unwrap().0
+    };
+    let plain = |d| cost(d, Metric::ShiftedL2, Floors::default(), false);
+    assert!(plain(16) > plain(128) / 8.0, "{} against {}", plain(16), plain(128));
+    let both = Floors { row: true, col: true };
+    let ladder = [
+        plain(32),
+        cost(32, Metric::SquaredL2, Floors::default(), false),
+        cost(32, Metric::L2, both, false),
+        cost(32, Metric::L2, both, true),
+    ];
+    assert!(ladder.is_sorted_by(|a, b| a < b), "{ladder:?}");
+}
+
 // ---- norms -------------------------------------------------------------------------
 
 #[test_case(1024, Ok(vec![4, 8, 16]); "1024")]
@@ -1501,7 +1924,9 @@ fn a_bound_conv_batch_plans_per_image() {
 /// RDNA plans kernels from the lattice under its own facts: register-staged
 /// rings of one slot (rolled: there is nothing to fold) or two (unrolled
 /// over the slots), 16×16 WMMA-tileable warp grids, attention within 64 KB
-/// of LDS with its score relayout.
+/// of LDS with the scratch its probabilities may cross (RDNA3's accumulator
+/// cannot feed the P·V product as it stands): the 16-bit tile per key
+/// warp, charged as a bound.
 #[test]
 fn rdna_plans_register_staged_kernels() {
     let target = rdna3();
@@ -1515,7 +1940,10 @@ fn rdna_plans_register_staged_kernels() {
             kernel_plan(shape::attention(Some(&planner(target.clone())), &[BF16; 3], Some(&q), Some(&q), false, false));
         let within = |c: &FaCfg| c.smem_bytes(d, false) + c.scratch_bytes(&target) <= 64 << 10;
         assert!(fa.iter().all(|c| c.stages == 2 && within(c)), "{fa:?}");
-        assert!(fa.iter().all(|c| c.scratch_bytes(&target) == c.bq * c.bkv * 4), "RDNA3 re-holds its scores");
+        assert!(
+            fa.iter().all(|c| c.scratch_bytes(&target) == c.key_warps * c.bq * c.bkv * 2),
+            "RDNA3 may re-hold its probabilities"
+        );
     }
     assert!(matches!(
         shape::norm(Some(&planner(target.clone())), &[BF16; 2], Some(&ext(&[37, 1024]))),
@@ -1525,10 +1953,12 @@ fn rdna_plans_register_staged_kernels() {
 
 /// Two atom rows per warp are a variant of a tile, never its representative:
 /// the d64 biased attention's shortlist on gfx1151 (under its measured
-/// costs) and gfx1201 is the one of a lattice without the variant, tile for
-/// tile, and every two-row config follows its one-row twin, from blocks of
-/// 64 queries, so the twins stage times it beside the contender tiles. On
-/// gfx942 the d128 pick's tile carries its two-row pipelines as twins.
+/// costs; its 128×64 tile's rings and bias ring fill the 64 KB, which the
+/// scratch its probabilities may cross puts past them) and gfx1201 is the
+/// one of a lattice without the variant, tile for tile, and every two-row
+/// config follows its one-row twin, from blocks of 64 queries, so the
+/// twins stage times it beside the contender tiles. On gfx942 the d128
+/// pick's tile carries its two-row pipelines as twins.
 #[test_case(gfx1151_planner(), &[(128, 32), (64, 32), (64, 16), (64, 64), (32, 16), (32, 32), (32, 64), (16, 16), (16, 32), (16, 64)]; "gfx1151")]
 #[test_case(planner(gfx1201()), &[(128, 64), (128, 32), (64, 32), (64, 64), (64, 16), (32, 32), (32, 16), (32, 64), (16, 32), (16, 16), (16, 64)]; "gfx1201")]
 fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usize)]) {
@@ -1536,7 +1966,9 @@ fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usiz
     let ranked = target.attention_ranked(32, 2048, 2048, 64, false, true);
     let reps = representatives(&ranked);
     assert!(reps.iter().all(|c| c.warp_rows == WARP_ROWS), "{reps:?}");
-    let at = shortlist(&reps, |b| vec![crate::tune::Compiled::Clean; b.len()]).expect("a shortlist");
+    let clean = vec![Compiled::Clean; reps.len()];
+    let mut compiles = Verdicts { verdicts: &clean, order: [0].iter().cycle(), room: 0, flight: vec![], asked: vec![] };
+    let at = shortlist(&reps, &mut compiles).expect("a shortlist");
     assert_eq!(at.iter().map(|&i| (reps[i].bq, reps[i].bkv)).collect::<Vec<_>>(), tiles);
     for (i, wide) in ranked.iter().enumerate().filter(|(_, c)| !c.represents()) {
         let one = FaCfg { warp_rows: WARP_ROWS, ..*wide };
@@ -1573,4 +2005,24 @@ fn the_warpgroup_core_is_a_tile_of_its_own() {
 
 fn gfx1151_planner() -> Planner {
     planned(Device { target: super::targets::amd(AmdArch::Gfx1151, 40), costs: super::gfx1151_costs() })
+}
+
+/// The 8-bit search is priced at its own step: where a card's 8-bit core
+/// runs a step at a quarter (sm_86) or half (gfx1201) of the 16-bit cost,
+/// its best ranked self-join at 16384 rows by depth 768 costs less than the
+/// f16 one's (the model: 0.30 and 0.57 of it, its fill and fragment bytes
+/// halved too).
+#[test_case(sm86(), crate::test::unit::sm86_costs(), 0.2, 0.4; "sm_86")]
+#[test_case(gfx1201(), crate::test::unit::gfx1201_costs(), 0.45, 0.7; "gfx1201")]
+fn an_8_bit_search_is_priced_at_its_step(target: Target, costs: Costs, low: f64, high: f64) {
+    use crate::kernels::nearest::Metric;
+    use svod_dtype::ScalarDType;
+    let planner = planned(Device { target, costs });
+    let best = |dtype| {
+        let p = config::Nearest { dtype, ..self_join(16384, 16384, 768, Metric::NegDot, 1) };
+        let ranked = planner.nearest_ranked(p);
+        p.admit(&planner, &ranked[0]).expect("ranked").0
+    };
+    let ratio = best(ScalarDType::Int8) / best(ScalarDType::Float16);
+    assert!((low..high).contains(&ratio), "8-bit over f16: {ratio:.3}");
 }

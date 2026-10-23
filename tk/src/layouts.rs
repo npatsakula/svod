@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use snafu::{OptionExt, Snafu, ensure};
 
-use crate::atoms::{Core, Costs, Device, GroupMmaAtom, MmaAtom, Target};
+use crate::atoms::{Core, Costs, Device, GroupMmaAtom, LaneMove, MmaAtom, Target};
 use crate::ir::*;
 use crate::layout::Dim::{Col, Lane, Reg, Row, Warp};
 use crate::layout::{self as frag, Layout};
@@ -27,6 +27,8 @@ pub enum Error {
     GroupOperand { what: String },
     #[snafu(display("the layouts reach no fixed point in {passes} passes"))]
     NotConverged { passes: usize },
+    #[snafu(display("value {value:?} is laid by what produces it and wanted otherwise where it is consumed"))]
+    Unresolved { value: ValId },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -70,7 +72,7 @@ impl WarpGrid {
 /// How a block holds a register tile: a fragment over `(Reg, Lane)`, repeated
 /// `reps` times (row-major, by register) inside each warp's sub-tile, and the
 /// warps' sub-tile coordinates (free warp bits replicate the sub-tile).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileLayout {
     pub frag: Layout,
     pub reps: [u32; 2],
@@ -157,6 +159,196 @@ impl TileLayout {
         Self { frag: keep_axis(&self.frag, Row), reps: [self.reps[0], 1], warps: self.warps.sublayout(&[Warp], &[Row]) }
     }
 
+    /// A `[rows, cols]` tile whose [`Self::row_vector`] is `vector` (a
+    /// `[rows, 1]` layout): a lane holds runs of a row's consecutive columns
+    /// in its registers, and the lanes that hold the same rows of `vector`
+    /// hold its successive runs, so a row's columns are held once rather
+    /// than in every lane sharing it, and only a run's first column has its
+    /// predecessor in another lane. The columns' power-of-two part spreads
+    /// so; the registers repeat the rest.
+    pub fn spread_row(vector: &Self, cols: u32) -> Self {
+        let (frag, rows) = (&vector.frag, vector.frag.out_size(Row));
+        let row_of = |dim, bit| frag.basis(dim, bit).first().map_or(0, |o| o.1);
+        let free = (0..frag.in_bits(Lane)).filter(|&b| row_of(Lane, b) == 0).count() as u32;
+        let part = cols.trailing_zeros();
+        let (spread, run) = (free.min(part), part - free.min(part));
+        let regs: Vec<[u32; 2]> =
+            (0..frag.in_bits(Reg)).map(|b| [row_of(Reg, b), 0]).chain((0..run).map(|b| [0, 1 << b])).collect();
+        let mut taken = 0;
+        let lanes: Vec<[u32; 2]> = (0..frag.in_bits(Lane))
+            .map(|b| match row_of(Lane, b) {
+                0 if taken < spread => {
+                    taken += 1;
+                    [0, 1 << (run + taken - 1)]
+                }
+                r => [r, 0],
+            })
+            .collect();
+        let frag = Layout::from_bases([(Row, rows), (Col, 1 << part)], &[(Reg, &regs), (Lane, &lanes)]);
+        Self { frag, reps: [vector.reps[0], cols >> part], warps: vector.warps.clone() }
+    }
+
+    /// The moves of a [`TileOp::Shift`] along `axis`: per register, the
+    /// lane-xor moves bringing each lane the element one step back, as an
+    /// [`Relayout::Exchange`]'s, and the lanes whose element is the first
+    /// (the fill); `None` where an element's predecessor is in another warp
+    /// or the moves differ between warps.
+    pub fn shift(&self, axis: Axis, warps: u32, lanes: u32) -> Option<Vec<(Vec<Pick>, u64)>> {
+        self.moves(warps, lanes, |(r, c)| match axis {
+            Axis::Col => c.checked_sub(1).map(|c| (r, c)),
+            Axis::Row => r.checked_sub(1).map(|r| (r, c)),
+        })
+    }
+
+    /// The moves of a [`TileOp::Flip`] across the bits of `mask` along
+    /// `axis`, as [`Self::shift`]'s; no lane fills.
+    pub fn flip(&self, axis: Axis, mask: u32, warps: u32, lanes: u32) -> Option<Vec<(Vec<Pick>, u64)>> {
+        self.moves(warps, lanes, |(r, c)| {
+            Some(match axis {
+                Axis::Col => (r, c ^ mask),
+                Axis::Row => (r ^ mask, c),
+            })
+        })
+    }
+
+    /// The moves of a [`TileOp::Deal`] `j` of this tile into `dst` (its
+    /// `[rows, w]` result), as [`Self::shift`]'s, and the column of this tile
+    /// each element of the result takes ([`Self::dealt`]).
+    pub fn deal(&self, dst: &Self, j: u32, warps: u32, lanes: u32) -> Option<Vec<(Vec<Pick>, u64)>> {
+        self.deal_taking(dst, &self.dealt(dst, warps, lanes), j, warps, lanes)
+    }
+
+    /// [`Self::deal`] with the columns each element takes, `taken`.
+    fn deal_taking(&self, dst: &Self, taken: &Dealt, j: u32, warps: u32, lanes: u32) -> Option<Vec<(Vec<Pick>, u64)>> {
+        self.moves_into(dst, warps, lanes, |(r, c)| Some((r, taken[&(r, c)][j as usize])))
+    }
+
+    /// The column of this tile that element `(r, c)` of a `[rows, w]`
+    /// [`TileOp::Deal`] into `dst` takes, per `j`: where every lane holding
+    /// row `r` of `dst` holds `n` times as many of this tile's row and the
+    /// lanes holding a row's columns of `dst` hold all of its columns here
+    /// once, the `q`th of a lane's `dst` columns takes its `(j·w_lane + q)`th
+    /// here (in register order), else column `c·n + j`.
+    pub fn dealt(&self, dst: &Self, warps: u32, lanes: u32) -> Dealt {
+        let (Shape { rows, cols }, w) = (self.shape(), dst.shape().cols as u32);
+        let n = cols as u32 / w;
+        let plain = || {
+            let at = |c| (0..n).map(|j| c * n + j).collect();
+            (0..rows as u32).flat_map(|r| (0..w).map(move |c| ((r, c), at(c)))).collect()
+        };
+        let mut taken: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+        for warp in 0..warps {
+            for lane in 0..lanes {
+                // This lane's columns of each row, in register order, here and in `dst`.
+                let held = |l: &Self| {
+                    let mut by_row: HashMap<u32, Vec<u32>> = HashMap::new();
+                    for reg in 0..l.regs() {
+                        let (r, c) = l.coord(warp, lane, reg);
+                        by_row.entry(r).or_default().push(c);
+                    }
+                    by_row
+                };
+                let (here, there) = (held(self), held(dst));
+                for (r, dcols) in there {
+                    let Some(scols) = here.get(&r).filter(|s| s.len() == n as usize * dcols.len()) else {
+                        return plain();
+                    };
+                    for (q, &c) in dcols.iter().enumerate() {
+                        let at: Vec<u32> = (0..n as usize).map(|j| scols[j * dcols.len() + q]).collect();
+                        if taken.insert((r, c), at.clone()).is_some_and(|before| before != at) {
+                            return plain();
+                        }
+                    }
+                }
+            }
+        }
+        // Every element of `dst` held, each row's columns here taken once.
+        let whole = (0..rows as u32).all(|r| {
+            let mut seen = vec![false; cols];
+            (0..w).all(|c| {
+                taken.get(&(r, c)).is_some_and(|at| at.iter().all(|&s| !std::mem::replace(&mut seen[s as usize], true)))
+            })
+        });
+        if whole { taken } else { plain() }
+    }
+
+    /// Per register, the lane-xor moves bringing each lane the element at
+    /// `from` of the one it holds, and the lanes `from` leaves without one.
+    fn moves(
+        &self,
+        warps: u32,
+        lanes: u32,
+        from: impl Fn((u32, u32)) -> Option<(u32, u32)>,
+    ) -> Option<Vec<(Vec<Pick>, u64)>> {
+        self.moves_into(self, warps, lanes, from)
+    }
+
+    /// [`Self::moves`] into `dst`'s registers: each lane's register of `dst`
+    /// holding `(r, c)` brought the element at `from((r, c))` of this tile.
+    fn moves_into(
+        &self,
+        dst: &Self,
+        warps: u32,
+        lanes: u32,
+        from: impl Fn((u32, u32)) -> Option<(u32, u32)>,
+    ) -> Option<Vec<(Vec<Pick>, u64)>> {
+        // Per warp, the (lane, register) pairs holding each element (row-major), in order.
+        type Holders = Vec<smallvec::SmallVec<[(u32, u32); 2]>>;
+        let Shape { rows, cols } = self.shape();
+        let held: Vec<Holders> = (0..warps)
+            .map(|w| {
+                let mut at = vec![smallvec::SmallVec::new(); rows * cols];
+                for from in 0..lanes {
+                    for reg in 0..self.regs() {
+                        let (r, c) = self.coord(w, from, reg);
+                        at[r as usize * cols + c as usize].push((from, reg));
+                    }
+                }
+                at
+            })
+            .collect();
+        // The (mask, register) moves that bring lane `l` of warp `w` element `j`'s source.
+        let moves = |w: u32, l: u32, j: u32| -> Option<Vec<(u32, u32)>> {
+            let (r, c) = from(dst.coord(w, l, j))?;
+            let (r, c) = (r as usize, c as usize);
+            let found = if r < rows && c < cols { &held[w as usize][r * cols + c][..] } else { &[] };
+            Some(found.iter().map(|&(from, reg)| (from ^ l, reg)).collect())
+        };
+        (0..dst.regs())
+            .map(|j| {
+                // Each lane's moves in the first warp, and the lanes each move serves.
+                let first: Vec<Option<Vec<(u32, u32)>>> = (0..lanes).map(|l| moves(0, l, j)).collect();
+                let mut serves: HashMap<(u32, u32), u64> = HashMap::new();
+                for (l, mv) in first.iter().enumerate() {
+                    for &mv in mv.iter().flatten() {
+                        *serves.entry(mv).or_default() |= 1 << l;
+                    }
+                }
+                let fill = (0..lanes).filter(|&l| first[l as usize].is_none()).fold(0u64, |a, l| a | 1 << l);
+                let mut open: u64 = (u64::MAX >> (64 - lanes)) & !fill;
+                let mut picks: Vec<Pick> = vec![];
+                while open != 0 {
+                    let lanes_of = |mv: (u32, u32)| serves[&mv] & open;
+                    // The same lane first, then the move serving the most lanes still open.
+                    let (mask, reg) = (0..lanes)
+                        .filter(|l| open >> l & 1 == 1)
+                        .flat_map(|l| first[l as usize].iter().flatten().copied())
+                        .max_by_key(|&mv| (lanes_of(mv).count_ones(), mv.0 == 0))?;
+                    let covered = lanes_of((mask, reg));
+                    open &= !covered;
+                    picks.push(Pick { mask, reg, lanes: covered });
+                }
+                let every_warp = (1..warps).all(|w| {
+                    (0..lanes).all(|l| match moves(w, l, j) {
+                        None => fill >> l & 1 == 1,
+                        Some(v) => picks.iter().any(|p| p.lanes >> l & 1 == 1 && v.contains(&(p.mask, p.reg))),
+                    })
+                });
+                every_warp.then_some((picks, fill))
+            })
+            .collect()
+    }
+
     pub fn col_vector(&self) -> Self {
         Self { frag: keep_axis(&self.frag, Col), reps: [1, self.reps[1]], warps: self.warps.sublayout(&[Warp], &[Col]) }
     }
@@ -169,6 +361,22 @@ impl TileLayout {
 
     pub fn col_fold_masks(&self) -> smallvec::SmallVec<[u32; 6]> {
         crate::layout::lanes_sharing_row(&self.frag.transpose())
+    }
+
+    /// The fold masks of a reduction along `axis`: [`Self::row_fold_masks`]
+    /// over rows, [`Self::col_fold_masks`] over columns.
+    pub fn fold_masks(&self, axis: Axis) -> smallvec::SmallVec<[u32; 6]> {
+        match axis {
+            Axis::Row => self.row_fold_masks(),
+            Axis::Col => self.col_fold_masks(),
+        }
+    }
+
+    /// The lane moves each lane issues reducing `self` along `axis` into
+    /// `dst`: a butterfly over the [`Self::fold_masks`] per register of
+    /// `dst`, each mask moved as `how` moves it.
+    pub fn fold_moves(&self, dst: &Self, axis: Axis, how: LaneMove) -> u32 {
+        dst.regs() * self.fold_masks(axis).iter().map(|&m| how.issues(m)).sum::<u32>()
     }
 
     /// How `self` becomes `dst`, for `warps` warps of `lanes` lanes: lanes
@@ -293,6 +501,68 @@ pub struct Pick {
     pub mask: u32,
     pub reg: u32,
     pub lanes: u64,
+}
+
+/// Per register of a shift's, flip's or deal's result, the lane moves that
+/// fill it and the lanes the fill takes ([`TileLayout::shift`]).
+pub type LaneMoves = Vec<(Vec<Pick>, u64)>;
+
+/// Per element `(r, c)` of a deal's result, the column of its source each
+/// deal `j` takes ([`TileLayout::dealt`]).
+pub type Dealt = HashMap<(u32, u32), Vec<u32>>;
+
+/// A tile op that moves elements across lanes: what besides its layouts
+/// decides its moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Move {
+    Shift(Axis),
+    Flip(Axis, u32),
+    Deal(u32),
+}
+
+impl Move {
+    /// `op`'s source and move, if it is a shift, flip or deal.
+    pub fn of(op: &TileOp) -> Option<(ValId, Self)> {
+        Some(match *op {
+            TileOp::Shift { src, axis, .. } => (src, Move::Shift(axis)),
+            TileOp::Flip { src, axis, mask } => (src, Move::Flip(axis, mask)),
+            TileOp::Deal { src, j, .. } => (src, Move::Deal(j)),
+            _ => return None,
+        })
+    }
+}
+
+/// The moves of shifts, flips and deals over `warps` warps of `lanes` lanes,
+/// by their layouts: a sorting network flips one layout across the same
+/// masks stage after stage.
+pub(crate) struct Moves {
+    warps: u32,
+    lanes: u32,
+    memo: HashMap<(TileLayout, TileLayout, Move), Option<LaneMoves>>,
+    /// What every deal of a source into a result takes, whichever `j`.
+    dealt: HashMap<(TileLayout, TileLayout), Dealt>,
+}
+
+impl Moves {
+    pub fn new(warps: u32, lanes: u32) -> Self {
+        Self { warps, lanes, memo: HashMap::new(), dealt: HashMap::new() }
+    }
+
+    /// The moves of `how` from `src` into `dst` ([`TileLayout::shift`],
+    /// [`TileLayout::flip`], [`TileLayout::deal`]).
+    pub fn get(&mut self, src: &TileLayout, dst: &TileLayout, how: Move) -> Option<&LaneMoves> {
+        let Self { warps, lanes, memo, dealt } = self;
+        let (warps, lanes) = (*warps, *lanes);
+        let moves = memo.entry((src.clone(), dst.clone(), how)).or_insert_with(|| match how {
+            Move::Shift(axis) => src.shift(axis, warps, lanes),
+            Move::Flip(axis, mask) => src.flip(axis, mask, warps, lanes),
+            Move::Deal(j) => {
+                let taken = dealt.entry((src.clone(), dst.clone())).or_insert_with(|| src.dealt(dst, warps, lanes));
+                src.deal_taking(dst, taken, j, warps, lanes)
+            }
+        });
+        moves.as_ref()
+    }
 }
 
 /// What re-holding a tile costs.
@@ -530,6 +800,17 @@ pub fn natural(shape: Shape, warps: u32, lanes: u32) -> Option<TileLayout> {
     Some(TileLayout { frag, reps, warps: warps_layout })
 }
 
+/// Whether `threads` threads fill a `shape` tile of `bytes`-byte elements
+/// in 16-byte chunks: whole chunks along every row and the same count of
+/// them per thread. The emitter refuses any other `cp.async` fill
+/// ([`crate::lower::emit`]), and the rankings hold a register-staged one
+/// to it too (a tile whose chunks do not share out evenly leaves lanes
+/// idle), so every config's `fits` asks here.
+pub fn fills_in_chunks(shape: Shape, bytes: usize, threads: usize) -> bool {
+    let chunk = 16 / bytes;
+    shape.cols.is_multiple_of(chunk) && (shape.rows * shape.cols / chunk).is_multiple_of(threads)
+}
+
 /// The layout of a register-staged fill: each lane holds a 16-byte run of
 /// a row (the `cp.async` chunk), consecutive lanes walk the runs along
 /// `walk` first (`Col`: along the row, as a row-major tile is written;
@@ -619,8 +900,9 @@ pub struct Laid {
 /// layouts.
 ///
 /// A product may be issued either way round at no cost, and which way it goes
-/// decides whether the next product takes its result as it stands. The
-/// assignment that forces the least relayout traffic wins — every assignment
+/// decides whether the next product takes its result as it stands and how
+/// many lanes a reduction of it folds across. The assignment of the least
+/// relayout traffic, scattered loads and fold moves wins — every assignment
 /// is tried while the free products are few, one flip at a time beyond that —
 /// so an accumulator that feeds another product reaches it in the layout that
 /// product wants, which on a target whose accumulator is its operand's
@@ -633,7 +915,14 @@ pub fn infer(mut prog: Program, device: &Device, grid: WarpGrid, core: Core) -> 
     let (mut layouts, conflicts) = (it.lay, it.conflicts);
     if !conflicts.is_empty() {
         let body = std::mem::take(&mut prog.body);
-        let body = Rewrite { prog: &mut prog, lay: &mut layouts, conflicts, pos: 0 }.insert(body);
+        let mut rewrite = Rewrite { prog: &mut prog, lay: &mut layouts, conflicts, pos: 0 };
+        let body = rewrite.insert(body);
+        // A conflict the rewrite re-holds no operand for is on a result the
+        // op lays itself (a product's, a deal's): dropped, the emitter would
+        // write the op's layout into registers read under another.
+        if let Some(&(_, value)) = rewrite.conflicts.keys().next() {
+            return UnresolvedSnafu { value }.fail();
+        }
         prog.body = body;
     }
     Ok(Laid { prog, layouts })
@@ -668,24 +957,48 @@ fn scatters(prog: &Program, lay: &TileLayout, from: &Value, lanes: u32) -> bool 
 }
 
 /// Write an orientation into every product of `prog`: the pinned ones stay,
-/// the rest take the assignment of least relayout and scatter cost.
+/// a product whose result is dealt issues the way round that spreads a row
+/// over the fewest lanes ([`MmaAtom::narrow`]), the rest take the
+/// assignment of least relayout, scatter and fold cost.
+///
+/// A deal renames registers only where its rows spread over the fewest
+/// lanes ([`TileLayout::dealt`]), which is how the op layer prices a list
+/// ([`crate::kernels::nearest::NearestCfg::sharing`]). Left to the search,
+/// a static count of the scattered loads beside the deals (a list's merge
+/// into the outputs) outweighed the deals' lane moves under gfx1201's
+/// measured costs (a scattered element 90 lane moves) for a queued list
+/// dealing 16 candidates a trip; issued the other way round, every tile of
+/// its state took eight registers a lane instead of one and every deal lane
+/// moves: 400k instructions where the narrow way emits 60k, 5 KB of spill
+/// and 100 s of clang a config.
 fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Core) -> Result<()> {
     let Device { target, costs } = device;
+    let dealt = dealt_values(prog);
     // A product listed twice (a peeled loop trip) is one decision; a
     // warpgroup product is never square, so it issues one way.
     let mut free: Vec<ValId> = vec![];
+    let mut fixed: HashMap<ValId, Orient> = HashMap::new();
     for (_, s) in prog.walk() {
-        if let Stmt::Let { dst, op: TileOp::Mma { a, orient: None, .. } } = s {
+        if let Stmt::Let { dst, op: TileOp::Mma { a, a_t, orient: None, .. } } = s {
             let (va, vd) = (prog.value(*a), prog.value(*dst));
-            if core == Core::Warp
-                && target.mma(va.dtype, vd.dtype).is_some_and(MmaAtom::swappable)
-                && !free.contains(dst)
-            {
+            let Some(atom) = target.mma(va.dtype, vd.dtype).filter(|atom| core == Core::Warp && atom.swappable())
+            else {
+                continue;
+            };
+            if dealt.contains(dst) {
+                let k = if *a_t { va.shape.rows } else { va.shape.cols };
+                if let Ok((orient, _)) = atom.narrow(grid, vd.shape.rows, vd.shape.cols, k) {
+                    fixed.insert(*dst, orient);
+                    continue;
+                }
+            }
+            if !free.contains(dst) {
                 free.push(*dst);
             }
         }
     }
-    let cost_of = |choice: &HashMap<ValId, Orient>| -> Result<f64> {
+    let mut moved = Moves::new(grid.count(), target.wave);
+    let mut cost_of = |choice: &HashMap<ValId, Orient>| -> Result<f64> {
         let mut trial = prog.clone();
         set_orient(&mut trial.body, choice);
         let mut it = Infer::new(&trial, target, grid, core);
@@ -713,12 +1026,40 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Co
                 _ => None,
             })
             .sum();
-        Ok(relayouts + costs.scatter * scattered)
+        // A reduction folds across the lanes that share its rows (or
+        // columns): what the emitter issues per lane, over every lane.
+        let folds: f64 = trial
+            .walk()
+            .filter_map(|(_, s)| match s {
+                Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } => {
+                    let (ls, ld) = (it.lay[src.index()].as_ref()?, it.lay[dst.index()].as_ref()?);
+                    let moves = ls.fold_moves(ld, *axis, target.lane_move) * target.wave * grid.count();
+                    Some(moves as f64)
+                }
+                _ => None,
+            })
+            .sum();
+        // A shift, flip or deal moves across the lanes its layouts hold
+        // apart: the moves a lane issues, over every lane.
+        let exchanges: f64 = trial
+            .walk()
+            .filter_map(|(_, s)| {
+                let Stmt::Let { dst, op } = s else { return None };
+                let (src, how) = Move::of(op)?;
+                let (ls, ld) = (it.lay[src.index()].as_ref()?, it.lay[dst.index()].as_ref()?);
+                let crossing = |picks: &[Pick]| picks.iter().filter(|p| p.mask != 0).count() as u32;
+                let moves = moved.get(ls, ld, how);
+                let issued: u32 = moves.map_or(0, |m| m.iter().map(|(picks, _)| crossing(picks)).sum());
+                Some(f64::from(issued * target.wave * grid.count()))
+            })
+            .sum();
+        Ok(relayouts + costs.scatter * scattered + costs.lane_move * (folds + exchanges))
     };
-    let mut best: HashMap<ValId, Orient> = HashMap::new();
+    let mut best = fixed.clone();
     let mut best_cost = cost_of(&best)?;
     let swapped = |bits: u32| -> HashMap<ValId, Orient> {
-        free.iter().enumerate().filter(|(i, _)| bits >> i & 1 == 1).map(|(_, &v)| (v, Orient::Swapped)).collect()
+        let swapped = free.iter().enumerate().filter(|(i, _)| bits >> i & 1 == 1).map(|(_, &v)| (v, Orient::Swapped));
+        fixed.iter().map(|(&v, &o)| (v, o)).chain(swapped).collect()
     };
     if free.len() <= EXHAUSTIVE_UP_TO {
         for bits in 1..1u32 << free.len() {
@@ -740,8 +1081,68 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Co
             }
         }
     }
+    let swapped = best.values().filter(|&&o| o == Orient::Swapped).count();
+    tracing::debug!(name = prog.name, free = free.len(), dealt = fixed.len(), swapped, cost = best_cost, "oriented");
     set_orient(&mut prog.body, &best);
     Ok(())
+}
+
+/// The register values a deal ([`TileOp::Deal`]) takes its columns of, with
+/// every value held in their layout: the operands of the elementwise ops,
+/// casts, moves and exchanges feeding them and the carries of the loops
+/// they come out of (what [`Infer::let_`] and [`Infer::carried`] unify),
+/// back to the products they come from.
+fn dealt_values(prog: &Program) -> HashSet<ValId> {
+    let stmts: Vec<&Stmt> = prog.walk().map(|(_, s)| s).collect();
+    let mut dealt: HashSet<ValId> = stmts
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Let { op: TileOp::Deal { src, .. }, .. } => Some(*src),
+            _ => None,
+        })
+        .collect();
+    // Definitions precede uses, so a pass backwards reaches a value's
+    // sources; a loop's carry is defined in its body, after the loop
+    // statement, so the passes repeat until nothing is added.
+    loop {
+        let before = dealt.len();
+        for s in stmts.iter().rev() {
+            match s {
+                Stmt::Let { dst, op } if dealt.contains(dst) => dealt.extend(unified(op)),
+                Stmt::Loop(Loop { carried, .. }) | Stmt::Pipeline(Pipeline { carried, .. }) => {
+                    let sources: Vec<ValId> =
+                        carried.iter().filter(|c| dealt.contains(&c.phi)).flat_map(|c| [c.init, c.next]).collect();
+                    dealt.extend(sources);
+                }
+                _ => {}
+            }
+        }
+        if dealt.len() == before {
+            return dealt;
+        }
+    }
+}
+
+/// The operands of `op` held in its result's layout ([`Infer::let_`]).
+fn unified(op: &TileOp) -> Vec<ValId> {
+    match *op {
+        TileOp::Unary { src, .. }
+        | TileOp::Cast { src, .. }
+        | TileOp::Move { src }
+        | TileOp::Shift { src, .. }
+        | TileOp::Flip { src, .. } => vec![src],
+        TileOp::Binary { a, b, .. } => vec![a, b],
+        TileOp::Where { pred, a, b } => vec![pred, a, b],
+        TileOp::MulAdd { a, b, c } => vec![a, b, c],
+        TileOp::Fill(_)
+        | TileOp::Splat(_)
+        | TileOp::Coord(_)
+        | TileOp::Relayout { .. }
+        | TileOp::Mma { .. }
+        | TileOp::Reduce { .. }
+        | TileOp::Transpose { .. }
+        | TileOp::Deal { .. } => vec![],
+    }
 }
 
 /// Orient every free product of `block`: as `choice` says, else direct.
@@ -781,9 +1182,12 @@ impl<'a> Infer<'a> {
                 // broadcasts over, say) is demanded from it rather than defaulted
                 // apart from it. Tiles seed before vectors: a vector's layout is
                 // its tile's to decide.
-                let Some(v) = self.unconstrained() else { return Ok(()) };
+                // A tile a laid vector spreads into first: its loop's
+                // initial value and its next take its layout from it.
+                let spread = self.spread();
+                let Some(v) = spread.as_ref().map(|s| s.0).or_else(|| self.unconstrained()) else { return Ok(()) };
                 let shape = prog.values[v.index()].shape;
-                let l = natural(shape, warps, lanes).context(UndeterminedSnafu {
+                let l = spread.map(|s| s.1).or_else(|| natural(shape, warps, lanes)).context(UndeterminedSnafu {
                     value: v,
                     rows: shape.rows,
                     cols: shape.cols,
@@ -796,6 +1200,40 @@ impl<'a> Infer<'a> {
             self.pass(&prog.body)?;
         }
         NotConvergedSnafu { passes }.fail()
+    }
+
+    /// The first register tile (not vector) nothing constrains that a laid
+    /// row vector broadcasts over (or a column vector, transposed), and the
+    /// tile it [spreads into](TileLayout::spread_row) at its first such
+    /// statement: a list of a row's values held beside that row's.
+    fn spread(&self) -> Option<(ValId, TileLayout)> {
+        let open = |v: ValId| {
+            let Value { place, shape, .. } = self.prog.value(v);
+            *place == Place::Reg && self.lay[v.index()].is_none() && shape.rows != 1 && shape.cols != 1
+        };
+        let mut first: Option<(ValId, TileLayout)> = None;
+        for (_, stmt) in self.prog.walk() {
+            let Stmt::Let { dst, op } = stmt else { continue };
+            let pairs = match *op {
+                TileOp::Binary { a, b, .. } | TileOp::Where { a, b, .. } | TileOp::MulAdd { a, b, .. } => [a, b],
+                _ => continue,
+            };
+            let Some((tile, vector, axis)) = self.broadcast(pairs[0], pairs[1]) else { continue };
+            let Some(vector) = self.lay[vector.index()].as_ref().filter(|_| self.lay[dst.index()].is_none()) else {
+                continue;
+            };
+            for v in [tile, *dst] {
+                if open(v) && first.as_ref().is_none_or(|(f, _)| v.index() < f.index()) {
+                    let Shape { rows, cols } = self.shape(v);
+                    let l = match axis {
+                        Axis::Row => TileLayout::spread_row(vector, cols as u32),
+                        Axis::Col => TileLayout::spread_row(&vector.transposed(), rows as u32).transposed(),
+                    };
+                    first = Some((v, l));
+                }
+            }
+        }
+        first
     }
 
     /// The first register value without a layout, tiles before vectors.
@@ -832,11 +1270,11 @@ impl<'a> Infer<'a> {
     /// so the operands reach it in the result's layout (a conflict is only
     /// ever resolved on a statement's operand).
     fn unify(&mut self, a: ValId, b: ValId) {
-        match (self.lay[a.index()].clone(), self.lay[b.index()].clone()) {
-            (Some(l), None) => self.set(b, l),
-            (None, Some(l)) => self.set(a, l),
+        match (&self.lay[a.index()], &self.lay[b.index()]) {
+            (Some(l), None) => self.set(b, l.clone()),
+            (None, Some(l)) => self.set(a, l.clone()),
             (Some(x), Some(y)) if x != y => {
-                self.conflicts.insert((self.pos, b), x);
+                self.conflicts.insert((self.pos, b), x.clone());
             }
             _ => {}
         }
@@ -845,9 +1283,9 @@ impl<'a> Infer<'a> {
     fn carried(&mut self, carried: &[Carried]) -> Result<()> {
         for c in carried {
             for (x, y) in [(c.init, c.phi), (c.next, c.phi)] {
-                match (self.lay[x.index()].clone(), self.lay[y.index()].clone()) {
-                    (Some(l), None) => self.set(y, l),
-                    (None, Some(l)) => self.set(x, l),
+                match (&self.lay[x.index()], &self.lay[y.index()]) {
+                    (Some(l), None) => self.set(y, l.clone()),
+                    (None, Some(l)) => self.set(x, l.clone()),
                     (Some(a), Some(b)) => ensure!(a == b, CarriedLayoutChangesSnafu { value: c.phi }),
                     _ => {}
                 }
@@ -925,7 +1363,18 @@ impl<'a> Infer<'a> {
     fn let_(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
         match *op {
             TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) | TileOp::Relayout { .. } => {}
-            TileOp::Unary { src, .. } | TileOp::Cast { src, .. } | TileOp::Move { src } => self.unify(dst, src),
+            TileOp::Unary { src, .. }
+            | TileOp::Cast { src, .. }
+            | TileOp::Move { src }
+            | TileOp::Shift { src, .. }
+            | TileOp::Flip { src, .. } => self.unify(dst, src),
+            // A row's columns dealt over the lanes holding it.
+            TileOp::Deal { src, .. } => {
+                if let Some(l) = &self.lay[src.index()] {
+                    let want = TileLayout::spread_row(&l.row_vector(), self.shape(dst).cols as u32);
+                    self.demand(dst, want);
+                }
+            }
             TileOp::Binary { a, b, .. } => self.elementwise(dst, a, b),
             TileOp::Where { pred, a, b } => {
                 self.elementwise(dst, a, b);
@@ -1022,6 +1471,9 @@ impl Rewrite<'_> {
                     TileOp::Unary { src, .. }
                     | TileOp::Cast { src, .. }
                     | TileOp::Transpose { src }
+                    | TileOp::Shift { src, .. }
+                    | TileOp::Flip { src, .. }
+                    | TileOp::Deal { src, .. }
                     | TileOp::Relayout { src }
                     | TileOp::Move { src } => rewrite(self, src),
                     TileOp::Binary { a, b, .. } => {
@@ -1051,6 +1503,26 @@ impl Rewrite<'_> {
                         *b = self.insert(std::mem::take(b));
                     }
                 }
+            }
+            // A reduction whose result its consumers laid otherwise than
+            // its operand's vector reduces into that vector, then re-holds
+            // it: the emitter folds a register's lanes as the operand holds
+            // them, so a result laid apart would hold other rows' values.
+            if let Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } = &stmt
+                && self.conflicts.remove(&(pos, *dst)).is_some()
+            {
+                let held = self.lay[src.index()].as_ref().map(|l| match axis {
+                    Axis::Row => l.row_vector(),
+                    Axis::Col => l.col_vector(),
+                });
+                let Value { dtype, shape, .. } = self.prog.value(*dst).clone();
+                self.prog.values.push(Value { dtype, shape, place: Place::Reg });
+                let fresh = ValId(self.prog.values.len() as u32 - 1);
+                self.lay.push(held);
+                let dst = *dst;
+                let Stmt::Let { op, .. } = stmt else { unreachable!("a reduction") };
+                out.push(Stmt::Let { dst: fresh, op });
+                stmt = Stmt::Let { dst, op: TileOp::Relayout { src: fresh } };
             }
             out.push(stmt);
         }

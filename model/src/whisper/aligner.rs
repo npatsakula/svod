@@ -2,14 +2,15 @@
 
 use std::time::{Duration, Instant};
 
+use svod_arch::pipelines::audio::Segment;
 use svod_device::Buffer;
 use svod_dtype::DType;
 
 use crate::jit::InputSpec;
 
-use super::config::{HOP_LENGTH, N_AUDIO_CTX, N_FRAMES, TOKENS_PER_SECOND, WhisperSize};
+use super::config::{HOP_LENGTH, ModelDimensions, N_AUDIO_CTX, N_FRAMES, TOKENS_PER_SECOND, WhisperSize};
 use super::decode::{WhisperTask, decode_err, read_f32};
-use super::dtw::{find_alignment_path_selected, path_to_word_timings};
+use super::dtw::{find_alignment_path_selected, path_to_word_timings_in_segments};
 use super::error::Result;
 use super::jit::{WhisperAlignmentJit, WhisperAlignmentModel};
 use super::model::Whisper;
@@ -46,6 +47,9 @@ pub struct WhisperAlignmentInput<'a> {
     pub task: WhisperTask,
     /// Unpadded source-audio length in samples.
     pub audio_samples: usize,
+    /// Recogniser timestamp segments for this window, window-relative. Their
+    /// first start and last end repair the aligned edge words.
+    pub segments: &'a [Segment],
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +89,17 @@ impl WhisperAligner {
         }
         let heads = size.alignment_heads().to_vec();
         let dims = &model.dims;
+        let expected = ModelDimensions::for_size(size);
+        if dims.n_mels != expected.n_mels
+            || dims.n_vocab != expected.n_vocab
+            || (dims.n_audio_state, dims.n_audio_head, dims.n_audio_layer)
+                != (expected.n_audio_state, expected.n_audio_head, expected.n_audio_layer)
+            || (dims.n_text_state, dims.n_text_head, dims.n_text_layer)
+                != (expected.n_text_state, expected.n_text_head, expected.n_text_layer)
+        {
+            let msg = format!("whisper size {} does not match the model dimensions", size.name());
+            return Err(decode_err(&msg));
+        }
         let (layer_heads, d_head) = (dims.n_text_layer * dims.n_text_head, dims.n_text_state / dims.n_text_head);
         let prompt_len = if dims.is_multilingual() { 3 } else { 1 };
         let text_ctx = replay_rows(max_tokens, prompt_len, dims.n_text_ctx);
@@ -104,13 +119,17 @@ impl WhisperAligner {
         Ok(Self { jit, n_heads: heads.len(), batch_size, text_ctx, cache_dtype, cache_bytes })
     }
 
-    /// Align up to the concrete batch capacity prepared at construction.
+    /// Align up to the concrete batch capacity prepared at construction. The
+    /// window order is the audio order, so the pause clamp carries from one
+    /// input to the next.
     pub fn align_batch(
         &mut self,
         inputs: &[WhisperAlignmentInput<'_>],
         tokenizer: &WhisperTokenizer,
     ) -> Result<Vec<Vec<Word>>> {
-        self.align_batch_profiled(inputs, tokenizer, &mut CopyProfile::default()).map(|(words, _)| words)
+        let mut last_speech_timestamp = 0.0;
+        self.align_batch_profiled(inputs, tokenizer, &mut CopyProfile::default(), &mut last_speech_timestamp)
+            .map(|(words, _)| words)
     }
 
     pub(crate) fn align_batch_profiled(
@@ -118,6 +137,7 @@ impl WhisperAligner {
         inputs: &[WhisperAlignmentInput<'_>],
         tokenizer: &WhisperTokenizer,
         copies: &mut CopyProfile,
+        last_speech_timestamp: &mut f32,
     ) -> Result<(Vec<Vec<Word>>, AlignmentProfile)> {
         if inputs.len() > self.batch_size {
             let msg = format!("alignment input {} exceeds prepared batch {}", inputs.len(), self.batch_size);
@@ -169,14 +189,11 @@ impl WhisperAligner {
             }
             let prompt_len = tokens.len();
             tokens.push(tokenizer.no_timestamps());
-            let text: Vec<u32> = input
-                .decoded_tokens
-                .iter()
-                .copied()
-                .filter(|&token| token < tokenizer.eot())
-                .take(text_ctx - prompt_len - 2)
-                .collect();
-            let token_probs = input.token_probs[..input.token_probs.len().min(text.len())].to_vec();
+            // Text the replay holds after the prompt, `<|notimestamps|>`, and
+            // EOT. A longer lane is refused rather than silently truncated.
+            let capacity = text_ctx.saturating_sub(prompt_len + 2);
+            let (text, token_probs) =
+                lane_text_tokens(input.decoded_tokens, input.token_probs, tokenizer.eot(), capacity)?;
             tokens.extend_from_slice(&text);
             tokens.push(tokenizer.eot());
             for (index, token) in tokens.iter().enumerate() {
@@ -207,30 +224,65 @@ impl WhisperAligner {
         let qk = copies.d2h("alignment_qk", 1, count * size_of::<f32>(), output, || read_f32(output, 0, count))?;
 
         let cpu_started = Instant::now();
-        let words = inputs
-            .iter()
-            .zip(lanes)
-            .enumerate()
-            .map(|(lane, (input, meta))| {
-                let lane_qk = &qk[lane * qk_stride..(lane + 1) * qk_stride];
-                let valid_audio = (input.audio_samples / HOP_LENGTH).min(N_FRAMES) / 2;
-                let (text_indices, time_indices) = find_alignment_path_selected(
-                    lane_qk,
-                    self.n_heads,
-                    text_ctx,
-                    N_AUDIO_CTX,
-                    meta.valid_text,
-                    valid_audio,
-                    7,
-                    meta.prompt_len,
-                );
-                words_from_path(&text_indices, &time_indices, &meta.text, &meta.token_probs, input.language, tokenizer)
-            })
-            .collect();
+        let mut words = Vec::with_capacity(inputs.len());
+        for (lane, (input, meta)) in inputs.iter().zip(lanes).enumerate() {
+            let lane_qk = &qk[lane * qk_stride..(lane + 1) * qk_stride];
+            let valid_audio = (input.audio_samples / HOP_LENGTH).min(N_FRAMES) / 2;
+            let (text_indices, time_indices) = find_alignment_path_selected(
+                lane_qk,
+                self.n_heads,
+                text_ctx,
+                N_AUDIO_CTX,
+                meta.valid_text,
+                valid_audio,
+                7,
+                meta.prompt_len,
+            );
+            let (lane_words, carried) = words_from_path(
+                &text_indices,
+                &time_indices,
+                &meta.text,
+                &meta.token_probs,
+                input.language,
+                tokenizer,
+                input.segments,
+                *last_speech_timestamp,
+            );
+            *last_speech_timestamp = carried;
+            words.push(lane_words);
+        }
         Ok((words, AlignmentProfile { graph, cpu_dtw_wall: cpu_started.elapsed() }))
     }
 }
 
+/// One lane's aligned text: decoder tokens below EOT, each paired with the
+/// probability the decoder gave that same token. Timestamp and EOT tokens are
+/// dropped, so their probabilities must be dropped with them. `capacity` is
+/// the text the prepared replay holds; a longer lane is an error rather than a
+/// silent truncation.
+pub(crate) fn lane_text_tokens(
+    decoded: &[u32],
+    token_probs: &[f32],
+    eot: u32,
+    capacity: usize,
+) -> Result<(Vec<u32>, Vec<f32>)> {
+    let mut tokens = Vec::new();
+    let mut probabilities = Vec::new();
+    for (index, &token) in decoded.iter().enumerate() {
+        if token >= eot {
+            continue;
+        }
+        if tokens.len() == capacity {
+            let msg = format!("alignment text exceeds the prepared {capacity}-token context");
+            return Err(decode_err(&msg));
+        }
+        tokens.push(token);
+        probabilities.push(token_probs.get(index).copied().unwrap_or(0.0));
+    }
+    Ok((tokens, probabilities))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn words_from_path(
     text_indices: &[usize],
     time_indices: &[usize],
@@ -238,13 +290,15 @@ pub(crate) fn words_from_path(
     token_probs: &[f32],
     language: Option<&str>,
     tokenizer: &WhisperTokenizer,
-) -> Vec<Word> {
+    segments: &[Segment],
+    last_speech_timestamp: f32,
+) -> (Vec<Word>, f32) {
     let (word_strings, word_token_lists) = tokenizer.split_to_word_tokens_for_language(text_tokens, language);
     let mut word_boundaries = vec![0usize];
     for tokens in &word_token_lists {
         word_boundaries.push(word_boundaries.last().copied().unwrap() + tokens.len());
     }
-    path_to_word_timings(
+    let (timings, last_speech_timestamp) = path_to_word_timings_in_segments(
         text_indices,
         time_indices,
         &word_boundaries,
@@ -252,9 +306,13 @@ pub(crate) fn words_from_path(
         &word_token_lists,
         token_probs,
         TOKENS_PER_SECOND,
-    )
-    .into_iter()
-    .filter(|word| !word.word.trim().is_empty())
-    .map(|word| Word { text: word.word, start: word.start, end: word.end })
-    .collect()
+        segments,
+        last_speech_timestamp,
+    );
+    let words = timings
+        .into_iter()
+        .filter(|word| !word.word.trim().is_empty())
+        .map(|word| Word { text: word.word, start: word.start, end: word.end })
+        .collect();
+    (words, last_speech_timestamp)
 }

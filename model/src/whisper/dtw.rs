@@ -7,6 +7,8 @@
 //! 4. DTW on `-matrix` → backtrace → `(text_idx, time_idx)` path
 //! 5. Map jump points to word boundaries
 
+use svod_arch::pipelines::audio::Segment;
+
 /// One word's timing from DTW alignment.
 #[derive(Clone, Debug)]
 pub struct WordTiming {
@@ -96,6 +98,14 @@ pub fn dtw(x: &[f32], n_rows: usize, n_cols: usize) -> (Vec<usize>, Vec<usize>) 
 /// `filter_width` applied to the last axis (n_cols).
 pub fn median_filter(data: &[f32], n_rows: usize, n_cols: usize, filter_width: usize) -> Vec<f32> {
     assert!(filter_width > 0 && filter_width % 2 == 1, "filter_width must be odd");
+    // Fewer than four frames leave no interior for a seven-wide reflect
+    // padding: every window folds back onto the same edge values. Narrow the
+    // filter to the window instead, as whisper.cpp does.
+    let filter_width = match n_cols {
+        1 | 2 => 1,
+        3 => 3,
+        _ => filter_width,
+    };
     let pad = filter_width / 2;
     let mut out = vec![0.0f32; n_rows * n_cols];
 
@@ -140,7 +150,9 @@ pub fn find_alignment_path_selected(
 ) -> (Vec<usize>, Vec<usize>) {
     let valid_text = valid_text.min(text_stride);
     let valid_audio = valid_audio.min(audio_stride);
-    if n_heads == 0 || valid_audio == 0 || valid_text <= sot_len + 1 {
+    // The matrix keeps the `<|notimestamps|>` row before the text tokens, so
+    // `sot_len + 2` tokens (prompt, `<|notimestamps|>`, EOT) leave no text row.
+    if n_heads == 0 || valid_audio == 0 || valid_text <= sot_len + 2 {
         return (Vec::new(), Vec::new());
     }
 
@@ -230,6 +242,60 @@ pub fn path_to_word_timings(
     token_probs: &[f32],
     tokens_per_second: f32,
 ) -> Vec<WordTiming> {
+    let mut timings = raw_word_timings(
+        text_indices,
+        time_indices,
+        word_boundaries,
+        words,
+        word_token_lists,
+        token_probs,
+        tokens_per_second,
+    );
+    clean_up_word_timings(&mut timings);
+    timings
+}
+
+/// [`path_to_word_timings`] with `add_word_timestamps`' segment-edge repair.
+///
+/// `segments` are the recogniser's timestamped segments for the aligned text;
+/// the first segment's start and the last segment's end bound the edge words.
+/// Returns the repaired timings and the `last_speech_timestamp` that a
+/// following window carries into the pause clamp.
+#[allow(clippy::too_many_arguments)]
+pub fn path_to_word_timings_in_segments(
+    text_indices: &[usize],
+    time_indices: &[usize],
+    word_boundaries: &[usize],
+    words: &[String],
+    word_token_lists: &[Vec<u32>],
+    token_probs: &[f32],
+    tokens_per_second: f32,
+    segments: &[Segment],
+    last_speech_timestamp: f32,
+) -> (Vec<WordTiming>, f32) {
+    let mut timings = raw_word_timings(
+        text_indices,
+        time_indices,
+        word_boundaries,
+        words,
+        word_token_lists,
+        token_probs,
+        tokens_per_second,
+    );
+    let median = clean_up(&mut timings);
+    let last_speech_timestamp = repair_segment_edges(&mut timings, segments, median, last_speech_timestamp);
+    (timings, last_speech_timestamp)
+}
+
+fn raw_word_timings(
+    text_indices: &[usize],
+    time_indices: &[usize],
+    word_boundaries: &[usize],
+    words: &[String],
+    word_token_lists: &[Vec<u32>],
+    token_probs: &[f32],
+    tokens_per_second: f32,
+) -> Vec<WordTiming> {
     if word_boundaries.len() <= 1 || text_indices.is_empty() || time_indices.is_empty() {
         return Vec::new();
     }
@@ -241,17 +307,26 @@ pub fn path_to_word_timings(
         jumps[i] = text_indices[i] != text_indices[i - 1];
     }
 
-    // Map jump times
-    let jump_times: Vec<f32> =
-        time_indices.iter().zip(&jumps).filter(|&(_, j)| *j).map(|(&ti, _)| ti as f32 / tokens_per_second).collect();
+    // `jump_times[k]` is the first frame of DTW row `k`, and row `k >= 1`
+    // aligns text token `k - 1`: the boundary at token `b` starts at
+    // `jump_times[b + 1]`. The final path frame ends the last token, which has
+    // no row of its own to start a boundary.
+    let mut jump_times: Vec<f32> = time_indices
+        .iter()
+        .zip(&jumps)
+        .filter(|&(_, jump)| *jump)
+        .map(|(&time, _)| time as f32 / tokens_per_second)
+        .collect();
+    let final_frame = time_indices.last().copied().unwrap_or(0) + 1;
+    jump_times.push(final_frame as f32 / tokens_per_second);
 
     let n_words = word_boundaries.len() - 1;
     let mut result = Vec::with_capacity(n_words);
 
     let last_jump = jump_times.last().copied().unwrap_or(0.0);
     for w in 0..n_words {
-        let start = jump_times.get(word_boundaries[w]).copied().unwrap_or(last_jump);
-        let end = jump_times.get(word_boundaries[w + 1]).copied().unwrap_or(last_jump).max(start);
+        let start = jump_times.get(word_boundaries[w] + 1).copied().unwrap_or(last_jump);
+        let end = jump_times.get(word_boundaries[w + 1] + 1).copied().unwrap_or(last_jump).max(start);
 
         // Token probabilities for this word
         let tok_start = word_boundaries[w];
@@ -272,25 +347,19 @@ pub fn path_to_word_timings(
         });
     }
 
-    clean_up_word_timings(&mut result);
     result
 }
 
 /// Apply OpenAI Whisper's sentence-boundary duration cleanup and punctuation
 /// attachment to raw DTW timings.
 pub fn clean_up_word_timings(words: &mut [WordTiming]) {
-    let mut durations: Vec<f32> = words
-        .iter()
-        .map(|word| word.end - word.start)
-        .filter(|duration| duration.is_finite() && *duration > 0.0)
-        .collect();
-    durations.sort_by(|a, b| a.total_cmp(b));
-    let median = match durations.len() {
-        0 => 0.0,
-        len if len % 2 == 0 => (durations[len / 2 - 1] + durations[len / 2]) / 2.0,
-        len => durations[len / 2],
-    }
-    .min(0.7);
+    clean_up(words);
+}
+
+/// The reference's median-duration sentence clamp followed by punctuation
+/// attachment. Returns the median duration the segment repair clamps against.
+fn clean_up(words: &mut [WordTiming]) -> f32 {
+    let median = median_word_duration(words);
     let max_duration = median * 2.0;
     if max_duration > 0.0 {
         const SENTENCE_END: &str = ".。!！?？";
@@ -306,6 +375,74 @@ pub fn clean_up_word_timings(words: &mut [WordTiming]) {
     }
 
     merge_punctuations(words, "\"'“¿([{-", "\"'.。,，!！?？:：”)]}、");
+    median
+}
+
+/// Median duration of the finite, positive word spans, capped at 0.7 s.
+fn median_word_duration(words: &[WordTiming]) -> f32 {
+    let mut durations: Vec<f32> = words
+        .iter()
+        .map(|word| word.end - word.start)
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .collect();
+    durations.sort_by(|a, b| a.total_cmp(b));
+    match durations.len() {
+        0 => 0.0,
+        len if len % 2 == 0 => (durations[len / 2 - 1] + durations[len / 2]) / 2.0,
+        len => durations[len / 2],
+    }
+    .min(0.7)
+}
+
+/// `add_word_timestamps`' segment-edge repair: clamp the first and last word to
+/// the segment timestamps the recogniser emitted, using the pause since
+/// `last_speech_timestamp`. Returns the timestamp the next window carries.
+pub(crate) fn repair_segment_edges(
+    words: &mut [WordTiming],
+    segments: &[Segment],
+    median: f32,
+    last_speech_timestamp: f32,
+) -> f32 {
+    let (Some(segment_start), Some(segment_end)) =
+        (segments.first().map(|segment| segment.start), segments.last().map(|segment| segment.end))
+    else {
+        return last_speech_timestamp;
+    };
+    let Some(first) = words.iter().position(|word| !word.word.is_empty()) else {
+        return last_speech_timestamp;
+    };
+    let last = words.iter().rposition(|word| !word.word.is_empty()).unwrap_or(first);
+    let max_duration = median * 2.0;
+
+    // A long pause before the first word leaves its DTW start far behind its
+    // end: first halve the following word's span, then clamp this word's start.
+    let second = (first + 1..words.len()).find(|&index| !words[index].word.is_empty());
+    let pause_clamp = words[first].end - last_speech_timestamp > median * 4.0
+        && (words[first].end - words[first].start > max_duration
+            || second.is_some_and(|index| words[index].end - words[first].start > max_duration * 2.0));
+    if pause_clamp {
+        if let Some(index) = second
+            && words[index].end - words[index].start > max_duration
+        {
+            let boundary = (words[index].end / 2.0).max(words[index].end - max_duration);
+            words[first].end = boundary;
+            words[index].start = boundary;
+        }
+        words[first].start = (words[first].end - max_duration).max(0.0);
+    }
+
+    // Prefer the segment start when DTW put the first word well before it.
+    if segment_start < words[first].end && segment_start - 0.5 > words[first].start {
+        words[first].start = (words[first].end - median).min(segment_start).max(0.0);
+    }
+
+    // Prefer the segment end when DTW put the last word well after it.
+    if segment_end > words[last].start && segment_end + 0.5 < words[last].end {
+        words[last].end = (words[last].start + median).max(segment_end);
+        segment_end
+    } else {
+        words[last].end
+    }
 }
 
 fn merge_punctuations(words: &mut [WordTiming], prepended: &str, appended: &str) {

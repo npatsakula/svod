@@ -308,6 +308,7 @@ impl AmdDevice {
             num_xcc,
             num_cp_queues: 1,
             max_slots_scratch_cu: 32,
+            memory_bytes: 0,
         };
         let core = Arc::new(AmdDeviceCore {
             node,

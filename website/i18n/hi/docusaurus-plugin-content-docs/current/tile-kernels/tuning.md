@@ -5,14 +5,25 @@ sidebar_label: Tuning
 # Tuning {#tuning}
 
 हर op `ops::config` में अपने configs को हर shape के लिए device की मापी गई costs से rank करता है (देखें
-[Device costs](#device-costs))। Ranking एक model है, और register count भी, इसलिए दोनों में से कोई
-config को admit नहीं करता। एक नियम करता है: tuner ranked configs को 64 के batches (`config::SHORTLIST`)
-में, ranked क्रम में और समानांतर रूप से compile करता है, जब तक उसे वे पहले 64 tiles न मिल जाएँ जिनके
-compiled kernels spill नहीं करते (spilled scratch bytes बताने वाला कर्नेल spill करता है; जो backend कुछ
-नहीं बताता वह admit करता है)। एक tile अपनी पहली clean pipeline (ring depth, unrolling) पर admit होता
-है, इसलिए spill करने वाली unrolled ring अपने rolled जुड़वाँ के लिए जगह छोड़ देती है। जब compile होने
-वाला हर config spill करे, तब भी उनमें से पहले 64 मापे जाते हैं: spills की वजह से कोई op ग्राफ़ पर नहीं
-गिरता।
+[Device costs](#device-costs)), और 16 tiles रख लेने के बाद सबसे सस्ते के 2.5× से महँगे configs छोड़ देता है
+(`config::PRUNED_PAST`): sm_86 पर उनमें से कोई contender band में नहीं चला। Ranking एक model है, और register count भी, इसलिए दोनों में से कोई
+config को admit नहीं करता। एक नियम करता है: tuner ranked configs को समानांतर रूप से compile करता है, जब
+तक उसे ranked क्रम में वे पहले 64 tiles (`config::SHORTLIST`) न मिल जाएँ जिनके compiled kernels spill
+नहीं करते (spilled scratch bytes बताने वाला कर्नेल spill करता है; जो backend कुछ नहीं बताता वह admit
+करता है)। एक tile अपनी पहली clean pipeline (ring depth, unrolling) पर admit होता है, इसलिए spill करने
+वाली unrolled ring अपने rolled जुड़वाँ के लिए जगह छोड़ देती है। कोई pipeline तभी compile होती है जब
+उसके tile की उससे ऊपर ranked pipelines spill या fail हुईं, और 64वें clean tile के बाद कोई नहीं: ठीक
+वही जो ranked क्रम में एक-एक config compile करने वाला walk compile करता (`config::Search`)। जिन tiles की कोई
+pipeline clean compile नहीं होती, वे उन्हीं 64 के भीतर clean tiles के बाद आते हैं, हर एक की एक pipeline:
+compiled kernel जो आँक सकता है वह आँकता है और बाक़ी समय आँकता है (spills की वजह से कोई op ग्राफ़ पर नहीं
+गिरता, और gfx1201 पर 16384² depth-768 nearest का सबसे अच्छा tile प्रति lane 196 bytes spill करके clean
+pick से 2 % आगे चलता है)। किसी config का compile thread pool पर तभी शुरू हो जाता है जब search उसे माँगती है (pool में जगह हो तो tile की अगली pipeline तभी शुरू हो जाती है जब पिछली अभी compile हो रही हो, और उसका verdict वहीं गिना जाता है जहाँ walk उसे माँगता); जिसका compiler
+30 s (`tune::COMPILE_TIMEOUT`) से ज़्यादा चले उसे kill करके fail की तरह reject किया जाता है, और planner
+log यह बताता है (`compile timed out`); जिसका lowered program उसके target की अनुमति से ज़्यादा instructions
+emit करे (`Target::most_instructions`: AMD पर 2^18, CUDA पर 2^19, सबसे बड़े ranked kernels से ऊपर) उसे
+lowering ही किसी compiler के देखने से पहले मना कर देती है (`lower::Error::TooLarge`, planner log में
+`does not lower`) और वैसे ही reject किया जाता है। हर program एक tuning में एक बार lower होता है: store के fingerprint
+ने जो lower किया वही body compile launch करता है।
 
 Admit हुए configs, अपने variants के साथ (attention के लिए key splits, भूखे convolution के लिए
 reduction splits), वे candidates हैं जिन्हें tune store तब मापता है जब कोई device पहली बार किसी shape
@@ -37,13 +48,15 @@ variable अपने maximum पर bound होता है (float operands �
 | क़दम | सेटिंग |
 |---|---|
 | Warm-up | लगातार runs जब तक clock स्थिर न हो जाए |
-| Rounds | हर candidate का एक round, फिर contenders के 3 और: वे जो पहले round के सबसे अच्छे के 1.2× के भीतर हों (16 से कम हों तो हर candidate); फिर दो अग्रणियों के 4 और, जहाँ दो से ज़्यादा contenders चले हों |
-| हर round | लगातार sustain runs में 5 ms device time (अधिकतम 1024 launches, candidate के पिछले run के हिसाब से आकार), फिर 5 profiled runs, हर candidate का minimum रखते हुए |
+| Rounds | ranked क्रम में हर candidate का एक round, जिसमें जिस candidate का पहला timed run अब तक के सबसे अच्छे के 2× से ज़्यादा हो, उसका वही run उसका time रहता है; फिर contenders के 3 और: वे जो पहले round के सबसे अच्छे के 1.2× के भीतर हों (8 से कम candidates हों तो 2× के भीतर), दूसरे round के बाद सिर्फ़ वे जो अब तक के सबसे अच्छे के 1.05× के भीतर हों, और बाद के rounds बारी-बारी से उल्टे और सीधे क्रम में चलते हैं ताकि हर candidate अपने दोनों पड़ोसियों के बाद चले; फिर दो अग्रणियों के 4 और, जहाँ दो से ज़्यादा contenders चले हों। tuning की पहली timing, जो सिर्फ़ अग्रणी tiles चुनती है, दूसरे round के बाद रुक जाती है: उन tiles को उनकी बाकी pipelines के साथ फिर से मापा जाता है |
+| हर round | candidate के programs के क्रम से लगातार sustain runs में 5 ms device time (अधिकतम 1024 launches, candidate के पिछले run के हिसाब से आकार), फिर हर program के profiled runs, हर candidate का minimum रखते हुए: जितने 20 ms device time में आएँ, 2 से 5 (`tune::runs`), और 5 ms या उससे लंबे candidate के लिए कोई sustain नहीं, जिसका पहला timed run तब उन्हीं में गिना जाता है; leaders के rounds (और cost probes) sustain के बाद 5 runs रखते हैं |
 | एक run का समय | उसके कर्नेलों के GPU timestamps का जोड़ |
 
 Sustain का आकार device time में तय होता है क्योंकि launches asynchronously queue होते हैं। एक
 candidate programs की एक list है, एक कर्नेल और split होने पर उसके partial results का merge, और उसका
-समय उसके programs के समयों का जोड़ है। जो candidate build या run होने में विफल हो उसे छोड़ दिया जाता
+समय उसके programs के समयों का जोड़ है। जो candidates timing शुरू होने तक compile नहीं हुए (split के variants,
+tile के twins) वे pool के एक को छोड़ बाकी सभी threads पर compile होते हैं जबकि तैयार candidates मापे जाते हैं,
+हर एक तब जब ranked क्रम उस तक पहुँचे। जो candidate build या run होने में विफल हो उसे छोड़ दिया जाता
 है। अगर कुछ भी नहीं मापा जाता, तो पहला candidate इस्तेमाल होता है और कुछ भी store नहीं होता।
 
 दो पहरेदार समय को ईमानदार रखते हैं:

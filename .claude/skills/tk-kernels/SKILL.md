@@ -47,10 +47,12 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
 2. **`lower::lower`** (`lower/mod.rs`): grid check → `materialize_operands` (non-register `mma` operands become loads;
    on `Core::Group` shared operands stay in place) → `sync::insert_barriers` (fences from shared-memory effects) →
    `schedule::expand` (`Schedule::Uniform { fill, unroll, async_products }` or `PingPong { crew }`) → `layouts::infer`
-   (F2 `TileLayout` per register tile, priced relayouts) → `orient_shared` → `emit::emit` (`lower/emit/{mod,address,
+   (F2 `TileLayout` per register tile, priced relayouts; a product whose result is dealt issues the narrow way,
+   `MmaAtom::narrow`) → `orient_shared` → `emit::emit` (`lower/emit/{mod,address,
    copy,compute,nvptx,amdgpu}.rs`; vendor intrinsics only in the last two). `Lowering { device, schedule, grid,
    swizzle, core }`; `Lowering::uniform(device, unroll, grid)` for plain kernels; `layouts::Swizzle::{None,B32,B64,B128}`.
-3. **Target** (`atoms.rs`): matrix cores (`mma: Vec<MmaAtom>`, `group_mma`), `fill: Fill::{CpAsync, Staged}`
+3. **Target** (`atoms.rs`): matrix cores (`mma: Vec<MmaAtom>`, `group_mma`; `geometry()` the 16-bit atom the
+   planner prices, `geometry_of(Int8)` the 8-bit one into i32: NVIDIA m16n8k32, CDNA 16×16×32, RDNA `iu8` 16×16×16), `fill: Fill::{CpAsync, Staged}`
    (`Fill::stages` clamps a staged ring to 1–2), `ldmatrix`, `tr_load`, `sync: SyncCaps { warp_barrier, commit_fence,
    priority }`, `occupancy`, `crews`, `sms`, `xcds`. Built by `Target::for_device(&spec)`, `for_arch(arch)`,
    `offline(arch, sms, xcds)` or `card(name)` from `atoms::CARDS` (rtx3060, h100-pcie, h100-sxm, rtx5070, rtx5090,
@@ -63,7 +65,8 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
 5. **Op layer** (`ops/`): `linear`, `attention`, `heads`, `layer_norm`/`rms_norm`/`add_*`, `conv2d` always return a
    Tensor. `ops/shape.rs` gates kernel vs graph (`Plan::Kernel(ranked)` / `Plan::Graph(Fallback::{Target, Dtype,
    Symbolic, Shape, Config})`); `ops/config.rs` ranks a lattice (`Problem::admit`, `Attention::admit` →
-   `Result<(ns, regs), Rejected>`); `ops::Tuner` admits the shortlist (compiles, drops spills) and times it once per
+   `Result<(ns, regs), Rejected>`); `ops::Tuner` admits the shortlist (compiles: the clean tiles, then the spilling
+   ones; a program past `Target::most_instructions` is refused by the lowering) and times it once per
    device × shape (`tune.rs`).
 6. **Launch** (`launch.rs`): `graph_launch[_all]` wraps the body in a custom kernel, lowered bodies memoized.
 7. **Interpreter** (`interp.rs`): f64, rounded to each element type; a pipeline runs serially, `Sync` is a no-op.
@@ -76,8 +79,10 @@ Masks, `select_if`, `each_warp`, `smem_view_as`, `load_scalar`, `where_`, `mul_a
 gathers (`Kernel::gather`): `kernels/conv.rs`. Builder call table: `first-kernel.md`. Full wiring: [new-kernel.md](new-kernel.md).
 
 Rules the code enforces:
-- Split `XSpec` (shapes, options, `cfg`) / `XCfg::lowering(&self, &Device) -> Lowering` / `pub fn x<T: Elem>(&XSpec)
-  -> Program`, dispatched on bf16/f16 by `ops::typed!`. 16-bit operands only; f32 stays on the graph.
+- Split `XSpec` (shapes, options, `cfg`) / `XCfg::lowering(&self, &Device) -> Lowering` / `pub fn x<T: Half>(&XSpec)
+  -> Program`, dispatched on bf16/f16 by `ops::typed!` (`typed!(…, int8)` adds `I8`). `Kernel::mma` takes `T: MmaIn`
+  (bf16/f16 → f32, `I8` → i32 exact; `MmaIn::widened` to f32): `gemm` and `nearest` run over `I8`, the rest 16-bit
+  only; f32 stays on the graph except `k_nearest_reranked` (8-bit or f16 search, f32 pass by `nearest_rescore`).
 - Effects are not declared by hand: async stages inside a `pipeline` belong to the template, `Sync` copies and shared
   stores are fenced by `sync::insert_barriers`; `k.barrier()` is the only hand-placed sync. A block barrier under a
   branch on the warp is `lower::Error::DivergentBarrier`.
@@ -89,7 +94,7 @@ Rules the code enforces:
 Tests live in `tk/src/test/unit/<topic>.rs` (never in-place; `test_case` tables, `proptest` shapes). Shared helpers in
 `mod.rs`: `device_target()`, `device_planner()`, `cp_async_target()`, `group_target()`, `tuned_on_device`, `measure`,
 `first_eight`, `costs()` (GUESSED, `step_group` 0), `gfx1151_costs()`, `declared`, `planner`, `rounded`, `decode`,
-`assert_rel_close`. Targets: `atoms::sm86()`, `targets::hopper()`, `targets::amd(AmdArch::Gfx1201, 64)`.
+`assert_rel_close`, `Scratch` (a temp directory a test drops, for a tune store), `self_join` (a nearest problem). Targets: `atoms::sm86()`, `targets::hopper()`, `targets::amd(AmdArch::Gfx1201, 64)`.
 
 | Level | Example |
 |---|---|
@@ -109,8 +114,10 @@ Tests live in `tk/src/test/unit/<topic>.rs` (never in-place; `test_case` tables,
 `ranking problem admitted rejected`, the first 16 `ranked rank ns regs cfg`, on a store miss `compiled cfg verdict
 registers scratch`, then each stage's configs as Debug text (the store's lines hold indices only): `first cfg stored`,
 `admitted configs stored` (`stored=false`: nothing compiled, the untested shortlist), `choice timed=[(cfg, ns)…]`,
-`twins admitted compiled`, then `tuned op shape pick` / `attention tuned`; a replay adds `replayed lookup`. `RUST_LOG=svod_tk=debug` adds `tuner's first
-round`/`leaders`/`rounds`/`twins` and `probe pair timed`/`resolved`. Device tests install the subscriber (`traced()` inside `device_target()`); `tk_dump` installs its own.
+`twins admitted compiled`, then `tuned op shape pick` / `attention tuned`; a replay adds `replayed lookup`, a config
+that does not lower `does not lower` with the error. `RUST_LOG=svod_tk=debug` adds `tuner's first
+round`/`leaders`/`rounds`/`twins` and `probe pair timed`/`resolved`; `svod_tk::layouts=debug` adds `oriented` per
+lowered program (its free and dealt products, how many issue swapped, the cost). Device tests install the subscriber (`traced()` inside `device_target()`); `tk_dump` installs its own.
 
 **Dumps.** `TK_DUMP_LIST` (`lower/emit/mod.rs`) prints `[i] id=N "Op" dtype <- [src ids]`; the tuner lowers every
 candidate and `launch.rs` memoizes, so pin one config (`SVOD_TK_TUNE=0`, one test, or `tk_dump --cfg N|tuned`).
@@ -124,6 +131,7 @@ any target: `lower::render(prog, &lowering)` or `lower::standalone(prog, &loweri
 | `N warps over a grid of M: …` | `lower::Error::Grid` (`targets::a_grid_takes_every_warp_or_whole_grids_run_alone`) |
 | `<what> is not lowered yet` | `lower::Error::Unsupported`: cross-warp reductions, a cross-thread transpose, column-major chunk fills, odd warpgroup operands |
 | `… is a block barrier under a branch on the warp, which some warps skip` | `lower::Error::DivergentBarrier` (sync pass or a relayout through shared memory) |
+| `NAME emits N instructions, past the M a kernel may` | `lower::Error::TooLarge` (`Target::most_instructions`: 2^18 AMD, 2^19 CUDA): refused before any compiler sees it; the tuner rejects the config as failed |
 | `program assembly: …` / `rendering <name>: …` | `svod_ir::Error` from `UOp::linear_program` / the LLVM renderer; rerun with `SVOD_SPEC_DEBUG=1 TK_DUMP_LIST=1` |
 | `element I of NAME is accessed, which holds N` / `scalar A Div B is undefined` (also `Rem`) | `interp::Error::{OutOfBounds, Division}`; also `UnboundVar`, `ParamSize` |
 | `Rejected::{Lowers, Shallow, Divides, Smem, Layout, Registers}` | why `admit` left a lattice config out (`tk_dump` counts them, `plan.txt` lists each) |
@@ -206,10 +214,27 @@ The `#[ignore]` probes print and never assert; one at a time on an idle GPU:
 | `attention::key_warp_resources_probe` | registers/LDS/spill per key-warp config |
 | `device::first_execution_probe` (cp.async), `parts::mma_peak_probe` (CUDA) | build/lower/prepare cost; `mma.sync` ceiling |
 | `probe::probe_signals_are_strong` | every probe pair's signal (run alone) |
+| `nearest::knn_probe` | k-nearest lists: the tuned pick's Gpairs/s per `KNN_ROWS`/`KNN_DEPTHS`/`KNN_KS` (f16, NegDot and SquaredL2) and its share of k=1's (register lists to 64, queued into the outputs and score-matrix lists past 32; a score matrix splits over candidates as a least does and, `SelectCfg { filter }`, lists only the steps its trips' leasts bound, in shares merged by `nearest_merge`); `KNN_CANDIDATES` for a search instead of a self-join, `KNN_METRICS` one metric, `KNN_GRAPH`/`KNN_GRAPH_K` the graph fallback beside, `KNN_ALL` times every admitted config |
+| `nearest::rerank_probe` | `k_nearest_reranked`'s parts: the f16 search of `k`, the 8-bit and f16 searches of `k + MARGIN`, the exact pass, ms and Gpairs/s (`RR_ROWS`, `RR_CANDIDATES`, `RR_DEPTHS`, `RR_KS`, `RR_METRIC`, `RR_TUNE=0` pins) |
+| `nearest::recall_probe` | the reranked op's recall per search against the f64 top-k on `real_<d>.bin` embeddings (`RECALL_DIR`, `RECALL_QUERIES`, `RECALL_DEPTHS`) |
+| `nearest::list_time_probe` | list configs untuned, alternating runs (`LIST_CFGS` = `bq:bkv:stages:depth:width[:queue]`;…, `LIST_BK`, `LIST_SPLITS`, `LIST_KS`, `LIST_ROWS`, `LIST_CANDIDATES`, `LIST_DEPTH`, `LIST_RUNS`): the A/B of a list kernel change, split counts forced |
+| `nearest::list_ir_dump` | the LLVM IR of those configs into `LIST_IR` (`LIST_TARGET` sm_86/gfx1201/gfx1151, `LIST_INT8` over 8-bit rows, `LIST_STORE` a copied tune store whose probes orient the products as the card's own would), with each one's lines and lowering time, for `ptxas -v` register counts or `clang -S` |
+| `nearest::live::live_probe` | the op over rows bound to a variable against the op at the bound count (`LIVE_ROWS`, `LIVE_DEPTHS`, `LIVE_KS`): the concrete pick, the live op under that config and under its own pick, rows bound at twice the count run at it |
+| `nearest::tuning_probe` | cold tuning wall time, the pick, predicted vs measured per timed config (nearest at `TUNE_KS`, `TUNE_GEMMS`, `TUNE_ATTN`); run on a store of the probes' lines alone |
 
 Ad hoc timing in a test: `super::measure(candidates)` (compile + time, ns per candidate on scratch buffers). Models:
 `tk3_pr.md` Table B gives each row's command and line (e.g. `--example nemotron_diarize -- <wav> --dtype bf16 --profile`;
 tk kernels appear as `gemm`, `flash_attention`, `heads`, `layer_norm`/`rms_norm`, `conv`).
+
+**RDNA ceilings (measured 2026-10-23, HIP probes of chained `v_wmma` on registers).** gfx1201 (RX 9070 XT): 201 TOPS
+f16/bf16 and 408 int8 with nothing else in the loop; one raw `ds_load_b128` a product (no wait on it) leaves 129
+TOPS, one a two products 147, two a product 101, and the same bytes as `ds_load_b64` cost the same: an LDS byte
+into registers costs the matrix pipe ~1/64 cycle a SIMD. A 64×64 warp tile reads half a fragment a product
+(A+B frags over M·N products), which bounds an LDS-fed GEMM near 157 TF; tk's 4096³ bf16 runs 153 and hipBLASLt
+142 (`hipblasLtMatmulAlgoGetHeuristic`'s 32 algos, best; rocBLAS 95). Barriers, a `global_load_b128` a 4 products
+(−14 %) and VALU moves (~1 cycle each) cost less. gfx1151 (Strix Halo): 46–49 TOPS f16 = bf16 = int8 (the `iu8`
+WMMA runs at the 16-bit rate there, so 8-bit search gains only operand bytes), a `ds_load_b128` a product −12 %,
+two −16 %: its GEMM (31 TF tk, 26 hipBLASLt) is bound by memory, not the loop.
 
 ## Performance-regression protocol
 

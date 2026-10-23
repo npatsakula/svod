@@ -4,7 +4,7 @@ sidebar_label: 内核库
 
 # 内核库 {#kernel-library}
 
-`svod_tk::kernels` 中的每个内核都是一个函数 `fn k<T: Elem>(spec: &Spec) -> Program`，对 16 位元素类型（`BF16` 或 `F16`）泛型。每个 spec 都有一个 `batch: Batch`：`Batch::Static(n)` 启动 `n` 个批次，`Batch::Var { name, min, max }` 按名称绑定的运行时变量的实际值启动批次，缓冲区按 `max` 分配。每种配置类型都有一个 `lowering(&device)`（一个 `atoms::Device`：目标及其代价）。模型通过[算子层](./op-layer)使用这些内核，由算子层选择配置。
+`svod_tk::kernels` 中的每个内核都是一个函数 `fn k<T: Elem>(spec: &Spec) -> Program`，对 16 位元素类型（`BF16` 或 `F16`）泛型；`gemm` 和 `nearest` 也接受 8 位整数（`I8`，在 i32 中精确累加：`gemm` 存储 f32，`nearest` 用各行的 `x_scale` 和 `c_scale` 缩放每行的乘积）。每个 spec 都有一个 `batch: Batch`：`Batch::Static(n)` 启动 `n` 个批次，`Batch::Var { name, min, max }` 按名称绑定的运行时变量的实际值启动批次，缓冲区按 `max` 分配。每种配置类型都有一个 `lowering(&device)`（一个 `atoms::Device`：目标及其代价）。模型通过[算子层](./op-layer)使用这些内核，由算子层选择配置。
 
 | 内核 | Spec → 程序 | 内核名称 | 算子 |
 |---|---|---|---|

@@ -9,6 +9,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Instant;
 
 use object::read::{Object, ObjectSymbol};
 use object::{Architecture, BinaryFormat, Endianness, ObjectKind};
@@ -103,18 +104,49 @@ impl ClangToolchain {
     }
 }
 
+thread_local! {
+    /// When the compiler processes this thread runs are killed ([`with_compile_deadline`]).
+    static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// `f` with every compiler process this thread runs before `deadline` killed
+/// there, its compile failing: a tuner's candidate whose compile would take
+/// minutes is not worth them. Compiles fanned out to other threads keep none.
+pub fn with_compile_deadline<R>(deadline: Instant, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DEADLINE.set(self.0);
+        }
+    }
+    let _restore = Restore(DEADLINE.replace(Some(deadline)));
+    f()
+}
+
 /// Run `command` with `input` on its stdin and return its stdout; a failing
 /// status carries the stderr, and empty output is a failure too (`what`
-/// names the tool in both).
+/// names the tool in both). Under a [`with_compile_deadline`] the process
+/// is killed at the deadline.
 pub(crate) fn run_piped(mut command: Command, input: &[u8], what: &str) -> Result<Vec<u8>> {
+    // Its own process group, so a kill at the deadline reaches the tools
+    // the driver runs (the linker), which would hold the pipes open.
+    #[cfg(unix)]
+    if DEADLINE.get().is_some() {
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    }
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .jit("spawn the compiler")?;
-    child.stdin.take().expect("stdin piped").write_all(input).jit("write the compiler's stdin")?;
-    let output = child.wait_with_output().jit("wait for the compiler")?;
+    let output = match DEADLINE.get() {
+        Some(deadline) => wait_until(child, input, deadline, what)?,
+        None => {
+            child.stdin.take().expect("stdin piped").write_all(input).jit("write the compiler's stdin")?;
+            child.wait_with_output().jit("wait for the compiler")?
+        }
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(Error::JitCompilation { reason: format!("{what} failed:\n{stderr}") });
@@ -123,6 +155,54 @@ pub(crate) fn run_piped(mut command: Command, input: &[u8], what: &str) -> Resul
         return Err(Error::JitCompilation { reason: format!("{what} produced empty output") });
     }
     Ok(output.stdout)
+}
+
+/// `child`'s output once it exits, `input` written and its pipes drained
+/// meanwhile; killed and an error at `deadline`.
+fn wait_until(
+    mut child: std::process::Child,
+    input: &[u8],
+    deadline: Instant,
+    what: &str,
+) -> Result<std::process::Output> {
+    let (mut stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    std::thread::scope(|s| {
+        let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            s.spawn(move || {
+                let mut bytes = vec![];
+                let _ = pipe.expect("piped").read_to_end(&mut bytes);
+                bytes
+            })
+        };
+        let (stdout, stderr) = (drain(stdout.map(|p| Box::new(p) as _)), drain(stderr.map(|p| Box::new(p) as _)));
+        // Dropped once written: the compiler sees the end of its input.
+        let written = s.spawn(move || stdin.take().expect("stdin piped").write_all(input));
+        let mut poll = std::time::Duration::from_millis(1);
+        let status = loop {
+            if let Some(status) = child.try_wait().jit("wait for the compiler")? {
+                break status;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                // SAFETY: a signal to the group `run_piped` gave the child, which is not reaped yet.
+                #[cfg(unix)]
+                unsafe {
+                    libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::JitCompilation { reason: format!("{what} killed at its deadline") });
+            }
+            std::thread::sleep(poll.min(deadline - now));
+            poll = (poll * 2).min(std::time::Duration::from_millis(20));
+        };
+        let joined = |h: std::thread::ScopedJoinHandle<'_, Vec<u8>>| h.join().unwrap_or_default();
+        let output = std::process::Output { status, stdout: joined(stdout), stderr: joined(stderr) };
+        if status.success() {
+            written.join().expect("the stdin writer").jit("write the compiler's stdin")?;
+        }
+        Ok(output)
+    })
 }
 
 /// Does `executable` list `target` under `--print-targets`?

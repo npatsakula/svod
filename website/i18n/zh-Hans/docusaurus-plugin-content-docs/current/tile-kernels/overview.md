@@ -53,7 +53,7 @@ model code ──► svod_tk::ops          always a Tensor; picks a kernel and c
 在 RTX 3060 上，对 8192×1024 bf16 做 RMSNorm 的带宽为 325 GB/s（该卡上限为 360）；Nemotron-3-Diarization（bf16，四步）用 1064 次调度耗费 45.82 ms GPU 时间，而在 tk3 之前需要 2292 次调度。
 
 :::note[本版本未包含]
-Hopper TMA 与 mbarrier 生产者（sm_90 运行由 `cp.async` 供数的 `wgmma`）、Blackwell `tcgen05`、32×32 MFMA、Apple 内核、fp8/int8、注意力反向传播，以及卷积的图像暂存形式。参见[可移植性](./portability#not-in-this-release)。
+Hopper TMA 与 mbarrier 生产者（sm_90 运行由 `cp.async` 供数的 `wgmma`）、Blackwell `tcgen05`、32×32 MFMA、Apple 内核、fp8、最近邻搜索之外的 int8、注意力反向传播，以及卷积的图像暂存形式。参见[可移植性](./portability#not-in-this-release)。
 :::
 
 ## 阅读顺序 {#reading-order}

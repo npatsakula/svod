@@ -6,8 +6,8 @@ sidebar_label: Layouts और Lowering
 
 `lower::lower(program, &lowering, params, device)` एक tile program को ऐसे Svod program में बदलता है
 जिसकी instruction list पहले से क्रम में है। एक `Lowering` में वह सब होता है जो लेखक ने तय नहीं
-किया: `Device` (target और उसकी costs), `Schedule`, block tile पर `WarpGrid`, यह कि shared rows
-swizzle होंगी या नहीं (`swizzle`), और products किस matrix instruction पर issue होंगे (`core`)। हर
+किया: `Device` (target और उसकी costs), `Schedule`, block tile पर `WarpGrid`, और products किस
+matrix instruction पर issue होंगे (`core`); shared rows हमेशा XOR-swizzle होती हैं। हर
 कर्नेल config अपना `Lowering` बनाता है (`GemmCfg::lowering`, `FaCfg::lowering`,
 `NormCfg::lowering`)। `lower::standalone(program, &lowering)` बिना जुड़े device के किसी target के
 लिए lower करता है, और `lower::render` वह LLVM text लौटाता है जो backend के compiler को सौंपा जाता।
@@ -64,6 +64,12 @@ layouts उस atom से पढ़ता है जो values को consume �
 | AMD RDNA3 / RDNA4 | WMMA 16×16×16 | `wmma_gfx11_input`, `wmma_gfx11_acc` / `wmma_gfx12` |
 | Apple | simdgroup 8×8×8 (सिर्फ़ atom; कोई kernels नहीं) | `simdgroup_8x8` |
 
+Kernels वाले हर target में i32 में जाने वाला एक 8-bit integer atom भी है (`Target::geometry_of(Int8)`):
+`mma.sync` m16n8k32 s8 और CDNA का MFMA 16×16×32 i8 16-bit fragments के bytes रखते हैं, दोगुनी
+गहराई के साथ (`mma_sync_a8`, `mma_sync_b8`, `mfma_16x16x32_i8`); RDNA का `iu8` WMMA 16-bit layouts
+को depth 16 पर रखता है। इसके `m` और `n` 16-bit atom वाले ही हैं। Planner 16-bit geometry
+(`Target::geometry`) की cost लगाता है, सिवाय 8-bit rows पर किसी problem के।
+
 `atoms::GroupMmaAtom` एक warpgroup instruction है: चार लगातार warps मिलकर 64 × n का product जारी
 करते हैं, operands shared memory से descriptors के ज़रिए पढ़े जाते हैं (`B` हमेशा, `A` तब तक जब तक वह
 register tile न हो), और accumulator पूरे group पर फैला रहता है, हर warp अपनी 16 rows `mma.sync` के C
@@ -78,7 +84,10 @@ ring की swizzled rows पर एक `wgmma` chain के रूप में
    layouts देता है (`MmaAtom::issue`), और उसे उसी रुख़ (`ir::Orient`) से issue करता है जो lowering की
    `Costs` के तहत program पर सबसे कम relayout cost छोड़े: `Cᵀ = Bᵀ·Aᵀ` वही instruction है जिसके slots
    आपस में बदल दिए गए हों, इसलिए square atom पर accumulator बिना किसी cost के अगले product का operand
-   बनकर रखा जा सकता है। लेखक orientation pin कर सकता है (`Kernel::mma_oriented`)।
+   बनकर रखा जा सकता है। जिस product का नतीजा deal होता है (`TileOp::Deal`, किसी list की lane queues)
+   वह उसी रुख़ से issue होता है जो एक row को सबसे कम lanes पर फैलाए (`MmaAtom::narrow`): वहीं deal
+   registers का नाम बदलना भर है, जैसा op layer उसकी क़ीमत लगाती है। लेखक orientation pin कर सकता है
+   (`Kernel::mma_oriented`)।
 2. **Elementwise ops एक करते हैं।** `binary`, `cast`, `where_`, `mul_add` के operands और नतीजा, और
    किसी loop की carried values, एक ही layout साझा करते हैं।
 3. **बिना बंधन वाले tiles natural layout लेते हैं।** Fixed point पर, जिस tile पर कोई बंधन नहीं, उसे
@@ -105,7 +114,7 @@ ring की swizzled rows पर एक `wgmma` chain के रूप में
 | `Fill::CpAsync`, `stages ≥ 2` | `extent + stages − 1` iterations का एक loop। हर iteration तब तक रुकता है जब तक अधिकतम `stages − 2` copy groups बाक़ी न रहें, फिर barrier करके step `i − (stages − 1)` consume करता है। फिर step `i` की `cp.async` copies को एक iteration पहले ख़ाली हुए slot में भेजता है और उन्हें एक group के रूप में commit करता है (अंत के बाद एक ख़ाली group गिनती को एकसमान रखता है)। |
 | `Fill::CpAsync`, `stages ≥ 3`, `async_products` | वही, पर consume की `wgmma` chains अगले fill के दौरान चलती रहती हैं: दो trips पहले consume हुआ slot फिर से भरा जाता है, और हर consume के बाद हर thread अपनी सबसे नई chain को छोड़कर बाक़ी सबका wait करता है (`Sync::WaitProducts`)। |
 | `Fill::CpAsync`, `stages = 1` | Copy, wait, consume, और slot फिर से भरने से पहले एक barrier। |
-| `Fill::Staged`, 2 stages | एक ही induction variable पर तीन loops: पहला trip step 0 को registers में load करके उसके slot में store करता है; steady trip step `i` को registers में load करता है, step `i − 1` consume करता है, fence करता है, और registers को step `i` के slot में store करता है, उसकी body में कोई branch नहीं; आख़िरी trip सिर्फ़ consume करता है। |
+| `Fill::Staged`, 2 stages | एक ही induction variable पर तीन loops: पहला trip step 0 को registers में load करके उसके slot में store करता है; steady trip step `i` को registers में load करता है, fence करता है, step `i − 1` consume करता है, fence करता है, और registers को step `i` के slot में store करता है, उसकी body में कोई branch नहीं (RDNA पर fences loads को products से पहले और commit को उनके बाद रखते हैं); आख़िरी trip सिर्फ़ consume करता है। |
 | `Fill::Staged`, 1 stage | एक ही slot पर वही तीन loops: store एक barrier के पीछे तब तक रुकता है जब तक हर warp slot से निपट न जाए, फिर दोबारा barrier, ताकि उसी shared memory में दोगुना गहरा tile समा जाए। |
 | `PingPong` | एक trip अपने products पर कटकर load clusters और product clusters में बँटता है, हर एक के बाद block barrier, ताकि एक crew के products बढ़ी issue priority पर registers से चलें जबकि दूसरी crew load कर रही हो। |
 
@@ -122,7 +131,7 @@ Emitter हर statement के instructions को program order में ए�
 आगे के global accesses gated होते हैं: loads शून्य पढ़ते हैं और stores छोड़ दिए जाते हैं। जहाँ row
 में chunks की गिनती दो की घात हो, वहाँ shared rows 16-byte chunks में XOR-swizzle होती हैं
 (`layouts::Swizzle`)। 16-bit tiles के shared से register loads, जहाँ layout अनुमति दे, `ldmatrix.x4`
-इस्तेमाल करते हैं; RDNA4 पर global से register loads `global_load_tr_b128` इस्तेमाल करते हैं जहाँ
+इस्तेमाल करते हैं, और 8-bit tiles के loads 16×32 bytes पर उसका untransposed रूप; RDNA4 पर global से register loads `global_load_tr_b128` इस्तेमाल करते हैं जहाँ
 layout वही हो जो वह छोड़ता है। एक `Warps` statement अपनी body को हर warp पर अकेले, अपनी copies और
 barriers के साथ चलाता है। AMD पर f32 `exp2` hardware का `v_exp_f32` है, जो 2⁻¹²⁶ से नीचे के results को
 शून्य कर देता है। CUDA पर 48 KB से ऊपर की shared memory एक dynamic array है; candidates
@@ -131,7 +140,8 @@ barriers के साथ चलाता है। AMD पर f32 `exp2` hardwa
 :::note[Emitter के invariants, लेखक के नहीं]
 Pure values उस loop level पर सूचीबद्ध होती हैं जिसकी उनके inputs को ज़रूरत है। Register accesses
 scalar होते हैं। Shared और global accesses `SHRINK` vector accesses होते हैं। Gated stores एक `If`
-के अंदर रहते हैं। Carried values उन्हें परिभाषित करने वाले block के अंत में अपने `phi` में जाती हैं।
+के अंदर रहते हैं। Carried values उन्हें परिभाषित करने वाले block के अंत में अपने `phi` में जाती हैं। जिस loop
+का extent शून्य से नीचे जा सकता है वह कोई trip नहीं चलाता (range का end शून्य पर floor होता है)।
 :::
 
 `TK_DUMP_LIST=1` emit की गई list छापता है (देखें [टेस्टिंग और डिबगिंग](./testing-and-debugging))।

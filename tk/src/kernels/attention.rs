@@ -98,7 +98,35 @@ pub struct Forms {
 /// differs ([`FaCfg::fits`](FaCfg::fits)).
 pub const WARP_ROWS: usize = 16;
 
+/// Why [`attention`] refuses a config, whatever the target: what its
+/// ranking leaves out as one that does not lower
+/// ([`crate::ops::config::Rejected::Lowers`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, snafu::Snafu)]
+pub enum Invalid {
+    #[snafu(display("{key_warps} key warps share a block of one row warp, not {bq} rows"))]
+    KeyWarps { key_warps: usize, bq: usize },
+    #[snafu(display("{stages} stages of {bkv} keys hold no key warp's output"))]
+    KeyWarpOutput { stages: usize, bkv: usize },
+}
+
 impl FaCfg {
+    /// Whether [`attention`] runs the config's key warps: several share a
+    /// block of one row warp, and a warp's merged output takes `16·d` f32
+    /// of its 16-bit K ring.
+    pub fn shares_keys(&self) -> Result<(), Invalid> {
+        let Self { bq, bkv, stages, key_warps, .. } = *self;
+        if key_warps == 1 {
+            return Ok(());
+        }
+        if bq != WARP_ROWS {
+            return Err(Invalid::KeyWarps { key_warps, bq });
+        }
+        if stages * bkv < 2 * WARP_ROWS {
+            return Err(Invalid::KeyWarpOutput { stages, bkv });
+        }
+        Ok(())
+    }
+
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
         Self {
             bq,
@@ -156,12 +184,18 @@ impl FaCfg {
         self.key_warps * self.stages * slot * 2
     }
 
-    /// The shared scratch the f32 score tile crosses to become the P·V
+    /// The shared scratch the probabilities may cross to become the P·V
     /// operand where the core's accumulator cannot feed a product as it
-    /// stands (RDNA3); nothing where it can.
+    /// stands (RDNA3): the 16-bit tile, one per key warp. A bound: the
+    /// lowering declares it only where the inference re-holds the tile
+    /// through shared memory rather than a lane exchange, which the whole
+    /// program and the device's costs decide (under the Strix Halo's costs
+    /// a 32×128 block of head size 64 crosses it under a key mask and
+    /// exchanges without one), so no count from the config alone is the
+    /// kernel's. Nothing where the accumulator feeds.
     pub fn scratch_bytes(&self, target: &Target) -> usize {
         match target.geometry() {
-            Some(atom) if !atom.accumulator_feeds(target.wave) => self.bq * self.bkv * 4,
+            Some(atom) if !atom.accumulator_feeds(target.wave) => self.key_warps * self.bq * self.bkv * 2,
             _ => 0,
         }
     }
@@ -330,7 +364,7 @@ impl<T> Step<'_, T> {
 /// what keeps that sum finite for any value magnitude.
 const RESCALE_ABOVE: f64 = 8.0;
 
-fn step<T: Elem, PK: TierMark, PV: TierMark>(
+fn step<T: Half, PK: TierMark, PV: TierMark>(
     k: &mut Kernel,
     st: &Step<'_, T>,
     k_t: Tile<PK, T>,
@@ -407,7 +441,7 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
 /// skipped through the first block and the trip count, the rest shared
 /// evenly by the splits; only blocks a mask edge crosses pay for the mask,
 /// except under a key mask or a bias, which every block reads.
-pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
+pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, scale, cfg } = *spec;
     let AttnMask { causal, window, chunk, key_lens, key_mask, seg_start, bias } = mask;
     let FaCfg { bq, bkv, stages, splits, .. } = cfg;
@@ -447,9 +481,9 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let (gz, bb) = batch.axis(&mut k);
     k.grid([Sc::from(t.div_ceil(bq) * splits), Sc::from(heads), gz]);
     let kw = cfg.key_warps;
-    assert!(kw == 1 || bq == WARP_ROWS, "{kw} key warps share a block of one row warp, not {bq} rows");
-    // A warp's merged output takes 16·d f32 of its 16-bit K ring.
-    assert!(kw == 1 || stages * bkv >= 2 * WARP_ROWS, "{stages} stages of {bkv} keys hold no key warp's output");
+    if let Err(e) = cfg.shares_keys() {
+        panic!("{e}");
+    }
     k.warps(cfg.warps());
     let k_s = k.smem::<T>("k_s", kw * stages * bkv * d);
     let v_s = k.smem::<T>("v_s", kw * stages * bkv * d);

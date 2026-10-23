@@ -406,6 +406,16 @@ fn a_consume_body_fences_its_own_tiles() {
     scale: 0.125,
     cfg: FaCfg { splits: 2, ..FaCfg::new(16, 64, 3) },
 }); "attention with every mask, a cache and splits")]
+#[test_case(crate::kernels::nearest::nearest::<BF16>(&crate::kernels::nearest::NearestSpec {
+    n: 100, m: 150, d: 32, metric: crate::kernels::nearest::Metric::L2,
+    floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true, k: 1,
+    cfg: crate::kernels::nearest::NearestCfg::new(32, 32, 3), live: Default::default(),
+}); "nearest with floors and groups")]
+#[test_case(crate::kernels::nearest::nearest::<BF16>(&crate::kernels::nearest::NearestSpec {
+    n: 100, m: 150, d: 32, metric: crate::kernels::nearest::Metric::L2,
+    floors: crate::kernels::nearest::Floors { row: true, col: true }, groups: true, k: 8,
+    cfg: crate::kernels::nearest::NearestCfg::new(32, 32, 3), live: Default::default(),
+}); "nearest lists with floors and groups")]
 fn shipped_kernels_need_no_barriers(prog: Program) {
     let mut fenced = prog.clone();
     insert_barriers(&mut fenced).unwrap();
@@ -448,4 +458,68 @@ fn a_block_barrier_under_a_branch_on_the_warp_is_refused(
     }
     let Stmt::If { then, .. } = stmt else { panic!("a branch") };
     Ok(kinds(&prog, then))
+}
+
+/// A branch on a vote is a branch on the warp: a shared tile stored and read
+/// back under it would need a block barrier some warps skip, so the lowering
+/// refuses it; reductions within the warp need none.
+#[test_case(true => Err("a shared tile's fence is a block barrier under a branch on the warp, which some warps skip".into()); "through shared memory")]
+#[test_case(false => Ok(()); "in registers")]
+fn a_block_barrier_under_a_vote_is_refused(shared: bool) -> Result<(), String> {
+    let mut k = Kernel::new("voted");
+    let s = k.smem::<F32>("s", 256);
+    let x = k.zeros::<F32>(Shape::new(16, 16));
+    let low = k.reduce(x, Axis::Row, ReduceOp::Min);
+    let zero = k.zeros::<F32>(Shape::new(16, 1));
+    let pred = k.compare(low, zero, CmpOp::Lt);
+    k.where_any(
+        pred,
+        |k| {
+            if shared {
+                let tile = k.smem_view::<F32>(s, 0, Shape::new(16, 16));
+                k.store(tile, x);
+                let y = k.load(tile);
+                return [k.reduce(y, Axis::Row, ReduceOp::Max)];
+            }
+            [k.reduce(x, Axis::Row, ReduceOp::Max)]
+        },
+        [low],
+    );
+    let mut prog = k.finish();
+    insert_barriers(&mut prog).map_err(|e| e.to_string())
+}
+
+/// A streamed nearest runs the depth pipeline once per candidate tile: the
+/// pass fences the ring where the next tile's first fill meets the last
+/// tile's reads of it, one barrier at the head of the pipeline in the loop,
+/// and adds nothing else.
+#[test]
+fn a_ring_restarted_in_a_loop_is_fenced_at_its_head() {
+    use crate::kernels::nearest::{Floors, Metric, NearestCfg, NearestSpec, nearest};
+    let cfg = NearestCfg::streamed(32, 32, 32, 3);
+    let spec = NearestSpec {
+        n: 100,
+        m: 150,
+        d: 80,
+        metric: Metric::L2,
+        floors: Floors::default(),
+        groups: true,
+        k: 1,
+        cfg,
+        live: Default::default(),
+    };
+    let prog = nearest::<BF16>(&spec);
+    let mut fenced = prog.clone();
+    insert_barriers(&mut fenced).unwrap();
+    let body = |prog: &Program| {
+        let Some(Stmt::Loop(l)) = prog.body.0.iter().find(|s| matches!(s, Stmt::Loop(_))) else { panic!("a loop") };
+        l.body.clone()
+    };
+    let (before, after) = (body(&prog), body(&fenced));
+    let at = before.0.iter().position(|s| matches!(s, Stmt::Pipeline(_))).expect("a pipeline");
+    assert_eq!(kinds(&fenced, &after)[at..at + 2], ["barrier", "pipeline"]);
+    let mut unfenced = after.0.clone();
+    unfenced.remove(at);
+    assert!(unfenced == before.0);
+    assert!(top(&fenced) == top(&prog));
 }

@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use svod_dtype::default_device::{default_device, with_default_device};
 use svod_dtype::{DType, DeviceSpec, ScalarDType};
+use svod_ir::UOp;
 use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
 use svod_runtime::{ExecutionPlan, KernelResources};
 use svod_tensor::{PrepareConfig, Tensor};
@@ -44,19 +45,63 @@ pub(crate) const FORMAT: u32 = 5;
 /// candidate, the rest over the contenders), and the rounds the two leaders
 /// then run again ([`rounds`]).
 const ROUNDS: usize = 4;
+/// How far a timing goes ([`rounds`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pass {
+    /// Every round, then the leaders' rounds: the order is the choice.
+    Whole,
+    /// The first round and one more of its contenders: the order only
+    /// chooses what a later pass times again with the rest of its kind (a
+    /// tuning's leading tiles, whose pipelines the twins stage times with
+    /// them), and the rounds that would settle its leaders run there.
+    Screen,
+}
 /// Search bound: candidates from which the first round cuts the field to
 /// its [`CONTENDER`]s; fewer run every round, a cut saving little and a
 /// short list being what a decode step's splits or a coordinate descent
-/// ask, where the candidates sit within a few percent of each other.
-const CUT_FROM: usize = 16;
+/// ask, where the candidates sit within a few percent of each other. A
+/// list of 8 to 15 is a shortlist all the same (gfx1151 admits 15 tiles of
+/// a split nearest at depth 768, a third of them past 1.4 times the best).
+const CUT_FROM: usize = 8;
 /// Search bound: rounds past the first go to the candidates within this
 /// factor of the first round's best; the rest cannot win (a round's best of [`RUNS`] runs
 /// after a sustain sits within a few percent of the candidate's settled
 /// time), and a shortlist is mostly losers. The twins stage keeps the tiles
 /// within it of the leader for the same reason.
 pub(crate) const CONTENDER: f64 = 1.2;
-/// Measurement: profiled runs per candidate per round.
+/// Search bound: rounds past the second go to the contenders within this
+/// factor of the best so far. Two rounds in, a candidate's best sits within
+/// a few percent of its settled time, and a flat field (a split nearest's
+/// tiles, the GEMM's twins) keeps most of its contenders through every
+/// round of a 1.2 band: replaying the rounds recorded on sm_86, gfx1201 and
+/// gfx1151 (nearest at depths 512–1024, the 4096³ GEMM, an attention; 27
+/// timed lists) under a cut at 1.02–1.08 moved no pick, and one at 1.05
+/// times a fourth fewer candidates.
+const SETTLED: f64 = 1.05;
+/// Search bound: a candidate whose first run takes this factor of the best
+/// time so far is timed no further, and no later round of a short list
+/// runs it: it cannot win. The first timed run follows an untimed one, and
+/// over 908 candidates on sm_86 (nearest, the 4096³ GEMM) it sat within
+/// 0.93–1.15 of the candidate's settled time: one aborted settles past 1.7
+/// times the best.
+pub(crate) const HOPELESS: f64 = 2.0;
+/// Measurement: profiled runs per candidate per round, the most a tuner's
+/// round gives one ([`runs`]) and what the leaders' rounds and the probes give.
 const RUNS: usize = 5;
+/// Measurement: the device time a tuner's round gives a candidate's profiled
+/// runs, at least [`MIN_RUNS`] of them ([`runs`]): a 10 ms kernel's best of
+/// two sits where its best of five does, within a round's drift.
+const RUN_BUDGET: Duration = Duration::from_millis(20);
+/// Measurement: the fewest profiled runs a tuner's round gives a candidate.
+const MIN_RUNS: usize = 2;
+
+/// The profiled runs a tuner's round gives a candidate whose last run took
+/// `t`: those [`RUN_BUDGET`] holds, [`MIN_RUNS`] to [`RUNS`]. A candidate
+/// of [`SUSTAIN`] or more is not sustained: its runs keep the clock up, and
+/// its first timed run counts among them.
+pub(crate) fn runs(t: Duration) -> usize {
+    (RUN_BUDGET.as_nanos().div_ceil(t.as_nanos().max(1)) as usize).clamp(MIN_RUNS, RUNS)
+}
 /// Measurement: device time of back-to-back runs ahead of each candidate's
 /// profiled runs, keeping the lifted clock up where their host overhead would let a short
 /// kernel's clock sag.
@@ -86,7 +131,7 @@ pub struct TuneKey {
 }
 
 impl TuneKey {
-    pub fn new(
+    pub(crate) fn new(
         op: &'static str,
         target: &Target,
         compiler: u64,
@@ -99,13 +144,13 @@ impl TuneKey {
 
     /// The store line of a `kind` of entry for the candidate programs
     /// fingerprinted as `programs`.
-    pub fn line(&self, kind: Kind, programs: u64) -> String {
+    pub(crate) fn line(&self, kind: Kind, programs: u64) -> String {
         format!("{}|{:016x}|{programs:016x}", self.candidates(kind), self.compiler)
     }
 
     /// A line's key up to the candidates' digest: what a [`TuneStore::replay`]
     /// matches, whatever compiler and programs keyed the line.
-    pub fn candidates(&self, kind: Kind) -> String {
+    pub(crate) fn candidates(&self, kind: Kind) -> String {
         format!("{}|{:016x}", self.shape(kind), self.candidates)
     }
 
@@ -123,7 +168,7 @@ pub(crate) fn device(target: &Target) -> String {
 
 /// A digest of `spec`'s compiler identity (backend, toolchain, flags) for
 /// [`TuneKey::compiler`], once per device; 0 where no device opens.
-pub fn compiler(spec: &DeviceSpec) -> u64 {
+pub(crate) fn compiler(spec: &DeviceSpec) -> u64 {
     static DIGESTS: LazyLock<Once<DeviceSpec, u64>> = LazyLock::new(Mutex::default);
     once(&DIGESTS, spec, || {
         let device = svod_runtime::DEVICE_FACTORIES.device(spec, svod_device::registry::registry());
@@ -142,7 +187,7 @@ pub type Candidate = Vec<(Program, Lowering)>;
 /// processes of the same build, by the global store
 /// ([`TuneStore::fingerprint`]): lowering a shortlist takes 0.05–1.6 s,
 /// and a warm process lowers nothing.
-pub fn fingerprint(candidates: &[Candidate]) -> u64 {
+pub(crate) fn fingerprint(candidates: &[Candidate]) -> u64 {
     TuneStore::global().fingerprint(candidates)
 }
 
@@ -152,11 +197,41 @@ pub fn fingerprint(candidates: &[Candidate]) -> u64 {
 /// outside any origin scope, which would key the call site; `None` where it
 /// does not lower or render, and the caller keys it by its inputs: a
 /// program that fails to lower fails the same way until they change.
-fn emitted(prog: &Program, lowering: &Lowering) -> Option<u64> {
+fn emitted(prog: &Program, lowering: &Lowering) -> Option<(u64, Arc<UOp>)> {
     let _capture = svod_ir::origin::capture_for_thread(false);
     let _scope = svod_ir::origin::install(None);
-    let lowered = crate::lower::standalone(prog.clone(), lowering).ok()?;
-    Some(digest(&(digest(&lowered.program), lowered.text(&lowering.device.target).ok()?)))
+    let lowered = crate::lower::standalone(prog.clone(), lowering)
+        .inspect_err(|e| tracing::debug!(target: crate::ops::PLAN, name = prog.name, error = %e, "does not lower"))
+        .ok()?;
+    let emitted = digest(&(digest(&lowered.program), lowered.text(&lowering.device.target).ok()?));
+    Some((emitted, lowered.program))
+}
+
+/// What a program is made of, which keys what it emits: the program and
+/// its lowering whole.
+pub(crate) fn made_of(prog: &Program, lowering: &Lowering) -> u64 {
+    digest(&format!("{prog:?}{lowering:?}"))
+}
+
+/// Programs lowered for a fingerprint, by what they are made of, kept for
+/// the compile that follows: a tuning lowers each program once. One that
+/// did not lower is kept as `None`, which stays: it fails the same way
+/// until its inputs change, so its compile is refused without lowering it
+/// again.
+#[derive(Default)]
+pub(crate) struct Lowerings(pub(crate) Mutex<HashMap<u64, Option<Arc<UOp>>>>);
+
+impl Lowerings {
+    /// What the fingerprint left for `made_of`: the program, handed over
+    /// once; `Some(None)` where it did not lower; `None` where nothing was.
+    fn take(&self, made_of: u64) -> Option<Option<Arc<UOp>>> {
+        let mut kept = self.0.lock().expect("lowerings");
+        match kept.get(&made_of) {
+            Some(None) => Some(None),
+            Some(Some(_)) => kept.remove(&made_of),
+            None => None,
+        }
+    }
 }
 
 /// Values per key, each made once: a caller asking for a key in flight
@@ -313,7 +388,7 @@ impl TuneStore {
     }
 
     /// Whether this is a [`Self::replay`].
-    pub fn replays(&self) -> bool {
+    pub(crate) fn replays(&self) -> bool {
         self.replayed.is_some()
     }
 
@@ -359,16 +434,62 @@ impl TuneStore {
     /// same. Opening the file marks it used and removes the builds' files
     /// unused for [`EMITTED_KEPT`]; each line is appended by one write, so
     /// processes of one build share the file.
-    pub fn fingerprint(&self, candidates: &[Candidate]) -> u64 {
+    pub(crate) fn fingerprint(&self, candidates: &[Candidate]) -> u64 {
+        self.fingerprint_keeping(candidates, None)
+    }
+
+    /// [`Self::fingerprint`], the programs it lowers kept in `keep` for
+    /// their compile.
+    pub(crate) fn fingerprint_keeping(&self, candidates: &[Candidate], keep: Option<&Lowerings>) -> u64 {
         use rayon::prelude::*;
         let made_of: Vec<Vec<u64>> =
-            candidates.iter().map(|c| c.iter().map(|(p, l)| digest(&format!("{p:?}{l:?}"))).collect()).collect();
-        let dir = self.root.as_ref().filter(|_| !self.replays()).map(|root| root.join("emitted"));
-        let file = dir.as_ref().zip(self.build).map(|(dir, build)| dir.join(format!("{build:016x}.txt")));
-        let memo = self.emitted.get_or_init(|| {
-            if let Some(dir) = &dir {
-                prune(dir);
+            candidates.iter().map(|c| c.iter().map(|(p, l)| made_of(p, l)).collect()).collect();
+        let memo = self.emitted_memo();
+        let missing: Vec<(u64, &(Program, Lowering))> = {
+            let known = memo.lock().expect("emitted memo");
+            let mut seen = std::collections::HashSet::new();
+            let programs = made_of.iter().flatten().zip(candidates.iter().flatten());
+            programs.filter(|(m, _)| !known.contains_key(*m) && seen.insert(**m)).map(|(&m, p)| (m, p)).collect()
+        };
+        let found: Vec<(u64, u64)> = missing
+            .into_par_iter()
+            .map(|(m, (prog, lowering))| {
+                let lowered = emitted(prog, lowering);
+                if let Some(keep) = keep {
+                    keep.0.lock().expect("lowerings").insert(m, lowered.as_ref().map(|(_, program)| program.clone()));
+                }
+                lowered.map_or((m, m), |(emitted, _)| (m, emitted))
+            })
+            .collect();
+        self.record_emitted(&found);
+        let known = memo.lock().expect("emitted memo");
+        digest(&made_of.iter().map(|c| c.iter().map(|m| known[m]).collect::<Vec<_>>()).collect::<Vec<_>>())
+    }
+
+    /// `prog` lowered under `lowering` ([`crate::lower::standalone`]),
+    /// without origins, from `keep` where a fingerprint left it (or found
+    /// it does not lower), else lowered here and what it emits remembered
+    /// as a fingerprint would; `None` where it does not lower.
+    pub(crate) fn lowered(&self, prog: &Program, lowering: &Lowering, keep: &Lowerings) -> Option<Arc<UOp>> {
+        let m = made_of(prog, lowering);
+        if let Some(kept) = keep.take(m) {
+            return kept;
+        }
+        let (emitted, program) = emitted(prog, lowering)?;
+        if !self.emitted_memo().lock().expect("emitted memo").contains_key(&m) {
+            self.record_emitted(&[(m, emitted)]);
+        }
+        Some(program)
+    }
+
+    /// What programs emit by what they are made of: this process's and its
+    /// build's file's.
+    fn emitted_memo(&self) -> &Mutex<HashMap<u64, u64>> {
+        self.emitted.get_or_init(|| {
+            if let Some(dir) = self.emitted_dir() {
+                prune(&dir);
             }
+            let file = self.emitted_file();
             let open = |f: &PathBuf| std::fs::OpenOptions::new().create(true).append(true).open(f);
             if let Some(Ok(f)) = file.as_ref().map(open) {
                 let _ = f.set_modified(std::time::SystemTime::now());
@@ -378,26 +499,28 @@ impl TuneStore {
             Mutex::new(
                 text.lines().filter_map(|l| l.split_once(' ').and_then(|(a, b)| Some((hex(a)?, hex(b)?)))).collect(),
             )
-        });
-        let missing: Vec<(u64, &(Program, Lowering))> = {
-            let known = memo.lock().expect("emitted memo");
-            let mut seen = std::collections::HashSet::new();
-            let programs = made_of.iter().flatten().zip(candidates.iter().flatten());
-            programs.filter(|(m, _)| !known.contains_key(*m) && seen.insert(**m)).map(|(&m, p)| (m, p)).collect()
-        };
-        let found: Vec<(u64, u64)> =
-            missing.into_par_iter().map(|(m, (prog, lowering))| (m, emitted(prog, lowering).unwrap_or(m))).collect();
-        if let (Some(file), false) = (file, found.is_empty()) {
+        })
+    }
+
+    fn emitted_dir(&self) -> Option<PathBuf> {
+        self.root.as_ref().filter(|_| !self.replays()).map(|root| root.join("emitted"))
+    }
+
+    fn emitted_file(&self) -> Option<PathBuf> {
+        self.emitted_dir().zip(self.build).map(|(dir, build)| dir.join(format!("{build:016x}.txt")))
+    }
+
+    /// Adds `(made of, emitted)` pairs to the memo and the build's file.
+    fn record_emitted(&self, found: &[(u64, u64)]) {
+        if let (Some(file), false) = (self.emitted_file(), found.is_empty()) {
             let append = std::fs::OpenOptions::new().create(true).append(true).open(file);
             if let Ok(mut f) = append {
-                for (m, e) in &found {
+                for (m, e) in found {
                     let _ = std::io::Write::write_all(&mut f, format!("{m:016x} {e:016x}\n").as_bytes());
                 }
             }
         }
-        let mut known = memo.lock().expect("emitted memo");
-        known.extend(found);
-        digest(&made_of.iter().map(|c| c.iter().map(|m| known[m]).collect::<Vec<_>>()).collect::<Vec<_>>())
+        self.emitted_memo().lock().expect("emitted memo").extend(found.iter().copied());
     }
 
     /// The process-wide store per the environment (see the module docs).
@@ -424,7 +547,7 @@ impl TuneStore {
 
     /// Every readable `line -> entry` of the key's device file; empty when
     /// unreadable or of another format.
-    pub fn entries(&self, key: &TuneKey) -> HashMap<String, Entry> {
+    pub(crate) fn entries(&self, key: &TuneKey) -> HashMap<String, Entry> {
         let Some(text) = self.path(key).and_then(|p| std::fs::read_to_string(p).ok()) else { return HashMap::new() };
         if text.lines().next() != Some(format!("format {FORMAT}").as_str()) {
             return HashMap::new();
@@ -462,7 +585,7 @@ impl TuneStore {
 
     /// A measured number (a probe's cost, say) by the same path as
     /// [`Self::choose`]: the memo, the store, else `measure`, stored when `Some`.
-    pub fn value(
+    pub(crate) fn value(
         &self,
         key: &TuneKey,
         programs: impl FnOnce() -> u64,
@@ -505,21 +628,23 @@ impl TuneStore {
     /// device ns: the memo, then the store under the line the programs
     /// `build` makes fingerprint (each built once), else, on a store miss,
     /// those `bench` has not compiled are compiled and every candidate is
-    /// [`time`]d, their order stored.
-    pub fn choose<C: Copy + PartialEq>(
+    /// [`time`]d through `pass`, their order stored.
+    pub(crate) fn choose<C: Copy + PartialEq + std::fmt::Debug + Send>(
         &self,
         key: &TuneKey,
         candidates: &[C],
         build: impl Fn(C) -> Candidate,
         bench: &mut Bench<C>,
+        pass: Pass,
     ) -> Option<Arc<[(usize, u64)]>> {
+        let keep = bench.lowered.clone();
         let programs = || {
             let built: Vec<Candidate> = candidates.iter().map(|&c| build(c)).collect();
-            (self.fingerprint(&built), built)
+            (self.fingerprint_keeping(&built, Some(&keep)), built)
         };
         let within =
             |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _)| i < candidates.len()));
-        let timed = |built| ordered(bench.time(candidates, built)).map(Entry::Choice);
+        let timed = |built| ordered(bench.time(candidates, built, pass, self)).map(Entry::Choice);
         match self.remember(Kind::Choice, key, within, programs, timed)? {
             Entry::Choice(timed) => Some(timed),
             _ => None,
@@ -532,7 +657,7 @@ impl TuneStore {
     /// stored when it judged. What compiles without spilling is the
     /// compiler's and the programs' alone, both in the line, so a later
     /// process compiles nothing but its choice.
-    pub fn admitted(
+    pub(crate) fn admitted(
         &self,
         key: &TuneKey,
         programs: impl FnOnce() -> u64,
@@ -549,7 +674,7 @@ impl TuneStore {
     /// `key` names (`None`: nothing compiled), by the same path as
     /// [`Self::admitted`] under its own kind, so a list's full admission and
     /// its first clean config are each remembered once.
-    pub fn first(
+    pub(crate) fn first(
         &self,
         key: &TuneKey,
         programs: impl FnOnce() -> u64,
@@ -574,14 +699,14 @@ pub(crate) fn ordered(ns: Vec<Option<u64>>) -> Option<Arc<[(usize, u64)]>> {
 /// A candidate compiled on scratch buffers: its plans (`None` when one
 /// failed to build) and its kernels' compiled resources where the backend
 /// reports them.
-pub struct Built {
+pub(crate) struct Built {
     plans: Option<Vec<Scratch>>,
     resources: Vec<KernelResources>,
 }
 
 /// What compiling a candidate showed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Compiled {
+pub(crate) enum Compiled {
     Failed,
     /// A kernel [`spilled`]: admitted only where every candidate does, timed
     /// among a tile's pipelines.
@@ -590,7 +715,7 @@ pub enum Compiled {
 }
 
 impl Built {
-    pub fn verdict(&self) -> Compiled {
+    pub(crate) fn verdict(&self) -> Compiled {
         match &self.plans {
             None => Compiled::Failed,
             Some(_) if spilled(&self.resources) => Compiled::Spilled,
@@ -601,63 +726,177 @@ impl Built {
 
 /// Whether a kernel of `resources` spilled to scratch; a backend reporting
 /// nothing has not.
-pub fn spilled(resources: &[KernelResources]) -> bool {
+pub(crate) fn spilled(resources: &[KernelResources]) -> bool {
     resources.iter().any(|r| r.scratch_bytes.is_some_and(|b| b > 0))
 }
 
-/// Candidates compiled once on one scratch pool and kept: admitted in ranked
-/// batches, then timed by the passes that ask for them, none compiled twice.
-pub struct Bench<C> {
+/// Candidates compiled once on one scratch pool and kept: admitted as the
+/// shortlist's search asks, then timed by the passes that ask for them, none
+/// compiled or lowered twice (a fingerprint's lowerings are kept for the
+/// compile). Compiles run on the rayon pool ([`streamed`]), each killed at
+/// [`COMPILE_TIMEOUT`]; while candidates are timed, the rest compile.
+pub(crate) struct Bench<C> {
     pool: ScratchPool,
     pub(crate) built: Vec<(C, Built)>,
+    pub(crate) lowered: Arc<Lowerings>,
 }
 
 impl<C> Default for Bench<C> {
     fn default() -> Self {
-        Self { pool: ScratchPool::default(), built: vec![] }
+        Self { pool: ScratchPool::default(), built: vec![], lowered: Arc::default() }
     }
 }
 
-impl<C: Copy + PartialEq> Bench<C> {
+/// Search bound: a candidate's compile past this is killed and the
+/// candidate rejected, as one that fails (its lowering and compiler runs
+/// together; Tinygrad's BEAM gives one 10 s). On gfx1201 the 16384² d128
+/// k64 nearest's queue-32 tiles spill at 256 VGPRs after 62–77 s of clang
+/// each, which was most of that shape's admission, while every clean one of
+/// nine nearest shapes compiled within 9 s at eight compiles at once (the
+/// slowest clang seen beside another process's load: 21 s).
+pub(crate) const COMPILE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Compiles of a [`Bench`], `width` at a time, keyed by `K`.
+type Compiling<'a, K> = Stream<'a, (K, Candidate), (K, Built, Duration)>;
+
+impl<C: Copy + PartialEq + std::fmt::Debug + Send> Bench<C> {
     fn find(&self, c: C) -> Option<usize> {
         self.built.iter().position(|(b, _)| *b == c)
     }
 
-    /// Compiles, in parallel, those of `candidates` not compiled before,
-    /// from the programs `programs` makes of a candidate's position.
-    fn compile(&mut self, candidates: &[C], mut programs: impl FnMut(usize) -> Candidate) {
-        let missing: Vec<usize> = (0..candidates.len()).filter(|&i| self.find(candidates[i]).is_none()).collect();
-        let built = compile(missing.iter().map(|&i| programs(i)).collect(), &self.pool);
-        self.built.extend(missing.into_iter().map(|i| candidates[i]).zip(built));
-    }
-
-    /// What compiling each of `batch` (the programs `build` makes) showed.
-    pub fn admit(&mut self, batch: &[C], build: impl Fn(C) -> Candidate) -> Vec<Compiled>
-    where
-        C: std::fmt::Debug,
-    {
-        self.compile(batch, |i| build(batch[i]));
-        let verdict = |&cfg: &C| {
-            let built = &self.built[self.find(cfg).expect("compiled")].1;
-            let (verdict, resources) = (built.verdict(), &built.resources);
-            let registers: Vec<_> = resources.iter().map(|r| (r.vgprs, r.agprs)).collect();
-            let scratch: Vec<_> = resources.iter().map(|r| r.scratch_bytes).collect();
-            tracing::debug!(target: crate::ops::PLAN, ?cfg, ?verdict, ?registers, ?scratch, "compiled");
-            verdict
+    /// `body` over a stream compiling candidates on this bench's pool and
+    /// lowerings, `width` at once.
+    fn compiling<K: Send, T>(
+        &self,
+        store: &TuneStore,
+        width: usize,
+        body: impl FnOnce(&mut Compiling<'_, K>) -> T,
+    ) -> T {
+        let (pool, lowered) = (&self.pool, &self.lowered);
+        let run = |(key, programs): (K, Candidate)| {
+            let start = std::time::Instant::now();
+            let built = svod_runtime::clang::with_compile_deadline(start + COMPILE_TIMEOUT, || {
+                compile_one(programs, pool, Some((store, lowered)))
+            });
+            (key, built, start.elapsed())
         };
-        batch.iter().map(verdict).collect()
+        streamed(width, run, body)
     }
 
-    /// Each of `candidates`' best device time ([`time`]); those not compiled
-    /// yet compile from `programs`, theirs in order.
-    pub fn time(&mut self, candidates: &[C], programs: Vec<Candidate>) -> Vec<Option<u64>> {
-        let mut programs: Vec<Option<Candidate>> = programs.into_iter().map(Some).collect();
-        self.compile(candidates, |i| programs[i].take().expect("a candidate's programs"));
-        let (timed, mut built): (Vec<C>, Vec<&mut Built>) =
-            self.built.iter_mut().filter(|(c, _)| candidates.contains(c)).map(|(c, b)| (*c, b)).unzip();
-        let ns = time(&mut built);
-        candidates.iter().map(|c| ns[timed.iter().position(|t| t == c).expect("compiled")]).collect()
+    /// What compiling each of `batch` (the programs `build` makes) showed,
+    /// those not compiled before compiled in parallel.
+    pub(crate) fn admit(&mut self, batch: &[C], build: impl Fn(C) -> Candidate, store: &TuneStore) -> Vec<Compiled> {
+        let missing: Vec<C> = distinct(batch.iter().copied().filter(|&c| self.find(c).is_none()));
+        let done = self.compiling(store, threads(), |stream| {
+            missing.into_iter().for_each(|c| stream.push((c, build(c))));
+            std::iter::from_fn(|| stream.next()).collect::<Vec<_>>()
+        });
+        for (cfg, built, took) in done {
+            keep(&mut self.built, cfg, built, took);
+        }
+        batch.iter().map(|&c| self.built[self.find(c).expect("compiled")].1.verdict()).collect()
     }
+
+    /// The tuner's shortlist of `ranked` ([`crate::ops::config::shortlist`]),
+    /// each config compiled as soon as the search wants it.
+    pub(crate) fn shortlist(
+        &mut self,
+        ranked: &[C],
+        build: impl Fn(C) -> Candidate,
+        store: &TuneStore,
+    ) -> Option<Vec<usize>>
+    where
+        C: crate::ops::config::Tiled,
+    {
+        struct Search<'s, 'b, C, B> {
+            stream: &'s mut Compiling<'b, (usize, C)>,
+            bench: &'s mut Vec<(C, Built)>,
+            build: B,
+        }
+        impl<C: Copy + PartialEq + std::fmt::Debug, B: Fn(C) -> Candidate> crate::ops::config::Compiles<C>
+            for Search<'_, '_, C, B>
+        {
+            fn start(&mut self, at: usize, config: C) {
+                self.stream.push(((at, config), (self.build)(config)));
+            }
+
+            fn idle(&self) -> bool {
+                self.stream.idle()
+            }
+
+            fn finished(&mut self) -> Option<(usize, Compiled)> {
+                let ((at, cfg), built, took) = self.stream.next()?;
+                Some((at, keep(self.bench, cfg, built, took)))
+            }
+        }
+        let mut built = std::mem::take(&mut self.built);
+        let found = self.compiling(store, threads(), |stream| {
+            crate::ops::config::shortlist(ranked, &mut Search { stream, bench: &mut built, build })
+        });
+        self.built = built;
+        found
+    }
+
+    /// Each of `candidates`' best device time, timed in their order (the
+    /// ranking's, so a good time is soon the bar the [`HOPELESS`] ones miss);
+    /// those not compiled yet compile from `programs`, in order, on all
+    /// but one of the pool's threads while the ones ready are timed.
+    pub(crate) fn time(
+        &mut self,
+        candidates: &[C],
+        programs: Vec<Candidate>,
+        pass: Pass,
+        store: &TuneStore,
+    ) -> Vec<Option<u64>> {
+        let mut slots: Vec<Option<Built>> =
+            candidates.iter().map(|&c| self.find(c).map(|at| self.built.swap_remove(at).1)).collect();
+        let missing: Vec<(usize, Candidate)> =
+            programs.into_iter().enumerate().filter(|(i, _)| slots[*i].is_none()).collect();
+        // Their scratch buffers filled now: a fill is a kernel, which would
+        // run beside the ones timed.
+        for (_, candidate) in &missing {
+            for (prog, _) in candidate {
+                self.pool.buffers(&prog.params);
+            }
+        }
+        let ns = self.compiling(store, threads().saturating_sub(1), |stream| {
+            missing.into_iter().for_each(|job| stream.push(job));
+            let arrive = || stream.next().map(|(i, built, _)| (i, built));
+            time_with(&mut slots, arrive, Some(HOPELESS), pass, true)
+        });
+        for (&c, built) in candidates.iter().zip(slots) {
+            self.built.extend(built.map(|b| (c, b)));
+        }
+        ns
+    }
+}
+
+/// Keeps what compiling `cfg` built in `bench` and logs it; its verdict.
+fn keep<C: std::fmt::Debug>(bench: &mut Vec<(C, Built)>, cfg: C, built: Built, took: Duration) -> Compiled {
+    let verdict = built.verdict();
+    let registers: Vec<_> = built.resources.iter().map(|r| (r.vgprs, r.agprs)).collect();
+    let scratch: Vec<_> = built.resources.iter().map(|r| r.scratch_bytes).collect();
+    tracing::debug!(target: crate::ops::PLAN, ?cfg, ?verdict, ?registers, ?scratch, ?took, "compiled");
+    if verdict == Compiled::Failed && took >= COMPILE_TIMEOUT {
+        tracing::info!(target: crate::ops::PLAN, ?cfg, ?took, "compile timed out: rejected");
+    }
+    bench.push((cfg, built));
+    verdict
+}
+
+/// The rayon pool's threads, the most compiles a stream runs at once.
+fn threads() -> usize {
+    rayon::current_num_threads()
+}
+
+fn distinct<C: PartialEq>(items: impl Iterator<Item = C>) -> Vec<C> {
+    let mut out: Vec<C> = vec![];
+    for c in items {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Builds each candidate's plans on `pool`'s scratch buffers at capacity
@@ -665,11 +904,26 @@ impl<C: Copy + PartialEq> Bench<C> {
 /// [`resources`]. The programs compile in parallel, on workers carrying the
 /// caller's default device and origin scope.
 pub(crate) fn compile(candidates: Vec<Candidate>, pool: &ScratchPool) -> Vec<Built> {
-    in_parallel(candidates, |programs| {
-        let plans: Option<Vec<Scratch>> = programs.into_iter().map(|(p, l)| scratch_plan(p, &l, pool)).collect();
-        let resources = plans.iter().flatten().flat_map(|(plan, _)| resources(plan)).collect();
-        Built { plans, resources }
-    })
+    in_parallel(candidates, |programs| compile_one(programs, pool, None))
+}
+
+/// One candidate's [`compile`], its programs lowered through `lowered`
+/// (`store`'s fingerprint memo and the lowerings a fingerprint kept) where
+/// given: a program that does not lower fails the candidate there, lowered
+/// no further.
+fn compile_one(programs: Candidate, pool: &ScratchPool, lowered: Option<(&TuneStore, &Lowerings)>) -> Built {
+    let plans: Option<Vec<Scratch>> = programs
+        .into_iter()
+        .map(|(p, l)| match lowered {
+            Some((store, keep)) => {
+                let body = store.lowered(&p, &l, keep)?;
+                scratch_plan_of(p, &l, pool, Some(body))
+            }
+            None => scratch_plan(p, &l, pool),
+        })
+        .collect();
+    let resources = plans.iter().flatten().flat_map(|(plan, _)| resources(plan)).collect();
+    Built { plans, resources }
 }
 
 /// Held across every [`time`] in the process, the probes' and the tuner's
@@ -679,75 +933,152 @@ static DEVICE: Mutex<()> = Mutex::new(());
 /// Each built candidate's best device time in ns, its programs' summed;
 /// `None` where one failed to build or run. The device runs them one at a
 /// time, after the clock is lifted, under the process's one timing lock.
-pub(crate) fn time<B: BorrowMut<Built>>(built: &mut [B]) -> Vec<Option<u64>> {
+pub(crate) fn time(built: &mut [Built]) -> Vec<Option<u64>> {
+    let mut slots: Vec<Option<&mut Built>> = built.iter_mut().map(Some).collect();
+    time_with(&mut slots, || None, None, Pass::Whole, false)
+}
+
+/// [`time`] through [`rounds`] under `hopeless` and `pass` of the
+/// candidates in `slots`, an empty one filled from `arrive` (the compiles
+/// that land, each with its candidate's index) as timing reaches it: a
+/// candidate whose first timed run passes that factor of the best so far
+/// keeps that run's time.
+fn time_with<B: BorrowMut<Built>>(
+    slots: &mut [Option<B>],
+    mut arrive: impl FnMut() -> Option<(usize, B)>,
+    hopeless: Option<f64>,
+    pass: Pass,
+    budgeted: bool,
+) -> Vec<Option<u64>> {
     let _device = DEVICE.lock().unwrap_or_else(PoisonError::into_inner);
-    let plans: Vec<Option<Vec<&ExecutionPlan>>> = built
-        .iter_mut()
-        .map(|b| {
-            b.borrow_mut()
-                .plans
-                .as_mut()?
-                .iter_mut()
-                .map(|(plan, vars)| {
-                    let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-                    plan.execute_with_vars(&vars).ok().map(|_| &*plan)
-                })
-                .collect()
-        })
-        .collect();
-    if let Some(first) = plans.iter().flatten().flatten().next() {
-        warm_clock(CLOCK_WARMUP, || run(first));
-    }
+    let count = slots.len();
+    // Whether a candidate's plans ran once (`None`: not tried yet).
+    let mut ran: Vec<Option<bool>> = vec![None; count];
+    let Some(first) = (0..count).find(|&i| ready(i, slots, &mut arrive, &mut ran).is_some()) else {
+        return vec![None; count];
+    };
+    let plan = ready(first, slots, &mut arrive, &mut ran).expect("ran")[0];
+    warm_clock(CLOCK_WARMUP, || run(plan));
     // A plan's last timed run sizes its sustain, one timed run first.
-    let mut last: Vec<Vec<Option<Duration>>> =
-        plans.iter().map(|p| vec![None; p.as_ref().map_or(0, Vec::len)]).collect();
-    let time = |i: usize| {
-        let plans = plans[i].as_ref()?;
+    let mut last: Vec<Vec<Option<Duration>>> = vec![vec![]; count];
+    let mut time = |i: usize, abort: Option<Duration>, leader: bool| {
+        let plans = ready(i, slots, &mut arrive, &mut ran)?;
+        let last = &mut last[i];
+        last.resize(plans.len(), None);
+        // The first timed run, where this call takes it.
+        let mut fresh = vec![None; plans.len()];
+        for ((plan, last), fresh) in plans.iter().zip(last.iter_mut()).zip(&mut fresh).filter(|((_, l), _)| l.is_none())
+        {
+            *last = Some(run(plan)?);
+            *fresh = *last;
+        }
+        let first: Duration = last.iter().flatten().sum();
+        if abort.is_some_and(|abort| first > abort) {
+            return Some(first);
+        }
+        let (runs, sustained) = match budgeted && !leader {
+            true => (runs(first), first < SUSTAIN),
+            false => (RUNS, true),
+        };
+        if sustained {
+            sustain(&plans, SUSTAIN, first);
+        }
         plans
             .iter()
-            .zip(&mut last[i])
-            .map(|(plan, last)| {
-                let per_run = match *last {
-                    Some(t) => t,
-                    None => run(plan)?,
-                };
-                sustain(plan, SUSTAIN, per_run);
-                let t = best((0..RUNS).map(|_| run(plan)))?;
+            .zip(last.iter_mut())
+            .zip(fresh)
+            .map(|((plan, last), fresh)| {
+                // Unsustained, the first run is as good as the next ones.
+                let kept = fresh.filter(|_| !sustained);
+                let t = best(kept.map(Some).into_iter().chain((kept.is_some() as usize..runs).map(|_| run(plan))))?;
                 *last = Some(t);
                 Some(t)
             })
             .sum::<Option<Duration>>()
     };
-    rounds(plans.len(), time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
+    rounds(count, hopeless, pass, &mut time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()
+}
+
+/// Candidate `i`'s plans once they ran a first time (untimed), its
+/// compile awaited through `arrive` where its slot is empty; `None` where
+/// it failed to build or run.
+fn ready<'s, B: BorrowMut<Built>>(
+    i: usize,
+    slots: &'s mut [Option<B>],
+    arrive: &mut impl FnMut() -> Option<(usize, B)>,
+    ran: &mut [Option<bool>],
+) -> Option<Vec<&'s ExecutionPlan>> {
+    while slots[i].is_none() {
+        let (at, built) = arrive()?;
+        slots[at] = Some(built);
+    }
+    let plans = slots[i].as_mut()?.borrow_mut().plans.as_mut()?;
+    let ok = *ran[i].get_or_insert_with(|| {
+        plans.iter_mut().all(|(plan, vars)| {
+            let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+            plan.execute_with_vars(&vars).is_ok()
+        })
+    });
+    ok.then(|| plans.iter().map(|(plan, _)| plan).collect())
 }
 
 /// Each candidate's minimum over the timed rounds: one round of every
-/// candidate, then [`ROUNDS`]` - 1` more ([`round_robin_min`]) of the
-/// [`CONTENDER`]s of the first round's best (of every candidate, under
-/// [`CUT_FROM`]), then, where more than two contenders ran them, [`ROUNDS`]
-/// more of the two leaders, whose gap is often within a round's drift (two
-/// contenders have run every round together already). `None` where a
-/// candidate failed to run.
-pub(crate) fn rounds(count: usize, mut time: impl FnMut(usize) -> Option<Duration>) -> Vec<Option<Duration>> {
-    let mut best = round_robin_min(count, 1, None, &mut time);
+/// candidate, then [`ROUNDS`]` - 1` more of the [`CONTENDER`]s of the first
+/// round's best (under [`CUT_FROM`], those within `hopeless` of it, else
+/// every candidate), each round past the second left to those within
+/// [`SETTLED`] of the best (from [`CUT_FROM`]), then, where more than
+/// two contenders ran them, [`ROUNDS`] more of the two leaders, whose gap
+/// is often within a round's drift (two contenders have run every round
+/// together already); a [`Pass::Screen`] stops after the second round.
+/// The first round runs in the given order, the later ones in turn
+/// backwards and forwards: a candidate runs slower after some others (on
+/// sm_86 a nearest tile ran 4 % slower after its tile's other pipelines than
+/// after a larger tile, timed in one order or the other), and its minimum
+/// over both neighbours' runs keeps that out of the choice.
+/// `time` times a candidate; in the first round its
+/// second argument is the bar, `hopeless` times the best time so far, past
+/// which the candidate's first run may stand as its time; its third says a
+/// leaders' round (timed at full [`RUNS`]). `None` where a candidate failed
+/// to run.
+pub(crate) fn rounds(
+    count: usize,
+    hopeless: Option<f64>,
+    pass: Pass,
+    mut time: impl FnMut(usize, Option<Duration>, bool) -> Option<Duration>,
+) -> Vec<Option<Duration>> {
+    let mut lead: Option<Duration> = None;
+    let mut best = round_robin_min(count, 1, None, |i| {
+        let t = time(i, hopeless.zip(lead).map(|(k, lead)| lead.mul_f64(k)), false);
+        lead = t.map(|t| lead.map_or(t, |lead| lead.min(t))).or(lead);
+        t
+    });
     let Some(lead) = best.iter().flatten().min().copied() else { return best };
-    let bound = (count >= CUT_FROM).then(|| lead.mul_f64(CONTENDER));
+    let bound = if count >= CUT_FROM { Some(CONTENDER) } else { hopeless }.map(|k| lead.mul_f64(k));
     let contenders: Vec<usize> =
         (0..count).filter(|&i| best[i].is_some_and(|t| bound.is_none_or(|bound| t <= bound))).collect();
     tracing::debug!(first = ?best, ?contenders, "tuner's first round");
-    let again = |best: &mut Vec<Option<Duration>>, among: &[usize], rounds, bound, time: &mut dyn FnMut(usize) -> _| {
-        let more = round_robin_min(among.len(), rounds, bound, |j| time(among[j]));
-        for (&i, more) in among.iter().zip(more) {
-            best[i] = more.and_then(|m| best[i].map(|b| b.min(m)));
+    let (mut live, mut later) = (contenders.clone(), vec![None; count]);
+    let screened = pass == Pass::Screen;
+    for round in 1..if screened { 2 } else { ROUNDS } {
+        let order: Vec<usize> = if round % 2 == 1 { live.iter().rev().copied().collect() } else { live.clone() };
+        for &i in &order {
+            let t = time(i, None, false);
+            later[i] = t.map(|t| later[i].map_or(t, |l: Duration| l.min(t)));
+            best[i] = t.and_then(|t| best[i].map(|b| b.min(t)));
         }
-    };
-    again(&mut best, &contenders, ROUNDS - 1, bound, &mut time);
-    if contenders.len() > 2 {
+        let settled = best.iter().flatten().min().map(|lead| lead.mul_f64(SETTLED)).filter(|_| count >= CUT_FROM);
+        let near = |i: usize| best[i].is_some_and(|t| settled.is_none_or(|settled| t <= settled));
+        live.retain(|&i| later[i].is_some_and(|t| bound.is_none_or(|bound| t <= bound)) && near(i));
+    }
+    if contenders.len() > 2 && !screened {
         let mut leaders: Vec<usize> = (0..count).filter(|&i| best[i].is_some()).collect();
         leaders.sort_by_key(|&i| best[i]);
         leaders.truncate(2);
         if let [first, second] = leaders[..] {
-            again(&mut best, &leaders, ROUNDS, None, &mut time);
+            let more = round_robin_min(2, ROUNDS, None, |j| time(leaders[j], None, true));
+            for (&i, more) in leaders.iter().zip(more) {
+                best[i] = more.and_then(|m| best[i].map(|b| b.min(m)));
+            }
             tracing::debug!(leader = first, runner_up = second, times = ?(best[first], best[second]), "tuner's leaders");
         }
     }
@@ -815,22 +1146,47 @@ fn scratch(p: &Param) -> Tensor {
 /// placeholders no op's call keys, and a shortlist of them per shape would
 /// otherwise stay for the process).
 pub(crate) fn scratch_plan(prog: Program, lowering: &Lowering, pool: &ScratchPool) -> Option<Scratch> {
-    let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
-    let buffers = pool.buffers(&prog.params);
-    let out = launch::graph_launch_once(prog, lowering, &buffers.iter().collect::<Vec<_>>()).ok()?;
-    let mut config = PrepareConfig::from_env();
-    config.ephemeral = true;
-    Some((out.prepare_with(&config).ok()?, vars))
+    scratch_plan_of(prog, lowering, pool, None)
 }
 
-/// Runs `plan` back to back, unsynchronized, for about `budget` of device
-/// time at `per_run` a run. Launches queue without waiting, so a spin of
-/// host time would queue a thousand runs of a short kernel and every timed
-/// run after it would wait for the queue to drain.
-fn sustain(plan: &ExecutionPlan, budget: Duration, per_run: Duration) {
+/// [`scratch_plan`] of `body`, the program lowered already
+/// ([`crate::lower::standalone`]) where given.
+fn scratch_plan_of(prog: Program, lowering: &Lowering, pool: &ScratchPool, body: Option<Arc<UOp>>) -> Option<Scratch> {
+    let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
+    let name = prog.name.clone();
+    let buffers = pool.buffers(&prog.params);
+    let tensors: Vec<&Tensor> = buffers.iter().collect();
+    let out = match body {
+        Some(body) => launch::graph_launch_lowered(&prog, lowering, body, &tensors)
+            .map(|mut outs| outs.swap_remove(launch::first_output(&prog))),
+        None => launch::graph_launch_once(prog, lowering, &tensors),
+    }
+    .ok()?;
+    let mut config = PrepareConfig::from_env();
+    config.ephemeral = true;
+    // A program past what the scheduler's rewrites hold (a queued list two
+    // lanes wide 32 deep built 518k nodes on gfx1201, past the rewrite
+    // engine's stack) panics there: the candidate fails to build, as one
+    // the compiler refuses, rather than taking the tuning down.
+    let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| out.prepare_with(&config)));
+    let plan = prepared.map_err(|_| tracing::warn!(kernel = name, "a candidate's graph failed to schedule")).ok()?;
+    Some((plan.ok()?, vars))
+}
+
+/// Runs a candidate's `plans` back to back, in order, unsynchronized, for
+/// about `budget` of device time at `per_run` a run of them all. Launches
+/// queue without waiting, so a spin of host time would queue a thousand
+/// runs of a short kernel and every timed run after it would wait for the
+/// queue to drain. The candidate is sustained whole, not each plan for the
+/// budget: a split's merge alone queued a thousand microsecond launches,
+/// and the candidates timed after it ran slow (on gfx1201 an unsplit
+/// nearest at depth 768 timed 106–110 TFLOP/s among split ones, 124–126
+/// alone or with each candidate sustained whole, so the tuner never chose
+/// it).
+fn sustain(plans: &[&ExecutionPlan], budget: Duration, per_run: Duration) {
     let launches = budget.as_nanos().div_ceil(per_run.as_nanos().max(1)).clamp(1, SUSTAIN_LAUNCHES);
     for _ in 0..launches {
-        if plan.execute().is_err() {
+        if plans.iter().any(|plan| plan.execute().is_err()) {
             break;
         }
     }
@@ -841,19 +1197,114 @@ fn sustain(plan: &ExecutionPlan, budget: Duration, per_run: Duration) {
 /// thread), so what it builds is what the caller would have built.
 pub(crate) fn in_parallel<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
     use rayon::prelude::*;
-    let (device, origin, capture) = (default_device(), svod_ir::origin::current(), svod_ir::origin::enabled());
-    let tuning = SCOPED.get();
-    items
-        .into_par_iter()
-        .map(|item| {
-            with_default_device(device.clone(), || {
-                let _capture = svod_ir::origin::capture_for_thread(capture);
-                let _scope = svod_ir::origin::install(origin);
-                let _tuning = Restore(SCOPED.replace(tuning));
-                f(item)
-            })
+    let context = Context::here();
+    items.into_par_iter().map(|item| context.enter(|| f(item))).collect()
+}
+
+/// What a worker takes over from the thread that hands it work: the
+/// default device, origin scope and [`scoped`] tuning (all per thread).
+struct Context {
+    device: DeviceSpec,
+    origin: Option<svod_ir::origin::OriginId>,
+    capture: bool,
+    tuning: Option<bool>,
+}
+
+impl Context {
+    fn here() -> Self {
+        let (origin, capture) = (svod_ir::origin::current(), svod_ir::origin::enabled());
+        Self { device: default_device(), origin, capture, tuning: SCOPED.get() }
+    }
+
+    fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
+        with_default_device(self.device.clone(), || {
+            let _capture = svod_ir::origin::capture_for_thread(self.capture);
+            let _scope = svod_ir::origin::install(self.origin);
+            let _tuning = Restore(SCOPED.replace(self.tuning));
+            f()
         })
-        .collect()
+    }
+}
+
+/// `body` handed a [`Stream`] whose jobs `run` takes on the rayon pool, at
+/// most `width` at once, in the order queued, each under this thread's
+/// [`Context`]; a job's panic resumes on this thread. Jobs still running
+/// when `body` returns are waited for, their results dropped.
+pub(crate) fn streamed<J: Send, R: Send, T>(
+    width: usize,
+    run: impl Fn(J) -> R + Sync,
+    body: impl FnOnce(&mut Stream<'_, J, R>) -> T,
+) -> T {
+    let context = Context::here();
+    let (run, context) = (&run, &context);
+    let (sent, results) = std::sync::mpsc::channel();
+    rayon::in_place_scope(|scope| {
+        let spawn = move |job: J| {
+            let sent = sent.clone();
+            scope.spawn(move |_| {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| context.enter(|| run(job))));
+                let _ = sent.send(result);
+            });
+        };
+        let mut stream =
+            Stream { spawn: Box::new(spawn), results, queue: Default::default(), flight: 0, width: width.max(1) };
+        body(&mut stream)
+    })
+}
+
+/// The jobs of a [`streamed`] body.
+pub(crate) struct Stream<'a, J, R> {
+    spawn: Box<dyn FnMut(J) + 'a>,
+    results: std::sync::mpsc::Receiver<std::thread::Result<R>>,
+    queue: std::collections::VecDeque<J>,
+    flight: usize,
+    width: usize,
+}
+
+impl<J, R> Stream<'_, J, R> {
+    /// Whether a job pushed now would start at once.
+    pub(crate) fn idle(&self) -> bool {
+        self.queue.is_empty() && self.flight < self.width
+    }
+
+    pub(crate) fn push(&mut self, job: J) {
+        self.queue.push_back(job);
+        self.pump();
+    }
+
+    fn pump(&mut self) {
+        while self.flight < self.width
+            && let Some(job) = self.queue.pop_front()
+        {
+            (self.spawn)(job);
+            self.flight += 1;
+        }
+    }
+
+    /// A job's result as it lands, waiting for one; `None` when no job is
+    /// queued or running. A pool thread waiting here runs the pool's jobs.
+    pub(crate) fn next(&mut self) -> Option<R> {
+        if self.flight == 0 {
+            return None;
+        }
+        let result = loop {
+            if let Ok(result) = self.results.try_recv() {
+                break result;
+            }
+            match rayon::yield_now() {
+                Some(rayon::Yield::Executed) => {}
+                Some(rayon::Yield::Idle) => {
+                    if let Ok(result) = self.results.recv_timeout(Duration::from_millis(1)) {
+                        break result;
+                    }
+                }
+                None => break self.results.recv().expect("a job's sender lives until it sends"),
+            }
+        };
+        self.flight -= 1;
+        self.pump();
+        Some(result.unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+    }
 }
 
 /// The fastest of a candidate's timed runs, dropping any under half their
@@ -881,7 +1332,7 @@ pub(crate) fn stamped(stamps: impl IntoIterator<Item = (Option<u64>, Option<u64>
 
 /// The compiled resources (registers, LDS, scratch) of the plan's kernels
 /// whose backend reports them, in schedule order.
-pub fn resources(plan: &ExecutionPlan) -> Vec<KernelResources> {
+pub(crate) fn resources(plan: &ExecutionPlan) -> Vec<KernelResources> {
     plan.kernels().filter_map(|k| k.program.resource_usage()).collect()
 }
 
@@ -892,7 +1343,7 @@ thread_local! {
 
 /// The innermost [`scoped`] setting on this thread, else `SVOD_TK_TUNE`
 /// is not `0`.
-pub fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     SCOPED.get().unwrap_or_else(|| std::env::var("SVOD_TK_TUNE").map_or(true, |v| v != "0"))
 }
 

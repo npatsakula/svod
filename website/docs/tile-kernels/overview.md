@@ -70,7 +70,8 @@ Nemotron-3-Diarization (bf16, four steps) takes 45.82 ms of GPU time in 1064 dis
 
 :::note[Not in this release]
 Hopper TMA and mbarrier producers (sm_90 runs `wgmma` fed by `cp.async`), Blackwell `tcgen05`,
-32×32 MFMA, Apple kernels, fp8/int8, attention backward, and the convolution's image-staged form.
+32×32 MFMA, Apple kernels, fp8, int8 beyond the nearest-neighbour search, attention backward, and
+the convolution's image-staged form.
 See [Portability](./portability#not-in-this-release).
 :::
 

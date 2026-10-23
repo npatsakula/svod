@@ -20,11 +20,15 @@ impl Emit<'_> {
         trans: bool,
         perm: &[u32],
     ) -> Result<()> {
+        // A block is 16 rows of 32 bytes: 16 columns of 16-bit elements or
+        // 32 of 8-bit ones, each lane's register `per` of them.
+        let per = 4 / s.dtype.bytes() as u32;
+        let cols = 8 * per;
         let [sub_r, sub_c] = l.sub_shape();
-        let (blocks_r, blocks_c) = (sub_r / 16, sub_c / 16);
-        let pair = DType::Scalar(s.dtype).vec(2).expect("a pair");
+        let (blocks_r, blocks_c) = (sub_r / 16, sub_c / cols);
+        let word_ty = DType::Scalar(s.dtype).vec(per as usize).expect("a register's elements");
         let lane16 = self.hoist(and(&self.lane, &c32(15)));
-        let lane_hi = self.hoist(mul(&shr(&self.lane, 4), &c32(8)));
+        let lane_hi = self.hoist(mul(&shr(&self.lane, 4), &c32((cols / 2) as i64)));
         // Where this warp's sub-tile starts.
         let (wr, wc) =
             self.coord(&TileLayout { frag: Layout::zeros(Lane, 1), reps: [1, 1], warps: l.warps.clone() }, 0).full();
@@ -32,21 +36,21 @@ impl Emit<'_> {
         for br in 0..blocks_r {
             for bc in 0..blocks_c {
                 let row = self.hoist(add(&add(&wr, &c32((br * 16) as i64)), &lane16));
-                let col = self.hoist(add(&add(&wc, &c32((bc * 16) as i64)), &lane_hi));
+                let col = self.hoist(add(&add(&wc, &c32((bc * cols) as i64)), &lane_hi));
                 let (off, _) = self.address(s, &Coord::plain(row, col));
                 let idx = self.access(&s.buf, &off, 1);
-                let words = ldmatrix(&idx, 4, trans, pair.clone());
+                let words = ldmatrix(&idx, 4, trans, word_ty.clone());
                 let block = br * blocks_c + bc;
                 for (jd, &js) in perm.iter().enumerate() {
                     let jd = jd as u32;
-                    if js / 8 != block {
+                    if js / (4 * per) != block {
                         continue;
                     }
-                    let e = js % 8;
-                    // Register pair `p` holds matrix `p` of the TL, BL, TR, BR address
+                    let e = js % (4 * per);
+                    // Register `p` holds matrix `p` of the TL, BL, TR, BR address
                     // order, with the middle two swapped under `.trans`.
-                    let word = if trans { [0, 2, 1, 3][(e / 2) as usize] } else { (e / 2) as usize };
-                    let v = elem(&words[word], (e % 2) as usize, 2);
+                    let word = if trans { [0, 2, 1, 3][(e / per) as usize] } else { (e / per) as usize };
+                    let v = elem(&words[word], (e % per) as usize, per as usize);
                     self.reg_store(dst, jd, vec![v]);
                 }
             }
@@ -102,8 +106,8 @@ impl Emit<'_> {
         let (va, vb, vd) = (self.value(a).clone(), self.value(b).clone(), self.value(dst).clone());
         let atom = self.low.device.target.group_mma(va.dtype, vd.dtype).expect("inference found the core").clone();
         snafu::ensure!(
-            !a_t && vb.tier() == Tier::Smem && self.low.swizzle,
-            UnsupportedSnafu { what: "a warpgroup product over other than an untransposed A and swizzled shared B" }
+            !a_t && vb.tier() == Tier::Smem,
+            UnsupportedSnafu { what: "a warpgroup product over other than an untransposed A and shared B" }
         );
         let grid = self.low.grid;
         let k = va.shape.cols;

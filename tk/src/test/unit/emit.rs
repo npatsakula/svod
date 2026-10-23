@@ -188,9 +188,83 @@ fn a_guarded_scalar_read_stays_under_its_guard(max: i64, div: i64, guarded: bool
     }
 }
 
+/// A loop whose extent may fall below zero runs no trip, as the interpreter
+/// runs none: the backend compares a range's counter unsigned, so a negative
+/// end would run billions of trips (a listing's share of steps starting
+/// past the last read 8 GB before its scores on sm_86), and the emitter
+/// floors an extent the bounds let below zero. One the bounds keep at or
+/// above zero is listed as it is: a share's count less one where it is
+/// positive (a register-staged ring's steady trips, `x − [0 < x]`) is
+/// bounded as such, not a step under the count's own low.
+#[test_case(4, false, true; "a share past the last steps")]
+#[test_case(9, false, false; "every share within the steps")]
+#[test_case(9, true, false; "a share's steady trips")]
+fn a_loop_extent_below_zero_runs_no_trip(steps: i64, steady: bool, floored: bool) {
+    let tile = Shape::new(16, 32);
+    let mut k = Kernel::new("shares");
+    k.warps(1);
+    let y = k.param::<F32>("y", ParamKind::Out, 4 * tile.elems());
+    k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
+    // A share of three steps each: the fourth starts at nine.
+    let count = (Sc::from(steps) - k.block(0) * 3).min(3);
+    let mut count = Sc::Id(k.intern(count));
+    if steady {
+        count = count.clone() - Sc::from(0).lt(count);
+    }
+    let zero = k.zeros::<F32>(tile);
+    let one = k.fill::<F32>(tile, Const::Float(1.0));
+    let [sum] = k.loop_(count, [zero], |k, _, [sum]| [k.binary(sum, one, BinaryOp::Add)]);
+    let at = k.block(0) * tile.elems();
+    let out = k.view(y, at, [tile.cols, 1], tile, [None, None]);
+    k.store(out, sum);
+    let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
+    let linear = linear(k.finish(), &Lowering::uniform(&device, false, WarpGrid { rows: 1, cols: 1 }));
+    let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
+    let ends: Vec<&Arc<UOp>> =
+        list.iter().filter_map(|u| if let Op::Range(r) = u.op() { Some(&r.end) } else { None }).collect();
+    let [end] = ends[..] else { panic!("one loop, {} ranges", ends.len()) };
+    let zero = |u: &Arc<UOp>| matches!(u.op(), Op::Const(c) if c.0 == ConstValue::Int(0));
+    let max0 = |u: &Arc<UOp>| matches!(u.op(), Op::Binary(svod_ir::BinaryOp::Max, _, c) if zero(c));
+    let end = if let Op::Cast(..) = end.op() { end.op().sources()[0].clone() } else { end.clone() };
+    assert_eq!(max0(&end), floored, "range end {:?}", end.op().as_ref());
+}
+
 /// A tile re-held through the relayout scratch lowers in a program that
 /// interns no zero: the scratch is addressed from its start, not at an
 /// offset scalar of the program.
+/// A program emitting more instructions than a kernel may on its target
+/// ([`crate::atoms::Target::most_instructions`]: the CUDA bound above the
+/// AMD one) is refused by the lowering, before any compiler sees it,
+/// naming its count and the bound: given up at the statement passing the
+/// bound (the count named is under twice it, where the whole program emits
+/// four times it), not emitted whole and then refused.
+#[test]
+fn a_program_past_the_instruction_bound_is_refused() {
+    use crate::lower::Error;
+    let target = amd(AmdArch::Gfx1201, 64);
+    let (most, shape) = (target.most_instructions(), Shape::new(64, 64));
+    assert!(most < crate::atoms::sm86().most_instructions());
+    let regs = shape.elems() / (4 * target.wave as usize);
+    let mut k = Kernel::new("huge");
+    k.warps(4);
+    let out = k.param::<F32>("o", ParamKind::Out, shape.elems());
+    let one = k.fill::<F32>(shape, Const::Float(1.0));
+    let mut x = k.zeros::<F32>(shape);
+    // Each add lists its loads, adds and stores: four instructions a register.
+    for _ in 0..most / regs + 1 {
+        x = k.binary(x, one, BinaryOp::Add);
+    }
+    let v = k.view(out, 0, [shape.cols, 1], shape, [None, None]);
+    k.store(v, x);
+    let grid = WarpGrid { rows: 4, cols: 1 };
+    let lowering = crate::lower::Lowering::uniform(&super::declared(target), false, grid);
+    let err = crate::lower::standalone(k.finish(), &lowering).err().expect("refused");
+    let Error::TooLarge { name, instructions, most: bound } = &err else { panic!("{err}") };
+    assert_eq!((name.as_str(), *bound), ("huge", most));
+    assert!(*instructions > most && *instructions < 2 * most, "{instructions} of {most}");
+    assert_eq!(err.to_string(), format!("huge emits {instructions} instructions, past the {most} a kernel may"));
+}
+
 #[test]
 fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
     use crate::layouts::{Relayout, chunked};
@@ -312,4 +386,37 @@ fn a_scalars_bounds_are_its_operations(f: fn(&mut Kernel, Sc) -> Sc, want: Optio
     let v = f(&mut k, n);
     let id = k.intern(v);
     assert_eq!(k.finish().bounds(id, &|_| None), want);
+}
+
+/// A `cp.async` fill goes in whole 16-byte chunks, the same count per
+/// thread ([`crate::layouts::fills_in_chunks`]); the emitter refuses any
+/// other, naming the fill, as the rankings' `fits` predicts.
+#[test_case(16, 32, true; "64 chunks over 32 threads")]
+#[test_case(16, 24, false; "48 chunks over 32 threads")]
+#[test_case(16, 20, false; "a row of two chunks and a half")]
+fn a_fill_goes_in_whole_chunks_per_thread(rows: usize, cols: usize, fills: bool) {
+    let shape = Shape::new(rows, cols);
+    assert_eq!(crate::layouts::fills_in_chunks(shape, 2, 32), fills);
+    let mut k = Kernel::new("fill");
+    k.warps(1);
+    let x = k.param::<F16>("x", ParamKind::In, shape.elems());
+    let y = k.param::<F16>("y", ParamKind::Out, shape.elems());
+    let s = k.smem::<F16>("s", shape.elems());
+    let src = k.view(x, 0, [cols, 1], shape, [None, None]);
+    let t = k.smem_view::<F16>(s, 0, shape);
+    k.stage(t, src, CopyMode::Async);
+    let held = Shape::new(rows, 16);
+    let v = k.smem_view::<F16>(s, 0, held);
+    let r = k.load(v);
+    let out = k.view(y, 0, [cols, 1], held, [None, None]);
+    k.store(out, r);
+    let lowering = Lowering::uniform(&super::declared(crate::atoms::sm86()), false, WarpGrid { rows: 1, cols: 1 });
+    match crate::lower::standalone(k.finish(), &lowering) {
+        Ok(_) => assert!(fills, "a {rows}×{cols} fill lowered"),
+        Err(crate::lower::Error::Unsupported { what }) => {
+            assert!(!fills, "{what}");
+            assert_eq!(what, format!("a {rows}×{cols} fill by 32 threads"));
+        }
+        Err(e) => panic!("{e}"),
+    }
 }

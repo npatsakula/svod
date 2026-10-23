@@ -26,6 +26,30 @@ use svod_ir::{AddrSpace, Op, UOp, ops as uops};
 /// gain of its own, and the plans tuned under the hint rely on it.
 pub const LOOP_HINT: &str = "!{!\"amdgpu.loop.unroll.threshold\", i32 300}";
 
+/// The hint a loop over matrix-core products carries instead: it stays as
+/// emitted. Such a loop is a tile pipeline's trip, whose author copies the
+/// body per trip where that pays; LLVM's own partial unroll of it doubles
+/// the live accumulators and staged operands at the copies' seam, which
+/// the register allocator then moves between the copies and spills (a
+/// 128×128×64 bf16 GEMM trip on gfx1201: 31 accumulator moves and 392
+/// bytes of scratch a trip at 256 VGPRs; rolled, none at 253).
+pub const ROLLED_HINT: &str = "!{!\"llvm.loop.unroll.disable\"}";
+
+/// The ranges whose body issues a matrix-core product, every loop around
+/// one: [`ROLLED_HINT`]'s.
+pub fn product_ranges(nodes: &[Arc<UOp>]) -> HashSet<u64> {
+    let (mut open, mut rolled) = (Vec::new(), HashSet::new());
+    for node in nodes {
+        match node.op() {
+            Op::Range(..) => open.push(node.id),
+            Op::End(uops::End { ranges, .. }) => open.retain(|id| ranges.iter().all(|r| r.id != *id)),
+            Op::Wmma(..) => rolled.extend(open.iter().copied()),
+            _ => {}
+        }
+    }
+    rolled
+}
+
 /// The ranges whose counter indexes a register array, which [`LOOP_HINT`]
 /// leaves alone: LLVM has to unroll such a loop before SROA can keep the array
 /// in registers, and its private-memory boost exists for exactly that. tk's

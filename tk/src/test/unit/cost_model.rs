@@ -14,23 +14,25 @@ use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::kernels::{Act, Batch};
 use crate::ops::config::{Attention, DIAGONAL, Planner, Problem, gemm_cfg};
-use crate::tune::{Bench, Candidate, Compiled};
+use crate::tune::{Bench, Candidate, Compiled, Pass, TuneStore};
 
 /// Each of `ranked` compiled (in ranked batches, as the tuner admits), then
 /// every one that compiled timed twice, its lesser time kept: the verdicts
 /// and ns in `ranked`'s order, and the extra candidates' ns after them.
-fn timed<C: Copy + PartialEq + std::fmt::Debug>(
+fn timed<C: Copy + PartialEq + std::fmt::Debug + Send>(
     ranked: &[C],
     extra: &[C],
     build: impl Fn(C) -> Candidate,
 ) -> (Vec<Compiled>, Vec<Option<u64>>) {
     let mut bench: Bench<C> = Bench::default();
-    let verdicts: Vec<Compiled> = ranked.chunks(64).flat_map(|chunk| bench.admit(chunk, &build)).collect();
+    let verdicts: Vec<Compiled> =
+        ranked.chunks(64).flat_map(|chunk| bench.admit(chunk, &build, TuneStore::global())).collect();
     let mut runs: Vec<C> =
         ranked.iter().zip(&verdicts).filter(|(_, v)| **v != Compiled::Failed).map(|(c, _)| *c).collect();
     runs.extend(extra.iter().filter(|c| !runs.contains(c)).copied().collect::<Vec<_>>());
-    let passes: Vec<Vec<Option<u64>>> =
-        (0..2).map(|_| bench.time(&runs, runs.iter().map(|&c| build(c)).collect())).collect();
+    let passes: Vec<Vec<Option<u64>>> = (0..2)
+        .map(|_| bench.time(&runs, runs.iter().map(|&c| build(c)).collect(), Pass::Whole, TuneStore::global()))
+        .collect();
     let ns = |c: &C| -> Option<u64> {
         let at = runs.iter().position(|r| r == c)?;
         passes.iter().filter_map(|p| p[at]).min()
@@ -185,7 +187,7 @@ fn cost_model_replay() {
         let row = |c: &GemmCfg| {
             let blocks = m.div_ceil(c.tile[0]) * n.div_ceil(c.tile[1]);
             let regs = c.registers(target, halves).expect("ranked");
-            (format!("{c:?}"), at_once(blocks, c.smem_bytes(epilogue.gated), regs, c.warps[0] * c.warps[1]))
+            (format!("{c:?}"), at_once(blocks, c.smem_bytes(epilogue.gated, 2), regs, c.warps[0] * c.warps[1]))
         };
         print(label, ranked.iter().map(row).collect(), ns);
     }

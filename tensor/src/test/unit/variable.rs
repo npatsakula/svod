@@ -605,3 +605,42 @@ crate::codegen_tests! {
         assert_close_f32(&negate.as_vec::<f32>().unwrap(), &[-1.5, 2.0], 1e-6);
     }
 }
+
+// ==========================================================================
+// Rows shrunk to a variable: the realized buffer spans the variable's max, so a
+// variable that may be 0 (`vmin == 0`) realizes like one that may not.
+// ==========================================================================
+
+fn realized_prefix(t: &Tensor, config: &crate::PrepareConfig, numel: usize) -> Vec<f32> {
+    let t = t.contiguous();
+    t.realize_with(config).unwrap();
+    crate::jit::to_vec::<f32>(&t.buffer().unwrap(), numel).unwrap()
+}
+
+crate::codegen_tests! {
+    #[test_case(0, 5; "min_0")]
+    #[test_case(1, 5; "min_1")]
+    #[test_case(0, 1; "min_0_bound_1")]
+    #[test_case(0, 8; "min_0_bound_max")]
+    #[test_case(0, 0; "min_0_bound_0")]
+    fn test_symbolic_row_shrink(config, min: i64, n: i64) {
+        test_setup();
+        let (rows, cols, keys, n_rows) = (8usize, 3usize, 5usize, n as usize);
+        let xs: Vec<f32> = (0..rows * cols).map(|e| (e / cols) as f32 + 1.0 + (e % cols) as f32 * 0.25).collect();
+        let cs: Vec<f32> = (0..keys * cols).map(|e| ((e / cols) as f32 - 2.0).powi(2)).collect();
+        let x = Tensor::from_slice(xs.clone()).try_reshape([rows, cols]).unwrap();
+        let c = Tensor::from_slice(cs).try_reshape([keys, cols]).unwrap();
+        let bound = Variable::new("n", min, rows as i64).bind(n).unwrap();
+        let xb = x.try_shrink([Some((SInt::Const(0), bound.as_sint())), None]).unwrap();
+
+        assert_eq!(realized_prefix(&xb, &config, n_rows * cols), xs[..n_rows * cols]);
+        let row_sums: Vec<f32> = xs.chunks(cols).take(n_rows).map(|row| row.iter().sum()).collect();
+        assert_close_f32(&realized_prefix(&xb.sum(1isize).unwrap(), &config, n_rows), &row_sums, 1e-5);
+        let dot = xb.matmul(&c.try_transpose(0, 1).unwrap()).unwrap();
+        let expected: Vec<f32> =
+            row_sums.iter().flat_map(|s| (0..keys).map(move |k| s * (k as f32 - 2.0).powi(2))).collect();
+        assert_close_f32(&realized_prefix(&dot, &config, n_rows * keys), &expected, 1e-4);
+        let argmin = realized_prefix(&dot.argmin(1isize).unwrap().cast(DType::Float32), &config, n_rows);
+        assert_eq!(argmin, vec![2.0; n_rows]);
+    }
+}

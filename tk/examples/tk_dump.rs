@@ -15,8 +15,10 @@
 //! `--act silu|gelu`), `attention BxHxTxD` (`--causal`), `norm RxD` (`--norm
 //! rms|layer`, `--bias`, `--residual`), `conv BxHxWxCINxCOUT` (`--kernel K`,
 //! `--stride S`, `--pad P`, `--dilation D`, `--bias`, `--residual`, `--act`),
-//! `heads BxTxHxKVxD` (`--qk-norm`, `--rope`). Each goes through the op
-//! layer's own shape gate (`ops::shape`) and tuning (`ops::tuned`).
+//! `heads BxTxHxKVxD` (`--qk-norm`, `--rope`), `nearest NxMxD` (`--metric
+//! squared-l2|shifted-l2|l2|neg-dot`, `--row-floor`, `--col-floor`,
+//! `--groups`, `--k K` least scores a row). Each goes through the op layer's own shape gate
+//! (`ops::shape`) and tuning (`ops::tuned`).
 //!
 //! `--compare FILE [--fun NAME]` sets the main loop of a reference kernel
 //! beside tk's, counted by the same [`svod_tk::isa::main_loop`]: a
@@ -51,10 +53,11 @@ use svod_tk::kernels::attention::{AttnMask, AttnSpec, attention};
 use svod_tk::kernels::conv::{ConvGeom, ConvSpec};
 use svod_tk::kernels::gemm::{Epilogue, GemmSpec, gemm};
 use svod_tk::kernels::heads::{HeadsSpec, Rope, heads};
+use svod_tk::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
 use svod_tk::kernels::rows::{Norm, NormSpec, norm};
 use svod_tk::kernels::{Act, Batch};
 use svod_tk::lower::Lowering;
-use svod_tk::ops::config::{Attention, Planner, Problem, gemm_lattice};
+use svod_tk::ops::config::{Attention, Nearest, Planner, Problem, gemm_lattice};
 use svod_tk::ops::shape::{self, Extent, Plan};
 use svod_tk::ops::tuned;
 use svod_tk::probe::{self, Measured};
@@ -254,9 +257,39 @@ fn main() -> Result<()> {
             println!("emitting {:?}", spec.cfg);
             vec![(if bf16 { heads::<BF16>(&spec) } else { heads::<F16>(&spec) }, spec.cfg.lowering(&planner.device))]
         }
+        ("nearest", &[n, m, d]) => {
+            let metric = match opt("--metric").unwrap_or("squared-l2") {
+                "squared-l2" => Metric::SquaredL2,
+                "shifted-l2" => Metric::ShiftedL2,
+                "l2" => Metric::L2,
+                "neg-dot" => Metric::NegDot,
+                other => return Err(format!("--metric {other}: squared-l2, shifted-l2, l2 or neg-dot").into()),
+            };
+            let (floors, groups) = (Floors { row: flag("--row-floor"), col: flag("--col-floor") }, flag("--groups"));
+            let k = num("--k")?.unwrap_or(1);
+            let operands = [dtype.clone(), dtype.clone()];
+            let (x, c) = (extent(&[n, d]), extent(&[m, d]));
+            let ranked =
+                kernel(shape::nearest(Some(&planner), &operands, Some(&x), Some(&c), metric, floors, groups, k))
+                    .map_err(gate("nearest"))?;
+            let scalar = dtype.scalar().ok_or("a scalar dtype")?;
+            let d = planner.nearest_depth(d, scalar).ok_or("no matrix core")?;
+            let p = Nearest { n, m, d, dtype: scalar, metric, floors, groups, k };
+            report(&mut plan, top, &ranked, &p.lattice(&target), |c| p.admit(&planner, c));
+            let spec = NearestSpec { n, m, d, metric, floors, groups, k, cfg: ranked[0], live: Default::default() };
+            let spec = match pick {
+                Pick::Ranked(i) => NearestSpec { cfg: *ranked.get(i).ok_or("no such ranked config")?, ..spec },
+                Pick::Tuned => replayed(&store()?, "nearest", |s| {
+                    tuned::nearest(s, &planner, dtype.clone(), &ranked, spec.clone())
+                })?,
+            };
+            println!("emitting {:?} at depth {d}", spec.cfg);
+            let prog = if bf16 { nearest::<BF16>(&spec) } else { nearest::<F16>(&spec) };
+            vec![(prog, spec.cfg.lowering(&planner.device))]
+        }
         (op, dims) => {
             return Err(format!(
-                "{op} over {dims:?}: gemm takes MxNxK, attention BxHxTxD, norm RxD, conv BxHxWxCINxCOUT, heads BxTxHxKVxD"
+                "{op} over {dims:?}: gemm takes MxNxK, attention BxHxTxD, norm RxD, conv BxHxWxCINxCOUT, heads BxTxHxKVxD, nearest NxMxD"
             )
             .into());
         }

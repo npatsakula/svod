@@ -36,6 +36,8 @@ pub enum Error {
     },
     #[snafu(display("{what} is a block barrier under a branch on the warp, which some warps skip"))]
     DivergentBarrier { what: &'static str },
+    #[snafu(display("{name} emits {instructions} instructions, past the {most} a kernel may"))]
+    TooLarge { name: String, instructions: usize, most: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -48,21 +50,18 @@ pub struct Lowering {
     pub device: Device,
     pub schedule: Schedule,
     pub grid: WarpGrid,
-    /// XOR-swizzle 16-byte chunks of shared rows against the row index.
-    pub swizzle: bool,
     /// The matrix instruction products issue on; on the warpgroup atom
     /// ([`crate::atoms::GroupMmaAtom`]) the grid's rows are warpgroups of
     /// four warps, shared operands are read through descriptors (over the
-    /// swizzled rows, so `swizzle` holds) and never loaded into registers.
+    /// swizzled rows) and never loaded into registers.
     pub core: Core,
 }
 
 impl Lowering {
-    /// `device`'s uniform pipeline over `grid`, its ring `unroll`ed or not,
-    /// shared rows swizzled.
+    /// `device`'s uniform pipeline over `grid`, its ring `unroll`ed or not.
     pub fn uniform(device: &Device, unroll: bool, grid: WarpGrid) -> Self {
         let schedule = Schedule::Uniform { fill: device.target.fill, unroll, async_products: false };
-        Self { device: device.clone(), schedule, grid, swizzle: true, core: Core::Warp }
+        Self { device: device.clone(), schedule, grid, core: Core::Warp }
     }
 }
 
@@ -108,6 +107,15 @@ pub fn render(prog: Program, lowering: &Lowering) -> Result<String> {
 }
 
 impl Lowered {
+    /// The instructions the program emitted (within
+    /// [`Target::most_instructions`]).
+    pub fn instructions(&self) -> usize {
+        let Op::Program(ops::Program { linear: Some(linear), .. }) = self.program.op() else {
+            unreachable!("a lowering emits a linear program")
+        };
+        linear.op().sources().len()
+    }
+
     /// The LLVM text of the program for `target`: what the backend's
     /// compiler is handed. Metal renders C, which has no text here.
     pub fn text(&self, target: &Target) -> Result<String> {

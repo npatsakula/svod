@@ -109,6 +109,9 @@ impl Emit<'_> {
             TileOp::Mma { .. } => self.mma(dst, op)?,
             TileOp::Reduce { src, axis, f } => self.reduce(dst, src, axis, f)?,
             TileOp::Transpose { src } => self.transpose(dst, src)?,
+            TileOp::Shift { src, axis, fill } => self.shift(dst, src, axis, fill)?,
+            TileOp::Flip { src, axis, mask } => self.flip(dst, src, axis, mask)?,
+            TileOp::Deal { src, j, col } => self.deal(dst, src, j, col)?,
             TileOp::Relayout { src } => self.relayout(dst, src)?,
             TileOp::Move { src } => {
                 for j in 0..regs {
@@ -210,10 +213,8 @@ impl Emit<'_> {
         let (from, to) = (self.value(src).dtype, self.value(dst).dtype);
         let dot2 =
             from != to && from == ScalarDType::BFloat16 && f == ReduceOp::Sum && self.low.device.target.dot2_bf16;
-        let (fold_masks, across) = match axis {
-            Axis::Row => (ls.row_fold_masks(), ls.warps.out_size(Col)),
-            Axis::Col => (ls.col_fold_masks(), ls.warps.out_size(Row)),
-        };
+        let fold_masks = ls.fold_masks(axis);
+        let across = ls.warps.out_size(if axis == Axis::Row { Col } else { Row });
         snafu::ensure!(across == 1, UnsupportedSnafu { what: "a reduction across warps" });
         let key = |l: &TileLayout, lane: u32, j: u32| {
             let (r, c) = l.coord(0, lane, j);
@@ -298,6 +299,43 @@ impl Emit<'_> {
         } else {
             x.try_exp2().expect("exp2")
         }
+    }
+
+    /// Whether some element of the boolean tile `v` this warp holds is set
+    /// ([`Scalar::Any`]): each lane's own elements or'd, then the warp's
+    /// vote, uniform over its lanes. Listed at this point, behind a compiler
+    /// memory barrier: the branch on it would otherwise let the backend sink
+    /// the loads listed above it (a pipeline's next step, used past the
+    /// branch) below it, where their latency is no longer hidden.
+    pub(super) fn vote_any(&mut self, v: ValId) -> Arc<UOp> {
+        let mut lane = self.reg_load(v, 0);
+        for j in 1..self.layout(v).regs() {
+            let x = self.reg_load(v, j);
+            lane = self.push(lane.try_or_op(&x).expect("a boolean or"));
+        }
+        if !matches!(self.low.device.target.lane_move, LaneMove::SimdShuffle) {
+            let pin = UOp::custom(
+                smallvec![lane.clone()],
+                "call void asm sideeffect \"\", \"~{{memory}}\"()".to_string(),
+                DType::Void,
+            );
+            self.push(pin);
+        }
+        let vote = match self.low.device.target.lane_move {
+            LaneMove::Shuffle => UOp::custom(
+                smallvec![lane],
+                "declare i1 @llvm.nvvm.vote.any.sync(i32, i1)\ncall i1 @llvm.nvvm.vote.any.sync(i32 -1, i1 {0})"
+                    .to_string(),
+                DType::Bool,
+            ),
+            LaneMove::SimdShuffle => UOp::custom(smallvec![lane], "simd_any({0})".to_string(), DType::Bool),
+            LaneMove::Permute | LaneMove::Dpp => {
+                let ballot = super::amdgpu::ballot(&lane, self.low.device.target.wave);
+                let ballot = self.push(ballot);
+                ballot.try_cmpne(&ballot.const_like(0)).expect("a ballot compare")
+            }
+        };
+        self.push(vote)
     }
 
     pub(super) fn shuffle_xor(&mut self, value: &Arc<UOp>, mask: u32) -> Arc<UOp> {

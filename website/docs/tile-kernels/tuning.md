@@ -5,13 +5,25 @@ sidebar_label: Tuning
 # Tuning
 
 Each op ranks its configs per shape in `ops::config` from the device's measured costs (see
-[Device costs](#device-costs)). The ranking is a model, and so is a register count, so neither
-admits a config. One rule does: the tuner compiles the ranked configs in batches of 64
-(`config::SHORTLIST`), in ranked order and in parallel, until it has the first 64 tiles whose
-compiled kernels do not spill (a kernel reporting scratch bytes spilled; a backend that reports
-nothing admits). A tile is admitted at its first clean pipeline (ring depth, unrolling), so an
-unrolled ring that spills yields to its rolled twin. When every config that compiles spills,
-the first 64 of those are timed anyway: no op falls to the graph because of spills.
+[Device costs](#device-costs)), dropping the configs priced past 2.5× the cheapest once 16 tiles are
+kept (`config::PRUNED_PAST`): on sm_86 none of them ran within the contender band. The ranking is a model, and so is a register count, so neither
+admits a config. One rule does: the tuner compiles the ranked configs in parallel until it has
+the first 64 tiles in ranked order (`config::SHORTLIST`) whose compiled kernels do not spill (a
+kernel reporting scratch bytes spilled; a backend that reports nothing admits). A tile is
+admitted at its first clean pipeline (ring depth, unrolling), so an unrolled ring that spills
+yields to its rolled twin. A pipeline is compiled only when the tile's pipelines ranked ahead of
+it spilled or failed, and none past the 64th clean tile: what a walk in ranked order compiling
+one config at a time would compile (`config::Search`). The tiles none of whose pipelines compile
+clean follow the clean ones within the 64, a pipeline each: the compiled kernel judges what it
+can and the time the rest (no op falls to the graph because of spills, and on gfx1201 the 16384²
+depth-768 nearest's best tile spills 196 bytes a lane and runs 2 % ahead of the clean pick). A config's
+compile starts as soon as the search wants it, on the thread pool (where the pool has room, a tile's next pipeline starts while the one ahead still compiles, its verdict used only where the walk would have asked for it); one whose compiler runs past
+30 s (`tune::COMPILE_TIMEOUT`) is killed and rejected as a failure would be, and the planner log
+says so (`compile timed out`); one whose lowered program emits more instructions than its target
+may (`Target::most_instructions`: 2^18 on AMD, 2^19 on CUDA, above the largest ranked kernels) is
+refused by the lowering before any compiler sees it (`lower::Error::TooLarge`, `does not lower` in
+the planner log) and rejected alike. Each program is lowered once per tuning: what the store's
+fingerprint lowered is the body the compile launches.
 
 The admitted configs, with their variants (key splits for attention, reduction splits for a
 starved convolution), are the candidates the tune store measures the first time a device meets
@@ -35,13 +47,15 @@ clocks down under real data is timed as it will run; integer operands hold zeros
 | Step | Setting |
 |---|---|
 | Warm-up | Back-to-back runs until the clock plateaus |
-| Rounds | One round of every candidate, then 3 more of the contenders: those within 1.2× of the first round's best (every candidate, under 16 of them); then 4 more of the two leaders, where more than two contenders ran |
-| Per round | 5 ms of device time in back-to-back sustain runs (at most 1024 launches, sized by the candidate's last run), then 5 profiled runs, keeping each candidate's minimum |
+| Rounds | One round of every candidate in ranked order, where a candidate whose first timed run passes 2× the best so far keeps that run as its time; then 3 more of the contenders: those within 1.2× of the first round's best (within 2×, under 8 candidates), each round past the second only those within 1.05× of the best so far, the later rounds running backwards and forwards in turn so that each candidate runs after both its neighbours; then 4 more of the two leaders, where more than two contenders ran. The first timing of a tuning, which only picks its leading tiles, stops after the second round: those tiles are timed again with their other pipelines |
+| Per round | 5 ms of device time in back-to-back sustain runs of the candidate's programs in order (at most 1024 launches, sized by the candidate's last run), then profiled runs of each program, keeping each candidate's minimum: as many as 20 ms of device time holds, 2 to 5 (`tune::runs`), and no sustain for a candidate of 5 ms or more, whose first timed run then counts among them; the leaders' rounds (and the cost probes) keep 5 runs after a sustain |
 | Time of a run | The sum of its kernels' GPU timestamps |
 
 The sustain is sized in device time because launches queue asynchronously. A candidate is a
 list of programs, a kernel plus the merge of its partial results for a split, and its time is
-the sum of its programs' times. A candidate that fails to build or run is skipped. If nothing
+the sum of its programs' times. Candidates not compiled yet when a timing starts (a split's
+variants, a tile's twins) compile on all but one of the pool's threads while the ones ready are
+timed, each timed when the ranked order reaches it. A candidate that fails to build or run is skipped. If nothing
 measures, the first candidate is used and nothing is stored.
 
 Two guards keep a time honest:

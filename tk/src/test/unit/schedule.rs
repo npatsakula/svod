@@ -239,10 +239,11 @@ fn staged_halves_keep_their_copys_scope() {
 /// consumer and a store after it, and peels the ring into three loops over
 /// one induction variable: the first trip loads and commits step 0, a
 /// steady trip loads, consumes and ends in `tail` with no branch in its
-/// body, and the last trip only consumes what the steady loop left. Two
-/// slots fence the commit and unroll over the slots; one slot commits
-/// between two barriers (the slot is read out before it is overwritten,
-/// then seen), its slot scalars the constant 0 and nothing to unroll.
+/// body, and the last trip only consumes what the steady loop left. A
+/// trip's loads are fenced ahead of its products. Two slots fence the
+/// commit and unroll over the slots; one slot commits between two barriers
+/// (the slot is read out before it is overwritten, then seen), its slot
+/// scalars the constant 0 and nothing to unroll.
 #[test_case(2, ["fence", "commit", "commit", "barrier"], 2; "two slots fence the commit")]
 #[test_case(1, ["barrier", "commit", "commit", "barrier"], 1; "one slot commits between two barriers")]
 fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, tail: [&str; 4], unroll: u32) {
@@ -273,13 +274,13 @@ fn register_staging_peels_the_ring_into_three_branch_free_loops(stages: usize, t
     let kinds = |l: &Loop| l.body.0.iter().map(kind).collect::<Vec<_>>();
     assert_eq!(kinds(head), ["issue", "issue", "commit", "commit", "barrier"]);
     let k = kinds(steady);
-    let computes = k.len() - 6;
-    assert_eq!(k[..2], ["issue", "issue"]);
-    assert!(computes > 0 && k[2..2 + computes].iter().all(|k| *k == "compute"), "{k:?}");
-    assert_eq!(k[2 + computes..], tail);
+    let computes = k.len() - 7;
+    assert_eq!(k[..3], ["issue", "issue", "fence"]);
+    assert!(computes > 0 && k[3..3 + computes].iter().all(|k| *k == "compute"), "{k:?}");
+    assert_eq!(k[3 + computes..], tail);
     assert_eq!(kinds(drain), vec!["compute"; computes]);
     assert_eq!((head.unroll, steady.unroll, drain.unroll), (1, unroll, 1));
-    assert_eq!(count(&prog, |s| matches!(s, Stmt::Sync(Sync::Fence))), usize::from(stages == 2), "fences");
+    assert_eq!(count(&prog, |s| matches!(s, Stmt::Sync(Sync::Fence))), stages, "fences");
     assert!(head.iv == steady.iv && steady.iv == drain.iv, "one induction variable");
     assert!(head.carried.is_empty());
     assert_eq!(steady.carried.len(), 1);

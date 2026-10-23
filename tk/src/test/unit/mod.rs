@@ -6,11 +6,13 @@ mod cost_model;
 mod device;
 mod emit;
 mod gather;
+mod hazards;
 mod heads;
 mod interp;
 mod isa;
 mod layout;
 mod layouts;
+mod nearest;
 mod offline;
 mod ops;
 mod ops_plan;
@@ -36,7 +38,8 @@ use crate::interp::round_to;
 use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use crate::ops::config::{Planner, has_kernels};
+use crate::kernels::nearest::{Floors, Metric};
+use crate::ops::config::{self, Planner, has_kernels};
 pub(crate) use crate::sweep::{conv_first_eight, costs, declared, first_eight, planner};
 
 /// The default device's target when tk has kernels for it, of any vendor:
@@ -131,22 +134,23 @@ fn traced() {
         .try_init();
 }
 
-/// What the tuner makes of `ranked` on the device, as the op layer tunes:
+/// What the tuner makes of `ranked` on the device, as the op layer tunes
+/// (keyed by `salt`, what else the programs vary with):
 /// the candidates `expand` makes of the admitted shortlist (compiled, the
 /// spilling ones dropped while clean ones remain) and its pick among them,
 /// none where the planner offers no kernel (the op layer takes the graph).
 pub(crate) fn tuned_on_device<C: crate::ops::config::Tiled + PartialEq + std::fmt::Debug>(
     planner: &Planner,
-    (op, dtype, shape): (&'static str, svod_dtype::DType, &[usize]),
+    (op, dtype, shape, salt): (&'static str, svod_dtype::DType, &[usize], impl std::fmt::Debug),
     ranked: &[C],
     expand: impl Fn(&[C]) -> Vec<C>,
     build: impl Fn(C) -> crate::tune::Candidate,
 ) -> (Vec<C>, Option<C>) {
     let store = crate::tune::TuneStore::global();
-    let mut tuner = crate::ops::Tuner::new(store, &planner.device, dtype, shape, crate::ops::DEVICE_TEST, build);
+    let mut tuner = crate::ops::Tuner::new(store, &planner.device, dtype, shape, salt, build);
     let candidates = expand(&tuner.admitted(op, &crate::ops::config::representatives(ranked)));
     let pick = (!candidates.is_empty()).then(|| {
-        let ordered = tuner.ordered(op, &candidates);
+        let ordered = tuner.ordered(op, &candidates, crate::tune::Pass::Screen);
         tuner.pipelined(op, &ordered, ranked)
     });
     (candidates, pick)
@@ -159,6 +163,13 @@ fn measure(candidates: impl IntoIterator<Item = crate::tune::Candidate>) -> Vec<
     crate::tune::time(&mut crate::tune::compile(candidates.into_iter().collect(), &pool))
 }
 
+/// The 8-bit step `probe::costs` measured on each fixture's device on
+/// 2026-10-22, after the fixture's other fields; the bf16 `step` of the
+/// same run: gfx1151 7.77 (1.22x), sm_86 8.10 (4.0x), gfx1201 2.73 (2.0x).
+const STEP_I8_GFX1151: f64 = 6.3627;
+const STEP_I8_SM86: f64 = 2.0166;
+const STEP_I8_GFX1201: f64 = 1.3564;
+
 /// gfx1151's costs (Strix Halo, 40 CUs) as `probe::costs` measured them on
 /// the device on 2026-10-14.
 pub(crate) fn gfx1151_costs() -> Costs {
@@ -168,6 +179,7 @@ pub(crate) fn gfx1151_costs() -> Costs {
         scatter: 3.05,
         step: 6.25,
         step_group: 0.0,
+        step_i8: STEP_I8_GFX1151,
         // Unmeasured there: equal to `step`, so a lone wave hides nothing.
         step_lone: 6.25,
         score: 0.0773,
@@ -188,6 +200,34 @@ pub(crate) fn gfx1151_costs() -> Costs {
     }
 }
 
+/// gfx1151's costs as the Strix Halo's tune store held them on 2026-10-23
+/// (`probe::stored`), every field measured: under them the inference
+/// re-holds a 32×128 attention probability tile through shared memory
+/// under a key mask, where [`gfx1151_costs`] has it exchanged.
+pub(crate) fn gfx1151_store_costs() -> Costs {
+    Costs {
+        smem_byte: 0.00356,
+        global_byte: 0.187412,
+        scatter: 2.415543,
+        step: 7.611237,
+        step_group: 0.0,
+        step_i8: 6.152153,
+        step_lone: 12.841797,
+        score: 0.079565,
+        trip: 1.905518,
+        trip_rolled: 1.893921,
+        trip_one: 1.983032,
+        trip_lone: 51.728516,
+        trip_one_lone: 59.355469,
+        lane_move: 0.034459,
+        smem_trip: 0.086365,
+        latency: 598.285924,
+        latency_one: 0.0,
+        l2_byte: 0.011227,
+        l2_bytes: 27_860_358.0,
+    }
+}
+
 /// sm_86's costs (RTX 3060, 28 SMs) as `probe::costs` measured them on the
 /// device on 2026-10-19.
 pub(crate) fn sm86_costs() -> Costs {
@@ -197,6 +237,7 @@ pub(crate) fn sm86_costs() -> Costs {
         scatter: 2.825,
         step: 8.196,
         step_group: 0.0,
+        step_i8: STEP_I8_SM86,
         step_lone: 33.25,
         score: 0.07915,
         trip: 1.81,
@@ -222,6 +263,7 @@ pub(crate) fn gfx1201_costs() -> Costs {
         scatter: 1.8443,
         step: 2.7104,
         step_group: 0.0,
+        step_i8: STEP_I8_GFX1201,
         step_lone: 5.5957,
         score: 0.059305,
         trip: 7.3026,
@@ -278,6 +320,7 @@ fn decode(dtype: ScalarDType, bytes: &[u8]) -> Vec<f64> {
         ScalarDType::Float32 => bytes.chunks(4).map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap()))).collect(),
         ScalarDType::BFloat16 => bytes.chunks(2).map(|b| bf16(half(b))).collect(),
         ScalarDType::Float16 => bytes.chunks(2).map(|b| half::f16::from_bits(half(b)).to_f64()).collect(),
+        ScalarDType::Int32 => bytes.chunks(4).map(|b| f64::from(i32::from_le_bytes(b.try_into().unwrap()))).collect(),
         other => unreachable!("{other:?} output"),
     }
 }
@@ -301,6 +344,45 @@ fn bf16(bits: u16) -> f64 {
 fn a_16_bit_output_decodes_as_ieee(dtype: ScalarDType, bits: u16, want: Option<f64>) {
     let got = decode(dtype, &bits.to_le_bytes())[0];
     assert!(want.map_or(got.is_nan(), |w| got == w), "{bits:#06x}: {got}");
+}
+
+/// The planner's problem of `n` f16 rows against `m` candidates at depth
+/// `d`, keeping `k` scores a row, with neither floors nor groups.
+fn self_join(n: usize, m: usize, d: usize, metric: Metric, k: usize) -> config::Nearest {
+    let (dtype, floors) = (ScalarDType::Float16, Floors::default());
+    config::Nearest { n, m, d, dtype, metric, floors, groups: false, k }
+}
+
+/// A fresh directory under the system temp dir, removed when dropped (a
+/// test's panic included).
+pub(super) struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    pub(super) fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("svod-tk-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        Self(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for Scratch {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
 }
 
 /// `|got - want| ≤ tol·max(|want|, 1)` everywhere: an error relative to the

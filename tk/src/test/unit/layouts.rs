@@ -10,7 +10,7 @@ use crate::build::*;
 use crate::ir::*;
 use crate::layout::{self as frag, Dim};
 use crate::layouts::{
-    Issue, Laid, Pick, Relayout, Swizzle, TileLayout, WarpGrid, chunked, infer, natural, transposing,
+    Issue, Laid, Pick, Relayout, Swizzle, TileLayout, WarpGrid, chunked, fills_in_chunks, infer, natural, transposing,
 };
 
 fn coords(l: &TileLayout, warps: u32, lanes: u32) -> Vec<(u32, u32)> {
@@ -151,6 +151,27 @@ fn shapes_that_do_not_tile_the_grid_are_rejected() {
     assert_eq!((a.reps, b.reps, c.reps), ([1, 2], [2, 6], [1, 6]), "48 columns are six n-halves");
 }
 
+/// A product's result is held as its atom leaves it: pinned otherwise, the
+/// conflict is on the result, which no inserted relayout can re-hold, and
+/// the inference refuses the program rather than drop it (the emitter would
+/// write the atom's fragments into registers the store reads as the pin).
+#[test]
+fn a_product_result_pinned_off_its_atom_is_refused() {
+    let shape = Shape::new(16, 16);
+    let mut k = Kernel::new("pinned_product");
+    let a = k.param::<BF16>("a", ParamKind::In, shape.elems());
+    let c = k.param::<F32>("c", ParamKind::Out, shape.elems());
+    let v = k.view(a, 0, [16, 1], shape, [None, None]);
+    let x = k.load(v);
+    let zero = k.zeros::<F32>(shape);
+    let acc = k.mma(zero, x, false, x, true);
+    k.pin(acc, natural(shape, 1, 32).unwrap());
+    let out = k.view(c, 0, [16, 1], shape, [None, None]);
+    k.store(out, acc);
+    let err = infer(k.finish(), &declared(sm86()), WarpGrid { rows: 1, cols: 1 }, Core::Warp).err();
+    assert!(matches!(err, Some(crate::layouts::Error::Unresolved { value }) if value == acc.0), "{err:?}");
+}
+
 /// A register-staged fill's layout holds every element of its tile, each
 /// lane's registers in 16-byte row runs, and replicates only warps (or
 /// lanes) the tile has no rows for.
@@ -283,7 +304,14 @@ fn attention_step(bias: bool) -> Program {
 /// The orientation `infer` gives each product of `prog` on gfx1151 (RDNA3.5)
 /// at `costs`, and the layouts each inserted relayout re-holds a tile between.
 fn gfx1151_attention(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLayout, TileLayout)>) {
+    let (orients, relayouts, _) = gfx1151_attention_folds(prog, costs);
+    (orients, relayouts)
+}
+
+/// [`gfx1151_attention`] and the lane moves each lane issues per reduction.
+fn gfx1151_attention_folds(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLayout, TileLayout)>, Vec<u32>) {
     let target = Target::for_arch(GpuArch::Amd(AmdArch::Gfx1151));
+    let how = target.lane_move;
     let Laid { prog, layouts: lay } =
         infer(prog, &Device { target, costs: *costs }, WarpGrid { rows: 4, cols: 1 }, Core::Warp).unwrap();
     let orients = prog
@@ -302,7 +330,16 @@ fn gfx1151_attention(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(TileLay
             _ => None,
         })
         .collect();
-    (orients, relayouts)
+    let folds = prog
+        .walk()
+        .filter_map(|(_, s)| match s {
+            Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } => {
+                Some(lay[src.index()].as_ref()?.fold_moves(lay[dst.index()].as_ref()?, *axis, how))
+            }
+            _ => None,
+        })
+        .collect();
+    (orients, relayouts, folds)
 }
 
 /// On gfx11 the score accumulator never feeds the next product as laid. With
@@ -320,13 +357,30 @@ fn rdna3_attention_trades_probabilities_between_half_waves() {
     assert!(picks.iter().all(|p| p.len() <= 2 && p.iter().all(|p| p.mask < 32)), "{picks:?}");
 }
 
-/// A bias tile read into the swapped scores would scatter, a row per lane:
-/// where a scattered element costs what a round trip does (the declared
-/// [`costs`]) the products stay direct and the bias is read along its rows.
-#[test]
-fn rdna3_attention_reads_a_bias_along_its_rows() {
-    let (orients, _) = gfx1151_attention(attention_step(true), &costs());
-    assert_eq!(orients, [Orient::Direct, Orient::Direct]);
+/// Biased scores weigh the bias's scattered lines against the folds' lane
+/// moves. Direct, the bias is read along its rows, but a row of scores
+/// spreads over 16 lanes: its maximum folds in four DPP moves for each of a
+/// lane's 8 rows (32), and P reaches PV through shared memory alone. Swapped,
+/// a lane holds a query: one `permlanex16` folds its row and the half-waves
+/// trade P (1.5 moves an element), but the bias is read a row per lane, a
+/// line per lane. Over 4 warps of 32 lanes, a 64×16 bias and P at the
+/// declared [`costs`] (a lane move 1, a round trip 8), direct costs
+/// `8·1024 + 32·128 = 12288` and swapped `1.5·1024 + 1·128 + 1024·scatter`:
+/// they cross at a scattered element of 10.375.
+#[test_case(8.0, Orient::Swapped; "a line at a round trip's cost: the folds decide")]
+#[test_case(10.25, Orient::Swapped; "just under the crossover")]
+#[test_case(10.5, Orient::Direct; "just over it: the bias is read along its rows")]
+fn rdna3_biased_attention_weighs_scattered_lines_against_fold_moves(scatter: f64, qk: Orient) {
+    let costs = Costs { scatter, ..costs() };
+    let (orients, pairs, folds) = gfx1151_attention_folds(attention_step(true), &costs);
+    assert_eq!(orients, [qk, Orient::Direct], "QKᵀ, PV");
+    assert_eq!(pairs.len(), 1, "only P changes role");
+    let relayout = pairs[0].0.relayout(&pairs[0].1, 4, 32, &costs);
+    let (fold, exchanged) = (folds, matches!(relayout, Relayout::Exchange(_)));
+    match qk {
+        Orient::Direct => assert_eq!((fold, relayout), (vec![32], Relayout::ViaSmem)),
+        Orient::Swapped => assert_eq!((fold, exchanged, relayout.work()), (vec![1], true, 1.5)),
+    }
 }
 
 /// Where a lane move costs more than a round trip through shared memory, P
@@ -471,4 +525,203 @@ fn warpgroups_are_consecutive_warps_down_the_rows() {
 fn a_shared_row_swizzles_by_its_chunks(cols: usize, bytes: usize, want: Swizzle, spans: bool) {
     assert_eq!(Swizzle::of_row(cols, bytes), want);
     assert_eq!(Swizzle::spans(cols, bytes), spans);
+}
+
+/// What the orientation search prices a reduction is what the emitter
+/// issues: per lane, a butterfly over the fold masks for each register of the
+/// result, a mask moved as the target moves it (on RDNA a DPP `row_xmask`
+/// and a `permlanex16` for a mask with bits on both sides of 16).
+#[test_case(sm86(), Orient::Direct, Axis::Row; "sm_86 rows")]
+#[test_case(sm86(), Orient::Direct, Axis::Col; "sm_86 columns")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Direct, Axis::Row; "gfx1201 direct rows")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Swapped, Axis::Row; "gfx1201 swapped rows")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Direct, Axis::Row; "gfx1151 direct rows")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Swapped, Axis::Row; "gfx1151 swapped rows")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Direct, Axis::Col; "gfx1151 direct columns")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Direct, Axis::Row; "gfx942 direct rows")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Swapped, Axis::Row; "gfx942 swapped rows")]
+fn a_fold_issues_the_lane_moves_it_is_priced(target: Target, orient: Orient, axis: Axis) {
+    // One warp: a fold across warps is not lowered.
+    let grid = WarpGrid { rows: 1, cols: 1 };
+    let (rows, cols) = (32, 32);
+    let atom = target.mma(svod_dtype::ScalarDType::BFloat16, svod_dtype::ScalarDType::Float32).unwrap().clone();
+    let held = atom.issue(orient, grid, rows, cols, 16).unwrap().c;
+    let mut k = Kernel::new("fold");
+    k.warps(grid.count());
+    let tile = Shape::new(rows, cols);
+    let x = k.param::<F32>("x", ParamKind::In, tile.elems());
+    let x = k.view(x, 0, [cols, 1], tile, [None, None]);
+    let x = k.load(x);
+    k.pin(x, held.clone());
+    let folded = k.reduce(x, axis, ReduceOp::Max);
+    let out = k.shape(folded);
+    let y = k.param::<F32>("y", ParamKind::Out, out.elems());
+    let y = k.view(y, 0, [out.cols, 1], out, [None, None]);
+    k.store(y, folded);
+    let device = Device { target: target.clone(), costs: costs() };
+    let lowering = crate::lower::Lowering::uniform(&device, false, grid);
+    let prog = k.finish();
+    let laid = infer(prog.clone(), &device, grid, Core::Warp).unwrap();
+    let priced: u32 = laid
+        .prog
+        .walk()
+        .filter_map(|(_, s)| match s {
+            Stmt::Let { dst, op: TileOp::Reduce { src, axis, .. } } => {
+                Some(laid.layouts[src.index()].as_ref()?.fold_moves(
+                    laid.layouts[dst.index()].as_ref()?,
+                    *axis,
+                    target.lane_move,
+                ))
+            }
+            _ => None,
+        })
+        .sum();
+    let ir = crate::lower::render(prog, &lowering).unwrap();
+    let moves = ["update.dpp", "permlanex16", "ds.bpermute", "shfl"];
+    let issued = ir.lines().filter(|l| l.contains("call") && moves.iter().any(|m| l.contains(m))).count();
+    assert!(priced > 0);
+    assert_eq!(issued as u32, priced, "{ir}");
+}
+
+/// A tile spread from a product's row minimum holds the vector as its row
+/// vector, every element once a lane group (the lanes sharing a row hold
+/// successive runs of its columns, a column count's odd part repeating in
+/// registers), and shifts along its columns, a power-of-two count with lane
+/// moves only into a run's first register.
+#[test_case(sm86(), Orient::Direct; "sm_86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Swapped; "gfx1201 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Swapped; "gfx1151 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Direct; "gfx942")]
+fn a_spread_tile_holds_its_rows_vector(target: Target, orient: Orient) {
+    let (warps, lanes) = (4, target.wave);
+    let grid = WarpGrid { rows: warps, cols: 1 };
+    let atom = target.geometry().unwrap().clone();
+    let vector = atom.issue(orient, grid, 64, 64, 32).unwrap().c.row_vector();
+    for cols in [2, 3, 4, 8, 12, 16, 32] {
+        let t = TileLayout::spread_row(&vector, cols);
+        assert_eq!((t.shape(), t.row_vector()), (Shape::new(64, cols as usize), vector.clone()), "{cols}");
+        let held: HashSet<(u32, u32)> = coords(&t, warps, lanes).into_iter().collect();
+        assert_eq!(held.len(), 64 * cols as usize, "{cols}: every element held");
+        let moves = t.shift(Axis::Col, warps, lanes).expect("a shift within the warp");
+        for (j, (_, fill)) in moves.iter().enumerate() {
+            assert_eq!(*fill != 0, (0..lanes).any(|l| t.coord(0, l, j as u32).1 == 0), "{cols}: register {j} fills");
+        }
+        let crossing = moves.iter().filter(|(picks, _)| picks.iter().any(|p| p.mask != 0)).count();
+        if cols.is_power_of_two() {
+            assert_eq!(crossing as u32, vector.regs(), "{cols}: a run's first register a row crosses lanes");
+        }
+    }
+}
+
+/// A flip of a spread tile across a column bit its lane holds is a renaming
+/// of registers, across one its lane group spreads a lane move a register;
+/// every element is exchanged with its partner, whatever the mask.
+#[test_case(sm86(), Orient::Direct; "sm_86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Swapped; "gfx1201 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Swapped; "gfx1151 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Direct; "gfx942")]
+fn a_spread_tile_flips_within_its_lane_group(target: Target, orient: Orient) {
+    let (warps, lanes) = (4, target.wave);
+    let grid = WarpGrid { rows: warps, cols: 1 };
+    let atom = target.geometry().unwrap().clone();
+    let vector = atom.issue(orient, grid, 64, 64, 32).unwrap().c.row_vector();
+    for cols in [2u32, 8, 16, 32] {
+        let t = TileLayout::spread_row(&vector, cols);
+        // The column bits a lane holds in its registers.
+        let (r0, c0) = t.coord(0, 0, 0);
+        let in_lane = |bit: u32| (0..t.regs()).any(|j| t.coord(0, 0, j) == (r0, c0 ^ (1 << bit)));
+        for mask in 1..cols {
+            let lane_bits = (0..cols.ilog2()).any(|b| mask >> b & 1 == 1 && !in_lane(b));
+            let moves = t.flip(Axis::Col, mask, warps, lanes).expect("a flip within the warp");
+            for (j, (picks, fill)) in moves.iter().enumerate() {
+                assert_eq!(*fill, 0, "{cols}/{mask:#b}: register {j} has a partner in every lane");
+                let crossing = picks.iter().any(|p| p.mask != 0);
+                assert_eq!(crossing, lane_bits, "{cols}/{mask:#b}: register {j}: {picks:?}");
+                for l in 0..lanes {
+                    let p = picks.iter().find(|p| p.lanes >> l & 1 == 1).expect("a source");
+                    let (r, c) = t.coord(0, l, j as u32);
+                    assert_eq!(t.coord(0, l ^ p.mask, p.reg), (r, c ^ mask), "{cols}/{mask:#b}: lane {l}");
+                }
+            }
+        }
+    }
+}
+
+/// The narrow orientation of a product spreads a row over the fewest lanes:
+/// swapped on RDNA and CDNA, whose accumulator holds a column a lane;
+/// direct where the atom cannot swap.
+#[test_case(sm86(), Orient::Direct, 4; "sm_86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Swapped, 2; "gfx1201")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Swapped, 2; "gfx1151")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Swapped, 4; "gfx942")]
+fn the_narrow_orientation_folds_a_row_across_the_fewest_lanes(target: Target, want: Orient, sharing: usize) {
+    let grid = WarpGrid { rows: 4, cols: 1 };
+    let atom = target.geometry().unwrap();
+    let (orient, issue) = atom.narrow(grid, 64, 32, 32).unwrap();
+    assert_eq!(orient, want);
+    assert_eq!(1 << issue.c.row_fold_masks().len(), sharing);
+    assert_eq!(issue.c, atom.issue(orient, grid, 64, 32, 32).unwrap().c);
+    if atom.swappable() {
+        let other = if orient == Orient::Direct { Orient::Swapped } else { Orient::Direct };
+        let wide = atom.issue(other, grid, 64, 32, 32).unwrap().c;
+        assert!(wide.row_fold_masks().len() > issue.c.row_fold_masks().len(), "{other:?} spreads a row wider");
+    }
+}
+
+/// A product's scores deal into `[rows, w]` tiles spread over the lanes
+/// sharing each of its rows: as a renaming of registers where `w` is a
+/// multiple of those lanes, else by lane moves; either way a lane's register
+/// of a deal brings it the element its table says, and over the deals every
+/// column of a row is taken once.
+#[test_case(sm86(), Orient::Direct, 4; "sm_86")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Swapped, 2; "gfx1201 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64), Orient::Direct, 16; "gfx1201 direct")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40), Orient::Swapped, 2; "gfx1151 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Swapped, 4; "gfx942 swapped")]
+#[test_case(crate::sweep::amd(AmdArch::Gfx942, 304), Orient::Direct, 16; "gfx942 direct")]
+fn a_product_deals_its_rows_in_lane(target: Target, orient: Orient, sharing: u32) {
+    let (warps, lanes) = (4, target.wave);
+    let grid = WarpGrid { rows: warps, cols: 1 };
+    let atom = target.geometry().unwrap().clone();
+    let scores = atom.issue(orient, grid, 64, 64, 32).unwrap().c;
+    assert_eq!(1 << scores.row_fold_masks().len(), sharing, "lanes sharing a row");
+    for w in [sharing / 2, sharing, 2 * sharing, 4 * sharing].into_iter().filter(|&w| (2..=64).contains(&w)) {
+        let dst = TileLayout::spread_row(&scores.row_vector(), w);
+        let n = 64 / w;
+        let taken = scores.dealt(&dst, warps, lanes);
+        for r in 0..64 {
+            let mut cols: Vec<u32> = (0..w).flat_map(|c| taken[&(r, c)].clone()).collect();
+            cols.sort_unstable();
+            assert_eq!(cols, (0..64).collect::<Vec<_>>(), "w {w}: row {r} takes each column once");
+        }
+        for j in 0..n {
+            let moves = scores.deal(&dst, j, warps, lanes).expect("a deal within the warp");
+            for (reg, (picks, fill)) in moves.iter().enumerate() {
+                assert_eq!(*fill, 0, "w {w} j {j}: register {reg} has a source");
+                assert_eq!(picks.iter().any(|p| p.mask != 0), w < sharing, "w {w} j {j}: register {reg}: {picks:?}");
+                for warp in 0..warps {
+                    for l in 0..lanes {
+                        let p = picks.iter().find(|p| p.lanes >> l & 1 == 1).expect("a source");
+                        let (r, c) = dst.coord(warp, l, reg as u32);
+                        let want = (r, taken[&(r, c)][j as usize]);
+                        assert_eq!(scores.coord(warp, l ^ p.mask, p.reg), want, "w {w} j {j}: lane {l}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A tile fills in whole 16-byte chunks per thread where every row is
+/// whole chunks and the chunks share out evenly over the threads: what the
+/// emitter asks of a `cp.async` fill and every `fits` of the rankings.
+#[test_case(16, 32, 2, 32 => true; "64 chunks over 32 threads")]
+#[test_case(8, 32, 2, 32 => true; "32 chunks over 32 threads")]
+#[test_case(16, 24, 2, 32 => false; "48 chunks over 32 threads")]
+#[test_case(16, 20, 2, 32 => false; "a row of two chunks and a half")]
+#[test_case(64, 64, 1, 128 => true; "8-bit rows, 16 a chunk")]
+#[test_case(16, 64, 1, 128 => false; "64 8-bit chunks over 128 threads")]
+#[test_case(32, 32, 4, 64 => true; "f32 rows on wave64")]
+fn a_tile_fills_in_whole_chunks_per_thread(rows: usize, cols: usize, bytes: usize, threads: usize) -> bool {
+    fills_in_chunks(Shape::new(rows, cols), bytes, threads)
 }

@@ -114,7 +114,8 @@ the consumer. The author says what to copy into a slot and what to compute from 
 [schedule template](./layouts-and-lowering#schedule-templates) decides how far ahead copies
 run and places every wait and barrier.
 
-**The product.** `mma(acc, a, a_t, b, b_t)` is `acc + A·B` on f32 accumulators, here with `B`
+**The product.** `mma(acc, a, a_t, b, b_t)` is `acc + A·B` on f32 accumulators (i32 over 8-bit
+integers, `MmaIn::Acc`), here with `B`
 read transposed. It never names an instruction: the lowering picks the target's matrix-core
 atom and gives `a`, `b` and `acc` its layouts. The result is rounded once, at the cast before
 the store.
@@ -157,6 +158,6 @@ output and falls back to the graph when the kernel does not apply.
 | Declarations | `param`, `var` (a launch variable bound by name), `grid`, `warps`, `smem` |
 | Scalars | `block(axis)`, `warp()`, `row()` (inside a gather map), `load_scalar(param, index)`, `Sc` operators and `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
 | Views | `view`, `gather` (a row-mapped view), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
-| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (a row or column vector broadcasts), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (one rounding), `reduce`, `reduce_f32`, `transpose`, `mma`, `mma_oriented`, `pin` |
+| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (a row or column vector broadcasts), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (one rounding), `reduce`, `reduce_f32`, `transpose`, `shift` (one step along an axis, a fill first), `flip` (each element exchanged across a mask's bits along an axis: a sorting network's step), `mma`, `mma_oriented`, `pin` |
 | Movement | `stage` (global → shared, `CopyMode::Async` or `Sync`), `load`, `load_as_fill`, `store` |
-| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (branches producing tiles), `each_warp` (a `Warps` statement), `barrier` |
+| Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (branches producing tiles), `where_any` (a `where_` whose taken side only the warps holding a set predicate element compute), `each_warp` (a `Warps` statement), `barrier` |

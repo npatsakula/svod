@@ -21,11 +21,12 @@ use crate::kernels::Batch;
 use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CombineSpec, Forms, attention, combine};
 use crate::kernels::conv::ConvSpec;
 use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+use crate::kernels::nearest::{Floors, Metric, NearestSpec, nearest};
 use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch_all;
 use crate::lower::sync::insert_barriers;
 use crate::lower::{Lowering, lower};
-use crate::ops::config;
+use crate::ops::config::{self, Nearest, Planner};
 use crate::schedule::Schedule;
 
 use super::{conv_first_eight, declared, first_eight, planner};
@@ -33,11 +34,13 @@ use crate::sweep::device;
 pub(super) use crate::sweep::{Launch, amd, families, group_families, hopper, linear, render};
 
 /// Random parameters of `prog` rounded to their types; every i32 parameter
-/// (key counts, masks, segment starts, row maps) is 1.
+/// (key counts, masks, segment starts, row maps) is 1, every i8 one an
+/// integer of the full range.
 fn inputs(name: &str, prog: &Program) -> Vec<Vec<f64>> {
     let mut seed = name.len() as u64;
     let params = prog.params.iter().map(|p| match p.dtype {
         ScalarDType::Int32 => vec![1.0; p.elems],
+        ScalarDType::Int8 => super::rounded(ScalarDType::Int8, p.elems, &mut seed, |x| (127.0 * x).round()),
         dtype => super::rounded(dtype, p.elems, &mut seed, |x| x),
     });
     params.collect()
@@ -260,7 +263,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
     assert!(config::has_kernels(&target));
     if let Some(free) = facts.free_scores {
         let atom = target.mma.first().expect("a matrix core");
-        assert_eq!(atom.accumulator_feeds(target.wave), free, "what the planner charges for the scratch");
+        assert_eq!(atom.accumulator_feeds(target.wave), free, "whether the scores feed the product as they stand");
     }
     let mut launches = families(&target);
     if target.arch == hopper().arch {
@@ -335,6 +338,11 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
         if let (Some(dpp), true) = (facts.dpp, name.ends_with("norm")) {
             let moves = (ir.contains("@llvm.amdgcn.update.dpp.i32("), ir.contains("@llvm.amdgcn.ds.bpermute("));
             check(moves == (dpp, !dpp), &format!("DPP and ds_bpermute: {moves:?}"));
+        }
+        if name.starts_with("gemm int8") {
+            let cores = ["mma.m16n8k32.row.col.satfinite.s8", "wmma.i32.16x16x16.iu8", "mfma.i32.16x16x32.i8"];
+            check(cores.iter().any(|c| ir.contains(c)), "no 8-bit product");
+            check(ir.contains("ldmatrix") == target.ldmatrix, "fragments not read by ldmatrix where it is");
         }
         if name.starts_with("group gemm") {
             let reg_operand = |s: &crate::ir::Stmt| matches!(s, crate::ir::Stmt::Copy { dst, .. } if tile.value(*dst).place == crate::ir::Place::Reg && tile.value(*dst).dtype == ScalarDType::BFloat16);
@@ -537,10 +545,32 @@ fn a_predicate_met_inside_a_branch_guards_a_later_if(target: Target) {
 
 /// Every output parameter of `prog` after launching it under `lowering` on
 /// the default device, `None` for inputs.
-fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>]) -> Vec<Option<Vec<f64>>> {
-    let decl = prog.params.clone();
+pub(super) fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>]) -> Vec<Option<Vec<f64>>> {
     let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
     let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+    on_device_with(prog, lowering, params, &vars)
+}
+
+/// [`on_device`] with the program's variables bound to `vars`.
+pub(super) fn on_device_with(
+    prog: Program,
+    lowering: &Lowering,
+    params: &[Vec<f64>],
+    vars: &[(&str, i64)],
+) -> Vec<Option<Vec<f64>>> {
+    launched(prog, lowering, params, vars, false)
+}
+
+/// [`on_device_with`], the program lowered for its target alone first and
+/// launched as that body where `lowered`, as the tuner launches it.
+fn launched(
+    prog: Program,
+    lowering: &Lowering,
+    params: &[Vec<f64>],
+    vars: &[(&str, i64)],
+    lowered: bool,
+) -> Vec<Option<Vec<f64>>> {
+    let decl = prog.params.clone();
     let tensors: Vec<Tensor> = decl
         .iter()
         .zip(params)
@@ -550,12 +580,18 @@ fn on_device(prog: Program, lowering: &Lowering, params: &[Vec<f64>]) -> Vec<Opt
         })
         .collect();
     let refs: Vec<&Tensor> = tensors.iter().collect();
-    let outs = graph_launch_all(prog, lowering, &refs).unwrap();
+    let outs = match lowered {
+        true => {
+            let body = crate::lower::standalone(prog.clone(), lowering).unwrap().program;
+            crate::launch::graph_launch_lowered(&prog, lowering, body, &refs).unwrap()
+        }
+        false => graph_launch_all(prog, lowering, &refs).unwrap(),
+    };
     decl.iter()
         .zip(outs)
         .map(|(p, t)| {
             (p.kind != ParamKind::In).then(|| {
-                t.prepare().unwrap().execute_with_vars(&vars).unwrap();
+                t.prepare().unwrap().execute_with_vars(vars).unwrap();
                 let mut bytes = vec![0u8; p.elems * p.dtype.bytes()];
                 t.buffer().unwrap().copyout(&mut bytes).unwrap();
                 super::decode(p.dtype, &bytes)
@@ -577,7 +613,7 @@ fn check_on_device(target: &Target) {
             let bad = g
                 .iter()
                 .zip(w)
-                .position(|(g, w)| !(g.is_nan() && w.is_nan() || (g - w).abs() <= 2e-2 * w.abs().max(1.0)));
+                .position(|(g, w)| !(g == w || g.is_nan() && w.is_nan() || (g - w).abs() <= 2e-2 * w.abs().max(1.0)));
             let worst = g.iter().zip(w).map(|(g, w)| (g - w).abs()).fold(0.0, f64::max);
             eprintln!("{name}: output {i} max abs diff {worst:.3e}");
             assert!(bad.is_none(), "{name}: output {i}[{}] = {} vs {}", bad.unwrap(), g[bad.unwrap()], w[bad.unwrap()]);
@@ -592,6 +628,24 @@ fn check_on_device(target: &Target) {
 fn families_match_the_interpreter_on_the_device() {
     let Some(target) = super::device_target() else { return };
     check_on_device(&target);
+}
+
+/// Each family lowered for its target alone and launched as that body, as
+/// the tuner launches a candidate it fingerprinted, writes bit for bit what
+/// the same program lowered at its launch writes.
+#[test]
+fn a_program_lowered_alone_runs_as_one_lowered_at_launch() {
+    let Some(target) = super::device_target() else { return };
+    for (name, prog, lowering) in families(&target) {
+        let params = inputs(&name, &prog);
+        let vars: Vec<(String, i64)> = prog.vars.iter().map(|v| (v.name.clone(), v.max)).collect();
+        let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        let bits = |outs: Vec<Option<Vec<f64>>>| -> Vec<Option<Vec<u64>>> {
+            outs.into_iter().map(|o| o.map(|v| v.iter().map(|x| x.to_bits()).collect())).collect()
+        };
+        let at_launch = bits(launched(prog.clone(), &lowering, &params, &vars, false));
+        assert_eq!(bits(launched(prog, &lowering, &params, &vars, true)), at_launch, "{name}");
+    }
 }
 
 /// The device's occupancy facts come from the device where it reports them
@@ -616,19 +670,18 @@ fn register_staged_families_match_on_cuda() {
     check_on_device(&Target { fill: Fill::Staged, ldmatrix: false, ..target });
 }
 
-/// Every candidate the op layer may plan lowers (the tune store would
-/// otherwise time a failure): the GEMM lists of a large, a small-M and a
-/// ragged shape (the large one as deep as the shortlist compiles, on one
-/// target of each fill path), the attention lists of every head size and
-/// both query regimes, and the convolution lists of every YOLO class.
-#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
-#[test_case(amd(AmdArch::Gfx1151, 40), false; "gfx1151")]
-#[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
-#[test_case(crate::atoms::sm86(), true; "sm86")]
-#[test_case(hopper(), false; "hopper")]
-fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
-    let planner = planner(target.clone());
-    let mut launches: Vec<Launch> = vec![];
+/// The launches of every candidate the op layer may plan on the planner's
+/// target, each with the shared memory its ranking admitted it with: the
+/// GEMM lists of a large, a small-M and a ragged shape (the large one as
+/// deep as the shortlist compiles where `shortlist_deep`), the attention
+/// lists of every head size and both query regimes, the convolution lists
+/// of every YOLO class (a split's merge after its kernel, no shared memory
+/// of its own), and the nearest lists of a shallow, a middle and a deep
+/// self-join under several metrics, floors and groups, and of the depths
+/// that stream the rows (a last chunk overhanging 800), a row's least
+/// alone and lists of 4 to 32.
+fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usize, usize))> {
+    let mut launches = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
         for gated in [false, true] {
             let ranked = planner.gemm_ranked(1, m, n, k, gated);
@@ -636,7 +689,9 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
             for cfg in config::distinct(&ranked).take(deep) {
                 let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
                 let spec = GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue, cfg };
-                launches.push((format!("{m}x{n}x{k} {cfg:?}"), gemm::<BF16>(&spec), cfg.lowering(&planner.device)));
+                let launch =
+                    (format!("{m}x{n}x{k} g{gated} {cfg:?}"), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
+                launches.push((launch, (cfg.smem_bytes(gated, 2), 0)));
             }
         }
     }
@@ -655,22 +710,89 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
                     scale: 0.125,
                     cfg,
                 };
-                launches.push((format!("d{d} t{t} {cfg:?}"), attention::<BF16>(&spec), cfg.lowering(&planner.device)));
+                let launch = (format!("d{d} t{t} {cfg:?}"), attention::<BF16>(&spec), cfg.lowering(&planner.device));
+                let scratch = cfg.scratch_bytes(&planner.device.target);
+                launches.push((launch, (cfg.smem_bytes(d, false) + scratch, scratch)));
             }
         }
     }
     for class in super::conv::YOLO {
         let g = super::conv::yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        for c in conv_first_eight(&planner, 1, ho * wo, &g) {
+        for c in conv_first_eight(planner, 1, ho * wo, &g) {
             let spec =
                 ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, cfg: c.gemm, split: c.split };
-            for (prog, lowering) in spec.programs::<F16>(&planner.device) {
-                launches.push((format!("{g:?} {c:?}"), prog, lowering));
+            for (i, (prog, lowering)) in spec.programs::<F16>(&planner.device).into_iter().enumerate() {
+                let smem = if i == 0 { c.gemm.smem_bytes(false, 2) } else { 0 };
+                launches.push(((format!("{g:?} {c:?} #{i}"), prog, lowering), (smem, 0)));
             }
         }
     }
-    each(launches, |_, prog, lowering| drop(linear(prog, &lowering)));
+    let (none, both) = (Floors::default(), Floors { row: true, col: true });
+    for (d, metric, floors, groups, k) in [
+        (16, Metric::ShiftedL2, none, false, 1),
+        (64, Metric::L2, both, true, 1),
+        (128, Metric::SquaredL2, none, true, 1),
+        (512, Metric::NegDot, none, false, 1),
+        (800, Metric::SquaredL2, both, true, 1),
+        (1024, Metric::ShiftedL2, none, false, 1),
+        (64, Metric::SquaredL2, none, false, 4),
+        (128, Metric::NegDot, none, true, 16),
+        (768, Metric::SquaredL2, none, false, 8),
+        (768, Metric::NegDot, none, false, 32),
+    ] {
+        let dtype = ScalarDType::Float16;
+        let p = Nearest { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors, groups, k };
+        for cfg in first_eight(&planner.nearest_ranked(p)) {
+            let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Default::default() };
+            let name = format!("nearest d{d} {metric:?} {floors:?} {groups} k{k} {cfg:?}");
+            let launch = (name, nearest::<BF16>(&spec), cfg.lowering(&planner.device));
+            launches.push((launch, (cfg.smem_bytes(d, dtype), 0)));
+        }
+    }
+    launches
+}
+
+/// The static shared memory a lowered program declares: its rings and any
+/// scratch the lowering added (a relayout through shared memory).
+fn shared_bytes(linear: &Arc<UOp>) -> usize {
+    let local = |u: &Arc<UOp>| match u.op() {
+        Op::Buffer(ops::Buffer { shape, arg }) if arg.addrspace == Some(svod_dtype::AddrSpace::Local) => Some(
+            shape.vmax().try_int().expect("a committed size") as usize * u.dtype().scalar().expect("a type").bytes(),
+        ),
+        _ => None,
+    };
+    linear.toposort().iter().filter_map(local).sum()
+}
+
+/// Every candidate the op layer may plan ([`ranked_launches`]) lowers (the
+/// tune store would otherwise time a failure), declaring the shared memory
+/// its ranking admitted it with: the rings as the config's `smem_bytes`
+/// counts them, so a `Rejected::Smem` is the kernel's own count; an
+/// attention config on a core whose accumulator cannot feed a product is
+/// admitted with the scratch its probabilities may cross besides
+/// ([`FaCfg::scratch_bytes`], a bound), and declares it or not as the
+/// inference decides.
+#[test_case(amd(AmdArch::Gfx1100, 48), false; "gfx1100")]
+#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40), false; "gfx1151")]
+#[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
+#[test_case(crate::atoms::sm86(), true; "sm86")]
+#[test_case(hopper(), false; "hopper")]
+fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
+    let planner = planner(target.clone());
+    let (launches, admitted): (Vec<Launch>, Vec<(usize, usize)>) =
+        ranked_launches(&planner, shortlist_deep).into_iter().unzip();
+    let admitted: std::collections::HashMap<String, (usize, usize)> =
+        launches.iter().map(|(name, ..)| name.clone()).zip(admitted).collect();
+    each(launches, |name, prog, lowering| {
+        let declared = shared_bytes(&linear(prog, &lowering));
+        let (smem, bound) = admitted[name];
+        assert!(
+            declared == smem || declared + bound == smem,
+            "declares {declared} bytes of shared memory, admitted with {smem} ({bound} of them a bound)"
+        );
+    });
 }
 
 /// The attention program carries the softmax forms its config declares: a
@@ -758,7 +880,6 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
         schedule: crate::schedule::Schedule::Uniform { fill: target.fill, unroll: false, async_products: false },
         device: declared(target),
         grid: crate::layouts::WarpGrid { rows: 1, cols: 1 },
-        swizzle: false,
     };
     let ir = render(k.finish(), &lowering);
     assert_eq!(ir.contains("@llvm.amdgcn.fdot2.f32.bf16("), dot2, "{ir}");
@@ -772,24 +893,29 @@ fn fences(block: &crate::ir::Block) -> usize {
     block.walk().filter(|(_, s)| matches!(s, Stmt::Sync(Sync::Fence))).count()
 }
 
-/// The two-slot register-staged template fences every trip between its
-/// products and its commit on every target that runs it; the fence is an
-/// instruction only where the scheduler would otherwise hoist the commit
-/// (RDNA4), and the interpreter never sees it, so
-/// `every_family_lowers_keeps_its_numbers_and_compiles` covers its
-/// placement. One slot needs none: a barrier holds the commit back.
+/// The register-staged template fences every trip between its loads and its
+/// products, and over two slots again between its products and its commit,
+/// on every target that runs it; the fences are instructions only where the
+/// scheduler would otherwise move the loads or the commit past the products
+/// (RDNA), and the interpreter never sees them, so
+/// `every_family_lowers_keeps_its_numbers_and_compiles` covers their
+/// placement. One slot's commit needs none: a barrier holds it back.
 #[test_case(AmdArch::Gfx1201, true; "gfx1201 fences")]
+#[test_case(AmdArch::Gfx1100, true; "gfx1100 fences")]
 #[test_case(AmdArch::Gfx942, false; "gfx942 keeps order")]
-#[test_case(AmdArch::Gfx1100, false; "gfx1100 keeps order")]
 fn register_staged_trips_are_fenced(arch: AmdArch, emitted: bool) {
     let target = amd(arch, 64);
     assert_eq!(target.sync.commit_fence, emitted);
     let device = declared(target);
-    for (stages, want) in [(2, 1), (1, 0)] {
+    for (stages, want) in [(2, 2), (1, 1)] {
         let cfg = config::gemm_cfg([64, 64, 32], stages, [2, 2], stages == 2);
         let spec = GemmSpec { m: 130, n: 192, k: 128, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };
         let tile = lowered_tile(gemm::<BF16>(&spec), &cfg.lowering(&device));
-        assert_eq!(fences(&tile.body), want, "{stages} slots: a fence per two-slot pipeline");
+        assert_eq!(
+            fences(&tile.body),
+            want,
+            "{stages} slots: a fence after the loads, one more before a two-slot commit"
+        );
     }
 }
 
@@ -900,4 +1026,178 @@ fn two_atom_rows_per_warp_lower(target: Target) {
     assert!(!odd.fits(&target, 64, false), "a 16-row block holds no 32-row warp");
     let keyed = FaCfg { warp_rows: 2 * WARP_ROWS, key_warps: 2, ..FaCfg::new(32, 16, 2) };
     assert!(!keyed.fits(&target, 64, false), "key warps share a block of one atom row warp");
+}
+
+/// Four warps of one 256-wide row each: every row's maximum, and its sum
+/// instead where the maximum is positive, the sums taken under
+/// [`Kernel::where_any`](crate::build::Kernel::where_any) (rows 1 and 3 of
+/// [`voted_input`] pass, so warps 0 and 2 skip them).
+fn voted_rows() -> (Program, crate::layouts::WarpGrid) {
+    use crate::build::{CmpOp, F32, Kernel};
+    use crate::ir::{ReduceOp, Shape};
+    let (rows, d) = (4, 256);
+    let mut k = Kernel::new("voted");
+    let x = k.param::<F32>("x", ParamKind::In, rows * d);
+    let y = k.param::<F32>("y", ParamKind::Out, rows);
+    k.warps(rows as u32);
+    let xv = k.view(x, 0, [d, 1], Shape::new(rows, d), [None, None]);
+    let xs = k.load(xv);
+    let most = k.reduce(xs, Axis::Row, ReduceOp::Max);
+    let zero = k.zeros::<F32>(Shape::new(rows, 1));
+    let positive = k.compare(zero, most, CmpOp::Lt);
+    let [out] = k.where_any(positive, |k| [k.reduce(xs, Axis::Row, ReduceOp::Sum)], [most]);
+    let yv = k.view(y, 0, [1, 1], Shape::new(rows, 1), [None, None]);
+    k.store(yv, out);
+    (k.finish(), crate::layouts::WarpGrid { rows: rows as u32, cols: 1 })
+}
+
+/// Small integers, every one of rows 0 and 2 negative, so their sums and
+/// maxima are exact and only rows 1 and 3 take their sums.
+fn voted_input() -> Vec<f64> {
+    (0..4 * 256).map(|e| if (e / 256) % 2 == 0 { -1.0 - (e % 5) as f64 } else { (e % 7) as f64 - 3.0 }).collect()
+}
+
+/// What [`voted_rows`] computes from [`voted_input`]: rows 0 and 2 their
+/// maxima, rows 1 and 3 their sums.
+fn voted_want() -> Vec<f64> {
+    let x = voted_input();
+    (0..4)
+        .map(|r| {
+            let row = &x[r * 256..(r + 1) * 256];
+            let most = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            if most > 0.0 { row.iter().sum() } else { most }
+        })
+        .collect()
+}
+
+/// The interpreter takes a branch on a vote as the block's one warp: the
+/// sums are found for every row and kept where the rows pass.
+#[test]
+fn a_branch_on_a_vote_keeps_the_otherwise_where_the_tile_is_clear() {
+    let (prog, _) = voted_rows();
+    let out = interp::run(&prog, vec![voted_input(), vec![0.0; 4]], &[]).unwrap();
+    assert_eq!(out[1], voted_want());
+}
+
+/// A branch on a vote is a warp's vote on each target, behind a compiler
+/// memory barrier; the kernel compiles where the toolchain is installed.
+#[test_case(amd(AmdArch::Gfx1201, 64), "call i32 @llvm.amdgcn.ballot.i32(i1"; "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40), "call i32 @llvm.amdgcn.ballot.i32(i1"; "gfx1151")]
+#[test_case(amd(AmdArch::Gfx942, 304), "call i64 @llvm.amdgcn.ballot.i64(i1"; "gfx942")]
+#[test_case(crate::atoms::sm86(), "call i1 @llvm.nvvm.vote.any.sync(i32 -1, i1"; "sm_86")]
+#[test_case(hopper(), "call i1 @llvm.nvvm.vote.any.sync(i32 -1, i1"; "sm_90")]
+fn a_branch_on_a_vote_lowers_to_the_warps_vote(target: Target, vote: &str) {
+    let (prog, grid) = voted_rows();
+    let device = declared(target.clone());
+    let ir = render(prog, &Lowering::uniform(&device, false, grid));
+    let (pin, at) = (ir.find(r#"asm sideeffect "", "~{memory}"()"#), ir.find(vote));
+    assert!(pin.zip(at).is_some_and(|(p, v)| p < v), "a pinned vote:\n{ir}");
+    assert_eq!(ir.matches(vote).count(), 1, "one vote:\n{ir}");
+    if let GpuArch::Amd(arch) = target.arch {
+        match svod_runtime::amd::compile_ir_to_amd_object(&ir, arch) {
+            Ok(object) => assert_eq!(&object[..4], b"\x7fELF"),
+            Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
+                eprintln!("skipped: {e}");
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+/// On the device the warps whose rows all fail skip the sums and keep their
+/// maxima; the others take them: the interpreter's numbers exactly.
+#[test]
+fn a_branch_on_a_vote_matches_the_interpreter_on_the_device() {
+    let Some(target) = super::device_target() else { return };
+    let (prog, grid) = voted_rows();
+    let device = declared(target);
+    let got = on_device(prog, &Lowering::uniform(&device, false, grid), &[voted_input(), vec![0.0; 4]]);
+    assert_eq!(got[1].as_deref(), Some(&voted_want()[..]));
+}
+
+/// The labels the conditional branches on a vote mask in `asm` jump to
+/// (`s_cbranch_vccz`/`vccnz`, the vote's mask in VCC), and whether a global
+/// load lies between each such label and the next barrier: the next step's
+/// loads sunk past the branch, waited on before the commit.
+fn loads_sunk_past_a_vote(asm: &str) -> Vec<(String, bool)> {
+    let lines: Vec<&str> = asm.lines().map(str::trim).filter(|l| !l.starts_with(';')).collect();
+    let targets = lines.iter().filter_map(|l| {
+        let rest = l.strip_prefix("s_cbranch_vccz ").or_else(|| l.strip_prefix("s_cbranch_vccnz "))?;
+        Some(rest.trim().to_string())
+    });
+    targets
+        .map(|label| {
+            let head = lines.iter().position(|l| l.starts_with(&format!("{label}:"))).expect("a branch target");
+            let block = lines[head + 1..].iter().take_while(|l| !l.starts_with("s_barrier"));
+            let sunk = block.clone().any(|l| l.starts_with("global_load"));
+            (label, sunk)
+        })
+        .collect()
+}
+
+/// A resident nearest kernel's steady trip issues the next step's global
+/// loads before its products and branches on a vote after them; the loads
+/// are used only past the branch, and without the vote's memory barrier the
+/// backend sinks them there, where the commit waits on them at once. They
+/// stay at the head of the trip.
+#[test_case(AmdArch::Gfx1201; "gfx1201")]
+#[test_case(AmdArch::Gfx1151; "gfx1151")]
+fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
+    use crate::kernels::nearest::NearestCfg;
+    let device = declared(amd(arch, 64));
+    let cfg = NearestCfg { warp_rows: 32, ..NearestCfg::new(128, 16, 2) };
+    let spec = NearestSpec {
+        n: 32768,
+        m: 32768,
+        d: 256,
+        metric: Metric::NegDot,
+        floors: Floors::default(),
+        groups: false,
+        k: 1,
+        cfg,
+        live: Default::default(),
+    };
+    let ir = render(nearest::<BF16>(&spec), &cfg.lowering(&device));
+    let asm = match svod_runtime::amd::compile_ir_to_amd_asm(&ir, arch) {
+        Ok(asm) => String::from_utf8(asm).unwrap(),
+        Err(e) if e.to_string().contains("AMDGPU target") || e.to_string().contains("too old") => {
+            eprintln!("skipped: {e}");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
+    let votes = loads_sunk_past_a_vote(&asm);
+    assert!(!votes.is_empty(), "a branch on a vote:\n{asm}");
+    assert!(votes.iter().all(|(_, sunk)| !sunk), "{votes:?}:\n{asm}");
+}
+
+/// Where the accumulator cannot feed the P·V product (RDNA3), whether the
+/// probabilities cross shared memory is the whole program's and the
+/// costs' call, not the config's: under the Strix Halo's store
+/// ([`super::gfx1151_store_costs`]) the 32×128 block of head size 64
+/// re-holds them through shared memory under a key mask (the card refused
+/// it admitted at its 64 KB of rings alone: "local memory (73728) exceeds
+/// limit (65536)") and exchanges them through lanes without one. The
+/// admission's [`FaCfg::scratch_bytes`] bounds both.
+#[test_case(AttnMask::default(), 0; "plain")]
+#[test_case(AttnMask { key_mask: true, ..AttnMask::default() }, 32 * 128 * 2; "key mask")]
+fn the_probabilities_cross_shared_memory_as_the_program_decides(mask: AttnMask, scratch: usize) {
+    let target = amd(AmdArch::Gfx1151, 40);
+    let device = crate::atoms::Device { target: target.clone(), costs: super::gfx1151_store_costs() };
+    let cfg = crate::kernels::attention::FaCfg::new(32, 128, 2);
+    let spec = AttnSpec {
+        batch: Batch::Static(2),
+        t: 100,
+        tk: 100,
+        heads: 4,
+        kv_heads: 4,
+        d: 64,
+        mask,
+        cache: None,
+        scale: 0.125,
+        cfg,
+    };
+    let declared = shared_bytes(&linear(attention::<F16>(&spec), &cfg.lowering(&device)));
+    assert_eq!(declared, cfg.smem_bytes(64, false) + scratch);
+    assert!(scratch <= cfg.scratch_bytes(&target));
 }

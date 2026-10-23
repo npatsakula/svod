@@ -10,7 +10,7 @@ use crate::ops::{self as tk, Act, Attn, Cache, Chunk, Conv, KeyMask, Linear, Qkv
 
 /// `test` on a device with tk tables, with tuning off on its thread so it
 /// does not measure every shape it touches (the untuned pick runs).
-fn untuned(test: impl FnOnce()) {
+pub(super) fn untuned(test: impl FnOnce()) {
     if super::device_planner().is_some() {
         crate::tune::scoped(false, test);
     }
@@ -60,7 +60,7 @@ fn rebound(t: &Tensor, batch: usize, row: usize) -> Vec<f32> {
 }
 
 /// The graph kernel named `name` is in `t`'s graph.
-fn assert_kernel(t: &Tensor, name: &str) {
+pub(super) fn assert_kernel(t: &Tensor, name: &str) {
     let calls: Vec<String> = t
         .uop()
         .toposort()

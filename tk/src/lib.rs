@@ -16,7 +16,7 @@
 
 pub mod atoms;
 pub mod build;
-pub mod index;
+pub(crate) mod index;
 pub mod interp;
 pub mod ir;
 pub mod isa;

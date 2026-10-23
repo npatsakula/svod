@@ -174,7 +174,6 @@ fn lowering(target: Target, fill: Fill, warps: [u32; 2]) -> Lowering {
         device: declared(target),
         schedule: Schedule::Uniform { fill, unroll: true, async_products: false },
         grid: WarpGrid { rows: warps[0], cols: warps[1] },
-        swizzle: true,
     }
 }
 
