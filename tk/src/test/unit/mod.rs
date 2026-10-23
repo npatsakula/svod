@@ -348,9 +348,9 @@ fn a_16_bit_output_decodes_as_ieee(dtype: ScalarDType, bits: u16, want: Option<f
 
 /// The planner's problem of `n` f16 rows against `m` candidates at depth
 /// `d`, keeping `k` scores a row, with neither floors nor groups.
-fn self_join(n: usize, m: usize, d: usize, metric: Metric, k: usize) -> config::Nearest {
+fn self_join(n: usize, m: usize, d: usize, metric: Metric, k: usize) -> config::NearestProblem {
     let (dtype, floors) = (ScalarDType::Float16, Floors::default());
-    config::Nearest { n, m, d, dtype, metric, floors, groups: false, k }
+    config::NearestProblem { n, m, d, dtype, metric, floors, groups: false, k }
 }
 
 /// A fresh directory under the system temp dir, removed when dropped (a

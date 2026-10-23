@@ -178,7 +178,7 @@ fn a_gated_gemm_is_a_double_width_problem() {
     let gated = planner(target.clone()).gemm_ranked(1, 4096, 3072, 1024, true);
     assert_valid(&gated, &target, 1024, true);
     assert!(gated.iter().all(|c| c.tile[2] >= 32), "{gated:?}");
-    let p = config::Problem { batches: 1, m: 4096, n: 3072, k: 1024, halves: 2 };
+    let p = config::GemmProblem { batches: 1, m: 4096, n: 3072, k: 1024, halves: 2 };
     assert!(deep.smem_bytes(true, 2) > target.smem_bytes && p.admit(&planner(target), &deep).is_err());
 }
 
@@ -246,7 +246,7 @@ fn an_sm_issues_its_share_of_blocks() {
 #[test_case(sm86(), 32, false; "sm86 three slots against one")]
 #[test_case(rdna3(), 32, true; "rdna3 two slots against one")]
 fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize, cheap_wins: bool) {
-    let problem = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
+    let problem = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     // A small tile: its residency is bound by shared memory, not registers.
     let two = gemm_cfg([64, 64, bk], target.fill.stages(3), [2, 2], false);
     let one = GemmCfg { stages: 1, ..two };
@@ -384,7 +384,7 @@ fn a_round_pays_the_latency_its_ring_leaves() {
 #[test]
 fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
     let cfg = |warps| gemm_cfg([64, 64, 32], 3, warps, false);
-    let p = config::Problem { batches: 1, m: 64 * 28, n: 64 * 28, k: 4096, halves: 1 };
+    let p = config::GemmProblem { batches: 1, m: 64 * 28, n: 64 * 28, k: 4096, halves: 1 };
     let ratio = |step_lone| {
         let planner = planned(Device { target: sm86(), costs: Costs { step_lone, ..costs() } });
         let cost = |c| p.admit(&planner, &c).expect("admitted").0;
@@ -401,7 +401,7 @@ fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
 /// flight at once, which share a tile's keys, so the cost sits between.
 #[test]
 fn an_attention_fill_is_priced_by_where_it_comes_from() {
-    let a = config::Attention { tiles: 32, t: 2048, tk: 2048, d: 64, causal: false, bias: false };
+    let a = config::AttentionProblem { tiles: 32, t: 2048, tk: 2048, d: 64, causal: false, bias: false };
     let unique = (a.tiles * a.tk * a.d * 4) as f64;
     let cost = |l2_bytes| {
         let c = Costs { global_byte: 0.08, l2_byte: 0.01, l2_bytes, ..costs() };
@@ -448,7 +448,7 @@ fn blocks_in_flight_share_their_lines_past_the_cache() {
     assert_eq!(planner.fill_byte(100.0 * mb, 1e4 * mb, 0.0), 0.08);
     assert!((planner.fill_byte(100.0 * mb, 1e4 * mb, 0.75) - (0.75 * 0.01 + 0.25 * 0.08)).abs() < 1e-12);
     assert_eq!(planner.fill_byte(mb, 100.0 * mb, 0.5), planner.fill_byte(mb, 100.0 * mb, 0.0));
-    let p = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
+    let p = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
     let dram = planned(Device { target: sm86(), costs: Costs { l2_bytes: 0.0, ..c } });
     let (cached, at_dram) = (p.admit(&planner, &cfg).unwrap().0, p.admit(&dram, &cfg).unwrap().0);
@@ -523,7 +523,7 @@ proptest::proptest! {
 #[test]
 fn under_latency_resident_blocks_halve_the_cost() {
     let slow = Costs { latency: 1e9, ..costs() };
-    let p = config::Problem { batches: 112, m: 128, n: 128, k: 4096, halves: 1 };
+    let p = config::GemmProblem { batches: 112, m: 128, n: 128, k: 4096, halves: 1 };
     let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
     let full = sm86();
     let starved = Target { occupancy: crate::atoms::Occupancy { waves: 2, ..full.occupancy }, ..sm86() };
@@ -1024,9 +1024,9 @@ fn a_bias_rides_its_own_ring_slot(target: Target) {
     assert!(!ranked.is_empty());
     let within = |c: &FaCfg| c.smem_bytes(64, true) + c.scratch_bytes(&target) <= target.smem_bytes;
     assert!(ranked.iter().all(|c| c.fits(&target, 64, true) && within(c)), "{ranked:?}");
-    let biased = config::Attention { tiles: 8, t: 512, tk: 512, d: 64, causal: false, bias: true };
-    let plain = config::Attention { bias: false, ..biased };
-    let cost = |a: &config::Attention, c: &FaCfg| a.admit(&planner, c).expect("admitted").0;
+    let biased = config::AttentionProblem { tiles: 8, t: 512, tk: 512, d: 64, causal: false, bias: true };
+    let plain = config::AttentionProblem { bias: false, ..biased };
+    let cost = |a: &config::AttentionProblem, c: &FaCfg| a.admit(&planner, c).expect("admitted").0;
     assert!(ranked.iter().all(|c| cost(&biased, c) > cost(&plain, c)), "{ranked:?}");
 }
 
@@ -1038,7 +1038,7 @@ fn a_planner_over_a_zero_field_still_ranks() {
     let measured = crate::probe::Measured { costs: Costs { step: 0.0, ..costs() }, unmeasured: vec!["step"] };
     let planner = Planner::measured(sm86(), measured).expect("an SM count");
     assert_eq!(planner.unmeasured, ["step"]);
-    let p = config::Problem { batches: 1, m: 704, n: 1536, k: 512, halves: 1 };
+    let p = config::GemmProblem { batches: 1, m: 704, n: 1536, k: 512, halves: 1 };
     let ranked = p.ranked(&planner);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| p.admit(&planner, c).is_ok_and(|(cost, _)| cost.is_finite() && cost > 0.0)));
@@ -1050,11 +1050,11 @@ fn a_planner_over_a_zero_field_still_ranks() {
 #[test]
 fn a_ranking_at_zero_costs_is_finite() {
     let planner = planned(Device { target: sm86(), costs: Costs::default() });
-    let p = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
+    let p = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     let ranked = p.ranked(&planner);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| p.admit(&planner, c).is_ok_and(|(cost, _)| cost == 0.0)));
-    let a = config::Attention { tiles: 8, t: 100, tk: 100, d: 64, causal: true, bias: false };
+    let a = config::AttentionProblem { tiles: 8, t: 100, tk: 100, d: 64, causal: true, bias: false };
     let ranked = a.ranked(&planner);
     assert!(!ranked.is_empty());
     assert!(ranked.iter().all(|c| a.admit(&planner, c).is_ok_and(|(cost, _)| cost == 0.0)));
@@ -1513,9 +1513,9 @@ fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, shari
 #[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40); "gfx1151")]
 fn a_long_list_is_queued_or_listed_from_a_matrix(target: Target) {
     use crate::kernels::nearest::{Floors, Metric, NearestCfg, SelectCfg};
-    use crate::ops::config::{Nearest, REGISTER_K, Rejected};
+    use crate::ops::config::{NearestProblem, REGISTER_K, Rejected};
     let planner = planner(target.clone());
-    let p = |k| Nearest {
+    let p = |k| NearestProblem {
         dtype: svod_dtype::ScalarDType::Float16,
         n: 1 << 15,
         m: 1 << 15,
@@ -1588,10 +1588,10 @@ fn deep_rows_stream(target: Target, held: usize) {
 #[test_case(gfx1201(); "gfx1201")]
 fn a_streamed_tile_pays_its_rows_again(target: Target) {
     use crate::kernels::nearest::{Floors, Metric, NearestCfg};
-    use crate::ops::config::{Nearest, Rejected};
+    use crate::ops::config::{NearestProblem, Rejected};
     let planner = planner(target);
     let (resident, streamed) = (NearestCfg::new(64, 64, 2), NearestCfg::streamed(64, 64, 32, 2));
-    let p = |d| Nearest {
+    let p = |d| NearestProblem {
         dtype: svod_dtype::ScalarDType::Float16,
         n: 1 << 16,
         m: 1 << 16,
@@ -1661,11 +1661,11 @@ fn a_list_plans_by_its_bound(k: usize, registers: bool, long: bool) {
 #[test_case(gfx1201(); "gfx1201")]
 fn the_nearest_cost_charges_every_pair(target: Target) {
     use crate::kernels::nearest::{Floors, Metric, NearestCfg};
-    use crate::ops::config::Nearest;
+    use crate::ops::config::NearestProblem;
     let planner = planner(target.clone());
     let cfg = NearestCfg::new(64, 64, 2);
     let cost = |d, metric, floors, groups| {
-        let p = Nearest {
+        let p = NearestProblem {
             n: 1 << 16,
             m: 1 << 16,
             d,
@@ -1712,7 +1712,8 @@ fn extents_take_a_bound_leading_variable_only() {
     let (e, v) = extent(&t.shape().unwrap()).expect("a bound batch");
     assert_eq!(e, Extent { dims: vec![6, 3, 5], var: true });
     let v = v.unwrap();
-    assert_eq!((v.name.as_str(), v.min, v.max, v.dim), ("b", 1, 6, bound.as_sint()));
+    assert_eq!(v, bound.as_sint());
+    assert_eq!(shape::bound_var(&v), Some(crate::ir::Var { name: "b".into(), min: 1, max: 6 }));
 
     let (e, v) = extent(&Tensor::empty(&[6, 3], BF16).shape().unwrap()).unwrap();
     assert_eq!((e, v.is_none()), (Extent { dims: vec![6, 3], var: false }, true));
@@ -2019,7 +2020,7 @@ fn an_8_bit_search_is_priced_at_its_step(target: Target, costs: Costs, low: f64,
     use svod_dtype::ScalarDType;
     let planner = planned(Device { target, costs });
     let best = |dtype| {
-        let p = config::Nearest { dtype, ..self_join(16384, 16384, 768, Metric::NegDot, 1) };
+        let p = config::NearestProblem { dtype, ..self_join(16384, 16384, 768, Metric::NegDot, 1) };
         let ranked = planner.nearest_ranked(p);
         p.admit(&planner, &ranked[0]).expect("ranked").0
     };

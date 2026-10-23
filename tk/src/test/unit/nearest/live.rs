@@ -151,7 +151,8 @@ impl Case {
                         let mut out = exec(nearest_select(&spec), &listing, params, &vars);
                         lists = out.split_off(out.len() - 2);
                         if shares > 1 {
-                            let merge = MergeSpec { n: rows, splits: shares, metric, k: kmax, live: live.clone() };
+                            let merge =
+                                NearestMergeSpec { n: rows, splits: shares, metric, k: kmax, live: live.clone() };
                             let params = [lists, vec![vec![0.0; rows * kmax]; 2]].concat();
                             let mut out = exec(nearest_merge(&merge), &merge.lowering(device), params, &vars);
                             lists = out.split_off(out.len() - 2);
@@ -170,7 +171,7 @@ impl Case {
                 if cfg.splits == 1 {
                     (score, index)
                 } else {
-                    let merge = MergeSpec { live: live.clone(), ..self.merge(cfg.splits, kmax) };
+                    let merge = NearestMergeSpec { live: live.clone(), ..self.merge(cfg.splits, kmax) };
                     let params = vec![score, index, vec![0.0; self.n * kmax], vec![0.0; self.n * kmax]];
                     let mut out = exec(nearest_merge(&merge), &merge.lowering(device), params, &vars);
                     let index = out.pop().unwrap();

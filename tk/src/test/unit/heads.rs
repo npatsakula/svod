@@ -105,7 +105,7 @@ fn reference(s: &HeadsSpec, p: &[Vec<f64>]) -> [Vec<f64>; 3] {
 
 const STATIC: Batch = Batch::Static(2);
 fn var() -> Batch {
-    Batch::Var { name: "b".into(), min: 1, max: 2 }
+    Batch::var("b", 1, 2)
 }
 
 #[test_case(spec(STATIC, 9, [4, 2, 64], [true, true], Some(false)); "normed and rotated, shared tables")]

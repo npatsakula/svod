@@ -18,18 +18,18 @@ use svod_ir::{Op, UOp, ops};
 use crate::atoms::{Core, Costs, Device, Target};
 use crate::build::{BF16, F16, I8};
 use crate::ir::{Program, Var};
-use crate::kernels::attention::{AttnMask, AttnSpec, Bias, Cache, Chunk, CombineSpec, FaCfg, attention, combine};
+use crate::kernels::attention::{AttnMask, AttnSpec, Bias, CacheLayout, Chunk, CombineSpec, FaCfg, attention, combine};
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::heads::{HeadsSpec, Rope, heads};
 use crate::kernels::nearest::{
-    Floors, Live, MergeSpec, Metric, NearestCfg, NearestSpec, RescoreSpec, SelectCfg, SelectSpec, nearest,
+    Floors, Live, Metric, NearestCfg, NearestMergeSpec, NearestSpec, RescoreSpec, SelectCfg, SelectSpec, nearest,
     nearest_merge, nearest_rescore, nearest_select,
 };
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
 use crate::lower::{Lowering, lower};
-use crate::ops::config::{self, Nearest, Planner};
+use crate::ops::config::{self, NearestProblem, Planner};
 
 /// Costs a test declares where it needs a ranking or an orientation: the
 /// guessed sm_86-class fixture, the warpgroup step free.
@@ -106,7 +106,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
 
     // The planner's lead for the shape; a head size it plans no kernel for
     // has no family.
-    let fa = |t, tk, d, mask: AttnMask, cache: Option<Cache>, batch| {
+    let fa = |t, tk, d, mask: AttnMask, cache: Option<CacheLayout>, batch| {
         let cfg = *planner.attention_ranked(8, t, tk, d, mask.causal, mask.bias.is_some()).first()?;
         let splits = if cache.is_some() { 2 } else { 1 };
         let cfg = crate::kernels::attention::FaCfg { splits, ..cfg };
@@ -122,16 +122,16 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         }
     }
     let masked = AttnMask { key_lens: true, key_mask: true, ..AttnMask::default() };
-    let spec = fa(37, 75, 64, masked, None, Batch::Var { name: "b".into(), min: 1, max: 2 }).expect("d 64 plans");
+    let spec = fa(37, 75, 64, masked, None, Batch::var("b", 1, 2)).expect("d 64 plans");
     push("attention d64 key masks", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
     // The bias streams through its own ring slot; its 75 keys end inside a
     // key block, so the ring's fill meets the column bound.
     let biased = AttnMask { key_lens: true, bias: Some(Bias::PerBatch), ..AttnMask::default() };
     let spec = fa(37, 75, 64, biased, None, Batch::Static(2)).expect("d 64 plans with a bias");
     push("attention d64 bias", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
-    let cache = Cache { rows: 6, heads_total: 6, row_map: true, appended: 1, app_lens: false };
+    let cache = CacheLayout { rows: 6, heads_total: 6, row_map: true, appended: 1, app_lens: false };
     let lens = AttnMask { key_lens: true, ..AttnMask::default() };
-    let spec = fa(1, 150, 64, lens, Some(cache), Batch::Var { name: "b".into(), min: 1, max: 3 }).expect("d 64 plans");
+    let spec = fa(1, 150, 64, lens, Some(cache), Batch::var("b", 1, 3)).expect("d 64 plans");
     push("attention d64 cache", attention::<F16>(&spec), spec.cfg.lowering(&planner.device));
     let cfg = crate::kernels::attention::FaCfg {
         key_warps: 4,
@@ -191,7 +191,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         ("nearest 256 queued streamed neg dot", 256, Metric::NegDot, Floors::default(), false, 256),
         ("nearest 48 registers l2 floors", 64, Metric::L2, both, false, 48),
     ] {
-        let p = Nearest { n: 1 << 16, m: 1 << 16, d, dtype: ScalarDType::Float16, metric, floors, groups, k };
+        let p = NearestProblem { n: 1 << 16, m: 1 << 16, d, dtype: ScalarDType::Float16, metric, floors, groups, k };
         // A named way's first config, else the ranking's first.
         let way = |c: &&NearestCfg| match name {
             _ if name.contains("queued") => c.queue.is_some(),
@@ -216,7 +216,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     {
         let d = planner.nearest_depth(d, ScalarDType::Int8).expect("an 8-bit core");
         let dtype = ScalarDType::Int8;
-        let p = Nearest { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors, groups, k };
+        let p = NearestProblem { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors, groups, k };
         let way = |c: &&NearestCfg| !name.contains("queued") || c.queue.is_some();
         let streamed = |c: &&NearestCfg| name.contains("streamed") == c.bk.is_some();
         let ranked = planner.nearest_ranked(p);
@@ -252,7 +252,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
         let (metric, floors, live) = (Metric::L2, Floors::default(), Live::default());
         let spec = NearestSpec { n: 100, m: 90, d: 64, metric, floors, groups: true, k, cfg, live };
         push(&format!("nearest{name} split"), nearest::<BF16>(&spec), cfg.lowering(&planner.device));
-        let merge = MergeSpec { n: 300, splits: 3, metric: Metric::L2, k, live: Live::default() };
+        let merge = NearestMergeSpec { n: 300, splits: 3, metric: Metric::L2, k, live: Live::default() };
         push(&format!("nearest{name} merge"), nearest_merge(&merge), merge.lowering(&planner.device));
     }
 
@@ -286,7 +286,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     let var = |name: &str, max: i64| Var { name: name.into(), min: 1, max };
     let live = |from: usize, k: i64| Live { rows: Some((var("n", 100), from)), k: Some(var("k", k)) };
     for (name, d, k, queued) in [("nearest live 16", 64, 16, false), ("nearest live queued 256", 256, 256, true)] {
-        let p = Nearest {
+        let p = NearestProblem {
             n: 1 << 16,
             m: 1 << 16,
             d,
@@ -306,7 +306,7 @@ pub(crate) fn families(target: &Target) -> Vec<Launch> {
     let (metric, floors) = (Metric::NegDot, Floors::default());
     let spec = NearestSpec { n: 100, m: 90, d: 64, metric, floors, groups: false, k: 8, cfg, live: live(0, 8) };
     push("nearest live split", nearest::<BF16>(&spec), cfg.lowering(&planner.device));
-    let merge = MergeSpec { n: 100, splits: 3, metric, k: 8, live: live(0, 8) };
+    let merge = NearestMergeSpec { n: 100, splits: 3, metric, k: 8, live: live(0, 8) };
     push("nearest live merge", nearest_merge(&merge), merge.lowering(&planner.device));
     let cfg = NearestCfg { select: Some(select), ..NearestCfg::new(64, 32, 2) };
     let (metric, live) = (Metric::L2, live(30, 100));
@@ -468,8 +468,8 @@ pub fn targets() -> Vec<(&'static str, Target)> {
 /// over a cache with and without a row map and appended rows. Each is
 /// `(name, t, tk, d, mask, cache, batch)`.
 #[allow(clippy::type_complexity)]
-fn attention_variants() -> Vec<(String, usize, usize, usize, AttnMask, Option<Cache>, Batch)> {
-    let var = |max| Batch::Var { name: "b".into(), min: 1, max };
+fn attention_variants() -> Vec<(String, usize, usize, usize, AttnMask, Option<CacheLayout>, Batch)> {
+    let var = |max| Batch::var("b", 1, max);
     let m = AttnMask::default();
     let lens = AttnMask { key_lens: true, ..m };
     let chunk = AttnMask { chunk: Some(Chunk { size: 32, left: Some(1), right: 0 }), ..lens };
@@ -486,7 +486,7 @@ fn attention_variants() -> Vec<(String, usize, usize, usize, AttnMask, Option<Ca
     ];
     for row_map in [false, true] {
         for (appended, app_lens) in [(0, false), (4, true)] {
-            let cache = Cache { rows: 6, heads_total: 6, row_map, appended, app_lens };
+            let cache = CacheLayout { rows: 6, heads_total: 6, row_map, appended, app_lens };
             let tag = format!("rm{}_app{appended}", row_map as u8);
             cases.push((format!("decode_{tag}"), 1, 150, 64, lens, Some(cache), var(3)));
             cases.push((format!("prefill_{tag}"), 8, 150, 64, lens, Some(cache), var(3)));
@@ -667,7 +667,7 @@ pub fn rankings(target: &Target) -> String {
     }
     let self_join = |d, metric, k| {
         let dtype = ScalarDType::Float16;
-        Nearest { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors: Floors::default(), groups: false, k }
+        NearestProblem { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors: Floors::default(), groups: false, k }
     };
     for d in [16, 64, 256, 512, 1024] {
         for metric in [Metric::SquaredL2, Metric::NegDot] {

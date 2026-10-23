@@ -3,7 +3,7 @@
 //! and `K = kh·kw·cin` walked tap-major, one pipeline over every tap.
 
 use super::Batch;
-use super::gemm::{Epilogue, GemmCfg, GemmSpec, MergeSpec, mainloop_gemm, split_merge};
+use super::gemm::{Epilogue, GemmCfg, GemmSpec, SplitMergeSpec, mainloop_gemm, split_merge};
 use crate::atoms::Device;
 use crate::build::*;
 use crate::ir::*;
@@ -81,9 +81,9 @@ impl ConvSpec {
     }
 
     /// The merge of a split convolution.
-    pub fn merge(&self) -> MergeSpec {
+    pub fn merge(&self) -> SplitMergeSpec {
         let gemm = self.gemm();
-        MergeSpec { m: gemm.m, n: gemm.n, split: self.split, epilogue: self.epilogue, tile: MERGE_TILE }
+        SplitMergeSpec { m: gemm.m, n: gemm.n, split: self.split, epilogue: self.epilogue, tile: MERGE_TILE }
     }
 
     /// The programs to launch in order with their lowerings: the convolution,
@@ -110,7 +110,7 @@ pub fn conv<T: Half>(spec: &ConvSpec) -> Program {
     assert!(g.cin.is_multiple_of(bk), "cin is a multiple of bk");
     let images = match spec.batch {
         Batch::Static(n) => n,
-        Batch::Var { .. } => 1,
+        Batch::Var(_) => 1,
     };
     mainloop_gemm::<T, _>("conv", &gemm, images * g.h * g.w * g.cin, spec.split, |_k, x, bb, row0| {
         let base = bb.clone().map_or(Sc::from(0), |b| b * (g.h * g.w * g.cin));

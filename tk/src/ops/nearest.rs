@@ -8,7 +8,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::config::Planner;
-use super::shape::{self, BatchVar, bound_var, extent, shape_of};
+use super::shape::{self, bound_var, extent, shape_of};
 use super::{
     DtypeSnafu, GraphSnafu, LaunchSnafu, NoScoresSnafu, Result, ShapeSnafu, Tuner, UnboundSnafu, fmt_shape, output,
     typed,
@@ -16,7 +16,7 @@ use super::{
 use crate::ir::Var;
 pub use crate::kernels::nearest::Metric;
 use crate::kernels::nearest::{
-    Floors, Live, MergeSpec, NearestCfg, NearestSpec, RescoreSpec, SelectSpec, nearest as kernel, nearest_merge,
+    Floors, Live, NearestCfg, NearestMergeSpec, NearestSpec, RescoreSpec, SelectSpec, nearest as kernel, nearest_merge,
     nearest_rescore, nearest_select, scratch, select_blocks, share_stride,
 };
 use crate::launch;
@@ -235,8 +235,7 @@ fn searched(
     let plan = shape::nearest(Some(planner), &dtypes, x_ext.as_ref(), c_ext.as_ref(), metric, floors, groups, coarse);
     let cfgs = super::kernel(OP, plan)?;
     let ([n, d], m) = (x_ext?.dims[..].try_into().ok()?, c_ext?.dims[0]);
-    let rows = x_var.flatten().map(|v| (Var { name: v.name, min: v.min, max: v.max }, 0));
-    let live = Live { rows, k: None };
+    let live = Live { rows: live_rows(&x_var.flatten()), k: None };
     let d = planner.nearest_depth(d, dtype)?;
     let spec = NearestSpec { n, m, d, metric, floors, groups, k: coarse, cfg: cfgs[0], live };
     let (spec, ns) = timed(TuneStore::global(), planner, DType::Scalar(dtype), &cfgs, spec);
@@ -255,7 +254,7 @@ pub(crate) fn rescored(
     top: usize,
     opts: Nearest,
     k_var: &Option<Var>,
-    x_var: &Option<BatchVar>,
+    x_var: &Option<SInt>,
 ) -> Result<(Tensor, Tensor)> {
     let graph_err = || GraphSnafu { op: OP };
     let (xs, cs, is) = (shape_of(x), shape_of(c), shape_of(index));
@@ -265,9 +264,9 @@ pub(crate) fn rescored(
     else {
         unreachable!("constant candidates and lists")
     };
-    let n = x_var.as_ref().map_or_else(|| xs[0].as_const().expect("constant rows"), |v| v.max as usize);
-    let rows = x_var.as_ref().map(|v| (Var { name: v.name.clone(), min: v.min, max: v.max }, 0));
-    let spec = RescoreSpec { n, m, d, cols, metric: opts.metric, floors: opts.floors(), live: Live { rows, k: None } };
+    let n = x_var.as_ref().unwrap_or(&xs[0]).vmax().expect("bound rows");
+    let live = Live { rows: live_rows(x_var), k: None };
+    let spec = RescoreSpec { n, m, d, cols, metric: opts.metric, floors: opts.floors(), live };
     let f32 = |t: &Tensor| t.cast(DType::Float32);
     let floors = [opts.row_floor.map(f32), opts.col_floor.map(f32)];
     let scores = output(&[n, cols], x_var, DType::Float32).context(graph_err())?;
@@ -287,19 +286,16 @@ pub(crate) fn listed(
     index: &Tensor,
     top: usize,
     k_var: &Option<Var>,
-    x_var: &Option<BatchVar>,
+    x_var: &Option<SInt>,
 ) -> Result<(Tensor, Tensor)> {
     use crate::kernels::nearest::{SelectCfg, select_runs};
     let graph_err = || GraphSnafu { op: OP };
     let shape = shape_of(scores).context(graph_err())?;
-    let (Some(n), Some(cols)) =
-        (x_var.as_ref().map_or(shape[0].as_const(), |v| Some(v.max as usize)), shape[1].as_const())
-    else {
+    let (Some(n), Some(cols)) = (x_var.as_ref().unwrap_or(&shape[0]).vmax(), shape[1].as_const()) else {
         unreachable!("a bound row count and a constant list")
     };
     let cfg = SelectCfg { warps: 4, queue: select_runs(top), filter: false };
-    let rows = x_var.as_ref().map(|v| (Var { name: v.name.clone(), min: v.min, max: v.max }, 0));
-    let live = Live { rows, k: k_var.clone().filter(|_| top > 1) };
+    let live = Live { rows: live_rows(x_var), k: k_var.clone().filter(|_| top > 1) };
     let wide = cfg.wide(planner.device.target.wave);
     let spec =
         SelectSpec { n, cols, k: top, metric: Metric::NegDot, first: true, cfg, live, wide, filter: None, shares: 1 };
@@ -325,10 +321,14 @@ fn list_len(k: &SInt) -> Result<(usize, Option<Var>)> {
         ensure!(k > 0, NoScoresSnafu { op: OP });
         return Ok((k, None));
     }
-    let BatchVar { name, min, max, .. } =
-        bound_var(k).ok_or_else(|| UnboundSnafu { op: OP, got: k.to_string() }.build())?;
-    ensure!(min > 0, NoScoresSnafu { op: OP });
-    Ok((max as usize, Some(Var { name, min, max })))
+    let var = bound_var(k).ok_or_else(|| UnboundSnafu { op: OP, got: k.to_string() }.build())?;
+    ensure!(var.min > 0, NoScoresSnafu { op: OP });
+    Ok((var.max as usize, Some(var)))
+}
+
+/// The rows a launch binds where `x_var` binds them, from row 0.
+fn live_rows(x_var: &Option<SInt>) -> Option<(Var, usize)> {
+    x_var.as_ref().and_then(bound_var).map(|v| (v, 0))
 }
 
 /// What 8-bit rows score with: each row's scale (`[N]`, `[M]` f32), and
@@ -415,10 +415,7 @@ pub(crate) fn picked(
     let f32 = |t: &Tensor| t.cast(DType::Float32);
     let (row_floor, col_floor) = (opts.row_floor.map(f32), opts.col_floor.map(f32));
     let (row_group, col_group) = opts.groups.map(|(r, c)| (r.cast(DType::Int32), c.cast(DType::Int32))).unzip();
-    let live = Live {
-        rows: x_var.as_ref().map(|v| (Var { name: v.name.clone(), min: v.min, max: v.max }, 0)),
-        k: k_var.clone().filter(|_| top > 1),
-    };
+    let live = Live { rows: live_rows(&x_var), k: k_var.clone().filter(|_| top > 1) };
     let spec = NearestSpec { n, m, d: depth, metric, floors, groups, k: top, cfg: cfgs[0], live };
     let spec = pick(&planner, &cfgs, spec);
     let rows_in = [Some(&xp), x_scale.as_ref(), x_sq.as_ref(), row_floor.as_ref(), row_group.as_ref()];
@@ -463,8 +460,8 @@ pub(crate) fn picked(
 }
 
 /// The merge of a split `spec`'s shares.
-fn merge_of(spec: &NearestSpec) -> MergeSpec {
-    MergeSpec { n: spec.n, splits: spec.cfg.splits, metric: spec.metric, k: spec.k, live: spec.live.clone() }
+fn merge_of(spec: &NearestSpec) -> NearestMergeSpec {
+    NearestMergeSpec { n: spec.n, splits: spec.cfg.splits, metric: spec.metric, k: spec.k, live: spec.live.clone() }
 }
 
 /// One block of a score matrix's launches ([`launches`]).
@@ -544,7 +541,7 @@ fn matrix(
     spec: &NearestSpec,
     rows: [Option<&Tensor>; 5],
     cols: [Option<&Tensor>; 5],
-    var: &Option<BatchVar>,
+    var: &Option<SInt>,
 ) -> Result<(Tensor, Tensor)> {
     let NearestSpec { n, m, k, cfg, .. } = *spec;
     let select = cfg.select.expect("a score matrix");
@@ -626,7 +623,7 @@ fn matrix(
         let mut outs = launch::graph_launch_all(nearest_select(&b), &listing, &ins).context(LaunchSnafu { op: OP })?;
         let mut parts = outs.split_off(outs.len() - 2);
         if b.shares > 1 {
-            let merge = MergeSpec { n: nr, splits: b.shares, metric: b.metric, k, live: b.live.clone() };
+            let merge = NearestMergeSpec { n: nr, splits: b.shares, metric: b.metric, k, live: b.live.clone() };
             let merged = lists_out()?;
             let ins: Vec<&Tensor> = parts.iter().chain(&merged).collect();
             let mut outs = launch::graph_launch_all(nearest_merge(&merge), &merge.lowering(&planner.device), &ins)
@@ -641,9 +638,7 @@ fn matrix(
             _ => Tensor::cat(&lists.iter().map(|l| &l[j]).collect::<Vec<_>>(), 0).context(graph_err())?,
         };
         match var {
-            Some(v) if lists.len() > 1 => {
-                t.try_shrink([Some((SInt::Const(0), v.dim.clone())), None]).context(graph_err())
-            }
+            Some(v) if lists.len() > 1 => t.try_shrink([Some((SInt::Const(0), v.clone())), None]).context(graph_err()),
             _ => Ok(t),
         }
     };
@@ -709,7 +704,7 @@ pub(crate) fn programs(planner: &Planner, dtype: DType, spec: &NearestSpec) -> c
             let scores = (typed!(dtype.clone(), kernel, &scores, int8), spec.cfg.lowering(&planner.device));
             let bound = bound.map(|b| (nearest_select(&b), listing.clone()));
             let merge = (list.shares > 1).then(|| {
-                let merge = MergeSpec {
+                let merge = NearestMergeSpec {
                     n: list.n,
                     splits: list.shares,
                     metric: list.metric,
@@ -731,9 +726,9 @@ pub(crate) fn programs(planner: &Planner, dtype: DType, spec: &NearestSpec) -> c
 }
 
 /// The planner's problem of `spec`.
-pub(crate) fn problem(spec: &NearestSpec, dtype: ScalarDType) -> crate::ops::config::Nearest {
+pub(crate) fn problem(spec: &NearestSpec, dtype: ScalarDType) -> crate::ops::config::NearestProblem {
     let NearestSpec { n, m, d, metric, floors, groups, k, .. } = *spec;
-    crate::ops::config::Nearest { n, m, d, dtype, metric, floors, groups, k }
+    crate::ops::config::NearestProblem { n, m, d, dtype, metric, floors, groups, k }
 }
 
 /// The scores of every pair in f32 (L2 compared squared against its floors

@@ -36,7 +36,7 @@ pub use crate::kernels::Act;
 use crate::kernels::Batch;
 use crate::tune::{self, Bench, Pass, TuneKey, TuneStore};
 use config::Planner;
-use shape::{BatchVar, Plan};
+use shape::Plan;
 
 /// The salt of the tunings the device tests and GEMM probes run, keyed by
 /// the kernel's name (`gemm`) rather than an op's: [`tuned::gemm_probe`]
@@ -327,20 +327,21 @@ fn fmt_shape(shape: &[SInt]) -> String {
     format!("[{}]", dims.join(", "))
 }
 
-/// The kernel batch axis of an operand whose leading dims hold `lead` rows.
-fn batch_of(var: &Option<BatchVar>, static_batches: usize) -> Batch {
-    match var {
-        Some(v) => Batch::Var { name: v.name.clone(), min: v.min, max: v.max },
+/// The kernel batch axis of an operand whose leading dim is `var` where a
+/// variable binds it.
+fn batch_of(var: &Option<SInt>, static_batches: usize) -> Batch {
+    match var.as_ref().and_then(shape::bound_var) {
+        Some(v) => Batch::Var(v),
         None => Batch::Static(static_batches),
     }
 }
 
 /// A kernel output: allocated at capacity, shaped with the live batch in dim 0
 /// so a consumer kernel binds the realized buffer itself rather than a copy.
-fn output(dims: &[usize], var: &Option<BatchVar>, dtype: DType) -> svod_tensor::error::Result<Tensor> {
+fn output(dims: &[usize], var: &Option<SInt>, dtype: DType) -> svod_tensor::error::Result<Tensor> {
     let mut shape: Vec<SInt> = dims.iter().map(|&d| SInt::Const(d)).collect();
     if let Some(var) = var {
-        shape[0] = var.dim.clone();
+        shape[0] = var.clone();
     }
     kernel_buffer(&shape, dtype)
 }

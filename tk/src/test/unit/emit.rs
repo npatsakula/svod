@@ -334,7 +334,7 @@ fn the_segment_bounds_are_read_ahead_of_the_key_loop(group: bool) {
         (crate::atoms::sm86(), FaCfg::new(64, 64, 3))
     };
     let spec = AttnSpec {
-        batch: Batch::Var { name: "b".into(), min: 1, max: 4 },
+        batch: Batch::var("b", 1, 4),
         t: 100,
         tk: 100,
         heads: 4,

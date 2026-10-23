@@ -12,7 +12,7 @@ use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::attention::{
-    AttnMask, AttnSpec, Bias, Cache, Chunk, CombineSpec, FaCfg, Forms, Invalid, WARP_ROWS, attention, combine,
+    AttnMask, AttnSpec, Bias, CacheLayout, Chunk, CombineSpec, FaCfg, Forms, Invalid, WARP_ROWS, attention, combine,
     key_mask_stride,
 };
 use crate::kernels::rows::NormCfg;
@@ -98,8 +98,13 @@ fn case(spec: AttnSpec, lens: &[i64]) -> Case {
 fn reference(c: &Case) -> Vec<f64> {
     let s = &c.spec;
     let m = s.mask;
-    let cache =
-        s.cache.unwrap_or(Cache { rows: 0, heads_total: s.kv_heads, row_map: false, appended: 0, app_lens: false });
+    let cache = s.cache.unwrap_or(CacheLayout {
+        rows: 0,
+        heads_total: s.kv_heads,
+        row_map: false,
+        appended: 0,
+        app_lens: false,
+    });
     let head_start = if s.cache.is_some() { c.head_start as usize } else { 0 };
     let (stride, kv_stride, group) = (s.heads * s.d, cache.heads_total * s.d, s.heads / s.kv_heads);
     let mut out = vec![0.0; s.batch.capacity() * s.t * stride];
@@ -228,7 +233,7 @@ fn spec(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, causal: bool, key_
 
 fn masked(t: usize, tk: usize, d: usize, bq: usize, bkv: usize, mask: AttnMask) -> AttnSpec {
     AttnSpec {
-        batch: Batch::Var { name: "b".into(), min: 1, max: 2 },
+        batch: Batch::var("b", 1, 2),
         t,
         tk,
         heads: 2,
@@ -443,7 +448,7 @@ fn cached(
     let mut spec = masked(t, tk, d, 64, 32, AttnMask { key_lens: true, ..AttnMask::default() });
     spec.heads = heads;
     spec.kv_heads = kv_heads;
-    let cache = Cache { rows: 3, heads_total: 3 * kv_heads, row_map, appended, app_lens: false };
+    let cache = CacheLayout { rows: 3, heads_total: 3 * kv_heads, row_map, appended, app_lens: false };
     spec.cache = Some(cache);
     spec.cfg.splits = splits;
     spec
@@ -451,7 +456,7 @@ fn cached(
 
 /// `spec` with the visible appended rows counted per batch.
 fn counted(mut spec: AttnSpec) -> AttnSpec {
-    spec.cache = spec.cache.map(|c| Cache { app_lens: true, ..c });
+    spec.cache = spec.cache.map(|c| CacheLayout { app_lens: true, ..c });
     spec
 }
 

@@ -12,6 +12,7 @@ use super::{
     DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
     output, typed,
 };
+use crate::ir::Var;
 use crate::kernels;
 use crate::kernels::Batch;
 pub use crate::kernels::attention::Chunk;
@@ -185,7 +186,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let ([b, t, heads, d], [kv_rows, tk, heads_total, _]) = (dims4(&q_ext.dims), dims4(&k_ext.dims));
     let batch = batch_of(&var, b);
     let kv_heads = opts.cache.map_or(heads_total, |c| c.kv_heads);
-    let cache = opts.cache.map(|c| kernels::attention::Cache {
+    let cache = opts.cache.map(|c| kernels::attention::CacheLayout {
         rows: kv_rows,
         heads_total,
         row_map: c.row_map.is_some(),
@@ -309,8 +310,8 @@ pub fn tuned(
     let measured_mask = AttnMask { bias: bias_rows, ..edges };
     let measured = match &spec.batch {
         Batch::Static(n) if *n > TUNE_BATCH => Batch::Static(TUNE_BATCH),
-        Batch::Var { name, min, max } if *max > TUNE_BATCH as i64 => {
-            Batch::Var { name: name.clone(), min: (*min).min(TUNE_BATCH as i64), max: TUNE_BATCH as i64 }
+        Batch::Var(v) if v.max > TUNE_BATCH as i64 => {
+            Batch::Var(Var { min: v.min.min(TUNE_BATCH as i64), max: TUNE_BATCH as i64, ..v.clone() })
         }
         other => other.clone(),
     };
@@ -323,7 +324,7 @@ pub fn tuned(
     let salt = (&measured, measured_mask, cache.map(|c| c.heads_total), rows, mapped, splits);
     let build = |cfg: FaCfg| {
         // Scratch caches hold no appended rows and no garbage: a zero map.
-        let plain = cache.map(|c| kernels::attention::Cache {
+        let plain = cache.map(|c| kernels::attention::CacheLayout {
             rows: rows.expect("a cache"),
             row_map: mapped,
             appended: 0,

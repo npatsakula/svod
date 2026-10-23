@@ -1720,7 +1720,7 @@ fn finished(k: &mut Kernel, best: Regs<F32>, metric: Metric) -> Regs<F32> {
 /// The partial results of [`nearest`] split `splits` ways over `n` rows,
 /// folded under `metric`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MergeSpec {
+pub struct NearestMergeSpec {
     pub n: usize,
     pub splits: usize,
     pub metric: Metric,
@@ -1736,7 +1736,7 @@ const MERGE_ROWS: usize = 256;
 /// Rows a merge block of lists folds, a warp each.
 pub const LIST_WARPS: u32 = 4;
 
-impl MergeSpec {
+impl NearestMergeSpec {
     pub fn lowering(&self, device: &Device) -> Lowering {
         let rows = if self.k > 1 { LIST_WARPS } else { 1 };
         Lowering::uniform(device, false, WarpGrid { rows, cols: 1 })
@@ -1759,11 +1759,11 @@ impl MergeSpec {
 /// merges each share's list into it by the lower half of a bitonic merge:
 /// the share's runs reversed against the list's, the earlier of each pair
 /// kept, then the list's bitonic order.
-pub fn nearest_merge(spec: &MergeSpec) -> Program {
+pub fn nearest_merge(spec: &NearestMergeSpec) -> Program {
     if spec.k > 1 {
         return merge_lists(spec);
     }
-    let MergeSpec { n, splits, metric, ref live, .. } = *spec;
+    let NearestMergeSpec { n, splits, metric, ref live, .. } = *spec;
     let mut k = Kernel::new("nearest_merge");
     let stride = share_stride(n);
     let score_part = k.param::<F32>("score_part", ParamKind::In, splits * stride);
@@ -1803,8 +1803,8 @@ pub fn nearest_merge(spec: &MergeSpec) -> Program {
 }
 
 /// [`nearest_merge`] of `k > 1` scores a row.
-fn merge_lists(spec: &MergeSpec) -> Program {
-    let MergeSpec { n, splits, metric, k: top, ref live } = *spec;
+fn merge_lists(spec: &NearestMergeSpec) -> Program {
+    let NearestMergeSpec { n, splits, metric, k: top, ref live } = *spec;
     let (rows, runs) = (LIST_WARPS as usize, select_runs(top));
     let mut k = Kernel::new("nearest_merge");
     let stride = share_stride(n);

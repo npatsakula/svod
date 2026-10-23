@@ -8,7 +8,7 @@ Every kernel in `svod_tk::kernels` is a function `fn k<T: Elem>(spec: &Spec) -> 
 generic over the 16-bit element type (`BF16` or `F16`); `gemm` and `nearest` also take 8-bit
 integers (`I8`, accumulated exactly in i32: `gemm` stores f32, `nearest` scales each row's
 products by the rows' `x_scale` and `c_scale`). Each spec has a `batch: Batch`:
-`Batch::Static(n)` launches `n` batches, and `Batch::Var { name, min, max }` launches the live
+`Batch::Static(n)` launches `n` batches, and `Batch::var(name, min, max)` (an `ir::Var`) launches the live
 count of a runtime variable bound by name, with buffers sized for `max`. Each config type has a
 `lowering(&device)` (an `atoms::Device`: the target and its costs). Models reach these kernels
 through the [op layer](./op-layer), which picks the config.

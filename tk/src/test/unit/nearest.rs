@@ -14,8 +14,8 @@ use crate::build::{BF16, F16, I8};
 use crate::interp::{round_to, run};
 use crate::ir::Orient;
 use crate::kernels::nearest::{
-    Floors, Invalid, LaneQueue, MergeSpec, Metric, NearestCfg, NearestSpec, SCRATCH, SelectCfg, SelectSpec, nearest,
-    nearest_merge, nearest_select, share_stride,
+    Floors, Invalid, LaneQueue, Metric, NearestCfg, NearestMergeSpec, NearestSpec, SCRATCH, SelectCfg, SelectSpec,
+    nearest, nearest_merge, nearest_select, share_stride,
 };
 use crate::ops::config::{self, Planner};
 use crate::ops::{self as tk, Nearest};
@@ -117,9 +117,9 @@ impl Case {
     }
 
     /// The planner's problem of the case at `depth`, keeping `k` scores a row.
-    fn problem(&self, depth: usize, k: usize) -> config::Nearest {
+    fn problem(&self, depth: usize, k: usize) -> config::NearestProblem {
         let (n, m, metric, floors, groups) = (self.n, self.m, self.metric, self.floors(), self.groups.is_some());
-        config::Nearest { n, m, d: depth, dtype: svod_dtype::ScalarDType::Float16, metric, floors, groups, k }
+        config::NearestProblem { n, m, d: depth, dtype: svod_dtype::ScalarDType::Float16, metric, floors, groups, k }
     }
 
     fn row(v: &[f64], d: usize, i: usize) -> &[f64] {
@@ -231,8 +231,8 @@ impl Case {
         if self.f16 { nearest::<F16>(&spec) } else { nearest::<BF16>(&spec) }
     }
 
-    fn merge(&self, splits: usize, k: usize) -> MergeSpec {
-        MergeSpec { n: self.n, splits, metric: self.metric, k, live: Default::default() }
+    fn merge(&self, splits: usize, k: usize) -> NearestMergeSpec {
+        NearestMergeSpec { n: self.n, splits, metric: self.metric, k, live: Default::default() }
     }
 
     /// The scores and indices the interpreter computes under `cfg`, split,
@@ -327,7 +327,8 @@ impl Case {
                 let mut out = run(nearest_select(&spec), &listing, params);
                 lists = out.split_off(out.len() - 2);
                 if shares > 1 {
-                    let merge = MergeSpec { n: rows, splits: shares, metric: self.metric, k, live: Default::default() };
+                    let merge =
+                        NearestMergeSpec { n: rows, splits: shares, metric: self.metric, k, live: Default::default() };
                     let params = [lists, vec![vec![0.0; rows * k]; 2]].concat();
                     let mut out = run(nearest_merge(&merge), &merge.lowering(device), params);
                     lists = out.split_off(out.len() - 2);
@@ -470,7 +471,7 @@ pub(super) fn plain(n: usize, m: usize, d: usize, metric: Metric, k: usize, cfg:
 }
 
 /// The interpreter's merge of a split kernel's shares.
-fn merged(spec: &MergeSpec, score: Vec<f64>, index: Vec<f64>) -> (Vec<f64>, Vec<f64>) {
+fn merged(spec: &NearestMergeSpec, score: Vec<f64>, index: Vec<f64>) -> (Vec<f64>, Vec<f64>) {
     let rows = spec.n * spec.k;
     let params = vec![score, index, vec![0.0; rows], vec![0.0; rows]];
     let mut out = run(&nearest_merge(spec), params, &[]).unwrap();
@@ -693,7 +694,7 @@ fn the_merge_folds_shares_in_order(metric: Metric) {
         };
         want.push((v, j));
     }
-    let (score, index) = merged(&MergeSpec { n, splits, metric, k: 1, live: Default::default() }, score, index);
+    let (score, index) = merged(&NearestMergeSpec { n, splits, metric, k: 1, live: Default::default() }, score, index);
     for (i, want) in want.into_iter().enumerate() {
         assert_eq!((score[i], index[i]), want, "row {i}");
     }
@@ -848,7 +849,7 @@ fn a_merge_passes_over_slots_past_the_live_length(k: usize, lives: &[usize]) {
         }
     }
     for &live in lives {
-        let spec = MergeSpec {
+        let spec = NearestMergeSpec {
             n,
             splits,
             metric: Metric::NegDot,
@@ -1111,7 +1112,7 @@ fn the_merge_offers_lists_in_order(metric: Metric, k: usize) {
         };
         want.extend(entries[..k].iter().map(|&(v, at)| (finish(v), at)));
     }
-    let (score, index) = merged(&MergeSpec { n, splits, metric, k, live: Default::default() }, score, index);
+    let (score, index) = merged(&NearestMergeSpec { n, splits, metric, k, live: Default::default() }, score, index);
     for (e, want) in want.into_iter().enumerate() {
         assert_eq!((score[e], index[e]), want, "row {} slot {}", e / k, e % k);
     }
@@ -1155,7 +1156,7 @@ fn few_queries_split_their_lists_to_fill_the_gpu(target: Target) {
     let planner = super::planner(target);
     let m = 1 << 20;
     for (n, d, k) in [(256, 128, 16), (256, 768, 64), (1024, 128, 64), (1024, 768, 256), (256, 128, 256)] {
-        let p = config::Nearest { m, ..self_join(n, n, d, Metric::NegDot, k) };
+        let p = config::NearestProblem { m, ..self_join(n, n, d, Metric::NegDot, k) };
         for cfg in first_eight(&planner.nearest_ranked(p)) {
             let split = planner.nearest_split(&p, &cfg);
             eprintln!("n {n} d {d} k {k} {cfg:?}: {split:?}");
@@ -1422,7 +1423,7 @@ fn a_list_is_dealt_in_lane_under_measured_costs(target: Target, costs: crate::at
     let planner = Planner::new(device.clone()).unwrap();
     let (n, m, d, k) = (1 << 14, 1 << 14, 128, 64 + tk::MARGIN);
     for dtype in [ScalarDType::Int8, ScalarDType::Float16] {
-        let p = config::Nearest { dtype, ..self_join(n, m, d, Metric::NegDot, k) };
+        let p = config::NearestProblem { dtype, ..self_join(n, m, d, Metric::NegDot, k) };
         let atom = device.target.geometry_of(dtype).unwrap();
         let ranked = p.ranked(&planner);
         let queued = |bkv| ranked.iter().filter(move |c| c.queue == Some(32) && c.bkv == bkv).take(3).copied();
@@ -1851,12 +1852,12 @@ fn nearest_wide_probe() {
 /// Times the tuner's pick for an `n`-row self-join and every config it
 /// admitted, printing each one's pairs a second and TFLOP/s.
 fn time_nearest(planner: &Planner, n: usize, d: usize, metric: Metric, floors: Floors, groups: bool) {
-    time_list(planner, config::Nearest { floors, groups, ..self_join(n, n, d, metric, 1) }, DType::BFloat16);
+    time_list(planner, config::NearestProblem { floors, groups, ..self_join(n, n, d, metric, 1) }, DType::BFloat16);
 }
 
 /// [`time_nearest`] of the self-join `p` (its `k` scores a row) in `dtype`.
-fn time_list(planner: &Planner, p: config::Nearest, dtype: DType) {
-    let config::Nearest { n, d, metric, floors, groups, k, .. } = p;
+fn time_list(planner: &Planner, p: config::NearestProblem, dtype: DType) {
+    let config::NearestProblem { n, d, metric, floors, groups, k, .. } = p;
     let (admitted, pick) = device_nearest(planner, p, dtype.clone());
     let mut timed = admitted.clone();
     if !timed.contains(&pick) {
@@ -1971,7 +1972,7 @@ fn rerank_probe() {
                 for &k in &ks {
                     let coarse = (k + tk::MARGIN).min(m);
                     let search = |dtype: ScalarDType, k: usize| {
-                        let p = config::Nearest { n, m, d, dtype, metric, floors: NONE, groups: false, k };
+                        let p = config::NearestProblem { n, m, d, dtype, metric, floors: NONE, groups: false, k };
                         if planner.nearest_ranked(p).is_empty() {
                             return (None, None);
                         }
@@ -2130,8 +2131,8 @@ fn time_gemm(planner: &Planner, m: usize, n: usize, k: usize) {
 
 /// The configs the tuner admits for the self-join `p` on the device in
 /// `dtype`, and its pick.
-fn device_nearest(planner: &Planner, p: config::Nearest, dtype: DType) -> (Vec<NearestCfg>, NearestCfg) {
-    let config::Nearest { n, m, d, metric, floors, groups, k, .. } = p;
+fn device_nearest(planner: &Planner, p: config::NearestProblem, dtype: DType) -> (Vec<NearestCfg>, NearestCfg) {
+    let config::NearestProblem { n, m, d, metric, floors, groups, k, .. } = p;
     let ranked = planner.nearest_ranked(p);
     let spec = |cfg| NearestSpec { n, m, d, metric, floors, groups, k, cfg, live: Default::default() };
     let build = |cfg: NearestCfg| tk::nearest::programs(planner, dtype.clone(), &spec(cfg));
@@ -2264,7 +2265,7 @@ fn tuning_probe() {
     use crate::kernels::Batch;
     use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
     use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-    use crate::ops::config::{Attention, Nearest as Problem, Problem as Gemm};
+    use crate::ops::config::{AttentionProblem, GemmProblem, NearestProblem};
     let var = |name| std::env::var(name).ok();
     let list = |name, default: &str| -> Vec<Vec<usize>> {
         let text = var(name).unwrap_or(default.into());
@@ -2314,7 +2315,16 @@ fn tuning_probe() {
     crate::tune::scoped(true, || {
         for (d, k) in depths.iter().flat_map(|&d| ks.iter().map(move |&k| (d, k))) {
             let (n, metric, floors) = (rows, Metric::NegDot, NONE);
-            let p = Problem { n, m: n, d, dtype: svod_dtype::ScalarDType::Float16, metric, floors, groups: false, k };
+            let p = NearestProblem {
+                n,
+                m: n,
+                d,
+                dtype: svod_dtype::ScalarDType::Float16,
+                metric,
+                floors,
+                groups: false,
+                k,
+            };
             let ranked = planner.nearest_ranked(p);
             let spec =
                 |cfg| NearestSpec { n, m: n, d, metric, floors, groups: false, k, cfg, live: Default::default() };
@@ -2340,7 +2350,7 @@ fn tuning_probe() {
                 GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg: super::device::BIG };
             let build =
                 |cfg: GemmCfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
-            let p = Gemm { batches: 1, m, n, k, halves: 1 };
+            let p = GemmProblem { batches: 1, m, n, k, halves: 1 };
             let work = 2.0 * (m * n * k) as f64;
             let key = ("gemm", &[1, m, n, k][..], crate::ops::DEVICE_TEST);
             report(
@@ -2361,7 +2371,7 @@ fn tuning_probe() {
             let build = |cfg: FaCfg| {
                 vec![(attention::<BF16>(&AttnSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))]
             };
-            let p = Attention { tiles: batch * heads, t, tk: t, d, causal: mask.causal, bias: false };
+            let p = AttentionProblem { tiles: batch * heads, t, tk: t, d, causal: mask.causal, bias: false };
             let work = 4.0 * (batch * heads * t * t * d) as f64 / if mask.causal { 2.0 } else { 1.0 };
             let shape = [batch, t, t, heads, d];
             report(

@@ -132,6 +132,14 @@ fn a_gemm_tuning_reads_the_key_the_op_layer_writes(probe: bool) {
     assert_eq!(lookups[0].key, want.candidates(Kind::Admitted));
 }
 
+/// A batch prints as the stored salts hold it: a bound one as it did when
+/// its variable's fields were the variant's.
+#[test]
+fn a_batch_keys_as_it_did() {
+    assert_eq!(format!("{:?}", Batch::var("b", 1, 8)), r#"Var { name: "b", min: 1, max: 8 }"#);
+    assert_eq!(format!("{:?}", Batch::Static(2)), "Static(2)");
+}
+
 /// A store under `dir` holding a 512³ GEMM's admission, of the ranking's
 /// third and second representatives, and their screened choice, the second
 /// at 900 ns and the third at 2000 (outside the contender band); the

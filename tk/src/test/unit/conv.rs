@@ -91,7 +91,7 @@ fn check_interp(g: ConvGeom, batch: Batch, epi: Epilogue, c: GemmCfg) {
     let params = inputs(&g, images, epi, 3);
     let want = reference(&g, images, epi, &params);
     let vars: Vec<(&str, i64)> = match &batch {
-        Batch::Var { name, max, .. } => vec![(name.as_str(), *max)],
+        Batch::Var(v) => vec![(v.name.as_str(), v.max)],
         Batch::Static(_) => vec![],
     };
     let got = run(&prog, params, &vars).unwrap();
@@ -103,7 +103,7 @@ pub(super) const SILU_BIAS: Epilogue = Epilogue { bias: true, act: Act::Silu, ..
 /// A bound batch walks grid z instead of folding into the rows.
 #[test]
 fn a_bound_batch_walks_grid_z() {
-    let batch = Batch::Var { name: "b".into(), min: 1, max: 3 };
+    let batch = Batch::var("b", 1, 3);
     check_interp(geom([6, 5], 16, 32, 3, 2, 1, 1), batch, SILU_BIAS, gemm_cfg([32, 32, 16], 3, [2, 2], true));
 }
 
@@ -424,7 +424,7 @@ fn a_bound_batch_runs_the_live_images_on_the_device() {
     let [ho, wo] = g.out_hw();
     let (cap, live) = (3usize, 2usize);
     let spec = ConvSpec {
-        batch: Batch::Var { name: "b".into(), min: 1, max: cap as i64 },
+        batch: Batch::var("b", 1, cap as i64),
         geom: g,
         epilogue: RESIDUAL_SILU_BIAS,
         cfg: gemm_cfg([64, 64, 32], target.fill.stages(3), [2, 2], true),

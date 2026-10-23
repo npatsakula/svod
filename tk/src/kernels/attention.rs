@@ -253,7 +253,7 @@ pub enum Bias {
 /// `kv_heads` heads from a `[1]` i32 `head_start` parameter on: a layer's
 /// slice is a runtime value, so every layer runs the one program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Cache {
+pub struct CacheLayout {
     pub rows: usize,
     pub heads_total: usize,
     /// A `[batch]` i32 parameter: the cache row each batch reads.
@@ -284,7 +284,7 @@ pub struct AttnSpec {
     pub kv_heads: usize,
     pub d: usize,
     pub mask: AttnMask,
-    pub cache: Option<Cache>,
+    pub cache: Option<CacheLayout>,
     pub scale: f32,
     pub cfg: FaCfg,
 }
@@ -294,7 +294,7 @@ impl AttnSpec {
     pub fn extra_params(&self) -> Vec<&'static str> {
         let AttnMask { key_lens, key_mask, seg_start, .. } = self.mask;
         let cache =
-            self.cache.unwrap_or(Cache { rows: 0, heads_total: 0, row_map: false, appended: 0, app_lens: false });
+            self.cache.unwrap_or(CacheLayout { rows: 0, heads_total: 0, row_map: false, appended: 0, app_lens: false });
         [
             (key_lens, "key_lens"),
             (key_mask, "key_mask"),

@@ -64,7 +64,7 @@ optimization"), `do_linearize` returns before the `SVOD_DUMP_LINEAR` dump (`code
    `None` without an SM count).
 5. **Op layer** (`ops/`): `linear`, `attention`, `heads`, `layer_norm`/`rms_norm`/`add_*`, `conv2d` always return a
    Tensor. `ops/shape.rs` gates kernel vs graph (`Plan::Kernel(ranked)` / `Plan::Graph(Fallback::{Target, Dtype,
-   Symbolic, Shape, Config})`); `ops/config.rs` ranks a lattice (`Problem::admit`, `Attention::admit` →
+   Symbolic, Shape, Config})`); `ops/config.rs` ranks a lattice (`GemmProblem::admit`, `AttentionProblem::admit`, `NearestProblem::admit` →
    `Result<(ns, regs), Rejected>`); `ops::Tuner` admits the shortlist (compiles: the clean tiles, then the spilling
    ones; a program past `Target::most_instructions` is refused by the lowering) and times it once per
    device × shape (`tune.rs`).

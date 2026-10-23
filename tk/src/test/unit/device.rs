@@ -278,7 +278,7 @@ fn gemm_candidates_probe() {
         (704, 512, 2048, Epilogue { residual: true, ..plain }, true),
         (4096, 4096, 4096, plain, false),
     ] {
-        let batch = if var { Batch::Var { name: "b".into(), min: 1, max: 1 } } else { Batch::Static(1) };
+        let batch = if var { Batch::var("b", 1, 1) } else { Batch::Static(1) };
         let (cfgs, pick) = device_gemms(&planner, &GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg: BIG });
         let build = |cfg| {
             let spec = GemmSpec { m, n, k, batch: batch.clone(), epilogue, cfg };

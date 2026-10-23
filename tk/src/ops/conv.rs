@@ -173,7 +173,7 @@ pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[ConvC
         g.dilation[0],
         g.dilation[1],
     ];
-    let bound = matches!(spec.batch, Batch::Var { .. });
+    let bound = matches!(spec.batch, Batch::Var(_));
     let (batches, m) = shape::conv_grid(&shape::Extent { dims: vec![images], var: bound }, &g);
     let expand = |admitted: &[ConvCfg]| {
         let mut list = planner.conv_splits(batches, m, &g, admitted);

@@ -309,7 +309,7 @@ fn finish<T: Elem, U: Elem>(
 /// The second program of a split reduction: `c = epilogue(Σ_z partial[z])`
 /// over `partial [split, m, n]` f32, `bm × bn` tiles per block.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MergeSpec {
+pub struct SplitMergeSpec {
     pub m: usize,
     pub n: usize,
     pub split: usize,
@@ -318,7 +318,7 @@ pub struct MergeSpec {
     pub tile: [usize; 2],
 }
 
-impl MergeSpec {
+impl SplitMergeSpec {
     pub fn lowering(&self, device: &Device) -> Lowering {
         GemmCfg {
             tile: [self.tile[0], self.tile[1], 16],
@@ -334,12 +334,12 @@ impl MergeSpec {
 
 /// Parameters in order: `partial [split, m, n]` f32, `bias [n]` if any,
 /// `residual [m, n]` if any, `c [m, n]` (f32 when `out_f32`).
-pub fn split_merge<T: Elem>(spec: &MergeSpec) -> Program {
+pub fn split_merge<T: Elem>(spec: &SplitMergeSpec) -> Program {
     if spec.epilogue.out_f32 { merge::<T, F32>(spec) } else { merge::<T, T>(spec) }
 }
 
-fn merge<T: Elem, U: Elem>(spec: &MergeSpec) -> Program {
-    let MergeSpec { m, n, split, epilogue: epi, tile: [bm, bn] } = *spec;
+fn merge<T: Elem, U: Elem>(spec: &SplitMergeSpec) -> Program {
+    let SplitMergeSpec { m, n, split, epilogue: epi, tile: [bm, bn] } = *spec;
     assert!(!epi.gated, "a gated weight is not split");
     let mut k = Kernel::new("split_merge");
     let partial = k.param::<F32>("partial", ParamKind::In, split * m * n);

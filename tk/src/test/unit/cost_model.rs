@@ -13,7 +13,7 @@ use crate::build::BF16;
 use crate::kernels::attention::{AttnMask, AttnSpec, FaCfg, attention};
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
 use crate::kernels::{Act, Batch};
-use crate::ops::config::{Attention, DIAGONAL, Planner, Problem, gemm_cfg};
+use crate::ops::config::{AttentionProblem, DIAGONAL, GemmProblem, Planner, gemm_cfg};
 use crate::tune::{Bench, Candidate, Compiled, Pass, TuneStore};
 
 /// Each of `ranked` compiled (in ranked batches, as the tuner admits), then
@@ -100,7 +100,7 @@ fn rankings(planner: &Planner) -> (Vec<Ranking<GemmCfg>>, Vec<Ranking<FaCfg>>) {
         .into_iter()
         .filter(|s| wanted(s.0))
         .map(|(label, m, n, k, epilogue)| {
-            let p = Problem { batches: 1, m, n, k, halves: if epilogue.gated { 2 } else { 1 } };
+            let p = GemmProblem { batches: 1, m, n, k, halves: if epilogue.gated { 2 } else { 1 } };
             let ranked: Vec<GemmCfg> = planner.gemm_ranked(1, m, n, k, epilogue.gated).to_vec();
             let ns = ranked.iter().map(|c| p.admit(planner, c).expect("ranked").0).collect();
             (label, ranked, ns)
@@ -110,7 +110,7 @@ fn rankings(planner: &Planner) -> (Vec<Ranking<GemmCfg>>, Vec<Ranking<FaCfg>>) {
         .into_iter()
         .filter(|s| wanted(s.0))
         .map(|(label, batch, heads, t, d, causal)| {
-            let p = Attention { tiles: batch * heads, t, tk: t, d, causal, bias: false };
+            let p = AttentionProblem { tiles: batch * heads, t, tk: t, d, causal, bias: false };
             let ranked: Vec<FaCfg> = planner.attention_ranked(batch * heads, t, t, d, causal, false).to_vec();
             let ns = ranked.iter().map(|c| p.admit(planner, c).expect("ranked").0).collect();
             (label, ranked, ns)
@@ -257,7 +257,7 @@ proptest! {
         bq in prop::sample::select(vec![16usize, 32, 64, 128]),
         bkv in prop::sample::select(vec![16usize, 32, 64, 128]),
     ) {
-        let p = Attention { tiles: 1, t, tk, d: 64, causal: true, bias: false };
+        let p = AttentionProblem { tiles: 1, t, tk, d: 64, causal: true, bias: false };
         let model = p.causal_trips(bq, bkv) as f64;
         let diagonal = (DIAGONAL * bq.div_ceil(bkv)) as f64;
         let kernel = kernel_trips(t, tk, bq, bkv);
@@ -272,7 +272,7 @@ proptest! {
 #[test_case::test_case(1500, 128, 32; "whisper")]
 #[test_case::test_case(384, 16, 128; "qwen3")]
 fn causal_trips_of_one_sequence_are_half_the_keys(t: usize, bq: usize, bkv: usize) {
-    let p = Attention { tiles: 1, t, tk: t, d: 64, causal: true, bias: false };
+    let p = AttentionProblem { tiles: 1, t, tk: t, d: 64, causal: true, bias: false };
     assert_eq!(p.causal_trips(bq, bkv), t.div_ceil(2 * bkv) + DIAGONAL * bq.div_ceil(bkv));
 }
 
@@ -301,7 +301,7 @@ fn a_block_alone_ranks_behind_the_measured_faster_tile(
 ) {
     let target = Target::card(card).expect("a listed card");
     let planner = Planner::new(Device { target, costs }).expect("an SM count");
-    let p = Problem { batches: 1, m, n, k, halves };
+    let p = GemmProblem { batches: 1, m, n, k, halves };
     let cost = |c: &GemmCfg| p.admit(&planner, c).expect("admitted").0;
     assert!(cost(&fast) < cost(&slow), "{} against {}", cost(&fast), cost(&slow));
 }

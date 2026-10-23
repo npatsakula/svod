@@ -9,24 +9,40 @@ pub mod nearest;
 pub mod rows;
 
 use std::f64::consts::{FRAC_1_SQRT_2, LOG2_E};
+use std::fmt;
 
 use crate::build::*;
 use crate::ir::*;
 
 /// The launch's batch axis, grid z.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Batch {
     /// `n` batches, all launched; a single one is no addressing axis.
     Static(usize),
-    /// A runtime variable bound by name in `min..=max`; buffers hold `max`.
-    Var { name: String, min: i64, max: i64 },
+    /// A runtime variable bound by name; buffers hold its `max`.
+    Var(Var),
+}
+
+/// The tune store keys by this text: a bound batch prints as it did when
+/// the variable's fields were the variant's.
+impl fmt::Debug for Batch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Batch::Static(n) => f.debug_tuple("Static").field(n).finish(),
+            Batch::Var(v) => v.fmt(f),
+        }
+    }
 }
 
 impl Batch {
+    pub fn var(name: impl Into<String>, min: i64, max: i64) -> Self {
+        Batch::Var(Var { name: name.into(), min, max })
+    }
+
     pub fn capacity(&self) -> usize {
         match self {
             Batch::Static(n) => *n,
-            Batch::Var { max, .. } => *max as usize,
+            Batch::Var(v) => v.max as usize,
         }
     }
 
@@ -35,7 +51,7 @@ impl Batch {
         match self {
             Batch::Static(1) => (Sc::from(1), None),
             Batch::Static(n) => (Sc::from(*n), Some(k.block(2))),
-            Batch::Var { name, min, max } => (k.var(name.clone(), *min, *max), Some(k.block(2))),
+            Batch::Var(v) => (k.var(v.name.clone(), v.min, v.max), Some(k.block(2))),
         }
     }
 }

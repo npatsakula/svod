@@ -4,10 +4,11 @@
 use std::sync::Arc;
 
 use svod_dtype::{DType, ScalarDType};
-use svod_ir::{ConstValue, Op, SInt, UOp, ops};
+use svod_ir::{ConstValue, Op, SInt, ops};
 use svod_tensor::Tensor;
 
 use super::config::{self, Planner};
+use crate::ir::Var;
 use crate::kernels::attention::FaCfg;
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
@@ -44,37 +45,26 @@ pub struct Extent {
     pub var: bool,
 }
 
-/// A leading dim bound to a runtime variable (the JIT `batch_var`).
-#[derive(Clone, Debug)]
-pub struct BatchVar {
-    /// The dim as the operand spells it, to shrink an output back to.
-    pub dim: SInt,
-    pub name: String,
-    pub min: i64,
-    pub max: i64,
-}
-
-/// `t`'s dims at capacity and its batch variable; `None` when a dim other
-/// than a bound leading one is symbolic.
-pub fn extent(shape: &[SInt]) -> Option<(Extent, Option<BatchVar>)> {
+/// `t`'s dims at capacity and its leading dim where a runtime variable (the
+/// JIT `batch_var`) binds it, as the operand spells it; `None` when a dim
+/// other than a bound leading one is symbolic.
+pub fn extent(shape: &[SInt]) -> Option<(Extent, Option<SInt>)> {
     let var = match shape.first() {
-        Some(SInt::Symbolic(dim)) => Some(batch_var(dim)?),
+        Some(dim @ SInt::Symbolic(_)) => {
+            bound_var(dim)?;
+            Some(dim.clone())
+        }
         _ => None,
     };
     let dims: Option<Vec<usize>> =
         shape.iter().enumerate().map(|(i, d)| if i == 0 { d.vmax() } else { d.as_const() }).collect();
-    let var = var.map(|(name, min, max)| BatchVar { dim: shape[0].clone(), name, min, max });
     Some((Extent { dims: dims?, var: var.is_some() }, var))
 }
 
-/// `dim`'s bound variable: `None` for a constant or another expression.
-pub fn bound_var(dim: &SInt) -> Option<BatchVar> {
-    let SInt::Symbolic(var) = dim else { return None };
-    let (name, min, max) = batch_var(var)?;
-    Some(BatchVar { dim: dim.clone(), name, min, max })
-}
-
-fn batch_var(dim: &Arc<UOp>) -> Option<(String, i64, i64)> {
+/// The variable bound to `dim`, as a kernel binds it at launch: `None` for
+/// a constant or another expression.
+pub fn bound_var(dim: &SInt) -> Option<Var> {
+    let SInt::Symbolic(dim) = dim else { return None };
     let var = match dim.op() {
         Op::Bind(ops::Bind { var, .. }) => var,
         _ => dim,
@@ -85,10 +75,12 @@ fn batch_var(dim: &Arc<UOp>) -> Option<(String, i64, i64)> {
         _ => None,
     };
     match var.op() {
-        Op::DefineVar(ops::DefineVar { name, min_val, max_val }) => Some((name.clone(), *min_val, *max_val)),
+        Op::DefineVar(ops::DefineVar { name, min_val, max_val }) => {
+            Some(Var { name: name.clone(), min: *min_val, max: *max_val })
+        }
         Op::Param(ops::Param { arg, .. }) => {
             let (min, max) = arg.vmin_vmax.as_ref()?;
-            Some((arg.name.clone()?, int(&min.0)?, int(&max.0)?))
+            Some(Var { name: arg.name.clone()?, min: int(&min.0)?, max: int(&max.0)? })
         }
         _ => None,
     }
@@ -268,7 +260,7 @@ pub fn nearest(
             return Err(Fallback::Shape);
         }
         let d = planner.nearest_depth(d, dtype).ok_or(Fallback::Target)?;
-        let p = config::Nearest { n, m, d, dtype, metric, floors, groups, k };
+        let p = config::NearestProblem { n, m, d, dtype, metric, floors, groups, k };
         candidates(planner.nearest_ranked(p), Fallback::Config)
     })
 }

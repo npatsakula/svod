@@ -26,7 +26,7 @@ use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch_all;
 use crate::lower::sync::insert_barriers;
 use crate::lower::{Lowering, lower};
-use crate::ops::config::{self, Nearest, Planner};
+use crate::ops::config::{self, NearestProblem, Planner};
 use crate::schedule::Schedule;
 
 use super::{conv_first_eight, declared, first_eight, planner};
@@ -742,7 +742,7 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
         (768, Metric::NegDot, none, false, 32),
     ] {
         let dtype = ScalarDType::Float16;
-        let p = Nearest { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors, groups, k };
+        let p = NearestProblem { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors, groups, k };
         for cfg in first_eight(&planner.nearest_ranked(p)) {
             let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Default::default() };
             let name = format!("nearest d{d} {metric:?} {floors:?} {groups} k{k} {cfg:?}");

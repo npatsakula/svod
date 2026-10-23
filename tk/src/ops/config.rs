@@ -297,7 +297,7 @@ pub(crate) struct Run {
 /// (two halves: a gated weight, whose block stages a `2·bn`-wide B tile
 /// and holds two accumulators).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Problem {
+pub struct GemmProblem {
     pub batches: usize,
     pub m: usize,
     pub n: usize,
@@ -305,7 +305,7 @@ pub struct Problem {
     pub halves: usize,
 }
 
-impl Problem {
+impl GemmProblem {
     fn blocks(&self, cfg: &GemmCfg) -> usize {
         self.batches * self.m.div_ceil(cfg.tile[0]) * self.n.div_ceil(cfg.tile[1])
     }
@@ -787,9 +787,9 @@ pub struct Planner {
     /// The cost fields the device's probes could not measure, ranked at
     /// zero ([`crate::probe::Measured`]); empty for a device that measured.
     pub unmeasured: Vec<&'static str>,
-    ranked: papaya::HashMap<Problem, Arc<[GemmCfg]>>,
-    attention: papaya::HashMap<Attention, Arc<[FaCfg]>>,
-    nearest: papaya::HashMap<Nearest, Arc<[NearestCfg]>>,
+    ranked: papaya::HashMap<GemmProblem, Arc<[GemmCfg]>>,
+    attention: papaya::HashMap<AttentionProblem, Arc<[FaCfg]>>,
+    nearest: papaya::HashMap<NearestProblem, Arc<[NearestCfg]>>,
 }
 
 /// The ranking kept under `key`, made by `rank` the first time it is asked for.
@@ -912,7 +912,7 @@ impl Planner {
     }
 
     /// Every attention config for `tiles` rows of `t` queries over `tk`
-    /// keys at head size `d` ([`Attention`]), the cheapest first.
+    /// keys at head size `d` ([`AttentionProblem`]), the cheapest first.
     pub fn attention_ranked(
         &self,
         tiles: usize,
@@ -925,12 +925,12 @@ impl Planner {
         if tiles * t * tk * d == 0 {
             return Arc::new([]);
         }
-        let p = Attention { tiles, t, tk, d, causal, bias };
+        let p = AttentionProblem { tiles, t, tk, d, causal, bias };
         cached(&self.attention, p, || p.ranked(self))
     }
 
     /// Every config of the nearest-candidate problem `p`, the cheapest first.
-    pub(crate) fn nearest_ranked(&self, p: Nearest) -> Arc<[NearestCfg]> {
+    pub(crate) fn nearest_ranked(&self, p: NearestProblem) -> Arc<[NearestCfg]> {
         if p.n * p.m * p.d * p.k == 0 {
             return Arc::new([]);
         }
@@ -947,7 +947,7 @@ impl Planner {
     /// whole tile ran 8–12 % behind the best split on gfx1201, its unrolled
     /// pipeline included, 10–12 % on sm_86 (depth 768) and 18–34 % on
     /// gfx1151).
-    pub(crate) fn nearest_splits(&self, p: &Nearest, admitted: &[NearestCfg]) -> Vec<NearestCfg> {
+    pub(crate) fn nearest_splits(&self, p: &NearestProblem, admitted: &[NearestCfg]) -> Vec<NearestCfg> {
         let split = |c: &NearestCfg| self.nearest_split(p, c).map(|splits| NearestCfg { splits, ..*c });
         let whole = |i: usize, c: &NearestCfg, split: bool| (!split || i == 0).then_some(*c);
         admitted.iter().enumerate().flat_map(|(i, c)| [split(c), whole(i, c, split(c).is_some())]).flatten().collect()
@@ -972,13 +972,13 @@ impl Planner {
     /// A score matrix splits as a least does, each share storing its own
     /// scores, where its query blocks are fewer than the SMs. A list of `k >
     /// 1` (in registers or queued) splits as the model prices cheapest
-    /// ([`Nearest::admit`]: a few query blocks over many candidates leave SMs
+    /// ([`NearestProblem::admit`]: a few query blocks over many candidates leave SMs
     /// idle, against every share's list filled again and the merge of the
     /// shares; at 256 queries by 2^20 candidates at depth 128 on sm_86 the
     /// best of 4–64 shares measured 16–32 for 16 and 64 scores, 8 for 256,
     /// 8 at 1024 queries, as the model's), streamed up to [`REREAD_K`] at
     /// least as the rereads split, which the model does not see.
-    pub(crate) fn nearest_split(&self, p: &Nearest, cfg: &NearestCfg) -> Option<usize> {
+    pub(crate) fn nearest_split(&self, p: &NearestProblem, cfg: &NearestCfg) -> Option<usize> {
         let (target, d) = (&self.device.target, p.d);
         let blocks = p.n.div_ceil(cfg.bq);
         // A score matrix splits only to fill SMs its query blocks leave
@@ -1015,7 +1015,7 @@ impl Planner {
         Some(d.next_multiple_of(self.device.target.geometry_of(dtype)?.k as usize))
     }
 
-    fn ranked(&self, p: Problem) -> Arc<[GemmCfg]> {
+    fn ranked(&self, p: GemmProblem) -> Arc<[GemmCfg]> {
         cached(&self.ranked, p, || p.ranked(self))
     }
 
@@ -1025,7 +1025,7 @@ impl Planner {
         if batches * m * n * k == 0 {
             return Arc::new([]);
         }
-        self.ranked(Problem { batches, m, n, k, halves: if gated { 2 } else { 1 } })
+        self.ranked(GemmProblem { batches, m, n, k, halves: if gated { 2 } else { 1 } })
     }
 
     /// Unsplit convolution configs for `batches` grid batches of `m` output
@@ -1038,7 +1038,7 @@ impl Planner {
         if batches * m * n * k == 0 {
             return Arc::new([]);
         }
-        let p = Problem { batches, m, n, k, halves: 1 };
+        let p = GemmProblem { batches, m, n, k, halves: 1 };
         let target = &self.device.target;
         let depth = match (target.fill, target.geometry()) {
             (Fill::CpAsync, Some(atom)) => 2 * atom.k as usize,
@@ -1057,7 +1057,7 @@ impl Planner {
     /// dividing the steps that keep at most 16 blocks per SM.
     pub(crate) fn conv_splits(&self, batches: usize, m: usize, g: &ConvGeom, admitted: &[ConvCfg]) -> Vec<ConvCfg> {
         let Some(&ConvCfg { gemm: base, .. }) = admitted.first() else { return vec![] };
-        let (p, k) = (Problem { batches, m, n: g.cout, k: g.k(), halves: 1 }, g.k());
+        let (p, k) = (GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1 }, g.k());
         let mut out = admitted.to_vec();
         let sms = self.sms();
         let blocks = |c: &GemmCfg| p.blocks(c);
@@ -1205,7 +1205,7 @@ pub(crate) const DIAGONAL: usize = 3;
 /// query sees the keys up to its own position, `bias` when an additive bias
 /// streams beside the keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Attention {
+pub struct AttentionProblem {
     pub tiles: usize,
     pub t: usize,
     pub tk: usize,
@@ -1214,12 +1214,12 @@ pub struct Attention {
     pub bias: bool,
 }
 
-impl Attention {
+impl AttentionProblem {
     fn blocks(&self, cfg: &FaCfg) -> usize {
         self.tiles * self.t.div_ceil(cfg.bq)
     }
 
-    /// What `cfg` costs here, as [`Problem::admit`]: a key block's trip pays
+    /// What `cfg` costs here, as [`GemmProblem::admit`]: a key block's trip pays
     /// both products' fragment reads, fills (priced by where their bytes
     /// come from, every tile's keys and values the distinct ones; a bias
     /// tile is filled and read once per trip like them, every one of its
@@ -1419,7 +1419,7 @@ impl NearestCfg {
         Some(operands + 2 * scores + self.list_registers(target, d, k, dtype)?)
     }
 
-    /// The registers [`Nearest::admit`] holds against the lane's budget:
+    /// The registers [`NearestProblem::admit`] holds against the lane's budget:
     /// [`Self::registers`], or streamed, the depth pipeline's alone (its
     /// fragments, accumulators and staged chunks). A streamed tile folds
     /// once its pipeline has drained, its fragments dead, and whether the
@@ -1641,7 +1641,7 @@ const NEAREST_DEPTHS: [Option<usize>; 4] = [None, Some(DEPTHS[0]), Some(DEPTHS[1
 /// scaled per row), scored by `metric` above `floors`, under groups or not,
 /// each row keeping its `k` least scores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Nearest {
+pub struct NearestProblem {
     pub n: usize,
     pub m: usize,
     pub d: usize,
@@ -1652,8 +1652,8 @@ pub struct Nearest {
     pub k: usize,
 }
 
-impl Nearest {
-    /// What `cfg` costs here, as [`Problem::admit`]: a candidate trip pays
+impl NearestProblem {
+    /// What `cfg` costs here, as [`GemmProblem::admit`]: a candidate trip pays
     /// every wave's read of the candidate tile, its fill (every block reads
     /// every candidate: the blocks in flight share the lines), the product's
     /// steps and every pair's epilogue ([`NEAREST_PAIR`], plus a
@@ -1717,7 +1717,7 @@ impl Nearest {
         // Split, every query block's candidate tiles in shares, a block each.
         let splits = cfg.splits;
         let (blocks, tiles, stages) = (self.n.div_ceil(bq) * splits, self.m.div_ceil(bkv).div_ceil(splits), cfg.stages);
-        let share = Nearest { m: self.m.min(tiles * bkv), ..*self };
+        let share = NearestProblem { m: self.m.min(tiles * bkv), ..*self };
         let depth = cfg.bk.unwrap_or(d);
         let chunks = d.div_ceil(depth);
         // The rows a trip fills and every wave reads: the candidates, and
@@ -1812,7 +1812,7 @@ impl Nearest {
         let groups = self.m.div_ceil(bkv);
         let read = (self.k * bkv.max(LANES)).min(self.m);
         let skipped = (self.m - read).div_ceil(LANES);
-        Nearest { m: groups, ..*self }.scan_cost(planner, select, groups, 0)
+        NearestProblem { m: groups, ..*self }.scan_cost(planner, select, groups, 0)
             + self.scan_cost(planner, select, read, skipped)
     }
 
@@ -1832,7 +1832,7 @@ impl Nearest {
         let width = (select_runs(self.k) * LANES) as f64;
         let depth = queued.log2();
         let merge = queued * depth * (depth + 1.0) / 2.0 + width * width.log2();
-        let offers = Nearest { m: read, ..*self }.offers();
+        let offers = NearestProblem { m: read, ..*self }.offers();
         let merges = offers / (queued * SELECT_FILLED) + 1.0;
         let row = steps * LANES as f64 * SCAN_SCORE
             + skipped as f64 * SKIP_STEP
