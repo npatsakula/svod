@@ -63,7 +63,7 @@ pub(crate) fn conv_first_eight(planner: &Planner, batches: usize, m: usize, g: &
 pub type Launch = (String, Program, Lowering);
 
 /// The first candidate the op layer plans for each kernel family on `target`.
-pub fn families(target: &Target) -> Vec<Launch> {
+pub(crate) fn families(target: &Target) -> Vec<Launch> {
     let mut out: Vec<Launch> = vec![];
     let mut push = |name: &str, prog: Program, lowering: Lowering| out.push((name.to_string(), prog, lowering));
     let planner = planner(target.clone());
@@ -345,7 +345,7 @@ pub fn families(target: &Target) -> Vec<Launch> {
 }
 
 /// An H100 SXM: sm_90 with 132 SMs.
-pub fn hopper() -> Target {
+pub(crate) fn hopper() -> Target {
     Target { sms: Some(132), ..Target::for_arch(GpuArch::Cuda(CudaArch { major: 9, minor: 0 })) }
 }
 
@@ -353,7 +353,7 @@ pub fn hopper() -> Target {
 /// rows, one or two across, every swizzle span (16-, 32- and 64-deep rings
 /// are 32-, 64- and 128-byte rows), a 96-wide tile of three `n32` and a
 /// `k` of several trips. Shapes stay small for the interpreter.
-pub fn group_families(target: &Target) -> Vec<Launch> {
+pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
     let planner = planner(target.clone());
     let tiles: [([usize; 3], [u32; 2], usize); 7] = [
         ([128, 128, 64], [8, 1], 3),
@@ -378,20 +378,20 @@ pub fn group_families(target: &Target) -> Vec<Launch> {
 
 /// An AMD GPU with `cus` compute units and 64 KB of LDS per workgroup; a
 /// CDNA3 one is an MI300X of eight dies.
-pub fn amd(arch: AmdArch, cus: u32) -> Target {
+pub(crate) fn amd(arch: AmdArch, cus: u32) -> Target {
     let xcds = if arch.is_cdna() { 8 } else { 1 };
     Target { sms: Some(cus), xcds, ..Target::for_arch(GpuArch::Amd(arch)) }
 }
 
 /// A square-kernel convolution of `cin` to `cout` channels over `hw`, its
 /// stride, padding and dilation the same along both axes.
-pub fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, p: usize, d: usize) -> ConvGeom {
+pub(crate) fn geom(hw: [usize; 2], cin: usize, cout: usize, k: usize, s: usize, p: usize, d: usize) -> ConvGeom {
     ConvGeom { h: hw[0], w: hw[1], cin, cout, kernel: [k, k], stride: [s, s], pad: [p, p], dilation: [d, d] }
 }
 
 /// `(cin, cout, k, [h, w], stride)` of the YOLO26x dense 3×3 classes at
 /// 640² (the memo's census), padded `k / 2`.
-pub const YOLO: [(usize, usize, usize, [usize; 2], usize); 9] = [
+pub(crate) const YOLO: [(usize, usize, usize, [usize; 2], usize); 9] = [
     (192, 192, 3, [40, 40], 1),
     (96, 96, 3, [80, 80], 1),
     (384, 384, 3, [160, 160], 2),
@@ -403,7 +403,7 @@ pub const YOLO: [(usize, usize, usize, [usize; 2], usize); 9] = [
     (768, 96, 3, [20, 20], 1),
 ];
 
-pub fn yolo_geom((cin, cout, k, hw, s): (usize, usize, usize, [usize; 2], usize)) -> ConvGeom {
+pub(crate) fn yolo_geom((cin, cout, k, hw, s): (usize, usize, usize, [usize; 2], usize)) -> ConvGeom {
     geom(hw, cin, cout, k, s, k / 2, 1)
 }
 
@@ -416,7 +416,7 @@ pub(crate) fn device(target: &Target) -> DeviceSpec {
 }
 
 /// The lowered instruction list of `prog`.
-pub fn linear(prog: Program, lowering: &Lowering) -> Arc<UOp> {
+pub(crate) fn linear(prog: Program, lowering: &Lowering) -> Arc<UOp> {
     let params =
         prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
     let name = prog.name.clone();
@@ -427,7 +427,8 @@ pub fn linear(prog: Program, lowering: &Lowering) -> Arc<UOp> {
 }
 
 /// LLVM text of `prog` for its lowering's target.
-pub fn render(prog: Program, lowering: &Lowering) -> String {
+#[cfg(test)]
+pub(crate) fn render(prog: Program, lowering: &Lowering) -> String {
     let name = prog.name.clone();
     try_render(prog, lowering).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
@@ -622,7 +623,7 @@ pub fn digested(target: &Target) -> Vec<Launch> {
 }
 
 /// `launches` with every repeated name numbered (`name #2`, …) after its first.
-pub fn unique(launches: Vec<Launch>) -> Vec<Launch> {
+pub(crate) fn unique(launches: Vec<Launch>) -> Vec<Launch> {
     let mut seen = std::collections::HashMap::<String, usize>::new();
     launches
         .into_iter()

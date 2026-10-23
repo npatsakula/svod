@@ -47,7 +47,7 @@ pub(crate) const FORMAT: u32 = 5;
 const ROUNDS: usize = 4;
 /// How far a timing goes ([`rounds`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Pass {
+pub(crate) enum Pass {
     /// Every round, then the leaders' rounds: the order is the choice.
     Whole,
     /// The first round and one more of its contenders: the order only
@@ -131,7 +131,7 @@ pub struct TuneKey {
 }
 
 impl TuneKey {
-    pub fn new(
+    pub(crate) fn new(
         op: &'static str,
         target: &Target,
         compiler: u64,
@@ -144,13 +144,13 @@ impl TuneKey {
 
     /// The store line of a `kind` of entry for the candidate programs
     /// fingerprinted as `programs`.
-    pub fn line(&self, kind: Kind, programs: u64) -> String {
+    pub(crate) fn line(&self, kind: Kind, programs: u64) -> String {
         format!("{}|{:016x}|{programs:016x}", self.candidates(kind), self.compiler)
     }
 
     /// A line's key up to the candidates' digest: what a [`TuneStore::replay`]
     /// matches, whatever compiler and programs keyed the line.
-    pub fn candidates(&self, kind: Kind) -> String {
+    pub(crate) fn candidates(&self, kind: Kind) -> String {
         format!("{}|{:016x}", self.shape(kind), self.candidates)
     }
 
@@ -168,7 +168,7 @@ pub(crate) fn device(target: &Target) -> String {
 
 /// A digest of `spec`'s compiler identity (backend, toolchain, flags) for
 /// [`TuneKey::compiler`], once per device; 0 where no device opens.
-pub fn compiler(spec: &DeviceSpec) -> u64 {
+pub(crate) fn compiler(spec: &DeviceSpec) -> u64 {
     static DIGESTS: LazyLock<Once<DeviceSpec, u64>> = LazyLock::new(Mutex::default);
     once(&DIGESTS, spec, || {
         let device = svod_runtime::DEVICE_FACTORIES.device(spec, svod_device::registry::registry());
@@ -187,7 +187,7 @@ pub type Candidate = Vec<(Program, Lowering)>;
 /// processes of the same build, by the global store
 /// ([`TuneStore::fingerprint`]): lowering a shortlist takes 0.05–1.6 s,
 /// and a warm process lowers nothing.
-pub fn fingerprint(candidates: &[Candidate]) -> u64 {
+pub(crate) fn fingerprint(candidates: &[Candidate]) -> u64 {
     TuneStore::global().fingerprint(candidates)
 }
 
@@ -388,7 +388,7 @@ impl TuneStore {
     }
 
     /// Whether this is a [`Self::replay`].
-    pub fn replays(&self) -> bool {
+    pub(crate) fn replays(&self) -> bool {
         self.replayed.is_some()
     }
 
@@ -434,7 +434,7 @@ impl TuneStore {
     /// same. Opening the file marks it used and removes the builds' files
     /// unused for [`EMITTED_KEPT`]; each line is appended by one write, so
     /// processes of one build share the file.
-    pub fn fingerprint(&self, candidates: &[Candidate]) -> u64 {
+    pub(crate) fn fingerprint(&self, candidates: &[Candidate]) -> u64 {
         self.fingerprint_keeping(candidates, None)
     }
 
@@ -547,7 +547,7 @@ impl TuneStore {
 
     /// Every readable `line -> entry` of the key's device file; empty when
     /// unreadable or of another format.
-    pub fn entries(&self, key: &TuneKey) -> HashMap<String, Entry> {
+    pub(crate) fn entries(&self, key: &TuneKey) -> HashMap<String, Entry> {
         let Some(text) = self.path(key).and_then(|p| std::fs::read_to_string(p).ok()) else { return HashMap::new() };
         if text.lines().next() != Some(format!("format {FORMAT}").as_str()) {
             return HashMap::new();
@@ -585,7 +585,7 @@ impl TuneStore {
 
     /// A measured number (a probe's cost, say) by the same path as
     /// [`Self::choose`]: the memo, the store, else `measure`, stored when `Some`.
-    pub fn value(
+    pub(crate) fn value(
         &self,
         key: &TuneKey,
         programs: impl FnOnce() -> u64,
@@ -629,7 +629,7 @@ impl TuneStore {
     /// `build` makes fingerprint (each built once), else, on a store miss,
     /// those `bench` has not compiled are compiled and every candidate is
     /// [`time`]d through `pass`, their order stored.
-    pub fn choose<C: Copy + PartialEq + std::fmt::Debug + Send>(
+    pub(crate) fn choose<C: Copy + PartialEq + std::fmt::Debug + Send>(
         &self,
         key: &TuneKey,
         candidates: &[C],
@@ -657,7 +657,7 @@ impl TuneStore {
     /// stored when it judged. What compiles without spilling is the
     /// compiler's and the programs' alone, both in the line, so a later
     /// process compiles nothing but its choice.
-    pub fn admitted(
+    pub(crate) fn admitted(
         &self,
         key: &TuneKey,
         programs: impl FnOnce() -> u64,
@@ -674,7 +674,7 @@ impl TuneStore {
     /// `key` names (`None`: nothing compiled), by the same path as
     /// [`Self::admitted`] under its own kind, so a list's full admission and
     /// its first clean config are each remembered once.
-    pub fn first(
+    pub(crate) fn first(
         &self,
         key: &TuneKey,
         programs: impl FnOnce() -> u64,
@@ -699,14 +699,14 @@ pub(crate) fn ordered(ns: Vec<Option<u64>>) -> Option<Arc<[(usize, u64)]>> {
 /// A candidate compiled on scratch buffers: its plans (`None` when one
 /// failed to build) and its kernels' compiled resources where the backend
 /// reports them.
-pub struct Built {
+pub(crate) struct Built {
     plans: Option<Vec<Scratch>>,
     resources: Vec<KernelResources>,
 }
 
 /// What compiling a candidate showed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Compiled {
+pub(crate) enum Compiled {
     Failed,
     /// A kernel [`spilled`]: admitted only where every candidate does, timed
     /// among a tile's pipelines.
@@ -715,7 +715,7 @@ pub enum Compiled {
 }
 
 impl Built {
-    pub fn verdict(&self) -> Compiled {
+    pub(crate) fn verdict(&self) -> Compiled {
         match &self.plans {
             None => Compiled::Failed,
             Some(_) if spilled(&self.resources) => Compiled::Spilled,
@@ -726,7 +726,7 @@ impl Built {
 
 /// Whether a kernel of `resources` spilled to scratch; a backend reporting
 /// nothing has not.
-pub fn spilled(resources: &[KernelResources]) -> bool {
+pub(crate) fn spilled(resources: &[KernelResources]) -> bool {
     resources.iter().any(|r| r.scratch_bytes.is_some_and(|b| b > 0))
 }
 
@@ -735,7 +735,7 @@ pub fn spilled(resources: &[KernelResources]) -> bool {
 /// compiled or lowered twice (a fingerprint's lowerings are kept for the
 /// compile). Compiles run on the rayon pool ([`streamed`]), each killed at
 /// [`COMPILE_TIMEOUT`]; while candidates are timed, the rest compile.
-pub struct Bench<C> {
+pub(crate) struct Bench<C> {
     pool: ScratchPool,
     pub(crate) built: Vec<(C, Built)>,
     pub(crate) lowered: Arc<Lowerings>,
@@ -785,7 +785,7 @@ impl<C: Copy + PartialEq + std::fmt::Debug + Send> Bench<C> {
 
     /// What compiling each of `batch` (the programs `build` makes) showed,
     /// those not compiled before compiled in parallel.
-    pub fn admit(&mut self, batch: &[C], build: impl Fn(C) -> Candidate, store: &TuneStore) -> Vec<Compiled> {
+    pub(crate) fn admit(&mut self, batch: &[C], build: impl Fn(C) -> Candidate, store: &TuneStore) -> Vec<Compiled> {
         let missing: Vec<C> = distinct(batch.iter().copied().filter(|&c| self.find(c).is_none()));
         let done = self.compiling(store, threads(), |stream| {
             missing.into_iter().for_each(|c| stream.push((c, build(c))));
@@ -841,7 +841,7 @@ impl<C: Copy + PartialEq + std::fmt::Debug + Send> Bench<C> {
     /// ranking's, so a good time is soon the bar the [`HOPELESS`] ones miss);
     /// those not compiled yet compile from `programs`, in order, on all
     /// but one of the pool's threads while the ones ready are timed.
-    pub fn time(
+    pub(crate) fn time(
         &mut self,
         candidates: &[C],
         programs: Vec<Candidate>,
@@ -1332,7 +1332,7 @@ pub(crate) fn stamped(stamps: impl IntoIterator<Item = (Option<u64>, Option<u64>
 
 /// The compiled resources (registers, LDS, scratch) of the plan's kernels
 /// whose backend reports them, in schedule order.
-pub fn resources(plan: &ExecutionPlan) -> Vec<KernelResources> {
+pub(crate) fn resources(plan: &ExecutionPlan) -> Vec<KernelResources> {
     plan.kernels().filter_map(|k| k.program.resource_usage()).collect()
 }
 
@@ -1343,7 +1343,7 @@ thread_local! {
 
 /// The innermost [`scoped`] setting on this thread, else `SVOD_TK_TUNE`
 /// is not `0`.
-pub fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     SCOPED.get().unwrap_or_else(|| std::env::var("SVOD_TK_TUNE").map_or(true, |v| v != "0"))
 }
 

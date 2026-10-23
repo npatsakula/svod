@@ -333,36 +333,12 @@ fn launched(live: &Option<Sc>, n: usize, per: usize) -> Sc {
 /// exact below 2^24.
 pub const MAX_CANDIDATES: usize = 1 << 24;
 
-impl NearestSpec {
-    /// The input parameters in order over operands of `dtype` (8-bit ones
-    /// with their rows' scales); the outputs `score [n, k]` (f32) and
-    /// `index [n, k]` (i32) follow them.
-    pub fn inputs(&self, dtype: svod_dtype::ScalarDType) -> Vec<&'static str> {
-        let scaled = dtype.bytes() == 1;
-        [
-            (true, "x"),
-            (true, "c"),
-            (scaled, "x_scale"),
-            (scaled, "c_scale"),
-            (self.metric.col_norms(), "c_sq"),
-            (self.metric.row_norms(), "x_sq"),
-            (self.floors.row, "row_floor"),
-            (self.floors.col, "col_floor"),
-            (self.groups, "row_group"),
-            (self.groups, "col_group"),
-        ]
-        .into_iter()
-        .filter(|(on, _)| *on)
-        .map(|(_, name)| name)
-        .collect()
-    }
-}
-
 /// For every row `i` of `x`, the least score over the candidates `c` (over
 /// `j` with `row_group[i] ≠ col_group[j]` under groups) and the smallest
 /// candidate index scoring it: the row's minimum, then the least column
 /// where a score equals it. A row with no admissible candidate scores `+∞`
-/// at index −1. Parameters as [`NearestSpec::inputs`] names them (`c_sq`,
+/// at index −1. Parameters in order, each where the spec takes it: `x`, `c`,
+/// over 8-bit rows `x_scale [n]` and `c_scale [m]` (f32), then (`c_sq`,
 /// `x_sq` the squared norms in f32, the floors f32, the groups i32), then
 /// `score [n]` f32 and `index [n]` i32. Split (`cfg.splits > 1`), grid y
 /// takes an even share of the candidate tiles and the outputs are

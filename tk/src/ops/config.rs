@@ -78,7 +78,7 @@ impl GemmCfg {
     /// Whether the config lowers on `target`: it [`tiles`](Self::tiles), and
     /// both operand tiles fill in whole 16-byte chunks per thread
     /// ([`fills_in_chunks`]).
-    pub fn fits(&self, target: &Target) -> bool {
+    pub(crate) fn fits(&self, target: &Target) -> bool {
         let ([bm, bn, bk], [wr, wc]) = (self.tile, self.warps.map(|w| w as usize));
         let threads = target.wave as usize * wr * wc;
         let fills = |rows| fills_in_chunks(Shape::new(rows, bk), ELEM, threads);
@@ -91,7 +91,7 @@ impl GemmCfg {
     /// chunks, from the layouts the lowering assigns. `None` when the tile
     /// does not lay out. Addressing and the epilogue's temporaries are not
     /// counted.
-    pub fn registers(&self, target: &Target, halves: usize) -> Option<u32> {
+    pub(crate) fn registers(&self, target: &Target, halves: usize) -> Option<u32> {
         let ([bm, bn, bk], [wr, wc]) = (self.tile, self.warps);
         let issue = self.issue(target, bk)?;
         let halves = halves as u32;
@@ -115,7 +115,7 @@ impl GemmCfg {
     /// the accumulators in a file of their own where the target has one) or
     /// past the block's share of the file the kernel cannot compile without
     /// spilling.
-    pub fn live_registers(&self, target: &Target, halves: usize) -> Option<(u32, u32)> {
+    pub(crate) fn live_registers(&self, target: &Target, halves: usize) -> Option<(u32, u32)> {
         let issue = self.issue(target, 16)?;
         let halves = halves as u32;
         Some((issue.c.regs() * halves, self.operand_registers(&issue, halves)))
@@ -394,7 +394,7 @@ impl Problem {
     /// first (then by fewer registers) and [`spread`] over the block tiles
     /// the cost band holds: the shortlist keeps a tile's first clean one
     /// ([`shortlist`]).
-    pub fn ranked(&self, planner: &Planner) -> Vec<GemmCfg> {
+    pub(crate) fn ranked(&self, planner: &Planner) -> Vec<GemmCfg> {
         let lattice = gemm_lattice(&planner.device.target);
         let count = lattice.len();
         let admitted: Vec<(f64, u32, GemmCfg)> = lattice
@@ -823,7 +823,7 @@ impl Planner {
     }
 
     /// The device's SM count.
-    pub fn sms(&self) -> usize {
+    pub(crate) fn sms(&self) -> usize {
         self.sms
     }
 
@@ -930,7 +930,7 @@ impl Planner {
     }
 
     /// Every config of the nearest-candidate problem `p`, the cheapest first.
-    pub fn nearest_ranked(&self, p: Nearest) -> Arc<[NearestCfg]> {
+    pub(crate) fn nearest_ranked(&self, p: Nearest) -> Arc<[NearestCfg]> {
         if p.n * p.m * p.d * p.k == 0 {
             return Arc::new([]);
         }
@@ -947,7 +947,7 @@ impl Planner {
     /// whole tile ran 8–12 % behind the best split on gfx1201, its unrolled
     /// pipeline included, 10–12 % on sm_86 (depth 768) and 18–34 % on
     /// gfx1151).
-    pub fn nearest_splits(&self, p: &Nearest, admitted: &[NearestCfg]) -> Vec<NearestCfg> {
+    pub(crate) fn nearest_splits(&self, p: &Nearest, admitted: &[NearestCfg]) -> Vec<NearestCfg> {
         let split = |c: &NearestCfg| self.nearest_split(p, c).map(|splits| NearestCfg { splits, ..*c });
         let whole = |i: usize, c: &NearestCfg, split: bool| (!split || i == 0).then_some(*c);
         admitted.iter().enumerate().flat_map(|(i, c)| [split(c), whole(i, c, split(c).is_some())]).flatten().collect()
@@ -978,7 +978,7 @@ impl Planner {
     /// best of 4–64 shares measured 16–32 for 16 and 64 scores, 8 for 256,
     /// 8 at 1024 queries, as the model's), streamed up to [`REREAD_K`] at
     /// least as the rereads split, which the model does not see.
-    pub fn nearest_split(&self, p: &Nearest, cfg: &NearestCfg) -> Option<usize> {
+    pub(crate) fn nearest_split(&self, p: &Nearest, cfg: &NearestCfg) -> Option<usize> {
         let (target, d) = (&self.device.target, p.d);
         let blocks = p.n.div_ceil(cfg.bq);
         // A score matrix splits only to fill SMs its query blocks leave
@@ -1033,7 +1033,7 @@ impl Planner {
     /// configs whose step stays within one tap (`bk` divides `cin`) and
     /// whose tiles pad `m × n` by at most 1/8. On the cp.async path a step
     /// is at least two matrix-core depths, else the conv takes the graph.
-    pub fn conv_ranked(&self, batches: usize, m: usize, g: &ConvGeom) -> Arc<[ConvCfg]> {
+    pub(crate) fn conv_ranked(&self, batches: usize, m: usize, g: &ConvGeom) -> Arc<[ConvCfg]> {
         let (n, k, cin) = (g.cout, g.k(), g.cin);
         if batches * m * n * k == 0 {
             return Arc::new([]);
@@ -1055,7 +1055,7 @@ impl Planner {
     /// batch), the lead and the admitted configs with the most blocks at
     /// 1/16 and at 1/8 padding also split over the reduction, in counts
     /// dividing the steps that keep at most 16 blocks per SM.
-    pub fn conv_splits(&self, batches: usize, m: usize, g: &ConvGeom, admitted: &[ConvCfg]) -> Vec<ConvCfg> {
+    pub(crate) fn conv_splits(&self, batches: usize, m: usize, g: &ConvGeom, admitted: &[ConvCfg]) -> Vec<ConvCfg> {
         let Some(&ConvCfg { gemm: base, .. }) = admitted.first() else { return vec![] };
         let (p, k) = (Problem { batches, m, n: g.cout, k: g.k(), halves: 1 }, g.k());
         let mut out = admitted.to_vec();
@@ -1151,7 +1151,7 @@ impl FaCfg {
     /// On the warpgroup core the key and value tiles stay in shared memory
     /// and a chain's descriptors (two registers a `k16` step) stand in for
     /// their fragments.
-    pub fn registers(&self, target: &Target, d: usize, bias: bool) -> Option<u32> {
+    pub(crate) fn registers(&self, target: &Target, d: usize, bias: bool) -> Option<u32> {
         let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
         let (qk, pv) = (
             target.issue(self.core, grid, self.bq, self.bkv, d)?,
@@ -1176,7 +1176,7 @@ impl FaCfg {
     /// Of [`Self::registers`], the f32 output accumulator a lane carries
     /// across the key loop: what a matrix core with a file of its own
     /// (CDNA's AGPRs) may hold beside the rest.
-    pub fn accumulators(&self, target: &Target, d: usize) -> Option<u32> {
+    pub(crate) fn accumulators(&self, target: &Target, d: usize) -> Option<u32> {
         let grid = WarpGrid { rows: self.row_warps(), cols: 1 };
         Some(target.issue(Core::Warp, grid, self.bq, d, self.bkv)?.c.regs())
     }
@@ -1334,7 +1334,7 @@ impl Attention {
     /// variant of a tile (its rows per warp are not part of it), so the
     /// shortlist holds the one-row representatives and the twins stage times
     /// the variant beside them for the contender tiles.
-    pub fn ranked(&self, planner: &Planner) -> Vec<FaCfg> {
+    pub(crate) fn ranked(&self, planner: &Planner) -> Vec<FaCfg> {
         let lattice = self.lattice(&planner.device.target);
         let count = lattice.len();
         let admitted: Vec<(f64, u32, FaCfg)> = lattice
@@ -1389,7 +1389,7 @@ impl NearestCfg {
     /// each operand fills in whole 16-byte chunks per thread
     /// ([`fills_in_chunks`]); a streamed depth is whole 16-byte chunks too,
     /// which an overhanging chunk's fill zeroes past it.
-    pub fn fits(&self, target: &Target, d: usize, dtype: ScalarDType) -> bool {
+    pub(crate) fn fits(&self, target: &Target, d: usize, dtype: ScalarDType) -> bool {
         let Some(atom) = target.geometry_of(dtype) else { return false };
         let (bq, bkv, rows, depth) = (self.bq, self.bkv, self.warp_rows, self.depth(d));
         let threads = self.warps() as usize * target.wave as usize;
@@ -1414,7 +1414,7 @@ impl NearestCfg {
     /// columns in; the staged chunks where the fill goes through registers.
     /// Addressing and the row vectors are not counted, but for the `k`
     /// least scores and indices a row's list holds past one.
-    pub fn registers(&self, target: &Target, d: usize, k: usize, dtype: ScalarDType) -> Option<u32> {
+    pub(crate) fn registers(&self, target: &Target, d: usize, k: usize, dtype: ScalarDType) -> Option<u32> {
         let [operands, scores] = self.lane_parts(target, d, dtype)?;
         Some(operands + 2 * scores + self.list_registers(target, d, k, dtype)?)
     }
@@ -1430,7 +1430,7 @@ impl NearestCfg {
     /// scores beside it across the deals, so a list counts it all either way
     /// (gfx1151, 32 rows by 64 candidates streamed 32 deep, a list of 64:
     /// estimated 252 so, 284 whole, 256 and spilled compiled).
-    pub fn held(&self, target: &Target, d: usize, k: usize, dtype: ScalarDType) -> Option<u32> {
+    pub(crate) fn held(&self, target: &Target, d: usize, k: usize, dtype: ScalarDType) -> Option<u32> {
         let [operands, scores] = self.lane_parts(target, d, dtype)?;
         let listed = k > 1 && self.select.is_none();
         let scores = if self.bk.is_some() && !listed { scores } else { 2 * scores };
@@ -1482,7 +1482,7 @@ impl NearestCfg {
     /// The lanes the products spread a row of the scores over
     /// ([`Self::scores_layout`]): the narrowest lane queues a deal renames
     /// registers into.
-    pub fn sharing(&self, target: &Target, d: usize, dtype: ScalarDType) -> Option<usize> {
+    pub(crate) fn sharing(&self, target: &Target, d: usize, dtype: ScalarDType) -> Option<usize> {
         Some(1 << self.scores_layout(target, d, dtype)?.row_fold_masks().len())
     }
 
@@ -1558,7 +1558,7 @@ const MOST_DEALS: usize = 16;
 /// ([`NearestCfg::queue`]), or listed from a score matrix
 /// ([`NearestCfg::select`]). At 16384² rows on sm_86 a register list of 48
 /// ran ahead of both (depths 128 and 768), one of 64 at depth 768.
-pub const REGISTER_K: usize = 64;
+pub(crate) const REGISTER_K: usize = 64;
 /// Search bound: the shortest list ranked queued and through a score matrix
 /// as well.
 const LONG_FROM: usize = 33;
@@ -1974,7 +1974,7 @@ impl Nearest {
     /// planner's target, cheapest first, then by fewer registers. A list of
     /// `k > 1` is priced at its [split](Planner::nearest_split) where that
     /// is cheaper, as the tuner times it.
-    pub fn ranked(&self, planner: &Planner) -> Vec<NearestCfg> {
+    pub(crate) fn ranked(&self, planner: &Planner) -> Vec<NearestCfg> {
         let lattice = self.lattice(&planner.device.target);
         let count = lattice.len();
         let split = |c: &NearestCfg, whole: f64| {

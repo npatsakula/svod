@@ -527,9 +527,6 @@ impl Program {
     pub fn scalar(&self, id: ScalarId) -> &Scalar {
         &self.scalars[id.index()]
     }
-    pub fn param(&self, id: ParamId) -> &Param {
-        &self.params[id.index()]
-    }
     /// Whether scalar `id` reads [`Special::Warp`]: the warps of a block may
     /// see it differ.
     pub fn varies_by_warp(&self, id: ScalarId) -> bool {
