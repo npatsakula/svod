@@ -78,8 +78,6 @@ pub struct GemmCfg {
     pub stages: usize,
     /// `[rows, cols]` of the warp grid over the output tile.
     pub warps: [u32; 2],
-    /// Tile rows walked together so resident blocks share B in L2 (0 = row-major).
-    pub group_m: usize,
     pub unroll: bool,
     pub core: Core,
     /// Crews the warp rows form: 1, every warp loading and computing
@@ -91,12 +89,13 @@ pub struct GemmCfg {
 
 /// The tune store keys by this text: a config on the warp-level core and
 /// one crew prints as it did before the fields existed, so its stored
-/// choices still apply.
+/// choices still apply, and every config walks [`GROUP_ROWS`] as when it
+/// was a field (`group_m`).
 impl fmt::Debug for GemmCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("GemmCfg");
         s.field("tile", &self.tile).field("stages", &self.stages).field("warps", &self.warps);
-        s.field("group_m", &self.group_m).field("unroll", &self.unroll);
+        s.field("group_m", &GROUP_ROWS).field("unroll", &self.unroll);
         if self.core != Core::Warp {
             s.field("core", &self.core);
         }
@@ -106,6 +105,11 @@ impl fmt::Debug for GemmCfg {
         s.finish()
     }
 }
+
+/// Search bound: the tile rows the blocks in flight walk together, so
+/// resident blocks share the other operand's lines in L2 (a GEMM's B, a
+/// split nearest kernel's candidate shares); one pick no lattice searches.
+pub(crate) const GROUP_ROWS: usize = 8;
 
 /// The depth of an operand's k-slices under two crews: one matrix-core step,
 /// the k of every atom two crews run on (the planner admits none other), so
@@ -221,7 +225,7 @@ fn build<T: MmaIn, U: Elem, S: Fn(&mut Kernel, Sc, Sc) -> Gmem<T>>(
     k.grid([Sc::from(gm), Sc::from(gn), gz]);
     k.warps(cfg.warps[0] * cfg.warps[1]);
 
-    let (bx, by) = tile_order(&mut k, gm, gn, cfg.group_m);
+    let (bx, by) = tile_order(&mut k, gm, gn);
     let (row0, col0) = (bx * bm, by * bn);
     let n_bound = bound(n, bn);
     let a_tile = a_source(&mut k, a, if partial { &None } else { &bb }, row0.clone());
@@ -320,7 +324,6 @@ impl MergeSpec {
             tile: [self.tile[0], self.tile[1], 16],
             stages: 1,
             warps: [4, 1],
-            group_m: 0,
             unroll: false,
             core: Core::Warp,
             crews: 1,
@@ -358,16 +361,13 @@ fn merge<T: Elem, U: Elem>(spec: &MergeSpec) -> Program {
     k.finish()
 }
 
-/// The `(row, col)` tile of this block, walking groups of `group_m` tile rows.
-pub(super) fn tile_order(k: &mut Kernel, gm: impl Into<Sc>, gn: usize, group_m: usize) -> (Sc, Sc) {
-    if group_m == 0 {
-        return (k.block(0), k.block(1));
-    }
+/// The `(row, col)` tile of this block, walking groups of [`GROUP_ROWS`] tile rows.
+pub(super) fn tile_order(k: &mut Kernel, gm: impl Into<Sc>, gn: usize) -> (Sc, Sc) {
     let gm = gm.into();
     let id = k.block(0) + k.block(1) * gm.clone();
-    let first_m = id.clone() / (group_m * gn) * group_m;
-    let rows = (gm - first_m.clone()).min(group_m);
-    let within = id % (group_m * gn);
+    let first_m = id.clone() / (GROUP_ROWS * gn) * GROUP_ROWS;
+    let rows = (gm - first_m.clone()).min(GROUP_ROWS);
+    let within = id % (GROUP_ROWS * gn);
     (first_m + within.clone() % rows.clone(), within / rows)
 }
 

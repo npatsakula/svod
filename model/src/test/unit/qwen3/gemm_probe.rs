@@ -28,7 +28,7 @@ fn flat(n: usize, seed: &mut u64) -> Tensor {
 }
 
 const fn cfg(tile: [usize; 3], warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { tile, stages: 2, warps, group_m: 8, unroll, core: Core::Warp, crews: 1 }
+    GemmCfg { tile, stages: 2, warps, unroll, core: Core::Warp, crews: 1 }
 }
 
 #[test]

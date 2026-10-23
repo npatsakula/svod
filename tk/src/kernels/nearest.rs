@@ -345,7 +345,7 @@ pub const MAX_CANDIDATES: usize = 1 << 24;
 /// `score_part` and `index_part`, [`share_stride`] apart: each share's
 /// least in the units the scores are compared in and its first index, which
 /// [`nearest_merge`] folds; the blocks in flight walk groups of
-/// [`SPLIT_GROUP`] query blocks over every share, as the GEMM's tiles, so
+/// [`GROUP_ROWS`](super::gemm::GROUP_ROWS) query blocks over every share, as the GEMM's tiles, so
 /// they read the same query and candidate lines.
 ///
 /// With `k > 1` a row keeps its `k` least scores (`score [n, k]`, `index
@@ -438,7 +438,7 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
     // how many it takes.
     let (q_block, share) = match split {
         true => {
-            let (q_block, part) = tile_order(&mut k, blocks.clone(), splits, SPLIT_GROUP);
+            let (q_block, part) = tile_order(&mut k, blocks.clone(), splits);
             let first = part.clone() * tiles / splits;
             let count = (part.clone() + 1) * tiles / splits - first.clone();
             (q_block, Some((part, first, count)))
@@ -1490,10 +1490,6 @@ pub fn nearest_select(spec: &SelectSpec) -> Program {
     }
     k.finish()
 }
-
-/// The query blocks a split kernel's blocks in flight walk every share of
-/// the candidates over, as the GEMM's `group_m`.
-pub const SPLIT_GROUP: usize = 8;
 
 /// The elements one share's partial results of `n` rows span: whole merge
 /// blocks, so every share starts where the merge's vector loads may (a

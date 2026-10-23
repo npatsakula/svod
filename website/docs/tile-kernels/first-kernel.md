@@ -139,7 +139,7 @@ let (m, n, k) = (1000, 512, 256);
 let target = Target::for_device(&default_device()).expect("a GPU target");
 let device = Device { costs: svod_tk::probe::costs(&target)?.costs, target };
 let cfg =
-    GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], group_m: 8, unroll: true, core: Core::Warp, crews: 1 };
+    GemmCfg { tile: [64, 64, 32], stages: 2, warps: [2, 2], unroll: true, core: Core::Warp, crews: 1 };
 let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg };
 let a = Tensor::empty(&[m * k], DType::BFloat16);
 let b = Tensor::empty(&[n * k], DType::BFloat16);

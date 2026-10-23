@@ -36,10 +36,11 @@ the matrix product runs on the f32 accumulator, and the result is rounded once a
 | `residual` | `[batch·m, n]` added last |
 | `out_f32` | f32 output and residual, the accumulator stored unrounded |
 
-`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll, core, crews }`. Rows
+`GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], unroll, core, crews }`. Rows
 past `m` and columns past `n` are bounded views, so `m` and `n` are free. `k` must be a multiple
 of `bk`. `core: Core::Group` issues the products on `wgmma` (sm_90); `crews: 2` runs the two
-warp rows in ping-pong over one slot (CDNA).
+warp rows in ping-pong over one slot (CDNA). The blocks walk the output tiles in groups of
+8 tile rows (`gemm::GROUP_ROWS`), so blocks resident together read the same B tiles.
 
 There is no tile table. `config::Planner::gemm_ranked` enumerates tiles, `bk`, warp grids, ring
 depths and unrolling, keeps what the lowering runs on the target (the atoms tile the warp grid,

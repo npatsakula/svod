@@ -27,8 +27,8 @@ use crate::atoms::{Core, Device, Fill, GroupMmaAtom, Target};
 use crate::ir::{Axis, Orient, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
-use crate::kernels::gemm::{GemmCfg, KSLICE};
-use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, SPLIT_GROUP, SelectCfg, select_runs};
+use crate::kernels::gemm::{GROUP_ROWS, GemmCfg, KSLICE};
+use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, SelectCfg, select_runs};
 use crate::kernels::rows::NormCfg;
 use crate::layouts::{Issue, Swizzle, TileLayout, WarpGrid, chunked, fills_in_chunks};
 use crate::tune::Compiled;
@@ -133,7 +133,7 @@ impl GemmCfg {
 }
 
 pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], unroll: bool) -> GemmCfg {
-    GemmCfg { core: Core::Warp, tile, stages, warps, group_m: 8, unroll, crews: 1 }
+    GemmCfg { core: Core::Warp, tile, stages, warps, unroll, crews: 1 }
 }
 
 /// Search bound: the output tile's rows, the first of the knobs a GEMM-shaped
@@ -378,7 +378,7 @@ impl Problem {
         let (blocks, trips, stages) = (self.blocks(cfg), self.k / bk, cfg.stages);
         let unique = (self.batches * (self.m + self.n * halves) * self.k * ELEM) as f64;
         let flight = planner.sms().min(blocks).max(1);
-        let group = cfg.group_m.max(1).min(flight);
+        let group = GROUP_ROWS.min(flight);
         let distinct = group * bm + flight.div_ceil(group) * bn * halves;
         let shared = 1.0 - distinct as f64 / (flight * (bm + bn * halves)) as f64;
         let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
@@ -960,7 +960,7 @@ impl Planner {
     /// 0.63 of the whole tile, a 4-way one of 128 candidates at 0.77),
     /// enough that the blocks in flight (every SM's resident ones) span the
     /// query blocks they walk at once. Streamed, those are a group
-    /// of [`SPLIT_GROUP`] (the grid's raster), so the blocks share their
+    /// of [`GROUP_ROWS`] (the grid's raster), so the blocks share their
     /// query and candidate lines as a GEMM's grouped tiles do: whole, a
     /// block's own query rows fall out of the cache between its candidate
     /// tiles (at depth 1024, 104 TFLOP/s whole and 129 split at 32768² rows
@@ -991,7 +991,7 @@ impl Planner {
             Some(_) => {
                 let regs = cfg.registers(target, d, p.k, p.dtype)?;
                 let resident = self.resident(cfg.smem_bytes(d, p.dtype), regs, cfg.warps() as usize);
-                (self.sms() * resident.max(1), blocks.min(SPLIT_GROUP))
+                (self.sms() * resident.max(1), blocks.min(GROUP_ROWS))
             }
             None => (self.sms(), blocks),
         };
@@ -1732,11 +1732,11 @@ impl Nearest {
         let unique = ((self.n + self.m) * d * elem) as f64;
         let flight = planner.sms().min(blocks).max(1);
         // The query blocks and shares the blocks in flight read: split, a
-        // group of query blocks walks every share ([`SPLIT_GROUP`]).
+        // group of query blocks walks every share ([`GROUP_ROWS`]).
         let (queries, shares) = match splits {
             1 => (flight, 1),
             _ => {
-                let group = self.n.div_ceil(bq).min(SPLIT_GROUP);
+                let group = self.n.div_ceil(bq).min(GROUP_ROWS);
                 (flight.min(group), flight.div_ceil(group).min(splits))
             }
         };

@@ -367,7 +367,7 @@ pub(crate) fn group_families(target: &Target) -> Vec<Launch> {
     tiles
         .into_iter()
         .map(|(tile, warps, stages)| {
-            let cfg = GemmCfg { tile, stages, warps, group_m: 8, unroll: false, core: Core::Group, crews: 1 };
+            let cfg = GemmCfg { tile, stages, warps, unroll: false, core: Core::Group, crews: 1 };
             assert!(cfg.fits(target), "{cfg:?} fits the warpgroup core");
             let (m, n, k) = (tile[0] + 2, tile[1] - 3, 3 * tile[2]);
             let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg };

@@ -293,12 +293,12 @@ fn gemm_nt(m: usize, n: usize, k: usize, bm: usize, bn: usize, bk: usize, stages
 
 /// A plain bf16 `c = a·bᵀ` program for two crews: a 2×4 warp grid over one slot.
 fn gemm_nt_crews(m: usize, n: usize, k: usize, tile: [usize; 3]) -> Program {
-    let cfg = GemmCfg { tile, stages: 1, warps: [2, 4], group_m: 0, unroll: false, core: Core::Warp, crews: 2 };
+    let cfg = GemmCfg { tile, stages: 1, warps: [2, 4], unroll: false, core: Core::Warp, crews: 2 };
     gemm::<BF16>(&GemmSpec { m, n, k, batch: Batch::Static(1), epilogue: Epilogue::default(), cfg })
 }
 
 fn gemm_nt_batched(m: usize, n: usize, k: usize, tile: [usize; 3], stages: usize, batch: Batch) -> Program {
-    let cfg = GemmCfg { core: Core::Warp, tile, stages, warps: [2, 4], group_m: 0, unroll: true, crews: 1 };
+    let cfg = GemmCfg { core: Core::Warp, tile, stages, warps: [2, 4], unroll: true, crews: 1 };
     gemm::<BF16>(&GemmSpec { m, n, k, batch, epilogue: Epilogue::default(), cfg })
 }
 

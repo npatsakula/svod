@@ -62,7 +62,7 @@ fn gemm_matches_the_interpreter(
 ) {
     let Some(target) = super::device_target() else { return };
     let stages = target.fill.stages(stages);
-    let cfg = GemmCfg { group_m: 0, ..gemm_cfg([bm, bn, bk], stages, [wr, wc], true) };
+    let cfg = gemm_cfg([bm, bn, bk], stages, [wr, wc], true);
     check_gemm(&declared(target), m, n, k, cfg);
 }
 
@@ -227,15 +227,13 @@ fn gemm_throughput_probe() {
         cfgs.push(pick);
     }
     for cfg in cfgs {
-        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], group_m, unroll, core, crews } = cfg;
+        let GemmCfg { tile: [bm, bn, bk], stages, warps: [wr, wc], unroll, core, crews } = cfg;
         let (prog, lowering) = (plain_gemm(m, n, k, cfg), cfg.lowering(&planner.device));
         let c_t = Tensor::empty(&[m * n], DType::BFloat16);
         let out = graph_launch(prog, &lowering, &[&a_t, &b_t, &c_t]).unwrap();
         let picked = if cfg == pick { " (tuner's pick)" } else { "" };
         plans.push((
-            format!(
-                "tk {bm}x{bn}x{bk} s{stages} {wr}x{wc} group_m={group_m} unroll={unroll} {core:?} crews={crews}{picked}"
-            ),
+            format!("tk {bm}x{bn}x{bk} s{stages} {wr}x{wc} unroll={unroll} {core:?} crews={crews}{picked}"),
             out.prepare().unwrap(),
         ));
     }
