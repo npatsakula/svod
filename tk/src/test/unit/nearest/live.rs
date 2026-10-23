@@ -557,6 +557,23 @@ fn a_list_length_is_a_count_or_a_bound_variable() {
     assert!(matches!(tk::k_nearest(&x, &x, none.as_sint(), Nearest::default()), Err(tk::Error::NoScores { .. })));
 }
 
+/// Rows quantized beforehand for a reranked search are those of the tensor
+/// they stand in for: another shape is an error before any device is asked.
+#[test]
+fn prequantized_rows_of_another_shape_are_an_error() {
+    let x = Tensor::from_slice(vec![0.0f32; 8]).try_reshape([2, 4]).unwrap();
+    let other = Tensor::from_slice(vec![0.0f32; 12]).try_reshape([3, 4]).unwrap();
+    let q = tk::Quantized::new(&other).unwrap();
+    for (x8, c8, operand) in [(Some(&q), None, "x8"), (None, Some(&q), "c8")] {
+        let rerank = tk::Rerank { x8, c8, ..tk::Rerank::default() };
+        let got = tk::k_nearest_reranked(&x, &x, 1usize, Nearest::default(), rerank);
+        assert!(matches!(got, Err(tk::Error::Shape { operand: o, .. }) if o == operand), "{operand}");
+    }
+    let q = tk::Quantized::new(&x).unwrap();
+    let rerank = tk::Rerank { x8: Some(&q), c8: Some(&q), ..tk::Rerank::default() };
+    assert!(tk::k_nearest_reranked(&x, &x, 1usize, Nearest::default(), rerank).is_ok());
+}
+
 /// Rows that may bind to none (a variable down to 0): the kernel and the
 /// graph (f32) keep the lists of the rows bound. (Bound to none, the graph's
 /// own kernels launch an empty grid, which the runtime refuses.)

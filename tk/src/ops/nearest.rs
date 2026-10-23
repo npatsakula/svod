@@ -116,8 +116,10 @@ pub struct Rerank<'a> {
     /// `x` and `c` quantized beforehand ([`Quantized::new`]), else here.
     pub x8: Option<&'a Quantized>,
     pub c8: Option<&'a Quantized>,
-    /// The search's rows: [`ScalarDType::Int8`] or [`ScalarDType::Float16`];
-    /// `None`, whichever runs faster.
+    /// The search's rows: [`ScalarDType::Int8`], or a 16-bit float the
+    /// device has a kernel for ([`ScalarDType::Float16`],
+    /// [`ScalarDType::BFloat16`]); `None`, the faster of 8-bit and f16. A
+    /// type without a kernel lists the rows on the f32 graph.
     pub search: Option<ScalarDType>,
 }
 
@@ -155,6 +157,13 @@ pub fn k_nearest_reranked(
             Some(_) => Ok((cut(score).context(graph_err())?, cut(index).context(graph_err())?)),
         }
     };
+    // Rows quantized beforehand are the rows given, quantized.
+    for (operand, given, rows) in [("x8", rerank.x8, &xs), ("c8", rerank.c8, &cs)] {
+        let Some(q) = given else { continue };
+        let got = shape(&q.rows)?;
+        let shape_err = ShapeSnafu { op: OP, operand, got: fmt_shape(&got), expected: fmt_shape(rows) };
+        ensure!(got == *rows, shape_err);
+    }
     let planner = super::planner(&x.device());
     let (Some(planner), [_, _], Some(m)) = (planner, &xs[..], cs.first().and_then(SInt::as_const)) else {
         return live_k(graph_k(&xf, &cf, top, opts).context(graph_err())?);
@@ -188,7 +197,7 @@ pub fn k_nearest_reranked(
             let scaled = Scaled { x_scale: x8.scale.clone(), c_scale: c8.scale.clone(), x_sq, c_sq };
             picked(&x8.rows, &c8.rows, coarse, opts, Some(&scaled), pick)?
         }
-        _ => picked(&x.cast(DType::Float16), &c.cast(DType::Float16), coarse, opts, None, pick)?,
+        half => picked(&x.cast(DType::Scalar(half)), &c.cast(DType::Scalar(half)), coarse, opts, None, pick)?,
     };
     let index = if coarse == 1 { index.try_unsqueeze(1).context(graph_err())? } else { index };
     let index = index.contiguous();

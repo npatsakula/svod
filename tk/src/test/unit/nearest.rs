@@ -1617,6 +1617,28 @@ fn lists_match_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join: bo
     });
 }
 
+/// A filtered listing of a few rows over many candidates runs in more
+/// shares than its steps fill evenly (on sm_86 two row blocks take 128
+/// shares of 1000 steps, 8 each, the last starting past them): a share
+/// past the last step lists nothing, its trips below zero running none,
+/// rather than reading past its scores (a share of 300 000 candidates
+/// faulted 8 GB before them).
+#[test]
+fn a_listing_share_past_the_last_step_lists_nothing() {
+    use crate::kernels::nearest::SelectCfg;
+    super::ops::untuned(|| {
+        let (n, m, d, k) = (5, 32_000, 16, 33);
+        let case = Case::draw(n, m, d, draw(Metric::NegDot, NONE, None, false, false), 5);
+        let (x, c, opts) = operands(&case, DType::BFloat16, false);
+        let select = Some(SelectCfg { warps: 4, queue: 2, filter: true });
+        let cfg = NearestCfg { select, ..NearestCfg::new(16, 32, 2) };
+        let pick = |_: &Planner, _: &[NearestCfg], spec: NearestSpec| NearestSpec { cfg, ..spec };
+        let (score, index) = tk::nearest::picked(&x, &c, k, options(&case, &opts), None, pick).unwrap();
+        super::ops::assert_kernel(&score, "nearest_select");
+        case.check_list("shares", k, &host(&score), &host(&index), 1e-3, false);
+    });
+}
+
 /// The op's filtered score matrix bounds each row's list by the `k`-th of
 /// its trips' leasts, listed from them, and keeps the reference's lists,
 /// resident and streamed, whole and split. (The op once bounded the lists

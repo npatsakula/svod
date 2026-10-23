@@ -140,7 +140,8 @@ Shared memory above 48 KB is one dynamic array on CUDA; candidates are filtered 
 :::note[Invariants kept by the emitter, not the author]
 Pure values are listed at the loop level their inputs require. Register accesses are scalar.
 Shared and global accesses are `SHRINK` vector accesses. Gated stores sit inside an `If`.
-Carried values move into their `phi` at the end of the block that defines them.
+Carried values move into their `phi` at the end of the block that defines them. A loop whose
+extent may fall below zero runs no trip (the range's end is floored).
 :::
 
 `TK_DUMP_LIST=1` prints the emitted list (see [Testing and Debugging](./testing-and-debugging)).

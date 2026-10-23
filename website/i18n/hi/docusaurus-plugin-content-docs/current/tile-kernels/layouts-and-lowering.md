@@ -140,7 +140,8 @@ barriers के साथ चलाता है। AMD पर f32 `exp2` hardwa
 :::note[Emitter के invariants, लेखक के नहीं]
 Pure values उस loop level पर सूचीबद्ध होती हैं जिसकी उनके inputs को ज़रूरत है। Register accesses
 scalar होते हैं। Shared और global accesses `SHRINK` vector accesses होते हैं। Gated stores एक `If`
-के अंदर रहते हैं। Carried values उन्हें परिभाषित करने वाले block के अंत में अपने `phi` में जाती हैं।
+के अंदर रहते हैं। Carried values उन्हें परिभाषित करने वाले block के अंत में अपने `phi` में जाती हैं। जिस loop
+का extent शून्य से नीचे जा सकता है वह कोई trip नहीं चलाता (range का end शून्य पर floor होता है)।
 :::
 
 `TK_DUMP_LIST=1` emit की गई list छापता है (देखें [टेस्टिंग और डिबगिंग](./testing-and-debugging))।

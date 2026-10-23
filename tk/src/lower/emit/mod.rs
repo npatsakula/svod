@@ -628,7 +628,17 @@ impl<'a> Emit<'a> {
                 self.reg_store_vec(c.phi, j, w, x);
             }
         }
-        let (start, extent) = (self.sc(l.start), self.sc(l.extent));
+        let (start, mut extent) = (self.sc(l.start), self.sc(l.extent));
+        // An extent below zero runs no trip, as the interpreter runs none: a
+        // range's end is unsigned to the backend, so where the bounds say it
+        // may fall below zero (a share of steps past the last) it is floored.
+        let bound = |iv| {
+            let (_, u) = self.inductions.get(&iv)?;
+            Some((u.vmin().try_int()?, u.vmax().try_int()?))
+        };
+        if self.prog.bounds(l.extent, &bound).is_some_and(|(lo, _)| lo < 0) {
+            extent = self.hoist(extent.try_max(&c32(0)).expect("a floored extent"));
+        }
         let u = l.unroll.max(1) as i64;
         let constant = self.constant(l.extent);
         if u == 1 {

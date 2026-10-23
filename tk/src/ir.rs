@@ -336,8 +336,9 @@ pub struct Carried {
     pub next: ValId,
 }
 
-/// `iv` runs over `start..start + extent`; several loops may share an `iv`
-/// (and the scalars defined from it) over consecutive ranges.
+/// `iv` runs over `start..start + extent` (no trip at all below an extent
+/// of one); several loops may share an `iv` (and the scalars defined from
+/// it) over consecutive ranges.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Loop {
     pub iv: ScalarId,
@@ -567,9 +568,23 @@ impl Program {
                     let v = [f(a0, b0)?, f(a0, b1)?, f(a1, b0)?, f(a1, b1)?];
                     Some((v.into_iter().min()?, v.into_iter().max()?))
                 };
+                // `x − [c < x]` (a count less one where it passes `c`: a
+                // register-staged ring's steady trips) stays at `x` up to
+                // `c` and a step under it past, never a step under `x`'s
+                // own low.
+                let less_one_past = |b: ScalarId| match self.scalar(b) {
+                    Scalar::Bin(BinOp::Lt, c, x) if *x == *a => match self.scalar(*c) {
+                        Scalar::Const(c) => Some(*c),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 match op {
                     BinOp::Add => Some((a0.checked_add(b0)?, a1.checked_add(b1)?)),
-                    BinOp::Sub => Some((a0.checked_sub(b1)?, a1.checked_sub(b0)?)),
+                    BinOp::Sub => match less_one_past(*b) {
+                        Some(c) => Some((if a0 > c { a0 - 1 } else { a0 }, if a1 > c { a1 - 1 } else { a1 })),
+                        None => Some((a0.checked_sub(b1)?, a1.checked_sub(b0)?)),
+                    },
                     BinOp::Mul => corners(i64::checked_mul),
                     BinOp::Div if b0 > 0 || b1 < 0 => corners(i64::checked_div),
                     BinOp::Rem if b0 > 0 || b1 < 0 => {

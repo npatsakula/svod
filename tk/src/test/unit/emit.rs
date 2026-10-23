@@ -188,6 +188,47 @@ fn a_guarded_scalar_read_stays_under_its_guard(max: i64, div: i64, guarded: bool
     }
 }
 
+/// A loop whose extent may fall below zero runs no trip, as the interpreter
+/// runs none: the backend compares a range's counter unsigned, so a negative
+/// end would run billions of trips (a listing's share of steps starting
+/// past the last read 8 GB before its scores on sm_86), and the emitter
+/// floors an extent the bounds let below zero. One the bounds keep at or
+/// above zero is listed as it is: a share's count less one where it is
+/// positive (a register-staged ring's steady trips, `x − [0 < x]`) is
+/// bounded as such, not a step under the count's own low.
+#[test_case(4, false, true; "a share past the last steps")]
+#[test_case(9, false, false; "every share within the steps")]
+#[test_case(9, true, false; "a share's steady trips")]
+fn a_loop_extent_below_zero_runs_no_trip(steps: i64, steady: bool, floored: bool) {
+    let tile = Shape::new(16, 32);
+    let mut k = Kernel::new("shares");
+    k.warps(1);
+    let y = k.param::<F32>("y", ParamKind::Out, 4 * tile.elems());
+    k.grid([Sc::from(4), Sc::from(1), Sc::from(1)]);
+    // A share of three steps each: the fourth starts at nine.
+    let count = (Sc::from(steps) - k.block(0) * 3).min(3);
+    let mut count = Sc::Id(k.intern(count));
+    if steady {
+        count = count.clone() - Sc::from(0).lt(count);
+    }
+    let zero = k.zeros::<F32>(tile);
+    let one = k.fill::<F32>(tile, Const::Float(1.0));
+    let [sum] = k.loop_(count, [zero], |k, _, [sum]| [k.binary(sum, one, BinaryOp::Add)]);
+    let at = k.block(0) * tile.elems();
+    let out = k.view(y, at, [tile.cols, 1], tile, [None, None]);
+    k.store(out, sum);
+    let device = Device { target: crate::atoms::sm86(), costs: Costs::default() };
+    let linear = linear(k.finish(), &Lowering::uniform(&device, false, WarpGrid { rows: 1, cols: 1 }));
+    let Op::Linear(ops::Linear { ops: list }) = linear.op() else { panic!("a linear list") };
+    let ends: Vec<&Arc<UOp>> =
+        list.iter().filter_map(|u| if let Op::Range(r) = u.op() { Some(&r.end) } else { None }).collect();
+    let [end] = ends[..] else { panic!("one loop, {} ranges", ends.len()) };
+    let zero = |u: &Arc<UOp>| matches!(u.op(), Op::Const(c) if c.0 == ConstValue::Int(0));
+    let max0 = |u: &Arc<UOp>| matches!(u.op(), Op::Binary(svod_ir::BinaryOp::Max, _, c) if zero(c));
+    let end = if let Op::Cast(..) = end.op() { end.op().sources()[0].clone() } else { end.clone() };
+    assert_eq!(max0(&end), floored, "range end {:?}", end.op().as_ref());
+}
+
 /// A tile re-held through the relayout scratch lowers in a program that
 /// interns no zero: the scratch is addressed from its start, not at an
 /// offset scalar of the program.
