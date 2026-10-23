@@ -411,7 +411,7 @@ fn qwen3_gemm_candidates_probe() {
                     for warps in [[2, 2], [2, 4], [4, 2], [4, 4]] {
                         for unroll in [false, true] {
                             let cfg = gemm_cfg([bm, bn, bk], 2, warps, unroll);
-                            let fits = cfg.fits(target) && cfg.smem_bytes(epilogue.gated) <= target.smem_bytes;
+                            let fits = cfg.fits(target) && cfg.smem_bytes(epilogue.gated, 2) <= target.smem_bytes;
                             if fits && !shortlist.contains(&cfg) {
                                 lattice.push(cfg);
                             }

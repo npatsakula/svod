@@ -187,7 +187,7 @@ fn cost_model_replay() {
         let row = |c: &GemmCfg| {
             let blocks = m.div_ceil(c.tile[0]) * n.div_ceil(c.tile[1]);
             let regs = c.registers(target, halves).expect("ranked");
-            (format!("{c:?}"), at_once(blocks, c.smem_bytes(epilogue.gated), regs, c.warps[0] * c.warps[1]))
+            (format!("{c:?}"), at_once(blocks, c.smem_bytes(epilogue.gated, 2), regs, c.warps[0] * c.warps[1]))
         };
         print(label, ranked.iter().map(row).collect(), ns);
     }
@@ -195,8 +195,10 @@ fn cost_model_replay() {
         attentions.into_iter().zip(ATTENTION_SHAPES.into_iter().filter(|s| wanted(s.0)))
     {
         let row = |c: &FaCfg| {
-            let (smem, regs) =
-                (c.smem_bytes(d, false) + c.scratch_bytes(target), c.registers(target, d, false).expect("ranked"));
+            let (smem, regs) = (
+                c.smem_bytes(d, false) + c.scratch_bytes(&planner.device),
+                c.registers(target, d, false).expect("ranked"),
+            );
             (format!("{c:?}"), at_once(batch * heads * t.div_ceil(c.bq), smem, regs, c.warps()))
         };
         print(label, ranked.iter().map(row).collect(), ns);

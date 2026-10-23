@@ -5,10 +5,10 @@ use std::fmt;
 
 use super::rows::NormCfg;
 use super::{Batch, batch_offset, bound, load_f32};
-use crate::atoms::{Core, Device, Target};
+use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
-use crate::layouts::WarpGrid;
+use crate::layouts::{Relayout, WarpGrid};
 use crate::lower::Lowering;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -184,12 +184,18 @@ impl FaCfg {
         self.key_warps * self.stages * slot * 2
     }
 
-    /// The shared scratch the f32 score tile crosses to become the P·V
-    /// operand where the core's accumulator cannot feed a product as it
-    /// stands (RDNA3); nothing where it can.
-    pub fn scratch_bytes(&self, target: &Target) -> usize {
+    /// The shared scratch the probabilities cross to become the P·V operand
+    /// where the core's accumulator cannot feed a product as it stands
+    /// (RDNA3) and the inference re-holds them through shared memory rather
+    /// than a lane exchange, the device's costs deciding
+    /// ([`crate::atoms::MmaAtom::accumulator_relayout`]): the 16-bit tile,
+    /// one per key warp. Nothing otherwise.
+    pub fn scratch_bytes(&self, device: &Device) -> usize {
+        let Device { target, costs } = device;
         match target.geometry() {
-            Some(atom) if !atom.accumulator_feeds(target.wave) => self.bq * self.bkv * 4,
+            Some(atom) if atom.accumulator_relayout(target.wave, costs) == Relayout::ViaSmem => {
+                self.key_warps * self.bq * self.bkv * 2
+            }
             _ => 0,
         }
     }

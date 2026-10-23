@@ -26,7 +26,7 @@ use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch_all;
 use crate::lower::sync::insert_barriers;
 use crate::lower::{Lowering, lower};
-use crate::ops::config::{self, Nearest};
+use crate::ops::config::{self, Nearest, Planner};
 use crate::schedule::Schedule;
 
 use super::{conv_first_eight, declared, first_eight, planner};
@@ -263,7 +263,7 @@ fn every_family_lowers_keeps_its_numbers_and_compiles(target: Target, facts: Fac
     assert!(config::has_kernels(&target));
     if let Some(free) = facts.free_scores {
         let atom = target.mma.first().expect("a matrix core");
-        assert_eq!(atom.accumulator_feeds(target.wave), free, "what the planner charges for the scratch");
+        assert_eq!(atom.accumulator_feeds(target.wave), free, "whether the scores feed the product as they stand");
     }
     let mut launches = families(&target);
     if target.arch == hopper().arch {
@@ -670,22 +670,18 @@ fn register_staged_families_match_on_cuda() {
     check_on_device(&Target { fill: Fill::Staged, ldmatrix: false, ..target });
 }
 
-/// Every candidate the op layer may plan lowers (the tune store would
-/// otherwise time a failure): the GEMM lists of a large, a small-M and a
-/// ragged shape (the large one as deep as the shortlist compiles, on one
-/// target of each fill path), the attention lists of every head size and
-/// both query regimes, the convolution lists of every YOLO class, and the
-/// nearest lists of a shallow, a middle and a deep self-join under several
-/// metrics, floors and groups, and of the depths that stream the rows (a
-/// last chunk overhanging 800), a row's least alone and lists of 4 to 32.
-#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
-#[test_case(amd(AmdArch::Gfx1151, 40), false; "gfx1151")]
-#[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
-#[test_case(crate::atoms::sm86(), true; "sm86")]
-#[test_case(hopper(), false; "hopper")]
-fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
-    let planner = planner(target.clone());
-    let mut launches: Vec<Launch> = vec![];
+/// The launches of every candidate the op layer may plan on the planner's
+/// target, each with the shared memory its ranking admitted it with: the
+/// GEMM lists of a large, a small-M and a ragged shape (the large one as
+/// deep as the shortlist compiles where `shortlist_deep`), the attention
+/// lists of every head size and both query regimes, the convolution lists
+/// of every YOLO class (a split's merge after its kernel, no shared memory
+/// of its own), and the nearest lists of a shallow, a middle and a deep
+/// self-join under several metrics, floors and groups, and of the depths
+/// that stream the rows (a last chunk overhanging 800), a row's least
+/// alone and lists of 4 to 32.
+fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, usize)> {
+    let mut launches = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
         for gated in [false, true] {
             let ranked = planner.gemm_ranked(1, m, n, k, gated);
@@ -693,7 +689,9 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
             for cfg in config::distinct(&ranked).take(deep) {
                 let epilogue = Epilogue { gated, ..Epilogue::DEFAULT };
                 let spec = GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue, cfg };
-                launches.push((format!("{m}x{n}x{k} {cfg:?}"), gemm::<BF16>(&spec), cfg.lowering(&planner.device)));
+                let launch =
+                    (format!("{m}x{n}x{k} g{gated} {cfg:?}"), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
+                launches.push((launch, cfg.smem_bytes(gated, 2)));
             }
         }
     }
@@ -712,18 +710,20 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
                     scale: 0.125,
                     cfg,
                 };
-                launches.push((format!("d{d} t{t} {cfg:?}"), attention::<BF16>(&spec), cfg.lowering(&planner.device)));
+                let launch = (format!("d{d} t{t} {cfg:?}"), attention::<BF16>(&spec), cfg.lowering(&planner.device));
+                launches.push((launch, cfg.smem_bytes(d, false) + cfg.scratch_bytes(&planner.device)));
             }
         }
     }
     for class in super::conv::YOLO {
         let g = super::conv::yolo_geom(class);
         let [ho, wo] = g.out_hw();
-        for c in conv_first_eight(&planner, 1, ho * wo, &g) {
+        for c in conv_first_eight(planner, 1, ho * wo, &g) {
             let spec =
                 ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, cfg: c.gemm, split: c.split };
-            for (prog, lowering) in spec.programs::<F16>(&planner.device) {
-                launches.push((format!("{g:?} {c:?}"), prog, lowering));
+            for (i, (prog, lowering)) in spec.programs::<F16>(&planner.device).into_iter().enumerate() {
+                let smem = if i == 0 { c.gemm.smem_bytes(false, 2) } else { 0 };
+                launches.push(((format!("{g:?} {c:?} #{i}"), prog, lowering), smem));
             }
         }
     }
@@ -740,14 +740,54 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
         (768, Metric::SquaredL2, none, false, 8),
         (768, Metric::NegDot, none, false, 32),
     ] {
-        let p = Nearest { n: 1 << 16, m: 1 << 16, d, dtype: ScalarDType::Float16, metric, floors, groups, k };
+        let dtype = ScalarDType::Float16;
+        let p = Nearest { n: 1 << 16, m: 1 << 16, d, dtype, metric, floors, groups, k };
         for cfg in first_eight(&planner.nearest_ranked(p)) {
             let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Default::default() };
             let name = format!("nearest d{d} {metric:?} {floors:?} {groups} k{k} {cfg:?}");
-            launches.push((name, nearest::<BF16>(&spec), cfg.lowering(&planner.device)));
+            launches.push(((name, nearest::<BF16>(&spec), cfg.lowering(&planner.device)), cfg.smem_bytes(d, dtype)));
         }
     }
-    each(launches, |_, prog, lowering| drop(linear(prog, &lowering)));
+    launches
+}
+
+/// The static shared memory a lowered program declares: its rings and any
+/// scratch the lowering added (a relayout through shared memory).
+fn shared_bytes(linear: &Arc<UOp>) -> usize {
+    let local = |u: &Arc<UOp>| match u.op() {
+        Op::Buffer(ops::Buffer { shape, arg }) if arg.addrspace == Some(svod_dtype::AddrSpace::Local) => Some(
+            shape.vmax().try_int().expect("a committed size") as usize * u.dtype().scalar().expect("a type").bytes(),
+        ),
+        _ => None,
+    };
+    linear.toposort().iter().filter_map(local).sum()
+}
+
+/// Every candidate the op layer may plan ([`ranked_launches`]) lowers (the
+/// tune store would otherwise time a failure), declaring the shared memory
+/// its ranking admitted it with: the rings as the config's `smem_bytes`
+/// counts them and, where the lowering re-holds a tile through shared
+/// memory, that scratch ([`FaCfg::scratch_bytes`]), so a `Rejected::Smem`
+/// is the kernel's own count.
+#[test_case(amd(AmdArch::Gfx1100, 48), false; "gfx1100")]
+#[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
+#[test_case(amd(AmdArch::Gfx1151, 40), false; "gfx1151")]
+#[test_case(amd(AmdArch::Gfx942, 304), false; "gfx942")]
+#[test_case(crate::atoms::sm86(), true; "sm86")]
+#[test_case(hopper(), false; "hopper")]
+fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
+    let planner = planner(target.clone());
+    let (launches, admitted): (Vec<Launch>, Vec<usize>) = ranked_launches(&planner, shortlist_deep).into_iter().unzip();
+    let admitted: std::collections::HashMap<String, usize> =
+        launches.iter().map(|(name, ..)| name.clone()).zip(admitted).collect();
+    each(launches, |name, prog, lowering| {
+        let declared = shared_bytes(&linear(prog, &lowering));
+        assert_eq!(
+            declared, admitted[name],
+            "declares {declared} bytes of shared memory, admitted with {}",
+            admitted[name]
+        );
+    });
 }
 
 /// The attention program carries the softmax forms its config declares: a

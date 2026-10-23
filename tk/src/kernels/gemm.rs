@@ -132,10 +132,12 @@ impl GemmCfg {
         if self.crews == 2 { self.tile[2] / KSLICE } else { 1 }
     }
 
-    /// Static shared memory of the operand ring, in bytes of a 16-bit type.
-    pub fn smem_bytes(&self, gated: bool) -> usize {
+    /// Static shared memory of the operand ring over elements of `bytes`
+    /// bytes: what [`mainloop`] allocates, a slot of the A tile and of
+    /// each B tile (two gated) per stage.
+    pub fn smem_bytes(&self, gated: bool, bytes: usize) -> usize {
         let [bm, bn, bk] = self.tile;
-        self.stages * (bm + bn * if gated { 2 } else { 1 }) * bk * 2
+        self.stages * (bm + bn * if gated { 2 } else { 1 }) * bk * bytes
     }
 }
 

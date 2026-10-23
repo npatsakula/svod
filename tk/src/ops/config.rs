@@ -339,7 +339,7 @@ impl Problem {
         // A step is at least two matrix-core depths, unless the reduction dim
         // allows nothing deeper.
         let depth = 2 * atom.k as usize;
-        let smem = cfg.smem_bytes(gated);
+        let smem = cfg.smem_bytes(gated, ELEM);
         if bk < depth && self.k.is_multiple_of(depth) {
             return Err(Rejected::Shallow);
         }
@@ -1235,7 +1235,7 @@ impl Attention {
     pub fn admit(&self, planner: &Planner, cfg: &FaCfg) -> Result<(f64, u32), Rejected> {
         let Device { target, costs } = &planner.device;
         let (bq, bkv, d, kw) = (cfg.bq, cfg.bkv, self.d, cfg.key_warps);
-        let smem = cfg.smem_bytes(d, self.bias) + cfg.scratch_bytes(target);
+        let smem = cfg.smem_bytes(d, self.bias) + cfg.scratch_bytes(&planner.device);
         if !cfg.fits(target, d, self.bias) {
             return Err(Rejected::Lowers);
         }
@@ -1360,7 +1360,7 @@ impl Attention {
     fn two_rows_pay(&self, planner: &Planner, one: &FaCfg, wide: &FaCfg) -> bool {
         let target = &planner.device.target;
         let resident = |cfg: &FaCfg| -> Option<usize> {
-            let smem = cfg.smem_bytes(self.d, self.bias) + cfg.scratch_bytes(target);
+            let smem = cfg.smem_bytes(self.d, self.bias) + cfg.scratch_bytes(&planner.device);
             Some(planner.resident(smem, cfg.registers(target, self.d, self.bias)?, cfg.warps() as usize))
         };
         one.core == Core::Warp

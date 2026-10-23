@@ -219,7 +219,7 @@ fn conv_candidates_lower() {
             assert!(!unsplit[..i].iter().any(same), "one pipeline per tile and grid: {c:?}");
         }
         for ConvCfg { gemm: c, split } in cands {
-            assert!(c.fits(&target) && g.cin.is_multiple_of(c.tile[2]) && c.smem_bytes(false) <= target.smem_bytes);
+            assert!(c.fits(&target) && g.cin.is_multiple_of(c.tile[2]) && c.smem_bytes(false, 2) <= target.smem_bytes);
             assert!((g.k() / c.tile[2]).is_multiple_of(split));
         }
     }

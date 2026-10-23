@@ -390,10 +390,11 @@ fn with(cfg: FaCfg, spec: AttnSpec) -> AttnSpec {
 #[test_case(biased(counted(cached(5, 96, [2, 2, 128], false, 8, 2))), &[64, 96]; "cache biased: d 128, eight counted appended, two splits")]
 fn attention_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     matches_a_direct_softmax(&case(spec.clone(), lens));
-    let Some(target) = super::device_target() else { return };
+    let Some(planner) = super::device_planner() else { return };
+    let target = planner.device.target.clone();
     let spec = AttnSpec { cfg: FaCfg { stages: target.fill.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
     let bias = spec.mask.bias.is_some();
-    let smem = spec.cfg.smem_bytes(spec.d, bias) + spec.cfg.scratch_bytes(&target);
+    let smem = spec.cfg.smem_bytes(spec.d, bias) + spec.cfg.scratch_bytes(&planner.device);
     if !spec.cfg.fits(&target, spec.d, bias) || smem > target.smem_bytes {
         return eprintln!("skipped on the device: {:?} does not fit {}", spec.cfg, target.arch.target_name());
     }

@@ -81,7 +81,7 @@ fn assert_valid(list: &[GemmCfg], target: &Target, k: usize, gated: bool) {
     assert!(!list.is_empty(), "{list:?}");
     for (i, c) in list.iter().enumerate() {
         assert!(c.fits(target) && k.is_multiple_of(c.tile[2]), "{c:?}");
-        assert!(c.smem_bytes(gated) <= target.smem_bytes, "{c:?}");
+        assert!(c.smem_bytes(gated, 2) <= target.smem_bytes, "{c:?}");
         assert!(!list[..i].contains(c), "{c:?} twice");
     }
     let short = first_eight(list);
@@ -179,7 +179,7 @@ fn a_gated_gemm_is_a_double_width_problem() {
     assert_valid(&gated, &target, 1024, true);
     assert!(gated.iter().all(|c| c.tile[2] >= 32), "{gated:?}");
     let p = config::Problem { batches: 1, m: 4096, n: 3072, k: 1024, halves: 2 };
-    assert!(deep.smem_bytes(true) > target.smem_bytes && p.admit(&planner(target), &deep).is_err());
+    assert!(deep.smem_bytes(true, 2) > target.smem_bytes && p.admit(&planner(target), &deep).is_err());
 }
 
 /// The layout count over-counts gfx11's replicated WMMA fragments: at
@@ -1022,7 +1022,7 @@ fn a_bias_rides_its_own_ring_slot(target: Target) {
     let planner = planner(target.clone());
     let ranked = planner.attention_ranked(8, 512, 512, 64, false, true);
     assert!(!ranked.is_empty());
-    let within = |c: &FaCfg| c.smem_bytes(64, true) + c.scratch_bytes(&target) <= target.smem_bytes;
+    let within = |c: &FaCfg| c.smem_bytes(64, true) + c.scratch_bytes(&planner.device) <= target.smem_bytes;
     assert!(ranked.iter().all(|c| c.fits(&target, 64, true) && within(c)), "{ranked:?}");
     let biased = config::Attention { tiles: 8, t: 512, tk: 512, d: 64, causal: false, bias: true };
     let plain = config::Attention { bias: false, ..biased };
@@ -1209,7 +1209,7 @@ fn attention_candidates(d: usize, smem: usize) {
     assert!(list.iter().all(|c| c.smem_bytes(d, false) <= smem && c.fits(&target, d, false)), "{list:?}");
     for (i, c) in list.iter().enumerate() {
         assert!(!list[..i].contains(c), "{c:?} twice");
-        assert_eq!(c.scratch_bytes(&target), 0);
+        assert_eq!(c.scratch_bytes(&super::declared(target.clone())), 0);
     }
     let short = first_eight(&list);
     assert!(short.len() >= 4, "{short:?}");
@@ -1924,7 +1924,11 @@ fn a_bound_conv_batch_plans_per_image() {
 /// RDNA plans kernels from the lattice under its own facts: register-staged
 /// rings of one slot (rolled: there is nothing to fold) or two (unrolled
 /// over the slots), 16×16 WMMA-tileable warp grids, attention within 64 KB
-/// of LDS with its score relayout.
+/// of LDS. RDNA3's accumulator cannot feed the P·V product as it stands:
+/// under the declared costs (and gfx1151's measured ones) the inference
+/// exchanges the probabilities through lanes, no scratch, and only where a
+/// trip through shared memory is cheaper does the kernel declare one, the
+/// 16-bit tile per key warp.
 #[test]
 fn rdna_plans_register_staged_kernels() {
     let target = rdna3();
@@ -1932,13 +1936,23 @@ fn rdna_plans_register_staged_kernels() {
         kernel_plan(shape::linear(Some(&planner(target.clone())), &[BF16; 2], Some(&ext(&[4096, 4096])), 4096, false));
     assert_valid(&gemms, &target, 4096, false);
     assert!(first_eight(&gemms).iter().all(|c| c.unroll == (c.stages == 2) && c.fits(&target)), "{gemms:?}");
+    let declared = super::declared(target.clone());
+    let cheap_smem = Device { costs: Costs { smem_trip: 0.001, ..costs() }, ..declared.clone() };
+    let measured = Device { costs: super::gfx1151_costs(), ..declared.clone() };
     for (d, t) in [(64, 1500), (64, 1)] {
         let q = ext(&[1, t, 8, d]);
         let fa =
             kernel_plan(shape::attention(Some(&planner(target.clone())), &[BF16; 3], Some(&q), Some(&q), false, false));
-        let within = |c: &FaCfg| c.smem_bytes(d, false) + c.scratch_bytes(&target) <= 64 << 10;
+        let within = |c: &FaCfg| c.smem_bytes(d, false) + c.scratch_bytes(&declared) <= 64 << 10;
         assert!(fa.iter().all(|c| c.stages == 2 && within(c)), "{fa:?}");
-        assert!(fa.iter().all(|c| c.scratch_bytes(&target) == c.bq * c.bkv * 4), "RDNA3 re-holds its scores");
+        for c in fa.iter() {
+            assert_eq!(
+                (c.scratch_bytes(&declared), c.scratch_bytes(&measured)),
+                (0, 0),
+                "{c:?} exchanges through lanes"
+            );
+            assert_eq!(c.scratch_bytes(&cheap_smem), c.key_warps * c.bq * c.bkv * 2, "{c:?} through shared memory");
+        }
     }
     assert!(matches!(
         shape::norm(Some(&planner(target.clone())), &[BF16; 2], Some(&ext(&[37, 1024]))),
