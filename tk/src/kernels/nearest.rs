@@ -79,8 +79,8 @@ pub struct LaneQueue {
 }
 
 impl LaneQueue {
-    /// What a list config without its own takes: as wide as the lanes
-    /// CUDA's and RDNA's swapped products spread a row over, or more.
+    /// As wide as the lanes CUDA's and RDNA's swapped products spread a row
+    /// over, or more: what a list config without its own takes.
     pub const PORTABLE: Self = Self { width: 4, depth: 2, passes: false };
 }
 
@@ -1131,19 +1131,20 @@ impl SelectCfg {
     }
 }
 
-/// The trips whose leasts a filtered score matrix stores at once, a
-/// row's run of them a sector.
+/// The trips whose leasts a filtered score matrix stores at once: 8 a
+/// row, one 32-byte sector.
 const MINS_RUN: usize = 8;
 
 /// The scores a lane of [`nearest_select`] reads a step at most, one vector
 /// load.
 const SELECT_WIDE: usize = 4;
 
-/// The most scores a block of a score matrix holds where the device's
-/// memory is not known (1 GiB of them).
+/// Search bound: the most scores a block of a score matrix holds where the
+/// device's memory is not known (1 GiB of them).
 pub const SCRATCH: usize = 1 << 28;
 
-/// The share of device memory a block of a score matrix takes at most.
+/// Search bound: the share of device memory a block of a score matrix takes
+/// at most.
 const SCRATCH_SHARE: u64 = 8;
 
 /// The most scores a block of a score matrix holds on a device of `memory`
@@ -1164,8 +1165,8 @@ pub fn select_blocks(n: usize, m: usize, k: usize, cfg: &NearestCfg, scratch: us
     (rows, cols)
 }
 
-/// Lanes a row's list spreads over in [`nearest_select`], a run of the list
-/// a register of each.
+/// A warp's lanes, which a row's list spreads over in [`nearest_select`], a
+/// run of the list a register of each.
 pub const LANES: usize = 32;
 
 /// The runs of [`LANES`] slots a list of `k` is held in: `k` up to a power
@@ -1731,9 +1732,11 @@ pub struct NearestMergeSpec {
     pub live: Live,
 }
 
-/// Rows a merge block folds, one warp's.
+/// Search bound: the rows a `k = 1` merge block folds, one warp's, and the
+/// stride a split's shares land at — one pick the lattice does not search.
 const MERGE_ROWS: usize = 256;
-/// Rows a merge block of lists folds, a warp each.
+/// Search bound: the warps a merge block of lists folds over, a warp's rows
+/// each — one pick the lattice does not search.
 pub const LIST_WARPS: u32 = 4;
 
 impl NearestMergeSpec {
@@ -1880,13 +1883,15 @@ fn merge_lists(spec: &NearestMergeSpec) -> Program {
     k.finish()
 }
 
-/// Candidates [`nearest_rescore`] scores per block, a warp's share of them
-/// rows of its tile.
+/// Search bound: the candidates [`nearest_rescore`] scores per block, a
+/// warp's share of them rows of its tile — one pick the lattice does not
+/// search.
 pub const RESCORE_PAIRS: usize = 64;
 /// The depth a [`nearest_rescore`] trip reads of each pair's rows: 64 f32,
 /// two 128-byte lines a row.
 const RESCORE_DEPTH: usize = 64;
-/// Warps of a [`nearest_rescore`] block.
+/// Search bound: the warps of a [`nearest_rescore`] block — one pick the
+/// lattice does not search.
 const RESCORE_WARPS: u32 = 4;
 
 /// Each row's candidates scored again from rows of any precision ([`nearest_rescore`]).

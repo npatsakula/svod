@@ -129,10 +129,10 @@ impl Quantized {
     }
 }
 
-/// Scores past `k` a row's search keeps for [`k_nearest_reranked`]'s exact
-/// pass by default: on 33 342 Qwen3 embeddings (L2-normalized, depths
-/// 128–768, `k` 1, 16 and 64) the 8-bit search held every exact neighbour
-/// within `k + 13`.
+/// Search bound: the scores past `k` a row's search keeps for
+/// [`k_nearest_reranked`]'s exact pass, 16 by default — on 33 342 Qwen3
+/// embeddings (L2-normalized, depths 128–768, `k` 1, 16 and 64) the 8-bit
+/// search held every exact neighbour within `k + 13`.
 pub const MARGIN: usize = 16;
 
 /// How [`k_nearest_reranked`] searches before its exact pass.
