@@ -1777,10 +1777,17 @@ fn reranked_lists_match_the_reference(n: usize, m: usize, d: usize, draw: Draw, 
         let (score, index) = tk::k_nearest_reranked(&x, &c, k, opts, tk::Rerank::default()).unwrap();
         assert_eq!(score.dims().unwrap(), [n, k]);
         super::ops::assert_kernel(&score, "nearest_select");
+        // The op records its search: which rows' dtype won, `Auto`'s pick
+        // included ([`tk::chosen`]).
+        let Some(tk::Chosen::Kernel { op, family, cfg }) = tk::chosen() else { panic!("no record") };
+        assert_eq!((op, family), ("k_nearest_reranked", "nearest"));
+        assert!(cfg.starts_with("(Int8") || cfg.starts_with("(Float16"), "the auto search: {cfg}");
         case.check_list("reranked", k, &host(&score), &host(&index), 1e-5, true);
         let (x8, c8) = (tk::Quantized::new(&x).unwrap(), tk::Quantized::new(&c).unwrap());
         let rerank = tk::Rerank { margin: 24, x8: Some(&x8), c8: Some(&c8), search: Some(ScalarDType::Int8) };
         let (score, index) = tk::k_nearest_reranked(&x, &c, k, opts, rerank).unwrap();
+        let Some(tk::Chosen::Kernel { cfg, .. }) = tk::chosen() else { panic!("no record") };
+        assert!(cfg.starts_with("(Int8"), "the forced search: {cfg}");
         case.check_list("quantized beforehand", k, &host(&score), &host(&index), 1e-5, true);
     });
 }

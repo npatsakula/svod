@@ -86,6 +86,7 @@ pub fn heads(qkv: &Tensor, opts: Qkv) -> Result<(Tensor, Tensor, Tensor)> {
         cfg: cfgs[0],
     };
     let spec = tuned(TuneStore::global(), &planner, qkv.dtype(), &cfgs, spec);
+    super::ran(OP, "heads", spec.cfg);
     let q = output(&[b, t, heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;
     let k = output(&[b, t, kv_heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;
     let v = output(&[b, t, kv_heads, d], &var, qkv.dtype()).context(GraphSnafu { op: OP })?;

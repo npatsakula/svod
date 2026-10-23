@@ -8,7 +8,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 
 use super::config::Planner;
-use super::shape::{self, bound_var, extent, shape_of};
+use super::shape::{self, Fallback, bound_var, extent, shape_of};
 use super::{
     DtypeSnafu, GraphSnafu, LaunchSnafu, NoScoresSnafu, Result, ShapeSnafu, Tuner, UnboundSnafu, fmt_shape, output,
     typed,
@@ -23,6 +23,9 @@ use crate::launch;
 use crate::tune::TuneStore;
 
 const OP: &str = "nearest";
+
+/// The op name a reranked call records its search under ([`super::chosen`]).
+const RERANK: &str = "k_nearest_reranked";
 
 /// How pairs score and which pairs count.
 #[derive(Clone, Copy, Debug, Default)]
@@ -177,9 +180,18 @@ pub fn k_nearest_reranked(
         let shape_err = ShapeSnafu { op: OP, operand, got: fmt_shape(&got), expected: fmt_shape(rows) };
         ensure!(got == *rows, shape_err);
     }
+    // The whole op on the graph: no planner for the device, a shape the
+    // kernels do not take, or candidates no count names.
+    let on_graph = |why: Fallback| -> Result<(Tensor, Tensor)> {
+        super::ran_graph(RERANK, why);
+        live_k(graph_k(&xf, &cf, top, opts).context(graph_err())?)
+    };
     let planner = super::planner(&x.device());
-    let (Some(planner), [_, _], Some(m)) = (planner, &xs[..], cs.first().and_then(SInt::as_const)) else {
-        return live_k(graph_k(&xf, &cf, top, opts).context(graph_err())?);
+    let (planner, m) = match (planner, &xs[..], cs.first().and_then(SInt::as_const)) {
+        (None, _, _) => return on_graph(Fallback::Target),
+        (Some(_), dims, _) if dims.len() != 2 => return on_graph(Fallback::Shape),
+        (Some(_), _, None) => return on_graph(Fallback::Symbolic),
+        (Some(p), _, Some(m)) => (p, m),
     };
     let coarse = (top + rerank.margin).min(m);
     // Each search's rows, what scores them, and its pick for the shape.
@@ -197,7 +209,7 @@ pub fn k_nearest_reranked(
         false => a.3.total_cmp(&b.3),
     });
     let Some(&(dtype, cfg, ..)) = fastest else {
-        return live_k(graph_k(&xf, &cf, top, opts).context(graph_err())?);
+        return on_graph(Fallback::Dtype);
     };
     tracing::debug!(target: super::PLAN, op = OP, ?dtype, ?cfg, coarse, "reranked search");
     let pick = |_: &Planner, _: &[NearestCfg], spec: NearestSpec| NearestSpec { cfg, ..spec };
@@ -212,6 +224,7 @@ pub fn k_nearest_reranked(
         }
         half => picked(&x.cast(DType::Scalar(half)), &c.cast(DType::Scalar(half)), coarse, opts, None, pick)?,
     };
+    super::ran(RERANK, "nearest", (dtype, cfg));
     let index = if coarse == 1 { index.try_unsqueeze(1).context(graph_err())? } else { index };
     let index = index.contiguous();
     let x_var = extent(&xs).and_then(|(_, v)| v);
@@ -418,6 +431,7 @@ pub(crate) fn picked(
     let live = Live { rows: live_rows(&x_var), k: k_var.clone().filter(|_| top > 1) };
     let spec = NearestSpec { n, m, d: depth, metric, floors, groups, k: top, cfg: cfgs[0], live };
     let spec = pick(&planner, &cfgs, spec);
+    super::ran(OP, "nearest", spec.cfg);
     let rows_in = [Some(&xp), x_scale.as_ref(), x_sq.as_ref(), row_floor.as_ref(), row_group.as_ref()];
     let cols_in = [Some(&cp), c_scale.as_ref(), c_sq.as_ref(), col_floor.as_ref(), col_group.as_ref()];
     if spec.cfg.select.is_some() {

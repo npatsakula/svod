@@ -83,6 +83,7 @@ pub fn linear(x: &Tensor, w: &Tensor, opts: Linear) -> Result<Tensor> {
     };
     let spec = GemmSpec { m, n, k, batch: batch_of(&var, 1), epilogue, cfg: cfgs[0] };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
+    super::ran(OP, "gemm", spec.cfg);
     let y = output(&[lead, &[n]].concat(), &var, x.dtype()).context(GraphSnafu { op: OP })?;
     let ins: Vec<&Tensor> = [Some(x), Some(w), opts.bias, opts.residual, Some(&y)].into_iter().flatten().collect();
     launch::graph_launch(typed!(x.dtype(), gemm, &spec), &spec.cfg.lowering(&planner.device), &ins)

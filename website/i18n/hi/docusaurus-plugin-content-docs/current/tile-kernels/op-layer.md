@@ -50,6 +50,12 @@ compile होते हैं (या, अगर हर एक spill करे,
 भेजते)। `Plan::Graph(Fallback)` बताता है कि ग्राफ़ क्यों चलता है, और planner log उसका नाम लेता है
 (`RUST_LOG=svod_tk::plan=debug`)।
 
+`ops::chosen()` उस op का फ़ैसला एक value के रूप में लौटाता है जो इस thread ने आख़िरी चलाया:
+`Chosen::Kernel { op, family, cfg }` — kernel का नाम (`family`) और उसकी pick का Debug text
+(`cfg`, जो एक nearest pick का path बताता है: score matrix, queue, splits) — या
+`Chosen::Graph { op, why }`। `k_nearest_reranked` का record उसकी search का है: जीतने वाली
+rows का dtype उसके config के साथ।
+
 | `Fallback` | कब |
 |---|---|
 | `Target` | Tensor default device पर नहीं है, device के पास कोई tk kernels नहीं हैं (`config::has_kernels`: sm_80 से नीचे का CUDA, Metal, CPU), या उसका target कोई SM count नहीं बताता |

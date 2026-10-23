@@ -60,6 +60,12 @@ holds the ranked configs; the [tuner](./tuning) measures the first that compile 
 
 `attention` also takes the graph when appended rows are wider than every config's key block.
 
+`ops::chosen()` returns what the last op this thread ran chose, as a value beside the tensors it
+returned: `Chosen::Kernel { op, family, cfg }` — the kernel's name (`family`) and its pick's Debug
+text (`cfg`), which names a nearest pick's path (score matrix, queue, splits) — or
+`Chosen::Graph { op, why }`. `k_nearest_reranked`'s record is its search's: the winning rows'
+dtype beside its config.
+
 :::note[Why f32 keeps the graph]
 The kernels take 16-bit operands (and, for the nearest-neighbour search, 8-bit integers).
 Casting an f32 model down would trade about three decimal digits of precision for speed, so the

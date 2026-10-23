@@ -14,6 +14,7 @@ pub(crate) mod nearest;
 pub(crate) mod norm;
 pub mod shape;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -36,7 +37,7 @@ pub use crate::kernels::Act;
 use crate::kernels::Batch;
 use crate::tune::{self, Bench, Pass, TuneKey, TuneStore};
 use config::Planner;
-use shape::Plan;
+use shape::{Fallback, Plan};
 
 /// The salt of the tunings the device tests and GEMM probes run, keyed by
 /// the kernel's name (`gemm`) rather than an op's: [`tuned::gemm_probe`]
@@ -63,12 +64,50 @@ pub mod tuned {
 /// showed (its verdict, registers and spilled bytes), and the tuned pick.
 pub const PLAN: &str = "svod_tk::plan";
 
+/// What an op ran, asked of the last one this thread ran ([`chosen`]): the
+/// kernel family (the kernel's name, `gemm` say) under the op's name, with
+/// the config its tuning picked — the pick's Debug text, a tile, or a
+/// reranked search's rows' dtype beside its config — or why the graph ran
+/// instead. A reranked op's record is its search's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Chosen {
+    /// The kernel `family` `op` launched under `cfg`: a nearest pick's text
+    /// names its path (its score matrix, queue, splits), an attention one
+    /// its split count.
+    Kernel { op: &'static str, family: &'static str, cfg: String },
+    /// The graph, and why.
+    Graph { op: &'static str, why: Fallback },
+}
+
+thread_local! {
+    /// The last op this thread ran's [`Chosen`], set where the op decides.
+    static CHOSEN: RefCell<Option<Chosen>> = const { RefCell::new(None) };
+}
+
+/// The last op this thread ran's [`Chosen`]: the same facts the planner log
+/// holds, as a value a caller (or a test) reads beside the tensors the op
+/// returned. `None` before an op ran on this thread.
+pub fn chosen() -> Option<Chosen> {
+    CHOSEN.with(|c| c.borrow().clone())
+}
+
+/// `op`'s kernel `family` under `cfg`, its pick.
+pub(crate) fn ran(op: &'static str, family: &'static str, cfg: impl Debug) {
+    CHOSEN.with(|c| *c.borrow_mut() = Some(Chosen::Kernel { op, family, cfg: format!("{cfg:?}") }));
+}
+
+/// `op` took the graph for `why`.
+pub(crate) fn ran_graph(op: &'static str, why: Fallback) {
+    CHOSEN.with(|c| *c.borrow_mut() = Some(Chosen::Graph { op, why }));
+}
+
 /// `plan`'s ranked configs, or `None` with why `op` takes the graph logged.
 fn kernel<C>(op: &'static str, plan: Plan<C>) -> Option<Arc<[C]>> {
     match plan {
         Plan::Kernel(cfgs) => Some(cfgs),
         Plan::Graph(why) => {
             tracing::debug!(target: PLAN, op, ?why, "graph");
+            ran_graph(op, why);
             None
         }
     }

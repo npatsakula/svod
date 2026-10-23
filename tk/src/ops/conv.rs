@@ -129,6 +129,7 @@ pub fn conv2d(x: &Tensor, w: &Tensor, opts: Conv) -> Result<Tensor> {
     };
     let spec = ConvSpec { batch, geom, epilogue, cfg: cfgs[0].gemm, split: cfgs[0].split };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
+    super::ran(OP, "conv", ConvCfg { gemm: spec.cfg, split: spec.split });
     let mut programs = programs(&spec, &x.dtype(), &planner).into_iter();
     let y = output(&[images, ho, wo, geom.cout], &var, out_dtype).context(GraphSnafu { op: OP })?;
     let (prog, lowering) = programs.next().expect("the convolution");

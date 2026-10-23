@@ -76,6 +76,7 @@ fn norm(
     let (batch, residual_, bias) = (batch_of(&var, 1), residual.is_some(), b.is_some());
     let spec = NormSpec { norm: kind, rows, d, batch, eps, residual: residual_, bias, cfg: cfgs[0] };
     let spec = tuned(TuneStore::global(), &planner, x.dtype(), &cfgs, spec);
+    super::ran(op, op, spec.cfg);
     let out = output(&ext.dims, &var, x.dtype()).context(GraphSnafu { op })?;
     let sum = residual.map(|_| output(&ext.dims, &var, x.dtype())).transpose().context(GraphSnafu { op })?;
     let ins: Vec<&Tensor> = [Some(x), residual, Some(w), b, Some(&out), sum.as_ref()].into_iter().flatten().collect();

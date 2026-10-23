@@ -7,6 +7,7 @@ use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
 use super::config::Planner;
+use super::shape::Fallback;
 use super::shape::{self, extent, shape_of};
 use super::{
     DtypeSnafu, GraphSnafu, HeadsSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
@@ -179,6 +180,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let cfgs: Vec<FaCfg> = cfgs.iter().copied().filter(|c| c.holds_appended(appended)).collect();
     if cfgs.is_empty() {
         tracing::debug!(target: super::PLAN, op = OP, appended, "graph: no config holds the appended rows");
+        super::ran_graph(OP, Fallback::Config);
         return graph(q, k, v, opts).context(GraphSnafu { op: OP });
     }
     let (q_ext, k_ext, var) = (q_ext.expect("planned"), k_ext.expect("planned"), var.flatten());
@@ -199,6 +201,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     let scale = opts.scale.unwrap_or(1.0 / (d as f32).sqrt());
     let spec = AttnSpec { batch: batch.clone(), t, tk, heads, kv_heads, d, mask, cache, scale, cfg: cfgs[0] };
     let cfg = tuned(TuneStore::global(), &planner, q.dtype(), &cfgs, spec.clone(), opts.splits).cfg;
+    super::ran(OP, "flash_attention", cfg);
     let i32 = |t: &Tensor| if t.dtype() == DType::Int32 { t.clone() } else { t.cast(DType::Int32) };
     let lens = lens.map(i32);
     // Rows padded to the kernel's aligned stride.
