@@ -70,9 +70,11 @@ dtype beside its config.
 The kernels take 16-bit operands (and, for the nearest-neighbour search, 8-bit integers).
 Casting an f32 model down would trade about three decimal digits of precision for speed, so the
 op layer leaves that choice to the model's dtype. `k_nearest_reranked` is the exception that
-keeps f32 numbers: it searches the rows in 8 bits or f16 (`Quantized`, `Rerank`), keeps each
-row's `k + margin` least (16 by default), and scores those again in f32 from the rows as given.
-A neighbour the search ranks past `k + margin` is missed.
+keeps f32 numbers: it searches the rows in 8 bits or f16 (`Quantized` with its
+`QuantScheme::Row` scale, `Rerank`), keeps each row's `k + margin` least (16 by default), and
+scores those again in f32 from the rows as given. `Rerank::search` names the rows
+(`Search::Int8`, `Search::Half(f16)`, or `Search::Auto`, the faster of the two — which one won
+is the op's `chosen()` record). A neighbour the search ranks past `k + margin` is missed.
 :::
 
 ## Batch variables

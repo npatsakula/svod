@@ -48,7 +48,7 @@ pub fn supported(device: &DeviceSpec) -> bool;
 `ops::chosen()` 以值的形式返回本线程最后一个算子的决策：`Chosen::Kernel { op, family, cfg }` ——内核名（`family`）与其所选配置的 Debug 文本（`cfg`，其中也标明 nearest 选择的路径：得分矩阵、队列、拆分），或 `Chosen::Graph { op, why }`。`k_nearest_reranked` 的记录是关于其搜索的：获胜行的 dtype 及其配置。
 
 :::note[为什么 f32 保留计算图]
-内核接受 16 位操作数（最近邻搜索还接受 8 位整数）。把 f32 模型向下转换会用大约三位十进制精度换取速度，因此算子层把这个选择留给模型的数据类型。`k_nearest_reranked` 是保留 f32 数值的例外：它以 8 位或 f16 搜索各行（`Quantized`、`Rerank`），为每行保留最小的 `k + margin` 个（默认 16），再按原样给出的行以 f32 重新评分。被搜索排在 `k + margin` 之后的近邻会被遗漏。
+内核接受 16 位操作数（最近邻搜索还接受 8 位整数）。把 f32 模型向下转换会用大约三位十进制精度换取速度，因此算子层把这个选择留给模型的数据类型。`k_nearest_reranked` 是保留 f32 数值的例外：它以 8 位或 f16 搜索各行（`Quantized`，携带其 `QuantScheme::Row` 缩放方案；`Rerank`），为每行保留最小的 `k + margin` 个（默认 16），再按原样给出的行以 f32 重新评分。`Rerank::search` 指明搜索所用的行（`Search::Int8`、`Search::Half(f16)`，或 `Search::Auto` 取两者中更快的——谁胜出记录在该算子的 `chosen()` 里）。被搜索排在 `k + margin` 之后的近邻会被遗漏。
 :::
 
 ## 批次变量 {#batch-variables}

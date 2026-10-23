@@ -30,7 +30,9 @@ pub use self::attention::{Attn, Cache, Chunk, KeyMask, attention};
 pub use self::conv::{Conv, conv2d};
 pub use self::heads::{Qkv, heads};
 pub use self::linear::{Linear, linear};
-pub use self::nearest::{MARGIN, Metric, Nearest, Quantized, Rerank, k_nearest, k_nearest_reranked, nearest};
+pub use self::nearest::{
+    MARGIN, Metric, Nearest, QuantScheme, Quantized, Rerank, Search, k_nearest, k_nearest_reranked, nearest,
+};
 pub use self::norm::{add_layer_norm, add_rms_norm, layer_norm, rms_norm};
 use crate::atoms::{Device, Target};
 pub use crate::kernels::Act;

@@ -46,30 +46,28 @@ impl Nearest<'_> {
     }
 }
 
-/// For every row of `x [N, D]`, the least score over the candidates
-/// `c [M, D]` that [`Nearest`] admits, `max(metric, row_floor[i],
-/// col_floor[j])`, and the smallest candidate index scoring it: `([N]` f32
-/// scores, `[N]` i32 indices`)`. A row with no admissible candidate scores
-/// `+∞` at index −1. A self-join passes the same tensor as `x` and `c`.
-/// [`Metric::L2`] is decided on the squared distances and rooted once per
-/// row: two candidates whose roots round to one f32 are told apart by their
-/// squares, so an equal score does not always sit at the smaller index.
-/// `N` may be a bound variable (a symbolic batch): the kernels are built for
-/// its bound and take the rows bound at launch, the outputs `[N]` alike.
+/// For every row of `x [N, D]`, its least admitted score and the smallest
+/// candidate index scoring it: `([N]` f32 scores, `[N]` i32 indices`)`,
+/// [`k_nearest`] at `k = 1` with the list axis left out — the scoring
+/// contract, ties and bounds included, is [`k_nearest`]'s.
 pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)> {
     let dtype = x.dtype();
     picked(x, c, 1, opts, None, |planner, ranked, spec| tuned(TuneStore::global(), planner, dtype, ranked, spec))
 }
 
 /// For every row of `x [N, D]`, its `k` least scores over the candidates
-/// [`nearest`] admits, ascending, and the candidate indices scoring them, an
+/// `c [M, D]` that [`Nearest`] admits — `max(metric, row_floor[i],
+/// col_floor[j])` — ascending, and the candidate indices scoring them, an
 /// equal score at the smaller index (under [`Metric::L2`] an equal squared
 /// distance: the list is ordered on the squares and rooted once, so two
-/// roots that round to one f32 keep their squares' order): `([N, k]` f32
-/// scores, `[N, k]` i32 indices`)`. The slots past a row's admissible candidates score `+∞` at
-/// index −1. `k` is a count or a bound variable: the kernels keep lists of
-/// its bound (whose length picks how they are kept) and end them at the
-/// value bound at launch, the outputs `[N, k]` views of `[N, bound]` ones.
+/// roots that round to one f32 keep their squares' order, and an equal
+/// score does not always sit at the smaller index): `([N, k]` f32 scores,
+/// `[N, k]` i32 indices`), the list axis kept at `k = 1` too ([`nearest`]
+/// returns `[N]`). The slots past a row's admissible candidates score `+∞`
+/// at index −1; a self-join passes the same tensor as `x` and `c`. `k` and
+/// `N` are counts or bound variables: the kernels are built for their
+/// bounds and take the values bound at launch, the outputs `[N, k]` views
+/// of `[bound]` ones.
 pub fn k_nearest(x: &Tensor, c: &Tensor, k: impl Into<SInt>, opts: Nearest) -> Result<(Tensor, Tensor)> {
     let (k, dtype) = (k.into(), x.dtype());
     let (score, index) = picked(x, c, k.clone(), opts, None, |planner, ranked, spec| {
@@ -97,6 +95,19 @@ pub struct Quantized {
     pub rows: Tensor,
     /// `[N]` f32.
     pub scale: Tensor,
+    /// How `rows` were scaled; [`Quantized::new`] sets [`QuantScheme::Row`].
+    pub scheme: QuantScheme,
+}
+
+/// How [`Quantized`] scaled its rows, so what scores the integers carry
+/// comes back right; carried, not computed, so another scheme can come
+/// without breaking a caller holding one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuantScheme {
+    /// One scale a row, `s = max|v|/127`, the row `round(v/s)` in ±127:
+    /// the score of a pair is its integers' dot times both scales.
+    #[default]
+    Row,
 }
 
 impl Quantized {
@@ -112,7 +123,7 @@ impl Quantized {
             let scale = Tensor::const_(1.0f32, DType::Float32).where_(&zero, &scale)?;
             let q = x.try_div(&scale.try_unsqueeze(1)?)?.round();
             let rows = q.clamp().min(-127.0f32).max(127.0f32).call()?.cast(DType::Int8);
-            Ok(Self { rows, scale })
+            Ok(Self { rows, scale, scheme: QuantScheme::Row })
         };
         quantized().context(GraphSnafu { op: OP })
     }
@@ -132,17 +143,29 @@ pub struct Rerank<'a> {
     /// `x` and `c` quantized beforehand ([`Quantized::new`]), else here.
     pub x8: Option<&'a Quantized>,
     pub c8: Option<&'a Quantized>,
-    /// The search's rows: [`ScalarDType::Int8`], or a 16-bit float the
-    /// device has a kernel for ([`ScalarDType::Float16`],
-    /// [`ScalarDType::BFloat16`]); `None`, the faster of 8-bit and f16. A
-    /// type without a kernel lists the rows on the f32 graph.
-    pub search: Option<ScalarDType>,
+    /// The search's rows.
+    pub search: Search,
 }
 
 impl Default for Rerank<'_> {
     fn default() -> Self {
-        Self { margin: MARGIN, x8: None, c8: None, search: None }
+        Self { margin: MARGIN, x8: None, c8: None, search: Search::default() }
     }
+}
+
+/// The rows [`k_nearest_reranked`] searches over before its exact pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Search {
+    /// The faster of 8-bit and f16 on the device (as tuned; as ranked with
+    /// tuning off) — which one won is the op's [`Chosen`](super::Chosen).
+    #[default]
+    Auto,
+    /// 8-bit rows ([`Quantized`]).
+    Int8,
+    /// A 16-bit float the device has a kernel for ([`ScalarDType::Float16`],
+    /// [`ScalarDType::BFloat16`]); one without lists the rows on the f32
+    /// graph.
+    Half(ScalarDType),
 }
 
 /// [`k_nearest`] of rows of any float type (f32, say) scored in f32: a
@@ -197,7 +220,11 @@ pub fn k_nearest_reranked(
     // Each search's rows, what scores them, and its pick for the shape.
     let x8 = || rerank.x8.cloned().map_or_else(|| Quantized::new(x), Ok);
     let c8 = || rerank.c8.cloned().map_or_else(|| Quantized::new(c), Ok);
-    let dtypes = rerank.search.map_or(vec![ScalarDType::Int8, ScalarDType::Float16], |d| vec![d]);
+    let dtypes = match rerank.search {
+        Search::Auto => vec![ScalarDType::Int8, ScalarDType::Float16],
+        Search::Int8 => vec![ScalarDType::Int8],
+        Search::Half(d) => vec![d],
+    };
     let searches = dtypes.into_iter().filter_map(|dtype| {
         let (cfg, ns, cost) = searched(&planner, dtype, &xs, &cs, coarse, opts)?;
         Some((dtype, cfg, ns, cost))
@@ -219,7 +246,11 @@ pub fn k_nearest_reranked(
             let squared = |t: &Tensor| t.square().sum(1isize);
             let x_sq = opts.metric.row_norms().then(|| squared(&xf)).transpose().context(graph_err())?;
             let c_sq = opts.metric.col_norms().then(|| squared(&cf)).transpose().context(graph_err())?;
-            let scaled = Scaled { x_scale: x8.scale.clone(), c_scale: c8.scale.clone(), x_sq, c_sq };
+            let scaled = match (x8.scheme, c8.scheme) {
+                (QuantScheme::Row, QuantScheme::Row) => {
+                    Scaled { x_scale: x8.scale.clone(), c_scale: c8.scale.clone(), x_sq, c_sq }
+                }
+            };
             picked(&x8.rows, &c8.rows, coarse, opts, Some(&scaled), pick)?
         }
         half => picked(&x.cast(DType::Scalar(half)), &c.cast(DType::Scalar(half)), coarse, opts, None, pick)?,

@@ -70,9 +70,11 @@ rows का dtype उसके config के साथ।
 कर्नेल 16-bit operands लेते हैं (और nearest-neighbour search के लिए 8-bit integers)। किसी f32 मॉडल
 को नीचे cast करने से गति के बदले precision के लगभग तीन दशमलव अंक चले जाते, इसलिए op layer यह फ़ैसला
 मॉडल के dtype पर छोड़ती है। `k_nearest_reranked` वह अपवाद है जो f32 numbers रखता है: यह rows को
-8 bits या f16 में search करता है (`Quantized`, `Rerank`), हर row के `k + margin` सबसे छोटे रखता है
-(default 16), और उन्हें दी गई rows से f32 में फिर से score करता है। जिस neighbour को search
-`k + margin` के बाद rank करता है, वह छूट जाता है।
+8 bits या f16 में search करता है (`Quantized`, अपनी `QuantScheme::Row` scale के साथ; `Rerank`),
+हर row के `k + margin` सबसे छोटे रखता है (default 16), और उन्हें दी गई rows से f32 में फिर से
+score करता है। `Rerank::search` rows का नाम लेता है (`Search::Int8`, `Search::Half(f16)`, या
+`Search::Auto`, दोनों में तेज़ — कौन जीता, वह op के `chosen()` record में है)। जिस neighbour को
+search `k + margin` के बाद rank करता है, वह छूट जाता है।
 :::
 
 ## Batch variables {#batch-variables}

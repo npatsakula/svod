@@ -1748,7 +1748,7 @@ fn rows_quantize_within_half_a_step() {
     let x = Tensor::from_slice(rows.clone()).try_reshape([4, 4]).unwrap();
     let q = tk::Quantized::new(&x).unwrap();
     let (ints, scales) = (host(&q.rows), host(&q.scale));
-    assert_eq!(q.rows.dtype(), DType::Int8);
+    assert_eq!((q.rows.dtype(), q.scheme), (DType::Int8, tk::QuantScheme::Row));
     assert_eq!(scales, [1.0 / 127.0, 3.0 / 127.0, 1.0, 1.0].map(|s: f64| f64::from(s as f32)));
     for (i, &v) in rows.iter().enumerate() {
         let (q, s) = (ints[i], scales[i / 4]);
@@ -1784,7 +1784,7 @@ fn reranked_lists_match_the_reference(n: usize, m: usize, d: usize, draw: Draw, 
         assert!(cfg.starts_with("(Int8") || cfg.starts_with("(Float16"), "the auto search: {cfg}");
         case.check_list("reranked", k, &host(&score), &host(&index), 1e-5, true);
         let (x8, c8) = (tk::Quantized::new(&x).unwrap(), tk::Quantized::new(&c).unwrap());
-        let rerank = tk::Rerank { margin: 24, x8: Some(&x8), c8: Some(&c8), search: Some(ScalarDType::Int8) };
+        let rerank = tk::Rerank { margin: 24, x8: Some(&x8), c8: Some(&c8), search: tk::Search::Int8 };
         let (score, index) = tk::k_nearest_reranked(&x, &c, k, opts, rerank).unwrap();
         let Some(tk::Chosen::Kernel { cfg, .. }) = tk::chosen() else { panic!("no record") };
         assert!(cfg.starts_with("(Int8"), "the forced search: {cfg}");
@@ -2060,8 +2060,8 @@ fn recall_probe() {
                 })
                 .collect();
             for k in [1, 16, 64] {
-                for search in [ScalarDType::Int8, ScalarDType::Float16] {
-                    let rerank = tk::Rerank { search: Some(search), ..tk::Rerank::default() };
+                for search in [tk::Search::Int8, tk::Search::Half(ScalarDType::Float16)] {
+                    let rerank = tk::Rerank { search, ..tk::Rerank::default() };
                     let opts = Nearest { metric, ..Nearest::default() };
                     let (_, index) = tk::k_nearest_reranked(&x, &c, k, opts, rerank).unwrap();
                     let got = host(&index);
