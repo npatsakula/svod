@@ -481,6 +481,7 @@ impl WhisperAlignedTranscriber {
         recognized: &[RecognizedWindow],
         copies: &mut CopyProfile,
         profile: &mut Option<RunProfile>,
+        last_speech_timestamp: &mut f32,
     ) -> Result<Vec<Transcript>> {
         let task = self.recognizer.options.task;
         let tokenizer = &self.recognizer.tokenizer;
@@ -496,9 +497,11 @@ impl WhisperAlignedTranscriber {
                     language: window.result.language.as_deref(),
                     task,
                     audio_samples: window.audio_samples,
+                    segments: &window.segments,
                 })
                 .collect();
-            let (words, alignment) = self.aligner.align_batch_profiled(&inputs, tokenizer, copies)?;
+            let (words, alignment) =
+                self.aligner.align_batch_profiled(&inputs, tokenizer, copies, last_speech_timestamp)?;
             if let Some(profile) = profile {
                 profile.push(alignment.graph.stage("alignment_graph"));
                 profile.push(StageProfile::host("alignment_cpu_dtw", alignment.cpu_dtw_wall));
@@ -529,10 +532,18 @@ impl Transcriber for WhisperAlignedTranscriber {
     ) -> Result<(Vec<Transcript>, Option<RunProfile>)> {
         let mut transcripts = Vec::with_capacity(windows.len());
         let mut run = opts.profile.then(RunProfile::default);
+        // `add_word_timestamps` carries the last spoken timestamp from window
+        // to window for its pause clamp; a new recording starts from zero.
+        let mut last_speech_timestamp = 0.0;
         for batch in windows.chunks(self.recognizer.max_batch) {
             let (recognized, mut batch_profile, mut copies) = self.recognizer.recognize_windows(batch, opts.profile)?;
             if opts.words {
-                transcripts.extend(self.align_recognized(&recognized, &mut copies, &mut batch_profile)?);
+                transcripts.extend(self.align_recognized(
+                    &recognized,
+                    &mut copies,
+                    &mut batch_profile,
+                    &mut last_speech_timestamp,
+                )?);
             } else {
                 transcripts.extend(recognized.iter().map(|window| window.transcript(Vec::new())));
             }
