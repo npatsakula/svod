@@ -174,13 +174,13 @@ fn walk(prog: &Program, block: Block, mut state: State, scope: Scope, divergent:
                 state.merge(&end);
                 Stmt::Pipeline(p)
             }
-            Stmt::If { pred, then, otherwise } => {
+            Stmt::If { pred, then, otherwise, results } => {
                 let divergent = divergent || (scope == Scope::Block && prog.varies_by_warp(pred));
                 let (then, s1) = walk(prog, then, state.clone(), scope, divergent)?;
                 let (otherwise, s2) = walk(prog, otherwise, state, scope, divergent)?;
                 state = s1;
                 state.merge(&s2);
-                Stmt::If { pred, then, otherwise }
+                Stmt::If { pred, then, otherwise, results }
             }
             // The warps part on a clean slate (the block's open effects are
             // fenced first, for every warp), fence their own effects among

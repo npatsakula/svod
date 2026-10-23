@@ -594,7 +594,7 @@ impl<'a> Emit<'a> {
                 self.scope = outer;
                 out
             }
-            Stmt::If { pred, then, otherwise } => {
+            Stmt::If { pred, then, otherwise, results } => {
                 let divergent = usize::from(self.scope == Scope::Block && self.prog.varies_by_warp(*pred));
                 let (cond, not) = if let Scalar::Any(v) = *self.prog.scalar(*pred) {
                     // Listed here, after the tile it reads, never hoisted.
@@ -609,8 +609,20 @@ impl<'a> Emit<'a> {
                     (cond.clone(), self.hoist(cond.not()))
                 };
                 self.divergent += divergent;
-                for (branch, cond) in [(then, cond), (otherwise, not)] {
-                    if branch.0.is_empty() {
+                // A branch ends in its merges: the moves of the results whose
+                // source it computed, the last thing it does.
+                let merge = |e: &mut Self, srcs: Vec<Option<ValId>>| -> Result<()> {
+                    for (&(dst, ..), src) in results.iter().zip(srcs) {
+                        let Some(src) = src else { continue };
+                        e.let_(dst, &TileOp::Move { src })?;
+                        e.advance(dst);
+                    }
+                    Ok(())
+                };
+                let then_srcs: Vec<Option<ValId>> = results.iter().map(|&(_, t, ..)| Some(t)).collect();
+                let else_srcs: Vec<Option<ValId>> = results.iter().map(|&(.., e)| e).collect();
+                for (branch, cond, merges) in [(then, cond, then_srcs), (otherwise, not, else_srcs)] {
+                    if branch.0.is_empty() && merges.iter().all(Option::is_none) {
                         continue;
                     }
                     let tag = self.next_tag();
@@ -618,6 +630,7 @@ impl<'a> Emit<'a> {
                     self.list.open();
                     self.guards.push(self.level());
                     self.block(branch)?;
+                    merge(self, merges)?;
                     let level = self.guards.pop().expect("the branch just opened");
                     self.list.close();
                     // What was listed under the branch is out of reach past it.

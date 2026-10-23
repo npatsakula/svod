@@ -660,13 +660,16 @@ impl Kernel {
     /// as the interpreter's simultaneous assignment does, and a next the
     /// body never defines still moves.
     fn snapshot_carried<T: Elem>(&mut self, body: &mut Block, phi: &[ValId], next: &mut [Regs<T>]) {
-        let defined: std::collections::HashSet<ValId> = body
-            .walk()
-            .filter_map(|(_, s)| match s {
-                Stmt::Let { dst, .. } | Stmt::Copy { dst, .. } => Some(*dst),
-                _ => None,
-            })
-            .collect();
+        let mut defined = std::collections::HashSet::new();
+        for (_, s) in body.walk() {
+            match s {
+                Stmt::Let { dst, .. } | Stmt::Copy { dst, .. } => {
+                    defined.insert(*dst);
+                }
+                Stmt::If { results, .. } => defined.extend(results.iter().map(|&(dst, ..)| dst)),
+                _ => {}
+            }
+        }
         let mut copies = vec![];
         for (n, &p) in next.iter_mut().zip(phi) {
             if n.0 == p || defined.contains(&n.0) {
@@ -678,6 +681,23 @@ impl Kernel {
             *n = Tile::new(dst);
         }
         body.0.splice(0..0, copies);
+    }
+
+    /// Carried values may share a `next` (each takes it), but no two of a
+    /// loop's `next`s are one value: every one past the first reads a copy
+    /// made at the body's end, where the moves into the `phi`s read, so
+    /// their order decides nothing ([`check_carried`]).
+    fn deshare_carried<T: Elem>(&mut self, body: &mut Block, next: &mut [Regs<T>]) {
+        let mut seen = std::collections::HashSet::new();
+        for n in next.iter_mut() {
+            if seen.insert(n.0) {
+                continue;
+            }
+            let Value { dtype, shape, .. } = self.prog.value(n.0).clone();
+            let dst = self.value(dtype, shape, Place::Reg);
+            body.0.push(Stmt::Let { dst, op: TileOp::Move { src: n.0 } });
+            *n = Tile::new(dst);
+        }
     }
 
     fn with_block(&mut self, f: impl FnOnce(&mut Self)) -> Block {
@@ -711,6 +731,7 @@ impl Kernel {
         let mut next = vec![];
         let mut block = self.with_block(|k| next = body(k, Sc::Id(iv), phi.iter().map(|&v| Tile::new(v)).collect()));
         self.snapshot_carried(&mut block, &phi, &mut next);
+        self.deshare_carried(&mut block, &mut next);
         let carried = carry(&init, &phi, &next);
         self.push(Stmt::Loop(Loop { iv, start, extent, carried, body: block, unroll: 1 }));
         phi.into_iter().map(Tile::new).collect()
@@ -753,6 +774,7 @@ impl Kernel {
             next = consume(k, Sc::Id(cstep), Sc::Id(cslot), phi.iter().map(|&v| Tile::new(v)).collect())
         });
         self.snapshot_carried(&mut body, &phi, &mut next);
+        self.deshare_carried(&mut body, &mut next);
         let consume = Stage { step: cstep, slot: cslot, body };
         let carried = carry(&init, &phi, &next);
         self.push(Stmt::Pipeline(Pipeline { extent, stages, unroll, crews, carried, produce, consume }));
@@ -773,7 +795,7 @@ impl Kernel {
         let pred = self.intern(pred);
         let then = self.with_block(then);
         let otherwise = self.with_block(otherwise);
-        self.push(Stmt::If { pred, then, otherwise });
+        self.push(Stmt::If { pred, then, otherwise, results: vec![] });
     }
 
     /// `if pred { then } else { otherwise }` producing `N` register tiles:
@@ -795,30 +817,25 @@ impl Kernel {
         otherwise: impl FnOnce(&mut Self) -> Vec<Regs<T>>,
     ) -> Vec<Regs<T>> {
         let pred = self.intern(pred);
-        let mut merged: Option<Vec<ValId>> = None;
-        type Branch<'a, T> = Box<dyn FnOnce(&mut Kernel) -> Vec<Regs<T>> + 'a>;
-        let mut branch = |k: &mut Self, f: Branch<'_, T>| {
-            k.with_block(|k| {
-                let vals = f(k);
-                let out = merged.get_or_insert_with(|| {
-                    vals.iter()
-                        .map(|v| {
-                            let Value { dtype, shape, .. } = k.prog.value(v.0).clone();
-                            k.value(dtype, shape, Place::Reg)
-                        })
-                        .collect()
-                });
-                assert_eq!(out.len(), vals.len(), "both branches produce as many tiles");
-                for (&dst, v) in out.iter().zip(vals) {
-                    assert_eq!(k.shape(dst), k.shape(v), "both branches produce the same shapes");
-                    k.push(Stmt::Let { dst, op: TileOp::Move { src: v.0 } });
-                }
+        let mut tv = vec![];
+        let then = self.with_block(|k| tv = then(k).into_iter().map(|v| v.0).collect());
+        let mut ov = vec![];
+        let otherwise = self.with_block(|k| ov = otherwise(k).into_iter().map(|v| v.0).collect());
+        assert_eq!(tv.len(), ov.len(), "both branches produce as many tiles");
+        // One merge per tile, on the `if` itself: each branch's value stays
+        // its own, and the merged tile is defined once, past the statement.
+        let results = tv
+            .into_iter()
+            .zip(ov)
+            .map(|(t, o)| {
+                let Value { dtype, shape, .. } = self.prog.value(t).clone();
+                let dst = self.value(dtype, shape, Place::Reg);
+                assert_eq!(self.shape(dst), self.shape(o), "both branches produce the same shapes");
+                (dst, t, Some(o))
             })
-        };
-        let then = branch(self, Box::new(then));
-        let otherwise = branch(self, Box::new(otherwise));
-        self.push(Stmt::If { pred, then, otherwise });
-        merged.expect("both branches ran").into_iter().map(Tile::new).collect()
+            .collect::<Vec<_>>();
+        self.push(Stmt::If { pred, then, otherwise, results: results.clone() });
+        results.into_iter().map(|(dst, ..)| Tile::new(dst)).collect()
     }
 
     /// `where_(pred, then(k), otherwise)` for each pair of tiles, `then` run
@@ -852,9 +869,9 @@ impl Kernel {
     /// there may only feed work that changes nothing there). `then` must hold
     /// no block barrier.
     ///
-    /// The results hold `otherwise` before the branch, which `then`'s
-    /// replace: no path past it leaves them unset, so a loop around it
-    /// carries none of them from its last trip.
+    /// The results hold `otherwise` before the branch (one move each), which
+    /// `then`'s replace as the branch's merge: no path past it leaves them
+    /// unset, so a loop around it carries none of them from its last trip.
     pub fn if_any<T: Elem>(
         &mut self,
         pred: Regs<Bool>,
@@ -871,16 +888,20 @@ impl Kernel {
                 dst
             })
             .collect();
-        let then = self.with_block(|k| {
-            let vals = then(k);
-            assert_eq!(vals.len(), held.len(), "both branches produce as many tiles");
-            for (&dst, v) in held.iter().zip(vals) {
-                assert_eq!(k.shape(dst), k.shape(v), "both branches produce the same shapes");
-                k.push(Stmt::Let { dst, op: TileOp::Move { src: v.0 } });
-            }
-        });
+        let mut vals = vec![];
+        let then = self.with_block(|k| vals = then(k).into_iter().map(|v| v.0).collect());
+        assert_eq!(vals.len(), held.len(), "both branches produce as many tiles");
+        let results = held
+            .clone()
+            .into_iter()
+            .zip(vals)
+            .map(|(dst, t)| {
+                assert_eq!(self.shape(dst), self.shape(t), "both branches produce the same shapes");
+                (dst, t, None)
+            })
+            .collect();
         let pred = self.intern(any);
-        self.push(Stmt::If { pred, then, otherwise: Block::default() });
+        self.push(Stmt::If { pred, then, otherwise: Block::default(), results });
         held.into_iter().map(Tile::new).collect()
     }
 
@@ -893,7 +914,46 @@ impl Kernel {
     pub fn finish(mut self) -> Program {
         assert_eq!(self.blocks.len(), 1, "every block closed");
         self.prog.body = self.blocks.pop().expect("the root block");
+        check_carried(&self.prog.body);
         self.prog
+    }
+}
+
+/// Every loop's and pipeline's `next`s are statements of its own body (an
+/// `if`'s merge among them, never a branch of one) and pairwise distinct:
+/// the moves into the `phi`s all run at that body's end, which is where the
+/// interpreter's simultaneous assignment leaves them, so the device and the
+/// interpreter agree wherever this holds ([`Kernel::loop_`],
+/// [`Kernel::pipeline`]).
+fn check_carried(block: &Block) {
+    for stmt in &block.0 {
+        let (body, carried) = match stmt {
+            Stmt::Loop(l) => (&l.body, &l.carried),
+            Stmt::Pipeline(p) => (&p.consume.body, &p.carried),
+            _ => {
+                stmt.blocks().for_each(check_carried);
+                continue;
+            }
+        };
+        let mut defined = std::collections::HashSet::new();
+        for s in &body.0 {
+            match s {
+                Stmt::Let { dst, .. } | Stmt::Copy { dst, .. } => {
+                    defined.insert(*dst);
+                }
+                Stmt::If { results, .. } => defined.extend(results.iter().map(|&(dst, ..)| dst)),
+                _ => {}
+            }
+        }
+        let mut nexts = std::collections::HashSet::new();
+        for c in carried {
+            if c.next == c.phi {
+                continue;
+            }
+            assert!(defined.contains(&c.next), "a carried next is a statement of its loop's body");
+            assert!(nexts.insert(c.next), "a loop's nexts are distinct values");
+        }
+        stmt.blocks().for_each(check_carried);
     }
 }
 

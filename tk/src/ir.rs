@@ -468,6 +468,15 @@ pub enum Stmt {
         pred: ScalarId,
         then: Block,
         otherwise: Block,
+        /// The branch's merge: past the statement each `dst` holds its
+        /// branch's source (`None`: what `dst` held before it, which `then`
+        /// replaces). Both sources keep their identity — every value stays
+        /// defined once, by the branch that computes it or before — and the
+        /// moves into `dst` are the branch's last, so a `dst` a loop carries
+        /// moves into its `phi` at the end of the body holding the `if`,
+        /// never inside the branch ([`crate::build::Kernel::select_if_vec`],
+        /// [`crate::build::Kernel::if_any`]).
+        results: Vec<(ValId, ValId, Option<ValId>)>,
     },
     Sync(Sync),
 }

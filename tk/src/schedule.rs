@@ -105,7 +105,7 @@ impl Expander<'_> {
     }
 
     fn if_(pred: ScalarId, then: Vec<Stmt>) -> Stmt {
-        Stmt::If { pred, then: Block(then), otherwise: Block::default() }
+        Stmt::If { pred, then: Block(then), otherwise: Block::default(), results: vec![] }
     }
 
     /// `for i in 0..extent + stages - 1`: consume step `i - (stages - 1)` once

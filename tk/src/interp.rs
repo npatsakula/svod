@@ -201,9 +201,17 @@ impl Frame<'_> {
                 }
                 self.warp = saved;
             }
-            Stmt::If { pred, then, otherwise } => {
-                let branch = if self.scalar(*pred)? != 0 { then } else { otherwise };
-                self.block_run(branch)?;
+            Stmt::If { pred, then, otherwise, results } => {
+                let taken = self.scalar(*pred)? != 0;
+                self.block_run(if taken { then } else { otherwise })?;
+                // The merge, as the moves the branches end in: the taken
+                // branch's source, else what `dst` held before the `if`.
+                for (dst, then_src, else_src) in results {
+                    if let Some(src) = if taken { Some(*then_src) } else { *else_src } {
+                        let out = self.tile_op(*dst, &TileOp::Move { src })?;
+                        self.regs.insert(*dst, out);
+                    }
+                }
             }
             Stmt::Sync(_) => {}
         }

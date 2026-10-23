@@ -1317,6 +1317,16 @@ impl<'a> Infer<'a> {
                         }
                     }
                 }
+                // The branches end in their merges, each a move of its source
+                // into `dst`: all of a result holds one layout.
+                Stmt::If { results, .. } => {
+                    for (dst, then_src, else_src) in results {
+                        self.unify(*dst, *then_src);
+                        if let Some(e) = else_src {
+                            self.unify(*dst, *e);
+                        }
+                    }
+                }
                 _ => {}
             }
             for b in stmt.blocks() {
@@ -1458,6 +1468,17 @@ struct Rewrite<'a> {
 }
 
 impl Rewrite<'_> {
+    /// A fresh register value holding `v` as `want`, appended to `into`:
+    /// re-held where its consumer runs.
+    fn reheld(&mut self, v: ValId, want: TileLayout, into: &mut Vec<Stmt>) -> ValId {
+        let Value { dtype, shape, .. } = self.prog.value(v).clone();
+        self.prog.values.push(Value { dtype, shape, place: Place::Reg });
+        let fresh = ValId(self.prog.values.len() as u32 - 1);
+        self.lay.push(Some(want));
+        into.push(Stmt::Let { dst: fresh, op: TileOp::Relayout { src: v } });
+        fresh
+    }
+
     /// Re-hold every conflicting operand just before its consumer.
     fn insert(&mut self, block: Block) -> Block {
         let mut out = Vec::with_capacity(block.0.len());
@@ -1466,12 +1487,7 @@ impl Rewrite<'_> {
             let pos = self.pos;
             let mut rewrite = |it: &mut Self, v: &mut ValId| {
                 if let Some(want) = it.conflicts.remove(&(pos, *v)) {
-                    let Value { dtype, shape, .. } = it.prog.value(*v).clone();
-                    it.prog.values.push(Value { dtype, shape, place: Place::Reg });
-                    let fresh = ValId(it.prog.values.len() as u32 - 1);
-                    it.lay.push(Some(want));
-                    out.push(Stmt::Let { dst: fresh, op: TileOp::Relayout { src: *v } });
-                    *v = fresh;
+                    *v = it.reheld(*v, want, &mut out);
                 }
             };
             match &mut stmt {
@@ -1506,6 +1522,28 @@ impl Rewrite<'_> {
                     TileOp::Reduce { src, .. } => rewrite(self, src),
                     TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) => {}
                 },
+                Stmt::If { .. } => {
+                    for b in stmt.blocks_mut() {
+                        *b = self.insert(std::mem::take(b));
+                    }
+                    // A merge's source is re-held at the end of the branch
+                    // that computed it, before the move the branch ends in.
+                    let Stmt::If { then, otherwise, results, .. } = &mut stmt else { unreachable!() };
+                    for (_, then_src, else_src) in results.iter_mut() {
+                        let shared = Some(*then_src) == *else_src;
+                        let want = self.conflicts.remove(&(pos, *then_src));
+                        if let Some(want) = want.clone() {
+                            *then_src = self.reheld(*then_src, want, &mut then.0);
+                        }
+                        if let Some(e) = else_src {
+                            let want =
+                                self.conflicts.remove(&(pos, *e)).or_else(|| shared.then(|| want.clone()).flatten());
+                            if let Some(want) = want {
+                                *e = self.reheld(*e, want, &mut otherwise.0);
+                            }
+                        }
+                    }
+                }
                 nested => {
                     for b in nested.blocks_mut() {
                         *b = self.insert(std::mem::take(b));
