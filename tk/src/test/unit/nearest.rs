@@ -1737,20 +1737,24 @@ fn rescored_pairs_match_the_reference(metric: Metric, floors: Floors) {
 
 /// A row quantized to 8 bits: its integers within ±127, the largest
 /// magnitude 127, each within half a step of the row over its scale; a
-/// row of zeros scales by 1.
+/// row of zeros scales by 1, as does one whose scale would be zero (its
+/// largest magnitude under 127 of the smallest positive f32), which
+/// quantizes to zeros rather than to the row over zero.
 #[test]
 fn rows_quantize_within_half_a_step() {
-    let rows: Vec<f32> = vec![0.5, -1.0, 0.25, 0.0, 3.0, 2.9, -0.01, 1.0, 0.0, 0.0, 0.0, 0.0];
-    let x = Tensor::from_slice(rows.clone()).try_reshape([3, 4]).unwrap();
+    let least = f32::from_bits(1);
+    let rows: Vec<f32> = vec![0.5, -1.0, 0.25, 0.0, 3.0, 2.9, -0.01, 1.0, 0.0, 0.0, 0.0, 0.0, least, 0.0, 0.0, -least];
+    let x = Tensor::from_slice(rows.clone()).try_reshape([4, 4]).unwrap();
     let q = tk::Quantized::new(&x).unwrap();
     let (ints, scales) = (host(&q.rows), host(&q.scale));
     assert_eq!(q.rows.dtype(), DType::Int8);
-    assert_eq!(scales, [1.0 / 127.0, 3.0 / 127.0, 1.0].map(|s: f64| f64::from(s as f32)));
+    assert_eq!(scales, [1.0 / 127.0, 3.0 / 127.0, 1.0, 1.0].map(|s: f64| f64::from(s as f32)));
     for (i, &v) in rows.iter().enumerate() {
         let (q, s) = (ints[i], scales[i / 4]);
         assert!(q.abs() <= 127.0 && (q - f64::from(v) / s).abs() <= 0.5 + 1e-4, "{i}: {v} as {q}·{s}");
     }
     assert_eq!([ints[1], ints[4], ints[8]], [-127.0, 127.0, 0.0]);
+    assert_eq!(&ints[12..], [0.0; 4], "a row too small to scale quantizes to zeros");
 }
 
 /// The reranked op lists each row's `k` least exactly as scored in f32 over

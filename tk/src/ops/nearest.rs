@@ -48,6 +48,9 @@ impl Nearest<'_> {
 /// col_floor[j])`, and the smallest candidate index scoring it: `([N]` f32
 /// scores, `[N]` i32 indices`)`. A row with no admissible candidate scores
 /// `+∞` at index −1. A self-join passes the same tensor as `x` and `c`.
+/// [`Metric::L2`] is decided on the squared distances and rooted once per
+/// row: two candidates whose roots round to one f32 are told apart by their
+/// squares, so an equal score does not always sit at the smaller index.
 /// `N` may be a bound variable (a symbolic batch): the kernels are built for
 /// its bound and take the rows bound at launch, the outputs `[N]` alike.
 pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)> {
@@ -57,8 +60,10 @@ pub fn nearest(x: &Tensor, c: &Tensor, opts: Nearest) -> Result<(Tensor, Tensor)
 
 /// For every row of `x [N, D]`, its `k` least scores over the candidates
 /// [`nearest`] admits, ascending, and the candidate indices scoring them, an
-/// equal score at the smaller index: `([N, k]` f32 scores, `[N, k]` i32
-/// indices`)`. The slots past a row's admissible candidates score `+∞` at
+/// equal score at the smaller index (under [`Metric::L2`] an equal squared
+/// distance: the list is ordered on the squares and rooted once, so two
+/// roots that round to one f32 keep their squares' order): `([N, k]` f32
+/// scores, `[N, k]` i32 indices`)`. The slots past a row's admissible candidates score `+∞` at
 /// index −1. `k` is a count or a bound variable: the kernels keep lists of
 /// its bound (whose length picks how they are kept) and end them at the
 /// value bound at launch, the outputs `[N, k]` views of `[N, bound]` ones.
@@ -75,8 +80,14 @@ pub fn k_nearest(x: &Tensor, c: &Tensor, k: impl Into<SInt>, opts: Nearest) -> R
 }
 
 /// Rows held as 8-bit integers for [`k_nearest_reranked`]'s search: each
-/// row `v` as `round(v / s)` clamped to ±127, `s = max|v| / 127` (1 for a
-/// row of zeros).
+/// row `v` as `round(v / s)` clamped to ±127, `s = max|v| / 127` as the
+/// graph computes it (a multiply by the f32 reciprocal of 127, within an
+/// ulp of the quotient); 1 where that is zero (a row of zeros, or one whose
+/// largest magnitude is under 127 of the smallest positive f32), which
+/// quantizes the row to zeros. A row holding a NaN or an infinity
+/// quantizes to no meaning: the maximum passes over a NaN and takes an
+/// infinity, and the integers of such a row are what dividing by that
+/// leaves (saturated, or zero).
 #[derive(Clone, Debug)]
 pub struct Quantized {
     /// `[N, D]` i8.
@@ -91,9 +102,11 @@ impl Quantized {
     pub fn new(x: &Tensor) -> Result<Self> {
         let quantized = || -> svod_tensor::error::Result<Self> {
             let x = x.cast(DType::Float32);
-            let top = x.abs().max(1isize)?;
-            let zero = top.try_eq(0.0f32)?;
-            let scale = Tensor::const_(1.0f32, DType::Float32).where_(&zero, &top.try_div(127.0f32)?)?;
+            let scale = x.abs().max(1isize)?.try_div(127.0f32)?;
+            // A scale of zero (no magnitude, or one under 127 of the smallest
+            // positive f32) would divide the row by zero.
+            let zero = scale.try_eq(0.0f32)?;
+            let scale = Tensor::const_(1.0f32, DType::Float32).where_(&zero, &scale)?;
             let q = x.try_div(&scale.try_unsqueeze(1)?)?.round();
             let rows = q.clamp().min(-127.0f32).max(127.0f32).call()?.cast(DType::Int8);
             Ok(Self { rows, scale })
