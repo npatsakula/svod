@@ -151,6 +151,27 @@ fn shapes_that_do_not_tile_the_grid_are_rejected() {
     assert_eq!((a.reps, b.reps, c.reps), ([1, 2], [2, 6], [1, 6]), "48 columns are six n-halves");
 }
 
+/// A product's result is held as its atom leaves it: pinned otherwise, the
+/// conflict is on the result, which no inserted relayout can re-hold, and
+/// the inference refuses the program rather than drop it (the emitter would
+/// write the atom's fragments into registers the store reads as the pin).
+#[test]
+fn a_product_result_pinned_off_its_atom_is_refused() {
+    let shape = Shape::new(16, 16);
+    let mut k = Kernel::new("pinned_product");
+    let a = k.param::<BF16>("a", ParamKind::In, shape.elems());
+    let c = k.param::<F32>("c", ParamKind::Out, shape.elems());
+    let v = k.view(a, 0, [16, 1], shape, [None, None]);
+    let x = k.load(v);
+    let zero = k.zeros::<F32>(shape);
+    let acc = k.mma(zero, x, false, x, true);
+    k.pin(acc, natural(shape, 1, 32).unwrap());
+    let out = k.view(c, 0, [16, 1], shape, [None, None]);
+    k.store(out, acc);
+    let err = infer(k.finish(), &declared(sm86()), WarpGrid { rows: 1, cols: 1 }, Core::Warp).err();
+    assert!(matches!(err, Some(crate::layouts::Error::Unresolved { value }) if value == acc.0), "{err:?}");
+}
+
 /// A register-staged fill's layout holds every element of its tile, each
 /// lane's registers in 16-byte row runs, and replicates only warps (or
 /// lanes) the tile has no rows for.

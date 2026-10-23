@@ -218,13 +218,16 @@ impl Frame<'_> {
     }
 
     /// Carried registers take their `next` where the iteration computed one
-    /// (a guarded body may skip it, leaving the register as it was).
+    /// (a guarded body may skip it, leaving the register as it was), all at
+    /// once: every `next` is read before any `phi` is written, so two
+    /// carried values sharing a `next` both take it.
     fn advance(&mut self, carried: &[Carried]) {
+        let taken: Vec<(ValId, Vec<f64>)> =
+            carried.iter().filter_map(|c| self.regs.get(&c.next).map(|next| (c.phi, next.clone()))).collect();
         for c in carried {
-            if let Some(next) = self.regs.remove(&c.next) {
-                self.regs.insert(c.phi, next);
-            }
+            self.regs.remove(&c.next);
         }
+        self.regs.extend(taken);
     }
 
     /// Element coordinates → flat index of a view, or `None` past its bounds.

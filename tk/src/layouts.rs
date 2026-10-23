@@ -27,6 +27,8 @@ pub enum Error {
     GroupOperand { what: String },
     #[snafu(display("the layouts reach no fixed point in {passes} passes"))]
     NotConverged { passes: usize },
+    #[snafu(display("value {value:?} is laid by what produces it and wanted otherwise where it is consumed"))]
+    Unresolved { value: ValId },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -902,7 +904,14 @@ pub fn infer(mut prog: Program, device: &Device, grid: WarpGrid, core: Core) -> 
     let (mut layouts, conflicts) = (it.lay, it.conflicts);
     if !conflicts.is_empty() {
         let body = std::mem::take(&mut prog.body);
-        let body = Rewrite { prog: &mut prog, lay: &mut layouts, conflicts, pos: 0 }.insert(body);
+        let mut rewrite = Rewrite { prog: &mut prog, lay: &mut layouts, conflicts, pos: 0 };
+        let body = rewrite.insert(body);
+        // A conflict the rewrite re-holds no operand for is on a result the
+        // op lays itself (a product's, a deal's): dropped, the emitter would
+        // write the op's layout into registers read under another.
+        if let Some(&(_, value)) = rewrite.conflicts.keys().next() {
+            return UnresolvedSnafu { value }.fail();
+        }
         prog.body = body;
     }
     Ok(Laid { prog, layouts })

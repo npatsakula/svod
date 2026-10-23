@@ -73,6 +73,28 @@ fn loop_carries_registers_and_bounds_gate_the_tail() {
     }
 }
 
+/// Two carried registers sharing one `next` both take it at the end of a
+/// trip, as the emitter moves them: the nexts are read before any `phi` is
+/// written, not taken one carried value at a time.
+#[test]
+fn carried_registers_sharing_a_next_both_take_it() {
+    let shape = Shape::new(4, 32);
+    let mut k = Kernel::new("shared_next");
+    let y = k.param::<F32>("y", ParamKind::Out, 2 * shape.elems());
+    let zero = k.zeros::<F32>(shape);
+    let one = k.fill::<F32>(shape, Const::Float(1.0));
+    let [a, b] = k.loop_(3, [zero, zero], |k, _, [a, _]| {
+        let next = k.binary(a, one, BinaryOp::Add);
+        [next, next]
+    });
+    for (at, v) in [(0, a), (shape.elems(), b)] {
+        let out = k.view(y, at, [32, 1], shape, [None, None]);
+        k.store(out, v);
+    }
+    let out = run(&k.finish(), vec![vec![0.0; 2 * shape.elems()]], &[]).unwrap();
+    assert!(out[0].iter().all(|&v| v == 3.0), "{:?}", &out[0][..]);
+}
+
 /// Online softmax as a monoid over `(max, sum)` carried through a loop of
 /// column blocks equals the direct softmax normalizer.
 #[test]
