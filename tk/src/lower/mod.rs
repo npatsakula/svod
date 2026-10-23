@@ -50,21 +50,18 @@ pub struct Lowering {
     pub device: Device,
     pub schedule: Schedule,
     pub grid: WarpGrid,
-    /// XOR-swizzle 16-byte chunks of shared rows against the row index.
-    pub swizzle: bool,
     /// The matrix instruction products issue on; on the warpgroup atom
     /// ([`crate::atoms::GroupMmaAtom`]) the grid's rows are warpgroups of
     /// four warps, shared operands are read through descriptors (over the
-    /// swizzled rows, so `swizzle` holds) and never loaded into registers.
+    /// swizzled rows) and never loaded into registers.
     pub core: Core,
 }
 
 impl Lowering {
-    /// `device`'s uniform pipeline over `grid`, its ring `unroll`ed or not,
-    /// shared rows swizzled.
+    /// `device`'s uniform pipeline over `grid`, its ring `unroll`ed or not.
     pub fn uniform(device: &Device, unroll: bool, grid: WarpGrid) -> Self {
         let schedule = Schedule::Uniform { fill: device.target.fill, unroll, async_products: false };
-        Self { device: device.clone(), schedule, grid, swizzle: true, core: Core::Warp }
+        Self { device: device.clone(), schedule, grid, core: Core::Warp }
     }
 }
 

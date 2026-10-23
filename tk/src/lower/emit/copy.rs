@@ -123,14 +123,7 @@ impl Emit<'_> {
                 }
             }
         }
-        for (j, w) in self.runs(&l, &s) {
-            let c = self.coord(&l, j);
-            let (off, _) = self.address(&s, &c);
-            let v = self.mem_load(&s.buf, &off, w, None);
-            let vals = (0..w as usize).map(|e| elem(&v, e, w as usize)).collect();
-            self.reg_store(dst, j, vals);
-        }
-        Ok(())
+        self.gather_view(dst, &s)
     }
 
     /// Global → registers: past a plain bound the load is gated; a gathered
@@ -237,30 +230,10 @@ impl Emit<'_> {
                 }
                 Ok(())
             }
+            // Every lane has a source: a shift's moves with nothing to fill.
             Relayout::Exchange(picks) => {
-                // A (mask, register) move is made once and shared by every
-                // destination register that selects it.
-                let mut moved: HashMap<(u32, u32), Arc<UOp>> = HashMap::new();
-                for (jd, picks) in picks.into_iter().enumerate() {
-                    let mut out: Option<Arc<UOp>> = None;
-                    for p in picks.into_iter().rev() {
-                        let v = moved
-                            .entry((p.mask, p.reg))
-                            .or_insert_with(|| {
-                                let x = self.reg_load(src, p.reg);
-                                if p.mask == 0 { x } else { self.shuffle_xor(&x, p.mask) }
-                            })
-                            .clone();
-                        out = Some(match out {
-                            None => v,
-                            Some(rest) => {
-                                let mine = self.hoist(self.lane_in(p.lanes));
-                                UOp::try_where(mine, v, rest).expect("exchange select")
-                            }
-                        });
-                    }
-                    self.reg_store(dst, jd as u32, vec![out.expect("a move per register")]);
-                }
+                let moves = picks.into_iter().map(|p| (p, 0)).collect();
+                self.moved(dst, moves, None, false, |e, reg| e.reg_load(src, reg));
                 Ok(())
             }
             Relayout::ViaSmem => self.relayout_via_smem(dst, src),
@@ -406,6 +379,8 @@ impl Emit<'_> {
         self.gather_view(dst, &view)
     }
 
+    /// Registers → a view without bounds (a shared tile, the scratch), in
+    /// the runs [`Self::runs`] gives.
     pub(super) fn store_view(&mut self, d: &View, src: ValId) -> Result<()> {
         let l = self.layout(src).clone();
         for (j, w) in self.runs(&l, d) {
@@ -417,6 +392,7 @@ impl Emit<'_> {
         Ok(())
     }
 
+    /// A view without bounds → registers, in the runs [`Self::runs`] gives.
     pub(super) fn gather_view(&mut self, dst: ValId, s: &View) -> Result<()> {
         let l = self.layout(dst).clone();
         for (j, w) in self.runs(&l, s) {

@@ -128,7 +128,7 @@ impl Emit<'_> {
                     None => (None, cols),
                 };
                 let chunk = 16 / bytes as i64;
-                let swizzle = if self.low.swizzle { Swizzle::of_row(cols as usize, bytes) } else { Swizzle::None };
+                let swizzle = Swizzle::of_row(cols as usize, bytes);
                 let col = if swizzle != Swizzle::None {
                     let (c, within) = (shr(&col, chunk.trailing_zeros()), and(&col, &c32(chunk - 1)));
                     let (shift, mask) = (3 - swizzle.bits(), c32((1 << swizzle.bits()) - 1));
@@ -233,8 +233,7 @@ impl Emit<'_> {
     /// reaches every row; `None` keeps the row whole.
     pub(super) fn panel_cols(&self, cols: usize, bytes: usize) -> Option<usize> {
         let (row, span) = (cols * bytes, Swizzle::B128.span());
-        (self.low.core == Core::Group && self.low.swizzle && row > span && row.is_multiple_of(span))
-            .then_some(span / bytes)
+        (self.low.core == Core::Group && row > span && row.is_multiple_of(span)).then_some(span / bytes)
     }
 
     /// The register runs of `l` a view is accessed by: 16-byte vectors along

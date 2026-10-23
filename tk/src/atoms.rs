@@ -7,7 +7,7 @@ use svod_ir::{AxisId, RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 use svod_schedule::optimizer::{Renderer, TensorCore};
 
 use crate::ir::Orient;
-use crate::layout::{self as frag, Dim, Layout};
+use crate::layout::{self as frag, Layout};
 use crate::layouts::{Issue, WarpGrid};
 
 /// Which matrix instruction a config's products issue on.
@@ -37,16 +37,6 @@ pub struct MmaAtom {
     pub dtype_in: ScalarDType,
     pub dtype_out: ScalarDType,
     pub meta: WmmaMetadata,
-}
-
-impl MmaAtom {
-    pub fn regs(&self, operand: Dim) -> u32 {
-        match operand {
-            Dim::Row => self.a.in_size(Dim::Reg),
-            Dim::Col => self.b.in_size(Dim::Reg),
-            _ => self.c.in_size(Dim::Reg),
-        }
-    }
 }
 
 impl MmaAtom {

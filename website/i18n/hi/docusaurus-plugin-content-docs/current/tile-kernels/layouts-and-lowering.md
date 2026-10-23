@@ -6,8 +6,8 @@ sidebar_label: Layouts और Lowering
 
 `lower::lower(program, &lowering, params, device)` एक tile program को ऐसे Svod program में बदलता है
 जिसकी instruction list पहले से क्रम में है। एक `Lowering` में वह सब होता है जो लेखक ने तय नहीं
-किया: `Device` (target और उसकी costs), `Schedule`, block tile पर `WarpGrid`, यह कि shared rows
-swizzle होंगी या नहीं (`swizzle`), और products किस matrix instruction पर issue होंगे (`core`)। हर
+किया: `Device` (target और उसकी costs), `Schedule`, block tile पर `WarpGrid`, और products किस
+matrix instruction पर issue होंगे (`core`); shared rows हमेशा XOR-swizzle होती हैं। हर
 कर्नेल config अपना `Lowering` बनाता है (`GemmCfg::lowering`, `FaCfg::lowering`,
 `NormCfg::lowering`)। `lower::standalone(program, &lowering)` बिना जुड़े device के किसी target के
 लिए lower करता है, और `lower::render` वह LLVM text लौटाता है जो backend के compiler को सौंपा जाता।

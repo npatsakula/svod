@@ -4,7 +4,7 @@ sidebar_label: 布局与降级
 
 # 布局与降级 {#layouts-and-lowering}
 
-`lower::lower(program, &lowering, params, device)` 把 tile 程序变成一个指令列表已排好顺序的 Svod 程序。`Lowering` 包含所有作者没有决定的东西：`Device`（目标及其代价）、`Schedule`、块 tile 上的 `WarpGrid`、共享内存行是否做 swizzle（`swizzle`），以及乘积在哪种矩阵指令上发出（`core`）。每种内核配置都会构造自己的降级参数（`GemmCfg::lowering`、`FaCfg::lowering`、`NormCfg::lowering`）。`lower::standalone(program, &lowering)` 针对未连接设备的目标进行降级，`lower::render` 返回将交给后端编译器的 LLVM 文本。
+`lower::lower(program, &lowering, params, device)` 把 tile 程序变成一个指令列表已排好顺序的 Svod 程序。`Lowering` 包含所有作者没有决定的东西：`Device`（目标及其代价）、`Schedule`、块 tile 上的 `WarpGrid`，以及乘积在哪种矩阵指令上发出（`core`）；共享内存行总是做 XOR swizzle。每种内核配置都会构造自己的降级参数（`GemmCfg::lowering`、`FaCfg::lowering`、`NormCfg::lowering`）。`lower::standalone(program, &lowering)` 针对未连接设备的目标进行降级，`lower::render` 返回将交给后端编译器的 LLVM 文本。
 
 | 步骤 | 模块 | 作用 |
 |---|---|---|

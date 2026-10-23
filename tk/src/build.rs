@@ -59,16 +59,12 @@ impl MmaIn for I8 {
     }
 }
 
-pub trait TierMark: Copy {
-    const TIER: Tier;
-}
+pub trait TierMark: Copy {}
 macro_rules! tier {
     ($($name:ident),*) => {$(
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub struct $name;
-        impl TierMark for $name {
-            const TIER: Tier = Tier::$name;
-        }
+        impl TierMark for $name {}
     )*};
 }
 tier!(Global, Smem, Reg);

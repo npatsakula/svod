@@ -835,7 +835,6 @@ fn a_bf16_sum_in_f32_takes_the_pair_dot_product_where_it_exists(target: Target, 
         schedule: crate::schedule::Schedule::Uniform { fill: target.fill, unroll: false, async_products: false },
         device: declared(target),
         grid: crate::layouts::WarpGrid { rows: 1, cols: 1 },
-        swizzle: false,
     };
     let ir = render(k.finish(), &lowering);
     assert_eq!(ir.contains("@llvm.amdgcn.fdot2.f32.bf16("), dot2, "{ir}");

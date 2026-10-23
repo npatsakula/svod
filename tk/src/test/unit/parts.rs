@@ -30,7 +30,6 @@ fn check(prog: Program, inputs: Vec<Vec<f64>>, out_elems: usize, warps: u32, tol
         device: declared(target),
         schedule: Schedule::Uniform { fill: Fill::CpAsync, unroll: false, async_products: false },
         grid: WarpGrid { rows: warps, cols: 1 },
-        swizzle: true,
     };
     let tensors: Vec<Tensor> = inputs
         .iter()
@@ -154,7 +153,6 @@ fn mma_peak_probe() {
         device: declared(target),
         schedule: Schedule::Uniform { fill: Fill::CpAsync, unroll: false, async_products: false },
         grid: WarpGrid { rows: 2, cols: 2 },
-        swizzle: true,
     };
     let a_t = Tensor::from_slice(vec![0.5f32; bm * bk]).cast(DType::BFloat16);
     let b_t = Tensor::from_slice(vec![0.5f32; bn * bk]).cast(DType::BFloat16);

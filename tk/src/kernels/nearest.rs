@@ -441,17 +441,9 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
     let shape = Shape::new(bq, bkv);
     let rows = Shape::new(bq, 1);
     // The block's rows of an `[n]` parameter (of the one at `base` of
-    // several, its rows `step` apart), `rows` of them, and a trip's columns
-    // of an `[m]` one.
-    fn row_view<E: Elem>(
-        k: &mut Kernel,
-        p: ParamRef<E>,
-        (base, step): (Sc, usize),
-        rows: Option<Sc>,
-        bq: usize,
-        q_off: Sc,
-    ) -> Gmem<E> {
-        let v = k.view(p, base, [step, 1], Shape::new(bq, 1), [rows, None]);
+    // several), `rows` of them, and a trip's columns of an `[m]` one.
+    fn row_view<E: Elem>(k: &mut Kernel, p: ParamRef<E>, base: Sc, rows: Option<Sc>, bq: usize, q_off: Sc) -> Gmem<E> {
+        let v = k.view(p, base, [1, 1], Shape::new(bq, 1), [rows, None]);
         k.at(v, q_off, 0)
     }
     fn col_view<E: Elem>(k: &mut Kernel, p: ParamRef<E>, m: usize, bkv: usize, start: Sc) -> Gmem<E> {
@@ -478,21 +470,21 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
     let x_view = k.at(x_view, q_off.clone(), 0);
     let q_r = cfg.bk.is_none().then(|| k.load(x_view));
     let x_sq = x_sq.map(|p| {
-        let v = row_view(&mut k, p, (Sc::from(from), 1), rb.clone(), bq, q_off.clone());
+        let v = row_view(&mut k, p, Sc::from(from), rb.clone(), bq, q_off.clone());
         let x_sq = k.load(v);
         half(&mut k, x_sq)
     });
     let x_scale = scales.map(|(p, _)| {
-        let v = row_view(&mut k, p, (Sc::from(from), 1), rb.clone(), bq, q_off.clone());
+        let v = row_view(&mut k, p, Sc::from(from), rb.clone(), bq, q_off.clone());
         k.load(v)
     });
     let row_floor = row_floor.map(|p| {
-        let v = row_view(&mut k, p, (Sc::from(from), 1), rb.clone(), bq, q_off.clone());
+        let v = row_view(&mut k, p, Sc::from(from), rb.clone(), bq, q_off.clone());
         let f = k.load(v);
         floor(&mut k, f)
     });
     let row_group = grouped.map(|(p, _)| {
-        let v = row_view(&mut k, p, (Sc::from(from), 1), rb.clone(), bq, q_off.clone());
+        let v = row_view(&mut k, p, Sc::from(from), rb.clone(), bq, q_off.clone());
         k.load(v)
     });
     let c_view = k.view(c, 0, [d, 1], Shape::new(bkv, depth), [bound(m, bkv), bound(d, depth)]);
@@ -1051,10 +1043,10 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
             Some((part, ..)) => (best, part.clone() * share_stride(n)),
             None => (finished(&mut k, best, metric), Sc::from(0)),
         };
-        let v = row_view(&mut k, score_out, (at.clone(), 1), rb.clone(), bq, q_off.clone());
+        let v = row_view(&mut k, score_out, at.clone(), rb.clone(), bq, q_off.clone());
         k.store(v, best);
         let index = k.cast::<F32, I32>(index);
-        let v = row_view(&mut k, index_out.expect("an index output"), (at, 1), rb, bq, q_off);
+        let v = row_view(&mut k, index_out.expect("an index output"), at, rb, bq, q_off);
         k.store(v, index);
         return k.finish();
     }

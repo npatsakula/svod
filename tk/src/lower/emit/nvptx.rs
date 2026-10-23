@@ -106,8 +106,8 @@ impl Emit<'_> {
         let (va, vb, vd) = (self.value(a).clone(), self.value(b).clone(), self.value(dst).clone());
         let atom = self.low.device.target.group_mma(va.dtype, vd.dtype).expect("inference found the core").clone();
         snafu::ensure!(
-            !a_t && vb.tier() == Tier::Smem && self.low.swizzle,
-            UnsupportedSnafu { what: "a warpgroup product over other than an untransposed A and swizzled shared B" }
+            !a_t && vb.tier() == Tier::Smem,
+            UnsupportedSnafu { what: "a warpgroup product over other than an untransposed A and shared B" }
         );
         let grid = self.low.grid;
         let k = va.shape.cols;
