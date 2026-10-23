@@ -94,7 +94,7 @@ Rules the code enforces:
 Tests live in `tk/src/test/unit/<topic>.rs` (never in-place; `test_case` tables, `proptest` shapes). Shared helpers in
 `mod.rs`: `device_target()`, `device_planner()`, `cp_async_target()`, `group_target()`, `tuned_on_device`, `measure`,
 `first_eight`, `costs()` (GUESSED, `step_group` 0), `gfx1151_costs()`, `declared`, `planner`, `rounded`, `decode`,
-`assert_rel_close`. Targets: `atoms::sm86()`, `targets::hopper()`, `targets::amd(AmdArch::Gfx1201, 64)`.
+`assert_rel_close`, `Scratch` (a temp directory a test drops, for a tune store), `self_join` (a nearest problem). Targets: `atoms::sm86()`, `targets::hopper()`, `targets::amd(AmdArch::Gfx1201, 64)`.
 
 | Level | Example |
 |---|---|
