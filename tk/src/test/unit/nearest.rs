@@ -8,7 +8,7 @@ use svod_dtype::{AmdArch, DType, ScalarDType};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
-use super::first_eight;
+use super::{first_eight, self_join};
 use crate::atoms::{Core, Target};
 use crate::build::{BF16, F16, I8};
 use crate::interp::{round_to, run};
@@ -461,6 +461,12 @@ impl Case {
             }
         }
     }
+}
+
+/// `n` rows against `m` candidates at depth `d` under `metric`, `k` scores a
+/// row, neither floors nor groups, nothing live: the spec most tests launch.
+pub(super) fn plain(n: usize, m: usize, d: usize, metric: Metric, k: usize, cfg: NearestCfg) -> NearestSpec {
+    NearestSpec { n, m, d, metric, floors: NONE, groups: false, k, cfg, live: Default::default() }
 }
 
 /// The interpreter's merge of a split kernel's shares.
@@ -1165,12 +1171,6 @@ fn few_queries_split_their_lists_to_fill_the_gpu(target: Target) {
     assert_eq!(planner.nearest_split(&self_join(1 << 16, 1 << 16, 128, Metric::NegDot, 16), &resident), None);
 }
 
-/// The planner's problem of `n` rows against `m` candidates at depth `d`,
-/// keeping `k` scores a row, with neither floors nor groups.
-fn self_join(n: usize, m: usize, d: usize, metric: Metric, k: usize) -> config::Nearest {
-    config::Nearest { n, m, d, dtype: svod_dtype::ScalarDType::Float16, metric, floors: NONE, groups: false, k }
-}
-
 // ---- device ------------------------------------------------------------------
 
 /// Every config of the first eight tiles ranked for the case's shape, lowered
@@ -1220,17 +1220,7 @@ fn split_too(planner: &Planner, case: &Case, depth: usize, k: usize, ranked: &[N
 #[test_case(crate::atoms::sm86(), "@llvm.nvvm.vote.any.sync("; "sm_86")]
 fn a_resident_trip_votes_before_it_places_its_least(target: Target, vote: &str) {
     let device = crate::sweep::declared(target);
-    let case = |cfg| NearestSpec {
-        n: 300,
-        m: 500,
-        d: 64,
-        metric: Metric::NegDot,
-        floors: NONE,
-        groups: false,
-        k: 1,
-        cfg,
-        live: Default::default(),
-    };
+    let case = |cfg| plain(300, 500, 64, Metric::NegDot, 1, cfg);
     for (cfg, votes) in [(NearestCfg::new(64, 32, 2), true), (NearestCfg::streamed(64, 32, 32, 2), false)] {
         let ir = crate::sweep::render(nearest::<BF16>(&case(cfg)), &cfg.lowering(&device));
         assert_eq!(ir.contains(vote), votes, "{cfg:?}");
@@ -1363,17 +1353,7 @@ fn every_lane_queue_lists_its_least(order: Order) {
 #[test_case(crate::atoms::sm86(), "@llvm.nvvm.vote.any.sync("; "sm_86")]
 fn a_list_votes_before_its_rounds(target: Target, vote: &str) {
     let device = crate::sweep::declared(target);
-    let case = |cfg| NearestSpec {
-        n: 300,
-        m: 500,
-        d: 64,
-        metric: Metric::NegDot,
-        floors: NONE,
-        groups: false,
-        k: 8,
-        cfg,
-        live: Default::default(),
-    };
+    let case = |cfg| plain(300, 500, 64, Metric::NegDot, 8, cfg);
     for cfg in [NearestCfg::new(64, 32, 2), NearestCfg::streamed(64, 32, 32, 2)] {
         let ir = crate::sweep::render(nearest::<BF16>(&case(cfg)), &cfg.lowering(&device));
         assert!(ir.contains(vote), "{cfg:?}");
@@ -1395,17 +1375,7 @@ fn a_list_is_held_beside_its_rows(target: Target) {
     for (cfg, k) in
         [(NearestCfg::new(64, 32, 2), 8), (NearestCfg::streamed(64, 64, 32, 2), 16), (NearestCfg::new(32, 16, 2), 3)]
     {
-        let spec = NearestSpec {
-            n: 300,
-            m: 500,
-            d: 64,
-            metric: Metric::SquaredL2,
-            floors: NONE,
-            groups: false,
-            k,
-            cfg,
-            live: Default::default(),
-        };
+        let spec = plain(300, 500, 64, Metric::SquaredL2, k, cfg);
         let grid = crate::layouts::WarpGrid { rows: cfg.warps(), cols: 1 };
         let laid = crate::layouts::infer(nearest::<BF16>(&spec), &device, grid, Core::Warp).unwrap();
         let (mut lists, mut deals) = (0, 0);
@@ -1452,7 +1422,7 @@ fn a_list_is_dealt_in_lane_under_measured_costs(target: Target, costs: crate::at
     let planner = Planner::new(device.clone()).unwrap();
     let (n, m, d, k) = (1 << 14, 1 << 14, 128, 64 + tk::MARGIN);
     for dtype in [ScalarDType::Int8, ScalarDType::Float16] {
-        let p = config::Nearest { n, m, d, dtype, metric: Metric::NegDot, floors: NONE, groups: false, k };
+        let p = config::Nearest { dtype, ..self_join(n, m, d, Metric::NegDot, k) };
         let atom = device.target.geometry_of(dtype).unwrap();
         let ranked = p.ranked(&planner);
         let queued = |bkv| ranked.iter().filter(move |c| c.queue == Some(32) && c.bkv == bkv).take(3).copied();
@@ -1461,7 +1431,7 @@ fn a_list_is_dealt_in_lane_under_measured_costs(target: Target, costs: crate::at
         for cfg in queued {
             let sharing = cfg.sharing(&device.target, d, dtype).unwrap();
             let metric = p.metric;
-            let spec = NearestSpec { n, m, d, metric, floors: NONE, groups: false, k, cfg, live: Default::default() };
+            let spec = plain(n, m, d, metric, k, cfg);
             let prog = match dtype {
                 ScalarDType::Int8 => nearest::<I8>(&spec),
                 _ => nearest::<F16>(&spec),
@@ -1855,11 +1825,7 @@ fn nearest_wide_probe() {
 /// Times the tuner's pick for an `n`-row self-join and every config it
 /// admitted, printing each one's pairs a second and TFLOP/s.
 fn time_nearest(planner: &Planner, n: usize, d: usize, metric: Metric, floors: Floors, groups: bool) {
-    time_list(
-        planner,
-        config::Nearest { n, m: n, d, dtype: svod_dtype::ScalarDType::Float16, metric, floors, groups, k: 1 },
-        DType::BFloat16,
-    );
+    time_list(planner, config::Nearest { floors, groups, ..self_join(n, n, d, metric, 1) }, DType::BFloat16);
 }
 
 /// [`time_nearest`] of the self-join `p` (its `k` scores a row) in `dtype`.
@@ -1922,31 +1888,12 @@ fn knn_probe() {
                     let mut least = None;
                     for &k in &ks {
                         let m = candidates.unwrap_or(n);
-                        let p = config::Nearest {
-                            n,
-                            m,
-                            d,
-                            dtype: svod_dtype::ScalarDType::Float16,
-                            metric,
-                            floors: NONE,
-                            groups: false,
-                            k,
-                        };
+                        let p = self_join(n, m, d, metric, k);
                         if std::env::var_os("KNN_ALL").is_some() && m == n {
                             time_list(&planner, p, DType::Float16);
                         }
                         let (_, pick) = device_nearest(&planner, p, DType::Float16);
-                        let spec = NearestSpec {
-                            n,
-                            m,
-                            d,
-                            metric,
-                            floors: NONE,
-                            groups: false,
-                            k,
-                            cfg: pick,
-                            live: Default::default(),
-                        };
+                        let spec = plain(n, m, d, metric, k, pick);
                         let [ns] = super::measure([tk::nearest::programs(&planner, DType::Float16, &spec)])[..] else {
                             unreachable!("one candidate")
                         };
@@ -2003,17 +1950,7 @@ fn rerank_probe() {
                             return (None, None);
                         }
                         let (_, pick) = device_nearest(&planner, p, DType::Scalar(dtype));
-                        let spec = NearestSpec {
-                            n,
-                            m,
-                            d,
-                            metric,
-                            floors: NONE,
-                            groups: false,
-                            k,
-                            cfg: pick,
-                            live: Default::default(),
-                        };
+                        let spec = plain(n, m, d, metric, k, pick);
                         let [ns] = super::measure([tk::nearest::programs(&planner, DType::Scalar(dtype), &spec)])[..]
                         else {
                             unreachable!("one candidate")
@@ -2241,17 +2178,7 @@ fn a_swapped_product_folds_a_row_in_lanes(target: Target, direct: usize, swapped
     let how = target.lane_move;
     let planner = super::planner(target.clone());
     let cfg = NearestCfg { warp_rows: 32, ..NearestCfg::new(128, 64, 2) };
-    let spec = NearestSpec {
-        n: 1000,
-        m: 1000,
-        d: 64,
-        metric: Metric::SquaredL2,
-        floors: NONE,
-        groups: false,
-        k: 1,
-        cfg,
-        live: Default::default(),
-    };
+    let spec = plain(1000, 1000, 64, Metric::SquaredL2, 1, cfg);
     let grid = crate::layouts::WarpGrid { rows: cfg.warps(), cols: 1 };
     fn pin(block: &mut Block, to: Orient) {
         for s in &mut block.0 {
@@ -2614,17 +2541,7 @@ fn list_ir_dump() {
         let unroll = std::env::var_os("LIST_UNROLL").is_some();
         let cfg = NearestCfg { lanes, unroll, queue: v.get(5).copied(), ..NearestCfg::new(v[0], v[1], v[2]) };
         for &k in &ks {
-            let spec = NearestSpec {
-                n: 1 << 14,
-                m: 1 << 14,
-                d: 128,
-                metric: Metric::SquaredL2,
-                floors: NONE,
-                groups: false,
-                k,
-                cfg,
-                live: Default::default(),
-            };
+            let spec = plain(1 << 14, 1 << 14, 128, Metric::SquaredL2, k, cfg);
             let start = std::time::Instant::now();
             let prog = if int8 { nearest::<I8>(&spec) } else { nearest::<F16>(&spec) };
             let ir = crate::sweep::render(prog, &cfg.lowering(&device));
@@ -2665,17 +2582,7 @@ fn list_time_probe() {
         })
         .collect();
     for &k in &ks {
-        let spec = |cfg| NearestSpec {
-            n,
-            m,
-            d,
-            metric: Metric::SquaredL2,
-            floors: NONE,
-            groups: false,
-            k,
-            cfg,
-            live: Default::default(),
-        };
+        let spec = |cfg| plain(n, m, d, Metric::SquaredL2, k, cfg);
         for run in 0..runs {
             let ns =
                 super::measure(cfgs.iter().map(|&cfg| tk::nearest::programs(&planner, DType::Float16, &spec(cfg))));
@@ -2734,17 +2641,7 @@ fn cfg_time_probe() {
     let [n, m, d, k] = shape[..] else { panic!("CFG_SHAPE is n,m,d,k") };
     let runs: usize = var("CFG_RUNS").parse().unwrap_or(3);
     let cfgs: Vec<NearestCfg> = var("CFGS").split(';').map(parsed_cfg).collect();
-    let spec = |cfg| NearestSpec {
-        n,
-        m,
-        d,
-        metric: Metric::NegDot,
-        floors: NONE,
-        groups: false,
-        k,
-        cfg,
-        live: Default::default(),
-    };
+    let spec = |cfg| plain(n, m, d, Metric::NegDot, k, cfg);
     for run in 0..runs {
         let ns = super::measure(cfgs.iter().map(|&cfg| tk::nearest::programs(&planner, DType::Float16, &spec(cfg))));
         for (cfg, ns) in cfgs.iter().zip(ns) {

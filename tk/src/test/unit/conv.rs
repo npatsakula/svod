@@ -8,14 +8,14 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::{assert_rel_close, conv_first_eight, declared, planner};
-use crate::atoms::{Core, Target, sm86};
+use crate::atoms::{Target, sm86};
 use crate::build::F16;
 use crate::interp::{round_to, run};
 use crate::kernels::conv::{ConvCfg, ConvGeom, ConvSpec, conv};
 use crate::kernels::gemm::{Epilogue, GemmCfg};
 use crate::kernels::{Act, Batch};
 use crate::launch::graph_launch;
-use crate::ops::config::Planner;
+use crate::ops::config::{Planner, gemm_cfg};
 
 pub(super) use crate::sweep::{YOLO, geom, yolo_geom};
 
@@ -85,10 +85,6 @@ pub(super) fn tolerance(epi: Epilogue) -> f64 {
     if epi.out_f32 { 1e-4 } else { 2e-3 }
 }
 
-fn cfg(tile: [usize; 3], warps: [u32; 2], stages: usize) -> GemmCfg {
-    GemmCfg { core: Core::Warp, tile, stages, warps, group_m: 8, unroll: true, crews: 1 }
-}
-
 fn check_interp(g: ConvGeom, batch: Batch, epi: Epilogue, c: GemmCfg) {
     let images = batch.capacity();
     let prog = conv::<F16>(&ConvSpec { batch: batch.clone(), geom: g, epilogue: epi, cfg: c, split: 1 });
@@ -108,7 +104,7 @@ pub(super) const SILU_BIAS: Epilogue = Epilogue { bias: true, act: Act::Silu, ..
 #[test]
 fn a_bound_batch_walks_grid_z() {
     let batch = Batch::Var { name: "b".into(), min: 1, max: 3 };
-    check_interp(geom([6, 5], 16, 32, 3, 2, 1, 1), batch, SILU_BIAS, cfg([32, 32, 16], [2, 2], 3));
+    check_interp(geom([6, 5], 16, 32, 3, 2, 1, 1), batch, SILU_BIAS, gemm_cfg([32, 32, 16], 3, [2, 2], true));
 }
 
 /// A reduction split over grid z: the partial program writes one f32
@@ -117,8 +113,13 @@ fn a_bound_batch_walks_grid_z() {
 #[test_case(9, Epilogue { out_f32: true, ..SILU_BIAS }; "a split per tap, f32 out")]
 fn split_conv_matches_the_direct_convolution(split: usize, epi: Epilogue) {
     let (g, images) = (geom([7, 6], 32, 40, 3, 1, 1, 1), 2);
-    let spec =
-        ConvSpec { batch: Batch::Static(images), geom: g, epilogue: epi, cfg: cfg([32, 32, 32], [2, 2], 2), split };
+    let spec = ConvSpec {
+        batch: Batch::Static(images),
+        geom: g,
+        epilogue: epi,
+        cfg: gemm_cfg([32, 32, 32], 2, [2, 2], true),
+        split,
+    };
     let params = inputs(&g, images, epi, 6);
     let want = reference(&g, images, epi, &params);
     let [ho, wo] = g.out_hw();
@@ -141,7 +142,7 @@ fn an_inf_reaches_only_the_windows_over_it() {
         batch: Batch::Static(1),
         geom: g,
         epilogue: epi,
-        cfg: cfg([32, 32, 16], [2, 2], 2),
+        cfg: gemm_cfg([32, 32, 16], 2, [2, 2], true),
         split: 1,
     });
     let mut params = inputs(&g, 1, epi, 5);
@@ -187,7 +188,7 @@ proptest! {
     ) {
         let g = geom(hw, depths * tile[2], cout, k, s, if padded { d * (k / 2) } else { 0 }, d);
         prop_assume!(g.out_hw().iter().all(|&d| d > 0));
-        check_interp(g, Batch::Static(images), epi, cfg(tile, [2, 2], 2));
+        check_interp(g, Batch::Static(images), epi, gemm_cfg(tile, 2, [2, 2], true));
     }
 }
 
@@ -381,7 +382,7 @@ fn conv_matches_on_the_device(g: ConvGeom, images: usize, epi: Epilogue, tile: [
         batch: Batch::Static(images),
         geom: g,
         epilogue: epi,
-        cfg: cfg(tile, warps, target.fill.stages(3)),
+        cfg: gemm_cfg(tile, target.fill.stages(3), warps, true),
         split: 1,
     };
     let params = inputs(&g, images, epi, 21);
@@ -404,7 +405,7 @@ fn an_inf_gives_the_graphs_non_finite_set_on_the_device() {
         batch: Batch::Static(1),
         geom: g,
         epilogue: epi,
-        cfg: cfg([64, 64, 32], [2, 2], target.fill.stages(3)),
+        cfg: gemm_cfg([64, 64, 32], target.fill.stages(3), [2, 2], true),
         split: 1,
     };
     let got = on_device(&spec, &target, &params);
@@ -426,7 +427,7 @@ fn a_bound_batch_runs_the_live_images_on_the_device() {
         batch: Batch::Var { name: "b".into(), min: 1, max: cap as i64 },
         geom: g,
         epilogue: RESIDUAL_SILU_BIAS,
-        cfg: cfg([64, 64, 32], [2, 2], target.fill.stages(3)),
+        cfg: gemm_cfg([64, 64, 32], target.fill.stages(3), [2, 2], true),
         split: 1,
     };
     let params = inputs(&g, cap, RESIDUAL_SILU_BIAS, 4);

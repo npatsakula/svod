@@ -38,7 +38,8 @@ use crate::interp::round_to;
 use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
-use crate::ops::config::{Planner, has_kernels};
+use crate::kernels::nearest::{Floors, Metric};
+use crate::ops::config::{self, Planner, has_kernels};
 pub(crate) use crate::sweep::{conv_first_eight, costs, declared, first_eight, planner};
 
 /// The default device's target when tk has kernels for it, of any vendor:
@@ -315,6 +316,45 @@ fn bf16(bits: u16) -> f64 {
 fn a_16_bit_output_decodes_as_ieee(dtype: ScalarDType, bits: u16, want: Option<f64>) {
     let got = decode(dtype, &bits.to_le_bytes())[0];
     assert!(want.map_or(got.is_nan(), |w| got == w), "{bits:#06x}: {got}");
+}
+
+/// The planner's problem of `n` f16 rows against `m` candidates at depth
+/// `d`, keeping `k` scores a row, with neither floors nor groups.
+fn self_join(n: usize, m: usize, d: usize, metric: Metric, k: usize) -> config::Nearest {
+    let (dtype, floors) = (ScalarDType::Float16, Floors::default());
+    config::Nearest { n, m, d, dtype, metric, floors, groups: false, k }
+}
+
+/// A fresh directory under the system temp dir, removed when dropped (a
+/// test's panic included).
+pub(super) struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    pub(super) fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("svod-tk-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        Self(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for Scratch {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
 }
 
 /// `|got - want| ≤ tol·max(|want|, 1)` everywhere: an error relative to the

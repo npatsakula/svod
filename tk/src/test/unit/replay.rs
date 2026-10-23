@@ -5,6 +5,8 @@
 //! admission, choice and pipeline stages to the config they name.
 
 use std::path::{Path, PathBuf};
+
+use super::Scratch;
 use std::sync::Arc;
 
 use svod_dtype::{DType, ScalarDType};
@@ -16,13 +18,6 @@ use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec};
 use crate::ops::config::{Planner, Tiled, representatives};
 use crate::ops::{DEVICE_TEST, tuned};
 use crate::tune::{self, Entry, FORMAT, Found, Kind, TuneKey, TuneStore};
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("svod-tk-replay-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
-}
 
 /// Writes `lines` (`line numbers`) as `key`'s device file under `dir`.
 fn write(dir: &Path, key: &TuneKey, lines: &[String]) -> PathBuf {
@@ -64,7 +59,7 @@ fn a_replay_reads_a_keys_line_whatever_compiler_wrote_it(
     programs: u64,
 ) -> (Found, Option<u64>) {
     let name: String = format!("{lines:?}").chars().filter(char::is_ascii_digit).collect();
-    let dir = scratch(&format!("lines-{name}"));
+    let dir = Scratch::new(&format!("replay-lines-{name}"));
     let key = key();
     let other = TuneKey { candidates: key.candidates ^ 1, ..key.clone() };
     let mut text: Vec<String> = lines
@@ -75,13 +70,12 @@ fn a_replay_reads_a_keys_line_whatever_compiler_wrote_it(
         .collect();
     text.push(format!("{} 99", other.line(Kind::Value, programs)));
     write(&dir, &key, &text);
-    let store = TuneStore::replay(dir.clone());
+    let store = TuneStore::replay(dir.to_path_buf());
     let v = store.value(&key, || programs, || panic!("a replay measures nothing"));
     let lookups = store.lookups();
     assert_eq!(lookups.len(), 1);
     assert_eq!(lookups[0].key, key.candidates(Kind::Value));
     assert_eq!(lookups[0].entry, v.map(Entry::Value));
-    let _ = std::fs::remove_dir_all(dir);
     (lookups[0].found, v)
 }
 
@@ -90,7 +84,7 @@ fn a_replay_reads_a_keys_line_whatever_compiler_wrote_it(
 /// costs read from the same directory open nothing for writing either.
 #[test]
 fn a_replay_writes_nothing() {
-    let dir = scratch("writes");
+    let dir = Scratch::new("replay-writes");
     let planner = super::planner(sm86());
     let ranked = planner.gemm_ranked(1, 256, 256, 256, false);
     let file = write(&dir, &key(), &[format!("{} 5", key().line(Kind::Value, 1))]);
@@ -102,14 +96,13 @@ fn a_replay_writes_nothing() {
     let before = tree(&dir);
     let spec =
         GemmSpec { m: 256, n: 256, k: 256, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: ranked[0] };
-    let store = TuneStore::replay(dir.clone());
+    let store = TuneStore::replay(dir.to_path_buf());
     tuned::linear(&store, &planner, DType::BFloat16, &ranked, spec);
     assert!(store.lookups().iter().all(|l| matches!(l.found, Found::Missing { .. })), "{:?}", store.lookups());
     // No probe line: every probe is unmeasured, each fingerprinted to look.
     assert!(crate::probe::stored(&dir, &sm86()).is_some_and(|m| !m.unmeasured.is_empty()));
     assert_eq!(tree(&dir), before, "the replay changed its root");
     assert!(file.exists());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// What `linear` and the GEMM probes key their first store line by: the
@@ -123,7 +116,8 @@ fn a_gemm_tuning_reads_the_key_the_op_layer_writes(probe: bool) {
     let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
     let spec =
         GemmSpec { m: 512, n: 512, k: 512, batch: Batch::Static(1), epilogue: Epilogue::DEFAULT, cfg: ranked[0] };
-    let store = TuneStore::replay(scratch(&format!("key-{probe}")));
+    let dir = Scratch::new(&format!("replay-key-{probe}"));
+    let store = TuneStore::replay(dir.to_path_buf());
     let reps = representatives(&ranked);
     let (op, candidates) = if probe {
         tuned::gemm_probe(&store, &planner, DType::BFloat16, &ranked, spec);
@@ -173,9 +167,9 @@ fn spec(cfg: GemmCfg) -> GemmSpec {
 /// twins' stage unstored) the leader is the pick.
 #[test]
 fn a_replayed_gemm_follows_the_admission_and_the_choice() {
-    let dir = scratch("chain");
+    let dir = Scratch::new("replay-chain");
     let (planner, ranked, reps) = admitted_and_chosen(&dir);
-    let store = TuneStore::replay(dir.clone());
+    let store = TuneStore::replay(dir.to_path_buf());
     let pick = tuned::linear(&store, &planner, DType::BFloat16, &ranked, spec(ranked[0])).cfg;
     assert_eq!(pick, reps[1], "the choice's fastest, the second admitted");
     let lookups = store.lookups();
@@ -185,7 +179,6 @@ fn a_replayed_gemm_follows_the_admission_and_the_choice() {
     let twins = reps[1].twins(&ranked).len();
     assert_eq!(lookups.len(), if twins >= 2 { 3 } else { 2 }, "{lookups:?}");
     assert!(tune::enabled());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The planner log names the configs each stage decided on as their Debug
@@ -202,12 +195,12 @@ fn the_planner_log_names_the_admitted_and_chosen_configs() {
         tuned::linear(&TuneStore::replay(dir.into()), &planner, DType::BFloat16, &ranked, spec(ranked[0]));
         return;
     }
-    let dir = scratch("log");
+    let dir = Scratch::new("replay-log");
     let (_, _, reps) = admitted_and_chosen(&dir);
     let test = std::thread::current().name().expect("a named test thread").to_string();
     let child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
         .args(["--exact", &test, "--nocapture", "--test-threads=1"])
-        .env(CHILD, &dir)
+        .env(CHILD, &*dir)
         .env("RUST_LOG", format!("{}=debug", crate::ops::PLAN))
         .env("NO_COLOR", "1")
         .output()
@@ -218,5 +211,4 @@ fn the_planner_log_names_the_admitted_and_chosen_configs() {
     assert!(line(" admitted ").contains(&format!("configs=[{:?}, {:?}]", reps[2], reps[1])), "{log}");
     assert!(line(" choice ").contains(&format!("timed=[({:?}, 900), ({:?}, 2000)]", reps[1], reps[2])), "{log}");
     assert!(line(" tuned ").contains(&format!("pick={:?}", reps[1])), "{log}");
-    let _ = std::fs::remove_dir_all(dir);
 }

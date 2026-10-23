@@ -10,7 +10,7 @@ use test_case::test_case;
 
 use super::conv::geom;
 use super::tune::Select;
-use super::{costs, first_eight, planner};
+use super::{costs, first_eight, planner, self_join};
 use crate::atoms::{Core, Costs, Device, Fill, Target, sm86};
 use crate::build::BF16 as BF16T;
 use crate::kernels::Batch;
@@ -72,8 +72,7 @@ fn apple() -> Target {
 
 /// The config measured fastest at 4096³ on the 3060 (25.4 TFLOP/s): the
 /// 128×128 tile and three 32-deep slots over eight warps.
-const BIG_MEASURED: GemmCfg =
-    GemmCfg { core: Core::Warp, tile: [128, 128, 32], stages: 3, warps: [2, 4], group_m: 8, unroll: false, crews: 1 };
+const BIG_MEASURED: GemmCfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
 
 /// A list the planner offers for `k` on `target`: not empty, each config
 /// once, lowering there with its ring in shared memory and dividing `k`;
@@ -249,15 +248,7 @@ fn an_sm_issues_its_share_of_blocks() {
 fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize, cheap_wins: bool) {
     let problem = config::Problem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     // A small tile: its residency is bound by shared memory, not registers.
-    let two = GemmCfg {
-        core: Core::Warp,
-        tile: [64, 64, bk],
-        stages: target.fill.stages(3),
-        warps: [2, 2],
-        group_m: 8,
-        unroll: false,
-        crews: 1,
-    };
+    let two = gemm_cfg([64, 64, bk], target.fill.stages(3), [2, 2], false);
     let one = GemmCfg { stages: 1, ..two };
     let c = costs();
     let latency_one = c.latency / (two.stages - 1) as f64;
@@ -392,8 +383,7 @@ fn a_round_pays_the_latency_its_ring_leaves() {
 /// changes nothing.
 #[test]
 fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
-    let cfg =
-        |warps| GemmCfg { core: Core::Warp, tile: [64, 64, 32], stages: 3, warps, group_m: 8, unroll: false, crews: 1 };
+    let cfg = |warps| gemm_cfg([64, 64, 32], 3, warps, false);
     let p = config::Problem { batches: 1, m: 64 * 28, n: 64 * 28, k: 4096, halves: 1 };
     let ratio = |step_lone| {
         let planner = planned(Device { target: sm86(), costs: Costs { step_lone, ..costs() } });
@@ -469,15 +459,7 @@ fn blocks_in_flight_share_their_lines_past_the_cache() {
 /// second tile comes after every class's first, and every config is kept.
 #[test]
 fn the_ranking_leads_with_a_tile_of_each_block() {
-    let cfg = |tile: [usize; 3], warps: [u32; 2], stages| GemmCfg {
-        core: Core::Warp,
-        tile,
-        stages,
-        warps,
-        group_m: 8,
-        unroll: false,
-        crews: 1,
-    };
+    let cfg = |tile, warps, stages| gemm_cfg(tile, stages, warps, false);
     let ranked = vec![
         (100.0, cfg([128, 128, 64], [2, 2], 3)),
         (100.0, cfg([128, 128, 64], [2, 2], 2)),
@@ -1496,20 +1478,11 @@ fn nearest_plans(x: &[usize], c: &[usize], dtype: DType, k: usize, want: Result<
 #[test_case(gfx1201(), 1, 2; "gfx1201")]
 #[test_case(crate::test::unit::targets::amd(AmdArch::Gfx1151, 40), 1, 2; "gfx1151")]
 fn a_list_costs_its_registers_and_merges(target: Target, per_16_rows: u32, sharing: u32) {
-    use crate::kernels::nearest::{Floors, LaneQueue, Metric, NearestCfg};
-    use crate::ops::config::{Nearest, REGISTER_K, Rejected};
+    use crate::kernels::nearest::{LaneQueue, Metric, NearestCfg};
+    use crate::ops::config::{REGISTER_K, Rejected};
     let planner = planner(target.clone());
     let cfg = NearestCfg::new(64, 32, 2);
-    let p = |k| Nearest {
-        dtype: svod_dtype::ScalarDType::Float16,
-        n: 1 << 16,
-        m: 1 << 16,
-        d: 64,
-        metric: Metric::SquaredL2,
-        floors: Floors::default(),
-        groups: false,
-        k,
-    };
+    let p = |k| self_join(1 << 16, 1 << 16, 64, Metric::SquaredL2, k);
     let regs = |k| cfg.registers(&target, 64, k, svod_dtype::ScalarDType::Float16).unwrap();
     let LaneQueue { width, depth, .. } = LaneQueue::PORTABLE;
     assert_eq!(cfg.sharing(&target, 64, svod_dtype::ScalarDType::Float16), Some(sharing as usize));
@@ -2035,20 +2008,11 @@ fn gfx1151_planner() -> Planner {
 #[test_case(sm86(), crate::test::unit::sm86_costs(), 0.2, 0.4; "sm_86")]
 #[test_case(gfx1201(), crate::test::unit::gfx1201_costs(), 0.45, 0.7; "gfx1201")]
 fn an_8_bit_search_is_priced_at_its_step(target: Target, costs: Costs, low: f64, high: f64) {
-    use crate::kernels::nearest::{Floors, Metric};
+    use crate::kernels::nearest::Metric;
     use svod_dtype::ScalarDType;
     let planner = planned(Device { target, costs });
     let best = |dtype| {
-        let p = config::Nearest {
-            n: 16384,
-            m: 16384,
-            d: 768,
-            dtype,
-            metric: Metric::NegDot,
-            floors: Floors::default(),
-            groups: false,
-            k: 1,
-        };
+        let p = config::Nearest { dtype, ..self_join(16384, 16384, 768, Metric::NegDot, 1) };
         let ranked = planner.nearest_ranked(p);
         p.admit(&planner, &ranked[0]).expect("ranked").0
     };
