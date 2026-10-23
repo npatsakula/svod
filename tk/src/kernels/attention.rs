@@ -96,7 +96,7 @@ pub struct Forms {
 /// row's scores and its reductions stay within the warp. A warp may own a
 /// multiple ([`FaCfg::warp_rows`]); the planner refuses a core whose atom
 /// differs ([`FaCfg::fits`](FaCfg::fits)).
-pub const WARP_ROWS: usize = 16;
+pub(crate) const WARP_ROWS: usize = 16;
 
 /// Why [`attention`] refuses a config, whatever the target: what its
 /// ranking leaves out as one that does not lower
@@ -269,7 +269,7 @@ pub struct CacheLayout {
 
 /// The row stride of the `key_mask` and `bias` parameters: 8-element runs
 /// stay aligned.
-pub fn key_mask_stride(tk: usize) -> usize {
+pub(crate) fn key_mask_stride(tk: usize) -> usize {
     tk.next_multiple_of(8)
 }
 

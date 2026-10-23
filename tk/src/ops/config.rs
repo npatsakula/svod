@@ -2021,7 +2021,7 @@ impl Tiled for NearestCfg {
 }
 
 /// One warp per head row, the head split in halves a warp spreads over.
-pub fn heads_candidates(d: usize) -> Vec<NormCfg> {
+pub(crate) fn heads_candidates(d: usize) -> Vec<NormCfg> {
     if !(d.is_power_of_two() && (16..=256).contains(&d)) {
         return vec![];
     }

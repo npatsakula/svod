@@ -765,7 +765,7 @@ impl Costs {
 /// (about the square) and gfx1201 65, 27, 17, 11 (about the blocks); the
 /// square ranks both cards' configs closer to their measured order than
 /// either card's own exponent.
-pub const TRIP_HIDING: i32 = 2;
+pub(crate) const TRIP_HIDING: i32 = 2;
 
 const fn sm(major: u8, minor: u8) -> GpuArch {
     GpuArch::Cuda(CudaArch { major, minor })

@@ -331,7 +331,7 @@ fn launched(live: &Option<Sc>, n: usize, per: usize) -> Sc {
 
 /// The most candidates a kernel ranks: the running index is held in f32,
 /// exact below 2^24.
-pub const MAX_CANDIDATES: usize = 1 << 24;
+pub(crate) const MAX_CANDIDATES: usize = 1 << 24;
 
 /// For every row `i` of `x`, the least score over the candidates `c` (over
 /// `j` with `row_group[i] ≠ col_group[j]` under groups) and the smallest
@@ -1141,7 +1141,7 @@ const SELECT_WIDE: usize = 4;
 
 /// Search bound: the most scores a block of a score matrix holds where the
 /// device's memory is not known (1 GiB of them).
-pub const SCRATCH: usize = 1 << 28;
+pub(crate) const SCRATCH: usize = 1 << 28;
 
 /// Search bound: the share of device memory a block of a score matrix takes
 /// at most.
@@ -1159,7 +1159,7 @@ pub fn scratch(memory: Option<u64>) -> usize {
 /// where it holds them, else as many candidates as it holds of every row, at
 /// least `8·k` (each block reads and writes a list a row), and then as many
 /// rows as it holds of them.
-pub fn select_blocks(n: usize, m: usize, k: usize, cfg: &NearestCfg, scratch: usize) -> (usize, usize) {
+pub(crate) fn select_blocks(n: usize, m: usize, k: usize, cfg: &NearestCfg, scratch: usize) -> (usize, usize) {
     let cols = m.min((scratch / n).max(8 * k).next_multiple_of(cfg.bkv));
     let rows = n.min((scratch / cols).max(cfg.bq) / cfg.bq * cfg.bq);
     (rows, cols)
@@ -1171,7 +1171,7 @@ pub const LANES: usize = 32;
 
 /// The runs of [`LANES`] slots a list of `k` is held in: `k` up to a power
 /// of two.
-pub fn select_runs(k: usize) -> usize {
+pub(crate) fn select_runs(k: usize) -> usize {
     k.next_power_of_two().max(LANES) / LANES
 }
 
@@ -1495,7 +1495,7 @@ pub fn nearest_select(spec: &SelectSpec) -> Program {
 /// The elements one share's partial results of `n` rows span: whole merge
 /// blocks, so every share starts where the merge's vector loads may (a
 /// misaligned one faults on CUDA).
-pub fn share_stride(n: usize) -> usize {
+pub(crate) fn share_stride(n: usize) -> usize {
     n.next_multiple_of(MERGE_ROWS)
 }
 
@@ -1737,7 +1737,7 @@ pub struct NearestMergeSpec {
 const MERGE_ROWS: usize = 256;
 /// Search bound: the warps a merge block of lists folds over, a warp's rows
 /// each — one pick the lattice does not search.
-pub const LIST_WARPS: u32 = 4;
+pub(crate) const LIST_WARPS: u32 = 4;
 
 impl NearestMergeSpec {
     pub fn lowering(&self, device: &Device) -> Lowering {
@@ -1886,7 +1886,7 @@ fn merge_lists(spec: &NearestMergeSpec) -> Program {
 /// Search bound: the candidates [`nearest_rescore`] scores per block, a
 /// warp's share of them rows of its tile — one pick the lattice does not
 /// search.
-pub const RESCORE_PAIRS: usize = 64;
+pub(crate) const RESCORE_PAIRS: usize = 64;
 /// The depth a [`nearest_rescore`] trip reads of each pair's rows: 64 f32,
 /// two 128-byte lines a row.
 const RESCORE_DEPTH: usize = 64;

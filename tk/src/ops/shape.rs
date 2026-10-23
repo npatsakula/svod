@@ -86,7 +86,7 @@ pub fn bound_var(dim: &SInt) -> Option<Var> {
     }
 }
 
-pub fn shape_of(t: &Tensor) -> svod_tensor::error::Result<Vec<SInt>> {
+pub(crate) fn shape_of(t: &Tensor) -> svod_tensor::error::Result<Vec<SInt>> {
     Ok(t.shape()?.to_vec())
 }
 
