@@ -5,10 +5,10 @@ use std::fmt;
 
 use super::rows::NormCfg;
 use super::{Batch, batch_offset, bound, load_f32};
-use crate::atoms::{Core, Device};
+use crate::atoms::{Core, Device, Target};
 use crate::build::*;
 use crate::ir::*;
-use crate::layouts::{Relayout, WarpGrid};
+use crate::layouts::WarpGrid;
 use crate::lower::Lowering;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -184,18 +184,18 @@ impl FaCfg {
         self.key_warps * self.stages * slot * 2
     }
 
-    /// The shared scratch the probabilities cross to become the P·V operand
-    /// where the core's accumulator cannot feed a product as it stands
-    /// (RDNA3) and the inference re-holds them through shared memory rather
-    /// than a lane exchange, the device's costs deciding
-    /// ([`crate::atoms::MmaAtom::accumulator_relayout`]): the 16-bit tile,
-    /// one per key warp. Nothing otherwise.
-    pub fn scratch_bytes(&self, device: &Device) -> usize {
-        let Device { target, costs } = device;
+    /// The shared scratch the probabilities may cross to become the P·V
+    /// operand where the core's accumulator cannot feed a product as it
+    /// stands (RDNA3): the 16-bit tile, one per key warp. A bound: the
+    /// lowering declares it only where the inference re-holds the tile
+    /// through shared memory rather than a lane exchange, which the whole
+    /// program and the device's costs decide (under the Strix Halo's costs
+    /// a 32×128 block of head size 64 crosses it under a key mask and
+    /// exchanges without one), so no count from the config alone is the
+    /// kernel's. Nothing where the accumulator feeds.
+    pub fn scratch_bytes(&self, target: &Target) -> usize {
         match target.geometry() {
-            Some(atom) if atom.accumulator_relayout(target.wave, costs) == Relayout::ViaSmem => {
-                self.key_warps * self.bq * self.bkv * 2
-            }
+            Some(atom) if !atom.accumulator_feeds(target.wave) => self.key_warps * self.bq * self.bkv * 2,
             _ => 0,
         }
     }

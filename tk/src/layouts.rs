@@ -660,25 +660,6 @@ impl MmaAtom {
         feeds(m, k, |p| &p.a) || (self.swappable() && feeds(k, n, |p| &p.b))
     }
 
-    /// How an accumulator becomes the next product's operand: in place
-    /// where it [feeds](Self::accumulator_feeds), else the cheaper under
-    /// `costs` of a lane exchange and a trip through shared memory, as the
-    /// inference weighs them ([`TileLayout::relayout`]), over the direct
-    /// form and the swapped one.
-    pub fn accumulator_relayout(&self, lanes: u32, costs: &Costs) -> Relayout {
-        let (m, n, k) = (self.m as usize, self.n as usize, self.k as usize);
-        let one = WarpGrid { rows: 1, cols: 1 };
-        let crosses = |rows, cols, operand: fn(&Issue) -> &TileLayout| {
-            self.issue(Orient::Direct, one, rows, cols, k).ok().map(|p| p.c.relayout(operand(&p), 1, lanes, costs))
-        };
-        let swapped = self.swappable().then(|| crosses(k, n, |p| &p.b)).flatten();
-        [crosses(m, k, |p| &p.a), swapped]
-            .into_iter()
-            .flatten()
-            .min_by(|a, b| a.cost_per_element(costs).total_cmp(&b.cost_per_element(costs)))
-            .unwrap_or(Relayout::ViaSmem)
-    }
-
     /// The `[m, n] += [m, k] · [k, n]` product over `grid`, issued `orient`
     /// way round. Swapped, our A feeds the slot expecting `atom.b` (as Aᵀ)
     /// and our B the one expecting `atom.a`, so each is held in the other's

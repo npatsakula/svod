@@ -1022,7 +1022,7 @@ fn a_bias_rides_its_own_ring_slot(target: Target) {
     let planner = planner(target.clone());
     let ranked = planner.attention_ranked(8, 512, 512, 64, false, true);
     assert!(!ranked.is_empty());
-    let within = |c: &FaCfg| c.smem_bytes(64, true) + c.scratch_bytes(&planner.device) <= target.smem_bytes;
+    let within = |c: &FaCfg| c.smem_bytes(64, true) + c.scratch_bytes(&target) <= target.smem_bytes;
     assert!(ranked.iter().all(|c| c.fits(&target, 64, true) && within(c)), "{ranked:?}");
     let biased = config::Attention { tiles: 8, t: 512, tk: 512, d: 64, causal: false, bias: true };
     let plain = config::Attention { bias: false, ..biased };
@@ -1209,7 +1209,7 @@ fn attention_candidates(d: usize, smem: usize) {
     assert!(list.iter().all(|c| c.smem_bytes(d, false) <= smem && c.fits(&target, d, false)), "{list:?}");
     for (i, c) in list.iter().enumerate() {
         assert!(!list[..i].contains(c), "{c:?} twice");
-        assert_eq!(c.scratch_bytes(&super::declared(target.clone())), 0);
+        assert_eq!(c.scratch_bytes(&target), 0);
     }
     let short = first_eight(&list);
     assert!(short.len() >= 4, "{short:?}");
@@ -1924,11 +1924,9 @@ fn a_bound_conv_batch_plans_per_image() {
 /// RDNA plans kernels from the lattice under its own facts: register-staged
 /// rings of one slot (rolled: there is nothing to fold) or two (unrolled
 /// over the slots), 16×16 WMMA-tileable warp grids, attention within 64 KB
-/// of LDS. RDNA3's accumulator cannot feed the P·V product as it stands:
-/// under the declared costs (and gfx1151's measured ones) the inference
-/// exchanges the probabilities through lanes, no scratch, and only where a
-/// trip through shared memory is cheaper does the kernel declare one, the
-/// 16-bit tile per key warp.
+/// of LDS with the scratch its probabilities may cross (RDNA3's accumulator
+/// cannot feed the P·V product as it stands): the 16-bit tile per key
+/// warp, charged as a bound.
 #[test]
 fn rdna_plans_register_staged_kernels() {
     let target = rdna3();
@@ -1936,23 +1934,16 @@ fn rdna_plans_register_staged_kernels() {
         kernel_plan(shape::linear(Some(&planner(target.clone())), &[BF16; 2], Some(&ext(&[4096, 4096])), 4096, false));
     assert_valid(&gemms, &target, 4096, false);
     assert!(first_eight(&gemms).iter().all(|c| c.unroll == (c.stages == 2) && c.fits(&target)), "{gemms:?}");
-    let declared = super::declared(target.clone());
-    let cheap_smem = Device { costs: Costs { smem_trip: 0.001, ..costs() }, ..declared.clone() };
-    let measured = Device { costs: super::gfx1151_costs(), ..declared.clone() };
     for (d, t) in [(64, 1500), (64, 1)] {
         let q = ext(&[1, t, 8, d]);
         let fa =
             kernel_plan(shape::attention(Some(&planner(target.clone())), &[BF16; 3], Some(&q), Some(&q), false, false));
-        let within = |c: &FaCfg| c.smem_bytes(d, false) + c.scratch_bytes(&declared) <= 64 << 10;
+        let within = |c: &FaCfg| c.smem_bytes(d, false) + c.scratch_bytes(&target) <= 64 << 10;
         assert!(fa.iter().all(|c| c.stages == 2 && within(c)), "{fa:?}");
-        for c in fa.iter() {
-            assert_eq!(
-                (c.scratch_bytes(&declared), c.scratch_bytes(&measured)),
-                (0, 0),
-                "{c:?} exchanges through lanes"
-            );
-            assert_eq!(c.scratch_bytes(&cheap_smem), c.key_warps * c.bq * c.bkv * 2, "{c:?} through shared memory");
-        }
+        assert!(
+            fa.iter().all(|c| c.scratch_bytes(&target) == c.key_warps * c.bq * c.bkv * 2),
+            "RDNA3 may re-hold its probabilities"
+        );
     }
     assert!(matches!(
         shape::norm(Some(&planner(target.clone())), &[BF16; 2], Some(&ext(&[37, 1024]))),
@@ -1962,14 +1953,13 @@ fn rdna_plans_register_staged_kernels() {
 
 /// Two atom rows per warp are a variant of a tile, never its representative:
 /// the d64 biased attention's shortlist on gfx1151 (under its measured
-/// costs; its 128×64 tile's rings and bias ring fill the 64 KB exactly,
-/// which the scratch once charged for a relayout the inference never makes
-/// put past it) and gfx1201 is the one of a lattice without the variant,
-/// tile for tile, and every two-row config follows its one-row twin, from
-/// blocks of 64 queries, so the twins stage times it beside the contender
-/// tiles. On gfx942 the d128 pick's tile carries its two-row pipelines as
-/// twins.
-#[test_case(gfx1151_planner(), &[(128, 64), (128, 32), (64, 32), (64, 16), (64, 64), (32, 16), (32, 32), (32, 64), (16, 16), (16, 32), (16, 64)]; "gfx1151")]
+/// costs; its 128×64 tile's rings and bias ring fill the 64 KB, which the
+/// scratch its probabilities may cross puts past them) and gfx1201 is the
+/// one of a lattice without the variant, tile for tile, and every two-row
+/// config follows its one-row twin, from blocks of 64 queries, so the
+/// twins stage times it beside the contender tiles. On gfx942 the d128
+/// pick's tile carries its two-row pipelines as twins.
+#[test_case(gfx1151_planner(), &[(128, 32), (64, 32), (64, 16), (64, 64), (32, 16), (32, 32), (32, 64), (16, 16), (16, 32), (16, 64)]; "gfx1151")]
 #[test_case(planner(gfx1201()), &[(128, 64), (128, 32), (64, 32), (64, 64), (64, 16), (32, 32), (32, 16), (32, 64), (16, 32), (16, 16), (16, 64)]; "gfx1201")]
 fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usize)]) {
     use crate::ops::config::{representatives, shortlist};

@@ -680,7 +680,7 @@ fn register_staged_families_match_on_cuda() {
 /// self-join under several metrics, floors and groups, and of the depths
 /// that stream the rows (a last chunk overhanging 800), a row's least
 /// alone and lists of 4 to 32.
-fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, usize)> {
+fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usize, usize))> {
     let mut launches = vec![];
     for (m, n, k) in [(4096, 4096, 4096), (704, 512, 512), (1500, 1280, 5120), (37, 96, 48)] {
         for gated in [false, true] {
@@ -691,7 +691,7 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, usiz
                 let spec = GemmSpec { m: 100, n: 96, k: cfg.tile[2] * 2, batch: Batch::Static(1), epilogue, cfg };
                 let launch =
                     (format!("{m}x{n}x{k} g{gated} {cfg:?}"), gemm::<BF16>(&spec), cfg.lowering(&planner.device));
-                launches.push((launch, cfg.smem_bytes(gated, 2)));
+                launches.push((launch, (cfg.smem_bytes(gated, 2), 0)));
             }
         }
     }
@@ -711,7 +711,8 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, usiz
                     cfg,
                 };
                 let launch = (format!("d{d} t{t} {cfg:?}"), attention::<BF16>(&spec), cfg.lowering(&planner.device));
-                launches.push((launch, cfg.smem_bytes(d, false) + cfg.scratch_bytes(&planner.device)));
+                let scratch = cfg.scratch_bytes(&planner.device.target);
+                launches.push((launch, (cfg.smem_bytes(d, false) + scratch, scratch)));
             }
         }
     }
@@ -723,7 +724,7 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, usiz
                 ConvSpec { batch: Batch::Static(1), geom: g, epilogue: Epilogue::DEFAULT, cfg: c.gemm, split: c.split };
             for (i, (prog, lowering)) in spec.programs::<F16>(&planner.device).into_iter().enumerate() {
                 let smem = if i == 0 { c.gemm.smem_bytes(false, 2) } else { 0 };
-                launches.push(((format!("{g:?} {c:?} #{i}"), prog, lowering), smem));
+                launches.push(((format!("{g:?} {c:?} #{i}"), prog, lowering), (smem, 0)));
             }
         }
     }
@@ -745,7 +746,8 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, usiz
         for cfg in first_eight(&planner.nearest_ranked(p)) {
             let spec = NearestSpec { n: 100, m: 150, d, metric, floors, groups, k, cfg, live: Default::default() };
             let name = format!("nearest d{d} {metric:?} {floors:?} {groups} k{k} {cfg:?}");
-            launches.push(((name, nearest::<BF16>(&spec), cfg.lowering(&planner.device)), cfg.smem_bytes(d, dtype)));
+            let launch = (name, nearest::<BF16>(&spec), cfg.lowering(&planner.device));
+            launches.push((launch, (cfg.smem_bytes(d, dtype), 0)));
         }
     }
     launches
@@ -766,9 +768,11 @@ fn shared_bytes(linear: &Arc<UOp>) -> usize {
 /// Every candidate the op layer may plan ([`ranked_launches`]) lowers (the
 /// tune store would otherwise time a failure), declaring the shared memory
 /// its ranking admitted it with: the rings as the config's `smem_bytes`
-/// counts them and, where the lowering re-holds a tile through shared
-/// memory, that scratch ([`FaCfg::scratch_bytes`]), so a `Rejected::Smem`
-/// is the kernel's own count.
+/// counts them, so a `Rejected::Smem` is the kernel's own count; an
+/// attention config on a core whose accumulator cannot feed a product is
+/// admitted with the scratch its probabilities may cross besides
+/// ([`FaCfg::scratch_bytes`], a bound), and declares it or not as the
+/// inference decides.
 #[test_case(amd(AmdArch::Gfx1100, 48), false; "gfx1100")]
 #[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
 #[test_case(amd(AmdArch::Gfx1151, 40), false; "gfx1151")]
@@ -777,15 +781,16 @@ fn shared_bytes(linear: &Arc<UOp>) -> usize {
 #[test_case(hopper(), false; "hopper")]
 fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
     let planner = planner(target.clone());
-    let (launches, admitted): (Vec<Launch>, Vec<usize>) = ranked_launches(&planner, shortlist_deep).into_iter().unzip();
-    let admitted: std::collections::HashMap<String, usize> =
+    let (launches, admitted): (Vec<Launch>, Vec<(usize, usize)>) =
+        ranked_launches(&planner, shortlist_deep).into_iter().unzip();
+    let admitted: std::collections::HashMap<String, (usize, usize)> =
         launches.iter().map(|(name, ..)| name.clone()).zip(admitted).collect();
     each(launches, |name, prog, lowering| {
         let declared = shared_bytes(&linear(prog, &lowering));
-        assert_eq!(
-            declared, admitted[name],
-            "declares {declared} bytes of shared memory, admitted with {}",
-            admitted[name]
+        let (smem, bound) = admitted[name];
+        assert!(
+            declared == smem || declared + bound == smem,
+            "declares {declared} bytes of shared memory, admitted with {smem} ({bound} of them a bound)"
         );
     });
 }
@@ -1164,4 +1169,35 @@ fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
     let votes = loads_sunk_past_a_vote(&asm);
     assert!(!votes.is_empty(), "a branch on a vote:\n{asm}");
     assert!(votes.iter().all(|(_, sunk)| !sunk), "{votes:?}:\n{asm}");
+}
+
+/// Where the accumulator cannot feed the P·V product (RDNA3), whether the
+/// probabilities cross shared memory is the whole program's and the
+/// costs' call, not the config's: under the Strix Halo's store
+/// ([`super::gfx1151_store_costs`]) the 32×128 block of head size 64
+/// re-holds them through shared memory under a key mask (the card refused
+/// it admitted at its 64 KB of rings alone: "local memory (73728) exceeds
+/// limit (65536)") and exchanges them through lanes without one. The
+/// admission's [`FaCfg::scratch_bytes`] bounds both.
+#[test_case(AttnMask::default(), 0; "plain")]
+#[test_case(AttnMask { key_mask: true, ..AttnMask::default() }, 32 * 128 * 2; "key mask")]
+fn the_probabilities_cross_shared_memory_as_the_program_decides(mask: AttnMask, scratch: usize) {
+    let target = amd(AmdArch::Gfx1151, 40);
+    let device = crate::atoms::Device { target: target.clone(), costs: super::gfx1151_store_costs() };
+    let cfg = crate::kernels::attention::FaCfg::new(32, 128, 2);
+    let spec = AttnSpec {
+        batch: Batch::Static(2),
+        t: 100,
+        tk: 100,
+        heads: 4,
+        kv_heads: 4,
+        d: 64,
+        mask,
+        cache: None,
+        scale: 0.125,
+        cfg,
+    };
+    let declared = shared_bytes(&linear(attention::<F16>(&spec), &cfg.lowering(&device)));
+    assert_eq!(declared, cfg.smem_bytes(64, false) + scratch);
+    assert!(scratch <= cfg.scratch_bytes(&target));
 }

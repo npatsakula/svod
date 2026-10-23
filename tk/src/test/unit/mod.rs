@@ -200,6 +200,34 @@ pub(crate) fn gfx1151_costs() -> Costs {
     }
 }
 
+/// gfx1151's costs as the Strix Halo's tune store held them on 2026-10-23
+/// (`probe::stored`), every field measured: under them the inference
+/// re-holds a 32×128 attention probability tile through shared memory
+/// under a key mask, where [`gfx1151_costs`] has it exchanged.
+pub(crate) fn gfx1151_store_costs() -> Costs {
+    Costs {
+        smem_byte: 0.00356,
+        global_byte: 0.187412,
+        scatter: 2.415543,
+        step: 7.611237,
+        step_group: 0.0,
+        step_i8: 6.152153,
+        step_lone: 12.841797,
+        score: 0.079565,
+        trip: 1.905518,
+        trip_rolled: 1.893921,
+        trip_one: 1.983032,
+        trip_lone: 51.728516,
+        trip_one_lone: 59.355469,
+        lane_move: 0.034459,
+        smem_trip: 0.086365,
+        latency: 598.285924,
+        latency_one: 0.0,
+        l2_byte: 0.011227,
+        l2_bytes: 27_860_358.0,
+    }
+}
+
 /// sm_86's costs (RTX 3060, 28 SMs) as `probe::costs` measured them on the
 /// device on 2026-10-19.
 pub(crate) fn sm86_costs() -> Costs {
