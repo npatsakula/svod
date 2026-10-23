@@ -235,7 +235,9 @@ fn a_loop_extent_below_zero_runs_no_trip(steps: i64, steady: bool, floored: bool
 /// A program emitting more instructions than a kernel may on its target
 /// ([`crate::atoms::Target::most_instructions`]: the CUDA bound above the
 /// AMD one) is refused by the lowering, before any compiler sees it,
-/// naming its count and the bound.
+/// naming its count and the bound: given up at the statement passing the
+/// bound (the count named is under twice it, where the whole program emits
+/// four times it), not emitted whole and then refused.
 #[test]
 fn a_program_past_the_instruction_bound_is_refused() {
     use crate::lower::Error;
@@ -248,6 +250,7 @@ fn a_program_past_the_instruction_bound_is_refused() {
     let out = k.param::<F32>("o", ParamKind::Out, shape.elems());
     let one = k.fill::<F32>(shape, Const::Float(1.0));
     let mut x = k.zeros::<F32>(shape);
+    // Each add lists its loads, adds and stores: four instructions a register.
     for _ in 0..most / regs + 1 {
         x = k.binary(x, one, BinaryOp::Add);
     }
@@ -258,7 +261,7 @@ fn a_program_past_the_instruction_bound_is_refused() {
     let err = crate::lower::standalone(k.finish(), &lowering).err().expect("refused");
     let Error::TooLarge { name, instructions, most: bound } = &err else { panic!("{err}") };
     assert_eq!((name.as_str(), *bound), ("huge", most));
-    assert!(*instructions > most, "{instructions}");
+    assert!(*instructions > most && *instructions < 2 * most, "{instructions} of {most}");
     assert_eq!(err.to_string(), format!("huge emits {instructions} instructions, past the {most} a kernel may"));
 }
 

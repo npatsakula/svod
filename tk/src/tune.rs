@@ -209,18 +209,28 @@ fn emitted(prog: &Program, lowering: &Lowering) -> Option<(u64, Arc<UOp>)> {
 
 /// What a program is made of, which keys what it emits: the program and
 /// its lowering whole.
-fn made_of(prog: &Program, lowering: &Lowering) -> u64 {
+pub(crate) fn made_of(prog: &Program, lowering: &Lowering) -> u64 {
     digest(&format!("{prog:?}{lowering:?}"))
 }
 
 /// Programs lowered for a fingerprint, by what they are made of, kept for
-/// the compile that follows: a tuning lowers each program once.
+/// the compile that follows: a tuning lowers each program once. One that
+/// did not lower is kept as `None`, which stays: it fails the same way
+/// until its inputs change, so its compile is refused without lowering it
+/// again.
 #[derive(Default)]
-pub(crate) struct Lowerings(pub(crate) Mutex<HashMap<u64, Arc<UOp>>>);
+pub(crate) struct Lowerings(pub(crate) Mutex<HashMap<u64, Option<Arc<UOp>>>>);
 
 impl Lowerings {
-    fn take(&self, made_of: u64) -> Option<Arc<UOp>> {
-        self.0.lock().expect("lowerings").remove(&made_of)
+    /// What the fingerprint left for `made_of`: the program, handed over
+    /// once; `Some(None)` where it did not lower; `None` where nothing was.
+    fn take(&self, made_of: u64) -> Option<Option<Arc<UOp>>> {
+        let mut kept = self.0.lock().expect("lowerings");
+        match kept.get(&made_of) {
+            Some(None) => Some(None),
+            Some(Some(_)) => kept.remove(&made_of),
+            None => None,
+        }
     }
 }
 
@@ -444,11 +454,11 @@ impl TuneStore {
         let found: Vec<(u64, u64)> = missing
             .into_par_iter()
             .map(|(m, (prog, lowering))| {
-                let Some((emitted, program)) = emitted(prog, lowering) else { return (m, m) };
+                let lowered = emitted(prog, lowering);
                 if let Some(keep) = keep {
-                    keep.0.lock().expect("lowerings").insert(m, program);
+                    keep.0.lock().expect("lowerings").insert(m, lowered.as_ref().map(|(_, program)| program.clone()));
                 }
-                (m, emitted)
+                lowered.map_or((m, m), |(emitted, _)| (m, emitted))
             })
             .collect();
         self.record_emitted(&found);
@@ -457,13 +467,13 @@ impl TuneStore {
     }
 
     /// `prog` lowered under `lowering` ([`crate::lower::standalone`]),
-    /// without origins, from `keep` where a fingerprint left it, else
-    /// lowered here and what it emits remembered as a fingerprint would;
-    /// `None` where it does not lower.
+    /// without origins, from `keep` where a fingerprint left it (or found
+    /// it does not lower), else lowered here and what it emits remembered
+    /// as a fingerprint would; `None` where it does not lower.
     pub(crate) fn lowered(&self, prog: &Program, lowering: &Lowering, keep: &Lowerings) -> Option<Arc<UOp>> {
         let m = made_of(prog, lowering);
-        if let Some(program) = keep.take(m) {
-            return Some(program);
+        if let Some(kept) = keep.take(m) {
+            return kept;
         }
         let (emitted, program) = emitted(prog, lowering)?;
         if !self.emitted_memo().lock().expect("emitted memo").contains_key(&m) {
@@ -898,16 +908,18 @@ pub(crate) fn compile(candidates: Vec<Candidate>, pool: &ScratchPool) -> Vec<Bui
 }
 
 /// One candidate's [`compile`], its programs lowered through `lowered`
-/// (`store`'s fingerprint memo and the lowerings a fingerprint kept) where given.
+/// (`store`'s fingerprint memo and the lowerings a fingerprint kept) where
+/// given: a program that does not lower fails the candidate there, lowered
+/// no further.
 fn compile_one(programs: Candidate, pool: &ScratchPool, lowered: Option<(&TuneStore, &Lowerings)>) -> Built {
     let plans: Option<Vec<Scratch>> = programs
         .into_iter()
-        .map(|(p, l)| {
-            let body = lowered.and_then(|(store, keep)| store.lowered(&p, &l, keep));
-            match body {
-                Some(body) => scratch_plan_of(p, &l, pool, Some(body)),
-                None => scratch_plan(p, &l, pool),
+        .map(|(p, l)| match lowered {
+            Some((store, keep)) => {
+                let body = store.lowered(&p, &l, keep)?;
+                scratch_plan_of(p, &l, pool, Some(body))
             }
+            None => scratch_plan(p, &l, pool),
         })
         .collect();
     let resources = plans.iter().flatten().flat_map(|(plan, _)| resources(plan)).collect();

@@ -33,9 +33,8 @@ pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSp
     let mut e = Emit::new(prog, lay, low, params);
     e.prologue()?;
     e.block(&prog.body)?;
+    e.list.within(&prog.name)?;
     let list = e.list.listed();
-    let most = low.device.target.most_instructions();
-    ensure!(list.len() <= most, TooLargeSnafu { name: &prog.name, instructions: list.len(), most });
     if std::env::var_os("TK_DUMP_LIST").is_some() {
         for (i, u) in list.iter().enumerate() {
             let srcs: Vec<u64> = u.op().sources().iter().map(|s| s.id).collect();
@@ -49,40 +48,56 @@ pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSp
 /// The instruction list cut at the insertion point of every nesting level
 /// (the kernel's, then every open loop's body and branch of an `If`): a
 /// value hoisted to a level appends to its segment, a statement to the
-/// last one, the innermost level's body.
-struct Listing(Vec<Vec<Arc<UOp>>>);
+/// last one, the innermost level's body. It holds `most` instructions at
+/// most ([`crate::atoms::Target::most_instructions`]): a statement listing
+/// one past that refuses the program ([`Self::within`]), so a program far
+/// past the bound is given up at the statement passing it rather than
+/// emitted whole and then refused.
+struct Listing {
+    levels: Vec<Vec<Arc<UOp>>>,
+    len: usize,
+    most: usize,
+}
 
 impl Listing {
-    fn new() -> Self {
-        Self(vec![vec![], vec![]])
+    fn new(most: usize) -> Self {
+        Self { levels: vec![vec![], vec![]], len: 0, most }
     }
 
     /// The innermost open level.
     fn level(&self) -> usize {
-        self.0.len() - 2
+        self.levels.len() - 2
     }
 
     fn push(&mut self, u: Arc<UOp>) {
-        self.0.last_mut().expect("a body").push(u);
+        self.levels.last_mut().expect("a body").push(u);
+        self.len += 1;
     }
 
     fn hoist(&mut self, level: usize, u: Arc<UOp>) {
-        self.0[level].push(u);
+        self.levels[level].push(u);
+        self.len += 1;
     }
 
     /// A level opens here: what follows is its body.
     fn open(&mut self) {
-        self.0.push(vec![]);
+        self.levels.push(vec![]);
     }
 
     /// The innermost level closes: its body joins the level around it.
     fn close(&mut self) {
-        let body = self.0.pop().expect("an open level");
-        self.0.last_mut().expect("a body").extend(body);
+        let body = self.levels.pop().expect("an open level");
+        self.levels.last_mut().expect("a body").extend(body);
+    }
+
+    /// Whether the instructions listed so far are within the bound.
+    fn within(&self, name: &str) -> Result<()> {
+        ensure!(self.len <= self.most, TooLargeSnafu { name, instructions: self.len, most: self.most });
+        Ok(())
     }
 
     fn listed(self) -> Vec<Arc<UOp>> {
-        self.0.concat()
+        self.levels.concat()
     }
 }
 
@@ -208,7 +223,7 @@ impl<'a> Emit<'a> {
             low,
             params,
             vars: HashMap::new(),
-            list: Listing::new(),
+            list: Listing::new(low.device.target.most_instructions()),
             guards: vec![],
             divergent: 0,
             levels: HashMap::new(),
@@ -544,6 +559,7 @@ impl<'a> Emit<'a> {
         let outer = std::mem::replace(&mut self.async_products, waited);
         for stmt in &block.0 {
             self.stmt(stmt)?;
+            self.list.within(&self.prog.name)?;
         }
         self.async_products = outer;
         // A carried tile moves a fragment at a time, as the products read
