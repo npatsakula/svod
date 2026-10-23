@@ -7,7 +7,7 @@ fn aligned_words(text: &str, language: &str) -> Vec<svod_arch::rnnt::Word> {
     let tokenizer = WhisperTokenizer::from_hub(true, 99).unwrap();
     let tokens = tokenizer.encode(text);
     let path: Vec<_> = (0..=tokens.len()).collect();
-    words_from_path(&path, &path, &tokens, &vec![1.0; tokens.len()], Some(language), &tokenizer)
+    words_from_path(&path, &path, &tokens, &vec![1.0; tokens.len()], Some(language), &tokenizer, &[], 0.0).0
 }
 
 #[test]
