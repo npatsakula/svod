@@ -1962,11 +1962,14 @@ fn rdna_plans_register_staged_kernels() {
 
 /// Two atom rows per warp are a variant of a tile, never its representative:
 /// the d64 biased attention's shortlist on gfx1151 (under its measured
-/// costs) and gfx1201 is the one of a lattice without the variant, tile for
-/// tile, and every two-row config follows its one-row twin, from blocks of
-/// 64 queries, so the twins stage times it beside the contender tiles. On
-/// gfx942 the d128 pick's tile carries its two-row pipelines as twins.
-#[test_case(gfx1151_planner(), &[(128, 32), (64, 32), (64, 16), (64, 64), (32, 16), (32, 32), (32, 64), (16, 16), (16, 32), (16, 64)]; "gfx1151")]
+/// costs; its 128×64 tile's rings and bias ring fill the 64 KB exactly,
+/// which the scratch once charged for a relayout the inference never makes
+/// put past it) and gfx1201 is the one of a lattice without the variant,
+/// tile for tile, and every two-row config follows its one-row twin, from
+/// blocks of 64 queries, so the twins stage times it beside the contender
+/// tiles. On gfx942 the d128 pick's tile carries its two-row pipelines as
+/// twins.
+#[test_case(gfx1151_planner(), &[(128, 64), (128, 32), (64, 32), (64, 16), (64, 64), (32, 16), (32, 32), (32, 64), (16, 16), (16, 32), (16, 64)]; "gfx1151")]
 #[test_case(planner(gfx1201()), &[(128, 64), (128, 32), (64, 32), (64, 64), (64, 16), (32, 32), (32, 16), (32, 64), (16, 32), (16, 16), (16, 64)]; "gfx1201")]
 fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usize)]) {
     use crate::ops::config::{representatives, shortlist};
