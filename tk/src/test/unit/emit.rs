@@ -387,3 +387,36 @@ fn a_scalars_bounds_are_its_operations(f: fn(&mut Kernel, Sc) -> Sc, want: Optio
     let id = k.intern(v);
     assert_eq!(k.finish().bounds(id, &|_| None), want);
 }
+
+/// A `cp.async` fill goes in whole 16-byte chunks, the same count per
+/// thread ([`crate::layouts::fills_in_chunks`]); the emitter refuses any
+/// other, naming the fill, as the rankings' `fits` predicts.
+#[test_case(16, 32, true; "64 chunks over 32 threads")]
+#[test_case(16, 24, false; "48 chunks over 32 threads")]
+#[test_case(16, 20, false; "a row of two chunks and a half")]
+fn a_fill_goes_in_whole_chunks_per_thread(rows: usize, cols: usize, fills: bool) {
+    let shape = Shape::new(rows, cols);
+    assert_eq!(crate::layouts::fills_in_chunks(shape, 2, 32), fills);
+    let mut k = Kernel::new("fill");
+    k.warps(1);
+    let x = k.param::<F16>("x", ParamKind::In, shape.elems());
+    let y = k.param::<F16>("y", ParamKind::Out, shape.elems());
+    let s = k.smem::<F16>("s", shape.elems());
+    let src = k.view(x, 0, [cols, 1], shape, [None, None]);
+    let t = k.smem_view::<F16>(s, 0, shape);
+    k.stage(t, src, CopyMode::Async);
+    let held = Shape::new(rows, 16);
+    let v = k.smem_view::<F16>(s, 0, held);
+    let r = k.load(v);
+    let out = k.view(y, 0, [cols, 1], held, [None, None]);
+    k.store(out, r);
+    let lowering = Lowering::uniform(&super::declared(crate::atoms::sm86()), false, WarpGrid { rows: 1, cols: 1 });
+    match crate::lower::standalone(k.finish(), &lowering) {
+        Ok(_) => assert!(fills, "a {rows}×{cols} fill lowered"),
+        Err(crate::lower::Error::Unsupported { what }) => {
+            assert!(!fills, "{what}");
+            assert_eq!(what, format!("a {rows}×{cols} fill by 32 threads"));
+        }
+        Err(e) => panic!("{e}"),
+    }
+}

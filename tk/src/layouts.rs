@@ -800,6 +800,17 @@ pub fn natural(shape: Shape, warps: u32, lanes: u32) -> Option<TileLayout> {
     Some(TileLayout { frag, reps, warps: warps_layout })
 }
 
+/// Whether `threads` threads fill a `shape` tile of `bytes`-byte elements
+/// in 16-byte chunks: whole chunks along every row and the same count of
+/// them per thread. The emitter refuses any other `cp.async` fill
+/// ([`crate::lower::emit`]), and the rankings hold a register-staged one
+/// to it too (a tile whose chunks do not share out evenly leaves lanes
+/// idle), so every config's `fits` asks here.
+pub fn fills_in_chunks(shape: Shape, bytes: usize, threads: usize) -> bool {
+    let chunk = 16 / bytes;
+    shape.cols.is_multiple_of(chunk) && (shape.rows * shape.cols / chunk).is_multiple_of(threads)
+}
+
 /// The layout of a register-staged fill: each lane holds a 16-byte run of
 /// a row (the `cp.async` chunk), consecutive lanes walk the runs along
 /// `walk` first (`Col`: along the row, as a row-major tile is written;

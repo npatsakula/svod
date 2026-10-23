@@ -123,7 +123,48 @@ impl fmt::Debug for NearestCfg {
     }
 }
 
+/// Why [`nearest`] refuses a config's lists, whatever the target: what its
+/// ranking leaves out as one that does not lower
+/// ([`crate::ops::config::Rejected::Lowers`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, snafu::Snafu)]
+pub enum Invalid {
+    #[snafu(display("a queue of {queue} below a list of {k}: a power of two from 2"))]
+    Queue { queue: usize, k: usize },
+    #[snafu(display("a score matrix unqueued: {queue} queued beside {select:?}"))]
+    QueuedMatrix { queue: usize, select: SelectCfg },
+    #[snafu(display("{select:?} lists {k}: a lane's queue, a power of two, fits the list's runs of {LANES}"))]
+    Select { select: SelectCfg, k: usize },
+    #[snafu(display("lane queues {lanes:?} dealing {bkv} candidates: powers of two, a column at least"))]
+    Lanes { lanes: LaneQueue, bkv: usize },
+}
+
 impl NearestCfg {
+    /// Whether [`nearest`] keeps `k` scores a row under this config: a
+    /// queue is a power of two from 2 below `k`, a score matrix is
+    /// unqueued and its listing fits `k` ([`SelectCfg::fits`]), and a
+    /// list's lane queues are powers of two wide (past one) and deep,
+    /// dealing a trip's candidates whole.
+    pub fn lists(&self, k: usize) -> Result<(), Invalid> {
+        if let Some(queue) = self.queue {
+            if !(queue.is_power_of_two() && (2..k).contains(&queue)) {
+                return Err(Invalid::Queue { queue, k });
+            }
+            if let Some(select) = self.select {
+                return Err(Invalid::QueuedMatrix { queue, select });
+            }
+        }
+        if let Some(select) = self.select {
+            return if select.fits(k) { Ok(()) } else { Err(Invalid::Select { select, k }) };
+        }
+        let lanes = self.lane_queue();
+        let LaneQueue { width, depth, .. } = lanes;
+        let dealt = width.is_power_of_two() && width > 1 && depth.is_power_of_two() && self.bkv.is_multiple_of(width);
+        if k > 1 && !dealt {
+            return Err(Invalid::Lanes { lanes, bkv: self.bkv });
+        }
+        Ok(())
+    }
+
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
         Self {
             bq,
@@ -378,12 +419,9 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
     // A fill zeroes the 16-byte chunks past an overhanging chunk's depth.
     let chunk = 16 / T::DTYPE.bytes();
     assert!(cfg.bk.is_none() || d.is_multiple_of(chunk), "a streamed depth {d} of whole 16-byte chunks");
-    let held = cfg.queue.unwrap_or(top);
-    assert!(
-        cfg.queue.is_none_or(|q| q.is_power_of_two() && (2..top).contains(&q)),
-        "a queue of {held} below a list of {top}"
-    );
-    assert!(cfg.select.is_none() || cfg.queue.is_none(), "a score matrix unqueued");
+    if let Err(e) = cfg.lists(top) {
+        panic!("{e}");
+    }
     assert!(live.k.is_none() || top > 1, "a live list of more than one score");
     assert!(live.rows.is_none() || live.from() == 0 || cfg.select.is_some(), "a panel of a score matrix");
     let (held_rows, from) = (live.held(n), live.from());
@@ -598,11 +636,6 @@ pub fn nearest<T: MmaIn>(spec: &NearestSpec) -> Program {
     // a queue of `depth` pairs, column `c` of each a queue a lane holds of
     // the scores it is dealt below the row's `k`-th, unsorted.
     let LaneQueue { width: w, depth: slots, .. } = cfg.lane_queue();
-    assert!(
-        top == 1 || matrix || (w.is_power_of_two() && w > 1 && slots.is_power_of_two() && bkv.is_multiple_of(w)),
-        "lane queues {:?} dealing {bkv} candidates",
-        cfg.lanes
-    );
     let lane = Shape::new(bq, w);
     // The slots the register list holds: the list's (its bound's where it
     // is live) in a power of two of whole pairs; queued, the queue's.

@@ -42,7 +42,7 @@ impl Emit<'_> {
         let threads = (warps * self.low.device.target.wave) as i64;
         let chunks = d.shape.rows as i64 * cols / chunk;
         snafu::ensure!(
-            cols % chunk == 0 && chunks % threads == 0,
+            crate::layouts::fills_in_chunks(d.shape, d.dtype.bytes(), threads as usize),
             UnsupportedSnafu { what: format!("a {}×{} fill by {threads} threads", d.shape.rows, cols) }
         );
         snafu::ensure!(self.along(&d).0 == Axis::Col, UnsupportedSnafu { what: "a chunk fill of a column-major tile" });

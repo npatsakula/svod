@@ -98,7 +98,35 @@ pub struct Forms {
 /// differs ([`FaCfg::fits`](FaCfg::fits)).
 pub const WARP_ROWS: usize = 16;
 
+/// Why [`attention`] refuses a config, whatever the target: what its
+/// ranking leaves out as one that does not lower
+/// ([`crate::ops::config::Rejected::Lowers`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, snafu::Snafu)]
+pub enum Invalid {
+    #[snafu(display("{key_warps} key warps share a block of one row warp, not {bq} rows"))]
+    KeyWarps { key_warps: usize, bq: usize },
+    #[snafu(display("{stages} stages of {bkv} keys hold no key warp's output"))]
+    KeyWarpOutput { stages: usize, bkv: usize },
+}
+
 impl FaCfg {
+    /// Whether [`attention`] runs the config's key warps: several share a
+    /// block of one row warp, and a warp's merged output takes `16·d` f32
+    /// of its 16-bit K ring.
+    pub fn shares_keys(&self) -> Result<(), Invalid> {
+        let Self { bq, bkv, stages, key_warps, .. } = *self;
+        if key_warps == 1 {
+            return Ok(());
+        }
+        if bq != WARP_ROWS {
+            return Err(Invalid::KeyWarps { key_warps, bq });
+        }
+        if stages * bkv < 2 * WARP_ROWS {
+            return Err(Invalid::KeyWarpOutput { stages, bkv });
+        }
+        Ok(())
+    }
+
     pub const fn new(bq: usize, bkv: usize, stages: usize) -> Self {
         Self {
             bq,
@@ -447,9 +475,9 @@ pub fn attention<T: Half>(spec: &AttnSpec) -> Program {
     let (gz, bb) = batch.axis(&mut k);
     k.grid([Sc::from(t.div_ceil(bq) * splits), Sc::from(heads), gz]);
     let kw = cfg.key_warps;
-    assert!(kw == 1 || bq == WARP_ROWS, "{kw} key warps share a block of one row warp, not {bq} rows");
-    // A warp's merged output takes 16·d f32 of its 16-bit K ring.
-    assert!(kw == 1 || stages * bkv >= 2 * WARP_ROWS, "{stages} stages of {bkv} keys hold no key warp's output");
+    if let Err(e) = cfg.shares_keys() {
+        panic!("{e}");
+    }
     k.warps(cfg.warps());
     let k_s = k.smem::<T>("k_s", kw * stages * bkv * d);
     let v_s = k.smem::<T>("v_s", kw * stages * bkv * d);

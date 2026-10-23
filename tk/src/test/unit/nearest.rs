@@ -14,7 +14,7 @@ use crate::build::{BF16, F16, I8};
 use crate::interp::{round_to, run};
 use crate::ir::Orient;
 use crate::kernels::nearest::{
-    Floors, LaneQueue, MergeSpec, Metric, NearestCfg, NearestSpec, SCRATCH, SelectCfg, SelectSpec, nearest,
+    Floors, Invalid, LaneQueue, MergeSpec, Metric, NearestCfg, NearestSpec, SCRATCH, SelectCfg, SelectSpec, nearest,
     nearest_merge, nearest_select, share_stride,
 };
 use crate::ops::config::{self, Planner};
@@ -2671,4 +2671,38 @@ fn cfg_time_probe() {
             eprintln!("cfg {n}x{m} d{d} k{k} run {run}: {rate} {cfg:?}");
         }
     }
+}
+
+/// What [`nearest`] refuses of a config's lists, whatever the target
+/// ([`NearestCfg::lists`]): a queue not a power of two from 2 below the
+/// list, a queue beside a score matrix, a listing that does not fit the
+/// list, and lane queues not powers of two (a column at least) or not
+/// dealing the trip's candidates whole; a least alone takes any lanes.
+#[test_case(NearestCfg::new(32, 32, 2), 1, Ok(()); "a least")]
+#[test_case(NearestCfg::new(32, 32, 2), 16, Ok(()); "the portable lanes")]
+#[test_case(NearestCfg { queue: Some(16), ..NearestCfg::new(32, 32, 2) }, 64, Ok(()); "a queue below the list")]
+#[test_case(NearestCfg { queue: Some(64), ..NearestCfg::new(32, 32, 2) }, 64, Err(Invalid::Queue { queue: 64, k: 64 }); "a queue as long as the list")]
+#[test_case(NearestCfg { queue: Some(3), ..NearestCfg::new(32, 32, 2) }, 64, Err(Invalid::Queue { queue: 3, k: 64 }); "a queue off a power of two")]
+#[test_case(NearestCfg { queue: Some(1), ..NearestCfg::new(32, 32, 2) }, 64, Err(Invalid::Queue { queue: 1, k: 64 }); "a queue of one")]
+#[test_case(NearestCfg { queue: Some(16), select: Some(SelectCfg { warps: 4, queue: 2, filter: false }), ..NearestCfg::new(32, 32, 2) }, 64, Err(Invalid::QueuedMatrix { queue: 16, select: SelectCfg { warps: 4, queue: 2, filter: false } }); "a queued matrix")]
+#[test_case(NearestCfg { select: Some(SelectCfg { warps: 4, queue: 2, filter: false }), ..NearestCfg::new(32, 32, 2) }, 64, Ok(()); "a matrix listed two deep")]
+#[test_case(NearestCfg { select: Some(SelectCfg { warps: 4, queue: 4, filter: false }), ..NearestCfg::new(32, 32, 2) }, 64, Err(Invalid::Select { select: SelectCfg { warps: 4, queue: 4, filter: false }, k: 64 }); "a listing past the list's runs")]
+#[test_case(NearestCfg { lanes: Some(LaneQueue { width: 3, depth: 2, passes: false }), ..NearestCfg::new(32, 48, 2) }, 16, Err(Invalid::Lanes { lanes: LaneQueue { width: 3, depth: 2, passes: false }, bkv: 48 }); "lanes three wide")]
+#[test_case(NearestCfg { lanes: Some(LaneQueue { width: 1, depth: 2, passes: false }), ..NearestCfg::new(32, 32, 2) }, 16, Err(Invalid::Lanes { lanes: LaneQueue { width: 1, depth: 2, passes: false }, bkv: 32 }); "lanes a column wide")]
+#[test_case(NearestCfg { lanes: Some(LaneQueue { width: 4, depth: 3, passes: false }), ..NearestCfg::new(32, 32, 2) }, 16, Err(Invalid::Lanes { lanes: LaneQueue { width: 4, depth: 3, passes: false }, bkv: 32 }); "lanes three deep")]
+#[test_case(NearestCfg { lanes: Some(LaneQueue { width: 16, depth: 2, passes: true }), ..NearestCfg::new(32, 24, 2) }, 16, Err(Invalid::Lanes { lanes: LaneQueue { width: 16, depth: 2, passes: true }, bkv: 24 }); "lanes off the trip's candidates")]
+#[test_case(NearestCfg { lanes: Some(LaneQueue { width: 3, depth: 2, passes: false }), ..NearestCfg::new(32, 48, 2) }, 1, Ok(()); "a least takes any lanes")]
+fn the_kernel_refuses_lists_it_cannot_keep(cfg: NearestCfg, k: usize, want: Result<(), Invalid>) {
+    assert_eq!(cfg.lists(k), want);
+    if let Err(e) = want {
+        assert!(!e.to_string().is_empty());
+    }
+}
+
+/// The kernel panics on what [`NearestCfg::lists`] refuses, naming it.
+#[test]
+#[should_panic(expected = "a queue of 64 below a list of 64")]
+fn a_queue_as_long_as_the_list_is_refused_by_the_kernel() {
+    let cfg = NearestCfg { queue: Some(64), ..NearestCfg::new(32, 32, 2) };
+    nearest::<F16>(&plain(64, 300, 64, Metric::NegDot, 64, cfg));
 }

@@ -12,7 +12,8 @@ use crate::interp::{round_to, run};
 use crate::ir::Program;
 use crate::kernels::Batch;
 use crate::kernels::attention::{
-    AttnMask, AttnSpec, Bias, Cache, Chunk, CombineSpec, FaCfg, Forms, WARP_ROWS, attention, combine, key_mask_stride,
+    AttnMask, AttnSpec, Bias, Cache, Chunk, CombineSpec, FaCfg, Forms, Invalid, WARP_ROWS, attention, combine,
+    key_mask_stride,
 };
 use crate::kernels::rows::NormCfg;
 use crate::launch::graph_launch;
@@ -1039,4 +1040,24 @@ fn decode_throughput_probe() {
             eprintln!("{label}: {us:.1} us");
         }
     });
+}
+
+/// What [`attention`] refuses of a config's key warps, whatever the target
+/// ([`FaCfg::shares_keys`]): several share a block of one row warp, and
+/// their ring holds a warp's merged output; the ranking's `fits` agrees.
+#[test_case(FaCfg::new(64, 64, 2), Ok(()); "one key warp")]
+#[test_case(FaCfg { key_warps: 4, ..FaCfg::new(16, 16, 2) }, Ok(()); "four over one row warp")]
+#[test_case(FaCfg { key_warps: 2, ..FaCfg::new(32, 16, 2) }, Err(Invalid::KeyWarps { key_warps: 2, bq: 32 }); "two over two row warps")]
+#[test_case(FaCfg { key_warps: 2, ..FaCfg::new(16, 16, 1) }, Err(Invalid::KeyWarpOutput { stages: 1, bkv: 16 }); "a ring too small for the output")]
+fn the_kernel_refuses_key_warps_it_cannot_share(cfg: FaCfg, want: Result<(), Invalid>) {
+    assert_eq!(cfg.shares_keys(), want);
+    assert_eq!(cfg.shares_keys().is_ok(), cfg.fits(&crate::atoms::sm86(), 64, false));
+}
+
+/// The kernel panics on what [`FaCfg::shares_keys`] refuses, naming it.
+#[test]
+#[should_panic(expected = "2 key warps share a block of one row warp, not 32 rows")]
+fn key_warps_over_two_row_warps_are_refused_by_the_kernel() {
+    let cfg = FaCfg { key_warps: 2, ..FaCfg::new(32, 16, 2) };
+    flash_attention(&AttnSpec { cfg, ..probe_spec(1, 1, 32, 64, 64, AttnMask::default()) });
 }

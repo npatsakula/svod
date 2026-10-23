@@ -10,7 +10,7 @@ use crate::build::*;
 use crate::ir::*;
 use crate::layout::{self as frag, Dim};
 use crate::layouts::{
-    Issue, Laid, Pick, Relayout, Swizzle, TileLayout, WarpGrid, chunked, infer, natural, transposing,
+    Issue, Laid, Pick, Relayout, Swizzle, TileLayout, WarpGrid, chunked, fills_in_chunks, infer, natural, transposing,
 };
 
 fn coords(l: &TileLayout, warps: u32, lanes: u32) -> Vec<(u32, u32)> {
@@ -710,4 +710,18 @@ fn a_product_deals_its_rows_in_lane(target: Target, orient: Orient, sharing: u32
             }
         }
     }
+}
+
+/// A tile fills in whole 16-byte chunks per thread where every row is
+/// whole chunks and the chunks share out evenly over the threads: what the
+/// emitter asks of a `cp.async` fill and every `fits` of the rankings.
+#[test_case(16, 32, 2, 32 => true; "64 chunks over 32 threads")]
+#[test_case(8, 32, 2, 32 => true; "32 chunks over 32 threads")]
+#[test_case(16, 24, 2, 32 => false; "48 chunks over 32 threads")]
+#[test_case(16, 20, 2, 32 => false; "a row of two chunks and a half")]
+#[test_case(64, 64, 1, 128 => true; "8-bit rows, 16 a chunk")]
+#[test_case(16, 64, 1, 128 => false; "64 8-bit chunks over 128 threads")]
+#[test_case(32, 32, 4, 64 => true; "f32 rows on wave64")]
+fn a_tile_fills_in_whole_chunks_per_thread(rows: usize, cols: usize, bytes: usize, threads: usize) -> bool {
+    fills_in_chunks(Shape::new(rows, cols), bytes, threads)
 }

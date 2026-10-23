@@ -221,6 +221,12 @@ impl Fill {
             Fill::Staged => stages.clamp(1, 2),
         }
     }
+
+    /// Whether this fill runs a ring `stages` deep as asked: what a config
+    /// asks of its ring is what the template builds ([`Self::stages`]).
+    pub fn runs(self, stages: usize) -> bool {
+        self.stages(stages) == stages
+    }
 }
 
 /// The semantic syncs ([`crate::ir::Sync`]) that are an instruction on a

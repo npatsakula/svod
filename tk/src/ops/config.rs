@@ -30,7 +30,7 @@ use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::{GemmCfg, KSLICE};
 use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, SPLIT_GROUP, SelectCfg, select_runs};
 use crate::kernels::rows::NormCfg;
-use crate::layouts::{Issue, Swizzle, TileLayout, WarpGrid, chunked};
+use crate::layouts::{Issue, Swizzle, TileLayout, WarpGrid, chunked, fills_in_chunks};
 use crate::tune::Compiled;
 
 /// Targets with kernels: CUDA sm_80+ on `mma.sync` + `cp.async` + `ldmatrix`,
@@ -72,15 +72,17 @@ impl GemmCfg {
                 && self.warps[0] == 2
                 && bk.is_multiple_of(KSLICE)
                 && bk >= 2 * KSLICE);
-        row && crews && self.issue(target, bk).is_some() && target.fill.stages(self.stages) == self.stages
+        row && crews && self.issue(target, bk).is_some() && target.fill.runs(self.stages)
     }
 
     /// Whether the config lowers on `target`: it [`tiles`](Self::tiles), and
-    /// both operand tiles split into whole 16-byte chunks per thread.
+    /// both operand tiles fill in whole 16-byte chunks per thread
+    /// ([`fills_in_chunks`]).
     pub fn fits(&self, target: &Target) -> bool {
         let ([bm, bn, bk], [wr, wc]) = (self.tile, self.warps.map(|w| w as usize));
         let threads = target.wave as usize * wr * wc;
-        self.tiles(target) && (bm * bk / 8).is_multiple_of(threads) && (bn * bk / 8).is_multiple_of(threads)
+        let fills = |rows| fills_in_chunks(Shape::new(rows, bk), ELEM, threads);
+        self.tiles(target) && fills(bm) && fills(bn)
     }
 
     /// The registers a lane holds for a GEMM over a weight of `halves`
@@ -193,7 +195,10 @@ pub fn gemm_lattice(target: &Target) -> Vec<GemmCfg> {
 pub enum Rejected {
     /// It does not lower on the target: no matrix core, a warp grid that
     /// does not tile the core's atoms, a fill that does not split into whole
-    /// 16-byte chunks per thread, a ring depth the prefetch does not run.
+    /// 16-byte chunks per thread ([`fills_in_chunks`]), a ring depth the
+    /// fill does not run ([`Fill::runs`]), lists or key warps the kernel
+    /// refuses ([`NearestCfg::lists`], [`FaCfg::shares_keys`]), or lane
+    /// queues past the search's bounds.
     Lowers,
     /// Its step is shallower than two matrix-core depths where the
     /// reduction allows one.
@@ -1094,9 +1099,11 @@ impl Planner {
 impl FaCfg {
     /// Whether the config lowers on `target` for head size `d`: the atom's M
     /// is the kernel's [`WARP_ROWS`], a warp owns whole atom rows of queries
-    /// and the block whole warps, both products tile the atoms, and the K
-    /// and V fills (and the bias tile's under a bias) split into whole
-    /// 16-byte chunks per thread. On the warpgroup core a group of four row
+    /// and the block whole warps, both products tile the atoms, the key
+    /// warps share the block as the kernel shares it
+    /// ([`FaCfg::shares_keys`]), and the K and V fills (and the bias
+    /// tile's under a bias) go in whole 16-byte chunks per thread
+    /// ([`fills_in_chunks`]). On the warpgroup core a group of four row
     /// warps of one atom row each owns 64 query rows, both products' column
     /// blocks tile the instruction, a value row spans whole column panels
     /// (one swizzle span, or 128-byte panels) and no key warps split the
@@ -1124,12 +1131,11 @@ impl FaCfg {
             && rows > 0
             && bq.is_multiple_of(rows)
             && bq > 0
-            // A key warp's merged output reuses its 16-bit key ring as f32.
-            && (self.key_warps == 1 || bq == WARP_ROWS && self.stages * bkv >= 2 * WARP_ROWS)
+            && self.shares_keys().is_ok()
             && [bkv, d].iter().all(|&x| x.is_multiple_of(atom.n as usize) && x.is_multiple_of(atom.k as usize))
-            && (bkv * d / 8).is_multiple_of(threads)
-            && (!self.bias_ring(bias) || (bq * bkv / 8).is_multiple_of(threads))
-            && target.fill.stages(self.stages) == self.stages
+            && fills_in_chunks(Shape::new(bkv, d), ELEM, threads)
+            && (!self.bias_ring(bias) || fills_in_chunks(Shape::new(bq, bkv), ELEM, threads))
+            && target.fill.runs(self.stages)
     }
 
     /// The registers a lane holds for head size `d`, from the layouts the
@@ -1380,15 +1386,15 @@ impl NearestCfg {
     /// Whether the config lowers on `target` at depth `d` over operands of
     /// `dtype`: the atom's M is [`WARP_ROWS`], a warp owns whole atom rows of
     /// queries and the block whole warps, the product tiles the atoms, and
-    /// each operand fill splits into whole 16-byte chunks per thread; a
-    /// streamed depth is whole 16-byte chunks too, which an overhanging
-    /// chunk's fill zeroes past it.
+    /// each operand fills in whole 16-byte chunks per thread
+    /// ([`fills_in_chunks`]); a streamed depth is whole 16-byte chunks too,
+    /// which an overhanging chunk's fill zeroes past it.
     pub fn fits(&self, target: &Target, d: usize, dtype: ScalarDType) -> bool {
         let Some(atom) = target.geometry_of(dtype) else { return false };
         let (bq, bkv, rows, depth) = (self.bq, self.bkv, self.warp_rows, self.depth(d));
         let threads = self.warps() as usize * target.wave as usize;
         let chunk = 16 / dtype.bytes();
-        let fills = self.filled().all(|rows| (rows * depth / chunk).is_multiple_of(threads));
+        let fills = self.filled().all(|rows| fills_in_chunks(Shape::new(rows, depth), dtype.bytes(), threads));
         atom.m as usize == WARP_ROWS
             && rows.is_multiple_of(WARP_ROWS)
             && rows > 0
@@ -1398,7 +1404,7 @@ impl NearestCfg {
             && depth.is_multiple_of(atom.k as usize)
             && d.is_multiple_of(if self.bk.is_some() { chunk } else { atom.k as usize })
             && fills
-            && target.fill.stages(self.stages) == self.stages
+            && target.fill.runs(self.stages)
     }
 
     /// The registers a lane holds at depth `d`, from the layouts the lowering
@@ -1675,15 +1681,11 @@ impl Nearest {
     pub fn admit(&self, planner: &Planner, cfg: &NearestCfg) -> Result<(f64, u32), Rejected> {
         let Device { target, costs } = &planner.device;
         let (bq, bkv, d, k) = (cfg.bq, cfg.bkv, self.d, self.k);
-        match (cfg.queue, cfg.select) {
-            (None, None) if k > REGISTER_K => return Err(Rejected::TopK { k, most: REGISTER_K }),
-            (Some(q), None) if q >= k => return Err(Rejected::Lowers),
-            (Some(_), Some(_)) => return Err(Rejected::Lowers),
-            (None, Some(s)) if !s.fits(k) => return Err(Rejected::Lowers),
-            _ => {}
+        if cfg.queue.is_none() && cfg.select.is_none() && k > REGISTER_K {
+            return Err(Rejected::TopK { k, most: REGISTER_K });
         }
         let dtype = self.dtype;
-        if !cfg.fits(target, d, dtype) {
+        if cfg.lists(k).is_err() || !cfg.fits(target, d, dtype) {
             return Err(Rejected::Lowers);
         }
         let atom = target.geometry_of(dtype).ok_or(Rejected::Lowers)?;
@@ -1756,13 +1758,10 @@ impl Nearest {
             let sharing = cfg.sharing(target, d, dtype).ok_or(Rejected::Layout)?;
             let queued = lanes.width * lanes.depth;
             let deals = bkv / lanes.width;
-            if lanes.width < sharing.max(2)
-                || !lanes.width.is_power_of_two()
-                || !lanes.depth.is_power_of_two()
-                || !bkv.is_multiple_of(lanes.width)
-                || deals > MOST_DEALS
-                || cfg.queue.is_some_and(|q| 2 * queued > q)
-            {
+            // Search bounds over the lanes the kernel runs: queues as wide
+            // as the lanes a row spreads over, a trip in few deals, a
+            // register queue at least twice the lanes'.
+            if lanes.width < sharing || deals > MOST_DEALS || cfg.queue.is_some_and(|q| 2 * queued > q) {
                 return Err(Rejected::Lowers);
             }
             epilogue += share.listing(cfg, lanes, target.wave) * waves as f64 * costs.score / (tiles * chunks) as f64;
