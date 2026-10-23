@@ -450,7 +450,6 @@ pub struct Block(pub Vec<Stmt>);
 pub enum ParamKind {
     In,
     Out,
-    InOut,
 }
 
 #[derive(Clone, Debug, PartialEq)]

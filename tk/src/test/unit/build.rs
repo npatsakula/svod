@@ -33,12 +33,11 @@ fn a_variable_asked_for_again_keeps_its_range(min: i64, max: i64) {
 
 /// A scalar read is of an input and no store writes an input, so the
 /// lowering may list a read anywhere its index is known.
-#[test_case::test_case(ParamKind::Out; "a read of an output")]
-#[test_case::test_case(ParamKind::InOut; "a read of an output it also reads")]
+#[test]
 #[should_panic(expected = "a scalar load reads an input")]
-fn a_scalar_read_is_of_an_input(kind: ParamKind) {
+fn a_scalar_read_is_of_an_input() {
     let mut k = crate::build::Kernel::new("read");
-    let p = k.param::<crate::build::I32>("p", kind, 4);
+    let p = k.param::<crate::build::I32>("p", ParamKind::Out, 4);
     k.load_scalar(p, 0);
 }
 

@@ -1,5 +1,5 @@
 //! Running a tile program as a lazy graph kernel: placeholders sized at
-//! capacity, the lowered PROGRAM as the call body. The first `Out`/`InOut`
+//! capacity, the lowered PROGRAM as the call body. The first `Out`
 //! parameter is the call's output and every other parameter an input;
 //! results return in `prog.params` order.
 
@@ -47,7 +47,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Launch `prog` over `tensors`, one per declared parameter in order; the
-/// first `Out`/`InOut` parameter's tensor is returned as the lazy result.
+/// first `Out` parameter's tensor is returned as the lazy result.
 pub fn graph_launch(prog: Program, lowering: &Lowering, tensors: &[&Tensor]) -> Result<Tensor> {
     let out_at = first_output(&prog);
     Ok(launch_all(prog, lowering, tensors, true)?.swap_remove(out_at))
@@ -102,10 +102,7 @@ pub(crate) fn graph_launch_lowered(
 }
 
 pub(crate) fn first_output(prog: &Program) -> usize {
-    prog.params
-        .iter()
-        .position(|p| matches!(p.kind, ParamKind::Out | ParamKind::InOut))
-        .expect("a program writes something")
+    prog.params.iter().position(|p| p.kind == ParamKind::Out).expect("a program writes something")
 }
 
 /// [`graph_launch`] returning every parameter's tensor as it is after the
