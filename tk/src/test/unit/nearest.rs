@@ -1127,32 +1127,6 @@ fn few_queries_split_their_lists_to_fill_the_gpu(target: Target) {
 
 // ---- device ------------------------------------------------------------------
 
-/// Every config of the first eight tiles ranked for the case's shape, lowered
-/// and run on the device, against the f64 reference as the interpreter is:
-/// exactly where the values are integers ([non-negative](Case::unsigned)).
-#[test_case(300, 500, 64, draw(Metric::ShiftedL2, NONE, None, false, true); "assignment d64")]
-#[test_case(257, 333, 5, draw(Metric::L2, BOTH, Some(3), false, false); "l2 floors groups d5")]
-#[test_case(130, 270, 37, draw(Metric::L2, BOTH, Some(2), true, true); "integer ties d37")]
-#[test_case(64, 1000, 128, draw(Metric::NegDot, Floors { row: false, col: true }, Some(4), false, false); "neg dot d128")]
-#[test_case(100, 200, 32, draw(Metric::SquaredL2, NONE, None, false, false); "squared l2 d32")]
-#[test_case(200, 300, 512, draw(Metric::NegDot, NONE, None, false, false); "streamed neg dot d512")]
-#[test_case(130, 170, 1000, draw(Metric::L2, BOTH, Some(3), true, true); "streamed integer ties d1000")]
-#[test_case(150, 250, 768, draw(Metric::SquaredL2, NONE, Some(2), false, false); "streamed squared l2 groups d768")]
-fn nearest_matches_on_device(n: usize, m: usize, d: usize, draw: Draw) {
-    let Some(planner) = super::device_planner() else { return };
-    let case = Case::draw(n, m, d, draw, 7).unsigned(draw.integer);
-    let depth = planner.nearest_depth(d, svod_dtype::ScalarDType::Float16).unwrap();
-    let ranked = planner.nearest_ranked(case.problem(depth, 1));
-    let (want_score, want_index) = case.listed(ranked[0], 1);
-    case.check_list("interpreter", 1, &want_score, &want_index, 1e-4, draw.integer);
-    for cfg in split_too(&planner, &case, depth, 1, &ranked) {
-        let (score, index) = case.on_device(&planner, depth, cfg, 1);
-        case.check_list(&format!("{cfg:?}"), 1, &score, &index, 1e-3, draw.integer);
-        let same = index.iter().zip(&want_index).filter(|(a, b)| a == b).count();
-        eprintln!("{cfg:?}: {same} of {n} indices as interpreted");
-    }
-}
-
 /// The first eight tiles of `ranked` (for `k` scores a row) as the tuner
 /// times them (each unsplit, then at the planner's split where there is one)
 /// and the first of each way that splits (a register list, a queued one)
@@ -1181,38 +1155,28 @@ fn a_resident_trip_votes_before_it_places_its_least(target: Target, vote: &str) 
     }
 }
 
-/// [`the_trip_that_lowers_a_row_places_its_least`] for every config of the
-/// first eight tiles ranked on the device, where warps whose rows no trip
-/// lowers skip finding the least's column: exactly the reference's index.
-#[test_case(Order::Falling; "the last candidate")]
-#[test_case(Order::Rising; "the first candidate")]
-#[test_case(Order::Flat; "every candidate alike")]
-fn the_trip_that_lowers_a_row_places_its_least_on_device(order: Order) {
-    let Some(planner) = super::device_planner() else { return };
-    for d in [16, 512] {
-        let case = ordered(150, 230, d, order);
-        let ranked = planner.nearest_ranked(case.problem(d, 1));
-        for cfg in split_too(&planner, &case, d, 1, &ranked) {
-            let (score, index) = case.on_device(&planner, d, cfg, 1);
-            case.check_list(&format!("{cfg:?}"), 1, &score, &index, 0.0, true);
-        }
-    }
-}
-
 /// Every config of the first eight tiles ranked for `k` scores a row (and
 /// the tuner's splits), lowered and run on the device in bf16 and in f16,
 /// against the reference as the interpreter is: exactly where the values are
 /// integers ([non-negative](Case::unsigned)). Resident and streamed rows,
 /// lists longer than the admissible candidates, exact ties among repeated
-/// candidates.
+/// candidates; `k` of 1 the least alone, each shape's k = 1 beside its list.
+#[test_case(300, 500, 64, draw(Metric::ShiftedL2, NONE, None, false, true), 1; "assignment d64 k1")]
 #[test_case(300, 500, 64, draw(Metric::ShiftedL2, NONE, None, false, true), 4; "assignment d64 k4")]
+#[test_case(257, 333, 5, draw(Metric::L2, BOTH, Some(3), false, false), 1; "l2 floors groups d5 k1")]
 #[test_case(257, 333, 5, draw(Metric::L2, BOTH, Some(3), false, false), 2; "l2 floors groups d5 k2")]
+#[test_case(130, 270, 37, draw(Metric::L2, BOTH, Some(2), true, true), 1; "integer ties d37 k1")]
 #[test_case(130, 270, 37, draw(Metric::L2, BOTH, Some(2), true, true), 16; "integer ties d37 k16")]
+#[test_case(64, 1000, 128, draw(Metric::NegDot, Floors { row: false, col: true }, Some(4), false, false), 1; "neg dot d128 k1")]
 #[test_case(64, 1000, 128, draw(Metric::NegDot, Floors { row: false, col: true }, Some(4), false, false), 8; "neg dot d128 k8")]
+#[test_case(100, 200, 32, draw(Metric::SquaredL2, NONE, None, false, false), 1; "squared l2 d32 k1")]
 #[test_case(100, 200, 32, draw(Metric::SquaredL2, NONE, None, true, false), config::REGISTER_K; "squared l2 d32 longest")]
 #[test_case(70, 20, 16, draw(Metric::SquaredL2, NONE, Some(3), true, true), config::REGISTER_K; "fewer candidates than slots")]
+#[test_case(200, 300, 512, draw(Metric::NegDot, NONE, None, false, false), 1; "streamed neg dot d512 k1")]
 #[test_case(200, 300, 512, draw(Metric::NegDot, NONE, None, false, false), 8; "streamed neg dot d512 k8")]
+#[test_case(130, 170, 1000, draw(Metric::L2, BOTH, Some(3), true, true), 1; "streamed integer ties d1000 k1")]
 #[test_case(130, 170, 1000, draw(Metric::L2, BOTH, Some(3), true, true), 16; "streamed integer ties d1000 k16")]
+#[test_case(150, 250, 768, draw(Metric::SquaredL2, NONE, Some(2), false, false), 1; "streamed squared l2 groups d768 k1")]
 #[test_case(150, 250, 768, draw(Metric::SquaredL2, NONE, Some(2), false, false), config::REGISTER_K; "streamed squared l2 groups d768 longest")]
 #[test_case(300, 2000, 64, draw(Metric::ShiftedL2, NONE, None, false, true), 100; "assignment d64 k100")]
 #[test_case(257, 1000, 5, draw(Metric::L2, BOTH, Some(3), false, false), 256; "l2 floors groups d5 k256")]
@@ -1238,8 +1202,9 @@ fn lists_match_on_device(n: usize, m: usize, d: usize, draw: Draw, k: usize) {
     }
 }
 
-/// [`the_trip_that_lowers_a_row_places_its_least`] for lists, on the host
-/// and on the device for every config of the first eight tiles ranked:
+/// [`the_trip_that_lowers_a_row_places_its_least`] for the least alone and
+/// for lists, on the host and on the device for every config of the first
+/// eight tiles ranked:
 /// every trip offering every row a whole list's worth (the scores falling),
 /// only the first trip (rising, every later trip skipped by the vote), or
 /// ties everywhere; exactly the reference's lists.
