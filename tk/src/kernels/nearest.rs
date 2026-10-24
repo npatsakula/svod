@@ -1278,14 +1278,7 @@ pub fn nearest_select(spec: &SelectSpec) -> Program {
     let out_base = if shares > 1 { k.block(1) * (share_stride(n) * top) } else { Sc::from(0) };
     let lane = Shape::new(rows, LANES);
     let empty = |k: &mut Kernel| [Const::Float(f64::INFINITY), Const::Float(-1.0)].map(|e| k.fill::<F32>(lane, e));
-    // Run `t` of the block's lists in `score` and `index` from `base`.
-    let run = |k: &mut Kernel, (score, index): (ParamRef<F32>, ParamRef<I32>), base: Sc, t: usize| {
-        let bounds = [rb.clone(), kb.clone()];
-        let s = k.view(score, base.clone(), [top, 1], lane, bounds.clone());
-        let s = k.at(s, row0.clone(), t * LANES);
-        let i = k.view(index, base, [top, 1], lane, bounds);
-        (s, k.at(i, row0.clone(), t * LANES))
-    };
+    let list_runs = ListRuns { top, lane, row0: row0.clone(), bounds: [rb.clone(), kb.clone()] };
     let held = top.div_ceil(LANES);
     // The list's `top`-th score (the live length's where it varies: each
     // run's slot of it, if any, the most of them).
@@ -1312,24 +1305,9 @@ pub fn nearest_select(spec: &SelectSpec) -> Program {
     let loaded = |k: &mut Kernel| {
         (0..runs)
             .flat_map(|t| {
-                if t >= held {
-                    return empty(k);
-                }
-                let (s, i) = run(k, lists.expect("the lists to carry"), Sc::from(0), t);
-                let s = k.load(s);
-                let i = k.load(i);
-                let mut v = [s, k.cast::<I32, F32>(i)];
-                if (t + 1) * LANES > top || k_live.is_some() {
-                    let col = k.coord(lane, Axis::Col);
-                    let width = match &k_live {
-                        None => k.fill::<I32>(lane, Const::Int((top - t * LANES) as i64)),
-                        Some(live) => k.splat::<I32>(lane, live.clone() - t * LANES),
-                    };
-                    let inside = k.compare(col, width, CmpOp::Lt);
-                    let e = empty(k);
-                    v = [0, 1].map(|j| k.where_(inside, v[j], e[j]));
-                }
-                v
+                list_runs
+                    .loaded(k, lists.expect("the lists to carry"), Sc::from(0), t, &k_live)
+                    .unwrap_or_else(|| empty(k))
             })
             .collect::<Vec<_>>()
     };
@@ -1478,7 +1456,8 @@ pub fn nearest_select(spec: &SelectSpec) -> Program {
             1 => k.select_if(last.clone().eq(0), |_| [s], |k| [finished(k, s, metric)]),
             _ => [s],
         };
-        let (sv, iv) = run(&mut k, (score_out, index_out), out_base.clone(), t);
+        let sv = list_runs.run(&mut k, score_out, out_base.clone(), t);
+        let iv = list_runs.run(&mut k, index_out, out_base.clone(), t);
         k.store(sv, s);
         let i = k.cast::<F32, I32>(i);
         k.store(iv, i);
@@ -1594,6 +1573,57 @@ type Seq = Vec<[Regs<F32>; 2]>;
 /// `len` pairs of `shape` holding nothing: `+∞` at −1.
 fn empty_seq(k: &mut Kernel, shape: Shape, len: usize) -> Seq {
     (0..len).map(|_| [f64::INFINITY, -1.0].map(|e| k.fill::<F32>(shape, Const::Float(e)))).collect()
+}
+
+/// A kernel's runs of [`LANES`] list slots: where they sit in a `[top, 1]`
+/// parameter (the block's rows at `row0`, over `lane`, within `bounds`).
+#[derive(Clone)]
+struct ListRuns {
+    top: usize,
+    lane: Shape,
+    row0: Sc,
+    bounds: [Option<Sc>; 2],
+}
+
+impl ListRuns {
+    /// Run `t` of the list `p` holds from `base`: its view.
+    fn run<E: Elem>(&self, k: &mut Kernel, p: ParamRef<E>, base: Sc, t: usize) -> Gmem<E> {
+        let v = k.view(p, base, [self.top, 1], self.lane, self.bounds.clone());
+        k.at(v, self.row0.clone(), t * LANES)
+    }
+
+    /// Run `t` of the lists `score` and `index` hold from `base`, loaded:
+    /// the index cast to the score's type, its slots past `top` — or past
+    /// the live length `k`'s, where it varies — empty; `None` where the run
+    /// is past `top` itself.
+    fn loaded(
+        &self,
+        k: &mut Kernel,
+        (score, index): (ParamRef<F32>, ParamRef<I32>),
+        base: Sc,
+        t: usize,
+        k_live: &Option<Sc>,
+    ) -> Option<[Regs<F32>; 2]> {
+        if t * LANES >= self.top {
+            return None;
+        }
+        let s = self.run(k, score, base.clone(), t);
+        let s = k.load(s);
+        let i = self.run(k, index, base, t);
+        let i = k.load(i);
+        let mut pair = [s, k.cast::<I32, F32>(i)];
+        if (t + 1) * LANES > self.top || k_live.is_some() {
+            let col = k.coord(self.lane, Axis::Col);
+            let width = match k_live {
+                None => k.fill::<I32>(self.lane, Const::Int((self.top - t * LANES) as i64)),
+                Some(live) => k.splat::<I32>(self.lane, live.clone() - t * LANES),
+            };
+            let inside = k.compare(col, width, CmpOp::Lt);
+            let empty = [f64::INFINITY, -1.0].map(|e| k.fill::<F32>(self.lane, Const::Float(e)));
+            pair = [0, 1].map(|j| k.where_(inside, pair[j], empty[j]));
+        }
+        Some(pair)
+    }
 }
 
 /// A sequence's tiles in order.
@@ -1810,39 +1840,11 @@ fn merge_lists(spec: &NearestMergeSpec) -> Program {
     k.warps(LIST_WARPS);
     let row0 = k.block(0) * rows;
     let lane = Shape::new(rows, LANES);
-    // Run `t` of the block's lists in `p` from `base`.
-    let run = |k: &mut Kernel, p: ParamRef<F32>, base: Sc, t: usize| {
-        let v = k.view(p, base, [top, 1], lane, [rb.clone(), kb.clone()]);
-        k.at(v, row0.clone(), t * LANES)
-    };
-    let index_run = |k: &mut Kernel, p: ParamRef<I32>, base: Sc, t: usize| {
-        let v = k.view(p, base, [top, 1], lane, [rb.clone(), kb.clone()]);
-        k.at(v, row0.clone(), t * LANES)
-    };
+    let list_runs = ListRuns { top, lane, row0: row0.clone(), bounds: [rb.clone(), kb.clone()] };
     // Run `t` of share `s`'s lists, its slots past the list (the live
     // length) empty; `None` where none is.
-    let loaded = |k: &mut Kernel, s: Sc, t: usize| {
-        if t * LANES >= top {
-            return None;
-        }
-        let base = s * (stride * top);
-        let v = run(k, score_part, base.clone(), t);
-        let v = k.load(v);
-        let i = index_run(k, index_part, base, t);
-        let i = k.load(i);
-        let mut pair = [v, k.cast::<I32, F32>(i)];
-        if (t + 1) * LANES > top || k_live.is_some() {
-            let col = k.coord(lane, Axis::Col);
-            let width = match &k_live {
-                None => k.fill::<I32>(lane, Const::Int((top - t * LANES) as i64)),
-                Some(live) => k.splat::<I32>(lane, live.clone() - t * LANES),
-            };
-            let inside = k.compare(col, width, CmpOp::Lt);
-            let empty = empty_seq(k, lane, 1)[0];
-            pair = [0, 1].map(|j| k.where_(inside, pair[j], empty[j]));
-        }
-        Some(pair)
-    };
+    let loaded =
+        |k: &mut Kernel, s: Sc, t: usize| list_runs.loaded(k, (score_part, index_part), s * (stride * top), t, &k_live);
     // The first share's lists as they are, every later one merged in.
     let first: Seq =
         (0..runs).map(|t| loaded(&mut k, Sc::from(0), t).unwrap_or_else(|| empty_seq(&mut k, lane, 1)[0])).collect();
@@ -1861,10 +1863,10 @@ fn merge_lists(spec: &NearestMergeSpec) -> Program {
     });
     for (t, [s, i]) in pairs(&list).into_iter().take(top.div_ceil(LANES)).enumerate() {
         let s = finished(&mut k, s, metric);
-        let v = run(&mut k, score, Sc::from(0), t);
+        let v = list_runs.run(&mut k, score, Sc::from(0), t);
         k.store(v, s);
         let i = k.cast::<F32, I32>(i);
-        let v = index_run(&mut k, index, Sc::from(0), t);
+        let v = list_runs.run(&mut k, index, Sc::from(0), t);
         k.store(v, i);
     }
     k.finish()
