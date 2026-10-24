@@ -8,12 +8,7 @@
 //! and digests of it compared across builds ([`digest`], [`diff`]).
 //! Fixtures, not an API: hidden from the docs.
 
-use std::sync::Arc;
-
-use svod_codegen::Renderer;
-use svod_codegen::llvm::LlvmTextRenderer;
-use svod_dtype::{AmdArch, CudaArch, DType, DeviceSpec, GpuArch, ScalarDType};
-use svod_ir::{Op, UOp, ops};
+use svod_dtype::{AmdArch, CudaArch, GpuArch, ScalarDType};
 
 use crate::atoms::{Core, Costs, Device, Target};
 use crate::build::{BF16, F16, I8};
@@ -28,7 +23,7 @@ use crate::kernels::nearest::{
 };
 use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::kernels::{Act, Batch};
-use crate::lower::{Lowering, lower};
+use crate::lower::Lowering;
 use crate::ops::config::{self, NearestProblem, Planner};
 
 /// Costs a test declares where it needs a ranking or an orientation: the
@@ -407,22 +402,30 @@ pub(crate) fn yolo_geom((cin, cout, k, hw, s): (usize, usize, usize, [usize; 2],
     geom(hw, cin, cout, k, s, k / 2, 1)
 }
 
-pub(crate) fn device(target: &Target) -> DeviceSpec {
+#[cfg(test)]
+pub(crate) fn device(target: &Target) -> svod_dtype::DeviceSpec {
     match target.arch {
-        GpuArch::Cuda(_) => DeviceSpec::Cuda { device_id: 0 },
-        GpuArch::Amd(_) => DeviceSpec::Amd { device_id: 0 },
-        GpuArch::Metal(_) => DeviceSpec::Metal { device_id: 0 },
+        GpuArch::Cuda(_) => svod_dtype::DeviceSpec::Cuda { device_id: 0 },
+        GpuArch::Amd(_) => svod_dtype::DeviceSpec::Amd { device_id: 0 },
+        GpuArch::Metal(_) => svod_dtype::DeviceSpec::Metal { device_id: 0 },
     }
 }
 
 /// The lowered instruction list of `prog`.
-pub(crate) fn linear(prog: Program, lowering: &Lowering) -> Arc<UOp> {
-    let params =
-        prog.params.iter().enumerate().map(|(i, p)| UOp::param(i, p.elems, DType::Scalar(p.dtype), None)).collect();
+#[cfg(test)]
+pub(crate) fn linear(prog: Program, lowering: &Lowering) -> std::sync::Arc<svod_ir::UOp> {
+    let params = prog
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| svod_ir::UOp::param(i, p.elems, svod_dtype::DType::Scalar(p.dtype), None))
+        .collect();
     let name = prog.name.clone();
-    let lowered =
-        lower(prog, lowering, params, device(&lowering.device.target)).unwrap_or_else(|e| panic!("{name}: {e}"));
-    let Op::Program(ops::Program { linear: Some(linear), .. }) = lowered.program.op() else { panic!("a program") };
+    let lowered = crate::lower::lower(prog, lowering, params, device(&lowering.device.target))
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    let svod_ir::Op::Program(svod_ir::ops::Program { linear: Some(linear), .. }) = lowered.program.op() else {
+        panic!("a program")
+    };
     linear.clone()
 }
 
@@ -433,16 +436,12 @@ pub(crate) fn render(prog: Program, lowering: &Lowering) -> String {
     try_render(prog, lowering).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
-/// [`render`], a renderer's error returned.
+/// [`render`], a renderer's error returned. Through [`lower::render`], so
+/// the program's own rolled loops carry their hint.
 pub fn try_render(prog: Program, lowering: &Lowering) -> Result<String, svod_codegen::Error> {
     let name = prog.name.clone();
-    let renderer = match lowering.device.target.arch {
-        GpuArch::Cuda(arch) => LlvmTextRenderer::nvptx(arch),
-        GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
-        GpuArch::Metal(_) => unreachable!("Metal renders C"),
-    };
-    let linear = linear(prog, lowering);
-    Ok(renderer.render(&linear, Some(&name))?.code)
+    crate::lower::render(prog, lowering)
+        .map_err(|e| svod_codegen::Error::InvalidGraph { reason: format!("{name}: {e}") })
 }
 
 /// The targets of the refactor sweep, by the names the gate files them

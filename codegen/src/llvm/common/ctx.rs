@@ -72,20 +72,32 @@ impl RenderContext {
         self.rolled = rolled;
     }
 
+    /// [`Self::set_loop_hint`] with no unroll hint: only the loops in
+    /// `rolled` carry one, the rolled one; the rest stay bare.
+    pub fn set_rolled_hint(&mut self, rolled_hint: &'static str, rolled: HashSet<u64>) {
+        self.loop_hints = Some(["", rolled_hint]);
+        self.unhinted = Default::default();
+        self.rolled = rolled;
+    }
+
     /// The hint nodes the module declares: the rolled one only where a loop
     /// carries it.
     fn hint_nodes(&self) -> usize {
-        1 + usize::from(!self.rolled.is_empty())
+        let empty = self.loop_hints.is_some_and(|[h, _]| h.is_empty());
+        usize::from(!empty) + usize::from(!self.rolled.is_empty())
     }
 
     /// The branch that closes the loop over `range` (axis `id`) — back to its
     /// latch, with a loop ID of its own when it carries a hint.
     pub fn back_edge(&mut self, range: &Arc<UOp>, id: &str) -> String {
         let branch = format!("  br label %loop_latch_{id}");
-        if self.loop_hints.is_none() || self.unhinted.contains(&range.id) {
+        let Some([hint, _]) = self.loop_hints else { return branch };
+        if self.unhinted.contains(&range.id) || hint.is_empty() && !self.rolled.contains(&range.id) {
             return branch;
         }
-        self.loops.push(usize::from(self.rolled.contains(&range.id)));
+        let rolled_hint = self.rolled.contains(&range.id);
+        let at = if hint.is_empty() { self.hint_nodes() - 1 } else { usize::from(rolled_hint) };
+        self.loops.push(at);
         format!("{branch}, !llvm.loop !{}", self.hint_nodes() + self.loops.len() - 1)
     }
 
@@ -93,6 +105,7 @@ impl RenderContext {
     /// one distinct, self-referential loop ID per loop, as LLVM requires.
     pub fn loop_metadata(&self) -> Vec<String> {
         let Some(hints) = self.loop_hints.filter(|_| !self.loops.is_empty()) else { return Vec::new() };
+        let hints: Vec<&str> = hints.iter().filter(|h| !h.is_empty()).copied().collect();
         let nodes = self.hint_nodes();
         let heads = hints.iter().take(nodes).enumerate().map(|(i, hint)| format!("!{i} = {hint}"));
         let loops = self.loops.iter().enumerate().map(|(i, &hint)| {

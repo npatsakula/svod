@@ -25,6 +25,13 @@ mod compute;
 mod copy;
 mod nvptx;
 
+thread_local! {
+    /// The rolled ranges of the program [`emit`] is emitting, handed to
+    /// [`lower`](super::lower) — a thread-local, as `emit` returns the
+    /// program alone.
+    pub(super) static ROLLED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(vec![]) };
+}
+
 pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSpec) -> Result<Arc<UOp>> {
     let (prog, lay) = (&laid.prog, laid.layouts.as_slice());
     // Parameters and buffers committed up front: the assembly rebuilds none
@@ -42,6 +49,7 @@ pub fn emit(laid: &Laid, low: &Lowering, params: Vec<Arc<UOp>>, device: DeviceSp
         }
     }
     let info = KernelInfo { name: Some(prog.name.clone()), ..Default::default() };
+    ROLLED.with(|cell| cell.borrow_mut().extend(e.rolled));
     UOp::linear_program(info, list, device).context(ProgramSnafu)
 }
 
@@ -144,6 +152,11 @@ struct Emit<'a> {
     /// The block being emitted holds a [`Sync::WaitProducts`]: its warpgroup
     /// products issue without waiting, that statement is their wait.
     async_products: bool,
+    /// Whether the loop being emitted holds a product, innermost last: the
+    /// ranges opened over one that does are the schedule's own decision to
+    /// stay rolled, carried to the renderer ([`Lowered::rolled`]).
+    rolling: Vec<bool>,
+    rolled: Vec<u64>,
     range_id: usize,
     reg_slot: usize,
     local_slot: usize,
@@ -246,6 +259,8 @@ impl<'a> Emit<'a> {
             blocks: [None, None, None],
             scope: Scope::Block,
             async_products: false,
+            rolling: vec![],
+            rolled: vec![],
             range_id: 0,
             reg_slot: 0,
             local_slot: 0,
@@ -647,7 +662,19 @@ impl<'a> Emit<'a> {
 
     /// A rolled loop, or `unroll` copies of the body per iteration followed by
     /// a rolled remainder (skipped when a constant extent divides evenly).
+    /// Whether any statement of `block`, at any depth, is a product.
+    fn holds_product(block: &Block) -> bool {
+        block.walk().any(|(_, s)| matches!(s, Stmt::Let { op: TileOp::Mma { .. }, .. }))
+    }
+
     fn loop_(&mut self, l: &Loop) -> Result<()> {
+        self.rolling.push(Self::holds_product(&l.body));
+        let out = self.loop_inner(l);
+        self.rolling.pop();
+        out
+    }
+
+    fn loop_inner(&mut self, l: &Loop) -> Result<()> {
         let copied: Vec<Carried> =
             l.carried.iter().filter(|c| self.root(c.init) != self.root(c.phi)).copied().collect();
         for c in copied {
@@ -688,6 +715,9 @@ impl<'a> Emit<'a> {
     fn open_range(&mut self, end: Arc<UOp>) -> Arc<UOp> {
         let range = UOp::range_axis_dtype(end, AxisId::Renumbered(self.range_id), AxisType::Loop, DType::Int32);
         self.range_id += 1;
+        if self.rolling.last() == Some(&true) {
+            self.rolled.push(range.id);
+        }
         let range = self.push(range);
         self.list.open();
         // The induction variable belongs to the level it opens.

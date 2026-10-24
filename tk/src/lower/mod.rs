@@ -68,6 +68,10 @@ pub struct Lowered {
     pub program: Arc<UOp>,
     pub tile: Program,
     pub layouts: Vec<Option<TileLayout>>,
+    /// The ranges the program's own schedule kept rolled (a loop whose body
+    /// holds a product), which [`Lowered::text`] hints every target against
+    /// unrolling further.
+    pub rolled: Vec<u64>,
 }
 
 /// `params` are the flat buffer UOps in `prog.params` order (placeholders on
@@ -81,9 +85,11 @@ pub fn lower(mut prog: Program, lowering: &Lowering, params: Vec<Arc<UOp>>, devi
     schedule::expand(&mut prog, lowering.device.target.fill, lowering.core);
     let mut laid = layouts::infer(prog, &lowering.device, lowering.core).context(LayoutSnafu)?;
     orient_shared(&mut laid, &lowering.device.target);
+    emit::ROLLED.with(|cell| cell.borrow_mut().clear());
     let program = emit::emit(&laid, lowering, params, device)?;
+    let rolled = emit::ROLLED.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     let Laid { prog, layouts } = laid;
-    Ok(Lowered { program, tile: prog, layouts })
+    Ok(Lowered { program, tile: prog, layouts, rolled })
 }
 
 /// `prog` lowered for its lowering's target alone, its parameters declared
@@ -122,7 +128,8 @@ impl Lowered {
             GpuArch::Cuda(arch) => LlvmTextRenderer::nvptx(arch),
             GpuArch::Amd(arch) => LlvmTextRenderer::amd(arch),
             GpuArch::Metal(_) => return UnsupportedSnafu { what: "Metal's LLVM text" }.fail(),
-        };
+        }
+        .rolled(self.rolled.iter().copied());
         let Op::Program(ops::Program { linear: Some(linear), .. }) = self.program.op() else {
             unreachable!("a lowering emits a linear program")
         };
