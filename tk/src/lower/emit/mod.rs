@@ -819,7 +819,8 @@ impl<'a> Emit<'a> {
 /// `dies` dies, each taking every `dies`th block of a dispatch: the dies'
 /// shares laid end to end (the first `total % dies` dies hold a block more),
 /// so a die runs a contiguous range of the kernel's block order.
-pub fn die_order(linear: u64, total: u64, dies: u64) -> u64 {
+#[cfg(test)]
+pub(crate) fn die_order(linear: u64, total: u64, dies: u64) -> u64 {
     let (base, tall) = (total / dies, total % dies);
     let (die, local) = (linear % dies, linear / dies);
     die * base + die.min(tall) + local

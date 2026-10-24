@@ -94,7 +94,8 @@ pub fn ldmatrix_x4_bytes() -> Layout {
 
 /// The `ldmatrix.x4` addressing: lane `L` supplies the 16-byte row `L % 16` at column
 /// `8·(L/16)`, so lanes `8m..8m+8` address matrix `m` = TL, BL, TR, BR.
-pub fn ldmatrix_x4_rows() -> Layout {
+#[cfg(test)]
+pub(crate) fn ldmatrix_x4_rows() -> Layout {
     Layout::from_bases([(Row, 16), (Col, 16)], &[(Lane, &[[1, 0], [2, 0], [4, 0], [8, 0], [0, 8]])])
 }
 
