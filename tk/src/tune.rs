@@ -214,17 +214,19 @@ pub(crate) fn made_of(prog: &Program, lowering: &Lowering) -> u64 {
 }
 
 /// Programs lowered for a fingerprint, by what they are made of, kept for
-/// the compile that follows: a tuning lowers each program once. One that
-/// did not lower is kept as `None`, which stays: it fails the same way
-/// until its inputs change, so its compile is refused without lowering it
+/// the compile that follows: a tuning lowers each program once, with the
+/// digest of what it emits ([`emitted_key`] of the candidate it belongs to).
+/// One that did not lower is kept as `None`, which stays: it fails the same
+/// way until its inputs change, so its compile is refused without lowering it
 /// again.
 #[derive(Default)]
-pub(crate) struct Lowerings(pub(crate) Mutex<HashMap<u64, Option<Arc<UOp>>>>);
+pub(crate) struct Lowerings(pub(crate) Mutex<HashMap<u64, Option<(u64, Arc<UOp>)>>>);
 
 impl Lowerings {
-    /// What the fingerprint left for `made_of`: the program, handed over
-    /// once; `Some(None)` where it did not lower; `None` where nothing was.
-    fn take(&self, made_of: u64) -> Option<Option<Arc<UOp>>> {
+    /// What the fingerprint left for `made_of`: what the program emits and
+    /// the program, handed over once; `Some(None)` where it did not lower;
+    /// `None` where nothing was.
+    fn take(&self, made_of: u64) -> Option<Option<(u64, Arc<UOp>)>> {
         let mut kept = self.0.lock().expect("lowerings");
         match kept.get(&made_of) {
             Some(None) => Some(None),
@@ -435,12 +437,13 @@ impl TuneStore {
     /// unused for [`EMITTED_KEPT`]; each line is appended by one write, so
     /// processes of one build share the file.
     pub(crate) fn fingerprint(&self, candidates: &[Candidate]) -> u64 {
-        self.fingerprint_keeping(candidates, None)
+        self.fingerprint_keeping(candidates, None).0
     }
 
     /// [`Self::fingerprint`], the programs it lowers kept in `keep` for
-    /// their compile.
-    pub(crate) fn fingerprint_keeping(&self, candidates: &[Candidate], keep: Option<&Lowerings>) -> u64 {
+    /// their compile, and the digest of what each candidate's programs emit:
+    /// candidates sharing one emit the same kernel ([`emitted_key`]).
+    pub(crate) fn fingerprint_keeping(&self, candidates: &[Candidate], keep: Option<&Lowerings>) -> (u64, Vec<u64>) {
         use rayon::prelude::*;
         let made_of: Vec<Vec<u64>> =
             candidates.iter().map(|c| c.iter().map(|(p, l)| made_of(p, l)).collect()).collect();
@@ -456,21 +459,26 @@ impl TuneStore {
             .map(|(m, (prog, lowering))| {
                 let lowered = emitted(prog, lowering);
                 if let Some(keep) = keep {
-                    keep.0.lock().expect("lowerings").insert(m, lowered.as_ref().map(|(_, program)| program.clone()));
+                    keep.0
+                        .lock()
+                        .expect("lowerings")
+                        .insert(m, lowered.as_ref().map(|(emitted, program)| (*emitted, program.clone())));
                 }
                 lowered.map_or((m, m), |(emitted, _)| (m, emitted))
             })
             .collect();
         self.record_emitted(&found);
         let known = memo.lock().expect("emitted memo");
-        digest(&made_of.iter().map(|c| c.iter().map(|m| known[m]).collect::<Vec<_>>()).collect::<Vec<_>>())
+        let emitted: Vec<Vec<u64>> = made_of.iter().map(|c| c.iter().map(|m| known[m]).collect()).collect();
+        (digest(&emitted), emitted.iter().map(|e| digest(e)).collect())
     }
 
     /// `prog` lowered under `lowering` ([`crate::lower::standalone`]),
     /// without origins, from `keep` where a fingerprint left it (or found
     /// it does not lower), else lowered here and what it emits remembered
-    /// as a fingerprint would; `None` where it does not lower.
-    pub(crate) fn lowered(&self, prog: &Program, lowering: &Lowering, keep: &Lowerings) -> Option<Arc<UOp>> {
+    /// as a fingerprint would; `None` where it does not lower. What the
+    /// program emits comes with it.
+    pub(crate) fn lowered(&self, prog: &Program, lowering: &Lowering, keep: &Lowerings) -> Option<(u64, Arc<UOp>)> {
         let m = made_of(prog, lowering);
         if let Some(kept) = keep.take(m) {
             return kept;
@@ -479,7 +487,17 @@ impl TuneStore {
         if !self.emitted_memo().lock().expect("emitted memo").contains_key(&m) {
             self.record_emitted(&[(m, emitted)]);
         }
-        Some(program)
+        Some((emitted, program))
+    }
+
+    /// The digest of what `programs` emit, where a fingerprint or a compile
+    /// lowered them (else `None`): what a candidate is keyed by, its twins
+    /// (the same emitted kernel) sharing it.
+    pub(crate) fn emitted_key(&self, programs: &Candidate) -> Option<u64> {
+        let memo = self.emitted_memo().lock().expect("emitted memo");
+        let emitted: Vec<u64> =
+            programs.iter().map(|(p, l)| memo.get(&made_of(p, l)).copied()).collect::<Option<_>>()?;
+        Some(digest(&emitted))
     }
 
     /// What programs emit by what they are made of: this process's and its
@@ -628,8 +646,10 @@ impl TuneStore {
     /// device ns: the memo, then the store under the line the programs
     /// `build` makes fingerprint (each built once), else, on a store miss,
     /// those `bench` has not compiled are compiled and every candidate is
-    /// [`time`]d through `pass`, their order stored.
-    pub(crate) fn choose<C: Copy + PartialEq + std::fmt::Debug + Send>(
+    /// [`time`]d through `pass`, their order stored. A candidate whose
+    /// programs emit what another's do (an unrolling the schedule folds
+    /// away) is timed as its twin: the line still names it, at its twin's ns.
+    pub(crate) fn choose<C: Copy + PartialEq + Eq + std::hash::Hash + std::fmt::Debug + Send>(
         &self,
         key: &TuneKey,
         candidates: &[C],
@@ -640,11 +660,14 @@ impl TuneStore {
         let keep = bench.lowered.clone();
         let programs = || {
             let built: Vec<Candidate> = candidates.iter().map(|&c| build(c)).collect();
-            (self.fingerprint_keeping(&built, Some(&keep)), built)
+            let (fingerprint, keys) = self.fingerprint_keeping(&built, Some(&keep));
+            (fingerprint, (built, keys))
         };
         let within =
             |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _)| i < candidates.len()));
-        let timed = |built| ordered(bench.time(candidates, built, pass, self)).map(Entry::Choice);
+        let timed = |(built, keys): (Vec<Candidate>, Vec<u64>)| {
+            ordered(bench.time(candidates, built, &keys, pass, self)).map(Entry::Choice)
+        };
         match self.remember(Kind::Choice, key, within, programs, timed)? {
             Entry::Choice(timed) => Some(timed),
             _ => None,
@@ -733,17 +756,37 @@ pub(crate) fn spilled(resources: &[KernelResources]) -> bool {
 /// Candidates compiled once on one scratch pool and kept: admitted as the
 /// shortlist's search asks, then timed by the passes that ask for them, none
 /// compiled or lowered twice (a fingerprint's lowerings are kept for the
-/// compile). Compiles run on the rayon pool ([`streamed`]), each killed at
+/// compile). One whose programs emit what another's do compiles and times no
+/// more: it is that one's twin, its verdict and time the twin's ([`Emitted`]).
+/// Compiles run on the rayon pool ([`streamed`]), each killed at
 /// [`COMPILE_TIMEOUT`]; while candidates are timed, the rest compile.
 pub(crate) struct Bench<C> {
     pool: ScratchPool,
     pub(crate) built: Vec<(C, Built)>,
     pub(crate) lowered: Arc<Lowerings>,
+    pub(crate) emitted: Emitted<C>,
+}
+
+/// What the candidates compiled so far emit, by digest: the first config to
+/// emit a kernel, and per twin of it skipped the config that compiled for
+/// the twin. A digest maps a candidate's programs whole, so candidates of
+/// one shape cannot share another's; a config, not a `built` index, names
+/// the compiler, a timing's swap-remove reordering them.
+pub(crate) struct Emitted<C> {
+    pub(crate) first: HashMap<u64, C>,
+    /// A skipped twin and the config that compiled for it.
+    pub(crate) twin: HashMap<C, C>,
+}
+
+impl<C> Default for Emitted<C> {
+    fn default() -> Self {
+        Self { first: HashMap::new(), twin: HashMap::new() }
+    }
 }
 
 impl<C> Default for Bench<C> {
     fn default() -> Self {
-        Self { pool: ScratchPool::default(), built: vec![], lowered: Arc::default() }
+        Self { pool: ScratchPool::default(), built: vec![], lowered: Arc::default(), emitted: Default::default() }
     }
 }
 
@@ -756,12 +799,16 @@ impl<C> Default for Bench<C> {
 /// slowest clang seen beside another process's load: 21 s).
 pub(crate) const COMPILE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Compiles of a [`Bench`], `width` at a time, keyed by `K`.
-type Compiling<'a, K> = Stream<'a, (K, Candidate), (K, Built, Duration)>;
+/// Compiles of a [`Bench`], `width` at a time, keyed by `K`: what compiled,
+/// what it emitted, and how long it took.
+type Compiling<'a, K> = Stream<'a, (K, Candidate), (K, Built, Option<u64>, Duration)>;
 
-impl<C: Copy + PartialEq + std::fmt::Debug + Send> Bench<C> {
+impl<C: Copy + PartialEq + Eq + std::hash::Hash + std::fmt::Debug + Send> Bench<C> {
     fn find(&self, c: C) -> Option<usize> {
-        self.built.iter().position(|(b, _)| *b == c)
+        self.built
+            .iter()
+            .position(|(b, _)| *b == c)
+            .or_else(|| self.emitted.twin.get(&c).and_then(|&of| self.built.iter().position(|(b, _)| *b == of)))
     }
 
     /// `body` over a stream compiling candidates on this bench's pool and
@@ -775,30 +822,52 @@ impl<C: Copy + PartialEq + std::fmt::Debug + Send> Bench<C> {
         let (pool, lowered) = (&self.pool, &self.lowered);
         let run = |(key, programs): (K, Candidate)| {
             let start = std::time::Instant::now();
-            let built = svod_runtime::clang::with_compile_deadline(start + COMPILE_TIMEOUT, || {
+            let (built, emitted) = svod_runtime::clang::with_compile_deadline(start + COMPILE_TIMEOUT, || {
                 compile_one(programs, pool, Some((store, lowered)))
             });
-            (key, built, start.elapsed())
+            (key, built, emitted, start.elapsed())
         };
         streamed(width, run, body)
     }
 
     /// What compiling each of `batch` (the programs `build` makes) showed,
-    /// those not compiled before compiled in parallel.
+    /// those not compiled before compiled in parallel. A candidate whose
+    /// programs emit what one already built's (or an earlier one of the
+    /// batch's) do is its twin: it compiles nothing, its verdict the twin's.
     pub(crate) fn admit(&mut self, batch: &[C], build: impl Fn(C) -> Candidate, store: &TuneStore) -> Vec<Compiled> {
         let missing: Vec<C> = distinct(batch.iter().copied().filter(|&c| self.find(c).is_none()));
+        let mut keys: HashMap<u64, C> = self.emitted.first.clone();
+        let mut fresh: Vec<(C, Candidate)> = vec![];
+        for &c in &missing {
+            let programs = build(c);
+            match store.emitted_key(&programs) {
+                Some(k) if keys.contains_key(&k) => {
+                    self.emitted.twin.insert(c, keys[&k]);
+                }
+                Some(k) => {
+                    keys.insert(k, c);
+                    fresh.push((c, programs));
+                }
+                None => fresh.push((c, programs)),
+            }
+        }
         let done = self.compiling(store, threads(), |stream| {
-            missing.into_iter().for_each(|c| stream.push((c, build(c))));
+            fresh.into_iter().for_each(|job| stream.push(job));
             std::iter::from_fn(|| stream.next()).collect::<Vec<_>>()
         });
-        for (cfg, built, took) in done {
-            keep(&mut self.built, cfg, built, took);
+        let (mut built, mut emitted) = (std::mem::take(&mut self.built), std::mem::take(&mut self.emitted));
+        for (cfg, built_one, key, took) in done {
+            keep(&mut built, &mut emitted, cfg, built_one, key, took);
         }
+        (self.built, self.emitted) = (built, emitted);
         batch.iter().map(|&c| self.built[self.find(c).expect("compiled")].1.verdict()).collect()
     }
 
     /// The tuner's shortlist of `ranked` ([`crate::ops::config::shortlist`]),
-    /// each config compiled as soon as the search wants it.
+    /// each config compiled as soon as the search wants it. A config whose
+    /// programs emit what one already built's does is its twin (its verdict
+    /// waits on the compile of the same kernel, in flight or done); one held
+    /// for a kernel still compiling answers as it lands.
     pub(crate) fn shortlist(
         &mut self,
         ranked: &[C],
@@ -811,13 +880,43 @@ impl<C: Copy + PartialEq + std::fmt::Debug + Send> Bench<C> {
         struct Search<'s, 'b, C, B> {
             stream: &'s mut Compiling<'b, (usize, C)>,
             bench: &'s mut Vec<(C, Built)>,
+            emitted: &'s mut Emitted<C>,
             build: B,
+            store: &'s TuneStore,
+            /// Compiles started per emitted kernel, not landed yet.
+            started: HashMap<u64, C>,
+            /// Starts held for a kernel compiling: their configs answer as
+            /// its compile lands.
+            held: Vec<(usize, u64, C)>,
+            /// Verdicts a twin's compile made, ready to hand back.
+            ready: std::collections::VecDeque<(usize, Compiled)>,
         }
-        impl<C: Copy + PartialEq + std::fmt::Debug, B: Fn(C) -> Candidate> crate::ops::config::Compiles<C>
-            for Search<'_, '_, C, B>
+        impl<C: Copy + PartialEq + Eq + std::hash::Hash + std::fmt::Debug, B: Fn(C) -> Candidate>
+            crate::ops::config::Compiles<C> for Search<'_, '_, C, B>
         {
             fn start(&mut self, at: usize, config: C) {
-                self.stream.push(((at, config), (self.build)(config)));
+                let programs = (self.build)(config);
+                let Some(k) = self.store.emitted_key(&programs) else {
+                    self.stream.push(((at, config), programs));
+                    return;
+                };
+                if let Some(&of) = self.emitted.first.get(&k) {
+                    let Some((_, built)) = self.bench.iter().find(|(b, _)| *b == of) else {
+                        self.stream.push(((at, config), programs));
+                        return;
+                    };
+                    self.emitted.twin.insert(config, of);
+                    self.ready.push_back((at, built.verdict()));
+                    return;
+                }
+                match self.started.insert(k, config) {
+                    // The same kernel compiling: its verdict is this one's.
+                    Some(of) => {
+                        let _ = self.started.insert(k, of);
+                        self.held.push((at, k, config));
+                    }
+                    None => self.stream.push(((at, config), programs)),
+                }
             }
 
             fn idle(&self) -> bool {
@@ -825,31 +924,77 @@ impl<C: Copy + PartialEq + std::fmt::Debug + Send> Bench<C> {
             }
 
             fn finished(&mut self) -> Option<(usize, Compiled)> {
-                let ((at, cfg), built, took) = self.stream.next()?;
-                Some((at, keep(self.bench, cfg, built, took)))
+                if let Some((at, verdict)) = self.ready.pop_front() {
+                    return Some((at, verdict));
+                }
+                let ((at, cfg), built, key, took) = self.stream.next()?;
+                let verdict = keep(self.bench, self.emitted, cfg, built, key, took);
+                if let Some(k) = key {
+                    self.started.remove(&k);
+                    let (answering, held): (Vec<_>, Vec<_>) =
+                        std::mem::take(&mut self.held).into_iter().partition(|&(_, held, _)| held == k);
+                    for (at, _, twin) in answering {
+                        self.emitted.twin.insert(twin, cfg);
+                        self.ready.push_back((at, verdict));
+                    }
+                    self.held = held;
+                }
+                Some((at, verdict))
             }
         }
-        let mut built = std::mem::take(&mut self.built);
+        let (mut built, mut emitted) = (std::mem::take(&mut self.built), std::mem::take(&mut self.emitted));
         let found = self.compiling(store, threads(), |stream| {
-            crate::ops::config::shortlist(ranked, &mut Search { stream, bench: &mut built, build })
+            crate::ops::config::shortlist(
+                ranked,
+                &mut Search {
+                    stream,
+                    bench: &mut built,
+                    emitted: &mut emitted,
+                    build,
+                    store,
+                    started: HashMap::new(),
+                    held: vec![],
+                    ready: Default::default(),
+                },
+            )
         });
-        self.built = built;
+        (self.built, self.emitted) = (built, emitted);
         found
     }
 
     /// Each of `candidates`' best device time, timed in their order (the
-    /// ranking's, so a good time is soon the bar the [`HOPELESS`] ones miss);
-    /// those not compiled yet compile from `programs`, in order, on all
-    /// but one of the pool's threads while the ones ready are timed.
+    /// ranking's, so a good time is soon the bar the [`HOPELESS`] ones miss):
+    /// one a [`emitted`](Emitted) key shares with another times once, as the
+    /// first of them, its twins at its ns. Those not compiled yet compile
+    /// from `programs`, in order, on all but one of the pool's threads while
+    /// the ones ready are timed.
     pub(crate) fn time(
         &mut self,
         candidates: &[C],
-        programs: Vec<Candidate>,
+        mut programs: Vec<Candidate>,
+        keys: &[u64],
         pass: Pass,
         store: &TuneStore,
     ) -> Vec<Option<u64>> {
-        let mut slots: Vec<Option<Built>> =
-            candidates.iter().map(|&c| self.find(c).map(|at| self.built.swap_remove(at).1)).collect();
+        let mut firsts: HashMap<&u64, usize> = HashMap::new();
+        let of: Vec<usize> = keys.iter().enumerate().map(|(i, k)| *firsts.entry(k).or_insert(i)).collect();
+        let runs: Vec<usize> = (0..candidates.len()).filter(|&i| of[i] == i).collect();
+        let at: Vec<C> = runs.iter().map(|&i| candidates[i]).collect();
+        let programs: Vec<Candidate> = runs.iter().map(|&i| std::mem::take(&mut programs[i])).collect();
+        let ns = self.timed(&at, programs, pass, store);
+        let mut out = vec![None; candidates.len()];
+        for (i, ns) in runs.into_iter().zip(ns) {
+            out[i] = ns;
+        }
+        for (i, &of) in of.iter().enumerate() {
+            out[i] = out[of];
+        }
+        out
+    }
+
+    /// [`Self::time`] of candidates known apart by what they emit.
+    fn timed(&mut self, candidates: &[C], programs: Vec<Candidate>, pass: Pass, store: &TuneStore) -> Vec<Option<u64>> {
+        let mut slots: Vec<Option<Built>> = candidates.iter().map(|&c| self.take(c)).collect();
         let missing: Vec<(usize, Candidate)> =
             programs.into_iter().enumerate().filter(|(i, _)| slots[*i].is_none()).collect();
         // Their scratch buffers filled now: a fill is a kernel, which would
@@ -861,7 +1006,7 @@ impl<C: Copy + PartialEq + std::fmt::Debug + Send> Bench<C> {
         }
         let ns = self.compiling(store, threads().saturating_sub(1), |stream| {
             missing.into_iter().for_each(|job| stream.push(job));
-            let arrive = || stream.next().map(|(i, built, _)| (i, built));
+            let arrive = || stream.next().map(|(i, built, _, _)| (i, built));
             time_with(&mut slots, arrive, Some(HOPELESS), pass, true)
         });
         for (&c, built) in candidates.iter().zip(slots) {
@@ -869,16 +1014,50 @@ impl<C: Copy + PartialEq + std::fmt::Debug + Send> Bench<C> {
         }
         ns
     }
+
+    /// The candidate's compile, taken out of `built` for a timing: a twin's
+    /// held under the config that compiled for it, which the timing's
+    /// candidate then holds (its Built lands under its own config, and what
+    /// compiled the kernel names it).
+    fn take(&mut self, c: C) -> Option<Built> {
+        let at = self.find(c)?;
+        let (held, built) = self.built.swap_remove(at);
+        if held != c {
+            for of in self.emitted.twin.values_mut() {
+                if *of == held {
+                    *of = c;
+                }
+            }
+            for of in self.emitted.first.values_mut() {
+                if *of == held {
+                    *of = c;
+                }
+            }
+        }
+        Some(built)
+    }
 }
 
 /// Keeps what compiling `cfg` built in `bench` and logs it; its verdict.
-fn keep<C: std::fmt::Debug>(bench: &mut Vec<(C, Built)>, cfg: C, built: Built, took: Duration) -> Compiled {
+/// What it emitted, where the compile learned it, records `cfg` as the first
+/// to emit that kernel.
+fn keep<C: std::fmt::Debug + Clone>(
+    bench: &mut Vec<(C, Built)>,
+    emitted: &mut Emitted<C>,
+    cfg: C,
+    built: Built,
+    key: Option<u64>,
+    took: Duration,
+) -> Compiled {
     let verdict = built.verdict();
     let registers: Vec<_> = built.resources.iter().map(|r| (r.vgprs, r.agprs)).collect();
     let scratch: Vec<_> = built.resources.iter().map(|r| r.scratch_bytes).collect();
     tracing::debug!(target: crate::ops::PLAN, ?cfg, ?verdict, ?registers, ?scratch, ?took, "compiled");
     if verdict == Compiled::Failed && took >= COMPILE_TIMEOUT {
         tracing::info!(target: crate::ops::PLAN, ?cfg, ?took, "compile timed out: rejected");
+    }
+    if let Some(k) = key {
+        emitted.first.entry(k).or_insert_with(|| cfg.clone());
     }
     bench.push((cfg, built));
     verdict
@@ -904,26 +1083,35 @@ fn distinct<C: PartialEq>(items: impl Iterator<Item = C>) -> Vec<C> {
 /// [`resources`]. The programs compile in parallel, on workers carrying the
 /// caller's default device and origin scope.
 pub(crate) fn compile(candidates: Vec<Candidate>, pool: &ScratchPool) -> Vec<Built> {
-    in_parallel(candidates, |programs| compile_one(programs, pool, None))
+    in_parallel(candidates, |programs| compile_one(programs, pool, None).0)
 }
 
 /// One candidate's [`compile`], its programs lowered through `lowered`
 /// (`store`'s fingerprint memo and the lowerings a fingerprint kept) where
 /// given: a program that does not lower fails the candidate there, lowered
-/// no further.
-fn compile_one(programs: Candidate, pool: &ScratchPool, lowered: Option<(&TuneStore, &Lowerings)>) -> Built {
+/// no further. What its programs emit, where a store lowered them, keys the
+/// candidate for its twins; `None` where one did not lower (such a candidate
+/// fails, and nothing emits).
+fn compile_one(
+    programs: Candidate,
+    pool: &ScratchPool,
+    lowered: Option<(&TuneStore, &Lowerings)>,
+) -> (Built, Option<u64>) {
+    let mut emitted: Vec<u64> = vec![];
     let plans: Option<Vec<Scratch>> = programs
         .into_iter()
         .map(|(p, l)| match lowered {
             Some((store, keep)) => {
-                let body = store.lowered(&p, &l, keep)?;
+                let (digest, body) = store.lowered(&p, &l, keep)?;
+                emitted.push(digest);
                 scratch_plan_of(p, &l, pool, Some(body))
             }
             None => scratch_plan(p, &l, pool),
         })
         .collect();
+    let key = plans.as_ref().filter(|_| !emitted.is_empty()).map(|_| digest(&emitted));
     let resources = plans.iter().flatten().flat_map(|(plan, _)| resources(plan)).collect();
-    Built { plans, resources }
+    (Built { plans, resources }, key)
 }
 
 /// Held across every [`time`] in the process, the probes' and the tuner's

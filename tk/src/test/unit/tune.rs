@@ -820,10 +820,11 @@ fn a_tuning_lowers_each_program_once() {
     let alone = crate::lower::standalone(prog.clone(), lowering).expect("lowers").program;
     let (store, keep) = (TuneStore::at(None), tune::Lowerings::default());
     let fingerprinted = store.fingerprint_keeping(std::slice::from_ref(&candidate), Some(&keep));
-    assert_eq!(store.lowered(prog, lowering, &keep), Some(alone.clone()), "kept by the fingerprint");
-    assert_eq!(store.lowered(prog, lowering, &keep), Some(alone.clone()), "lowered again once taken");
+    let lowered = |store: &TuneStore, keep: &tune::Lowerings| store.lowered(prog, lowering, keep).map(|(_, p)| p);
+    assert_eq!(lowered(&store, &keep), Some(alone.clone()), "kept by the fingerprint");
+    assert_eq!(lowered(&store, &keep), Some(alone.clone()), "lowered again once taken");
     let (fresh, keep) = (TuneStore::at(None), tune::Lowerings::default());
-    assert_eq!(fresh.lowered(prog, lowering, &keep), Some(alone));
+    assert_eq!(lowered(&fresh, &keep), Some(alone));
     assert_eq!(fresh.fingerprint_keeping(std::slice::from_ref(&candidate), Some(&keep)), fingerprinted);
     assert!(keep.0.lock().unwrap().is_empty(), "nothing lowered: the compile remembered what it emits");
 }

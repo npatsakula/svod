@@ -19,19 +19,23 @@ use crate::tune::{Bench, Candidate, Compiled, Pass, TuneStore};
 /// Each of `ranked` compiled (in ranked batches, as the tuner admits), then
 /// every one that compiled timed twice, its lesser time kept: the verdicts
 /// and ns in `ranked`'s order, and the extra candidates' ns after them.
-fn timed<C: Copy + PartialEq + std::fmt::Debug + Send>(
+fn timed<C: Copy + PartialEq + Eq + std::hash::Hash + std::fmt::Debug + Send>(
     ranked: &[C],
     extra: &[C],
     build: impl Fn(C) -> Candidate,
 ) -> (Vec<Compiled>, Vec<Option<u64>>) {
+    let store = TuneStore::global();
     let mut bench: Bench<C> = Bench::default();
-    let verdicts: Vec<Compiled> =
-        ranked.chunks(64).flat_map(|chunk| bench.admit(chunk, &build, TuneStore::global())).collect();
+    let verdicts: Vec<Compiled> = ranked.chunks(64).flat_map(|chunk| bench.admit(chunk, &build, store)).collect();
     let mut runs: Vec<C> =
         ranked.iter().zip(&verdicts).filter(|(_, v)| **v != Compiled::Failed).map(|(c, _)| *c).collect();
     runs.extend(extra.iter().filter(|c| !runs.contains(c)).copied().collect::<Vec<_>>());
+    // What each run's programs emit, where the compiles learned it, an
+    // index of its own where not: twins time once, the rest apart.
+    let keys: Vec<u64> =
+        runs.iter().enumerate().map(|(i, &c)| store.emitted_key(&build(c)).unwrap_or(i as u64 + 1)).collect();
     let passes: Vec<Vec<Option<u64>>> = (0..2)
-        .map(|_| bench.time(&runs, runs.iter().map(|&c| build(c)).collect(), Pass::Whole, TuneStore::global()))
+        .map(|_| bench.time(&runs, runs.iter().map(|&c| build(c)).collect(), &keys, Pass::Whole, store))
         .collect();
     let ns = |c: &C| -> Option<u64> {
         let at = runs.iter().position(|r| r == c)?;

@@ -224,7 +224,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
     /// admission's store line carries: a lowering change re-judges.
     /// The programs lowered for it are kept in `keep` for their compile.
     fn programs(store: &TuneStore, build: &B, list: &[C], keep: &tune::Lowerings) -> u64 {
-        store.fingerprint_keeping(&list.iter().map(|&c| build(c)).collect::<Vec<_>>(), Some(keep))
+        store.fingerprint_keeping(&list.iter().map(|&c| build(c)).collect::<Vec<_>>(), Some(keep)).0
     }
 
     fn key(&self, op: &'static str, list: &[C]) -> TuneKey {
