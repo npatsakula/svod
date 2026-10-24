@@ -72,7 +72,7 @@ Two guards keep a time honest:
 |---|---|
 | Directory | `$SVOD_TK_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk_tune`, else `~/.cache/svod/tk_tune` |
 | File | One per device and crate version, e.g. `sm_86_28sm-v0.2.0.txt`, headed by its line format (`format 5`); a file of another format, or without the line, is dropped whole |
-| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: a `choice` holds the candidates that ran, fastest first, each `index ns`; a `value` a measured number; an `admitted` the ranked indices admission kept; a `first` the first clean config's index |
+| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: a `choice` holds the candidates that ran, fastest first, each `index ns` (a candidate whose programs emit what another's do — an unrolling the schedule folds away — is recorded at its twin's ns, the kernel the two share); a `value` a measured number; an `admitted` the ranked indices admission kept; a `first` the first clean config's index |
 | Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, where `device` is arch and SM count (`sm_86-28sm`) and `compiler` digests the device's compiler (`tune::compiler`) |
 
 Lines from a real store on the RTX 3060: an attention choice (shape `[batch, t, tk, heads,

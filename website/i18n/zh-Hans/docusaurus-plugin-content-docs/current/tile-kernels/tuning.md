@@ -34,7 +34,7 @@ sidebar_label: 调优
 |---|---|
 | 目录 | `$SVOD_TK_TUNE_DIR`，否则 `$XDG_CACHE_HOME/svod/tk_tune`，否则 `~/.cache/svod/tk_tune` |
 | 文件 | 每个设备和 crate 版本一个，例如 `sm_86_28sm-v0.2.0.txt`，以其行格式作为首行（`format 5`）；其他格式或没有该行的文件整个丢弃 |
-| 行 | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`：`choice` 存放运行过的候选，最快者在前，每个为 `index ns`；`value` 存放一个测得的数；`admitted` 存放准入保留的排序索引；`first` 存放第一个干净配置的索引 |
+| 行 | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`：`choice` 存放运行过的候选，最快者在前，每个为 `index ns`（程序发射结果与另一候选相同的候选——比如被调度折叠掉的反滚——按其孪生的 ns 记录，两者共用同一内核）；`value` 存放一个测得的数；`admitted` 存放准入保留的排序索引；`first` 存放第一个干净配置的索引 |
 | 键 | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`，其中 `device` 是架构和 SM 数量（`sm_86-28sm`），`compiler` 是设备编译器的摘要（`tune::compiler`） |
 
 来自 RTX 3060 上一个真实存储的两行：一条注意力选择（形状 `[batch, t, tk, heads, kv_heads, d]`，候选 0 以 3904 ns 胜出），以及一条代价探针的值（每单位的飞秒数）。

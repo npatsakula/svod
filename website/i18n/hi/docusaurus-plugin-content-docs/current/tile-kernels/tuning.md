@@ -73,7 +73,7 @@ tile के twins) वे pool के एक को छोड़ बाकी �
 |---|---|
 | Directory | `$SVOD_TK_TUNE_DIR`, वरना `$XDG_CACHE_HOME/svod/tk_tune`, वरना `~/.cache/svod/tk_tune` |
 | File | हर device और crate version के लिए एक, जैसे `sm_86_28sm-v0.2.0.txt`, जिसकी शुरुआत उसके line format (`format 5`) से होती है; किसी दूसरे format वाली, या बिना इस line वाली फ़ाइल पूरी हटा दी जाती है |
-| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: एक `choice` में चले हुए candidates होते हैं, सबसे तेज़ पहले, हर एक `index ns`; एक `value` में एक मापी गई संख्या; एक `admitted` में वे ranked indices जिन्हें admission ने रखा; एक `first` में पहले clean config का index |
+| Line | `kind\|op\|device\|dtype\|shape\|candidates\|compiler\|programs numbers`: एक `choice` में चले हुए candidates होते हैं, सबसे तेज़ पहले, हर एक `index ns` (जिस candidate के programs वही emit करते हैं जो किसी और के करता है — एक unrolling जो schedule चुपके से मिटा देता है — वह अपने twin के ns पर दर्ज है, वह kernel जो दोनों बाँटते हैं); एक `value` में एक मापी गई संख्या; एक `admitted` में वे ranked indices जिन्हें admission ने रखा; एक `first` में पहले clean config का index |
 | Key | `tune::TuneKey { op, device, dtype, shape, candidates, compiler }`, जहाँ `device` arch और SM count है (`sm_86-28sm`) और `compiler` device के compiler का digest है (`tune::compiler`) |
 
 RTX 3060 पर एक असली store की lines: एक attention choice (shape `[batch, t, tk, heads, kv_heads, d]`,
