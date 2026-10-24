@@ -83,6 +83,8 @@ pub struct Attn<'a> {
 }
 
 const OP: &str = "attention";
+/// The packed operand's tunings, apart from the split one's.
+const PACKED: &str = "packed_attention";
 /// Search bound: the rows (one warp each) of a split's merge block, which
 /// the tuner times as part of every split candidate rather than on its own.
 const MERGE_ROWS: usize = 4;
@@ -93,6 +95,32 @@ const TUNE_BATCH: usize = 64;
 /// `softmax(q·kᵀ·scale + bias)·v` over `q [B, T, H, D]` and `k`/`v [B, Tk, H_kv, D]`,
 /// query head `h` reading KV head `h / (H / H_kv)`; returns `[B, T, H, D]`.
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tensor> {
+    attend(q, k, v, None, opts)
+}
+
+/// [`attention`] over a fused projection `qkv [B, T, (heads + 2·kv_heads)·D]`
+/// of queries, keys and values side by side, without a cache: a kernel
+/// reads the three in place, the graph splits them.
+pub fn attention_packed(qkv: &Tensor, heads: usize, kv_heads: usize, opts: Attn) -> Result<Tensor> {
+    let got = shape_of(qkv).context(GraphSnafu { op: OP })?;
+    ensure!(kv_heads > 0 && heads.is_multiple_of(kv_heads), HeadsSnafu { op: OP, heads, kv_heads });
+    let slots = heads + 2 * kv_heads;
+    let d = got.get(2).and_then(SInt::as_const).filter(|w| *w > 0 && w.is_multiple_of(slots)).map(|w| w / slots);
+    let shape_err = |expected: &'static str| ShapeSnafu { op: OP, operand: "qkv", got: fmt_shape(&got), expected };
+    let Some(d) = d.filter(|_| got.len() == 3) else { return shape_err("[B, T, slots·D]").fail() };
+    ensure!(opts.cache.is_none(), shape_err("[B, T, slots·D] with no cache"));
+    let (b, t) = (qkv.dim(0).context(GraphSnafu { op: OP })?, qkv.dim(1).context(GraphSnafu { op: OP })?);
+    let parts = qkv.split(&[heads * d, kv_heads * d, kv_heads * d], -1).context(GraphSnafu { op: OP })?;
+    let head = |part: &Tensor, n: usize| {
+        part.try_reshape([b.clone(), t.clone(), SInt::Const(n), SInt::Const(d)]).context(GraphSnafu { op: OP })
+    };
+    let (q, k, v) = (head(&parts[0], heads)?, head(&parts[1], kv_heads)?, head(&parts[2], kv_heads)?);
+    attend(&q, &k, &v, Some(qkv), opts)
+}
+
+/// [`attention`] of `q`, `k` and `v`, or of the `packed` operand they are
+/// views of.
+fn attend(q: &Tensor, k: &Tensor, v: &Tensor, packed: Option<&Tensor>, opts: Attn) -> Result<Tensor> {
     let shape = |t: &Tensor| shape_of(t).context(GraphSnafu { op: OP });
     let (qs, ks, vs) = (shape(q)?, shape(k)?, shape(v)?);
     let shape_err =
@@ -196,7 +224,19 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     // `lens`, `bools` and `segs` are set below; the tuner reads the key lengths' presence.
     let mask = AttnMask { key_lens: lens.is_some(), bias: bias_rows, ..edges };
     let scale = opts.scale.unwrap_or(1.0 / (d as f32).sqrt());
-    let spec = AttnSpec { batch: batch.clone(), t, tk, heads, kv_heads, d, mask, cache, scale, cfg: cfgs[0] };
+    let spec = AttnSpec {
+        batch: batch.clone(),
+        t,
+        tk,
+        heads,
+        kv_heads,
+        d,
+        mask,
+        cache,
+        packed: packed.is_some(),
+        scale,
+        cfg: cfgs[0],
+    };
     let cfg = tuned(TuneStore::global(), &planner, q.dtype(), &cfgs, spec.clone(), opts.splits).cfg;
     let i32 = |t: &Tensor| if t.dtype() == DType::Int32 { t.clone() } else { t.cast(DType::Int32) };
     let lens = lens.map(i32);
@@ -230,6 +270,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     };
     let spec = AttnSpec { mask, cfg, ..spec };
     let lowering = cfg.lowering(&planner.device);
+    let operands = packed.map_or(vec![q, k, v], |qkv| vec![qkv]);
     let extras = [
         lens.as_ref(),
         bools.as_ref(),
@@ -243,7 +284,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
     ];
     if cfg.splits == 1 {
         let o = output(&q_ext.dims, &var, q.dtype()).context(GraphSnafu { op: OP })?;
-        let ins: Vec<&Tensor> = [Some(q), Some(k), Some(v), Some(&o)].into_iter().chain(extras).flatten().collect();
+        let ins: Vec<&Tensor> = operands.into_iter().chain([&o]).chain(extras.into_iter().flatten()).collect();
         return launch::graph_launch(typed!(q.dtype(), fa, &spec), &lowering, &ins).context(LaunchSnafu { op: OP });
     }
     let part = |dims: &[usize]| {
@@ -255,11 +296,8 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, opts: Attn) -> Result<Tenso
         part(&[cfg.splits, batch.capacity(), t, heads])?,
         part(&[cfg.splits, batch.capacity(), t, heads])?,
     );
-    let ins: Vec<&Tensor> = [Some(q), Some(k), Some(v), Some(&o_part), Some(&m_part), Some(&l_part)]
-        .into_iter()
-        .chain(extras)
-        .flatten()
-        .collect();
+    let ins: Vec<&Tensor> =
+        operands.into_iter().chain([&o_part, &m_part, &l_part]).chain(extras.into_iter().flatten()).collect();
     let parts =
         launch::graph_launch_all(typed!(q.dtype(), fa, &spec), &lowering, &ins).context(LaunchSnafu { op: OP })?;
     let merge = merge(batch, t, heads, d, cfg.splits);
@@ -331,7 +369,9 @@ pub fn tuned(
             ..c
         });
         let spec = AttnSpec { batch: measured.clone(), mask: measured_mask, cache: plain, cfg, ..spec.clone() };
-        let mut programs = timed_keys(tk, cache.is_some() || lens, &cfg)
+        // A packed operand holds its own keys, none below `tk`.
+        let below = !spec.packed && (cache.is_some() || lens);
+        let mut programs = timed_keys(tk, below, &cfg)
             .into_iter()
             .map(|tk| (typed!(dtype, fa, &AttnSpec { tk, ..spec.clone() }), cfg.lowering(&planner.device)))
             .collect::<Vec<_>>();
@@ -341,9 +381,10 @@ pub fn tuned(
         }
         programs
     };
+    let op = if spec.packed { PACKED } else { OP };
     let mut tuner = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build);
-    let cfg = tune(&mut tuner, &split, bias_rows.is_some(), expand);
-    tracing::debug!(target: super::PLAN, op = OP, ?shape, pick = ?cfg, "attention tuned");
+    let cfg = tune(op, &mut tuner, &split, bias_rows.is_some(), expand);
+    tracing::debug!(target: super::PLAN, op, ?shape, pick = ?cfg, "attention tuned");
     AttnSpec { cfg, ..spec }
 }
 
@@ -406,29 +447,30 @@ pub(crate) fn descend(
     forms(tiles(&formed), bias, pick)
 }
 
-/// The config `tuner` launches from `ranked`, `expand` making a tile pass's
-/// candidates as in [`Tuner::tuned`]: the softmax forms (the bias form
-/// under a `bias`) and tiles tuned in turn by [`descend`], or with tuning
-/// off the first clean, plain.
+/// The config `tuner` launches from `ranked` under `op`, `expand` making a
+/// tile pass's candidates as in [`Tuner::tuned`]: the softmax forms (the
+/// bias form under a `bias`) and tiles tuned in turn by [`descend`], or
+/// with tuning off the first clean, plain.
 pub(crate) fn tune<B: Fn(FaCfg) -> crate::tune::Candidate>(
+    op: &'static str,
     tuner: &mut Tuner<'_, FaCfg, B>,
     ranked: &[FaCfg],
     bias: bool,
     expand: impl Fn(&[FaCfg]) -> Vec<FaCfg>,
 ) -> FaCfg {
     if !crate::tune::enabled() {
-        return tuner.tuned(OP, ranked, expand);
+        return tuner.tuned(op, ranked, expand);
     }
     let tuner = std::cell::RefCell::new(tuner);
     descend(
         ranked,
         bias,
-        |r| tuner.borrow_mut().first_clean(OP, r).expect("a ranked attention config"),
-        |r| tuner.borrow_mut().tuned(OP, r, &expand),
+        |r| tuner.borrow_mut().first_clean(op, r).expect("a ranked attention config"),
+        |r| tuner.borrow_mut().tuned(op, r, &expand),
         |pair| {
             let mut tuner = tuner.borrow_mut();
-            let admitted = tuner.admitted(OP, &pair);
-            tuner.fastest(OP, &admitted)
+            let admitted = tuner.admitted(op, &pair);
+            tuner.fastest(op, &admitted)
         },
     )
 }

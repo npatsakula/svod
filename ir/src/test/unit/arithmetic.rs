@@ -95,6 +95,26 @@ fn test_signed_floor_divmod_semantics() {
     }
 }
 
+/// The integer bf16 narrowing replaces exactly the f32 → bf16 cast: no cast to
+/// bf16 survives and the payload arrives by bitcast, while the other float
+/// casts (f32 → f16, bf16 → f32) stay for the backend to select.
+#[test]
+fn bf16_integer_casts_rewrite_only_f32_to_bf16() {
+    let patterns = crate::decompositions::bf16_integer_cast_patterns();
+    let casts_to = |root: &std::sync::Arc<UOp>, dt: &DType| {
+        root.toposort().iter().filter(|u| matches!(u.op(), Op::Cast(_)) && u.dtype() == *dt).count()
+    };
+    let narrow = crate::decompositions::decompose_with(&UOp::native_const(0.25f32).cast(DType::BFloat16), &patterns);
+    assert_eq!(narrow.dtype(), DType::BFloat16);
+    assert!(matches!(narrow.op(), Op::BitCast(_)), "{narrow:?}");
+    assert_eq!(casts_to(&narrow, &DType::BFloat16), 0);
+    for (from, to) in [(DType::Float32, DType::Float16), (DType::BFloat16, DType::Float32)] {
+        let root = UOp::native_const(0.25f32).cast(from).cast(to.clone());
+        let kept = crate::decompositions::decompose_with(&root, &patterns);
+        assert_eq!(casts_to(&kept, &to), 1, "{to:?} cast must stay");
+    }
+}
+
 #[test]
 fn test_floor_divmod_decompose_to_c_ops() {
     let a = UOp::define_var("a".to_string(), -20, 20);

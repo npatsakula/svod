@@ -141,7 +141,7 @@ impl TileLayout {
     /// The register permutation under which this layout is `produced` (what
     /// an instruction leaves a tile in), if it is one lane for lane.
     pub fn as_permutation_of(&self, produced: &Self, warps: u32, lanes: u32) -> Option<Vec<u32>> {
-        match produced.held(self, warps, lanes) {
+        match produced.held(self, 0, warps, lanes) {
             Held::InLane(perm) => Some(perm),
             Held::AcrossLanes { .. } | Held::AcrossWarps => None,
         }
@@ -175,24 +175,33 @@ impl TileLayout {
     /// trade registers by lane moves while that is cheaper per element than
     /// a round trip through shared memory.
     pub fn relayout(&self, dst: &Self, warps: u32, lanes: u32, costs: &Costs) -> Relayout {
-        match self.held(dst, warps, lanes) {
+        self.relayout_flipped(dst, 0, warps, lanes, costs)
+    }
+
+    /// [`relayout`](Self::relayout) of the tile whose element `(r, c)` is
+    /// this one's `(r, c ^ flip)`: the [`TileOp::SwapHalves`] of `flip`
+    /// columns, a plain relayout at 0.
+    pub fn relayout_flipped(&self, dst: &Self, flip: u32, warps: u32, lanes: u32, costs: &Costs) -> Relayout {
+        match self.held(dst, flip, warps, lanes) {
             Held::InLane(perm) if is_identity(&perm) => Relayout::Identity,
             Held::InLane(perm) => Relayout::RegPermute(perm),
-            Held::AcrossLanes(holders) => match self.exchange(dst, &holders, warps, lanes).map(Relayout::Exchange) {
-                Some(exchange) if exchange.cost_per_element(costs) < Relayout::ViaSmem.cost_per_element(costs) => {
-                    exchange
+            Held::AcrossLanes(holders) => {
+                match self.exchange(dst, flip, &holders, warps, lanes).map(Relayout::Exchange) {
+                    Some(exchange) if exchange.cost_per_element(costs) < Relayout::ViaSmem.cost_per_element(costs) => {
+                        exchange
+                    }
+                    _ => Relayout::ViaSmem,
                 }
-                _ => Relayout::ViaSmem,
-            },
+            }
             Held::AcrossWarps => Relayout::ViaSmem,
         }
     }
 
-    /// Where every register of `dst` is held in `self`, preferring the same
-    /// lane, then the same warp.
-    fn held(&self, dst: &Self, warps: u32, lanes: u32) -> Held {
+    /// Where every register of `dst` is held in `self`, its column
+    /// coordinate xor `flip`, preferring the same lane, then the same warp.
+    fn held(&self, dst: &Self, flip: u32, warps: u32, lanes: u32) -> Held {
         assert_eq!(self.shape(), dst.shape(), "relayout between different tiles");
-        if self == dst {
+        if self == dst && flip == 0 {
             return Held::InLane((0..dst.regs()).collect());
         }
         let Shape { rows, cols } = self.shape();
@@ -213,7 +222,7 @@ impl TileLayout {
                 let mut perm = Vec::with_capacity(dst.regs() as usize);
                 for j in 0..dst.regs() {
                     let (r, c) = dst.coord(w, l, j);
-                    let held = &holders[r as usize * cols + c as usize];
+                    let held = &holders[r as usize * cols + (c ^ flip) as usize];
                     let pick = held
                         .iter()
                         .find(|h| (h.0, h.1) == (w, l))
@@ -238,13 +247,22 @@ impl TileLayout {
 
     /// Every destination register as lane-xor moves of one source register
     /// each, the same in every warp: lanes trading registers with fixed
-    /// partners. `holders` lists who holds each element.
-    fn exchange(&self, dst: &Self, holders: &[Vec<(u32, u32, u32)>], warps: u32, lanes: u32) -> Option<Vec<Vec<Pick>>> {
+    /// partners. `holders` lists who holds each element; a destination
+    /// column reads the source's xor `flip`.
+    fn exchange(
+        &self,
+        dst: &Self,
+        flip: u32,
+        holders: &[Vec<(u32, u32, u32)>],
+        warps: u32,
+        lanes: u32,
+    ) -> Option<Vec<Vec<Pick>>> {
         let cols = self.shape().cols;
         // The (mask, source register) moves that bring lane `l` of warp `w` its element `j`.
         let moves = |w: u32, l: u32, j: u32| -> Vec<(u32, u32)> {
             let (r, c) = dst.coord(w, l, j);
-            holders[r as usize * cols + c as usize].iter().filter(|h| h.0 == w).map(|h| (h.1 ^ l, h.2)).collect()
+            let held = &holders[r as usize * cols + (c ^ flip) as usize];
+            held.iter().filter(|h| h.0 == w).map(|h| (h.1 ^ l, h.2)).collect()
         };
         (0..dst.regs())
             .map(|j| {
@@ -925,7 +943,10 @@ impl<'a> Infer<'a> {
     fn let_(&mut self, dst: ValId, op: &TileOp) -> Result<()> {
         match *op {
             TileOp::Fill(_) | TileOp::Splat(_) | TileOp::Coord(_) | TileOp::Relayout { .. } => {}
-            TileOp::Unary { src, .. } | TileOp::Cast { src, .. } | TileOp::Move { src } => self.unify(dst, src),
+            TileOp::Unary { src, .. }
+            | TileOp::Cast { src, .. }
+            | TileOp::Move { src }
+            | TileOp::SwapHalves { src, .. } => self.unify(dst, src),
             TileOp::Binary { a, b, .. } => self.elementwise(dst, a, b),
             TileOp::Where { pred, a, b } => {
                 self.elementwise(dst, a, b);
@@ -1023,7 +1044,8 @@ impl Rewrite<'_> {
                     | TileOp::Cast { src, .. }
                     | TileOp::Transpose { src }
                     | TileOp::Relayout { src }
-                    | TileOp::Move { src } => rewrite(self, src),
+                    | TileOp::Move { src }
+                    | TileOp::SwapHalves { src, .. } => rewrite(self, src),
                     TileOp::Binary { a, b, .. } => {
                         rewrite(self, a);
                         rewrite(self, b);

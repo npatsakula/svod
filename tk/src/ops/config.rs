@@ -1143,9 +1143,11 @@ pub fn heads_candidates(d: usize) -> Vec<NormCfg> {
     ROW_WARPS.map(|br| NormCfg { br }).to_vec()
 }
 
-/// One warp per row of a power-of-two width a warp's vector loads span.
+/// One warp per row, a multiple of 256 wide: a wave32 warp's 16-byte loads span
+/// 256 columns, so on every target one warp holds a row in whole vectors, and
+/// 2048 is 64 elements a lane.
 pub fn norm_candidates(d: usize) -> Vec<NormCfg> {
-    if !(d.is_power_of_two() && (256..=2048).contains(&d)) {
+    if !(d.is_multiple_of(256) && (256..=2048).contains(&d)) {
         return vec![];
     }
     ROW_WARPS.map(|br| NormCfg { br }).to_vec()

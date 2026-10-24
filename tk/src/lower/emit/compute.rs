@@ -110,6 +110,7 @@ impl Emit<'_> {
             TileOp::Reduce { src, axis, f } => self.reduce(dst, src, axis, f)?,
             TileOp::Transpose { src } => self.transpose(dst, src)?,
             TileOp::Relayout { src } => self.relayout(dst, src)?,
+            TileOp::SwapHalves { src, half } => self.remap(dst, src, half as u32)?,
             TileOp::Move { src } => {
                 for j in 0..regs {
                     let x = self.reg_load(src, j);

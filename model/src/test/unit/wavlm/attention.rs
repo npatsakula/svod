@@ -209,7 +209,7 @@ fn half_attention_matches_reference_formula(dtype: DType) {
     let want = reference_attention(&attn, &x, &pb, cfg.encoder_head_dim).to_vec::<f32>().unwrap();
 
     let mut half = attn.clone();
-    half.load_state_dict(&cast_all(&attn.state_dict(""), dtype.clone()), "").unwrap();
+    half.load_state_dict(&cast_all(&attn.state_dict(""), dtype.clone()).unwrap(), "").unwrap();
     let got = half.forward(&x.cast(dtype.clone()), &pb.cast(dtype)).unwrap();
     let got = got.cast(DType::Float32).to_vec::<f32>().unwrap();
     assert_eq!(got.len(), want.len());

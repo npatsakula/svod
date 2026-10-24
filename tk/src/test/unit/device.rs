@@ -8,12 +8,14 @@ use test_case::test_case;
 
 use super::declared;
 use crate::atoms::{Core, Device, Fill};
-use crate::build::BF16;
+use crate::build::*;
 use crate::interp::{round_to, run};
-use crate::ir::Program;
+use crate::ir::*;
 use crate::kernels::Batch;
-use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, gemm};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Rope, gemm};
 use crate::launch::graph_launch;
+use crate::layouts::WarpGrid;
+use crate::lower::Lowering;
 use crate::ops::config::Planner;
 
 fn plain_gemm(m: usize, n: usize, k: usize, cfg: GemmCfg) -> Program {
@@ -552,5 +554,114 @@ fn transposing_loads_land_as_their_layout() {
             assert_eq!(held[(lane * 8 + j) as usize], r * 16 + c, "lane {lane} register {j}");
         }
         assert_eq!(rows.apply(&[(Lane, lane)]), (lane % 8 + 8 * (lane / 16), 8 * (lane / 8 % 2)));
+    }
+}
+
+/// A halves swap of a tile held as the matrix core's accumulator stores what
+/// the interpreter stores, held in each lane, traded between lanes or round
+/// tripped through shared memory (as the halves lie on sm_86: 64 columns a
+/// warp, halves within an atom, 32 columns a warp).
+#[test_case([2, 2], 32; "64 columns a warp")]
+#[test_case([2, 2], 4; "halves within an atom")]
+#[test_case([2, 4], 32; "32 columns a warp")]
+fn swapped_halves_match_the_interpreter(grid: [u32; 2], half: usize) {
+    let Some(target) = super::device_target() else { return };
+    let (rows, cols) = (64usize, 128usize);
+    let warps = WarpGrid { rows: grid[0], cols: grid[1] };
+    let atom = target.mma(ScalarDType::BFloat16, ScalarDType::Float32).expect("a bf16 matrix core");
+    let held = atom.issue(Orient::Direct, warps, rows, cols, 16).unwrap().c;
+    let mut k = Kernel::new("swap");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    k.warps(warps.count());
+    let src = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let v = k.load(src);
+    k.pin(v, held);
+    let swapped = k.swap_halves(v, half);
+    let dst = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    k.store(dst, swapped);
+    let prog = k.finish();
+    let xs: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
+    let want = run(&prog, vec![xs.clone(), vec![0.0; rows * cols]], &[]).unwrap();
+    let x_t = Tensor::from_slice(xs.iter().map(|&v| v as f32).collect::<Vec<_>>());
+    let y_t = Tensor::empty(&[rows * cols], DType::Float32);
+    let got = graph_launch(prog, &Lowering::uniform(&declared(target), false, warps), &[&x_t, &y_t]).unwrap();
+    let got: Vec<f64> = got.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
+    assert_eq!(got, want[1]);
+}
+
+/// A periodic view of a bf16 table with gathered rows reads into registers
+/// what the interpreter reads: 16-byte runs within a period of 32, 8-element
+/// runs within one of 24, pairs within one of 6.
+#[test_case(32; "a period of 32")]
+#[test_case(24; "a period of 24")]
+#[test_case(6; "a period of 6")]
+fn a_periodic_table_matches_the_interpreter(period: usize) {
+    let Some(target) = super::device_target() else { return };
+    let (rows, cols, table_rows) = (64usize, 96usize, 37usize);
+    let mut k = Kernel::new("periodic");
+    let x = k.param::<BF16>("x", ParamKind::In, table_rows * period);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    k.warps(4);
+    let r = k.row();
+    let g = k.gather(x, 0, (r * 5 + 3) % table_rows * period, None, Shape::new(rows, cols), None);
+    let g = k.periodic(g, period);
+    let v = k.load(g);
+    let v = k.cast::<BF16, F32>(v);
+    let dst = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    k.store(dst, v);
+    let prog = k.finish();
+    let mut seed = 3;
+    let xs = super::rounded(ScalarDType::BFloat16, table_rows * period, &mut seed, |x| x);
+    let want = run(&prog, vec![xs.clone(), vec![0.0; rows * cols]], &[]).unwrap();
+    let x_t = Tensor::from_slice(xs.iter().map(|&v| v as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+    let y_t = Tensor::empty(&[rows * cols], DType::Float32);
+    let grid = WarpGrid { rows: 4, cols: 1 };
+    let got = graph_launch(prog, &Lowering::uniform(&declared(target), false, grid), &[&x_t, &y_t]).unwrap();
+    let got: Vec<f64> = got.to_vec::<f32>().unwrap().into_iter().map(f64::from).collect();
+    assert_eq!(got, want[1]);
+}
+
+/// The configs the tuner admits for a fused projection that turns its
+/// heads ([`GemmCfg::turns`]), and a 256-wide tile across the last turned
+/// head, compute what the interpreter computes: 6 turned heads of 64 and 3
+/// plain ones, rows no tile divides, positions wrapping every 50 rows.
+#[test]
+fn turning_gemms_match_the_interpreter() {
+    let Some(planner) = super::device_planner() else { return };
+    let (m, n, k, d) = (200, 576, 128, 64);
+    let rope = Rope { heads: 6, head_dim: d, seq: 50 };
+    let epilogue = Epilogue { rope: Some(rope), ..Epilogue::DEFAULT };
+    let spec = GemmSpec { m, n, k, batch: Batch::Static(1), epilogue, cfg: BIG };
+    let ranked: Vec<GemmCfg> = planner.gemm_ranked(1, m, n, k, false).iter().copied().filter(|c| c.turns(d)).collect();
+    let build = |cfg| vec![(gemm::<BF16>(&GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
+    let shape = [1, m, n, k];
+    let (mut cfgs, _) =
+        super::tuned_on_device(&planner, ("gemm", DType::BFloat16, &shape), &ranked, <[_]>::to_vec, build);
+    let across = crate::ops::config::gemm_cfg([64, 256, 32], 2, [1, 4], false);
+    assert!(across.turns(d) && !(6 * d).is_multiple_of(256), "a tile across the last turned head");
+    cfgs.push(across);
+    let mut seed = 13;
+    let mut data = |n: usize| super::rounded(ScalarDType::BFloat16, n, &mut seed, |x| x);
+    let (a, b) = (data(m * k), data(n * k));
+    let (cos, sin): (Vec<f64>, Vec<f64>) = (0..rope.seq * d / 2)
+        .map(|i| {
+            let angle = (i / (d / 2)) as f64 * 10_000f64.powf(-2.0 * (i % (d / 2)) as f64 / d as f64);
+            (round_to(ScalarDType::BFloat16, angle.cos()), round_to(ScalarDType::BFloat16, angle.sin()))
+        })
+        .unzip();
+    let tensor = |v: &[f64]| Tensor::from_slice(v.iter().map(|&x| x as f32).collect::<Vec<_>>()).cast(DType::BFloat16);
+    let (a_t, b_t, cos_t, sin_t) = (tensor(&a), tensor(&b), tensor(&cos), tensor(&sin));
+    for cfg in &cfgs {
+        let prog = gemm::<BF16>(&GemmSpec { cfg: *cfg, ..spec.clone() });
+        let want = run(&prog, vec![a.clone(), b.clone(), cos.clone(), sin.clone(), vec![0.0; m * n]], &[]).unwrap();
+        let c_t = Tensor::empty(&[m * n], DType::BFloat16);
+        let got = graph_launch(prog, &cfg.lowering(&planner.device), &[&a_t, &b_t, &cos_t, &sin_t, &c_t]).unwrap();
+        let got: Vec<f32> = got.cast(DType::Float32).to_vec::<f32>().unwrap();
+        for (i, (g, w)) in got.iter().zip(&want[4]).enumerate() {
+            let diff = (*g as f64 - w).abs();
+            assert!(diff <= 1.6e-2 * w.abs().max(1.0), "{cfg:?}: c[{}, {}] = {g}, interpreter {w}", i / n, i % n);
+        }
+        eprintln!("{cfg:?}: matches");
     }
 }

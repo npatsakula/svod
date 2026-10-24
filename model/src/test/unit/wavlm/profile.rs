@@ -21,7 +21,7 @@ fn wavlm_forward_profile() {
     let mut cfg = wavlm_large_s80_md();
     cfg.max_batch_size = batch;
     let mut model = WavLm::empty(cfg);
-    let sd = cast_all(&model.state_dict(""), DType::Float16);
+    let sd = cast_all(&model.state_dict(""), DType::Float16).unwrap();
     for t in sd.values() {
         t.realize().unwrap();
     }

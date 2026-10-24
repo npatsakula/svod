@@ -236,8 +236,9 @@ impl Frame<'_> {
                     + (if self.prog.smem[alloc.index()].along == Axis::Row { c * rows + r } else { r * cols + c })
                         as i64,
             ),
-            Place::Global { offset, stride, bounds, rows, .. } => {
+            Place::Global { offset, stride, bounds, rows, period, .. } => {
                 let inside = |b: Option<ScalarId>, i: usize| b.map_or(Ok(true), |b| Ok((i as i64) < self.scalar(b)?));
+                let c = period.map_or(c, |p| c % p);
                 let at = |id: ScalarId| self.scalar_at(id, Some(r as i64));
                 let (row_ok, row_off) = match rows {
                     Some(map) => (map.valid.map_or(Ok(true), |v| Ok(at(v)? != 0))?, at(map.offset)?),
@@ -420,6 +421,10 @@ impl Frame<'_> {
             TileOp::Transpose { src } => {
                 let v = self.read(*src)?;
                 (0..rows * cols).map(|i| v[(i % cols) * rows + i / cols]).collect()
+            }
+            TileOp::SwapHalves { src, half } => {
+                let v = self.read(*src)?;
+                (0..rows * cols).map(|i| v[i ^ half]).collect()
             }
         };
         Ok(data.into_iter().map(|x| round_to(out.dtype, x)).collect())

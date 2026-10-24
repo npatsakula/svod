@@ -995,7 +995,7 @@ fn the_graph_scales_before_the_residual(act: Act, gated: bool) {
     let (m, n, k) = (5, 6, 4);
     let rows = if gated { 2 * n } else { n };
     let (x, w, b, r) = (f(&[m, k], 1), f(&[rows, k], 2), f(&[rows], 3), f(&[m, n], 4));
-    let opts = Linear { bias: Some(&b), act, gated, residual: Some(&r), scale: Some(-0.75) };
+    let opts = Linear { bias: Some(&b), act, gated, residual: Some(&r), scale: Some(-0.75), rope: None };
     let got = tk::linear(&x, &w, opts).unwrap().to_vec::<f32>().unwrap();
     let unscaled = Linear { residual: None, scale: None, ..opts };
     let y = tk::linear(&x, &w, unscaled).unwrap().to_vec::<f32>().unwrap();
@@ -1270,7 +1270,8 @@ fn heads_need_three_dims() {
 
 #[test_case(1024, Ok(vec![4, 8, 16]); "1024")]
 #[test_case(256, Ok(vec![4, 8, 16]); "256")]
-#[test_case(768, Err(Fallback::Shape); "not a power of two")]
+#[test_case(768, Ok(vec![4, 8, 16]); "768, three spans of 256")]
+#[test_case(384, Err(Fallback::Shape); "not a multiple of 256")]
 #[test_case(128, Err(Fallback::Shape); "narrower than a warp's loads")]
 #[test_case(4096, Err(Fallback::Shape); "wider than the measured range")]
 fn norm_plans(d: usize, want: Result<Vec<usize>, Fallback>) {
