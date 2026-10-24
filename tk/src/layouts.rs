@@ -323,28 +323,10 @@ impl TileLayout {
         };
         (0..dst.regs())
             .map(|j| {
-                // Each lane's moves in the first warp, and the lanes each move serves.
+                // Each lane's moves in the first warp.
                 let first: Vec<Option<Vec<(u32, u32)>>> = (0..lanes).map(|l| moves(0, l, j)).collect();
-                let mut serves: HashMap<(u32, u32), u64> = HashMap::new();
-                for (l, mv) in first.iter().enumerate() {
-                    for &mv in mv.iter().flatten() {
-                        *serves.entry(mv).or_default() |= 1 << l;
-                    }
-                }
-                let fill = (0..lanes).filter(|&l| first[l as usize].is_none()).fold(0u64, |a, l| a | 1 << l);
-                let mut open: u64 = (u64::MAX >> (64 - lanes)) & !fill;
-                let mut picks: Vec<Pick> = vec![];
-                while open != 0 {
-                    let lanes_of = |mv: (u32, u32)| serves[&mv] & open;
-                    // The same lane first, then the move serving the most lanes still open.
-                    let (mask, reg) = (0..lanes)
-                        .filter(|l| open >> l & 1 == 1)
-                        .flat_map(|l| first[l as usize].iter().flatten().copied())
-                        .max_by_key(|&mv| (lanes_of(mv).count_ones(), mv.0 == 0))?;
-                    let covered = lanes_of((mask, reg));
-                    open &= !covered;
-                    picks.push(Pick { mask, reg, lanes: covered });
-                }
+                let fill = fill_of(&first, lanes);
+                let picks = cover(&first, lanes)?;
                 let every_warp = (1..warps).all(|w| {
                     (0..lanes).all(|l| match moves(w, l, j) {
                         None => fill >> l & 1 == 1,
@@ -463,23 +445,8 @@ impl TileLayout {
         };
         (0..dst.regs())
             .map(|j| {
-                // Greedy cover: the move serving the most lanes still open, until none are.
-                let mut picks: Vec<Pick> = vec![];
-                let mut open: u64 = u64::MAX >> (64 - lanes);
-                while open != 0 {
-                    let lanes_of = |mv: (u32, u32)| {
-                        (0..lanes)
-                            .filter(|&m| open >> m & 1 == 1 && moves(0, m, j).contains(&mv))
-                            .fold(0u64, |a, m| a | 1 << m)
-                    };
-                    let (mask, reg) = (0..lanes)
-                        .filter(|l| open >> l & 1 == 1)
-                        .flat_map(|l| moves(0, l, j))
-                        .max_by_key(|&mv| lanes_of(mv).count_ones())?;
-                    let covered = lanes_of((mask, reg));
-                    open &= !covered;
-                    picks.push(Pick { mask, reg, lanes: covered });
-                }
+                let first: Vec<Option<Vec<(u32, u32)>>> = (0..lanes).map(|l| Some(moves(0, l, j))).collect();
+                let picks = cover(&first, lanes)?;
                 let every_warp = (1..warps).all(|w| {
                     picks.iter().all(|p| {
                         (0..lanes).filter(|l| p.lanes >> l & 1 == 1).all(|l| moves(w, l, j).contains(&(p.mask, p.reg)))
@@ -489,6 +456,37 @@ impl TileLayout {
             })
             .collect()
     }
+}
+
+/// The moves covering the lanes still open, fewest first: of each lane's
+/// candidate moves `first` (`None`: the lane has none, a fill), the move
+/// serving the most lanes still open is taken until every lane has one, the
+/// one staying in the lane (`mask` 0) preferred on a tie.
+fn cover(first: &[Option<Vec<(u32, u32)>>], lanes: u32) -> Option<Vec<Pick>> {
+    let mut serves: HashMap<(u32, u32), u64> = HashMap::new();
+    for (l, mv) in first.iter().enumerate() {
+        for &mv in mv.iter().flatten() {
+            *serves.entry(mv).or_default() |= 1 << l;
+        }
+    }
+    let mut open: u64 = (u64::MAX >> (64 - lanes)) & !fill_of(first, lanes);
+    let mut picks: Vec<Pick> = vec![];
+    while open != 0 {
+        let lanes_of = |mv: (u32, u32)| serves[&mv] & open;
+        let (mask, reg) = (0..lanes)
+            .filter(|l| open >> l & 1 == 1)
+            .flat_map(|l| first[l as usize].iter().flatten().copied())
+            .max_by_key(|&mv| (lanes_of(mv).count_ones(), mv.0 == 0))?;
+        let covered = lanes_of((mask, reg));
+        open &= !covered;
+        picks.push(Pick { mask, reg, lanes: covered });
+    }
+    Some(picks)
+}
+
+/// The lanes without a candidate move.
+fn fill_of(first: &[Option<Vec<(u32, u32)>>], lanes: u32) -> u64 {
+    (0..lanes).filter(|&l| first[l as usize].is_none()).fold(0u64, |a, l| a | 1 << l)
 }
 
 /// Where a destination layout's registers are held in a source layout.
