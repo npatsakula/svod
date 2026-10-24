@@ -733,6 +733,17 @@ pub struct Device {
     pub costs: Costs,
 }
 
+impl Device {
+    /// Whether a relayout across lanes takes the lane exchange whatever the
+    /// costs: on a target whose matrix atom for `dtype` cannot feed a
+    /// product from its accumulator (RDNA3's probabilities), so that the
+    /// shared memory a kernel declares is its config's alone
+    /// ([`crate::kernels::attention::FaCfg::smem_bytes`]).
+    pub fn pins_exchanges(&self, dtype: ScalarDType) -> bool {
+        self.target.geometry_of(dtype).is_some_and(|atom| !atom.accumulator_feeds(self.target.wave))
+    }
+}
+
 impl Costs {
     /// One pipeline trip's fixed overhead over a ring `stages` deep that
     /// `fill` fills, `unroll`ed or not: a ring of one slot pays its barrier

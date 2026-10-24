@@ -709,8 +709,7 @@ fn ranked_launches(planner: &Planner, shortlist_deep: bool) -> Vec<(Launch, (usi
                     cfg,
                 };
                 let launch = (format!("d{d} t{t} {cfg:?}"), attention::<BF16>(&spec), cfg.lowering(&planner.device));
-                let scratch = cfg.scratch_bytes(&planner.device.target);
-                launches.push((launch, (cfg.smem_bytes(d, false) + scratch, scratch)));
+                launches.push((launch, (cfg.smem_bytes(d, false), 0)));
             }
         }
     }
@@ -764,13 +763,12 @@ fn shared_bytes(linear: &Arc<UOp>) -> usize {
 }
 
 /// Every candidate the op layer may plan ([`ranked_launches`]) lowers (the
-/// tune store would otherwise time a failure), declaring the shared memory
-/// its ranking admitted it with: the rings as the config's `smem_bytes`
-/// counts them, so a `Rejected::Smem` is the kernel's own count; an
-/// attention config on a core whose accumulator cannot feed a product is
-/// admitted with the scratch its probabilities may cross besides
-/// ([`FaCfg::scratch_bytes`], a bound), and declares it or not as the
-/// inference decides.
+/// tune store would otherwise time a failure), declaring exactly the shared
+/// memory its ranking admitted it with: the rings as the config's
+/// `smem_bytes` counts them, so a `Rejected::Smem` is the kernel's own
+/// count — the probabilities' relayout pinned to the lane exchange where
+/// the accumulator cannot feed the product, a kernel of a no-feed config
+/// declares no scratch for them.
 #[test_case(amd(AmdArch::Gfx1100, 48), false; "gfx1100")]
 #[test_case(amd(AmdArch::Gfx1201, 64), true; "gfx1201")]
 #[test_case(amd(AmdArch::Gfx1151, 40), false; "gfx1151")]
@@ -785,11 +783,8 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
         launches.iter().map(|(name, ..)| name.clone()).zip(admitted).collect();
     each(launches, |name, prog, lowering| {
         let declared = shared_bytes(&linear(prog, &lowering));
-        let (smem, bound) = admitted[name];
-        assert!(
-            declared == smem || declared + bound == smem,
-            "declares {declared} bytes of shared memory, admitted with {smem} ({bound} of them a bound)"
-        );
+        let (smem, _) = admitted[name];
+        assert_eq!(declared, smem, "declares its admission's shared memory");
     });
 }
 
@@ -1163,20 +1158,22 @@ fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
     assert!(votes.iter().all(|(_, sunk)| !sunk), "{votes:?}:\n{asm}");
 }
 
-/// Where the accumulator cannot feed the P·V product (RDNA3), whether the
-/// probabilities cross shared memory is the whole program's and the
-/// costs' call, not the config's. Under the Strix Halo's store
+/// Where the accumulator cannot feed the P·V product (RDNA3), the
+/// probabilities reach it through the lane exchange, never shared scratch,
+/// whatever the costs and whatever the masks: pinned
+/// ([`crate::layouts::TileLayout::relayout`]), a kernel of the config
+/// declares its rings alone. Under the Strix Halo's store
 /// ([`super::gfx1151_store_costs`]) the 32×128 block of head size 64
-/// exchanges them through lanes, with and without a key mask: the mask's
-/// lens row is one coalesced read (a `[1,128]` row of i32, its 512 bytes
-/// four lines however the lanes split them), where a line-an-element count
-/// had tipped the block onto the crossing the card refused at its 64 KB of
-/// rings alone ("local memory (73728) exceeds limit (65536)") — which is
-/// why the admission's [`FaCfg::scratch_bytes`] bounds whichever way the
-/// program decides.
-#[test_case(AttnMask::default(), 0; "plain")]
-#[test_case(AttnMask { key_mask: true, ..AttnMask::default() }, 0; "key mask")]
-fn the_probabilities_cross_shared_memory_as_the_program_decides(mask: AttnMask, scratch: usize) {
+/// exchanged them through lanes already, with and without a key mask (the
+/// mask's lens row one coalesced read, a `[1,128]` row of i32, its 512
+/// bytes four lines however the lanes split them), where a line-an-element
+/// count had once tipped it onto the crossing the card refused at its 64 KB
+/// of rings alone ("local memory (73728) exceeds limit (65536)") — the pin
+/// takes that choice away, so the 64 KB-exact tile a card has room for is
+/// admitted and nothing declares past the limit.
+#[test_case(AttnMask::default(); "plain")]
+#[test_case(AttnMask { key_mask: true, ..AttnMask::default() }; "key mask")]
+fn the_probabilities_reach_pv_through_the_lanes_on_a_no_feed_target(mask: AttnMask) {
     let target = amd(AmdArch::Gfx1151, 40);
     let device = crate::atoms::Device { target: target.clone(), costs: super::gfx1151_store_costs() };
     let cfg = crate::kernels::attention::FaCfg::new(32, 128, 2);
@@ -1193,6 +1190,5 @@ fn the_probabilities_cross_shared_memory_as_the_program_decides(mask: AttnMask, 
         cfg,
     };
     let declared = shared_bytes(&linear(attention::<F16>(&spec), &cfg.lowering(&device)));
-    assert_eq!(declared, cfg.smem_bytes(64, false) + scratch);
-    assert!(scratch <= cfg.scratch_bytes(&target));
+    assert_eq!(declared, cfg.smem_bytes(64, false), "its rings alone, at the target's whole 64 KB");
 }

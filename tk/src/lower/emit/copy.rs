@@ -216,7 +216,11 @@ impl Emit<'_> {
 
     pub(super) fn relayout(&mut self, dst: ValId, src: ValId) -> Result<()> {
         let (ls, ld) = (self.layout(src).clone(), self.layout(dst).clone());
-        match ls.relayout(&ld, self.grid_warps(), self.low.device.target.wave, &self.low.device.costs) {
+        // A layout the program pins is its author's call (a probe's forced
+        // pair); the inference's relayouts alone are pinned.
+        let pinned = self.prog.pins.iter().any(|(p, _)| p == &src);
+        let pin = !pinned && self.low.device.pins_exchanges(self.value(src).dtype);
+        match ls.relayout(&ld, self.grid_warps(), self.low.device.target.wave, &self.low.device.costs, pin) {
             Relayout::Identity => {
                 let buf = self.reg_buf(src);
                 let root = self.root(dst);

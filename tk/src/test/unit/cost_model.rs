@@ -199,8 +199,7 @@ fn cost_model_replay() {
         attentions.into_iter().zip(ATTENTION_SHAPES.into_iter().filter(|s| wanted(s.0)))
     {
         let row = |c: &FaCfg| {
-            let (smem, regs) =
-                (c.smem_bytes(d, false) + c.scratch_bytes(target), c.registers(target, d, false).expect("ranked"));
+            let (smem, regs) = (c.smem_bytes(d, false), c.registers(target, d, false).expect("ranked"));
             (format!("{c:?}"), at_once(batch * heads * t.div_ceil(c.bq), smem, regs, c.warps()))
         };
         print(label, ranked.iter().map(row).collect(), ns);

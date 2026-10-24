@@ -400,7 +400,7 @@ fn attention_matches_a_direct_softmax(spec: AttnSpec, lens: &[i64]) {
     let target = planner.device.target.clone();
     let spec = AttnSpec { cfg: FaCfg { stages: target.fill.stages(spec.cfg.stages), ..spec.cfg }, ..spec };
     let bias = spec.mask.bias.is_some();
-    let smem = spec.cfg.smem_bytes(spec.d, bias) + spec.cfg.scratch_bytes(&target);
+    let smem = spec.cfg.smem_bytes(spec.d, bias);
     if !spec.cfg.fits(&target, spec.d, bias) || smem > target.smem_bytes {
         return eprintln!("skipped on the device: {:?} does not fit {}", spec.cfg, target.arch.target_name());
     }

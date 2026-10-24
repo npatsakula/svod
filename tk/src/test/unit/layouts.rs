@@ -116,7 +116,7 @@ fn attention_probabilities_feed_the_second_mma_without_data_movement() {
     let (from, to) = (lay[src.index()].as_ref().unwrap(), lay[dst.index()].as_ref().unwrap());
     assert_eq!(from.frag, frag::mma_sync_c());
     assert_eq!(to.frag, frag::mma_sync_a());
-    assert_eq!(from.relayout(to, 4, 32, &costs()), Relayout::Identity);
+    assert_eq!(from.relayout(to, 4, 32, &costs(), false), Relayout::Identity);
     assert_eq!(lay[q_r.0.index()].as_ref().unwrap().frag, frag::mma_sync_a());
     let m_l = lay[m.0.index()].as_ref().unwrap();
     assert_eq!((m_l.frag.in_size(Dim::Reg), m_l.shape()), (2, Shape::new(bq, 1)), "two rows per lane");
@@ -347,7 +347,7 @@ fn gfx1151_attention_folds(prog: Program, costs: &Costs) -> (Vec<Orient>, Vec<(T
 #[test]
 fn rdna3_attention_trades_probabilities_between_half_waves() {
     let (orients, pairs) = gfx1151_attention(attention_step(false), &costs());
-    let relayouts: Vec<Relayout> = pairs.iter().map(|(from, to)| from.relayout(to, 4, 32, &costs())).collect();
+    let relayouts: Vec<Relayout> = pairs.iter().map(|(from, to)| from.relayout(to, 4, 32, &costs(), false)).collect();
     assert_eq!(orients[0], Orient::Swapped, "QKᵀ: {orients:?}");
     assert_eq!(relayouts.len(), 1, "only P changes role: {relayouts:?}");
     let Relayout::Exchange(picks) = &relayouts[0] else { panic!("an exchange: {:?}", relayouts[0]) };
@@ -357,40 +357,38 @@ fn rdna3_attention_trades_probabilities_between_half_waves() {
 /// Biased scores weigh the bias's scattered lines against the folds' lane
 /// moves. Direct, the bias is read along its rows, but a row of scores
 /// spreads over 16 lanes: its maximum folds in four DPP moves for each of a
-/// lane's 8 rows (32), and P reaches PV through shared memory alone. Swapped,
-/// a lane holds a query: one `permlanex16` folds its row and the half-waves
-/// trade P (1.5 moves an element), but the bias is read a row per lane, its
-/// row a line of its own. Over 4 warps of 32 lanes, a 64×16 bias over rows
-/// 128 bytes apart touches 64 lines for 2048 bytes, 48 past what the bytes
-/// take coalesced, and P at the declared [`costs`] (a lane move 1, a round
-/// trip 8) makes direct cost `8·1024 + 32·128 = 12288` and swapped
-/// `1.5·1024 + 1·128 + 48·scatter`: they cross at a scattered line of
-/// 221.7 — one line where the read's bytes are a lane's 16 elements wide
-/// the old count charged 1024 of.
-#[test_case(8.0, Orient::Swapped; "a line at a round trip's cost: the folds decide")]
-#[test_case(221.0, Orient::Swapped; "just under the crossover")]
-#[test_case(222.0, Orient::Direct; "just over it: the bias is read along its rows")]
-fn rdna3_biased_attention_weighs_scattered_lines_against_fold_moves(scatter: f64, qk: Orient) {
+/// lane's 8 rows (32), and P — pinned to the exchange — reaches PV by a
+/// cover dear enough (a lane's pieces of sixteen scores each, work in the
+/// forties an element) that the swapped way wins at any line cost. Swapped,
+/// a lane holds a query: one `permlanex16` folds its row, the half-waves
+/// trade P (1.5 moves an element), and the bias is read a row per lane, its
+/// row a line of its own (a scattered line still priced: over 4 warps of 32
+/// lanes a 64×16 bias over rows 128 bytes apart touches 64 lines for 2048
+/// bytes, 48 past what the bytes take coalesced — the old line-an-element
+/// count charged 1024 of, crossing over a round trip it no longer pays).
+#[test_case(8.0; "a line at a lane move's cost")]
+#[test_case(222.0; "past the crossing a round trip once made")]
+#[test_case(900.0; "a line dearer than any round trip")]
+fn rdna3_biased_attention_reads_its_bias_along_a_lane_a_line(scatter: f64) {
     let costs = Costs { scatter, ..costs() };
     let (orients, pairs, folds) = gfx1151_attention_folds(attention_step(true), &costs);
-    assert_eq!(orients, [qk, Orient::Direct], "QKᵀ, PV");
+    assert_eq!(orients, [Orient::Swapped, Orient::Direct], "QKᵀ, PV, whatever a line costs");
     assert_eq!(pairs.len(), 1, "only P changes role");
-    let relayout = pairs[0].0.relayout(&pairs[0].1, 4, 32, &costs);
-    let (fold, exchanged) = (folds, matches!(relayout, Relayout::Exchange(_)));
-    match qk {
-        Orient::Direct => assert_eq!((fold, relayout), (vec![32], Relayout::ViaSmem)),
-        Orient::Swapped => assert_eq!((fold, exchanged, relayout.work()), (vec![1], true, 1.5)),
-    }
+    let relayout = pairs[0].0.relayout(&pairs[0].1, 4, 32, &costs, true);
+    assert_eq!((folds, matches!(relayout, Relayout::Exchange(_)), relayout.work()), (vec![1], true, 1.5));
 }
 
-/// Where a lane move costs more than a round trip through shared memory, P
-/// reaches PV through shared memory: no exchange is inserted.
+/// Where a lane move costs more than a round trip through shared memory and
+/// no pin holds, P would reach PV through shared memory: no exchange. On a
+/// no-feed target the pin holds and the exchange is taken however dear a
+/// move ([`TileLayout::relayout`]), the count of what a kernel declares the
+/// config's alone.
 #[test]
 fn rdna3_attention_takes_the_round_trip_where_lane_moves_are_dear() {
     let (_, pairs) = gfx1151_attention(attention_step(false), &lane_moves_dear());
     assert!(!pairs.is_empty());
     for (from, to) in &pairs {
-        assert_eq!(from.relayout(to, 4, 32, &lane_moves_dear()), Relayout::ViaSmem);
+        assert_eq!(from.relayout(to, 4, 32, &lane_moves_dear(), false), Relayout::ViaSmem);
     }
 }
 
@@ -400,10 +398,10 @@ fn rdna3_attention_takes_the_round_trip_where_lane_moves_are_dear() {
 fn an_exchange_turns_into_the_round_trip_when_its_moves_cost_as_much() {
     let (_, pairs) = gfx1151_attention(attention_step(false), &costs());
     let (from, to) = &pairs[0];
-    let exchange = from.relayout(to, 4, 32, &costs());
+    let exchange = from.relayout(to, 4, 32, &costs(), false);
     assert!(matches!(exchange, Relayout::Exchange(_)), "an exchange: {exchange:?}");
     let k = exchange.work();
-    let at = |lane_move: f64| from.relayout(to, 4, 32, &Costs { lane_move, ..costs() });
+    let at = |lane_move: f64| from.relayout(to, 4, 32, &Costs { lane_move, ..costs() }, false);
     let even = costs().smem_trip / k;
     assert_eq!(at(even), Relayout::ViaSmem, "{k} moves at the round trip's cost");
     assert!(matches!(at(even * 0.99), Relayout::Exchange(_)), "{k} moves just under it");
@@ -439,7 +437,7 @@ fn exchange_work_counts_moves_and_selects(regs: &[&[(u32, u32)]], work: f64) {
 fn a_half_swap_moves_and_selects_once_per_register(lane: u32, mask: u32) {
     let plain = natural(Shape::new(64, 64), 4, 32).unwrap();
     let held = crate::probe::half_swapped(&plain, lane);
-    let exchange = plain.relayout(&held, 4, 32, &Costs { lane_move: 0.0, ..costs() });
+    let exchange = plain.relayout(&held, 4, 32, &Costs { lane_move: 0.0, ..costs() }, false);
     let Relayout::Exchange(p) = &exchange else { panic!("an exchange: {exchange:?}") };
     let masks: HashSet<u32> = p.iter().flatten().map(|p| p.mask).collect();
     assert_eq!(masks, HashSet::from([0, mask]));

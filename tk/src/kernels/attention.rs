@@ -176,26 +176,17 @@ impl FaCfg {
 
     /// Static shared memory in bytes: the K and V rings of a 16-bit type (and
     /// the bias ring, [`bias_ring`](Self::bias_ring)), one set per key warp
-    /// (the states key warps merge through reuse their rings).
+    /// (the states key warps merge through reuse their rings) — all of it:
+    /// where the core's accumulator cannot feed the P·V product (RDNA3), the
+    /// probabilities' relayout is pinned to the lane exchange
+    /// ([`crate::layouts::TileLayout::relayout`]), so a kernel of the config
+    /// declares no scratch for them. (A shared crossing, which the costs
+    /// could choose before, the card may refuse: the Strix Halo's "local
+    /// memory (73728) exceeds limit (65536)", a 32×128 block of head size 64
+    /// whose rings alone are its whole 64 KB.)
     pub fn smem_bytes(&self, d: usize, bias: bool) -> usize {
         let slot = 2 * self.bkv * d + usize::from(self.bias_ring(bias)) * self.bq * self.bkv;
         self.key_warps * self.stages * slot * 2
-    }
-
-    /// The shared scratch the probabilities may cross to become the P·V
-    /// operand where the core's accumulator cannot feed a product as it
-    /// stands (RDNA3): the 16-bit tile, one per key warp. A bound: the
-    /// lowering declares it only where the inference re-holds the tile
-    /// through shared memory rather than a lane exchange, which the whole
-    /// program and the device's costs decide (under the Strix Halo's costs
-    /// a 32×128 block of head size 64 crosses it under a key mask and
-    /// exchanges without one), so no count from the config alone is the
-    /// kernel's. Nothing where the accumulator feeds.
-    pub fn scratch_bytes(&self, target: &Target) -> usize {
-        match target.geometry() {
-            Some(atom) if !atom.accumulator_feeds(target.wave) => self.key_warps * self.bq * self.bkv * 2,
-            _ => 0,
-        }
     }
 }
 

@@ -269,7 +269,7 @@ fn a_relayout_through_shared_memory_needs_no_zero_of_the_program() {
     let (tile, lanes) = (Shape::new(16, 32), 32);
     let [from, to] = [Axis::Col, Axis::Row].map(|walk| chunked(tile, 4, 1, lanes, walk).expect("a chunked layout"));
     let costs = super::lane_moves_dear();
-    assert_eq!(from.relayout(&to, 1, lanes, &costs), Relayout::ViaSmem);
+    assert_eq!(from.relayout(&to, 1, lanes, &costs, false), Relayout::ViaSmem);
     let mut k = Kernel::new("relayout");
     k.warps(1);
     let x = k.param::<F32>("x", ParamKind::In, 2 * tile.elems());

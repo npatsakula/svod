@@ -960,7 +960,9 @@ impl<'a> Probes<'a> {
         let (warps, lanes) = (self.warps, self.target.wave);
         let work: f64 = helds
             .iter()
-            .flat_map(|h| [plain.relayout(h, warps, lanes, &costs), h.relayout(plain, warps, lanes, &costs)])
+            .flat_map(|h| {
+                [plain.relayout(h, warps, lanes, &costs, false), h.relayout(plain, warps, lanes, &costs, false)]
+            })
             .map(|r| r.work())
             .sum();
         let units = iters as f64 * work * tile.elems() as f64 / warps as f64;

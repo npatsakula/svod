@@ -1022,7 +1022,7 @@ fn a_bias_rides_its_own_ring_slot(target: Target) {
     let planner = planner(target.clone());
     let ranked = planner.attention_ranked(8, 512, 512, 64, false, true);
     assert!(!ranked.is_empty());
-    let within = |c: &FaCfg| c.smem_bytes(64, true) + c.scratch_bytes(&target) <= target.smem_bytes;
+    let within = |c: &FaCfg| c.smem_bytes(64, true) <= target.smem_bytes;
     assert!(ranked.iter().all(|c| c.fits(&target, 64, true) && within(c)), "{ranked:?}");
     let biased = config::AttentionProblem { tiles: 8, t: 512, tk: 512, d: 64, causal: false, bias: true };
     let plain = config::AttentionProblem { bias: false, ..biased };
@@ -1209,7 +1209,6 @@ fn attention_candidates(d: usize, smem: usize) {
     assert!(list.iter().all(|c| c.smem_bytes(d, false) <= smem && c.fits(&target, d, false)), "{list:?}");
     for (i, c) in list.iter().enumerate() {
         assert!(!list[..i].contains(c), "{c:?} twice");
-        assert_eq!(c.scratch_bytes(&target), 0);
     }
     let short = first_eight(&list);
     assert!(short.len() >= 4, "{short:?}");
@@ -1939,11 +1938,11 @@ fn rdna_plans_register_staged_kernels() {
         let q = ext(&[1, t, 8, d]);
         let fa =
             kernel_plan(shape::attention(Some(&planner(target.clone())), &[BF16; 3], Some(&q), Some(&q), false, false));
-        let within = |c: &FaCfg| c.smem_bytes(d, false) + c.scratch_bytes(&target) <= 64 << 10;
+        let within = |c: &FaCfg| c.smem_bytes(d, false) <= 64 << 10;
         assert!(fa.iter().all(|c| c.stages == 2 && within(c)), "{fa:?}");
         assert!(
-            fa.iter().all(|c| c.scratch_bytes(&target) == c.key_warps * c.bq * c.bkv * 2),
-            "RDNA3 may re-hold its probabilities"
+            fa.iter().any(|c| c.smem_bytes(64, false) == 64 << 10),
+            "a 64 KB-exact tile is admitted: its probabilities exchange, not cross"
         );
     }
     assert!(matches!(
@@ -1954,13 +1953,14 @@ fn rdna_plans_register_staged_kernels() {
 
 /// Two atom rows per warp are a variant of a tile, never its representative:
 /// the d64 biased attention's shortlist on gfx1151 (under its measured
-/// costs; its 128×64 tile's rings and bias ring fill the 64 KB, which the
-/// scratch its probabilities may cross puts past them) and gfx1201 is the
+/// costs; its 128×64 tile's rings and bias ring fill the 64 KB exactly,
+/// admitted now that its probabilities exchange rather than cross — the
+/// crossing would put them past the limit) and gfx1201 is the
 /// one of a lattice without the variant, tile for tile, and every two-row
 /// config follows its one-row twin, from blocks of 64 queries, so the
 /// twins stage times it beside the contender tiles. On gfx942 the d128
 /// pick's tile carries its two-row pipelines as twins.
-#[test_case(gfx1151_planner(), &[(128, 32), (64, 32), (64, 16), (64, 64), (32, 16), (32, 32), (32, 64), (16, 16), (16, 32), (16, 64)]; "gfx1151")]
+#[test_case(gfx1151_planner(), &[(128, 64), (128, 32), (64, 32), (64, 16), (64, 64), (32, 16), (32, 32), (32, 64), (16, 16), (16, 32), (16, 64)]; "gfx1151")]
 #[test_case(planner(gfx1201()), &[(128, 64), (128, 32), (64, 32), (64, 64), (64, 16), (32, 32), (32, 16), (32, 64), (16, 32), (16, 16), (16, 64)]; "gfx1201")]
 fn two_atom_rows_are_a_variant_not_a_tile(target: Planner, tiles: &[(usize, usize)]) {
     use crate::ops::config::{representatives, shortlist};

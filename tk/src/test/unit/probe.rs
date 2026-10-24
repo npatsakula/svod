@@ -397,7 +397,7 @@ fn relayouts(target: &Target, p: &Probe, i: usize) -> Vec<Relayout> {
     tile.walk()
         .filter_map(|(_, s)| match s {
             Stmt::Let { dst, op: TileOp::Relayout { src } } => {
-                Some(lay(*src).relayout(&lay(*dst), tile.warps, target.wave, &lowering.device.costs))
+                Some(lay(*src).relayout(&lay(*dst), tile.warps, target.wave, &lowering.device.costs, false))
             }
             _ => None,
         })

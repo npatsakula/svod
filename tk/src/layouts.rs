@@ -370,13 +370,17 @@ impl TileLayout {
 
     /// How `self` becomes `dst`, for `warps` warps of `lanes` lanes: lanes
     /// trade registers by lane moves while that is cheaper per element than
-    /// a round trip through shared memory.
-    pub fn relayout(&self, dst: &Self, warps: u32, lanes: u32, costs: &Costs) -> Relayout {
+    /// a round trip through shared memory — or, `pin`ned (a target whose
+    /// accumulator cannot feed a product re-holds that way whatever the
+    /// costs), whenever an exchange covers.
+    pub fn relayout(&self, dst: &Self, warps: u32, lanes: u32, costs: &Costs, pin: bool) -> Relayout {
         match self.held(dst, warps, lanes) {
             Held::InLane(perm) if is_identity(&perm) => Relayout::Identity,
             Held::InLane(perm) => Relayout::RegPermute(perm),
             Held::AcrossLanes(holders) => match self.exchange(dst, &holders, warps, lanes).map(Relayout::Exchange) {
-                Some(exchange) if exchange.cost_per_element(costs) < Relayout::ViaSmem.cost_per_element(costs) => {
+                Some(exchange)
+                    if pin || exchange.cost_per_element(costs) < Relayout::ViaSmem.cost_per_element(costs) =>
+                {
                     exchange
                 }
                 _ => Relayout::ViaSmem,
@@ -1091,8 +1095,16 @@ fn orient_products(prog: &mut Program, device: &Device, grid: WarpGrid, core: Co
             .iter()
             .map(|((pos, v), want)| match &it.lay[v.index()] {
                 Some(have) => {
+                    // As the emitter pins: a value the program pins is its
+                    // author's call, the inference's relayouts alone pinned.
+                    let pinned = trial.pins.iter().any(|(p, _)| p == v);
+                    let pin = !pinned
+                        && target
+                            .geometry_of(trial.value(*v).dtype)
+                            .is_some_and(|atom| !atom.accumulator_feeds(target.wave));
                     let elems = trial.value(*v).shape.elems() as f64;
-                    let unit = have.relayout(want, grid.count(), target.wave, costs).cost_per_element(costs) * elems;
+                    let unit =
+                        have.relayout(want, grid.count(), target.wave, costs, pin).cost_per_element(costs) * elems;
                     unit * terms[*pos].0
                 }
                 None => 0.0,
