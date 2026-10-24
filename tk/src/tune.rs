@@ -207,6 +207,9 @@ fn emitted(prog: &Program, lowering: &Lowering) -> Option<(u64, Arc<UOp>)> {
     Some((emitted, lowered.program))
 }
 
+/// A program lowered (or found not to lower), with what it emits.
+type Lowered = HashMap<u64, Option<(u64, Arc<UOp>)>>;
+
 /// What a program is made of, which keys what it emits: the program and
 /// its lowering whole.
 pub(crate) fn made_of(prog: &Program, lowering: &Lowering) -> u64 {
@@ -220,7 +223,7 @@ pub(crate) fn made_of(prog: &Program, lowering: &Lowering) -> u64 {
 /// way until its inputs change, so its compile is refused without lowering it
 /// again.
 #[derive(Default)]
-pub(crate) struct Lowerings(pub(crate) Mutex<HashMap<u64, Option<(u64, Arc<UOp>)>>>);
+pub(crate) struct Lowerings(pub(crate) Mutex<Lowered>);
 
 impl Lowerings {
     /// What the fingerprint left for `made_of`: what the program emits and
@@ -470,7 +473,7 @@ impl TuneStore {
         self.record_emitted(&found);
         let known = memo.lock().expect("emitted memo");
         let emitted: Vec<Vec<u64>> = made_of.iter().map(|c| c.iter().map(|m| known[m]).collect()).collect();
-        (digest(&emitted), emitted.iter().map(|e| digest(e)).collect())
+        (digest(&emitted), emitted.iter().map(digest).collect())
     }
 
     /// `prog` lowered under `lowering` ([`crate::lower::standalone`]),

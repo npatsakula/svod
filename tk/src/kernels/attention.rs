@@ -5,7 +5,7 @@ use std::fmt;
 
 use super::rows::NormCfg;
 use super::{Batch, batch_offset, bound, load_f32};
-use crate::atoms::{Core, Device, Target};
+use crate::atoms::{Core, Device};
 use crate::build::*;
 use crate::ir::*;
 use crate::lower::Lowering;
