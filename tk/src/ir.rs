@@ -299,6 +299,13 @@ pub enum TileOp {
         src: ValId,
         j: u32,
         col: bool,
+        /// The source column each element takes, per row of the result, as
+        /// the layouts the inference assigned hold them
+        /// ([`crate::layouts::TileLayout::dealt`]): the device's order,
+        /// recorded once laid so the interpreter replays it. `None` until
+        /// then (and in a program never lowered): the fallback order,
+        /// column `c·n + j`.
+        order: Option<Vec<Vec<u32>>>,
     },
     /// The same elements held under the layout its consumer needs; inserted
     /// by the layout inference, never by an author (who pins layouts instead).

@@ -1165,14 +1165,17 @@ fn the_next_steps_loads_stay_above_a_vote(arch: AmdArch) {
 
 /// Where the accumulator cannot feed the P·V product (RDNA3), whether the
 /// probabilities cross shared memory is the whole program's and the
-/// costs' call, not the config's: under the Strix Halo's store
+/// costs' call, not the config's. Under the Strix Halo's store
 /// ([`super::gfx1151_store_costs`]) the 32×128 block of head size 64
-/// re-holds them through shared memory under a key mask (the card refused
-/// it admitted at its 64 KB of rings alone: "local memory (73728) exceeds
-/// limit (65536)") and exchanges them through lanes without one. The
-/// admission's [`FaCfg::scratch_bytes`] bounds both.
+/// exchanges them through lanes, with and without a key mask: the mask's
+/// lens row is one coalesced read (a `[1,128]` row of i32, its 512 bytes
+/// four lines however the lanes split them), where a line-an-element count
+/// had tipped the block onto the crossing the card refused at its 64 KB of
+/// rings alone ("local memory (73728) exceeds limit (65536)") — which is
+/// why the admission's [`FaCfg::scratch_bytes`] bounds whichever way the
+/// program decides.
 #[test_case(AttnMask::default(), 0; "plain")]
-#[test_case(AttnMask { key_mask: true, ..AttnMask::default() }, 32 * 128 * 2; "key mask")]
+#[test_case(AttnMask { key_mask: true, ..AttnMask::default() }, 0; "key mask")]
 fn the_probabilities_cross_shared_memory_as_the_program_decides(mask: AttnMask, scratch: usize) {
     let target = amd(AmdArch::Gfx1151, 40);
     let device = crate::atoms::Device { target: target.clone(), costs: super::gfx1151_store_costs() };

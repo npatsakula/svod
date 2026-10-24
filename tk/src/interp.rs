@@ -451,14 +451,15 @@ impl Frame<'_> {
                     })
                     .collect()
             }
-            TileOp::Deal { src, j, col } => {
+            TileOp::Deal { src, j, col, order } => {
                 let s = self.prog.value(*src).shape;
                 let n = s.cols / cols;
                 let v = if *col { vec![] } else { self.read(*src)? };
                 (0..rows * cols)
                     .map(|i| {
-                        let at = (i % cols) * n + *j as usize;
-                        if *col { at as f64 } else { v[i / cols * s.cols + at] }
+                        let (r, c) = (i / cols, i % cols);
+                        let at = order.as_ref().map_or(c * n + *j as usize, |o| o[r][c * n + *j as usize] as usize);
+                        if *col { at as f64 } else { v[r * s.cols + at] }
                     })
                     .collect()
             }

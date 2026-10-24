@@ -268,7 +268,9 @@ fn attention_step(bias: bool) -> Program {
     let (bq, bkv, d) = (64usize, 16usize, 64usize);
     let mut k = Kernel::new("fa");
     let q = k.param::<BF16>("q", ParamKind::In, bq * d);
-    let b = k.param::<BF16>("bias", ParamKind::In, bq * bkv);
+    // Rows a line apart, as the kernel's bias views are (`bias_stride`):
+    // a lane's row is a line of its own.
+    let b = k.param::<BF16>("bias", ParamKind::In, bq * 64);
     let kk = k.smem::<BF16>("k", bkv * d);
     let vv = k.smem::<BF16>("v", bkv * d);
     let q_g = k.view(q, 0, [d, 1], Shape::new(bq, d), [None, None]);
@@ -278,7 +280,7 @@ fn attention_step(bias: bool) -> Program {
     let zero = k.zeros::<F32>(Shape::new(bq, bkv));
     let mut s = k.mma(zero, q_r, false, k_s, true);
     if bias {
-        let b_g = k.view(b, 0, [bkv, 1], Shape::new(bq, bkv), [None, None]);
+        let b_g = k.view(b, 0, [64, 1], Shape::new(bq, bkv), [None, None]);
         let b_r = k.load(b_g);
         let b_r = k.cast::<BF16, F32>(b_r);
         s = k.binary(s, b_r, BinaryOp::Add);
@@ -357,14 +359,17 @@ fn rdna3_attention_trades_probabilities_between_half_waves() {
 /// spreads over 16 lanes: its maximum folds in four DPP moves for each of a
 /// lane's 8 rows (32), and P reaches PV through shared memory alone. Swapped,
 /// a lane holds a query: one `permlanex16` folds its row and the half-waves
-/// trade P (1.5 moves an element), but the bias is read a row per lane, a
-/// line per lane. Over 4 warps of 32 lanes, a 64×16 bias and P at the
-/// declared [`costs`] (a lane move 1, a round trip 8), direct costs
-/// `8·1024 + 32·128 = 12288` and swapped `1.5·1024 + 1·128 + 1024·scatter`:
-/// they cross at a scattered element of 10.375.
+/// trade P (1.5 moves an element), but the bias is read a row per lane, its
+/// row a line of its own. Over 4 warps of 32 lanes, a 64×16 bias over rows
+/// 128 bytes apart touches 64 lines for 2048 bytes, 48 past what the bytes
+/// take coalesced, and P at the declared [`costs`] (a lane move 1, a round
+/// trip 8) makes direct cost `8·1024 + 32·128 = 12288` and swapped
+/// `1.5·1024 + 1·128 + 48·scatter`: they cross at a scattered line of
+/// 221.7 — one line where the read's bytes are a lane's 16 elements wide
+/// the old count charged 1024 of.
 #[test_case(8.0, Orient::Swapped; "a line at a round trip's cost: the folds decide")]
-#[test_case(10.25, Orient::Swapped; "just under the crossover")]
-#[test_case(10.5, Orient::Direct; "just over it: the bias is read along its rows")]
+#[test_case(221.0, Orient::Swapped; "just under the crossover")]
+#[test_case(222.0, Orient::Direct; "just over it: the bias is read along its rows")]
 fn rdna3_biased_attention_weighs_scattered_lines_against_fold_moves(scatter: f64, qk: Orient) {
     let costs = Costs { scatter, ..costs() };
     let (orients, pairs, folds) = gfx1151_attention_folds(attention_step(true), &costs);

@@ -376,6 +376,59 @@ fn a_deal_takes_a_column_of_each_run(w: usize) {
     }
 }
 
+/// A lowered deal carries the order the device's layouts rename registers
+/// by ([`TileOp::Deal`]'s `order`): every row a permutation of the source's
+/// columns, and the interpreter replaying it keeps each dealt value the one
+/// at its recorded column, `col` its index — the pair the device holds,
+/// whatever order that is.
+#[test]
+fn a_lowered_deal_replays_the_devices_order() {
+    use crate::atoms::sm86;
+    use crate::lower::Lowering;
+    let (rows, cols, depth, w) = (64usize, 64usize, 32usize, 8usize);
+    let n = cols / w;
+    let mut k = Kernel::new("dealt");
+    let x = k.param::<BF16>("x", ParamKind::In, rows * depth);
+    let c = k.param::<BF16>("c", ParamKind::In, cols * depth);
+    let (y, at) = (k.param::<F32>("y", ParamKind::Out, rows * cols), k.param::<I32>("at", ParamKind::Out, rows * cols));
+    k.warps(4);
+    let xv = k.view(x, 0, [depth, 1], Shape::new(rows, depth), [None, None]);
+    let cv = k.view(c, 0, [depth, 1], Shape::new(cols, depth), [None, None]);
+    let (xr, cr) = (k.load(xv), k.load(cv));
+    let zero = k.zeros::<F32>(Shape::new(rows, cols));
+    let s = k.mma(zero, xr, false, cr, true);
+    for j in 0..n {
+        let (v, col) = (k.deal(s, w, j), k.deal_col(s, w, j));
+        let yv = k.view(y, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(yv, v);
+        let av = k.view(at, j * w, [cols, 1], Shape::new(rows, w), [None, None]);
+        k.store(av, col);
+    }
+    let lowered = crate::lower::standalone(k.finish(), &Lowering::new(&super::declared(sm86()))).unwrap();
+    let mut orders = 0;
+    for (_, stmt) in lowered.tile.walk() {
+        let Stmt::Let { op: TileOp::Deal { src, order, .. }, .. } = stmt else { continue };
+        let Some(order) = order else { continue };
+        orders += 1;
+        let cols = lowered.tile.value(*src).shape.cols;
+        for row in order {
+            let mut sorted = row.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..cols as u32).collect::<Vec<_>>(), "a row's columns once");
+        }
+    }
+    assert!(orders > 0, "the device's renaming order was recorded");
+    let mut seed = 5;
+    let xs = super::rounded(ScalarDType::BFloat16, rows * depth, &mut seed, |v| v);
+    let cs = super::rounded(ScalarDType::BFloat16, cols * depth, &mut seed, |v| v);
+    let params = vec![xs.clone(), cs.clone(), vec![0.0; rows * cols], vec![0.0; rows * cols]];
+    let got = run(&lowered.tile, params, &[]).unwrap();
+    for (i, (&v, &col)) in got[2].iter().zip(&got[3]).enumerate() {
+        let want = (0..depth).map(|e| xs[i / cols * depth + e] * cs[col as usize * depth + e]).sum::<f64>();
+        assert!((v - want).abs() <= 1e-3 * want.abs().max(1.0), "element {i} = {v} at column {col}");
+    }
+}
+
 /// A deal's width divides its source's columns.
 #[test]
 #[should_panic(expected = "deal")]

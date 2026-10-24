@@ -593,7 +593,7 @@ impl Kernel {
     fn dealt<T: Elem, U: Elem>(&mut self, src: Regs<T>, w: usize, j: usize, col: bool) -> Regs<U> {
         let shape = self.shape(src);
         assert!(w > 0 && shape.cols.is_multiple_of(w) && j < shape.cols / w, "deal {j} of {shape:?} by {w}");
-        self.let_(Shape::new(shape.rows, w), TileOp::Deal { src: src.0, j: j as u32, col })
+        self.let_(Shape::new(shape.rows, w), TileOp::Deal { src: src.0, j: j as u32, col, order: None })
     }
 
     /// Hold `v` under `layout` (see [`Program::pins`]).
