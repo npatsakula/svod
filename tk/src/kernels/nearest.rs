@@ -1316,16 +1316,10 @@ pub fn nearest_select(spec: &SelectSpec) -> Program {
     let tau = kth(&mut k, &list);
     let queue: Vec<[Regs<F32>; 2]> = (0..depth).map(|_| empty(&mut k)).collect();
 
-    // The queues sorted and merged into the list: the list's last runs
-    // ordered against the queues' reversed, then the list's bitonic order.
-    let merge = |k: &mut Kernel, mut list: Vec<[Regs<F32>; 2]>, mut queue: Vec<[Regs<F32>; 2]>| {
-        network(k, &mut queue, (1..=(depth * LANES).ilog2()).map(|b| 1 << b));
-        for t in runs - depth..runs {
-            let rev = queue[runs - 1 - t].map(|v| k.flip(v, Axis::Col, LANES as u32 - 1));
-            let first = before(k, list[t], rev);
-            list[t] = [0, 1].map(|j| k.where_(first, list[t][j], rev[j]));
-        }
-        network(k, &mut list, [runs * LANES]);
+    // The queues merged into the list ([`queued_into`]), the list's `top`-th
+    // back, and the queues empty again.
+    let merge = |k: &mut Kernel, list: Vec<[Regs<F32>; 2]>, queue: Vec<[Regs<F32>; 2]>| {
+        let list = queued_into(k, list, queue);
         let tau = kth(k, &list);
         let queue = (0..depth).map(|_| empty(k));
         list.into_iter().chain(queue).flatten().chain([tau]).collect::<Vec<_>>()
