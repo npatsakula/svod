@@ -83,6 +83,15 @@ fn timed<'a>(ns: &'a [Option<u64>], ran: &'a Cell<bool>) -> impl FnOnce() -> Vec
 /// knows the leaders and how close they ran; a second store on the directory
 /// reads it back without measuring; a kernel change (another program
 /// fingerprint) re-measures.
+/// A store line is its key, a space and the entry, the key's fields split
+/// at bars: an op name with either would never be read back.
+#[test_case("packed attention"; "a space")]
+#[test_case("attention|packed"; "a bar")]
+#[should_panic(expected = "a store line is split at spaces and bars")]
+fn an_op_name_splits_no_store_line(op: &'static str) {
+    TuneKey::new(op, &sm86(), 0, ScalarDType::BFloat16, &[1], &[0usize]);
+}
+
 #[test]
 fn a_winner_round_trips_through_the_store() {
     let dir = scratch("round-trip");

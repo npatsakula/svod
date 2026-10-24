@@ -173,7 +173,7 @@ impl Emit<'_> {
     /// and a column bound ends a 16-byte run, which such a load reads whole.
     pub(super) fn transposing(&self, l: &TileLayout, view: &View) -> Option<Vec<u32>> {
         let [sub_r, sub_c] = l.sub_shape();
-        let Some(Place::Global { bounds, .. }) = view.place else { return None };
+        let Some(Place::Global { bounds, period: None, .. }) = view.place else { return None };
         let runs = bounds[1].is_none_or(|b| multiple_of(self.prog, b, 16 / view.dtype.bytes() as i64));
         let global = self.along(view) == (Axis::Col, true) && runs;
         if !self.low.device.target.tr_load || !global || view.dtype.bytes() != 2 || sub_r % 16 != 0 || sub_c % 16 != 0 {
@@ -205,8 +205,16 @@ impl Emit<'_> {
     }
 
     pub(super) fn relayout(&mut self, dst: ValId, src: ValId) -> Result<()> {
+        self.remap(dst, src, 0)
+    }
+
+    /// `dst`'s element `(r, c)` from `src`'s `(r, c ^ flip)`: a relayout at
+    /// 0, a [`TileOp::SwapHalves`] otherwise; within a lane where the
+    /// layouts allow, else by lane moves or through shared memory.
+    pub(super) fn remap(&mut self, dst: ValId, src: ValId, flip: u32) -> Result<()> {
         let (ls, ld) = (self.layout(src).clone(), self.layout(dst).clone());
-        match ls.relayout(&ld, self.grid_warps(), self.low.device.target.wave, &self.low.device.costs) {
+        let (warps, lanes, costs) = (self.grid_warps(), self.low.device.target.wave, &self.low.device.costs);
+        match ls.relayout_flipped(&ld, flip, warps, lanes, costs) {
             Relayout::Identity => {
                 let buf = self.reg_buf(src);
                 let root = self.root(dst);
@@ -246,7 +254,7 @@ impl Emit<'_> {
                 }
                 Ok(())
             }
-            Relayout::ViaSmem => self.relayout_via_smem(dst, src),
+            Relayout::ViaSmem => self.relayout_via_smem(dst, src, flip),
         }
     }
 
@@ -262,9 +270,10 @@ impl Emit<'_> {
         bit.try_cmpne(&c(0)).expect("lane predicate")
     }
 
-    /// A tile re-held through a scratch of shared memory; inside a
-    /// [`Stmt::Warps`] every warp takes its own region of it.
-    pub(super) fn relayout_via_smem(&mut self, dst: ValId, src: ValId) -> Result<()> {
+    /// A tile re-held through a scratch of shared memory, its columns read
+    /// back xor `flip`; inside a [`Stmt::Warps`] every warp takes its own
+    /// region of it.
+    pub(super) fn relayout_via_smem(&mut self, dst: ValId, src: ValId, flip: u32) -> Result<()> {
         let Value { dtype, shape, .. } = self.value(src).clone();
         let elems = shape.elems();
         let regions = if self.scope == Scope::Warp { self.prog.warps as usize } else { 1 };
@@ -292,7 +301,7 @@ impl Emit<'_> {
         self.sync(Sync::Barrier { scope: self.scope })?;
         self.store_view(&view, src)?;
         self.sync(Sync::Barrier { scope: self.scope })?;
-        self.gather_view(dst, &view)
+        self.gather_view(dst, &view, flip)
     }
 
     pub(super) fn store_view(&mut self, d: &View, src: ValId) -> Result<()> {
@@ -306,10 +315,21 @@ impl Emit<'_> {
         Ok(())
     }
 
-    pub(super) fn gather_view(&mut self, dst: ValId, s: &View) -> Result<()> {
+    /// `dst` read from the tile `s`, every column xor `flip`: runs no wider
+    /// than `flip`, which keeps them contiguous.
+    pub(super) fn gather_view(&mut self, dst: ValId, s: &View, flip: u32) -> Result<()> {
         let l = self.layout(dst).clone();
-        for (j, w) in self.runs(&l, s) {
-            let c = self.coord(&l, j);
+        let mut runs = self.runs(&l, s);
+        if flip != 0 {
+            let width = runs.iter().map(|r| r.1).max().unwrap_or(1).min(flip);
+            runs = l.runs(self.low.device.target.wave, width, self.along(s).0);
+        }
+        for (j, w) in runs {
+            let mut c = self.coord(&l, j);
+            if flip != 0 {
+                let (row, col) = c.full();
+                c = Coord::plain(row, xor(&col, &c32(flip as i64)));
+            }
             let (off, _) = self.address(s, &c);
             let v = self.mem_load(&s.buf, &off, w, None);
             let vals = (0..w as usize).map(|e| elem(&v, e, w as usize)).collect();

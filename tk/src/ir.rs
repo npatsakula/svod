@@ -94,12 +94,17 @@ pub enum Place {
     /// With `rows`, row `r` starts at `offset + rows.offset[Row := r]`
     /// instead (`stride.0` is unused) and a row outside `rows.valid` reads
     /// zero on every path, fills included: a gather whose padding is data.
+    ///
+    /// With `period`, column `c` reads column `c % period`: a table every
+    /// `period` columns of the window repeat. It is read into registers
+    /// only, and has no column bound.
     Global {
         param: ParamId,
         offset: ScalarId,
         stride: [ScalarId; 2],
         bounds: [Option<ScalarId>; 2],
         rows: Option<RowMap>,
+        period: Option<usize>,
     },
 }
 
@@ -261,6 +266,13 @@ pub enum TileOp {
     /// Logical transpose of a register tile.
     Transpose {
         src: ValId,
+    },
+    /// The halves of every `2·half` columns exchanged: element `(r, c)` is
+    /// the source's `(r, c ^ half)`, `half` a power of two. A rotary
+    /// embedding's partner: the element half a head along.
+    SwapHalves {
+        src: ValId,
+        half: usize,
     },
     /// The same elements held under the layout its consumer needs; inserted
     /// by the layout inference, never by an author (who pins layouts instead).

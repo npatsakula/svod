@@ -1,5 +1,6 @@
 use svod_dtype::DType;
 
+use crate::encoder_head::PoolingMode;
 use crate::jit::InputSpec;
 use crate::modernbert::{ModernBert, ModernBertConfig, ModernBertJit};
 
@@ -22,6 +23,11 @@ fn tiny_cfg() -> ModernBertConfig {
         decoder_bias: true,
         dtype: DType::Float32,
         max_batch_size: 4,
+        num_labels: 3,
+        classifier_pooling: PoolingMode::Cls,
+        classifier_bias: false,
+        norm_bias: false,
+        id2label: vec![],
     }
 }
 

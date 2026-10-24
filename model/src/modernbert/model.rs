@@ -9,7 +9,8 @@
 use std::path::Path;
 
 use svod_tensor::Tensor;
-use svod_tensor::nn::{Layer, LayerNorm, Module};
+use svod_tensor::nn::{LayerNorm, Module};
+use svod_tk::ops;
 
 use crate::state::{self, StateDict};
 
@@ -45,7 +46,8 @@ impl ModernBert {
     pub fn forward(&self, input_ids: &Tensor, padding_mask: Option<&Tensor>) -> Result<Tensor> {
         let x = self.embeddings.forward(input_ids)?;
         let x = self.encoder.forward(&x, padding_mask)?;
-        Ok(self.final_norm.forward(&x)?)
+        let ln = &self.final_norm;
+        Ok(ops::layer_norm(&x, &ln.weight, ln.bias.as_ref(), ln.eps)?)
     }
 
     /// Download `config.json` + `model.safetensors` from a HuggingFace Hub
@@ -61,7 +63,7 @@ impl ModernBert {
         // dtype / max_batch_size (those aren't in the on-disk config).
         let cfg_path = repo.get("config.json")?;
         let parsed = ModernBertConfig::from_json(&cfg_path)?;
-        config.merge_structural_from(&parsed);
+        config.apply_checkpoint(&parsed);
 
         let weights_path = repo.get("model.safetensors")?;
         Self::from_safetensors(&weights_path, config.clone())
@@ -81,7 +83,7 @@ impl ModernBert {
     pub fn from_state_dict(sd: &StateDict, config: ModernBertConfig) -> Result<Self> {
         let dtype = config.dtype.clone();
         let mut model = Self::empty(config);
-        model.load_state_dict(&state::cast_all(sd, dtype), "")?;
+        model.load_state_dict(&state::cast_all(sd, dtype)?, "")?;
         Ok(model)
     }
 }

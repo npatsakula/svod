@@ -153,8 +153,19 @@ fn main() -> Result<()> {
             let mask = AttnMask { causal, ..AttnMask::default() };
             let scale = 1.0 / (d as f32).sqrt();
             let cfg = ranked[0];
-            let spec =
-                AttnSpec { batch: Batch::Static(b), t, tk: t, heads: h, kv_heads: h, d, mask, cache: None, scale, cfg };
+            let spec = AttnSpec {
+                batch: Batch::Static(b),
+                t,
+                tk: t,
+                heads: h,
+                kv_heads: h,
+                d,
+                mask,
+                cache: None,
+                packed: false,
+                scale,
+                cfg,
+            };
             let spec = match pick {
                 Pick::Ranked(i) => AttnSpec { cfg: *ranked.get(i).ok_or("no such ranked config")?, ..spec },
                 Pick::Tuned => replayed(&store()?, "attention", |s| {

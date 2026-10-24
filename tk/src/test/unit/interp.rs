@@ -240,3 +240,57 @@ fn an_access_past_the_capacity_is_an_error(access: Access, at: i64) -> Result<()
     k.store(dst, v);
     run(&k.finish(), vec![vec![1.0; 16], vec![0.0; 16]], &[]).map(drop).map_err(|e| e.to_string())
 }
+
+/// A halves swap reads every element's partner half a block along, in
+/// every block of every row.
+#[test]
+fn swapped_halves_read_their_partner_columns() {
+    let (rows, cols, half) = (3usize, 16usize, 4usize);
+    let mut k = Kernel::new("swap");
+    let x = k.param::<F32>("x", ParamKind::In, rows * cols);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let src = k.view(x, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    let v = k.load(src);
+    let swapped = k.swap_halves(v, half);
+    let dst = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    k.store(dst, swapped);
+    let xs: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
+    let out = run(&k.finish(), vec![xs.clone(), vec![0.0; rows * cols]], &[]).unwrap();
+    for r in 0..rows {
+        for c in 0..cols {
+            let partner = if c % (2 * half) < half { c + half } else { c - half };
+            assert_eq!(out[1][r * cols + c], xs[r * cols + partner], "y[{r}, {c}]");
+        }
+    }
+}
+
+/// A periodic view reads column `c % period` of the row its window puts
+/// there, moved down its rows or gathered.
+#[test_case(false; "moved down a row")]
+#[test_case(true; "gathered")]
+fn a_periodic_view_repeats_its_columns(gathered: bool) {
+    let (rows, period, cols) = (4usize, 4usize, 12usize);
+    let mut k = Kernel::new("periodic");
+    let x = k.param::<F32>("x", ParamKind::In, (rows + 2) * period);
+    let y = k.param::<F32>("y", ParamKind::Out, rows * cols);
+    let src = if gathered {
+        let r = k.row();
+        let g = k.gather(x, 0, (r + 2) * period, None, Shape::new(rows, cols), None);
+        k.periodic(g, period)
+    } else {
+        let v = k.view(x, 0, [period, 1], Shape::new(rows, cols), [None, None]);
+        let v = k.periodic(v, period);
+        k.at(v, 1, 0)
+    };
+    let v = k.load(src);
+    let dst = k.view(y, 0, [cols, 1], Shape::new(rows, cols), [None, None]);
+    k.store(dst, v);
+    let xs: Vec<f64> = (0..(rows + 2) * period).map(|i| i as f64).collect();
+    let out = run(&k.finish(), vec![xs.clone(), vec![0.0; rows * cols]], &[]).unwrap();
+    let first = if gathered { 2 } else { 1 };
+    for r in 0..rows {
+        for c in 0..cols {
+            assert_eq!(out[1][r * cols + c], xs[(r + first) * period + c % period], "y[{r}, {c}]");
+        }
+    }
+}

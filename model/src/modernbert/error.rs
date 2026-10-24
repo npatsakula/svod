@@ -24,4 +24,10 @@ pub enum Error {
     Hub { source: hf_hub::HFError },
     #[snafu(display("reading config.json failed: {message}"))]
     Config { message: String },
+    #[snafu(display("loading tokenizer failed: {source}"))]
+    Tokenizer { source: svod_arch::pipelines::text::HfTokenizerError },
+    #[snafu(display("building encoder head failed: {source}"))]
+    Head { source: crate::encoder_head::HeadError },
+    #[snafu(display("reading the embedding pooling failed: {source}"), context(false))]
+    Pooling { source: crate::encoder_head::PoolingError },
 }

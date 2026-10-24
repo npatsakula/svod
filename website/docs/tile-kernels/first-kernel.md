@@ -156,7 +156,7 @@ output and falls back to the graph when the kernel does not apply.
 |---|---|
 | Declarations | `param`, `var` (a launch variable bound by name), `grid`, `warps`, `smem` |
 | Scalars | `block(axis)`, `warp()`, `row()` (inside a gather map), `load_scalar(param, index)`, `Sc` operators and `min`/`max`/`lt`/`le`/`eq`/`and`/`or` |
-| Views | `view`, `gather` (a row-mapped view), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
-| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (a row or column vector broadcasts), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (one rounding), `reduce`, `reduce_f32`, `transpose`, `mma`, `mma_oriented`, `pin` |
+| Views | `view`, `gather` (a row-mapped view), `periodic` (columns repeating a table), `at`, `narrow`, `smem_view`, `smem_view_as`, `smem_slot` |
+| Tile ops | `fill`, `zeros`, `splat`, `coord`, `unary`, `binary` (a row or column vector broadcasts), `scale`, `compare` (`CmpOp`), `cast`, `cast_toward_zero`, `where_`, `mul_add` (one rounding), `reduce`, `reduce_f32`, `transpose`, `swap_halves`, `mma`, `mma_oriented`, `pin` |
 | Movement | `stage` (global → shared, `CopyMode::Async` or `Sync`), `load`, `load_as_fill`, `store` |
 | Control | `loop_` (carried register tiles), `pipeline`, `if_`, `select_if` (branches producing tiles), `each_warp` (a `Warps` statement), `barrier` |

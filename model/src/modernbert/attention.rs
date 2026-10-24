@@ -4,14 +4,15 @@
 //! `Wqkv: Linear(D, 3D)` (no bias), RoPE applied to Q and K, scaled
 //! dot-product attention, then `Wo: Linear(D, D)` (no bias).
 //!
-//! The fused QKV output along dim -1 is `[Q(H*hd) | K(H*hd) | V(H*hd)]`; the
-//! heads op splits it into rotated sequence-major `(B, L, H, hd)` heads.
-//! Sliding-window local layers pass a `window`; global layers pass `None`.
+//! The fused QKV output along dim -1 is `[Q(H*hd) | K(H*hd) | V(H*hd)]`, its
+//! Q and K heads rotated by the projection itself; attention reads the three
+//! from it in place. Sliding-window local layers pass a `window`; global
+//! layers pass `None`.
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
-use svod_tk::ops::{self, Attn, KeyMask, Qkv};
+use svod_tk::ops::{self, Attn, KeyMask, Rotary};
 
 use crate::init::fan_in_uniform;
 
@@ -55,21 +56,12 @@ impl ModernBertAttention {
         rope: &(Tensor, Tensor),
         padding_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (b, l, d) = (x.dim(0)?, x.dim(1)?, self.hidden_size);
+        let (b, l, d, h) = (x.dim(0)?, x.dim(1)?, self.hidden_size, self.num_heads);
         let (cos, sin) = rope;
-        let qkv = ops::linear(x, &self.qkv_weight, ops::Linear::default())?;
-        let split = Qkv {
-            heads: self.num_heads,
-            kv_heads: self.num_heads,
-            head_dim: self.head_dim,
-            q_norm: None,
-            k_norm: None,
-            eps: 0.0,
-            rope: Some((cos, sin)),
-        };
-        let (q, k, v) = ops::heads(&qkv, split)?;
+        let turned = Rotary { cos, sin, heads: 2 * h, head_dim: self.head_dim };
+        let qkv = ops::linear(x, &self.qkv_weight, ops::Linear { rope: Some(turned), ..Default::default() })?;
         let keys = padding_mask.map_or(KeyMask::None, KeyMask::Bool);
-        let attn = ops::attention(&q, &k, &v, Attn { keys, window: self.window, ..Attn::default() })?;
+        let attn = ops::attention_packed(&qkv, h, h, Attn { keys, window: self.window, ..Attn::default() })?;
 
         let opts = ops::Linear { residual: Some(residual), ..Default::default() };
         Ok(ops::linear(&attn.try_reshape([b, l, d.into()])?, &self.out_weight, opts)?)

@@ -118,11 +118,9 @@ pub fn get_transcendental_patterns(supported: &crate::RendererOps, force: bool) 
 }
 
 /// f32 → bf16 round-to-nearest-even done in the integer domain, emitting no
-/// `fptrunc`. amdgcn (LLVM 18) cannot select the vectorized bf16 truncstore that
-/// `-O3` forms by fusing `fptrunc float to bfloat` + `store bfloat`; routing the
-/// bits through integers and a final `bitcast i16 → bfloat` keeps `fptrunc` away
-/// from the store. Port of Tinygrad's `cast_float_to_bf16` (`renderer/cstyle.py`),
-/// bit-exact with the native conversion and vector-count-preserving.
+/// `fptrunc`. Port of Tinygrad's `cast_float_to_bf16` (`renderer/cstyle.py`),
+/// bit-exact with the native conversion and vector-count-preserving; see
+/// [`bf16_integer_cast_patterns`] for who needs it.
 fn cast_float_to_bf16(x: &Arc<UOp>) -> Arc<UOp> {
     use crate::DType;
     use svod_dtype::ScalarDType;
@@ -155,6 +153,21 @@ fn cast_float_to_bf16(x: &Arc<UOp>) -> Arc<UOp> {
         .expect("bf16: extract high half")
         .cast(vec(ScalarDType::UInt16))
         .bitcast(vec(ScalarDType::BFloat16))
+}
+
+/// f32 → bf16 narrowing in integers ([`cast_float_to_bf16`]) instead of an
+/// `fptrunc`, for a backend that cannot select the native one: amdgcn before
+/// LLVM 21 fails on the vectorized bf16 truncating store `-O3` makes of an
+/// `fptrunc float to bfloat` feeding a `store bfloat` (LLVM 18 is known to; the
+/// cutoff at 21 is assumed, not bisected), and Metal takes it too. The result is
+/// a `BitCast`, never a matching `Cast`, so the rewrite cannot recurse.
+pub fn bf16_integer_cast_patterns() -> TypedPatternMatcher<()> {
+    patterns! {
+        node @ Cast { src, .. }
+            if node.dtype().base() == svod_dtype::ScalarDType::BFloat16
+                && src.dtype().base() == svod_dtype::ScalarDType::Float32
+            => cast_float_to_bf16(src),
+    }
 }
 
 /// Decomposition patterns for the AMD backend.
@@ -191,23 +204,15 @@ pub fn amd_decomposition_patterns() -> TypedPatternMatcher<()> {
         Cos(src)  => xcos(&src.cast(DType::Float32)).cast(src.dtype()),
         Tan(src)  => xtan(&src.cast(DType::Float32)).cast(src.dtype()),
         Pow(base, exp) => xpow(&base.cast(DType::Float32), &exp.cast(DType::Float32)).cast(base.dtype()),
-
-        // f32 → bf16: integer round (see `cast_float_to_bf16`) instead of the
-        // `fptrunc` whose vectorized truncstore amdgcn can't select. The result
-        // is a BitCast, never a matching Cast, so the rewrite can't recurse.
-        node @ Cast { src, .. }
-            if node.dtype().base() == svod_dtype::ScalarDType::BFloat16
-                && src.dtype().base() == svod_dtype::ScalarDType::Float32
-            => cast_float_to_bf16(src),
     }
 }
 
 /// Decomposition patterns for the NVPTX backend.
 ///
-/// The AMD set (transcendentals over native `exp2`/`log2`, integer-domain bf16
-/// rounding) plus the f64 `Exp2`/`Log2` expansions: NVPTX lowers
-/// `@llvm.exp2` for f16/f32 only and `Log2` rides the f32-only
-/// `lg2.approx.f32`, so double precision takes the polynomial path.
+/// The AMD set (transcendentals over native `exp2`/`log2`) plus the f64
+/// `Exp2`/`Log2` expansions: NVPTX lowers `@llvm.exp2` for f16/f32 only and
+/// `Log2` rides the f32-only `lg2.approx.f32`, so double precision takes the
+/// polynomial path.
 pub fn nvptx_decomposition_patterns() -> TypedPatternMatcher<()> {
     fn f64(d: &crate::DType) -> bool {
         d.base() == svod_dtype::ScalarDType::Float64

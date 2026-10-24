@@ -56,13 +56,15 @@ Svod के साथ स्पीच, टेक्स्ट और विज़
 | वॉइस एक्टिविटी | FireRedVAD, Silero VAD |
 | स्पीच एन्हांसमेंट | GTCRN |
 | स्पीकर विश्लेषण | Nemotron-3-Diarization, DiariZen, WeSpeaker |
-| टेक्स्ट एम्बेडिंग और रीरैंकिंग | BGE-M3, Qwen3-Embedding, ModernBERT |
+| टेक्स्ट एम्बेडिंग और रीरैंकिंग | BGE-M3, BGE-reranker-v2-m3, Qwen3-Embedding, Qwen3-Reranker, ModernBERT |
+| टेक्स्ट क्लासिफ़िकेशन | ModernBERT और XLM-RoBERTa, दोनों पूरे टेक्स्ट और अलग-अलग टोकन के लिए |
+| वाक्य विभाजन | SaT |
 | विज़न | YOLO26, ResNet |
 | बाकी सब | [ONNX इम्पोर्टर](https://github.com/npatsakula/svod/tree/main/onnx/) ([ऑपरेटर कवरेज](https://github.com/npatsakula/svod/tree/main/onnx/PARITY.md)) |
 
 वेट सीधे Hugging Face Hub से आते हैं, और आउटपुट संदर्भ कार्यान्वयनों के विरुद्ध जाँचे
 जाते हैं। [`model/`](https://github.com/npatsakula/svod/tree/main/model/) में वेरिएंट, अपस्ट्रीम लिंक और चलाने योग्य
-उदाहरण सूचीबद्ध हैं; [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) में डिकोडर और लंबे ऑडियो की पाइपलाइन है।
+उदाहरण सूचीबद्ध हैं; [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) में CTC और RNN-T डिकोडर, लंबे ऑडियो की पाइपलाइन और टेक्स्ट पाइपलाइन हैं। टेक्स्ट पाइपलाइन लंबे टेक्स्ट को विंडो में बाँटती है, विंडो को बैच में एनकोडर से गुज़ारती है और विंडो के परिणामों को जोड़ती है, ताकि एम्बेडिंग, स्कोर या लेबलिंग पूरे टेक्स्ट के लिए मिले।
 
 ## इंजन
 
@@ -178,7 +180,7 @@ Morok Svod का पुराना नाम था।
 | [`tensor`](https://github.com/npatsakula/svod/tree/main/tensor/) | लेज़ी टेंसर API, `nn` मॉड्यूल और मेमोरी प्लानर |
 | [`tk`](https://github.com/npatsakula/svod/tree/main/tk/) | op layer के पीछे की टाइल लैंग्वेज, कर्नेल लाइब्रेरी, प्लानर और ट्यूनर |
 | [`onnx`](https://github.com/npatsakula/svod/tree/main/onnx/) | ONNX इम्पोर्टर |
-| [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | होस्ट-साइड डिकोडर, VAD सेगमेंटेशन और ऑडियो पाइपलाइन |
+| [`arch`](https://github.com/npatsakula/svod/tree/main/arch/) | होस्ट-साइड डिकोडर, VAD सेगमेंटेशन, ऑडियो और टेक्स्ट पाइपलाइन |
 | [`model`](https://github.com/npatsakula/svod/tree/main/model/) | प्रीट्रेन्ड मॉडल और उदाहरण |
 
 ## लाइब्रेरी का उपयोग

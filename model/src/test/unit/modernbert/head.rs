@@ -3,6 +3,7 @@ use svod_tensor::Tensor;
 
 use svod_tensor::nn::{Module, StateDict};
 
+use crate::encoder_head::PoolingMode;
 use crate::modernbert::{ModernBertConfig, ModernBertForMaskedLm};
 
 /// Tiny config matching `model::tiny_cfg` but with a smaller vocab so the
@@ -25,6 +26,11 @@ fn tiny_cfg() -> ModernBertConfig {
         decoder_bias: true,
         dtype: DType::Float32,
         max_batch_size: 1,
+        num_labels: 3,
+        classifier_pooling: PoolingMode::Cls,
+        classifier_bias: false,
+        norm_bias: false,
+        id2label: vec![],
     }
 }
 

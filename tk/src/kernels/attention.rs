@@ -251,6 +251,11 @@ pub struct AttnSpec {
     pub d: usize,
     pub mask: AttnMask,
     pub cache: Option<Cache>,
+    /// Queries, keys and values are one `[batch, t, heads + 2·kv_heads, d]`
+    /// parameter, a fused projection read in place: its keys from head
+    /// `heads` on, its values from `heads + kv_heads`. Without a cache, `tk`
+    /// is `t`.
+    pub packed: bool,
     pub scale: f32,
     pub cfg: FaCfg,
 }
@@ -400,7 +405,8 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
     [m_new, l, o]
 }
 
-/// `o = softmax(q·kᵀ·scale + bias)·v`. Parameters in order: `q`, `k`, `v`, then `o`
+/// `o = softmax(q·kᵀ·scale + bias)·v`. Parameters in order: `q`, `k`, `v`
+/// (one `qkv` [packed](AttnSpec::packed)), then `o`
 /// (one split) or the f32 partials `o_part [splits, batch, t, heads, d]`,
 /// `m_part` and `l_part [splits, batch, t, heads]`, then
 /// [`AttnSpec::extra_params`]. Key blocks no query of the tile sees are
@@ -408,17 +414,24 @@ fn step<T: Elem, PK: TierMark, PV: TierMark>(
 /// evenly by the splits; only blocks a mask edge crosses pay for the mask,
 /// except under a key mask or a bias, which every block reads.
 pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
-    let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, scale, cfg } = *spec;
+    let AttnSpec { ref batch, t, tk, heads, kv_heads, d, mask, cache, packed, scale, cfg } = *spec;
     let AttnMask { causal, window, chunk, key_lens, key_mask, seg_start, bias } = mask;
     let FaCfg { bq, bkv, stages, splits, .. } = cfg;
     let cap = batch.capacity();
     let (kv_rows, heads_total) = cache.map_or((cap, kv_heads), |c| (c.rows, c.heads_total));
     let appended = cache.map_or(0, |c| c.appended);
     assert!(appended <= bkv, "{appended} appended rows overflow a key block of {bkv}");
-    let mut k = Kernel::new("flash_attention");
-    let q = k.param::<T>("q", ParamKind::In, cap * t * heads * d);
-    let kk = k.param::<T>("k", ParamKind::In, kv_rows * tk * heads_total * d);
-    let v = k.param::<T>("v", ParamKind::In, kv_rows * tk * heads_total * d);
+    assert!(!packed || (cache.is_none() && tk == t), "a packed operand holds its own keys");
+    let slots = heads + 2 * kv_heads;
+    let mut k = Kernel::new(if packed { "flash_attention_packed" } else { "flash_attention" });
+    let (q, kk, v) = if packed {
+        let qkv = k.param::<T>("qkv", ParamKind::In, cap * t * slots * d);
+        (qkv, qkv, qkv)
+    } else {
+        let q = k.param::<T>("q", ParamKind::In, cap * t * heads * d);
+        let kk = k.param::<T>("k", ParamKind::In, kv_rows * tk * heads_total * d);
+        (q, kk, k.param::<T>("v", ParamKind::In, kv_rows * tk * heads_total * d))
+    };
     let o = (splits == 1).then(|| k.param::<T>("o", ParamKind::Out, cap * t * heads * d));
     let parts = (splits > 1).then(|| {
         let o = k.param::<F32>("o_part", ParamKind::Out, splits * cap * t * heads * d);
@@ -471,18 +484,22 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         Some(lens) => k.load_scalar(lens, b.clone()).min(tk),
         None => Sc::from(tk),
     };
-    let (q_stride, kv_stride) = (heads * d, heads_total * d);
-    let rows = |k: &mut Kernel, p: ParamRef<T>| {
+    // The output's rows hold its heads alone; a packed operand's hold every slot.
+    let o_stride = heads * d;
+    let (q_stride, kv_stride) = if packed { (slots * d, slots * d) } else { (o_stride, heads_total * d) };
+    // The packed operand's keys follow its queries, its values its keys.
+    let (k_first, v_first) = if packed { (heads, heads + kv_heads) } else { (0, 0) };
+    let rows = |k: &mut Kernel, p: ParamRef<T>, stride: usize| {
         let v = k.view(
             p,
-            batch_offset(&bb, t * q_stride) + hh.clone() * d,
-            [q_stride, 1],
+            batch_offset(&bb, t * stride) + hh.clone() * d,
+            [stride, 1],
             Shape::new(bq, d),
             [bound(t, bq), None],
         );
         k.at(v, q_off.clone(), 0)
     };
-    let q_view = rows(&mut k, q);
+    let q_view = rows(&mut k, q, q_stride);
     let kv_row = match row_map {
         Some(map) => k.load_scalar(map, b.clone()),
         None => b.clone(),
@@ -491,8 +508,9 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
     let head_start = head_start.map_or(Sc::from(0), |p| k.load_scalar(p, 0));
     let kv_base = kv_row * (tk * kv_stride) + (kv_head.clone() + head_start) * d;
     let kv_bound = keys_masked.then(|| len.clone());
-    let k_view = k.view(kk, kv_base.clone(), [kv_stride, 1], Shape::new(bkv, d), [kv_bound.clone(), None]);
-    let v_view = k.view(v, kv_base, [kv_stride, 1], Shape::new(bkv, d), [kv_bound, None]);
+    let (k_base, v_base) = (kv_base.clone() + k_first * d, kv_base + v_first * d);
+    let k_view = k.view(kk, k_base, [kv_stride, 1], Shape::new(bkv, d), [kv_bound.clone(), None]);
+    let v_view = k.view(v, v_base, [kv_stride, 1], Shape::new(bkv, d), [kv_bound, None]);
     let mask_view = masks.map(|m| {
         let view = k.view(m, b.clone() * mask_stride, [mask_stride, 1], Shape::new(1, bkv), [None, bound(tk, bkv)]);
         k.at(view, 0, 0)
@@ -794,15 +812,15 @@ pub fn attention<T: Elem>(spec: &AttnSpec) -> Program {
         (Some(o), _) => {
             let out = normalized(&mut k, acc, l, bq);
             let out = k.cast::<F32, T>(out);
-            let o_view = rows(&mut k, o);
+            let o_view = rows(&mut k, o, o_stride);
             k.store(o_view, out);
         }
         (None, Some((o_part, m_part, l_part))) => {
             let per_split = cap * t * heads;
             let o_view = k.view(
                 o_part,
-                split.clone() * (per_split * d) + batch_offset(&bb, t * q_stride) + hh.clone() * d,
-                [q_stride, 1],
+                split.clone() * (per_split * d) + batch_offset(&bb, t * o_stride) + hh.clone() * d,
+                [o_stride, 1],
                 Shape::new(bq, d),
                 [bound(t, bq), None],
             );

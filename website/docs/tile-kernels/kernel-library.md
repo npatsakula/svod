@@ -33,11 +33,17 @@ the matrix product runs on the f32 accumulator, and the result is rounded once a
 | `scale` | Multiplies the activated value before the residual |
 | `residual` | `[batch·m, n]` added last |
 | `out_f32` | f32 output and residual, the accumulator stored unrounded |
+| `rope` | `Rope { heads, head_dim, seq }`: the first `heads` heads of `head_dim` columns rotated by `[seq, head_dim/2]` cos and sin tables (output row `m` at position `m % seq`), the columns after them stored as they are; with a bias alone, on a tile whose warps hold whole heads (`GemmCfg::turns`) |
 
 `GemmCfg { tile: [bm, bn, bk], stages, warps: [rows, cols], group_m, unroll, core, crews }`. Rows
 past `m` and columns past `n` are bounded views, so `m` and `n` are free. `k` must be a multiple
 of `bk`. `core: Core::Group` issues the products on `wgmma` (sm_90); `crews: 2` runs the two
 warp rows in ping-pong over one slot (CDNA).
+
+The rotation reads each element's partner half a head along through `swap_halves`. When a
+warp's columns hold whole heads, a lane holds both halves, and the swap is a register
+permutation. The tables are read through a periodic view, so every head of a row reads the
+same `[head_dim/2]` row.
 
 There is no tile table. `config::Planner::gemm_ranked` enumerates tiles, `bk`, warp grids, ring
 depths and unrolling, keeps what the lowering runs on the target (the atoms tile the warp grid,
@@ -93,6 +99,11 @@ query that sees no key yields zeros, as the graph writes it.
 The first of this attention's heads is a `[1]` i32 `head_start` parameter, so every layer runs
 one program.
 
+**Packed mode** (`AttnSpec::packed`) reads `q`, `k` and `v` from one
+`[batch, t, heads + 2·kv_heads, d]` parameter, a fused projection, at head offsets 0, `heads` and
+`heads + kv_heads`, without a cache. The kernel is `flash_attention_packed`, tuned apart from the
+split one; on the same config both compute the same bits.
+
 **Key splits** (`FaCfg::splits > 1`) give a few long rows, such as a decoder step, more blocks.
 Each split writes f32 partials `o_part`, `m_part` and `l_part`, and `combine` merges them.
 `Attn::splits = Some(n)` fixes the count; with `None`, `Planner::splits` proposes 1, 2, the
@@ -145,5 +156,5 @@ in 16..=256, and candidates are `br ∈ {4, 8, 16}`.
 | `Rms` | `x·rsqrt(mean(x²) + eps)·w` |
 
 With `residual: true` it normalizes `x + residual` rounded to the element type and also writes
-that sum, which is the pre-norm residual stream of a transformer layer. `d` must be a power of
-two in 256..=2048, and candidates are `br ∈ {4, 8, 16}` rows per block.
+that sum, which is the pre-norm residual stream of a transformer layer. `d` must be a multiple
+of 256 in 256..=2048, and candidates are `br ∈ {4, 8, 16}` rows per block.

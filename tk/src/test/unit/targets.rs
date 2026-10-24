@@ -100,6 +100,7 @@ fn a_grid_takes_every_warp_or_whole_grids_run_alone(
             d: 64,
             mask,
             cache: None,
+            packed: false,
             scale: 0.125,
             cfg,
         })
@@ -164,6 +165,7 @@ fn every_group_attention_assembles_for_hopper() {
             d,
             mask,
             cache: None,
+            packed: false,
             scale: 0.125,
             cfg,
         };
@@ -652,6 +654,7 @@ fn every_candidate_lowers(target: Target, shortlist_deep: bool) {
                     d,
                     mask: AttnMask { causal: t > 1, ..AttnMask::default() },
                     cache: None,
+                    packed: false,
                     scale: 0.125,
                     cfg,
                 };
@@ -705,6 +708,7 @@ fn attention_softmax_takes_the_declared_forms(
         d: 64,
         mask,
         cache: None,
+        packed: false,
         scale: 0.125,
         cfg,
     };
@@ -865,6 +869,7 @@ fn attention_at(target: &Target, cfg: crate::kernels::attention::FaCfg, d: usize
         d,
         mask: AttnMask::default(),
         cache: None,
+        packed: false,
         scale: 0.125,
         cfg,
     };
