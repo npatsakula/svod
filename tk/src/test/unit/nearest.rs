@@ -166,14 +166,7 @@ impl Case {
     /// Each row's least score and the smallest index scoring it; `(+∞, −1)`
     /// where every pair is skipped.
     fn reference(&self) -> (Vec<f64>, Vec<i64>) {
-        (0..self.n)
-            .map(|i| {
-                (0..self.m).fold((f64::INFINITY, -1), |(best, at), j| {
-                    let s = self.pair(i, j);
-                    if s < best { (s, j as i64) } else { (best, at) }
-                })
-            })
-            .unzip()
+        self.reference_list(1).into_iter().map(|row| row[0]).unzip()
     }
 
     /// Per candidate, the first one holding the same row, floor and group.
@@ -234,12 +227,6 @@ impl Case {
 
     fn merge(&self, splits: usize, k: usize) -> NearestMergeSpec {
         NearestMergeSpec { n: self.n, splits, metric: self.metric, k, live: Default::default() }
-    }
-
-    /// The scores and indices the interpreter computes under `cfg`, split,
-    /// its shares merged.
-    fn interpreted(&self, cfg: NearestCfg) -> (Vec<f64>, Vec<f64>) {
-        self.listed(cfg, 1)
     }
 
     /// [`Self::interpreted`] keeping `k` scores a row, `[n, k]`; a score
@@ -428,41 +415,6 @@ impl Case {
             }
         }
     }
-
-    /// `score` and `index` are each row's least and where: every score
-    /// within `tol` of the reference's (relative, absolute below one; L2's
-    /// squared) and
-    /// `+∞` exactly where it is; every index admissible, scoring the row's
-    /// least within `tol` (a near-tie may fall either way under another
-    /// rounding) and the first of the candidates alike; and, where `exact`,
-    /// the reference's own.
-    fn check(&self, what: &str, score: &[f64], index: &[f64], tol: f64, exact: bool) {
-        let (best, at) = self.reference();
-        let alike = self.alikes();
-        assert_eq!((score.len(), index.len()), (self.n, self.n), "{what}: rows");
-        // L2 is compared squared: a distance near zero is the root of a
-        // difference of norms, its error that of the norms.
-        let l2 = self.metric == Metric::L2;
-        let near = |a: f64, b: f64| {
-            let (a, b) = if l2 { (a * a, b * b) } else { (a, b) };
-            a == b || (a - b).abs() <= tol * b.abs().max(1.0)
-        };
-        for i in 0..self.n {
-            let (s, j) = (score[i], index[i]);
-            assert!(near(s, best[i]), "{what}: row {i} scores {s}, want {}", best[i]);
-            if best[i].is_infinite() {
-                assert_eq!(j, -1.0, "{what}: row {i} has no candidate");
-                continue;
-            }
-            assert!(j >= 0.0 && (j as usize) < self.m, "{what}: row {i} picks {j}");
-            let j = j as usize;
-            assert!(near(self.pair(i, j), best[i]), "{what}: row {i} picks {j} scoring {}", self.pair(i, j));
-            assert_eq!(alike[j], j, "{what}: row {i} picks {j}, a repeat of an earlier candidate");
-            if exact {
-                assert_eq!(j as i64, at[i], "{what}: row {i}");
-            }
-        }
-    }
 }
 
 /// `n` rows against `m` candidates at depth `d` under `metric`, `k` scores a
@@ -521,8 +473,8 @@ proptest! {
         seed in any::<u64>(),
     ) {
         let case = Case::draw(n, m, d, draw, seed);
-        let (score, index) = case.interpreted(shared_out(cfg, m));
-        case.check("interpreter", &score, &index, 1e-4, draw.integer);
+        let (score, index) = case.listed(shared_out(cfg, m), 1);
+        case.check_list("interpreter", 1, &score, &index, 1e-4, draw.integer);
     }
 }
 
@@ -531,12 +483,12 @@ proptest! {
 #[test]
 fn rows_without_a_candidate_score_infinity_at_minus_one() {
     let mut case = Case::draw(40, 50, 16, draw(Metric::L2, BOTH, Some(1), false, false), 1);
-    let (score, index) = case.interpreted(NearestCfg::new(32, 16, 2));
+    let (score, index) = case.listed(NearestCfg::new(32, 16, 2), 1);
     assert!(score.iter().all(|s| *s == f64::INFINITY) && index.iter().all(|i| *i == -1.0));
     case.groups.as_mut().unwrap().1[37] = 2;
-    let (score, index) = case.interpreted(NearestCfg::new(32, 16, 2));
+    let (score, index) = case.listed(NearestCfg::new(32, 16, 2), 1);
     assert!(index.iter().all(|i| *i == 37.0), "{index:?}");
-    case.check("one admissible candidate", &score, &index, 1e-4, false);
+    case.check_list("one admissible candidate", 1, &score, &index, 1e-4, false);
 }
 
 /// Equal scores in different trips, in one trip and in different shares
@@ -557,9 +509,9 @@ fn ties_resolve_to_the_smallest_index(bkv: usize, metric: Metric, splits: usize)
         let (best, _) = case.reference();
         assert!(best.iter().any(|s| *s < 0.0) && best.iter().any(|s| *s > 0.0), "scores of both signs: {best:?}");
     }
-    let (score, index) = case.interpreted(NearestCfg { splits, ..NearestCfg::new(16, bkv, 2) });
+    let (score, index) = case.listed(NearestCfg { splits, ..NearestCfg::new(16, bkv, 2) }, 1);
     assert!(index.iter().all(|i| *i == 0.0), "{index:?}");
-    case.check("ties", &score, &index, 0.0, true);
+    case.check_list("ties", 1, &score, &index, 0.0, true);
 }
 
 /// Where a row's least falls among the candidates: in the last one, each
@@ -600,9 +552,9 @@ fn ordered(n: usize, m: usize, d: usize, order: Order) -> Case {
 fn the_trip_that_lowers_a_row_places_its_least(order: Order, want: usize) {
     let case = ordered(40, 201, 16, order);
     for cfg in [NearestCfg::new(32, 16, 2), NearestCfg::new(16, 64, 1), NearestCfg::streamed(32, 32, 16, 2)] {
-        let (score, index) = case.interpreted(cfg);
+        let (score, index) = case.listed(cfg, 1);
         assert!(index.iter().all(|&i| i == want as f64), "{cfg:?}: {index:?}");
-        case.check(&format!("{cfg:?}"), &score, &index, 0.0, true);
+        case.check_list(&format!("{cfg:?}"), 1, &score, &index, 0.0, true);
     }
 }
 
@@ -612,7 +564,7 @@ fn the_trip_that_lowers_a_row_places_its_least(order: Order, want: usize) {
 fn a_floor_above_every_score_picks_the_first_candidate() {
     let mut case = Case::draw(20, 40, 16, draw(Metric::L2, Floors { row: true, col: false }, None, false, false), 3);
     case.row_floor = Some(vec![100.0; case.n]);
-    let (score, index) = case.interpreted(NearestCfg::new(16, 16, 2));
+    let (score, index) = case.listed(NearestCfg::new(16, 16, 2), 1);
     assert!(score.iter().all(|s| *s == 100.0) && index.iter().all(|i| *i == 0.0), "{score:?} {index:?}");
 }
 
@@ -629,12 +581,12 @@ fn a_floor_above_every_score_picks_the_first_candidate() {
 fn shares_merge_to_the_unsplit_answer(metric: Metric, floors: Floors, groups: Option<i32>) {
     let case = Case::draw(70, 230, 24, draw(metric, floors, groups, true, true), 9);
     for base in [NearestCfg::new(32, 16, 2), NearestCfg::streamed(32, 32, 16, 1)] {
-        let unsplit = case.interpreted(base);
-        case.check("unsplit", &unsplit.0, &unsplit.1, 1e-4, true);
+        let unsplit = case.listed(base, 1);
+        case.check_list("unsplit", 1, &unsplit.0, &unsplit.1, 1e-4, true);
         for splits in [2, 3, 5, case.m.div_ceil(base.bkv)] {
             let cfg = NearestCfg { splits, ..base };
-            let split = case.interpreted(cfg);
-            case.check(&format!("{cfg:?}"), &split.0, &split.1, 1e-4, true);
+            let split = case.listed(cfg, 1);
+            case.check_list(&format!("{cfg:?}"), 1, &split.0, &split.1, 1e-4, true);
             assert_eq!(split, unsplit, "{cfg:?}");
         }
     }
@@ -655,8 +607,8 @@ fn shares_without_a_candidate_leave_infinity(skipped: usize) {
     }
     for splits in [2, 4, 7, 13] {
         let cfg = NearestCfg { splits, ..NearestCfg::new(16, 16, 2) };
-        let (score, index) = case.interpreted(cfg);
-        case.check(&format!("{cfg:?}"), &score, &index, 1e-4, false);
+        let (score, index) = case.listed(cfg, 1);
+        case.check_list(&format!("{cfg:?}"), 1, &score, &index, 1e-4, false);
         match skipped == case.m {
             true => assert!(score.iter().all(|s| *s == f64::INFINITY) && index.iter().all(|i| *i == -1.0)),
             false => assert!(index.iter().all(|&i| i >= skipped as f64), "{cfg:?}: {index:?}"),
@@ -1191,11 +1143,11 @@ fn nearest_matches_on_device(n: usize, m: usize, d: usize, draw: Draw) {
     let case = Case::draw(n, m, d, draw, 7).unsigned(draw.integer);
     let depth = planner.nearest_depth(d, svod_dtype::ScalarDType::Float16).unwrap();
     let ranked = planner.nearest_ranked(case.problem(depth, 1));
-    let (want_score, want_index) = case.interpreted(ranked[0]);
-    case.check("interpreter", &want_score, &want_index, 1e-4, draw.integer);
+    let (want_score, want_index) = case.listed(ranked[0], 1);
+    case.check_list("interpreter", 1, &want_score, &want_index, 1e-4, draw.integer);
     for cfg in split_too(&planner, &case, depth, 1, &ranked) {
         let (score, index) = case.on_device(&planner, depth, cfg, 1);
-        case.check(&format!("{cfg:?}"), &score, &index, 1e-3, draw.integer);
+        case.check_list(&format!("{cfg:?}"), 1, &score, &index, 1e-3, draw.integer);
         let same = index.iter().zip(&want_index).filter(|(a, b)| a == b).count();
         eprintln!("{cfg:?}: {same} of {n} indices as interpreted");
     }
@@ -1242,7 +1194,7 @@ fn the_trip_that_lowers_a_row_places_its_least_on_device(order: Order) {
         let ranked = planner.nearest_ranked(case.problem(d, 1));
         for cfg in split_too(&planner, &case, d, 1, &ranked) {
             let (score, index) = case.on_device(&planner, d, cfg, 1);
-            case.check(&format!("{cfg:?}"), &score, &index, 0.0, true);
+            case.check_list(&format!("{cfg:?}"), 1, &score, &index, 0.0, true);
         }
     }
 }
@@ -1521,9 +1473,9 @@ fn nearest_matches_the_graph(n: usize, m: usize, d: usize, draw: Draw, self_join
             _ => tk::nearest::picked(&x, &c, 1, opts, None, split).unwrap(),
         };
         super::ops::assert_kernel(&score, if splits == 1 { "nearest" } else { "nearest_merge" });
-        case.check("kernel", &host(&score), &host(&index), 1e-3, false);
+        case.check_list("kernel", 1, &host(&score), &host(&index), 1e-3, false);
         let (score, index) = tk::nearest::graph(&x, &c, opts).unwrap();
-        case.check("graph", &host(&score), &host(&index), 1e-3, false);
+        case.check_list("graph", 1, &host(&score), &host(&index), 1e-3, false);
     });
 }
 

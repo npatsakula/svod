@@ -542,7 +542,7 @@ fn a_least_over_live_rows_keeps_the_least() {
         let mut plans = Rebound::new(&[&score, &index]);
         for n in [40, 1, 17] {
             let got = plans.run(&[(ROWS, n as i64)], (n, 1, 1));
-            case.first(n).check(&format!("{dtype:?} n {n}"), &got[0], &got[1], 1e-2, false);
+            case.first(n).check_list(&format!("{dtype:?} n {n}"), 1, &got[0], &got[1], 1e-2, false);
         }
     }
 }
