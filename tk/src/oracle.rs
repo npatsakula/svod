@@ -155,7 +155,14 @@ pub(crate) fn probed(target: &Target) -> Vec<(&'static str, bool, Option<bool>)>
     capabilities(target).into_iter().map(|c| (c.name, c.table, assemble(target, &c.module))).collect()
 }
 
-/// Every capability with its recorded verdict: the store's line where one/// measured (first-measurement-wins, as any probe), else assembled and stored
+/// The hand tables' own verdicts for `target`, by capability: what an offline
+/// target runs on where no toolchain answered.
+pub fn tables(target: &Target) -> Vec<(&'static str, bool)> {
+    capabilities(target).into_iter().map(|c| (c.name, c.table)).collect()
+}
+
+/// Every capability with its recorded verdict: the store's line where one
+/// measured (first-measurement-wins, as any probe), else assembled and stored
 /// — never for a target without an SM count, whose device no store names.
 fn verdicts(target: &Target) -> Vec<(Capability, Option<bool>)> {
     let store = (target.sms.is_some()).then(TuneStore::global);

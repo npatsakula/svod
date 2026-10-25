@@ -397,6 +397,12 @@ impl TuneStore {
         self.replayed.is_some()
     }
 
+    /// The directory this store keeps its device files under, `None` for a
+    /// memory-only one: where a card's probes and oracle verdicts live.
+    pub fn root(&self) -> Option<&std::path::Path> {
+        self.root.as_deref()
+    }
+
     /// What a [`Self::replay`] found for each key asked, in order.
     pub fn lookups(&self) -> Vec<Lookup> {
         self.replayed.as_ref().map(|r| r.lock().expect("replay log").clone()).unwrap_or_default()
