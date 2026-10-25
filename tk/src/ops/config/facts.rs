@@ -175,10 +175,52 @@ impl Facts {
     }
 }
 
-/// The node's facts from the KFD topology; `None` where it maps to no
-/// supported architecture. Filled by the AMD commit.
-fn amd_of(_device_id: usize) -> Option<Facts> {
-    None
+/// The node's facts from the KFD topology: its identity, occupancy geometry,
+/// the caches it lists with their sharing, and its peak engine clock — no HIP,
+/// no bus width (the KFD topology offers none). `None` where the node maps to
+/// no supported architecture.
+fn amd_of(device_id: usize) -> Option<Facts> {
+    use svod_device::amd::topology;
+    let node = topology::enumerate().into_iter().nth(device_id)?;
+    let arch = svod_dtype::AmdArch::from_gfx_target_version(node.gfx_target_version)?;
+    let caches = node
+        .caches
+        .iter()
+        .map(|cache| CacheInstance {
+            level: cache.level,
+            size_bytes: cache.size_bytes,
+            line_bytes: cache.line_bytes,
+            shared_by: cache.shared_by(),
+        })
+        .collect::<Vec<_>>();
+    // The KFD topology has no per-SM block limit and no reserved-LDS split;
+    // its one LDS figure is the budget a work-group allocates from.
+    let l2 = caches.iter().filter(|c| c.level == 2).map(|c| c.size_bytes).sum::<u64>();
+    Some(Facts {
+        name: GpuArch::Amd(arch).target_name().to_string(),
+        arch: GpuArch::Amd(arch),
+        sms: node.simd_count.checked_div(node.simd_per_cu).filter(|&sms| sms > 0).unwrap_or(0),
+        wave: node.wave_front_size,
+        smem_per_block: Some(node.lds_size_in_kb as u64 * 1024),
+        smem_per_block_optin: Some(node.lds_size_in_kb as u64 * 1024),
+        smem_reserved: None,
+        smem_per_sm: None,
+        registers_per_block: None,
+        registers_per_sm: None,
+        threads_per_sm: None,
+        blocks_per_sm: None,
+        l2_bytes: (l2 > 0).then_some(l2),
+        persisting_l2_bytes: None,
+        core_clock_khz: None,
+        memory_clock_khz: None,
+        engine_clk_fcompute: (node.max_engine_clk_fcompute > 0).then_some(node.max_engine_clk_fcompute),
+        bus_bits: None,
+        copy_engines: (node.num_sdma_engines > 0).then_some(node.num_sdma_engines),
+        xcds: node.num_xcc.max(1),
+        memory_bytes: (node.memory_bytes > 0).then_some(node.memory_bytes),
+        caches,
+        table: false,
+    })
 }
 
 /// The facts of a device, queried once and kept for the process, beside its

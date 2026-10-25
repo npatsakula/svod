@@ -309,6 +309,14 @@ impl AmdDevice {
             num_cp_queues: 1,
             max_slots_scratch_cu: 32,
             memory_bytes: 0,
+            max_engine_clk_fcompute: 0,
+            cu_per_simd_array: 0,
+            num_sdma_engines: 0,
+            num_sdma_xgmi_engines: 0,
+            hive_id: 0,
+            device_id: 0,
+            vendor_id: 0,
+            caches: vec![],
         };
         let core = Arc::new(AmdDeviceCore {
             node,

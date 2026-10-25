@@ -1,10 +1,12 @@
 //! KFD topology parser: enumerates AMD GPU nodes via sysfs.
 //!
 //! Reads `/sys/devices/virtual/kfd/kfd/topology/nodes/N/properties` for each
-//! numeric subdir, returning a [`Vec<AmdNode>`]. Containers and hosts without
-//! `/dev/kfd` get an empty result (never panic).
+//! numeric subdir (and its `mem_banks/*/properties` memory sizes and
+//! `caches/*/properties` cache instances), returning a [`Vec<AmdNode>`].
+//! Containers and hosts without `/dev/kfd` get an empty result (never panic).
 //!
-//! Source format (one key/value per line, whitespace-separated):
+//! Source format (one key/value per line, whitespace-separated; a cache's
+//! `sibling_map` is a comma-separated bitmap):
 //! ```text
 //! gpu_id 4660
 //! cpu_cores_count 0
@@ -53,6 +55,56 @@ pub struct AmdNode {
     /// of heap type 1 or 2, public or private): its VRAM, or an APU's
     /// carve-out. 0 when KFD lists none.
     pub memory_bytes: u64,
+    /// Peak shader engine clock, KFD's `max_engine_clk_fcompute` as the
+    /// kernel prints it (its unit has flipped between kernels: a diagnostic,
+    /// never derived from). 0 when the field is absent.
+    pub max_engine_clk_fcompute: u64,
+    /// Compute units per SIMD array (`cu_per_simd_array`); 0 when absent.
+    pub cu_per_simd_array: u32,
+    /// SDMA copy engines (`num_sdma_engines`); 0 when absent.
+    pub num_sdma_engines: u32,
+    /// SDMA engines on XGMI links (`num_sdma_xgmi_engines`); 0 when absent.
+    pub num_sdma_xgmi_engines: u32,
+    /// The XGMI hive the node belongs to (`hive_id`); 0 alone.
+    pub hive_id: u64,
+    /// PCI device id (`device_id`); 0 when absent.
+    pub device_id: u32,
+    /// PCI vendor id (`vendor_id`); 0 when absent.
+    pub vendor_id: u32,
+    /// The node's cache instances (`caches/*/properties`), empty where KFD
+    /// lists none: per-CU/WGP L1s and LDS, per-SE or per-XCD L2 slices, the
+    /// memory-side Infinity Cache (LLC) — with which processors share each.
+    pub caches: Vec<AmdCache>,
+}
+
+/// One cache instance of a KFD node's `caches/` topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmdCache {
+    /// The processor the instance hangs off (`processor_id_low`).
+    pub processor_id: u32,
+    /// 1 for the L1s and LDS, 2 for L2, 3 for the Infinity Cache (LLC).
+    pub level: u32,
+    /// Bytes (sysfs prints KB).
+    pub size_bytes: u64,
+    pub line_bytes: u32,
+    pub cache_lines_per_tag: u32,
+    /// Associativity, 0 where KFD reports none.
+    pub association: u32,
+    /// Load latency, 0 where KFD reports none.
+    pub latency: u32,
+    /// The `type` bitmask (bit 0 data, bit 1 instruction, …).
+    pub kind: u32,
+    /// Which processors share the instance, KFD's `sibling_map` bitmap (one
+    /// 64-bit word per comma-separated entry).
+    pub sibling_map: Vec<u64>,
+}
+
+impl AmdCache {
+    /// How many processors the instance is shared by: the set bits of its
+    /// sibling map.
+    pub fn shared_by(&self) -> u32 {
+        self.sibling_map.iter().map(|w| w.count_ones()).sum()
+    }
 }
 
 /// Sysfs root for KFD topology. Public so tests can override via env.
@@ -127,6 +179,14 @@ pub fn enumerate() -> Vec<AmdNode> {
                 .map(|v| v as u32)
                 .unwrap_or_else(|| simd_per_cu.max(1) * max_waves_per_simd.max(1)),
             memory_bytes: frame_buffer_bytes(&node_dir),
+            max_engine_clk_fcompute: map.get("max_engine_clk_fcompute").copied().unwrap_or(0),
+            cu_per_simd_array: map.get("cu_per_simd_array").copied().unwrap_or(0) as u32,
+            num_sdma_engines: map.get("num_sdma_engines").copied().unwrap_or(0) as u32,
+            num_sdma_xgmi_engines: map.get("num_sdma_xgmi_engines").copied().unwrap_or(0) as u32,
+            hive_id: map.get("hive_id").copied().unwrap_or(0),
+            device_id: map.get("device_id").copied().unwrap_or(0) as u32,
+            vendor_id: map.get("vendor_id").copied().unwrap_or(0) as u32,
+            caches: cache_instances(&node_dir),
         });
     }
     nodes.sort_by_key(|n| n.node_id);
@@ -158,6 +218,48 @@ fn frame_buffer_bytes(node_dir: &std::path::Path) -> u64 {
         .filter(|map| map.get("heap_type").is_some_and(|h| FRAME_BUFFER_HEAPS.contains(h)))
         .filter_map(|map| map.get("size_in_bytes").copied())
         .sum()
+}
+
+/// The node's cache instances from `caches/*/properties`, by their numeric
+/// directory name, empty where KFD lists none (or every file of it is
+/// malformed, which skips that file alone): the per-CU/WGP L1s and LDS, the
+/// L2 slices and the memory-side Infinity Cache, each with the processors
+/// sharing it.
+fn cache_instances(node_dir: &std::path::Path) -> Vec<AmdCache> {
+    let Ok(caches) = fs::read_dir(node_dir.join("caches")) else { return Vec::new() };
+    let mut parsed: Vec<(u32, AmdCache)> = caches
+        .flatten()
+        .filter_map(|cache| {
+            let at = cache.file_name().to_str()?.parse::<u32>().ok()?;
+            Some((at, parse_cache(&cache.path().join("properties"))?))
+        })
+        .collect();
+    parsed.sort_by_key(|(at, _)| *at);
+    parsed.into_iter().map(|(_, cache)| cache).collect()
+}
+
+/// One `caches/N/properties` file, `None` where unreadable or without a level.
+fn parse_cache(path: &std::path::Path) -> Option<AmdCache> {
+    let text = fs::read_to_string(path).ok()?;
+    let map = parse_properties(&text);
+    let level = map.get("level").copied()? as u32;
+    let sibling_map = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("sibling_map"))?
+        .split(',')
+        .map(|word| word.trim().parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(AmdCache {
+        processor_id: map.get("processor_id_low").copied().unwrap_or(0) as u32,
+        level,
+        size_bytes: map.get("size").copied().unwrap_or(0) * 1024,
+        line_bytes: map.get("cache_line_size").copied().unwrap_or(0) as u32,
+        cache_lines_per_tag: map.get("cache_lines_per_tag").copied().unwrap_or(0) as u32,
+        association: map.get("association").copied().unwrap_or(0) as u32,
+        latency: map.get("latency").copied().unwrap_or(0) as u32,
+        kind: map.get("type").copied().unwrap_or(0) as u32,
+        sibling_map,
+    })
 }
 
 pub(crate) fn parse_properties(s: &str) -> HashMap<String, u64> {
