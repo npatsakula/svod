@@ -43,6 +43,7 @@ pub use self::search::{Rejected, has_kernels};
 pub(crate) use self::facts::facts_of;
 
 pub(crate) use self::gemm::gemm_cfg;
+pub(crate) use self::nearest::Weights;
 pub(crate) use self::norm::heads_candidates;
 pub(crate) use self::search::{
     Compiles, FIRST, SHORTLIST, TWIN_TILES, Tiled, compiled, distinct, distinct_configs, first_clean, representatives,

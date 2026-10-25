@@ -12,7 +12,7 @@ use crate::kernels::nearest::NearestCfg;
 
 use super::attention::AttentionProblem;
 use super::gemm::GemmProblem;
-use super::nearest::NearestProblem;
+use super::nearest::{NearestProblem, Weights};
 
 /// How a problem runs under one config: `blocks` blocks of `waves` waves,
 /// each holding `smem` bytes of shared memory and `regs` registers a lane
@@ -83,6 +83,9 @@ pub struct Planner {
     /// The cost fields the device's probes could not measure, ranked at
     /// zero ([`crate::probe::Measured`]); empty for a device that measured.
     pub unmeasured: Vec<&'static str>,
+    /// The nearest epilogue's cost clusters, every one at its full weight
+    /// (the tests and the rank harness perturb them alone).
+    pub(crate) weights: Weights,
     pub(super) ranked: papaya::HashMap<GemmProblem, Arc<[GemmCfg]>>,
     pub(super) attention: papaya::HashMap<AttentionProblem, Arc<[FaCfg]>>,
     pub(super) nearest: papaya::HashMap<NearestProblem, Arc<[NearestCfg]>>,
@@ -106,6 +109,7 @@ impl Planner {
             device,
             sms,
             unmeasured: vec![],
+            weights: Weights::same(),
             ranked: papaya::HashMap::new(),
             attention: papaya::HashMap::new(),
             nearest: papaya::HashMap::new(),

@@ -78,11 +78,12 @@ fn predicted(planner: &Planner) -> Vec<f64> {
 #[test_case(|c: f64| (c * 3.0 + 17.0) as u64; "the device agreed with the model")]
 #[test_case(|c: f64| (9.0e5 - c * 3.0) as u64; "the device inverted the model")]
 fn a_store_replays_through_the_op_layers_keys(ns: fn(f64) -> u64) {
-    let order = Scratch::new("rank-order");
+    let agreed = (ns(1.0) as i64 - ns(0.0) as i64).signum() > 0;
+    let name = if agreed { "rank-agree" } else { "rank-invert" };
+    let order = Scratch::new(&format!("{name}-order"));
     let p = predicted(&store(&order, |at| at as u64));
     assert!(p.windows(2).all(|w| w[0] <= w[1]) && p[0] < p[3], "the model's order varies: {p:?}");
-    let agreed = (ns(1.0) as i64 - ns(0.0) as i64).signum() > 0;
-    let dir = Scratch::new(if agreed { "rank-agree" } else { "rank-invert" });
+    let dir = Scratch::new(name);
     store(&dir, |at| ns(p[at]));
     let devices = rank::replay(&dir, None, Some(&["gemm"]));
     assert_eq!(devices.len(), 1, "the one device file");
@@ -109,6 +110,64 @@ fn a_choice_line_no_ranking_makes_is_skipped() {
     let devices = rank::replay(&dir, None, Some(&["gemm"]));
     let family = &devices[0].families[0];
     assert_eq!((family.lines.len(), family.skipped), (1, 1), "the made line replays, the dead one counts");
+}
+
+/// The nearest epilogue's weight seam: each cluster scales only the
+/// constants of the work it names — a row's least (`k = 1`) holds none of
+/// the listing, merge or scan work, so zeroing those leaves its cost the
+/// same bits, while a list config's and a score matrix's cost move with
+/// theirs.
+#[test]
+fn the_epilogue_clusters_scale_their_own_constants() {
+    use crate::kernels::nearest::{Floors, Metric};
+    use crate::ops::config::Weights;
+    let mut planner = super::planner(crate::atoms::sm86());
+    let problem = |k| crate::ops::config::NearestProblem {
+        n: 1 << 14,
+        m: 1 << 14,
+        d: 128,
+        dtype: ScalarDType::Float16,
+        metric: Metric::SquaredL2,
+        floors: Floors::default(),
+        groups: false,
+        k,
+    };
+    let cost =
+        |planner: &Planner, p: &crate::ops::config::NearestProblem, cfg: &crate::kernels::nearest::NearestCfg| {
+            p.admit(planner, cfg).expect("admitted").0
+        };
+    let zero = |cluster: &str| match cluster {
+        "pair" => Weights { pair: 0.0, ..Weights::same() },
+        "deal" => Weights { deal: 0.0, ..Weights::same() },
+        "merge" => Weights { merge: 0.0, ..Weights::same() },
+        _ => Weights { scan: 0.0, ..Weights::same() },
+    };
+    let least = problem(1);
+    let cfg = planner.nearest_ranked(least)[0];
+    let same = cost(&planner, &least, &cfg);
+    for cluster in ["deal", "merge", "scan"] {
+        planner.weights = zero(cluster);
+        assert_eq!(cost(&planner, &least, &cfg), same, "a least holds no {cluster} work");
+    }
+    planner.weights = zero("pair");
+    assert!(cost(&planner, &least, &cfg) < same, "a least pays its pair epilogue");
+    planner.weights = Weights::same();
+
+    let lists = problem(64);
+    let ranked = planner.nearest_ranked(lists);
+    let (list, matrix) = ranked
+        .iter()
+        .find(|c| c.select.is_none())
+        .zip(ranked.iter().find(|c| c.select.is_some()))
+        .expect("a list and a score-matrix config ranked");
+    let lists_of = [(list, &["pair", "deal", "merge"][..]), (matrix, &["pair", "scan"][..])];
+    for (cfg, clusters) in lists_of {
+        let same = cost(&planner, &lists, cfg);
+        for cluster in clusters {
+            planner.weights = zero(cluster);
+            assert!(cost(&planner, &lists, cfg) != same, "a {cluster} config moves with its cluster");
+        }
+    }
 }
 
 /// The op layer's own tuning reads the same line the harness derives: its

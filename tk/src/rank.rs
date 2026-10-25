@@ -303,6 +303,50 @@ pub struct Device {
     pub skipped_groups: Vec<(String, usize)>,
 }
 
+/// One nearest family's per-cluster ablation: the ρ of the replayed lines
+/// with one cost cluster zeroed, against the ρ with every cluster at its
+/// full weight — the cluster whose removal moves ρ most is where the
+/// model's error lives.
+pub struct Ablated {
+    pub family: &'static str,
+    pub base: Option<f64>,
+    /// `(cluster, ρ with the cluster zeroed)`.
+    pub clusters: Vec<(&'static str, Option<f64>)>,
+}
+
+/// Zeroes each of the nearest epilogue's cost clusters
+/// ([`crate::ops::config`'s `Weights`]) in turn over the device's replayed
+/// nearest lines, re-predicting them under the same measured costs: the
+/// candidate lists and their measured ns stay the store's own.
+pub fn ablation(device: &Device) -> Vec<Ablated> {
+    use crate::ops::config::Weights;
+    type Cluster = (&'static str, fn(&mut Weights));
+    let clusters: [Cluster; 4] = [
+        ("pair", |w| w.pair = 0.0),
+        ("deal", |w| w.deal = 0.0),
+        ("merge", |w| w.merge = 0.0),
+        ("scan", |w| w.scan = 0.0),
+    ];
+    device
+        .families
+        .iter()
+        .filter(|f| f.name.starts_with("nearest"))
+        .filter(|f| !f.lines.is_empty())
+        .map(|family| Ablated {
+            family: family.name,
+            base: family.rho(&device.planner),
+            clusters: clusters
+                .iter()
+                .map(|&(name, zero)| {
+                    let mut planner = Planner::new(device.planner.device.clone()).expect("an SM count");
+                    zero(&mut planner.weights);
+                    (name, family.rho(&planner))
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Spearman's ρ of `a` against `b`: average ranks over ties, Pearson over
 /// the ranks; `None` where either side holds no variance to correlate.
 pub fn spearman(a: &[f64], b: &[f64]) -> Option<f64> {

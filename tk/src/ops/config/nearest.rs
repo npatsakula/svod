@@ -265,6 +265,44 @@ const REREAD_K: usize = 32;
 /// block walks ([`Planner::nearest_split`]).
 const SPLIT_TILES: usize = 4;
 
+/// The nearest epilogue's cost clusters, as its constants naturally divide,
+/// each scaled by a weight the tests and the rank harness perturb (zeroed,
+/// to attribute the model's rank error to a cluster) and nothing else: the
+/// default of one everywhere is today's arithmetic exactly.
+///
+/// * `pair` — every pair's score epilogue: [`NEAREST_PAIR`], the further
+///   elementwise operations ([`PAIR_OP`], the floors, norms and the L2
+///   clamp) and what groups add ([`GROUPS_PAIR`]). It is its own cluster
+///   because [`PAIR_OP`] is the unit the listing constants below are
+///   multiples of: folding it here would zero the whole epilogue with it.
+/// * `deal` — the listing's per-trip work: a deal's least ([`DEAL_ELEM`]),
+///   its votes ([`DEAL_LANE`], [`PASS_ELEM`]), a pushed deal's test
+///   ([`HIT_ELEM`]), a round's dealt column ([`ROUND_ELEM`]) and a queue
+///   slot's pushes ([`PUSH_ELEM`]).
+/// * `merge` — the bitonic sort and merge rates: a list's slot a stage
+///   ([`LIST_SLOT`], [`MERGE_SLOT`]) wherever a merge runs (a warp's queues,
+///   a queue's flush into the outputs, a split's merge kernel, a scan's).
+/// * `scan` — the score-matrix path: a stored pair ([`MATRIX_PAIR`]), the
+///   listing kernel's scan of a score ([`SCAN_SCORE`]), a skipped step
+///   ([`SKIP_STEP`]) and a queue insert ([`INSERT_SLOT`]).
+///
+/// The fill fractions ([`QUEUE_FILLED`], [`SELECT_FILLED`]) and the tile
+/// count [`FLUSH_TILES`] are counts and data math, not rates: they stay.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Weights {
+    pub(crate) pair: f64,
+    pub(crate) deal: f64,
+    pub(crate) merge: f64,
+    pub(crate) scan: f64,
+}
+
+impl Weights {
+    /// Today's constants: every cluster at its full weight.
+    pub(crate) fn same() -> Self {
+        Self { pair: 1.0, deal: 1.0, merge: 1.0, scan: 1.0 }
+    }
+}
+
 /// The largest power of two not past `n` (zero for zero).
 fn prev_power_of_two(n: usize) -> usize {
     if n == 0 { 0 } else { 1 << n.ilog2() }
@@ -360,8 +398,12 @@ impl NearestProblem {
         // 8-bit products are widened and scaled by both rows' scales.
         let scaled = if elem == 1 { 3 } else { 0 };
         let ops = [self.metric.row_norms(), row, col, clamp].into_iter().filter(|&on| on).count() + scaled;
-        let first = if cfg.select.is_some() { MATRIX_PAIR } else { NEAREST_PAIR };
-        let pair = first + ops as f64 * PAIR_OP + if self.groups { GROUPS_PAIR } else { 0.0 };
+        let w = &planner.weights;
+        let first = match cfg.select.is_some() {
+            true => MATRIX_PAIR * w.scan,
+            false => NEAREST_PAIR * w.pair,
+        };
+        let pair = first + ops as f64 * PAIR_OP * w.pair + if self.groups { GROUPS_PAIR * w.pair } else { 0.0 };
         // Split, every query block's candidate tiles in shares, a block each.
         let splits = cfg.splits;
         let (blocks, tiles, stages) = (self.n.div_ceil(bq) * splits, self.m.div_ceil(bkv).div_ceil(splits), cfg.stages);
@@ -412,7 +454,8 @@ impl NearestProblem {
             if lanes.width < sharing || deals > MOST_DEALS || cfg.queue.is_some_and(|q| 2 * queued > q) {
                 return Err(Rejected::Lowers);
             }
-            epilogue += share.listing(cfg, lanes, target.wave) * waves as f64 * costs.score / (tiles * chunks) as f64;
+            epilogue +=
+                share.listing(cfg, lanes, target.wave, w) * waves as f64 * costs.score / (tiles * chunks) as f64;
         }
         let step = if elem == 1 { costs.step_i8 } else { costs.step };
         let work = steps as f64 * step + epilogue;
@@ -440,7 +483,7 @@ impl NearestProblem {
     fn merge_cost(&self, planner: &Planner, splits: usize) -> f64 {
         let costs = &planner.device.costs;
         let slots = if self.k == 1 { 1.0 } else { (select_runs(self.k) * LANES) as f64 };
-        let row = (splits - 1) as f64 * slots * (slots.log2() + 1.0) * MERGE_SLOT;
+        let row = (splits - 1) as f64 * slots * (slots.log2() + 1.0) * MERGE_SLOT * planner.weights.merge;
         let bytes = ((splits + 1) * self.k * 8) as f64 * costs.global_byte;
         let spread = self.n as f64 * (row * costs.score).max(bytes) / planner.sms() as f64;
         spread.max(splits as f64 * costs.latency)
@@ -482,10 +525,11 @@ impl NearestProblem {
         let merge = queued * depth * (depth + 1.0) / 2.0 + width * width.log2();
         let offers = NearestProblem { m: read, ..*self }.offers();
         let merges = offers / (queued * SELECT_FILLED) + 1.0;
-        let row = steps * LANES as f64 * SCAN_SCORE
-            + skipped as f64 * SKIP_STEP
-            + busy * queued * INSERT_SLOT
-            + merges * merge * MERGE_SLOT;
+        let (w_scan, w_merge) = (planner.weights.scan, planner.weights.merge);
+        let row = steps * LANES as f64 * SCAN_SCORE * w_scan
+            + skipped as f64 * SKIP_STEP * w_scan
+            + busy * queued * INSERT_SLOT * w_scan
+            + merges * merge * MERGE_SLOT * w_merge;
         let bytes = (read * 4) as f64 * costs.global_byte;
         self.n as f64 * (row * costs.score).max(bytes) / planner.sms() as f64
     }
@@ -515,7 +559,7 @@ impl NearestProblem {
     /// [`LIST_SLOT`] a row's slot a stage. Queued, the merges of that list
     /// into the outputs too, one each time the warp's lists take a
     /// [`QUEUE_FILLED`] share of the room they leave the lanes' queues.
-    fn listing(&self, cfg: &NearestCfg, lanes: LaneQueue, wave: u32) -> f64 {
+    fn listing(&self, cfg: &NearestCfg, lanes: LaneQueue, wave: u32, w: &Weights) -> f64 {
         let LaneQueue { width, depth, passes } = lanes;
         let (rows, tiles, wave) = (cfg.warp_rows as f64, self.m.div_ceil(cfg.bkv), f64::from(wave));
         let deals = (cfg.bkv / width) as f64;
@@ -527,24 +571,25 @@ impl NearestProblem {
                 // A vote on every deal of a trip some row enters, and a push
                 // on each deal some row is dealt one below its `k`-th in.
                 let dealt = deals * (1.0 - (-hits / deals).exp());
-                return entered * deals * (elems * PASS_ELEM + wave * DEAL_LANE)
-                    + dealt * (elems * (HIT_ELEM + t * PUSH_ELEM) + wave * DEAL_LANE);
+                return entered * deals * (elems * PASS_ELEM * w.deal + wave * DEAL_LANE * w.deal)
+                    + dealt * (elems * (HIT_ELEM + t * PUSH_ELEM) * w.deal + wave * DEAL_LANE * w.deal);
             }
             let lambda = hits / elems;
             let rounds = (1.0 + lambda + (2.0 * lambda * elems.ln()).sqrt()).min(deals);
-            let round = deals * elems * ROUND_ELEM + elems * t * PUSH_ELEM + wave * DEAL_LANE;
-            entered * (deals * elems * DEAL_ELEM + wave * DEAL_LANE + rounds * round)
+            let round =
+                deals * elems * ROUND_ELEM * w.deal + elems * t * PUSH_ELEM * w.deal + wave * DEAL_LANE * w.deal;
+            entered * (deals * elems * DEAL_ELEM * w.deal + wave * DEAL_LANE * w.deal + rounds * round)
         };
         let walk: f64 = (0..tiles).map(trip).sum();
         let fact: f64 = (1..=depth + 1).map(|i| i as f64).product();
         let per_merge = (elems.powf(t) * fact).powf(1.0 / (t + 1.0));
         let (held, queued) = (cfg.list_slots(self.k) as f64, (width * depth) as f64);
         let sort = queued * queued.log2() * (queued.log2() + 1.0) / 2.0;
-        let merge = rows * (sort + held * (held.log2() + 1.0)) * LIST_SLOT;
+        let merge = rows * (sort + held * (held.log2() + 1.0)) * LIST_SLOT * w.merge;
         let mut list = walk + (rows * self.offers() / per_merge + 1.0) * merge;
         if let Some(q) = cfg.queue {
             let stages = 1.0 + 2.0 * (q as f64).log2();
-            let flush = (self.k.div_ceil(q) * q) as f64 * rows * stages * MERGE_SLOT;
+            let flush = (self.k.div_ceil(q) * q) as f64 * rows * stages * MERGE_SLOT * w.merge;
             list += (self.offers() / ((held - queued) * QUEUE_FILLED) + 1.0) * flush;
         }
         list

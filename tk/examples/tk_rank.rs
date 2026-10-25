@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = at("--device").and_then(|i| args.get(i + 1)).cloned();
     let ops = at("--op").and_then(|i| args.get(i + 1)).map(|o| o.split(',').collect::<Vec<_>>());
     let check = at("--check").is_some();
+    let ablate = at("--ablate").and_then(|i| args.get(i + 1)).cloned();
     let store = opt.map(PathBuf::from).or_else(|| TuneStore::global().root().map(PathBuf::from));
     let Some(store) = store.filter(|s| s.is_dir()) else {
         return Err("no tune store: pass --store DIR (or set SVOD_TK_TUNE_DIR)".into());
@@ -62,6 +63,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             for (group, lines) in device.skipped_groups.iter().take(200) {
                 println!("    skipped {lines:3} of {group}");
+            }
+        }
+        if let Some("nearest") = ablate.as_deref() {
+            for ablated in rank::ablation(&device) {
+                let base = ablated.base.map_or("-".into(), |r| format!("{r:.3}"));
+                println!("  {} with every cluster at full weight: rho {base}", ablated.family);
+                for (cluster, rho) in &ablated.clusters {
+                    let delta = rho.zip(ablated.base).map_or("-".into(), |(r, b)| format!("{:+.3}", r - b));
+                    println!(
+                        "    {:<6} zeroed: rho {} ({delta})",
+                        cluster,
+                        rho.map_or("-".into(), |r| format!("{r:.3}"))
+                    );
+                }
             }
         }
         println!();
