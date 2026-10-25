@@ -5,6 +5,7 @@ mod conv;
 mod cost_model;
 mod device;
 mod emit;
+mod facts;
 mod gather;
 mod hazards;
 mod heads;

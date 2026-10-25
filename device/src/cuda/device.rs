@@ -110,6 +110,34 @@ pub struct CudaLimits {
     /// `cuMemAllocManaged` is usable and host access is coherent with running
     /// kernels: the backing of host-visible buffers.
     pub managed_memory: bool,
+    /// Registers one block may use, whatever its thread count.
+    pub registers_per_block: u32,
+    /// Peak core clock in kHz. Identity/diagnostic: rates come from measured
+    /// costs, which a boost under load settles below this.
+    pub clock_rate_khz: u32,
+    /// Peak memory clock in kHz.
+    pub memory_clock_rate_khz: u32,
+    /// Global memory bus width in bits: the theoretical bandwidth with the
+    /// memory clock.
+    pub bus_width_bits: u32,
+    /// L2 cache bytes.
+    pub l2_cache_bytes: u32,
+    /// Copy engines (`ASYNC_ENGINE_COUNT`).
+    pub async_engine_count: u32,
+    /// The fp32-to-fp64 throughput ratio (how many fp32 steps one fp64 costs).
+    pub single_to_double_perf_ratio: u32,
+    /// The largest persisting-access window L2 may keep
+    /// (`cuCtxSetLimit`/access-policy, unused today).
+    pub persisting_l2_bytes: u32,
+    /// Shared memory the driver reserves per block out of the opt-in: what a
+    /// kernel may actually use is `shared_per_block_optin − this`.
+    pub reserved_shared_per_block: u32,
+    /// Thread-block clusters exist (`CLUSTER_LAUNCH`): sm_90+.
+    pub cluster_launch: bool,
+    /// Tensor-map (TMA) access exists.
+    pub tensor_map_access: bool,
+    /// NVLink multicast exists.
+    pub multicast: bool,
 }
 
 /// One in-order stream plus the scoped-sync state of its submissions. Owned
@@ -316,6 +344,18 @@ impl CudaDevice {
             warp_size: attribute(attribute::WARP_SIZE)?,
             managed_memory: attribute(attribute::MANAGED_MEMORY)? == 1
                 && attribute(attribute::CONCURRENT_MANAGED_ACCESS)? == 1,
+            registers_per_block: attribute(attribute::MAX_REGISTERS_PER_BLOCK)?,
+            clock_rate_khz: attribute(attribute::CLOCK_RATE)?,
+            memory_clock_rate_khz: attribute(attribute::MEMORY_CLOCK_RATE)?,
+            bus_width_bits: attribute(attribute::GLOBAL_MEMORY_BUS_WIDTH)?,
+            l2_cache_bytes: attribute(attribute::L2_CACHE_SIZE)?,
+            async_engine_count: attribute(attribute::ASYNC_ENGINE_COUNT)?,
+            single_to_double_perf_ratio: attribute(attribute::SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO)?,
+            persisting_l2_bytes: attribute(attribute::MAX_PERSISTING_L2_CACHE_SIZE)?,
+            reserved_shared_per_block: attribute(attribute::RESERVED_SHARED_MEMORY_PER_BLOCK)?,
+            cluster_launch: attribute(attribute::CLUSTER_LAUNCH)? == 1,
+            tensor_map_access: attribute(attribute::TENSOR_MAP_ACCESS_SUPPORTED)? == 1,
+            multicast: attribute(attribute::MULTICAST_SUPPORTED)? == 1,
         };
 
         let copy = Lane::create(api, raw)?;

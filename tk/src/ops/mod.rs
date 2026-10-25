@@ -167,6 +167,9 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
             let measured = crate::probe::costs(&target)
                 .inspect_err(|e| tracing::warn!("{}: no tk planner: {e}", target.arch.target_name()))
                 .ok()?;
+            // Its layer-0 facts are queried at the same time; no hand value
+            // reads them yet (capture-and-expose, phase B).
+            config::facts_of(device);
             Planner::measured(target, measured).map(Arc::new)
         })
         .clone()

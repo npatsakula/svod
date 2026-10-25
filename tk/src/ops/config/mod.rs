@@ -17,14 +17,16 @@
 //! are small functions of the target.
 //!
 //! By responsibility: `cost` the shared pricing core (a [`Run`] of a config,
-//! the [`Planner`] that pipelines it), `search` the machinery every family's
-//! ranking shares (bounds, the shortlist search, tile twins), and `gemm`,
+//! the [`Planner`] that pipelines it), `facts` the device's layer-0
+//! description ([`Facts`]), `search` the machinery every family's ranking
+//! shares (bounds, the shortlist search, tile twins), and `gemm`,
 //! `attention`, `nearest`, `conv`, `norm` their families' configs, lattices
 //! and admission.
 
 mod attention;
 mod conv;
 mod cost;
+mod facts;
 mod gemm;
 mod nearest;
 mod norm;
@@ -32,10 +34,13 @@ mod search;
 
 pub use self::attention::AttentionProblem;
 pub use self::cost::Planner;
+pub use self::facts::Facts;
 pub use self::gemm::{GemmProblem, gemm_lattice};
 pub use self::nearest::NearestProblem;
 pub use self::norm::norm_candidates;
 pub use self::search::{Rejected, has_kernels};
+
+pub(crate) use self::facts::facts_of;
 
 pub(crate) use self::gemm::gemm_cfg;
 pub(crate) use self::norm::heads_candidates;
