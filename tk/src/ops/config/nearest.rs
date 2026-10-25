@@ -271,10 +271,6 @@ const FILTER_GROUPS: usize = 4;
 /// list again (at 4096 queries by 2^20 candidates at depth 768 on gfx1201,
 /// 16 shares ran 14 % behind 2 for 64 scores and 24 % for 256).
 const REREAD_K: usize = 32;
-/// Search bound: the fewest candidate tiles a share of a split nearest
-/// block walks ([`Planner::nearest_split`]).
-const SPLIT_TILES: usize = 4;
-
 /// The nearest epilogue's cost clusters, as its constants naturally divide,
 /// each scaled by a weight the tests and the rank harness perturb (zeroed,
 /// to attribute the model's rank error to a cluster) and nothing else: the
@@ -848,7 +844,19 @@ impl Planner {
         };
         // A score matrix's shares store their own scores: none fills a list.
         let per = if cfg.select.is_some() { 1 } else { p.k };
-        let most = prev_power_of_two(p.m.div_ceil(cfg.bkv) / (SPLIT_TILES * per));
+        // The most shares anything leaves room for: a share's lists are a
+        // row's `k` scores and indices over the query rows, and the device's
+        // memory holds a quarter of them at most. [`SPLIT_TILES`] — each
+        // share four candidate tiles a score, an incident constant — is
+        // gone: its bound's counts past it, which the model once priced at a
+        // third to a half of the kept best, measure 15–45 % behind it once
+        // fills price through the cache ladder (16384² f16 at `k` 16, depth
+        // 128, the kept tile: 86 Gpairs/s at two shares, 58 at sixteen, 46
+        // at thirty-two), so it cut only losers; the priced sweep below
+        // decides among whatever the scratch leaves.
+        let lists = p.n * p.k * 8 * 4;
+        let memory = target.memory_bytes.map_or(usize::MAX, |b| (b as usize).max(1) / lists.max(1));
+        let most = prev_power_of_two(p.m.div_ceil(cfg.bkv) / per).min(memory.max(1));
         let fill = flight.div_ceil(rows).next_power_of_two().min(most);
         if per == 1 || most < 2 {
             return (fill > 1).then_some(fill);
@@ -860,11 +868,11 @@ impl Planner {
         if tracing::enabled!(target: crate::ops::PLAN, tracing::Level::DEBUG)
             && let Some(kept) = cost(splits)
         {
-            // SPLIT_TILES keeps every share `SPLIT_TILES` candidate tiles at
-            // least: the counts past `most`, against the count kept.
+            // The scratch's bound: the counts past `most`, against the
+            // count kept.
             let past: Vec<f64> =
                 (most.ilog2() + 1..=p.m.div_ceil(cfg.bkv).ilog2()).flat_map(|b| cost(1 << b)).collect();
-            fired("SPLIT_TILES", &past, kept);
+            fired("SPLIT_SLOTS", &past, kept);
             // REREAD_K: the fill the rereads would share the bound held
             // back for a longer list.
             if cfg.bk.is_some()
