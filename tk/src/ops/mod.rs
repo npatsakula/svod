@@ -168,8 +168,11 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
                 .inspect_err(|e| tracing::warn!("{}: no tk planner: {e}", target.arch.target_name()))
                 .ok()?;
             // Its layer-0 facts are queried at the same time; no hand value
-            // reads them yet (capture-and-expose, phase B).
+            // reads them yet (capture-and-expose, phase B). The compile-probe
+            // oracle records its verdicts beside the probes and compares them
+            // with the tables, which still drive.
             config::facts_of(device);
+            crate::oracle::audit(&target);
             Planner::measured(target, measured).map(Arc::new)
         })
         .clone()

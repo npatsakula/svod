@@ -17,6 +17,7 @@ mod nearest;
 mod offline;
 mod ops;
 mod ops_plan;
+mod oracle;
 mod parts;
 mod probe;
 mod replay;

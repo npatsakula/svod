@@ -12,4 +12,4 @@
 
 pub mod compile;
 
-pub use compile::{compile_ir_to_ptx, has_nvptx_target};
+pub use compile::{assemble_ptx, compile_ir_to_ptx, has_nvptx_target, has_ptxas};
