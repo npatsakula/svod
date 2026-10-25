@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use svod_dtype::ScalarDType;
 
-use crate::atoms::{Costs, Device, Fill, Target};
+use crate::atoms::{Device, Fill, Target};
 use crate::ir::{Axis, Orient, Shape};
 use crate::kernels::attention::WARP_ROWS;
 use crate::kernels::gemm::GROUP_ROWS;
@@ -161,16 +161,23 @@ impl NearestCfg {
 pub(crate) const NEAREST_PAIR: f64 = 1.0;
 /// Model: one vector operation of the epilogue — the row's norm added, a
 /// floor's maximum, the L2 clamp, a deal's least or vote, a merge's
-/// compare — in units of [`Costs::score`], measured per device as the
-/// score and step probes' ratio: the share of one 16×16×16 step one vector
-/// operation over a score element costs, wherever this device's vector
-/// pipe sits against its matrix one (gfx1201's score runs 2.2× the share
-/// of sm_86's). The constants below carry whole-operation counts and
-/// multiply it; the pair's own bundle ([`NEAREST_PAIR`]) stays whole score
-/// elements. Where nothing measured `step`, no operation is priced.
-pub(crate) fn pair_op(device: &Device) -> f64 {
-    let Costs { score, step, .. } = device.costs;
-    if step > 0.0 { score / step } else { 0.0 }
+/// compare — in units of [`Costs::score`], the whole [`Costs::score`] a
+/// softmax element's bundle of them. A declared residual, not a hand
+/// value kept: two measured derivations were tried against the rank
+/// harness on fresh stores (16384² nearest at `k` 1, 16, 64, depths 128
+/// and 768, three cards) and refuted — the score and step probes' ratio
+/// (`score/step`, sm_86 0.0097, gfx1201 0.0214 score units) prices the
+/// listing's chained work a fifth to a twentieth of its calibration,
+/// collapsing the queue-depth structure (gfx1151 prunes every 32-deep
+/// queue; a gfx1201 `k` 64 tune picks a queued list 7 % behind the
+/// register one) and dropping sm_86's fresh-store nearest ρ 0.415 → 0.381;
+/// the probe bundle's own counted op rate (`score/` its ~15 scalar
+/// operations) collapses it outright. The residual is the issue
+/// efficiency of chained vector work beside the matrix pipe, which no
+/// probe explains: the per-card fit from the store's own outcomes (the
+/// design's layer 2) is what replaces this value, regularized toward it.
+pub(crate) fn pair_op(_: &Device) -> f64 {
+    0.2
 }
 /// Model: what groups add to a pair: a compare and a select.
 pub(crate) const GROUPS_PAIR: f64 = 2.0;

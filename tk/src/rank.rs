@@ -705,12 +705,19 @@ fn nearest(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[us
                         cfg: NearestCfg::new(64, 64, 2),
                         live: live.clone(),
                     };
-                    let keying = Keying::new("nearest", planner, dtype, shape, format!("{:?}", Salt(&spec)));
-                    let p = NearestProblem { n, m, d, dtype, metric, floors, groups, k };
-                    let ranked = planner.nearest_ranked(p);
-                    let expand = |admitted: &[NearestCfg]| planner.nearest_splits(&p, admitted);
-                    let configs = |list: Vec<NearestCfg>| Configs::Nearest { problem: p, list };
-                    out.extend(stages(lines, &keying, &ranked, expand, configs).into_iter().flatten());
+                    // The op layer's own salt, and the tuning probe's (a
+                    // fresh store's cold tunes of these very shapes).
+                    let salts =
+                        [format!("{:?}", Salt(&spec)), format!("{:?}", (DEVICE_TEST, metric, floors, groups)).clone()];
+                    let salts = if *live == Live::default() { salts.to_vec() } else { salts[..1].to_vec() };
+                    for salt in salts {
+                        let keying = Keying::new("nearest", planner, dtype, shape, salt);
+                        let p = NearestProblem { n, m, d, dtype, metric, floors, groups, k };
+                        let ranked = planner.nearest_ranked(p);
+                        let expand = |admitted: &[NearestCfg]| planner.nearest_splits(&p, admitted);
+                        let configs = |list: Vec<NearestCfg>| Configs::Nearest { problem: p, list };
+                        out.extend(stages(lines, &keying, &ranked, expand, configs).into_iter().flatten());
+                    }
                 }
             }
         }
