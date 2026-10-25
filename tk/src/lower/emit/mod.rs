@@ -98,8 +98,19 @@ impl Listing {
         self.levels.last_mut().expect("a body").extend(body);
     }
 
-    /// Whether the instructions listed so far are within the bound.
+    /// Whether the instructions listed so far are within the bound. The one
+    /// bound that refuses a program by its own size fires a log line when it
+    /// does (the plan log's debug level gates it; no modeled cost reaches
+    /// the emitter, so the line carries the counts alone).
     fn within(&self, name: &str) -> Result<()> {
+        if self.len > self.most {
+            tracing::debug!(
+                target: crate::ops::PLAN,
+                "bound most_instructions dropped {name} at {} instructions (the target holds {})",
+                self.len,
+                self.most
+            );
+        }
         ensure!(self.len <= self.most, TooLargeSnafu { name, instructions: self.len, most: self.most });
         Ok(())
     }

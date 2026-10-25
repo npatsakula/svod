@@ -17,7 +17,7 @@ use crate::layouts::{TileLayout, WarpGrid, chunked, fills_in_chunks};
 use super::attention::{FA_STAGES, QUERY_BLOCKS};
 use super::cost::{Planner, Run, STEP, cached};
 use super::gemm::DEPTHS;
-use super::search::{Rejected, Tiled, sorted};
+use super::search::{Rejected, Tiled, fired, sorted};
 
 impl NearestCfg {
     /// The depth a trip's product spans: the whole `d` resident, else a chunk.
@@ -562,20 +562,32 @@ impl NearestProblem {
     /// candidate block, the rows resident or streamed at every depth chunk,
     /// every ring depth and unrolling.
     pub fn lattice(&self, target: &Target) -> Vec<NearestCfg> {
-        let stages: &[usize] = if target.fill == Fill::CpAsync { &FA_STAGES } else { &NEAREST_STAGED };
-        // A list in registers up to their most; a long one queued into the
-        // outputs and listed from a score matrix as well.
+        self.span(target, &self.lists())
+    }
+
+    /// The list forms the lattice spans: a list in registers up to their
+    /// most ([`REGISTER_K`]); a long one ([`LONG_FROM`] on) queued into the
+    /// outputs and listed from a score matrix as well, the listings
+    /// [filtered](SelectCfg::filter) where a row's trips are many to its
+    /// list's slots ([`FILTER_GROUPS`]).
+    fn lists(&self) -> Vec<(Option<usize>, Option<SelectCfg>)> {
         let registers = (self.k <= REGISTER_K).then_some((None, None));
         let long = self.k >= LONG_FROM;
         let queued = QUEUES.into_iter().filter(|&q| long && q < self.k).map(|q| (Some(q), None));
-        // Filtered where a row's trips are many to its list's slots.
         let filters =
             [false, true].into_iter().filter(|&f| !f || self.m >= FILTER_GROUPS * self.k * CANDIDATE_BLOCKS[0]);
         let selects =
             filters.flat_map(|filter| SELECT_QUEUES.map(|queue| SelectCfg { warps: SELECT_WARPS, queue, filter }));
         let selects = selects.filter(|s| long && s.fits(self.k)).map(|s| (None, Some(s)));
-        let lists: Vec<(Option<usize>, Option<SelectCfg>)> =
-            registers.into_iter().chain(queued).chain(selects).collect();
+        registers.into_iter().chain(queued).chain(selects).collect()
+    }
+
+    /// The tiles, depth chunks and pipelines the lattice spans each list
+    /// form of [`Self::lists`] over: the body of [`Self::lattice`], handed
+    /// the list forms to span (the bounds' fire-log prices what they cut
+    /// over the same tiles).
+    fn span(&self, target: &Target, lists: &[(Option<usize>, Option<SelectCfg>)]) -> Vec<NearestCfg> {
+        let stages: &[usize] = if target.fill == Fill::CpAsync { &FA_STAGES } else { &NEAREST_STAGED };
         let mut out = vec![];
         for bq in QUERY_BLOCKS {
             for warp_rows in NEAREST_WARP_ROWS.into_iter().filter(|&r| bq.is_multiple_of(r)) {
@@ -587,7 +599,7 @@ impl NearestProblem {
                     for bk in NEAREST_DEPTHS.map(|bk| bk.map(|bk| bk * 2 / self.dtype.bytes())) {
                         for &stages in stages {
                             for unroll in [false, true] {
-                                for &(queue, select) in &lists {
+                                for &(queue, select) in lists {
                                     let cfg = NearestCfg::new(bq, bkv, stages);
                                     let cfg = NearestCfg { unroll, warp_rows, bk, queue, select, ..cfg };
                                     if self.k == 1 || select.is_some() {
@@ -637,16 +649,75 @@ impl NearestProblem {
         // A score matrix's listing costs alike whatever its product's tile:
         // the cheapest few products a listing.
         admitted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let gather = tracing::enabled!(target: crate::ops::PLAN, tracing::Level::DEBUG);
+        let mut matrix = Vec::new();
         let mut products: HashMap<SelectCfg, HashSet<NearestCfg>> = HashMap::new();
-        admitted.retain(|(_, _, c)| {
+        admitted.retain(|&(ns, _, c)| {
             let Some(select) = c.select else { return true };
             let tiles = products.entry(select).or_default();
             if tiles.len() < MATRIX_TILES {
                 tiles.insert(c.tile());
             }
-            tiles.contains(&c.tile())
+            let keep = tiles.contains(&c.tile());
+            if !keep && gather {
+                matrix.push(ns);
+            }
+            keep
         });
-        sorted(self, admitted, count).into_iter().map(|(_, _, c)| c).collect()
+        let ranked = sorted(self, admitted, count);
+        if gather && let Some(&(kept, ..)) = ranked.first() {
+            fired("MATRIX_TILES", &matrix, kept);
+            self.cut(planner, kept);
+        }
+        ranked.into_iter().map(|(_, _, c)| c).collect()
+    }
+
+    /// The fire-log of the bounds that cut whole variant families out of
+    /// the lattice, `kept` the ranking's best: what [`LONG_FROM`],
+    /// [`FILTER_GROUPS`] and [`PASS_DEALS`] cut, priced by admitting the cut
+    /// candidates over the tiles [`Self::span`] walks. [`REGISTER_K`] and
+    /// [`MOST_DEALS`] also reject in [`Self::admit`], so what they cut
+    /// cannot be priced by it; only run with the plan log's debug level on.
+    fn cut(&self, planner: &Planner, kept: f64) {
+        let target = &planner.device.target;
+        let price = |forms: Vec<(Option<usize>, Option<SelectCfg>)>| {
+            self.span(target, &forms)
+                .into_iter()
+                .filter_map(|c| self.admit(planner, &c).ok().map(|(ns, _)| ns))
+                .collect::<Vec<_>>()
+        };
+        // The queued and score-matrix forms under LONG_FROM.
+        if self.k < LONG_FROM {
+            let queued = QUEUES.into_iter().filter(|&q| q < self.k).map(|q| (Some(q), None));
+            let selects = SELECT_QUEUES
+                .into_iter()
+                .map(|queue| SelectCfg { warps: SELECT_WARPS, queue, filter: false })
+                .filter(|s| s.fits(self.k))
+                .map(|s| (None, Some(s)));
+            fired("LONG_FROM", &price(queued.chain(selects).collect()), kept);
+        }
+        // The filtered listings under FILTER_GROUPS' trip count; where
+        // LONG_FROM already cut every form, they are its cut, not this one's.
+        if self.k >= LONG_FROM && self.m < FILTER_GROUPS * self.k * CANDIDATE_BLOCKS[0] {
+            let filtered = SELECT_QUEUES
+                .into_iter()
+                .map(|queue| SelectCfg { warps: SELECT_WARPS, queue, filter: true })
+                .filter(|s| s.fits(self.k))
+                .map(|s| (None, Some(s)))
+                .collect();
+            fired("FILTER_GROUPS", &price(filtered), kept);
+        }
+        // The pass variant of every dealt config PASS_DEALS skipped.
+        let passes: Vec<f64> = self
+            .lattice(target)
+            .into_iter()
+            .filter_map(|c| {
+                let lanes = c.lanes.filter(|l| !l.passes && c.bkv / l.width < PASS_DEALS)?;
+                let twin = NearestCfg { lanes: Some(LaneQueue { passes: true, ..lanes }), ..c };
+                self.admit(planner, &twin).ok().map(|(ns, _)| ns)
+            })
+            .collect();
+        fired("PASS_DEALS", &passes, kept);
     }
 }
 
@@ -728,6 +799,24 @@ impl Planner {
         let priced = (0..=most.ilog2()).map(|b| 1 << b).filter_map(|s| cost(s).map(|ns| (ns, s)));
         let priced = priced.min_by(|a, b| a.0.total_cmp(&b.0)).map_or(1, |(_, s)| s);
         let splits = if cfg.bk.is_some() && p.k <= REREAD_K { fill.max(priced) } else { priced };
+        if tracing::enabled!(target: crate::ops::PLAN, tracing::Level::DEBUG)
+            && let Some(kept) = cost(splits)
+        {
+            // SPLIT_TILES keeps every share `SPLIT_TILES` candidate tiles at
+            // least: the counts past `most`, against the count kept.
+            let past: Vec<f64> =
+                (most.ilog2() + 1..=p.m.div_ceil(cfg.bkv).ilog2()).flat_map(|b| cost(1 << b)).collect();
+            fired("SPLIT_TILES", &past, kept);
+            // REREAD_K: the fill the rereads would share the bound held
+            // back for a longer list.
+            if cfg.bk.is_some()
+                && p.k > REREAD_K
+                && fill > priced
+                && let Some(ns) = cost(fill)
+            {
+                fired("REREAD_K", &[ns], kept);
+            }
+        }
         (splits > 1).then_some(splits)
     }
 

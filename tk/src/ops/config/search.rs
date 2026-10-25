@@ -73,21 +73,73 @@ pub(super) fn sorted<C: Tiled + Debug>(
     for (rank, (ns, regs, cfg)) in ranked.iter().take(LOGGED).enumerate() {
         tracing::debug!(target: crate::ops::PLAN, rank, ns, regs, ?cfg, "ranked");
     }
+    // The shortlist times the first [`SHORTLIST`] tiles of this list and the
+    // twins stage the first [`TWIN_TILES`] of its contenders, so a candidate
+    // on a tile past them is never measured; a GEMM shortlist walks the
+    // [`spread`] order, this the ranked one.
+    if tracing::enabled!(target: crate::ops::PLAN, tracing::Level::DEBUG)
+        && let Some(&(kept, ..)) = ranked.first()
+    {
+        let mut seen = HashSet::new();
+        let (mut twins, mut shortlist) = (Vec::new(), Vec::new());
+        for &(ns, _, c) in &ranked {
+            if seen.insert(c.tile()) {
+                if seen.len() > TWIN_TILES {
+                    twins.push(ns);
+                }
+                if seen.len() > SHORTLIST {
+                    shortlist.push(ns);
+                }
+            }
+        }
+        fired("TWIN_TILES", &twins, kept);
+        fired("SHORTLIST", &shortlist, kept);
+    }
     ranked
+}
+
+/// A search bound's fire-log: `bound` cut the modeled costs `dropped` from
+/// a ranking whose kept best costs `kept`, and the cheapest of them within
+/// [`BAND`] of it is a candidate it may have taken a contender from. One
+/// line per shape names the bound, how many it cut within the band and that
+/// one's ratio to the kept best; a bound whose cut sat outside the band
+/// stays silent. The gathering at each bound runs only with the plan log's
+/// debug level on ([`crate::ops::PLAN`]): never by default.
+pub(super) fn fired(bound: &str, dropped: &[f64], kept: f64) {
+    let within: Vec<f64> = dropped.iter().copied().filter(|cost| *cost <= BAND * kept).collect();
+    let Some(best) = within.iter().copied().reduce(f64::min) else { return };
+    tracing::debug!(
+        target: crate::ops::PLAN,
+        "bound {bound} dropped {} within band (best dropped {:.2}x of kept)",
+        within.len(),
+        best / kept
+    );
 }
 
 /// Drops the configs of `ranked` (cheapest first) past [`PRUNED_PAST`] times
 /// the cheapest one's cost once [`KEPT_TILES`] tiles are kept.
 pub(crate) fn prune<C: Tiled>(ranked: &mut Vec<(f64, u32, C)>) {
     let Some(&(cheapest, ..)) = ranked.first() else { return };
+    let gather = tracing::enabled!(target: crate::ops::PLAN, tracing::Level::DEBUG);
     let mut tiles = HashSet::new();
-    ranked.retain(|(cost, _, c)| {
-        let keep = *cost <= PRUNED_PAST * cheapest || tiles.len() < KEPT_TILES;
+    let (mut past, mut kept) = (Vec::new(), Vec::new());
+    let mut out = Vec::with_capacity(ranked.len());
+    for (cost, regs, c) in ranked.drain(..) {
+        let keep = cost <= PRUNED_PAST * cheapest || tiles.len() < KEPT_TILES;
         if keep {
             tiles.insert(c.tile());
+            out.push((cost, regs, c));
+        } else if gather {
+            // Past the cost band [`PRUNED_PAST`] drops it; within, the kept
+            // tiles ran out: [`KEPT_TILES`].
+            (if cost > PRUNED_PAST * cheapest { &mut past } else { &mut kept }).push(cost);
         }
-        keep
-    });
+    }
+    *ranked = out;
+    if gather {
+        fired("PRUNED_PAST", &past, cheapest);
+        fired("KEPT_TILES", &kept, cheapest);
+    }
 }
 
 /// Search bound: the configs of a ranking logged with their costs.
