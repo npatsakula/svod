@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ops = at("--op").and_then(|i| args.get(i + 1)).map(|o| o.split(',').collect::<Vec<_>>());
     let check = at("--check").is_some();
     let ablate = at("--ablate").and_then(|i| args.get(i + 1)).cloned();
+    let claims = at("--claims").is_some();
     let store = opt.map(PathBuf::from).or_else(|| TuneStore::global().root().map(PathBuf::from));
     let Some(store) = store.filter(|s| s.is_dir()) else {
         return Err("no tune store: pass --store DIR (or set SVOD_TK_TUNE_DIR)".into());
@@ -75,6 +76,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "    {:<6} zeroed: rho {} ({delta})",
                         cluster,
                         rho.map_or("-".into(), |r| format!("{r:.3}"))
+                    );
+                }
+            }
+        }
+        if claims {
+            for diffused in rank::claims(&svod_tk::atoms::Target::card("rtx3060").expect("a card")) {
+                println!("  {} ({} layout regs):", diffused.name, diffused.regs);
+                for (what, predicted, program, holds) in &diffused.rows {
+                    println!(
+                        "    {:<16} predicted {:>10.1}   program {:>10.1}   {}",
+                        what,
+                        predicted,
+                        program,
+                        if *holds { "holds" } else { "outside ±15%" }
                     );
                 }
             }

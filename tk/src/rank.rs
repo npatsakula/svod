@@ -758,3 +758,287 @@ fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize
     }
     out
 }
+
+/// What a lowered program's instruction list counts by category: the
+/// quantities the claim diff holds a config's program to. The list is the
+/// code one warp runs, its loops rolled where a body holds a product, so a
+/// rolled trip's counts sit in it once; the fill counts every thread's
+/// loads (`cp.async` copies by their width, on the targets that fill
+/// through them).
+pub struct Counted {
+    /// The whole program's instruction count.
+    pub instructions: usize,
+    /// The shared bytes the program declares.
+    pub smem: usize,
+    /// Matrix instructions (`wmma`).
+    pub steps: usize,
+    /// VALU operations (arithmetic, logic, casts).
+    pub valu: usize,
+    /// The bytes of global memory the program's loads move.
+    pub fill: usize,
+}
+
+/// What `program`'s linear list holds, by category.
+pub fn counted(program: &svod_ir::UOp) -> Option<Counted> {
+    use svod_dtype::AddrSpace;
+    use svod_ir::Op;
+    use svod_ir::ops;
+    let Op::Program(ops::Program { linear: Some(linear), .. }) = program.op() else { return None };
+    let list: Vec<_> = linear.op().sources().to_vec();
+    // A buffer's address space, and the shared bytes its declaration holds.
+    let mut spaces: HashMap<u64, AddrSpace> = HashMap::new();
+    let mut smem = 0;
+    for u in &list {
+        let arg = match u.op() {
+            Op::Buffer(ops::Buffer { arg, .. }) | Op::Param(ops::Param { arg, .. }) => arg,
+            _ => continue,
+        };
+        let Some(space) = arg.addrspace else { continue };
+        if space == AddrSpace::Local {
+            match u.op().sources()[0].op() {
+                Op::Const(elems) => {
+                    smem += match elems.0 {
+                        svod_ir::ConstValue::Int(elems) => elems.max(0) as usize * u.dtype().bytes(),
+                        _ => 0,
+                    }
+                }
+                _ => return None,
+            }
+        }
+        spaces.insert(u.id, space);
+    }
+    // The buffer a load reads (a view chain), for the space it loads from.
+    let space_of = |u: &std::sync::Arc<svod_ir::UOp>| -> Option<AddrSpace> {
+        let mut at = u;
+        for _ in 0..8 {
+            match at.op() {
+                Op::Buffer(..) | Op::Param(..) => return spaces.get(&at.id).copied(),
+                Op::Shrink(ops::Shrink { src, .. }) => at = src,
+                Op::Slice(ops::Slice { buffer, .. }) | Op::Index(ops::Index { buffer, .. }) => at = buffer,
+                Op::GetAddr(ops::GetAddr { src, .. }) => at = src,
+                _ => return None,
+            }
+        }
+        None
+    };
+    let mut out = Counted { instructions: list.len(), smem, steps: 0, valu: 0, fill: 0 };
+    for u in &list {
+        match u.op() {
+            Op::Wmma(..) => out.steps += 1,
+            Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..) => out.valu += 1,
+            // A `cp.async` copy moves its width's bytes from global memory
+            // without a load the list would hold.
+            Op::Custom(ops::Custom { code, .. }) if code.contains("cp.async") => out.fill += 16,
+            Op::Load(..) if space_of(u) == Some(AddrSpace::Global) => out.fill += u.dtype().bytes(),
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// A config's predicted resource claim, the quantities the cost model
+/// counts, outside the fused ns — the seed of the Claim vocabulary: what a
+/// trip of the config's kernel should hold. The VALU count keeps the
+/// epilogue's own units (a pair's operations, a listing's share), which a
+/// program's instruction mix only sometimes maps.
+pub struct Claim {
+    /// Matrix-core steps a trip, in the target's atom instructions.
+    pub steps: f64,
+    /// VALU operations a trip.
+    pub ops: f64,
+    /// The bytes a trip fills from global memory.
+    pub fill: usize,
+    /// The shared memory the config declares.
+    pub smem: usize,
+    /// The registers a lane holds by the layout count.
+    pub regs: u32,
+}
+
+/// One config's claim against its program: per quantity the predicted
+/// value, the program's own count, and whether they hold within ±15 % —
+/// a quantity that cannot map is reported, not forced.
+pub struct Diffed {
+    pub name: String,
+    /// `(quantity, predicted, program, holds)`.
+    pub rows: Vec<(&'static str, f64, f64, bool)>,
+    /// The registers a lane holds by the layout count: the linear list
+    /// holds no register count (the compiler's verdict, not the program's).
+    pub regs: u32,
+}
+
+/// How far a program's count may sit from the claim it checks.
+const HOLDS: f64 = 0.15;
+
+/// A sample of each family's configs emitted and counted against the
+/// model's predictions — the GEMM tiles of a 4096³ plan, two attention
+/// configs, nearest at `k = 1` resident and streamed, a register list at
+/// `k = 64` and a split at `k = 8` — on `target`'s planner under the
+/// declared guessed costs. The tensors are small (the interpreter's
+/// shapes); the tiles are those a large shape plans.
+pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
+    use crate::build::{BF16, F16};
+    use crate::kernels::attention::{AttnMask, AttnSpec, attention};
+    use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
+    use crate::kernels::nearest::{Live, Metric, NearestSpec, nearest};
+    use crate::kernels::{Act, Batch};
+
+    let device = crate::atoms::Device { target: target.clone(), costs: crate::probe::GUESSED };
+    let planner = Planner::new(device.clone()).expect("an SM count");
+    let lowering = crate::lower::Lowering::new(&device);
+    let atom_step = target.geometry().expect("a matrix core").m as usize
+        * target.geometry().expect("a matrix core").n as usize
+        * target.geometry().expect("a matrix core").k as usize;
+    // The program's list is one warp's code, its loads one thread's: the
+    // block's per-trip claim divides by the warps for the steps and the
+    // VALU, and its fill bytes compare against the threads' loads together.
+    let diff = |name: String, claim: Claim, warps: usize, prog: crate::ir::Program| -> Option<Diffed> {
+        let counted = counted(&crate::lower::standalone(prog, &lowering).ok()?.program)?;
+        let threads = (warps * target.wave as usize) as f64;
+        let row = |what: &'static str, predicted: f64, program: f64| {
+            (what, predicted, program, (program - predicted).abs() <= HOLDS * predicted.max(1.0))
+        };
+        Some(Diffed {
+            name,
+            regs: claim.regs,
+            rows: vec![
+                row("steps/trip", claim.steps / warps as f64, counted.steps as f64),
+                row("fill bytes/trip", claim.fill as f64, counted.fill as f64 * threads),
+                row("valu ops/trip", claim.ops, counted.valu as f64 * warps as f64),
+                row("smem", claim.smem as f64, counted.smem as f64),
+            ],
+        })
+    };
+    let mut out: Vec<(String, Claim, usize, crate::ir::Program)> = vec![];
+    // GEMM: the leading tiles of a 4096³ plan, emitted small.
+    for cfg in config::distinct(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).take(3) {
+        let [bm, bn, bk] = cfg.tile;
+        let claim = Claim {
+            steps: (bm * bn * bk) as f64 / atom_step as f64,
+            ops: 0.0,
+            fill: (bm + bn) * bk * 2,
+            smem: cfg.smem_bytes(false, 2),
+            regs: cfg.registers(target, 1).expect("ranked"),
+        };
+        let spec = GemmSpec {
+            m: 130,
+            n: 192,
+            k: cfg.tile[2] * 8,
+            batch: Batch::Static(1),
+            epilogue: Epilogue { act: Act::Gelu, ..Epilogue::DEFAULT },
+            cfg,
+        };
+        out.push((format!("gemm {:?}", cfg.tile), claim, (cfg.warps[0] * cfg.warps[1]) as usize, gemm::<BF16>(&spec)));
+    }
+    // Attention: two configs of a d64 causal plan, emitted small.
+    for cfg in config::distinct(&planner.attention_ranked(8, 100, 100, 64, true, false)).take(2) {
+        let claim = Claim {
+            steps: (2 * cfg.bq * cfg.bkv * 64) as f64 / atom_step as f64,
+            ops: (cfg.key_warps * cfg.bq * cfg.bkv) as f64,
+            fill: cfg.key_warps * 2 * cfg.bkv * 64 * 2,
+            smem: cfg.smem_bytes(64, false),
+            regs: cfg.registers(target, 64, false).expect("ranked"),
+        };
+        let spec = AttnSpec {
+            batch: Batch::Static(2),
+            t: 100,
+            tk: 100,
+            heads: 4,
+            kv_heads: 2,
+            d: 64,
+            mask: AttnMask { causal: true, ..AttnMask::default() },
+            cache: None,
+            scale: 0.125,
+            cfg,
+        };
+        out.push((format!("attention {}x{}", cfg.bq, cfg.bkv), claim, cfg.warps() as usize, attention::<BF16>(&spec)));
+    }
+    // Nearest: k = 1 resident and streamed, a register list at k = 64, a
+    // split at k = 8.
+    let problem = |k| NearestProblem {
+        n: 1 << 16,
+        m: 1 << 16,
+        d: 128,
+        dtype: ScalarDType::Float16,
+        metric: Metric::SquaredL2,
+        floors: Floors::default(),
+        groups: false,
+        k,
+    };
+    let spec = |cfg, k| NearestSpec {
+        n: 100,
+        m: 960,
+        d: 128,
+        metric: Metric::SquaredL2,
+        floors: Floors::default(),
+        groups: false,
+        k,
+        cfg,
+        live: Live::default(),
+    };
+    let ranked = planner.nearest_ranked(problem(1));
+    for (name, way) in [
+        ("resident", ranked.iter().find(|c| c.bk.is_none()).copied()),
+        ("streamed", ranked.iter().find(|c| c.bk.is_some()).copied()),
+    ] {
+        let Some(cfg) = way else { continue };
+        let claim = nearest_claim(&planner, &problem(1), &cfg, atom_step);
+        out.push((
+            format!("nearest k1 {name} {}x{}", cfg.bq, cfg.bkv),
+            claim,
+            cfg.warps() as usize,
+            nearest::<F16>(&spec(cfg, 1)),
+        ));
+    }
+    let ranked = planner.nearest_ranked(problem(64));
+    if let Some(&cfg) = ranked.iter().find(|c| c.queue.is_none() && c.select.is_none()) {
+        let claim = nearest_claim(&planner, &problem(64), &cfg, atom_step);
+        out.push((
+            format!("nearest k64 list {}x{}", cfg.bq, cfg.bkv),
+            claim,
+            cfg.warps() as usize,
+            nearest::<F16>(&spec(cfg, 64)),
+        ));
+    }
+    let split_problem = NearestProblem { n: 256, m: 1 << 20, ..problem(8) };
+    let ranked = planner.nearest_ranked(split_problem);
+    let split = planner.nearest_splits(&split_problem, &config::distinct(&ranked).take(16).collect::<Vec<_>>());
+    if let Some(&cfg) = split.iter().find(|c| c.splits > 1 && c.splits <= 32) {
+        let claim = nearest_claim(&planner, &split_problem, &cfg, atom_step);
+        let mut split_spec = spec(cfg, 8);
+        split_spec.m = cfg.splits * cfg.bkv * 2;
+        out.push((
+            format!("nearest k8 split {} {}x{}", cfg.splits, cfg.bq, cfg.bkv),
+            claim,
+            cfg.warps() as usize,
+            nearest::<F16>(&split_spec),
+        ));
+    }
+    out.into_iter().filter_map(|(name, claim, warps, prog)| diff(name, claim, warps, prog)).collect()
+}
+
+/// A nearest config's predicted claim: a trip's steps in atom instructions,
+/// its epilogue's operation count (every pair's, and a list's the listing's
+/// share a trip), the bytes it fills, its declared shared memory and the
+/// registers a lane holds.
+fn nearest_claim(planner: &Planner, p: &NearestProblem, cfg: &NearestCfg, atom_step: usize) -> Claim {
+    use crate::ops::config::{GROUPS_PAIR, NEAREST_PAIR, PAIR_OP, Weights};
+    let target = &planner.device.target;
+    let depth = cfg.bk.unwrap_or(p.d);
+    let chunks = p.d.div_ceil(depth);
+    let ops = [p.metric.row_norms(), p.floors.row, p.floors.col].iter().filter(|&&on| on).count() as f64
+        + if p.dtype.bytes() == 1 { 3.0 } else { 0.0 };
+    let pairs = (cfg.bq * cfg.bkv) as f64 / chunks as f64;
+    let mut epilogue = pairs * (NEAREST_PAIR + ops * PAIR_OP + if p.groups { GROUPS_PAIR } else { 0.0 });
+    if p.k > 1 && cfg.select.is_none() {
+        epilogue += p.listing(cfg, cfg.lane_queue(), target.wave, &Weights::same()) * cfg.warps() as f64
+            / (p.m.div_ceil(cfg.bkv) * chunks) as f64;
+    }
+    let filled = cfg.bkv + usize::from(cfg.bk.is_some()) * cfg.bq;
+    Claim {
+        steps: (cfg.bq * cfg.bkv * depth) as f64 / atom_step as f64,
+        ops: epilogue,
+        fill: filled * depth * p.dtype.bytes(),
+        smem: cfg.smem_bytes(p.d, p.dtype),
+        regs: cfg.registers(target, p.d, p.k, p.dtype).expect("ranked"),
+    }
+}

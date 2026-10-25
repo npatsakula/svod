@@ -158,12 +158,12 @@ impl NearestCfg {
 /// two of them reductions, where the softmax's `exp2` stands for the
 /// argmin's select. The argmin's three run only in the warps a trip lowers
 /// some row of, ever fewer as the trips pass; the model charges them all.
-const NEAREST_PAIR: f64 = 1.0;
+pub(crate) const NEAREST_PAIR: f64 = 1.0;
 /// Model: one more elementwise operation a pair, in the same units: the
 /// row's norm added, a floor's maximum, the L2 clamp.
-const PAIR_OP: f64 = 0.2;
+pub(crate) const PAIR_OP: f64 = 0.2;
 /// Model: what groups add to a pair: a compare and a select.
-const GROUPS_PAIR: f64 = 2.0 * PAIR_OP;
+pub(crate) const GROUPS_PAIR: f64 = 2.0 * PAIR_OP;
 /// Model: a deal's least an element ([`crate::kernels::nearest::nearest`]
 /// with `k > 1`), in units of [`Costs::score`]: the minimum a lane's scores
 /// enter a trip's rounds with.
@@ -559,7 +559,7 @@ impl NearestProblem {
     /// [`LIST_SLOT`] a row's slot a stage. Queued, the merges of that list
     /// into the outputs too, one each time the warp's lists take a
     /// [`QUEUE_FILLED`] share of the room they leave the lanes' queues.
-    fn listing(&self, cfg: &NearestCfg, lanes: LaneQueue, wave: u32, w: &Weights) -> f64 {
+    pub(crate) fn listing(&self, cfg: &NearestCfg, lanes: LaneQueue, wave: u32, w: &Weights) -> f64 {
         let LaneQueue { width, depth, passes } = lanes;
         let (rows, tiles, wave) = (cfg.warp_rows as f64, self.m.div_ceil(cfg.bkv), f64::from(wave));
         let deals = (cfg.bkv / width) as f64;

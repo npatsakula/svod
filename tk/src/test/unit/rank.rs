@@ -183,3 +183,38 @@ fn the_op_layers_tuning_reads_the_same_line() {
         tuned::linear(&TuneStore::replay(dir.to_path_buf()), &planner, svod_dtype::DType::BFloat16, &ranked, spec).cfg;
     assert_eq!(pick, representatives(&ranked)[3], "the line's fastest, at 600 ns");
 }
+
+/// The claim diff's mappings that hold: a trip's matrix steps in the
+/// target's atom instructions and the config's declared shared memory are
+/// exact on every family's sample — the model counts what the program does.
+#[test]
+fn the_claimed_steps_and_smem_hold_their_programs() {
+    let diffed = rank::claims(&sm86());
+    assert!(diffed.len() >= 8, "{:?}", diffed.iter().map(|d| &d.name).collect::<Vec<_>>());
+    for d in &diffed {
+        let row = |what: &str| d.rows.iter().find(|(w, ..)| *w == what).copied().expect(what);
+        let (_, predicted, program, holds) = row("steps/trip");
+        assert!((predicted - program).abs() < 0.5 && holds, "{}: {predicted} steps against {program}", d.name);
+        let (_, predicted, program, holds) = row("smem");
+        assert_eq!((predicted, program, holds), (predicted, predicted, true), "{}: shared bytes", d.name);
+    }
+}
+
+/// The claim diff's reported opacity: the program moves the model's fill
+/// bytes once to about twice over — the ring's staging and the fill
+/// layout's per-thread assignment against the model's block mean — and the
+/// VALU count only sometimes maps (a GEMM's epilogue the model prices no
+/// operations of; a nearest list's dealt rounds the model counts as an
+/// average). Bounded, not pinned.
+#[test]
+fn the_claimed_fill_and_valu_are_bounded_not_pinned() {
+    for d in &rank::claims(&sm86()) {
+        let (_, predicted, program, _) = d.rows.iter().find(|(w, ..)| *w == "fill bytes/trip").expect("the fill");
+        let (predicted, program) = (*predicted, *program);
+        assert!(
+            predicted <= program && program <= 2.5 * predicted.max(1.0),
+            "{}: the program moves {program} of {predicted} fill bytes",
+            d.name
+        );
+    }
+}
