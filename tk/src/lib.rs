@@ -28,6 +28,7 @@ pub mod lower;
 pub mod ops;
 pub mod oracle;
 pub mod probe;
+pub mod rank;
 pub mod schedule;
 #[doc(hidden)]
 pub mod sweep;

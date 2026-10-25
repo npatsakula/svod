@@ -311,7 +311,7 @@ impl Kind {
 
 impl Entry {
     /// The entry's numbers as its line holds them after the key.
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         match self {
             Entry::Choice(timed) => timed.iter().map(|(i, ns)| format!("{i} {ns}")).collect::<Vec<_>>().join(" "),
             Entry::Value(v) => v.to_string(),
@@ -320,7 +320,7 @@ impl Entry {
     }
 
     /// The entry a line of `kind` with `numbers` after its key records.
-    fn parse(kind: &str, numbers: &[u64]) -> Option<Self> {
+    pub(crate) fn parse(kind: &str, numbers: &[u64]) -> Option<Self> {
         match (kind, numbers) {
             ("choice", pairs) if !pairs.is_empty() && pairs.len().is_multiple_of(2) => {
                 Some(Entry::Choice(pairs.chunks(2).map(|p| (p[0] as usize, p[1])).collect()))

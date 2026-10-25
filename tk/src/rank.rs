@@ -1,0 +1,716 @@
+//! The rank harness: a tune store replayed offline, correlating the order
+//! the model predicts a shape's timed candidates with the ns the device
+//! measured for them. The instrument that gates every later model change
+//! (the config rework's §7.1): a store's `choice|` line holds every timed
+//! candidate of a shape, fastest first, and the candidates a line names are
+//! the ones the same ranking code regenerates — replay re-derives each
+//! stage's candidate list for the offline target under the costs the same
+//! store measured, and the digest in the line's key asserts the list: a
+//! line no hypothesis reproduces is skipped and counted, never guessed at.
+//!
+//! Per family and device: the Spearman ρ of predicted against measured
+//! order over the replayed lines, and the fraction of lines whose predicted
+//! best is the measured winner — the number tuning actually cares about.
+//! The stages follow [`crate::ops::Tuner`]: a shape's ranking admitted, its
+//! candidates expanded as the op layer expands them, screened, and the
+//! leading tiles' pipelines timed again; a stage's lookup missing (a wrong
+//! salt, another ranking) hands the shape to the next hypothesis.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use svod_dtype::{AmdArch, CudaArch, GpuArch, ScalarDType};
+
+use crate::atoms::{CARDS, Target};
+use crate::ir::Var;
+use crate::kernels::attention::{AttnMask, Bias, FaCfg};
+use crate::kernels::conv::{ConvCfg, ConvGeom};
+use crate::kernels::gemm::{Epilogue, GemmCfg};
+use crate::kernels::nearest::{Floors, Live, Metric, NearestCfg, NearestSpec};
+use crate::kernels::{Act, Batch};
+use crate::ops::DEVICE_TEST;
+use crate::ops::attention::split_ranked;
+use crate::ops::config::{self, AttentionProblem, GemmProblem, NearestProblem, Planner, Tiled, representatives};
+use crate::ops::nearest::Salt;
+use crate::tune::{self, Entry, Kind, TuneKey};
+
+/// A choice line the harness correlates holds at least this many timed
+/// candidates: a pair of softmax forms is a flip the model does not price
+/// (its configs tie), a line with no order to check.
+const LEAST_CANDIDATES: usize = 3;
+
+/// One device's store lines, by key.
+struct Lines {
+    /// Line key (up to the candidates' digest; whatever compiler and
+    /// programs wrote it) to its entry, several builds' lines of one key
+    /// holding the one the file's order gives.
+    entries: HashMap<String, Entry>,
+    /// The choice lines a replay found, by key prefix, with their timed
+    /// candidate counts: what was correlated, what was too short, and the
+    /// rest skipped.
+    found: HashMap<String, usize>,
+}
+
+impl Lines {
+    /// Every store file under `root` of this crate's version, its lines
+    /// merged by the device they name.
+    fn read(root: &Path) -> HashMap<String, Self> {
+        let mut out: HashMap<String, Self> = HashMap::new();
+        let suffix = format!("-v{}.txt", env!("CARGO_PKG_VERSION"));
+        for path in std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path()) {
+            if !path.is_file() || !path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&suffix)) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            if text.lines().next() != Some(format!("format {}", tune::FORMAT).as_str()) {
+                continue;
+            }
+            let entries = Self::parse(&text);
+            let Some(key) = entries.keys().next() else { continue };
+            let device = key.split('|').nth(2).unwrap_or_default().to_string();
+            let lines = out.entry(device).or_insert_with(|| Self { entries: HashMap::new(), found: HashMap::new() });
+            lines.entries.extend(entries);
+        }
+        out
+    }
+
+    /// Every readable `line -> entry` of a store file's text.
+    fn parse(text: &str) -> HashMap<String, Entry> {
+        text.lines()
+            .skip(1)
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let key = fields.next()?;
+                let numbers: Vec<u64> = fields.map(str::parse).collect::<Result<_, _>>().ok()?;
+                Some((key.to_string(), Entry::parse(key.split('|').next()?, &numbers)?))
+            })
+            .collect()
+    }
+
+    /// The entry of `kind` a stage's `list` keys under `keying`, `None` when
+    /// no line holds that key: the digest asserts the list is the one the
+    /// store timed.
+    fn at<C: std::hash::Hash + std::fmt::Debug>(
+        &mut self,
+        kind: Kind,
+        keying: &Keying,
+        rule: &str,
+        list: &[C],
+    ) -> Option<Entry> {
+        let candidates = format!("{}{rule} {list:?}", keying.salt);
+        let key = TuneKey::new(keying.op, &keying.target, 0, keying.dtype, &keying.shape, &candidates);
+        let prefix = key.candidates(kind);
+        let mut found: Vec<&String> = self.entries.keys().filter(|l| l.starts_with(&prefix)).collect();
+        found.sort();
+        let entry = found.first().map(|l| self.entries[*l].clone());
+        if let (Kind::Choice, Some(Entry::Choice(timed))) = (kind, &entry) {
+            self.found.insert(prefix, timed.len());
+        }
+        entry
+    }
+
+    /// The candidates that ran, fastest first, each with its ns.
+    fn choice<C: std::hash::Hash + std::fmt::Debug>(
+        &mut self,
+        keying: &Keying,
+        rule: &str,
+        list: &[C],
+    ) -> Option<Vec<(usize, u64)>> {
+        match self.at(Kind::Choice, keying, rule, list)? {
+            Entry::Choice(timed) => Some(timed.iter().copied().collect()),
+            _ => None,
+        }
+    }
+
+    /// The ranked indices an admission kept.
+    fn admitted<C: std::hash::Hash + std::fmt::Debug>(
+        &mut self,
+        keying: &Keying,
+        rule: &str,
+        list: &[C],
+    ) -> Option<Vec<usize>> {
+        match self.at(Kind::Admitted, keying, rule, list)? {
+            Entry::Admitted(at) => Some(at.to_vec()),
+            _ => None,
+        }
+    }
+
+    /// The index of the first clean config of a ranked list.
+    fn first<C: std::hash::Hash + std::fmt::Debug>(&mut self, keying: &Keying, list: &[C]) -> Option<usize> {
+        match self.at(Kind::First, keying, "", list)? {
+            Entry::Admitted(at) => at.first().copied(),
+            _ => None,
+        }
+    }
+
+    /// The choice lines by `(op, dtype, shape)` group, each group's by the
+    /// candidates' digest, with how many lines (builds) hold it.
+    fn by_group(&self) -> HashMap<String, Vec<(String, usize)>> {
+        let mut out: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        for key in self.entries.keys().filter(|k| k.starts_with("choice|")) {
+            let fields: Vec<&str> = key.split('|').collect();
+            let group = fields[..5].join("|");
+            let prefix = fields[..6].join("|");
+            let list = out.entry(group).or_default();
+            match list.iter_mut().find(|(p, _)| *p == prefix) {
+                Some((_, count)) => *count += 1,
+                None => list.push((prefix, 1)),
+            }
+        }
+        out
+    }
+}
+
+/// What one tuning attempt keys every stage's lines by: the op, the
+/// device's target, dtype, shape and salt.
+struct Keying {
+    op: &'static str,
+    target: Target,
+    dtype: ScalarDType,
+    shape: Vec<usize>,
+    salt: String,
+}
+
+impl Keying {
+    fn new(op: &'static str, planner: &Planner, dtype: ScalarDType, shape: &[usize], salt: String) -> Self {
+        Self { op, target: planner.device.target.clone(), dtype, shape: shape.to_vec(), salt }
+    }
+}
+
+/// One replayed `choice|` line: the candidates its key asserts, what the
+/// model says they cost, and the ns the device measured.
+pub struct Replay {
+    /// `" screened"` (the shortlist's first pass) or `""` (the leading
+    /// tiles' pipelines timed again): the two stages of a shape's choice.
+    pub rule: &'static str,
+    pub configs: Configs,
+    /// The candidates that ran, in the line's (fastest first) order.
+    pub timed: Vec<(usize, u64)>,
+}
+
+/// The candidates a replayed line names, with the problem that ranks them.
+pub enum Configs {
+    Gemm {
+        problem: GemmProblem,
+        list: Vec<GemmCfg>,
+    },
+    Attention {
+        problem: AttentionProblem,
+        list: Vec<FaCfg>,
+    },
+    Nearest {
+        problem: NearestProblem,
+        list: Vec<NearestCfg>,
+    },
+    /// A convolution's GEMM body; its splits the model does not price (the
+    /// ranking orders the unsplit configs alone).
+    Conv {
+        problem: GemmProblem,
+        list: Vec<ConvCfg>,
+    },
+}
+
+impl Configs {
+    /// The ns of SM time the model ranks `at` of the list at.
+    fn cost(&self, planner: &Planner, at: usize) -> Option<f64> {
+        let of = |problem: &GemmProblem, cfg: &_| problem.admit(planner, cfg).ok().map(|(ns, _)| ns);
+        match self {
+            Self::Gemm { problem, list } => of(problem, &list[at]),
+            Self::Attention { problem, list } => problem.admit(planner, &list[at]).ok().map(|(ns, _)| ns),
+            Self::Nearest { problem, list } => problem.admit(planner, &list[at]).ok().map(|(ns, _)| ns),
+            Self::Conv { problem, list } => of(problem, &list[at].gemm),
+        }
+    }
+}
+
+impl Replay {
+    /// The model's predicted ns per timed candidate, in the line's order.
+    pub fn predicted(&self, planner: &Planner) -> Vec<f64> {
+        self.timed.iter().map(|&(at, _)| self.configs.cost(planner, at).unwrap_or(f64::MAX)).collect()
+    }
+
+    /// The measured ns per timed candidate, in the line's order.
+    fn measured(&self) -> Vec<f64> {
+        self.timed.iter().map(|&(_, ns)| ns as f64).collect()
+    }
+
+    /// Whether the model's best is the measured winner: the pick the tuner
+    /// would have made without timing.
+    pub fn top1(&self, planner: &Planner) -> bool {
+        let predicted = self.predicted(planner);
+        let best = predicted
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(at, _)| self.timed[at].0)
+            .expect("a timed line holds a candidate");
+        best == self.timed[0].0
+    }
+
+    /// The Spearman ρ of the model's order against the device's.
+    pub fn rho(&self, planner: &Planner) -> Option<f64> {
+        spearman(&self.predicted(planner), &self.measured())
+    }
+}
+
+/// One family's outcome over a device's store.
+pub struct Family {
+    pub name: &'static str,
+    /// The replayed choice lines ([`LEAST_CANDIDATES`] candidates at least).
+    pub lines: Vec<Replay>,
+    /// Every choice line of the family's ops in the store.
+    pub total: usize,
+    /// The choice lines a replay found, and of them the ones too short to
+    /// correlate (a pair of softmax forms).
+    pub replayed: usize,
+    pub short: usize,
+    /// The choice lines no hypothesis reproduced.
+    pub skipped: usize,
+}
+
+impl Family {
+    fn new(name: &'static str) -> Self {
+        Self { name, lines: vec![], total: 0, replayed: 0, short: 0, skipped: 0 }
+    }
+
+    /// The mean Spearman ρ over the lines, each shape's measurement weighing
+    /// alike.
+    pub fn rho(&self, planner: &Planner) -> Option<f64> {
+        let rhos: Vec<f64> = self.lines.iter().filter_map(|l| l.rho(planner)).collect();
+        (!rhos.is_empty()).then(|| rhos.iter().sum::<f64>() / rhos.len() as f64)
+    }
+
+    /// The fraction of lines whose predicted best is the measured winner.
+    pub fn top1(&self, planner: &Planner) -> Option<f64> {
+        (!self.lines.is_empty())
+            .then(|| self.lines.iter().filter(|l| l.top1(planner)).count() as f64 / self.lines.len() as f64)
+    }
+
+    /// The timed candidates over the lines.
+    pub fn candidates(&self) -> usize {
+        self.lines.iter().map(|l| l.timed.len()).sum()
+    }
+}
+
+/// One device's replay: its name, the cost fields its store could not
+/// measure, the planner its costs make, each family's lines, and the
+/// `(op dtype shape, lines)` groups no hypothesis reproduced.
+pub struct Device {
+    pub name: String,
+    pub unmeasured: Vec<&'static str>,
+    pub planner: std::sync::Arc<Planner>,
+    pub families: Vec<Family>,
+    pub skipped_groups: Vec<(String, usize)>,
+}
+
+/// Spearman's ρ of `a` against `b`: average ranks over ties, Pearson over
+/// the ranks; `None` where either side holds no variance to correlate.
+pub fn spearman(a: &[f64], b: &[f64]) -> Option<f64> {
+    let (ra, rb) = (ranks(a), ranks(b));
+    let n = ra.len() as f64;
+    let (ma, mb) = (ra.iter().sum::<f64>() / n, rb.iter().sum::<f64>() / n);
+    let (mut cov, mut va, mut vb) = (0.0, 0.0, 0.0);
+    for (&x, &y) in ra.iter().zip(&rb) {
+        cov += (x - ma) * (y - mb);
+        va += (x - ma) * (x - ma);
+        vb += (y - mb) * (y - mb);
+    }
+    (va > 0.0 && vb > 0.0).then(|| cov / (va * vb).sqrt())
+}
+
+/// The ranks of `x`, ties averaged.
+fn ranks(x: &[f64]) -> Vec<f64> {
+    let mut order: Vec<usize> = (0..x.len()).collect();
+    order.sort_by(|&i, &j| x[i].total_cmp(&x[j]));
+    let mut out = vec![0.0; x.len()];
+    let mut i = 0;
+    while i < order.len() {
+        let mut j = i + 1;
+        while j < order.len() && x[order[j]] == x[order[i]] {
+            j += 1;
+        }
+        for &at in &order[i..j] {
+            out[at] = (i + j - 1) as f64 / 2.0;
+        }
+        i = j;
+    }
+    out
+}
+
+/// Replays every device's lines under `root` (a device `wanted` does not
+/// name is left out, as is a family `ops` does not): the model's order of
+/// each choice line the store holds against the ns it measured, offline,
+/// no device opened. A shape's every salt that replays is correlated: two
+/// layers of one shape (a plain and a biased epilogue, say) are two
+/// measurements.
+pub fn replay(root: &Path, wanted: Option<&str>, ops: Option<&[&str]>) -> Vec<Device> {
+    let mut out = vec![];
+    for (name, mut lines) in Lines::read(root) {
+        if wanted.is_some_and(|w| !name.contains(w)) {
+            continue;
+        }
+        let Some(target) = target(&name) else {
+            eprintln!("{name}: no target of its arch; skipped");
+            continue;
+        };
+        let Some(measured) = crate::probe::stored(root, &target) else {
+            eprintln!("{name}: no readable store file; skipped");
+            continue;
+        };
+        let unmeasured = measured.unmeasured.clone();
+        let planner = std::sync::Arc::new(Planner::measured(target.clone(), measured).expect("an SM count"));
+        let mut groups: Vec<String> = lines.by_group().into_keys().collect();
+        groups.sort();
+        let mut kept: HashMap<&'static str, Family> = HashMap::new();
+        for group in groups {
+            let fields: Vec<&str> = group.split('|').collect();
+            let (op, dtype, shape) = (fields[1], fields[3], fields[4]);
+            let Some(dtype) = dtype_of(dtype) else { continue };
+            if ops.is_some_and(|want| !want.contains(&family_of(op, dtype))) {
+                continue;
+            }
+            let shape: Vec<usize> = shape.split('x').map(|n| n.parse().expect("a number")).collect();
+            let Some(op) =
+                ["linear", "gemm", "attention", "nearest", "conv2d"].into_iter().find(|known| *known == fields[1])
+            else {
+                continue;
+            };
+            let replays = match op {
+                "linear" | "gemm" => gemm(&mut lines, &planner, op, dtype, &shape),
+                "attention" => attention(&mut lines, &planner, dtype, &shape),
+                "nearest" => nearest(&mut lines, &planner, dtype, &shape),
+                _ => conv(&mut lines, &planner, dtype, &shape),
+            };
+            let name = family_of(op, dtype);
+            kept.entry(name)
+                .or_insert_with(|| Family::new(name))
+                .lines
+                .extend(replays.into_iter().filter(|r| r.timed.len() >= LEAST_CANDIDATES));
+        }
+        // What a family's lines came to: every choice line of its ops
+        // correlated, too short to correlate, or skipped — no hypothesis
+        // reproduced the list its digest names. Several builds' lines of
+        // one key count once found, as the replay reads one of them.
+        let mut skipped_groups: Vec<(String, usize)> = vec![];
+        for (group, prefixes) in lines.by_group() {
+            let fields: Vec<&str> = group.split('|').collect();
+            let Some(dtype) = dtype_of(fields[3]) else { continue };
+            if ops.is_some_and(|want| !want.contains(&family_of(fields[1], dtype))) {
+                continue;
+            }
+            let name = family_of(fields[1], dtype);
+            let family = kept.entry(name).or_insert_with(|| Family::new(name));
+            let mut skipped = 0;
+            for (prefix, count) in prefixes {
+                family.total += count;
+                match lines.found.get(&prefix) {
+                    Some(&candidates) if candidates >= LEAST_CANDIDATES => family.replayed += count,
+                    Some(_) => family.short += count,
+                    None => skipped += count,
+                }
+            }
+            if skipped > 0 {
+                skipped_groups.push((format!("{} {} {}", fields[1], fields[3], fields[4]), skipped));
+            }
+        }
+        for family in kept.values_mut() {
+            family.skipped = family.total - family.replayed - family.short;
+        }
+        skipped_groups.sort();
+        let mut families: Vec<Family> = kept.into_values().filter(|f| f.total > 0).collect();
+        families.sort_by_key(|f| f.name);
+        out.push(Device { name, unmeasured, planner, families, skipped_groups });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// The family an op and dtype belong to; ops the harness does not replay
+/// (norm, heads) count under `other`.
+fn family_of(op: &str, dtype: ScalarDType) -> &'static str {
+    match op {
+        "linear" | "gemm" => "gemm",
+        "attention" => "attention",
+        "nearest" if dtype == ScalarDType::Int8 => "nearest i8",
+        "nearest" => "nearest",
+        "conv2d" => "conv",
+        _ => "other",
+    }
+}
+
+/// The dtype a line's key names.
+fn dtype_of(name: &str) -> Option<ScalarDType> {
+    match name {
+        "Float16" => Some(ScalarDType::Float16),
+        "BFloat16" => Some(ScalarDType::BFloat16),
+        "Int8" => Some(ScalarDType::Int8),
+        _ => None,
+    }
+}
+
+/// The offline target of a device's name in the store ([`tune::device`]):
+/// its arch and SM count, the dies of its arch's first listed card.
+fn target(device: &str) -> Option<Target> {
+    let (arch, sms) = device.rsplit_once('-')?;
+    let sms = sms.strip_suffix("sm")?.parse().ok()?;
+    let arch = match AmdArch::parse(arch) {
+        Some(a) => GpuArch::Amd(a),
+        None => GpuArch::Cuda(arch.trim_end_matches('a').parse::<CudaArch>().ok()?),
+    };
+    let xcds = CARDS.iter().find(|c| c.1 == arch).map_or(
+        match arch {
+            GpuArch::Amd(a) if a.is_cdna() => 8,
+            _ => 1,
+        },
+        |c| c.3,
+    );
+    let target = Target::offline(arch, sms, xcds);
+    (tune::device(&target) == device).then_some(target)
+}
+
+/// The stages of a shape's tuning over `ranked` ([`crate::ops::Tuner`]):
+/// its admission kept, the candidates `expand` makes of them screened, and
+/// the leading tiles' pipelines timed again; every stage's line keyed by
+/// the digest of its list, a miss ending the attempt. One [`Replay`] per
+/// choice line found.
+fn stages<C: Tiled + std::fmt::Debug>(
+    lines: &mut Lines,
+    keying: &Keying,
+    ranked: &[C],
+    expand: impl Fn(&[C]) -> Vec<C>,
+    configs: impl Fn(Vec<C>) -> Configs,
+) -> Option<Vec<Replay>> {
+    let reps = representatives(ranked);
+    let at = lines.admitted(keying, "", &reps)?;
+    let admitted: Vec<C> = at.iter().filter_map(|&i| reps.get(i).copied()).collect();
+    let candidates = expand(&admitted);
+    let screened = lines.choice(keying, " screened", &candidates)?;
+    let mut out = vec![Replay { rule: " screened", configs: configs(candidates.clone()), timed: screened.clone() }];
+    // The leading tiles' pipelines: as many as the contender band holds, at
+    // most [`config::TWIN_TILES`] tiles, their twins in `ranked` judged and
+    // the ones that compiled timed again.
+    let ordered: Vec<(C, Option<u64>)> = screened.iter().map(|&(i, ns)| (candidates[i], Some(ns))).collect();
+    let lead = ordered[0].1;
+    let near: Vec<C> = ordered
+        .iter()
+        .filter(|(_, ns)| lead.zip(*ns).is_none_or(|(lead, ns)| ns as f64 <= lead as f64 * tune::CONTENDER))
+        .map(|&(c, _)| c)
+        .collect();
+    let leaders: Vec<C> = config::distinct(&near).take(config::TWIN_TILES).collect();
+    let twins: Vec<C> = config::distinct_configs(&leaders.iter().flat_map(|l| l.twins(ranked)).collect::<Vec<_>>());
+    if twins.len() >= 2
+        && let Some(judged) = lines.admitted(keying, " compiled", &twins)
+    {
+        let compiled: Vec<C> = judged.iter().filter_map(|&i| twins.get(i).copied()).collect();
+        if compiled.len() > 1
+            && let Some(whole) = lines.choice(keying, "", &compiled)
+        {
+            out.push(Replay { rule: "", configs: configs(compiled), timed: whole });
+        }
+    }
+    Some(out)
+}
+
+/// The GEMM family: `linear`'s lines, keyed by the batch and epilogue of
+/// the layer that tuned them, and the device tests' and GEMM probes'
+/// (`gemm`, [`DEVICE_TEST`]). Every salt that replays is a measurement.
+fn gemm(lines: &mut Lines, planner: &Planner, op: &'static str, dtype: ScalarDType, shape: &[usize]) -> Vec<Replay> {
+    let [cap, m, n, k] = shape[..] else { return vec![] };
+    let batches = |bound: bool| if bound { cap.max(1) } else { 1 };
+    let salts: Vec<(String, bool, bool)> = match op {
+        "gemm" => [false, true]
+            .into_iter()
+            .flat_map(|gated| [false, true].map(move |bound| (format!("{DEVICE_TEST:?}"), gated, bound)))
+            .collect(),
+        _ => batches_of(cap)
+            .into_iter()
+            .flat_map(|batch| {
+                let bound = matches!(batch, Batch::Var(_));
+                epilogues().into_iter().map(move |epi| (format!("{:?}", (&batch, epi)), epi.gated, bound))
+            })
+            .collect(),
+    };
+    let mut out = vec![];
+    for (salt, gated, bound) in salts {
+        let keying = Keying::new(op, planner, dtype, shape, salt);
+        let p = GemmProblem { batches: batches(bound), m, n, k, halves: if gated { 2 } else { 1 } };
+        let ranked = planner.gemm_ranked(p.batches, m, n, k, gated);
+        let configs = |list: Vec<GemmCfg>| Configs::Gemm { problem: p, list };
+        out.extend(stages(lines, &keying, &ranked, <[_]>::to_vec, configs).into_iter().flatten());
+    }
+    out
+}
+
+/// A shape's batch as the op layer keys it: static at its capacity, or a
+/// variable named `b` bound at one.
+fn batches_of(cap: usize) -> Vec<Batch> {
+    let mut out = vec![Batch::Static(cap)];
+    if cap > 1 {
+        out.push(Batch::var("b", 1, cap as i64));
+    }
+    out
+}
+
+/// The epilogues a tuned layer plausibly ran: the models' combinations of
+/// bias, activation, gating and residual.
+fn epilogues() -> Vec<Epilogue> {
+    [Act::None, Act::Gelu, Act::Silu]
+        .into_iter()
+        .flat_map(|act| {
+            [false, true].into_iter().flat_map(move |bias| {
+                [false, true].into_iter().flat_map(move |gated| {
+                    [false, true].map(move |residual| Epilogue {
+                        bias,
+                        act,
+                        gated,
+                        residual,
+                        scale: None,
+                        out_f32: false,
+                    })
+                })
+            })
+        })
+        .collect()
+}
+
+/// The attention family: a shape's ranking admitted at its first clean
+/// config, the softmax forms the tuner flipped (each pair's admission and
+/// choice read back), and the tile stage over the formed ranking.
+fn attention(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize]) -> Vec<Replay> {
+    let [cap, t, tk, heads, _kv, d] = shape[..] else { return vec![] };
+    let mut out = vec![];
+    for batch in batches_of(cap) {
+        for causal in [false, true] {
+            for bias in [None, Some(Bias::Shared), Some(Bias::PerBatch)] {
+                let mask = AttnMask { causal, bias, ..AttnMask::default() };
+                let salt = format!("{:?}", (&batch, mask, None::<usize>, None::<usize>, false, None::<usize>));
+                let keying = Keying::new("attention", planner, dtype, shape, salt);
+                let ranked = planner.attention_ranked(cap * heads, t, tk, d, causal, bias.is_some());
+                let split = split_ranked(&ranked, None, tk);
+                let reps = representatives(&split);
+                let Some(at) = lines.first(&keying, &reps) else { continue };
+                let Some(&start) = reps.get(at) else { return out };
+                let mut forms = start.forms;
+                for flip in crate::ops::attention::FORMS.iter().take(4 + usize::from(bias.is_some())) {
+                    let pair = [FaCfg { forms, ..start }, FaCfg { forms: flip(forms), ..start }];
+                    let Some(admitted) = lines.admitted(&keying, "", &pair) else { return out };
+                    let list: Vec<FaCfg> = admitted.iter().filter_map(|&i| pair.get(i).copied()).collect();
+                    let winner = match list.first() {
+                        Some(&c) if list.len() == 1 => Some(c),
+                        _ => lines.choice(&keying, "", &list).and_then(|c| c.first().map(|&(at, _)| list[at])),
+                    };
+                    let Some(winner) = winner else { return out };
+                    forms = winner.forms;
+                }
+                let formed: Vec<FaCfg> = split.iter().map(|&c| FaCfg { forms, ..c }).collect();
+                let p = AttentionProblem { tiles: cap * heads, t, tk, d, causal, bias: bias.is_some() };
+                let expand = |admitted: &[FaCfg]| {
+                    admitted
+                        .iter()
+                        .flat_map(|c| {
+                            planner
+                                .splits(cap * heads * t.div_ceil(c.bq), tk.div_ceil(c.bkv))
+                                .into_iter()
+                                .map(move |splits| FaCfg { splits, ..*c })
+                        })
+                        .collect()
+                };
+                let configs = |list: Vec<FaCfg>| Configs::Attention { problem: p, list };
+                out.extend(stages(lines, &keying, &formed, expand, configs).into_iter().flatten());
+            }
+        }
+    }
+    out
+}
+
+/// The nearest family: the metric, floors and groups of the join that tuned
+/// the shape are its salt, and where its rows or list ran live, their
+/// bounds; the candidates the splits the planner adds to the admitted
+/// configs.
+fn nearest(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize]) -> Vec<Replay> {
+    let (n, m, d, k) = match shape[..] {
+        [n, m, d] => (n, m, d, 1),
+        [n, m, d, k] => (n, m, d, k),
+        _ => return vec![],
+    };
+    let var = |name: &str, max: usize| Var { name: name.into(), min: 1, max: max as i64 };
+    let lives = [
+        Live::default(),
+        Live { rows: Some((var("n", n), 0)), k: None },
+        Live { rows: None, k: (k > 1).then(|| var("k", k)) },
+        Live { rows: Some((var("n", n), 0)), k: (k > 1).then(|| var("k", k)) },
+    ];
+    let mut out = vec![];
+    for metric in [Metric::SquaredL2, Metric::ShiftedL2, Metric::L2, Metric::NegDot] {
+        for floors in [
+            Floors::default(),
+            Floors { row: true, col: false },
+            Floors { row: false, col: true },
+            Floors { row: true, col: true },
+        ] {
+            for groups in [false, true] {
+                for live in &lives {
+                    let spec = NearestSpec {
+                        n,
+                        m,
+                        d,
+                        metric,
+                        floors,
+                        groups,
+                        k,
+                        cfg: NearestCfg::new(64, 64, 2),
+                        live: live.clone(),
+                    };
+                    let keying = Keying::new("nearest", planner, dtype, shape, format!("{:?}", Salt(&spec)));
+                    let p = NearestProblem { n, m, d, dtype, metric, floors, groups, k };
+                    let ranked = planner.nearest_ranked(p);
+                    let expand = |admitted: &[NearestCfg]| planner.nearest_splits(&p, admitted);
+                    let configs = |list: Vec<NearestCfg>| Configs::Nearest { problem: p, list };
+                    out.extend(stages(lines, &keying, &ranked, expand, configs).into_iter().flatten());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The convolution family: a line's shape is the full geometry the op keys
+/// (the device tests' probes key its channel counts and side instead), the
+/// candidates the splits a starved grid breaks into.
+fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize]) -> Vec<Replay> {
+    let geoms: Vec<(ConvGeom, usize, String)> = match shape[..] {
+        [cin, cout, h, w, stride] => {
+            let g =
+                ConvGeom { h, w, cin, cout, kernel: [3, 3], stride: [stride, stride], pad: [1, 1], dilation: [1, 1] };
+            vec![(g, 1, format!("{DEVICE_TEST:?}"))]
+        }
+        [images, h, w, cin, cout, k0, k1, s0, s1, p0, p1, d0, d1] => {
+            let g = ConvGeom { h, w, cin, cout, kernel: [k0, k1], stride: [s0, s1], pad: [p0, p1], dilation: [d0, d1] };
+            batches_of(images)
+                .into_iter()
+                .flat_map(|batch| epilogues().into_iter().map(move |epi| (g, images, format!("{:?}", (&batch, epi)))))
+                .collect()
+        }
+        _ => return vec![],
+    };
+    let mut out = vec![];
+    for (g, images, salt) in geoms {
+        let [ho, wo] = g.out_hw();
+        for bound in [false, true] {
+            let salt = salt.clone();
+            let (batches, m) = match bound {
+                false => (1, images * ho * wo),
+                true => (images, ho * wo),
+            };
+            let ranked = planner.conv_ranked(batches, m, &g);
+            let p = GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1 };
+            let expand = |admitted: &[ConvCfg]| {
+                planner.conv_splits(batches, m, &g, admitted).into_iter().filter(|c| c.split == 1 || !bound).collect()
+            };
+            let configs = |list: Vec<ConvCfg>| Configs::Conv { problem: p, list };
+            let keying = Keying::new("conv2d", planner, dtype, shape, salt);
+            out.extend(stages(lines, &keying, &ranked, expand, configs).into_iter().flatten());
+        }
+    }
+    out
+}

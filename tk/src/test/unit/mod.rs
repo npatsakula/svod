@@ -20,6 +20,7 @@ mod ops_plan;
 mod oracle;
 mod parts;
 mod probe;
+mod rank;
 mod replay;
 mod rows;
 mod schedule;
