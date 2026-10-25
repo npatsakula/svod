@@ -347,6 +347,51 @@ pub fn ablation(device: &Device) -> Vec<Ablated> {
         .collect()
 }
 
+/// The model's cost fields one at a time perturbed (×`factor`, the ladder
+/// with it) over the device's replayed `family` lines: the ρ each
+/// perturbation leaves says which term the family's order rides on — the
+/// explain mode's attribution, priced on the lines the store itself timed.
+pub fn explained(device: &Device, family: &str, factor: f64) -> Vec<(&'static str, Option<f64>)> {
+    let mut probe_costs = device.planner.device.costs;
+    let mut fields: Vec<&'static str> = probe_costs.fields().into_iter().map(|(f, _)| f).collect();
+    fields.extend(["l2_byte"]);
+    fields
+        .into_iter()
+        .map(|field| {
+            let mut costs = device.planner.device.costs;
+            let ladder = |costs: &mut crate::atoms::Costs| {
+                if field == "l2_byte" {
+                    costs.l2_byte *= factor;
+                    for (_, rate) in costs.ladder.iter_mut() {
+                        *rate = (*rate * factor).min(costs.global_byte);
+                    }
+                }
+            };
+            match field {
+                "step" => costs.step *= factor,
+                "step_i8" => costs.step_i8 *= factor,
+                "score" => costs.score *= factor,
+                "smem_byte" => costs.smem_byte *= factor,
+                "global_byte" => {
+                    costs.global_byte *= factor;
+                    ladder(&mut costs);
+                }
+                "trip" => costs.trip *= factor,
+                "trip_one" => costs.trip_one *= factor,
+                "latency" => costs.latency *= factor,
+                "smem_trip" => costs.smem_trip *= factor,
+                "lane_move" => costs.lane_move *= factor,
+                "l2_byte" => ladder(&mut costs),
+                _ => return (field, None),
+            }
+            let planner =
+                Planner::new(crate::atoms::Device { costs, ..device.planner.device.clone() }).expect("an SM count");
+            let family = device.families.iter().find(|f| f.name == family);
+            (field, family.and_then(|f| f.rho(&planner)))
+        })
+        .collect()
+}
+
 /// Spearman's ρ of `a` against `b`: average ranks over ties, Pearson over
 /// the ranks; `None` where either side holds no variance to correlate.
 pub fn spearman(a: &[f64], b: &[f64]) -> Option<f64> {
@@ -919,12 +964,17 @@ pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
         })
     };
     let mut out: Vec<(String, Claim, usize, crate::ir::Program)> = vec![];
-    // GEMM: the leading tiles of a 4096³ plan, emitted small.
+    // GEMM: the leading tiles of a 4096³ plan, emitted small, a gelu
+    // epilogue on the accumulator (the tile operations it emits counted —
+    // each a lane's register a thread over the tile's elements, so a trip's
+    // VALU count is them times the tile over the wave: the linear list
+    // holds one scalar op a lane).
+    let gelu = 1 + 3 * 3 + 1 + 4 * 4 + 1 + 1 + 3 + 1 + 1 + 3 + 1 + 1 + 1;
     for cfg in config::distinct(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).take(3) {
         let [bm, bn, bk] = cfg.tile;
         let claim = Claim {
             steps: (bm * bn * bk) as f64 / atom_step as f64,
-            ops: 0.0,
+            ops: gelu as f64 * (bm * bn) as f64 / target.wave as f64,
             fill: (bm + bn) * bk * 2,
             smem: cfg.smem_bytes(false, 2),
             regs: cfg.registers(target, 1).expect("ranked"),

@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let check = at("--check").is_some();
     let ablate = at("--ablate").and_then(|i| args.get(i + 1)).cloned();
     let claims = at("--claims").is_some();
+    let explain = at("--explain").and_then(|i| args.get(i + 1)).cloned();
     let store = opt.map(PathBuf::from).or_else(|| TuneStore::global().root().map(PathBuf::from));
     let Some(store) = store.filter(|s| s.is_dir()) else {
         return Err("no tune store: pass --store DIR (or set SVOD_TK_TUNE_DIR)".into());
@@ -64,6 +65,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             for (group, lines) in device.skipped_groups.iter().take(200) {
                 println!("    skipped {lines:3} of {group}");
+            }
+        }
+        if let Some(family) = explain.as_deref() {
+            for wanted in &device.families {
+                if !wanted.name.contains(family) {
+                    continue;
+                }
+                let base = wanted.rho(planner).map_or("-".into(), |r| format!("{r:.3}"));
+                println!("  {} at its measured costs: rho {base}", wanted.name);
+                for (field, rho) in rank::explained(&device, wanted.name, 2.0) {
+                    let delta = rho.zip(wanted.rho(planner)).map_or("-".into(), |(r, b)| format!("{:+.3}", r - b));
+                    println!("    {:<12} x2: rho {} ({delta})", field, rho.map_or("-".into(), |r| format!("{r:.3}")));
+                }
             }
         }
         if let Some("nearest") = ablate.as_deref() {
