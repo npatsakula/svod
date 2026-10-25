@@ -342,13 +342,24 @@ pub struct Costs {
     /// trip ahead as two do ([`Self::latency`]).
     pub latency_one: f64,
     /// One byte streamed into a block from the cache in front of DRAM (L2),
-    /// as `global_byte` from a footprint that stays in it.
+    /// as `global_byte` from a footprint that stays in it: the ladder's
+    /// smallest-footprint rate.
     pub l2_byte: f64,
-    /// That cache's bytes: operands that fit in it come from DRAM once and
-    /// are re-read from it. 0 where unmeasured: every fill byte is then
+    /// That cache's bytes: the most any footprint shows it answering
+    /// ([`crate::probe::held`]). 0 where unmeasured: every fill byte is then
     /// priced at `global_byte`.
     pub l2_bytes: f64,
+    /// The cache ladder itself: `(footprint bytes, ns a streamed byte)` at
+    /// each footprint measured, smallest first, the rungs a probe could not
+    /// measure left out and the rest zero. What a stream over a working set
+    /// of any size costs is read from it ([`Self::rate`]); the two fields
+    /// above are its reduced views.
+    pub ladder: [(usize, f64); LADDER],
 }
+
+/// The footprints a device's cache ladder holds at most
+/// ([`crate::probe`]'s grid).
+pub const LADDER: usize = 9;
 
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
@@ -374,6 +385,7 @@ impl Costs {
             latency_one,
             l2_byte: _,
             l2_bytes: _,
+            ladder: _,
         } = self;
         [
             ("smem_byte", smem_byte),
@@ -394,6 +406,45 @@ impl Costs {
             ("latency", latency),
             ("latency_one", latency_one),
         ]
+    }
+
+    /// What a byte of a stream over `unique` distinct bytes costs: the
+    /// ladder's rate at that working set, interpolated on the log of both
+    /// axes between the footprints that bracket it, held at the smallest
+    /// footprint's rate below them all and past the last one decaying with
+    /// the working set — the last rung's answered share of its own footprint
+    /// holds as its bytes' worth of any larger set, nothing new measured
+    /// there. DRAM's rate where no ladder was measured.
+    pub fn rate(&self, unique: f64) -> f64 {
+        let (mut below, mut above) = ((0, 0.0), (0, 0.0));
+        for &(footprint, rate) in &self.ladder {
+            if footprint == 0 || rate <= 0.0 {
+                continue;
+            }
+            if footprint as f64 <= unique {
+                if footprint >= below.0 {
+                    below = (footprint, rate);
+                }
+            } else if above.0 == 0 || footprint < above.0 {
+                above = (footprint, rate);
+            }
+        }
+        let answered = |share: f64| share * self.l2_byte + (1.0 - share) * self.global_byte;
+        let rate = match (below.0, above.0) {
+            (0, 0) => self.global_byte,
+            (0, _) => above.1,
+            (_, 0) => {
+                let span = self.global_byte - self.l2_byte;
+                let share =
+                    if span <= 0.0 { 0.0 } else { (self.global_byte - below.1) / span * below.0 as f64 / unique };
+                answered(share.min(1.0))
+            }
+            _ => {
+                let t = (unique / below.0 as f64).ln() / (above.0 as f64 / below.0 as f64).ln();
+                below.1 * (above.1 / below.1).powf(t)
+            }
+        };
+        rate.clamp(self.l2_byte.min(self.global_byte), self.global_byte)
     }
 }
 

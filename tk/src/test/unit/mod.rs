@@ -200,6 +200,7 @@ pub(crate) fn gfx1151_costs() -> Costs {
         latency_one: 0.0,
         l2_byte: 0.0,
         l2_bytes: 0.0,
+        ladder: [(0, 0.0); crate::atoms::LADDER],
     }
 }
 
@@ -208,7 +209,21 @@ pub(crate) fn gfx1151_costs() -> Costs {
 /// re-holds a 32×128 attention probability tile through shared memory
 /// under a key mask, where [`gfx1151_costs`] has it exchanged.
 pub(crate) fn gfx1151_store_costs() -> Costs {
-    Costs {
+    // The cache ladder the same store measured (fs per byte, 2026-10-23):
+    // its knee runs 8–32 MB, the Infinity Cache answering most of a 32 MB
+    // working set.
+    let rungs = [
+        (1 << 20, 11593.0),
+        (2 << 20, 13374.0),
+        (4 << 20, 22319.0),
+        (8 << 20, 33120.0),
+        (16 << 20, 36746.0),
+        (32 << 20, 39297.0),
+        (64 << 20, 143145.0),
+        (128 << 20, 167180.0),
+    ]
+    .map(|(f, fs)| (f, fs * 1e-6));
+    let mut costs = Costs {
         smem_byte: 0.00356,
         global_byte: 0.187412,
         scatter: 2.415543,
@@ -226,15 +241,21 @@ pub(crate) fn gfx1151_store_costs() -> Costs {
         smem_trip: 0.086365,
         latency: 598.285924,
         latency_one: 0.0,
-        l2_byte: 0.011227,
-        l2_bytes: 27_860_358.0,
-    }
+        l2_byte: 0.0,
+        l2_bytes: 0.0,
+        ladder: [(0, 0.0); crate::atoms::LADDER],
+    };
+    set_ladder(&mut costs, &rungs);
+    costs
 }
 
 /// sm_86's costs (RTX 3060, 28 SMs) as `probe::costs` measured them on the
-/// device on 2026-10-19.
+/// device on 2026-10-19; the ladder rungs are the same device's store
+/// (2026-10-25), its 3 MB L2 answering past none of 16 MB.
 pub(crate) fn sm86_costs() -> Costs {
-    Costs {
+    let rungs = [(1 << 20, 15824.0), (2 << 20, 27536.0), (4 << 20, 29535.0), (8 << 20, 41680.0), (16 << 20, 61173.0)]
+        .map(|(f, fs)| (f, fs * 1e-6));
+    let mut costs = Costs {
         smem_byte: 0.003447,
         global_byte: 0.08274,
         scatter: 2.825,
@@ -252,15 +273,32 @@ pub(crate) fn sm86_costs() -> Costs {
         smem_trip: 0.2449,
         latency: 311.79,
         latency_one: 324.77,
-        l2_byte: 0.016066,
-        l2_bytes: 7.018e6,
-    }
+        l2_byte: 0.0,
+        l2_bytes: 0.0,
+        ladder: [(0, 0.0); crate::atoms::LADDER],
+    };
+    set_ladder(&mut costs, &rungs);
+    costs
 }
 
 /// gfx1201's costs (RX 9070 XT, 64 CUs) as `probe::costs` measured them on
-/// the device on 2026-10-19.
+/// the device on 2026-10-19; the ladder rungs are the same device's store
+/// (2026-10-25), its 8 MB L2 and 64 MB Infinity Cache answering past half
+/// of 128 MB.
 pub(crate) fn gfx1201_costs() -> Costs {
-    Costs {
+    let rungs = [
+        (1 << 20, 5704.0),
+        (2 << 20, 5729.0),
+        (4 << 20, 5831.0),
+        (8 << 20, 5863.0),
+        (16 << 20, 6596.0),
+        (32 << 20, 10334.0),
+        (64 << 20, 20732.0),
+        (128 << 20, 58746.0),
+        (256 << 20, 99716.0),
+    ]
+    .map(|(f, fs)| (f, fs * 1e-6));
+    let mut costs = Costs {
         smem_byte: 0.00325,
         global_byte: 0.10823,
         scatter: 1.8443,
@@ -278,9 +316,19 @@ pub(crate) fn gfx1201_costs() -> Costs {
         smem_trip: 0.078096,
         latency: 243.15,
         latency_one: 0.0,
-        l2_byte: 0.005929,
-        l2_bytes: 65.97e6,
-    }
+        l2_byte: 0.0,
+        l2_bytes: 0.0,
+        ladder: [(0, 0.0); crate::atoms::LADDER],
+    };
+    set_ladder(&mut costs, &rungs);
+    costs
+}
+
+/// A cost set's cache views from its ladder rungs, as measuring them would
+/// have left them.
+fn set_ladder(costs: &mut Costs, rungs: &[(usize, f64)]) {
+    costs.ladder[..rungs.len()].copy_from_slice(rungs);
+    (costs.l2_byte, costs.l2_bytes) = crate::probe::held(rungs, costs.global_byte);
 }
 
 /// [`costs`] on a part whose lane moves cost more than a round trip through

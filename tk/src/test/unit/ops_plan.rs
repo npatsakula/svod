@@ -403,56 +403,83 @@ fn a_one_warp_tile_yields_to_four_at_one_wave_per_scheduler() {
 fn an_attention_fill_is_priced_by_where_it_comes_from() {
     let a = config::AttentionProblem { tiles: 32, t: 2048, tk: 2048, d: 64, causal: false, bias: false };
     let unique = (a.tiles * a.tk * a.d * 4) as f64;
-    let cost = |l2_bytes| {
-        let c = Costs { global_byte: 0.08, l2_byte: 0.01, l2_bytes, ..costs() };
-        let planner = planned(Device { target: sm86(), costs: c });
+    assert!((unique / (1 << 20) as f64 - 16.0).abs() < 1e-9, "a 16 MB working set");
+    let cost = |rungs: &[(usize, f64)]| {
+        let planner = planned(Device { target: sm86(), costs: ladder(rungs, 0.08) });
         a.admit(&planner, &FaCfg::new(64, 64, 3)).expect("admitted").0
     };
-    let (dram, cached, small) = (cost(0.0), cost(4.0 * unique), cost(unique / 4.0));
-    assert!(cached < dram, "{cached} cached, {dram} from DRAM");
-    assert!(cached <= small && small < dram, "{small} under a small cache");
+    let holds = [(1 << 20, 0.01), (4 << 20, 0.01), (64 << 20, 0.01)];
+    let small = [(1 << 20, 0.01), (4 << 20, 0.01), (8 << 20, 0.05), (16 << 20, 0.08)];
+    let dram = planned(Device { target: sm86(), costs: Costs { global_byte: 0.08, ..costs() } });
+    let (dram, cached, small) = (a.admit(&dram, &FaCfg::new(64, 64, 3)).unwrap().0, cost(&holds), cost(&small));
+    assert!(cached < small && small < dram, "{cached} cached, {small} under a small cache, {dram} from DRAM");
 }
 
-/// A fill's byte is DRAM's where no cache was measured or the distinct
-/// operands overflow it, the cache's for the re-reads where they fit, and in
-/// between as much nearer DRAM as they overflow three quarters of it.
+/// A fill's byte is DRAM's where no cache was measured; where one was, each
+/// distinct byte comes from DRAM once and its re-reads at the ladder's
+/// measured rate for a working set of the stream's distinct bytes — the
+/// cache's under the smallest footprint, DRAM's past the last rung for all
+/// but the share of it the ladder shows the cache answering, between the
+/// rungs interpolated. A fill that reads each byte once pays DRAM whatever
+/// the cache.
 #[test]
 fn a_fill_is_priced_by_where_its_bytes_come_from() {
     let mb = (1 << 20) as f64;
-    let with = |l2_bytes| {
-        let c = Costs { global_byte: 0.08, l2_byte: 0.01, l2_bytes, ..costs() };
-        planned(Device { target: sm86(), costs: c })
-    };
-    let (none, cached) = (with(0.0), with(4.0 * mb));
+    let rungs = [(1 << 20, 0.01), (2 << 20, 0.011), (4 << 20, 0.03), (8 << 20, 0.06), (16 << 20, 0.075)];
+    let cached = planned(Device { target: sm86(), costs: ladder(&rungs, 0.08) });
+    let none = planned(Device { target: sm86(), costs: Costs { global_byte: 0.08, ..costs() } });
     assert_eq!(none.fill_byte(mb, 100.0 * mb, 0.0), 0.08);
-    // 1 MB read 100 times over: one byte in a hundred from DRAM.
+    // 1 MB read 100 times over: one byte in a hundred from DRAM, the rest at
+    // the smallest rung's rate.
     assert!((cached.fill_byte(mb, 100.0 * mb, 0.0) - (0.01 * 0.99 + 0.08 * 0.01)).abs() < 1e-12);
-    // Past 1.5 × 3 MB every byte comes from DRAM.
-    assert_eq!(cached.fill_byte(5.0 * mb, 100.0 * mb, 0.0), 0.08);
-    let edge: Vec<f64> = [2.0, 3.0, 3.5, 4.0, 4.5].iter().map(|&u| cached.fill_byte(u * mb, 100.0 * mb, 0.0)).collect();
-    assert!(edge.windows(2).all(|w| w[0] <= w[1]), "{edge:?}");
+    // Between two rungs the rate interpolates on the log of both axes, and it
+    // never falls as the working set grows.
+    let edge: Vec<f64> =
+        [0.5, 1.0, 3.0, 5.0, 12.0, 16.0, 32.0, 64.0].iter().map(|&u| cached.device.costs.rate(u * mb)).collect();
+    assert!(edge.windows(2).all(|w| w[0] <= w[1] + 1e-12), "{edge:?}");
+    assert!((edge[1] - 0.01).abs() < 1e-12 && (edge[5] - 0.075).abs() < 1e-12, "{edge:?}");
+    assert!((edge[3] - 0.03 * 1.25).abs() < 1e-12, "{edge:?}");
+    // Past the last rung the cache answers the share the last rung showed of
+    // its own footprint, its bytes' worth of the larger set: 16 MB's 7.1 % of
+    // 64 MB at the cache's rate, the rest DRAM.
+    let share = (0.08 - 0.075) / (0.08 - 0.01) * 16.0 / 64.0;
+    let want = share * 0.01 + (1.0 - share) * 0.08;
+    assert!((edge[7] - want).abs() < 1e-12, "{} of {want}", edge[7]);
     // A fill that reads each byte once pays DRAM whatever the cache.
-    assert_eq!(cached.fill_byte(mb, mb, 0.0), 0.08);
+    assert_eq!(cached.fill_byte(5.0 * mb, 5.0 * mb, 0.0), 0.08);
 }
 
 /// Where the whole operands overflow the cache, the blocks in flight at
 /// once still re-read one another's lines: that share is priced from the
-/// cache, a fill shared by nothing stays at DRAM, and the share never
-/// lowers a fill the cache already serves. A 4096³ GEMM on sm_86 (its
-/// operands twenty times its L2) is so priced nearer the cache than DRAM.
+/// cache, a fill shared by nothing stays at the ladder's rate, and the
+/// share never lowers a fill the cache already serves. A 4096³ GEMM on
+/// sm_86 (its operands twenty times its cache) is so priced nearer the
+/// cache than DRAM.
 #[test]
 fn blocks_in_flight_share_their_lines_past_the_cache() {
     let mb = (1 << 20) as f64;
-    let c = Costs { global_byte: 0.08, l2_byte: 0.01, l2_bytes: 4.0 * mb, ..costs() };
+    let rungs = [(1 << 20, 0.01), (2 << 20, 0.01), (4 << 20, 0.02), (8 << 20, 0.06)];
+    let c = ladder(&rungs, 0.08);
     let planner = planned(Device { target: sm86(), costs: c });
-    assert_eq!(planner.fill_byte(100.0 * mb, 1e4 * mb, 0.0), 0.08);
-    assert!((planner.fill_byte(100.0 * mb, 1e4 * mb, 0.75) - (0.75 * 0.01 + 0.25 * 0.08)).abs() < 1e-12);
-    assert_eq!(planner.fill_byte(mb, 100.0 * mb, 0.5), planner.fill_byte(mb, 100.0 * mb, 0.0));
+    let rate = planner.device.costs.rate(100.0 * mb);
+    let stream = 0.99 * rate + 0.01 * 0.08;
+    assert!((planner.fill_byte(100.0 * mb, 1e4 * mb, 0.75) - (0.75 * 0.01 + 0.25 * stream)).abs() < 1e-12);
+    assert!((planner.fill_byte(100.0 * mb, 1e4 * mb, 0.0) - stream).abs() < 1e-12);
+    assert!(planner.fill_byte(mb, 100.0 * mb, 0.5) < planner.fill_byte(mb, 100.0 * mb, 0.0));
     let p = config::GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
     let dram = planned(Device { target: sm86(), costs: Costs { l2_bytes: 0.0, ..c } });
     let (cached, at_dram) = (p.admit(&planner, &cfg).unwrap().0, p.admit(&dram, &cfg).unwrap().0);
     assert!(cached < 0.75 * at_dram, "{cached} cached, {at_dram} from DRAM");
+}
+
+/// The costs a cache ladder of `rungs` (footprint bytes, ns a streamed byte)
+/// implies under a DRAM rate of `global`: what measuring them would leave.
+fn ladder(rungs: &[(usize, f64)], global: f64) -> Costs {
+    let mut c = Costs { global_byte: global, ..costs() };
+    (c.l2_byte, c.l2_bytes) = crate::probe::held(rungs, global);
+    c.ladder[..rungs.len()].copy_from_slice(rungs);
+    c
 }
 
 /// The ranking's front spreads over the band's block tiles: a block tile's

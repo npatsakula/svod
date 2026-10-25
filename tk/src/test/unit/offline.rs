@@ -114,7 +114,7 @@ fn costs_read_from_a_copied_store() {
 
 /// Of a probe's several lines the one this build's programs measured
 /// counts; several of none of them leave the field unmeasured, as does a
-/// missing one, and a ladder with a missing rung leaves the cache so.
+/// missing one, and a ladder missing a rung keeps the rungs it has.
 #[test]
 fn a_probe_of_several_lines_takes_this_builds() {
     let target = Target::card("h100-pcie").expect("a listed card");
@@ -134,8 +134,13 @@ fn a_probe_of_several_lines_takes_this_builds() {
     let dir = store("several", &target, &lines);
     let Measured { costs, unmeasured } = probe::stored(&dir, &target).expect("the device's file");
     assert_eq!(costs.step, 2.0);
-    assert_eq!((costs.trip, costs.latency, costs.l2_bytes), (0.0, 0.0, 0.0));
-    assert_eq!(unmeasured, ["step_i8", "trip", "trip_lone", "trip_one_lone", "latency", "latency_one", "l2_bytes"]);
+    assert_eq!((costs.trip, costs.latency), (0.0, 0.0));
+    // The ladder's missing rung (`cached_2m`) is bridged, not fatal: the
+    // rest are measured until two past the knee (H100's 50 MB L2 settles
+    // only past 128 MB).
+    assert!(costs.l2_bytes > 0.0, "{}", costs.l2_bytes);
+    assert_eq!(costs.ladder.iter().filter(|&&(f, _)| f > 0).count(), 7);
+    assert_eq!(unmeasured, ["step_i8", "trip", "trip_lone", "trip_one_lone", "latency", "latency_one"]);
 }
 
 /// A planner needs no device: a card's target under its stored costs

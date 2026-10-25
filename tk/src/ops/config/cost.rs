@@ -50,14 +50,6 @@ pub(super) const ELEM: usize = 2;
 /// configs apart: on sm_86 the measured best of Nemotron's projections and of 4096³
 /// sat 12–31% behind the model's first.
 pub(super) const BAND: f64 = 1.35;
-/// Model: the share of the cache in front of DRAM a fill's distinct bytes
-/// may take and stay resident, the rest left to the other operands and the
-/// outputs streaming through it.
-const CACHE_SHARE: f64 = 0.75;
-/// Model: distinct bytes past this multiple of the resident share all come
-/// from DRAM: an LRU cache streamed past its size by half holds nothing
-/// that is read again.
-const CACHE_SPILL: f64 = 1.5;
 /// Model: the waves per SIMD past which a trip's pipes overlap no further
 /// (measured on gfx1201 and sm_86: sixteen waves per SIMD run a tile no
 /// better than four, and the ranking that counted them did put sixteen-warp
@@ -195,19 +187,20 @@ impl Planner {
 
     /// What a byte of a fill costs when `fill` bytes stream `unique`
     /// distinct ones, of which the blocks in flight at once re-read a
-    /// `shared` part from one another's lines. Where the distinct bytes fit
-    /// the [`CACHE_SHARE`] of the cache in front of DRAM each comes from
-    /// DRAM once and its re-reads from the cache; past [`CACHE_SPILL`] times
-    /// that every byte comes from DRAM but the shared part, which a cache
-    /// too small for the whole still holds; between, the two blend.
+    /// `shared` part from one another's lines. Those come from the cache in
+    /// front of DRAM at its measured rate; of the rest, each distinct byte
+    /// comes from DRAM once and its re-reads at the cache ladder's measured
+    /// rate for a working set of `unique` bytes — the rate a stream of that
+    /// size runs at, whichever cache levels answer it (RDNA4's L2 and
+    /// Infinity Cache alike) and wherever its knee sits, no hand share of
+    /// the cache assumed. DRAM's rate where no ladder was measured.
     pub(crate) fn fill_byte(&self, unique: f64, fill: f64, shared: f64) -> f64 {
         let c = &self.device.costs;
-        let held = CACHE_SHARE * c.l2_bytes;
-        if held <= 0.0 || fill <= 0.0 {
+        if c.l2_bytes <= 0.0 || fill <= 0.0 {
             return c.global_byte;
         }
-        let fits = ((CACHE_SPILL * held - unique) / ((CACHE_SPILL - 1.0) * held)).clamp(0.0, 1.0);
-        let hit = (fits * (1.0 - unique / fill).max(0.0)).max(shared.clamp(0.0, 1.0));
-        hit * c.l2_byte + (1.0 - hit) * c.global_byte
+        let (shared, reread) = (shared.clamp(0.0, 1.0), (1.0 - unique / fill).max(0.0));
+        let stream = reread * c.rate(unique) + (1.0 - reread) * c.global_byte;
+        shared * c.l2_byte + (1.0 - shared) * stream
     }
 }

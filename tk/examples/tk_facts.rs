@@ -130,7 +130,15 @@ fn costs_section(out: &mut String, store: &Option<PathBuf>, target: &Target) {
     };
     l2("l2_byte", costs.l2_byte);
     let bytes = if costs.l2_bytes == 0.0 { "null".to_string() } else { costs.l2_bytes.to_string() };
-    out.push_str(&format!("\n    \"l2_bytes\": {bytes}\n  }},\n"));
+    out.push_str(&format!("\n    \"l2_bytes\": {bytes},"));
+    let ladder: Vec<String> = costs
+        .ladder
+        .iter()
+        .filter(|&&(f, r)| f > 0 && r > 0.0)
+        .map(|&(f, r)| format!("{{\"footprint\": {f}, \"ns_per_byte\": {r}}}"))
+        .collect();
+    let ladder = if ladder.is_empty() { "null".to_string() } else { ladder.join(", ") };
+    out.push_str(&format!("\n    \"ladder\": [{ladder}]\n  }},\n"));
 }
 
 /// The oracle's verdicts: the recorded ones for a device (assembling and

@@ -187,13 +187,23 @@ pub fn costs(target: &Target) -> Result<Measured> {
 fn priced(target: &Target, mut measure: impl FnMut(Probe) -> Result<f64>) -> Result<Measured> {
     let mut measured = assemble(target, probes(target)?, &mut measure);
     let Measured { costs, unmeasured } = &mut measured;
-    // The cache ladder is read against the DRAM rate; without one, or when a
-    // footprint fails, the cache is unmeasured and fills are priced as DRAM.
+    // The cache ladder is read against the DRAM rate; without one the cache
+    // is unmeasured and fills are priced as DRAM.
     let ladder = if unmeasured.contains(&"global_byte") { None } else { cache(target, costs.global_byte, measure)? };
-    (costs.l2_byte, costs.l2_bytes) = ladder.unwrap_or_else(|| {
-        unmeasured.push("l2_bytes");
-        (costs.global_byte, 0.0)
-    });
+    match ladder {
+        Some(rates) => {
+            assert!(rates.len() <= costs.ladder.len(), "a ladder rung a footprint");
+            costs.l2_byte = rates[0].1;
+            costs.l2_bytes = held(&rates, costs.global_byte).1;
+            for (slot, rate) in costs.ladder.iter_mut().zip(rates) {
+                *slot = rate;
+            }
+        }
+        None => {
+            unmeasured.push("l2_bytes");
+            (costs.l2_byte, costs.l2_bytes) = (costs.global_byte, 0.0);
+        }
+    }
     Ok(measured)
 }
 
@@ -261,6 +271,7 @@ pub const GUESSED: Costs = Costs {
     latency_one: 900.0,
     l2_byte: 0.0,
     l2_bytes: 0.0,
+    ladder: [(0, 0.0); crate::atoms::LADDER],
 };
 
 /// `probes`, in [`Costs::fields`] order, each measured by `measure` into its
@@ -376,30 +387,40 @@ const FOOTPRINTS: [(&str, usize); 9] = [
     ("probe:cached_256m", 256 << 20),
 ];
 
-/// The cache in front of DRAM, as [`climbed`] reads the ladder of
-/// footprints; `None`, with a warning, when a footprint cannot be measured.
-fn cache(target: &Target, global_byte: f64, measure: impl FnMut(Probe) -> Result<f64>) -> Result<Option<(f64, f64)>> {
+/// The cache ladder, as [`climbed`] reads the footprints; `None`, with a
+/// warning, when no footprint can be measured.
+fn cache(
+    target: &Target,
+    global_byte: f64,
+    measure: impl FnMut(Probe) -> Result<f64>,
+) -> Result<Option<Vec<(usize, f64)>>> {
     let ladder = climbed(cache_probes(target)?, global_byte, measure);
     Ok(ladder.map_err(|e| tracing::warn!("{}: {e}; the cache is unmeasured", target.arch.target_name())).ok())
 }
 
 /// The ladder of `probes` (smallest footprint first) measured until it has
-/// [`settled`] past the cache, read by [`held`]: a small cache's ladder
-/// stops after a few footprints, and no run streams a large one for
-/// nothing.
+/// [`settled`] past the cache: a small cache's ladder stops after a few
+/// footprints, and no run streams a large one for nothing. A rung that
+/// cannot be measured is skipped — the ladder keeps the rungs it has, and
+/// fails only when it holds none.
 pub(crate) fn climbed(
     probes: Vec<(usize, Probe)>,
     global_byte: f64,
     mut measure: impl FnMut(Probe) -> Result<f64>,
-) -> Result<(f64, f64)> {
+) -> Result<Vec<(usize, f64)>> {
     let mut rates = Vec::with_capacity(probes.len());
     for (footprint, probe) in probes {
         if settled(&rates, global_byte) {
             break;
         }
-        rates.push((footprint, measure(probe)?));
+        match measure(probe) {
+            Ok(rate) => rates.push((footprint, rate)),
+            Err(e) => tracing::warn!("probe:cached: {e}; the ladder keeps the rungs it has"),
+        }
     }
-    Ok(held(&rates, global_byte))
+    (!rates.is_empty())
+        .then_some(rates)
+        .ok_or_else(|| Error::Unmeasured { probe: "probe:cached", last: "no rung measured".into() })
 }
 
 /// Whether the ladder's last two footprints both read nearer DRAM's rate

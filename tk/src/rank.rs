@@ -827,8 +827,11 @@ pub fn counted(program: &svod_ir::UOp) -> Option<Counted> {
             Op::Wmma(..) => out.steps += 1,
             Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast(..) | Op::BitCast(..) => out.valu += 1,
             // A `cp.async` copy moves its width's bytes from global memory
-            // without a load the list would hold.
-            Op::Custom(ops::Custom { code, .. }) if code.contains("cp.async") => out.fill += 16,
+            // without a load the list would hold; the commit and wait groups
+            // a ring lands them with move nothing.
+            Op::Custom(ops::Custom { code, .. }) if code.contains("cp.async") && code.contains("shared.global") => {
+                out.fill += 16;
+            }
             Op::Load(..) if space_of(u) == Some(AddrSpace::Global) => out.fill += u.dtype().bytes(),
             _ => {}
         }

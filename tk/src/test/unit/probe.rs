@@ -153,13 +153,14 @@ fn the_ladder_reads_the_cache(rates: &[(usize, f64)], global_byte: f64, want: (f
 /// footprints in a row read nearer DRAM than the cache, so a device with a
 /// small cache measures a few rungs and one whose cache holds every
 /// footprint measures them all; a rung that cannot be measured (a rate of
-/// 0 here) fails the ladder. A list of rates repeats its last.
-#[test_case(&[10.0, 11.0, 60.0, 95.0, 100.0], 100.0, 4, Some((10.0, 2.0 * (1 << 20) as f64 * (89.0 / 90.0))); "a small cache stops the ladder at four")]
-#[test_case(&[10.0, 12.0, 30.0, 31.0, 90.0, 95.0], 100.0, 6, Some((10.0, 8.0 * (1 << 20) as f64 * (69.0 / 90.0))); "a second level is climbed through")]
-#[test_case(&[120.0, 130.0], 100.0, 2, Some((100.0, 0.0)); "slower than DRAM stops at two")]
-#[test_case(&[10.0], 100.0, 9, Some((10.0, (STREAM / 2) as f64)); "a cache holding half the stream climbs every rung")]
-#[test_case(&[10.0, 11.0, 0.0], 100.0, 3, None; "a rung that fails")]
-fn the_ladder_stops_past_the_cache(rates: &[f64], global_byte: f64, want_calls: usize, want: Option<(f64, f64)>) {
+/// 0 here) is skipped and the ladder keeps the rungs it has, failing only
+/// when it holds none. A list of rates repeats its last.
+#[test_case(&[10.0, 11.0, 60.0, 95.0, 100.0], 100.0, 4, 4; "a small cache stops the ladder at four")]
+#[test_case(&[10.0, 12.0, 30.0, 31.0, 90.0, 95.0], 100.0, 6, 6; "a second level is climbed through")]
+#[test_case(&[120.0, 130.0], 100.0, 2, 2; "slower than DRAM stops at two")]
+#[test_case(&[10.0], 100.0, 9, 9; "a cache holding half the stream climbs every rung")]
+#[test_case(&[10.0, 11.0, 0.0], 100.0, 9, 2; "a rung that fails is skipped")]
+fn the_ladder_stops_past_the_cache(rates: &[f64], global_byte: f64, want_calls: usize, want_rungs: usize) {
     let probes = crate::probe::cache_probes(&sm86()).unwrap();
     assert_eq!(probes.last().map(|p| p.0), Some(STREAM / 2), "the ladder reaches half the stream");
     let mut calls = 0;
@@ -167,9 +168,12 @@ fn the_ladder_stops_past_the_cache(rates: &[f64], global_byte: f64, want_calls: 
         let rate = rates.get(calls).or(rates.last()).copied().unwrap();
         calls += 1;
         (rate > 0.0).then_some(rate).ok_or(crate::probe::Error::Unmeasured { probe: p.op, last: "lost".into() })
-    });
-    assert_eq!(got.ok(), want);
+    })
+    .expect("a rung of the ladder");
     assert_eq!(calls, want_calls);
+    assert_eq!(got.len(), want_rungs);
+    assert!(got.windows(2).all(|w| w[0].0 < w[1].0), "{got:?}");
+    assert_eq!(got[0].1, rates[0]);
 }
 
 /// A cache probe's region holds a prime number of tiles that nearly fills
