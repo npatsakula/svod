@@ -1024,16 +1024,17 @@ pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
 /// share a trip), the bytes it fills, its declared shared memory and the
 /// registers a lane holds.
 fn nearest_claim(planner: &Planner, p: &NearestProblem, cfg: &NearestCfg, atom_step: usize) -> Claim {
-    use crate::ops::config::{GROUPS_PAIR, NEAREST_PAIR, PAIR_OP, Weights};
+    use crate::ops::config::{GROUPS_PAIR, NEAREST_PAIR, Weights, pair_op};
     let target = &planner.device.target;
     let depth = cfg.bk.unwrap_or(p.d);
     let chunks = p.d.div_ceil(depth);
     let ops = [p.metric.row_norms(), p.floors.row, p.floors.col].iter().filter(|&&on| on).count() as f64
         + if p.dtype.bytes() == 1 { 3.0 } else { 0.0 };
     let pairs = (cfg.bq * cfg.bkv) as f64 / chunks as f64;
-    let mut epilogue = pairs * (NEAREST_PAIR + ops * PAIR_OP + if p.groups { GROUPS_PAIR } else { 0.0 });
+    let unit = pair_op(&planner.device);
+    let mut epilogue = pairs * (NEAREST_PAIR + ops * unit + if p.groups { GROUPS_PAIR * unit } else { 0.0 });
     if p.k > 1 && cfg.select.is_none() {
-        epilogue += p.listing(cfg, cfg.lane_queue(), target.wave, &Weights::same()) * cfg.warps() as f64
+        epilogue += p.listing(cfg, cfg.lane_queue(), target.wave, unit, &Weights::same()) * cfg.warps() as f64
             / (p.m.div_ceil(cfg.bkv) * chunks) as f64;
     }
     let filled = cfg.bkv + usize::from(cfg.bk.is_some()) * cfg.bq;

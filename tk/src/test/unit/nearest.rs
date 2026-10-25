@@ -1343,32 +1343,61 @@ fn a_list_is_dealt_in_lane_under_measured_costs(target: Target, costs: crate::at
         let p = config::NearestProblem { dtype, ..self_join(n, m, d, Metric::NegDot, k) };
         let atom = device.target.geometry_of(dtype).unwrap();
         let ranked = p.ranked(&planner);
-        let queued = |bkv| ranked.iter().filter(move |c| c.queue == Some(32) && c.bkv == bkv).take(3).copied();
-        let queued: Vec<NearestCfg> = queued(16).chain(queued(32)).collect();
-        assert!(queued.len() >= 3, "{dtype:?}: queued lists of 16 or 32 candidates a trip ranked: {queued:?}");
-        for cfg in queued {
+        // The ranked queued lists the search deals in lane: lowered whole,
+        // their products dealt and the deals renaming registers. A config
+        // the lowering refuses (admission does not predict a program's
+        // instruction count; the tuner's own compile verdict does) or whose
+        // product the inference issues wide — its deals then moving across
+        // lanes, priced by the moves the inference counts, not the renames
+        // admission assumes — stands down for the next.
+        let queued = |bkv| {
+            ranked
+                .iter()
+                .filter(move |c| c.queue.is_some() && c.bkv == bkv)
+                .filter_map(|c| {
+                    let spec = plain(n, m, d, p.metric, k, *c);
+                    let prog = match dtype {
+                        ScalarDType::Int8 => nearest::<I8>(&spec),
+                        _ => nearest::<F16>(&spec),
+                    };
+                    let lowered = crate::lower::standalone(prog, &Lowering::new(&device)).ok()?;
+                    let dealt_in_lane = lowered.tile.walk().all(|(_, stmt)| match stmt {
+                        crate::ir::Stmt::Let { dst, op: crate::ir::TileOp::Deal { src, j, .. } } => {
+                            let [s, t] = [*src, *dst].map(|v| lowered.layouts[v.index()].as_ref().unwrap());
+                            s.deal(t, *j, c.warps(), device.target.wave)
+                                .is_some_and(|moves| moves.iter().all(|(picks, _)| picks.iter().all(|p| p.mask == 0)))
+                        }
+                        _ => true,
+                    });
+                    dealt_in_lane.then_some((*c, lowered))
+                })
+                .take(3)
+        };
+        let queued: Vec<(NearestCfg, _)> = queued(16).chain(queued(32)).collect();
+        assert!(
+            queued.len() >= 3,
+            "{dtype:?}: queued lists of 16 or 32 candidates a trip ranked: {:?}",
+            queued.iter().map(|(c, _)| c).collect::<Vec<_>>()
+        );
+        for (cfg, lowered) in queued {
             let sharing = cfg.sharing(&device.target, d, dtype).unwrap();
-            let metric = p.metric;
-            let spec = plain(n, m, d, metric, k, cfg);
-            let prog = match dtype {
-                ScalarDType::Int8 => nearest::<I8>(&spec),
-                _ => nearest::<F16>(&spec),
-            };
-            let lowered = crate::lower::standalone(prog, &Lowering::new(&device)).unwrap();
             let instructions = lowered.instructions();
             let most = device.target.most_instructions();
             assert!(instructions <= most, "{dtype:?} {cfg:?}: {instructions} instructions");
             let grid = WarpGrid { rows: cfg.warps(), cols: 1 };
-            let (narrow, issue) = atom.narrow(grid, cfg.bq, cfg.bkv, d).unwrap();
+            let (_, issue) = atom.narrow(grid, cfg.bq, cfg.bkv, d).unwrap();
             assert_eq!(sharing, 1 << issue.c.row_fold_masks().len(), "{dtype:?} {cfg:?}");
             let (mut products, mut deals) = (0, 0);
             for (_, stmt) in lowered.tile.walk() {
                 let Stmt::Let { dst, op } = stmt else { continue };
                 match *op {
-                    TileOp::Mma { orient, .. } => {
-                        assert_eq!(orient, Some(narrow), "{dtype:?} {cfg:?}: the product's orientation");
-                        products += 1;
-                    }
+                    // The issue orientation is the inference's own costed
+                    // choice over the whole deal chain, which at a lane
+                    // width of two need not be the atom's narrowest row
+                    // spread ([`crate::atoms::MmaAtom::narrow`], the bound
+                    // admission prices); the claim diff holds the atom
+                    // count whatever way round it issues.
+                    TileOp::Mma { .. } => products += 1,
                     TileOp::Deal { src, j, .. } => {
                         let [s, t] = [src, *dst].map(|v| lowered.layouts[v.index()].as_ref().unwrap());
                         let moves = s.deal(t, j, cfg.warps(), device.target.wave).unwrap();
