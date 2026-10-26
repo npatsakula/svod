@@ -249,7 +249,8 @@ impl GemmProblem {
         let reads = fragments as f64 * costs.smem_byte;
         let work = steps as f64 * step;
         let trip = costs.trip(target.fill, stages, cfg.unroll);
-        let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
+        let hide = costs.hide();
+        let run = Run { blocks, smem, regs, waves, atoms, hide, trips, reads, work, epilogue: 0.0, fill, trip, stages };
         Ok((planner.pipelined(run), regs))
     }
 

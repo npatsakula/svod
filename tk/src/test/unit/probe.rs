@@ -96,7 +96,7 @@ fn counted(target: &Target, probes: &[Probe], field: &str) -> f64 {
         "score" => (blocks * extent * carried()) as f64,
         // One wave's chain: every wave runs its own alongside the others.
         "scatter" => (extent * loads_from(probe, Tier::Global)[0].0.elems() / warps) as f64,
-        "step_lone" => (extent * mma(probe) / 4096 / warps) as f64,
+        "step_lone" | "step_lone_i8" => (extent * mma(probe) / 4096 / warps) as f64,
         // The work of every relayout of a trip, as the inference prices it.
         "smem_trip" | "lane_move" => {
             let moved: f64 = relayouts(target, find(probes, field), 1).iter().map(Relayout::work).sum();

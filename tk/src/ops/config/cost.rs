@@ -29,11 +29,19 @@ pub(crate) struct Run {
     /// The independent matrix-core accumulators a wave holds between
     /// dependent steps: they hide a chain's latency as other waves do.
     pub atoms: usize,
+    /// The waves a SIMD needs to hide a dependent chain of this run's
+    /// steps: the lone-wave inflation of its work, the step probes' ratio
+    /// of the dtype the run multiplies (the 8-bit chain's own, where its
+    /// lone step was measured).
+    pub hide: f64,
     pub trips: usize,
     /// A trip's operand fragments read from shared memory.
     pub reads: f64,
-    /// A trip's matrix-core steps and vector work.
+    /// A trip's matrix-core steps (the chain the lone waves inflate)
+    /// and its vector work beside them (the epilogue, not a chain).
     pub work: f64,
+    /// A trip's vector work beside the steps: the epilogue.
+    pub epilogue: f64,
     /// A trip's fill, priced by where its bytes come from.
     pub fill: f64,
     pub trip: f64,
@@ -142,7 +150,7 @@ impl Planner {
     /// [`crate::atoms::Costs::latency_one`]) on top of its issue: measured on
     /// both, the latency adds rather than hides under the issue.
     pub(crate) fn pipelined(&self, run: Run) -> f64 {
-        let Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages } = run;
+        let Run { blocks, smem, regs, waves, atoms, hide, trips, reads, work, epilogue, fill, trip, stages } = run;
         let Device { target, costs } = &self.device;
         let (o, sms) = (target.occupancy, self.sms());
         // At least one: the compiled kernel, not the layout count, decides
@@ -150,15 +158,14 @@ impl Planner {
         let resident = self.resident(smem, regs, waves).max(1);
         let per_sm = blocks.div_ceil(sms);
         let rounds = per_sm.div_ceil(resident);
-        let hide =
-            if costs.step > 0.0 && costs.step_lone > 0.0 { (costs.step_lone / costs.step).max(1.0) } else { 1.0 };
+        let hide = hide.max(1.0);
         let per_simd = |waves: usize| (waves as f64 / o.simds as f64).max(1.0);
         let lone = |waves: usize| (hide / (per_simd(waves) * atoms.max(1) as f64)).max(1.0);
         let serial = stages <= 1 && target.fill == Fill::CpAsync;
         // `alone`: one block's pipes, its fill after the rest where serial.
         let body = |waves: usize, alone: bool| {
             let fill = if alone && serial { (0.0, fill) } else { (fill, 0.0) };
-            let pipes = [reads, work * lone(waves), fill.0];
+            let pipes = [reads, work * lone(waves) + epilogue, fill.0];
             let longest = pipes.into_iter().fold(0.0, f64::max);
             longest + (pipes.iter().sum::<f64>() - longest) / per_simd(waves).min(OVERLAP_WAVES) + fill.1
         };

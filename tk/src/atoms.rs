@@ -304,6 +304,11 @@ pub struct Costs {
     /// The same step of a wave alone on its SIMD: a dependent chain's
     /// latency, which `step_lone / step` waves a SIMD hide.
     pub step_lone: f64,
+    /// The 8-bit step's chain alone on its SIMD: the waves an 8-bit
+    /// product's chain hides with are `step_lone_i8 / step_i8`, not the
+    /// 16-bit ratio (the chain's latency does not scale with its step's
+    /// throughput). 0 where unmeasured: the 16-bit ratio then stands.
+    pub step_lone_i8: f64,
     /// One score element's softmax vector work (scale, max, exp2, sum).
     pub score: f64,
     /// One pipeline trip's fixed overhead (barrier, ring bubble), unrolled,
@@ -364,7 +369,7 @@ pub const LADDER: usize = 9;
 impl Costs {
     /// Every field a pair of programs measures, by name, in declaration
     /// order: all but the cache's, which a series of footprints measures.
-    pub fn fields(&mut self) -> [(&'static str, &mut f64); 17] {
+    pub fn fields(&mut self) -> [(&'static str, &mut f64); 18] {
         let Costs {
             smem_byte,
             global_byte,
@@ -373,6 +378,7 @@ impl Costs {
             step_group,
             step_i8,
             step_lone,
+            step_lone_i8,
             score,
             trip,
             trip_rolled,
@@ -395,6 +401,7 @@ impl Costs {
             ("step_group", step_group),
             ("step_i8", step_i8),
             ("step_lone", step_lone),
+            ("step_lone_i8", step_lone_i8),
             ("score", score),
             ("trip", trip),
             ("trip_rolled", trip_rolled),
@@ -796,6 +803,12 @@ impl Device {
 }
 
 impl Costs {
+    /// The waves a SIMD needs to hide a dependent chain of 16-bit steps,
+    /// one at least; one where nothing measured their lone latency.
+    pub fn hide(&self) -> f64 {
+        if self.step > 0.0 && self.step_lone > 0.0 { (self.step_lone / self.step).max(1.0) } else { 1.0 }
+    }
+
     /// One pipeline trip's fixed overhead over a ring `stages` deep that
     /// `fill` fills, `unroll`ed or not: a ring of one slot pays its barrier
     /// pair, a rolled register-staged ring of two recomputes its slot

@@ -210,7 +210,21 @@ fn run(
     [reads, work, fill, trip]: [f64; 4],
     stages: usize,
 ) -> Run {
-    Run { blocks, smem: sm86().smem_bytes / resident, regs: 0, waves, atoms, trips, reads, work, fill, trip, stages }
+    Run {
+        blocks,
+        smem: sm86().smem_bytes / resident,
+        regs: 0,
+        waves,
+        atoms,
+        hide: 1.0,
+        trips,
+        reads,
+        work,
+        epilogue: 0.0,
+        fill,
+        trip,
+        stages,
+    }
 }
 
 /// The SM time of `rounds` rounds of `actual` resident blocks of `waves`
@@ -318,12 +332,20 @@ fn a_one_slot_cp_async_block_fills_alone() {
 fn a_lone_wave_pays_its_chain() {
     let flat = |step_lone| Costs { latency: 0.0, step: 5.0, step_lone, ..costs() };
     let waves = sm86().occupancy.simds as usize;
-    let cost = |step_lone, resident, work, fill| {
-        let planner = planned(Device { target: sm86(), costs: flat(step_lone) });
-        planner.pipelined(run(resident * planner.sms(), resident, waves, 1, 1, [0.0, work, fill, 0.0], 2))
+    let cost = |step_lone, resident, work, epilogue| {
+        let costs = flat(step_lone);
+        let hide = costs.hide();
+        let planner = planned(Device { target: sm86(), costs });
+        planner.pipelined(Run {
+            hide,
+            epilogue,
+            ..run(resident * planner.sms(), resident, waves, 1, 1, [0.0, work, 0.0, 0.0], 2)
+        })
     };
+    // The chain's ratio on the steps alone; the epilogue rides beside them.
     assert_eq!(cost(15.0, 1, 100.0, 0.0), 300.0);
     assert_eq!(cost(15.0, 1, 100.0, 50.0), 350.0);
+    assert_eq!(cost(15.0, 1, 0.0, 100.0), 100.0);
     assert_eq!(cost(15.0, 4, 100.0, 0.0), 400.0);
     assert_eq!(cost(5.0, 1, 100.0, 0.0), 100.0);
     assert_eq!(cost(0.0, 1, 100.0, 0.0), 100.0);
@@ -338,8 +360,10 @@ fn independent_accumulators_hide_the_chain() {
     let flat = Costs { latency: 0.0, step: 5.0, step_lone: 15.0, ..costs() };
     let planner = planned(Device { target: sm86(), costs: flat });
     let waves = sm86().occupancy.simds as usize;
-    let cost =
-        |atoms, work, reads| planner.pipelined(run(planner.sms(), 1, waves, atoms, 1, [reads, work, 0.0, 0.0], 2));
+    let cost = |atoms, work, reads| {
+        planner
+            .pipelined(Run { hide: flat.hide(), ..run(planner.sms(), 1, waves, atoms, 1, [reads, work, 0.0, 0.0], 2) })
+    };
     assert_eq!(cost(1, 100.0, 0.0), 300.0);
     assert_eq!(cost(3, 100.0, 0.0), 100.0);
     assert_eq!(cost(1, 0.0, 100.0), 100.0);

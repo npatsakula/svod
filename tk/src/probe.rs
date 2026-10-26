@@ -256,6 +256,8 @@ pub const GUESSED: Costs = Costs {
     step_i8: 2.5,
     // Three waves a SIMD hide the chain.
     step_lone: 15.0,
+    // Unmeasured: the 16-bit ratio stands.
+    step_lone_i8: 0.0,
     score: 0.5,
     trip: 150.0,
     trip_rolled: 170.0,
@@ -483,6 +485,7 @@ pub(crate) fn probes(target: &Target) -> Result<Vec<Probe>> {
         p.step_group(),
         p.step_i8(),
         p.step_lone(),
+        p.step_lone_i8(),
         p.score(),
         p.trips("probe:trip", true, 2),
         p.rolled_trips(),
@@ -768,6 +771,26 @@ impl<'a> Probes<'a> {
             self.chain(Costs::default()),
             false,
         )
+    }
+
+    /// [`Self::step_lone`] over 8-bit integers: the 8-bit chain's own
+    /// latency, whose ratio to [`Self::step_i8`] is the waves a SIMD hides
+    /// an 8-bit product's chain with; no candidates where the target has no
+    /// such core.
+    fn step_lone_i8(&self) -> Probe {
+        let warps = self.warps;
+        let mut probe = self.steps::<I8>(
+            "probe:step_lone_i8",
+            [32 * warps as usize, 32, 32],
+            self.sms as usize,
+            warps.into(),
+            self.chain(Costs::default()),
+            false,
+        );
+        if self.target.geometry_of(ScalarDType::Int8).is_none() {
+            probe.candidates.clear();
+        }
+        probe
     }
 
     /// `blocks` of `warps` each accumulating a `bm × bn` product over `bk`

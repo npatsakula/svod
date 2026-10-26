@@ -195,9 +195,11 @@ impl AttentionProblem {
         let shared = 1.0 - flight.div_ceil(self.t.div_ceil(bq)) as f64 / flight as f64;
         let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
         let reads = fragments as f64 * costs.smem_byte;
-        let work = steps as f64 * step + (kw * bq * bkv) as f64 * costs.score;
+        let work = steps as f64 * step;
+        let epilogue = (kw * bq * bkv) as f64 * costs.score;
         let trip = costs.trip(target.fill, stages, cfg.unroll);
-        let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
+        let hide = costs.hide();
+        let run = Run { blocks, smem, regs, waves, atoms, hide, trips, reads, work, epilogue, fill, trip, stages };
         Ok((planner.pipelined(run), regs))
     }
 

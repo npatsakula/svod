@@ -465,9 +465,16 @@ impl NearestProblem {
                 share.listing(cfg, lanes, target.wave, unit, w) * waves as f64 * costs.score / (tiles * chunks) as f64;
         }
         let step = if elem == 1 { costs.step_i8 } else { costs.step };
-        let work = steps as f64 * step + epilogue;
+        // The 8-bit chain hides with its own lone ratio where its lone step
+        // was measured, not the 16-bit one: the chain's latency does not
+        // scale with its step's throughput.
+        let hide = match elem {
+            1 if costs.step_lone_i8 > 0.0 && costs.step_i8 > 0.0 => (costs.step_lone_i8 / costs.step_i8).max(1.0),
+            _ => costs.hide(),
+        };
+        let work = steps as f64 * step;
         let trip = costs.trip(target.fill, stages, cfg.unroll);
-        let run = Run { blocks, smem, regs, waves, atoms, trips, reads, work, fill, trip, stages };
+        let run = Run { blocks, smem, regs, waves, atoms, hide, trips, reads, work, epilogue, fill, trip, stages };
         let restarts = match cfg.bk {
             None => 0.0,
             Some(_) => {
