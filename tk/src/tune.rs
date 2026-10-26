@@ -94,6 +94,17 @@ const RUNS: usize = 5;
 const RUN_BUDGET: Duration = Duration::from_millis(20);
 /// Measurement: the fewest profiled runs a tuner's round gives a candidate.
 const MIN_RUNS: usize = 2;
+/// Measurement: the most profiled runs a candidate's minimum takes to prove
+/// consistent: a run under [`STEADY`] of the minimum so far resets the
+/// count, three over it settle the candidate. A clock still lifting shows a
+/// falling minimum run to run (a 3060 read a nearest search at 4.8 ms
+/// against its warm 0.87 while its every timed run rode the sagged clock);
+/// a warm kernel's minimum is flat within a run's drift.
+const STABLE_RUNS: usize = 3;
+/// Measurement: a run within this of the minimum so far counts stable.
+const STEADY: f64 = 0.97;
+/// Measurement: the most profiled runs a candidate is given to settle.
+const MOST_RUNS: usize = 16;
 
 /// The profiled runs a tuner's round gives a candidate whose last run took
 /// `t`: those [`RUN_BUDGET`] holds, [`MIN_RUNS`] to [`RUNS`]. A candidate
@@ -1186,8 +1197,19 @@ fn time_with<B: BorrowMut<Built>>(
             .zip(fresh)
             .map(|((plan, last), fresh)| {
                 // Unsustained, the first run is as good as the next ones.
-                let kept = fresh.filter(|_| !sustained);
-                let t = best(kept.map(Some).into_iter().chain((kept.is_some() as usize..runs).map(|_| run(plan))))?;
+                let mut timed = vec![fresh.or_else(|| run(plan))?];
+                if sustained {
+                    // Run until the minimum is consistent: the budget's
+                    // runs the floor, three stable ones settle it.
+                    let (mut stable, mut least) = (0, timed[0]);
+                    while timed.len() < MOST_RUNS && (timed.len() < runs || stable < STABLE_RUNS) {
+                        let r = run(plan)?;
+                        stable = if r.as_secs_f64() < least.as_secs_f64() * STEADY { 0 } else { stable + 1 };
+                        least = least.min(r);
+                        timed.push(r);
+                    }
+                }
+                let t = best(timed.into_iter().map(Some))?;
                 *last = Some(t);
                 Some(t)
             })
