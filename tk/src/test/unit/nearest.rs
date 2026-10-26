@@ -1074,9 +1074,8 @@ fn the_merge_offers_lists_in_order(metric: Metric, k: usize) {
 /// The planner splits a streamed tile's candidates at a large self-join,
 /// where the blocks in flight span more query blocks than a group, and a
 /// resident tile's only where its query blocks leave SMs idle; every share
-/// keeps a candidate tile for each score a row keeps, whatever more the
-/// priced sweep picks. The tuner times each admitted config split where it
-/// splits, whole where not, and the first whole as well.
+/// keeps four candidate tiles. The tuner times each admitted config split
+/// where it splits, whole where not, and the first whole as well.
 #[test_case(crate::atoms::sm86(); "sm_86")]
 #[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64); "gfx1201")]
 #[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40); "gfx1151")]
@@ -1088,12 +1087,7 @@ fn splits_serve_rereads_and_idle_sms(target: Target) {
     assert!(s.is_power_of_two() && big.div_ceil(streamed.bkv) / s >= 4, "{s}");
     assert_eq!(split(big, big, 128, resident), None, "a resident self-join fills the SMs whole");
     assert!(split(300, big, 128, resident).is_some(), "three query blocks leave SMs idle");
-    // Seven candidate tiles: the four-tile floor is gone (its counts past
-    // the bound measured only losers once fills price through the ladder);
-    // a share a tile at least, the count the pricing picks.
-    let s = split(big, 7 * 128, 768, streamed);
-    assert!(s.is_none_or(|s| s.is_power_of_two() && 7 / s >= 1), "{s:?}");
-    _ = s;
+    assert_eq!(split(big, 7 * 128, 768, streamed), None, "seven candidate tiles make one share of four");
     let admitted = [streamed, NearestCfg::streamed(64, 64, 32, 2), resident];
     let timed = planner.nearest_splits(&self_join(big, big, 768, Metric::SquaredL2, 1), &admitted);
     let whole: Vec<NearestCfg> = timed.iter().filter(|c| c.splits == 1).copied().collect();
@@ -1102,12 +1096,12 @@ fn splits_serve_rereads_and_idle_sms(target: Target) {
 }
 
 /// A few queries over many candidates leave SMs idle whole: each way of the
-/// ranking's front splits its candidates into shares of at least a
-/// candidate tile a score of a list (a score matrix's shares store their
-/// scores, a tile each, as a least's), until the grid's blocks reach half
-/// the SMs at least, register lists, queued ones and score matrices alike,
-/// resident and streamed; a self-join's resident tiles at depth 128 fill
-/// them whole.
+/// ranking's front splits its candidates into shares of at least four
+/// candidate tiles a score of a list (a score matrix's shares store their
+/// scores, four tiles each, as a least's), until the grid's blocks reach
+/// half the SMs at least, register lists, queued ones and score matrices
+/// alike, resident and streamed; a self-join's resident tiles at depth 128
+/// fill them whole.
 #[test_case(crate::atoms::sm86(); "sm_86")]
 #[test_case(crate::sweep::amd(AmdArch::Gfx1201, 64); "gfx1201")]
 #[test_case(crate::sweep::amd(AmdArch::Gfx1151, 40); "gfx1151")]
@@ -1121,7 +1115,7 @@ fn few_queries_split_their_lists_to_fill_the_gpu(target: Target) {
             eprintln!("n {n} d {d} k {k} {cfg:?}: {split:?}");
             let s = split.unwrap_or_else(|| panic!("n {n} d {d} k {k} {cfg:?} splits"));
             let per = if cfg.select.is_some() { 1 } else { k };
-            assert!(s.is_power_of_two() && m.div_ceil(cfg.bkv) / s >= per, "{cfg:?}: {s}");
+            assert!(s.is_power_of_two() && m.div_ceil(cfg.bkv) / s >= 4 * per, "{cfg:?}: {s}");
             // At least half the SMs: past that, a round more of blocks or a
             // long list filled again in every share may cost more.
             assert!(2 * n.div_ceil(cfg.bq) * s >= planner.sms(), "{cfg:?}: {s} shares leave SMs idle");
