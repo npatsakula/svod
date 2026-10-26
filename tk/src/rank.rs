@@ -891,11 +891,12 @@ pub fn counted(program: &svod_ir::UOp) -> Option<Counted> {
     Some(out)
 }
 
-/// A config's predicted resource claim, the quantities the cost model
-/// counts, outside the fused ns — the seed of the Claim vocabulary: what a
-/// trip of the config's kernel should hold. The VALU count keeps the
-/// epilogue's own units (a pair's operations, a listing's share), which a
-/// program's instruction mix only sometimes maps.
+/// A config's predicted resource claim — the quantities the cost model
+/// counts, read from the family's own [`config::Claim`] construction (the
+/// one path the ranking prices), outside the fused ns: what a trip of the
+/// config's kernel should hold. The VALU count keeps the epilogue's own
+/// units (a pair's operations, a listing's share), which a program's
+/// instruction mix only sometimes maps.
 pub struct Claim {
     /// Matrix-core steps a trip, in the target's atom instructions.
     pub steps: f64,
@@ -929,7 +930,10 @@ const HOLDS: f64 = 0.15;
 /// configs, nearest at `k = 1` resident and streamed, a register list at
 /// `k = 64` and a split at `k = 8` — on `target`'s planner under the
 /// declared guessed costs. The tensors are small (the interpreter's
-/// shapes); the tiles are those a large shape plans.
+/// shapes); the tiles are those a large shape plans. Every row but a
+/// GEMM's epilogue is the family's own claim, the same construction the
+/// ranking prices; the gelu's forty tile operations a GEMM's epilogue
+/// emits stay this diff's own prediction until the claim carries them.
 pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
     use crate::build::{BF16, F16};
     use crate::kernels::attention::{AttnMask, AttnSpec, attention};
@@ -940,45 +944,53 @@ pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
     let device = crate::atoms::Device { target: target.clone(), costs: crate::probe::GUESSED };
     let planner = Planner::new(device.clone()).expect("an SM count");
     let lowering = crate::lower::Lowering::new(&device);
-    let atom_step = target.geometry().expect("a matrix core").m as usize
-        * target.geometry().expect("a matrix core").n as usize
-        * target.geometry().expect("a matrix core").k as usize;
+    let atom = target.geometry().expect("a matrix core");
+    let atom_step = (atom.m as usize * atom.n as usize * atom.k as usize) as f64;
     // The program's list is one warp's code, its loads one thread's: the
     // block's per-trip claim divides by the warps for the steps and the
     // VALU, and its fill bytes compare against the threads' loads together.
-    let diff = |name: String, claim: Claim, warps: usize, prog: crate::ir::Program| -> Option<Diffed> {
+    let diff = |name: String,
+                claim: &config::Claim,
+                gelu_ops: f64,
+                warps: usize,
+                prog: crate::ir::Program|
+     -> Option<Diffed> {
         let counted = counted(&crate::lower::standalone(prog, &lowering).ok()?.program)?;
         let threads = (warps * target.wave as usize) as f64;
+        let unit = config::pair_op(&device);
+        let predicted = Claim {
+            steps: claim.steps.count() * config::STEP as f64 / atom_step,
+            ops: claim.ops.fold(unit, 1.0, &config::Weights::same()) + gelu_ops,
+            fill: claim.fill.bytes as usize,
+            smem: claim.smem,
+            regs: claim.regs,
+        };
+        let Claim { steps, ops, fill, smem, regs } = predicted;
         let row = |what: &'static str, predicted: f64, program: f64| {
             (what, predicted, program, (program - predicted).abs() <= HOLDS * predicted.max(1.0))
         };
         Some(Diffed {
             name,
-            regs: claim.regs,
+            regs,
             rows: vec![
-                row("steps/trip", claim.steps / warps as f64, counted.steps as f64),
-                row("fill bytes/trip", claim.fill as f64, counted.fill as f64 * threads),
-                row("valu ops/trip", claim.ops, counted.valu as f64 * warps as f64),
-                row("smem", claim.smem as f64, counted.smem as f64),
+                row("steps/trip", steps / warps as f64, counted.steps as f64),
+                row("fill bytes/trip", fill as f64, counted.fill as f64 * threads),
+                row("valu ops/trip", ops, counted.valu as f64 * warps as f64),
+                row("smem", smem as f64, counted.smem as f64),
             ],
         })
     };
-    let mut out: Vec<(String, Claim, usize, crate::ir::Program)> = vec![];
+    let mut out: Vec<(String, config::Claim, f64, usize, crate::ir::Program)> = vec![];
     // GEMM: the leading tiles of a 4096³ plan, emitted small, a gelu
     // epilogue on the accumulator (the tile operations it emits counted —
     // each a lane's register a thread over the tile's elements, so a trip's
     // VALU count is them times the tile over the wave: the linear list
     // holds one scalar op a lane).
     let gelu = 1 + 3 * 3 + 1 + 4 * 4 + 1 + 1 + 3 + 1 + 1 + 3 + 1 + 1 + 1;
+    let p = GemmProblem { batches: 1, m: 4096, n: 4096, k: 4096, halves: 1 };
     for cfg in config::distinct(&planner.gemm_ranked(1, 4096, 4096, 4096, false)).take(3) {
-        let [bm, bn, bk] = cfg.tile;
-        let claim = Claim {
-            steps: (bm * bn * bk) as f64 / atom_step as f64,
-            ops: gelu as f64 * (bm * bn) as f64 / target.wave as f64,
-            fill: (bm + bn) * bk * 2,
-            smem: cfg.smem_bytes(false, 2),
-            regs: cfg.registers(target, 1).expect("ranked"),
-        };
+        let claim = p.claim(&planner, &cfg).expect("ranked");
+        let gelu_ops = gelu as f64 * (cfg.tile[0] * cfg.tile[1]) as f64 / target.wave as f64;
         let spec = GemmSpec {
             m: 130,
             n: 192,
@@ -987,17 +999,18 @@ pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
             epilogue: Epilogue { act: Act::Gelu, ..Epilogue::DEFAULT },
             cfg,
         };
-        out.push((format!("gemm {:?}", cfg.tile), claim, (cfg.warps[0] * cfg.warps[1]) as usize, gemm::<BF16>(&spec)));
+        out.push((
+            format!("gemm {:?}", cfg.tile),
+            claim,
+            gelu_ops,
+            (cfg.warps[0] * cfg.warps[1]) as usize,
+            gemm::<BF16>(&spec),
+        ));
     }
     // Attention: two configs of a d64 causal plan, emitted small.
+    let p = AttentionProblem { tiles: 8, t: 100, tk: 100, d: 64, causal: true, bias: false };
     for cfg in config::distinct(&planner.attention_ranked(8, 100, 100, 64, true, false)).take(2) {
-        let claim = Claim {
-            steps: (2 * cfg.bq * cfg.bkv * 64) as f64 / atom_step as f64,
-            ops: (cfg.key_warps * cfg.bq * cfg.bkv) as f64,
-            fill: cfg.key_warps * 2 * cfg.bkv * 64 * 2,
-            smem: cfg.smem_bytes(64, false),
-            regs: cfg.registers(target, 64, false).expect("ranked"),
-        };
+        let claim = p.claim(&planner, &cfg).expect("ranked");
         let spec = AttnSpec {
             batch: Batch::Static(2),
             t: 100,
@@ -1010,7 +1023,13 @@ pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
             scale: 0.125,
             cfg,
         };
-        out.push((format!("attention {}x{}", cfg.bq, cfg.bkv), claim, cfg.warps() as usize, attention::<BF16>(&spec)));
+        out.push((
+            format!("attention {}x{}", cfg.bq, cfg.bkv),
+            claim,
+            0.0,
+            cfg.warps() as usize,
+            attention::<BF16>(&spec),
+        ));
     }
     // Nearest: k = 1 resident and streamed, a register list at k = 64, a
     // split at k = 8.
@@ -1041,20 +1060,22 @@ pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
         ("streamed", ranked.iter().find(|c| c.bk.is_some()).copied()),
     ] {
         let Some(cfg) = way else { continue };
-        let claim = nearest_claim(&planner, &problem(1), &cfg, atom_step);
+        let claim = problem(1).claim(&planner, &cfg).expect("ranked");
         out.push((
             format!("nearest k1 {name} {}x{}", cfg.bq, cfg.bkv),
             claim,
+            0.0,
             cfg.warps() as usize,
             nearest::<F16>(&spec(cfg, 1)),
         ));
     }
     let ranked = planner.nearest_ranked(problem(64));
     if let Some(&cfg) = ranked.iter().find(|c| c.queue.is_none() && c.select.is_none()) {
-        let claim = nearest_claim(&planner, &problem(64), &cfg, atom_step);
+        let claim = problem(64).claim(&planner, &cfg).expect("ranked");
         out.push((
             format!("nearest k64 list {}x{}", cfg.bq, cfg.bkv),
             claim,
+            0.0,
             cfg.warps() as usize,
             nearest::<F16>(&spec(cfg, 64)),
         ));
@@ -1063,43 +1084,18 @@ pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
     let ranked = planner.nearest_ranked(split_problem);
     let split = planner.nearest_splits(&split_problem, &config::distinct(&ranked).take(16).collect::<Vec<_>>());
     if let Some(&cfg) = split.iter().find(|c| c.splits > 1 && c.splits <= 32) {
-        let claim = nearest_claim(&planner, &split_problem, &cfg, atom_step);
+        let claim = split_problem.claim(&planner, &cfg).expect("ranked");
         let mut split_spec = spec(cfg, 8);
         split_spec.m = cfg.splits * cfg.bkv * 2;
         out.push((
             format!("nearest k8 split {} {}x{}", cfg.splits, cfg.bq, cfg.bkv),
             claim,
+            0.0,
             cfg.warps() as usize,
             nearest::<F16>(&split_spec),
         ));
     }
-    out.into_iter().filter_map(|(name, claim, warps, prog)| diff(name, claim, warps, prog)).collect()
-}
-
-/// A nearest config's predicted claim: a trip's steps in atom instructions,
-/// its epilogue's operation count (every pair's, and a list's the listing's
-/// share a trip), the bytes it fills, its declared shared memory and the
-/// registers a lane holds.
-fn nearest_claim(planner: &Planner, p: &NearestProblem, cfg: &NearestCfg, atom_step: usize) -> Claim {
-    use crate::ops::config::{GROUPS_PAIR, NEAREST_PAIR, Weights, pair_op};
-    let target = &planner.device.target;
-    let depth = cfg.bk.unwrap_or(p.d);
-    let chunks = p.d.div_ceil(depth);
-    let ops = [p.metric.row_norms(), p.floors.row, p.floors.col].iter().filter(|&&on| on).count() as f64
-        + if p.dtype.bytes() == 1 { 3.0 } else { 0.0 };
-    let pairs = (cfg.bq * cfg.bkv) as f64 / chunks as f64;
-    let unit = pair_op(&planner.device);
-    let mut epilogue = pairs * (NEAREST_PAIR + ops * unit + if p.groups { GROUPS_PAIR * unit } else { 0.0 });
-    if p.k > 1 && cfg.select.is_none() {
-        epilogue += p.listing(cfg, cfg.lane_queue(), target.wave, unit, &Weights::same()) * cfg.warps() as f64
-            / (p.m.div_ceil(cfg.bkv) * chunks) as f64;
-    }
-    let filled = cfg.bkv + usize::from(cfg.bk.is_some()) * cfg.bq;
-    Claim {
-        steps: (cfg.bq * cfg.bkv * depth) as f64 / atom_step as f64,
-        ops: epilogue,
-        fill: filled * depth * p.dtype.bytes(),
-        smem: cfg.smem_bytes(p.d, p.dtype),
-        regs: cfg.registers(target, p.d, p.k, p.dtype).expect("ranked"),
-    }
+    out.into_iter()
+        .filter_map(|(name, claim, gelu_ops, warps, prog)| diff(name, &claim, gelu_ops, warps, prog))
+        .collect()
 }

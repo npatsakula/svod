@@ -4,12 +4,12 @@
 
 use std::sync::Arc;
 
-use crate::atoms::{Core, Device, Fill, GroupMmaAtom, Target};
+use crate::atoms::{Core, Fill, GroupMmaAtom, Target};
 use crate::ir::{Axis, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::layouts::{Swizzle, WarpGrid, chunked, fills_in_chunks};
 
-use super::cost::{ELEM, Planner, Run, STEP, cached};
+use super::cost::{Claim, ELEM, Kind, Ops, PAIR_OPS, Planner, STEP, Spread, Steps, Stream, cached};
 use super::search::{Rejected, sorted};
 
 impl FaCfg {
@@ -149,7 +149,16 @@ impl AttentionProblem {
     /// owning more rows reads each fragment for all of them: the fragment
     /// reads are per wave, so they divide by the rows per warp.
     pub fn admit(&self, planner: &Planner, cfg: &FaCfg) -> Result<(f64, u32), Rejected> {
-        let Device { target, costs } = &planner.device;
+        let claim = self.claim(planner, cfg)?;
+        Ok((planner.price(&claim), claim.regs))
+    }
+
+    /// The config's [claim](super::cost::Claim): its checks run first — a
+    /// config that lowers and fits the target's shared memory and register
+    /// files — then its resources. A warpgroup product reads no key or
+    /// value fragments and holds one chain per product.
+    pub(crate) fn claim(&self, planner: &Planner, cfg: &FaCfg) -> Result<Claim, Rejected> {
+        let target = &planner.device.target;
         let (bq, bkv, d, kw) = (cfg.bq, cfg.bkv, self.d, cfg.key_warps);
         let smem = cfg.smem_bytes(d, self.bias);
         if !cfg.fits(target, d, self.bias) {
@@ -174,13 +183,13 @@ impl AttentionProblem {
         // A warpgroup product reads no key or value fragments, holds one
         // chain per product, and is past `ptxas` beyond the block's share of
         // the register file.
-        let (atoms, kv_reads, step) = match cfg.core {
+        let (atoms, kv_reads) = match cfg.core {
             Core::Warp => {
                 let atom = target.geometry().ok_or(Rejected::Lowers)?;
                 let atoms = (cfg.warp_rows / atom.m as usize) * (bkv.min(d) / atom.n as usize);
-                (atoms, 2 * waves * bkv * d * ELEM, costs.step)
+                (atoms, 2 * waves * bkv * d * ELEM)
             }
-            Core::Group if regs <= target.lane_budget(waves as u32) => (1, 0, costs.step_group),
+            Core::Group if regs <= target.lane_budget(waves as u32) => (1, 0),
             Core::Group => return Err(Rejected::Registers { need: regs, have: target.lane_budget(waves as u32) }),
         };
         let bias = usize::from(self.bias) * kw * bq * bkv * ELEM;
@@ -193,14 +202,26 @@ impl AttentionProblem {
         let unique = (self.tiles * self.tk * (d * 2 + usize::from(self.bias) * self.t) * ELEM) as f64;
         let flight = planner.sms().min(blocks).max(1);
         let shared = 1.0 - flight.div_ceil(self.t.div_ceil(bq)) as f64 / flight as f64;
-        let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
-        let reads = fragments as f64 * costs.smem_byte;
-        let work = steps as f64 * step;
-        let epilogue = (kw * bq * bkv) as f64 * costs.score;
-        let trip = costs.trip(target.fill, stages, cfg.unroll);
-        let hide = costs.hide();
-        let run = Run { blocks, smem, regs, waves, atoms, hide, trips, reads, work, epilogue, fill, trip, stages };
-        Ok((planner.pipelined(run), regs))
+        Ok(Claim {
+            blocks,
+            smem,
+            regs,
+            waves,
+            atoms,
+            steps: match cfg.core {
+                Core::Warp => Steps::F16(steps as f64),
+                Core::Group => Steps::Group(steps as f64),
+            },
+            trips,
+            reads: fragments as f64,
+            ops: Ops::of(Kind::Pair, (kw * bq * bkv) as f64 * PAIR_OPS),
+            fill: Stream { bytes: fill as f64, unique, shared },
+            stores: 0.0,
+            ring: stages,
+            unroll: cfg.unroll,
+            waits: 0.0,
+            sections: [Spread::default(); 2],
+        })
     }
 
     /// The key-block trips of a causal query block of `bq` rows over key

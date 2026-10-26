@@ -16,12 +16,13 @@
 //! A [`Planner`] holds the rankings of one device. The other kernels' lists
 //! are small functions of the target.
 //!
-//! By responsibility: `cost` the shared pricing core (a [`Run`] of a config,
-//! the [`Planner`] that pipelines it), `facts` the device's layer-0
-//! description ([`Facts`]), `search` the machinery every family's ranking
-//! shares (bounds, the shortlist search, tile twins), and `gemm`,
-//! `attention`, `nearest`, `conv`, `norm` their families' configs, lattices
-//! and admission.
+//! By responsibility: `cost` the shared pricing core (the [`Claim`]
+//! vocabulary a family states a config's resources in, the one
+//! [`Planner::price`] that turns a claim into time, the [`Run`] it
+//! pipelines), `facts` the device's layer-0 description ([`Facts`]),
+//! `search` the machinery every family's ranking shares (bounds, the
+//! shortlist search, tile twins), and `gemm`, `attention`, `nearest`,
+//! `conv`, `norm` their families' configs, lattices and admission.
 
 mod attention;
 mod conv;
@@ -40,10 +41,10 @@ pub use self::nearest::NearestProblem;
 pub use self::norm::norm_candidates;
 pub use self::search::{Rejected, has_kernels};
 
+pub(crate) use self::cost::{Claim, STEP, Weights, pair_op};
 pub(crate) use self::facts::facts_of;
 
 pub(crate) use self::gemm::gemm_cfg;
-pub(crate) use self::nearest::{GROUPS_PAIR, NEAREST_PAIR, Weights, pair_op};
 pub(crate) use self::norm::heads_candidates;
 pub(crate) use self::search::{
     Compiles, FIRST, SHORTLIST, TWIN_TILES, Tiled, compiled, distinct, distinct_configs, first_clean, representatives,

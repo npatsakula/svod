@@ -4,12 +4,12 @@
 
 use std::sync::Arc;
 
-use crate::atoms::{Core, Device, Fill, Target};
+use crate::atoms::{Core, Fill, Target};
 use crate::ir::{Axis, Shape};
 use crate::kernels::gemm::{GROUP_ROWS, GemmCfg, KSLICE};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 
-use super::cost::{ELEM, Planner, Run, STEP, cached};
+use super::cost::{Claim, ELEM, Ops, Planner, STEP, Spread, Steps, Stream, cached};
 use super::search::{Rejected, sorted, spread};
 
 impl GemmCfg {
@@ -181,7 +181,8 @@ impl GemmProblem {
         (area - self.m * self.n) as f64 / area as f64
     }
 
-    /// What `cfg` costs on the planner's device ([`Planner::pipelined`] ns of
+    /// What `cfg` costs on the planner's device ([`Planner::price`] of its
+    /// [`Claim`](super::cost::Claim), ns of
     /// SM time) and a lane's registers by the layout count, which over-counts
     /// what the lowering streams (the compiled kernel judges, [`shortlist`](super::search::shortlist));
     /// `None` when it does not lower, or when its [live
@@ -196,7 +197,18 @@ impl GemmProblem {
     /// only CDNA runs them ([`Target::crews`]) and no CDNA card has measured
     /// one; the tuner times them beside the rest.
     pub fn admit(&self, planner: &Planner, cfg: &GemmCfg) -> Result<(f64, u32), Rejected> {
-        let Device { target, costs } = &planner.device;
+        let claim = self.claim(planner, cfg)?;
+        Ok((planner.price(&claim), claim.regs))
+    }
+
+    /// The config's [claim](super::cost::Claim): its checks run first — a
+    /// step at least two matrix-core depths where the reduction allows one,
+    /// a step that divides it, a config that lowers and fits the target's
+    /// shared memory, registers the lane may hold — then its resources. A
+    /// warpgroup product reads no fragments and holds one accumulator chain
+    /// per instruction column block; its step is the group's.
+    pub(crate) fn claim(&self, planner: &Planner, cfg: &GemmCfg) -> Result<Claim, Rejected> {
+        let target = &planner.device.target;
         let ([bm, bn, bk], [wr, wc]) = (cfg.tile, cfg.warps.map(|w| w as usize));
         let gated = self.halves == 2;
         let atom = target.geometry().ok_or(Rejected::Lowers)?;
@@ -225,33 +237,44 @@ impl GemmProblem {
         }
         // A warpgroup product reads no fragments and holds one accumulator
         // chain per instruction column block; its step is the group's.
-        let (atoms, fragments, step) = match cfg.core {
+        let (atoms, fragments) = match cfg.core {
             Core::Warp => (
                 (bm / wr / atom.m as usize) * (bn * halves / wc / atom.n as usize),
                 waves * (bm / wr + bn * halves / wc) * bk * ELEM,
-                costs.step,
             ),
             Core::Group => {
                 let group = target.group_mma.first().ok_or(Rejected::Lowers)?;
                 let n = group.n_for((bn / wc) as u32).ok_or(Rejected::Lowers)? as usize;
-                (bn * halves / wc / n, 0, costs.step_group)
+                (bn * halves / wc / n, 0)
             }
         };
-        let fill = (bm + bn * halves) * bk * ELEM;
-        let steps = bm * bn * halves * bk / STEP;
+        let (fill, steps) = ((bm + bn * halves) * bk * ELEM, (bm * bn * halves * bk / STEP) as f64);
         let (blocks, trips, stages) = (self.blocks(cfg), self.k / bk, cfg.stages);
         let unique = (self.batches * (self.m + self.n * halves) * self.k * ELEM) as f64;
         let flight = planner.sms().min(blocks).max(1);
         let group = GROUP_ROWS.min(flight);
         let distinct = group * bm + flight.div_ceil(group) * bn * halves;
         let shared = 1.0 - distinct as f64 / (flight * (bm + bn * halves)) as f64;
-        let fill = fill as f64 * planner.fill_byte(unique, (blocks * trips * fill) as f64, shared);
-        let reads = fragments as f64 * costs.smem_byte;
-        let work = steps as f64 * step;
-        let trip = costs.trip(target.fill, stages, cfg.unroll);
-        let hide = costs.hide();
-        let run = Run { blocks, smem, regs, waves, atoms, hide, trips, reads, work, epilogue: 0.0, fill, trip, stages };
-        Ok((planner.pipelined(run), regs))
+        Ok(Claim {
+            blocks,
+            smem,
+            regs,
+            waves,
+            atoms,
+            steps: match cfg.core {
+                Core::Warp => Steps::F16(steps),
+                Core::Group => Steps::Group(steps),
+            },
+            trips,
+            reads: fragments as f64,
+            ops: Ops::default(),
+            fill: Stream { bytes: fill as f64, unique, shared },
+            stores: 0.0,
+            ring: stages,
+            unroll: cfg.unroll,
+            waits: 0.0,
+            sections: [Spread::default(); 2],
+        })
     }
 
     /// The lattice's configs that run this problem on the planner's target,

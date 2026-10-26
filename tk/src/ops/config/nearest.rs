@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use svod_dtype::ScalarDType;
 
-use crate::atoms::{Device, Fill, Target};
+use crate::atoms::{Fill, Target};
 use crate::ir::{Axis, Orient, Shape};
 use crate::kernels::attention::WARP_ROWS;
 use crate::kernels::gemm::GROUP_ROWS;
@@ -15,7 +15,7 @@ use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, Sele
 use crate::layouts::{TileLayout, WarpGrid, chunked, fills_in_chunks};
 
 use super::attention::{FA_STAGES, QUERY_BLOCKS};
-use super::cost::{Planner, Run, STEP, cached};
+use super::cost::{Claim, Kind, Ops, PAIR_OPS, Planner, STEP, Spread, Steps, Stream, cached};
 use super::gemm::DEPTHS;
 use super::search::{Rejected, Tiled, fired, sorted};
 
@@ -152,35 +152,12 @@ impl NearestCfg {
     }
 }
 
-/// Model: a pair's score, its row minimum and the argmin's compare, select
-/// and second minimum, in units of [`Costs::score`] (a softmax score's scale,
-/// row maximum, subtract, `exp2` and row sum): as many vector operations,
-/// two of them reductions, where the softmax's `exp2` stands for the
-/// argmin's select. The argmin's three run only in the warps a trip lowers
-/// some row of, ever fewer as the trips pass; the model charges them all.
-pub(crate) const NEAREST_PAIR: f64 = 1.0;
-/// Model: one vector operation of the epilogue — the row's norm added, a
-/// floor's maximum, the L2 clamp, a deal's least or vote, a merge's
-/// compare — in units of [`Costs::score`], the whole [`Costs::score`] a
-/// softmax element's bundle of them. A declared residual, not a hand
-/// value kept: two measured derivations were tried against the rank
-/// harness on fresh stores (16384² nearest at `k` 1, 16, 64, depths 128
-/// and 768, three cards) and refuted — the score and step probes' ratio
-/// (`score/step`, sm_86 0.0097, gfx1201 0.0214 score units) prices the
-/// listing's chained work a fifth to a twentieth of its calibration,
-/// collapsing the queue-depth structure (gfx1151 prunes every 32-deep
-/// queue; a gfx1201 `k` 64 tune picks a queued list 7 % behind the
-/// register one) and dropping sm_86's fresh-store nearest ρ 0.415 → 0.381;
-/// the probe bundle's own counted op rate (`score/` its ~15 scalar
-/// operations) collapses it outright. The residual is the issue
-/// efficiency of chained vector work beside the matrix pipe, which no
-/// probe explains: the per-card fit from the store's own outcomes (the
-/// design's layer 2) is what replaces this value, regularized toward it.
-pub(crate) fn pair_op(_: &Device) -> f64 {
-    0.2
-}
 /// Model: what groups add to a pair: a compare and a select.
 pub(crate) const GROUPS_PAIR: f64 = 2.0;
+/// Model: a score-matrix pair's work as elementary operations: its score,
+/// without the row's least, and its store's issue — three score elements'
+/// worth (a pair bundle and a half again).
+pub(crate) const MATRIX_OPS: f64 = 15.0;
 /// Model: a deal's least an element ([`crate::kernels::nearest::nearest`]
 /// with `k > 1`): the minimum a lane's scores enter a trip's rounds with.
 const DEAL_ELEM: f64 = 1.0;
@@ -232,9 +209,6 @@ const MERGE_SLOT: f64 = 8.0;
 /// Model: the share of a queue a warp's rows hold on average when its
 /// first row fills it, and the warp merges them all.
 const QUEUE_FILLED: f64 = 0.6;
-/// Model: a score-matrix pair's work: its score, without the row's least,
-/// and its store's issue.
-const MATRIX_PAIR: f64 = 3.0;
 /// Model: a listed score's scan in [`crate::kernels::nearest::nearest_select`]:
 /// its load, its compare against the row's `k`-th and the vote.
 const SCAN_SCORE: f64 = 3.0;
@@ -275,44 +249,6 @@ const REREAD_K: usize = 32;
 /// block walks ([`Planner::nearest_split`]).
 const SPLIT_TILES: usize = 4;
 
-/// The nearest epilogue's cost clusters, as its constants naturally divide,
-/// each scaled by a weight the tests and the rank harness perturb (zeroed,
-/// to attribute the model's rank error to a cluster) and nothing else: the
-/// default of one everywhere is today's arithmetic exactly.
-///
-/// * `pair` — every pair's score epilogue: [`NEAREST_PAIR`], the further
-///   elementwise operations ([`pair_op`]'s unit — the floors, norms and the
-///   L2 clamp) and what groups add ([`GROUPS_PAIR`]). It is its own cluster
-///   because that unit is the one the listing constants below are multiples
-///   of: folding it here would zero the whole epilogue with it.
-/// * `deal` — the listing's per-trip work: a deal's least ([`DEAL_ELEM`]),
-///   its votes ([`DEAL_LANE`], [`PASS_ELEM`]), a pushed deal's test
-///   ([`HIT_ELEM`]), a round's dealt column ([`ROUND_ELEM`]) and a queue
-///   slot's pushes ([`PUSH_ELEM`]).
-/// * `merge` — the bitonic sort and merge rates: a list's slot a stage
-///   ([`LIST_SLOT`], [`MERGE_SLOT`]) wherever a merge runs (a warp's queues,
-///   a queue's flush into the outputs, a split's merge kernel, a scan's).
-/// * `scan` — the score-matrix path: a stored pair ([`MATRIX_PAIR`]), the
-///   listing kernel's scan of a score ([`SCAN_SCORE`]), a skipped step
-///   ([`SKIP_STEP`]) and a queue insert ([`INSERT_SLOT`]).
-///
-/// The fill fractions ([`QUEUE_FILLED`], [`SELECT_FILLED`]) and the tile
-/// count [`FLUSH_TILES`] are counts and data math, not rates: they stay.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Weights {
-    pub(crate) pair: f64,
-    pub(crate) deal: f64,
-    pub(crate) merge: f64,
-    pub(crate) scan: f64,
-}
-
-impl Weights {
-    /// Today's constants: every cluster at its full weight.
-    pub(crate) fn same() -> Self {
-        Self { pair: 1.0, deal: 1.0, merge: 1.0, scan: 1.0 }
-    }
-}
-
 /// The largest power of two not past `n` (zero for zero).
 fn prev_power_of_two(n: usize) -> usize {
     if n == 0 { 0 } else { 1 << n.ilog2() }
@@ -349,15 +285,14 @@ pub struct NearestProblem {
 }
 
 impl NearestProblem {
-    /// What `cfg` costs here, as [`GemmProblem::admit`]: a candidate trip pays
-    /// every wave's read of the candidate tile, its fill (every block reads
-    /// every candidate: the blocks in flight share the lines), the product's
-    /// steps and every pair's epilogue ([`NEAREST_PAIR`], plus the
-    /// epilogue's measured unit for each further operation and
-    /// [`GROUPS_PAIR`] under groups), which at a
-    /// small depth outweighs the product. A wave's independent accumulators
-    /// are its atom rows times the trip's atom columns. Left out past the
-    /// lane's register budget: the queries stay resident.
+    /// What `cfg` costs here, as [`GemmProblem::admit`]: [`Planner::price`] of
+    /// its [`Claim`](super::cost::Claim). A candidate trip pays every wave's
+    /// read of the candidate tile, its fill (every block reads every
+    /// candidate: the blocks in flight share the lines), the product's steps
+    /// and every pair's epilogue (a pair bundle, plus the epilogue's unit
+    /// for each further operation and [`GROUPS_PAIR`] under groups), which
+    /// at a small depth outweighs the product. Left out past the lane's
+    /// register budget: the queries stay resident.
     ///
     /// Streamed, a candidate tile takes `⌈d / bk⌉` trips of the GEMM's K
     /// pipeline, each reading and filling both operands' chunks: the block's
@@ -372,10 +307,21 @@ impl NearestProblem {
     /// ([`Self::listing`]), its lane queues at least as wide as the lanes a
     /// row spreads over ([`NearestCfg::sharing`]) and, queued, at most half
     /// the register queue; past [`REGISTER_K`] a register list is left out.
-    /// Through a score matrix, a pair costs [`MATRIX_PAIR`] and its store,
-    /// and the listing kernel's [`Self::select_cost`] is added.
+    /// Through a score matrix, a pair costs [`MATRIX_OPS`] and its store,
+    /// and the listing kernel's [`Self::select_spreads`] is added.
     pub fn admit(&self, planner: &Planner, cfg: &NearestCfg) -> Result<(f64, u32), Rejected> {
-        let Device { target, costs } = &planner.device;
+        let claim = self.claim(planner, cfg)?;
+        Ok((planner.price(&claim), claim.regs))
+    }
+
+    /// The config's [claim](super::cost::Claim): its checks run first — a
+    /// list a register list holds, a config that lowers and fits the
+    /// target's shared memory and the lane's register budget — then its
+    /// resources, the split shares the config asks counted whole. A wave's
+    /// independent accumulators are its atom rows times the trip's atom
+    /// columns.
+    pub(crate) fn claim(&self, planner: &Planner, cfg: &NearestCfg) -> Result<Claim, Rejected> {
+        let target = &planner.device.target;
         let (bq, bkv, d, k) = (cfg.bq, cfg.bkv, self.d, self.k);
         if cfg.queue.is_none() && cfg.select.is_none() && k > REGISTER_K {
             return Err(Rejected::TopK { k, most: REGISTER_K });
@@ -398,23 +344,16 @@ impl NearestProblem {
         }
         let regs = cfg.registers(target, d, k, dtype).ok_or(Rejected::Layout)?;
         let waves = cfg.warps() as usize;
-        let (held, budget) = (cfg.held(target, d, k, dtype).ok_or(Rejected::Layout)?, target.lane_budget(waves as u32));
-        if held > budget {
-            return Err(Rejected::Registers { need: held, have: budget });
+        let held = cfg.held(target, d, k, dtype).ok_or(Rejected::Layout)?;
+        if held > target.lane_budget(waves as u32) {
+            return Err(Rejected::Registers { need: held, have: target.lane_budget(waves as u32) });
         }
         let atoms = (cfg.warp_rows / atom.m as usize) * (bkv / atom.n as usize);
         let Floors { row, col } = self.floors;
         let clamp = self.metric == Metric::L2 && !(row || col);
         // 8-bit products are widened and scaled by both rows' scales.
         let scaled = if elem == 1 { 3 } else { 0 };
-        let ops = [self.metric.row_norms(), row, col, clamp].into_iter().filter(|&on| on).count() + scaled;
-        let w = &planner.weights;
-        let first = match cfg.select.is_some() {
-            true => MATRIX_PAIR * w.scan,
-            false => NEAREST_PAIR * w.pair,
-        };
-        let unit = pair_op(&planner.device);
-        let pair = first + ops as f64 * unit * w.pair + if self.groups { GROUPS_PAIR * unit * w.pair } else { 0.0 };
+        let companions = [self.metric.row_norms(), row, col, clamp].into_iter().filter(|&on| on).count() + scaled;
         // Split, every query block's candidate tiles in shares, a block each.
         let splits = cfg.splits;
         let (blocks, tiles, stages) = (self.n.div_ceil(bq) * splits, self.m.div_ceil(bkv).div_ceil(splits), cfg.stages);
@@ -443,17 +382,26 @@ impl NearestProblem {
         };
         let distinct = queries * (filled - bkv) + shares * bkv;
         let shared = 1.0 - distinct as f64 / (flight * filled) as f64;
-        let mut fill = tile as f64 * planner.fill_byte(unique, (blocks * trips * tile) as f64, shared);
-        if cfg.select.is_some() {
-            // A trip stores its f32 scores, a row's at least a line.
-            fill += (bq * (bkv * 4).max(LINE)) as f64 * costs.global_byte / chunks as f64;
-            // Filtered, each row's least of the trip too, a sector a row.
-            if cfg.select.is_some_and(|s| s.filter) {
-                fill += (bq * SECTOR) as f64 * costs.global_byte / chunks as f64;
+        // A trip stores its f32 scores, a row's at least a line; filtered,
+        // each row's least of the trip too, a sector a row.
+        let stores = match &cfg.select {
+            Some(s) => {
+                let mut bytes = (bq * (bkv * 4).max(LINE)) as f64 / chunks as f64;
+                if s.filter {
+                    bytes += (bq * SECTOR) as f64 / chunks as f64;
+                }
+                bytes
             }
+            None => 0.0,
+        };
+        // A trip's pair epilogue: the bundle over the chunk's share of a
+        // tile's pairs, and every further operation each of them carries.
+        let pairs = (bq * bkv) as f64 / chunks as f64;
+        let mut ops = match cfg.select.is_some() {
+            true => Ops::of(Kind::Scan, pairs * MATRIX_OPS),
+            false => Ops::of(Kind::Pair, pairs * PAIR_OPS),
         }
-        let reads = (read * depth * elem) as f64 * costs.smem_byte;
-        let mut epilogue = (bq * bkv) as f64 * pair * costs.score / chunks as f64;
+        .add(Kind::Pair, pairs * (companions as f64 + if self.groups { GROUPS_PAIR } else { 0.0 }));
         if k > 1 && cfg.select.is_none() {
             let lanes = cfg.lane_queue();
             let sharing = cfg.sharing(target, d, dtype).ok_or(Rejected::Layout)?;
@@ -465,77 +413,83 @@ impl NearestProblem {
             if lanes.width < sharing || deals > MOST_DEALS || cfg.queue.is_some_and(|q| 2 * queued > q) {
                 return Err(Rejected::Lowers);
             }
-            epilogue +=
-                share.listing(cfg, lanes, target.wave, unit, w) * waves as f64 * costs.score / (tiles * chunks) as f64;
+            ops = ops.plus(share.listing(cfg, lanes, target.wave).scaled(waves as f64 / (tiles * chunks) as f64));
         }
-        let step = if elem == 1 { costs.step_i8 } else { costs.step };
-        // The 8-bit chain hides with its own lone ratio where its lone step
-        // was measured, not the 16-bit one: the chain's latency does not
-        // scale with its step's throughput.
-        let hide = match elem {
-            1 if costs.step_lone_i8 > 0.0 && costs.step_i8 > 0.0 => (costs.step_lone_i8 / costs.step_i8).max(1.0),
-            _ => costs.hide(),
-        };
-        let work = steps as f64 * step;
-        let trip = costs.trip(target.fill, stages, cfg.unroll);
-        let run = Run { blocks, smem, regs, waves, atoms, hide, trips, reads, work, epilogue, fill, trip, stages };
-        let restarts = match cfg.bk {
+        // A streamed tile's ring starts empty at every tile: a memory
+        // latency a round of blocks waits unhidden.
+        let waits = match cfg.bk {
             None => 0.0,
             Some(_) => {
                 let rounds = blocks.div_ceil(planner.sms()).div_ceil(planner.resident(smem, regs, waves).max(1));
-                (tiles * rounds) as f64 * costs.latency
+                (tiles * rounds) as f64
             }
         };
-        let listed = cfg.select.map_or(0.0, |s| self.select_cost(planner, &s, bkv));
-        let merged = if splits > 1 && cfg.select.is_none() { self.merge_cost(planner, splits) } else { 0.0 };
-        Ok((planner.pipelined(run) + restarts + listed + merged, regs))
+        let mut sections = [Spread::default(); 2];
+        if let Some(select) = &cfg.select {
+            sections = self.select_spreads(select, bkv);
+        } else if splits > 1 {
+            sections[0] = self.merge_spread(splits);
+        }
+        Ok(Claim {
+            blocks,
+            smem,
+            regs,
+            waves,
+            atoms,
+            steps: if elem == 1 { Steps::I8(steps as f64) } else { Steps::F16(steps as f64) },
+            trips,
+            reads: (read * depth * elem) as f64,
+            ops,
+            fill: Stream { bytes: tile as f64, unique, shared },
+            stores,
+            ring: stages,
+            unroll: cfg.unroll,
+            waits,
+            sections,
+        })
     }
 
-    /// What [`crate::kernels::nearest::nearest_merge`] costs folding
-    /// `splits` shares of this problem, ns: each row's shares read once from
-    /// DRAM, or its work, whichever is longer, spread over the SMs, and at
-    /// least a memory latency a share (a block's loads wait on the share
-    /// before). A row's least compares once a share; a list merges every
-    /// later share by a bitonic merge's lower half over its runs of
-    /// [`LANES`], a [`MERGE_SLOT`] each slot a stage.
-    fn merge_cost(&self, planner: &Planner, splits: usize) -> f64 {
-        let costs = &planner.device.costs;
+    /// What [`crate::kernels::nearest::nearest_merge`] folds of `splits`
+    /// shares of this problem, as a [section](super::cost::Spread): each
+    /// row's shares read once from DRAM, a row's least compares once a
+    /// share and a list merges every later share by a bitonic merge's lower
+    /// half over its runs of [`LANES`], and a share's loads wait on the
+    /// share before them.
+    fn merge_spread(&self, splits: usize) -> Spread {
         let slots = if self.k == 1 { 1.0 } else { (select_runs(self.k) * LANES) as f64 };
-        let unit = pair_op(&planner.device);
-        let row = (splits - 1) as f64 * slots * (slots.log2() + 1.0) * MERGE_SLOT * unit * planner.weights.merge;
-        let bytes = ((splits + 1) * self.k * 8) as f64 * costs.global_byte;
-        let spread = self.n as f64 * (row * costs.score).max(bytes) / planner.sms() as f64;
-        spread.max(splits as f64 * costs.latency)
+        Spread {
+            rows: self.n as f64,
+            ops: Ops::of(Kind::Merge, (splits - 1) as f64 * slots * (slots.log2() + 1.0) * MERGE_SLOT),
+            bytes: ((splits + 1) * self.k * 8) as f64,
+            waits: splits as f64,
+        }
     }
 
-    /// What [`crate::kernels::nearest::nearest_select`] costs listing this
-    /// problem's score matrix under `select` (`bkv` candidates a trip), ns:
-    /// [`Self::scan_cost`] of every score a row, or
-    /// [filtered](SelectCfg::filter), of the trips' leasts first (the
+    /// What [`crate::kernels::nearest::nearest_select`] lists of this
+    /// problem's score matrix under `select` (`bkv` candidates a trip), as
+    /// its [sections](super::cost::Spread): the scan of every score a row,
+    /// or [filtered](SelectCfg::filter), of the trips' leasts first (the
     /// bound's listing), then of about `k` trips' scores a row (a step of
     /// [`LANES`] reads both of two shorter trips), every other step passed
     /// over at [`SKIP_STEP`].
-    fn select_cost(&self, planner: &Planner, select: &SelectCfg, bkv: usize) -> f64 {
+    fn select_spreads(&self, select: &SelectCfg, bkv: usize) -> [Spread; 2] {
         if !select.filter {
-            return self.scan_cost(planner, select, self.m, 0);
+            return [self.scan_spread(select, self.m, 0), Spread::default()];
         }
         let groups = self.m.div_ceil(bkv);
         let read = (self.k * bkv.max(LANES)).min(self.m);
         let skipped = (self.m - read).div_ceil(LANES);
-        NearestProblem { m: groups, ..*self }.scan_cost(planner, select, groups, 0)
-            + self.scan_cost(planner, select, read, skipped)
+        [NearestProblem { m: groups, ..*self }.scan_spread(select, groups, 0), self.scan_spread(select, read, skipped)]
     }
 
-    /// [`Self::select_cost`] reading `read` scores a row and passing over
-    /// `skipped` steps: each row read once from DRAM, or its work,
-    /// whichever is longer, spread over the SMs. A row's work is a step a
-    /// [`LANES`] of its scores, a queue insert a step some lane of it offers
-    /// in (every step while the list fills, then the `j`-th with chance
-    /// `k / j`), and a merge each time its lanes queue [`SELECT_FILLED`] of
-    /// what they hold: the queues' bitonic sort and the list's bitonic merge,
-    /// a [`MERGE_SLOT`] each slot a stage.
-    fn scan_cost(&self, planner: &Planner, select: &SelectCfg, read: usize, skipped: usize) -> f64 {
-        let costs = &planner.device.costs;
+    /// [`Self::select_spreads`] reading `read` scores a row and passing over
+    /// `skipped` steps. A row's work is a step a [`LANES`] of its scores, a
+    /// queue insert a step some lane of it offers in (every step while the
+    /// list fills, then the `j`-th with chance `k / j`), and a merge each
+    /// time its lanes queue [`SELECT_FILLED`] of what they hold: the queues'
+    /// bitonic sort and the list's bitonic merge, one exchange a slot a
+    /// stage.
+    fn scan_spread(&self, select: &SelectCfg, read: usize, skipped: usize) -> Spread {
         let (k, queued) = (self.k as f64, (LANES * select.queue) as f64);
         let steps = read.div_ceil(LANES) as f64;
         let busy = steps.min(k * (1.0 + (steps / k).max(1.0).ln()));
@@ -544,13 +498,16 @@ impl NearestProblem {
         let merge = queued * depth * (depth + 1.0) / 2.0 + width * width.log2();
         let offers = NearestProblem { m: read, ..*self }.offers();
         let merges = offers / (queued * SELECT_FILLED) + 1.0;
-        let (unit, (w_scan, w_merge)) = (pair_op(&planner.device), (planner.weights.scan, planner.weights.merge));
-        let row = steps * LANES as f64 * SCAN_SCORE * unit * w_scan
-            + skipped as f64 * SKIP_STEP * unit * w_scan
-            + busy * queued * INSERT_SLOT * unit * w_scan
-            + merges * merge * MERGE_SLOT * unit * w_merge;
-        let bytes = (read * 4) as f64 * costs.global_byte;
-        self.n as f64 * (row * costs.score).max(bytes) / planner.sms() as f64
+        Spread {
+            rows: self.n as f64,
+            ops: Ops::of(
+                Kind::Scan,
+                steps * LANES as f64 * SCAN_SCORE + skipped as f64 * SKIP_STEP + busy * queued * INSERT_SLOT,
+            )
+            .add(Kind::Merge, merges * merge * MERGE_SLOT),
+            bytes: (read * 4) as f64,
+            waits: 0.0,
+        }
     }
 
     /// The scores of trip `t` of `cfg` below a row's `k`-th as a stream in
@@ -563,22 +520,22 @@ impl NearestProblem {
         }
     }
 
-    /// A warp's list work over a block's candidates under `lanes`, in units
-    /// of [`Costs::score`] a pair: each trip some row of the warp has a
-    /// score below its `k`-th in (`warp_rows` rows' [`Self::lowered`]) takes
-    /// each lane's least of its deals ([`DEAL_ELEM`] an element), then
-    /// rounds of a push a lane, as many as the most of the trip's scores
-    /// any lane takes (a Poisson count's maximum over the warp's queues, one
-    /// at least, every deal at most): [`ROUND_ELEM`] a dealt element,
-    /// [`PUSH_ELEM`] a queue slot, a vote; then the merges,
-    /// one each time some queue of the warp takes a score past its depth
-    /// (`N` pushes into `Q` queues fill one past `t` from about
-    /// `N = (Q^t·(t+1)!)^(1/(t+1))`) and one at the end: the queues'
-    /// bitonic sort and the merge into the list held in registers,
-    /// [`LIST_SLOT`] a row's slot a stage. Queued, the merges of that list
-    /// into the outputs too, one each time the warp's lists take a
-    /// [`QUEUE_FILLED`] share of the room they leave the lanes' queues.
-    pub(crate) fn listing(&self, cfg: &NearestCfg, lanes: LaneQueue, wave: u32, unit: f64, w: &Weights) -> f64 {
+    /// A warp's list work over a block's candidates under `lanes`, as
+    /// operation counts by kind: each trip some row of the warp has a score
+    /// below its `k`-th in (`warp_rows` rows' [`Self::lowered`]) takes each
+    /// lane's least of its deals ([`DEAL_ELEM`] an element), then rounds of a
+    /// push a lane, as many as the most of the trip's scores any lane takes
+    /// (a Poisson count's maximum over the warp's queues, one at least,
+    /// every deal at most): [`ROUND_ELEM`] a dealt element, [`PUSH_ELEM`] a
+    /// queue slot, a vote; then the merges, one each time some queue of the
+    /// warp takes a score past its depth (`N` pushes into `Q` queues fill
+    /// one past `t` from about `N = (Q^t·(t+1)!)^(1/(t+1))`) and one at the
+    /// end: the queues' bitonic sort and the merge into the list held in
+    /// registers, one exchange a slot a stage ([`LIST_SLOT`]). Queued, the
+    /// merges of that list into the outputs too, one each time the warp's
+    /// lists take a [`QUEUE_FILLED`] share of the room they leave the lanes'
+    /// queues.
+    pub(crate) fn listing(&self, cfg: &NearestCfg, lanes: LaneQueue, wave: u32) -> Ops {
         let LaneQueue { width, depth, passes } = lanes;
         let (rows, tiles, wave) = (cfg.warp_rows as f64, self.m.div_ceil(cfg.bkv), f64::from(wave));
         let deals = (cfg.bkv / width) as f64;
@@ -590,29 +547,27 @@ impl NearestProblem {
                 // A vote on every deal of a trip some row enters, and a push
                 // on each deal some row is dealt one below its `k`-th in.
                 let dealt = deals * (1.0 - (-hits / deals).exp());
-                return entered * deals * (elems * PASS_ELEM * unit * w.deal + wave * DEAL_LANE * unit * w.deal)
-                    + dealt * (elems * (HIT_ELEM + t * PUSH_ELEM) * unit * w.deal + wave * DEAL_LANE * unit * w.deal);
+                return entered * deals * (elems * PASS_ELEM + wave * DEAL_LANE)
+                    + dealt * (elems * (HIT_ELEM + t * PUSH_ELEM) + wave * DEAL_LANE);
             }
             let lambda = hits / elems;
             let rounds = (1.0 + lambda + (2.0 * lambda * elems.ln()).sqrt()).min(deals);
-            let round = deals * elems * ROUND_ELEM * unit * w.deal
-                + elems * t * PUSH_ELEM * unit * w.deal
-                + wave * DEAL_LANE * unit * w.deal;
-            entered * (deals * elems * DEAL_ELEM * unit * w.deal + wave * DEAL_LANE * unit * w.deal + rounds * round)
+            let round = deals * elems * ROUND_ELEM + elems * t * PUSH_ELEM + wave * DEAL_LANE;
+            entered * (deals * elems * DEAL_ELEM + wave * DEAL_LANE + rounds * round)
         };
         let walk: f64 = (0..tiles).map(trip).sum();
         let fact: f64 = (1..=depth + 1).map(|i| i as f64).product();
         let per_merge = (elems.powf(t) * fact).powf(1.0 / (t + 1.0));
         let (held, queued) = (cfg.list_slots(self.k) as f64, (width * depth) as f64);
         let sort = queued * queued.log2() * (queued.log2() + 1.0) / 2.0;
-        let merge = rows * (sort + held * (held.log2() + 1.0)) * LIST_SLOT * unit * w.merge;
-        let mut list = walk + (rows * self.offers() / per_merge + 1.0) * merge;
+        let merge = rows * (sort + held * (held.log2() + 1.0)) * LIST_SLOT;
+        let mut ops = Ops::of(Kind::Deal, walk).add(Kind::Merge, (rows * self.offers() / per_merge + 1.0) * merge);
         if let Some(q) = cfg.queue {
             let stages = 1.0 + 2.0 * (q as f64).log2();
-            let flush = (self.k.div_ceil(q) * q) as f64 * rows * stages * MERGE_SLOT * unit * w.merge;
-            list += (self.offers() / ((held - queued) * QUEUE_FILLED) + 1.0) * flush;
+            let flush = (self.k.div_ceil(q) * q) as f64 * rows * stages * MERGE_SLOT;
+            ops = ops.add(Kind::Merge, (self.offers() / ((held - queued) * QUEUE_FILLED) + 1.0) * flush);
         }
-        list
+        ops
     }
 
     /// The scores a row offers its list over the candidates in random order:
