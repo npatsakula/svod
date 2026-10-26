@@ -104,7 +104,7 @@ const STABLE_RUNS: usize = 3;
 /// Measurement: a run within this of the minimum so far counts stable.
 const STEADY: f64 = 0.97;
 /// Measurement: the most profiled runs a candidate is given to settle.
-const MOST_RUNS: usize = 16;
+const MOST_RUNS: usize = 24;
 
 /// The profiled runs a tuner's round gives a candidate whose last run took
 /// `t`: those [`RUN_BUDGET`] holds, [`MIN_RUNS`] to [`RUNS`]. A candidate
