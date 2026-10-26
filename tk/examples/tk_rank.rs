@@ -7,7 +7,7 @@
 //! config rework's later phases must not regress; see `svod_tk::rank`.
 //!
 //! ```text
-//! cargo run -p svod-tk --release --example tk_rank -- [--store DIR] [--device NAME] [--op gemm,attention] [--check]
+//! cargo run -p svod-tk --release --example tk_rank -- [--store DIR] [--device NAME] [--op gemm,attention] [--check] [--fit]
 //! ```
 //!
 //! `--store` defaults to the global tune store; `--device` and `--op` filter
@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ablate = at("--ablate").and_then(|i| args.get(i + 1)).cloned();
     let claims = at("--claims").is_some();
     let explain = at("--explain").and_then(|i| args.get(i + 1)).cloned();
+    let fit = at("--fit").is_some();
     let store = opt.map(PathBuf::from).or_else(|| TuneStore::global().root().map(PathBuf::from));
     let Some(store) = store.filter(|s| s.is_dir()) else {
         return Err("no tune store: pass --store DIR (or set SVOD_TK_TUNE_DIR)".into());
@@ -92,6 +93,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rho.map_or("-".into(), |r| format!("{r:.3}"))
                     );
                 }
+            }
+        }
+        if fit {
+            for f in rank::fitted(&device) {
+                let (held, prior) = (f.held_out, f.prior);
+                let show = |r: Option<f64>| r.map_or("-".into(), |r| format!("{r:.3}"));
+                let folds: Vec<String> = f.multipliers.iter().map(|m| format!("{m:.2}")).collect();
+                println!(
+                    "  {:<12} fit x{:.2} overall; held-out rho {} against the prior's {} (folds x: {})",
+                    f.family,
+                    f.overall,
+                    show(held),
+                    show(prior),
+                    folds.join(" "),
+                );
             }
         }
         if claims {

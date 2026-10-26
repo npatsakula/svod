@@ -2655,8 +2655,9 @@ fn cfg_time_probe() {
 #[test]
 fn the_resident_list_keeps_the_shallow_search() {
     use crate::ops::config::NearestProblem;
-    let planner = Planner::new(crate::atoms::Device { target: crate::atoms::sm86(), costs: crate::test::unit::sm86_costs() })
-        .unwrap();
+    let planner =
+        Planner::new(crate::atoms::Device { target: crate::atoms::sm86(), costs: crate::test::unit::sm86_costs() })
+            .unwrap();
     let p = NearestProblem {
         n: 2000,
         m: 31342,
