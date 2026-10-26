@@ -34,6 +34,7 @@ mod norm;
 mod search;
 
 pub use self::attention::AttentionProblem;
+pub use self::conv::ConvProblem;
 pub use self::cost::Planner;
 pub use self::facts::Facts;
 pub use self::gemm::{GemmProblem, gemm_lattice};

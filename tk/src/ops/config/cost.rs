@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::atoms::{Device, Fill, Target};
 use crate::kernels::attention::FaCfg;
+use crate::kernels::conv::ConvCfg;
 use crate::kernels::gemm::GemmCfg;
 use crate::kernels::nearest::NearestCfg;
 
@@ -348,6 +349,7 @@ pub struct Planner {
     pub(super) ranked: papaya::HashMap<GemmProblem, Arc<[GemmCfg]>>,
     pub(super) attention: papaya::HashMap<AttentionProblem, Arc<[FaCfg]>>,
     pub(super) nearest: papaya::HashMap<NearestProblem, Arc<[NearestCfg]>>,
+    pub(super) conv: papaya::HashMap<super::conv::ConvProblem, Arc<[ConvCfg]>>,
 }
 
 /// The ranking kept under `key`, made by `rank` the first time it is asked for.
@@ -372,6 +374,7 @@ impl Planner {
             ranked: papaya::HashMap::new(),
             attention: papaya::HashMap::new(),
             nearest: papaya::HashMap::new(),
+            conv: papaya::HashMap::new(),
         })
     }
 

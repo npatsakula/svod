@@ -30,7 +30,9 @@ use crate::kernels::nearest::{Floors, Live, Metric, NearestCfg, NearestSpec};
 use crate::kernels::{Act, Batch};
 use crate::ops::DEVICE_TEST;
 use crate::ops::attention::split_ranked;
-use crate::ops::config::{self, AttentionProblem, GemmProblem, NearestProblem, Planner, Tiled, representatives};
+use crate::ops::config::{
+    self, AttentionProblem, ConvProblem, GemmProblem, NearestProblem, Planner, Tiled, representatives,
+};
 use crate::ops::nearest::Salt;
 use crate::tune::{self, Entry, Kind, TuneKey};
 
@@ -202,10 +204,11 @@ pub enum Configs {
         problem: NearestProblem,
         list: Vec<NearestCfg>,
     },
-    /// A convolution's GEMM body; its splits the model does not price (the
-    /// ranking orders the unsplit configs alone).
+    /// A convolution's GEMM body under its own claim (the image the fill's
+    /// working set); its splits the model does not price (the ranking
+    /// orders the unsplit configs alone).
     Conv {
-        problem: GemmProblem,
+        problem: ConvProblem,
         list: Vec<ConvCfg>,
     },
 }
@@ -218,7 +221,7 @@ impl Configs {
             Self::Gemm { problem, list } => of(problem, &list[at]),
             Self::Attention { problem, list } => problem.admit(planner, &list[at]).ok().map(|(ns, _)| ns),
             Self::Nearest { problem, list } => problem.admit(planner, &list[at]).ok().map(|(ns, _)| ns),
-            Self::Conv { problem, list } => of(problem, &list[at].gemm),
+            Self::Conv { problem, list } => problem.claim(planner, &list[at].gemm).ok().map(|c| planner.price(&c)),
         }
     }
 }
@@ -799,7 +802,7 @@ fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize
                 true => (images, ho * wo),
             };
             let ranked = planner.conv_ranked(batches, m, &g);
-            let p = GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1 };
+            let p = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1 }, geom: g };
             let expand = |admitted: &[ConvCfg]| {
                 planner.conv_splits(batches, m, &g, admitted).into_iter().filter(|c| c.split == 1 || !bound).collect()
             };
