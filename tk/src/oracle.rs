@@ -1,16 +1,22 @@
 //! The compile-probe oracle: instruction availability asked of the toolchain
 //! that compiles the kernels, per target, cached in the tune store like any
 //! probe. The [`Target`](crate::atoms::Target) booleans (`group_mma`,
-//! `ldmatrix`, `tr_load`, `dot2_bf16`, the int8 atoms) are hand arch lists
-//! today; the oracle is what makes an unseen architecture self-describing —
-//! its verdict is the vendor assembler's own accept/reject of a one-instruction
-//! module (ptxas: "Instruction 'wgmma.fence' not supported on .target
-//! 'sm_86'"; the AMDGPU assembler: "instruction not supported on this GPU").
+//! `ldmatrix`, `tr_load`, `dot2_bf16`, the int8 atoms) are the hand arch
+//! tables of [`crate::atoms`]; the oracle is what makes an unseen
+//! architecture self-describing — its verdict is the vendor assembler's own
+//! accept/reject of a one-instruction module (ptxas: "Instruction
+//! 'wgmma.fence' not supported on .target 'sm_86'"; the AMDGPU assembler:
+//! "instruction not supported on this GPU").
 //!
-//! Rollout gate (this phase): the tables still drive everything. Where a
-//! device's oracle answers, [`audit`] compares the two and logs a mismatch
-//! loudly — on a runnable target a disagreement is a bug in one of the two,
-//! and the host test pins them equal for every target the sweep digests.
+//! A device's verdicts drive its target's capability gates ([`gate`]): the
+//! oracle asked the toolchain the kernels are emitted to, so it wins. The
+//! tables are the fallback where no toolchain answers (`None`, never a
+//! false) and the cross-check everywhere else — a mismatch on a known arch
+//! is a bug in one of the two, logged loudly, and the host test pins them
+//! equal for every target the sweep digests. A verdict cannot build an atom
+//! the tables did not (a matrix core the renderer knows nothing of carries
+//! layouts a yes alone cannot conjure): such a confirm flips nothing but
+//! the log line, and the tables must learn the arch.
 
 use std::hash::{Hash, Hasher};
 
@@ -187,25 +193,54 @@ pub fn record(target: &Target) -> Vec<(&'static str, Option<bool>)> {
     verdicts(target).into_iter().map(|(c, v)| (c.name, v)).collect()
 }
 
-/// The oracle beside the target's tables, at planner build: every recorded
-/// verdict is compared with the table's own — equal, the tables drive on and
-/// the verdict is evidence; a mismatch does not switch anything but is logged
-/// loudly, a bug in one of the two on a runnable target.
-pub(crate) fn audit(target: &Target) {
-    for (capability, verdict) in verdicts(target) {
-        let name = capability.name;
+/// The target with its capability gates set to `verdicts`: a verdict wins
+/// over the table's own answer, a mismatch logged loudly (the oracle asked
+/// the device's toolchain; on a known arch a disagreement is a bug in one of
+/// the two), `None` leaves the table's answer — the fallback where no
+/// toolchain can be asked. A deny always holds; a confirm for a capability
+/// whose atom the tables did not build cannot construct one (see the module
+/// docs) and flips nothing.
+pub(crate) fn flipped(target: &Target, verdicts: &[(&'static str, Option<bool>)]) -> Target {
+    use svod_dtype::ScalarDType;
+    let mut gated = target.clone();
+    let tables = tables(target);
+    for &(name, verdict) in verdicts {
+        let table = tables.iter().find(|(n, _)| *n == name).is_some_and(|&(_, v)| v);
         match verdict {
-            Some(v) if v != capability.table => warn!(
+            None => tracing::debug!(target: crate::ops::PLAN, name, "no oracle: the toolchain is absent"),
+            Some(v) if v == table => tracing::debug!(target: crate::ops::PLAN, name, "oracle agrees with the tables"),
+            Some(v) => warn!(
                 arch = %target.arch.target_name(),
                 name,
                 oracle = v,
-                table = capability.table,
-                "the compile-probe oracle disagrees with the target tables: one of the two is wrong"
+                table,
+                "the compile-probe oracle disagrees with the target tables: the oracle wins, and one of the two is wrong"
             ),
-            Some(_) => tracing::debug!(target: crate::ops::PLAN, name, "oracle agrees with the tables"),
-            None => tracing::debug!(target: crate::ops::PLAN, name, "no oracle: the toolchain is absent"),
+        }
+        let Some(v) = verdict else { continue };
+        match name {
+            "wgmma" if !v => gated.group_mma = vec![],
+            "ldmatrix" => gated.ldmatrix = v,
+            // The atoms carry operand layouts the renderer assigns; a yes
+            // without them builds nothing.
+            "mma_i8" if !v => gated.mma.retain(|a| a.dtype_in != ScalarDType::Int8),
+            "cp_async" => gated.fill = if v { Fill::CpAsync } else { Fill::Staged },
+            "wmma16" if !v => gated.mma.retain(|a| a.dtype_in.bytes() != 2),
+            "tr_load" => gated.tr_load = v,
+            "dot2_bf16" => gated.dot2_bf16 = v,
+            _ => {}
         }
     }
+    gated
+}
+
+/// The target a device's planner gates its capabilities by: its toolchain's
+/// recorded verdicts ([`record`], assembled and stored where missing) applied
+/// — the oracle the source of truth, the tables the fallback and the
+/// cross-check.
+pub(crate) fn gate(target: Target) -> Target {
+    let verdicts = record(&target);
+    flipped(&target, &verdicts)
 }
 
 /// The verdicts a store copied from a card recorded for its device, read

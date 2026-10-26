@@ -161,18 +161,18 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
     planners
         .entry(device.clone())
         .or_insert_with(|| {
-            let target = Target::for_device(device).filter(config::has_kernels)?;
+            // The compile-probe oracle gates the target's capabilities first:
+            // its verdicts are asked of the device's own toolchain and cached
+            // beside the probes, the tables the fallback and the cross-check.
+            let target = crate::oracle::gate(Target::for_device(device).filter(config::has_kernels)?);
             // A device no probe can scale to (no SM count) has no planner; a
             // probe that fails leaves its field at zero and the planner ranks on.
             let measured = crate::probe::costs(&target)
                 .inspect_err(|e| tracing::warn!("{}: no tk planner: {e}", target.arch.target_name()))
                 .ok()?;
             // Its layer-0 facts are queried at the same time; no hand value
-            // reads them yet (capture-and-expose, phase B). The compile-probe
-            // oracle records its verdicts beside the probes and compares them
-            // with the tables, which still drive.
+            // reads them yet (capture-and-expose, phase B).
             config::facts_of(device);
-            crate::oracle::audit(&target);
             Planner::measured(target, measured).map(Arc::new)
         })
         .clone()

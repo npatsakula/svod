@@ -153,7 +153,7 @@ impl Occupancy {
 }
 
 /// What a target offers the lowering.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Target {
     pub arch: GpuArch,
     pub wave: u32,
