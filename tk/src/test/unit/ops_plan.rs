@@ -494,7 +494,11 @@ fn blocks_in_flight_share_their_lines_past_the_cache() {
     let cfg = gemm_cfg([128, 128, 32], 3, [2, 4], false);
     let dram = planned(Device { target: sm86(), costs: Costs { l2_bytes: 0.0, ..c } });
     let (cached, at_dram) = (p.admit(&planner, &cfg).unwrap().0, p.admit(&dram, &cfg).unwrap().0);
-    assert!(cached < 0.75 * at_dram, "{cached} cached, {at_dram} from DRAM");
+    // The cache saves the fill its share of; the epilogue term both sides
+    // carry the same (a representative layer's tile operations, an eighth of
+    // this GEMM's modeled cost at the fixture costs) bounds the ratio away
+    // from the fill's alone.
+    assert!(cached < 0.85 * at_dram, "{cached} cached, {at_dram} from DRAM");
 }
 
 /// The costs a cache ladder of `rungs` (footprint bytes, ns a streamed byte)

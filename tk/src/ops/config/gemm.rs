@@ -9,7 +9,7 @@ use crate::ir::{Axis, Shape};
 use crate::kernels::gemm::{GROUP_ROWS, GemmCfg, KSLICE};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 
-use super::cost::{Claim, ELEM, Ops, Planner, STEP, Spread, Steps, Stream, cached};
+use super::cost::{Claim, ELEM, Kind, Ops, Planner, STEP, Spread, Steps, Stream, cached};
 use super::search::{Rejected, sorted, spread};
 
 impl GemmCfg {
@@ -103,6 +103,17 @@ pub(crate) const fn gemm_cfg(tile: [usize; 3], stages: usize, warps: [u32; 2], u
     GemmCfg { core: Core::Warp, tile, stages, warps, unroll, crews: 1 }
 }
 
+/// Model: a representative layer epilogue's tile operations an output
+/// element — a gelu's forty (the abs, three affines, the reciprocal, the
+/// polynomial's four multiplies and affines and its product, the square, the
+/// `exp2`'s affine and `exp2`, the two tails and the final affine), the
+/// claim diff's own ±0.7 % pin against a program's instruction mix. The
+/// ranking is epilogue-kind-blind (the epilogue varies by layer, the tune
+/// key's salt, not by tile): this bundle — the models' ff layers' — is what
+/// orders tiles by the epilogue work they carry, their total over a problem
+/// the same whatever the tile.
+pub(crate) const EPILOGUE_OPS: f64 = 40.0;
+
 /// Search bound: the output tile's rows, the first of the knobs a GEMM-shaped
 /// kernel is enumerated over.
 const ROWS: [usize; 4] = [32, 64, 128, 256];
@@ -188,8 +199,9 @@ impl GemmProblem {
     /// `None` when it does not lower, or when its [live
     /// registers](GemmCfg::live_registers) alone pass the lane's limit; why it
     /// is left out otherwise. A trip
-    /// pays its fragment reads, fill, matrix-core steps (padding included)
-    /// and overhead. The fill's bytes are the whole operands' distinct ones,
+    /// pays its fragment reads, fill, matrix-core steps (padding included),
+    /// the representative epilogue's tile operations and overhead. The
+    /// fill's bytes are the whole operands' distinct ones,
     /// and the blocks in flight at once (one an SM at least) share a group's
     /// A rows and their B columns whatever the cache holds of the whole. Two
     /// crews are priced as the one-crew pipeline of their tile: the overlap
@@ -255,6 +267,12 @@ impl GemmProblem {
         let group = GROUP_ROWS.min(flight);
         let distinct = group * bm + flight.div_ceil(group) * bn * halves;
         let shared = 1.0 - distinct as f64 / (flight * (bm + bn * halves)) as f64;
+        // The epilogue's operations over the tile's output elements, one a
+        // lane's element each, paid over the trips that fold into one
+        // output: their whole is m·n·[`EPILOGUE_OPS`] of lane operations
+        // whatever the tile, so what the term orders is a trip's balance of
+        // steps against epilogue.
+        let epilogue = EPILOGUE_OPS * (bm * bn) as f64 / trips as f64;
         Ok(Claim {
             blocks,
             smem,
@@ -267,7 +285,7 @@ impl GemmProblem {
             },
             trips,
             reads: fragments as f64,
-            ops: Ops::default(),
+            ops: Ops::of(Kind::Epilogue, epilogue),
             fill: Stream { bytes: fill as f64, unique, shared },
             stores: 0.0,
             ring: stages,

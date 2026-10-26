@@ -200,6 +200,21 @@ fn the_claimed_steps_and_smem_hold_their_programs() {
     }
 }
 
+/// A GEMM's epilogue claim enters the ranking, and the diff's VALU row
+/// predicts a program's instruction mix from the claim itself: the gelu's
+/// forty tile operations an element, [128,256,64] at 0.7 % under.
+#[test]
+fn the_gemm_epilogue_claim_holds_its_program() {
+    for d in &rank::claims(&sm86()) {
+        if !d.name.starts_with("gemm") {
+            continue;
+        }
+        let (_, predicted, program, holds) =
+            d.rows.iter().find(|(w, ..)| *w == "valu ops/trip").copied().expect("the valu row");
+        assert!(holds, "{}: {predicted} VALU against {program}", d.name);
+    }
+}
+
 /// The claim diff's reported opacity: the program moves the model's fill
 /// bytes once to about twice over — the ring's staging and the fill
 /// layout's per-thread assignment against the model's block mean — and the
