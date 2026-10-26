@@ -2,21 +2,26 @@
 //! the model predicts a shape's timed candidates with the ns the device
 //! measured for them. The instrument that gates every later model change
 //! (the config rework's §7.1): a store's `choice|` line holds every timed
-//! candidate of a shape, fastest first, and the candidates a line names are
-//! the ones the same ranking code regenerates — replay re-derives each
-//! stage's candidate list for the offline target under the costs the same
-//! store measured, and the digest in the line's key asserts the list: a
-//! line no hypothesis reproduces is skipped and counted, never guessed at.
+//! candidate of a shape, fastest first, each with its config's own code
+//! beside its index — replay prices the line's own candidates, so a store
+//! reads whatever ranking code wrote it and whatever ranks since (a model
+//! change no longer orphans a measurement). The digest in the line's key
+//! stays the consistency check: where the ranking code at hand re-derives
+//! the very list a line timed, the line counts as derived; the rest replay
+//! from their codes under the problem of the hypothesis whose ranking
+//! admits the most of them, and a line no hypothesis admits — an unknown
+//! salt — is skipped and counted, never guessed at.
 //!
 //! Per family and device: the Spearman ρ of predicted against measured
 //! order over the replayed lines, and the fraction of lines whose predicted
 //! best is the measured winner — the number tuning actually cares about.
-//! The stages follow [`crate::ops::Tuner`]: a shape's ranking admitted, its
-//! candidates expanded as the op layer expands them, screened, and the
-//! leading tiles' pipelines timed again; a stage's lookup missing (a wrong
-//! salt, another ranking) hands the shape to the next hypothesis.
+//! The derived stage follows [`crate::ops::Tuner`]: a shape's ranking
+//! admitted, its candidates expanded as the op layer expands them,
+//! screened, and the leading tiles' pipelines timed again; a stage's lookup
+//! missing (a wrong salt) hands the shape to the next hypothesis.
 
 use std::collections::HashMap;
+use std::hash::Hasher;
 use std::path::Path;
 
 use svod_dtype::{AmdArch, CudaArch, GpuArch, ScalarDType};
@@ -41,16 +46,42 @@ use crate::tune::{self, Entry, Kind, TuneKey};
 /// (its configs tie), a line with no order to check.
 const LEAST_CANDIDATES: usize = 3;
 
+/// Whether `key` is a line of `group` exactly: the group's fields whole,
+/// not a shape whose joined text begins another's (`128` of `128x16`).
+fn of_group(key: &str, group: &str) -> bool {
+    key.len() > group.len() && key.as_bytes()[group.len()] == b'|' && &key[..group.len()] == group
+}
+
+/// The choice-line group of `op`'s `dtype` and `shape` on `planner`'s
+/// device: every line of the shape, any salt ([`TuneKey`]'s key up to the
+/// candidates' digest).
+fn group(op: &str, planner: &Planner, dtype: ScalarDType, shape: &[usize]) -> String {
+    let shape: Vec<String> = shape.iter().map(usize::to_string).collect();
+    format!("choice|{op}|{}|{dtype:?}|{}", crate::tune::device(&planner.device.target), shape.join("x"))
+}
+
+fn digest(value: &impl std::hash::Hash) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A choice line's candidates: index into the list its digest names, the
+/// config's code, and its measured ns.
+type Timed = Vec<(usize, String, u64)>;
+
 /// One device's store lines, by key.
 struct Lines {
     /// Line key (up to the candidates' digest; whatever compiler and
     /// programs wrote it) to its entry, several builds' lines of one key
     /// holding the one the file's order gives.
     entries: HashMap<String, Entry>,
-    /// The choice lines a replay found, by key prefix, with their timed
-    /// candidate counts: what was correlated, what was too short, and the
-    /// rest skipped.
-    found: HashMap<String, usize>,
+    /// The lines a derived list's digest matched (every line of the key's
+    /// prefix, builds alike): what the consistency check confirmed.
+    read: std::collections::HashSet<String>,
+    /// The payloads of the lines replayed from their own candidates (no
+    /// derivation matching their digest): the cross-ranked measurements.
+    stored: std::collections::HashSet<u64>,
 }
 
 impl Lines {
@@ -70,7 +101,11 @@ impl Lines {
             let entries = Self::parse(&text);
             let Some(key) = entries.keys().next() else { continue };
             let device = key.split('|').nth(2).unwrap_or_default().to_string();
-            let lines = out.entry(device).or_insert_with(|| Self { entries: HashMap::new(), found: HashMap::new() });
+            let lines = out.entry(device).or_insert_with(|| Self {
+                entries: HashMap::new(),
+                read: Default::default(),
+                stored: Default::default(),
+            });
             lines.entries.extend(entries);
         }
         out
@@ -83,7 +118,7 @@ impl Lines {
             .filter_map(|line| {
                 let mut fields = line.split_whitespace();
                 let key = fields.next()?;
-                let numbers: Vec<u64> = fields.map(str::parse).collect::<Result<_, _>>().ok()?;
+                let numbers: Vec<&str> = fields.collect();
                 Some((key.to_string(), Entry::parse(key.split('|').next()?, &numbers)?))
             })
             .collect()
@@ -105,8 +140,8 @@ impl Lines {
         let mut found: Vec<&String> = self.entries.keys().filter(|l| l.starts_with(&prefix)).collect();
         found.sort();
         let entry = found.first().map(|l| self.entries[*l].clone());
-        if let (Kind::Choice, Some(Entry::Choice(timed))) = (kind, &entry) {
-            self.found.insert(prefix, timed.len());
+        if entry.is_some() {
+            self.read.extend(found.into_iter().cloned());
         }
         entry
     }
@@ -119,7 +154,7 @@ impl Lines {
         list: &[C],
     ) -> Option<Vec<(usize, u64)>> {
         match self.at(Kind::Choice, keying, rule, list)? {
-            Entry::Choice(timed) => Some(timed.iter().copied().collect()),
+            Entry::Choice(timed) => Some(timed.iter().map(|&(i, _, ns)| (i, ns)).collect()),
             _ => None,
         }
     }
@@ -132,7 +167,7 @@ impl Lines {
         list: &[C],
     ) -> Option<Vec<usize>> {
         match self.at(Kind::Admitted, keying, rule, list)? {
-            Entry::Admitted(at) => Some(at.to_vec()),
+            Entry::Admitted(at) => Some(at.iter().map(|&(i, _)| i).collect()),
             _ => None,
         }
     }
@@ -140,23 +175,24 @@ impl Lines {
     /// The index of the first clean config of a ranked list.
     fn first<C: std::hash::Hash + std::fmt::Debug>(&mut self, keying: &Keying, list: &[C]) -> Option<usize> {
         match self.at(Kind::First, keying, "", list)? {
-            Entry::Admitted(at) => at.first().copied(),
+            Entry::Admitted(at) => at.first().map(|&(i, _)| i),
             _ => None,
         }
     }
 
-    /// The choice lines by `(op, dtype, shape)` group, each group's by the
-    /// candidates' digest, with how many lines (builds) hold it.
-    fn by_group(&self) -> HashMap<String, Vec<(String, usize)>> {
-        let mut out: HashMap<String, Vec<(String, usize)>> = HashMap::new();
-        for key in self.entries.keys().filter(|k| k.starts_with("choice|")) {
-            let fields: Vec<&str> = key.split('|').collect();
-            let group = fields[..5].join("|");
-            let prefix = fields[..6].join("|");
-            let list = out.entry(group).or_default();
-            match list.iter_mut().find(|(p, _)| *p == prefix) {
-                Some((_, count)) => *count += 1,
-                None => list.push((prefix, 1)),
+    /// The choice lines of `group` no derived list matched, each with its
+    /// decoded candidates and measured ns, one of each distinct payload
+    /// (builds write the same measurement on several lines).
+    fn unread(&self, group: &str) -> Vec<(Timed, u64)> {
+        let mut out: Vec<(Timed, u64)> = vec![];
+        for (key, entry) in &self.entries {
+            if !of_group(key, group) || self.read.contains(key) {
+                continue;
+            }
+            let Entry::Choice(timed) = entry else { continue };
+            let payload = digest(&timed);
+            if out.iter().all(|(_, p)| *p != payload) {
+                out.push((timed.to_vec(), payload));
             }
         }
         out
@@ -267,13 +303,16 @@ pub struct Family {
     /// correlate (a pair of softmax forms).
     pub replayed: usize,
     pub short: usize,
-    /// The choice lines no hypothesis reproduced.
+    /// The replayed lines read from their own candidates, no derivation
+    /// matching their digest: the cross-ranked measurements.
+    pub stored: usize,
+    /// The choice lines no hypothesis admitted a candidate of.
     pub skipped: usize,
 }
 
 impl Family {
     fn new(name: &'static str) -> Self {
-        Self { name, lines: vec![], total: 0, replayed: 0, short: 0, skipped: 0 }
+        Self { name, lines: vec![], total: 0, replayed: 0, short: 0, stored: 0, skipped: 0 }
     }
 
     /// The mean Spearman ρ over the lines, each shape's measurement weighing
@@ -533,8 +572,14 @@ pub fn replay(root: &Path, wanted: Option<&str>, ops: Option<&[&str]>) -> Vec<De
         };
         let unmeasured = measured.unmeasured.clone();
         let planner = std::sync::Arc::new(Planner::measured(target.clone(), measured).expect("an SM count"));
-        let mut groups: Vec<String> = lines.by_group().into_keys().collect();
+        let mut groups: Vec<String> = lines
+            .entries
+            .keys()
+            .filter(|k| k.starts_with("choice|"))
+            .map(|k| k.split('|').take(5).collect::<Vec<_>>().join("|"))
+            .collect();
         groups.sort();
+        groups.dedup();
         let mut kept: HashMap<&'static str, Family> = HashMap::new();
         for group in groups {
             let fields: Vec<&str> = group.split('|').collect();
@@ -562,34 +607,48 @@ pub fn replay(root: &Path, wanted: Option<&str>, ops: Option<&[&str]>) -> Vec<De
                 .extend(replays.into_iter().filter(|r| r.timed.len() >= LEAST_CANDIDATES));
         }
         // What a family's lines came to: every choice line of its ops
-        // correlated, too short to correlate, or skipped — no hypothesis
-        // reproduced the list its digest names. Several builds' lines of
-        // one key count once found, as the replay reads one of them.
+        // correlated — derived, where the digest of a list this code
+        // re-derives names it, else stored, its own candidates read under
+        // the problem that admits them — too short to correlate, or
+        // skipped: no hypothesis admits a candidate of it.
         let mut skipped_groups: Vec<(String, usize)> = vec![];
-        for (group, prefixes) in lines.by_group() {
-            let fields: Vec<&str> = group.split('|').collect();
+        let mut skipped: HashMap<String, usize> = HashMap::new();
+        // The cross-replayed payloads already counted (builds write the same
+        // measurement on several lines; the replay reads one).
+        let mut counted: std::collections::HashSet<u64> = Default::default();
+        for (key, entry) in &lines.entries {
+            if !key.starts_with("choice|") {
+                continue;
+            }
+            let fields: Vec<&str> = key.split('|').collect();
             let Some(dtype) = dtype_of(fields[3]) else { continue };
             if ops.is_some_and(|want| !want.contains(&family_of(fields[1], dtype))) {
                 continue;
             }
-            let name = family_of(fields[1], dtype);
-            let family = kept.entry(name).or_insert_with(|| Family::new(name));
-            let mut skipped = 0;
-            for (prefix, count) in prefixes {
-                family.total += count;
-                match lines.found.get(&prefix) {
-                    Some(&candidates) if candidates >= LEAST_CANDIDATES => family.replayed += count,
-                    Some(_) => family.short += count,
-                    None => skipped += count,
+            let Entry::Choice(timed) = entry else { continue };
+            let family =
+                kept.entry(family_of(fields[1], dtype)).or_insert_with(|| Family::new(family_of(fields[1], dtype)));
+            family.total += 1;
+            let payload = digest(timed);
+            let cross = lines.stored.contains(&payload);
+            if cross && !counted.insert(payload) {
+                continue;
+            }
+            if lines.read.contains(key) || cross {
+                if timed.len() >= LEAST_CANDIDATES {
+                    family.replayed += 1;
+                    if cross {
+                        family.stored += 1;
+                    }
+                } else {
+                    family.short += 1;
                 }
-            }
-            if skipped > 0 {
-                skipped_groups.push((format!("{} {} {}", fields[1], fields[3], fields[4]), skipped));
+            } else {
+                let group = format!("{} {} {}", fields[1], fields[3], fields[4]);
+                *skipped.entry(group).or_default() += 1;
             }
         }
-        for family in kept.values_mut() {
-            family.skipped = family.total - family.replayed - family.short;
-        }
+        skipped_groups.extend(skipped);
         skipped_groups.sort();
         let mut families: Vec<Family> = kept.into_values().filter(|f| f.total > 0).collect();
         families.sort_by_key(|f| f.name);
@@ -685,6 +744,43 @@ fn stages<C: Tiled + std::fmt::Debug>(
     Some(out)
 }
 
+/// The choice lines of `group` no derived list's digest matched, replayed
+/// from their own candidates: each code the line carries beside its index
+/// decodes to the config that ran, and the line is priced under the problem
+/// of the hypothesis (of `hypotheses`, by index) whose admission holds the
+/// most of them — a line no hypothesis admits any candidate of is left for
+/// the skip count, its salt one the enumeration does not name. Its configs
+/// list holds the candidates in the line's own timed order, its timed
+/// indices that order's positions.
+fn stored<C: Tiled>(
+    lines: &mut Lines,
+    group: &str,
+    hypotheses: usize,
+    admits: impl Fn(usize, &C) -> bool,
+    configs: impl Fn(usize, Vec<C>) -> Configs,
+) -> Vec<Replay> {
+    let mut out = vec![];
+    for (timed, payload) in lines.unread(group) {
+        let Some(list) = timed.iter().map(|(_, c, _)| C::of_code(c)).collect::<Option<Vec<_>>>() else { continue };
+        let held = |h: usize| list.iter().filter(|c| admits(h, c)).count();
+        let Some((best, held)) = (0..hypotheses).map(|h| (h, held(h))).max_by_key(|&(_, n)| n) else { continue };
+        if held == 0 || timed.len() < LEAST_CANDIDATES {
+            continue;
+        }
+        lines.read.extend(
+            lines
+                .entries
+                .iter()
+                .filter(|(k, e)| of_group(k, group) && matches!(e, Entry::Choice(t) if digest(t) == payload))
+                .map(|(k, _)| k.clone()),
+        );
+        lines.stored.insert(payload);
+        let timed: Vec<(usize, u64)> = timed.iter().enumerate().map(|(at, &(_, _, ns))| (at, ns)).collect();
+        out.push(Replay { rule: " stored", configs: configs(best, list), timed });
+    }
+    out
+}
+
 /// The GEMM family: `linear`'s lines, keyed by the batch and epilogue of
 /// the layer that tuned them, and the device tests' and GEMM probes'
 /// (`gemm`, [`DEVICE_TEST`]). Every salt that replays is a measurement.
@@ -705,13 +801,25 @@ fn gemm(lines: &mut Lines, planner: &Planner, op: &'static str, dtype: ScalarDTy
             .collect(),
     };
     let mut out = vec![];
+    let mut problems: Vec<GemmProblem> = vec![];
     for (salt, gated, bound) in salts {
         let keying = Keying::new(op, planner, dtype, shape, salt);
         let p = GemmProblem { batches: batches(bound), m, n, k, halves: if gated { 2 } else { 1 } };
         let ranked = planner.gemm_ranked(p.batches, m, n, k, gated);
         let configs = |list: Vec<GemmCfg>| Configs::Gemm { problem: p, list };
         out.extend(stages(lines, &keying, &ranked, <[_]>::to_vec, configs).into_iter().flatten());
+        if !problems.contains(&p) {
+            problems.push(p);
+        }
     }
+    let (group, count) = (group(op, planner, dtype, shape), problems.len());
+    out.extend(stored(
+        lines,
+        &group,
+        count,
+        |h, c| problems[h].admit(planner, c).is_ok(),
+        |h, list| Configs::Gemm { problem: problems[h], list },
+    ));
     out
 }
 
@@ -753,6 +861,7 @@ fn epilogues() -> Vec<Epilogue> {
 fn attention(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize]) -> Vec<Replay> {
     let [cap, t, tk, heads, _kv, d] = shape[..] else { return vec![] };
     let mut out = vec![];
+    let mut problems: Vec<AttentionProblem> = vec![];
     for batch in batches_of(cap) {
         for causal in [false, true] {
             for bias in [None, Some(Bias::Shared), Some(Bias::PerBatch)] {
@@ -778,6 +887,9 @@ fn attention(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[
                 }
                 let formed: Vec<FaCfg> = split.iter().map(|&c| FaCfg { forms, ..c }).collect();
                 let p = AttentionProblem { tiles: cap * heads, t, tk, d, causal, bias: bias.is_some() };
+                if !problems.contains(&p) {
+                    problems.push(p);
+                }
                 let expand = |admitted: &[FaCfg]| {
                     admitted
                         .iter()
@@ -794,6 +906,14 @@ fn attention(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[
             }
         }
     }
+    let (group, count) = (group("attention", planner, dtype, shape), problems.len());
+    out.extend(stored(
+        lines,
+        &group,
+        count,
+        |h, c| problems[h].admit(planner, c).is_ok(),
+        |h, list| Configs::Attention { problem: problems[h], list },
+    ));
     out
 }
 
@@ -815,6 +935,7 @@ fn nearest(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[us
         Live { rows: Some((var("n", n), 0)), k: (k > 1).then(|| var("k", k)) },
     ];
     let mut out = vec![];
+    let mut problems: Vec<NearestProblem> = vec![];
     for metric in [Metric::SquaredL2, Metric::ShiftedL2, Metric::L2, Metric::NegDot] {
         for floors in [
             Floors::default(),
@@ -840,9 +961,12 @@ fn nearest(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[us
                     let salts =
                         [format!("{:?}", Salt(&spec)), format!("{:?}", (DEVICE_TEST, metric, floors, groups)).clone()];
                     let salts = if *live == Live::default() { salts.to_vec() } else { salts[..1].to_vec() };
+                    let p = NearestProblem { n, m, d, dtype, metric, floors, groups, k };
+                    if !problems.contains(&p) {
+                        problems.push(p);
+                    }
                     for salt in salts {
                         let keying = Keying::new("nearest", planner, dtype, shape, salt);
-                        let p = NearestProblem { n, m, d, dtype, metric, floors, groups, k };
                         let ranked = planner.nearest_ranked(p);
                         let expand = |admitted: &[NearestCfg]| planner.nearest_splits(&p, admitted);
                         let configs = |list: Vec<NearestCfg>| Configs::Nearest { problem: p, list };
@@ -852,6 +976,14 @@ fn nearest(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[us
             }
         }
     }
+    let (group, count) = (group("nearest", planner, dtype, shape), problems.len());
+    out.extend(stored(
+        lines,
+        &group,
+        count,
+        |h, c| problems[h].admit(planner, c).is_ok(),
+        |h, list| Configs::Nearest { problem: problems[h], list },
+    ));
     out
 }
 
@@ -875,6 +1007,7 @@ fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize
         _ => return vec![],
     };
     let mut out = vec![];
+    let mut problems: Vec<ConvProblem> = vec![];
     for (g, images, salt) in geoms {
         let [ho, wo] = g.out_hw();
         for bound in [false, true] {
@@ -885,6 +1018,9 @@ fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize
             };
             let ranked = planner.conv_ranked(batches, m, &g);
             let p = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1 }, geom: g };
+            if !problems.contains(&p) {
+                problems.push(p);
+            }
             let expand = |admitted: &[ConvCfg]| {
                 planner.conv_splits(batches, m, &g, admitted).into_iter().filter(|c| c.split == 1 || !bound).collect()
             };
@@ -893,6 +1029,16 @@ fn conv(lines: &mut Lines, planner: &Planner, dtype: ScalarDType, shape: &[usize
             out.extend(stages(lines, &keying, &ranked, expand, configs).into_iter().flatten());
         }
     }
+    // The convolution's candidates are priced by their GEMM body's claim;
+    // a hypothesis holds a candidate whose body it admits.
+    let (group, count) = (group("conv2d", planner, dtype, shape), problems.len());
+    out.extend(stored(
+        lines,
+        &group,
+        count,
+        |h: usize, c: &ConvCfg| problems[h].claim(planner, &c.gemm).is_ok(),
+        |h, list| Configs::Conv { problem: problems[h], list },
+    ));
     out
 }
 

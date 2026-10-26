@@ -193,9 +193,10 @@ rocprof, or tk's probes). `llvm-mca` on AMDGPU is a one-wave, no-memory model an
 ## Tune store
 
 `$SVOD_TK_TUNE_DIR`, else `$XDG_CACHE_HOME/svod/tk_tune`, else `~/.cache/svod/tk_tune`; one file per device
-`<arch>_<sms>sm-v<crate version>.txt` (`sm_86_28sm-v0.2.0.txt`) under a `format 5` line (`tune::FORMAT`); lines
-`choice|…` (candidate index + ns pairs, fastest first), `admitted|…`/`first|…` (ranked indices), `value|…` (one number;
-probes in femtoseconds) keyed by op, device, dtype, shape, candidate digest, compiler digest and the
+`<arch>_<sms>sm-v<crate version>.txt` (`sm_86_28sm-v0.2.0.txt`) under a `format 6` line (`tune::FORMAT`); lines
+`choice|…` (`idx:code ns` pairs, fastest first, each candidate's config as its family's compact code —
+`Tiled::code`), `admitted|…`/`first|…` (`idx:code`), `value|…` (one number; probes in femtoseconds) keyed by op,
+device, dtype, shape, candidate digest, compiler digest and the
 fingerprint of the **emitted kernels** (lowered program + LLVM text), so only a change in what a kernel emits re-measures.
 The emitted fingerprints are memoized per build in `emitted/<build>.txt` (dropped after 7 days unused). A new FORMAT
 orphans every file: the next run re-probes and re-tunes every shape (budget the cold run). Read the probes without

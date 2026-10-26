@@ -8,11 +8,12 @@ use std::hash::Hash;
 
 use svod_dtype::GpuArch;
 
+use crate::atoms::Core;
 use crate::atoms::Target;
-use crate::kernels::attention::{FaCfg, WARP_ROWS};
+use crate::kernels::attention::{FaCfg, Forms, WARP_ROWS};
 use crate::kernels::conv::ConvCfg;
 use crate::kernels::gemm::GemmCfg;
-use crate::kernels::nearest::{LaneQueue, NearestCfg};
+use crate::kernels::nearest::{LaneQueue, NearestCfg, SelectCfg};
 use crate::kernels::rows::NormCfg;
 use crate::tune::Compiled;
 
@@ -231,6 +232,39 @@ pub(crate) trait Tiled: Copy + Eq + Hash + Send {
     fn represents(&self) -> bool {
         true
     }
+
+    /// The config as the compact code a store line carries beside its
+    /// index ([`super::super::tune`]'s format 6): its fields in a fixed
+    /// order, numbers and markers, `~` a `None` — a family's own form,
+    /// round-trip tested per family, so a line's candidates read without
+    /// re-deriving the list their digest names.
+    fn code(&self) -> String;
+
+    /// The config a [`code`](Self::code) holds; `None` where it is not the
+    /// family's form.
+    fn of_code(code: &str) -> Option<Self>;
+}
+
+/// The numbers of a `code` split on commas, `~` a `None` field.
+fn fields(code: &str) -> Option<Vec<Option<usize>>> {
+    code.split(',')
+        .map(|f| match f {
+            "~" => Some(None),
+            n => Some(Some(n.parse::<usize>().ok()?)),
+        })
+        .collect()
+}
+
+/// The code of `fields`: `~` a `None`, a number the rest.
+fn coded(fields: &[Option<usize>]) -> String {
+    fields
+        .iter()
+        .map(|f| match f {
+            Some(n) => n.to_string(),
+            None => "~".into(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The configs of `ranked` that may stand for their tiles, in order.
@@ -243,6 +277,50 @@ impl Tiled for GemmCfg {
         GemmCfg { tile: [self.tile[0], self.tile[1], 0], stages: 0, unroll: false, ..*self }
     }
 
+    /// `w|g` (the core), the tile, the ring, the warp grid, unrolling and
+    /// crews: `w,128,256,64,3,2,4,0,1`.
+    fn code(&self) -> String {
+        format!(
+            "{},{}",
+            match self.core {
+                Core::Warp => "w",
+                Core::Group => "g",
+            },
+            coded(&[
+                Some(self.tile[0]),
+                Some(self.tile[1]),
+                Some(self.tile[2]),
+                Some(self.stages),
+                Some(self.warps[0] as usize),
+                Some(self.warps[1] as usize),
+                Some(self.unroll as usize),
+                Some(self.crews as usize),
+            ])
+        )
+    }
+
+    fn of_code(code: &str) -> Option<Self> {
+        let (core, rest) = code.split_once(',')?;
+        let core = match core {
+            "w" => Core::Warp,
+            "g" => Core::Group,
+            _ => return None,
+        };
+        let f = fields(rest)?;
+        if f.len() != 8 {
+            return None;
+        }
+        let n = |i: usize| f.get(i).copied().flatten();
+        Some(GemmCfg {
+            core,
+            tile: [n(0)?, n(1)?, n(2)?],
+            stages: n(3)?,
+            warps: [n(4)? as u32, n(5)? as u32],
+            unroll: n(6)? == 1,
+            crews: n(7)? as u32,
+        })
+    }
+
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
         ranked.iter().filter(|c| c.tile() == self.tile()).copied().collect()
     }
@@ -251,6 +329,16 @@ impl Tiled for GemmCfg {
 impl Tiled for ConvCfg {
     fn tile(&self) -> Self {
         ConvCfg { gemm: self.gemm.tile(), ..*self }
+    }
+
+    /// Its GEMM's code, the split last: `w,64,64,32,2,2,2,0,1,4`.
+    fn code(&self) -> String {
+        format!("{},{}", self.gemm.code(), self.split)
+    }
+
+    fn of_code(code: &str) -> Option<Self> {
+        let (gemm, split) = code.rsplit_once(',')?;
+        Some(ConvCfg { gemm: GemmCfg::of_code(gemm)?, split: split.parse().ok()? })
     }
 
     /// A split's twins keep its depth as well as its split: a partial
@@ -276,6 +364,68 @@ impl Tiled for FaCfg {
         FaCfg { stages: 0, unroll: false, warp_rows: WARP_ROWS, ..*self }
     }
 
+    /// The blocks, ring, splits, unrolling, the softmax forms as their five
+    /// bits (`truncate_p, sum_after, skip_rescale, raw_max, bias_direct`),
+    /// the key warps, rows a warp and the core:
+    /// `64,64,3,1,0,9,1,2,g`.
+    fn code(&self) -> String {
+        let forms = self.forms;
+        let bits = [forms.truncate_p, forms.sum_after, forms.skip_rescale, forms.raw_max, forms.bias_direct]
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| usize::from(b) << i)
+            .sum::<usize>();
+        coded(&[
+            Some(self.bq),
+            Some(self.bkv),
+            Some(self.stages),
+            Some(self.splits),
+            Some(self.unroll as usize),
+            Some(bits),
+            Some(self.key_warps),
+            Some(self.warp_rows),
+        ]) + &format!(
+            ",{}",
+            match self.core {
+                Core::Warp => "w",
+                Core::Group => "g",
+            }
+        )
+    }
+
+    fn of_code(code: &str) -> Option<Self> {
+        let (rest, core) = code.rsplit_once(',')?;
+        let core = match core {
+            "w" => Core::Warp,
+            "g" => Core::Group,
+            _ => return None,
+        };
+        let f = fields(rest)?;
+        if f.len() != 8 {
+            return None;
+        }
+        let n = |i: usize| f.get(i).copied().flatten();
+        let bits = n(5)?;
+        let bit = |i: usize| (bits >> i & 1) == 1;
+        Some(FaCfg {
+            bq: n(0)?,
+            bkv: n(1)?,
+            stages: n(2)?,
+            splits: n(3)?,
+            unroll: n(4)? == 1,
+            forms: Forms {
+                truncate_p: bit(0),
+                sum_after: bit(1),
+                skip_rescale: bit(2),
+                raw_max: bit(3),
+                bias_direct: bit(4),
+            },
+            key_warps: n(6)?,
+            warp_rows: n(7)?,
+            core,
+        })
+    }
+
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
         let block = |c: &FaCfg| (c.bq, c.bkv, c.key_warps, c.core);
         ranked
@@ -296,6 +446,15 @@ impl Tiled for NormCfg {
         *self
     }
 
+    /// Its rows a block: `4`.
+    fn code(&self) -> String {
+        self.br.to_string()
+    }
+
+    fn of_code(code: &str) -> Option<Self> {
+        Some(NormCfg { br: code.parse().ok()? })
+    }
+
     fn twins(&self, _: &[Self]) -> Vec<Self> {
         vec![*self]
     }
@@ -309,6 +468,56 @@ impl Tiled for NearestCfg {
     fn tile(&self) -> Self {
         let lanes = self.lanes.map(|l| LaneQueue { passes: false, ..l });
         NearestCfg { stages: 0, unroll: false, lanes, ..*self }
+    }
+
+    /// The blocks, ring, rows a warp, the streamed depth, the splits, the
+    /// register list, a score-matrix listing's (`warps, queue, filter`) and
+    /// a lane queue's (`width, depth, passes`) — a `None` field `~`:
+    /// `64,64,2,0,2,~,1,~,~,~,~,4,32,0`.
+    fn code(&self) -> String {
+        coded(&[
+            Some(self.bq),
+            Some(self.bkv),
+            Some(self.stages),
+            Some(self.unroll as usize),
+            Some(self.warp_rows),
+            self.bk,
+            Some(self.splits),
+            self.queue,
+            self.select.map(|s| s.warps as usize),
+            self.select.map(|s| s.queue),
+            self.select.map(|s| usize::from(s.filter)),
+            self.lanes.map(|l| l.width),
+            self.lanes.map(|l| l.depth),
+            self.lanes.map(|l| usize::from(l.passes)),
+        ])
+    }
+
+    fn of_code(code: &str) -> Option<Self> {
+        let f = fields(code)?;
+        if f.len() != 14 {
+            return None;
+        }
+        let n = |i: usize| f.get(i).copied().flatten();
+        let select = n(8).zip(n(9)).zip(n(10)).map(|((warps, queue), filter)| SelectCfg {
+            warps: warps as u32,
+            queue,
+            filter: filter == 1,
+        });
+        let lanes =
+            n(11).zip(n(12)).zip(n(13)).map(|((width, depth), passes)| LaneQueue { width, depth, passes: passes == 1 });
+        Some(NearestCfg {
+            bq: n(0)?,
+            bkv: n(1)?,
+            stages: n(2)?,
+            unroll: n(3)? == 1,
+            warp_rows: n(4)?,
+            bk: n(5),
+            splits: n(6)?,
+            queue: n(7),
+            select,
+            lanes,
+        })
     }
 
     /// The ranked (unsplit) pipelines of the tile, at the split the tuner

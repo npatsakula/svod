@@ -154,12 +154,13 @@ fn admitted_and_chosen(dir: &Path) -> (Planner, Arc<[GemmCfg]>, Vec<GemmCfg>) {
         TuneKey::new("linear", &sm86(), 0, ScalarDType::BFloat16, &[1, 512, 512, 512], &candidates)
     };
     let (admitted, candidates) = (at("", &reps), at(" screened", &[reps[2], reps[1]]));
+    let screened = [reps[2], reps[1]];
     write(
         dir,
         &admitted,
         &[
-            format!("{} 2 1", admitted.line(Kind::Admitted, 1)),
-            format!("{} 1 900 0 2000", candidates.line(Kind::Choice, 1)),
+            format!("{} 2:{} 1:{}", admitted.line(Kind::Admitted, 1), reps[2].code(), reps[1].code()),
+            format!("{} 1:{} 900 0:{} 2000", candidates.line(Kind::Choice, 1), screened[1].code(), screened[0].code()),
         ],
     );
     (planner, ranked, reps)

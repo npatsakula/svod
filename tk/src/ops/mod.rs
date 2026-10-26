@@ -257,7 +257,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         let keep = bench.lowered.clone();
         let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::FIRST)], &keep);
         let find = || config::first_clean(ranked, |batch| bench.admit(batch, build, store));
-        let at = store.first(&key, programs, find);
+        let at = store.first(&key, ranked, programs, find);
         let cfg = ranked.get(at.unwrap_or(0)).copied();
         tracing::debug!(target: PLAN, op, shape = ?self.shape, ?cfg, stored = at.is_some(), "first");
         cfg
@@ -276,7 +276,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         let keep = bench.lowered.clone();
         let programs = || Self::programs(store, build, &ranked[..ranked.len().min(config::SHORTLIST)], &keep);
         let admit = || bench.shortlist(ranked, build, store);
-        let found = store.admitted(&key, programs, admit);
+        let found = store.admitted(&key, ranked, programs, admit);
         let configs: Vec<C> = match &found {
             Some(at) => at.iter().map(|&i| ranked[i]).collect(),
             None => config::distinct(ranked).take(config::SHORTLIST).collect(),
@@ -362,7 +362,7 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         let (store, bench, build) = (self.store, &mut self.bench, &self.build);
         let keep = bench.lowered.clone();
         let admit = || config::compiled(&twins, |batch| bench.admit(batch, build, store));
-        let judged = store.admitted(&key, || Self::programs(store, build, &twins, &keep), admit);
+        let judged = store.admitted(&key, &twins, || Self::programs(store, build, &twins, &keep), admit);
         let compiled: Vec<C> = judged.iter().flat_map(|at| at.iter().map(|&i| twins[i])).collect();
         tracing::debug!(target: PLAN, op, shape = ?self.shape, ?compiled, "twins admitted");
         if compiled.len() > 1 { self.ordered(op, &compiled, Pass::Whole)[0] } else { (winner, lead) }

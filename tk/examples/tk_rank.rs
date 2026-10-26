@@ -1,10 +1,13 @@
 //! The rank harness over a tune store, offline: replays each `choice|` line
-//! the store holds — re-deriving the candidates its key digests, under the
-//! costs the same store measured — and prints, per family and device, the
-//! Spearman ρ of the model's predicted order against the device's measured
-//! one, the fraction of lines whose predicted best is the measured winner,
-//! and the lines no hypothesis could reproduce. The baseline numbers the
-//! config rework's later phases must not regress; see `svod_tk::rank`.
+//! the store holds — its own candidates, the codes the line carries beside
+//! its indices, priced under the costs the same store measured — and
+//! prints, per family and device, the Spearman ρ of the model's predicted
+//! order against the device's measured one, the fraction of lines whose
+//! predicted best is the measured winner, how many lines replayed from
+//! their own candidates (no derivation matching their digest: a ranking
+//! that changed since they were written), and the lines no hypothesis
+//! admits a candidate of. The baseline numbers the config rework's later
+//! phases must not regress; see `svod_tk::rank`.
 //!
 //! ```text
 //! cargo run -p svod-tk --release --example tk_rank -- [--store DIR] [--device NAME] [--op gemm,attention] [--check] [--fit]
@@ -12,7 +15,7 @@
 //!
 //! `--store` defaults to the global tune store; `--device` and `--op` filter
 //! by substring. `--check` adds the determinism pass: which choice lines of
-//! each family were reproduced (the digest in their key asserted), which
+//! each family were derived (the digest in their key asserted), which
 //! skipped, and the shapes it happened on.
 
 use std::path::PathBuf;
@@ -38,18 +41,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for device in rank::replay(&store, device.as_deref(), ops.as_deref()) {
         println!("{} ({} of its cost fields unmeasured)", device.name, device.unmeasured.len());
         println!(
-            "  {:<12} {:>6} {:>11} {:>7} {:>6} {:>8} {:>7}",
-            "family", "lines", "candidates", "rho", "top1", "skipped", "short"
+            "  {:<12} {:>6} {:>11} {:>7} {:>6} {:>7} {:>8} {:>7}",
+            "family", "lines", "candidates", "rho", "top1", "stored", "skipped", "short"
         );
         let planner = &device.planner;
         for family in &device.families {
             println!(
-                "  {:<12} {:>6} {:>11} {:>7} {:>6} {:>8} {:>7}",
+                "  {:<12} {:>6} {:>11} {:>7} {:>6} {:>7} {:>8} {:>7}",
                 family.name,
                 family.lines.len(),
                 family.candidates(),
                 family.rho(planner).map_or("-".into(), |r| format!("{r:.3}")),
                 family.top1(planner).map_or("-".into(), |t| format!("{t:.2}")),
+                family.stored,
                 family.skipped,
                 family.short,
             );

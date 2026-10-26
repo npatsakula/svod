@@ -2,15 +2,18 @@
 //! configs are admitted ([`Bench`]) and, on a store miss, timed; the winner
 //! is kept in the process memo and on disk.
 //!
-//! The store is one line per [`Entry`] (`kind|key numbers`) under a
+//! The store is one line per [`Entry`] (`kind|key candidates`) under a
 //! `format N` line ([`FORMAT`]) in `$SVOD_TK_TUNE_DIR` (else
 //! `$XDG_CACHE_HOME/svod/tk_tune`, else `$HOME/.cache/svod/tk_tune`), one
 //! file per device and crate version. A line's key carries a digest of the
 //! device's compiler ([`compiler`]) and a fingerprint of the kernels the
 //! candidates emit ([`fingerprint`]), so a toolchain or kernel change
-//! re-measures and nothing else does. An unreadable or
-//! unwritable store is a miss, never an error; a line the store cannot read
-//! is dropped at its next write, and a file of another format whole.
+//! re-measures and nothing else does; its candidates carry each config's
+//! own code beside its index, so a line reads without re-deriving the list
+//! its digest names ([`crate::rank`]). An unreadable or unwritable store is
+//! a miss, never an error; a line the store cannot read is dropped at its
+//! next write, and a file of another format whole (a format bump orphans
+//! every file: the next run re-probes and re-tunes every shape).
 //! `SVOD_TK_TUNE=0`, or [`scoped`] on a thread, turns candidate timing off:
 //! the first ranked config that compiles without spilling is used (that
 //! verdict is still stored), while a device's probes still measure.
@@ -37,10 +40,14 @@ use crate::launch;
 use crate::lower::Lowering;
 
 /// The store's line format, bumped when a line's meaning changes; a file of
-/// another format, or without the line, is dropped whole. 5 fingerprints the
-/// emitted kernels, where 4 fingerprinted the programs and lowerings, targets
-/// and costs whole.
-pub(crate) const FORMAT: u32 = 5;
+/// another format, or without the line, is dropped whole. 6 carries each
+/// candidate's config code beside its index (`idx:code ns` a timed pair,
+/// `idx:code` an admitted one), where 5 held indices alone into the list the
+/// line's digest names — a ranking change used to orphan every choice line,
+/// and now the line's own candidates replay ([`crate::rank`]). 5
+/// fingerprinted the emitted kernels, where 4 fingerprinted the programs
+/// and lowerings, targets and costs whole.
+pub(crate) const FORMAT: u32 = 6;
 /// Measurement: the rounds a contender is timed (the first over every
 /// candidate, the rest over the contenders), and the rounds the two leaders
 /// then run again ([`rounds`]).
@@ -262,13 +269,14 @@ fn once<K: Clone + Eq + Hash, V: Clone>(map: &Once<K, V>, key: &K, init: impl Fn
 /// What a store line records, under its kind, key and fingerprint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
-    /// The candidates that ran, fastest first, each with its device ns.
-    Choice(Arc<[(usize, u64)]>),
+    /// The candidates that ran, fastest first, each with its index into the
+    /// list the line's key digests, its config's code and its device ns.
+    Choice(Arc<[(usize, String, u64)]>),
     /// A measured number: a probe's cost.
     Value(u64),
-    /// The ranked indices admission kept, or the one its search for a
-    /// first clean config found.
-    Admitted(Arc<[usize]>),
+    /// The ranked configs admission kept (each with its index and code), or
+    /// the one its search for a first clean config found.
+    Admitted(Arc<[(usize, String)]>),
 }
 
 /// What a [`TuneStore::replay`] found for one key.
@@ -321,24 +329,39 @@ impl Kind {
 }
 
 impl Entry {
-    /// The entry's numbers as its line holds them after the key.
+    /// The entry's candidates as its line holds them after the key: a timed
+    /// pair its index, code and ns; an admitted one its index and code.
     pub(crate) fn render(&self) -> String {
         match self {
-            Entry::Choice(timed) => timed.iter().map(|(i, ns)| format!("{i} {ns}")).collect::<Vec<_>>().join(" "),
+            Entry::Choice(timed) => {
+                timed.iter().map(|(i, c, ns)| format!("{i}:{c} {ns}")).collect::<Vec<_>>().join(" ")
+            }
             Entry::Value(v) => v.to_string(),
-            Entry::Admitted(at) => at.iter().map(usize::to_string).collect::<Vec<_>>().join(" "),
+            Entry::Admitted(at) => at.iter().map(|(i, c)| format!("{i}:{c}")).collect::<Vec<_>>().join(" "),
         }
     }
 
-    /// The entry a line of `kind` with `numbers` after its key records.
-    pub(crate) fn parse(kind: &str, numbers: &[u64]) -> Option<Self> {
-        match (kind, numbers) {
-            ("choice", pairs) if !pairs.is_empty() && pairs.len().is_multiple_of(2) => {
-                Some(Entry::Choice(pairs.chunks(2).map(|p| (p[0] as usize, p[1])).collect()))
+    /// The entry a line of `kind` with `fields` after its key records.
+    pub(crate) fn parse(kind: &str, fields: &[&str]) -> Option<Self> {
+        let at = |f: &str| -> Option<(usize, String)> {
+            let (i, code) = f.split_once(':')?;
+            Some((i.parse().ok()?, code.to_string()))
+        };
+        match (kind, fields) {
+            ("choice", pairs) if !pairs.is_empty() && pairs.len().is_multiple_of(2) => Some(Entry::Choice(
+                pairs
+                    .chunks(2)
+                    .map(|p| {
+                        let (i, code) = at(p[0])?;
+                        Some((i, code, p[1].parse().ok()?))
+                    })
+                    .collect::<Option<_>>()?,
+            )),
+            ("value", &[v]) => Some(Entry::Value(v.parse().ok()?)),
+            ("admitted", ats) if !ats.is_empty() => {
+                Some(Entry::Admitted(ats.iter().map(|f| at(f)).collect::<Option<_>>()?))
             }
-            ("value", &[v]) => Some(Entry::Value(v)),
-            ("admitted", at) if !at.is_empty() => Some(Entry::Admitted(at.iter().map(|&i| i as usize).collect())),
-            ("first", &[at]) => Some(Entry::Admitted([at as usize].into())),
+            ("first", &[one]) => Some(Entry::Admitted([at(one)?].into())),
             _ => None,
         }
     }
@@ -594,7 +617,7 @@ impl TuneStore {
             .filter_map(|line| {
                 let mut fields = line.split_whitespace();
                 let line = fields.next()?;
-                let numbers: Vec<u64> = fields.map(str::parse).collect::<Result<_, _>>().ok()?;
+                let numbers: Vec<&str> = fields.collect();
                 Some((line.to_string(), Entry::parse(line.split('|').next()?, &numbers)?))
             })
             .collect()
@@ -669,7 +692,7 @@ impl TuneStore {
     /// [`time`]d through `pass`, their order stored. A candidate whose
     /// programs emit what another's do (an unrolling the schedule folds
     /// away) is timed as its twin: the line still names it, at its twin's ns.
-    pub(crate) fn choose<C: Copy + PartialEq + Eq + std::hash::Hash + std::fmt::Debug + Send>(
+    pub(crate) fn choose<C: crate::ops::config::Tiled + std::fmt::Debug>(
         &self,
         key: &TuneKey,
         candidates: &[C],
@@ -683,13 +706,14 @@ impl TuneStore {
             let (fingerprint, keys) = self.fingerprint_keeping(&built, Some(&keep));
             (fingerprint, (built, keys))
         };
-        let within =
-            |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _)| i < candidates.len()));
+        let within = |entry: &Entry| matches!(entry, Entry::Choice(timed) if timed.iter().all(|&(i, _, _)| i < candidates.len()));
         let timed = |(built, keys): (Vec<Candidate>, Vec<u64>)| {
-            ordered(bench.time(candidates, built, &keys, pass, self)).map(Entry::Choice)
+            ordered(bench.time(candidates, built, &keys, pass, self)).map(|timed| {
+                Entry::Choice(timed.iter().map(|&(i, ns)| (i, candidates[i].code(), ns)).collect::<Vec<_>>().into())
+            })
         };
         match self.remember(Kind::Choice, key, within, programs, timed)? {
-            Entry::Choice(timed) => Some(timed),
+            Entry::Choice(timed) => Some(timed.iter().map(|&(i, _, ns)| (i, ns)).collect()),
             _ => None,
         }
     }
@@ -700,15 +724,17 @@ impl TuneStore {
     /// stored when it judged. What compiles without spilling is the
     /// compiler's and the programs' alone, both in the line, so a later
     /// process compiles nothing but its choice.
-    pub(crate) fn admitted(
+    pub(crate) fn admitted<C: crate::ops::config::Tiled>(
         &self,
         key: &TuneKey,
+        list: &[C],
         programs: impl FnOnce() -> u64,
         admit: impl FnOnce() -> Option<Vec<usize>>,
     ) -> Option<Arc<[usize]>> {
-        let judged = |()| admit().map(|at| Entry::Admitted(at.into()));
+        let judged =
+            |()| admit().map(|at| Entry::Admitted(at.iter().map(|&i| (i, list[i].code())).collect::<Vec<_>>().into()));
         match self.remember(Kind::Admitted, key, |_| true, || (programs(), ()), judged)? {
-            Entry::Admitted(at) => Some(at),
+            Entry::Admitted(at) => Some(at.iter().map(|&(i, _)| i).collect()),
             _ => None,
         }
     }
@@ -717,15 +743,16 @@ impl TuneStore {
     /// `key` names (`None`: nothing compiled), by the same path as
     /// [`Self::admitted`] under its own kind, so a list's full admission and
     /// its first clean config are each remembered once.
-    pub(crate) fn first(
+    pub(crate) fn first<C: crate::ops::config::Tiled>(
         &self,
         key: &TuneKey,
+        list: &[C],
         programs: impl FnOnce() -> u64,
         find: impl FnOnce() -> Option<usize>,
     ) -> Option<usize> {
-        let found = |()| find().map(|at| Entry::Admitted([at].into()));
+        let found = |()| find().and_then(|at| list.get(at).map(|c| Entry::Admitted([(at, c.code())].into())));
         match self.remember(Kind::First, key, |_| true, || (programs(), ()), found)? {
-            Entry::Admitted(at) => at.first().copied(),
+            Entry::Admitted(at) => at.first().map(|&(i, _)| i),
             _ => None,
         }
     }

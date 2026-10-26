@@ -10,7 +10,7 @@ use svod_dtype::ScalarDType;
 use crate::atoms::sm86;
 use crate::kernels::Batch;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec};
-use crate::ops::config::{GemmProblem, Planner, representatives};
+use crate::ops::config::{GemmProblem, Planner, Tiled, representatives};
 use crate::ops::tuned;
 use crate::rank;
 use crate::tune::{Entry, Kind, TuneKey, TuneStore};
@@ -57,6 +57,8 @@ fn store(dir: &std::path::Path, ns: impl Fn(usize) -> u64) -> Planner {
     let admitted: Vec<GemmCfg> = at.iter().map(|&i| reps[i]).collect();
     let mut timed: Vec<(usize, u64)> = (0..4).map(|i| (i, ns(i))).collect();
     timed.sort_by_key(|&(_, ns)| ns);
+    let at: Vec<(usize, String)> = at.iter().map(|&i| (i, reps[i].code())).collect();
+    let timed: Vec<(usize, String, u64)> = timed.into_iter().map(|(i, ns)| (i, admitted[i].code(), ns)).collect();
     text += &format!("{} {}\n", keyed("", &reps).line(Kind::Admitted, 1), Entry::Admitted(at.into()).render());
     text +=
         &format!("{} {}\n", keyed(" screened", &admitted).line(Kind::Choice, 1), Entry::Choice(timed.into()).render());
@@ -94,22 +96,38 @@ fn a_store_replays_through_the_op_layers_keys(ns: fn(f64) -> u64) {
     assert_eq!(family.lines[0].top1(&devices[0].planner), agreed);
 }
 
-/// A choice line whose candidates digest names a list no ranking of the
-/// shape makes is skipped and counted, never read as one.
+/// A choice line whose candidates digest no ranking of the shape makes — a
+/// model that moved, a list the code at hand no longer derives — replays
+/// from the configs its own codes carry, counted stored beside the derived
+/// line; a line whose codes no hypothesis of the shape admits (an unknown
+/// salt) is skipped and counted, never guessed at.
 #[test]
-fn a_choice_line_no_ranking_makes_is_skipped() {
+fn a_line_no_ranking_makes_replays_from_its_own_configs() {
     let dir = Scratch::new("rank-drift");
-    store(&dir, |at| 100 + at as u64);
+    let planner = store(&dir, |at| 100 + at as u64);
     let file = TuneStore::at(Some(dir.to_path_buf())).file("sm_86-28sm").expect("a file");
     let text = std::fs::read_to_string(&file).expect("read");
-    std::fs::write(
-        &file,
-        format!("{text}choice|linear|sm_86-28sm|BFloat16|1x512x512x512|deadbeefdeadbeef|0|0 0 100 1 200 2 300\n"),
-    )
-    .expect("written");
+    let ranked = planner.gemm_ranked(1, 512, 512, 512, false);
+    let drifted: Vec<GemmCfg> = representatives(&ranked).into_iter().skip(1).take(4).collect();
+    let made = |key: u64| {
+        format!(
+            "choice|linear|sm_86-28sm|BFloat16|1x512x512x512|{key:016x}|0|0 {}\n",
+            (0..drifted.len())
+                .map(|i| format!("{}:{} {}", i, drifted[i].code(), 400 + 10 * i))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+    std::fs::write(&file, format!("{text}{}{}", made(0xdeadbeefdeadbeef), made(0xbeefbeefbeefbeef))).expect("written");
+    // The drifted digest is not the one the ranking derives; the line still
+    // replays from its codes, in their ns order. Its codes are the ranking's
+    // own configs, so the hypothesis admits every one.
     let devices = rank::replay(&dir, None, Some(&["gemm"]));
     let family = &devices[0].families[0];
-    assert_eq!((family.lines.len(), family.skipped), (1, 1), "the made line replays, the dead one counts");
+    assert_eq!((family.lines.len(), family.stored, family.skipped), (2, 1, 0), "derived and stored lines");
+    let stored = family.lines.iter().find(|l| l.rule == " stored").expect("the stored line");
+    let rho = stored.rho(&devices[0].planner).expect("variance");
+    assert!(rho > 0.9, "its ns order is its predicted order: {rho}");
 }
 
 /// The nearest epilogue's weight seam: each cluster scales only the

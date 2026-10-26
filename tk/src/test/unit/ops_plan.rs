@@ -723,6 +723,15 @@ impl config::Tiled for Pipe {
     fn twins(&self, ranked: &[Self]) -> Vec<Self> {
         ranked.iter().filter(|p| p.tile == self.tile).copied().collect()
     }
+
+    fn code(&self) -> String {
+        format!("{},{}", self.at, self.tile)
+    }
+
+    fn of_code(code: &str) -> Option<Self> {
+        let (at, tile) = code.split_once(',')?;
+        Some(Pipe { at: at.parse().ok()?, tile: tile.parse().ok()? })
+    }
 }
 
 proptest::proptest! {
