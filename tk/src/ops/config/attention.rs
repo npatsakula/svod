@@ -131,8 +131,10 @@ pub struct AttentionProblem {
 }
 
 impl AttentionProblem {
+    /// The blocks of the grid: a block a query tile, each of a split's key
+    /// shares one.
     fn blocks(&self, cfg: &FaCfg) -> usize {
-        self.tiles * self.t.div_ceil(cfg.bq)
+        self.tiles * self.t.div_ceil(cfg.bq) * cfg.splits
     }
 
     /// What `cfg` costs here, as [`GemmProblem::admit`]: a key block's trip pays
@@ -156,7 +158,11 @@ impl AttentionProblem {
     /// The config's [claim](super::cost::Claim): its checks run first — a
     /// config that lowers and fits the target's shared memory and register
     /// files — then its resources. A warpgroup product reads no key or
-    /// value fragments and holds one chain per product.
+    /// value fragments and holds one chain per product. A split's blocks
+    /// each walk their share of the key blocks and write f32 partials a
+    /// row a split; the combine that folds them (a row the max of the
+    /// splits' maxima, each split's weighted sums, the normalizing divide)
+    /// is a section beside the run.
     pub(crate) fn claim(&self, planner: &Planner, cfg: &FaCfg) -> Result<Claim, Rejected> {
         let target = &planner.device.target;
         let (bq, bkv, d, kw) = (cfg.bq, cfg.bkv, self.d, cfg.key_warps);
@@ -196,9 +202,30 @@ impl AttentionProblem {
         let fragments = kv_reads + bias;
         let fill = kw * 2 * bkv * d * ELEM + bias;
         let steps = kw * 2 * bq * bkv * d / STEP;
+        // A split walks its share of the key blocks (the rest of the grid
+        // the splits' own blocks fill), writing f32 partials a row a split.
         let trips = if self.causal { self.causal_trips(bq, bkv) } else { self.tk.div_ceil(bkv) };
-        let trips = trips.div_ceil(kw);
+        let trips = trips.div_ceil(kw).div_ceil(cfg.splits);
         let (blocks, stages) = (self.blocks(cfg), cfg.stages);
+        let rows = (self.tiles * self.t) as f64;
+        let (parts, combine) = match cfg.splits {
+            1 => (0.0, Spread::default()),
+            splits => (
+                (bq * (d * 4 + 8)) as f64 / trips as f64,
+                Spread {
+                    rows,
+                    // The combine of a split's partials a row: the max of
+                    // their m's, each split's weight (a subtract, an exp2
+                    // and three multiplies) and sums, the accumulator's two
+                    // a d-element, the row's normalizing divide and the
+                    // output's cast — elementwise vector work, the pair
+                    // epilogue's own kind.
+                    ops: Ops::of(Kind::Pair, (splits * 6 + (2 * splits + 7) * d) as f64),
+                    bytes: (splits * (d * 4 + 8) + d * 2) as f64,
+                    waits: 0.0,
+                },
+            ),
+        };
         let unique = (self.tiles * self.tk * (d * 2 + usize::from(self.bias) * self.t) * ELEM) as f64;
         let flight = planner.sms().min(blocks).max(1);
         let shared = 1.0 - flight.div_ceil(self.t.div_ceil(bq)) as f64 / flight as f64;
@@ -216,11 +243,11 @@ impl AttentionProblem {
             reads: fragments as f64,
             ops: Ops::of(Kind::Pair, (kw * bq * bkv) as f64 * PAIR_OPS),
             fill: Stream { bytes: fill as f64, unique, shared },
-            stores: 0.0,
+            stores: parts,
             ring: stages,
             unroll: cfg.unroll,
             waits: 0.0,
-            sections: [Spread::default(); 2],
+            sections: [combine, Spread::default()],
         })
     }
 
