@@ -2642,6 +2642,48 @@ fn cfg_time_probe() {
 /// What [`nearest`] refuses of a config's lists, whatever the target
 /// ([`NearestCfg::lists`]): a queue not a power of two from 2 below the
 /// list, a queue beside a score matrix, a listing that does not fit the
+/// The listing's fitted constants are not free to recount: at the int8
+/// rerank search's shape (2000×31342, depth 128, `k` 16 + MARGIN, the sm_86
+/// costs a fresh store measured) the device runs the resident, depth-4
+/// list at 0.831 ms against a streamed, depth-2 one's 3.554 — a recount of
+/// the deal cluster's terms to the counts the kernel code issues (the
+/// round's column at twice the fit, the pushed deal's index-and-order work,
+/// the push's pair of selects) priced the streamed one under the resident
+/// and flipped the pick, 4.3× behind (2026-10-26, fresh cold stores both
+/// sides); the fit's halves keep their place until a measured unit prices
+/// them, and this order is pinned so no recount flips it silently.
+#[test]
+fn the_resident_list_keeps_the_shallow_search() {
+    use crate::ops::config::NearestProblem;
+    let planner = Planner::new(crate::atoms::Device { target: crate::atoms::sm86(), costs: crate::test::unit::sm86_costs() })
+        .unwrap();
+    let p = NearestProblem {
+        n: 2000,
+        m: 31342,
+        d: 128,
+        dtype: svod_dtype::ScalarDType::Int8,
+        metric: Metric::NegDot,
+        floors: Floors::default(),
+        groups: false,
+        k: 32,
+    };
+    let resident = NearestCfg {
+        unroll: true,
+        splits: 4,
+        lanes: Some(LaneQueue { width: 4, depth: 4, passes: true }),
+        ..NearestCfg::new(64, 32, 3)
+    };
+    let streamed = NearestCfg {
+        unroll: true,
+        splits: 4,
+        lanes: Some(LaneQueue { width: 4, depth: 2, passes: true }),
+        ..NearestCfg::streamed(64, 32, 64, 3)
+    };
+    let (won, _) = p.admit(&planner, &resident).expect("the resident list admitted");
+    let (lost, _) = p.admit(&planner, &streamed).expect("the streamed list admitted");
+    assert!(won < lost, "the resident depth-4 list at {won} against the streamed depth-2 one's {lost}");
+}
+
 /// list, and lane queues not powers of two (a column at least) or not
 /// dealing the trip's candidates whole; a least alone takes any lanes.
 #[test_case(NearestCfg::new(32, 32, 2), 1, Ok(()); "a least")]

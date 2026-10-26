@@ -83,8 +83,9 @@ pub(crate) enum Kind {
     /// the same bundle.
     Pair,
     /// The listing's per-trip work ([`super::nearest`]): a deal's least an
-    /// element, its votes a lane, a pass's vote an element, a pushed deal's
-    /// test, a round's dealt column, a queue slot's pushes.
+    /// element, a trip's entry and its votes (a row's tests and the
+    /// branch), a pushed deal's index and order, a round's dealt column and
+    /// its fixed work, a queue slot's pushes.
     Deal,
     /// A bitonic network's work: a queue's sort, a merge into a list, a
     /// flush into the outputs — one exchange a slot a stage.

@@ -174,7 +174,14 @@ const HIT_ELEM: f64 = 1.3;
 const PASS_DEALS: usize = 8;
 /// Model: a round's work a dealt element: the column of its lane's least
 /// (a compare, a select and a minimum), its removal (a compare and a
-/// select) and the next least (a minimum), at half their count.
+/// select) and the next least (a minimum), at half their count. The counts
+/// the code issues are twice these and the pushed deal's and the round's
+/// fixed work more again — a recount of them (phase E, 2026-10-26) was
+/// refuted standalone on the rank harness's own A/B: at the int8 rerank
+/// search (2000×31342, depth 128, `k` 16 + MARGIN) the dearer listing
+/// flipped the model's pick to a streamed, depth-2-queue config the device
+/// runs 4.3× behind the resident depth-4 one it kept (3.554 against
+/// 0.831 ms, fresh cold stores both sides), the fitted halves included.
 const ROUND_ELEM: f64 = 3.0;
 /// Model: a push's work an element a queue slot: its selects.
 const PUSH_ELEM: f64 = 1.3;
@@ -552,7 +559,8 @@ impl NearestProblem {
             }
             let lambda = hits / elems;
             let rounds = (1.0 + lambda + (2.0 * lambda * elems.ln()).sqrt()).min(deals);
-            let round = deals * elems * ROUND_ELEM + elems * t * PUSH_ELEM + wave * DEAL_LANE;
+            let round =
+                deals * elems * ROUND_ELEM + elems * t * PUSH_ELEM + wave * DEAL_LANE;
             entered * (deals * elems * DEAL_ELEM + wave * DEAL_LANE + rounds * round)
         };
         let walk: f64 = (0..tiles).map(trip).sum();
