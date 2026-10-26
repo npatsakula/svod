@@ -15,7 +15,7 @@ use crate::kernels::nearest::{Floors, LANES, LaneQueue, Metric, NearestCfg, Sele
 use crate::layouts::{TileLayout, WarpGrid, chunked, fills_in_chunks};
 
 use super::attention::{FA_STAGES, QUERY_BLOCKS};
-use super::cost::{Claim, Kind, Ops, PAIR_OPS, Planner, STEP, Spread, Steps, Stream, cached};
+use super::cost::{Claim, Family, Kind, Ops, PAIR_OPS, Planner, STEP, Spread, Steps, Stream, cached};
 use super::gemm::DEPTHS;
 use super::search::{Rejected, Tiled, fired, sorted};
 
@@ -317,8 +317,7 @@ impl NearestProblem {
     /// Through a score matrix, a pair costs [`MATRIX_OPS`] and its store,
     /// and the listing kernel's [`Self::select_spreads`] is added.
     pub fn admit(&self, planner: &Planner, cfg: &NearestCfg) -> Result<(f64, u32), Rejected> {
-        let claim = self.claim(planner, cfg)?;
-        Ok((planner.price(&claim), claim.regs))
+        planner.admit(self, cfg)
     }
 
     /// The config's [claim](super::cost::Claim): its checks run first — a
@@ -559,8 +558,7 @@ impl NearestProblem {
             }
             let lambda = hits / elems;
             let rounds = (1.0 + lambda + (2.0 * lambda * elems.ln()).sqrt()).min(deals);
-            let round =
-                deals * elems * ROUND_ELEM + elems * t * PUSH_ELEM + wave * DEAL_LANE;
+            let round = deals * elems * ROUND_ELEM + elems * t * PUSH_ELEM + wave * DEAL_LANE;
             entered * (deals * elems * DEAL_ELEM + wave * DEAL_LANE + rounds * round)
         };
         let walk: f64 = (0..tiles).map(trip).sum();
@@ -746,6 +744,18 @@ impl NearestProblem {
             })
             .collect();
         fired("PASS_DEALS", &passes, kept);
+    }
+}
+
+impl Family for NearestProblem {
+    type Cfg = NearestCfg;
+
+    fn lattice(&self, target: &Target) -> Vec<NearestCfg> {
+        NearestProblem::lattice(self, target)
+    }
+
+    fn claim(&self, planner: &Planner, cfg: &NearestCfg) -> Result<Claim, Rejected> {
+        NearestProblem::claim(self, planner, cfg)
     }
 }
 

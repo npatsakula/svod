@@ -395,6 +395,88 @@ pub fn explained(device: &Device, family: &str, factor: f64) -> Vec<(&'static st
         .collect()
 }
 
+/// The layer-2 fit, evaluated: the multiplier a family's card earns for
+/// the declared residual unit ([`crate::ops::config::pair_op`]'s 0.2 score
+/// elements an elementary operation) from its own store's timed outcomes —
+/// every ops kind's weight scaled together, the whole epilogue's unit. One
+/// leave-one-out pass over the replayed lines: each line held out in turn,
+/// the multiplier that orders the rest best read off a geometric grid
+/// around the prior, and the held-out line predicted under it and under the
+/// prior (the multiplier 1). The fit is accepted only where the mean
+/// held-out ρ beats the prior's; enabling it anywhere is the design's
+/// phase F, so this computes and reports, never plans.
+pub struct Fitted {
+    pub family: &'static str,
+    /// The multiplier each held-out fold fitted, in its line's order.
+    pub multipliers: Vec<f64>,
+    /// The mean held-out ρ at the folds' fitted multipliers, against the
+    /// prior's (every weight 1).
+    pub held_out: Option<f64>,
+    pub prior: Option<f64>,
+    /// The multiplier that orders every line best, the one a store would
+    /// keep (regularized: the grid point nearest 1 among those within a
+    /// hundredth of the best ρ).
+    pub overall: f64,
+}
+
+/// The grid the fit reads its multiplier off: a quarter to four times the
+/// prior, the prior itself among the points.
+const FIT_GRID: [f64; 13] = [0.25, 0.3, 0.36, 0.44, 0.53, 0.72, 1.0, 1.4, 1.7, 2.1, 2.5, 3.1, 4.0];
+
+pub fn fitted(device: &Device) -> Vec<Fitted> {
+    let scaled = |m: f64| {
+        let mut planner = Planner::new(device.planner.device.clone()).expect("an SM count");
+        planner.weights = crate::ops::config::Weights { pair: m, deal: m, merge: m, scan: m, epilogue: m };
+        planner
+    };
+    let mean = |rho: &[Option<f64>]| {
+        let kept: Vec<f64> = rho.iter().flatten().copied().collect();
+        (!kept.is_empty()).then(|| kept.iter().sum::<f64>() / kept.len() as f64)
+    };
+    device
+        .families
+        .iter()
+        .filter(|f| f.lines.len() >= 4)
+        .map(|family| {
+            // The multiplier that orders `keep`'s lines best: the best ρ
+            // over the grid, regularized to the point nearest the prior
+            // among those within five hundredths of it.
+            let best_over = |keep: &[usize]| {
+                let scored: Vec<(f64, f64)> = FIT_GRID
+                    .iter()
+                    .map(|&m| {
+                        let rho: Vec<Option<f64>> = keep.iter().map(|&i| family.lines[i].rho(&scaled(m))).collect();
+                        (mean(&rho).unwrap_or(f64::NEG_INFINITY), m)
+                    })
+                    .collect();
+                let best = scored.iter().map(|(r, _)| *r).fold(f64::NEG_INFINITY, f64::max);
+                scored
+                    .iter()
+                    .filter(|(r, _)| *r >= best - 0.05)
+                    .min_by(|a, b| a.1.ln().abs().total_cmp(&b.1.ln().abs()))
+                    .map(|(_, m)| *m)
+                    .unwrap_or(1.0)
+            };
+            let all: Vec<usize> = (0..family.lines.len()).collect();
+            let folds: Vec<f64> = (0..family.lines.len())
+                .map(|held| {
+                    let keep: Vec<usize> = all.iter().copied().filter(|&i| i != held).collect();
+                    best_over(&keep)
+                })
+                .collect();
+            let held_out: Vec<Option<f64>> =
+                folds.iter().enumerate().map(|(held, &m)| family.lines[held].rho(&scaled(m))).collect();
+            Fitted {
+                family: family.name,
+                multipliers: folds,
+                held_out: mean(&held_out),
+                prior: family.rho(&device.planner),
+                overall: best_over(&all),
+            }
+        })
+        .collect()
+}
+
 /// Spearman's ρ of `a` against `b`: average ranks over ties, Pearson over
 /// the ranks; `None` where either side holds no variance to correlate.
 pub fn spearman(a: &[f64], b: &[f64]) -> Option<f64> {

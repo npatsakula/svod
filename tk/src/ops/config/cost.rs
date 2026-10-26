@@ -16,6 +16,7 @@ use crate::kernels::nearest::NearestCfg;
 use super::attention::AttentionProblem;
 use super::gemm::GemmProblem;
 use super::nearest::NearestProblem;
+use super::search::{Rejected, Tiled};
 
 /// How a problem runs under one config: `blocks` blocks of `waves` waves,
 /// each holding `smem` bytes of shared memory and `regs` registers a lane
@@ -325,6 +326,28 @@ pub(crate) struct Claim {
     pub sections: [Spread; 2],
 }
 
+/// A kernel family behind one interface: the configs it spans on a target
+/// and the resources each claims — everything the planner needs of a family
+/// beyond its configs' own tiles ([`Tiled`]), so that a family cannot price
+/// what the vocabulary does not carry: poisoning is closed at the type
+/// level, and a new family is an impl, not a cost-model change. Unstable:
+/// publication (external families) is the design's phase F. The planner's
+/// per-family caches and the op layer's dispatch stay concrete at the
+/// boundary — an op builds tensors around its family's types either way —
+/// and the norms rank nothing (a fixed candidate list the tuner times).
+pub(crate) trait Family {
+    /// The configs the family ranks.
+    type Cfg: Tiled;
+
+    /// Every config the family spans on `target`: its lattice, the search
+    /// bounds' shape.
+    fn lattice(&self, target: &Target) -> Vec<Self::Cfg>;
+
+    /// One config's [resources](Claim) on the planner's device: the checks
+    /// first — why it is left out — then what it uses.
+    fn claim(&self, planner: &Planner, cfg: &Self::Cfg) -> Result<Claim, Rejected>;
+}
+
 /// What the op layer plans with on one device: its target, what its
 /// primitives cost, and the problems ranked for it so far. An op plans its
 /// shape again at every call, and laying out the lattice's feasible configs
@@ -453,6 +476,14 @@ impl Planner {
         let (target, o) = (&self.device.target, self.device.target.occupancy);
         let per_simd = o.waves.min(o.file / regs.max(1)) as usize;
         (target.smem_bytes / smem.max(1)).min(o.simds as usize * per_simd / waves.max(1))
+    }
+
+    /// What `cfg` costs the planner's device — ns of SM time — and a
+    /// lane's registers by the layout count: the one admission path, a
+    /// [`Family`]'s claim priced; `None` with why the config is left out.
+    pub(crate) fn admit<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Result<(f64, u32), Rejected> {
+        let claim = problem.claim(self, cfg)?;
+        Ok((self.price(&claim), claim.regs))
     }
 
     /// The SM time of `claim`'s run — the only place a claim becomes time:

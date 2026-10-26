@@ -7,12 +7,12 @@
 
 use std::sync::Arc;
 
-use crate::atoms::Fill;
+use crate::atoms::{Fill, Target};
 use crate::kernels::conv::{ConvCfg, ConvGeom};
 use crate::kernels::gemm::GemmCfg;
 
 use super::cost::ELEM;
-use super::cost::{Claim, Planner, cached};
+use super::cost::{Claim, Family, Planner, cached};
 use super::gemm::{GemmProblem, gemm_lattice};
 use super::search::{Rejected, sorted, spread};
 
@@ -74,6 +74,31 @@ impl ConvProblem {
         .into_iter()
         .map(|gemm| ConvCfg { gemm, split: 1 })
         .collect()
+    }
+}
+
+impl Family for ConvProblem {
+    type Cfg = GemmCfg;
+
+    /// The gemm lattice's configs a convolution body can run: a step that
+    /// stays within one tap and tiles that pad `m × n` by at most an
+    /// eighth; on the cp.async path a step at least two matrix-core depths,
+    /// else the conv takes the graph.
+    fn lattice(&self, target: &Target) -> Vec<GemmCfg> {
+        let depth = match (target.fill, target.geometry()) {
+            (Fill::CpAsync, Some(atom)) => 2 * atom.k as usize,
+            _ => 0,
+        };
+        gemm_lattice(target)
+            .into_iter()
+            .filter(|c| {
+                self.geom.cin.is_multiple_of(c.tile[2]) && c.tile[2] >= depth && self.gemm.padding(c) <= CONV_PADDING
+            })
+            .collect()
+    }
+
+    fn claim(&self, planner: &Planner, cfg: &GemmCfg) -> Result<Claim, Rejected> {
+        ConvProblem::claim(self, planner, cfg)
     }
 }
 

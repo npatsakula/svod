@@ -9,7 +9,7 @@ use crate::ir::{Axis, Shape};
 use crate::kernels::attention::{FaCfg, WARP_ROWS};
 use crate::layouts::{Swizzle, WarpGrid, chunked, fills_in_chunks};
 
-use super::cost::{Claim, ELEM, Kind, Ops, PAIR_OPS, Planner, STEP, Spread, Steps, Stream, cached};
+use super::cost::{Claim, ELEM, Family, Kind, Ops, PAIR_OPS, Planner, STEP, Spread, Steps, Stream, cached};
 use super::search::{Rejected, sorted};
 
 impl FaCfg {
@@ -151,8 +151,7 @@ impl AttentionProblem {
     /// owning more rows reads each fragment for all of them: the fragment
     /// reads are per wave, so they divide by the rows per warp.
     pub fn admit(&self, planner: &Planner, cfg: &FaCfg) -> Result<(f64, u32), Rejected> {
-        let claim = self.claim(planner, cfg)?;
-        Ok((planner.price(&claim), claim.regs))
+        planner.admit(self, cfg)
     }
 
     /// The config's [claim](super::cost::Claim): its checks run first — a
@@ -334,6 +333,18 @@ impl AttentionProblem {
             && one.key_warps == 1
             && self.admit(planner, wide).is_ok()
             && resident(wide).zip(resident(one)).is_some_and(|(w, o)| w >= o)
+    }
+}
+
+impl Family for AttentionProblem {
+    type Cfg = FaCfg;
+
+    fn lattice(&self, target: &Target) -> Vec<FaCfg> {
+        AttentionProblem::lattice(self, target)
+    }
+
+    fn claim(&self, planner: &Planner, cfg: &FaCfg) -> Result<Claim, Rejected> {
+        AttentionProblem::claim(self, planner, cfg)
     }
 }
 

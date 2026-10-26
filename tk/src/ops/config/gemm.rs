@@ -9,7 +9,7 @@ use crate::ir::{Axis, Shape};
 use crate::kernels::gemm::{GROUP_ROWS, GemmCfg, KSLICE};
 use crate::layouts::{Issue, Swizzle, WarpGrid, chunked, fills_in_chunks};
 
-use super::cost::{Claim, ELEM, Kind, Ops, Planner, STEP, Spread, Steps, Stream, cached};
+use super::cost::{Claim, ELEM, Family, Kind, Ops, Planner, STEP, Spread, Steps, Stream, cached};
 use super::search::{Rejected, sorted, spread};
 
 impl GemmCfg {
@@ -209,8 +209,7 @@ impl GemmProblem {
     /// only CDNA runs them ([`Target::crews`]) and no CDNA card has measured
     /// one; the tuner times them beside the rest.
     pub fn admit(&self, planner: &Planner, cfg: &GemmCfg) -> Result<(f64, u32), Rejected> {
-        let claim = self.claim(planner, cfg)?;
-        Ok((planner.price(&claim), claim.regs))
+        planner.admit(self, cfg)
     }
 
     /// The config's [claim](super::cost::Claim): its checks run first — a
@@ -301,7 +300,7 @@ impl GemmProblem {
     /// the cost band holds: the shortlist keeps a tile's first clean one
     /// ([`shortlist`](super::search::shortlist)).
     pub(crate) fn ranked(&self, planner: &Planner) -> Vec<GemmCfg> {
-        let lattice = gemm_lattice(&planner.device.target);
+        let lattice = self.lattice(&planner.device.target);
         let count = lattice.len();
         let admitted: Vec<(f64, u32, GemmCfg)> = lattice
             .into_iter()
@@ -309,6 +308,18 @@ impl GemmProblem {
             .collect();
         let ranked = sorted(self, admitted, count);
         spread(ranked.into_iter().map(|(cost, _, c)| (cost, c)).collect(), |c| [c.tile[0], c.tile[1]])
+    }
+}
+
+impl Family for GemmProblem {
+    type Cfg = GemmCfg;
+
+    fn lattice(&self, target: &Target) -> Vec<GemmCfg> {
+        gemm_lattice(target)
+    }
+
+    fn claim(&self, planner: &Planner, cfg: &GemmCfg) -> Result<Claim, Rejected> {
+        GemmProblem::claim(self, planner, cfg)
     }
 }
 
