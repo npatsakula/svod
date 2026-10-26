@@ -19,7 +19,7 @@ use crate::kernels::conv::ConvCfg;
 use crate::kernels::gemm::{Epilogue, GemmCfg, GemmSpec, Scale, gemm};
 use crate::kernels::rows::NormCfg;
 use crate::ops::attention::{descend, split_ranked};
-use crate::ops::config::{self, Planner, Run, SHORTLIST, Tiled, gemm_cfg};
+use crate::ops::config::{self, Planner, SHORTLIST, Tiled, gemm_cfg};
 use crate::ops::shape::{self, Extent, Fallback, Plan, extent};
 use crate::ops::{self as tk, Act, Attn, Cache, Error, KeyMask, Linear, Qkv};
 use crate::tune::Compiled;
@@ -197,33 +197,43 @@ fn no_register_count_admits() {
     }
 }
 
-/// A run of `blocks` blocks on sm_86, `resident` of them sharing an SM's
-/// shared memory, each of `waves` waves and `atoms` independent
-/// accumulators a wave, `trips` trips of `[reads, work, fill, trip]` over a
-/// ring of `stages`.
-fn run(
-    blocks: usize,
-    resident: usize,
+/// The run that pays a trip's pipes ([`Planner::priced`]): a block of
+/// `waves` waves holding `atoms` independent accumulators a wave, `trips`
+/// trips over a ring `stages` deep.
+#[derive(Clone, Copy)]
+struct Grid {
     waves: usize,
     atoms: usize,
     trips: usize,
-    [reads, work, fill, trip]: [f64; 4],
     stages: usize,
-) -> Run {
-    Run {
-        blocks,
-        smem: sm86().smem_bytes / resident,
-        regs: 0,
-        waves,
-        atoms,
-        hide: 1.0,
-        trips,
-        reads,
-        work,
-        epilogue: 0.0,
-        fill,
-        trip,
-        stages,
+}
+
+/// The four pipes of [`Grid`]'s trips — reads, work, fill, epilogue — as ns
+/// of SM time: the counts whose pricing under the planner's own costs
+/// multiplies out to them, so the tests state their arithmetic in pipe ns
+/// as they always have.
+impl Planner {
+    fn priced(&self, blocks: usize, resident: usize, pipes: [f64; 4], g: Grid) -> f64 {
+        let [reads, work, fill, epilogue] = pipes;
+        let (costs, target) = (&self.device.costs, &self.device.target);
+        let unit = config::pair_op(&self.device) * costs.score;
+        self.price(&config::Claim {
+            blocks,
+            smem: target.smem_bytes / resident,
+            regs: 0,
+            waves: g.waves,
+            atoms: g.atoms,
+            steps: config::Steps::F16(work / costs.step),
+            trips: g.trips,
+            reads: reads / costs.smem_byte,
+            ops: config::Ops::of(config::Kind::Epilogue, epilogue / unit),
+            fill: config::Stream { bytes: fill / costs.global_byte, unique: 0.0, shared: 0.0 },
+            stores: 0.0,
+            ring: g.stages,
+            unroll: false,
+            waits: 0.0,
+            sections: [config::Spread::default(); 2],
+        })
     }
 }
 
@@ -232,18 +242,27 @@ fn run(
 /// filling the SMs `rounds` times over, each holding `1/actual` of an SM's
 /// shared memory (at most twelve resident: sm_86's 48 waves over four).
 fn pipelined(costs: Costs, [rounds, trips, actual, waves, stages]: [usize; 5], work: f64) -> f64 {
+    // A flat chain (the lone step is the step's own cost) and no trip
+    // overhead: the work alone.
+    let costs = Costs { step_lone: costs.step, trip: 0.0, trip_rolled: 0.0, trip_one: 0.0, ..costs };
     let planner = planned(Device { target: sm86(), costs });
-    planner.pipelined(run(rounds * actual * planner.sms(), actual, waves, 1, trips, [0.0, work, 0.0, 0.0], stages))
+    planner.priced(
+        rounds * actual * planner.sms(),
+        actual,
+        [0.0, work, 0.0, 0.0],
+        Grid { waves, atoms: 1, trips, stages },
+    )
 }
 
 /// The busiest SM issues `⌈blocks / sms⌉` blocks' work, not whole rounds of
 /// what it holds: nine blocks an SM over rounds of four cost nine blocks.
 #[test]
 fn an_sm_issues_its_share_of_blocks() {
-    let flat = Costs { latency: 0.0, ..costs() };
+    let flat = Costs { latency: 0.0, step_lone: costs().step, trip: 0.0, ..costs() };
     let planner = planned(Device { target: sm86(), costs: flat });
     let sms = planner.sms();
-    let cost = |blocks| planner.pipelined(run(blocks, 4, 4, 1, 1, [0.0, 100.0, 0.0, 0.0], 2));
+    let cost =
+        |blocks| planner.priced(blocks, 4, [0.0, 100.0, 0.0, 0.0], Grid { waves: 4, atoms: 1, trips: 1, stages: 2 });
     assert_eq!(cost(9 * sms), 900.0);
     assert_eq!(cost(9 * sms + 1), 1000.0);
 }
@@ -282,9 +301,18 @@ fn a_one_slot_ring_is_charged_its_own_trip(target: Target, bk: usize, cheap_wins
 #[test_case(1; "one block an SM")]
 #[test_case(4; "four")]
 fn a_trip_overhead_is_paid_by_every_block_trip(resident: usize) {
-    let flat = Costs { latency: 0.0, ..costs() };
+    let flat = Costs { latency: 0.0, step_lone: costs().step, ..costs() };
     let planner = planned(Device { target: sm86(), costs: flat });
-    let cost = |trip| planner.pipelined(run(resident * planner.sms(), resident, 4, 1, 1, [0.0, 100.0, 0.0, trip], 2));
+    let cost = |trip| {
+        let costs = Costs { trip, ..planner.device.costs };
+        let planner = planned(Device { target: sm86(), costs });
+        planner.priced(
+            resident * planner.sms(),
+            resident,
+            [0.0, 100.0, 0.0, 0.0],
+            Grid { waves: 4, atoms: 1, trips: 1, stages: 2 },
+        )
+    };
     assert_eq!(cost(40.0) - cost(0.0), resident as f64 * 40.0);
 }
 
@@ -296,9 +324,14 @@ fn a_trip_overhead_is_paid_by_every_block_trip(resident: usize) {
 #[test_case(400.0, 4 => 4.0 * 140.0; "four hide them under the full trip")]
 #[test_case(0.0, 1 => 140.0; "unmeasured")]
 fn a_trip_overhead_shrinks_with_the_blocks_at_once(trip_lone: f64, resident: usize) -> f64 {
-    let costs = Costs { latency: 0.0, step_lone: costs().step, trip_lone, ..costs() };
+    let costs = Costs { latency: 0.0, step_lone: costs().step, trip: 40.0, trip_lone, ..costs() };
     let planner = planned(Device { target: sm86(), costs });
-    planner.pipelined(run(resident * planner.sms(), resident, 4, 1, 1, [0.0, 100.0, 0.0, 40.0], 2))
+    planner.priced(
+        resident * planner.sms(),
+        resident,
+        [0.0, 100.0, 0.0, 0.0],
+        Grid { waves: 4, atoms: 1, trips: 1, stages: 2 },
+    )
 }
 
 /// A one-slot `cp.async` ring copies, waits and then computes: a block
@@ -308,13 +341,22 @@ fn a_trip_overhead_shrinks_with_the_blocks_at_once(trip_lone: f64, resident: usi
 #[test]
 fn a_one_slot_cp_async_block_fills_alone() {
     let cost = |target: Target, stages: usize, resident: usize| {
-        let flat = Costs { latency: 0.0, latency_one: 0.0, step_lone: costs().step, ..costs() };
-        let planner = planned(Device { target: target.clone(), costs: flat });
-        let run = Run {
-            smem: target.smem_bytes / resident,
-            ..run(resident * planner.sms(), resident, 16, 1, 1, [0.0, 100.0, 60.0, 0.0], stages)
+        let flat = Costs {
+            latency: 0.0,
+            latency_one: 0.0,
+            step_lone: costs().step,
+            trip: 0.0,
+            trip_rolled: 0.0,
+            trip_one: 0.0,
+            ..costs()
         };
-        planner.pipelined(run)
+        let planner = planned(Device { target: target.clone(), costs: flat });
+        planner.priced(
+            resident * planner.sms(),
+            resident,
+            [0.0, 100.0, 60.0, 0.0],
+            Grid { waves: 16, atoms: 1, trips: 1, stages },
+        )
     };
     assert_eq!(cost(sm86(), 1, 1), 160.0);
     assert_eq!(cost(sm86(), 2, 1), 115.0);
@@ -330,17 +372,16 @@ fn a_one_slot_cp_async_block_fills_alone() {
 /// has none measured) hides nothing to pay for.
 #[test]
 fn a_lone_wave_pays_its_chain() {
-    let flat = |step_lone| Costs { latency: 0.0, step: 5.0, step_lone, ..costs() };
+    let flat = |step_lone| Costs { latency: 0.0, step: 5.0, step_lone, trip: 0.0, ..costs() };
     let waves = sm86().occupancy.simds as usize;
     let cost = |step_lone, resident, work, epilogue| {
-        let costs = flat(step_lone);
-        let hide = costs.hide();
-        let planner = planned(Device { target: sm86(), costs });
-        planner.pipelined(Run {
-            hide,
-            epilogue,
-            ..run(resident * planner.sms(), resident, waves, 1, 1, [0.0, work, 0.0, 0.0], 2)
-        })
+        let planner = planned(Device { target: sm86(), costs: flat(step_lone) });
+        planner.priced(
+            resident * planner.sms(),
+            resident,
+            [0.0, work, 0.0, epilogue],
+            Grid { waves, atoms: 1, trips: 1, stages: 2 },
+        )
     };
     // The chain's ratio on the steps alone; the epilogue rides beside them.
     assert_eq!(cost(15.0, 1, 100.0, 0.0), 300.0);
@@ -357,12 +398,11 @@ fn a_lone_wave_pays_its_chain() {
 /// pay it.
 #[test]
 fn independent_accumulators_hide_the_chain() {
-    let flat = Costs { latency: 0.0, step: 5.0, step_lone: 15.0, ..costs() };
+    let flat = Costs { latency: 0.0, step: 5.0, step_lone: 15.0, trip: 0.0, ..costs() };
     let planner = planned(Device { target: sm86(), costs: flat });
     let waves = sm86().occupancy.simds as usize;
     let cost = |atoms, work, reads| {
-        planner
-            .pipelined(Run { hide: flat.hide(), ..run(planner.sms(), 1, waves, atoms, 1, [reads, work, 0.0, 0.0], 2) })
+        planner.priced(planner.sms(), 1, [reads, work, 0.0, 0.0], Grid { waves, atoms, trips: 1, stages: 2 })
     };
     assert_eq!(cost(1, 100.0, 0.0), 300.0);
     assert_eq!(cost(3, 100.0, 0.0), 100.0);
@@ -377,11 +417,16 @@ fn independent_accumulators_hide_the_chain() {
 /// does, four times over.
 #[test]
 fn pipes_overlap_across_the_waves_a_simd_holds() {
-    let flat = Costs { latency: 0.0, step_lone: costs().step, ..costs() };
+    let flat = Costs { latency: 0.0, step_lone: costs().step, trip: 0.0, ..costs() };
     let planner = planned(Device { target: sm86(), costs: flat });
     let simds = sm86().occupancy.simds as usize;
     let cost = |resident: usize, waves: usize| {
-        planner.pipelined(run(resident * planner.sms(), resident, waves, 1, 1, [40.0, 100.0, 60.0, 0.0], 2))
+        planner.priced(
+            resident * planner.sms(),
+            resident,
+            [40.0, 100.0, 60.0, 0.0],
+            Grid { waves, atoms: 1, trips: 1, stages: 2 },
+        )
     };
     assert_eq!(cost(1, simds), 200.0);
     assert_eq!(cost(1, 4 * simds), 125.0);
@@ -647,10 +692,19 @@ fn a_ring_without_prefetch_waits_the_latency(stages: usize) {
 /// what a two-slot ring's does, whatever `latency_one` says.
 #[test]
 fn a_register_staged_slot_waits_what_two_slots_do() {
-    let planner = planned(Device { target: rdna3(), costs: Costs { latency_one: 10.0 * costs().latency, ..costs() } });
-    let cost = |stages| planner.pipelined(run(planner.sms(), 1, 4, 1, 1, [0.0, 0.0, 0.0, 0.0], stages));
+    let costs = Costs {
+        latency_one: 10.0 * costs().latency,
+        trip: 0.0,
+        trip_rolled: 0.0,
+        trip_one: 0.0,
+        step_lone: costs().step,
+        ..costs()
+    };
+    let planner = planned(Device { target: rdna3(), costs });
+    let cost =
+        |stages| planner.priced(planner.sms(), 1, [0.0, 0.0, 0.0, 0.0], Grid { waves: 4, atoms: 1, trips: 1, stages });
     assert_eq!(cost(1), cost(2));
-    assert_eq!(cost(1), costs().latency);
+    assert_eq!(cost(1), costs.latency);
 }
 
 /// A ranked config of the shortlist tests: its position, and the tile it

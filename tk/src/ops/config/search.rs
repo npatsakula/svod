@@ -56,7 +56,7 @@ pub enum Rejected {
     TopK { k: usize, most: usize },
 }
 
-/// A ranking: its configs with their costs ([`Planner::pipelined`] ns of SM
+/// A ranking: its configs with their costs ([`Planner::price`] ns of SM
 /// time) and registers by the layout count, cheapest first (then fewer
 /// registers) and [pruned](prune), logged under [`crate::ops::PLAN`] with how
 /// many of the `spanned` configs it left out.

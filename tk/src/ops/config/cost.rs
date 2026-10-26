@@ -18,40 +18,6 @@ use super::gemm::GemmProblem;
 use super::nearest::NearestProblem;
 use super::search::{Rejected, Tiled};
 
-/// How a problem runs under one config: `blocks` blocks of `waves` waves,
-/// each holding `smem` bytes of shared memory and `regs` registers a lane
-/// by the layout count, and running `trips` trips through a ring `stages`
-/// deep. A trip's issue goes down three pipes, in ns of SM time each, plus
-/// a fixed overhead `trip` (its barrier and ring bubble, which the other
-/// blocks an SM holds work through).
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Run {
-    pub blocks: usize,
-    pub smem: usize,
-    pub regs: u32,
-    pub waves: usize,
-    /// The independent matrix-core accumulators a wave holds between
-    /// dependent steps: they hide a chain's latency as other waves do.
-    pub atoms: usize,
-    /// The waves a SIMD needs to hide a dependent chain of this run's
-    /// steps: the lone-wave inflation of its work, the step probes' ratio
-    /// of the dtype the run multiplies (the 8-bit chain's own, where its
-    /// lone step was measured).
-    pub hide: f64,
-    pub trips: usize,
-    /// A trip's operand fragments read from shared memory.
-    pub reads: f64,
-    /// A trip's matrix-core steps (the chain the lone waves inflate)
-    /// and its vector work beside them (the epilogue, not a chain).
-    pub work: f64,
-    /// A trip's vector work beside the steps: the epilogue.
-    pub epilogue: f64,
-    /// A trip's fill, priced by where its bytes come from.
-    pub fill: f64,
-    pub trip: f64,
-    pub stages: usize,
-}
-
 /// Model: the elements of one 16×16×16 matrix-core step, [`Costs::step`]'s
 /// unit.
 pub(crate) const STEP: usize = 16 * 16 * 16;
@@ -413,11 +379,18 @@ impl Planner {
         self.sms
     }
 
-    /// The SM time of `run`. The busiest SM issues the work of
-    /// `⌈blocks / sms⌉` blocks, each taken up as another ends (measured on
-    /// sm_86: a 64×64 GEMM's time steps with that count, not with whole
-    /// rounds of resident blocks), every block-trip paying a trip's fixed
-    /// overhead at the blocks the SM runs at once ([`crate::atoms::Costs::trip_at`]: the
+    /// The SM time of `claim`'s run — the only place a claim becomes time:
+    /// the steps at their core's probe with the chain ratio that hides
+    /// them, the fragment reads at the shared rate, the ops at [`pair_op`]'s
+    /// unit by kind, the fill through the cache ladder, the trip at its
+    /// ring's probe — pipelined over the waves a SIMD holds — and the waits
+    /// and the sections beside the run's trips.
+    ///
+    /// The pipelining: the busiest SM issues the work of `⌈blocks / sms⌉`
+    /// blocks, each taken up as another ends (measured on sm_86: a 64×64
+    /// GEMM's time steps with that count, not with whole rounds of resident
+    /// blocks), every block-trip paying a trip's fixed overhead at the
+    /// blocks the SM runs at once ([`crate::atoms::Costs::trip_at`]: the
     /// trip probes measure it per block-trip, alone and with the SM full).
     /// A trip's pipes (the fragment reads, the matrix-core steps, the fill)
     /// overlap across the waves a SIMD holds: the longest is paid whole, the
@@ -435,18 +408,45 @@ impl Planner {
     /// prefetches `stages - 1` trips ahead; a one-slot `cp.async` ring none,
     /// [`crate::atoms::Costs::latency_one`]) on top of its issue: measured on
     /// both, the latency adds rather than hides under the issue.
-    pub(crate) fn pipelined(&self, run: Run) -> f64 {
-        let Run { blocks, smem, regs, waves, atoms, hide, trips, reads, work, epilogue, fill, trip, stages } = run;
+    pub(crate) fn price(&self, claim: &Claim) -> f64 {
         let Device { target, costs } = &self.device;
+        let hide = match claim.steps {
+            // The 8-bit chain hides with its own lone ratio where its lone
+            // step was measured, not the 16-bit one: the chain's latency
+            // does not scale with its step's throughput.
+            Steps::I8(_) if costs.step_lone_i8 > 0.0 && costs.step_i8 > 0.0 => {
+                (costs.step_lone_i8 / costs.step_i8).max(1.0)
+            }
+            _ => costs.hide(),
+        };
+        let work = match claim.steps {
+            Steps::F16(n) => n * costs.step,
+            Steps::Group(n) => n * costs.step_group,
+            Steps::I8(n) => n * costs.step_i8,
+        };
+        let (reads, epilogue) =
+            (claim.reads * costs.smem_byte, claim.ops.fold(pair_op(&self.device), costs.score, &self.weights));
+        let fill = claim.fill.bytes
+            * self.fill_byte(
+                claim.fill.unique,
+                (claim.blocks * claim.trips) as f64 * claim.fill.bytes,
+                claim.fill.shared,
+            )
+            + claim.stores * costs.global_byte;
+        let trip = costs.trip(target.fill, claim.ring, claim.unroll);
+        // The run the claim describes: `blocks` blocks of `waves` waves,
+        // `trips` trips through a ring `stages` deep, a trip's issue down
+        // three pipes in ns of SM time each plus its fixed `trip` overhead.
+        let (blocks, waves, stages) = (claim.blocks, claim.waves, claim.ring);
         let (o, sms) = (target.occupancy, self.sms());
         // At least one: the compiled kernel, not the layout count, decides
         // whether a block runs.
-        let resident = self.resident(smem, regs, waves).max(1);
+        let resident = self.resident(claim.smem, claim.regs, waves).max(1);
         let per_sm = blocks.div_ceil(sms);
         let rounds = per_sm.div_ceil(resident);
         let hide = hide.max(1.0);
         let per_simd = |waves: usize| (waves as f64 / o.simds as f64).max(1.0);
-        let lone = |waves: usize| (hide / (per_simd(waves) * atoms.max(1) as f64)).max(1.0);
+        let lone = |waves: usize| (hide / (per_simd(waves) * claim.atoms.max(1) as f64)).max(1.0);
         let serial = stages <= 1 && target.fill == Fill::CpAsync;
         // `alone`: one block's pipes, its fill after the rest where serial.
         let body = |waves: usize, alone: bool| {
@@ -465,7 +465,13 @@ impl Planner {
             ..=1 if serial => costs.latency_one.max(costs.latency),
             s => costs.latency / s.saturating_sub(1).max(1) as f64,
         };
-        trips as f64 * (issue.max(rounds as f64 * wave) + rounds as f64 * wait)
+        let run = claim.trips as f64 * (issue.max(rounds as f64 * wave) + rounds as f64 * wait);
+        let section = |s: &Spread| {
+            let work = s.ops.fold(pair_op(&self.device), costs.score, &self.weights);
+            let bytes = s.bytes * costs.global_byte;
+            (s.rows * work.max(bytes) / self.sms() as f64).max(s.waits * costs.latency)
+        };
+        run + claim.waits * costs.latency + claim.sections.iter().map(section).sum::<f64>()
     }
 
     /// The blocks of `waves` waves an SM holds at once, each holding `smem`
@@ -484,57 +490,6 @@ impl Planner {
     pub(crate) fn admit<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Result<(f64, u32), Rejected> {
         let claim = problem.claim(self, cfg)?;
         Ok((self.price(&claim), claim.regs))
-    }
-
-    /// The SM time of `claim`'s run — the only place a claim becomes time:
-    /// the steps at their core's probe with the chain ratio that hides
-    /// them, the fragment reads at the shared rate, the ops at [`pair_op`]'s
-    /// unit by kind, the fill through the cache ladder, the trip at its
-    /// ring's probe — pipelined over the waves a SIMD holds ([`Run`]) — and
-    /// the waits and the sections beside the run's trips.
-    pub(crate) fn price(&self, claim: &Claim) -> f64 {
-        let Device { target, costs } = &self.device;
-        let hide = match claim.steps {
-            // The 8-bit chain hides with its own lone ratio where its lone
-            // step was measured, not the 16-bit one: the chain's latency
-            // does not scale with its step's throughput.
-            Steps::I8(_) if costs.step_lone_i8 > 0.0 && costs.step_i8 > 0.0 => {
-                (costs.step_lone_i8 / costs.step_i8).max(1.0)
-            }
-            _ => costs.hide(),
-        };
-        let work = match claim.steps {
-            Steps::F16(n) => n * costs.step,
-            Steps::Group(n) => n * costs.step_group,
-            Steps::I8(n) => n * costs.step_i8,
-        };
-        let run = Run {
-            blocks: claim.blocks,
-            smem: claim.smem,
-            regs: claim.regs,
-            waves: claim.waves,
-            atoms: claim.atoms,
-            hide,
-            trips: claim.trips,
-            reads: claim.reads * costs.smem_byte,
-            work,
-            epilogue: claim.ops.fold(pair_op(&self.device), costs.score, &self.weights),
-            fill: claim.fill.bytes
-                * self.fill_byte(
-                    claim.fill.unique,
-                    (claim.blocks * claim.trips) as f64 * claim.fill.bytes,
-                    claim.fill.shared,
-                )
-                + claim.stores * costs.global_byte,
-            trip: costs.trip(target.fill, claim.ring, claim.unroll),
-            stages: claim.ring,
-        };
-        let section = |s: &Spread| {
-            let work = s.ops.fold(pair_op(&self.device), costs.score, &self.weights);
-            let bytes = s.bytes * costs.global_byte;
-            (s.rows * work.max(bytes) / self.sms() as f64).max(s.waits * costs.latency)
-        };
-        self.pipelined(run) + claim.waits * costs.latency + claim.sections.iter().map(section).sum::<f64>()
     }
 
     /// What a byte of a fill costs when `fill` bytes stream `unique`

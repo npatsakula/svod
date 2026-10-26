@@ -7,7 +7,7 @@
 //! lowering runs and ranked in nanoseconds of SM time from the device's
 //! measured [`Costs`]: a round of resident blocks is bound by the SM's issue
 //! work or by one wave's own issue, plus the memory latency one pipeline
-//! stage ahead cannot hide ([`Planner::pipelined`]). The model orders block
+//! stage ahead cannot hide ([`Planner::price`]). The model orders block
 //! tiles well enough to lead with them ([`spread`]) and warp grids less well
 //! (on sm_86 the measured best sat as deep as the 92nd of 109 tiles before
 //! a trip's pipes overlapped across a SIMD's waves), which is why the
@@ -18,8 +18,7 @@
 //!
 //! By responsibility: `cost` the shared pricing core (the [`Claim`]
 //! vocabulary a family states a config's resources in, the one
-//! [`Planner::price`] that turns a claim into time, the [`Run`] it
-//! pipelines), `facts` the device's layer-0 description ([`Facts`]),
+//! [`Planner::price`] that turns a claim into time), `facts` the device's layer-0 description ([`Facts`]),
 //! `search` the machinery every family's ranking shares (bounds, the
 //! shortlist search, tile twins), and `gemm`, `attention`, `nearest`,
 //! `conv`, `norm` their families' configs, lattices and admission.
@@ -57,7 +56,7 @@ pub(crate) use self::search::{
 #[cfg(test)]
 pub(crate) use self::attention::DIAGONAL;
 #[cfg(test)]
-pub(crate) use self::cost::Run;
+pub(crate) use self::cost::{Kind, Ops, Spread, Steps, Stream};
 #[cfg(test)]
 pub(crate) use self::nearest::REGISTER_K;
 #[cfg(test)]
