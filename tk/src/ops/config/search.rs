@@ -200,10 +200,34 @@ pub(crate) fn spread<C: Tiled, K: Eq + Hash>(ranked: Vec<(f64, C)>, class: impl 
 }
 
 /// Search bound: the tiles the tune store measures per shape, their
-/// pipelines compiled in parallel ([`Search`]): most of the lattice, since timing a tile costs
-/// about 20 ms once the device's clock is up and the ranking cannot be
-/// trusted to put the best within a few (see the module docs).
-pub(crate) const SHORTLIST: usize = 64;
+/// pipelines compiled in parallel ([`Search`]): timing a tile costs about
+/// 20 ms once the device's clock is up and the ranking cannot be trusted
+/// to put the best within a few (see the module docs). 56, measured down
+/// from 64 (2026-10-27) by the winners the format-6 stores name: over
+/// every replayed choice line of the three cards' stores (162 lines — the
+/// phase-E fresh nearest stores, the local sm_86 store and the
+/// device-suite stores' gemm, attention and conv lines), the share whose
+/// measured winner's tile sits in the model's top N. At 56 that is 161 of
+/// 162 (99.4 %): every family and card whole — nearest (the expensive
+/// family, 16384² rows at depths 128–768) from 24 tiles on sm_86, gemm at
+/// 32, attention and conv at 16 — but one int8 line of gfx1151's six,
+/// whose winner sat at the 62nd tile. 48, tried first, holds only 95 %
+/// (five conv lines and a nearest line of sm_86's out at 49–54) and the
+/// battery refused it: the gelu GEMM's winner (704×2048×512, its tile at
+/// 54 — a warp grid the cheaper [2,2] form of the same tile hides from
+/// the tile count) fell out of the shortlist and the row read 4–5 % over
+/// four alternating tunes; at 56 the winner is timed again and picked by
+/// both (70.4–70.8 µs the base, 71.7–72.5 the tip, one tile — the runs'
+/// own noise). The rest of the battery at 48 was already same-or-better
+/// than 64 (every nearest, gemm, attention and rerank row on sm_86 and
+/// gfx1201, the conv classes within +1.9 %), and 56 sits between the two.
+/// The tuning wall-clock is unmoved on sm_86 at any of 48, 56 and 64
+/// (17.5–20.5 s at 16384² d128 k64 — the measurement discipline, the
+/// clock warm-up and the runs to a stable minimum, dominates the count)
+/// and 10–20 % less on gfx1201 (8.9–9.6 s at 48 against 11.5–11.6 at 64,
+/// whose clang compiles the shorter list does not pay), with 25–12 %
+/// fewer compiles in flight everywhere.
+pub(crate) const SHORTLIST: usize = 56;
 /// Search bound: the most tiles of a timing whose other pipelines are
 /// timed after it, among those within the tuner's contender band
 /// ([`crate::tune::CONTENDER`]) of the leader: a tile enters the shortlist
