@@ -2715,3 +2715,34 @@ fn a_queue_as_long_as_the_list_is_refused_by_the_kernel() {
     let cfg = NearestCfg { queue: Some(64), ..NearestCfg::new(32, 32, 2) };
     nearest::<F16>(&plain(64, 300, 64, Metric::NegDot, 64, cfg));
 }
+
+/// A dispatch long enough that a stamp the device lands off its compute reads
+/// far below its wall — the score-matrix kernel of the config a fresh Strix
+/// store picked for 256x1048576 d768 k64 (2026-10-28), its 270 ms dispatch
+/// stamped 1-3 us and the pick read 1.3 ms against a 25 ms runner-up. The
+/// kernel is dispatched profiled back to back (a first run after other
+/// in-flight work hides the lie), every run's stamps spanning most of its wall.
+#[test]
+fn a_long_dispatch_stamps_its_duration() {
+    let Some(planner) = super::device_planner() else { return };
+    let cfg = NearestCfg {
+        select: Some(SelectCfg { warps: 4, queue: 2, filter: true }),
+        ..NearestCfg::streamed(128, 128, 32, 2)
+    };
+    let spec = plain(256, 1 << 20, 768, Metric::NegDot, 64, cfg);
+    let prog = crate::ops::nearest::programs(&planner, DType::Float16, &spec).remove(0).0;
+    let pool = crate::tune::ScratchPool::default();
+    let (mut plan, vars) = crate::tune::scratch_plan(prog, &Lowering::new(&planner.device), &pool).expect("a plan");
+    let vars: Vec<(&str, i64)> = vars.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+    plan.execute_with_vars(&vars).expect("runs");
+    let _ = crate::tune::run(&plan).expect("a stamped drain of the untimed run");
+    for run in 0..3 {
+        let wall = std::time::Instant::now();
+        let span = crate::tune::run(&plan).expect("stamped");
+        let wall = wall.elapsed();
+        assert!(
+            span * 4 > wall,
+            "run {run}: the stamps span {span:?} of a {wall:?} dispatch — a stamp landed off the compute"
+        );
+    }
+}
