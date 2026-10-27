@@ -115,7 +115,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if claims {
-            for diffused in rank::claims(&svod_tk::atoms::Target::card("rtx3060").expect("a card")) {
+            let (diffed, statics) = rank::claims(&svod_tk::atoms::Target::card("rtx3060").expect("a card"));
+            for diffused in diffed {
                 println!("  {} ({} layout regs):", diffused.name, diffused.regs);
                 for (what, predicted, program, holds) in &diffused.rows {
                     println!(
@@ -124,6 +125,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         predicted,
                         program,
                         if *holds { "holds" } else { "outside ±15%" }
+                    );
+                }
+            }
+            for diffused in statics {
+                println!("  {} (the static decomposition):", diffused.name);
+                for (what, predicted, program, holds) in &diffused.rows {
+                    println!(
+                        "    {:<16} predicted {:>10.1}   program {:>10.1}   {}",
+                        what,
+                        predicted,
+                        program,
+                        if *holds { "holds" } else { "outside ±30%" }
                     );
                 }
             }

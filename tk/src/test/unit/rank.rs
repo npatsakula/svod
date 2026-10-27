@@ -207,7 +207,7 @@ fn the_op_layers_tuning_reads_the_same_line() {
 /// exact on every family's sample — the model counts what the program does.
 #[test]
 fn the_claimed_steps_and_smem_hold_their_programs() {
-    let diffed = rank::claims(&sm86());
+    let (diffed, _) = rank::claims(&sm86());
     assert!(diffed.len() >= 8, "{:?}", diffed.iter().map(|d| &d.name).collect::<Vec<_>>());
     for d in &diffed {
         let row = |what: &str| d.rows.iter().find(|(w, ..)| *w == what).copied().expect(what);
@@ -223,7 +223,7 @@ fn the_claimed_steps_and_smem_hold_their_programs() {
 /// forty tile operations an element, [128,256,64] at 0.7 % under.
 #[test]
 fn the_gemm_epilogue_claim_holds_its_program() {
-    for d in &rank::claims(&sm86()) {
+    for d in &rank::claims(&sm86()).0 {
         if !d.name.starts_with("gemm") {
             continue;
         }
@@ -241,7 +241,7 @@ fn the_gemm_epilogue_claim_holds_its_program() {
 /// average). Bounded, not pinned.
 #[test]
 fn the_claimed_fill_and_valu_are_bounded_not_pinned() {
-    for d in &rank::claims(&sm86()) {
+    for d in &rank::claims(&sm86()).0 {
         let (_, predicted, program, _) = d.rows.iter().find(|(w, ..)| *w == "fill bytes/trip").expect("the fill");
         let (predicted, program) = (*predicted, *program);
         assert!(
@@ -250,4 +250,83 @@ fn the_claimed_fill_and_valu_are_bounded_not_pinned() {
             d.name
         );
     }
+}
+
+/// The listing's static decomposition maps its program: over the configs
+/// the constants were measured on — register lists at every `k`, wider and
+/// deeper blocks, the pass form, queued lists — the counted parts hold the
+/// program's own listing adder (its VALU count less the same tile at
+/// `k = 1`, where no list runs) within ±30 % (the measured grid's worst is
+/// 27 %). The priced listing stays the fitted expectation; this pins the
+/// structure the parts claim (see `NearestProblem::listing_static`).
+#[test]
+fn the_listing_static_decomposition_maps_its_programs() {
+    use crate::build::F16;
+    use crate::kernels::nearest::{Floors, LaneQueue, Live, Metric, NearestCfg, NearestSpec, nearest};
+    let target = sm86();
+    let device = crate::atoms::Device { target: target.clone(), costs: crate::probe::GUESSED };
+    let lowering = crate::lower::Lowering::new(&device);
+    let problem = |k| crate::ops::config::NearestProblem {
+        n: 1 << 16,
+        m: 1 << 16,
+        d: 128,
+        dtype: ScalarDType::Float16,
+        metric: Metric::SquaredL2,
+        floors: Floors::default(),
+        groups: false,
+        k,
+    };
+    let lanes = |w, d, p| Some(LaneQueue { width: w, depth: d, passes: p });
+    let base = |bkv, lanes, queue| NearestCfg {
+        bq: 128,
+        bkv,
+        stages: 3,
+        unroll: false,
+        warp_rows: 16,
+        bk: None,
+        splits: 1,
+        queue,
+        select: None,
+        lanes,
+    };
+    let count = |k: usize, cfg: NearestCfg| {
+        let spec = NearestSpec {
+            n: 100,
+            m: 960,
+            d: 128,
+            metric: Metric::SquaredL2,
+            floors: Floors::default(),
+            groups: false,
+            k,
+            cfg,
+            live: Live::default(),
+        };
+        rank::counted(&crate::lower::standalone(nearest::<F16>(&spec), &lowering).ok()?.program).map(|c| c.valu)
+    };
+    let rows = [
+        (8, base(32, lanes(4, 2, false), None)),
+        (16, base(16, lanes(4, 2, false), None)),
+        (16, base(32, lanes(4, 2, false), None)),
+        (16, base(32, lanes(8, 2, false), None)),
+        (32, base(32, lanes(4, 2, false), None)),
+        (64, base(16, lanes(4, 2, false), None)),
+        (64, base(32, lanes(4, 2, false), None)),
+        (64, base(128, lanes(4, 2, false), None)),
+        (64, base(32, lanes(4, 4, false), None)),
+        (64, base(32, lanes(4, 2, true), None)),
+        (64, base(32, lanes(4, 2, false), Some(16))),
+        (64, base(32, lanes(4, 2, false), Some(32))),
+    ];
+    let mut worst = 0.0f64;
+    for (k, cfg) in rows {
+        let twin = NearestCfg { lanes: None, queue: None, select: None, ..cfg };
+        let Some(adder) = count(k, cfg).zip(count(1, twin)).map(|(whole, least)| whole - least) else {
+            panic!("{k} {cfg:?} does not lower");
+        };
+        let predicted = problem(k).listing_static(&cfg);
+        let off = (adder as f64 - predicted).abs() / predicted;
+        worst = worst.max(off);
+        assert!(off <= 0.30, "{k} {cfg:?}: the parts say {predicted}, the program {adder}");
+    }
+    eprintln!("worst deviation {worst:.2}");
 }

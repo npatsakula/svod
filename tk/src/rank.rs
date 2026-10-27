@@ -1167,7 +1167,7 @@ const HOLDS: f64 = 0.15;
 /// score elements (the claim's counts folded at the epilogue's unit), a
 /// GEMM's epilogue un-amortized over its trips, its tile operations an
 /// instruction a lane.
-pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
+pub fn claims(target: &crate::atoms::Target) -> (Vec<Diffed>, Vec<Diffed>) {
     use crate::build::{BF16, F16};
     use crate::kernels::attention::{AttnMask, AttnSpec, attention};
     use crate::kernels::gemm::{Epilogue, GemmSpec, gemm};
@@ -1209,6 +1209,9 @@ pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
             })
         };
     let mut out: Vec<(String, config::Claim, f64, usize, crate::ir::Program)> = vec![];
+    // The static decomposition rows (see the k64 list below): what the
+    // program's listing adder holds against the counted parts.
+    let mut statics: Vec<Diffed> = vec![];
     // GEMM: the leading tiles of a 4096³ plan, emitted small, a gelu
     // epilogue on the accumulator — the claim's own epilogue term, un-
     // amortized over the trips and in the static-code units a program's
@@ -1301,6 +1304,31 @@ pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
     if let Some(&cfg) = ranked.iter().find(|c| c.queue.is_none() && c.select.is_none()) {
         let claim = problem(64).claim(&planner, &cfg).expect("ranked");
         let valu = claim.ops.fold(config::pair_op(&device), 1.0, &config::Weights::same());
+        // The listing's static decomposition beside the expected-ops row:
+        // the program's listing adder (its count less the same tile's at
+        // `k = 1`, where no list runs) against the parts
+        // [`NearestProblem::listing_static`] counts, within ±30 % — the
+        // guarded bodies, the merge network's stages, the queues' sort.
+        let twin = crate::kernels::nearest::NearestCfg { lanes: None, queue: None, select: None, ..cfg };
+        let listing = |prog: crate::ir::Program| {
+            counted(&crate::lower::standalone(prog, &lowering).ok()?.program).map(|c| c.valu as f64)
+        };
+        if let Some(program) = listing(nearest::<F16>(&spec(cfg, 64)))
+            .zip(listing(nearest::<F16>(&spec(twin, 1))))
+            .map(|(whole, least)| whole - least)
+        {
+            let predicted = problem(64).listing_static(&cfg);
+            statics.push(Diffed {
+                name: format!("nearest k64 list {}x{}", cfg.bq, cfg.bkv),
+                regs: 0,
+                rows: vec![(
+                    "listing static",
+                    predicted,
+                    program,
+                    (program - predicted).abs() <= HOLDS_STATIC * predicted.max(1.0),
+                )],
+            });
+        }
         out.push((
             format!("nearest k64 list {}x{}", cfg.bq, cfg.bkv),
             claim,
@@ -1325,7 +1353,14 @@ pub fn claims(target: &crate::atoms::Target) -> Vec<Diffed> {
             nearest::<F16>(&split_spec),
         ));
     }
-    out.into_iter()
+    let diffed = out
+        .into_iter()
         .filter_map(|(name, claim, gelu_ops, warps, prog)| diff(name, &claim, gelu_ops, warps, prog))
-        .collect()
+        .collect();
+    (diffed, statics)
 }
+
+/// How far a program's static listing adder may sit from the parts the
+/// decomposition counts: the grid the constants were measured on holds
+/// within 27 %, the diff's own sample within 7 %.
+const HOLDS_STATIC: f64 = 0.30;

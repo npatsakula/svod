@@ -187,6 +187,29 @@ const ROUND_ELEM: f64 = 3.0;
 const PUSH_ELEM: f64 = 1.3;
 /// Model: a merge's work a row's slot a stage, its lanes sharing it.
 const LIST_SLOT: f64 = 1.0;
+
+/// Model (static): the listing's guarded bodies a deal, in instructions a
+/// warp's code holds — the round form's per-deal slope of the emitted
+/// program's VALU count (measured 2026-10-27 by [`crate::rank::counted`]
+/// over emitted programs at bq 128, 16 rows a warp, rolled rings on
+/// sm_86, differencing `bkv`, `k`, the queue depth and a queued list out;
+/// see [`NearestProblem::listing_static`]).
+const ROUND_DEAL_I: f64 = 46.0;
+/// Model (static): the pass form's bodies a deal (it carries each deal's
+/// vote and branch the round form keeps in its loop).
+const PASS_DEAL_I: f64 = 60.0;
+/// Model (static): the list's merge network, an instruction a slot a stage.
+const LIST_STAGE_I: f64 = 12.0;
+/// Model (static): the lanes' queues' sort, an instruction a unit of
+/// `q·log2(q)·(log2(q)+1)/2` over the `q` a lane queue holds beside its
+/// row's list.
+const QUEUE_STAGE_I: f64 = 22.0;
+/// Model (static): a queued list's flush into the outputs, an instruction
+/// a slot of the queue held in registers.
+const FLUSH_SLOT_I: f64 = 175.0;
+/// Model (static): the listing's fixed code a warp: the state, the `k`-th,
+/// the pending test, the round's fixed body.
+const LISTING_FIXED_I: f64 = 450.0;
 /// Search bound: the scores a lane queues of a row before the warp merges
 /// the queues into the lists.
 const LANE_DEPTHS: [usize; 2] = [2, 4];
@@ -574,6 +597,44 @@ impl NearestProblem {
             ops = ops.add(Kind::Merge, (self.offers() / ((held - queued) * QUEUE_FILLED) + 1.0) * flush);
         }
         ops
+    }
+
+    /// The listing's static program, in instructions a warp's code holds
+    /// under `cfg` (a list of `k > 1` in registers, its lane queues set):
+    /// the guarded bodies each deal (the round form's, or the pass form's
+    /// dearer ones), the list's merge network a slot a stage
+    /// ([`LIST_STAGE_I`]), the queues' sort ([`QUEUE_STAGE_I`]), a queued
+    /// list's flush a slot ([`FLUSH_SLOT_I`]), and the fixed state work
+    /// ([`LISTING_FIXED_I`]). What the claim diff holds a program to: the
+    /// parts sum to every register list of the measured grid within 27 %
+    /// and to the diff's own k64 sample within 7 %.
+    ///
+    /// Priced they are not, and the measurement that says so: the executed
+    /// work [`Self::listing`] gates is per *element* (a body's instructions
+    /// are mostly lane-local plumbing — the state, the `k`-th, the index —
+    /// beside its elementwise chain over the deal's columns), and pricing
+    /// the counted weights was measured against the phase-E fresh stores —
+    /// the list network's slot a stage at the merge's unit
+    /// ([`LIST_SLOT`] ×8) keeps every stored winner in the admit band
+    /// (worst 1.6× of the cheapest, the 2.5× band aside) but degrades the
+    /// int8 order monotonically, gfx1201 ρ 0.409 → 0.358 → 0.275 → 0.190 at
+    /// ×1, 2, 4, 8, and the deal terms dearer still is phase E's refuted
+    /// recount (a 4.3× starved winner). The decomposition pins the
+    /// structure — the stage laws [`Self::listing`] already prices — and
+    /// the fitted units stand as the calibration of issue efficiency they
+    /// are declared to be.
+    pub(crate) fn listing_static(&self, cfg: &NearestCfg) -> f64 {
+        let LaneQueue { width, depth, passes } = cfg.lane_queue();
+        let deals = (cfg.bkv / width) as f64;
+        let held = cfg.list_slots(self.k) as f64;
+        let queued = (width * depth) as f64;
+        let stages = |slots: f64| slots * (slots.log2() + 1.0);
+        let sort = queued * queued.log2() * (queued.log2() + 1.0) / 2.0;
+        (if passes { PASS_DEAL_I } else { ROUND_DEAL_I }) * deals
+            + LIST_STAGE_I * stages(held)
+            + QUEUE_STAGE_I * sort
+            + cfg.queue.map_or(0.0, |q| FLUSH_SLOT_I * q as f64)
+            + LISTING_FIXED_I
     }
 
     /// The scores a row offers its list over the candidates in random order:
