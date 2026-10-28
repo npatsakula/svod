@@ -65,10 +65,13 @@ pub fn load_zero(access: &Arc<UOp>) -> Arc<UOp> {
 }
 
 pub fn store_at(access: &Arc<UOp>, vals: Vec<Arc<UOp>>) -> Arc<UOp> {
+    access.store(store_at_value(vals))
+}
+
+/// The stored value of `vals`: the one, or their stack.
+pub fn store_at_value(vals: Vec<Arc<UOp>>) -> Arc<UOp> {
     let w = vals.len();
-    let value =
-        if w == 1 { vals.into_iter().next().expect("one value") } else { UOp::stack(vals.into_iter().collect()) };
-    access.store(value)
+    if w == 1 { vals.into_iter().next().expect("one value") } else { UOp::stack(vals.into_iter().collect()) }
 }
 
 /// Element `j` of a `w`-wide vector value (an `i32` constant-position INDEX).

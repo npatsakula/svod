@@ -603,6 +603,9 @@ impl<'a> Emit<'a> {
     /// this consumer; a slot filled any other way (a lane move, a select, a
     /// re-store) keeps the loads, and SLP stays the backstop under them.
     fn stacked(&mut self, v: ValId, j: u32, w: u32) -> Arc<UOp> {
+        if w == 1 {
+            return self.reg_load(v, j);
+        }
         /// The lane each slot of a fold reads: one shared source and its index.
         type Lanes = Vec<(Arc<UOp>, u32)>;
         let buf = self.reg_buf(v);

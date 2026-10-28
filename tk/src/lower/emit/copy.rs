@@ -200,15 +200,15 @@ impl Emit<'_> {
         for (j, w) in runs {
             let c = self.coord(&l, j);
             let (off, gate) = self.address(&d, &c);
-            let vals = self.reg_loads(src, j, w);
+            let val = self.stacked(src, j, w);
             match gate {
                 Some(gate) => {
                     let tag = self.next_tag();
                     let if_ = self.push(UOp::if_(gate, smallvec![]).rtag(Some(smallvec![tag as usize])));
-                    self.mem_store(&d.buf, &off, vals);
+                    self.mem_store_wide(&d.buf, &off, w, val);
                     self.push(UOp::endif(if_));
                 }
-                None => self.mem_store(&d.buf, &off, vals),
+                None => self.mem_store_wide(&d.buf, &off, w, val),
             }
         }
         Ok(())
@@ -390,8 +390,8 @@ impl Emit<'_> {
         for (j, w) in self.runs(&l, d) {
             let c = self.coord(&l, j);
             let (off, _) = self.address(d, &c);
-            let vals = self.reg_loads(src, j, w);
-            self.mem_store(&d.buf, &off, vals);
+            let val = self.stacked(src, j, w);
+            self.mem_store_wide(&d.buf, &off, w, val);
         }
         Ok(())
     }

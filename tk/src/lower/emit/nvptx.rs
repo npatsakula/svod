@@ -194,7 +194,7 @@ impl Emit<'_> {
             let at = add(&mul(&group_col, &c32((n_atom * rn) as i64)), &c32((j * n_atom) as i64));
             let at = self.hoist(at);
             let b_op = gather(describe(self, b, at, b_t)?);
-            let c = UOp::stack(self.reg_loads(acc, (j * rc) as u32, rc as u32).into_iter().collect());
+            let c = self.stacked(acc, (j * rc) as u32, rc as u32);
             let d = UOp::wmma(a_op.clone(), b_op, c, meta.clone());
             let vals = (0..rc).map(|p| elem(&d, p, rc)).collect();
             self.reg_store(dst, (j * rc) as u32, vals);
