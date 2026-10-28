@@ -25,7 +25,8 @@
 //! Buffers are stored in a separate map (`BUFFERS`) indexed by UOp ID.
 //! This is a lookup index for `collect_input_buffers()` during schedule creation.
 //! - Key is UOp ID (unique per buffer via the `ParamArg.slot` unique counter)
-//! - Value is `Arc<Buffer>` (strong ref — kept alive while the BUFFER UOp lives)
+//! - Value is a `BufferSlot` holding the `Arc<Buffer>` (strong ref — kept
+//!   alive while the BUFFER UOp lives, released as soon as it dies)
 //! - Entries expire automatically when the BUFFER UOp is dropped, via
 //!   `svod_ir::uop::set_uop_drop_hook` (installed on first map access)
 //!
@@ -97,22 +98,47 @@ static TENSORS: OnceLock<PapayaMap<u64, Weak<TensorEntry>>> = OnceLock::new();
 // Lookup index for collect_input_buffers() during schedule creation.
 // Buffer UOp IDs are unique (Op::Unique monotonic counter), so entries never
 // collide across tests. Stale entries cleaned via gc_dead_refs().
-static BUFFERS: OnceLock<PapayaMap<u64, Arc<Buffer>>> = OnceLock::new();
+static BUFFERS: OnceLock<PapayaMap<u64, BufferSlot>> = OnceLock::new();
+
+/// A `BUFFERS` value. papaya drops a removed value only once the removing
+/// thread has retired a full batch (32+) of them, which may never come, and
+/// the buffer may be hundreds of MiB of device memory. Removal therefore
+/// empties the slot; only the empty slot waits for the collector. A replaced
+/// slot stays full: a reader that loaded it under its guard must see a buffer.
+struct BufferSlot(parking_lot::Mutex<Option<Arc<Buffer>>>);
+
+impl BufferSlot {
+    fn new(buffer: Arc<Buffer>) -> Self {
+        Self(parking_lot::Mutex::new(Some(buffer)))
+    }
+
+    fn get(&self) -> Option<Arc<Buffer>> {
+        self.0.lock().clone()
+    }
+}
+
+fn remove_slot(map: &PapayaMap<u64, BufferSlot>, uop_id: u64) {
+    let guard = map.guard();
+    let buffer = map.remove(&uop_id, &guard).and_then(|slot| slot.0.lock().take());
+    // Released outside the lock and the guard: freeing may wait on the device.
+    drop(guard);
+    drop(buffer);
+}
 
 fn tensors() -> &'static PapayaMap<u64, Weak<TensorEntry>> {
     TENSORS.get_or_init(PapayaMap::new)
 }
 
-fn buffers() -> &'static PapayaMap<u64, Arc<Buffer>> {
+fn buffers() -> &'static PapayaMap<u64, BufferSlot> {
     BUFFERS.get_or_init(|| {
         // Expire entries automatically when their BUFFER UOp dies: uop ids are
         // per-allocation and never reused, so once the node is dropped no
         // live graph can look the id up again — the entry is unreachable
-        // garbage from that point. Lock-free removal; safe from Drop context.
+        // garbage from that point. Safe from Drop context: the slot lock is a
+        // leaf, never held across a drop.
         svod_ir::uop::set_uop_drop_hook(|uop_id| {
             if let Some(map) = BUFFERS.get() {
-                let guard = map.guard();
-                map.remove(&uop_id, &guard);
+                remove_slot(map, uop_id);
             }
         });
         PapayaMap::new()
@@ -169,7 +195,7 @@ pub fn register_tensor_with_buffer(uop: Arc<UOp>, buffer: Arc<Buffer>, buffer_uo
 
     // Store buffer indexed by UOp ID (for collect_input_buffers lookups)
     let buf_guard = buffers().guard();
-    buffers().insert(buffer_uop_id, buffer, &buf_guard);
+    buffers().insert(buffer_uop_id, BufferSlot::new(buffer), &buf_guard);
 
     entry
 }
@@ -180,7 +206,7 @@ pub fn register_tensor_with_buffer(uop: Arc<UOp>, buffer: Arc<Buffer>, buffer_uo
 /// Used by collect_input_buffers() during schedule creation.
 pub fn get_buffer(uop_id: u64) -> Option<Buffer> {
     let guard = buffers().guard();
-    buffers().get(&uop_id, &guard).map(|arc_buf| (**arc_buf).clone())
+    buffers().get(&uop_id, &guard).and_then(BufferSlot::get).map(|buffer| (*buffer).clone())
 }
 
 /// Get buffer by UOp ID as Arc (shared reference, no clone).
@@ -188,15 +214,14 @@ pub fn get_buffer(uop_id: u64) -> Option<Buffer> {
 /// Used by ensure_buffer() to attach a buffer without cloning.
 pub fn get_buffer_arc(uop_id: u64) -> Option<Arc<Buffer>> {
     let guard = buffers().guard();
-    buffers().get(&uop_id, &guard).cloned()
+    buffers().get(&uop_id, &guard).and_then(BufferSlot::get)
 }
 
 /// Remove buffer entry from the BUFFERS map.
 ///
 /// Called during cleanup to eagerly remove stale entries.
 pub fn remove_buffer(uop_id: u64) {
-    let buf_guard = buffers().guard();
-    buffers().remove(&uop_id, &buf_guard);
+    remove_slot(buffers(), uop_id);
 }
 
 /// Get count of buffers in the registry (for testing/diagnostics).
@@ -217,7 +242,7 @@ pub fn buffer_count() -> usize {
 pub fn register_buffer(uop_id: u64, tensor_id: u64, buffer: Arc<Buffer>) {
     // Store buffer indexed by UOp ID (for collect_input_buffers lookups)
     let buf_guard = buffers().guard();
-    buffers().insert(uop_id, buffer.clone(), &buf_guard);
+    buffers().insert(uop_id, BufferSlot::new(buffer.clone()), &buf_guard);
 
     // Also set buffer on the TensorEntry for direct tensor access. A lost
     // `set_buffer` for the SAME buffer is a benign re-registration; a lost set
@@ -243,7 +268,7 @@ pub fn register_buffer(uop_id: u64, tensor_id: u64, buffer: Arc<Buffer>) {
 /// to the computation graph, not a specific tensor.
 pub fn register_buffer_by_uop_id(uop_id: u64, buffer: Arc<Buffer>) {
     let guard = buffers().guard();
-    buffers().insert(uop_id, buffer, &guard);
+    buffers().insert(uop_id, BufferSlot::new(buffer), &guard);
 }
 
 /// Get a tensor entry by ID.
