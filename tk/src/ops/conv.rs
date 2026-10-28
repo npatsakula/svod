@@ -5,7 +5,7 @@ use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-use super::config::Planner;
+use super::config::{ConvProblem, GemmProblem, Planner};
 use super::shape::{self, extent, shape_of};
 use super::{
     Act, DtypeSnafu, GraphSnafu, LaunchSnafu, Linear, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, kernel_buffer,
@@ -183,7 +183,9 @@ pub fn tuned(store: &TuneStore, planner: &Planner, dtype: DType, ranked: &[ConvC
         list
     };
     let build = |c: ConvCfg| programs(&ConvSpec { cfg: c.gemm, split: c.split, ..spec.clone() }, &dtype, planner);
+    let problem = ConvProblem { gemm: GemmProblem { batches, m, n: g.cout, k: g.k(), halves: 1 }, geom: g };
     let cfg = Tuner::new(store, &planner.device, dtype.clone(), &key, (&spec.batch, spec.epilogue), build)
+        .floored(|c| problem.claim(planner, &c.gemm).ok().map(|claim| planner.floor(&claim)))
         .tuned(OP, ranked, expand);
     ConvSpec { cfg: cfg.gemm, split: cfg.split, ..spec }
 }

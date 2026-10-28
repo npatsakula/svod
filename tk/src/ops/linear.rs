@@ -8,7 +8,7 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 
-use super::config::Planner;
+use super::config::{GemmProblem, Planner};
 use super::shape::{self, Plan, extent, shape_of};
 use super::{
     Act, DEVICE_TEST, DtypeSnafu, GraphSnafu, LaunchSnafu, Result, ShapeSnafu, Tuner, batch_of, fmt_shape, output,
@@ -113,7 +113,16 @@ fn tune(
 ) -> GemmSpec {
     let shape = [spec.batch.capacity(), spec.m, spec.n, spec.k];
     let build = |cfg| vec![(typed!(dtype, gemm, &GemmSpec { cfg, ..spec.clone() }), cfg.lowering(&planner.device))];
-    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build).tuned(op, ranked, <[_]>::to_vec);
+    let problem = GemmProblem {
+        batches: spec.batch.capacity().max(1),
+        m: spec.m,
+        n: spec.n,
+        k: spec.k,
+        halves: usize::from(spec.epilogue.gated) + 1,
+    };
+    let cfg = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build)
+        .floored(|cfg| planner.floor_of(&problem, cfg))
+        .tuned(op, ranked, <[_]>::to_vec);
     GemmSpec { cfg, ..spec }
 }
 

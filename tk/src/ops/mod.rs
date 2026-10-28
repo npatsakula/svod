@@ -190,6 +190,10 @@ pub(crate) fn planner(device: &DeviceSpec) -> Option<Arc<Planner>> {
 /// off (`SVOD_TK_TUNE=0`) nothing is timed: the ranked list's
 /// [`Self::first_clean`] config runs (its verdict kept as a `first` line), and
 /// the device's cost probes still measure once ([`planner`]).
+/// A candidate's least honest ns ([`config::Planner::floor_of`]): the
+/// closure a [`Tuner`] refuses a measurement under.
+type Floor<'a, C> = Option<Box<dyn Fn(&C) -> Option<f64> + 'a>>;
+
 pub(crate) struct Tuner<'a, C, B> {
     store: &'a TuneStore,
     target: &'a Target,
@@ -199,6 +203,10 @@ pub(crate) struct Tuner<'a, C, B> {
     salt: String,
     build: B,
     bench: Bench<C>,
+    /// The least ns each candidate can honestly take
+    /// ([`Planner::floor_of`]): a measurement under it is refused, never a
+    /// pick. `None` where the family's problem carries no claim.
+    floor: Floor<'a, C>,
 }
 
 impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> {
@@ -223,7 +231,17 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
             salt: format!("{salt:?}"),
             build,
             bench: Bench::default(),
+            floor: None,
         }
+    }
+
+    /// [`Self::new`] refusing measurements under their candidate's floor
+    /// (`floor`, of [`Planner::floor_of`] of the problem's claim): a
+    /// wrong-but-fast reading — a stamp that landed off its kernel — never
+    /// becomes the pick.
+    pub(crate) fn floored(mut self, floor: impl Fn(&C) -> Option<f64> + 'a) -> Self {
+        self.floor = Some(Box::new(floor));
+        self
     }
 
     /// The fingerprint of the programs `build` makes of `list`, what an
@@ -296,7 +314,10 @@ impl<'a, C: config::Tiled + Debug, B: Fn(C) -> tune::Candidate> Tuner<'a, C, B> 
         }
         let key = self.keyed(op, if pass == Pass::Screen { " screened" } else { "" }, candidates);
         let bench = &mut self.bench;
-        let Some(timed) = self.store.choose(&key, candidates, &self.build, bench, pass) else { return untimed() };
+        let floor = self.floor.as_ref().map(|f| &**f as &dyn Fn(&C) -> Option<f64>);
+        let Some(timed) = self.store.choose(&key, candidates, &self.build, bench, pass, floor) else {
+            return untimed();
+        };
         let timed: Vec<(C, u64)> = timed.iter().map(|&(i, ns)| (candidates[i], ns)).collect();
         tracing::debug!(target: PLAN, op, shape = ?self.shape, ?timed, "choice");
         timed.into_iter().map(|(c, ns)| (c, Some(ns))).collect()

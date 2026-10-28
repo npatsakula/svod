@@ -289,7 +289,7 @@ fn a_store_hit_compiles_nothing() {
     };
     let programs = fingerprint(&[gemm_programs(cfgs[0]), gemm_programs(cfgs[1])]);
     let mut bench = Bench::default();
-    let missed = TuneStore::at(Some(dir.to_path_buf())).choose(&k, &cfgs, build, &mut bench, Pass::Whole);
+    let missed = TuneStore::at(Some(dir.to_path_buf())).choose(&k, &cfgs, build, &mut bench, Pass::Whole, None);
     assert_eq!((builds.get(), bench.built.len()), (2, 2), "a miss builds and compiles each once");
     // Without a device that timed them, what it would have measured, stored
     // as a timing would; with one, its choice is already stored.
@@ -298,7 +298,7 @@ fn a_store_hit_compiles_nothing() {
     assert_eq!(stored, missed.or(Some(1)), "the device's choice, else the stored timing's");
     builds.set(0);
     let mut bench = Bench::default();
-    let hit = TuneStore::at(Some(dir.to_path_buf())).choose(&k, &cfgs, build, &mut bench, Pass::Whole);
+    let hit = TuneStore::at(Some(dir.to_path_buf())).choose(&k, &cfgs, build, &mut bench, Pass::Whole, None);
     assert_eq!((hit.map(|timed| timed[0].0), builds.get(), bench.built.len()), (stored, 2, 0));
 }
 
@@ -561,7 +561,8 @@ fn a_gemm_tunes_on_the_device() {
     let key = TuneKey::new("gemm", &device.target, tune::compiler(&spec), ScalarDType::BFloat16, &[1, m, n, k], &cfgs);
     let dir = Scratch::new("tune-device");
     let start = std::time::Instant::now();
-    let chosen = TuneStore::at(Some(dir.to_path_buf())).choose(&key, &cfgs, build, &mut Bench::default(), Pass::Whole);
+    let chosen =
+        TuneStore::at(Some(dir.to_path_buf())).choose(&key, &cfgs, build, &mut Bench::default(), Pass::Whole, None);
     let chosen = cfgs[chosen.expect("measured")[0].0];
     eprintln!("tuned {} candidates in {:.1} s: {chosen:?}", cfgs.len(), start.elapsed().as_secs_f64());
     let programs = || fingerprint(&cfgs.iter().map(|&c| build(c)).collect::<Vec<_>>());
@@ -997,4 +998,226 @@ fn a_stream_runs_width_jobs_at_once_in_order() {
         )
     });
     assert!(panicked.is_err(), "the job's panic reached the caller");
+}
+
+/// Every timed candidate of the stores' choice lines clears its physical
+/// floor ([`Planner::floor_of`] of its own claim): the least ns a kernel can
+/// honestly measure, the bytes it must move at the card's measured rate for
+/// them. The one known reading under it is gfx1151's k-nearest pick of
+/// 2026-10-28 — the 270 ms scores kernel whose end stamp landed off the
+/// compute, its chain timed 1.3 ms — on both lines the shape tuned; every
+/// other candidate of every family and card clears it, the least by half.
+/// The stores are the three cards' probes' and the local one; the test
+/// passes vacuously where none of them is on disk.
+#[test]
+fn timed_candidates_clear_their_physical_floor() {
+    fn dtype_of(name: &str) -> Option<ScalarDType> {
+        match name {
+            "Float16" => Some(ScalarDType::Float16),
+            "BFloat16" => Some(ScalarDType::BFloat16),
+            "Int8" => Some(ScalarDType::Int8),
+            _ => None,
+        }
+    }
+    fn target(device: &str) -> Option<crate::atoms::Target> {
+        use svod_dtype::{AmdArch, CudaArch, GpuArch};
+        let (arch, sms) = device.rsplit_once('-')?;
+        let sms = sms.strip_suffix("sm")?.parse().ok()?;
+        let arch = match AmdArch::parse(arch) {
+            Some(a) => GpuArch::Amd(a),
+            None => GpuArch::Cuda(arch.trim_end_matches('a').parse::<CudaArch>().ok()?),
+        };
+        let xcds = crate::atoms::CARDS.iter().find(|c| c.1 == arch).map_or(
+            match arch {
+                GpuArch::Amd(a) if a.is_cdna() => 8,
+                _ => 1,
+            },
+            |c| c.3,
+        );
+        Some(crate::atoms::Target::offline(arch, sms, xcds))
+    }
+    fn floor(
+        planner: &crate::ops::config::Planner,
+        op: &str,
+        dtype: ScalarDType,
+        shape: &[usize],
+        code: &str,
+    ) -> Option<f64> {
+        use crate::kernels::nearest::{Floors, Metric};
+        use crate::ops::config::{AttentionProblem, ConvProblem, GemmProblem, NearestProblem, Tiled};
+        match op {
+            "nearest" => {
+                let (n, m, d, k) = match shape[..] {
+                    [n, m, d] => (n, m, d, 1),
+                    [n, m, d, k] => (n, m, d, k),
+                    _ => return None,
+                };
+                let p = NearestProblem {
+                    n,
+                    m,
+                    d,
+                    dtype,
+                    metric: Metric::SquaredL2,
+                    floors: Floors::default(),
+                    groups: false,
+                    k,
+                };
+                planner.floor_of(&p, &Tiled::of_code(code)?)
+            }
+            "gemm" | "linear" => {
+                let &[cap, m, n, k] = shape else { return None };
+                let p = GemmProblem { batches: cap.max(1), m, n, k, halves: 1 };
+                planner.floor_of(&p, &Tiled::of_code(code)?)
+            }
+            "attention" => {
+                let &[cap, t, tk, heads, _kv, d] = shape else { return None };
+                let p = AttentionProblem { tiles: cap * heads, t, tk, d, causal: false, bias: false };
+                planner.floor_of(&p, &Tiled::of_code(code)?)
+            }
+            "conv2d" => {
+                let (g, images) = match shape[..] {
+                    [cin, cout, h, w, stride] => (
+                        crate::kernels::conv::ConvGeom {
+                            h,
+                            w,
+                            cin,
+                            cout,
+                            kernel: [3, 3],
+                            stride: [stride, stride],
+                            pad: [1, 1],
+                            dilation: [1, 1],
+                        },
+                        1,
+                    ),
+                    [images, h, w, cin, cout, k0, k1, s0, s1, p0, p1, d0, d1] => (
+                        crate::kernels::conv::ConvGeom {
+                            h,
+                            w,
+                            cin,
+                            cout,
+                            kernel: [k0, k1],
+                            stride: [s0, s1],
+                            pad: [p0, p1],
+                            dilation: [d0, d1],
+                        },
+                        images,
+                    ),
+                    _ => return None,
+                };
+                let [ho, wo] = g.out_hw();
+                let p = ConvProblem {
+                    gemm: GemmProblem { batches: 1, m: images * ho * wo, n: g.cout, k: g.k(), halves: 1 },
+                    geom: g,
+                };
+                let c: crate::kernels::conv::ConvCfg = Tiled::of_code(code)?;
+                p.claim(planner, &c.gemm).ok().map(|claim| planner.floor(&claim))
+            }
+            _ => None,
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dirs = [
+        format!("{home}/projects/tk-nearest-work/pr2-store-strix"),
+        format!("{home}/projects/tk-nearest-work/pr2-store-rx"),
+        format!("{home}/projects/tk-nearest-work/pr2-store-sm86"),
+        format!("{home}/.cache/svod/tk_tune"),
+    ];
+    let dirs: Vec<String> =
+        std::env::var("TK_FLOOR_STORES").map_or(dirs.to_vec(), |list| list.split(':').map(str::to_string).collect());
+    let mut worst: Vec<(f64, String)> = vec![];
+    for dir in dirs {
+        let path = std::path::PathBuf::from(&dir);
+        let Ok(files) = std::fs::read_dir(&path) else {
+            println!("-- {dir}: absent");
+            continue;
+        };
+        println!("-- {dir}");
+        let mut planners: std::collections::HashMap<String, Option<crate::ops::config::Planner>> = Default::default();
+        for file in files.flatten() {
+            let text = std::fs::read_to_string(file.path()).unwrap_or_default();
+            let name = file.path().file_stem().unwrap().to_string_lossy().to_string();
+            for line in text.lines() {
+                let fields: Vec<&str> = line.split('|').collect();
+                if fields.first() != Some(&"choice") || fields.len() != 8 {
+                    continue;
+                }
+                let (op, dtype, shape) = (fields[1], fields[3], fields[4]);
+                let Some(dtype) = dtype_of(dtype) else { continue };
+                let Ok(shape) = shape.split('x').map(|n| n.parse::<usize>()).collect::<Result<Vec<_>, _>>() else {
+                    continue;
+                };
+                let planner = planners.entry(fields[2].to_string()).or_insert_with(|| {
+                    let t = target(fields[2])?;
+                    crate::probe::stored(&path, &t).and_then(|m| crate::ops::config::Planner::measured(t, m))
+                });
+                let Some(planner) = planner else { continue };
+                let Some(pairs) = fields[7].split_once(' ').map(|(_, p)| p) else { continue };
+                for pair in pairs.split(' ').collect::<Vec<_>>().chunks(2) {
+                    let [f, ns] = pair else { continue };
+                    let Some(code) = f.split_once(':').map(|(_, c)| c) else { continue };
+                    let Some(ns) = ns.parse::<u64>().ok() else { continue };
+                    let Some(f) = floor(planner, op, dtype, &shape, code) else { continue };
+                    if f > 0.0 {
+                        worst.push((ns as f64 / f, format!("{name} {op} {shape:?} {code}")));
+                    }
+                }
+            }
+        }
+    }
+    worst.sort_by(|a, b| a.0.total_cmp(&b.0));
+    println!("candidates: {}", worst.len());
+    if worst.is_empty() {
+        return;
+    }
+    for (ratio, what) in worst.iter().take(24) {
+        println!("{ratio:8.3} {what}");
+    }
+
+    let under: Vec<&String> = worst.iter().filter(|&&(ratio, _)| ratio < 1.0).map(|(_, what)| what).collect();
+    assert_eq!(
+        under.len(),
+        3,
+        "under the floor: {under:?}\nthe least above it: {:?}",
+        worst.iter().find(|&&(ratio, _)| ratio >= 1.0)
+    );
+    for what in under {
+        assert!(
+            what.contains("gfx1151") && what.contains("nearest [256, 1048576, 768, 64] 128,128,2,"),
+            "an honest candidate refused: {what}"
+        );
+    }
+}
+
+/// A candidate measuring under its floor never becomes the pick — not
+/// measured, not read back from a store that holds the number: the choice is
+/// the next candidate's. One that refuses everything leaves the order as it
+/// ran: a floor that refuses every candidate is itself what is wrong.
+#[test]
+fn an_underfloor_measurement_is_never_the_pick() {
+    let dir = Scratch::new("tune-floor");
+    let k = key(&[128, 128, 128], &[0, 1]);
+    let cfgs = [gemm_cfg([64, 64, 32], 2, [2, 2], true), gemm_cfg([128, 64, 32], 2, [2, 2], true)];
+    let programs = || fingerprint(&[gemm_programs(cfgs[0]), gemm_programs(cfgs[1])]);
+    TuneStore::at(Some(dir.to_path_buf())).select(&k, 2, programs, || vec![Some(1), Some(4)]);
+    let build = |c: crate::kernels::gemm::GemmCfg| gemm_programs(c);
+    let floor = |c: &crate::kernels::gemm::GemmCfg| (c == &cfgs[0]).then_some(3.0);
+    let chosen = TuneStore::at(Some(dir.to_path_buf())).choose(
+        &k,
+        &cfgs,
+        build,
+        &mut Bench::default(),
+        Pass::Whole,
+        Some(&floor),
+    );
+    assert_eq!(chosen.map(|timed| timed[0].0), Some(1), "the under-floor candidate is refused");
+    let every = |_: &crate::kernels::gemm::GemmCfg| Some(9.0);
+    let kept = TuneStore::at(Some(dir.to_path_buf())).choose(
+        &k,
+        &cfgs,
+        build,
+        &mut Bench::default(),
+        Pass::Whole,
+        Some(&every),
+    );
+    assert_eq!(kept.map(|timed| timed[0].0), Some(0), "a floor refusing everything is ignored");
 }

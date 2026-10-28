@@ -699,6 +699,7 @@ impl TuneStore {
         build: impl Fn(C) -> Candidate,
         bench: &mut Bench<C>,
         pass: Pass,
+        floor: Floor<'_, C>,
     ) -> Option<Arc<[(usize, u64)]>> {
         let keep = bench.lowered.clone();
         let programs = || {
@@ -713,7 +714,7 @@ impl TuneStore {
             })
         };
         match self.remember(Kind::Choice, key, within, programs, timed)? {
-            Entry::Choice(timed) => Some(timed.iter().map(|&(i, _, ns)| (i, ns)).collect()),
+            Entry::Choice(timed) => Some(floored(&timed, candidates, floor).into()),
             _ => None,
         }
     }
@@ -764,6 +765,43 @@ pub(crate) fn ordered(ns: Vec<Option<u64>>) -> Option<Arc<[(usize, u64)]>> {
     let mut ran: Vec<(u64, usize)> = ns.into_iter().enumerate().filter_map(|(i, ns)| Some((ns?, i))).collect();
     ran.sort_unstable();
     (!ran.is_empty()).then(|| ran.into_iter().map(|(ns, i)| (i, ns)).collect())
+}
+
+/// A candidate's least honest ns: what [`crate::ops::Tuner`] passes
+/// [`TuneStore::choose`] to refuse a measurement under.
+pub(crate) type Floor<'a, C> = Option<&'a dyn Fn(&C) -> Option<f64>>;
+
+/// [`ordered`]'s pairs less those under their floor: a candidate measuring
+/// below what its own bytes can stream at is a measurement that lied (a stamp
+/// that landed off its kernel, gfx1151's k-nearest pick of 2026-10-28), not a
+/// fast kernel, and never a pick — measured, replayed or memoized alike.
+/// Everything refused leaves the order as it ran: a floor that refuses every
+/// candidate is itself what is wrong.
+fn floored<C: std::fmt::Debug>(
+    timed: &Arc<[(usize, String, u64)]>,
+    candidates: &[C],
+    floor: Floor<'_, C>,
+) -> Vec<(usize, u64)> {
+    let pairs = |kept: &[&(usize, String, u64)]| kept.iter().map(|&&(i, _, ns)| (i, ns)).collect();
+    let Some(floor) = floor else { return pairs(&timed.iter().collect::<Vec<_>>()) };
+    let (kept, refused): (Vec<_>, Vec<_>) =
+        timed.iter().partition(|&&(i, _, ns)| floor(&candidates[i]).is_none_or(|least| ns as f64 >= least));
+    for &(i, _, ns) in &refused {
+        tracing::info!(
+            target: crate::ops::PLAN,
+            cfg = ?candidates[*i],
+            ns,
+            floor = floor(&candidates[*i]),
+            "refused: the measurement is under the candidate's physical floor"
+        );
+    }
+    match kept.is_empty() {
+        false => pairs(&kept),
+        true => {
+            tracing::warn!(target: crate::ops::PLAN, "every candidate under its floor: the floor is wrong, not the kernels");
+            pairs(&timed.iter().collect::<Vec<_>>())
+        }
+    }
 }
 
 /// A candidate compiled on scratch buffers: its plans (`None` when one

@@ -292,6 +292,26 @@ pub(crate) struct Claim {
     pub sections: [Spread; 2],
 }
 
+/// The safety divisor of [`Planner::floor`]: how many times below its bytes'
+/// measured pace a candidate may measure before the tuner refuses the number.
+/// Measured over every timed candidate of the three cards' stores and the
+/// local one on 2026-10-28 (23851 candidates): the least honest one reads
+/// 1.83x its floor, the k-nearest pick whose stamps landed off its kernel
+/// 0.20x — the floor sits between, half the bytes' pace.
+pub(crate) const FLOOR: f64 = 2.0;
+
+impl Claim {
+    /// The bytes the kernel must move at least once: every distinct byte of
+    /// its streams, its straight-to-DRAM stores and its whole-problem
+    /// sections' — the work no config of the problem can skip, whatever it
+    /// caches or overlaps.
+    pub(crate) fn distinct(&self) -> f64 {
+        self.fill.unique
+            + self.stores * self.trips as f64 * self.blocks as f64
+            + self.sections.iter().map(|s| s.bytes * s.rows).sum::<f64>()
+    }
+}
+
 /// A kernel family behind one interface: the configs it spans on a target
 /// and the resources each claims — everything the planner needs of a family
 /// beyond its configs' own tiles ([`Tiled`]), so that a family cannot price
@@ -490,6 +510,21 @@ impl Planner {
     pub(crate) fn admit<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Result<(f64, u32), Rejected> {
         let claim = problem.claim(self, cfg)?;
         Ok((self.price(&claim), claim.regs))
+    }
+
+    /// The least wall ns `cfg`'s kernel can honestly take
+    /// ([`Planner::floor_of`] of its claim): a measured time under it is a
+    /// measurement that lied, never a fast kernel.
+    pub(crate) fn floor_of<P: Family>(&self, problem: &P, cfg: &P::Cfg) -> Option<f64> {
+        Some(self.floor(&problem.claim(self, cfg).ok()?))
+    }
+
+    /// The least wall ns a claim's kernel can take: the bytes it must move
+    /// at the card's measured rate for a stream of that many distinct bytes,
+    /// every SM streaming at once, [`FLOOR`] times below that.
+    pub(crate) fn floor(&self, claim: &Claim) -> f64 {
+        let bytes = claim.distinct();
+        bytes * self.device.costs.rate(bytes) / (self.sms() as f64 * FLOOR)
     }
 
     /// What a byte of a fill costs when `fill` bytes stream `unique`

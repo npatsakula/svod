@@ -6,7 +6,7 @@ use svod_ir::SInt;
 use svod_ir::origin::OriginScope;
 use svod_tensor::Tensor;
 
-use super::config::Planner;
+use super::config::{AttentionProblem, Planner};
 use super::shape::Fallback;
 use super::shape::{self, extent, shape_of};
 use super::{
@@ -346,7 +346,16 @@ pub fn tuned(
         }
         programs
     };
-    let mut tuner = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build);
+    let problem = AttentionProblem {
+        tiles: spec.batch.capacity() * heads,
+        t,
+        tk,
+        d,
+        causal: spec.mask.causal,
+        bias: bias_rows.is_some(),
+    };
+    let mut tuner = Tuner::new(store, &planner.device, dtype.clone(), &shape, salt, build)
+        .floored(|cfg| planner.floor_of(&problem, cfg));
     let cfg = tune(&mut tuner, &split, bias_rows.is_some(), expand);
     tracing::debug!(target: super::PLAN, op = OP, ?shape, pick = ?cfg, "attention tuned");
     AttnSpec { cfg, ..spec }

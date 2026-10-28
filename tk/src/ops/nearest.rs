@@ -734,7 +734,8 @@ pub(crate) fn timed(
     let build = |cfg: NearestCfg| programs(planner, dtype.clone(), &NearestSpec { cfg, ..spec.clone() });
     let p = problem(&spec, dtype.scalar().expect("a kernel dtype"));
     let expand = |admitted: &[NearestCfg]| planner.nearest_splits(&p, admitted);
-    let mut tuner = Tuner::new(store, &planner.device, dtype.clone(), shape, Salt(&spec), build);
+    let mut tuner = Tuner::new(store, &planner.device, dtype.clone(), shape, Salt(&spec), build)
+        .floored(|cfg| planner.floor_of(&p, cfg));
     let (cfg, ns) = tuner.tuned_timed(OP, ranked, expand);
     (NearestSpec { cfg, ..spec }, ns)
 }
