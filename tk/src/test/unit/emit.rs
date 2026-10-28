@@ -9,9 +9,11 @@ use svod_ir::uop::eval::{eval_binary_op, eval_unary_op};
 use svod_ir::{ConstValue, Op, UOp, ops};
 use test_case::test_case;
 
-use crate::atoms::{Core, Costs, Device};
+use crate::atoms::{Core, Costs, Device, Target};
 use crate::build::*;
 use crate::ir::*;
+use crate::kernels::Batch;
+use crate::kernels::rows::{Norm, NormCfg, NormSpec, norm};
 use crate::lower::Lowering;
 use crate::lower::emit::minimum;
 
@@ -416,5 +418,46 @@ fn a_fill_goes_in_whole_chunks_per_thread(rows: usize, cols: usize, fills: bool)
             assert_eq!(what, format!("a {rows}×{cols} fill by 32 threads"));
         }
         Err(e) => panic!("{e}"),
+    }
+}
+
+/// The alias contract the LLVM text claims, and nothing beyond it: every
+/// buffer parameter is `ptr noalias align 32` — each `ParamArg` a distinct
+/// buffer of the launch, a view an offset inside its own — while the one
+/// runtime scalar (a bound batch's count) carries nothing, and no access
+/// carries `align` or scoped `!alias.scope`/`!noalias` metadata. The
+/// accesses of a ring's slots are runtime-offset windows of one shared
+/// object, where a static scope would be unsound across a loop's
+/// iterations; per-access `align` measured byte-identical objects on clang
+/// 22 and 23, nvptx and amdgcn alike (gemm, attention d64/d128, nearest
+/// k1/k16/k64, norm; 2026-10-28), so none is claimed.
+#[test_case(crate::atoms::sm86(); "sm_86")]
+#[test_case(amd(AmdArch::Gfx1201, 64); "gfx1201")]
+fn the_text_claims_exactly_the_aliasing_tk_knows(target: Target) {
+    let spec = NormSpec {
+        norm: Norm::Layer,
+        rows: 64,
+        d: 256,
+        batch: Batch::var("n", 1, 4),
+        eps: 1e-5,
+        residual: true,
+        bias: true,
+        cfg: NormCfg { br: 4 },
+    };
+    let text = crate::lower::render(norm::<BF16>(&spec), &Lowering::new(&super::declared(target))).unwrap();
+    let define = text.lines().find(|l| l.starts_with("define ")).expect("a define line");
+    let params = define.split('(').nth(1).expect("parameters").trim_end_matches(") #0 {");
+    let mut buffers = 0;
+    for param in params.split(", ") {
+        if param.starts_with("ptr noalias align 32 %data") {
+            buffers += 1;
+        } else {
+            assert_eq!(param, "i32 %data6", "the batch count alone is bare: {define}");
+        }
+    }
+    assert_eq!(buffers, 6, "x, residual, w, b, out, sum: {define}");
+    for line in text.lines().filter(|l| l.contains("load ") || l.contains("store ")) {
+        let claim = ["align", "!alias", "dereferenceable"].iter().filter(|meta| line.contains(*meta)).count();
+        assert_eq!(claim, 0, "an access claims metadata nowhere justified: {line}");
     }
 }
