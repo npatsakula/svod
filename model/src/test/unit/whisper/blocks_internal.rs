@@ -29,9 +29,9 @@ fn fp16_layernorm_keeps_affine_in_fp32_until_final_cast() {
     // the normalized value and each product (the legacy form) differs from
     // rounding once at the end: since a Float16 roundtrip rounds instead of
     // folding away, only such values keep this fixture discriminative.
-    let x = fp16(&[0.15673828125, -0.1868896484375, -2.517578125, -0.53857421875], &[1, 4]);
-    let weight = fp16(&[-0.387939453125, 0.90625, -12.2421875, -3.822265625], &[4]);
-    let bias = fp16(&[-3.9140625, -3.234375, 4.2421875, -3.23046875], &[4]);
+    let x = fp16(&[0.15673828, -0.18688965, -2.5175781, -0.5385742], &[1, 4]);
+    let weight = fp16(&[-0.38793945, 0.90625, -12.2421875, -3.8222656], &[4]);
+    let bias = fp16(&[-3.9140625, -3.234375, 4.2421875, -3.2304688], &[4]);
     let layer = LayerNorm::new(weight.clone(), Some(bias.clone()), 1e-5);
     let f32_of = |t: &Tensor| t.cast(DType::Float32);
 
